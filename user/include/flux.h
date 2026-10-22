@@ -12,5 +12,7 @@ int reboot(int cmd);
 int dmesg(char *buf, unsigned int size);
 int sched_yield(void);
 int msleep(unsigned int ms);
+int getmounts(char *buf, unsigned int size);
+int blkinfo(int index, struct blkinfo *bi);
 
 #endif

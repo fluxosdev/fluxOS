@@ -93,9 +93,11 @@ char *strerror(int err)
     case ENOMEM: return "Cannot allocate memory";
     case EACCES: return "Permission denied";
     case EFAULT: return "Bad address";
+    case ENOTBLK: return "Block device required";
     case EBUSY: return "Device or resource busy";
     case EEXIST: return "File exists";
     case EXDEV: return "Invalid cross-device link";
+    case ENODEV: return "No such device";
     case ENOTDIR: return "Not a directory";
     case EISDIR: return "Is a directory";
     case EINVAL: return "Invalid argument";
@@ -105,6 +107,7 @@ char *strerror(int err)
     case EFBIG: return "File too large";
     case ENOSPC: return "No space left on device";
     case ESPIPE: return "Illegal seek";
+    case EROFS: return "Read-only file system";
     case EPIPE: return "Broken pipe";
     case ERANGE: return "Numerical result out of range";
     case ENAMETOOLONG: return "File name too long";

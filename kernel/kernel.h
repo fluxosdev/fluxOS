@@ -11,7 +11,7 @@
 #include <flux/abi.h>
 
 #define FLUXOS_NAME    "fluxOS"
-#define FLUXOS_RELEASE "1.0.0"
+#define FLUXOS_RELEASE "0.0.1"
 
 #define PAGE_SIZE 4096u
 #define ALIGN_UP(x, a)   (((x) + ((a) - 1)) & ~((a) - 1))
@@ -38,6 +38,9 @@ void kputs(const char *s);
 int klog_read(char *buf, uint32_t size);
 void boot_ok(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void panic(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
+
+/* Kernel command line (from the boot loader). */
+int cmdline_has(const char *option);
 
 /* Console sink used by kprintf and the tty. */
 void console_write(const char *buf, uint32_t len);

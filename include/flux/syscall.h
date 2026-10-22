@@ -47,7 +47,12 @@
 #define SYS_rename    39
 #define SYS_dmesg     40
 #define SYS_chmod     41
+#define SYS_mount     42
+#define SYS_umount    43
+#define SYS_statfs    44
+#define SYS_getmounts 45
+#define SYS_blkinfo   46
 
-#define NSYSCALLS     42
+#define NSYSCALLS     47
 
 #endif

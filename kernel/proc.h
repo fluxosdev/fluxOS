@@ -32,7 +32,8 @@ struct proc {
     uint32_t *pd;               /* page directory (physical == virtual) */
     struct trapframe *tf;       /* user registers on syscall/trap entry */
     void *chan;                 /* wait channel while P_BLOCKED */
-    uint32_t wake_tick;         /* deadline while P_SLEEPING */
+    uint32_t wake_tick;         /* deadline while P_SLEEPING (or timed P_BLOCKED) */
+    int timed;                  /* P_BLOCKED with a deadline */
     int exit_status;
     uint32_t sig_pending;
     uint32_t sig_ignored;
@@ -54,6 +55,7 @@ void schedule(void);
 void proc_tick(void);
 
 void sleep_on(void *chan);
+void sleep_on_timeout(void *chan, uint32_t deadline);
 void wakeup(void *chan);
 int sleep_ticks(uint32_t n);
 

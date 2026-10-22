@@ -5,9 +5,10 @@
 #include <stdint.h>
 #include <flux/abi.h>
 
-enum { VN_FILE = 1, VN_DIR, VN_CHR };
+enum { VN_FILE = 1, VN_DIR, VN_CHR, VN_BLK };
 
 struct vnode;
+struct fs;
 typedef int (*dev_read_t)(struct vnode *vn, void *buf, uint32_t off, uint32_t n);
 typedef int (*dev_write_t)(struct vnode *vn, const void *buf, uint32_t off, uint32_t n);
 
@@ -19,7 +20,7 @@ struct vnode {
     uint32_t size;
     uint32_t cap;
     uint32_t mtime;
-    uint32_t rdev;              /* character devices only */
+    uint32_t rdev;              /* device nodes only */
     uint8_t *data;
     int refs;                   /* open files + working directories */
     int linked;                 /* still reachable from the tree */
@@ -28,11 +29,24 @@ struct vnode {
     struct vnode *next;
     dev_read_t dev_read;
     dev_write_t dev_write;
+    void *dev_priv;             /* device driver data */
+    struct fs *fs;              /* NULL for ramfs and device nodes */
+    void *fs_data;              /* filesystem-specific inode data */
+    int loaded;                 /* fs directories: children have been read */
+    struct vnode *mounted;      /* root of a filesystem mounted here */
 };
 
 extern struct vnode *vfs_root;
 
 void vfs_init(void);
+
+/*
+ * Serialises filesystem and block-device work, which may sleep waiting
+ * for disk interrupts. FIFO (ticket) order, so a process doing a long
+ * copy cannot starve others. No-op before the first process exists.
+ */
+void vfs_lock(void);
+void vfs_unlock(void);
 void vfs_ref(struct vnode *vn);
 void vfs_unref(struct vnode *vn);
 

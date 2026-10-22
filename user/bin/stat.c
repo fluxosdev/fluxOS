@@ -9,6 +9,7 @@ static const char *type_name(uint32_t m)
 {
     if (S_ISDIR(m)) return "directory";
     if (S_ISCHR(m)) return "character special file";
+    if (S_ISBLK(m)) return "block special file";
     if (S_ISFIFO(m)) return "fifo";
     return "regular file";
 }
@@ -35,7 +36,7 @@ int main(int argc, char **argv)
         printf("  File: %s\n", argv[i]);
         printf("  Size: %-10u Type: %s\n", st.st_size, type_name(st.st_mode));
         printf(" Inode: %-10u Links: %u", st.st_ino, st.st_nlink);
-        if (S_ISCHR(st.st_mode))
+        if (S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode))
             printf("   Device: %u,%u", MAJOR(st.st_rdev), MINOR(st.st_rdev));
         printf("\nAccess: (%04o)\nModify: %s\n", st.st_mode & 07777, when);
     }

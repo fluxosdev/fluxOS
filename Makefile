@@ -4,6 +4,7 @@
 #   make run        boot the ISO in QEMU (serial console on stdio)
 #   make run-kernel boot the kernel directly with QEMU's multiboot loader
 #   make check      verify the kernel is a valid multiboot image
+#   make disk       create fluxdisk.img, a FAT32 data disk (kept by make clean)
 #   make clean      remove build artifacts
 
 CC      ?= gcc
@@ -17,6 +18,9 @@ ISO     := fluxOS.iso
 KERNEL  := $(BUILD)/fluxos.kernel
 INITRD  := $(BUILD)/initrd.tar
 ROOTFS  := $(BUILD)/rootfs
+DISK    := fluxdisk.img
+DISK_MB ?= 64
+MKFS_FAT ?= $(shell command -v mkfs.fat 2>/dev/null || ls /usr/sbin/mkfs.fat /sbin/mkfs.fat 2>/dev/null | head -1)
 
 GCC_INC := $(shell $(CC) -print-file-name=include)
 
@@ -48,7 +52,7 @@ BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/fsh
 
 ROOTFS_FILES := $(shell find rootfs -type f 2>/dev/null)
 
-.PHONY: all iso kernel initrd run run-kernel check clean
+.PHONY: all iso kernel initrd disk run run-kernel check clean
 .SECONDARY:
 
 all: $(ISO)
@@ -107,11 +111,23 @@ $(ISO): $(KERNEL) $(INITRD) grub/grub.cfg
 check: $(KERNEL)
 	grub-file --is-x86-multiboot $(KERNEL) && echo "$(KERNEL): valid multiboot kernel"
 
-run: $(ISO)
-	$(QEMU) -cdrom $(ISO) -m 128M -serial stdio
+disk: $(DISK)
 
-run-kernel: $(KERNEL) $(INITRD)
-	$(QEMU) -kernel $(KERNEL) -initrd $(INITRD) -m 128M -serial stdio
+# A blank FAT32 disk; without a host mkfs.fat it stays unformatted and can
+# be formatted from inside fluxOS with "mkfs.fat /dev/hda".
+$(DISK):
+	truncate -s $(DISK_MB)M $@
+	@if [ -n "$(MKFS_FAT)" ]; then $(MKFS_FAT) -F 32 -n FLUXDISK $@ >/dev/null && \
+		echo "$@: $(DISK_MB) MiB FAT32"; \
+	else echo "$@: blank, run 'mkfs.fat /dev/hda' inside fluxOS"; fi
+
+QEMU_DISK := -drive file=$(DISK),format=raw,if=ide,index=0
+
+run: $(ISO) $(DISK)
+	$(QEMU) -m 128M -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK)
+
+run-kernel: $(KERNEL) $(INITRD) $(DISK)
+	$(QEMU) -kernel $(KERNEL) -initrd $(INITRD) -m 128M -serial stdio $(QEMU_DISK)
 
 clean:
 	rm -rf $(BUILD) $(ISO)

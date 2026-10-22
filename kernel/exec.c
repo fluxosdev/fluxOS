@@ -15,6 +15,7 @@
 #define PT_LOAD   1
 
 #define MAX_ARG_BYTES (64 * 1024)
+#define MAX_IMAGE     (32u << 20)
 #define MAX_ARGS      1024
 #define STACK_SLACK   (4 * PAGE_SIZE)
 
@@ -40,7 +41,42 @@ static int count_strings(char *const v[], uint32_t *bytes)
     return n;
 }
 
-static int load_segments(uint32_t *pd, struct vnode *vn, uint32_t *entry, uint32_t *top)
+/* An executable's bytes: ramfs files are used in place, others read in. */
+struct image {
+    const uint8_t *data;
+    uint32_t size;
+    uint8_t *owned;
+};
+
+static int image_load(struct vnode *vn, struct image *img)
+{
+    img->owned = NULL;
+    img->size = vn->size;
+    if (!vn->fs) {
+        img->data = vn->data;
+        return 0;
+    }
+    if (vn->size > MAX_IMAGE)
+        return -E2BIG;
+    img->owned = kmalloc(vn->size ? vn->size : 1);
+    if (!img->owned)
+        return -ENOMEM;
+    int r = vfs_read(vn, img->owned, 0, vn->size);
+    if (r != (int)vn->size) {
+        kfree(img->owned);
+        return r < 0 ? r : -EIO;
+    }
+    img->data = img->owned;
+    return 0;
+}
+
+static void image_free(struct image *img)
+{
+    kfree(img->owned);
+    img->owned = NULL;
+}
+
+static int load_segments(uint32_t *pd, const struct image *vn, uint32_t *entry, uint32_t *top)
 {
     const struct elf32_ehdr *eh = (const struct elf32_ehdr *)vn->data;
 
@@ -125,7 +161,7 @@ static int build_stack(uint32_t *pd, char *const argv[], char *const envp[], uin
 }
 
 /* "#!/path/to/interp" -> run interp with the script path as argv[1]. */
-static int exec_script(struct proc *p, struct vnode *vn, const char *path,
+static int exec_script(struct proc *p, struct image *vn, const char *path,
                        char *const argv[], char *const envp[])
 {
     char interp[PATH_MAX];
@@ -136,6 +172,7 @@ static int exec_script(struct proc *p, struct vnode *vn, const char *path,
            vn->data[i] != ' ' && vn->data[i] != '\r')
         interp[n++] = (char)vn->data[i++];
     interp[n] = 0;
+    image_free(vn);
     if (!n)
         return -ENOEXEC;
 
@@ -152,8 +189,10 @@ static int exec_script(struct proc *p, struct vnode *vn, const char *path,
     nargv[argc < 1 ? 2 : argc + 1] = NULL;
 
     struct vnode *ivn;
+    char magic[2] = { 0, 0 };
     int r = vfs_resolve(interp, p->cwd, &ivn);
-    if (r == 0 && ivn->size >= 2 && ivn->data[0] == '#' && ivn->data[1] == '!')
+    if (r == 0 && ivn->type == VN_FILE && vfs_read(ivn, magic, 0, 2) == 2 &&
+        magic[0] == '#' && magic[1] == '!')
         r = -ENOEXEC;                       /* no nested interpreters */
     if (r == 0)
         r = proc_exec(p, interp, nargv, envp);
@@ -171,15 +210,22 @@ int proc_exec(struct proc *p, const char *path, char *const argv[], char *const 
         return -EISDIR;
     if (vn->type != VN_FILE || !(vn->mode & 0111))
         return -EACCES;
-    if (vn->size >= 2 && vn->data[0] == '#' && vn->data[1] == '!')
-        return exec_script(p, vn, path, argv, envp);
+    struct image img;
+    r = image_load(vn, &img);
+    if (r < 0)
+        return r;
+    if (img.size >= 2 && img.data[0] == '#' && img.data[1] == '!')
+        return exec_script(p, &img, path, argv, envp);
 
     uint32_t *pd = vmm_create();
-    if (!pd)
+    if (!pd) {
+        image_free(&img);
         return -ENOMEM;
+    }
 
     uint32_t entry, top, sp;
-    r = load_segments(pd, vn, &entry, &top);
+    r = load_segments(pd, &img, &entry, &top);
+    image_free(&img);
     if (r == 0)
         r = build_stack(pd, argv, envp, &sp);
     if (r < 0) {

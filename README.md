@@ -1,7 +1,8 @@
 # fluxOS
 
 fluxOS is a small 32-bit x86 Unix-like operating system with preemptive
-multitasking, ring-3 user processes, paging, a RAM filesystem and a
+multitasking, ring-3 user processes, paging, a RAM root filesystem, IDE
+disk and CD-ROM drivers with FAT32 and ISO9660 support, and a
 zsh-flavoured shell called **fsh**. It boots with GRUB (Multiboot) from an ISO
 image.
 
@@ -37,6 +38,22 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
 - VFS over an in-memory filesystem, unpacked at boot from a ustar initrd that
   GRUB loads as a module. It has directories, files, `/dev/{tty,console,null,
   zero,random,urandom}`, pipes, `dup2`, `rename`, `chmod` and `getdents`.
+- Storage:
+  - An IDE driver for ATA hard disks (PIO, LBA28/LBA48, read/write) and ATAPI
+    CD/DVD drives (packet commands, media detection). It is interrupt driven:
+    a process waiting on the disk sleeps until IRQ14/15, so other processes
+    keep running. The `ata.poll` kernel option falls back to polling, for
+    hardware whose IDE interrupts don't arrive.
+  - Block devices `/dev/hda`..`/dev/hdd`, with MBR partitions as `/dev/hda1`
+    and so on, behind a write-through sector cache.
+- Filesystems, mounted into the same VFS tree:
+  - **FAT32**, read/write: VFAT long file names with `~N` short aliases,
+    case-insensitive lookup, directories that grow, all FAT copies kept in
+    sync, and FSInfo free counts. Programs can run straight from FAT.
+  - **ISO9660**, read-only: Rock Ridge names, modes and timestamps, on CDs or
+    on 512-byte-sector disks.
+  - Volumes are mounted at boot on `/mnt/cdrom` and `/mnt/hdX`, and with
+    `mount`/`umount`, which refuses while files are in use.
 - Console: VGA text mode with an ANSI/VT100 escape interpreter, PS/2 keyboard
   (arrows and modifiers map to escape sequences), and a mirrored COM1 serial
   console. The tty line discipline supports canonical and raw modes, echo,
@@ -64,10 +81,11 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
 - History expansion (`!! !$ !n !str`), aliases, `source`, `~/.fshrc`, and
   history saved in `~/.fsh_history`.
 
-**Userland** (`/bin`): basename cat chmod clear cp date dirname dmesg echo env
-fetch free fsh grep halt head hexdump init ls mkdir more mv poweroff ps reboot
-rm rmdir seq sh sleep sort spin stat tail tee top touch tr uname uniq uptime wc
-yes, all on a small libc (stdio, malloc, environ, dirent, time).
+**Userland** (`/bin`): basename cat chmod clear cp date df dirname dmesg echo
+env fetch free fsh grep halt head hexdump init ls lsblk mkdir mkfs.fat more
+mount mv poweroff ps reboot rm rmdir seq sh sleep sort spin stat tail tee top
+touch tr umount uname uniq uptime wc yes, all on a small libc (stdio, malloc,
+environ, dirent, time).
 
 ## Building
 
@@ -84,9 +102,10 @@ libgcc or the host libc.
 ```sh
 make            # builds build/fluxos.kernel, build/initrd.tar and fluxOS.iso
 make check      # verifies the kernel is a valid Multiboot image
-make run        # boots the ISO in QEMU (VGA window + serial on the terminal)
+make disk       # creates fluxdisk.img, a 64 MiB FAT32 data disk (DISK_MB=...)
+make run        # boots the ISO in QEMU with fluxdisk.img as /dev/hda
 make run-kernel # boots the kernel directly with QEMU's Multiboot loader
-make clean
+make clean      # removes build/ and the ISO; fluxdisk.img is kept
 ```
 
 To boot real hardware or another VM, write `fluxOS.iso` to a USB stick or
@@ -106,8 +125,16 @@ echo {1..3} $((6*7)) ~         # brace, arithmetic and tilde expansion
 mkdir -p /tmp/{a,b}/c; ls -R /tmp
 cd /etc; ..                    # AUTO_CD via the '..' alias
 dmesg | tail
+lsblk; df -h; mount            # disks, CD-ROM and mounted filesystems
+ls /mnt/cdrom/boot             # the boot CD itself, via ATAPI + ISO9660
+cp -r ~ /mnt/hda/home; ls -l /mnt/hda/home   # FAT32 writes survive reboots
+umount /mnt/hda; mkfs.fat -n MYDISK /dev/hda; mount /dev/hda /mnt/hda
 poweroff
 ```
+
+Files written to `/mnt/hda` live in `fluxdisk.img`. On a Linux host you can
+inspect the image with `mdir -i fluxdisk.img ::` (mtools) or `fsck.fat -n
+fluxdisk.img`.
 
 ## Layout
 
@@ -122,7 +149,9 @@ kernel/
   pmm.c, vmm.c, heap.c     frame allocator, paging, kernel heap
   proc.c, exec.c           processes, scheduler, signals, ELF loader
   syscall.c                system call table and user-pointer validation
-  vfs.c, file.c, initrd.c  ramfs, devices, open files, pipes, initrd unpacking
+  vfs.c, file.c, initrd.c  VFS + ramfs, mounting, devices, open files, pipes, initrd
+  ata.c, blkdev.c          IDE ATA/ATAPI driver, block devices, partitions, cache
+  fat32.c, iso9660.c       filesystem drivers
   tty.c, vga.c, serial.c,  console stack
   keyboard.c, timer.c      PS/2 keyboard, PIT, RTC, power control
   kmain.c                  boot sequence
@@ -153,6 +182,12 @@ either because it blocked or because the timer set `need_resched` and the trap
 is about to return to user mode. `switch_context` swaps kernel stacks, and a
 new process starts by "returning" into `trapret`.
 
+**Disk I/O.** Filesystem and block-device work may now sleep in the middle of
+an operation (waiting for a disk interrupt), so it is serialised by one FIFO
+"VFS lock". System calls that walk or change the tree hold it for the call.
+`read`/`write` on files and block devices take it per 64 KiB chunk, so a long
+copy can't starve other disk users. Terminals and pipes never take it.
+
 **System calls.** `int 0x80` with the number in `eax` and arguments in `ebx`,
 `ecx`, `edx`, `esi` and `edi`. Failures return `-errno`. Every user pointer is
 checked against the user range and the current page tables before the kernel
@@ -160,8 +195,18 @@ touches it.
 
 ## Limitations
 
-fluxOS supports a single CPU and has no disk driver; the filesystem lives in
-RAM and is lost on reboot. Permission bits are cosmetic apart from the exec
-bit, and there is a single user. Signals cannot have user handlers, and jobs
+fluxOS supports a single CPU. The root filesystem lives in RAM; only what you
+write to a mounted FAT32 volume persists.
+
+Storage limits:
+- Disks use PIO rather than DMA, so the CPU copies each sector itself; it
+  sleeps while the drive works, so other processes keep running.
+- Only MBR partitions are supported (no GPT), only FAT32 (no FAT12/16), and
+  ISO9660 without Joliet names.
+- Raw access to `/dev/hdX` is limited to the first 4 GiB.
+- FAT has no permission bits, so every file there appears as `rwxr-xr-x`.
+
+Permission bits are cosmetic apart from the exec bit, and there is a single
+user. Signals cannot have user handlers, and jobs
 cannot be stopped (no ^Z). User programs may not use the FPU: the kernel does
 not save FPU state, so FPU instructions raise `SIGILL`.

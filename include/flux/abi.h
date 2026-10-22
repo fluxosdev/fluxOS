@@ -22,9 +22,11 @@
 #define ENOMEM       12
 #define EACCES       13
 #define EFAULT       14
+#define ENOTBLK      15
 #define EBUSY        16
 #define EEXIST       17
 #define EXDEV        18
+#define ENODEV       19
 #define ENOTDIR      20
 #define EISDIR       21
 #define EINVAL       22
@@ -34,6 +36,7 @@
 #define EFBIG        27
 #define ENOSPC       28
 #define ESPIPE       29
+#define EROFS        30
 #define EPIPE        32
 #define ERANGE       34
 #define ENAMETOOLONG 36
@@ -60,11 +63,13 @@
 #define S_IFIFO  0x1000
 #define S_IFCHR  0x2000
 #define S_IFDIR  0x4000
+#define S_IFBLK  0x6000
 #define S_IFREG  0x8000
 #define S_ISDIR(m)  (((m) & S_IFMT) == S_IFDIR)
 #define S_ISREG(m)  (((m) & S_IFMT) == S_IFREG)
 #define S_ISCHR(m)  (((m) & S_IFMT) == S_IFCHR)
 #define S_ISFIFO(m) (((m) & S_IFMT) == S_IFIFO)
+#define S_ISBLK(m)  (((m) & S_IFMT) == S_IFBLK)
 
 struct stat {
     uint32_t st_ino;
@@ -72,22 +77,24 @@ struct stat {
     uint32_t st_size;
     uint32_t st_nlink;
     uint32_t st_mtime;
-    uint32_t st_rdev;           /* device number for character devices */
+    uint32_t st_rdev;           /* device number for device nodes */
 };
 
 #define MAJOR(dev) (((dev) >> 8) & 0xFF)
 #define MINOR(dev) ((dev) & 0xFF)
 #define MKDEV(ma, mi) (((ma) << 8) | (mi))
 #define TTY_MAJOR 4
+#define IDE_MAJOR 3
 
 /* ---- directory entries (getdents) ---- */
-#define NAME_MAX 59
-#define PATH_MAX 256
+#define NAME_MAX 255
+#define PATH_MAX 512
 
 #define DT_UNKNOWN 0
 #define DT_FIFO    1
 #define DT_CHR     2
 #define DT_DIR     4
+#define DT_BLK     6
 #define DT_REG     8
 
 struct dirent {
@@ -167,6 +174,32 @@ struct meminfo {
     uint32_t kernel_kb;
     uint32_t heap_total_kb;
     uint32_t heap_used_kb;
+};
+
+/* ---- filesystems and block devices ---- */
+#define ST_RDONLY 0x1
+
+struct statfs {
+    uint32_t f_bsize;           /* allocation unit in bytes */
+    uint32_t f_blocks;          /* total units */
+    uint32_t f_bfree;           /* free units */
+    uint32_t f_flags;           /* ST_RDONLY */
+    char     f_fstype[16];
+    char     f_source[32];
+};
+
+#define BLK_DISK  0
+#define BLK_CDROM 1
+#define BLK_PART  2
+
+struct blkinfo {
+    char     name[16];
+    char     model[44];
+    uint32_t type;              /* BLK_* */
+    uint32_t sector_size;
+    uint32_t sectors;
+    char     fstype[16];        /* mounted filesystem, if any */
+    char     mountpoint[128];
 };
 
 /* ---- reboot(2) ---- */

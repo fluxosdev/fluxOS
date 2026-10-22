@@ -121,7 +121,8 @@ void proc_tick(void)
     current->cpu_ticks++;
     for (int i = 1; i < MAX_PROCS; i++) {
         struct proc *p = &procs[i];
-        if (p->state == P_SLEEPING && (int32_t)(ticks - p->wake_tick) >= 0) {
+        if ((p->state == P_SLEEPING || (p->state == P_BLOCKED && p->timed)) &&
+            (int32_t)(ticks - p->wake_tick) >= 0) {
             p->state = P_READY;
             need_resched = 1;
         }
@@ -138,6 +139,15 @@ void sleep_on(void *chan)
     current->state = P_BLOCKED;
     schedule();
     current->chan = NULL;
+}
+
+/* Block on chan, but give up once `ticks` reaches deadline. */
+void sleep_on_timeout(void *chan, uint32_t deadline)
+{
+    current->wake_tick = deadline;
+    current->timed = 1;
+    sleep_on(chan);
+    current->timed = 0;
 }
 
 void wakeup(void *chan)

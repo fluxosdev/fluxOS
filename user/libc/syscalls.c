@@ -9,7 +9,9 @@
 #include <flux/syscall.h>
 #include <signal.h>
 #include <stdio.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -186,6 +188,14 @@ int meminfo(struct meminfo *mi) { return ret(sc1(SYS_meminfo, (int)mi)); }
 unsigned int uptime_ms(void) { return (unsigned int)sc0(SYS_uptime); }
 int reboot(int cmd) { return ret(sc1(SYS_reboot, cmd)); }
 int dmesg(char *buf, unsigned int size) { return ret(sc2(SYS_dmesg, (int)buf, (int)size)); }
+int mount(const char *source, const char *target, const char *type)
+{
+    return ret(sc3(SYS_mount, (int)source, (int)target, (int)type));
+}
+int umount(const char *target) { return ret(sc1(SYS_umount, (int)target)); }
+int statfs(const char *path, struct statfs *st) { return ret(sc2(SYS_statfs, (int)path, (int)st)); }
+int getmounts(char *buf, unsigned int size) { return ret(sc2(SYS_getmounts, (int)buf, (int)size)); }
+int blkinfo(int index, struct blkinfo *bi) { return ret(sc2(SYS_blkinfo, index, (int)bi)); }
 
 int isatty(int fd)
 {

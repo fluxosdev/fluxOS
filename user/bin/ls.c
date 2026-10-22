@@ -38,11 +38,11 @@ static const char *color_of(const struct stat *st)
         return NULL;
     if (S_ISDIR(st->st_mode))
         return "\033[1;34m";
-    if (S_ISCHR(st->st_mode))
+    if (S_ISCHR(st->st_mode) || S_ISBLK(st->st_mode))
         return "\033[1;33m";
     if (S_ISFIFO(st->st_mode))
         return "\033[33m";
-    if (st->st_mode & 0111)
+    if (S_ISREG(st->st_mode) && (st->st_mode & 0111))
         return "\033[1;32m";
     return NULL;
 }
@@ -53,7 +53,7 @@ static char type_suffix(const struct stat *st)
         return 0;
     if (S_ISDIR(st->st_mode)) return '/';
     if (S_ISFIFO(st->st_mode)) return '|';
-    if (st->st_mode & 0111) return '*';
+    if (S_ISREG(st->st_mode) && (st->st_mode & 0111)) return '*';
     return 0;
 }
 
@@ -72,7 +72,7 @@ static int print_name(const struct entry *e)
 
 static void mode_string(uint32_t m, char *s)
 {
-    s[0] = S_ISDIR(m) ? 'd' : S_ISCHR(m) ? 'c' : S_ISFIFO(m) ? 'p' : '-';
+    s[0] = S_ISDIR(m) ? 'd' : S_ISCHR(m) ? 'c' : S_ISBLK(m) ? 'b' : S_ISFIFO(m) ? 'p' : '-';
     const char *rwx = "rwxrwxrwx";
     for (int i = 0; i < 9; i++)
         s[i + 1] = (m & (1u << (8 - i))) ? rwx[i] : '-';
@@ -99,7 +99,7 @@ static void print_long(const struct entry *e)
     struct tm tm;
     gmtime_r(&t, &tm);
     strftime(when, sizeof(when), "%b %e %H:%M", &tm);
-    if (S_ISCHR(e->st.st_mode))
+    if (S_ISCHR(e->st.st_mode) || S_ISBLK(e->st.st_mode))
         snprintf(size, sizeof(size), "%u, %u", MAJOR(e->st.st_rdev), MINOR(e->st.st_rdev));
     else if (opt_human)
         human(e->st.st_size, size, sizeof(size));

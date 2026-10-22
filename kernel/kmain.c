@@ -5,7 +5,9 @@
  */
 #include "kernel.h"
 #include "arch.h"
+#include "blkdev.h"
 #include "drivers.h"
+#include "fs.h"
 #include "mm.h"
 #include "multiboot.h"
 #include "proc.h"
@@ -21,6 +23,18 @@ static const char *banner[] = {
     "|_| |_|\\__,_/_/\\_\\ \\___/|____/ ",
 };
 
+static char cmdline[256];
+
+/* True if `option` appears as a whole word on the kernel command line. */
+int cmdline_has(const char *option)
+{
+    size_t n = strlen(option);
+    for (const char *p = cmdline; (p = strstr(p, option)); p += n)
+        if ((p == cmdline || p[-1] == ' ') && (p[n] == 0 || p[n] == ' '))
+            return 1;
+    return 0;
+}
+
 void kmain(uint32_t magic, struct multiboot_info *mbi)
 {
     serial_init();
@@ -35,6 +49,9 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
         panic("not booted by a multiboot loader (magic %08x)", magic);
     if ((mbi->flags & MB_INFO_LOADER) && mbi->boot_loader_name)
         boot_ok("Booted by %s", (const char *)mbi->boot_loader_name);
+
+    if ((mbi->flags & MB_INFO_CMDLINE) && mbi->cmdline)
+        strlcpy(cmdline, (const char *)mbi->cmdline, sizeof(cmdline));
 
     /* Remember the initrd before any allocation can reuse that memory. */
     uint32_t initrd_start = 0, initrd_end = 0;
@@ -78,6 +95,9 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     } else {
         panic("no initrd module: check the GRUB configuration");
     }
+
+    ata_init();
+    vfs_automount();
 
     proc_init();
     proc_spawn_init("/bin/init");

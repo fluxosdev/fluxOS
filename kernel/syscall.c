@@ -4,7 +4,9 @@
  * the kernel touches it.
  */
 #include "kernel.h"
+#include "blkdev.h"
 #include "drivers.h"
+#include "fs.h"
 #include "mm.h"
 #include "proc.h"
 #include "syscall.h"
@@ -259,6 +261,37 @@ static int sys_ttymode(uint32_t mode, uint32_t b, uint32_t c, uint32_t d, uint32
 
 /* ---- files ---- */
 
+/*
+ * File I/O that may reach a disk runs under the VFS lock, in chunks so
+ * other processes get their turn during a long transfer. Terminals and
+ * pipes block for unbounded time and never take the lock.
+ */
+#define IO_CHUNK (64 * 1024)
+
+static int needs_vfs_lock(struct file *f)
+{
+    return f->type == FT_VNODE && f->vn->type != VN_CHR;
+}
+
+static int file_io(struct file *f, uint8_t *buf, uint32_t n, int write)
+{
+    if (!needs_vfs_lock(f))
+        return write ? file_write(f, buf, n) : file_read(f, buf, n);
+    uint32_t done = 0;
+    while (done < n) {
+        uint32_t chunk = MIN(n - done, (uint32_t)IO_CHUNK);
+        vfs_lock();
+        int r = write ? file_write(f, buf + done, chunk) : file_read(f, buf + done, chunk);
+        vfs_unlock();
+        if (r < 0)
+            return done ? (int)done : r;
+        done += (uint32_t)r;
+        if ((uint32_t)r < chunk)
+            break;
+    }
+    return (int)done;
+}
+
 static int sys_read(uint32_t fd, uint32_t buf, uint32_t n, uint32_t d, uint32_t e)
 {
     (void)d; (void)e;
@@ -267,7 +300,7 @@ static int sys_read(uint32_t fd, uint32_t buf, uint32_t n, uint32_t d, uint32_t 
         return -EBADF;
     if (user_check((void *)buf, n) < 0)
         return -EFAULT;
-    return file_read(f, (void *)buf, n);
+    return file_io(f, (uint8_t *)buf, n, 0);
 }
 
 static int sys_write(uint32_t fd, uint32_t buf, uint32_t n, uint32_t d, uint32_t e)
@@ -278,7 +311,7 @@ static int sys_write(uint32_t fd, uint32_t buf, uint32_t n, uint32_t d, uint32_t
         return -EBADF;
     if (user_check((void *)buf, n) < 0)
         return -EFAULT;
-    return file_write(f, (const void *)buf, n);
+    return file_io(f, (uint8_t *)buf, n, 1);
 }
 
 static int sys_open(uint32_t upath, uint32_t flags, uint32_t c, uint32_t d, uint32_t e)
@@ -387,6 +420,7 @@ static int sys_lseek(uint32_t fd, uint32_t off, uint32_t whence, uint32_t d, uin
         return -ESPIPE;
     if (f->vn->type == VN_CHR)
         return 0;
+
     int32_t base;
     switch (whence) {
     case SEEK_SET: base = 0; break;
@@ -524,7 +558,82 @@ static int sys_chmod(uint32_t upath, uint32_t mode, uint32_t c, uint32_t d, uint
     int r = vfs_resolve(path, current->cwd, &vn);
     if (r < 0)
         return r;
+    if (vn->fs && vn->fs->readonly)
+        return -EROFS;
     vn->mode = mode & 07777;
+    return 0;
+}
+
+/* ---- filesystems ---- */
+
+static int sys_mount(uint32_t usrc, uint32_t utarget, uint32_t utype, uint32_t d, uint32_t e)
+{
+    (void)d; (void)e;
+    COPY_PATH(src, usrc);
+    COPY_PATH(target, utarget);
+    char type[16] = "auto";
+    if (utype && copy_str(type, (const char *)utype, sizeof(type)) < 0)
+        return -EINVAL;
+    return vfs_mount(src, target, type, current->cwd);
+}
+
+static int sys_umount(uint32_t utarget, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)b; (void)c; (void)d; (void)e;
+    COPY_PATH(target, utarget);
+    return vfs_umount(target, current->cwd);
+}
+
+static int sys_statfs(uint32_t upath, uint32_t ubuf, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    COPY_PATH(path, upath);
+    if (user_check((void *)ubuf, sizeof(struct statfs)) < 0)
+        return -EFAULT;
+    struct vnode *vn;
+    int r = vfs_resolve(path, current->cwd, &vn);
+    if (r < 0)
+        return r;
+    return vfs_statfs(vn, (struct statfs *)ubuf);
+}
+
+static int sys_getmounts(uint32_t ubuf, uint32_t size, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    size = MIN(size, 8192u);
+    if (user_check((void *)ubuf, size) < 0)
+        return -EFAULT;
+    char *tmp = kmalloc(size + 1);
+    if (!tmp)
+        return -ENOMEM;
+    int n = vfs_mounts_text(tmp, size + 1);
+    n = MIN(n, (int)size);
+    memcpy((void *)ubuf, tmp, (uint32_t)n);
+    kfree(tmp);
+    return n;
+}
+
+static int sys_blkinfo(uint32_t idx, uint32_t ubuf, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    if (user_check((void *)ubuf, sizeof(struct blkinfo)) < 0)
+        return -EFAULT;
+    struct blockdev *bd = blk_get((int)idx);
+    if (!bd)
+        return -ENODEV;
+    struct blkinfo *bi = (struct blkinfo *)ubuf;
+    memset(bi, 0, sizeof(*bi));
+    if (bd->refresh)
+        bd->refresh(bd);
+    strlcpy(bi->name, bd->name, sizeof(bi->name));
+    strlcpy(bi->model, bd->model, sizeof(bi->model));
+    bi->type = (uint32_t)bd->type;
+    bi->sector_size = bd->sector_size;
+    bi->sectors = bd->nsectors;
+    if (bd->fs) {
+        strlcpy(bi->fstype, bd->fs->ops->name, sizeof(bi->fstype));
+        vfs_mountpoint_of(bd, bi->mountpoint, sizeof(bi->mountpoint));
+    }
     return 0;
 }
 
@@ -647,6 +756,19 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_rename] = sys_rename,
     [SYS_dmesg] = sys_dmesg,
     [SYS_chmod] = sys_chmod,
+    [SYS_mount] = sys_mount,
+    [SYS_umount] = sys_umount,
+    [SYS_statfs] = sys_statfs,
+    [SYS_getmounts] = sys_getmounts,
+    [SYS_blkinfo] = sys_blkinfo,
+};
+
+/* Calls that walk or change the VFS tree; read and write lock per chunk. */
+static const uint8_t takes_vfs_lock[NSYSCALLS] = {
+    [SYS_open] = 1, [SYS_execve] = 1, [SYS_chdir] = 1, [SYS_getcwd] = 1,
+    [SYS_getdents] = 1, [SYS_mkdir] = 1, [SYS_rmdir] = 1, [SYS_unlink] = 1,
+    [SYS_rename] = 1, [SYS_chmod] = 1, [SYS_stat] = 1, [SYS_mount] = 1,
+    [SYS_umount] = 1, [SYS_statfs] = 1, [SYS_getmounts] = 1, [SYS_blkinfo] = 1,
 };
 
 void syscall_dispatch(struct trapframe *tf)
@@ -656,5 +778,9 @@ void syscall_dispatch(struct trapframe *tf)
         tf->eax = (uint32_t)-ENOSYS;
         return;
     }
+    if (takes_vfs_lock[n])
+        vfs_lock();
     tf->eax = (uint32_t)syscalls[n](tf->ebx, tf->ecx, tf->edx, tf->esi, tf->edi);
+    if (takes_vfs_lock[n])
+        vfs_unlock();
 }
