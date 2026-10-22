@@ -1,0 +1,35 @@
+fluxOS quick tour
+=================
+
+The filesystem lives in RAM: everything you create is lost on reboot.
+
+Multitasking
+  spin A 5 &         CPU-bound task in the background (never yields)
+  spin B 5 &         ...and another; the shell stays responsive
+  jobs               list background jobs, 'fg %1' brings one back
+  top                live CPU usage per process (^C to quit)
+  ps                 process table
+
+The shell (fsh) is zsh-flavoured
+  * syntax highlighting: commands turn green when they exist
+  * grey autosuggestions from history; Right arrow or ^E accepts
+  * Tab completion with zsh-style listings
+  * Up/Down search history by the prefix you typed
+  * AUTO_CD: type a directory name to cd into it
+  * globs that match nothing are an error ("no matches found")
+  * continuation prompts: if> for> dquote> pipe> ...
+
+Scripting
+  for i in $(seq 1 3); do echo "round $i"; done
+  if [ -d /bin ]; then echo yes; else echo no; fi
+  greet() { echo "hello, ${1:-world}"; }; greet flux
+  echo $((6 * 7))
+  ./demo.sh
+
+Pipes and redirection
+  ls /bin | grep -c .
+  cat README | grep -n shell > /tmp/out; cat /tmp/out
+  sort < /etc/fshrc | uniq | head -3
+
+System
+  free, uname -a, uptime, date, dmesg, fetch, reboot, poweroff
