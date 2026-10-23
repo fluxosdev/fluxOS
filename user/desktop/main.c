@@ -117,6 +117,7 @@ int main(void)
         if (now - last_blink >= BLINK_MS) {
             last_blink = now;
             terminal_blink();
+            editor_blink();
         }
         if (now - last_tick >= 1000) {
             last_tick = now;

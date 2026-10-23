@@ -37,6 +37,7 @@ struct dialog {
     struct dialog **self;       /* cleared when the dialog closes */
     /* message boxes and prompts: what to call when the user agrees */
     void (*on_yes)(void *ctx);
+    void (*on_no)(void *ctx);
     void (*on_text)(void *ctx, const char *text);
     void *ctx;
 };
@@ -302,6 +303,7 @@ static void dialog_show(struct dialog *d, int focus_index)
 static void ask_command(struct dialog *d, int id)
 {
     void (*on_yes)(void *) = d->on_yes;
+    void (*on_no)(void *) = d->on_no;
     void (*on_text)(void *, const char *) = d->on_text;
     void *ctx = d->ctx;
     char text[sizeof(d->edit)];
@@ -309,6 +311,8 @@ static void ask_command(struct dialog *d, int id)
     close_dialog(d);                    /* frees d */
     if (id == ID_YES && on_yes)
         on_yes(ctx);
+    else if (id == ID_NO && on_no)
+        on_no(ctx);
     else if (id == ID_OK && on_text && text[0])
         on_text(ctx, text);
 }
@@ -358,6 +362,19 @@ void ask_yes_no(const char *title, enum icon_id icon, const char *text,
     struct dialog *d = message_dialog(title, icon, text, labels, ids, 2);
     if (d) {
         d->on_yes = yes;
+        d->ctx = ctx;
+    }
+}
+
+void ask_yes_no_cancel(const char *title, enum icon_id icon, const char *text,
+                       void (*yes)(void *ctx), void (*no)(void *ctx), void *ctx)
+{
+    static const char *const labels[] = { "Yes", "No", "Cancel" };
+    static const int ids[] = { ID_YES, ID_NO, ID_CANCEL };
+    struct dialog *d = message_dialog(title, icon, text, labels, ids, 3);
+    if (d) {
+        d->on_yes = yes;
+        d->on_no = no;
         d->ctx = ctx;
     }
 }

@@ -241,7 +241,14 @@ struct fbinfo {
 #define KEY_TAB   0x0F
 #define KEY_ENTER 0x1C
 #define KEY_SPACE 0x39
+#define KEY_F2    0x3C
 #define KEY_F4    0x3E
+#define KEY_F5    0x3F
+#define KEY_HOME  0xC7
+#define KEY_PGUP  0xC9
+#define KEY_END   0xCF
+#define KEY_PGDN  0xD1
+#define KEY_DELETE 0xD3
 #define KEY_UP    0xC8
 #define KEY_DOWN  0xD0
 #define KEY_LEFT  0xCB

@@ -72,6 +72,11 @@ static void open_computer(void)
     files_open("/");
 }
 
+static void open_editor(void)
+{
+    editor_open(NULL);
+}
+
 static void open_home(void)
 {
     const char *home = getenv("HOME");
@@ -111,6 +116,7 @@ struct menu_item {
 static struct menu_item menu_items[] = {
     { ICON_TERMINAL, "Terminal", open_terminal },
     { ICON_FOLDER, "File Manager", open_home },
+    { ICON_EDITOR, "Text Editor", open_editor },
     { ICON_README, "Read Me", open_readme },
     { ICON_COMPUTER, "System Properties", about_open },
     { ICON_RUN, "Run...", run_open },
@@ -1016,6 +1022,9 @@ static void mouse_event(const struct input_event *ev)
             drag_motion();
         else if (menu_open)
             set_menu_hover(menu_hit(mx, my));
+        else if (focused && !focused->minimized && focused->ops && focused->ops->mouse &&
+                 rect_contains(wm_client_rect(focused), mx, my))
+            client_mouse(focused, mbuttons, 0);     /* hovering: menus highlight */
     }
     if (pressed & MOUSE_LEFT)
         press_left();

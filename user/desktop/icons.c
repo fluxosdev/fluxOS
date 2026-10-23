@@ -185,6 +185,7 @@ static const char *const icon_names[ICON_COUNT] = {
     [ICON_UP] = "go-up",
     [ICON_DELETE] = "edit-delete",
     [ICON_INSTALL] = "system-installer",
+    [ICON_EDITOR] = "accessories-text-editor",
 };
 
 static const int icon_sizes[] = { 16, 32, 48 };

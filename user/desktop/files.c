@@ -3,7 +3,8 @@
  * icon view, with a toolbar (Up, New Folder, Delete, Rename), an address
  * field, a scroll bar and a status bar. Double-clicking a folder opens
  * it in the same window; a program runs in a terminal window, a PNG
- * opens in the image viewer, and anything else is shown with more(1).
+ * opens in the image viewer, a text file in the text editor, and anything
+ * else is shown with more(1).
  *
  * Keys: arrows move the selection, Enter opens, Backspace goes up,
  * Delete deletes, F2 renames and F5 reloads the folder. Clicking the
@@ -32,12 +33,6 @@
 #define SB_W       16
 #define LINE_STEP  CELL_H
 #define DBLCLICK_MS 500
-
-#define KEY_HOME   0xC7
-#define KEY_END    0xCF
-#define KEY_DELETE 0xD3
-#define KEY_F2     0x3C
-#define KEY_F5     0x3F
 
 struct entry {
     char name[NAME_MAX + 1];
@@ -103,6 +98,16 @@ static int has_suffix(const char *name, const char *suffix)
 {
     size_t n = strlen(name), k = strlen(suffix);
     return n > k && !strcasecmp(name + n - k, suffix);
+}
+
+/* Files the double-click opens in the text editor. */
+static int is_text_name(const char *name)
+{
+    static const char *const suffixes[] = { ".txt", ".md", ".log", ".cfg", ".conf", ".ini", ".c", ".h" };
+    for (unsigned i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++)
+        if (has_suffix(name, suffixes[i]))
+            return 1;
+    return 0;
 }
 
 static enum icon_id classify(struct fm *f, const struct entry *e, const char *parent_fs)
@@ -460,6 +465,8 @@ static void open_entry(struct fm *f, int i)
     } else if (e->icon == ICON_RUN) {
         const char *argv[] = { path, NULL };
         terminal_open(e->name, argv, 1, 0);
+    } else if (is_text_name(e->name)) {
+        editor_open(path);
     } else {
         const char *argv[] = { "/bin/more", path, NULL };
         terminal_open(e->name, argv, 0, 0);

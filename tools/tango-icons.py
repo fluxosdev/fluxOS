@@ -35,6 +35,7 @@ ICONS = {
     "Go-up.svg": "go-up",
     "Edit-delete.svg": "edit-delete",
     "System-installer.svg": "system-installer",
+    "Accessories-text-editor.svg": "accessories-text-editor",
 }
 SIZES = (16, 32, 48)
 SOURCE_PX = 250         # a standard Commons thumbnail width, scaled down from here

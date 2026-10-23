@@ -118,6 +118,14 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   get drive icons. Double-clicking a folder opens it, a program or script
   runs in a terminal window, a PNG opens in an image viewer, and any other
   file is shown with `more`.
+- Text editor: a Notepad-style window with File and Edit menus (New, Open,
+  Save, Save As, Cut, Copy, Paste, Select All), a monospaced text area with
+  both scroll bars, mouse and Shift+arrow selection, a clipboard shared
+  between editors, and a status bar with the line and column. It opens and
+  saves plain text files (up to 1 MB), appends `.txt` to a name with no
+  extension, keeps CRLF files as CRLF, and asks "Save changes?" before
+  discarding anything. Double-clicking a `.txt`, `.md`, `.log`, `.cfg`,
+  `.conf`, `.ini`, `.c` or `.h` file in the file manager opens it there.
 - Setup: a Win95-style wizard (the **Install fluxOS** icon) that installs
   fluxOS on a hard disk. It lists the disks, greying out any that are too
   small or hold the install files, asks you to confirm that the chosen disk
@@ -128,7 +136,7 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   the kernel which filesystem it booted from, and a system started from an
   installed hard disk hides the icon and the Start menu entry. (`fluxinstall`
   still works from a shell there.)
-- Start menu: Terminal, File Manager, Read Me, System Properties (version,
+- Start menu: Terminal, File Manager, Text Editor, Read Me, System Properties (version,
   memory, display, uptime), Run... (runs a command in a new window), Install
   fluxOS..., and Shut Down... (power off, restart, or close the desktop and
   return to the text console).
@@ -257,7 +265,8 @@ user/
   fsh/                     the shell: lexer, parser, expansion, executor, editor
   desktop/                 the desktop: compositor and window manager (wm.c),
                            terminal emulator, file manager and image viewer
-                           (files.c), the Setup wizard (setup.c), dialogs,
+                           (files.c), the text editor (edit.c), the Setup
+                           wizard (setup.c), dialogs,
                            drawing, PNG decoding (png.c), icons, fonts
   bin/                     one program per file (fluxinstall.c is the installer)
 rootfs/                    files copied into the initrd (/etc, /home/flux,
@@ -361,7 +370,8 @@ Storage limits:
   2-second resolution.
 
 The desktop's terminals are a fixed 80x25 and keep no scrollback, windows
-cannot be resized, and there is no clipboard. While the desktop runs, the
+cannot be resized, and the only clipboard is the text editor's. The editor
+has no undo, no word wrap and no search, and shows only ASCII. While the desktop runs, the
 serial port's input goes to the unused console; its output still mirrors the
 kernel log.
 

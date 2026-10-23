@@ -43,6 +43,7 @@ enum icon_id {
     ICON_UP,
     ICON_DELETE,
     ICON_INSTALL,
+    ICON_EDITOR,
     ICON_COUNT,
 };
 
@@ -108,6 +109,22 @@ void draw_title_button(struct surface *s, struct rect r, int glyph, int pressed,
 enum { TB_CLOSE, TB_MINIMIZE, TB_MAXIMIZE };
 void draw_radio(struct surface *s, int x, int y, const char *label, int checked, int focused);
 void draw_separator(struct surface *s, int x, int y, int w);
+
+/* A scroll bar along one axis. pos, page and total share one unit (lines,
+ * columns, ...): the view shows [pos, pos + page) of total. */
+struct sbar {
+    struct rect r;              /* the whole bar, arrows included */
+    int vertical;
+    int pos, page, total;
+};
+enum sbar_part { SBAR_NONE, SBAR_ARROW1, SBAR_ARROW2, SBAR_PAGE1, SBAR_PAGE2, SBAR_THUMB };
+#define SBAR_W 16
+void sbar_draw(struct surface *s, const struct sbar *b, enum sbar_part pressed);
+enum sbar_part sbar_hit(const struct sbar *b, int x, int y);
+struct rect sbar_thumb(const struct sbar *b);
+/* The position for a thumb grabbed `grab` pixels from its start and dragged to mouse. */
+int sbar_drag(const struct sbar *b, int mouse, int grab);
+int sbar_max(const struct sbar *b);
 void draw_text_field(struct surface *s, struct rect r, const char *text, int cursor, int focused);
 
 /* ---- apps ---- */
@@ -118,6 +135,8 @@ void terminal_child_exited(int pid);
 void terminal_blink(void);
 
 struct window *files_open(const char *path);
+struct window *editor_open(const char *path);      /* path NULL: an empty document */
+void editor_blink(void);
 void setup_open(void);
 void setup_child_exited(int pid, int status);
 void system_restart(void);
@@ -132,6 +151,8 @@ struct window *image_view_open(const char *path);
 void message_box(const char *title, enum icon_id icon, const char *text);
 void ask_yes_no(const char *title, enum icon_id icon, const char *text,
                 void (*yes)(void *ctx), void *ctx);
+void ask_yes_no_cancel(const char *title, enum icon_id icon, const char *text,
+                       void (*yes)(void *ctx), void (*no)(void *ctx), void *ctx);
 void ask_text(const char *title, const char *label, const char *initial,
               void (*done)(void *ctx, const char *text), void *ctx);
 
