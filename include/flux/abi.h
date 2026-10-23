@@ -200,6 +200,7 @@ struct blkinfo {
     uint32_t sectors;
     char     fstype[16];        /* mounted filesystem, if any */
     char     mountpoint[128];
+    uint32_t start;             /* partitions: first sector on the disk */
 };
 
 /* ---- reboot(2) ---- */

@@ -54,7 +54,8 @@
 #define SYS_blkinfo   46
 #define SYS_sync      47
 #define SYS_fsync     48
+#define SYS_blkrescan 49
 
-#define NSYSCALLS     49
+#define NSYSCALLS     50
 
 #endif

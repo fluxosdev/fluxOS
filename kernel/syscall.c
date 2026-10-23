@@ -630,6 +630,7 @@ static int sys_blkinfo(uint32_t idx, uint32_t ubuf, uint32_t c, uint32_t d, uint
     bi->type = (uint32_t)bd->type;
     bi->sector_size = bd->sector_size;
     bi->sectors = bd->nsectors;
+    bi->start = bd->start;
     if (bd->fs) {
         strlcpy(bi->fstype, bd->fs->ops->name, sizeof(bi->fstype));
         vfs_mountpoint_of(bd, bi->mountpoint, sizeof(bi->mountpoint));
@@ -688,6 +689,19 @@ static int sys_meminfo(uint32_t ubuf, uint32_t b, uint32_t c, uint32_t d, uint32
     mi->heap_total_kb = htotal / 1024;
     mi->heap_used_kb = hused / 1024;
     return 0;
+}
+
+/* Re-read the partition table of a whole disk (like Linux's BLKRRPART). */
+static int sys_blkrescan(uint32_t upath, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)b; (void)c; (void)d; (void)e;
+    COPY_PATH(path, upath);
+    struct vnode *vn;
+    int r = vfs_resolve(path, current->cwd, &vn);
+    if (r < 0)
+        return r;
+    struct blockdev *bd = blk_by_vnode(vn);
+    return bd ? blk_rescan(bd) : -ENOTBLK;
 }
 
 static int sys_sync(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
@@ -789,6 +803,7 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_blkinfo] = sys_blkinfo,
     [SYS_sync] = sys_sync,
     [SYS_fsync] = sys_fsync,
+    [SYS_blkrescan] = sys_blkrescan,
 };
 
 /* Calls that walk or change the VFS tree; read and write lock per chunk. */
@@ -797,7 +812,7 @@ static const uint8_t takes_vfs_lock[NSYSCALLS] = {
     [SYS_getdents] = 1, [SYS_mkdir] = 1, [SYS_rmdir] = 1, [SYS_unlink] = 1,
     [SYS_rename] = 1, [SYS_chmod] = 1, [SYS_stat] = 1, [SYS_mount] = 1,
     [SYS_umount] = 1, [SYS_statfs] = 1, [SYS_getmounts] = 1, [SYS_blkinfo] = 1,
-    [SYS_sync] = 1, [SYS_fsync] = 1,
+    [SYS_sync] = 1, [SYS_fsync] = 1, [SYS_blkrescan] = 1,
 };
 
 void syscall_dispatch(struct trapframe *tf)

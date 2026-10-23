@@ -88,7 +88,7 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   history saved in `~/.fsh_history`.
 
 **Userland** (`/bin`): basename cat chmod clear cp date df dirname dmesg echo
-env fetch free fsh grep halt head hexdump init ls lsblk mkdir mkfs.fat more
+env fetch fluxinstall free fsh grep halt head hexdump init ls lsblk mkdir mkfs.fat more
 mount mv poweroff ps reboot rm rmdir seq sh sleep sort spin stat sync tail tee
 top touch tr umount uname uniq uptime wc yes, all on a small libc (stdio, malloc,
 environ, dirent, time).
@@ -111,6 +111,7 @@ make check      # verifies the kernel is a valid Multiboot image
 make disk       # creates fluxdisk.img, a 64 MiB FAT32 data disk (DISK_MB=...)
 make run        # boots the ISO in QEMU with fluxdisk.img as /dev/hda
 make run-kernel # boots the kernel directly with QEMU's Multiboot loader
+make run-disk   # boots fluxdisk.img alone, after installing fluxOS onto it
 make clean      # removes build/ and the ISO; fluxdisk.img is kept
 ```
 
@@ -118,6 +119,33 @@ To boot real hardware or another VM, write `fluxOS.iso` to a USB stick or
 attach it as a CD-ROM. fluxOS uses VGA text mode, so boot in **legacy BIOS**
 mode. Under UEFI-only firmware GRUB starts the kernel, but nothing is visible
 except on the serial port.
+
+## Installing to a hard disk
+
+Boot the CD, then run the installer on a whole disk (see `lsblk`):
+
+```sh
+fluxinstall /dev/hda      # asks you to type "yes"; -y skips the question
+```
+
+The installer:
+1. writes a new MBR with one bootable FAT32 partition starting at 1 MiB;
+2. puts GRUB's boot sector in the MBR and its core image in the gap before
+   the partition, as `grub-install` would;
+3. formats the partition with `mkfs.fat`;
+4. copies the kernel, the initrd, `grub.cfg` and GRUB's modules from the CD.
+
+**This erases the whole disk.** The disk must be at least 34 MiB. Afterwards
+the disk boots on its own, through GRUB's menu, and the partition is mounted
+on `/mnt/hda1`. An installed disk carries the installer's files too, so it
+can install onto another disk with `fluxinstall -s /mnt/hda1 /dev/hdb`.
+
+In QEMU, `make run` attaches `fluxdisk.img` next to the CD. Install with
+`fluxinstall /dev/hda`, then quit and run `make run-disk` to boot the disk
+alone.
+
+The installed system still runs from RAM, like the CD. The disk holds the
+kernel and initrd, and its FAT32 partition is where files persist.
 
 ## Things to try
 
@@ -164,7 +192,7 @@ kernel/
 user/
   libc/, include/          the C library and its headers
   fsh/                     the shell: lexer, parser, expansion, executor, editor
-  bin/                     one program per file
+  bin/                     one program per file (fluxinstall.c is the installer)
 rootfs/                    files copied into the initrd (/etc, /home/flux)
 ```
 

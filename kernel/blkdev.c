@@ -281,6 +281,28 @@ int blk_sync_all(void)
     return err;
 }
 
+/* Re-read a disk's partition table, e.g. after an installer rewrote it. */
+int blk_rescan(struct blockdev *disk)
+{
+    if (disk->parent || disk->type != BLK_DISK)
+        return -EINVAL;
+    if (disk->fs)
+        return -EBUSY;
+    for (int i = 0; i < ndevices; i++)
+        if (devices[i]->parent == disk && devices[i]->fs)
+            return -EBUSY;
+    int r = blk_sync(disk);
+    if (r < 0)
+        return r;
+    drop_cache(disk);
+    /* Partitions that are gone stay registered, but empty. */
+    for (int i = 0; i < ndevices; i++)
+        if (devices[i]->parent == disk)
+            devices[i]->nsectors = 0;
+    blk_scan_partitions(disk);
+    return 0;
+}
+
 /* Forget clean cached sectors of a disk, e.g. after unmounting it. */
 void blk_invalidate(struct blockdev *bd)
 {
@@ -448,6 +470,14 @@ static int looks_like_vbr(const uint8_t *s)
            (!memcmp(s + 82, "FAT32", 5) || !memcmp(s + 54, "FAT", 3));
 }
 
+static struct blockdev *find_partition(struct blockdev *disk, const char *name)
+{
+    for (int i = 0; i < ndevices; i++)
+        if (devices[i]->parent == disk && !strcmp(devices[i]->name, name))
+            return devices[i];
+    return NULL;
+}
+
 void blk_scan_partitions(struct blockdev *disk)
 {
     if (disk->sector_size != 512 || disk->nsectors == 0)
@@ -466,10 +496,15 @@ void blk_scan_partitions(struct blockdev *disk)
             e[i].lba_start >= disk->nsectors ||
             e[i].sectors > disk->nsectors - e[i].lba_start)
             continue;
-        struct blockdev *part = kzalloc(sizeof(*part));
-        if (!part)
+        char name[16];
+        snprintf(name, sizeof(name), "%s%d", disk->name, i + 1);
+        /* A rescan updates existing partition devices in place: an open
+         * /dev node may still point at them. */
+        struct blockdev *part = find_partition(disk, name);
+        int is_new = !part;
+        if (is_new && !(part = kzalloc(sizeof(*part))))
             break;
-        snprintf(part->name, sizeof(part->name), "%s%d", disk->name, i + 1);
+        strlcpy(part->name, name, sizeof(part->name));
         snprintf(part->model, sizeof(part->model), "partition type 0x%02x", e[i].type);
         part->type = BLK_PART;
         part->sector_size = disk->sector_size;
@@ -479,7 +514,8 @@ void blk_scan_partitions(struct blockdev *disk)
         part->readonly = disk->readonly;
         part->read = disk->read;
         part->write = disk->write;
-        blk_register(part);
+        if (is_new)
+            blk_register(part);
         boot_ok("  %s: %u MiB, type 0x%02x", part->name, part->nsectors / 2048, e[i].type);
     }
     kfree(mbr);

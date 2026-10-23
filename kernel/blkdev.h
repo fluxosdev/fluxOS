@@ -55,6 +55,7 @@ void blk_invalidate(struct blockdev *bd);
 void blk_start_flusher(void);
 
 void blk_scan_partitions(struct blockdev *disk);
+int blk_rescan(struct blockdev *disk);
 void ata_init(void);
 
 #endif

@@ -20,6 +20,8 @@ int main(void)
     printf("%-8s %-5s %8s %-8s %-14s %s\n", "NAME", "TYPE", "SIZE", "FSTYPE", "MOUNTPOINT", "MODEL");
     struct blkinfo bi;
     for (int i = 0; blkinfo(i, &bi) == 0; i++) {
+        if (bi.type == BLK_PART && !bi.sectors)
+            continue;                   /* removed by a partition table rescan */
         char name[24], size[16];
         snprintf(name, sizeof(name), "%s%s", bi.type == BLK_PART ? "`-" : "", bi.name);
         if (bi.sectors)

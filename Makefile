@@ -3,6 +3,7 @@
 #   make            build the bootable ISO (fluxOS.iso)
 #   make run        boot the ISO in QEMU (serial console on stdio)
 #   make run-kernel boot the kernel directly with QEMU's multiboot loader
+#   make run-disk   boot fluxdisk.img alone (after installing onto it)
 #   make check      verify the kernel is a valid multiboot image
 #   make disk       create fluxdisk.img, a FAT32 data disk (kept by make clean)
 #   make clean      remove build artifacts
@@ -12,6 +13,8 @@ LD      ?= ld
 AR      ?= ar
 QEMU    ?= qemu-system-i386
 MKRESCUE ?= grub-mkrescue
+GRUB_MKIMAGE ?= grub-mkimage
+GRUB_PC_DIR ?= /usr/lib/grub/i386-pc
 
 BUILD   := build
 ISO     := fluxOS.iso
@@ -52,7 +55,7 @@ BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/fsh
 
 ROOTFS_FILES := $(shell find rootfs -type f 2>/dev/null)
 
-.PHONY: all iso kernel initrd disk run run-kernel check clean
+.PHONY: all iso kernel initrd disk run run-kernel run-disk check clean
 .SECONDARY:
 
 all: $(ISO)
@@ -106,6 +109,13 @@ $(ISO): $(KERNEL) $(INITRD) grub/grub.cfg
 	cp $(KERNEL) $(BUILD)/iso/boot/fluxos.kernel
 	cp $(INITRD) $(BUILD)/iso/boot/initrd.tar
 	cp grub/grub.cfg $(BUILD)/iso/boot/grub/grub.cfg
+	@# GRUB for hard disks, written to disk by /bin/fluxinstall: boot.img
+	@# goes in the MBR, core.img in the gap before the first partition and
+	@# reads its modules from /boot/grub on that FAT32 partition.
+	@mkdir -p $(BUILD)/iso/boot/install
+	$(GRUB_MKIMAGE) -O i386-pc -d $(GRUB_PC_DIR) -o $(BUILD)/iso/boot/install/core.img \
+		-p '(,msdos1)/boot/grub' biosdisk part_msdos fat
+	cp $(GRUB_PC_DIR)/boot.img $(BUILD)/iso/boot/install/boot.img
 	$(MKRESCUE) -o $@ $(BUILD)/iso
 
 check: $(KERNEL)
@@ -128,6 +138,10 @@ run: $(ISO) $(DISK)
 
 run-kernel: $(KERNEL) $(INITRD) $(DISK)
 	$(QEMU) -kernel $(KERNEL) -initrd $(INITRD) -m 128M -serial stdio $(QEMU_DISK)
+
+# Boot fluxdisk.img on its own, after "fluxinstall /dev/hda".
+run-disk: $(DISK)
+	$(QEMU) -m 128M -serial stdio -boot c $(QEMU_DISK)
 
 clean:
 	rm -rf $(BUILD) $(ISO)

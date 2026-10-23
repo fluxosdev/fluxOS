@@ -125,6 +125,7 @@ int main(int argc, char **argv)
     sec[21] = 0xF8;
     wr16(sec + 24, 63);
     wr16(sec + 26, 255);
+    wr32(sec + 28, bi.start);           /* hidden sectors: the partition offset */
     wr32(sec + 32, total);
     wr32(sec + 36, fatsz);
     wr32(sec + 44, 2);                  /* root directory cluster */

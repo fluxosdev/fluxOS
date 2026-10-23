@@ -14,5 +14,6 @@ int sched_yield(void);
 int msleep(unsigned int ms);
 int getmounts(char *buf, unsigned int size);
 int blkinfo(int index, struct blkinfo *bi);
+int blkrescan(const char *disk);         /* re-read the partition table */
 
 #endif

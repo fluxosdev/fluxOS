@@ -194,6 +194,7 @@ int mount(const char *source, const char *target, const char *type)
 }
 int umount(const char *target) { return ret(sc1(SYS_umount, (int)target)); }
 void sync(void) { sc0(SYS_sync); }
+int blkrescan(const char *disk) { return ret(sc1(SYS_blkrescan, (int)disk)); }
 int fsync(int fd) { return ret(sc1(SYS_fsync, fd)); }
 int statfs(const char *path, struct statfs *st) { return ret(sc2(SYS_statfs, (int)path, (int)st)); }
 int getmounts(char *buf, unsigned int size) { return ret(sc2(SYS_getmounts, (int)buf, (int)size)); }
