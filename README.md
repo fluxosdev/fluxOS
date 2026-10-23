@@ -39,11 +39,14 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   GRUB loads as a module. It has directories, files, `/dev/{tty,console,null,
   zero,random,urandom}`, pipes, `dup2`, `rename`, `chmod` and `getdents`.
 - Storage:
-  - An IDE driver for ATA hard disks (PIO, LBA28/LBA48, read/write) and ATAPI
-    CD/DVD drives (packet commands, media detection). It is interrupt driven:
-    a process waiting on the disk sleeps until IRQ14/15, so other processes
-    keep running. The `ata.poll` kernel option falls back to polling, for
-    hardware whose IDE interrupts don't arrive.
+  - An IDE driver for ATA hard disks (LBA28/LBA48, read/write) and ATAPI
+    CD/DVD drives (packet commands, media detection). Data moves by
+    bus-master DMA, up to 64 KiB per command, found through PCI. It is
+    interrupt driven: a process waiting on the disk sleeps until IRQ14/15,
+    so other processes keep running. If a DMA command fails, the driver
+    resets the channel and switches that drive to PIO, so no data is lost.
+  - IDE kernel options: `ata.nodma` forces PIO, and `ata.poll` polls instead
+    of using interrupts, for hardware whose IDE interrupts don't arrive.
   - Block devices `/dev/hda`..`/dev/hdd`, with MBR partitions as `/dev/hda1`
     and so on, behind a write-through sector cache.
 - Filesystems, mounted into the same VFS tree:
@@ -150,7 +153,7 @@ kernel/
   proc.c, exec.c           processes, scheduler, signals, ELF loader
   syscall.c                system call table and user-pointer validation
   vfs.c, file.c, initrd.c  VFS + ramfs, mounting, devices, open files, pipes, initrd
-  ata.c, blkdev.c          IDE ATA/ATAPI driver, block devices, partitions, cache
+  ata.c, blkdev.c, pci.c   IDE ATA/ATAPI driver (DMA), block devices, partitions, cache
   fat32.c, iso9660.c       filesystem drivers
   tty.c, vga.c, serial.c,  console stack
   keyboard.c, timer.c      PS/2 keyboard, PIT, RTC, power control
@@ -199,9 +202,15 @@ fluxOS supports a single CPU. The root filesystem lives in RAM; only what you
 write to a mounted FAT32 volume persists.
 
 Storage limits:
-- **Transfers use PIO, not DMA.** The CPU copies every sector, at most 128
-  sectors (64 KiB) per command. A process waiting on the disk sleeps, so other
-  processes keep running, but throughput is limited by PIO speed.
+- **DMA needs a PCI IDE controller with bus mastering.** The channel must be
+  in legacy mode (ports 0x1F0/0x170, IRQ 14/15), and the firmware must have
+  put the drive in a DMA mode: fluxOS does not set transfer modes or chipset
+  timings itself. Anything else uses PIO, which works everywhere but is
+  slower and has the CPU copy every sector. SATA controllers in AHCI mode
+  are not supported at all.
+- **Writes are slower than reads.** Each write command is followed by a
+  cache flush, so data is on the drive before the call returns. Under QEMU
+  that flush is a host `fsync`, which dominates copy times.
 - **Partitioning:** only MBR partition tables, with up to four primary
   partitions. GPT is not supported, and neither are extended or logical
   partitions. A FAT volume with no partition table (a "superfloppy") is

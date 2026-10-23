@@ -28,6 +28,18 @@ static inline uint16_t inw(uint16_t port)
     return v;
 }
 
+static inline void outl(uint16_t port, uint32_t v)
+{
+    __asm__ volatile("outl %0, %1" : : "a"(v), "Nd"(port) : "memory");
+}
+
+static inline uint32_t inl(uint16_t port)
+{
+    uint32_t v;
+    __asm__ volatile("inl %1, %0" : "=a"(v) : "Nd"(port) : "memory");
+    return v;
+}
+
 static inline void insw(uint16_t port, void *buf, uint32_t words)
 {
     __asm__ volatile("rep insw" : "+D"(buf), "+c"(words) : "d"(port) : "memory");
