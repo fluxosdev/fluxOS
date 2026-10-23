@@ -33,6 +33,7 @@ enum icon_id {
     ICON_INFO,
     ICON_README,
     ICON_WARNING,
+    ICON_COUNT,
 };
 
 struct window;
@@ -84,7 +85,8 @@ void wm_tick(void);             /* clock and timers; call a few times a second *
 unsigned int now_ms(void);
 
 /* ---- icons (icons.c) ---- */
-void draw_icon(struct surface *s, int x, int y, enum icon_id id, int size);   /* 16, 32, 64 */
+void draw_icon(struct surface *s, int x, int y, enum icon_id id, int size);   /* 16, 32, 48 */
+void draw_icon_selected(struct surface *s, int x, int y, enum icon_id id, int size);
 void draw_cursor(struct surface *s, int x, int y);
 #define CURSOR_W 12
 #define CURSOR_H 19

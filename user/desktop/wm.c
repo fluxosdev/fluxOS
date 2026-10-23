@@ -291,9 +291,10 @@ static void draw_desktop(void)
             continue;
         int sel = i == desk_selected;
         int ix = cell.x + (cell.w - 32) / 2, iy = cell.y + 2;
-        draw_icon(&screen, ix, iy, desk_icons[i].icon, 32);
         if (sel)
-            gfx_dither(&screen, ix, iy, 32, 32, C_NAVY);
+            draw_icon_selected(&screen, ix, iy, desk_icons[i].icon, 32);
+        else
+            draw_icon(&screen, ix, iy, desk_icons[i].icon, 32);
 
         int tw = gfx_text_width(&font_sans, desk_icons[i].label);
         struct rect lr = mkrect(cell.x + (cell.w - tw) / 2 - 2, iy + 32 + 3, tw + 4, font_sans.height + 1);

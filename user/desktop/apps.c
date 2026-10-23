@@ -360,7 +360,7 @@ void about_open(void)
         { AB_RELEASE, 32 }, { AB_VERSION, 50 }, { AB_CPU, 94 }, { AB_MEMORY, 112 },
         { AB_DISPLAY, 130 }, { AB_UPTIME, 174 }, { AB_PROCS, 192 },
     };
-    add(d, CT_ICON, 24, 30, 64, 64, NULL, ICON_COMPUTER);
+    add(d, CT_ICON, 32, 30, 48, 48, NULL, ICON_COMPUTER);
     add(d, CT_BOLD, 136, 14, 0, 0, "System:", 0);
     add(d, CT_BOLD, 136, 76, 0, 0, "Computer:", 0);
     add(d, CT_BOLD, 136, 156, 0, 0, "Status:", 0);

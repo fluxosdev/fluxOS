@@ -133,6 +133,44 @@ void gfx_blit(struct surface *dst, int x, int y, const struct surface *src,
                src->px + (sy + j) * src->stride + sx, (size_t)r.w * 4);
 }
 
+static uint32_t blend(uint32_t dst, uint32_t src, uint32_t a)
+{
+    uint32_t out = 0;
+    for (int shift = 0; shift < 24; shift += 8) {
+        uint32_t d = (dst >> shift) & 0xFF, c = (src >> shift) & 0xFF;
+        out |= ((c * a + d * (255 - a) + 127) / 255) << shift;
+    }
+    return out;
+}
+
+static void draw_image(struct surface *s, int x, int y, const struct image *img,
+                       int tinted, color_t tint)
+{
+    struct rect r = rect_intersect(mkrect(x, y, img->w, img->h), s->clip);
+    for (int j = r.y; j < r.y + r.h; j++) {
+        const uint32_t *src = img->px + (j - y) * img->w;
+        uint32_t *dst = s->px + j * s->stride;
+        for (int i = r.x; i < r.x + r.w; i++) {
+            uint32_t p = src[i - x], a = p >> 24;
+            if (!a)
+                continue;
+            if (tinted && a >= 128)
+                p = blend(p, tint, 128);
+            dst[i] = a == 255 ? p & 0xFFFFFF : blend(dst[i], p, a);
+        }
+    }
+}
+
+void gfx_image(struct surface *s, int x, int y, const struct image *img)
+{
+    draw_image(s, x, y, img, 0, 0);
+}
+
+void gfx_image_tint(struct surface *s, int x, int y, const struct image *img, color_t tint)
+{
+    draw_image(s, x, y, img, 1, tint);
+}
+
 static const struct pglyph *glyph(const struct pfont *f, char ch)
 {
     unsigned char c = (unsigned char)ch;

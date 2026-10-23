@@ -62,6 +62,18 @@ void gfx_invert_dither(struct surface *s, int x, int y, int w, int h);
 void gfx_blit(struct surface *dst, int x, int y, const struct surface *src,
               int sx, int sy, int w, int h);
 
+/* Images: 0xAARRGGBB pixels with straight (not premultiplied) alpha. */
+struct image {
+    int w, h;
+    uint32_t *px;
+};
+
+struct image *image_load_png(const char *path);     /* NULL if unreadable */
+void image_free(struct image *img);
+void gfx_image(struct surface *s, int x, int y, const struct image *img);
+/* Blend `tint` over the image's opaque half, like a selected Win95 icon. */
+void gfx_image_tint(struct surface *s, int x, int y, const struct image *img, color_t tint);
+
 /* Proportional UI text; y is the top of the line. Returns the end x. */
 int gfx_text(struct surface *s, const struct pfont *f, int x, int y, const char *str, color_t c);
 int gfx_text_n(struct surface *s, const struct pfont *f, int x, int y, const char *str,

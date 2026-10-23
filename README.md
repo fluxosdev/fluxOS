@@ -101,6 +101,12 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   along the bottom with a Start button, a button for each window and a clock,
   beveled window frames with caption buttons, and the Win95 system colors.
   UI text uses bitmap fonts rasterised from Liberation Sans.
+- Icons are PNG images from the public-domain [Tango icon
+  theme](https://commons.wikimedia.org/wiki/Tango_icons), in
+  `/usr/share/icons/tango/{16x16,32x32,48x48}`. The desktop has its own PNG
+  decoder (inflate included) and alpha-blends images, so any 8-bit,
+  non-interlaced PNG can be shown; a missing icon file falls back to a
+  simple built-in drawing.
 - Windows move by dragging an outline, minimize to the taskbar, raise and take
   the focus when clicked, and cascade as they open.
 - Terminal windows: 80x25 VGA-style terminals running fsh on a
@@ -212,6 +218,7 @@ include/flux/              kernel <-> user ABI (syscall numbers, structs, errno)
 lib/                       string and printf routines and the 8x16 font, shared
                            by kernel and libc
 tools/mkfont.py            regenerates the font sources (needs Python and PIL)
+tools/tango-icons.py       re-fetches and scales the Tango icons in rootfs/
 kernel/
   boot.S, entry.S          multiboot entry, ISR stubs, trap return, context switch
   gdt.c, idt.c             descriptor tables, PIC, trap dispatch
@@ -229,9 +236,11 @@ user/
   libc/, include/          the C library and its headers
   fsh/                     the shell: lexer, parser, expansion, executor, editor
   desktop/                 the desktop: compositor and window manager (wm.c),
-                           terminal emulator, dialogs, drawing, icons, fonts
+                           terminal emulator, dialogs, drawing, PNG decoding
+                           (png.c), icons, fonts
   bin/                     one program per file (fluxinstall.c is the installer)
-rootfs/                    files copied into the initrd (/etc, /home/flux)
+rootfs/                    files copied into the initrd (/etc, /home/flux,
+                           /usr/share/icons)
 ```
 
 ## Design notes

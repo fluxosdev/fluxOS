@@ -1,8 +1,13 @@
 /*
- * Icons, drawn with rectangles on a 32x32 design grid so the same code
- * makes every size, and the mouse pointer.
+ * Icons and the mouse pointer. Icons are PNG files from the Tango icon
+ * theme in /usr/share/icons/tango/<size>x<size>/, loaded the first time
+ * they are drawn. If a file is missing, a simple built-in icon drawn
+ * with rectangles on a 32x32 design grid takes its place.
  */
+#include <stdio.h>
 #include "desktop.h"
+
+#define ICON_DIR "/usr/share/icons/tango"
 
 #define PURPLE RGB(0x7B, 0x3F, 0xBF)
 #define ORANGE RGB(0xF0, 0x80, 0x20)
@@ -13,15 +18,11 @@
 static struct surface *S;
 static int X0, Y0, SIZE;
 
-/*
- * A rectangle in design units. Icons are 32, 64 or 16 pixels: a unit is
- * one pixel, two pixels or half a pixel.
- */
+/* A rectangle in design units: one pixel at 32 pixels, half a pixel at 16. */
 static void P(int x, int y, int w, int h, color_t c)
 {
-    if (SIZE >= 32) {
-        int k = SIZE / 32;
-        gfx_fill(S, X0 + x * k, Y0 + y * k, w * k, h * k, c);
+    if (SIZE == 32) {
+        gfx_fill(S, X0 + x, Y0 + y, w, h, c);
         return;
     }
     int x0 = x / 2, y0 = y / 2, x1 = (x + w + 1) / 2, y1 = (y + h + 1) / 2;
@@ -165,12 +166,53 @@ static void icon_flux(void)
     }
 }
 
-void draw_icon(struct surface *s, int x, int y, enum icon_id id, int size)
+static const char *const icon_names[ICON_COUNT] = {
+    [ICON_FLUX] = "start-here",
+    [ICON_COMPUTER] = "computer",
+    [ICON_TERMINAL] = "utilities-terminal",
+    [ICON_SHUTDOWN] = "system-shutdown",
+    [ICON_RUN] = "application-x-executable",
+    [ICON_INFO] = "dialog-information",
+    [ICON_README] = "text-x-generic",
+    [ICON_WARNING] = "dialog-warning",
+};
+
+static const int icon_sizes[] = { 16, 32, 48 };
+#define NSIZES ((int)(sizeof(icon_sizes) / sizeof(icon_sizes[0])))
+
+static struct {
+    struct image *img;
+    int tried;
+} cache[ICON_COUNT][NSIZES];
+
+static struct image *icon_image(enum icon_id id, int size)
+{
+    if (id <= ICON_NONE || id >= ICON_COUNT || !icon_names[id])
+        return NULL;
+    for (int k = 0; k < NSIZES; k++) {
+        if (icon_sizes[k] != size)
+            continue;
+        if (!cache[id][k].tried) {
+            char path[128];
+            snprintf(path, sizeof(path), ICON_DIR "/%dx%d/%s.png", size, size, icon_names[id]);
+            cache[id][k].img = image_load_png(path);
+            cache[id][k].tried = 1;
+        }
+        return cache[id][k].img;
+    }
+    return NULL;
+}
+
+static void draw_builtin(struct surface *s, int x, int y, enum icon_id id, int size)
 {
     S = s;
     X0 = x;
     Y0 = y;
-    SIZE = size;
+    SIZE = size == 16 ? 16 : 32;
+    if (size > 32) {                    /* larger sizes get the 32 pixel icon, centred */
+        X0 += (size - 32) / 2;
+        Y0 += (size - 32) / 2;
+    }
     switch (id) {
     case ICON_FLUX: icon_flux(); break;
     case ICON_COMPUTER: icon_computer(); break;
@@ -180,7 +222,27 @@ void draw_icon(struct surface *s, int x, int y, enum icon_id id, int size)
     case ICON_INFO: icon_info(); break;
     case ICON_README: icon_readme(); break;
     case ICON_WARNING: icon_warning(); break;
-    case ICON_NONE: break;
+    case ICON_NONE: case ICON_COUNT: break;
+    }
+}
+
+void draw_icon(struct surface *s, int x, int y, enum icon_id id, int size)
+{
+    struct image *img = icon_image(id, size);
+    if (img)
+        gfx_image(s, x, y, img);
+    else
+        draw_builtin(s, x, y, id, size);
+}
+
+void draw_icon_selected(struct surface *s, int x, int y, enum icon_id id, int size)
+{
+    struct image *img = icon_image(id, size);
+    if (img) {
+        gfx_image_tint(s, x, y, img, C_NAVY);
+    } else {
+        draw_builtin(s, x, y, id, size);
+        gfx_dither(s, x, y, size, size, C_NAVY);
     }
 }
 
