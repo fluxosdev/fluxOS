@@ -84,7 +84,9 @@ struct stat {
 #define MINOR(dev) ((dev) & 0xFF)
 #define MKDEV(ma, mi) (((ma) << 8) | (mi))
 #define TTY_MAJOR 4
+#define PTY_MAJOR 5             /* minor = 2 * index (+1 for the master) */
 #define IDE_MAJOR 3
+#define INPUT_MAJOR 13
 
 /* ---- directory entries (getdents) ---- */
 #define NAME_MAX 255
@@ -207,6 +209,69 @@ struct blkinfo {
 #define REBOOT_RESTART  1
 #define REBOOT_POWEROFF 2
 #define REBOOT_HALT     3
+
+/* ---- framebuffer (SYS_fbinfo, SYS_fbmap) ---- */
+struct fbinfo {
+    uint32_t width, height;
+    uint32_t pitch;             /* bytes per line */
+    uint32_t bpp;               /* 15, 16, 24 or 32 */
+    uint8_t  red_pos, red_size;
+    uint8_t  green_pos, green_size;
+    uint8_t  blue_pos, blue_size;
+    uint16_t reserved;
+};
+
+/* ---- input events, read from /dev/input ---- */
+#define IEV_KEY   1
+#define IEV_MOUSE 2
+
+#define IEV_PRESSED 0x1         /* key: pressed (else released) */
+#define IEV_ABS     0x2         /* mouse: x, y are a position in 0..32767 */
+
+#define KMOD_SHIFT 0x1
+#define KMOD_CTRL  0x2
+#define KMOD_ALT   0x4
+
+#define MOUSE_LEFT   0x1
+#define MOUSE_RIGHT  0x2
+#define MOUSE_MIDDLE 0x4
+
+/* Key codes are PS/2 set 1 scancodes; E0-prefixed keys get 0x80 added. */
+#define KEY_ESC   0x01
+#define KEY_TAB   0x0F
+#define KEY_ENTER 0x1C
+#define KEY_SPACE 0x39
+#define KEY_F4    0x3E
+#define KEY_UP    0xC8
+#define KEY_DOWN  0xD0
+#define KEY_LEFT  0xCB
+#define KEY_RIGHT 0xCD
+#define KEY_LWIN  0xDB
+#define KEY_RWIN  0xDC
+#define KEY_MENU  0xDD
+
+struct input_event {
+    uint8_t  type;              /* IEV_KEY or IEV_MOUSE */
+    uint8_t  flags;             /* IEV_PRESSED, IEV_ABS */
+    uint8_t  mods;              /* key: KMOD_*; mouse: MOUSE_* buttons held */
+    uint8_t  len;               /* key: bytes in text */
+    uint16_t code;              /* key: KEY_* code */
+    int16_t  x, y;              /* mouse: motion (y grows down) or position */
+    char     text[6];           /* key: what a terminal would receive */
+};
+
+/* ---- poll(2) ---- */
+#define POLLIN   0x01
+#define POLLOUT  0x04
+#define POLLERR  0x08
+#define POLLHUP  0x10
+#define POLLNVAL 0x20
+
+struct pollfd {
+    int32_t fd;
+    int16_t events;
+    int16_t revents;
+};
 
 /* timer frequency; SYS_uptime reports milliseconds */
 #define HZ 100

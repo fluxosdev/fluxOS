@@ -1,6 +1,8 @@
 /*
  * PS/2 keyboard driver (scancode set 1, US layout). Keys are translated
- * to bytes and VT100 escape sequences and fed into the tty.
+ * to bytes and VT100 escape sequences and fed into the console tty, or,
+ * while the desktop has /dev/input open, reported there as key events
+ * that carry the same bytes.
  */
 #include "kernel.h"
 #include "arch.h"
@@ -39,33 +41,51 @@ static const char keymap_shift[128] = {
 
 static int shift, ctrl, alt, caps, extended;
 
-static void send(const char *s)
+static int mods(void)
 {
-    while (*s)
-        tty_input(*s++);
+    return (shift ? KMOD_SHIFT : 0) | (ctrl ? KMOD_CTRL : 0) | (alt ? KMOD_ALT : 0);
 }
 
-static void extended_key(uint8_t sc)
+static void key_event(uint16_t code, int pressed, const char *text, int len)
+{
+    if (!input_grabbed()) {
+        for (int i = 0; i < len; i++)
+            tty_input(text[i]);
+        return;
+    }
+    struct input_event ev = { .type = IEV_KEY, .code = code };
+    ev.flags = pressed ? IEV_PRESSED : 0;
+    ev.mods = (uint8_t)mods();
+    ev.len = (uint8_t)len;
+    memcpy(ev.text, text, (uint32_t)len);
+    input_push(&ev);
+}
+
+static const char *extended_text(uint8_t sc)
 {
     switch (sc) {
-    case 0x48: send("\033[A"); break;   /* up */
-    case 0x50: send("\033[B"); break;   /* down */
-    case 0x4D: send("\033[C"); break;   /* right */
-    case 0x4B: send("\033[D"); break;   /* left */
-    case 0x47: send("\033[H"); break;   /* home */
-    case 0x4F: send("\033[F"); break;   /* end */
-    case 0x53: send("\033[3~"); break;  /* delete */
-    case 0x49: send("\033[5~"); break;  /* page up */
-    case 0x51: send("\033[6~"); break;  /* page down */
-    case 0x52: send("\033[2~"); break;  /* insert */
-    case 0x1C: tty_input('\n'); break;  /* keypad enter */
-    case 0x35: tty_input('/'); break;   /* keypad slash */
+    case 0x48: return "\033[A";        /* up */
+    case 0x50: return "\033[B";        /* down */
+    case 0x4D: return "\033[C";        /* right */
+    case 0x4B: return "\033[D";        /* left */
+    case 0x47: return "\033[H";        /* home */
+    case 0x4F: return "\033[F";        /* end */
+    case 0x53: return "\033[3~";       /* delete */
+    case 0x49: return "\033[5~";       /* page up */
+    case 0x51: return "\033[6~";       /* page down */
+    case 0x52: return "\033[2~";       /* insert */
+    case 0x1C: return "\n";            /* keypad enter */
+    case 0x35: return "/";              /* keypad slash */
     }
+    return "";
 }
 
 static void keyboard_irq(struct trapframe *tf)
 {
     (void)tf;
+    uint8_t st = inb(0x64);
+    if (!(st & 0x01) || (st & 0x20))
+        return;                         /* nothing, or mouse data (IRQ12) */
     uint8_t sc = inb(0x60);
 
     if (sc == 0xE0) {
@@ -78,17 +98,16 @@ static void keyboard_irq(struct trapframe *tf)
 
     if (extended) {
         extended = 0;
+        if (sc == SC_LSHIFT || sc == SC_RSHIFT)
+            return;                     /* fake shifts around nav keys */
         if (sc == SC_LCTRL)
             ctrl = !released;
         else if (sc == SC_LALT)
             alt = !released;
-        else if (sc == SC_LSHIFT || sc == SC_RSHIFT)
-            ;                           /* fake shifts around nav keys */
-        else if (!released) {
-            if (ctrl && alt && sc == SC_DEL)
-                machine_reboot();
-            extended_key(sc);
-        }
+        else if (!released && ctrl && alt && sc == SC_DEL)
+            machine_reboot();
+        const char *text = released ? "" : extended_text(sc);
+        key_event(0x80 | sc, !released, text, (int)strlen(text));
         return;
     }
 
@@ -96,12 +115,15 @@ static void keyboard_irq(struct trapframe *tf)
     case SC_LSHIFT:
     case SC_RSHIFT:
         shift = !released;
+        key_event(sc, !released, "", 0);
         return;
     case SC_LCTRL:
         ctrl = !released;
+        key_event(sc, !released, "", 0);
         return;
     case SC_LALT:
         alt = !released;
+        key_event(sc, !released, "", 0);
         return;
     case SC_CAPS:
         if (!released)
@@ -109,14 +131,18 @@ static void keyboard_irq(struct trapframe *tf)
         return;
     }
 
-    if (released)
+    if (released) {
+        key_event(sc, 0, "", 0);
         return;
+    }
     if (ctrl && alt && sc == SC_DEL)
         machine_reboot();
 
     char c = shift ? keymap_shift[sc] : keymap[sc];
-    if (!c)
+    if (!c) {
+        key_event(sc, 1, "", 0);        /* function keys and the like */
         return;
+    }
     if (caps && c >= 'a' && c <= 'z' && !shift)
         c = (char)(c - 'a' + 'A');
     else if (caps && c >= 'A' && c <= 'Z' && shift)
@@ -134,9 +160,12 @@ static void keyboard_irq(struct trapframe *tf)
         else if (c == ' ')
             c = 0;
     }
+    char text[2];
+    int len = 0;
     if (alt)
-        tty_input(0x1B);                /* meta sends an ESC prefix */
-    tty_input(c);
+        text[len++] = 0x1B;             /* meta sends an ESC prefix */
+    text[len++] = c;
+    key_event(sc, 1, text, len);
 }
 
 void keyboard_init(void)

@@ -1,0 +1,1105 @@
+/*
+ * Window manager and compositor: windows, the taskbar with its Start
+ * menu and clock, desktop icons, the mouse pointer, and input routing.
+ *
+ * Changes only record damaged rectangles; wm_flush() repaints each one
+ * from the bottom of the scene to the top into the back buffer and
+ * copies it to the framebuffer. Windows are moved by dragging an
+ * outline, as in Windows 95, so a drag only repaints the outline.
+ */
+#include <flux.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "desktop.h"
+
+#define MAX_DAMAGE   32
+#define DBLCLICK_MS  500
+#define OUTLINE      3          /* drag outline thickness */
+#define ICON_CELL_W  75
+#define ICON_CELL_H  70
+#define MENU_ITEM_H  36
+#define MENU_SEP_H   8
+#define BANNER_W     21
+
+struct surface screen;
+int screen_w, screen_h;
+
+static uint8_t *fb;
+static struct fbinfo fbi;
+static int fb_fast;                     /* 32 bpp with the 0xRRGGBB layout */
+
+static struct window *bottom;           /* z-order list, bottom to top */
+static struct window *focused;
+
+static struct rect damage[MAX_DAMAGE];
+static int ndamage;
+
+static int mx, my, mbuttons;
+
+enum drag {
+    DRAG_NONE,
+    DRAG_MOVE,                          /* caption: moving the outline */
+    DRAG_TITLE_BUTTON,                  /* holding a caption button */
+    DRAG_CLIENT,                        /* the client area has the mouse */
+    DRAG_TASK,                          /* holding a taskbar button */
+    DRAG_MENU,                          /* the Start menu is tracking */
+};
+static enum drag drag;
+static struct window *drag_win;
+static int drag_button;                 /* TB_* while DRAG_TITLE_BUTTON */
+static int drag_pressed;                /* the held button is drawn pushed */
+static int drag_dx, drag_dy;
+static struct rect outline;
+
+static int menu_open;
+static int menu_hover = -1;
+static int task_pressed_idx = -1;
+static char clock_text[16];
+
+/* ---- desktop icons and the Start menu ---- */
+
+static void open_terminal(void)
+{
+    terminal_open("Terminal", NULL, 0, 0);
+}
+
+static void open_readme(void)
+{
+    static const char *const argv[] = { "/bin/more", "/home/flux/README", NULL };
+    terminal_open("Read Me", argv, 0, 0);
+}
+
+struct desk_icon {
+    enum icon_id icon;
+    const char *label;
+    void (*open)(void);
+};
+
+static const struct desk_icon desk_icons[] = {
+    { ICON_COMPUTER, "My Computer", about_open },
+    { ICON_TERMINAL, "Terminal", open_terminal },
+    { ICON_README, "Read Me", open_readme },
+};
+#define NDESK ((int)(sizeof(desk_icons) / sizeof(desk_icons[0])))
+static int desk_selected = -1;
+static int last_click_icon = -1;
+static unsigned int last_click_ms;
+
+struct menu_item {
+    enum icon_id icon;
+    const char *label;                  /* NULL: separator */
+    void (*run)(void);
+};
+
+static const struct menu_item menu_items[] = {
+    { ICON_TERMINAL, "Terminal", open_terminal },
+    { ICON_README, "Read Me", open_readme },
+    { ICON_COMPUTER, "System Properties", about_open },
+    { ICON_RUN, "Run...", run_open },
+    { ICON_NONE, NULL, NULL },
+    { ICON_SHUTDOWN, "Shut Down...", shutdown_open },
+};
+#define NMENU ((int)(sizeof(menu_items) / sizeof(menu_items[0])))
+
+/* ---- time ---- */
+
+unsigned int now_ms(void)
+{
+    return uptime_ms();
+}
+
+static int update_clock(void)
+{
+    time_t t = time(NULL);
+    struct tm *tm = localtime(&t);
+    char buf[16];
+    int h = tm->tm_hour % 12;
+    snprintf(buf, sizeof(buf), "%d:%02d %s", h ? h : 12, tm->tm_min, tm->tm_hour < 12 ? "AM" : "PM");
+    if (!strcmp(buf, clock_text))
+        return 0;
+    strcpy(clock_text, buf);
+    return 1;
+}
+
+/* ---- geometry ---- */
+
+static struct rect taskbar_rect(void)
+{
+    return mkrect(0, screen_h - TASKBAR_H, screen_w, TASKBAR_H);
+}
+
+static struct rect start_button_rect(void)
+{
+    return mkrect(2, screen_h - TASKBAR_H + 4, 54, 22);
+}
+
+static struct rect tray_rect(void)
+{
+    int w = gfx_text_width(&font_sans, "88:88 PM") + 18;
+    return mkrect(screen_w - 2 - w, screen_h - TASKBAR_H + 4, w, 22);
+}
+
+/* Taskbar buttons are in creation order, which is kept in task_order. */
+static struct window *task_order[64];
+static int ntasks;
+
+static struct rect task_button_rect(int i)
+{
+    int x0 = 60, x1 = tray_rect().x - 4;
+    int n = ntasks ? ntasks : 1;
+    int w = (x1 - x0 - (n - 1) * 3) / n;
+    if (w > 160)
+        w = 160;
+    return mkrect(x0 + i * (w + 3), screen_h - TASKBAR_H + 4, w, 22);
+}
+
+static int menu_item_height(int i)
+{
+    return menu_items[i].label ? MENU_ITEM_H : MENU_SEP_H;
+}
+
+static struct rect menu_rect(void)
+{
+    int h = 6;
+    int tw = 0;
+    for (int i = 0; i < NMENU; i++) {
+        h += menu_item_height(i);
+        if (menu_items[i].label) {
+            int w = gfx_text_width(&font_sans, menu_items[i].label);
+            if (w > tw)
+                tw = w;
+        }
+    }
+    int w = 6 + BANNER_W + 4 + 32 + 10 + tw + 24;
+    return mkrect(2, screen_h - TASKBAR_H - h + 2, w, h);
+}
+
+static struct rect menu_item_rect(int idx)
+{
+    struct rect m = menu_rect();
+    int y = m.y + 3;
+    for (int i = 0; i < idx; i++)
+        y += menu_item_height(i);
+    return mkrect(m.x + 3 + BANNER_W, y, m.w - 6 - BANNER_W, menu_item_height(idx));
+}
+
+static struct rect desk_icon_rect(int i)
+{
+    return mkrect(4, 6 + i * ICON_CELL_H, ICON_CELL_W, ICON_CELL_H - 4);
+}
+
+static struct rect caption_rect(struct window *w)
+{
+    return mkrect(w->r.x + 3, w->r.y + 3, w->r.w - 6, TITLE_H);
+}
+
+struct rect wm_client_rect(struct window *w)
+{
+    return mkrect(w->r.x + BORDER, w->r.y + 3 + TITLE_H + 1, w->content.w, w->content.h);
+}
+
+/* Caption buttons from right to left: close, then maximize and minimize. */
+static int title_buttons(struct window *w, struct rect *rects, int *kinds)
+{
+    struct rect c = caption_rect(w);
+    int x = c.x + c.w - 2 - 16, y = c.y + 2, n = 0;
+    rects[n] = mkrect(x, y, 16, 14);
+    kinds[n++] = TB_CLOSE;
+    x -= 2;
+    if (w->flags & WF_MAXIMIZE) {
+        x -= 16;
+        rects[n] = mkrect(x, y, 16, 14);
+        kinds[n++] = TB_MAXIMIZE;
+    }
+    if (w->flags & WF_MINIMIZE) {
+        x -= 16;
+        rects[n] = mkrect(x, y, 16, 14);
+        kinds[n++] = TB_MINIMIZE;
+    }
+    return n;
+}
+
+/* ---- damage and presentation ---- */
+
+static int area(struct rect r)
+{
+    return r.w * r.h;
+}
+
+void wm_damage(struct rect r)
+{
+    r = rect_intersect(r, mkrect(0, 0, screen_w, screen_h));
+    if (rect_empty(r))
+        return;
+    for (int i = 0; i < ndamage; i++) {
+        struct rect u = rect_union(damage[i], r);
+        if (area(u) <= area(damage[i]) + area(r) + 4096) {
+            damage[i] = u;
+            return;
+        }
+    }
+    if (ndamage == MAX_DAMAGE) {
+        for (int i = 1; i < ndamage; i++)
+            damage[0] = rect_union(damage[0], damage[i]);
+        damage[0] = rect_union(damage[0], r);
+        ndamage = 1;
+        return;
+    }
+    damage[ndamage++] = r;
+}
+
+static void present(struct rect r)
+{
+    uint32_t bytespp = (fbi.bpp + 7) / 8;
+    for (int j = r.y; j < r.y + r.h; j++) {
+        const uint32_t *src = screen.px + j * screen.stride + r.x;
+        uint8_t *dst = fb + (uint32_t)j * fbi.pitch + (uint32_t)r.x * bytespp;
+        if (fb_fast) {
+            memcpy(dst, src, (size_t)r.w * 4);
+            continue;
+        }
+        for (int i = 0; i < r.w; i++, dst += bytespp) {
+            uint32_t c = src[i];
+            uint32_t v = (((c >> 16) & 0xFF) >> (8 - fbi.red_size)) << fbi.red_pos |
+                         (((c >> 8) & 0xFF) >> (8 - fbi.green_size)) << fbi.green_pos |
+                         ((c & 0xFF) >> (8 - fbi.blue_size)) << fbi.blue_pos;
+            if (bytespp == 4) {
+                *(uint32_t *)dst = v;
+            } else if (bytespp == 3) {
+                dst[0] = (uint8_t)v;
+                dst[1] = (uint8_t)(v >> 8);
+                dst[2] = (uint8_t)(v >> 16);
+            } else {
+                *(uint16_t *)dst = (uint16_t)v;
+            }
+        }
+    }
+}
+
+/* ---- drawing the scene ---- */
+
+static void draw_desktop(void)
+{
+    struct rect c = screen.clip;
+    gfx_fill(&screen, c.x, c.y, c.w, c.h, C_DESKTOP);
+
+    for (int i = 0; i < NDESK; i++) {
+        struct rect cell = desk_icon_rect(i);
+        if (!rect_overlaps(cell, c))
+            continue;
+        int sel = i == desk_selected;
+        int ix = cell.x + (cell.w - 32) / 2, iy = cell.y + 2;
+        draw_icon(&screen, ix, iy, desk_icons[i].icon, 32);
+        if (sel)
+            gfx_dither(&screen, ix, iy, 32, 32, C_NAVY);
+
+        int tw = gfx_text_width(&font_sans, desk_icons[i].label);
+        struct rect lr = mkrect(cell.x + (cell.w - tw) / 2 - 2, iy + 32 + 3, tw + 4, font_sans.height + 1);
+        if (sel)
+            gfx_fill(&screen, lr.x, lr.y, lr.w, lr.h, C_NAVY);
+        gfx_text(&screen, &font_sans, lr.x + 2, lr.y, desk_icons[i].label, C_WHITE);
+        if (sel && focused == NULL)
+            gfx_focus_rect(&screen, lr);
+    }
+}
+
+static void draw_window(struct window *w)
+{
+    struct rect r = w->r;
+    if (!rect_overlaps(r, screen.clip))
+        return;
+    struct rect cl = wm_client_rect(w);
+
+    /* Frame face around the client, then the bevel and caption. */
+    gfx_fill(&screen, r.x, r.y, r.w, cl.y - r.y, C_FACE);
+    gfx_fill(&screen, r.x, cl.y, cl.x - r.x, cl.h, C_FACE);
+    gfx_fill(&screen, cl.x + cl.w, cl.y, r.x + r.w - cl.x - cl.w, cl.h, C_FACE);
+    gfx_fill(&screen, r.x, cl.y + cl.h, r.w, r.y + r.h - cl.y - cl.h, C_FACE);
+    gfx_bevel(&screen, r, BEVEL_WINDOW);
+
+    struct rect cap = caption_rect(w);
+    int active = w == focused;
+    gfx_fill(&screen, cap.x, cap.y, cap.w, cap.h, active ? C_NAVY : C_SHADOW);
+    draw_icon(&screen, cap.x + 2, cap.y + 1, w->icon, 16);
+
+    struct rect br[3];
+    int kinds[3];
+    int nb = title_buttons(w, br, kinds);
+    char title[64];
+    int text_x = cap.x + 21;
+    gfx_ellipsize(&font_sans_bold, w->title, br[nb - 1].x - 4 - text_x, title, sizeof(title));
+    gfx_text(&screen, &font_sans_bold, text_x, cap.y + 2, title, active ? C_WHITE : C_FACE);
+
+    for (int i = 0; i < nb; i++) {
+        int pushed = drag == DRAG_TITLE_BUTTON && drag_win == w && drag_button == kinds[i] && drag_pressed;
+        draw_title_button(&screen, br[i], kinds[i], pushed, kinds[i] == TB_MAXIMIZE);
+    }
+
+    gfx_blit(&screen, cl.x, cl.y, &w->content, 0, 0, cl.w, cl.h);
+}
+
+static void draw_taskbar(void)
+{
+    struct rect tb = taskbar_rect();
+    if (!rect_overlaps(tb, screen.clip))
+        return;
+    gfx_fill(&screen, tb.x, tb.y, tb.w, tb.h, C_FACE);
+    gfx_hline(&screen, tb.x, tb.y, tb.w, C_LIGHT);
+    gfx_hline(&screen, tb.x, tb.y + 1, tb.w, C_WHITE);
+
+    struct rect sb = start_button_rect();
+    int down = menu_open;
+    gfx_bevel(&screen, sb, down ? BEVEL_PRESSED : BEVEL_RAISED);
+    draw_icon(&screen, sb.x + 4 + down, sb.y + 3 + down, ICON_FLUX, 16);
+    gfx_text(&screen, &font_sans_bold, sb.x + 22 + down, sb.y + 4 + down, "Start", C_BLACK);
+    if (down)
+        gfx_focus_rect(&screen, mkrect(sb.x + 3, sb.y + 3, sb.w - 6, sb.h - 6));
+
+    for (int i = 0; i < ntasks; i++) {
+        struct window *w = task_order[i];
+        struct rect b = task_button_rect(i);
+        int active = (w == focused && !w->minimized) || task_pressed_idx == i;
+        if (active) {
+            gfx_bevel(&screen, b, BEVEL_PRESSED);
+            if (task_pressed_idx != i)
+                gfx_dither(&screen, b.x + 2, b.y + 2, b.w - 4, b.h - 4, C_WHITE);
+        } else {
+            gfx_bevel(&screen, b, BEVEL_RAISED);
+        }
+        draw_icon(&screen, b.x + 4 + active, b.y + 3 + active, w->icon, 16);
+        char label[64];
+        const struct pfont *f = active ? &font_sans_bold : &font_sans;
+        gfx_ellipsize(f, w->title, b.w - 28, label, sizeof(label));
+        gfx_text(&screen, f, b.x + 23 + active, b.y + 4 + active, label, C_BLACK);
+    }
+
+    struct rect tr = tray_rect();
+    gfx_bevel(&screen, tr, BEVEL_THIN_SUNKEN);
+    int cw = gfx_text_width(&font_sans, clock_text);
+    gfx_text(&screen, &font_sans, tr.x + tr.w - 9 - cw, tr.y + 4, clock_text, C_BLACK);
+}
+
+static void draw_start_menu(void)
+{
+    struct rect m = menu_rect();
+    if (!rect_overlaps(m, screen.clip))
+        return;
+    gfx_fill(&screen, m.x, m.y, m.w, m.h, C_FACE);
+    gfx_bevel(&screen, m, BEVEL_WINDOW);
+
+    /* The banner down the left side, reading upwards. */
+    int bx = m.x + 3, by = m.y + 3, bh = m.h - 6;
+    gfx_fill(&screen, bx, by, BANNER_W, bh, C_SHADOW);
+    int y = by + bh - 5;
+    gfx_text_up(&screen, &font_banner, bx + 1, y, "flux", C_FACE);
+    gfx_text_up(&screen, &font_banner, bx + 1, y - gfx_text_width(&font_banner, "flux"),
+                "OS", C_WHITE);
+
+    for (int i = 0; i < NMENU; i++) {
+        struct rect r = menu_item_rect(i);
+        if (!menu_items[i].label) {
+            draw_separator(&screen, r.x + 1, r.y + 3, r.w - 2);
+            continue;
+        }
+        int hot = i == menu_hover;
+        if (hot)
+            gfx_fill(&screen, r.x, r.y, r.w, r.h, C_NAVY);
+        draw_icon(&screen, r.x + 4, r.y + 2, menu_items[i].icon, 32);
+        gfx_text(&screen, &font_sans, r.x + 4 + 32 + 10, r.y + (r.h - font_sans.height) / 2,
+                 menu_items[i].label, hot ? C_WHITE : C_BLACK);
+    }
+}
+
+static void draw_outline(void)
+{
+    struct rect o = outline;
+    gfx_invert_dither(&screen, o.x, o.y, o.w, OUTLINE);
+    gfx_invert_dither(&screen, o.x, o.y + o.h - OUTLINE, o.w, OUTLINE);
+    gfx_invert_dither(&screen, o.x, o.y + OUTLINE, OUTLINE, o.h - 2 * OUTLINE);
+    gfx_invert_dither(&screen, o.x + o.w - OUTLINE, o.y + OUTLINE, OUTLINE, o.h - 2 * OUTLINE);
+}
+
+static struct window *modal_window(void)
+{
+    for (struct window *w = bottom; w; w = w->above)
+        if ((w->flags & WF_MODAL) && !w->minimized)
+            return w;
+    return NULL;
+}
+
+static void compose(struct rect r)
+{
+    gfx_clip(&screen, r);
+    draw_desktop();
+    struct window *modal = modal_window();
+    for (struct window *w = bottom; w; w = w->above)
+        if (!w->minimized && w != modal)
+            draw_window(w);
+    draw_taskbar();
+    if (modal) {
+        gfx_dither(&screen, r.x, r.y, r.w, r.h, C_BLACK);
+        draw_window(modal);
+    }
+    if (menu_open)
+        draw_start_menu();
+    if (drag == DRAG_MOVE)
+        draw_outline();
+    draw_cursor(&screen, mx, my);
+    gfx_noclip(&screen);
+}
+
+void wm_flush(void)
+{
+    for (int i = 0; i < ndamage; i++) {
+        compose(damage[i]);
+        present(damage[i]);
+    }
+    ndamage = 0;
+}
+
+static void damage_outline(void)
+{
+    struct rect o = outline;
+    wm_damage(mkrect(o.x, o.y, o.w, OUTLINE));
+    wm_damage(mkrect(o.x, o.y + o.h - OUTLINE, o.w, OUTLINE));
+    wm_damage(mkrect(o.x, o.y, OUTLINE, o.h));
+    wm_damage(mkrect(o.x + o.w - OUTLINE, o.y, OUTLINE, o.h));
+}
+
+static void damage_taskbar(void)
+{
+    wm_damage(taskbar_rect());
+}
+
+/* ---- windows ---- */
+
+struct window *wm_create(const char *title, enum icon_id icon, int client_w, int client_h,
+                         int flags, const struct window_ops *ops, void *priv)
+{
+    struct window *w = calloc(1, sizeof(*w));
+    if (!w)
+        return NULL;
+    if (surface_init(&w->content, client_w, client_h) < 0) {
+        free(w);
+        return NULL;
+    }
+    gfx_fill(&w->content, 0, 0, client_w, client_h, C_FACE);
+    strncpy(w->title, title, sizeof(w->title) - 1);
+    w->icon = icon;
+    w->flags = flags;
+    w->ops = ops;
+    w->priv = priv;
+    w->r = mkrect(0, 0, client_w + 2 * BORDER, client_h + 3 + TITLE_H + 1 + BORDER);
+
+    struct window **pp = &bottom;
+    while (*pp)
+        pp = &(*pp)->above;
+    *pp = w;
+    if (!(flags & WF_NOTASK) && ntasks < (int)(sizeof(task_order) / sizeof(task_order[0])))
+        task_order[ntasks++] = w;
+    wm_cascade(w);
+    wm_focus(w);
+    damage_taskbar();
+    if (flags & WF_MODAL)
+        wm_damage(mkrect(0, 0, screen_w, screen_h));    /* dim everything */
+    return w;
+}
+
+static void unlink_window(struct window *w)
+{
+    for (struct window **pp = &bottom; *pp; pp = &(*pp)->above) {
+        if (*pp == w) {
+            *pp = w->above;
+            break;
+        }
+    }
+    w->above = NULL;
+}
+
+static struct window *topmost_visible(void)
+{
+    struct window *top = NULL;
+    for (struct window *w = bottom; w; w = w->above)
+        if (!w->minimized)
+            top = w;
+    return top;
+}
+
+void wm_destroy(struct window *w)
+{
+    wm_damage(w->flags & WF_MODAL ? mkrect(0, 0, screen_w, screen_h) : w->r);
+    unlink_window(w);
+    for (int i = 0; i < ntasks; i++) {
+        if (task_order[i] == w) {
+            memmove(&task_order[i], &task_order[i + 1], (size_t)(ntasks - i - 1) * sizeof(w));
+            ntasks--;
+            break;
+        }
+    }
+    if (drag_win == w) {
+        if (drag == DRAG_MOVE)
+            damage_outline();
+        drag = DRAG_NONE;
+        drag_win = NULL;
+    }
+    task_pressed_idx = -1;
+    if (focused == w) {
+        focused = NULL;
+        struct window *next = topmost_visible();
+        if (next)
+            wm_focus(next);
+    }
+    damage_taskbar();
+    if (w->ops && w->ops->destroy)
+        w->ops->destroy(w);
+    surface_free(&w->content);
+    free(w);
+}
+
+void wm_focus(struct window *w)
+{
+    struct window *old = focused;
+    if (w) {
+        w->minimized = 0;
+        if (w->above) {                 /* raise */
+            unlink_window(w);
+            struct window **pp = &bottom;
+            while (*pp)
+                pp = &(*pp)->above;
+            *pp = w;
+            wm_damage(w->r);
+        }
+    }
+    if (old == w)
+        return;
+    focused = w;
+    if (old) {
+        wm_damage(caption_rect(old));
+        if (old->ops && old->ops->focus)
+            old->ops->focus(old, 0);
+    }
+    if (w) {
+        wm_damage(w->r);
+        if (w->ops && w->ops->focus)
+            w->ops->focus(w, 1);
+    }
+    damage_taskbar();
+    if (desk_selected >= 0)
+        wm_damage(desk_icon_rect(desk_selected));
+}
+
+struct window *wm_focused(void)
+{
+    return focused;
+}
+
+static void minimize(struct window *w)
+{
+    w->minimized = 1;
+    wm_damage(w->r);
+    if (focused == w) {
+        focused = NULL;
+        if (w->ops && w->ops->focus)
+            w->ops->focus(w, 0);
+        struct window *next = topmost_visible();
+        if (next)
+            wm_focus(next);
+    }
+    damage_taskbar();
+}
+
+static void move_window(struct window *w, int x, int y)
+{
+    wm_damage(w->r);
+    w->r.x = x;
+    w->r.y = y;
+    wm_damage(w->r);
+}
+
+void wm_center(struct window *w)
+{
+    int x = (screen_w - w->r.w) / 2;
+    int y = (screen_h - TASKBAR_H - w->r.h) / 2;
+    move_window(w, x > 0 ? x : 0, y > 0 ? y : 0);
+}
+
+void wm_cascade(struct window *w)
+{
+    static int slot;
+    int x = 96 + (slot % 8) * 26, y = 24 + (slot % 8) * 26;
+    slot++;
+    if (x + w->r.w > screen_w)
+        x = screen_w - w->r.w > 0 ? screen_w - w->r.w : 0;
+    if (y + w->r.h > screen_h - TASKBAR_H)
+        y = screen_h - TASKBAR_H - w->r.h > 0 ? screen_h - TASKBAR_H - w->r.h : 0;
+    move_window(w, x, y);
+}
+
+void wm_set_title(struct window *w, const char *title)
+{
+    strncpy(w->title, title, sizeof(w->title) - 1);
+    wm_damage(caption_rect(w));
+    damage_taskbar();
+}
+
+void wm_damage_client(struct window *w, struct rect r)
+{
+    if (w->minimized)
+        return;
+    struct rect cl = wm_client_rect(w);
+    r.x += cl.x;
+    r.y += cl.y;
+    wm_damage(rect_intersect(r, cl));
+}
+
+int wm_window_count(void)
+{
+    int n = 0;
+    for (struct window *w = bottom; w; w = w->above)
+        n++;
+    return n;
+}
+
+static void close_window(struct window *w)
+{
+    if (w->ops && w->ops->close)
+        w->ops->close(w);
+    else
+        wm_destroy(w);
+}
+
+/* ---- the Start menu ---- */
+
+static void set_menu(int open)
+{
+    if (open == menu_open)
+        return;
+    struct rect m = menu_rect();
+    menu_open = open;
+    menu_hover = -1;
+    wm_damage(m);
+    wm_damage(start_button_rect());
+}
+
+static void menu_activate(int i)
+{
+    set_menu(0);
+    if (i >= 0 && i < NMENU && menu_items[i].run)
+        menu_items[i].run();
+}
+
+static int menu_hit(int x, int y)
+{
+    for (int i = 0; i < NMENU; i++)
+        if (menu_items[i].label && rect_contains(menu_item_rect(i), x, y))
+            return i;
+    return -1;
+}
+
+static void set_menu_hover(int i)
+{
+    if (i == menu_hover)
+        return;
+    if (menu_hover >= 0)
+        wm_damage(menu_item_rect(menu_hover));
+    menu_hover = i;
+    if (i >= 0)
+        wm_damage(menu_item_rect(i));
+}
+
+/* ---- mouse ---- */
+
+static struct window *window_at(int x, int y)
+{
+    struct window *hit = NULL;
+    struct window *modal = modal_window();
+    if (modal)
+        return rect_contains(modal->r, x, y) ? modal : NULL;
+    for (struct window *w = bottom; w; w = w->above)
+        if (!w->minimized && rect_contains(w->r, x, y))
+            hit = w;
+    return hit;
+}
+
+static void select_icon(int i)
+{
+    if (desk_selected >= 0)
+        wm_damage(desk_icon_rect(desk_selected));
+    desk_selected = i;
+    if (i >= 0)
+        wm_damage(desk_icon_rect(i));
+}
+
+static void client_mouse(struct window *w, int buttons, int changed)
+{
+    if (!w->ops || !w->ops->mouse)
+        return;
+    struct rect cl = wm_client_rect(w);
+    w->ops->mouse(w, mx - cl.x, my - cl.y, buttons, changed);
+}
+
+static void press_left(void)
+{
+    if (menu_open) {
+        struct rect m = menu_rect();
+        if (rect_contains(m, mx, my)) {
+            drag = DRAG_MENU;
+            set_menu_hover(menu_hit(mx, my));
+            return;
+        }
+        set_menu(0);
+        if (rect_contains(start_button_rect(), mx, my))
+            return;                     /* the click closed the menu */
+    }
+
+    struct window *modal = modal_window();
+    if (rect_contains(taskbar_rect(), mx, my) && !modal) {
+        if (rect_contains(start_button_rect(), mx, my)) {
+            set_menu(1);
+            drag = DRAG_MENU;
+            return;
+        }
+        for (int i = 0; i < ntasks; i++) {
+            if (rect_contains(task_button_rect(i), mx, my)) {
+                drag = DRAG_TASK;
+                task_pressed_idx = i;
+                damage_taskbar();
+                return;
+            }
+        }
+        return;
+    }
+
+    struct window *w = window_at(mx, my);
+    if (!w) {
+        if (modal)
+            return;
+        int hit = -1;
+        for (int i = 0; i < NDESK; i++) {
+            struct rect cell = desk_icon_rect(i);
+            struct rect icon = mkrect(cell.x + (cell.w - 32) / 2, cell.y + 2, 32, 32);
+            int tw = gfx_text_width(&font_sans, desk_icons[i].label);
+            struct rect label = mkrect(cell.x + (cell.w - tw) / 2 - 2, cell.y + 37, tw + 4, 15);
+            if (rect_contains(icon, mx, my) || rect_contains(label, mx, my))
+                hit = i;
+        }
+        if (focused)
+            wm_focus(NULL);
+        select_icon(hit);
+        unsigned int t = now_ms();
+        if (hit >= 0 && hit == last_click_icon && t - last_click_ms < DBLCLICK_MS) {
+            last_click_icon = -1;
+            desk_icons[hit].open();
+            return;
+        }
+        last_click_icon = hit;
+        last_click_ms = t;
+        return;
+    }
+
+    wm_focus(w);
+    struct rect br[3];
+    int kinds[3];
+    int nb = title_buttons(w, br, kinds);
+    for (int i = 0; i < nb; i++) {
+        if (rect_contains(br[i], mx, my)) {
+            drag = DRAG_TITLE_BUTTON;
+            drag_win = w;
+            drag_button = kinds[i];
+            drag_pressed = kinds[i] != TB_MAXIMIZE;
+            wm_damage(br[i]);
+            return;
+        }
+    }
+    if (rect_contains(caption_rect(w), mx, my)) {
+        drag = DRAG_MOVE;
+        drag_win = w;
+        drag_dx = mx - w->r.x;
+        drag_dy = my - w->r.y;
+        outline = w->r;
+        damage_outline();
+        return;
+    }
+    if (rect_contains(wm_client_rect(w), mx, my)) {
+        drag = DRAG_CLIENT;
+        drag_win = w;
+        client_mouse(w, mbuttons, MOUSE_LEFT);
+    }
+}
+
+static void drag_motion(void)
+{
+    switch (drag) {
+    case DRAG_MOVE: {
+        int x = mx - drag_dx, y = my - drag_dy;
+        /* Keep part of the caption on screen. */
+        if (y < 0)
+            y = 0;
+        if (y > screen_h - TASKBAR_H - 10)
+            y = screen_h - TASKBAR_H - 10;
+        if (x + outline.w < 40)
+            x = 40 - outline.w;
+        if (x > screen_w - 40)
+            x = screen_w - 40;
+        if (x != outline.x || y != outline.y) {
+            damage_outline();
+            outline.x = x;
+            outline.y = y;
+            damage_outline();
+        }
+        break;
+    }
+    case DRAG_TITLE_BUTTON: {
+        struct rect br[3];
+        int kinds[3];
+        int nb = title_buttons(drag_win, br, kinds);
+        for (int i = 0; i < nb; i++) {
+            if (kinds[i] != drag_button)
+                continue;
+            int over = rect_contains(br[i], mx, my) && drag_button != TB_MAXIMIZE;
+            if (over != drag_pressed) {
+                drag_pressed = over;
+                wm_damage(br[i]);
+            }
+        }
+        break;
+    }
+    case DRAG_CLIENT:
+        client_mouse(drag_win, mbuttons, 0);
+        break;
+    case DRAG_TASK: {
+        int idx = -1;
+        for (int i = 0; i < ntasks; i++)
+            if (rect_contains(task_button_rect(i), mx, my))
+                idx = i;
+        if (idx != task_pressed_idx) {
+            task_pressed_idx = idx;
+            damage_taskbar();
+        }
+        break;
+    }
+    case DRAG_MENU:
+        set_menu_hover(menu_hit(mx, my));
+        break;
+    case DRAG_NONE:
+        break;
+    }
+}
+
+static void release_left(void)
+{
+    enum drag d = drag;
+    struct window *w = drag_win;
+    drag = DRAG_NONE;
+    drag_win = NULL;
+
+    switch (d) {
+    case DRAG_MOVE:
+        damage_outline();
+        move_window(w, outline.x, outline.y);
+        break;
+    case DRAG_TITLE_BUTTON:
+        wm_damage(caption_rect(w));
+        if (!drag_pressed)
+            break;
+        drag_pressed = 0;
+        if (drag_button == TB_CLOSE)
+            close_window(w);
+        else if (drag_button == TB_MINIMIZE)
+            minimize(w);
+        break;
+    case DRAG_CLIENT:
+        client_mouse(w, mbuttons, MOUSE_LEFT);
+        break;
+    case DRAG_TASK: {
+        int i = task_pressed_idx;
+        task_pressed_idx = -1;
+        damage_taskbar();
+        if (i < 0 || i >= ntasks)
+            break;
+        struct window *t = task_order[i];
+        if (t == focused && !t->minimized)
+            minimize(t);
+        else
+            wm_focus(t);
+        break;
+    }
+    case DRAG_MENU: {
+        int i = menu_hit(mx, my);
+        if (i >= 0)
+            menu_activate(i);
+        else if (!rect_contains(start_button_rect(), mx, my) && !rect_contains(menu_rect(), mx, my))
+            set_menu(0);
+        break;
+    }
+    case DRAG_NONE:
+        break;
+    }
+}
+
+static void mouse_event(const struct input_event *ev)
+{
+    int ox = mx, oy = my;
+    if (ev->flags & IEV_ABS) {
+        mx = ev->x * screen_w / 32768;
+        my = ev->y * screen_h / 32768;
+    } else {
+        mx += ev->x;
+        my += ev->y;
+    }
+    if (mx < 0)
+        mx = 0;
+    if (my < 0)
+        my = 0;
+    if (mx >= screen_w)
+        mx = screen_w - 1;
+    if (my >= screen_h)
+        my = screen_h - 1;
+    if (mx != ox || my != oy) {
+        wm_damage(mkrect(ox, oy, CURSOR_W, CURSOR_H));
+        wm_damage(mkrect(mx, my, CURSOR_W, CURSOR_H));
+    }
+
+    int old = mbuttons;
+    mbuttons = ev->mods;
+    int pressed = mbuttons & ~old, released = old & ~mbuttons;
+
+    if (mx != ox || my != oy) {
+        if (drag != DRAG_NONE)
+            drag_motion();
+        else if (menu_open)
+            set_menu_hover(menu_hit(mx, my));
+    }
+    if (pressed & MOUSE_LEFT)
+        press_left();
+    if (released & MOUSE_LEFT)
+        release_left();
+}
+
+/* ---- keyboard ---- */
+
+static void focus_next(void)
+{
+    /* Alt+Tab: bring up the window that has been waiting longest. */
+    for (struct window *w = bottom; w; w = w->above) {
+        if (w != focused && !(w->flags & WF_NOTASK)) {
+            wm_focus(w);
+            return;
+        }
+    }
+}
+
+static int menu_step(int from, int dir)
+{
+    int i = from;
+    for (int n = 0; n < NMENU; n++) {
+        i = (i + dir + NMENU) % NMENU;
+        if (menu_items[i].label)
+            return i;
+    }
+    return from;
+}
+
+static void key_event(const struct input_event *ev)
+{
+    if (!(ev->flags & IEV_PRESSED))
+        return;
+    int code = ev->code;
+    int ctrl = ev->mods & KMOD_CTRL, alt = ev->mods & KMOD_ALT;
+
+    if (code == KEY_LWIN || code == KEY_RWIN || (ctrl && code == KEY_ESC)) {
+        if (!modal_window())
+            set_menu(!menu_open);
+        return;
+    }
+    if (menu_open) {
+        if (code == KEY_ESC)
+            set_menu(0);
+        else if (code == KEY_UP)
+            set_menu_hover(menu_step(menu_hover < 0 ? 0 : menu_hover, -1));
+        else if (code == KEY_DOWN)
+            set_menu_hover(menu_step(menu_hover < 0 ? NMENU - 1 : menu_hover, 1));
+        else if (code == KEY_ENTER && menu_hover >= 0)
+            menu_activate(menu_hover);
+        return;
+    }
+    if (alt && code == KEY_F4) {
+        if (focused)
+            close_window(focused);
+        else
+            shutdown_open();
+        return;
+    }
+    if (alt && code == KEY_TAB) {
+        if (!modal_window())
+            focus_next();
+        return;
+    }
+    if (focused && focused->ops && focused->ops->key)
+        focused->ops->key(focused, ev);
+    else if (!focused && desk_selected >= 0 && code == KEY_ENTER)
+        desk_icons[desk_selected].open();
+}
+
+void wm_input(const struct input_event *ev)
+{
+    if (ev->type == IEV_MOUSE)
+        mouse_event(ev);
+    else if (ev->type == IEV_KEY)
+        key_event(ev);
+}
+
+/* A message alone on a black screen, drawn at twice the 8x16 font's size. */
+void wm_splash(const char *message, color_t color)
+{
+    gfx_noclip(&screen);
+    gfx_fill(&screen, 0, 0, screen_w, screen_h, C_BLACK);
+    int len = (int)strlen(message);
+    int x0 = (screen_w - len * 16) / 2, y0 = (screen_h - 32) / 2;
+    struct surface glyph;
+    uint32_t px[8 * 16];
+    glyph.px = px;
+    glyph.w = 8;
+    glyph.h = 16;
+    glyph.stride = 8;
+    gfx_noclip(&glyph);
+    for (int k = 0; k < len; k++) {
+        gfx_glyph8x16(&glyph, 0, 0, (unsigned char)message[k], color, C_BLACK);
+        for (int j = 0; j < 32; j++)
+            for (int i = 0; i < 16; i++)
+                gfx_pixel(&screen, x0 + k * 16 + i, y0 + j, px[(j / 2) * 8 + i / 2]);
+    }
+    present(mkrect(0, 0, screen_w, screen_h));
+}
+
+void wm_tick(void)
+{
+    if (update_clock())
+        wm_damage(tray_rect());
+}
+
+void wm_init(void)
+{
+    if (fbinfo(&fbi) < 0) {
+        perror("desktop: no framebuffer");
+        exit(1);
+    }
+    fb = fbmap();
+    if (!fb) {
+        perror("desktop: cannot map the framebuffer");
+        exit(1);
+    }
+    screen_w = (int)fbi.width;
+    screen_h = (int)fbi.height;
+    fb_fast = fbi.bpp == 32 && fbi.red_pos == 16 && fbi.green_pos == 8 && fbi.blue_pos == 0;
+    if (surface_init(&screen, screen_w, screen_h) < 0) {
+        fprintf(stderr, "desktop: out of memory\n");
+        exit(1);
+    }
+    mx = screen_w / 2;
+    my = screen_h / 2;
+    update_clock();
+    wm_damage(mkrect(0, 0, screen_w, screen_h));
+}

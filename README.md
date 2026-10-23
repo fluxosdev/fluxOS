@@ -2,9 +2,9 @@
 
 fluxOS is a small 32-bit x86 Unix-like operating system with preemptive
 multitasking, ring-3 user processes, paging, a RAM root filesystem, IDE
-disk and CD-ROM drivers with FAT32 and ISO9660 support, and a
-zsh-flavoured shell called **fsh**. It boots with GRUB (Multiboot) from an ISO
-image.
+disk and CD-ROM drivers with FAT32 and ISO9660 support, a zsh-flavoured
+shell called **fsh**, and a Windows 95 style graphical desktop. It boots with
+GRUB (Multiboot) from an ISO image, straight into the desktop.
 
 ```
 flux@fluxOS ~ % spin A 3 & spin B 3 &
@@ -60,10 +60,19 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
     on 512-byte-sector disks.
   - Volumes are mounted at boot on `/mnt/cdrom` and `/mnt/hdX`, and with
     `mount`/`umount`, which refuses while files are in use.
-- Console: VGA text mode with an ANSI/VT100 escape interpreter, PS/2 keyboard
-  (arrows and modifiers map to escape sequences), and a mirrored COM1 serial
-  console. The tty line discipline supports canonical and raw modes, echo,
-  erase/kill/word-erase and EOF.
+- Console: a text console with an ANSI/VT100 escape interpreter, drawn on the
+  boot framebuffer with an 8x16 font (or in VGA text mode without one), PS/2
+  keyboard (arrows and modifiers map to escape sequences), and a mirrored COM1
+  serial console. The tty line discipline supports canonical and raw modes,
+  echo, erase/kill/word-erase and EOF.
+- Graphics and input: GRUB sets a 1024x768x32 mode, which the kernel maps and
+  lends to one process at a time (`fbinfo`, `fbmap`); the console takes the
+  screen back when that process exits. A PS/2 mouse driver, which uses the
+  VMware/QEMU "vmmouse" interface for absolute positioning when it is there,
+  and `/dev/input`, which delivers keyboard and mouse events to the desktop.
+- Pseudo-terminals (`openpty`) that share the console's line discipline, with
+  a controlling terminal per process, hangup (`SIGHUP`) when the master side
+  closes, and `poll` over terminals, pipes and devices.
 - Kernel log (`dmesg`), CMOS clock, reboot and ACPI power-off (QEMU, Bochs,
   VirtualBox).
 
@@ -87,7 +96,23 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
 - History expansion (`!! !$ !n !str`), aliases, `source`, `~/.fshrc`, and
   history saved in `~/.fsh_history`.
 
-**Userland** (`/bin`): basename cat chmod clear cp date df dirname dmesg echo
+**The desktop** (`/bin/desktop`), started by init at boot
+- Windows 95 look: a dark purple (`#3f175f`) desktop with icons, a taskbar
+  along the bottom with a Start button, a button for each window and a clock,
+  beveled window frames with caption buttons, and the Win95 system colors.
+  UI text uses bitmap fonts rasterised from Liberation Sans.
+- Windows move by dragging an outline, minimize to the taskbar, raise and take
+  the focus when clicked, and cascade as they open.
+- Terminal windows: 80x25 VGA-style terminals running fsh on a
+  pseudo-terminal, as many as you like. Closing one hangs up its shell.
+- Start menu: Terminal, Read Me, System Properties (version, memory, display,
+  uptime), Run... (runs a command in a new window), and Shut Down... (power
+  off, restart, or close the desktop and return to the text console).
+- Keys: the Windows key or Ctrl+Esc opens the Start menu, Alt+Tab switches
+  windows, Alt+F4 closes a window (or, with none focused, opens Shut Down).
+  Dialogs follow Tab, Enter, Escape and the arrow keys.
+
+**Userland** (`/bin`): basename cat chmod clear cp date desktop df dirname dmesg echo
 env fetch fluxinstall free fsh grep halt head hexdump init ls lsblk mkdir mkfs.fat more
 mount mv poweroff ps reboot rm rmdir seq sh sleep sort spin stat sync tail tee
 top touch tr umount uname uniq uptime wc yes, all on a small libc (stdio, malloc,
@@ -110,15 +135,18 @@ make            # builds build/fluxos.kernel, build/initrd.tar and fluxOS.iso
 make check      # verifies the kernel is a valid Multiboot image
 make disk       # creates fluxdisk.img, a 64 MiB FAT32 data disk (DISK_MB=...)
 make run        # boots the ISO in QEMU with fluxdisk.img as /dev/hda
-make run-kernel # boots the kernel directly with QEMU's Multiboot loader
+make run-kernel # boots the kernel directly with QEMU's Multiboot loader (text console)
 make run-disk   # boots fluxdisk.img alone, after installing fluxOS onto it
 make clean      # removes build/ and the ISO; fluxdisk.img is kept
 ```
 
 To boot real hardware or another VM, write `fluxOS.iso` to a USB stick or
-attach it as a CD-ROM. fluxOS uses VGA text mode, so boot in **legacy BIOS**
-mode. Under UEFI-only firmware GRUB starts the kernel, but nothing is visible
-except on the serial port.
+attach it as a CD-ROM, and boot in **legacy BIOS** mode; UEFI is untested.
+The default boot entry starts the desktop in a 1024x768 graphics mode. The
+second entry, **fluxOS (text console)**, boots in VGA text mode with the
+shell on the console, as does `make run-kernel`. In QEMU the mouse works
+without grabbing, through the vmmouse interface; elsewhere click into the VM
+window to capture the mouse.
 
 ## Installing to a hard disk
 
@@ -149,6 +177,10 @@ kernel and initrd, and its FAT32 partition is where files persist.
 
 ## Things to try
 
+On the desktop: double-click **My Computer**, drag windows by their title
+bars, open more terminals from the Start menu, try **Run...** with `ls -l /bin`,
+and open **Shut Down...** to see the screen dim. In a terminal:
+
 ```sh
 fetch                          # system summary
 spin A 5 & spin B 5 & top      # CPU-bound jobs sharing the CPU; ^C quits top
@@ -163,6 +195,7 @@ lsblk; df -h; mount            # disks, CD-ROM and mounted filesystems
 ls /mnt/cdrom/boot             # the boot CD itself, via ATAPI + ISO9660
 cp -r ~ /mnt/hda/home; ls -l /mnt/hda/home   # FAT32 writes survive reboots
 umount /mnt/hda; mkfs.fat -n MYDISK /dev/hda; mount /dev/hda /mnt/hda
+desktop                        # (from the text console) start the desktop
 poweroff
 ```
 
@@ -176,7 +209,9 @@ fluxdisk.img`.
 Makefile, linker.ld        build and kernel link script
 grub/grub.cfg              boot menu
 include/flux/              kernel <-> user ABI (syscall numbers, structs, errno)
-lib/                       string and printf routines shared by kernel and libc
+lib/                       string and printf routines and the 8x16 font, shared
+                           by kernel and libc
+tools/mkfont.py            regenerates the font sources (needs Python and PIL)
 kernel/
   boot.S, entry.S          multiboot entry, ISR stubs, trap return, context switch
   gdt.c, idt.c             descriptor tables, PIC, trap dispatch
@@ -186,12 +221,15 @@ kernel/
   vfs.c, file.c, initrd.c  VFS + ramfs, mounting, devices, open files, pipes, initrd
   ata.c, blkdev.c, pci.c   IDE ATA/ATAPI driver (DMA), block devices, partitions, cache
   fat32.c, iso9660.c       filesystem drivers
-  tty.c, vga.c, serial.c,  console stack
-  keyboard.c, timer.c      PS/2 keyboard, PIT, RTC, power control
+  tty.c, vga.c, serial.c,  console stack: terminals and ptys, text console,
+  keyboard.c, timer.c      serial port, PS/2 keyboard, PIT, RTC, power control
+  fb.c, mouse.c, input.c   framebuffer, PS/2 mouse and vmmouse, /dev/input
   kmain.c                  boot sequence
 user/
   libc/, include/          the C library and its headers
   fsh/                     the shell: lexer, parser, expansion, executor, editor
+  desktop/                 the desktop: compositor and window manager (wm.c),
+                           terminal emulator, dialogs, drawing, icons, fonts
   bin/                     one program per file (fluxinstall.c is the installer)
 rootfs/                    files copied into the initrd (/etc, /home/flux)
 ```
@@ -204,7 +242,9 @@ rootfs/                    files copied into the initrd (/etc, /home/flux)
 |-----------------------------|--------------------------------------------------|
 | `0x00000000 - 0x3FFFFFFF`   | kernel; identity map of the first GiB of RAM     |
 | `0x40000000 - ...`          | user program image, then the `sbrk` heap         |
+| `0xB0000000 - ...`          | the framebuffer, in the process that mapped it   |
 | `0xBF800000 - 0xBFFFFFFF`   | user stack (up to 8 MiB, grown on page faults)   |
+| `0xC0000000 - ...`          | kernel mappings of device memory (framebuffer)   |
 
 The kernel reaches page tables and user frames through the identity map, which
 is why physical memory is used only up to 1 GiB.
@@ -230,6 +270,23 @@ in LBA order, merging neighbours into multi-sector commands, then issues one
 FLUSH CACHE to the drive. `kflushd` is a kernel thread. It runs in ring 0
 with interrupts off like the rest of the kernel, so it can only be switched
 out while sleeping, and it ignores signals.
+
+**Graphics.** GRUB sets the video mode because the kernel's Multiboot header
+asks for one. The kernel maps the framebuffer above 3 GiB with 4 MiB pages,
+and its console draws there with an 8x16 font, redrawing only changed cells
+and moving pixels once per write however many lines scrolled. `fbmap` maps
+the same memory into the caller's address space with PTEs marked as device
+memory, which `fork` shares instead of copying and `exit` never frees.
+
+**The desktop** composes the screen in a back buffer. Every change records a
+damaged rectangle; once per pass through its event loop, the desktop repaints
+each one bottom to top (wallpaper and icons, windows, taskbar, menus, drag
+outline, pointer) and copies it to the framebuffer. Each window keeps its
+client area in its own buffer, so terminals only redraw cells that changed.
+One `poll` covers `/dev/input` and every terminal's pty master, with a timeout
+for the cursor blink and the clock. A terminal's shell runs on the pty slave;
+when its last program exits the master reports a hangup and the window
+closes.
 
 **System calls.** `int 0x80` with the number in `eax` and arguments in `ebx`,
 `ecx`, `edx`, `esi` and `edi`. Failures return `-errno`. Every user pointer is
@@ -271,6 +328,11 @@ Storage limits:
   mode, so the change is lost when the volume is unmounted.
 - **Names:** FAT names are limited to 255 UTF-8 bytes. FAT timestamps have
   2-second resolution.
+
+The desktop's terminals are a fixed 80x25 and keep no scrollback, windows
+cannot be resized, and there is no clipboard. While the desktop runs, the
+serial port's input goes to the unused console; its output still mirrors the
+kernel log.
 
 Permission bits are cosmetic apart from the exec bit, and there is a single
 user. Signals cannot have user handlers, and jobs

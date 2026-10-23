@@ -38,6 +38,7 @@ int cmdline_has(const char *option)
 void kmain(uint32_t magic, struct multiboot_info *mbi)
 {
     serial_init();
+    int have_fb = magic == MULTIBOOT_BOOT_MAGIC && fb_init(mbi);
     vga_init();
 
     for (uint32_t i = 0; i < ARRAY_SIZE(banner); i++)
@@ -70,7 +71,11 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     boot_ok("Physical memory: %u MiB usable, %u KiB free",
             pmm_total_kb() / 1024, pmm_free_kb());
     paging_init();
+    fb_map();
     boot_ok("Paging enabled (4 MiB kernel pages, 4 KiB user pages)");
+    if (have_fb)
+        boot_ok("Framebuffer: %ux%u, %u bits per pixel at %08x",
+                fb.width, fb.height, fb.bpp, fb.phys);
     heap_init();
     {
         uint32_t total, used;
@@ -85,6 +90,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     keyboard_init();
     serial_enable_irq();
     boot_ok("Keyboard and serial console ready");
+    mouse_init();
 
     vfs_init();
     if (initrd_start && initrd_end > initrd_start) {

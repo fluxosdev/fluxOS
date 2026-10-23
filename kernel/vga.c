@@ -1,18 +1,33 @@
 /*
- * 80x25 VGA text-mode console with a small ANSI/VT100 interpreter:
- * cursor movement (A B C D G H f), erase (J K), SGR colors (m),
+ * The kernel console: a text grid with a small ANSI/VT100 interpreter
+ * for cursor movement (A B C D G H f), erase (J K), SGR colors (m),
  * save/restore cursor (s u) and cursor visibility (?25l / ?25h).
+ *
+ * The grid lives in `cells` and is flushed after every write, either to
+ * 80x25 VGA text memory or, when the boot loader set a graphics mode,
+ * drawn with the 8x16 font on the framebuffer. Only cells that changed
+ * since the last flush are redrawn, and scrolling moves pixels once per
+ * flush however many lines scrolled.
  */
 #include "kernel.h"
 #include "drivers.h"
 #include "x86.h"
+#include <flux/font.h>
 
-#define VGA_W 80
-#define VGA_H 25
 #define VGA_MEM ((volatile uint16_t *)0xB8000)
+#define MAX_COLS 256
+#define MAX_ROWS 96
 #define MAX_PARAMS 8
+#define INVALID 0xFFFF                  /* never a real cell in drawn[] */
 
 enum { ST_NORMAL, ST_ESC, ST_CSI };
+
+static int cols = 80, rows = 25;
+static uint16_t cells[MAX_COLS * MAX_ROWS];
+static uint16_t drawn[MAX_COLS * MAX_ROWS];     /* what the screen shows */
+static int graphics;                    /* drawing on the framebuffer */
+static int pending_scroll;              /* lines scrolled since the last flush */
+static int cursor_at = -1;              /* cell with the drawn fb cursor */
 
 static int cx, cy, saved_x, saved_y;
 static int fg = 7, bg = 0, bold, reverse;
@@ -26,6 +41,13 @@ static int private_mode;
 
 /* ANSI color index -> VGA color index */
 static const uint8_t ansi_to_vga[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };
+
+/* The VGA text palette, for drawing on the framebuffer. */
+static const uint32_t vga_rgb[16] = {
+    0x000000, 0x0000AA, 0x00AA00, 0x00AAAA, 0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+    0x555555, 0x5555FF, 0x55FF55, 0x55FFFF, 0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF,
+};
+static uint32_t palette[16];            /* vga_rgb packed for the framebuffer */
 
 static void update_attr(void)
 {
@@ -48,37 +70,99 @@ static inline uint16_t cell(char c)
 static void clear_range(int from, int to)
 {
     for (int i = from; i < to; i++)
-        VGA_MEM[i] = cell(' ');
+        cells[i] = cell(' ');
 }
 
 static void scroll(void)
 {
-    for (int i = 0; i < VGA_W * (VGA_H - 1); i++)
-        VGA_MEM[i] = VGA_MEM[i + VGA_W];
-    clear_range(VGA_W * (VGA_H - 1), VGA_W * VGA_H);
+    memmove(cells, cells + cols, (uint32_t)(cols * (rows - 1)) * sizeof(cells[0]));
+    clear_range(cols * (rows - 1), cols * rows);
+    pending_scroll++;
 }
 
 static void newline(void)
 {
     cx = 0;
-    if (++cy >= VGA_H) {
+    if (++cy >= rows) {
         scroll();
-        cy = VGA_H - 1;
+        cy = rows - 1;
     }
 }
 
-static void update_cursor(void)
+static void draw_cell(int i)
 {
-    uint16_t pos = (uint16_t)(cy * VGA_W + cx);
+    uint16_t c = cells[i];
+    drawn[i] = c;
+    if (!graphics) {
+        VGA_MEM[i] = c;
+        return;
+    }
+    uint8_t a = (uint8_t)(c >> 8);
+    fb_glyph((uint32_t)(i % cols) * FONT_W, (uint32_t)(i / cols) * FONT_H,
+             font8x16_glyph((unsigned char)c), FONT_H, palette[a & 0x0F], palette[a >> 4]);
+}
+
+/* The framebuffer cursor is an underline in the cell's foreground color. */
+static void draw_fb_cursor(void)
+{
+    int i = cy * cols + cx;
+    if (cursor_at >= 0 && cursor_at != i)
+        draw_cell(cursor_at);
+    cursor_at = -1;
+    if (!cursor_visible)
+        return;
+    uint8_t a = (uint8_t)(cells[i] >> 8);
+    fb_fill((uint32_t)cx * FONT_W, (uint32_t)cy * FONT_H + FONT_H - 3, FONT_W, 2,
+            palette[a & 0x0F]);
+    drawn[i] = INVALID;                 /* redrawn when the cursor leaves */
+    cursor_at = i;
+}
+
+static void update_hw_cursor(void)
+{
+    uint16_t pos = (uint16_t)(cy * cols + cx);
     outb(0x3D4, 0x0F);
     outb(0x3D5, pos & 0xFF);
     outb(0x3D4, 0x0E);
     outb(0x3D5, (pos >> 8) & 0xFF);
 }
 
+static void flush(void)
+{
+    int n = cols * rows;
+    if (graphics && !fb_console_active()) {
+        pending_scroll = 0;             /* the desktop owns the screen */
+        return;
+    }
+    if (pending_scroll) {
+        int k = MIN(pending_scroll, rows);
+        pending_scroll = 0;
+        if (graphics && k < rows) {
+            fb_scroll(0, (uint32_t)rows * FONT_H, (uint32_t)k * FONT_H);
+            memmove(drawn, drawn + k * cols, (uint32_t)((rows - k) * cols) * sizeof(drawn[0]));
+            for (int i = (rows - k) * cols; i < n; i++)
+                drawn[i] = INVALID;
+            if (cursor_at >= 0)
+                cursor_at = cursor_at >= k * cols ? cursor_at - k * cols : -1;
+        } else {
+            for (int i = 0; i < n; i++)
+                drawn[i] = INVALID;
+        }
+    }
+    for (int i = 0; i < n; i++)
+        if (cells[i] != drawn[i])
+            draw_cell(i);
+    if (graphics)
+        draw_fb_cursor();
+    else
+        update_hw_cursor();
+}
+
 static void set_cursor_visible(int on)
 {
     cursor_visible = on;
+    if (graphics)
+        return;
     outb(0x3D4, 0x0A);
     outb(0x3D5, on ? 14 : 0x20);
     outb(0x3D4, 0x0B);
@@ -100,7 +184,7 @@ static void put_char(char c)
         return;
     case '\t':
         cx = (cx + 8) & ~7;
-        if (cx >= VGA_W)
+        if (cx >= cols)
             newline();
         return;
     case '\a':
@@ -108,8 +192,8 @@ static void put_char(char c)
     }
     if ((unsigned char)c < 32)
         return;
-    VGA_MEM[cy * VGA_W + cx] = cell(c);
-    if (++cx >= VGA_W)
+    cells[cy * cols + cx] = cell(c);
+    if (++cx >= cols)
         newline();
 }
 
@@ -156,35 +240,35 @@ static void csi_dispatch(char final)
     int n = param(0, 1);
     switch (final) {
     case 'A': cy = MAX(cy - n, 0); break;
-    case 'B': cy = MIN(cy + n, VGA_H - 1); break;
-    case 'C': cx = MIN(cx + n, VGA_W - 1); break;
+    case 'B': cy = MIN(cy + n, rows - 1); break;
+    case 'C': cx = MIN(cx + n, cols - 1); break;
     case 'D': cx = MAX(cx - n, 0); break;
-    case 'G': cx = MIN(n, VGA_W) - 1; break;
+    case 'G': cx = MIN(n, cols) - 1; break;
     case 'H':
     case 'f':
-        cy = MIN(param(0, 1), VGA_H) - 1;
-        cx = MIN(param(1, 1), VGA_W) - 1;
+        cy = MIN(param(0, 1), rows) - 1;
+        cx = MIN(param(1, 1), cols) - 1;
         break;
     case 'J': {
         int mode = nparams ? params[0] : 0;
-        int pos = cy * VGA_W + cx;
+        int pos = cy * cols + cx;
         if (mode == 0)
-            clear_range(pos, VGA_W * VGA_H);
+            clear_range(pos, cols * rows);
         else if (mode == 1)
             clear_range(0, pos + 1);
         else
-            clear_range(0, VGA_W * VGA_H);
+            clear_range(0, cols * rows);
         break;
     }
     case 'K': {
         int mode = nparams ? params[0] : 0;
-        int row = cy * VGA_W;
+        int row = cy * cols;
         if (mode == 0)
-            clear_range(row + cx, row + VGA_W);
+            clear_range(row + cx, row + cols);
         else if (mode == 1)
             clear_range(row, row + cx + 1);
         else
-            clear_range(row, row + VGA_W);
+            clear_range(row, row + cols);
         break;
     }
     case 'm':
@@ -252,20 +336,43 @@ void vga_write(const char *buf, uint32_t len)
 {
     for (uint32_t i = 0; i < len; i++)
         vga_putc(buf[i]);
-    update_cursor();
+    flush();
+}
+
+/* Repaint the whole console, after a process gave the framebuffer back. */
+void vga_redraw(void)
+{
+    if (!graphics)
+        return;
+    fb_fill(0, 0, fb.width, fb.height, palette[0]);
+    for (int i = 0; i < cols * rows; i++)
+        drawn[i] = INVALID;
+    cursor_at = -1;
+    flush();
 }
 
 void vga_init(void)
 {
-    /* Disable blinking so bright background colors are available. */
-    (void)inb(0x3DA);
-    outb(0x3C0, 0x30);
-    uint8_t mode = inb(0x3C1);
-    outb(0x3C0, mode & (uint8_t)~0x08);
+    if (fb.base) {
+        graphics = 1;
+        cols = MIN((int)(fb.width / FONT_W), MAX_COLS);
+        rows = MIN((int)(fb.height / FONT_H), MAX_ROWS);
+        for (int i = 0; i < 16; i++)
+            palette[i] = fb_pack(vga_rgb[i]);
+        fb_fill(0, 0, fb.width, fb.height, palette[0]);
+    } else {
+        /* Disable blinking so bright background colors are available. */
+        (void)inb(0x3DA);
+        outb(0x3C0, 0x30);
+        uint8_t mode = inb(0x3C1);
+        outb(0x3C0, mode & (uint8_t)~0x08);
+    }
 
     update_attr();
-    clear_range(0, VGA_W * VGA_H);
+    clear_range(0, cols * rows);
+    for (int i = 0; i < cols * rows; i++)
+        drawn[i] = INVALID;
     cx = cy = 0;
     set_cursor_visible(1);
-    update_cursor();
+    flush();
 }

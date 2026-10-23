@@ -34,6 +34,8 @@ static struct vnode *vnode_new(const char *name, int type)
 
 static void vnode_free(struct vnode *vn)
 {
+    if (vn->dev_release)
+        vn->dev_release(vn);
     if (vn->fs && vn->fs->ops->release)
         vn->fs->ops->release(vn);
     kfree(vn->data);
@@ -436,6 +438,19 @@ struct vnode *vfs_mknod(struct vnode *dir, const char *name, uint32_t rdev,
     vn->rdev = rdev;
     vn->dev_read = rd;
     vn->dev_write = wr;
+    return vn;
+}
+
+/* A device vnode outside the tree, freed when its last file is closed. */
+struct vnode *vfs_mknod_anon(uint32_t rdev, dev_read_t rd, dev_write_t wr)
+{
+    struct vnode *vn = vnode_new("", VN_CHR);
+    if (!vn)
+        return NULL;
+    vn->rdev = rdev;
+    vn->dev_read = rd;
+    vn->dev_write = wr;
+    vn->mode = 0620;
     return vn;
 }
 
@@ -857,18 +872,6 @@ static int dev_random_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n
     return (int)n;
 }
 
-static int dev_tty_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
-{
-    (void)vn; (void)off;
-    return tty_read(buf, n);
-}
-
-static int dev_tty_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n)
-{
-    (void)vn; (void)off;
-    return tty_write(buf, n);
-}
-
 void vfs_init(void)
 {
     vfs_root = vnode_new("", VN_DIR);
@@ -882,8 +885,11 @@ void vfs_init(void)
     vfs_create(vfs_root, "tmp", VN_DIR, &tmp);
     vfs_create(vfs_root, "mnt", VN_DIR, NULL);
     tmp->mode = 01777;
-    vfs_mknod(dev, "tty", MKDEV(TTY_MAJOR, 0), dev_tty_read, dev_tty_write);
-    vfs_mknod(dev, "console", MKDEV(TTY_MAJOR, 1), dev_tty_read, dev_tty_write);
+    struct vnode *tty = vfs_mknod(dev, "tty", MKDEV(TTY_MAJOR, 0), tty_dev_read, tty_dev_write);
+    struct vnode *con = vfs_mknod(dev, "console", MKDEV(TTY_MAJOR, 1), tty_dev_read, tty_dev_write);
+    tty->dev_poll = con->dev_poll = tty_dev_poll;
+    con->dev_priv = &console_tty;       /* /dev/tty is the controlling terminal */
+    input_register(dev);
     vfs_mknod(dev, "null", MKDEV(1, 3), dev_null_read, dev_null_write);
     vfs_mknod(dev, "zero", MKDEV(1, 5), dev_zero_read, dev_null_write);
     vfs_mknod(dev, "random", MKDEV(1, 8), dev_random_read, dev_null_write);

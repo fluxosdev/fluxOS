@@ -28,8 +28,8 @@ void *memmove(void *dst, const void *src, size_t n)
     if (d == s || n == 0)
         return dst;
     if (d < s) {
-        while (n--)
-            *d++ = *s++;
+        /* memcpy copies front to back, which is safe when moving down. */
+        memcpy(d, s, n);
     } else {
         d += n;
         s += n;

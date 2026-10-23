@@ -11,6 +11,8 @@ struct vnode;
 struct fs;
 typedef int (*dev_read_t)(struct vnode *vn, void *buf, uint32_t off, uint32_t n);
 typedef int (*dev_write_t)(struct vnode *vn, const void *buf, uint32_t off, uint32_t n);
+typedef int (*dev_poll_t)(struct vnode *vn);            /* POLL* events ready */
+typedef void (*dev_release_t)(struct vnode *vn);        /* last reference gone */
 
 struct vnode {
     char name[NAME_MAX + 1];
@@ -29,6 +31,8 @@ struct vnode {
     struct vnode *next;
     dev_read_t dev_read;
     dev_write_t dev_write;
+    dev_poll_t dev_poll;        /* NULL: always ready */
+    dev_release_t dev_release;  /* anonymous devices (ptys) */
     void *dev_priv;             /* device driver data */
     struct fs *fs;              /* NULL for ramfs and device nodes */
     void *fs_data;              /* filesystem-specific inode data */
@@ -61,6 +65,7 @@ int vfs_rmdir(const char *path, struct vnode *cwd);
 int vfs_rename(const char *from, const char *to, struct vnode *cwd);
 struct vnode *vfs_mknod(struct vnode *dir, const char *name, uint32_t rdev,
                         dev_read_t rd, dev_write_t wr);
+struct vnode *vfs_mknod_anon(uint32_t rdev, dev_read_t rd, dev_write_t wr);
 
 int vfs_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n);
 int vfs_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n);
@@ -95,6 +100,11 @@ void file_close(struct file *f);
 int file_read(struct file *f, void *buf, uint32_t n);
 int file_write(struct file *f, const void *buf, uint32_t n);
 int pipe_create(struct file **rd, struct file **wr);
+
+/* poll(2): which of events are ready on f; waiters are woken by poll_wakeup. */
+int file_poll(struct file *f, int events);
+void poll_wakeup(void);
+int do_poll(struct pollfd *fds, uint32_t nfds, int timeout_ms);
 
 /* boot-time root filesystem image (ustar) */
 void initrd_load(const uint8_t *data, uint32_t size);

@@ -177,6 +177,7 @@ void proc_spawn_init(const char *path)
     p->pgid = p->pid;
     p->cwd = vfs_root;
     vfs_ref(vfs_root);
+    p->ctty = &console_tty;
 
     struct vnode *tty;
     if (vfs_resolve("/dev/tty", NULL, &tty) == 0) {
@@ -192,7 +193,7 @@ void proc_spawn_init(const char *path)
         panic("cannot execute %s (error %d)", path, -r);
 
     init_proc = p;
-    tty_set_fg(p->pgid);
+    tty_set_fg(&console_tty, p->pgid);
     p->state = P_READY;
 }
 
@@ -239,6 +240,7 @@ int do_fork(void)
         child->fds[i] = file_dup(parent->fds[i]);
     child->cwd = parent->cwd;
     vfs_ref(child->cwd);
+    child->ctty = tty_hold(parent->ctty);
     child->heap_start = parent->heap_start;
     child->brk = parent->brk;
     child->stack_low = parent->stack_low;
@@ -263,6 +265,9 @@ void do_exit(int status)
     }
     vfs_unref(p->cwd);
     p->cwd = NULL;
+    tty_drop(p->ctty);
+    p->ctty = NULL;
+    fb_proc_exit(p->pid);
 
     if (p->pd != kernel_pd) {
         vmm_switch(kernel_pd);

@@ -23,6 +23,7 @@ enum {
 
 struct file;
 struct vnode;
+struct tty;
 
 struct proc {
     int pid, ppid, pgid;
@@ -40,6 +41,7 @@ struct proc {
     uint32_t sig_ignored;
     struct file *fds[MAX_FDS];
     struct vnode *cwd;
+    struct tty *ctty;           /* controlling terminal */
     uint32_t heap_start, brk;
     uint32_t stack_low;         /* lowest mapped stack page */
     uint32_t cpu_ticks;

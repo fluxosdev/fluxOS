@@ -5,7 +5,13 @@
 .set MB_MAGIC,    0x1BADB002
 .set MB_ALIGN,    1 << 0            /* page-align modules */
 .set MB_MEMINFO,  1 << 1            /* provide a memory map */
+.set MB_VIDEO,    1 << 2            /* set a graphics mode, report the framebuffer */
+/* QEMU's own multiboot loader (-kernel) refuses kernels that ask for video. */
+#ifdef MB_TEXT_ONLY
 .set MB_FLAGS,    MB_ALIGN | MB_MEMINFO
+#else
+.set MB_FLAGS,    MB_ALIGN | MB_MEMINFO | MB_VIDEO
+#endif
 .set MB_CHECKSUM, -(MB_MAGIC + MB_FLAGS)
 
 .section .multiboot, "a"
@@ -13,6 +19,9 @@
 .long MB_MAGIC
 .long MB_FLAGS
 .long MB_CHECKSUM
+.long 0, 0, 0, 0, 0                 /* address fields: unused for ELF kernels */
+.long 0                             /* linear graphics mode, preferably */
+.long 1024, 768, 32                 /* 1024x768, 32 bits per pixel */
 
 .section .bss
 .align 16

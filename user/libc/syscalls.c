@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <flux.h>
 #include <flux/syscall.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <sys/mount.h>
@@ -200,12 +201,31 @@ int statfs(const char *path, struct statfs *st) { return ret(sc2(SYS_statfs, (in
 int getmounts(char *buf, unsigned int size) { return ret(sc2(SYS_getmounts, (int)buf, (int)size)); }
 int blkinfo(int index, struct blkinfo *bi) { return ret(sc2(SYS_blkinfo, index, (int)bi)); }
 
+int poll(struct pollfd *fds, unsigned int nfds, int timeout_ms)
+{
+    return ret(sc3(SYS_poll, (int)fds, (int)nfds, timeout_ms));
+}
+
+int openpty(int fds[2]) { return ret(sc1(SYS_openpty, (int)fds)); }
+int fbinfo(struct fbinfo *fi) { return ret(sc1(SYS_fbinfo, (int)fi)); }
+
+void *fbmap(void)
+{
+    int r = sc0(SYS_fbmap);
+    if ((unsigned int)r >= (unsigned int)-4095) {
+        errno = -r;
+        return NULL;
+    }
+    return (void *)r;
+}
+
 int isatty(int fd)
 {
     struct stat st;
     if (fstat(fd, &st) < 0)
         return 0;
-    if (!S_ISCHR(st.st_mode) || MAJOR(st.st_rdev) != TTY_MAJOR) {
+    int pty_slave = MAJOR(st.st_rdev) == PTY_MAJOR && !(MINOR(st.st_rdev) & 1);
+    if (!S_ISCHR(st.st_mode) || (MAJOR(st.st_rdev) != TTY_MAJOR && !pty_slave)) {
         errno = ENOTTY;
         return 0;
     }

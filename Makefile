@@ -3,6 +3,7 @@
 #   make            build the bootable ISO (fluxOS.iso)
 #   make run        boot the ISO in QEMU (serial console on stdio)
 #   make run-kernel boot the kernel directly with QEMU's multiboot loader
+#                   (text console only: that loader cannot set a video mode)
 #   make run-disk   boot fluxdisk.img alone (after installing onto it)
 #   make check      verify the kernel is a valid multiboot image
 #   make disk       create fluxdisk.img, a FAT32 data disk (kept by make clean)
@@ -19,6 +20,7 @@ GRUB_PC_DIR ?= /usr/lib/grub/i386-pc
 BUILD   := build
 ISO     := fluxOS.iso
 KERNEL  := $(BUILD)/fluxos.kernel
+TEXT_KERNEL := $(BUILD)/fluxos-text.kernel
 INITRD  := $(BUILD)/initrd.tar
 ROOTFS  := $(BUILD)/rootfs
 DISK    := fluxdisk.img
@@ -40,18 +42,19 @@ USER_CFLAGS   := $(CFLAGS_COMMON) -Iinclude -Iuser/include
 LDFLAGS_COMMON := -m elf_i386 -nostdlib -z noexecstack --no-warn-rwx-segments
 
 # ---- kernel ----
-KERNEL_SRCS := kernel/boot.S kernel/entry.S $(wildcard kernel/*.c) lib/string.c lib/vsnprintf.c
+KERNEL_SRCS := kernel/boot.S kernel/entry.S $(wildcard kernel/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c
 KERNEL_OBJS := $(patsubst %,$(BUILD)/k/%.o,$(basename $(KERNEL_SRCS)))
 
 # ---- user space ----
-LIBC_SRCS := $(wildcard user/libc/*.c) lib/string.c lib/vsnprintf.c
+LIBC_SRCS := $(wildcard user/libc/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c
 LIBC_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(LIBC_SRCS)))
 CRT0      := $(BUILD)/u/user/libc/crt0.o
 LIBC      := $(BUILD)/libc.a
 
 PROGS     := $(basename $(notdir $(wildcard user/bin/*.c)))
 FSH_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/fsh/*.c)))
-BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/fsh
+DESKTOP_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/desktop/*.c)))
+BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/fsh $(ROOTFS)/bin/desktop
 
 ROOTFS_FILES := $(shell find rootfs -type f 2>/dev/null)
 
@@ -74,6 +77,16 @@ $(BUILD)/k/%.o: %.S
 $(KERNEL): $(KERNEL_OBJS) linker.ld
 	$(LD) $(LDFLAGS_COMMON) -T linker.ld -o $@ $(KERNEL_OBJS)
 
+# The same kernel without the Multiboot video request, for run-kernel.
+$(BUILD)/k/kernel/boot-text.o: kernel/boot.S
+	@mkdir -p $(dir $@)
+	$(CC) $(KERNEL_CFLAGS) -DMB_TEXT_ONLY -c $< -o $@
+
+TEXT_KERNEL_OBJS := $(BUILD)/k/kernel/boot-text.o $(filter-out $(BUILD)/k/kernel/boot.o,$(KERNEL_OBJS))
+
+$(TEXT_KERNEL): $(TEXT_KERNEL_OBJS) linker.ld
+	$(LD) $(LDFLAGS_COMMON) -T linker.ld -o $@ $(TEXT_KERNEL_OBJS)
+
 $(BUILD)/u/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
@@ -89,6 +102,10 @@ $(LIBC): $(LIBC_OBJS)
 $(ROOTFS)/bin/fsh: $(CRT0) $(FSH_OBJS) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(FSH_OBJS) $(LIBC)
+
+$(ROOTFS)/bin/desktop: $(CRT0) $(DESKTOP_OBJS) $(LIBC) user/user.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(DESKTOP_OBJS) $(LIBC)
 
 $(ROOTFS)/bin/%: $(BUILD)/u/user/bin/%.o $(CRT0) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
@@ -136,8 +153,8 @@ QEMU_DISK := -drive file=$(DISK),format=raw,if=ide,index=0
 run: $(ISO) $(DISK)
 	$(QEMU) -m 128M -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK)
 
-run-kernel: $(KERNEL) $(INITRD) $(DISK)
-	$(QEMU) -kernel $(KERNEL) -initrd $(INITRD) -m 128M -serial stdio $(QEMU_DISK)
+run-kernel: $(TEXT_KERNEL) $(INITRD) $(DISK)
+	$(QEMU) -kernel $(TEXT_KERNEL) -initrd $(INITRD) -m 128M -serial stdio $(QEMU_DISK)
 
 # Boot fluxdisk.img on its own, after "fluxinstall /dev/hda".
 run-disk: $(DISK)

@@ -135,6 +135,8 @@ static int sys_execve(uint32_t upath, uint32_t uargv, uint32_t uenvp, uint32_t d
         r = copy_vector(uenvp, envp, EXEC_MAX_ARGS, &cursor, &left);
     if (r >= 0)
         r = proc_exec(current, path, argv, envp);
+    if (r >= 0)
+        tty_exec_attach(current);
     kfree(argv);
     kfree(pool);
     return r < 0 ? r : 0;
@@ -179,7 +181,7 @@ static int sys_sbrk(uint32_t incr, uint32_t b, uint32_t c, uint32_t d, uint32_t 
     uint32_t nbrk = old + (uint32_t)delta;
 
     if (delta > 0) {
-        if (nbrk < old || nbrk > USER_STACK_LIMIT - PAGE_SIZE)
+        if (nbrk < old || nbrk > USER_MMIO_BASE)
             return -ENOMEM;
         for (uint32_t va = ALIGN_UP(old, PAGE_SIZE); va < nbrk; va += PAGE_SIZE) {
             if (vmm_alloc(p->pd, va) < 0) {
@@ -243,20 +245,20 @@ static int sys_getpgid(uint32_t pid, uint32_t b, uint32_t c, uint32_t d, uint32_
 static int sys_tcsetpgrp(uint32_t pgid, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)b; (void)c; (void)d; (void)e;
-    tty_set_fg((int)pgid);
+    tty_set_fg(tty_current(), (int)pgid);
     return 0;
 }
 
 static int sys_tcgetpgrp(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)a; (void)b; (void)c; (void)d; (void)e;
-    return tty_get_fg();
+    return tty_get_fg(tty_current());
 }
 
 static int sys_ttymode(uint32_t mode, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)b; (void)c; (void)d; (void)e;
-    return tty_set_mode((int)mode);
+    return tty_set_mode(tty_current(), (int)mode);
 }
 
 /* ---- files ---- */
@@ -408,6 +410,41 @@ static int sys_pipe(uint32_t ufds, uint32_t b, uint32_t c, uint32_t d, uint32_t 
     ((int *)ufds)[0] = fd0;
     ((int *)ufds)[1] = fd1;
     return 0;
+}
+
+static int sys_openpty(uint32_t ufds, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)b; (void)c; (void)d; (void)e;
+    if (user_check((void *)ufds, 2 * sizeof(int)) < 0)
+        return -EFAULT;
+    struct file *master, *slave;
+    int r = pty_create(&master, &slave);
+    if (r < 0)
+        return r;
+    int fd0 = alloc_fd(master);
+    int fd1 = fd0 >= 0 ? alloc_fd(slave) : -EMFILE;
+    if (fd1 < 0) {
+        if (fd0 >= 0)
+            current->fds[fd0] = NULL;
+        file_close(master);
+        file_close(slave);
+        return -EMFILE;
+    }
+    ((int *)ufds)[0] = fd0;
+    ((int *)ufds)[1] = fd1;
+    return 0;
+}
+
+#define POLL_MAX 64
+
+static int sys_poll(uint32_t ufds, uint32_t nfds, uint32_t timeout, uint32_t d, uint32_t e)
+{
+    (void)d; (void)e;
+    if (nfds > POLL_MAX)
+        return -EINVAL;
+    if (user_check((void *)ufds, nfds * sizeof(struct pollfd)) < 0)
+        return -EFAULT;
+    return do_poll((struct pollfd *)ufds, nfds, (int)timeout);
 }
 
 static int sys_lseek(uint32_t fd, uint32_t off, uint32_t whence, uint32_t d, uint32_t e)
@@ -725,6 +762,20 @@ static int sys_fsync(uint32_t fd, uint32_t b, uint32_t c, uint32_t d, uint32_t e
     return bd ? blk_sync(bd) : 0;
 }
 
+static int sys_fbinfo(uint32_t ubuf, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)b; (void)c; (void)d; (void)e;
+    if (user_check((void *)ubuf, sizeof(struct fbinfo)) < 0)
+        return -EFAULT;
+    return fb_get_info((struct fbinfo *)ubuf);
+}
+
+static int sys_fbmap(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)a; (void)b; (void)c; (void)d; (void)e;
+    return fb_map_user();
+}
+
 static int sys_reboot(uint32_t cmd, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)b; (void)c; (void)d; (void)e;
@@ -804,6 +855,10 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_sync] = sys_sync,
     [SYS_fsync] = sys_fsync,
     [SYS_blkrescan] = sys_blkrescan,
+    [SYS_fbinfo] = sys_fbinfo,
+    [SYS_fbmap] = sys_fbmap,
+    [SYS_openpty] = sys_openpty,
+    [SYS_poll] = sys_poll,
 };
 
 /* Calls that walk or change the VFS tree; read and write lock per chunk. */
