@@ -167,7 +167,7 @@ static void icon_flux(void)
 }
 
 static const char *const icon_names[ICON_COUNT] = {
-    [ICON_FLUX] = "start-here",
+    [ICON_FLUX] = "fluxos",
     [ICON_COMPUTER] = "computer",
     [ICON_TERMINAL] = "utilities-terminal",
     [ICON_SHUTDOWN] = "system-shutdown",

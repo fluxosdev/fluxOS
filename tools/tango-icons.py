@@ -18,7 +18,6 @@ from PIL import Image
 
 # Commons file name -> icon name in fluxOS (the freedesktop.org name)
 ICONS = {
-    "Start-here.svg": "start-here",
     "Computer.svg": "computer",
     "Utilities-terminal.svg": "utilities-terminal",
     "Text-x-generic.svg": "text-x-generic",
