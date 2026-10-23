@@ -199,12 +199,26 @@ fluxOS supports a single CPU. The root filesystem lives in RAM; only what you
 write to a mounted FAT32 volume persists.
 
 Storage limits:
-- Disks use PIO rather than DMA, so the CPU copies each sector itself; it
-  sleeps while the drive works, so other processes keep running.
-- Only MBR partitions are supported (no GPT), only FAT32 (no FAT12/16), and
-  ISO9660 without Joliet names.
-- Raw access to `/dev/hdX` is limited to the first 4 GiB.
-- FAT has no permission bits, so every file there appears as `rwxr-xr-x`.
+- **Transfers use PIO, not DMA.** The CPU copies every sector, at most 128
+  sectors (64 KiB) per command. A process waiting on the disk sleeps, so other
+  processes keep running, but throughput is limited by PIO speed.
+- **Partitioning:** only MBR partition tables, with up to four primary
+  partitions. GPT is not supported, and neither are extended or logical
+  partitions. A FAT volume with no partition table (a "superfloppy") is
+  also accepted.
+- **Filesystems:** FAT32 only, with no FAT12 or FAT16. ISO9660 has no Joliet
+  names. Without Rock Ridge, ISO names are shown in lower case with the `;1`
+  version suffix removed, and files show as read-only.
+- **Size limits:** raw access through `/dev/hdX` cannot go past 4 GiB, because
+  byte offsets are 32-bit. Directories are capped at 4 MiB (about 131,000
+  FAT entries, or the same size of ISO records); any entries past that are
+  silently ignored. File sizes are also 32-bit, so a file can't exceed 4 GiB.
+- **Permissions:** FAT and ISO9660 store no usable permission bits. FAT files
+  show as `rwxr-xr-x` (executable), or `r-xr-xr-x` when the read-only attribute
+  is set. `chmod` on those volumes only changes the in-memory
+  mode, so the change is lost when the volume is unmounted.
+- **Names:** FAT names are limited to 255 UTF-8 bytes. FAT timestamps have
+  2-second resolution.
 
 Permission bits are cosmetic apart from the exec bit, and there is a single
 user. Signals cannot have user handlers, and jobs
