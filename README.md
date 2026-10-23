@@ -19,9 +19,10 @@
 
 fluxOS is a small 32-bit x86 Unix-like operating system with preemptive
 multitasking, ring-3 user processes, paging, a RAM root filesystem, IDE
-disk and CD-ROM drivers with FAT32 and ISO9660 support, an NE2000 network
-driver with a TCP/IP stack, a zsh-flavoured shell called **fsh**, and a
-Windows 95 style graphical desktop with a web browser. It boots with
+disk, CD-ROM and floppy drivers with FAT12/16/32 and ISO9660 support, an
+NE2000 network driver with a TCP/IP stack, a zsh-flavoured shell called
+**fsh**, a Windows 95 style graphical desktop with a web browser, and a
+compatibility layer that runs DOS programs in the terminal. It boots with
 GRUB (Multiboot) from an ISO image, straight into the desktop.
 
 ```
@@ -65,23 +66,32 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
     resets the channel and switches that drive to PIO, so no data is lost.
   - IDE kernel options: `ata.nodma` forces PIO, and `ata.poll` polls instead
     of using interrupts, for hardware whose IDE interrupts don't arrive.
+  - A floppy driver for the PC floppy controller (82077AA and compatibles):
+    drives `/dev/fd0` and `/dev/fd1`, found through the CMOS, with ISA DMA
+    and IRQ 6. It reads whole tracks into a cache (a floppy turns slowly),
+    finds the disk's format (1.44M, 720K, 1.2M, 360K, or anything a FAT boot
+    sector describes) by trying data rates, notices write-protected and
+    changed disks, and turns the motor off after 3 seconds of quiet. A disk
+    in the drive at boot is mounted on `/mnt/fd0`.
   - Block devices `/dev/hda`..`/dev/hdd`, with MBR partitions as `/dev/hda1`
     and so on, behind a write-back sector cache. Metadata writes stay in
     memory and are written out in sorted, merged runs by the `kflushd`
     kernel thread every 5 seconds, by `sync`/`fsync`, on `umount`, and
     before `reboot`/`poweroff`.
 - Filesystems, mounted into the same VFS tree:
-  - **FAT32**, read/write: VFAT long file names with `~N` short aliases,
-    case-insensitive lookup, directories that grow, all FAT copies kept in
-    sync, and FSInfo free counts. Programs can run straight from FAT.
+  - **FAT12, FAT16 and FAT32**, read/write: VFAT long file names with `~N`
+    short aliases, case-insensitive lookup, directories that grow (except a
+    FAT12/16 root, which has a fixed size), all FAT copies kept in sync, and
+    FSInfo free counts. Programs can run straight from FAT. `mkfs.fat`
+    formats floppies as FAT12 in the standard DOS layouts.
   - **ISO9660**, read-only: Rock Ridge names, modes and timestamps, on CDs or
     on 512-byte-sector disks.
-  - Volumes are mounted at boot on `/mnt/cdrom` and `/mnt/hdX`, and with
-    `mount`/`umount`, which refuses while files are in use.
+  - Volumes are mounted at boot on `/mnt/cdrom`, `/mnt/hdX` and `/mnt/fd0`,
+    and with `mount`/`umount`, which refuses while files are in use.
 - Console: a text console with an ANSI/VT100 escape interpreter, drawn on the
-  boot framebuffer with an 8x16 font (or in VGA text mode without one), PS/2
-  keyboard (arrows and modifiers map to escape sequences), and a mirrored COM1
-  serial console. The tty line discipline supports canonical and raw modes,
+  boot framebuffer with an 8x16 font of the PC's code page 437 (or in VGA text
+  mode without one), PS/2 keyboard (arrows, function keys and modifiers map to
+  xterm escape sequences), and a mirrored COM1 serial console. The tty line discipline supports canonical and raw modes,
   echo, erase/kill/word-erase and EOF.
 - Graphics and input: GRUB sets a 1024x768x32 mode, which the kernel maps and
   lends to one process at a time (`fbinfo`, `fbmap`); the console takes the
@@ -224,7 +234,38 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   windows, Alt+F4 closes a window (or, with none focused, opens Shut Down).
   Dialogs follow Tab, Enter, Escape and the arrow keys.
 
-**Userland** (`/bin`): basename cat chmod clear cp date desktop df dirname dmesg echo
+**DOS programs** (`/bin/dos`)
+- `.COM` and MZ `.EXE` files run in the terminal: type `./GAME.EXE` (the
+  kernel hands DOS programs to `/bin/dos`), `dos game` (the extension and case
+  may be left out), or double-click one in the file manager.
+- `dos` emulates a PC in user space: an x86 CPU in real mode (the 8086 with the
+  186, 286 and 386 additions usable in real mode, 32-bit registers included;
+  no FPU, which programs detect as on a PC without one), 640 KiB of
+  conventional memory, a BIOS (text video, keyboard, timer, clock, equipment)
+  and DOS 5: files and directories by handle and by FCB, memory blocks, EXEC
+  of child programs, the environment, Ctrl-C, country information, and the
+  usual undocumented structures (List of Lists, InDOS, MCB chain). Interrupt
+  vectors point into an emulated ROM, so programs can hook and chain them, and
+  the timer (IRQ 0, 18.2 Hz or as reprogrammed through the PIT) and keyboard
+  (IRQ 1, port 60h) interrupts reach programs that install handlers.
+- Drives: `C:` is the fluxOS root, `A:` and `B:` are `/mnt/fd0` and `/mnt/fd1`
+  (a floppy is mounted the first time a program looks at the drive) and `D:`
+  is `/mnt/cdrom`. Names are matched case-insensitively; directory listings
+  show the names that fit in 8.3. DOS standard handles are fluxOS's
+  descriptors 0-2, so `dos PROG > out.txt` and pipes work.
+- Screen: a program that only prints behaves like a fluxOS program, and its
+  output scrolls in the terminal. As soon as it uses the screen (writes text
+  video memory, moves the cursor, scrolls a window, sets a video mode), the
+  terminal shows its 80x25 text screen, colours and box drawing included,
+  redrawn as it changes. Console output understands ANSI.SYS escapes.
+- Keys: arrows, Home/End, PgUp/PgDn, Insert/Delete, F1-F12 and Alt+letter
+  arrive as PC scan codes. **Ctrl+\** stops the emulator at any time.
+- EXEC of a fluxOS program runs it as a real process, and `COMMAND.COM`
+  runs the fluxOS shell (`COMMAND /C cmd` runs `sh -c cmd`), so a DOS
+  program's "shell out" feature works. `dos -l FILE` (or `DOSLOG=FILE`) logs
+  what the emulator does not support, for diagnosing a program that fails.
+
+**Userland** (`/bin`): basename cat chmod clear cp date desktop df dirname dmesg dos echo
 env fetch fluxinstall free fsh grep halt head hexdump host ifconfig init ls lsblk
 mkdir mkfs.fat more mount mv nc ping poweroff ps reboot rm rmdir seq sh sleep sort
 spin stat sync tail tee top touch tr umount uname uniq uptime wc wget yes, all on a
@@ -255,10 +296,12 @@ libgcc or the host libc.
 make            # builds build/fluxos.kernel, build/initrd.tar and fluxOS.iso
 make check      # verifies the kernel is a valid Multiboot image
 make disk       # creates fluxdisk.img, a 64 MiB FAT32 data disk (DISK_MB=...)
-make run        # boots the ISO in QEMU with fluxdisk.img as /dev/hda and an NE2000
+make floppy     # creates fluxfloppy.img, a 1.44 MB FAT12 floppy for drive A:
+make run        # boots the ISO in QEMU with fluxdisk.img as /dev/hda (and
+                # fluxfloppy.img as /dev/fd0, if it exists) and an NE2000
 make run-kernel # boots the kernel directly with QEMU's Multiboot loader (text console)
 make run-disk   # boots fluxdisk.img alone, after installing fluxOS onto it
-make clean      # removes build/ and the ISO; fluxdisk.img is kept
+make clean      # removes build/ and the ISO; the disk images are kept
 ```
 
 The QEMU targets give the machine an NE2000 card on QEMU's user-mode
@@ -330,13 +373,17 @@ ifconfig; ping -c 3 10.0.2.2   # the network card, and QEMU's gateway
 host example.com               # DNS
 wget -O - http://example.com/  # HTTP over the TCP stack
 nc -l 7777 &  echo hi | nc localhost 7777    # a TCP server and client
+ls /mnt/fd0; df -h /mnt/fd0     # the floppy (make floppy, then make run)
+cp /mnt/fd0/GAME.EXE ~; ./GAME.EXE   # a DOS program, in the terminal
+dos edit                       # finds EDIT.COM or EDIT.EXE in this directory
 desktop                        # (from the text console) start the desktop
 poweroff
 ```
 
-Files written to `/mnt/hda` live in `fluxdisk.img`. On a Linux host you can
-inspect the image with `mdir -i fluxdisk.img ::` (mtools) or `fsck.fat -n
-fluxdisk.img`.
+Files written to `/mnt/hda` live in `fluxdisk.img`, and those on `/mnt/fd0`
+in `fluxfloppy.img`. On a Linux host you can inspect the images with `mdir -i
+fluxdisk.img ::` (mtools) or `fsck.fat -n fluxdisk.img`, and put DOS programs
+on the floppy with `mcopy -i fluxfloppy.img GAME.EXE ::`.
 
 ## Layout
 
@@ -344,8 +391,8 @@ fluxdisk.img`.
 Makefile, linker.ld        build and kernel link script
 grub/grub.cfg              boot menu
 include/flux/              kernel <-> user ABI (syscall numbers, structs, errno)
-lib/                       string and printf routines and the 8x16 font, shared
-                           by kernel and libc
+lib/                       string and printf routines and the 8x16 font (code
+                           page 437), shared by kernel and libc
 tools/mkfont.py            regenerates the fonts, including the browser's
                            rootfs/usr/share/fonts/web.fnt (needs Python and PIL)
 tools/tango-icons.py       re-fetches and scales the Tango icons in rootfs/
@@ -357,7 +404,8 @@ kernel/
   syscall.c                system call table and user-pointer validation
   vfs.c, file.c, initrd.c  VFS + ramfs, mounting, devices, open files, pipes, initrd
   ata.c, blkdev.c, pci.c   IDE ATA/ATAPI driver (DMA), block devices, partitions, cache
-  fat32.c, iso9660.c       filesystem drivers
+  floppy.c                 floppy disk controller driver (ISA DMA, track cache)
+  fat32.c, iso9660.c       filesystem drivers (FAT12/16/32, ISO9660)
   tty.c, vga.c, serial.c,  console stack: terminals and ptys, text console,
   keyboard.c, timer.c      serial port, PS/2 keyboard, PIT, RTC, power control
   fb.c, mouse.c, input.c   framebuffer, PS/2 mouse and vmmouse, /dev/input
@@ -377,6 +425,11 @@ user/
                            and the web browser: its window (browser.c), HTML
                            parser (html.c), CSS (css.c), layout and painting
                            (layout.c), fonts (webfont.c) and URLs (webutil.c)
+  dos/                     the DOS emulator: the x86 real-mode CPU (cpu.c), ROM,
+                           interrupt controller, timer and BIOS services
+                           (bios.c), keyboard (keyboard.c), text screen and
+                           INT 10h (video.c), DOS processes, memory and console
+                           (dos.c), and files, paths and FCBs (files.c)
   bin/                     one program per file (fluxinstall.c is the installer)
 rootfs/                    files copied into the initrd (/etc, /home/flux,
                            /usr/share/icons, the browser's fonts and its
@@ -466,7 +519,7 @@ touches it.
 ## Limitations
 
 fluxOS supports a single CPU. The root filesystem lives in RAM; only what you
-write to a mounted FAT32 volume persists.
+write to a mounted FAT volume persists.
 
 Storage limits:
 - **DMA needs a PCI IDE controller with bus mastering.** The channel must be
@@ -485,7 +538,7 @@ Storage limits:
   partitions. GPT is not supported, and neither are extended or logical
   partitions. A FAT volume with no partition table (a "superfloppy") is
   also accepted.
-- **Filesystems:** FAT32 only, with no FAT12 or FAT16. ISO9660 has no Joliet
+- **Filesystems:** FAT12, FAT16 and FAT32 (no exFAT). ISO9660 has no Joliet
   names. Without Rock Ridge, ISO names are shown in lower case with the `;1`
   version suffix removed, and files show as read-only.
 - **Size limits:** raw access through `/dev/hdX` cannot go past 4 GiB, because
@@ -498,14 +551,32 @@ Storage limits:
   mode, so the change is lost when the volume is unmounted.
 - **Names:** FAT names are limited to 255 UTF-8 bytes. FAT timestamps have
   2-second resolution.
+- **Floppies:** only the primary controller at 0x3F0, two drives, and
+  double- and high-density disks (a 2.88M drive is used as a 1.44M one).
+  Unmount a floppy before taking it out: a disk changed while mounted is
+  refused until it is unmounted, and changes not yet written are lost.
 
 The desktop's terminals are a fixed 80x25 and keep no scrollback, windows
 are resized by an outline (the contents redraw when you let go), dialogs,
 terminals and the calculator cannot be resized, and the only clipboard is
 the text editor's. The editor
-has no undo, no word wrap and no search, and shows only ASCII. While the desktop runs, the
+has no undo, no word wrap and no search, and shows bytes as code page 437
+(no UTF-8). While the desktop runs, the
 serial port's input goes to the unused console; its output still mirrors the
 kernel log.
+
+DOS programs run in text modes only: a program that switches to a graphics
+mode (CGA, EGA, VGA or VESA) is stopped with a message, since a terminal
+cannot show it, and the screen stays 80x25 (43- and 50-line modes keep 25
+lines). There is no sound (no PC speaker, AdLib or Sound Blaster), no mouse
+driver, no EMS or XMS memory, no protected mode (so no DOS extenders such as
+DOS/4GW), no batch files, and no BIOS disk access (INT 13h), so self-booting
+and copy-protected software will not run. The terminal reports key presses
+but not releases, so each key is released right after it is pressed: games
+that need keys held down respond poorly. Every instruction is interpreted,
+which is quick enough for applications but keeps no PC's timing, so games that
+time themselves with delay loops may run too fast. Files keep no DOS
+attributes besides read-only, and their times cannot be set.
 
 Networking limits: IPv4 only, one network card, no IP fragments in either
 direction, and no TCP congestion control (the receiver's window is the only

@@ -138,12 +138,14 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     }
 
     ata_init();
+    floppy_init();
     vfs_automount();
     net_init();
 
     proc_init();
     proc_spawn_init("/bin/init");
     blk_start_flusher();
+    floppy_start();
     boot_ok("Scheduler started, launching /bin/init");
     kprintf("\n");
 

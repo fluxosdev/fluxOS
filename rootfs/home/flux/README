@@ -31,5 +31,11 @@ Pipes and redirection
   cat README | grep -n shell > /tmp/out; cat /tmp/out
   sort < /etc/fshrc | uniq | head -3
 
+DOS programs
+  ./HELLO.COM        .COM and .EXE files run in the terminal (also: dos hello)
+  dos -l /tmp/dos.log GAME.EXE   ...logging what the emulator cannot do
+  ls /mnt/fd0        the floppy disk in drive A: (DOS programs see it as A:)
+  Ctrl+\             stops a DOS program that will not stop
+
 System
   free, uname -a, uptime, date, dmesg, fetch, reboot, poweroff

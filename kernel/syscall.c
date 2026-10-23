@@ -843,7 +843,7 @@ static int sys_blkinfo(uint32_t idx, uint32_t ubuf, uint32_t c, uint32_t d, uint
     bi->sectors = bd->nsectors;
     bi->start = bd->start;
     if (bd->fs) {
-        strlcpy(bi->fstype, bd->fs->ops->name, sizeof(bi->fstype));
+        strlcpy(bi->fstype, bd->fs->name, sizeof(bi->fstype));
         vfs_mountpoint_of(bd, bi->mountpoint, sizeof(bi->mountpoint));
     }
     return 0;
@@ -934,6 +934,19 @@ static int sys_fsync(uint32_t fd, uint32_t b, uint32_t c, uint32_t d, uint32_t e
     if (!bd && f->vn->fs)
         bd = f->vn->fs->bd;
     return bd ? blk_sync(bd) : 0;
+}
+
+static int sys_ftruncate(uint32_t fd, uint32_t size, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    struct file *f = get_file(fd);
+    if (!f)
+        return -EBADF;
+    if (f->type != FT_VNODE || f->vn->type != VN_FILE)
+        return -EINVAL;
+    if ((f->flags & O_ACCMODE) == O_RDONLY)
+        return -EBADF;
+    return vfs_truncate(f->vn, size);
 }
 
 static int sys_fbinfo(uint32_t ubuf, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
@@ -1044,6 +1057,7 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_sockname] = sys_sockname,
     [SYS_netinfo] = sys_netinfo,
     [SYS_netconf] = sys_netconf,
+    [SYS_ftruncate] = sys_ftruncate,
 };
 
 /* Calls that walk or change the VFS tree; read and write lock per chunk. */
@@ -1052,7 +1066,7 @@ static const uint8_t takes_vfs_lock[NSYSCALLS] = {
     [SYS_getdents] = 1, [SYS_mkdir] = 1, [SYS_rmdir] = 1, [SYS_unlink] = 1,
     [SYS_rename] = 1, [SYS_chmod] = 1, [SYS_stat] = 1, [SYS_mount] = 1,
     [SYS_umount] = 1, [SYS_statfs] = 1, [SYS_getmounts] = 1, [SYS_blkinfo] = 1,
-    [SYS_sync] = 1, [SYS_fsync] = 1, [SYS_blkrescan] = 1,
+    [SYS_sync] = 1, [SYS_fsync] = 1, [SYS_blkrescan] = 1, [SYS_ftruncate] = 1,
 };
 
 void syscall_dispatch(struct trapframe *tf)

@@ -7,6 +7,8 @@
 #   make run-disk   boot fluxdisk.img alone (after installing onto it)
 #   make check      verify the kernel is a valid multiboot image
 #   make disk       create fluxdisk.img, a FAT32 data disk (kept by make clean)
+#   make floppy     create fluxfloppy.img, a 1.44 MB FAT12 floppy that the
+#                   QEMU targets then put in drive A: (kept by make clean)
 #   make clean      remove build artifacts
 
 CC      ?= gcc
@@ -25,6 +27,7 @@ INITRD  := $(BUILD)/initrd.tar
 ROOTFS  := $(BUILD)/rootfs
 DISK    := fluxdisk.img
 DISK_MB ?= 64
+FLOPPY  := fluxfloppy.img
 MKFS_FAT ?= $(shell command -v mkfs.fat 2>/dev/null || ls /usr/sbin/mkfs.fat /sbin/mkfs.fat 2>/dev/null | head -1)
 
 GCC_INC := $(shell $(CC) -print-file-name=include)
@@ -54,11 +57,13 @@ LIBC      := $(BUILD)/libc.a
 PROGS     := $(basename $(notdir $(wildcard user/bin/*.c)))
 FSH_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/fsh/*.c)))
 DESKTOP_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/desktop/*.c)))
-BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/fsh $(ROOTFS)/bin/desktop
+DOS_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/dos/*.c)))
+BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/fsh $(ROOTFS)/bin/desktop \
+             $(ROOTFS)/bin/dos
 
 ROOTFS_FILES := $(shell find rootfs -type f 2>/dev/null)
 
-.PHONY: all iso kernel initrd disk run run-kernel run-disk check clean
+.PHONY: all iso kernel initrd disk floppy run run-kernel run-disk check clean
 .SECONDARY:
 
 all: $(ISO)
@@ -107,6 +112,10 @@ $(ROOTFS)/bin/desktop: $(CRT0) $(DESKTOP_OBJS) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(DESKTOP_OBJS) $(LIBC)
 
+$(ROOTFS)/bin/dos: $(CRT0) $(DOS_OBJS) $(LIBC) user/user.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(DOS_OBJS) $(LIBC)
+
 $(ROOTFS)/bin/%: $(BUILD)/u/user/bin/%.o $(CRT0) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
@@ -148,7 +157,20 @@ $(DISK):
 		echo "$@: $(DISK_MB) MiB FAT32"; \
 	else echo "$@: blank, run 'mkfs.fat /dev/hda' inside fluxOS"; fi
 
+floppy: $(FLOPPY)
+
+# A blank floppy; without a host mkfs.fat, format it inside fluxOS with
+# "mkfs.fat /dev/fd0".
+$(FLOPPY):
+	truncate -s 1440K $@
+	@if [ -n "$(MKFS_FAT)" ]; then $(MKFS_FAT) -F 12 -n FLUXFLOPPY $@ >/dev/null && \
+		echo "$@: 1.44 MB FAT12 floppy"; \
+	else echo "$@: blank, run 'mkfs.fat /dev/fd0' inside fluxOS"; fi
+
 QEMU_DISK := -drive file=$(DISK),format=raw,if=ide,index=0
+ifneq ($(wildcard $(FLOPPY)),)
+QEMU_DISK += -drive file=$(FLOPPY),format=raw,if=floppy,index=0
+endif
 # An NE2000 card on QEMU's user-mode network: DHCP, DNS and NAT to the host's network.
 QEMU_NET  ?= -netdev user,id=net0 -device ne2k_pci,netdev=net0
 

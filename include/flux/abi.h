@@ -105,6 +105,7 @@ struct stat {
 #define MKDEV(ma, mi) (((ma) << 8) | (mi))
 #define TTY_MAJOR 4
 #define PTY_MAJOR 5             /* minor = 2 * index (+1 for the master) */
+#define FLOPPY_MAJOR 2           /* minor = drive number */
 #define IDE_MAJOR 3
 #define INPUT_MAJOR 13
 
@@ -210,9 +211,10 @@ struct statfs {
     char     f_source[32];
 };
 
-#define BLK_DISK  0
-#define BLK_CDROM 1
-#define BLK_PART  2
+#define BLK_DISK   0
+#define BLK_CDROM  1
+#define BLK_PART   2
+#define BLK_FLOPPY 3
 
 struct blkinfo {
     char     name[16];

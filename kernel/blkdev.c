@@ -312,6 +312,12 @@ void blk_invalidate(struct blockdev *bd)
             bcache[i].valid = 0;
 }
 
+void blk_discard(struct blockdev *bd)
+{
+    if (bcache)
+        drop_cache(disk_of(bd));
+}
+
 /* Kernel thread: write back whatever has been waiting a few seconds. */
 static void kflushd(void)
 {
@@ -440,8 +446,10 @@ int blk_register(struct blockdev *bd)
     if (vfs_resolve("/dev", NULL, &dev) == 0) {
         int disk = bd->parent ? bd->parent->index : bd->index;
         int part = bd->parent ? (int)(bd->name[strlen(bd->name) - 1] - '0') : 0;
-        struct vnode *vn = vfs_mknod(dev, bd->name, MKDEV(IDE_MAJOR, disk * 16 + part),
-                                     dev_blk_read, dev_blk_write);
+        uint32_t rdev = bd->type == BLK_FLOPPY
+                      ? MKDEV(FLOPPY_MAJOR, bd->name[strlen(bd->name) - 1] - '0')
+                      : MKDEV(IDE_MAJOR, disk * 16 + part);
+        struct vnode *vn = vfs_mknod(dev, bd->name, rdev, dev_blk_read, dev_blk_write);
         if (vn) {
             vn->type = VN_BLK;
             vn->mode = 0660;

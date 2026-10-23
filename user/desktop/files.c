@@ -100,6 +100,22 @@ static int has_suffix(const char *name, const char *suffix)
     return n > k && !strcasecmp(name + n - k, suffix);
 }
 
+/* A DOS program, which runs under /bin/dos: .COM, or an MZ executable. */
+static int is_dos_program(const char *path)
+{
+    if (has_suffix(path, ".com"))
+        return 1;
+    if (!has_suffix(path, ".exe"))
+        return 0;
+    char head[2];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    int n = (int)read(fd, head, sizeof(head));
+    close(fd);
+    return n == 2 && ((head[0] == 'M' && head[1] == 'Z') || (head[0] == 'Z' && head[1] == 'M'));
+}
+
 /* Files the double-click opens in the text editor. */
 static int is_text_name(const char *name)
 {
@@ -129,7 +145,7 @@ static enum icon_id classify(struct fm *f, const struct entry *e, const char *pa
     if (has_suffix(e->name, ".html") || has_suffix(e->name, ".htm"))
         return ICON_HTML;
     struct stat st;
-    if (stat(path, &st) == 0 && (st.st_mode & 0111) && is_program(path))
+    if (is_dos_program(path) || (stat(path, &st) == 0 && (st.st_mode & 0111) && is_program(path)))
         return ICON_RUN;
     return ICON_README;
 }
@@ -469,8 +485,9 @@ static void open_entry(struct fm *f, int i)
         snprintf(url, sizeof(url), "file://%s", path);
         browser_open(url);
     } else if (e->icon == ICON_RUN) {
-        const char *argv[] = { path, NULL };
-        terminal_open(e->name, argv, 1, 0);
+        /* DOS programs go through the emulator even without execute permission. */
+        const char *dos_argv[] = { "/bin/dos", path, NULL }, *argv[] = { path, NULL };
+        terminal_open(e->name, is_dos_program(path) ? dos_argv : argv, 1, 0);
     } else if (is_text_name(e->name)) {
         editor_open(path);
     } else {

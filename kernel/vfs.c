@@ -605,7 +605,7 @@ int vfs_getpath(struct vnode *vn, char *buf, uint32_t size)
 static const struct fs_ops *fs_by_name(const char *type)
 {
     if (!strcmp(type, "fat32") || !strcmp(type, "vfat") || !strcmp(type, "fat") ||
-        !strcmp(type, "msdos"))
+        !strcmp(type, "msdos") || !strcmp(type, "fat12") || !strcmp(type, "fat16"))
         return &fat32_ops;
     if (!strcmp(type, "iso9660") || !strcmp(type, "iso") || !strcmp(type, "cd9660"))
         return &iso9660_ops;
@@ -641,6 +641,7 @@ static int mount_at(struct blockdev *bd, struct vnode *mp, const char *type)
         if (!fs)
             return -ENOMEM;
         fs->ops = ops;
+        fs->name = ops->name;
         fs->bd = bd;
         fs->readonly = bd->readonly;
         r = ops->mount(fs);
@@ -764,7 +765,7 @@ int vfs_statfs(struct vnode *vn, struct statfs *st)
     }
     struct fs *fs = vn->fs;
     fs->ops->statfs(fs, st);
-    strlcpy(st->f_fstype, fs->ops->name, sizeof(st->f_fstype));
+    strlcpy(st->f_fstype, fs->name, sizeof(st->f_fstype));
     snprintf(st->f_source, sizeof(st->f_source), "/dev/%s", fs->bd->name);
     if (fs->readonly)
         st->f_flags |= ST_RDONLY;
@@ -787,7 +788,7 @@ int vfs_mounts_text(char *buf, uint32_t size)
         if (vfs_getpath(fs->root, path, sizeof(path)) < 0)
             strcpy(path, "?");
         snprintf(line, sizeof(line), "/dev/%s on %s type %s (%s)\n", fs->bd->name, path,
-                 fs->ops->name, fs->readonly ? "ro" : "rw");
+                 fs->name, fs->readonly ? "ro" : "rw");
         if (len < size)
             len += strlcpy(buf + len, line, size - len);
     }
@@ -811,6 +812,8 @@ void vfs_automount(void)
             continue;
         if (bd->type == BLK_CDROM && !bd->nsectors)
             continue;
+        if (bd->type == BLK_FLOPPY)
+            continue;                   /* probing sleeps: kfloppyd mounts these */
         char path[32];
         if (bd->type == BLK_CDROM) {
             if (cds)
@@ -825,7 +828,7 @@ void vfs_automount(void)
         if (!existed && vfs_mkdir_p(path, &mp) < 0)
             continue;
         if (mount_at(bd, mp, "auto") == 0) {
-            boot_ok("Mounted /dev/%s (%s) on /%s", bd->name, bd->fs->ops->name, path);
+            boot_ok("Mounted /dev/%s (%s) on /%s", bd->name, bd->fs->name, path);
             if (bd->type == BLK_CDROM)
                 cds++;
         } else if (!existed) {

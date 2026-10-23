@@ -1,10 +1,15 @@
 /*
- * FAT32 filesystem (read/write) with VFAT long file names.
+ * FAT filesystems (read/write) with VFAT long file names: FAT32, and the
+ * FAT12 and FAT16 of floppies and small disks.
  *
  * Every vnode remembers where its 32-byte directory entry lives (the
  * parent directory's first cluster and the entry's byte offset), so
  * size and timestamp changes can be written back in place. All writes
  * go straight to disk; FAT updates are mirrored to every FAT copy.
+ *
+ * FAT12 and FAT16 keep the root directory in a fixed area after the
+ * FATs instead of a cluster chain; it is addressed as cluster FIXED_ROOT,
+ * which no real chain can contain, and it cannot grow.
  */
 #include "kernel.h"
 #include "blkdev.h"
@@ -24,12 +29,16 @@
 #define FAT_MASK  0x0FFFFFFFu
 #define FAT_EOC   0x0FFFFFF8u
 #define FAT_END   0x0FFFFFFFu
+#define FIXED_ROOT 1u            /* "first cluster" of a FAT12/16 root directory */
 #define LFN_CHARS 13
 #define MAX_DIR_BYTES (4u << 20)
 
 struct fat_fs {
     struct fs *fs;
     struct blockdev *bd;
+    int bits;                   /* 12, 16 or 32 */
+    uint32_t root_lba;          /* FAT12/16: the fixed root directory */
+    uint32_t root_secs;
     uint32_t spc;               /* sectors per cluster */
     uint32_t reserved;
     uint32_t nfats;
@@ -108,17 +117,81 @@ static uint32_t cluster_lba(struct fat_fs *f, uint32_t c)
     return f->data_start + (c - 2) * f->spc;
 }
 
+/* Byte offset of cluster c's entry in the FAT. */
+static uint32_t fat_offset(struct fat_fs *f, uint32_t c)
+{
+    return f->bits == 32 ? c * 4 : f->bits == 16 ? c * 2 : c + c / 2;
+}
+
+/* The two bytes at `off` in the FAT starting at sector `base`; a FAT12
+ * entry may straddle two sectors. */
+static int fat_read16(struct fat_fs *f, uint32_t base, uint32_t off, uint32_t *v)
+{
+    const uint8_t *s = bcache_read(f->bd, base + off / 512);
+    if (!s)
+        return -EIO;
+    *v = s[off % 512];
+    if (off % 512 == 511 && !(s = bcache_read(f->bd, base + off / 512 + 1)))
+        return -EIO;
+    *v |= (uint32_t)s[(off + 1) % 512] << 8;
+    return 0;
+}
+
+/* Replace the bits `mask` of the 16-bit value at `off` in the FAT at `base`. */
+static int fat_write16(struct fat_fs *f, uint32_t base, uint32_t off, uint32_t mask, uint32_t v)
+{
+    uint8_t sec[512];
+    for (uint32_t k = 0; k < 2; k++) {
+        uint8_t m = (uint8_t)(mask >> (8 * k));
+        if (!m)
+            continue;
+        uint32_t lba = base + (off + k) / 512, at = (off + k) % 512;
+        const uint8_t *s = bcache_read(f->bd, lba);
+        if (!s)
+            return -EIO;
+        memcpy(sec, s, 512);
+        sec[at] = (uint8_t)((sec[at] & ~m) | ((v >> (8 * k)) & m));
+        if (bcache_write(f->bd, lba, sec) < 0)
+            return -EIO;
+    }
+    return 0;
+}
+
+/* Entries are returned in FAT32's range: end of chain is >= FAT_EOC. */
 static uint32_t fat_get(struct fat_fs *f, uint32_t c)
 {
-    uint32_t off = c * 4;
-    const uint8_t *s = bcache_read(f->bd, f->reserved + off / 512);
-    return s ? rd32(s + off % 512) & FAT_MASK : FAT_END;
+    uint32_t off = fat_offset(f, c);
+    if (f->bits == 32) {
+        const uint8_t *s = bcache_read(f->bd, f->reserved + off / 512);
+        return s ? rd32(s + off % 512) & FAT_MASK : FAT_END;
+    }
+    uint32_t v;
+    if (fat_read16(f, f->reserved, off, &v) < 0)
+        return FAT_END;
+    if (f->bits == 12) {
+        v = (c & 1) ? v >> 4 : v & 0xFFF;
+        return v >= 0xFF7 ? v | 0x0FFFF000u : v;
+    }
+    return v >= 0xFFF7 ? v | 0x0FFF0000u : v;
 }
 
 static int fat_set(struct fat_fs *f, uint32_t c, uint32_t v)
 {
     uint8_t sec[512];
-    uint32_t off = c * 4;
+    uint32_t off = fat_offset(f, c);
+    if (f->bits != 32) {
+        uint32_t mask = 0xFFFF;
+        if (f->bits == 12) {
+            v &= 0xFFF;
+            mask = (c & 1) ? 0xFFF0 : 0x0FFF;
+            if (c & 1)
+                v <<= 4;
+        }
+        for (uint32_t i = 0; i < f->nfats; i++)
+            if (fat_write16(f, f->reserved + i * f->fat_size, off, mask, v) < 0)
+                return -EIO;
+        return 0;
+    }
     for (uint32_t i = 0; i < f->nfats; i++) {
         uint32_t lba = f->reserved + i * f->fat_size + off / 512;
         const uint8_t *s = bcache_read(f->bd, lba);
@@ -136,6 +209,12 @@ static int fat_set(struct fat_fs *f, uint32_t c, uint32_t v)
 static uint32_t count_free(struct fat_fs *f)
 {
     uint32_t chunk = 64, free = 0;
+    if (f->bits != 32) {                        /* small FATs: through the cache */
+        for (uint32_t c = 2; c < f->nclusters + 2; c++)
+            if (fat_get(f, c) == 0)
+                free++;
+        return free;
+    }
     uint8_t *buf = kmalloc(chunk * 512);
     if (!buf)
         return 0;
@@ -248,6 +327,19 @@ static int read_dir(struct fat_fs *f, uint32_t first, uint8_t **out, uint32_t *l
 {
     uint8_t *buf = NULL;
     uint32_t size = 0;
+    if (first == FIXED_ROOT) {
+        size = f->root_secs * 512;
+        buf = kmalloc(size);
+        if (!buf)
+            return -ENOMEM;
+        if (blk_read(f->bd, f->root_lba, f->root_secs, buf) < 0) {
+            kfree(buf);
+            return -EIO;
+        }
+        *out = buf;
+        *len = size;
+        return 0;
+    }
     for (uint32_t c = first, guard = 0; !is_end(f, c) && guard < f->nclusters; guard++) {
         if (size + f->cluster_bytes > MAX_DIR_BYTES)
             break;
@@ -271,6 +363,12 @@ static int read_dir(struct fat_fs *f, uint32_t first, uint8_t **out, uint32_t *l
 
 static int slot_location(struct fat_fs *f, uint32_t dir_first, uint32_t off, uint32_t *lba)
 {
+    if (dir_first == FIXED_ROOT) {
+        if (off >= f->root_secs * 512)
+            return -EIO;
+        *lba = f->root_lba + off / 512;
+        return 0;
+    }
     struct fat_node tmp = { .first = dir_first };
     uint32_t c = node_cluster(f, &tmp, off / f->cluster_bytes, 0);
     if (!c)
@@ -391,7 +489,7 @@ static struct vnode *make_vnode(struct fat_fs *f, struct vnode *dir, const char 
         kfree(n);
         return NULL;
     }
-    n->first = rd16(e + 20) << 16 | rd16(e + 26);
+    n->first = (f->bits == 32 ? rd16(e + 20) << 16 : 0) | rd16(e + 26);
     n->dir_first = pn->first;
     n->ent_off = ent_off;
     n->lfn_count = lfn_count;
@@ -650,6 +748,8 @@ static int add_entry(struct fat_fs *f, struct vnode *dir, const char *name, uint
     /* Grow the directory to fit. */
     uint32_t end = start + need * 32;
     while (len < end) {
+        if (dn->first == FIXED_ROOT)
+            return -ENOSPC;                     /* a FAT12/16 root is full */
         uint32_t c = node_cluster(f, dn, len / f->cluster_bytes, 1);
         if (!c || zero_cluster(f, c) < 0)
             return -ENOSPC;
@@ -988,13 +1088,16 @@ static int fat_mount(struct fs *fs)
     uint8_t b[512];
     if (blk_read(bd, 0, 1, b) < 0)
         return -EIO;
-    if (b[510] != 0x55 || b[511] != 0xAA || rd16(b + 11) != 512)
+    /* Some old DOS floppies lack the boot signature; their boot sector
+     * still starts with a jump and declares a media byte. */
+    int signed_ok = b[510] == 0x55 && b[511] == 0xAA;
+    if (!signed_ok && !((b[0] == 0xEB || b[0] == 0xE9) && b[21] >= 0xF0 && rd16(b + 22)))
+        return -EINVAL;
+    if (rd16(b + 11) != 512)
         return -EINVAL;
     uint32_t spc = b[13];
     if (!spc || (spc & (spc - 1)) || spc > 128)
         return -EINVAL;
-    if (rd16(b + 17) != 0 || rd16(b + 22) != 0 || rd32(b + 36) == 0)
-        return -EINVAL;                         /* FAT12/16 layouts */
 
     struct fat_fs *f = kzalloc(sizeof(*f));
     if (!f)
@@ -1004,21 +1107,44 @@ static int fat_mount(struct fs *fs)
     f->spc = spc;
     f->reserved = rd16(b + 14);
     f->nfats = b[16];
-    f->fat_size = rd32(b + 36);
-    f->root_clus = rd32(b + 44);
-    f->fsinfo = rd16(b + 48);
     uint32_t total = rd16(b + 19) ? rd16(b + 19) : rd32(b + 32);
     if (total > bd->nsectors)
         total = bd->nsectors;
-    f->data_start = f->reserved + f->nfats * f->fat_size;
     f->cluster_bytes = spc * 512;
-    if (!f->nfats || f->data_start >= total) {
+    if (rd16(b + 22)) {
+        /* FAT12/16: the root directory follows the FATs; the cluster count
+         * decides the FAT width. */
+        f->fat_size = rd16(b + 22);
+        f->root_lba = f->reserved + f->nfats * f->fat_size;
+        f->root_secs = (rd16(b + 17) * 32 + 511) / 512;
+        f->root_clus = FIXED_ROOT;
+        f->data_start = f->root_lba + f->root_secs;
+    } else {
+        f->fat_size = rd32(b + 36);
+        f->root_clus = rd32(b + 44);
+        f->fsinfo = rd16(b + 48);
+        f->data_start = f->reserved + f->nfats * f->fat_size;
+    }
+    if (!f->nfats || !f->reserved || !f->fat_size || f->data_start >= total ||
+        (f->root_clus == FIXED_ROOT && !f->root_secs)) {
         kfree(f);
         return -EINVAL;
     }
     f->nclusters = (total - f->data_start) / spc;
-    f->nclusters = MIN(f->nclusters, f->fat_size * 128 - 2);
-    if (f->root_clus < 2 || f->root_clus >= f->nclusters + 2) {
+    if (f->root_clus != FIXED_ROOT) {
+        f->bits = 32;
+        f->nclusters = MIN(f->nclusters, f->fat_size * 128 - 2);
+    } else if (f->nclusters < 4085) {
+        f->bits = 12;
+        f->nclusters = MIN(f->nclusters, f->fat_size * 512 * 2 / 3 - 2);
+    } else if (f->nclusters < 65525) {
+        f->bits = 16;
+        f->nclusters = MIN(f->nclusters, f->fat_size * 256 - 2);
+    } else {
+        kfree(f);
+        return -EINVAL;
+    }
+    if (f->root_clus != FIXED_ROOT && (f->root_clus < 2 || f->root_clus >= f->nclusters + 2)) {
         kfree(f);
         return -EINVAL;
     }
@@ -1054,6 +1180,7 @@ static int fat_mount(struct fs *fs)
     fs->priv = f;
     fs->root = root;
     fs->case_insensitive = 1;
+    fs->name = f->bits == 12 ? "fat12" : f->bits == 16 ? "fat16" : "fat32";
     return 0;
 }
 

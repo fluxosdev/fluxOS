@@ -1,6 +1,6 @@
 /*
  * PS/2 keyboard driver (scancode set 1, US layout). Keys are translated
- * to bytes and VT100 escape sequences and fed into the console tty, or,
+ * to bytes and VT100/xterm escape sequences and fed into the console tty, or,
  * while the desktop has /dev/input open, reported there as key events
  * that carry the same bytes.
  */
@@ -80,6 +80,26 @@ static const char *extended_text(uint8_t sc)
     return "";
 }
 
+/* Function keys send xterm's sequences: ESC O P-S for F1-F4, ESC [ n ~ above. */
+static const char *function_text(uint8_t sc)
+{
+    switch (sc) {
+    case 0x3B: return "\033OP";
+    case 0x3C: return "\033OQ";
+    case 0x3D: return "\033OR";
+    case 0x3E: return "\033OS";
+    case 0x3F: return "\033[15~";
+    case 0x40: return "\033[17~";
+    case 0x41: return "\033[18~";
+    case 0x42: return "\033[19~";
+    case 0x43: return "\033[20~";
+    case 0x44: return "\033[21~";
+    case 0x57: return "\033[23~";
+    case 0x58: return "\033[24~";
+    }
+    return "";
+}
+
 static void keyboard_irq(struct trapframe *tf)
 {
     (void)tf;
@@ -140,7 +160,8 @@ static void keyboard_irq(struct trapframe *tf)
 
     char c = shift ? keymap_shift[sc] : keymap[sc];
     if (!c) {
-        key_event(sc, 1, "", 0);        /* function keys and the like */
+        const char *text = function_text(sc);
+        key_event(sc, 1, text, (int)strlen(text));
         return;
     }
     if (caps && c >= 'a' && c <= 'z' && !shift)

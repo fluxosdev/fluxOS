@@ -14,7 +14,7 @@ struct vnode;
 struct blockdev {
     char name[16];
     char model[44];
-    int type;                   /* BLK_DISK, BLK_CDROM, BLK_PART */
+    int type;                   /* BLK_DISK, BLK_CDROM, BLK_PART, BLK_FLOPPY */
     uint32_t sector_size;
     uint32_t nsectors;
     uint32_t start;             /* partitions: first sector on the parent */
@@ -52,10 +52,15 @@ int bcache_write(struct blockdev *bd, uint32_t lba, const void *data);
 int blk_sync(struct blockdev *bd);
 int blk_sync_all(void);
 void blk_invalidate(struct blockdev *bd);
+/* Forget every cached sector of a disk, unwritten ones too: its removable
+ * medium was taken out. */
+void blk_discard(struct blockdev *bd);
 void blk_start_flusher(void);
 
 void blk_scan_partitions(struct blockdev *disk);
 int blk_rescan(struct blockdev *disk);
 void ata_init(void);
+void floppy_init(void);
+void floppy_start(void);                /* after the scheduler: needs a thread */
 
 #endif

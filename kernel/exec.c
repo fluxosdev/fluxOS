@@ -1,6 +1,7 @@
 /*
- * execve: load a static ELF32 executable (or a "#!" script) into a new
- * address space and build the initial user stack:
+ * execve: load a static ELF32 executable (or a "#!" script, or a DOS
+ * program, which runs under /bin/dos) into a new address space and
+ * build the initial user stack:
  *
  *   sp -> argc, argv[0..argc-1], NULL, envp[0..n-1], NULL, strings...
  */
@@ -13,6 +14,8 @@
 #define ET_EXEC   2
 #define EM_386    3
 #define PT_LOAD   1
+
+#define DOS_LOADER "/bin/dos"
 
 #define MAX_ARG_BYTES (64 * 1024)
 #define MAX_IMAGE     (32u << 20)
@@ -160,29 +163,17 @@ static int build_stack(uint32_t *pd, char *const argv[], char *const envp[], uin
     return r;
 }
 
-/* "#!/path/to/interp" -> run interp with the script path as argv[1]. */
-static int exec_script(struct proc *p, struct image *vn, const char *path,
+/* Run interp with the program's path as argv[1], followed by argv[1..]. */
+static int exec_interp(struct proc *p, const char *interp, const char *path,
                        char *const argv[], char *const envp[])
 {
-    char interp[PATH_MAX];
-    uint32_t i = 2, n = 0;
-    while (i < vn->size && vn->data[i] == ' ')
-        i++;
-    while (i < vn->size && n < sizeof(interp) - 1 && vn->data[i] != '\n' &&
-           vn->data[i] != ' ' && vn->data[i] != '\r')
-        interp[n++] = (char)vn->data[i++];
-    interp[n] = 0;
-    image_free(vn);
-    if (!n)
-        return -ENOEXEC;
-
     int argc = 0;
     while (argv && argv[argc])
         argc++;
     char **nargv = kmalloc(sizeof(char *) * (uint32_t)(argc + 3));
     if (!nargv)
         return -ENOMEM;
-    nargv[0] = interp;
+    nargv[0] = (char *)interp;
     nargv[1] = (char *)path;
     for (int k = 1; k < argc; k++)
         nargv[k + 1] = argv[k];
@@ -198,6 +189,38 @@ static int exec_script(struct proc *p, struct image *vn, const char *path,
         r = proc_exec(p, interp, nargv, envp);
     kfree(nargv);
     return r;
+}
+
+/* "#!/path/to/interp" -> run interp with the script path as argv[1]. */
+static int exec_script(struct proc *p, struct image *vn, const char *path,
+                       char *const argv[], char *const envp[])
+{
+    char interp[PATH_MAX];
+    uint32_t i = 2, n = 0;
+    while (i < vn->size && vn->data[i] == ' ')
+        i++;
+    while (i < vn->size && n < sizeof(interp) - 1 && vn->data[i] != '\n' &&
+           vn->data[i] != ' ' && vn->data[i] != '\r')
+        interp[n++] = (char)vn->data[i++];
+    interp[n] = 0;
+    image_free(vn);
+    if (!n)
+        return -ENOEXEC;
+    return exec_interp(p, interp, path, argv, envp);
+}
+
+/* A DOS program: an "MZ" executable, or a .COM file, which has no header. */
+static int is_dos_program(const struct image *img, const char *path)
+{
+    if (img->size >= 2 && ((img->data[0] == 'M' && img->data[1] == 'Z') ||
+                           (img->data[0] == 'Z' && img->data[1] == 'M')))
+        return 1;
+    if (img->size >= 4 && memcmp(img->data, ELF_MAGIC, 4) == 0)
+        return 0;
+    uint32_t n = strlen(path);
+    return n > 4 && img->size > 0 && img->size <= 0xFF00 && path[n - 4] == '.' &&
+           (path[n - 3] | 0x20) == 'c' && (path[n - 2] | 0x20) == 'o' &&
+           (path[n - 1] | 0x20) == 'm';
 }
 
 int proc_exec(struct proc *p, const char *path, char *const argv[], char *const envp[])
@@ -216,6 +239,10 @@ int proc_exec(struct proc *p, const char *path, char *const argv[], char *const 
         return r;
     if (img.size >= 2 && img.data[0] == '#' && img.data[1] == '!')
         return exec_script(p, &img, path, argv, envp);
+    if (is_dos_program(&img, path)) {
+        image_free(&img);
+        return exec_interp(p, DOS_LOADER, path, argv, envp);
+    }
 
     uint32_t *pd = vmm_create();
     if (!pd) {

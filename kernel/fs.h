@@ -31,6 +31,7 @@ struct fs_ops {
 
 struct fs {
     const struct fs_ops *ops;
+    const char *name;           /* type shown to users (ops->name unless the driver says) */
     struct blockdev *bd;
     struct vnode *root;
     struct vnode *covered;      /* the directory this fs is mounted on */

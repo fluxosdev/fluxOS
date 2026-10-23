@@ -70,7 +70,8 @@
 #define SYS_sockname  62
 #define SYS_netinfo   63
 #define SYS_netconf   64
+#define SYS_ftruncate 65
 
-#define NSYSCALLS     65
+#define NSYSCALLS     66
 
 #endif

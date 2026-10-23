@@ -26,6 +26,7 @@ ssize_t write(int fd, const void *buf, size_t n);
 int close(int fd);
 void sync(void);
 int fsync(int fd);
+int ftruncate(int fd, off_t size);
 int dup(int fd);
 int dup2(int oldfd, int newfd);
 int pipe(int fds[2]);

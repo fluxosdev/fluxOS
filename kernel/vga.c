@@ -30,6 +30,7 @@ static int pending_scroll;              /* lines scrolled since the last flush *
 static int cursor_at = -1;              /* cell with the drawn fb cursor */
 
 static int cx, cy, saved_x, saved_y;
+static int wrap_pending;                /* the last column was written: wrap on the next character */
 static int fg = 7, bg = 0, bold, reverse;
 static uint8_t attr = 0x07;
 static int cursor_visible = 1;
@@ -171,6 +172,8 @@ static void set_cursor_visible(int on)
 
 static void put_char(char c)
 {
+    if ((unsigned char)c < 32)
+        wrap_pending = 0;
     switch (c) {
     case '\n':
         newline();
@@ -192,9 +195,17 @@ static void put_char(char c)
     }
     if ((unsigned char)c < 32)
         return;
-    cells[cy * cols + cx] = cell(c);
-    if (++cx >= cols)
+    if (wrap_pending) {
+        wrap_pending = 0;
         newline();
+    }
+    cells[cy * cols + cx] = cell(c);
+    /* As on a VT100, writing the last column leaves the cursor there, so a
+     * full-screen program can fill the bottom right cell without scrolling. */
+    if (cx == cols - 1)
+        wrap_pending = 1;
+    else
+        cx++;
 }
 
 static void apply_sgr(void)
@@ -238,6 +249,7 @@ static int param(int i, int def)
 static void csi_dispatch(char final)
 {
     int n = param(0, 1);
+    wrap_pending = 0;
     switch (final) {
     case 'A': cy = MAX(cy - n, 0); break;
     case 'B': cy = MIN(cy + n, rows - 1); break;
@@ -373,6 +385,7 @@ void vga_init(void)
     for (int i = 0; i < cols * rows; i++)
         drawn[i] = INVALID;
     cx = cy = 0;
+    wrap_pending = 0;
     set_cursor_visible(1);
     flush();
 }

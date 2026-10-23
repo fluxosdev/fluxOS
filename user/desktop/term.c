@@ -43,6 +43,7 @@ struct term {
     int pending_scroll;
     int cursor_at;                      /* cell index with the cursor drawn, or -1 */
     int cx, cy, saved_x, saved_y;
+    int wrap_pending;                   /* the last column was written: wrap on the next character */
     int fg, bg, bold, reverse, underline;
     int cursor_visible;
     int focused;
@@ -106,6 +107,8 @@ static void newline(struct term *t)
 
 static void put_char(struct term *t, char c)
 {
+    if ((unsigned char)c < 32)
+        t->wrap_pending = 0;
     switch (c) {
     case '\n':
         newline(t);
@@ -127,12 +130,20 @@ static void put_char(struct term *t, char c)
     }
     if ((unsigned char)c < 32)
         return;
+    if (t->wrap_pending) {
+        t->wrap_pending = 0;
+        newline(t);
+    }
     struct cell *cell = &t->cells[t->cy][t->cx];
     cell->ch = (uint8_t)c;
     cell->attr = cur_attr(t);
     cell->underline = (uint8_t)t->underline;
-    if (++t->cx >= COLS)
-        newline(t);
+    /* As on a VT100, writing the last column leaves the cursor there, so a
+     * full-screen program can fill the bottom right cell without scrolling. */
+    if (t->cx == COLS - 1)
+        t->wrap_pending = 1;
+    else
+        t->cx++;
 }
 
 static void apply_sgr(struct term *t)
@@ -184,6 +195,7 @@ static int clamp(int v, int lo, int hi)
 static void csi_dispatch(struct term *t, char final)
 {
     int n = param(t, 0, 1);
+    t->wrap_pending = 0;
     switch (final) {
     case 'A': t->cy = clamp(t->cy - n, 0, ROWS - 1); break;
     case 'B': t->cy = clamp(t->cy + n, 0, ROWS - 1); break;
