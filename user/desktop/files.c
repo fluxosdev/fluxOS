@@ -775,6 +775,13 @@ static void fm_focus(struct window *w, int focused)
         paint(f);
 }
 
+static void fm_resize(struct window *w)
+{
+    struct fm *f = w->priv;
+    set_scroll(f, f->scroll);
+    paint(f);
+}
+
 static void fm_destroy(struct window *w)
 {
     struct fm *f = w->priv;
@@ -792,6 +799,7 @@ static const struct window_ops fm_ops = {
     .key = fm_key,
     .mouse = fm_mouse,
     .focus = fm_focus,
+    .resize = fm_resize,
     .destroy = fm_destroy,
 };
 

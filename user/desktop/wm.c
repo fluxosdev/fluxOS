@@ -43,6 +43,7 @@ static int mx, my, mbuttons;
 enum drag {
     DRAG_NONE,
     DRAG_MOVE,                          /* caption: moving the outline */
+    DRAG_RESIZE,                        /* a window edge: resizing the outline */
     DRAG_TITLE_BUTTON,                  /* holding a caption button */
     DRAG_CLIENT,                        /* the client area has the mouse */
     DRAG_TASK,                          /* holding a taskbar button */
@@ -54,6 +55,15 @@ static int drag_button;                 /* TB_* while DRAG_TITLE_BUTTON */
 static int drag_pressed;                /* the held button is drawn pushed */
 static int drag_dx, drag_dy;
 static struct rect outline;
+static int drag_edges;                  /* E_* while DRAG_RESIZE */
+static int drag_mx, drag_my;            /* where a resize started */
+static struct rect drag_start;          /* the frame when it did */
+static enum cursor_kind cursor_kind;
+static struct window *last_caption_win;  /* for double-clicking a caption */
+static unsigned int last_caption_ms;
+
+enum { E_L = 1, E_R = 2, E_T = 4, E_B = 8 };
+#define GRIP 16                         /* corner grab length along an edge */
 
 static int menu_open;
 static int menu_hover = -1;
@@ -75,6 +85,11 @@ static void open_computer(void)
 static void open_editor(void)
 {
     editor_open(NULL);
+}
+
+static void open_calculator(void)
+{
+    calculator_open();
 }
 
 static void open_browser(void)
@@ -104,6 +119,7 @@ static struct desk_icon desk_icons[] = {
     { ICON_COMPUTER, "My Computer", open_computer },
     { ICON_TERMINAL, "Terminal", open_terminal },
     { ICON_BROWSER, "Web Browser", open_browser },
+    { ICON_CALC, "Calculator", open_calculator },
     { ICON_README, "Read Me", open_readme },
     { ICON_INSTALL, "Install fluxOS", setup_open },
 };
@@ -124,6 +140,7 @@ static struct menu_item menu_items[] = {
     { ICON_FOLDER, "File Manager", open_home },
     { ICON_EDITOR, "Text Editor", open_editor },
     { ICON_BROWSER, "Web Browser", open_browser },
+    { ICON_CALC, "Calculator", open_calculator },
     { ICON_README, "Read Me", open_readme },
     { ICON_COMPUTER, "System Properties", about_open },
     { ICON_RUN, "Run...", run_open },
@@ -257,6 +274,17 @@ struct rect wm_client_rect(struct window *w)
     return mkrect(w->r.x + BORDER, w->r.y + 3 + TITLE_H + 1, w->content.w, w->content.h);
 }
 
+static int resizable(const struct window *w)
+{
+    return (w->flags & WF_MAXIMIZE) && w->ops && w->ops->resize;
+}
+
+/* A maximize button that does nothing is drawn disabled. */
+static int button_disabled(const struct window *w, int kind)
+{
+    return (kind == TB_MAXIMIZE || kind == TB_RESTORE) && !resizable(w);
+}
+
 /* Caption buttons from right to left: close, then maximize and minimize. */
 static int title_buttons(struct window *w, struct rect *rects, int *kinds)
 {
@@ -268,7 +296,7 @@ static int title_buttons(struct window *w, struct rect *rects, int *kinds)
     if (w->flags & WF_MAXIMIZE) {
         x -= 16;
         rects[n] = mkrect(x, y, 16, 14);
-        kinds[n++] = TB_MAXIMIZE;
+        kinds[n++] = w->maximized ? TB_RESTORE : TB_MAXIMIZE;
     }
     if (w->flags & WF_MINIMIZE) {
         x -= 16;
@@ -392,7 +420,7 @@ static void draw_window(struct window *w)
 
     for (int i = 0; i < nb; i++) {
         int pushed = drag == DRAG_TITLE_BUTTON && drag_win == w && drag_button == kinds[i] && drag_pressed;
-        draw_title_button(&screen, br[i], kinds[i], pushed, kinds[i] == TB_MAXIMIZE);
+        draw_title_button(&screen, br[i], kinds[i], pushed, button_disabled(w, kinds[i]));
     }
 
     gfx_blit(&screen, cl.x, cl.y, &w->content, 0, 0, cl.w, cl.h);
@@ -502,9 +530,9 @@ static void compose(struct rect r)
     }
     if (menu_open)
         draw_start_menu();
-    if (drag == DRAG_MOVE)
+    if (drag == DRAG_MOVE || drag == DRAG_RESIZE)
         draw_outline();
-    draw_cursor(&screen, mx, my);
+    draw_cursor(&screen, mx, my, cursor_kind);
     gfx_noclip(&screen);
 }
 
@@ -549,6 +577,8 @@ struct window *wm_create(const char *title, enum icon_id icon, int client_w, int
     w->flags = flags;
     w->ops = ops;
     w->priv = priv;
+    w->min_w = 200;
+    w->min_h = 120;
     w->r = mkrect(0, 0, client_w + 2 * BORDER, client_h + 3 + TITLE_H + 1 + BORDER);
 
     struct window **pp = &bottom;
@@ -695,6 +725,56 @@ void wm_cascade(struct window *w)
     move_window(w, x, y);
 }
 
+void wm_set_min_size(struct window *w, int client_w, int client_h)
+{
+    w->min_w = client_w;
+    w->min_h = client_h;
+}
+
+/*
+ * Give the window the frame r: allocate a client surface of the new size,
+ * let the app redraw into it. If memory runs out the window stays as it was.
+ */
+static int set_frame(struct window *w, struct rect r)
+{
+    int cw = r.w - 2 * BORDER, ch = r.h - (3 + TITLE_H + 1 + BORDER);
+    if (cw < 1 || ch < 1)
+        return -1;
+    struct rect old = w->r;
+    if (cw != w->content.w || ch != w->content.h) {
+        struct surface ns;
+        if (surface_init(&ns, cw, ch) < 0)
+            return -1;
+        gfx_fill(&ns, 0, 0, cw, ch, C_FACE);
+        surface_free(&w->content);
+        w->content = ns;
+        w->r = r;
+        if (w->ops && w->ops->resize)
+            w->ops->resize(w);
+    } else {
+        w->r = r;
+    }
+    wm_damage(old);
+    wm_damage(w->r);
+    return 0;
+}
+
+static void toggle_maximize(struct window *w)
+{
+    if (!resizable(w))
+        return;
+    struct rect to = w->restore;
+    if (!w->maximized)
+        to = mkrect(0, 0, screen_w, screen_h - TASKBAR_H);
+    struct rect from = w->r;
+    if (set_frame(w, to) < 0)
+        return;
+    if (!w->maximized)
+        w->restore = from;
+    w->maximized = !w->maximized;
+    wm_damage(caption_rect(w));
+}
+
 void wm_set_title(struct window *w, const char *title)
 {
     strncpy(w->title, title, sizeof(w->title) - 1);
@@ -798,6 +878,98 @@ static void client_mouse(struct window *w, int buttons, int changed)
     w->ops->mouse(w, mx - cl.x, my - cl.y, buttons, changed);
 }
 
+/* Which edges of the frame (E_*) a point grabs, for a window that can be resized. */
+static int edge_hit(struct window *w, int x, int y)
+{
+    struct rect r = w->r;
+    if (!resizable(w) || w->maximized || !rect_contains(r, x, y) ||
+        rect_contains(caption_rect(w), x, y) || rect_contains(wm_client_rect(w), x, y))
+        return 0;
+    int e = 0;
+    if (x < r.x + BORDER)
+        e |= E_L;
+    if (x >= r.x + r.w - BORDER)
+        e |= E_R;
+    if (y < r.y + BORDER)
+        e |= E_T;
+    if (y >= r.y + r.h - BORDER)
+        e |= E_B;
+    if (e & (E_T | E_B)) {              /* near a corner: grab both edges */
+        if (x < r.x + GRIP)
+            e |= E_L;
+        if (x >= r.x + r.w - GRIP)
+            e |= E_R;
+    }
+    if (e & (E_L | E_R)) {
+        if (y < r.y + GRIP)
+            e |= E_T;
+        if (y >= r.y + r.h - GRIP)
+            e |= E_B;
+    }
+    return e;
+}
+
+/* The frame the pointer's drag asks for, kept on screen and above the minimum size. */
+static struct rect resized_frame(void)
+{
+    struct window *w = drag_win;
+    struct rect s = drag_start;
+    int dx = mx - drag_mx, dy = my - drag_my;
+    int min_w = w->min_w + 2 * BORDER, min_h = w->min_h + 3 + TITLE_H + 1 + BORDER;
+    int l = s.x, r = s.x + s.w, t = s.y, b = s.y + s.h;
+    if (drag_edges & E_L)
+        l = s.x + dx < 0 ? 0 : s.x + dx;
+    if (drag_edges & E_R)
+        r = s.x + s.w + dx > screen_w ? screen_w : s.x + s.w + dx;
+    if (drag_edges & E_T)
+        t = s.y + dy < 0 ? 0 : s.y + dy;
+    if (drag_edges & E_B)
+        b = s.y + s.h + dy > screen_h - TASKBAR_H ? screen_h - TASKBAR_H : s.y + s.h + dy;
+    if (r - l < min_w) {
+        if (drag_edges & E_L)
+            l = r - min_w;
+        else
+            r = l + min_w;
+    }
+    if (b - t < min_h) {
+        if (drag_edges & E_T)
+            t = b - min_h;
+        else
+            b = t + min_h;
+    }
+    return mkrect(l, t, r - l, b - t);
+}
+
+static enum cursor_kind kind_for_edges(int e)
+{
+    if ((e & (E_L | E_T)) == (E_L | E_T) || (e & (E_R | E_B)) == (E_R | E_B))
+        return CUR_NWSE;
+    if (e & (E_L | E_R)) {
+        if (e & (E_T | E_B))
+            return CUR_NESW;
+        return CUR_EW;
+    }
+    return e & (E_T | E_B) ? CUR_NS : CUR_ARROW;
+}
+
+/* Show the pointer the place under it calls for. */
+static void update_cursor(void)
+{
+    enum cursor_kind k = CUR_ARROW;
+    if (drag == DRAG_RESIZE) {
+        k = kind_for_edges(drag_edges);
+    } else if (drag == DRAG_NONE && !menu_open) {
+        struct window *w = window_at(mx, my);
+        if (w)
+            k = kind_for_edges(edge_hit(w, mx, my));
+    }
+    if (k != cursor_kind) {
+        wm_damage(cursor_bounds(mx, my, cursor_kind));
+        cursor_kind = k;
+        wm_damage(cursor_bounds(mx, my, cursor_kind));
+    }
+}
+
 static void press_left(void)
 {
     if (menu_open) {
@@ -866,16 +1038,38 @@ static void press_left(void)
             drag = DRAG_TITLE_BUTTON;
             drag_win = w;
             drag_button = kinds[i];
-            drag_pressed = kinds[i] != TB_MAXIMIZE;
+            drag_pressed = !button_disabled(w, kinds[i]);
             wm_damage(br[i]);
             return;
         }
     }
     if (rect_contains(caption_rect(w), mx, my)) {
+        unsigned int t = now_ms();
+        if (resizable(w) && w == last_caption_win && t - last_caption_ms < DBLCLICK_MS) {
+            last_caption_win = NULL;
+            toggle_maximize(w);         /* a double click on the caption */
+            return;
+        }
+        last_caption_win = w;
+        last_caption_ms = t;
+        if (w->maximized)
+            return;                     /* maximized windows stay put */
         drag = DRAG_MOVE;
         drag_win = w;
         drag_dx = mx - w->r.x;
         drag_dy = my - w->r.y;
+        outline = w->r;
+        damage_outline();
+        return;
+    }
+    int edges = edge_hit(w, mx, my);
+    if (edges) {
+        drag = DRAG_RESIZE;
+        drag_win = w;
+        drag_edges = edges;
+        drag_mx = mx;
+        drag_my = my;
+        drag_start = w->r;
         outline = w->r;
         damage_outline();
         return;
@@ -909,6 +1103,15 @@ static void drag_motion(void)
         }
         break;
     }
+    case DRAG_RESIZE: {
+        struct rect n = resized_frame();
+        if (n.x != outline.x || n.y != outline.y || n.w != outline.w || n.h != outline.h) {
+            damage_outline();
+            outline = n;
+            damage_outline();
+        }
+        break;
+    }
     case DRAG_TITLE_BUTTON: {
         struct rect br[3];
         int kinds[3];
@@ -916,7 +1119,7 @@ static void drag_motion(void)
         for (int i = 0; i < nb; i++) {
             if (kinds[i] != drag_button)
                 continue;
-            int over = rect_contains(br[i], mx, my) && drag_button != TB_MAXIMIZE;
+            int over = rect_contains(br[i], mx, my) && !button_disabled(drag_win, drag_button);
             if (over != drag_pressed) {
                 drag_pressed = over;
                 wm_damage(br[i]);
@@ -958,6 +1161,10 @@ static void release_left(void)
         damage_outline();
         move_window(w, outline.x, outline.y);
         break;
+    case DRAG_RESIZE:
+        damage_outline();
+        set_frame(w, outline);
+        break;
     case DRAG_TITLE_BUTTON:
         wm_damage(caption_rect(w));
         if (!drag_pressed)
@@ -967,6 +1174,8 @@ static void release_left(void)
             close_window(w);
         else if (drag_button == TB_MINIMIZE)
             minimize(w);
+        else
+            toggle_maximize(w);
         break;
     case DRAG_CLIENT:
         client_mouse(w, mbuttons, MOUSE_LEFT);
@@ -1016,8 +1225,8 @@ static void mouse_event(const struct input_event *ev)
     if (my >= screen_h)
         my = screen_h - 1;
     if (mx != ox || my != oy) {
-        wm_damage(mkrect(ox, oy, CURSOR_W, CURSOR_H));
-        wm_damage(mkrect(mx, my, CURSOR_W, CURSOR_H));
+        wm_damage(cursor_bounds(ox, oy, cursor_kind));
+        wm_damage(cursor_bounds(mx, my, cursor_kind));
     }
 
     int old = mbuttons;
@@ -1047,6 +1256,7 @@ static void mouse_event(const struct input_event *ev)
         press_left();
     if (released & MOUSE_LEFT)
         release_left();
+    update_cursor();
 }
 
 /* ---- keyboard ---- */

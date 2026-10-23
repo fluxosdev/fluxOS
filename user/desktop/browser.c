@@ -156,44 +156,44 @@ static void start_next(struct browser *b);
 
 /* ---- geometry ---- */
 
-static struct rect button_rect(int i)
+static struct rect button_rect(struct browser *b, int i)
 {
     static const int widths[] = { 62, 74, 56, 70, 60 };
     int x = 4;
     if (i == B_GO)
-        return mkrect(BR_W - 44, TOOLBAR_H + 2, 40, ADDR_H - 4);
+        return mkrect(b->win->content.w - 44, TOOLBAR_H + 2, 40, ADDR_H - 4);
     for (int k = 0; k < i; k++)
         x += widths[k] + 2;
     return mkrect(x, 3, widths[i], TOOLBAR_H - 6);
 }
 
-static struct rect addr_rect(void)
+static struct rect addr_rect(struct browser *b)
 {
     int lx = 4 + gfx_text_width(&font_sans, "Address") + 8;
-    return mkrect(lx, TOOLBAR_H + 2, BR_W - 52 - lx, ADDR_H - 4);
+    return mkrect(lx, TOOLBAR_H + 2, b->win->content.w - 52 - lx, ADDR_H - 4);
 }
 
-static struct rect frame_rect(void)
+static struct rect frame_rect(struct browser *b)
 {
     int y = TOOLBAR_H + ADDR_H;
-    return mkrect(2, y, BR_W - 4, BR_H - y - STATUS_H - 2);
+    return mkrect(2, y, b->win->content.w - 4, b->win->content.h - y - STATUS_H - 2);
 }
 
 static int has_hbar(struct browser *b)
 {
-    struct rect f = frame_rect();
+    struct rect f = frame_rect(b);
     return b->lo.width > f.w - 4 - SBAR_W;
 }
 
 static struct rect view_rect(struct browser *b)
 {
-    struct rect f = frame_rect();
+    struct rect f = frame_rect(b);
     return mkrect(f.x + 2, f.y + 2, f.w - 4 - SBAR_W, f.h - 4 - (has_hbar(b) ? SBAR_W : 0));
 }
 
 static struct sbar vbar(struct browser *b)
 {
-    struct rect v = view_rect(b), f = frame_rect();
+    struct rect v = view_rect(b), f = frame_rect(b);
     return (struct sbar){ mkrect(v.x + v.w, v.y, SBAR_W, f.h - 4 - (has_hbar(b) ? SBAR_W : 0)), 1,
                           b->scroll_y, v.h, b->lo.height > v.h ? b->lo.height : v.h };
 }
@@ -1572,7 +1572,7 @@ static void draw_toolbar(struct browser *b, struct surface *s)
     gfx_fill(s, 0, 0, s->w, TOOLBAR_H + ADDR_H, C_FACE);
     draw_separator(s, 0, TOOLBAR_H - 1, s->w);
     for (int i = 0; i < B_GO; i++) {
-        struct rect r = button_rect(i);
+        struct rect r = button_rect(b, i);
         int en = button_enabled(b, i), down = b->hold == H_BUTTON && b->button_pressed == i && b->button_down;
         if (down)
             gfx_bevel(s, r, BEVEL_THIN_SUNKEN);
@@ -1587,7 +1587,7 @@ static void draw_toolbar(struct browser *b, struct surface *s)
     }
     /* The address bar. */
     gfx_text(s, &font_sans, 6, TOOLBAR_H + (ADDR_H - font_sans.height) / 2 - 1, "Address", C_BLACK);
-    struct rect a = addr_rect();
+    struct rect a = addr_rect(b);
     gfx_fill(s, a.x, a.y, a.w, a.h, C_WHITE);
     gfx_bevel(s, a, BEVEL_SUNKEN);
     struct rect inner = mkrect(a.x + 3, a.y + 2, a.w - 6, a.h - 4);
@@ -1613,7 +1613,7 @@ static void draw_toolbar(struct browser *b, struct surface *s)
             gfx_vline(s, tx + cx, ty, font_sans.height, C_BLACK);
     }
     s->clip = saved;
-    struct rect go = button_rect(B_GO);
+    struct rect go = button_rect(b, B_GO);
     draw_button(s, go, "Go", b->hold == H_BUTTON && b->button_pressed == B_GO && b->button_down, 0, 0);
 }
 
@@ -1652,7 +1652,7 @@ static void paint(struct browser *b)
     if (b->root && b->laid_out_w != view_rect(b).w)
         relayout(b);
     draw_toolbar(b, s);
-    struct rect f = frame_rect();
+    struct rect f = frame_rect(b);
     gfx_bevel(s, f, BEVEL_SUNKEN);
 
     struct rect v = view_rect(b);
@@ -1871,7 +1871,7 @@ static void br_mouse(struct window *w, int x, int y, int buttons, int changed)
 
     if (pressed) {
         for (int i = 0; i < NBUTTONS; i++) {
-            if (rect_contains(button_rect(i), x, y) && button_enabled(b, i)) {
+            if (rect_contains(button_rect(b, i), x, y) && button_enabled(b, i)) {
                 b->hold = H_BUTTON;
                 b->button_pressed = i;
                 b->button_down = 1;
@@ -1879,13 +1879,13 @@ static void br_mouse(struct window *w, int x, int y, int buttons, int changed)
                 return;
             }
         }
-        if (rect_contains(addr_rect(), x, y)) {
+        if (rect_contains(addr_rect(b), x, y)) {
             if (!b->addr_focus) {
                 b->addr_focus = 1;
                 b->addr_all = 1;
             } else {
                 /* Put the caret where the click was. */
-                struct rect a = addr_rect();
+                struct rect a = addr_rect(b);
                 b->addr_all = 0;
                 int k = 0;
                 char part[URL_MAX];
@@ -1941,7 +1941,7 @@ static void br_mouse(struct window *w, int x, int y, int buttons, int changed)
         b->hold = H_NONE;
         if (hold == H_BUTTON) {
             int i = b->button_pressed;
-            int over = rect_contains(button_rect(i), x, y);
+            int over = rect_contains(button_rect(b, i), x, y);
             b->button_down = 0;
             paint(b);
             if (over)
@@ -1965,7 +1965,7 @@ static void br_mouse(struct window *w, int x, int y, int buttons, int changed)
 
     /* Motion. */
     if (b->hold == H_BUTTON) {
-        int over = rect_contains(button_rect(b->button_pressed), x, y);
+        int over = rect_contains(button_rect(b, b->button_pressed), x, y);
         if (over != b->button_down) {
             b->button_down = over;
             paint(b);
@@ -1986,6 +1986,14 @@ static void br_wheel(struct window *w, int delta)
 {
     struct browser *b = w->priv;
     scroll_by(b, 0, -delta * 3 * LINE_STEP / 2);
+    paint(b);
+}
+
+static void br_resize(struct window *w)
+{
+    struct browser *b = w->priv;
+    b->need_layout = 1;
+    relayout(b);
     paint(b);
 }
 
@@ -2023,6 +2031,7 @@ static const struct window_ops br_ops = {
     .key = br_key,
     .mouse = br_mouse,
     .wheel = br_wheel,
+    .resize = br_resize,
     .focus = br_focus,
     .close = br_close,
     .destroy = br_destroy,
@@ -2068,6 +2077,7 @@ struct window *browser_open(const char *url)
         return NULL;
     }
     b->win = w;
+    wm_set_min_size(w, 440, 240);
     b->next = browsers;
     browsers = b;
     set_status(b, "Ready");

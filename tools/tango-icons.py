@@ -37,6 +37,7 @@ ICONS = {
     "System-installer.svg": "system-installer",
     "Accessories-text-editor.svg": "accessories-text-editor",
     "Internet-web-browser.svg": "internet-web-browser",
+    "Accessories-calculator.svg": "accessories-calculator",
     "Text-html.svg": "text-html",
     "Go-previous.svg": "go-previous",
     "Go-next.svg": "go-next",

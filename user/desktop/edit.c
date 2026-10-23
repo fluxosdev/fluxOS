@@ -1140,6 +1140,13 @@ static void ed_focus(struct window *w, int focused)
         paint(e);
 }
 
+static void ed_resize(struct window *w)
+{
+    struct ed *e = w->priv;
+    show_caret(e);
+    paint(e);
+}
+
 static void ed_close(struct window *w)
 {
     request(w->priv, A_CLOSE);
@@ -1163,6 +1170,7 @@ static const struct window_ops ed_ops = {
     .key = ed_key,
     .mouse = ed_mouse,
     .focus = ed_focus,
+    .resize = ed_resize,
     .close = ed_close,
     .destroy = ed_destroy,
 };

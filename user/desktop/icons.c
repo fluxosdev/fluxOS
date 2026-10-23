@@ -5,6 +5,7 @@
  * with rectangles on a 32x32 design grid takes its place.
  */
 #include <stdio.h>
+#include <string.h>
 #include "desktop.h"
 
 #define ICON_DIR "/usr/share/icons/tango"
@@ -187,6 +188,7 @@ static const char *const icon_names[ICON_COUNT] = {
     [ICON_INSTALL] = "system-installer",
     [ICON_EDITOR] = "accessories-text-editor",
     [ICON_BROWSER] = "internet-web-browser",
+    [ICON_CALC] = "accessories-calculator",
     [ICON_HTML] = "text-html",
     [ICON_BACK] = "go-previous",
     [ICON_FORWARD] = "go-next",
@@ -286,8 +288,82 @@ static const char *const arrow[CURSOR_H] = {
     "       XX   ",
 };
 
-void draw_cursor(struct surface *s, int x, int y)
+#define RS 15                   /* the resize pointers are RS x RS, hot spot in the middle */
+
+/* A double-headed arrow as a white shape with a black outline. */
+static void resize_mask(enum cursor_kind kind, uint8_t m[RS][RS])
 {
+    memset(m, 0, RS * RS);
+    int c = RS / 2;
+    switch (kind) {
+    case CUR_EW:
+    case CUR_NS:
+        for (int k = 0; k < 4; k++) {           /* arrow heads, tips at the ends */
+            for (int d = -k; d <= k; d++) {
+                m[c + d][1 + k] = m[c + d][RS - 2 - k] = 1;
+            }
+        }
+        for (int x = 4; x <= RS - 5; x++)
+            m[c][x] = 1;
+        if (kind == CUR_NS) {                   /* transpose */
+            for (int i = 0; i < RS; i++)
+                for (int j = i + 1; j < RS; j++) {
+                    uint8_t t = m[i][j];
+                    m[i][j] = m[j][i];
+                    m[j][i] = t;
+                }
+        }
+        break;
+    default:
+        /* NW-SE: heads are corner triangles, joined by a diagonal. */
+        for (int y = 0; y < 5; y++)
+            for (int x = 0; x < 5 - y; x++)
+                m[2 + y][2 + x] = m[RS - 3 - y][RS - 3 - x] = 1;
+        for (int i = 3; i <= RS - 4; i++)
+            m[i][i] = 1;
+        if (kind == CUR_NESW)                   /* mirror */
+            for (int j = 0; j < RS; j++)
+                for (int i = 0; i < RS / 2; i++) {
+                    uint8_t t = m[j][i];
+                    m[j][i] = m[j][RS - 1 - i];
+                    m[j][RS - 1 - i] = t;
+                }
+        break;
+    }
+}
+
+struct rect cursor_bounds(int x, int y, enum cursor_kind kind)
+{
+    if (kind == CUR_ARROW)
+        return mkrect(x, y, CURSOR_W, CURSOR_H);
+    return mkrect(x - RS / 2, y - RS / 2, RS, RS);
+}
+
+void draw_cursor(struct surface *s, int x, int y, enum cursor_kind kind)
+{
+    if (kind != CUR_ARROW) {
+        uint8_t m[RS][RS];
+        resize_mask(kind, m);
+        x -= RS / 2;
+        y -= RS / 2;
+        for (int j = 0; j < RS; j++)
+            for (int i = 0; i < RS; i++) {
+                if (m[j][i]) {
+                    gfx_pixel(s, x + i, y + j, C_WHITE);
+                    continue;
+                }
+                int near = 0;
+                for (int dj = -1; dj <= 1; dj++)
+                    for (int di = -1; di <= 1; di++) {
+                        int jj = j + dj, ii = i + di;
+                        if (jj >= 0 && jj < RS && ii >= 0 && ii < RS && m[jj][ii])
+                            near = 1;
+                    }
+                if (near)
+                    gfx_pixel(s, x + i, y + j, C_BLACK);
+            }
+        return;
+    }
     for (int j = 0; j < CURSOR_H; j++)
         for (int i = 0; i < CURSOR_W; i++) {
             char c = arrow[j][i];

@@ -19,7 +19,8 @@
 
 /* Window flags */
 #define WF_MINIMIZE 0x1         /* has a minimize button */
-#define WF_MAXIMIZE 0x2         /* shows a (disabled) maximize button */
+#define WF_MAXIMIZE 0x2         /* has a maximize button; with ops->resize the window
+                                   can also be maximized and resized */
 #define WF_MODAL    0x4         /* dims everything else while open */
 #define WF_NOTASK   0x8         /* no taskbar button */
 
@@ -45,6 +46,7 @@ enum icon_id {
     ICON_INSTALL,
     ICON_EDITOR,
     ICON_BROWSER,
+    ICON_CALC,
     ICON_HTML,
     ICON_BACK,
     ICON_FORWARD,
@@ -61,6 +63,9 @@ struct window_ops {
     /* Client coordinates; buttons is the MOUSE_* mask after the event. */
     void (*mouse)(struct window *w, int x, int y, int buttons, int changed);
     void (*wheel)(struct window *w, int steps);     /* positive: away from the user */
+    /* The window's size changed: w->content is a new, blank surface of the new
+     * size. Redraw it (and report it damaged). */
+    void (*resize)(struct window *w);
     void (*focus)(struct window *w, int focused);
     void (*close)(struct window *w);    /* close button or Alt+F4 */
     void (*destroy)(struct window *w);  /* free app data */
@@ -76,6 +81,9 @@ struct window {
     const struct window_ops *ops;
     void *priv;
     struct window *above;       /* z-order, bottom to top */
+    int maximized;
+    struct rect restore;        /* where the frame was before it was maximized */
+    int min_w, min_h;           /* smallest client area when resizing */
 };
 
 /* ---- screen and compositor (wm.c) ---- */
@@ -95,6 +103,7 @@ void wm_cascade(struct window *w);
 void wm_focus(struct window *w);
 struct window *wm_focused(void);
 void wm_set_title(struct window *w, const char *title);
+void wm_set_min_size(struct window *w, int client_w, int client_h);
 void wm_damage_client(struct window *w, struct rect r);  /* client coordinates */
 int wm_window_count(void);
 
@@ -106,7 +115,10 @@ unsigned int now_ms(void);
 /* ---- icons (icons.c) ---- */
 void draw_icon(struct surface *s, int x, int y, enum icon_id id, int size);   /* 16, 32, 48 */
 void draw_icon_selected(struct surface *s, int x, int y, enum icon_id id, int size);
-void draw_cursor(struct surface *s, int x, int y);
+enum cursor_kind { CUR_ARROW, CUR_EW, CUR_NS, CUR_NWSE, CUR_NESW };
+/* Draw the pointer with its hot spot at (x, y); cursor_bounds is what it covers. */
+void draw_cursor(struct surface *s, int x, int y, enum cursor_kind kind);
+struct rect cursor_bounds(int x, int y, enum cursor_kind kind);
 #define CURSOR_W 12
 #define CURSOR_H 19
 
@@ -114,7 +126,7 @@ void draw_cursor(struct surface *s, int x, int y);
 void draw_button(struct surface *s, struct rect r, const char *label, int pressed,
                  int is_default, int focused);
 void draw_title_button(struct surface *s, struct rect r, int glyph, int pressed, int disabled);
-enum { TB_CLOSE, TB_MINIMIZE, TB_MAXIMIZE };
+enum { TB_CLOSE, TB_MINIMIZE, TB_MAXIMIZE, TB_RESTORE };
 void draw_radio(struct surface *s, int x, int y, const char *label, int checked, int focused);
 void draw_separator(struct surface *s, int x, int y, int w);
 
@@ -143,6 +155,7 @@ void terminal_child_exited(int pid);
 void terminal_blink(void);
 
 struct window *files_open(const char *path);
+struct window *calculator_open(void);
 struct window *editor_open(const char *path);      /* path NULL: an empty document */
 void editor_blink(void);
 struct window *browser_open(const char *url);      /* url NULL: the home page */

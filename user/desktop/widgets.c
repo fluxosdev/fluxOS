@@ -50,6 +50,18 @@ static const char *const glyph_maximize[] = {
     "XXXXXXXXX",
 };
 
+static const char *const glyph_restore[] = {
+    "  XXXXXX",
+    "  XXXXXX",
+    "  X    X",
+    "XXXXXX X",
+    "XXXXXX X",
+    "X    XXX",
+    "X    X  ",
+    "X    X  ",
+    "XXXXXX  ",
+};
+
 static void draw_art(struct surface *s, int x, int y, const char *const *rows, int n, color_t c)
 {
     for (int j = 0; j < n; j++)
@@ -76,6 +88,12 @@ void draw_title_button(struct surface *s, struct rect r, int glyph, int pressed,
         n = 2;
         x += 4;
         y += 9;
+        break;
+    case TB_RESTORE:
+        art = glyph_restore;
+        n = 9;
+        x += 4;
+        y += 2;
         break;
     default:
         art = glyph_maximize;

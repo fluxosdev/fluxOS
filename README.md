@@ -1,5 +1,22 @@
 # fluxOS
 
+> **Warning: fluxOS is experimental. Do not use it as your daily driver.**
+> It is a hobby operating system, written to see how far one could go, not to
+> be relied on. It has no security model (one user, cosmetic permissions, no
+> firewall, an unaudited network stack), a young filesystem driver that can
+> lose or corrupt data, and plenty of bugs nobody has found yet. Run it in a
+> virtual machine, or on a computer with nothing on it you would miss, and
+> never connect it to a network you do not trust or keep anything important
+> on its disks.
+>
+> **It was built entirely with Claude.** Every line of fluxOS, from the
+> bootloader glue and kernel to the TCP/IP stack, the desktop and the web
+> browser, was written by [Claude](https://claude.ai), Anthropic's AI model,
+> working through [Claude Code](https://claude.com/claude-code) from
+> instructions given in conversation. No code was written by hand. It has
+> been tested by running it in QEMU, not reviewed or audited by people, so
+> read it with that in mind.
+
 fluxOS is a small 32-bit x86 Unix-like operating system with preemptive
 multitasking, ring-3 user processes, paging, a RAM root filesystem, IDE
 disk and CD-ROM drivers with FAT32 and ISO9660 support, an NE2000 network
@@ -135,6 +152,11 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   decoder (inflate included) and alpha-blends images, so any 8-bit,
   non-interlaced PNG can be shown; a missing icon file falls back to a
   simple built-in drawing.
+- Windows can be resized by dragging any edge or corner (the pointer turns
+  into a resize arrow), maximized and restored with the caption button or by
+  double-clicking the caption. The browser, text editor and file manager
+  resize; terminals, dialogs, the calculator and the image viewer have a
+  fixed size.
 - Windows move by dragging an outline, minimize to the taskbar, raise and take
   the focus when clicked, and cascade as they open.
 - Terminal windows: 80x25 VGA-style terminals running fsh on a
@@ -146,6 +168,12 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   get drive icons. Double-clicking a folder opens it, a program or script
   runs in a terminal window, a PNG opens in an image viewer, and any other
   file is shown with `more`.
+- Calculator: a Windows 95 style standard calculator with memory keys
+  (MC, MR, MS, M+), percent, square root, reciprocal, change sign, CE and
+  Back, usable with the mouse or the keyboard (digits, `+ - * /`, Enter, `%`,
+  `@` for square root, `r` for reciprocal, Delete for CE, Esc to clear). It
+  does exact decimal arithmetic on digit strings with 30 significant digits
+  (rounded to 24 on screen), so `0.1 + 0.2` is `0.3` and `1/3*3` is `1`.
 - Text editor: a Notepad-style window with File and Edit menus (New, Open,
   Save, Save As, Cut, Copy, Paste, Select All), a monospaced text area with
   both scroll bars, mouse and Shift+arrow selection, a clipboard shared
@@ -188,7 +216,7 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   the kernel which filesystem it booted from, and a system started from an
   installed hard disk hides the icon and the Start menu entry. (`fluxinstall`
   still works from a shell there.)
-- Start menu: Terminal, File Manager, Text Editor, Web Browser, Read Me, System Properties (version,
+- Start menu: Terminal, File Manager, Text Editor, Web Browser, Calculator, Read Me, System Properties (version,
   memory, display, uptime), Run... (runs a command in a new window), Install
   fluxOS..., and Shut Down... (power off, restart, or close the desktop and
   return to the text console).
@@ -342,7 +370,8 @@ user/
   fsh/                     the shell: lexer, parser, expansion, executor, editor
   desktop/                 the desktop: compositor and window manager (wm.c),
                            terminal emulator, file manager and image viewer
-                           (files.c), the text editor (edit.c), the Setup
+                           (files.c), the text editor (edit.c), the calculator
+                           (calc.c), the Setup
                            wizard (setup.c), dialogs,
                            drawing, PNG decoding (png.c), icons, fonts,
                            and the web browser: its window (browser.c), HTML
@@ -471,7 +500,9 @@ Storage limits:
   2-second resolution.
 
 The desktop's terminals are a fixed 80x25 and keep no scrollback, windows
-cannot be resized, and the only clipboard is the text editor's. The editor
+are resized by an outline (the contents redraw when you let go), dialogs,
+terminals and the calculator cannot be resized, and the only clipboard is
+the text editor's. The editor
 has no undo, no word wrap and no search, and shows only ASCII. While the desktop runs, the
 serial port's input goes to the unused console; its output still mirrors the
 kernel log.
