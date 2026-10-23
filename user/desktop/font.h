@@ -8,7 +8,7 @@ struct pglyph {
     uint8_t advance;            /* pen movement after the glyph */
     int8_t xoff;                /* ink start relative to the pen */
     uint8_t width;              /* ink columns in bits (<= 16) */
-    const uint16_t *bits;       /* `height` rows, MSB leftmost */
+    const uint8_t *cov;         /* height rows of `width` pixels, 0-15 coverage */
 };
 
 struct pfont {

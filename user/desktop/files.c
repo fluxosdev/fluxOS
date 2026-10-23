@@ -126,6 +126,8 @@ static enum icon_id classify(struct fm *f, const struct entry *e, const char *pa
     }
     if (has_suffix(e->name, ".png"))
         return ICON_IMAGE;
+    if (has_suffix(e->name, ".html") || has_suffix(e->name, ".htm"))
+        return ICON_HTML;
     struct stat st;
     if (stat(path, &st) == 0 && (st.st_mode & 0111) && is_program(path))
         return ICON_RUN;
@@ -462,6 +464,10 @@ static void open_entry(struct fm *f, int i)
             snprintf(msg, sizeof(msg), "%s is not a PNG image fluxOS can show.", e->name);
             message_box("Image Viewer", ICON_WARNING, msg);
         }
+    } else if (e->icon == ICON_HTML) {
+        char url[PATH_MAX + 8];
+        snprintf(url, sizeof(url), "file://%s", path);
+        browser_open(url);
     } else if (e->icon == ICON_RUN) {
         const char *argv[] = { path, NULL };
         terminal_open(e->name, argv, 1, 0);

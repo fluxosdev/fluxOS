@@ -9,7 +9,9 @@ struct pci_dev {
 };
 
 #define PCI_COMMAND   0x04
+#define PCI_BAR0      0x10
 #define PCI_BAR4      0x20
+#define PCI_INTERRUPT 0x3C          /* low byte: the IRQ line the BIOS routed */
 
 #define PCI_CMD_IO      0x1
 #define PCI_CMD_MASTER  0x4
@@ -20,5 +22,8 @@ void pci_write32(const struct pci_dev *p, int off, uint32_t v);
 /* Find the first device whose class code (class << 8 | subclass) matches.
  * Fills in the programming interface byte. Returns 0, or -1 if none. */
 int pci_find_class(uint16_t class_sub, struct pci_dev *out, uint8_t *prog_if);
+
+/* Find the first device with this vendor and device ID. Returns 0, or -1. */
+int pci_find_device(uint16_t vendor, uint16_t device, struct pci_dev *out);
 
 #endif

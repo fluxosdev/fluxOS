@@ -280,7 +280,7 @@ static int unfilter(uint8_t *data, int h, uint32_t stride, int bpp)
     return 0;
 }
 
-static struct image *decode_png(const uint8_t *p, uint32_t n)
+struct image *image_decode_png(const uint8_t *p, uint32_t n)
 {
     static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n' };
     if (n < 8 || memcmp(p, sig, 8))
@@ -401,7 +401,7 @@ struct image *image_load_png(const char *path)
         while (buf && got < st.st_size && (r = (int)read(fd, buf + got, st.st_size - got)) > 0)
             got += (uint32_t)r;
         if (buf && got == st.st_size)
-            img = decode_png(buf, got);
+            img = image_decode_png(buf, got);
         free(buf);
     }
     close(fd);

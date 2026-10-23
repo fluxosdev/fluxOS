@@ -36,6 +36,13 @@ ICONS = {
     "Edit-delete.svg": "edit-delete",
     "System-installer.svg": "system-installer",
     "Accessories-text-editor.svg": "accessories-text-editor",
+    "Internet-web-browser.svg": "internet-web-browser",
+    "Text-html.svg": "text-html",
+    "Go-previous.svg": "go-previous",
+    "Go-next.svg": "go-next",
+    "Go-home.svg": "go-home",
+    "View-refresh.svg": "view-refresh",
+    "Process-stop.svg": "process-stop",
 }
 SIZES = (16, 32, 48)
 SOURCE_PX = 250         # a standard Commons thumbnail width, scaled down from here

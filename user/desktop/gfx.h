@@ -69,6 +69,7 @@ struct image {
 };
 
 struct image *image_load_png(const char *path);     /* NULL if unreadable */
+struct image *image_decode_png(const uint8_t *data, uint32_t len);
 void image_free(struct image *img);
 void gfx_image(struct surface *s, int x, int y, const struct image *img);
 /* Blend `tint` over the image's opaque half, like a selected Win95 icon. */

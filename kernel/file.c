@@ -1,9 +1,10 @@
 /*
  * Open file descriptions (shared between descriptors after dup/fork),
- * anonymous pipes and poll(2).
+ * anonymous pipes, sockets and poll(2).
  */
 #include "kernel.h"
 #include "mm.h"
+#include "net.h"
 #include "proc.h"
 #include "vfs.h"
 #include "drivers.h"
@@ -26,6 +27,18 @@ struct file *file_open(struct vnode *vn, int flags)
     f->refs = 1;
     f->vn = vn;
     vfs_ref(vn);
+    return f;
+}
+
+struct file *file_socket(struct socket *s)
+{
+    struct file *f = kzalloc(sizeof(*f));
+    if (!f)
+        return NULL;
+    f->type = FT_SOCKET;
+    f->flags = O_RDWR;
+    f->refs = 1;
+    f->sock = s;
     return f;
 }
 
@@ -52,6 +65,8 @@ void file_close(struct file *f)
         return;
     if (f->type == FT_VNODE) {
         vfs_unref(f->vn);
+    } else if (f->type == FT_SOCKET) {
+        sock_close(f->sock);
     } else if (f->type == FT_PIPE) {
         struct pipe *p = f->pipe;
         if (can_write(f))
@@ -112,6 +127,8 @@ int file_read(struct file *f, void *buf, uint32_t n)
         return -EBADF;
     if (f->type == FT_PIPE)
         return pipe_read(f->pipe, buf, n);
+    if (f->type == FT_SOCKET)
+        return sock_recvfrom(f->sock, buf, n, 0, NULL);
     int r = vfs_read(f->vn, buf, f->off, n);
     if (r > 0)
         f->off += (uint32_t)r;
@@ -124,6 +141,8 @@ int file_write(struct file *f, const void *buf, uint32_t n)
         return -EBADF;
     if (f->type == FT_PIPE)
         return pipe_write(f->pipe, buf, n);
+    if (f->type == FT_SOCKET)
+        return sock_sendto(f->sock, buf, n, 0, NULL);
     if ((f->flags & O_APPEND) && f->vn->type == VN_FILE)
         f->off = f->vn->size;
     int r = vfs_write(f->vn, buf, f->off, n);
@@ -167,6 +186,8 @@ int file_poll(struct file *f, int events)
             if (p->writers <= 0)
                 ready |= POLLHUP;
         }
+    } else if (f->type == FT_SOCKET) {
+        ready = sock_poll(f->sock);
     } else if (f->vn->type == VN_CHR && f->vn->dev_poll) {
         ready = f->vn->dev_poll(f->vn);
     } else {

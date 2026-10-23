@@ -23,7 +23,7 @@ int input_grabbed(void)
 static int same_motion(const struct input_event *a, const struct input_event *b)
 {
     return a->type == IEV_MOUSE && b->type == IEV_MOUSE &&
-           a->flags == b->flags && a->mods == b->mods;
+           a->flags == b->flags && a->mods == b->mods && !a->code && !b->code;
 }
 
 /* Called from IRQ handlers. */

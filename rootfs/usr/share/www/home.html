@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>fluxOS Web Browser</title>
+<style>
+body { font-family: sans-serif; margin: 0; background: #f3f0f7; color: #222; }
+.banner { background: #3f175f; color: white; padding: 18px 28px 16px; border-bottom: 4px solid #f08020; }
+.banner h1 { margin: 0; font-size: 28px; }
+.banner p { margin: 4px 0 0; color: #d9c8ea; }
+.main { padding: 4px 28px 20px; max-width: 700px; }
+form { margin: 18px 0 8px; padding: 10px 12px; background: white; border: 1px solid #d6cce2; }
+h2 { font-size: 17px; color: #3f175f; border-bottom: 1px solid #c9b8da; padding-bottom: 3px; margin-top: 22px; }
+ul { padding-left: 22px; margin: 8px 0; }
+li { margin: 5px 0; }
+li span { color: #666; }
+.note { font-size: 13px; color: #444; background: #fffbe6; border: 1px solid #e6d9a2; padding: 8px 12px; margin-top: 22px; }
+kbd { font-family: monospace; background: #eee; border: 1px solid #bbb; padding: 0 3px; }
+</style>
+</head>
+<body>
+<div class="banner">
+<h1>fluxOS Web Browser</h1>
+<p>HTML and CSS over plain HTTP, on a 32-bit hobby operating system</p>
+</div>
+<div class="main">
+
+<form action="http://wiby.me/" method="get">
+Search the classic web: <input name="q" size="32"> <input type="submit" value="Search wiby.me">
+</form>
+
+<h2>Made for simple browsers</h2>
+<ul>
+<li><a href="http://68k.news/">68k.news</a> <span>&mdash; news headlines for vintage computers</span></li>
+<li><a href="http://wiby.me/">wiby.me</a> <span>&mdash; a search engine for the classic web</span></li>
+<li><a href="http://www.textfiles.com/">textfiles.com</a> <span>&mdash; text files from the BBS era</span></li>
+<li><a href="http://info.cern.ch/hypertext/WWW/TheProject.html">The World Wide Web project</a> <span>&mdash; the first web site, at CERN</span></li>
+</ul>
+
+<h2>More sites that still speak plain HTTP</h2>
+<ul>
+<li><a href="http://example.com/">example.com</a></li>
+<li><a href="http://neverssl.com/">NeverSSL</a></li>
+<li><a href="http://www.gnu.org/">The GNU Project</a></li>
+<li><a href="http://danluu.com/">Dan Luu&rsquo;s blog</a></li>
+<li><a href="http://acme.com/">ACME Laboratories</a></li>
+<li><a href="http://www.catb.org/~esr/faqs/hacker-howto.html">How To Become A Hacker</a></li>
+</ul>
+
+<h2>On this computer</h2>
+<ul>
+<li><a href="test.html">The browser test page</a> <span>&mdash; what the HTML and CSS engine can do</span></li>
+<li><a href="file:///home/flux/">Your home folder</a></li>
+</ul>
+
+<p class="note">Secure <b>https://</b> sites cannot be shown: this browser has no TLS.
+Type an address in the bar above (<kbd>Ctrl+L</kbd>), use <kbd>Alt+Left</kbd> to go back,
+and <kbd>F5</kbd> to reload. <b>wget</b>, <b>ping</b> and <b>ifconfig</b> in a terminal
+help when a page will not load.</p>
+</div>
+</body>
+</html>

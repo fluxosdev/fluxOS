@@ -179,6 +179,25 @@ static const struct pglyph *glyph(const struct pfont *f, char ch)
     return &f->glyphs[c - 32];
 }
 
+/* Blend c over the pixel under it, cov/15 of the way (cov is 1-14). */
+static uint32_t blend15(uint32_t under, uint32_t c, int cov)
+{
+    uint32_t out = 0;
+    for (int shift = 0; shift < 24; shift += 8) {
+        uint32_t u = under >> shift & 0xFF, v = c >> shift & 0xFF;
+        out |= ((u * (uint32_t)(15 - cov) + v * (uint32_t)cov + 7) / 15) << shift;
+    }
+    return out;
+}
+
+static void put_cov(uint32_t *px, color_t c, int cov)
+{
+    if (cov >= 15)
+        *px = c;
+    else if (cov > 0)
+        *px = blend15(*px, c, cov);
+}
+
 static void draw_glyph(struct surface *s, const struct pfont *f, const struct pglyph *g,
                        int x, int y, color_t c)
 {
@@ -187,13 +206,10 @@ static void draw_glyph(struct surface *s, const struct pfont *f, const struct pg
     if (rect_empty(r))
         return;
     for (int j = r.y; j < r.y + r.h; j++) {
-        uint16_t bits = g->bits[j - y];
-        if (!bits)
-            continue;
+        const uint8_t *cov = g->cov + (j - y) * g->width;
         uint32_t *row = s->px + j * s->stride;
         for (int i = r.x; i < r.x + r.w; i++)
-            if (bits & (0x8000 >> (i - gx)))
-                row[i] = c;
+            put_cov(&row[i], c, cov[i - gx]);
     }
 }
 
@@ -227,10 +243,11 @@ void gfx_text_up(struct surface *s, const struct pfont *f, int x, int y, const c
     for (; *str; str++) {
         const struct pglyph *g = glyph(f, *str);
         for (int j = 0; j < f->height; j++) {
-            uint16_t bits = g->bits[j];
-            for (int i = 0; bits && i < g->width; i++)
-                if (bits & (0x8000 >> i))
-                    gfx_pixel(s, x + j, y - g->xoff - i, c);
+            for (int i = 0; i < g->width; i++) {
+                int px = x + j, py = y - g->xoff - i, cv = g->cov[j * g->width + i];
+                if (cv && rect_contains(s->clip, px, py))
+                    put_cov(&s->px[py * s->stride + px], c, cv);
+            }
         }
         y -= g->advance;
     }

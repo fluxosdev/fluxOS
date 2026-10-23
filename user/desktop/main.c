@@ -16,7 +16,7 @@
 #include "desktop.h"
 
 #define MAX_TERMS   32
-#define MAX_WATCHES 8
+#define MAX_WATCHES 16
 #define BLINK_MS    500
 
 /* Other descriptors the loop waits on, such as the installer's pipe. */
@@ -111,6 +111,7 @@ int main(void)
         while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
             terminal_child_exited(pid);
             setup_child_exited(pid, status);
+            browser_child_exited(pid, status);
         }
 
         unsigned int now = now_ms();
@@ -118,11 +119,13 @@ int main(void)
             last_blink = now;
             terminal_blink();
             editor_blink();
+            browser_blink();
         }
         if (now - last_tick >= 1000) {
             last_tick = now;
             wm_tick();
             about_tick();
+            browser_tick();
         }
         wm_flush();
     }

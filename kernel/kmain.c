@@ -10,6 +10,7 @@
 #include "fs.h"
 #include "mm.h"
 #include "multiboot.h"
+#include "net.h"
 #include "proc.h"
 #include "tty.h"
 #include "vfs.h"
@@ -138,6 +139,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
 
     ata_init();
     vfs_automount();
+    net_init();
 
     proc_init();
     proc_spawn_init("/bin/init");

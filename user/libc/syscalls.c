@@ -10,7 +10,9 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/mount.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/utsname.h>
@@ -45,6 +47,14 @@ static inline int sc3(int n, int a, int b, int c)
 {
     int r;
     __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a), "c"(b), "d"(c) : "memory");
+    return r;
+}
+
+static inline int sc5(int n, int a, int b, int c, int d, int e)
+{
+    int r;
+    __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a), "c"(b), "d"(c), "S"(d), "D"(e)
+                     : "memory");
     return r;
 }
 
@@ -251,3 +261,78 @@ int remove(const char *path)
         return -1;
     return S_ISDIR(st.st_mode) ? rmdir(path) : unlink(path);
 }
+
+/* ---- sockets ---- */
+
+int socket(int domain, int type, int protocol)
+{
+    return ret(sc3(SYS_socket, domain, type, protocol));
+}
+
+int bind(int fd, const struct sockaddr *addr, socklen_t len)
+{
+    return ret(sc3(SYS_bind, fd, (int)addr, (int)len));
+}
+
+int connect(int fd, const struct sockaddr *addr, socklen_t len)
+{
+    return ret(sc3(SYS_connect, fd, (int)addr, (int)len));
+}
+
+int listen(int fd, int backlog) { return ret(sc2(SYS_listen, fd, backlog)); }
+
+/* The kernel always fills a whole sockaddr_in; give the caller what fits. */
+static void give_addr(const struct sockaddr_in *sin, struct sockaddr *addr, socklen_t *len)
+{
+    if (!addr || !len)
+        return;
+    memcpy(addr, sin, *len < sizeof(*sin) ? *len : sizeof(*sin));
+    *len = sizeof(*sin);
+}
+
+int accept(int fd, struct sockaddr *addr, socklen_t *len)
+{
+    struct sockaddr_in sin;
+    int r = ret(sc2(SYS_accept, fd, (int)&sin));
+    if (r >= 0)
+        give_addr(&sin, addr, len);
+    return r;
+}
+
+ssize_t sendto(int fd, const void *buf, size_t n, int flags, const struct sockaddr *to,
+               socklen_t len)
+{
+    if (to && len < sizeof(struct sockaddr_in)) {
+        errno = EINVAL;
+        return -1;
+    }
+    return ret(sc5(SYS_sendto, fd, (int)buf, (int)n, flags, (int)to));
+}
+
+ssize_t recvfrom(int fd, void *buf, size_t n, int flags, struct sockaddr *from, socklen_t *len)
+{
+    struct sockaddr_in sin;
+    int r = ret(sc5(SYS_recvfrom, fd, (int)buf, (int)n, flags, from ? (int)&sin : 0));
+    if (r >= 0)
+        give_addr(&sin, from, len);
+    return r;
+}
+
+ssize_t send(int fd, const void *buf, size_t n, int flags) { return sendto(fd, buf, n, flags, NULL, 0); }
+ssize_t recv(int fd, void *buf, size_t n, int flags) { return recvfrom(fd, buf, n, flags, NULL, NULL); }
+int shutdown(int fd, int how) { return ret(sc2(SYS_shutdown, fd, how)); }
+
+static int sockname(int fd, struct sockaddr *addr, socklen_t *len, int peer)
+{
+    struct sockaddr_in sin;
+    int r = ret(sc3(SYS_sockname, fd, (int)&sin, peer));
+    if (r == 0)
+        give_addr(&sin, addr, len);
+    return r;
+}
+
+int getsockname(int fd, struct sockaddr *addr, socklen_t *len) { return sockname(fd, addr, len, 0); }
+int getpeername(int fd, struct sockaddr *addr, socklen_t *len) { return sockname(fd, addr, len, 1); }
+
+int netinfo(struct netinfo *ni) { return ret(sc1(SYS_netinfo, (int)ni)); }
+int netconf(const struct netinfo *ni) { return ret(sc1(SYS_netconf, (int)ni)); }

@@ -186,6 +186,13 @@ static const char *const icon_names[ICON_COUNT] = {
     [ICON_DELETE] = "edit-delete",
     [ICON_INSTALL] = "system-installer",
     [ICON_EDITOR] = "accessories-text-editor",
+    [ICON_BROWSER] = "internet-web-browser",
+    [ICON_HTML] = "text-html",
+    [ICON_BACK] = "go-previous",
+    [ICON_FORWARD] = "go-next",
+    [ICON_STOP] = "process-stop",
+    [ICON_REFRESH] = "view-refresh",
+    [ICON_HOMEPAGE] = "go-home",
 };
 
 static const int icon_sizes[] = { 16, 32, 48 };

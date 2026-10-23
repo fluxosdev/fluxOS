@@ -19,6 +19,10 @@ int blkrescan(const char *disk);         /* re-read the partition table */
 /* Pseudo-terminal: fds[0] is the master, fds[1] the slave (a terminal). */
 int openpty(int fds[2]);
 
+/* The network interface. netconf with NETF_DHCP set asks DHCP for an address. */
+int netinfo(struct netinfo *ni);
+int netconf(const struct netinfo *ni);
+
 /* The boot framebuffer. fbmap maps it and takes the screen from the console. */
 int fbinfo(struct fbinfo *fi);
 void *fbmap(void);

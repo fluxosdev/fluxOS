@@ -59,7 +59,18 @@
 #define SYS_fbmap     51
 #define SYS_openpty   52
 #define SYS_poll      53
+#define SYS_socket    54
+#define SYS_bind      55
+#define SYS_connect   56
+#define SYS_listen    57
+#define SYS_accept    58
+#define SYS_sendto    59
+#define SYS_recvfrom  60
+#define SYS_shutdown  61
+#define SYS_sockname  62
+#define SYS_netinfo   63
+#define SYS_netconf   64
 
-#define NSYSCALLS     54
+#define NSYSCALLS     65
 
 #endif

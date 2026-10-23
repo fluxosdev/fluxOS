@@ -2,8 +2,9 @@
 
 fluxOS is a small 32-bit x86 Unix-like operating system with preemptive
 multitasking, ring-3 user processes, paging, a RAM root filesystem, IDE
-disk and CD-ROM drivers with FAT32 and ISO9660 support, a zsh-flavoured
-shell called **fsh**, and a Windows 95 style graphical desktop. It boots with
+disk and CD-ROM drivers with FAT32 and ISO9660 support, an NE2000 network
+driver with a TCP/IP stack, a zsh-flavoured shell called **fsh**, and a
+Windows 95 style graphical desktop with a web browser. It boots with
 GRUB (Multiboot) from an ISO image, straight into the desktop.
 
 ```
@@ -67,14 +68,39 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   echo, erase/kill/word-erase and EOF.
 - Graphics and input: GRUB sets a 1024x768x32 mode, which the kernel maps and
   lends to one process at a time (`fbinfo`, `fbmap`); the console takes the
-  screen back when that process exits. A PS/2 mouse driver, which uses the
-  VMware/QEMU "vmmouse" interface for absolute positioning when it is there,
-  and `/dev/input`, which delivers keyboard and mouse events to the desktop.
+  screen back when that process exits. A PS/2 mouse driver with IntelliMouse
+  wheel support, which uses the VMware/QEMU "vmmouse" interface for absolute
+  positioning (and the wheel) when it is there, and `/dev/input`, which
+  delivers keyboard and mouse events to the desktop.
 - Pseudo-terminals (`openpty`) that share the console's line discipline, with
   a controlling terminal per process, hangup (`SIGHUP`) when the master side
   closes, and `poll` over terminals, pipes and devices.
 - Kernel log (`dmesg`), CMOS clock, reboot and ACPI power-off (QEMU, Bochs,
   VirtualBox).
+- Networking:
+  - An NE2000 driver for the PCI RTL8029 (QEMU's `ne2k_pci`) and its clones,
+    or an ISA card at 0x300 or 0x280 (QEMU's `ne2k_isa`). It receives into
+    the card's ring buffer from its interrupt handler, recovers from ring
+    overflows, and moves frames with 16-bit programmed I/O.
+  - Ethernet and ARP (a 16-entry cache that holds the newest packet while it
+    resolves), IPv4 with checksums but no fragments, ICMP echo replies and
+    "port unreachable", UDP, and a loopback path for `127.0.0.0/8` and our own
+    address.
+  - TCP: the full connection state machine with listening sockets and an
+    accept queue, an RTT estimate per connection (RFC 6298), retransmission
+    with exponential backoff, fast retransmit after three duplicate ACKs,
+    zero-window probes, `TIME_WAIT`, and resets for closed ports. The window
+    each connection offers is capped so that bursts fit in the NE2000's
+    receive ring.
+  - A DHCP client in the kernel configures the interface at boot and renews
+    its lease; `net.ip=10.0.2.15/24 net.gw=10.0.2.2 net.dns=10.0.2.3` on the
+    kernel command line sets an address by hand instead.
+  - BSD sockets (`socket`, `bind`, `connect`, `listen`, `accept`, `send`,
+    `recv`, `sendto`, `recvfrom`, `shutdown`, `getsockname`, `getpeername`)
+    for TCP, UDP and ICMP echo ("ping sockets", as in Linux). Sockets are
+    file descriptors, so `read`, `write`, `poll` and `close` work on them.
+  - The C library resolves host names from `/etc/hosts` and then by DNS,
+    with the server DHCP gave us.
 
 **fsh, the flux shell (zsh-flavoured)**
 - zsh prompt escapes in `PROMPT`/`RPROMPT`: `%n %m %~ %# %? %F{color} %B
@@ -100,7 +126,9 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
 - Windows 95 look: a dark purple (`#3f175f`) desktop with icons, a taskbar
   along the bottom with a Start button, a button for each window and a clock,
   beveled window frames with caption buttons, and the Win95 system colors.
-  UI text uses bitmap fonts rasterised from Liberation Sans.
+  UI text is anti-aliased (4 bits of coverage per pixel, rasterised from
+  Liberation Sans); only the terminals and the text editor's monospace text keep
+  the sharp 8x16 bitmap font.
 - Icons are PNG images from the public-domain [Tango icon
   theme](https://commons.wikimedia.org/wiki/Tango_icons), in
   `/usr/share/icons/tango/{16x16,32x32,48x48}`. The desktop has its own PNG
@@ -126,6 +154,30 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   extension, keeps CRLF files as CRLF, and asks "Save changes?" before
   discarding anything. Double-clicking a `.txt`, `.md`, `.log`, `.cfg`,
   `.conf`, `.ini`, `.c` or `.h` file in the file manager opens it there.
+- Web browser: an Internet Explorer 3 style window (the **Web Browser** icon)
+  with Back, Forward, Stop, Refresh and Home, an address bar, a progress
+  gauge, and the address of the link under the mouse in its status bar. It
+  fetches pages over plain HTTP (by running `wget`, so the desktop keeps
+  working while a page loads), then their style sheets and PNG pictures,
+  and opens `file://` pages and folders too.
+  - Its HTML parser follows the main rules of the HTML5 tree builder (implied
+    and auto-closed tags, tables, character references, quirks mode) and
+    takes UTF-8, Latin-1 and Windows-1252.
+  - Its CSS supports type, class, id, attribute and structural selectors
+    with all four combinators, `:not()` and `:is()`, specificity and
+    `!important`, `@media` queries, custom properties with `var()`,
+    `::before`/`::after` text, and the old presentational attributes
+    (`bgcolor`, `<font>`, `align`, `cellpadding`...).
+  - Its layout does blocks with margin collapsing, inline text with line
+    breaking and alignment, inline-blocks, lists with markers, tables with
+    `colspan`, `rowspan` and automatic column widths, flex rows, borders,
+    backgrounds, images and form controls, with a scroll wheel.
+  - Links, `GET` and `POST` forms (text fields, check boxes, radio buttons,
+    selects, buttons), `<meta refresh>`, fragments (`#name`), redirects, and
+    `:visited` colors work. Text is anti-aliased: Liberation Sans, Serif and
+    Mono in 12 sizes are rasterised by `tools/mkfont.py` with 4 bits of
+    coverage per pixel (the file is 2.6 MB), and drawing blends each pixel
+    with the background.
 - Setup: a Win95-style wizard (the **Install fluxOS** icon) that installs
   fluxOS on a hard disk. It lists the disks, greying out any that are too
   small or hold the install files, asks you to confirm that the chosen disk
@@ -136,7 +188,7 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   the kernel which filesystem it booted from, and a system started from an
   installed hard disk hides the icon and the Start menu entry. (`fluxinstall`
   still works from a shell there.)
-- Start menu: Terminal, File Manager, Text Editor, Read Me, System Properties (version,
+- Start menu: Terminal, File Manager, Text Editor, Web Browser, Read Me, System Properties (version,
   memory, display, uptime), Run... (runs a command in a new window), Install
   fluxOS..., and Shut Down... (power off, restart, or close the desktop and
   return to the text console).
@@ -145,10 +197,19 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   Dialogs follow Tab, Enter, Escape and the arrow keys.
 
 **Userland** (`/bin`): basename cat chmod clear cp date desktop df dirname dmesg echo
-env fetch fluxinstall free fsh grep halt head hexdump init ls lsblk mkdir mkfs.fat more
-mount mv poweroff ps reboot rm rmdir seq sh sleep sort spin stat sync tail tee
-top touch tr umount uname uniq uptime wc yes, all on a small libc (stdio, malloc,
-environ, dirent, time).
+env fetch fluxinstall free fsh grep halt head hexdump host ifconfig init ls lsblk
+mkdir mkfs.fat more mount mv nc ping poweroff ps reboot rm rmdir seq sh sleep sort
+spin stat sync tail tee top touch tr umount uname uniq uptime wc wget yes, all on a
+small libc (stdio, malloc, environ, dirent, time, sockets and a DNS resolver).
+The network tools:
+- `ifconfig` shows the interface (address, lease, MAC, counters) and sets a
+  static address (`ifconfig ne0 10.0.2.15 netmask 255.255.255.0 gw 10.0.2.2
+  dns 10.0.2.3`) or asks DHCP again (`ifconfig ne0 dhcp`).
+- `ping [-c N] HOST`, `host NAME`, and `nc HOST PORT`, `nc -l PORT` and
+  `nc -u HOST PORT` (netcat).
+- `wget [-q] [-O FILE] [-T SECONDS] [--save-headers] [--content-on-error]
+  [--max-redirect=N] [--post-data=STRING] URL` downloads over HTTP/1.0,
+  following redirects and decoding chunked bodies.
 
 ## Building
 
@@ -166,11 +227,16 @@ libgcc or the host libc.
 make            # builds build/fluxos.kernel, build/initrd.tar and fluxOS.iso
 make check      # verifies the kernel is a valid Multiboot image
 make disk       # creates fluxdisk.img, a 64 MiB FAT32 data disk (DISK_MB=...)
-make run        # boots the ISO in QEMU with fluxdisk.img as /dev/hda
+make run        # boots the ISO in QEMU with fluxdisk.img as /dev/hda and an NE2000
 make run-kernel # boots the kernel directly with QEMU's Multiboot loader (text console)
 make run-disk   # boots fluxdisk.img alone, after installing fluxOS onto it
 make clean      # removes build/ and the ISO; fluxdisk.img is kept
 ```
+
+The QEMU targets give the machine an NE2000 card on QEMU's user-mode
+network, which hands out an address by DHCP and reaches the internet
+through the host; change `QEMU_NET` (for example to `-netdev
+user,id=net0 -device ne2k_isa,netdev=net0`) for an ISA card instead.
 
 To boot real hardware or another VM, write `fluxOS.iso` to a USB stick or
 attach it as a CD-ROM, and boot in **legacy BIOS** mode; UEFI is untested.
@@ -213,7 +279,10 @@ kernel and initrd, and its FAT32 partition is where files persist.
 
 On the desktop: double-click **My Computer** to browse files, drag windows by their title
 bars, open more terminals from the Start menu, try **Run...** with `ls -l /bin`,
-and open **Shut Down...** to see the screen dim. In a terminal:
+and open **Shut Down...** to see the screen dim. Double-click **Web Browser**
+and follow the links on its home page (68k.news, wiby.me and textfiles.com are
+made for simple browsers), search from it, or type `example.com` in the address
+bar. In a terminal:
 
 ```sh
 fetch                          # system summary
@@ -229,6 +298,10 @@ lsblk; df -h; mount            # disks, CD-ROM and mounted filesystems
 ls /mnt/cdrom/boot             # the boot CD itself, via ATAPI + ISO9660
 cp -r ~ /mnt/hda/home; ls -l /mnt/hda/home   # FAT32 writes survive reboots
 umount /mnt/hda; mkfs.fat -n MYDISK /dev/hda; mount /dev/hda /mnt/hda
+ifconfig; ping -c 3 10.0.2.2   # the network card, and QEMU's gateway
+host example.com               # DNS
+wget -O - http://example.com/  # HTTP over the TCP stack
+nc -l 7777 &  echo hi | nc localhost 7777    # a TCP server and client
 desktop                        # (from the text console) start the desktop
 poweroff
 ```
@@ -245,7 +318,8 @@ grub/grub.cfg              boot menu
 include/flux/              kernel <-> user ABI (syscall numbers, structs, errno)
 lib/                       string and printf routines and the 8x16 font, shared
                            by kernel and libc
-tools/mkfont.py            regenerates the font sources (needs Python and PIL)
+tools/mkfont.py            regenerates the fonts, including the browser's
+                           rootfs/usr/share/fonts/web.fnt (needs Python and PIL)
 tools/tango-icons.py       re-fetches and scales the Tango icons in rootfs/
 kernel/
   boot.S, entry.S          multiboot entry, ISR stubs, trap return, context switch
@@ -259,6 +333,9 @@ kernel/
   tty.c, vga.c, serial.c,  console stack: terminals and ptys, text console,
   keyboard.c, timer.c      serial port, PS/2 keyboard, PIT, RTC, power control
   fb.c, mouse.c, input.c   framebuffer, PS/2 mouse and vmmouse, /dev/input
+  ne2000.c                 NE2000 network card driver (PCI and ISA)
+  net.c                    Ethernet, ARP, IPv4, ICMP, loopback, DHCP client
+  tcp.c, socket.c          TCP, and sockets (with UDP and ICMP echo)
   kmain.c                  boot sequence
 user/
   libc/, include/          the C library and its headers
@@ -267,10 +344,14 @@ user/
                            terminal emulator, file manager and image viewer
                            (files.c), the text editor (edit.c), the Setup
                            wizard (setup.c), dialogs,
-                           drawing, PNG decoding (png.c), icons, fonts
+                           drawing, PNG decoding (png.c), icons, fonts,
+                           and the web browser: its window (browser.c), HTML
+                           parser (html.c), CSS (css.c), layout and painting
+                           (layout.c), fonts (webfont.c) and URLs (webutil.c)
   bin/                     one program per file (fluxinstall.c is the installer)
 rootfs/                    files copied into the initrd (/etc, /home/flux,
-                           /usr/share/icons)
+                           /usr/share/icons, the browser's fonts and its
+                           home page in /usr/share/www)
 ```
 
 ## Design notes
@@ -328,6 +409,26 @@ for the cursor blink and the clock. A terminal's shell runs on the pty slave;
 when its last program exits the master reports a hangup and the window
 closes.
 
+**Networking.** The NE2000's interrupt handler passes each frame up the
+stack, and TCP's timers run from the timer interrupt, so packets are handled
+as they arrive, whatever is running. That is safe because the kernel runs
+with interrupts off: an interrupt can only arrive while a process is in user
+mode or the idle loop is halted, never in the middle of kernel code. A
+process waiting on a socket sleeps on it and is woken from the interrupt
+handler. Packets to our own address go through a loopback queue that the
+next timer tick delivers, so a reply is never built inside the code that
+sent the request. TCP keeps segments that arrive out of order out: it
+acknowledges what it has and the sender goes back and resends.
+
+**The browser** keeps everything a page owns in arenas: the document tree
+and style sheets in one, computed styles in a second that is rebuilt when a
+style sheet arrives, and the layout in a third that is rebuilt when a
+picture arrives. Layout produces a flat list of rectangles, text runs,
+images and controls in page coordinates, which painting clips to the view;
+a box whose size must be known first (an inline-block, a table cell) is laid
+out at the origin and moved into place. All of it is integer arithmetic:
+CSS numbers are fixed point with two decimals.
+
 **System calls.** `int 0x80` with the number in `eax` and arguments in `ebx`,
 `ecx`, `edx`, `esi` and `edi`. Failures return `-errno`. Every user pointer is
 checked against the user range and the current page tables before the kernel
@@ -374,6 +475,21 @@ cannot be resized, and the only clipboard is the text editor's. The editor
 has no undo, no word wrap and no search, and shows only ASCII. While the desktop runs, the
 serial port's input goes to the unused console; its output still mirrors the
 kernel log.
+
+Networking limits: IPv4 only, one network card, no IP fragments in either
+direction, and no TCP congestion control (the receiver's window is the only
+limit) or out-of-order buffering. DHCP renews by broadcast. ping times have
+the timer's 10 ms resolution.
+
+The web browser has no HTTPS (there is no TLS), so most of today's web is
+out of reach: it explains this and suggests the plain http:// address
+instead. It runs no JavaScript and shows only PNG pictures (GIF, JPEG and
+SVG show their alternative text). Its layout is an approximation: floats
+become inline-blocks, positioned elements stay in the normal flow (those
+hidden off-screen are dropped), grids are blocks, flex rows are lines of
+inline-blocks, and `calc()` takes its first length. It has no font downloads,
+cookies, cache of pages, or text selection, and characters outside Latin-1
+and common punctuation show as `?`.
 
 Permission bits are cosmetic apart from the exec bit, and there is a single
 user. Signals cannot have user handlers, and jobs

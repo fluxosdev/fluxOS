@@ -8,6 +8,7 @@
 #include "drivers.h"
 #include "fs.h"
 #include "mm.h"
+#include "net.h"
 #include "proc.h"
 #include "syscall.h"
 #include "tty.h"
@@ -453,7 +454,7 @@ static int sys_lseek(uint32_t fd, uint32_t off, uint32_t whence, uint32_t d, uin
     struct file *f = get_file(fd);
     if (!f)
         return -EBADF;
-    if (f->type == FT_PIPE)
+    if (f->type == FT_PIPE || f->type == FT_SOCKET)
         return -ESPIPE;
     if (f->vn->type == VN_CHR)
         return 0;
@@ -495,6 +496,12 @@ static int sys_fstat(uint32_t fd, uint32_t ust, uint32_t c, uint32_t d, uint32_t
     if (user_check((void *)ust, sizeof(struct stat)) < 0)
         return -EFAULT;
     struct stat *st = (struct stat *)ust;
+    if (f->type == FT_SOCKET) {
+        memset(st, 0, sizeof(*st));
+        st->st_mode = S_IFSOCK | 0777;
+        st->st_nlink = 1;
+        return 0;
+    }
     if (f->type == FT_PIPE) {
         memset(st, 0, sizeof(*st));
         st->st_mode = S_IFIFO | 0600;
@@ -599,6 +606,173 @@ static int sys_chmod(uint32_t upath, uint32_t mode, uint32_t c, uint32_t d, uint
         return -EROFS;
     vn->mode = mode & 07777;
     return 0;
+}
+
+/* ---- sockets ---- */
+
+static int get_socket(uint32_t fd, struct socket **out)
+{
+    struct file *f = get_file(fd);
+    if (!f)
+        return -EBADF;
+    if (f->type != FT_SOCKET)
+        return -ENOTSOCK;
+    *out = f->sock;
+    return 0;
+}
+
+/* Socket addresses are always a struct sockaddr_in; len is only checked. */
+static int copy_sockaddr(uint32_t uaddr, uint32_t len, struct sockaddr_in *out)
+{
+    if (len < sizeof(*out))
+        return -EINVAL;
+    if (user_check((void *)uaddr, sizeof(*out)) < 0)
+        return -EFAULT;
+    memcpy(out, (void *)uaddr, sizeof(*out));
+    return 0;
+}
+
+static int install_socket(struct socket *s)
+{
+    struct file *f = file_socket(s);
+    if (!f) {
+        sock_close(s);
+        return -ENOMEM;
+    }
+    int fd = alloc_fd(f);
+    if (fd < 0)
+        file_close(f);
+    return fd;
+}
+
+static int sys_socket(uint32_t domain, uint32_t type, uint32_t proto, uint32_t d, uint32_t e)
+{
+    (void)d; (void)e;
+    struct socket *s;
+    int r = sock_create((int)domain, (int)type, (int)proto, &s);
+    return r < 0 ? r : install_socket(s);
+}
+
+static int sys_bind(uint32_t fd, uint32_t uaddr, uint32_t len, uint32_t d, uint32_t e)
+{
+    (void)d; (void)e;
+    struct socket *s;
+    struct sockaddr_in sin;
+    int r = get_socket(fd, &s);
+    if (r == 0)
+        r = copy_sockaddr(uaddr, len, &sin);
+    return r < 0 ? r : sock_bind(s, &sin);
+}
+
+static int sys_connect(uint32_t fd, uint32_t uaddr, uint32_t len, uint32_t d, uint32_t e)
+{
+    (void)d; (void)e;
+    struct socket *s;
+    struct sockaddr_in sin;
+    int r = get_socket(fd, &s);
+    if (r == 0)
+        r = copy_sockaddr(uaddr, len, &sin);
+    return r < 0 ? r : sock_connect(s, &sin);
+}
+
+static int sys_listen(uint32_t fd, uint32_t backlog, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    struct socket *s;
+    int r = get_socket(fd, &s);
+    return r < 0 ? r : sock_listen(s, (int)backlog);
+}
+
+static int sys_accept(uint32_t fd, uint32_t uaddr, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    struct socket *s, *conn;
+    struct sockaddr_in peer;
+    int r = get_socket(fd, &s);
+    if (r < 0)
+        return r;
+    if (uaddr && user_check((void *)uaddr, sizeof(peer)) < 0)
+        return -EFAULT;
+    r = sock_accept(s, &conn, &peer);
+    if (r < 0)
+        return r;
+    r = install_socket(conn);
+    if (r >= 0 && uaddr)
+        memcpy((void *)uaddr, &peer, sizeof(peer));
+    return r;
+}
+
+static int sys_sendto(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, uint32_t uaddr)
+{
+    struct socket *s;
+    struct sockaddr_in sin;
+    int r = get_socket(fd, &s);
+    if (r < 0)
+        return r;
+    if (user_check((void *)buf, n) < 0)
+        return -EFAULT;
+    if (uaddr && (r = copy_sockaddr(uaddr, sizeof(sin), &sin)) < 0)
+        return r;
+    return sock_sendto(s, (const void *)buf, n, (int)flags, uaddr ? &sin : NULL);
+}
+
+static int sys_recvfrom(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, uint32_t uaddr)
+{
+    struct socket *s;
+    struct sockaddr_in sin;
+    int r = get_socket(fd, &s);
+    if (r < 0)
+        return r;
+    if (user_check((void *)buf, n) < 0 || (uaddr && user_check((void *)uaddr, sizeof(sin)) < 0))
+        return -EFAULT;
+    r = sock_recvfrom(s, (void *)buf, n, (int)flags, uaddr ? &sin : NULL);
+    if (r >= 0 && uaddr)
+        memcpy((void *)uaddr, &sin, sizeof(sin));
+    return r;
+}
+
+static int sys_shutdown(uint32_t fd, uint32_t how, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    struct socket *s;
+    int r = get_socket(fd, &s);
+    return r < 0 ? r : sock_shutdown(s, (int)how);
+}
+
+/* getsockname (peer 0) and getpeername (peer 1) */
+static int sys_sockname(uint32_t fd, uint32_t uaddr, uint32_t peer, uint32_t d, uint32_t e)
+{
+    (void)d; (void)e;
+    struct socket *s;
+    struct sockaddr_in sin;
+    int r = get_socket(fd, &s);
+    if (r < 0)
+        return r;
+    if (user_check((void *)uaddr, sizeof(sin)) < 0)
+        return -EFAULT;
+    r = sock_name(s, (int)peer, &sin);
+    if (r == 0)
+        memcpy((void *)uaddr, &sin, sizeof(sin));
+    return r;
+}
+
+static int sys_netinfo(uint32_t ubuf, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)b; (void)c; (void)d; (void)e;
+    if (user_check((void *)ubuf, sizeof(struct netinfo)) < 0)
+        return -EFAULT;
+    net_get_info((struct netinfo *)ubuf);
+    return 0;
+}
+
+static int sys_netconf(uint32_t ubuf, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)b; (void)c; (void)d; (void)e;
+    if (user_check((void *)ubuf, sizeof(struct netinfo)) < 0)
+        return -EFAULT;
+    struct netinfo ni;
+    memcpy(&ni, (void *)ubuf, sizeof(ni));
+    return net_configure(&ni);
 }
 
 /* ---- filesystems ---- */
@@ -859,6 +1033,17 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_fbmap] = sys_fbmap,
     [SYS_openpty] = sys_openpty,
     [SYS_poll] = sys_poll,
+    [SYS_socket] = sys_socket,
+    [SYS_bind] = sys_bind,
+    [SYS_connect] = sys_connect,
+    [SYS_listen] = sys_listen,
+    [SYS_accept] = sys_accept,
+    [SYS_sendto] = sys_sendto,
+    [SYS_recvfrom] = sys_recvfrom,
+    [SYS_shutdown] = sys_shutdown,
+    [SYS_sockname] = sys_sockname,
+    [SYS_netinfo] = sys_netinfo,
+    [SYS_netconf] = sys_netconf,
 };
 
 /* Calls that walk or change the VFS tree; read and write lock per chunk. */

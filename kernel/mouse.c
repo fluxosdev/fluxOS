@@ -1,9 +1,10 @@
 /*
  * PS/2 mouse on the i8042 auxiliary port (IRQ12), reported as relative
- * motion. Under QEMU, VMware and VirtualBox the VMware "vmmouse"
- * backdoor gives absolute positions instead, so the pointer follows the
- * host's without grabbing it; the PS/2 interrupt still signals that
- * data is waiting.
+ * motion, with a scroll wheel when the mouse speaks the IntelliMouse
+ * protocol. Under QEMU, VMware and VirtualBox the VMware "vmmouse"
+ * backdoor gives absolute positions (and the wheel) instead, so the
+ * pointer follows the host's without grabbing it; the PS/2 interrupt
+ * still signals that data is waiting.
  */
 #include "kernel.h"
 #include "arch.h"
@@ -30,8 +31,9 @@
 #define VMMOUSE_ERROR    0xFFFF0000
 #define VMMOUSE_RELATIVE 0x00010000
 
-static uint8_t packet[3];
+static uint8_t packet[4];
 static int npacket;
+static int packet_size = 3;             /* 4 with an IntelliMouse wheel */
 static int vmmouse;
 
 static void wait_write(void)
@@ -117,6 +119,7 @@ static void vmmouse_poll(void)
             ev.mods |= MOUSE_RIGHT;
         if (r.a & 0x08)
             ev.mods |= MOUSE_MIDDLE;
+        ev.code = (uint16_t)(int16_t)-(int8_t)r.d;     /* wheel: positive is away from the user */
         if (r.a & VMMOUSE_RELATIVE) {
             ev.x = (int16_t)(int32_t)r.b;
             ev.y = (int16_t)-(int32_t)r.c;
@@ -137,6 +140,8 @@ static void ps2_packet(void)
     ev.mods = packet[0] & 0x07;         /* left, right, middle */
     ev.x = (int16_t)(packet[1] - ((packet[0] << 4) & 0x100));
     ev.y = (int16_t)-(packet[2] - ((packet[0] << 3) & 0x100));
+    if (packet_size == 4)
+        ev.code = (uint16_t)(int16_t)-(int8_t)packet[3];
     input_push(&ev);
 }
 
@@ -153,7 +158,7 @@ static void mouse_irq(struct trapframe *tf)
         if (npacket == 0 && !(b & 0x08))
             continue;                   /* out of sync: wait for a first byte */
         packet[npacket++] = b;
-        if (npacket == 3) {
+        if (npacket == packet_size) {
             npacket = 0;
             ps2_packet();
         }
@@ -176,8 +181,20 @@ void mouse_init(void)
     outb(PS2_DATA, cfg);
 
     mouse_cmd(0xF6);                    /* defaults */
+    /* The IntelliMouse knock: sample rates 200, 100, 80 turn on the wheel. */
+    static const uint8_t knock[] = { 200, 100, 80 };
+    for (int i = 0; i < 3; i++) {
+        mouse_cmd(0xF3);
+        mouse_cmd(knock[i]);
+    }
+    mouse_cmd(0xF2);                    /* identify */
+    if (wait_read() && inb(PS2_DATA) == 3)
+        packet_size = 4;
+    mouse_cmd(0xF3);
+    mouse_cmd(100);                     /* back to the default rate */
     mouse_cmd(0xF4);                    /* start streaming */
     vmmouse = vmmouse_enable();
     irq_register(IRQ_MOUSE, mouse_irq);
-    boot_ok("PS/2 mouse ready%s", vmmouse ? " (absolute positioning via vmmouse)" : "");
+    boot_ok("PS/2 mouse ready%s%s", packet_size == 4 ? " with a wheel" : "",
+            vmmouse ? " (absolute positioning via vmmouse)" : "");
 }

@@ -42,6 +42,24 @@
 #define ENAMETOOLONG 36
 #define ENOSYS       38
 #define ENOTEMPTY    39
+#define ENOTSOCK     88
+#define EDESTADDRREQ 89
+#define EMSGSIZE     90
+#define EPROTOTYPE   91
+#define EPROTONOSUPPORT 93
+#define EOPNOTSUPP   95
+#define EAFNOSUPPORT 97
+#define EADDRINUSE   98
+#define EADDRNOTAVAIL 99
+#define ENETDOWN    100
+#define ENETUNREACH 101
+#define ECONNABORTED 103
+#define ECONNRESET  104
+#define EISCONN     106
+#define ENOTCONN    107
+#define ETIMEDOUT   110
+#define ECONNREFUSED 111
+#define EHOSTUNREACH 113
 
 /* ---- open(2) flags ---- */
 #define O_RDONLY     0x0000
@@ -65,11 +83,13 @@
 #define S_IFDIR  0x4000
 #define S_IFBLK  0x6000
 #define S_IFREG  0x8000
+#define S_IFSOCK 0xC000
 #define S_ISDIR(m)  (((m) & S_IFMT) == S_IFDIR)
 #define S_ISREG(m)  (((m) & S_IFMT) == S_IFREG)
 #define S_ISCHR(m)  (((m) & S_IFMT) == S_IFCHR)
 #define S_ISFIFO(m) (((m) & S_IFMT) == S_IFIFO)
 #define S_ISBLK(m)  (((m) & S_IFMT) == S_IFBLK)
+#define S_ISSOCK(m) (((m) & S_IFMT) == S_IFSOCK)
 
 struct stat {
     uint32_t st_ino;
@@ -262,7 +282,8 @@ struct input_event {
     uint8_t  flags;             /* IEV_PRESSED, IEV_ABS */
     uint8_t  mods;              /* key: KMOD_*; mouse: MOUSE_* buttons held */
     uint8_t  len;               /* key: bytes in text */
-    uint16_t code;              /* key: KEY_* code */
+    uint16_t code;              /* key: KEY_* code; mouse: wheel steps as an
+                                   int16_t, positive away from the user */
     int16_t  x, y;              /* mouse: motion (y grows down) or position */
     char     text[6];           /* key: what a terminal would receive */
 };
@@ -278,6 +299,64 @@ struct pollfd {
     int32_t fd;
     int16_t events;
     int16_t revents;
+};
+
+/* ---- sockets (IPv4 only) ---- */
+#define AF_INET 2
+#define PF_INET AF_INET
+
+#define SOCK_STREAM 1
+#define SOCK_DGRAM  2
+
+#define IPPROTO_IP   0
+#define IPPROTO_ICMP 1              /* SOCK_DGRAM: ICMP echo ("ping") sockets */
+#define IPPROTO_TCP  6
+#define IPPROTO_UDP  17
+
+#define SHUT_RD   0
+#define SHUT_WR   1
+#define SHUT_RDWR 2
+
+#define MSG_PEEK     0x02
+#define MSG_DONTWAIT 0x40
+
+#define INADDR_ANY       0x00000000u
+#define INADDR_BROADCAST 0xFFFFFFFFu
+#define INADDR_LOOPBACK  0x7F000001u
+
+/* Addresses and ports are in network byte order, as in BSD. */
+struct in_addr {
+    uint32_t s_addr;
+};
+
+struct sockaddr {
+    uint16_t sa_family;
+    char     sa_data[14];
+};
+
+struct sockaddr_in {
+    uint16_t sin_family;        /* AF_INET */
+    uint16_t sin_port;
+    struct in_addr sin_addr;
+    uint8_t  sin_zero[8];
+};
+
+/* ---- the network interface (SYS_netinfo, SYS_netconf) ---- */
+#define NETF_UP   0x1               /* a network card was found */
+#define NETF_DHCP 0x2               /* configure the address by DHCP */
+#define NETF_BOUND 0x4              /* has an address */
+
+/* Addresses in network byte order. */
+struct netinfo {
+    char     name[8];           /* "ne0" */
+    char     driver[32];
+    uint8_t  mac[6];
+    uint16_t flags;             /* NETF_* */
+    uint32_t addr, netmask, gateway, dns;
+    uint32_t io_base, irq;
+    uint32_t rx_packets, tx_packets, rx_bytes, tx_bytes;
+    uint32_t rx_errors, tx_errors, rx_dropped;
+    uint32_t lease_secs;        /* DHCP lease time left */
 };
 
 /* timer frequency; SYS_uptime reports milliseconds */

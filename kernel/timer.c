@@ -5,6 +5,7 @@
 #include "kernel.h"
 #include "arch.h"
 #include "drivers.h"
+#include "net.h"
 #include "proc.h"
 #include "x86.h"
 
@@ -18,6 +19,7 @@ static void timer_irq(struct trapframe *tf)
     (void)tf;
     ticks++;
     proc_tick();
+    net_tick();
 }
 
 void pit_init(uint32_t hz)

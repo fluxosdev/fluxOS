@@ -44,6 +44,13 @@ enum icon_id {
     ICON_DELETE,
     ICON_INSTALL,
     ICON_EDITOR,
+    ICON_BROWSER,
+    ICON_HTML,
+    ICON_BACK,
+    ICON_FORWARD,
+    ICON_STOP,
+    ICON_REFRESH,
+    ICON_HOMEPAGE,
     ICON_COUNT,
 };
 
@@ -53,6 +60,7 @@ struct window_ops {
     void (*key)(struct window *w, const struct input_event *ev);
     /* Client coordinates; buttons is the MOUSE_* mask after the event. */
     void (*mouse)(struct window *w, int x, int y, int buttons, int changed);
+    void (*wheel)(struct window *w, int steps);     /* positive: away from the user */
     void (*focus)(struct window *w, int focused);
     void (*close)(struct window *w);    /* close button or Alt+F4 */
     void (*destroy)(struct window *w);  /* free app data */
@@ -137,6 +145,10 @@ void terminal_blink(void);
 struct window *files_open(const char *path);
 struct window *editor_open(const char *path);      /* path NULL: an empty document */
 void editor_blink(void);
+struct window *browser_open(const char *url);      /* url NULL: the home page */
+void browser_child_exited(int pid, int status);
+void browser_blink(void);
+void browser_tick(void);
 void setup_open(void);
 void setup_child_exited(int pid, int status);
 void system_restart(void);

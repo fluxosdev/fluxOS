@@ -149,16 +149,18 @@ $(DISK):
 	else echo "$@: blank, run 'mkfs.fat /dev/hda' inside fluxOS"; fi
 
 QEMU_DISK := -drive file=$(DISK),format=raw,if=ide,index=0
+# An NE2000 card on QEMU's user-mode network: DHCP, DNS and NAT to the host's network.
+QEMU_NET  ?= -netdev user,id=net0 -device ne2k_pci,netdev=net0
 
 run: $(ISO) $(DISK)
-	$(QEMU) -m 128M -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK)
+	$(QEMU) -m 128M -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK) $(QEMU_NET)
 
 run-kernel: $(TEXT_KERNEL) $(INITRD) $(DISK)
-	$(QEMU) -kernel $(TEXT_KERNEL) -initrd $(INITRD) -m 128M -serial stdio $(QEMU_DISK)
+	$(QEMU) -kernel $(TEXT_KERNEL) -initrd $(INITRD) -m 128M -serial stdio $(QEMU_DISK) $(QEMU_NET)
 
 # Boot fluxdisk.img on its own, after "fluxinstall /dev/hda".
 run-disk: $(DISK)
-	$(QEMU) -m 128M -serial stdio -boot c $(QEMU_DISK)
+	$(QEMU) -m 128M -serial stdio -boot c $(QEMU_DISK) $(QEMU_NET)
 
 clean:
 	rm -rf $(BUILD) $(ISO)

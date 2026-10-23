@@ -77,6 +77,11 @@ static void open_editor(void)
     editor_open(NULL);
 }
 
+static void open_browser(void)
+{
+    browser_open(NULL);
+}
+
 static void open_home(void)
 {
     const char *home = getenv("HOME");
@@ -98,6 +103,7 @@ struct desk_icon {
 static struct desk_icon desk_icons[] = {
     { ICON_COMPUTER, "My Computer", open_computer },
     { ICON_TERMINAL, "Terminal", open_terminal },
+    { ICON_BROWSER, "Web Browser", open_browser },
     { ICON_README, "Read Me", open_readme },
     { ICON_INSTALL, "Install fluxOS", setup_open },
 };
@@ -117,6 +123,7 @@ static struct menu_item menu_items[] = {
     { ICON_TERMINAL, "Terminal", open_terminal },
     { ICON_FOLDER, "File Manager", open_home },
     { ICON_EDITOR, "Text Editor", open_editor },
+    { ICON_BROWSER, "Web Browser", open_browser },
     { ICON_README, "Read Me", open_readme },
     { ICON_COMPUTER, "System Properties", about_open },
     { ICON_RUN, "Run...", run_open },
@@ -1016,6 +1023,16 @@ static void mouse_event(const struct input_event *ev)
     int old = mbuttons;
     mbuttons = ev->mods;
     int pressed = mbuttons & ~old, released = old & ~mbuttons;
+
+    /* The wheel scrolls the window under the pointer. */
+    int16_t wheel = (int16_t)ev->code;
+    if (wheel && !menu_open && drag == DRAG_NONE) {
+        struct window *w = window_at(mx, my);
+        if (!w)
+            w = focused;
+        if (w && !w->minimized && w->ops && w->ops->wheel)
+            w->ops->wheel(w, wheel);
+    }
 
     if (mx != ox || my != oy) {
         if (drag != DRAG_NONE)

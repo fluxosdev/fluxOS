@@ -77,13 +77,15 @@ int vfs_getpath(struct vnode *vn, char *buf, uint32_t size);
 /* ---- open file descriptions ---- */
 #define PIPE_SIZE 4096
 
-enum { FT_VNODE = 1, FT_PIPE };
+enum { FT_VNODE = 1, FT_PIPE, FT_SOCKET };
 
 struct pipe {
     char buf[PIPE_SIZE];
     uint32_t rpos, wpos;        /* free-running */
     int readers, writers;
 };
+
+struct socket;
 
 struct file {
     int type;
@@ -92,9 +94,11 @@ struct file {
     int refs;
     struct vnode *vn;
     struct pipe *pipe;
+    struct socket *sock;
 };
 
 struct file *file_open(struct vnode *vn, int flags);
+struct file *file_socket(struct socket *s);
 struct file *file_dup(struct file *f);
 void file_close(struct file *f);
 int file_read(struct file *f, void *buf, uint32_t n);
