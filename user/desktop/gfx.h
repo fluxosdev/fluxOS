@@ -81,6 +81,10 @@ int gfx_text_n(struct surface *s, const struct pfont *f, int x, int y, const cha
 int gfx_text_width(const struct pfont *f, const char *str);
 /* Text rotated 90 degrees counter-clockwise, reading upwards from (x, y). */
 void gfx_text_up(struct surface *s, const struct pfont *f, int x, int y, const char *str, color_t c);
+/* Word-wrapped text in a column w pixels wide; '\n' breaks lines and a
+ * blank line separates paragraphs. Returns the y below the last line. */
+int gfx_text_wrap(struct surface *s, const struct pfont *f, int x, int y, int w,
+                  const char *text, color_t c);
 /* Fit str into max_w pixels, ending with "..." if it had to be cut. */
 void gfx_ellipsize(const struct pfont *f, const char *str, int max_w, char *out, int outsz);
 

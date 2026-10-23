@@ -33,6 +33,16 @@ enum icon_id {
     ICON_INFO,
     ICON_README,
     ICON_WARNING,
+    ICON_FOLDER,
+    ICON_FOLDER_OPEN,
+    ICON_FOLDER_NEW,
+    ICON_HOME,
+    ICON_DRIVE,
+    ICON_CDROM,
+    ICON_IMAGE,
+    ICON_UP,
+    ICON_DELETE,
+    ICON_INSTALL,
     ICON_COUNT,
 };
 
@@ -106,6 +116,24 @@ int terminal_poll_fds(struct pollfd *fds, struct window **owners, int max);
 void terminal_ready(struct window *w, int revents);
 void terminal_child_exited(int pid);
 void terminal_blink(void);
+
+struct window *files_open(const char *path);
+void setup_open(void);
+void setup_child_exited(int pid, int status);
+void system_restart(void);
+
+/* The event loop (main.c): call ready(ctx, revents) when fd is readable. */
+int loop_watch(int fd, void (*ready)(void *ctx, int revents), void *ctx);
+void loop_unwatch(int fd);
+struct window *image_view_open(const char *path);
+
+/* Message boxes and prompts (apps.c). Only one is open at a time: while
+ * one is, more requests just focus it. ctx is passed back unchanged. */
+void message_box(const char *title, enum icon_id icon, const char *text);
+void ask_yes_no(const char *title, enum icon_id icon, const char *text,
+                void (*yes)(void *ctx), void *ctx);
+void ask_text(const char *title, const char *label, const char *initial,
+              void (*done)(void *ctx, const char *text), void *ctx);
 
 void about_open(void);
 void about_tick(void);

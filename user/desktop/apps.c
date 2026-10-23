@@ -35,12 +35,16 @@ struct dialog {
     int edit_len, edit_cur;
     void (*command)(struct dialog *d, int id);
     struct dialog **self;       /* cleared when the dialog closes */
+    /* message boxes and prompts: what to call when the user agrees */
+    void (*on_yes)(void *ctx);
+    void (*on_text)(void *ctx, const char *text);
+    void *ctx;
 };
 
 enum { ID_OK = 1, ID_CANCEL, ID_YES, ID_NO };
 enum { OPT_SHUTDOWN, OPT_RESTART, OPT_CONSOLE };
 
-static struct dialog *about_dlg, *run_dlg, *shutdown_dlg;
+static struct dialog *about_dlg, *run_dlg, *shutdown_dlg, *ask_dlg;
 
 static struct control *add(struct dialog *d, enum ctl_type type, int x, int y, int w, int h,
                            const char *text, int id)
@@ -293,6 +297,96 @@ static void dialog_show(struct dialog *d, int focus_index)
     paint(d);
 }
 
+/* ---- message boxes and prompts ---- */
+
+static void ask_command(struct dialog *d, int id)
+{
+    void (*on_yes)(void *) = d->on_yes;
+    void (*on_text)(void *, const char *) = d->on_text;
+    void *ctx = d->ctx;
+    char text[sizeof(d->edit)];
+    snprintf(text, sizeof(text), "%s", d->edit);
+    close_dialog(d);                    /* frees d */
+    if (id == ID_YES && on_yes)
+        on_yes(ctx);
+    else if (id == ID_OK && on_text && text[0])
+        on_text(ctx, text);
+}
+
+/* A box with an icon, a line of text and the given buttons; NULL if one is open. */
+static struct dialog *message_dialog(const char *title, enum icon_id icon, const char *text,
+                                     const char *const *labels, const int *ids, int nbuttons)
+{
+    if (ask_dlg) {
+        wm_focus(ask_dlg->win);
+        return NULL;
+    }
+    int w = 62 + gfx_text_width(&font_sans, text) + 24;
+    int bw = nbuttons * 75 + (nbuttons - 1) * 6;
+    if (w < bw + 40)
+        w = bw + 40;
+    if (w < 240)
+        w = 240;
+    int h = 100;
+    struct dialog *d = dialog_new(title, icon, w, h, WF_NOTASK, &ask_dlg);
+    if (!d)
+        return NULL;
+    d->command = ask_command;
+    d->default_id = ids[0];
+    d->cancel_id = ids[nbuttons - 1];
+    add(d, CT_ICON, 14, 14, 32, 32, NULL, icon);
+    add(d, CT_LABEL, 62, 23, 0, 0, text, 0);
+    int first = d->n;
+    for (int i = 0; i < nbuttons; i++)
+        add(d, CT_BUTTON, (w - bw) / 2 + i * 81, h - 12 - 23, 75, 23, labels[i], ids[i]);
+    dialog_show(d, first);
+    return d;
+}
+
+void message_box(const char *title, enum icon_id icon, const char *text)
+{
+    static const char *const labels[] = { "OK" };
+    static const int ids[] = { ID_OK };
+    message_dialog(title, icon, text, labels, ids, 1);
+}
+
+void ask_yes_no(const char *title, enum icon_id icon, const char *text,
+                void (*yes)(void *ctx), void *ctx)
+{
+    static const char *const labels[] = { "Yes", "No" };
+    static const int ids[] = { ID_YES, ID_NO };
+    struct dialog *d = message_dialog(title, icon, text, labels, ids, 2);
+    if (d) {
+        d->on_yes = yes;
+        d->ctx = ctx;
+    }
+}
+
+void ask_text(const char *title, const char *label, const char *initial,
+              void (*done)(void *ctx, const char *text), void *ctx)
+{
+    if (ask_dlg) {
+        wm_focus(ask_dlg->win);
+        return;
+    }
+    struct dialog *d = dialog_new(title, ICON_NONE, 320, 104, WF_NOTASK, &ask_dlg);
+    if (!d)
+        return;
+    d->command = ask_command;
+    d->default_id = ID_OK;
+    d->cancel_id = ID_CANCEL;
+    d->on_text = done;
+    d->ctx = ctx;
+    add(d, CT_LABEL, 12, 12, 0, 0, label, 0);
+    int edit = d->n;
+    add(d, CT_EDIT, 12, 32, 296, 21, NULL, 0);
+    add(d, CT_BUTTON, 320 - 12 - 75 - 6 - 75, 104 - 12 - 23, 75, 23, "OK", ID_OK);
+    add(d, CT_BUTTON, 320 - 12 - 75, 104 - 12 - 23, 75, 23, "Cancel", ID_CANCEL);
+    snprintf(d->edit, sizeof(d->edit), "%s", initial);
+    d->edit_len = d->edit_cur = (int)strlen(d->edit);
+    dialog_show(d, edit);
+}
+
 /* ---- System Properties ---- */
 
 static void format_uptime(char *buf, size_t size)
@@ -424,6 +518,13 @@ void run_open(void)
 
 /* ---- Shut Down ---- */
 
+void system_restart(void)
+{
+    wm_splash("Please wait while your computer restarts.", RGB(0xFF, 0xFF, 0xFF));
+    sync();
+    reboot(REBOOT_RESTART);
+}
+
 static void shutdown_command(struct dialog *d, int id)
 {
     int choice = d->radio;
@@ -439,9 +540,7 @@ static void shutdown_command(struct dialog *d, int id)
         reboot(REBOOT_HALT);
         break;
     case OPT_RESTART:
-        wm_splash("Please wait while your computer restarts.", RGB(0xFF, 0xFF, 0xFF));
-        sync();
-        reboot(REBOOT_RESTART);
+        system_restart();
         break;
     case OPT_CONSOLE:
         exit(0);

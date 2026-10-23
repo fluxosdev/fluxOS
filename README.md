@@ -111,9 +111,27 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   the focus when clicked, and cascade as they open.
 - Terminal windows: 80x25 VGA-style terminals running fsh on a
   pseudo-terminal, as many as you like. Closing one hangs up its shell.
-- Start menu: Terminal, Read Me, System Properties (version, memory, display,
-  uptime), Run... (runs a command in a new window), and Shut Down... (power
-  off, restart, or close the desktop and return to the text console).
+- File manager: a Win95 Explorer-style folder window (My Computer opens it on
+  `/`, the Start menu on your home folder) with large icons, a scroll bar, an
+  address field you can type a path into, and Up, New Folder, Delete and
+  Rename (also Backspace, Delete, F2, F5 and Ctrl+L). Mounted disks and CDs
+  get drive icons. Double-clicking a folder opens it, a program or script
+  runs in a terminal window, a PNG opens in an image viewer, and any other
+  file is shown with `more`.
+- Setup: a Win95-style wizard (the **Install fluxOS** icon) that installs
+  fluxOS on a hard disk. It lists the disks, greying out any that are too
+  small or hold the install files, asks you to confirm that the chosen disk
+  will be erased, then runs `fluxinstall` and shows its progress and output.
+  When it finishes it offers to restart; if it fails it shows why and lets
+  you go back and pick again.
+  It only appears when fluxOS was started from the install medium: GRUB tells
+  the kernel which filesystem it booted from, and a system started from an
+  installed hard disk hides the icon and the Start menu entry. (`fluxinstall`
+  still works from a shell there.)
+- Start menu: Terminal, File Manager, Read Me, System Properties (version,
+  memory, display, uptime), Run... (runs a command in a new window), Install
+  fluxOS..., and Shut Down... (power off, restart, or close the desktop and
+  return to the text console).
 - Keys: the Windows key or Ctrl+Esc opens the Start menu, Alt+Tab switches
   windows, Alt+F4 closes a window (or, with none focused, opens Shut Down).
   Dialogs follow Tab, Enter, Escape and the arrow keys.
@@ -156,7 +174,9 @@ window to capture the mouse.
 
 ## Installing to a hard disk
 
-Boot the CD, then run the installer on a whole disk (see `lsblk`):
+Boot the CD and double-click **Install fluxOS** on the desktop: the Setup
+wizard walks you through choosing a disk. From a shell, run the installer on
+a whole disk instead (see `lsblk`):
 
 ```sh
 fluxinstall /dev/hda      # asks you to type "yes"; -y skips the question
@@ -183,7 +203,7 @@ kernel and initrd, and its FAT32 partition is where files persist.
 
 ## Things to try
 
-On the desktop: double-click **My Computer**, drag windows by their title
+On the desktop: double-click **My Computer** to browse files, drag windows by their title
 bars, open more terminals from the Start menu, try **Run...** with `ls -l /bin`,
 and open **Shut Down...** to see the screen dim. In a terminal:
 
@@ -236,8 +256,9 @@ user/
   libc/, include/          the C library and its headers
   fsh/                     the shell: lexer, parser, expansion, executor, editor
   desktop/                 the desktop: compositor and window manager (wm.c),
-                           terminal emulator, dialogs, drawing, PNG decoding
-                           (png.c), icons, fonts
+                           terminal emulator, file manager and image viewer
+                           (files.c), the Setup wizard (setup.c), dialogs,
+                           drawing, PNG decoding (png.c), icons, fonts
   bin/                     one program per file (fluxinstall.c is the installer)
 rootfs/                    files copied into the initrd (/etc, /home/flux,
                            /usr/share/icons)
@@ -276,7 +297,8 @@ cache as dirty sectors. File data bypasses the cache: a run of contiguous
 clusters is written as one DMA command. Raw reads overlay any dirty cached
 sectors, so they always see the newest data. A sync writes the dirty sectors
 in LBA order, merging neighbours into multi-sector commands, then issues one
-FLUSH CACHE to the drive. `kflushd` is a kernel thread. It runs in ring 0
+FLUSH CACHE to the drive (skipped for drives that reject that command, as
+pre-ATA-5 drives and 86Box's emulated disks do). `kflushd` is a kernel thread. It runs in ring 0
 with interrupts off like the rest of the kernel, so it can only be switched
 out while sleeping, and it ignores signals.
 

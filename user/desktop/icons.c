@@ -175,6 +175,16 @@ static const char *const icon_names[ICON_COUNT] = {
     [ICON_INFO] = "dialog-information",
     [ICON_README] = "text-x-generic",
     [ICON_WARNING] = "dialog-warning",
+    [ICON_FOLDER] = "folder",
+    [ICON_FOLDER_OPEN] = "folder-open",
+    [ICON_FOLDER_NEW] = "folder-new",
+    [ICON_HOME] = "user-home",
+    [ICON_DRIVE] = "drive-harddisk",
+    [ICON_CDROM] = "media-cdrom",
+    [ICON_IMAGE] = "image-x-generic",
+    [ICON_UP] = "go-up",
+    [ICON_DELETE] = "edit-delete",
+    [ICON_INSTALL] = "system-installer",
 };
 
 static const int icon_sizes[] = { 16, 32, 48 };
@@ -222,7 +232,7 @@ static void draw_builtin(struct surface *s, int x, int y, enum icon_id id, int s
     case ICON_INFO: icon_info(); break;
     case ICON_README: icon_readme(); break;
     case ICON_WARNING: icon_warning(); break;
-    case ICON_NONE: case ICON_COUNT: break;
+    default: break;                     /* image-only icons */
     }
 }
 

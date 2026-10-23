@@ -236,6 +236,37 @@ void gfx_text_up(struct surface *s, const struct pfont *f, int x, int y, const c
     }
 }
 
+int gfx_text_wrap(struct surface *s, const struct pfont *f, int x, int y, int w,
+                  const char *text, color_t c)
+{
+    const char *p = text;
+    while (*p) {
+        /* Take words while they fit; a word wider than the column goes alone. */
+        const char *end = p, *q = p;
+        int width = 0;
+        while (*q && *q != '\n') {
+            const char *r = q;
+            int ww = 0;
+            while (*r == ' ')
+                ww += glyph(f, *r++)->advance;
+            while (*r && *r != ' ' && *r != '\n')
+                ww += glyph(f, *r++)->advance;
+            if (end != p && width + ww > w)
+                break;
+            width += ww;
+            end = q = r;
+        }
+        gfx_text_n(s, f, x, y, p, (int)(end - p), c);
+        y += f->height + 2;
+        p = end;
+        while (*p == ' ')
+            p++;
+        if (*p == '\n')
+            p++;
+    }
+    return y;
+}
+
 void gfx_ellipsize(const struct pfont *f, const char *str, int max_w, char *out, int outsz)
 {
     int len = (int)strlen(str);

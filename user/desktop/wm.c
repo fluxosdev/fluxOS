@@ -7,11 +7,13 @@
  * copies it to the framebuffer. Windows are moved by dragging an
  * outline, as in Windows 95, so a drag only repaints the outline.
  */
+#include <fcntl.h>
 #include <flux.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include "desktop.h"
 
 #define MAX_DAMAGE   32
@@ -65,6 +67,17 @@ static void open_terminal(void)
     terminal_open("Terminal", NULL, 0, 0);
 }
 
+static void open_computer(void)
+{
+    files_open("/");
+}
+
+static void open_home(void)
+{
+    const char *home = getenv("HOME");
+    files_open(home ? home : "/");
+}
+
 static void open_readme(void)
 {
     static const char *const argv[] = { "/bin/more", "/home/flux/README", NULL };
@@ -77,12 +90,14 @@ struct desk_icon {
     void (*open)(void);
 };
 
-static const struct desk_icon desk_icons[] = {
-    { ICON_COMPUTER, "My Computer", about_open },
+static struct desk_icon desk_icons[] = {
+    { ICON_COMPUTER, "My Computer", open_computer },
     { ICON_TERMINAL, "Terminal", open_terminal },
     { ICON_README, "Read Me", open_readme },
+    { ICON_INSTALL, "Install fluxOS", setup_open },
 };
-#define NDESK ((int)(sizeof(desk_icons) / sizeof(desk_icons[0])))
+static int ndesk = (int)(sizeof(desk_icons) / sizeof(desk_icons[0]));
+#define NDESK ndesk
 static int desk_selected = -1;
 static int last_click_icon = -1;
 static unsigned int last_click_ms;
@@ -93,15 +108,44 @@ struct menu_item {
     void (*run)(void);
 };
 
-static const struct menu_item menu_items[] = {
+static struct menu_item menu_items[] = {
     { ICON_TERMINAL, "Terminal", open_terminal },
+    { ICON_FOLDER, "File Manager", open_home },
     { ICON_README, "Read Me", open_readme },
     { ICON_COMPUTER, "System Properties", about_open },
     { ICON_RUN, "Run...", run_open },
+    { ICON_INSTALL, "Install fluxOS...", setup_open },
     { ICON_NONE, NULL, NULL },
     { ICON_SHUTDOWN, "Shut Down...", shutdown_open },
 };
-#define NMENU ((int)(sizeof(menu_items) / sizeof(menu_items[0])))
+static int nmenu = (int)(sizeof(menu_items) / sizeof(menu_items[0]));
+#define NMENU nmenu
+
+/* Started from the hard disk, not the install medium: nothing to install. */
+static int booted_from_disk(void)
+{
+    char buf[16] = "";
+    int fd = open("/etc/boot-source", O_RDONLY);
+    if (fd < 0)
+        return 0;
+    int n = (int)read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    return n >= 4 && !strncmp(buf, "disk", 4);
+}
+
+static void remove_installer(void)
+{
+    int k = 0;
+    for (int i = 0; i < ndesk; i++)
+        if (desk_icons[i].open != setup_open)
+            desk_icons[k++] = desk_icons[i];
+    ndesk = k;
+    k = 0;
+    for (int i = 0; i < nmenu; i++)
+        if (menu_items[i].run != setup_open)
+            menu_items[k++] = menu_items[i];
+    nmenu = k;
+}
 
 /* ---- time ---- */
 
@@ -1099,6 +1143,8 @@ void wm_init(void)
         fprintf(stderr, "desktop: out of memory\n");
         exit(1);
     }
+    if (booted_from_disk())
+        remove_installer();
     mx = screen_w / 2;
     my = screen_h / 2;
     update_clock();

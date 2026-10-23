@@ -25,6 +25,16 @@ ICONS = {
     "System-shutdown.svg": "system-shutdown",
     "Dialog-information.svg": "dialog-information",
     "Dialog-warning.svg": "dialog-warning",
+    "Folder.svg": "folder",
+    "Folder-open.svg": "folder-open",
+    "Folder-new.svg": "folder-new",
+    "User-home.svg": "user-home",
+    "Drive-harddisk.svg": "drive-harddisk",
+    "Media-cdrom.svg": "media-cdrom",
+    "Image-x-generic.svg": "image-x-generic",
+    "Go-up.svg": "go-up",
+    "Edit-delete.svg": "edit-delete",
+    "System-installer.svg": "system-installer",
 }
 SIZES = (16, 32, 48)
 SOURCE_PX = 250         # a standard Commons thumbnail width, scaled down from here
@@ -53,7 +63,8 @@ def main():
     with open(OUT + "/README", "w") as f:
         f.write("Icons from the Tango Desktop Project, released into the public domain.\n"
                 "Source: https://commons.wikimedia.org/wiki/Tango_icons\n"
-                "Regenerate with tools/tango-icons.py.\n")
+                "Regenerate with tools/tango-icons.py.\n"
+                "fluxos.png is the fluxOS logo (assets/fluxos-logo.png), not part of Tango.\n")
 
 
 if __name__ == "__main__":

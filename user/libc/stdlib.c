@@ -335,22 +335,26 @@ int rand(void)
 
 void srand(unsigned int seed) { rand_state = seed; }
 
+static void swap(char *x, char *y, size_t size)
+{
+    char tmp[64];
+    while (size) {
+        size_t k = size < sizeof(tmp) ? size : sizeof(tmp);
+        memcpy(tmp, x, k);
+        memcpy(x, y, k);
+        memcpy(y, tmp, k);
+        x += k;
+        y += k;
+        size -= k;
+    }
+}
+
 /* Shell sort: small, in-place and good enough for directory listings. */
 void qsort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *))
 {
     char *a = base;
-    char tmp[256];
-    if (size > sizeof(tmp))
-        return;
-    for (size_t gap = n / 2; gap > 0; gap /= 2) {
-        for (size_t i = gap; i < n; i++) {
-            memcpy(tmp, a + i * size, size);
-            size_t j = i;
-            while (j >= gap && cmp(a + (j - gap) * size, tmp) > 0) {
-                memcpy(a + j * size, a + (j - gap) * size, size);
-                j -= gap;
-            }
-            memcpy(a + j * size, tmp, size);
-        }
-    }
+    for (size_t gap = n / 2; gap > 0; gap /= 2)
+        for (size_t i = gap; i < n; i++)
+            for (size_t j = i; j >= gap && cmp(a + (j - gap) * size, a + j * size) > 0; j -= gap)
+                swap(a + (j - gap) * size, a + j * size, size);
 }

@@ -15,8 +15,46 @@
 #include <unistd.h>
 #include "desktop.h"
 
-#define MAX_TERMS 32
-#define BLINK_MS  500
+#define MAX_TERMS   32
+#define MAX_WATCHES 8
+#define BLINK_MS    500
+
+/* Other descriptors the loop waits on, such as the installer's pipe. */
+static struct watch {
+    int fd;
+    void (*ready)(void *ctx, int revents);
+    void *ctx;
+} watches[MAX_WATCHES];
+static int nwatches;
+
+int loop_watch(int fd, void (*ready)(void *ctx, int revents), void *ctx)
+{
+    if (nwatches == MAX_WATCHES)
+        return -1;
+    watches[nwatches].fd = fd;
+    watches[nwatches].ready = ready;
+    watches[nwatches].ctx = ctx;
+    nwatches++;
+    return 0;
+}
+
+void loop_unwatch(int fd)
+{
+    for (int i = 0; i < nwatches; i++) {
+        if (watches[i].fd == fd) {
+            watches[i] = watches[--nwatches];
+            return;
+        }
+    }
+}
+
+static int watching(const struct watch *w)
+{
+    for (int i = 0; i < nwatches; i++)
+        if (watches[i].fd == w->fd && watches[i].ready == w->ready && watches[i].ctx == w->ctx)
+            return 1;
+    return 0;
+}
 
 int main(void)
 {
@@ -34,20 +72,33 @@ int main(void)
 
     unsigned int last_blink = now_ms(), last_tick = last_blink;
     for (;;) {
-        struct pollfd fds[1 + MAX_TERMS];
+        struct pollfd fds[1 + MAX_TERMS + MAX_WATCHES];
         struct window *owners[1 + MAX_TERMS];
+        struct watch w[MAX_WATCHES];
         fds[0].fd = input;
         fds[0].events = POLLIN;
         fds[0].revents = 0;
         int n = 1 + terminal_poll_fds(fds + 1, owners + 1, MAX_TERMS);
+        int nw = nwatches;
+        for (int i = 0; i < nw; i++) {
+            w[i] = watches[i];
+            fds[n + i].fd = w[i].fd;
+            fds[n + i].events = POLLIN;
+            fds[n + i].revents = 0;
+        }
 
         unsigned int since = now_ms() - last_blink;
-        poll(fds, (unsigned int)n, since >= BLINK_MS ? 0 : (int)(BLINK_MS - since));
+        poll(fds, (unsigned int)(n + nw), since >= BLINK_MS ? 0 : (int)(BLINK_MS - since));
 
         /* Terminals first: input handling may close their windows. */
         for (int i = 1; i < n; i++)
             if (fds[i].revents)
                 terminal_ready(owners[i], fds[i].revents);
+
+        /* A callback may drop its own watch or another; check each is still wanted. */
+        for (int i = 0; i < nw; i++)
+            if (fds[n + i].revents && watching(&w[i]))
+                w[i].ready(w[i].ctx, fds[n + i].revents);
 
         if (fds[0].revents & POLLIN) {
             struct input_event ev[64];
@@ -57,8 +108,10 @@ int main(void)
         }
 
         int pid, status;
-        while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
+        while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
             terminal_child_exited(pid);
+            setup_child_exited(pid, status);
+        }
 
         unsigned int now = now_ms();
         if (now - last_blink >= BLINK_MS) {

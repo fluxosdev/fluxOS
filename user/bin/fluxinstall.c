@@ -172,6 +172,10 @@ int main(int argc, char **argv)
     if (i != argc - 1)
         usage();
 
+    /* Line by line even into a pipe, so a front end (the desktop's
+     * Setup wizard) sees each step as it starts. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     const char *dev = argv[i];
     const char *disk = strrchr(dev, '/') ? strrchr(dev, '/') + 1 : dev;
     char devpath[64], partpath[64];

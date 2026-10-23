@@ -35,6 +35,39 @@ int cmdline_has(const char *option)
     return 0;
 }
 
+int cmdline_value(const char *key, char *out, size_t size)
+{
+    size_t n = strlen(key);
+    for (const char *p = cmdline; (p = strstr(p, key)); p += n) {
+        if ((p == cmdline || p[-1] == ' ') && p[n] == '=') {
+            size_t len = strcspn(p + n + 1, " ");
+            if (len >= size)
+                len = size - 1;
+            memcpy(out, p + n + 1, len);
+            out[len] = 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * /etc/boot-source says where the system was started from: "cdrom" for
+ * an ISO9660 volume, "disk" for anything else, or nothing if the boot
+ * loader did not say (QEMU's -kernel). The desktop uses it to offer the
+ * installer only when booted from the install medium.
+ */
+static void record_boot_source(void)
+{
+    char fs[16];
+    if (!cmdline_value("bootfs", fs, sizeof(fs)) || !fs[0])
+        return;
+    const char *text = !strcmp(fs, "iso9660") ? "cdrom\n" : "disk\n";
+    struct vnode *etc, *vn;
+    if (vfs_resolve("/etc", NULL, &etc) == 0 && vfs_create(etc, "boot-source", VN_FILE, &vn) == 0)
+        vfs_write(vn, text, 0, (uint32_t)strlen(text));
+}
+
 void kmain(uint32_t magic, struct multiboot_info *mbi)
 {
     serial_init();
@@ -98,6 +131,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
             panic("initrd loaded above the identity-mapped region");
         initrd_load((const uint8_t *)initrd_start, initrd_end - initrd_start);
         pmm_release(initrd_start, initrd_end);
+        record_boot_source();
     } else {
         panic("no initrd module: check the GRUB configuration");
     }

@@ -41,6 +41,8 @@
 #define ST_DF   0x20
 #define ST_BSY  0x80
 
+#define ERR_ABRT 0x04                   /* error register: command aborted */
+
 #define CMD_READ        0x20
 #define CMD_READ_EXT    0x24
 #define CMD_WRITE       0x30
@@ -97,6 +99,8 @@ struct ata_dev {
     int lba48;
     int dma_capable;                    /* IDENTIFY: a DMA mode is selected */
     int dma;                            /* use DMA for data transfers */
+    int flush_ext;                      /* flush with FLUSH CACHE EXT */
+    int no_flush;                       /* the drive rejects FLUSH CACHE */
     struct blockdev bd;
 };
 
@@ -329,12 +333,17 @@ static void ata_load(struct ata_dev *d, uint32_t lba, uint32_t count, int ext)
     }
 }
 
+/* Returns 0, -EIO, or -ENOSYS if the drive aborted the command. */
 static int ata_flush(struct ata_dev *d, int ext)
 {
     arm(d);
     outb(d->io + REG_COMMAND, ext ? CMD_FLUSH_EXT : CMD_FLUSH);
     int st = wait_irq(d);
-    return st < 0 || (st & (ST_ERR | ST_DF)) ? -EIO : 0;
+    if (st < 0 || (st & ST_DF))
+        return -EIO;
+    if (st & ST_ERR)
+        return (inb(d->io + REG_ERROR) & ERR_ABRT) ? -ENOSYS : -EIO;
+    return 0;
 }
 
 static int ata_pio(struct ata_dev *d, uint32_t lba, uint32_t count, void *buf, int write)
@@ -397,15 +406,32 @@ static int ata_dma(struct ata_dev *d, uint32_t lba, uint32_t count, void *buf, i
     return r ? -EIO : 0;
 }
 
-/* Flush the drive's write cache; the block layer calls this on sync. */
+/*
+ * Flush the drive's write cache; the block layer calls this on sync.
+ * FLUSH CACHE only became standard with ATA-5 and some drives (and
+ * emulators such as 86Box) abort it. Such a drive has nothing we can
+ * flush, so after the first abort the flush is skipped and counts as
+ * done. An aborted FLUSH CACHE EXT is retried as plain FLUSH CACHE.
+ */
 static int ata_flush_cache(struct blockdev *bd)
 {
     struct ata_dev *d = bd->priv;
+    if (d->no_flush)
+        return 0;
     select_drive(d, 0);
     if (wait_not_busy(d) < 0)
         return -EIO;
-    int r = ata_flush(d, d->lba48);
+    int r = ata_flush(d, d->flush_ext);
+    if (r == -ENOSYS && d->flush_ext) {
+        d->flush_ext = 0;
+        r = ata_flush(d, 0);
+    }
     disarm(d);
+    if (r == -ENOSYS) {
+        klog("%s: drive does not support FLUSH CACHE; not flushing its cache\n", bd->name);
+        d->no_flush = 1;
+        r = 0;
+    }
     return r;
 }
 
@@ -741,6 +767,8 @@ void ata_init(void)
             bd->write = ata_write;
             bd->flush = ata_flush_cache;
             d->lba48 = (id[83] & (1 << 10)) != 0;
+            /* Word 83 is valid when its top bits read 01; bit 13 is FLUSH CACHE EXT. */
+            d->flush_ext = d->lba48 && (id[83] & 0xC000) == 0x4000 && (id[83] & (1 << 13));
             uint32_t lba28 = id[60] | ((uint32_t)id[61] << 16);
             uint32_t lba48 = id[100] | ((uint32_t)id[101] << 16);
             bd->nsectors = d->lba48 && (id[102] || id[103]) ? 0xFFFFFFFFu
