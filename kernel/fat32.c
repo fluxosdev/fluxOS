@@ -770,7 +770,18 @@ static int write_range(struct fat_fs *f, struct vnode *vn, const uint8_t *in, ui
         uint32_t chunk = MIN(cb - within, n - done);
         int r;
         if (within == 0 && chunk == cb) {
-            r = blk_write(f->bd, cluster_lba(f, c), f->spc, in + done);
+            /* Whole clusters: write a physically contiguous run at once
+             * (the allocator hands out neighbouring clusters). */
+            uint32_t run = 1, last = c;
+            while ((run + 1) * cb <= n - done && run * f->spc < 128) {
+                uint32_t next = node_cluster(f, nd, idx + run, 1);
+                if (next != last + 1)
+                    break;                      /* used on the next pass */
+                last = next;
+                run++;
+            }
+            r = blk_write(f->bd, cluster_lba(f, c), run * f->spc, in + done);
+            chunk = run * cb;
         } else {
             if ((uint64_t)idx * cb < vn->size)
                 r = blk_read(f->bd, cluster_lba(f, c), f->spc, f->clbuf);

@@ -175,6 +175,8 @@ int main(int argc, char **argv)
         if (put(fd, root, sec, 1) < 0)
             goto fail;
     }
+    if (fsync(fd) < 0)
+        goto fail;
     close(fd);
 
     printf("%s: FAT32, %u MiB, %u clusters of %u bytes, label %.11s\n", dev, total / 2048,

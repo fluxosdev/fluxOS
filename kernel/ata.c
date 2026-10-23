@@ -367,8 +367,6 @@ static int ata_pio(struct ata_dev *d, uint32_t lba, uint32_t count, void *buf, i
         int st = wait_irq(d);
         if (st < 0 || (st & (ST_ERR | ST_DF)))
             goto out;
-        if (ata_flush(d, ext) < 0)
-            goto out;
     }
     r = 0;
 out:
@@ -394,12 +392,21 @@ static int ata_dma(struct ata_dev *d, uint32_t lba, uint32_t count, void *buf, i
 
     int r = dma_wait(d);
     disarm(d);
-    if (r == 0 && write)
-        r = ata_flush(d, ext);
-    disarm(d);
     if (r == 0 && !write && mem != buf)
         memcpy(buf, mem, bytes);
     return r ? -EIO : 0;
+}
+
+/* Flush the drive's write cache; the block layer calls this on sync. */
+static int ata_flush_cache(struct blockdev *bd)
+{
+    struct ata_dev *d = bd->priv;
+    select_drive(d, 0);
+    if (wait_not_busy(d) < 0)
+        return -EIO;
+    int r = ata_flush(d, d->lba48);
+    disarm(d);
+    return r;
 }
 
 /* DMA when the drive has it; if a DMA command fails, switch the drive to PIO. */
@@ -732,6 +739,7 @@ void ata_init(void)
             bd->sector_size = 512;
             bd->read = ata_read;
             bd->write = ata_write;
+            bd->flush = ata_flush_cache;
             d->lba48 = (id[83] & (1 << 10)) != 0;
             uint32_t lba28 = id[60] | ((uint32_t)id[61] << 16);
             uint32_t lba48 = id[100] | ((uint32_t)id[101] << 16);

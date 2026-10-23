@@ -725,6 +725,9 @@ int vfs_umount(const char *target, struct vnode *cwd)
     subtree_free(fs->root);
     if (fs->ops->unmount)
         fs->ops->unmount(fs);
+    /* Everything written must be on the disk before it can be removed. */
+    blk_sync(fs->bd);
+    blk_invalidate(fs->bd);
     fs->bd->fs = NULL;
     kfree(fs);
     vfs_unref(mp);

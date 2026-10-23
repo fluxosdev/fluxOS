@@ -690,9 +690,35 @@ static int sys_meminfo(uint32_t ubuf, uint32_t b, uint32_t c, uint32_t d, uint32
     return 0;
 }
 
+static int sys_sync(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)a; (void)b; (void)c; (void)d; (void)e;
+    return blk_sync_all();
+}
+
+/* Sync the device holding the file (or the block device itself). */
+static int sys_fsync(uint32_t fd, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)b; (void)c; (void)d; (void)e;
+    struct file *f = get_file(fd);
+    if (!f)
+        return -EBADF;
+    if (f->type != FT_VNODE)
+        return -EINVAL;
+    struct blockdev *bd = blk_by_vnode(f->vn);
+    if (!bd && f->vn->fs)
+        bd = f->vn->fs->bd;
+    return bd ? blk_sync(bd) : 0;
+}
+
 static int sys_reboot(uint32_t cmd, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)b; (void)c; (void)d; (void)e;
+    if (cmd == REBOOT_RESTART || cmd == REBOOT_POWEROFF || cmd == REBOOT_HALT) {
+        vfs_lock();
+        blk_sync_all();                         /* nothing cached may be lost */
+        vfs_unlock();
+    }
     switch (cmd) {
     case REBOOT_RESTART:
         kprintf("\nfluxOS: restarting system...\n");
@@ -761,6 +787,8 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_statfs] = sys_statfs,
     [SYS_getmounts] = sys_getmounts,
     [SYS_blkinfo] = sys_blkinfo,
+    [SYS_sync] = sys_sync,
+    [SYS_fsync] = sys_fsync,
 };
 
 /* Calls that walk or change the VFS tree; read and write lock per chunk. */
@@ -769,6 +797,7 @@ static const uint8_t takes_vfs_lock[NSYSCALLS] = {
     [SYS_getdents] = 1, [SYS_mkdir] = 1, [SYS_rmdir] = 1, [SYS_unlink] = 1,
     [SYS_rename] = 1, [SYS_chmod] = 1, [SYS_stat] = 1, [SYS_mount] = 1,
     [SYS_umount] = 1, [SYS_statfs] = 1, [SYS_getmounts] = 1, [SYS_blkinfo] = 1,
+    [SYS_sync] = 1, [SYS_fsync] = 1,
 };
 
 void syscall_dispatch(struct trapframe *tf)

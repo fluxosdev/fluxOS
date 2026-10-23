@@ -34,6 +34,7 @@ struct proc {
     void *chan;                 /* wait channel while P_BLOCKED */
     uint32_t wake_tick;         /* deadline while P_SLEEPING (or timed P_BLOCKED) */
     int timed;                  /* P_BLOCKED with a deadline */
+    int kthread;                /* kernel thread: ring 0, no signals */
     int exit_status;
     uint32_t sig_pending;
     uint32_t sig_ignored;
@@ -51,6 +52,7 @@ extern struct proc *current;
 
 void proc_init(void);
 void proc_spawn_init(const char *path);
+void proc_spawn_kthread(const char *name, void (*fn)(void));
 void schedule(void);
 void proc_tick(void);
 

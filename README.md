@@ -48,7 +48,10 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   - IDE kernel options: `ata.nodma` forces PIO, and `ata.poll` polls instead
     of using interrupts, for hardware whose IDE interrupts don't arrive.
   - Block devices `/dev/hda`..`/dev/hdd`, with MBR partitions as `/dev/hda1`
-    and so on, behind a write-through sector cache.
+    and so on, behind a write-back sector cache. Metadata writes stay in
+    memory and are written out in sorted, merged runs by the `kflushd`
+    kernel thread every 5 seconds, by `sync`/`fsync`, on `umount`, and
+    before `reboot`/`poweroff`.
 - Filesystems, mounted into the same VFS tree:
   - **FAT32**, read/write: VFAT long file names with `~N` short aliases,
     case-insensitive lookup, directories that grow, all FAT copies kept in
@@ -86,8 +89,8 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
 
 **Userland** (`/bin`): basename cat chmod clear cp date df dirname dmesg echo
 env fetch free fsh grep halt head hexdump init ls lsblk mkdir mkfs.fat more
-mount mv poweroff ps reboot rm rmdir seq sh sleep sort spin stat tail tee top
-touch tr umount uname uniq uptime wc yes, all on a small libc (stdio, malloc,
+mount mv poweroff ps reboot rm rmdir seq sh sleep sort spin stat sync tail tee
+top touch tr umount uname uniq uptime wc yes, all on a small libc (stdio, malloc,
 environ, dirent, time).
 
 ## Building
@@ -191,6 +194,15 @@ an operation (waiting for a disk interrupt), so it is serialised by one FIFO
 `read`/`write` on files and block devices take it per 64 KiB chunk, so a long
 copy can't starve other disk users. Terminals and pipes never take it.
 
+**Write-back.** FAT, directory-entry and FSInfo updates go into the sector
+cache as dirty sectors. File data bypasses the cache: a run of contiguous
+clusters is written as one DMA command. Raw reads overlay any dirty cached
+sectors, so they always see the newest data. A sync writes the dirty sectors
+in LBA order, merging neighbours into multi-sector commands, then issues one
+FLUSH CACHE to the drive. `kflushd` is a kernel thread. It runs in ring 0
+with interrupts off like the rest of the kernel, so it can only be switched
+out while sleeping, and it ignores signals.
+
 **System calls.** `int 0x80` with the number in `eax` and arguments in `ebx`,
 `ecx`, `edx`, `esi` and `edi`. Failures return `-errno`. Every user pointer is
 checked against the user range and the current page tables before the kernel
@@ -208,9 +220,12 @@ Storage limits:
   timings itself. Anything else uses PIO, which works everywhere but is
   slower and has the CPU copy every sector. SATA controllers in AHCI mode
   are not supported at all.
-- **Writes are slower than reads.** Each write command is followed by a
-  cache flush, so data is on the drive before the call returns. Under QEMU
-  that flush is a host `fsync`, which dominates copy times.
+- **Recent writes can be lost on a crash.** A `write()` returns before the
+  metadata reaches the disk, so a power cut within about 5 seconds of a
+  write can lose that file. The filesystem itself stays consistent. Run
+  `sync` (or `fsync(fd)` from a program) when that matters; `umount`,
+  `reboot` and `poweroff` sync automatically. The Ctrl+Alt+Del reboot does
+  not, because it happens in the keyboard interrupt handler.
 - **Partitioning:** only MBR partition tables, with up to four primary
   partitions. GPT is not supported, and neither are extended or logical
   partitions. A FAT volume with no partition table (a "superfloppy") is

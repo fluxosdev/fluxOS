@@ -25,6 +25,8 @@ struct blockdev {
     int (*read)(struct blockdev *bd, uint32_t lba, uint32_t count, void *buf);
     int (*write)(struct blockdev *bd, uint32_t lba, uint32_t count, const void *buf);
     int (*refresh)(struct blockdev *bd);    /* re-read capacity (removable media) */
+    int (*flush)(struct blockdev *bd);      /* flush the drive's write cache */
+    int unflushed;              /* written since the last flush */
     void *priv;
     struct fs *fs;              /* filesystem mounted on this device */
 };
@@ -40,10 +42,17 @@ int blk_write(struct blockdev *bd, uint32_t lba, uint32_t count, const void *buf
 int blk_read_at(struct blockdev *bd, uint32_t base, uint32_t off, uint32_t n, void *buf);
 int blk_write_at(struct blockdev *bd, uint32_t base, uint32_t off, uint32_t n, const void *buf);
 
-/* Cached single sectors (write-through). The pointer stays valid until
- * the next cache call. */
+/* Cached single sectors. Reads return a pointer valid until the next
+ * cache call; writes replace the whole sector and are written back
+ * later (write-back). */
 const uint8_t *bcache_read(struct blockdev *bd, uint32_t lba);
 int bcache_write(struct blockdev *bd, uint32_t lba, const void *data);
+
+/* Write back dirty cached sectors and flush the drive (VFS lock held). */
+int blk_sync(struct blockdev *bd);
+int blk_sync_all(void);
+void blk_invalidate(struct blockdev *bd);
+void blk_start_flusher(void);
 
 void blk_scan_partitions(struct blockdev *disk);
 void ata_init(void);

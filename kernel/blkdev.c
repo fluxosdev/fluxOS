@@ -1,19 +1,30 @@
 /*
  * Block device layer: the device table, /dev nodes, partition
- * translation, MBR scanning and a small write-through sector cache.
+ * translation, MBR scanning and a write-back sector cache.
+ *
+ * Filesystem metadata (FAT sectors, directory entries) is written into
+ * the cache and reaches the disk later, sorted and merged into runs:
+ * when an entry is evicted, on sync()/fsync(), on unmount, before a
+ * reboot or power-off, and every few seconds from the kflushd thread.
+ * Bulk data bypasses the cache with blk_read/blk_write, which stay
+ * coherent with it. A disk's write cache is flushed only on sync.
  */
 #include "kernel.h"
 #include "blkdev.h"
 #include "mm.h"
+#include "proc.h"
 #include "vfs.h"
 
-#define BCACHE_SIZE 128
+#define BCACHE_SIZE  256
+#define SYNC_RUN_MAX 64                 /* sectors merged into one write */
+#define FLUSH_PERIOD (5 * HZ)
 
 struct bcache_entry {
     struct blockdev *dev;       /* always a whole disk */
     uint32_t lba;               /* absolute sector */
     uint32_t stamp;
     int valid;
+    int dirty;                  /* newer than the disk */
     uint8_t data[BLK_MAX_SECTOR];
 };
 
@@ -59,7 +70,17 @@ int blk_read(struct blockdev *bd, uint32_t lba, uint32_t count, void *buf)
     if (check_range(bd, lba, count) < 0)
         return -EIO;
     struct blockdev *disk = translate(bd, &lba);
-    return disk->read(disk, lba, count, buf);
+    int r = disk->read(disk, lba, count, buf);
+    if (r < 0 || !bcache)
+        return r;
+    /* Sectors still waiting in the cache are newer than the disk. */
+    for (int i = 0; i < BCACHE_SIZE; i++) {
+        struct bcache_entry *e = &bcache[i];
+        if (e->valid && e->dirty && e->dev == disk && e->lba >= lba && e->lba - lba < count)
+            memcpy((uint8_t *)buf + (e->lba - lba) * disk->sector_size, e->data,
+                   disk->sector_size);
+    }
+    return r;
 }
 
 int blk_write(struct blockdev *bd, uint32_t lba, uint32_t count, const void *buf)
@@ -74,16 +95,63 @@ int blk_write(struct blockdev *bd, uint32_t lba, uint32_t count, const void *buf
     if (!disk->write)
         return -EROFS;
     int r = disk->write(disk, lba, count, buf);
-    if (r < 0 || !bcache)
+    if (r < 0)
         return r;
-    /* keep cached copies coherent */
+    disk->unflushed = 1;
+    if (!bcache)
+        return r;
+    /* This write is the newest version of any cached copy. */
     for (int i = 0; i < BCACHE_SIZE; i++) {
         struct bcache_entry *e = &bcache[i];
-        if (e->valid && e->dev == disk && e->lba >= lba && e->lba - lba < count)
+        if (e->valid && e->dev == disk && e->lba >= lba && e->lba - lba < count) {
             memcpy(e->data, (const uint8_t *)buf + (e->lba - lba) * disk->sector_size,
                    disk->sector_size);
+            e->dirty = 0;
+        }
     }
     return r;
+}
+
+static int write_entry(struct bcache_entry *e)
+{
+    int r = e->dev->write(e->dev, e->lba, 1, e->data);
+    if (r < 0)
+        return r;
+    e->dirty = 0;
+    e->dev->unflushed = 1;
+    return 0;
+}
+
+/*
+ * Find the entry for (disk, lba) or claim a slot for it: a free slot,
+ * else the least recently used clean one, else the least recently used
+ * dirty one, which is written back first.
+ */
+static struct bcache_entry *lookup(struct blockdev *disk, uint32_t lba, int *hit)
+{
+    struct bcache_entry *free = NULL, *clean = NULL, *dirty = NULL;
+    for (int i = 0; i < BCACHE_SIZE; i++) {
+        struct bcache_entry *e = &bcache[i];
+        if (!e->valid) {
+            if (!free)
+                free = e;
+            continue;
+        }
+        if (e->dev == disk && e->lba == lba) {
+            *hit = 1;
+            e->stamp = ++bcache_clock;
+            return e;
+        }
+        struct bcache_entry **best = e->dirty ? &dirty : &clean;
+        if (!*best || e->stamp < (*best)->stamp)
+            *best = e;
+    }
+    *hit = 0;
+    struct bcache_entry *v = free ? free : clean ? clean : dirty;
+    if (v->valid && v->dirty && write_entry(v) < 0)
+        return NULL;
+    v->valid = 0;
+    return v;
 }
 
 const uint8_t *bcache_read(struct blockdev *bd, uint32_t lba)
@@ -91,29 +159,43 @@ const uint8_t *bcache_read(struct blockdev *bd, uint32_t lba)
     if (check_range(bd, lba, 1) < 0)
         return NULL;
     struct blockdev *disk = translate(bd, &lba);
-    struct bcache_entry *victim = &bcache[0];
-    for (int i = 0; i < BCACHE_SIZE; i++) {
-        struct bcache_entry *e = &bcache[i];
-        if (e->valid && e->dev == disk && e->lba == lba) {
-            e->stamp = ++bcache_clock;
-            return e->data;
-        }
-        if (!e->valid || e->stamp < victim->stamp)
-            victim = e;
-    }
-    victim->valid = 0;
-    if (disk->read(disk, lba, 1, victim->data) < 0)
+    int hit;
+    struct bcache_entry *e = lookup(disk, lba, &hit);
+    if (!e)
         return NULL;
-    victim->dev = disk;
-    victim->lba = lba;
-    victim->valid = 1;
-    victim->stamp = ++bcache_clock;
-    return victim->data;
+    if (hit)
+        return e->data;
+    if (disk->read(disk, lba, 1, e->data) < 0)
+        return NULL;
+    e->dev = disk;
+    e->lba = lba;
+    e->valid = 1;
+    e->dirty = 0;
+    e->stamp = ++bcache_clock;
+    return e->data;
 }
 
+/* Replace a whole sector in the cache; it reaches the disk on sync. */
 int bcache_write(struct blockdev *bd, uint32_t lba, const void *data)
 {
-    return blk_write(bd, lba, 1, data);
+    if (bd->readonly)
+        return -EROFS;
+    if (check_range(bd, lba, 1) < 0)
+        return -EIO;
+    struct blockdev *disk = translate(bd, &lba);
+    if (!disk->write)
+        return -EROFS;
+    int hit;
+    struct bcache_entry *e = lookup(disk, lba, &hit);
+    if (!e)
+        return -EIO;
+    memcpy(e->data, data, disk->sector_size);
+    e->dev = disk;
+    e->lba = lba;
+    e->valid = 1;
+    e->dirty = 1;
+    e->stamp = ++bcache_clock;
+    return 0;
 }
 
 static void drop_cache(struct blockdev *disk)
@@ -121,6 +203,108 @@ static void drop_cache(struct blockdev *disk)
     for (int i = 0; i < BCACHE_SIZE; i++)
         if (bcache[i].dev == disk)
             bcache[i].valid = 0;
+}
+
+/* ---- sync ---- */
+
+static struct blockdev *disk_of(struct blockdev *bd)
+{
+    return bd->parent ? bd->parent : bd;
+}
+
+/*
+ * Write a disk's dirty sectors in LBA order, merging neighbours into
+ * one command each, then flush the drive's own write cache.
+ */
+int blk_sync(struct blockdev *bd)
+{
+    struct blockdev *disk = disk_of(bd);
+    static struct bcache_entry *order[BCACHE_SIZE];
+    static uint8_t *runbuf;
+    int n = 0, err = 0;
+
+    if (!bcache || !disk->write)
+        return 0;
+    for (int i = 0; i < BCACHE_SIZE; i++)
+        if (bcache[i].valid && bcache[i].dirty && bcache[i].dev == disk)
+            order[n++] = &bcache[i];
+    for (int i = 1; i < n; i++) {                       /* insertion sort by LBA */
+        struct bcache_entry *e = order[i];
+        int j = i;
+        for (; j > 0 && order[j - 1]->lba > e->lba; j--)
+            order[j] = order[j - 1];
+        order[j] = e;
+    }
+    if (n && !runbuf)
+        runbuf = kmalloc(SYNC_RUN_MAX * BLK_MAX_SECTOR);
+
+    uint32_t ss = disk->sector_size;
+    for (int i = 0; i < n; ) {
+        int k = 1;
+        while (runbuf && i + k < n && k < SYNC_RUN_MAX && order[i + k]->lba == order[i]->lba + (uint32_t)k)
+            k++;
+        int r;
+        if (k == 1) {
+            r = disk->write(disk, order[i]->lba, 1, order[i]->data);
+        } else {
+            for (int j = 0; j < k; j++)
+                memcpy(runbuf + (uint32_t)j * ss, order[i + j]->data, ss);
+            r = disk->write(disk, order[i]->lba, (uint32_t)k, runbuf);
+        }
+        if (r < 0) {
+            err = -EIO;
+        } else {
+            for (int j = 0; j < k; j++)
+                order[i + j]->dirty = 0;
+            disk->unflushed = 1;
+        }
+        i += k;
+    }
+
+    if (disk->unflushed && disk->flush) {
+        if (disk->flush(disk) < 0)
+            err = -EIO;
+        else
+            disk->unflushed = 0;
+    }
+    if (err)
+        klog("%s: sync failed, %d dirty sectors kept\n", disk->name, n);
+    return err;
+}
+
+int blk_sync_all(void)
+{
+    int err = 0;
+    for (int i = 0; i < ndevices; i++)
+        if (!devices[i]->parent && blk_sync(devices[i]) < 0)
+            err = -EIO;
+    return err;
+}
+
+/* Forget clean cached sectors of a disk, e.g. after unmounting it. */
+void blk_invalidate(struct blockdev *bd)
+{
+    struct blockdev *disk = disk_of(bd);
+    for (int i = 0; i < BCACHE_SIZE && bcache; i++)
+        if (bcache[i].valid && !bcache[i].dirty && bcache[i].dev == disk)
+            bcache[i].valid = 0;
+}
+
+/* Kernel thread: write back whatever has been waiting a few seconds. */
+static void kflushd(void)
+{
+    for (;;) {
+        sleep_ticks(FLUSH_PERIOD);
+        current->sig_pending = 0;
+        vfs_lock();
+        blk_sync_all();
+        vfs_unlock();
+    }
+}
+
+void blk_start_flusher(void)
+{
+    proc_spawn_kthread("kflushd", kflushd);
 }
 
 /* ---- byte-granular access ---- */

@@ -101,6 +101,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
 
     proc_init();
     proc_spawn_init("/bin/init");
+    blk_start_flusher();
     boot_ok("Scheduler started, launching /bin/init");
     kprintf("\n");
 

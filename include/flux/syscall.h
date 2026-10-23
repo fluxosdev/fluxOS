@@ -52,7 +52,9 @@
 #define SYS_statfs    44
 #define SYS_getmounts 45
 #define SYS_blkinfo   46
+#define SYS_sync      47
+#define SYS_fsync     48
 
-#define NSYSCALLS     47
+#define NSYSCALLS     49
 
 #endif

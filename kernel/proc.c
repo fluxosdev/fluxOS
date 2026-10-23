@@ -196,6 +196,28 @@ void proc_spawn_init(const char *path)
     p->state = P_READY;
 }
 
+/*
+ * A kernel thread starts by "returning" through trapret into fn in ring
+ * 0, with interrupts off like all kernel code: it only gives up the CPU
+ * when it sleeps, so it never runs in the middle of another syscall.
+ */
+void proc_spawn_kthread(const char *name, void (*fn)(void))
+{
+    struct proc *p = proc_alloc();
+    if (!p)
+        panic("cannot create kernel thread %s", name);
+    setup_kstack(p, NULL);
+    struct trapframe *tf = p->tf;
+    tf->cs = SEG_KCODE;
+    tf->ds = tf->es = tf->fs = tf->gs = SEG_KDATA;
+    tf->eflags = 0x002;                         /* IF clear */
+    tf->eip = (uint32_t)fn;
+    p->kthread = 1;
+    p->pgid = p->pid;
+    strlcpy(p->name, name, sizeof(p->name));
+    p->state = P_READY;
+}
+
 int do_fork(void)
 {
     struct proc *parent = current;
@@ -332,7 +354,7 @@ static void deliver(struct proc *p, int sig)
 
 void proc_signal(struct proc *p, int sig)
 {
-    if (sig <= 0 || sig >= NSIG || !p || p->pid <= 1)
+    if (sig <= 0 || sig >= NSIG || !p || p->pid <= 1 || p->kthread)
         return;
     if (p->state == P_UNUSED || p->state == P_ZOMBIE)
         return;
@@ -366,7 +388,7 @@ int do_kill(int pid, int sig)
         struct proc *p = proc_find(pid);
         if (!p || p->state == P_ZOMBIE)
             return -ESRCH;
-        if (p->pid == 1)
+        if (p->pid == 1 || p->kthread)
             return -EPERM;
         if (sig)
             proc_signal(p, sig);
