@@ -513,7 +513,7 @@ bar. In a terminal:
 fetch                          # system summary
 spin A 5 & spin B 5 & top      # CPU-bound jobs sharing the CPU; ^C quits top
 ps; jobs; kill %1
-cat ~/README; ./demo.sh        # tour and a scripting demo
+cat ~/README.txt; ./demo.sh       # tour and a scripting demo
 ls -l /bin | sort -n | tail -3
 echo {1..3} $((6*7)) ~         # brace, arithmetic and tilde expansion
 mkdir -p /tmp/{a,b}/c; ls -R /tmp

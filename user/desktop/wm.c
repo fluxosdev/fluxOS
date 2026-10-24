@@ -110,8 +110,7 @@ static void open_home(void)
 
 static void open_readme(void)
 {
-    static const char *const argv[] = { "/bin/more", "/home/flux/README", NULL };
-    terminal_open("Read Me", argv, 0, 0);
+    editor_open("/home/flux/README.txt");
 }
 
 struct desk_icon {

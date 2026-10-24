@@ -7,7 +7,8 @@
  * sound plays with play(1), and anything else is shown with more(1).
  *
  * Keys: arrows move the selection, Enter opens, Backspace goes up,
- * Delete deletes, F2 renames and F5 reloads the folder. Clicking the
+ * Delete deletes, F2 renames and F5 reloads the folder. Ctrl+X, Ctrl+C
+ * and Ctrl+V cut, copy and paste (also between disks and the CD). Clicking the
  * address field or Ctrl+L lets you type a path to go to.
  */
 #include <dirent.h>
@@ -41,7 +42,7 @@ struct entry {
     enum icon_id icon;
 };
 
-enum { TB_UP, TB_NEWDIR, TB_DELETE, TB_RENAME, NTOOLS };
+enum { TB_UP, TB_NEWDIR, TB_CUT, TB_COPY, TB_PASTE, TB_DELETE, TB_RENAME, NTOOLS };
 
 static const struct {
     const char *label;
@@ -49,9 +50,16 @@ static const struct {
 } tools[NTOOLS] = {
     { "Up", ICON_UP },
     { "New Folder", ICON_FOLDER_NEW },
+    { "Cut", ICON_NONE },
+    { "Copy", ICON_NONE },
+    { "Paste", ICON_NONE },
     { "Delete", ICON_DELETE },
     { "Rename", ICON_NONE },
 };
+
+/* The clipboard is shared by all folder windows. */
+static char clip_path[PATH_MAX];
+static int clip_cut;
 
 /* What the mouse is holding down. */
 enum hold { HOLD_NONE, HOLD_TOOL, HOLD_THUMB, HOLD_ARROW_UP, HOLD_ARROW_DOWN };
@@ -368,7 +376,8 @@ static void paint(struct fm *f)
     for (int i = 0; i < NTOOLS; i++) {
         struct rect r = tool_rect(i);
         int down = f->hold == HOLD_TOOL && f->hold_tool == i && f->hold_in;
-        int disabled = (i == TB_DELETE || i == TB_RENAME) && f->sel < 0;
+        int disabled = ((i == TB_DELETE || i == TB_RENAME || i == TB_CUT || i == TB_COPY) &&
+                        f->sel < 0) || (i == TB_PASTE && !clip_path[0]);
         draw_button(s, r, "", down, 0, 0);
         int x = r.x + 8 + down, y = r.y + 4 + down;
         if (tools[i].icon) {
@@ -612,6 +621,153 @@ static void ask_rename(struct fm *f)
     ask_text("Rename", label, f->pending, do_rename, f);
 }
 
+/* ---- cut, copy and paste ---- */
+
+static int copy_file(const char *src, const char *dst)
+{
+    static char buf[4096];
+    int in = open(src, O_RDONLY);
+    if (in < 0)
+        return -1;
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC);
+    if (out < 0) {
+        int e = errno;
+        close(in);
+        errno = e;
+        return -1;
+    }
+    int n, r = 0;
+    while ((n = (int)read(in, buf, sizeof(buf))) > 0) {
+        if (write(out, buf, (size_t)n) != n) {
+            r = -1;
+            break;
+        }
+    }
+    if (n < 0)
+        r = -1;
+    int e = errno;
+    close(in);
+    close(out);
+    errno = e;
+    return r;
+}
+
+/* Copies a file or a whole folder tree; this works between filesystems. */
+static int copy_tree(const char *src, const char *dst)
+{
+    struct stat st;
+    if (stat(src, &st) < 0)
+        return -1;
+    if (!S_ISDIR(st.st_mode))
+        return copy_file(src, dst);
+    if (mkdir(dst, 0755) < 0 && errno != EEXIST)
+        return -1;
+    DIR *d = opendir(src);
+    if (!d)
+        return -1;
+    int r = 0;
+    struct dirent *de;
+    while (r == 0 && (de = readdir(d))) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
+        char s[PATH_MAX], t[PATH_MAX];
+        join(s, sizeof(s), src, de->d_name);
+        join(t, sizeof(t), dst, de->d_name);
+        r = copy_tree(s, t);
+    }
+    closedir(d);
+    return r;
+}
+
+static int remove_tree(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) < 0)
+        return -1;
+    if (!S_ISDIR(st.st_mode))
+        return unlink(path);
+    DIR *d = opendir(path);
+    if (!d)
+        return -1;
+    int r = 0;
+    struct dirent *de;
+    while (r == 0 && (de = readdir(d))) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
+        char c[PATH_MAX];
+        join(c, sizeof(c), path, de->d_name);
+        r = remove_tree(c);
+    }
+    closedir(d);
+    return r ? r : rmdir(path);
+}
+
+static void clip_set(struct fm *f, int cut)
+{
+    if (f->sel < 0)
+        return;
+    join(clip_path, sizeof(clip_path), f->path, f->ents[f->sel].name);
+    clip_cut = cut;
+    paint(f);
+}
+
+static int exists(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+static void do_paste(struct fm *f)
+{
+    if (!clip_path[0])
+        return;
+    const char *base = strrchr(clip_path, '/');
+    base = base ? base + 1 : clip_path;
+    char dst[PATH_MAX], name[NAME_MAX + 1];
+    snprintf(name, sizeof(name), "%s", base);
+    join(dst, sizeof(dst), f->path, name);
+
+    /* A folder cannot go inside itself. */
+    size_t n = strlen(clip_path);
+    if (!strncmp(dst, clip_path, n) && dst[n] == '/') {
+        struct stat st;
+        if (stat(clip_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            message_box("File Manager", ICON_WARNING, "Cannot copy a folder into itself.");
+            return;
+        }
+    }
+    if (clip_cut && !strcmp(dst, clip_path))
+        return;                         /* moved onto itself */
+    for (int k = 1; exists(dst) && k < 100; k++) {
+        if (k == 1)
+            snprintf(name, sizeof(name), "Copy of %s", base);
+        else
+            snprintf(name, sizeof(name), "Copy (%d) of %s", k, base);
+        join(dst, sizeof(dst), f->path, name);
+    }
+
+    int r;
+    if (clip_cut && rename(clip_path, dst) == 0) {
+        r = 0;
+    } else {
+        /* Different filesystem (say, CD to hard disk): copy, then remove the original. */
+        r = copy_tree(clip_path, dst);
+        if (r < 0) {
+            int e = errno;
+            remove_tree(dst);
+            errno = e;
+        } else if (clip_cut) {
+            r = remove_tree(clip_path);
+        }
+    }
+    if (r < 0) {
+        report(clip_cut ? "Error Moving File" : "Error Copying File", clip_cut ? "move" : "copy", base);
+    } else if (clip_cut) {
+        clip_path[0] = 0;
+    }
+    reload(f, name);
+}
+
 /* ---- the address field ---- */
 
 static void start_editing(struct fm *f)
@@ -679,6 +835,9 @@ static void tool_action(struct fm *f, int i)
     switch (i) {
     case TB_UP: go_up(f); break;
     case TB_NEWDIR: ask_text("New Folder", "Name of the new folder:", "New Folder", do_mkdir, f); break;
+    case TB_CUT: clip_set(f, 1); break;
+    case TB_COPY: clip_set(f, 0); break;
+    case TB_PASTE: do_paste(f); break;
     case TB_DELETE: ask_delete(f); break;
     case TB_RENAME: ask_rename(f); break;
     }
@@ -698,6 +857,13 @@ static void fm_key(struct window *w, const struct input_event *ev)
     if (ev->len == 1 && ev->text[0] == 0x0C) {         /* Ctrl+L */
         start_editing(f);
         paint(f);
+        return;
+    }
+    if (ev->len == 1 && (ev->text[0] == 0x18 || ev->text[0] == 0x03 || ev->text[0] == 0x16)) {
+        if (ev->text[0] == 0x16)
+            do_paste(f);                /* Ctrl+V */
+        else
+            clip_set(f, ev->text[0] == 0x18);   /* Ctrl+X, Ctrl+C */
         return;
     }
     int cols = columns(f), sel = f->sel;

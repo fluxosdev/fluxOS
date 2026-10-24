@@ -11,7 +11,7 @@
 #include <flux/abi.h>
 
 #define FLUXOS_NAME    "fluxOS"
-#define FLUXOS_RELEASE "0.1.0"
+#define FLUXOS_RELEASE "0.1.1"
 
 #define PAGE_SIZE 4096u
 #define ALIGN_UP(x, a)   (((x) + ((a) - 1)) & ~((a) - 1))
