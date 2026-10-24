@@ -45,10 +45,21 @@
 #define RTL8201_REG11     0x11
 #define RTL8201_NV_INIT   0x1000
 
+/*
+ * Realtek's OUI is 0x000732, which PHYSID1/2 hold as 0x001C and the top six
+ * bits of 0xC8xx; the model is bits 4-9 of PHYSID2. The RTL8201 behind
+ * nForce MACs reports model 0x20 (Linux's PHY_MODEL_REALTEK_8201), the
+ * RTL8201CP/CL 0x0000:0x8201, and the RTL8201F/FL model 0x01.
+ */
 static int is_rtl8201(uint32_t id)
 {
-    /* The RTL8201CP/CL/N leave the OUI half of the ID at zero. */
-    return id == 0x00008201u || (id & 0xFFFFFFF0u) == 0x001CC810u;
+    uint32_t id1 = id >> 16, id2 = id & 0xFFFF;
+    if (id == 0x00008201u)
+        return 1;
+    if (id1 != 0x001C || (id2 & 0xFC00) != 0xC800)
+        return 0;
+    uint32_t model = (id2 >> 4) & 0x3F;
+    return model == 0x20 || model == 0x01;
 }
 
 int mii_probe(struct mii_phy *phy)

@@ -174,8 +174,8 @@ static const struct {
     { 0x0037, 3, 0, "MCP04" }, { 0x0038, 3, 0, "MCP04" },
     { 0x0268, 3, C_POWER, "MCP51" }, { 0x0269, 3, C_POWER, "MCP51" },
     { 0x0372, 3, C_POWER, "MCP55" }, { 0x0373, 3, C_POWER, "MCP55" },
-    { 0x03E5, 3, C_POWER | C_PHYFIX, "MCP61" }, { 0x03E6, 3, C_POWER | C_PHYFIX, "MCP61" },
-    { 0x03EE, 3, C_POWER | C_PHYFIX, "MCP61" }, { 0x03EF, 3, C_POWER | C_PHYFIX, "MCP61" },
+    { 0x03E5, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP61" }, { 0x03E6, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP61" },
+    { 0x03EE, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP61" }, { 0x03EF, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP61" },
     { 0x0450, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP65" },
     { 0x0451, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP65" },
     { 0x0452, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP65" },
@@ -684,7 +684,7 @@ int forcedeth_init(void)
     fd.regs = pci_map_bar(&pci, PCI_BAR0);
     int irq = pci_irq(&pci);
     if (!fd.regs || alloc_buffers() < 0) {
-        klog("forcedeth: cannot set up the %s controller\n", chip);
+        boot_warn("Network: cannot set up the nVidia %s controller", chip);
         return -1;
     }
     pci_enable(&pci, PCI_CMD_MEM | PCI_CMD_MASTER);
@@ -708,11 +708,11 @@ int forcedeth_init(void)
     fd.phy.write = mii_write;
     fd.phy.nv_fix = (fd.flags & C_PHYFIX) != 0;
     if (mii_probe(&fd.phy) < 0) {
-        klog("forcedeth: no PHY answers on the %s controller's MII bus\n", chip);
+        boot_warn("Network: no PHY answers on the nVidia %s controller's MII bus", chip);
         return -1;
     }
     if (mii_init(&fd.phy) < 0)
-        klog("forcedeth: %s at address %d did not reset\n", fd.phy.name, fd.phy.addr);
+        boot_warn("Network: PHY %s at address %d did not reset", fd.phy.name, fd.phy.addr);
 
     start();
     snprintf(fd.dev.driver, sizeof(fd.dev.driver), "forcedeth (%s, %s)", chip, fd.phy.name);

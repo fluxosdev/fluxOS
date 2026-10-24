@@ -11,6 +11,7 @@
 #include "mm.h"
 #include "multiboot.h"
 #include "net.h"
+#include "pci.h"
 #include "proc.h"
 #include "tty.h"
 #include "vfs.h"
@@ -149,6 +150,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     if (!want_root && !have_initrd)
         panic("no initrd module: check the GRUB configuration");
 
+    pci_log_devices();
     ata_init();
     ahci_init();
     floppy_init();

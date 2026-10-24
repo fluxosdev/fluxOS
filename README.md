@@ -76,6 +76,10 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
     interrupt driven: a process waiting on the disk sleeps until IRQ14/15,
     so other processes keep running. If a DMA command fails, the driver
     resets the channel and switches that drive to PIO, so no data is lost.
+  - PCI IDE controllers in native mode are driven as well, on their own
+    ports and shared PCI interrupt: that is how chipsets such as nVidia's
+    MCP present SATA disks when the BIOS sets SATA to "IDE" instead of
+    AHCI. Their drives are `/dev/sdX` (or `/dev/srN`).
   - IDE kernel options: `ata.nodma` forces PIO, and `ata.poll` polls instead
     of using interrupts, for hardware whose IDE interrupts don't arrive.
   - A **SATA (AHCI)** driver for hard disks (LBA48) and ATAPI CD/DVD drives
@@ -548,6 +552,12 @@ sudo apt install build-essential grub-pc-bin grub-common xorriso mtools qemu-sys
 No cross compiler is needed. Everything is built with the host GCC using `-m32
 -ffreestanding` and GCC's own freestanding headers. Nothing links against
 libgcc or the host libc.
+
+The ISO is made with Debian 12's GRUB 2.06, which the first `make` downloads
+into `grub-2.06/` (checked against fixed SHA-256 hashes, unpacked, nothing
+installed): GRUB 2.12, as Ubuntu 24.04 and Linux Mint 22 ship it, reboots
+some older PCs right after "Welcome to GRUB!". `make GRUB=/ GRUB_DEP=` uses
+the host's GRUB instead. The ISO boots on legacy BIOS only.
 
 ```sh
 make            # builds build/fluxos.kernel, build/initrd.tar and fluxOS.iso

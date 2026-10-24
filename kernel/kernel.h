@@ -43,6 +43,7 @@ int klog_read(char *buf, uint32_t size);
 void random_add(uint32_t v);
 void random_bytes(void *buf, uint32_t n);
 void boot_ok(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void boot_warn(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void panic(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
 
 /* Kernel command line (from the boot loader). */

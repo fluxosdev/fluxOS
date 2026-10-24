@@ -616,7 +616,7 @@ static void port_probe(struct hba *h, int n, uint16_t *id)
 
     struct ata_cmd c = { .command = p->atapi ? ATA_ID_PACKET : ATA_IDENTIFY };
     if (port_exec(p, &c, id, 512, 0, CMD_TIMEOUT) != 512) {
-        klog("ahci: port %d: IDENTIFY failed\n", n);
+        boot_warn("AHCI: port %d: a drive is there but does not answer IDENTIFY", n);
         goto fail;
     }
 
@@ -685,7 +685,7 @@ static void hba_init(const struct pci_dev *pci)
     struct hba *h = &hbas[nhbas];
     h->regs = pci_map_bar(pci, PCI_BAR5);
     if (!h->regs) {
-        klog("ahci: controller registers out of reach\n");
+        boot_warn("AHCI: controller registers out of reach");
         return;
     }
     pci_enable(pci, PCI_CMD_MEM | PCI_CMD_MASTER);

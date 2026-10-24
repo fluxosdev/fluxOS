@@ -34,6 +34,9 @@ int pci_find_class(uint16_t class_sub, struct pci_dev *out, uint8_t *prog_if);
 /* Find the first device with this vendor and device ID. Returns 0, or -1. */
 int pci_find_device(uint16_t vendor, uint16_t device, struct pci_dev *out);
 
+/* List every device in the kernel log (dmesg | grep pci). */
+void pci_log_devices(void);
+
 /* The n-th (from 0) device of a class, for drivers that take them all. */
 int pci_find_class_nth(uint16_t class_sub, int n, struct pci_dev *out, uint8_t *prog_if);
 

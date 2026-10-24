@@ -13,8 +13,16 @@
  * the disk works. Boot-time probing polls instead. Callers serialise
  * through the VFS lock, so one command is in flight at a time.
  *
- * Device names follow the old Linux IDE scheme: hda/hdb are the
- * primary master/slave, hdc/hdd the secondary ones.
+ * Besides the two legacy channels at 0x1F0 and 0x170 (IRQ 14 and 15), PCI
+ * controllers in native mode are driven too: they have their own ports
+ * and a PCI interrupt, which other devices may share. That is how many
+ * chipsets (nVidia's MCP SATA among them) present SATA disks when the
+ * BIOS sets SATA to "IDE" rather than AHCI.
+ *
+ * Device names follow the old Linux IDE scheme on the legacy channels:
+ * hda/hdb are the primary master/slave, hdc/hdd the secondary ones.
+ * Drives on native-mode channels, SATA in practice, are sdX (or srN for
+ * a CD drive), as Linux's libata names them.
  */
 #include "kernel.h"
 #include "arch.h"
@@ -75,19 +83,35 @@
 #define PRD_EOT    0x80000000u
 #define DMA_DEVERR 1                    /* the device reported an error */
 
+#define MAX_CTRLS  4
+#define MAX_CHANS  (2 + 2 * MAX_CTRLS)
+#define MAX_DRIVES (2 * MAX_CHANS)
+
+/* A PCI IDE controller. */
+struct ide_ctrl {
+    struct pci_dev pci;
+    uint8_t prog_if;
+};
+
 struct ata_chan {
     uint16_t io, ctrl;
-    int irq_line;
+    int irq_line;                       /* -1: none, polled */
+    int native;                         /* a PCI native-mode channel */
+    struct ide_ctrl *owner;             /* the controller it belongs to, if known */
+    int chan_no;                        /* 0 primary, 1 secondary, on that controller */
     volatile int armed;                 /* a command is waiting for an IRQ */
     volatile int fired;
     uint16_t bm;                        /* bus-master registers; 0 = no DMA */
     uint32_t *prd;                      /* physical region descriptor table */
 };
 
-static struct ata_chan chans[2] = {
+static struct ata_chan chans[MAX_CHANS] = {
     { .io = 0x1F0, .ctrl = 0x3F6, .irq_line = 14 },
     { .io = 0x170, .ctrl = 0x376, .irq_line = 15 },
 };
+static int nchans = 2;
+static struct ide_ctrl ctrls[MAX_CTRLS];
+static int nctrls;
 static int irq_mode;
 static uint8_t *dma_bounce;             /* 64 KiB, 64 KiB aligned */
 
@@ -105,7 +129,7 @@ struct ata_dev {
     struct blockdev bd;
 };
 
-static struct ata_dev drives[4];
+static struct ata_dev drives[MAX_DRIVES];
 
 static void delay400(struct ata_dev *d)
 {
@@ -137,14 +161,26 @@ static int wait_drq(struct ata_dev *d)
     return -EIO;
 }
 
+/* Every channel on this line: PCI channels share it with each other and
+ * with other devices, and reading the status register is harmless. */
 static void ata_irq(struct trapframe *tf)
 {
-    struct ata_chan *ch = &chans[(int)tf->int_no - IRQ_BASE == 15];
-    (void)inb(ch->io + REG_STATUS);     /* acknowledge INTRQ */
-    if (ch->armed) {
-        ch->fired = 1;
-        wakeup(ch);
+    int irq = (int)tf->int_no - IRQ_BASE;
+    for (int c = 0; c < nchans; c++) {
+        struct ata_chan *ch = &chans[c];
+        if (ch->irq_line != irq)
+            continue;
+        (void)inb(ch->io + REG_STATUS); /* acknowledge INTRQ */
+        if (ch->armed) {
+            ch->fired = 1;
+            wakeup(ch);
+        }
     }
+}
+
+static int chan_irq(struct ata_chan *ch)
+{
+    return irq_mode && ch->irq_line >= 0;
 }
 
 /* Expect an interrupt for the command (phase) about to start. */
@@ -169,7 +205,7 @@ static void disarm(struct ata_dev *d)
 static int wait_irq(struct ata_dev *d)
 {
     struct ata_chan *ch = d->ch;
-    if (irq_mode && current && current->pid > 0) {
+    if (chan_irq(ch) && current && current->pid > 0) {
         uint32_t deadline = ticks + IRQ_TIMEOUT;
         while (!ch->fired && (int32_t)(ticks - deadline) < 0)
             sleep_on_timeout(ch, deadline);
@@ -265,7 +301,7 @@ static void dma_stop(struct ata_chan *ch)
 static int dma_wait(struct ata_dev *d)
 {
     struct ata_chan *ch = d->ch;
-    if (irq_mode && current && current->pid > 0) {
+    if (chan_irq(ch) && current && current->pid > 0) {
         uint32_t deadline = ticks + IRQ_TIMEOUT;
         while (!(inb(ch->bm + BM_STATUS) & (BM_INTR | BM_ERR)) &&
                (int32_t)(ticks - deadline) < 0) {
@@ -298,7 +334,7 @@ static int dma_wait(struct ata_dev *d)
 /* Software reset, to get a drive out of a command that went wrong. */
 static void chan_reset(struct ata_chan *ch)
 {
-    uint8_t nien = irq_mode ? 0x00 : 0x02;
+    uint8_t nien = chan_irq(ch) ? 0x00 : 0x02;
     outb(ch->ctrl, (uint8_t)(nien | 0x04));
     for (int i = 0; i < 20; i++)
         io_wait();
@@ -719,18 +755,9 @@ static int dma_mode_selected(const uint16_t *id)
     return 0;
 }
 
-/* Find the PCI IDE controller's bus-master registers and enable DMA. */
+/* Give each channel its controller's bus-master registers, and enable DMA. */
 static void dma_init(void)
 {
-    struct pci_dev ide;
-    uint8_t prog_if;
-    if (pci_find_class(0x0101, &ide, &prog_if) < 0 || !(prog_if & 0x80))
-        return;                                         /* no bus mastering */
-    uint32_t bar4 = pci_read32(&ide, PCI_BAR4);
-    if (!(bar4 & 1) || !(bar4 & 0xFFFC))
-        return;
-    uint16_t bm = (uint16_t)(bar4 & 0xFFFC);
-
     /* One 64 KiB-aligned 64 KiB bounce buffer, carved out of 128 KiB. */
     uint32_t raw = pmm_alloc_contig(32);
     if (!raw)
@@ -742,22 +769,24 @@ static void dma_init(void)
         pmm_free(f);
     dma_bounce = (uint8_t *)aligned;
 
-    for (int c = 0; c < 2; c++) {
-        /* Only channels at the legacy ports this driver uses. */
-        if (prog_if & (c ? 0x04 : 0x01))
+    for (int c = 0; c < nchans; c++) {
+        struct ata_chan *ch = &chans[c];
+        struct ide_ctrl *k = ch->owner;
+        if (!k || !(k->prog_if & 0x80))
+            continue;                                   /* no bus mastering */
+        uint32_t bar4 = pci_read32(&k->pci, PCI_BAR4);
+        if (!(bar4 & 1) || !(bar4 & 0xFFFC))
             continue;
         uint32_t page = pmm_alloc();                    /* PRD tables: dword aligned */
         if (!page)
             continue;
-        chans[c].prd = (uint32_t *)page;
-        chans[c].bm = (uint16_t)(bm + 8 * c);
+        ch->prd = (uint32_t *)page;
+        ch->bm = (uint16_t)((bar4 & 0xFFFC) + 8 * ch->chan_no);
+        pci_enable(&k->pci, PCI_CMD_IO | PCI_CMD_MASTER);
     }
 
-    uint32_t cmd = pci_read32(&ide, PCI_COMMAND) & 0xFFFF;      /* keep RW1C status bits clear */
-    pci_write32(&ide, PCI_COMMAND, cmd | PCI_CMD_IO | PCI_CMD_MASTER);
-
-    char names[32] = "";
-    for (int i = 0; i < 4; i++) {
+    char names[64] = "";
+    for (int i = 0; i < MAX_DRIVES; i++) {
         struct ata_dev *d = &drives[i];
         if (!d->bd.name[0] || !d->dma_capable || !d->ch->bm)
             continue;
@@ -769,13 +798,61 @@ static void dma_init(void)
         boot_ok("IDE: bus-master DMA (%s)", names);
 }
 
+/*
+ * The PCI IDE controllers: which owns each legacy channel (a channel in
+ * compatibility mode), and the native-mode channels, at the ports in
+ * BAR0-3 with the controller's interrupt line.
+ */
+static void find_controllers(void)
+{
+    for (int i = 0; nctrls < MAX_CTRLS; i++) {
+        struct ide_ctrl *k = &ctrls[nctrls];
+        if (pci_find_class_nth(0x0101, i, &k->pci, &k->prog_if) < 0)
+            break;
+        nctrls++;
+        uint32_t id = pci_read32(&k->pci, 0);
+        for (int c = 0; c < 2; c++) {
+            if (!(k->prog_if & (c ? 0x04 : 0x01))) {
+                if (!chans[c].owner) {                  /* the legacy channel */
+                    chans[c].owner = k;
+                    chans[c].chan_no = c;
+                }
+                continue;
+            }
+            uint32_t io = pci_read32(&k->pci, PCI_BAR0 + 8 * c);
+            uint32_t ctl = pci_read32(&k->pci, PCI_BAR0 + 8 * c + 4);
+            if (!(io & 1) || !(ctl & 1) || !(io & 0xFFFC) || !(ctl & 0xFFFC) ||
+                nchans == MAX_CHANS)
+                continue;
+            struct ata_chan *ch = &chans[nchans++];
+            ch->io = (uint16_t)(io & 0xFFFC);
+            ch->ctrl = (uint16_t)((ctl & 0xFFFC) + 2);
+            ch->irq_line = pci_irq(&k->pci);
+            ch->native = 1;
+            ch->owner = k;
+            ch->chan_no = c;
+            pci_enable(&k->pci, PCI_CMD_IO);
+            boot_ok("IDE: native-mode channel %d of %04x:%04x at %04x/%04x, IRQ %d", c,
+                    id & 0xFFFF, id >> 16, ch->io, ch->ctrl, ch->irq_line);
+        }
+    }
+}
+
+/* SATA controllers in IDE mode may answer for an absent slave with the
+ * master: the same drive twice. */
+static int same_drive(const uint16_t *a, const uint16_t *b)
+{
+    return !memcmp(a + 10, b + 10, 20) && !memcmp(a + 27, b + 27, 40);
+}
+
 void ata_init(void)
 {
-    uint16_t *id = kmalloc(512);
-    if (!id)
+    uint16_t *id = kmalloc(512), *master_id = kmalloc(512);
+    if (!id || !master_id)
         return;
+    find_controllers();
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 2 * nchans; i++) {
         struct ata_dev *d = &drives[i];
         memset(d, 0, sizeof(*d));
         d->ch = &chans[i / 2];
@@ -786,9 +863,18 @@ void ata_init(void)
 
         if (identify(d, id) < 0)
             continue;
+        if (d->slave && drives[i - 1].bd.name[0] && same_drive(id, master_id)) {
+            klog("ata: %s answers for its slave too; ignoring the slave\n", drives[i - 1].bd.name);
+            continue;
+        }
+        if (!d->slave)
+            memcpy(master_id, id, 512);
 
         struct blockdev *bd = &d->bd;
-        snprintf(bd->name, sizeof(bd->name), "hd%c", 'a' + i);
+        if (d->ch->native)
+            blk_new_name(bd->name, sizeof(bd->name), d->atapi ? "sr" : "sd", d->atapi);
+        else
+            snprintf(bd->name, sizeof(bd->name), "hd%c", 'a' + i);
         ident_string(id, 27, 20, bd->model);
         bd->priv = d;
         if (d->atapi) {
@@ -824,17 +910,20 @@ void ata_init(void)
             blk_scan_partitions(bd);
     }
     kfree(id);
+    kfree(master_id);
 
     /* From here on, commands complete by interrupt (nIEN clear), unless
      * "ata.poll" on the command line asks for the polled fallback. */
     if (cmdline_has("ata.poll")) {
         boot_ok("IDE: polled I/O (ata.poll)");
     } else {
-        for (int c = 0; c < 2; c++) {
+        irq_mode = 1;
+        for (int c = 0; c < nchans; c++) {
+            if (chans[c].irq_line < 0)
+                continue;               /* a native channel without an IRQ: polled */
             irq_register(chans[c].irq_line, ata_irq);
             outb(chans[c].ctrl, 0x00);
         }
-        irq_mode = 1;
     }
 
     /* Data moves by DMA unless "ata.nodma" asks for PIO. */

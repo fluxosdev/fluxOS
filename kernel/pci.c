@@ -103,6 +103,21 @@ int pci_find_device(uint16_t vendor, uint16_t device, struct pci_dev *out)
     return pci_scan(id_matches, &id, out);
 }
 
+static int log_device(const struct pci_dev *p, const void *arg)
+{
+    (void)arg;
+    uint32_t id = pci_read32(p, 0x00), cls = pci_read32(p, 0x08);
+    klog("pci %02x:%02x.%d %04x:%04x class %04x prog-if %02x rev %02x irq %d\n", p->bus, p->dev,
+         p->fn, id & 0xFFFF, id >> 16, cls >> 16, (cls >> 8) & 0xFF, cls & 0xFF, pci_irq(p));
+    return 0;
+}
+
+void pci_log_devices(void)
+{
+    struct pci_dev unused;
+    pci_scan(log_device, NULL, &unused);
+}
+
 struct nth {
     uint16_t class_sub;
     int n;

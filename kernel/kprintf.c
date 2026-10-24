@@ -76,6 +76,17 @@ void boot_ok(const char *fmt, ...)
     kprintf("[\033[1;32m  OK  \033[0m] %s\n", buf);
 }
 
+/* Boot problem worth seeing, not fatal: "[ WARN ] message" */
+void boot_warn(const char *fmt, ...)
+{
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    kprintf("[\033[1;33m WARN \033[0m] %s\n", buf);
+}
+
 void panic(const char *fmt, ...)
 {
     char buf[256];

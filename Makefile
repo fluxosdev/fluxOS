@@ -19,9 +19,14 @@ CC      ?= gcc
 LD      ?= ld
 AR      ?= ar
 QEMU    ?= qemu-system-i386
-MKRESCUE ?= grub-mkrescue
-GRUB_MKIMAGE ?= grub-mkimage
-GRUB_PC_DIR ?= /usr/lib/grub/i386-pc
+# GRUB 2.06 from Debian 12, fetched once by tools/fetch-grub.sh (2.12 reboots
+# some older PCs right after "Welcome to GRUB!"). For the host's own GRUB:
+#   make GRUB=/ GRUB_DEP=
+GRUB    ?= grub-2.06
+GRUB_DEP ?= $(GRUB)/usr/bin/grub-mkimage
+MKRESCUE ?= $(GRUB)/usr/bin/grub-mkrescue
+GRUB_MKIMAGE ?= $(GRUB)/usr/bin/grub-mkimage
+GRUB_PC_DIR ?= $(GRUB)/usr/lib/grub/i386-pc
 
 BUILD   := build
 ISO     := fluxOS.iso
@@ -150,7 +155,10 @@ $(INITRD): $(BUILD)/.rootfs-stamp $(BINS)
 	chmod 755 $(ROOTFS)/home/flux/demo.sh
 	tar --format=ustar --owner=0 --group=0 --numeric-owner -cf $@ -C $(ROOTFS) .
 
-$(ISO): $(KERNEL) $(INITRD) grub/grub.cfg
+$(GRUB)/usr/bin/grub-mkimage:
+	sh tools/fetch-grub.sh $(GRUB)
+
+$(ISO): $(KERNEL) $(INITRD) grub/grub.cfg $(GRUB_DEP)
 	@mkdir -p $(BUILD)/iso/boot/grub
 	cp $(KERNEL) $(BUILD)/iso/boot/fluxos.kernel
 	cp $(INITRD) $(BUILD)/iso/boot/initrd.tar
@@ -162,7 +170,7 @@ $(ISO): $(KERNEL) $(INITRD) grub/grub.cfg
 	$(GRUB_MKIMAGE) -O i386-pc -d $(GRUB_PC_DIR) -o $(BUILD)/iso/boot/install/core.img \
 		-p '(,msdos1)/boot/grub' biosdisk part_msdos fat
 	cp $(GRUB_PC_DIR)/boot.img $(BUILD)/iso/boot/install/boot.img
-	$(MKRESCUE) -o $@ $(BUILD)/iso
+	PATH="$(abspath $(GRUB))/usr/bin:$$PATH" $(MKRESCUE) -d $(GRUB_PC_DIR) -o $@ $(BUILD)/iso
 
 check: $(KERNEL)
 	grub-file --is-x86-multiboot $(KERNEL) && echo "$(KERNEL): valid multiboot kernel"
