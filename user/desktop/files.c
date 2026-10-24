@@ -8,7 +8,9 @@
  *
  * Keys: arrows move the selection, Enter opens, Backspace goes up,
  * Delete deletes, F2 renames and F5 reloads the folder. Ctrl+X, Ctrl+C
- * and Ctrl+V cut, copy and paste (also between disks and the CD). Clicking the
+ * and Ctrl+V cut, copy and paste (also between disks and the CD), and
+ * Ctrl+A selects everything; dragging a box with the mouse selects several
+ * items. Clicking the
  * address field or Ctrl+L lets you type a path to go to.
  */
 #include <dirent.h>
@@ -39,6 +41,7 @@
 struct entry {
     char name[NAME_MAX + 1];
     int is_dir;
+    int selected;
     enum icon_id icon;
 };
 
@@ -58,18 +61,21 @@ static const struct {
 };
 
 /* The clipboard is shared by all folder windows. */
-static char clip_path[PATH_MAX];
+static char (*clip)[PATH_MAX];
+static int clip_n;
 static int clip_cut;
 
 /* What the mouse is holding down. */
-enum hold { HOLD_NONE, HOLD_TOOL, HOLD_THUMB, HOLD_ARROW_UP, HOLD_ARROW_DOWN };
+enum hold { HOLD_NONE, HOLD_TOOL, HOLD_THUMB, HOLD_ARROW_UP, HOLD_ARROW_DOWN, HOLD_BAND };
 
 struct fm {
     struct window *win;
     char path[PATH_MAX];
     struct entry *ents;
     int n, cap;
-    int sel;                            /* selected entry, or -1 */
+    int sel;                            /* the primary selected entry, or -1 */
+    int band_x0, band_y0;               /* rubber band start (y includes the scroll) */
+    int band_x1, band_y1;               /* rubber band end, in window coordinates */
     int scroll;                         /* view offset in pixels */
     enum hold hold;
     int hold_tool, hold_in;
@@ -199,6 +205,7 @@ static void load(struct fm *f)
         struct entry *e = &f->ents[f->n++];
         snprintf(e->name, sizeof(e->name), "%s", de->d_name);
         e->is_dir = de->d_type == DT_DIR;
+        e->selected = 0;
         e->icon = classify(f, e, pst.f_fstype);
     }
     closedir(d);
@@ -318,6 +325,54 @@ static void draw_scrollbar(struct fm *f, struct surface *s)
     }
 }
 
+static int count_selected(struct fm *f)
+{
+    int c = 0;
+    for (int i = 0; i < f->n; i++)
+        c += f->ents[i].selected;
+    return c;
+}
+
+static void clear_selection(struct fm *f)
+{
+    for (int i = 0; i < f->n; i++)
+        f->ents[i].selected = 0;
+    f->sel = -1;
+}
+
+static void select_only(struct fm *f, int i)
+{
+    clear_selection(f);
+    if (i >= 0 && i < f->n) {
+        f->ents[i].selected = 1;
+        f->sel = i;
+    }
+}
+
+static struct rect band_rect(struct fm *f)
+{
+    int x0 = f->band_x0, x1 = f->band_x1;
+    int y0 = f->band_y0 - f->scroll, y1 = f->band_y1;
+    if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
+    if (y0 > y1) { int t = y0; y0 = y1; y1 = t; }
+    return mkrect(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+}
+
+/* Selects the entries whose icon or label the rubber band touches. */
+static void band_select(struct fm *f)
+{
+    struct rect b = band_rect(f);
+    f->sel = -1;
+    for (int i = 0; i < f->n; i++) {
+        struct rect c = cell_rect(f, i);
+        struct rect icon = mkrect(c.x + (CELL_W - 32) / 2, c.y + 2, 32, 32);
+        struct rect label = mkrect(c.x + 2, c.y + 37, CELL_W - 4, font_sans.height + 1);
+        f->ents[i].selected = rect_overlaps(b, icon) || rect_overlaps(b, label);
+        if (f->ents[i].selected && f->sel < 0)
+            f->sel = i;
+    }
+}
+
 static void draw_entries(struct fm *f, struct surface *s)
 {
     struct rect a = icon_area(f);
@@ -328,7 +383,7 @@ static void draw_entries(struct fm *f, struct surface *s)
         struct rect c = cell_rect(f, i);
         if (!rect_overlaps(c, a))
             continue;
-        int sel = i == f->sel;
+        int sel = f->ents[i].selected;
         int ix = c.x + (CELL_W - 32) / 2, iy = c.y + 2;
         if (sel)
             draw_icon_selected(s, ix, iy, f->ents[i].icon, 32);
@@ -341,16 +396,23 @@ static void draw_entries(struct fm *f, struct surface *s)
         if (sel)
             gfx_fill(s, lr.x, lr.y, lr.w, lr.h, C_NAVY);
         gfx_text(s, &font_sans, lr.x + 2, lr.y, label, sel ? C_WHITE : C_BLACK);
-        if (sel && wm_focused() == f->win)
+        if (i == f->sel && wm_focused() == f->win)
             gfx_focus_rect(s, lr);
     }
+    if (f->hold == HOLD_BAND)
+        gfx_focus_rect(s, band_rect(f));
     s->clip = saved;
 }
 
 static void format_status(struct fm *f, char *buf, size_t size)
 {
-    if (f->sel < 0) {
+    int nsel = count_selected(f);
+    if (nsel == 0) {
         snprintf(buf, size, "%d object%s", f->n, f->n == 1 ? "" : "s");
+        return;
+    }
+    if (nsel > 1) {
+        snprintf(buf, size, "%d objects selected", nsel);
         return;
     }
     struct entry *e = &f->ents[f->sel];
@@ -376,8 +438,9 @@ static void paint(struct fm *f)
     for (int i = 0; i < NTOOLS; i++) {
         struct rect r = tool_rect(i);
         int down = f->hold == HOLD_TOOL && f->hold_tool == i && f->hold_in;
-        int disabled = ((i == TB_DELETE || i == TB_RENAME || i == TB_CUT || i == TB_COPY) &&
-                        f->sel < 0) || (i == TB_PASTE && !clip_path[0]);
+        int nsel = count_selected(f);
+        int disabled = ((i == TB_DELETE || i == TB_CUT || i == TB_COPY) && nsel == 0) ||
+                       (i == TB_RENAME && nsel != 1) || (i == TB_PASTE && !clip_n);
         draw_button(s, r, "", down, 0, 0);
         int x = r.x + 8 + down, y = r.y + 4 + down;
         if (tools[i].icon) {
@@ -432,10 +495,11 @@ static void show_selection(struct fm *f)
 
 static void select_name(struct fm *f, const char *name)
 {
-    f->sel = -1;
+    int hit = -1;
     for (int i = 0; i < f->n; i++)
         if (!strcmp(f->ents[i].name, name))
-            f->sel = i;
+            hit = i;
+    select_only(f, hit);
     show_selection(f);
 }
 
@@ -470,13 +534,25 @@ static void go_up(struct fm *f)
 static void reload(struct fm *f, const char *select)
 {
     char keep[NAME_MAX + 1] = "";
-    if (select)
+    char (*kept)[NAME_MAX + 1] = NULL;
+    int nkept = 0;
+    if (select) {
         snprintf(keep, sizeof(keep), "%s", select);
-    else if (f->sel >= 0)
+    } else if (f->sel >= 0) {
         snprintf(keep, sizeof(keep), "%s", f->ents[f->sel].name);
+        kept = malloc((size_t)f->n * sizeof(*kept) + 1);
+        for (int i = 0; kept && i < f->n; i++)
+            if (f->ents[i].selected)
+                snprintf(kept[nkept++], sizeof(*kept), "%s", f->ents[i].name);
+    }
     load(f);
     set_scroll(f, f->scroll);
     select_name(f, keep);
+    for (int k = 0; k < nkept; k++)
+        for (int i = 0; i < f->n; i++)
+            if (!strcmp(f->ents[i].name, kept[k]))
+                f->ents[i].selected = 1;
+    free(kept);
     paint(f);
 }
 
@@ -554,27 +630,41 @@ static void report(const char *title, const char *what, const char *name)
     message_box(title, ICON_WARNING, msg);
 }
 
+static int remove_tree(const char *path);
+
 static void do_delete(void *ctx)
 {
     struct fm *f = alive(ctx);
     if (!f)
         return;
-    char path[PATH_MAX];
-    struct stat st;
-    join(path, sizeof(path), f->path, f->pending);
-    int r = stat(path, &st) == 0 && S_ISDIR(st.st_mode) ? rmdir(path) : unlink(path);
-    if (r < 0)
-        report("Error Deleting File", "delete", f->pending);
+    for (int i = 0; i < f->n; i++) {
+        if (!f->ents[i].selected)
+            continue;
+        char path[PATH_MAX];
+        join(path, sizeof(path), f->path, f->ents[i].name);
+        struct stat st;
+        int r = stat(path, &st) == 0 && S_ISDIR(st.st_mode) ? rmdir(path) : unlink(path);
+        if (r < 0) {
+            report("Error Deleting File", "delete", f->ents[i].name);
+            break;
+        }
+    }
+    f->sel = -1;
     reload(f, NULL);
 }
 
 static void ask_delete(struct fm *f)
 {
-    if (f->sel < 0)
+    int nsel = count_selected(f);
+    if (nsel == 0)
         return;
-    struct entry *e = &f->ents[f->sel];
-    snprintf(f->pending, sizeof(f->pending), "%s", e->name);
     char msg[NAME_MAX + 64];
+    if (nsel > 1) {
+        snprintf(msg, sizeof(msg), "Are you sure you want to delete these %d items?", nsel);
+        ask_yes_no("Confirm Multiple File Delete", ICON_WARNING, msg, do_delete, f);
+        return;
+    }
+    struct entry *e = &f->ents[f->sel];
     snprintf(msg, sizeof(msg), "Are you sure you want to delete '%s'?", e->name);
     ask_yes_no(e->is_dir ? "Confirm Folder Delete" : "Confirm File Delete", ICON_WARNING, msg,
                do_delete, f);
@@ -613,7 +703,7 @@ static void do_rename(void *ctx, const char *name)
 
 static void ask_rename(struct fm *f)
 {
-    if (f->sel < 0)
+    if (f->sel < 0 || count_selected(f) != 1)
         return;
     snprintf(f->pending, sizeof(f->pending), "%s", f->ents[f->sel].name);
     char label[NAME_MAX + 32];
@@ -704,9 +794,18 @@ static int remove_tree(const char *path)
 
 static void clip_set(struct fm *f, int cut)
 {
-    if (f->sel < 0)
+    int nsel = count_selected(f);
+    if (nsel == 0)
         return;
-    join(clip_path, sizeof(clip_path), f->path, f->ents[f->sel].name);
+    char (*list)[PATH_MAX] = malloc((size_t)nsel * sizeof(*list));
+    if (!list)
+        return;
+    free(clip);
+    clip = list;
+    clip_n = 0;
+    for (int i = 0; i < f->n; i++)
+        if (f->ents[i].selected)
+            join(clip[clip_n++], PATH_MAX, f->path, f->ents[i].name);
     clip_cut = cut;
     paint(f);
 }
@@ -717,55 +816,67 @@ static int exists(const char *path)
     return stat(path, &st) == 0;
 }
 
-static void do_paste(struct fm *f)
+/* Pastes one clipboard item into the folder; 0 on success. */
+static int paste_one(struct fm *f, const char *src, char *name)
 {
-    if (!clip_path[0])
-        return;
-    const char *base = strrchr(clip_path, '/');
-    base = base ? base + 1 : clip_path;
-    char dst[PATH_MAX], name[NAME_MAX + 1];
-    snprintf(name, sizeof(name), "%s", base);
+    const char *base = strrchr(src, '/');
+    base = base ? base + 1 : src;
+    char dst[PATH_MAX];
+    snprintf(name, NAME_MAX + 1, "%s", base);
     join(dst, sizeof(dst), f->path, name);
 
     /* A folder cannot go inside itself. */
-    size_t n = strlen(clip_path);
-    if (!strncmp(dst, clip_path, n) && dst[n] == '/') {
+    size_t n = strlen(src);
+    if (!strncmp(dst, src, n) && dst[n] == '/') {
         struct stat st;
-        if (stat(clip_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (stat(src, &st) == 0 && S_ISDIR(st.st_mode)) {
             message_box("File Manager", ICON_WARNING, "Cannot copy a folder into itself.");
-            return;
+            return 1;
         }
     }
-    if (clip_cut && !strcmp(dst, clip_path))
-        return;                         /* moved onto itself */
+    if (clip_cut && !strcmp(dst, src))
+        return 0;                       /* moved onto itself */
     for (int k = 1; exists(dst) && k < 100; k++) {
         if (k == 1)
-            snprintf(name, sizeof(name), "Copy of %s", base);
+            snprintf(name, NAME_MAX + 1, "Copy of %s", base);
         else
-            snprintf(name, sizeof(name), "Copy (%d) of %s", k, base);
+            snprintf(name, NAME_MAX + 1, "Copy (%d) of %s", k, base);
         join(dst, sizeof(dst), f->path, name);
     }
 
     int r;
-    if (clip_cut && rename(clip_path, dst) == 0) {
+    if (clip_cut && rename(src, dst) == 0) {
         r = 0;
     } else {
         /* Different filesystem (say, CD to hard disk): copy, then remove the original. */
-        r = copy_tree(clip_path, dst);
+        r = copy_tree(src, dst);
         if (r < 0) {
             int e = errno;
             remove_tree(dst);
             errno = e;
         } else if (clip_cut) {
-            r = remove_tree(clip_path);
+            r = remove_tree(src);
         }
     }
     if (r < 0) {
         report(clip_cut ? "Error Moving File" : "Error Copying File", clip_cut ? "move" : "copy", base);
-    } else if (clip_cut) {
-        clip_path[0] = 0;
+        return 1;
     }
-    reload(f, name);
+    return 0;
+}
+
+static void do_paste(struct fm *f)
+{
+    char name[NAME_MAX + 1] = "";
+    int failed = 0;
+    for (int i = 0; i < clip_n && !failed; i++)
+        failed = paste_one(f, clip[i], name);
+    if (clip_cut && !failed) {
+        free(clip);
+        clip = NULL;
+        clip_n = 0;
+    }
+    reload(f, name[0] ? name : NULL);
 }
 
 /* ---- the address field ---- */
@@ -866,6 +977,13 @@ static void fm_key(struct window *w, const struct input_event *ev)
             clip_set(f, ev->text[0] == 0x18);   /* Ctrl+X, Ctrl+C */
         return;
     }
+    if (ev->len == 1 && ev->text[0] == 0x01) {         /* Ctrl+A */
+        for (int i = 0; i < f->n; i++)
+            f->ents[i].selected = 1;
+        f->sel = f->n ? 0 : -1;
+        paint(f);
+        return;
+    }
     int cols = columns(f), sel = f->sel;
     switch (ev->code) {
     case KEY_LEFT: sel = sel < 0 ? 0 : sel - 1; break;
@@ -888,7 +1006,7 @@ static void fm_key(struct window *w, const struct input_event *ev)
     }
     if (f->n == 0 || sel < 0 || sel >= f->n)
         return;
-    f->sel = sel;
+    select_only(f, sel);
     show_selection(f);
     paint(f);
 }
@@ -946,7 +1064,16 @@ static void press(struct fm *f, int x, int y)
         if (rect_contains(icon, x, y) || rect_contains(label, x, y))
             hit = i;
     }
-    f->sel = hit;
+    if (hit < 0) {
+        clear_selection(f);
+        f->last_click = -1;
+        f->hold = HOLD_BAND;
+        f->band_x0 = f->band_x1 = x;
+        f->band_y0 = y + f->scroll;
+        f->band_y1 = y;
+        return;
+    }
+    select_only(f, hit);
     unsigned int t = now_ms();
     if (hit >= 0 && hit == f->last_click && t - f->last_click_ms < DBLCLICK_MS) {
         f->last_click = -1;
@@ -967,6 +1094,10 @@ static void fm_mouse(struct window *w, int x, int y, int buttons, int changed)
         f->hold = HOLD_NONE;
         if (h == HOLD_TOOL && f->hold_in && rect_contains(tool_rect(f->hold_tool), x, y))
             tool_action(f, f->hold_tool);
+    } else if (f->hold == HOLD_BAND) {
+        f->band_x1 = x;
+        f->band_y1 = y;
+        band_select(f);
     } else if (f->hold == HOLD_THUMB) {
         scroll_to_mouse(f, y);
     } else if (f->hold == HOLD_TOOL) {
