@@ -389,22 +389,12 @@ fail:
 
 struct image *image_load_png(const char *path)
 {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0)
+    uint32_t len;
+    uint8_t *buf = file_read_all(path, &len);
+    if (!buf)
         return NULL;
-    struct stat st;
-    struct image *img = NULL;
-    if (fstat(fd, &st) == 0 && st.st_size > 0 && st.st_size < 16 * 1024 * 1024) {
-        uint8_t *buf = malloc(st.st_size);
-        uint32_t got = 0;
-        int r = 1;
-        while (buf && got < st.st_size && (r = (int)read(fd, buf + got, st.st_size - got)) > 0)
-            got += (uint32_t)r;
-        if (buf && got == st.st_size)
-            img = image_decode_png(buf, got);
-        free(buf);
-    }
-    close(fd);
+    struct image *img = image_decode_png(buf, len);
+    free(buf);
     return img;
 }
 

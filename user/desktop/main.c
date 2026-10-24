@@ -70,6 +70,8 @@ int main(void)
     sound_init();
     terminal_open("Terminal", NULL, 0, 1);
     wm_flush();
+    wallpaper_init();                   /* after the first frame: decoding takes a moment */
+    wm_flush();
 
     unsigned int last_blink = now_ms(), last_tick = last_blink;
     for (;;) {
@@ -133,6 +135,7 @@ int main(void)
             about_tick();
             display_tick();
             sound_tick();
+            files_tick();
             browser_tick();
         }
         wm_flush();

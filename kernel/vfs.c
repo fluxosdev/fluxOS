@@ -689,7 +689,10 @@ int vfs_mount(const char *source, const char *target, const char *type, struct v
     r = vfs_resolve(target, cwd, &mp);
     if (r < 0)
         return r;
-    return mount_at(bd, mp, type);
+    r = mount_at(bd, mp, type);
+    if (r == 0)
+        bd->manual_umount = 0;
+    return r;
 }
 
 static int subtree_busy(struct vnode *vn)
@@ -713,6 +716,37 @@ static void subtree_free(struct vnode *vn)
     vnode_free(vn);
 }
 
+/* media_gone: the medium was taken out, so what was not written is lost. */
+static int umount_fs(struct fs *fs, int media_gone)
+{
+    if (subtree_busy(fs->root))
+        return -EBUSY;
+
+    for (struct fs **pp = &mounts; *pp; pp = &(*pp)->next) {
+        if (*pp == fs) {
+            *pp = fs->next;
+            break;
+        }
+    }
+    struct vnode *mp = fs->covered;
+    struct blockdev *bd = fs->bd;
+    mp->mounted = NULL;
+    subtree_free(fs->root);
+    if (fs->ops->unmount)
+        fs->ops->unmount(fs);
+    if (media_gone) {
+        blk_discard(bd);
+    } else {
+        /* Everything written must be on the disk before it can be removed. */
+        blk_sync(bd);
+        blk_invalidate(bd);
+    }
+    bd->fs = NULL;
+    kfree(fs);
+    vfs_unref(mp);
+    return 0;
+}
+
 int vfs_umount(const char *target, struct vnode *cwd)
 {
     struct vnode *vn;
@@ -727,27 +761,61 @@ int vfs_umount(const char *target, struct vnode *cwd)
         fs = vn->fs;
     if (!fs)
         return -EINVAL;
-    if (subtree_busy(fs->root))
-        return -EBUSY;
+    bd = fs->bd;
+    r = umount_fs(fs, 0);
+    if (r == 0)
+        bd->manual_umount = 1;          /* the automounter leaves this medium alone now */
+    return r;
+}
 
-    for (struct fs **pp = &mounts; *pp; pp = &(*pp)->next) {
-        if (*pp == fs) {
-            *pp = fs->next;
-            break;
-        }
+/*
+ * The automounter's two entry points, for the kmediad thread (VFS lock held).
+ * A medium that the user unmounts is not mounted again until it is taken out.
+ */
+int vfs_unmount_removable(struct blockdev *bd, int media_gone)
+{
+    return bd->fs ? umount_fs(bd->fs, media_gone) : 0;
+}
+
+/* The mount point's path (without the leading slash) for the next medium. */
+static int removable_mount_point(struct blockdev *bd, char *path, uint32_t size)
+{
+    if (bd->type != BLK_CDROM) {
+        snprintf(path, size, "mnt/%s", bd->name);
+        return 0;
     }
-    struct vnode *mp = fs->covered;
-    mp->mounted = NULL;
-    subtree_free(fs->root);
-    if (fs->ops->unmount)
-        fs->ops->unmount(fs);
-    /* Everything written must be on the disk before it can be removed. */
-    blk_sync(fs->bd);
-    blk_invalidate(fs->bd);
-    fs->bd->fs = NULL;
-    kfree(fs);
-    vfs_unref(mp);
-    return 0;
+    for (int n = 0; n < BLK_MAX_DEVS; n++) {
+        if (n)
+            snprintf(path, size, "mnt/cdrom%d", n);
+        else
+            snprintf(path, size, "mnt/cdrom");
+        struct vnode *mp;
+        if (vfs_resolve(path, NULL, &mp) < 0 || !mp->mounted)
+            return 0;                   /* free: new, or an empty directory */
+    }
+    return -EBUSY;
+}
+
+int vfs_mount_removable(struct blockdev *bd, char *where, uint32_t size)
+{
+    char path[32];
+    int r = removable_mount_point(bd, path, sizeof(path));
+    if (r < 0)
+        return r;
+    struct vnode *mp;
+    int existed = vfs_resolve(path, NULL, &mp) == 0;
+    if (!existed && (r = vfs_mkdir_p(path, &mp)) < 0)
+        return r;
+    r = mount_at(bd, mp, "auto");
+    if (r < 0 && !existed) {
+        char abs[40];
+        snprintf(abs, sizeof(abs), "/%s", path);
+        vfs_rmdir(abs, NULL);
+        return r;
+    }
+    if (r == 0 && where)
+        snprintf(where, size, "/%s", path);
+    return r;
 }
 
 int vfs_statfs(struct vnode *vn, struct statfs *st)

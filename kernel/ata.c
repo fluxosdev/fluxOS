@@ -101,6 +101,7 @@ struct ata_dev {
     int dma;                            /* use DMA for data transfers */
     int flush_ext;                      /* flush with FLUSH CACHE EXT */
     int no_flush;                       /* the drive rejects FLUSH CACHE */
+    int media_changed;                  /* ATAPI: a unit attention not yet reported */
     struct blockdev bd;
 };
 
@@ -584,6 +585,43 @@ static int atapi_capacity(struct blockdev *bd)
     return -EIO;
 }
 
+/*
+ * Is there a disc, and is it a new one? TEST UNIT READY succeeds when there
+ * is. When it fails, the sense data says why: NOT READY with "medium not
+ * present" is an empty drive (tray open or closed), NOT READY "becoming
+ * ready" a disc still spinning up, and UNIT ATTENTION means the medium
+ * changed (or the drive was reset) since the last command, which is
+ * reported once; the next try then works if a disc is in. The change is
+ * remembered until it can be reported, even if the disc is not ready yet.
+ */
+static int atapi_media(struct blockdev *bd)
+{
+    struct ata_dev *d = bd->priv;
+    static const uint8_t tur[12] = { 0 };
+    static const uint8_t req[12] = { 0x03, 0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0 };
+    for (int tries = 0; tries < 4; tries++) {
+        if (atapi_packet(d, tur, NULL, 0) == 0) {
+            int changed = d->media_changed;
+            d->media_changed = 0;
+            return changed ? MEDIA_CHANGED : MEDIA_PRESENT;
+        }
+        uint8_t sense[18] = { 0 };
+        if (atapi_packet(d, req, sense, sizeof(sense)) < 0)
+            return MEDIA_BUSY;          /* the drive does not answer: look again later */
+        int key = sense[2] & 15, asc = sense[12];
+        if (key == 6) {                 /* unit attention */
+            d->media_changed = 1;
+            continue;
+        }
+        if (key == 2 && asc == 0x3A) {  /* no medium: whatever comes next is new */
+            d->media_changed = 0;
+            return MEDIA_NONE;
+        }
+        return MEDIA_BUSY;
+    }
+    return MEDIA_BUSY;
+}
+
 static int atapi_read(struct blockdev *bd, uint32_t lba, uint32_t count, void *buf)
 {
     struct ata_dev *d = bd->priv;
@@ -759,6 +797,7 @@ void ata_init(void)
             bd->readonly = 1;
             bd->read = atapi_read;
             bd->refresh = atapi_capacity;
+            bd->media = atapi_media;
             atapi_capacity(bd);
         } else {
             bd->type = BLK_DISK;

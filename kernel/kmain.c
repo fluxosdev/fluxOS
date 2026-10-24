@@ -149,6 +149,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     proc_spawn_init("/bin/init");
     blk_start_flusher();
     floppy_start();
+    automount_start();
     boot_ok("Scheduler started, launching /bin/init");
     kprintf("\n");
 

@@ -2,8 +2,8 @@
  * The file manager: a folder window in the style of Windows 95's large
  * icon view, with a toolbar (Up, New Folder, Delete, Rename), an address
  * field, a scroll bar and a status bar. Double-clicking a folder opens
- * it in the same window; a program runs in a terminal window, a PNG
- * opens in the image viewer, a text file in the text editor, a WAV or VOC
+ * it in the same window; a program runs in a terminal window, a PNG or
+ * JPEG picture opens in the image viewer, a text file in the text editor, a WAV or VOC
  * sound plays with play(1), and anything else is shown with more(1).
  *
  * Keys: arrows move the selection, Enter opens, Backspace goes up,
@@ -13,6 +13,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <flux.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -140,7 +141,8 @@ static enum icon_id classify(struct fm *f, const struct entry *e, const char *pa
             return !strcmp(st.f_fstype, "iso9660") ? ICON_CDROM : ICON_DRIVE;
         return ICON_FOLDER;
     }
-    if (has_suffix(e->name, ".png"))
+    if (has_suffix(e->name, ".png") || has_suffix(e->name, ".jpg") ||
+        has_suffix(e->name, ".jpeg") || has_suffix(e->name, ".jpe") || has_suffix(e->name, ".jfif"))
         return ICON_IMAGE;
     if (has_suffix(e->name, ".html") || has_suffix(e->name, ".htm"))
         return ICON_HTML;
@@ -469,6 +471,32 @@ static void reload(struct fm *f, const char *select)
     paint(f);
 }
 
+/*
+ * Once a second: discs and floppies are mounted and unmounted by the kernel
+ * as they are put in and taken out (the automounter), so when the list of
+ * mounts changes, every folder window reads its folder again and the drive
+ * icons follow.
+ */
+void files_tick(void)
+{
+    static char last[2048];
+    static int known;
+    char now[sizeof(last)];
+    int n = getmounts(now, sizeof(now) - 1);
+    if (n < 0)
+        return;
+    now[n] = 0;
+    if (known && !strcmp(now, last))
+        return;
+    int changed = known;
+    memcpy(last, now, (size_t)n + 1);
+    known = 1;
+    if (!changed)
+        return;                         /* the first look only takes note */
+    for (struct fm *f = fms; f; f = f->next)
+        reload(f, NULL);
+}
+
 static void open_entry(struct fm *f, int i)
 {
     struct entry *e = &f->ents[i];
@@ -479,7 +507,7 @@ static void open_entry(struct fm *f, int i)
     } else if (e->icon == ICON_IMAGE) {
         if (!image_view_open(path)) {
             char msg[NAME_MAX + 64];
-            snprintf(msg, sizeof(msg), "%s is not a PNG image fluxOS can show.", e->name);
+            snprintf(msg, sizeof(msg), "%s is not a PNG or JPEG picture fluxOS can show.", e->name);
             message_box("Image Viewer", ICON_WARNING, msg);
         }
     } else if (e->icon == ICON_HTML) {
@@ -859,7 +887,7 @@ static const struct window_ops iv_ops = {
 
 struct window *image_view_open(const char *path)
 {
-    struct image *img = image_load_png(path);
+    struct image *img = image_load(path);
     if (!img)
         return NULL;
     int cw = img->w + 16, ch = img->h + 16;

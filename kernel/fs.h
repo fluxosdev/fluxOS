@@ -54,6 +54,11 @@ int vfs_umount(const char *target, struct vnode *cwd);
 int vfs_statfs(struct vnode *vn, struct statfs *st);
 int vfs_mounts_text(char *buf, uint32_t size);
 void vfs_automount(void);
+/* The automounter's: mount the medium in bd on a mount point it picks (a CD on
+ * /mnt/cdrom or the next free /mnt/cdromN, a floppy on /mnt/fdN), or unmount
+ * it. media_gone: it was taken out, so nothing can be written back. -EBUSY if in use. */
+int vfs_mount_removable(struct blockdev *bd, char *where, uint32_t size);
+int vfs_unmount_removable(struct blockdev *bd, int media_gone);
 int vfs_mountpoint_of(struct blockdev *bd, char *buf, uint32_t size);
 
 #endif

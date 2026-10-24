@@ -388,7 +388,7 @@ static void present(struct rect r)
 static void draw_desktop(void)
 {
     struct rect c = screen.clip;
-    gfx_fill(&screen, c.x, c.y, c.w, c.h, C_DESKTOP);
+    wallpaper_draw(&screen, c);
 
     for (int i = 0; i < NDESK; i++) {
         struct rect cell = desk_icon_rect(i);
@@ -405,6 +405,9 @@ static void draw_desktop(void)
         struct rect lr = mkrect(cell.x + (cell.w - tw) / 2 - 2, iy + 32 + 3, tw + 4, font_sans.height + 1);
         if (sel)
             gfx_fill(&screen, lr.x, lr.y, lr.w, lr.h, C_NAVY);
+        /* Over a photograph, white text needs a shadow to stay readable. */
+        if (!sel && wallpaper_active())
+            gfx_text(&screen, &font_sans, lr.x + 3, lr.y + 1, desk_icons[i].label, C_BLACK);
         gfx_text(&screen, &font_sans, lr.x + 2, lr.y, desk_icons[i].label, C_WHITE);
         if (sel && focused == NULL)
             gfx_focus_rect(&screen, lr);
@@ -1413,6 +1416,7 @@ int wm_reconfigure(void)
     screen_w = (int)fbi.width;
     screen_h = (int)fbi.height;
     fb_fast = fbi.bpp == 32 && fbi.red_pos == 16 && fbi.green_pos == 8 && fbi.blue_pos == 0;
+    wallpaper_resize();
 
     if (drag != DRAG_CLIENT) {
         drag = DRAG_NONE;

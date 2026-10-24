@@ -94,6 +94,21 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
     on 512-byte-sector disks.
   - Volumes are mounted at boot on `/mnt/cdrom`, `/mnt/hdX` and `/mnt/fd0`,
     and with `mount`/`umount`, which refuses while files are in use.
+  - **Automounting:** the `kmediad` thread looks at every CD-ROM and floppy
+    drive every 2 seconds. A disc or disk that is put in is mounted (a CD on
+    `/mnt/cdrom`, or the next free `/mnt/cdromN` if another is there; a
+    floppy on `/mnt/fdN`); one that is taken out or swapped is unmounted, at
+    once if nothing is using it and otherwise as soon as it is free (a shell
+    whose directory is inside it is enough to keep it). A medium you unmount
+    by hand is left alone until it is taken out, so `umount /mnt/cdrom` and
+    the eject button work in that order. A disc it cannot mount (an audio
+    CD, a blank floppy) is tried once and noted in `dmesg`. A CD drive is
+    asked with TEST UNIT READY and its sense data (no medium, new medium,
+    still spinning up); a floppy drive's disk change line is read, and an
+    empty drive's head is stepped out and back to see whether a disk went
+    in. `automount=off` on the kernel command line switches it off, and
+    `floppy.nopoll` stops the floppy polling alone (on a real drive each
+    look at an empty one clicks the head).
 - Console: a text console with an ANSI/VT100 escape interpreter, drawn on the
   boot framebuffer with an 8x16 font of the PC's code page 437 (or in VGA text
   mode without one), PS/2 keyboard (arrows, function keys and modifiers map to
@@ -199,6 +214,17 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   decoder (inflate included) and alpha-blends images, so any 8-bit,
   non-interlaced PNG can be shown; a missing icon file falls back to a
   simple built-in drawing.
+- JPEG pictures too: the desktop decodes baseline and progressive JPEG
+  (greyscale, YCbCr or RGB, any chroma subsampling, restart intervals), with
+  smooth chroma upsampling so photographs have no blocky colour edges. The
+  file's first bytes decide which decoder runs, whatever its name, in the
+  image viewer, the file manager's icons, the browser and the wallpaper.
+- Wallpaper: the desktop shows a picture (JPEG or PNG) behind its icons,
+  by default a photograph in `/usr/share/wallpapers`. It can be **Fill**ed
+  (scaled evenly to cover the screen, the overflow cut off), **Stretch**ed
+  to the screen's exact size, **Center**ed at its own size, or **Tile**d. It
+  is drawn again from the original whenever the screen changes size, and the
+  icons' labels get a shadow so they read on a bright picture.
 - Windows can be resized by dragging any edge or corner (the pointer turns
   into a resize arrow), maximized and restored with the caption button or by
   double-clicking the caption. The browser, text editor and file manager
@@ -212,9 +238,10 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   `/`, the Start menu on your home folder) with large icons, a scroll bar, an
   address field you can type a path into, and Up, New Folder, Delete and
   Rename (also Backspace, Delete, F2, F5 and Ctrl+L). Mounted disks and CDs
-  get drive icons. Double-clicking a folder opens it, a program or script
-  runs in a terminal window, a PNG opens in an image viewer, and any other
-  file is shown with `more`.
+  get drive icons, and every folder window reads its folder again when a
+  disc or floppy is mounted or unmounted. Double-clicking a folder opens it, a program or script
+  runs in a terminal window, a PNG or JPEG picture opens in an image viewer,
+  a sound plays, and any other file is shown with `more`.
 - Calculator: a Windows 95 style standard calculator with memory keys
   (MC, MR, MS, M+), percent, square root, reciprocal, change sign, CE and
   Back, usable with the mouse or the keyboard (digits, `+ - * /`, Enter, `%`,
@@ -233,7 +260,8 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   with Back, Forward, Stop, Refresh and Home, an address bar, a progress
   gauge, and the address of the link under the mouse in its status bar. It
   fetches pages over plain HTTP (by running `wget`, so the desktop keeps
-  working while a page loads), then their style sheets and PNG pictures,
+  working while a page loads), then their style sheets and PNG and JPEG
+  pictures,
   and opens `file://` pages and folders too.
   - Its HTML parser follows the main rules of the HTML5 tree builder (implied
     and auto-closed tags, tables, character references, quirks mode) and
@@ -263,7 +291,13 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   the kernel which filesystem it booted from, and a system started from an
   installed hard disk hides the icon and the Start menu entry. (`fluxinstall`
   still works from a shell there.)
-- Display Properties: a Win95-style dialog with two pages.
+- Display Properties: a Win95-style dialog with three pages.
+  - **Background** picks the wallpaper from a list (the pictures in
+    `/usr/share/wallpapers` and your home folder, or **(None)**; **Browse...**
+    takes the path of any other) and how it fills the screen. A preview
+    monitor, shaped like the real screen, shows the choice as soon as it is
+    made, drawn from a thumbnail: a JPEG decodes at an eighth of its size,
+    which takes a fraction of the time of the whole picture.
   - **Settings** shows a monitor with a miniature of the desktop at the
     chosen size, the display adapter, the driver (standard VGA or the 3dfx
     driver), the color palette (High Color, 16 bit, or True Color, 32 bit),
@@ -277,9 +311,9 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
     out again and asks whether to keep it, going back to the old mode by
     itself after 15 seconds. With the standard driver the BIOS mode stays,
     and a system installed on a hard disk can choose the mode to start in.
-  - Settings are saved for the next start in GRUB's environment block
-    (`/boot/grub/grubenv` on the installed partition); started from the CD
-    they last until a restart.
+  - Settings, wallpaper included, are saved for the next start in GRUB's
+    environment block (`/boot/grub/grubenv` on the installed partition);
+    started from the CD they last until a restart.
 - 3D Gears: the classic OpenGL gears demo in a resizable window, drawn by
   the Voodoo3's 3D engine when there is one and by the software renderer
   otherwise. The status bar names the renderer and counts frames per
@@ -314,7 +348,8 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   the timer (IRQ 0, 18.2 Hz or as reprogrammed through the PIT) and keyboard
   (IRQ 1, port 60h) interrupts reach programs that install handlers.
 - Drives: `C:` is the fluxOS root, `A:` and `B:` are `/mnt/fd0` and `/mnt/fd1`
-  (a floppy is mounted the first time a program looks at the drive) and `D:`
+  (a floppy is mounted when it is put in, or at the latest the first time a
+  program looks at the drive) and `D:`
   is `/mnt/cdrom`. Names are matched case-insensitively; directory listings
   show the names that fit in 8.3. DOS standard handles are fluxOS's
   descriptors 0-2, so `dos PROG > out.txt` and pipes work.
@@ -493,6 +528,7 @@ host example.com               # DNS
 wget -O - http://example.com/  # HTTP over the TCP stack
 nc -l 7777 &  echo hi | nc localhost 7777    # a TCP server and client
 ls /mnt/fd0; df -h /mnt/fd0     # the floppy (make floppy, then make run)
+dmesg | grep -E "mounted|removed"   # discs and floppies mounted as they are put in
 cp /mnt/fd0/GAME.EXE ~; ./GAME.EXE   # a DOS program, in the terminal
 beep -m "T160 L8 CDEGEC4"      # the PC speaker, with BASIC's PLAY music
 play /usr/share/sounds/startup.wav   # the Sound Blaster (also .voc files)
@@ -528,6 +564,8 @@ kernel/
   vfs.c, file.c, initrd.c  VFS + ramfs, mounting, devices, open files, pipes, initrd
   ata.c, blkdev.c, pci.c   IDE ATA/ATAPI driver (DMA), block devices, partitions, cache
   floppy.c                 floppy disk controller driver (ISA DMA, track cache)
+  automount.c              kmediad: mounts and unmounts CDs and floppies as they
+                           are put in and taken out
   fat32.c, iso9660.c       filesystem drivers (FAT12/16/32, ISO9660)
   tty.c, vga.c, serial.c,  console stack: terminals and ptys, text console,
   keyboard.c, timer.c      serial port, PS/2 keyboard, PIT, RTC, power control
@@ -555,7 +593,10 @@ user/
                            (calc.c), the Setup wizard (setup.c), Display
                            Properties (display.c), 3D Gears (gears.c), the
                            tray speaker and Volume Control (sound.c), dialogs,
-                           drawing, PNG decoding (png.c), icons, fonts,
+                           drawing, PNG and JPEG decoding (png.c, jpeg.c, with
+                           image.c choosing between them), the wallpaper
+                           (wallpaper.c), GRUB's environment block
+                           (grubenv.c), icons, fonts,
                            and the web browser: its window (browser.c), HTML
                            parser (html.c), CSS (css.c), layout and painting
                            (layout.c), fonts (webfont.c) and URLs (webutil.c)
@@ -669,6 +710,21 @@ next timer tick delivers, so a reply is never built inside the code that
 sent the request. TCP keeps segments that arrive out of order out: it
 acknowledges what it has and the sender goes back and resends.
 
+**Pictures and the wallpaper.** The JPEG decoder reads bits from a 32-bit
+buffer with a 9-bit lookahead for Huffman codes. A sequential scan goes
+block by block through the integer inverse DCT into the component's sample
+plane. A progressive file keeps every coefficient (16 bits each) until its
+last scan and transforms them all then, so a file that ends early still
+shows what arrived, blurrier. Chroma planes are upsampled with a triangle
+filter while the colors are converted, a row at a time. The thumbnail
+decode skips the transform and takes each block's DC coefficient as one
+pixel. The wallpaper is kept as decoded and drawn once into a surface the
+size of the screen, so the compositor's repaints of a window's damage are a
+copy: a picture more than twice too big is first averaged down in whole
+blocks (which avoids aliasing), then interpolated linearly, four channels
+at a time in two 32-bit lanes. Decoding happens after the desktop's first
+frame, so the terminal appears before the picture does.
+
 **The browser** keeps everything a page owns in arenas: the document tree
 and style sheets in one, computed styles in a second that is rebuilt when a
 style sheet arrives, and the layout in a third that is rebuilt when a
@@ -720,8 +776,12 @@ Storage limits:
   2-second resolution.
 - **Floppies:** only the primary controller at 0x3F0, two drives, and
   double- and high-density disks (a 2.88M drive is used as a 1.44M one).
-  Unmount a floppy before taking it out: a disk changed while mounted is
-  refused until it is unmounted, and changes not yet written are lost.
+  Disks are unmounted for you when they come out, but changes that had not
+  been written yet (up to 5 seconds' worth, or what `sync` has not
+  flushed) are lost with them: unmount a floppy before taking it out, as on
+  any system. A disk changed while mounted is refused until it is
+  unmounted, which the automounter does at once unless something uses it.
+  Looking for a disk in an empty drive steps the head every 2 seconds.
 
 The desktop's terminals are a fixed 80x25 and keep no scrollback, windows
 are resized by an outline (the contents redraw when you let go), dialogs,
@@ -754,8 +814,8 @@ the timer's 10 ms resolution.
 
 The web browser has no HTTPS (there is no TLS), so most of today's web is
 out of reach: it explains this and suggests the plain http:// address
-instead. It runs no JavaScript and shows only PNG pictures (GIF, JPEG and
-SVG show their alternative text). Its layout is an approximation: floats
+instead. It runs no JavaScript and shows only PNG and JPEG pictures (GIF
+and SVG show their alternative text). Its layout is an approximation: floats
 become inline-blocks, positioned elements stay in the normal flow (those
 hidden off-screen are dropped), grids are blocks, flex rows are lines of
 inline-blocks, and `calc()` takes its first length. It has no font downloads,
@@ -786,3 +846,20 @@ Permission bits are cosmetic apart from the exec bit, and there is a single
 user. Signals cannot have user handlers, and jobs
 cannot be stopped (no ^Z). User programs may use the x87 FPU but not SSE,
 whose registers the kernel does not save: SSE instructions raise `SIGILL`.
+
+Pictures: files that are not JPEGs of the supported kinds (arithmetic
+coding, 12-bit samples, lossless, CMYK) or non-interlaced 8-bit PNGs are
+not shown; the JPEG decoder ignores the EXIF orientation tag and color
+profiles, and handles pictures up to 4096 by 4096. A 1920x1080 photograph
+takes a few seconds to decode on a slow machine, with the desktop waiting;
+the wallpaper list holds 40 pictures.
+
+## Credits
+
+The default wallpaper, `/usr/share/wallpapers/mountains.jpg`, is a photograph
+by Štefan Štefančík on [Unsplash](https://unsplash.com), used under the
+[Unsplash License](https://unsplash.com/license). Thank you for sharing it.
+
+The icons are from the public-domain [Tango Desktop
+Project](https://commons.wikimedia.org/wiki/Tango_icons), and the desktop's
+text is rasterised from Liberation Sans, Serif and Mono.

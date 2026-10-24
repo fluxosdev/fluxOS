@@ -1,6 +1,10 @@
 /*
- * Display Properties: the display driver, the video mode and the monitor.
+ * Display Properties: the wallpaper, the display driver, the video mode
+ * and the monitor.
  *
+ * The Background page picks the wallpaper (a JPEG or PNG picture) and how
+ * it fills the screen: a preview monitor shows the choice, drawn from a
+ * thumbnail (a JPEG decodes at an eighth of its size, which is quick).
  * The Settings page picks the driver, color depth, desktop area and
  * refresh rate. The Monitor page picks the kind of monitor, which limits
  * the modes offered, and shows what the monitor's EDID says about it and
@@ -19,6 +23,7 @@
  * kernel as video=. Started from the CD there is nowhere to save them, and
  * they last until a restart.
  */
+#include <dirent.h>
 #include <fcntl.h>
 #include <flux.h>
 #include <stdio.h>
@@ -31,15 +36,20 @@
 #define DLG_H 448
 #define ITEM_H 16                       /* rows of an open drop-down list */
 #define CONFIRM_SECS 15
-#define GRUBENV_SIZE 1024
 
-enum page { PAGE_SETTINGS, PAGE_MONITOR };
+enum page { PAGE_BACKGROUND, PAGE_SETTINGS, PAGE_MONITOR, PAGE_COUNT };
 enum driver { DRV_STANDARD, DRV_NATIVE };
 
 /* Controls, in Tab order. */
 enum ctl {
-    K_TABS, K_DRIVER, K_COLORS, K_AREA, K_REFRESH, K_MONITOR, K_OK, K_CANCEL, K_APPLY, K_COUNT
+    K_TABS, K_DRIVER, K_COLORS, K_AREA, K_REFRESH, K_MONITOR,
+    K_WALL, K_BROWSE, K_WALLMODE,
+    K_OK, K_CANCEL, K_APPLY, K_COUNT
 };
+#define IS_PUSH(k) ((k) >= K_OK || (k) == K_BROWSE)     /* push buttons */
+
+#define MAX_WALLS 40
+#define WALL_ROWS 6                     /* rows of the wallpaper list in view */
 
 /* What a monitor can show: line rate in kHz, refresh in Hz, largest mode. */
 struct monitor {
@@ -69,6 +79,15 @@ struct edid_text {
     char model[32], maker[32], made[32], size[32], preferred[40], hrange[32], vrange[32], clock[32];
 };
 
+/* One choice in the wallpaper list; the first is always "(None)". */
+struct wall_entry {
+    char path[160];                     /* "" for none */
+    char name[40];
+    struct image *thumb;                /* decoded when first selected */
+    int full_w, full_h;                 /* the picture's real size */
+    int tried;
+};
+
 struct dprops {
     struct window *win;
     enum page page;
@@ -96,6 +115,11 @@ struct dprops {
     int nres, res_idx;
     int rates[8];
     int nrates;
+
+    /* the Background page */
+    struct wall_entry walls[MAX_WALLS];
+    int nwalls, wall_sel, wall_top, wall_mode;
+    int sb_drag, sb_grab;               /* the list's scroll bar thumb is held */
 };
 
 static struct dprops *dlg;
@@ -116,84 +140,25 @@ static struct confirm *cfm;
 static void dp_paint(struct dprops *d);
 static void dp_reload(struct dprops *d);
 
-/* ---- grubenv ---- */
+/* ---- grubenv (see grubenv.c) ---- */
 
-static int booted_from_disk(void)
-{
-    char buf[16] = "";
-    int fd = open("/etc/boot-source", O_RDONLY);
-    if (fd < 0)
-        return 0;
-    int n = (int)read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    return n >= 4 && !strncmp(buf, "disk", 4);
-}
-
-/* The mounted FAT volume with GRUB on it, when started from a hard disk. */
 static void find_boot_dir(char *out, size_t size)
 {
-    out[0] = 0;
-    if (!booted_from_disk())
-        return;
-    struct blkinfo bi;
-    for (int i = 0; blkinfo(i, &bi) == 0; i++) {
-        if (!bi.mountpoint[0] || strncmp(bi.fstype, "fat", 3) != 0)
-            continue;
-        char path[192];
-        snprintf(path, sizeof(path), "%s/boot/grub/grub.cfg", bi.mountpoint);
-        int fd = open(path, O_RDONLY);
-        if (fd >= 0) {
-            close(fd);
-            snprintf(out, size, "%s", bi.mountpoint);
-            return;
-        }
-    }
+    grubenv_boot_dir(out, size);
 }
 
 static void read_grubenv(const char *dir, char *gfx, char *video)
 {
-    gfx[0] = video[0] = 0;
-    if (!dir[0])
-        return;
-    char path[192], buf[GRUBENV_SIZE + 1];
-    snprintf(path, sizeof(path), "%s/boot/grub/grubenv", dir);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0)
-        return;
-    int n = (int)read(fd, buf, GRUBENV_SIZE);
-    close(fd);
-    if (n <= 0)
-        return;
-    buf[n] = 0;
-    for (char *line = buf; line && *line; ) {
-        char *next = strchr(line, '\n');
-        if (next)
-            *next++ = 0;
-        if (!strncmp(line, "fluxos_gfx=", 11))
-            snprintf(gfx, 32, "%s", line + 11);
-        else if (!strncmp(line, "fluxos_video=", 13))
-            snprintf(video, 32, "%s", line + 13);
-        line = next;
-    }
+    grubenv_get(dir, "fluxos_gfx", gfx, 32);
+    grubenv_get(dir, "fluxos_video", video, 32);
 }
 
-/* GRUB wants the block exactly 1024 bytes long, padded with '#'. */
+/* Empty values are left out of the file, which GRUB treats as unset. */
 static int write_grubenv(const char *dir, const char *gfx, const char *video)
 {
-    char path[192], buf[GRUBENV_SIZE];
-    snprintf(path, sizeof(path), "%s/boot/grub/grubenv", dir);
-    int n = snprintf(buf, sizeof(buf), "# GRUB Environment Block\n");
-    if (gfx[0])
-        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "fluxos_gfx=%s\n", gfx);
-    n += snprintf(buf + n, sizeof(buf) - (size_t)n, "fluxos_video=%s\n", video);
-    memset(buf + n, '#', sizeof(buf) - (size_t)n);
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0)
-        return -1;
-    int w = (int)write(fd, buf, sizeof(buf));
-    close(fd);
-    sync();
-    return w == (int)sizeof(buf) ? 0 : -1;
+    const char *keys[2] = { "fluxos_gfx", "fluxos_video" };
+    const char *vals[2] = { gfx, video };
+    return grubenv_update(dir, keys, vals, 2);
 }
 
 /* "1024x768x32" (refresh 0) or "1024x768x16@85" */
@@ -397,9 +362,21 @@ static int mode_controls_enabled(struct dprops *d)
 
 /* ---- geometry ---- */
 
+static const enum page tab_pages[PAGE_COUNT] = { PAGE_BACKGROUND, PAGE_SETTINGS, PAGE_MONITOR };
+static const char *const tab_names[PAGE_COUNT] = { "Background", "Settings", "Monitor" };
+
 static struct rect tab_rect(int i)
 {
-    return i == 0 ? mkrect(6, 6, 64, 20) : mkrect(70, 6, 62, 20);
+    static const int x[PAGE_COUNT + 1] = { 6, 86, 152, 216 };
+    return mkrect(x[i], 6, x[i + 1] - x[i] - 2, 20);
+}
+
+static int tab_index(enum page p)
+{
+    for (int i = 0; i < PAGE_COUNT; i++)
+        if (tab_pages[i] == p)
+            return i;
+    return 0;
 }
 
 static const struct rect panel_r = { 6, 25, DLG_W - 12, 382 };
@@ -407,7 +384,10 @@ static const struct rect panel_r = { 6, 25, DLG_W - 12, 382 };
 static struct rect ctl_rect(enum ctl k)
 {
     switch (k) {
-    case K_TABS: return mkrect(6, 4, 128, 22);
+    case K_TABS: return mkrect(6, 4, 208, 22);
+    case K_WALL: return mkrect(18, 190, 268, WALL_ROWS * ITEM_H + 4);
+    case K_BROWSE: return mkrect(298, 190, 90, 23);
+    case K_WALLMODE: return mkrect(78, 302, 150, 21);
     case K_DRIVER: return mkrect(24, 206, 360, 36);
     case K_COLORS: return mkrect(24, 284, 162, 21);
     case K_AREA: return mkrect(250, 272, 96, 26);
@@ -427,6 +407,8 @@ static int on_page(struct dprops *d, enum ctl k)
         return d->page == PAGE_SETTINGS;
     case K_MONITOR:
         return d->page == PAGE_MONITOR;
+    case K_WALL: case K_BROWSE: case K_WALLMODE:
+        return d->page == PAGE_BACKGROUND;
     default:
         return 1;
     }
@@ -473,6 +455,11 @@ static int combo_items(struct dprops *d, enum ctl k, char rows[][48], int *chose
             snprintf(rows[i], 48, "%s", d->mons[i].name);
         *chosen = d->monitor;
         return d->nmons;
+    case K_WALLMODE:
+        for (int i = 0; i < WALL_MODES; i++)
+            snprintf(rows[i], 48, "%s", wall_mode_names[i]);
+        *chosen = d->wall_mode;
+        return WALL_MODES;
     default:
         return 0;
     }
@@ -500,10 +487,140 @@ static void choose_item(struct dprops *d, enum ctl k, int i)
         if (i >= 0 && i < d->nmons)
             d->monitor = i;
         break;
+    case K_WALLMODE:
+        if (i >= 0 && i < WALL_MODES)
+            d->wall_mode = i;
+        return;
     default:
         return;
     }
     update_lists(d);
+}
+
+/* ---- the wallpaper list ---- */
+
+static int has_suffix(const char *name, const char *suffix)
+{
+    size_t n = strlen(name), k = strlen(suffix);
+    return n > k && !strcasecmp(name + n - k, suffix);
+}
+
+static int is_picture_name(const char *name)
+{
+    return has_suffix(name, ".jpg") || has_suffix(name, ".jpeg") || has_suffix(name, ".jpe") ||
+           has_suffix(name, ".jfif") || has_suffix(name, ".png");
+}
+
+/* "mountain-dawn.jpg" is listed as "Mountain dawn". */
+static void wall_title(const char *path, char *out, size_t size)
+{
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    snprintf(out, size, "%s", base);
+    char *dot = strrchr(out, '.');
+    if (dot && dot != out)
+        *dot = 0;
+    for (char *c = out; *c; c++)
+        if (*c == '-' || *c == '_')
+            *c = ' ';
+    if (out[0] >= 'a' && out[0] <= 'z')
+        out[0] = (char)(out[0] - 'a' + 'A');
+}
+
+static int wall_find(struct dprops *d, const char *path)
+{
+    for (int i = 0; i < d->nwalls; i++)
+        if (!strcmp(d->walls[i].path, path))
+            return i;
+    return -1;
+}
+
+static int wall_add(struct dprops *d, const char *path)
+{
+    int i = wall_find(d, path);
+    if (i >= 0)
+        return i;
+    if (d->nwalls == MAX_WALLS || strlen(path) >= sizeof(d->walls[0].path))
+        return -1;
+    struct wall_entry *e = &d->walls[d->nwalls];
+    memset(e, 0, sizeof(*e));
+    snprintf(e->path, sizeof(e->path), "%s", path);
+    wall_title(path, e->name, sizeof(e->name));
+    return d->nwalls++;
+}
+
+/* Add the pictures in dir, by name. */
+static void wall_scan(struct dprops *d, const char *dir)
+{
+    static char names[MAX_WALLS][NAME_MAX + 1];
+    int n = 0;
+    DIR *dh = opendir(dir);
+    if (!dh)
+        return;
+    struct dirent *de;
+    while ((de = readdir(dh)) && n < MAX_WALLS) {
+        if (de->d_type == DT_DIR || !is_picture_name(de->d_name))
+            continue;
+        int k = n++;
+        while (k > 0 && strcasecmp(names[k - 1], de->d_name) > 0) {
+            memcpy(names[k], names[k - 1], sizeof(names[k]));
+            k--;
+        }
+        snprintf(names[k], sizeof(names[k]), "%s", de->d_name);
+    }
+    closedir(dh);
+    for (int i = 0; i < n; i++) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+        wall_add(d, path);
+    }
+}
+
+static void wall_make_visible(struct dprops *d)
+{
+    if (d->wall_sel < d->wall_top)
+        d->wall_top = d->wall_sel;
+    if (d->wall_sel >= d->wall_top + WALL_ROWS)
+        d->wall_top = d->wall_sel - WALL_ROWS + 1;
+    int max = d->nwalls > WALL_ROWS ? d->nwalls - WALL_ROWS : 0;
+    d->wall_top = d->wall_top < 0 ? 0 : d->wall_top > max ? max : d->wall_top;
+}
+
+/* The choice of entry i, with the thumbnail the preview will show. */
+static void wall_select(struct dprops *d, int i)
+{
+    if (i < 0 || i >= d->nwalls)
+        return;
+    d->wall_sel = i;
+    struct wall_entry *e = &d->walls[i];
+    if (!e->tried && e->path[0]) {
+        e->thumb = image_load_thumb(e->path, &e->full_w, &e->full_h);
+        e->tried = 1;
+    }
+    wall_make_visible(d);
+}
+
+static void wall_init(struct dprops *d)
+{
+    memset(d->walls, 0, sizeof(d->walls));
+    snprintf(d->walls[0].name, sizeof(d->walls[0].name), "(None)");
+    d->nwalls = 1;
+    wall_scan(d, WALLPAPER_DIR);
+    const char *home = getenv("HOME");
+    if (home && home[0])
+        wall_scan(d, home);
+    const char *cur = wallpaper_path();
+    int i = cur[0] ? wall_add(d, cur) : 0;      /* a wallpaper from elsewhere is listed too */
+    d->wall_mode = wallpaper_mode();
+    wall_select(d, i < 0 ? 0 : i);
+}
+
+static struct sbar wall_bar(struct dprops *d)
+{
+    struct rect l = ctl_rect(K_WALL);
+    struct sbar b = { mkrect(l.x + l.w - 2 - SBAR_W, l.y + 2, SBAR_W, l.h - 4), 1, d->wall_top,
+                      WALL_ROWS, d->nwalls };
+    return b;
 }
 
 /* ---- drawing ---- */
@@ -588,30 +705,51 @@ static void draw_slider(struct dprops *d, struct surface *s, int enabled, int fo
         gfx_focus_rect(s, mkrect(r.x - 4, r.y - 2, r.w + 8, r.h + 2));
 }
 
-/* A monitor with a miniature of the desktop at the chosen size on its screen. */
-static void draw_preview(struct dprops *d, struct surface *s)
+/*
+ * A monitor with a miniature of the desktop on its screen, shaped like the
+ * screen. On the Settings page it shows the size being chosen, with a
+ * window; on the Background page the wallpaper as it will fill the screen.
+ */
+static void draw_preview(struct dprops *d, struct surface *s, int background)
 {
+    int pw = background ? screen_w : d->w, ph = background ? screen_h : d->h;
     int bx = (DLG_W - 160) / 2, by = 36;
     struct rect bezel = mkrect(bx, by, 160, 124);
     gfx_fill(s, bezel.x, bezel.y, bezel.w, bezel.h, C_FACE);
     gfx_bevel(s, bezel, BEVEL_RAISED);
-    struct rect scr = mkrect(bx + 12, by + 10, 136, 102);
-    gfx_fill(s, scr.x - 1, scr.y - 1, scr.w + 2, scr.h + 2, C_BLACK);
-    gfx_fill(s, scr.x, scr.y, scr.w, scr.h, C_DESKTOP);
-    /* the taskbar and a window, sized as they would be at w x h */
-    int tbh = TASKBAR_H * scr.h / d->h;
+    struct rect glass = mkrect(bx + 12, by + 10, 136, 102);
+    gfx_fill(s, glass.x - 1, glass.y - 1, glass.w + 2, glass.h + 2, C_BLACK);
+
+    /* the screen, as large as fits the glass without changing its shape */
+    int sw = glass.w, sh = glass.w * ph / pw;
+    if (sh > glass.h) {
+        sh = glass.h;
+        sw = glass.h * pw / ph;
+    }
+    struct rect scr = mkrect(glass.x + (glass.w - sw) / 2, glass.y + (glass.h - sh) / 2,
+                             sw < 1 ? 1 : sw, sh < 1 ? 1 : sh);
+    if (background) {
+        struct wall_entry *e = &d->walls[d->wall_sel];
+        wallpaper_render(s, scr, e->thumb, e->full_w, e->full_h, d->wall_mode, C_DESKTOP, pw, ph);
+    } else {
+        gfx_fill(s, scr.x, scr.y, scr.w, scr.h, C_DESKTOP);
+    }
+    /* the taskbar and a few icons, sized as they would be */
+    int tbh = TASKBAR_H * scr.h / ph;
     if (tbh < 2)
         tbh = 2;
     gfx_fill(s, scr.x, scr.y + scr.h - tbh, scr.w, tbh, C_FACE);
     gfx_hline(s, scr.x, scr.y + scr.h - tbh, scr.w, C_WHITE);
-    int ww = 400 * scr.w / d->w, wh = 300 * scr.h / d->h;
-    int wx = scr.x + 60 * scr.w / d->w + 6, wy = scr.y + 40 * scr.h / d->h + 4;
-    gfx_fill(s, wx, wy, ww, wh, C_FACE);
-    gfx_frame(s, wx, wy, ww, wh, C_BLACK);
-    gfx_fill(s, wx + 1, wy + 1, ww - 2, TITLE_H * scr.h / d->h + 1, C_NAVY);
-    for (int i = 0; i < 3; i++) {       /* a column of tiny desktop icons */
-        int ix = scr.x + 8 * scr.w / d->w + 2, iy = scr.y + (6 + i * 70) * scr.h / d->h + 2;
-        int sz = 32 * scr.w / d->w + 1;
+    if (!background) {
+        int ww = 400 * scr.w / pw, wh = 300 * scr.h / ph;
+        int wx = scr.x + 60 * scr.w / pw + 6, wy = scr.y + 40 * scr.h / ph + 4;
+        gfx_fill(s, wx, wy, ww, wh, C_FACE);
+        gfx_frame(s, wx, wy, ww, wh, C_BLACK);
+        gfx_fill(s, wx + 1, wy + 1, ww - 2, TITLE_H * scr.h / ph + 1, C_NAVY);
+    }
+    for (int i = 0; i < 3; i++) {
+        int ix = scr.x + 8 * scr.w / pw + 2, iy = scr.y + (6 + i * 70) * scr.h / ph + 2;
+        int sz = 32 * scr.w / pw + 1;
         gfx_fill(s, ix, iy, sz, sz, RGB(0xC0, 0xC0, 0xFF));
     }
     /* the power light and the stand */
@@ -622,7 +760,6 @@ static void draw_preview(struct dprops *d, struct surface *s)
 
 static void draw_tabs(struct dprops *d, struct surface *s)
 {
-    static const char *const names[] = { "Settings", "Monitor" };
     struct rect p = panel_r;
     gfx_hline(s, p.x, p.y, p.w - 1, C_WHITE);
     gfx_vline(s, p.x, p.y, p.h - 1, C_WHITE);
@@ -630,9 +767,9 @@ static void draw_tabs(struct dprops *d, struct surface *s)
     gfx_vline(s, p.x + p.w - 1, p.y, p.h, C_BLACK);
     gfx_hline(s, p.x + 1, p.y + p.h - 2, p.w - 2, C_SHADOW);
     gfx_vline(s, p.x + p.w - 2, p.y + 1, p.h - 2, C_SHADOW);
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < PAGE_COUNT; i++) {
         struct rect t = tab_rect(i);
-        int sel = (int)d->page == i;
+        int sel = d->page == tab_pages[i];
         if (sel)
             t = mkrect(t.x - 2, t.y - 2, t.w + 4, t.h + 3);    /* joins the panel */
         else
@@ -644,9 +781,9 @@ static void draw_tabs(struct dprops *d, struct surface *s)
         gfx_vline(s, t.x + t.w - 1, t.y + 2, t.h - 2, C_BLACK);
         gfx_pixel(s, t.x + t.w - 2, t.y + 1, C_BLACK);
         gfx_vline(s, t.x + t.w - 2, t.y + 2, t.h - 2, C_SHADOW);
-        int tw = gfx_text_width(&font_sans, names[i]);
+        int tw = gfx_text_width(&font_sans, tab_names[i]);
         int tx = t.x + (t.w - tw) / 2, ty = t.y + (sel ? 4 : 3);
-        gfx_text(s, &font_sans, tx, ty, names[i], C_BLACK);
+        gfx_text(s, &font_sans, tx, ty, tab_names[i], C_BLACK);
         if (sel && d->focus == K_TABS)
             gfx_focus_rect(s, mkrect(tx - 3, ty - 1, tw + 6, font_sans.height + 2));
     }
@@ -661,7 +798,7 @@ static void draw_line(struct surface *s, int y, const char *label, const char *v
 static void settings_page(struct dprops *d, struct surface *s)
 {
     char buf[96];
-    draw_preview(d, s);
+    draw_preview(d, s, 0);
 
     gfx_text(s, &font_sans, 18, 172, "Display adapter:", C_BLACK);
     if (d->di.vram_kb)
@@ -716,6 +853,66 @@ static void settings_page(struct dprops *d, struct surface *s)
         note = "The BIOS mode stays until you restart. Install fluxOS on a hard disk to choose "
                "the startup mode.";
     gfx_text_wrap(s, &font_sans, 18, 368, 368, note, C_BLACK);
+}
+
+static void draw_wall_list(struct dprops *d, struct surface *s)
+{
+    struct rect r = ctl_rect(K_WALL);
+    gfx_fill(s, r.x, r.y, r.w, r.h, C_WHITE);
+    gfx_bevel(s, r, BEVEL_SUNKEN);
+    int bar = d->nwalls > WALL_ROWS;
+    int w = r.w - 4 - (bar ? SBAR_W : 0);
+    for (int i = 0; i < WALL_ROWS && d->wall_top + i < d->nwalls; i++) {
+        int idx = d->wall_top + i;
+        struct rect row = mkrect(r.x + 2, r.y + 2 + i * ITEM_H, w, ITEM_H);
+        int sel = idx == d->wall_sel;
+        char fit[48];
+        gfx_ellipsize(&font_sans, d->walls[idx].name, row.w - 8, fit, sizeof(fit));
+        if (sel)
+            gfx_fill(s, row.x, row.y, row.w, row.h, C_NAVY);
+        gfx_text(s, &font_sans, row.x + 4, row.y + (ITEM_H - font_sans.height) / 2, fit,
+                 sel ? C_WHITE : C_BLACK);
+        if (sel && d->focus == K_WALL)
+            gfx_focus_rect(s, row);
+    }
+    if (bar) {
+        struct sbar b = wall_bar(d);
+        sbar_draw(s, &b, SBAR_NONE);
+    }
+}
+
+static void background_page(struct dprops *d, struct surface *s)
+{
+    char rows[8][48];
+    int chosen;
+    draw_preview(d, s, 1);
+
+    gfx_text(s, &font_sans, 18, 174, "Wallpaper:", C_BLACK);
+    draw_wall_list(d, s);
+    draw_button(s, ctl_rect(K_BROWSE), "Browse...", d->pressed == K_BROWSE && d->pressed_in,
+                d->focus == K_BROWSE, d->focus == K_BROWSE);
+
+    gfx_text(s, &font_sans, 18, 306, "Display:", C_BLACK);
+    combo_items(d, K_WALLMODE, rows, &chosen);
+    draw_combo(s, ctl_rect(K_WALLMODE), rows[chosen], 1, d->focus == K_WALLMODE, d->open == K_WALLMODE);
+
+    static const char *const how[WALL_MODES] = {
+        "Fill: scaled to cover the screen, the overflow cut off.",
+        "Stretch: scaled to the exact size of the screen.",
+        "Center: at its own size in the middle of the screen.",
+        "Tile: at its own size, repeated across the screen.",
+    };
+    gfx_text(s, &font_sans, 18, 334, how[d->wall_mode], C_BLACK);
+    struct wall_entry *e = &d->walls[d->wall_sel];
+    if (d->wall_sel > 0 && !e->thumb)
+        gfx_text(s, &font_sans_bold, 18, 350, "fluxOS cannot show this picture.", RGB(0x80, 0x00, 0x00));
+    gfx_text_wrap(s, &font_sans, 18, 368, 368,
+                  d->bootdir[0] ? "JPEG and PNG pictures in /usr/share/wallpapers and your home folder "
+                                  "are listed; Browse opens any other. Kept for the next start."
+                                : "JPEG and PNG pictures in /usr/share/wallpapers and your home folder "
+                                  "are listed; Browse opens any other. Lasts until you restart: "
+                                  "fluxOS is running from its CD.",
+                  C_BLACK);
 }
 
 static void monitor_page(struct dprops *d, struct surface *s)
@@ -774,13 +971,15 @@ static void dp_paint(struct dprops *d)
     gfx_noclip(s);
     gfx_fill(s, 0, 0, s->w, s->h, C_FACE);
     draw_tabs(d, s);
-    if (d->page == PAGE_SETTINGS)
+    if (d->page == PAGE_BACKGROUND)
+        background_page(d, s);
+    else if (d->page == PAGE_SETTINGS)
         settings_page(d, s);
     else
         monitor_page(d, s);
 
     static const char *const labels[] = { "OK", "Cancel", "Apply" };
-    int focus_is_button = d->focus >= K_OK;
+    int focus_is_button = IS_PUSH(d->focus);
     for (int k = K_OK; k <= K_APPLY; k++) {
         int is_default = focus_is_button ? d->focus == k : k == K_OK;
         draw_button(s, ctl_rect(k), labels[k - K_OK], d->pressed == k && d->pressed_in, is_default,
@@ -1034,17 +1233,54 @@ static void dp_close(struct dprops *d)
     wm_destroy(d->win);
 }
 
+/* Put the chosen wallpaper on the desktop; returns 0 if the dialog may close. */
+static int apply_background(struct dprops *d)
+{
+    const char *path = d->walls[d->wall_sel].path;
+    if (!strcmp(path, wallpaper_path()) && d->wall_mode == wallpaper_mode())
+        return 0;
+    if (wallpaper_set(path, d->wall_mode, 1) < 0) {
+        message_box("Display Properties", ICON_WARNING, "fluxOS cannot show that picture.");
+        return -1;
+    }
+    return 0;
+}
+
+/* Browse...: the path of a picture was typed in. */
+static void wall_browsed(void *ctx, const char *text)
+{
+    struct dprops *d = ctx;
+    if (dlg != d)                       /* the dialog was closed meanwhile */
+        return;
+    int i = wall_add(d, text);
+    if (i < 0) {
+        message_box("Display Properties", ICON_WARNING, "The list of wallpapers is full.");
+        return;
+    }
+    wall_select(d, i);
+    if (!d->walls[i].thumb)
+        message_box("Display Properties", ICON_WARNING, "That is not a JPEG or PNG picture fluxOS can show.");
+    dp_paint(d);
+}
+
 static void activate(struct dprops *d, enum ctl k)
 {
     if (k == K_OK) {
-        if (apply(d) == 0)
+        if (apply_background(d) == 0 && apply(d) == 0)
             dp_close(d);
     } else if (k == K_CANCEL) {
         dp_close(d);
     } else if (k == K_APPLY) {
+        apply_background(d);
         apply(d);
         if (dlg)
             dp_paint(dlg);
+    } else if (k == K_BROWSE) {
+        const char *home = getenv("HOME");
+        char initial[128];
+        snprintf(initial, sizeof(initial), "%s", d->walls[d->wall_sel].path[0] ? d->walls[d->wall_sel].path
+                                                : home ? home : "/");
+        ask_text("Browse", "Picture file (JPEG or PNG):", initial, wall_browsed, d);
     }
 }
 
@@ -1068,14 +1304,26 @@ static void set_page(struct dprops *d, enum page p)
         d->focus = K_TABS;
 }
 
+/* The next tab, wrapping round. */
+static void cycle_page(struct dprops *d, int dir)
+{
+    set_page(d, tab_pages[(tab_index(d->page) + dir + PAGE_COUNT) % PAGE_COUNT]);
+}
+
 /* Arrow keys on the focused control. */
 static void step(struct dprops *d, int dir)
 {
     char rows[8][48];
     int chosen, n;
     switch (d->focus) {
-    case K_TABS:
-        set_page(d, d->page == PAGE_SETTINGS ? PAGE_MONITOR : PAGE_SETTINGS);
+    case K_TABS: {
+        int i = tab_index(d->page) + dir;
+        if (i >= 0 && i < PAGE_COUNT)
+            set_page(d, tab_pages[i]);
+        break;
+    }
+    case K_WALL:
+        wall_select(d, d->wall_sel + dir);
         break;
     case K_DRIVER:
         d->driver = dir > 0 ? DRV_NATIVE : DRV_STANDARD;
@@ -1091,6 +1339,7 @@ static void step(struct dprops *d, int dir)
     case K_COLORS:
     case K_REFRESH:
     case K_MONITOR:
+    case K_WALLMODE:
         n = combo_items(d, d->focus, rows, &chosen);
         if (chosen + dir >= 0 && chosen + dir < n)
             choose_item(d, d->focus, chosen + dir);
@@ -1121,21 +1370,26 @@ static void dp_key(struct window *w, const struct input_event *ev)
         return;
     }
     if (code == KEY_TAB && (ev->mods & KMOD_CTRL)) {
-        set_page(d, d->page == PAGE_SETTINGS ? PAGE_MONITOR : PAGE_SETTINGS);
+        cycle_page(d, (ev->mods & KMOD_SHIFT) ? -1 : 1);
     } else if (code == KEY_TAB) {
         move_focus(d, (ev->mods & KMOD_SHIFT) ? -1 : 1);
     } else if (code == KEY_ESC) {
         dp_close(d);
         return;
     } else if (code == KEY_ENTER) {
-        activate(d, d->focus >= K_OK ? d->focus : K_OK);
+        activate(d, IS_PUSH(d->focus) ? d->focus : K_OK);
         return;
-    } else if (code == KEY_SPACE && d->focus >= K_OK) {
+    } else if (code == KEY_SPACE && IS_PUSH(d->focus)) {
         activate(d, d->focus);
         return;
+    } else if (d->focus == K_WALL && (code == KEY_HOME || code == KEY_END || code == KEY_PGUP ||
+                                      code == KEY_PGDN)) {
+        int to = code == KEY_HOME ? 0 : code == KEY_END ? d->nwalls - 1
+                 : d->wall_sel + (code == KEY_PGUP ? -WALL_ROWS : WALL_ROWS);
+        wall_select(d, to < 0 ? 0 : to >= d->nwalls ? d->nwalls - 1 : to);
     } else if (code == KEY_DOWN && (ev->mods & KMOD_ALT) &&
-               (d->focus == K_COLORS || d->focus == K_REFRESH || d->focus == K_MONITOR) &&
-               ctl_enabled(d, d->focus)) {
+               (d->focus == K_COLORS || d->focus == K_REFRESH || d->focus == K_MONITOR ||
+                d->focus == K_WALLMODE) && ctl_enabled(d, d->focus)) {
         d->open = d->focus;
         d->hover = -1;
     } else if (code == KEY_LEFT || code == KEY_UP) {
@@ -1164,6 +1418,44 @@ static void slider_to(struct dprops *d, int x)
         d->h = d->res[i].h;
         update_lists(d);
     }
+}
+
+/* A press in the wallpaper list: its scroll bar, or a row. */
+static void wall_click(struct dprops *d, int x, int y)
+{
+    int max = d->nwalls > WALL_ROWS ? d->nwalls - WALL_ROWS : 0;
+    if (d->nwalls > WALL_ROWS) {
+        struct sbar b = wall_bar(d);
+        if (rect_contains(b.r, x, y)) {
+            switch (sbar_hit(&b, x, y)) {
+            case SBAR_ARROW1: d->wall_top--; break;
+            case SBAR_ARROW2: d->wall_top++; break;
+            case SBAR_PAGE1: d->wall_top -= WALL_ROWS; break;
+            case SBAR_PAGE2: d->wall_top += WALL_ROWS; break;
+            case SBAR_THUMB:
+                d->sb_drag = 1;
+                d->sb_grab = y - sbar_thumb(&b).y;
+                break;
+            default: break;
+            }
+            d->wall_top = d->wall_top < 0 ? 0 : d->wall_top > max ? max : d->wall_top;
+            return;
+        }
+    }
+    struct rect r = ctl_rect(K_WALL);
+    int row = (y - r.y - 2) / ITEM_H;
+    if (y >= r.y + 2 && row < WALL_ROWS && d->wall_top + row < d->nwalls)
+        wall_select(d, d->wall_top + row);
+}
+
+static void dp_wheel(struct window *w, int steps)
+{
+    struct dprops *d = w->priv;
+    if (d->page != PAGE_BACKGROUND || d->nwalls <= WALL_ROWS || d->open >= 0)
+        return;
+    int max = d->nwalls - WALL_ROWS, top = d->wall_top - steps * 3;
+    d->wall_top = top < 0 ? 0 : top > max ? max : top;
+    dp_paint(d);
 }
 
 static void dp_mouse(struct window *w, int x, int y, int buttons, int changed)
@@ -1199,15 +1491,29 @@ static void dp_mouse(struct window *w, int x, int y, int buttons, int changed)
         dp_paint(d);
         return;
     }
+    if (d->sb_drag) {                   /* the wallpaper list's scroll bar */
+        struct sbar b = wall_bar(d);
+        d->wall_top = sbar_drag(&b, y, d->sb_grab);
+        if (release)
+            d->sb_drag = 0;
+        dp_paint(d);
+        return;
+    }
 
     if (press) {
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < PAGE_COUNT; i++) {
             if (rect_contains(tab_rect(i), x, y)) {
-                set_page(d, (enum page)i);
+                set_page(d, tab_pages[i]);
                 d->focus = K_TABS;
                 dp_paint(d);
                 return;
             }
+        }
+        if (d->page == PAGE_BACKGROUND && rect_contains(ctl_rect(K_WALL), x, y)) {
+            d->focus = K_WALL;
+            wall_click(d, x, y);
+            dp_paint(d);
+            return;
         }
         for (int k = K_DRIVER; k < K_COUNT; k++) {
             if (!on_page(d, k) || !ctl_enabled(d, k))
@@ -1218,7 +1524,7 @@ static void dp_mouse(struct window *w, int x, int y, int buttons, int changed)
             if (!rect_contains(r, x, y))
                 continue;
             d->focus = k;
-            if (k >= K_OK) {
+            if (IS_PUSH(k)) {
                 d->pressed = k;
                 d->pressed_in = 1;
             } else if (k == K_DRIVER) {
@@ -1275,12 +1581,15 @@ static void dp_destroy(struct window *w)
     struct dprops *d = w->priv;
     if (dlg == d)
         dlg = NULL;
+    for (int i = 0; i < d->nwalls; i++)
+        image_free(d->walls[i].thumb);
     free(d);
 }
 
 static const struct window_ops dp_ops = {
     .key = dp_key,
     .mouse = dp_mouse,
+    .wheel = dp_wheel,
     .focus = dp_focus,
     .close = dp_window_close,
     .destroy = dp_destroy,
@@ -1336,6 +1645,7 @@ void display_open(void)
     d->hover = -1;
     find_boot_dir(d->bootdir, sizeof(d->bootdir));
     read_grubenv(d->bootdir, d->saved_gfx, d->saved_video);
+    wall_init(d);
     dp_reload(d);
     d->win = wm_create("Display Properties", ICON_DISPLAY, DLG_W, DLG_H, 0, &dp_ops, d);
     if (!d->win) {

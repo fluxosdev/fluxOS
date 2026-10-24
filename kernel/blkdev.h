@@ -11,6 +11,12 @@
 struct fs;
 struct vnode;
 
+/* What a drive's media() hook says about its removable medium. */
+#define MEDIA_NONE    0         /* the drive is empty */
+#define MEDIA_PRESENT 1         /* the same medium as at the last look */
+#define MEDIA_CHANGED 2         /* there is one, and it is not the one seen last */
+#define MEDIA_BUSY    3         /* cannot tell now (spinning up...): ask again later */
+
 struct blockdev {
     char name[16];
     char model[44];
@@ -26,7 +32,14 @@ struct blockdev {
     int (*write)(struct blockdev *bd, uint32_t lba, uint32_t count, const void *buf);
     int (*refresh)(struct blockdev *bd);    /* re-read capacity (removable media) */
     int (*flush)(struct blockdev *bd);      /* flush the drive's write cache */
+    /* Removable drives: is there a medium, and is it a new one? Cheap; VFS lock held. */
+    int (*media)(struct blockdev *bd);
     int unflushed;              /* written since the last flush */
+    /* the automounter's notes (automount.c) */
+    int am_present;             /* a medium was in at the last look */
+    int am_tried;               /* it has been offered to the mounter already */
+    int am_stuck;               /* it is gone but still in use: say so only once */
+    int manual_umount;          /* unmounted by hand: leave this medium alone */
     void *priv;
     struct fs *fs;              /* filesystem mounted on this device */
 };
@@ -62,5 +75,6 @@ int blk_rescan(struct blockdev *disk);
 void ata_init(void);
 void floppy_init(void);
 void floppy_start(void);                /* after the scheduler: needs a thread */
+void automount_start(void);             /* the thread that mounts media as they are inserted */
 
 #endif

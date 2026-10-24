@@ -70,6 +70,16 @@ struct image {
 
 struct image *image_load_png(const char *path);     /* NULL if unreadable */
 struct image *image_decode_png(const uint8_t *data, uint32_t len);
+struct image *image_decode_jpeg(const uint8_t *data, uint32_t len);
+/* An eighth of the size, quickly; *full_w and *full_h get the real size. */
+struct image *image_decode_jpeg_thumb(const uint8_t *data, uint32_t len, int *full_w, int *full_h);
+/* Either kind, told apart by the first bytes of the file. */
+struct image *image_decode(const uint8_t *data, uint32_t len);
+struct image *image_load(const char *path);
+struct image *image_load_thumb(const char *path, int *full_w, int *full_h);
+int image_is_png(const uint8_t *data, uint32_t len);
+int image_is_jpeg(const uint8_t *data, uint32_t len);
+uint8_t *file_read_all(const char *path, uint32_t *len);     /* malloc'd, or NULL */
 void image_free(struct image *img);
 void gfx_image(struct surface *s, int x, int y, const struct image *img);
 /* Blend `tint` over the image's opaque half, like a selected Win95 icon. */

@@ -17,9 +17,10 @@
  * sector if it has one (so 1.68M DMF disks work too).
  *
  * A disk that is changed while mounted is not trusted: its cached
- * sectors are dropped and I/O fails until it is unmounted. The kfloppyd
- * thread turns the motor off after 3 seconds without access, and at
- * boot creates /mnt/fdN and mounts a disk that is already in a drive.
+ * sectors are dropped and I/O fails until it is unmounted (the automounter,
+ * automount.c, does that, and mounts the next disk). The kfloppyd thread
+ * turns the motor off after 3 seconds without access, and at boot creates
+ * /mnt/fdN and mounts a disk that is already in a drive.
  */
 #include "kernel.h"
 #include "arch.h"
@@ -103,6 +104,7 @@ struct fd_drive {
     uint32_t spt, heads, tracks;        /* its geometry */
     int cyl;                            /* where the head is, -1 = unknown */
     int stale;                          /* changed while mounted: refuse I/O */
+    int disk_in;                        /* the automounter saw a disk go in (readable or not) */
     int probed;
     uint32_t probe_tick;
     struct blockdev bd;
@@ -116,6 +118,7 @@ static uint8_t selected;
 static int cur_rate = -1;
 static uint32_t last_use;
 static volatile int fired;
+static int nopoll;                      /* floppy.nopoll: never look for new disks */
 
 /* One side of a track, in memory the DMA controller can reach: below
  * 16 MiB (the kernel is loaded at 1 MiB) and inside one 64 KiB page. */
@@ -541,6 +544,66 @@ static int fd_refresh(struct blockdev *bd)
     return 0;
 }
 
+/*
+ * The automounter's look at a drive. While a disk is believed to be in, only
+ * the disk change line is read, with the drive selected for an instant: it
+ * stays clear until the disk is taken out. An empty drive's line stays set
+ * whether or not a disk is then put in, until a step pulse clears it, so
+ * for an empty drive the head is stepped out and back to see if it does.
+ * (That is how Linux notices floppies too, and it is why "floppy.nopoll" on
+ * the kernel command line turns the polling off: on a real drive each look
+ * at an empty one makes the head click.) A disk that has appeared is
+ * probed by fd_refresh when the caller mounts it.
+ */
+static int fd_media(struct blockdev *bd)
+{
+    struct fd_drive *d = bd->priv;
+    if (!in_process() || nopoll)
+        return MEDIA_BUSY;
+    int believed = d->disk_in || bd->nsectors != 0 || bd->fs != NULL;
+    if (believed && d->stale)
+        return MEDIA_CHANGED;           /* check_disk saw it first */
+
+    uint8_t bit = (uint8_t)(0x10 << d->unit);
+    int had_motor = (motors & bit) != 0;
+    if (need_reset && fdc_reset() < 0)
+        return MEDIA_BUSY;
+    selected = (uint8_t)d->unit;
+    motors |= bit;
+    write_dor();
+    for (int i = 0; i < 1000; i++)
+        io_wait();                      /* about a millisecond for the drive's outputs to settle */
+    int line = (inb(FDC_DIR) & DIR_CHANGE) != 0;
+    if (!believed && line) {
+        /* Empty, or a disk nobody has stepped yet: step out and back. */
+        if (seek(d, 1) < 0 || recalibrate(d) < 0)
+            d->cyl = -1;
+        line = (inb(FDC_DIR) & DIR_CHANGE) != 0;
+    }
+    if (!had_motor) {
+        motors &= (uint8_t)~bit;
+        write_dor();
+    }
+
+    if (believed && !line)
+        return MEDIA_PRESENT;
+    if (!believed && line) {
+        d->disk_in = 0;
+        return MEDIA_NONE;
+    }
+    /* A disk was taken out or swapped, or one has been put in. */
+    d->probed = 0;                      /* the next fd_refresh looks at once */
+    if (cache_drive == d)
+        cache_drive = NULL;
+    d->disk_in = !line;
+    if (line) {                         /* taken out (the mounted one is dropped by the caller) */
+        if (!bd->fs)
+            bd->nsectors = 0;
+        return MEDIA_NONE;
+    }
+    return MEDIA_CHANGED;
+}
+
 static uint8_t cmos_read(uint8_t reg)
 {
     outb(0x70, reg);
@@ -554,6 +617,7 @@ void floppy_init(void)
         klog("floppy: no DMA buffer below 16 MiB\n");
         return;
     }
+    nopoll = cmdline_has("floppy.nopoll");
     uint8_t types = cmos_read(0x10);
     if (!types || inb(FDC_MSR) == 0xFF)
         return;                         /* no drives, or no controller */
@@ -574,6 +638,7 @@ void floppy_init(void)
         bd->read = fd_read;
         bd->write = fd_write;
         bd->refresh = fd_refresh;
+        bd->media = fd_media;
         bd->priv = d;
         blk_register(bd);
         boot_ok("%s: %s floppy drive", bd->name, type_names[type]);

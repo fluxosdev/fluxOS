@@ -1032,9 +1032,7 @@ static void wget_error(struct fetch *f, char *out, int size)
 
 static void image_done(struct browser *b, const char *url, const char *data, int len)
 {
-    struct image *img = NULL;
-    if (len > 8 && !memcmp(data, "\x89PNG\r\n\x1a\n", 8))
-        img = image_decode_png((const uint8_t *)data, (uint32_t)len);
+    struct image *img = len > 8 ? image_decode((const uint8_t *)data, (uint32_t)len) : NULL;
     cache_add(b, url, img);
     if (!img)
         return;
@@ -1065,8 +1063,11 @@ static void fetch_complete(struct browser *b)
         int html = (ul > 5 && !strncasecmp(u + ul - 5, ".html", 5)) ||
                    (ul > 4 && !strncasecmp(u + ul - 4, ".htm", 4)) || f->slot == -1;
         int png = ul > 4 && !strncasecmp(u + ul - 4, ".png", 4);
+        int jpg = (ul > 4 && !strncasecmp(u + ul - 4, ".jpg", 4)) ||
+                  (ul > 5 && !strncasecmp(u + ul - 5, ".jpeg", 5));
         int css = ul > 4 && !strncasecmp(u + ul - 4, ".css", 4);
-        snprintf(r.type, sizeof(r.type), "%s", html ? "text/html" : png ? "image/png" : css ? "text/css" : "text/plain");
+        snprintf(r.type, sizeof(r.type), "%s", html ? "text/html" : png ? "image/png" : jpg ? "image/jpeg" :
+             css ? "text/css" : "text/plain");
     } else if (is_file) {
         snprintf(why, sizeof(why), "%s", b->status);
     }
@@ -1112,7 +1113,7 @@ static void fetch_complete(struct browser *b)
             image_done(b, done.url, r.body, r.len);
             escape(done.url, eurl, sizeof(eurl));
             int n = snprintf(html, sizeof(html),
-                             "<html><head><title>%s</title></head><body style=\"margin:8px\"><img src=\"%s\" alt=\"(%s: not a PNG image)\"></body></html>",
+                             "<html><head><title>%s</title></head><body style=\"margin:8px\"><img src=\"%s\" alt=\"(%s: not a PNG or JPEG image)\"></body></html>",
                              eurl, eurl, r.type);
             load_document(b, html, n, done.url, "utf-8");
         } else if (r.type[0] && strncmp(r.type, "text/", 5) && !strstr(r.type, "html") &&

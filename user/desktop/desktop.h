@@ -163,6 +163,7 @@ void terminal_child_exited(int pid);
 void terminal_blink(void);
 
 struct window *files_open(const char *path);
+void files_tick(void);                  /* once a second: follow mounts coming and going */
 struct window *calculator_open(void);
 struct window *editor_open(const char *path);      /* path NULL: an empty document */
 void editor_blink(void);
@@ -172,6 +173,30 @@ void browser_blink(void);
 void browser_tick(void);
 void setup_open(void);
 void display_open(void);                /* Display Properties */
+
+/* GRUB's environment block on the boot partition (grubenv.c): for settings
+ * that have to outlive the RAM filesystem. dir is the partition's mount point. */
+int grubenv_boot_dir(char *out, size_t size);                   /* 1 if started from a disk */
+int grubenv_get(const char *dir, const char *key, char *out, size_t size);
+int grubenv_update(const char *dir, const char *const *keys, const char *const *vals, int count);
+
+/* The wallpaper (wallpaper.c) */
+enum { WALL_FILL, WALL_STRETCH, WALL_CENTER, WALL_TILE, WALL_MODES };
+extern const char *const wall_mode_names[WALL_MODES];
+#define WALLPAPER_DIR     "/usr/share/wallpapers"
+#define WALLPAPER_DEFAULT WALLPAPER_DIR "/mountains.jpg"
+void wallpaper_init(void);              /* the saved wallpaper, or the default */
+/* "" shows none; save keeps it for the next start. -1 if the file cannot be shown. */
+int wallpaper_set(const char *path, int mode, int save);
+const char *wallpaper_path(void);       /* "" when there is none */
+int wallpaper_mode(void);
+int wallpaper_active(void);
+void wallpaper_resize(void);            /* the screen changed size */
+void wallpaper_draw(struct surface *s, struct rect clip);
+/* Draw img over bg into area a of dst; (lw, lh) is the screen a stands for,
+ * and (iw, ih) the real size of img if it is a thumbnail. */
+void wallpaper_render(struct surface *dst, struct rect a, const struct image *img, int iw, int ih,
+                      int mode, color_t bg, int lw, int lh);
 void sound_init(void);                  /* see what cards there are; startup sound */
 void sound_tick(void);                  /* once a second */
 void sound_beep(void);                  /* the terminal bell */
