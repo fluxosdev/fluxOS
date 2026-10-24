@@ -15,6 +15,7 @@ int msleep(unsigned int ms);
 int getmounts(char *buf, unsigned int size);
 int blkinfo(int index, struct blkinfo *bi);
 int blkrescan(const char *disk);         /* re-read the partition table */
+int usbinfo(int index, struct usbinfo *ui); /* the index-th USB device plugged in */
 
 /* Pseudo-terminal: fds[0] is the master, fds[1] the slave (a terminal). */
 int openpty(int fds[2]);

@@ -232,6 +232,22 @@ struct blkinfo {
     uint32_t start;             /* partitions: first sector on the disk */
 };
 
+/* ---- usbinfo(2): the USB devices plugged in ---- */
+
+struct usbinfo {
+    uint16_t vendor, product;
+    uint8_t  cls, subclass, protocol;   /* the device's class, or its first interface's */
+    uint8_t  speed;                     /* 0 low, 1 full, 2 high, 3 super */
+    uint8_t  bus;                       /* which host controller, from 0 */
+    uint8_t  addr;                      /* USB address */
+    uint8_t  port;                      /* port on its hub */
+    uint8_t  depth;                     /* hubs between it and the controller */
+    char     hc[8];                     /* "UHCI", "OHCI", "EHCI", "xHCI" */
+    char     manufacturer[32];
+    char     name[48];
+    char     driver[24];                /* the drivers that took it: "hid", "storage", "hub" */
+};
+
 /* ---- reboot(2) ---- */
 #define REBOOT_RESTART  1
 #define REBOOT_POWEROFF 2
@@ -350,6 +366,7 @@ struct mixer_level {
 #define SOUNDF_OPL2    0x2      /* an FM synthesizer (/dev/opl) ... */
 #define SOUNDF_OPL3    0x4      /* ... that is an OPL3 */
 #define SOUNDF_SPEAKER 0x8      /* the PC speaker (always) */
+#define SOUNDF_HDA     0x10     /* /dev/dsp is an HD Audio codec, not a Sound Blaster */
 
 struct sound_info {
     char     card[32];          /* "Sound Blaster 16" */

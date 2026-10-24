@@ -20,7 +20,9 @@
 fluxOS is a small 32-bit x86 Unix-like operating system with preemptive
 multitasking, ring-3 user processes, paging, a root filesystem in RAM (from
 the CD) or on the installed hard disk, IDE
-disk, CD-ROM and floppy drivers with FAT12/16/32 and ISO9660 support, an
+and SATA (AHCI) disk and CD-ROM drivers, a floppy driver, USB (UHCI, OHCI,
+EHCI and xHCI controllers, hubs, keyboards, mice and storage), FAT12/16/32
+and ISO9660 support, an
 NE2000 network driver with a TCP/IP stack, a zsh-flavoured shell called
 **fsh**, a Windows 95 style graphical desktop with a web browser, a 3dfx
 Voodoo3 display driver with a small OpenGL library, PC speaker and Sound
@@ -76,6 +78,17 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
     resets the channel and switches that drive to PIO, so no data is lost.
   - IDE kernel options: `ata.nodma` forces PIO, and `ata.poll` polls instead
     of using interrupts, for hardware whose IDE interrupts don't arrive.
+  - A **SATA (AHCI)** driver for hard disks (LBA48) and ATAPI CD/DVD drives
+    on controllers in AHCI mode, as on most PCs since about 2006 and on
+    QEMU's q35 machine (a controller left in IDE mode by the firmware is the
+    IDE driver's). It takes the controller from the BIOS, brings each
+    port's link up (spinning drives up where the controller staggers them,
+    with a COMRESET for a link that will not train), and sends each command
+    as a FIS with a table of buffers the controller moves by DMA, up to
+    64 KiB at a time. The caller sleeps until the port interrupts; a failed
+    command restarts the port. Disks are `/dev/sda`, `/dev/sdb`... and
+    drives `/dev/sr0`..., as on Linux. `ahci.poll` polls instead of using
+    the interrupt.
   - A floppy driver for the PC floppy controller (82077AA and compatibles):
     drives `/dev/fd0` and `/dev/fd1`, found through the CMOS, with ISA DMA
     and IRQ 6. It reads whole tracks into a cache (a floppy turns slowly),
@@ -83,11 +96,40 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
     sector describes) by trying data rates, notices write-protected and
     changed disks, and turns the motor off after 3 seconds of quiet. A disk
     in the drive at boot is mounted on `/mnt/fd0`.
-  - Block devices `/dev/hda`..`/dev/hdd`, with MBR partitions as `/dev/hda1`
-    and so on, behind a write-back sector cache. Metadata writes stay in
+  - Block devices `/dev/hda`..`/dev/hdd` (IDE), `/dev/sdX` (SATA and USB)
+    and `/dev/srN` (SATA and USB CD drives), with MBR partitions as
+    `/dev/hda1`, `/dev/sda1` and so on, behind a write-back sector cache. Metadata writes stay in
     memory and are written out in sorted, merged runs by the `kflushd`
     kernel thread every 5 seconds, by `sync`/`fsync`, on `umount`, and
     before `reboot`/`poweroff`.
+- USB:
+  - Host controller drivers for **UHCI** and **OHCI** (USB 1.1), **EHCI**
+    (USB 2.0) and **xHCI** (USB 3), found through PCI, each taken from the
+    BIOS (its SMI handler and PS/2 emulation switched off) and reset. EHCI
+    gives low and full speed devices on its own ports to its UHCI or OHCI
+    companion, and reaches them behind a high-speed hub with split
+    transactions, as on Intel chipsets whose ports all sit behind a
+    rate-matching hub. Intel's 7 to 9 series chipsets have their shared
+    ports switched to xHCI.
+  - A core that enumerates devices (reset, address, descriptors,
+    configuration) and offers each interface to the drivers. All ports are
+    scanned once at boot, so a USB keyboard works at once and a USB disk
+    can hold the root filesystem; then the `kusbd` thread handles plugging
+    and unplugging, looking at root ports four times a second and at hubs
+    when they report a change. Controllers complete transfers by interrupt,
+    and the timer tick polls them as well.
+  - Hubs (USB 1.1, 2.0 and 3), chained up to five deep.
+  - **Keyboards** in the boot protocol, translated to the same keys as the
+    PS/2 keyboard, with key repeat done by the kernel (USB keyboards don't
+    repeat by themselves). **Mice and tablets** read through their HID
+    report descriptor: buttons, wheel, and relative or absolute positions
+    (QEMU's `usb-tablet` follows the host's pointer).
+  - **Mass storage** (Bulk-Only Transport, SCSI commands): sticks, disks,
+    card readers and CD drives, as `/dev/sdX` and `/dev/srN`. A stick that
+    is pulled out and put back gets its old name.
+  - `lsusb` lists the devices (`usbinfo()`, the `SYS_usbinfo` call).
+    Kernel options: `usb=off` leaves USB alone, and `usb.poll` polls the
+    controllers instead of using their interrupts.
 - Filesystems, mounted into the same VFS tree:
   - **FAT12, FAT16 and FAT32**, read/write: VFAT long file names with `~N`
     short aliases, case-insensitive lookup, directories that grow (except a
@@ -96,10 +138,14 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
     formats floppies as FAT12 in the standard DOS layouts.
   - **ISO9660**, read-only: Rock Ridge names, modes and timestamps, on CDs or
     on 512-byte-sector disks.
-  - Volumes are mounted at boot on `/mnt/cdrom`, `/mnt/hdX` and `/mnt/fd0`,
-    and with `mount`/`umount`, which refuses while files are in use.
+  - Volumes are mounted at boot on `/mnt/cdrom`, `/mnt/hdX`, `/mnt/sdX` and
+    `/mnt/fd0`, and with `mount`/`umount`, which refuses while files are in
+    use.
   - **Automounting:** the `kmediad` thread looks at every CD-ROM and floppy
-    drive every 2 seconds. A disc or disk that is put in is mounted (a CD on
+    drive, and every USB disk, every 2 seconds. A USB stick that is plugged
+    in has its partition table read and each partition mounted on
+    `/mnt/sdXN` (the whole disk on `/mnt/sdX` if it has none); one that is
+    pulled out is unmounted, as a CD would be. A disc or disk that is put in is mounted (a CD on
     `/mnt/cdrom`, or the next free `/mnt/cdromN` if another is there; a
     floppy on `/mnt/fdN`); one that is taken out or swapped is unmounted, at
     once if nothing is using it and otherwise as soon as it is free (a shell
@@ -122,8 +168,9 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   lends to one process at a time (`fbinfo`, `fbmap`); the console takes the
   screen back when that process exits. A PS/2 mouse driver with IntelliMouse
   wheel support, which uses the VMware/QEMU "vmmouse" interface for absolute
-  positioning (and the wheel) when it is there, and `/dev/input`, which
-  delivers keyboard and mouse events to the desktop.
+  positioning (and the wheel) when it is there, USB keyboards, mice and
+  tablets, and `/dev/input`, which delivers keyboard and mouse events to the
+  desktop.
 - Display drivers: the standard driver keeps the mode the VESA BIOS set at
   startup (the default), and reports the adapter's name and memory from the
   BIOS. A driver for the **3dfx Voodoo Banshee, Voodoo3 and Voodoo4/5**
@@ -153,6 +200,21 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   - The OPL2/OPL3 FM synthesizer at 388h (`/dev/opl`, AdLib or the SB16's
     own): register writes in order, with the waits the chip needs; closing
     the device silences every voice.
+  - **Intel HD Audio** controllers (Intel ICH/PCH, nVidia MCP, ATI/AMD,
+    VIA, QEMU's `intel-hda`) and their codecs, such as the **Realtek
+    ALC888/ALC888S** of nForce boards, as `/dev/dsp` and `/dev/mixer` when
+    there is no Sound Blaster (`/dev/dsp1` when there is). Commands go to
+    the codec through the CORB/RIRB rings (or the immediate command
+    registers). The driver finds the output jacks the BIOS describes (line
+    out, speakers, headphones), follows each back to a DAC through the
+    codec's mixers and selectors, and unmutes and enables everything on the
+    way, external amplifier (EAPD) included, plus the ALC888's coefficient
+    fix; every jack plays the same stereo. The codec runs at 48 kHz (or
+    44.1), 16-bit stereo, and what programs write in the Sound Blaster's
+    formats (8 or 16 bits, mono or stereo, 5000-48000 Hz) is converted
+    with linear interpolation, so `play`, the desktop's sounds and DOS
+    games' Sound Blaster work unchanged. `mixer master` sets the DACs'
+    amplifiers, `mixer pcm` scales in software. `hda=off` leaves it alone.
   - `ioctl()` (the new `SYS_ioctl` call) controls the devices. Kernel
     options `sb16=off` and `opl=off` leave the cards alone.
 - Pseudo-terminals (`openpty`) that share the console's line discipline, with
@@ -165,6 +227,17 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
     or an ISA card at 0x300 or 0x280 (QEMU's `ne2k_isa`). It receives into
     the card's ring buffer from its interrupt handler, recovers from ring
     overflows, and moves frames with 16-bit programmed I/O.
+  - A driver for the **nVidia nForce** Ethernet controller ("forcedeth":
+    nForce, nForce2/3, CK804 and MCP04 to MCP89), as `eth0`, with the PHY
+    on its MII bus: the **Realtek RTL8201N** (and RTL8201CP/CL) 10/100 PHY
+    is recognised and given the setup nForce chips need with it, and any
+    standard PHY works through the generic MII code (`mii.c`), which
+    resets it, advertises 10/100 half and full duplex, and reads back what
+    autonegotiation settled on. Frames move by DMA through rings of
+    descriptors in all three of the chip generations' layouts. Link changes
+    reprogram the MAC's speed and duplex and are logged; the timer tick
+    checks the link and the rings too, in case an interrupt is lost.
+    `forcedeth=off` leaves it alone.
   - Ethernet and ARP (a 16-entry cache that holds the newest packet while it
     resolves), IPv4 with checksums but no fragments, ICMP echo replies and
     "port unreachable", UDP, and a loopback path for `127.0.0.0/8` and our own
@@ -485,6 +558,13 @@ make run        # boots the ISO in QEMU with fluxdisk.img as /dev/hda (and
                 # fluxfloppy.img as /dev/fd0, if it exists) and an NE2000
 make run-kernel # boots the kernel directly with QEMU's Multiboot loader (text console)
 make run-disk   # boots fluxdisk.img alone, after installing fluxOS onto it
+make run-q35    # boots the ISO on QEMU's q35 machine: fluxdisk.img (/dev/sda)
+                # and the CD (/dev/sr0) on SATA, a USB keyboard and tablet on xHCI
+make run-usb    # boots the ISO with fluxdisk.img as a USB stick (/dev/sda) on
+                # EHCI, and a USB keyboard and mouse on UHCI
+make run QEMU_NET="-nic user,model=ne2k_pci -device intel-hda -device hda-duplex"
+                # with HD Audio (add an -audiodev for your host's sound
+                # system if QEMU asks for one)
 make clean      # removes build/ and the ISO; the disk images are kept
 ```
 
@@ -570,6 +650,8 @@ wget -O - http://example.com/  # HTTP over the TCP stack
 wget -O - https://example.com/ # HTTPS: TLS 1.3
 nc -l 7777 &  echo hi | nc localhost 7777    # a TCP server and client
 ls /mnt/fd0; df -h /mnt/fd0     # the floppy (make floppy, then make run)
+lsusb -v                       # USB devices (make run-usb or make run-q35)
+ls /mnt/sda                    # fluxdisk.img as a USB stick, under make run-usb
 dmesg | grep -E "mounted|removed"   # discs and floppies mounted as they are put in
 cp /mnt/fd0/GAME.EXE ~; ./GAME.EXE   # a DOS program, in the terminal
 beep -m "T160 L8 CDEGEC4"      # the PC speaker, with BASIC's PLAY music
@@ -605,9 +687,15 @@ kernel/
   syscall.c                system call table and user-pointer validation
   vfs.c, file.c, initrd.c  VFS + ramfs, mounting, devices, open files, pipes, initrd
   ata.c, blkdev.c, pci.c   IDE ATA/ATAPI driver (DMA), block devices, partitions, cache
+  ahci.c                   SATA (AHCI) disk and ATAPI driver
+  usb.c, usb.h             USB core: transfers, enumeration, hub ports, kusbd
+  uhci.c, ohci.c, ehci.c,  USB host controller drivers
+  xhci.c
+  usbhub.c, usbhid.c,      USB hubs, keyboards/mice/tablets (HID), and mass
+  usbmsc.c                 storage
   floppy.c                 floppy disk controller driver (ISA DMA, track cache)
-  automount.c              kmediad: mounts and unmounts CDs and floppies as they
-                           are put in and taken out
+  automount.c              kmediad: mounts and unmounts CDs, floppies and USB
+                           disks as they are put in and taken out
   fat32.c, iso9660.c       filesystem drivers (FAT12/16/32, ISO9660)
   tty.c, vga.c, serial.c,  console stack: terminals and ptys, text console,
   keyboard.c, timer.c      serial port, PS/2 keyboard, PIT, RTC, power control
@@ -616,8 +704,10 @@ kernel/
   voodoo.c                 3dfx Banshee/Voodoo3 driver: modes, EDID, 3D engine
   pcspkr.c, sb16.c, opl.c  sound: PC speaker, Sound Blaster 16 (/dev/dsp,
                            /dev/mixer), OPL FM synthesizer; isadma.c, ISA DMA
+  hda.c                    Intel HD Audio controller and codecs (Realtek ALC888)
   fpu.c                    lazy x87 FPU context switching
   ne2000.c                 NE2000 network card driver (PCI and ISA)
+  forcedeth.c, mii.c       nVidia nForce Ethernet, and MII PHYs (Realtek RTL8201N)
   net.c                    Ethernet, ARP, IPv4, ICMP, loopback, DHCP client
   tcp.c, socket.c          TCP, and sockets (with UDP and ICMP echo)
   kmain.c                  boot sequence
@@ -794,8 +884,23 @@ Storage limits:
   in legacy mode (ports 0x1F0/0x170, IRQ 14/15), and the firmware must have
   put the drive in a DMA mode: fluxOS does not set transfer modes or chipset
   timings itself. Anything else uses PIO, which works everywhere but is
-  slower and has the CPU copy every sector. SATA controllers in AHCI mode
-  are not supported at all.
+  slower and has the CPU copy every sector.
+- **SATA:** AHCI only, one command at a time per port (no NCQ), no port
+  multipliers, and no hot plugging: drives are found at boot. A controller
+  whose registers the firmware put above 4 GiB cannot be reached.
+- **USB:** no isochronous transfers (so no audio or webcams), no USB
+  Attached SCSI (UAS drives fall back to Bulk-Only, which they all speak),
+  only LUN 0 of a mass storage device (one slot of a multi-slot card
+  reader), no keyboard LEDs, and no suspend or power management. Keyboards
+  and mice must offer the boot protocol or a plain HID report; game
+  controllers and other HID devices are ignored. On UHCI, OHCI and EHCI,
+  interrupt endpoints are polled every frame (1 ms) rather than at their
+  own interval. An xHCI
+  controller whose registers lie above 4 GiB is skipped (there is no PAE),
+  and one xHCI controller takes at most 32 devices. Sectors must be 512
+  bytes (2048 for CDs). Pull a
+  stick out only after `umount` or `sync`: unwritten changes are lost with
+  it, as with a floppy.
 - **Recent writes can be lost on a crash.** A `write()` returns before the
   metadata reaches the disk, so a power cut within about 5 seconds of a
   write can lose that file. The filesystem itself stays consistent. Run
@@ -851,6 +956,16 @@ after it is pressed; in graphics mode the desktop's terminal reports both. Every
 which is quick enough for applications but keeps no PC's timing, so games that
 time themselves with delay loops may run too fast. Files keep no DOS
 attributes besides read-only, and their times cannot be set.
+
+HD Audio plays only (no recording, no S/PDIF or HDMI), in stereo on every
+output jack at once: there is no jack sensing, so plugging in headphones
+does not silence the speakers, and the surround jacks of a 5.1/7.1 board
+repeat the front pair. Board-specific codec fixes (GPIO-switched amplifiers
+on some laptops) are not applied.
+
+forcedeth runs at 10 or 100 Mbit/s (a gigabit PHY is held at 100), without
+checksum offload, VLANs, wake-on-LAN or MSI, and leaves alone the
+management unit of nForce Professional server boards.
 
 Networking limits: IPv4 only, one network card, no IP fragments in either
 direction, and no TCP congestion control (the receiver's window is the only

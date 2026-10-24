@@ -854,6 +854,14 @@ static int sys_blkinfo(uint32_t idx, uint32_t ubuf, uint32_t c, uint32_t d, uint
     return 0;
 }
 
+static int sys_usbinfo(uint32_t idx, uint32_t ubuf, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    if (user_check((void *)ubuf, sizeof(struct usbinfo)) < 0)
+        return -EFAULT;
+    return usb_info((int)idx, (struct usbinfo *)ubuf);
+}
+
 /* ---- system information ---- */
 
 static int sys_time(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
@@ -1098,6 +1106,7 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_ftruncate] = sys_ftruncate,
     [SYS_display] = sys_display,
     [SYS_ioctl] = sys_ioctl,
+    [SYS_usbinfo] = sys_usbinfo,
 };
 
 /* Calls that walk or change the VFS tree; read and write lock per chunk. */

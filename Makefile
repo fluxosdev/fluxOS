@@ -5,6 +5,10 @@
 #   make run-kernel boot the kernel directly with QEMU's multiboot loader
 #                   (text console only: that loader cannot set a video mode)
 #   make run-disk   boot fluxdisk.img alone (after installing onto it)
+#   make run-q35    boot the ISO on a q35 machine: fluxdisk.img and the CD on
+#                   its SATA (AHCI) controller, a USB keyboard and tablet on xHCI
+#   make run-usb    boot the ISO with fluxdisk.img as a USB stick on EHCI, and
+#                   a USB keyboard and mouse on UHCI
 #   make check      verify the kernel is a valid multiboot image
 #   make disk       create fluxdisk.img, a FAT32 data disk (kept by make clean)
 #   make floppy     create fluxfloppy.img, a 1.44 MB FAT12 floppy that the
@@ -73,7 +77,7 @@ BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/fsh $(ROOTFS)/bi
 
 ROOTFS_FILES := $(shell find rootfs -type f 2>/dev/null)
 
-.PHONY: all iso kernel initrd disk floppy run run-kernel run-disk check clean
+.PHONY: all iso kernel initrd disk floppy run run-kernel run-disk run-q35 run-usb check clean
 .SECONDARY:
 
 all: $(ISO)
@@ -199,6 +203,20 @@ run-kernel: $(TEXT_KERNEL) $(INITRD) $(DISK)
 # Boot fluxdisk.img on its own, after "fluxinstall /dev/hda".
 run-disk: $(DISK)
 	$(QEMU) -m 256M -serial stdio -boot c $(QEMU_DISK) $(QEMU_NET)
+
+# On q35 "if=ide" drives and the CD sit on the chipset's AHCI controller.
+QEMU_XHCI ?= -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0
+
+run-q35: $(ISO) $(DISK)
+	$(QEMU) -M q35 -m 256M -serial stdio -boot d -cdrom $(ISO) \
+		-drive file=$(DISK),format=raw,if=ide,index=0 $(QEMU_NET) $(QEMU_XHCI)
+
+QEMU_USB ?= -usb -device usb-kbd,bus=usb-bus.0 -device usb-mouse,bus=usb-bus.0 \
+	-device usb-ehci,id=ehci -drive file=$(DISK),format=raw,if=none,id=stick \
+	-device usb-storage,bus=ehci.0,drive=stick
+
+run-usb: $(ISO) $(DISK)
+	$(QEMU) -m 256M -serial stdio -boot d -cdrom $(ISO) $(QEMU_NET) $(QEMU_USB)
 
 clean:
 	rm -rf $(BUILD) $(ISO)

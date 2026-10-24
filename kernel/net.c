@@ -691,8 +691,8 @@ void net_register(const struct netdev *dev)
 
 void net_init(void)
 {
-    if (ne2000_init() < 0) {
-        boot_ok("Network: no NE2000 card found (loopback only)");
+    if (forcedeth_init() < 0 && ne2000_init() < 0) {
+        boot_ok("Network: no network card found (loopback only)");
         return;
     }
     char opt[32];
@@ -742,7 +742,8 @@ int net_configure(const struct netinfo *ni)
 void net_get_info(struct netinfo *ni)
 {
     memset(ni, 0, sizeof(*ni));
-    strcpy(ni->name, netif.present ? "ne0" : "lo");
+    strlcpy(ni->name, !netif.present ? "lo" : netif.dev.name[0] ? netif.dev.name : "ne0",
+            sizeof(ni->name));
     strlcpy(ni->driver, netif.present ? netif.dev.driver : "loopback", sizeof(ni->driver));
     memcpy(ni->mac, netif.dev.mac, ETH_ALEN);
     ni->flags = (uint16_t)((netif.present ? NETF_UP : 0) | (netif.use_dhcp ? NETF_DHCP : 0) |
@@ -769,6 +770,8 @@ void net_tick(void)
     loop_tick();
     tcp_timer();
     if (ticks % (HZ / 10) == 0 && netif.present) {
+        if (netif.dev.poll)
+            netif.dev.poll();
         arp_tick();
         dhcp_tick();
     }

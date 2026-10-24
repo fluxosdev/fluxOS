@@ -19,6 +19,8 @@ static void timer_irq(struct trapframe *tf)
     (void)tf;
     ticks++;
     spkr_tick();
+    hda_tick();
+    usb_tick();
     proc_tick();
     net_tick();
 }
@@ -30,6 +32,47 @@ void pit_init(uint32_t hz)
     outb(0x40, divisor & 0xFF);
     outb(0x40, (divisor >> 8) & 0xFF);
     irq_register(IRQ_TIMER, timer_irq);
+}
+
+static uint32_t pit_count(void)
+{
+    outb(0x43, 0x00);                   /* latch channel 0 */
+    uint32_t lo = inb(0x40);
+    return lo | (uint32_t)inb(0x40) << 8;
+}
+
+/*
+ * Busy-wait for at least `us` microseconds. This works with interrupts
+ * off, as during boot, by watching PIT channel 0 count down: in mode 3
+ * it steps by 2 per PIT clock from the divisor to 0, twice per tick.
+ */
+void udelay(uint32_t us)
+{
+    uint32_t reload = PIT_FREQ / HZ;
+    while (us) {
+        uint32_t chunk = MIN(us, 1000u);
+        us -= chunk;
+        uint32_t need = chunk * 2387 / 1000 + 1;
+        uint32_t prev = pit_count(), done = 0;
+        while (done < need) {
+            uint32_t now = pit_count();
+            done += now <= prev ? prev - now : prev + reload - now;
+            prev = now;
+        }
+    }
+}
+
+/* Wait at least `ms` milliseconds: a process sleeps, the boot code spins. */
+void mdelay(uint32_t ms)
+{
+    static int chan;
+    if (!current || current->pid <= 0) {
+        udelay(ms * 1000);
+        return;
+    }
+    uint32_t until = ticks + ms / (1000 / HZ) + 1;
+    while ((int32_t)(ticks - until) < 0)
+        sleep_on_timeout(&chan, until);
 }
 
 static uint8_t cmos_read(uint8_t reg)

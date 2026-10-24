@@ -213,6 +213,7 @@ int ftruncate(int fd, off_t size) { return ret(sc2(SYS_ftruncate, fd, (int)size)
 int statfs(const char *path, struct statfs *st) { return ret(sc2(SYS_statfs, (int)path, (int)st)); }
 int getmounts(char *buf, unsigned int size) { return ret(sc2(SYS_getmounts, (int)buf, (int)size)); }
 int blkinfo(int index, struct blkinfo *bi) { return ret(sc2(SYS_blkinfo, index, (int)bi)); }
+int usbinfo(int index, struct usbinfo *ui) { return ret(sc2(SYS_usbinfo, index, (int)ui)); }
 
 int poll(struct pollfd *fds, unsigned int nfds, int timeout_ms)
 {

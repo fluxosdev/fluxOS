@@ -75,16 +75,17 @@ static int parse(const char *s, uint32_t *out)
 
 int main(int argc, char **argv)
 {
-    if (argc == 1 || (argc == 2 && (!strcmp(argv[1], "ne0") || !strcmp(argv[1], "-a"))))
-        return show();
-    if (strcmp(argv[1], "ne0") || argc < 3) {
-        fprintf(stderr, "usage: ifconfig [ne0 ADDR [netmask M] [gw G] [dns D] | ne0 dhcp]\n");
-        return 2;
-    }
     struct netinfo ni;
     if (netinfo(&ni) < 0) {
         perror("ifconfig");
         return 1;
+    }
+    if (argc == 1 || (argc == 2 && (!strcmp(argv[1], ni.name) || !strcmp(argv[1], "-a"))))
+        return show();
+    if (strcmp(argv[1], ni.name) || argc < 3) {
+        fprintf(stderr, "usage: ifconfig [%s ADDR [netmask M] [gw G] [dns D] | %s dhcp]\n",
+                ni.name, ni.name);
+        return 2;
     }
     if (!strcmp(argv[2], "dhcp")) {
         ni.flags = NETF_DHCP;

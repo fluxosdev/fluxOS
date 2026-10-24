@@ -29,7 +29,10 @@ struct idt_ptr {
 
 static struct idt_entry idt[256];
 static struct idt_ptr idt_desc;
-static irq_handler_t irq_handlers[16];
+/* PCI devices share interrupt lines: each line has a few handlers, all
+ * called on every interrupt, and each checks its own device. */
+#define IRQ_SHARED 4
+static irq_handler_t irq_handlers[16][IRQ_SHARED];
 
 volatile int need_resched;
 
@@ -83,12 +86,19 @@ void irq_unmask(int irq)
 
 int irq_registered(int irq)
 {
-    return irq_handlers[irq] != NULL;
+    return irq_handlers[irq][0] != NULL;
 }
 
 void irq_register(int irq, irq_handler_t handler)
 {
-    irq_handlers[irq] = handler;
+    for (int i = 0; i < IRQ_SHARED; i++) {
+        if (irq_handlers[irq][i] == handler)
+            break;
+        if (!irq_handlers[irq][i]) {
+            irq_handlers[irq][i] = handler;
+            break;
+        }
+    }
     irq_unmask(irq);
 }
 
@@ -166,8 +176,8 @@ static void handle_irq(struct trapframe *tf)
     }
 
     random_add((uint32_t)irq);
-    if (irq_handlers[irq])
-        irq_handlers[irq](tf);
+    for (int i = 0; i < IRQ_SHARED && irq_handlers[irq][i]; i++)
+        irq_handlers[irq][i](tf);
 
     if (irq >= 8)
         outb(PIC2_CMD, PIC_EOI);

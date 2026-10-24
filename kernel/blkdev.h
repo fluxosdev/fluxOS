@@ -6,7 +6,7 @@
 #include <flux/abi.h>
 
 #define BLK_MAX_SECTOR 2048
-#define BLK_MAX_DEVS   16
+#define BLK_MAX_DEVS   32
 
 struct fs;
 struct vnode;
@@ -45,6 +45,8 @@ struct blockdev {
 };
 
 int blk_register(struct blockdev *bd);
+/* The first free name of the form prefix + letter ("sda") or + digit ("sr0"). */
+void blk_new_name(char *out, uint32_t size, const char *prefix, int digit);
 struct blockdev *blk_get(int index);
 struct blockdev *blk_by_vnode(struct vnode *vn);
 
@@ -73,6 +75,7 @@ void blk_start_flusher(void);
 void blk_scan_partitions(struct blockdev *disk);
 int blk_rescan(struct blockdev *disk);
 void ata_init(void);
+void ahci_init(void);
 void floppy_init(void);
 void floppy_start(void);                /* after the scheduler: needs a thread */
 void automount_start(void);             /* the thread that mounts media as they are inserted */

@@ -73,7 +73,8 @@
 #define SYS_ftruncate 65
 #define SYS_display   66
 #define SYS_ioctl     67
+#define SYS_usbinfo   68
 
-#define NSYSCALLS     68
+#define NSYSCALLS     69
 
 #endif

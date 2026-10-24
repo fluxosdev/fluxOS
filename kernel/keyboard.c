@@ -100,24 +100,14 @@ static const char *function_text(uint8_t sc)
     return "";
 }
 
-static void keyboard_irq(struct trapframe *tf)
+/*
+ * One key going down or up. Both keyboards come here: the PS/2 interrupt
+ * with the codes it reads, and USB keyboards with their keys translated
+ * to the same codes.
+ */
+void keyboard_key(uint8_t sc, int ext, int released)
 {
-    (void)tf;
-    uint8_t st = inb(0x64);
-    if (!(st & 0x01) || (st & 0x20))
-        return;                         /* nothing, or mouse data (IRQ12) */
-    uint8_t sc = inb(0x60);
-
-    if (sc == 0xE0) {
-        extended = 1;
-        return;
-    }
-
-    int released = sc & 0x80;
-    sc &= 0x7F;
-
-    if (extended) {
-        extended = 0;
+    if (ext) {
         if (sc == SC_LSHIFT || sc == SC_RSHIFT)
             return;                     /* fake shifts around nav keys */
         if (sc == SC_LCTRL)
@@ -187,6 +177,23 @@ static void keyboard_irq(struct trapframe *tf)
         text[len++] = 0x1B;             /* meta sends an ESC prefix */
     text[len++] = c;
     key_event(sc, 1, text, len);
+}
+
+static void keyboard_irq(struct trapframe *tf)
+{
+    (void)tf;
+    uint8_t st = inb(0x64);
+    if (!(st & 0x01) || (st & 0x20))
+        return;                         /* nothing, or mouse data (IRQ12) */
+    uint8_t sc = inb(0x60);
+
+    if (sc == 0xE0) {
+        extended = 1;
+        return;
+    }
+    int ext = extended;
+    extended = 0;
+    keyboard_key(sc & 0x7F, ext, sc & 0x80);
 }
 
 void keyboard_init(void)

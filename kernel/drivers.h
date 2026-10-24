@@ -55,6 +55,10 @@ void spkr_tick(void);
 void spkr_beep(uint32_t freq, uint32_t ms);
 void sb16_init(struct vnode *devdir);
 void opl_init(struct vnode *devdir);
+/* Intel HD Audio (hda.c): /dev/dsp and /dev/mixer when there is no SB16 */
+void hda_init(struct vnode *devdir);
+void hda_tick(void);
+int hda_get_info(struct sound_info *si);
 int opl_present(void);                  /* 0, 2 (OPL2) or 3 (OPL3) */
 
 /* Console: VGA text mode or the framebuffer (a subset of ANSI escapes) */
@@ -71,6 +75,15 @@ void serial_write(const char *buf, uint32_t len);
 /* PS/2 keyboard and mouse */
 void keyboard_init(void);
 void mouse_init(void);
+/* A key by its scancode set 1 code (extended: after an E0 prefix), from
+ * the PS/2 or a USB keyboard. Called from interrupt handlers. */
+void keyboard_key(uint8_t sc, int extended, int released);
+
+/* USB (usb.c): host controllers, hubs and the device drivers on them */
+void usb_init(void);
+void usb_start(void);                   /* after the scheduler: the hotplug thread */
+void usb_tick(void);                    /* from the timer interrupt */
+int usb_info(int index, struct usbinfo *ui);
 
 /*
  * Input events for the desktop (/dev/input). While that device is open,
@@ -83,6 +96,8 @@ void input_push(const struct input_event *ev);
 /* Programmable interval timer */
 extern volatile uint32_t ticks;
 void pit_init(uint32_t hz);
+void udelay(uint32_t us);               /* spins; works with interrupts off */
+void mdelay(uint32_t ms);               /* sleeps in a process, spins at boot */
 
 /* CMOS real-time clock */
 void rtc_init(void);

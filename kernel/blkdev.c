@@ -460,6 +460,18 @@ int blk_register(struct blockdev *bd)
     return 0;
 }
 
+void blk_new_name(char *out, uint32_t size, const char *prefix, int digit)
+{
+    for (int n = 0; n < (digit ? 10 : 26); n++) {
+        snprintf(out, size, "%s%c", prefix, digit ? '0' + n : 'a' + n);
+        int used = 0;
+        for (int i = 0; i < ndevices && !used; i++)
+            used = !strcmp(devices[i]->name, out);
+        if (!used)
+            return;
+    }
+}
+
 /* ---- MBR partitions ---- */
 
 struct mbr_entry {

@@ -524,7 +524,7 @@ void sound_get_info(struct sound_info *si)
         si->dma8 = sb.dma8;
         si->dma16 = sb.dma16;
         si->flags |= SOUNDF_DSP;
-    } else {
+    } else if (!hda_get_info(si)) {
         strlcpy(si->card, "PC speaker", sizeof(si->card));
     }
     int opl = opl_present();
@@ -625,5 +625,6 @@ void sound_init(void)
         return;
     spkr_init(dev);
     sb16_init(dev);
+    hda_init(dev);
     opl_init(dev);
 }

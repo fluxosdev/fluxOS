@@ -90,11 +90,29 @@ struct tcp_hdr {
 
 /* What a network card driver provides. */
 struct netdev {
+    char name[8];                       /* "eth0"; "ne0" when empty */
     char driver[32];
     uint8_t mac[ETH_ALEN];
     uint32_t io_base, irq;
     int (*transmit)(const void *frame, uint32_t len);
+    void (*poll)(void);                 /* optional: from the timer, ten times a second */
 };
+
+/* An Ethernet PHY on a MAC's MII management bus (mii.c). */
+struct mii_phy {
+    int (*read)(int addr, int reg);     /* < 0 on error */
+    int (*write)(int addr, int reg, uint16_t value);
+    int addr;
+    uint32_t id;                        /* PHYSID1 << 16 | PHYSID2 */
+    char name[24];
+    int rtl8201;                        /* a Realtek RTL8201CP/CL/N */
+    int nv_fix;                         /* the MAC is an nForce that needs the RTL8201 fix */
+};
+
+int mii_probe(struct mii_phy *phy);     /* find it: 0, or -1 */
+int mii_init(struct mii_phy *phy);      /* reset, advertise 10/100, autonegotiate */
+void mii_power_up(struct mii_phy *phy);
+int mii_link(struct mii_phy *phy, int *speed, int *full);  /* 1 if the link is up */
 
 struct netif {
     int present;                /* a card was found */
@@ -115,6 +133,7 @@ void net_get_info(struct netinfo *ni);
 int net_configure(const struct netinfo *ni);
 
 int ne2000_init(void);
+int forcedeth_init(void);
 
 /* Ones' complement sums: accumulate with csum_add, finish with csum_fold. */
 uint32_t csum_add(uint32_t sum, const void *data, uint32_t len);

@@ -220,7 +220,7 @@ static void enable_palette(void)
     vga_out(ATT_IW, 0x20);
 }
 
-static void udelay(int us)
+static void isa_udelay(int us)
 {
     while (us-- > 0)
         io_wait();                  /* an ISA cycle: about a microsecond */
@@ -275,7 +275,7 @@ static void ddc_set(int scl, int sda)
     wr(VIDSERPARPORT, v);
     ddc_scl = scl;
     ddc_sda = sda;
-    udelay(5);
+    isa_udelay(5);
 }
 
 static int ddc_sda_in(void)
@@ -288,7 +288,7 @@ static void ddc_clock_high(void)
 {
     ddc_set(1, ddc_sda);
     for (int i = 0; i < 1000 && !(rd(VIDSERPARPORT) & DDC_SCL_IN); i++)
-        udelay(10);
+        isa_udelay(10);
 }
 
 static void ddc_start(void)

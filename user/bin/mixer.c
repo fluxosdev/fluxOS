@@ -24,7 +24,12 @@ static const char *const names[MIXER_CHANNELS] = {
 static void show(int fd)
 {
     struct sound_info si;
-    if (ioctl(fd, SOUND_INFO, &si) == 0) {
+    if (ioctl(fd, SOUND_INFO, &si) == 0 && (si.flags & SOUNDF_HDA)) {
+        printf("%s (HD Audio), IRQ %d", si.card, si.irq);
+        if (si.flags & SOUNDF_OPL2)
+            printf("; %s at %Xh", (si.flags & SOUNDF_OPL3) ? "OPL3" : "OPL2", si.opl_base);
+        printf("\n");
+    } else if (ioctl(fd, SOUND_INFO, &si) == 0) {
         printf("%s, DSP %d.%02d at %Xh, IRQ %d, DMA %d", si.card, si.dsp_version >> 8,
                si.dsp_version & 0xFF, si.base, si.irq, si.dma8);
         if (si.dma16 != 0xFF)
