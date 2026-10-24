@@ -363,6 +363,54 @@ void vga_redraw(void)
     flush();
 }
 
+/*
+ * The framebuffer has a new size or pixel format (a display driver set a
+ * mode). Re-lay the grid out for it, keeping the text at the top left
+ * and, if there are fewer rows now, the rows nearest the cursor.
+ */
+void vga_reset_fb(void)
+{
+    if (!graphics || !fb.base)
+        return;
+    int ncols = MIN((int)(fb.width / FONT_W), MAX_COLS);
+    int nrows = MIN((int)(fb.height / FONT_H), MAX_ROWS);
+    for (int i = 0; i < 16; i++)
+        palette[i] = fb_pack(vga_rgb[i]);
+
+    if (cy >= nrows) {                  /* drop rows off the top */
+        int k = cy - nrows + 1;
+        memmove(cells, cells + k * cols, (uint32_t)((rows - k) * cols) * sizeof(cells[0]));
+        rows -= k;
+        cy -= k;
+        saved_y = MAX(saved_y - k, 0);
+    }
+    if (ncols < cols) {
+        for (int r = 0; r < rows; r++)
+            memmove(cells + r * ncols, cells + r * cols, (uint32_t)ncols * sizeof(cells[0]));
+    } else if (ncols > cols) {
+        for (int r = rows - 1; r >= 0; r--) {
+            memmove(cells + r * ncols, cells + r * cols, (uint32_t)cols * sizeof(cells[0]));
+            for (int c = cols; c < ncols; c++)
+                cells[r * ncols + c] = (uint16_t)(' ' | 0x07 << 8);
+        }
+    }
+    for (int i = MIN(rows, nrows) * ncols; i < nrows * ncols; i++)
+        cells[i] = (uint16_t)(' ' | 0x07 << 8);
+    cols = ncols;
+    rows = nrows;
+    cx = MIN(cx, cols - 1);
+    cy = MIN(cy, rows - 1);
+    saved_x = MIN(saved_x, cols - 1);
+    saved_y = MIN(saved_y, rows - 1);
+    wrap_pending = 0;
+    pending_scroll = 0;
+    if (fb_console_active())
+        vga_redraw();
+    else
+        for (int i = 0; i < cols * rows; i++)
+            drawn[i] = INVALID;
+}
+
 void vga_init(void)
 {
     if (fb.base) {

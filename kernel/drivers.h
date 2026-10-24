@@ -16,9 +16,12 @@ struct framebuffer {
     uint8_t red_pos, red_size, green_pos, green_size, blue_pos, blue_size;
 };
 extern struct framebuffer fb;
+extern struct framebuffer fb_boot;      /* the boot loader's mode */
 
 int fb_init(struct multiboot_info *mbi);
 void fb_map(void);
+void fb_mode_changed(void);             /* a driver set a new mode in fb */
+int fb_display(int op, void *arg);      /* SYS_display; arg checked by the caller */
 uint32_t fb_pack(uint32_t rgb);
 void fb_glyph(uint32_t x, uint32_t y, const uint8_t *rows, uint32_t h, uint32_t fg, uint32_t bg);
 void fb_fill(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color);
@@ -28,10 +31,21 @@ int fb_get_info(struct fbinfo *fi);
 int fb_map_user(void);
 void fb_proc_exit(int pid);
 
+/* 3dfx Banshee/Voodoo3 display driver (voodoo.c) */
+void voodoo_init(void);
+int voodoo_present(void);
+void voodoo_info(struct dispinfo *di);
+int voodoo_modes(struct dispmode *out, int max);
+int voodoo_set_mode(const struct dispmode *m);
+int voodoo_screen_bytes(void);
+int voodoo_map3d(struct disp3d *d);
+void voodoo_proc_exit(int pid);
+
 /* Console: VGA text mode or the framebuffer (a subset of ANSI escapes) */
 void vga_init(void);
 void vga_write(const char *buf, uint32_t len);
 void vga_redraw(void);
+void vga_reset_fb(void);                /* the framebuffer's mode changed */
 
 /* COM1 serial port */
 void serial_init(void);

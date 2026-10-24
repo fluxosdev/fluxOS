@@ -243,6 +243,53 @@ struct fbinfo {
     uint16_t reserved;
 };
 
+/* ---- display adapter (SYS_display) ---- */
+#define DISP_INFO    0          /* arg: struct dispinfo * */
+#define DISP_MODES   1          /* arg: struct dispmode[DISP_MAX_MODES]; returns the count */
+#define DISP_SETMODE 2          /* arg: const struct dispmode *; width 0: the boot mode */
+#define DISP_MAP3D   3          /* arg: struct disp3d *; maps the 3D engine */
+
+#define DISP_MAX_MODES 32
+
+#define DISPF_NATIVE 0x1        /* the driver sets modes itself (DISP_SETMODE) */
+#define DISPF_3D     0x2        /* has a 3D engine (DISP_MAP3D) */
+#define DISPF_EDID   0x4        /* edid[] holds the monitor's EDID block */
+#define DISPF_BOOT   0x8        /* the boot loader's mode is on the screen */
+
+/* A video mode. DISP_MODES lists timings with bpp 0: each works at 16 or
+ * 32 bits per pixel if the video memory holds it. */
+struct dispmode {
+    uint16_t width, height;
+    uint16_t bpp;               /* 16 or 32 */
+    uint16_t refresh;           /* Hz; 0 if unknown (the boot mode) */
+    uint32_t pixclock;          /* kHz; 0 if unknown */
+    uint32_t hfreq;             /* line rate in Hz; 0 if unknown */
+};
+
+struct dispinfo {
+    char     adapter[48];       /* "3dfx Voodoo3" */
+    char     driver[32];        /* "voodoo" or "vesa" */
+    uint32_t flags;             /* DISPF_* */
+    uint32_t pci_id;            /* vendor | device << 16, or 0 */
+    uint32_t vram_kb;
+    uint32_t max_pixclock;      /* kHz */
+    uint32_t screen_bytes;      /* video memory the screen uses, from offset 0 */
+    struct dispmode mode;       /* on the screen now */
+    struct dispmode boot;       /* what the boot loader set */
+    uint8_t  edid[128];
+};
+
+/* DISP_MAP3D: the 3D engine's registers and all of video memory, mapped
+ * into the caller (one process at a time). The screen occupies video
+ * memory from offset 0 to screen_end. */
+struct disp3d {
+    uint32_t regs;              /* user address of the 3D register block */
+    uint32_t vram;              /* user address of video memory */
+    uint32_t vram_size;
+    uint32_t screen_end;
+    uint32_t pci_id;
+};
+
 /* ---- input events, read from /dev/input ---- */
 #define IEV_KEY   1
 #define IEV_MOUSE 2

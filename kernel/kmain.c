@@ -105,11 +105,13 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     boot_ok("Physical memory: %u MiB usable, %u KiB free",
             pmm_total_kb() / 1024, pmm_free_kb());
     paging_init();
+    fpu_init();
     fb_map();
     boot_ok("Paging enabled (4 MiB kernel pages, 4 KiB user pages)");
     if (have_fb)
         boot_ok("Framebuffer: %ux%u, %u bits per pixel at %08x",
                 fb.width, fb.height, fb.bpp, fb.phys);
+    voodoo_init();
     heap_init();
     {
         uint32_t total, used;

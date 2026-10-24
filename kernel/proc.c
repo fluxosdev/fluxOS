@@ -110,6 +110,7 @@ void schedule(void)
         return;
 
     current = next;
+    fpu_switch(next);
     if (next->kstack)
         tss_set_kernel_stack((uint32_t)next->kstack + KSTACK_SIZE);
     vmm_switch(next->pd);
@@ -246,6 +247,7 @@ int do_fork(void)
     child->stack_low = parent->stack_low;
     child->sig_ignored = parent->sig_ignored;
     memcpy(child->name, parent->name, sizeof(child->name));
+    fpu_fork(child);
 
     child->state = P_READY;
     return child->pid;
@@ -268,6 +270,7 @@ void do_exit(int status)
     tty_drop(p->ctty);
     p->ctty = NULL;
     fb_proc_exit(p->pid);
+    fpu_release(p);
 
     if (p->pd != kernel_pd) {
         vmm_switch(kernel_pd);

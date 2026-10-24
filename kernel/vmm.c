@@ -40,11 +40,8 @@ void paging_init(void)
 
     write_cr4(read_cr4() | (1u << 4) | (1u << 7));      /* PSE, PGE */
     write_cr3((uint32_t)kernel_pd);
-    /* PG, WP (honour read-only pages in ring 0), EM (trap FPU use) */
-    uint32_t cr0 = read_cr0();
-    cr0 |= (1u << 31) | (1u << 16) | (1u << 2);
-    cr0 &= ~(1u << 1);                                  /* MP */
-    write_cr0(cr0);
+    /* PG, WP (honour read-only pages in ring 0); fpu_init() sets the FPU bits */
+    write_cr0(read_cr0() | (1u << 31) | (1u << 16));
 }
 
 void vmm_switch(uint32_t *pd)
@@ -68,7 +65,7 @@ uint32_t *vmm_create(void)
  * for use before the first process exists: address spaces copy these
  * entries when they are created.
  */
-void *vmm_map_mmio(uint32_t phys, uint32_t size)
+void *vmm_map_mmio(uint32_t phys, uint32_t size, uint32_t flags)
 {
     uint32_t base = ALIGN_DOWN(phys, 0x400000u);
     uint32_t end = ALIGN_UP(phys + size, 0x400000u);
@@ -76,7 +73,7 @@ void *vmm_map_mmio(uint32_t phys, uint32_t size)
     if (end - base > 0u - va)
         return NULL;
     for (uint32_t pa = base; pa != end; pa += 0x400000u, mmio_next += 0x400000u)
-        kernel_pd[PDE_INDEX(mmio_next)] = pa | PTE_PRESENT | PTE_WRITE | PTE_LARGE | PTE_GLOBAL;
+        kernel_pd[PDE_INDEX(mmio_next)] = pa | PTE_PRESENT | PTE_WRITE | PTE_LARGE | PTE_GLOBAL | flags;
     write_cr3(read_cr3());
     return (void *)(va + (phys - base));
 }
@@ -122,7 +119,7 @@ int vmm_alloc(uint32_t *pd, uint32_t va)
 }
 
 /* Map [phys, phys + size) into a user address space as device memory. */
-int vmm_map_phys(uint32_t *pd, uint32_t va, uint32_t phys, uint32_t size)
+int vmm_map_phys(uint32_t *pd, uint32_t va, uint32_t phys, uint32_t size, uint32_t flags)
 {
     if (va < USER_BASE || va + size > USER_STACK_LIMIT || va + size < va)
         return -EINVAL;
@@ -132,7 +129,7 @@ int vmm_map_phys(uint32_t *pd, uint32_t va, uint32_t phys, uint32_t size)
             return -ENOMEM;
         if ((*pte & (PTE_PRESENT | PTE_MMIO)) == PTE_PRESENT)
             return -EBUSY;                      /* ordinary memory is there */
-        *pte = (phys + off) | PTE_PRESENT | PTE_WRITE | PTE_USER | PTE_MMIO;
+        *pte = (phys + off) | PTE_PRESENT | PTE_WRITE | PTE_USER | PTE_MMIO | flags;
         flush_if_current(pd, va + off);
     }
     return 0;

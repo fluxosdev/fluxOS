@@ -267,6 +267,7 @@ int proc_exec(struct proc *p, const char *path, char *const argv[], char *const 
         vmm_switch(pd);
     vmm_destroy(old);
 
+    fpu_release(p);
     p->heap_start = p->brk = ALIGN_UP(top, PAGE_SIZE);
     p->stack_low = ALIGN_DOWN(sp, PAGE_SIZE) - STACK_SLACK;
 

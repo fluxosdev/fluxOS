@@ -44,6 +44,8 @@ ICONS = {
     "Go-home.svg": "go-home",
     "View-refresh.svg": "view-refresh",
     "Process-stop.svg": "process-stop",
+    "Video-display.svg": "video-display",
+    "Applications-system.svg": "applications-system",
 }
 SIZES = (16, 32, 48)
 SOURCE_PX = 250         # a standard Commons thumbnail width, scaled down from here

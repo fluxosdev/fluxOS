@@ -97,6 +97,11 @@ static void open_browser(void)
     browser_open(NULL);
 }
 
+static void open_gears(void)
+{
+    gears_open();
+}
+
 static void open_home(void)
 {
     const char *home = getenv("HOME");
@@ -141,8 +146,10 @@ static struct menu_item menu_items[] = {
     { ICON_EDITOR, "Text Editor", open_editor },
     { ICON_BROWSER, "Web Browser", open_browser },
     { ICON_CALC, "Calculator", open_calculator },
+    { ICON_GEARS, "3D Gears", open_gears },
     { ICON_README, "Read Me", open_readme },
     { ICON_COMPUTER, "System Properties", about_open },
+    { ICON_DISPLAY, "Display Properties", display_open },
     { ICON_RUN, "Run...", run_open },
     { ICON_INSTALL, "Install fluxOS...", setup_open },
     { ICON_NONE, NULL, NULL },
@@ -1359,6 +1366,59 @@ void wm_tick(void)
 {
     if (update_clock())
         wm_damage(tray_rect());
+}
+
+/*
+ * After a mode change: map the new screen, give the back buffer its size,
+ * and keep every window reachable (maximized ones fill the new screen).
+ * On failure (no memory for the back buffer) nothing changes.
+ */
+int wm_reconfigure(void)
+{
+    struct fbinfo nfi;
+    if (fbinfo(&nfi) < 0)
+        return -1;
+    uint8_t *nfb = fbmap();
+    if (!nfb)
+        return -1;
+    struct surface ns;
+    if (surface_init(&ns, (int)nfi.width, (int)nfi.height) < 0)
+        return -1;
+    surface_free(&screen);
+    screen = ns;
+    fb = nfb;
+    fbi = nfi;
+    screen_w = (int)fbi.width;
+    screen_h = (int)fbi.height;
+    fb_fast = fbi.bpp == 32 && fbi.red_pos == 16 && fbi.green_pos == 8 && fbi.blue_pos == 0;
+
+    if (drag != DRAG_CLIENT) {
+        drag = DRAG_NONE;
+        drag_win = NULL;
+        task_pressed_idx = -1;
+    }
+    menu_open = 0;
+    menu_hover = -1;
+    if (mx >= screen_w)
+        mx = screen_w - 1;
+    if (my >= screen_h)
+        my = screen_h - 1;
+    for (struct window *w = bottom; w; w = w->above) {
+        if (w->maximized) {
+            set_frame(w, mkrect(0, 0, screen_w, screen_h - TASKBAR_H));
+            continue;
+        }
+        int x = w->r.x, y = w->r.y;
+        if (x + w->r.w > screen_w)
+            x = screen_w - w->r.w;
+        if (y + w->r.h > screen_h - TASKBAR_H)
+            y = screen_h - TASKBAR_H - w->r.h;
+        w->r.x = x < 0 ? 0 : x;
+        w->r.y = y < 0 ? 0 : y;
+    }
+    ndamage = 0;
+    wm_damage(mkrect(0, 0, screen_w, screen_h));
+    return 0;
 }
 
 void wm_init(void)

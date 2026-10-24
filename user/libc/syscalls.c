@@ -219,6 +219,7 @@ int poll(struct pollfd *fds, unsigned int nfds, int timeout_ms)
 
 int openpty(int fds[2]) { return ret(sc1(SYS_openpty, (int)fds)); }
 int fbinfo(struct fbinfo *fi) { return ret(sc1(SYS_fbinfo, (int)fi)); }
+int display(int op, void *arg) { return ret(sc2(SYS_display, op, (int)arg)); }
 
 void *fbmap(void)
 {

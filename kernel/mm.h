@@ -21,6 +21,8 @@ uint32_t pmm_free_kb(void);
 #define PTE_PRESENT 0x001
 #define PTE_WRITE   0x002
 #define PTE_USER    0x004
+#define PTE_PWT     0x008       /* write-through */
+#define PTE_PCD     0x010       /* cache disabled (device registers) */
 #define PTE_LARGE   0x080
 #define PTE_GLOBAL  0x100
 #define PTE_MMIO    0x200       /* (available bit) device memory, not ours to free */
@@ -37,8 +39,9 @@ void vmm_free_page(uint32_t *pd, uint32_t va);
 uint32_t vmm_translate(uint32_t *pd, uint32_t va);
 int vmm_copy_to(uint32_t *pd, uint32_t va, const void *src, uint32_t len);
 uint32_t vmm_user_pages(uint32_t *pd);
-void *vmm_map_mmio(uint32_t phys, uint32_t size);       /* boot time only */
-int vmm_map_phys(uint32_t *pd, uint32_t va, uint32_t phys, uint32_t size);
+/* flags: extra page bits, such as PTE_PCD for device registers */
+void *vmm_map_mmio(uint32_t phys, uint32_t size, uint32_t flags);  /* boot time only */
+int vmm_map_phys(uint32_t *pd, uint32_t va, uint32_t phys, uint32_t size, uint32_t flags);
 
 /* ---- kernel heap ---- */
 void heap_init(void);

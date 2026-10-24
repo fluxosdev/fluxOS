@@ -21,9 +21,10 @@ fluxOS is a small 32-bit x86 Unix-like operating system with preemptive
 multitasking, ring-3 user processes, paging, a RAM root filesystem, IDE
 disk, CD-ROM and floppy drivers with FAT12/16/32 and ISO9660 support, an
 NE2000 network driver with a TCP/IP stack, a zsh-flavoured shell called
-**fsh**, a Windows 95 style graphical desktop with a web browser, and a
-compatibility layer that runs DOS programs in the terminal. It boots with
-GRUB (Multiboot) from an ISO image, straight into the desktop.
+**fsh**, a Windows 95 style graphical desktop with a web browser, a 3dfx
+Voodoo3 display driver with a small OpenGL library, and a compatibility
+layer that runs DOS programs in the terminal. It boots with GRUB
+(Multiboot) from an ISO image, straight into the desktop.
 
 ```
 flux@fluxOS ~ % spin A 3 & spin B 3 &
@@ -45,6 +46,10 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
 - Processes: `fork` (full address-space copy), `execve` (static ELF32 and `#!`
   scripts), `exit`/`waitpid` with zombies, reparenting of orphans to init,
   process groups and a foreground process group on the tty.
+- Lazy x87 FPU switching: a process's first FPU instruction after a task
+  switch traps (#NM), and the kernel saves the previous owner's FPU
+  registers and loads its own (FNSAVE/FRSTOR), so only processes that use
+  floating point pay for it. `fork` copies the FPU state.
 - Signals: `kill`, `SIGINT`/`SIGQUIT` from ^C/^\, `SIGPIPE`, and fault signals
   (`SIGSEGV`, `SIGFPE`, `SIGILL`). Each signal either terminates the process or
   is ignored.
@@ -99,6 +104,19 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   wheel support, which uses the VMware/QEMU "vmmouse" interface for absolute
   positioning (and the wheel) when it is there, and `/dev/input`, which
   delivers keyboard and mouse events to the desktop.
+- Display drivers: the standard driver keeps the mode the VESA BIOS set at
+  startup (the default), and reports the adapter's name and memory from the
+  BIOS. A driver for the **3dfx Voodoo Banshee, Voodoo3 and Voodoo4/5**
+  (PCI vendor `121a`) sizes video memory, reads the monitor's EDID over DDC,
+  and can set modes itself, from 640x480 to 1600x1200 at 16 or 32 bits per
+  pixel and 56 to 85 Hz (VESA DMT timings, programmed into the CRTC, the
+  Banshee extension registers and the video PLL). It saves the BIOS mode's
+  registers first, so that mode can be restored without a reboot, and it
+  lends the 3D engine to one process at a time by mapping its registers and
+  video memory into it. `display()` (the `SYS_display` call) reports the
+  adapter, lists modes, sets them and maps the 3D engine. Kernel options:
+  `video=1024x768x16@85` starts in a mode of the 3dfx driver, and
+  `voodoo=off` leaves the card to the standard driver.
 - Pseudo-terminals (`openpty`) that share the console's line discipline, with
   a controlling terminal per process, hangup (`SIGHUP`) when the master side
   closes, and `poll` over terminals, pipes and devices.
@@ -226,8 +244,32 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   the kernel which filesystem it booted from, and a system started from an
   installed hard disk hides the icon and the Start menu entry. (`fluxinstall`
   still works from a shell there.)
-- Start menu: Terminal, File Manager, Text Editor, Web Browser, Calculator, Read Me, System Properties (version,
-  memory, display, uptime), Run... (runs a command in a new window), Install
+- Display Properties: a Win95-style dialog with two pages.
+  - **Settings** shows a monitor with a miniature of the desktop at the
+    chosen size, the display adapter, the driver (standard VGA or the 3dfx
+    driver), the color palette (High Color, 16 bit, or True Color, 32 bit),
+    the desktop area on a Less/More slider, and the refresh rate.
+  - **Monitor** picks the monitor type: Plug and Play (from its EDID) or a
+    generic VGA/SVGA model, which limits the modes offered to what that
+    monitor can show by resolution, line rate and refresh. It also shows
+    what the EDID says (model, manufacturer, date, size, preferred mode,
+    frequency ranges) and the timing of the mode on the screen.
+  - With the 3dfx driver a new mode takes effect at once; the desktop is laid
+    out again and asks whether to keep it, going back to the old mode by
+    itself after 15 seconds. With the standard driver the BIOS mode stays,
+    and a system installed on a hard disk can choose the mode to start in.
+  - Settings are saved for the next start in GRUB's environment block
+    (`/boot/grub/grubenv` on the installed partition); started from the CD
+    they last until a restart.
+- 3D Gears: the classic OpenGL gears demo in a resizable window, drawn by
+  the Voodoo3's 3D engine when there is one and by the software renderer
+  otherwise. The status bar names the renderer and counts frames per
+  second; drag or use the arrow keys to turn the view, Space pauses, Home
+  resets it, and S switches between the 3D hardware and the software
+  renderer.
+- Start menu: Terminal, File Manager, Text Editor, Web Browser, Calculator,
+  3D Gears, Read Me, System Properties (version, memory, display, uptime),
+  Display Properties, Run... (runs a command in a new window), Install
   fluxOS..., and Shut Down... (power off, restart, or close the desktop and
   return to the text console).
 - Keys: the Windows key or Ctrl+Esc opens the Start menu, Alt+Tab switches
@@ -264,6 +306,30 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   runs the fluxOS shell (`COMMAND /C cmd` runs `sh -c cmd`), so a DOS
   program's "shell out" feature works. `dos -l FILE` (or `DOSLOG=FILE`) logs
   what the emulator does not support, for diagnosing a program that fails.
+
+**OpenGL** (`libGL.a`, `<GL/gl.h>`, `<GL/fluxgl.h>`, `<GL/glu.h>`)
+- A subset of OpenGL 1.1's fixed-function pipeline: `glBegin`/`glEnd` with
+  every primitive type, the modelview, projection and texture matrix
+  stacks, per-vertex lighting (eight lights: directional, positional and
+  spot lights with attenuation, ambient, diffuse and specular terms,
+  materials and `GL_COLOR_MATERIAL`), flat and smooth shading, back-face
+  culling, the depth buffer, the scissor box, display lists, `glGet*`, and
+  `gluPerspective`, `gluLookAt` and `gluOrtho2D`.
+- Polygons are clipped against the view volume in homogeneous coordinates;
+  lines and points become thin polygons, so a backend only fills convex
+  polygons.
+- Two backends. On a 3dfx card the GL library drives the 3D engine from user
+  space, as Glide does: each context gets a 16-bit color buffer and depth
+  buffer in video memory, polygons go to the chip's triangle setup unit,
+  `glClear` is a fast fill, and the picture is read back when the frame is
+  done. Anywhere else (or with `LIBGL_ALWAYS_SOFTWARE` set) a scanline
+  rasterizer fills a 24-bit color buffer with a 30-bit depth buffer.
+- `fglCreateContext`, `fglMakeCurrent`, `fglResize` and `fglSwapBuffers`
+  play GLX's part: a context draws into its own picture, which
+  `fglSwapBuffers` copies to a pixel buffer such as a desktop window's.
+- A math library (`<math.h>`) on the x87's own instructions. Programs that
+  use GL or `<math.h>` are built with `USER_FP_CFLAGS` (see the Makefile);
+  the rest of user space stays integer-only.
 
 **Userland** (`/bin`): basename cat chmod clear cp date desktop df dirname dmesg dos echo
 env fetch fluxinstall free fsh grep halt head hexdump host ifconfig init ls lsblk
@@ -316,6 +382,13 @@ second entry, **fluxOS (text console)**, boots in VGA text mode with the
 shell on the console, as does `make run-kernel`. In QEMU the mouse works
 without grabbing, through the vmmouse interface; elsewhere click into the VM
 window to capture the mouse.
+
+For the 3dfx driver and hardware-accelerated GL, give the machine a Voodoo
+Banshee or Voodoo3 as its video card (86Box emulates both, as "3dfx Voodoo3
+3000" and so on); QEMU has no 3dfx card, so there the GL library uses its
+software renderer. fluxOS still starts in the BIOS mode: switch to the 3dfx
+driver in Display Properties, or add `video=1024x768x16@85` to the kernel
+command line in GRUB.
 
 ## Installing to a hard disk
 
@@ -408,19 +481,27 @@ kernel/
   fat32.c, iso9660.c       filesystem drivers (FAT12/16/32, ISO9660)
   tty.c, vga.c, serial.c,  console stack: terminals and ptys, text console,
   keyboard.c, timer.c      serial port, PS/2 keyboard, PIT, RTC, power control
-  fb.c, mouse.c, input.c   framebuffer, PS/2 mouse and vmmouse, /dev/input
+  fb.c, mouse.c, input.c   framebuffer and SYS_display, PS/2 mouse and vmmouse,
+                           /dev/input
+  voodoo.c                 3dfx Banshee/Voodoo3 driver: modes, EDID, 3D engine
+  fpu.c                    lazy x87 FPU context switching
   ne2000.c                 NE2000 network card driver (PCI and ISA)
   net.c                    Ethernet, ARP, IPv4, ICMP, loopback, DHCP client
   tcp.c, socket.c          TCP, and sockets (with UDP and ICMP echo)
   kmain.c                  boot sequence
 user/
-  libc/, include/          the C library and its headers
+  libc/, include/          the C library (math.c is the x87 math library) and
+                           its headers, GL/ included
+  gl/                      the OpenGL library: state and matrices (gl.c), the
+                           vertex pipeline, lighting and clipping (prim.c),
+                           display lists (list.c), GLU (glu.c), and the 3dfx
+                           (tdfx.c) and software (soft.c) backends
   fsh/                     the shell: lexer, parser, expansion, executor, editor
   desktop/                 the desktop: compositor and window manager (wm.c),
                            terminal emulator, file manager and image viewer
                            (files.c), the text editor (edit.c), the calculator
-                           (calc.c), the Setup
-                           wizard (setup.c), dialogs,
+                           (calc.c), the Setup wizard (setup.c), Display
+                           Properties (display.c), 3D Gears (gears.c), dialogs,
                            drawing, PNG decoding (png.c), icons, fonts,
                            and the web browser: its window (browser.c), HTML
                            parser (html.c), CSS (css.c), layout and painting
@@ -480,6 +561,27 @@ and its console draws there with an 8x16 font, redrawing only changed cells
 and moving pixels once per write however many lines scrolled. `fbmap` maps
 the same memory into the caller's address space with PTEs marked as device
 memory, which `fork` shares instead of copying and `exit` never frees.
+
+**The 3dfx driver** is modelled on Linux's tdfxfb. At boot it maps the
+first 4 MiB of the register BAR (uncached) and all of video memory, moves
+the tiled aperture past the end of memory so every address reads linearly,
+and saves the VGA, extension and video-processor registers of the BIOS
+mode. A mode change waits for the engines to go idle, programs the PLL for
+the timing's pixel clock (the DAC takes two pixels per clock above half
+its limit), the CRTC with the Banshee's overflow registers, the pixel
+format and the desktop stride, then points `fb` at the new screen: the
+console lays its text out again, and the process that owns the screen
+gets the new one mapped where the old one was, then reads `fbinfo` again
+and rebuilds its back buffer (`wm_reconfigure`). `DISP_MAP3D` maps the 3D
+register block at `0xB4000000` and video memory at `0xB2000000`; GL
+contexts take their buffers from the top of video memory, and fall back
+to the software renderer if a bigger screen mode grows over them.
+
+**The FPU.** CR0.TS is set whenever the process on the CPU is not the one
+whose registers the FPU holds. Its first FPU instruction raises #NM, and
+the handler saves the owner's registers into its `struct proc` with FNSAVE
+and loads the current process's with FRSTOR (or FNINIT for a first use).
+SSE is never enabled, so only the 108-byte x87 state needs saving.
 
 **The desktop** composes the screen in a back buffer. Every change records a
 damaged rectangle; once per pass through its event loop, the desktop repaints
@@ -593,7 +695,21 @@ inline-blocks, and `calc()` takes its first length. It has no font downloads,
 cookies, cache of pages, or text selection, and characters outside Latin-1
 and common punctuation show as `?`.
 
+Graphics limits: the 3dfx driver is the only one that sets modes; any other
+card keeps its BIOS mode, which can only be changed for the next start, and
+only on an installed system (GRUB asks the BIOS for it, falling back to
+1024x768). There is no hardware cursor, no 2D acceleration (the desktop
+draws in memory and copies), no 8-bit palette modes, and no interlaced or
+doublescan modes. The 3D engine renders 16-bit color with a 16-bit depth
+buffer, and the picture is read back over the bus every frame, which is
+slow for big windows. The GL library has no textures, blending, fog,
+stencil, vertex arrays, pixel operations, selection or feedback; lighting
+is per vertex with an infinite viewer and front faces only (two-sided
+lighting is accepted and ignored); polygons are assumed convex; and wide
+lines and points are plain rectangles. Only one process at a time can use
+the 3D hardware; others get the software renderer.
+
 Permission bits are cosmetic apart from the exec bit, and there is a single
 user. Signals cannot have user handlers, and jobs
-cannot be stopped (no ^Z). User programs may not use the FPU: the kernel does
-not save FPU state, so FPU instructions raise `SIGILL`.
+cannot be stopped (no ^Z). User programs may use the x87 FPU but not SSE,
+whose registers the kernel does not save: SSE instructions raise `SIGILL`.

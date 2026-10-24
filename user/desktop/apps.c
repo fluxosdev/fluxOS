@@ -443,7 +443,11 @@ static void about_fill(struct dialog *d)
     snprintf(t[AB_MEMORY], n, "%u.%uMB RAM (%u.%uMB free)",
              mi.total_kb / 1024, mi.total_kb % 1024 * 10 / 1024,
              mi.free_kb / 1024, mi.free_kb % 1024 * 10 / 1024);
-    snprintf(t[AB_DISPLAY], n, "Display: %d x %d", screen_w, screen_h);
+    struct dispinfo di;
+    if (display(DISP_INFO, &di) == 0 && di.adapter[0])
+        snprintf(t[AB_DISPLAY], n, "Display: %d x %d, %s", screen_w, screen_h, di.adapter);
+    else
+        snprintf(t[AB_DISPLAY], n, "Display: %d x %d", screen_w, screen_h);
     format_uptime(t[AB_UPTIME], n);
     snprintf(t[AB_PROCS], n, "%d processes running", count_processes());
 }

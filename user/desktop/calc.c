@@ -3,11 +3,12 @@
  * percent, square root, reciprocal and a keyboard interface.
  *
  * Numbers are exact decimals: a sign, a string of digits (a "mag") and the
- * number of those digits that follow the decimal point. Programs here may
- * not use the FPU, so everything is done on digits: addition, subtraction
- * and multiplication on the digit strings, division by long division, and
- * the square root digit by digit. Calculations keep 30 significant digits
- * and the display rounds them (half up) to 24, so 1/3 shows
+ * number of those digits that follow the decimal point. The desktop is
+ * built without the FPU (only its GL code may use it), so everything is
+ * done on digits: addition, subtraction and multiplication on the digit
+ * strings, division by long division, and the square root digit by digit.
+ * Calculations keep 30 significant digits and the display rounds them
+ * (half up) to 24, so 1/3 shows
  * 0.333333333333333333333333, 1/3*3 shows 1 and 0.1 + 0.2 is exactly 0.3.
  *
  * Keys: digits and '.', + - * / and Enter or =, % (percent), @ (square

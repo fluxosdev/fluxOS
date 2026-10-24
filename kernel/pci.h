@@ -10,10 +10,13 @@ struct pci_dev {
 
 #define PCI_COMMAND   0x04
 #define PCI_BAR0      0x10
+#define PCI_BAR1      0x14
+#define PCI_BAR2      0x18
 #define PCI_BAR4      0x20
 #define PCI_INTERRUPT 0x3C          /* low byte: the IRQ line the BIOS routed */
 
 #define PCI_CMD_IO      0x1
+#define PCI_CMD_MEM     0x2
 #define PCI_CMD_MASTER  0x4
 
 uint32_t pci_read32(const struct pci_dev *p, int off);

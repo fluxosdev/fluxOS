@@ -53,6 +53,8 @@ enum icon_id {
     ICON_STOP,
     ICON_REFRESH,
     ICON_HOMEPAGE,
+    ICON_DISPLAY,
+    ICON_GEARS,
     ICON_COUNT,
 };
 
@@ -108,6 +110,8 @@ void wm_damage_client(struct window *w, struct rect r);  /* client coordinates *
 int wm_window_count(void);
 
 void wm_input(const struct input_event *ev);
+/* The video mode changed: map the new screen and lay the desktop out for it. */
+int wm_reconfigure(void);
 void wm_splash(const char *message, color_t color);     /* full-screen notice */
 void wm_tick(void);             /* clock and timers; call a few times a second */
 unsigned int now_ms(void);
@@ -163,6 +167,11 @@ void browser_child_exited(int pid, int status);
 void browser_blink(void);
 void browser_tick(void);
 void setup_open(void);
+void display_open(void);                /* Display Properties */
+void display_tick(void);                /* once a second */
+struct window *gears_open(void);        /* 3D Gears, an OpenGL demo */
+void gears_frame(void);                 /* draw the next frame when it is due */
+int gears_timeout(void);                /* ms until the next frame, -1 if none */
 void setup_child_exited(int pid, int status);
 void system_restart(void);
 

@@ -11,6 +11,7 @@
 #define MB_INFO_MODS    (1u << 3)
 #define MB_INFO_MMAP    (1u << 6)
 #define MB_INFO_LOADER  (1u << 9)
+#define MB_INFO_VBE     (1u << 11)
 #define MB_INFO_FB      (1u << 12)
 
 struct multiboot_info {

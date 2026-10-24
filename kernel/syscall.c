@@ -963,6 +963,22 @@ static int sys_fbmap(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
     return fb_map_user();
 }
 
+static int sys_display(uint32_t op, uint32_t uarg, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    uint32_t size;
+    switch (op) {
+    case DISP_INFO: size = sizeof(struct dispinfo); break;
+    case DISP_MODES: size = DISP_MAX_MODES * sizeof(struct dispmode); break;
+    case DISP_SETMODE: size = sizeof(struct dispmode); break;
+    case DISP_MAP3D: size = sizeof(struct disp3d); break;
+    default: return -EINVAL;
+    }
+    if (user_check((void *)uarg, size) < 0)
+        return -EFAULT;
+    return fb_display((int)op, (void *)uarg);
+}
+
 static int sys_reboot(uint32_t cmd, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)b; (void)c; (void)d; (void)e;
@@ -1058,6 +1074,7 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_netinfo] = sys_netinfo,
     [SYS_netconf] = sys_netconf,
     [SYS_ftruncate] = sys_ftruncate,
+    [SYS_display] = sys_display,
 };
 
 /* Calls that walk or change the VFS tree; read and write lock per chunk. */

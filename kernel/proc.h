@@ -47,6 +47,8 @@ struct proc {
     uint32_t cpu_ticks;
     uint32_t start_tick;
     char name[32];
+    int fpu_used;               /* has FPU registers (in fpu, or in the FPU) */
+    uint8_t fpu[108] __attribute__((aligned(16)));     /* FNSAVE image */
 };
 
 extern struct proc procs[MAX_PROCS];
@@ -79,5 +81,12 @@ void proc_signal_group(int pgid, int sig);
 int signal_pending(struct proc *p);
 void proc_check_signals(void);
 int proc_grow_stack(uint32_t addr);
+
+/* Lazy FPU switching (fpu.c) */
+void fpu_init(void);
+void fpu_trap(void);
+void fpu_switch(struct proc *next);
+void fpu_fork(struct proc *child);
+void fpu_release(struct proc *p);
 
 #endif

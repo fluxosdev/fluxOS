@@ -86,6 +86,24 @@ static void icon_shutdown(void)
     disc(18, 10, 3, C_BLACK);
 }
 
+static void icon_display(void)
+{
+    monitor(C_NAVY);
+    P(9, 7, 4, 1, RGB(0x80, 0x80, 0xFF));   /* glare */
+}
+
+/* A cog: a disc with square teeth around it and a hole. */
+static void icon_gears(void)
+{
+    static const int teeth[8][2] = {
+        { 14, 1 }, { 14, 25 }, { 1, 14 }, { 25, 14 }, { 5, 5 }, { 23, 5 }, { 5, 23 }, { 23, 23 },
+    };
+    for (int i = 0; i < 8; i++)
+        P(teeth[i][0], teeth[i][1], 5, 5, C_SHADOW);
+    disc(16, 16, 11, RGB(0x90, 0x90, 0xC0));
+    disc(16, 16, 4, C_FACE);
+}
+
 static void small_window(color_t body)
 {
     frame(2, 4, 28, 24, C_BLACK);
@@ -195,6 +213,8 @@ static const char *const icon_names[ICON_COUNT] = {
     [ICON_STOP] = "process-stop",
     [ICON_REFRESH] = "view-refresh",
     [ICON_HOMEPAGE] = "go-home",
+    [ICON_DISPLAY] = "video-display",
+    [ICON_GEARS] = "applications-system",
 };
 
 static const int icon_sizes[] = { 16, 32, 48 };
@@ -242,6 +262,8 @@ static void draw_builtin(struct surface *s, int x, int y, enum icon_id id, int s
     case ICON_INFO: icon_info(); break;
     case ICON_README: icon_readme(); break;
     case ICON_WARNING: icon_warning(); break;
+    case ICON_DISPLAY: icon_display(); break;
+    case ICON_GEARS: icon_gears(); break;
     default: break;                     /* image-only icons */
     }
 }

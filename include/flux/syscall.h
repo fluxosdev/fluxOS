@@ -71,7 +71,8 @@
 #define SYS_netinfo   63
 #define SYS_netconf   64
 #define SYS_ftruncate 65
+#define SYS_display   66
 
-#define NSYSCALLS     66
+#define NSYSCALLS     67
 
 #endif

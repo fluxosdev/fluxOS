@@ -88,7 +88,11 @@ int main(void)
         }
 
         unsigned int since = now_ms() - last_blink;
-        poll(fds, (unsigned int)(n + nw), since >= BLINK_MS ? 0 : (int)(BLINK_MS - since));
+        int timeout = since >= BLINK_MS ? 0 : (int)(BLINK_MS - since);
+        int frame = gears_timeout();            /* animation wants an earlier wakeup */
+        if (frame >= 0 && frame < timeout)
+            timeout = frame;
+        poll(fds, (unsigned int)(n + nw), timeout);
 
         /* Terminals first: input handling may close their windows. */
         for (int i = 1; i < n; i++)
@@ -114,6 +118,7 @@ int main(void)
             browser_child_exited(pid, status);
         }
 
+        gears_frame();
         unsigned int now = now_ms();
         if (now - last_blink >= BLINK_MS) {
             last_blink = now;
@@ -125,6 +130,7 @@ int main(void)
             last_tick = now;
             wm_tick();
             about_tick();
+            display_tick();
             browser_tick();
         }
         wm_flush();

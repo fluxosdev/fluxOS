@@ -41,6 +41,10 @@ CFLAGS_COMMON := -m32 -march=i686 -std=gnu11 -O2 -g \
 
 KERNEL_CFLAGS := $(CFLAGS_COMMON) -fno-omit-frame-pointer -Iinclude -Ikernel/include -Ikernel
 USER_CFLAGS   := $(CFLAGS_COMMON) -Iinclude -Iuser/include
+# User code that may use the x87 FPU (the kernel switches its state lazily):
+# the math library, the GL library and GL programs. No SSE: it is not enabled.
+USER_FP_CFLAGS := $(filter-out -mgeneral-regs-only,$(USER_CFLAGS)) -mfpmath=387 -mno-sse \
+	-fno-math-errno
 
 LDFLAGS_COMMON := -m elf_i386 -nostdlib -z noexecstack --no-warn-rwx-segments
 
@@ -53,6 +57,9 @@ LIBC_SRCS := $(wildcard user/libc/*.c) lib/string.c lib/vsnprintf.c lib/font8x16
 LIBC_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(LIBC_SRCS)))
 CRT0      := $(BUILD)/u/user/libc/crt0.o
 LIBC      := $(BUILD)/libc.a
+GL_OBJS   := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/gl/*.c)))
+LIBGL     := $(BUILD)/libGL.a
+FP_OBJS   := $(BUILD)/u/user/libc/math.o $(GL_OBJS) $(BUILD)/u/user/desktop/gears.o
 
 PROGS     := $(basename $(notdir $(wildcard user/bin/*.c)))
 FSH_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/fsh/*.c)))
@@ -100,7 +107,13 @@ $(BUILD)/u/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
+$(FP_OBJS): USER_CFLAGS := $(USER_FP_CFLAGS)
+
 $(LIBC): $(LIBC_OBJS)
+	@rm -f $@
+	$(AR) rcs $@ $^
+
+$(LIBGL): $(GL_OBJS)
 	@rm -f $@
 	$(AR) rcs $@ $^
 
@@ -108,9 +121,9 @@ $(ROOTFS)/bin/fsh: $(CRT0) $(FSH_OBJS) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(FSH_OBJS) $(LIBC)
 
-$(ROOTFS)/bin/desktop: $(CRT0) $(DESKTOP_OBJS) $(LIBC) user/user.ld
+$(ROOTFS)/bin/desktop: $(CRT0) $(DESKTOP_OBJS) $(LIBGL) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
-	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(DESKTOP_OBJS) $(LIBC)
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(DESKTOP_OBJS) $(LIBGL) $(LIBC)
 
 $(ROOTFS)/bin/dos: $(CRT0) $(DOS_OBJS) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)

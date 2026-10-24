@@ -3,6 +3,10 @@
  * The kernel console draws on it until a user process (the desktop)
  * claims it with SYS_fbmap; the console takes the screen back when that
  * process exits.
+ *
+ * A display driver (voodoo.c) may later switch to a mode of its own and
+ * point fb at it; fb_boot keeps the boot loader's mode. SYS_display
+ * reports the adapter and sets modes through that driver.
  */
 #include "kernel.h"
 #include "drivers.h"
@@ -11,10 +15,61 @@
 #include "proc.h"
 
 struct framebuffer fb;
+struct framebuffer fb_boot;
 static int fb_owner;                    /* pid with the screen mapped, or 0 */
+
+/* What the VESA BIOS says about the adapter, for the standard driver. */
+static char vesa_name[48];
+static uint32_t vesa_vram_kb;
+
+struct vbe_info {
+    char sig[4];                        /* "VESA" */
+    uint16_t version;
+    uint32_t oem;                       /* real-mode far pointers (segment:offset) */
+    uint32_t caps;
+    uint32_t modes;
+    uint16_t memory;                    /* 64 KiB blocks */
+    uint16_t oem_rev;
+    uint32_t vendor, product, product_rev;      /* VBE 2.0 */
+} __attribute__((packed));
+
+/* Append the BIOS string at a real-mode far pointer to out. */
+static void append_bios_string(char *out, size_t size, uint32_t farptr)
+{
+    uint32_t lin = (farptr >> 16) * 16 + (farptr & 0xFFFF);
+    if (!farptr || lin >= 0x100000)
+        return;
+    const char *s = (const char *)lin;
+    size_t n = strlen(out);
+    if (n && n + 1 < size)
+        out[n++] = ' ';
+    for (size_t i = 0; n + 1 < size && s[i] >= 32 && s[i] < 127; i++)
+        out[n++] = s[i];
+    while (n > 0 && out[n - 1] == ' ')
+        n--;
+    out[n] = 0;
+}
+
+/* Paging is still off, so the BIOS data GRUB found can be read where it is. */
+static void read_vbe_info(struct multiboot_info *mbi)
+{
+    if (!(mbi->flags & MB_INFO_VBE) || !mbi->vbe_control_info)
+        return;
+    const struct vbe_info *vi = (const struct vbe_info *)mbi->vbe_control_info;
+    if (memcmp(vi->sig, "VESA", 4) != 0)
+        return;
+    vesa_vram_kb = (uint32_t)vi->memory * 64;
+    if (vi->version >= 0x200) {
+        append_bios_string(vesa_name, sizeof(vesa_name), vi->vendor);
+        append_bios_string(vesa_name, sizeof(vesa_name), vi->product);
+    }
+    if (!vesa_name[0])
+        append_bios_string(vesa_name, sizeof(vesa_name), vi->oem);
+}
 
 int fb_init(struct multiboot_info *mbi)
 {
+    read_vbe_info(mbi);
     if (!(mbi->flags & MB_INFO_FB) || mbi->fb_type != MB_FB_TYPE_RGB)
         return 0;
     if (mbi->fb_addr >> 32 || mbi->fb_width < 640 || mbi->fb_height < 400)
@@ -46,9 +101,23 @@ void fb_map(void)
 {
     if (!fb.base)
         return;
-    fb.base = vmm_map_mmio(fb.phys, fb.size);
+    fb.base = vmm_map_mmio(fb.phys, fb.size, 0);
     if (!fb.base)
         panic("cannot map the framebuffer at %08x", fb.phys);
+    fb_boot = fb;
+}
+
+/*
+ * The driver switched modes and updated fb. The process that has the
+ * screen gets the new one mapped in place of the old (it must read
+ * fbinfo again), and the console lays itself out for the new size.
+ */
+void fb_mode_changed(void)
+{
+    struct proc *p = fb_owner ? proc_find(fb_owner) : NULL;
+    if (p && p->state != P_ZOMBIE)
+        vmm_map_phys(p->pd, USER_MMIO_BASE, fb.phys, fb.size, 0);
+    vga_reset_fb();
 }
 
 uint32_t fb_pack(uint32_t rgb)
@@ -140,7 +209,7 @@ int fb_map_user(void)
         if (p && p->state != P_ZOMBIE)
             return -EBUSY;
     }
-    int r = vmm_map_phys(current->pd, USER_MMIO_BASE, fb.phys, fb.size);
+    int r = vmm_map_phys(current->pd, USER_MMIO_BASE, fb.phys, fb.size, 0);
     if (r < 0)
         return r;
     if (!fb_owner)
@@ -152,9 +221,63 @@ int fb_map_user(void)
 /* Called for every exiting process; the console comes back with the screen. */
 void fb_proc_exit(int pid)
 {
+    voodoo_proc_exit(pid);
     if (!fb_owner || pid != fb_owner)
         return;
     fb_owner = 0;
     klog("fb: screen returned to the console\n");
     vga_redraw();
+}
+
+/* ---- SYS_display ---- */
+
+static void boot_mode(struct dispmode *m)
+{
+    if (!fb_boot.base)
+        return;
+    m->width = (uint16_t)fb_boot.width;
+    m->height = (uint16_t)fb_boot.height;
+    m->bpp = (uint16_t)fb_boot.bpp;
+}
+
+int fb_display(int op, void *arg)
+{
+    switch (op) {
+    case DISP_INFO: {
+        struct dispinfo *di = arg;
+        memset(di, 0, sizeof(*di));
+        if (voodoo_present()) {
+            voodoo_info(di);
+            di->screen_bytes = (uint32_t)voodoo_screen_bytes();
+        } else {
+            strlcpy(di->adapter, vesa_name[0] ? vesa_name : "Standard VGA", sizeof(di->adapter));
+            strlcpy(di->driver, fb_boot.base ? "vesa" : "vga", sizeof(di->driver));
+            di->flags = DISPF_BOOT;
+            di->vram_kb = vesa_vram_kb;
+            boot_mode(&di->boot);
+            di->mode = di->boot;
+            di->screen_bytes = fb.base ? fb.pitch * fb.height : 0;
+        }
+        return 0;
+    }
+    case DISP_MODES:
+        return voodoo_present() ? voodoo_modes(arg, DISP_MAX_MODES) : 0;
+    case DISP_SETMODE: {
+        if (!voodoo_present())
+            return -ENODEV;
+        /* Only the process that has the screen, or anyone while the console does. */
+        if (fb_owner && fb_owner != current->pid) {
+            struct proc *p = proc_find(fb_owner);
+            if (p && p->state != P_ZOMBIE)
+                return -EBUSY;
+        }
+        struct dispmode m = *(const struct dispmode *)arg;
+        return voodoo_set_mode(&m);
+    }
+    case DISP_MAP3D:
+        if (!voodoo_present())
+            return -ENODEV;
+        return voodoo_map3d(arg);
+    }
+    return -EINVAL;
 }
