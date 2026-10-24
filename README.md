@@ -417,12 +417,34 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   second; drag or use the arrow keys to turn the view, Space pauses, Home
   resets it, and S switches between the 3D hardware and the software
   renderer.
+- Task Manager (Start menu): a resizable window with three pages.
+  *Applications* lists the desktop's windows, with End Task, Switch To and
+  New Task. *Processes* lists every process with its status, CPU share,
+  CPU time and memory; click a heading to sort by it, and End Process
+  (also the Delete key) kills the selected one. *Performance* shows CPU
+  and memory gauges with a two minute history graph and the kernel's
+  memory figures. It updates once a second.
+- Disk Manager (Start menu): the volumes (partitions, CD-ROMs, floppies)
+  in a list with file system, size and free space, and every disk drawn as
+  a bar of its partitions, as wide as they are big, with the unallocated
+  space between them and a strip showing how full each mounted volume is.
+  Explore opens a volume in the file manager, Mount and Unmount do what
+  mount(8) and umount(8) do (on `/mnt/<name>`), Format writes a new FAT
+  file system with `mkfs.fat` in a terminal window after asking for a
+  label, Rescan re-reads a disk's partition table, and the window follows
+  disks and mounts coming and going by itself. Partitions are edited in the
+  disk's MBR (four primary partitions): select unallocated space and New
+  makes a FAT32 partition aligned to 1 MiB (on a blank disk it writes a
+  new partition table first) and offers to format it; Delete removes a
+  partition and Set Active moves the boot flag. Changes that move
+  partitions need every volume on that disk unmounted first.
 - Sound: a speaker in the taskbar's tray (crossed out when muted) opens
   **Volume Control**, a column for each mixer output with a vertical
   slider and a Mute box. The desktop plays a startup sound, terminals beep
   on ^G, and double-clicking a `.wav` or `.voc` file plays it.
 - Start menu: Terminal, File Manager, Text Editor, Web Browser, Calculator,
-  3D Gears, Read Me, System Properties (version, memory, display, uptime),
+  3D Gears, Read Me, Task Manager, Disk Manager, System Properties (version,
+  memory, display, uptime),
   Display Properties, Run... (runs a command in a new window), Install
   fluxOS..., and Shut Down... (power off, restart, or close the desktop and
   return to the text console).
@@ -733,7 +755,8 @@ user/
                            terminal emulator, file manager and image viewer
                            (files.c), the text editor (edit.c), the calculator
                            (calc.c), the Setup wizard (setup.c), Display
-                           Properties (display.c), 3D Gears (gears.c), the
+                           Properties (display.c), 3D Gears (gears.c), Task
+                           Manager (taskmgr.c), Disk Manager (diskmgr.c), the
                            tray speaker and Volume Control (sound.c), dialogs,
                            drawing, PNG and JPEG decoding (png.c, jpeg.c, with
                            image.c choosing between them), the wallpaper

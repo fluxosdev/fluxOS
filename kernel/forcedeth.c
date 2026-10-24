@@ -54,6 +54,7 @@
 #define R_TXRXCTL     0x144
 #define R_TXRINGHI    0x148
 #define R_RXRINGHI    0x14C
+#define R_TXPAUSE     0x170
 #define R_MIISTATUS   0x180
 #define R_MIIMASK     0x184
 #define R_ADAPTCTL    0x188
@@ -101,7 +102,9 @@
 #define LINKSPEED_10     1000
 #define LINKSPEED_100    100
 #define TXWM_DESC1       0x0200010
-#define TXWM_DESC23      0x1E08000
+#define TXWM_DESC23      0x0E08000      /* 10/100; 0x1E08000 is for gigabit */
+#define TXPAUSE_OFF      0x0FFF0080
+#define MISC1_PAUSE_TX   0x01
 #define TXRXCTL_KICK     0x0001
 #define TXRXCTL_BIT1     0x0002
 #define TXRXCTL_BIT2     0x0004
@@ -160,6 +163,7 @@
 #define C_MACOK   0x2                   /* the MAC address registers are in order */
 #define C_PHYFIX  0x4                   /* RTL8201 PHYs need the init fix */
 #define C_TIMER   0x8                   /* the timer interrupt is needed */
+#define C_PAUSE   0x10                  /* can send pause frames (MCP55 on) */
 
 static const struct {
     uint16_t id;
@@ -173,30 +177,30 @@ static const struct {
     { 0x0056, 3, 0, "CK804" }, { 0x0057, 3, 0, "CK804" },
     { 0x0037, 3, 0, "MCP04" }, { 0x0038, 3, 0, "MCP04" },
     { 0x0268, 3, C_POWER, "MCP51" }, { 0x0269, 3, C_POWER, "MCP51" },
-    { 0x0372, 3, C_POWER, "MCP55" }, { 0x0373, 3, C_POWER, "MCP55" },
-    { 0x03E5, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP61" }, { 0x03E6, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP61" },
-    { 0x03EE, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP61" }, { 0x03EF, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP61" },
-    { 0x0450, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP65" },
-    { 0x0451, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP65" },
-    { 0x0452, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP65" },
-    { 0x0453, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP65" },
-    { 0x054C, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP67" },
-    { 0x054D, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP67" },
-    { 0x054E, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP67" },
-    { 0x054F, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP67" },
-    { 0x07DC, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP73" },
-    { 0x07DD, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP73" },
-    { 0x07DE, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP73" },
-    { 0x07DF, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP73" },
-    { 0x0760, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP77" },
-    { 0x0761, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP77" },
-    { 0x0762, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP77" },
-    { 0x0763, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP77" },
-    { 0x0AB0, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP79" },
-    { 0x0AB1, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP79" },
-    { 0x0AB2, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP79" },
-    { 0x0AB3, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP79" },
-    { 0x0D7D, 3, C_POWER | C_PHYFIX | C_MACOK, "MCP89" },
+    { 0x0372, 3, C_POWER | C_PAUSE, "MCP55" }, { 0x0373, 3, C_POWER | C_PAUSE, "MCP55" },
+    { 0x03E5, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP61" }, { 0x03E6, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP61" },
+    { 0x03EE, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP61" }, { 0x03EF, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP61" },
+    { 0x0450, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP65" },
+    { 0x0451, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP65" },
+    { 0x0452, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP65" },
+    { 0x0453, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP65" },
+    { 0x054C, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP67" },
+    { 0x054D, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP67" },
+    { 0x054E, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP67" },
+    { 0x054F, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP67" },
+    { 0x07DC, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP73" },
+    { 0x07DD, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP73" },
+    { 0x07DE, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP73" },
+    { 0x07DF, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP73" },
+    { 0x0760, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP77" },
+    { 0x0761, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP77" },
+    { 0x0762, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP77" },
+    { 0x0763, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP77" },
+    { 0x0AB0, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP79" },
+    { 0x0AB1, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP79" },
+    { 0x0AB2, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP79" },
+    { 0x0AB3, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP79" },
+    { 0x0D7D, 3, C_POWER | C_PAUSE | C_PHYFIX | C_MACOK, "MCP89" },
 };
 
 struct desc1 {
@@ -653,15 +657,15 @@ int forcedeth_init(void)
 {
     if (cmdline_has("forcedeth=off"))
         return -1;
+    /* By ID first: from CK804 on, the controller calls itself a bridge
+     * (class 0x0680), not an Ethernet controller. */
     struct pci_dev pci;
     uint8_t prog_if;
     int found = 0;
-    for (int i = 0; pci_find_class_nth(0x0200, i, &pci, &prog_if) == 0; i++) {
-        if ((pci_read32(&pci, 0) & 0xFFFF) == 0x10DE) {
-            found = 1;
-            break;
-        }
-    }
+    for (uint32_t i = 0; i < ARRAY_SIZE(chips) && !found; i++)
+        found = pci_find_device(0x10DE, chips[i].id, &pci) == 0;
+    for (int i = 0; !found && pci_find_class_nth(0x0200, i, &pci, &prog_if) == 0; i++)
+        found = (pci_read32(&pci, 0) & 0xFFFF) == 0x10DE;
     if (!found)
         return -1;
 
@@ -699,6 +703,16 @@ int forcedeth_init(void)
     wr(R_IRQMASK, 0);
     read_mac(fd.dev.mac);
     write_mac(fd.dev.mac);
+
+    /* Pause frames left on while the MAC sat idle (by the BIOS, or another
+     * OS before a warm reboot) can freeze it: off, then a transmitter start
+     * and stop recovers it, as Linux does. We never turn them on. */
+    if (fd.flags & C_PAUSE) {
+        wr(R_TXPAUSE, TXPAUSE_OFF);
+        wr(R_MISC1, rd(R_MISC1) & ~MISC1_PAUSE_TX);
+        start_tx();
+        stop_tx();
+    }
 
     /* Quiet the PHY polling while we look for the PHY. */
     wr(R_MIIMASK, 0);

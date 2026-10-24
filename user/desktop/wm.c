@@ -102,6 +102,16 @@ static void open_gears(void)
     gears_open();
 }
 
+static void open_taskmgr(void)
+{
+    taskmgr_open();
+}
+
+static void open_diskmgr(void)
+{
+    diskmgr_open();
+}
+
 static void open_home(void)
 {
     const char *home = getenv("HOME");
@@ -147,6 +157,8 @@ static struct menu_item menu_items[] = {
     { ICON_CALC, "Calculator", open_calculator },
     { ICON_GEARS, "3D Gears", open_gears },
     { ICON_README, "Read Me", open_readme },
+    { ICON_TASKMGR, "Task Manager", open_taskmgr },
+    { ICON_DRIVE, "Disk Manager", open_diskmgr },
     { ICON_COMPUTER, "System Properties", about_open },
     { ICON_DISPLAY, "Display Properties", display_open },
     { ICON_RUN, "Run...", run_open },
@@ -833,6 +845,19 @@ static void close_window(struct window *w)
         w->ops->close(w);
     else
         wm_destroy(w);
+}
+
+struct window *wm_nth(int i)
+{
+    struct window *w = bottom;
+    while (w && i-- > 0)
+        w = w->above;
+    return w;
+}
+
+void wm_close(struct window *w)
+{
+    close_window(w);
 }
 
 /* ---- the Start menu ---- */

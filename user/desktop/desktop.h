@@ -58,6 +58,7 @@ enum icon_id {
     ICON_VOLUME,
     ICON_MUTED,
     ICON_SOUND,
+    ICON_TASKMGR,
     ICON_COUNT,
 };
 
@@ -111,6 +112,8 @@ void wm_set_title(struct window *w, const char *title);
 void wm_set_min_size(struct window *w, int client_w, int client_h);
 void wm_damage_client(struct window *w, struct rect r);  /* client coordinates */
 int wm_window_count(void);
+struct window *wm_nth(int i);           /* the i-th window from the bottom of the stack, or NULL */
+void wm_close(struct window *w);        /* as the close button does */
 
 void wm_input(const struct input_event *ev);
 /* The video mode changed: map the new screen and lay the desktop out for it. */
@@ -207,6 +210,10 @@ void sound_beep(void);                  /* the terminal bell */
 enum icon_id sound_tray_icon(void);     /* ICON_NONE without a mixer */
 void volume_open(void);                 /* Volume Control */
 void display_tick(void);                /* once a second */
+struct window *taskmgr_open(void);      /* Task Manager: applications, processes, performance */
+void taskmgr_tick(void);                /* once a second: sample the system */
+struct window *diskmgr_open(void);      /* Disk Manager: disks, partitions, mounting, formatting */
+void diskmgr_tick(void);                /* once a second: follow disks and mounts changing */
 struct window *gears_open(void);        /* 3D Gears, an OpenGL demo */
 void gears_frame(void);                 /* draw the next frame when it is due */
 int gears_timeout(void);                /* ms until the next frame, -1 if none */

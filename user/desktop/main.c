@@ -140,6 +140,8 @@ int main(void)
             display_tick();
             sound_tick();
             files_tick();
+            taskmgr_tick();
+            diskmgr_tick();
             browser_tick();
         }
         wm_flush();

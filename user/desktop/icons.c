@@ -104,6 +104,17 @@ static void icon_gears(void)
     disc(16, 16, 4, C_FACE);
 }
 
+/* A window holding a green trace on black, like a system monitor. */
+static void icon_taskmgr(void)
+{
+    box(2, 4, 28, 24, C_FACE);
+    P(4, 6, 24, 4, C_NAVY);
+    P(4, 12, 24, 14, C_BLACK);
+    static const int h[8] = { 3, 5, 4, 8, 6, 10, 7, 11 };
+    for (int i = 0; i < 8; i++)
+        P(5 + i * 3, 25 - h[i], 2, h[i], GREEN);
+}
+
 static void small_window(color_t body)
 {
     frame(2, 4, 28, 24, C_BLACK);
@@ -267,6 +278,7 @@ static void draw_builtin(struct surface *s, int x, int y, enum icon_id id, int s
     case ICON_WARNING: icon_warning(); break;
     case ICON_DISPLAY: icon_display(); break;
     case ICON_GEARS: icon_gears(); break;
+    case ICON_TASKMGR: icon_taskmgr(); break;
     default: break;                     /* image-only icons */
     }
 }
