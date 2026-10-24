@@ -157,6 +157,8 @@ void draw_text_field(struct surface *s, struct rect r, const char *text, int cur
 
 /* ---- apps ---- */
 struct window *terminal_open(const char *title, const char *const *argv, int hold, int motd);
+/* The same, with the program started in dir rather than the home folder. */
+struct window *terminal_open_in(const char *dir, const char *title, const char *const *argv, int hold);
 int terminal_poll_fds(struct pollfd *fds, struct window **owners, int max);
 void terminal_ready(struct window *w, int revents);
 void terminal_child_exited(int pid);

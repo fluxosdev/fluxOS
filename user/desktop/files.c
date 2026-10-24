@@ -659,9 +659,11 @@ static void open_entry(struct fm *f, int i)
         const char *argv[] = { "/bin/play", path, NULL };
         terminal_open(e->name, argv, 0, 0);
     } else if (e->icon == ICON_RUN) {
-        /* DOS programs go through the emulator even without execute permission. */
+        /* DOS programs go through the emulator even without execute permission.
+         * Programs start in their own folder, as on Windows: a DOS game's
+         * setup program runs the game by a name relative to it. */
         const char *dos_argv[] = { "/bin/dos", path, NULL }, *argv[] = { path, NULL };
-        terminal_open(e->name, is_dos_program(path) ? dos_argv : argv, 1, 0);
+        terminal_open_in(f->path, e->name, is_dos_program(path) ? dos_argv : argv, 1);
     } else if (is_text_name(e->name)) {
         editor_open(path);
     } else {

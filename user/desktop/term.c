@@ -461,7 +461,7 @@ static void show_motd(void)
     close(fd);
 }
 
-static int spawn(struct term *t, int slave, const char *const *argv, int motd)
+static int spawn(struct term *t, int slave, const char *const *argv, int motd, const char *dir)
 {
     int pid = fork();
     if (pid < 0)
@@ -478,7 +478,8 @@ static int spawn(struct term *t, int slave, const char *const *argv, int motd)
         signal(SIGTERM, SIG_DFL);
         signal(SIGHUP, SIG_DFL);
         const char *home = getenv("HOME");
-        chdir(home ? home : "/");
+        if (!dir || chdir(dir) < 0)
+            chdir(home ? home : "/");
         if (motd)
             show_motd();
         if (argv) {
@@ -495,7 +496,8 @@ static int spawn(struct term *t, int slave, const char *const *argv, int motd)
     return 0;
 }
 
-struct window *terminal_open(const char *title, const char *const *argv, int hold, int motd)
+static struct window *open_term(const char *title, const char *const *argv, int hold, int motd,
+                                const char *dir)
 {
     struct term *t = calloc(1, sizeof(*t));
     if (!t)
@@ -529,11 +531,21 @@ struct window *terminal_open(const char *title, const char *const *argv, int hol
     gfx_bevel(&w->content, mkrect(0, 0, w->content.w, w->content.h), BEVEL_SUNKEN);
     render(t);
 
-    int r = spawn(t, fds[1], argv, motd);
+    int r = spawn(t, fds[1], argv, motd, dir);
     close(fds[1]);
     if (r < 0)
         finish(t);
     return w;
+}
+
+struct window *terminal_open(const char *title, const char *const *argv, int hold, int motd)
+{
+    return open_term(title, argv, hold, motd, NULL);
+}
+
+struct window *terminal_open_in(const char *dir, const char *title, const char *const *argv, int hold)
+{
+    return open_term(title, argv, hold, 0, dir);
 }
 
 /* ---- the event loop's view ---- */
