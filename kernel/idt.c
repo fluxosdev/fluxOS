@@ -165,6 +165,7 @@ static void handle_irq(struct trapframe *tf)
         }
     }
 
+    random_add((uint32_t)irq);
     if (irq_handlers[irq])
         irq_handlers[irq](tf);
 

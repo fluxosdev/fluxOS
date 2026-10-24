@@ -5,8 +5,10 @@
  * Pages are fetched by running /bin/wget in a child process that writes
  * the server's response (headers included) into a pipe, so the desktop
  * keeps running while a page loads. After the page itself come its style
- * sheets and images, one at a time. file:// URLs are read directly, and
- * there is no HTTPS: such links get a page explaining why.
+ * sheets and images, one at a time. file:// URLs are read directly.
+ * https:// goes through wget's TLS 1.3 client, which encrypts the
+ * connection but does not verify the server's certificate; the status bar
+ * says so.
  *
  * Keys: Alt+Left/Backspace back, Alt+Right forward, F5 reload, Esc stop,
  * Ctrl+L or F6 the address bar, arrows/PgUp/PgDn/Space/Home/End scroll,
@@ -687,7 +689,7 @@ static int parse_response(const struct fetch *f, struct response *r)
 
 static void queue_resource(struct browser *b, int kind, const char *url, int slot, int redirects)
 {
-    if (b->nqueue == MAX_RES || (!url_is_http(url) && !url_is_file(url)))
+    if (b->nqueue == MAX_RES || (!url_is_http(url) && !url_is_https(url) && !url_is_file(url)))
         return;
     for (int i = b->qhead; i < b->nqueue; i++)
         if (b->queue[i].kind == kind && kind == F_IMG && !strcmp(b->queue[i].url, url))
@@ -978,23 +980,6 @@ static void escape(const char *s, char *out, int size)
     out[o] = 0;
 }
 
-static void show_https(struct browser *b, const char *url, const char *from)
-{
-    char eurl[URL_MAX * 2], plain[URL_MAX], eplain[URL_MAX * 2], body[URL_MAX * 6];
-    escape(url, eurl, sizeof(eurl));
-    snprintf(plain, sizeof(plain), "http://%s", url + 8);
-    escape(plain, eplain, sizeof(eplain));
-    snprintf(body, sizeof(body),
-             "<p>%s<code>%s</code> is a secure (HTTPS) address. This browser speaks plain HTTP "
-             "only: it has no TLS, so it cannot load encrypted pages.</p>"
-             "<p>Some sites still answer over plain HTTP: try <a href=\"%s\">%s</a>.</p>"
-             "<p>Sites made for old computers work well, such as "
-             "<a href=\"http://wiby.me/\">wiby.me</a> (search) and "
-             "<a href=\"http://68k.news/\">68k.news</a> (news).</p>",
-             from ? "The page you asked for moved to " : "", eurl, eplain, eplain);
-    show_message(b, url, "Secure page not supported", body);
-}
-
 static void page_failed(struct browser *b, const char *url, const char *why)
 {
     char eurl[URL_MAX * 2], ewhy[1024], body[URL_MAX * 3];
@@ -1043,6 +1028,15 @@ static void image_done(struct browser *b, const char *url, const char *data, int
         }
 }
 
+/* The status bar once a page is in: a secure page says what that means here. */
+static void done_status(struct browser *b)
+{
+    if (url_is_https(b->url))
+        set_status(b, "Done - encrypted (TLS 1.3), but the site's certificate is not verified");
+    else
+        set_status(b, "Done");
+}
+
 static void fetch_complete(struct browser *b)
 {
     struct fetch *f = &b->fetch;
@@ -1085,9 +1079,7 @@ static void fetch_complete(struct browser *b)
         } else if (r.status >= 300 && r.status < 400 && r.location[0]) {
             char next[URL_MAX];
             url_resolve(done.url, r.location, next, sizeof(next));
-            if (url_is_https(next))
-                show_https(b, next, done.url);
-            else if (done.redirects >= 10)
+            if (done.redirects >= 10)
                 page_failed(b, done.url, "Too many redirects");
             else {
                 if (!url_fragment(next) && url_fragment(done.url)) {
@@ -1148,7 +1140,7 @@ static void fetch_complete(struct browser *b)
         }
         mark_visited(done.url);
         if (!b->total_res)
-            set_status(b, "Done");
+            done_status(b);
     } else {
         b->done_res++;
         if (ok && r.status >= 300 && r.status < 400 && r.location[0] && done.redirects < 5) {
@@ -1198,7 +1190,7 @@ static void start_next(struct browser *b)
     if (b->need_style || b->need_layout)
         relayout(b);
     if (b->total_res)
-        set_status(b, "Done");
+        done_status(b);
     paint(b);
 }
 
@@ -1254,11 +1246,9 @@ static void navigate(struct browser *b, const char *url, const char *post, int m
             return;
         }
         page_failed(b, u, "There is no such about: page");
-    } else if (url_is_https(u)) {
-        show_https(b, u, NULL);
-    } else if (!url_is_http(u) && !url_is_file(u)) {
+    } else if (!url_is_http(u) && !url_is_https(u) && !url_is_file(u)) {
         char msg[256];
-        snprintf(msg, sizeof(msg), "Only http:// and file:// addresses can be opened");
+        snprintf(msg, sizeof(msg), "Only http://, https:// and file:// addresses can be opened");
         page_failed(b, u, msg);
     } else {
         b->loading = 1;
@@ -1271,7 +1261,7 @@ static void navigate(struct browser *b, const char *url, const char *post, int m
         if (b->loading || b->fetch.active)
             return;
     }
-    set_status(b, "Done");
+    done_status(b);
     paint(b);
 }
 

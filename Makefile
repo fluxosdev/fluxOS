@@ -49,11 +49,12 @@ USER_FP_CFLAGS := $(filter-out -mgeneral-regs-only,$(USER_CFLAGS)) -mfpmath=387 
 LDFLAGS_COMMON := -m elf_i386 -nostdlib -z noexecstack --no-warn-rwx-segments
 
 # ---- kernel ----
-KERNEL_SRCS := kernel/boot.S kernel/entry.S $(wildcard kernel/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c
+KERNEL_SRCS := kernel/boot.S kernel/entry.S $(wildcard kernel/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c \
+               lib/sha256.c
 KERNEL_OBJS := $(patsubst %,$(BUILD)/k/%.o,$(basename $(KERNEL_SRCS)))
 
 # ---- user space ----
-LIBC_SRCS := $(wildcard user/libc/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c
+LIBC_SRCS := $(wildcard user/libc/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c lib/sha256.c
 LIBC_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(LIBC_SRCS)))
 CRT0      := $(BUILD)/u/user/libc/crt0.o
 LIBC      := $(BUILD)/libc.a

@@ -1045,16 +1045,8 @@ static int dev_zero_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
 
 static int dev_random_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
 {
-    static uint32_t state = 0x2545F491;
     (void)vn; (void)off;
-    state ^= ticks * 2654435761u;
-    uint8_t *p = buf;
-    for (uint32_t i = 0; i < n; i++) {
-        state ^= state << 13;
-        state ^= state >> 17;
-        state ^= state << 5;
-        p[i] = (uint8_t)state;
-    }
+    random_bytes(buf, n);
     return (int)n;
 }
 

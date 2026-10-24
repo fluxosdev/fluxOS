@@ -1,5 +1,5 @@
 /*
- * wget - download a file over HTTP.
+ * wget - download a file over HTTP or HTTPS.
  *
  *   wget [-q] [-O FILE] [-T SECONDS] [--save-headers] [--content-on-error]
  *        [--max-redirect=N] [--post-data=STRING] URL
@@ -17,8 +17,10 @@
  *
  * Requests are HTTP/1.0 with "Connection: close", so the body ends when
  * the server closes the connection; a chunked body is decoded anyway.
- * There is no HTTPS. Exit status, as in GNU wget: 0 success, 1 generic
- * error, 2 usage, 3 file error, 4 network failure, 8 server error.
+ * HTTPS uses libc's TLS 1.3 client (<tls.h>): the connection is encrypted,
+ * but the server's certificate is not verified. Exit status, as in GNU
+ * wget: 0 success, 1 generic error, 2 usage, 3 file error, 4 network
+ * failure, 8 server error.
  */
 #include <arpa/inet.h>
 #include <errno.h>
@@ -30,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <tls.h>
 #include <unistd.h>
 
 #define MAX_HEADER  (64 * 1024)
@@ -38,6 +41,7 @@
 enum { EXIT_GENERIC = 1, EXIT_USAGE = 2, EXIT_FILE = 3, EXIT_NETWORK = 4, EXIT_SERVER = 8 };
 
 struct url {
+    int https;
     char host[256];
     int port;
     char path[2048];
@@ -46,6 +50,7 @@ struct url {
 static int quiet, save_headers, content_on_error, max_redirect = 20, timeout_ms = 60000;
 static const char *post_data;
 static int sock = -1;
+static struct tls *tls;
 static char rbuf[16384];
 static int rpos, rlen;
 
@@ -75,9 +80,10 @@ static void fail(int code, const char *fmt, ...)
 
 static int parse_url(const char *s, struct url *u)
 {
-    if (!strncasecmp(s, "https://", 8))
-        fail(EXIT_GENERIC, "%s: HTTPS is not supported, only http://", s);
-    if (!strncasecmp(s, "http://", 7))
+    u->https = !strncasecmp(s, "https://", 8);
+    if (u->https)
+        s += 8;
+    else if (!strncasecmp(s, "http://", 7))
         s += 7;
     else if (strstr(s, "://"))
         return -1;
@@ -87,7 +93,7 @@ static int parse_url(const char *s, struct url *u)
     memcpy(u->host, s, hl);
     u->host[hl] = 0;
     s += hl;
-    u->port = 80;
+    u->port = u->https ? 443 : 80;
     if (*s == ':') {
         u->port = atoi(s + 1);
         if (u->port <= 0 || u->port > 65535)
@@ -107,12 +113,13 @@ static int parse_url(const char *s, struct url *u)
 /* Resolve a Location header against the URL it came from. */
 static void resolve_location(const struct url *base, const char *loc, char *out, size_t size)
 {
+    const char *scheme = base->https ? "https" : "http";
     if (strstr(loc, "://"))
         snprintf(out, size, "%s", loc);
     else if (loc[0] == '/' && loc[1] == '/')
-        snprintf(out, size, "http:%s", loc);
+        snprintf(out, size, "%s:%s", scheme, loc);
     else if (loc[0] == '/')
-        snprintf(out, size, "http://%s:%d%s", base->host, base->port, loc);
+        snprintf(out, size, "%s://%s:%d%s", scheme, base->host, base->port, loc);
     else {
         char dir[2048];
         snprintf(dir, sizeof(dir), "%s", base->path);
@@ -122,7 +129,7 @@ static void resolve_location(const struct url *base, const char *loc, char *out,
         char *slash = strrchr(dir, '/');
         if (slash)
             slash[1] = 0;
-        snprintf(out, size, "http://%s:%d%s%s", base->host, base->port, dir, loc);
+        snprintf(out, size, "%s://%s:%d%s%s", scheme, base->host, base->port, dir, loc);
     }
 }
 
@@ -130,6 +137,14 @@ static void resolve_location(const struct url *base, const char *loc, char *out,
 
 static int fill(void)
 {
+    if (tls) {
+        int r = tls_read(tls, rbuf, sizeof(rbuf));
+        if (r < 0)
+            fail(EXIT_NETWORK, "TLS: %s", tls_error(tls));
+        rpos = 0;
+        rlen = r;
+        return r;
+    }
     struct pollfd pfd = { sock, POLLIN, 0 };
     int r = poll(&pfd, 1, timeout_ms);
     if (r == 0)
@@ -183,10 +198,33 @@ static void connect_to(const struct url *u)
     }
     say("connected.\n");
     rpos = rlen = 0;
+    if (u->https) {
+        char err[256];
+        say("Negotiating TLS with %s... ", u->host);
+        tls = tls_connect(sock, u->host, timeout_ms, err, sizeof(err));
+        if (!tls) {
+            say("failed.\n");
+            fail(EXIT_NETWORK, "%s", err);
+        }
+        say("done (TLS 1.3, certificate not verified).\n");
+    }
+}
+
+static void disconnect(void)
+{
+    tls_close(tls);
+    tls = NULL;
+    close(sock);
+    sock = -1;
 }
 
 static void send_all(const char *p, int n)
 {
+    if (tls) {
+        if (tls_write(tls, p, n) < 0)
+            fail(EXIT_NETWORK, "TLS: %s", tls_error(tls));
+        return;
+    }
     while (n > 0) {
         int w = (int)send(sock, p, (size_t)n, 0);
         if (w <= 0)
@@ -401,7 +439,7 @@ int main(int argc, char **argv)
 
         char req[4096];
         char host[300];
-        if (u.port == 80)
+        if (u.port == (u.https ? 443 : 80))
             snprintf(host, sizeof(host), "%s", u.host);
         else
             snprintf(host, sizeof(host), "%s:%d", u.host, u.port);
@@ -430,7 +468,7 @@ int main(int argc, char **argv)
             say("Location: %s [following]\n", next);
             snprintf(url_text, sizeof(url_text), "%s", next);
             post_data = NULL;
-            close(sock);
+            disconnect();
             free(r.headers);
             continue;
         }
@@ -457,7 +495,7 @@ int main(int argc, char **argv)
         say("\n'%s' saved [%u]\n", out_name, got_bytes);
         if (out != 1)
             close(out);
-        close(sock);
+        disconnect();
         return r.status >= 400 ? EXIT_SERVER : 0;
     }
 }

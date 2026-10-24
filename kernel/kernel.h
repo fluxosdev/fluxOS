@@ -38,6 +38,10 @@ void kprintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void klog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void kputs(const char *s);
 int klog_read(char *buf, uint32_t size);
+
+/* Random numbers (random.c): interrupts add timing, readers get SHA-256 output. */
+void random_add(uint32_t v);
+void random_bytes(void *buf, uint32_t n);
 void boot_ok(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void panic(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
 

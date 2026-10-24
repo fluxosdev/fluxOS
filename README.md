@@ -263,7 +263,7 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
 - Web browser: an Internet Explorer 3 style window (the **Web Browser** icon)
   with Back, Forward, Stop, Refresh and Home, an address bar, a progress
   gauge, and the address of the link under the mouse in its status bar. It
-  fetches pages over plain HTTP (by running `wget`, so the desktop keeps
+  fetches pages over HTTP or HTTPS (by running `wget`, so the desktop keeps
   working while a page loads), then their style sheets and PNG and JPEG
   pictures,
   and opens `file://` pages and folders too.
@@ -430,7 +430,12 @@ The network tools:
   `nc -u HOST PORT` (netcat).
 - `wget [-q] [-O FILE] [-T SECONDS] [--save-headers] [--content-on-error]
   [--max-redirect=N] [--post-data=STRING] URL` downloads over HTTP/1.0,
-  following redirects and decoding chunked bodies.
+  following redirects and decoding chunked bodies. `https://` URLs go
+  through libc's TLS 1.3 client (`<tls.h>`): X25519 key exchange and
+  AES-128-GCM, written from scratch. It encrypts the connection and checks
+  the handshake's integrity, but does not verify the server's certificate.
+- `/dev/random` and `/dev/urandom` hash a pool that every interrupt stirs
+  with the CPU's cycle counter (SHA-256), so TLS keys are not guessable.
 
 The sound tools:
 - `beep [-f HZ] [-l MS] [-r N] [-d MS] [-n ...]` beeps the PC speaker, and
@@ -546,6 +551,7 @@ umount /mnt/hda; mkfs.fat -n MYDISK /dev/hda; mount /dev/hda /mnt/hda
 ifconfig; ping -c 3 10.0.2.2   # the network card, and QEMU's gateway
 host example.com               # DNS
 wget -O - http://example.com/  # HTTP over the TCP stack
+wget -O - https://example.com/ # HTTPS: TLS 1.3
 nc -l 7777 &  echo hi | nc localhost 7777    # a TCP server and client
 ls /mnt/fd0; df -h /mnt/fd0     # the floppy (make floppy, then make run)
 dmesg | grep -E "mounted|removed"   # discs and floppies mounted as they are put in
@@ -833,9 +839,11 @@ direction, and no TCP congestion control (the receiver's window is the only
 limit) or out-of-order buffering. DHCP renews by broadcast. ping times have
 the timer's 10 ms resolution.
 
-The web browser has no HTTPS (there is no TLS), so most of today's web is
-out of reach: it explains this and suggests the plain http:// address
-instead. It runs no JavaScript and shows only PNG and JPEG pictures (GIF
+HTTPS is TLS 1.3 only, with one cipher suite (TLS_AES_128_GCM_SHA256) and
+X25519: servers that only speak TLS 1.2, or will not use X25519, cannot be
+reached. Certificates are not verified, so the encryption keeps out
+eavesdroppers but not someone who intercepts the connection and poses as
+the site. The browser runs no JavaScript and shows only PNG and JPEG pictures (GIF
 and SVG show their alternative text). Its layout is an approximation: floats
 become inline-blocks, positioned elements stay in the normal flow (those
 hidden off-screen are dropped), grids are blocks, flex rows are lines of

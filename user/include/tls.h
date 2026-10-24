@@ -1,0 +1,37 @@
+/*
+ * A TLS 1.3 client (tls.c in libc), enough for HTTPS.
+ *
+ * It offers one cipher suite, TLS_AES_128_GCM_SHA256 (which every TLS 1.3
+ * server must support), X25519 key exchange and SNI. The connection is
+ * encrypted and protected against tampering, but the server's certificate
+ * is not checked: anyone able to intercept the connection could pose as
+ * the server.
+ */
+#ifndef _TLS_H
+#define _TLS_H
+
+#include <stddef.h>
+
+struct tls;
+
+/* Handshake over the connected TCP socket fd, naming host to the server.
+ * Waits at most timeout_ms for each read. Returns NULL on failure, with
+ * the reason in err. */
+struct tls *tls_connect(int fd, const char *host, int timeout_ms, char *err, size_t errsize);
+
+/* Bytes read (at most n), 0 at the end of the stream, -1 on an error
+ * (tls_error says which; a timeout is one). */
+int tls_read(struct tls *t, void *buf, int n);
+
+/* Write all n bytes; returns n, or -1 on an error. */
+int tls_write(struct tls *t, const void *buf, int n);
+
+/* Plaintext already received and not read yet: poll() on the socket does not see it. */
+int tls_pending(struct tls *t);
+
+const char *tls_error(struct tls *t);
+
+/* Send close_notify and free t; the socket stays open. */
+void tls_close(struct tls *t);
+
+#endif
