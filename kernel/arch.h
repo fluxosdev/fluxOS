@@ -34,6 +34,7 @@ void tss_set_kernel_stack(uint32_t esp0);
 
 void idt_init(void);
 void irq_register(int irq, irq_handler_t handler);
+int irq_registered(int irq);           /* another driver has it */
 void irq_unmask(int irq);
 
 /* Set by the timer or wakeups to request a reschedule on trap exit. */

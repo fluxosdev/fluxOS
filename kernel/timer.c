@@ -18,6 +18,7 @@ static void timer_irq(struct trapframe *tf)
 {
     (void)tf;
     ticks++;
+    spkr_tick();
     proc_tick();
     net_tick();
 }

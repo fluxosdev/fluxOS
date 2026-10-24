@@ -81,6 +81,11 @@ void irq_unmask(int irq)
     outb(port, inb(port) & (uint8_t)~bit);
 }
 
+int irq_registered(int irq)
+{
+    return irq_handlers[irq] != NULL;
+}
+
 void irq_register(int irq, irq_handler_t handler)
 {
     irq_handlers[irq] = handler;

@@ -9,8 +9,10 @@
 #include <flux/syscall.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -220,6 +222,15 @@ int poll(struct pollfd *fds, unsigned int nfds, int timeout_ms)
 int openpty(int fds[2]) { return ret(sc1(SYS_openpty, (int)fds)); }
 int fbinfo(struct fbinfo *fi) { return ret(sc1(SYS_fbinfo, (int)fi)); }
 int display(int op, void *arg) { return ret(sc2(SYS_display, op, (int)arg)); }
+
+int ioctl(int fd, unsigned int request, ...)
+{
+    va_list ap;
+    va_start(ap, request);
+    int arg = va_arg(ap, int);
+    va_end(ap);
+    return ret(sc3(SYS_ioctl, fd, (int)request, arg));
+}
 
 void *fbmap(void)
 {

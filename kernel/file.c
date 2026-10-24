@@ -64,6 +64,8 @@ void file_close(struct file *f)
     if (!f || --f->refs > 0)
         return;
     if (f->type == FT_VNODE) {
+        if (f->vn->dev_close)
+            f->vn->dev_close(f->vn, f->flags);
         vfs_unref(f->vn);
     } else if (f->type == FT_SOCKET) {
         sock_close(f->sock);

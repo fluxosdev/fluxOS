@@ -13,6 +13,10 @@ typedef int (*dev_read_t)(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
 typedef int (*dev_write_t)(struct vnode *vn, const void *buf, uint32_t off, uint32_t n);
 typedef int (*dev_poll_t)(struct vnode *vn);            /* POLL* events ready */
 typedef void (*dev_release_t)(struct vnode *vn);        /* last reference gone */
+typedef int (*dev_open_t)(struct vnode *vn, int flags);  /* before a file opens it */
+typedef void (*dev_close_t)(struct vnode *vn, int flags);    /* its last file closed */
+/* arg is the caller's value: a user pointer must be checked with user_access_ok(). */
+typedef int (*dev_ioctl_t)(struct vnode *vn, uint32_t req, uint32_t arg);
 
 struct vnode {
     char name[NAME_MAX + 1];
@@ -33,6 +37,9 @@ struct vnode {
     dev_write_t dev_write;
     dev_poll_t dev_poll;        /* NULL: always ready */
     dev_release_t dev_release;  /* anonymous devices (ptys) */
+    dev_open_t dev_open;        /* NULL: anyone may open it */
+    dev_close_t dev_close;      /* each open file description, when it goes */
+    dev_ioctl_t dev_ioctl;      /* NULL: ioctl fails with ENOTTY */
     void *dev_priv;             /* device driver data */
     struct fs *fs;              /* NULL for ramfs and device nodes */
     void *fs_data;              /* filesystem-specific inode data */

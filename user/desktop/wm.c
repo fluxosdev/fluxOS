@@ -219,7 +219,20 @@ static struct rect start_button_rect(void)
 static struct rect tray_rect(void)
 {
     int w = gfx_text_width(&font_sans, "88:88 PM") + 18;
+    if (sound_tray_icon() != ICON_NONE)
+        w += 20;                        /* the speaker */
     return mkrect(screen_w - 2 - w, screen_h - TASKBAR_H + 4, w, 22);
+}
+
+static struct rect tray_icon_rect(void)
+{
+    struct rect tr = tray_rect();
+    return mkrect(tr.x + 3, tr.y + 3, 16, 16);
+}
+
+void wm_tray_changed(void)
+{
+    wm_damage(tray_rect());
 }
 
 /* Taskbar buttons are in creation order, which is kept in task_order. */
@@ -470,6 +483,11 @@ static void draw_taskbar(void)
 
     struct rect tr = tray_rect();
     gfx_bevel(&screen, tr, BEVEL_THIN_SUNKEN);
+    enum icon_id speaker = sound_tray_icon();
+    if (speaker != ICON_NONE) {
+        struct rect ir = tray_icon_rect();
+        draw_icon(&screen, ir.x, ir.y, speaker, 16);
+    }
     int cw = gfx_text_width(&font_sans, clock_text);
     gfx_text(&screen, &font_sans, tr.x + tr.w - 9 - cw, tr.y + 4, clock_text, C_BLACK);
 }
@@ -996,6 +1014,10 @@ static void press_left(void)
         if (rect_contains(start_button_rect(), mx, my)) {
             set_menu(1);
             drag = DRAG_MENU;
+            return;
+        }
+        if (sound_tray_icon() != ICON_NONE && rect_contains(tray_icon_rect(), mx, my)) {
+            volume_open();
             return;
         }
         for (int i = 0; i < ntasks; i++) {

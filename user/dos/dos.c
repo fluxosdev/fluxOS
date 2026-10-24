@@ -1511,15 +1511,17 @@ void dos_init(char **envp)
     /* The COMMAND.COM stand-in: its PSP, and the master environment. */
     uint16_t largest, env;
     mem_alloc(0x10, 8, &root_psp, &largest);       /* owner 8: DOS, until set */
-    static const char *const vars[] = {
+    const char *vars[] = {
         "COMSPEC=C:\\COMMAND.COM", "PATH=C:\\", "PROMPT=$P$G", "TEMP=C:\\TMP", "TMP=C:\\TMP",
+        sound_blaster_env(),            /* last: NULL without a Sound Blaster */
     };
+    unsigned nvars = sizeof(vars) / sizeof(vars[0]) - (vars[5] ? 0 : 1);
     uint32_t len = 0;
-    for (unsigned i = 0; i < sizeof(vars) / sizeof(vars[0]); i++)
+    for (unsigned i = 0; i < nvars; i++)
         len += (uint32_t)strlen(vars[i]) + 1;
     mem_alloc((uint16_t)((len + 1 + 15) / 16 + 16), root_psp, &env, &largest);
     uint32_t e = ADDR(env, 0);
-    for (unsigned i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
+    for (unsigned i = 0; i < nvars; i++) {
         mem_write(e, vars[i], (uint32_t)strlen(vars[i]) + 1);
         e += (uint32_t)strlen(vars[i]) + 1;
     }

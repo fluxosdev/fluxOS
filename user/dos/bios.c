@@ -77,6 +77,7 @@ struct pit_channel {
     uint32_t reload;                    /* 1-65536 */
     uint8_t access;                     /* 1 low byte, 2 high byte, 3 both */
     uint8_t write_hi, read_hi;          /* next byte of a two-byte access */
+    uint8_t mode;                       /* counter mode 0-5 */
     uint8_t latched;
     uint16_t latch;
 };
@@ -115,6 +116,8 @@ static void pit_write(int ch, uint8_t v)
         p->write_hi = 0;
     }
     p->reload = r ? r : 65536;
+    if (ch == 2)
+        speaker_update(port61, p->reload, p->mode);
     if (ch == 0) {
         timer_period_us = p->reload * 838 / 1000;   /* 1 / 1.193182 MHz */
         if (timer_period_us < 200)
@@ -157,6 +160,7 @@ static void pit_control(uint8_t v)
         return;
     }
     p->access = (uint8_t)access;
+    p->mode = (uint8_t)((v >> 1) & 7);
     p->write_hi = p->read_hi = 0;
 }
 
@@ -204,6 +208,9 @@ uint32_t io_in(uint16_t port, int size)
 {
     if (size > 8)
         return io_in(port, 8) | io_in((uint16_t)(port + 1), size - 8) << 8;
+    uint8_t sv;
+    if (sound_io_in(port, &sv))
+        return sv;
     switch (port) {
     case 0x20:
         return 0;
@@ -248,6 +255,8 @@ void io_out(uint16_t port, uint32_t v, int size)
         return;
     }
     uint8_t b = (uint8_t)v;
+    if (sound_io_out(port, b))
+        return;
     switch (port) {
     case 0x20:
         if (b == 0x20)
@@ -268,6 +277,7 @@ void io_out(uint16_t port, uint32_t v, int size)
         return;
     case 0x61:
         port61 = b;
+        speaker_update(port61, pit[2].reload, pit[2].mode);
         return;
     case 0x3B4:
     case 0x3D4:
@@ -410,6 +420,10 @@ void bios_callback(int id)
     case 0x09:
         kbd_irq_ack();
         pic_eoi_irq(1);
+        break;
+    case 0x0D:                          /* IRQ 5 (the Sound Blaster) and 7 with */
+    case 0x0F:                          /* no handler: just end the interrupt */
+        pic_eoi_irq(id - 8);
         break;
     case 0x10:
         int10();

@@ -215,6 +215,9 @@ static const char *const icon_names[ICON_COUNT] = {
     [ICON_HOMEPAGE] = "go-home",
     [ICON_DISPLAY] = "video-display",
     [ICON_GEARS] = "applications-system",
+    [ICON_VOLUME] = "audio-volume-high",
+    [ICON_MUTED] = "audio-volume-muted",
+    [ICON_SOUND] = "audio-x-generic",
 };
 
 static const int icon_sizes[] = { 16, 32, 48 };

@@ -67,6 +67,7 @@ int main(void)
         return 1;
     }
     wm_init();
+    sound_init();
     terminal_open("Terminal", NULL, 0, 1);
     wm_flush();
 
@@ -131,6 +132,7 @@ int main(void)
             wm_tick();
             about_tick();
             display_tick();
+            sound_tick();
             browser_tick();
         }
         wm_flush();

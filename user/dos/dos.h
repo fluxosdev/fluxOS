@@ -163,6 +163,17 @@ int irq_masked(int irq);
 void timer_poll(void);
 uint32_t bios_ticks(void);
 
+/* ---- sound (sound.c) ---- */
+
+void sound_init(void);
+void sound_poll(void);                  /* move a Sound Blaster transfer on; flush FM */
+int sound_active(void);                 /* a transfer is running: do not sleep long */
+void sound_shutdown(void);
+int sound_io_in(uint16_t port, uint8_t *v);     /* 1 if the port is a sound port */
+int sound_io_out(uint16_t port, uint8_t v);
+void speaker_update(int port61, uint32_t reload, int mode);     /* PIT channel 2 */
+const char *sound_blaster_env(void);    /* "BLASTER=...", or NULL without a card */
+
 /* ---- keyboard ---- */
 
 void kbd_init(void);

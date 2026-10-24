@@ -55,6 +55,9 @@ enum icon_id {
     ICON_HOMEPAGE,
     ICON_DISPLAY,
     ICON_GEARS,
+    ICON_VOLUME,
+    ICON_MUTED,
+    ICON_SOUND,
     ICON_COUNT,
 };
 
@@ -112,6 +115,7 @@ int wm_window_count(void);
 void wm_input(const struct input_event *ev);
 /* The video mode changed: map the new screen and lay the desktop out for it. */
 int wm_reconfigure(void);
+void wm_tray_changed(void);             /* redraw the tray (the volume icon) */
 void wm_splash(const char *message, color_t color);     /* full-screen notice */
 void wm_tick(void);             /* clock and timers; call a few times a second */
 unsigned int now_ms(void);
@@ -168,6 +172,11 @@ void browser_blink(void);
 void browser_tick(void);
 void setup_open(void);
 void display_open(void);                /* Display Properties */
+void sound_init(void);                  /* see what cards there are; startup sound */
+void sound_tick(void);                  /* once a second */
+void sound_beep(void);                  /* the terminal bell */
+enum icon_id sound_tray_icon(void);     /* ICON_NONE without a mixer */
+void volume_open(void);                 /* Volume Control */
 void display_tick(void);                /* once a second */
 struct window *gears_open(void);        /* 3D Gears, an OpenGL demo */
 void gears_frame(void);                 /* draw the next frame when it is due */

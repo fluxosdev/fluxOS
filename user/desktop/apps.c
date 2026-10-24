@@ -3,10 +3,12 @@
  * client area holds a few controls; the dialog code handles focus,
  * Tab/Enter/Escape and mouse presses the way Windows 95 dialogs do.
  */
+#include <fcntl.h>
 #include <flux.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/soundcard.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 #include "desktop.h"
@@ -423,7 +425,7 @@ static int count_processes(void)
 }
 
 /* System Properties' text lines, which about_fill() keeps current. */
-enum { AB_RELEASE, AB_VERSION, AB_CPU, AB_MEMORY, AB_DISPLAY, AB_UPTIME, AB_PROCS, AB_LINES };
+enum { AB_RELEASE, AB_VERSION, AB_CPU, AB_MEMORY, AB_DISPLAY, AB_SOUND, AB_UPTIME, AB_PROCS, AB_LINES };
 static int about_line[AB_LINES];
 
 static void about_fill(struct dialog *d)
@@ -448,6 +450,18 @@ static void about_fill(struct dialog *d)
         snprintf(t[AB_DISPLAY], n, "Display: %d x %d, %s", screen_w, screen_h, di.adapter);
     else
         snprintf(t[AB_DISPLAY], n, "Display: %d x %d", screen_w, screen_h);
+    struct sound_info si;
+    memset(&si, 0, sizeof(si));
+    int fd = open("/dev/speaker", O_WRONLY);
+    if (fd >= 0 && ioctl(fd, SOUND_INFO, &si) == 0 && (si.flags & SOUNDF_DSP))
+        snprintf(t[AB_SOUND], n, "Sound: %s%s", si.card,
+                 (si.flags & SOUNDF_OPL3) ? ", OPL3 FM" : (si.flags & SOUNDF_OPL2) ? ", OPL2 FM" : "");
+    else if (fd >= 0 && (si.flags & SOUNDF_OPL2))
+        snprintf(t[AB_SOUND], n, "Sound: PC speaker, %s FM", (si.flags & SOUNDF_OPL3) ? "OPL3" : "OPL2");
+    else
+        snprintf(t[AB_SOUND], n, "Sound: PC speaker");
+    if (fd >= 0)
+        close(fd);
     format_uptime(t[AB_UPTIME], n);
     snprintf(t[AB_PROCS], n, "%d processes running", count_processes());
 }
@@ -464,7 +478,7 @@ void about_open(void)
         wm_focus(about_dlg->win);
         return;
     }
-    struct dialog *d = dialog_new("System Properties", ICON_COMPUTER, 380, 262, 0, &about_dlg);
+    struct dialog *d = dialog_new("System Properties", ICON_COMPUTER, 380, 280, 0, &about_dlg);
     if (!d)
         return;
     d->command = about_command;
@@ -473,18 +487,18 @@ void about_open(void)
 
     static const struct { int line, y; } lines[] = {
         { AB_RELEASE, 32 }, { AB_VERSION, 50 }, { AB_CPU, 94 }, { AB_MEMORY, 112 },
-        { AB_DISPLAY, 130 }, { AB_UPTIME, 174 }, { AB_PROCS, 192 },
+        { AB_DISPLAY, 130 }, { AB_SOUND, 148 }, { AB_UPTIME, 192 }, { AB_PROCS, 210 },
     };
     add(d, CT_ICON, 32, 30, 48, 48, NULL, ICON_COMPUTER);
     add(d, CT_BOLD, 136, 14, 0, 0, "System:", 0);
     add(d, CT_BOLD, 136, 76, 0, 0, "Computer:", 0);
-    add(d, CT_BOLD, 136, 156, 0, 0, "Status:", 0);
+    add(d, CT_BOLD, 136, 174, 0, 0, "Status:", 0);
     for (int i = 0; i < AB_LINES; i++) {
         about_line[lines[i].line] = d->n;
         add(d, CT_LABEL, 150, lines[i].y, 0, 0, NULL, 0);
     }
-    add(d, CT_SEPARATOR, 10, 216, 360, 2, NULL, 0);
-    add(d, CT_BUTTON, 380 - 10 - 75, 262 - 10 - 23, 75, 23, "OK", ID_OK);
+    add(d, CT_SEPARATOR, 10, 234, 360, 2, NULL, 0);
+    add(d, CT_BUTTON, 380 - 10 - 75, 280 - 10 - 23, 75, 23, "OK", ID_OK);
     about_fill(d);
     dialog_show(d, d->n - 1);
 }

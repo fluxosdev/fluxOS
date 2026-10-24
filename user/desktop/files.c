@@ -3,8 +3,8 @@
  * icon view, with a toolbar (Up, New Folder, Delete, Rename), an address
  * field, a scroll bar and a status bar. Double-clicking a folder opens
  * it in the same window; a program runs in a terminal window, a PNG
- * opens in the image viewer, a text file in the text editor, and anything
- * else is shown with more(1).
+ * opens in the image viewer, a text file in the text editor, a WAV or VOC
+ * sound plays with play(1), and anything else is shown with more(1).
  *
  * Keys: arrows move the selection, Enter opens, Backspace goes up,
  * Delete deletes, F2 renames and F5 reloads the folder. Clicking the
@@ -144,6 +144,8 @@ static enum icon_id classify(struct fm *f, const struct entry *e, const char *pa
         return ICON_IMAGE;
     if (has_suffix(e->name, ".html") || has_suffix(e->name, ".htm"))
         return ICON_HTML;
+    if (has_suffix(e->name, ".wav") || has_suffix(e->name, ".voc"))
+        return ICON_SOUND;
     struct stat st;
     if (is_dos_program(path) || (stat(path, &st) == 0 && (st.st_mode & 0111) && is_program(path)))
         return ICON_RUN;
@@ -484,6 +486,9 @@ static void open_entry(struct fm *f, int i)
         char url[PATH_MAX + 8];
         snprintf(url, sizeof(url), "file://%s", path);
         browser_open(url);
+    } else if (e->icon == ICON_SOUND) {
+        const char *argv[] = { "/bin/play", path, NULL };
+        terminal_open(e->name, argv, 0, 0);
     } else if (e->icon == ICON_RUN) {
         /* DOS programs go through the emulator even without execute permission. */
         const char *dos_argv[] = { "/bin/dos", path, NULL }, *argv[] = { path, NULL };

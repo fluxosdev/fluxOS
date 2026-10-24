@@ -46,6 +46,9 @@ ICONS = {
     "Process-stop.svg": "process-stop",
     "Video-display.svg": "video-display",
     "Applications-system.svg": "applications-system",
+    "Audio-volume-high.svg": "audio-volume-high",
+    "Audio-volume-muted.svg": "audio-volume-muted",
+    "Audio-x-generic.svg": "audio-x-generic",
 }
 SIZES = (16, 32, 48)
 SOURCE_PX = 250         # a standard Commons thumbnail width, scaled down from here

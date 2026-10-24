@@ -22,8 +22,9 @@ multitasking, ring-3 user processes, paging, a RAM root filesystem, IDE
 disk, CD-ROM and floppy drivers with FAT12/16/32 and ISO9660 support, an
 NE2000 network driver with a TCP/IP stack, a zsh-flavoured shell called
 **fsh**, a Windows 95 style graphical desktop with a web browser, a 3dfx
-Voodoo3 display driver with a small OpenGL library, and a compatibility
-layer that runs DOS programs in the terminal. It boots with GRUB
+Voodoo3 display driver with a small OpenGL library, PC speaker and Sound
+Blaster 16 sound, and a compatibility layer that runs DOS programs (with
+their sound) in the terminal. It boots with GRUB
 (Multiboot) from an ISO image, straight into the desktop.
 
 ```
@@ -117,6 +118,24 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   adapter, lists modes, sets them and maps the 3D engine. Kernel options:
   `video=1024x768x16@85` starts in a mode of the 3dfx driver, and
   `voodoo=off` leaves the card to the standard driver.
+- Sound:
+  - The PC speaker (`/dev/speaker`): PIT channel 2 through port 61h. Writes
+    queue tones (`struct spkr_tone`) that play in the background, timed by
+    the scheduler tick; `SPKR_SET` holds a frequency until changed. The
+    console's bell (^G) beeps on it.
+  - The **Sound Blaster 16** (DSP 4.x), found by resetting its DSP at 220h,
+    240h, 260h or 280h, with the IRQ and DMA channels its mixer reports.
+    `/dev/dsp` plays 8-bit or 16-bit, mono or stereo samples at 5000 to
+    44100 Hz, in the style of OSS (`SNDCTL_DSP_SPEED`, `_CHANNELS`,
+    `_SETFMT`, `_SYNC`, `_GETOSPACE`...): an auto-init DMA buffer in two
+    halves of about 40 ms each, refilled from a 64 KiB ring at each
+    interrupt, on the 16-bit DMA channel. `/dev/mixer` sets the master,
+    wave, FM, CD, line, microphone and PC speaker volumes.
+  - The OPL2/OPL3 FM synthesizer at 388h (`/dev/opl`, AdLib or the SB16's
+    own): register writes in order, with the waits the chip needs; closing
+    the device silences every voice.
+  - `ioctl()` (the new `SYS_ioctl` call) controls the devices. Kernel
+    options `sb16=off` and `opl=off` leave the cards alone.
 - Pseudo-terminals (`openpty`) that share the console's line discipline, with
   a controlling terminal per process, hangup (`SIGHUP`) when the master side
   closes, and `poll` over terminals, pipes and devices.
@@ -267,6 +286,10 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   second; drag or use the arrow keys to turn the view, Space pauses, Home
   resets it, and S switches between the 3D hardware and the software
   renderer.
+- Sound: a speaker in the taskbar's tray (crossed out when muted) opens
+  **Volume Control**, a column for each mixer output with a vertical
+  slider and a Mute box. The desktop plays a startup sound, terminals beep
+  on ^G, and double-clicking a `.wav` or `.voc` file plays it.
 - Start menu: Terminal, File Manager, Text Editor, Web Browser, Calculator,
   3D Gears, Read Me, System Properties (version, memory, display, uptime),
   Display Properties, Run... (runs a command in a new window), Install
@@ -302,6 +325,18 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   redrawn as it changes. Console output understands ANSI.SYS escapes.
 - Keys: arrows, Home/End, PgUp/PgDn, Insert/Delete, F1-F12 and Alt+letter
   arrive as PC scan codes. **Ctrl+\** stops the emulator at any time.
+- Sound, passed on to fluxOS's sound devices:
+  - the PC speaker, when port 61h connects PIT channel 2 to it;
+  - an AdLib at 388h (and the SB16's FM ports): writes go to the real OPL
+    chip, and the status port's timers are emulated for detection;
+  - a Sound Blaster 16 at 220h, IRQ 5, DMA 1 and 5, announced as
+    `BLASTER=A220 I5 D1 H5 T6`: the DSP (reset, version 4.05, 8-bit and
+    16-bit single-cycle and auto-init DMA output, time constants and rates,
+    pause, resume, silence blocks), its mixer, and both 8237 DMA
+    controllers. The transfer runs at the real sample rate, a little ahead
+    of what is heard, fetching samples from the program's memory as their
+    time comes; the DMA counters move as on a PC and IRQ 5 ends each
+    block, so programs that watch the DMA position or chain blocks work.
 - EXEC of a fluxOS program runs it as a real process, and `COMMAND.COM`
   runs the fluxOS shell (`COMMAND /C cmd` runs `sh -c cmd`), so a DOS
   program's "shell out" feature works. `dos -l FILE` (or `DOSLOG=FILE`) logs
@@ -331,9 +366,9 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   use GL or `<math.h>` are built with `USER_FP_CFLAGS` (see the Makefile);
   the rest of user space stays integer-only.
 
-**Userland** (`/bin`): basename cat chmod clear cp date desktop df dirname dmesg dos echo
+**Userland** (`/bin`): basename beep cat chmod clear cp date desktop df dirname dmesg dos echo
 env fetch fluxinstall free fsh grep halt head hexdump host ifconfig init ls lsblk
-mkdir mkfs.fat more mount mv nc ping poweroff ps reboot rm rmdir seq sh sleep sort
+mkdir mkfs.fat mixer more mount mv nc ping play poweroff ps reboot rm rmdir seq sh sleep sort
 spin stat sync tail tee top touch tr umount uname uniq uptime wc wget yes, all on a
 small libc (stdio, malloc, environ, dirent, time, sockets and a DNS resolver).
 The network tools:
@@ -345,6 +380,17 @@ The network tools:
 - `wget [-q] [-O FILE] [-T SECONDS] [--save-headers] [--content-on-error]
   [--max-redirect=N] [--post-data=STRING] URL` downloads over HTTP/1.0,
   following redirects and decoding chunked bodies.
+
+The sound tools:
+- `beep [-f HZ] [-l MS] [-r N] [-d MS] [-n ...]` beeps the PC speaker, and
+  `beep -m MUSIC` plays a tune written in BASIC's PLAY language (notes,
+  lengths, dots, octaves, tempo, staccato and legato).
+- `play [-q] FILE...` plays WAV (8 to 32-bit PCM) and Creative Voice
+  (`.voc`) files on the Sound Blaster, resampling rates the card lacks;
+  `play -t HZ [-l MS]` plays a test tone. A startup sound, a "ding" and a
+  VOC chime are in `/usr/share/sounds`.
+- `mixer` shows the card and its volumes; `mixer CHANNEL LEVEL [RIGHT]`
+  sets one.
 
 ## Building
 
@@ -448,6 +494,9 @@ wget -O - http://example.com/  # HTTP over the TCP stack
 nc -l 7777 &  echo hi | nc localhost 7777    # a TCP server and client
 ls /mnt/fd0; df -h /mnt/fd0     # the floppy (make floppy, then make run)
 cp /mnt/fd0/GAME.EXE ~; ./GAME.EXE   # a DOS program, in the terminal
+beep -m "T160 L8 CDEGEC4"      # the PC speaker, with BASIC's PLAY music
+play /usr/share/sounds/startup.wav   # the Sound Blaster (also .voc files)
+play -t 440; mixer; mixer pcm 60     # a test tone; the volumes
 dos edit                       # finds EDIT.COM or EDIT.EXE in this directory
 desktop                        # (from the text console) start the desktop
 poweroff
@@ -469,6 +518,7 @@ lib/                       string and printf routines and the 8x16 font (code
 tools/mkfont.py            regenerates the fonts, including the browser's
                            rootfs/usr/share/fonts/web.fnt (needs Python and PIL)
 tools/tango-icons.py       re-fetches and scales the Tango icons in rootfs/
+tools/mksounds.py          synthesizes the sounds in rootfs/usr/share/sounds
 kernel/
   boot.S, entry.S          multiboot entry, ISR stubs, trap return, context switch
   gdt.c, idt.c             descriptor tables, PIC, trap dispatch
@@ -484,6 +534,8 @@ kernel/
   fb.c, mouse.c, input.c   framebuffer and SYS_display, PS/2 mouse and vmmouse,
                            /dev/input
   voodoo.c                 3dfx Banshee/Voodoo3 driver: modes, EDID, 3D engine
+  pcspkr.c, sb16.c, opl.c  sound: PC speaker, Sound Blaster 16 (/dev/dsp,
+                           /dev/mixer), OPL FM synthesizer; isadma.c, ISA DMA
   fpu.c                    lazy x87 FPU context switching
   ne2000.c                 NE2000 network card driver (PCI and ISA)
   net.c                    Ethernet, ARP, IPv4, ICMP, loopback, DHCP client
@@ -501,7 +553,8 @@ user/
                            terminal emulator, file manager and image viewer
                            (files.c), the text editor (edit.c), the calculator
                            (calc.c), the Setup wizard (setup.c), Display
-                           Properties (display.c), 3D Gears (gears.c), dialogs,
+                           Properties (display.c), 3D Gears (gears.c), the
+                           tray speaker and Volume Control (sound.c), dialogs,
                            drawing, PNG decoding (png.c), icons, fonts,
                            and the web browser: its window (browser.c), HTML
                            parser (html.c), CSS (css.c), layout and painting
@@ -510,7 +563,8 @@ user/
                            interrupt controller, timer and BIOS services
                            (bios.c), keyboard (keyboard.c), text screen and
                            INT 10h (video.c), DOS processes, memory and console
-                           (dos.c), and files, paths and FCBs (files.c)
+                           (dos.c), files, paths and FCBs (files.c), and the
+                           PC speaker, AdLib, Sound Blaster and DMA (sound.c)
   bin/                     one program per file (fluxinstall.c is the installer)
 rootfs/                    files copied into the initrd (/etc, /home/flux,
                            /usr/share/icons, the browser's fonts and its
@@ -576,6 +630,17 @@ and rebuilds its back buffer (`wm_reconfigure`). `DISP_MAP3D` maps the 3D
 register block at `0xB4000000` and video memory at `0xB2000000`; GL
 contexts take their buffers from the top of video memory, and fall back
 to the software renderer if a bigger screen mode grows over them.
+
+**Sound.** The Sound Blaster 16 is always fed in one format: signed 16-bit
+on its 16-bit DMA channel (or unsigned 8-bit without one), so `write()`
+converts as it copies into the ring and the interrupt handler only copies
+a half's worth into the DMA buffer, padding with silence when the ring is
+short. Once both halves hold nothing but silence the DSP is paused, and the
+next write starts it again. A format change waits for what was written in
+the old one to play. If no interrupt arrives within a second, the driver
+says so in the kernel log and stops, instead of leaving writers asleep.
+The PC speaker's queue advances in the timer interrupt, so tones need no
+process to keep them going.
 
 **The FPU.** CR0.TS is set whenever the process on the CPU is not the one
 whose registers the FPU holds. Its first FPU instruction raises #NM, and
@@ -670,8 +735,10 @@ kernel log.
 DOS programs run in text modes only: a program that switches to a graphics
 mode (CGA, EGA, VGA or VESA) is stopped with a message, since a terminal
 cannot show it, and the screen stays 80x25 (43- and 50-line modes keep 25
-lines). There is no sound (no PC speaker, AdLib or Sound Blaster), no mouse
-driver, no EMS or XMS memory, no protected mode (so no DOS extenders such as
+lines). Recording on the Sound Blaster gives no data (the transfer runs, and
+nothing is written to memory); ADPCM, the direct DAC (command 10h), the
+MPU-401 and a speaker toggled by hand to make samples stay silent. There is
+no mouse driver, no EMS or XMS memory, no protected mode (so no DOS extenders such as
 DOS/4GW), no batch files, and no BIOS disk access (INT 13h), so self-booting
 and copy-protected software will not run. The terminal reports key presses
 but not releases, so each key is released right after it is pressed: games
@@ -694,6 +761,12 @@ hidden off-screen are dropped), grids are blocks, flex rows are lines of
 inline-blocks, and `calc()` takes its first length. It has no font downloads,
 cookies, cache of pages, or text selection, and characters outside Latin-1
 and common punctuation show as `?`.
+
+Sound limits: only the Sound Blaster 16 (DSP version 4) is supported, not
+the earlier Sound Blasters or other cards, and only for output: there is
+no recording, no MIDI (MPU-401) and no hardware mixing of several
+programs, so one program at a time has `/dev/dsp`. The latency is about
+80 ms, and the PC speaker's tones are timed in 10 ms steps.
 
 Graphics limits: the 3dfx driver is the only one that sets modes; any other
 card keeps its BIOS mode, which can only be changed for the next start, and

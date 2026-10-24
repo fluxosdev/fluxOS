@@ -41,6 +41,22 @@ int voodoo_screen_bytes(void);
 int voodoo_map3d(struct disp3d *d);
 void voodoo_proc_exit(int pid);
 
+/* ISA DMA (isadma.c). Modes: single transfers 0x40, auto-init 0x10, and
+ * 0x08 to read memory (play) or 0x04 to write it (record). */
+int isa_dma_start(int ch, uint32_t phys, uint32_t len, uint8_t mode);
+void isa_dma_stop(int ch);
+
+/* Sound: the PC speaker (pcspkr.c), the Sound Blaster 16 (sb16.c) and the
+ * OPL FM synthesizer (opl.c), as /dev/speaker, /dev/dsp, /dev/mixer, /dev/opl */
+void sound_init(void);
+void sound_get_info(struct sound_info *si);
+void spkr_init(struct vnode *devdir);
+void spkr_tick(void);
+void spkr_beep(uint32_t freq, uint32_t ms);
+void sb16_init(struct vnode *devdir);
+void opl_init(struct vnode *devdir);
+int opl_present(void);                  /* 0, 2 (OPL2) or 3 (OPL3) */
+
 /* Console: VGA text mode or the framebuffer (a subset of ANSI escapes) */
 void vga_init(void);
 void vga_write(const char *buf, uint32_t len);

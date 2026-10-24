@@ -126,6 +126,7 @@ static void put_char(struct term *t, char c)
             newline(t);
         return;
     case '\a':
+        sound_beep();
         return;
     }
     if ((unsigned char)c < 32)

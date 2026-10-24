@@ -52,6 +52,7 @@ void dlog(const char *fmt, ...)
 
 static void restore_terminal(void)
 {
+    sound_shutdown();
     video_leave();
     kbd_restore();
 }
@@ -146,17 +147,22 @@ static void run(void)
         if (dos_exited)
             break;
         timer_poll();
+        sound_poll();
         kbd_poll(0);
         if (cpu.halted || idle_ms >= 0) {
             /* Waiting for a key or an interrupt: sleep until input comes
-             * or the next timer tick is due. */
+             * or the next timer tick is due (or, while the Sound Blaster
+             * plays, its next samples are). */
             int ms = idle_ms >= 0 ? idle_ms : 55;
+            if (sound_active() && ms > 5)
+                ms = 5;
             idle_ms = -1;
             video_refresh(0);
             last_refresh = now_ms();
             if (pic_pending() < 0 || !(cpu.flags & F_IF))
                 kbd_poll(ms);
             timer_poll();
+            sound_poll();
         }
         uint32_t t = now_ms();
         if (t - last_refresh >= REFRESH_MS) {
@@ -201,6 +207,7 @@ int main(int argc, char **argv)
 
     cpu_reset();
     bios_init();
+    sound_init();
     video_init();
     files_init();
     dos_init(environ);

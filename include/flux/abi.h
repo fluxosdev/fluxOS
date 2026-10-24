@@ -108,6 +108,11 @@ struct stat {
 #define FLOPPY_MAJOR 2           /* minor = drive number */
 #define IDE_MAJOR 3
 #define INPUT_MAJOR 13
+#define SOUND_MAJOR 14          /* minors: SOUND_MINOR_* */
+#define SOUND_MINOR_MIXER   0
+#define SOUND_MINOR_DSP     3
+#define SOUND_MINOR_OPL     16
+#define SOUND_MINOR_SPEAKER 32
 
 /* ---- directory entries (getdents) ---- */
 #define NAME_MAX 255
@@ -288,6 +293,83 @@ struct disp3d {
     uint32_t vram_size;
     uint32_t screen_end;
     uint32_t pci_id;
+};
+
+/* ---- sound (ioctl requests and records for the sound devices) ---- */
+
+/* /dev/speaker, the PC speaker. A write queues struct spkr_tone records,
+ * which play one after another in the background. */
+#define SPKR_TONE 0x5301        /* arg: const struct spkr_tone *: queue one tone */
+#define SPKR_SET  0x5302        /* arg: a frequency in Hz (by value), 0 for off:
+                                   sound it now, until changed; clears the queue */
+#define SPKR_STOP 0x5303        /* silence, and forget the queued tones */
+
+struct spkr_tone {
+    uint32_t freq;              /* Hz; 0 is a rest */
+    uint32_t ms;
+};
+
+/* /dev/dsp, digital audio out (Sound Blaster 16), after OSS. Set the format
+ * first, then write samples; writes block while the buffer is full. */
+#define SNDCTL_DSP_RESET     0x5000     /* stop now, dropping what is queued */
+#define SNDCTL_DSP_SYNC      0x5001     /* wait until everything written has played */
+#define SNDCTL_DSP_SPEED     0x5002     /* int *: rate in Hz; set to the one used */
+#define SNDCTL_DSP_CHANNELS  0x5003     /* int *: 1 or 2; set to the one used */
+#define SNDCTL_DSP_SETFMT    0x5004     /* int *: AFMT_*; set to the one used */
+#define SNDCTL_DSP_GETOSPACE 0x5005     /* struct audio_buf_info * */
+#define SNDCTL_DSP_GETODELAY 0x5006     /* int *: bytes written and not yet heard */
+#define SNDCTL_DSP_POST      0x5007     /* start playing what is queued, however little */
+
+#define AFMT_U8     0x08                /* unsigned 8 bit */
+#define AFMT_S16_LE 0x10                /* signed 16 bit, little endian */
+
+struct audio_buf_info {
+    int32_t fragments;          /* whole fragments that can be written now */
+    int32_t fragstotal;
+    int32_t fragsize;           /* bytes */
+    int32_t bytes;              /* bytes that can be written without blocking */
+};
+
+/* /dev/mixer: volumes from 0 to 100. SOUND_INFO also works on /dev/dsp
+ * and /dev/opl. */
+#define MIXER_READ  0x4D00      /* struct mixer_level *: fills in left and right */
+#define MIXER_WRITE 0x4D01      /* const struct mixer_level * */
+#define SOUND_INFO  0x4D02      /* struct sound_info * */
+
+enum {
+    MIXER_MASTER, MIXER_PCM, MIXER_SYNTH, MIXER_CD, MIXER_LINE, MIXER_MIC, MIXER_SPEAKER,
+    MIXER_CHANNELS
+};
+
+struct mixer_level {
+    uint32_t channel;           /* MIXER_* */
+    uint32_t left, right;       /* mono channels read the same on both sides */
+};
+
+#define SOUNDF_DSP     0x1      /* a Sound Blaster 16 (/dev/dsp, /dev/mixer) */
+#define SOUNDF_OPL2    0x2      /* an FM synthesizer (/dev/opl) ... */
+#define SOUNDF_OPL3    0x4      /* ... that is an OPL3 */
+#define SOUNDF_SPEAKER 0x8      /* the PC speaker (always) */
+
+struct sound_info {
+    char     card[32];          /* "Sound Blaster 16" */
+    uint16_t dsp_version;       /* major << 8 | minor, e.g. 0x0405 */
+    uint16_t base;              /* I/O base, e.g. 0x220 */
+    uint8_t  irq, dma8, dma16;  /* dma16 is 0xFF without a 16-bit channel */
+    uint8_t  reserved;
+    uint16_t opl_base;          /* 0x388 */
+    uint16_t reserved2;
+    uint32_t flags;             /* SOUNDF_* */
+};
+
+/* /dev/opl, the FM synthesizer: a write sends struct opl_write records to
+ * its registers in order. Closing it silences every voice. */
+#define OPL_RESET 0x4F00        /* silence every voice, back to OPL2 mode */
+
+struct opl_write {
+    uint16_t reg;               /* 0x000-0x0FF; 0x100-0x1FF: the OPL3's second bank */
+    uint8_t  val;
+    uint8_t  reserved;
 };
 
 /* ---- input events, read from /dev/input ---- */

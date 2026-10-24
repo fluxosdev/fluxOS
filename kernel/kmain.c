@@ -143,6 +143,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     floppy_init();
     vfs_automount();
     net_init();
+    sound_init();                       /* after the drivers whose IRQs it must not take */
 
     proc_init();
     proc_spawn_init("/bin/init");

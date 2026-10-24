@@ -1,0 +1,3 @@
+ding.wav and chime.voc are synthesized by tools/mksounds.py.
+startup.wav, played when the desktop starts, is a recording.
+Play any of them with play(1).

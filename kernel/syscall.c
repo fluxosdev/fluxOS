@@ -344,9 +344,14 @@ static int sys_open(uint32_t upath, uint32_t flags, uint32_t c, uint32_t d, uint
     if ((flags & O_TRUNC) && writable && vn->type == VN_FILE)
         vfs_truncate(vn, 0);
 
+    if (vn->type == VN_CHR && vn->dev_open && (r = vn->dev_open(vn, (int)flags)) < 0)
+        return r;
     struct file *f = file_open(vn, (int)flags);
-    if (!f)
+    if (!f) {
+        if (vn->type == VN_CHR && vn->dev_close)
+            vn->dev_close(vn, (int)flags);
         return -ENOMEM;
+    }
     int fd = alloc_fd(f);
     if (fd < 0)
         file_close(f);
@@ -963,6 +968,23 @@ static int sys_fbmap(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
     return fb_map_user();
 }
 
+int user_access_ok(const void *ptr, uint32_t len)
+{
+    return user_check(ptr, len) == 0;
+}
+
+/* Device control: the device checks the request and its argument. */
+static int sys_ioctl(uint32_t fd, uint32_t req, uint32_t arg, uint32_t d, uint32_t e)
+{
+    (void)d; (void)e;
+    struct file *f = get_file(fd);
+    if (!f)
+        return -EBADF;
+    if (f->type != FT_VNODE || f->vn->type != VN_CHR || !f->vn->dev_ioctl)
+        return -ENOTTY;
+    return f->vn->dev_ioctl(f->vn, req, arg);
+}
+
 static int sys_display(uint32_t op, uint32_t uarg, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)c; (void)d; (void)e;
@@ -1075,6 +1097,7 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_netconf] = sys_netconf,
     [SYS_ftruncate] = sys_ftruncate,
     [SYS_display] = sys_display,
+    [SYS_ioctl] = sys_ioctl,
 };
 
 /* Calls that walk or change the VFS tree; read and write lock per chunk. */

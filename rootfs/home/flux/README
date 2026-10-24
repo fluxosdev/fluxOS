@@ -37,5 +37,11 @@ DOS programs
   ls /mnt/fd0        the floppy disk in drive A: (DOS programs see it as A:)
   Ctrl+\             stops a DOS program that will not stop
 
+Sound
+  beep -m "T160 L8 CDEGEC4"            the PC speaker, playing BASIC-style music
+  play /usr/share/sounds/startup.wav   the Sound Blaster 16 (WAV and VOC files)
+  play -t 440                          a test tone
+  mixer; mixer master 80               the volumes (or the speaker in the tray)
+
 System
   free, uname -a, uptime, date, dmesg, fetch, reboot, poweroff

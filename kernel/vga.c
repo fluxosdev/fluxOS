@@ -191,6 +191,7 @@ static void put_char(char c)
             newline();
         return;
     case '\a':
+        spkr_beep(750, 120);            /* the bell, on the PC speaker */
         return;
     }
     if ((unsigned char)c < 32)
