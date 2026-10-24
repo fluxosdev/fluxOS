@@ -60,7 +60,9 @@ CRT0      := $(BUILD)/u/user/libc/crt0.o
 LIBC      := $(BUILD)/libc.a
 GL_OBJS   := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/gl/*.c)))
 LIBGL     := $(BUILD)/libGL.a
-FP_OBJS   := $(BUILD)/u/user/libc/math.o $(GL_OBJS) $(BUILD)/u/user/desktop/gears.o
+FP_OBJS   := $(BUILD)/u/user/libc/math.o $(GL_OBJS) $(BUILD)/u/user/desktop/gears.o \
+             $(BUILD)/u/user/desktop/js.o $(BUILD)/u/user/desktop/jslib.o \
+             $(BUILD)/u/user/desktop/jsre.o $(BUILD)/u/user/desktop/jsdom.o
 
 PROGS     := $(basename $(notdir $(wildcard user/bin/*.c)))
 FSH_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/fsh/*.c)))
@@ -189,14 +191,14 @@ endif
 QEMU_NET  ?= -netdev user,id=net0 -device ne2k_pci,netdev=net0
 
 run: $(ISO) $(DISK)
-	$(QEMU) -m 128M -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK) $(QEMU_NET)
+	$(QEMU) -m 256M -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK) $(QEMU_NET)
 
 run-kernel: $(TEXT_KERNEL) $(INITRD) $(DISK)
-	$(QEMU) -kernel $(TEXT_KERNEL) -initrd $(INITRD) -m 128M -serial stdio $(QEMU_DISK) $(QEMU_NET)
+	$(QEMU) -kernel $(TEXT_KERNEL) -initrd $(INITRD) -m 256M -serial stdio $(QEMU_DISK) $(QEMU_NET)
 
 # Boot fluxdisk.img on its own, after "fluxinstall /dev/hda".
 run-disk: $(DISK)
-	$(QEMU) -m 128M -serial stdio -boot c $(QEMU_DISK) $(QEMU_NET)
+	$(QEMU) -m 256M -serial stdio -boot c $(QEMU_DISK) $(QEMU_NET)
 
 clean:
 	rm -rf $(BUILD) $(ISO)

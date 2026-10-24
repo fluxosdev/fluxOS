@@ -949,6 +949,7 @@ static void place_line(struct lctx *c, struct flow *f, int from, int to)
                     d->len = it->kind == I_WORD ? it->len : 1;
                     d->color = st->color;
                     d->deco = st->decoration;
+                    d->node = it->node;         /* the element the text is in: for clicks */
                     if (it->kind == I_SPACE && it->w > d->w)
                         d->w = it->w;
                 }
@@ -1283,8 +1284,10 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
     if (slot >= 0) {
         struct ditem *d = &c->lo->items[slot];
         int paint = ALPHA(st->bg) && !st->hidden && n != c->skip_bg;
-        d->x = bx, d->y = y, d->w = paint ? bw : 0, d->h = paint ? bh : 0;
-        d->color = st->bg;
+        /* An unpainted background keeps the box (transparent) so clicks find the element. */
+        d->x = bx, d->y = y, d->w = bw, d->h = bh;
+        d->color = paint ? st->bg : TRANSPARENT;
+        d->node = n;
     }
     if (bg_slot)
         *bg_slot = slot;
@@ -2008,7 +2011,8 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
         int x = d->x - sx + ox, y = d->y - sy + oy;
         switch (d->kind) {
         case DK_FILL:
-            fill_blend(s, x, y, d->w, d->h, d->color, d->deco);
+            if (ALPHA(d->color))
+                fill_blend(s, x, y, d->w, d->h, d->color, d->deco);
             break;
         case DK_TEXT: {
             uint32_t col = ALPHA(d->color) == 255 ? d->color : blend(0xFFFFFF, d->color);

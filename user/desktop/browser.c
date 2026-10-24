@@ -28,6 +28,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "desktop.h"
+#include "jsdom.h"
 #include "web.h"
 
 #define BR_W        800
@@ -51,7 +52,7 @@
 #define KEY_BACKSPACE 0x0E
 #define KEY_F6 0x40
 
-enum { F_PAGE, F_CSS, F_IMG };
+enum { F_PAGE, F_CSS, F_IMG, F_JS, F_XHR };
 enum { NAV_NEW, NAV_REPLACE, NAV_HISTORY };
 enum { B_BACK, B_FORWARD, B_STOP, B_REFRESH, B_HOME, B_GO, NBUTTONS };
 enum hold { H_NONE, H_BUTTON, H_VBAR, H_HBAR, H_PAGE };
@@ -70,8 +71,9 @@ struct fetch {
     char *post;                 /* F_PAGE: a form's POST body */
 };
 
-struct res {                    /* a style sheet or image waiting to be fetched */
+struct res {                    /* a style sheet, image, script or request waiting to be fetched */
     int kind, slot, redirects;
+    char *post;                     /* F_XHR: a POST body (malloc'd) */
     char url[URL_MAX];
 };
 
@@ -143,6 +145,22 @@ struct browser {
 
     struct cached *cache;
     size_t cache_bytes;
+
+    /* scripts: run in document order once each one's text is here */
+    struct jsdom *js;
+    struct script {
+        struct node *n;
+        const char *text;
+        int len;
+        char *owned;                    /* fetched text */
+        int pending;                    /* its src is still loading */
+        int done;
+    } *scripts;
+    int nscripts, script_cap, next_script;
+    int scripts_finished;               /* the load event has fired */
+    /* what scripts asked for, done once they have returned */
+    char js_nav[URL_MAX];
+    int js_nav_replace, js_history, js_reload;
 };
 
 static struct browser *browsers;
@@ -698,6 +716,7 @@ static void queue_resource(struct browser *b, int kind, const char *url, int slo
     r->kind = kind;
     r->slot = slot;
     r->redirects = redirects;
+    r->post = NULL;
     snprintf(r->url, sizeof(r->url), "%s", url);
     b->total_res++;
 }
@@ -722,6 +741,16 @@ static void free_page(struct browser *b)
     b->hover = NULL;
     b->press_link = b->press_ctrl = NULL;
     b->refresh_url[0] = 0;
+    jsdom_free(b->js);
+    b->js = NULL;
+    for (int i = 0; i < b->nscripts; i++)
+        free(b->scripts[i].owned);
+    free(b->scripts);
+    b->scripts = NULL;
+    b->nscripts = b->script_cap = b->next_script = 0;
+    b->scripts_finished = 0;
+    b->js_nav[0] = 0;
+    b->js_history = b->js_reload = 0;
 }
 
 static void relayout(struct browser *b)
@@ -838,6 +867,289 @@ static void init_controls(struct node *root)
     }
 }
 
+/* ---- scripts ---- */
+
+static int is_text_field(const struct node *n);
+
+/* Form controls that scripts made: their values, as init_controls gives. */
+static void init_new_controls(struct node *root)
+{
+    for (struct node *n = root; n; n = node_next(n, root)) {
+        if (n->type != N_ELEMENT || n->value)
+            continue;
+        if (n->tag == T_INPUT) {
+            const char *v = node_attr(n, "value");
+            n->value = strdup(v ? v : "");
+            n->cursor = n->value ? (int)strlen(n->value) : 0;
+            if (node_attr(n, "checked"))
+                n->checked = 1;
+        } else if (n->tag == T_TEXTAREA) {
+            n->value = strdup(n->first && n->first->type == N_TEXT ? n->first->text : "");
+        } else if (n->tag == T_OPTION) {
+            char text[1024];
+            node_text(n, text, sizeof(text));
+            n->value = strdup(text);
+        }
+    }
+}
+
+static void js_navigate(void *ctx, const char *url, int replace)
+{
+    struct browser *b = ctx;
+    snprintf(b->js_nav, sizeof(b->js_nav), "%s", url);
+    b->js_nav_replace = replace;
+}
+
+static void js_history(void *ctx, int delta)
+{
+    ((struct browser *)ctx)->js_history = delta;
+}
+
+static void js_reload(void *ctx)
+{
+    ((struct browser *)ctx)->js_reload = 1;
+}
+
+static void js_alert(void *ctx, const char *text)
+{
+    (void)ctx;
+    message_box("Web Browser", ICON_INFO, text && *text ? text : " ");
+}
+
+static void js_status(void *ctx, const char *text)
+{
+    struct browser *b = ctx;
+    set_status(b, "%s", text);
+    paint(b);
+}
+
+static void js_changed(void *ctx)
+{
+    struct browser *b = ctx;
+    if (!b->root)
+        return;
+    init_new_controls(b->root);
+    b->need_style = 1;
+    relayout(b);
+    paint(b);
+}
+
+static void js_scroll(void *ctx, int x, int y, int relative)
+{
+    struct browser *b = ctx;
+    b->scroll_x = relative ? b->scroll_x + x : x;
+    b->scroll_y = relative ? b->scroll_y + y : y;
+    clamp_scroll(b);
+    paint(b);
+}
+
+static void js_scroll_pos(void *ctx, int *x, int *y)
+{
+    struct browser *b = ctx;
+    *x = b->scroll_x;
+    *y = b->scroll_y;
+}
+
+static void js_viewport(void *ctx, int *w, int *h)
+{
+    struct rect v = view_rect(ctx);
+    *w = v.w;
+    *h = v.h;
+}
+
+static void js_set_title(void *ctx, const char *title)
+{
+    update_title(ctx, title);
+}
+
+static void add_script(struct browser *b, struct node *n, int pending)
+{
+    if (b->nscripts == b->script_cap) {
+        int cap = b->script_cap ? b->script_cap * 2 : 16;
+        struct script *ns = realloc(b->scripts, sizeof(*ns) * (size_t)cap);
+        if (!ns)
+            return;
+        b->scripts = ns;
+        b->script_cap = cap;
+    }
+    struct script *sc = &b->scripts[b->nscripts++];
+    memset(sc, 0, sizeof(*sc));
+    sc->n = n;
+    sc->pending = pending;
+    if (!pending && n->first && n->first->type == N_TEXT) {
+        sc->text = n->first->text;
+        sc->len = n->first->len;
+    }
+}
+
+static void js_load_script(void *ctx, struct node *n, const char *url)
+{
+    struct browser *b = ctx;
+    add_script(b, n, 1);
+    queue_resource(b, F_JS, url, b->nscripts - 1, 0);
+    if (!b->fetch.active)
+        start_next(b);
+}
+
+static void js_load_image(void *ctx, struct node *n)
+{
+    struct browser *b = ctx;
+    const char *src = node_attr(n, "src");
+    if (!src || !*src || !b->imgs)
+        return;
+    char abs[URL_MAX];
+    url_resolve(b->base, src, abs, sizeof(abs));
+    url_strip_fragment(abs);
+    struct cached *c = cache_find(b, abs);
+    if (b->nimgs < MAX_RES) {
+        b->imgs[b->nimgs].n = n;
+        b->imgs[b->nimgs].url = arena_strdup(&b->arena, abs);
+        b->nimgs++;
+    }
+    if (c) {
+        n->img = c->img;
+        return;
+    }
+    queue_resource(b, F_IMG, abs, 0, 0);
+    if (!b->fetch.active)
+        start_next(b);
+}
+
+/* An element's box: everything laid out for it and its descendants. */
+static int js_node_box(void *ctx, struct node *n, int *x, int *y, int *w, int *h)
+{
+    struct browser *b = ctx;
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0, any = 0;
+    for (int i = 0; i < b->lo.nitems; i++) {
+        const struct ditem *d = &b->lo.items[i];
+        if (!d->node || d->w <= 0 || d->h <= 0)
+            continue;
+        const struct node *k = d->node;
+        while (k && k != n)
+            k = k->parent;
+        if (!k)
+            continue;
+        if (!any || d->x < x0) x0 = d->x;
+        if (!any || d->y < y0) y0 = d->y;
+        if (!any || d->x + d->w > x1) x1 = d->x + d->w;
+        if (!any || d->y + d->h > y1) y1 = d->y + d->h;
+        any = 1;
+    }
+    *x = x0;
+    *y = y0;
+    *w = x1 - x0;
+    *h = y1 - y0;
+    return any;
+}
+
+/* A script's XMLHttpRequest: fetched like the page's other resources. */
+static void js_http(void *ctx, int id, const char *method, const char *url, const char *body)
+{
+    struct browser *b = ctx;
+    int before = b->nqueue;
+    queue_resource(b, F_XHR, url, id, 0);
+    if (b->nqueue == before) {
+        jsdom_http_done(b->js, id, 0, NULL, 0, NULL, 0);    /* the queue is full */
+        return;
+    }
+    if (body && !strcasecmp(method, "POST"))
+        b->queue[b->nqueue - 1].post = strdup(body);
+    if (!b->fetch.active)
+        start_next(b);
+}
+
+static void js_focus(void *ctx, struct node *n)
+{
+    struct browser *b = ctx;
+    if (is_text_field(n)) {
+        b->focus = n;
+        b->addr_focus = 0;
+        paint(b);
+    }
+}
+
+static int runnable_script(const struct node *n)
+{
+    const char *type = node_attr(n, "type"), *lang = node_attr(n, "language");
+    if (type && *type)
+        return strcasestr(type, "javascript") || strcasestr(type, "ecmascript") ||
+               strcasestr(type, "jscript");
+    return !lang || strcasestr(lang, "javascript");
+}
+
+/* Start the page's scripts: make the engine and queue the external ones. */
+static void start_scripts(struct browser *b, const char *url)
+{
+    struct jshost h = {
+        .ctx = b, .arena = &b->arena, .root = b->root, .url = b->url, .base = b->base,
+        .navigate = js_navigate, .history = js_history, .reload = js_reload, .alert = js_alert,
+        .status = js_status, .changed = js_changed, .scroll = js_scroll, .scroll_pos = js_scroll_pos,
+        .viewport = js_viewport, .set_title = js_set_title, .load_script = js_load_script,
+        .load_image = js_load_image, .node_box = js_node_box, .focus = js_focus, .http = js_http,
+    };
+    b->js = jsdom_new(&h);
+    if (!b->js)
+        return;
+    for (struct node *n = b->root; n; n = node_next(n, b->root)) {
+        if (n->type != N_ELEMENT || n->tag != T_SCRIPT || !runnable_script(n))
+            continue;
+        const char *src = node_attr(n, "src");
+        if (src && *src) {
+            char abs[URL_MAX];
+            url_resolve(b->base, src, abs, sizeof(abs));
+            add_script(b, n, 1);
+            queue_resource(b, F_JS, abs, b->nscripts - 1, 0);
+        } else {
+            add_script(b, n, 0);
+        }
+    }
+    (void)url;
+}
+
+/* Run the scripts that are ready, in order; the load event after the last. */
+static void run_scripts(struct browser *b)
+{
+    while (b->js && b->next_script < b->nscripts) {
+        struct script *sc = &b->scripts[b->next_script];
+        if (sc->pending)
+            return;
+        b->next_script++;
+        if (sc->done)
+            continue;
+        sc->done = 1;
+        if (sc->text) {
+            char where[96];
+            const char *src = node_attr(sc->n, "src");
+            snprintf(where, sizeof(where), "%s", src ? src : "inline script");
+            jsdom_run_script(b->js, sc->n, sc->text, sc->len, where);
+        }
+    }
+    if (b->js && !b->scripts_finished) {
+        b->scripts_finished = 1;
+        jsdom_loaded(b->js);
+    }
+}
+
+/* javascript: URLs run their code in the page. */
+static void run_js_url(struct browser *b, const char *url)
+{
+    if (!b->js)
+        return;
+    char code[URL_MAX];
+    int n = 0;
+    for (const char *p = url + 11; *p && n < (int)sizeof(code) - 1; p++) {
+        if (*p == '%' && isxdigit((unsigned char)p[1]) && isxdigit((unsigned char)p[2])) {
+            char hex[3] = { p[1], p[2], 0 };
+            code[n++] = (char)strtol(hex, NULL, 16);
+            p += 2;
+        } else {
+            code[n++] = *p;
+        }
+    }
+    code[n] = 0;
+    jsdom_run_script(b->js, NULL, code, n, "javascript: URL");
+}
+
 static void load_document(struct browser *b, const char *text, int len, const char *url,
                           const char *charset)
 {
@@ -903,6 +1215,7 @@ static void load_document(struct browser *b, const char *text, int len, const ch
     }
     update_title(b, title);
     b->total_res = b->done_res = 0;
+    start_scripts(b, url);              /* external scripts are fetched first */
     for (struct node *n = b->root; n; n = node_next(n, b->root)) {
         if (n->type != N_ELEMENT)
             continue;
@@ -948,6 +1261,7 @@ static void load_document(struct browser *b, const char *text, int len, const ch
     } else {
         scroll_to_fragment(b, url_fragment(url));
     }
+    run_scripts(b);
 }
 
 static void show_message(struct browser *b, const char *url, const char *title, const char *body)
@@ -1151,6 +1465,24 @@ static void fetch_complete(struct browser *b)
                     if (!strcmp(b->imgs[i].url, done.url))
                         b->imgs[i].url = arena_strdup(&b->arena, next);
             queue_resource(b, done.kind, next, done.slot, done.redirects + 1);
+        } else if (done.kind == F_XHR) {
+            if (b->js) {
+                int hlen = ok ? (int)(r.body - done.buf) : 0;
+                jsdom_http_done(b->js, done.slot, ok ? r.status : 0, ok ? done.buf : NULL, hlen,
+                                ok ? r.body : NULL, ok ? r.len : 0);
+            }
+        } else if (done.kind == F_JS) {
+            if (done.slot < b->nscripts) {
+                struct script *sc = &b->scripts[done.slot];
+                if (ok && r.status < 300 && (sc->owned = malloc((size_t)r.len + 1))) {
+                    memcpy(sc->owned, r.body, (size_t)r.len);
+                    sc->owned[r.len] = 0;
+                    sc->text = sc->owned;
+                    sc->len = r.len;
+                }
+                sc->pending = 0;
+            }
+            run_scripts(b);
         } else if (ok && r.status < 300 && done.kind == F_CSS && done.slot < b->nsheets) {
             b->sheets[done.slot] = css_parse(&b->arena, r.body, r.len, view_rect(b).w);
             b->need_style = 1;
@@ -1179,9 +1511,16 @@ static void start_next(struct browser *b)
             b->done_res++;
             continue;
         }
-        set_status(b, "Loading %s %d of %d: %s", r.kind == F_CSS ? "style sheet" : "picture",
+        set_status(b, "Loading %s %d of %d: %s",
+                   r.kind == F_CSS ? "style sheet" : r.kind == F_JS ? "script" :
+                   r.kind == F_XHR ? "request" : "picture",
                    b->done_res + 1, b->total_res, r.url);
-        if (start_fetch(b, r.kind, r.url, NULL, r.slot, r.redirects, 0) == 0) {
+        int started = start_fetch(b, r.kind, r.url, r.post, r.slot, r.redirects, 0) == 0;
+        free(r.post);
+        b->queue[b->qhead - 1].post = NULL;
+        if (!started && r.kind == F_XHR && b->js)
+            jsdom_http_done(b->js, r.slot, 0, NULL, 0, NULL, 0);
+        if (started) {
             paint(b);
             return;
         }
@@ -1216,6 +1555,10 @@ static void push_history(struct browser *b, const char *url)
 
 static void navigate(struct browser *b, const char *url, const char *post, int mode)
 {
+    if (!strncasecmp(url, "javascript:", 11)) {
+        run_js_url(b, url);
+        return;
+    }
     char u[URL_MAX];
     snprintf(u, sizeof(u), "%s", url);
     stop_all(b);
@@ -1311,8 +1654,7 @@ static void follow_link(struct browser *b, struct node *a)
     while (*href == ' ')
         href++;
     if (!strncasecmp(href, "javascript:", 11)) {
-        set_status(b, "JavaScript is not supported");
-        paint(b);
+        run_js_url(b, href);
         return;
     }
     if (!strncasecmp(href, "mailto:", 7)) {
@@ -1366,6 +1708,10 @@ static void add_pair(char *q, int size, const char *name, const char *value)
 
 static void submit(struct browser *b, struct node *form, struct node *submitter)
 {
+    if (b->js && jsdom_dispatch(b->js, form, "submit"))
+        return;                         /* a handler said no */
+    if (b->js_nav[0])
+        return;                         /* or went somewhere else */
     char q[URL_MAX];
     q[0] = 0;
     for (struct node *n = form; n; n = node_next(n, form)) {
@@ -1437,6 +1783,7 @@ static void reset_form(struct node *form)
 /* A click on a form control. */
 static void activate(struct browser *b, struct node *n)
 {
+    int changed = 0;
     struct node *form = form_of(n);
     const char *t = n->tag == T_INPUT ? type_of(n) : n->tag == T_BUTTON ? (node_attr(n, "type") ? node_attr(n, "type") : "submit") : "";
     if (is_text_field(n)) {
@@ -1447,6 +1794,7 @@ static void activate(struct browser *b, struct node *n)
     } else if (n->tag == T_INPUT && !strcasecmp(t, "checkbox")) {
         n->checked = !n->checked;
         b->focus = n;
+        changed = 1;
     } else if (n->tag == T_INPUT && !strcasecmp(t, "radio")) {
         const char *name = node_attr(n, "name");
         struct node *scope = form ? form : b->root;
@@ -1456,6 +1804,7 @@ static void activate(struct browser *b, struct node *n)
                 o->checked = 0;
         n->checked = 1;
         b->focus = n;
+        changed = 1;
     } else if (n->tag == T_SELECT) {
         int count = 0;
         for (struct node *o = n; o; o = node_next(o, n))
@@ -1464,6 +1813,7 @@ static void activate(struct browser *b, struct node *n)
             n->checked = (n->checked + 1) % count;     /* each click shows the next option */
         b->focus = n;
         b->need_layout = 1;
+        changed = 1;
     } else if (!strcasecmp(t, "submit") || !strcasecmp(t, "image")) {
         if (form)
             submit(b, form, n);
@@ -1472,9 +1822,48 @@ static void activate(struct browser *b, struct node *n)
         if (form)
             reset_form(form);
     }
+    if (changed && b->js) {
+        jsdom_dispatch(b->js, n, "input");
+        jsdom_dispatch(b->js, n, "change");
+    }
     if (b->need_layout)
         relayout(b);
     paint(b);
+}
+
+/* The element drawn at a page point: the topmost thing laid out there. */
+static struct node *element_at(struct browser *b, int x, int y)
+{
+    for (int i = b->lo.nitems - 1; i >= 0; i--) {
+        const struct ditem *d = &b->lo.items[i];
+        if (d->node && d->node->type == N_ELEMENT && x >= d->x && x < d->x + d->w && y >= d->y &&
+            y < d->y + d->h)
+            return d->node;
+    }
+    return NULL;
+}
+
+/* A click on the page: scripts hear of it first, and may cancel what it does. */
+static int page_click(struct browser *b, int px, int py)
+{
+    if (!b->js)
+        return 0;
+    struct node *target = b->press_ctrl ? b->press_ctrl : element_at(b, px, py);
+    if (!target)
+        return 0;
+    const char *t = target->tag == T_INPUT ? type_of(target) : "";
+    if (target == b->press_ctrl && (!strcasecmp(t, "checkbox") || !strcasecmp(t, "radio"))) {
+        activate(b, target);            /* the box changes first, handlers see it */
+        if (b->js)
+            jsdom_dispatch(b->js, target, "click");
+        return 1;
+    }
+    int prevented = jsdom_dispatch(b->js, target, "click");
+    if (!b->root || b->js_nav[0])
+        return 1;                       /* the page is going away */
+    if (prevented)
+        paint(b);
+    return prevented;
 }
 
 static void edit_field(struct browser *b, struct node *n, const struct input_event *ev)
@@ -1750,9 +2139,61 @@ static void addr_key(struct browser *b, const struct input_event *ev)
     paint(b);
 }
 
+/* A key as the DOM names it: event.key in key, and the legacy keyCode. */
+static int dom_key(const struct input_event *ev, char *key, int size)
+{
+    static const struct { int code; const char *name; int kc; } named[] = {
+        { KEY_UP, "ArrowUp", 38 }, { KEY_DOWN, "ArrowDown", 40 }, { KEY_LEFT, "ArrowLeft", 37 },
+        { KEY_RIGHT, "ArrowRight", 39 }, { KEY_ENTER, "Enter", 13 }, { KEY_ESC, "Escape", 27 },
+        { KEY_TAB, "Tab", 9 }, { KEY_BACKSPACE, "Backspace", 8 }, { KEY_DELETE, "Delete", 46 },
+        { KEY_HOME, "Home", 36 }, { KEY_END, "End", 35 }, { KEY_PGUP, "PageUp", 33 },
+        { KEY_PGDN, "PageDown", 34 }, { KEY_SPACE, " ", 32 }, { 0x2A, "Shift", 16 },
+        { 0x36, "Shift", 16 }, { 0x1D, "Control", 17 }, { 0x9D, "Control", 17 }, { 0x38, "Alt", 18 },
+    };
+    for (unsigned i = 0; i < sizeof(named) / sizeof(named[0]); i++)
+        if (ev->code == named[i].code) {
+            snprintf(key, (size_t)size, "%s", named[i].name);
+            return named[i].kc;
+        }
+    /* Letters and digits by scan code, so releases (which carry no text) are named too. */
+    static const char row1[] = "1234567890", qwerty[] = "qwertyuiop", asdf[] = "asdfghjkl", zxcv[] = "zxcvbnm";
+    char c = 0;
+    if (ev->code >= 0x02 && ev->code <= 0x0B)
+        c = row1[ev->code - 0x02];
+    else if (ev->code >= 0x10 && ev->code <= 0x19)
+        c = qwerty[ev->code - 0x10];
+    else if (ev->code >= 0x1E && ev->code <= 0x26)
+        c = asdf[ev->code - 0x1E];
+    else if (ev->code >= 0x2C && ev->code <= 0x32)
+        c = zxcv[ev->code - 0x2C];
+    if (ev->len == 1 && (unsigned char)ev->text[0] >= 32)
+        c = ev->text[0];
+    if (!c) {
+        key[0] = 0;
+        return 0;
+    }
+    key[0] = c;
+    key[1] = 0;
+    return c >= 'a' && c <= 'z' ? c - 32 : (unsigned char)c;
+}
+
 static void br_key(struct window *w, const struct input_event *ev)
 {
     struct browser *b = w->priv;
+    if (b->js && b->root && !b->addr_focus && !(ev->mods & KMOD_ALT)) {
+        char key[16];
+        int kc = dom_key(ev, key, sizeof(key));
+        int pressed = ev->flags & IEV_PRESSED;
+        int prevented = jsdom_key_event(b->js, b->focus, pressed ? "keydown" : "keyup", kc, key);
+        if (pressed && !prevented && key[0] && !key[1])
+            prevented = jsdom_key_event(b->js, b->focus, "keypress", (unsigned char)key[0], key);
+        if (!b->js || b->js_nav[0])
+            return;
+        if (pressed && prevented) {
+            paint(b);
+            return;
+        }
+    }
     if (!(ev->flags & IEV_PRESSED))
         return;
     int ctrl = ev->mods & KMOD_CTRL, alt = ev->mods & KMOD_ALT, shift = ev->mods & KMOD_SHIFT;
@@ -1802,7 +2243,11 @@ static void br_key(struct window *w, const struct input_event *ev)
                 submit(b, form, NULL);
             return;
         }
+        char *before = f->value ? strdup(f->value) : NULL;
         edit_field(b, f, ev);
+        if (b->js && (!before || !f->value || strcmp(before, f->value)))
+            jsdom_dispatch(b->js, f, "input");
+        free(before);
         paint(b);
         return;
     }
@@ -1940,6 +2385,8 @@ static void br_mouse(struct window *w, int x, int y, int buttons, int changed)
         } else if (hold == H_VBAR || hold == H_HBAR) {
             paint(b);
         } else if (hold == H_PAGE) {
+            if (page_click(b, px, py))
+                return;
             const struct hotspot *h = layout_hit(b->lo.controls, b->lo.ncontrols, px, py);
             if (b->press_ctrl && h && h->node == b->press_ctrl) {
                 activate(b, b->press_ctrl);
@@ -2034,6 +2481,47 @@ void browser_blink(void)
     for (struct browser *b = browsers; b; b = b->next)
         if (b->focused && (b->addr_focus || is_text_field(b->focus)))
             paint(b);
+}
+
+/* Every pass of the desktop's loop: timers, and what scripts asked for. */
+void browser_poll(void)
+{
+    for (struct browser *b = browsers; b; b = b->next) {
+        if (b->js)
+            jsdom_run_timers(b->js);
+        if (b->js_nav[0]) {
+            char u[URL_MAX];
+            snprintf(u, sizeof(u), "%s", b->js_nav);
+            b->js_nav[0] = 0;
+            navigate(b, u, NULL, b->js_nav_replace ? NAV_REPLACE : NAV_NEW);
+            return;                     /* the list may have changed */
+        }
+        if (b->js_history) {
+            int delta = b->js_history;
+            b->js_history = 0;
+            go_history(b, delta);
+            return;
+        }
+        if (b->js_reload) {
+            b->js_reload = 0;
+            reload(b);
+            return;
+        }
+    }
+}
+
+/* ms until a browser needs browser_poll, or -1. */
+int browser_timeout(void)
+{
+    int best = -1;
+    for (struct browser *b = browsers; b; b = b->next) {
+        if (b->js_nav[0] || b->js_history || b->js_reload)
+            return 0;
+        int t = jsdom_next_timer(b->js);
+        if (t >= 0 && (best < 0 || t < best))
+            best = t;
+    }
+    return best;
 }
 
 void browser_tick(void)

@@ -157,7 +157,7 @@ static const char ua_css[] =
     " summary, frameset, frame, noframes, optgroup { display: block }"
     "head, script, style, link, meta, title, base, template, param, area, map, source, track,"
     " datalist, iframe, object, embed, video, audio, canvas, svg, col, colgroup, option,"
-    " input[type=hidden], [hidden], noembed, dialog:not([open]) { display: none }"
+    " input[type=hidden], [hidden], noembed, noscript, dialog:not([open]) { display: none }"
     "li { display: list-item }"
     "table { display: table; border-spacing: 2px; text-indent: 0 }"
     "caption { display: table-caption; text-align: center }"

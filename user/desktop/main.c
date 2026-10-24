@@ -95,6 +95,9 @@ int main(void)
         int frame = gears_timeout();            /* animation wants an earlier wakeup */
         if (frame >= 0 && frame < timeout)
             timeout = frame;
+        int js = browser_timeout();             /* a page's timers */
+        if (js >= 0 && js < timeout)
+            timeout = js;
         poll(fds, (unsigned int)(n + nw), timeout);
 
         /* Terminals first: input handling may close their windows. */
@@ -122,6 +125,7 @@ int main(void)
         }
 
         gears_frame();
+        browser_poll();
         unsigned int now = now_ms();
         if (now - last_blink >= BLINK_MS) {
             last_blink = now;

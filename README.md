@@ -285,6 +285,22 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
     Mono in 12 sizes are rasterised by `tools/mkfont.py` with 4 bits of
     coverage per pixel (the file is 2.6 MB), and drawing blends each pixel
     with the background.
+  - JavaScript: a tree-walking interpreter written for fluxOS (js.c, with
+    the built-ins in jslib.c and regular expressions in jsre.c) runs a
+    page's inline and external scripts in order, then `DOMContentLoaded`
+    and `load`. It covers most of ES5 and the common parts of ES6 (`let`
+    and `const`, arrow functions, template literals, default and rest
+    parameters, spread, optional chaining, getters and setters, `Map` and
+    `Set`), with Object, Array, String, Number, Math, JSON, Date and RegExp.
+    The DOM (jsdom.c) has `document` (`getElementById`, `querySelector`,
+    `createElement`, `write`...), elements with `innerHTML`, `textContent`,
+    `style`, `classList`, `dataset`, attributes and tree editing, events
+    (`click`, `input`, `change`, `submit`, `keydown`...) through
+    `addEventListener`, `on*` properties and attributes, timers,
+    `location`, `history`, `localStorage` for the page's lifetime,
+    `XMLHttpRequest` (fetched like the page's other resources),
+    `performance.timing`, and `alert`. Changes to the page are laid out again when a script returns.
+    A script that runs too long or allocates too much is stopped.
 - Setup: a Win95-style wizard (the **Install fluxOS** icon) that installs
   fluxOS on a hard disk. It lists the disks, greying out any that are too
   small or hold the install files, asks you to confirm that the chosen disk
@@ -626,6 +642,8 @@ user/
                            and the web browser: its window (browser.c), HTML
                            parser (html.c), CSS (css.c), layout and painting
                            (layout.c), fonts (webfont.c) and URLs (webutil.c)
+                           and its JavaScript engine (js.c, jslib.c, jsre.c)
+                           and DOM bindings (jsdom.c)
   dos/                     the DOS emulator: the x86 CPU (cpu.c), the DPMI host
                            (dpmi.c), ROM, interrupt controller, timer and BIOS
                            services (bios.c), keyboard (keyboard.c), text
@@ -825,11 +843,11 @@ cannot show it, and the screen stays 80x25 (43- and 50-line modes keep 25
 lines). Recording on the Sound Blaster gives no data (the transfer runs, and
 nothing is written to memory); ADPCM, the direct DAC (command 10h), the
 MPU-401 and a speaker toggled by hand to make samples stay silent. There is
-no mouse driver, no EMS or XMS memory, no protected mode (so no DOS extenders such as
-DOS/4GW), no batch files, and no BIOS disk access (INT 13h), so self-booting
-and copy-protected software will not run. The terminal reports key presses
-but not releases, so each key is released right after it is pressed: games
-that need keys held down respond poorly. Every instruction is interpreted,
+no mouse driver, no EMS or XMS memory (protected-mode programs get theirs
+through DPMI), no batch files, and no BIOS disk access (INT 13h), so
+self-booting and copy-protected software will not run. In text mode the
+terminal reports key presses but not releases, so each key is released right
+after it is pressed; in graphics mode the desktop's terminal reports both. Every instruction is interpreted,
 which is quick enough for applications but keeps no PC's timing, so games that
 time themselves with delay loops may run too fast. Files keep no DOS
 attributes besides read-only, and their times cannot be set.
@@ -843,7 +861,10 @@ HTTPS is TLS 1.3 only, with one cipher suite (TLS_AES_128_GCM_SHA256) and
 X25519: servers that only speak TLS 1.2, or will not use X25519, cannot be
 reached. Certificates are not verified, so the encryption keeps out
 eavesdroppers but not someone who intercepts the connection and poses as
-the site. The browser runs no JavaScript and shows only PNG and JPEG pictures (GIF
+the site. The browser's JavaScript has no classes, destructuring, generators, async
+functions, promises or fetch (XMLHttpRequest works, always asynchronously),
+typed arrays are plain arrays, and eval runs in the global scope, so most
+modern web applications do not run; it shows only PNG and JPEG pictures (GIF
 and SVG show their alternative text). Its layout is an approximation: floats
 become inline-blocks, positioned elements stay in the normal flow (those
 hidden off-screen are dropped), grids are blocks, flex rows are lines of

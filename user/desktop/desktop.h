@@ -170,6 +170,8 @@ struct window *calculator_open(void);
 struct window *editor_open(const char *path);      /* path NULL: an empty document */
 void editor_blink(void);
 struct window *browser_open(const char *url);      /* url NULL: the home page */
+void browser_poll(void);                /* script timers and requests */
+int browser_timeout(void);              /* ms until browser_poll is needed, -1 if never */
 void browser_child_exited(int pid, int status);
 void browser_blink(void);
 void browser_tick(void);

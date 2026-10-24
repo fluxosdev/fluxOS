@@ -4,9 +4,10 @@
  * and a layout pass that turns the styled tree into a list of things to
  * paint. browser.c wraps it in a window and fetches pages with wget.
  *
- * All arithmetic is integer (user programs may not use the FPU): CSS
- * numbers are parsed as fixed point with two decimals, lengths are
- * resolved to whole pixels.
+ * All arithmetic here is integer (desktop code is built without the FPU):
+ * CSS numbers are parsed as fixed point with two decimals, lengths are
+ * resolved to whole pixels. Only the JavaScript engine (js.h), which
+ * needs doubles, is compiled with the FPU.
  */
 #ifndef WEB_H
 #define WEB_H
@@ -118,6 +119,8 @@ struct node {
     /* generated content: ::before and ::after with a string "content" */
     struct style *pseudo_st[2];
     const char *pseudo_text[2];
+
+    void *js;                           /* the script engine's wrapper (jsdom.c) */
 };
 
 struct node *html_parse(struct arena *a, const char *text, int len);

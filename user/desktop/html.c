@@ -557,8 +557,9 @@ static void start_tag(struct parser *p, const char *name, int nlen)
         } else {
             raw_text(p, n->name, &text, &len);
         }
-        if (t == T_SCRIPT || t == T_IFRAME || t == T_NOFRAMES)
+        if (t == T_IFRAME || t == T_NOFRAMES)
             return;                     /* never shown */
+        /* A script keeps its text for the script engine (scripts are display: none). */
         int rcdata = t == T_TEXTAREA || t == T_TITLE;
         struct node *tn = arena_alloc(p->a, sizeof(*tn));
         if (!tn)
