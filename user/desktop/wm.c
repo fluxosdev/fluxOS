@@ -1316,8 +1316,12 @@ static int menu_step(int from, int dir)
 
 static void key_event(const struct input_event *ev)
 {
-    if (!(ev->flags & IEV_PRESSED))
+    if (!(ev->flags & IEV_PRESSED)) {
+        /* Releases only matter to a window that follows keys held down. */
+        if (!menu_open && focused && focused->ops && focused->ops->key)
+            focused->ops->key(focused, ev);
         return;
+    }
     int code = ev->code;
     int ctrl = ev->mods & KMOD_CTRL, alt = ev->mods & KMOD_ALT;
 

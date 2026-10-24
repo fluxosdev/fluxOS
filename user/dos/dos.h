@@ -1,10 +1,11 @@
 /*
  * dos: runs DOS programs (.COM files and MZ .EXE files) on fluxOS.
  *
- * The program runs on an emulated PC: an x86 CPU in real mode (the 8086
- * instruction set with the 186, 286 and 386 additions usable in real
- * mode, and no FPU), one MiB of memory, a BIOS (video, keyboard, timer,
- * equipment) and DOS 5 (files, memory, processes, console). Each
+ * The program runs on an emulated PC: an x86 CPU (the 8086 instruction
+ * set with the 186, 286 and 386 additions, and no FPU), one MiB of
+ * memory, a BIOS (video, keyboard, timer, equipment) and DOS 5 (files,
+ * memory, processes, console). A DPMI host (dpmi.c) adds protected mode
+ * and extended memory for DOS extenders such as DOS/4GW. Each
  * interrupt vector initially points to a stub in the emulated ROM that
  * calls back into C, so programs can hook and chain interrupts as on a
  * real PC.
@@ -13,7 +14,8 @@
  * and D: the CD-ROM. Text the program prints goes to the terminal as it
  * would from a fluxOS program; once it draws on the screen (writing
  * video memory or moving the cursor), the terminal shows its 80x25
- * text screen instead.
+ * text screen instead. In the desktop's terminal, VGA graphics (mode 13h
+ * and its unchained "mode X" form) are shown too.
  */
 #ifndef DOS_H
 #define DOS_H
@@ -22,48 +24,94 @@
 
 /* ---- memory ---- */
 
-#define MEM_SIZE 0x100000               /* addresses wrap at 1 MiB (A20 off) */
+/*
+ * mem is the first MiB, until a protected-mode program asks for more:
+ * then it is reallocated with extended memory after it (dpmi.c), and
+ * mem_mask grows from the 1 MiB wrap of real mode (A20 off) to cover it.
+ * A0000-AFFFF is VGA memory in graphics modes (video.c), and F0000-FFFFF
+ * is ROM.
+ */
+#define MEM_SIZE 0x100000
 #define ADDR(seg, off) ((((uint32_t)(seg) << 4) + (uint32_t)(off)) & 0xFFFFF)
 
-extern uint8_t mem[MEM_SIZE + 4];
+extern uint8_t *mem;
+extern uint32_t mem_mask;
 extern int video_written;               /* the program wrote to text video memory */
+extern int vga_graphics;                /* A0000-AFFFF is the VGA's planes */
+
+uint8_t vga_read(uint32_t a);
+void vga_write(uint32_t a, uint8_t v);
 
 static inline uint8_t rb(uint32_t a)
 {
-    return mem[a & 0xFFFFF];
-}
-
-static inline uint16_t rw(uint32_t a)
-{
-    a &= 0xFFFFF;
-    return (uint16_t)(mem[a] | mem[(a + 1) & 0xFFFFF] << 8);
-}
-
-static inline uint32_t rd(uint32_t a)
-{
-    return rw(a) | (uint32_t)rw(a + 2) << 16;
+    a &= mem_mask;
+    if (a - 0xA0000 < 0x10000 && vga_graphics)
+        return vga_read(a);
+    return mem[a];
 }
 
 static inline void wb(uint32_t a, uint8_t v)
 {
-    a &= 0xFFFFF;
-    if (a >= 0xA0000) {
+    a &= mem_mask;
+    if (a - 0xA0000 < 0x60000) {
         if (a >= 0xF0000)
             return;                     /* ROM */
-        if (a >= 0xB0000 && a < 0xC0000)
+        if (a < 0xB0000) {
+            if (vga_graphics) {
+                vga_write(a, v);
+                return;
+            }
+        } else if (a < 0xC0000) {
             video_written = 1;
+        }
     }
     mem[a] = v;
 }
 
+/* Words and doublewords: in one go away from the edges and the video and
+ * ROM area, byte by byte there. */
+static inline int plain(uint32_t a, uint32_t n)
+{
+    a &= mem_mask;
+    return a <= mem_mask - n && (a + n <= 0xA0000 || a >= 0x100000);
+}
+
+static inline uint16_t rw(uint32_t a)
+{
+    if (plain(a, 2)) {
+        uint16_t v;
+        __builtin_memcpy(&v, mem + (a & mem_mask), 2);
+        return v;
+    }
+    return (uint16_t)(rb(a) | rb(a + 1) << 8);
+}
+
+static inline uint32_t rd(uint32_t a)
+{
+    if (plain(a, 4)) {
+        uint32_t v;
+        __builtin_memcpy(&v, mem + (a & mem_mask), 4);
+        return v;
+    }
+    return rw(a) | (uint32_t)rw(a + 2) << 16;
+}
+
 static inline void ww(uint32_t a, uint16_t v)
 {
+    if (plain(a, 2)) {
+        __builtin_memcpy(mem + (a & mem_mask), &v, 2);
+        return;
+    }
     wb(a, (uint8_t)v);
     wb(a + 1, (uint8_t)(v >> 8));
 }
 
 static inline void wd(uint32_t a, uint32_t v)
 {
+    if (plain(a, 4)) {
+        __builtin_memcpy(mem + (a & mem_mask), &v, 4);
+        return;
+    }
     ww(a, (uint16_t)v);
     ww(a + 2, (uint16_t)(v >> 16));
 }
@@ -85,9 +133,14 @@ enum { S_ES, S_CS, S_SS, S_DS, S_FS, S_GS };
 
 struct cpu {
     uint32_t r[8];
-    uint16_t seg[6];
+    uint16_t seg[6];                    /* selectors in protected mode */
+    uint32_t base[6];                   /* protected mode: the descriptors' bases */
     uint32_t ip;
     uint32_t flags;
+    int pm;                             /* protected mode (a DPMI client runs) */
+    int code32;                         /* CS is a 32-bit segment */
+    int stack32;                        /* SS is a 32-bit segment: ESP, not SP */
+    uint32_t ip_mask;                   /* 0xFFFF, or all ones with code32 */
     uint32_t ip_start;                  /* the instruction being executed */
     int inhibit;                        /* no interrupt before the next instruction */
     int stop;                           /* leave cpu_run() */
@@ -127,6 +180,18 @@ void cpu_run(uint32_t count);
 void cpu_interrupt(int n);              /* enter interrupt n as INT n does */
 void cpu_push16(uint16_t v);
 uint16_t cpu_pop16(void);
+void cpu_push32(uint32_t v);
+uint32_t cpu_pop32(void);
+uint32_t cpu_sp(void);                  /* SP, or ESP on a 32-bit stack */
+void cpu_set_sp(uint32_t v);
+/* Load segment register s: a paragraph in real mode, a selector in
+ * protected mode (from the DPMI host's descriptors). */
+void cpu_load_seg(int s, uint16_t sel);
+void cpu_real_mode(void);               /* leave protected mode */
+static inline uint32_t seg_base(int s)
+{
+    return cpu.pm ? cpu.base[s] : (uint32_t)cpu.seg[s] << 4;
+}
 
 static inline void set_cf(int on)
 {
@@ -146,6 +211,8 @@ static inline void set_zf(int on)
 #define CB_CPM     0x100                /* callbacks beyond the vectors */
 #define CB_IRET    0x101                /* (just an IRET) */
 #define CB_CASEMAP 0x102                /* country info case map routine */
+#define CB_DPMI    0x110                /* 0x110-0x1FF: the DPMI host's real-mode entries */
+#define CB_DPMI_END 0x200
 #define CALLBACK_OFF(id) (STUB_BASE + (id) * STUB_SIZE)
 #define FONT_OFF   0xA000               /* the 8x16 font at F000:A000 */
 
@@ -160,8 +227,27 @@ int pic_pending(void);                  /* an IRQ to deliver now, or -1 */
 void pic_ack(int irq);
 int irq_busy(int irq);                  /* requested or in service */
 int irq_masked(int irq);
+int irq_hooked(int irq);                /* the program has its own handler for the IRQ */
 void timer_poll(void);
 uint32_t bios_ticks(void);
+
+/* ---- DPMI (dpmi.c) ---- */
+
+/* A protected-mode code segment for the DPMI host's own stubs lies in the
+ * ROM at F000:DPMI_STUBS: its callback ids are DPMI_CB_PM and up. */
+#define DPMI_STUBS  0xC000
+#define DPMI_CB_PM  0x400
+
+void dpmi_callback(int id);             /* the 0F FF opcode, for DPMI ids */
+int dpmi_active(void);
+void dpmi_interrupt(int n, int hardware);   /* INT n (or an IRQ) in protected mode */
+int dpmi_irq_in_real_mode(int vector);  /* pass an IRQ up to a protected-mode handler */
+int dpmi_hooked(int vector);            /* the client set a protected-mode handler */
+void dpmi_exception(int n);             /* a fault in protected mode */
+int dpmi_descriptor(uint16_t sel, uint32_t *base, uint32_t *limit, uint8_t *access, int *big);
+void dpmi_terminate(uint16_t psp);      /* the program ended: drop its protected mode */
+void dpmi_install_check(void);          /* INT 2Fh AX=1687h */
+void dpmi_rom_init(void);               /* the host's stubs in the ROM */
 
 /* ---- sound (sound.c) ---- */
 
@@ -188,6 +274,7 @@ void kbd_pump(void);                    /* deliver queued keys as IRQ 1 */
 uint8_t kbd_port60(void);
 uint8_t kbd_port64(void);
 void kbd_idle_hint(void);               /* the program polled and found no key */
+void kbd_raw(int on);                   /* key presses and releases from the terminal */
 void int16(void);
 
 /* ---- video ---- */
@@ -201,6 +288,9 @@ void video_flush(void);
 void con_putc(uint8_t c);               /* console output: teletype with ANSI.SYS */
 void con_puts(const char *s);
 void video_crtc_write(int index, uint8_t v);
+int vga_io_in(uint16_t port, uint8_t *v);       /* 1 if the port is a VGA register */
+int vga_io_out(uint16_t port, uint8_t v);
+int video_graphics_ok(void);            /* the terminal can show graphics */
 void int10(void);
 extern int screen_mode;
 
@@ -239,6 +329,10 @@ void dos_cpm_call(void);
 void dos_terminate(int code, int type);
 void dos_keep(uint16_t paras, int code);        /* terminate and stay resident */
 int dos_ctrl_c(void);                   /* 1 if it ended the program */
+/* Conventional memory for the DPMI host (INT 31h 0100h-0102h); DOS error codes. */
+int dos_mem_alloc(uint16_t paras, uint16_t *seg, uint16_t *largest);
+int dos_mem_free(uint16_t seg);
+int dos_mem_resize(uint16_t seg, uint16_t paras, uint16_t *max);
 uint8_t cp437_upper(uint8_t c);
 extern int dos_exited;
 extern int dos_exit_code;

@@ -9,6 +9,12 @@
  * handler puts the keystroke in the BIOS buffer in the data area
  * (40:1E-40:3D), where INT 16h and DOS find it.
  *
+ * While VGA graphics are shown, the desktop's terminal sends every key
+ * press and release instead, as ESC [ code ; down k with the fluxOS key
+ * code (the PC scan code, 80h for E0 keys). Those go to port 60h as they
+ * are, so games see keys held down, and the BIOS keystroke comes from a
+ * US keyboard table.
+ *
  * Ctrl+\ ends the emulator, whatever the program is doing.
  */
 #include <flux.h>
@@ -17,7 +23,7 @@
 #include <unistd.h>
 #include "dos.h"
 
-#define QUEUE 64
+#define QUEUE 128
 #define INPUT 256
 #define ESC_WAIT_MS 30                  /* a lone ESC: no sequence follows */
 
@@ -28,18 +34,22 @@
 static int in_fd = -1;
 static int old_mode = -1;
 
-static uint32_t queue[QUEUE];           /* mods << 16 | scan << 8 | char */
+/* mods << 16 | scan << 8 | char, or for a raw byte:
+ * RAW | byte << 16 | the BIOS keystroke it makes (0 for none). */
+#define RAW 0x1000000u
+static uint32_t queue[QUEUE];
 static int q_head, q_tail;
 static uint8_t input[INPUT];
 static int in_len;
 
 /* Delivery of the key at the head of the queue through port 60h:
- * 0 idle, 1 make code raised, 2 break code raised. */
+ * 0 idle, 1 make code raised, 2 break code raised, 3 raw byte raised. */
 static int phase;
 static uint32_t current;
 static uint8_t port60;
 static int port_read;                   /* port 60h read since the last IRQ */
 static int empty_polls;
+static int raw_mode;
 
 /* Scan codes of the ASCII characters on a US keyboard. */
 static uint8_t scan_of[128];
@@ -176,6 +186,8 @@ static void key_nav(uint8_t scan, int m)
     enqueue((uint16_t)(scan << 8), m == 2 ? MOD_SHIFT : m >= 5 ? MOD_CTRL : 0);
 }
 
+static void key_raw(int code, int down);
+
 /* Parse one escape sequence at input[i] (after the ESC). Returns the
  * bytes it used, or 0 if it is incomplete. */
 static int parse_escape(int i)
@@ -186,6 +198,23 @@ static int parse_escape(int i)
     uint8_t intro = input[i++];
     if (intro != '[' && intro != 'O') {
         key_alt(intro);
+        return i - start;
+    }
+    if (intro == '[' && raw_mode) {     /* ESC [ code ; down k */
+        int p0 = 0, p1 = 0, semi = 0;
+        while (i < in_len && ((input[i] >= '0' && input[i] <= '9') || input[i] == ';')) {
+            if (input[i] == ';')
+                semi = 1;
+            else if (semi)
+                p1 = p1 * 10 + (input[i] - '0');
+            else
+                p0 = p0 * 10 + (input[i] - '0');
+            i++;
+        }
+        if (i >= in_len)
+            return 0;
+        if (input[i++] == 'k')
+            key_raw(p0, p1);
         return i - start;
     }
     if (intro == '[' && i < in_len && input[i] == '[') {    /* Linux console F1-F5 */
@@ -251,6 +280,115 @@ static void stop_requested(void)
     fatal("stopped (Ctrl+\\)");
 }
 
+void kbd_raw(int on)
+{
+    raw_mode = on;
+}
+
+static void enqueue_raw(uint8_t byte, uint16_t key)
+{
+    int next = (q_tail + 1) % QUEUE;
+    if (next == q_head)
+        return;
+    queue[q_tail] = RAW | (uint32_t)byte << 16 | key;
+    q_tail = next;
+}
+
+/* The BIOS keystroke for a make code, from the shift state in 40:17. */
+static uint16_t bios_key(uint8_t sc, int ext)
+{
+    static const char normal[0x3A] =
+        "\0\x1b" "1234567890-=\b\tqwertyuiop[]\r\0asdfghjkl;'`\0\\zxcvbnm,./\0*\0 ";
+    static const char shifted[0x3A] =
+        "\0\x1b" "!@#$%^&*()_+\b\tQWERTYUIOP{}\r\0ASDFGHJKL:\"~\0|ZXCVBNM<>?\0*\0 ";
+    static const char keypad[13] = "789-456+1230.";
+    uint8_t st = mem[0x417];
+    int shift = st & 3, ctrl = st & MOD_CTRL, alt = st & MOD_ALT;
+    if (ext) {
+        if (sc == 0x1C)
+            return 0xE00D;              /* keypad Enter */
+        if (sc == 0x35)
+            return 0xE02F;              /* keypad / */
+        if (sc >= 0x47 && sc <= 0x53 && sc != 0x4A && sc != 0x4E && sc != 0x4C) {
+            uint8_t s = sc;
+            if (ctrl) {
+                static const uint8_t c[13] = { 0x77, 0x8D, 0x84, 0, 0x73, 0, 0x74, 0, 0x75, 0x91,
+                                               0x76, 0x92, 0x93 };
+                s = c[sc - 0x47];
+            } else if (alt) {
+                s = (uint8_t)(sc + 0x50);
+            }
+            return (uint16_t)(s << 8 | (ctrl || alt ? 0 : 0xE0));
+        }
+        return 0;
+    }
+    if (sc >= 0x3B && sc <= 0x44)       /* F1-F10 */
+        return (uint16_t)((shift ? sc + 0x19 : ctrl ? sc + 0x23 : alt ? sc + 0x2D : sc) << 8);
+    if (sc == 0x57 || sc == 0x58)       /* F11, F12 */
+        return (uint16_t)((sc + (shift ? 0x30 : ctrl ? 0x32 : alt ? 0x34 : 0x2E)) << 8);
+    if (sc >= 0x47 && sc <= 0x53) {     /* the keypad */
+        int digits = ((st & 0x20) != 0) != (shift != 0);
+        char ch = keypad[sc - 0x47];
+        if (ch == '-' || ch == '+' || (digits && !alt && !ctrl))
+            return (uint16_t)(sc << 8 | (uint8_t)ch);
+        return (uint16_t)(sc << 8);
+    }
+    if (sc >= 0x3A || !normal[sc])
+        return 0;
+    if (alt) {
+        if (sc >= 0x02 && sc <= 0x0D)
+            return (uint16_t)((sc + 0x76) << 8);
+        return (uint16_t)(sc << 8);
+    }
+    char ch = normal[sc];
+    if (ctrl) {
+        if (ch >= 'a' && ch <= 'z')
+            return (uint16_t)(sc << 8 | (ch - 'a' + 1));
+        if (ch == '[' || ch == '\\' || ch == ']')
+            return (uint16_t)(sc << 8 | (ch == '[' ? 0x1B : ch == '\\' ? 0x1C : 0x1D));
+        if (ch == '\r')
+            return 0x1C0A;
+        if (ch == '\b')
+            return 0x0E7F;
+        return 0;
+    }
+    int upper = shift;
+    if (ch >= 'a' && ch <= 'z' && (st & 0x40))
+        upper = !upper;                 /* Caps Lock */
+    if (ch >= 'a' && ch <= 'z')
+        ch = upper ? shifted[sc] : ch;
+    else if (shift)
+        ch = shifted[sc];
+    return (uint16_t)(sc << 8 | (uint8_t)ch);
+}
+
+/* A key press or release from the terminal: fluxOS key code (the scan code, 80h for E0). */
+static void key_raw(int code, int down)
+{
+    uint8_t sc = (uint8_t)(code & 0x7F);
+    int ext = (code & 0x80) != 0;
+    uint8_t bit = 0;
+    switch (sc) {
+    case 0x2A: bit = ext ? 0 : 0x02; break;     /* left Shift (E0 2A is a fake shift) */
+    case 0x36: bit = 0x01; break;
+    case 0x1D: bit = MOD_CTRL; break;
+    case 0x38: bit = MOD_ALT; break;
+    }
+    if (bit)
+        mem[0x417] = down ? mem[0x417] | bit : mem[0x417] & ~bit;
+    if (down && !ext) {
+        if (sc == 0x3A)
+            mem[0x417] ^= 0x40;
+        else if (sc == 0x45)
+            mem[0x417] ^= 0x20;
+    }
+    if (down && sc == 0x2B && (mem[0x417] & MOD_CTRL))
+        stop_requested();
+    if (ext)
+        enqueue_raw(0xE0, 0);
+    enqueue_raw(down ? sc : (uint8_t)(sc | 0x80), down ? bios_key(sc, ext) : 0);
+}
+
 /* Turn the bytes read so far into keystrokes. A trailing incomplete
  * escape sequence is kept for the next read. */
 static void parse_input(int flush_esc)
@@ -258,7 +396,7 @@ static void parse_input(int flush_esc)
     int i = 0;
     while (i < in_len) {
         uint8_t c = input[i];
-        if (c == 0x1C)
+        if (c == 0x1C && !raw_mode)
             stop_requested();
         if (c != 0x1B) {
             key_char(c);
@@ -336,6 +474,11 @@ void kbd_pump(void)
             return;
         current = queue[q_head];
         q_head = (q_head + 1) % QUEUE;
+        if (current & RAW) {
+            port60 = (uint8_t)(current >> 16);
+            phase = 3;
+            break;
+        }
         port60 = (uint8_t)(current >> 8);
         mem[0x417] = (uint8_t)((mem[0x417] & ~(MOD_SHIFT | MOD_CTRL | MOD_ALT)) | (current >> 16));
         phase = 1;
@@ -344,6 +487,9 @@ void kbd_pump(void)
         port60 = (uint8_t)((current >> 8) | 0x80);
         phase = 2;
         break;
+    case 3:
+        phase = 0;
+        return;
     default:
         mem[0x417] &= (uint8_t)~(MOD_SHIFT | MOD_CTRL | MOD_ALT);
         phase = 0;
@@ -369,6 +515,8 @@ void kbd_irq_ack(void)
 {
     port_read = 1;
     if (phase == 1 && !(port60 & 0x80))
+        kbd_push((uint16_t)current);
+    else if (phase == 3 && (uint16_t)current)
         kbd_push((uint16_t)current);
 }
 

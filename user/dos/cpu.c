@@ -1,5 +1,6 @@
 /*
- * The CPU: an x86 in real mode, interpreted one instruction at a time.
+ * The CPU: an x86 in real or protected mode, interpreted one instruction
+ * at a time.
  *
  * It implements the 8086 instruction set, the 186/286 additions (PUSHA,
  * ENTER, immediate shifts and IMUL, BOUND, INS/OUTS) and what a 386
@@ -14,6 +15,13 @@
  * the faulting instruction's address pushed, as on a 286 or later.
  * Opcode 0F FF followed by a 16-bit id calls into the emulator; the ROM
  * interrupt stubs use it.
+ *
+ * Protected mode is there for DPMI clients (see dpmi.c), which run at
+ * ring 3 and never touch the descriptor tables themselves: segment
+ * registers take their base and size from the DPMI host's descriptors,
+ * a 32-bit code segment makes 32-bit operands and addresses the default,
+ * a 32-bit stack segment uses ESP, and interrupts and faults go to the
+ * host. Limits and privileges are not checked.
  */
 #include <string.h>
 #include "dos.h"
@@ -30,15 +38,12 @@ static int rep_prefix;                  /* 0, 0xF2 (REPNE) or 0xF3 (REP/REPE) */
 #define MASK(s) ((s) == 8 ? 0xFFu : (s) == 16 ? 0xFFFFu : 0xFFFFFFFFu)
 #define SIGN(s) (1u << ((s) - 1))
 
-static inline uint32_t segbase(int s)
-{
-    return (uint32_t)cpu.seg[s] << 4;
-}
+#define segbase seg_base
 
 static inline uint8_t fetch8(void)
 {
     uint8_t b = rb(segbase(S_CS) + cpu.ip);
-    cpu.ip = (cpu.ip + 1) & 0xFFFF;
+    cpu.ip = (cpu.ip + 1) & cpu.ip_mask;
     return b;
 }
 
@@ -62,6 +67,12 @@ static inline uint32_t fetch_v(void)
 static inline int vsize(void)
 {
     return opsize32 ? 32 : 16;
+}
+
+/* Instruction pointers are cut to the operand size. */
+static inline uint32_t vmask(void)
+{
+    return opsize32 ? 0xFFFFFFFFu : 0xFFFFu;
 }
 
 static inline uint32_t get_reg(int size, int r)
@@ -200,31 +211,55 @@ static inline void rm_set(const struct modrm *m, int size, uint32_t v)
 
 /* ---- stack ---- */
 
+uint32_t cpu_sp(void)
+{
+    return cpu.stack32 ? cpu.r[R_SP] : SP;
+}
+
+void cpu_set_sp(uint32_t v)
+{
+    if (cpu.stack32)
+        cpu.r[R_SP] = v;
+    else
+        SP = (uint16_t)v;
+}
+
+static inline void sp_add(int32_t d)
+{
+    if (cpu.stack32)
+        cpu.r[R_SP] += (uint32_t)d;
+    else
+        SP = (uint16_t)(SP + d);
+}
+
 void cpu_push16(uint16_t v)
 {
-    SP -= 2;
-    ww(segbase(S_SS) + SP, v);
+    sp_add(-2);
+    ww(segbase(S_SS) + cpu_sp(), v);
 }
 
 uint16_t cpu_pop16(void)
 {
-    uint16_t v = rw(segbase(S_SS) + SP);
-    SP += 2;
+    uint16_t v = rw(segbase(S_SS) + cpu_sp());
+    sp_add(2);
     return v;
 }
 
-static void push32(uint32_t v)
+void cpu_push32(uint32_t v)
 {
-    SP -= 4;
-    wd(segbase(S_SS) + SP, v);
+    sp_add(-4);
+    wd(segbase(S_SS) + cpu_sp(), v);
 }
 
-static uint32_t pop32(void)
+uint32_t cpu_pop32(void)
 {
-    uint32_t v = rd(segbase(S_SS) + SP);
-    SP += 4;
+    uint32_t v = rd(segbase(S_SS) + cpu_sp());
+    sp_add(4);
     return v;
 }
+
+#define push32 cpu_push32
+#define pop32 cpu_pop32
 
 static void push_v(uint32_t v)
 {
@@ -239,10 +274,55 @@ static uint32_t pop_v(void)
     return opsize32 ? pop32() : cpu_pop16();
 }
 
+/* ---- segments ---- */
+
+void cpu_load_seg(int s, uint16_t sel)
+{
+    cpu.seg[s] = sel;
+    if (!cpu.pm)
+        return;
+    uint32_t base, limit;
+    uint8_t access;
+    int big;
+    if (!(sel & 0xFFFC)) {
+        if (s == S_CS || s == S_SS) {
+            dlog("null selector loaded into %s at %04x:%08x\n", s == S_CS ? "CS" : "SS",
+                 cpu.seg[S_CS], cpu.ip_start);
+            dpmi_exception(13);
+        }
+        cpu.base[s] = 0;
+        return;
+    }
+    if (!dpmi_descriptor(sel, &base, &limit, &access, &big)) {
+        dlog("bad selector %04x loaded at %04x:%08x\n", sel, cpu.seg[S_CS], cpu.ip_start);
+        dpmi_exception(13);
+        return;
+    }
+    cpu.base[s] = base;
+    if (s == S_CS) {
+        cpu.code32 = big;
+        cpu.ip_mask = big ? 0xFFFFFFFFu : 0xFFFFu;
+    } else if (s == S_SS) {
+        cpu.stack32 = big;
+    }
+}
+
+void cpu_real_mode(void)
+{
+    cpu.pm = 0;
+    cpu.code32 = cpu.stack32 = 0;
+    cpu.ip_mask = 0xFFFF;
+    cpu.r[R_SP] &= 0xFFFF;
+}
+
 /* ---- interrupts and faults ---- */
 
 void cpu_interrupt(int n)
 {
+    if (cpu.pm) {
+        dpmi_interrupt(n, 0);
+        return;
+    }
     cpu_push16((uint16_t)cpu.flags);
     cpu_push16(CS);
     cpu_push16((uint16_t)cpu.ip);
@@ -254,12 +334,15 @@ void cpu_interrupt(int n)
 static void fault(int n)
 {
     cpu.ip = cpu.ip_start;
-    cpu_interrupt(n);
+    if (cpu.pm)
+        dpmi_exception(n);
+    else
+        cpu_interrupt(n);
 }
 
 static void invalid_opcode(void)
 {
-    uint32_t at = ADDR(CS, cpu.ip_start);
+    uint32_t at = segbase(S_CS) + cpu.ip_start;
     dlog("invalid opcode %02x %02x %02x at %04x:%04x\n", rb(at), rb(at + 1), rb(at + 2),
          CS, cpu.ip_start);
     fault(6);
@@ -732,13 +815,13 @@ static void bit_test(int op, const struct modrm *m, uint32_t bit, int from_reg)
 
 static void jump_rel(int32_t d)
 {
-    cpu.ip = (cpu.ip + (uint32_t)d) & 0xFFFF;
+    cpu.ip = (cpu.ip + (uint32_t)d) & vmask();
 }
 
 static void far_jump(uint16_t seg, uint32_t off)
 {
-    CS = seg;
-    cpu.ip = off & 0xFFFF;
+    cpu_load_seg(S_CS, seg);
+    cpu.ip = off & vmask();
 }
 
 static void load_far_pointer(int seg)
@@ -751,7 +834,7 @@ static void load_far_pointer(int seg)
     }
     int size = vsize();
     uint32_t off = mread(size, m.addr);
-    cpu.seg[seg] = rw(m.addr + (uint32_t)size / 8);
+    cpu_load_seg(seg, rw(m.addr + (uint32_t)size / 8));
     set_reg(size, m.reg, off);
     if (seg == S_SS)
         cpu.inhibit = 1;
@@ -783,9 +866,43 @@ static void step_0f(void)
     }
 
     switch (op) {
-    case 0x00:                          /* protected-mode only */
-        invalid_opcode();
+    case 0x00:                          /* SLDT, STR, LLDT, LTR, VERR, VERW */
+        if (!cpu.pm) {
+            invalid_opcode();
+            return;
+        }
+        decode(&m);
+        if (m.reg == 4 || m.reg == 5) {
+            uint32_t base, limit;
+            uint8_t access;
+            int big;
+            set_flag(F_ZF, dpmi_descriptor((uint16_t)rm_get(&m, 16), &base, &limit, &access, &big));
+        } else if (m.reg < 2) {
+            rm_set(&m, 16, 0);
+        }
         return;
+    case 0x02:                          /* LAR */
+    case 0x03: {                        /* LSL */
+        uint32_t base, limit;
+        uint8_t access;
+        int big;
+        if (!cpu.pm) {
+            invalid_opcode();
+            return;
+        }
+        decode(&m);
+        if (!dpmi_descriptor((uint16_t)rm_get(&m, 16), &base, &limit, &access, &big)) {
+            cpu.flags &= ~F_ZF;
+            return;
+        }
+        cpu.flags |= F_ZF;
+        if (op == 0x02)
+            set_reg(size, m.reg, (uint32_t)access << 8 | (big ? 0x400000u : 0) |
+                                 (limit > 0xFFFFF ? 0x800000u : 0));
+        else
+            set_reg(size, m.reg, limit);
+        return;
+    }
     case 0x01:
         decode(&m);
         switch (m.reg) {
@@ -801,12 +918,13 @@ static void step_0f(void)
         case 2:                         /* LGDT, LIDT: accepted, unused */
         case 3:
             return;
-        case 4:                         /* SMSW: real mode, no FPU */
-            rm_set(&m, 16, 0x0010);
+        case 4:                         /* SMSW: no FPU */
+            rm_set(&m, 16, 0x0010 | (uint32_t)cpu.pm);
             return;
         case 6:                         /* LMSW */
-            if (rm_get(&m, 16) & 1)
-                fatal("the program switched to protected mode, which is not supported");
+            if ((rm_get(&m, 16) & 1) && !cpu.pm)
+                fatal("the program switched to protected mode itself, which is only "
+                      "supported through DPMI");
             return;
         default:
             invalid_opcode();
@@ -819,18 +937,19 @@ static void step_0f(void)
     case 0x20:                          /* MOV r32, CRn */
     case 0x21:                          /* MOV r32, DRn */
         decode(&m);
-        cpu.r[m.rm] = op == 0x20 && m.reg == 0 ? 0x00000010 : 0;
+        cpu.r[m.rm] = op == 0x20 && m.reg == 0 ? 0x00000010u | (uint32_t)cpu.pm : 0;
         return;
     case 0x22:                          /* MOV CRn, r32 */
     case 0x23:
         decode(&m);
-        if (op == 0x22 && m.reg == 0 && (cpu.r[m.rm] & 1))
-            fatal("the program switched to protected mode, which is not supported");
+        if (op == 0x22 && m.reg == 0 && (cpu.r[m.rm] & 1) && !cpu.pm)
+            fatal("the program switched to protected mode itself, which is only "
+                  "supported through DPMI");
         return;
     case 0xA0: push_v(cpu.seg[S_FS]); return;
-    case 0xA1: cpu.seg[S_FS] = (uint16_t)pop_v(); return;
+    case 0xA1: cpu_load_seg(S_FS, (uint16_t)pop_v()); return;
     case 0xA8: push_v(cpu.seg[S_GS]); return;
-    case 0xA9: cpu.seg[S_GS] = (uint16_t)pop_v(); return;
+    case 0xA9: cpu_load_seg(S_GS, (uint16_t)pop_v()); return;
     case 0xA3:                          /* BT */
     case 0xAB:                          /* BTS */
     case 0xB3:                          /* BTR */
@@ -919,9 +1038,14 @@ static void step_0f(void)
         rm_set(&m, sz, r);
         return;
     }
-    case 0xFF:                          /* emulator callback */
-        bios_callback(fetch16());
+    case 0xFF: {                        /* emulator callback */
+        int id = fetch16();
+        if (id >= DPMI_CB_PM || (id >= CB_DPMI && id < CB_DPMI_END))
+            dpmi_callback(id);
+        else
+            bios_callback(id);
         return;
+    }
     default:
         invalid_opcode();
         return;
@@ -937,7 +1061,7 @@ static void step(void)
     int size;
 
     cpu.ip_start = cpu.ip;
-    opsize32 = addrsize32 = 0;
+    opsize32 = addrsize32 = cpu.code32;
     seg_ovr = -1;
     rep_prefix = 0;
 
@@ -953,8 +1077,8 @@ static void step(void)
         case 0x3E: seg_ovr = S_DS; continue;
         case 0x64: seg_ovr = S_FS; continue;
         case 0x65: seg_ovr = S_GS; continue;
-        case 0x66: opsize32 = 1; continue;
-        case 0x67: addrsize32 = 1; continue;
+        case 0x66: opsize32 = !cpu.code32; continue;
+        case 0x67: addrsize32 = !cpu.code32; continue;
         case 0xF0: continue;            /* LOCK */
         case 0xF2:
         case 0xF3: rep_prefix = op; continue;
@@ -999,13 +1123,13 @@ static void step(void)
 
     switch (op) {
     case 0x06: push_v(ES); return;
-    case 0x07: ES = (uint16_t)pop_v(); return;
+    case 0x07: cpu_load_seg(S_ES, (uint16_t)pop_v()); return;
     case 0x0E: push_v(CS); return;
     case 0x0F: step_0f(); return;
     case 0x16: push_v(SS); return;
-    case 0x17: SS = (uint16_t)pop_v(); cpu.inhibit = 1; return;
+    case 0x17: cpu_load_seg(S_SS, (uint16_t)pop_v()); cpu.inhibit = 1; return;
     case 0x1E: push_v(DS); return;
-    case 0x1F: DS = (uint16_t)pop_v(); return;
+    case 0x1F: cpu_load_seg(S_DS, (uint16_t)pop_v()); return;
     case 0x27: daa_das(0); return;
     case 0x2F: daa_das(1); return;
     case 0x37: aaa_aas(0); return;
@@ -1060,6 +1184,20 @@ static void step(void)
             fault(5);
         return;
     }
+    case 0x63:                          /* ARPL (protected mode only) */
+        if (!cpu.pm) {
+            invalid_opcode();
+            return;
+        }
+        decode(&m);
+        v = rm_get(&m, 16);
+        if ((v & 3) < (REG16(m.reg) & 3u)) {
+            rm_set(&m, 16, (v & ~3u) | (REG16(m.reg) & 3u));
+            cpu.flags |= F_ZF;
+        } else {
+            cpu.flags &= ~F_ZF;
+        }
+        return;
     case 0x68: push_v(fetch_v()); return;
     case 0x6A: push_v(sign_extend(fetch8(), 8)); return;
     case 0x69:                          /* IMUL Gv, Ev, Iv */
@@ -1148,7 +1286,7 @@ static void step(void)
             invalid_opcode();
             return;
         }
-        cpu.seg[m.reg] = (uint16_t)rm_get(&m, 16);
+        cpu_load_seg(m.reg, (uint16_t)rm_get(&m, 16));
         if (m.reg == S_SS)
             cpu.inhibit = 1;
         return;
@@ -1250,12 +1388,12 @@ static void step(void)
     }
     case 0xC2: {                        /* RET imm16 */
         uint16_t n = fetch16();
-        cpu.ip = pop_v() & 0xFFFF;
-        SP += n;
+        cpu.ip = pop_v() & vmask();
+        sp_add(n);
         return;
     }
     case 0xC3:
-        cpu.ip = pop_v() & 0xFFFF;
+        cpu.ip = pop_v() & vmask();
         return;
     case 0xC4: load_far_pointer(S_ES); return;
     case 0xC5: load_far_pointer(S_DS); return;
@@ -1270,43 +1408,51 @@ static void step(void)
         int level = fetch8() & 31;
         size = vsize();
         push_v(get_reg(size, R_BP));
-        uint32_t frame = SP;
+        uint32_t frame = cpu_sp();
         for (int i = 1; i < level; i++) {
-            BP = (uint16_t)(BP - size / 8);
-            push_v(mread(size, segbase(S_SS) + BP));
+            if (cpu.stack32)
+                cpu.r[R_BP] -= (uint32_t)size / 8;
+            else
+                BP = (uint16_t)(BP - size / 8);
+            push_v(mread(size, segbase(S_SS) + (cpu.stack32 ? cpu.r[R_BP] : BP)));
         }
         if (level)
             push_v(frame);
         set_reg(size, R_BP, frame);
-        SP -= alloc;
+        sp_add(-(int32_t)alloc);
         return;
     }
     case 0xC9:                          /* LEAVE */
-        SP = BP;
+        cpu_set_sp(cpu.stack32 ? cpu.r[R_BP] : BP);
         set_reg(vsize(), R_BP, pop_v());
         return;
     case 0xCA: {                        /* RETF imm16 */
         uint16_t n = fetch16();
-        cpu.ip = pop_v() & 0xFFFF;
-        CS = (uint16_t)pop_v();
-        SP += n;
+        uint32_t ip = pop_v();
+        cpu_load_seg(S_CS, (uint16_t)pop_v());
+        cpu.ip = ip & vmask();
+        sp_add(n);
         return;
     }
-    case 0xCB:
-        cpu.ip = pop_v() & 0xFFFF;
-        CS = (uint16_t)pop_v();
+    case 0xCB: {
+        uint32_t ip = pop_v();
+        cpu_load_seg(S_CS, (uint16_t)pop_v());
+        cpu.ip = ip & vmask();
         return;
+    }
     case 0xCC: cpu_interrupt(3); return;
     case 0xCD: cpu_interrupt(fetch8()); return;
     case 0xCE:
         if (cpu.flags & F_OF)
             cpu_interrupt(4);
         return;
-    case 0xCF:                          /* IRET */
-        cpu.ip = pop_v() & 0xFFFF;
-        CS = (uint16_t)pop_v();
+    case 0xCF: {                        /* IRET */
+        uint32_t ip = pop_v();
+        cpu_load_seg(S_CS, (uint16_t)pop_v());
+        cpu.ip = ip & vmask();
         set_flags16(pop_v());
         return;
+    }
 
     case 0xD4: {                        /* AAM */
         uint8_t base = fetch8();
@@ -1436,7 +1582,7 @@ static void step(void)
         case 2:                         /* CALL near indirect */
             v = rm_get(&m, size);
             push_v(cpu.ip);
-            cpu.ip = v & 0xFFFF;
+            cpu.ip = v & vmask();
             return;
         case 3:                         /* CALL far indirect */
         case 5: {                       /* JMP far indirect */
@@ -1454,7 +1600,7 @@ static void step(void)
             return;
         }
         case 4:                         /* JMP near indirect */
-            cpu.ip = rm_get(&m, size) & 0xFFFF;
+            cpu.ip = rm_get(&m, size) & vmask();
             return;
         case 6:
             push_v(rm_get(&m, size));
@@ -1478,9 +1624,13 @@ void cpu_run(uint32_t count)
         if (pic_irr && !cpu.inhibit && (cpu.flags & F_IF)) {
             int irq = pic_pending();
             if (irq >= 0) {
+                int vector = irq < 8 ? 8 + irq : 0x70 + irq - 8;
                 cpu.halted = 0;
                 pic_ack(irq);
-                cpu_interrupt(irq < 8 ? 8 + irq : 0x70 + irq - 8);
+                if (cpu.pm)
+                    dpmi_interrupt(vector, 1);
+                else if (!dpmi_irq_in_real_mode(vector))
+                    cpu_interrupt(vector);
             }
         }
         cpu.inhibit = 0;
@@ -1502,4 +1652,5 @@ void cpu_reset(void)
     }
     memset(&cpu, 0, sizeof(cpu));
     cpu.flags = 0x0202;                 /* IF set; bit 1 always reads 1 */
+    cpu.ip_mask = 0xFFFF;
 }

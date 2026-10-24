@@ -17,7 +17,9 @@
 #include <flux/font.h>
 #include "dos.h"
 
-uint8_t mem[MEM_SIZE + 4];
+static uint8_t conventional[MEM_SIZE + 4];
+uint8_t *mem = conventional;
+uint32_t mem_mask = MEM_SIZE - 1;
 int video_written;
 
 /* ---- interrupt controller (one 8259; IRQs 8-15 never fire) ---- */
@@ -67,6 +69,13 @@ int irq_busy(int irq)
 int irq_masked(int irq)
 {
     return (pic_imr >> irq) & 1;
+}
+
+int irq_hooked(int irq)
+{
+    int vector = irq < 8 ? 8 + irq : 0x70 + irq - 8;
+    return rw((uint32_t)vector * 4) != CALLBACK_OFF(vector) ||
+           rw((uint32_t)vector * 4 + 2) != BIOS_SEG || dpmi_hooked(vector);
 }
 
 /* ---- timer (8253 PIT) ---- */
@@ -209,7 +218,7 @@ uint32_t io_in(uint16_t port, int size)
     if (size > 8)
         return io_in(port, 8) | io_in((uint16_t)(port + 1), size - 8) << 8;
     uint8_t sv;
-    if (sound_io_in(port, &sv))
+    if (sound_io_in(port, &sv) || vga_io_in(port, &sv))
         return sv;
     switch (port) {
     case 0x20:
@@ -255,7 +264,7 @@ void io_out(uint16_t port, uint32_t v, int size)
         return;
     }
     uint8_t b = (uint8_t)v;
-    if (sound_io_out(port, b))
+    if (sound_io_out(port, b) || vga_io_out(port, b))
         return;
     switch (port) {
     case 0x20:
@@ -534,7 +543,7 @@ static void stub(int id, const uint8_t *code, int n)
 
 void bios_init(void)
 {
-    memset(mem, 0, sizeof(mem));
+    memset(mem, 0, MEM_SIZE + 4);
     memset(mem + 0xF0000, 0xCF, 0x10000);   /* stray jumps into the ROM return */
 
     for (int n = 0; n < 256; n++) {
@@ -545,6 +554,11 @@ void bios_init(void)
             code[6] = 0xCF;
         }
         stub(n, code, 8);
+        /* As on a PC, the vectors no one has claimed (60h-66h for user
+         * programs, and 78h up) are zero: DOS extenders look for free
+         * vectors as ones that are equal. */
+        if ((n >= 0x60 && n <= 0x66) || n >= 0x78)
+            continue;
         ww((uint32_t)n * 4, (uint16_t)CALLBACK_OFF(n));
         ww((uint32_t)n * 4 + 2, BIOS_SEG);
     }
@@ -591,4 +605,5 @@ void bios_init(void)
         pit[i].access = 3;
     }
     timer_last_ms = now_ms();
+    dpmi_rom_init();
 }

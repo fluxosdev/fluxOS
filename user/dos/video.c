@@ -16,10 +16,25 @@
  *    are drawn with ANSI escapes every few tens of milliseconds.
  *
  * Console output understands the ANSI.SYS escapes. Characters below 32
- * have no glyphs in the terminal font and are drawn as look-alikes;
- * graphics modes cannot be shown at all.
+ * have no glyphs in the terminal font and are drawn as look-alikes.
+ *
+ * VGA graphics: mode 13h (320x200, 256 colours), including the unchained
+ * form games turn it into ("mode X"), with the planes, map mask, read
+ * map, latches and bit mask, the DAC and the display start address. The
+ * fluxOS desktop's terminal can show it (FLUX_TERMINAL is set in its
+ * environment): the screen goes there in an escape sequence of its own,
+ * ESC _ G and a command byte:
+ *
+ *   B          graphics begin (and keys come as presses and releases)
+ *   P rgb*256  the palette, 8 bits a component
+ *   R y n pix  n rows of 320 pixels from row y
+ *   E          graphics end
+ *
+ * Only rows that changed since the last refresh are sent. Elsewhere a
+ * graphics mode ends the program with a message.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include "dos.h"
@@ -28,6 +43,10 @@
 #define COLS 80
 
 int screen_mode;
+int vga_graphics;
+
+#define GFX_W 320
+#define GFX_H 200
 
 static int term_fd = -1;
 static char obuf[8192];
@@ -182,6 +201,250 @@ static void clear_page(int page, uint8_t attr)
     scroll(page, 0, 0, rows() - 1, cols() - 1, 0, attr, 0);
 }
 
+/* ---- VGA graphics ---- */
+
+static uint8_t planes[4][0x10000];
+static uint8_t latch[4];
+static uint8_t seq_index, seq_regs[8];          /* 2: map mask, 4: memory mode */
+static uint8_t gc_index, gc_regs[16];           /* 4: read map, 5: mode, 8: bit mask */
+static uint8_t dac[256][3];
+static int dac_write, dac_read, dac_part, dac_dirty;
+static uint16_t gfx_start;                      /* CRTC display start, in plane bytes */
+static uint8_t gfx_offset = 40;                 /* CRTC offset: words per line */
+static uint8_t frame[GFX_H][GFX_W], sent[GFX_H][GFX_W];
+static int gfx_shown;                           /* the terminal shows graphics */
+static int sent_valid;
+
+int video_graphics_ok(void)
+{
+    return term_fd >= 0 && getenv("FLUX_TERMINAL") != NULL;
+}
+
+static int chain4(void)
+{
+    return (seq_regs[4] & 0x08) != 0;
+}
+
+uint8_t vga_read(uint32_t a)
+{
+    uint32_t off = a - 0xA0000;
+    if (chain4())
+        return planes[off & 3][off >> 2];
+    for (int p = 0; p < 4; p++)
+        latch[p] = planes[p][off];
+    return latch[gc_regs[4] & 3];
+}
+
+void vga_write(uint32_t a, uint8_t v)
+{
+    uint32_t off = a - 0xA0000;
+    if (chain4()) {
+        planes[off & 3][off >> 2] = v;
+        return;
+    }
+    uint8_t mask = seq_regs[2], bits = gc_regs[8];
+    int latched = (gc_regs[5] & 3) == 1;        /* write mode 1: copy the latches */
+    for (int p = 0; p < 4; p++) {
+        if (!(mask & (1 << p)))
+            continue;
+        if (latched)
+            planes[p][off] = latch[p];
+        else
+            planes[p][off] = (uint8_t)((v & bits) | (latch[p] & ~bits));
+    }
+}
+
+int vga_io_in(uint16_t port, uint8_t *v)
+{
+    switch (port) {
+    case 0x3C1:
+        *v = 0;
+        return 1;
+    case 0x3C4:
+        *v = seq_index;
+        return 1;
+    case 0x3C5:
+        *v = seq_regs[seq_index & 7];
+        return 1;
+    case 0x3C6:
+        *v = 0xFF;                      /* PEL mask */
+        return 1;
+    case 0x3C7:
+        *v = 0;                         /* DAC state */
+        return 1;
+    case 0x3C8:
+        *v = (uint8_t)dac_write;
+        return 1;
+    case 0x3C9:
+        *v = dac[dac_read][dac_part];
+        if (++dac_part == 3) {
+            dac_part = 0;
+            dac_read = (dac_read + 1) & 0xFF;
+        }
+        return 1;
+    case 0x3CC:
+        *v = 0x63;                      /* misc output */
+        return 1;
+    case 0x3CE:
+        *v = gc_index;
+        return 1;
+    case 0x3CF:
+        *v = gc_regs[gc_index & 15];
+        return 1;
+    }
+    return 0;
+}
+
+int vga_io_out(uint16_t port, uint8_t v)
+{
+    switch (port) {
+    case 0x3C0:                         /* attribute controller, misc output: */
+    case 0x3C2:                         /* nothing they do is shown */
+    case 0x3C6:
+        return 1;
+    case 0x3C4:
+        seq_index = v;
+        return 1;
+    case 0x3C5:
+        seq_regs[seq_index & 7] = v;
+        return 1;
+    case 0x3C7:
+        dac_read = v;
+        dac_part = 0;
+        return 1;
+    case 0x3C8:
+        dac_write = v;
+        dac_part = 0;
+        return 1;
+    case 0x3C9:
+        dac[dac_write][dac_part] = v & 0x3F;
+        dac_dirty = 1;
+        if (++dac_part == 3) {
+            dac_part = 0;
+            dac_write = (dac_write + 1) & 0xFF;
+        }
+        return 1;
+    case 0x3CE:
+        gc_index = v;
+        return 1;
+    case 0x3CF:
+        gc_regs[gc_index & 15] = v;
+        return 1;
+    }
+    return 0;
+}
+
+/* The VGA's power-on palette: the 16 colours, a grey ramp, then hues. */
+static void default_palette(void)
+{
+    static const uint8_t ega[16][3] = {
+        { 0, 0, 0 }, { 0, 0, 42 }, { 0, 42, 0 }, { 0, 42, 42 }, { 42, 0, 0 }, { 42, 0, 42 },
+        { 42, 21, 0 }, { 42, 42, 42 }, { 21, 21, 21 }, { 21, 21, 63 }, { 21, 63, 21 },
+        { 21, 63, 63 }, { 63, 21, 21 }, { 63, 21, 63 }, { 63, 63, 21 }, { 63, 63, 63 },
+    };
+    memcpy(dac, ega, sizeof(ega));
+    for (int i = 0; i < 16; i++)
+        dac[16 + i][0] = dac[16 + i][1] = dac[16 + i][2] = (uint8_t)(i * 63 / 15);
+    for (int i = 32; i < 256; i++) {
+        int k = i - 32, level = 63 - (k / 72) * 21, h = k % 72 / 3;
+        int up = level * (h % 6) / 6, down = level - up;
+        static const int rgb[6][3] = { { 1, 2, 0 }, { 3, 1, 0 }, { 0, 1, 2 }, { 0, 3, 1 },
+                                       { 2, 0, 1 }, { 1, 0, 3 } };
+        int vals[4] = { 0, level, up, down };
+        for (int c = 0; c < 3; c++)
+            dac[i][c] = (uint8_t)vals[rgb[h / 4 % 6][c]];
+    }
+    dac_dirty = 1;
+}
+
+static void gfx_begin(void)
+{
+    if (gfx_shown)
+        return;
+    gfx_shown = 1;
+    sent_valid = 0;
+    dac_dirty = 1;
+    outs("\033_GB");
+    kbd_raw(1);
+}
+
+static void gfx_end(void)
+{
+    if (!gfx_shown)
+        return;
+    gfx_shown = 0;
+    outs("\033_GE");
+    kbd_raw(0);
+}
+
+static void gfx_refresh(void)
+{
+    gfx_begin();
+    if (dac_dirty) {
+        uint8_t pal[3 + 768];
+        memcpy(pal, "\033_G", 3);
+        pal[3] = 'P';
+        out((const char *)pal, 4);
+        for (int i = 0; i < 256; i++)
+            for (int c = 0; c < 3; c++)
+                pal[i * 3 + c] = (uint8_t)(dac[i][c] * 255 / 63);
+        out((const char *)pal, 768);
+        dac_dirty = 0;
+    }
+    uint32_t width = (uint32_t)gfx_offset * 2;
+    for (int y = 0; y < GFX_H; y++) {
+        uint32_t row = gfx_start + (uint32_t)y * width;
+        for (int x = 0; x < GFX_W; x++)
+            frame[y][x] = planes[x & 3][(row + (uint32_t)(x >> 2)) & 0xFFFF];
+    }
+    for (int y = 0; y < GFX_H;) {
+        if (sent_valid && !memcmp(frame[y], sent[y], GFX_W)) {
+            y++;
+            continue;
+        }
+        int n = 1;
+        while (y + n < GFX_H && n < 255 && !(sent_valid && !memcmp(frame[y + n], sent[y + n], GFX_W)))
+            n++;
+        char head[6] = { 0x1B, '_', 'G', 'R', (char)y, (char)n };
+        out(head, 6);
+        out((const char *)frame[y], n * GFX_W);
+        memcpy(sent[y], frame[y], (size_t)n * GFX_W);
+        y += n;
+    }
+    sent_valid = 1;
+    video_flush();
+}
+
+static void set_graphics_mode(int m, int clear)
+{
+    if (!video_graphics_ok())
+        fatal("the program switched to graphics mode %02Xh, which only the desktop's "
+              "terminal can show", m);
+    vga_graphics = 1;
+    mem[0x449] = (uint8_t)m;
+    ww(0x44A, 40);
+    ww(0x44C, 0xFA00);
+    ww(0x44E, 0);
+    for (int p = 0; p < 8; p++)
+        set_cursor(p, 0, 0);
+    mem[0x462] = 0;
+    mem[0x484] = ROWS - 1;
+    ww(0x485, 8);
+    memset(seq_regs, 0, sizeof(seq_regs));
+    memset(gc_regs, 0, sizeof(gc_regs));
+    seq_regs[2] = 0x0F;
+    seq_regs[4] = 0x0E;                 /* chain 4 */
+    gc_regs[5] = 0x40;
+    gc_regs[6] = 0x05;
+    gc_regs[8] = 0xFF;
+    gfx_start = 0;
+    gfx_offset = 40;
+    default_palette();
+    if (clear)
+        memset(planes, 0, sizeof(planes));
+    gfx_begin();
+}
+
 /* ---- screen mode ---- */
 
 static void enter_screen(void)
@@ -221,6 +484,12 @@ static int cursor_visible(void)
 
 void video_refresh(int force)
 {
+    if (vga_graphics) {
+        if (force)
+            sent_valid = 0;
+        gfx_refresh();
+        return;
+    }
     if (video_written && !screen_mode)
         enter_screen();
     video_written = 0;
@@ -266,7 +535,11 @@ void video_refresh(int force)
 /* The program has ended: leave the terminal where its cursor is. */
 void video_leave(void)
 {
-    if (screen_mode && term_fd >= 0) {
+    if (gfx_shown) {
+        gfx_end();
+        vga_graphics = 0;
+        outs("\033[0m\033[H\033[2J");
+    } else if (screen_mode && term_fd >= 0) {
         video_refresh(0);
         int row, col;
         get_cursor(active_page(), &row, &col);
@@ -284,6 +557,7 @@ void video_leave(void)
 /* A fluxOS program is about to use the terminal. */
 void video_suspend(void)
 {
+    gfx_end();
     if (screen_mode)
         outs("\033[0m\033[?25h\033[H\033[2J");
     video_flush();
@@ -291,6 +565,10 @@ void video_suspend(void)
 
 void video_resume(void)
 {
+    if (vga_graphics) {
+        video_refresh(1);
+        return;
+    }
     if (screen_mode) {
         outs("\033[H\033[2J");
         host_attr = host_cursor = host_row = host_col = -1;
@@ -510,6 +788,10 @@ void con_puts(const char *s)
 static void set_mode(int m, int clear)
 {
     int c;
+    if (m == 0x13) {
+        set_graphics_mode(m, clear);
+        return;
+    }
     switch (m) {
     case 0x00:
     case 0x01:
@@ -521,7 +803,13 @@ static void set_mode(int m, int clear)
         c = 80;
         break;
     default:
-        fatal("the program switched to graphics mode %02Xh, which a terminal cannot show", m);
+        fatal("the program switched to graphics mode %02Xh, which is not supported", m);
+    }
+    if (vga_graphics) {
+        vga_graphics = 0;
+        gfx_end();
+        shown_valid = 0;
+        host_attr = host_row = host_col = host_cursor = -1;
     }
     mem[0x449] = (uint8_t)m;
     ww(0x44A, (uint16_t)c);
@@ -555,6 +843,15 @@ static void set_mode(int m, int clear)
 void video_crtc_write(int index, uint8_t v)
 {
     int page = active_page();
+    if (vga_graphics) {
+        if (index == 0x0C)
+            gfx_start = (uint16_t)((gfx_start & 0xFF) | v << 8);
+        else if (index == 0x0D)
+            gfx_start = (uint16_t)((gfx_start & 0xFF00) | v);
+        else if (index == 0x13)
+            gfx_offset = v;
+        return;
+    }
     switch (index) {
     case 0x0A:                          /* cursor start line, bit 5 hides it */
         mem[0x461] = v;
@@ -582,9 +879,59 @@ void video_crtc_write(int index, uint8_t v)
     }
 }
 
+/* INT 10h in graphics mode: pixels and the palette; text calls are ignored. */
+static int int10_graphics(void)
+{
+    switch (AH) {
+    case 0x0C:                          /* write pixel */
+        if (CX < GFX_W && DX < GFX_H)
+            vga_write(0xA0000 + (uint32_t)DX * GFX_W + CX, AL);
+        return 1;
+    case 0x0D:                          /* read pixel */
+        AL = CX < GFX_W && DX < GFX_H ? vga_read(0xA0000 + (uint32_t)DX * GFX_W + CX) : 0;
+        return 1;
+    case 0x02: case 0x06: case 0x07: case 0x09: case 0x0A: case 0x0E: case 0x13:
+        return 1;                       /* text: not drawn */
+    }
+    return 0;
+}
+
+static void int10_palette(void)
+{
+    switch (AL) {
+    case 0x10:                          /* set one DAC register */
+        dac[BX & 0xFF][0] = DH & 0x3F;
+        dac[BX & 0xFF][1] = CH & 0x3F;
+        dac[BX & 0xFF][2] = CL & 0x3F;
+        dac_dirty = 1;
+        return;
+    case 0x12:                          /* set a block of DAC registers */
+        for (uint32_t i = 0, a = ADDR(ES, DX); i < CX && BX + i < 256; i++, a += 3)
+            for (int c = 0; c < 3; c++)
+                dac[BX + i][c] = rb(a + (uint32_t)c) & 0x3F;
+        dac_dirty = 1;
+        return;
+    case 0x15:                          /* read one DAC register */
+        DH = dac[BX & 0xFF][0];
+        CH = dac[BX & 0xFF][1];
+        CL = dac[BX & 0xFF][2];
+        return;
+    case 0x17:                          /* read a block */
+        for (uint32_t i = 0, a = ADDR(ES, DX); i < CX && BX + i < 256; i++, a += 3)
+            for (int c = 0; c < 3; c++)
+                wb(a + (uint32_t)c, dac[BX + i][c]);
+        return;
+    case 0x03:                          /* blink or bright backgrounds */
+        blink = BL != 0;
+        return;
+    }
+}
+
 void int10(void)
 {
     int page, row, col;
+    if (vga_graphics && int10_graphics())
+        return;
     switch (AH) {
     case 0x00:
         set_mode(AL & 0x7F, !(AL & 0x80));
@@ -646,12 +993,11 @@ void int10(void)
         return;
     case 0x0F:
         AL = rb(0x449);
-        AH = (uint8_t)cols();
+        AH = (uint8_t)(vga_graphics ? 40 : cols());
         BH = (uint8_t)active_page();
         return;
     case 0x10:
-        if (AL == 0x03)                 /* blink or bright backgrounds */
-            blink = BL != 0;
+        int10_palette();
         return;
     case 0x11:
         if (AL == 0x30) {               /* font information */

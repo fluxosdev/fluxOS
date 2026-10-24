@@ -310,6 +310,7 @@ static struct {
     uint32_t block;                     /* command 48h: bytes per block, less one */
     uint8_t mixer_index, mixer[256];
     uint8_t irq_status;                 /* bit 0: 8-bit IRQ pending, bit 1: 16-bit */
+    int irq_line;                       /* set through mixer register 80h; 0: not set */
 
     /* the transfer */
     int active, paused, autoinit, bits16, stereo, is_signed, silence, input;
@@ -422,10 +423,25 @@ static void start_transfer(int bits16, int autoinit, uint32_t bytes, int stereo,
     open_dsp();
 }
 
+/* The IRQ line: the one chosen in mixer register 80h, or else the one the
+ * program hooked (its setup may say 7 while the card is at 5). */
+static int irq_line(void)
+{
+    if (sb.irq_line)
+        return sb.irq_line;
+    if (!irq_hooked(SB_IRQ)) {
+        if (irq_hooked(7))
+            return 7;
+        if (irq_hooked(2))
+            return 2;
+    }
+    return SB_IRQ;
+}
+
 static void raise_irq(int bits16)
 {
     sb.irq_status |= bits16 ? 2 : 1;
-    pic_raise(SB_IRQ);
+    pic_raise(irq_line());
 }
 
 static void dsp_command(void)
@@ -619,8 +635,10 @@ int sound_io_in(uint16_t port, uint8_t *v)
         *v = opl_status();
         return 1;
     case 0x5:
-        if (sb.mixer_index == 0x80)
-            *v = 0x02;                  /* IRQ 5 */
+        if (sb.mixer_index == 0x80) {
+            int irq = irq_line();
+            *v = irq == 2 ? 0x01 : irq == 7 ? 0x04 : 0x02;
+        }
         else if (sb.mixer_index == 0x81)
             *v = (uint8_t)(1 << SB_DMA8 | 1 << SB_DMA16);
         else if (sb.mixer_index == 0x82)
@@ -690,6 +708,8 @@ int sound_io_out(uint16_t port, uint8_t v)
             mixer_reset();
         else if (sb.mixer_index < 0x80)
             sb.mixer[sb.mixer_index] = v;
+        else if (sb.mixer_index == 0x80)    /* IRQ select: 2, 5 or 7 (10 is not wired) */
+            sb.irq_line = v & 0x01 ? 2 : v & 0x04 ? 7 : v & 0x02 ? 5 : 0;
         return 1;
     case 0x6:
         if (v & 1)

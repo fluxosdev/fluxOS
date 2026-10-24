@@ -204,6 +204,21 @@ static int mem_resize(uint16_t seg, uint16_t paras, uint16_t *max)
     return 0;
 }
 
+int dos_mem_alloc(uint16_t paras, uint16_t *seg, uint16_t *largest)
+{
+    return mem_alloc(paras, dos_psp, seg, largest);
+}
+
+int dos_mem_free(uint16_t seg)
+{
+    return mem_free(seg);
+}
+
+int dos_mem_resize(uint16_t seg, uint16_t paras, uint16_t *max)
+{
+    return mem_resize(seg, paras, max);
+}
+
 static void mem_free_owned(uint16_t owner)
 {
     for (uint16_t m = FIRST_MCB; mcb_valid(m); m = (uint16_t)(m + 1 + mcb_size(m))) {
@@ -513,6 +528,7 @@ void dos_terminate(int code, int type)
 {
     uint16_t psp = dos_psp, parent = rw(ADDR(psp, 0x16));
     video_flush();
+    dpmi_terminate(psp);
     if (type != 3) {
         files_close_all(psp);
         mem_free_owned(psp);
@@ -1421,6 +1437,9 @@ void int2f(void)
     case 0x1600:                        /* no Windows */
     case 0x4300:                        /* no XMS */
         AL = 0;
+        return;
+    case 0x1687:                        /* the DPMI host */
+        dpmi_install_check();
         return;
     case 0x1680:                        /* release the time slice */
         request_idle(2);

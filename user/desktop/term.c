@@ -6,6 +6,14 @@
  * Output updates a cell grid; render() then draws only the cells that
  * differ from what the window shows, after moving the pixels once for
  * however many lines scrolled meanwhile.
+ *
+ * The DOS emulator can also show VGA graphics here, 320x200 pixels drawn
+ * twice the size over the text area, with an escape sequence of its own:
+ * ESC _ G, then B (begin), E (end), P and 768 bytes of palette, or R, a
+ * first row, a row count and the rows' pixels. While graphics are shown,
+ * every key press and release goes to the program as ESC [ code ; down k
+ * (code: the fluxOS key code), so it can follow keys held down. Programs
+ * find out they may use this from FLUX_TERMINAL in their environment.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -25,7 +33,10 @@
 #define MAX_PARAMS 8
 #define SHELL "/bin/fsh"
 
-enum { ST_NORMAL, ST_ESC, ST_CSI };
+enum { ST_NORMAL, ST_ESC, ST_CSI, ST_APC, ST_APC_G, ST_GFX };
+
+#define VGA_W 320
+#define VGA_H 200
 
 struct cell {
     uint8_t ch, attr;                   /* attr: VGA style, bg << 4 | fg */
@@ -49,6 +60,12 @@ struct term {
     int focused;
     int state, nparams, private_mode;
     int params[MAX_PARAMS];
+    int gfx;                            /* VGA graphics shown (and keys sent raw) */
+    uint8_t *fb;                        /* VGA_W x VGA_H palette indices */
+    color_t pal[256];
+    uint8_t palbuf[768];
+    int gfx_cmd, gfx_pos, gfx_y, gfx_n;
+    int gfx_dirty_top, gfx_dirty_bottom;    /* rows drawn since the last damage */
     struct term *next;
 };
 
@@ -249,6 +266,94 @@ static void csi_dispatch(struct term *t, char final)
     }
 }
 
+/* ---- graphics ---- */
+
+static void invalidate(struct term *t);
+
+static void gfx_row(struct term *t, int y)
+{
+    struct surface *s = &t->win->content;
+    uint32_t *a = s->px + (PAD + 2 * y) * s->stride + PAD, *b = a + s->stride;
+    const uint8_t *src = t->fb + y * VGA_W;
+    for (int x = 0; x < VGA_W; x++) {
+        color_t c = t->pal[src[x]];
+        a[2 * x] = a[2 * x + 1] = b[2 * x] = b[2 * x + 1] = c;
+    }
+    if (y < t->gfx_dirty_top)
+        t->gfx_dirty_top = y;
+    if (y >= t->gfx_dirty_bottom)
+        t->gfx_dirty_bottom = y + 1;
+}
+
+static void gfx_damage(struct term *t)
+{
+    if (t->gfx_dirty_bottom > t->gfx_dirty_top)
+        wm_damage_client(t->win, mkrect(PAD, PAD + 2 * t->gfx_dirty_top, 2 * VGA_W,
+                                        2 * (t->gfx_dirty_bottom - t->gfx_dirty_top)));
+    t->gfx_dirty_top = VGA_H;
+    t->gfx_dirty_bottom = 0;
+}
+
+static void gfx_begin(struct term *t)
+{
+    if (!t->fb && !(t->fb = calloc(VGA_W, VGA_H)))
+        return;
+    memset(t->fb, 0, VGA_W * VGA_H);
+    memset(t->pal, 0, sizeof(t->pal));
+    t->gfx = 1;
+    struct surface *s = &t->win->content;
+    gfx_fill(s, PAD, PAD, COLS * FONT_W, ROWS * FONT_H, 0);
+    wm_damage_client(t->win, mkrect(PAD, PAD, COLS * FONT_W, ROWS * FONT_H));
+    t->gfx_dirty_top = VGA_H;
+    t->gfx_dirty_bottom = 0;
+}
+
+static void gfx_end(struct term *t)
+{
+    if (!t->gfx)
+        return;
+    t->gfx = 0;
+    invalidate(t);
+}
+
+/* One byte of a graphics command's data. */
+static void gfx_data(struct term *t, uint8_t c)
+{
+    if (t->gfx_cmd == 'P') {
+        t->palbuf[t->gfx_pos++] = c;
+        if (t->gfx_pos < 768)
+            return;
+        for (int i = 0; i < 256; i++)
+            t->pal[i] = (color_t)t->palbuf[i * 3] << 16 | (color_t)t->palbuf[i * 3 + 1] << 8 |
+                        t->palbuf[i * 3 + 2];
+        if (t->gfx)
+            for (int y = 0; y < VGA_H; y++)
+                gfx_row(t, y);
+        t->state = ST_NORMAL;
+        return;
+    }
+    /* 'R': row, count, then the pixels */
+    int pos = t->gfx_pos++;
+    if (pos == 0) {
+        t->gfx_y = c;
+        return;
+    }
+    if (pos == 1) {
+        t->gfx_n = c;
+        if (!c)
+            t->state = ST_NORMAL;
+        return;
+    }
+    int i = pos - 2, y = t->gfx_y + i / VGA_W, x = i % VGA_W;
+    if (t->gfx && y < VGA_H) {
+        t->fb[y * VGA_W + x] = c;
+        if (x == VGA_W - 1)
+            gfx_row(t, y);
+    }
+    if (i + 1 == t->gfx_n * VGA_W)
+        t->state = ST_NORMAL;
+}
+
 static void term_putc(struct term *t, char c)
 {
     switch (t->state) {
@@ -264,9 +369,29 @@ static void term_putc(struct term *t, char c)
             t->nparams = 0;
             t->private_mode = 0;
             memset(t->params, 0, sizeof(t->params));
+        } else if (c == '_') {
+            t->state = ST_APC;
         } else {
             t->state = ST_NORMAL;
         }
+        break;
+    case ST_APC:
+        t->state = c == 'G' ? ST_APC_G : ST_NORMAL;
+        break;
+    case ST_APC_G:
+        t->state = ST_NORMAL;
+        if (c == 'B') {
+            gfx_begin(t);
+        } else if (c == 'E') {
+            gfx_end(t);
+        } else if (c == 'P' || c == 'R') {
+            t->state = ST_GFX;
+            t->gfx_cmd = c;
+            t->gfx_pos = 0;
+        }
+        break;
+    case ST_GFX:
+        gfx_data(t, (uint8_t)c);
         break;
     case ST_CSI:
         if (c >= '0' && c <= '9') {
@@ -318,6 +443,11 @@ static void render(struct term *t)
 {
     struct surface *s = &t->win->content;
     struct rect dirty = { 0, 0, 0, 0 };
+
+    if (t->gfx) {
+        gfx_damage(t);
+        return;
+    }
 
     if (t->pending_scroll) {
         int k = t->pending_scroll < ROWS ? t->pending_scroll : ROWS;
@@ -380,6 +510,15 @@ static void invalidate(struct term *t)
 static void term_key(struct window *w, const struct input_event *ev)
 {
     struct term *t = w->priv;
+    if (t->gfx && !t->finished) {
+        if (ev->code) {
+            char buf[16];
+            int n = snprintf(buf, sizeof(buf), "\033[%u;%uk", ev->code,
+                             (ev->flags & IEV_PRESSED) ? 1 : 0);
+            write(t->master, buf, (size_t)n);
+        }
+        return;
+    }
     if (!(ev->flags & IEV_PRESSED))
         return;
     if (t->finished) {
@@ -419,6 +558,7 @@ static void term_destroy(struct window *w)
     }
     if (t->master >= 0)
         close(t->master);               /* hangs up: the shell gets SIGHUP */
+    free(t->fb);
     free(t);
 }
 
@@ -434,6 +574,7 @@ static void finish(struct term *t)
     if (t->finished)
         return;
     t->finished = 1;
+    gfx_end(t);
     if (!t->hold) {
         wm_destroy(t->win);
         return;
@@ -477,6 +618,7 @@ static int spawn(struct term *t, int slave, const char *const *argv, int motd, c
         signal(SIGQUIT, SIG_DFL);
         signal(SIGTERM, SIG_DFL);
         signal(SIGHUP, SIG_DFL);
+        setenv("FLUX_TERMINAL", "desktop", 1);
         const char *home = getenv("HOME");
         if (!dir || chdir(dir) < 0)
             chdir(home ? home : "/");
@@ -577,7 +719,7 @@ void terminal_ready(struct window *w, int revents)
     struct term *t = term_of(w);
     if (!t || t->finished)
         return;
-    char buf[4096];
+    static char buf[32768];
     int n = 0;
     if (revents & POLLIN)
         n = (int)read(t->master, buf, sizeof(buf));

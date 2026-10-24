@@ -19,7 +19,7 @@
 
 #define IBUF_SIZE 4096
 #define LINE_MAX  1024
-#define OBUF_SIZE 4096
+#define OBUF_SIZE 32768          /* room for a DOS program's graphics */
 #define MAX_PTYS  32
 #define CH_EOF    0x04        /* end-of-file marker inside ibuf (canonical) */
 

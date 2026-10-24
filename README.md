@@ -18,7 +18,8 @@
 > read it with that in mind.
 
 fluxOS is a small 32-bit x86 Unix-like operating system with preemptive
-multitasking, ring-3 user processes, paging, a RAM root filesystem, IDE
+multitasking, ring-3 user processes, paging, a root filesystem in RAM (from
+the CD) or on the installed hard disk, IDE
 disk, CD-ROM and floppy drivers with FAT12/16/32 and ISO9660 support, an
 NE2000 network driver with a TCP/IP stack, a zsh-flavoured shell called
 **fsh**, a Windows 95 style graphical desktop with a web browser, a 3dfx
@@ -63,6 +64,9 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
 - VFS over an in-memory filesystem, unpacked at boot from a ustar initrd that
   GRUB loads as a module. It has directories, files, `/dev/{tty,console,null,
   zero,random,urandom}`, pipes, `dup2`, `rename`, `chmod` and `getdents`.
+  Started from an installed disk (`root=UUID=` on the kernel command line),
+  the disk's FAT32 partition is the root instead, and only `/dev`, `/tmp` and
+  `/mnt` stay in memory.
 - Storage:
   - An IDE driver for ATA hard disks (LBA28/LBA48, read/write) and ATAPI
     CD/DVD drives (packet commands, media detection). Data moves by
@@ -337,16 +341,23 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
 - `.COM` and MZ `.EXE` files run in the terminal: type `./GAME.EXE` (the
   kernel hands DOS programs to `/bin/dos`), `dos game` (the extension and case
   may be left out), or double-click one in the file manager.
-- `dos` emulates a PC in user space: an x86 CPU in real mode (the 8086 with the
-  186, 286 and 386 additions usable in real mode, 32-bit registers included;
-  no FPU, which programs detect as on a PC without one), 640 KiB of
-  conventional memory, a BIOS (text video, keyboard, timer, clock, equipment)
+- `dos` emulates a PC in user space: an x86 CPU (the 8086 with the 186, 286,
+  386 and 486 additions, 32-bit registers included; no FPU, which programs
+  detect as on a PC without one), 640 KiB of conventional memory, a BIOS
+  (video, keyboard, timer, clock, equipment)
   and DOS 5: files and directories by handle and by FCB, memory blocks, EXEC
   of child programs, the environment, Ctrl-C, country information, and the
   usual undocumented structures (List of Lists, InDOS, MCB chain). Interrupt
   vectors point into an emulated ROM, so programs can hook and chain them, and
   the timer (IRQ 0, 18.2 Hz or as reprogrammed through the PIT) and keyboard
   (IRQ 1, port 60h) interrupts reach programs that install handlers.
+- Protected mode: a DPMI 0.9 host with 16 MiB of memory, for DOS extenders
+  such as DOS/4GW (DOOM and other 32-bit games). It provides descriptors,
+  extended and DOS memory blocks, protected-mode interrupt vectors with
+  reflection to real mode, real-mode calls and callbacks, and passes
+  hardware interrupts that happen in real mode up to protected-mode
+  handlers. Paging and limit checks are not emulated; a fault ends the
+  program with a report in the `dos -l` log.
 - Drives: `C:` is the fluxOS root, `A:` and `B:` are `/mnt/fd0` and `/mnt/fd1`
   (a floppy is mounted when it is put in, or at the latest the first time a
   program looks at the drive) and `D:`
@@ -358,8 +369,13 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   video memory, moves the cursor, scrolls a window, sets a video mode), the
   terminal shows its 80x25 text screen, colours and box drawing included,
   redrawn as it changes. Console output understands ANSI.SYS escapes.
+  In the desktop's terminal, VGA mode 13h graphics show too, doubled to
+  640x400, chained or unchained ("mode X": planes, map mask, read map,
+  latches, display start for page flipping), with the 256-colour palette.
 - Keys: arrows, Home/End, PgUp/PgDn, Insert/Delete, F1-F12 and Alt+letter
-  arrive as PC scan codes. **Ctrl+\** stops the emulator at any time.
+  arrive as PC scan codes. In graphics mode the desktop's terminal sends
+  every press and release, so games see keys held down. **Ctrl+\** stops
+  the emulator at any time.
 - Sound, passed on to fluxOS's sound devices:
   - the PC speaker, when port 61h connects PIT channel 2 to it;
   - an AdLib at 388h (and the SB16's FM ports): writes go to the real OPL
@@ -486,19 +502,23 @@ The installer:
 2. puts GRUB's boot sector in the MBR and its core image in the gap before
    the partition, as `grub-install` would;
 3. formats the partition with `mkfs.fat`;
-4. copies the kernel, the initrd, `grub.cfg` and GRUB's modules from the CD.
+4. copies the kernel, the initrd, `grub.cfg` and GRUB's modules from the CD,
+   and unpacks the initrd's files (`/bin`, `/etc`, `/home`, `/usr`) onto the
+   partition.
 
 **This erases the whole disk.** The disk must be at least 34 MiB. Afterwards
-the disk boots on its own, through GRUB's menu, and the partition is mounted
-on `/mnt/hda1`. An installed disk carries the installer's files too, so it
-can install onto another disk with `fluxinstall -s /mnt/hda1 /dev/hdb`.
+the disk boots on its own, through GRUB's menu, with the partition as `/`. An
+installed disk carries the installer's files too, so it can install onto
+another disk with `fluxinstall -s / /dev/hdb`.
 
 In QEMU, `make run` attaches `fluxdisk.img` next to the CD. Install with
 `fluxinstall /dev/hda`, then quit and run `make run-disk` to boot the disk
 alone.
 
-The installed system still runs from RAM, like the CD. The disk holds the
-kernel and initrd, and its FAT32 partition is where files persist.
+The installed system runs from the disk, as Windows runs from C:, so what is
+saved anywhere outside `/tmp` stays there. The boot menu's **safe mode**
+entry runs from the initrd in memory instead, like the CD, with the disk on
+`/mnt/hda1`.
 
 ## Things to try
 
@@ -600,10 +620,11 @@ user/
                            and the web browser: its window (browser.c), HTML
                            parser (html.c), CSS (css.c), layout and painting
                            (layout.c), fonts (webfont.c) and URLs (webutil.c)
-  dos/                     the DOS emulator: the x86 real-mode CPU (cpu.c), ROM,
-                           interrupt controller, timer and BIOS services
-                           (bios.c), keyboard (keyboard.c), text screen and
-                           INT 10h (video.c), DOS processes, memory and console
+  dos/                     the DOS emulator: the x86 CPU (cpu.c), the DPMI host
+                           (dpmi.c), ROM, interrupt controller, timer and BIOS
+                           services (bios.c), keyboard (keyboard.c), text
+                           screen, VGA and INT 10h (video.c), DOS processes,
+                           memory and console
                            (dos.c), files, paths and FCBs (files.c), and the
                            PC speaker, AdLib, Sound Blaster and DMA (sound.c)
   bin/                     one program per file (fluxinstall.c is the installer)
