@@ -5,6 +5,10 @@
  * callbacks. Mounted filesystems (struct fs) add vnodes to the same
  * tree: their directories are read on first use and their file I/O
  * goes through the filesystem's ops.
+ *
+ * Started from an installed disk, the root is that disk's filesystem
+ * instead (vfs_mount_root); only /dev, /tmp and /mnt stay in ramfs,
+ * grafted onto it.
  */
 #include "kernel.h"
 #include "blkdev.h"
@@ -602,6 +606,8 @@ int vfs_getpath(struct vnode *vn, char *buf, uint32_t size)
 
 /* ---- mounting ---- */
 
+static void subtree_free(struct vnode *vn);
+
 static const struct fs_ops *fs_by_name(const char *type)
 {
     if (!strcmp(type, "fat32") || !strcmp(type, "vfat") || !strcmp(type, "fat") ||
@@ -612,15 +618,10 @@ static const struct fs_ops *fs_by_name(const char *type)
     return NULL;
 }
 
-static int mount_at(struct blockdev *bd, struct vnode *mp, const char *type)
+/* Find a filesystem of `type` (or any, for "auto") on bd and mount it, unattached. */
+static int fs_probe(struct blockdev *bd, const char *type, struct fs **out)
 {
     static const struct fs_ops *const probe_order[] = { &iso9660_ops, &fat32_ops };
-    if (mp->type != VN_DIR)
-        return -ENOTDIR;
-    if (mp == vfs_root || is_fs_root(mp) || mp->mounted)
-        return -EBUSY;
-    if (bd->fs || (bd->parent && bd->parent->fs))
-        return -EBUSY;
     if (bd->refresh)
         bd->refresh(bd);
     if (!bd->nsectors)
@@ -653,6 +654,32 @@ static int mount_at(struct blockdev *bd, struct vnode *mp, const char *type)
             break;
     }
     if (!fs)
+        return r;
+    *out = fs;
+    return 0;
+}
+
+/* Undo fs_probe for a filesystem that was never attached. */
+static void fs_discard(struct fs *fs)
+{
+    subtree_free(fs->root);
+    if (fs->ops->unmount)
+        fs->ops->unmount(fs);
+    blk_invalidate(fs->bd);
+    kfree(fs);
+}
+
+static int mount_at(struct blockdev *bd, struct vnode *mp, const char *type)
+{
+    if (mp->type != VN_DIR)
+        return -ENOTDIR;
+    if (mp == vfs_root || is_fs_root(mp) || mp->mounted)
+        return -EBUSY;
+    if (bd->fs || (bd->parent && bd->parent->fs))
+        return -EBUSY;
+    struct fs *fs;
+    int r = fs_probe(bd, type, &fs);
+    if (r < 0)
         return r;
 
     struct vnode *root = fs->root;
@@ -719,6 +746,8 @@ static void subtree_free(struct vnode *vn)
 /* media_gone: the medium was taken out, so what was not written is lost. */
 static int umount_fs(struct fs *fs, int media_gone)
 {
+    if (!fs->covered)
+        return -EBUSY;                  /* the root filesystem */
     if (subtree_busy(fs->root))
         return -EBUSY;
 
@@ -844,8 +873,12 @@ int vfs_mounts_text(char *buf, uint32_t size)
 {
     uint32_t len = 0;
     char line[PATH_MAX + 64], path[PATH_MAX];
-    snprintf(line, sizeof(line), "ramfs on / type ramfs (rw)\n");
-    len = strlcpy(buf, line, size);
+    if (!vfs_root->fs) {
+        snprintf(line, sizeof(line), "ramfs on / type ramfs (rw)\n");
+        len = strlcpy(buf, line, size);
+    } else if (size) {
+        buf[0] = 0;
+    }
     /* the list is newest first; print in mount order */
     struct fs *order[BLK_MAX_DEVS];
     int n = 0;
@@ -868,6 +901,88 @@ int vfs_mountpoint_of(struct blockdev *bd, char *buf, uint32_t size)
     if (!bd->fs)
         return -ENOENT;
     return vfs_getpath(bd->fs->root, buf, size);
+}
+
+/* A FAT volume's serial number, written as GRUB's "probe --fs-uuid" does. */
+static int fat_uuid(struct blockdev *bd, char *out, uint32_t size)
+{
+    uint8_t b[512];
+    if (bd->sector_size != 512 || !bd->nsectors || blk_read(bd, 0, 1, b) < 0)
+        return -1;
+    if (b[510] != 0x55 || b[511] != 0xAA)
+        return -1;
+    /* FAT32 has no 16-bit FAT size; its extended boot record sits further in. */
+    const uint8_t *e = (b[22] | b[23]) ? b + 38 : b + 66;
+    if (e[0] != 0x29)
+        return -1;
+    uint32_t serial = e[1] | (uint32_t)e[2] << 8 | (uint32_t)e[3] << 16 | (uint32_t)e[4] << 24;
+    snprintf(out, size, "%04x-%04x", serial >> 16, serial & 0xFFFF);
+    return 0;
+}
+
+static int same_uuid(const char *a, const char *b)
+{
+    for (;; a++, b++) {
+        char x = *a >= 'A' && *a <= 'Z' ? (char)(*a + 32) : *a;
+        char y = *b >= 'A' && *b <= 'Z' ? (char)(*b + 32) : *b;
+        if (x != y)
+            return 0;
+        if (!x)
+            return 1;
+    }
+}
+
+/*
+ * Make the filesystem on the volume `spec` names (UUID=xxxx-xxxx, or a
+ * device name such as hda1) the root, so the system runs from the disk
+ * rather than from an initrd in memory. /dev, /tmp and /mnt move over
+ * from the ramfs root and hide any directories of those names on the disk.
+ */
+int vfs_mount_root(const char *spec)
+{
+    int by_uuid = !strncmp(spec, "UUID=", 5);
+    struct blockdev *bd = NULL, *b;
+    for (int i = 0; !bd && (b = blk_get(i)); i++) {
+        char id[16];
+        if (b->type == BLK_CDROM || b->type == BLK_FLOPPY || b->fs)
+            continue;
+        if (by_uuid ? fat_uuid(b, id, sizeof(id)) == 0 && same_uuid(id, spec + 5)
+                    : !strcmp(b->name, spec))
+            bd = b;
+    }
+    if (!bd)
+        return -ENODEV;
+
+    struct fs *fs;
+    int r = fs_probe(bd, "auto", &fs);
+    if (r < 0)
+        return r;
+    struct vnode *root = fs->root, *bin;
+    if (!(bin = find_child(root, "bin")) || !find_child(bin, "init")) {
+        fs_discard(fs);                 /* a data disk, or an older install */
+        return -ENOENT;
+    }
+
+    struct vnode *old = vfs_root;
+    while (old->children) {
+        struct vnode *c = old->children;
+        detach(c);
+        struct vnode *hidden = find_child(root, c->name);
+        if (hidden) {
+            detach(hidden);
+            subtree_free(hidden);       /* forgets the cached vnodes, not the files */
+        }
+        attach(root, c);
+    }
+    root->parent = root;
+    root->linked = 1;
+    vfs_root = root;
+    vnode_free(old);
+    bd->fs = fs;
+    fs->next = mounts;
+    mounts = fs;
+    boot_ok("Root filesystem: /dev/%s (%s)", bd->name, fs->name);
+    return 0;
 }
 
 /* Mount every recognisable volume: CDs on /mnt/cdrom, disks on /mnt/hdX. */

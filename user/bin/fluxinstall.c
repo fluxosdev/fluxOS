@@ -10,6 +10,10 @@
  * kernel, initrd and GRUB files are copied from SOURCE, the install
  * medium (the fluxOS CD, mounted on /mnt/cdrom, by default). An
  * installed disk carries the same files, so it can be a SOURCE too.
+ *
+ * The initrd's contents (/bin, /etc, /home, /usr) are unpacked onto the
+ * partition as well: an installed system runs from the disk, with the
+ * partition as /, and keeps the initrd only for the boot menu's safe mode.
  */
 #include <ctype.h>
 #include <dirent.h>
@@ -116,6 +120,71 @@ static void make_dir(const char *path)
 {
     if (mkdir(path, 0755) < 0 && errno != EEXIST)
         die("mkdir %s: %s", path, strerror(errno));
+}
+
+static unsigned octal(const char *s, size_t n)
+{
+    unsigned v = 0;
+    for (size_t i = 0; i < n && s[i] >= '0' && s[i] <= '7'; i++)
+        v = v * 8 + (unsigned)(s[i] - '0');
+    return v;
+}
+
+/* Unpack the ustar archive `tar` (directories and regular files) into dir. */
+static void extract_tar(const char *tar, const char *dir, unsigned long *bytes, unsigned *files)
+{
+    static char buf[65536];
+    unsigned char h[SECTOR];
+    int in = open(tar, O_RDONLY);
+    if (in < 0)
+        die("%s: %s", tar, strerror(errno));
+    while (read(in, h, SECTOR) == SECTOR && h[0]) {
+        if (memcmp(h + 257, "ustar", 5))
+            die("%s: not a ustar archive", tar);
+        char name[PATH_MAX] = "";
+        if (h[345])
+            snprintf(name, sizeof(name), "%.155s/", (char *)h + 345);
+        snprintf(name + strlen(name), sizeof(name) - strlen(name), "%.100s", (char *)h);
+        unsigned size = octal((char *)h + 124, 12);
+        unsigned padded = (size + SECTOR - 1) / SECTOR * SECTOR;
+
+        char *p = name;
+        while (*p == '.' && p[1] == '/')
+            p += 2;
+        while (*p == '/')
+            p++;
+        size_t len = strlen(p);
+        while (len && p[len - 1] == '/')
+            p[--len] = 0;
+        char dst[PATH_MAX];
+        path_join(dst, sizeof(dst), dir, p);
+
+        if (*p && strcmp(p, ".") && h[156] == '5') {
+            make_dir(dst);
+        } else if (*p && (h[156] == '0' || h[156] == 0)) {
+            int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC);
+            if (out < 0)
+                die("%s: %s", dst, strerror(errno));
+            for (unsigned left = padded; left; ) {
+                unsigned chunk = left < sizeof(buf) ? left : sizeof(buf);
+                if (read(in, buf, chunk) != (int)chunk)
+                    die("%s: truncated archive", tar);
+                unsigned data = padded - left < size ? size - (padded - left) : 0;
+                if (data > chunk)
+                    data = chunk;
+                if (data && write(out, buf, data) != (int)data)
+                    die("writing %s: %s", dst, strerror(errno));
+                left -= chunk;
+            }
+            close(out);
+            *bytes += size;
+            (*files)++;
+            continue;
+        }
+        if (padded && lseek(in, padded, SEEK_CUR) < 0)
+            die("%s: %s", tar, strerror(errno));
+    }
+    close(in);
 }
 
 /* Is device `name` the disk `disk` or one of its partitions? */
@@ -361,6 +430,10 @@ int main(int argc, char **argv)
         files++;
     }
     closedir(d);
+
+    /* The system itself, which runs from this partition. */
+    path_join(src, sizeof(src), source, "boot/initrd.tar");
+    extract_tar(src, MOUNTPOINT, &bytes, &files);
     printf("      %u files, %lu KiB\n", files, bytes / 1024);
 
     /* ---- [4/4] finish ---- */

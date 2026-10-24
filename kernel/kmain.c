@@ -65,8 +65,14 @@ static void record_boot_source(void)
         return;
     const char *text = !strcmp(fs, "iso9660") ? "cdrom\n" : "disk\n";
     struct vnode *etc, *vn;
-    if (vfs_resolve("/etc", NULL, &etc) == 0 && vfs_create(etc, "boot-source", VN_FILE, &vn) == 0)
+    if (vfs_resolve("/etc", NULL, &etc) < 0)
+        return;
+    /* Running from the disk, it is already there from an earlier boot. */
+    if (vfs_resolve("/etc/boot-source", NULL, &vn) == 0 ||
+        vfs_create(etc, "boot-source", VN_FILE, &vn) == 0) {
+        vfs_truncate(vn, 0);
         vfs_write(vn, text, 0, (uint32_t)strlen(text));
+    }
 }
 
 void kmain(uint32_t magic, struct multiboot_info *mbi)
@@ -128,19 +134,36 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     boot_ok("Keyboard and serial console ready");
     mouse_init();
 
+    /*
+     * The root: the installed disk named by root= (the system then runs
+     * from the disk, as Windows does from C:), or else the initrd
+     * unpacked into memory, as from the CD. The initrd is also the
+     * fallback when the disk cannot be used.
+     */
     vfs_init();
-    if (initrd_start && initrd_end > initrd_start) {
-        if (initrd_end > KERNEL_SPACE_END)
-            panic("initrd loaded above the identity-mapped region");
-        initrd_load((const uint8_t *)initrd_start, initrd_end - initrd_start);
-        pmm_release(initrd_start, initrd_end);
-        record_boot_source();
-    } else {
+    int have_initrd = initrd_start && initrd_end > initrd_start;
+    if (have_initrd && initrd_end > KERNEL_SPACE_END)
+        panic("initrd loaded above the identity-mapped region");
+    char root[48];
+    int want_root = cmdline_value("root", root, sizeof(root)) && root[0];
+    if (!want_root && !have_initrd)
         panic("no initrd module: check the GRUB configuration");
-    }
 
     ata_init();
     floppy_init();
+    int r = want_root ? vfs_mount_root(root) : -1;
+    if (want_root && r < 0) {
+        if (!have_initrd)
+            panic("cannot use %s as the root filesystem (error %d): "
+                  "choose the safe mode entry in the boot menu", root, r);
+        kprintf("Cannot use %s as the root filesystem (error %d); running from the initrd\n",
+                root, r);
+    }
+    if (r < 0)
+        initrd_load((const uint8_t *)initrd_start, initrd_end - initrd_start);
+    if (have_initrd)
+        pmm_release(initrd_start, initrd_end);
+    record_boot_source();
     vfs_automount();
     net_init();
     sound_init();                       /* after the drivers whose IRQs it must not take */

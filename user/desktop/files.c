@@ -66,7 +66,9 @@ static int clip_n;
 static int clip_cut;
 
 /* What the mouse is holding down. */
-enum hold { HOLD_NONE, HOLD_TOOL, HOLD_THUMB, HOLD_ARROW_UP, HOLD_ARROW_DOWN, HOLD_BAND };
+enum hold { HOLD_NONE, HOLD_TOOL, HOLD_THUMB, HOLD_ARROW_UP, HOLD_ARROW_DOWN, HOLD_BAND, HOLD_ITEM };
+
+#define DRAG_SLOP 4
 
 struct fm {
     struct window *win;
@@ -80,6 +82,9 @@ struct fm {
     enum hold hold;
     int hold_tool, hold_in;
     int thumb_grab;                     /* where the thumb was grabbed */
+    int item_x, item_y;                 /* where an item was pressed */
+    int item_hit;                       /* the entry pressed, for HOLD_ITEM */
+    int dragging;                       /* HOLD_ITEM moved far enough to be a drag */
     int last_click;
     unsigned int last_click_ms;
     char pending[NAME_MAX + 1];         /* entry a delete/rename prompt is about */
@@ -90,6 +95,10 @@ struct fm {
 };
 
 static struct fm *fms;
+
+/* The folder a drag is hovering over: the entry drop_i of window drop_f, or -1 for the window. */
+static struct fm *drop_f;
+static int drop_i = -1;
 
 /* ---- paths and directory loading ---- */
 
@@ -383,7 +392,7 @@ static void draw_entries(struct fm *f, struct surface *s)
         struct rect c = cell_rect(f, i);
         if (!rect_overlaps(c, a))
             continue;
-        int sel = f->ents[i].selected;
+        int sel = f->ents[i].selected || (f == drop_f && i == drop_i);
         int ix = c.x + (CELL_W - 32) / 2, iy = c.y + 2;
         if (sel)
             draw_icon_selected(s, ix, iy, f->ents[i].icon, 32);
@@ -425,6 +434,52 @@ static void format_status(struct fm *f, char *buf, size_t size)
         snprintf(buf, size, "%s: %u bytes", e->name, st.st_size);
     else
         snprintf(buf, size, "%s: %u.%uKB", e->name, st.st_size / 1024, st.st_size % 1024 * 10 / 1024);
+}
+
+/* Free space on the folder's drive: a usage bar and a caption at the right of the status bar. */
+static void draw_disk_space(struct fm *f, struct surface *s, int w, int h)
+{
+    struct statfs st;
+    if (statfs(f->path, &st) < 0 || !st.f_blocks)
+        return;
+    /* No 64-bit division here, so work in KB with 32-bit arithmetic. */
+    unsigned int total, free_kb;
+    if (st.f_bsize >= 1024) {
+        total = st.f_blocks * (st.f_bsize / 1024);
+        free_kb = st.f_bfree * (st.f_bsize / 1024);
+    } else {
+        total = st.f_blocks / (1024 / st.f_bsize);
+        free_kb = st.f_bfree / (1024 / st.f_bsize);
+    }
+    if (!total)
+        return;
+    /* "/" is a ramfs in kernel memory, not the hard disk: say so. */
+    const char *what = strcmp(st.f_fstype, "ramfs") ? "free" : "RAM free";
+    char text[48];
+    if (free_kb >= 1024 * 1024)
+        snprintf(text, sizeof(text), "%u.%uGB %s", free_kb >> 20,
+                 (free_kb & 0xFFFFF) * 10 >> 20, what);
+    else if (free_kb >= 1024)
+        snprintf(text, sizeof(text), "%u.%uMB %s", free_kb >> 10,
+                 (free_kb & 0x3FF) * 10 >> 10, what);
+    else
+        snprintf(text, sizeof(text), "%uKB %s", free_kb, what);
+
+    int tw = gfx_text_width(&font_sans, text);
+    int bar_w = 60, pw = bar_w + tw + 20;
+    struct rect pr = mkrect(w - 2 - pw, h - STATUS_H, pw, STATUS_H - 2);
+    gfx_bevel(s, pr, BEVEL_THIN_SUNKEN);
+    struct rect bar = mkrect(pr.x + 5, pr.y + 4, bar_w, pr.h - 8);
+    gfx_fill(s, bar.x, bar.y, bar.w, bar.h, C_WHITE);
+    unsigned int used_kb = total - free_kb;
+    while (total > 0x3FFFFFF) {         /* keep used * width within 32 bits */
+        total >>= 4;
+        used_kb >>= 4;
+    }
+    int used = (int)(used_kb * (bar_w - 2) / (total ? total : 1));
+    if (used > 0)
+        gfx_fill(s, bar.x + 1, bar.y + 1, used, bar.h - 2, C_NAVY);
+    gfx_text(s, &font_sans, bar.x + bar_w + 6, h - STATUS_H + 2, text, C_BLACK);
 }
 
 static void paint(struct fm *f)
@@ -470,6 +525,7 @@ static void paint(struct fm *f)
     format_status(f, status, sizeof(status));
     gfx_bevel(s, mkrect(2, h - STATUS_H, w - 4, STATUS_H - 2), BEVEL_THIN_SUNKEN);
     gfx_text(s, &font_sans, 7, h - STATUS_H + 2, status, C_BLACK);
+    draw_disk_space(f, s, w, h);
 
     wm_damage_client(f->win, mkrect(0, 0, w, h));
 }
@@ -817,13 +873,13 @@ static int exists(const char *path)
 }
 
 /* Pastes one clipboard item into the folder; 0 on success. */
-static int paste_one(struct fm *f, const char *src, char *name)
+static int paste_one(const char *dir, const char *src, char *name, int cut)
 {
     const char *base = strrchr(src, '/');
     base = base ? base + 1 : src;
     char dst[PATH_MAX];
     snprintf(name, NAME_MAX + 1, "%s", base);
-    join(dst, sizeof(dst), f->path, name);
+    join(dst, sizeof(dst), dir, name);
 
     /* A folder cannot go inside itself. */
     size_t n = strlen(src);
@@ -834,18 +890,18 @@ static int paste_one(struct fm *f, const char *src, char *name)
             return 1;
         }
     }
-    if (clip_cut && !strcmp(dst, src))
+    if (cut && !strcmp(dst, src))
         return 0;                       /* moved onto itself */
     for (int k = 1; exists(dst) && k < 100; k++) {
         if (k == 1)
             snprintf(name, NAME_MAX + 1, "Copy of %s", base);
         else
             snprintf(name, NAME_MAX + 1, "Copy (%d) of %s", k, base);
-        join(dst, sizeof(dst), f->path, name);
+        join(dst, sizeof(dst), dir, name);
     }
 
     int r;
-    if (clip_cut && rename(src, dst) == 0) {
+    if (cut && rename(src, dst) == 0) {
         r = 0;
     } else {
         /* Different filesystem (say, CD to hard disk): copy, then remove the original. */
@@ -854,12 +910,12 @@ static int paste_one(struct fm *f, const char *src, char *name)
             int e = errno;
             remove_tree(dst);
             errno = e;
-        } else if (clip_cut) {
+        } else if (cut) {
             r = remove_tree(src);
         }
     }
     if (r < 0) {
-        report(clip_cut ? "Error Moving File" : "Error Copying File", clip_cut ? "move" : "copy", base);
+        report(cut ? "Error Moving File" : "Error Copying File", cut ? "move" : "copy", base);
         return 1;
     }
     return 0;
@@ -870,7 +926,7 @@ static void do_paste(struct fm *f)
     char name[NAME_MAX + 1] = "";
     int failed = 0;
     for (int i = 0; i < clip_n && !failed; i++)
-        failed = paste_one(f, clip[i], name);
+        failed = paste_one(f->path, clip[i], name, clip_cut);
     if (clip_cut && !failed) {
         free(clip);
         clip = NULL;
@@ -1020,6 +1076,70 @@ static void scroll_to_mouse(struct fm *f, int y)
         set_scroll(f, (y - f->thumb_grab - (sb.y + SB_W)) * max_scroll(f) / span);
 }
 
+/* The folder window under a screen point, and which of its entries (or -1). */
+static struct fm *fm_at(int sx, int sy, int *entry)
+{
+    for (struct fm *o = fms; o; o = o->next) {
+        struct rect cl = wm_client_rect(o->win);
+        int x = sx - cl.x, y = sy - cl.y;
+        if (o->win->minimized || !rect_contains(mkrect(0, 0, cl.w, cl.h), x, y) ||
+            !rect_contains(icon_area(o), x, y))
+            continue;
+        *entry = -1;
+        for (int i = 0; i < o->n; i++)
+            if (o->ents[i].is_dir && rect_contains(cell_rect(o, i), x, y))
+                *entry = i;
+        return o;
+    }
+    return NULL;
+}
+
+/* Finds what a drag from f is over; entries being dragged are not drop targets. */
+static void drop_target(struct fm *f, int x, int y, struct fm **tf, int *ti)
+{
+    struct rect cl = wm_client_rect(f->win);
+    *tf = fm_at(cl.x + x, cl.y + y, ti);
+    if (*tf == f && *ti >= 0 && f->ents[*ti].selected)
+        *ti = -1;
+}
+
+static void set_drop(struct fm *tf, int ti)
+{
+    struct fm *old = drop_f;
+    if (tf == drop_f && ti == drop_i)
+        return;
+    drop_f = tf;
+    drop_i = ti;
+    if (old)
+        paint(old);
+    if (tf && tf != old)
+        paint(tf);
+}
+
+/* Moves the dragged selection into the folder it was dropped on. */
+static void drop_items(struct fm *f, struct fm *tf, int ti)
+{
+    char dir[PATH_MAX];
+    if (ti >= 0)
+        join(dir, sizeof(dir), tf->path, tf->ents[ti].name);
+    else
+        snprintf(dir, sizeof(dir), "%s", tf->path);
+    if (!strcmp(dir, f->path))
+        return;                         /* dropped where it came from */
+    char name[NAME_MAX + 1] = "";
+    for (int i = 0; i < f->n; i++) {
+        if (!f->ents[i].selected)
+            continue;
+        char src[PATH_MAX];
+        join(src, sizeof(src), f->path, f->ents[i].name);
+        if (paste_one(dir, src, name, 1))
+            break;
+    }
+    reload(f, NULL);
+    if (tf != f)
+        reload(tf, NULL);
+}
+
 static void press(struct fm *f, int x, int y)
 {
     if (rect_contains(addr_rect(f), x, y)) {
@@ -1073,7 +1193,10 @@ static void press(struct fm *f, int x, int y)
         f->band_y1 = y;
         return;
     }
-    select_only(f, hit);
+    if (!f->ents[hit].selected)
+        select_only(f, hit);
+    else
+        f->sel = hit;
     unsigned int t = now_ms();
     if (hit >= 0 && hit == f->last_click && t - f->last_click_ms < DBLCLICK_MS) {
         f->last_click = -1;
@@ -1082,6 +1205,11 @@ static void press(struct fm *f, int x, int y)
     }
     f->last_click = hit;
     f->last_click_ms = t;
+    f->hold = HOLD_ITEM;
+    f->item_hit = hit;
+    f->item_x = x;
+    f->item_y = y;
+    f->dragging = 0;
 }
 
 static void fm_mouse(struct window *w, int x, int y, int buttons, int changed)
@@ -1092,12 +1220,34 @@ static void fm_mouse(struct window *w, int x, int y, int buttons, int changed)
     } else if (changed & MOUSE_LEFT) {                  /* release */
         enum hold h = f->hold;
         f->hold = HOLD_NONE;
+        if (h == HOLD_ITEM) {
+            struct fm *tf;
+            int ti;
+            if (f->dragging) {
+                drop_target(f, x, y, &tf, &ti);
+                set_drop(NULL, -1);
+                f->dragging = 0;
+                if (tf)
+                    drop_items(f, tf, ti);
+            } else if (count_selected(f) > 1) {
+                select_only(f, f->item_hit);    /* a plain click on one of several */
+            }
+        }
         if (h == HOLD_TOOL && f->hold_in && rect_contains(tool_rect(f->hold_tool), x, y))
             tool_action(f, f->hold_tool);
     } else if (f->hold == HOLD_BAND) {
         f->band_x1 = x;
         f->band_y1 = y;
         band_select(f);
+    } else if (f->hold == HOLD_ITEM) {
+        if (!f->dragging && abs(x - f->item_x) < DRAG_SLOP && abs(y - f->item_y) < DRAG_SLOP)
+            return;
+        f->dragging = 1;
+        struct fm *tf;
+        int ti;
+        drop_target(f, x, y, &tf, &ti);
+        set_drop(tf, ti);
+        return;
     } else if (f->hold == HOLD_THUMB) {
         scroll_to_mouse(f, y);
     } else if (f->hold == HOLD_TOOL) {
@@ -1138,6 +1288,8 @@ static void fm_destroy(struct window *w)
             break;
         }
     }
+    if (drop_f == f)
+        drop_f = NULL;
     free(f->ents);
     free(f);
 }

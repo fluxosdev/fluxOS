@@ -53,6 +53,8 @@ int vfs_mount_dev(struct blockdev *bd, const char *target, const char *type);
 int vfs_umount(const char *target, struct vnode *cwd);
 int vfs_statfs(struct vnode *vn, struct statfs *st);
 int vfs_mounts_text(char *buf, uint32_t size);
+/* Run from the disk volume spec names (UUID=xxxx-xxxx or a device name). */
+int vfs_mount_root(const char *spec);
 void vfs_automount(void);
 /* The automounter's: mount the medium in bd on a mount point it picks (a CD on
  * /mnt/cdrom or the next free /mnt/cdromN, a floppy on /mnt/fdN), or unmount
