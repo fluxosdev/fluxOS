@@ -3,8 +3,8 @@
  * icon view, with a toolbar (Up, New Folder, Delete, Rename), an address
  * field, a scroll bar and a status bar. Double-clicking a folder opens
  * it in the same window; a program runs in a terminal window, a PNG or
- * JPEG picture opens in the image viewer, a text file in the text editor, a WAV or VOC
- * sound plays with play(1), and anything else is shown with more(1).
+ * JPEG picture opens in the image viewer, a text file in the text editor, a WAV sound opens
+ * in the sound player, a VOC one plays with play(1), and anything else is shown with more(1).
  *
  * Keys: arrows move the selection, Enter opens, Backspace goes up,
  * Delete deletes, F2 renames and F5 reloads the folder. Ctrl+X, Ctrl+C
@@ -741,6 +741,8 @@ static void open_entry(struct fm *f, int i)
         char url[PATH_MAX + 8];
         snprintf(url, sizeof(url), "file://%s", path);
         browser_open(url);
+    } else if (e->icon == ICON_SOUND && has_suffix(e->name, ".wav")) {
+        player_open(path);
     } else if (e->icon == ICON_SOUND) {
         const char *argv[] = { "/bin/play", path, NULL };
         terminal_open(e->name, argv, 0, 0);

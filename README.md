@@ -439,6 +439,12 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
       too much is stopped.
     - `/usr/share/www/js.html` (linked from the home page) is a test page
       that checks all of this live.
+- Sound Player (Accessories, or double-click a `.wav` file): opens a PCM WAV
+  file (typed in its path field or chosen in the file manager), shows its
+  format and length, and has Play, Pause and Stop buttons and a bar you can
+  click or drag to seek. It plays through `play(1)` (`play -s SECONDS`
+  starts a file part-way in), so the desktop keeps running; it needs a Sound
+  Blaster 16, and says so if there is none or another program has it.
 - Setup: a Win95-style wizard (the **Install fluxOS** icon) that installs
   fluxOS on a hard disk. It lists the disks, greying out any that are too
   small or hold the install files, asks you to confirm that the chosen disk

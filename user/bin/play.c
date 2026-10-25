@@ -1,14 +1,16 @@
 /*
  * play - play sound files on the Sound Blaster
  *
- *   play [-q] FILE...
+ *   play [-q] [-s SECONDS] FILE...
  *   play [-q] -t HZ [-l MS]
  *
  * Plays WAV files (PCM, 8, 16, 24 or 32 bit, mono or stereo) and Creative
  * Voice files (.VOC: 8-bit and 16-bit PCM, silence blocks, stereo). Rates
  * the card cannot do (it goes from 5000 to 44100 Hz) are resampled. -t
  * plays a test tone (a sine wave, 2 seconds unless -l says otherwise),
- * and -q keeps quiet instead of showing the format and the time.
+ * and -q keeps quiet instead of showing the format and the time. -s starts
+ * a WAV file that many seconds in (the desktop's sound player pauses and
+ * seeks with it).
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -22,6 +24,7 @@
 #define CHUNK 4096                      /* frames decoded at a time */
 
 static int quiet;
+static uint32_t start_sec;              /* -s: where in a WAV file to begin */
 static int dsp = -1;
 static int out_rate, out_channels;      /* what /dev/dsp is set to */
 
@@ -370,6 +373,15 @@ static int play_file(const char *name)
         close(s.fd);
         return -1;
     }
+    if (start_sec && !s.voc) {
+        uint32_t frame = (uint32_t)(s.channels * s.bits / 8), skipped = start_sec * (uint32_t)s.rate;
+        if (skipped > s.total_frames)
+            skipped = s.total_frames;
+        if (skipped && skip(s.fd, skipped * frame) == 0) {
+            s.left -= skipped * frame;
+            s.total_frames -= skipped;
+        }
+    }
     r = play_source(&s, name);
     close(s.fd);
     return r;
@@ -413,7 +425,7 @@ static int play_tone(int hz, int ms)
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: play [-q] FILE...\n       play [-q] -t HZ [-l MS]\n");
+    fprintf(stderr, "usage: play [-q] [-s SECONDS] FILE...\n       play [-q] -t HZ [-l MS]\n");
     exit(2);
 }
 
@@ -425,6 +437,8 @@ int main(int argc, char **argv)
             quiet = 1;
         else if (!strcmp(argv[i], "-t") && i + 1 < argc)
             tone = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-s") && i + 1 < argc)
+            start_sec = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "-l") && i + 1 < argc)
             ms = atoi(argv[++i]);
         else
@@ -433,6 +447,10 @@ int main(int argc, char **argv)
     if (!tone && i >= argc)
         usage();
     dsp = open("/dev/dsp", O_WRONLY);
+    for (int tries = 0; dsp < 0 && errno == EBUSY && tries < 40; tries++) {
+        usleep(50000);                  /* the program that had it is still closing */
+        dsp = open("/dev/dsp", O_WRONLY);
+    }
     if (dsp < 0) {
         fprintf(stderr, "play: /dev/dsp: %s\n",
                 errno == ENOENT ? "no sound card (play needs a Sound Blaster 16)" :

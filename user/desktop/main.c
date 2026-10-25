@@ -122,6 +122,7 @@ int main(void)
             terminal_child_exited(pid);
             setup_child_exited(pid, status);
             browser_child_exited(pid, status);
+            player_child_exited(pid, status);
         }
 
         gears_frame();
@@ -132,6 +133,7 @@ int main(void)
             terminal_blink();
             editor_blink();
             browser_blink();
+            player_tick();
         }
         if (now - last_tick >= 1000) {
             last_tick = now;
