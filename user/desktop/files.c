@@ -91,6 +91,10 @@ struct fm {
     int editing;                        /* typing in the address field */
     char addr[PATH_MAX];
     int addr_len, addr_cur;
+    int ctx_open;                       /* the right-click menu */
+    int ctx_x, ctx_y, ctx_hover;
+    int ctx_n;
+    int ctx_codes[10];
     struct fm *next;
 };
 
@@ -482,6 +486,86 @@ static void draw_disk_space(struct fm *f, struct surface *s, int w, int h)
     gfx_text(s, &font_sans, bar.x + bar_w + 6, h - STATUS_H + 2, text, C_BLACK);
 }
 
+/* ---- the right-click menu ---- */
+
+enum { CX_SEP, CX_OPEN, CX_CUT, CX_COPY, CX_PASTE, CX_DELETE, CX_RENAME, CX_NEWDIR, CX_REFRESH, CX_TERMINAL };
+
+static const char *const ctx_labels[] = {
+    [CX_OPEN] = "Open", [CX_CUT] = "Cut", [CX_COPY] = "Copy", [CX_PASTE] = "Paste", [CX_DELETE] = "Delete",
+    [CX_RENAME] = "Rename", [CX_NEWDIR] = "New Folder", [CX_REFRESH] = "Refresh",
+    [CX_TERMINAL] = "Open Terminal Here",
+};
+
+#define CTX_W 150
+#define CTX_ITEM_H 20
+#define CTX_SEP_H 8
+
+static int ctx_height(const struct fm *f, int i)
+{
+    return f->ctx_codes[i] == CX_SEP ? CTX_SEP_H : CTX_ITEM_H;
+}
+
+static struct rect ctx_rect(const struct fm *f)
+{
+    int h = 4;
+    for (int i = 0; i < f->ctx_n; i++)
+        h += ctx_height(f, i);
+    int x = f->ctx_x, y = f->ctx_y, w = f->win->content.w, ch = f->win->content.h;
+    if (x + CTX_W > w)
+        x = w - CTX_W;
+    if (y + h > ch)
+        y = ch - h;
+    return mkrect(x < 0 ? 0 : x, y < 0 ? 0 : y, CTX_W, h);
+}
+
+static struct rect ctx_item_rect(const struct fm *f, int idx)
+{
+    struct rect m = ctx_rect(f);
+    int y = m.y + 2;
+    for (int i = 0; i < idx; i++)
+        y += ctx_height(f, i);
+    return mkrect(m.x + 2, y, m.w - 4, ctx_height(f, idx));
+}
+
+static int ctx_hit(const struct fm *f, int x, int y)
+{
+    for (int i = 0; i < f->ctx_n; i++)
+        if (f->ctx_codes[i] != CX_SEP && rect_contains(ctx_item_rect(f, i), x, y))
+            return i;
+    return -1;
+}
+
+static int ctx_enabled(const struct fm *f, int code)
+{
+    if (code == CX_PASTE)
+        return clip_n > 0;
+    if (code == CX_RENAME)
+        return count_selected((struct fm *)f) == 1;
+    return 1;
+}
+
+static void draw_ctx(struct fm *f, struct surface *s)
+{
+    struct rect m = ctx_rect(f);
+    gfx_fill(s, m.x, m.y, m.w, m.h, C_FACE);
+    gfx_bevel(s, m, BEVEL_WINDOW);
+    for (int i = 0; i < f->ctx_n; i++) {
+        struct rect r = ctx_item_rect(f, i);
+        int code = f->ctx_codes[i];
+        if (code == CX_SEP) {
+            draw_separator(s, r.x + 1, r.y + 3, r.w - 2);
+            continue;
+        }
+        int en = ctx_enabled(f, code), hot = i == f->ctx_hover && en;
+        if (hot)
+            gfx_fill(s, r.x, r.y, r.w, r.h, C_NAVY);
+        int ty = r.y + (r.h - font_sans.height) / 2;
+        if (!en)
+            gfx_text(s, &font_sans, r.x + 13, ty + 1, ctx_labels[code], C_WHITE);
+        gfx_text(s, &font_sans, r.x + 12, ty, ctx_labels[code], hot ? C_WHITE : en ? C_BLACK : C_SHADOW);
+    }
+}
+
 static void paint(struct fm *f)
 {
     struct surface *s = &f->win->content;
@@ -526,6 +610,8 @@ static void paint(struct fm *f)
     gfx_bevel(s, mkrect(2, h - STATUS_H, w - 4, STATUS_H - 2), BEVEL_THIN_SUNKEN);
     gfx_text(s, &font_sans, 7, h - STATUS_H + 2, status, C_BLACK);
     draw_disk_space(f, s, w, h);
+    if (f->ctx_open)
+        draw_ctx(f, s);
 
     wm_damage_client(f->win, mkrect(0, 0, w, h));
 }
@@ -1012,6 +1098,48 @@ static void tool_action(struct fm *f, int i)
     }
 }
 
+static void open_ctx(struct fm *f, int x, int y, int hit)
+{
+    int n = 0;
+    if (hit >= 0) {
+        if (!f->ents[hit].selected)
+            select_only(f, hit);
+        else
+            f->sel = hit;
+        int c[] = { CX_OPEN, CX_SEP, CX_CUT, CX_COPY, CX_PASTE, CX_SEP, CX_DELETE, CX_RENAME };
+        for (int i = 0; i < (int)(sizeof(c) / sizeof(c[0])); i++)
+            f->ctx_codes[n++] = c[i];
+    } else {
+        clear_selection(f);
+        int c[] = { CX_NEWDIR, CX_SEP, CX_PASTE, CX_SEP, CX_REFRESH, CX_TERMINAL };
+        for (int i = 0; i < (int)(sizeof(c) / sizeof(c[0])); i++)
+            f->ctx_codes[n++] = c[i];
+    }
+    f->ctx_n = n;
+    f->ctx_x = x;
+    f->ctx_y = y;
+    f->ctx_hover = -1;
+    f->ctx_open = 1;
+}
+
+static void ctx_action(struct fm *f, int code)
+{
+    switch (code) {
+    case CX_OPEN:
+        if (f->sel >= 0)
+            open_entry(f, f->sel);
+        break;
+    case CX_CUT: clip_set(f, 1); break;
+    case CX_COPY: clip_set(f, 0); break;
+    case CX_PASTE: do_paste(f); break;
+    case CX_DELETE: ask_delete(f); break;
+    case CX_RENAME: ask_rename(f); break;
+    case CX_NEWDIR: ask_text("New Folder", "Name of the new folder:", "New Folder", do_mkdir, f); break;
+    case CX_REFRESH: reload(f, NULL); break;
+    case CX_TERMINAL: terminal_open_in(f->path, "Terminal", NULL, 0); break;
+    }
+}
+
 /* ---- input ---- */
 
 static void fm_key(struct window *w, const struct input_event *ev)
@@ -1019,6 +1147,12 @@ static void fm_key(struct window *w, const struct input_event *ev)
     struct fm *f = w->priv;
     if (!(ev->flags & IEV_PRESSED))
         return;
+    if (f->ctx_open) {
+        f->ctx_open = 0;
+        paint(f);
+        if (ev->code == KEY_ESC)
+            return;
+    }
     if (f->editing) {
         address_key(f, ev);
         return;
@@ -1217,6 +1351,44 @@ static void press(struct fm *f, int x, int y)
 static void fm_mouse(struct window *w, int x, int y, int buttons, int changed)
 {
     struct fm *f = w->priv;
+    if (changed & MOUSE_RIGHT) {
+        if (!(buttons & MOUSE_RIGHT))
+            return;
+        int hit = -1;
+        if (rect_contains(icon_area(f), x, y))
+            for (int i = 0; i < f->n; i++) {
+                struct rect c = cell_rect(f, i);
+                if (rect_contains(mkrect(c.x + (CELL_W - 32) / 2, c.y + 2, 32, 32), x, y) ||
+                    rect_contains(mkrect(c.x + 2, c.y + 37, CELL_W - 4, font_sans.height + 1), x, y))
+                    hit = i;
+            }
+        if (!rect_contains(icon_area(f), x, y))
+            f->ctx_open = 0;
+        else
+            open_ctx(f, x, y, hit);
+        f->editing = 0;
+        paint(f);
+        return;
+    }
+    if (f->ctx_open && !(changed & MOUSE_LEFT)) {
+        int hv = ctx_hit(f, x, y);
+        if (hv != f->ctx_hover) {
+            f->ctx_hover = hv;
+            paint(f);
+        }
+        return;
+    }
+    if ((changed & MOUSE_LEFT) && (buttons & MOUSE_LEFT) && f->ctx_open) {
+        int i = ctx_hit(f, x, y);
+        int code = i >= 0 && ctx_enabled(f, f->ctx_codes[i]) ? f->ctx_codes[i] : CX_SEP;
+        int inside = rect_contains(ctx_rect(f), x, y);
+        f->ctx_open = 0;
+        paint(f);
+        if (code != CX_SEP)
+            ctx_action(f, code);
+        if (inside)
+            return;                     /* a click on the menu is not a click on the folder */
+    }
     if ((changed & MOUSE_LEFT) && (buttons & MOUSE_LEFT)) {
         press(f, x, y);
     } else if (changed & MOUSE_LEFT) {                  /* release */
@@ -1268,6 +1440,8 @@ static void fm_focus(struct window *w, int focused)
     struct fm *f = w->priv;
     if (!f->win)
         return;                         /* still inside wm_create() */
+    if (!focused)
+        f->ctx_open = 0;
     if (focused)
         reload(f, NULL);                /* other windows may have changed files */
     else
@@ -1312,7 +1486,7 @@ struct window *files_open(const char *path)
     f->sel = -1;
     f->last_click = -1;
     snprintf(f->path, sizeof(f->path), "%s", path);
-    struct window *w = wm_create(path, ICON_FOLDER_OPEN, FM_W, FM_H, WF_MINIMIZE | WF_MAXIMIZE,
+    struct window *w = wm_create(path, ICON_FOLDER_OPEN, FM_W, FM_H, WF_MINIMIZE | WF_MAXIMIZE | WF_RIGHTCLICK,
                                  &fm_ops, f);
     if (!w) {
         free(f);

@@ -23,6 +23,7 @@
                                    can also be maximized and resized */
 #define WF_MODAL    0x4         /* dims everything else while open */
 #define WF_NOTASK   0x8         /* no taskbar button */
+#define WF_RIGHTCLICK 0x10      /* the right button is passed to ops->mouse (MOUSE_RIGHT in changed) */
 
 enum icon_id {
     ICON_NONE,
@@ -59,6 +60,8 @@ enum icon_id {
     ICON_MUTED,
     ICON_SOUND,
     ICON_TASKMGR,
+    ICON_MINES,
+    ICON_CLOCK,
     ICON_COUNT,
 };
 
@@ -105,6 +108,9 @@ struct window *wm_create(const char *title, enum icon_id icon, int client_w, int
                          int flags, const struct window_ops *ops, void *priv);
 void wm_destroy(struct window *w);
 void wm_center(struct window *w);
+void wm_move(struct window *w, int x, int y);
+/* Give the window a client area of this size, keeping its corner (ops->resize is called). */
+int wm_resize_client(struct window *w, int client_w, int client_h);
 void wm_cascade(struct window *w);
 void wm_focus(struct window *w);
 struct window *wm_focused(void);
@@ -217,6 +223,10 @@ struct window *taskmgr_open(void);      /* Task Manager: applications, processes
 void taskmgr_tick(void);                /* once a second: sample the system */
 struct window *diskmgr_open(void);      /* Disk Manager: disks, partitions, mounting, formatting */
 void diskmgr_tick(void);                /* once a second: follow disks and mounts changing */
+struct window *minesweeper_open(void);
+void minesweeper_tick(void);            /* once a second: the game's timer */
+void clock_open(void);                  /* the analog clock and calendar over the taskbar clock */
+void clock_tick(void);                  /* once a second */
 struct window *gears_open(void);        /* 3D Gears, an OpenGL demo */
 void gears_frame(void);                 /* draw the next frame when it is due */
 int gears_timeout(void);                /* ms until the next frame, -1 if none */

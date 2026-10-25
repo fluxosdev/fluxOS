@@ -136,6 +136,8 @@ int main(void)
         if (now - last_tick >= 1000) {
             last_tick = now;
             wm_tick();
+            clock_tick();
+            minesweeper_tick();
             about_tick();
             display_tick();
             sound_tick();

@@ -139,6 +139,11 @@ static void open_home(void)
     files_open(home ? home : "/");
 }
 
+static void open_minesweeper(void)
+{
+    minesweeper_open();
+}
+
 static void open_readme(void)
 {
     editor_open("/home/flux/README.txt");
@@ -152,12 +157,12 @@ struct desk_icon {
 };
 
 static struct desk_icon desk_icons[] = {
-    { ICON_COMPUTER, "My Computer", open_computer },
-    { ICON_TERMINAL, "Terminal", open_terminal },
-    { ICON_BROWSER, "Web Browser", open_browser },
-    { ICON_CALC, "Calculator", open_calculator },
-    { ICON_README, "Read Me", open_readme },
-    { ICON_INSTALL, "Install fluxOS", setup_open },
+    { ICON_COMPUTER, "My Computer", open_computer, 0, 0 },
+    { ICON_TERMINAL, "Terminal", open_terminal, 0, 0 },
+    { ICON_BROWSER, "Web Browser", open_browser, 0, 0 },
+    { ICON_CALC, "Calculator", open_calculator, 0, 0 },
+    { ICON_README, "Read Me", open_readme, 0, 0 },
+    { ICON_INSTALL, "Install fluxOS", setup_open, 0, 0 },
 };
 static int ndesk = (int)(sizeof(desk_icons) / sizeof(desk_icons[0]));
 #define NDESK ndesk
@@ -183,6 +188,7 @@ static const struct menu_item programs_items[] = {
     { ICON_BROWSER, "Web Browser", open_browser, NULL, 0 },
     { ICON_TERMINAL, "Terminal", open_terminal, NULL, 0 },
     { ICON_GEARS, "3D Gears", open_gears, NULL, 0 },
+    { ICON_MINES, "Minesweeper", open_minesweeper, NULL, 0 },
 };
 
 static const struct menu_item accessories_items[] = {
@@ -1248,6 +1254,25 @@ static void move_window(struct window *w, int x, int y)
     wm_damage(w->r);
 }
 
+static int set_frame(struct window *w, struct rect r);
+
+void wm_move(struct window *w, int x, int y)
+{
+    move_window(w, x, y);
+}
+
+int wm_resize_client(struct window *w, int client_w, int client_h)
+{
+    struct rect r = w->r;
+    r.w = client_w + 2 * BORDER;
+    r.h = client_h + 3 + TITLE_H + 1 + BORDER;
+    if (r.x + r.w > screen_w)
+        r.x = screen_w > r.w ? screen_w - r.w : 0;
+    if (r.y + r.h > screen_h - TASKBAR_H)
+        r.y = screen_h - TASKBAR_H > r.h ? screen_h - TASKBAR_H - r.h : 0;
+    return set_frame(w, r);
+}
+
 void wm_center(struct window *w)
 {
     int x = (screen_w - w->r.w) / 2;
@@ -1638,6 +1663,10 @@ static void press_left(void)
             volume_open();
             return;
         }
+        if (rect_contains(tray_rect(), mx, my)) {
+            clock_open();
+            return;
+        }
         for (int i = 0; i < ntasks; i++) {
             if (rect_contains(task_button_rect(i), mx, my)) {
                 drag = DRAG_TASK;
@@ -1910,6 +1939,13 @@ static void press_right(void)
 {
     if (menu_open)
         set_menu(0);
+    struct window *rw = window_at(mx, my);
+    if (rw && (rw->flags & WF_RIGHTCLICK) && drag == DRAG_NONE && rect_contains(wm_client_rect(rw), mx, my)) {
+        set_ctx(NULL, 0, 0, 0, -1);
+        wm_focus(rw);
+        client_mouse(rw, mbuttons, MOUSE_RIGHT);
+        return;
+    }
     if (modal_window() || drag != DRAG_NONE || rect_contains(taskbar_rect(), mx, my) ||
         window_at(mx, my)) {
         set_ctx(NULL, 0, 0, 0, -1);

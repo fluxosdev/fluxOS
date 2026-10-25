@@ -115,6 +115,31 @@ static void icon_taskmgr(void)
         P(5 + i * 3, 25 - h[i], 2, h[i], GREEN);
 }
 
+/* A mine: a black ball with spikes and a highlight. */
+static void icon_mines(void)
+{
+    P(2, 2, 28, 28, C_FACE);
+    frame(2, 2, 28, 28, C_SHADOW);
+    P(15, 5, 2, 22, C_BLACK);
+    P(5, 15, 22, 2, C_BLACK);
+    P(8, 8, 2, 2, C_BLACK);
+    P(22, 8, 2, 2, C_BLACK);
+    P(8, 22, 2, 2, C_BLACK);
+    P(22, 22, 2, 2, C_BLACK);
+    disc(16, 16, 8, C_BLACK);
+    P(12, 12, 3, 3, C_WHITE);
+}
+
+/* A round clock face with two hands. */
+static void icon_clock(void)
+{
+    disc(16, 16, 14, C_SHADOW);
+    disc(16, 16, 12, C_WHITE);
+    P(15, 7, 2, 10, C_BLACK);
+    P(16, 15, 7, 2, C_BLACK);
+    P(15, 15, 2, 2, RGB(0xC0, 0x00, 0x00));
+}
+
 static void small_window(color_t body)
 {
     frame(2, 4, 28, 24, C_BLACK);
@@ -279,6 +304,8 @@ static void draw_builtin(struct surface *s, int x, int y, enum icon_id id, int s
     case ICON_DISPLAY: icon_display(); break;
     case ICON_GEARS: icon_gears(); break;
     case ICON_TASKMGR: icon_taskmgr(); break;
+    case ICON_MINES: icon_mines(); break;
+    case ICON_CLOCK: icon_clock(); break;
     default: break;                     /* image-only icons */
     }
 }
