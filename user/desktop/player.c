@@ -374,7 +374,9 @@ static void pl_mouse(struct window *w, int x, int y, int buttons, int changed)
 
 static void pl_focus(struct window *w, int focused)
 {
-    paint(w->priv);
+    struct player *p = w->priv;
+    if (p->win)                         /* wm_create focuses it before p->win is set */
+        paint(p);
 }
 
 static void pl_destroy(struct window *w)
