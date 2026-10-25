@@ -46,7 +46,7 @@ enum driver { DRV_STANDARD, DRV_NATIVE, DRV_RADEON };
 /* Controls, in Tab order. */
 enum ctl {
     K_TABS, K_DRIVER, K_COLORS, K_AREA, K_REFRESH, K_MONITOR,
-    K_WALL, K_BROWSE, K_WALLMODE,
+    K_WALL, K_BROWSE, K_WALLMODE, K_COLOR,
     K_OK, K_CANCEL, K_APPLY, K_COUNT
 };
 #define IS_PUSH(k) ((k) >= K_OK || (k) == K_BROWSE)     /* push buttons */
@@ -124,6 +124,9 @@ struct dprops {
     /* the Background page */
     struct wall_entry walls[MAX_WALLS];
     int nwalls, wall_sel, wall_top, wall_mode;
+    char hex[16];                       /* the solid color, as typed */
+    int hexlen, hexcur;
+    uint32_t color;                     /* the last valid one */
     int sb_drag, sb_grab;               /* the list's scroll bar thumb is held */
 };
 
@@ -404,6 +407,7 @@ static struct rect ctl_rect(enum ctl k)
     case K_WALL: return mkrect(18, 190, 268, WALL_ROWS * ITEM_H + 4);
     case K_BROWSE: return mkrect(298, 190, 90, 23);
     case K_WALLMODE: return mkrect(78, 302, 150, 21);
+    case K_COLOR: return mkrect(290, 302, 72, 21);
     case K_DRIVER: return mkrect(24, 206, 360, 54);
     case K_COLORS: return mkrect(24, 300, 162, 21);
     case K_AREA: return mkrect(250, 288, 96, 26);
@@ -423,7 +427,7 @@ static int on_page(struct dprops *d, enum ctl k)
         return d->page == PAGE_SETTINGS;
     case K_MONITOR:
         return d->page == PAGE_MONITOR;
-    case K_WALL: case K_BROWSE: case K_WALLMODE:
+    case K_WALL: case K_BROWSE: case K_WALLMODE: case K_COLOR:
         return d->page == PAGE_BACKGROUND;
     default:
         return 1;
@@ -436,6 +440,7 @@ static int ctl_enabled(struct dprops *d, enum ctl k)
     case K_DRIVER: return d->native_ok || d->radeon_ok;
     case K_COLORS: case K_AREA: return mode_controls_enabled(d);
     case K_REFRESH: return own_modes(d) && d->nrates > 1;
+    case K_COLOR: return d->wall_sel == 0;      /* only with no picture */
     default: return 1;
     }
 }
@@ -634,6 +639,9 @@ static void wall_init(struct dprops *d)
     const char *cur = wallpaper_path();
     int i = cur[0] ? wall_add(d, cur) : 0;      /* a wallpaper from elsewhere is listed too */
     d->wall_mode = wallpaper_mode();
+    d->color = wallpaper_color();
+    snprintf(d->hex, sizeof(d->hex), "#%06X", (unsigned)d->color);
+    d->hexlen = d->hexcur = (int)strlen(d->hex);
     wall_select(d, i < 0 ? 0 : i);
 }
 
@@ -752,7 +760,7 @@ static void draw_preview(struct dprops *d, struct surface *s, int background)
                              sw < 1 ? 1 : sw, sh < 1 ? 1 : sh);
     if (background) {
         struct wall_entry *e = &d->walls[d->wall_sel];
-        wallpaper_render(s, scr, e->thumb, e->full_w, e->full_h, d->wall_mode, C_DESKTOP, pw, ph);
+        wallpaper_render(s, scr, e->thumb, e->full_w, e->full_h, d->wall_mode, d->color, pw, ph);
     } else {
         gfx_fill(s, scr.x, scr.y, scr.w, scr.h, C_DESKTOP);
     }
@@ -926,13 +934,35 @@ static void background_page(struct dprops *d, struct surface *s)
     combo_items(d, K_WALLMODE, rows, &chosen);
     draw_combo(s, ctl_rect(K_WALLMODE), rows[chosen], 1, d->focus == K_WALLMODE, d->open == K_WALLMODE);
 
+    int bad_color = 0;
+    {                                   /* the solid color, for when there is no picture */
+        int on = ctl_enabled(d, K_COLOR);
+        struct rect r = ctl_rect(K_COLOR);
+        gfx_text(s, &font_sans, 240, 306, "Color:", on ? C_BLACK : C_SHADOW);
+        uint32_t tmp;
+        int valid = parse_hex_color(d->hex, &tmp) == 0;
+        if (on) {
+            draw_text_field(s, r, d->hex, d->hexcur, d->focus == K_COLOR);
+        } else {
+            gfx_fill(s, r.x, r.y, r.w, r.h, C_FACE);
+            gfx_bevel(s, r, BEVEL_SUNKEN);
+            gfx_text(s, &font_sans, r.x + 4, r.y + (r.h - font_sans.height) / 2, d->hex, C_SHADOW);
+        }
+        struct rect sw = mkrect(r.x + r.w + 4, r.y, 22, r.h);
+        gfx_fill(s, sw.x, sw.y, sw.w, sw.h, d->color);
+        gfx_bevel(s, sw, BEVEL_SUNKEN);
+        bad_color = on && !valid;
+    }
     static const char *const how[WALL_MODES] = {
         "Fill: scaled to cover the screen, the overflow cut off.",
         "Stretch: scaled to the exact size of the screen.",
         "Center: at its own size in the middle of the screen.",
         "Tile: at its own size, repeated across the screen.",
     };
-    gfx_text(s, &font_sans, 18, 334, how[d->wall_mode], C_BLACK);
+    if (bad_color)
+        gfx_text(s, &font_sans_bold, 18, 334, "Type a color such as #3f175f.", RGB(0x80, 0x00, 0x00));
+    else
+        gfx_text(s, &font_sans, 18, 334, how[d->wall_mode], C_BLACK);
     struct wall_entry *e = &d->walls[d->wall_sel];
     if (d->wall_sel > 0 && !e->thumb)
         gfx_text(s, &font_sans_bold, 18, 350, "fluxOS cannot show this picture.", RGB(0x80, 0x00, 0x00));
@@ -1309,8 +1339,16 @@ static void dp_close(struct dprops *d)
 static int apply_background(struct dprops *d)
 {
     const char *path = d->walls[d->wall_sel].path;
-    if (!strcmp(path, wallpaper_path()) && d->wall_mode == wallpaper_mode())
+    uint32_t rgb;
+    if (!path[0] && parse_hex_color(d->hex, &rgb) < 0) {
+        message_box("Display Properties", ICON_WARNING, "Type the color as hexadecimal, such as #3f175f.");
+        return -1;
+    }
+    int color_changed = d->color != wallpaper_color();
+    if (!strcmp(path, wallpaper_path()) && d->wall_mode == wallpaper_mode() && !color_changed)
         return 0;
+    if (color_changed)
+        wallpaper_set_color(d->color, 0);       /* saved with the picture just below */
     if (wallpaper_set(path, d->wall_mode, 1) < 0) {
         message_box("Display Properties", ICON_WARNING, "fluxOS cannot show that picture.");
         return -1;
@@ -1425,6 +1463,46 @@ static void step(struct dprops *d, int dir)
     }
 }
 
+/* The text field for the solid color; returns 1 if the key was its. */
+static int color_key(struct dprops *d, const struct input_event *ev)
+{
+    int code = ev->code;
+    if (code == KEY_LEFT) {
+        if (d->hexcur > 0)
+            d->hexcur--;
+    } else if (code == KEY_RIGHT) {
+        if (d->hexcur < d->hexlen)
+            d->hexcur++;
+    } else if (code == KEY_HOME) {
+        d->hexcur = 0;
+    } else if (code == KEY_END) {
+        d->hexcur = d->hexlen;
+    } else if (code == KEY_DELETE) {
+        if (d->hexcur < d->hexlen) {
+            memmove(d->hex + d->hexcur, d->hex + d->hexcur + 1, (size_t)(d->hexlen - d->hexcur));
+            d->hexlen--;
+        }
+    } else if (ev->len == 1 && ev->text[0] == 0x7F) {
+        if (d->hexcur > 0) {
+            memmove(d->hex + d->hexcur - 1, d->hex + d->hexcur, (size_t)(d->hexlen - d->hexcur + 1));
+            d->hexcur--;
+            d->hexlen--;
+        }
+    } else if (ev->len == 1 && d->hexlen < 7 &&
+               ((ev->text[0] >= '0' && ev->text[0] <= '9') || (ev->text[0] >= 'a' && ev->text[0] <= 'f') ||
+                (ev->text[0] >= 'A' && ev->text[0] <= 'F') || ev->text[0] == '#')) {
+        memmove(d->hex + d->hexcur + 1, d->hex + d->hexcur, (size_t)(d->hexlen - d->hexcur + 1));
+        d->hex[d->hexcur++] = ev->text[0];
+        d->hexlen++;
+    } else {
+        return 0;
+    }
+    uint32_t rgb;
+    if (parse_hex_color(d->hex, &rgb) == 0)
+        d->color = rgb;                 /* the preview follows as it is typed */
+    return 1;
+}
+
 static void dp_key(struct window *w, const struct input_event *ev)
 {
     struct dprops *d = w->priv;
@@ -1444,6 +1522,11 @@ static void dp_key(struct window *w, const struct input_event *ev)
             d->open = -1;
         } else if (code == KEY_ESC || code == KEY_TAB)
             d->open = -1;
+        dp_paint(d);
+        return;
+    }
+    if (d->focus == K_COLOR && d->page == PAGE_BACKGROUND && ctl_enabled(d, K_COLOR) &&
+        !(ev->mods & (KMOD_CTRL | KMOD_ALT)) && color_key(d, ev)) {
         dp_paint(d);
         return;
     }
@@ -1605,6 +1688,8 @@ static void dp_mouse(struct window *w, int x, int y, int buttons, int changed)
             if (IS_PUSH(k)) {
                 d->pressed = k;
                 d->pressed_in = 1;
+            } else if (k == K_COLOR) {
+                d->hexcur = d->hexlen;
             } else if (k == K_DRIVER) {
                 for (int i = DRV_STANDARD; i <= DRV_RADEON; i++)
                     if (rect_contains(radio_rect(i), x, y) && driver_ok(d, i))

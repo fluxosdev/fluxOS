@@ -125,7 +125,8 @@ desktop.
 - **Sound Player**: opens a PCM WAV (typed path or from the file manager) with
   Play, Pause, Stop and a seek bar. It runs `play(1)` (`play -s SECONDS`
   starts part-way in) so the desktop keeps running.
-- **Display Properties**: wallpaper and fill mode with a preview, resolution,
+- **Display Properties**: wallpaper and fill mode with a preview (with **(None)** chosen, a
+  `#rrggbb` field sets the solid desktop color), resolution,
   color depth and refresh rate (with a 15 s "keep this mode?" prompt on the
   3dfx and Radeon drivers), monitor type and EDID details. Settings are saved
   in GRUB's environment block on an installed system.

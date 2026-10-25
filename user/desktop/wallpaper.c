@@ -227,6 +227,13 @@ void wallpaper_render(struct surface *dst, struct rect a, const struct image *im
 
 /* ---- the desktop's wallpaper ---- */
 
+static uint32_t desk_color = C_DESKTOP;
+
+uint32_t wallpaper_color(void)
+{
+    return desk_color;
+}
+
 static void rebuild(void)
 {
     if (!src) {
@@ -242,7 +249,7 @@ static void rebuild(void)
         return;
     }
     wallpaper_render(&wall, mkrect(0, 0, screen_w, screen_h), src, src->w, src->h, cur_mode,
-                     C_DESKTOP, screen_w, screen_h);
+                     desk_color, screen_w, screen_h);
 }
 
 int wallpaper_active(void)
@@ -265,7 +272,7 @@ void wallpaper_draw(struct surface *s, struct rect clip)
     if (wall.px)
         gfx_blit(s, clip.x, clip.y, &wall, clip.x, clip.y, clip.w, clip.h);
     else
-        gfx_fill(s, clip.x, clip.y, clip.w, clip.h, C_DESKTOP);
+        gfx_fill(s, clip.x, clip.y, clip.w, clip.h, desk_color);
 }
 
 void wallpaper_resize(void)
@@ -279,9 +286,43 @@ static void save_setting(void)
     char dir[128];
     if (!grubenv_boot_dir(dir, sizeof(dir)))
         return;
-    const char *keys[2] = { "fluxos_wall", "fluxos_wallmode" };
-    const char *vals[2] = { cur_path[0] ? cur_path : "none", mode_keys[cur_mode] };
-    grubenv_update(dir, keys, vals, 2);
+    char color[8];
+    snprintf(color, sizeof(color), "%06X", (unsigned)desk_color);
+    const char *keys[3] = { "fluxos_wall", "fluxos_wallmode", "fluxos_wallcolor" };
+    const char *vals[3] = { cur_path[0] ? cur_path : "none", mode_keys[cur_mode], color };
+    grubenv_update(dir, keys, vals, 3);
+}
+
+/* "#3f175f", "3F175F" or "#fa0" (short form). */
+int parse_hex_color(const char *text, uint32_t *rgb)
+{
+    if (*text == '#')
+        text++;
+    int n = 0;
+    uint32_t v = 0;
+    for (; text[n]; n++) {
+        char c = text[n];
+        int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
+              : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        if (d < 0 || n >= 6)
+            return -1;
+        v = v << 4 | (uint32_t)d;
+    }
+    if (n == 3)
+        v = (v >> 8 & 15) * 0x110000u | (v >> 4 & 15) * 0x1100u | (v & 15) * 0x11u;
+    else if (n != 6)
+        return -1;
+    *rgb = v;
+    return 0;
+}
+
+void wallpaper_set_color(uint32_t rgb, int save)
+{
+    desk_color = rgb & 0xFFFFFF;
+    rebuild();
+    if (save)
+        save_setting();
+    wm_damage(mkrect(0, 0, screen_w, screen_h));
 }
 
 int wallpaper_set(const char *path, int mode, int save)
@@ -309,6 +350,9 @@ void wallpaper_init(void)
     if (grubenv_boot_dir(dir, sizeof(dir))) {
         if (grubenv_get(dir, "fluxos_wall", path, sizeof(path)) && path[0])
             use = !strcmp(path, "none") ? "" : path;
+        uint32_t rgb;
+        if (grubenv_get(dir, "fluxos_wallcolor", name, sizeof(name)) && parse_hex_color(name, &rgb) == 0)
+            desk_color = rgb;
         if (grubenv_get(dir, "fluxos_wallmode", name, sizeof(name)))
             for (int i = 0; i < WALL_MODES; i++)
                 if (!strcmp(name, mode_keys[i]))

@@ -212,6 +212,9 @@ void wallpaper_init(void);              /* the saved wallpaper, or the default *
 int wallpaper_set(const char *path, int mode, int save);
 const char *wallpaper_path(void);       /* "" when there is none */
 int wallpaper_mode(void);
+uint32_t wallpaper_color(void);         /* the solid color behind (or instead of) the picture, 0xRRGGBB */
+void wallpaper_set_color(uint32_t rgb, int save);
+int parse_hex_color(const char *text, uint32_t *rgb);   /* "#rrggbb", "#rgb", with or without the # */
 int wallpaper_active(void);
 void wallpaper_resize(void);            /* the screen changed size */
 void wallpaper_draw(struct surface *s, struct rect clip);
