@@ -1,5 +1,5 @@
 
-Welcome to fluxOS 0.1.2 (i686)
+Welcome to fluxOS 0.1.3 (i686)
 
  * Type 'help' for shell builtins and 'ls /bin' for programs.
  * Try:  fetch | top | spin A 5 & spin B 5 & | cat ~/README.txt

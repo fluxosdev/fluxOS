@@ -1,4 +1,4 @@
-Welcome to fluxOS 0.1.2
+Welcome to fluxOS 0.1.3
 =======================
 
 fluxOS is an experimental hobby operating system, built entirely with
