@@ -207,7 +207,7 @@ endif
 QEMU_NET  ?= -netdev user,id=net0 -device ne2k_pci,netdev=net0
 
 run: $(ISO) $(DISK)
-	$(QEMU) -m 256M -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK) $(QEMU_NET)
+	$(QEMU) -m 512M -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK) $(QEMU_NET)
 
 run-kernel: $(TEXT_KERNEL) $(INITRD) $(DISK)
 	$(QEMU) -kernel $(TEXT_KERNEL) -initrd $(INITRD) -m 256M -serial stdio $(QEMU_DISK) $(QEMU_NET)

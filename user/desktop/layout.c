@@ -7,8 +7,10 @@
  * content is gathered into a run of items (words, spaces, line breaks,
  * the edges of inline elements, and atomic boxes such as images and
  * inline-blocks) and broken into lines at spaces. Tables size their
- * columns from the minimum and maximum widths of their cells. Floats are
- * laid out as inline-blocks, flex rows as a line of inline-blocks, and
+ * columns from the minimum and maximum widths of their cells. Flex
+ * containers grow and shrink their items along lines and align them
+ * across; grid containers size column tracks (fixed, content and fr) and
+ * place items in rows. Floats are laid out as inline-blocks, and
  * positioned elements stay in the normal flow.
  *
  * Atomic boxes are laid out at (0, 0) first, to learn their size, and
@@ -34,7 +36,6 @@ struct item {
     uint8_t kind;
     uint8_t wrap;               /* space: a line may break here */
     uint8_t invisible;          /* a space that is only a break opportunity (<wbr>) */
-    uint8_t top;                /* atomic: aligned to the top of the line (flex items) */
     const struct style *st;
     struct node *node;          /* atomic, open, close: the element */
     struct node *link;          /* the enclosing <a href> */
@@ -59,7 +60,6 @@ struct flow {
     int n, cap;
     int space_before;           /* the run ends in a collapsible space (or is empty) */
     struct node *link;
-    int flex;                   /* 1: flex row (children are atomic), 2: flex column */
     int lines;                  /* lines placed so far */
     int min, max;               /* measuring */
     struct open_el open[16];
@@ -80,6 +80,7 @@ struct lctx {
     int marker_pending;
     int last_baseline;          /* of the most recent line */
     struct node *skip_bg;       /* the element whose background became the canvas */
+    struct node *contain;       /* a flex or grid item: its children's margins stay inside */
 };
 
 static unsigned layout_gen;
@@ -90,6 +91,9 @@ static int layout_table(struct lctx *c, struct node *n, int x, int y, int cw, in
 static void measure(struct lctx *c, struct node *n, int *min, int *max);
 static void flow_children(struct lctx *c, struct flow *f, struct node *n);
 static void flush_run(struct lctx *c, struct flow *f);
+static int layout_flex(struct lctx *c, struct node *n, int x, int y, int w, int defh, int minh);
+static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int defh, int minh);
+static void container_measure(struct lctx *c, struct node *n, int *min, int *max);
 
 /* ---- output ---- */
 
@@ -194,16 +198,42 @@ static uint32_t shade(uint32_t c, int num, int den, int toward_white)
     return out;
 }
 
-static void fill(struct lctx *c, int x, int y, int w, int h, uint32_t color, int dash)
+static struct ditem *fill(struct lctx *c, int x, int y, int w, int h, uint32_t color, int dash)
 {
     if (w <= 0 || h <= 0 || !ALPHA(color))
-        return;
+        return NULL;
     struct ditem *d = emit(c, DK_FILL);
     if (!d)
-        return;
+        return NULL;
     d->x = x, d->y = y, d->w = w, d->h = h;
     d->color = color;
     d->deco = (uint8_t)dash;
+    return d;
+}
+
+static int len_px(struct len l, int base);
+
+/* A box's rounded corners, w x h, into its item. */
+static void round_corners(struct ditem *d, const struct style *st, int w, int h)
+{
+    int lim = (w < h ? w : h) / 2;
+    if (lim > 2000)
+        lim = 2000;
+    for (int k = 0; k < 4; k++) {
+        int r = len_px(st->radius[k], w < h ? w : h);
+        d->rad[k] = r < 0 ? 0 : r > lim ? lim : r;
+    }
+}
+
+/* Rounded corners and a gradient for a box's fill. */
+static void decorate(struct ditem *d, const struct style *st, int w, int h)
+{
+    round_corners(d, st, w, h);
+    if (st->grad) {
+        d->grad = st->grad;
+        d->g0 = st->g0;
+        d->g1 = st->g1;
+    }
 }
 
 /* The four sides of a border box. */
@@ -233,6 +263,42 @@ static void borders(struct lctx *c, const struct style *st, int x, int y, int w,
     }
 }
 
+/*
+ * Size a box's background (the item reserved at slot) and draw its
+ * borders: as a ring round the background when the corners are rounded
+ * and the border is the same all round.
+ */
+static void finish_box(struct lctx *c, struct node *n, int slot, int x, int y, int w, int h)
+{
+    const struct style *st = n->style;
+    if (slot < 0) {
+        borders(c, st, x, y, w, h);
+        return;
+    }
+    struct ditem *d = &c->lo->items[slot];
+    int paint = !st->hidden && n != c->skip_bg;
+    /* An unpainted background keeps the box (transparent) so clicks find the element. */
+    d->x = x, d->y = y, d->w = w, d->h = h;
+    d->color = paint && ALPHA(st->bg) ? st->bg : TRANSPARENT;
+    d->node = n;
+    if (!paint) {
+        borders(c, st, x, y, w, h);
+        return;
+    }
+    decorate(d, st, w, h);
+    const int *bw = st->border_w;
+    int bs = st->border_style[0];
+    if ((d->rad[0] | d->rad[1] | d->rad[2] | d->rad[3]) && bw[0] && bw[0] == bw[1] &&
+        bw[0] == bw[2] && bw[0] == bw[3] && st->border_color[0] == st->border_color[1] &&
+        st->border_color[0] == st->border_color[2] && st->border_color[0] == st->border_color[3] &&
+        bs != BS_DOTTED && bs != BS_DASHED && bs != BS_DOUBLE) {
+        d->ring = bw[0];
+        d->ring_color = st->border_color[0];
+        return;
+    }
+    borders(c, st, x, y, w, h);
+}
+
 /* ---- boxes ---- */
 
 static int len_px(struct len l, int base)
@@ -243,7 +309,19 @@ static int len_px(struct len l, int base)
         int v = l.v > 100000 ? 100000 : l.v;
         return base > 20000 ? base / 10000 * v : base * v / 10000;
     }
+    if (l.unit == U_CALC || l.unit == U_MIN || l.unit == U_MAX) {
+        int p = len_px((struct len){ .v = l.pct, .unit = U_PCT }, base);
+        if (l.unit == U_CALC)
+            return l.v + p;
+        return (l.unit == U_MIN) == (p < l.v) ? p : l.v;
+    }
     return 0;
+}
+
+/* A length that depends on what it is in. */
+static int relative(int unit)
+{
+    return unit == U_PCT || unit == U_CALC || unit == U_MIN || unit == U_MAX;
 }
 
 struct boxm {
@@ -332,7 +410,7 @@ static int collapse(int a, int b)
 
 static int is_block_level(int d)
 {
-    return d == D_BLOCK || d == D_LIST_ITEM || d == D_TABLE || d == D_FLEX || d == D_TABLE_ROW ||
+    return d == D_BLOCK || d == D_LIST_ITEM || d == D_TABLE || d == D_TABLE_ROW ||
            d == D_TABLE_ROW_GROUP || d == D_TABLE_CAPTION;
 }
 
@@ -506,13 +584,6 @@ static void add_text(struct lctx *c, struct flow *f, const char *text, int tlen,
     int collapse_spaces = ws == WS_NORMAL || ws == WS_NOWRAP || ws == WS_PRE_LINE;
     int keep_newlines = ws == WS_PRE || ws == WS_PRE_WRAP || ws == WS_PRE_LINE;
     int sw = space_width(st), col = 0;
-    if (f->flex == 1) {                 /* whitespace between flex items is not content */
-        const char *p = s;
-        while (p < end && (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r' || *p == '\f'))
-            p++;
-        if (p == end)
-            return;
-    }
     while (s < end) {
         char ch = *s;
         if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f') {
@@ -626,7 +697,7 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
     b.ml = len_px(st->margin[3], avail);       /* auto margins are the caller's business */
     b.mr = len_px(st->margin[1], avail);
     int w = st->width.unit == U_PX ? st->width.v
-          : st->width.unit == U_PCT && !c->measuring ? len_px(st->width, avail) : -1;
+          : relative(st->width.unit) && !c->measuring ? len_px(st->width, avail) : -1;
     int h = st->height.unit == U_PX ? st->height.v : -1;
     if (st->box_sizing_border) {
         if (w >= 0)
@@ -650,7 +721,7 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
                 w = h * img->w / img->h;
             else if (h < 0)
                 h = w * img->h / img->w;
-            if (st->max_width.unit == U_PX || (st->max_width.unit == U_PCT && !c->measuring)) {
+            if (st->max_width.unit == U_PX || (relative(st->max_width.unit) && !c->measuring)) {
                 int mx = len_px(st->max_width, avail);
                 if (w > mx && mx > 0) {
                     h = h * mx / w;
@@ -739,6 +810,8 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
     d->node = n;
     d->font = f;
     d->color = st->color;
+    if (kind == DK_IMAGE)
+        round_corners(d, st, w, h);
     if (kind == DK_FRAME && alt && *alt) {
         struct ditem *t = emit(c, DK_TEXT);
         if (t) {
@@ -802,7 +875,6 @@ static void add_atomic(struct lctx *c, struct flow *f, struct node *n)
     if (!it)
         return;
     it->node = n;
-    it->top = f->flex == 1;             /* flex items stretch from the top of the row */
     f->space_before = 0;
     if (c->measuring) {
         int mn, mx;
@@ -847,7 +919,9 @@ static void open_box_rect(struct lctx *c, const struct style *st, int x0, int x1
     int pt = len_px(st->padding[0], 0), pb = len_px(st->padding[2], 0);
     int top = baseline - asc - pt - st->border_w[0];
     int bottom = baseline + desc + pb + st->border_w[2];
-    fill(c, x0, top, x1 - x0, bottom - top, st->bg, 0);
+    struct ditem *d = fill(c, x0, top, x1 - x0, bottom - top, st->bg, 0);
+    if (d)
+        decorate(d, st, x1 - x0, bottom - top);
     if (st->border_w[0] || st->border_w[1] || st->border_w[2] || st->border_w[3])
         borders(c, st, x0, top, x1 - x0, bottom - top);
 }
@@ -876,9 +950,6 @@ static void place_line(struct lctx *c, struct flow *f, int from, int to)
                 above = a - sh;
             if (d + sh > below)
                 below = d + sh;
-        } else if (it->kind == I_ATOMIC && it->top) {
-            if (it->h - above > below)
-                below = it->h - above;
         } else if (it->kind == I_ATOMIC) {
             int top = it->base, bot = it->h - it->base;
             if (it->st->vertical_align == VA_MIDDLE) {
@@ -959,9 +1030,7 @@ static void place_line(struct lctx *c, struct flow *f, int from, int to)
                             line_top, it->w, line_h);
         } else if (it->kind == I_ATOMIC) {
             int top = baseline - it->base;
-            if (it->top)
-                top = line_top;
-            else if (st->vertical_align == VA_MIDDLE)
+            if (st->vertical_align == VA_MIDDLE)
                 top = baseline - xh / 2 - it->h / 2;
             shift(c, it->m0, it->m1, it->x, top);
             if (it->link)
@@ -1164,11 +1233,7 @@ static void flow_node(struct lctx *c, struct flow *f, struct node *n)
     }
     if (n->tag == T_INPUT && !strcasecmp(input_type(n), "hidden"))
         return;
-    if (f->flex == 1) {
-        add_atomic(c, f, n);
-        return;
-    }
-    if (f->flex == 2 || is_block_level(st->display)) {
+    if (is_block_level(st->display)) {
         block_child(c, f, n);
         return;
     }
@@ -1215,16 +1280,22 @@ static struct node *enclosing_link(struct node *n)
 }
 
 /* Lay out the content of a block container; returns its height (the last
- * child's bottom margin is left in *pm). */
-static int block_content(struct lctx *c, struct node *n, int x, int y, int w, int *pm)
+ * child's bottom margin is left in *pm). defh is the content height when
+ * the box has one set (else -1), minh its least. */
+static int block_content(struct lctx *c, struct node *n, int x, int y, int w, int defh, int minh,
+                         int *pm)
 {
     const struct style *st = n->style;
+    if (st->inner == IN_FLEX || st->inner == IN_GRID) {
+        *pm = 0;
+        return st->inner == IN_FLEX ? layout_flex(c, n, x, y, w, defh, minh)
+                                    : layout_grid(c, n, x, y, w, defh, minh);
+    }
     struct flow f = { 0 };
     f.x = x, f.w = w, f.y0 = f.cy = y;
     f.st = st;
     f.space_before = 1;
     f.link = enclosing_link(n);
-    f.flex = st->display == D_FLEX ? (st->flex_column ? 2 : 1) : 0;
     add_pseudo(c, &f, n, 0);
     flow_children(c, &f, n);
     add_pseudo(c, &f, n, 1);
@@ -1262,8 +1333,12 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
     int cx = bx + b.bl + b.pl, cy = y + b.bt + b.pt;
     if (st->display == D_LIST_ITEM)
         start_marker(c, n, cx);
-    int pm = 0;
-    int ch = block_content(c, n, cx, cy, b.w, &pm);
+    int pm = 0, vt = st->box_sizing_border ? b.bt + b.bb + b.pt + b.pb : 0, defh = -1, minh = 0;
+    if (st->height.unit == U_PX)
+        defh = st->height.v - vt > 0 ? st->height.v - vt : 0;
+    if (st->min_height.unit == U_PX)
+        minh = st->min_height.v - vt > 0 ? st->min_height.v - vt : 0;
+    int ch = block_content(c, n, cx, cy, b.w, defh, minh, &pm);
     if (c->marker_pending && st->display == D_LIST_ITEM)
         place_marker(c, cy + wfont_ascent(st->font));
 
@@ -1272,7 +1347,7 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
         ch = st->height.v - (st->box_sizing_border ? b.bt + b.bb + b.pt + b.pb : 0);
         if (ch < 0)
             ch = 0;
-    } else if (!b.pb && !b.bb && st->display != D_TABLE_CELL && n->parent) {
+    } else if (!b.pb && !b.bb && st->display != D_TABLE_CELL && n->parent && n != c->contain) {
         *mb = collapse(b.mb, pm);               /* the last child's margin passes through */
     } else {
         ch += pm;
@@ -1281,19 +1356,984 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
         ch = st->min_height.v;
     int bh = b.bt + b.pt + ch + b.pb + b.bb;
 
-    if (slot >= 0) {
-        struct ditem *d = &c->lo->items[slot];
-        int paint = ALPHA(st->bg) && !st->hidden && n != c->skip_bg;
-        /* An unpainted background keeps the box (transparent) so clicks find the element. */
-        d->x = bx, d->y = y, d->w = bw, d->h = bh;
-        d->color = paint ? st->bg : TRANSPARENT;
-        d->node = n;
-    }
-    if (bg_slot)
+    if (bg_slot) {
         *bg_slot = slot;
-    else
-        borders(c, st, bx, y, bw, bh);
+        if (slot >= 0) {
+            struct ditem *d = &c->lo->items[slot];
+            int paint = ALPHA(st->bg) && !st->hidden && n != c->skip_bg;
+            d->x = bx, d->y = y, d->w = bw, d->h = bh;
+            d->color = paint ? st->bg : TRANSPARENT;
+            d->node = n;
+        }
+    } else {
+        finish_box(c, n, slot, bx, y, bw, bh);
+    }
     return bh;
+}
+
+/* ---- flex and grid containers ---- */
+
+/* a * b / c without overflowing 32 bits on the way (c > 0). */
+static int muldiv(int a, int b, int c)
+{
+    int neg = (a < 0) != (b < 0);
+    unsigned ua = a < 0 ? 0u - (unsigned)a : (unsigned)a, ub = b < 0 ? 0u - (unsigned)b : (unsigned)b;
+    unsigned uc = c > 0 ? (unsigned)c : 1u;
+    unsigned long long p = (unsigned long long)ua * ub;
+    unsigned hi = (unsigned)(p >> 32), lo = (unsigned)p;
+    if (hi >= uc)
+        return neg ? -0x7FFFFFFF : 0x7FFFFFFF;
+    unsigned r = hi, q = 0;
+    for (int i = 31; i >= 0; i--) {             /* long division, a bit at a time */
+        r = (r << 1) | (lo >> i & 1);
+        if (r >= uc) {
+            r -= uc;
+            q |= 1u << i;
+        }
+    }
+    int res = q > 0x7FFFFFFFu ? 0x7FFFFFFF : (int)q;
+    return neg ? -res : res;
+}
+
+enum { FI_BLOCK, FI_REPLACED, FI_TABLE, FI_TEXT, FI_PSEUDO };
+
+struct fitem {
+    struct node *n;             /* the element; a text node; the container, for ::before/::after */
+    const struct style *st;     /* the element's style; the container's for text */
+    uint8_t kind, which;        /* FI_*; FI_PSEUDO: 0 ::before, 1 ::after */
+    int order;
+    int ml, mr, mt, mb;         /* margins; auto ones are 0 here and flagged */
+    uint8_t aml, amr, amt, amb;
+    int hz, vt;                 /* borders and padding across and down */
+    int grow, shrink;           /* times 100 */
+    /* sizes along the main axis: content boxes for rows, border boxes for columns */
+    int base, hyp, minm, maxm, main;
+    int me, mm;                 /* the edges and margins along it */
+    int viol;
+    uint8_t frozen;
+    int bw, bh;                 /* the border box as laid out */
+    int slot;                   /* its background, sized when it is placed */
+    struct mark m0, m1;
+    int col, row, cspan, rspan; /* grid */
+};
+
+static int anonymous(const struct fitem *it)
+{
+    return it->kind == FI_TEXT || it->kind == FI_PSEUDO;
+}
+
+/* Text with something other than collapsible spaces in it. */
+static int has_text(const char *t, int len, const struct style *st)
+{
+    if (st->white_space == WS_PRE || st->white_space == WS_PRE_WRAP)
+        return len > 0;
+    for (int i = 0; i < len; i++)
+        if (t[i] != ' ' && t[i] != '\t' && t[i] != '\n' && t[i] != '\r' && t[i] != '\f')
+            return 1;
+    return 0;
+}
+
+static void push_fitem(struct fitem *items, int *n, struct node *node, const struct style *st,
+                       int kind, int which)
+{
+    struct fitem *it = &items[(*n)++];
+    memset(it, 0, sizeof(*it));
+    it->n = node;
+    it->st = st;
+    it->kind = (uint8_t)kind;
+    it->which = (uint8_t)which;
+    it->order = kind == FI_PSEUDO ? (which ? 1 << 30 : -(1 << 30)) : anonymous(it) ? 0 : st->order;
+    it->slot = -1;
+}
+
+/*
+ * The items of a flex or grid container: its element children, and runs
+ * of text and ::before/::after content as anonymous items, in order.
+ * Returns how many (the array is malloc'd).
+ */
+static int container_items(struct node *n, struct fitem **out)
+{
+    int cap = 2;
+    for (struct node *k = n->first; k; k = k->next)
+        cap++;
+    struct fitem *items = malloc(sizeof(struct fitem) * (size_t)cap);
+    *out = items;
+    if (!items)
+        return 0;
+    int ni = 0;
+    for (int pe = 0; pe < 2; pe++) {
+        const struct style *ps = n->pseudo_st[pe];
+        const char *t = n->pseudo_text[pe];
+        if (ps && t && ps->display != D_NONE && has_text(t, (int)strlen(t), ps))
+            push_fitem(items, &ni, n, ps, FI_PSEUDO, pe);
+    }
+    for (struct node *k = n->first; k; k = k->next) {
+        if (k->type == N_TEXT) {
+            if (has_text(k->text, k->len, n->style))
+                push_fitem(items, &ni, k, n->style, FI_TEXT, 0);
+            continue;
+        }
+        const struct style *st = k->style;
+        if (!st || st->display == D_NONE || !st->font || k->tag == T_BR || k->tag == T_WBR ||
+            (k->tag == T_INPUT && !strcasecmp(input_type(k), "hidden")))
+            continue;
+        int kind = is_replaced(k) ? FI_REPLACED
+                 : st->display == D_TABLE || st->display == D_INLINE_TABLE ? FI_TABLE : FI_BLOCK;
+        push_fitem(items, &ni, k, st, kind, 0);
+    }
+    /* order, keeping document order among equals */
+    for (int i = 1; i < ni; i++) {
+        struct fitem t = items[i];
+        int j = i;
+        while (j > 0 && items[j - 1].order > t.order) {
+            items[j] = items[j - 1];
+            j--;
+        }
+        items[j] = t;
+    }
+    return ni;
+}
+
+/* An anonymous item's content, into a flow. */
+static void anon_content(struct lctx *c, struct flow *f, struct fitem *it)
+{
+    if (it->kind == FI_TEXT)
+        flow_node(c, f, it->n);
+    else
+        add_pseudo(c, f, it->n, it->which);
+}
+
+/* An item's narrowest and widest margin boxes. */
+static void item_measure(struct lctx *c, struct fitem *it, int *mn, int *mx)
+{
+    if (!anonymous(it)) {
+        measure(c, it->n, mn, mx);
+        return;
+    }
+    int saved = c->measuring;
+    c->measuring = 1;
+    struct flow f = { 0 };
+    f.st = it->st;
+    f.space_before = 1;
+    f.w = BIG;
+    anon_content(c, &f, it);
+    flush_run(c, &f);
+    free(f.items);
+    c->measuring = saved;
+    *mn = f.min;
+    *mx = f.max;
+}
+
+/* Margins, borders and padding, in a container cw wide. Replaced elements
+ * keep theirs inside the box layout_replaced makes. */
+static void item_edges(struct fitem *it, int cw)
+{
+    const struct style *st = it->st;
+    it->ml = it->mr = it->mt = it->mb = it->hz = it->vt = 0;
+    it->aml = it->amr = it->amt = it->amb = 0;
+    it->grow = 0;
+    it->shrink = 100;
+    if (anonymous(it))
+        return;
+    it->aml = st->margin[3].unit == U_AUTO, it->amr = st->margin[1].unit == U_AUTO;
+    it->amt = st->margin[0].unit == U_AUTO, it->amb = st->margin[2].unit == U_AUTO;
+    it->grow = st->flex_grow;
+    it->shrink = st->flex_shrink;
+    if (it->kind == FI_REPLACED)
+        return;
+    it->ml = len_px(st->margin[3], cw), it->mr = len_px(st->margin[1], cw);
+    it->mt = len_px(st->margin[0], cw), it->mb = len_px(st->margin[2], cw);
+    it->hz = st->border_w[1] + st->border_w[3] + len_px(st->padding[1], cw) + len_px(st->padding[3], cw);
+    it->vt = st->border_w[0] + st->border_w[2] + len_px(st->padding[0], cw) + len_px(st->padding[2], cw);
+}
+
+/* How it sits across the line: align-self, or the container's align-items. */
+static int item_align(const struct style *cst, const struct fitem *it)
+{
+    int al = anonymous(it) || it->st->align_self == AL_AUTO ? cst->align_items : it->st->align_self;
+    return al == AL_NORMAL ? AL_STRETCH : al;
+}
+
+static int item_justify(const struct style *cst, const struct fitem *it)
+{
+    int al = anonymous(it) || it->st->justify_self == AL_AUTO ? cst->justify_items : it->st->justify_self;
+    return al == AL_NORMAL ? AL_STRETCH : al;
+}
+
+/* The border-box width of an item that is not stretched: its own width,
+ * or shrink-to-fit in avail (its margin box). */
+static int fit_width(struct lctx *c, struct fitem *it, int avail)
+{
+    const struct style *st = it->st;
+    if (!anonymous(it) && st->width.unit != U_AUTO) {
+        struct boxm b;
+        resolve_box(st, avail, -1, &b);
+        return b.w + hz(&b);
+    }
+    int mn, mx;
+    item_measure(c, it, &mn, &mx);
+    int stf = mx < avail ? mx : avail;
+    if (stf < mn)
+        stf = mn;
+    stf -= it->ml + it->mr;
+    return stf > 0 ? stf : 0;
+}
+
+/* A stretched item's border-box width: the space less margins, within max-width. */
+static int stretch_width(struct fitem *it, int avail)
+{
+    int bw = avail - it->ml - it->mr;
+    const struct style *st = it->st;
+    if (!anonymous(it) && st->max_width.unit != U_AUTO) {
+        int mx = len_px(st->max_width, avail) + (st->box_sizing_border ? 0 : it->hz);
+        if (bw > mx)
+            bw = mx;
+    }
+    if (!anonymous(it) && st->min_width.unit != U_AUTO) {
+        int mn = len_px(st->min_width, avail) + (st->box_sizing_border ? 0 : it->hz);
+        if (bw < mn)
+            bw = mn;
+    }
+    return bw > 0 ? bw : 0;
+}
+
+/*
+ * Lay out an item with its border box at (0, 0), bw wide (replaced
+ * elements take their own size, margins and all). Returns its height;
+ * a block's background and borders wait for item_place.
+ */
+static int item_layout(struct lctx *c, struct fitem *it, int bw, int cw)
+{
+    it->m0 = mark_now(c);
+    it->slot = -1;
+    int h = 0, mb;
+    if (anonymous(it)) {
+        struct flow f = { 0 };
+        f.w = bw;
+        f.st = it->st;
+        f.space_before = 1;
+        f.link = enclosing_link(it->kind == FI_TEXT ? it->n->parent : it->n);
+        anon_content(c, &f, it);
+        flush_run(c, &f);
+        free(f.items);
+        h = f.cy;
+    } else if (it->kind == FI_REPLACED) {
+        int base;
+        layout_replaced(c, it->n, cw, &bw, &h, &base);
+    } else if (it->kind == FI_TABLE) {
+        h = layout_table(c, it->n, 0, 0, cw, bw, &mb);
+    } else {
+        int saved = c->marker_pending;
+        struct node *outer = c->contain;
+        c->marker_pending = 0;
+        c->contain = it->n;
+        h = layout_block_box(c, it->n, 0, 0, cw, bw, &mb, &it->slot);
+        c->contain = outer;
+        c->marker_pending = saved;
+    }
+    it->m1 = mark_now(c);
+    it->bw = bw;
+    it->bh = h;
+    return h;
+}
+
+/* Move a laid-out item to (x, y), h tall, and finish its box. */
+static void item_place(struct lctx *c, struct fitem *it, int x, int y, int h)
+{
+    shift(c, it->m0, it->m1, x, y);
+    if (it->kind != FI_BLOCK)
+        return;
+    finish_box(c, it->n, it->slot, x, y, it->bw, h);
+    if (it->n->tag == T_BUTTON && !it->st->hidden)
+        add_hotspot(c, &c->lo->controls, &c->lo->ncontrols, &c->lo->controlcap, it->n, x, y, it->bw, h);
+    struct node *link = enclosing_link(it->n);
+    if (link)
+        add_hotspot(c, &c->lo->links, &c->lo->nlinks, &c->lo->linkcap, link, x, y, it->bw, h);
+}
+
+/* A row item's flex base size and limits (content box widths). */
+static void row_sizes(struct lctx *c, struct fitem *it, int cw)
+{
+    const struct style *st = it->st;
+    int anon = anonymous(it), mn = 0, mx = 0;
+    it->me = it->hz;
+    it->mm = it->ml + it->mr;
+    if (it->kind == FI_REPLACED) {
+        item_measure(c, it, &mn, &mx);
+        it->base = it->hyp = it->minm = it->maxm = mx;
+        it->grow = it->shrink = 0;
+        return;
+    }
+    int bs = !anon && st->box_sizing_border ? it->hz : 0, edges = it->hz + it->mm;
+    if (anon || (st->flex_basis.unit == U_AUTO && st->width.unit == U_AUTO) ||
+        (st->min_width.unit == U_AUTO && !st->clips))
+        item_measure(c, it, &mn, &mx);
+    if (!anon && st->flex_basis.unit != U_AUTO)
+        it->base = len_px(st->flex_basis, cw) - bs;
+    else if (!anon && st->width.unit != U_AUTO)
+        it->base = len_px(st->width, cw) - bs;
+    else
+        it->base = mx - edges;
+    if (!anon && st->min_width.unit != U_AUTO) {
+        it->minm = len_px(st->min_width, cw) - bs;
+    } else if (!anon && st->clips) {
+        it->minm = 0;
+    } else {                                    /* automatic: no narrower than its content */
+        it->minm = mn - edges;
+        if (!anon && st->width.unit != U_AUTO && len_px(st->width, cw) - bs < it->minm)
+            it->minm = len_px(st->width, cw) - bs;
+    }
+    it->maxm = !anon && st->max_width.unit != U_AUTO ? len_px(st->max_width, cw) - bs : BIG;
+    if (it->base < 0)
+        it->base = 0;
+    if (it->minm < 0)
+        it->minm = 0;
+    if (it->maxm < it->minm)
+        it->maxm = it->minm;
+    it->hyp = it->base < it->minm ? it->minm : it->base > it->maxm ? it->maxm : it->base;
+}
+
+/* Grow or shrink a line's items to fill avail (their margin boxes, less gaps). */
+static void resolve_flexible(struct fitem *it, int n, int avail)
+{
+    int used = 0;
+    for (int k = 0; k < n; k++)
+        used += it[k].hyp + it[k].me + it[k].mm;
+    int growing = used < avail;
+    for (int k = 0; k < n; k++) {
+        int factor = growing ? it[k].grow : it[k].shrink;
+        it[k].main = it[k].hyp;
+        it[k].frozen = used == avail || !factor ||
+                       (growing ? it[k].base > it[k].hyp : it[k].base < it[k].hyp);
+    }
+    for (int iter = 0; iter <= n; iter++) {
+        int spare = avail, unfrozen = 0, sumf = 0;
+        for (int k = 0; k < n; k++) {
+            spare -= (it[k].frozen ? it[k].main : it[k].base) + it[k].me + it[k].mm;
+            if (it[k].frozen)
+                continue;
+            unfrozen++;
+            sumf += growing ? it[k].grow : muldiv(it[k].shrink, it[k].base, 100);
+        }
+        if (!unfrozen)
+            break;
+        if (growing && sumf < 100)              /* flex-grow: .5 takes half the room */
+            spare = muldiv(spare, sumf, 100);
+        int total = 0;
+        for (int k = 0; k < n; k++) {
+            if (it[k].frozen)
+                continue;
+            int share = growing ? it[k].grow : muldiv(it[k].shrink, it[k].base, 100);
+            int target = it[k].base + (sumf > 0 ? muldiv(spare, share, sumf) : 0);
+            int clamped = target < it[k].minm ? it[k].minm : target > it[k].maxm ? it[k].maxm : target;
+            it[k].viol = clamped - target;
+            it[k].main = clamped;
+            total += it[k].viol;
+        }
+        for (int k = 0; k < n; k++)
+            if (!it[k].frozen && (!total || (total > 0 ? it[k].viol > 0 : it[k].viol < 0)))
+                it[k].frozen = 1;
+        if (!total)
+            break;
+    }
+}
+
+/* Where free space goes along a line: before the first item, and between them. */
+static void justify_space(int jst, int spare, int n, int gap, int *off, int *between)
+{
+    *off = 0;
+    *between = gap;
+    if (spare <= 0) {
+        if (jst == AL_CENTER)
+            *off = spare / 2 > 0 ? spare / 2 : 0;
+        return;
+    }
+    switch (jst) {
+    case AL_END: *off = spare; break;
+    case AL_CENTER: *off = spare / 2; break;
+    case AL_BETWEEN: if (n > 1) *between += spare / (n - 1); break;
+    case AL_AROUND: *between += spare / n; *off = spare / n / 2; break;
+    case AL_EVENLY: *between += spare / (n + 1); *off = spare / (n + 1); break;
+    default: break;
+    }
+}
+
+static int flex_row(struct lctx *c, const struct style *st, struct fitem *it, int ni, int x, int y,
+                    int w, int defh, int minh)
+{
+    int gap = len_px(st->col_gap, w), rgap = len_px(st->row_gap, w);
+    for (int i = 0; i < ni; i++) {
+        item_edges(&it[i], w);
+        row_sizes(c, &it[i], w);
+    }
+    /* Break into lines, flex each, and lay the items out to learn their heights. */
+    int *starts = malloc(sizeof(int) * (size_t)(ni + 1) * 2);
+    if (!starts)
+        return 0;
+    int *cross = starts + ni + 1;
+    int nlines = 0;
+    for (int i = 0; i < ni;) {
+        int start = i, sum = it[i].hyp + it[i].me + it[i].mm;
+        for (i++; i < ni && st->flex_wrap; i++) {
+            int o = it[i].hyp + it[i].me + it[i].mm;
+            if (sum + gap + o > w)
+                break;
+            sum += gap + o;
+        }
+        if (!st->flex_wrap)
+            i = ni;
+        starts[nlines] = start;
+        int cnt = i - start;
+        resolve_flexible(it + start, cnt, w - gap * (cnt - 1));
+        cross[nlines] = 0;
+        for (int k = start; k < i; k++) {
+            int h = item_layout(c, &it[k], it[k].main + it[k].me, w);
+            if (it[k].mt + h + it[k].mb > cross[nlines])
+                cross[nlines] = it[k].mt + h + it[k].mb;
+        }
+        nlines++;
+    }
+    starts[nlines] = ni;
+
+    /* A single line fills the container's height; several share what is spare. */
+    int total = rgap * (nlines - 1);
+    for (int l = 0; l < nlines; l++)
+        total += cross[l];
+    int target = defh >= 0 ? defh : minh;
+    if (!st->flex_wrap && nlines == 1 && target > cross[0]) {
+        total += target - cross[0];
+        cross[0] = target;
+    } else if (target > total && nlines) {
+        int extra = target - total;
+        for (int l = 0; l < nlines; l++)
+            cross[l] += extra / nlines;
+        total = target;
+    }
+
+    int jst = st->justify;
+    if (st->flex_reverse)
+        jst = jst == AL_END ? AL_START : jst == AL_START || jst == AL_NORMAL ? AL_END : jst;
+    int ly = y;
+    for (int l = 0; l < nlines; l++) {
+        int a = starts[l], b = starts[l + 1], cnt = b - a;
+        int spare = w - gap * (cnt - 1), nauto = 0;
+        for (int k = a; k < b; k++) {
+            spare -= it[k].bw + it[k].ml + it[k].mr;
+            nauto += it[k].aml + it[k].amr;
+        }
+        int off, between, per_auto = 0;
+        if (spare > 0 && nauto) {
+            per_auto = spare / nauto;
+            off = 0, between = gap;
+        } else {
+            justify_space(jst, spare, cnt, gap, &off, &between);
+        }
+        int cx = x + off;
+        for (int k = a; k < b; k++) {
+            struct fitem *t = &it[k];
+            if (t->aml)
+                cx += per_auto;
+            cx += t->ml;
+            int al = item_align(st, t), h = t->bh, top;
+            int outer = t->mt + h + t->mb;
+            if (al == AL_STRETCH && t->kind == FI_BLOCK && t->st->height.unit == U_AUTO &&
+                !t->amt && !t->amb && cross[l] - t->mt - t->mb > h)
+                h = cross[l] - t->mt - t->mb;
+            if (t->amt && t->amb)
+                top = (cross[l] - outer) / 2 + t->mt;
+            else if (t->amt)
+                top = cross[l] - t->mb - h;
+            else if (al == AL_END)
+                top = cross[l] - t->mb - h;
+            else if (al == AL_CENTER)
+                top = (cross[l] - outer) / 2 + t->mt;
+            else
+                top = t->mt;
+            item_place(c, t, cx, ly + top, h);
+            cx += t->bw + t->mr + between;
+            if (t->amr)
+                cx += per_auto;
+        }
+        ly += cross[l] + rgap;
+    }
+    free(starts);
+    return total;
+}
+
+static int flex_column(struct lctx *c, const struct style *st, struct fitem *it, int ni, int x, int y,
+                       int w, int defh, int minh)
+{
+    int gap = len_px(st->row_gap, w);
+    int used = gap * (ni - 1);
+    for (int i = 0; i < ni; i++) {
+        struct fitem *t = &it[i];
+        item_edges(t, w);
+        int al = item_align(st, t), bw;
+        if (t->kind == FI_REPLACED)
+            bw = -1;
+        else if (anonymous(t))
+            bw = w;
+        else if (al == AL_STRETCH && t->st->width.unit == U_AUTO && !t->aml && !t->amr)
+            bw = stretch_width(t, w);
+        else
+            bw = fit_width(c, t, w);
+        int h = item_layout(c, t, bw, w);
+        /* Heights are border boxes here; an item is never shorter than its content. */
+        const struct style *ist = t->st;
+        int bs = !anonymous(t) && !ist->box_sizing_border ? t->vt : 0;
+        t->me = 0;
+        t->mm = t->mt + t->mb;
+        t->base = h;
+        if (!anonymous(t) && ist->flex_basis.unit == U_PX)
+            t->base = ist->flex_basis.v + bs;
+        else if (!anonymous(t) && ist->flex_basis.unit != U_AUTO && defh >= 0)
+            t->base = len_px(ist->flex_basis, defh) + bs;
+        t->minm = !anonymous(t) && ist->clips ? t->vt : h;
+        if (!anonymous(t) && ist->min_height.unit == U_PX && ist->min_height.v + bs > t->minm)
+            t->minm = ist->min_height.v + bs;
+        t->maxm = BIG;
+        if (t->kind != FI_BLOCK)
+            t->grow = t->shrink = 0, t->minm = t->maxm = h;
+        t->hyp = t->base < t->minm ? t->minm : t->base;
+        used += t->hyp + t->mm;
+    }
+    int avail = defh >= 0 ? defh : minh > used ? minh : used;
+    resolve_flexible(it, ni, avail - gap * (ni - 1));
+
+    int spare = avail - gap * (ni - 1), nauto = 0;
+    for (int i = 0; i < ni; i++) {
+        if (it[i].main < it[i].bh)
+            it[i].main = it[i].bh;
+        spare -= it[i].main + it[i].mm;
+        nauto += it[i].amt + it[i].amb;
+    }
+    int off, between, per_auto = 0;
+    int jst = st->justify;
+    if (st->flex_reverse)
+        jst = jst == AL_END ? AL_START : jst == AL_START || jst == AL_NORMAL ? AL_END : jst;
+    if (spare > 0 && nauto) {
+        per_auto = spare / nauto;
+        off = 0, between = gap;
+    } else {
+        justify_space(jst, spare, ni, gap, &off, &between);
+    }
+    int cy = y + off;
+    for (int i = 0; i < ni; i++) {
+        struct fitem *t = &it[i];
+        if (t->amt)
+            cy += per_auto;
+        cy += t->mt;
+        int al = item_align(st, t), left;
+        int outer = t->ml + t->bw + t->mr;
+        if (t->aml && t->amr)
+            left = (w - outer) / 2 + t->ml;
+        else if (t->aml || al == AL_END)
+            left = w - t->mr - t->bw;
+        else if (al == AL_CENTER)
+            left = (w - outer) / 2 + t->ml;
+        else
+            left = t->ml;
+        item_place(c, t, x + left, cy, t->main);
+        cy += t->main + t->mb + between;
+        if (t->amb)
+            cy += per_auto;
+    }
+    int h = cy - between - y;
+    if (ni && it[ni - 1].amb)
+        h -= per_auto;
+    return h > avail ? h : avail;
+}
+
+static int layout_flex(struct lctx *c, struct node *n, int x, int y, int w, int defh, int minh)
+{
+    const struct style *st = n->style;
+    struct fitem *items;
+    int ni = container_items(n, &items), h = 0;
+    if (st->flex_reverse)
+        for (int i = 0; i < ni / 2; i++) {
+            struct fitem t = items[i];
+            items[i] = items[ni - 1 - i];
+            items[ni - 1 - i] = t;
+        }
+    if (ni > 0)
+        h = st->flex_column ? flex_column(c, st, items, ni, x, y, w, defh, minh)
+                            : flex_row(c, st, items, ni, x, y, w, defh, minh);
+    free(items);
+    return h;
+}
+
+/* Track sizes as pixels, or 0 for content-sized ones. */
+static int track_px(int kind, int v, int w)
+{
+    return kind == TK_PX ? v : kind == TK_PCT ? muldiv(w, v, 10000) : 0;
+}
+
+/*
+ * The column tracks for a container w wide: the template's, with
+ * auto-fill and auto-fit repeated as often as they fit. No template
+ * makes one column.
+ */
+static int grid_tracks(const struct gridspec *g, int w, int gap, int nitems, struct track *out)
+{
+    if (!g || !g->n) {
+        out[0] = (struct track){ TK_AUTO, TK_AUTO, 0, 0 };
+        return 1;
+    }
+    if (!g->auto_repeat) {
+        memcpy(out, g->t, sizeof(struct track) * (size_t)g->n);
+        return g->n;
+    }
+    int fixed = 0, rep = 0;
+    for (int i = 0; i < g->n; i++) {
+        const struct track *t = &g->t[i];
+        int size = track_px(t->max, t->vmax, w);
+        if (!size)
+            size = track_px(t->min, t->vmin, w);
+        if (i >= g->rep && i < g->rep + g->nrep)
+            rep += size + gap;
+        else
+            fixed += size + gap;
+    }
+    int others = g->n - g->nrep, count = 1;
+    if (rep > 0)
+        count = (w - fixed + gap) / rep;
+    if (count > (MAX_TRACKS - others) / g->nrep)
+        count = (MAX_TRACKS - others) / g->nrep;
+    if (g->auto_repeat == 2 && count * g->nrep > nitems)     /* auto-fit: no empty columns */
+        count = (nitems + g->nrep - 1) / g->nrep;
+    if (count < 1)
+        count = 1;
+    int n = 0;
+    for (int i = 0; i < g->rep; i++)
+        out[n++] = g->t[i];
+    for (int k = 0; k < count; k++)
+        for (int i = 0; i < g->nrep; i++)
+            out[n++] = g->t[g->rep + i];
+    for (int i = g->rep + g->nrep; i < g->n; i++)
+        out[n++] = g->t[i];
+    return n;
+}
+
+/* Column widths: fixed tracks, then content-sized ones up to what their
+ * items want, then fr tracks share the rest; with no fr tracks, auto
+ * ones stretch to fill. */
+static void size_columns(struct lctx *c, const struct track *tr, int nt, struct fitem *it, int ni,
+                         int w, int avail, int *colw)
+{
+    int cmin[MAX_TRACKS], cmax[MAX_TRACKS], limit[MAX_TRACKS];
+    memset(cmin, 0, sizeof(cmin));
+    memset(cmax, 0, sizeof(cmax));
+    for (int i = 0; i < ni; i++) {
+        if (it[i].cspan != 1)
+            continue;
+        int mn, mx;
+        item_measure(c, &it[i], &mn, &mx);
+        if (mn > cmin[it[i].col])
+            cmin[it[i].col] = mn;
+        if (mx > cmax[it[i].col])
+            cmax[it[i].col] = mx;
+    }
+    int spare = avail, sumfr = 0, nauto = 0;
+    for (int k = 0; k < nt; k++) {
+        const struct track *t = &tr[k];
+        int base = t->min == TK_PX || t->min == TK_PCT ? track_px(t->min, t->vmin, w)
+                 : t->min == TK_MAX ? cmax[k] : cmin[k];
+        int lim = t->max == TK_PX || t->max == TK_PCT ? track_px(t->max, t->vmax, w)
+                : t->max == TK_MIN ? base : t->max == TK_FR ? base : cmax[k];
+        colw[k] = base;
+        limit[k] = lim > base ? lim : base;
+        spare -= base;
+        if (t->max == TK_FR)
+            sumfr += t->vmax;
+        else if (t->max == TK_AUTO)
+            nauto++;
+    }
+    /* content-sized tracks grow towards their limits */
+    int room = 0;
+    for (int k = 0; k < nt; k++)
+        if (tr[k].max != TK_FR)
+            room += limit[k] - colw[k];
+    if (spare > 0 && room > 0) {
+        int give = room < spare ? room : spare;
+        for (int k = 0; k < nt; k++)
+            if (tr[k].max != TK_FR)
+                colw[k] += muldiv(limit[k] - colw[k], give, room);
+        spare -= give;
+    }
+    if (sumfr) {
+        /* fr tracks: a share of what is left, unless their content needs more */
+        uint8_t fixed[MAX_TRACKS];
+        memset(fixed, 0, sizeof(fixed));
+        for (int iter = 0; iter < nt; iter++) {
+            int left = avail, frs = 0;
+            for (int k = 0; k < nt; k++) {
+                if (tr[k].max != TK_FR || fixed[k])
+                    left -= colw[k];
+                else
+                    frs += tr[k].vmax;
+            }
+            if (!frs)
+                break;
+            int unit = muldiv(left > 0 ? left : 0, 100, frs < 100 ? 100 : frs);   /* per 1fr */
+            int again = 0;
+            for (int k = 0; k < nt; k++) {
+                if (tr[k].max != TK_FR || fixed[k])
+                    continue;
+                int share = muldiv(unit, tr[k].vmax, 100);
+                if (share < colw[k]) {
+                    fixed[k] = 1;
+                    again = 1;
+                }
+            }
+            if (again)
+                continue;
+            for (int k = 0; k < nt; k++)
+                if (tr[k].max == TK_FR && !fixed[k])
+                    colw[k] = muldiv(unit, tr[k].vmax, 100);
+            break;
+        }
+    } else if (spare > 0 && nauto) {
+        for (int k = 0; k < nt; k++)
+            if (tr[k].max == TK_AUTO)
+                colw[k] += spare / nauto;
+    }
+}
+
+/* Put items into cells: explicit columns and rows, then the rest in reading order. */
+static int grid_place(struct fitem *it, int ni, int nt)
+{
+    int rows_cap = 16, nrows = 0;
+    uint8_t *occ = calloc((size_t)(rows_cap * nt), 1);
+    if (!occ)
+        return 0;
+    int cur_r = 0, cur_c = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < ni; i++) {
+            struct fitem *t = &it[i];
+            const struct style *st = t->st;
+            int anon = anonymous(t);
+            int col = -1, cs = !anon && st->gc_span > 0 ? st->gc_span : 1;
+            int row = !anon && st->gr_start > 0 ? st->gr_start - 1 : -1;
+            int rs = !anon && st->gr_span > 0 ? st->gr_span : 1;
+            if (!anon && st->gc_start)
+                col = (st->gc_start > 0 ? st->gc_start : nt + 2 + st->gc_start) - 1;
+            if (!anon && st->gc_end) {
+                int end = (st->gc_end > 0 ? st->gc_end : nt + 2 + st->gc_end) - 1;
+                if (col >= 0 && end > col)
+                    cs = end - col;
+                else if (col < 0 && end - cs >= 0)
+                    col = end - cs;
+            }
+            if (cs > nt)
+                cs = nt;
+            if (col >= 0 && col + cs > nt)
+                col = nt - cs;
+            if (rs > 64)
+                rs = 64;
+            if (row > 1024)
+                row = 1024;
+            if ((pass == 0) != (col >= 0 && row >= 0))
+                continue;
+            /* find a free spot */
+            int r = row >= 0 ? row : cur_r, cc = col >= 0 ? col : row >= 0 ? 0 : cur_c;
+            if (col < 0 && cc + cs > nt) {
+                cc = 0;
+                if (row < 0)
+                    r++;
+            }
+            for (;;) {
+                if (r + rs > rows_cap) {
+                    int ncap = (r + rs) * 2;
+                    uint8_t *no = realloc(occ, (size_t)(ncap * nt));
+                    if (!no) {
+                        free(occ);
+                        return nrows;
+                    }
+                    memset(no + rows_cap * nt, 0, (size_t)((ncap - rows_cap) * nt));
+                    occ = no;
+                    rows_cap = ncap;
+                }
+                int fits = pass == 0;
+                if (!fits) {
+                    fits = 1;
+                    for (int a = r; a < r + rs && fits; a++)
+                        for (int b = cc; b < cc + cs && fits; b++)
+                            fits = !occ[a * nt + b];
+                }
+                if (fits)
+                    break;
+                if (col >= 0) {
+                    r++;
+                } else if (++cc + cs > nt) {
+                    cc = 0;
+                    if (row >= 0)
+                        break;                  /* the row is full: overlap */
+                    r++;
+                }
+            }
+            for (int a = r; a < r + rs; a++)
+                for (int b = cc; b < cc + cs; b++)
+                    occ[a * nt + b] = 1;
+            t->row = r, t->col = cc, t->rspan = rs, t->cspan = cs;
+            if (r + rs > nrows)
+                nrows = r + rs;
+            if (pass == 1 && row < 0) {
+                cur_r = r;
+                cur_c = cc + cs;
+            }
+        }
+    }
+    free(occ);
+    return nrows;
+}
+
+static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int defh, int minh)
+{
+    const struct style *st = n->style;
+    struct fitem *it;
+    int ni = container_items(n, &it);
+    if (ni <= 0) {
+        free(it);
+        return 0;
+    }
+    int cgap = len_px(st->col_gap, w), rgap = len_px(st->row_gap, w);
+    struct track tr[MAX_TRACKS];
+    int nt = grid_tracks(st->grid_cols, w, cgap, ni, tr);
+    for (int i = 0; i < ni; i++)
+        item_edges(&it[i], w);
+    int nrows = grid_place(it, ni, nt);
+    if (nrows <= 0) {
+        free(it);
+        return 0;
+    }
+    int colw[MAX_TRACKS], colx[MAX_TRACKS + 1];
+    size_columns(c, tr, nt, it, ni, w, w - cgap * (nt - 1), colw);
+    colx[0] = 0;
+    for (int k = 0; k < nt; k++)
+        colx[k + 1] = colx[k] + colw[k] + cgap;
+
+    int *rowh = calloc((size_t)(nrows + 1) * 2, sizeof(int));
+    if (!rowh) {
+        free(it);
+        return 0;
+    }
+    int *rowy = rowh + nrows + 1;
+    for (int i = 0; i < ni; i++) {
+        struct fitem *t = &it[i];
+        int cw = colx[t->col + t->cspan] - colx[t->col] - cgap;
+        int js = item_justify(st, t), bw;
+        if (t->kind == FI_REPLACED)
+            bw = -1;
+        else if (js == AL_STRETCH && (anonymous(t) || t->st->width.unit == U_AUTO) && !t->aml && !t->amr)
+            bw = stretch_width(t, cw);
+        else
+            bw = fit_width(c, t, cw);
+        int h = item_layout(c, t, bw, cw);
+        if (t->rspan == 1 && t->mt + h + t->mb > rowh[t->row])
+            rowh[t->row] = t->mt + h + t->mb;
+    }
+    for (int i = 0; i < ni; i++) {              /* rows spanned by taller items grow */
+        struct fitem *t = &it[i];
+        if (t->rspan == 1)
+            continue;
+        int have = rgap * (t->rspan - 1);
+        for (int r = t->row; r < t->row + t->rspan; r++)
+            have += rowh[r];
+        if (t->mt + t->bh + t->mb > have)
+            rowh[t->row + t->rspan - 1] += t->mt + t->bh + t->mb - have;
+    }
+    int total = rgap * (nrows - 1);
+    for (int r = 0; r < nrows; r++)
+        total += rowh[r];
+    int target = defh >= 0 ? defh : minh;
+    if (target > total && nrows) {              /* auto rows stretch to fill */
+        for (int r = 0; r < nrows; r++)
+            rowh[r] += (target - total) / nrows;
+        total = target;
+    }
+    rowy[0] = 0;
+    for (int r = 0; r < nrows; r++)
+        rowy[r + 1] = rowy[r] + rowh[r] + rgap;
+
+    for (int i = 0; i < ni; i++) {
+        struct fitem *t = &it[i];
+        int cx = x + colx[t->col], cw = colx[t->col + t->cspan] - colx[t->col] - cgap;
+        int cy = y + rowy[t->row], ch = rowy[t->row + t->rspan] - rowy[t->row] - rgap;
+        int al = item_align(st, t), js = item_justify(st, t), h = t->bh, top, left;
+        int outer = t->mt + h + t->mb, oute = t->ml + t->bw + t->mr;
+        if (al == AL_STRETCH && t->kind == FI_BLOCK && t->st->height.unit == U_AUTO &&
+            !t->amt && !t->amb && ch - t->mt - t->mb > h)
+            h = ch - t->mt - t->mb;
+        if (t->amt && t->amb)
+            top = (ch - outer) / 2 + t->mt;
+        else if (t->amt || al == AL_END)
+            top = ch - t->mb - h;
+        else if (al == AL_CENTER)
+            top = (ch - outer) / 2 + t->mt;
+        else
+            top = t->mt;
+        if (t->aml && t->amr)
+            left = (cw - oute) / 2 + t->ml;
+        else if (t->aml || js == AL_END)
+            left = cw - t->mr - t->bw;
+        else if (js == AL_CENTER)
+            left = (cw - oute) / 2 + t->ml;
+        else
+            left = t->ml;
+        item_place(c, t, cx + left, cy + top, h);
+    }
+    free(rowh);
+    free(it);
+    return total;
+}
+
+/* The intrinsic widths of a flex or grid container's content. */
+static void container_measure(struct lctx *c, struct node *n, int *min, int *max)
+{
+    const struct style *st = n->style;
+    struct fitem *it;
+    int ni = container_items(n, &it), mn = 0, mx = 0;
+    int row = st->inner == IN_FLEX && !st->flex_column;
+    int gap = len_px(st->col_gap, 0);
+    int nt = 1, tfixed = 0;
+    if (st->inner == IN_GRID && st->grid_cols && st->grid_cols->n) {
+        const struct gridspec *g = st->grid_cols;
+        nt = g->auto_repeat ? (ni < MAX_TRACKS ? ni : MAX_TRACKS) : g->n;
+        for (int k = 0; k < g->n; k++)
+            tfixed += track_px(g->t[k].min, g->t[k].vmin, 0);
+    }
+    int bigmin = 0, bigmax = 0;
+    for (int i = 0; i < ni; i++) {
+        int a, z;
+        item_edges(&it[i], 0);
+        item_measure(c, &it[i], &a, &z);
+        if (row && !anonymous(&it[i]) && it[i].st->min_width.unit == U_PX && it[i].kind != FI_REPLACED)
+            a = it[i].st->min_width.v + it[i].ml + it[i].mr +
+                (it[i].st->box_sizing_border ? 0 : it[i].hz);
+        else if (row && !anonymous(&it[i]) && it[i].st->clips)
+            a = it[i].ml + it[i].mr + it[i].hz;
+        if (row) {
+            mn = st->flex_wrap ? (a > mn ? a : mn) : mn + a + (i ? gap : 0);
+            mx += z + (i ? gap : 0);
+        }
+        bigmin = a > bigmin ? a : bigmin;
+        bigmax = z > bigmax ? z : bigmax;
+    }
+    if (!row) {
+        mn = bigmin;
+        mx = bigmax;
+        if (st->inner == IN_GRID && nt > 1) {
+            int k = nt < ni ? nt : ni;
+            mx = bigmax * k + gap * (k - 1);
+            if (tfixed + gap * (nt - 1) > mn)
+                mn = tfixed + gap * (nt - 1);
+            if (mn > mx)
+                mx = mn;
+        }
+    }
+    free(it);
+    *min = mn;
+    *max = mx;
 }
 
 /* ---- intrinsic widths ---- */
@@ -1316,6 +2356,8 @@ static void measure(struct lctx *c, struct node *n, int *min, int *max)
         layout_replaced(c, n, BIG, &w, &h, &base);
         c->measuring = saved;
         mn = mx = w;
+        if (relative(st->width.unit) || relative(st->max_width.unit))
+            mn = 0;
         edges = 0;
     } else if (st->display == D_TABLE || st->display == D_INLINE_TABLE) {
         int saved = c->measuring;
@@ -1325,6 +2367,8 @@ static void measure(struct lctx *c, struct node *n, int *min, int *max)
         mx = layout_table(c, n, 0, 0, 0, -3, &mb);     /* -3: and the maximum */
         c->measuring = saved;
         edges = b.ml + b.mr;
+    } else if (st->inner == IN_FLEX || st->inner == IN_GRID) {
+        container_measure(c, n, &mn, &mx);
     } else {
         int saved = c->measuring;
         c->measuring = 1;
@@ -1332,7 +2376,6 @@ static void measure(struct lctx *c, struct node *n, int *min, int *max)
         f.st = st;
         f.space_before = 1;
         f.w = BIG;
-        f.flex = st->display == D_FLEX ? (st->flex_column ? 2 : 1) : 0;
         add_pseudo(c, &f, n, 0);
         flow_children(c, &f, n);
         add_pseudo(c, &f, n, 1);
@@ -1341,17 +2384,6 @@ static void measure(struct lctx *c, struct node *n, int *min, int *max)
         c->measuring = saved;
         mn = f.min;
         mx = f.max;
-        if (f.flex == 1) {              /* flex items sit side by side: their widths add up */
-            mn = mx = 0;
-            for (struct node *k = n->first; k; k = k->next) {
-                if (k->type != N_ELEMENT || !k->style || k->style->display == D_NONE)
-                    continue;
-                int a, z;
-                measure(c, k, &a, &z);
-                mn = a > mn ? a : mn;
-                mx += z;
-            }
-        }
     }
     if (st->width.unit == U_PX && !is_replaced(n) && st->display != D_TABLE &&
         st->display != D_INLINE_TABLE) {
@@ -1867,6 +2899,144 @@ static void fill_blend(struct surface *s, int x, int y, int w, int h, uint32_t c
     }
 }
 
+static unsigned isqrt(unsigned v)
+{
+    unsigned r = 0, bit = 1u << 30;
+    while (bit > v)
+        bit >>= 2;
+    while (bit) {
+        if (v >= r + bit) {
+            v -= r + bit;
+            r = (r >> 1) + bit;
+        } else {
+            r >>= 1;
+        }
+        bit >>= 2;
+    }
+    return r;
+}
+
+/* How much of pixel (i, j) a w x h box with these corner radii covers, out of 256. */
+static int coverage(int i, int j, int w, int h, const int *rad)
+{
+    if (i < 0 || j < 0 || i >= w || j >= h)
+        return 0;
+    int r, cx, cy;
+    if (i < rad[0] && j < rad[0])
+        r = rad[0], cx = r, cy = r;
+    else if (i >= w - rad[1] && j < rad[1])
+        r = rad[1], cx = w - r, cy = r;
+    else if (i >= w - rad[2] && j >= h - rad[2])
+        r = rad[2], cx = w - r, cy = h - r;
+    else if (i < rad[3] && j >= h - rad[3])
+        r = rad[3], cx = r, cy = h - r;
+    else
+        return 256;
+    int dx = (2 * i + 1 - 2 * cx) * 8, dy = (2 * j + 1 - 2 * cy) * 8;   /* sixteenths */
+    int cov = r * 16 + 8 - (int)isqrt((unsigned)(dx * dx + dy * dy));
+    return cov <= 0 ? 0 : cov >= 16 ? 256 : cov * 16;
+}
+
+static uint32_t with_alpha(uint32_t c, int cov)
+{
+    return (c & 0xFFFFFF) | (uint32_t)((int)ALPHA(c) * cov / 256) << 24;
+}
+
+/* k of the way from a to b, in n steps. */
+static uint32_t lerp(uint32_t a, uint32_t b, int k, int n)
+{
+    int t = n > 1 ? k * 256 / (n - 1) : 0;
+    uint32_t out = 0;
+    for (int sh = 0; sh < 32; sh += 8) {
+        int u = (int)(a >> sh & 0xFF), v = (int)(b >> sh & 0xFF);
+        out |= (uint32_t)(u + (v - u) * t / 256) << sh;
+    }
+    return out;
+}
+
+/* A fill with rounded corners, a gradient or a border ring. */
+static void fill_rich(struct surface *s, const struct ditem *d, int x, int y)
+{
+    struct rect r = rect_intersect(mkrect(x, y, d->w, d->h), s->clip);
+    if (rect_empty(r))
+        return;
+    int ring = d->ring, inner[4], maxr = 0;
+    for (int k = 0; k < 4; k++) {
+        inner[k] = d->rad[k] > ring ? d->rad[k] - ring : 0;
+        if (d->rad[k] > maxr)
+            maxr = d->rad[k];
+    }
+    if (maxr < ring)
+        maxr = ring;
+    for (int j = r.y; j < r.y + r.h; j++) {
+        int bj = j - y;
+        uint32_t *row = s->px + j * s->stride;
+        uint32_t rowc = d->grad == 1 ? lerp(d->g0, d->g1, bj, d->h) : 0;
+        int edge_row = bj < maxr || bj >= d->h - maxr;
+        if (!edge_row && !ring && d->grad != 2) {
+            /* away from the corners a row is one color */
+            uint32_t col = d->grad && ALPHA(rowc) == 255 ? rowc : d->color;
+            if (d->grad && ALPHA(rowc) < 255)
+                col = 0;
+            if (ALPHA(col) == 255) {
+                gfx_fill(s, r.x, j, r.w, 1, col & 0xFFFFFF);
+                continue;
+            }
+        }
+        for (int i = r.x; i < r.x + r.w; i++) {
+            int bi = i - x, out, in;
+            if (!edge_row && bi >= maxr && bi < d->w - maxr) {
+                if (!ALPHA(d->color) && !d->grad) {     /* a ring's empty middle */
+                    i = x + d->w - maxr - 1;
+                    continue;
+                }
+                out = in = 256;
+            } else {
+                out = coverage(bi, bj, d->w, d->h, d->rad);
+                in = ring ? coverage(bi - ring, bj - ring, d->w - 2 * ring, d->h - 2 * ring, inner) : out;
+                if (in > out)
+                    in = out;
+            }
+            if (!out)
+                continue;
+            uint32_t px = row[i];
+            if (in) {
+                if (ALPHA(d->color))
+                    px = blend(px, with_alpha(d->color, in));
+                if (d->grad)
+                    px = blend(px, with_alpha(d->grad == 1 ? rowc : lerp(d->g0, d->g1, bi, d->w), in));
+            }
+            if (ring && out > in)
+                px = blend(px, with_alpha(d->ring_color, out - in));
+            row[i] = px & 0xFFFFFF;
+        }
+    }
+}
+
+/* An image with its corners rounded off. */
+static void draw_image_round(struct surface *s, const struct ditem *d, int x, int y)
+{
+    const struct image *img = d->img;
+    struct rect r = rect_intersect(mkrect(x, y, d->w, d->h), s->clip);
+    if (rect_empty(r) || !img || img->w <= 0 || img->h <= 0)
+        return;
+    for (int j = r.y; j < r.y + r.h; j++) {
+        const uint32_t *src = img->px + (j - y) * img->h / d->h * img->w;
+        uint32_t *dst = s->px + j * s->stride;
+        for (int i = r.x; i < r.x + r.w; i++) {
+            int cov = coverage(i - x, j - y, d->w, d->h, d->rad);
+            if (!cov)
+                continue;
+            uint32_t p = src[(i - x) * img->w / d->w];
+            uint32_t a = (p >> 24) * (uint32_t)cov / 256;
+            if (a == 255)
+                dst[i] = p & 0xFFFFFF;
+            else if (a)
+                dst[i] = blend(dst[i], (p & 0xFFFFFF) | a << 24);
+        }
+    }
+}
+
 void draw_image_scaled(struct surface *s, const struct image *img, int x, int y, int w, int h)
 {
     struct rect r = rect_intersect(mkrect(x, y, w, h), s->clip);
@@ -2011,7 +3181,11 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
         int x = d->x - sx + ox, y = d->y - sy + oy;
         switch (d->kind) {
         case DK_FILL:
-            if (ALPHA(d->color))
+            if (!ALPHA(d->color) && !d->grad && !d->ring)
+                break;
+            if (d->grad || d->ring || d->rad[0] || d->rad[1] || d->rad[2] || d->rad[3])
+                fill_rich(s, d, x, y);
+            else if (ALPHA(d->color))
                 fill_blend(s, x, y, d->w, d->h, d->color, d->deco);
             break;
         case DK_TEXT: {
@@ -2029,7 +3203,10 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
             break;
         }
         case DK_IMAGE:
-            draw_image_scaled(s, d->img, x, y, d->w, d->h);
+            if (d->rad[0] || d->rad[1] || d->rad[2] || d->rad[3])
+                draw_image_round(s, d, x, y);
+            else
+                draw_image_scaled(s, d->img, x, y, d->w, d->h);
             break;
         case DK_FRAME:
             gfx_frame(s, x, y, d->w, d->h, 0xC0C0C0);

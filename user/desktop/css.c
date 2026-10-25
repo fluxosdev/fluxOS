@@ -37,47 +37,71 @@ enum prop {
     P_BORDER_BOTTOM_COLOR, P_BORDER_LEFT_COLOR, P_WIDTH, P_HEIGHT, P_MIN_WIDTH, P_MAX_WIDTH,
     P_MIN_HEIGHT, P_BOX_SIZING, P_VISIBILITY, P_FLOAT, P_FLEX_DIRECTION, P_FLEX_FLOW,
     P_BORDER_SPACING, P_BORDER_COLLAPSE, P_POSITION, P_OPACITY, P_LEFT, P_TOP, P_CLIP, P_MASK,
-    P_CONTENT,
+    P_CONTENT, P_BACKGROUND_IMAGE, P_BORDER_RADIUS, P_BORDER_TL_RADIUS, P_BORDER_TR_RADIUS,
+    P_BORDER_BR_RADIUS, P_BORDER_BL_RADIUS, P_FLEX, P_FLEX_GROW, P_FLEX_SHRINK, P_FLEX_BASIS,
+    P_FLEX_WRAP, P_JUSTIFY_CONTENT, P_ALIGN_ITEMS, P_ALIGN_SELF, P_JUSTIFY_ITEMS, P_JUSTIFY_SELF,
+    P_PLACE_CONTENT, P_PLACE_ITEMS, P_PLACE_SELF, P_ORDER, P_GAP, P_ROW_GAP, P_COLUMN_GAP,
+    P_OVERFLOW, P_GRID_TEMPLATE_COLUMNS, P_GRID_TEMPLATE, P_GRID_COLUMN, P_GRID_COLUMN_START,
+    P_GRID_COLUMN_END, P_GRID_ROW, P_GRID_ROW_START, P_GRID_AREA,
 };
 
 static const struct { const char *name; uint8_t prop; } prop_names[] = {
-    { "-webkit-mask", P_MASK }, { "-webkit-mask-image", P_MASK },
-    { "background", P_BACKGROUND }, { "background-color", P_BACKGROUND_COLOR },
+    { "-ms-flex", P_FLEX }, { "-webkit-align-items", P_ALIGN_ITEMS },
+    { "-webkit-border-radius", P_BORDER_RADIUS }, { "-webkit-flex", P_FLEX },
+    { "-webkit-flex-direction", P_FLEX_DIRECTION }, { "-webkit-flex-wrap", P_FLEX_WRAP },
+    { "-webkit-justify-content", P_JUSTIFY_CONTENT }, { "-webkit-mask", P_MASK },
+    { "-webkit-mask-image", P_MASK }, { "align-items", P_ALIGN_ITEMS },
+    { "align-self", P_ALIGN_SELF }, { "background", P_BACKGROUND },
+    { "background-color", P_BACKGROUND_COLOR }, { "background-image", P_BACKGROUND_IMAGE },
     { "border", P_BORDER }, { "border-bottom", P_BORDER_BOTTOM },
-    { "border-bottom-color", P_BORDER_BOTTOM_COLOR }, { "border-bottom-style", P_BORDER_BOTTOM_STYLE },
+    { "border-bottom-color", P_BORDER_BOTTOM_COLOR },
+    { "border-bottom-left-radius", P_BORDER_BL_RADIUS },
+    { "border-bottom-right-radius", P_BORDER_BR_RADIUS },
+    { "border-bottom-style", P_BORDER_BOTTOM_STYLE },
     { "border-bottom-width", P_BORDER_BOTTOM_WIDTH }, { "border-collapse", P_BORDER_COLLAPSE },
     { "border-color", P_BORDER_COLOR }, { "border-left", P_BORDER_LEFT },
     { "border-left-color", P_BORDER_LEFT_COLOR }, { "border-left-style", P_BORDER_LEFT_STYLE },
-    { "border-left-width", P_BORDER_LEFT_WIDTH }, { "border-right", P_BORDER_RIGHT },
-    { "border-right-color", P_BORDER_RIGHT_COLOR }, { "border-right-style", P_BORDER_RIGHT_STYLE },
-    { "border-right-width", P_BORDER_RIGHT_WIDTH }, { "border-spacing", P_BORDER_SPACING },
-    { "border-style", P_BORDER_STYLE }, { "border-top", P_BORDER_TOP },
-    { "border-top-color", P_BORDER_TOP_COLOR }, { "border-top-style", P_BORDER_TOP_STYLE },
+    { "border-left-width", P_BORDER_LEFT_WIDTH }, { "border-radius", P_BORDER_RADIUS },
+    { "border-right", P_BORDER_RIGHT }, { "border-right-color", P_BORDER_RIGHT_COLOR },
+    { "border-right-style", P_BORDER_RIGHT_STYLE }, { "border-right-width", P_BORDER_RIGHT_WIDTH },
+    { "border-spacing", P_BORDER_SPACING }, { "border-style", P_BORDER_STYLE },
+    { "border-top", P_BORDER_TOP }, { "border-top-color", P_BORDER_TOP_COLOR },
+    { "border-top-left-radius", P_BORDER_TL_RADIUS },
+    { "border-top-right-radius", P_BORDER_TR_RADIUS }, { "border-top-style", P_BORDER_TOP_STYLE },
     { "border-top-width", P_BORDER_TOP_WIDTH }, { "border-width", P_BORDER_WIDTH },
     { "box-sizing", P_BOX_SIZING }, { "clip", P_CLIP }, { "color", P_COLOR },
-    { "content", P_CONTENT },
-    { "display", P_DISPLAY },
-    { "flex-direction", P_FLEX_DIRECTION }, { "flex-flow", P_FLEX_FLOW }, { "float", P_FLOAT },
-    { "font", P_FONT }, { "font-family", P_FONT_FAMILY }, { "font-size", P_FONT_SIZE },
-    { "font-style", P_FONT_STYLE }, { "font-weight", P_FONT_WEIGHT }, { "height", P_HEIGHT },
-    { "left", P_LEFT },
-    { "line-height", P_LINE_HEIGHT }, { "list-style", P_LIST_STYLE },
-    { "list-style-type", P_LIST_STYLE_TYPE }, { "margin", P_MARGIN },
-    { "margin-block-end", P_MARGIN_BOTTOM }, { "margin-block-start", P_MARGIN_TOP },
-    { "margin-bottom", P_MARGIN_BOTTOM }, { "margin-inline-end", P_MARGIN_RIGHT },
-    { "margin-inline-start", P_MARGIN_LEFT }, { "margin-left", P_MARGIN_LEFT },
-    { "margin-right", P_MARGIN_RIGHT }, { "margin-top", P_MARGIN_TOP }, { "mask", P_MASK },
-    { "mask-image", P_MASK },
+    { "column-gap", P_COLUMN_GAP }, { "content", P_CONTENT }, { "display", P_DISPLAY },
+    { "flex", P_FLEX }, { "flex-basis", P_FLEX_BASIS }, { "flex-direction", P_FLEX_DIRECTION },
+    { "flex-flow", P_FLEX_FLOW }, { "flex-grow", P_FLEX_GROW }, { "flex-shrink", P_FLEX_SHRINK },
+    { "flex-wrap", P_FLEX_WRAP }, { "float", P_FLOAT }, { "font", P_FONT },
+    { "font-family", P_FONT_FAMILY }, { "font-size", P_FONT_SIZE }, { "font-style", P_FONT_STYLE },
+    { "font-weight", P_FONT_WEIGHT }, { "gap", P_GAP }, { "grid-area", P_GRID_AREA },
+    { "grid-column", P_GRID_COLUMN }, { "grid-column-end", P_GRID_COLUMN_END },
+    { "grid-column-gap", P_COLUMN_GAP }, { "grid-column-start", P_GRID_COLUMN_START },
+    { "grid-gap", P_GAP }, { "grid-row", P_GRID_ROW }, { "grid-row-gap", P_ROW_GAP },
+    { "grid-row-start", P_GRID_ROW_START }, { "grid-template", P_GRID_TEMPLATE },
+    { "grid-template-columns", P_GRID_TEMPLATE_COLUMNS }, { "height", P_HEIGHT },
+    { "justify-content", P_JUSTIFY_CONTENT }, { "justify-items", P_JUSTIFY_ITEMS },
+    { "justify-self", P_JUSTIFY_SELF }, { "left", P_LEFT }, { "line-height", P_LINE_HEIGHT },
+    { "list-style", P_LIST_STYLE }, { "list-style-type", P_LIST_STYLE_TYPE },
+    { "margin", P_MARGIN }, { "margin-block-end", P_MARGIN_BOTTOM },
+    { "margin-block-start", P_MARGIN_TOP }, { "margin-bottom", P_MARGIN_BOTTOM },
+    { "margin-inline-end", P_MARGIN_RIGHT }, { "margin-inline-start", P_MARGIN_LEFT },
+    { "margin-left", P_MARGIN_LEFT }, { "margin-right", P_MARGIN_RIGHT },
+    { "margin-top", P_MARGIN_TOP }, { "mask", P_MASK }, { "mask-image", P_MASK },
     { "max-width", P_MAX_WIDTH }, { "min-height", P_MIN_HEIGHT }, { "min-width", P_MIN_WIDTH },
-    { "opacity", P_OPACITY },
-    { "padding", P_PADDING }, { "padding-block-end", P_PADDING_BOTTOM },
-    { "padding-block-start", P_PADDING_TOP }, { "padding-bottom", P_PADDING_BOTTOM },
-    { "padding-inline-end", P_PADDING_RIGHT }, { "padding-inline-start", P_PADDING_LEFT },
-    { "padding-left", P_PADDING_LEFT }, { "padding-right", P_PADDING_RIGHT },
-    { "padding-top", P_PADDING_TOP }, { "position", P_POSITION }, { "text-align", P_TEXT_ALIGN },
-    { "text-decoration", P_TEXT_DECORATION }, { "text-decoration-line", P_TEXT_DECORATION_LINE },
-    { "text-indent", P_TEXT_INDENT }, { "text-transform", P_TEXT_TRANSFORM },
-    { "top", P_TOP }, { "vertical-align", P_VERTICAL_ALIGN }, { "visibility", P_VISIBILITY },
+    { "opacity", P_OPACITY }, { "order", P_ORDER }, { "overflow", P_OVERFLOW },
+    { "overflow-x", P_OVERFLOW }, { "padding", P_PADDING },
+    { "padding-block-end", P_PADDING_BOTTOM }, { "padding-block-start", P_PADDING_TOP },
+    { "padding-bottom", P_PADDING_BOTTOM }, { "padding-inline-end", P_PADDING_RIGHT },
+    { "padding-inline-start", P_PADDING_LEFT }, { "padding-left", P_PADDING_LEFT },
+    { "padding-right", P_PADDING_RIGHT }, { "padding-top", P_PADDING_TOP },
+    { "place-content", P_PLACE_CONTENT }, { "place-items", P_PLACE_ITEMS },
+    { "place-self", P_PLACE_SELF }, { "position", P_POSITION }, { "row-gap", P_ROW_GAP },
+    { "text-align", P_TEXT_ALIGN }, { "text-decoration", P_TEXT_DECORATION },
+    { "text-decoration-line", P_TEXT_DECORATION_LINE }, { "text-indent", P_TEXT_INDENT },
+    { "text-transform", P_TEXT_TRANSFORM }, { "top", P_TOP },
+    { "vertical-align", P_VERTICAL_ALIGN }, { "visibility", P_VISIBILITY },
     { "white-space", P_WHITE_SPACE }, { "width", P_WIDTH },
 };
 
@@ -1139,6 +1163,7 @@ static int match_from(const struct selector *s, int i, const struct node *n, con
 
 struct vctx {                   /* what relative units are relative to */
     int font_size, root_font_size, vw, vh;
+    struct arena *a;            /* for values kept in the style (grid tracks) */
 };
 
 static const struct named_color {
@@ -1367,28 +1392,249 @@ int css_parse_color(const char *s, int n, uint32_t *out)
     return -1;
 }
 
+/* num (times 100) of `unit` in hundredths of a pixel; 0 for an unknown unit. */
+static int unit_px100(const char *unit, long num, const struct vctx *v, long *out)
+{
+    long px;
+    if (!strcmp(unit, "px"))
+        px = num;
+    else if (!strcmp(unit, "em"))
+        px = num * v->font_size;
+    else if (!strcmp(unit, "rem"))
+        px = num * v->root_font_size;
+    else if (!strcmp(unit, "ex") || !strcmp(unit, "ch"))
+        px = num * v->font_size / 2;
+    else if (!strcmp(unit, "pt"))
+        px = num * 4 / 3;
+    else if (!strcmp(unit, "pc"))
+        px = num * 16;
+    else if (!strcmp(unit, "in"))
+        px = num * 96;
+    else if (!strcmp(unit, "cm"))
+        px = num * 96 * 100 / 254;
+    else if (!strcmp(unit, "mm"))
+        px = num * 96 * 10 / 254;
+    else if (!strcmp(unit, "vw") || !strcmp(unit, "dvw") || !strcmp(unit, "svw") || !strcmp(unit, "lvw"))
+        px = num * v->vw / 100;
+    else if (!strcmp(unit, "vh") || !strcmp(unit, "dvh") || !strcmp(unit, "svh") || !strcmp(unit, "lvh"))
+        px = num * v->vh / 100;
+    else if (!strcmp(unit, "vmin"))
+        px = num * (v->vw < v->vh ? v->vw : v->vh) / 100;
+    else if (!strcmp(unit, "vmax"))
+        px = num * (v->vw > v->vh ? v->vw : v->vh) / 100;
+    else
+        return 0;
+    *out = px;
+    return 1;
+}
+
+/* ---- calc(), min(), max() and clamp() ---- */
+
+struct cval {
+    long px, pct;               /* hundredths of a pixel, and percent times 100 */
+    int num;                    /* a plain number (times 100), held in px */
+    int ok;
+    int pick;                   /* 1 the smaller, 2 the larger of px and pct (not a sum) */
+};
+
+/* A value to do arithmetic on: a pick of px and percent becomes the percent. */
+static struct cval calc_flat(struct cval a)
+{
+    if (a.pick) {
+        a.px = 0;
+        a.pick = 0;
+    }
+    return a;
+}
+
+static struct cval calc_sum(const char **p, const struct vctx *v);
+
+static void calc_ws(const char **p)
+{
+    while (isspace((unsigned char)**p))
+        (*p)++;
+}
+
+/* Of two values, the smaller (or larger). Percentages are unknown until
+ * layout, so a pixel size and a percentage are kept for it to choose
+ * between (min(100%, 600px)); other mixes keep the one with a percentage. */
+static struct cval calc_pick(struct cval a, struct cval b, int larger)
+{
+    if (!a.ok || !b.ok)
+        return a.ok ? a : b;
+    a = calc_flat(a);
+    b = calc_flat(b);
+    if (!a.pct && !b.pct)
+        return (larger ? a.px >= b.px : a.px <= b.px) ? a : b;
+    if (!a.px && !b.px)
+        return (larger ? a.pct >= b.pct : a.pct <= b.pct) ? a : b;
+    if ((!a.pct && !b.px) || (!a.px && !b.pct)) {
+        struct cval r = { a.px + b.px, a.pct + b.pct, 0, 1, larger ? 2 : 1 };
+        return r;
+    }
+    return a.pct ? a : b;
+}
+
+/* min(a, b, ...) (kind 0), max(...) (1) or clamp(lo, val, hi) (2), *p past the '('. */
+static struct cval calc_func(const char **p, const struct vctx *v, int kind)
+{
+    struct cval args[8], r = { 0, 0, 0, 0, 0 };
+    int n = 0;
+    for (;;) {
+        struct cval a = calc_sum(p, v);
+        if (n < 8)
+            args[n++] = a;
+        calc_ws(p);
+        if (**p != ',')
+            break;
+        (*p)++;
+    }
+    if (**p != ')')
+        return r;
+    (*p)++;
+    if (kind == 2)
+        return n == 3 ? calc_pick(args[0], calc_pick(args[1], args[2], 0), 1) : r;
+    r = args[0];
+    for (int i = 1; i < n; i++)
+        r = calc_pick(r, args[i], kind == 1);
+    return r;
+}
+
+static struct cval calc_term(const char **p, const struct vctx *v)
+{
+    static const struct { const char *name; int kind; } funcs[] = {
+        { "calc(", -1 }, { "-webkit-calc(", -1 }, { "min(", 0 }, { "max(", 1 }, { "clamp(", 2 },
+    };
+    struct cval r = { 0, 0, 0, 0, 0 };
+    calc_ws(p);
+    for (size_t i = 0; i < sizeof(funcs) / sizeof(funcs[0]); i++) {
+        size_t fl = strlen(funcs[i].name);
+        if (strncasecmp(*p, funcs[i].name, fl))
+            continue;
+        *p += fl;
+        if (funcs[i].kind >= 0)
+            return calc_func(p, v, funcs[i].kind);
+        (*p)--;                         /* calc( is a bracket */
+        break;
+    }
+    if (**p == '(') {
+        (*p)++;
+        r = calc_sum(p, v);
+        calc_ws(p);
+        if (**p != ')')
+            r.ok = 0;
+        else
+            (*p)++;
+        return r;
+    }
+    int num, used = parse_num(*p, &num);
+    if (!used)
+        return r;
+    const char *u = *p + used;
+    char unit[8];
+    int ul = 0;
+    while (ul < 7 && (isalpha((unsigned char)u[ul]) || u[ul] == '%'))
+        unit[ul] = (char)tolower((unsigned char)u[ul]), ul++;
+    unit[ul] = 0;
+    *p = u + ul;
+    r.ok = 1;
+    if (!unit[0])
+        r.num = 1, r.px = num;
+    else if (!strcmp(unit, "%"))
+        r.pct = num;
+    else if (!unit_px100(unit, num, v, &r.px))
+        r.ok = 0;
+    return r;
+}
+
+static struct cval calc_product(const char **p, const struct vctx *v)
+{
+    struct cval a = calc_term(p, v);
+    for (;;) {
+        calc_ws(p);
+        char op = **p;
+        if (op != '*' && op != '/')
+            return a;
+        (*p)++;
+        struct cval b = calc_flat(calc_term(p, v));
+        a = calc_flat(a);
+        if (!a.ok || !b.ok)
+            return (struct cval){ 0, 0, 0, 0, 0 };
+        if (op == '*' && (b.num || a.num)) {
+            struct cval k = b.num ? b : a, x = b.num ? a : b;
+            x.px = x.px * k.px / 100;
+            x.pct = x.pct * k.px / 100;
+            x.num = a.num && b.num;
+            a = x;
+        } else if (op == '/' && b.num && b.px) {
+            a.px = a.px * 100 / b.px;
+            a.pct = a.pct * 100 / b.px;
+        } else {
+            a.ok = 0;
+        }
+    }
+}
+
+static struct cval calc_sum(const char **p, const struct vctx *v)
+{
+    struct cval a = calc_product(p, v);
+    for (;;) {
+        calc_ws(p);
+        char op = **p;
+        /* + and - between terms have spaces round them; "-5px" is a number */
+        if ((op != '+' && op != '-') || !isspace((unsigned char)(*p)[1]))
+            return a;
+        (*p)++;
+        struct cval b = calc_flat(calc_product(p, v));
+        a = calc_flat(a);
+        if (!a.ok || !b.ok)
+            return (struct cval){ 0, 0, 0, 0, 0 };
+        long sign = op == '-' ? -1 : 1;
+        a.px += sign * b.px;
+        a.pct += sign * b.pct;
+        a.num = a.num && b.num;
+    }
+}
+
 /*
  * A length in pixels. base is the font size for em; unitless numbers are
  * pixels (as quirks mode allows). Returns 0 for anything unparseable.
+ * calc() and friends are worked out, except that percentages stay
+ * percentages until layout knows what they are of (U_CALC when mixed).
  */
 static int length_value(const char *s, const struct vctx *v, struct len *out)
 {
     while (isspace((unsigned char)*s))
         s++;
+    out->pct = 0;
     if (!strncasecmp(s, "auto", 4)) {
         out->unit = U_AUTO;
         out->v = 0;
         return 1;
     }
     if (!strncasecmp(s, "calc(", 5) || !strncasecmp(s, "min(", 4) || !strncasecmp(s, "max(", 4) ||
-        !strncasecmp(s, "clamp(", 6)) {
-        /* Not evaluated: take the first length inside, which is usually close. */
-        const char *p = strchr(s, '(') + 1;
-        while (*p && !isdigit((unsigned char)*p) && *p != '.')
-            p++;
-        if (!*p)
+        !strncasecmp(s, "clamp(", 6) || !strncasecmp(s, "-webkit-calc(", 13)) {
+        const char *p = s;
+        struct cval r = calc_term(&p, v);
+        if (!r.ok)
             return 0;
-        return length_value(p, v, out);
+        long px = (r.px + (r.px >= 0 ? 50 : -50)) / 100;
+        if (r.pick) {
+            out->unit = r.pick == 1 ? U_MIN : U_MAX;
+            out->v = (int)px;
+            out->pct = (int)r.pct;
+        } else if (!r.pct) {
+            out->unit = U_PX;
+            out->v = (int)px;
+        } else if (!px) {
+            out->unit = U_PCT;
+            out->v = (int)r.pct;
+        } else {
+            out->unit = U_CALC;
+            out->v = (int)px;
+            out->pct = (int)r.pct;
+        }
+        return 1;
     }
     int num;
     int used = parse_num(s, &num);
@@ -1406,42 +1652,32 @@ static int length_value(const char *s, const struct vctx *v, struct len *out)
         out->unit = U_PCT;
         out->v = num;
         return 1;
-    } else if (!strcmp(unit, "px") || !unit[0]) {
-        px = num;
-    } else if (!strcmp(unit, "em")) {
-        px = (long)num * v->font_size;
-    } else if (!strcmp(unit, "rem")) {
-        px = (long)num * v->root_font_size;
-    } else if (!strcmp(unit, "ex") || !strcmp(unit, "ch")) {
-        px = (long)num * v->font_size / 2;
-    } else if (!strcmp(unit, "pt")) {
-        px = (long)num * 4 / 3;
-    } else if (!strcmp(unit, "pc")) {
-        px = (long)num * 16;
-    } else if (!strcmp(unit, "in")) {
-        px = (long)num * 96;
-    } else if (!strcmp(unit, "cm")) {
-        px = (long)num * 96 * 100 / 254;
-    } else if (!strcmp(unit, "mm")) {
-        px = (long)num * 96 * 10 / 254;
-    } else if (!strcmp(unit, "vw")) {
-        px = (long)num * v->vw / 100;
-    } else if (!strcmp(unit, "vh")) {
-        px = (long)num * v->vh / 100;
-    } else if (!strcmp(unit, "vmin")) {
-        px = (long)num * (v->vw < v->vh ? v->vw : v->vh) / 100;
-    } else if (!strcmp(unit, "vmax")) {
-        px = (long)num * (v->vw > v->vh ? v->vw : v->vh) / 100;
-    } else {
-        return 0;
     }
+    if (!unit[0])
+        px = num;
+    else if (!unit_px100(unit, num, v, &px))
+        return 0;
     out->v = (int)((px + (px >= 0 ? 50 : -50)) / 100);
     return 1;
 }
 
+/* A length on a base: percentages (and calc()'s) are of it. */
+static int len_on(struct len l, int base)
+{
+    if (l.unit == U_PCT)
+        return base * l.v / 10000;
+    if (l.unit == U_CALC)
+        return l.v + base * l.pct / 10000;
+    if (l.unit == U_MIN || l.unit == U_MAX) {
+        int p = base * l.pct / 10000;
+        return (l.unit == U_MIN) == (p < l.v) ? p : l.v;
+    }
+    return l.v;
+}
+
 static int length_px(const char *s, int base)
 {
-    struct vctx v = { base, 16, 1024, 768 };
+    struct vctx v = { base, 16, 1024, 768, NULL };
     struct len l;
     if (!length_value(s, &v, &l) || l.unit != U_PX)
         return 0;
@@ -1502,8 +1738,11 @@ static void init_initial(void)
         s->border_style[i] = BS_NONE;
         s->border_color[i] = 1;         /* currentColor, resolved at the end */
     }
-    s->width.unit = s->height.unit = s->max_width.unit = U_AUTO;
-    s->min_width.unit = s->min_height.unit = U_PX;
+    s->width.unit = s->height.unit = s->max_width.unit = s->min_width.unit = U_AUTO;
+    s->min_height.unit = U_PX;
+    s->flex_basis.unit = U_AUTO;
+    s->flex_shrink = 100;
+    s->align_items = s->justify = s->justify_items = AL_NORMAL;
     s->lh_kind = LH_NORMAL;
     s->list_style = LS_DISC;
 }
@@ -1662,7 +1901,7 @@ static int font_size_value(const char *value, const struct style *parent, const 
     struct len l;
     if (!length_value(value, &pv, &l) || l.unit == U_AUTO)
         return 0;
-    *px = l.unit == U_PCT ? parent->font_size * l.v / 10000 : l.v;
+    *px = len_on(l, parent->font_size);
     if (*px < 1)
         *px = 1;
     return 1;
@@ -1727,12 +1966,283 @@ static void apply_font_shorthand(struct style *st, const struct style *parent, c
                 struct len l;
                 if (length_value(lh, &fv, &l))
                     st->lh_kind = LH_PX,
-                    st->lh = l.unit == U_PCT ? st->font_size * l.v / 10000 : l.v;
+                    st->lh = len_on(l, st->font_size);
             }
         }
     }
     if (i + 1 < n)
         st->family = (uint8_t)family_of(w[i + 1], st->family);
+}
+
+/* ---- flex, grid and background helpers ---- */
+
+/* justify-content, align-items and the rest: the last word decides
+ * ("safe center", "first baseline"). */
+static int align_value(const char *value, int *out)
+{
+    static const struct { const char *kw; uint8_t al; } kws[] = {
+        { "auto", AL_AUTO }, { "normal", AL_NORMAL }, { "stretch", AL_STRETCH },
+        { "start", AL_START }, { "flex-start", AL_START }, { "self-start", AL_START },
+        { "left", AL_START }, { "end", AL_END }, { "flex-end", AL_END }, { "self-end", AL_END },
+        { "right", AL_END }, { "center", AL_CENTER }, { "baseline", AL_BASELINE },
+        { "space-between", AL_BETWEEN }, { "space-around", AL_AROUND },
+        { "space-evenly", AL_EVENLY },
+    };
+    const char *w[4];
+    int wl[4], n = words(value, w, wl, 4);
+    if (!n)
+        return 0;
+    for (size_t i = 0; i < sizeof(kws) / sizeof(kws[0]); i++)
+        if (word_is(w[n - 1], wl[n - 1], kws[i].kw))
+            return *out = kws[i].al, 1;
+    return 0;
+}
+
+/* The first of a value's words, NUL-terminated in buf. */
+static const char *first_word(const char *value, char *buf, int size, const char **rest)
+{
+    const char *w[2];
+    int wl[2], n = words(value, w, wl, 2);
+    buf[0] = 0;
+    if (n && wl[0] < size) {
+        memcpy(buf, w[0], (size_t)wl[0]);
+        buf[wl[0]] = 0;
+    }
+    if (rest)
+        *rest = n > 1 ? w[1] : NULL;
+    return buf;
+}
+
+/*
+ * A linear-gradient() somewhere in a background value: its first and last
+ * colors and which way it runs (1 down, 2 right; swapped for up and left).
+ * Radial gradients come out as one color, between their first and last.
+ */
+static int parse_gradient(const char *value, uint32_t *g0, uint32_t *g1, uint8_t *dir)
+{
+    const char *g = strcasestr(value, "gradient(");
+    if (!g)
+        return 0;
+    int radial = g >= value + 6 && !strncasecmp(g - 6, "radial", 6);
+    const char *p = strchr(g, '(') + 1, *end = skip_group(p - 1, p + strlen(p)) - 1;
+    int down = 1, horizontal = 0, ncolors = 0;
+    for (int arg = 0; p < end; arg++) {
+        const char *e = find_top(p, end, ',');
+        char buf[128];
+        int len = (int)(e - p) < (int)sizeof(buf) - 1 ? (int)(e - p) : (int)sizeof(buf) - 1;
+        memcpy(buf, p, (size_t)len);
+        buf[len] = 0;
+        p = e + 1;
+        const char *w[4];
+        int wl[4], n = words(buf, w, wl, 4);
+        if (!n)
+            continue;
+        uint32_t col;
+        if (css_parse_color(w[0], wl[0], &col) == 0) {
+            if (!ncolors++)
+                *g0 = col;
+            *g1 = col;
+            continue;
+        }
+        if (arg || radial)
+            continue;
+        /* the direction: "to right", or an angle */
+        if (word_is(w[0], wl[0], "to")) {
+            for (int i = 1; i < n; i++) {
+                if (word_is(w[i], wl[i], "right") || word_is(w[i], wl[i], "left")) {
+                    horizontal = n == 2;        /* "to bottom right" stays vertical */
+                    if (horizontal)
+                        down = word_is(w[i], wl[i], "right");
+                } else if (word_is(w[i], wl[i], "top")) {
+                    down = 0;
+                }
+            }
+        } else {
+            int num, used = parse_num(w[0], &num);
+            if (!used)
+                continue;
+            long deg = num;                     /* times 100 */
+            if (!strncasecmp(w[0] + used, "turn", 4))
+                deg = (long)num * 360;
+            else if (!strncasecmp(w[0] + used, "rad", 3))
+                deg = (long)num * 5730 / 100;
+            deg = (deg / 100 % 360 + 360) % 360;
+            horizontal = (deg > 45 && deg < 135) || (deg > 225 && deg < 315);
+            down = horizontal ? deg < 180 : deg > 90 && deg < 270;
+        }
+    }
+    if (!ncolors)
+        return 0;
+    if (radial || ncolors == 1) {
+        uint32_t mix = 0;
+        for (int sh = 0; sh < 32; sh += 8)
+            mix |= (((*g0 >> sh & 0xFF) + (*g1 >> sh & 0xFF)) / 2) << sh;
+        *g0 = *g1 = mix;
+    } else if (!down) {
+        uint32_t t = *g0;
+        *g0 = *g1;
+        *g1 = t;
+    }
+    *dir = horizontal ? 2 : 1;
+    return 1;
+}
+
+/* One track size: 100px, 20%, 1fr, auto, min-content, max-content. */
+static int track_size(const char *w, int wl, const struct vctx *v, uint8_t *kind, int *val)
+{
+    char buf[64];
+    if (wl <= 0 || wl >= (int)sizeof(buf))
+        return 0;
+    memcpy(buf, w, (size_t)wl);
+    buf[wl] = 0;
+    *val = 0;
+    if (!strcasecmp(buf, "auto") || !strncasecmp(buf, "fit-content", 11))
+        return *kind = TK_AUTO, 1;
+    if (!strcasecmp(buf, "min-content"))
+        return *kind = TK_MIN, 1;
+    if (!strcasecmp(buf, "max-content"))
+        return *kind = TK_MAX, 1;
+    int num, used = parse_num(buf, &num);
+    if (used && !strcasecmp(buf + used, "fr"))
+        return *kind = TK_FR, *val = num, 1;
+    struct len l;
+    if (!length_value(buf, v, &l) || l.unit == U_AUTO)
+        return 0;
+    *kind = l.unit == U_PCT ? TK_PCT : TK_PX;     /* min(100%, 250px) and calc() go by their pixels */
+    *val = l.v;
+    return 1;
+}
+
+static void add_track(struct gridspec *g, const char *w, int wl, const struct vctx *v)
+{
+    if (g->n >= MAX_TRACKS)
+        return;
+    struct track *t = &g->t[g->n];
+    if (wl > 7 && !strncasecmp(w, "minmax(", 7)) {
+        const char *in = w + 7, *end = w + wl - 1;
+        const char *comma = find_top(in, end, ',');
+        if (comma >= end)
+            return;
+        while (in < comma && isspace((unsigned char)*in))
+            in++;
+        const char *b = comma + 1;
+        while (b < end && isspace((unsigned char)*b))
+            b++;
+        const char *ae = comma, *be = end;
+        while (ae > in && isspace((unsigned char)ae[-1]))
+            ae--;
+        while (be > b && isspace((unsigned char)be[-1]))
+            be--;
+        if (!track_size(in, (int)(ae - in), v, &t->min, &t->vmin) ||
+            !track_size(b, (int)(be - b), v, &t->max, &t->vmax))
+            return;
+        if (t->min == TK_FR)
+            t->min = TK_AUTO;
+    } else {
+        if (!track_size(w, wl, v, &t->max, &t->vmax))
+            return;
+        t->min = t->max, t->vmin = t->vmax;
+        if (t->max == TK_FR)                    /* 1fr is minmax(auto, 1fr) */
+            t->min = TK_AUTO, t->vmin = 0;
+    }
+    g->n++;
+}
+
+/* grid-template-columns: "200px 1fr", "repeat(3, 1fr)", "repeat(auto-fill, minmax(180px, 1fr))". */
+static const struct gridspec *parse_tracks(const char *value, const struct vctx *v)
+{
+    if (!v->a)
+        return NULL;
+    struct gridspec *g = arena_alloc(v->a, sizeof(*g));
+    if (!g)
+        return NULL;
+    memset(g, 0, sizeof(*g));
+    const char *w[64];
+    int wl[64], n = words(value, w, wl, 64), in_names = 0;
+    for (int i = 0; i < n; i++) {
+        if (in_names || w[i][0] == '[') {               /* [line names] */
+            in_names = w[i][wl[i] - 1] != ']';
+            continue;
+        }
+        if (wl[i] > 7 && !strncasecmp(w[i], "repeat(", 7)) {
+            char inner[256];
+            int len = wl[i] - 8;
+            if (len <= 0 || len >= (int)sizeof(inner))
+                continue;
+            memcpy(inner, w[i] + 7, (size_t)len);
+            inner[len] = 0;
+            const char *rw[32];
+            int rwl[32], rn = words(inner, rw, rwl, 32);
+            if (rn < 2)
+                continue;
+            int count = 1, autorep = 0;
+            if (word_is(rw[0], rwl[0], "auto-fill"))
+                autorep = 1;
+            else if (word_is(rw[0], rwl[0], "auto-fit"))
+                autorep = 2;
+            else
+                count = atoi(rw[0]);
+            if (autorep && !g->auto_repeat) {
+                g->auto_repeat = (uint8_t)autorep;
+                g->rep = g->n;
+            }
+            for (int k = 0; k < (count < MAX_TRACKS ? count : MAX_TRACKS); k++) {
+                int names = 0;
+                for (int j = 1; j < rn; j++) {
+                    if (names || rw[j][0] == '[') {
+                        names = rw[j][rwl[j] - 1] != ']';
+                        continue;
+                    }
+                    add_track(g, rw[j], rwl[j], v);
+                }
+            }
+            if (autorep && g->auto_repeat == autorep && !g->nrep)
+                g->nrep = g->n - g->rep;
+            continue;
+        }
+        add_track(g, w[i], wl[i], v);
+    }
+    if (g->auto_repeat && !g->nrep)
+        g->auto_repeat = 0;
+    return g;
+}
+
+/* A grid line: "3", "-1", "span 2"; names and auto give 0. */
+static void grid_line(const char *s, const char *end, int *line, int *span)
+{
+    char buf[64];
+    while (s < end && isspace((unsigned char)*s))
+        s++;
+    while (end > s && isspace((unsigned char)end[-1]))
+        end--;
+    int len = (int)(end - s) < (int)sizeof(buf) - 1 ? (int)(end - s) : (int)sizeof(buf) - 1;
+    memcpy(buf, s, (size_t)len);
+    buf[len] = 0;
+    *line = 0;
+    if (span)
+        *span = 0;
+    if (!strncasecmp(buf, "span", 4)) {
+        if (span)
+            *span = atoi(buf + 4) > 0 ? atoi(buf + 4) : 1;
+        return;
+    }
+    if (isdigit((unsigned char)buf[0]) || buf[0] == '-')
+        *line = atoi(buf);
+}
+
+/* "start / end": a line and a span, or a line to a line. */
+static void grid_placement(const char *value, int *start, int *end, int *span)
+{
+    const char *vend = value + strlen(value), *slash = find_top(value, vend, '/');
+    int sspan, espan;
+    grid_line(value, slash, start, &sspan);
+    *end = 0;
+    *span = sspan;
+    if (slash < vend) {
+        grid_line(slash + 1, vend, end, &espan);
+        if (espan)
+            *span = espan;
+    }
 }
 
 static void set_len(struct len *dst, const char *value, const struct vctx *v)
@@ -1759,29 +2269,244 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
     case P_DISPLAY:
         if (inherit_kw) {
             st->display = parent->display;
+            st->inner = parent->inner;
         } else {
-            static const struct { const char *kw; uint8_t d; } ds[] = {
-                { "none", D_NONE }, { "block", D_BLOCK }, { "inline", D_INLINE },
-                { "inline-block", D_INLINE_BLOCK }, { "list-item", D_LIST_ITEM },
-                { "table", D_TABLE }, { "inline-table", D_INLINE_TABLE },
-                { "table-row", D_TABLE_ROW }, { "table-row-group", D_TABLE_ROW_GROUP },
-                { "table-header-group", D_TABLE_ROW_GROUP },
-                { "table-footer-group", D_TABLE_ROW_GROUP }, { "table-cell", D_TABLE_CELL },
-                { "table-caption", D_TABLE_CAPTION }, { "table-column", D_NONE },
-                { "table-column-group", D_NONE }, { "flex", D_FLEX }, { "grid", D_BLOCK },
-                { "inline-flex", D_INLINE_BLOCK }, { "inline-grid", D_INLINE_BLOCK },
-                { "flow-root", D_BLOCK }, { "contents", D_INLINE }, { "run-in", D_BLOCK },
-                { "-webkit-box", D_BLOCK }, { "-ms-flexbox", D_FLEX }, { "-webkit-flex", D_FLEX },
-                { "block flex", D_FLEX }, { "inline flow-root", D_INLINE_BLOCK },
+            static const struct { const char *kw; uint8_t d, in; } ds[] = {
+                { "none", D_NONE, 0 }, { "block", D_BLOCK, 0 }, { "inline", D_INLINE, 0 },
+                { "inline-block", D_INLINE_BLOCK, 0 }, { "list-item", D_LIST_ITEM, 0 },
+                { "table", D_TABLE, 0 }, { "inline-table", D_INLINE_TABLE, 0 },
+                { "table-row", D_TABLE_ROW, 0 }, { "table-row-group", D_TABLE_ROW_GROUP, 0 },
+                { "table-header-group", D_TABLE_ROW_GROUP, 0 },
+                { "table-footer-group", D_TABLE_ROW_GROUP, 0 }, { "table-cell", D_TABLE_CELL, 0 },
+                { "table-caption", D_TABLE_CAPTION, 0 }, { "table-column", D_NONE, 0 },
+                { "table-column-group", D_NONE, 0 }, { "flow-root", D_BLOCK, 0 },
+                { "contents", D_INLINE, 0 }, { "run-in", D_BLOCK, 0 }, { "-webkit-box", D_BLOCK, 0 },
+                { "inline flow-root", D_INLINE_BLOCK, 0 },
+                { "flex", D_BLOCK, IN_FLEX }, { "block flex", D_BLOCK, IN_FLEX },
+                { "-ms-flexbox", D_BLOCK, IN_FLEX }, { "-webkit-flex", D_BLOCK, IN_FLEX },
+                { "inline-flex", D_INLINE_BLOCK, IN_FLEX }, { "inline flex", D_INLINE_BLOCK, IN_FLEX },
+                { "-webkit-inline-flex", D_INLINE_BLOCK, IN_FLEX },
+                { "-ms-inline-flexbox", D_INLINE_BLOCK, IN_FLEX },
+                { "grid", D_BLOCK, IN_GRID }, { "block grid", D_BLOCK, IN_GRID },
+                { "inline-grid", D_INLINE_BLOCK, IN_GRID }, { "inline grid", D_INLINE_BLOCK, IN_GRID },
             };
             for (size_t i = 0; i < sizeof(ds) / sizeof(ds[0]); i++)
-                if (!strcasecmp(value, ds[i].kw))
+                if (!strcasecmp(value, ds[i].kw)) {
                     st->display = ds[i].d;
+                    st->inner = ds[i].in;
+                }
         }
         break;
     case P_FLEX_DIRECTION:
     case P_FLEX_FLOW:
-        st->flex_column = !strncasecmp(value, "column", 6);
+        n = words(value, w, wl, 8);
+        for (int i = 0; i < n; i++) {
+            if (!strncasecmp(w[i], "row", 3) || !strncasecmp(w[i], "column", 6)) {
+                st->flex_column = !strncasecmp(w[i], "column", 6);
+                st->flex_reverse = wl[i] > 8 && !strncasecmp(w[i] + wl[i] - 8, "-reverse", 8);
+            } else if (word_is(w[i], wl[i], "wrap") || word_is(w[i], wl[i], "wrap-reverse")) {
+                st->flex_wrap = 1;
+            } else if (word_is(w[i], wl[i], "nowrap")) {
+                st->flex_wrap = 0;
+            }
+        }
+        break;
+    case P_FLEX_WRAP:
+        st->flex_wrap = !strncasecmp(value, "wrap", 4);
+        break;
+    case P_FLEX:
+        if (!strcasecmp(value, "none")) {
+            st->flex_grow = st->flex_shrink = 0;
+            st->flex_basis.unit = U_AUTO;
+        } else if (!strcasecmp(value, "auto")) {
+            st->flex_grow = st->flex_shrink = 100;
+            st->flex_basis.unit = U_AUTO;
+        } else if (initial_kw) {
+            st->flex_grow = 0, st->flex_shrink = 100;
+            st->flex_basis.unit = U_AUTO;
+        } else {
+            int nums = 0, num, basis = 0;
+            n = words(value, w, wl, 8);
+            for (int i = 0; i < n; i++) {
+                int used = parse_num(w[i], &num);
+                if (used == wl[i] && nums < 2 && !basis) {
+                    if (nums++ == 0)
+                        st->flex_grow = num > 0 ? num : 0;
+                    else
+                        st->flex_shrink = num > 0 ? num : 0;
+                } else {
+                    char tmp[64];
+                    snprintf(tmp, sizeof(tmp), "%.*s", wl[i], w[i]);
+                    struct len l;
+                    if (!strcasecmp(tmp, "content"))
+                        st->flex_basis.unit = U_AUTO, basis = 1;
+                    else if (length_value(tmp, v, &l))
+                        st->flex_basis = l, basis = 1;
+                }
+            }
+            if (nums == 1 || (!nums && basis))     /* flex: 2 and flex: 200px */
+                st->flex_shrink = 100;
+            if (!nums && basis)
+                st->flex_grow = 100;
+            if (nums && !basis)                 /* flex: 1 is 1 1 0% */
+                st->flex_basis = (struct len){ .unit = U_PX };
+        }
+        break;
+    case P_FLEX_GROW:
+    case P_FLEX_SHRINK: {
+        int num;
+        if (parse_num(value, &num) && num >= 0)
+            *(prop == P_FLEX_GROW ? &st->flex_grow : &st->flex_shrink) = num;
+        else if (initial_kw)
+            *(prop == P_FLEX_GROW ? &st->flex_grow : &st->flex_shrink) = prop == P_FLEX_GROW ? 0 : 100;
+        break;
+    }
+    case P_FLEX_BASIS:
+        if (!strcasecmp(value, "content") || initial_kw)
+            st->flex_basis.unit = U_AUTO;
+        else
+            set_len(&st->flex_basis, value, v);
+        break;
+    case P_JUSTIFY_CONTENT:
+    case P_ALIGN_ITEMS:
+    case P_ALIGN_SELF:
+    case P_JUSTIFY_ITEMS:
+    case P_JUSTIFY_SELF: {
+        int al;
+        if (!align_value(value, &al))
+            break;
+        switch (prop) {
+        case P_JUSTIFY_CONTENT: st->justify = (uint8_t)al; break;
+        case P_ALIGN_ITEMS: st->align_items = (uint8_t)al; break;
+        case P_ALIGN_SELF: st->align_self = (uint8_t)al; break;
+        case P_JUSTIFY_ITEMS: st->justify_items = (uint8_t)al; break;
+        default: st->justify_self = (uint8_t)al; break;
+        }
+        break;
+    }
+    case P_PLACE_CONTENT:
+    case P_PLACE_ITEMS:
+    case P_PLACE_SELF: {
+        /* align, then justify (or the same for both) */
+        char first[64];
+        const char *rest;
+        int a1, a2;
+        first_word(value, first, sizeof(first), &rest);
+        if (!align_value(first, &a1))
+            break;
+        if (!rest || !align_value(rest, &a2))
+            a2 = a1;
+        if (prop == P_PLACE_CONTENT)
+            st->justify = (uint8_t)a2;
+        else if (prop == P_PLACE_ITEMS)
+            st->align_items = (uint8_t)a1, st->justify_items = (uint8_t)a2;
+        else
+            st->align_self = (uint8_t)a1, st->justify_self = (uint8_t)a2;
+        break;
+    }
+    case P_ORDER: {
+        int num;
+        if (parse_num(value, &num))
+            st->order = num / 100;
+        break;
+    }
+    case P_GAP:
+    case P_ROW_GAP:
+    case P_COLUMN_GAP: {
+        struct len l[2] = { { .unit = U_PX }, { .unit = U_PX } };
+        n = words(value, w, wl, 8);
+        for (int i = 0; i < n && i < 2; i++) {
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "%.*s", wl[i], w[i]);
+            if (!length_value(tmp, v, &l[i]) || l[i].unit == U_AUTO)
+                l[i] = (struct len){ .unit = U_PX };    /* normal */
+        }
+        if (n == 1)
+            l[1] = l[0];
+        if (prop != P_COLUMN_GAP)
+            st->row_gap = l[0];
+        if (prop != P_ROW_GAP)
+            st->col_gap = prop == P_GAP ? l[1] : l[0];
+        break;
+    }
+    case P_OVERFLOW:
+        st->clips = strcasecmp(value, "visible") != 0 && !inherit_kw;
+        break;
+    case P_GRID_TEMPLATE_COLUMNS:
+    case P_GRID_TEMPLATE: {
+        const char *cols = value;
+        if (prop == P_GRID_TEMPLATE) {          /* rows / columns */
+            const char *slash = find_top(value, value + strlen(value), '/');
+            if (!*slash) {
+                st->grid_cols = NULL;
+                break;
+            }
+            cols = slash + 1;
+        }
+        st->grid_cols = !strcasecmp(cols, "none") || initial_kw ? NULL : parse_tracks(cols, v);
+        break;
+    }
+    case P_GRID_COLUMN:
+        grid_placement(value, &st->gc_start, &st->gc_end, &st->gc_span);
+        break;
+    case P_GRID_COLUMN_START: {
+        int span;
+        grid_line(value, value + strlen(value), &st->gc_start, &span);
+        if (span)
+            st->gc_span = span;
+        break;
+    }
+    case P_GRID_COLUMN_END: {
+        int span;
+        grid_line(value, value + strlen(value), &st->gc_end, &span);
+        if (span)
+            st->gc_span = span;
+        break;
+    }
+    case P_GRID_ROW: {
+        int end;
+        grid_placement(value, &st->gr_start, &end, &st->gr_span);
+        if (end > st->gr_start && st->gr_start > 0)
+            st->gr_span = end - st->gr_start;
+        break;
+    }
+    case P_GRID_ROW_START: {
+        int span;
+        grid_line(value, value + strlen(value), &st->gr_start, &span);
+        if (span)
+            st->gr_span = span;
+        break;
+    }
+    case P_GRID_AREA: {
+        /* row-start / column-start / row-end / column-end */
+        const char *e = value + strlen(value), *p = value;
+        int part[4] = { 0, 0, 0, 0 }, spans[4] = { 0, 0, 0, 0 };
+        for (int i = 0; i < 4 && p <= e; i++) {
+            const char *slash = find_top(p, e, '/');
+            grid_line(p, slash, &part[i], &spans[i]);
+            p = slash + 1;
+        }
+        st->gr_start = part[0], st->gc_start = part[1], st->gc_end = part[3];
+        st->gr_span = spans[2] ? spans[2] : part[2] > part[0] && part[0] > 0 ? part[2] - part[0] : 0;
+        st->gc_span = spans[3];
+        break;
+    }
+    case P_BORDER_RADIUS: {
+        char first[256];
+        snprintf(first, sizeof(first), "%.*s", (int)strcspn(value, "/"), value);
+        if (box_values(first, v, box))          /* the same 1-4 value pattern */
+            memcpy(st->radius, box, sizeof(box));
+        break;
+    }
+    case P_BORDER_TL_RADIUS: case P_BORDER_TR_RADIUS: case P_BORDER_BR_RADIUS:
+    case P_BORDER_BL_RADIUS: {
+        char first[64];
+        set_len(&st->radius[prop - P_BORDER_TL_RADIUS], first_word(value, first, sizeof(first), NULL), v);
+        break;
+    }
+    case P_BACKGROUND_IMAGE:
+        if (!parse_gradient(value, &st->g0, &st->g1, &st->grad))
+            st->grad = 0;
         break;
     case P_FLOAT:
         st->floated = !strcasecmp(value, "left") || !strcasecmp(value, "right");
@@ -1805,6 +2530,8 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
             st->bg = c;
         break;
     case P_BACKGROUND:
+        if (!parse_gradient(value, &st->g0, &st->g1, &st->grad))
+            st->grad = 0;
         if (!strcasecmp(value, "none") || initial_kw) {
             st->bg = TRANSPARENT;
             break;
@@ -1851,7 +2578,7 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         else if (used && !value[used])
             st->lh_kind = LH_FACTOR, st->lh = num;
         else if (length_value(value, v, &l) && l.unit != U_AUTO)
-            st->lh_kind = LH_PX, st->lh = l.unit == U_PCT ? st->font_size * l.v / 10000 : l.v;
+            st->lh_kind = LH_PX, st->lh = len_on(l, st->font_size);
         break;
     }
     case P_TEXT_ALIGN:
@@ -1945,7 +2672,7 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
     case P_PADDING_TOP: case P_PADDING_RIGHT: case P_PADDING_BOTTOM: case P_PADDING_LEFT:
         set_len(&st->padding[prop - P_PADDING_TOP], value, v);
         if (st->padding[prop - P_PADDING_TOP].unit == U_AUTO)
-            st->padding[prop - P_PADDING_TOP] = (struct len){ 0, U_PX };
+            st->padding[prop - P_PADDING_TOP] = (struct len){ .unit = U_PX };
         break;
     case P_BORDER:
         apply_border(st, value, 15, v);
@@ -2018,15 +2745,13 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
     case P_WIDTH: set_len(&st->width, value, v); break;
     case P_HEIGHT: set_len(&st->height, value, v); break;
     case P_MIN_WIDTH:
-        set_len(&st->min_width, value, v);
-        if (st->min_width.unit == U_AUTO)
-            st->min_width = (struct len){ 0, U_PX };
+        set_len(&st->min_width, value, v);      /* auto: a flex item's own minimum */
         break;
     case P_MAX_WIDTH: set_len(&st->max_width, value, v); break;
     case P_MIN_HEIGHT:
         set_len(&st->min_height, value, v);
         if (st->min_height.unit == U_AUTO)
-            st->min_height = (struct len){ 0, U_PX };
+            st->min_height = (struct len){ .unit = U_PX };
         break;
     case P_BOX_SIZING:
         st->box_sizing_border = !strcasecmp(value, "border-box");
@@ -2510,6 +3235,7 @@ static void compute(struct arena *a, struct node *n, const struct style *parent,
     }
 
     struct vctx v = *base;
+    v.a = a;
     /* Pass 2: font-size, which em units in everything else depend on. Pass 3: the rest. */
     int author_color = 0;
     for (int pass = 2; pass <= 3; pass++) {
@@ -2556,7 +3282,7 @@ static void compute(struct arena *a, struct node *n, const struct style *parent,
     if (st->invisible & 1)
         st->hidden = 1;
     if (st->invisible & 8)
-        st->bg = TRANSPARENT;
+        st->bg = TRANSPARENT, st->grad = 0;
     if (st->floated && st->display != D_NONE)
         st->display = (st->display == D_TABLE || st->display == D_INLINE_TABLE) ? D_INLINE_TABLE
                                                                                : D_INLINE_BLOCK;
@@ -2734,7 +3460,7 @@ void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int 
     }
     if (!ua_sheet || !ua_quirks || !root)
         return;
-    struct vctx v = { 16, 16, viewport_w, viewport_h };
+    struct vctx v = { 16, 16, viewport_w, viewport_h, a };
     struct mctx mc = { visited, ctx, root->quirks };
     struct match *buf = malloc(sizeof(struct match) * MAX_MATCHES);
     if (!buf)

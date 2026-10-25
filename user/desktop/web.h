@@ -132,16 +132,25 @@ const char *tag_name(int tag);
 int tag_lookup(const char *name, int len);
 
 /* ---- styles (css.c) ---- */
-enum unit { U_PX, U_PCT, U_AUTO };
+enum unit { U_PX, U_PCT, U_AUTO, U_CALC, U_MIN, U_MAX };
 
 struct len {
     int v;                      /* pixels, or percent times 100 */
+    int pct;                    /* U_CALC: v pixels plus this percent (times 100);
+                                   U_MIN, U_MAX: the smaller or larger of v pixels and it */
     uint8_t unit;
 };
 
 enum display {
     D_INLINE, D_BLOCK, D_LIST_ITEM, D_INLINE_BLOCK, D_TABLE, D_INLINE_TABLE, D_TABLE_ROW,
-    D_TABLE_ROW_GROUP, D_TABLE_CELL, D_TABLE_CAPTION, D_FLEX, D_NONE,
+    D_TABLE_ROW_GROUP, D_TABLE_CELL, D_TABLE_CAPTION, D_NONE,
+};
+/* How a box lays out its children: display's inside, next to its outside above. */
+enum { IN_FLOW, IN_FLEX, IN_GRID };
+/* justify-content, align-items and the like; AL_NORMAL stretches where it can. */
+enum {
+    AL_AUTO, AL_NORMAL, AL_STRETCH, AL_START, AL_END, AL_CENTER, AL_BASELINE, AL_BETWEEN,
+    AL_AROUND, AL_EVENLY,
 };
 enum { TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY };
 enum { WS_NORMAL, WS_PRE, WS_NOWRAP, WS_PRE_WRAP, WS_PRE_LINE };
@@ -159,6 +168,20 @@ enum { LH_NORMAL, LH_FACTOR, LH_PX };
 #define OPAQUE(c) ((c) | 0xFF000000u)
 #define TRANSPARENT 0x00000000u
 #define ALPHA(c) ((c) >> 24)
+
+/* grid-template-columns: sizes, after repeat(n, ...) is expanded. */
+enum { TK_PX, TK_PCT, TK_FR, TK_AUTO, TK_MIN, TK_MAX };
+#define MAX_TRACKS 24
+struct track {
+    uint8_t min, max;           /* TK_*: minmax(min, max); a plain size is both */
+    int vmin, vmax;             /* pixels, percent times 100 or fr times 100 */
+};
+struct gridspec {
+    int n;
+    uint8_t auto_repeat;        /* 1 auto-fill, 2 auto-fit: tracks [rep, rep + nrep) repeat */
+    int rep, nrep;
+    struct track t[MAX_TRACKS];
+};
 
 struct custom_prop {            /* a CSS custom property (--name: value) */
     const char *name;
@@ -188,6 +211,23 @@ struct style {
     int border_spacing;         /* tables, inherited */
     struct custom_prop *vars;
     const struct wfont *font;
+
+    struct len radius[4];       /* border-radius: top left, top right, bottom right, bottom left */
+    uint32_t g0, g1;            /* a linear gradient over the background, from g0 to g1 */
+    uint8_t grad;               /* 0 none, 1 downwards, 2 rightwards */
+
+    /* flex and grid containers, and their items */
+    uint8_t inner;              /* IN_* */
+    uint8_t flex_wrap, flex_reverse;
+    uint8_t justify, align_items, align_self, justify_items, justify_self;   /* AL_* */
+    uint8_t clips;              /* overflow other than visible */
+    int flex_grow, flex_shrink; /* times 100 */
+    struct len flex_basis;
+    int order;
+    struct len row_gap, col_gap;
+    const struct gridspec *grid_cols;
+    int gc_start, gc_end, gc_span;      /* grid-column: lines from 1 (negative: from the end), 0 auto */
+    int gr_start, gr_span;              /* grid-row */
 };
 
 struct sheet;
@@ -212,6 +252,13 @@ struct ditem {
     int len;
     struct image *img;          /* image */
     struct node *node;          /* control */
+    /* fills and images: rounded corners; fills: a gradient over the color,
+       and a border of ring pixels all round in ring_color */
+    int rad[4];
+    uint8_t grad;
+    uint32_t g0, g1;
+    int ring;
+    uint32_t ring_color;
 };
 
 struct hotspot {                /* a link or a form control */
