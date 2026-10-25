@@ -934,6 +934,10 @@ static void free_page(struct browser *b)
     for (struct node *n = b->root; n; n = node_next(n, b->root)) {
         free(n->value);
         n->value = NULL;
+        if (n->type == N_ELEMENT && n->tag == T_SVG) {      /* inline SVG: drawn by us */
+            image_free(n->img);
+            n->img = NULL;
+        }
     }
     arena_free(&b->larena);
     arena_free(&b->sarena);
@@ -1904,8 +1908,10 @@ static void fetch_complete(struct browser *b)
         int jpg = (ul > 4 && !strncasecmp(u + ul - 4, ".jpg", 4)) ||
                   (ul > 5 && !strncasecmp(u + ul - 5, ".jpeg", 5));
         int css = ul > 4 && !strncasecmp(u + ul - 4, ".css", 4);
+        int gif = ul > 4 && !strncasecmp(u + ul - 4, ".gif", 4);
+        int svg = ul > 4 && !strncasecmp(u + ul - 4, ".svg", 4);
         snprintf(r.type, sizeof(r.type), "%s", html ? "text/html" : png ? "image/png" : jpg ? "image/jpeg" :
-             css ? "text/css" : "text/plain");
+             gif ? "image/gif" : svg ? "image/svg+xml" : css ? "text/css" : "text/plain");
     } else if (is_file) {
         snprintf(why, sizeof(why), "%s", b->status);
     }
@@ -1951,7 +1957,7 @@ static void fetch_complete(struct browser *b)
             image_done(b, done.url, r.body, r.len);
             escape(done.url, eurl, sizeof(eurl));
             int n = snprintf(html, sizeof(html),
-                             "<html><head><title>%s</title></head><body style=\"margin:8px\"><img src=\"%s\" alt=\"(%s: not a PNG or JPEG image)\"></body></html>",
+                             "<html><head><title>%s</title></head><body style=\"margin:8px\"><img src=\"%s\" alt=\"(%s: not a picture the browser can show)\"></body></html>",
                              eurl, eurl, r.type);
             load_document(b, html, n, done.url, "utf-8");
         } else if (r.type[0] && strncmp(r.type, "text/", 5) && !strstr(r.type, "html") &&

@@ -417,7 +417,7 @@ static int is_block_level(int d)
 static int is_replaced(const struct node *n)
 {
     return n->tag == T_IMG || n->tag == T_INPUT || n->tag == T_SELECT || n->tag == T_TEXTAREA ||
-           n->tag == T_IFRAME;
+           n->tag == T_IFRAME || n->tag == T_SVG;
 }
 
 /* ---- list markers ---- */
@@ -741,6 +741,24 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
             if (h < 0)
                 h = w > 0 && alt && *alt ? fh + 4 : w;
         }
+    } else if (n->tag == T_SVG) {       /* drawn by svg.c at the size it ends up */
+        ctrl = 0;
+        int iw, ih;
+        svg_size(n, &iw, &ih);
+        if (w < 0 && h < 0)
+            w = iw, h = ih;
+        else if (w < 0)
+            w = h * iw / ih;
+        else if (h < 0)
+            h = w * ih / iw;
+        if (st->max_width.unit == U_PX || (relative(st->max_width.unit) && !c->measuring)) {
+            int mx = len_px(st->max_width, avail);
+            if (w > mx && mx > 0) {
+                h = h * mx / w;
+                w = mx;
+            }
+        }
+        kind = DK_IMAGE;
     } else if (n->tag == T_INPUT) {
         const char *t = input_type(n);
         if (!strcasecmp(t, "checkbox") || !strcasecmp(t, "radio")) {
@@ -797,16 +815,24 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
     *ow = b.ml + bw + b.mr;
     *oh = b.mt + bh + b.mb;
     *obase = *oh;
-    if (n->tag != T_IMG && !(n->tag == T_INPUT && h <= 13))
+    if (n->tag != T_IMG && n->tag != T_SVG && !(n->tag == T_INPUT && h <= 13))
         *obase = b.mt + b.bt + b.pt + (h - fh) / 2 + wfont_ascent(f) + 1;
     if (c->measuring || st->hidden)
         return;
 
-    if (n->tag == T_IMG)
+    if (n->tag == T_IMG || n->tag == T_SVG)
         fill(c, bx + b.bl, by + b.bt, b.pl + w + b.pr, b.pt + h + b.pb, st->bg, 0);
     borders(c, st, bx, by, bw, bh);
     if (w <= 0 || h <= 0)
         return;
+    if (n->tag == T_SVG) {
+        if (!n->img || n->img->w != w || n->img->h != h) {
+            image_free(n->img);
+            n->img = svg_render(n, w, h, st->color | 0xFF000000u);
+        }
+        if (!n->img)
+            kind = DK_FRAME;
+    }
     struct ditem *d = emit(c, kind);
     if (!d)
         return;
@@ -2108,7 +2134,7 @@ static void size_columns(struct lctx *c, const struct track *tr, int nt, struct 
 }
 
 /* Put items into cells: explicit columns and rows, then the rest in reading order. */
-static int grid_place(struct fitem *it, int ni, int nt)
+static int grid_place(struct fitem *it, int ni, int nt, const struct style *cst)
 {
     int rows_cap = 16, nrows = 0;
     uint8_t *occ = calloc((size_t)(rows_cap * nt), 1);
@@ -2123,8 +2149,21 @@ static int grid_place(struct fitem *it, int ni, int nt)
             int col = -1, cs = !anon && st->gc_span > 0 ? st->gc_span : 1;
             int row = !anon && st->gr_start > 0 ? st->gr_start - 1 : -1;
             int rs = !anon && st->gr_span > 0 ? st->gr_span : 1;
-            if (!anon && st->gc_start)
+            if (!anon && st->grid_area && cst->grid_areas) {      /* grid-area: name */
+                const struct gridareas *ga = cst->grid_areas;
+                for (int k = 0; k < ga->n; k++)
+                    if (!strcmp(ga->a[k].name, st->grid_area)) {
+                        col = ga->a[k].c0;
+                        cs = ga->a[k].c1 - ga->a[k].c0;
+                        row = ga->a[k].r0;
+                        rs = ga->a[k].r1 - ga->a[k].r0;
+                        break;
+                    }
+            }
+            if (!anon && st->gc_start && col < 0)
                 col = (st->gc_start > 0 ? st->gc_start : nt + 2 + st->gc_start) - 1;
+            if (!anon && st->gr_end > 0 && row >= 0 && st->gr_end - 1 > row && !st->grid_area)
+                rs = st->gr_end - 1 - row;
             if (!anon && st->gc_end) {
                 int end = (st->gc_end > 0 ? st->gc_end : nt + 2 + st->gc_end) - 1;
                 if (col >= 0 && end > col)
@@ -2142,6 +2181,8 @@ static int grid_place(struct fitem *it, int ni, int nt)
                 row = 1024;
             if ((pass == 0) != (col >= 0 && row >= 0))
                 continue;
+            if (cst->grid_dense && row < 0 && col < 0)
+                cur_r = cur_c = 0;              /* dense: fill the earliest hole */
             /* find a free spot */
             int r = row >= 0 ? row : cur_r, cc = col >= 0 ? col : row >= 0 ? 0 : cur_c;
             if (col < 0 && cc + cs > nt) {
@@ -2209,7 +2250,11 @@ static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int 
     int nt = grid_tracks(st->grid_cols, w, cgap, ni, tr);
     for (int i = 0; i < ni; i++)
         item_edges(&it[i], w);
-    int nrows = grid_place(it, ni, nt);
+    int nrows = grid_place(it, ni, nt, st);
+    const struct gridspec *rspec = st->grid_rows, *aspec = st->grid_auto_rows;
+    int erows = rspec ? rspec->n : 0;
+    if (nrows < erows)
+        nrows = erows;
     if (nrows <= 0) {
         free(it);
         return 0;
@@ -2250,14 +2295,59 @@ static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int 
         if (t->mt + t->bh + t->mb > have)
             rowh[t->row + t->rspan - 1] += t->mt + t->bh + t->mb - have;
     }
+    /* row sizes from grid-template-rows and grid-auto-rows */
+    int sumfr = 0, nauto = 0;
+    uint8_t rkind[1100];                        /* 0 auto, 1 fixed, 2 fr */
+    int rweight[1100];
+    for (int r = 0; r < nrows && r < 1100; r++) {
+        const struct track *t = r < erows ? &rspec->t[r]
+                              : aspec && aspec->n ? &aspec->t[(r - erows) % aspec->n] : NULL;
+        rkind[r] = 0;
+        rweight[r] = 0;
+        if (t) {
+            int lo = t->min == TK_PX ? t->vmin : t->min == TK_PCT && defh >= 0 ? muldiv(defh, t->vmin, 10000) : -1;
+            int hi = t->max == TK_PX ? t->vmax : t->max == TK_PCT && defh >= 0 ? muldiv(defh, t->vmax, 10000) : -1;
+            if (lo > rowh[r])
+                rowh[r] = lo;
+            if (hi >= 0 && rowh[r] > hi)
+                rowh[r] = hi;
+            if (hi >= 0)
+                rkind[r] = 1;
+            else if (t->max == TK_FR)
+                rkind[r] = 2, rweight[r] = t->vmax, sumfr += t->vmax;
+        }
+        if (!rkind[r])
+            nauto++;
+    }
     int total = rgap * (nrows - 1);
     for (int r = 0; r < nrows; r++)
         total += rowh[r];
     int target = defh >= 0 ? defh : minh;
-    if (target > total && nrows) {              /* auto rows stretch to fill */
-        for (int r = 0; r < nrows; r++)
-            rowh[r] += (target - total) / nrows;
-        total = target;
+    if (target > total && nrows && nrows <= 1100) {
+        if (sumfr) {                            /* fr rows share what is left */
+            int left = target - total, given = 0, last = -1;
+            for (int r = 0; r < nrows; r++)
+                if (rkind[r] == 2) {
+                    int add = muldiv(left, rweight[r], sumfr);
+                    rowh[r] += add;
+                    given += add;
+                    last = r;
+                }
+            if (last >= 0)
+                rowh[last] += left - given;
+            total = target;
+        } else if (nauto) {                     /* auto rows stretch to fill */
+            int left = target - total, given = 0, last = -1;
+            for (int r = 0; r < nrows; r++)
+                if (!rkind[r]) {
+                    rowh[r] += left / nauto;
+                    given += left / nauto;
+                    last = r;
+                }
+            if (last >= 0)
+                rowh[last] += left - given;
+            total = target;
+        }
     }
     rowy[0] = 0;
     for (int r = 0; r < nrows; r++)

@@ -42,7 +42,8 @@ enum prop {
     P_FLEX_WRAP, P_JUSTIFY_CONTENT, P_ALIGN_ITEMS, P_ALIGN_SELF, P_JUSTIFY_ITEMS, P_JUSTIFY_SELF,
     P_PLACE_CONTENT, P_PLACE_ITEMS, P_PLACE_SELF, P_ORDER, P_GAP, P_ROW_GAP, P_COLUMN_GAP,
     P_OVERFLOW, P_GRID_TEMPLATE_COLUMNS, P_GRID_TEMPLATE, P_GRID_COLUMN, P_GRID_COLUMN_START,
-    P_GRID_COLUMN_END, P_GRID_ROW, P_GRID_ROW_START, P_GRID_AREA,
+    P_GRID_COLUMN_END, P_GRID_ROW, P_GRID_ROW_START, P_GRID_AREA, P_GRID_TEMPLATE_ROWS,
+    P_GRID_TEMPLATE_AREAS, P_GRID_AUTO_ROWS, P_GRID_ROW_END, P_GRID_AUTO_FLOW,
 };
 
 static const struct { const char *name; uint8_t prop; } prop_names[] = {
@@ -76,11 +77,15 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "flex-wrap", P_FLEX_WRAP }, { "float", P_FLOAT }, { "font", P_FONT },
     { "font-family", P_FONT_FAMILY }, { "font-size", P_FONT_SIZE }, { "font-style", P_FONT_STYLE },
     { "font-weight", P_FONT_WEIGHT }, { "gap", P_GAP }, { "grid-area", P_GRID_AREA },
+    { "grid-auto-flow", P_GRID_AUTO_FLOW }, { "grid-auto-rows", P_GRID_AUTO_ROWS },
     { "grid-column", P_GRID_COLUMN }, { "grid-column-end", P_GRID_COLUMN_END },
     { "grid-column-gap", P_COLUMN_GAP }, { "grid-column-start", P_GRID_COLUMN_START },
-    { "grid-gap", P_GAP }, { "grid-row", P_GRID_ROW }, { "grid-row-gap", P_ROW_GAP },
+    { "grid-gap", P_GAP }, { "grid-row", P_GRID_ROW }, { "grid-row-end", P_GRID_ROW_END },
+    { "grid-row-gap", P_ROW_GAP },
     { "grid-row-start", P_GRID_ROW_START }, { "grid-template", P_GRID_TEMPLATE },
-    { "grid-template-columns", P_GRID_TEMPLATE_COLUMNS }, { "height", P_HEIGHT },
+    { "grid-template-areas", P_GRID_TEMPLATE_AREAS },
+    { "grid-template-columns", P_GRID_TEMPLATE_COLUMNS },
+    { "grid-template-rows", P_GRID_TEMPLATE_ROWS }, { "height", P_HEIGHT },
     { "justify-content", P_JUSTIFY_CONTENT }, { "justify-items", P_JUSTIFY_ITEMS },
     { "justify-self", P_JUSTIFY_SELF }, { "left", P_LEFT }, { "line-height", P_LINE_HEIGHT },
     { "list-style", P_LIST_STYLE }, { "list-style-type", P_LIST_STYLE_TYPE },
@@ -182,7 +187,7 @@ static const char ua_css[] =
     " h4, h5, h6, hgroup, nav, section, dl, dt, dd, ol, ul, menu, dir, fieldset, details,"
     " summary, frameset, frame, noframes, optgroup { display: block }"
     "head, script, style, link, meta, title, base, template, param, area, map, source, track,"
-    " datalist, object, embed, video, audio, canvas, svg, col, colgroup, option,"
+    " datalist, object, embed, video, audio, canvas, col, colgroup, option,"
     " input[type=hidden], [hidden], noembed, noscript, dialog:not([open]) { display: none }"
     "li { display: list-item }"
     "table { display: table; border-spacing: 2px; text-indent: 0 }"
@@ -2217,6 +2222,62 @@ static const struct gridspec *parse_tracks(const char *value, const struct vctx 
     return g;
 }
 
+/* grid-template-areas: "header header" "nav main": each string is a row of cell names. */
+static const struct gridareas *parse_areas(const char *value, const struct vctx *v)
+{
+    if (!v->a)
+        return NULL;
+    struct gridareas *g = arena_alloc(v->a, sizeof(*g));
+    if (!g)
+        return NULL;
+    memset(g, 0, sizeof(*g));
+    const char *p = value;
+    int row = 0;
+    while (*p) {
+        while (*p && *p != '"' && *p != '\'')
+            p++;
+        if (!*p)
+            break;
+        char q = *p++;
+        int col = 0;
+        while (*p && *p != q) {
+            while (*p == ' ' || *p == '\t')
+                p++;
+            const char *s = p;
+            while (*p && *p != q && *p != ' ' && *p != '\t')
+                p++;
+            if (p == s)
+                continue;
+            if (!(p - s == 1 && *s == '.') && p - s < 24) {
+                int k;
+                for (k = 0; k < g->n; k++)
+                    if (!strncmp(g->a[k].name, s, (size_t)(p - s)) && !g->a[k].name[p - s])
+                        break;
+                if (k == g->n && g->n < MAX_AREAS) {
+                    memcpy(g->a[k].name, s, (size_t)(p - s));
+                    g->a[k].r0 = row, g->a[k].c0 = col, g->a[k].r1 = row + 1, g->a[k].c1 = col + 1;
+                    g->n++;
+                } else if (k < g->n) {
+                    if (row + 1 > g->a[k].r1)
+                        g->a[k].r1 = row + 1;
+                    if (col + 1 > g->a[k].c1)
+                        g->a[k].c1 = col + 1;
+                    if (col < g->a[k].c0)
+                        g->a[k].c0 = col;
+                }
+            }
+            col++;
+        }
+        if (*p)
+            p++;
+        if (col > g->ncols)
+            g->ncols = col;
+        row++;
+    }
+    g->nrows = row;
+    return row ? g : NULL;
+}
+
 /* A grid line: "3", "-1", "span 2"; names and auto give 0. */
 static void grid_line(const char *s, const char *end, int *line, int *span)
 {
@@ -2443,17 +2504,28 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         st->clips = strcasecmp(value, "visible") != 0 && !inherit_kw;
         break;
     case P_GRID_TEMPLATE_COLUMNS:
-    case P_GRID_TEMPLATE: {
-        const char *cols = value;
-        if (prop == P_GRID_TEMPLATE) {          /* rows / columns */
-            const char *slash = find_top(value, value + strlen(value), '/');
-            if (!*slash) {
-                st->grid_cols = NULL;
-                break;
-            }
-            cols = slash + 1;
-        }
-        st->grid_cols = !strcasecmp(cols, "none") || initial_kw ? NULL : parse_tracks(cols, v);
+        st->grid_cols = !strcasecmp(value, "none") || initial_kw ? NULL : parse_tracks(value, v);
+        break;
+    case P_GRID_TEMPLATE_ROWS:
+        st->grid_rows = !strcasecmp(value, "none") || initial_kw ? NULL : parse_tracks(value, v);
+        break;
+    case P_GRID_AUTO_ROWS:
+        st->grid_auto_rows = !strcasecmp(value, "auto") || initial_kw ? NULL : parse_tracks(value, v);
+        break;
+    case P_GRID_TEMPLATE_AREAS:
+        st->grid_areas = !strcasecmp(value, "none") || initial_kw ? NULL : parse_areas(value, v);
+        break;
+    case P_GRID_AUTO_FLOW:
+        st->grid_dense = strcasestr(value, "dense") != NULL;
+        break;
+    case P_GRID_TEMPLATE: {                     /* rows / columns, or areas with their row sizes */
+        const char *vend = value + strlen(value), *slash = find_top(value, vend, '/');
+        char rows[512];
+        snprintf(rows, sizeof(rows), "%.*s", (int)(slash - value), value);
+        st->grid_areas = strchr(rows, '"') || strchr(rows, '\'') ? parse_areas(rows, v) : NULL;
+        st->grid_rows = !strcasecmp(rows, "none") || initial_kw ? NULL : parse_tracks(rows, v);
+        st->grid_cols = slash >= vend || !strcasecmp(slash + 1, "none") || initial_kw
+                      ? NULL : parse_tracks(slash + 1, v);
         break;
     }
     case P_GRID_COLUMN:
@@ -2476,8 +2548,16 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
     case P_GRID_ROW: {
         int end;
         grid_placement(value, &st->gr_start, &end, &st->gr_span);
+        st->gr_end = end;
         if (end > st->gr_start && st->gr_start > 0)
             st->gr_span = end - st->gr_start;
+        break;
+    }
+    case P_GRID_ROW_END: {
+        int span;
+        grid_line(value, value + strlen(value), &st->gr_end, &span);
+        if (span)
+            st->gr_span = span;
         break;
     }
     case P_GRID_ROW_START: {
@@ -2488,8 +2568,13 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         break;
     }
     case P_GRID_AREA: {
-        /* row-start / column-start / row-end / column-end */
+        /* a name, or row-start / column-start / row-end / column-end */
         const char *e = value + strlen(value), *p = value;
+        if (isalpha((unsigned char)*p) && strncasecmp(p, "span", 4) && strncasecmp(p, "auto", 4) &&
+            !strchr(p, '/')) {
+            st->grid_area = arena_strdup(v->a, value);
+            break;
+        }
         int part[4] = { 0, 0, 0, 0 }, spans[4] = { 0, 0, 0, 0 };
         for (int i = 0; i < 4 && p <= e; i++) {
             const char *slash = find_top(p, e, '/');
@@ -3020,6 +3105,10 @@ static void hints(const struct node *n, char *buf, int size)
         hint_len(buf, size, "height", node_attr(n, "height"));
         if ((v = node_attr(n, "frameborder")) && (!strcmp(v, "0") || !strcasecmp(v, "no")))
             hint_add(buf, size, "border: none;");
+        break;
+    case T_SVG:
+        hint_len(buf, size, "width", node_attr(n, "width"));
+        hint_len(buf, size, "height", node_attr(n, "height"));
         break;
     case T_IMG:
         hint_len(buf, size, "width", node_attr(n, "width"));

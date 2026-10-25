@@ -72,7 +72,8 @@ LIBGL     := $(BUILD)/libGL.a
 FP_OBJS   := $(BUILD)/u/user/libc/math.o $(GL_OBJS) $(BUILD)/u/user/desktop/gears.o \
              $(BUILD)/u/user/desktop/js.o $(BUILD)/u/user/desktop/jslib.o \
              $(BUILD)/u/user/desktop/jsre.o $(BUILD)/u/user/desktop/jsdom.o \
-             $(BUILD)/u/user/desktop/jslib2.o $(BUILD)/u/user/desktop/jsgc.o
+             $(BUILD)/u/user/desktop/jslib2.o $(BUILD)/u/user/desktop/jsgc.o \
+             $(BUILD)/u/user/desktop/svg.o
 
 PROGS     := $(basename $(notdir $(wildcard user/bin/*.c)))
 FSH_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/fsh/*.c)))

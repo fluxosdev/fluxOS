@@ -367,8 +367,8 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   with Back, Forward, Stop, Refresh and Home, an address bar, a progress
   gauge, and the address of the link under the mouse in its status bar. It
   fetches pages over HTTP or HTTPS (by running `wget`, so the desktop keeps
-  working while a page loads), then their style sheets and PNG and JPEG
-  pictures,
+  working while a page loads), then their style sheets and PNG, JPEG,
+  GIF (its first frame) and SVG pictures,
   and opens `file://` pages and folders too.
   - Its HTML parser follows the main rules of the HTML5 tree builder (implied
     and auto-closed tags, tables, character references, quirks mode) and
@@ -386,6 +386,13 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
     Page Address; on a link it adds Open Link, Open Link in New Window and
     Copy Link Address; on the address bar it offers Cut, Copy and Paste
     (the clipboard is shared with the text editor).
+  - Pictures: GIF (first frame, transparency, interlacing) and SVG, both as
+    `<img>` and as an inline `<svg>` element. The SVG renderer (svg.c) draws
+    shapes, paths with curves and arcs, groups, `use`, text, transforms,
+    `viewBox`, solid colors and linear and radial gradients, strokes with
+    dashes, caps and joins, opacity, and simple `<style>` rules.
+  - Grid containers take `grid-template-columns`, `-rows` and `-areas`,
+    `grid-auto-rows`, `grid-auto-flow: dense`, and `grid-area` names.
   - Links, `GET` and `POST` forms (text fields, check boxes, radio buttons,
     selects, buttons), `<meta refresh>`, fragments (`#name`), redirects, and
     `:visited` colors work. Text is anti-aliased: Liberation Sans, Serif and
@@ -835,7 +842,7 @@ user/
                            Properties (display.c), 3D Gears (gears.c), Task
                            Manager (taskmgr.c), Disk Manager (diskmgr.c), the
                            tray speaker and Volume Control (sound.c), dialogs,
-                           drawing, PNG and JPEG decoding (png.c, jpeg.c, with
+                           drawing, PNG, JPEG, GIF and SVG decoding (png.c, jpeg.c, gif.c, svg.c, with
                            image.c choosing between them), the wallpaper
                            (wallpaper.c), GRUB's environment block
                            (grubenv.c), icons, fonts,
@@ -1091,10 +1098,10 @@ real BigInt, strings count bytes of UTF-8 rather than 16-bit units (so
 indexes into non-ASCII text differ), `Symbol`s are strings, `fetch` cannot
 send request headers or cookies and has no streaming, typed arrays are plain
 arrays, and eval runs in the global scope, so many modern web applications
-still do not run; it shows only PNG and JPEG pictures (GIF
-and SVG show their alternative text). Its layout is an approximation: floats
+still do not run; it shows PNG, JPEG, GIF (only the first frame of an
+animation) and SVG pictures (no clip paths, masks, filters or patterns). Its layout is an approximation: floats
 become inline-blocks, positioned elements stay in the normal flow (those
-hidden off-screen are dropped), grids are blocks, flex rows are lines of
+hidden off-screen are dropped), grids lack named lines and column flow, flex rows are lines of
 inline-blocks, and `calc()` takes its first length. It has no font downloads,
 cookies, cache of pages, or text selection, and characters outside Latin-1
 and common punctuation show as `?`.

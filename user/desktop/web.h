@@ -7,7 +7,7 @@
  * All arithmetic here is integer (desktop code is built without the FPU):
  * CSS numbers are parsed as fixed point with two decimals, lengths are
  * resolved to whole pixels. Only the JavaScript engine (js.h), which
- * needs doubles, is compiled with the FPU.
+ * needs doubles (and svg.c, which draws SVG), is compiled with the FPU.
  */
 #ifndef WEB_H
 #define WEB_H
@@ -188,6 +188,13 @@ struct gridspec {
     struct track t[MAX_TRACKS];
 };
 
+/* grid-template-areas: named rectangles of cells (0-based, end exclusive). */
+#define MAX_AREAS 32
+struct gridareas {
+    int n, nrows, ncols;
+    struct { char name[24]; int r0, c0, r1, c1; } a[MAX_AREAS];
+};
+
 struct custom_prop {            /* a CSS custom property (--name: value) */
     const char *name;
     const char *value;
@@ -230,7 +237,11 @@ struct style {
     struct len flex_basis;
     int order;
     struct len row_gap, col_gap;
-    const struct gridspec *grid_cols;
+    const struct gridspec *grid_cols, *grid_rows, *grid_auto_rows;
+    const struct gridareas *grid_areas;     /* on the container */
+    const char *grid_area;              /* on an item: grid-area: name */
+    int gr_end;                         /* grid-row-end line */
+    uint8_t grid_dense;                 /* grid-auto-flow: dense */
     int gc_start, gc_end, gc_span;      /* grid-column: lines from 1 (negative: from the end), 0 auto */
     int gr_start, gr_span;              /* grid-row */
 };
@@ -243,6 +254,12 @@ void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int 
                  int viewport_w, int viewport_h, int (*visited)(const char *href, void *ctx),
                  void *ctx);
 int css_parse_color(const char *s, int n, uint32_t *out);
+
+/* ---- SVG (svg.c) ---- */
+/* The size an <svg> element asks for (width, height, viewBox; else 300x150). */
+void svg_size(const struct node *svg, int *w, int *h);
+/* Draw it w x h; color is currentColor. NULL if it cannot be. */
+struct image *svg_render(const struct node *svg, int w, int h, uint32_t color);
 
 /* ---- layout and painting (layout.c) ---- */
 /* DK_FRAME: a picture that could not be shown; DK_IFRAME: where an <iframe>'s page goes (browser.c) */
