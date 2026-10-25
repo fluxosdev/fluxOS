@@ -19,6 +19,8 @@
 #define URL_MAX 2048
 /* How the browser names itself: in its requests, and to scripts (navigator.userAgent). */
 #define BROWSER_USER_AGENT "Mozilla/5.0 (fluxOS; i686) FluxBrowser/1.0"
+/* Where what is typed in the address bar that is not an address goes. */
+#define SEARCH_URL "https://html.duckduckgo.com/html/?q="
 
 /* ---- memory: everything a page owns lives in arenas, freed at once ---- */
 struct arena {
@@ -243,7 +245,8 @@ void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int 
 int css_parse_color(const char *s, int n, uint32_t *out);
 
 /* ---- layout and painting (layout.c) ---- */
-enum dkind { DK_FILL, DK_TEXT, DK_IMAGE, DK_DISC, DK_CIRCLE, DK_CONTROL, DK_FRAME };
+/* DK_FRAME: a picture that could not be shown; DK_IFRAME: where an <iframe>'s page goes (browser.c) */
+enum dkind { DK_FILL, DK_TEXT, DK_IMAGE, DK_DISC, DK_CIRCLE, DK_CONTROL, DK_FRAME, DK_IFRAME };
 
 struct ditem {
     uint8_t kind;

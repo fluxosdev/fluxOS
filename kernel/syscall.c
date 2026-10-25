@@ -1031,6 +1031,7 @@ static int sys_reboot(uint32_t cmd, uint32_t b, uint32_t c, uint32_t d, uint32_t
     case REBOOT_POWEROFF:
         kprintf("\nfluxOS: powering off...\n");
         machine_poweroff();
+        return -EIO;                    /* still on: the caller says it is safe to switch off */
     case REBOOT_HALT:
         machine_halt();
     }

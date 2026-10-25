@@ -570,8 +570,9 @@ static void shutdown_command(struct dialog *d, int id)
     case OPT_SHUTDOWN:
         wm_splash("Please wait while your computer shuts down.", RGB(0xFF, 0xFF, 0xFF));
         sync();
-        wm_splash("It's now safe to turn off your computer.", RGB(0xFF, 0x80, 0x00));
         reboot(REBOOT_POWEROFF);
+        /* still here: the machine cannot switch itself off */
+        wm_splash("It's now safe to turn off your computer.", RGB(0xFF, 0x80, 0x00));
         reboot(REBOOT_HALT);
         break;
     case OPT_RESTART:

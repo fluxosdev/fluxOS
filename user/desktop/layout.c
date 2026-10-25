@@ -416,7 +416,8 @@ static int is_block_level(int d)
 
 static int is_replaced(const struct node *n)
 {
-    return n->tag == T_IMG || n->tag == T_INPUT || n->tag == T_SELECT || n->tag == T_TEXTAREA;
+    return n->tag == T_IMG || n->tag == T_INPUT || n->tag == T_SELECT || n->tag == T_TEXTAREA ||
+           n->tag == T_IFRAME;
 }
 
 /* ---- list markers ---- */
@@ -773,6 +774,13 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
         }
         if (h < 0)
             h = fh + 6;
+    } else if (n->tag == T_IFRAME) {    /* its page is drawn by the browser */
+        ctrl = 0;
+        kind = DK_IFRAME;
+        if (w < 0)
+            w = 300;
+        if (h < 0)
+            h = 150;
     } else {                            /* textarea */
         if (w < 0)
             w = 168;
@@ -3210,6 +3218,9 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
             break;
         case DK_FRAME:
             gfx_frame(s, x, y, d->w, d->h, 0xC0C0C0);
+            break;
+        case DK_IFRAME:
+            fill_blend(s, x, y, d->w, d->h, OPAQUE(0xFFFFFF), 0);   /* until its page is drawn over it */
             break;
         case DK_DISC:
         case DK_CIRCLE:

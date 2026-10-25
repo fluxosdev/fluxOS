@@ -127,6 +127,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
         boot_ok("Kernel heap: %u KiB", total / 1024);
     }
 
+    acpi_init();
     rtc_init();
     pit_init(HZ);
     boot_ok("PIT timer at %u Hz, RTC clock read", HZ);

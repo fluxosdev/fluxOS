@@ -127,7 +127,9 @@ uint32_t time_now(void);
 
 /* Power management */
 void machine_reboot(void) __attribute__((noreturn));
-void machine_poweroff(void) __attribute__((noreturn));
+int machine_poweroff(void);             /* returns only if it failed */
+void acpi_init(void);                   /* acpi.c: find the tables, at boot */
+void acpi_poweroff(void);               /* returns only if it failed */
 void machine_halt(void) __attribute__((noreturn));
 
 #endif

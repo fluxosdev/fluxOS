@@ -146,15 +146,21 @@ void machine_reboot(void)
         hlt();
 }
 
-void machine_poweroff(void)
+/* Switch off through ACPI; returns, interrupts as they were, if the machine is still on. */
+int machine_poweroff(void)
 {
+    uint32_t flags = read_eflags();
     cli();
+    acpi_poweroff();
+    /* Emulators whose tables we could not use answer at fixed ports. */
     outw(0x604, 0x2000);                /* QEMU (q35/piix4 ACPI) */
     outw(0xB004, 0x2000);               /* Bochs, older QEMU */
     outw(0x4004, 0x3400);               /* VirtualBox */
-    kprintf("\nACPI power-off failed. It is now safe to turn off your computer.\n");
-    for (;;)
-        hlt();
+    udelay(100000);
+    kprintf("\nACPI power-off failed.\n");
+    if (flags & 0x200)
+        sti();
+    return -1;
 }
 
 void machine_halt(void)

@@ -180,7 +180,7 @@ static const char ua_css[] =
     " h4, h5, h6, hgroup, nav, section, dl, dt, dd, ol, ul, menu, dir, fieldset, details,"
     " summary, frameset, frame, noframes, optgroup { display: block }"
     "head, script, style, link, meta, title, base, template, param, area, map, source, track,"
-    " datalist, iframe, object, embed, video, audio, canvas, svg, col, colgroup, option,"
+    " datalist, object, embed, video, audio, canvas, svg, col, colgroup, option,"
     " input[type=hidden], [hidden], noembed, noscript, dialog:not([open]) { display: none }"
     "li { display: list-item }"
     "table { display: table; border-spacing: 2px; text-indent: 0 }"
@@ -232,7 +232,8 @@ static const char ua_css[] =
     "details > :not(summary) { display: none }"
     "details[open] > :not(summary) { display: block }"
     "q::before { content: open-quote } q::after { content: close-quote }"
-    "img { vertical-align: baseline }";
+    "img { vertical-align: baseline }"
+    "iframe { border: 2px inset #808080 }";
 
 /* In quirks mode tables do not inherit these (the HTML standard's rendering section). */
 static const char ua_quirks_css[] =
@@ -3005,6 +3006,12 @@ static void hints(const struct node *n, char *buf, int size)
         }
         break;
     }
+    case T_IFRAME:
+        hint_len(buf, size, "width", node_attr(n, "width"));
+        hint_len(buf, size, "height", node_attr(n, "height"));
+        if ((v = node_attr(n, "frameborder")) && (!strcmp(v, "0") || !strcasecmp(v, "no")))
+            hint_add(buf, size, "border: none;");
+        break;
     case T_IMG:
         hint_len(buf, size, "width", node_attr(n, "width"));
         hint_len(buf, size, "height", node_attr(n, "height"));

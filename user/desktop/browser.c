@@ -10,6 +10,12 @@
  * connection but does not verify the server's certificate; the status bar
  * says so.
  *
+ * An <iframe> is a browser of its own with no window: it loads its page,
+ * styles, pictures and scripts like a window does, and its parent draws
+ * it in the iframe's box and passes it the mouse and keys aimed there.
+ * Frames are made, sized and dropped as their parent lays out, but loaded
+ * and freed from the main loop, never in the middle of a paint.
+ *
  * Keys: Alt+Left/Backspace back, Alt+Right forward, F5 reload, Esc stop,
  * Ctrl+L or F6 the address bar, arrows/PgUp/PgDn/Space/Home/End scroll,
  * Tab moves between form fields, Enter in a field submits its form.
@@ -50,6 +56,8 @@
 #define DOWNLOADS_FILE "/home/flux/.browser_downloads"
 #define DOWNLOADS_DIR  "/home/flux/Downloads"
 #define LOG_MAX     300             /* entries kept of the history and download logs */
+#define MAX_FRAMES  12              /* iframes a page may have */
+#define FRAME_DEPTH 3               /* iframes inside iframes, at most */
 
 /* PS/2 scancodes of the letters used for shortcuts */
 #define SC_L 0x26
@@ -168,6 +176,20 @@ struct browser {
     /* what scripts asked for, done once they have returned */
     char js_nav[URL_MAX];
     int js_nav_replace, js_history, js_reload;
+
+    /* frames: an <iframe> is a browser too, with no window (win is NULL) */
+    struct browser *parent;
+    struct node *frame_el;              /* its <iframe>, in the parent's document */
+    int frame_w, frame_h;               /* the iframe's box */
+    int frame_depth;
+    int frame_vbar;                     /* its page is taller than it: a scroll bar (until the next page) */
+    int frame_dead;                     /* dropped: the main loop frees it */
+    char frame_src[URL_MAX];            /* what the iframe asked for (src, or about:srcdoc) */
+    char frame_nav[URL_MAX];            /* to load when the main loop next runs */
+    struct browser *frames, *next_frame;
+    struct browser *mouse_frame;        /* a press went into this frame: it has the mouse */
+    struct browser *key_frame;          /* a window's: the frame that has the keys */
+    int mouse_x, mouse_y;               /* a window's: the pointer, for the wheel */
 };
 
 static struct browser *browsers;
@@ -201,28 +223,62 @@ static struct rect addr_rect(struct browser *b)
     return mkrect(lx, TOOLBAR_H + 2, b->win->content.w - 52 - lx, ADDR_H - 4);
 }
 
+static int is_frame(const struct browser *b)
+{
+    return !b->win;
+}
+
+/* scrolling="no" frames have no scroll bars, and the wheel passes them by */
+static int frame_scrolls(const struct browser *b)
+{
+    const char *v = b->frame_el ? node_attr(b->frame_el, "scrolling") : NULL;
+    return !v || strcasecmp(v, "no");
+}
+
+static struct browser *top_of(struct browser *b)
+{
+    while (b->parent)
+        b = b->parent;
+    return b;
+}
+
+/* The page's area with its frame: the window's sunken box, or a frame's whole iframe. */
 static struct rect frame_rect(struct browser *b)
 {
+    if (is_frame(b))
+        return mkrect(0, 0, b->frame_w, b->frame_h);
     int y = TOOLBAR_H + ADDR_H;
     return mkrect(2, y, b->win->content.w - 4, b->win->content.h - y - STATUS_H - 2);
+}
+
+static int has_vbar(struct browser *b)
+{
+    return !is_frame(b) || b->frame_vbar;
 }
 
 static int has_hbar(struct browser *b)
 {
     struct rect f = frame_rect(b);
+    if (is_frame(b))
+        return frame_scrolls(b) && b->lo.width > f.w - (b->frame_vbar ? SBAR_W : 0);
     return b->lo.width > f.w - 4 - SBAR_W;
 }
 
 static struct rect view_rect(struct browser *b)
 {
     struct rect f = frame_rect(b);
+    if (is_frame(b)) {
+        int w = f.w - (has_vbar(b) ? SBAR_W : 0), h = f.h - (has_hbar(b) ? SBAR_W : 0);
+        return mkrect(0, 0, w > 0 ? w : 0, h > 0 ? h : 0);
+    }
     return mkrect(f.x + 2, f.y + 2, f.w - 4 - SBAR_W, f.h - 4 - (has_hbar(b) ? SBAR_W : 0));
 }
 
 static struct sbar vbar(struct browser *b)
 {
     struct rect v = view_rect(b), f = frame_rect(b);
-    return (struct sbar){ mkrect(v.x + v.w, v.y, SBAR_W, f.h - 4 - (has_hbar(b) ? SBAR_W : 0)), 1,
+    int h = is_frame(b) ? v.h : f.h - 4 - (has_hbar(b) ? SBAR_W : 0);
+    return (struct sbar){ mkrect(v.x + v.w, v.y, SBAR_W, h), 1,
                           b->scroll_y, v.h, b->lo.height > v.h ? b->lo.height : v.h };
 }
 
@@ -310,7 +366,8 @@ static void update_title(struct browser *b, const char *title)
         snprintf(t, sizeof(t), "%.60s - Web Browser", title);
     else
         snprintf(t, sizeof(t), "Web Browser");
-    wm_set_title(b->win, t);
+    if (b->win)                         /* a frame's title is nobody's */
+        wm_set_title(b->win, t);
 }
 
 /* ---- the image cache ---- */
@@ -732,10 +789,143 @@ static void queue_resource(struct browser *b, int kind, const char *url, int slo
     b->total_res++;
 }
 
+/* ---- frames ---- */
+
+/* Take a frame (and its frames) out of the page. It may be running code
+ * further up the stack, so it is only stopped here and marked; the main
+ * loop frees it (sweep_frames). */
+static void drop_frame(struct browser *f)
+{
+    while (f->frames)
+        drop_frame(f->frames);
+    struct browser *p = f->parent;
+    for (struct browser *a = p; a; a = a->parent) {
+        if (a->mouse_frame == f)
+            a->mouse_frame = NULL;
+        if (a->key_frame == f)
+            a->key_frame = NULL;
+    }
+    if (p)
+        for (struct browser **pp = &p->frames; *pp; pp = &(*pp)->next_frame)
+            if (*pp == f) {
+                *pp = f->next_frame;
+                break;
+            }
+    stop_all(f);
+    f->frame_dead = 1;
+    f->parent = NULL;
+    f->frame_el = NULL;
+    f->next_frame = NULL;
+}
+
+static struct browser *new_frame(struct browser *parent, struct node *el)
+{
+    struct browser *f = calloc(1, sizeof(*f));
+    if (!f)
+        return NULL;
+    f->fetch.out = f->fetch.err = -1;
+    f->parent = parent;
+    f->frame_el = el;
+    f->frame_depth = parent->frame_depth + 1;
+    f->next_frame = parent->frames;
+    parent->frames = f;
+    f->next = browsers;
+    browsers = f;
+    set_status(f, "Ready");
+    return f;
+}
+
+/* Where the iframe's box is in its parent's layout. */
+static const struct ditem *frame_item(struct browser *b, const struct browser *f)
+{
+    for (int i = 0; i < b->lo.nitems; i++)
+        if (b->lo.items[i].kind == DK_IFRAME && b->lo.items[i].node == f->frame_el)
+            return &b->lo.items[i];
+    return NULL;
+}
+
+/* The frame's box in its parent's coordinates; 0 if it has none. */
+static int frame_box(struct browser *b, const struct browser *f, struct rect *r)
+{
+    const struct ditem *d = frame_item(b, f);
+    if (!d)
+        return 0;
+    struct rect v = view_rect(b);
+    *r = mkrect(v.x + d->x - b->scroll_x, v.y + d->y - b->scroll_y, d->w, d->h);
+    return 1;
+}
+
+/* The frame whose box is at (x, y), in b's page. */
+static struct browser *frame_at(struct browser *b, int x, int y, struct rect *r)
+{
+    if (!rect_contains(view_rect(b), x, y))
+        return NULL;
+    for (struct browser *f = b->frames; f; f = f->next_frame)
+        if (frame_box(b, f, r) && rect_contains(*r, x, y))
+            return f;
+    return NULL;
+}
+
+/* What an iframe asks to show: its srcdoc, its src, or a blank page. */
+static void frame_wanted(struct browser *b, struct node *el, char *out, int size)
+{
+    const char *src = node_attr(el, "src");
+    while (src && *src == ' ')
+        src++;
+    if (node_attr(el, "srcdoc"))
+        snprintf(out, (size_t)size, "about:srcdoc");
+    else if (src && *src && strncasecmp(src, "javascript:", 11))
+        url_resolve(b->base, src, out, size);
+    else
+        snprintf(out, (size_t)size, "about:blank");
+}
+
+/* After a layout: a frame for every iframe laid out, the size of its box,
+ * loading what its src says; frames whose iframe is gone are dropped. */
+static void sync_frames(struct browser *b)
+{
+    for (struct browser *f = b->frames, *next; f; f = next) {
+        next = f->next_frame;
+        if (!frame_item(b, f))
+            drop_frame(f);
+    }
+    int nframes = 0;
+    for (struct browser *f = b->frames; f; f = f->next_frame)
+        nframes++;
+    for (int i = 0; i < b->lo.nitems; i++) {
+        const struct ditem *d = &b->lo.items[i];
+        if (d->kind != DK_IFRAME)
+            continue;
+        struct browser *f = b->frames;
+        while (f && f->frame_el != d->node)
+            f = f->next_frame;
+        if (!f) {
+            if (b->frame_depth >= FRAME_DEPTH || nframes >= MAX_FRAMES || !(f = new_frame(b, d->node)))
+                continue;
+            nframes++;
+        }
+        if (f->frame_w != d->w || f->frame_h != d->h) {
+            f->frame_w = d->w;
+            f->frame_h = d->h;
+            f->need_layout = 1;
+        }
+        char want[URL_MAX];
+        frame_wanted(b, d->node, want, sizeof(want));
+        if (strcmp(want, f->frame_src)) {
+            snprintf(f->frame_src, sizeof(f->frame_src), "%s", want);
+            snprintf(f->frame_nav, sizeof(f->frame_nav), "%s", want);
+        }
+    }
+}
+
 /* ---- documents ---- */
 
 static void free_page(struct browser *b)
 {
+    b->frame_vbar = 0;
+    while (b->frames)
+        drop_frame(b->frames);
+    b->mouse_frame = b->key_frame = NULL;
     for (struct node *n = b->root; n; n = node_next(n, b->root)) {
         free(n->value);
         n->value = NULL;
@@ -778,7 +968,10 @@ static void relayout(struct browser *b)
     layout_document(&b->larena, &b->lo, b->root, v.w, v.h);
     b->laid_out_w = v.w;
     b->need_layout = 0;
+    if (is_frame(b) && frame_scrolls(b) && b->lo.height > b->frame_h)
+        b->frame_vbar = 1;              /* (narrower now: laid out again when next painted) */
     clamp_scroll(b);
+    sync_frames(b);
 }
 
 static void scroll_to_fragment(struct browser *b, const char *frag)
@@ -1236,7 +1429,8 @@ static void load_document(struct browser *b, const char *text, int len, const ch
         }
     }
     update_title(b, title);
-    history_add(url, title);
+    if (!is_frame(b))
+        history_add(url, title);
     b->total_res = b->done_res = 0;
     start_scripts(b, url);              /* external scripts are fetched first */
     for (struct node *n = b->root; n; n = node_next(n, b->root)) {
@@ -1969,20 +2163,54 @@ static void reload(struct browser *b)
     navigate(b, u, NULL, NAV_HISTORY);
 }
 
-/* What was typed in the address bar, as a URL. */
+/* What was typed in the address bar, as a URL. Words with spaces, or
+ * with no dot (other than localhost), are a search. */
 static void normalize(const char *in, char *out, int size)
 {
     while (*in == ' ')
         in++;
+    int spaces = strchr(in, ' ') != NULL, dotted = strchr(in, '.') != NULL || strchr(in, ':') != NULL;
     if (strstr(in, "://") || !strncasecmp(in, "about:", 6) || !strncasecmp(in, "file:", 5))
         snprintf(out, (size_t)size, "%s", in);
     else if (in[0] == '/')
         snprintf(out, (size_t)size, "file://%s", in);
-    else
+    else if (in[0] && (spaces || (!dotted && strcasecmp(in, "localhost")))) {
+        char q[URL_MAX];
+        url_encode_form(q, sizeof(q), in);
+        snprintf(out, (size_t)size, "%s%s", SEARCH_URL, q);
+    } else
         snprintf(out, (size_t)size, "http://%s", in);
     int n = (int)strlen(out);
     while (n > 0 && out[n - 1] == ' ')
         out[--n] = 0;
+}
+
+/* A frame named name, here or in frames further in. */
+static struct browser *named_frame(struct browser *b, const char *name)
+{
+    for (struct browser *f = b->frames; f; f = f->next_frame) {
+        const char *n = f->frame_el ? node_attr(f->frame_el, "name") : NULL;
+        if (n && !strcmp(n, name))
+            return f;
+        struct browser *in = named_frame(f, name);
+        if (in)
+            return in;
+    }
+    return NULL;
+}
+
+/* Where a link or form with this target opens: here, the parent, the
+ * window (_top, and _blank: there are no new windows), or a named frame. */
+static struct browser *target_of(struct browser *b, const char *target)
+{
+    if (!target || !*target || !strcasecmp(target, "_self"))
+        return b;
+    if (!strcasecmp(target, "_parent"))
+        return b->parent ? b->parent : b;
+    if (!strcasecmp(target, "_top") || !strcasecmp(target, "_blank"))
+        return top_of(b);
+    struct browser *f = named_frame(top_of(b), target);
+    return f ? f : top_of(b);
 }
 
 static void follow_link(struct browser *b, struct node *a)
@@ -2003,7 +2231,7 @@ static void follow_link(struct browser *b, struct node *a)
     }
     char abs[URL_MAX];
     url_resolve(b->base, href, abs, sizeof(abs));
-    navigate(b, abs, NULL, NAV_NEW);
+    navigate(target_of(b, node_attr(a, "target")), abs, NULL, NAV_NEW);
 }
 
 /* ---- forms ---- */
@@ -2090,8 +2318,9 @@ static void submit(struct browser *b, struct node *form, struct node *submitter)
     char target[URL_MAX];
     url_resolve(b->base, action && *action ? action : b->url, target, sizeof(target));
     url_strip_fragment(target);
+    struct browser *to = target_of(b, node_attr(form, "target"));
     if (method && !strcasecmp(method, "post")) {
-        navigate(b, target, q, NAV_NEW);
+        navigate(to, target, q, NAV_NEW);
         return;
     }
     char *qm = strchr(target, '?');
@@ -2099,7 +2328,7 @@ static void submit(struct browser *b, struct node *form, struct node *submitter)
         *qm = 0;
     size_t l = strlen(target);
     snprintf(target + l, sizeof(target) - l, "?%s", q);
-    navigate(b, target, NULL, NAV_NEW);
+    navigate(to, target, NULL, NAV_NEW);
 }
 
 static void reset_form(struct node *form)
@@ -2366,33 +2595,60 @@ static void draw_status(struct browser *b, struct surface *s)
     }
 }
 
-static void paint(struct browser *b)
+/* The keys go to this page: its window is focused, and it is the frame chosen (or no frame is). */
+static int has_keys(struct browser *b)
 {
-    struct surface *s = &b->win->content;
-    gfx_noclip(s);
+    struct browser *t = top_of(b);
+    return t->focused && !t->addr_focus && (t->key_frame ? t->key_frame == b : b == t);
+}
+
+/* A page, its frames in their boxes, and its scroll bars, with b's
+ * coordinates at (ox, oy) in s. */
+static void paint_page(struct browser *b, struct surface *s, int ox, int oy)
+{
     if (b->root && b->laid_out_w != view_rect(b).w)
         relayout(b);
-    draw_toolbar(b, s);
-    struct rect f = frame_rect(b);
-    gfx_bevel(s, f, BEVEL_SUNKEN);
-
     struct rect v = view_rect(b);
+    v.x += ox;
+    v.y += oy;
     struct rect saved = s->clip;
     s->clip = rect_intersect(saved, v);
     if (b->root)
-        paint_document(&b->lo, s, v.x, v.y, b->scroll_x, b->scroll_y, b->focus,
-                       caret_on && b->focused && !b->addr_focus);
+        paint_document(&b->lo, s, v.x, v.y, b->scroll_x, b->scroll_y, b->focus, caret_on && has_keys(b));
     else
         gfx_fill(s, v.x, v.y, v.w, v.h, C_WHITE);
+    struct rect page = s->clip, box;
+    for (struct browser *f = b->frames; f; f = f->next_frame) {
+        if (!frame_box(b, f, &box))
+            continue;
+        s->clip = rect_intersect(page, mkrect(box.x + ox, box.y + oy, box.w, box.h));
+        if (!rect_empty(s->clip))
+            paint_page(f, s, box.x + ox, box.y + oy);
+    }
     s->clip = saved;
 
-    struct sbar vb = vbar(b);
-    sbar_draw(s, &vb, b->hold == H_VBAR ? b->sbar_pressed : SBAR_NONE);
+    struct sbar vb = vbar(b), hb = hbar(b);
+    vb.r.x += ox, vb.r.y += oy, hb.r.x += ox, hb.r.y += oy;
+    if (has_vbar(b))
+        sbar_draw(s, &vb, b->hold == H_VBAR ? b->sbar_pressed : SBAR_NONE);
     if (has_hbar(b)) {
-        struct sbar hb = hbar(b);
         sbar_draw(s, &hb, b->hold == H_HBAR ? b->sbar_pressed : SBAR_NONE);
-        gfx_fill(s, vb.r.x, hb.r.y, SBAR_W, SBAR_W, C_FACE);
+        if (has_vbar(b))
+            gfx_fill(s, vb.r.x, hb.r.y, SBAR_W, SBAR_W, C_FACE);
     }
+}
+
+/* Paint the window a page is in (a frame's is its outermost parent's). */
+static void paint(struct browser *b)
+{
+    b = top_of(b);
+    if (!b->win)
+        return;                         /* a dropped frame */
+    struct surface *s = &b->win->content;
+    gfx_noclip(s);
+    draw_toolbar(b, s);
+    gfx_bevel(s, frame_rect(b), BEVEL_SUNKEN);
+    paint_page(b, s, 0, 0);
     draw_status(b, s);
     wm_damage_client(b->win, mkrect(0, 0, s->w, s->h));
 }
@@ -2415,6 +2671,8 @@ static void press(struct browser *b, int i)
     case B_FORWARD: go_history(b, 1); break;
     case B_STOP:
         stop_all(b);
+        for (struct browser *f = b->frames; f; f = f->next_frame)
+            stop_all(f);
         if (b->need_style || b->need_layout)
             relayout(b);
         set_status(b, "Stopped");
@@ -2520,10 +2778,13 @@ static int dom_key(const struct input_event *ev, char *key, int size)
     return c >= 'a' && c <= 'z' ? c - 32 : (unsigned char)c;
 }
 
+/* Keys go to the window (t) for its own shortcuts and the address bar, and
+ * to the page with the keys (b: a frame clicked in, or the window's) for the rest. */
 static void br_key(struct window *w, const struct input_event *ev)
 {
-    struct browser *b = w->priv;
-    if (b->js && b->root && !b->addr_focus && !(ev->mods & KMOD_ALT)) {
+    struct browser *t = w->priv;
+    struct browser *b = t->key_frame && !t->addr_focus ? t->key_frame : t;
+    if (b->js && b->root && !t->addr_focus && !(ev->mods & KMOD_ALT)) {
         char key[16];
         int kc = dom_key(ev, key, sizeof(key));
         int pressed = ev->flags & IEV_PRESSED;
@@ -2541,40 +2802,40 @@ static void br_key(struct window *w, const struct input_event *ev)
         return;
     int ctrl = ev->mods & KMOD_CTRL, alt = ev->mods & KMOD_ALT, shift = ev->mods & KMOD_SHIFT;
     if ((ctrl && ev->code == SC_L) || ev->code == KEY_F6) {
-        b->addr_focus = 1;
-        b->addr_all = 1;
-        b->addr_cur = b->addr_len;
-        b->focus = NULL;
-        paint(b);
+        t->addr_focus = 1;
+        t->addr_all = 1;
+        t->addr_cur = t->addr_len;
+        t->focus = NULL;
+        paint(t);
         return;
     }
     if (ctrl && ev->code == SC_H) {
-        navigate(b, "about:history", NULL, NAV_NEW);
+        navigate(t, "about:history", NULL, NAV_NEW);
         return;
     }
     if (ctrl && ev->code == SC_J) {
-        navigate(b, "about:downloads", NULL, NAV_NEW);
+        navigate(t, "about:downloads", NULL, NAV_NEW);
         return;
     }
     if (ev->code == KEY_F5 || (ctrl && ev->code == SC_R)) {
-        reload(b);
+        reload(t);
         return;
     }
     if (alt && ev->code == KEY_LEFT) {
-        go_history(b, -1);
+        go_history(t, -1);
         return;
     }
     if (alt && ev->code == KEY_RIGHT) {
-        go_history(b, 1);
+        go_history(t, 1);
         return;
     }
-    if (b->addr_focus) {
-        addr_key(b, ev);
+    if (t->addr_focus) {
+        addr_key(t, ev);
         return;
     }
     if (ev->code == KEY_ESC) {
-        if (b->loading || b->fetch.active)
-            press(b, B_STOP);
+        if (t->loading || t->fetch.active)
+            press(t, B_STOP);
         else if (b->focus) {
             b->focus = NULL;
             paint(b);
@@ -2617,7 +2878,7 @@ static void br_key(struct window *w, const struct input_event *ev)
     case KEY_SPACE: scroll_by(b, 0, shift ? -(v.h - LINE_STEP) : v.h - LINE_STEP); break;
     case KEY_HOME: b->scroll_y = 0; clamp_scroll(b); break;
     case KEY_END: b->scroll_y = b->lo.height; clamp_scroll(b); break;
-    case KEY_BACKSPACE: go_history(b, shift ? 1 : -1); return;
+    case KEY_BACKSPACE: go_history(t, shift ? 1 : -1); return;
     default: return;
     }
     paint(b);
@@ -2648,15 +2909,43 @@ static void update_hover(struct browser *b, int x, int y)
     }
 }
 
-static void br_mouse(struct window *w, int x, int y, int buttons, int changed)
+/* The mouse at (x, y) in b's coordinates: the window's, or a frame's own. */
+static void mouse(struct browser *b, int x, int y, int buttons, int changed)
 {
-    struct browser *b = w->priv;
     int left = buttons & MOUSE_LEFT;
     int pressed = (changed & MOUSE_LEFT) && left, released = (changed & MOUSE_LEFT) && !left;
-    struct rect v = view_rect(b);
+    struct rect v = view_rect(b), box;
     int px = x - v.x + b->scroll_x, py = y - v.y + b->scroll_y;
 
-    if (pressed) {
+    /* A press that went into a frame: it has the mouse until the button comes up. */
+    if (b->mouse_frame) {
+        struct browser *f = b->mouse_frame;
+        if (released)
+            b->mouse_frame = NULL;
+        if (frame_box(b, f, &box))
+            mouse(f, x - box.x, y - box.y, buttons, changed);
+        return;
+    }
+    if (b->hold == H_NONE) {
+        struct browser *f = frame_at(b, x, y, &box);
+        if (f) {
+            if (pressed)
+                b->mouse_frame = f;
+            if (b->hover) {
+                b->hover = NULL;
+                paint(b);
+            }
+            mouse(f, x - box.x, y - box.y, buttons, changed);
+            return;
+        }
+        for (f = b->frames; f; f = f->next_frame)
+            if (f->hover) {             /* the pointer has left it */
+                f->hover = NULL;
+                paint(b);
+            }
+    }
+
+    if (pressed && !is_frame(b)) {
         for (int i = 0; i < NBUTTONS; i++) {
             if (rect_contains(button_rect(b, i), x, y) && button_enabled(b, i)) {
                 b->hold = H_BUTTON;
@@ -2688,8 +2977,11 @@ static void br_mouse(struct window *w, int x, int y, int buttons, int changed)
             paint(b);
             return;
         }
+    }
+    if (pressed) {
         struct sbar vb = vbar(b), hb = hbar(b);
-        enum sbar_part pv = sbar_hit(&vb, x, y), ph = has_hbar(b) ? sbar_hit(&hb, x, y) : SBAR_NONE;
+        enum sbar_part pv = has_vbar(b) ? sbar_hit(&vb, x, y) : SBAR_NONE;
+        enum sbar_part ph = has_hbar(b) ? sbar_hit(&hb, x, y) : SBAR_NONE;
         if (pv != SBAR_NONE || ph != SBAR_NONE) {
             struct sbar *sb = pv != SBAR_NONE ? &vb : &hb;
             enum sbar_part part = pv != SBAR_NONE ? pv : ph;
@@ -2705,9 +2997,11 @@ static void br_mouse(struct window *w, int x, int y, int buttons, int changed)
             return;
         }
         if (rect_contains(v, x, y) && b->root) {
+            struct browser *t = top_of(b);
             b->hold = H_PAGE;
-            int was_addr = b->addr_focus;
-            b->addr_focus = 0;
+            t->key_frame = is_frame(b) ? b : NULL;     /* the keys go where the click was */
+            int was_addr = t->addr_focus;
+            t->addr_focus = 0;
             const struct hotspot *h = layout_hit(b->lo.controls, b->lo.ncontrols, px, py);
             b->press_ctrl = h ? h->node : NULL;
             h = layout_hit(b->lo.links, b->lo.nlinks, px, py);
@@ -2716,7 +3010,7 @@ static void br_mouse(struct window *w, int x, int y, int buttons, int changed)
                 b->focus = NULL;
                 paint(b);
             } else if (was_addr) {
-                set_addr(b, b->url);
+                set_addr(t, t->url);
                 paint(b);
             }
         }
@@ -2771,11 +3065,36 @@ static void br_mouse(struct window *w, int x, int y, int buttons, int changed)
     }
 }
 
+static void br_mouse(struct window *w, int x, int y, int buttons, int changed)
+{
+    struct browser *b = w->priv;
+    b->mouse_x = x;
+    b->mouse_y = y;
+    mouse(b, x, y, buttons, changed);
+}
+
+/* The wheel scrolls the frame under the pointer, unless it cannot (or is at
+ * its end), and then the page around it; 1 if something scrolled. */
+static int wheel(struct browser *b, int x, int y, int delta)
+{
+    struct rect box;
+    struct browser *f = frame_at(b, x, y, &box);
+    if (f && wheel(f, x - box.x, y - box.y, delta))
+        return 1;
+    if (is_frame(b) && (!frame_scrolls(b) || b->lo.height <= view_rect(b).h))
+        return 0;
+    int before = b->scroll_y;
+    scroll_by(b, 0, -delta * 3 * LINE_STEP / 2);
+    if (is_frame(b) && b->scroll_y == before)
+        return 0;
+    paint(b);
+    return 1;
+}
+
 static void br_wheel(struct window *w, int delta)
 {
     struct browser *b = w->priv;
-    scroll_by(b, 0, -delta * 3 * LINE_STEP / 2);
-    paint(b);
+    wheel(b, b->mouse_x, b->mouse_y, delta);
 }
 
 static void br_resize(struct window *w)
@@ -2799,21 +3118,40 @@ static void br_close(struct window *w)
     wm_destroy(w);
 }
 
-static void br_destroy(struct window *w)
+static void destroy_browser(struct browser *b)
 {
-    struct browser *b = w->priv;
     stop_all(b);
-    free_page(b);
+    free_page(b);                       /* (its frames are dropped, to be freed by sweep_frames) */
     cache_clear(b);
     for (int i = 0; i < b->nhist; i++)
         free(b->hist[i].url);
+    free(b);
+}
+
+static void br_destroy(struct window *w)
+{
+    struct browser *b = w->priv;
     for (struct browser **pp = &browsers; *pp; pp = &(*pp)->next) {
         if (*pp == b) {
             *pp = b->next;
             break;
         }
     }
-    free(b);
+    destroy_browser(b);
+}
+
+/* Free the frames that have been dropped. Only from the main loop: nothing of theirs is on the stack. */
+static void sweep_frames(void)
+{
+    for (struct browser **pp = &browsers; *pp;) {
+        struct browser *b = *pp;
+        if (b->frame_dead) {
+            *pp = b->next;
+            destroy_browser(b);
+        } else {
+            pp = &b->next;
+        }
+    }
 }
 
 static const struct window_ops br_ops = {
@@ -2829,15 +3167,35 @@ static const struct window_ops br_ops = {
 void browser_blink(void)
 {
     caret_on = !caret_on;
-    for (struct browser *b = browsers; b; b = b->next)
-        if (b->focused && (b->addr_focus || is_text_field(b->focus)))
+    for (struct browser *b = browsers; b; b = b->next) {
+        struct browser *k = b->key_frame ? b->key_frame : b;
+        if (b->win && b->focused && (b->addr_focus || is_text_field(k->focus)))
             paint(b);
+    }
 }
 
 /* Every pass of the desktop's loop: timers, and what scripts asked for. */
 void browser_poll(void)
 {
+    sweep_frames();
     for (struct browser *b = browsers; b; b = b->next) {
+        if (b->frame_dead)
+            continue;
+        if (b->frame_nav[0]) {          /* a frame's iframe asked for a page */
+            char u[URL_MAX];
+            snprintf(u, sizeof(u), "%s", b->frame_nav);
+            b->frame_nav[0] = 0;
+            if (!strcmp(u, "about:srcdoc")) {
+                const char *doc = b->frame_el ? node_attr(b->frame_el, "srcdoc") : NULL;
+                stop_all(b);
+                load_document(b, doc ? doc : "", doc ? (int)strlen(doc) : 0, u, "utf-8");
+                done_status(b);
+                paint(b);
+            } else {
+                navigate(b, u, NULL, NAV_REPLACE);
+            }
+            return;                     /* the list may have changed */
+        }
         if (b->js)
             jsdom_run_timers(b->js);
         if (b->js_nav[0]) {
@@ -2866,7 +3224,7 @@ int browser_timeout(void)
 {
     int best = -1;
     for (struct browser *b = browsers; b; b = b->next) {
-        if (b->js_nav[0] || b->js_history || b->js_reload)
+        if (b->frame_dead || b->frame_nav[0] || b->js_nav[0] || b->js_history || b->js_reload)
             return 0;
         int t = jsdom_next_timer(b->js);
         if (t >= 0 && (best < 0 || t < best))
@@ -2877,8 +3235,9 @@ int browser_timeout(void)
 
 void browser_tick(void)
 {
+    sweep_frames();
     for (struct browser *b = browsers; b; b = b->next) {
-        if (b->refresh_url[0] && !b->loading && !b->fetch.active &&
+        if (b->refresh_url[0] && !b->frame_dead && !b->loading && !b->fetch.active &&
             (int)(now_ms() - b->refresh_at) >= 0) {
             char u[URL_MAX];
             snprintf(u, sizeof(u), "%s", b->refresh_url);
