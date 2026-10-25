@@ -9,11 +9,11 @@
 > never connect it to a network you do not trust or keep anything important
 > on its disks.
 >
-> **It was built entirely with Claude.** Every line of fluxOS, from the
+> **It was built with AI assistance from Claude and ChatGPT Codex.** Every line of fluxOS, from the
 > bootloader glue and kernel to the TCP/IP stack, the desktop and the web
-> browser, was written by [Claude](https://claude.ai), Anthropic's AI model,
-> working through [Claude Code](https://claude.com/claude-code) from
-> instructions given in conversation. No code was written by hand. It has
+> browser, was written with [Claude](https://claude.ai), Anthropic's AI model,
+> working through [Claude Code](https://claude.com/claude-code), and ChatGPT
+> Codex from instructions given in conversation. No code was written by hand. It has
 > been tested by running it in QEMU, not reviewed or audited by people, so
 > read it with that in mind.
 
