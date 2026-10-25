@@ -120,6 +120,8 @@ struct attr_sel {
     uint8_t nocase;
 };
 
+struct selector;
+
 struct compound {
     int tag;                    /* -1: any */
     const char *tagname;        /* for elements we have no tag id for */
@@ -130,9 +132,9 @@ struct compound {
     int nattrs;
     uint32_t pseudo;
     int nth_a, nth_b, has_nth, nth_of_type;
-    struct compound *not_list;  /* :not(a, b): matches none of them */
+    struct selector *not_list;  /* :not(a, b): matches none of them */
     int nnot;
-    struct compound *is_list;   /* :is(a, b) / :where(): matches one of them */
+    struct selector *is_list;   /* :is(a, b) / :where(): matches one of them */
     int nis;
     char comb;                  /* how it relates to the compound before it */
     uint8_t pe;                 /* 1 ::before, 2 ::after */
@@ -374,9 +376,6 @@ static const char *read_ident(struct arena *a, const char **p, const char *end, 
 
 /* ---- selector parsing ---- */
 
-static int parse_compound_list(struct arena *a, const char *s, const char *end,
-                               struct compound **out, int *nout);
-
 static int parse_nth(const char *s, const char *end, int *ra, int *rb)
 {
     char buf[64];
@@ -409,6 +408,9 @@ static int parse_nth(const char *s, const char *end, int *ra, int *rb)
     *rb = nn[1] ? atoi(nn + 1) : 0;
     return 0;
 }
+
+static int parse_compound_list(struct arena *a, const char *s, const char *end,
+                               struct selector **out, int *nout);
 
 /* Parse one compound selector; returns its end, or NULL if it is invalid. */
 static const char *parse_compound(struct arena *a, const char *s, const char *end,
@@ -573,36 +575,41 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
     return s;
 }
 
-/* "a, b.c" inside :not() or :is(): compound selectors only. */
+static int parse_selector(struct arena *a, const char *s, const char *end, struct selector *sel);
+
+/* "a, b > c" inside :not() or :is(): a list of full selectors. */
 static int parse_compound_list(struct arena *a, const char *s, const char *end,
-                               struct compound **out, int *nout)
+                               struct selector **out, int *nout)
 {
-    struct compound list[16];
+    struct selector list[16];
     int n = 0;
     while (s < end) {
-        while (s < end && (isspace((unsigned char)*s) || *s == ','))
-            s++;
-        if (s >= end)
-            break;
-        uint32_t spec = 0;
-        memset(&list[n], 0, sizeof(list[n]));
-        const char *e = parse_compound(a, s, end, &list[n], &spec);
-        if (!e)
-            return -1;
-        while (e < end && isspace((unsigned char)*e))
-            e++;
-        if (e < end && *e != ',')
-            return -1;                  /* combinators inside: not supported */
-        if (n < 15)
-            n++;
-        s = e;
+        const char *e = s;
+        int depth = 0;
+        for (; e < end && (depth || *e != ','); e++) {
+            if (*e == '(' || *e == '[')
+                depth++;
+            else if ((*e == ')' || *e == ']') && depth)
+                depth--;
+        }
+        const char *t = s;
+        while (t < e && isspace((unsigned char)*t))
+            t++;
+        if (t < e) {
+            memset(&list[n < 15 ? n : 15], 0, sizeof(list[0]));
+            if (parse_selector(a, t, e, &list[n < 15 ? n : 15]) < 0)
+                return -1;
+            if (n < 15)
+                n++;
+        }
+        s = e < end ? e + 1 : e;
     }
     if (!n)
         return -1;
-    *out = arena_alloc(a, sizeof(struct compound) * (size_t)n);
+    *out = arena_alloc(a, sizeof(struct selector) * (size_t)n);
     if (!*out)
         return -1;
-    memcpy(*out, list, sizeof(struct compound) * (size_t)n);
+    memcpy(*out, list, sizeof(struct selector) * (size_t)n);
     *nout = n;
     return 0;
 }
@@ -1061,6 +1068,8 @@ static int is_link(const struct node *n)
     return (n->tag == T_A || n->tag == T_AREA) && node_attr(n, "href");
 }
 
+static int match_from(const struct selector *s, int i, const struct node *n, const struct mctx *m);
+
 static int match_compound(const struct compound *c, const struct node *n, const struct mctx *m)
 {
     if (c->tag >= 0 && (c->tag != n->tag || (c->tag == T_UNKNOWN && strcmp(c->tagname, n->name))))
@@ -1122,12 +1131,12 @@ static int match_compound(const struct compound *c, const struct node *n, const 
             return 0;
     }
     for (int i = 0; i < c->nnot; i++)
-        if (match_compound(&c->not_list[i], n, m))
+        if (match_from(&c->not_list[i], c->not_list[i].nparts - 1, n, m))
             return 0;
     if (c->nis) {
         int any = 0;
         for (int i = 0; i < c->nis && !any; i++)
-            any = match_compound(&c->is_list[i], n, m);
+            any = match_from(&c->is_list[i], c->is_list[i].nparts - 1, n, m);
         if (!any)
             return 0;
     }

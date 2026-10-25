@@ -190,6 +190,11 @@ struct browser {
     struct browser *mouse_frame;        /* a press went into this frame: it has the mouse */
     struct browser *key_frame;          /* a window's: the frame that has the keys */
     int mouse_x, mouse_y;               /* a window's: the pointer, for the wheel */
+
+    /* a window's right-click menu */
+    int ctx_open, ctx_n, ctx_hover, ctx_x, ctx_y;
+    uint8_t ctx_codes[10];
+    char ctx_url[URL_MAX];              /* the link the menu was opened on */
 };
 
 static struct browser *browsers;
@@ -2638,6 +2643,100 @@ static void paint_page(struct browser *b, struct surface *s, int ox, int oy)
     }
 }
 
+/* ---- the right-click menu ---- */
+
+enum {
+    CB_SEP, CB_BACK, CB_FORWARD, CB_REFRESH, CB_STOP, CB_HOME, CB_COPYPAGE,
+    CB_OPENLINK, CB_NEWWIN, CB_COPYLINK, CB_CUT, CB_COPY, CB_PASTE,
+};
+
+static const char *const ctx_labels[] = {
+    [CB_BACK] = "Back", [CB_FORWARD] = "Forward", [CB_REFRESH] = "Refresh", [CB_STOP] = "Stop",
+    [CB_HOME] = "Home", [CB_COPYPAGE] = "Copy Page Address", [CB_OPENLINK] = "Open Link",
+    [CB_NEWWIN] = "Open Link in New Window", [CB_COPYLINK] = "Copy Link Address",
+    [CB_CUT] = "Cut", [CB_COPY] = "Copy", [CB_PASTE] = "Paste",
+};
+
+#define CTX_W 190
+#define CTX_ITEM_H 20
+#define CTX_SEP_H 8
+
+static int ctx_height(const struct browser *b, int i)
+{
+    return b->ctx_codes[i] == CB_SEP ? CTX_SEP_H : CTX_ITEM_H;
+}
+
+static struct rect ctx_rect(const struct browser *b)
+{
+    int h = 4;
+    for (int i = 0; i < b->ctx_n; i++)
+        h += ctx_height(b, i);
+    int x = b->ctx_x, y = b->ctx_y, w = b->win->content.w, ch = b->win->content.h;
+    if (x + CTX_W > w)
+        x = w - CTX_W;
+    if (y + h > ch)
+        y = ch - h;
+    return mkrect(x < 0 ? 0 : x, y < 0 ? 0 : y, CTX_W, h);
+}
+
+static struct rect ctx_item_rect(const struct browser *b, int idx)
+{
+    struct rect m = ctx_rect(b);
+    int y = m.y + 2;
+    for (int i = 0; i < idx; i++)
+        y += ctx_height(b, i);
+    return mkrect(m.x + 2, y, m.w - 4, ctx_height(b, idx));
+}
+
+static int ctx_hit(const struct browser *b, int x, int y)
+{
+    for (int i = 0; i < b->ctx_n; i++)
+        if (b->ctx_codes[i] != CB_SEP && rect_contains(ctx_item_rect(b, i), x, y))
+            return i;
+    return -1;
+}
+
+static int ctx_enabled(struct browser *b, int code)
+{
+    switch (code) {
+    case CB_BACK: return button_enabled(b, B_BACK);
+    case CB_FORWARD: return button_enabled(b, B_FORWARD);
+    case CB_REFRESH: return button_enabled(b, B_REFRESH);
+    case CB_STOP: return button_enabled(b, B_STOP);
+    case CB_COPYPAGE: return b->url[0] != 0;
+    case CB_OPENLINK: case CB_NEWWIN:
+        return strncasecmp(b->ctx_url, "javascript:", 11) && strncasecmp(b->ctx_url, "mailto:", 7);
+    case CB_CUT: case CB_COPY: return b->addr_len > 0;
+    case CB_PASTE: {
+        int n;
+        return clipboard_get(&n) && n > 0;
+    }
+    default: return 1;
+    }
+}
+
+static void draw_ctx(struct browser *b, struct surface *s)
+{
+    struct rect m = ctx_rect(b);
+    gfx_fill(s, m.x, m.y, m.w, m.h, C_FACE);
+    gfx_bevel(s, m, BEVEL_WINDOW);
+    for (int i = 0; i < b->ctx_n; i++) {
+        struct rect r = ctx_item_rect(b, i);
+        int code = b->ctx_codes[i];
+        if (code == CB_SEP) {
+            draw_separator(s, r.x + 1, r.y + 3, r.w - 2);
+            continue;
+        }
+        int en = ctx_enabled(b, code), hot = i == b->ctx_hover && en;
+        if (hot)
+            gfx_fill(s, r.x, r.y, r.w, r.h, C_NAVY);
+        int ty = r.y + (r.h - font_sans.height) / 2;
+        if (!en)
+            gfx_text(s, &font_sans, r.x + 13, ty + 1, ctx_labels[code], C_WHITE);
+        gfx_text(s, &font_sans, r.x + 12, ty, ctx_labels[code], hot ? C_WHITE : en ? C_BLACK : C_SHADOW);
+    }
+}
+
 /* Paint the window a page is in (a frame's is its outermost parent's). */
 static void paint(struct browser *b)
 {
@@ -2650,6 +2749,8 @@ static void paint(struct browser *b)
     gfx_bevel(s, frame_rect(b), BEVEL_SUNKEN);
     paint_page(b, s, 0, 0);
     draw_status(b, s);
+    if (b->ctx_open)
+        draw_ctx(b, s);
     wm_damage_client(b->win, mkrect(0, 0, s->w, s->h));
 }
 
@@ -2784,6 +2885,10 @@ static void br_key(struct window *w, const struct input_event *ev)
 {
     struct browser *t = w->priv;
     struct browser *b = t->key_frame && !t->addr_focus ? t->key_frame : t;
+    if (t->ctx_open) {
+        t->ctx_open = 0;
+        paint(t);
+    }
     if (b->js && b->root && !t->addr_focus && !(ev->mods & KMOD_ALT)) {
         char key[16];
         int kc = dom_key(ev, key, sizeof(key));
@@ -2909,6 +3014,130 @@ static void update_hover(struct browser *b, int x, int y)
     }
 }
 
+/* ---- right-click actions ---- */
+
+static void ctx_add(struct browser *t, int code)
+{
+    if (t->ctx_n < (int)sizeof(t->ctx_codes))
+        t->ctx_codes[t->ctx_n++] = (uint8_t)code;
+}
+
+/* Open the menu for a right click at (x, y) in b's own coordinates. */
+static void open_ctx(struct browser *b, int x, int y)
+{
+    struct browser *t = top_of(b);
+    if (!t->win)
+        return;
+    t->ctx_n = 0;
+    t->ctx_url[0] = 0;
+    t->ctx_x = t->mouse_x;
+    t->ctx_y = t->mouse_y;
+    t->ctx_hover = -1;
+    if (!is_frame(b) && rect_contains(addr_rect(b), x, y)) {
+        ctx_add(t, CB_CUT);
+        ctx_add(t, CB_COPY);
+        ctx_add(t, CB_PASTE);
+    } else if (rect_contains(view_rect(b), x, y) || is_frame(b)) {
+        struct rect v = view_rect(b);
+        const struct hotspot *h = b->root ?
+            layout_hit(b->lo.links, b->lo.nlinks, x - v.x + b->scroll_x, y - v.y + b->scroll_y) : NULL;
+        if (h && node_attr(h->node, "href")) {
+            url_resolve(b->base, node_attr(h->node, "href"), t->ctx_url, sizeof(t->ctx_url));
+            ctx_add(t, CB_OPENLINK);
+            ctx_add(t, CB_NEWWIN);
+            ctx_add(t, CB_COPYLINK);
+            ctx_add(t, CB_SEP);
+        }
+        ctx_add(t, CB_BACK);
+        ctx_add(t, CB_FORWARD);
+        ctx_add(t, CB_REFRESH);
+        ctx_add(t, CB_STOP);
+        ctx_add(t, CB_SEP);
+        ctx_add(t, CB_HOME);
+        ctx_add(t, CB_COPYPAGE);
+    } else {
+        return;
+    }
+    t->ctx_open = 1;
+    paint(t);
+}
+
+static void ctx_action(struct browser *t, int code)
+{
+    int n;
+    const char *clip;
+    switch (code) {
+    case CB_BACK: press(t, B_BACK); break;
+    case CB_FORWARD: press(t, B_FORWARD); break;
+    case CB_REFRESH: press(t, B_REFRESH); break;
+    case CB_STOP: press(t, B_STOP); break;
+    case CB_HOME: press(t, B_HOME); break;
+    case CB_COPYPAGE: clipboard_set(t->url); break;
+    case CB_OPENLINK: navigate(t, t->ctx_url, NULL, NAV_NEW); break;
+    case CB_NEWWIN: browser_open(t->ctx_url); break;
+    case CB_COPYLINK: clipboard_set(t->ctx_url); break;
+    case CB_COPY: clipboard_set(t->addr); break;
+    case CB_CUT:
+        clipboard_set(t->addr);
+        t->addr[0] = 0;
+        t->addr_len = t->addr_cur = 0;
+        t->addr_all = 0;
+        t->addr_focus = 1;
+        paint(t);
+        break;
+    case CB_PASTE:
+        clip = clipboard_get(&n);
+        if (!clip)
+            break;
+        if (t->addr_all || !t->addr_focus) {
+            t->addr[0] = 0;
+            t->addr_len = t->addr_cur = 0;
+        }
+        t->addr_all = 0;
+        t->addr_focus = 1;
+        for (int i = 0; i < n && t->addr_len < URL_MAX - 1; i++) {
+            if ((unsigned char)clip[i] < 32 || (unsigned char)clip[i] > 126)
+                continue;
+            memmove(t->addr + t->addr_cur + 1, t->addr + t->addr_cur, (size_t)(t->addr_len - t->addr_cur + 1));
+            t->addr[t->addr_cur++] = clip[i];
+            t->addr_len++;
+        }
+        caret_on = 1;
+        paint(t);
+        break;
+    }
+}
+
+/* The menu is open: it takes the mouse. Returns 1 if the event was used. */
+static int ctx_mouse(struct browser *b, int x, int y, int buttons, int changed)
+{
+    if (changed & MOUSE_RIGHT) {
+        if (!(buttons & MOUSE_RIGHT))
+            return 1;                   /* the release that follows the press */
+        b->ctx_open = 0;                /* a new right click: the menu moves */
+        paint(b);
+        return 0;
+    }
+    if (!(changed & MOUSE_LEFT)) {
+        int hv = ctx_hit(b, x, y);
+        if (hv != b->ctx_hover) {
+            b->ctx_hover = hv;
+            paint(b);
+        }
+        return 1;
+    }
+    if (!(buttons & MOUSE_LEFT))
+        return 1;
+    int i = ctx_hit(b, x, y);
+    int code = i >= 0 && ctx_enabled(b, b->ctx_codes[i]) ? b->ctx_codes[i] : CB_SEP;
+    int inside = rect_contains(ctx_rect(b), x, y);
+    b->ctx_open = 0;
+    paint(b);
+    if (code != CB_SEP)
+        ctx_action(b, code);
+    return inside;                      /* a click outside goes on to the page */
+}
+
 /* The mouse at (x, y) in b's coordinates: the window's, or a frame's own. */
 static void mouse(struct browser *b, int x, int y, int buttons, int changed)
 {
@@ -2945,6 +3174,11 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             }
     }
 
+    if (changed & MOUSE_RIGHT) {
+        if (buttons & MOUSE_RIGHT)
+            open_ctx(b, x, y);
+        return;
+    }
     if (pressed && !is_frame(b)) {
         for (int i = 0; i < NBUTTONS; i++) {
             if (rect_contains(button_rect(b, i), x, y) && button_enabled(b, i)) {
@@ -3070,6 +3304,8 @@ static void br_mouse(struct window *w, int x, int y, int buttons, int changed)
     struct browser *b = w->priv;
     b->mouse_x = x;
     b->mouse_y = y;
+    if (b->ctx_open && ctx_mouse(b, x, y, buttons, changed))
+        return;
     mouse(b, x, y, buttons, changed);
 }
 
@@ -3109,6 +3345,7 @@ static void br_focus(struct window *w, int focused)
 {
     struct browser *b = w->priv;
     b->focused = focused;
+    b->ctx_open = 0;
     if (b->win)
         paint(b);
 }
@@ -3259,7 +3496,7 @@ struct window *browser_open(const char *url)
     if (!b)
         return NULL;
     b->fetch.out = b->fetch.err = -1;
-    struct window *w = wm_create("Web Browser", ICON_BROWSER, BR_W, BR_H, WF_MINIMIZE | WF_MAXIMIZE,
+    struct window *w = wm_create("Web Browser", ICON_BROWSER, BR_W, BR_H, WF_MINIMIZE | WF_MAXIMIZE | WF_RIGHTCLICK,
                                  &br_ops, b);
     if (!w) {
         free(b);

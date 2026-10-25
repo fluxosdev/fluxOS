@@ -181,6 +181,8 @@ void files_tick(void);                  /* once a second: follow mounts coming a
 struct window *calculator_open(void);
 struct window *editor_open(const char *path);      /* path NULL: an empty document */
 void editor_blink(void);
+void clipboard_set(const char *text);              /* the clipboard the editors share */
+const char *clipboard_get(int *len);               /* NULL when empty */
 struct window *browser_open(const char *url);      /* url NULL: the home page */
 void browser_poll(void);                /* script timers and requests */
 int browser_timeout(void);              /* ms until browser_poll is needed, -1 if never */

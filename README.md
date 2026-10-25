@@ -374,7 +374,7 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
     and auto-closed tags, tables, character references, quirks mode) and
     takes UTF-8, Latin-1 and Windows-1252.
   - Its CSS supports type, class, id, attribute and structural selectors
-    with all four combinators, `:not()` and `:is()`, specificity and
+    with all four combinators, `:not()` and `:is()` (which take full selectors, combinators included), specificity and
     `!important`, `@media` queries, custom properties with `var()`,
     `::before`/`::after` text, and the old presentational attributes
     (`bgcolor`, `<font>`, `align`, `cellpadding`...).
@@ -382,6 +382,10 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
     breaking and alignment, inline-blocks, lists with markers, tables with
     `colspan`, `rowspan` and automatic column widths, flex rows, borders,
     backgrounds, images and form controls, with a scroll wheel.
+  - Right-clicking a page shows Back, Forward, Refresh, Stop, Home and Copy
+    Page Address; on a link it adds Open Link, Open Link in New Window and
+    Copy Link Address; on the address bar it offers Cut, Copy and Paste
+    (the clipboard is shared with the text editor).
   - Links, `GET` and `POST` forms (text fields, check boxes, radio buttons,
     selects, buttons), `<meta refresh>`, fragments (`#name`), redirects, and
     `:visited` colors work. Text is anti-aliased: Liberation Sans, Serif and
@@ -396,7 +400,7 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
       arrow functions, template literals (tagged too), default and rest
       parameters, spread, optional chaining, `??=`, numeric separators,
       getters and setters, **classes** (fields, `#private` members,
-      `extends`, `super`, statics), **destructuring** everywhere (declarations,
+      `extends`, `super`, statics and `static {}` blocks), **destructuring** everywhere (declarations,
       assignments, parameters, loops, `catch`), **generators**, **`async` and
       `await`** (also `for await`), and the iteration protocol
       (`Symbol.iterator`), with Map, Set, strings and arrays all iterable.

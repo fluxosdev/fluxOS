@@ -1532,6 +1532,7 @@ struct ast {
 #define F_SCOPED   1                    /* blocks with let, const or functions */
 #define F_EXPRBODY 4                    /* an arrow function's body is an expression */
 #define F_ASYNC    8                    /* async function: returns a promise, may await */
+#define F_NOPARAMS 32                   /* a class static block: no parameter list */
 #define F_GEN      16                   /* function*: returns a generator, may yield */
 
 struct parser {
@@ -1861,6 +1862,8 @@ static struct ast *function_body_inner(struct parser *P, struct ast *fn, int arr
     int cap = 0;
     int saved_args = P->fn_uses_args;
     P->fn_uses_args = 0;
+    if (fn->flags & F_NOPARAMS)
+        goto body;
     if (!expect(P, "("))
         return NULL;
     while (!at(P, ")")) {
@@ -1902,6 +1905,7 @@ static struct ast *function_body_inner(struct parser *P, struct ast *fn, int arr
             return fn->a ? fn : NULL;
         }
     }
+body:
     if (!expect(P, "{"))
         return NULL;
     struct ast *body = mk(P, S_BLOCK);
@@ -1995,8 +1999,17 @@ static struct ast *class_expr(struct parser *P)
         if (tok_is(peek(P), "static") && !name_ends(P)) {
             P->pos++;
             m->op = 1;
-            if (at(P, "{"))
-                return fail_parse(P, "static blocks are not supported"), NULL;
+            if (at(P, "{")) {
+                struct ast *fn = mk(P, N_FUNC);
+                fn->flags |= F_NOPARAMS;
+                m->kind = N_FIELD;
+                m->op = 2;              /* a static block, run as a method of the class */
+                m->a = function_rest(P, fn, 0);
+                if (!m->a)
+                    return NULL;
+                list_add(P, &n->list, &n->n, &cap, m);
+                continue;
+            }
         }
         struct tok *t = peek(P);
         if ((tok_is(t, "get") || tok_is(t, "set")) && !name_ends(P)) {
@@ -4062,6 +4075,13 @@ static jsval eval_class(struct js *J, struct ast *n, struct env *e)
             jsval kv = eval(J, m->b, ce);
             TRY();
             key = js_tostr(J, kv);
+        }
+        if (m->kind == N_FIELD && m->op == 2) {
+            jsval bf = make_function(J, m->a, ce);
+            bf.u.o->home = F;
+            js_call_value(J, bf, fv, NULL, 0);
+            TRY();
+            continue;
         }
         if (m->kind == N_FIELD) {
             if (!m->op)

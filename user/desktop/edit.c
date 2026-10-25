@@ -825,6 +825,25 @@ static void copy_selection(struct ed *e)
     cliplen = to - from;
 }
 
+/* The shared clipboard, for the other programs. */
+void clipboard_set(const char *text)
+{
+    size_t n = strlen(text);
+    char *c = malloc(n ? n : 1);
+    if (!c)
+        return;
+    memcpy(c, text, n);
+    free(clip);
+    clip = c;
+    cliplen = (int)n;
+}
+
+const char *clipboard_get(int *len)
+{
+    *len = cliplen;
+    return clip;
+}
+
 static void delete_selection(struct ed *e)
 {
     int from, to;
