@@ -6,7 +6,9 @@
  *
  * A display driver (voodoo.c) may later switch to a mode of its own and
  * point fb at it; fb_boot keeps the boot loader's mode. SYS_display
- * reports the adapter and sets modes through that driver.
+ * reports the adapter and sets modes through that driver. Another
+ * (radeon.c) keeps the boot mode but lends the screen's owner a second
+ * page to flip to and a hardware pointer.
  */
 #include "kernel.h"
 #include "drivers.h"
@@ -209,7 +211,8 @@ int fb_map_user(void)
         if (p && p->state != P_ZOMBIE)
             return -EBUSY;
     }
-    int r = vmm_map_phys(current->pd, USER_MMIO_BASE, fb.phys, fb.size, 0);
+    uint32_t size = radeon_present() ? radeon_map_size() : fb.size;
+    int r = vmm_map_phys(current->pd, USER_MMIO_BASE, fb.phys, size, 0);
     if (r < 0)
         return r;
     if (!fb_owner)
@@ -225,6 +228,7 @@ void fb_proc_exit(int pid)
     if (!fb_owner || pid != fb_owner)
         return;
     fb_owner = 0;
+    radeon_release();
     klog("fb: screen returned to the console\n");
     vga_redraw();
 }
@@ -240,6 +244,12 @@ static void boot_mode(struct dispmode *m)
     m->bpp = (uint16_t)fb_boot.bpp;
 }
 
+/* Only the process that has the screen may flip it or move the pointer. */
+static int screen_owner(void)
+{
+    return fb_owner && fb_owner == current->pid;
+}
+
 int fb_display(int op, void *arg)
 {
     switch (op) {
@@ -249,6 +259,8 @@ int fb_display(int op, void *arg)
         if (voodoo_present()) {
             voodoo_info(di);
             di->screen_bytes = (uint32_t)voodoo_screen_bytes();
+        } else if (radeon_present()) {
+            radeon_info(di);
         } else {
             strlcpy(di->adapter, vesa_name[0] ? vesa_name : "Standard VGA", sizeof(di->adapter));
             strlcpy(di->driver, fb_boot.base ? "vesa" : "vga", sizeof(di->driver));
@@ -278,6 +290,26 @@ int fb_display(int op, void *arg)
         if (!voodoo_present())
             return -ENODEV;
         return voodoo_map3d(arg);
+    case DISP_FLIP:
+        if (!radeon_present())
+            return -ENODEV;
+        if (!screen_owner())
+            return -EPERM;
+        return radeon_flip((int)((const struct dispflip *)arg)->page);
+    case DISP_CURSOR:
+        if (!radeon_present())
+            return -ENODEV;
+        if (!screen_owner())
+            return -EPERM;
+        return radeon_cursor(arg);
+    case DISP_CURSORPOS: {
+        if (!radeon_present())
+            return -ENODEV;
+        if (!screen_owner())
+            return -EPERM;
+        struct disppos pos = *(const struct disppos *)arg;
+        return radeon_cursor_pos(&pos);
+    }
     }
     return -EINVAL;
 }

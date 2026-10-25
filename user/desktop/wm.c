@@ -23,6 +23,7 @@
 #define ICON_CELL_H  70
 #define MENU_ITEM_H  36
 #define MENU_SEP_H   8
+#define SUB_ITEM_H   24         /* items of a cascading menu: 16 pixel icons */
 #define BANNER_W     21
 
 struct surface screen;
@@ -31,6 +32,15 @@ int screen_w, screen_h;
 static uint8_t *fb;
 static struct fbinfo fbi;
 static int fb_fast;                     /* 32 bpp with the 0xRRGGBB layout */
+
+/* With two pages of the screen, frames are drawn on the one not shown and
+ * flipped to; that page still lacks what changed in the frame before. */
+static int flip_ok;
+static uint32_t page_offset;
+static int back_page = 1;
+static struct rect shown[MAX_DAMAGE];
+static int nshown;
+static int hw_cursor;                   /* the adapter draws the pointer */
 
 static struct window *bottom;           /* z-order list, bottom to top */
 static struct window *focused;
@@ -67,6 +77,8 @@ enum { E_L = 1, E_R = 2, E_T = 4, E_B = 8 };
 
 static int menu_open;
 static int menu_hover = -1;
+static int menu_sub = -1;               /* the item whose submenu is open, or -1 */
+static int sub_hover = -1;              /* the highlighted item in that submenu */
 static int task_pressed_idx = -1;
 static char clock_text[16];
 
@@ -147,24 +159,45 @@ struct menu_item {
     enum icon_id icon;
     const char *label;                  /* NULL: separator */
     void (*run)(void);
+    const struct menu_item *sub;        /* a cascading menu instead of run */
+    int nsub;
+};
+
+#define COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))
+
+static const struct menu_item programs_items[] = {
+    { ICON_BROWSER, "Web Browser", open_browser, NULL, 0 },
+    { ICON_TERMINAL, "Terminal", open_terminal, NULL, 0 },
+    { ICON_GEARS, "3D Gears", open_gears, NULL, 0 },
+};
+
+static const struct menu_item accessories_items[] = {
+    { ICON_FOLDER, "File Manager", open_home, NULL, 0 },
+    { ICON_EDITOR, "Text Editor", open_editor, NULL, 0 },
+    { ICON_CALC, "Calculator", open_calculator, NULL, 0 },
+};
+
+static const struct menu_item system_items[] = {
+    { ICON_TASKMGR, "Task Manager", open_taskmgr, NULL, 0 },
+    { ICON_DRIVE, "Disk Manager", open_diskmgr, NULL, 0 },
+};
+
+static const struct menu_item settings_items[] = {
+    { ICON_DISPLAY, "Display Properties", display_open, NULL, 0 },
+    { ICON_COMPUTER, "System Properties", about_open, NULL, 0 },
 };
 
 static struct menu_item menu_items[] = {
-    { ICON_TERMINAL, "Terminal", open_terminal },
-    { ICON_FOLDER, "File Manager", open_home },
-    { ICON_EDITOR, "Text Editor", open_editor },
-    { ICON_BROWSER, "Web Browser", open_browser },
-    { ICON_CALC, "Calculator", open_calculator },
-    { ICON_GEARS, "3D Gears", open_gears },
-    { ICON_README, "Read Me", open_readme },
-    { ICON_TASKMGR, "Task Manager", open_taskmgr },
-    { ICON_DRIVE, "Disk Manager", open_diskmgr },
-    { ICON_COMPUTER, "System Properties", about_open },
-    { ICON_DISPLAY, "Display Properties", display_open },
-    { ICON_RUN, "Run...", run_open },
-    { ICON_INSTALL, "Install fluxOS...", setup_open },
-    { ICON_NONE, NULL, NULL },
-    { ICON_SHUTDOWN, "Shut Down...", shutdown_open },
+    { ICON_FOLDER_OPEN, "Programs", NULL, programs_items, COUNT(programs_items) },
+    { ICON_FOLDER, "Accessories", NULL, accessories_items, COUNT(accessories_items) },
+    { ICON_GEARS, "System Tools", NULL, system_items, COUNT(system_items) },
+    { ICON_DISPLAY, "Settings", NULL, settings_items, COUNT(settings_items) },
+    { ICON_NONE, NULL, NULL, NULL, 0 },
+    { ICON_README, "Read Me", open_readme, NULL, 0 },
+    { ICON_RUN, "Run...", run_open, NULL, 0 },
+    { ICON_INSTALL, "Install fluxOS...", setup_open, NULL, 0 },
+    { ICON_NONE, NULL, NULL, NULL, 0 },
+    { ICON_SHUTDOWN, "Shut Down...", shutdown_open, NULL, 0 },
 };
 static int nmenu = (int)(sizeof(menu_items) / sizeof(menu_items[0]));
 #define NMENU nmenu
@@ -290,6 +323,30 @@ static struct rect menu_item_rect(int idx)
     return mkrect(m.x + 3 + BANNER_W, y, m.w - 6 - BANNER_W, menu_item_height(idx));
 }
 
+/* The cascading menu of main item p: beside it, level with it, kept on the screen. */
+static struct rect sub_rect(int p)
+{
+    const struct menu_item *it = &menu_items[p];
+    int tw = 0;
+    for (int i = 0; i < it->nsub; i++) {
+        int w = gfx_text_width(&font_sans, it->sub[i].label);
+        if (w > tw)
+            tw = w;
+    }
+    int w = 6 + 4 + 16 + 8 + tw + 20, h = 6 + it->nsub * SUB_ITEM_H;
+    struct rect m = menu_rect(), r = menu_item_rect(p);
+    int y = r.y - 3;
+    if (y + h > screen_h - TASKBAR_H + 2)
+        y = screen_h - TASKBAR_H + 2 - h;
+    return mkrect(m.x + m.w - 3, y, w, h);
+}
+
+static struct rect sub_item_rect(int p, int j)
+{
+    struct rect m = sub_rect(p);
+    return mkrect(m.x + 3, m.y + 3 + j * SUB_ITEM_H, m.w - 6, SUB_ITEM_H);
+}
+
 static struct rect desk_icon_rect(int i)
 {
     return mkrect(4, 6 + i * ICON_CELL_H, ICON_CELL_W, ICON_CELL_H - 4);
@@ -344,34 +401,40 @@ static int area(struct rect r)
     return r.w * r.h;
 }
 
-void wm_damage(struct rect r)
+/* Add r to a list of at most MAX_DAMAGE rectangles, merging where cheap. */
+static void add_rect(struct rect *list, int *n, struct rect r)
 {
-    r = rect_intersect(r, mkrect(0, 0, screen_w, screen_h));
-    if (rect_empty(r))
-        return;
-    for (int i = 0; i < ndamage; i++) {
-        struct rect u = rect_union(damage[i], r);
-        if (area(u) <= area(damage[i]) + area(r) + 4096) {
-            damage[i] = u;
+    for (int i = 0; i < *n; i++) {
+        struct rect u = rect_union(list[i], r);
+        if (area(u) <= area(list[i]) + area(r) + 4096) {
+            list[i] = u;
             return;
         }
     }
-    if (ndamage == MAX_DAMAGE) {
-        for (int i = 1; i < ndamage; i++)
-            damage[0] = rect_union(damage[0], damage[i]);
-        damage[0] = rect_union(damage[0], r);
-        ndamage = 1;
+    if (*n == MAX_DAMAGE) {
+        for (int i = 1; i < *n; i++)
+            list[0] = rect_union(list[0], list[i]);
+        list[0] = rect_union(list[0], r);
+        *n = 1;
         return;
     }
-    damage[ndamage++] = r;
+    list[(*n)++] = r;
 }
 
-static void present(struct rect r)
+void wm_damage(struct rect r)
+{
+    r = rect_intersect(r, mkrect(0, 0, screen_w, screen_h));
+    if (!rect_empty(r))
+        add_rect(damage, &ndamage, r);
+}
+
+/* Copy r of the back buffer to a page of the screen. */
+static void present(uint8_t *page, struct rect r)
 {
     uint32_t bytespp = (fbi.bpp + 7) / 8;
     for (int j = r.y; j < r.y + r.h; j++) {
         const uint32_t *src = screen.px + j * screen.stride + r.x;
-        uint8_t *dst = fb + (uint32_t)j * fbi.pitch + (uint32_t)r.x * bytespp;
+        uint8_t *dst = page + (uint32_t)j * fbi.pitch + (uint32_t)r.x * bytespp;
         if (fb_fast) {
             memcpy(dst, src, (size_t)r.w * 4);
             continue;
@@ -392,6 +455,98 @@ static void present(struct rect r)
             }
         }
     }
+}
+
+/* Put the changed rectangles of the back buffer on the screen. */
+static void show_frame(const struct rect *r, int n)
+{
+    if (!flip_ok) {
+        for (int i = 0; i < n; i++)
+            present(fb, r[i]);
+        return;
+    }
+    struct rect todo[MAX_DAMAGE];
+    int ntodo = 0;
+    for (int i = 0; i < nshown; i++)
+        add_rect(todo, &ntodo, shown[i]);
+    for (int i = 0; i < n; i++)
+        add_rect(todo, &ntodo, r[i]);
+    uint8_t *page = fb + back_page * page_offset;
+    for (int i = 0; i < ntodo; i++)
+        present(page, todo[i]);
+    struct dispflip f = { (uint32_t)back_page };
+    if (display(DISP_FLIP, &f) < 0) {
+        /* Stay on the page asked for and draw on it directly from now on. */
+        fb = page;
+        flip_ok = 0;
+        return;
+    }
+    memcpy(shown, r, (size_t)n * sizeof(*r));
+    nshown = n;
+    back_page ^= 1;
+}
+
+/* ---- the hardware pointer ---- */
+
+static struct dispcursor cursor_dc;
+
+/* Hand the adapter the pointer's picture. It is drawn twice, on black and
+ * on white: the pixels that come out different are transparent. */
+static int load_cursor(void)
+{
+    static uint32_t px[2][DISP_CURSOR_SIZE * DISP_CURSOR_SIZE];
+    struct dispcursor *dc = &cursor_dc;
+    struct rect b = cursor_bounds(0, 0, cursor_kind);
+    if (b.x > 0 || b.y > 0 || -b.x >= DISP_CURSOR_SIZE || -b.y >= DISP_CURSOR_SIZE ||
+        b.w > DISP_CURSOR_SIZE || b.h > DISP_CURSOR_SIZE)
+        return -1;
+    for (int k = 0; k < 2; k++) {
+        struct surface s;
+        s.px = px[k];
+        s.w = s.h = s.stride = DISP_CURSOR_SIZE;
+        gfx_noclip(&s);
+        gfx_fill(&s, 0, 0, s.w, s.h, k ? C_WHITE : C_BLACK);
+        draw_cursor(&s, -b.x, -b.y, cursor_kind);
+    }
+    for (int i = 0; i < DISP_CURSOR_SIZE * DISP_CURSOR_SIZE; i++)
+        dc->image[i] = px[0][i] == px[1][i] ? 0xFF000000u | px[0][i] : 0;
+    dc->show = 1;
+    dc->hot_x = (uint16_t)-b.x;
+    dc->hot_y = (uint16_t)-b.y;
+    if (display(DISP_CURSOR, dc) < 0)
+        return -1;
+    struct disppos pos = { mx, my };
+    return display(DISP_CURSORPOS, &pos);
+}
+
+static void hide_cursor(void)
+{
+    cursor_dc.show = 0;
+    display(DISP_CURSOR, &cursor_dc);
+}
+
+/* Draw the pointer in the back buffer from now on. */
+static void software_cursor(void)
+{
+    hide_cursor();
+    hw_cursor = 0;
+    wm_damage(cursor_bounds(mx, my, cursor_kind));
+}
+
+/* Flip pages and let the adapter draw the pointer, where it can. */
+static void use_adapter(void)
+{
+    struct dispinfo di;
+    flip_ok = hw_cursor = 0;
+    nshown = 0;
+    if (display(DISP_INFO, &di) < 0)
+        return;
+    if ((di.flags & DISPF_FLIP) && di.page_offset) {
+        flip_ok = 1;
+        page_offset = di.page_offset;
+    }
+    if ((di.flags & DISPF_CURSOR) && load_cursor() == 0)
+        hw_cursor = 1;
 }
 
 /* ---- drawing the scene ---- */
@@ -506,10 +661,17 @@ static void draw_taskbar(void)
     gfx_text(&screen, &font_sans, tr.x + tr.w - 9 - cw, tr.y + 4, clock_text, C_BLACK);
 }
 
+/* A small triangle pointing right, centred vertically on y. */
+static void draw_menu_arrow(int x, int y, color_t c)
+{
+    for (int i = 0; i < 4; i++)
+        gfx_vline(&screen, x + i, y - 3 + i, 7 - 2 * i, c);
+}
+
 static void draw_start_menu(void)
 {
     struct rect m = menu_rect();
-    if (!rect_overlaps(m, screen.clip))
+    if (!rect_overlaps(m, screen.clip) && (menu_sub < 0 || !rect_overlaps(sub_rect(menu_sub), screen.clip)))
         return;
     gfx_fill(&screen, m.x, m.y, m.w, m.h, C_FACE);
     gfx_bevel(&screen, m, BEVEL_WINDOW);
@@ -528,12 +690,29 @@ static void draw_start_menu(void)
             draw_separator(&screen, r.x + 1, r.y + 3, r.w - 2);
             continue;
         }
-        int hot = i == menu_hover;
+        int hot = i == menu_hover || i == menu_sub;
         if (hot)
             gfx_fill(&screen, r.x, r.y, r.w, r.h, C_NAVY);
         draw_icon(&screen, r.x + 4, r.y + 2, menu_items[i].icon, 32);
         gfx_text(&screen, &font_sans, r.x + 4 + 32 + 10, r.y + (r.h - font_sans.height) / 2,
                  menu_items[i].label, hot ? C_WHITE : C_BLACK);
+        if (menu_items[i].sub)
+            draw_menu_arrow(r.x + r.w - 12, r.y + r.h / 2, hot ? C_WHITE : C_BLACK);
+    }
+    if (menu_sub >= 0) {
+        struct rect sm = sub_rect(menu_sub);
+        gfx_fill(&screen, sm.x, sm.y, sm.w, sm.h, C_FACE);
+        gfx_bevel(&screen, sm, BEVEL_WINDOW);
+        const struct menu_item *it = &menu_items[menu_sub];
+        for (int j = 0; j < it->nsub; j++) {
+            struct rect r = sub_item_rect(menu_sub, j);
+            int hot = j == sub_hover;
+            if (hot)
+                gfx_fill(&screen, r.x, r.y, r.w, r.h, C_NAVY);
+            draw_icon(&screen, r.x + 4, r.y + (r.h - 16) / 2, it->sub[j].icon, 16);
+            gfx_text(&screen, &font_sans, r.x + 4 + 16 + 8, r.y + (r.h - font_sans.height) / 2,
+                     it->sub[j].label, hot ? C_WHITE : C_BLACK);
+        }
     }
 }
 
@@ -571,16 +750,18 @@ static void compose(struct rect r)
         draw_start_menu();
     if (drag == DRAG_MOVE || drag == DRAG_RESIZE)
         draw_outline();
-    draw_cursor(&screen, mx, my, cursor_kind);
+    if (!hw_cursor)
+        draw_cursor(&screen, mx, my, cursor_kind);
     gfx_noclip(&screen);
 }
 
 void wm_flush(void)
 {
-    for (int i = 0; i < ndamage; i++) {
+    if (!ndamage)
+        return;
+    for (int i = 0; i < ndamage; i++)
         compose(damage[i]);
-        present(damage[i]);
-    }
+    show_frame(damage, ndamage);
     ndamage = 0;
 }
 
@@ -867,8 +1048,10 @@ static void set_menu(int open)
     if (open == menu_open)
         return;
     struct rect m = menu_rect();
+    if (menu_sub >= 0)
+        wm_damage(sub_rect(menu_sub));
     menu_open = open;
-    menu_hover = -1;
+    menu_hover = menu_sub = sub_hover = -1;
     wm_damage(m);
     wm_damage(start_button_rect());
 }
@@ -880,12 +1063,47 @@ static void menu_activate(int i)
         menu_items[i].run();
 }
 
+static void sub_activate(int p, int j)
+{
+    void (*run)(void) = menu_items[p].sub[j].run;
+    set_menu(0);
+    if (run)
+        run();
+}
+
 static int menu_hit(int x, int y)
 {
     for (int i = 0; i < NMENU; i++)
         if (menu_items[i].label && rect_contains(menu_item_rect(i), x, y))
             return i;
     return -1;
+}
+
+static int sub_hit(int x, int y)
+{
+    if (menu_sub < 0)
+        return -1;
+    for (int j = 0; j < menu_items[menu_sub].nsub; j++)
+        if (rect_contains(sub_item_rect(menu_sub, j), x, y))
+            return j;
+    return -1;
+}
+
+/* Is the point on the menu or its open submenu? */
+static int menu_contains(int x, int y)
+{
+    return rect_contains(menu_rect(), x, y) || (menu_sub >= 0 && rect_contains(sub_rect(menu_sub), x, y));
+}
+
+static void set_sub_hover(int j)
+{
+    if (j == sub_hover)
+        return;
+    if (menu_sub >= 0 && sub_hover >= 0)
+        wm_damage(sub_item_rect(menu_sub, sub_hover));
+    sub_hover = j;
+    if (menu_sub >= 0 && j >= 0)
+        wm_damage(sub_item_rect(menu_sub, j));
 }
 
 static void set_menu_hover(int i)
@@ -897,6 +1115,44 @@ static void set_menu_hover(int i)
     menu_hover = i;
     if (i >= 0)
         wm_damage(menu_item_rect(i));
+}
+
+/* Open the submenu of main item p (or close it, for -1). */
+static void set_menu_sub(int p)
+{
+    if (p == menu_sub)
+        return;
+    if (menu_sub >= 0) {
+        wm_damage(sub_rect(menu_sub));
+        wm_damage(menu_item_rect(menu_sub));
+    }
+    menu_sub = p;
+    sub_hover = -1;
+    if (p >= 0) {
+        wm_damage(sub_rect(p));
+        wm_damage(menu_item_rect(p));
+    }
+}
+
+/* The pointer moved over the menu: highlight, and open or close submenus. */
+static void menu_pointer(int x, int y)
+{
+    int j = sub_hit(x, y);
+    if (j >= 0) {
+        set_menu_hover(-1);
+        set_sub_hover(j);
+        return;
+    }
+    if (menu_sub >= 0 && rect_contains(sub_rect(menu_sub), x, y))
+        return;                         /* its border */
+    int i = menu_hit(x, y);
+    if (i >= 0) {
+        set_menu_hover(i);
+        set_menu_sub(menu_items[i].sub ? i : -1);
+    } else if (rect_contains(menu_rect(), x, y)) {
+        set_menu_hover(-1);             /* a separator or the banner */
+        set_menu_sub(-1);
+    }
 }
 
 /* ---- mouse ---- */
@@ -1015,20 +1271,25 @@ static void update_cursor(void)
         if (w)
             k = kind_for_edges(edge_hit(w, mx, my));
     }
-    if (k != cursor_kind) {
-        wm_damage(cursor_bounds(mx, my, cursor_kind));
+    if (k == cursor_kind)
+        return;
+    if (hw_cursor) {
         cursor_kind = k;
-        wm_damage(cursor_bounds(mx, my, cursor_kind));
+        if (load_cursor() < 0)
+            software_cursor();
+        return;
     }
+    wm_damage(cursor_bounds(mx, my, cursor_kind));
+    cursor_kind = k;
+    wm_damage(cursor_bounds(mx, my, cursor_kind));
 }
 
 static void press_left(void)
 {
     if (menu_open) {
-        struct rect m = menu_rect();
-        if (rect_contains(m, mx, my)) {
+        if (menu_contains(mx, my)) {
             drag = DRAG_MENU;
-            set_menu_hover(menu_hit(mx, my));
+            menu_pointer(mx, my);
             return;
         }
         set_menu(0);
@@ -1198,7 +1459,7 @@ static void drag_motion(void)
         break;
     }
     case DRAG_MENU:
-        set_menu_hover(menu_hit(mx, my));
+        menu_pointer(mx, my);
         break;
     case DRAG_NONE:
         break;
@@ -1250,10 +1511,14 @@ static void release_left(void)
         break;
     }
     case DRAG_MENU: {
-        int i = menu_hit(mx, my);
-        if (i >= 0)
+        int j = sub_hit(mx, my), i = menu_hit(mx, my);
+        if (j >= 0)
+            sub_activate(menu_sub, j);
+        else if (i >= 0 && menu_items[i].sub)
+            set_menu_sub(i);            /* stays open: pick from the submenu */
+        else if (i >= 0)
             menu_activate(i);
-        else if (!rect_contains(start_button_rect(), mx, my) && !rect_contains(menu_rect(), mx, my))
+        else if (!rect_contains(start_button_rect(), mx, my) && !menu_contains(mx, my))
             set_menu(0);
         break;
     }
@@ -1280,7 +1545,11 @@ static void mouse_event(const struct input_event *ev)
         mx = screen_w - 1;
     if (my >= screen_h)
         my = screen_h - 1;
-    if (mx != ox || my != oy) {
+    if ((mx != ox || my != oy) && hw_cursor) {
+        struct disppos pos = { mx, my };
+        if (display(DISP_CURSORPOS, &pos) < 0)
+            software_cursor();
+    } else if (mx != ox || my != oy) {
         wm_damage(cursor_bounds(ox, oy, cursor_kind));
         wm_damage(cursor_bounds(mx, my, cursor_kind));
     }
@@ -1303,7 +1572,7 @@ static void mouse_event(const struct input_event *ev)
         if (drag != DRAG_NONE)
             drag_motion();
         else if (menu_open)
-            set_menu_hover(menu_hit(mx, my));
+            menu_pointer(mx, my);
         else if (focused && !focused->minimized && focused->ops && focused->ops->mouse &&
                  rect_contains(wm_client_rect(focused), mx, my))
             client_mouse(focused, mbuttons, 0);     /* hovering: menus highlight */
@@ -1356,14 +1625,43 @@ static void key_event(const struct input_event *ev)
         return;
     }
     if (menu_open) {
-        if (code == KEY_ESC)
-            set_menu(0);
-        else if (code == KEY_UP)
-            set_menu_hover(menu_step(menu_hover < 0 ? 0 : menu_hover, -1));
-        else if (code == KEY_DOWN)
-            set_menu_hover(menu_step(menu_hover < 0 ? NMENU - 1 : menu_hover, 1));
-        else if (code == KEY_ENTER && menu_hover >= 0)
-            menu_activate(menu_hover);
+        int n = menu_sub >= 0 ? menu_items[menu_sub].nsub : 0;
+        if (code == KEY_ESC) {
+            if (sub_hover >= 0 || menu_sub >= 0)
+                set_menu_sub(-1);       /* one level back */
+            else
+                set_menu(0);
+        } else if (code == KEY_LEFT) {
+            if (menu_sub >= 0) {
+                set_menu_hover(menu_sub);
+                set_menu_sub(-1);
+            }
+        } else if (code == KEY_RIGHT) {
+            int p = menu_sub >= 0 ? menu_sub : menu_hover;
+            if (p >= 0 && menu_items[p].sub) {
+                set_menu_sub(p);
+                set_menu_hover(-1);
+                set_sub_hover(0);
+            }
+        } else if (code == KEY_UP || code == KEY_DOWN) {
+            int dir = code == KEY_UP ? -1 : 1;
+            if (sub_hover >= 0)
+                set_sub_hover((sub_hover + dir + n) % n);
+            else {
+                set_menu_sub(-1);
+                set_menu_hover(menu_step(menu_hover < 0 ? (dir > 0 ? NMENU - 1 : 0) : menu_hover, dir));
+            }
+        } else if (code == KEY_ENTER) {
+            if (sub_hover >= 0) {
+                sub_activate(menu_sub, sub_hover);
+            } else if (menu_hover >= 0 && menu_items[menu_hover].sub) {
+                set_menu_sub(menu_hover);
+                set_menu_hover(-1);
+                set_sub_hover(0);
+            } else if (menu_hover >= 0) {
+                menu_activate(menu_hover);
+            }
+        }
         return;
     }
     if (alt && code == KEY_F4) {
@@ -1412,7 +1710,10 @@ void wm_splash(const char *message, color_t color)
             for (int i = 0; i < 16; i++)
                 gfx_pixel(&screen, x0 + k * 16 + i, y0 + j, px[(j / 2) * 8 + i / 2]);
     }
-    present(mkrect(0, 0, screen_w, screen_h));
+    if (hw_cursor)
+        hide_cursor();
+    struct rect all = mkrect(0, 0, screen_w, screen_h);
+    show_frame(&all, 1);
 }
 
 void wm_tick(void)
@@ -1444,6 +1745,7 @@ int wm_reconfigure(void)
     screen_w = (int)fbi.width;
     screen_h = (int)fbi.height;
     fb_fast = fbi.bpp == 32 && fbi.red_pos == 16 && fbi.green_pos == 8 && fbi.blue_pos == 0;
+    use_adapter();
     wallpaper_resize();
 
     if (drag != DRAG_CLIENT) {
@@ -1452,7 +1754,7 @@ int wm_reconfigure(void)
         task_pressed_idx = -1;
     }
     menu_open = 0;
-    menu_hover = -1;
+    menu_hover = menu_sub = sub_hover = -1;
     if (mx >= screen_w)
         mx = screen_w - 1;
     if (my >= screen_h)
@@ -1497,6 +1799,7 @@ void wm_init(void)
         remove_installer();
     mx = screen_w / 2;
     my = screen_h / 2;
+    use_adapter();
     update_clock();
     wm_damage(mkrect(0, 0, screen_w, screen_h));
 }

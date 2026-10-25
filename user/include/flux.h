@@ -29,7 +29,8 @@ int fbinfo(struct fbinfo *fi);
 void *fbmap(void);
 
 /* The display adapter: op is DISP_INFO, DISP_MODES (returns the number of
- * modes), DISP_SETMODE or DISP_MAP3D; see <flux/abi.h>. */
+ * modes), DISP_SETMODE, DISP_MAP3D, DISP_FLIP, DISP_CURSOR or
+ * DISP_CURSORPOS; see <flux/abi.h>. */
 int display(int op, void *arg);
 
 #endif

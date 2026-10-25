@@ -49,9 +49,24 @@ Search the classic web: <input name="q" size="32"> <input type="submit" value="S
 <h2>On this computer</h2>
 <ul>
 <li><a href="test.html">The browser test page</a> <span>&mdash; what the HTML and CSS engine can do</span></li>
+<li><a href="js.html">The JavaScript test page</a> <span>&mdash; runs checks for everything below, live</span></li>
 <li><a href="file:///home/flux/">Your home folder</a></li>
 </ul>
 
+<h2>JavaScript</h2>
+<p>Pages can run scripts. The engine now covers most of modern JavaScript:</p>
+<ul>
+<li><b>Language:</b> classes (fields, <code>#private</code> members, <code>extends</code>, <code>super</code>, getters, statics),
+destructuring everywhere, <code>async</code>/<code>await</code>, generators, <code>for await</code>, iterators, tagged templates,
+optional chaining, <code>??=</code>, numeric separators.</li>
+<li><b>Promises:</b> <code>then</code>, <code>catch</code>, <code>finally</code>, <code>all</code>, <code>allSettled</code>,
+<code>race</code>, <code>any</code>, <code>queueMicrotask</code>.</li>
+<li><b>Network:</b> <code>fetch</code> with <code>Response</code>, <code>Headers</code> and <code>AbortController</code>,
+as well as <code>XMLHttpRequest</code>; <code>URL</code> and <code>URLSearchParams</code>.</li>
+<li><b>Library:</b> <code>Symbol</code>, <code>Reflect</code>, <code>WeakMap</code>, <code>structuredClone</code>,
+<code>atob</code>/<code>btoa</code>, <code>EventTarget</code>, newer <code>Array</code>, <code>Object</code> and <code>Math</code> methods,
+and regular expressions with lookbehind and named groups.</li>
+</ul>
 <p class="note">Secure <b>https://</b> sites load over TLS 1.3 (sites that only speak
 older TLS cannot be reached, and certificates are not checked).
 Type an address in the bar above (<kbd>Ctrl+L</kbd>), use <kbd>Alt+Left</kbd> to go back,

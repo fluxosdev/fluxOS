@@ -1002,6 +1002,9 @@ static int sys_display(uint32_t op, uint32_t uarg, uint32_t c, uint32_t d, uint3
     case DISP_MODES: size = DISP_MAX_MODES * sizeof(struct dispmode); break;
     case DISP_SETMODE: size = sizeof(struct dispmode); break;
     case DISP_MAP3D: size = sizeof(struct disp3d); break;
+    case DISP_FLIP: size = sizeof(struct dispflip); break;
+    case DISP_CURSOR: size = sizeof(struct dispcursor); break;
+    case DISP_CURSORPOS: size = sizeof(struct disppos); break;
     default: return -EINVAL;
     }
     if (user_check((void *)uarg, size) < 0)

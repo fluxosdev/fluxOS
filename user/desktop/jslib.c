@@ -266,6 +266,8 @@ static void define_property(struct js *J, jsval obj, struct jsstr *key, jsval de
         return;
     }
     struct prop *p = js_own(o, key);
+    if (p)
+        p->getter = p->setter = NULL;           /* a data property now */
     js_put(J, o, key, v, p ? p->hidden : !js_truthy(enumerable));
 }
 
@@ -392,14 +394,17 @@ static jsval object_from_entries(struct js *J, jsval self, jsval *args, int argc
 {
     (void)self;
     struct jsobj *o = js_new_object(J);
-    jsval list = ARG(0);
-    if (!js_is_array(list))
-        return js_obj(o);
-    for (int i = 0; i < list.u.o->len; i++) {
-        jsval pair = list.u.o->items[i];
+    struct iter it;
+    if (js_iter_open(J, ARG(0), &it) < 0)
+        return js_undefined;
+    jsval pair;
+    int r;
+    while ((r = js_iter_next(J, &it, &pair)) > 0) {
         js_setv(J, js_obj(o), js_getv(J, pair, js_num(0)), js_getv(J, pair, js_num(1)));
+        if (J->throwing)
+            return js_undefined;
     }
-    return js_obj(o);
+    return r < 0 ? js_undefined : js_obj(o);
 }
 
 static jsval proto_has_own(struct js *J, jsval self, jsval *args, int argc)
@@ -578,24 +583,20 @@ static jsval array_from(struct js *J, jsval self, jsval *args, int argc)
     (void)self;
     struct jsobj *a = js_new_array(J);
     jsval src = ARG(0), map = ARG(1);
-    if (src.t == JS_STR) {
-        const char *s = src.u.s->s, *end = s + src.u.s->len;
-        while (s < end) {
-            const char *st = s;
-            utf8_next(&s, end);
-            js_array_push(J, a, js_strn(J, st, (int)(s - st)));
-        }
-    } else if (src.t == JS_OBJ) {
-        jsval len = js_get(J, src, "length");
-        if (len.t == JS_NUM) {
-            for (int i = 0; i < (int)len.u.n; i++)
-                js_array_push(J, a, js_getv(J, src, js_num(i)));
-        } else if (src.u.o->cls == C_OBJECT) {
-            jsval items = js_get(J, src, "__items");     /* Map and Set */
-            if (js_is_array(items))
-                for (int i = 0; i < items.u.o->len; i++)
-                    js_array_push(J, a, items.u.o->items[i]);
-        }
+    if (src.t == JS_STR || src.t == JS_OBJ) {       /* anything iterable, or with a length */
+        struct iter it;
+        jsval len = src.t == JS_OBJ ? js_get(J, src, "length") : js_undefined;
+        jsval iterf = src.t == JS_OBJ ? js_get(J, src, "@@iterator") : js_undefined;
+        if (src.t == JS_OBJ && len.t != JS_NUM && iterf.t == JS_UNDEF)
+            return js_obj(a);                       /* a plain object: no elements */
+        if (js_iter_open(J, src, &it) < 0)
+            return js_undefined;
+        jsval x;
+        int r;
+        while ((r = js_iter_next(J, &it, &x)) > 0)
+            js_array_push(J, a, x);
+        if (r < 0)
+            return js_undefined;
     }
     if (js_is_callable(map))
         for (int i = 0; i < a->len; i++) {
@@ -1321,6 +1322,15 @@ static jsval match_array(struct js *J, struct jsstr *s, struct regex *re, int *c
                       js_strn(J, s->s + caps[2 * g], caps[2 * g + 1] - caps[2 * g]));
     js_put(J, m, S(J, "index"), js_num(caps[0]), 0);
     js_put(J, m, S(J, "input"), strv(s), 0);
+    jsval groups = js_undefined;
+    if (re_has_names(re)) {
+        struct jsobj *go = js_new_object(J);
+        for (int g = 1; g < re_ngroups(re); g++)
+            if (re_group_name(re, g))
+                js_put(J, go, S(J, re_group_name(re, g)), m->items[g], 0);
+        groups = js_obj(go);
+    }
+    js_put(J, m, S(J, "groups"), groups, 0);
     return js_obj(m);
 }
 
@@ -1445,16 +1455,24 @@ static jsval string_search(struct js *J, jsval self, jsval *args, int argc)
 }
 
 /* The replacement for one match: a function's result, or the template with $1, $& and so on. */
-static struct jsstr *replacement(struct js *J, struct jsstr *s, jsval with, int *caps, int ngroups)
+static struct jsstr *replacement(struct js *J, struct jsstr *s, jsval with, int *caps, int ngroups,
+                                 struct regex *re)
 {
     if (js_is_callable(with)) {
-        jsval a[RE_MAX_GROUPS + 2];
+        jsval a[RE_MAX_GROUPS + 3];
         int n = 0;
         for (int g = 0; g < ngroups; g++)
             a[n++] = caps[2 * g] < 0 ? js_undefined :
                      js_strn(J, s->s + caps[2 * g], caps[2 * g + 1] - caps[2 * g]);
         a[n++] = js_num(caps[0]);
         a[n++] = strv(s);
+        if (re && re_has_names(re)) {            /* the named groups, as the last argument */
+            struct jsobj *go = js_new_object(J);
+            for (int g = 1; g < ngroups; g++)
+                if (re_group_name(re, g))
+                    js_put(J, go, S(J, re_group_name(re, g)), a[g], 0);
+            a[n++] = js_obj(go);
+        }
         return js_tostr(J, js_call_value(J, with, js_undefined, a, n));
     }
     struct jsstr *t = js_tostr(J, with);
@@ -1481,6 +1499,20 @@ static struct jsstr *replacement(struct js *J, struct jsstr *s, jsval with, int 
                 piece = s->s + caps[1];
                 plen = s->len - caps[1];
                 i++;
+            } else if (c == '<' && re && re_has_names(re)) {      /* $<name> */
+                const char *close = memchr(t->s + i + 2, '>', (size_t)(t->len - i - 2));
+                if (close) {
+                    int nl = (int)(close - (t->s + i + 2));
+                    piece = "";
+                    for (int g = 1; g < ngroups; g++) {
+                        const char *gn = re_group_name(re, g);
+                        if (gn && (int)strlen(gn) == nl && !memcmp(gn, t->s + i + 2, (size_t)nl) && caps[2 * g] >= 0) {
+                            piece = s->s + caps[2 * g];
+                            plen = caps[2 * g + 1] - caps[2 * g];
+                        }
+                    }
+                    i += nl + 2;
+                }
             } else if (c >= '1' && c <= '9' && c - '0' < ngroups) {
                 int g = c - '0';
                 if (i + 2 < t->len && t->s[i + 2] >= '0' && t->s[i + 2] <= '9' &&
@@ -1525,7 +1557,7 @@ static jsval string_replace_impl(struct js *J, jsval self, jsval *args, int argc
         int caps[2 * RE_MAX_GROUPS], at = 0, global = re_global(re) || all;
         while (at <= s->len && re_exec(re, s->s, s->len, at, caps) >= 0) {
             out = js_concat(J, out, js_mkstr(J, s->s + last, caps[0] - last));
-            out = js_concat(J, out, replacement(J, s, with, caps, re_ngroups(re)));
+            out = js_concat(J, out, replacement(J, s, with, caps, re_ngroups(re), re));
             if (J->throwing)
                 return js_undefined;
             last = caps[1];
@@ -1549,7 +1581,7 @@ static jsval string_replace_impl(struct js *J, jsval self, jsval *args, int argc
             break;
         int caps[2] = { at, at + sub->len };
         out = js_concat(J, out, js_mkstr(J, s->s + last, at - last));
-        out = js_concat(J, out, replacement(J, s, with, caps, 1));
+        out = js_concat(J, out, replacement(J, s, with, caps, 1, NULL));
         if (J->throwing)
             return js_undefined;
         last = at + sub->len;
@@ -2780,10 +2812,14 @@ static void collection_init(struct js *J, struct jsobj *o, int map, jsval src)
     js_put(J, o, S(J, "__items"), js_obj(js_new_array(J)), 1);
     if (map)
         js_put(J, o, S(J, "__values"), js_obj(js_new_array(J)), 1);
-    if (!js_is_array(src))
+    if (src.t == JS_UNDEF || src.t == JS_NULL)
         return;
-    for (int i = 0; i < src.u.o->len; i++) {
-        jsval it = src.u.o->items[i];
+    struct iter iter;
+    if (js_iter_open(J, src, &iter) < 0)
+        return;
+    jsval it;
+    int r;
+    while ((r = js_iter_next(J, &iter, &it)) > 0) {
         jsval keys = js_get(J, js_obj(o), "__items");
         if (map) {
             jsval k = js_getv(J, it, js_num(0)), v = js_getv(J, it, js_num(1));
@@ -3390,6 +3426,7 @@ void js_init_lib(struct js *J)
     fn_obj(J, map_proto, "keys", collection_keys, 0);
     fn_obj(J, map_proto, "values", collection_values, 0);
     fn_obj(J, map_proto, "entries", collection_entries, 0);
+    fn_obj(J, map_proto, "@@iterator", collection_entries, 0);
     define_getter(J, map_proto, "size", collection_size_getter);
     set_proto = js_mkobj(J, C_OBJECT, op);
     ctor_obj(J, "Set", set_ctor, 0, set_proto);
@@ -3401,6 +3438,7 @@ void js_init_lib(struct js *J)
     fn_obj(J, set_proto, "keys", collection_keys, 0);
     fn_obj(J, set_proto, "values", collection_keys, 0);
     fn_obj(J, set_proto, "entries", collection_entries, 0);
+    fn_obj(J, set_proto, "@@iterator", collection_keys, 0);
     define_getter(J, set_proto, "size", collection_size_getter);
 
     init_typed_arrays(J);
@@ -3414,4 +3452,6 @@ void js_init_lib(struct js *J)
     fn_obj(J, console, "error", console_log, 0);
     fn_obj(J, console, "debug", console_log, 0);
     fn_obj(J, console, "trace", console_log, 0);
+
+    js_init_lib2(J);
 }

@@ -363,21 +363,52 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
     coverage per pixel (the file is 2.6 MB), and drawing blends each pixel
     with the background.
   - JavaScript: a tree-walking interpreter written for fluxOS (js.c, with
-    the built-ins in jslib.c and regular expressions in jsre.c) runs a
-    page's inline and external scripts in order, then `DOMContentLoaded`
-    and `load`. It covers most of ES5 and the common parts of ES6 (`let`
-    and `const`, arrow functions, template literals, default and rest
-    parameters, spread, optional chaining, getters and setters, `Map` and
-    `Set`), with Object, Array, String, Number, Math, JSON, Date and RegExp.
-    The DOM (jsdom.c) has `document` (`getElementById`, `querySelector`,
-    `createElement`, `write`...), elements with `innerHTML`, `textContent`,
-    `style`, `classList`, `dataset`, attributes and tree editing, events
-    (`click`, `input`, `change`, `submit`, `keydown`...) through
-    `addEventListener`, `on*` properties and attributes, timers,
-    `location`, `history`, `localStorage` for the page's lifetime,
-    `XMLHttpRequest` (fetched like the page's other resources),
-    `performance.timing`, and `alert`. Changes to the page are laid out again when a script returns.
-    A script that runs too long or allocates too much is stopped.
+    the built-ins in jslib.c and jslib2.c and regular expressions in jsre.c)
+    runs a page's inline and external scripts in order, then
+    `DOMContentLoaded` and `load`.
+    - The language covers most of ES2020 and some later: `let` and `const`,
+      arrow functions, template literals (tagged too), default and rest
+      parameters, spread, optional chaining, `??=`, numeric separators,
+      getters and setters, **classes** (fields, `#private` members,
+      `extends`, `super`, statics), **destructuring** everywhere (declarations,
+      assignments, parameters, loops, `catch`), **generators**, **`async` and
+      `await`** (also `for await`), and the iteration protocol
+      (`Symbol.iterator`), with Map, Set, strings and arrays all iterable.
+    - Generators and async functions run as coroutines, each on a 96 KiB
+      stack of its own (at most 192 at a time, and 32 nested calls on each),
+      switched with a few instructions of assembly. `await` really suspends
+      the function: the rest of the script and the page carry on, and the
+      function continues from a promise reaction. Results are never
+      reordered by running things early.
+    - **Promises** (`then`, `catch`, `finally`, `all`, `allSettled`, `race`,
+      `any`, `withResolvers`) with a proper microtask queue that drains when a
+      script, timer or event handler returns, and `queueMicrotask`.
+    - Built-ins: Object, Array, String, Number, Math, JSON, Date, RegExp,
+      Symbol (as hidden string keys: `typeof` says "string"), Reflect, Map,
+      Set, WeakMap, WeakSet, WeakRef, typed arrays, `structuredClone`,
+      `atob`/`btoa`, a small `Intl`, `AggregateError`, `DOMException`, and
+      the newer methods (`at`, `findLast`, `flat`, `flatMap`, `toSorted`,
+      `with`, `Object.groupBy`, `Object.hasOwn`, ...). Regular expressions
+      have lookahead and lookbehind, named groups (`\k<name>`, `$<name>`,
+      `.groups`), and match whole UTF-8 characters.
+    - Part of the library is itself JavaScript (jsprelude.h): a core that
+      starts with every page, and chunks (URL, `fetch`, events and others) that
+      are compiled the first time a page names something in them, so a page
+      that uses none of them pays nothing.
+    - The DOM (jsdom.c) has `document` (`getElementById`, `querySelector`,
+      `createElement`, `write`...), elements with `innerHTML`, `textContent`,
+      `style`, `classList`, `dataset`, attributes and tree editing, events
+      (`click`, `input`, `change`, `submit`, `keydown`...) through
+      `addEventListener`, `on*` properties and attributes, timers,
+      `location`, `history`, `localStorage` for the page's lifetime,
+      `XMLHttpRequest`, **`fetch`** (with `Response`, `Headers`, `Request`
+      and `AbortController`, on top of XMLHttpRequest, so request headers are
+      not sent), `URL`, `URLSearchParams`, `EventTarget`, observer stubs,
+      `performance.timing`, and `alert`. Changes to the page are laid out
+      again when a script returns. A script that runs too long or allocates
+      too much is stopped.
+    - `/usr/share/www/js.html` (linked from the home page) is a test page
+      that checks all of this live.
 - Setup: a Win95-style wizard (the **Install fluxOS** icon) that installs
   fluxOS on a hard disk. It lists the disks, greying out any that are too
   small or hold the install files, asks you to confirm that the chosen disk
@@ -442,12 +473,14 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   **Volume Control**, a column for each mixer output with a vertical
   slider and a Mute box. The desktop plays a startup sound, terminals beep
   on ^G, and double-clicking a `.wav` or `.voc` file plays it.
-- Start menu: Terminal, File Manager, Text Editor, Web Browser, Calculator,
-  3D Gears, Read Me, Task Manager, Disk Manager, System Properties (version,
-  memory, display, uptime),
-  Display Properties, Run... (runs a command in a new window), Install
-  fluxOS..., and Shut Down... (power off, restart, or close the desktop and
-  return to the text console).
+- Start menu: programs are grouped in cascading submenus, as in Windows 95.
+  **Programs** holds Web Browser, Terminal and 3D Gears; **Accessories**
+  File Manager, Text Editor and Calculator; **System Tools** Task Manager
+  and Disk Manager; **Settings** Display Properties and System Properties
+  (version, memory, display, uptime). Below them are Read Me, Run... (runs a
+  command in a new window), Install fluxOS..., and Shut Down... (power off,
+  restart, or close the desktop and return to the text console). The arrow
+  keys work in the menu too: Right opens a submenu, Left or Esc closes it.
 - Keys: the Windows key or Ctrl+Esc opens the Start menu, Alt+Tab switches
   windows, Alt+F4 closes a window (or, with none focused, opens Shut Down).
   Dialogs follow Tab, Enter, Escape and the arrow keys.
@@ -765,7 +798,7 @@ user/
                            and the web browser: its window (browser.c), HTML
                            parser (html.c), CSS (css.c), layout and painting
                            (layout.c), fonts (webfont.c) and URLs (webutil.c)
-                           and its JavaScript engine (js.c, jslib.c, jsre.c)
+                           and its JavaScript engine (js.c, jslib.c, jslib2.c, jsprelude.h, jsre.c)
                            and DOM bindings (jsdom.c)
   dos/                     the DOS emulator: the x86 CPU (cpu.c), the DPMI host
                            (dpmi.c), ROM, interrupt controller, timer and BIOS
@@ -1009,10 +1042,12 @@ HTTPS is TLS 1.3 only, with one cipher suite (TLS_AES_128_GCM_SHA256) and
 X25519: servers that only speak TLS 1.2, or will not use X25519, cannot be
 reached. Certificates are not verified, so the encryption keeps out
 eavesdroppers but not someone who intercepts the connection and poses as
-the site. The browser's JavaScript has no classes, destructuring, generators, async
-functions, promises or fetch (XMLHttpRequest works, always asynchronously),
-typed arrays are plain arrays, and eval runs in the global scope, so most
-modern web applications do not run; it shows only PNG and JPEG pictures (GIF
+the site. The browser's JavaScript has no async generators, proxies, modules or
+real BigInt, strings count bytes of UTF-8 rather than 16-bit units (so
+indexes into non-ASCII text differ), `Symbol`s are strings, `fetch` cannot
+send request headers or cookies and has no streaming, typed arrays are plain
+arrays, and eval runs in the global scope, so many modern web applications
+still do not run; it shows only PNG and JPEG pictures (GIF
 and SVG show their alternative text). Its layout is an approximation: floats
 become inline-blocks, positioned elements stay in the normal flow (those
 hidden off-screen are dropped), grids are blocks, flex rows are lines of

@@ -815,6 +815,9 @@ static void settings_page(struct dprops *d, struct surface *s)
         snprintf(buf, sizeof(buf), "%s driver: set modes, 3D acceleration", d->di.adapter);
         draw_radio(s, radio_rect(1).x, radio_rect(1).y, buf, d->driver == DRV_NATIVE,
                    focus_drv && d->driver == DRV_NATIVE);
+    } else if (d->di.flags & (DISPF_FLIP | DISPF_CURSOR)) {
+        snprintf(buf, sizeof(buf), "%s driver: page flipping, BIOS modes only", d->di.driver);
+        gfx_text(s, &font_sans, 44, radio_rect(1).y - 1, buf, C_SHADOW);
     } else {
         gfx_text(s, &font_sans, 44, radio_rect(1).y - 1, "No 3dfx Voodoo card was found.", C_SHADOW);
     }
@@ -942,7 +945,13 @@ static void monitor_page(struct dprops *d, struct surface *s)
 
     draw_group(s, mkrect(14, 256, 376, 112), "Current mode");
     const struct dispmode *m = &d->di.mode;
-    draw_line(s, 272, "Driver:", d->di.flags & DISPF_BOOT ? "standard VGA (BIOS mode)" : d->di.driver);
+    if (!(d->di.flags & DISPF_BOOT))
+        snprintf(buf, sizeof(buf), "%s", d->di.driver);
+    else if (d->di.flags & (DISPF_FLIP | DISPF_CURSOR))
+        snprintf(buf, sizeof(buf), "%s (BIOS mode)", d->di.driver);
+    else
+        snprintf(buf, sizeof(buf), "standard VGA (BIOS mode)");
+    draw_line(s, 272, "Driver:", buf);
     if (m->width) {
         snprintf(buf, sizeof(buf), "%u x %u, %u bits per pixel", m->width, m->height, m->bpp);
         draw_line(s, 290, "Screen:", buf);

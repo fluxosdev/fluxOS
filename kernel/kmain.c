@@ -119,6 +119,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
         boot_ok("Framebuffer: %ux%u, %u bits per pixel at %08x",
                 fb.width, fb.height, fb.bpp, fb.phys);
     voodoo_init();
+    radeon_init();
     heap_init();
     {
         uint32_t total, used;

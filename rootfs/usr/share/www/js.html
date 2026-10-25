@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>JavaScript test page</title>
+<style>
+body { font-family: sans-serif; max-width: 720px; margin: 16px auto; padding: 0 12px; line-height: 1.4; }
+h1 { color: #3f175f; border-bottom: 3px double #3f175f; }
+#summary { font-weight: bold; padding: 6px 10px; background: #fffbe6; border: 1px solid #e6d9a2; }
+.row { font-size: 14px; padding: 1px 6px; border-bottom: 1px solid #eee; }
+.pass { color: #176b2d; }
+.fail { color: #b00020; background: #fff0f0; }
+.group { margin-top: 14px; font-weight: bold; color: #3f175f; }
+</style>
+</head>
+<body>
+<h1>JavaScript test page</h1>
+<p>Each line below is a test the page's own scripts run when it loads: language features, the
+built-in library, and promises, <code>async</code> functions and <code>fetch</code> (which reads
+this very file through <code>file://</code>). Anything red is a bug worth reporting.</p>
+<div id="summary">Running...</div>
+<div id="results"></div>
+<script>
+var results = document.getElementById("results");
+var passed = 0, failed = 0, pending = 0;
+function group(name) {
+  var d = document.createElement("div");
+  d.className = "group";
+  d.textContent = name;
+  results.appendChild(d);
+}
+function report(name, ok, detail) {
+  var d = document.createElement("div");
+  d.className = "row " + (ok ? "pass" : "fail");
+  d.textContent = (ok ? "ok    " : "FAIL  ") + name + (ok ? "" : "  -> " + detail);
+  results.appendChild(d);
+  if (ok) passed++; else failed++;
+  var s = document.getElementById("summary");
+  s.textContent = passed + " passed, " + failed + " failed" + (pending ? ", " + pending + " still running" : "");
+}
+function same(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+function test(name, fn, expected) {
+  try {
+    var v = fn();
+    if (v && typeof v.then === "function") {
+      pending++;
+      v.then(function (r) { pending--; report(name, same(r, expected), "got " + JSON.stringify(r)); },
+             function (e) { pending--; report(name, false, "rejected: " + e); });
+    } else {
+      report(name, same(v, expected), "got " + JSON.stringify(v));
+    }
+  } catch (e) {
+    report(name, false, "threw " + e);
+  }
+}
+
+group("Destructuring and spread");
+test("object pattern with defaults and rest", function () {
+  var {a, b: {c = 5}, ...rest} = {a: 1, b: {}, x: 2, y: 3}; return [a, c, rest];
+}, [1, 5, {x: 2, y: 3}]);
+test("array pattern, holes, swap", function () {
+  var [p, , q = 7, ...r] = [1, 2, undefined, 4, 5]; var m = 1, n = 2; [m, n] = [n, m]; return [p, q, r, m, n];
+}, [1, 7, [4, 5], 2, 1]);
+test("parameters", function () { return (function ({a, b = 2}, [c] = [3]) { return a + b + c; })({a: 1}); }, 6);
+test("for-of with patterns over a Map", function () {
+  var out = []; for (var [k, v] of new Map([[1, "a"], [2, "b"]])) out.push(k + v); return out;
+}, ["1a", "2b"]);
+
+group("Classes");
+class Animal {
+  #secret = 42;
+  count = 0;
+  static kingdom = "animalia";
+  constructor(name) { this.name = name; this.count++; }
+  speak() { return this.name + " makes a sound"; }
+  get secret() { return this.#secret; }
+  static create(n) { return new this(n); }
+}
+class Dog extends Animal {
+  speak() { return super.speak() + " (woof)"; }
+}
+test("fields, private fields, getters, statics", function () {
+  var d = Dog.create("Rex"); return [d.speak(), d.count, d.secret, Dog.kingdom, d instanceof Animal];
+}, ["Rex makes a sound (woof)", 1, 42, "animalia", true]);
+test("extending Error and Array", function () {
+  class E extends Error { constructor(m) { super(m); this.name = "E"; } }
+  class S extends Array { top() { return this[this.length - 1]; } }
+  var s = new S(); s.push(1, 2); var e = new E("x");
+  return [e.message, e instanceof Error, String(e), s.top(), Array.isArray(s)];
+}, ["x", true, "E: x", 2, true]);
+test("a class cannot be called", function () { try { Animal("x"); } catch (e) { return e instanceof TypeError; } }, true);
+
+group("Generators and iterators");
+function* count(n) { for (var i = 0; i < n; i++) yield i; return "end"; }
+test("generators", function () { return [[...count(3)], Array.from(count(2)), count(1).next()]; },
+     [[0, 1, 2], [0, 1], {value: 0, done: false}]);
+test("yield*, return and finally", function () {
+  var log = []; function* g() { try { yield 1; yield* [2, 3]; } finally { log.push("done"); } }
+  var it = g(); it.next(); it.return(); var closed = log.slice(); return [[...g()], closed];
+}, [[1, 2, 3], ["done"]]);
+test("custom iterables", function () {
+  var o = { *[Symbol.iterator]() { yield "x"; yield "y"; } }; var [a, b] = o; return [a, b, [...o]];
+}, ["x", "y", ["x", "y"]]);
+test("Map and Set iterators", function () {
+  var m = new Map([[1, 2]]); return [m.entries().next().value, [...new Set([3, 3, 4]).values()], [..."ab"]];
+}, [[1, 2], [3, 4], ["a", "b"]]);
+
+group("Promises and async functions");
+test("then chains", function () {
+  return Promise.resolve(1).then(function (v) { return v + 1; }).then(function (v) { return v * 10; });
+}, 20);
+test("catch and finally", function () {
+  var log = [];
+  return Promise.reject("no").catch(function (e) { log.push(e); }).finally(function () { log.push("f"); }).then(function () { return log; });
+}, ["no", "f"]);
+test("Promise.all, allSettled, race, any", function () {
+  return Promise.all([Promise.all([1, Promise.resolve(2)]), Promise.allSettled([Promise.reject(1)]),
+                      Promise.race([new Promise(function () {}), 3]), Promise.any([Promise.reject(1), 4])]);
+}, [[1, 2], [{status: "rejected", reason: 1}], 3, 4]);
+test("await and try/catch", function () {
+  async function f() { try { await Promise.reject(new Error("bad")); } catch (e) { return "caught " + e.message; } }
+  return f();
+}, "caught bad");
+test("async arrows, methods and loops", function () {
+  var o = { async m(x) { return x * 2; } };
+  var f = async function () { var s = 0; for (var i = 0; i < 4; i++) s += await o.m(i); return s; };
+  return f();
+}, 12);
+test("for await", function () {
+  return (async function () { var out = []; for await (var v of [Promise.resolve("a"), "b"]) out.push(v); return out; })();
+}, ["a", "b"]);
+test("setTimeout in a promise", function () {
+  return new Promise(function (r) { setTimeout(function () { r("later"); }, 20); });
+}, "later");
+test("many async calls at once", function () {
+  var ps = []; for (var i = 0; i < 50; i++) ps.push((async function (j) { await null; return j; })(i));
+  return Promise.all(ps).then(function (r) { return r.length + ":" + r[49]; });
+}, "50:49");
+
+group("fetch, URL and friends");
+test("fetch a local file", function () {
+  return fetch(location.href).then(function (r) { return r.text().then(function (t) { return [r.ok, t.indexOf("JavaScript test page") > 0]; }); });
+}, [true, true]);
+test("fetch a missing file fails cleanly", function () {
+  return fetch("file:///no/such/file.txt").then(function (r) { return !r.ok; }, function () { return true; });
+}, true);
+test("URL", function () {
+  var u = new URL("https://user@Example.com:8080/a/b/../c?x=1#h");
+  u.searchParams.append("y", "2 3");
+  return [u.host, u.pathname, u.href, new URL("../up", "http://h.com/a/b/c").href];
+}, ["example.com:8080", "/a/c", "https://user@example.com:8080/a/c?x=1&y=2+3#h", "http://h.com/a/up"]);
+test("URLSearchParams", function () {
+  var p = new URLSearchParams("a=1&b=x+y&a=2"); return [p.get("b"), p.getAll("a"), p.toString()];
+}, ["x y", ["1", "2"], "a=1&b=x+y&a=2"]);
+test("Headers and Response", function () {
+  var h = new Headers({"Content-Type": "text/plain"}); return Response.json({a: 1}).json().then(function (j) { return [h.get("content-type"), j]; });
+}, ["text/plain", {a: 1}]);
+test("AbortController", function () {
+  var c = new AbortController(), seen = []; c.signal.addEventListener("abort", function () { seen.push(c.signal.aborted); });
+  c.abort(); return [seen, c.signal.reason.name];
+}, [[true], "AbortError"]);
+test("structuredClone, atob, btoa", function () {
+  var o = {a: [1, {b: 2}], d: new Date(5)}; var c = structuredClone(o);
+  return [c.a[1].b, c.d.getTime(), c !== o, btoa("hello"), atob("aGVsbG8=")];
+}, [2, 5, true, "aGVsbG8=", "hello"]);
+
+group("Library");
+test("newer Array methods", function () {
+  return [[1, 2, 3, 4].findLast(function (x) { return x % 2; }), [1, 2, 3].at(-1), [[1, [2]], 3].flat(2), [3, 1, 2].toSorted(), [1, 2, 3].with(1, 9)];
+}, [3, 3, [1, 2, 3], [1, 2, 3], [1, 9, 3]]);
+test("Object.groupBy, hasOwn, fromEntries", function () {
+  return [Object.groupBy([1, 2, 3], function (x) { return x % 2 ? "odd" : "even"; }), Object.hasOwn({a: 1}, "a"), Object.fromEntries(new Map([["k", 1]]))];
+}, [{odd: [1, 3], even: [2]}, true, {k: 1}]);
+test("Reflect, WeakMap, Symbol", function () {
+  var wm = new WeakMap(), k = {}; wm.set(k, 1); var s = Symbol("x"), o = {}; o[s] = 1;
+  return [Reflect.has({a: 1}, "a"), wm.get(k), Object.keys(o).length, o[s]];
+}, [true, 1, 0, 1]);
+test("tagged templates and numeric separators", function () {
+  function tag(s, v) { return s[0] + "[" + v + "]" + s[1]; } return [tag`a${1}b`, String.raw`x\ny`, 1_000 + 1];
+}, ["a[1]b", "x\\ny", 1001]);
+test("regular expressions", function () {
+  return ["2024-05-06".match(/(?<y>\d+)-(?<m>\d+)/).groups.y, "abc".replace(/(?<=a)b/, "X"), /^.{3}$/.test("héé"),
+          "2024-05-06".replace(/(?<y>\d+)-(?<m>\d+)-(?<d>\d+)/, "$<d>/$<m>/$<y>")];
+}, ["2024", "aXc", true, "06/05/2024"]);
+test("labels, optional chaining, ??=, **", function () {
+  var o = {a: {b: [1]}}, n = null; n ??= 5;
+  outer: for (var i = 0; i < 3; i++) { for (var j = 0; j < 3; j++) { if (j == 1) continue outer; } }
+  return [o?.a?.b?.[0], o.x?.y, n, 2 ** 10, i];
+}, [1, undefined, 5, 1024, 3]);
+</script>
+</body>
+</html>

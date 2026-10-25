@@ -32,8 +32,16 @@ enum {
 };
 
 struct ast;
+struct coro;
 struct env;
 struct regex;
+
+/* A microtask: run(J, job) later, after the script that queued it returns. */
+struct job {
+    struct job *next;
+    void (*run)(struct js *J, struct job *job);
+    jsval a, b, c, d;
+};
 
 struct jsobj {
     uint8_t cls;
@@ -50,6 +58,8 @@ struct jsobj {
     js_native native;
     const char *name;
     int nargs;
+    struct jsobj *home;                 /* a method's home object, for super */
+    uint8_t is_class;                   /* a class constructor: not callable without new */
     struct jsobj *bound;                /* Function.prototype.bind */
     jsval bound_this;
     jsval *bound_args;
@@ -82,6 +92,14 @@ struct js {
     unsigned steps, step_limit;
     int depth;
     int dead;                           /* out of memory or time: no more scripts */
+    struct jsstr *s_home;               /* the hidden variable that holds a method's home object */
+    struct job *jobs, *jobs_tail;       /* the microtask queue (promises) */
+    int in_jobs;
+    struct jsobj *promise_proto, *generator_proto;
+    struct coro *cur_co, *co_live;      /* the running coroutine, all those with a stack */
+    int nco;
+    unsigned lazy_done;                 /* which lazily loaded library chunks have run (jslib2.c) */
+    struct jsobj *return_marker;        /* thrown to unwind a generator that is being closed */
     char err[512];
     char textbuf[1024];
 };
@@ -116,18 +134,50 @@ int js_is_array(jsval v);
 /* The keys for for-in and Object.keys, own and enumerable (inherited too if asked). */
 int js_keys(struct js *J, jsval obj, int inherited, struct jsstr ***out);
 
+/* Iteration (js.c): arrays, strings, array-likes and objects with a [Symbol.iterator]. */
+enum { IT_ARRAY, IT_STR, IT_LIKE, IT_OBJ };
+
+struct iter {
+    int kind;
+    struct jsobj *arr;
+    int i;
+    const char *sp, *send;
+    jsval obj, next;
+};
+
+int js_iter_open(struct js *J, jsval v, struct iter *it);
+int js_iter_next(struct js *J, struct iter *it, jsval *out);
+void js_iter_close(struct js *J, struct iter *it);
+
+void js_enqueue(struct js *J, void (*run)(struct js *, struct job *), jsval a, jsval b, jsval c, jsval d);
+void js_run_jobs(struct js *J);
+
 /* jslib.c */
 void js_init_lib(struct js *J);
+void js_init_lib2(struct js *J);          /* jslib2.c: Symbol, Promise, Reflect, ... */
+
+/* Promises (jslib2.c). Settling and resolving are safe to call twice. */
+jsval js_promise_new(struct js *J);
+void js_promise_resolve(struct js *J, jsval po, jsval v);       /* follows thenables */
+void js_promise_settle(struct js *J, jsval po, int state, jsval v);     /* state 1 fulfilled, 2 rejected */
+jsval js_promise_then(struct js *J, jsval po, jsval ok, jsval err);
+jsval js_promise_from(struct js *J, jsval v);                   /* Promise.resolve */
+int js_is_promise(jsval v);
+int js_promise_state(jsval po, jsval *value);                   /* -1 if not a promise */
+/* Call on_ok(self, value) or on_err(self, reason) when it settles. */
+void js_promise_watch(struct js *J, jsval po, js_native on_ok, js_native on_err, jsval self);
 struct jsstr *js_json_stringify(struct js *J, jsval v, const char *indent);
 jsval js_array_join(struct js *J, struct jsobj *a, const char *sep);
 
 /* jsre.c: backtracking regular expressions over UTF-8 bytes */
-#define RE_MAX_GROUPS 10
+#define RE_MAX_GROUPS 32
 struct regex *re_compile(struct js *J, const char *pattern, int len, const char *flags,
                          const char **error);
 /* Match at or after start; caps[2*i], caps[2*i+1] are group i's offsets (-1: unmatched). */
 int re_exec(struct regex *re, const char *s, int len, int start, int caps[2 * RE_MAX_GROUPS]);
 int re_ngroups(struct regex *re);
+const char *re_group_name(struct regex *re, int g);     /* NULL if group g is not named */
+int re_has_names(struct regex *re);
 int re_global(struct regex *re);
 int re_icase(struct regex *re);
 const char *re_source(struct regex *re);

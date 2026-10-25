@@ -41,6 +41,16 @@ int voodoo_screen_bytes(void);
 int voodoo_map3d(struct disp3d *d);
 void voodoo_proc_exit(int pid);
 
+/* ATI Radeon HD 4000 display driver (radeon.c) */
+void radeon_init(void);
+int radeon_present(void);
+void radeon_info(struct dispinfo *di);
+uint32_t radeon_map_size(void);         /* what fbmap maps */
+int radeon_flip(int page);
+int radeon_cursor(const struct dispcursor *dc);
+int radeon_cursor_pos(const struct disppos *p);
+void radeon_release(void);              /* the screen goes back to the console */
+
 /* ISA DMA (isadma.c). Modes: single transfers 0x40, auto-init 0x10, and
  * 0x08 to read memory (play) or 0x04 to write it (record). */
 int isa_dma_start(int ch, uint32_t phys, uint32_t len, uint8_t mode);

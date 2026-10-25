@@ -269,6 +269,9 @@ struct fbinfo {
 #define DISP_MODES   1          /* arg: struct dispmode[DISP_MAX_MODES]; returns the count */
 #define DISP_SETMODE 2          /* arg: const struct dispmode *; width 0: the boot mode */
 #define DISP_MAP3D   3          /* arg: struct disp3d *; maps the 3D engine */
+#define DISP_FLIP    4          /* arg: const struct dispflip *; shows a page (DISPF_FLIP) */
+#define DISP_CURSOR  5          /* arg: const struct dispcursor *; the hardware pointer */
+#define DISP_CURSORPOS 6        /* arg: const struct disppos *; moves the hardware pointer */
 
 #define DISP_MAX_MODES 32
 
@@ -276,6 +279,8 @@ struct fbinfo {
 #define DISPF_3D     0x2        /* has a 3D engine (DISP_MAP3D) */
 #define DISPF_EDID   0x4        /* edid[] holds the monitor's EDID block */
 #define DISPF_BOOT   0x8        /* the boot loader's mode is on the screen */
+#define DISPF_FLIP   0x10       /* fbmap maps two pages of the screen (DISP_FLIP) */
+#define DISPF_CURSOR 0x20       /* has a hardware pointer (DISP_CURSOR) */
 
 /* A video mode. DISP_MODES lists timings with bpp 0: each works at 16 or
  * 32 bits per pixel if the video memory holds it. */
@@ -298,6 +303,29 @@ struct dispinfo {
     struct dispmode mode;       /* on the screen now */
     struct dispmode boot;       /* what the boot loader set */
     uint8_t  edid[128];
+    uint32_t page_offset;       /* DISPF_FLIP: where page 1 starts in what fbmap maps */
+};
+
+/* DISP_FLIP: show page 0 or 1 of what fbmap maps, from the next vertical
+ * blank. Only the process that has the screen may flip; the call returns
+ * once the page is on the screen, so the other one is free to draw on.
+ * The screen goes back to page 0 when that process exits. */
+struct dispflip {
+    uint32_t page;
+};
+
+/* DISP_CURSOR: the hardware pointer's picture, 0xAARRGGBB with alpha 0
+ * (transparent) or 255. The hot spot is the pixel DISP_CURSORPOS places. */
+#define DISP_CURSOR_SIZE 64
+
+struct dispcursor {
+    uint32_t show;              /* 0 hides the pointer, the rest is then ignored */
+    uint16_t hot_x, hot_y;
+    uint32_t image[DISP_CURSOR_SIZE * DISP_CURSOR_SIZE];
+};
+
+struct disppos {
+    int32_t x, y;               /* the hot spot, in screen pixels */
 };
 
 /* DISP_MAP3D: the 3D engine's registers and all of video memory, mapped

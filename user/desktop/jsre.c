@@ -4,11 +4,16 @@
  *
  * Supported: literals, ., character classes with ranges and negation,
  * \d \w \s and their negations, \b \B, anchors (^ $, multiline with m),
- * groups (capturing, (?:...), (?<name>...) counted as capturing),
- * lookahead (?= and ?!), backreferences \1-\9, alternation, and the
- * quantifiers * + ? {n} {n,} {n,m}, greedy or lazy. Flags g, i, m, s, y
- * (u is accepted). Case folding is ASCII only, and . or a class matches
- * one byte, not one character.
+ * groups (capturing, (?:...), named (?<name>...) with \k<name>),
+ * lookahead (?= and ?!), lookbehind (?<= and ?<!), backreferences \1-\9,
+ * alternation, and the quantifiers * + ? {n} {n,} {n,m}, greedy or lazy.
+ * Flags g, i, m, s, y (u, d and v are accepted). Case folding is ASCII
+ * only. . and the classes match one character, which may be several bytes
+ * of UTF-8; a class can only name characters below U+0100 one by one, and
+ * any other character is in it when the class is negated.
+ *
+ * A lookbehind tries every start position back from the current one and
+ * keeps the first from which its pattern ends exactly here.
  *
  * The matcher keeps its backtracking points on a heap stack instead of
  * recursing, so long subjects cannot overflow the C stack; a pattern that
@@ -23,7 +28,7 @@
 
 enum {
     R_CHAR, R_ANY, R_CLASS, R_SPLIT, R_JMP, R_SAVE, R_MATCH, R_BOL, R_EOL, R_WORDB, R_NWORDB,
-    R_BACKREF, R_LOOK, R_NLOOK,
+    R_BACKREF, R_LOOK, R_NLOOK, R_LBEH, R_NLBEH, R_LBEND,
 };
 
 struct rinst {
@@ -34,11 +39,13 @@ struct rinst {
 struct regex {
     struct rinst *code;
     int n;
-    uint32_t (*classes)[8];
+    uint32_t (*classes)[9];             /* 256 bits for U+0000-U+00FF, then a word for the rest */
     int nclasses;
     int ngroups;
     int global, icase, multiline, dotall, sticky;
     char *source, *flags;
+    const char *names[RE_MAX_GROUPS];   /* named groups, by number */
+    int nnames;
 };
 
 struct frag {
@@ -79,7 +86,7 @@ static int new_class(struct rparser *P)
     struct regex *re = P->re;
     if (re->nclasses == P->class_cap) {
         int nc = P->class_cap ? P->class_cap * 2 : 8;
-        uint32_t (*n)[8] = js_alloc(P->J, sizeof(*n) * (size_t)nc);
+        uint32_t (*n)[9] = js_alloc(P->J, sizeof(*n) * (size_t)nc);
         if (re->nclasses)
             memcpy(n, re->classes, sizeof(*n) * (size_t)re->nclasses);
         re->classes = n;
@@ -108,7 +115,7 @@ static void class_range(uint32_t *bits, int lo, int hi)
 /* \d \w \s and their capitals into bits. */
 static void class_escape(uint32_t *bits, char e)
 {
-    uint32_t tmp[8] = { 0 };
+    uint32_t tmp[9] = { 0 };
     switch (e | 32) {
     case 'd': class_range(tmp, '0', '9'); break;
     case 'w': class_range(tmp, '0', '9'); class_range(tmp, 'a', 'z'); class_range(tmp, 'A', 'Z'); class_set(tmp, '_'); break;
@@ -120,6 +127,8 @@ static void class_escape(uint32_t *bits, char e)
     int negate = e >= 'A' && e <= 'Z';
     for (int i = 0; i < 8; i++)
         bits[i] |= negate ? ~tmp[i] : tmp[i];
+    if (negate)
+        bits[8] = 1;                    /* \W, \D, \S: any other character */
 }
 
 static int hexd(int c)
@@ -228,20 +237,26 @@ static int parse_class(struct rparser *P, struct frag *f)
         if (lo > hi)
             return P->error = "range out of order in character class", -1;
         if (lo >= 0x80) {
-            /* A non-ASCII range: allow every byte of multi-byte characters. */
+            /* A non-ASCII range: Latin-1 as a whole, and a flag for anything above. */
             class_range(bits, 0x80, 0xFF);
+            if (hi >= 0x100)
+                bits[8] = 1;
             continue;
         }
         class_range(bits, lo, hi < 0x80 ? hi : 0x7F);
         if (hi >= 0x80)
             class_range(bits, 0x80, 0xFF);
+        if (hi >= 0x100)
+            bits[8] = 1;
     }
     if (P->s >= P->end)
         return P->error = "unterminated character class", -1;
     P->s++;
-    if (negate)
+    if (negate) {
         for (int i = 0; i < 8; i++)
             bits[i] = ~bits[i];
+        bits[8] = !bits[8];
+    }
     femit(P, f, R_CLASS, k, 0);
     return 0;
 }
@@ -254,7 +269,9 @@ static int parse_atom(struct rparser *P, struct frag *f)
     switch (c) {
     case '(': {
         P->s++;
-        int capture = 1, look = 0;
+        int capture = 1, look = 0, behind = 0;
+        const char *name = NULL;
+        int name_len = 0;
         if (P->s < P->end && *P->s == '?') {
             P->s++;
             if (P->s < P->end && *P->s == ':') {
@@ -264,18 +281,30 @@ static int parse_atom(struct rparser *P, struct frag *f)
                 look = *P->s == '=' ? R_LOOK : R_NLOOK;
                 capture = 0;
                 P->s++;
-            } else if (P->s < P->end && *P->s == '<' && P->s + 1 < P->end && P->s[1] != '=' && P->s[1] != '!') {
+            } else if (P->s + 1 < P->end && *P->s == '<' && (P->s[1] == '=' || P->s[1] == '!')) {
+                look = P->s[1] == '=' ? R_LBEH : R_NLBEH;
+                behind = 1;
+                capture = 0;
+                P->s += 2;
+            } else if (P->s < P->end && *P->s == '<') {
+                const char *q = ++P->s;
                 while (P->s < P->end && *P->s != '>')
                     P->s++;
-                if (P->s < P->end)
-                    P->s++;
+                if (P->s >= P->end)
+                    return P->error = "unterminated group name", -1;
+                name = q;
+                name_len = (int)(P->s - q);
+                P->s++;
             } else {
-                return P->error = "lookbehind and other (? groups are not supported", -1;
+                return P->error = "this (? group is not supported", -1;
             }
         }
         int g = -1;
-        if (capture && P->groups < RE_MAX_GROUPS - 1)
+        if (capture && P->groups < RE_MAX_GROUPS - 1) {
             g = ++P->groups;
+            if (name)
+                P->re->names[g] = js_mkstr(P->J, name, name_len)->s, P->re->nnames++;
+        }
         struct frag body = { 0 };
         if (parse_alt(P, &body) < 0)
             return -1;
@@ -285,7 +314,7 @@ static int parse_atom(struct rparser *P, struct frag *f)
         if (look) {
             femit(P, f, look, body.n + 1, 0);
             fappend(P, f, &body);
-            femit(P, f, R_MATCH, 0, 0);
+            femit(P, f, behind ? R_LBEND : R_MATCH, 0, 0);
             return 0;
         }
         if (g >= 0)
@@ -331,6 +360,19 @@ static int parse_atom(struct rparser *P, struct frag *f)
             P->s++;
             femit(P, f, R_BACKREF, e - '0', 0);
             return 0;
+        }
+        if (e == 'k' && P->s + 1 < P->end && P->s[1] == '<') {     /* \k<name> */
+            const char *q = P->s + 2, *close = q;
+            while (close < P->end && *close != '>')
+                close++;
+            for (int g = 1; close < P->end && g <= P->groups; g++) {
+                if (P->re->names[g] && (int)strlen(P->re->names[g]) == close - q &&
+                    !memcmp(P->re->names[g], q, (size_t)(close - q))) {
+                    P->s = close + 1;
+                    femit(P, f, R_BACKREF, g, 0);
+                    return 0;
+                }
+            }
         }
         emit_char(P, f, escape_char(P));
         return 0;
@@ -473,7 +515,7 @@ struct regex *re_compile(struct js *J, const char *pattern, int len, const char 
         case 'm': re->multiline = 1; break;
         case 's': re->dotall = 1; break;
         case 'y': re->sticky = 1; break;
-        case 'u': case 'd': break;
+        case 'u': case 'd': case 'v': break;
         default:
             *error = "invalid flags";
             return NULL;
@@ -510,7 +552,29 @@ struct matcher {
     struct bt *stack;
     int top, cap;
     long steps;
+    int lb_target;                      /* where the lookbehind being tried must end */
 };
+
+/* The character at s[sp]: its code point, and how many bytes it takes. */
+static int char_at(const unsigned char *s, int len, int sp, int *size)
+{
+    int c = s[sp];
+    int n = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+    if (n == 1 || sp + n > len) {
+        *size = 1;
+        return c;
+    }
+    int cp = c & (0xFF >> (n + 1));
+    for (int i = 1; i < n; i++) {
+        if ((s[sp + i] & 0xC0) != 0x80) {
+            *size = 1;
+            return c;
+        }
+        cp = cp << 6 | (s[sp + i] & 0x3F);
+    }
+    *size = n;
+    return cp;
+}
 
 static int lower(int c)
 {
@@ -561,10 +625,13 @@ static int run(struct matcher *m, int pc, int sp, int *caps)
                 pc++, sp++;
             break;
         case R_ANY:
-            if (sp >= m->len || (!re->dotall && (m->s[sp] == '\n' || m->s[sp] == '\r')))
+            if (sp >= m->len || (!re->dotall && (m->s[sp] == '\n' || m->s[sp] == '\r'))) {
                 ok = 0;
-            else
-                pc++, sp++;
+            } else {
+                int size;
+                char_at(m->s, m->len, sp, &size);
+                pc++, sp += size;
+            }
             break;
         case R_CLASS: {
             const uint32_t *bits = re->classes[in->x];
@@ -572,12 +639,17 @@ static int run(struct matcher *m, int pc, int sp, int *caps)
                 ok = 0;
                 break;
             }
-            int c = m->s[sp];
-            int hit = class_has(bits, c);
-            if (!hit && re->icase && c < 0x80)
-                hit = class_has(bits, lower(c)) || class_has(bits, c >= 'a' && c <= 'z' ? c - 32 : c);
+            int size = 1, c = m->s[sp], hit;
+            if (c < 0x80) {
+                hit = class_has(bits, c);
+                if (!hit && re->icase)
+                    hit = class_has(bits, lower(c)) || class_has(bits, c >= 'a' && c <= 'z' ? c - 32 : c);
+            } else {
+                int cp = char_at(m->s, m->len, sp, &size);
+                hit = cp < 0x100 ? class_has(bits, cp) : (int)(bits[8] & 1);
+            }
             if (hit)
-                pc++, sp++;
+                pc++, sp += size;
             else
                 ok = 0;
             break;
@@ -639,6 +711,37 @@ static int run(struct matcher *m, int pc, int sp, int *caps)
                 pc++, sp += n;
             break;
         }
+        case R_LBEND:                   /* the end of a lookbehind's pattern: only here */
+            if (sp == m->lb_target) {
+                m->top = base;
+                return 1;
+            }
+            ok = 0;
+            break;
+        case R_LBEH:
+        case R_NLBEH: {
+            int sub[2 * RE_MAX_GROUPS], hit = 0, saved_target = m->lb_target;
+            memcpy(sub, caps, sizeof(sub));
+            m->lb_target = sp;
+            for (int from = sp; from >= 0 && !hit; from--) {
+                if (from < m->len && (m->s[from] & 0xC0) == 0x80)
+                    continue;           /* inside a character */
+                hit = run(m, pc + 1, from, sub);
+                if (m->steps > MAX_STEPS)
+                    break;
+            }
+            m->lb_target = saved_target;
+            if (m->steps > MAX_STEPS)
+                goto fail_all;
+            if (hit != (in->op == R_LBEH)) {
+                ok = 0;
+                break;
+            }
+            if (hit)
+                memcpy(caps, sub, sizeof(sub));
+            pc += in->x + 1;
+            break;
+        }
         case R_LOOK:
         case R_NLOOK: {
             int sub[2 * RE_MAX_GROUPS];
@@ -680,7 +783,7 @@ fail_all:
 
 int re_exec(struct regex *re, const char *s, int len, int start, int caps[2 * RE_MAX_GROUPS])
 {
-    struct matcher m = { re, (const unsigned char *)s, len, NULL, 0, 0, 0 };
+    struct matcher m = { re, (const unsigned char *)s, len, NULL, 0, 0, 0, 0 };
     int found = -1;
     int anchored = re->code[1].op == R_BOL && !re->multiline;
     for (int at = start; at <= len; at++) {
@@ -707,6 +810,17 @@ int re_exec(struct regex *re, const char *s, int len, int start, int caps[2 * RE
 int re_ngroups(struct regex *re)
 {
     return re->ngroups;
+}
+
+/* The name of group g (from 1), or NULL; re_has_names says if any has one. */
+const char *re_group_name(struct regex *re, int g)
+{
+    return g > 0 && g < RE_MAX_GROUPS ? re->names[g] : NULL;
+}
+
+int re_has_names(struct regex *re)
+{
+    return re->nnames;
 }
 
 int re_global(struct regex *re)
