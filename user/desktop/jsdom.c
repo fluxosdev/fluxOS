@@ -59,6 +59,9 @@ struct jsdom {
     struct jsobj *xhr[MAX_XHR];         /* requests in flight, by id */
     struct jsobj *xhr_proto;
     unsigned int started;               /* uptime when the page's scripts began */
+    struct jsobj **wraps;               /* every node's wrapper, for the collector (not roots) */
+    int nwraps, wrap_cap;
+    unsigned gcpass;
 };
 
 static const struct jsclass node_class, document_class, style_class, classlist_class,
@@ -769,9 +772,84 @@ static jsval wrap(struct jsdom *d, struct node *n)
     if (!n->js) {
         struct jsobj *o = js_new_host(d->J, &node_class, n);
         o->proto = d->element_proto;
+        if (d->nwraps == d->wrap_cap) {
+            int cap = d->wrap_cap ? d->wrap_cap * 2 : 256;
+            struct jsobj **nw = realloc(d->wraps, sizeof(*nw) * (size_t)cap);
+            if (!nw)
+                js_gc_pause(d->J, 1);   /* it could not be forgotten when it dies: never collect */
+            else
+                d->wraps = nw, d->wrap_cap = cap;
+        }
+        if (d->nwraps < d->wrap_cap)
+            d->wraps[d->nwraps++] = o;
         n->js = o;
     }
     return js_obj(n->js);
+}
+
+/*
+ * The collector and the wrappers. A node's wrapper holds its listeners and
+ * whatever scripts stored on it, so it lives as long as the node can be
+ * reached: every wrapper in the document lives, and so does every wrapper
+ * in a detached tree that a living wrapper is part of. Dead ones are
+ * forgotten (wrap makes a fresh one if the node turns up again).
+ */
+static int mark_tree(struct jsdom *d, struct node *root)
+{
+    int any = 0;
+    root->gcpass = d->gcpass;
+    for (struct node *n = root; n; n = node_next(n, root))
+        if (n->js && !js_gc_marked(d->J, n->js)) {
+            js_gc_mark(d->J, n->js);
+            any = 1;
+        }
+    return any;
+}
+
+static void gc_mark(struct js *J, void *ctx)
+{
+    (void)J;
+    struct jsdom *d = ctx;
+    if (!++d->gcpass)
+        d->gcpass = 1;
+    if (d->h.root)
+        mark_tree(d, d->h.root);
+}
+
+static int gc_more(struct js *J, void *ctx)
+{
+    struct jsdom *d = ctx;
+    int any = 0;
+    for (int i = 0; i < d->nwraps; i++) {
+        struct jsobj *o = d->wraps[i];
+        if (!js_gc_marked(J, o))
+            continue;
+        struct node *r = js_host_data(o, &node_class);
+        if (!r)
+            continue;
+        while (r->parent)
+            r = r->parent;
+        if (r->gcpass != d->gcpass)
+            any |= mark_tree(d, r);
+    }
+    return any;
+}
+
+static void gc_sweep(struct js *J, void *ctx)
+{
+    struct jsdom *d = ctx;
+    int k = 0;
+    for (int i = 0; i < d->nwraps; i++) {
+        struct jsobj *o = d->wraps[i];
+        if (js_gc_marked(J, o)) {
+            d->wraps[k++] = o;
+            continue;
+        }
+        struct node *n = js_host_data(o, &node_class);
+        if (n && n->js == o)
+            n->js = NULL;
+    }
+    d->nwraps = k;
 }
 
 static struct node *node_of(jsval v)
@@ -3070,6 +3148,9 @@ struct jsdom *jsdom_new(const struct jshost *host)
         return NULL;
     }
     struct js *J = d->J;
+    js_gc_root(J, d, sizeof(*d));       /* the window, prototypes, timers and requests */
+    struct js_gc_hooks hooks = { d, gc_mark, gc_more, gc_sweep };
+    js_gc_hooks(J, &hooks);
     struct jsobj *w = d->window = js_global(J);
     jsval wv = js_obj(w);
 
@@ -3155,7 +3236,7 @@ struct jsdom *jsdom_new(const struct jshost *host)
 
     struct jsobj *nav = js_new_object(J);
     jsval nv = js_obj(nav);
-    js_set(J, nv, "userAgent", js_str(J, "Mozilla/5.0 (fluxOS; i686) FluxBrowser/1.0"));
+    js_set(J, nv, "userAgent", js_str(J, BROWSER_USER_AGENT));
     js_set(J, nv, "appName", js_str(J, "Netscape"));
     js_set(J, nv, "appVersion", js_str(J, "5.0 (fluxOS)"));
     js_set(J, nv, "platform", js_str(J, "fluxOS i686"));
@@ -3297,6 +3378,7 @@ void jsdom_free(struct jsdom *d)
     if (!d)
         return;
     js_free(d->J);
+    free(d->wraps);
     free(d);
 }
 

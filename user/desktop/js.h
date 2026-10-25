@@ -3,9 +3,9 @@
  * a practical subset of ES5 and ES6, and its built-in objects. jsdom.c
  * binds it to the document.
  *
- * Everything a page's scripts allocate comes from one arena and is freed
- * with the page; there is no garbage collector, only a limit. A script
- * that runs too long, or allocates too much, is stopped with an error.
+ * What a page's scripts allocate is garbage collected (jsgc.c), within a
+ * limit. A script that runs too long, or keeps too much, is stopped with
+ * an error.
  *
  * Numbers are doubles, so js.c and jsdom.c are compiled with the FPU on.
  */
@@ -41,6 +41,28 @@ struct jsclass {
     int (*get)(struct js *J, struct jsobj *o, const char *key, jsval *out);
     int (*set)(struct js *J, struct jsobj *o, const char *key, jsval v);
 };
+
+/*
+ * The garbage collector finds what is alive from the engine's own memory,
+ * the stacks and the program's globals. Hosts register any other memory
+ * that holds engine values; a host whose memory points into the heap
+ * without keeping things alive (DOM nodes and their wrappers) hooks into
+ * each collection: mark marks what must stay (js_gc_mark), more marks what
+ * the marked things keep alive and says whether it marked anything, sweep
+ * forgets what is not marked. Hooks must not allocate.
+ */
+struct js_gc_hooks {
+    void *ctx;
+    void (*mark)(struct js *J, void *ctx);
+    int (*more)(struct js *J, void *ctx);
+    void (*sweep)(struct js *J, void *ctx);
+};
+void js_gc_root(struct js *J, const void *p, size_t n);
+void js_gc_unroot(struct js *J, const void *p);
+void js_gc_hooks(struct js *J, const struct js_gc_hooks *hooks);
+void js_gc_mark(struct js *J, const void *p);
+int js_gc_marked(struct js *J, const void *p);
+void js_gc_pause(struct js *J, int pause);          /* 1: no collections until a 0 */
 
 struct js *js_new(void *host);
 void js_free(struct js *J);

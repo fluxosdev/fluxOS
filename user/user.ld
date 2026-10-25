@@ -18,6 +18,9 @@ SECTIONS
 
     . = ALIGN(4096);
 
+    /* the desktop's script engine scans globals for pointers (jsgc.c) */
+    __gc_data_start = .;
+
     .data :
     {
         *(.data .data.*)
@@ -28,6 +31,8 @@ SECTIONS
         *(COMMON)
         *(.bss .bss.*)
     }
+
+    __gc_data_end = .;
 
     /DISCARD/ :
     {

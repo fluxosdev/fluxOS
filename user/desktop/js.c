@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <flux.h>
 #include "jsint.h"
 
 const jsval js_undefined = { JS_UNDEF, { 0 } };
@@ -49,11 +50,18 @@ static void bail(struct js *J, const char *why)
     __builtin_longjmp(jmp_target, 1);
 }
 
-void *js_alloc(struct js *J, size_t n)
+static void *alloc_kind(struct js *J, size_t n, int atomic)
 {
-    if (J->arena.used + n > JS_HEAP_LIMIT && entered)
-        bail(J, "the page's scripts ran out of memory");
-    void *p = arena_alloc(&J->arena, n);
+    if (gc_heap_bytes(J) + n > J->heap_limit && entered) {
+        gc_collect(J);
+        if (gc_heap_bytes(J) + n > J->heap_limit)
+            bail(J, "the page's scripts ran out of memory");
+    }
+    void *p = gc_alloc(J, n, atomic);
+    if (!p) {
+        gc_collect(J);
+        p = gc_alloc(J, n, atomic);
+    }
     if (!p) {
         if (entered)
             bail(J, "the page's scripts ran out of memory");
@@ -62,9 +70,19 @@ void *js_alloc(struct js *J, size_t n)
     return p;
 }
 
+void *js_alloc(struct js *J, size_t n)
+{
+    return alloc_kind(J, n, 0);
+}
+
+void *js_alloc_atomic(struct js *J, size_t n)
+{
+    return alloc_kind(J, n, 1);
+}
+
 struct jsstr *js_mkstr(struct js *J, const char *s, int n)
 {
-    struct jsstr *r = js_alloc(J, sizeof(struct jsstr) + (size_t)n + 1);
+    struct jsstr *r = js_alloc_atomic(J, sizeof(struct jsstr) + (size_t)n + 1);
     r->len = n;
     if (n)
         memcpy(r->s, s, (size_t)n);
@@ -74,7 +92,7 @@ struct jsstr *js_mkstr(struct js *J, const char *s, int n)
 
 struct jsstr *js_concat(struct js *J, struct jsstr *a, struct jsstr *b)
 {
-    struct jsstr *r = js_alloc(J, sizeof(struct jsstr) + (size_t)a->len + (size_t)b->len + 1);
+    struct jsstr *r = js_alloc_atomic(J, sizeof(struct jsstr) + (size_t)a->len + (size_t)b->len + 1);
     r->len = a->len + b->len;
     memcpy(r->s, a->s, (size_t)a->len);
     memcpy(r->s + a->len, b->s, (size_t)b->len);
@@ -425,6 +443,14 @@ struct jsstr *js_tostr(struct js *J, jsval v)
     case JS_NULL: return js_mkstr(J, "null", 4);
     case JS_BOOL: return v.u.b ? js_mkstr(J, "true", 4) : js_mkstr(J, "false", 5);
     case JS_NUM:
+        if (v.u.n >= 0 && v.u.n < 256 && v.u.n == (int)v.u.n) {
+            int k = (int)v.u.n;
+            if (!J->small_ints[k]) {
+                snprintf(buf, sizeof(buf), "%d", k);
+                J->small_ints[k] = js_mkstr(J, buf, (int)strlen(buf));
+            }
+            return J->small_ints[k];
+        }
         js_numtostr(v.u.n, buf);
         return js_mkstr(J, buf, (int)strlen(buf));
     case JS_STR: return v.u.s;
@@ -1518,6 +1544,8 @@ struct parser {
     int fn_uses_args;
     const char *where;
     int in_async, in_gen;               /* parsing the body of an async function, a generator */
+    struct jsstr **names;               /* the names seen so far, hashed (tok_name) */
+    int names_cap, nnames;
 };
 
 static struct ast *mk(struct parser *P, int kind)
@@ -1569,9 +1597,39 @@ static int expect(struct parser *P, const char *s)
     return fail_parse(P, msg);
 }
 
+/* A name's string: one copy for every use of the same name in a script. */
 static struct jsstr *tok_name(struct parser *P, const struct tok *t)
 {
-    return js_mkstr(P->J, t->p, t->len);
+    if (P->names_cap == 0 || P->nnames * 2 >= P->names_cap) {
+        int cap = P->names_cap ? P->names_cap * 2 : 1024;
+        struct jsstr **nt = calloc((size_t)cap, sizeof(*nt));
+        if (!nt)
+            return js_mkstr(P->J, t->p, t->len);
+        for (int i = 0; i < P->names_cap; i++) {
+            struct jsstr *x = P->names[i];
+            if (!x)
+                continue;
+            unsigned h = 2166136261u;
+            for (int k = 0; k < x->len; k++)
+                h = (h ^ (unsigned char)x->s[k]) * 16777619u;
+            unsigned j = h & (unsigned)(cap - 1);
+            while (nt[j])
+                j = (j + 1) & (unsigned)(cap - 1);
+            nt[j] = x;
+        }
+        free(P->names);
+        P->names = nt;
+        P->names_cap = cap;
+    }
+    unsigned h = 2166136261u;
+    for (int k = 0; k < t->len; k++)
+        h = (h ^ (unsigned char)t->p[k]) * 16777619u;
+    unsigned j = h & (unsigned)(P->names_cap - 1);
+    for (struct jsstr *x; (x = P->names[j]); j = (j + 1) & (unsigned)(P->names_cap - 1))
+        if (x->len == t->len && !memcmp(x->s, t->p, (size_t)t->len))
+            return x;
+    P->nnames++;
+    return P->names[j] = js_mkstr(P->J, t->p, t->len);
 }
 
 static void list_add(struct parser *P, struct ast ***list, int *n, int *cap, struct ast *x)
@@ -2956,16 +3014,19 @@ static void prepare_body(struct js *J, struct ast *body, struct fninfo *fi)
     }
 }
 
+/* No collections while parsing: the tokens' strings are in memory the collector does not scan. */
 static struct ast *parse(struct js *J, const char *src, int len, const char *where, int expr_only)
 {
     struct lexer L = { J, src, src + len, 1, NULL, 0, 0, NULL, 0 };
+    J->gc_inhibit++;
     if (lex(&L) < 0) {
         snprintf(J->err, sizeof(J->err), "SyntaxError: %s (%s, line %d)", L.error ? L.error : "?",
                  where, L.error_line);
         free(L.toks);
+        J->gc_inhibit--;
         return NULL;
     }
-    struct parser P = { J, L.toks, 0, L.n, NULL, 0, 0, 0, where, 0, 0 };
+    struct parser P = { J, L.toks, 0, L.n, NULL, 0, 0, 0, where, 0, 0, NULL, 0, 0 };
     struct ast *prog;
     if (expr_only) {
         prog = expression(&P);
@@ -2986,7 +3047,9 @@ static struct ast *parse(struct js *J, const char *src, int len, const char *whe
         snprintf(J->err, sizeof(J->err), "SyntaxError: %s (%s, line %d)", P.error, where, P.error_line);
         prog = NULL;
     }
+    free(P.names);
     free(L.toks);
+    J->gc_inhibit--;
     return prog;
 }
 
@@ -5171,6 +5234,60 @@ static void co_free_all(struct js *J)
     J->nco = 0;
 }
 
+/* ---- for the garbage collector ---- */
+
+#define MAIN_STACK_TOP 0xC0000000u      /* the kernel puts a program's stack below here */
+#define MAIN_STACK_LOW (MAIN_STACK_TOP - (8u << 20))
+
+static int on_stack(const char *p, const char *lo, const char *hi)
+{
+    return p >= lo && p < hi;
+}
+
+/*
+ * The main stack and every coroutine's: each is scanned from the lowest
+ * place its frames may reach: where the engine is running now, where a
+ * coroutine switched away from it, or where it was left suspended.
+ */
+int js_gc_scan_stacks(struct js *J, const char *sp,
+                      void (*scan)(struct js *J, const void *lo, const void *hi))
+{
+    const char *mlo = (const char *)MAIN_STACK_LOW, *mhi = (const char *)MAIN_STACK_TOP;
+    int known = on_stack(sp, mlo, mhi);
+    const char *main_from = known ? sp : NULL;
+    for (struct coro *co = J->co_live; co; co = co->next_live) {
+        if (!co->stack)
+            continue;
+        const char *lo = co->stack, *hi = (const char *)co->stack + CORO_STACK;
+        const char *from = on_stack(co->sp, lo, hi) ? co->sp : lo;
+        if (on_stack(sp, lo, hi)) {
+            known = 1;
+            if (sp < from)
+                from = sp;
+        }
+        for (struct coro *x = J->co_live; x; x = x->next_live)
+            if (on_stack(x->caller_sp, lo, hi) && (const char *)x->caller_sp < from)
+                from = x->caller_sp;
+        scan(J, from, hi);
+    }
+    for (struct coro *x = J->co_live; x; x = x->next_live)
+        if (on_stack(x->caller_sp, mlo, mhi) && (!main_from || (const char *)x->caller_sp < main_from))
+            main_from = x->caller_sp;
+    if (!known)
+        return -1;
+    if (main_from)
+        scan(J, main_from, mhi);
+    return 0;
+}
+
+void js_gc_before(struct js *J)
+{
+    if (free_owner == J) {              /* recycled scopes: garbage now, unless still in use */
+        free_envs = NULL;
+        free_bindings = NULL;
+    }
+}
+
 /* ---- microtasks ---- */
 
 void js_enqueue(struct js *J, void (*run)(struct js *, struct job *), jsval a, jsval b, jsval c, jsval d)
@@ -5348,8 +5465,18 @@ struct js *js_new(void *host)
     struct js *J = calloc(1, sizeof(*J));
     if (!J)
         return NULL;
+    J->heap = gc_new();
+    if (!J->heap) {
+        free(J);
+        return NULL;
+    }
+    J->gc_inhibit = 1;                  /* no collections until the library is in place */
     J->host = host;
     J->step_limit = JS_STEP_LIMIT;
+    struct meminfo mi;
+    J->heap_limit = JS_HEAP_MIN;
+    if (meminfo(&mi) == 0 && mi.free_kb / 2 > (JS_HEAP_MIN >> 10))
+        J->heap_limit = mi.free_kb / 2 < (JS_HEAP_MAX >> 10) ? (size_t)(mi.free_kb / 2) << 10 : JS_HEAP_MAX;
     J->s_home = js_mkstr(J, "%home", 5);
     J->object_proto = js_mkobj(J, C_OBJECT, NULL);
     J->function_proto = js_mkobj(J, C_FUNCTION, J->object_proto);
@@ -5362,6 +5489,7 @@ struct js *js_new(void *host)
     js_init_lib(J);
     js_define_native(J, J->global, "eval", global_eval, 1);
     init_generators(J);
+    J->gc_inhibit = 0;
     return J;
 }
 
@@ -5377,6 +5505,6 @@ void js_free(struct js *J)
     if (active == J)
         active = NULL;
     co_free_all(J);
-    arena_free(&J->arena);
+    gc_destroy(J);
     free(J);
 }

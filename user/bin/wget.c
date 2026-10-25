@@ -398,7 +398,7 @@ static void read_response(struct response *r)
 
 int main(int argc, char **argv)
 {
-    const char *url_arg = NULL, *output = NULL;
+    const char *url_arg = NULL, *output = NULL, *user_agent = USER_AGENT;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "-q") || !strcmp(a, "--quiet"))
@@ -417,9 +417,13 @@ int main(int argc, char **argv)
             max_redirect = atoi(a + 15);
         else if (!strncmp(a, "--post-data=", 12))
             post_data = a + 12;
+        else if (!strcmp(a, "-U") && i + 1 < argc)
+            user_agent = argv[++i];
+        else if (!strncmp(a, "--user-agent=", 13))
+            user_agent = a + 13;
         else if (a[0] == '-' && a[1])
             fail(EXIT_USAGE, "unknown option '%s'\nusage: wget [-q] [-O FILE] [-T SECONDS] "
-                 "[--save-headers] [--content-on-error] [--max-redirect=N] URL", a);
+                 "[--save-headers] [--content-on-error] [--max-redirect=N] [-U AGENT] URL", a);
         else
             url_arg = a;
     }
@@ -444,10 +448,10 @@ int main(int argc, char **argv)
         else
             snprintf(host, sizeof(host), "%s:%d", u.host, u.port);
         int n = snprintf(req, sizeof(req),
-                         "%s %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: " USER_AGENT "\r\n"
+                         "%s %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: %s\r\n"
                          "Accept: text/html, text/css, image/png, */*;q=0.5\r\n"
                          "Accept-Encoding: identity\r\nConnection: close\r\n",
-                         post_data ? "POST" : "GET", u.path, host);
+                         post_data ? "POST" : "GET", u.path, host, user_agent);
         if (post_data)
             n += snprintf(req + n, sizeof(req) - (size_t)n,
                           "Content-Type: application/x-www-form-urlencoded\r\n"

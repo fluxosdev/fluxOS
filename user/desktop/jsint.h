@@ -9,7 +9,10 @@
 #include "js.h"
 #include "web.h"
 
-#define JS_HEAP_LIMIT (48u << 20)       /* bytes a page's scripts may allocate */
+/* Bytes a page's scripts may allocate: half the memory free when the page
+ * opens, within these bounds. */
+#define JS_HEAP_MIN   (48u << 20)
+#define JS_HEAP_MAX   (512u << 20)
 #define JS_STEP_LIMIT 40000000u         /* steps one entry into the engine may take (a second or so) */
 #define JS_MAX_DEPTH  180               /* nested calls */
 
@@ -73,8 +76,11 @@ struct jsobj {
     struct regex *re;
 };
 
+struct gcheap;
+
 struct js {
-    struct arena arena;
+    struct gcheap *heap;                /* jsgc.c */
+    int gc_inhibit;                     /* no collections while this is above 0 (parsing) */
     void *host;
     struct jsobj *global;
     struct env *genv;
@@ -90,12 +96,16 @@ struct js {
     struct jsstr *label;                /* break/continue label */
     int constructing;                   /* a native called with new */
     unsigned steps, step_limit;
+    size_t heap_limit;
+    struct jsstr *small_ints[256];      /* "0" to "255", made once: common property keys */
     int depth;
     int dead;                           /* out of memory or time: no more scripts */
     struct jsstr *s_home;               /* the hidden variable that holds a method's home object */
     struct job *jobs, *jobs_tail;       /* the microtask queue (promises) */
     int in_jobs;
     struct jsobj *promise_proto, *generator_proto;
+    struct jsobj *map_proto, *set_proto, *seqiter_proto, *buffer_proto;
+    struct jsstr *s_value, *s_done;     /* iterator results' keys */
     struct coro *cur_co, *co_live;      /* the running coroutine, all those with a stack */
     int nco;
     unsigned lazy_done;                 /* which lazily loaded library chunks have run (jslib2.c) */
@@ -104,8 +114,21 @@ struct js {
     char textbuf[1024];
 };
 
+/* jsgc.c: the garbage-collected heap */
+struct gcheap *gc_new(void);
+void *gc_alloc(struct js *J, size_t n, int atomic);    /* zeroed; NULL if out of memory */
+void gc_collect(struct js *J);
+void gc_destroy(struct js *J);
+size_t gc_heap_bytes(struct js *J);                     /* in use, garbage included */
+/* js.c, for the collector: scan the live part of each stack the engine may be
+ * running on (sp is where this one is now); -1 if sp is on none it knows. */
+int js_gc_scan_stacks(struct js *J, const char *sp,
+                      void (*scan)(struct js *J, const void *lo, const void *hi));
+void js_gc_before(struct js *J);        /* drop what the engine keeps only for reuse */
+
 /* js.c */
 void *js_alloc(struct js *J, size_t n);
+void *js_alloc_atomic(struct js *J, size_t n);      /* for bytes with no pointers: strings */
 struct jsstr *js_mkstr(struct js *J, const char *s, int n);
 struct jsstr *js_concat(struct js *J, struct jsstr *a, struct jsstr *b);
 struct jsobj *js_mkobj(struct js *J, int cls, struct jsobj *proto);

@@ -17,6 +17,8 @@
 #include "gfx.h"
 
 #define URL_MAX 2048
+/* How the browser names itself: in its requests, and to scripts (navigator.userAgent). */
+#define BROWSER_USER_AGENT "Mozilla/5.0 (fluxOS; i686) FluxBrowser/1.0"
 
 /* ---- memory: everything a page owns lives in arenas, freed at once ---- */
 struct arena {
@@ -121,6 +123,7 @@ struct node {
     const char *pseudo_text[2];
 
     void *js;                           /* the script engine's wrapper (jsdom.c) */
+    unsigned gcpass;                    /* jsdom.c: its tree's wrappers marked in this collection */
 };
 
 struct node *html_parse(struct arena *a, const char *text, int len);

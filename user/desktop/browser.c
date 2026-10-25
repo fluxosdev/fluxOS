@@ -619,6 +619,7 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
         argv[n++] = "--save-headers";
         argv[n++] = "--content-on-error";
         argv[n++] = "--max-redirect=0";
+        argv[n++] = "--user-agent=" BROWSER_USER_AGENT;
         argv[n++] = "-T";
         argv[n++] = kind == F_IMG ? "10" : "30";   /* a stuck picture holds up the rest */
         argv[n++] = "-O";

@@ -727,7 +727,7 @@ jsval js_array_join(struct js *J, struct jsobj *a, const char *sep)
         }
         total += parts[i]->len + (i ? seplen : 0);
     }
-    struct jsstr *r = js_alloc(J, sizeof(struct jsstr) + (size_t)total + 1);
+    struct jsstr *r = js_alloc_atomic(J, sizeof(struct jsstr) + (size_t)total + 1);
     int o = 0;
     for (int i = 0; i < a->len; i++) {
         if (i) {
@@ -971,34 +971,36 @@ static jsval array_flat(struct js *J, jsval self, jsval *args, int argc)
     return js_obj(r);
 }
 
+static jsval make_seqiter(struct js *J, jsval keys, jsval vals, int kind, int index_keys);
+
+enum { ITK_VALUES, ITK_KEYS, ITK_ENTRIES };
+
+static jsval array_iter(struct js *J, jsval self, int kind)
+{
+    if (self.t != JS_OBJ)
+        return js_throw_error(J, "TypeError: not an array");
+    return make_seqiter(J, self, js_undefined, kind, 1);
+}
+
 static jsval array_keys(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)args;
     (void)argc;
-    struct jsobj *a = this_array(J, self);
-    if (!a)
-        return js_undefined;
-    struct jsobj *r = js_new_array(J);
-    for (int i = 0; i < a->len; i++)
-        js_array_push(J, r, js_num(i));
-    return js_obj(r);
+    return array_iter(J, self, ITK_KEYS);
+}
+
+static jsval array_values(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)args;
+    (void)argc;
+    return array_iter(J, self, ITK_VALUES);
 }
 
 static jsval array_entries(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)args;
     (void)argc;
-    struct jsobj *a = this_array(J, self);
-    if (!a)
-        return js_undefined;
-    struct jsobj *r = js_new_array(J);
-    for (int i = 0; i < a->len; i++) {
-        struct jsobj *pair = js_new_array(J);
-        js_array_push(J, pair, js_num(i));
-        js_array_push(J, pair, a->items[i]);
-        js_array_push(J, r, js_obj(pair));
-    }
-    return js_obj(r);
+    return array_iter(J, self, ITK_ENTRIES);
 }
 
 /* ---- String ---- */
@@ -2837,14 +2839,13 @@ static void collection_init(struct js *J, struct jsobj *o, int map, jsval src)
     }
 }
 
-static struct jsobj *map_proto, *set_proto;
 
 static jsval map_ctor(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
     if (!J->constructing)
         return js_throw_error(J, "TypeError: Map needs new");
-    struct jsobj *o = js_mkobj(J, C_OBJECT, map_proto);
+    struct jsobj *o = js_mkobj(J, C_OBJECT, J->map_proto);
     collection_init(J, o, 1, ARG(0));
     return js_obj(o);
 }
@@ -2854,7 +2855,7 @@ static jsval set_ctor(struct js *J, jsval self, jsval *args, int argc)
     (void)self;
     if (!J->constructing)
         return js_throw_error(J, "TypeError: Set needs new");
-    struct jsobj *o = js_mkobj(J, C_OBJECT, set_proto);
+    struct jsobj *o = js_mkobj(J, C_OBJECT, J->set_proto);
     collection_init(J, o, 0, ARG(0));
     return js_obj(o);
 }
@@ -2949,54 +2950,152 @@ static jsval collection_for_each(struct js *J, jsval self, jsval *args, int argc
     return js_undefined;
 }
 
+/* Map and Set iterators walk the key and value arrays as they are then. */
+static jsval collection_iter(struct js *J, jsval self, int kind)
+{
+    jsval keys = collection_items(J, self, "__items");
+    if (J->throwing)
+        return js_undefined;
+    jsval vals = js_get(J, self, "__values");
+    return make_seqiter(J, keys, js_is_array(vals) ? vals : js_undefined, kind, 0);
+}
+
 static jsval collection_keys(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)args;
     (void)argc;
-    jsval keys = collection_items(J, self, "__items");
-    if (J->throwing)
-        return js_undefined;
-    return array_slice(J, keys, NULL, 0);
+    return collection_iter(J, self, ITK_KEYS);
 }
 
 static jsval collection_values(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)args;
     (void)argc;
-    jsval vals = js_get(J, self, "__values");
-    if (!js_is_array(vals))
-        return collection_keys(J, self, NULL, 0);
-    return array_slice(J, vals, NULL, 0);
+    return collection_iter(J, self, ITK_VALUES);
 }
 
 static jsval collection_entries(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)args;
     (void)argc;
-    jsval keys = collection_items(J, self, "__items");
-    if (J->throwing)
-        return js_undefined;
-    jsval vals = js_get(J, self, "__values");
-    struct jsobj *r = js_new_array(J);
-    for (int i = 0; i < keys.u.o->len; i++) {
-        struct jsobj *pair = js_new_array(J);
-        js_array_push(J, pair, keys.u.o->items[i]);
-        js_array_push(J, pair, js_is_array(vals) ? vals.u.o->items[i] : keys.u.o->items[i]);
-        js_array_push(J, r, js_obj(pair));
-    }
+    return collection_iter(J, self, ITK_ENTRIES);
+}
+
+/* ---- iterators: what keys(), values(), entries() and [Symbol.iterator] return ---- */
+
+struct seqiter {
+    jsval keys, vals;           /* an array or array-like to walk, and a Map's values */
+    struct jsstr *str;          /* or a string's characters */
+    int i, kind, index_keys;    /* index_keys: the keys are indexes (arrays) */
+    int done;
+};
+
+static const struct jsclass seqiter_class = { "Iterator", NULL, NULL };
+
+static jsval make_seqiter(struct js *J, jsval keys, jsval vals, int kind, int index_keys)
+{
+    struct seqiter *it = js_alloc(J, sizeof(*it));
+    memset(it, 0, sizeof(*it));
+    it->keys = keys;
+    it->vals = vals;
+    it->kind = kind;
+    it->index_keys = index_keys;
+    struct jsobj *o = js_new_host(J, &seqiter_class, it);
+    o->proto = J->seqiter_proto;
+    return js_obj(o);
+}
+
+static jsval iter_result(struct js *J, jsval value, int done)
+{
+    struct jsobj *r = js_new_object(J);
+    js_put(J, r, J->s_value, value, 0);
+    js_put(J, r, J->s_done, js_bool(done), 0);
     return js_obj(r);
+}
+
+static int seq_len(struct js *J, jsval a)
+{
+    if (a.t == JS_OBJ && (a.u.o->cls == C_ARRAY || a.u.o->cls == C_ARGUMENTS))
+        return a.u.o->len;
+    double d = js_to_number(J, js_get(J, a, "length"));
+    return d > 0 && d < (1 << 30) ? (int)d : 0;
+}
+
+static jsval seq_at(struct js *J, jsval a, int i)
+{
+    if (a.t == JS_OBJ && (a.u.o->cls == C_ARRAY || a.u.o->cls == C_ARGUMENTS))
+        return i < a.u.o->len ? a.u.o->items[i] : js_undefined;
+    return js_getv(J, a, js_num(i));
+}
+
+static jsval seqiter_next(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)args;
+    (void)argc;
+    struct seqiter *it = self.t == JS_OBJ ? js_host_data(self.u.o, &seqiter_class) : NULL;
+    if (!it)
+        return js_throw_error(J, "TypeError: next() called on something that is not an iterator");
+    if (it->done)
+        return iter_result(J, js_undefined, 1);
+    if (it->str) {
+        if (it->i >= it->str->len) {
+            it->done = 1;
+            return iter_result(J, js_undefined, 1);
+        }
+        unsigned char c = (unsigned char)it->str->s[it->i];
+        int n = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+        if (n > it->str->len - it->i)
+            n = it->str->len - it->i;
+        jsval ch = js_strn(J, it->str->s + it->i, n);
+        it->i += n;
+        return iter_result(J, ch, 0);
+    }
+    if (it->i >= seq_len(J, it->keys)) {
+        it->done = 1;
+        return iter_result(J, js_undefined, 1);
+    }
+    int i = it->i++;
+    jsval k = it->index_keys ? js_num(i) : seq_at(J, it->keys, i);
+    if (it->kind == ITK_KEYS)
+        return iter_result(J, k, 0);
+    jsval v = it->vals.t == JS_OBJ ? seq_at(J, it->vals, i) : it->index_keys ? seq_at(J, it->keys, i) : k;
+    if (it->kind == ITK_VALUES)
+        return iter_result(J, v, 0);
+    struct jsobj *pair = js_new_array(J);
+    js_array_push(J, pair, k);
+    js_array_push(J, pair, v);
+    return iter_result(J, js_obj(pair), 0);
+}
+
+static jsval seqiter_self(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)J;
+    (void)args;
+    (void)argc;
+    return self;
+}
+
+static jsval string_iterator(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)args;
+    (void)argc;
+    struct jsstr *str = this_string(J, self);
+    if (!str)
+        return js_undefined;
+    jsval r = make_seqiter(J, js_undefined, js_undefined, ITK_VALUES, 0);
+    ((struct seqiter *)r.u.o->hdata)->str = str;
+    return r;
 }
 
 static void put_value(struct js *J, struct jsobj *o, const char *name, jsval v);
 
 /* ---- typed arrays: plain arrays whose elements are converted when they are made ---- */
 
-static struct jsobj *buffer_proto;
 
 static jsval array_buffer_ctor(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
-    struct jsobj *b = js_mkobj(J, C_OBJECT, buffer_proto);
+    struct jsobj *b = js_mkobj(J, C_OBJECT, J->buffer_proto);
     double n = num_arg(J, args, argc, 0);
     js_put(J, b, S(J, "byteLength"), js_num(isnan(n) || n < 0 ? 0 : trunc(n)), 0);
     return js_obj(b);
@@ -3025,7 +3124,7 @@ static jsval typed_make(struct js *J, jsval *args, int argc, int kind, struct js
 {
     struct jsobj *a = js_mkobj(J, C_ARRAY, proto);
     jsval src = ARG(0);
-    if (src.t == JS_OBJ && src.u.o->proto == buffer_proto) {
+    if (src.t == JS_OBJ && src.u.o->proto == J->buffer_proto) {
         double len = js_to_number(J, js_get(J, src, "byteLength")) / bytes;
         if (argc > 2)
             len = js_to_number(J, args[2]);
@@ -3045,7 +3144,7 @@ static jsval typed_make(struct js *J, jsval *args, int argc, int kind, struct js
         for (int i = 0; i < a->len; i++)
             a->items[i] = js_num(0);
     }
-    struct jsobj *buf = js_mkobj(J, C_OBJECT, buffer_proto);
+    struct jsobj *buf = js_mkobj(J, C_OBJECT, J->buffer_proto);
     js_put(J, buf, S(J, "byteLength"), js_num(a->len * bytes), 0);
     js_put(J, a, S(J, "buffer"), js_obj(buf), 1);
     js_put(J, a, S(J, "byteLength"), js_num(a->len * bytes), 1);
@@ -3096,8 +3195,8 @@ static const js_native typed_ctors[] = {
 
 static void init_typed_arrays(struct js *J)
 {
-    buffer_proto = js_mkobj(J, C_OBJECT, J->object_proto);
-    ctor_obj(J, "ArrayBuffer", array_buffer_ctor, 1, buffer_proto);
+    J->buffer_proto = js_mkobj(J, C_OBJECT, J->object_proto);
+    ctor_obj(J, "ArrayBuffer", array_buffer_ctor, 1, J->buffer_proto);
     for (unsigned i = 0; i < sizeof(typed_kinds) / sizeof(typed_kinds[0]); i++) {
         struct jsobj *p = js_mkobj(J, C_ARRAY, J->array_proto);
         typed_kinds[i].proto = p;
@@ -3251,7 +3350,8 @@ void js_init_lib(struct js *J)
         { "find", array_find, 1 }, { "findIndex", array_find_index, 1 }, { "reduce", array_reduce, 1 },
         { "reduceRight", array_reduce_right, 1 }, { "fill", array_fill, 1 }, { "sort", array_sort, 1 },
         { "flat", array_flat, 0 }, { "keys", array_keys, 0 }, { "entries", array_entries, 0 },
-        { "values", array_slice, 0 }, { "toString", array_to_string, 0 },
+        { "values", array_values, 0 }, { "@@iterator", array_values, 0 },
+        { "toString", array_to_string, 0 },
         { "toLocaleString", array_to_string, 0 },
     };
     for (unsigned i = 0; i < sizeof(array_methods) / sizeof(array_methods[0]); i++)
@@ -3415,31 +3515,38 @@ void js_init_lib(struct js *J)
     }
 
     /* Map and Set */
-    map_proto = js_mkobj(J, C_OBJECT, op);
-    ctor_obj(J, "Map", map_ctor, 0, map_proto);
-    fn_obj(J, map_proto, "get", map_get, 1);
-    fn_obj(J, map_proto, "set", map_set, 2);
-    fn_obj(J, map_proto, "has", collection_has, 1);
-    fn_obj(J, map_proto, "delete", collection_delete, 1);
-    fn_obj(J, map_proto, "clear", collection_clear, 0);
-    fn_obj(J, map_proto, "forEach", collection_for_each, 1);
-    fn_obj(J, map_proto, "keys", collection_keys, 0);
-    fn_obj(J, map_proto, "values", collection_values, 0);
-    fn_obj(J, map_proto, "entries", collection_entries, 0);
-    fn_obj(J, map_proto, "@@iterator", collection_entries, 0);
-    define_getter(J, map_proto, "size", collection_size_getter);
-    set_proto = js_mkobj(J, C_OBJECT, op);
-    ctor_obj(J, "Set", set_ctor, 0, set_proto);
-    fn_obj(J, set_proto, "add", set_add, 1);
-    fn_obj(J, set_proto, "has", collection_has, 1);
-    fn_obj(J, set_proto, "delete", collection_delete, 1);
-    fn_obj(J, set_proto, "clear", collection_clear, 0);
-    fn_obj(J, set_proto, "forEach", collection_for_each, 1);
-    fn_obj(J, set_proto, "keys", collection_keys, 0);
-    fn_obj(J, set_proto, "values", collection_keys, 0);
-    fn_obj(J, set_proto, "entries", collection_entries, 0);
-    fn_obj(J, set_proto, "@@iterator", collection_keys, 0);
-    define_getter(J, set_proto, "size", collection_size_getter);
+    J->map_proto = js_mkobj(J, C_OBJECT, op);
+    ctor_obj(J, "Map", map_ctor, 0, J->map_proto);
+    fn_obj(J, J->map_proto, "get", map_get, 1);
+    fn_obj(J, J->map_proto, "set", map_set, 2);
+    fn_obj(J, J->map_proto, "has", collection_has, 1);
+    fn_obj(J, J->map_proto, "delete", collection_delete, 1);
+    fn_obj(J, J->map_proto, "clear", collection_clear, 0);
+    fn_obj(J, J->map_proto, "forEach", collection_for_each, 1);
+    fn_obj(J, J->map_proto, "keys", collection_keys, 0);
+    fn_obj(J, J->map_proto, "values", collection_values, 0);
+    fn_obj(J, J->map_proto, "entries", collection_entries, 0);
+    fn_obj(J, J->map_proto, "@@iterator", collection_entries, 0);
+    define_getter(J, J->map_proto, "size", collection_size_getter);
+    J->set_proto = js_mkobj(J, C_OBJECT, op);
+    ctor_obj(J, "Set", set_ctor, 0, J->set_proto);
+    fn_obj(J, J->set_proto, "add", set_add, 1);
+    fn_obj(J, J->set_proto, "has", collection_has, 1);
+    fn_obj(J, J->set_proto, "delete", collection_delete, 1);
+    fn_obj(J, J->set_proto, "clear", collection_clear, 0);
+    fn_obj(J, J->set_proto, "forEach", collection_for_each, 1);
+    fn_obj(J, J->set_proto, "keys", collection_keys, 0);
+    fn_obj(J, J->set_proto, "values", collection_values, 0);
+    fn_obj(J, J->set_proto, "entries", collection_entries, 0);
+    fn_obj(J, J->set_proto, "@@iterator", collection_values, 0);
+    define_getter(J, J->set_proto, "size", collection_size_getter);
+
+    J->seqiter_proto = js_mkobj(J, C_OBJECT, op);
+    fn_obj(J, J->seqiter_proto, "next", seqiter_next, 0);
+    fn_obj(J, J->seqiter_proto, "@@iterator", seqiter_self, 0);
+    J->s_value = S(J, "value");
+    J->s_done = S(J, "done");
+    fn_obj(J, sp, "@@iterator", string_iterator, 0);
 
     init_typed_arrays(J);
 
