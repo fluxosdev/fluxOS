@@ -1,13 +1,13 @@
 /*
  * 3D Gears: three meshing gears turning under a light, after Brian Paul's
  * gears demo, the classic first OpenGL program. It draws with the GL
- * library: on a 3dfx Voodoo card through its 3D engine, anywhere else
- * with the software renderer. The status bar says which, and how many
- * frames a second it manages.
+ * library: on an ATI Radeon HD 4000 or a 3dfx Voodoo card through its 3D
+ * engine, anywhere else with the software renderer. The status bar says
+ * which, and how many frames a second it manages.
  *
  * Drag with the mouse or use the arrow keys to turn the view; Space
- * pauses, Home puts the view back, and S switches between the 3D hardware
- * and the software renderer, to compare the two.
+ * pauses, Home puts the view back, and S moves on to the next renderer
+ * there is (Radeon, Voodoo, software), to compare them.
  *
  * This file is built with the FPU allowed (USER_FP_CFLAGS).
  */
@@ -299,11 +299,30 @@ static void redraw(struct gears *g)
     update_status(g, now_ms());
 }
 
-/* Start again with a new context, on the hardware or in software. */
+/* Start again with a new context on the next renderer that works, in the
+ * order Radeon, Voodoo, software. */
 static void switch_renderer(struct gears *g)
 {
-    unsigned int flags = fglIsAccelerated(g->ctx) ? FGL_SOFTWARE : 0;
-    FGLcontext *ctx = fglCreateContext(g->ctx_w, g->ctx_h, flags);
+    static const struct {
+        int driver;
+        unsigned int flags;
+    } order[3] = {
+        { FGL_DRIVER_RADEON, FGL_NO_TDFX },
+        { FGL_DRIVER_TDFX, FGL_NO_RADEON },
+        { FGL_DRIVER_SOFTWARE, FGL_SOFTWARE },
+    };
+    int cur = 0;
+    while (cur < 2 && order[cur].driver != fglGetDriver(g->ctx))
+        cur++;
+    FGLcontext *ctx = NULL;
+    for (int step = 1; step < 3 && !ctx; step++) {
+        int k = (cur + step) % 3;
+        ctx = fglCreateContext(g->ctx_w, g->ctx_h, order[k].flags);
+        if (ctx && fglGetDriver(ctx) != order[k].driver) {
+            fglDestroyContext(ctx);     /* that card is not there */
+            ctx = NULL;
+        }
+    }
     if (!ctx)
         return;
     fglDestroyContext(g->ctx);

@@ -15,13 +15,16 @@
  * startup mode can be chosen here, for the next start. A 3dfx card's own
  * driver changes modes at once: the desktop is laid out again and asks
  * whether to keep the new mode, and goes back to the old one by itself
- * after 15 seconds, in case the monitor cannot show it.
+ * after 15 seconds, in case the monitor cannot show it. An ATI Radeon's
+ * driver sets modes too, and draws without tearing (page flipping) and
+ * with a hardware pointer; choosing it asks the same question.
  *
  * Choices are saved in GRUB's environment block, /boot/grub/grubenv on the
  * partition fluxOS started from: fluxos_gfx is the mode GRUB asks the BIOS
- * for, fluxos_video the 3dfx driver's mode, which GRUB passes to the
- * kernel as video=. Started from the CD there is nowhere to save them, and
- * they last until a restart.
+ * for, fluxos_video the 3dfx or Radeon driver's mode, which GRUB passes to
+ * the kernel as video=, and fluxos_driver "radeon" when the Radeon driver
+ * is chosen, which the desktop reads when it starts. Started from the CD
+ * there is nowhere to save them, and they last until a restart.
  */
 #include <dirent.h>
 #include <fcntl.h>
@@ -33,12 +36,12 @@
 #include "desktop.h"
 
 #define DLG_W 404
-#define DLG_H 448
+#define DLG_H 464
 #define ITEM_H 16                       /* rows of an open drop-down list */
 #define CONFIRM_SECS 15
 
 enum page { PAGE_BACKGROUND, PAGE_SETTINGS, PAGE_MONITOR, PAGE_COUNT };
-enum driver { DRV_STANDARD, DRV_NATIVE };
+enum driver { DRV_STANDARD, DRV_NATIVE, DRV_RADEON };
 
 /* Controls, in Tab order. */
 enum ctl {
@@ -99,8 +102,10 @@ struct dprops {
     struct dispmode modes[DISP_MAX_MODES];
     int nmodes;
     int native_ok;                      /* the 3dfx driver can set modes */
+    int radeon_ok;                      /* there is a Radeon driver */
+    int radeon_modes;                   /* and it can set modes */
     char bootdir[128];                  /* the partition with GRUB, or "" */
-    char saved_gfx[32], saved_video[32];
+    char saved_gfx[32], saved_video[32], saved_driver[16];
 
     struct monitor mons[NGENERIC + 1];
     int nmons;
@@ -124,15 +129,19 @@ struct dprops {
 
 static struct dprops *dlg;
 
-/* The "keep this setting?" countdown after a mode change. */
+/* The "keep this setting?" countdown after a mode change, or after
+ * switching to the Radeon driver. */
 struct confirm {
     struct window *win;
     struct dispmode old;                /* to go back to; width 0: the boot mode */
+    int mode_changed;                   /* not kept: back to old */
+    int accel_old;                      /* and page flipping on or off as it was */
+    int startup_changed;                /* the BIOS mode changes at the next start */
     int secs;
     int focus;                          /* 0: Yes, 1: No */
     int pressed, pressed_in;
     char bootdir[128];                  /* where to save the mode when kept, or "" */
-    char gfx[32], video[32];
+    char gfx[32], video[32], driver[16];
 };
 
 static struct confirm *cfm;
@@ -147,18 +156,19 @@ static void find_boot_dir(char *out, size_t size)
     grubenv_boot_dir(out, size);
 }
 
-static void read_grubenv(const char *dir, char *gfx, char *video)
+static void read_grubenv(const char *dir, char *gfx, char *video, char *driver)
 {
     grubenv_get(dir, "fluxos_gfx", gfx, 32);
     grubenv_get(dir, "fluxos_video", video, 32);
+    grubenv_get(dir, "fluxos_driver", driver, 16);
 }
 
 /* Empty values are left out of the file, which GRUB treats as unset. */
-static int write_grubenv(const char *dir, const char *gfx, const char *video)
+static int write_grubenv(const char *dir, const char *gfx, const char *video, const char *driver)
 {
-    const char *keys[2] = { "fluxos_gfx", "fluxos_video" };
-    const char *vals[2] = { gfx, video };
-    return grubenv_update(dir, keys, vals, 2);
+    const char *keys[3] = { "fluxos_gfx", "fluxos_video", "fluxos_driver" };
+    const char *vals[3] = { gfx, video, driver };
+    return grubenv_update(dir, keys, vals, 3);
 }
 
 /* "1024x768x32" (refresh 0) or "1024x768x16@85" */
@@ -288,16 +298,22 @@ static int fits_memory(struct dprops *d, int w, int h, int bpp)
 
 static int startup_choosable(struct dprops *d);
 
+/* Does the chosen driver set modes of its own? */
+static int own_modes(struct dprops *d)
+{
+    return d->driver == DRV_NATIVE || (d->driver == DRV_RADEON && d->radeon_modes);
+}
+
 static void update_lists(struct dprops *d)
 {
     const struct monitor *m = &d->mons[d->monitor];
     d->nres = 0;
-    if (d->driver == DRV_STANDARD && !startup_choosable(d)) {
+    if (!own_modes(d) && !startup_choosable(d)) {
         /* Nothing to choose: show the BIOS mode as it is. */
         d->w = d->di.boot.width ? d->di.boot.width : d->w;
         d->h = d->di.boot.height ? d->di.boot.height : d->h;
         d->bpp = d->di.boot.bpp == 16 ? 16 : 32;
-    } else if (d->driver == DRV_NATIVE) {
+    } else if (own_modes(d)) {
         for (int i = 0; i < d->nmodes; i++) {
             const struct dispmode *md = &d->modes[i];
             if (!fits_memory(d, md->width, md->height, d->bpp) ||
@@ -333,7 +349,7 @@ static void update_lists(struct dprops *d)
     d->h = d->res[d->res_idx].h;
 
     d->nrates = 0;
-    if (d->driver == DRV_NATIVE) {
+    if (own_modes(d)) {
         for (int i = 0; i < d->nmodes && d->nrates < 8; i++) {
             const struct dispmode *md = &d->modes[i];
             if (md->width == d->w && md->height == d->h &&
@@ -349,15 +365,15 @@ static void update_lists(struct dprops *d)
         d->refresh = d->nrates ? d->rates[d->nrates - 1] : 0;     /* the fastest it allows */
 }
 
-/* Can the standard driver's startup mode be chosen? */
+/* Can the startup mode be chosen? Not when a driver of our own sets it. */
 static int startup_choosable(struct dprops *d)
 {
-    return d->driver == DRV_STANDARD && d->bootdir[0] && d->di.boot.width;
+    return !own_modes(d) && d->bootdir[0] && d->di.boot.width;
 }
 
 static int mode_controls_enabled(struct dprops *d)
 {
-    return d->driver == DRV_NATIVE || startup_choosable(d);
+    return own_modes(d) || startup_choosable(d);
 }
 
 /* ---- geometry ---- */
@@ -379,7 +395,7 @@ static int tab_index(enum page p)
     return 0;
 }
 
-static const struct rect panel_r = { 6, 25, DLG_W - 12, 382 };
+static const struct rect panel_r = { 6, 25, DLG_W - 12, 398 };
 
 static struct rect ctl_rect(enum ctl k)
 {
@@ -388,10 +404,10 @@ static struct rect ctl_rect(enum ctl k)
     case K_WALL: return mkrect(18, 190, 268, WALL_ROWS * ITEM_H + 4);
     case K_BROWSE: return mkrect(298, 190, 90, 23);
     case K_WALLMODE: return mkrect(78, 302, 150, 21);
-    case K_DRIVER: return mkrect(24, 206, 360, 36);
-    case K_COLORS: return mkrect(24, 284, 162, 21);
-    case K_AREA: return mkrect(250, 272, 96, 26);
-    case K_REFRESH: return mkrect(116, 337, 130, 21);
+    case K_DRIVER: return mkrect(24, 206, 360, 54);
+    case K_COLORS: return mkrect(24, 300, 162, 21);
+    case K_AREA: return mkrect(250, 288, 96, 26);
+    case K_REFRESH: return mkrect(116, 353, 130, 21);
     case K_MONITOR: return mkrect(116, 36, 272, 21);
     case K_OK: return mkrect(DLG_W - 12 - 3 * 75 - 12, DLG_H - 10 - 23, 75, 23);
     case K_CANCEL: return mkrect(DLG_W - 12 - 2 * 75 - 6, DLG_H - 10 - 23, 75, 23);
@@ -417,16 +433,22 @@ static int on_page(struct dprops *d, enum ctl k)
 static int ctl_enabled(struct dprops *d, enum ctl k)
 {
     switch (k) {
-    case K_DRIVER: return d->native_ok;
+    case K_DRIVER: return d->native_ok || d->radeon_ok;
     case K_COLORS: case K_AREA: return mode_controls_enabled(d);
-    case K_REFRESH: return d->driver == DRV_NATIVE && d->nrates > 1;
+    case K_REFRESH: return own_modes(d) && d->nrates > 1;
     default: return 1;
     }
 }
 
 static struct rect radio_rect(int i)
 {
-    return mkrect(26, 210 + 20 * i, 340, 14);
+    return mkrect(26, 209 + 18 * i, 340, 14);
+}
+
+/* Is driver choice i (an enum driver) there to pick? */
+static int driver_ok(struct dprops *d, int i)
+{
+    return i == DRV_STANDARD || (i == DRV_NATIVE && d->native_ok) || (i == DRV_RADEON && d->radeon_ok);
 }
 
 /* The rows of a drop-down list, in rows[] (up to 8); returns how many, and the chosen one. */
@@ -441,7 +463,7 @@ static int combo_items(struct dprops *d, enum ctl k, char rows[][48], int *chose
         return 2;
     case K_REFRESH:
         if (!d->nrates) {
-            snprintf(rows[0], 48, d->driver == DRV_NATIVE ? "None" : "Set by the BIOS");
+            snprintf(rows[0], 48, own_modes(d) ? "None" : "Set by the BIOS");
             return 1;
         }
         for (int i = 0; i < d->nrates; i++) {
@@ -807,7 +829,7 @@ static void settings_page(struct dprops *d, struct surface *s)
         snprintf(buf, sizeof(buf), "%s", d->di.adapter);
     gfx_text(s, &font_sans_bold, 116, 172, buf, C_BLACK);
 
-    draw_group(s, mkrect(14, 194, 376, 56), "Display driver");
+    draw_group(s, mkrect(14, 194, 376, 72), "Display driver");
     int focus_drv = d->focus == K_DRIVER;
     draw_radio(s, radio_rect(0).x, radio_rect(0).y, "Standard VGA: keep the mode the BIOS sets at startup",
                d->driver == DRV_STANDARD, focus_drv && d->driver == DRV_STANDARD);
@@ -815,36 +837,41 @@ static void settings_page(struct dprops *d, struct surface *s)
         snprintf(buf, sizeof(buf), "%s driver: set modes, 3D acceleration", d->di.adapter);
         draw_radio(s, radio_rect(1).x, radio_rect(1).y, buf, d->driver == DRV_NATIVE,
                    focus_drv && d->driver == DRV_NATIVE);
-    } else if (d->di.flags & (DISPF_FLIP | DISPF_CURSOR)) {
-        snprintf(buf, sizeof(buf), "%s driver: page flipping, BIOS modes only", d->di.driver);
-        gfx_text(s, &font_sans, 44, radio_rect(1).y - 1, buf, C_SHADOW);
     } else {
         gfx_text(s, &font_sans, 44, radio_rect(1).y - 1, "No 3dfx Voodoo card was found.", C_SHADOW);
     }
+    if (d->radeon_ok) {
+        draw_radio(s, radio_rect(2).x, radio_rect(2).y,
+                   d->radeon_modes ? "ATI Radeon driver: set modes, no tearing"
+                                   : "ATI Radeon driver: no tearing, hardware pointer",
+                   d->driver == DRV_RADEON, focus_drv && d->driver == DRV_RADEON);
+    } else {
+        gfx_text(s, &font_sans, 44, radio_rect(2).y - 1, "No ATI Radeon card was found.", C_SHADOW);
+    }
 
     int on = mode_controls_enabled(d);
-    draw_group(s, mkrect(14, 264, 182, 62), "Color palette");
+    draw_group(s, mkrect(14, 280, 182, 62), "Color palette");
     char rows[8][48];
     int chosen;
     combo_items(d, K_COLORS, rows, &chosen);
     draw_combo(s, ctl_rect(K_COLORS), rows[chosen], on, d->focus == K_COLORS, d->open == K_COLORS);
 
-    draw_group(s, mkrect(208, 264, 182, 62), "Desktop area");
+    draw_group(s, mkrect(208, 280, 182, 62), "Desktop area");
     color_t tc = on ? C_BLACK : C_SHADOW;
-    gfx_text(s, &font_sans, 218, 276, "Less", tc);
-    gfx_text(s, &font_sans, 352, 276, "More", tc);
+    gfx_text(s, &font_sans, 218, 292, "Less", tc);
+    gfx_text(s, &font_sans, 352, 292, "More", tc);
     draw_slider(d, s, on, d->focus == K_AREA);
     snprintf(buf, sizeof(buf), "%d by %d pixels", d->w, d->h);
     int tw = gfx_text_width(&font_sans, buf);
-    gfx_text(s, &font_sans, 208 + (182 - tw) / 2, 304, buf, tc);
+    gfx_text(s, &font_sans, 208 + (182 - tw) / 2, 320, buf, tc);
 
-    gfx_text(s, &font_sans, 18, 340, "Refresh rate:", C_BLACK);
+    gfx_text(s, &font_sans, 18, 356, "Refresh rate:", C_BLACK);
     combo_items(d, K_REFRESH, rows, &chosen);
     draw_combo(s, ctl_rect(K_REFRESH), rows[chosen], ctl_enabled(d, K_REFRESH), d->focus == K_REFRESH,
                d->open == K_REFRESH);
 
     const char *note;
-    if (d->driver == DRV_NATIVE)
+    if (own_modes(d))
         note = d->bootdir[0] ? "New settings take effect at once, and are kept for the next start."
                              : "New settings take effect at once and last until you restart: "
                                "fluxOS is running from its CD.";
@@ -855,7 +882,7 @@ static void settings_page(struct dprops *d, struct surface *s)
     else
         note = "The BIOS mode stays until you restart. Install fluxOS on a hard disk to choose "
                "the startup mode.";
-    gfx_text_wrap(s, &font_sans, 18, 368, 368, note, C_BLACK);
+    gfx_text_wrap(s, &font_sans, 18, 384, 368, note, C_BLACK);
 }
 
 static void draw_wall_list(struct dprops *d, struct surface *s)
@@ -938,7 +965,8 @@ static void monitor_page(struct dprops *d, struct surface *s)
         draw_line(s, 216, "Highest pixel clock:", e->clock);
     } else {
         gfx_text_wrap(s, &font_sans, 28, 92, 350,
-                      d->native_ok ? "The monitor did not answer over DDC, so choose its type above."
+                      d->native_ok || d->radeon_modes
+                          ? "The monitor did not answer over DDC, so choose its type above."
                                    : "The standard VGA driver cannot ask the monitor about itself.",
                       C_BLACK);
     }
@@ -947,7 +975,7 @@ static void monitor_page(struct dprops *d, struct surface *s)
     const struct dispmode *m = &d->di.mode;
     if (!(d->di.flags & DISPF_BOOT))
         snprintf(buf, sizeof(buf), "%s", d->di.driver);
-    else if (d->di.flags & (DISPF_FLIP | DISPF_CURSOR))
+    else if (wm_accel())
         snprintf(buf, sizeof(buf), "%s (BIOS mode)", d->di.driver);
     else
         snprintf(buf, sizeof(buf), "standard VGA (BIOS mode)");
@@ -1106,19 +1134,25 @@ static const struct window_ops confirm_ops = {
     .destroy = confirm_destroy,
 };
 
-/* The new mode is on the screen: ask whether to keep it, going back to old otherwise. */
-static void confirm_open(const struct dispmode *old, const char *bootdir, const char *gfx,
-                         const char *video)
+/* The new mode or driver is on the screen: ask whether to keep it, going
+ * back to the old mode (if mode_changed) and to page flipping as it was
+ * (accel_old) otherwise. */
+static void confirm_open(const struct dispmode *old, int mode_changed, int accel_old, int startup_changed,
+                         const char *bootdir, const char *gfx, const char *video, const char *driver)
 {
     struct confirm *c = calloc(1, sizeof(*c));
     if (!c)
         return;
     c->old = *old;
+    c->mode_changed = mode_changed;
+    c->accel_old = accel_old;
+    c->startup_changed = startup_changed;
     c->secs = CONFIRM_SECS;
     c->pressed = -1;
     snprintf(c->bootdir, sizeof(c->bootdir), "%s", bootdir);
     snprintf(c->gfx, sizeof(c->gfx), "%s", gfx);
     snprintf(c->video, sizeof(c->video), "%s", video);
+    snprintf(c->driver, sizeof(c->driver), "%s", driver);
     c->win = wm_create("Monitor Settings", ICON_DISPLAY, 300, 118, WF_MODAL | WF_NOTASK, &confirm_ops, c);
     if (!c->win) {
         free(c);
@@ -1136,19 +1170,27 @@ static void confirm_close(int keep)
         return;
     cfm = NULL;
     struct dispmode old = c->old;
-    char bootdir[128], gfx[32], video[32];
+    int mode_changed = c->mode_changed, accel_old = c->accel_old, startup_changed = c->startup_changed;
+    char bootdir[128], gfx[32], video[32], driver[16];
     snprintf(bootdir, sizeof(bootdir), "%s", c->bootdir);
     snprintf(gfx, sizeof(gfx), "%s", c->gfx);
     snprintf(video, sizeof(video), "%s", c->video);
+    snprintf(driver, sizeof(driver), "%s", c->driver);
     wm_destroy(c->win);                 /* frees c */
 
     if (keep) {
-        if (bootdir[0] && write_grubenv(bootdir, gfx, video) == 0 && dlg) {
+        if (bootdir[0] && write_grubenv(bootdir, gfx, video, driver) == 0 && dlg) {
             snprintf(dlg->saved_gfx, sizeof(dlg->saved_gfx), "%s", gfx);
             snprintf(dlg->saved_video, sizeof(dlg->saved_video), "%s", video);
+            snprintf(dlg->saved_driver, sizeof(dlg->saved_driver), "%s", driver);
         }
-    } else if (set_mode(&old) < 0) {
-        message_box("Display Properties", ICON_WARNING, "The old display settings could not be restored.");
+        if (startup_changed)
+            message_box("Display Properties", ICON_INFO, "The new mode will be used when you restart fluxOS.");
+    } else {
+        if (mode_changed && set_mode(&old) < 0)
+            message_box("Display Properties", ICON_WARNING, "The old display settings could not be restored.");
+        if (wm_accel() != accel_old)
+            wm_set_accel(accel_old);
     }
     if (dlg)
         dp_reload(dlg);
@@ -1177,29 +1219,40 @@ static int apply(struct dprops *d)
     snprintf(gfx, sizeof(gfx), "%s", d->saved_gfx);
     video[0] = 0;
 
-    if (d->driver == DRV_NATIVE) {
+    const char *driver = d->driver == DRV_RADEON ? "radeon" : "";
+    int accel = wm_accel();
+
+    if (own_modes(d)) {
+        int accel_on = d->driver == DRV_RADEON && !accel;
         format_mode(video, sizeof(video), d->w, d->h, d->bpp, d->refresh);
-        if (native_now && cur->width == d->w && cur->height == d->h && cur->bpp == d->bpp &&
-            cur->refresh == d->refresh) {
-            if (d->bootdir[0] && strcmp(video, d->saved_video) != 0 &&
-                write_grubenv(d->bootdir, gfx, video) == 0)
+        int same = native_now && cur->width == d->w && cur->height == d->h && cur->bpp == d->bpp &&
+                   cur->refresh == d->refresh;
+        if (same && !accel_on) {
+            if (d->bootdir[0] && (strcmp(video, d->saved_video) != 0 ||
+                                  strcmp(driver, d->saved_driver) != 0) &&
+                write_grubenv(d->bootdir, gfx, video, driver) == 0) {
                 snprintf(d->saved_video, sizeof(d->saved_video), "%s", video);
+                snprintf(d->saved_driver, sizeof(d->saved_driver), "%s", driver);
+            }
             return 0;                   /* already on the screen */
         }
         struct dispmode m = { (uint16_t)d->w, (uint16_t)d->h, (uint16_t)d->bpp, (uint16_t)d->refresh, 0, 0 };
         struct dispmode old = *cur;
         if (!native_now)
             old.width = 0;
-        if (set_mode(&m) < 0) {
+        if (!same && set_mode(&m) < 0) {
             message_box("Display Properties", ICON_WARNING, "The display driver could not set that mode.");
             dp_reload(d);
             return -1;
         }
-        confirm_open(&old, d->bootdir, gfx, video);
+        if (accel_on)
+            wm_set_accel(1);
+        confirm_open(&old, !same, accel, 0, d->bootdir, gfx, video, driver);
         return 0;
     }
 
-    /* The standard driver: the startup mode, and back to the BIOS mode if need be. */
+    /* The BIOS mode: the startup mode, back to the BIOS mode if need be,
+     * and the Radeon driver's page flipping on or off. */
     int startup_changed = 0;
     if (startup_choosable(d)) {
         char want[32];
@@ -1219,16 +1272,26 @@ static int apply(struct dprops *d)
             dp_reload(d);
             return -1;
         }
-        confirm_open(&old, d->bootdir, gfx, "");
+        if ((d->driver == DRV_RADEON) != accel)
+            wm_set_accel(d->driver == DRV_RADEON);
+        confirm_open(&old, 1, accel, startup_changed, d->bootdir, gfx, "", driver);
         return 0;
     }
-    if (d->bootdir[0] && (startup_changed || d->saved_video[0])) {
-        if (write_grubenv(d->bootdir, gfx, "") < 0) {
+    if (d->driver == DRV_RADEON && !accel) {
+        wm_set_accel(1);
+        confirm_open(cur, 0, accel, startup_changed, d->bootdir, gfx, "", driver);
+        return 0;
+    }
+    if (d->driver != DRV_RADEON && accel)
+        wm_set_accel(0);
+    if (d->bootdir[0] && (startup_changed || d->saved_video[0] || strcmp(driver, d->saved_driver) != 0)) {
+        if (write_grubenv(d->bootdir, gfx, "", driver) < 0) {
             message_box("Display Properties", ICON_WARNING, "The settings could not be saved.");
             return -1;
         }
         snprintf(d->saved_gfx, sizeof(d->saved_gfx), "%s", gfx);
         d->saved_video[0] = 0;
+        snprintf(d->saved_driver, sizeof(d->saved_driver), "%s", driver);
         if (startup_changed)
             message_box("Display Properties", ICON_INFO, "The new mode will be used when you restart fluxOS.");
     }
@@ -1334,10 +1397,16 @@ static void step(struct dprops *d, int dir)
     case K_WALL:
         wall_select(d, d->wall_sel + dir);
         break;
-    case K_DRIVER:
-        d->driver = dir > 0 ? DRV_NATIVE : DRV_STANDARD;
-        update_lists(d);
+    case K_DRIVER: {
+        int i = (int)d->driver + dir;
+        while (i >= DRV_STANDARD && i <= DRV_RADEON && !driver_ok(d, i))
+            i += dir;
+        if (i >= DRV_STANDARD && i <= DRV_RADEON) {
+            d->driver = (enum driver)i;
+            update_lists(d);
+        }
         break;
+    }
     case K_AREA:
         if (d->res_idx + dir >= 0 && d->res_idx + dir < d->nres) {
             d->w = d->res[d->res_idx + dir].w;
@@ -1537,9 +1606,9 @@ static void dp_mouse(struct window *w, int x, int y, int buttons, int changed)
                 d->pressed = k;
                 d->pressed_in = 1;
             } else if (k == K_DRIVER) {
-                for (int i = 0; i < 2; i++)
-                    if (rect_contains(radio_rect(i), x, y))
-                        d->driver = i ? DRV_NATIVE : DRV_STANDARD;
+                for (int i = DRV_STANDARD; i <= DRV_RADEON; i++)
+                    if (rect_contains(radio_rect(i), x, y) && driver_ok(d, i))
+                        d->driver = (enum driver)i;
                 update_lists(d);
             } else if (k == K_AREA) {
                 int tx = slider_x(d, ctl_rect(K_AREA));
@@ -1611,7 +1680,9 @@ static void dp_reload(struct dprops *d)
     display(DISP_INFO, &d->di);
     int n = display(DISP_MODES, d->modes);
     d->nmodes = n > 0 ? n : 0;
-    d->native_ok = (d->di.flags & DISPF_NATIVE) && d->nmodes > 0;
+    d->radeon_ok = !strcmp(d->di.driver, "radeon");
+    d->native_ok = !d->radeon_ok && (d->di.flags & DISPF_NATIVE) && d->nmodes > 0;
+    d->radeon_modes = d->radeon_ok && (d->di.flags & DISPF_NATIVE) && d->nmodes > 0;
 
     int had_monitor = d->nmons > 0;
     int monitor = d->monitor;
@@ -1626,13 +1697,18 @@ static void dp_reload(struct dprops *d)
                  : (d->di.flags & DISPF_EDID) ? 0 : DEFAULT_GENERIC;
 
     const struct dispmode *m = &d->di.mode;
-    d->driver = (d->di.flags & DISPF_BOOT) || !d->native_ok ? DRV_STANDARD : DRV_NATIVE;
+    if (!(d->di.flags & DISPF_BOOT) && d->native_ok)
+        d->driver = DRV_NATIVE;
+    else if (d->radeon_ok && (wm_accel() || !(d->di.flags & DISPF_BOOT)))
+        d->driver = DRV_RADEON;
+    else
+        d->driver = DRV_STANDARD;
     d->w = m->width ? m->width : 640;
     d->h = m->height ? m->height : 480;
     d->bpp = m->bpp == 16 ? 16 : 32;
     d->refresh = m->refresh;
     /* With the standard driver, start from the saved startup mode. */
-    if (d->driver == DRV_STANDARD && d->saved_gfx[0])
+    if (!own_modes(d) && d->saved_gfx[0])
         parse_mode(d->saved_gfx, &d->w, &d->h, &d->bpp);
     update_lists(d);
     if (d->win)
@@ -1653,7 +1729,7 @@ void display_open(void)
     d->open = -1;
     d->hover = -1;
     find_boot_dir(d->bootdir, sizeof(d->bootdir));
-    read_grubenv(d->bootdir, d->saved_gfx, d->saved_video);
+    read_grubenv(d->bootdir, d->saved_gfx, d->saved_video, d->saved_driver);
     wall_init(d);
     dp_reload(d);
     d->win = wm_create("Display Properties", ICON_DISPLAY, DLG_W, DLG_H, 0, &dp_ops, d);

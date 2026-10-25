@@ -1,8 +1,8 @@
 /*
  * The GL library's insides. gl.c keeps the state, prim.c turns vertices
  * into lit, clipped polygons in window coordinates, list.c records and
- * replays display lists, and a backend draws the polygons: tdfx.c on a
- * Voodoo card's 3D engine, soft.c in memory.
+ * replays display lists, and a backend draws the polygons: radeon.c on a
+ * Radeon HD 4000's 3D engine, tdfx.c on a Voodoo card's, soft.c in memory.
  */
 #ifndef GLINT_H
 #define GLINT_H
@@ -160,8 +160,11 @@ void gl_free_lists(struct fgl_context *c);
 /* backends */
 extern const struct backend gl_soft_backend;
 extern const struct backend gl_tdfx_backend;
+extern const struct backend gl_radeon_backend;
 int gl_tdfx_attach(struct fgl_context *c);     /* 0: the hardware took the context */
 int gl_tdfx_check(struct fgl_context *c);      /* 0: its video memory is still free */
+int gl_radeon_attach(struct fgl_context *c);
+int gl_radeon_check(struct fgl_context *c);    /* 0: the engine still runs */
 
 /* Round to the nearest integer without touching the FPU control word. */
 static inline int gl_iround(float f)

@@ -188,6 +188,32 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
   adapter, lists modes, sets them and maps the 3D engine. Kernel options:
   `video=1024x768x16@85` starts in a mode of the 3dfx driver, and
   `voodoo=off` leaves the card to the standard driver.
+- A driver for the **ATI Radeon HD 4000** series (the R700 chips: HD 4350
+  to HD 4890, PCI vendor `1002`) reads the real amount of video memory,
+  flips between two pages of the screen at the vertical blank (no tearing)
+  and draws a 64x64 ARGB hardware pointer. It sets modes by running the
+  card's own AtomBIOS tables through an interpreter ported from Linux
+  (pixel PLL, CRTC timing, DAC or TMDS encoder), for the modes the
+  monitor's EDID lists (read over the connector's DDC lines) and the VESA
+  DMT and common wide timings it names. Analog and DVI/HDMI outputs are
+  supported; DisplayPort and laptop panels keep the BIOS mode. It also
+  starts the 3D engine: AMD's command processor microcode (bundled in
+  `firmware/radeon`, under AMD's redistribution license in
+  `LICENSE.radeon`, embedded in the kernel) runs a ring of PM4 packets in
+  video memory, and fills and copies are drawn as textured rectangles. A
+  self-test at startup fills and copies two small surfaces and checks
+  them. The GART maps ordinary memory into the GPU's address space (64
+  MiB of page table in video memory, tested at startup too): with it the
+  desktop lends the GPU its back buffer and has it copy the changed
+  rectangles to the screen, so the CPU no longer writes the screen at all;
+  without it the engine still copies the last frame's changes between the
+  two screen pages. A process can also take the 3D engine (`DISP_MAP3D`:
+  128 MiB of video memory) and submit command buffers of its own, which
+  is how the GL library draws. Kernel options:
+  `video=1920x1080x32@60` starts in one of its modes, `radeon.modeset=0`
+  keeps the BIOS mode, `radeon.accel=0` leaves the 3D engine off,
+  `radeon.gart=0` the GART, and
+  `radeon=off` leaves the card to the standard driver.
 - Sound:
   - The PC speaker (`/dev/speaker`): PIT channel 2 through port 61h. Writes
     queue tones (`struct spkr_tone`) that play in the background, timed by
@@ -427,15 +453,15 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
     made, drawn from a thumbnail: a JPEG decodes at an eighth of its size,
     which takes a fraction of the time of the whole picture.
   - **Settings** shows a monitor with a miniature of the desktop at the
-    chosen size, the display adapter, the driver (standard VGA or the 3dfx
-    driver), the color palette (High Color, 16 bit, or True Color, 32 bit),
+    chosen size, the display adapter, the driver (standard VGA, the 3dfx
+    driver or the Radeon driver), the color palette (High Color, 16 bit, or True Color, 32 bit),
     the desktop area on a Less/More slider, and the refresh rate.
   - **Monitor** picks the monitor type: Plug and Play (from its EDID) or a
     generic VGA/SVGA model, which limits the modes offered to what that
     monitor can show by resolution, line rate and refresh. It also shows
     what the EDID says (model, manufacturer, date, size, preferred mode,
     frequency ranges) and the timing of the mode on the screen.
-  - With the 3dfx driver a new mode takes effect at once; the desktop is laid
+  - With the 3dfx or Radeon driver a new mode takes effect at once; the desktop is laid
     out again and asks whether to keep it, going back to the old mode by
     itself after 15 seconds. With the standard driver the BIOS mode stays,
     and a system installed on a hard disk can choose the mode to start in.
@@ -443,11 +469,11 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
     environment block (`/boot/grub/grubenv` on the installed partition);
     started from the CD they last until a restart.
 - 3D Gears: the classic OpenGL gears demo in a resizable window, drawn by
-  the Voodoo3's 3D engine when there is one and by the software renderer
-  otherwise. The status bar names the renderer and counts frames per
-  second; drag or use the arrow keys to turn the view, Space pauses, Home
-  resets it, and S switches between the 3D hardware and the software
-  renderer.
+  a Radeon HD 4000's or a Voodoo3's 3D engine when there is one and by the
+  software renderer otherwise. The status bar names the renderer and
+  counts frames per second; drag or use the arrow keys to turn the view,
+  Space pauses, Home resets it, and S moves on to the next renderer there
+  is (Radeon, Voodoo, software).
 - Task Manager (Start menu): a resizable window with three pages.
   *Applications* lists the desktop's windows, with End Task, Switch To and
   New Task. *Processes* lists every process with its status, CPU share,
@@ -552,12 +578,20 @@ flux@fluxOS ~ % for f in /etc/*; do echo "$f: $(wc -l < $f) lines"; done
 - Polygons are clipped against the view volume in homogeneous coordinates;
   lines and points become thin polygons, so a backend only fills convex
   polygons.
-- Two backends. On a 3dfx card the GL library drives the 3D engine from user
-  space, as Glide does: each context gets a 16-bit color buffer and depth
-  buffer in video memory, polygons go to the chip's triangle setup unit,
+- Three backends, tried in this order. On an ATI Radeon HD 4000 the GL
+  library writes PM4 command buffers that the kernel runs on the 3D engine
+  (`DISP_SUBMIT`): each context gets a 32-bit color buffer and a 24-bit
+  depth buffer in video memory, polygons become triangle lists drawn by a
+  pass-through vertex shader and a color pixel shader (hand-assembled R700
+  code), `glClear` draws a rectangle, and the picture comes back through
+  the GART into ordinary memory. On a 3dfx card it drives the 3D engine
+  from user space, as Glide does: a 16-bit color buffer and depth buffer
+  in video memory, polygons go to the chip's triangle setup unit,
   `glClear` is a fast fill, and the picture is read back when the frame is
-  done. Anywhere else (or with `LIBGL_ALWAYS_SOFTWARE` set) a scanline
-  rasterizer fills a 24-bit color buffer with a 30-bit depth buffer.
+  done. Anywhere else a scanline rasterizer fills a 24-bit color buffer
+  with a 30-bit depth buffer. `FGL_NO_RADEON`, `FGL_NO_TDFX` and
+  `FGL_SOFTWARE` skip renderers, as do `FLUXGL_DRIVER=radeon|tdfx|soft`
+  and `LIBGL_ALWAYS_SOFTWARE` in the environment.
 - `fglCreateContext`, `fglMakeCurrent`, `fglResize` and `fglSwapBuffers`
   play GLX's part: a context draws into its own picture, which
   `fglSwapBuffers` copies to a pixel buffer such as a desktop window's.

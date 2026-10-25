@@ -700,33 +700,9 @@ void voodoo_proc_exit(int pid)
 /* video=WxH[xD][@R] on the command line: start in that mode. */
 static void boot_option(void)
 {
-    char opt[32];
-    if (!cmdline_value("video", opt, sizeof(opt)) || !opt[0])
-        return;
-    struct dispmode m = { 0, 0, 32, 0, 0, 0 };
-    const char *p = opt;
-    int vals[4] = { 0, 0, 0, 0 }, n = 0;
-    while (*p && n < 4) {
-        int v = 0;
-        while (*p >= '0' && *p <= '9')
-            v = v * 10 + (*p++ - '0');
-        vals[n++] = v;
-        if (*p == 'x' && n < 3) {
-            p++;
-        } else if (*p == '@' && n >= 2) {
-            p++;
-            n = 3;                  /* the next number is the refresh rate */
-        } else {
-            break;
-        }
-    }
-    m.width = (uint16_t)vals[0];
-    m.height = (uint16_t)vals[1];
-    if (vals[2])
-        m.bpp = (uint16_t)vals[2];
-    m.refresh = (uint16_t)vals[3];
-    if (!m.width || !m.height || voodoo_set_mode(&m) < 0)
-        kprintf("voodoo: cannot set video=%s, keeping the boot mode\n", opt);
+    struct dispmode m;
+    if (fb_video_option(&m) && voodoo_set_mode(&m) < 0)
+        kprintf("voodoo: cannot set that video= mode, keeping the boot mode\n");
 }
 
 void voodoo_init(void)

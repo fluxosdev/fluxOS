@@ -1,12 +1,17 @@
 /*
  * fluxOS GL contexts, the counterpart of GLX or WGL. A context draws into
- * a picture of its own: on a 3dfx Voodoo card in video memory, with the
- * card's 3D engine, and anywhere else in ordinary memory, with the
- * software renderer. fglSwapBuffers() finishes the frame and copies the
- * picture to a 0xRRGGBB pixel buffer, such as a desktop window's.
+ * a picture of its own: on an ATI Radeon HD 4000 or a 3dfx Voodoo card in
+ * video memory, with the card's 3D engine, and anywhere else in ordinary
+ * memory, with the software renderer. fglSwapBuffers() finishes the frame
+ * and copies the picture to a 0xRRGGBB pixel buffer, such as a desktop
+ * window's.
  *
- * Setting LIBGL_ALWAYS_SOFTWARE in the environment, or passing
- * FGL_SOFTWARE, keeps a context off the hardware.
+ * A new context takes the first of the Radeon, the Voodoo and the software
+ * renderer that works. FGL_NO_RADEON and FGL_NO_TDFX skip a card;
+ * FGL_SOFTWARE, or LIBGL_ALWAYS_SOFTWARE in the environment, keeps the
+ * context off the hardware; FLUXGL_DRIVER=radeon, tdfx or soft in the
+ * environment names the only renderer to try (software stays the last
+ * resort).
  */
 #ifndef _GL_FLUXGL_H
 #define _GL_FLUXGL_H
@@ -16,7 +21,14 @@
 
 typedef struct fgl_context FGLcontext;
 
-#define FGL_SOFTWARE 0x1            /* never use the 3D hardware */
+#define FGL_SOFTWARE  0x1           /* never use the 3D hardware */
+#define FGL_NO_RADEON 0x2           /* not an ATI Radeon's 3D engine */
+#define FGL_NO_TDFX   0x4           /* not a 3dfx Voodoo's */
+
+/* fglGetDriver */
+#define FGL_DRIVER_SOFTWARE 0
+#define FGL_DRIVER_TDFX     1
+#define FGL_DRIVER_RADEON   2
 
 /* A context with a width x height picture; NULL if out of memory. */
 FGLcontext *fglCreateContext(int width, int height, unsigned int flags);
@@ -30,5 +42,7 @@ int fglResize(FGLcontext *ctx, int width, int height);
 void fglSwapBuffers(FGLcontext *ctx, uint32_t *dst, int stride);
 /* 1 if the context draws with 3D hardware. */
 int fglIsAccelerated(FGLcontext *ctx);
+/* Which renderer draws the context: FGL_DRIVER_*. */
+int fglGetDriver(FGLcontext *ctx);
 
 #endif

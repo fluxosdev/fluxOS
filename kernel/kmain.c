@@ -130,6 +130,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     rtc_init();
     pit_init(HZ);
     boot_ok("PIT timer at %u Hz, RTC clock read", HZ);
+    radeon_late_init();
     tty_init();
     keyboard_init();
     serial_enable_irq();

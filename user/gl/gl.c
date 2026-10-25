@@ -772,7 +772,7 @@ static int get_values(struct fgl_context *c, GLenum pname, double *v)
         v[0] = c->be == &gl_tdfx_backend ? 6 : 8;
         return 1;
     case GL_DEPTH_BITS:
-        v[0] = c->be == &gl_tdfx_backend ? 16 : 30;
+        v[0] = c->be == &gl_tdfx_backend ? 16 : c->be == &gl_radeon_backend ? 24 : 30;
         return 1;
     }
     {
@@ -880,6 +880,19 @@ static void init_state(struct fgl_context *c)
     gl_prim_init(c);
 }
 
+/* The first 3D card that takes the context; -1 for software. */
+static int attach_hardware(struct fgl_context *c, unsigned int flags)
+{
+    const char *only = getenv("FLUXGL_DRIVER");
+    if ((flags & FGL_SOFTWARE) || getenv("LIBGL_ALWAYS_SOFTWARE") || (only && !strcmp(only, "soft")))
+        return -1;
+    if (!(flags & FGL_NO_RADEON) && (!only || !strcmp(only, "radeon")) && gl_radeon_attach(c) == 0)
+        return 0;
+    if (!(flags & FGL_NO_TDFX) && (!only || !strcmp(only, "tdfx")) && gl_tdfx_attach(c) == 0)
+        return 0;
+    return -1;
+}
+
 FGLcontext *fglCreateContext(int width, int height, unsigned int flags)
 {
     if (width < 1 || height < 1 || width > MAX_VIEWPORT || height > MAX_VIEWPORT)
@@ -890,7 +903,7 @@ FGLcontext *fglCreateContext(int width, int height, unsigned int flags)
     c->width = width;
     c->height = height;
     init_state(c);
-    if ((flags & FGL_SOFTWARE) || getenv("LIBGL_ALWAYS_SOFTWARE") || gl_tdfx_attach(c) < 0) {
+    if (attach_hardware(c, flags) < 0) {
         c->be = &gl_soft_backend;
         strcpy(c->renderer, gl_soft_backend.name);
         if (c->be->resize(c) < 0) {
@@ -956,12 +969,23 @@ void fglSwapBuffers(FGLcontext *c, uint32_t *dst, int stride)
         return;
     c->be->finish(c);
     c->be->read(c, dst, stride);
-    /* A video mode change may have grown the screen over our video memory. */
-    if (c->be == &gl_tdfx_backend && gl_tdfx_check(c) < 0)
+    /* A video mode change may have grown the screen over our video memory,
+     * or the engine may have hung. */
+    if ((c->be == &gl_tdfx_backend && gl_tdfx_check(c) < 0) ||
+        (c->be == &gl_radeon_backend && gl_radeon_check(c) < 0))
         use_software(c);
 }
 
 int fglIsAccelerated(FGLcontext *c)
 {
-    return c && c->be == &gl_tdfx_backend;
+    return c && c->be != &gl_soft_backend;
+}
+
+int fglGetDriver(FGLcontext *c)
+{
+    if (c && c->be == &gl_radeon_backend)
+        return FGL_DRIVER_RADEON;
+    if (c && c->be == &gl_tdfx_backend)
+        return FGL_DRIVER_TDFX;
+    return FGL_DRIVER_SOFTWARE;
 }

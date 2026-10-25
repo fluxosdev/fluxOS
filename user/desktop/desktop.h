@@ -118,6 +118,9 @@ void wm_close(struct window *w);        /* as the close button does */
 void wm_input(const struct input_event *ev);
 /* The video mode changed: map the new screen and lay the desktop out for it. */
 int wm_reconfigure(void);
+/* The adapter's page flipping and hardware pointer (radeon), on or off. */
+int wm_accel(void);
+void wm_set_accel(int on);
 void wm_tray_changed(void);             /* redraw the tray (the volume icon) */
 void wm_splash(const char *message, color_t color);     /* full-screen notice */
 void wm_tick(void);             /* clock and timers; call a few times a second */

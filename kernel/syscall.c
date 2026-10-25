@@ -1005,6 +1005,10 @@ static int sys_display(uint32_t op, uint32_t uarg, uint32_t c, uint32_t d, uint3
     case DISP_FLIP: size = sizeof(struct dispflip); break;
     case DISP_CURSOR: size = sizeof(struct dispcursor); break;
     case DISP_CURSORPOS: size = sizeof(struct disppos); break;
+    case DISP_COPYRECTS: size = sizeof(struct dispcopy); break;
+    case DISP_MAPBUF: case DISP_UNMAPBUF: size = sizeof(struct dispbuf); break;
+    case DISP_BLIT: size = sizeof(struct dispblit); break;
+    case DISP_SUBMIT: size = sizeof(struct dispsubmit); break;
     default: return -EINVAL;
     }
     if (user_check((void *)uarg, size) < 0)

@@ -3,7 +3,8 @@
  * started from: a 1024 byte file of "name=value" lines after a header
  * line, padded with '#'. The boot menu reads some of the names
  * (fluxos_gfx, fluxos_video); the desktop keeps its own settings in
- * others (fluxos_wall, fluxos_wallmode), which GRUB leaves alone. Started
+ * others (fluxos_wall, fluxos_wallmode, fluxos_driver), which GRUB leaves
+ * alone. Started
  * from the CD there is no such partition, and nothing can be kept.
  */
 #include <fcntl.h>

@@ -4,11 +4,11 @@
  * claims it with SYS_fbmap; the console takes the screen back when that
  * process exits.
  *
- * A display driver (voodoo.c) may later switch to a mode of its own and
- * point fb at it; fb_boot keeps the boot loader's mode. SYS_display
- * reports the adapter and sets modes through that driver. Another
- * (radeon.c) keeps the boot mode but lends the screen's owner a second
- * page to flip to and a hardware pointer.
+ * A display driver (voodoo.c, radeon.c) may later switch to a mode of its
+ * own and point fb at it; fb_boot keeps the boot loader's mode. SYS_display
+ * reports the adapter and sets modes through that driver. The Radeon one
+ * also lends the screen's owner a second page to flip to and a hardware
+ * pointer.
  */
 #include "kernel.h"
 #include "drivers.h"
@@ -118,7 +118,7 @@ void fb_mode_changed(void)
 {
     struct proc *p = fb_owner ? proc_find(fb_owner) : NULL;
     if (p && p->state != P_ZOMBIE)
-        vmm_map_phys(p->pd, USER_MMIO_BASE, fb.phys, fb.size, 0);
+        vmm_map_phys(p->pd, USER_MMIO_BASE, fb.phys, radeon_present() ? radeon_map_size() : fb.size, 0);
     vga_reset_fb();
 }
 
@@ -225,12 +225,49 @@ int fb_map_user(void)
 void fb_proc_exit(int pid)
 {
     voodoo_proc_exit(pid);
+    radeon_proc_exit(pid);
     if (!fb_owner || pid != fb_owner)
         return;
     fb_owner = 0;
     radeon_release();
     klog("fb: screen returned to the console\n");
     vga_redraw();
+}
+
+/* video=WxH[xD][@R] on the command line: the mode a display driver starts in. */
+int fb_video_option(struct dispmode *m)
+{
+    char opt[32];
+    if (!cmdline_value("video", opt, sizeof(opt)) || !opt[0])
+        return 0;
+    memset(m, 0, sizeof(*m));
+    m->bpp = 32;
+    const char *p = opt;
+    int vals[4] = { 0, 0, 0, 0 }, n = 0;
+    while (*p && n < 4) {
+        int v = 0;
+        while (*p >= '0' && *p <= '9')
+            v = v * 10 + (*p++ - '0');
+        vals[n++] = v;
+        if (*p == 'x' && n < 3) {
+            p++;
+        } else if (*p == '@' && n >= 2) {
+            p++;
+            n = 3;                  /* the next number is the refresh rate */
+        } else {
+            break;
+        }
+    }
+    m->width = (uint16_t)vals[0];
+    m->height = (uint16_t)vals[1];
+    if (vals[2])
+        m->bpp = (uint16_t)vals[2];
+    m->refresh = (uint16_t)vals[3];
+    if (!m->width || !m->height) {
+        kprintf("fb: cannot read video=%s\n", opt);
+        return 0;
+    }
+    return 1;
 }
 
 /* ---- SYS_display ---- */
@@ -273,9 +310,11 @@ int fb_display(int op, void *arg)
         return 0;
     }
     case DISP_MODES:
-        return voodoo_present() ? voodoo_modes(arg, DISP_MAX_MODES) : 0;
+        if (voodoo_present())
+            return voodoo_modes(arg, DISP_MAX_MODES);
+        return radeon_present() ? radeon_modes(arg, DISP_MAX_MODES) : 0;
     case DISP_SETMODE: {
-        if (!voodoo_present())
+        if (!voodoo_present() && !radeon_present())
             return -ENODEV;
         /* Only the process that has the screen, or anyone while the console does. */
         if (fb_owner && fb_owner != current->pid) {
@@ -284,12 +323,12 @@ int fb_display(int op, void *arg)
                 return -EBUSY;
         }
         struct dispmode m = *(const struct dispmode *)arg;
-        return voodoo_set_mode(&m);
+        return voodoo_present() ? voodoo_set_mode(&m) : radeon_set_mode(&m);
     }
     case DISP_MAP3D:
-        if (!voodoo_present())
-            return -ENODEV;
-        return voodoo_map3d(arg);
+        if (voodoo_present())
+            return voodoo_map3d(arg);
+        return radeon_present() ? radeon_map3d_user(arg) : -ENODEV;
     case DISP_FLIP:
         if (!radeon_present())
             return -ENODEV;
@@ -310,6 +349,20 @@ int fb_display(int op, void *arg)
         struct disppos pos = *(const struct disppos *)arg;
         return radeon_cursor_pos(&pos);
     }
+    case DISP_COPYRECTS:
+        if (!radeon_present())
+            return -ENODEV;
+        if (!screen_owner())
+            return -EPERM;
+        return radeon_copy_rects(arg);
+    case DISP_MAPBUF:
+        return radeon_present() ? radeon_mapbuf(arg) : -ENODEV;
+    case DISP_UNMAPBUF:
+        return radeon_present() ? radeon_unmapbuf(arg) : -ENODEV;
+    case DISP_BLIT:
+        return radeon_present() ? radeon_blit(arg, screen_owner()) : -ENODEV;
+    case DISP_SUBMIT:
+        return radeon_present() ? radeon_submit_user(arg) : -ENODEV;
     }
     return -EINVAL;
 }

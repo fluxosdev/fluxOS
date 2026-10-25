@@ -34,13 +34,20 @@ static struct fbinfo fbi;
 static int fb_fast;                     /* 32 bpp with the 0xRRGGBB layout */
 
 /* With two pages of the screen, frames are drawn on the one not shown and
- * flipped to; that page still lacks what changed in the frame before. */
+ * flipped to; that page still lacks what changed in the frame before.
+ * Both this and the hardware pointer are used only when the adapter's own
+ * driver is chosen in Display Properties (fluxos_driver in grubenv). */
+static int accel_wanted;
 static int flip_ok;
 static uint32_t page_offset;
-static int back_page = 1;
+static int shown_page;                  /* the page on the screen */
 static struct rect shown[MAX_DAMAGE];
 static int nshown;
 static int hw_cursor;                   /* the adapter draws the pointer */
+static int gpu_copy;                    /* and copies between the pages (DISPF_ACCEL) */
+static int gpu_present;                 /* and copies the back buffer to the screen (DISPF_GART) */
+static uint32_t screen_handle;          /* the back buffer, lent to the GPU */
+static void *screen_mem;                /* its allocation */
 
 static struct window *bottom;           /* z-order list, bottom to top */
 static struct window *focused;
@@ -457,33 +464,130 @@ static void present(uint8_t *page, struct rect r)
     }
 }
 
+/* The back buffer, laid out for the GPU too: page aligned, lines a
+ * multiple of 256 bytes. */
+static int screen_alloc(struct surface *s, int w, int h)
+{
+    int stride = (w + 63) & ~63;
+    size_t bytes = (size_t)stride * (size_t)h * 4;
+    void *mem = malloc(bytes + 4095);
+    if (!mem)
+        return -1;
+    s->px = (uint32_t *)(((uintptr_t)mem + 4095) & ~(uintptr_t)4095);
+    memset(s->px, 0, bytes);            /* every page present, for DISP_MAPBUF */
+    s->w = w;
+    s->h = h;
+    s->stride = stride;
+    gfx_noclip(s);
+    screen_mem = mem;
+    return 0;
+}
+
+static void unlend_screen(void)
+{
+    if (screen_handle) {
+        struct dispbuf b = { 0, 0, screen_handle, 0, 0 };
+        display(DISP_UNMAPBUF, &b);
+        screen_handle = 0;
+    }
+    gpu_present = 0;
+}
+
+/* Lend the back buffer to the GPU so it can copy from it. */
+static void lend_screen(void)
+{
+    struct dispbuf b = { (uint32_t)(uintptr_t)screen.px, (uint32_t)(screen.stride * screen.h * 4), 0, 0, 0 };
+    if (display(DISP_MAPBUF, &b) == 0) {
+        screen_handle = b.handle;
+        gpu_present = 1;
+    }
+}
+
+/* Have the GPU copy rectangles of the back buffer to a page. */
+static int gpu_show(const struct rect *r, int n, int page)
+{
+    struct dispblit b;
+    memset(&b, 0, sizeof(b));
+    b.src.kind = DISP_SURF_BUFFER;
+    b.src.handle = screen_handle;
+    b.src.pitch = (uint32_t)screen.stride * 4;
+    b.src.width = (uint32_t)screen.w;
+    b.src.height = (uint32_t)screen.h;
+    b.dst.kind = DISP_SURF_PAGE;
+    b.dst.handle = (uint32_t)page;
+    b.count = (uint32_t)n;
+    for (int i = 0; i < n; i++) {
+        b.rects[i].sx = b.rects[i].dx = (int16_t)r[i].x;
+        b.rects[i].sy = b.rects[i].dy = (int16_t)r[i].y;
+        b.rects[i].w = (int16_t)r[i].w;
+        b.rects[i].h = (int16_t)r[i].h;
+    }
+    return display(DISP_BLIT, &b);
+}
+
 /* Put the changed rectangles of the back buffer on the screen. */
 static void show_frame(const struct rect *r, int n)
 {
     if (!flip_ok) {
         for (int i = 0; i < n; i++)
-            present(fb, r[i]);
+            present(fb + shown_page * page_offset, r[i]);
         return;
     }
+    /* The page to draw on still lacks last frame's changes: the 3D engine
+     * copies them over from the page on the screen, or the CPU draws them. */
     struct rect todo[MAX_DAMAGE];
     int ntodo = 0;
-    for (int i = 0; i < nshown; i++)
-        add_rect(todo, &ntodo, shown[i]);
+    if (gpu_present) {
+        /* The GPU copies this frame's and last frame's changes from memory. */
+        for (int i = 0; i < nshown; i++)
+            add_rect(todo, &ntodo, shown[i]);
+        for (int i = 0; i < n; i++)
+            add_rect(todo, &ntodo, r[i]);
+        int back = shown_page ^ 1;
+        if (gpu_show(todo, ntodo, back) == 0) {
+            struct dispflip f = { (uint32_t)back };
+            shown_page = back;
+            if (display(DISP_FLIP, &f) < 0) {
+                flip_ok = 0;
+                unlend_screen();
+                return;
+            }
+            memcpy(shown, r, (size_t)n * sizeof(*r));
+            nshown = n;
+            return;
+        }
+        unlend_screen();                /* the CPU draws from now on */
+        ntodo = 0;
+    }
+    if (gpu_copy && nshown) {
+        struct dispcopy c;
+        c.from_page = (uint32_t)shown_page;
+        c.count = (uint32_t)nshown;
+        for (int i = 0; i < nshown; i++) {
+            c.rects[i].x = (int16_t)shown[i].x;
+            c.rects[i].y = (int16_t)shown[i].y;
+            c.rects[i].w = (int16_t)shown[i].w;
+            c.rects[i].h = (int16_t)shown[i].h;
+        }
+        if (display(DISP_COPYRECTS, &c) < 0)
+            gpu_copy = 0;
+    }
+    if (!gpu_copy)
+        for (int i = 0; i < nshown; i++)
+            add_rect(todo, &ntodo, shown[i]);
     for (int i = 0; i < n; i++)
         add_rect(todo, &ntodo, r[i]);
-    uint8_t *page = fb + back_page * page_offset;
+    int back = shown_page ^ 1;
     for (int i = 0; i < ntodo; i++)
-        present(page, todo[i]);
-    struct dispflip f = { (uint32_t)back_page };
+        present(fb + back * page_offset, todo[i]);
+    struct dispflip f = { (uint32_t)back };
+    shown_page = back;
     if (display(DISP_FLIP, &f) < 0) {
-        /* Stay on the page asked for and draw on it directly from now on. */
-        fb = page;
-        flip_ok = 0;
+        flip_ok = 0;                    /* draw on the page asked for from now on */
         return;
     }
     memcpy(shown, r, (size_t)n * sizeof(*r));
     nshown = n;
-    back_page ^= 1;
 }
 
 /* ---- the hardware pointer ---- */
@@ -533,20 +637,51 @@ static void software_cursor(void)
     wm_damage(cursor_bounds(mx, my, cursor_kind));
 }
 
-/* Flip pages and let the adapter draw the pointer, where it can. */
+/* Flip pages and let the adapter draw the pointer, if it can and is chosen. */
 static void use_adapter(void)
 {
     struct dispinfo di;
-    flip_ok = hw_cursor = 0;
+    unlend_screen();
+    flip_ok = hw_cursor = gpu_copy = 0;
     nshown = 0;
-    if (display(DISP_INFO, &di) < 0)
+    if (!accel_wanted || display(DISP_INFO, &di) < 0)
         return;
     if ((di.flags & DISPF_FLIP) && di.page_offset) {
         flip_ok = 1;
         page_offset = di.page_offset;
+        gpu_copy = (di.flags & DISPF_ACCEL) != 0;
+        if (gpu_copy && (di.flags & DISPF_GART))
+            lend_screen();
     }
     if ((di.flags & DISPF_CURSOR) && load_cursor() == 0)
         hw_cursor = 1;
+}
+
+int wm_accel(void)
+{
+    return flip_ok || hw_cursor;
+}
+
+void wm_set_accel(int on)
+{
+    accel_wanted = on;
+    if (on) {
+        use_adapter();
+        wm_damage(mkrect(0, 0, screen_w, screen_h));    /* fills both pages */
+        return;
+    }
+    if (hw_cursor)
+        software_cursor();
+    gpu_copy = 0;
+    unlend_screen();
+    if (flip_ok && shown_page) {
+        /* Back to page 0, where the console and a plain screen draw. */
+        struct dispflip f = { 0 };
+        present(fb, mkrect(0, 0, screen_w, screen_h));
+        if (display(DISP_FLIP, &f) == 0)
+            shown_page = 0;
+    }
+    flip_ok = 0;
 }
 
 /* ---- drawing the scene ---- */
@@ -1735,16 +1870,19 @@ int wm_reconfigure(void)
     uint8_t *nfb = fbmap();
     if (!nfb)
         return -1;
+    void *old_mem = screen_mem;
     struct surface ns;
-    if (surface_init(&ns, (int)nfi.width, (int)nfi.height) < 0)
+    if (screen_alloc(&ns, (int)nfi.width, (int)nfi.height) < 0)
         return -1;
-    surface_free(&screen);
+    unlend_screen();
+    free(old_mem);
     screen = ns;
     fb = nfb;
     fbi = nfi;
     screen_w = (int)fbi.width;
     screen_h = (int)fbi.height;
     fb_fast = fbi.bpp == 32 && fbi.red_pos == 16 && fbi.green_pos == 8 && fbi.blue_pos == 0;
+    shown_page = 0;                     /* a new mode starts on page 0 */
     use_adapter();
     wallpaper_resize();
 
@@ -1791,7 +1929,7 @@ void wm_init(void)
     screen_w = (int)fbi.width;
     screen_h = (int)fbi.height;
     fb_fast = fbi.bpp == 32 && fbi.red_pos == 16 && fbi.green_pos == 8 && fbi.blue_pos == 0;
-    if (surface_init(&screen, screen_w, screen_h) < 0) {
+    if (screen_alloc(&screen, screen_w, screen_h) < 0) {
         fprintf(stderr, "desktop: out of memory\n");
         exit(1);
     }
@@ -1799,6 +1937,9 @@ void wm_init(void)
         remove_installer();
     mx = screen_w / 2;
     my = screen_h / 2;
+    char dir[128], drv[16];
+    accel_wanted = grubenv_boot_dir(dir, sizeof(dir)) &&
+                   grubenv_get(dir, "fluxos_driver", drv, sizeof(drv)) && !strcmp(drv, "radeon");
     use_adapter();
     update_clock();
     wm_damage(mkrect(0, 0, screen_w, screen_h));

@@ -272,6 +272,11 @@ struct fbinfo {
 #define DISP_FLIP    4          /* arg: const struct dispflip *; shows a page (DISPF_FLIP) */
 #define DISP_CURSOR  5          /* arg: const struct dispcursor *; the hardware pointer */
 #define DISP_CURSORPOS 6        /* arg: const struct disppos *; moves the hardware pointer */
+#define DISP_COPYRECTS 7        /* arg: const struct dispcopy *; copies between pages (DISPF_ACCEL) */
+#define DISP_MAPBUF  8          /* arg: struct dispbuf *; lends memory to the GPU (DISPF_GART) */
+#define DISP_UNMAPBUF 9         /* arg: const struct dispbuf *; takes it back */
+#define DISP_BLIT    10         /* arg: const struct dispblit *; copies rectangles (DISPF_ACCEL) */
+#define DISP_SUBMIT  11         /* arg: const struct dispsubmit *; runs a command buffer (Radeon 3D) */
 
 #define DISP_MAX_MODES 32
 
@@ -281,6 +286,8 @@ struct fbinfo {
 #define DISPF_BOOT   0x8        /* the boot loader's mode is on the screen */
 #define DISPF_FLIP   0x10       /* fbmap maps two pages of the screen (DISP_FLIP) */
 #define DISPF_CURSOR 0x20       /* has a hardware pointer (DISP_CURSOR) */
+#define DISPF_ACCEL  0x40       /* the 3D engine copies between pages (DISP_COPYRECTS) */
+#define DISPF_GART   0x80       /* the GPU reaches ordinary memory (DISP_MAPBUF) */
 
 /* A video mode. DISP_MODES lists timings with bpp 0: each works at 16 or
  * 32 bits per pixel if the video memory holds it. */
@@ -328,15 +335,76 @@ struct disppos {
     int32_t x, y;               /* the hot spot, in screen pixels */
 };
 
+/* DISP_COPYRECTS: the 3D engine copies rectangles of page from_page to the
+ * same place on the other page, and the call returns once they are there.
+ * Only the process that has the screen may ask. */
+#define DISP_MAX_RECTS 32
+
+struct disprect {
+    int16_t x, y, w, h;
+};
+
+struct dispcopy {
+    uint32_t from_page;
+    uint32_t count;
+    struct disprect rects[DISP_MAX_RECTS];
+};
+
+/* DISP_MAPBUF: map size bytes at addr (ordinary memory of the caller,
+ * every page present) into the GPU's address space, until DISP_UNMAPBUF
+ * or the process exits. Returns handle and the address the GPU sees addr
+ * at. A Radeon's buffers keep its 3D engine's rules: surfaces start on a
+ * 256 byte boundary and lines are a multiple of 256 bytes. */
+struct dispbuf {
+    uint32_t addr, size;
+    uint32_t handle;
+    uint32_t gpu_lo, gpu_hi;
+};
+
+/* DISP_BLIT: the 3D engine copies rectangles from one surface to another,
+ * converting between 16 and 32 bits per pixel; the call returns once they
+ * are there. A page of the screen has the screen's size and depth; the
+ * other surfaces are 32 bits per pixel (0xAARRGGBB), offset and pitch in
+ * bytes from the start of the 3D client's video memory or of a buffer. */
+#define DISP_SURF_PAGE   0      /* handle: page 0 or 1 of the screen */
+#define DISP_SURF_ARENA  1      /* the video memory of DISP_MAP3D */
+#define DISP_SURF_BUFFER 2      /* handle: from DISP_MAPBUF */
+
+struct dispsurf {
+    uint32_t kind, handle;
+    uint32_t offset, pitch;
+    uint32_t width, height;
+};
+
+struct dispblitrect {
+    int16_t sx, sy, dx, dy, w, h;
+};
+
+struct dispblit {
+    struct dispsurf src, dst;
+    uint32_t count;
+    struct dispblitrect rects[DISP_MAX_RECTS];
+};
+
+/* DISP_SUBMIT: the Radeon's command processor runs dwords of PM4 packets
+ * at a GPU address in the caller's video memory or buffers, after the
+ * driver's default 3D state, and the call returns when the engine is
+ * idle again. Only the process that has the 3D engine may submit. */
+struct dispsubmit {
+    uint32_t gpu_lo, gpu_hi;
+    uint32_t dwords;
+};
+
 /* DISP_MAP3D: the 3D engine's registers and all of video memory, mapped
  * into the caller (one process at a time). The screen occupies video
  * memory from offset 0 to screen_end. */
 struct disp3d {
-    uint32_t regs;              /* user address of the 3D register block */
+    uint32_t regs;              /* user address of the 3D register block (3dfx) */
     uint32_t vram;              /* user address of video memory */
     uint32_t vram_size;
     uint32_t screen_end;
     uint32_t pci_id;
+    uint32_t gpu_lo, gpu_hi;    /* Radeon: vram as its 3D engine addresses it */
 };
 
 /* ---- sound (ioctl requests and records for the sound devices) ---- */

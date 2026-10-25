@@ -22,6 +22,7 @@ int fb_init(struct multiboot_info *mbi);
 void fb_map(void);
 void fb_mode_changed(void);             /* a driver set a new mode in fb */
 int fb_display(int op, void *arg);      /* SYS_display; arg checked by the caller */
+int fb_video_option(struct dispmode *m);    /* video= on the command line; 1 if given */
 uint32_t fb_pack(uint32_t rgb);
 void fb_glyph(uint32_t x, uint32_t y, const uint8_t *rows, uint32_t h, uint32_t fg, uint32_t bg);
 void fb_fill(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color);
@@ -43,13 +44,23 @@ void voodoo_proc_exit(int pid);
 
 /* ATI Radeon HD 4000 display driver (radeon.c) */
 void radeon_init(void);
+void radeon_late_init(void);            /* once the timer and the heap run */
 int radeon_present(void);
 void radeon_info(struct dispinfo *di);
+int radeon_modes(struct dispmode *out, int max);
+int radeon_set_mode(const struct dispmode *m);
 uint32_t radeon_map_size(void);         /* what fbmap maps */
 int radeon_flip(int page);
 int radeon_cursor(const struct dispcursor *dc);
 int radeon_cursor_pos(const struct disppos *p);
 void radeon_release(void);              /* the screen goes back to the console */
+int radeon_copy_rects(const struct dispcopy *c);
+int radeon_blit(const struct dispblit *b, int screen_owner);
+int radeon_mapbuf(struct dispbuf *b);
+int radeon_unmapbuf(const struct dispbuf *b);
+int radeon_map3d_user(struct disp3d *d);
+int radeon_submit_user(const struct dispsubmit *s);
+void radeon_proc_exit(int pid);         /* its buffers and the 3D engine */
 
 /* ISA DMA (isadma.c). Modes: single transfers 0x40, auto-init 0x10, and
  * 0x08 to read memory (play) or 0x04 to write it (record). */

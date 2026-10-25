@@ -58,7 +58,7 @@ USER_FP_CFLAGS := $(filter-out -mgeneral-regs-only,$(USER_CFLAGS)) -mfpmath=387 
 LDFLAGS_COMMON := -m elf_i386 -nostdlib -z noexecstack --no-warn-rwx-segments
 
 # ---- kernel ----
-KERNEL_SRCS := kernel/boot.S kernel/entry.S $(wildcard kernel/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c \
+KERNEL_SRCS := kernel/boot.S kernel/entry.S kernel/radeon_fw.S $(wildcard kernel/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c \
                lib/sha256.c
 KERNEL_OBJS := $(patsubst %,$(BUILD)/k/%.o,$(basename $(KERNEL_SRCS)))
 
@@ -98,6 +98,9 @@ $(BUILD)/k/%.o: %.c
 $(BUILD)/k/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# The Radeon microcode is pulled in with .incbin.
+$(BUILD)/k/kernel/radeon_fw.o: $(wildcard firmware/radeon/*.bin)
 
 $(KERNEL): $(KERNEL_OBJS) linker.ld
 	$(LD) $(LDFLAGS_COMMON) -T linker.ld -o $@ $(KERNEL_OBJS)
