@@ -1078,6 +1078,17 @@ static void js_focus(void *ctx, struct node *n)
     }
 }
 
+/* Scripts always run here, so <noscript> is fallback content for other
+   browsers: its refreshes, style sheets, pictures and scripts are not ours.
+   (Google's sends script-less browsers to an "enable JavaScript" page.) */
+static int in_noscript(const struct node *n)
+{
+    for (; n; n = n->parent)
+        if (n->type == N_ELEMENT && n->tag == T_NOSCRIPT)
+            return 1;
+    return 0;
+}
+
 static int runnable_script(const struct node *n)
 {
     const char *type = node_attr(n, "type"), *lang = node_attr(n, "language");
@@ -1101,7 +1112,7 @@ static void start_scripts(struct browser *b, const char *url)
     if (!b->js)
         return;
     for (struct node *n = b->root; n; n = node_next(n, b->root)) {
-        if (n->type != N_ELEMENT || n->tag != T_SCRIPT || !runnable_script(n))
+        if (n->type != N_ELEMENT || n->tag != T_SCRIPT || !runnable_script(n) || in_noscript(n))
             continue;
         const char *src = node_attr(n, "src");
         if (src && *src) {
@@ -1195,7 +1206,7 @@ static void load_document(struct browser *b, const char *text, int len, const ch
     char title[256] = "";
     b->imgs = arena_alloc(&b->arena, sizeof(struct imgref) * MAX_RES);
     for (struct node *n = b->root; n; n = node_next(n, b->root)) {
-        if (n->type != N_ELEMENT)
+        if (n->type != N_ELEMENT || in_noscript(n))
             continue;
         const char *v;
         if (n->tag == T_BASE && (v = node_attr(n, "href")))
@@ -1228,7 +1239,7 @@ static void load_document(struct browser *b, const char *text, int len, const ch
     b->total_res = b->done_res = 0;
     start_scripts(b, url);              /* external scripts are fetched first */
     for (struct node *n = b->root; n; n = node_next(n, b->root)) {
-        if (n->type != N_ELEMENT)
+        if (n->type != N_ELEMENT || in_noscript(n))
             continue;
         const char *v;
         if (n->tag == T_STYLE && b->nsheets < MAX_SHEETS) {
