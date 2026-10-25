@@ -144,10 +144,11 @@ address bar). Pages come over HTTP or HTTPS (through `wget`, so the desktop
 keeps running), or from `file://`.
 - **HTML**: follows the main rules of the HTML5 tree builder (implied and
   auto-closed tags, tables, character references, quirks mode); UTF-8,
-  Latin-1 and Windows-1252.
+  Latin-1 and Windows-1252. The complete HTML5 named character-reference table
+  includes long names, legacy forms and references producing two code points.
 - **CSS**: type, class, id, attribute and structural selectors with all
   combinators, `:not()`/`:is()` with full selectors, specificity, `!important`,
-  `:has()`, `:nth-last-child()`, `@media`, custom properties and `var()`, `calc()`,
+  `:has()`, `:nth-child()`/`:nth-last-child()` with `of <selector-list>` filters, `@media`, custom properties and `var()`, `calc()`,
   `max-height`, `aspect-ratio`, `::before`/`::after` text,
   gradients, rounded corners, and the old presentational attributes.
 - **Layout**: blocks with margin collapsing, inline text, inline-blocks, lists,
@@ -181,13 +182,16 @@ keeps running), or from `file://`.
   Promises with a microtask queue, regular expressions with lookbehind and
   named groups, and the usual built-ins (Map, Set, Weak*, typed arrays, JSON,
   Date, Reflect, `Proxy` (get, set, has, deleteProperty and ownKeys traps), a small Intl, `structuredClone`...). The DOM (jsdom.c) has
-  `document`, `querySelector`, `innerHTML`, `classList`, `dataset`, events,
+  `document`, `querySelector` (including `:is()`, `:where()`, complex `:not()`
+  and filtered sibling selectors), `innerHTML`, `classList`, `dataset`, events,
+  `replaceChildren`, `insertAdjacentText` and `insertAdjacentElement`,
   timers, `location`, `history`, `localStorage`, `XMLHttpRequest`, `fetch`,
   `URL`, and more: `FormData`, `Blob`, `TextEncoder`/`TextDecoder`, `crypto.getRandomValues`/`randomUUID`,
   `DOMParser`, `postMessage`, and stand-ins for `customElements`, `WebSocket`, `Notification` and `CSS.supports`.
   `fetch` and `XMLHttpRequest` send request headers and any method (`PUT`, `DELETE`...). Changes are laid out again when a script returns; runaway
   scripts are stopped. `/usr/share/www/js.html`, `css.html` and `images.html`
-  (linked from the home page) are live test pages.
+  (linked from the home page) are live test pages. `features.html` demonstrates
+  the HTML, CSS and DOM additions in 0.1.4.
 
 **DOS programs** (`/bin/dos`)
 - Runs `.COM` and MZ `.EXE` files in the terminal (`./GAME.EXE`, `dos game`, or

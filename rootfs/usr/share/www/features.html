@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+<head>
+<title>Browser additions in fluxOS 0.1.4</title>
+<style>
+body { font-family: sans-serif; max-width: 720px; margin: 20px auto; padding: 0 16px; line-height: 1.5; color: #26202d; background: #f5f2f8; }
+h1, h2 { color: #4b2569; }
+.card { padding: 14px 18px; margin: 16px 0; background: white; border: 1px solid #d6c6e2; border-radius: 8px; }
+.rows > div { padding: 5px 10px; margin: 3px 0; background: #eee; }
+.rows > :nth-child(odd of .item) { background: #dcefe2; }
+.rows > :nth-child(even of .item) { background: #dfe7fa; }
+.rows > :nth-last-child(1 of .item) { border-right: 5px solid #4b2569; }
+.muted { color: #776c80; }
+button { margin: 3px; padding: 5px 10px; }
+code { font-family: monospace; }
+#output { border: 1px solid #c4b4d0; padding: 10px; min-height: 24px; }
+</style>
+</head>
+<body>
+<h1>Browser additions in fluxOS 0.1.4</h1>
+<p><a href="home.html">Home</a> &middot; <a href="js.html">Run JavaScript regression tests</a></p>
+<div class="card">
+<h2>Filtered CSS stripes</h2>
+<p>The item rows alternate green and blue. The grey note does not count toward the stripes, and the last item has a purple edge.</p>
+<div class="rows">
+<div class="item">First item: green</div>
+<div class="muted">A note between the items: grey</div>
+<div class="item">Second item: blue</div>
+<div class="item">Third item: green, with a purple edge</div>
+</div>
+<p><code>:nth-child(odd of .item)</code> counts matching siblings.</p>
+</div>
+<div class="card">
+<h2>HTML character references</h2>
+<p>Uppercase aliases: &AMP; &LT; &GT; &QUOT;<br>
+Two characters from one reference: &fjlig; (f and j)<br>
+Text and attributes now decode the full HTML5 named-reference table. Available fonts determine which symbols can be drawn.</p>
+</div>
+<div class="card">
+<h2>DOM updates</h2>
+<p>Use the buttons to replace content, add literal text, or move an element into the result.</p>
+<button onclick="replaceOutput()">Replace children</button>
+<button onclick="addText()">Add literal text</button>
+<button onclick="addElement()">Insert element</button>
+<div id="output">Ready.</div>
+</div>
+<script>
+function replaceOutput() {
+  var strong = document.createElement("strong"); strong.textContent = "New content";
+  document.getElementById("output").replaceChildren(strong, " with replaceChildren().");
+}
+function addText() {
+  document.getElementById("output").insertAdjacentText("beforeend", " <b>This stays plain text.</b>");
+}
+function addElement() {
+  var mark = document.createElement("mark"); mark.textContent = " Inserted element ";
+  document.getElementById("output").insertAdjacentElement("beforeend", mark);
+}
+</script>
+</body>
+</html>

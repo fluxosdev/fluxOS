@@ -136,6 +136,10 @@ int node_text(const struct node *n, char *out, int size);   /* text content, whi
 const char *tag_name(int tag);
 int tag_lookup(const char *name, int len);
 
+/* An+B for CSS and DOM selectors; filter is NULL or the selector list after "of". */
+int web_parse_nth(const char *s, const char *end, int *a, int *b, const char **filter);
+int web_nth_fits(int a, int b, int position);
+
 /* ---- styles (css.c) ---- */
 enum unit { U_PX, U_PCT, U_AUTO, U_CALC, U_MIN, U_MAX };
 

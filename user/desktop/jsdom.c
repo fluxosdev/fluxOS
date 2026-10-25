@@ -18,9 +18,8 @@
  * scripts that time themselves.
  *
  * querySelector understands type, #id, .class, [attr] (=, ~=, ^=, $=,
- * *=, |=), the combinators (space, >, +, ~) and a few pseudo-classes
- * (:first-child, :last-child, :only-child, :nth-child, :not, :checked,
- * :disabled, :enabled, :empty, :root, :first-of-type, :last-of-type).
+ * *=, |=), combinators, :is()/:where()/:not() selector lists, structural
+ * pseudo-classes (including An+B of selector-list), and common form states.
  */
 #include <ctype.h>
 #include <flux.h>
@@ -484,47 +483,25 @@ static int ident_char(int c)
     return isalnum(c) || c == '-' || c == '_' || c >= 0x80 || c == '\\';
 }
 
-/* :nth-child(an+b): does position pos (from 1) fit? */
-static int nth_fits(const char *arg, int len, int pos)
-{
-    char b[32];
-    snprintf(b, sizeof(b), "%.*s", len, arg);
-    char *s = b;
-    while (*s == ' ')
-        s++;
-    if (!strncasecmp(s, "odd", 3))
-        return pos % 2 == 1;
-    if (!strncasecmp(s, "even", 4))
-        return pos % 2 == 0;
-    int a = 0, bb = 0;
-    char *n = strchr(s, 'n');
-    if (n) {
-        if (n == s || (n == s + 1 && (*s == '+')))
-            a = 1;
-        else if (n == s + 1 && *s == '-')
-            a = -1;
-        else
-            a = atoi(s);
-        char *rest = n + 1;
-        while (*rest == ' ')
-            rest++;
-        if (*rest == '+' || *rest == '-') {
-            int sign = *rest == '-' ? -1 : 1;
-            rest++;
-            while (*rest == ' ')
-                rest++;
-            bb = sign * atoi(rest);
-        }
-    } else {
-        return pos == atoi(s);
-    }
-    if (a == 0)
-        return pos == bb;
-    int k = pos - bb;
-    return k / a >= 0 && k % a == 0;
-}
-
 static int match_compound(const struct node *n, const char *s, int len);
+static int matches_span(const struct node *n, const char *s, int len);
+
+static int nth_matches(const struct node *n, const char *arg, int len, int last, int of_type)
+{
+    int a, b;
+    const char *filter, *end = arg + len;
+    if (web_parse_nth(arg, end, &a, &b, &filter) < 0 || (of_type && filter))
+        return 0;
+    if (filter && !matches_span(n, filter, (int)(end - filter)))
+        return 0;
+    int position = 1;
+    for (const struct node *p = last ? next_element(n) : prev_element(n); p;
+         p = last ? next_element(p) : prev_element(p))
+        if ((!of_type || !strcmp(p->name, n->name)) &&
+            (!filter || matches_span(p, filter, (int)(end - filter))))
+            position++;
+    return web_nth_fits(a, b, position);
+}
 
 static int match_pseudo(const struct node *n, const char *name, int nlen, const char *arg, int alen)
 {
@@ -536,13 +513,17 @@ static int match_pseudo(const struct node *n, const char *name, int nlen, const 
         return !next_element(n);
     if (IS("only-child"))
         return !prev_element(n) && !next_element(n);
-    if (IS("nth-child"))
-        return arg && nth_fits(arg, alen, n->index);
-    if (IS("nth-last-child")) {
-        int pos = 1;
+    if (IS("nth-child") || IS("nth-last-child") || IS("nth-of-type") || IS("nth-last-of-type"))
+        return arg && nth_matches(n, arg, alen, IS("nth-last-child") || IS("nth-last-of-type"),
+                                  IS("nth-of-type") || IS("nth-last-of-type"));
+    if (IS("only-of-type")) {
+        for (const struct node *k = prev_element(n); k; k = prev_element(k))
+            if (!strcmp(k->name, n->name))
+                return 0;
         for (const struct node *k = next_element(n); k; k = next_element(k))
-            pos++;
-        return arg && nth_fits(arg, alen, pos);
+            if (!strcmp(k->name, n->name))
+                return 0;
+        return 1;
     }
     if (IS("first-of-type") || IS("last-of-type")) {
         int first = IS("first-of-type");
@@ -553,7 +534,9 @@ static int match_pseudo(const struct node *n, const char *name, int nlen, const 
         return 1;
     }
     if (IS("not"))
-        return arg && !match_compound(n, arg, alen);
+        return arg && !matches_span(n, arg, alen);
+    if (IS("is") || IS("where"))
+        return arg && matches_span(n, arg, alen);
     if (IS("checked"))
         return n->checked || (n->tag == T_OPTION && node_attr(n, "selected"));
     if (IS("disabled"))
@@ -744,30 +727,41 @@ static int match_complex(const struct node *n, const char *s, int len)
     }
 }
 
-/* A selector list. */
-static int matches(const struct node *n, const char *sel)
+/* A selector list, bounded so nested functional selectors need no copies. */
+static int matches_span(const struct node *n, const char *s, int len)
 {
-    const char *s = sel;
-    while (*s) {
+    const char *end = s + len;
+    while (s < end) {
         int depth = 0;
+        char quote = 0;
         const char *e = s;
-        while (*e && (depth || *e != ',')) {
-            if (*e == '(' || *e == '[')
+        for (; e < end; e++) {
+            if (*e == '\\' && e + 1 < end) { e++; continue; }
+            if (quote) {
+                if (*e == quote) quote = 0;
+            } else if (*e == '\'' || *e == '"') {
+                quote = *e;
+            } else if (*e == '(' || *e == '[') {
                 depth++;
-            else if (*e == ')' || *e == ']')
-                depth--;
-            e++;
+            } else if (*e == ')' || *e == ']') {
+                if (depth) depth--;
+            } else if (*e == ',' && !depth) {
+                break;
+            }
         }
         const char *a = s, *b = e;
-        while (a < b && isspace((unsigned char)*a))
-            a++;
-        while (b > a && isspace((unsigned char)b[-1]))
-            b--;
+        while (a < b && isspace((unsigned char)*a)) a++;
+        while (b > a && isspace((unsigned char)b[-1])) b--;
         if (b > a && match_complex(n, a, (int)(b - a)))
             return 1;
-        s = *e ? e + 1 : e;
+        s = e < end ? e + 1 : e;
     }
     return 0;
+}
+
+static int matches(const struct node *n, const char *sel)
+{
+    return matches_span(n, sel, (int)strlen(sel));
 }
 
 /* ---- wrappers ---- */
@@ -1905,6 +1899,48 @@ static jsval el_before(struct js *J, jsval s, jsval *a, int n) { return insert_i
 static jsval el_after(struct js *J, jsval s, jsval *a, int n) { return insert_items(J, s, a, n, 3); }
 static jsval el_replace_with(struct js *J, jsval s, jsval *a, int n) { return insert_items(J, s, a, n, 4); }
 
+/* Convert before detaching anything: coercion failures and ancestor cycles
+ * must leave the existing children in place. A staging fragment also makes
+ * repeated nodes and nodes already among the children retain the right order. */
+static jsval el_replace_children(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct node *parent = this_node(J, self);
+    if (!parent)
+        return js_undefined;
+    if (parent->type != N_ELEMENT)
+        return js_throw_error(J, "HierarchyRequestError: a text node cannot have children");
+    struct jsdom *d = dom(J);
+    struct jsobj *items = js_new_array(J);
+    for (int i = 0; i < argc; i++) {
+        jsval value = node_of(args[i]) ? args[i] : js_to_string(J, args[i]);
+        if (js_throwing(J))
+            return js_undefined;
+        js_array_push(J, items, value);
+    }
+    for (int i = 0; i < argc; i++) {
+        struct node *child = node_of(items->items[i]);
+        if (child && contains(child, parent))
+            return js_throw_error(J, "HierarchyRequestError: the new child contains the parent");
+    }
+    struct node *fragment = new_node(d, N_ELEMENT, "#fragment");
+    if (!fragment)
+        return js_throw_error(J, "Error: out of memory");
+    /* Allocate all text nodes before moving any supplied nodes. */
+    for (int i = 0; i < argc; i++)
+        if (!node_of(items->items[i])) {
+            struct jsstr *text = items->items[i].u.s;
+            struct node *child = new_text(d, text->s, text->len);
+            if (!child)
+                return js_throw_error(J, "Error: out of memory");
+            items->items[i] = wrap(d, child);
+        }
+    for (int i = 0; i < argc; i++)
+        insert_node(d, fragment, node_of(items->items[i]), NULL);
+    remove_children(d, parent);
+    insert_node(d, parent, fragment, NULL);
+    return js_undefined;
+}
+
 static struct node *clone(struct jsdom *d, const struct node *n, int deep)
 {
     struct node *c = n->type == N_TEXT ? new_text(d, n->text, n->len) : new_node(d, N_ELEMENT, n->name);
@@ -2079,6 +2115,64 @@ static jsval el_insert_adjacent_html(struct js *J, jsval self, jsval *args, int 
     else if (!strcasecmp(where, "afterend") && n->parent)
         insert_node(d, n->parent, frag, n->next);
     return js_undefined;
+}
+
+/* Return 1 for a target, 0 for a detached exterior position, -1 on error. */
+static int adjacent_target(struct js *J, struct node *n, const char *where,
+                           struct node **parent, struct node **ref)
+{
+    if (!strcasecmp(where, "beforebegin")) {
+        *parent = n->parent; *ref = n;
+    } else if (!strcasecmp(where, "afterbegin")) {
+        *parent = n; *ref = n->first;
+    } else if (!strcasecmp(where, "beforeend")) {
+        *parent = n; *ref = NULL;
+    } else if (!strcasecmp(where, "afterend")) {
+        *parent = n->parent; *ref = n->next;
+    } else {
+        js_throw_error(J, "SyntaxError: invalid adjacent insertion position");
+        return -1;
+    }
+    return *parent != NULL;
+}
+
+static jsval el_insert_adjacent_text(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct node *n = this_node(J, self), *parent, *ref;
+    if (!n)
+        return js_undefined;
+    struct jsstr *where = js_tostr(J, ARG(0));
+    if (js_throwing(J))
+        return js_undefined;
+    struct jsstr *text = js_tostr(J, ARG(1));
+    if (js_throwing(J) || adjacent_target(J, n, where->s, &parent, &ref) <= 0)
+        return js_undefined;
+    struct node *child = new_text(dom(J), text->s, text->len);
+    if (!child)
+        return js_throw_error(J, "Error: out of memory");
+    insert_node(dom(J), parent, child, ref);
+    return js_undefined;
+}
+
+static jsval el_insert_adjacent_element(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct node *n = this_node(J, self), *parent, *ref;
+    if (!n)
+        return js_undefined;
+    struct jsstr *where = js_tostr(J, ARG(0));
+    if (js_throwing(J))
+        return js_undefined;
+    struct node *child = node_of(ARG(1));
+    if (!is_element(child) || is_fragment(child))
+        return js_throw_error(J, "TypeError: insertAdjacentElement requires an element");
+    int target = adjacent_target(J, n, where->s, &parent, &ref);
+    if (target < 0)
+        return js_undefined;
+    if (!target)
+        return js_null;
+    if (insert_node(dom(J), parent, child, ref) < 0)
+        return js_throw_error(J, "HierarchyRequestError: the new child contains the parent");
+    return ARG(1);
 }
 
 static jsval el_focus(struct js *J, jsval self, jsval *args, int argc)
@@ -3317,6 +3411,7 @@ struct jsdom *jsdom_new(const struct jshost *host)
         { "appendChild", el_append_child, 1 }, { "insertBefore", el_insert_before, 2 },
         { "removeChild", el_remove_child, 1 }, { "replaceChild", el_replace_child, 2 },
         { "remove", el_remove, 0 }, { "append", el_append, 1 }, { "prepend", el_prepend, 1 },
+        { "replaceChildren", el_replace_children, 0 },
         { "before", el_before, 1 }, { "after", el_after, 1 }, { "replaceWith", el_replace_with, 1 },
         { "cloneNode", el_clone_node, 1 }, { "contains", el_contains, 1 },
         { "hasChildNodes", el_has_child_nodes, 0 }, { "getAttribute", el_get_attribute, 1 },
@@ -3326,6 +3421,8 @@ struct jsdom *jsdom_new(const struct jshost *host)
         { "getElementsByTagName", el_get_by_tag, 1 }, { "getElementsByClassName", el_get_by_class, 1 },
         { "matches", el_matches, 1 }, { "closest", el_closest, 1 },
         { "getBoundingClientRect", el_get_bounding_rect, 0 },
+        { "insertAdjacentText", el_insert_adjacent_text, 2 },
+        { "insertAdjacentElement", el_insert_adjacent_element, 2 },
         { "insertAdjacentHTML", el_insert_adjacent_html, 2 }, { "addEventListener", add_event_listener, 2 },
         { "removeEventListener", remove_event_listener, 2 }, { "dispatchEvent", el_dispatch_event, 1 },
         { "click", el_click, 0 }, { "focus", el_focus, 0 }, { "blur", nothing, 0 },

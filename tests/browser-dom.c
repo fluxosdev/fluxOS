@@ -22,7 +22,7 @@ int main(int argc, char **argv)
     /* The engine uses a 32-bit page directory. A non-PIE Linux binary
      * with mmap allocation disabled keeps its heap below 4 GiB. */
     mallopt(M_MMAP_MAX, 0);
-    if (argc != 2)
+    if (argc != 3)
         return 2;
     FILE *f = fopen(argv[1], "rb");
     if (!f)
@@ -50,12 +50,16 @@ int main(int argc, char **argv)
         " count++; }";
     jsdom_run_script(dom, NULL, prelude, (int)strlen(prelude), "test harness");
     jsdom_run_script(dom, NULL, src, (int)size, argv[1]);
-    const char *end = "if (count !== 20) throw new Error('Incomplete test run: ' + count);";
+    int expected = atoi(argv[2]);
+    if (expected <= 0)
+        return 2;
+    char end[128];
+    snprintf(end, sizeof(end), "if (count !== %d) throw new Error('Incomplete test run: ' + count);", expected);
     jsdom_run_script(dom, NULL, end, (int)strlen(end), "test count");
     jsdom_free(dom);
     arena_free(&arena);
     free(src);
     if (!errors)
-        puts("20 browser DOM regressions passed");
+        printf("%d browser DOM regressions passed (%s)\n", expected, argv[1]);
     return errors ? 1 : 0;
 }

@@ -140,6 +140,8 @@ struct compound {
     int nattrs;
     uint32_t pseudo;
     int nth_a, nth_b, has_nth, nth_of_type, nth_last;
+    struct selector *nth_list;   /* siblings matching the optional nth-child "of" filter */
+    int nnth;
     struct selector *has_list;  /* :has(a, > b): has a descendant (or child) matching one */
     int nhas;
     uint32_t has_child;         /* bit i: has_list[i] must match a child */
@@ -387,41 +389,17 @@ static const char *read_ident(struct arena *a, const char **p, const char *end, 
 
 /* ---- selector parsing ---- */
 
-static int parse_nth(const char *s, const char *end, int *ra, int *rb)
-{
-    char buf[64];
-    int n = 0;
-    for (; s < end && n < 63; s++)
-        if (!isspace((unsigned char)*s))
-            buf[n++] = (char)tolower((unsigned char)*s);
-    buf[n] = 0;
-    char *of = strstr(buf, "of");
-    if (of)
-        *of = 0;                        /* ":nth-child(2n of .x)": the filter is ignored */
-    if (!strcmp(buf, "odd")) {
-        *ra = 2, *rb = 1;
-        return 0;
-    }
-    if (!strcmp(buf, "even")) {
-        *ra = 2, *rb = 0;
-        return 0;
-    }
-    char *nn = strchr(buf, 'n');
-    if (!nn) {
-        if (!buf[0])
-            return -1;
-        *ra = 0;
-        *rb = atoi(buf);
-        return 0;
-    }
-    *nn = 0;
-    *ra = !buf[0] || !strcmp(buf, "+") ? 1 : !strcmp(buf, "-") ? -1 : atoi(buf);
-    *rb = nn[1] ? atoi(nn + 1) : 0;
-    return 0;
-}
-
 static int parse_compound_list(struct arena *a, const char *s, const char *end,
                                struct selector **out, int *nout);
+
+static uint32_t list_specificity(const struct selector *list, int count)
+{
+    uint32_t spec = 0;
+    for (int i = 0; i < count; i++)
+        if (list[i].spec > spec)
+            spec = list[i].spec;
+    return spec;
+}
 
 /* Parse one compound selector; returns its end, or NULL if it is invalid. */
 static const char *parse_compound(struct arena *a, const char *s, const char *end,
@@ -568,11 +546,25 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
                 c->pseudo |= PS_ENABLED;
             else if ((!strcmp(name, "nth-child") || !strcmp(name, "nth-of-type") ||
                       !strcmp(name, "nth-last-child") || !strcmp(name, "nth-last-of-type")) && args) {
-                if (parse_nth(args, args_end, &c->nth_a, &c->nth_b) < 0)
+                const char *filter;
+                if (web_parse_nth(args, args_end, &c->nth_a, &c->nth_b, &filter) < 0)
                     return NULL;
                 c->has_nth = 1;
                 c->nth_last = !strncmp(name, "nth-last", 8);
                 c->nth_of_type = strstr(name, "of-type") != NULL;
+                if (filter) {
+                    if (c->nth_of_type ||
+                        parse_compound_list(a, filter, args_end, &c->nth_list, &c->nnth) < 0)
+                        return NULL;
+                    uint32_t max_spec = 0;
+                    for (int i = 0; i < c->nnth; i++) {
+                        if (c->nth_list[i].pe)
+                            return NULL;
+                        if (c->nth_list[i].spec > max_spec)
+                            max_spec = c->nth_list[i].spec;
+                    }
+                    *spec += max_spec;
+                }
             } else if (!strcmp(name, "has") && args) {
                 /* a leading '>' means children only; other relative selectors never match */
                 char buf[256];
@@ -593,15 +585,20 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
                 if (!copy || parse_compound_list(a, copy, copy + strlen(copy), &c->has_list, &c->nhas) < 0)
                     return NULL;
                 c->has_child = child ? 0xFFFFFFFFu : 0;
+                *spec += list_specificity(c->has_list, c->nhas);
+                continue;
             } else if (!strcmp(name, "not") && args) {
                 if (parse_compound_list(a, args, args_end, &c->not_list, &c->nnot) < 0)
                     return NULL;
+                *spec += list_specificity(c->not_list, c->nnot);
+                continue;
             } else if ((!strcmp(name, "is") || !strcmp(name, "matches") || !strcmp(name, "where") ||
                         !strcmp(name, "-webkit-any")) && args) {
                 if (parse_compound_list(a, args, args_end, &c->is_list, &c->nis) < 0)
                     return NULL;
-                if (name[0] == 'w')
-                    *spec -= 1 << 10;   /* :where() adds nothing */
+                if (name[0] != 'w')     /* :where() adds nothing */
+                    *spec += list_specificity(c->is_list, c->nis);
+                continue;
             } else {
                 c->pseudo |= PS_NEVER;  /* :hover, :focus and anything we do not know */
             }
@@ -1125,6 +1122,16 @@ static int is_link(const struct node *n)
 
 static int match_from(const struct selector *s, int i, const struct node *n, const struct mctx *m);
 
+static int match_nth_filter(const struct compound *c, const struct node *n, const struct mctx *m)
+{
+    if (!c->nnth)
+        return 1;
+    for (int i = 0; i < c->nnth; i++)
+        if (match_from(&c->nth_list[i], c->nth_list[i].nparts - 1, n, m))
+            return 1;
+    return 0;
+}
+
 static int match_compound(const struct compound *c, const struct node *n, const struct mctx *m)
 {
     if (c->tag >= 0 && (c->tag != n->tag || (c->tag == T_UNKNOWN && strcmp(c->tagname, n->name))))
@@ -1211,18 +1218,19 @@ static int match_compound(const struct compound *c, const struct node *n, const 
             return 0;
     }
     if (c->has_nth) {
+        if (!match_nth_filter(c, n, m))
+            return 0;
         int idx = 1;
         if (c->nth_last) {
             for (const struct node *p = next_element(n); p; p = next_element(p))
-                if (!c->nth_of_type || same_type(p, n))
+                if ((!c->nth_of_type || same_type(p, n)) && match_nth_filter(c, p, m))
                     idx++;
         } else {
             for (const struct node *p = prev_element(n); p; p = prev_element(p))
-                if (!c->nth_of_type || same_type(p, n))
+                if ((!c->nth_of_type || same_type(p, n)) && match_nth_filter(c, p, m))
                     idx++;
         }
-        int d = idx - c->nth_b;
-        if (c->nth_a == 0 ? d != 0 : (d % c->nth_a != 0 || d / c->nth_a < 0))
+        if (!web_nth_fits(c->nth_a, c->nth_b, idx))
             return 0;
     }
     for (int i = 0; i < c->nnot; i++)

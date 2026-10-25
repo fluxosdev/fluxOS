@@ -320,3 +320,89 @@ void url_encode_form(char *out, int size, const char *s)
     }
     out[n] = 0;
 }
+
+/* Parse An+B and the optional whitespace-delimited "of <selector-list>".
+ * Shared by CSS styling and the JavaScript DOM selector matcher. */
+static int nth_integer(const char **s, const char *end, int sign, int *out)
+{
+    const char *start = *s;
+    unsigned value = 0, limit = sign < 0 ? 2147483648u : 2147483647u;
+    while (*s < end && isdigit((unsigned char)**s)) {
+        unsigned digit = (unsigned)(*(*s)++ - '0');
+        if (value > (limit - digit) / 10)
+            return -1;
+        value = value * 10 + digit;
+    }
+    if (*s == start)
+        return -1;
+    *out = sign < 0 ? (int)(-(long long)value) : (int)value;
+    return 0;
+}
+
+int web_parse_nth(const char *s, const char *end, int *a, int *b, const char **filter)
+{
+    *filter = NULL;
+    while (s < end && isspace((unsigned char)*s))
+        s++;
+    const char *formula_end = end;
+    for (const char *p = s; p + 2 < end; p++)
+        if (p > s && isspace((unsigned char)p[-1]) &&
+            (p[0] == 'o' || p[0] == 'O') && (p[1] == 'f' || p[1] == 'F') &&
+            isspace((unsigned char)p[2])) {
+            formula_end = p;
+            p += 2;
+            while (p < end && isspace((unsigned char)*p))
+                p++;
+            if (p == end)
+                return -1;
+            *filter = p;
+            break;
+        }
+    while (formula_end > s && isspace((unsigned char)formula_end[-1]))
+        formula_end--;
+    if (formula_end - s == 3 && !strncasecmp(s, "odd", 3)) {
+        *a = 2; *b = 1; return 0;
+    }
+    if (formula_end - s == 4 && !strncasecmp(s, "even", 4)) {
+        *a = 2; *b = 0; return 0;
+    }
+    int sign = 1, value = 1;
+    if (s < formula_end && (*s == '+' || *s == '-'))
+        sign = *s++ == '-' ? -1 : 1;
+    int digits = s < formula_end && isdigit((unsigned char)*s);
+    if (digits && nth_integer(&s, formula_end, sign, &value) < 0)
+        return -1;
+    if (s < formula_end && (*s == 'n' || *s == 'N')) {
+        s++;
+        *a = digits ? value : sign;
+        *b = 0;
+        while (s < formula_end && isspace((unsigned char)*s))
+            s++;
+        if (s == formula_end)
+            return 0;
+        if (*s != '+' && *s != '-')
+            return -1;
+        sign = *s++ == '-' ? -1 : 1;
+        while (s < formula_end && isspace((unsigned char)*s))
+            s++;
+        return nth_integer(&s, formula_end, sign, b) == 0 && s == formula_end ? 0 : -1;
+    }
+    if (!digits || s != formula_end)
+        return -1;
+    *a = 0; *b = value;
+    return 0;
+}
+
+int web_nth_fits(int a, int b, int position)
+{
+    if (!a)
+        return position == b;
+    if (a > 0) {
+        if (position < b)
+            return 0;
+        return ((uint32_t)position - (uint32_t)b) % (uint32_t)a == 0;
+    }
+    if (position > b)
+        return 0;
+    return ((uint32_t)b - (uint32_t)position) % (0u - (uint32_t)a) == 0;
+}

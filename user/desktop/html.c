@@ -46,43 +46,7 @@ int tag_lookup(const char *name, int len)
 
 /* ---- character references ---- */
 
-static const struct entity {
-    const char *name;
-    int cp;
-} entities[] = {
-    { "AElig", 198 }, { "Aacute", 193 }, { "Acirc", 194 }, { "Agrave", 192 }, { "Aring", 197 },
-    { "Atilde", 195 }, { "Auml", 196 }, { "Ccedil", 199 }, { "Dagger", 0x2021 }, { "ETH", 208 },
-    { "Eacute", 201 }, { "Ecirc", 202 }, { "Egrave", 200 }, { "Euml", 203 }, { "Iacute", 205 },
-    { "Icirc", 206 }, { "Igrave", 204 }, { "Iuml", 207 }, { "Ntilde", 209 }, { "OElig", 0x152 },
-    { "Oacute", 211 }, { "Ocirc", 212 }, { "Ograve", 210 }, { "Oslash", 216 }, { "Otilde", 213 },
-    { "Ouml", 214 }, { "Prime", 0x2033 }, { "Scaron", 0x160 }, { "THORN", 222 }, { "Uacute", 218 },
-    { "Ucirc", 219 }, { "Ugrave", 217 }, { "Uuml", 220 }, { "Yacute", 221 }, { "Yuml", 0x178 },
-    { "aacute", 225 }, { "acirc", 226 }, { "acute", 180 }, { "aelig", 230 }, { "agrave", 224 },
-    { "amp", '&' }, { "apos", '\'' }, { "aring", 229 }, { "atilde", 227 }, { "auml", 228 },
-    { "bdquo", 0x201E }, { "brvbar", 166 }, { "bull", 0x2022 }, { "ccedil", 231 }, { "cedil", 184 },
-    { "cent", 162 }, { "circ", 0x2C6 }, { "clubs", 0x2663 }, { "copy", 169 }, { "curren", 164 },
-    { "dArr", 0x21D3 }, { "dagger", 0x2020 }, { "darr", 0x2193 }, { "deg", 176 },
-    { "diams", 0x2666 }, { "divide", 247 }, { "eacute", 233 }, { "ecirc", 234 }, { "egrave", 232 },
-    { "emsp", 0x2003 }, { "ensp", 0x2002 }, { "eth", 240 }, { "euml", 235 }, { "euro", 0x20AC },
-    { "fnof", 0x192 }, { "frac12", 189 }, { "frac14", 188 }, { "frac34", 190 }, { "ge", 0x2265 },
-    { "gt", '>' }, { "hArr", 0x21D4 }, { "harr", 0x2194 }, { "hearts", 0x2665 },
-    { "hellip", 0x2026 }, { "iacute", 237 }, { "icirc", 238 }, { "iexcl", 161 }, { "igrave", 236 },
-    { "infin", 0x221E }, { "iquest", 191 }, { "iuml", 239 }, { "lArr", 0x21D0 }, { "laquo", 171 },
-    { "larr", 0x2190 }, { "ldquo", 0x201C }, { "le", 0x2264 }, { "lrm", 0x200E }, { "lsaquo", 0x2039 },
-    { "lsquo", 0x2018 }, { "lt", '<' }, { "macr", 175 }, { "mdash", 0x2014 }, { "micro", 181 },
-    { "middot", 183 }, { "minus", 0x2212 }, { "nbsp", 160 }, { "ndash", 0x2013 }, { "ne", 0x2260 },
-    { "not", 172 }, { "ntilde", 241 }, { "oacute", 243 }, { "ocirc", 244 }, { "oelig", 0x153 },
-    { "ograve", 242 }, { "ordf", 170 }, { "ordm", 186 }, { "oslash", 248 }, { "otilde", 245 },
-    { "ouml", 246 }, { "para", 182 }, { "permil", 0x2030 }, { "plusmn", 177 }, { "pound", 163 },
-    { "prime", 0x2032 }, { "quot", '"' }, { "rArr", 0x21D2 }, { "raquo", 187 }, { "rarr", 0x2192 },
-    { "rdquo", 0x201D }, { "reg", 174 }, { "rlm", 0x200F }, { "rsaquo", 0x203A },
-    { "rsquo", 0x2019 }, { "sbquo", 0x201A }, { "scaron", 0x161 }, { "sect", 167 }, { "shy", 173 },
-    { "spades", 0x2660 }, { "sup1", 185 }, { "sup2", 178 }, { "sup3", 179 }, { "szlig", 223 },
-    { "thinsp", 0x2009 }, { "thorn", 254 }, { "tilde", 0x2DC }, { "times", 215 }, { "trade", 0x2122 },
-    { "uArr", 0x21D1 }, { "uacute", 250 }, { "uarr", 0x2191 }, { "ucirc", 251 }, { "ugrave", 249 },
-    { "uml", 168 }, { "uuml", 252 }, { "yacute", 253 }, { "yen", 165 }, { "yuml", 255 },
-    { "zwj", 0x200D }, { "zwnj", 0x200C },
-};
+#include "html_entities.h"
 
 /* Windows-1252's meaning of 0x80-0x9F, which pages use in &#NNN; by mistake. */
 static const uint16_t cp1252[32] = {
@@ -97,8 +61,9 @@ static const uint16_t cp1252[32] = {
  * is not one. In attributes, a name without ';' followed by a letter,
  * digit or '=' is left alone, so URLs like "?a=1&copy=2" survive.
  */
-static int char_ref(const char *s, const char *end, int *used, int in_attr)
+static int char_ref(const char *s, const char *end, int *used, int in_attr, int *second)
 {
+    *second = 0;
     if (s < end && *s == '#') {
         const char *p = s + 1;
         int hex = p < end && (*p == 'x' || *p == 'X');
@@ -124,20 +89,32 @@ static int char_ref(const char *s, const char *end, int *used, int in_attr)
         return cp;
     }
     int n = 0;
-    while (s + n < end && n < 10 && isalnum((unsigned char)s[n]))
+    while (s + n < end && n < HTML_ENTITY_MAX_NAME && isalnum((unsigned char)s[n]))
         n++;
-    /* The longest name that matches a prefix (legacy references need no ';'). */
-    for (int len = n; len >= 2; len--) {
-        for (size_t i = 0; i < sizeof(entities) / sizeof(entities[0]); i++) {
-            if ((int)strlen(entities[i].name) != len || strncmp(entities[i].name, s, (size_t)len))
-                continue;
-            int semi = s + len < end && s[len] == ';';
-            if (!semi && len < n)
-                return -1;              /* "&notit" is text, not "¬it" */
-            if (!semi && in_attr && s + len < end && s[len] == '=')
-                return -1;
-            *used = len + semi;
-            return entities[i].cp;
+    if (s + n < end && s[n] == ';')
+        n++;
+    /* Longest match, including the semicolon when the name requires it. */
+    for (int len = n; len > 0; len--) {
+        int lo = 0, hi = (int)(sizeof(entities) / sizeof(entities[0])) - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            int cmp = strncmp(entities[mid].name, s, (size_t)len);
+            if (!cmp && entities[mid].name[len])
+                cmp = 1;
+            if (cmp < 0) {
+                lo = mid + 1;
+            } else if (cmp > 0) {
+                hi = mid - 1;
+            } else {
+                /* Legacy names followed by an attribute-name character
+                 * are literal text (notably query-string ampersands). */
+                if (s[len - 1] != ';' && in_attr && s + len < end &&
+                    (isalnum((unsigned char)s[len]) || s[len] == '='))
+                    return -1;
+                *used = len;
+                *second = entities[mid].second;
+                return entities[mid].cp;
+            }
         }
     }
     return -1;
@@ -153,10 +130,11 @@ static char *decode_text(struct arena *a, const char *s, int n, int in_attr, int
     const char *end = s + n;
     while (s < end) {
         if (*s == '&') {
-            int used, cp = char_ref(s + 1, end, &used, in_attr);
+            int used, second, cp = char_ref(s + 1, end, &used, in_attr, &second);
             if (cp >= 0) {
-                if (cp != 0x200C && cp != 0x200D && cp != 0x200E && cp != 0x200F && cp != 0xAD)
-                    o += utf8_put(out + o, cp);
+                o += utf8_put(out + o, cp);
+                if (second)
+                    o += utf8_put(out + o, second);
                 s += 1 + used;
                 continue;
             }

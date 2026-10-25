@@ -240,8 +240,10 @@ clean:
 HOSTCC ?= cc
 BROWSER_TEST_SRCS := tests/browser-dom.c $(addprefix user/desktop/,js.c jslib.c jslib2.c jsre.c jsgc.c jsdom.c html.c webutil.c)
 .PHONY: test-browser
-test-browser: $(BUILD)/tests/browser-dom
-	$< rootfs/usr/share/www/classlist-tests.js
+test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-style
+	$< rootfs/usr/share/www/classlist-tests.js 20
+	$< rootfs/usr/share/www/dom-feature-tests.js 25
+	$(BUILD)/tests/browser-style
 
 $(BUILD)/tests/browser-dom: $(BROWSER_TEST_SRCS) $(wildcard user/desktop/*.h) user/include/flux.h include/flux/abi.h
 	@mkdir -p $(dir $@)
@@ -272,3 +274,9 @@ $(BUILD)/tests/kernel-guest.o: tests/kernel-guest.c
 
 $(BUILD)/tests/kernel-guest: $(BUILD)/tests/kernel-guest.o $(CRT0) $(LIBC) user/user.ld
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
+
+$(BUILD)/tests/browser-style: tests/browser-style.c user/desktop/html.c user/desktop/html_entities.h user/desktop/css.c user/desktop/webutil.c user/desktop/web.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter \
+		-Iuser/desktop tests/browser-style.c user/desktop/html.c user/desktop/css.c \
+		user/desktop/webutil.c -o $@
