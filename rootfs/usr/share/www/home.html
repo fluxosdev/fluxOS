@@ -3,75 +3,43 @@
 <head>
 <title>fluxOS Web Browser</title>
 <style>
-body { font-family: sans-serif; margin: 0; background: #f3f0f7; color: #222; }
-.banner { background: #3f175f; color: white; padding: 18px 28px 16px; border-bottom: 4px solid #f08020; }
-.banner h1 { margin: 0; font-size: 28px; }
-.banner p { margin: 4px 0 0; color: #d9c8ea; }
-.main { padding: 4px 28px 20px; max-width: 700px; }
-form { margin: 18px 0 8px; padding: 10px 12px; background: white; border: 1px solid #d6cce2; }
-h2 { font-size: 17px; color: #3f175f; border-bottom: 1px solid #c9b8da; padding-bottom: 3px; margin-top: 22px; }
+body { font-family: sans-serif; margin: 0; background: #f3f0f7; color: #222; text-align: center; }
+.hero { padding: 48px 28px 8px; }
+.hero h1 { margin: 0; font-size: 34px; color: #3f175f; }
+.hero p { margin: 6px 0 0; color: #666; }
+form { margin: 26px auto 10px; max-width: 560px; padding: 14px; background: white; border: 1px solid #d6cce2; }
+.badge { display: inline-block; margin: 14px 0 0; padding: 4px 12px; font-size: 13px; color: #1d5e2a; background: #e4f4e7; border: 1px solid #a9d3b0; }
+.cols { max-width: 560px; margin: 34px auto 0; text-align: left; padding: 0 14px; }
+h2 { font-size: 16px; color: #3f175f; border-bottom: 1px solid #c9b8da; padding-bottom: 3px; }
 ul { padding-left: 22px; margin: 8px 0; }
 li { margin: 5px 0; }
 li span { color: #666; }
-.note { font-size: 13px; color: #444; background: #fffbe6; border: 1px solid #e6d9a2; padding: 8px 12px; margin-top: 22px; }
+.foot { max-width: 560px; margin: 26px auto 30px; padding: 0 14px; font-size: 13px; color: #555; }
 kbd { font-family: monospace; background: #eee; border: 1px solid #bbb; padding: 0 3px; }
 </style>
 </head>
 <body>
-<div class="banner">
+<div class="hero">
 <h1>fluxOS Web Browser</h1>
-<p>HTML and CSS over plain HTTP, on a 32-bit hobby operating system</p>
+<p>HTML, CSS and JavaScript, with HTTPS support</p>
 </div>
-<div class="main">
 
-<form action="http://wiby.me/" method="get">
-Search the classic web: <input name="q" size="32"> <input type="submit" value="Search wiby.me">
+<form action="https://www.google.com/search" method="get">
+<input name="q" size="40"> <input type="submit" value="Google Search">
 </form>
+<span class="badge">https:// supported &mdash; encrypted with TLS 1.3</span>
 
-<h2>Made for simple browsers</h2>
-<ul>
-<li><a href="http://68k.news/">68k.news</a> <span>&mdash; news headlines for vintage computers</span></li>
-<li><a href="http://wiby.me/">wiby.me</a> <span>&mdash; a search engine for the classic web</span></li>
-<li><a href="http://www.textfiles.com/">textfiles.com</a> <span>&mdash; text files from the BBS era</span></li>
-<li><a href="http://info.cern.ch/hypertext/WWW/TheProject.html">The World Wide Web project</a> <span>&mdash; the first web site, at CERN</span></li>
-</ul>
-
-<h2>More sites that still speak plain HTTP</h2>
-<ul>
-<li><a href="http://example.com/">example.com</a></li>
-<li><a href="http://neverssl.com/">NeverSSL</a></li>
-<li><a href="http://www.gnu.org/">The GNU Project</a></li>
-<li><a href="http://danluu.com/">Dan Luu&rsquo;s blog</a></li>
-<li><a href="http://acme.com/">ACME Laboratories</a></li>
-<li><a href="http://www.catb.org/~esr/faqs/hacker-howto.html">How To Become A Hacker</a></li>
-</ul>
-
+<div class="cols">
 <h2>On this computer</h2>
 <ul>
-<li><a href="test.html">The browser test page</a> <span>&mdash; what the HTML and CSS engine can do</span></li>
-<li><a href="js.html">The JavaScript test page</a> <span>&mdash; runs checks for everything below, live</span></li>
 <li><a href="file:///home/flux/">Your home folder</a></li>
+<li><a href="test.html">Browser test page</a> <span>&mdash; HTML and CSS</span></li>
+<li><a href="js.html">JavaScript test page</a> <span>&mdash; live checks of the script engine</span></li>
 </ul>
-
-<h2>JavaScript</h2>
-<p>Pages can run scripts. The engine now covers most of modern JavaScript:</p>
-<ul>
-<li><b>Language:</b> classes (fields, <code>#private</code> members, <code>extends</code>, <code>super</code>, getters, statics),
-destructuring everywhere, <code>async</code>/<code>await</code>, generators, <code>for await</code>, iterators, tagged templates,
-optional chaining, <code>??=</code>, numeric separators.</li>
-<li><b>Promises:</b> <code>then</code>, <code>catch</code>, <code>finally</code>, <code>all</code>, <code>allSettled</code>,
-<code>race</code>, <code>any</code>, <code>queueMicrotask</code>.</li>
-<li><b>Network:</b> <code>fetch</code> with <code>Response</code>, <code>Headers</code> and <code>AbortController</code>,
-as well as <code>XMLHttpRequest</code>; <code>URL</code> and <code>URLSearchParams</code>.</li>
-<li><b>Library:</b> <code>Symbol</code>, <code>Reflect</code>, <code>WeakMap</code>, <code>structuredClone</code>,
-<code>atob</code>/<code>btoa</code>, <code>EventTarget</code>, newer <code>Array</code>, <code>Object</code> and <code>Math</code> methods,
-and regular expressions with lookbehind and named groups.</li>
-</ul>
-<p class="note">Secure <b>https://</b> sites load over TLS 1.3 (sites that only speak
-older TLS cannot be reached, and certificates are not checked).
-Type an address in the bar above (<kbd>Ctrl+L</kbd>), use <kbd>Alt+Left</kbd> to go back,
-and <kbd>F5</kbd> to reload. <b>wget</b>, <b>ping</b> and <b>ifconfig</b> in a terminal
-help when a page will not load.</p>
 </div>
+
+<p class="foot">Type an address in the bar above (<kbd>Ctrl+L</kbd>), go back with <kbd>Alt+Left</kbd>,
+reload with <kbd>F5</kbd>. Sites that only speak older TLS versions cannot be reached, and
+certificates are not verified.</p>
 </body>
 </html>

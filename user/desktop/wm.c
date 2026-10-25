@@ -65,6 +65,8 @@ enum drag {
     DRAG_CLIENT,                        /* the client area has the mouse */
     DRAG_TASK,                          /* holding a taskbar button */
     DRAG_MENU,                          /* the Start menu is tracking */
+    DRAG_ICON,                          /* moving a desktop icon */
+    DRAG_CTX,                           /* the context menu is tracking */
 };
 static enum drag drag;
 static struct window *drag_win;
@@ -146,6 +148,7 @@ struct desk_icon {
     enum icon_id icon;
     const char *label;
     void (*open)(void);
+    int x, y;                           /* the cell's top left corner */
 };
 
 static struct desk_icon desk_icons[] = {
@@ -160,6 +163,10 @@ static int ndesk = (int)(sizeof(desk_icons) / sizeof(desk_icons[0]));
 #define NDESK ndesk
 static int desk_selected = -1;
 static int last_click_icon = -1;
+static int drag_icon;                   /* the icon DRAG_ICON is moving */
+static int icon_moved;                  /* it left its cell */
+static int icon_ox, icon_oy;            /* where it started */
+static int icon_px, icon_py;            /* where the pointer went down */
 static unsigned int last_click_ms;
 
 struct menu_item {
@@ -233,6 +240,113 @@ static void remove_installer(void)
         if (menu_items[i].run != setup_open)
             menu_items[k++] = menu_items[i];
     nmenu = k;
+}
+
+/* ---- the desktop context menu ---- */
+
+struct ctx_item {
+    const char *label;                  /* NULL for a separator */
+    enum icon_id icon;
+    void (*run)(void);
+};
+
+#define CTX_ITEM_H 22
+#define CTX_SEP_H 8
+#define ICON_MARGIN 4
+
+static void arrange_icons(void);
+static void open_ctx_icon(void);
+
+static const struct ctx_item desktop_ctx[] = {
+    { "Arrange Icons", ICON_NONE, arrange_icons },
+    { NULL, ICON_NONE, NULL },
+    { "Terminal", ICON_TERMINAL, open_terminal },
+    { "File Manager", ICON_FOLDER, open_home },
+    { "Task Manager", ICON_TASKMGR, open_taskmgr },
+    { NULL, ICON_NONE, NULL },
+    { "Display Properties", ICON_DISPLAY, display_open },
+};
+
+static const struct ctx_item icon_ctx[] = {
+    { "Open", ICON_NONE, open_ctx_icon },
+};
+
+static const struct ctx_item *ctx_items;
+static int ctx_n;
+static int ctx_open;
+static int ctx_hover = -1;
+static int ctx_x, ctx_y;
+static int ctx_icon = -1;               /* the icon the menu was opened on */
+
+static int ctx_item_height(int i)
+{
+    return ctx_items[i].label ? CTX_ITEM_H : CTX_SEP_H;
+}
+
+static struct rect ctx_rect(void)
+{
+    int h = 4, tw = 0;
+    for (int i = 0; i < ctx_n; i++) {
+        h += ctx_item_height(i);
+        if (ctx_items[i].label) {
+            int w = gfx_text_width(&font_sans, ctx_items[i].label);
+            if (w > tw)
+                tw = w;
+        }
+    }
+    int w = 4 + 4 + 16 + 8 + tw + 16;
+    int x = ctx_x, y = ctx_y;
+    if (x + w > screen_w)
+        x = screen_w - w;
+    if (y + h > screen_h - TASKBAR_H)
+        y = screen_h - TASKBAR_H - h;
+    return mkrect(x < 0 ? 0 : x, y < 0 ? 0 : y, w, h);
+}
+
+static struct rect ctx_item_rect(int idx)
+{
+    struct rect m = ctx_rect();
+    int y = m.y + 2;
+    for (int i = 0; i < idx; i++)
+        y += ctx_item_height(i);
+    return mkrect(m.x + 2, y, m.w - 4, ctx_item_height(idx));
+}
+
+static int ctx_hit(int x, int y)
+{
+    if (!ctx_open)
+        return -1;
+    for (int i = 0; i < ctx_n; i++)
+        if (ctx_items[i].label && rect_contains(ctx_item_rect(i), x, y))
+            return i;
+    return -1;
+}
+
+static void set_ctx(const struct ctx_item *items, int n, int x, int y, int icon)
+{
+    if (ctx_open)
+        wm_damage(ctx_rect());
+    ctx_open = items != NULL;
+    ctx_hover = -1;
+    if (items) {
+        ctx_items = items;
+        ctx_n = n;
+        ctx_x = x;
+        ctx_y = y;
+        ctx_icon = icon;
+        wm_damage(ctx_rect());
+    }
+}
+
+static void set_ctx_hover(int i)
+{
+    if (i == ctx_hover)
+        return;
+    if (ctx_hover >= 0)
+        wm_damage(ctx_item_rect(ctx_hover));
+    ctx_hover = i;
+    if (i >= 0)
+        wm_damage(ctx_item_rect(i));
 }
 
 /* ---- time ---- */
@@ -356,7 +470,55 @@ static struct rect sub_item_rect(int p, int j)
 
 static struct rect desk_icon_rect(int i)
 {
-    return mkrect(4, 6 + i * ICON_CELL_H, ICON_CELL_W, ICON_CELL_H - 4);
+    return mkrect(desk_icons[i].x, desk_icons[i].y, ICON_CELL_W, ICON_CELL_H - 4);
+}
+
+/* Lay the icons out in columns down the left edge, as they start. */
+static void arrange_icons(void)
+{
+    int per = (screen_h - TASKBAR_H - 6) / ICON_CELL_H;
+    if (per < 1)
+        per = 1;
+    for (int i = 0; i < NDESK; i++) {
+        wm_damage(desk_icon_rect(i));
+        desk_icons[i].x = ICON_MARGIN + (i / per) * ICON_CELL_W;
+        desk_icons[i].y = 6 + (i % per) * ICON_CELL_H;
+        wm_damage(desk_icon_rect(i));
+    }
+}
+
+static void open_ctx_icon(void)
+{
+    if (ctx_icon >= 0 && ctx_icon < NDESK)
+        desk_icons[ctx_icon].open();
+}
+
+/* Drop the dragged icon onto the nearest grid cell, or back if that one is taken. */
+static void place_icon(int i)
+{
+    int cx = (desk_icons[i].x - ICON_MARGIN + ICON_CELL_W / 2) / ICON_CELL_W;
+    int cy = (desk_icons[i].y - 6 + ICON_CELL_H / 2) / ICON_CELL_H;
+    int maxx = (screen_w - ICON_CELL_W - ICON_MARGIN) / ICON_CELL_W;
+    int maxy = (screen_h - TASKBAR_H - 6 - ICON_CELL_H) / ICON_CELL_H;
+    if (cx < 0)
+        cx = 0;
+    if (cy < 0)
+        cy = 0;
+    if (cx > maxx)
+        cx = maxx;
+    if (cy > maxy)
+        cy = maxy;
+    int nx = ICON_MARGIN + cx * ICON_CELL_W, ny = 6 + cy * ICON_CELL_H;
+    for (int j = 0; j < NDESK; j++)
+        if (j != i && desk_icons[j].x == nx && desk_icons[j].y == ny) {
+            nx = icon_ox;
+            ny = icon_oy;
+            break;
+        }
+    wm_damage(desk_icon_rect(i));
+    desk_icons[i].x = nx;
+    desk_icons[i].y = ny;
+    wm_damage(desk_icon_rect(i));
 }
 
 static struct rect caption_rect(struct window *w)
@@ -851,6 +1013,29 @@ static void draw_start_menu(void)
     }
 }
 
+static void draw_ctx_menu(void)
+{
+    struct rect m = ctx_rect();
+    if (!rect_overlaps(m, screen.clip))
+        return;
+    gfx_fill(&screen, m.x, m.y, m.w, m.h, C_FACE);
+    gfx_bevel(&screen, m, BEVEL_WINDOW);
+    for (int i = 0; i < ctx_n; i++) {
+        struct rect r = ctx_item_rect(i);
+        if (!ctx_items[i].label) {
+            draw_separator(&screen, r.x + 1, r.y + 3, r.w - 2);
+            continue;
+        }
+        int hot = i == ctx_hover;
+        if (hot)
+            gfx_fill(&screen, r.x, r.y, r.w, r.h, C_NAVY);
+        if (ctx_items[i].icon != ICON_NONE)
+            draw_icon(&screen, r.x + 4, r.y + (r.h - 16) / 2, ctx_items[i].icon, 16);
+        gfx_text(&screen, &font_sans, r.x + 4 + 16 + 8, r.y + (r.h - font_sans.height) / 2,
+                 ctx_items[i].label, hot ? C_WHITE : C_BLACK);
+    }
+}
+
 static void draw_outline(void)
 {
     struct rect o = outline;
@@ -883,6 +1068,8 @@ static void compose(struct rect r)
     }
     if (menu_open)
         draw_start_menu();
+    if (ctx_open)
+        draw_ctx_menu();
     if (drag == DRAG_MOVE || drag == DRAG_RESIZE)
         draw_outline();
     if (!hw_cursor)
@@ -1421,6 +1608,14 @@ static void update_cursor(void)
 
 static void press_left(void)
 {
+    if (ctx_open) {
+        if (rect_contains(ctx_rect(), mx, my)) {
+            drag = DRAG_CTX;
+            set_ctx_hover(ctx_hit(mx, my));
+            return;
+        }
+        set_ctx(NULL, 0, 0, 0, -1);
+    }
     if (menu_open) {
         if (menu_contains(mx, my)) {
             drag = DRAG_MENU;
@@ -1470,6 +1665,15 @@ static void press_left(void)
         if (focused)
             wm_focus(NULL);
         select_icon(hit);
+        if (hit >= 0 && !(hit == last_click_icon && now_ms() - last_click_ms < DBLCLICK_MS)) {
+            drag = DRAG_ICON;
+            drag_icon = hit;
+            icon_moved = 0;
+            icon_ox = desk_icons[hit].x;
+            icon_oy = desk_icons[hit].y;
+            icon_px = mx;
+            icon_py = my;
+        }
         unsigned int t = now_ms();
         if (hit >= 0 && hit == last_click_icon && t - last_click_ms < DBLCLICK_MS) {
             last_click_icon = -1;
@@ -1596,6 +1800,30 @@ static void drag_motion(void)
     case DRAG_MENU:
         menu_pointer(mx, my);
         break;
+    case DRAG_CTX:
+        set_ctx_hover(ctx_hit(mx, my));
+        break;
+    case DRAG_ICON: {
+        if (!icon_moved && abs(mx - icon_px) < 4 && abs(my - icon_py) < 4)
+            break;
+        icon_moved = 1;
+        int x = icon_ox + mx - icon_px, y = icon_oy + my - icon_py;
+        if (x < 0)
+            x = 0;
+        if (y < 0)
+            y = 0;
+        if (x > screen_w - ICON_CELL_W)
+            x = screen_w - ICON_CELL_W;
+        if (y > screen_h - TASKBAR_H - ICON_CELL_H)
+            y = screen_h - TASKBAR_H - ICON_CELL_H;
+        if (x != desk_icons[drag_icon].x || y != desk_icons[drag_icon].y) {
+            wm_damage(desk_icon_rect(drag_icon));
+            desk_icons[drag_icon].x = x;
+            desk_icons[drag_icon].y = y;
+            wm_damage(desk_icon_rect(drag_icon));
+        }
+        break;
+    }
     case DRAG_NONE:
         break;
     }
@@ -1657,9 +1885,49 @@ static void release_left(void)
             set_menu(0);
         break;
     }
+    case DRAG_CTX: {
+        int i = ctx_hit(mx, my);
+        void (*run)(void) = i >= 0 ? ctx_items[i].run : NULL;
+        if (i >= 0 || !rect_contains(ctx_rect(), mx, my)) {
+            int icon = ctx_icon;
+            set_ctx(NULL, 0, 0, 0, -1);
+            ctx_icon = icon;            /* for open_ctx_icon */
+            if (run)
+                run();
+        }
+        break;
+    }
+    case DRAG_ICON:
+        if (icon_moved)
+            place_icon(drag_icon);
+        break;
     case DRAG_NONE:
         break;
     }
+}
+
+static void press_right(void)
+{
+    if (menu_open)
+        set_menu(0);
+    if (modal_window() || drag != DRAG_NONE || rect_contains(taskbar_rect(), mx, my) ||
+        window_at(mx, my)) {
+        set_ctx(NULL, 0, 0, 0, -1);
+        return;
+    }
+    int hit = -1;
+    for (int i = 0; i < NDESK; i++) {
+        struct rect cell = desk_icon_rect(i);
+        if (rect_contains(mkrect(cell.x, cell.y, cell.w, 52), mx, my))
+            hit = i;
+    }
+    if (focused)
+        wm_focus(NULL);
+    select_icon(hit);
+    if (hit >= 0)
+        set_ctx(icon_ctx, COUNT(icon_ctx), mx, my, hit);
+    else
+        set_ctx(desktop_ctx, COUNT(desktop_ctx), mx, my, -1);
 }
 
 static void mouse_event(const struct input_event *ev)
@@ -1708,10 +1976,14 @@ static void mouse_event(const struct input_event *ev)
             drag_motion();
         else if (menu_open)
             menu_pointer(mx, my);
+        else if (ctx_open)
+            set_ctx_hover(ctx_hit(mx, my));
         else if (focused && !focused->minimized && focused->ops && focused->ops->mouse &&
                  rect_contains(wm_client_rect(focused), mx, my))
             client_mouse(focused, mbuttons, 0);     /* hovering: menus highlight */
     }
+    if (pressed & MOUSE_RIGHT)
+        press_right();
     if (pressed & MOUSE_LEFT)
         press_left();
     if (released & MOUSE_LEFT)
@@ -1757,6 +2029,10 @@ static void key_event(const struct input_event *ev)
     if (code == KEY_LWIN || code == KEY_RWIN || (ctrl && code == KEY_ESC)) {
         if (!modal_window())
             set_menu(!menu_open);
+        return;
+    }
+    if (ctx_open && code == KEY_ESC) {
+        set_ctx(NULL, 0, 0, 0, -1);
         return;
     }
     if (menu_open) {
@@ -1892,6 +2168,7 @@ int wm_reconfigure(void)
         task_pressed_idx = -1;
     }
     menu_open = 0;
+    ctx_open = 0;
     menu_hover = menu_sub = sub_hover = -1;
     if (mx >= screen_w)
         mx = screen_w - 1;
@@ -1909,6 +2186,12 @@ int wm_reconfigure(void)
             y = screen_h - TASKBAR_H - w->r.h;
         w->r.x = x < 0 ? 0 : x;
         w->r.y = y < 0 ? 0 : y;
+    }
+    for (int i = 0; i < NDESK; i++) {
+        if (desk_icons[i].x > screen_w - ICON_CELL_W || desk_icons[i].y > screen_h - TASKBAR_H - ICON_CELL_H) {
+            arrange_icons();
+            break;
+        }
     }
     ndamage = 0;
     wm_damage(mkrect(0, 0, screen_w, screen_h));
@@ -1935,6 +2218,7 @@ void wm_init(void)
     }
     if (booted_from_disk())
         remove_installer();
+    arrange_icons();
     mx = screen_w / 2;
     my = screen_h / 2;
     char dir[128], drv[16];
