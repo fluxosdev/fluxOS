@@ -1,10 +1,11 @@
 Welcome to fluxOS 0.1.4
 =======================
 
-fluxOS is an experimental hobby operating system, built entirely with
-Claude. Run it in a virtual machine, and do not keep anything you care about
-on it. The root filesystem lives in RAM: files you create in your home folder
-are lost on reboot unless you copy them to a disk (see "Disks" below).
+fluxOS is an experimental hobby operating system, built with AI assistance
+from Claude and ChatGPT Codex. Run it in a virtual machine, and do not keep
+anything you care about on it. The root filesystem lives in RAM: files you
+create in your home folder are lost on reboot unless you copy them to a disk
+(see "Disks" below).
 
 
 The desktop
