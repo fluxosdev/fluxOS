@@ -218,7 +218,8 @@ struct style {
     int border_w[4];
     uint8_t border_style[4];
     uint32_t border_color[4];
-    struct len width, min_width, max_width, height, min_height;
+    struct len width, min_width, max_width, height, min_height, max_height;
+    int aspect_w, aspect_h;     /* aspect-ratio, times 100 each; 0 for auto */
     int text_indent;
     int border_spacing;         /* tables, inherited */
     struct custom_prop *vars;

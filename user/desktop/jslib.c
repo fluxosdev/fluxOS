@@ -418,6 +418,8 @@ static jsval proto_has_own(struct js *J, jsval self, jsval *args, int argc)
         return js_bool(0);
     struct jsobj *o = self.u.o;
     uint32_t i;
+    if (o->phandler)
+        return js_bool(js_has(J, self, key));
     if ((o->cls == C_ARRAY || o->cls == C_ARGUMENTS) && js_index(strv(key), &i))
         return js_bool(i < (uint32_t)o->len);
     if (o->cls == C_HOST) {

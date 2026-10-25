@@ -54,6 +54,8 @@ struct image *image_decode(const uint8_t *data, uint32_t len)
         return image_decode_png(data, len);
     if (image_is_gif(data, len))
         return image_decode_gif(data, len);
+    if (image_is_ico(data, len))
+        return image_decode_ico(data, len);
     if (image_is_svg(data, len))
         return image_decode_svg(data, len);
     return NULL;

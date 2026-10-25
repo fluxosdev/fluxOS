@@ -74,6 +74,8 @@ struct jsobj {
     double num;
     struct jsstr *str;
     struct regex *re;
+    /* a Proxy: reads, writes and the rest go to the handler's traps */
+    struct jsobj *ptarget, *phandler;
 };
 
 struct gcheap;

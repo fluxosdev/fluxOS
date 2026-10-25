@@ -578,8 +578,24 @@ static jsval queue_microtask(struct js *J, jsval self, jsval *args, int argc)
     return js_undefined;
 }
 
+static jsval proxy_ctor(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    if (!J->constructing)
+        return js_throw_error(J, "TypeError: Constructor Proxy requires 'new'");
+    if (ARG(0).t != JS_OBJ || ARG(1).t != JS_OBJ)
+        return js_throw_error(J, "TypeError: Cannot create proxy with a non-object as target or handler");
+    if (js_is_callable(ARG(0)))
+        return js_throw_error(J, "TypeError: Proxy of a function is not supported");
+    struct jsobj *p = js_mkobj(J, C_OBJECT, ARG(0).u.o->proto);
+    p->ptarget = ARG(0).u.o;
+    p->phandler = ARG(1).u.o;
+    return js_obj(p);
+}
+
 static void init_promise(struct js *J)
 {
+    ctor_obj(J, "Proxy", proxy_ctor, 2, NULL);
     struct jsobj *pp = J->promise_proto = js_mkobj(J, C_OBJECT, J->object_proto);
     struct jsobj *promise = ctor_obj(J, "Promise", promise_ctor, 1, pp);
     fn_obj(J, pp, "then", promise_then_m, 2);
@@ -606,7 +622,7 @@ static void init_promise(struct js *J)
 static const struct lazy_chunk {
     const char *src;
     int len;
-    const char *names[8];
+    const char *names[16];
 } lazy_chunks[] = {
     { js_chunk_weak, sizeof(js_chunk_weak) - 1,
       { "Reflect", "WeakMap", "WeakSet", "WeakRef", "FinalizationRegistry", "AggregateError",
@@ -614,6 +630,9 @@ static const struct lazy_chunk {
     { js_chunk_misc, sizeof(js_chunk_misc) - 1, { "structuredClone", "btoa", "atob", "Intl", NULL } },
     { js_chunk_events, sizeof(js_chunk_events) - 1, { "EventTarget", "AbortSignal", "AbortController", NULL } },
     { js_chunk_url, sizeof(js_chunk_url) - 1, { "URLSearchParams", "URL", NULL } },
+    { js_chunk_web, sizeof(js_chunk_web) - 1,
+      { "TextEncoder", "TextDecoder", "crypto", "Blob", "FormData", "DOMParser", "customElements", "CSS",
+        "WebSocket", "Notification", "DOMRect", "postMessage", NULL } },
     { js_chunk_fetch, sizeof(js_chunk_fetch) - 1, { "Headers", "Response", "Request", "fetch", NULL } },
 };
 

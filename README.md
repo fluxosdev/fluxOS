@@ -146,16 +146,17 @@ keeps running), or from `file://`.
   Latin-1 and Windows-1252.
 - **CSS**: type, class, id, attribute and structural selectors with all
   combinators, `:not()`/`:is()` with full selectors, specificity, `!important`,
-  `@media`, custom properties and `var()`, `calc()`, `::before`/`::after` text,
+  `:has()`, `:nth-last-child()`, `@media`, custom properties and `var()`, `calc()`,
+  `max-height`, `aspect-ratio`, `::before`/`::after` text,
   gradients, rounded corners, and the old presentational attributes.
 - **Layout**: blocks with margin collapsing, inline text, inline-blocks, lists,
   tables, flex rows, grids (columns, rows, areas, auto rows, spans, `dense`),
   borders, backgrounds, images and form controls.
-- **Pictures**: PNG, JPEG, GIF (first frame) and SVG, as `<img>` and as an
+- **Pictures**: PNG, JPEG, GIF (first frame), ICO (the largest icon) and SVG, as `<img>` and as an
   inline `<svg>`. The SVG renderer (svg.c) draws shapes, paths (curves and
   arcs), groups, `use`, text, transforms, `viewBox`, solid and gradient fills,
   dashed strokes with caps and joins, opacity, and simple `<style>` rules.
-- Links, `GET`/`POST` forms, `<meta refresh>`, fragments, redirects, iframes,
+- `<details>`/`<summary>` open and close when clicked. Links, `GET`/`POST` forms, `<meta refresh>`, fragments, redirects, iframes,
   `:visited` colors, and anti-aliased text (Liberation Sans, Serif and Mono in
   12 sizes, rasterised by `tools/mkfont.py`).
 - **JavaScript**: a tree-walking interpreter (js.c, jslib.c, jslib2.c, jsre.c)
@@ -166,10 +167,12 @@ keeps running), or from `file://`.
   generators and `async`/`await` (run as coroutines on their own stacks),
   Promises with a microtask queue, regular expressions with lookbehind and
   named groups, and the usual built-ins (Map, Set, Weak*, typed arrays, JSON,
-  Date, Reflect, a small Intl, `structuredClone`...). The DOM (jsdom.c) has
+  Date, Reflect, `Proxy` (get, set, has, deleteProperty and ownKeys traps), a small Intl, `structuredClone`...). The DOM (jsdom.c) has
   `document`, `querySelector`, `innerHTML`, `classList`, `dataset`, events,
   timers, `location`, `history`, `localStorage`, `XMLHttpRequest`, `fetch`,
-  `URL`, and more. Changes are laid out again when a script returns; runaway
+  `URL`, and more: `FormData`, `Blob`, `TextEncoder`/`TextDecoder`, `crypto.getRandomValues`/`randomUUID`,
+  `DOMParser`, `postMessage`, and stand-ins for `customElements`, `WebSocket`, `Notification` and `CSS.supports`.
+  `fetch` and `XMLHttpRequest` send request headers and any method (`PUT`, `DELETE`...). Changes are laid out again when a script returns; runaway
   scripts are stopped. `/usr/share/www/js.html`, `css.html` and `images.html`
   (linked from the home page) are live test pages.
 
@@ -209,7 +212,7 @@ dirent, time, sockets, a DNS resolver).
 - `ifconfig` shows the interface and sets a static address or asks DHCP;
   `ping [-c N] HOST`, `host NAME`, `nc` (netcat, TCP and UDP).
 - `wget [-q] [-O FILE] [-T SECONDS] [--save-headers] [--content-on-error]
-  [--max-redirect=N] [--post-data=STRING] URL` follows redirects and decodes
+  [--max-redirect=N] [--post-data=STRING] [--method=VERB] [--header=LINE]... URL` follows redirects and decodes
   chunked bodies. `https://` uses libc's own TLS 1.3 client (`<tls.h>`: X25519,
   AES-128-GCM). It encrypts but does not verify the server's certificate.
 - `beep [-f HZ] [-l MS] [-r N] [-d MS] [-n ...]` and `beep -m MUSIC` (BASIC's
@@ -316,8 +319,8 @@ user/gl/                   the OpenGL library and its backends
 user/fsh/                  the shell
 user/desktop/              compositor and window manager (wm.c), apps (files, edit,
                            calc, player, taskmgr, diskmgr, display, setup, gears,
-                           mines, sound), PNG/JPEG/GIF/SVG decoding (png.c, jpeg.c,
-                           gif.c, svg.c, image.c), the wallpaper, and the browser:
+                           mines, sound), PNG/JPEG/GIF/ICO/SVG decoding (png.c, jpeg.c,
+                           gif.c, ico.c, svg.c, image.c), the wallpaper, and the browser:
                            window (browser.c), HTML (html.c), CSS (css.c), layout
                            (layout.c), fonts (webfont.c), URLs (webutil.c), and
                            JavaScript (js.c, jslib*.c, jsre.c, jsgc.c, jsdom.c)
@@ -445,9 +448,10 @@ be stopped (no ^Z). SSE instructions raise `SIGILL`.
   or out-of-order buffering. forcedeth runs at 10/100 Mbit/s without offload,
   VLANs, wake-on-LAN or MSI. HTTPS is TLS 1.3 with TLS_AES_128_GCM_SHA256 and
   X25519 only, and certificates are not verified.
-- **Browser:** JavaScript has no async generators, proxies, modules or real
-  BigInt; strings count UTF-8 bytes, `Symbol`s are strings, `fetch` sends no
-  request headers or cookies, typed arrays are plain arrays, and `eval` runs
+- **Browser:** JavaScript has no async generators, modules or real
+  BigInt, and `Proxy` cannot wrap a function; strings count UTF-8 bytes,
+  `Symbol`s are strings, `fetch` sends no cookies, `WebSocket` and
+  `customElements` are stand-ins that do nothing, typed arrays are plain arrays, and `eval` runs
   in the global scope, so many modern web apps won't run. Layout is an
   approximation: floats become inline-blocks, positioned elements stay in
   the flow, flex rows are lines of inline-blocks, grids lack named lines and

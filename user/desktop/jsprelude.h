@@ -576,6 +576,174 @@ static const char js_chunk_url[] = JS_SOURCE(
 })(globalThis);
 );
 
+static const char js_chunk_web[] = JS_SOURCE(
+(function (g) {
+  var def = g["%def"], lz = g["%lazy"], ITER = Symbol.iterator;
+  /* ---- TextEncoder, TextDecoder ---- */
+  class TextEncoder {
+    get encoding() { return "utf-8"; }
+    encode(s) {
+      s = s === undefined ? "" : String(s);
+      var out = [];
+      for (var i = 0; i < s.length; i++) out.push(s.charCodeAt(i) & 255);
+      return new Uint8Array(out);
+    }
+  }
+  class TextDecoder {
+    constructor(label) { def(this, "_l", label || "utf-8"); }
+    get encoding() { return String(this._l).toLowerCase(); }
+    decode(b) {
+      if (b === undefined) return "";
+      var a = b.buffer && !Array.isArray(b) ? new Uint8Array(b.buffer) : b, p = [], s = "", i;
+      for (i = 0; i < a.length; i++) p.push("%" + (a[i] < 16 ? "0" : "") + (a[i] & 255).toString(16));
+      try { return decodeURIComponent(p.join("")); } catch (e) {}
+      for (i = 0; i < a.length; i++) s += String.fromCharCode(a[i]);
+      return s;
+    }
+  }
+  /* ---- crypto ---- */
+  var crypto = {
+    getRandomValues: function (a) {
+      var m = (a.BYTES_PER_ELEMENT || 1) >= 4 ? 4294967296 : (a.BYTES_PER_ELEMENT === 2 ? 65536 : 256);
+      for (var i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * m);
+      return a;
+    },
+    randomUUID: function () {
+      return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function (c) {
+        var r = Math.floor(Math.random() * 16);
+        return (c === "x" ? r : (r & 3) | 8).toString(16);
+      });
+    },
+    subtle: {}
+  };
+  /* ---- Blob, FormData ---- */
+  class Blob {
+    constructor(parts, opts) {
+      var s = "";
+      (parts || []).forEach(function (p) { s += p instanceof Blob ? p._s : String(p); });
+      def(this, "_s", s);
+      def(this, "_t", opts && opts.type ? String(opts.type).toLowerCase() : "");
+    }
+    get size() { return this._s.length; }
+    get type() { return this._t; }
+    text() { return Promise.resolve(this._s); }
+    arrayBuffer() { return Promise.resolve(new TextEncoder().encode(this._s)); }
+    slice(a, b, t) { return new Blob([this._s.slice(a, b)], { type: t || "" }); }
+  }
+  class FormData {
+    constructor(form) {
+      def(this, "_l", []);
+      if (!form) return;
+      var els = form.elements || form.querySelectorAll("input,select,textarea");
+      for (var i = 0; i < els.length; i++) {
+        var e = els[i], t = (e.type || "").toLowerCase();
+        if (!e.name || e.disabled) continue;
+        if ((t === "checkbox" || t === "radio") && !e.checked) continue;
+        if (t === "submit" || t === "button" || t === "reset" || t === "file") continue;
+        this._l.push([e.name, String(e.value === undefined ? "" : e.value)]);
+      }
+    }
+    append(k, v) { this._l.push([String(k), v instanceof Blob ? v : String(v)]); }
+    set(k, v) { this.delete(k); this.append(k, v); }
+    get(k) { for (var i = 0; i < this._l.length; i++) if (this._l[i][0] === k) return this._l[i][1]; return null; }
+    getAll(k) { return this._l.filter(function (p) { return p[0] === k; }).map(function (p) { return p[1]; }); }
+    has(k) { return this.get(k) !== null; }
+    delete(k) { var l = this._l; for (var i = l.length - 1; i >= 0; i--) if (l[i][0] === k) l.splice(i, 1); }
+    forEach(f, t) { var s = this; this._l.forEach(function (p) { f.call(t, p[1], p[0], s); }); }
+    entries() { return this._l.map(function (p) { return [p[0], p[1]]; })[ITER](); }
+    keys() { return this._l.map(function (p) { return p[0]; })[ITER](); }
+    values() { return this._l.map(function (p) { return p[1]; })[ITER](); }
+    [ITER]() { return this.entries(); }
+  }
+  /* ---- DOMParser: the markup goes into a detached element ---- */
+  class DOMParser {
+    parseFromString(s, type) {
+      var d = document.createElement("div");
+      d.innerHTML = s;
+      var body = d.querySelector("body") || d;
+      return {
+        nodeType: 9, documentElement: d, body: body, head: d.querySelector("head"),
+        title: (d.querySelector("title") || { textContent: "" }).textContent,
+        querySelector: function (q) { return d.querySelector(q); },
+        querySelectorAll: function (q) { return d.querySelectorAll(q); },
+        getElementById: function (id) { return d.querySelector("#" + id); },
+        getElementsByTagName: function (t) { return d.getElementsByTagName(t); },
+        getElementsByClassName: function (c) { return d.getElementsByClassName(c); },
+        createElement: function (t) { return document.createElement(t); }
+      };
+    }
+  }
+  /* ---- stubs for APIs a page may probe for ---- */
+  var registry = Object.create(null), pending = Object.create(null);
+  var customElements = {
+    define: function (name, ctor) {
+      registry[name] = ctor;
+      if (pending[name]) pending[name](ctor);
+    },
+    get: function (name) { return registry[name]; },
+    whenDefined: function (name) {
+      if (registry[name]) return Promise.resolve(registry[name]);
+      return new Promise(function (res) { pending[name] = res; });
+    },
+    upgrade: function () {}
+  };
+  var CSS = {
+    supports: function () { return true; },
+    escape: function (s) { return String(s).replace(/[^a-zA-Z0-9_-]/g, function (c) { return "\\" + c; }); }
+  };
+  class WebSocket {
+    constructor(url) {
+      def(this, "url", String(url));
+      this.readyState = 0;
+      this.onopen = this.onerror = this.onclose = this.onmessage = null;
+      var self = this;
+      setTimeout(function () {
+        self.readyState = 3;
+        var e = new Event("error");
+        if (self.onerror) self.onerror(e);
+        var c = new Event("close");
+        c.code = 1006;
+        c.wasClean = false;
+        if (self.onclose) self.onclose(c);
+      }, 0);
+    }
+    send() { throw new DOMException("WebSocket is not open", "InvalidStateError"); }
+    close() { this.readyState = 3; }
+    addEventListener(t, f) { this["on" + t] = f; }
+    removeEventListener() {}
+  }
+  WebSocket.CONNECTING = 0; WebSocket.OPEN = 1; WebSocket.CLOSING = 2; WebSocket.CLOSED = 3;
+  class Notification {
+    constructor() {}
+    static requestPermission() { return Promise.resolve("denied"); }
+    close() {}
+  }
+  Notification.permission = "denied";
+  class DOMRect {
+    constructor(x, y, w, h) {
+      this.x = x || 0; this.y = y || 0; this.width = w || 0; this.height = h || 0;
+    }
+    get left() { return Math.min(this.x, this.x + this.width); }
+    get top() { return Math.min(this.y, this.y + this.height); }
+    get right() { return Math.max(this.x, this.x + this.width); }
+    get bottom() { return Math.max(this.y, this.y + this.height); }
+    static fromRect(r) { r = r || {}; return new DOMRect(r.x, r.y, r.width, r.height); }
+  }
+  function postMessage(data) {
+    setTimeout(function () {
+      var e = new Event("message");
+      e.data = data;
+      e.origin = location.origin;
+      window.dispatchEvent(e);
+    }, 0);
+  }
+  lz("TextEncoder", TextEncoder); lz("TextDecoder", TextDecoder); lz("crypto", crypto);
+  lz("Blob", Blob); lz("FormData", FormData); lz("DOMParser", DOMParser);
+  lz("customElements", customElements); lz("CSS", CSS); lz("WebSocket", WebSocket);
+  lz("Notification", Notification); lz("DOMRect", DOMRect); lz("postMessage", postMessage);
+})(globalThis);
+);
+
 static const char js_chunk_fetch[] = JS_SOURCE(
 (function (g) {
   var def = g["%def"], listIter = g["%iter"], lz = g["%lazy"], ITER = Symbol.iterator;

@@ -43,7 +43,8 @@ enum prop {
     P_PLACE_CONTENT, P_PLACE_ITEMS, P_PLACE_SELF, P_ORDER, P_GAP, P_ROW_GAP, P_COLUMN_GAP,
     P_OVERFLOW, P_GRID_TEMPLATE_COLUMNS, P_GRID_TEMPLATE, P_GRID_COLUMN, P_GRID_COLUMN_START,
     P_GRID_COLUMN_END, P_GRID_ROW, P_GRID_ROW_START, P_GRID_AREA, P_GRID_TEMPLATE_ROWS,
-    P_GRID_TEMPLATE_AREAS, P_GRID_AUTO_ROWS, P_GRID_ROW_END, P_GRID_AUTO_FLOW,
+    P_GRID_TEMPLATE_AREAS, P_GRID_AUTO_ROWS, P_GRID_ROW_END, P_GRID_AUTO_FLOW, P_MAX_HEIGHT,
+    P_ASPECT_RATIO,
 };
 
 static const struct { const char *name; uint8_t prop; } prop_names[] = {
@@ -52,7 +53,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "-webkit-flex-direction", P_FLEX_DIRECTION }, { "-webkit-flex-wrap", P_FLEX_WRAP },
     { "-webkit-justify-content", P_JUSTIFY_CONTENT }, { "-webkit-mask", P_MASK },
     { "-webkit-mask-image", P_MASK }, { "align-items", P_ALIGN_ITEMS },
-    { "align-self", P_ALIGN_SELF }, { "background", P_BACKGROUND },
+    { "align-self", P_ALIGN_SELF }, { "aspect-ratio", P_ASPECT_RATIO }, { "background", P_BACKGROUND },
     { "background-color", P_BACKGROUND_COLOR }, { "background-image", P_BACKGROUND_IMAGE },
     { "border", P_BORDER }, { "border-bottom", P_BORDER_BOTTOM },
     { "border-bottom-color", P_BORDER_BOTTOM_COLOR },
@@ -94,7 +95,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "margin-inline-end", P_MARGIN_RIGHT }, { "margin-inline-start", P_MARGIN_LEFT },
     { "margin-left", P_MARGIN_LEFT }, { "margin-right", P_MARGIN_RIGHT },
     { "margin-top", P_MARGIN_TOP }, { "mask", P_MASK }, { "mask-image", P_MASK },
-    { "max-width", P_MAX_WIDTH }, { "min-height", P_MIN_HEIGHT }, { "min-width", P_MIN_WIDTH },
+    { "max-height", P_MAX_HEIGHT }, { "max-width", P_MAX_WIDTH }, { "min-height", P_MIN_HEIGHT }, { "min-width", P_MIN_WIDTH },
     { "opacity", P_OPACITY }, { "order", P_ORDER }, { "overflow", P_OVERFLOW },
     { "overflow-x", P_OVERFLOW }, { "padding", P_PADDING },
     { "padding-block-end", P_PADDING_BOTTOM }, { "padding-block-start", P_PADDING_TOP },
@@ -116,7 +117,8 @@ enum {
     PS_FIRST_CHILD = 1 << 0, PS_LAST_CHILD = 1 << 1, PS_ONLY_CHILD = 1 << 2, PS_LINK = 1 << 3,
     PS_VISITED = 1 << 4, PS_ROOT = 1 << 5, PS_EMPTY = 1 << 6, PS_NEVER = 1 << 7,
     PS_CHECKED = 1 << 8, PS_DISABLED = 1 << 9, PS_ENABLED = 1 << 10, PS_FIRST_OF_TYPE = 1 << 11,
-    PS_LAST_OF_TYPE = 1 << 12,
+    PS_LAST_OF_TYPE = 1 << 12, PS_ONLY_OF_TYPE = 1 << 13, PS_REQUIRED = 1 << 14, PS_OPTIONAL = 1 << 15,
+    PS_ANY_LINK = 1 << 16, PS_PLACEHOLDER = 1 << 17,
 };
 
 struct attr_sel {
@@ -136,7 +138,10 @@ struct compound {
     struct attr_sel *attrs;
     int nattrs;
     uint32_t pseudo;
-    int nth_a, nth_b, has_nth, nth_of_type;
+    int nth_a, nth_b, has_nth, nth_of_type, nth_last;
+    struct selector *has_list;  /* :has(a, > b): has a descendant (or child) matching one */
+    int nhas;
+    uint32_t has_child;         /* bit i: has_list[i] must match a child */
     struct selector *not_list;  /* :not(a, b): matches none of them */
     int nnot;
     struct selector *is_list;   /* :is(a, b) / :where(): matches one of them */
@@ -527,7 +532,17 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
                 c->pseudo |= PS_FIRST_OF_TYPE;
             else if (!strcmp(name, "last-of-type"))
                 c->pseudo |= PS_LAST_OF_TYPE;
-            else if (!strcmp(name, "link") || !strcmp(name, "any-link"))
+            else if (!strcmp(name, "only-of-type"))
+                c->pseudo |= PS_ONLY_OF_TYPE;
+            else if (!strcmp(name, "required"))
+                c->pseudo |= PS_REQUIRED;
+            else if (!strcmp(name, "optional"))
+                c->pseudo |= PS_OPTIONAL;
+            else if (!strcmp(name, "placeholder-shown"))
+                c->pseudo |= PS_PLACEHOLDER;
+            else if (!strcmp(name, "any-link"))
+                c->pseudo |= PS_ANY_LINK;
+            else if (!strcmp(name, "link"))
                 c->pseudo |= PS_LINK;
             else if (!strcmp(name, "visited"))
                 c->pseudo |= PS_VISITED;
@@ -541,11 +556,33 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
                 c->pseudo |= PS_DISABLED;
             else if (!strcmp(name, "enabled"))
                 c->pseudo |= PS_ENABLED;
-            else if ((!strcmp(name, "nth-child") || !strcmp(name, "nth-of-type")) && args) {
+            else if ((!strcmp(name, "nth-child") || !strcmp(name, "nth-of-type") ||
+                      !strcmp(name, "nth-last-child") || !strcmp(name, "nth-last-of-type")) && args) {
                 if (parse_nth(args, args_end, &c->nth_a, &c->nth_b) < 0)
                     return NULL;
                 c->has_nth = 1;
-                c->nth_of_type = name[4] == 'o';
+                c->nth_last = !strncmp(name, "nth-last", 8);
+                c->nth_of_type = strstr(name, "of-type") != NULL;
+            } else if (!strcmp(name, "has") && args) {
+                /* a leading '>' means children only; other relative selectors never match */
+                char buf[256];
+                snprintf(buf, sizeof(buf), "%.*s", (int)(args_end - args), args);
+                const char *p = buf;
+                int child = 0;
+                while (isspace((unsigned char)*p))
+                    p++;
+                if (*p == '>') {
+                    child = 1;
+                    p++;
+                } else if (*p == '+' || *p == '~') {
+                    c->pseudo |= PS_NEVER;
+                    *spec += 1 << 10;
+                    continue;
+                }
+                const char *copy = arena_strdup(a, p);
+                if (!copy || parse_compound_list(a, copy, copy + strlen(copy), &c->has_list, &c->nhas) < 0)
+                    return NULL;
+                c->has_child = child ? 0xFFFFFFFFu : 0;
             } else if (!strcmp(name, "not") && args) {
                 if (parse_compound_list(a, args, args_end, &c->not_list, &c->nnot) < 0)
                     return NULL;
@@ -1098,6 +1135,24 @@ static int match_compound(const struct compound *c, const struct node *n, const 
             return 0;
         if ((ps & (PS_LAST_CHILD | PS_ONLY_CHILD)) && next_element(n))
             return 0;
+        if (ps & PS_ONLY_OF_TYPE) {
+            for (const struct node *p = prev_element(n); p; p = prev_element(p))
+                if (same_type(p, n))
+                    return 0;
+            for (const struct node *p = next_element(n); p; p = next_element(p))
+                if (same_type(p, n))
+                    return 0;
+        }
+        if ((ps & PS_ANY_LINK) && !is_link(n))
+            return 0;
+        if ((ps & PS_REQUIRED) && !node_attr(n, "required"))
+            return 0;
+        if ((ps & PS_OPTIONAL) && (node_attr(n, "required") ||
+                                   !(n->tag == T_INPUT || n->tag == T_SELECT || n->tag == T_TEXTAREA)))
+            return 0;
+        if ((ps & PS_PLACEHOLDER) && (!node_attr(n, "placeholder") || (n->value && *n->value) ||
+                                      node_attr(n, "value")))
+            return 0;
         if (ps & PS_FIRST_OF_TYPE)
             for (const struct node *p = prev_element(n); p; p = prev_element(p))
                 if (same_type(p, n))
@@ -1128,9 +1183,15 @@ static int match_compound(const struct compound *c, const struct node *n, const 
     }
     if (c->has_nth) {
         int idx = 1;
-        for (const struct node *p = prev_element(n); p; p = prev_element(p))
-            if (!c->nth_of_type || same_type(p, n))
-                idx++;
+        if (c->nth_last) {
+            for (const struct node *p = next_element(n); p; p = next_element(p))
+                if (!c->nth_of_type || same_type(p, n))
+                    idx++;
+        } else {
+            for (const struct node *p = prev_element(n); p; p = prev_element(p))
+                if (!c->nth_of_type || same_type(p, n))
+                    idx++;
+        }
         int d = idx - c->nth_b;
         if (c->nth_a == 0 ? d != 0 : (d % c->nth_a != 0 || d / c->nth_a < 0))
             return 0;
@@ -1138,6 +1199,31 @@ static int match_compound(const struct compound *c, const struct node *n, const 
     for (int i = 0; i < c->nnot; i++)
         if (match_from(&c->not_list[i], c->not_list[i].nparts - 1, n, m))
             return 0;
+    if (c->nhas) {
+        int any = 0;
+        for (int i = 0; i < c->nhas && !any; i++) {
+            for (const struct node *d = n->first; d && !any; d = d->next) {
+                /* walk every descendant (or just the children) in document order */
+                const struct node *k = d;
+                while (k && !any) {
+                    if (k->type == N_ELEMENT &&
+                        match_from(&c->has_list[i], c->has_list[i].nparts - 1, k, m))
+                        any = 1;
+                    if (any || (c->has_child & 1u))
+                        break;
+                    if (k->first) {
+                        k = k->first;
+                    } else {
+                        while (k != d && !k->next)
+                            k = k->parent;
+                        k = k == d ? NULL : k->next;
+                    }
+                }
+            }
+        }
+        if (!any)
+            return 0;
+    }
     if (c->nis) {
         int any = 0;
         for (int i = 0; i < c->nis && !any; i++)
@@ -1755,6 +1841,7 @@ static void init_initial(void)
     }
     s->width.unit = s->height.unit = s->max_width.unit = s->min_width.unit = U_AUTO;
     s->min_height.unit = U_PX;
+    s->max_height.unit = U_AUTO;
     s->flex_basis.unit = U_AUTO;
     s->flex_shrink = 100;
     s->align_items = s->justify = s->justify_items = AL_NORMAL;
@@ -2843,6 +2930,31 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         set_len(&st->min_width, value, v);      /* auto: a flex item's own minimum */
         break;
     case P_MAX_WIDTH: set_len(&st->max_width, value, v); break;
+    case P_MAX_HEIGHT: set_len(&st->max_height, value, v); break;
+    case P_ASPECT_RATIO: {                      /* "16 / 9", "1.5", "auto 4/3" */
+        const char *p = value;
+        int a = 0, b = 100;
+        st->aspect_w = st->aspect_h = 0;
+        if (!strncasecmp(p, "auto", 4))
+            p += 4;
+        while (isspace((unsigned char)*p))
+            p++;
+        int used = parse_num(p, &a);
+        if (used && a > 0) {
+            p += used;
+            while (isspace((unsigned char)*p))
+                p++;
+            if (*p == '/') {
+                p++;
+                while (isspace((unsigned char)*p))
+                    p++;
+                if (!parse_num(p, &b) || b <= 0)
+                    b = 100;
+            }
+            st->aspect_w = a, st->aspect_h = b;
+        }
+        break;
+    }
     case P_MIN_HEIGHT:
         set_len(&st->min_height, value, v);
         if (st->min_height.unit == U_AUTO)

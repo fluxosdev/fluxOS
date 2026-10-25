@@ -3014,7 +3014,28 @@ static jsval xhr_open(struct js *J, jsval self, jsval *args, int argc)
     js_put(J, self.u.o, S(J, "__method"), js_to_string(J, ARG(0)), 1);
     js_put(J, self.u.o, S(J, "__url"), js_str(J, abs), 1);
     js_put(J, self.u.o, S(J, "__aborted"), js_bool(0), 1);
+    js_put(J, self.u.o, S(J, "__headers"), js_str(J, ""), 1);
     xhr_state(d, self, 1);
+    return js_undefined;
+}
+
+static jsval xhr_set_header(struct js *J, jsval self, jsval *args, int argc)
+{
+    if (self.t != JS_OBJ)
+        return js_undefined;
+    const char *name = js_tostr(J, ARG(0))->s, *val = js_tostr(J, ARG(1))->s;
+    if (!*name || strpbrk(name, ":\r\n ") || strpbrk(val, "\r\n"))
+        return js_undefined;
+    const char *old = js_cstr(js_get(J, self, "__headers"));
+    size_t n = (old ? strlen(old) : 0) + strlen(name) + strlen(val) + 4;
+    if (n > 4000)
+        return js_undefined;
+    char *buf = malloc(n);
+    if (!buf)
+        return js_undefined;
+    snprintf(buf, n, "%s%s: %s\n", old ? old : "", name, val);
+    js_put(J, self.u.o, S(J, "__headers"), js_str(J, buf), 1);
+    free(buf);
     return js_undefined;
 }
 
@@ -3038,8 +3059,10 @@ static jsval xhr_send(struct js *J, jsval self, jsval *args, int argc)
     d->xhr[id] = self.u.o;
     jsval body = ARG(0);
     const char *method = js_cstr(js_get(J, self, "__method"));
+    const char *hdrs = js_cstr(js_get(J, self, "__headers"));
     d->h.http(d->h.ctx, id, method, url,
-              body.t == JS_UNDEF || body.t == JS_NULL ? NULL : js_tostr(J, body)->s);
+              body.t == JS_UNDEF || body.t == JS_NULL ? NULL : js_tostr(J, body)->s,
+              hdrs && *hdrs ? hdrs : NULL);
     return js_undefined;
 }
 
@@ -3313,7 +3336,7 @@ struct jsdom *jsdom_new(const struct jshost *host)
     fn(J, xp, "open", xhr_open, 2);
     fn(J, xp, "send", xhr_send, 1);
     fn(J, xp, "abort", xhr_abort, 0);
-    fn(J, xp, "setRequestHeader", nothing, 2);
+    fn(J, xp, "setRequestHeader", xhr_set_header, 2);
     fn(J, xp, "overrideMimeType", nothing, 1);
     fn(J, xp, "getResponseHeader", xhr_get_header, 1);
     fn(J, xp, "getAllResponseHeaders", xhr_all_headers, 0);

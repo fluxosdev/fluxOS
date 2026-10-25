@@ -93,6 +93,7 @@ static void flow_children(struct lctx *c, struct flow *f, struct node *n);
 static void flush_run(struct lctx *c, struct flow *f);
 static int layout_flex(struct lctx *c, struct node *n, int x, int y, int w, int defh, int minh);
 static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int defh, int minh);
+static int muldiv(int a, int b, int c);
 static void container_measure(struct lctx *c, struct node *n, int *min, int *max);
 
 /* ---- output ---- */
@@ -1385,6 +1386,16 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
         *mb = collapse(b.mb, pm);               /* the last child's margin passes through */
     } else {
         ch += pm;
+    }
+    if (st->aspect_w && st->height.unit == U_AUTO) {
+        int ah = muldiv(b.w, st->aspect_h, st->aspect_w);
+        if (ch < ah)
+            ch = ah;
+    }
+    if (st->max_height.unit == U_PX) {
+        int mh = st->max_height.v - (st->box_sizing_border ? b.bt + b.bb + b.pt + b.pb : 0);
+        if (mh >= 0 && ch > mh)
+            ch = mh;
     }
     if (st->min_height.unit == U_PX && ch < st->min_height.v)
         ch = st->min_height.v;

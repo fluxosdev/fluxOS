@@ -661,9 +661,40 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
         close(out[1]);
         return -1;
     }
-    char postarg[URL_MAX + 16];
-    if (post)
-        snprintf(postarg, sizeof(postarg), "--post-data=%s", post);
+    /* A script's request packs "METHOD\nHeader: value\n...\n\nbody" into post. */
+    char *packed = kind == F_XHR && post ? strdup(post) : NULL;
+    char methodarg[40] = "", postarg[URL_MAX + 16];
+    char *hdr_arg[12];
+    int nhdr = 0;
+    const char *body = post;
+    if (packed) {
+        char *nl = strchr(packed, '\n');
+        body = NULL;
+        if (nl) {
+            *nl = 0;
+            snprintf(methodarg, sizeof(methodarg), "--method=%.30s", packed);
+            char *p = nl + 1;
+            while (*p && *p != '\n') {             /* header lines end at an empty line */
+                char *e = strchr(p, '\n');
+                if (!e)
+                    break;
+                *e = 0;
+                if (nhdr < 12) {
+                    char *h = malloc(strlen(p) + 10);
+                    if (h) {
+                        sprintf(h, "--header=%s", p);
+                        hdr_arg[nhdr++] = h;
+                    }
+                }
+                p = e + 1;
+            }
+            body = *p == '\n' ? p + 1 : p;
+        }
+        if (body && !*body)
+            body = NULL;
+    }
+    if (body)
+        snprintf(postarg, sizeof(postarg), "--post-data=%s", body);
     int pid = fork();
     if (pid == 0) {
         int null = open("/dev/null", O_RDONLY);
@@ -674,7 +705,7 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
             close(fd);
         signal(SIGINT, SIG_DFL);
         signal(SIGQUIT, SIG_DFL);
-        char *argv[16];
+        char *argv[40];
         int n = 0;
         argv[n++] = "wget";
         argv[n++] = "-q";
@@ -686,7 +717,11 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
         argv[n++] = kind == F_IMG ? "10" : "30";   /* a stuck picture holds up the rest */
         argv[n++] = "-O";
         argv[n++] = "-";
-        if (post)
+        if (methodarg[0])
+            argv[n++] = methodarg;
+        for (int i = 0; i < nhdr; i++)
+            argv[n++] = hdr_arg[i];
+        if (body)
             argv[n++] = postarg;
         argv[n++] = (char *)url;
         argv[n] = NULL;
@@ -694,6 +729,9 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
         fprintf(stderr, "cannot run %s: %s\n", WGET, strerror(errno));
         _exit(127);
     }
+    for (int i = 0; i < nhdr; i++)
+        free(hdr_arg[i]);
+    free(packed);
     close(out[1]);
     close(err[1]);
     if (pid < 0) {
@@ -1256,7 +1294,8 @@ static int js_node_box(void *ctx, struct node *n, int *x, int *y, int *w, int *h
 }
 
 /* A script's XMLHttpRequest: fetched like the page's other resources. */
-static void js_http(void *ctx, int id, const char *method, const char *url, const char *body)
+static void js_http(void *ctx, int id, const char *method, const char *url, const char *body,
+                    const char *headers)
 {
     struct browser *b = ctx;
     int before = b->nqueue;
@@ -1265,8 +1304,16 @@ static void js_http(void *ctx, int id, const char *method, const char *url, cons
         jsdom_http_done(b->js, id, 0, NULL, 0, NULL, 0);    /* the queue is full */
         return;
     }
-    if (body && !strcasecmp(method, "POST"))
-        b->queue[b->nqueue - 1].post = strdup(body);
+    /* The method, the headers and the body travel together (see start_fetch). */
+    int plain = !strcasecmp(method, "GET") && !headers && !body;
+    if (!plain && strcasecmp(method, "HEAD")) {
+        size_t n = strlen(method) + (headers ? strlen(headers) : 0) + (body ? strlen(body) : 0) + 4;
+        char *packed = malloc(n);
+        if (packed) {
+            snprintf(packed, n, "%s\n%s\n%s", method, headers ? headers : "", body ? body : "");
+            b->queue[b->nqueue - 1].post = packed;
+        }
+    }
     if (!b->fetch.active)
         start_next(b);
 }
@@ -1910,8 +1957,9 @@ static void fetch_complete(struct browser *b)
         int css = ul > 4 && !strncasecmp(u + ul - 4, ".css", 4);
         int gif = ul > 4 && !strncasecmp(u + ul - 4, ".gif", 4);
         int svg = ul > 4 && !strncasecmp(u + ul - 4, ".svg", 4);
+        int ico = ul > 4 && !strncasecmp(u + ul - 4, ".ico", 4);
         snprintf(r.type, sizeof(r.type), "%s", html ? "text/html" : png ? "image/png" : jpg ? "image/jpeg" :
-             gif ? "image/gif" : svg ? "image/svg+xml" : css ? "text/css" : "text/plain");
+             gif ? "image/gif" : svg ? "image/svg+xml" : ico ? "image/x-icon" : css ? "text/css" : "text/plain");
     } else if (is_file) {
         snprintf(why, sizeof(why), "%s", b->status);
     }
@@ -2420,6 +2468,34 @@ static struct node *element_at(struct browser *b, int x, int y)
             return d->node;
     }
     return NULL;
+}
+
+/* A click on a <summary> opens or closes its <details>; 1 if it did. */
+static int toggle_details(struct browser *b, int px, int py)
+{
+    struct node *n = element_at(b, px, py);
+    while (n && n->tag != T_SUMMARY)
+        n = n->parent;
+    if (!n || !n->parent || n->parent->tag != T_DETAILS)
+        return 0;
+    struct node *det = n->parent;
+    struct attr **pp = &det->attrs;
+    for (; *pp; pp = &(*pp)->next)
+        if (!strcmp((*pp)->name, "open")) {
+            *pp = (*pp)->next;                  /* open -> closed */
+            goto changed;
+        }
+    struct attr *a = arena_alloc(&b->arena, sizeof(*a));
+    if (!a)
+        return 0;
+    a->name = arena_strdup(&b->arena, "open");
+    a->value = arena_strdup(&b->arena, "");
+    *pp = a;
+changed:
+    b->need_style = 1;
+    relayout(b);
+    paint(b);
+    return 1;
 }
 
 /* A click on the page: scripts hear of it first, and may cancel what it does. */
@@ -3282,6 +3358,8 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
                 follow_link(b, b->press_link);
                 return;
             }
+            if (!b->press_ctrl && !b->press_link)
+                toggle_details(b, px, py);
         }
         return;
     }

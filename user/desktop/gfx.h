@@ -79,6 +79,8 @@ struct image *image_load(const char *path);
 struct image *image_load_thumb(const char *path, int *full_w, int *full_h);
 struct image *image_decode_gif(const uint8_t *data, uint32_t len);     /* its first frame */
 struct image *image_decode_svg(const uint8_t *data, uint32_t len);     /* drawn at its own size */
+struct image *image_decode_ico(const uint8_t *data, uint32_t len);     /* the largest icon */
+int image_is_ico(const uint8_t *data, uint32_t len);
 int image_is_gif(const uint8_t *data, uint32_t len);
 int image_is_svg(const uint8_t *data, uint32_t len);
 int image_is_png(const uint8_t *data, uint32_t len);

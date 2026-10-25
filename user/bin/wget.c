@@ -2,7 +2,7 @@
  * wget - download a file over HTTP or HTTPS.
  *
  *   wget [-q] [-O FILE] [-T SECONDS] [--save-headers] [--content-on-error]
- *        [--max-redirect=N] [--post-data=STRING] URL
+ *        [--max-redirect=N] [--post-data=STRING] [--method=VERB] [--header=LINE]... URL
  *
  *   -O FILE             write to FILE ("-" is standard output); the default
  *                       is the last part of the URL's path, or index.html
@@ -49,6 +49,10 @@ struct url {
 
 static int quiet, save_headers, content_on_error, max_redirect = 20, timeout_ms = 60000;
 static const char *post_data;
+static const char *method_arg;          /* --method: PUT, DELETE... (a body goes with --post-data) */
+#define MAX_HEADERS 16
+static const char *extra_headers[MAX_HEADERS];
+static int nextra;
 static int sock = -1;
 static struct tls *tls;
 static char rbuf[16384];
@@ -417,7 +421,12 @@ int main(int argc, char **argv)
             max_redirect = atoi(a + 15);
         else if (!strncmp(a, "--post-data=", 12))
             post_data = a + 12;
-        else if (!strcmp(a, "-U") && i + 1 < argc)
+        else if (!strncmp(a, "--method=", 9))
+            method_arg = a + 9;
+        else if (!strncmp(a, "--header=", 9)) {
+            if (nextra < MAX_HEADERS && !strpbrk(a + 9, "\r\n"))
+                extra_headers[nextra++] = a + 9;
+        } else if (!strcmp(a, "-U") && i + 1 < argc)
             user_agent = argv[++i];
         else if (!strncmp(a, "--user-agent=", 13))
             user_agent = a + 13;
@@ -441,21 +450,32 @@ int main(int argc, char **argv)
         say("--  %s\n", url_text);
         connect_to(&u);
 
-        char req[4096];
+        char req[8192];
         char host[300];
         if (u.port == (u.https ? 443 : 80))
             snprintf(host, sizeof(host), "%s", u.host);
         else
             snprintf(host, sizeof(host), "%s:%d", u.host, u.port);
+        int has_accept = 0, has_type = 0;
+        for (int h = 0; h < nextra; h++) {
+            has_accept |= !strncasecmp(extra_headers[h], "accept:", 7);
+            has_type |= !strncasecmp(extra_headers[h], "content-type:", 13);
+        }
         int n = snprintf(req, sizeof(req),
                          "%s %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: %s\r\n"
-                         "Accept: text/html, text/css, image/png, */*;q=0.5\r\n"
+                         "%s"
                          "Accept-Encoding: identity\r\nConnection: close\r\n",
-                         post_data ? "POST" : "GET", u.path, host, user_agent);
+                         method_arg && *method_arg ? method_arg : post_data ? "POST" : "GET", u.path, host,
+                         user_agent,
+                         has_accept ? "" : "Accept: text/html, text/css, image/png, */*;q=0.5\r\n");
+        for (int h = 0; h < nextra && n < (int)sizeof(req) - 600; h++)
+            n += snprintf(req + n, sizeof(req) - (size_t)n, "%s\r\n", extra_headers[h]);
         if (post_data)
-            n += snprintf(req + n, sizeof(req) - (size_t)n,
-                          "Content-Type: application/x-www-form-urlencoded\r\n"
-                          "Content-Length: %u\r\n", (unsigned)strlen(post_data));
+            n += snprintf(req + n, sizeof(req) - (size_t)n, "%sContent-Length: %u\r\n",
+                          has_type ? "" : "Content-Type: application/x-www-form-urlencoded\r\n",
+                          (unsigned)strlen(post_data));
+        if (n > (int)sizeof(req) - 4)
+            n = (int)sizeof(req) - 4;
         n += snprintf(req + n, sizeof(req) - (size_t)n, "\r\n");
         send_all(req, n);
         if (post_data)

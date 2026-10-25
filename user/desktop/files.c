@@ -170,7 +170,7 @@ static enum icon_id classify(struct fm *f, const struct entry *e, const char *pa
     }
     if (has_suffix(e->name, ".png") || has_suffix(e->name, ".jpg") ||
         has_suffix(e->name, ".jpeg") || has_suffix(e->name, ".jpe") || has_suffix(e->name, ".jfif") ||
-        has_suffix(e->name, ".gif") || has_suffix(e->name, ".svg"))
+        has_suffix(e->name, ".gif") || has_suffix(e->name, ".svg") || has_suffix(e->name, ".ico"))
         return ICON_IMAGE;
     if (has_suffix(e->name, ".html") || has_suffix(e->name, ".htm"))
         return ICON_HTML;
@@ -735,7 +735,7 @@ static void open_entry(struct fm *f, int i)
     } else if (e->icon == ICON_IMAGE) {
         if (!image_view_open(path)) {
             char msg[NAME_MAX + 64];
-            snprintf(msg, sizeof(msg), "%s is not a picture fluxOS can show (PNG, JPEG, GIF or SVG).", e->name);
+            snprintf(msg, sizeof(msg), "%s is not a picture fluxOS can show (PNG, JPEG, GIF, SVG or ICO).", e->name);
             message_box("Image Viewer", ICON_WARNING, msg);
         }
     } else if (e->icon == ICON_HTML) {

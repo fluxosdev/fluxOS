@@ -629,10 +629,40 @@ void js_array_push(struct js *J, struct jsobj *a, jsval v)
 
 static jsval fn_prototype(struct js *J, struct jsobj *f);
 
+/* ---- Proxy: the traps get, set, has, deleteProperty and ownKeys ---- */
+
+static int proxy_trap(struct js *J, struct jsobj *p, const char *name, jsval *fn)
+{
+    jsval t = js_get(J, js_obj(p->phandler), name);
+    if (J->throwing || !js_is_callable(t))
+        return 0;
+    *fn = t;
+    return 1;
+}
+
+static int obj_get(struct js *J, struct jsobj *o, struct jsstr *key, jsval self, jsval *out);
+
+static int proxy_get(struct js *J, struct jsobj *p, struct jsstr *key, jsval self, jsval *out)
+{
+    jsval fn;
+    if (proxy_trap(J, p, "get", &fn)) {
+        jsval a[3] = { js_obj(p->ptarget), strv(key), self };
+        *out = js_call_value(J, fn, js_obj(p->phandler), a, 3);
+        return 1;
+    }
+    if (J->throwing) {
+        *out = js_undefined;
+        return 1;
+    }
+    return obj_get(J, p->ptarget, key, js_obj(p->ptarget), out);
+}
+
 /* A property of an object, through its prototype chain: 1 if found. */
 static int obj_get(struct js *J, struct jsobj *o, struct jsstr *key, jsval self, jsval *out)
 {
     for (struct jsobj *x = o; x; x = x->proto) {
+        if (x->phandler)
+            return proxy_get(J, x, key, self, out);
         if ((x->cls == C_ARRAY || x->cls == C_ARGUMENTS) && str_is(key, "length")) {
             *out = js_num(x->len);
             return 1;
@@ -742,6 +772,16 @@ jsval js_get(struct js *J, jsval obj, const char *key)
 
 static void obj_set(struct js *J, struct jsobj *o, struct jsstr *key, jsval v, jsval self)
 {
+    if (o->phandler) {
+        jsval fn;
+        if (proxy_trap(J, o, "set", &fn)) {
+            jsval a[4] = { js_obj(o->ptarget), strv(key), v, self };
+            js_call_value(J, fn, js_obj(o->phandler), a, 4);
+        } else if (!J->throwing) {
+            obj_set(J, o->ptarget, key, v, js_obj(o->ptarget));
+        }
+        return;
+    }
     if (o->cls == C_ARRAY || o->cls == C_ARGUMENTS) {
         uint32_t i;
         if (js_index(strv(key), &i)) {
@@ -817,6 +857,14 @@ int js_has(struct js *J, jsval obj, struct jsstr *key)
         return 0;
     uint32_t i;
     for (struct jsobj *x = obj.u.o; x; x = x->proto) {
+        if (x->phandler) {
+            jsval fn;
+            if (proxy_trap(J, x, "has", &fn)) {
+                jsval a[2] = { js_obj(x->ptarget), strv(key) };
+                return js_truthy(js_call_value(J, fn, js_obj(x->phandler), a, 2));
+            }
+            return js_has(J, js_obj(x->ptarget), key);
+        }
         if ((x->cls == C_ARRAY || x->cls == C_ARGUMENTS) &&
             ((js_index(strv(key), &i) && i < (uint32_t)x->len) || str_is(key, "length")))
             return 1;
@@ -836,6 +884,14 @@ int js_delete(struct js *J, jsval obj, struct jsstr *key)
         return 1;
     struct jsobj *o = obj.u.o;
     uint32_t i;
+    if (o->phandler) {
+        jsval fn;
+        if (proxy_trap(J, o, "deleteProperty", &fn)) {
+            jsval a[2] = { js_obj(o->ptarget), strv(key) };
+            return js_truthy(js_call_value(J, fn, js_obj(o->phandler), a, 2));
+        }
+        return js_delete(J, js_obj(o->ptarget), key);
+    }
     if ((o->cls == C_ARRAY || o->cls == C_ARGUMENTS) && js_index(strv(key), &i)) {
         if (i < (uint32_t)o->len)
             o->items[i] = js_undefined;
@@ -871,6 +927,24 @@ int js_keys(struct js *J, jsval obj, int inherited, struct jsstr ***out)
     if (obj.t != JS_OBJ) {
         *out = keys;
         return 0;
+    }
+    if (obj.u.o->phandler) {
+        struct jsobj *p = obj.u.o;
+        jsval fn, tgt = js_obj(p->ptarget);
+        if (proxy_trap(J, p, "ownKeys", &fn)) {
+            jsval r = js_call_value(J, fn, js_obj(p->phandler), &tgt, 1);
+            if (J->throwing || r.t != JS_OBJ || r.u.o->cls != C_ARRAY) {
+                *out = keys;
+                return 0;
+            }
+            int len = r.u.o->len;
+            keys = js_alloc(J, sizeof(*keys) * (size_t)(len ? len : 1));
+            for (int i = 0; i < len; i++)
+                keys[i] = js_tostr(J, r.u.o->items[i]);
+            *out = keys;
+            return len;
+        }
+        return js_keys(J, tgt, inherited, out);
     }
     for (struct jsobj *x = obj.u.o; x; x = inherited ? x->proto : NULL) {
         int count = (x->cls == C_ARRAY || x->cls == C_ARGUMENTS) ? x->len : 0;
