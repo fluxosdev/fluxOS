@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -45,16 +46,22 @@
 #define WGET        "/bin/wget"
 #define HOME_URL    "file:///usr/share/www/home.html"
 #define LINE_STEP   40
+#define HISTORY_FILE   "/home/flux/.browser_history"
+#define DOWNLOADS_FILE "/home/flux/.browser_downloads"
+#define DOWNLOADS_DIR  "/home/flux/Downloads"
+#define LOG_MAX     300             /* entries kept of the history and download logs */
 
 /* PS/2 scancodes of the letters used for shortcuts */
 #define SC_L 0x26
 #define SC_R 0x13
+#define SC_H 0x23
+#define SC_J 0x24
 #define KEY_BACKSPACE 0x0E
 #define KEY_F6 0x40
 
 enum { F_PAGE, F_CSS, F_IMG, F_JS, F_XHR };
 enum { NAV_NEW, NAV_REPLACE, NAV_HISTORY };
-enum { B_BACK, B_FORWARD, B_STOP, B_REFRESH, B_HOME, B_GO, NBUTTONS };
+enum { B_BACK, B_FORWARD, B_STOP, B_REFRESH, B_HOME, B_HISTORY, B_DOWNLOADS, B_GO, NBUTTONS };
 enum hold { H_NONE, H_BUTTON, H_VBAR, H_HBAR, H_PAGE };
 
 struct fetch {
@@ -173,12 +180,13 @@ static int nvisited;
 static void navigate(struct browser *b, const char *url, const char *post, int mode);
 static void paint(struct browser *b);
 static void start_next(struct browser *b);
+static void history_add(const char *url, const char *title);
 
 /* ---- geometry ---- */
 
 static struct rect button_rect(struct browser *b, int i)
 {
-    static const int widths[] = { 62, 74, 56, 70, 60 };
+    static const int widths[] = { 62, 74, 56, 70, 60, 68, 90 };
     int x = 4;
     if (i == B_GO)
         return mkrect(b->win->content.w - 44, TOOLBAR_H + 2, 40, ADDR_H - 4);
@@ -643,6 +651,7 @@ struct response {
     int status;
     char type[128], charset[32];
     char location[URL_MAX];
+    char disp[256];             /* Content-Disposition */
     const char *body;
     int len;
 };
@@ -687,6 +696,7 @@ static int parse_response(const struct fetch *f, struct response *r)
         end = f->buf + f->len;
     int hlen = (int)(end - f->buf);
     header_value(f->buf, hlen, "Location", r->location, sizeof(r->location));
+    header_value(f->buf, hlen, "Content-Disposition", r->disp, sizeof(r->disp));
     char ct[256];
     header_value(f->buf, hlen, "Content-Type", ct, sizeof(ct));
     const char *semi = strchr(ct, ';');
@@ -1214,6 +1224,7 @@ static void load_document(struct browser *b, const char *text, int len, const ch
         }
     }
     update_title(b, title);
+    history_add(url, title);
     b->total_res = b->done_res = 0;
     start_scripts(b, url);              /* external scripts are fetched first */
     for (struct node *n = b->root; n; n = node_next(n, b->root)) {
@@ -1342,6 +1353,314 @@ static void image_done(struct browser *b, const char *url, const char *data, int
         }
 }
 
+/* ---- history and downloads: logs kept in the home folder ---- */
+
+struct log_entry {
+    long when;
+    char *url;
+    char *extra;                        /* history: the title; downloads: the saved path */
+    long size;                          /* downloads only */
+};
+
+static struct log_entry hist_log[LOG_MAX], dl_log[LOG_MAX];
+static int nhist_log, ndl_log;
+static int logs_loaded;
+
+static void log_free(struct log_entry *e)
+{
+    free(e->url);
+    free(e->extra);
+}
+
+/* Fields are tab separated, so none may hold a tab or a line break. */
+static void log_clean(char *s)
+{
+    for (; *s; s++)
+        if (*s == '\t' || *s == '\n' || *s == '\r')
+            *s = ' ';
+}
+
+static void log_load(const char *path, struct log_entry *tab, int *n)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size <= 0 || st.st_size > (1 << 20)) {
+        close(fd);
+        return;
+    }
+    char *buf = malloc((size_t)st.st_size + 1);
+    int len = buf ? (int)read(fd, buf, (size_t)st.st_size) : 0;
+    close(fd);
+    if (len <= 0) {
+        free(buf);
+        return;
+    }
+    buf[len] = 0;
+    for (char *line = buf; *line;) {
+        char *eol = strchr(line, '\n');
+        if (eol)
+            *eol = 0;
+        char *f[4] = { line, NULL, NULL, NULL };
+        int nf = 1;
+        for (char *p = line; *p && nf < 4; p++)
+            if (*p == '\t') {
+                *p = 0;
+                f[nf++] = p + 1;
+            }
+        if (nf >= 2 && f[1][0]) {
+            if (*n == LOG_MAX) {
+                log_free(&tab[0]);
+                memmove(tab, tab + 1, sizeof(tab[0]) * (LOG_MAX - 1));
+                (*n)--;
+            }
+            tab[*n].when = atol(f[0]);
+            tab[*n].url = strdup(f[1]);
+            tab[*n].extra = strdup(nf > 2 ? f[2] : "");
+            tab[*n].size = nf > 3 ? atol(f[3]) : 0;
+            (*n)++;
+        }
+        if (!eol)
+            break;
+        line = eol + 1;
+    }
+    free(buf);
+}
+
+static void log_append(const char *path, const struct log_entry *e)
+{
+    char line[URL_MAX * 2 + 512];
+    int n = snprintf(line, sizeof(line), "%ld\t%s\t%s\t%ld\n", e->when, e->url, e->extra, e->size);
+    if (n >= (int)sizeof(line))
+        return;
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0)
+        return;
+    if (write(fd, line, (size_t)n) < 0) {
+        /* nothing to do: the log is a convenience */
+    }
+    close(fd);
+}
+
+static void log_clear(const char *path, struct log_entry *tab, int *n)
+{
+    for (int i = 0; i < *n; i++)
+        log_free(&tab[i]);
+    *n = 0;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0)
+        close(fd);
+}
+
+/* Add an entry, dropping the oldest from memory when the table is full. */
+static void log_push(const char *path, struct log_entry *tab, int *n, const char *url, const char *extra,
+                     long size)
+{
+    if (*n == LOG_MAX) {
+        log_free(&tab[0]);
+        memmove(tab, tab + 1, sizeof(tab[0]) * (LOG_MAX - 1));
+        (*n)--;
+    }
+    struct log_entry *e = &tab[*n];
+    e->when = (long)time(NULL);
+    e->url = strdup(url);
+    e->extra = strdup(extra);
+    e->size = size;
+    if (!e->url || !e->extra) {
+        log_free(e);
+        return;
+    }
+    log_clean(e->url);
+    log_clean(e->extra);
+    log_append(path, e);
+    (*n)++;
+}
+
+static void logs_init(void)
+{
+    if (logs_loaded)
+        return;
+    logs_loaded = 1;
+    log_load(HISTORY_FILE, hist_log, &nhist_log);
+    log_load(DOWNLOADS_FILE, dl_log, &ndl_log);
+}
+
+static void history_add(const char *url, const char *title)
+{
+    if (!strncasecmp(url, "about:", 6) || !strcmp(url, HOME_URL))
+        return;
+    logs_init();
+    char u[URL_MAX];
+    snprintf(u, sizeof(u), "%s", url);
+    url_strip_fragment(u);
+    if (nhist_log && !strcmp(hist_log[nhist_log - 1].url, u))
+        return;                         /* a reload */
+    log_push(HISTORY_FILE, hist_log, &nhist_log, u, title, 0);
+}
+
+static void format_time(long t, char *out, int size)
+{
+    time_t tt = (time_t)t;
+    struct tm *tm = localtime(&tt);
+    snprintf(out, (size_t)size, "%04d-%02d-%02d %02d:%02d", tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+             tm->tm_hour, tm->tm_min);
+}
+
+static void format_size(long n, char *out, int size)
+{
+    if (n >= 1 << 20)
+        snprintf(out, (size_t)size, "%ld.%ld MB", n >> 20, (n & ((1 << 20) - 1)) * 10 >> 20);
+    else if (n >= 1024)
+        snprintf(out, (size_t)size, "%ld KB", n >> 10);
+    else
+        snprintf(out, (size_t)size, "%ld bytes", n);
+}
+
+/* about:history and about:downloads, newest first. */
+static void show_log_page(struct browser *b, const char *url, int history)
+{
+    logs_init();
+    struct log_entry *tab = history ? hist_log : dl_log;
+    int n = history ? nhist_log : ndl_log;
+    int cap = 4096 + n * (URL_MAX * 3 + 512);
+    char *html = malloc((size_t)cap);
+    if (!html)
+        return;
+    const char *name = history ? "history" : "downloads";
+    int o = snprintf(html, (size_t)cap,
+                     "<!DOCTYPE html><html><head><title>%s</title><style>"
+                     "body { font-family: sans-serif; margin: 24px 32px; background: #f3f0f7; color: #222 }"
+                     "h1 { font-size: 24px; color: #3f175f; margin: 0 0 4px }"
+                     "p { color: #666; margin: 4px 0 14px }"
+                     "table { border-collapse: collapse; background: white; border: 1px solid #d6cce2 }"
+                     "td { padding: 5px 12px; border-bottom: 1px solid #eee; font-size: 14px }"
+                     "td.t { color: #777; white-space: nowrap }"
+                     "td.u { color: #777; font-size: 12px }"
+                     "</style></head><body><h1>%s</h1>",
+                     history ? "History" : "Downloads", history ? "History" : "Downloads");
+    if (history)
+        o += snprintf(html + o, (size_t)(cap - o),
+                      "<p>Pages you have visited. <a href=\"about:history?clear\">Clear history</a></p>");
+    else
+        o += snprintf(html + o, (size_t)(cap - o),
+                      "<p>Files are saved in <a href=\"file://%s/\">%s</a>. "
+                      "<a href=\"about:downloads?clear\">Clear list</a></p>",
+                      DOWNLOADS_DIR, DOWNLOADS_DIR);
+    if (!n) {
+        o += snprintf(html + o, (size_t)(cap - o), "<p>%s</p>",
+                      history ? "No pages visited yet." : "Nothing has been downloaded yet.");
+    } else {
+        o += snprintf(html + o, (size_t)(cap - o), "<table>");
+        for (int i = n - 1; i >= 0; i--) {
+            char when[32], eurl[URL_MAX * 2], eextra[1024], size[32];
+            format_time(tab[i].when, when, sizeof(when));
+            escape(tab[i].url, eurl, sizeof(eurl));
+            escape(tab[i].extra, eextra, sizeof(eextra));
+            if (history) {
+                o += snprintf(html + o, (size_t)(cap - o),
+                              "<tr><td class=t>%s</td><td><a href=\"%s\">%s</a></td><td class=u>%s</td></tr>",
+                              when, eurl, eextra[0] ? eextra : eurl, eurl);
+            } else {
+                format_size(tab[i].size, size, sizeof(size));
+                const char *base = strrchr(tab[i].extra, '/');
+                char ebase[256];
+                escape(base ? base + 1 : tab[i].extra, ebase, sizeof(ebase));
+                o += snprintf(html + o, (size_t)(cap - o),
+                              "<tr><td class=t>%s</td><td><a href=\"file://%s\">%s</a></td><td class=t>%s</td>"
+                              "<td class=u>%s</td></tr>",
+                              when, eextra, ebase, size, eurl);
+            }
+            if (o > cap - (URL_MAX * 3 + 512))
+                break;
+        }
+        o += snprintf(html + o, (size_t)(cap - o), "</table>");
+    }
+    o += snprintf(html + o, (size_t)(cap - o), "</body></html>");
+    (void)name;
+    load_document(b, html, o < cap ? o : cap - 1, url, "utf-8");
+    free(html);
+}
+
+/* The name a download is saved under: from Content-Disposition, else the end of the URL. */
+static void download_name(const char *url, const char *disp, char *out, int size)
+{
+    char raw[256] = "";
+    const char *fn = strcasestr(disp, "filename=");
+    if (fn) {
+        fn += 9;
+        if (*fn == '"')
+            fn++;
+        snprintf(raw, sizeof(raw), "%.*s", (int)strcspn(fn, "\";"), fn);
+    }
+    if (!raw[0]) {
+        const char *path = strstr(url, "://");
+        path = path ? strchr(path + 3, '/') : NULL;
+        size_t pl = path ? strcspn(path, "?#") : 0;
+        while (pl > 0 && path[pl - 1] == '/')
+            pl--;
+        size_t start = pl;
+        while (start > 0 && path[start - 1] != '/')
+            start--;
+        snprintf(raw, sizeof(raw), "%.*s", (int)(pl - start), path ? path + start : "");
+    }
+    const char *base = strrchr(raw, '/');
+    base = base ? base + 1 : raw;
+    int o = 0;
+    for (; *base && o < size - 8; base++) {
+        unsigned char c = (unsigned char)*base;
+        out[o++] = isalnum(c) || c == '.' || c == '-' || c == '_' ? (char)c : '_';
+    }
+    out[o] = 0;
+    if (!out[0] || !strcmp(out, ".") || !strcmp(out, ".."))
+        snprintf(out, (size_t)size, "download");
+}
+
+static void save_download(struct browser *b, const struct fetch *f, const struct response *r)
+{
+    char name[128], path[256], msg[URL_MAX + 512], eurl[URL_MAX * 2];
+    escape(f->url, eurl, sizeof(eurl));
+    if (f->len >= MAX_PAGE) {
+        snprintf(msg, sizeof(msg),
+                 "<code>%s</code> is larger than %d MB, which is more than the browser can download. "
+                 "Run <code>wget</code> with its address in a terminal instead.",
+                 eurl, MAX_PAGE >> 20);
+        show_message(b, f->url, "Download too large", msg);
+        return;
+    }
+    mkdir(DOWNLOADS_DIR, 0755);
+    download_name(f->url, r->disp, name, sizeof(name));
+    snprintf(path, sizeof(path), "%s/%s", DOWNLOADS_DIR, name);
+    for (int i = 1; access(path, F_OK) == 0 && i < 1000; i++)
+        snprintf(path, sizeof(path), "%s/%d-%s", DOWNLOADS_DIR, i, name);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int ok = fd >= 0;
+    for (int off = 0; ok && off < r->len;) {
+        int n = (int)write(fd, r->body + off, (size_t)(r->len - off));
+        if (n <= 0)
+            ok = 0;
+        else
+            off += n;
+    }
+    if (fd >= 0)
+        close(fd);
+    if (!ok) {
+        snprintf(msg, sizeof(msg), "<code>%s</code> could not be saved: %s.", eurl, strerror(errno));
+        show_message(b, f->url, "Download failed", msg);
+        return;
+    }
+    logs_init();
+    log_push(DOWNLOADS_FILE, dl_log, &ndl_log, f->url, path, r->len);
+    char size[32], epath[512];
+    format_size(r->len, size, sizeof(size));
+    escape(path, epath, sizeof(epath));
+    snprintf(msg, sizeof(msg),
+             "Saved <code>%s</code> (%s).<p><a href=\"file://%s\">Open</a> &middot; "
+             "<a href=\"about:downloads\">All downloads</a></p>", epath, size, epath);
+    show_message(b, f->url, "Download complete", msg);
+    set_status(b, "Downloaded %s", path);
+}
+
 /* The status bar once a page is in: a secure page says what that means here. */
 static void done_status(struct browser *b)
 {
@@ -1414,6 +1733,8 @@ static void fetch_complete(struct browser *b)
                 paint(b);
                 return;
             }
+        } else if (strcasestr(r.disp, "attachment")) {
+            save_download(b, &done, &r);
         } else if (!strncmp(r.type, "image/", 6)) {
             char html[URL_MAX * 2 + 128], eurl[URL_MAX * 2];
             image_done(b, done.url, r.body, r.len);
@@ -1424,11 +1745,7 @@ static void fetch_complete(struct browser *b)
             load_document(b, html, n, done.url, "utf-8");
         } else if (r.type[0] && strncmp(r.type, "text/", 5) && !strstr(r.type, "html") &&
                    !strstr(r.type, "xml")) {
-            char msg[URL_MAX + 256];
-            snprintf(msg, sizeof(msg),
-                     "This page is a file of type <code>%s</code>, which the browser cannot show. "
-                     "To save it, run <code>wget</code> with its address in a terminal.", r.type);
-            show_message(b, done.url, "Cannot show this file", msg);
+            save_download(b, &done, &r);
         } else if (r.type[0] && strncmp(r.type, "text/html", 9) && strstr(r.type, "text/") && !strstr(r.type, "xml")) {
             /* Plain text: show it as is. */
             int cap = r.len * 5 + 64;
@@ -1588,7 +1905,17 @@ static void navigate(struct browser *b, const char *url, const char *post, int m
             navigate(b, HOME_URL, NULL, NAV_REPLACE);
             return;
         }
-        page_failed(b, u, "There is no such about: page");
+        if (!strncasecmp(u, "about:history", 13)) {
+            if (strstr(u, "clear"))
+                log_clear(HISTORY_FILE, hist_log, &nhist_log);
+            show_log_page(b, u, 1);
+        } else if (!strncasecmp(u, "about:downloads", 15)) {
+            if (strstr(u, "clear"))
+                log_clear(DOWNLOADS_FILE, dl_log, &ndl_log);
+            show_log_page(b, u, 0);
+        } else {
+            page_failed(b, u, "There is no such about: page");
+        }
     } else if (!url_is_http(u) && !url_is_https(u) && !url_is_file(u)) {
         char msg[256];
         snprintf(msg, sizeof(msg), "Only http://, https:// and file:// addresses can be opened");
@@ -1933,8 +2260,10 @@ static void focus_next_control(struct browser *b, int dir)
 
 /* ---- drawing ---- */
 
-static const enum icon_id button_icons[] = { ICON_BACK, ICON_FORWARD, ICON_STOP, ICON_REFRESH, ICON_HOMEPAGE };
-static const char *const button_labels[] = { "Back", "Forward", "Stop", "Refresh", "Home", "Go" };
+static const enum icon_id button_icons[] = { ICON_BACK, ICON_FORWARD, ICON_STOP, ICON_REFRESH, ICON_HOMEPAGE,
+                                             ICON_README, ICON_FOLDER_OPEN };
+static const char *const button_labels[] = { "Back", "Forward", "Stop", "Refresh", "Home", "History",
+                                             "Downloads", "Go" };
 
 static int button_enabled(struct browser *b, int i)
 {
@@ -2081,6 +2410,8 @@ static void press(struct browser *b, int i)
         break;
     case B_REFRESH: reload(b); break;
     case B_HOME: navigate(b, HOME_URL, NULL, NAV_NEW); break;
+    case B_HISTORY: navigate(b, "about:history", NULL, NAV_NEW); break;
+    case B_DOWNLOADS: navigate(b, "about:downloads", NULL, NAV_NEW); break;
     case B_GO: {
         char u[URL_MAX];
         normalize(b->addr, u, sizeof(u));
@@ -2203,6 +2534,14 @@ static void br_key(struct window *w, const struct input_event *ev)
         b->addr_cur = b->addr_len;
         b->focus = NULL;
         paint(b);
+        return;
+    }
+    if (ctrl && ev->code == SC_H) {
+        navigate(b, "about:history", NULL, NAV_NEW);
+        return;
+    }
+    if (ctrl && ev->code == SC_J) {
+        navigate(b, "about:downloads", NULL, NAV_NEW);
         return;
     }
     if (ev->code == KEY_F5 || (ctrl && ev->code == SC_R)) {
