@@ -664,7 +664,7 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
     /* A script's request packs "METHOD\nHeader: value\n...\n\nbody" into post. */
     char *packed = kind == F_XHR && post ? strdup(post) : NULL;
     char methodarg[40] = "", postarg[URL_MAX + 16];
-    char *hdr_arg[12];
+    char *hdr_arg[14];
     int nhdr = 0;
     const char *body = post;
     if (packed) {
@@ -695,6 +695,17 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
     }
     if (body)
         snprintf(postarg, sizeof(postarg), "--post-data=%s", body);
+    {                                           /* the jar's cookies for this address */
+        static char cookies[4096];
+        cookie_header(url, 0, cookies, sizeof(cookies) - 16);
+        if (cookies[0] && nhdr < 14) {
+            char *h = malloc(strlen(cookies) + 16);
+            if (h) {
+                sprintf(h, "--header=Cookie: %s", cookies);
+                hdr_arg[nhdr++] = h;
+            }
+        }
+    }
     int pid = fork();
     if (pid == 0) {
         int null = open("/dev/null", O_RDONLY);
@@ -1293,6 +1304,24 @@ static int js_node_box(void *ctx, struct node *n, int *x, int *y, int *w, int *h
     return any;
 }
 
+static int js_cookie_get(void *ctx, char *out, int size)
+{
+    struct browser *b = ctx;
+    if (!url_is_http(b->url) && !url_is_https(b->url))
+        return 0;
+    cookie_header(b->url, 1, out, size);
+    return 1;
+}
+
+static int js_cookie_set(void *ctx, const char *value)
+{
+    struct browser *b = ctx;
+    if (!url_is_http(b->url) && !url_is_https(b->url))
+        return 0;
+    cookie_set(b->url, value, 1);
+    return 1;
+}
+
 /* A script's XMLHttpRequest: fetched like the page's other resources. */
 static void js_http(void *ctx, int id, const char *method, const char *url, const char *body,
                     const char *headers)
@@ -1357,6 +1386,7 @@ static void start_scripts(struct browser *b, const char *url)
         .status = js_status, .changed = js_changed, .scroll = js_scroll, .scroll_pos = js_scroll_pos,
         .viewport = js_viewport, .set_title = js_set_title, .load_script = js_load_script,
         .load_image = js_load_image, .node_box = js_node_box, .focus = js_focus, .http = js_http,
+        .cookie_get = js_cookie_get, .cookie_set = js_cookie_set,
     };
     b->js = jsdom_new(&h);
     if (!b->js)
@@ -1938,6 +1968,8 @@ static void fetch_complete(struct browser *b)
     struct response r;
     int ok = parse_response(f, &r) == 0;
     int is_file = url_is_file(f->url);
+    if (ok && !is_file)
+        cookie_set_from_headers(f->url, f->buf, (int)(r.body - f->buf));
     char why[512];
     if (!ok && !is_file)
         wget_error(f, why, sizeof(why));

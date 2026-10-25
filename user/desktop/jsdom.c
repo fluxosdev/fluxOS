@@ -2297,7 +2297,15 @@ static int document_get(struct js *J, struct jsobj *o, const char *key, jsval *o
     if (IS("URL") || IS("documentURI")) { *out = js_str(J, d->h.url); return 1; }
     if (IS("location")) { *out = js_obj(d->location); return 1; }
     if (IS("readyState")) { *out = js_str(J, d->loaded ? "complete" : "interactive"); return 1; }
-    if (IS("cookie")) { *out = js_str(J, d->cookies); return 1; }
+    if (IS("cookie")) {
+        char jar[4096];
+        if (d->h.cookie_get && d->h.cookie_get(d->h.ctx, jar, sizeof(jar))) {
+            *out = js_str(J, jar);
+            return 1;
+        }
+        *out = js_str(J, d->cookies);
+        return 1;
+    }
     if (IS("referrer")) { *out = js_str(J, ""); return 1; }
     if (IS("characterSet") || IS("charset")) { *out = js_str(J, "UTF-8"); return 1; }
     if (IS("compatMode")) { *out = js_str(J, root && root->quirks ? "BackCompat" : "CSS1Compat"); return 1; }
@@ -2343,6 +2351,8 @@ static int document_set(struct js *J, struct jsobj *o, const char *key, jsval v)
     if (!strcmp(key, "cookie")) {
         /* name=value (attributes after ; are ignored), replacing the same name */
         struct jsstr *s = js_tostr(J, v);
+        if (d->h.cookie_set && d->h.cookie_set(d->h.ctx, s->s))
+            return 1;
         char pair[512];
         snprintf(pair, sizeof(pair), "%.*s", (int)strcspn(s->s, ";"), s->s);
         char *eq = strchr(pair, '=');

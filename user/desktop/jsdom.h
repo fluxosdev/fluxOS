@@ -30,6 +30,9 @@ struct jshost {
     /* The element's border box in page coordinates; 0 if it has none. */
     int (*node_box)(void *ctx, struct node *n, int *x, int *y, int *w, int *h);
     void (*focus)(void *ctx, struct node *n);
+    /* document.cookie, through the browser's jar; they return 0 for pages that have none (file:). */
+    int (*cookie_get)(void *ctx, char *out, int size);
+    int (*cookie_set)(void *ctx, const char *value);
     /* Start an XMLHttpRequest; the browser calls jsdom_http_done with its id. */
     void (*http)(void *ctx, int id, const char *method, const char *url, const char *body,
                  const char *headers);       /* headers: "Name: value\n" lines, or NULL */

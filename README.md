@@ -151,7 +151,14 @@ keeps running), or from `file://`.
   gradients, rounded corners, and the old presentational attributes.
 - **Layout**: blocks with margin collapsing, inline text, inline-blocks, lists,
   tables, flex rows, grids (columns, rows, areas, auto rows, spans, `dense`),
-  borders, backgrounds, images and form controls.
+  borders, backgrounds, images and form controls. Floats (`float`, `clear`,
+  clearfixes, text wrapping, new formatting contexts beside floats) and
+  positioning (`relative`, `absolute` and `fixed` with `top`/`right`/`bottom`/
+  `left`, `inset`) work.
+- **Cookies**: a jar shared by every window (kept in memory only) fills from
+  `Set-Cookie` headers and `document.cookie` (domain, path, `Secure`,
+  `HttpOnly`, `Max-Age`, `Expires`) and goes out on every request, so
+  logins and `fetch` calls keep their session. `SameSite` is not enforced.
 - **Pictures**: PNG, JPEG, GIF (first frame), ICO (the largest icon) and SVG, as `<img>` and as an
   inline `<svg>`. The SVG renderer (svg.c) draws shapes, paths (curves and
   arcs), groups, `use`, text, transforms, `viewBox`, solid and gradient fills,
@@ -450,14 +457,15 @@ be stopped (no ^Z). SSE instructions raise `SIGILL`.
   X25519 only, and certificates are not verified.
 - **Browser:** JavaScript has no async generators, modules or real
   BigInt, and `Proxy` cannot wrap a function; strings count UTF-8 bytes,
-  `Symbol`s are strings, `fetch` sends no cookies, `WebSocket` and
+  `Symbol`s are strings, `WebSocket` and
   `customElements` are stand-ins that do nothing, typed arrays are plain arrays, and `eval` runs
   in the global scope, so many modern web apps won't run. Layout is an
-  approximation: floats become inline-blocks, positioned elements stay in
-  the flow, flex rows are lines of inline-blocks, grids lack named lines and
+  approximation: `fixed` boxes scroll with the page, there is no `z-index`, `sticky` acts as
+  `relative`, transforms are ignored, flex rows are lines of inline-blocks, grids lack named lines and
   column flow, and `calc()` takes its first length. GIF animations show their
   first frame; SVG ignores clip paths, masks, filters and patterns. There are
-  no font downloads, cookies, page cache or text selection, and characters
+  no font downloads, page cache or text selection, cookies last only until the
+  desktop closes, and characters
   outside Latin-1 and common punctuation show as `?`.
 - **Graphics:** only the 3dfx and Radeon drivers set modes (others keep the BIOS
   mode, changeable only on an installed system at the next start); no 8-bit

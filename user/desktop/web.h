@@ -168,6 +168,7 @@ enum {
 };
 enum { BS_NONE, BS_SOLID, BS_DOTTED, BS_DASHED, BS_DOUBLE, BS_INSET, BS_OUTSET, BS_GROOVE, BS_RIDGE };
 enum { LH_NORMAL, LH_FACTOR, LH_PX };
+enum { POS_STATIC, POS_RELATIVE, POS_ABSOLUTE, POS_FIXED, POS_STICKY };
 
 /* Colors carry alpha in the top byte: 0xFF000000 is opaque. */
 #define OPAQUE(c) ((c) | 0xFF000000u)
@@ -207,7 +208,10 @@ struct style {
     uint8_t text_align, white_space, decoration, text_transform, vertical_align;
     uint8_t list_style, hidden, box_sizing_border, flex_column, floated;
     uint8_t center_blocks;      /* text-align: -webkit-center (<center>): centers child blocks too */
-    uint8_t positioned;         /* position: absolute or fixed (laid out in the flow anyway) */
+    uint8_t positioned;         /* position: absolute or fixed (hidden ones are dropped) */
+    uint8_t position;           /* POS_* */
+    uint8_t clear;              /* clear: 1 left, 2 right, 3 both */
+    struct len top, right, bottom, left;    /* offsets of positioned boxes */
     uint8_t invisible;          /* opacity 0, off-screen or clipped away: hidden tricks */
     uint8_t lh_kind;
     int lh;                     /* LH_FACTOR: times 100; LH_PX: pixels */
@@ -255,6 +259,12 @@ void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int 
                  int viewport_w, int viewport_h, int (*visited)(const char *href, void *ctx),
                  void *ctx);
 int css_parse_color(const char *s, int n, uint32_t *out);
+
+/* ---- cookies (cookies.c) ---- */
+void cookie_set(const char *url, const char *set_cookie_value, int from_script);
+void cookie_set_from_headers(const char *url, const char *headers, int hlen);
+/* The Cookie header's value for a request to url; scripts do not see HttpOnly cookies. */
+void cookie_header(const char *url, int scripts_only, char *out, int size);
 
 /* ---- SVG (svg.c) ---- */
 /* The size an <svg> element asks for (width, height, viewBox; else 300x150). */

@@ -44,7 +44,7 @@ enum prop {
     P_OVERFLOW, P_GRID_TEMPLATE_COLUMNS, P_GRID_TEMPLATE, P_GRID_COLUMN, P_GRID_COLUMN_START,
     P_GRID_COLUMN_END, P_GRID_ROW, P_GRID_ROW_START, P_GRID_AREA, P_GRID_TEMPLATE_ROWS,
     P_GRID_TEMPLATE_AREAS, P_GRID_AUTO_ROWS, P_GRID_ROW_END, P_GRID_AUTO_FLOW, P_MAX_HEIGHT,
-    P_ASPECT_RATIO,
+    P_ASPECT_RATIO, P_RIGHT, P_BOTTOM, P_CLEAR, P_INSET, P_TRANSFORM,
 };
 
 static const struct { const char *name; uint8_t prop; } prop_names[] = {
@@ -71,7 +71,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "border-top-left-radius", P_BORDER_TL_RADIUS },
     { "border-top-right-radius", P_BORDER_TR_RADIUS }, { "border-top-style", P_BORDER_TOP_STYLE },
     { "border-top-width", P_BORDER_TOP_WIDTH }, { "border-width", P_BORDER_WIDTH },
-    { "box-sizing", P_BOX_SIZING }, { "clip", P_CLIP }, { "color", P_COLOR },
+    { "bottom", P_BOTTOM }, { "box-sizing", P_BOX_SIZING }, { "clear", P_CLEAR }, { "clip", P_CLIP }, { "color", P_COLOR },
     { "column-gap", P_COLUMN_GAP }, { "content", P_CONTENT }, { "display", P_DISPLAY },
     { "flex", P_FLEX }, { "flex-basis", P_FLEX_BASIS }, { "flex-direction", P_FLEX_DIRECTION },
     { "flex-flow", P_FLEX_FLOW }, { "flex-grow", P_FLEX_GROW }, { "flex-shrink", P_FLEX_SHRINK },
@@ -87,7 +87,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "grid-template-areas", P_GRID_TEMPLATE_AREAS },
     { "grid-template-columns", P_GRID_TEMPLATE_COLUMNS },
     { "grid-template-rows", P_GRID_TEMPLATE_ROWS }, { "height", P_HEIGHT },
-    { "justify-content", P_JUSTIFY_CONTENT }, { "justify-items", P_JUSTIFY_ITEMS },
+    { "inset", P_INSET }, { "justify-content", P_JUSTIFY_CONTENT }, { "justify-items", P_JUSTIFY_ITEMS },
     { "justify-self", P_JUSTIFY_SELF }, { "left", P_LEFT }, { "line-height", P_LINE_HEIGHT },
     { "list-style", P_LIST_STYLE }, { "list-style-type", P_LIST_STYLE_TYPE },
     { "margin", P_MARGIN }, { "margin-block-end", P_MARGIN_BOTTOM },
@@ -103,10 +103,10 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "padding-inline-start", P_PADDING_LEFT }, { "padding-left", P_PADDING_LEFT },
     { "padding-right", P_PADDING_RIGHT }, { "padding-top", P_PADDING_TOP },
     { "place-content", P_PLACE_CONTENT }, { "place-items", P_PLACE_ITEMS },
-    { "place-self", P_PLACE_SELF }, { "position", P_POSITION }, { "row-gap", P_ROW_GAP },
+    { "place-self", P_PLACE_SELF }, { "position", P_POSITION }, { "right", P_RIGHT }, { "row-gap", P_ROW_GAP },
     { "text-align", P_TEXT_ALIGN }, { "text-decoration", P_TEXT_DECORATION },
     { "text-decoration-line", P_TEXT_DECORATION_LINE }, { "text-indent", P_TEXT_INDENT },
-    { "text-transform", P_TEXT_TRANSFORM }, { "top", P_TOP },
+    { "text-transform", P_TEXT_TRANSFORM }, { "top", P_TOP }, { "transform", P_TRANSFORM },
     { "vertical-align", P_VERTICAL_ALIGN }, { "visibility", P_VISIBILITY },
     { "white-space", P_WHITE_SPACE }, { "width", P_WIDTH },
 };
@@ -1842,6 +1842,7 @@ static void init_initial(void)
     s->width.unit = s->height.unit = s->max_width.unit = s->min_width.unit = U_AUTO;
     s->min_height.unit = U_PX;
     s->max_height.unit = U_AUTO;
+    s->top.unit = s->right.unit = s->bottom.unit = s->left.unit = U_AUTO;
     s->flex_basis.unit = U_AUTO;
     s->flex_shrink = 100;
     s->align_items = s->justify = s->justify_items = AL_NORMAL;
@@ -2691,7 +2692,7 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
             st->grad = 0;
         break;
     case P_FLOAT:
-        st->floated = !strcasecmp(value, "left") || !strcasecmp(value, "right");
+        st->floated = !strcasecmp(value, "left") ? 1 : !strcasecmp(value, "right") ? 2 : 0;
         break;
     case P_COLOR:
         if (inherit_kw)
@@ -2979,7 +2980,34 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         break;
     case P_POSITION:
         st->positioned = !strcasecmp(value, "absolute") || !strcasecmp(value, "fixed");
+        st->position = !strcasecmp(value, "relative") ? POS_RELATIVE : !strcasecmp(value, "absolute") ? POS_ABSOLUTE
+                     : !strcasecmp(value, "fixed") ? POS_FIXED
+                     : !strcasecmp(value, "sticky") || !strcasecmp(value, "-webkit-sticky") ? POS_STICKY
+                     : POS_STATIC;
         break;
+    case P_TRANSFORM: {                         /* only to spot boxes slid out of view */
+        const char *t = strcasestr(value, "translate");
+        t = t ? strchr(t, '(') : NULL;
+        int num;
+        int used = t ? parse_num(t + 1, &num) : 0;
+        if (used && ((num <= -9900 && t[1 + used] == '%') || num <= -50000))
+            st->invisible |= 2;
+        break;
+    }
+    case P_CLEAR:
+        st->clear = !strcasecmp(value, "both") ? 3 : !strcasecmp(value, "left") ? 1 : !strcasecmp(value, "right") ? 2 : 0;
+        break;
+    case P_RIGHT: set_len(&st->right, value, v); break;
+    case P_BOTTOM: set_len(&st->bottom, value, v); break;
+    case P_INSET: {                             /* top, right, bottom, left */
+        struct len ib[4];
+        if (box_values(value, v, ib)) {
+            st->top = ib[0], st->right = ib[1], st->bottom = ib[2], st->left = ib[3];
+            if (ib[0].unit == U_PX && ib[3].unit == U_PX && (ib[0].v <= -500 || ib[3].v <= -500))
+                st->invisible |= 2;
+        }
+        break;
+    }
     case P_OPACITY: {
         int num;
         if (parse_num(value, &num))
@@ -2990,6 +3018,12 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
     case P_TOP: {
         /* Only to recognise content pushed off the screen to hide it. */
         struct len l;
+        if (length_value(value, v, &l)) {
+            if (prop == P_LEFT)
+                st->left = l;
+            else
+                st->top = l;
+        }
         if (length_value(value, v, &l) && l.unit == U_PX)
             st->invisible = (uint8_t)((st->invisible & ~2) | (l.v <= -500 ? 2 : 0));
         break;

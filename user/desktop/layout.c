@@ -10,8 +10,10 @@
  * columns from the minimum and maximum widths of their cells. Flex
  * containers grow and shrink their items along lines and align them
  * across; grid containers size column tracks (fixed, content and fr) and
- * place items in rows. Floats are laid out as inline-blocks, and
- * positioned elements stay in the normal flow.
+ * place items in rows. Floats sit against the sides of their block
+ * formatting context and lines are shortened beside them; relatively
+ * positioned boxes are moved after layout, and absolute and fixed ones are
+ * laid out once the box they are placed against is known.
  *
  * Atomic boxes are laid out at (0, 0) first, to learn their size, and
  * moved into place when their line is placed; table cells are moved
@@ -81,6 +83,14 @@ struct lctx {
     int last_baseline;          /* of the most recent line */
     struct node *skip_bg;       /* the element whose background became the canvas */
     struct node *contain;       /* a flex or grid item: its children's margins stay inside */
+    /* floats of the current block formatting context are floats[float_base..nfloats) */
+    struct fbox { int x, y, w, h, side; } floats[64];    /* margin boxes; side 1 left, 2 right */
+    int nfloats, float_base;
+    /* absolute and fixed boxes waiting for the box they are placed against */
+    struct pend { struct node *n; int sx, sy; } pend[128];
+    int npend;
+    int force_container;        /* the next block box places its absolute descendants itself */
+    int abs_bw1;                /* an absolute box's stretched border-box width, plus 1; 0: none */
 };
 
 static unsigned layout_gen;
@@ -876,7 +886,10 @@ static void layout_inline_block(struct lctx *c, struct node *n, int avail, int *
     int ml = len_px(st->margin[3], avail), mr = len_px(st->margin[1], avail);
     int mt = len_px(st->margin[0], avail);
     int bw;
-    if (st->width.unit == U_AUTO) {     /* shrink to fit */
+    if (c->abs_bw1) {                   /* an absolute box stretched between its sides */
+        bw = c->abs_bw1 - 1;
+        c->abs_bw1 = 0;
+    } else if (st->width.unit == U_AUTO) {     /* shrink to fit */
         int mn, mx;
         measure(c, n, &mn, &mx);
         int stf = mx < avail ? mx : avail;
@@ -892,10 +905,12 @@ static void layout_inline_block(struct lctx *c, struct node *n, int avail, int *
     c->marker_pending = 0;
     c->last_baseline = -1;
     int mb, h;
-    if (st->display == D_INLINE_TABLE || st->display == D_TABLE)
+    if (st->display == D_INLINE_TABLE || st->display == D_TABLE) {
         h = layout_table(c, n, ml, mt, avail, bw, &mb);
-    else
+    } else {
+        c->force_container = 1;         /* what is absolute inside is placed against this box */
         h = layout_block_box(c, n, ml, mt, avail, bw, &mb, NULL);
+    }
     c->marker_pending = saved_pending;
     if (n->tag == T_BUTTON && !st->hidden)
         add_hotspot(c, &c->lo->controls, &c->lo->ncontrols, &c->lo->controlcap, n, ml, mt, bw, h);
@@ -931,6 +946,98 @@ static void add_atomic(struct lctx *c, struct flow *f, struct node *n)
     it->w = w;
     it->h = h;
     it->base = base;
+}
+
+/* ---- floats ---- */
+
+/* Narrow [*left, *right) by the floats that meet y .. y + h; 1 if there are any. */
+static int float_edges(struct lctx *c, int y, int h, int *left, int *right)
+{
+    int hit = 0;
+    for (int i = c->float_base; i < c->nfloats; i++) {
+        const struct fbox *b = &c->floats[i];
+        if (b->y + b->h <= y || b->y >= y + (h > 0 ? h : 1))
+            continue;
+        hit = 1;
+        if (b->side == 1) {
+            if (b->x + b->w > *left)
+                *left = b->x + b->w;
+        } else if (b->x < *right) {
+            *right = b->x;
+        }
+    }
+    return hit;
+}
+
+/* The nearest bottom edge below y among the floats that meet y .. y + h; 0 if none. */
+static int float_next_bottom(struct lctx *c, int y, int h)
+{
+    int best = 0;
+    for (int i = c->float_base; i < c->nfloats; i++) {
+        const struct fbox *b = &c->floats[i];
+        int bottom = b->y + b->h;
+        if (bottom <= y || b->y >= y + (h > 0 ? h : 1))
+            continue;
+        if (!best || bottom < best)
+            best = bottom;
+    }
+    return best;
+}
+
+/* The lowest bottom edge of the floats on the sides in mask (1 left, 2 right); -BIG if none. */
+static int float_clear_y(struct lctx *c, int mask)
+{
+    int low = -BIG;
+    for (int i = c->float_base; i < c->nfloats; i++)
+        if ((c->floats[i].side & mask) && c->floats[i].y + c->floats[i].h > low)
+            low = c->floats[i].y + c->floats[i].h;
+    return low;
+}
+
+/* Lay out a float and put it against the side of the container, below what is already there. */
+static void place_float(struct lctx *c, struct flow *f, struct node *n)
+{
+    const struct style *st = n->style;
+    struct mark m0 = mark_now(c);
+    int w, h, base;
+    if (is_replaced(n))
+        layout_replaced(c, n, f->w, &w, &h, &base);
+    else
+        layout_inline_block(c, n, f->w, &w, &h, &base);
+    struct mark m1 = mark_now(c);
+    int y = f->cy + f->pm;
+    if (st->clear && float_clear_y(c, st->clear) > y)
+        y = float_clear_y(c, st->clear);
+    for (int i = c->float_base; i < c->nfloats; i++)        /* never higher than an earlier float */
+        if (c->floats[i].y > y)
+            y = c->floats[i].y;
+    int left, right;
+    for (int tries = 0; tries < 64; tries++) {
+        left = f->x;
+        right = f->x + f->w;
+        int hit = float_edges(c, y, h, &left, &right);
+        int nb = hit && right - left < w ? float_next_bottom(c, y, h) : 0;
+        if (nb <= y)
+            break;
+        y = nb;
+    }
+    int x = st->floated == 2 ? right - w : left;
+    shift(c, m0, m1, x, y);
+    if (c->nfloats < (int)(sizeof(c->floats) / sizeof(c->floats[0]))) {
+        c->floats[c->nfloats++] = (struct fbox){ x, y, w, h, st->floated };
+    }
+}
+
+/* Width of the run from item i up to its first place to break. */
+static int first_chunk(const struct item *items, int i, int n)
+{
+    int w = 0;
+    for (; i < n; i++) {
+        if (items[i].kind == I_BREAK || (items[i].kind == I_SPACE && items[i].wrap))
+            break;
+        w += items[i].w;
+    }
+    return w;
 }
 
 /* ---- lines ---- */
@@ -1142,12 +1249,30 @@ static void flush_run(struct lctx *c, struct flow *f)
     }
     struct item *items = f->items;
     int n = f->n, i = 0;
+    int ox = f->x, ow = f->w;           /* the container; a line beside floats is narrower */
     while (any && i < n) {
         /* Collapsible spaces at the start of a line go. */
         while (i < n && items[i].kind == I_SPACE && items[i].wrap)
             i++;
         if (i >= n)
             break;
+        f->x = ox;
+        f->w = ow;
+        if (c->nfloats > c->float_base) {
+            int probe = line_height(f->st), need = first_chunk(items, i, n);
+            for (int tries = 0; tries < 64; tries++) {
+                int l = ox, r = ox + ow;
+                int hit = float_edges(c, f->cy, probe, &l, &r);
+                int nb = hit && r - l < need ? float_next_bottom(c, f->cy, probe) : 0;
+                if (nb > f->cy) {
+                    f->cy = nb;         /* too narrow: go down past the float */
+                    continue;
+                }
+                f->x = l;
+                f->w = r - l;
+                break;
+            }
+        }
         int avail = f->w - (f->lines == 0 ? f->st->text_indent : 0);
         int start = i, x = 0, brk = -1, end = n, next = n, forced = 0;
         for (; i < n; i++) {
@@ -1187,6 +1312,8 @@ static void flush_run(struct lctx *c, struct flow *f)
             place_line(c, f, start, start);
         i = next;
     }
+    f->x = ox;
+    f->w = ow;
     f->n = 0;
     f->nopen = 0;
     f->space_before = 1;
@@ -1221,9 +1348,18 @@ static void block_child(struct lctx *c, struct flow *f, struct node *n)
     }
     int mt = len_px(st->margin[0], f->w);
     int gap = collapse(f->pm, mt);
-    int mb;
-    int h = st->display == D_TABLE ? layout_table(c, n, f->x, f->cy + gap, f->w, -1, &mb)
-                                   : layout_block_box(c, n, f->x, f->cy + gap, f->w, -1, &mb, NULL);
+    if (st->clear && float_clear_y(c, st->clear) > f->cy + gap)
+        gap = float_clear_y(c, st->clear) - f->cy;      /* clearance */
+    int mb, bx = f->x, bwid = f->w;
+    if (c->nfloats > c->float_base && (st->clips || st->display == D_TABLE)) {
+        int l = bx, r = bx + bwid;              /* a new formatting context sits beside floats */
+        if (float_edges(c, f->cy + gap, 1, &l, &r) && r > l) {
+            bx = l;
+            bwid = r - l;
+        }
+    }
+    int h = st->display == D_TABLE ? layout_table(c, n, bx, f->cy + gap, bwid, -1, &mb)
+                                   : layout_block_box(c, n, bx, f->cy + gap, bwid, -1, &mb, NULL);
     f->cy += gap + h;
     f->pm = mb;
 }
@@ -1268,6 +1404,16 @@ static void flow_node(struct lctx *c, struct flow *f, struct node *n)
     }
     if (n->tag == T_INPUT && !strcasecmp(input_type(n), "hidden"))
         return;
+    if (st->position == POS_ABSOLUTE || st->position == POS_FIXED) {
+        /* out of the flow: laid out once the box it is placed against is known */
+        if (!c->measuring && c->npend < (int)(sizeof(c->pend) / sizeof(c->pend[0])))
+            c->pend[c->npend++] = (struct pend){ n, f->x, f->cy + f->pm };
+        return;
+    }
+    if (st->floated && !c->measuring) {
+        place_float(c, f, n);
+        return;
+    }
     if (is_block_level(st->display)) {
         block_child(c, f, n);
         return;
@@ -1323,8 +1469,15 @@ static int block_content(struct lctx *c, struct node *n, int x, int y, int w, in
     const struct style *st = n->style;
     if (st->inner == IN_FLEX || st->inner == IN_GRID) {
         *pm = 0;
-        return st->inner == IN_FLEX ? layout_flex(c, n, x, y, w, defh, minh)
-                                    : layout_grid(c, n, x, y, w, defh, minh);
+        int h = st->inner == IN_FLEX ? layout_flex(c, n, x, y, w, defh, minh)
+                                     : layout_grid(c, n, x, y, w, defh, minh);
+        if (!c->measuring)
+            for (struct node *k = n->first; k; k = k->next)     /* absolute children are not items */
+                if (k->type == N_ELEMENT && k->style && k->style->display != D_NONE &&
+                    (k->style->position == POS_ABSOLUTE || k->style->position == POS_FIXED) &&
+                    c->npend < (int)(sizeof(c->pend) / sizeof(c->pend[0])))
+                    c->pend[c->npend++] = (struct pend){ k, x, y };
+        return h;
     }
     struct flow f = { 0 };
     f.x = x, f.w = w, f.y0 = f.cy = y;
@@ -1338,6 +1491,49 @@ static int block_content(struct lctx *c, struct node *n, int x, int y, int w, in
     free(f.items);
     *pm = f.pm;
     return f.cy - y;
+}
+
+/* An absolute or fixed box, placed against the padding box (cbx, cby, cbw x cbh) of its containing block. */
+static void layout_abs(struct lctx *c, const struct pend *p, int cbx, int cby, int cbw, int cbh)
+{
+    struct node *n = p->n;
+    const struct style *st = n->style;
+    int la = st->left.unit == U_AUTO, ra = st->right.unit == U_AUTO;
+    int ta = st->top.unit == U_AUTO, ba = st->bottom.unit == U_AUTO;
+    int l = len_px(st->left, cbw), r = len_px(st->right, cbw);
+    int t = len_px(st->top, cbh), bo = len_px(st->bottom, cbh);
+    int ml = len_px(st->margin[3], cbw), mr = len_px(st->margin[1], cbw);
+    int avail = cbw - (la ? 0 : l) - (ra ? 0 : r);
+    if (avail < 0)
+        avail = 0;
+    struct mark m0 = mark_now(c);
+    int ow, oh, base;
+    if (is_replaced(n)) {
+        layout_replaced(c, n, avail, &ow, &oh, &base);
+    } else {
+        if (st->width.unit == U_AUTO && !la && !ra)
+            c->abs_bw1 = (avail - ml - mr > 0 ? avail - ml - mr : 0) + 1;      /* stretched between the sides */
+        layout_inline_block(c, n, avail, &ow, &oh, &base);
+        c->abs_bw1 = 0;
+    }
+    int x, y;
+    if (!la)
+        x = cbx + l;
+    else if (!ra)
+        x = cbx + cbw - r - ow;
+    else
+        x = p->sx;
+    if (!ta)
+        y = cby + t;
+    else if (!ba)
+        y = cby + cbh - bo - oh;
+    else
+        y = p->sy;
+    if (!la && !ra && st->width.unit != U_AUTO && st->margin[3].unit == U_AUTO && st->margin[1].unit == U_AUTO)
+        x = cbx + l + (avail - ow) / 2;                 /* auto margins centre it between the sides */
+    if (!ta && !ba && st->height.unit != U_AUTO && st->margin[0].unit == U_AUTO && st->margin[2].unit == U_AUTO)
+        y = cby + t + (cbh - t - bo - oh) / 2;
+    shift(c, m0, mark_now(c), x, y);
 }
 
 /*
@@ -1358,6 +1554,18 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
         n->parent->style->center_blocks)
         b.ml = (cw - bw) / 2 > 0 ? (cw - bw) / 2 : 0;
     int bx = x + b.ml;
+    struct mark m_start = mark_now(c);
+    /* Positioned boxes (and boxes that will be moved as a whole) place absolute descendants;
+     * boxes that start a formatting context keep their floats to themselves. */
+    int is_cb = st->position != POS_STATIC || c->force_container || bg_slot || n == c->contain || !n->parent;
+    int pfirst = c->npend;
+    int bfc = !n->parent || st->clips || st->floated || st->display == D_TABLE_CELL ||
+              st->display == D_INLINE_BLOCK || st->position == POS_ABSOLUTE || st->position == POS_FIXED ||
+              n == c->contain;
+    int saved_base = c->float_base;
+    c->force_container = 0;
+    if (bfc)
+        c->float_base = c->nfloats;
     anchors_of(c, n, y);
 
     int slot = c->lo->nitems;
@@ -1376,6 +1584,19 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
     int ch = block_content(c, n, cx, cy, b.w, defh, minh, &pm);
     if (c->marker_pending && st->display == D_LIST_ITEM)
         place_marker(c, cy + wfont_ascent(st->font));
+    if (bfc) {                          /* a formatting context contains its floats */
+        int low = float_clear_y(c, 3);
+        if (low > cy + ch)
+            ch = low - cy;
+    } else if (n->pseudo_st[1] && n->pseudo_st[1]->clear) {      /* a clearfix */
+        int low = float_clear_y(c, n->pseudo_st[1]->clear);
+        if (low > cy + ch)
+            ch = low - cy;
+    }
+    if (bfc) {
+        c->nfloats = c->float_base;
+        c->float_base = saved_base;
+    }
 
     *mb = b.mb;
     if (st->height.unit == U_PX) {
@@ -1412,6 +1633,23 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
         }
     } else {
         finish_box(c, n, slot, bx, y, bw, bh);
+    }
+    if (is_cb && c->npend > pfirst) {
+        int end = c->npend;
+        for (int i = pfirst; i < end; i++) {
+            struct pend p = c->pend[i];
+            if (p.n->style->position == POS_FIXED || !n->parent)
+                layout_abs(c, &p, 0, 0, c->vw, c->vh);          /* against the viewport */
+            else
+                layout_abs(c, &p, bx + b.bl, y + b.bt, bw - b.bl - b.br, bh - b.bt - b.bb);
+        }
+        c->npend = pfirst;
+    }
+    if (st->position == POS_RELATIVE && !bg_slot) {
+        int dx = st->left.unit != U_AUTO ? len_px(st->left, cw) : st->right.unit != U_AUTO ? -len_px(st->right, cw) : 0;
+        int dy = st->top.unit != U_AUTO ? len_px(st->top, 0) : st->bottom.unit != U_AUTO ? -len_px(st->bottom, 0) : 0;
+        if (dx || dy)
+            shift(c, m_start, mark_now(c), dx, dy);
     }
     return bh;
 }
@@ -1520,7 +1758,8 @@ static int container_items(struct node *n, struct fitem **out)
         }
         const struct style *st = k->style;
         if (!st || st->display == D_NONE || !st->font || k->tag == T_BR || k->tag == T_WBR ||
-            (k->tag == T_INPUT && !strcasecmp(input_type(k), "hidden")))
+            (k->tag == T_INPUT && !strcasecmp(input_type(k), "hidden")) ||
+            st->position == POS_ABSOLUTE || st->position == POS_FIXED)
             continue;
         int kind = is_replaced(k) ? FI_REPLACED
                  : st->display == D_TABLE || st->display == D_INLINE_TABLE ? FI_TABLE : FI_BLOCK;
