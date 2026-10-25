@@ -44,7 +44,7 @@ enum prop {
     P_OVERFLOW, P_GRID_TEMPLATE_COLUMNS, P_GRID_TEMPLATE, P_GRID_COLUMN, P_GRID_COLUMN_START,
     P_GRID_COLUMN_END, P_GRID_ROW, P_GRID_ROW_START, P_GRID_AREA, P_GRID_TEMPLATE_ROWS,
     P_GRID_TEMPLATE_AREAS, P_GRID_AUTO_ROWS, P_GRID_ROW_END, P_GRID_AUTO_FLOW, P_MAX_HEIGHT,
-    P_ASPECT_RATIO, P_RIGHT, P_BOTTOM, P_CLEAR, P_INSET, P_TRANSFORM,
+    P_ASPECT_RATIO, P_RIGHT, P_BOTTOM, P_CLEAR, P_INSET, P_TRANSFORM, P_Z_INDEX, P_BOX_SHADOW,
 };
 
 static const struct { const char *name; uint8_t prop; } prop_names[] = {
@@ -71,7 +71,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "border-top-left-radius", P_BORDER_TL_RADIUS },
     { "border-top-right-radius", P_BORDER_TR_RADIUS }, { "border-top-style", P_BORDER_TOP_STYLE },
     { "border-top-width", P_BORDER_TOP_WIDTH }, { "border-width", P_BORDER_WIDTH },
-    { "bottom", P_BOTTOM }, { "box-sizing", P_BOX_SIZING }, { "clear", P_CLEAR }, { "clip", P_CLIP }, { "color", P_COLOR },
+    { "bottom", P_BOTTOM }, { "box-shadow", P_BOX_SHADOW }, { "box-sizing", P_BOX_SIZING }, { "clear", P_CLEAR }, { "clip", P_CLIP }, { "color", P_COLOR },
     { "column-gap", P_COLUMN_GAP }, { "content", P_CONTENT }, { "display", P_DISPLAY },
     { "flex", P_FLEX }, { "flex-basis", P_FLEX_BASIS }, { "flex-direction", P_FLEX_DIRECTION },
     { "flex-flow", P_FLEX_FLOW }, { "flex-grow", P_FLEX_GROW }, { "flex-shrink", P_FLEX_SHRINK },
@@ -108,7 +108,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "text-decoration-line", P_TEXT_DECORATION_LINE }, { "text-indent", P_TEXT_INDENT },
     { "text-transform", P_TEXT_TRANSFORM }, { "top", P_TOP }, { "transform", P_TRANSFORM },
     { "vertical-align", P_VERTICAL_ALIGN }, { "visibility", P_VISIBILITY },
-    { "white-space", P_WHITE_SPACE }, { "width", P_WIDTH },
+    { "white-space", P_WHITE_SPACE }, { "width", P_WIDTH }, { "z-index", P_Z_INDEX },
 };
 
 /* ---- selectors and rules ---- */
@@ -118,7 +118,8 @@ enum {
     PS_VISITED = 1 << 4, PS_ROOT = 1 << 5, PS_EMPTY = 1 << 6, PS_NEVER = 1 << 7,
     PS_CHECKED = 1 << 8, PS_DISABLED = 1 << 9, PS_ENABLED = 1 << 10, PS_FIRST_OF_TYPE = 1 << 11,
     PS_LAST_OF_TYPE = 1 << 12, PS_ONLY_OF_TYPE = 1 << 13, PS_REQUIRED = 1 << 14, PS_OPTIONAL = 1 << 15,
-    PS_ANY_LINK = 1 << 16, PS_PLACEHOLDER = 1 << 17,
+    PS_ANY_LINK = 1 << 16, PS_PLACEHOLDER = 1 << 17, PS_HOVER = 1 << 18, PS_FOCUS = 1 << 19,
+    PS_FOCUS_WITHIN = 1 << 20,
 };
 
 struct attr_sel {
@@ -532,7 +533,16 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
                 c->pseudo |= PS_FIRST_OF_TYPE;
             else if (!strcmp(name, "last-of-type"))
                 c->pseudo |= PS_LAST_OF_TYPE;
-            else if (!strcmp(name, "only-of-type"))
+            else if (!strcmp(name, "hover")) {
+                c->pseudo |= PS_HOVER;
+                css_dynamic_rules++;
+            } else if (!strcmp(name, "focus") || !strcmp(name, "focus-visible")) {
+                c->pseudo |= PS_FOCUS;
+                css_dynamic_rules++;
+            } else if (!strcmp(name, "focus-within")) {
+                c->pseudo |= PS_FOCUS_WITHIN;
+                css_dynamic_rules++;
+            } else if (!strcmp(name, "only-of-type"))
                 c->pseudo |= PS_ONLY_OF_TYPE;
             else if (!strcmp(name, "required"))
                 c->pseudo |= PS_REQUIRED;
@@ -1020,6 +1030,9 @@ struct sheet *css_parse(struct arena *a, const char *text, int len, int viewport
 
 /* ---- matching ---- */
 
+const struct node *css_hover_node, *css_focus_node;
+int css_dynamic_rules;
+
 struct mctx {
     int (*visited)(const char *href, void *ctx);
     void *ctx;
@@ -1161,6 +1174,22 @@ static int match_compound(const struct compound *c, const struct node *n, const 
             for (const struct node *p = next_element(n); p; p = next_element(p))
                 if (same_type(p, n))
                     return 0;
+        if (ps & PS_HOVER) {
+            const struct node *h = css_hover_node;
+            while (h && h != n)
+                h = h->parent;
+            if (!h)
+                return 0;
+        }
+        if ((ps & PS_FOCUS) && n != css_focus_node)
+            return 0;
+        if (ps & PS_FOCUS_WITHIN) {
+            const struct node *h = css_focus_node;
+            while (h && h != n)
+                h = h->parent;
+            if (!h)
+                return 0;
+        }
         if (ps & (PS_LINK | PS_VISITED)) {
             if (!is_link(n))
                 return 0;
@@ -2985,13 +3014,74 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
                      : !strcasecmp(value, "sticky") || !strcasecmp(value, "-webkit-sticky") ? POS_STICKY
                      : POS_STATIC;
         break;
+    case P_BOX_SHADOW: {
+        st->sh_color = 0;
+        const char *vend = value + strlen(value), *comma = find_top(value, vend, ',');
+        char first[160];
+        snprintf(first, sizeof(first), "%.*s", (int)(comma - value), value);
+        if (!strcasecmp(first, "none") || strcasestr(first, "inset"))
+            break;
+        const char *w2[8];
+        int wl2[8], nw = words(first, w2, wl2, 8), nl = 0, num[4] = { 0, 0, 0, 0 };
+        uint32_t col = OPAQUE(0x000000);
+        for (int i = 0; i < nw; i++) {
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "%.*s", wl2[i], w2[i]);
+            struct len l;
+            uint32_t cc;
+            if (css_parse_color(tmp, (int)strlen(tmp), &cc) == 0 && !(isdigit((unsigned char)tmp[0]) || tmp[0] == '-' || tmp[0] == '.'))
+                col = cc;
+            else if (length_value(tmp, v, &l) && l.unit == U_PX && nl < 4)
+                num[nl++] = l.v;
+        }
+        if (nl >= 2 && ALPHA(col)) {
+            st->sh_x = num[0], st->sh_y = num[1], st->sh_blur = num[2] < 0 ? 0 : num[2], st->sh_spread = num[3];
+            st->sh_color = col;
+        }
+        break;
+    }
     case P_TRANSFORM: {                         /* only to spot boxes slid out of view */
+        st->tx = st->ty = (struct len){ .unit = U_PX };
+        for (const char *t = value; (t = strcasestr(t, "translate")) != NULL; t++) {
+            const char *name = t;
+            t = strchr(t, '(');
+            if (!t)
+                break;
+            char arg[96];
+            const char *close = strchr(t, ')');
+            if (!close)
+                break;
+            snprintf(arg, sizeof(arg), "%.*s", (int)(close - t - 1), t + 1);
+            char *comma2 = strchr(arg, ',');
+            char a1[48] = "", a2[48] = "";
+            snprintf(a1, sizeof(a1), "%.*s", comma2 ? (int)(comma2 - arg) : (int)strlen(arg), arg);
+            if (comma2)
+                snprintf(a2, sizeof(a2), "%s", comma2 + 1);
+            struct len l1 = { .unit = U_PX }, l2 = { .unit = U_PX };
+            if (!length_value(a1, v, &l1))
+                l1 = (struct len){ .unit = U_PX };
+            if (a2[0] && !length_value(a2, v, &l2))
+                l2 = (struct len){ .unit = U_PX };
+            if (name[9] == 'X' || name[9] == 'x')
+                st->tx = l1;
+            else if (name[9] == 'Y' || name[9] == 'y')
+                st->ty = l1;
+            else
+                st->tx = l1, st->ty = l2;
+            t = close;
+        }
         const char *t = strcasestr(value, "translate");
         t = t ? strchr(t, '(') : NULL;
         int num;
         int used = t ? parse_num(t + 1, &num) : 0;
         if (used && ((num <= -9900 && t[1 + used] == '%') || num <= -50000))
             st->invisible |= 2;
+        break;
+    }
+    case P_Z_INDEX: {
+        int num;
+        st->z_set = parse_num(value, &num) != 0;
+        st->z_index = st->z_set ? num / 100 : 0;
         break;
     }
     case P_CLEAR:

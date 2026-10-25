@@ -211,6 +211,11 @@ struct style {
     uint8_t positioned;         /* position: absolute or fixed (hidden ones are dropped) */
     uint8_t position;           /* POS_* */
     uint8_t clear;              /* clear: 1 left, 2 right, 3 both */
+    uint8_t z_set;              /* z-index is not auto */
+    int sh_x, sh_y, sh_blur, sh_spread;     /* box-shadow (the first, outer one) */
+    uint32_t sh_color;          /* 0: none */
+    struct len tx, ty;          /* transform: translate() */
+    int z_index;
     struct len top, right, bottom, left;    /* offsets of positioned boxes */
     uint8_t invisible;          /* opacity 0, off-screen or clipped away: hidden tricks */
     uint8_t lh_kind;
@@ -259,6 +264,10 @@ void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int 
                  int viewport_w, int viewport_h, int (*visited)(const char *href, void *ctx),
                  void *ctx);
 int css_parse_color(const char *s, int n, uint32_t *out);
+
+/* ---- :hover and :focus (css.c): the elements they match; css_dynamic_rules counts the rules that use them ---- */
+extern const struct node *css_hover_node, *css_focus_node;
+extern int css_dynamic_rules;
 
 /* ---- cookies (cookies.c) ---- */
 void cookie_set(const char *url, const char *set_cookie_value, int from_script);
@@ -316,7 +325,15 @@ struct layout {
     int nanchors, anchorcap;
     int width, height;          /* the document's extent */
     uint32_t canvas;            /* the background behind everything */
+    /* the selected text: items sel_from..sel_to, from character sel_c0 of the first to sel_c1 of the last */
+    int sel_on, sel_from, sel_to, sel_c0, sel_c1;
 };
+
+/* Select the text between two points (page coordinates), in reading order. */
+void layout_select(struct layout *lo, int ax, int ay, int fx, int fy);
+void layout_select_all(struct layout *lo);
+/* The selected text, with line breaks; returns its length (0 if nothing is selected). */
+int layout_selection_text(const struct layout *lo, char *out, int size);
 
 /* Lay out the document for a viewport `vw` pixels wide. Output goes in lo,
  * allocated from a (free it to throw the layout away). */

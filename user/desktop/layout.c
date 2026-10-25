@@ -91,6 +91,8 @@ struct lctx {
     int npend;
     int force_container;        /* the next block box places its absolute descendants itself */
     int abs_bw1;                /* an absolute box's stretched border-box width, plus 1; 0: none */
+    struct zrange { int from, to, z; } zr[64];   /* items of positioned boxes with a z-index */
+    int nzr;
 };
 
 static unsigned layout_gen;
@@ -1534,6 +1536,8 @@ static void layout_abs(struct lctx *c, const struct pend *p, int cbx, int cby, i
     if (!ta && !ba && st->height.unit != U_AUTO && st->margin[0].unit == U_AUTO && st->margin[2].unit == U_AUTO)
         y = cby + t + (cbh - t - bo - oh) / 2;
     shift(c, m0, mark_now(c), x, y);
+    if (st->z_set && st->z_index != 0 && c->nzr < (int)(sizeof(c->zr) / sizeof(c->zr[0])))
+        c->zr[c->nzr++] = (struct zrange){ m0.items, c->lo->nitems, st->z_index };
 }
 
 /*
@@ -1568,6 +1572,15 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
         c->float_base = c->nfloats;
     anchors_of(c, n, y);
 
+    /* A box-shadow is a few translucent rectangles behind the background, sized below. */
+    int sh_first = c->lo->nitems, sh_steps = 0;
+    if (ALPHA(st->sh_color) && !st->hidden && !bg_slot) {
+        sh_steps = st->sh_blur <= 0 ? 1 : st->sh_blur < 10 ? 3 : 5;
+        for (int k = 0; k < sh_steps; k++)
+            fill(c, 0, 0, 1, 1, OPAQUE(0), 0);
+        if (c->lo->nitems - sh_first != sh_steps)
+            sh_steps = 0;
+    }
     int slot = c->lo->nitems;
     fill(c, 0, 0, 1, 1, OPAQUE(0), 0);          /* the background, sized below */
     if (c->lo->nitems == slot)
@@ -1622,6 +1635,24 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
         ch = st->min_height.v;
     int bh = b.bt + b.pt + ch + b.pb + b.bb;
 
+    for (int k = 0; k < sh_steps; k++) {        /* the outermost layer first, fading outwards */
+        struct ditem *d = &c->lo->items[sh_first + k];
+        int e = st->sh_spread + (sh_steps > 1 ? st->sh_blur - st->sh_blur * k / sh_steps : 0);
+        int lim = ((bw + 2 * e) < (bh + 2 * e) ? (bw + 2 * e) : (bh + 2 * e)) / 2;
+        d->x = bx + st->sh_x - e, d->y = y + st->sh_y - e, d->w = bw + 2 * e, d->h = bh + 2 * e;
+        if (d->w <= 0 || d->h <= 0) {
+            d->w = d->h = 0;
+            continue;
+        }
+        uint32_t a = ALPHA(st->sh_color) / (uint32_t)sh_steps;
+        d->color = (a ? a : 1) << 24 | (st->sh_color & 0xFFFFFF);
+        d->node = NULL;
+        for (int q = 0; q < 4; q++) {
+            int r = len_px(st->radius[q], bw < bh ? bw : bh) + e;
+            d->rad[q] = r < 0 ? 0 : r > lim ? lim : r;
+        }
+    }
+
     if (bg_slot) {
         *bg_slot = slot;
         if (slot >= 0) {
@@ -1644,6 +1675,11 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
                 layout_abs(c, &p, bx + b.bl, y + b.bt, bw - b.bl - b.br, bh - b.bt - b.bb);
         }
         c->npend = pfirst;
+    }
+    if (!bg_slot && (st->tx.v || st->ty.v)) {           /* transform: translate() */
+        int dx = len_px(st->tx, bw), dy = len_px(st->ty, bh);
+        if (dx || dy)
+            shift(c, m_start, mark_now(c), dx, dy);
     }
     if (st->position == POS_RELATIVE && !bg_slot) {
         int dx = st->left.unit != U_AUTO ? len_px(st->left, cw) : st->right.unit != U_AUTO ? -len_px(st->right, cw) : 0;
@@ -3163,6 +3199,52 @@ static int layout_table(struct lctx *c, struct node *n, int x, int y, int cw, in
 
 /* ---- the document ---- */
 
+/* Paint order: boxes with a negative z-index first, then the rest in document order, then positive ones. */
+static void apply_z_order(struct lctx *c)
+{
+    struct layout *lo = c->lo;
+    if (!c->nzr)
+        return;
+    struct ditem *out = arena_alloc(c->a, sizeof(struct ditem) * (size_t)(lo->nitems ? lo->nitems : 1));
+    char *taken = arena_alloc(c->a, (size_t)lo->nitems + 1);
+    int *order = arena_alloc(c->a, sizeof(int) * (size_t)c->nzr);
+    if (!out || !taken || !order)
+        return;
+    int n = 0, no = 0;
+    for (int i = 0; i < c->nzr; i++) {          /* outermost ranges only */
+        int nested = 0;
+        for (int j = 0; j < c->nzr && !nested; j++)
+            nested = j != i && c->zr[j].from <= c->zr[i].from && c->zr[i].to <= c->zr[j].to &&
+                     (c->zr[j].from < c->zr[i].from || c->zr[i].to < c->zr[j].to || j < i);
+        if (!nested && c->zr[i].to > c->zr[i].from)
+            order[no++] = i;
+    }
+    for (int i = 1; i < no; i++) {              /* by z, keeping document order among equals */
+        int t = order[i], j = i;
+        while (j > 0 && c->zr[order[j - 1]].z > c->zr[t].z) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = t;
+    }
+    for (int k = 0; k < no; k++)
+        for (int i = c->zr[order[k]].from; i < c->zr[order[k]].to; i++)
+            taken[i] = 1;
+    for (int k = 0; k < no; k++)
+        if (c->zr[order[k]].z < 0)
+            for (int i = c->zr[order[k]].from; i < c->zr[order[k]].to && n < lo->nitems; i++)
+                out[n++] = lo->items[i];
+    for (int i = 0; i < lo->nitems; i++)
+        if (!taken[i] && n < lo->nitems)
+            out[n++] = lo->items[i];
+    for (int k = 0; k < no; k++)
+        if (c->zr[order[k]].z > 0)
+            for (int i = c->zr[order[k]].from; i < c->zr[order[k]].to && n < lo->nitems; i++)
+                out[n++] = lo->items[i];
+    if (n == lo->nitems)
+        memcpy(lo->items, out, sizeof(struct ditem) * (size_t)n);
+}
+
 void layout_document(struct arena *a, struct layout *lo, struct node *root, int vw, int vh)
 {
     memset(lo, 0, sizeof(*lo));
@@ -3188,6 +3270,7 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
     int h = layout_block_box(&c, root, 0, 0, vw, -1, &mb, NULL);
     lo->height = h + (mb > 0 ? mb : 0);
     lo->width = vw;
+    apply_z_order(&c);
     for (int i = 0; i < lo->nitems; i++) {
         const struct ditem *d = &lo->items[i];
         if (d->w > 0 && d->x + d->w > lo->width && d->x < BIG)
@@ -3516,6 +3599,107 @@ static void draw_control(struct surface *s, const struct ditem *d, int x, int y,
         gfx_vline(s, inner.x + caret_x - scroll, ty, fh, C_BLACK);
 }
 
+/* ---- selecting text ---- */
+
+/* The character of a text item that x falls at, counted in bytes. */
+static int char_at(const struct ditem *d, int px)
+{
+    int prev = 0, pw = 0;
+    for (int n = 1; n <= d->len; n++) {
+        if (n < d->len && ((unsigned char)d->text[n] & 0xC0) == 0x80)
+            continue;                   /* inside a UTF-8 character */
+        int w = wfont_width(d->font, d->text, n);
+        if (d->x + w >= px)
+            return px - (d->x + pw) < d->x + w - px ? prev : n;
+        prev = n;
+        pw = w;
+    }
+    return d->len;
+}
+
+static void sel_pos(const struct layout *lo, int px, int py, int *item, int *ch)
+{
+    int last = -1;
+    for (int i = 0; i < lo->nitems; i++) {
+        const struct ditem *d = &lo->items[i];
+        if (d->kind != DK_TEXT || !d->len)
+            continue;
+        last = i;
+        if (d->y + d->h > py && (d->y > py || d->x + d->w > px)) {
+            *item = i;
+            *ch = d->y <= py && d->x < px ? char_at(d, px) : 0;
+            return;
+        }
+    }
+    *item = last;                       /* below everything: the end of the last text */
+    *ch = last >= 0 ? lo->items[last].len : 0;
+}
+
+void layout_select(struct layout *lo, int ax, int ay, int fx, int fy)
+{
+    int i1, c1, i2, c2;
+    sel_pos(lo, ax, ay, &i1, &c1);
+    sel_pos(lo, fx, fy, &i2, &c2);
+    lo->sel_on = 0;
+    if (i1 < 0 || i2 < 0)
+        return;
+    if (i1 > i2 || (i1 == i2 && c1 > c2)) {
+        int t = i1;
+        i1 = i2, i2 = t;
+        t = c1, c1 = c2, c2 = t;
+    }
+    if (i1 == i2 && c1 == c2)
+        return;
+    lo->sel_on = 1;
+    lo->sel_from = i1, lo->sel_to = i2, lo->sel_c0 = c1, lo->sel_c1 = c2;
+}
+
+void layout_select_all(struct layout *lo)
+{
+    int first = -1, last = -1;
+    for (int i = 0; i < lo->nitems; i++)
+        if (lo->items[i].kind == DK_TEXT && lo->items[i].len) {
+            if (first < 0)
+                first = i;
+            last = i;
+        }
+    lo->sel_on = first >= 0;
+    lo->sel_from = first, lo->sel_to = last, lo->sel_c0 = 0;
+    lo->sel_c1 = last >= 0 ? lo->items[last].len : 0;
+}
+
+int layout_selection_text(const struct layout *lo, char *out, int size)
+{
+    if (!lo->sel_on || size < 2)
+        return 0;
+    int o = 0;
+    const struct ditem *prev = NULL;
+    for (int i = lo->sel_from; i <= lo->sel_to && i < lo->nitems; i++) {
+        const struct ditem *d = &lo->items[i];
+        if (d->kind != DK_TEXT || !d->len)
+            continue;
+        int a = i == lo->sel_from ? lo->sel_c0 : 0, b = i == lo->sel_to ? lo->sel_c1 : d->len;
+        if (b > d->len)
+            b = d->len;
+        if (a >= b)
+            continue;
+        if (prev && o < size - 1) {
+            int dy = d->y - prev->y;
+            if (dy < 0)
+                dy = -dy;
+            if (dy > prev->h / 2)
+                out[o++] = '\n';
+            else if (d->x > prev->x + prev->w && out[o - 1] != ' ')
+                out[o++] = ' ';
+        }
+        for (int k = a; k < b && o < size - 1; k++)
+            out[o++] = d->text[k];
+        prev = d;
+    }
+    out[o] = 0;
+    return o;
+}
+
 void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, int sx, int sy,
                     const struct node *focus, int caret_on)
 {
@@ -3540,6 +3724,27 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
             uint32_t col = ALPHA(d->color) == 255 ? d->color : blend(0xFFFFFF, d->color);
             if (d->text[0] != ' ' || d->len != 1)
                 wfont_draw(s, d->font, x, y, d->text, d->len, col);
+            if (lo->sel_on && i >= lo->sel_from && i <= lo->sel_to && d->len) {
+                int a = i == lo->sel_from ? lo->sel_c0 : 0, e = i == lo->sel_to ? lo->sel_c1 : d->len;
+                if (e > d->len)
+                    e = d->len;
+                if (a < e) {
+                    int xa = wfont_width(d->font, d->text, a), xb = wfont_width(d->font, d->text, e);
+                    gfx_fill(s, x + xa, y, xb - xa, d->h, 0x000080);
+                    wfont_draw(s, d->font, x + xa, y, d->text + a, e - a, 0xFFFFFF);
+                    if (i > lo->sel_from) {         /* the space between words on this line */
+                        for (int j = i - 1; j >= lo->sel_from; j--) {
+                            const struct ditem *p = &lo->items[j];
+                            if (p->kind != DK_TEXT || !p->len)
+                                continue;
+                            int dy = p->y - d->y;
+                            if ((dy < 0 ? -dy : dy) <= d->h / 2 && p->x + p->w < d->x)
+                                gfx_fill(s, p->x + p->w - sx + ox, y, d->x - p->x - p->w, d->h, 0x000080);
+                            break;
+                        }
+                    }
+                }
+            }
             int size = wfont_size(d->font), thick = size >= 24 ? 2 : 1;
             int asc = wfont_ascent(d->font);
             if (d->deco & DECO_UNDERLINE)

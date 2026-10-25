@@ -84,6 +84,7 @@ struct window {
     struct rect r;              /* outer frame, screen coordinates */
     char title[64];
     enum icon_id icon;
+    struct image *icon_img;     /* a 16x16 picture drawn instead of icon (the browser's favicon) */
     int flags;
     int minimized;
     struct surface content;     /* the client area */

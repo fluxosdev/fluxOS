@@ -154,7 +154,12 @@ keeps running), or from `file://`.
   borders, backgrounds, images and form controls. Floats (`float`, `clear`,
   clearfixes, text wrapping, new formatting contexts beside floats) and
   positioning (`relative`, `absolute` and `fixed` with `top`/`right`/`bottom`/
-  `left`, `inset`) work.
+  `left`, `inset`) work, with `z-index` for absolute and fixed boxes, `box-shadow`
+  (the first outer shadow, drawn as fading layers) and `transform: translate()`.
+- **Interaction**: `:hover`, `:focus` and `:focus-within` restyle the page as the
+  pointer and focus move. Drag to select text, Ctrl+A to select all, Ctrl+C to
+  copy to the shared clipboard. The window and taskbar show the page's favicon
+  (`<link rel=icon>` or `/favicon.ico`; PNG, ICO, GIF or SVG).
 - **Cookies**: a jar shared by every window (kept in memory only) fills from
   `Set-Cookie` headers and `document.cookie` (domain, path, `Secure`,
   `HttpOnly`, `Max-Age`, `Expires`) and goes out on every request, so
@@ -460,8 +465,9 @@ be stopped (no ^Z). SSE instructions raise `SIGILL`.
   `Symbol`s are strings, `WebSocket` and
   `customElements` are stand-ins that do nothing, typed arrays are plain arrays, and `eval` runs
   in the global scope, so many modern web apps won't run. Layout is an
-  approximation: `fixed` boxes scroll with the page, there is no `z-index`, `sticky` acts as
-  `relative`, transforms are ignored, flex rows are lines of inline-blocks, grids lack named lines and
+  approximation: `fixed` boxes scroll with the page, `z-index` only orders absolute and fixed
+  boxes, `sticky` acts as `relative`, transforms other than `translate` and all
+  `transition`s and animations are ignored, flex rows are lines of inline-blocks, grids lack named lines and
   column flow, and `calc()` takes its first length. GIF animations show their
   first frame; SVG ignores clip paths, masks, filters and patterns. There are
   no font downloads, page cache or text selection, cookies last only until the

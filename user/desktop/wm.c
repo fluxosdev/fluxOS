@@ -906,7 +906,10 @@ static void draw_window(struct window *w)
     struct rect cap = caption_rect(w);
     int active = w == focused;
     gfx_fill(&screen, cap.x, cap.y, cap.w, cap.h, active ? C_NAVY : C_SHADOW);
-    draw_icon(&screen, cap.x + 2, cap.y + 1, w->icon, 16);
+    if (w->icon_img)
+        gfx_image(&screen, cap.x + 2, cap.y + 1, w->icon_img);
+    else
+        draw_icon(&screen, cap.x + 2, cap.y + 1, w->icon, 16);
 
     struct rect br[3];
     int kinds[3];
@@ -952,7 +955,10 @@ static void draw_taskbar(void)
         } else {
             gfx_bevel(&screen, b, BEVEL_RAISED);
         }
-        draw_icon(&screen, b.x + 4 + active, b.y + 3 + active, w->icon, 16);
+        if (w->icon_img)
+            gfx_image(&screen, b.x + 4 + active, b.y + 3 + active, w->icon_img);
+        else
+            draw_icon(&screen, b.x + 4 + active, b.y + 3 + active, w->icon, 16);
         char label[64];
         const struct pfont *f = active ? &font_sans_bold : &font_sans;
         gfx_ellipsize(f, w->title, b.w - 28, label, sizeof(label));
@@ -1197,6 +1203,7 @@ void wm_destroy(struct window *w)
     if (w->ops && w->ops->destroy)
         w->ops->destroy(w);
     surface_free(&w->content);
+    image_free(w->icon_img);
     free(w);
 }
 

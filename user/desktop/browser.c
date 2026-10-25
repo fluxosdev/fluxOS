@@ -61,13 +61,15 @@
 
 /* PS/2 scancodes of the letters used for shortcuts */
 #define SC_L 0x26
+#define SC_C 0x2E
+#define SC_A 0x1E
 #define SC_R 0x13
 #define SC_H 0x23
 #define SC_J 0x24
 #define KEY_BACKSPACE 0x0E
 #define KEY_F6 0x40
 
-enum { F_PAGE, F_CSS, F_IMG, F_JS, F_XHR };
+enum { F_PAGE, F_CSS, F_IMG, F_JS, F_XHR, F_ICON };
 enum { NAV_NEW, NAV_REPLACE, NAV_HISTORY };
 enum { B_BACK, B_FORWARD, B_STOP, B_REFRESH, B_HOME, B_HISTORY, B_DOWNLOADS, B_GO, NBUTTONS };
 enum hold { H_NONE, H_BUTTON, H_VBAR, H_HBAR, H_PAGE };
@@ -155,6 +157,8 @@ struct browser {
     enum hold hold;
     int button_pressed, button_down;
     struct node *press_link, *press_ctrl;
+    int sel_start, sel_active;          /* a press that may drag out a selection; one is shown */
+    int sel_ax, sel_ay, sel_fx, sel_fy; /* its ends, in page coordinates */
     enum sbar_part sbar_pressed;
     int grab;
 
@@ -988,6 +992,13 @@ static void free_page(struct browser *b)
             n->img = NULL;
         }
     }
+    css_hover_node = css_focus_node = NULL;
+    b->sel_active = b->sel_start = 0;
+    if (b->win && b->win->icon_img) {   /* the old page's icon */
+        image_free(b->win->icon_img);
+        b->win->icon_img = NULL;
+        wm_damage(b->win->r);
+    }
     arena_free(&b->larena);
     arena_free(&b->sarena);
     arena_free(&b->arena);
@@ -1024,6 +1035,8 @@ static void relayout(struct browser *b)
     }
     arena_free(&b->larena);
     layout_document(&b->larena, &b->lo, b->root, v.w, v.h);
+    if (b->sel_active)
+        layout_select(&b->lo, b->sel_ax, b->sel_ay, b->sel_fx, b->sel_fy);
     b->laid_out_w = v.w;
     b->need_layout = 0;
     if (is_frame(b) && frame_scrolls(b) && b->lo.height > b->frame_h)
@@ -1484,6 +1497,7 @@ static void load_document(struct browser *b, const char *text, int len, const ch
 
     /* <base>, <title>, <meta refresh>, style sheets and pictures. */
     char title[256] = "";
+    char icon_href[URL_MAX] = "";
     b->imgs = arena_alloc(&b->arena, sizeof(struct imgref) * MAX_RES);
     for (struct node *n = b->root; n; n = node_next(n, b->root)) {
         if (n->type != N_ELEMENT || in_noscript(n))
@@ -1528,6 +1542,9 @@ static void load_document(struct browser *b, const char *text, int len, const ch
             if (n->first && n->first->type == N_TEXT && (!media || !strcasestr(media, "print")))
                 b->sheets[b->nsheets++] = css_parse(&b->arena, n->first->text, n->first->len,
                                                     view_rect(b).w);
+        } else if (n->tag == T_LINK && !icon_href[0] && (v = node_attr(n, "rel")) && strcasestr(v, "icon") &&
+                   !strcasestr(v, "stylesheet") && (v = node_attr(n, "href")) && *v) {
+            snprintf(icon_href, sizeof(icon_href), "%s", v);
         } else if (n->tag == T_LINK && (v = node_attr(n, "rel")) && strcasestr(v, "stylesheet") &&
                    !strcasestr(v, "alternate") && (v = node_attr(n, "href")) && b->nsheets < MAX_SHEETS) {
             const char *media = node_attr(n, "media");
@@ -1554,6 +1571,12 @@ static void load_document(struct browser *b, const char *text, int len, const ch
             else
                 queue_resource(b, F_IMG, abs, 0, 0);
         }
+    }
+    if (b->win && (url_is_http(b->url) || url_is_https(b->url))) {      /* the window's icon */
+        char abs[URL_MAX];
+        url_resolve(b->base, icon_href[0] ? icon_href : "/favicon.ico", abs, sizeof(abs));
+        url_strip_fragment(abs);
+        queue_resource(b, F_ICON, abs, 0, 0);
     }
     b->need_style = 1;
     relayout(b);
@@ -1630,6 +1653,50 @@ static void wget_error(struct fetch *f, char *out, int size)
         snprintf(out, (size_t)size, "the connection failed");
     if (*out >= 'a' && *out <= 'z')
         *out = (char)(*out - 'a' + 'A');
+}
+
+/* The page's icon, shrunk to 16x16 (averaging the pixels that fall in each), for the window. */
+static void set_favicon(struct browser *b, const char *data, int len)
+{
+    struct image *src = len > 8 ? image_decode((const uint8_t *)data, (uint32_t)len) : NULL;
+    if (!src || !b->win || src->w <= 0 || src->h <= 0) {
+        image_free(src);
+        return;
+    }
+    struct image *icon = malloc(sizeof(*icon));
+    uint32_t *px = icon ? calloc(16 * 16, sizeof(uint32_t)) : NULL;
+    if (!px) {
+        free(icon);
+        image_free(src);
+        return;
+    }
+    icon->w = icon->h = 16;
+    icon->px = px;
+    for (int y = 0; y < 16; y++)
+        for (int x = 0; x < 16; x++) {
+            int x0 = x * src->w / 16, x1 = (x + 1) * src->w / 16, y0 = y * src->h / 16, y1 = (y + 1) * src->h / 16;
+            if (x1 <= x0)
+                x1 = x0 + 1;
+            if (y1 <= y0)
+                y1 = y0 + 1;
+            unsigned long a = 0, r = 0, g = 0, bl = 0, n = 0;
+            for (int j = y0; j < y1 && j < src->h; j++)
+                for (int i = x0; i < x1 && i < src->w; i++) {
+                    uint32_t p = src->px[j * src->w + i], pa = p >> 24;
+                    a += pa;
+                    r += (p >> 16 & 255) * pa;
+                    g += (p >> 8 & 255) * pa;
+                    bl += (p & 255) * pa;
+                    n++;
+                }
+            if (!n || !a)
+                continue;
+            px[y * 16 + x] = (uint32_t)(a / n) << 24 | (uint32_t)(r / a) << 16 | (uint32_t)(g / a) << 8 | (uint32_t)(bl / a);
+        }
+    image_free(src);
+    image_free(b->win->icon_img);
+    b->win->icon_img = icon;
+    wm_damage(b->win->r);
 }
 
 static void image_done(struct browser *b, const char *url, const char *data, int len)
@@ -2102,6 +2169,9 @@ static void fetch_complete(struct browser *b)
             b->need_style = 1;
         } else if (done.kind == F_IMG) {
             image_done(b, done.url, ok && r.status < 300 ? r.body : "", ok && r.status < 300 ? r.len : 0);
+        } else if (done.kind == F_ICON) {
+            if (ok && r.status < 300)
+                set_favicon(b, r.body, r.len);
         }
     }
     free(done.buf);
@@ -3028,6 +3098,21 @@ static void br_key(struct window *w, const struct input_event *ev)
         paint(t);
         return;
     }
+    if (ctrl && ev->code == SC_C && !t->addr_focus && !(b->focus && is_text_field(b->focus))) {
+        static char text[8192];
+        if (layout_selection_text(&b->lo, text, sizeof(text)))
+            clipboard_set(text);
+        return;
+    }
+    if (ctrl && ev->code == SC_A && !t->addr_focus && !(b->focus && is_text_field(b->focus)) && b->root) {
+        layout_select_all(&b->lo);
+        b->sel_active = b->lo.sel_on;
+        b->sel_ax = b->sel_ay = 0;
+        b->sel_fx = b->lo.width;
+        b->sel_fy = b->lo.height;
+        paint(b);
+        return;
+    }
     if (ctrl && ev->code == SC_H) {
         navigate(t, "about:history", NULL, NAV_NEW);
         return;
@@ -3113,15 +3198,44 @@ static void scroll_step(struct browser *b, const struct sbar *sb, enum sbar_part
         scroll_by(b, step, 0);
 }
 
+/* Restyle when the element under the pointer or the focused one changed and some rule cares. */
+static void sync_dynamic(struct browser *b, const struct node *hov, int hover_too)
+{
+    if (!css_dynamic_rules || !b->root)
+        return;
+    int changed = 0;
+    if (hover_too && css_hover_node != hov) {
+        css_hover_node = hov;
+        changed = 1;
+    }
+    if (css_focus_node != b->focus) {
+        css_focus_node = b->focus;
+        changed = 1;
+    }
+    static unsigned last;
+    if (changed && now_ms() - last >= 50) {
+        last = now_ms();
+        b->need_style = 1;
+        relayout(b);
+        paint(b);
+    } else if (changed) {
+        css_hover_node = NULL;          /* too soon: look again on the next movement */
+        css_focus_node = NULL;
+    }
+}
+
 static void update_hover(struct browser *b, int x, int y)
 {
     struct rect v = view_rect(b);
     struct node *link = NULL;
+    struct node *under = NULL;
     if (b->root && rect_contains(v, x, y)) {
         const struct hotspot *h = layout_hit(b->lo.links, b->lo.nlinks, x - v.x + b->scroll_x,
                                              y - v.y + b->scroll_y);
         link = h ? h->node : NULL;
+        under = element_at(b, x - v.x + b->scroll_x, y - v.y + b->scroll_y);
     }
+    sync_dynamic(b, under, 1);
     if (link != b->hover) {
         b->hover = link;
         paint(b);
@@ -3354,6 +3468,14 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             b->press_ctrl = h ? h->node : NULL;
             h = layout_hit(b->lo.links, b->lo.nlinks, px, py);
             b->press_link = h && !b->press_ctrl ? h->node : NULL;
+            b->sel_start = !b->press_ctrl && !b->press_link;
+            b->sel_ax = b->sel_fx = px;
+            b->sel_ay = b->sel_fy = py;
+            if (b->sel_active) {            /* a new press ends the old selection */
+                b->sel_active = 0;
+                b->lo.sel_on = 0;
+                paint(b);
+            }
             if (!b->press_ctrl && b->focus) {
                 b->focus = NULL;
                 paint(b);
@@ -3378,6 +3500,9 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
         } else if (hold == H_VBAR || hold == H_HBAR) {
             paint(b);
         } else if (hold == H_PAGE) {
+            b->sel_start = 0;
+            if (b->sel_active)
+                return;                 /* it was a drag: not a click */
             if (page_click(b, px, py))
                 return;
             const struct hotspot *h = layout_hit(b->lo.controls, b->lo.ncontrols, px, py);
@@ -3410,6 +3535,20 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
         else
             b->scroll_x = sbar_drag(&sb, x, b->grab);
         paint(b);
+    } else if (b->hold == H_PAGE && b->sel_start && left) {
+        int dx = px - b->sel_ax, dy = py - b->sel_ay;
+        if (!b->sel_active && (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy) > 4)
+            b->sel_active = 1;
+        if (b->sel_active) {
+            b->sel_fx = px;
+            b->sel_fy = py;
+            layout_select(&b->lo, b->sel_ax, b->sel_ay, px, py);
+            if (y < v.y)
+                scroll_by(b, 0, -LINE_STEP);        /* dragging past an edge scrolls */
+            else if (y >= v.y + v.h)
+                scroll_by(b, 0, LINE_STEP);
+            paint(b);
+        }
     } else if (b->hold == H_NONE) {
         update_hover(b, x, y);
     }

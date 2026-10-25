@@ -19,6 +19,16 @@ p.expect { margin: 0 0 8px; font-size: 13px; color: #555; }
 .rel .br { position: absolute; bottom: 4px; right: 4px; background: #2471a3; color: white; padding: 2px 6px; }
 .rel .center { position: absolute; top: 0; bottom: 0; left: 0; right: 0; margin: auto; width: 120px; height: 30px; background: #2d7d46; color: white; text-align: center; }
 .shift { position: relative; top: 6px; left: 20px; background: #f1c40f; padding: 2px 6px; display: inline-block; }
+.z { position: relative; height: 70px; }
+.z div { position: absolute; width: 90px; height: 50px; color: white; padding: 4px; box-sizing: border-box; }
+.z .a { left: 0; top: 0; background: #c0392b; z-index: 2; }
+.z .b { left: 40px; top: 20px; background: #2471a3; z-index: 1; }
+.z .c { left: 80px; top: 10px; background: #2d7d46; }
+.shadow { width: 200px; padding: 10px; margin: 8px; background: white; border-radius: 8px; box-shadow: 3px 4px 10px rgba(0,0,0,0.6); }
+.modal { position: relative; height: 80px; background: #f4effa; border: 1px solid #c9b8dd; }
+.modal div { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #3f175f; color: white; padding: 6px 12px; }
+.hov { display: inline-block; padding: 4px 10px; background: #ddd; margin-right: 6px; }
+.hov:hover { background: #3f175f; color: white; }
 .cols { overflow: hidden; }
 .cols > div { float: left; width: 31%; margin-right: 2%; background: #f4effa; border: 1px solid #c9b8dd; padding: 4px; box-sizing: border-box; }
 </style>
@@ -49,6 +59,25 @@ Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor i
 <h2>Relative positioning</h2>
 <p class="expect">The yellow label sits 6px lower and 20px to the right of where it would be.</p>
 <p>Text before <span class="shift">shifted</span> text after.</p>
+
+<h2>z-index</h2>
+<p class="expect">Red on top of blue on top of green, even though green comes last in the source.</p>
+<div class="z"><div class="c">3 (auto)</div><div class="b">2 (z=1)</div><div class="a">1 (z=2)</div></div>
+
+<h2>box-shadow</h2>
+<p class="expect">A white card with a soft dark shadow offset down and to the right.</p>
+<div class="shadow">A card with a shadow.</div>
+
+<h2>transform: translate</h2>
+<p class="expect">A purple label centred in the lilac box.</p>
+<div class="modal"><div>centred</div></div>
+
+<h2>:hover</h2>
+<p class="expect">Move the pointer over a grey button: it turns purple.</p>
+<p><span class="hov">one</span><span class="hov">two</span><span class="hov">three</span></p>
+
+<h2>Text selection</h2>
+<p class="expect">Drag across this paragraph to select it, then press Ctrl+C and paste into the text editor. Ctrl+A selects the whole page.</p>
 
 <p><a href="home.html">Back to the home page</a></p>
 </body>
