@@ -17,6 +17,9 @@ struct fs_ops {
     const char *name;
     /* Probe and mount bd; fill fs->priv and fs->root. */
     int (*mount)(struct fs *fs);
+    /* Stage pending filesystem metadata before flushing the block device. */
+    int (*sync)(struct fs *fs);
+    /* Release memory only; sync and the device flush run before teardown. */
     void (*unmount)(struct fs *fs);
     int (*load_dir)(struct vnode *dir);
     int (*read)(struct vnode *vn, void *buf, uint32_t off, uint32_t n);
@@ -38,6 +41,7 @@ struct fs {
     void *priv;
     int readonly;
     int case_insensitive;
+    uint32_t refs;             /* external vnode references, including unlinked files */
     struct fs *next;
 };
 

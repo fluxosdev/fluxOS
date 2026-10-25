@@ -235,3 +235,40 @@ clean:
 	rm -rf $(BUILD) $(ISO)
 
 -include $(shell find $(BUILD) -name '*.d' 2>/dev/null)
+
+# Run the browser's actual HTML/DOM/JS code on the host, without booting QEMU.
+HOSTCC ?= cc
+BROWSER_TEST_SRCS := tests/browser-dom.c $(addprefix user/desktop/,js.c jslib.c jslib2.c jsre.c jsgc.c jsdom.c html.c webutil.c)
+.PHONY: test-browser
+test-browser: $(BUILD)/tests/browser-dom
+	$< rootfs/usr/share/www/classlist-tests.js
+
+$(BUILD)/tests/browser-dom: $(BROWSER_TEST_SRCS) $(wildcard user/desktop/*.h) user/include/flux.h include/flux/abi.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -Wall -Wextra -Wno-unused-parameter \
+		-Iuser/desktop -Iinclude -idirafter user/include $(BROWSER_TEST_SRCS) \
+		-Wl,--defsym=__gc_data_start=__data_start,--defsym=__gc_data_end=_end -lm -o $@
+
+# Host regression tests use production kernel code with mocked hardware/I/O.
+KERNEL_TEST_NAMES := heap pipe socket storage syscall
+KERNEL_TEST_BINS := $(addprefix $(BUILD)/tests/kernel-,$(KERNEL_TEST_NAMES))
+.PHONY: test-kernel
+test-kernel: $(KERNEL_TEST_BINS)
+	@set -e; for test in $(KERNEL_TEST_BINS); do $$test; done
+
+$(BUILD)/tests/kernel-%: tests/kernel-%.c tests/kernel-test.h $(wildcard kernel/*.c kernel/*.h include/flux/*.h)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter \
+		-Wno-int-to-pointer-cast -Wno-pointer-to-int-cast -ffunction-sections -fdata-sections \
+		-Iinclude -Ikernel $< -Wl,--gc-sections -o $@
+
+.PHONY: test-kernel-qemu
+test-kernel-qemu: $(TEXT_KERNEL) $(INITRD) $(BUILD)/tests/kernel-guest
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(INITRD) $(BUILD)/tests/kernel-guest
+
+$(BUILD)/tests/kernel-guest.o: tests/kernel-guest.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(BUILD)/tests/kernel-guest: $(BUILD)/tests/kernel-guest.o $(CRT0) $(LIBC) user/user.ld
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)

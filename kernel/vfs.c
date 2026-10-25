@@ -118,16 +118,30 @@ static struct vnode *cross(struct vnode *vn)
 
 void vfs_ref(struct vnode *vn)
 {
-    if (vn)
+    if (vn) {
         vn->refs++;
+        if (vn->fs)
+            vn->fs->refs++;
+    }
 }
 
 void vfs_unref(struct vnode *vn)
 {
     if (!vn)
         return;
+    struct fs *fs = vn->fs;
+    /* Releasing an unlinked disk file may free its clusters and sleep for
+     * I/O. Hold the mount reference until release finishes, and serialize
+     * that I/O even when called from close(), dup2() or process exit. */
+    int lock = fs && vn->refs == 1 && !vn->linked && current && lock_owner != current->pid;
+    if (lock)
+        vfs_lock();
     if (--vn->refs <= 0 && !vn->linked && vn != vfs_root)
         vnode_free(vn);
+    if (fs)
+        fs->refs--;
+    if (lock)
+        vfs_unlock();
 }
 
 static struct vnode *find_child(struct vnode *dir, const char *name)
@@ -262,6 +276,8 @@ int vfs_create(struct vnode *dir, const char *name, int type, struct vnode **out
 {
     if (dir->type != VN_DIR)
         return -ENOTDIR;
+    if (!dir->linked)
+        return -ENOENT;
     if (find_child(dir, name))
         return -EEXIST;
     if (dir->fs) {
@@ -391,6 +407,8 @@ int vfs_rename(const char *from, const char *to, struct vnode *cwd)
         return r;
     if (src->fs != dir->fs)
         return -EXDEV;
+    if (!dir->linked)
+        return -ENOENT;
     if (src->fs && src->fs->readonly)
         return -EROFS;
 
@@ -748,8 +766,18 @@ static int umount_fs(struct fs *fs, int media_gone)
 {
     if (!fs->covered)
         return -EBUSY;                  /* the root filesystem */
-    if (subtree_busy(fs->root))
+    if (fs->refs || subtree_busy(fs->root))
         return -EBUSY;
+
+    /* A failed flush must leave the entire mount intact for a retry. */
+    if (!media_gone) {
+        int r = fs->ops->sync ? fs->ops->sync(fs) : 0;
+        if (r < 0)
+            return r;
+        r = blk_sync(fs->bd);
+        if (r < 0)
+            return r;
+    }
 
     for (struct fs **pp = &mounts; *pp; pp = &(*pp)->next) {
         if (*pp == fs) {
@@ -766,8 +794,6 @@ static int umount_fs(struct fs *fs, int media_gone)
     if (media_gone) {
         blk_discard(bd);
     } else {
-        /* Everything written must be on the disk before it can be removed. */
-        blk_sync(bd);
         blk_invalidate(bd);
     }
     bd->fs = NULL;

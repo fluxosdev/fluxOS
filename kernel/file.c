@@ -85,6 +85,8 @@ void file_close(struct file *f)
 
 static int pipe_read(struct pipe *p, uint8_t *buf, uint32_t n)
 {
+    if (!n)
+        return 0;
     while (p->wpos == p->rpos) {
         if (p->writers <= 0)
             return 0;

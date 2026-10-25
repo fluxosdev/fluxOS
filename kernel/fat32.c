@@ -60,6 +60,7 @@ struct fat_node {
     uint32_t ent_off;           /* byte offset of the short entry in the parent */
     uint32_t lfn_count;         /* long-name slots preceding it */
     uint8_t attr;
+    uint8_t unlinked;           /* directory slot is gone; chain lives until last close */
     uint32_t seek_idx, seek_clus;   /* last cluster looked up, for sequential I/O */
 };
 
@@ -233,19 +234,23 @@ static uint32_t count_free(struct fat_fs *f)
     return free;
 }
 
-static void flush_fsinfo(struct fat_fs *f)
+static int flush_fsinfo(struct fat_fs *f)
 {
     if (!f->fsinfo_dirty || f->fsinfo == 0 || f->fsinfo >= f->reserved)
-        return;
-    f->fsinfo_dirty = 0;
+        return 0;
     uint8_t sec[512];
     const uint8_t *s = bcache_read(f->bd, f->fsinfo);
-    if (!s || rd32(s) != 0x41615252 || rd32(s + 484) != 0x61417272)
-        return;
+    if (!s)
+        return -EIO;
+    if (rd32(s) != 0x41615252 || rd32(s + 484) != 0x61417272)
+        return 0;
     memcpy(sec, s, 512);
     wr32(sec + 488, f->free_count);
     wr32(sec + 492, f->next_free);
-    bcache_write(f->bd, f->fsinfo, sec);
+    int r = bcache_write(f->bd, f->fsinfo, sec);
+    if (r == 0)
+        f->fsinfo_dirty = 0;
+    return r;
 }
 
 static int zero_cluster(struct fat_fs *f, uint32_t c)
@@ -799,7 +804,7 @@ static int delete_entry(struct fat_fs *f, struct fat_node *n)
 static int update_entry(struct fat_fs *f, struct vnode *vn)
 {
     struct fat_node *n = vn->fs_data;
-    if (!n->dir_first)
+    if (!n->dir_first || n->unlinked)
         return 0;
     uint8_t e[32];
     if (slot_read(f, n->dir_first, n->ent_off, e) < 0)
@@ -923,9 +928,9 @@ static int fat_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n
     if (r == 0)
         r = write_range(f, vn, buf, off, n);
     vn->mtime = time_now();
-    update_entry(f, vn);
-    flush_fsinfo(f);
-    return r;
+    int meta = update_entry(f, vn);
+    int info = flush_fsinfo(f);
+    return r < 0 ? r : meta < 0 ? meta : info < 0 ? info : r;
 }
 
 static int fat_truncate(struct vnode *vn, uint32_t size)
@@ -955,9 +960,9 @@ static int fat_truncate(struct vnode *vn, uint32_t size)
         vn->size = size;
     }
     vn->mtime = time_now();
-    update_entry(f, vn);
-    flush_fsinfo(f);
-    return r;
+    int meta = update_entry(f, vn);
+    int info = flush_fsinfo(f);
+    return r < 0 ? r : meta < 0 ? meta : info < 0 ? info : r;
 }
 
 /* ---- namespace operations ---- */
@@ -1026,9 +1031,7 @@ static int fat_remove(struct vnode *vn)
     int r = delete_entry(f, n);
     if (r < 0)
         return r;
-    free_chain(f, n->first);
-    n->first = 0;
-    flush_fsinfo(f);
+    n->unlinked = 1;
     return 0;
 }
 
@@ -1064,6 +1067,12 @@ static int fat_rename(struct vnode *vn, struct vnode *newdir, const char *newnam
 
 static void fat_release(struct vnode *vn)
 {
+    struct fat_node *n = vn->fs_data;
+    if (n && n->unlinked) {
+        struct fat_fs *f = vn->fs->priv;
+        free_chain(f, n->first);
+        flush_fsinfo(f);
+    }
     kfree(vn->fs_data);
     vn->fs_data = NULL;
 }
@@ -1184,10 +1193,14 @@ static int fat_mount(struct fs *fs)
     return 0;
 }
 
+static int fat_sync(struct fs *fs)
+{
+    return flush_fsinfo(fs->priv);
+}
+
 static void fat_unmount(struct fs *fs)
 {
     struct fat_fs *f = fs->priv;
-    flush_fsinfo(f);
     kfree(f->clbuf);
     kfree(f);
 }
@@ -1195,6 +1208,7 @@ static void fat_unmount(struct fs *fs)
 const struct fs_ops fat32_ops = {
     .name = "fat32",
     .mount = fat_mount,
+    .sync = fat_sync,
     .unmount = fat_unmount,
     .load_dir = fat_load_dir,
     .read = fat_read,

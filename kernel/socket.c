@@ -376,7 +376,7 @@ int sock_recvfrom(struct socket *s, void *buf, uint32_t n, int flags, struct soc
         s->rq = d->next;
         if (!s->rq)
             s->rq_tail = NULL;
-        s->rq_bytes -= d->len;
+        s->rq_bytes -= (uint32_t)sizeof(*d) + d->len;
         kfree(d);
     }
     return (int)k;
@@ -446,7 +446,8 @@ void sock_close(struct socket *s)
 static void enqueue(struct socket *s, uint32_t addr, uint16_t port, const uint8_t *data,
                     uint32_t len)
 {
-    if (s->shut_rd || s->rq_bytes + len > UDP_RCVBUF) {
+    if (s->shut_rd || len > UDP_RCVBUF - sizeof(struct dgram) ||
+        s->rq_bytes > UDP_RCVBUF - sizeof(struct dgram) - len) {
         netif.rx_dropped++;
         return;
     }
@@ -463,7 +464,7 @@ static void enqueue(struct socket *s, uint32_t addr, uint16_t port, const uint8_
     else
         s->rq = d;
     s->rq_tail = d;
-    s->rq_bytes += len;
+    s->rq_bytes += (uint32_t)sizeof(*d) + len;
     sock_wake(s);
 }
 

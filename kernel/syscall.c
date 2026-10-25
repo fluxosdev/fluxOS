@@ -952,6 +952,8 @@ static int sys_fsync(uint32_t fd, uint32_t b, uint32_t c, uint32_t d, uint32_t e
 static int sys_ftruncate(uint32_t fd, uint32_t size, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)c; (void)d; (void)e;
+    if ((int32_t)size < 0)
+        return -EINVAL;
     struct file *f = get_file(fd);
     if (!f)
         return -EBADF;

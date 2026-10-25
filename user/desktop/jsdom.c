@@ -24,6 +24,7 @@
  */
 #include <ctype.h>
 #include <flux.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -439,18 +440,24 @@ static void set_inner_html(struct jsdom *d, struct node *n, const char *html, in
 
 /* ---- selectors ---- */
 
+/* HTML class tokens split on ASCII whitespace, excluding vertical tab. */
+static int class_space(int c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
+}
+
 static int has_class(const struct node *n, const char *cls, int len)
 {
     const char *v = node_attr(n, "class");
     if (!v)
         return 0;
     while (*v) {
-        while (*v && isspace((unsigned char)*v))
+        while (*v && class_space((unsigned char)*v))
             v++;
         const char *s = v;
-        while (*v && !isspace((unsigned char)*v))
+        while (*v && !class_space((unsigned char)*v))
             v++;
-        if (v - s == len && !strncmp(s, cls, (size_t)len))
+        if (len > 0 && v - s == len && !strncmp(s, cls, (size_t)len))
             return 1;
     }
     return 0;
@@ -1511,134 +1518,251 @@ static const struct jsclass computed_class = { "CSSStyleDeclaration", computed_g
 
 /* ---- classList and dataset ---- */
 
-static int classlist_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
+/* Walk the ordered set without changing the attribute's original spelling. */
+static const char *class_token(const char *v, const char **cursor, int *len)
 {
-    struct node *n = o->hdata;
-    const char *v = node_attr(n, "class");
-    if (!strcmp(key, "value")) {
-        *out = js_str(J, v ? v : "");
-        return 1;
-    }
-    if (!strcmp(key, "length")) {
-        int count = 0;
-        for (const char *s = v ? v : ""; *s;) {
-            while (*s == ' ')
-                s++;
-            if (*s)
-                count++;
-            while (*s && *s != ' ')
-                s++;
+    const char *s = *cursor;
+    while (*s) {
+        while (class_space((unsigned char)*s))
+            s++;
+        const char *t = s;
+        while (*s && !class_space((unsigned char)*s))
+            s++;
+        if (s == t)
+            break;
+        int duplicate = 0;
+        for (const char *p = v; p < t;) {
+            while (p < t && class_space((unsigned char)*p))
+                p++;
+            const char *q = p;
+            while (p < t && !class_space((unsigned char)*p))
+                p++;
+            if (q < t && p - q == s - t && !memcmp(q, t, (size_t)(s - t))) {
+                duplicate = 1;
+                break;
+            }
         }
-        *out = js_num(count);
-        return 1;
+        if (!duplicate) {
+            *cursor = s;
+            *len = (int)(s - t);
+            return t;
+        }
     }
-    return 0;
+    *cursor = s;
+    return NULL;
 }
 
-static const struct jsclass classlist_class = { "DOMTokenList", classlist_get, NULL };
+static int classlist_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
+{
+    const char *v = node_attr(o->hdata, "class");
+    if (!v)
+        v = "";
+    if (!strcmp(key, "value")) {
+        *out = js_str(J, v);
+        return 1;
+    }
+    int length = !strcmp(key, "length");
+    int index = 0;
+    if (!length) {
+        if (!*key || (key[0] == '0' && key[1]))
+            return 0;
+        for (const char *p = key; *p; p++) {
+            if (*p < '0' || *p > '9' || index > 214748364 ||
+                (index == 214748364 && *p > '7'))
+                return 0;
+            index = index * 10 + *p - '0';
+        }
+    }
+    int count = 0, len;
+    const char *cursor = v, *token;
+    while ((token = class_token(v, &cursor, &len))) {
+        if (!length && count == index) {
+            *out = js_strn(J, token, len);
+            return 1;
+        }
+        count++;
+    }
+    *out = length ? js_num(count) : js_undefined;
+    return 1;
+}
+
+static int classlist_set(struct js *J, struct jsobj *o, const char *key, jsval value)
+{
+    if (strcmp(key, "value"))
+        return 0;
+    set_attr(dom(J), o->hdata, "class", js_tostr(J, value)->s);
+    return 1;
+}
+
+static const struct jsclass classlist_class = { "DOMTokenList", classlist_get, classlist_set };
 
 static struct node *classlist_node(jsval self)
 {
     return self.t == JS_OBJ ? js_host_data(self.u.o, &classlist_class) : NULL;
 }
 
-/* Add (op 1), remove (0) or toggle (2) class name; returns whether it is there after. */
-static int class_op(struct jsdom *d, struct node *n, const char *name, int op)
+static int class_valid(struct js *J, struct jsstr *s)
+{
+    const char *name = NULL;
+    if (!s->len)
+        name = "SyntaxError";
+    for (int i = 0; i < s->len; i++)
+        if (class_space((unsigned char)s->s[i]))
+            name = "InvalidCharacterError";
+    if (!name)
+        return 1;
+    jsval error = js_make_error(J, "Error", "Invalid class token");
+    js_set(J, error, "name", js_str(J, name));
+    js_throw_value(J, error);
+    return 0;
+}
+
+/* Serialize a mutation once. Replacement retains the earlier token's slot. */
+static int class_update(struct jsdom *d, struct node *n, const char *name,
+                         const char *replacement, int add)
 {
     const char *v = node_attr(n, "class");
-    int len = (int)strlen(name);
-    int present = v && has_class(n, name, len);
-    if (op == 2)
-        op = !present;
-    if (op == present)
-        return present;
-    char *nv = malloc((v ? strlen(v) : 0) + (size_t)len + 2);
+    if (!v && !add)
+        return 0;
+    if (!v)
+        v = "";
+    size_t len = strlen(name);
+    char *nv = malloc(strlen(v) + len + (replacement ? strlen(replacement) : 0) + 2);
     if (!nv)
-        return present;
-    nv[0] = 0;
-    if (op) {
-        if (v && *v) {
-            strcpy(nv, v);
-            strcat(nv, " ");
-        }
-        strcat(nv, name);
-    } else {
-        for (const char *s = v; *s;) {
-            while (*s == ' ')
-                s++;
-            const char *t = s;
-            while (*s && *s != ' ')
-                s++;
-            if (s > t && !(s - t == len && !strncmp(t, name, (size_t)len))) {
-                if (*nv)
-                    strcat(nv, " ");
-                strncat(nv, t, (size_t)(s - t));
+        return 0;
+    const char *cursor = v, *token;
+    int tl, present = 0;
+    char *out = nv;
+    while ((token = class_token(v, &cursor, &tl))) {
+        int match = (size_t)tl == len && !memcmp(token, name, len);
+        if (match) {
+            present = 1;
+            if (replacement) {
+                /* If the new token was earlier, removing this slot suffices. */
+                struct node tmp = { 0 };
+                struct attr attr = { "class", nv, NULL };
+                tmp.attrs = &attr;
+                *out = 0;
+                if (has_class(&tmp, replacement, (int)strlen(replacement)))
+                    continue;
+                token = replacement;
+                tl = (int)strlen(replacement);
+            } else if (!add) {
+                continue;
             }
+        } else if (replacement && present && (size_t)tl == strlen(replacement) &&
+                   !memcmp(token, replacement, (size_t)tl)) {
+            continue;
         }
+        if (out != nv)
+            *out++ = ' ';
+        memcpy(out, token, (size_t)tl);
+        out += tl;
     }
-    set_attr(d, n, "class", nv);
+    if (add && !present) {
+        if (out != nv)
+            *out++ = ' ';
+        memcpy(out, name, len);
+        out += len;
+    }
+    *out = 0;
+    /* replace(missing, ...) does not normalize or create an attribute. */
+    if (!replacement || present)
+        set_attr(d, n, "class", nv);
     free(nv);
-    return op;
+    return present;
+}
+
+static jsval classlist_change(struct js *J, jsval self, jsval *args, int argc, int add)
+{
+    struct node *n = classlist_node(self);
+    if (!n)
+        return js_undefined;
+    /* Convert and validate every argument before touching the attribute. */
+    struct jsobj *tokens = js_new_array(J);
+    for (int i = 0; i < argc; i++) {
+        struct jsstr *s = js_tostr(J, args[i]);
+        if (js_throwing(J))
+            return js_undefined;
+        js_array_push(J, tokens, js_strn(J, s->s, s->len));
+    }
+    for (int i = 0; i < argc; i++)
+        if (!class_valid(J, tokens->items[i].u.s))
+            return js_undefined;
+    for (int i = 0; i < argc; i++)
+        class_update(dom(J), n, js_cstr(tokens->items[i]), NULL, add);
+    if (!argc && node_attr(n, "class"))
+        class_update(dom(J), n, "", NULL, 0);
+    return js_undefined;
 }
 
 static jsval classlist_add(struct js *J, jsval self, jsval *args, int argc)
 {
-    struct node *n = classlist_node(self);
-    for (int i = 0; n && i < argc; i++)
-        class_op(dom(J), n, js_tostr(J, args[i])->s, 1);
-    return js_undefined;
+    return classlist_change(J, self, args, argc, 1);
 }
 
 static jsval classlist_remove(struct js *J, jsval self, jsval *args, int argc)
 {
-    struct node *n = classlist_node(self);
-    for (int i = 0; n && i < argc; i++)
-        class_op(dom(J), n, js_tostr(J, args[i])->s, 0);
-    return js_undefined;
+    return classlist_change(J, self, args, argc, 0);
 }
 
 static jsval classlist_toggle(struct js *J, jsval self, jsval *args, int argc)
 {
     struct node *n = classlist_node(self);
-    if (!n)
-        return js_bool(0);
-    int op = argc > 1 ? js_truthy(args[1]) : 2;
-    return js_bool(class_op(dom(J), n, js_tostr(J, ARG(0))->s, op));
+    struct jsstr *s = js_tostr(J, ARG(0));
+    if (js_throwing(J) || !class_valid(J, s) || !n)
+        return js_undefined;
+    int present = has_class(n, s->s, s->len);
+    int add = argc > 1 ? js_truthy(args[1]) : !present;
+    if (add != present)
+        class_update(dom(J), n, s->s, NULL, add);
+    return js_bool(add);
 }
 
 static jsval classlist_contains(struct js *J, jsval self, jsval *args, int argc)
 {
     struct node *n = classlist_node(self);
     struct jsstr *s = js_tostr(J, ARG(0));
-    return js_bool(n && has_class(n, s->s, s->len));
+    return js_bool(n && s->len && has_class(n, s->s, s->len));
 }
 
 static jsval classlist_replace(struct js *J, jsval self, jsval *args, int argc)
 {
     struct node *n = classlist_node(self);
-    struct jsstr *a = js_tostr(J, ARG(0)), *b = js_tostr(J, ARG(1));
-    if (!n || !has_class(n, a->s, a->len))
-        return js_bool(0);
-    class_op(dom(J), n, a->s, 0);
-    class_op(dom(J), n, b->s, 1);
-    return js_bool(1);
+    struct jsstr *a = js_tostr(J, ARG(0));
+    if (js_throwing(J))
+        return js_undefined;
+    struct jsstr *b = js_tostr(J, ARG(1));
+    if (js_throwing(J) || !class_valid(J, a) || !class_valid(J, b) || !n)
+        return js_undefined;
+    return js_bool(class_update(dom(J), n, a->s, b->s, 0));
 }
 
 static jsval classlist_item(struct js *J, jsval self, jsval *args, int argc)
 {
     struct node *n = classlist_node(self);
-    int want = (int)js_to_number(J, ARG(0)), k = 0;
+    double want = js_to_number(J, ARG(0));
+    if (isnan(want) || isinf(want))
+        want = 0;
+    want = fmod(trunc(want), 4294967296.0);
+    if (want < 0)
+        want += 4294967296.0;
     const char *v = n ? node_attr(n, "class") : NULL;
-    for (const char *s = v ? v : ""; *s;) {
-        while (*s == ' ')
-            s++;
-        const char *t = s;
-        while (*s && *s != ' ')
-            s++;
-        if (s > t && k++ == want)
-            return js_strn(J, t, (int)(s - t));
-    }
+    if (!v)
+        v = "";
+    const char *cursor = v, *token;
+    int len, k = 0;
+    while ((token = class_token(v, &cursor, &len)))
+        if (k++ == want)
+            return js_strn(J, token, len);
     return js_null;
+}
+
+static jsval classlist_to_string(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct node *n = classlist_node(self);
+    const char *v = n ? node_attr(n, "class") : NULL;
+    return js_str(J, v ? v : "");
 }
 
 static int dataset_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
@@ -3224,6 +3348,7 @@ struct jsdom *jsdom_new(const struct jshost *host)
     fn(J, clp, "contains", classlist_contains, 1);
     fn(J, clp, "replace", classlist_replace, 2);
     fn(J, clp, "item", classlist_item, 1);
+    fn(J, clp, "toString", classlist_to_string, 0);
     d->style_proto = stp;
     d->classlist_proto = clp;
 

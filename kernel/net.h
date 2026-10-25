@@ -189,7 +189,7 @@ struct socket {
 
     /* datagram sockets */
     struct dgram *rq, *rq_tail;
-    uint32_t rq_bytes;
+    uint32_t rq_bytes;          /* queued allocation bytes, including datagram headers */
 
     /* TCP */
     enum tcp_state state;

@@ -74,6 +74,8 @@ void *kmalloc(size_t n)
 {
     if (!n)
         n = 1;
+    if (n > UINT32_MAX - (HEAP_ALIGN - 1u) || n > heap_size)
+        return NULL;
     uint32_t size = ALIGN_UP((uint32_t)n, HEAP_ALIGN);
     for (struct block *b = heap_head; b; b = b->next) {
         if (b->free && b->size >= size) {
@@ -112,6 +114,8 @@ void kfree(void *p)
 
 void *krealloc(void *p, size_t n)
 {
+    if (n > UINT32_MAX - (HEAP_ALIGN - 1u) || n > heap_size)
+        return NULL;
     if (!p)
         return kmalloc(n);
     struct block *b = (struct block *)p - 1;

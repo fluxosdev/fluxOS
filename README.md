@@ -250,6 +250,9 @@ host's GRUB. The ISO boots on legacy BIOS only.
 ```sh
 make            # builds fluxOS.iso
 make check      # verifies the kernel is a valid Multiboot image
+make test-browser # runs DOM/classList regressions on a Linux x86 host
+make test-kernel # runs allocator, filesystem, pipe and socket regressions on the host
+make test-kernel-qemu # boots kernel regressions with a disposable initrd and scratch disk
 make disk       # fluxdisk.img, a 64 MiB FAT32 data disk (DISK_MB=...)
 make floppy     # fluxfloppy.img, a 1.44 MB FAT12 floppy for drive A:
 make run        # boots the ISO in QEMU with the disk, floppy (if any) and an NE2000
