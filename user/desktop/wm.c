@@ -297,6 +297,18 @@ struct ctx_item {
 
 static void arrange_icons(void);
 static void open_ctx_icon(void);
+static void minimize_all(void);
+static void tile_horizontally(void);
+static void tile_vertically(void);
+
+/* What right-clicking the taskbar offers. */
+static const struct ctx_item taskbar_ctx[] = {
+    { "Task Manager", ICON_TASKMGR, open_taskmgr },
+    { NULL, ICON_NONE, NULL },
+    { "Minimize All Windows", ICON_NONE, minimize_all },
+    { "Tile Windows Horizontally", ICON_NONE, tile_horizontally },
+    { "Tile Windows Vertically", ICON_NONE, tile_vertically },
+};
 
 static const struct ctx_item desktop_ctx[] = {
     { "Arrange Icons", ICON_NONE, arrange_icons },
@@ -1162,7 +1174,7 @@ static void draw_taskbar_kinetik(void)
 
     struct rect sb = start_button_rect();
     if (!menu_open)
-        gfx_round_fill(&screen, sb, 6, 6, ARGB(52, 0x132C4B));     /* a shade darker than the other buttons */
+        gfx_round_fill(&screen, sb, 6, 6, ARGB(120, 0x0A1A2E));    /* darker than the other buttons */
     glass(sb, 6, menu_open);
     draw_icon(&screen, sb.x + 7, sb.y + (sb.h - 24) / 2, ICON_FLUX, 24);
     gfx_text(&screen, &font_archivo_start, sb.x + 37, sb.y + (sb.h - font_archivo_start.height) / 2, "menu",
@@ -1733,6 +1745,65 @@ static void toggle_maximize(struct window *w)
         w->restore = from;
     w->maximized = !w->maximized;
     wm_damage(caption_rect(w));
+}
+
+/* ---- the taskbar's menu: minimizing and tiling ---- */
+
+static void minimize_all(void)
+{
+    struct window *list[sizeof(task_order) / sizeof(task_order[0])];
+    int n = ntasks;
+    memcpy(list, task_order, (size_t)n * sizeof(list[0]));
+    for (int i = 0; i < n; i++)
+        if (!list[i]->minimized)
+            minimize(list[i]);
+}
+
+/* Place the visible windows in a grid of rows x cols cells over the screen
+ * above the taskbar, filled a row at a time (by_rows) or a column at a time.
+ * A window that cannot change size (no resize handler) is only moved. */
+static void tile(int by_rows)
+{
+    struct window *list[sizeof(task_order) / sizeof(task_order[0])];
+    int n = 0;
+    for (int i = 0; i < ntasks; i++)
+        if (!task_order[i]->minimized && !(task_order[i]->flags & WF_MODAL))
+            list[n++] = task_order[i];
+    if (!n)
+        return;
+    /* at most four windows deep, so that none gets too thin */
+    int lines = n < 4 ? n : 4, across = (n + lines - 1) / lines;
+    int rows = by_rows ? lines : across, cols = by_rows ? across : lines;
+    int w = screen_w, h = screen_h - TASKBAR_H;
+    for (int i = 0; i < n; i++) {
+        int r = by_rows ? i / cols : i % rows, c = by_rows ? i % cols : i / rows;
+        struct rect cell = mkrect(c * w / cols, r * h / rows, (c + 1) * w / cols - c * w / cols,
+                                  (r + 1) * h / rows - r * h / rows);
+        struct window *win = list[i];
+        if (resizable(win)) {
+            int min_w = win->min_w + 2 * BORDER, min_h = win->min_h + FRAME_TOP + BORDER;
+            if (cell.w < min_w)
+                cell.w = min_w;
+            if (cell.h < min_h)
+                cell.h = min_h;
+            if (win->maximized)
+                win->maximized = 0;
+            if (set_frame(win, cell) == 0)
+                continue;
+        }
+        move_window(win, cell.x, cell.y);
+    }
+    damage_taskbar();
+}
+
+static void tile_horizontally(void)
+{
+    tile(1);
+}
+
+static void tile_vertically(void)
+{
+    tile(0);
 }
 
 /* ---- a sample of the theme, for Display Properties ---- */
@@ -2476,6 +2547,10 @@ static void press_right(void)
         set_ctx(NULL, 0, 0, 0, -1);
         wm_focus(rw);
         client_mouse(rw, mbuttons, MOUSE_RIGHT);
+        return;
+    }
+    if (!modal_window() && drag == DRAG_NONE && rect_contains(taskbar_rect(), mx, my)) {
+        set_ctx(taskbar_ctx, COUNT(taskbar_ctx), mx, my, -1);
         return;
     }
     if (modal_window() || drag != DRAG_NONE || rect_contains(taskbar_rect(), mx, my) ||

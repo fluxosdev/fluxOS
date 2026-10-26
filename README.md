@@ -51,8 +51,8 @@ stops at boot and says why.
   MADT or the MultiProcessor Specification table, are started with INIT and
   startup IPIs and run user processes alongside the first. The kernel itself
   runs on one at a time (a big kernel lock); device interrupts stay on the
-  8259 PIC and the boot processor. `nosmp` on the kernel command line (the
-  boot menu's "one processor" entry) keeps to the first, `maxcpus=N` to N.
+  8259 PIC and the boot processor. `nosmp` on the kernel command line keeps
+  to the first, `maxcpus=N` to N.
 - Processes: `fork`, `execve` (static ELF32 and `#!` scripts), `exit`/
   `waitpid`, process groups, signals (`kill`, `SIGINT`, `SIGPIPE`, fault
   signals; no user handlers), lazy FPU and SSE switching (FXSAVE/FXRSTOR).
