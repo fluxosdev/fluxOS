@@ -60,7 +60,7 @@ void smp_add_cpu(uint8_t apic_id);      /* from the ACPI MADT */
 void smp_init(void);                    /* find the processors; before the first process */
 void smp_start(void);                   /* start the others; after proc_init() */
 void smp_tick(void);                    /* the timer ticked: pass it on */
-void smp_wake_idle(void);               /* a process became ready */
+int smp_wake_idle(void);                /* a process became ready: 1 if an idle processor takes it */
 void smp_kick_proc(struct proc *p);     /* p, running elsewhere, has a signal */
 void smp_flush_tlb(uint32_t *pd);       /* pd's mappings changed */
 void smp_tlb_ipi(void);

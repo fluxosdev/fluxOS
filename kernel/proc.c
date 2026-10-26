@@ -38,12 +38,13 @@ void proc_init(void)
     c->slice = QUANTUM;
 }
 
-/* p can run: here soon (need_resched), or on an idle processor. */
+/* p can run: on an idle processor if there is one, so that what runs here
+ * goes on; or else here, soon (need_resched). */
 static void make_ready(struct proc *p)
 {
     p->state = P_READY;
-    need_resched = 1;
-    smp_wake_idle();
+    if (!smp_wake_idle())
+        need_resched = 1;
 }
 
 struct proc *proc_find(int pid)

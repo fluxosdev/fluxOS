@@ -430,18 +430,23 @@ void smp_tick(void)
             send_ipi(&cpus[i], VEC_TICK);
 }
 
-/* Wake an idle processor (one not yet woken) to look for work. */
-void smp_wake_idle(void)
+/* A process became ready: 1 if an idle processor will run it, this one
+ * (which looks for work on its way out of the kernel) or another, woken
+ * by VEC_RESCHED; 0 if every processor is busy. */
+int smp_wake_idle(void)
 {
     struct cpu *self = this_cpu();
+    if (self->proc == self->idle)
+        return 1;
     for (int i = 0; i < ncpus; i++) {
         struct cpu *c = &cpus[i];
         if (c != self && c->online && c->proc == c->idle && !c->kicked) {
             c->kicked = 1;
             send_ipi(c, VEC_RESCHED);
-            return;
+            return 1;
         }
     }
+    return 0;
 }
 
 /* p runs on another processor: make it come into the kernel (for a signal). */
