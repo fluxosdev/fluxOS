@@ -870,6 +870,13 @@ static int sys_time(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
     return (int)time_now();
 }
 
+static int sys_stime(uint32_t now, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)b; (void)c; (void)d; (void)e;
+    time_set(now);
+    return 0;
+}
+
 static int sys_uptime(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)a; (void)b; (void)c; (void)d; (void)e;
@@ -1117,6 +1124,7 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_display] = sys_display,
     [SYS_ioctl] = sys_ioctl,
     [SYS_usbinfo] = sys_usbinfo,
+    [SYS_stime] = sys_stime,
 };
 
 /* Calls that walk or change the VFS tree; read and write lock per chunk. */

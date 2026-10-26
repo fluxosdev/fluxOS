@@ -124,6 +124,7 @@ void mdelay(uint32_t ms);               /* sleeps in a process, spins at boot */
 void rtc_init(void);
 uint32_t rtc_boot_epoch(void);
 uint32_t time_now(void);
+void time_set(uint32_t now);
 
 /* Power management */
 void machine_reboot(void) __attribute__((noreturn));

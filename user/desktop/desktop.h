@@ -96,6 +96,7 @@ enum icon_id {
     ICON_TASKMGR,
     ICON_MINES,
     ICON_CLOCK,
+    ICON_DATETIME,
     ICON_ARCHIVE,
     ICON_PAINT,
     ICON_COUNT,
@@ -250,6 +251,9 @@ void browser_blink(void);
 void browser_tick(void);
 void setup_open(void);
 void display_open(void);                /* Display Properties */
+void datetime_open(void);               /* Date and Time Properties: zone, NTP sync */
+void datetime_tick(void);               /* once a second */
+void datetime_init(void);               /* the saved time zone */
 
 /* GRUB's environment block on the boot partition (grubenv.c): for settings
  * that have to outlive the RAM filesystem. dir is the partition's mount point. */

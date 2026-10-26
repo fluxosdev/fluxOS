@@ -74,7 +74,8 @@
 #define SYS_display   66
 #define SYS_ioctl     67
 #define SYS_usbinfo   68
+#define SYS_stime     69
 
-#define NSYSCALLS     69
+#define NSYSCALLS     70
 
 #endif

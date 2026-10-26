@@ -193,6 +193,8 @@ time_t time(time_t *t)
     return now;
 }
 
+int stime(const time_t *t) { return ret(sc1(SYS_stime, (int)*t)); }
+
 int uname(struct utsname *buf) { return ret(sc1(SYS_uname, (int)buf)); }
 int sched_yield(void) { return sc0(SYS_yield); }
 int ttymode(int mode) { return sc1(SYS_ttymode, mode); }

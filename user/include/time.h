@@ -20,6 +20,9 @@ time_t time(time_t *t);
 struct tm *gmtime(const time_t *t);
 struct tm *gmtime_r(const time_t *t, struct tm *out);
 struct tm *localtime(const time_t *t);
+int stime(const time_t *t);             /* set the clock (and the RTC) */
+void tz_set(int minutes);               /* local time is UTC plus this */
+int tz_get(void);
 size_t strftime(char *buf, size_t size, const char *fmt, const struct tm *tm);
 
 #endif

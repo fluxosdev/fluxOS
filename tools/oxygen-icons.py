@@ -29,6 +29,7 @@ ICONS = {
     "audio-volume-muted": None, "audio-x-generic": None,
     "applications-graphics": None, "utilities-file-archiver": None,
     "utilities-system-monitor": None, "edit-bomb": None, "clock": None,
+    "preferences-system-time": None,
 }
 SIZES = (16, 32, 48)
 OUT = "rootfs/usr/share/icons/oxygen"

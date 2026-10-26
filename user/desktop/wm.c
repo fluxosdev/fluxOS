@@ -236,6 +236,7 @@ static const struct menu_item system_items[] = {
 
 static const struct menu_item settings_items[] = {
     { ICON_DISPLAY, "Display Properties", display_open, NULL, 0 },
+    { ICON_DATETIME, "Date and Time", datetime_open, NULL, 0 },
     { ICON_COMPUTER, "System Properties", about_open, NULL, 0 },
 };
 

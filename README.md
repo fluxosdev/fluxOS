@@ -706,8 +706,8 @@ cannot be used.
 ## Credits
 
 The default wallpaper, `/usr/share/wallpapers/bamboo.jpg`, is a photograph by
-kazuend on [Unsplash](https://unsplash.com), and `mountains.jpg` one by Štefan
-Štefančík, both used under the [Unsplash License](https://unsplash.com/license).
+kazuend on [Unsplash](https://unsplash.com), `mountains.jpg` one by Štefan
+Štefančík, and `shore.jpg` one by Nattu Adnan, all used under the [Unsplash License](https://unsplash.com/license).
 Thank you for sharing them.
 
 The startup, shutdown and error sounds (`/usr/share/sounds/startup.wav`, `shutdown.wav` and

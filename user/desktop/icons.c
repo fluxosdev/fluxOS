@@ -297,6 +297,7 @@ static const char *const icon_names[ICON_COUNT] = {
     [ICON_TASKMGR] = "utilities-system-monitor",
     [ICON_MINES] = "edit-bomb",
     [ICON_CLOCK] = "clock",
+    [ICON_DATETIME] = "preferences-system-time",
 };
 
 static const int icon_sizes[] = { 16, 24, 32, 48 };

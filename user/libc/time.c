@@ -59,9 +59,15 @@ struct tm *gmtime(const time_t *t)
     return gmtime_r(t, &tm);
 }
 
+static int tz_minutes;
+
+void tz_set(int minutes) { tz_minutes = minutes; }
+int tz_get(void) { return tz_minutes; }
+
 struct tm *localtime(const time_t *t)
 {
-    return gmtime(t);
+    time_t local = (time_t)((long)*t + tz_minutes * 60L);
+    return gmtime(&local);
 }
 
 size_t strftime(char *buf, size_t size, const char *fmt, const struct tm *tm)

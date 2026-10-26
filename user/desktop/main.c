@@ -67,6 +67,7 @@ int main(void)
         return 1;
     }
     wm_init();
+    datetime_init();
     sound_init();
     terminal_open("Terminal", NULL, 0, 1);
     wm_flush();
@@ -140,6 +141,7 @@ int main(void)
             last_tick = now;
             wm_tick();
             clock_tick();
+            datetime_tick();
             minesweeper_tick();
             about_tick();
             display_tick();

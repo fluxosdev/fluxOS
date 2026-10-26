@@ -132,6 +132,57 @@ uint32_t time_now(void)
     return boot_epoch + ticks / HZ;
 }
 
+static void cmos_write(uint8_t reg, uint8_t val)
+{
+    outb(0x70, reg);
+    outb(0x71, val);
+}
+
+static uint8_t to_bcd(int v)
+{
+    return (uint8_t)((v / 10) << 4 | (v % 10));
+}
+
+/* Set the wall clock (seconds since 1970, UTC) and the CMOS RTC with it. */
+void time_set(uint32_t now)
+{
+    boot_epoch = now - ticks / HZ;
+
+    uint32_t days = now / 86400, rem = now % 86400;
+    /* civil_from_days */
+    int z = (int)days + 719468;
+    int era = z / 146097;
+    int doe = z - era * 146097;
+    int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int mp = (5 * doy + 2) / 153;
+    int day = doy - (153 * mp + 2) / 5 + 1;
+    int mon = mp < 10 ? mp + 3 : mp - 9;
+    int year = yoe + era * 400 + (mon <= 2);
+    int hour = (int)(rem / 3600), min = (int)(rem % 3600 / 60), sec = (int)(rem % 60);
+
+    uint8_t regb = cmos_read(0x0B);
+    int binary = regb & 0x04;
+    int twelve = !(regb & 0x02);
+    int pm = 0;
+    if (twelve) {
+        pm = hour >= 12;
+        hour %= 12;
+        if (hour == 0)
+            hour = 12;
+    }
+#define ENC(v) (binary ? (uint8_t)(v) : to_bcd(v))
+    cmos_write(0x0B, regb | 0x80);      /* stop updates while writing */
+    cmos_write(0x00, ENC(sec));
+    cmos_write(0x02, ENC(min));
+    cmos_write(0x04, (uint8_t)(ENC(hour) | (pm ? 0x80 : 0)));
+    cmos_write(0x07, ENC(day));
+    cmos_write(0x08, ENC(mon));
+    cmos_write(0x09, ENC(year % 100));
+    cmos_write(0x0B, regb & 0x7F);
+#undef ENC
+}
+
 void machine_reboot(void)
 {
     cli();
