@@ -84,6 +84,8 @@ struct js {
     struct gcheap *heap;                /* jsgc.c */
     int gc_inhibit;                     /* no collections while this is above 0 (parsing) */
     void *host;
+    /* A promise was rejected and nothing had asked for the result by the time the microtasks ran. */
+    void (*on_unhandled)(struct js *J, jsval promise, jsval reason);
     struct jsobj *global;
     struct env *genv;
     /* prototypes */

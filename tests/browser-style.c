@@ -4,6 +4,7 @@
 #include <string.h>
 #include "web.h"
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
+int wfont_height(const struct wfont *f) { (void)f; return 16; }
 const struct wfont *wfont_get(int family, int bold, int italic, int px)
 { (void)family; (void)bold; (void)italic; (void)px; return NULL; }
 static struct node *id(struct node *root, const char *name)
@@ -208,9 +209,35 @@ static void backgrounds_and_overflow(void)
     CHECK(l->bg_url && !strncmp(l->bg_url, "data:image/svg+xml;utf8,<svg", 28) && l->bg_origin == 1);
     arena_free(&arena);
 }
+static void counters_and_selectors(void)
+{
+    struct arena arena = {0};
+    const char *html = "<!doctype html><body><div id='r'><h2 id='a'>x</h2><h2 id='b'>y</h2><h2 id='c'>z</h2></div>"
+        "<p id='p' lang='en'>t</p><input id='i' type='email' value='nope'><input id='j' type='email' value='a@b.cc'>"
+        "<input id='k' type='email'><div id='lc'>l</div></body>";
+    struct node *root = html_parse(&arena, html, (int)strlen(html));
+    const char *css =
+        "#r { counter-reset: sec 10 other } h2 { counter-increment: sec } h2::before { content: counter(sec) \". \" counter(other, upper-roman) }"
+        "#c::after { content: counter(sec, lower-alpha) \"/\" counter(sec, upper-roman) }"
+        ":scope { z-index: 3 } p:dir(ltr) { z-index: 4 } p:dir(rtl) { z-index: 99 }"
+        "input:user-invalid { z-index: 5 } #lc { -webkit-line-clamp: 3; line-height: 20px; tab-size: 4; text-align-last: right }";
+    struct sheet *sheet = css_parse(&arena, css, (int)strlen(css), 800);
+    css_cascade(&arena, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(id(root, "a")->pseudo_text[0] && !strcmp(id(root, "a")->pseudo_text[0], "11. 0"));
+    CHECK(!strcmp(id(root, "b")->pseudo_text[0], "12. 0"));
+    CHECK(!strcmp(id(root, "c")->pseudo_text[0], "13. 0"));
+    CHECK(id(root, "c")->pseudo_text[1] && !strcmp(id(root, "c")->pseudo_text[1], "m/XIII"));
+    CHECK(root->style->z_set && root->style->z_index == 3);
+    CHECK(id(root, "p")->style->z_index == 4);
+    CHECK(!id(root, "i")->style->z_set && !id(root, "k")->style->z_set);     /* nothing typed yet */
+    struct style *lc = id(root, "lc")->style;
+    CHECK(lc->line_clamp == 3 && lc->max_height.unit == U_PX && lc->max_height.v == 60 && lc->clips);
+    CHECK(lc->tab_size == 4 && lc->text_align_last == TA_RIGHT + 1);
+    arena_free(&arena);
+}
 int main(void)
 {
     entities(); cascade(); selector_specificity(); nth_boundaries();
-    text_and_interaction_properties(); state_pseudo_classes(); backgrounds_and_overflow();
+    text_and_interaction_properties(); state_pseudo_classes(); backgrounds_and_overflow(); counters_and_selectors();
     puts("browser HTML/CSS: named references, filtered siblings, cascade specificity and new properties passed");
 }

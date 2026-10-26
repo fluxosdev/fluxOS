@@ -261,7 +261,7 @@ int grubenv_update(const char *dir, const char *const *keys, const char *const *
 enum { WALL_FILL, WALL_STRETCH, WALL_CENTER, WALL_TILE, WALL_MODES };
 extern const char *const wall_mode_names[WALL_MODES];
 #define WALLPAPER_DIR     "/usr/share/wallpapers"
-#define WALLPAPER_DEFAULT WALLPAPER_DIR "/mountains.jpg"
+#define WALLPAPER_DEFAULT WALLPAPER_DIR "/bamboo.jpg"
 #define WALLPAPER_KINETIK "kinetik"     /* not a file: the Kinetik theme's own, drawn in its color */
 /* The Kinetik wallpaper at w x h, into s at (0, 0). */
 void wallpaper_kinetik(struct surface *s, int w, int h);

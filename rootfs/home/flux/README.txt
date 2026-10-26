@@ -110,6 +110,6 @@ System
   free, uname -a, uptime, date, dmesg, fetch, reboot, poweroff
 
 More about fluxOS is in README.md in the source tree, and the credits are
-there too: the default wallpaper is a photograph by Stefan Stefancik on
-Unsplash, and the Kinetik theme's text is set in Archivo (SIL Open Font
+there too: the default wallpaper is a photograph by kazuend on Unsplash
+(and mountains.jpg is by Stefan Stefancik), and the Kinetik theme's text is set in Archivo (SIL Open Font
 License, in /usr/share/doc/fonts/LICENSE.archivo).

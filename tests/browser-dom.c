@@ -7,6 +7,7 @@
 #include "jsdom.h"
 
 unsigned int uptime_ms(void) { return 0; }
+int wfont_height(const struct wfont *f) { (void)f; return 16; }
 const struct wfont *wfont_get(int family, int bold, int italic, int px)
 { (void)family; (void)bold; (void)italic; (void)px; return NULL; }
 int meminfo(struct meminfo *info) { (void)info; return -1; }

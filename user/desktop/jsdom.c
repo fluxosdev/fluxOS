@@ -58,6 +58,7 @@ struct jsdom {
     struct node *current_script;
     struct node *write_after;           /* document.write's insertion point */
     int dirty;
+    int hidden;                         /* the window is minimized: document.hidden */
     int loaded;
     int depth;                          /* nested entries from the browser */
     char cookies[2048];
@@ -2372,6 +2373,7 @@ static jsval el_normalize(struct js *J, jsval self, jsval *args, int argc)
 }
 
 static jsval new_event(struct jsdom *d, const char *type, jsval target);
+static void host_unhandled(struct js *J, jsval promise, jsval reason);
 static int dispatch_event(struct jsdom *d, struct node *target, const char *type, jsval ev, int bubbles);
 
 /* <dialog>: show(), showModal() and close(returnValue). */
@@ -3318,8 +3320,8 @@ static int document_get(struct js *J, struct jsobj *o, const char *key, jsval *o
     if (IS("referrer")) { *out = js_str(J, ""); return 1; }
     if (IS("characterSet") || IS("charset")) { *out = js_str(J, "UTF-8"); return 1; }
     if (IS("compatMode")) { *out = js_str(J, root && root->quirks ? "BackCompat" : "CSS1Compat"); return 1; }
-    if (IS("visibilityState")) { *out = js_str(J, "visible"); return 1; }
-    if (IS("hidden")) { *out = js_bool(0); return 1; }
+    if (IS("visibilityState")) { *out = js_str(J, d->hidden ? "hidden" : "visible"); return 1; }
+    if (IS("hidden")) { *out = js_bool(d->hidden); return 1; }
     if (IS("defaultView")) { *out = js_obj(d->window); return 1; }
     if (IS("activeElement")) {
         *out = wrap(d, d->active && contains(root, d->active) ? d->active : node_find(root, T_BODY));
@@ -3936,6 +3938,58 @@ static jsval history_length(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self, (void)args, (void)argc;
     return js_num(dom(J)->hist_len);
+}
+
+/* A promise nobody was waiting on was rejected: the window's unhandledrejection, else a line in the status bar. */
+static void host_unhandled(struct js *J, jsval promise, jsval reason)
+{
+    struct jsdom *d = dom(J);
+    d->depth++;
+    jsval ev = new_event(d, "unhandledrejection", js_obj(d->window));
+    js_set(J, ev, "bubbles", js_bool(0));
+    js_set(J, ev, "cancelable", js_bool(1));
+    js_set(J, ev, "promise", promise);
+    js_set(J, ev, "reason", reason);
+    fire_on(d, js_obj(d->window), NULL, "unhandledrejection", ev);
+    if (!js_truthy(js_get(J, ev, "defaultPrevented"))) {
+        struct jsstr *s = reason.t == JS_OBJ || reason.t == JS_STR ? js_tostr(J, reason) : NULL;
+        char msg[300];
+        snprintf(msg, sizeof(msg), "Uncaught (in promise): %s", s ? s->s : "rejected");
+        fprintf(stderr, "%s\n", msg);
+        if (d->h.status)
+            d->h.status(d->h.ctx, msg);
+    }
+    d->depth--;
+}
+
+/*
+ * Page-level events from the browser: "beforeunload" and "pagehide" at the window (the page is
+ * being left), "visibilitychange" at the document and up to the window (the window was minimized
+ * or came back; hidden says which).
+ */
+void jsdom_page_event(struct jsdom *d, const char *type, int hidden)
+{
+    if (!d)
+        return;
+    struct js *J = d->J;
+    d->depth++;
+    if (!strcmp(type, "visibilitychange")) {
+        if (d->hidden != hidden) {
+            d->hidden = hidden;
+            jsval ev = new_event(d, type, js_obj(d->document));
+            js_set(J, ev, "bubbles", js_bool(1));
+            js_set(J, ev, "cancelable", js_bool(0));
+            fire_on(d, js_obj(d->document), NULL, type, ev);
+            fire_phase(d, js_obj(d->window), NULL, type, ev, 3);
+        }
+    } else {
+        jsval ev = new_event(d, type, js_obj(d->window));
+        js_set(J, ev, "bubbles", js_bool(0));
+        js_set(J, ev, "cancelable", js_bool(!strcmp(type, "beforeunload")));
+        fire_on(d, js_obj(d->window), NULL, type, ev);
+    }
+    d->depth--;
+    settle(d);
 }
 
 void jsdom_traverse(struct jsdom *d, int id, const char *old_url, const char *new_url)
@@ -4706,6 +4760,8 @@ void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, i
  * puts the real thing in its place) and then reads the name again. */
 
 #define DOM_LIB_NAMES(X) \
+    X(W, MessageChannel) X(W, MessagePort) X(W, BroadcastChannel) X(W, XMLSerializer) X(W, Path2D) \
+    X(W, ImageData) \
     X(W, NodeFilter) X(W, TreeWalker) X(W, NodeIterator) X(W, Range) X(W, StaticRange) X(W, Selection) \
     X(W, getSelection) X(W, CSSStyleSheet) X(W, StyleSheet) X(W, CSSRule) X(W, FontFace) \
     X(D, createTreeWalker) X(D, createNodeIterator) X(D, getSelection) X(D, createRange) X(D, getAnimations) \
@@ -4777,6 +4833,7 @@ struct jsdom *jsdom_new(const struct jshost *host)
         return NULL;
     }
     struct js *J = d->J;
+    J->on_unhandled = host_unhandled;
     js_gc_root(J, d, sizeof(*d));       /* the window, prototypes, timers and requests */
     struct js_gc_hooks hooks = { d, gc_mark, gc_more, gc_sweep };
     js_gc_hooks(J, &hooks);

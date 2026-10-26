@@ -90,6 +90,7 @@ struct promise {
     jsval value;
     struct reaction *head, *tail;
     int locked;                         /* resolved, perhaps to another promise still pending */
+    int handled;                        /* something has asked for its result (then, catch, await...) */
 };
 
 static const struct jsclass promise_class = { "Promise", NULL, NULL, NULL };
@@ -145,6 +146,16 @@ static void reaction_job(struct js *J, struct job *j)
     }
 }
 
+/* Run after the reactions queued before it: is the rejected promise still without a handler? */
+static void unhandled_job(struct js *J, struct job *j)
+{
+    struct promise *p = pdata(j->a);
+    if (p && p->state == 2 && !p->handled && J->on_unhandled) {
+        p->handled = 1;
+        J->on_unhandled(J, j->a, p->value);
+    }
+}
+
 void js_promise_settle(struct js *J, jsval po, int state, jsval v)
 {
     struct promise *p = pdata(po);
@@ -152,6 +163,8 @@ void js_promise_settle(struct js *J, jsval po, int state, jsval v)
         return;
     p->state = state;
     p->value = v;
+    if (state == 2 && !p->handled && !p->head && J->on_unhandled)
+        js_enqueue(J, unhandled_job, po, js_undefined, js_undefined, js_undefined);
     for (struct reaction *r = p->head; r; r = r->next)
         js_enqueue(J, reaction_job, state == 1 ? r->ok : r->err, r->child, v, js_num(state));
     p->head = p->tail = NULL;
@@ -214,6 +227,7 @@ static void thenable_job(struct js *J, struct job *j)
 static void add_reaction(struct js *J, jsval po, jsval ok, jsval err, jsval child)
 {
     struct promise *p = pdata(po);
+    p->handled = 1;
     if (p->state) {
         js_enqueue(J, reaction_job, p->state == 1 ? ok : err, child, p->value, js_num(p->state));
         return;

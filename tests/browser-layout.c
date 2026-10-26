@@ -56,6 +56,8 @@ static void load(struct page *p, const char *html, int vw, int vh)
             continue;
         if (n->style && n->style->bg_url)
             n->style->bg_img = &test_img;
+        if (n->style && n->style->ls_url)
+            n->style->ls_img = &test_img;
         if (n->tag == T_IMG)
             n->img = &test_img;
     }
@@ -211,6 +213,86 @@ static void background_pictures(void)
     unload(&p);
 }
 
+static void text_extras(void)
+{
+    struct page p;
+    load(&p, "<style>body{margin:0} p{margin:0;width:200px} .tl{text-align:left;text-align-last:right}"
+             " pre{margin:0;tab-size:4} .clamp{width:100px;-webkit-line-clamp:2;line-height:10px}"
+             " ul{margin:0;padding:0;list-style-image:url(m.png)} li{margin:0}</style>"
+             "<p class=tl>last</p><pre>a\tb</pre>"
+             "<div class=clamp>aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj</div><ul><li>item</li></ul>", 800, 600);
+    const struct ditem *last = word(&p, "last");
+    CHECK(last && last->x + last->w == 200);                    /* text-align-last: the only line is the last */
+    const struct ditem *a = word(&p, "a"), *b = word(&p, "b");
+    CHECK(a && b && b->x - a->x >= 4 * 4 - 1);                  /* a tab stop four characters on, not eight */
+    const struct ditem *item = word(&p, "item");
+    CHECK(item && item->x == 0);
+    int img_markers = 0;
+    for (int i = 0; i < p.lo.nitems; i++)
+        img_markers += p.lo.items[i].kind == DK_IMAGE && p.lo.items[i].x < 0;
+    CHECK(img_markers == 1);                                    /* the picture stands for the bullet */
+    const struct ditem *eeee = word(&p, "eeee");
+    CHECK(eeee && eeee->sb);                                    /* the third line is in a clipped box: line-clamp: 2 */
+    unload(&p);
+}
+
+static void zoom(void)
+{
+    struct page p;
+    css_zoom = 200;
+    load(&p, "<style>body{margin:0} p{margin:0;font-size:10px;width:50px;border:1px solid red;line-height:normal}"
+             " .m{font-size:2em;margin-left:1em}</style><p>aa</p><p class=m>bb</p><img>", 800, 600);
+    css_zoom = 100;
+    const struct ditem *aa = word(&p, "aa"), *bb = word(&p, "bb");
+    CHECK(aa && aa->w == 20 && aa->x == 2);                     /* 10px text is 20 (the fake font is half the size wide); the border 2 */
+    CHECK(bb && bb->w == 64 && bb->x == 2 + 64);                /* 2em of the body's zoomed 32 is 64; the margin is 1em of that */
+    int img_w = 0;
+    for (int i = 0; i < p.lo.nitems; i++)
+        if (p.lo.items[i].kind == DK_IMAGE)
+            img_w = p.lo.items[i].w;
+    CHECK(img_w == 80);                                         /* the picture's own 40 pixels, doubled */
+    unload(&p);
+}
+
+static void ranges(void)
+{
+    struct arena a = { 0 };
+    const char *html = "<input id=r type=range min=0 max=10 step=2 value=4><input id=p type=range>"
+                       "<input id=d type=range min=-1 max=1 step=0.25 value=0.5>";
+    struct node *root = html_parse(&a, html, (int)strlen(html)), *r = NULL, *p = NULL, *d = NULL;
+    for (struct node *n = root; n; n = node_next(n, root)) {
+        const char *id = n->type == N_ELEMENT ? node_attr(n, "id") : NULL;
+        if (id && *id == 'r') r = n;
+        if (id && *id == 'p') p = n;
+        if (id && *id == 'd') d = n;
+    }
+    CHECK(r && p && d);
+    r->value = strdup("4");
+    d->value = strdup("0.5");
+    char v[32];
+    CHECK(range_fraction(r) == 400 && range_fraction(p) == 500 && range_fraction(d) == 750);
+    range_value_at(r, 0, v, sizeof(v));
+    CHECK(!strcmp(v, "0"));
+    range_value_at(r, 1000, v, sizeof(v));
+    CHECK(!strcmp(v, "10"));
+    range_value_at(r, 430, v, sizeof(v));                       /* 4.3 snaps to the step of 2 */
+    CHECK(!strcmp(v, "4"));
+    range_value_at(r, 560, v, sizeof(v));
+    CHECK(!strcmp(v, "6"));
+    range_value_at(d, 600, v, sizeof(v));                       /* -1 + 0.2 * 2: nearest quarter is -0.25... */
+    CHECK(!strcmp(v, "0.25"));
+    range_nudge(r, 1, v, sizeof(v));
+    CHECK(!strcmp(v, "6"));
+    range_nudge(r, -2, v, sizeof(v));
+    CHECK(!strcmp(v, "0"));
+    range_nudge(r, 2, v, sizeof(v));
+    CHECK(!strcmp(v, "10"));
+    range_nudge(d, -1, v, sizeof(v));
+    CHECK(!strcmp(v, "0.25"));
+    CHECK(input_pattern("date") && !strcmp(input_pattern("time"), "hh:mm") && !input_pattern("text"));
+    arena_free(&a);
+}
+
 static void object_fit(void)
 {
     struct page p;
@@ -334,6 +416,6 @@ static void scrolling_boxes(void)
 
 int main(void)
 {
-    text_flow(); positioning(); boxes(); background_pictures(); object_fit(); scrolling_boxes();
+    text_flow(); positioning(); boxes(); background_pictures(); text_extras(); zoom(); ranges(); object_fit(); scrolling_boxes();
     puts("browser layout: spacing, wrapping, fixed and sticky boxes, outlines, tables, ruby, background pictures, object-fit and scrolling boxes passed");
 }

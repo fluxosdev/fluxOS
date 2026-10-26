@@ -1,0 +1,66 @@
+<!doctype html>
+<html>
+<head>
+<title>Form widgets, find, zoom and favorites</title>
+<style>
+body { font-family: sans-serif; max-width: 740px; margin: 16px auto; padding: 0 16px; line-height: 1.4; color: #26202d; background: #f5f2f8; counter-reset: sec; }
+h1, h2 { color: #4b2569; }
+h2 { margin-top: 22px; border-bottom: 1px solid #c9b8da; padding-bottom: 3px; counter-increment: sec; }
+h2::before { content: counter(sec) ". "; color: #8a6aa8; }
+.card { background: white; border: 1px solid #d6c6e2; border-radius: 8px; padding: 10px 16px; margin: 10px 0; }
+label { display: inline-block; min-width: 150px; margin: 4px 0; }
+.note { color: #776c80; font-size: 13px; }
+.clamp { width: 300px; -webkit-line-clamp: 2; display: -webkit-box; -webkit-box-orient: vertical; background: #efe6f7; padding: 4px; }
+.last { width: 300px; text-align: left; text-align-last: right; background: #efe6f7; padding: 4px; }
+pre.tabs { tab-size: 4; background: #efe6f7; padding: 4px; margin: 4px 0; }
+ul.pics { list-style-image: url(tile.svg); }
+button.press:active { background: #b99bd6; }
+input:user-invalid { outline: 2px solid #c03030; }
+</style>
+</head>
+<body>
+<h1>Widgets and browser features</h1>
+<p><a href="home.html">Home</a> &middot; Try <b>Ctrl+F</b> (find), <b>Ctrl++</b> / <b>Ctrl+-</b> / <b>Ctrl+0</b> (zoom), <b>Ctrl+D</b> (favorites), <b>Ctrl+P</b> (print to a picture), and the right-click menu (View Page Source, Save Image As...).</p>
+
+<h2>Form controls</h2>
+<form class="card" action="https://example.com/" method="post" enctype="multipart/form-data" onsubmit="return confirm('Send it?')">
+<label for="name">Name (autofocus)</label><input id="name" name="name" autofocus><br>
+<label for="fruit">Fruit (datalist)</label><input id="fruit" name="fruit" list="fruits" placeholder="type an f..."><br>
+<datalist id="fruits"><option value="Apple"><option value="Apricot"><option value="Banana"><option value="Blueberry"><option value="Cherry" label="Cherry (sweet)"><option value="Fig"><option value="Grape"></datalist>
+<label for="size">Size (select)</label>
+<select id="size" name="size"><option>Small</option><option selected>Medium</option><option>Large</option><option disabled>Huge (sold out)</option><option>Extra large</option></select><br>
+<label for="vol">Volume (range)</label><input id="vol" type="range" name="vol" min="0" max="10" step="1" value="3"> <span class="note">drag it, or use the arrow keys</span><br>
+<label for="col">Color</label><input id="col" type="color" name="col" value="#8a2be2"> <span class="note">click, then type #rrggbb</span><br>
+<label for="d">Date</label><input id="d" type="date" name="d"><br>
+<label for="t">Time</label><input id="t" type="time" name="t"><br>
+<label for="dt">Date and time</label><input id="dt" type="datetime-local" name="dt"><br>
+<label for="n">Number</label><input id="n" type="number" name="n" min="1" max="9"> <span class="note">only digits go in</span><br>
+<label for="em">Email (red when invalid)</label><input id="em" type="email" name="em"><br>
+<label for="f">File to send</label><input id="f" type="file" name="f"> <span class="note">click, then type a path</span><br>
+<p><input type="submit" value="Send"> <input type="reset" value="Reset"> <button type="button" class="press">Hold me (:active)</button></p>
+</form>
+
+<h2>Tooltips</h2>
+<p>Rest the pointer on <a href="home.html" title="Back to the home page">this link</a>, on <abbr title="HyperText Markup Language">HTML</abbr>, or on <span title="Titles work on any element">any element with a title</span>.</p>
+
+<h2>Text</h2>
+<div class="card">
+<p class="note">-webkit-line-clamp: 2</p>
+<div class="clamp">This paragraph is far longer than two lines, but it is cut off after the second one, however much text there is in it, and however wide the box is.</div>
+<p class="note">text-align-last: right (only the last line moves)</p>
+<div class="last">A line of text that is long enough to wrap onto a second line so that the last one can be seen at the right.</div>
+<p class="note">tab-size: 4</p>
+<pre class="tabs">a	b	c
+abcd	efgh</pre>
+<p class="note">list-style-image</p>
+<ul class="pics"><li>First picture bullet</li><li>Second picture bullet</li></ul>
+</div>
+
+<h2>Counters</h2>
+<p>The headings are numbered by <code>counter-reset</code>, <code>counter-increment</code> and <code>counter()</code> in <code>::before</code> content.</p>
+
+<h2>Something to find</h2>
+<p>The quick brown fox jumps over the lazy dog. The lazy dog sleeps; the quick fox runs. Search for "lazy dog" or "fox" with Ctrl+F: every match is marked and Enter goes to the next one.</p>
+<p><img src="wide.svg" alt="a picture" title="Right-click me for Save Image As..." width="200"></p>
+</body>
+</html>

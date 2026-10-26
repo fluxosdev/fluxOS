@@ -50,6 +50,11 @@ int wfont_width(const struct wfont *f, const char *s, int n);         /* UTF-8 *
 int wfont_draw(struct surface *s, const struct wfont *f, int x, int y, const char *str, int n,
                color_t c);
 
+/* A piece of the page's text that a search found: item, the characters of it, and which match it belongs to. */
+struct fhl {
+    int item, c0, c1, match;
+};
+
 /* ---- the document tree (html.c) ---- */
 #define TAG_LIST(X) \
     X(A, "a") X(ABBR, "abbr") X(ACRONYM, "acronym") X(ADDRESS, "address") X(AREA, "area") \
@@ -254,6 +259,12 @@ struct style {
     int letter_spacing, word_spacing;   /* pixels */
     uint8_t word_break;                 /* WB_* */
     uint8_t small_caps, list_inside, empty_hide;
+    uint8_t tab_size;                   /* inherited: tab stops every this many characters */
+    uint8_t text_align_last;            /* 0: as text_align; else TA_* + 1 for the last line */
+    uint8_t line_clamp;                 /* -webkit-line-clamp: lines shown (0: all) */
+    const char *ls_url;                 /* list-style-image: its address */
+    struct image *ls_img;               /* ...and the picture, set by the browser */
+    const char *counter_reset, *counter_inc;   /* the declared values; applied by the cascade */
     uint8_t deco_style;                 /* DS_* */
     uint32_t deco_color;                /* 0: the text color */
     int ts_x, ts_y, ts_blur;            /* text-shadow (the first) */
@@ -330,9 +341,12 @@ int css_media_query(const char *query, int vw, int vh);
 int css_imports(const char *text, int len, int vw, void (*found)(void *ctx, const char *url), void *ctx);
 /* The viewport height media queries in css_parse see (the width is css_parse's argument). */
 extern int css_viewport_h;
+/* Page zoom, in percent: absolute lengths, the font size and pictures are this much larger (100: as written). */
+extern int css_zoom;
+#define ZOOM(n) ((n) * css_zoom / 100)
 
 /* ---- :hover and :focus (css.c): the elements they match; css_dynamic_rules counts the rules that use them ---- */
-extern const struct node *css_hover_node, *css_focus_node;
+extern const struct node *css_hover_node, *css_focus_node, *css_active_node;
 extern int css_dynamic_rules;
 
 /* ---- cookies (cookies.c) ---- */
@@ -453,6 +467,9 @@ struct layout {
     uint32_t canvas;            /* the background behind everything */
     /* the selected text: items sel_from..sel_to, from character sel_c0 of the first to sel_c1 of the last */
     int sel_on, sel_from, sel_to, sel_c0, sel_c1;
+    /* text the find bar found, painted behind the text: hl_cur is the match that is the current one */
+    const struct fhl *hl;
+    int nhl, hl_cur;
 };
 
 /* Select the text between two points (page coordinates), in reading order. */
@@ -495,6 +512,13 @@ void layout_reveal(struct layout *lo, const struct node *n, int x, int y, int w,
 /* How the scrolling boxes round an item (its sb) move it, and the page rectangle that clips it. */
 void layout_sb_view(const struct layout *lo, int sb, int psx, int psy, int *dx, int *dy, struct rect *clip);
 
+/* <input type=range>: where its value is on the track (0 to 1000), the value a click at such a place
+ * gives, and the value one step on (dir -1 or 1; 0 for the first or last: -2 and 2). */
+int range_fraction(const struct node *n);
+void range_value_at(const struct node *n, int fraction, char *out, int size);
+void range_nudge(const struct node *n, int dir, char *out, int size);
+/* Characters a date or time field takes, and the pattern it is waiting for ("yyyy-mm-dd"); NULL for other fields. */
+const char *input_pattern(const char *type);
 /* The text a button, submit input or select shows. */
 const char *control_label(const struct node *n);
 /* Draw img scaled to w x h, alpha-blended. */

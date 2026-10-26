@@ -324,7 +324,7 @@ void wallpaper_kinetik(struct surface *s, int w, int h)
 
 /* ---- the desktop's wallpaper ---- */
 
-static uint32_t desk_color = RGB(0x3F, 0x17, 0x5F);     /* (the classic desktop's purple) */
+static uint32_t desk_color = RGB(0x16, 0x46, 0x7D);     /* (Kinetik Blue's middle color) */
 
 uint32_t wallpaper_color(void)
 {
@@ -447,19 +447,18 @@ int wallpaper_set(const char *path, int mode, int save)
 
 void wallpaper_theme_changed(int old_style)
 {
-    if (KINETIK && old_style != THEME_KINETIK && (!strcmp(cur_path, WALLPAPER_DEFAULT) || !cur_path[0]))
-        wallpaper_set(WALLPAPER_KINETIK, cur_mode, 1);  /* the stock picture gives way to the theme's own */
-    else if (!KINETIK && kinetik && wallpaper_set(WALLPAPER_DEFAULT, cur_mode, 1) < 0)
-        wallpaper_set("", cur_mode, 1);                 /* (the picture is gone: the plain desktop) */
-    else if (kinetik)
-        wallpaper_set(WALLPAPER_KINETIK, cur_mode, 0);  /* in the new color */
+    (void)old_style;
+    if (kinetik && KINETIK)
+        wallpaper_set(WALLPAPER_KINETIK, cur_mode, 0);  /* the drawn one, in the new color */
+    else if (kinetik && wallpaper_set(WALLPAPER_DEFAULT, cur_mode, 1) < 0)
+        wallpaper_set("", cur_mode, 1);                 /* Classic has no drawn wallpaper of its own */
 }
 
-/* At startup: the saved choice, or the theme's (the photograph, filled, for Classic). */
+/* At startup: the saved choice, or the bamboo photograph, filled. */
 void wallpaper_init(void)
 {
     char dir[128], path[256], name[16];
-    const char *use = KINETIK ? WALLPAPER_KINETIK : WALLPAPER_DEFAULT;
+    const char *use = WALLPAPER_DEFAULT;
     int mode = WALL_FILL;
     if (grubenv_boot_dir(dir, sizeof(dir))) {
         if (grubenv_get(dir, "fluxos_wall", path, sizeof(path)) && path[0])

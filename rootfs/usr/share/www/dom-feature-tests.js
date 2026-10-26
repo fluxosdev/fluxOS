@@ -114,3 +114,27 @@ test("scrollTo, scroll and scrollBy exist on elements and take numbers or option
   e.scrollTo(3, 4); e.scroll({ left: 1, top: 2 }); e.scrollBy(1, 1); e.scrollBy({ top: 5 });
   return [typeof e.scrollTo, typeof e.scroll, typeof e.scrollBy, e.scrollTop >= 0, e.scrollLeft >= 0];
 }, ["function", "function", "function", true, true]);
+group("Small web APIs");
+test("XMLSerializer writes elements and text", function () {
+  var e = document.createElement("div"); e.innerHTML = "<b>a &amp; b</b>";
+  return [new XMLSerializer().serializeToString(e), new XMLSerializer().serializeToString(e.firstChild.firstChild)];
+}, ["<div><b>a &amp; b</b></div>", "a &amp; b"]);
+test("ImageData and Path2D keep their parts", function () {
+  var d = new ImageData(2, 3), p = new Path2D(); p.moveTo(1, 2); p.lineTo(3, 4); p.rect(0, 0, 5, 5);
+  var q = new Path2D(p); q.closePath();
+  return [d.width, d.height, d.data.length, p.ops.length, q.ops.length, new ImageData(new Array(16).fill(0), 2).height];
+}, [2, 3, 24, 3, 4, 2]);
+test("MessageChannel and BroadcastChannel are there, and BroadcastChannel names must match", function () {
+  var mc = new MessageChannel(), a = new BroadcastChannel("x"), b = new BroadcastChannel("x");
+  a.close(); b.close();
+  return [typeof mc.port1.postMessage, mc.port1 instanceof EventTarget, a.name, typeof MessagePort];
+}, ["function", true, "x", "function"]);
+var rejected = [];
+window.addEventListener("unhandledrejection", function (e) { rejected.push(String(e.reason)); e.preventDefault(); });
+test("a rejection nobody handles reaches the window (below)", function () {
+  Promise.reject("boom"); Promise.reject("handled").catch(function () {}); new Promise(function (_, rj) { rj("late"); });
+  return typeof document.hidden + document.visibilityState;
+}, "booleanvisible");
+Promise.resolve().then(function () {}).then(function () {}).then(function () {
+  test("unhandledrejection fired for the two that nobody handled", function () { return rejected.slice().sort(); }, ["boom", "late"]);
+});

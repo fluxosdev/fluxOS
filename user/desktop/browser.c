@@ -73,12 +73,26 @@
 #define SC_R 0x13
 #define SC_H 0x23
 #define SC_J 0x24
+#define SC_F 0x21
+#define SC_D 0x20
+#define SC_P 0x19
+#define SC_MINUS 0x0C
+#define SC_EQUALS 0x0D
+#define SC_0 0x0B
+#define SC_KP_MINUS 0x4A
+#define SC_KP_PLUS 0x4E
 #define KEY_BACKSPACE 0x0E
 #define KEY_F6 0x40
 
 enum { F_PAGE, F_CSS, F_IMG, F_JS, F_XHR, F_ICON, F_MODULE };
 enum { NAV_NEW, NAV_REPLACE, NAV_HISTORY };
-enum { B_BACK, B_FORWARD, B_STOP, B_REFRESH, B_HOME, B_HISTORY, B_DOWNLOADS, B_GO, NBUTTONS };
+enum { B_BACK, B_FORWARD, B_STOP, B_REFRESH, B_HOME, B_HISTORY, B_DOWNLOADS, B_FAVORITES, B_GO, NBUTTONS };
+/* What a page load is for besides showing the page. */
+enum { SP_NONE, SP_SAVE, SP_SOURCE };
+#define BOOKMARKS_FILE "/home/flux/.browser_bookmarks"
+#define FIND_MAX_HL   4000          /* highlighted pieces of text the find bar tracks */
+#define FIND_TEXT_MAX 400000        /* bytes of page text it searches */
+#define TIP_DELAY_MS  600
 enum hold { H_NONE, H_BUTTON, H_VBAR, H_HBAR, H_PAGE, H_SBOX };
 
 struct fetch {
@@ -95,6 +109,7 @@ struct fetch {
     int redirects;
     int mode;                   /* F_PAGE: NAV_* */
     char *post;                 /* F_PAGE: a form's POST body */
+    int special;                /* F_PAGE: SP_* */
 };
 
 /* A browser's fetcher process (httpc): requests go down one pipe, frames of answers come back up the other. */
@@ -185,6 +200,35 @@ struct browser {
     int loading, total_res, done_res;
     int need_style, need_layout;
     char status[256];
+    char page_title[128];       /* the document's title, for favorites */
+    int zoom;                   /* page zoom in percent, 0 for 100 (a window's; its frames follow it) */
+    int next_special;           /* SP_* for the next page fetch */
+
+    /* find in page (a window's) */
+    int find_open, find_len, find_cur, find_n;
+    char find_text[96];
+    struct fhl *find_hl;        /* the pieces of text that match, in order */
+    int find_nhl;
+    int *find_first;            /* find_first[k]: where match k starts in find_hl */
+
+    /* a tooltip (title=), shown when the pointer has rested on something that has one */
+    struct node *tip_node;
+    unsigned tip_since;
+    int tip_shown, tip_x, tip_y;
+    char tip_text[240];
+
+    /* the pop-up list of a <select> or of an input's <datalist> */
+    struct node *pop_node;
+    int pop_list;               /* 1: a datalist's suggestions for a text field */
+    int pop_hover, pop_top;
+    int pop_swallow;            /* a press went to the list: its release does too */
+    struct node *drag_range;    /* a range slider being dragged */
+    struct node *ask_node;      /* the file or color input a question is open for */
+
+    /* a multipart/form-data body for the form just submitted (it may hold NUL bytes) */
+    char *mp_body;
+    size_t mp_len;
+    char mp_type[96];
 
     /* history */
     struct hist hist[HIST_MAX];
@@ -245,7 +289,8 @@ struct browser {
 
     /* a window's right-click menu */
     int ctx_open, ctx_n, ctx_hover, ctx_x, ctx_y;
-    uint8_t ctx_codes[10];
+    uint8_t ctx_codes[24];
+    char ctx_image[URL_MAX];            /* the picture the menu was opened on */
     char ctx_url[URL_MAX];              /* the link the menu was opened on */
 };
 
@@ -258,6 +303,11 @@ static int nvisited;
 
 static void navigate(struct browser *b, const char *url, const char *post, int mode);
 static void paint(struct browser *b);
+static void draw_pop(struct browser *b, struct surface *s, int ox, int oy);
+static void find_run(struct browser *t, int jump);
+static void pop_close(struct browser *b);
+static void pop_open(struct browser *b, struct node *n, int list);
+static void suggest(struct browser *b, struct node *f);
 static void start_next(struct browser *b);
 static void history_add(const char *url, const char *title);
 
@@ -265,7 +315,7 @@ static void history_add(const char *url, const char *title);
 
 static struct rect button_rect(struct browser *b, int i)
 {
-    static const int widths[] = { 62, 74, 56, 70, 60, 68, 90 };
+    static const int widths[] = { 62, 74, 56, 70, 60, 68, 90, 82 };
     int x = 4;
     if (i == B_GO)
         return mkrect(b->win->content.w - 44, TOOLBAR_H + 2, 40, ADDR_H - 4);
@@ -297,6 +347,18 @@ static struct browser *top_of(struct browser *b)
     while (b->parent)
         b = b->parent;
     return b;
+}
+
+/* The zoom of the window b is in (frames follow it), made the one the style and layout code use. */
+static int zoom_of(struct browser *b)
+{
+    int z = top_of(b)->zoom;
+    return z ? z : 100;
+}
+
+static void zoom_sync(struct browser *b)
+{
+    css_zoom = zoom_of(b);
 }
 
 /* The page's area with its frame: the window's sunken box, or a frame's whole iframe. */
@@ -1049,6 +1111,14 @@ static int start_via_helper(struct browser *b, int kind, const char *url, const 
         if (body && !*body)
             body = NULL;
     }
+    size_t blen = body ? strlen(body) : 0;
+    char ctype[sizeof(b->mp_type) + 16];
+    if (kind == F_PAGE && b->mp_body && post) {         /* a form with files: its multipart body, NULs and all */
+        body = b->mp_body;
+        blen = b->mp_len;
+        snprintf(ctype, sizeof(ctype), "Content-Type: %s", b->mp_type);
+        hdrs[nh++] = ctype;
+    }
     char ua[] = "User-Agent: " BROWSER_USER_AGENT;
     hdrs[nh++] = ua;
     static char cookies[4096 + 16];
@@ -1066,8 +1136,12 @@ static int start_via_helper(struct browser *b, int kind, const char *url, const 
     if (kind == F_PAGE)
         b->reload_next = 0;
     int r = helper_request(b, id, flags, kind == F_IMG ? 10 : 30, kind == F_PAGE ? MAX_PAGE : MAX_RESOURCE,
-                           method, url, hdrs, nh, body, body ? strlen(body) : 0);
+                           method, url, hdrs, nh, body, blen);
     free(packed);
+    if (kind == F_PAGE) {
+        free(b->mp_body);               /* sent (or not to be) */
+        b->mp_body = NULL;
+    }
     if (r < 0) {
         helper_close(b);                        /* it was gone: the next request starts another */
         return -1;
@@ -1086,6 +1160,9 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
     struct fetch *f = &b->fetch;
     f->active = 1;
     f->kind = kind;
+    f->special = kind == F_PAGE ? b->next_special : SP_NONE;
+    if (kind == F_PAGE)
+        b->next_special = SP_NONE;
     f->slot = slot;
     f->redirects = redirects;
     f->mode = mode;
@@ -1320,33 +1397,46 @@ static struct bgref *bg_find(struct browser *b, const char *url)
  * Give every style whose background names a picture that picture (or none yet): asks for the ones not asked
  * for before. Styles are made afresh at each cascade, so this runs before each layout.
  */
+/* The picture named by url (asked for if it was not before), for a style that wants one. */
+static struct bgref *bg_want(struct browser *b, const char *url)
+{
+    char abs[URL_MAX];
+    const char *key = url;
+    if (strncasecmp(key, "data:", 5)) {
+        url_resolve(b->base, key, abs, sizeof(abs));
+        url_strip_fragment(abs);
+        key = abs;
+    }
+    struct bgref *r = bg_find(b, key);
+    if (!r && b->nbgs < MAX_RES) {
+        r = &b->bgs[b->nbgs++];
+        r->url = arena_strdup(&b->arena, key);
+        r->via = NULL;
+        r->img = NULL;
+        struct cached *c = r->url ? cache_find_data(b, r->url) : NULL;
+        if (c)
+            r->img = c->img;
+        else if (r->url)
+            queue_resource(b, F_IMG, r->url, 0, 0);
+    }
+    return r;
+}
+
 static void bg_attach(struct browser *b)
 {
     if (!b->root || !b->bgs)
         return;
     for (struct node *n = b->root; n; n = node_next(n, b->root)) {
-        if (n->type != N_ELEMENT || !n->style || !n->style->bg_url)
+        if (n->type != N_ELEMENT || !n->style || !(n->style->bg_url || n->style->ls_url))
             continue;
-        char abs[URL_MAX];
-        const char *key = n->style->bg_url;
-        if (strncasecmp(key, "data:", 5)) {
-            url_resolve(b->base, key, abs, sizeof(abs));
-            url_strip_fragment(abs);
-            key = abs;
+        if (n->style->bg_url) {
+            struct bgref *r = bg_want(b, n->style->bg_url);
+            n->style->bg_img = r ? r->img : NULL;
         }
-        struct bgref *r = bg_find(b, key);
-        if (!r && b->nbgs < MAX_RES) {
-            r = &b->bgs[b->nbgs++];
-            r->url = arena_strdup(&b->arena, key);
-            r->via = NULL;
-            r->img = NULL;
-            struct cached *c = r->url ? cache_find_data(b, r->url) : NULL;
-            if (c)
-                r->img = c->img;
-            else if (r->url)
-                queue_resource(b, F_IMG, r->url, 0, 0);
+        if (n->style->ls_url) {
+            struct bgref *r = bg_want(b, n->style->ls_url);
+            n->style->ls_img = r ? r->img : NULL;
         }
-        n->style->bg_img = r ? r->img : NULL;
     }
 }
 
@@ -1612,6 +1702,9 @@ static void free_page(struct browser *b)
     b->focus = NULL;
     b->hover = NULL;
     b->press_link = b->press_ctrl = NULL;
+    b->pop_node = b->drag_range = b->ask_node = b->tip_node = NULL;
+    b->tip_shown = 0;
+    b->pop_swallow = 0;
     b->refresh_url[0] = 0;
     jsdom_free(b->js);
     b->js = NULL;
@@ -1631,6 +1724,7 @@ static void relayout(struct browser *b)
 {
     if (!b->root)
         return;
+    zoom_sync(b);
     struct rect v = view_rect(b);
     if (b->need_style) {
         arena_free(&b->sarena);
@@ -1653,6 +1747,8 @@ static void relayout(struct browser *b)
     sync_frames(b);
     if (b->js)
         jsdom_layout_changed(b->js);
+    if (b->find_open && !is_frame(b))
+        find_run(b, 0);                 /* what was found is somewhere else now */
 }
 
 static void scroll_to_fragment(struct browser *b, const char *frag)
@@ -1842,8 +1938,8 @@ static void js_scroll_pos(void *ctx, int *x, int *y)
 static void js_viewport(void *ctx, int *w, int *h)
 {
     struct rect v = view_rect(ctx);
-    *w = v.w;
-    *h = v.h;
+    *w = v.w * 100 / zoom_of(ctx);              /* in CSS pixels: a zoomed page is a smaller window */
+    *h = v.h * 100 / zoom_of(ctx);
 }
 
 static void js_set_title(void *ctx, const char *title)
@@ -2392,6 +2488,7 @@ static struct sheet *parse_sheet(struct browser *b, const char *text, int len, c
                                  struct node *owner, int parent, int imports)
 {
     struct rect vr = view_rect(b);
+    zoom_sync(b);
     css_viewport_h = vr.h;
     int alen = len;
     char *abs_text = css_absolute_urls(text, len, base, &alen);
@@ -2438,6 +2535,7 @@ static struct node *after_subtree(struct node *n, const struct node *root)
 static void collect_sheets(struct browser *b)
 {
     struct rect vr = view_rect(b);
+    zoom_sync(b);
     b->nsheets = 0;
     for (struct node *n = b->root; n;) {
         if (n->type != N_ELEMENT) {
@@ -2536,6 +2634,12 @@ static void load_document(struct browser *b, const char *text, int len, const ch
     if (!b->root)
         return;
     init_controls(b->root);
+    for (struct node *n = b->root; n; n = node_next(n, b->root))        /* autofocus: the first field that asks */
+        if (n->type == N_ELEMENT && node_attr(n, "autofocus") && !node_attr(n, "disabled") && is_text_field(n)) {
+            b->focus = n;
+            n->cursor = n->value ? (int)strlen(n->value) : 0;
+            break;
+        }
 
     /* <base>, <title>, <meta refresh>, style sheets and pictures. */
     char title[256] = "";
@@ -2574,6 +2678,7 @@ static void load_document(struct browser *b, const char *text, int len, const ch
         }
     }
     update_title(b, title);
+    snprintf(b->page_title, sizeof(b->page_title), "%s", title);
     if (!is_frame(b))
         history_add(url, title);
     b->total_res = b->done_res = 0;
@@ -2978,6 +3083,105 @@ static void show_log_page(struct browser *b, const char *url, int history)
     free(html);
 }
 
+/* ---- favorites: the pages you kept, in the home folder like the history ---- */
+
+static struct log_entry bm_log[LOG_MAX];
+static int nbm_log, bm_loaded;
+
+static void bm_init(void)
+{
+    if (bm_loaded)
+        return;
+    bm_loaded = 1;
+    log_load(BOOKMARKS_FILE, bm_log, &nbm_log);
+}
+
+static int bm_find(const char *url)
+{
+    bm_init();
+    for (int i = 0; i < nbm_log; i++)
+        if (!strcmp(bm_log[i].url, url))
+            return i;
+    return -1;
+}
+
+static void bm_rewrite(void)
+{
+    int fd = open(BOOKMARKS_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0)
+        close(fd);
+    for (int i = 0; i < nbm_log; i++)
+        log_append(BOOKMARKS_FILE, &bm_log[i]);
+}
+
+static void bm_remove(int i)
+{
+    if (i < 0 || i >= nbm_log)
+        return;
+    log_free(&bm_log[i]);
+    memmove(&bm_log[i], &bm_log[i + 1], sizeof(bm_log[0]) * (size_t)(nbm_log - i - 1));
+    nbm_log--;
+    bm_rewrite();
+}
+
+/* Keep this page, or drop it from the favorites if it is there; 1 if it was added. */
+static int bm_toggle(struct browser *b)
+{
+    char u[URL_MAX];
+    snprintf(u, sizeof(u), "%s", b->url);
+    url_strip_fragment(u);
+    if (!u[0] || !strncasecmp(u, "about:", 6))
+        return -1;
+    int i = bm_find(u);
+    if (i >= 0) {
+        bm_remove(i);
+        return 0;
+    }
+    log_push(BOOKMARKS_FILE, bm_log, &nbm_log, u, b->page_title[0] ? b->page_title : u, 0);
+    return 1;
+}
+
+/* about:bookmarks, in the order they were kept; about:bookmarks?remove=N drops one first. */
+static void show_bookmarks_page(struct browser *b, const char *url)
+{
+    bm_init();
+    const char *rm = strstr(url, "remove=");
+    if (rm)
+        bm_remove(atoi(rm + 7));
+    int cap = 4096 + nbm_log * (URL_MAX * 3 + 512);
+    char *html = malloc((size_t)cap);
+    if (!html)
+        return;
+    int o = snprintf(html, (size_t)cap,
+                     "<!DOCTYPE html><html><head><title>Favorites</title><style>"
+                     "body { font-family: sans-serif; margin: 24px 32px; background: #f3f0f7; color: #222 }"
+                     "h1 { font-size: 24px; color: #3f175f; margin: 0 0 4px }"
+                     "p { color: #666; margin: 4px 0 14px }"
+                     "table { border-collapse: collapse; background: white; border: 1px solid #d6cce2 }"
+                     "td { padding: 5px 12px; border-bottom: 1px solid #eee; font-size: 14px }"
+                     "td.u { color: #777; font-size: 12px }"
+                     "</style></head><body><h1>Favorites</h1>"
+                     "<p>Press Ctrl+D on a page, or use its right-click menu, to keep it here.</p>");
+    if (!nbm_log) {
+        o += snprintf(html + o, (size_t)(cap - o), "<p>No favorites yet.</p>");
+    } else {
+        o += snprintf(html + o, (size_t)(cap - o), "<table>");
+        for (int i = 0; i < nbm_log && o < cap - (URL_MAX * 3 + 512); i++) {
+            char eurl[URL_MAX * 2], etitle[1024];
+            escape(bm_log[i].url, eurl, sizeof(eurl));
+            escape(bm_log[i].extra, etitle, sizeof(etitle));
+            o += snprintf(html + o, (size_t)(cap - o),
+                          "<tr><td><a href=\"%s\">%s</a></td><td class=u>%s</td>"
+                          "<td><a href=\"about:bookmarks?remove=%d\">Remove</a></td></tr>",
+                          eurl, etitle[0] ? etitle : eurl, eurl, i);
+        }
+        o += snprintf(html + o, (size_t)(cap - o), "</table>");
+    }
+    o += snprintf(html + o, (size_t)(cap - o), "</body></html>");
+    load_document(b, html, o < cap ? o : cap - 1, "about:bookmarks", "utf-8");
+    free(html);
+}
+
 /* The name a download is saved under: from Content-Disposition, else the end of the URL. */
 static void download_name(const char *url, const char *disp, char *out, int size)
 {
@@ -3015,7 +3219,12 @@ static void download_name(const char *url, const char *disp, char *out, int size
 static void save_download(struct browser *b, const struct fetch *f, const struct response *r)
 {
     char name[128], path[256], msg[URL_MAX + 512], eurl[URL_MAX * 2];
+    int quiet = f->special == SP_SAVE;      /* asked for from a menu: say so in the status bar, keep the page */
     escape(f->url, eurl, sizeof(eurl));
+    if (f->len >= MAX_PAGE && quiet) {
+        set_status(b, "%.100s is too large to save here: use wget", f->url);
+        return;
+    }
     if (f->len >= MAX_PAGE) {
         snprintf(msg, sizeof(msg),
                  "<code>%s</code> is larger than %d MB, which is more than the browser can download. "
@@ -3040,6 +3249,10 @@ static void save_download(struct browser *b, const struct fetch *f, const struct
     }
     if (fd >= 0)
         close(fd);
+    if (!ok && quiet) {
+        set_status(b, "Could not save %.100s: %s", f->url, strerror(errno));
+        return;
+    }
     if (!ok) {
         snprintf(msg, sizeof(msg), "<code>%s</code> could not be saved: %s.", eurl, strerror(errno));
         show_message(b, f->url, "Download failed", msg);
@@ -3047,6 +3260,10 @@ static void save_download(struct browser *b, const struct fetch *f, const struct
     }
     logs_init();
     log_push(DOWNLOADS_FILE, dl_log, &ndl_log, f->url, path, r->len);
+    if (quiet) {
+        set_status(b, "Saved %s", path);
+        return;
+    }
     char size[32], epath[512];
     format_size(r->len, size, sizeof(size));
     escape(path, epath, sizeof(epath));
@@ -3108,8 +3325,16 @@ static void fetch_complete(struct browser *b)
 
     if (done.kind == F_PAGE) {
         b->loading = 0;
-        if (!ok) {
-            page_failed(b, done.url, why);
+        char shown[URL_MAX + 16];       /* the address the page is shown under */
+        snprintf(shown, sizeof(shown), "%s%s", done.special == SP_SOURCE ? "view-source:" : "", done.url);
+        if (done.special == SP_SOURCE && ok) {
+            snprintf(r.type, sizeof(r.type), "text/plain");     /* its text, whatever it is */
+            r.disp[0] = 0;
+        }
+        if (!ok && done.special == SP_SAVE) {
+            set_status(b, "Could not save %.120s: %.120s", done.url, why);
+        } else if (!ok) {
+            page_failed(b, shown, why);
         } else if (r.status >= 300 && r.status < 400 && r.location[0]) {
             char next[URL_MAX];
             url_resolve(done.url, r.location, next, sizeof(next));
@@ -3120,6 +3345,7 @@ static void fetch_complete(struct browser *b)
                     size_t l = strlen(next);
                     snprintf(next + l, sizeof(next) - l, "#%s", url_fragment(done.url));
                 }
+                b->next_special = done.special;
                 start_fetch(b, F_PAGE, next, NULL, 0, done.redirects + 1,
                             done.mode == NAV_NEW ? NAV_REPLACE : done.mode);
                 if (done.mode == NAV_NEW && b->nhist) {
@@ -3127,14 +3353,15 @@ static void fetch_complete(struct browser *b)
                     b->hist[b->hpos].url = strdup(next);
                 }
                 b->loading = 1;
-                set_addr(b, next);
+                if (done.special != SP_SAVE)
+                    set_addr(b, next);
                 set_status(b, "Redirected to %s", next);
                 free(done.buf);
                 free(done.post);
                 paint(b);
                 return;
             }
-        } else if (strcasestr(r.disp, "attachment")) {
+        } else if (done.special == SP_SAVE || strcasestr(r.disp, "attachment")) {
             save_download(b, &done, &r);
         } else if (!strncmp(r.type, "image/", 6)) {
             char html[URL_MAX * 2 + 128], eurl[URL_MAX * 2];
@@ -3164,15 +3391,17 @@ static void fetch_complete(struct browser *b)
                     }
                 }
                 o += snprintf(html + o, (size_t)(cap - o), "</pre></body></html>");
-                load_document(b, html, o, done.url, r.charset);
+                load_document(b, html, o, shown, r.charset);
                 free(html);
             }
         } else {
             load_document(b, r.body, r.len, done.url, r.charset[0] ? r.charset : NULL);
         }
-        mark_visited(done.url);
-        if (!b->total_res)
-            done_status(b);
+        if (done.special != SP_SAVE) {
+            mark_visited(done.url);
+            if (!b->total_res)
+                done_status(b);
+        }
     } else {
         b->done_res++;
         if (ok && r.status >= 300 && r.status < 400 && r.location[0] && done.redirects < 5) {
@@ -3304,6 +3533,8 @@ static void navigate(struct browser *b, const char *url, const char *post, int m
     }
     char u[URL_MAX];
     snprintf(u, sizeof(u), "%s", url);
+    int source = !strncasecmp(u, "view-source:", 12);      /* its text, not the page it makes */
+    const char *fu = source ? u + 12 : u;                  /* what is fetched */
 
     /* Only the fragment changed: scroll, do not reload (nor stop what is loading). */
     char a[URL_MAX], cur[URL_MAX];
@@ -3332,6 +3563,11 @@ static void navigate(struct browser *b, const char *url, const char *post, int m
         paint(b);
         return;
     }
+    if (b->js && b->root) {             /* the page is being left */
+        jsdom_page_event(b->js, "beforeunload", 0);
+        if (b->js)
+            jsdom_page_event(b->js, "pagehide", 0);
+    }
     stop_all(b);
     b->refresh_url[0] = 0;
     if (mode == NAV_NEW)
@@ -3354,10 +3590,12 @@ static void navigate(struct browser *b, const char *url, const char *post, int m
             if (strstr(u, "clear"))
                 log_clear(DOWNLOADS_FILE, dl_log, &ndl_log);
             show_log_page(b, u, 0);
+        } else if (!strncasecmp(u, "about:bookmarks", 15)) {
+            show_bookmarks_page(b, u);
         } else {
             page_failed(b, u, "There is no such about: page");
         }
-    } else if (!url_is_http(u) && !url_is_https(u) && !url_is_file(u)) {
+    } else if (!url_is_http(fu) && !url_is_https(fu) && !url_is_file(fu)) {
         char msg[256];
         snprintf(msg, sizeof(msg), "Only http://, https:// and file:// addresses can be opened");
         page_failed(b, u, msg);
@@ -3365,7 +3603,13 @@ static void navigate(struct browser *b, const char *url, const char *post, int m
         b->loading = 1;
         set_status(b, "Opening %s...", u);
         paint(b);
-        if (start_fetch(b, F_PAGE, u, post, 0, 0, mode) < 0) {
+        if (source)
+            b->next_special = SP_SOURCE;
+        int started = start_fetch(b, F_PAGE, fu, post, 0, 0, mode);
+        free(b->mp_body);               /* whichever way it went, a multipart body is for this request only */
+        b->mp_body = NULL;
+        if (started < 0) {
+            b->next_special = SP_NONE;
             b->loading = 0;
             page_failed(b, u, strerror(errno));
         }
@@ -3512,7 +3756,8 @@ static int is_text_field(const struct node *n)
     const char *t = type_of(n);
     return strcasecmp(t, "checkbox") && strcasecmp(t, "radio") && strcasecmp(t, "submit") &&
            strcasecmp(t, "reset") && strcasecmp(t, "button") && strcasecmp(t, "image") &&
-           strcasecmp(t, "hidden") && strcasecmp(t, "file");
+           strcasecmp(t, "hidden") && strcasecmp(t, "file") && strcasecmp(t, "range") &&
+           strcasecmp(t, "color");
 }
 
 static void add_pair(char *q, int size, const char *name, const char *value)
@@ -3525,10 +3770,11 @@ static void add_pair(char *q, int size, const char *name, const char *value)
 }
 
 /* The request a form makes: target gets its URL; returns 1 for a POST, with the body in q. */
-static int form_request(struct browser *b, struct node *form, struct node *submitter, char *target, int tsize,
-                        char *q, int qsize)
+/* What a form sends: each name and value, in order (a file input's value is its path, and it comes as `file`). */
+typedef void (*field_fn)(void *ctx, const char *name, const char *value, struct node *file);
+
+static void form_fields(struct node *form, struct node *submitter, field_fn emit, void *ctx)
 {
-    q[0] = 0;
     for (struct node *n = form; n; n = node_next(n, form)) {
         if (n->type != N_ELEMENT || node_attr(n, "disabled"))
             continue;
@@ -3539,28 +3785,49 @@ static int form_request(struct browser *b, struct node *form, struct node *submi
             const char *t = type_of(n);
             if (!strcasecmp(t, "checkbox") || !strcasecmp(t, "radio")) {
                 if (n->checked)
-                    add_pair(q, qsize, name, node_attr(n, "value") ? node_attr(n, "value") : "on");
+                    emit(ctx, name, node_attr(n, "value") ? node_attr(n, "value") : "on", NULL);
             } else if (!strcasecmp(t, "submit") || !strcasecmp(t, "image") || !strcasecmp(t, "button")) {
                 if (n == submitter)
-                    add_pair(q, qsize, name, control_label(n));
-            } else if (strcasecmp(t, "reset") && strcasecmp(t, "file")) {
-                add_pair(q, qsize, name, n->value ? n->value : "");
+                    emit(ctx, name, control_label(n), NULL);
+            } else if (!strcasecmp(t, "file")) {
+                emit(ctx, name, n->value ? n->value : "", n);
+            } else if (strcasecmp(t, "reset")) {
+                emit(ctx, name, n->value ? n->value : "", NULL);
             }
         } else if (n->tag == T_TEXTAREA) {
-            add_pair(q, qsize, name, n->value ? n->value : "");
+            emit(ctx, name, n->value ? n->value : "", NULL);
         } else if (n->tag == T_SELECT) {
             int k = 0;
             for (struct node *o = n; o; o = node_next(o, n)) {
                 if (o->type != N_ELEMENT || o->tag != T_OPTION)
                     continue;
                 if (k++ == n->checked)
-                    add_pair(q, qsize, name, node_attr(o, "value") ? node_attr(o, "value")
-                                                                   : (o->value ? o->value : ""));
+                    emit(ctx, name, node_attr(o, "value") ? node_attr(o, "value") : (o->value ? o->value : ""), NULL);
             }
         } else if (n->tag == T_BUTTON && n == submitter) {
-            add_pair(q, qsize, name, node_attr(n, "value") ? node_attr(n, "value") : "");
+            emit(ctx, name, node_attr(n, "value") ? node_attr(n, "value") : "", NULL);
         }
     }
+}
+
+struct pairs {
+    char *q;
+    int size;
+};
+
+static void pair_field(void *ctx, const char *name, const char *value, struct node *file)
+{
+    struct pairs *p = ctx;
+    if (!file)                          /* a plain form sends a file's name only as a multipart one does */
+        add_pair(p->q, p->size, name, value);
+}
+
+static int form_request(struct browser *b, struct node *form, struct node *submitter, char *target, int tsize,
+                        char *q, int qsize)
+{
+    q[0] = 0;
+    struct pairs p = { q, qsize };
+    form_fields(form, submitter, pair_field, &p);
     const char *action = node_attr(form, "action");
     const char *method = node_attr(form, "method");
     url_resolve(b->base, action && *action ? action : b->url, target, tsize);
@@ -3575,6 +3842,116 @@ static int form_request(struct browser *b, struct node *form, struct node *submi
     return 0;
 }
 
+/* ---- multipart/form-data: forms with files ---- */
+
+struct mpbuf {
+    char *buf;
+    size_t len, cap;
+    char boundary[48];
+    int failed;
+};
+
+static void mp_cat(struct mpbuf *m, const void *data, size_t n)
+{
+    if (m->failed)
+        return;
+    if (m->len + n + 1 > m->cap) {
+        size_t cap = (m->len + n + 1) * 2;
+        char *nb = realloc(m->buf, cap);
+        if (!nb) {
+            m->failed = 1;
+            return;
+        }
+        m->buf = nb;
+        m->cap = cap;
+    }
+    memcpy(m->buf + m->len, data, n);
+    m->len += n;
+}
+
+static void mp_str(struct mpbuf *m, const char *s)
+{
+    mp_cat(m, s, strlen(s));
+}
+
+/* A name or file name inside the quotes of a header: no quotes, no line breaks. */
+static void mp_quoted(struct mpbuf *m, const char *s)
+{
+    for (; *s; s++) {
+        if (*s == '"')
+            mp_str(m, "%22");
+        else if (*s == '\r' || *s == '\n')
+            mp_str(m, " ");
+        else
+            mp_cat(m, s, 1);
+    }
+}
+
+static const char *mime_of(const char *name)
+{
+    static const struct { const char *ext, *type; } types[] = {
+        { ".txt", "text/plain" }, { ".html", "text/html" }, { ".htm", "text/html" }, { ".css", "text/css" },
+        { ".js", "text/javascript" }, { ".json", "application/json" }, { ".xml", "application/xml" },
+        { ".png", "image/png" }, { ".jpg", "image/jpeg" }, { ".jpeg", "image/jpeg" }, { ".gif", "image/gif" },
+        { ".svg", "image/svg+xml" }, { ".ico", "image/x-icon" }, { ".pdf", "application/pdf" },
+        { ".zip", "application/zip" }, { ".wav", "audio/wav" }, { ".csv", "text/csv" },
+    };
+    const char *dot = strrchr(name, '.');
+    for (size_t i = 0; dot && i < sizeof(types) / sizeof(types[0]); i++)
+        if (!strcasecmp(dot, types[i].ext))
+            return types[i].type;
+    return "application/octet-stream";
+}
+
+static void mp_field(void *ctx, const char *name, const char *value, struct node *file)
+{
+    struct mpbuf *m = ctx;
+    mp_str(m, "--");
+    mp_str(m, m->boundary);
+    mp_str(m, "\r\nContent-Disposition: form-data; name=\"");
+    mp_quoted(m, name);
+    if (!file) {
+        mp_str(m, "\"\r\n\r\n");
+        mp_str(m, value);
+        mp_str(m, "\r\n");
+        return;
+    }
+    const char *base = strrchr(value, '/');
+    base = base ? base + 1 : value;
+    long len = 0;
+    char *data = *value ? store_read_file(value, 8L << 20, &len) : NULL;   /* up to 8 MB a file */
+    mp_str(m, "\"; filename=\"");
+    mp_quoted(m, data ? base : "");
+    mp_str(m, "\"\r\nContent-Type: ");
+    mp_str(m, data ? mime_of(base) : "application/octet-stream");
+    mp_str(m, "\r\n\r\n");
+    if (data)
+        mp_cat(m, data, (size_t)len);
+    mp_str(m, "\r\n");
+    free(data);
+}
+
+/* The body for a form whose enctype is multipart/form-data, kept for the request the submit starts. */
+static int build_multipart(struct browser *tb, struct node *form, struct node *submitter)
+{
+    static int serial;
+    struct mpbuf m = { 0 };
+    snprintf(m.boundary, sizeof(m.boundary), "----fluxOSFormBoundary%08x", (unsigned)(now_ms() * 2654435761u) + (unsigned)serial++);
+    form_fields(form, submitter, mp_field, &m);
+    mp_str(&m, "--");
+    mp_str(&m, m.boundary);
+    mp_str(&m, "--\r\n");
+    if (m.failed) {
+        free(m.buf);
+        return -1;
+    }
+    free(tb->mp_body);
+    tb->mp_body = m.buf;
+    tb->mp_len = m.len;
+    snprintf(tb->mp_type, sizeof(tb->mp_type), "multipart/form-data; boundary=%s", m.boundary);
+    return 0;
+}
+
 static void submit(struct browser *b, struct node *form, struct node *submitter)
 {
     if (b->js && jsdom_dispatch(b->js, form, "submit"))
@@ -3583,7 +3960,15 @@ static void submit(struct browser *b, struct node *form, struct node *submitter)
         return;                         /* or went somewhere else */
     char q[URL_MAX], target[URL_MAX];
     int post = form_request(b, form, submitter, target, sizeof(target), q, sizeof(q));
-    navigate(target_of(b, node_attr(form, "target")), target, post ? q : NULL, NAV_NEW);
+    struct browser *tb = target_of(b, node_attr(form, "target"));
+    const char *enc = node_attr(form, "enctype");
+    if (post && enc && strcasestr(enc, "multipart/form-data") && build_multipart(tb, form, submitter) == 0) {
+        q[0] = 0;                       /* the body is the multipart one (the request picks it up) */
+    } else {
+        free(tb->mp_body);
+        tb->mp_body = NULL;
+    }
+    navigate(tb, target, post ? q : NULL, NAV_NEW);
 }
 
 /* form.submit() (no submit event) and requestSubmit(): done once the script returns. */
@@ -3626,6 +4011,65 @@ static void reset_form(struct node *form)
 }
 
 /* A click on a form control. */
+static void control_commit(struct browser *b, struct node *n, int changed);
+
+static int browser_alive(const struct browser *b)
+{
+    for (const struct browser *x = browsers; x; x = x->next)
+        if (x == b)
+            return 1;
+    return 0;
+}
+
+static void set_control_value(struct browser *b, struct node *n, const char *v)
+{
+    char *nv = strdup(v);
+    if (!nv)
+        return;
+    free(n->value);
+    n->value = nv;
+    n->cursor = (int)strlen(nv);
+    control_commit(b, n, 1);
+}
+
+/* A color or file the user typed in answer to the question a click on an input asked. */
+static void control_answered(void *ctx, const char *text)
+{
+    struct browser *b = ctx;
+    if (!browser_alive(b) || !b->ask_node || !b->root)
+        return;
+    struct node *n = b->ask_node;
+    b->ask_node = NULL;
+    if (!strcasecmp(type_of(n), "color")) {
+        uint32_t rgb;
+        char v[16];
+        if (parse_hex_color(text, &rgb) < 0) {
+            set_status(b, "\"%.40s\" is not a color: type it as #rrggbb", text);
+            paint(b);
+            return;
+        }
+        snprintf(v, sizeof(v), "#%06x", (unsigned)rgb);
+        set_control_value(b, n, v);
+        return;
+    }
+    while (*text == ' ')
+        text++;
+    if (*text && access(text, R_OK) < 0) {
+        set_status(b, "Cannot read %.100s: %s", text, strerror(errno));
+        paint(b);
+        return;
+    }
+    set_control_value(b, n, text);
+}
+
+static void ask_control(struct browser *b, struct node *n)
+{
+    int color = !strcasecmp(type_of(n), "color");
+    b->ask_node = n;
+    ask_text(color ? "Choose Color" : "Choose File", color ? "Color (#rrggbb):" : "Path of the file to send:",
+             n->value && n->value[0] ? n->value : color ? "#000000" : "/home/flux/", control_answered, b);
+}
+
 static void activate(struct browser *b, struct node *n)
 {
     int changed = 0;
@@ -3636,6 +4080,7 @@ static void activate(struct browser *b, struct node *n)
         b->addr_focus = 0;
         if (n->value)
             n->cursor = (int)strlen(n->value);
+        suggest(b, n);
     } else if (n->tag == T_INPUT && !strcasecmp(t, "checkbox")) {
         n->checked = !n->checked;
         b->focus = n;
@@ -3651,14 +4096,22 @@ static void activate(struct browser *b, struct node *n)
         b->focus = n;
         changed = 1;
     } else if (n->tag == T_SELECT) {
-        int count = 0;
-        for (struct node *o = n; o; o = node_next(o, n))
-            count += o->type == N_ELEMENT && o->tag == T_OPTION;
-        if (count)
-            n->checked = (n->checked + 1) % count;     /* each click shows the next option */
         b->focus = n;
-        b->need_layout = 1;
-        changed = 1;
+        if (b->pop_node == n)           /* a click on the box of an open list closes it */
+            pop_close(b);
+        else
+            pop_open(b, n, 0);
+        paint(b);
+        return;
+    } else if (n->tag == T_INPUT && !strcasecmp(t, "range")) {
+        b->focus = n;                   /* the press already set the value */
+        paint(b);
+        return;
+    } else if (n->tag == T_INPUT && (!strcasecmp(t, "color") || !strcasecmp(t, "file"))) {
+        b->focus = n;
+        ask_control(b, n);
+        paint(b);
+        return;
     } else if (!strcasecmp(t, "submit") || !strcasecmp(t, "image")) {
         if (form)
             submit(b, form, n);
@@ -3667,6 +4120,12 @@ static void activate(struct browser *b, struct node *n)
         if (form)
             reset_form(form);
     }
+    control_commit(b, n, changed);
+}
+
+/* A control's value changed (or, with changed 0, it only needs drawing): tell the page, restyle, lay out, paint. */
+static void control_commit(struct browser *b, struct node *n, int changed)
+{
     if (changed && b->js) {
         jsdom_dispatch(b->js, n, "input");
         jsdom_dispatch(b->js, n, "change");
@@ -3755,6 +4214,22 @@ static int page_click(struct browser *b, int px, int py)
     return prevented;
 }
 
+/* Does this kind of field take the character (date and time fields take digits and their punctuation)? */
+static int field_accepts(const struct node *n, char *c)
+{
+    if (n->tag != T_INPUT)
+        return 1;
+    const char *t = type_of(n);
+    if (input_pattern(t)) {
+        if (*c == 't' || *c == 'w')
+            *c = (char)(*c - 32);
+        return isdigit((unsigned char)*c) || strchr("-:TW. /", *c) != NULL;
+    }
+    if (!strcasecmp(t, "number"))
+        return isdigit((unsigned char)*c) || strchr("-+.eE", *c) != NULL;
+    return 1;
+}
+
 static void edit_field(struct browser *b, struct node *n, const struct input_event *ev)
 {
     char *v = n->value ? n->value : strdup("");
@@ -3781,7 +4256,7 @@ static void edit_field(struct browser *b, struct node *n, const struct input_eve
                 memmove(v + cur - 1, v + cur, (size_t)(len - cur + 1));
                 cur--;
             }
-        } else if ((c >= 32 && c < 127) || (c == '\n' && n->tag == T_TEXTAREA)) {
+        } else if (((c >= 32 && c < 127) || (c == '\n' && n->tag == T_TEXTAREA)) && field_accepts(n, &c)) {
             if (len < max) {
                 char *nv = realloc(v, (size_t)len + 2);
                 if (nv) {
@@ -3826,9 +4301,9 @@ static void focus_next_control(struct browser *b, int dir)
 /* ---- drawing ---- */
 
 static const enum icon_id button_icons[] = { ICON_BACK, ICON_FORWARD, ICON_STOP, ICON_REFRESH, ICON_HOMEPAGE,
-                                             ICON_README, ICON_FOLDER_OPEN };
+                                             ICON_README, ICON_FOLDER_OPEN, ICON_FOLDER };
 static const char *const button_labels[] = { "Back", "Forward", "Stop", "Refresh", "Home", "History",
-                                             "Downloads", "Go" };
+                                             "Downloads", "Favorites", "Go" };
 
 static int button_enabled(struct browser *b, int i)
 {
@@ -3951,6 +4426,10 @@ static void paint_page(struct browser *b, struct surface *s, int ox, int oy)
         if (!rect_empty(s->clip))
             paint_page(f, s, box.x + ox, box.y + oy);
     }
+    if (b->pop_node) {
+        s->clip = rect_intersect(saved, mkrect(v.x, v.y, v.w, v.h));
+        draw_pop(b, s, ox, oy);
+    }
     s->clip = saved;
 
     struct sbar vb = vbar(b), hb = hbar(b);
@@ -3969,6 +4448,7 @@ static void paint_page(struct browser *b, struct surface *s, int ox, int oy)
 enum {
     CB_SEP, CB_BACK, CB_FORWARD, CB_REFRESH, CB_STOP, CB_HOME, CB_COPYPAGE,
     CB_OPENLINK, CB_NEWWIN, CB_COPYLINK, CB_CUT, CB_COPY, CB_PASTE,
+    CB_SAVELINK, CB_SAVEIMG, CB_COPYIMG, CB_FAVORITE, CB_FIND, CB_SAVEPAGE, CB_SOURCE, CB_PRINT,
 };
 
 static const char *const ctx_labels[] = {
@@ -3976,7 +4456,24 @@ static const char *const ctx_labels[] = {
     [CB_HOME] = "Home", [CB_COPYPAGE] = "Copy Page Address", [CB_OPENLINK] = "Open Link",
     [CB_NEWWIN] = "Open Link in New Window", [CB_COPYLINK] = "Copy Link Address",
     [CB_CUT] = "Cut", [CB_COPY] = "Copy", [CB_PASTE] = "Paste",
+    [CB_SAVELINK] = "Save Link As...", [CB_SAVEIMG] = "Save Image As...",
+    [CB_COPYIMG] = "Copy Image Address", [CB_FAVORITE] = "Add to Favorites", [CB_FIND] = "Find in Page...",
+    [CB_SAVEPAGE] = "Save Page As...", [CB_SOURCE] = "View Page Source", [CB_PRINT] = "Print...",
 };
+
+static int bm_find(const char *url);
+
+/* What an item says: the favorites one is "Remove from" when the page is kept. */
+static const char *ctx_label(const struct browser *b, int code)
+{
+    if (code == CB_FAVORITE) {
+        char u[URL_MAX];
+        snprintf(u, sizeof(u), "%s", b->url);
+        url_strip_fragment(u);
+        return bm_find(u) >= 0 ? "Remove from Favorites" : "Add to Favorites";
+    }
+    return ctx_labels[code];
+}
 
 #define CTX_W 190
 #define CTX_ITEM_H 20
@@ -4027,6 +4524,16 @@ static int ctx_enabled(struct browser *b, int code)
     case CB_COPYPAGE: return b->url[0] != 0;
     case CB_OPENLINK: case CB_NEWWIN:
         return strncasecmp(b->ctx_url, "javascript:", 11) && strncasecmp(b->ctx_url, "mailto:", 7);
+    case CB_SAVELINK:
+        return url_is_http(b->ctx_url) || url_is_https(b->ctx_url) || url_is_file(b->ctx_url);
+    case CB_SAVEIMG: case CB_COPYIMG:
+        return b->ctx_image[0] && strncasecmp(b->ctx_image, "data:", 5);
+    case CB_FAVORITE: return b->url[0] && strncasecmp(b->url, "about:", 6);
+    case CB_FIND: case CB_PRINT: return b->root != NULL;
+    case CB_SAVEPAGE:
+        return url_is_http(b->url) || url_is_https(b->url) || url_is_file(b->url);
+    case CB_SOURCE:
+        return b->url[0] && strncasecmp(b->url, "about:", 6) && strncasecmp(b->url, "view-source:", 12);
     case CB_CUT: case CB_COPY: return b->addr_len > 0;
     case CB_PASTE: {
         int n;
@@ -4053,12 +4560,651 @@ static void draw_ctx(struct browser *b, struct surface *s)
             gfx_fill(s, r.x, r.y, r.w, r.h, C_NAVY);
         int ty = r.y + (r.h - font_sans.height) / 2;
         if (!en)
-            gfx_text(s, &font_sans, r.x + 13, ty + 1, ctx_labels[code], C_WHITE);
-        gfx_text(s, &font_sans, r.x + 12, ty, ctx_labels[code], hot ? C_WHITE : en ? C_BLACK : C_SHADOW);
+            gfx_text(s, &font_sans, r.x + 13, ty + 1, ctx_label(b, code), C_WHITE);
+        gfx_text(s, &font_sans, r.x + 12, ty, ctx_label(b, code), hot ? C_WHITE : en ? C_BLACK : C_SHADOW);
     }
 }
 
 /* Paint the window a page is in (a frame's is its outermost parent's). */
+/* ---- finding text on the page (Ctrl+F) ---- */
+
+enum { FP_FIELD, FP_PREV, FP_NEXT, FP_CLOSE };
+
+static struct rect find_rect(struct browser *t)
+{
+    struct rect v = view_rect(t);
+    int w = 358, x = v.x + v.w - w - 6;
+    return mkrect(x < v.x ? v.x : x, v.y + 4, w, 28);
+}
+
+static struct rect find_part(struct browser *t, int part)
+{
+    struct rect f = find_rect(t);
+    switch (part) {
+    case FP_FIELD: return mkrect(f.x + 40, f.y + 4, 140, 20);
+    case FP_PREV: return mkrect(f.x + 256, f.y + 4, 36, 20);
+    case FP_NEXT: return mkrect(f.x + 294, f.y + 4, 36, 20);
+    default: return mkrect(f.x + f.w - 26, f.y + 4, 22, 20);
+    }
+}
+
+static void find_clear(struct browser *t)
+{
+    free(t->find_hl);
+    free(t->find_first);
+    t->find_hl = NULL;
+    t->find_first = NULL;
+    t->find_nhl = t->find_n = 0;
+    t->lo.hl = NULL;
+    t->lo.nhl = 0;
+}
+
+/* Bring the current match into view (and the boxes that scroll round it). */
+static void find_show(struct browser *t)
+{
+    if (!t->find_n)
+        return;
+    const struct fhl *h = &t->find_hl[t->find_first[t->find_cur]];
+    if (h->item >= t->lo.nitems)
+        return;
+    const struct ditem *d = &t->lo.items[h->item];
+    if (d->sb && d->node)
+        layout_reveal(&t->lo, d->node, d->x, d->y, d->w, d->h);
+    if (d->dyn)
+        return;                         /* fixed or sticky: it is in view when it is anywhere */
+    int sbx = 0, sby = 0;
+    if (d->sb)
+        layout_sb_view(&t->lo, d->sb, t->scroll_x, t->scroll_y, &sbx, &sby, NULL);
+    struct rect v = view_rect(t);
+    int y = d->y + sby, x = d->x + sbx;
+    if (y < t->scroll_y || y + d->h > t->scroll_y + v.h)
+        t->scroll_y = y - v.h / 3;
+    if (x < t->scroll_x || x + d->w > t->scroll_x + v.w)
+        t->scroll_x = x - v.w / 3;
+    clamp_scroll(t);
+}
+
+/* Look for the text again (the page may have changed); jump: start from the first match in view. */
+static void find_run(struct browser *t, int jump)
+{
+    int keep = t->find_cur;
+    find_clear(t);
+    if (!t->find_len || !t->root)
+        return;
+    const struct layout *lo = &t->lo;
+    long total = 0;
+    for (int i = 0; i < lo->nitems; i++)
+        if (lo->items[i].kind == DK_TEXT)
+            total += lo->items[i].len + 1;
+    if (total > FIND_TEXT_MAX)
+        total = FIND_TEXT_MAX;
+    char *hay = malloc((size_t)total + 2);
+    int *hitem = malloc(sizeof(int) * ((size_t)total + 2)), *hoff = malloc(sizeof(int) * ((size_t)total + 2));
+    t->find_hl = malloc(sizeof(struct fhl) * FIND_MAX_HL);
+    t->find_first = malloc(sizeof(int) * FIND_MAX_HL);
+    if (!hay || !hitem || !hoff || !t->find_hl || !t->find_first) {
+        free(hay), free(hitem), free(hoff);
+        find_clear(t);
+        return;
+    }
+    int hn = 0;
+    const struct ditem *prev = NULL;
+    for (int i = 0; i < lo->nitems && hn < total; i++) {
+        const struct ditem *d = &lo->items[i];
+        if (d->kind != DK_TEXT || d->len <= 0 || (d->len == 1 && d->text[0] == ' '))
+            continue;
+        if (prev && hn && hay[hn - 1] != ' ' &&
+            (d->y > prev->y + prev->h / 2 || d->y + d->h / 2 < prev->y || d->x > prev->x + prev->w + 1)) {
+            hay[hn] = ' ';
+            hitem[hn] = -1;
+            hoff[hn++] = 0;
+        }
+        for (int k = 0; k < d->len && hn < total; k++, hn++) {
+            hay[hn] = d->text[k];
+            hitem[hn] = i;
+            hoff[hn] = k;
+        }
+        prev = d;
+    }
+    hay[hn] = 0;
+    int nl = t->find_len, nmatch = 0, nhl = 0;
+    for (int i = 0; i + nl <= hn && nhl < FIND_MAX_HL - 8;) {
+        if (strncasecmp(hay + i, t->find_text, (size_t)nl)) {
+            i++;
+            continue;
+        }
+        t->find_first[nmatch] = nhl;
+        for (int k = i; k < i + nl;) {
+            int it = hitem[k];
+            if (it < 0) {
+                k++;
+                continue;
+            }
+            int c0 = hoff[k], c1 = c0 + 1, e = k + 1;
+            while (e < i + nl && hitem[e] == it) {
+                c1 = hoff[e] + 1;
+                e++;
+            }
+            t->find_hl[nhl++] = (struct fhl){ it, c0, c1, nmatch };
+            k = e;
+        }
+        nmatch++;
+        i += nl;
+    }
+    free(hay), free(hitem), free(hoff);
+    t->find_n = nmatch;
+    t->find_nhl = nhl;
+    t->find_cur = keep < nmatch ? keep : 0;
+    if (jump)
+        for (int k = 0; k < nmatch; k++) {          /* the first one at or below the top of the window */
+            const struct ditem *d = &lo->items[t->find_hl[t->find_first[k]].item];
+            if (d->y + d->h > t->scroll_y) {
+                t->find_cur = k;
+                break;
+            }
+        }
+    t->lo.hl = t->find_hl;
+    t->lo.nhl = nhl;
+    t->lo.hl_cur = t->find_cur;
+    if (jump)
+        find_show(t);
+}
+
+static void find_step(struct browser *t, int dir)
+{
+    if (!t->find_n)
+        return;
+    t->find_cur = (t->find_cur + dir + t->find_n) % t->find_n;
+    t->lo.hl_cur = t->find_cur;
+    find_show(t);
+}
+
+static void find_close(struct browser *t)
+{
+    t->find_open = 0;
+    find_clear(t);
+}
+
+static void find_open_bar(struct browser *t)
+{
+    t->find_open = 1;
+    t->addr_focus = 0;
+    static char sel[96];
+    if (!t->find_len && layout_selection_text(&t->lo, sel, sizeof(sel)) > 0 && !strchr(sel, '\n')) {
+        snprintf(t->find_text, sizeof(t->find_text), "%s", sel);     /* what is selected is what is looked for */
+        t->find_len = (int)strlen(t->find_text);
+    }
+    find_run(t, 1);
+}
+
+/* A key while the bar is open: 1 if it was the bar's. */
+static int find_key(struct browser *t, const struct input_event *ev)
+{
+    int shift = ev->mods & KMOD_SHIFT;
+    if (ev->code == KEY_ESC) {
+        find_close(t);
+        paint(t);
+        return 1;
+    }
+    if (ev->code == KEY_ENTER) {
+        find_step(t, shift ? -1 : 1);
+        paint(t);
+        return 1;
+    }
+    if (ev->mods & (KMOD_CTRL | KMOD_ALT))
+        return 0;
+    if (ev->len == 1 && ev->text[0] == 0x7F) {
+        if (t->find_len)
+            t->find_text[--t->find_len] = 0;
+    } else if (ev->len == 1 && (unsigned char)ev->text[0] >= 32 && ev->text[0] != 0x7F &&
+               t->find_len < (int)sizeof(t->find_text) - 1) {
+        t->find_text[t->find_len++] = ev->text[0];
+        t->find_text[t->find_len] = 0;
+    } else {
+        return 0;
+    }
+    t->find_cur = 0;
+    find_run(t, 1);
+    caret_on = 1;
+    paint(t);
+    return 1;
+}
+
+static void draw_find(struct browser *t, struct surface *s)
+{
+    struct rect f = find_rect(t);
+    gfx_fill(s, f.x, f.y, f.w, f.h, C_FACE);
+    gfx_bevel(s, f, BEVEL_WINDOW);
+    gfx_text(s, &font_sans, f.x + 6, f.y + (f.h - font_sans.height) / 2, "Find:", C_BLACK);
+    draw_text_field(s, find_part(t, FP_FIELD), t->find_text, t->find_len, caret_on);
+    char count[40] = "";
+    if (t->find_len && !t->find_n)
+        snprintf(count, sizeof(count), "Not found");
+    else if (t->find_len)
+        snprintf(count, sizeof(count), "%d of %d", t->find_cur + 1, t->find_n);
+    gfx_text(s, &font_sans, f.x + 188, f.y + (f.h - font_sans.height) / 2, count,
+             t->find_len && !t->find_n ? RGB(0x80, 0x00, 0x00) : C_BLACK);
+    draw_button(s, find_part(t, FP_PREV), "Prev", 0, 0, 0);
+    draw_button(s, find_part(t, FP_NEXT), "Next", 0, 0, 0);
+    draw_button(s, find_part(t, FP_CLOSE), "x", 0, 0, 0);
+}
+
+/* A press in the bar (window coordinates): 1 if it was there. */
+static int find_mouse(struct browser *t, int x, int y)
+{
+    if (!t->find_open || !rect_contains(find_rect(t), x, y))
+        return 0;
+    if (rect_contains(find_part(t, FP_PREV), x, y))
+        find_step(t, -1);
+    else if (rect_contains(find_part(t, FP_NEXT), x, y))
+        find_step(t, 1);
+    else if (rect_contains(find_part(t, FP_CLOSE), x, y))
+        find_close(t);
+    paint(t);
+    return 1;
+}
+
+/* ---- the pop-up list of a <select>, and the suggestions of a field's <datalist> ---- */
+
+struct popitem {
+    char text[80];                      /* what the row says */
+    char fill[160];                     /* a datalist's: what goes in the field */
+    int enabled;
+};
+static struct popitem pop_items[300];
+
+static struct node *find_by_id(struct browser *b, const char *id)
+{
+    for (struct node *n = b->root; n; n = node_next(n, b->root))
+        if (n->type == N_ELEMENT) {
+            const char *v = node_attr(n, "id");
+            if (v && !strcmp(v, id))
+                return n;
+        }
+    return NULL;
+}
+
+/* The rows into pop_items; *selected is the chosen option of a select (-1 for none). */
+static int pop_collect(struct browser *b, int *selected)
+{
+    struct node *n = b->pop_node;
+    int count = 0, k = 0;
+    const int max = (int)(sizeof(pop_items) / sizeof(pop_items[0]));
+    *selected = -1;
+    if (!n)
+        return 0;
+    if (!b->pop_list) {
+        for (struct node *o = n; o && count < max; o = node_next(o, n)) {
+            if (o->type != N_ELEMENT || o->tag != T_OPTION)
+                continue;
+            snprintf(pop_items[count].text, sizeof(pop_items[0].text), "%s", o->value ? o->value : "");
+            pop_items[count].fill[0] = 0;
+            pop_items[count].enabled = !node_attr(o, "disabled");
+            if (k == n->checked)
+                *selected = count;
+            k++;
+            count++;
+        }
+        return count;
+    }
+    const char *list = node_attr(n, "list");
+    struct node *dl = list ? find_by_id(b, list) : NULL;
+    const char *needle = n->value ? n->value : "";
+    for (struct node *o = dl; o && count < max; o = node_next(o, dl)) {
+        if (o->type != N_ELEMENT || o->tag != T_OPTION || node_attr(o, "disabled"))
+            continue;
+        const char *val = node_attr(o, "value"), *label = o->value ? o->value : "";
+        const char *fill = val ? val : label;
+        if (!*fill || (*needle && !strcasestr(fill, needle) && !strcasestr(label, needle)))
+            continue;
+        if (!strcasecmp(fill, needle))
+            continue;                   /* it is what is typed already */
+        snprintf(pop_items[count].fill, sizeof(pop_items[0].fill), "%s", fill);
+        if (val && *label && strcmp(val, label))
+            snprintf(pop_items[count].text, sizeof(pop_items[0].text), "%s - %s", fill, label);
+        else
+            snprintf(pop_items[count].text, sizeof(pop_items[0].text), "%s", fill);
+        pop_items[count].enabled = 1;
+        count++;
+    }
+    return count;
+}
+
+/* A control's box in b's window coordinates: where its hotspot is, moved by what scrolls it. */
+static int control_rect(struct browser *b, const struct node *n, struct rect *r)
+{
+    struct rect v = view_rect(b);
+    for (int i = 0; i < b->lo.ncontrols; i++) {
+        const struct hotspot *h = &b->lo.controls[i];
+        if (h->node != n)
+            continue;
+        int dx = 0, dy = 0, sx = 0, sy = 0;
+        if (h->dyn)
+            layout_dyn_offset(&b->lo, h->dyn, b->scroll_x, b->scroll_y, &dx, &dy);
+        if (h->sb)
+            layout_sb_view(&b->lo, h->sb, b->scroll_x, b->scroll_y, &sx, &sy, NULL);
+        *r = mkrect(v.x + h->x + dx + sx - b->scroll_x, v.y + h->y + dy + sy - b->scroll_y, h->w, h->h);
+        return 1;
+    }
+    return 0;
+}
+
+#define POP_ROWS 10
+static int pop_row_h(void)
+{
+    return font_sans.height + 4;
+}
+
+/* Where the list is, how many rows there are and how many show; 0 if the control is not on the page now. */
+static int pop_rect(struct browser *b, struct rect *r, int *nitems, int *rows)
+{
+    int sel, n = pop_collect(b, &sel);
+    struct rect c, v = view_rect(b);
+    if (!n || !control_rect(b, b->pop_node, &c))
+        return 0;
+    int vis = n < POP_ROWS ? n : POP_ROWS, w = c.w;
+    for (int i = 0; i < n; i++) {
+        int tw = gfx_text_width(&font_sans, pop_items[i].text) + 24 + (n > vis ? SBAR_W : 0);
+        if (tw > w)
+            w = tw;
+    }
+    if (w > v.w)
+        w = v.w;
+    int h = vis * pop_row_h() + 2, y = c.y + c.h;
+    if (y + h > v.y + v.h && c.y - h >= v.y)
+        y = c.y - h;                    /* no room below: above */
+    int x = c.x + w > v.x + v.w ? v.x + v.w - w : c.x;
+    *r = mkrect(x < v.x ? v.x : x, y, w, h);
+    *nitems = n;
+    *rows = vis;
+    return 1;
+}
+
+static void pop_close(struct browser *b)
+{
+    if (!b->pop_node)
+        return;
+    b->pop_node = NULL;
+    b->pop_hover = -1;
+    b->pop_top = 0;
+}
+
+static void pop_show_hover(struct browser *b, int n)
+{
+    int vis = n < POP_ROWS ? n : POP_ROWS;
+    if (b->pop_hover >= 0 && b->pop_hover < b->pop_top)
+        b->pop_top = b->pop_hover;
+    if (b->pop_hover >= b->pop_top + vis)
+        b->pop_top = b->pop_hover - vis + 1;
+    if (b->pop_top > n - vis)
+        b->pop_top = n - vis;
+    if (b->pop_top < 0)
+        b->pop_top = 0;
+}
+
+static void pop_open(struct browser *b, struct node *n, int list)
+{
+    b->pop_node = n;
+    b->pop_list = list;
+    int sel, count = pop_collect(b, &sel);
+    if (!count) {
+        pop_close(b);
+        return;
+    }
+    b->pop_hover = list ? -1 : sel;
+    b->pop_top = 0;
+    pop_show_hover(b, count);
+}
+
+static void control_commit(struct browser *b, struct node *n, int changed);
+
+/* Row idx was picked: a select takes that option, a field the suggestion. */
+static void pop_choose(struct browser *b, int idx)
+{
+    int sel, n = pop_collect(b, &sel);
+    struct node *node = b->pop_node;
+    if (!node || idx < 0 || idx >= n || !pop_items[idx].enabled)
+        return;
+    if (!b->pop_list) {
+        node->checked = idx;
+        b->need_layout = 1;
+    } else {
+        char *nv = strdup(pop_items[idx].fill);
+        if (!nv)
+            return;
+        free(node->value);
+        node->value = nv;
+        node->cursor = (int)strlen(nv);
+        if (css_dynamic_rules)
+            b->need_style = 1;
+    }
+    pop_close(b);
+    b->focus = node;
+    control_commit(b, node, 1);
+}
+
+static void draw_pop(struct browser *b, struct surface *s, int ox, int oy)
+{
+    struct rect r;
+    int n, vis, sel;
+    if (!b->pop_node || !pop_rect(b, &r, &n, &vis))
+        return;
+    pop_collect(b, &sel);
+    r.x += ox, r.y += oy;
+    int rh = pop_row_h(), bar = n > vis;
+    gfx_fill(s, r.x, r.y, r.w, r.h, C_WHITE);
+    gfx_frame(s, r.x, r.y, r.w, r.h, KINETIK ? sys.edge_dark : C_BLACK);
+    for (int i = 0; i < vis && b->pop_top + i < n; i++) {
+        int idx = b->pop_top + i;
+        struct rect row = mkrect(r.x + 1, r.y + 1 + i * rh, r.w - 2 - (bar ? SBAR_W : 0), rh);
+        int hot = idx == b->pop_hover;
+        if (hot)
+            gfx_fill(s, row.x, row.y, row.w, row.h, C_NAVY);
+        char fit[80];
+        gfx_ellipsize(&font_sans, pop_items[idx].text, row.w - 10, fit, sizeof(fit));
+        gfx_text(s, idx == sel && !hot ? &font_sans_bold : &font_sans, row.x + 5,
+                 row.y + (rh - font_sans.height) / 2, fit,
+                 hot ? C_WHITE : pop_items[idx].enabled ? C_BLACK : C_SHADOW);
+    }
+    if (bar) {
+        struct sbar sb = { mkrect(r.x + r.w - 1 - SBAR_W, r.y + 1, SBAR_W, r.h - 2), 1, b->pop_top, vis, n };
+        sbar_draw(s, &sb, SBAR_NONE);
+    }
+}
+
+/* The pointer at (x, y) in b's coordinates while a list is open: 1 if the list took it. */
+static int pop_mouse(struct browser *b, int x, int y, int pressed, int released)
+{
+    struct rect r;
+    int n, vis;
+    if (!pop_rect(b, &r, &n, &vis)) {
+        pop_close(b);
+        return 0;
+    }
+    int inside = rect_contains(r, x, y), rh = pop_row_h();
+    if (pressed) {
+        b->pop_swallow = 1;             /* its release belongs to this click too */
+        if (!inside) {
+            pop_close(b);
+            paint(b);
+            return 1;
+        }
+        if (n > vis && x >= r.x + r.w - 1 - SBAR_W) {
+            struct sbar sb = { mkrect(r.x + r.w - 1 - SBAR_W, r.y + 1, SBAR_W, r.h - 2), 1, b->pop_top, vis, n };
+            switch (sbar_hit(&sb, x, y)) {
+            case SBAR_ARROW1: b->pop_top--; break;
+            case SBAR_ARROW2: b->pop_top++; break;
+            case SBAR_PAGE1: b->pop_top -= vis; break;
+            case SBAR_PAGE2: b->pop_top += vis; break;
+            default: break;
+            }
+            b->pop_top = b->pop_top < 0 ? 0 : b->pop_top > n - vis ? n - vis : b->pop_top;
+            paint(b);
+            return 1;
+        }
+        pop_choose(b, b->pop_top + (y - r.y - 1) / rh);
+        return 1;
+    }
+    if (released) {
+        int s = b->pop_swallow;
+        b->pop_swallow = 0;
+        return s;
+    }
+    if (inside) {
+        int row = b->pop_top + (y - r.y - 1) / rh;
+        if (row >= n)
+            row = n - 1;
+        if (row != b->pop_hover) {
+            b->pop_hover = row;
+            paint(b);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* A key while a list is open: 1 if it was the list's. */
+static int pop_key(struct browser *b, const struct input_event *ev)
+{
+    int sel, n = pop_collect(b, &sel);
+    if (!n) {
+        pop_close(b);
+        return 0;
+    }
+    int list = b->pop_list, h = b->pop_hover;
+    switch (ev->code) {
+    case KEY_TAB:
+        pop_close(b);                   /* on to the next control */
+        return 0;
+    case KEY_ESC:
+        pop_close(b);
+        paint(b);
+        return 1;
+    case KEY_ENTER:
+    case KEY_SPACE:
+        if (list && (h < 0 || ev->code == KEY_SPACE))
+            return 0;                   /* the field's own */
+        if (h >= 0)
+            pop_choose(b, h);
+        return 1;
+    case KEY_UP:
+    case KEY_DOWN: {
+        int dir = ev->code == KEY_UP ? -1 : 1, k = h < 0 && dir > 0 ? -1 : h;
+        for (int i = 0; i < n; i++) {
+            k += dir;
+            if (k < 0 || k >= n)
+                break;
+            if (pop_items[k].enabled) {
+                b->pop_hover = k;
+                break;
+            }
+        }
+        pop_show_hover(b, n);
+        paint(b);
+        return 1;
+    }
+    case KEY_HOME:
+    case KEY_END:
+    case KEY_PGUP:
+    case KEY_PGDN:
+        if (list)
+            return 0;
+        b->pop_hover = ev->code == KEY_HOME ? 0 : ev->code == KEY_END ? n - 1
+                     : (h < 0 ? 0 : h) + (ev->code == KEY_PGUP ? -POP_ROWS : POP_ROWS);
+        b->pop_hover = b->pop_hover < 0 ? 0 : b->pop_hover >= n ? n - 1 : b->pop_hover;
+        pop_show_hover(b, n);
+        paint(b);
+        return 1;
+    default:
+        break;
+    }
+    if (!list && ev->len == 1 && ev->text[0] > 32 && ev->text[0] < 127 && !(ev->mods & (KMOD_CTRL | KMOD_ALT))) {
+        for (int i = 1; i <= n; i++) {  /* typing a letter: the next option that starts with it */
+            int k = (h + i + n) % n;
+            if (pop_items[k].enabled && tolower((unsigned char)pop_items[k].text[0]) == tolower((unsigned char)ev->text[0])) {
+                b->pop_hover = k;
+                break;
+            }
+        }
+        pop_show_hover(b, n);
+        paint(b);
+        return 1;
+    }
+    return list ? 0 : 1;
+}
+
+/* After typing in a field that has a <datalist>: show what matches. */
+static void suggest(struct browser *b, struct node *f)
+{
+    if (!node_attr(f, "list") || f->tag != T_INPUT)
+        return;
+    pop_open(b, f, 1);
+}
+
+/* ---- tooltips ---- */
+
+/* The nearest element at or above n that has a title, or NULL. */
+static struct node *titled(struct node *n)
+{
+    for (; n; n = n->parent) {
+        const char *t = n->type == N_ELEMENT ? node_attr(n, "title") : NULL;
+        if (t && *t)
+            return n;
+    }
+    return NULL;
+}
+
+static void tip_hide(struct browser *t)
+{
+    t->tip_node = NULL;
+    if (t->tip_shown) {
+        t->tip_shown = 0;
+        paint(t);
+    }
+}
+
+/* The pointer is over `under` (the element at it, or NULL): start the wait for a tooltip, or drop one. */
+static void tip_move(struct browser *b, struct node *under)
+{
+    struct browser *t = top_of(b);
+    struct node *owner = titled(under);
+    t->tip_x = t->mouse_x;
+    t->tip_y = t->mouse_y;
+    if (owner == t->tip_node) {
+        if (t->tip_shown) {             /* it follows the pointer a little */
+            t->tip_shown = 0;
+            t->tip_since = now_ms();
+            paint(t);
+        }
+        return;
+    }
+    int was = t->tip_shown;
+    t->tip_node = owner;
+    t->tip_shown = 0;
+    t->tip_since = now_ms();
+    if (owner) {
+        const char *text = node_attr(owner, "title");
+        snprintf(t->tip_text, sizeof(t->tip_text), "%.*s", (int)strcspn(text, "\n"), text);
+    }
+    if (was)
+        paint(t);
+}
+
+static void draw_tip(struct browser *t, struct surface *s)
+{
+    char fit[240];
+    gfx_ellipsize(&font_sans, t->tip_text, 320, fit, sizeof(fit));
+    int w = gfx_text_width(&font_sans, fit) + 10, h = font_sans.height + 6;
+    int x = t->tip_x + 12, y = t->tip_y + 20;
+    if (x + w > s->w - 2)
+        x = s->w - 2 - w;
+    if (y + h > s->h - STATUS_H)
+        y = t->tip_y - h - 4;
+    gfx_fill(s, x, y, w, h, C_TOOLTIP);
+    gfx_frame(s, x, y, w, h, C_BLACK);
+    gfx_text(s, &font_sans, x + 5, y + 3, fit, C_BLACK);
+}
+
 static void paint(struct browser *b)
 {
     b = top_of(b);
@@ -4069,13 +5215,114 @@ static void paint(struct browser *b)
     draw_toolbar(b, s);
     gfx_bevel(s, frame_rect(b), BEVEL_SUNKEN);
     paint_page(b, s, 0, 0);
+    if (b->find_open) {
+        struct rect saved = s->clip;
+        s->clip = rect_intersect(saved, view_rect(b));
+        draw_find(b, s);
+        s->clip = saved;
+    }
     draw_status(b, s);
+    if (b->tip_shown && !b->ctx_open) {
+        struct rect saved = s->clip;
+        s->clip = rect_intersect(saved, mkrect(0, 0, s->w, s->h - STATUS_H));
+        draw_tip(b, s);
+        s->clip = saved;
+    }
     if (b->ctx_open)
         draw_ctx(b, s);
     wm_damage_client(b->win, mkrect(0, 0, s->w, s->h));
 }
 
 /* ---- input ---- */
+
+/* ---- zoom ---- */
+
+static const int zoom_steps[] = { 30, 50, 67, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300 };
+
+static void zoom_apply(struct browser *b, int old, int z)
+{
+    b->scroll_x = b->scroll_x * z / old;        /* stay about where the reader was */
+    b->scroll_y = b->scroll_y * z / old;
+    b->need_style = 1;
+    relayout(b);
+    for (struct browser *f = b->frames; f; f = f->next_frame)
+        zoom_apply(f, old, z);
+}
+
+static void set_zoom(struct browser *t, int z)
+{
+    int old = zoom_of(t);
+    z = z < zoom_steps[0] ? zoom_steps[0] : z > zoom_steps[12] ? zoom_steps[12] : z;
+    if (z != old) {
+        t->zoom = z;
+        zoom_apply(t, old, z);
+    }
+    set_status(t, "Zoom %d%%", z);
+    paint(t);
+}
+
+static void zoom_step(struct browser *t, int dir)
+{
+    int z = zoom_of(t);
+    if (dir > 0) {
+        for (int i = 0; i < 13; i++)
+            if (zoom_steps[i] > z) {
+                z = zoom_steps[i];
+                break;
+            }
+    } else {
+        for (int i = 12; i >= 0; i--)
+            if (zoom_steps[i] < z) {
+                z = zoom_steps[i];
+                break;
+            }
+    }
+    set_zoom(t, z);
+}
+
+/* ---- print: the whole page as a picture in the downloads folder ---- */
+
+static void print_page(struct browser *t)
+{
+    if (!t->root) {
+        set_status(t, "There is no page to print");
+        paint(t);
+        return;
+    }
+    struct rect v = view_rect(t);
+    int w = v.w, h = t->lo.height < 5000 ? t->lo.height : 5000;
+    if (h < v.h)
+        h = v.h;
+    struct surface s;
+    if (surface_init(&s, w, h) < 0) {
+        set_status(t, "Not enough memory to print this page");
+        paint(t);
+        return;
+    }
+    gfx_noclip(&s);
+    paint_document(&t->lo, &s, 0, 0, 0, 0, NULL, 0);
+    char name[64] = "page", path[256];
+    if (t->page_title[0]) {
+        int o = 0;
+        for (const char *c = t->page_title; *c && o < 48; c++)
+            name[o++] = isalnum((unsigned char)*c) || *c == '-' ? *c : '_';
+        name[o] = 0;
+    }
+    mkdir(DOWNLOADS_DIR, 0755);
+    snprintf(path, sizeof(path), "%s/%s.jpg", DOWNLOADS_DIR, name);
+    for (int i = 1; access(path, F_OK) == 0 && i < 1000; i++)
+        snprintf(path, sizeof(path), "%s/%s-%d.jpg", DOWNLOADS_DIR, name, i);
+    int r = jpeg_encode_file(path, s.px, s.stride, w, h, 88);
+    surface_free(&s);
+    if (r < 0) {
+        set_status(t, "Could not print: %s", strerror(errno));
+    } else {
+        logs_init();
+        log_push(DOWNLOADS_FILE, dl_log, &ndl_log, t->url, path, 0);
+        set_status(t, "Printed to %s%s", path, t->lo.height > 5000 ? " (the first 5000 pixels)" : "");
+    }
+    paint(t);
+}
 
 static void scroll_by(struct browser *b, int dx, int dy)
 {
@@ -4104,6 +5351,7 @@ static void press(struct browser *b, int i)
     case B_HOME: navigate(b, HOME_URL, NULL, NAV_NEW); break;
     case B_HISTORY: navigate(b, "about:history", NULL, NAV_NEW); break;
     case B_DOWNLOADS: navigate(b, "about:downloads", NULL, NAV_NEW); break;
+    case B_FAVORITES: navigate(b, "about:bookmarks", NULL, NAV_NEW); break;
     case B_GO: {
         char u[URL_MAX];
         normalize(b->addr, u, sizeof(u));
@@ -4210,6 +5458,43 @@ static void br_key(struct window *w, const struct input_event *ev)
         t->ctx_open = 0;
         paint(t);
     }
+    if (ev->flags & IEV_PRESSED) {
+        int ctrl = ev->mods & KMOD_CTRL;
+        if (t->tip_node || t->tip_shown)
+            tip_hide(t);
+        if (ctrl && ev->code == SC_F) {
+            find_open_bar(t);
+            paint(t);
+            return;
+        }
+        if (ctrl && (ev->code == SC_EQUALS || ev->code == SC_KP_PLUS)) {
+            zoom_step(t, 1);
+            return;
+        }
+        if (ctrl && (ev->code == SC_MINUS || ev->code == SC_KP_MINUS)) {
+            zoom_step(t, -1);
+            return;
+        }
+        if (ctrl && ev->code == SC_0) {
+            set_zoom(t, 100);
+            return;
+        }
+        if (ctrl && ev->code == SC_D) {
+            int added = bm_toggle(t);
+            set_status(t, added < 0 ? "This page cannot be kept in the favorites"
+                                    : added ? "Added to the favorites" : "Removed from the favorites");
+            paint(t);
+            return;
+        }
+        if (ctrl && ev->code == SC_P) {
+            print_page(t);
+            return;
+        }
+        if (b->pop_node && pop_key(b, ev))
+            return;
+        if (t->find_open && !t->addr_focus && find_key(t, ev))
+            return;
+    }
     if (b->js && b->root && !t->addr_focus && !(ev->mods & KMOD_ALT)) {
         char key[16];
         int kc = dom_key(ev, key, sizeof(key));
@@ -4289,6 +5574,17 @@ static void br_key(struct window *w, const struct input_event *ev)
         return;
     }
     struct node *f = b->focus;
+    if (f && f->tag == T_INPUT && !strcasecmp(type_of(f), "range")) {
+        int dir = ev->code == KEY_LEFT || ev->code == KEY_DOWN ? -1 : ev->code == KEY_RIGHT || ev->code == KEY_UP ? 1
+                : ev->code == KEY_HOME ? -2 : ev->code == KEY_END ? 2 : 0;
+        if (dir) {
+            char v[32];
+            range_nudge(f, dir, v, sizeof(v));
+            if (!f->value || strcmp(f->value, v))
+                set_control_value(b, f, v);
+            return;
+        }
+    }
     if (f && is_text_field(f)) {
         if (ev->code == KEY_ENTER && f->tag != T_TEXTAREA) {
             struct node *form = form_of(f);
@@ -4298,9 +5594,12 @@ static void br_key(struct window *w, const struct input_event *ev)
         }
         char *before = f->value ? strdup(f->value) : NULL;
         edit_field(b, f, ev);
-        if (b->js && (!before || !f->value || strcmp(before, f->value)))
+        int edited = !before || !f->value || strcmp(before, f->value);
+        if (b->js && edited)
             jsdom_dispatch(b->js, f, "input");
         free(before);
+        if (edited)
+            suggest(b, f);
         paint(b);
         return;
     }
@@ -4452,6 +5751,7 @@ static void update_hover(struct browser *b, int x, int y)
         under = element_at(b, x - v.x + b->scroll_x, y - v.y + b->scroll_y);
         ck = page_cursor(under, link);
     }
+    tip_move(b, under);
     if (top->win)
         wm_set_cursor(top->win, ck);
     if (b->js) {
@@ -4482,6 +5782,7 @@ static void open_ctx(struct browser *b, int x, int y)
         return;
     t->ctx_n = 0;
     t->ctx_url[0] = 0;
+    t->ctx_image[0] = 0;
     t->ctx_x = t->mouse_x;
     t->ctx_y = t->mouse_y;
     t->ctx_hover = -1;
@@ -4499,6 +5800,13 @@ static void open_ctx(struct browser *b, int x, int y)
             ctx_add(t, CB_OPENLINK);
             ctx_add(t, CB_NEWWIN);
             ctx_add(t, CB_COPYLINK);
+            ctx_add(t, CB_SAVELINK);
+            ctx_add(t, CB_SEP);
+        }
+        struct node *under = b->root ? element_at(b, x - v.x + b->scroll_x, y - v.y + b->scroll_y) : NULL;
+        if (under && under->tag == T_IMG && image_source(b, under, t->ctx_image, sizeof(t->ctx_image))) {
+            ctx_add(t, CB_SAVEIMG);
+            ctx_add(t, CB_COPYIMG);
             ctx_add(t, CB_SEP);
         }
         ctx_add(t, CB_BACK);
@@ -4507,11 +5815,40 @@ static void open_ctx(struct browser *b, int x, int y)
         ctx_add(t, CB_STOP);
         ctx_add(t, CB_SEP);
         ctx_add(t, CB_HOME);
+        ctx_add(t, CB_SEP);
+        ctx_add(t, CB_FAVORITE);
         ctx_add(t, CB_COPYPAGE);
+        ctx_add(t, CB_FIND);
+        ctx_add(t, CB_SAVEPAGE);
+        ctx_add(t, CB_SOURCE);
+        ctx_add(t, CB_PRINT);
     } else {
         return;
     }
     t->ctx_open = 1;
+    paint(t);
+}
+
+/* Fetch an address and keep it in the downloads folder, leaving the page on the screen as it is. */
+static void start_save(struct browser *t, const char *url)
+{
+    char u[URL_MAX];
+    snprintf(u, sizeof(u), "%s", url);
+    url_strip_fragment(u);
+    if (!url_is_http(u) && !url_is_https(u) && !url_is_file(u)) {
+        set_status(t, "That address cannot be saved");
+    } else if (t->fetch.active || t->loading) {
+        set_status(t, "Wait for the page to finish loading, then save it");
+    } else {
+        t->next_special = SP_SAVE;
+        t->loading = 1;
+        set_status(t, "Saving %s...", u);
+        if (start_fetch(t, F_PAGE, u, NULL, 0, 0, NAV_REPLACE) < 0) {
+            t->loading = 0;
+            t->next_special = SP_NONE;
+            set_status(t, "Could not save: %s", strerror(errno));
+        }
+    }
     paint(t);
 }
 
@@ -4529,6 +5866,25 @@ static void ctx_action(struct browser *t, int code)
     case CB_OPENLINK: navigate(t, t->ctx_url, NULL, NAV_NEW); break;
     case CB_NEWWIN: browser_open(t->ctx_url); break;
     case CB_COPYLINK: clipboard_set(t->ctx_url); break;
+    case CB_SAVELINK: start_save(t, t->ctx_url); break;
+    case CB_SAVEIMG: start_save(t, t->ctx_image); break;
+    case CB_COPYIMG: clipboard_set(t->ctx_image); break;
+    case CB_FAVORITE: {
+        int added = bm_toggle(t);
+        set_status(t, added < 0 ? "This page cannot be kept in the favorites"
+                                : added ? "Added to the favorites" : "Removed from the favorites");
+        paint(t);
+        break;
+    }
+    case CB_FIND: find_open_bar(t); paint(t); break;
+    case CB_SAVEPAGE: start_save(t, t->url); break;
+    case CB_SOURCE: {
+        char u[URL_MAX];
+        snprintf(u, sizeof(u), "view-source:%s", t->url);
+        navigate(t, u, NULL, NAV_NEW);
+        break;
+    }
+    case CB_PRINT: print_page(t); break;
     case CB_COPY: clipboard_set(t->addr); break;
     case CB_CUT:
         clipboard_set(t->addr);
@@ -4591,6 +5947,32 @@ static int ctx_mouse(struct browser *b, int x, int y, int buttons, int changed)
     return inside;                      /* a click outside goes on to the page */
 }
 
+/* A range slider being dragged: its value for the pointer at x (b's coordinates). */
+static void range_drag_to(struct browser *b, struct node *n, int x)
+{
+    struct rect cr;
+    if (!control_rect(b, n, &cr))
+        return;
+    int track = cr.w - 12 - 10;         /* the thumb is 10 wide, 6 in from each end */
+    char v[32];
+    range_value_at(n, track > 0 ? (x - (cr.x + 6 + 5)) * 1000 / track : 0, v, sizeof(v));
+    if (!n->value || strcmp(n->value, v)) {
+        char *nv = strdup(v);
+        if (!nv)
+            return;
+        free(n->value);
+        n->value = nv;
+        n->cursor = (int)strlen(nv);
+        if (b->js)
+            jsdom_dispatch(b->js, n, "input");
+        if (css_dynamic_rules)
+            b->need_style = 1;
+        if (b->need_style)
+            relayout(b);
+        paint(b);
+    }
+}
+
 /* The mouse at (x, y) in b's coordinates: the window's, or a frame's own. */
 static void mouse(struct browser *b, int x, int y, int buttons, int changed)
 {
@@ -4608,6 +5990,10 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             mouse(f, x - box.x, y - box.y, buttons, changed);
         return;
     }
+    if (b->pop_node && pop_mouse(b, x, y, pressed, released))      /* an open list has the pointer */
+        return;
+    if (pressed)
+        tip_hide(top_of(b));
     if (b->hold == H_NONE) {
         struct browser *f = frame_at(b, x, y, &box);
         if (f) {
@@ -4632,6 +6018,8 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             open_ctx(b, x, y);
         return;
     }
+    if (pressed && !is_frame(b) && find_mouse(b, x, y))
+        return;
     if (pressed && !is_frame(b)) {
         for (int i = 0; i < NBUTTONS; i++) {
             if (rect_contains(button_rect(b, i), x, y) && button_enabled(b, i)) {
@@ -4703,6 +6091,12 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             t->addr_focus = 0;
             const struct hotspot *h = layout_hit(&b->lo, b->lo.controls, b->lo.ncontrols, px, py, b->scroll_x, b->scroll_y);
             b->press_ctrl = h ? h->node : NULL;
+            if (b->press_ctrl && b->press_ctrl->tag == T_INPUT && !strcasecmp(type_of(b->press_ctrl), "range") &&
+                !node_attr(b->press_ctrl, "disabled")) {
+                b->drag_range = b->press_ctrl;      /* a press sets the value, and a drag goes on setting it */
+                b->focus = b->press_ctrl;
+                range_drag_to(b, b->drag_range, x);
+            }
             h = layout_hit(&b->lo, b->lo.links, b->lo.nlinks, px, py, b->scroll_x, b->scroll_y);
             b->press_link = h && !b->press_ctrl ? h->node : NULL;
             b->sel_start = !b->press_ctrl && !b->press_link;
@@ -4740,6 +6134,12 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             if (over)
                 press(b, i);
         } else if (hold == H_VBAR || hold == H_HBAR || hold == H_SBOX) {
+            paint(b);
+        } else if (hold == H_PAGE && b->drag_range) {
+            struct node *r = b->drag_range;
+            b->drag_range = NULL;
+            if (b->js && b->root)
+                jsdom_dispatch(b->js, r, "change");
             paint(b);
         } else if (hold == H_PAGE) {
             b->sel_start = 0;
@@ -4789,6 +6189,8 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             layout_sbar_drag(&b->lo, &b->sb_hit, b->sb_hit.axis ? py : px, b->sb_grab, b->scroll_x, b->scroll_y);
             paint(b);
         }
+    } else if (b->hold == H_PAGE && b->drag_range) {
+        range_drag_to(b, b->drag_range, x);
     } else if (b->hold == H_PAGE && b->sel_start && left) {
         int dx = px - b->sel_ax, dy = py - b->sel_ay;
         if (!b->sel_active && (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy) > 4)
@@ -4827,6 +6229,17 @@ static int wheel(struct browser *b, int x, int y, int delta)
     if (f && wheel(f, x - box.x, y - box.y, delta))
         return 1;
     struct rect v = view_rect(b);
+    if (b->pop_node) {                  /* an open list that scrolls */
+        struct rect pr;
+        int pn, pv;
+        if (pop_rect(b, &pr, &pn, &pv) && rect_contains(pr, x, y) && pn > pv) {
+            b->pop_top += delta > 0 ? -3 : 3;
+            b->pop_top = b->pop_top < 0 ? 0 : b->pop_top > pn - pv ? pn - pv : b->pop_top;
+            paint(b);
+            return 1;
+        }
+    }
+    tip_hide(top_of(b));
     if (b->root && rect_contains(v, x, y) &&            /* a box on the page that scrolls takes it first */
         layout_wheel(&b->lo, x - v.x + b->scroll_x, y - v.y + b->scroll_y, b->scroll_x, b->scroll_y, 0,
                      -delta * 3 * LINE_STEP / 2)) {
@@ -4862,6 +6275,8 @@ static void br_focus(struct window *w, int focused)
     struct browser *b = w->priv;
     b->focused = focused;
     b->ctx_open = 0;
+    if (b->js)                          /* minimized: the page is hidden; back: visible */
+        jsdom_page_event(b->js, "visibilitychange", !focused && w->minimized);
     if (b->win)
         paint(b);
 }
@@ -4877,6 +6292,8 @@ static void destroy_browser(struct browser *b)
     helper_close(b);
     free_page(b);                       /* (its frames are dropped, to be freed by sweep_frames) */
     cache_clear(b);
+    find_clear(b);
+    free(b->mp_body);
     for (int i = 0; i < b->nhist; i++)
         free(b->hist[i].url);
     free(b);
@@ -4950,6 +6367,10 @@ void browser_poll(void)
             }
             return;                     /* the list may have changed */
         }
+        if (b->tip_node && !b->tip_shown && b->win && now_ms() - b->tip_since >= TIP_DELAY_MS) {
+            b->tip_shown = 1;
+            paint(b);
+        }
         if (b->js)
             jsdom_run_timers(b->js);
         if (b->js_nav[0]) {
@@ -4986,6 +6407,12 @@ int browser_timeout(void)
         int t = jsdom_next_timer(b->js);
         if (t >= 0 && (best < 0 || t < best))
             best = t;
+        if (b->tip_node && !b->tip_shown) {         /* the tooltip is due */
+            unsigned waited = now_ms() - b->tip_since;
+            t = waited >= TIP_DELAY_MS ? 0 : (int)(TIP_DELAY_MS - waited);
+            if (best < 0 || t < best)
+                best = t;
+        }
     }
     return best;
 }

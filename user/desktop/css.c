@@ -54,7 +54,8 @@ enum prop {
     P_FONT_VARIANT, P_LIST_STYLE_POSITION, P_TABLE_LAYOUT, P_CAPTION_SIDE, P_EMPTY_CELLS,
     P_TEXT_SHADOW, P_BACKGROUND_SIZE, P_BACKGROUND_POSITION, P_BACKGROUND_POSITION_X,
     P_BACKGROUND_POSITION_Y, P_BACKGROUND_REPEAT, P_BACKGROUND_ORIGIN, P_OBJECT_FIT,
-    P_OBJECT_POSITION, P_OVERFLOW_X, P_OVERFLOW_Y,
+    P_OBJECT_POSITION, P_OVERFLOW_X, P_OVERFLOW_Y, P_TAB_SIZE, P_TEXT_ALIGN_LAST, P_LINE_CLAMP,
+    P_LIST_STYLE_IMAGE, P_COUNTER_RESET, P_COUNTER_INCREMENT,
 };
 
 static const struct { const char *name; uint8_t prop; } prop_names[] = {
@@ -62,12 +63,14 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "-moz-user-select", P_USER_SELECT }, { "-ms-flex", P_FLEX },
     { "-ms-user-select", P_USER_SELECT }, { "-webkit-align-items", P_ALIGN_ITEMS },
     { "-webkit-align-self", P_ALIGN_SELF }, { "-webkit-appearance", P_IGNORED },
-    { "-webkit-border-radius", P_BORDER_RADIUS }, { "-webkit-box-shadow", P_BOX_SHADOW },
+    { "-webkit-border-radius", P_BORDER_RADIUS }, { "-webkit-box-orient", P_IGNORED },
+    { "-webkit-box-shadow", P_BOX_SHADOW },
     { "-webkit-box-sizing", P_BOX_SIZING }, { "-webkit-flex", P_FLEX },
     { "-webkit-flex-basis", P_FLEX_BASIS }, { "-webkit-flex-direction", P_FLEX_DIRECTION },
     { "-webkit-flex-flow", P_FLEX_FLOW }, { "-webkit-flex-grow", P_FLEX_GROW },
     { "-webkit-flex-shrink", P_FLEX_SHRINK }, { "-webkit-flex-wrap", P_FLEX_WRAP },
-    { "-webkit-font-smoothing", P_IGNORED }, { "-webkit-justify-content", P_JUSTIFY_CONTENT },
+    { "-webkit-font-smoothing", P_IGNORED }, { "-webkit-hyphens", P_IGNORED },
+    { "-webkit-justify-content", P_JUSTIFY_CONTENT }, { "-webkit-line-clamp", P_LINE_CLAMP },
     { "-webkit-mask", P_MASK }, { "-webkit-mask-image", P_MASK }, { "-webkit-order", P_ORDER },
     { "-webkit-tap-highlight-color", P_IGNORED }, { "-webkit-transform", P_TRANSFORM },
     { "-webkit-user-select", P_USER_SELECT }, { "accent-color", P_IGNORED },
@@ -108,7 +111,8 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "bottom", P_BOTTOM }, { "box-shadow", P_BOX_SHADOW }, { "box-sizing", P_BOX_SIZING },
     { "caption-side", P_CAPTION_SIDE }, { "caret-color", P_IGNORED }, { "clear", P_CLEAR },
     { "clip", P_CLIP }, { "color", P_COLOR }, { "column-gap", P_COLUMN_GAP },
-    { "content", P_CONTENT }, { "cursor", P_CURSOR }, { "display", P_DISPLAY },
+    { "content", P_CONTENT }, { "counter-increment", P_COUNTER_INCREMENT },
+    { "counter-reset", P_COUNTER_RESET }, { "cursor", P_CURSOR }, { "display", P_DISPLAY },
     { "empty-cells", P_EMPTY_CELLS }, { "flex", P_FLEX }, { "flex-basis", P_FLEX_BASIS },
     { "flex-direction", P_FLEX_DIRECTION }, { "flex-flow", P_FLEX_FLOW },
     { "flex-grow", P_FLEX_GROW }, { "flex-shrink", P_FLEX_SHRINK }, { "flex-wrap", P_FLEX_WRAP },
@@ -123,14 +127,15 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "grid-row-gap", P_ROW_GAP }, { "grid-row-start", P_GRID_ROW_START },
     { "grid-template", P_GRID_TEMPLATE }, { "grid-template-areas", P_GRID_TEMPLATE_AREAS },
     { "grid-template-columns", P_GRID_TEMPLATE_COLUMNS },
-    { "grid-template-rows", P_GRID_TEMPLATE_ROWS }, { "height", P_HEIGHT },
+    { "grid-template-rows", P_GRID_TEMPLATE_ROWS }, { "height", P_HEIGHT }, { "hyphens", P_IGNORED },
     { "inline-size", P_WIDTH }, { "inset", P_INSET }, { "inset-block", P_INSET_BLOCK },
     { "inset-block-end", P_BOTTOM }, { "inset-block-start", P_TOP },
     { "inset-inline", P_INSET_INLINE }, { "inset-inline-end", P_RIGHT },
     { "inset-inline-start", P_LEFT }, { "justify-content", P_JUSTIFY_CONTENT },
     { "justify-items", P_JUSTIFY_ITEMS }, { "justify-self", P_JUSTIFY_SELF }, { "left", P_LEFT },
     { "letter-spacing", P_LETTER_SPACING }, { "line-height", P_LINE_HEIGHT },
-    { "list-style", P_LIST_STYLE }, { "list-style-position", P_LIST_STYLE_POSITION },
+    { "list-style", P_LIST_STYLE }, { "list-style-image", P_LIST_STYLE_IMAGE },
+    { "list-style-position", P_LIST_STYLE_POSITION },
     { "list-style-type", P_LIST_STYLE_TYPE }, { "margin", P_MARGIN },
     { "margin-block", P_MARGIN_BLOCK }, { "margin-block-end", P_MARGIN_BOTTOM },
     { "margin-block-start", P_MARGIN_TOP }, { "margin-bottom", P_MARGIN_BOTTOM },
@@ -153,9 +158,10 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "padding-left", P_PADDING_LEFT }, { "padding-right", P_PADDING_RIGHT },
     { "padding-top", P_PADDING_TOP }, { "place-content", P_PLACE_CONTENT },
     { "place-items", P_PLACE_ITEMS }, { "place-self", P_PLACE_SELF },
-    { "pointer-events", P_POINTER_EVENTS }, { "position", P_POSITION }, { "right", P_RIGHT },
-    { "row-gap", P_ROW_GAP }, { "scroll-behavior", P_IGNORED }, { "table-layout", P_TABLE_LAYOUT },
-    { "text-align", P_TEXT_ALIGN }, { "text-decoration", P_TEXT_DECORATION },
+    { "pointer-events", P_POINTER_EVENTS }, { "position", P_POSITION }, { "resize", P_IGNORED }, { "right", P_RIGHT },
+    { "row-gap", P_ROW_GAP }, { "scroll-behavior", P_IGNORED }, { "tab-size", P_TAB_SIZE },
+    { "table-layout", P_TABLE_LAYOUT }, { "text-align", P_TEXT_ALIGN },
+    { "text-align-last", P_TEXT_ALIGN_LAST }, { "text-decoration", P_TEXT_DECORATION },
     { "text-decoration-color", P_TEXT_DECORATION_COLOR },
     { "text-decoration-line", P_TEXT_DECORATION_LINE },
     { "text-decoration-style", P_TEXT_DECORATION_STYLE },
@@ -181,6 +187,11 @@ enum {
     PS_DEFAULT = 1 << 24, PS_INDETERMINATE = 1 << 25, PS_VALID = 1 << 26, PS_INVALID = 1 << 27,
     PS_IN_RANGE = 1 << 28, PS_OUT_RANGE = 1 << 29,
 };
+#define PS_ACTIVE       (1u << 30)
+#define PS_USER_INVALID (1u << 31)
+
+/* Page zoom in percent (see web.h): the browser sets it before it parses or cascades. */
+int css_zoom = 100;
 
 /* The fragment of the page's address, for :target (set by the browser before it cascades). */
 const char *css_target_id;
@@ -260,7 +271,7 @@ static const char ua_css[] =
     " summary, frameset, frame, noframes, optgroup { display: block }"
     "head, script, style, link, meta, title, base, template, param, area, map, source, track,"
     " datalist, object, embed, video, audio, canvas, col, colgroup, option,"
-    " input[type=hidden], [hidden], noembed, noscript, dialog:not([open]) { display: none }"
+    " input[type=hidden], [hidden], noembed, noscript, dialog:not([open]), datalist { display: none }"
     "li { display: list-item }"
     "table { display: table; border-spacing: 2px; text-indent: 0 }"
     "caption { display: table-caption; text-align: center }"
@@ -602,6 +613,20 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
                 c->pseudo |= PS_LAST_OF_TYPE;
             else if (!strcmp(name, "hover")) {
                 c->pseudo |= PS_HOVER;
+                css_dynamic_rules++;
+            } else if (!strcmp(name, "active")) {
+                c->pseudo |= PS_ACTIVE;
+                css_dynamic_rules++;
+            } else if (!strcmp(name, "scope")) {
+                c->pseudo |= PS_ROOT;           /* in a document, the scope is the root element */
+            } else if (!strcmp(name, "dir") && args) {
+                const char *d = args;
+                while (d < args_end && isspace((unsigned char)*d))
+                    d++;
+                if (strncasecmp(d, "ltr", 3))
+                    c->pseudo |= PS_NEVER;      /* nothing here is right to left */
+            } else if (!strcmp(name, "user-invalid")) {
+                c->pseudo |= PS_USER_INVALID;
                 css_dynamic_rules++;
             } else if (!strcmp(name, "focus") || !strcmp(name, "focus-visible")) {
                 c->pseudo |= PS_FOCUS;
@@ -1554,7 +1579,7 @@ struct sheet *css_parse(struct arena *a, const char *text, int len, int viewport
 
 /* ---- matching ---- */
 
-const struct node *css_hover_node, *css_focus_node;
+const struct node *css_hover_node, *css_focus_node, *css_active_node;
 int css_dynamic_rules;
 
 struct mctx {
@@ -1920,6 +1945,15 @@ static int match_compound(const struct compound *c, const struct node *n, const 
             if (!h)
                 return 0;
         }
+        if (ps & PS_ACTIVE) {
+            const struct node *h = css_active_node;
+            while (h && h != n)
+                h = h->parent;
+            if (!h)
+                return 0;
+        }
+        if ((ps & PS_USER_INVALID) && (!match_valid(n, 0) || !((n->value && *n->value) || n == css_focus_node)))
+            return 0;                   /* invalid, and the user has typed in it */
         if ((ps & PS_FOCUS) && n != css_focus_node)
             return 0;
         if (ps & PS_FOCUS_WITHIN) {
@@ -2319,14 +2353,15 @@ int css_parse_color(const char *s, int n, uint32_t *out)
 static int unit_px100(const char *unit, long num, const struct vctx *v, long *out)
 {
     long px;
+    int absolute = 1;
     if (!strcmp(unit, "px"))
         px = num;
     else if (!strcmp(unit, "em"))
-        px = num * v->font_size;
+        px = num * v->font_size, absolute = 0;      /* the font size is zoomed already */
     else if (!strcmp(unit, "rem"))
-        px = num * v->root_font_size;
+        px = num * v->root_font_size, absolute = 0;
     else if (!strcmp(unit, "ex") || !strcmp(unit, "ch"))
-        px = num * v->font_size / 2;
+        px = num * v->font_size / 2, absolute = 0;
     else if (!strcmp(unit, "pt"))
         px = num * 4 / 3;
     else if (!strcmp(unit, "pc"))
@@ -2338,16 +2373,16 @@ static int unit_px100(const char *unit, long num, const struct vctx *v, long *ou
     else if (!strcmp(unit, "mm"))
         px = num * 96 * 10 / 254;
     else if (!strcmp(unit, "vw") || !strcmp(unit, "dvw") || !strcmp(unit, "svw") || !strcmp(unit, "lvw"))
-        px = num * v->vw / 100;
+        px = num * v->vw / 100, absolute = 0;
     else if (!strcmp(unit, "vh") || !strcmp(unit, "dvh") || !strcmp(unit, "svh") || !strcmp(unit, "lvh"))
-        px = num * v->vh / 100;
+        px = num * v->vh / 100, absolute = 0;
     else if (!strcmp(unit, "vmin"))
-        px = num * (v->vw < v->vh ? v->vw : v->vh) / 100;
+        px = num * (v->vw < v->vh ? v->vw : v->vh) / 100, absolute = 0;
     else if (!strcmp(unit, "vmax"))
-        px = num * (v->vw > v->vh ? v->vw : v->vh) / 100;
+        px = num * (v->vw > v->vh ? v->vw : v->vh) / 100, absolute = 0;
     else
         return 0;
-    *out = px;
+    *out = absolute && css_zoom != 100 ? px * css_zoom / 100 : px;
     return 1;
 }
 
@@ -2577,7 +2612,7 @@ static int length_value(const char *s, const struct vctx *v, struct len *out)
         return 1;
     }
     if (!unit[0])
-        px = num;
+        px = num * css_zoom / 100;
     else if (!unit_px100(unit, num, v, &px))
         return 0;
     out->v = (int)((px + (px >= 0 ? 50 : -50)) / 100);
@@ -2601,7 +2636,7 @@ static int len_on(struct len l, int base)
 /* Something length_value can read (for @supports). */
 static int is_length(const char *s)
 {
-    struct vctx v = { 16, 16, 1024, 768, NULL };
+    struct vctx v = { ZOOM(16), ZOOM(16), 1024, 768, NULL };
     struct len l;
     return length_value(s, &v, &l);
 }
@@ -2680,6 +2715,7 @@ static void init_initial(void)
     s->list_style = LS_DISC;
     s->outline_color = 1;
     s->outline_w = 3;
+    s->tab_size = 8;
     s->bg_w.unit = s->bg_h.unit = U_AUTO;
     s->obj_px = s->obj_py = (struct len){ 5000, 0, U_PCT };
 }
@@ -2705,6 +2741,8 @@ static void inherit(struct style *st, const struct style *p)
     st->border_spacing = p->border_spacing;
     st->vars = p->vars;
     st->text_indent = p->text_indent;
+    st->tab_size = p->tab_size;
+    st->ls_url = p->ls_url;
     st->letter_spacing = p->letter_spacing;
     st->word_spacing = p->word_spacing;
     st->word_break = p->word_break;
@@ -2733,11 +2771,11 @@ static int parse_border_style(const char *w, int wl)
 static int border_width_kw(const char *w, int wl, const struct vctx *v, int *px)
 {
     if (word_is(w, wl, "thin"))
-        return *px = 1, 1;
+        return *px = ZOOM(1) ? ZOOM(1) : 1, 1;
     if (word_is(w, wl, "medium"))
-        return *px = 3, 1;
+        return *px = ZOOM(3), 1;
     if (word_is(w, wl, "thick"))
-        return *px = 5, 1;
+        return *px = ZOOM(5), 1;
     char tmp[32];
     if (wl >= (int)sizeof(tmp))
         return 0;
@@ -2754,7 +2792,7 @@ static void apply_border(struct style *st, const char *value, int mask, const st
 {
     const char *w[8];
     int wl[8], n = words(value, w, wl, 8);
-    int width = 3, style = BS_NONE;
+    int width = ZOOM(3), style = BS_NONE;
     uint32_t color = 1;
     for (int i = 0; i < n; i++) {
         int bs = parse_border_style(w[i], wl[i]), px;
@@ -2841,7 +2879,7 @@ static int font_size_value(const char *value, const struct style *parent, const 
     };
     for (size_t i = 0; i < sizeof(kws) / sizeof(kws[0]); i++)
         if (!strcasecmp(value, kws[i].kw))
-            return *px = kws[i].px, 1;
+            return *px = ZOOM(kws[i].px), 1;
     if (!strcasecmp(value, "smaller"))
         return *px = parent->font_size * 5 / 6, 1;
     if (!strcasecmp(value, "larger"))
@@ -4038,6 +4076,31 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
     case P_LIST_STYLE_POSITION:
         st->list_inside = !strcasecmp(value, "inside");
         break;
+    case P_LIST_STYLE_IMAGE:
+        st->ls_url = url_arg(v->a, value, value + strlen(value), NULL);
+        break;
+    case P_TAB_SIZE: {
+        int num, used = parse_num(value, &num);
+        st->tab_size = used && !value[used] && num >= 100 && num <= 1600 ? (uint8_t)(num / 100) : 8;
+        break;
+    }
+    case P_TEXT_ALIGN_LAST:
+        st->text_align_last = !strcasecmp(value, "center") ? TA_CENTER + 1
+                            : !strcasecmp(value, "right") || !strcasecmp(value, "end") ? TA_RIGHT + 1
+                            : !strcasecmp(value, "justify") ? TA_JUSTIFY + 1
+                            : !strcasecmp(value, "left") || !strcasecmp(value, "start") ? TA_LEFT + 1 : 0;
+        break;
+    case P_LINE_CLAMP: {
+        int num, used = parse_num(value, &num);
+        st->line_clamp = used && num >= 100 && num <= 25500 ? (uint8_t)(num / 100) : 0;
+        break;
+    }
+    case P_COUNTER_RESET:
+        st->counter_reset = v->a ? arena_strdup(v->a, value) : NULL;
+        break;
+    case P_COUNTER_INCREMENT:
+        st->counter_inc = v->a ? arena_strdup(v->a, value) : NULL;
+        break;
     case P_CURSOR: {
         static const struct { const char *kw; uint8_t c; } cursors[] = {
             { "auto", CSSCUR_AUTO }, { "default", CSSCUR_DEFAULT }, { "pointer", CSSCUR_POINTER },
@@ -4084,14 +4147,14 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
     case P_OUTLINE_WIDTH: {
         if (initial_kw) {
             st->outline_style = BS_NONE;
-            st->outline_w = 3;
+            st->outline_w = ZOOM(3);
             st->outline_color = 1;
             break;
         }
         n = words(value, w, wl, 8);
         if (prop == P_OUTLINE) {
             st->outline_style = BS_NONE;
-            st->outline_w = 3;
+            st->outline_w = ZOOM(3);
             st->outline_color = 1;
         }
         for (int i = 0; i < n; i++) {
@@ -4893,6 +4956,7 @@ static void match_sheet(struct collect *c, const struct sheet *sh, const struct 
 
 static void pseudo(struct arena *a, struct node *n, const struct style *st, const struct collect *c,
                    int pe, const struct vctx *base);
+static void counter_apply(const char *spec, int reset);
 
 static void compute(struct arena *a, struct node *n, const struct style *parent,
                     struct sheet **sheets, int nsheets, const struct vctx *base,
@@ -4973,6 +5037,11 @@ static void compute(struct arena *a, struct node *n, const struct style *parent,
         }
     }
 
+    if (st->counter_reset)
+        counter_apply(st->counter_reset, 1);
+    if (st->counter_inc)
+        counter_apply(st->counter_inc, 0);
+
     /* Links follow <body link=...> unless a style sheet says otherwise. */
     if (n->tag == T_BODY && node_attr(n, "link")) {
         char col[64];
@@ -5022,13 +5091,143 @@ static void compute(struct arena *a, struct node *n, const struct style *parent,
     if (st->font_size > 200)
         st->font_size = 200;
     st->font = wfont_get(st->family, st->bold, st->italic, st->font_size);
+    if (st->line_clamp && st->max_height.unit == U_AUTO) {         /* -webkit-line-clamp: that many lines, the rest cut off */
+        int lh = st->lh_kind == LH_PX ? st->lh : st->lh_kind == LH_FACTOR ? st->font_size * st->lh / 100
+               : wfont_height(st->font);
+        st->max_height.unit = U_PX;
+        st->max_height.v = lh * st->line_clamp;
+        st->ov_x = st->ov_y = OV_HIDDEN;
+        st->clips = 1;
+    }
 
     if (st->display != D_NONE)
         for (int pe = PE_BEFORE; pe <= PE_MARKER; pe++)
             pseudo(a, n, st, &c, pe, &v);
 }
 
-/* The text of a "content" value: strings, quotes and attr(); NULL for none. */
+/* ---- counters: counter-reset and counter-increment, read by counter() in content ---- */
+
+/* The document's counters, in tree order (a flat table: a counter is not scoped to the element
+ * that made it, so nested lists that restart a counter in each level read the innermost one). */
+static struct { char name[32]; int val; } counters[48];
+static int ncounters;
+
+static int counter_find(const char *name, int len, int make)
+{
+    for (int i = 0; i < ncounters; i++)
+        if ((int)strlen(counters[i].name) == len && !strncmp(counters[i].name, name, (size_t)len))
+            return i;
+    if (!make || ncounters == (int)(sizeof(counters) / sizeof(counters[0])) || len >= (int)sizeof(counters[0].name))
+        return -1;
+    memcpy(counters[ncounters].name, name, (size_t)len);
+    counters[ncounters].name[len] = 0;
+    counters[ncounters].val = 0;
+    return ncounters++;
+}
+
+/* "name", "name 5", "a 1 b -2": each counter set (reset) or advanced (increment). */
+static void counter_apply(const char *spec, int reset)
+{
+    const char *p = spec;
+    while (p && *p) {
+        while (isspace((unsigned char)*p))
+            p++;
+        const char *s = p;
+        while (*p && !isspace((unsigned char)*p))
+            p++;
+        if (p == s)
+            break;
+        if (p - s == 4 && !strncasecmp(s, "none", 4))
+            return;
+        int k = counter_find(s, (int)(p - s), 1);
+        while (isspace((unsigned char)*p))
+            p++;
+        int amount = reset ? 0 : 1, num, used = (isdigit((unsigned char)*p) || *p == '-' || *p == '+') ? parse_num(p, &num) : 0;
+        if (used) {
+            amount = num / 100;
+            p += used;
+        }
+        if (k >= 0) {
+            if (reset)
+                counters[k].val = amount;
+            else
+                counters[k].val += amount;
+        }
+    }
+}
+
+/* A counter's value as text: decimal, lower-alpha, upper-roman and so on. */
+static void counter_format(int v, const char *style, int slen, char *out, int size)
+{
+    static const struct { int v; const char *s; } rom[] = {
+        { 1000, "m" }, { 900, "cm" }, { 500, "d" }, { 400, "cd" }, { 100, "c" }, { 90, "xc" },
+        { 50, "l" }, { 40, "xl" }, { 10, "x" }, { 9, "ix" }, { 5, "v" }, { 4, "iv" }, { 1, "i" },
+    };
+    int upper = slen >= 5 && !strncasecmp(style, "upper", 5);
+    int alpha = slen >= 10 && (!strncasecmp(style + 6, "alpha", 5) || !strncasecmp(style + 6, "latin", 5));
+    int roman = slen >= 11 && !strncasecmp(style + 6, "roman", 5);
+    if ((upper || !strncasecmp(style, "lower", 5)) && alpha && v > 0) {
+        char tmp[16];
+        int n = 0;
+        for (int x = v; x > 0 && n < 14; x = (x - 1) / 26)
+            tmp[n++] = (char)((upper ? 'A' : 'a') + (x - 1) % 26);
+        for (int i = 0; i < n && i < size - 1; i++)
+            out[i] = tmp[n - 1 - i];
+        out[n < size - 1 ? n : size - 1] = 0;
+    } else if (roman && v > 0 && v < 4000) {
+        int o = 0;
+        for (int i = 0; i < 13; i++)
+            while (v >= rom[i].v) {
+                for (const char *c = rom[i].s; *c && o < size - 1; c++)
+                    out[o++] = upper ? (char)(*c - 'a' + 'A') : *c;
+                v -= rom[i].v;
+            }
+        out[o] = 0;
+    } else if (slen >= 7 && !strncasecmp(style, "decimal-leading-zero", 20 < slen ? 20 : slen) && slen >= 20) {
+        snprintf(out, (size_t)size, "%02d", v);
+    } else if (slen == 4 && !strncasecmp(style, "disc", 4)) {
+        snprintf(out, (size_t)size, "\xE2\x80\xA2");
+    } else {
+        snprintf(out, (size_t)size, "%d", v);
+    }
+}
+
+/* counter(name[, style]) or counters(name, "sep"[, style]) at p: appends its text; returns the end. */
+static const char *content_counter(const char *p, const char *end, char *out, int *o, int size)
+{
+    int plural = !strncasecmp(p, "counters(", 9);
+    const char *a = p + (plural ? 9 : 8), *close = skip_group(strchr(p, '('), end);
+    const char *stop = close > a ? close - 1 : a;
+    const char *c1 = find_top(a, stop, ',');
+    while (a < c1 && isspace((unsigned char)*a))
+        a++;
+    const char *ne = c1;
+    while (ne > a && isspace((unsigned char)ne[-1]))
+        ne--;
+    const char *style = "decimal";
+    int slen = 7;
+    if (c1 < stop) {
+        const char *c2 = plural ? find_top(c1 + 1, stop, ',') : stop;
+        const char *s = plural ? c2 + 1 : c1 + 1;
+        if (!plural || c2 < stop) {
+            while (s < stop && isspace((unsigned char)*s))
+                s++;
+            const char *se = stop;
+            while (se > s && isspace((unsigned char)se[-1]))
+                se--;
+            if (se > s)
+                style = s, slen = (int)(se - s);
+        }
+    }
+    int k = counter_find(a, (int)(ne - a), 0);
+    char text[40];
+    counter_format(k >= 0 ? counters[k].val : 0, style, slen, text, sizeof(text));
+    for (const char *t = text; *t && *o < size - 1; t++)
+        out[(*o)++] = *t;
+    return close;
+}
+
+/* The text of a "content" value: strings, quotes, counters and attr(); NULL for none. */
 static const char *content_text(struct arena *a, const struct node *n, const char *value)
 {
     char out[256];
@@ -5077,8 +5276,10 @@ static const char *content_text(struct arena *a, const struct node *n, const cha
                     out[o++] = *v;
             }
             p = close ? close + 1 : end;
+        } else if (!strncasecmp(p, "counter(", 8) || !strncasecmp(p, "counters(", 9)) {
+            p = content_counter(p, end, out, &o, (int)sizeof(out));
         } else if (*p == '(' || isalpha((unsigned char)*p)) {
-            /* url(), counter() and the like: nothing we can show */
+            /* url() and the like: nothing we can show */
             while (p < end && !isspace((unsigned char)*p)) {
                 if (*p == '(')
                     p = skip_group(p, end);
@@ -5113,6 +5314,19 @@ static void pseudo(struct arena *a, struct node *n, const struct style *st, cons
     if (pe <= PE_AFTER) {
         if (!content)
             return;
+        const char *creset = NULL, *cinc = NULL;
+        for (int i = 0; i < c->n; i++) {            /* counters the pseudo-element itself sets, before it reads them */
+            if (c->m[i].pe != (uint32_t)pe)
+                continue;
+            if (c->m[i].d->prop == P_COUNTER_RESET)
+                creset = c->m[i].d->value;
+            else if (c->m[i].d->prop == P_COUNTER_INCREMENT)
+                cinc = c->m[i].d->value;
+        }
+        if (creset)
+            counter_apply(creset, 1);
+        if (cinc)
+            counter_apply(cinc, 0);
         text = content_text(a, n, content);
         if (!text)
             return;
@@ -5194,13 +5408,18 @@ void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int 
                  void *ctx)
 {
     init_initial();
+    ncounters = 0;
     if (!ua_sheet) {
         ua_sheet = css_parse(&ua_arena, ua_css, (int)strlen(ua_css), viewport_w);
         ua_quirks = css_parse(&ua_arena, ua_quirks_css, (int)strlen(ua_quirks_css), viewport_w);
     }
     if (!ua_sheet || !ua_quirks || !root)
         return;
-    struct vctx v = { 16, 16, viewport_w, viewport_h, a };
+    initial_style.font_size = ZOOM(16);
+    for (int i = 0; i < 4; i++)
+        initial_style.border_w[i] = ZOOM(3);
+    initial_style.outline_w = ZOOM(3);
+    struct vctx v = { ZOOM(16), ZOOM(16), viewport_w, viewport_h, a };
     struct mctx mc = { visited, ctx, root->quirks };
     struct match *buf = malloc(sizeof(struct match) * MAX_MATCHES);
     if (!buf)

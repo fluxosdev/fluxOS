@@ -64,6 +64,7 @@ struct flow {
     int space_before;           /* the run ends in a collapsible space (or is empty) */
     struct node *link;
     int lines;                  /* lines placed so far */
+    int last_line;              /* the line being placed is the last of its block (or before a break) */
     int min, max;               /* measuring */
     struct open_el open[16];
     int nopen;
@@ -79,6 +80,7 @@ struct lctx {
     const struct style *marker_st;
     char marker_text[16];
     int marker_kind;            /* LS_* */
+    struct image *marker_img;   /* list-style-image */
     int marker_x;               /* the list item's content box left */
     int marker_pending;
     char inside_text[24];       /* list-style-position: inside: the marker, to start the item's text */
@@ -687,7 +689,7 @@ static void bg_picture_finish(struct lctx *c, struct node *n, int slot)
     if (ow <= 0 || oh <= 0)
         return;
     const struct image *img = st->bg_img;
-    int iw = img->w, ih = img->h, tw = iw, th = ih;
+    int iw = img->w, ih = img->h, tw = ZOOM(iw), th = ZOOM(ih);
     switch (st->bg_size) {
     case BGS_COVER:
     case BGS_CONTAIN: {
@@ -900,7 +902,8 @@ static void start_marker(struct lctx *c, struct node *li, int content_x)
     const struct style *st = li->style;
     c->marker_pending = 0;
     c->inside_text[0] = 0;
-    if (st->list_style == LS_NONE || st->hidden)
+    c->marker_img = st->ls_img && st->ls_img->w > 0 && st->ls_img->h > 0 ? st->ls_img : NULL;
+    if ((st->list_style == LS_NONE && !c->marker_img) || st->hidden)
         return;
     c->marker_st = li->pseudo_st[PE_MARKER - 1] ? li->pseudo_st[PE_MARKER - 1] : st;
     c->marker_kind = st->list_style;
@@ -924,6 +927,10 @@ static void start_marker(struct lctx *c, struct node *li, int content_x)
     default:
         break;
     }
+    if (c->marker_img) {                /* a picture instead: outside the box, whatever list-style-position says */
+        c->marker_pending = 1;
+        return;
+    }
     if (st->list_inside) {              /* the marker is the first thing on the first line */
         const char *glyph = c->marker_text[0] ? c->marker_text
                           : st->list_style == LS_CIRCLE ? "o" : st->list_style == LS_SQUARE ? "-"
@@ -942,6 +949,21 @@ static void place_marker(struct lctx *c, int baseline)
     c->marker_pending = 0;
     const struct style *st = c->marker_st;
     int size = st->font_size;
+    if (c->marker_img) {
+        int iw = ZOOM(c->marker_img->w), ih = ZOOM(c->marker_img->h), maxh = size * 3 / 2;
+        if (ih > maxh) {
+            iw = iw * maxh / ih;
+            ih = maxh;
+        }
+        struct ditem *d = emit(c, DK_IMAGE);
+        if (d) {
+            d->x = c->marker_x - (iw < 1 ? 1 : iw) - size / 2;
+            d->y = baseline - ih + size / 6;
+            d->w = iw < 1 ? 1 : iw, d->h = ih < 1 ? 1 : ih;
+            d->img = c->marker_img;
+        }
+        return;
+    }
     if (c->marker_text[0]) {
         int w = wfont_width(st->font, c->marker_text, (int)strlen(c->marker_text));
         struct ditem *d = emit(c, DK_TEXT);
@@ -1155,7 +1177,8 @@ static void add_text(struct lctx *c, struct flow *f, const char *text, int tlen,
             }
             int w = 0;
             while (s < end && (*s == ' ' || *s == '\t')) {
-                int adv = *s == '\t' ? 8 - col % 8 : 1;
+                int ts = st->tab_size ? st->tab_size : 8;
+                int adv = *s == '\t' ? ts - col % ts : 1;
                 w += adv * sw;
                 col += adv;
                 s++;
@@ -1247,7 +1270,7 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
         alt = node_attr(n, "alt");
         if (img && img->w > 0 && img->h > 0) {
             if (w < 0 && h < 0)
-                w = img->w, h = img->h;
+                w = ZOOM(img->w), h = ZOOM(img->h);
             else if (w < 0)
                 w = h * img->w / img->h;
             else if (h < 0)
@@ -1275,6 +1298,7 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
         ctrl = 0;
         int iw, ih;
         svg_size(n, &iw, &ih);
+        iw = ZOOM(iw), ih = ZOOM(ih);
         if (w < 0 && h < 0)
             w = iw, h = ih;
         else if (w < 0)
@@ -1292,25 +1316,36 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
     } else if (n->tag == T_INPUT) {
         const char *t = input_type(n);
         if (!strcasecmp(t, "checkbox") || !strcasecmp(t, "radio")) {
-            w = w < 0 ? 13 : w;
-            h = h < 0 ? 13 : h;
+            w = w < 0 ? ZOOM(13) : w;
+            h = h < 0 ? ZOOM(13) : h;
             if (st->margin[1].unit == U_PX && !st->margin[1].v && !st->margin[3].v)
                 b.ml = b.mr = 3;
+        } else if (!strcasecmp(t, "range")) {
+            if (w < 0)
+                w = ZOOM(129);
+            if (h < 0)
+                h = ZOOM(18);
+        } else if (!strcasecmp(t, "color")) {
+            if (w < 0)
+                w = ZOOM(48);
+            if (h < 0)
+                h = fh + 6;
         } else if (is_button_input(t)) {
             const char *label = control_label(n);
             if (w < 0)
-                w = wfont_width(f, label, (int)strlen(label)) + 16;
+                w = wfont_width(f, label, (int)strlen(label)) + ZOOM(16) +
+                    (!strcasecmp(t, "file") ? ZOOM(6 + 150) : 0);       /* a file's name goes beside its button */
             if (h < 0)
                 h = fh + 6;
         } else {
             if (w < 0)
-                w = 150;
+                w = ZOOM(150);
             if (h < 0)
                 h = fh + 6;
         }
     } else if (n->tag == T_SELECT) {
         if (w < 0) {
-            w = 40;
+            w = ZOOM(40);
             for (const struct node *o = n; o; o = node_next((struct node *)o, n))
                 if (o->type == N_ELEMENT && o->tag == T_OPTION && o->value) {
                     int ow2 = wfont_width(f, o->value, (int)strlen(o->value)) + 28;
@@ -1325,19 +1360,19 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
     } else if (n->tag == T_PROGRESS || n->tag == T_METER) {     /* a gauge, drawn by draw_control */
         ctrl = 0;
         if (w < 0)
-            w = n->tag == T_PROGRESS ? 160 : 80;
+            w = ZOOM(n->tag == T_PROGRESS ? 160 : 80);
         if (h < 0)
-            h = 16;
+            h = ZOOM(16);
     } else if (n->tag == T_IFRAME) {    /* its page is drawn by the browser */
         ctrl = 0;
         kind = DK_IFRAME;
         if (w < 0)
-            w = 300;
+            w = ZOOM(300);
         if (h < 0)
-            h = 150;
+            h = ZOOM(150);
     } else {                            /* textarea */
         if (w < 0)
-            w = 168;
+            w = ZOOM(168);
         if (h < 0)
             h = 2 * fh + 6;
     }
@@ -1384,7 +1419,7 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
     if (kind == DK_IMAGE) {
         round_corners(d, st, w, h);
         if (st->obj_fit != OF_FILL && n->tag == T_IMG && n->img && n->img->w > 0 && n->img->h > 0) {
-            int iw = n->img->w, ih = n->img->h, fw = iw, fh = ih;
+            int iw = n->img->w, ih = n->img->h, fw = ZOOM(iw), fh = ZOOM(ih);
             int fit = st->obj_fit;
             if (fit == OF_SCALE_DOWN)
                 fit = iw <= w && ih <= h ? OF_NONE : OF_CONTAIN;
@@ -1773,11 +1808,12 @@ static void place_line(struct lctx *c, struct flow *f, int from, int to)
     int line_top = f->cy, baseline = line_top + above, line_h = above + below;
 
     int x = f->x + indent;
-    if (cs->text_align == TA_CENTER)
+    int align = f->last_line && cs->text_align_last ? cs->text_align_last - 1 : cs->text_align;
+    if (align == TA_CENTER)
         x += (avail - lw) / 2;
-    else if (cs->text_align == TA_RIGHT)
+    else if (align == TA_RIGHT)
         x += avail - lw;
-    if (x < f->x && cs->text_align != TA_LEFT)
+    if (x < f->x && align != TA_LEFT)
         x = f->x;
     int line_left = x;
 
@@ -1981,6 +2017,7 @@ static void flush_run(struct lctx *c, struct flow *f)
         int has = forced;
         for (int k = start; k < e && !has; k++)
             has = is_content(&items[k]);
+        f->last_line = forced || next >= n;
         if (has)
             place_line(c, f, start, e);
         else if (forced)
@@ -4399,9 +4436,8 @@ static void draw_text_clipped(struct surface *s, const struct wfont *f, struct r
 }
 
 /* An attribute's number times 1000 ("0.75" is 750), or def. */
-static int milli_attr(const struct node *n, const char *name, int def)
+static int milli_str(const char *v, int def)
 {
-    const char *v = node_attr(n, name);
     if (!v)
         return def;
     while (*v == ' ')
@@ -4418,6 +4454,86 @@ static int milli_attr(const struct node *n, const char *name, int def)
             frac += (*v - '0') * scale;
     int r = whole * 1000 + frac;
     return neg ? -r : r;
+}
+
+static int milli_attr(const struct node *n, const char *name, int def)
+{
+    return milli_str(node_attr(n, name), def);
+}
+
+/* A value in thousandths as text: "5", "2.5", "0.125". */
+static void milli_text(int v, char *out, int size)
+{
+    int neg = v < 0, whole, frac;
+    if (neg)
+        v = -v;
+    whole = v / 1000, frac = v % 1000;
+    int o = snprintf(out, (size_t)size, "%s%d", neg ? "-" : "", whole);
+    if (frac && o < size - 4) {
+        o += snprintf(out + o, (size_t)(size - o), ".%03d", frac);
+        while (out[o - 1] == '0')
+            out[--o] = 0;
+    }
+}
+
+int range_fraction(const struct node *n)
+{
+    int lo = milli_attr(n, "min", 0), hi = milli_attr(n, "max", 100000);
+    int v = milli_str(n->value, lo + (hi - lo) / 2);       /* the middle, if nothing is set */
+    if (hi <= lo)
+        return 0;
+    v = v < lo ? lo : v > hi ? hi : v;
+    return muldiv(v - lo, 1000, hi - lo);
+}
+
+void range_value_at(const struct node *n, int fraction, char *out, int size)
+{
+    int lo = milli_attr(n, "min", 0), hi = milli_attr(n, "max", 100000);
+    const char *sa = node_attr(n, "step");
+    int step = sa && !strcasecmp(sa, "any") ? 1 : milli_attr(n, "step", 1000);
+    if (step <= 0)
+        step = 1000;
+    if (hi < lo)
+        hi = lo;
+    fraction = fraction < 0 ? 0 : fraction > 1000 ? 1000 : fraction;
+    int v = lo + muldiv(hi - lo, fraction, 1000);
+    v = lo + ((v - lo + step / 2) / step) * step;       /* to the nearest step from the minimum */
+    if (v > hi)
+        v = lo + ((hi - lo) / step) * step;
+    milli_text(v < lo ? lo : v, out, size);
+}
+
+void range_nudge(const struct node *n, int dir, char *out, int size)
+{
+    int lo = milli_attr(n, "min", 0), hi = milli_attr(n, "max", 100000);
+    const char *sa = node_attr(n, "step");
+    int step = sa && !strcasecmp(sa, "any") ? 1000 : milli_attr(n, "step", 1000);
+    if (step <= 0)
+        step = 1000;
+    int v = milli_str(n->value, lo + (hi - lo) / 2);
+    if (dir == -2)
+        v = lo;
+    else if (dir == 2)
+        v = hi;
+    else
+        v += dir * step;
+    v = v < lo ? lo : v > hi ? hi : v;
+    milli_text(v, out, size);
+}
+
+const char *input_pattern(const char *type)
+{
+    if (!strcasecmp(type, "date"))
+        return "yyyy-mm-dd";
+    if (!strcasecmp(type, "time"))
+        return "hh:mm";
+    if (!strcasecmp(type, "datetime-local"))
+        return "yyyy-mm-ddThh:mm";
+    if (!strcasecmp(type, "month"))
+        return "yyyy-mm";
+    if (!strcasecmp(type, "week"))
+        return "yyyy-Www";
+    return NULL;
 }
 
 /* <progress> and <meter>: a sunken trough with a bar. */
@@ -4499,6 +4615,52 @@ static void draw_control(struct surface *s, const struct ditem *d, int x, int y,
             gfx_focus_rect(s, mkrect(x - 2, y - 2, d->w + 4, d->h + 4));
         return;
     }
+    if (n->tag == T_INPUT && !strcasecmp(type, "range")) {
+        int mid = y + d->h / 2, left = x + 6, track = d->w - 12;
+        gfx_fill(s, left, mid - 2, track, 4, C_LIGHT);
+        gfx_bevel(s, mkrect(left, mid - 2, track, 4), BEVEL_SUNKEN);
+        int tx = left + muldiv(track - 10, range_fraction(n), 1000);
+        struct rect th = mkrect(tx, y + 1, 10, d->h - 2);
+        gfx_fill(s, th.x, th.y, th.w, th.h, C_FACE);
+        gfx_bevel(s, th, BEVEL_RAISED);
+        if (focused)
+            gfx_focus_rect(s, mkrect(x, y, d->w, d->h));
+        return;
+    }
+    if (n->tag == T_INPUT && !strcasecmp(type, "color")) {
+        uint32_t rgb = 0;
+        const char *cv = n->value && n->value[0] ? n->value : "#000000";
+        if (*cv == '#')
+            cv++;
+        for (int k = 0; k < 6 && cv[k]; k++)
+            rgb = rgb << 4 | (uint32_t)((cv[k] >= '0' && cv[k] <= '9') ? cv[k] - '0'
+                              : (cv[k] | 32) >= 'a' && (cv[k] | 32) <= 'f' ? (cv[k] | 32) - 'a' + 10 : 0);
+        gfx_fill(s, x, y, d->w, d->h, C_FACE);
+        gfx_bevel(s, r, BEVEL_RAISED);
+        gfx_fill(s, x + 4, y + 4, d->w - 8, d->h - 8, rgb);
+        gfx_frame(s, x + 4, y + 4, d->w - 8, d->h - 8, C_SHADOW);
+        if (focused)
+            gfx_focus_rect(s, mkrect(x + 2, y + 2, d->w - 4, d->h - 4));
+        return;
+    }
+    if (n->tag == T_INPUT && !strcasecmp(type, "file")) {
+        const char *label = control_label(n);
+        int tw = wfont_width(f, label, (int)strlen(label)), bw = tw + ZOOM(16);
+        struct rect b = mkrect(x, y, bw < d->w ? bw : d->w, d->h);
+        gfx_fill(s, b.x, b.y, b.w, b.h, C_FACE);
+        gfx_bevel(s, b, BEVEL_RAISED);
+        draw_text_clipped(s, f, b, x + (bw - tw) / 2, y + (d->h - fh) / 2, label, (int)strlen(label), 0);
+        const char *path = n->value && n->value[0] ? n->value : "No file chosen";
+        const char *base = strrchr(path, '/');
+        base = base && n->value && n->value[0] ? base + 1 : path;
+        struct rect nr = mkrect(x + bw + ZOOM(6), y, d->w - bw - ZOOM(6), d->h);
+        if (nr.w > 0)
+            draw_text_clipped(s, f, nr, nr.x, y + (d->h - fh) / 2, base, (int)strlen(base),
+                              n->value && n->value[0] ? 0 : OPAQUE(0x808080));
+        if (focused)
+            gfx_focus_rect(s, mkrect(x + 3, y + 3, b.w - 6, b.h - 6));
+        return;
+    }
     if (n->tag == T_INPUT && is_button_input(type)) {
         gfx_fill(s, x, y, d->w, d->h, C_FACE);
         gfx_bevel(s, r, BEVEL_RAISED);
@@ -4556,8 +4718,9 @@ static void draw_control(struct surface *s, const struct ditem *d, int x, int y,
     int ty = y + (d->h - fh) / 2;
     int cur = n->cursor > len ? len : n->cursor;
     int caret_x = wfont_width(f, shown, cur), scroll = caret_x > inner.w - 2 ? caret_x - inner.w + 2 : 0;
-    if (!len && !focused && node_attr(n, "placeholder")) {
-        const char *ph = node_attr(n, "placeholder");
+    const char *pattern = input_pattern(type);
+    if (!len && !focused && (node_attr(n, "placeholder") || pattern)) {
+        const char *ph = node_attr(n, "placeholder") ? node_attr(n, "placeholder") : pattern;
         draw_text_clipped(s, f, inner, inner.x, ty, ph, (int)strlen(ph), ph_color);
     } else {
         draw_text_clipped(s, f, inner, inner.x - scroll, ty, shown, len, 0);
@@ -4764,6 +4927,26 @@ int layout_selection_text(const struct layout *lo, char *out, int size)
     return o;
 }
 
+/* Found text (the find bar): a yellow box behind each piece, orange for the current match. */
+static void paint_found(const struct layout *lo, struct surface *s, const struct ditem *d, int item, int x, int y)
+{
+    int a = 0, b = lo->nhl;
+    while (a < b) {                     /* the first piece in this item (they are in item order) */
+        int m = (a + b) / 2;
+        if (lo->hl[m].item < item)
+            a = m + 1;
+        else
+            b = m;
+    }
+    for (; a < lo->nhl && lo->hl[a].item == item; a++) {
+        int c0 = lo->hl[a].c0, c1 = lo->hl[a].c1 > d->len ? d->len : lo->hl[a].c1;
+        if (c0 >= c1)
+            continue;
+        int xa = item_width(d, c0), xb = item_width(d, c1);
+        gfx_fill(s, x + xa, y, xb - xa, d->h, lo->hl[a].match == lo->hl_cur ? 0xFF9632 : 0xFFE866);
+    }
+}
+
 /* Text, a character at a time when it has letter-spacing. */
 static void draw_text(struct surface *s, const struct ditem *d, int x, int y, const char *text, int len,
                       uint32_t col)
@@ -4882,6 +5065,8 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
         case DK_TEXT: {
             uint32_t col = ALPHA(d->color) == 255 ? d->color : blend(0xFFFFFF, d->color);
             int shown = d->text[0] != ' ' || d->len != 1;
+            if (lo->nhl)
+                paint_found(lo, s, d, i, x, y);
             if (shown && d->sh_color)
                 draw_shadow(s, d, x, y);
             if (shown)

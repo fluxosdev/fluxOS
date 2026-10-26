@@ -248,7 +248,7 @@ BROWSER_TEST_SRCS := tests/browser-dom.c $(addprefix user/desktop/,js.c jslib.c 
 .PHONY: test-browser
 test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout
 	$< rootfs/usr/share/www/classlist-tests.js 20
-	$< rootfs/usr/share/www/dom-feature-tests.js 26
+	$< rootfs/usr/share/www/dom-feature-tests.js 31
 	$(BUILD)/tests/browser-style
 	$(BUILD)/tests/browser-layout
 

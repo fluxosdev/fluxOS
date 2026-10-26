@@ -18,6 +18,118 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
   var NP = Node.prototype, EP = HTMLElement.prototype, DP = Document.prototype;
   function getter(o, k, f) { Object.defineProperty(o, k, { get: f, configurable: true, enumerable: false }); }
 
+  /* ---- MessageChannel, BroadcastChannel (within the page), XMLSerializer, Path2D, ImageData ---- */
+  class MessagePort extends EventTarget {
+    constructor() {
+      super();
+      def(this, "_other", null);
+      def(this, "_closed", false);
+      this.onmessage = null;
+    }
+    postMessage(data) {
+      var o = this._other;
+      if (!o || this._closed) return;
+      var copy = structuredClone(data);
+      setTimeout(function () {
+        if (o._closed) return;
+        var e = new MessageEvent("message", { data: copy });
+        o.dispatchEvent(e);
+      }, 0);
+    }
+    start() {}
+    close() { this._closed = true; }
+  }
+  class MessageChannel {
+    constructor() {
+      this.port1 = new MessagePort();
+      this.port2 = new MessagePort();
+      this.port1._other = this.port2;
+      this.port2._other = this.port1;
+    }
+  }
+  def(g, "MessagePort", MessagePort);
+  def(g, "MessageChannel", MessageChannel);
+
+  var channels = [];
+  class BroadcastChannel extends EventTarget {
+    constructor(name) {
+      super();
+      def(this, "name", String(name));
+      def(this, "_closed", false);
+      this.onmessage = null;
+      channels.push(this);
+    }
+    postMessage(data) {
+      if (this._closed) throw new DOMException("Channel is closed", "InvalidStateError");
+      var copy = structuredClone(data), self = this;
+      channels.slice().forEach(function (c) {
+        if (c === self || c._closed || c.name !== self.name) return;
+        setTimeout(function () {
+          if (!c._closed) c.dispatchEvent(new MessageEvent("message", { data: copy }));
+        }, 0);
+      });
+    }
+    close() {
+      this._closed = true;
+      var i = channels.indexOf(this);
+      if (i >= 0) channels.splice(i, 1);
+    }
+  }
+  def(g, "BroadcastChannel", BroadcastChannel);
+
+  class XMLSerializer {
+    serializeToString(node) {
+      if (!node) return "";
+      if (node.nodeType === 9) node = node.documentElement;
+      if (node.nodeType === 3) return String(node.data).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      if (node.nodeType === 11) {
+        var out = "";
+        for (var c = node.firstChild; c; c = c.nextSibling) out += this.serializeToString(c);
+        return out;
+      }
+      return node.outerHTML === undefined ? "" : node.outerHTML;
+    }
+  }
+  def(g, "XMLSerializer", XMLSerializer);
+
+  /* Path2D keeps what it was told, for a canvas to draw (there is no canvas to draw on yet). */
+  class Path2D {
+    constructor(p) {
+      def(this, "ops", []);
+      if (p instanceof Path2D) this.ops = p.ops.slice();
+      else if (typeof p === "string") this.ops.push(["svg", p]);
+    }
+    addPath(p) { this.ops = this.ops.concat(p.ops); }
+    closePath() { this.ops.push(["close"]); }
+    moveTo(x, y) { this.ops.push(["move", x, y]); }
+    lineTo(x, y) { this.ops.push(["line", x, y]); }
+    bezierCurveTo(a, b, c, d, x, y) { this.ops.push(["bezier", a, b, c, d, x, y]); }
+    quadraticCurveTo(a, b, x, y) { this.ops.push(["quad", a, b, x, y]); }
+    arc(x, y, r, s, e, ccw) { this.ops.push(["arc", x, y, r, s, e, !!ccw]); }
+    arcTo(a, b, c, d, r) { this.ops.push(["arcTo", a, b, c, d, r]); }
+    ellipse(x, y, rx, ry, rot, s, e, ccw) { this.ops.push(["ellipse", x, y, rx, ry, rot, s, e, !!ccw]); }
+    rect(x, y, w, h) { this.ops.push(["rect", x, y, w, h]); }
+    roundRect(x, y, w, h, r) { this.ops.push(["roundRect", x, y, w, h, r]); }
+  }
+  def(g, "Path2D", Path2D);
+
+  class ImageData {
+    constructor(a, b, c) {
+      var data, w, h;
+      if (typeof a === "number") { w = a; h = b; data = null; }
+      else { data = a; w = b; h = c === undefined ? (data.length / 4 / b) : c; }
+      if (!(w > 0) || !(h > 0)) throw new DOMException("The source width is zero or not a number.", "IndexSizeError");
+      if (!data) {
+        data = typeof Uint8ClampedArray === "function" ? new Uint8ClampedArray(w * h * 4) : new Array(w * h * 4).fill(0);
+      }
+      def(this, "width", w | 0);
+      def(this, "height", h | 0);
+      def(this, "data", data);
+      def(this, "colorSpace", "srgb");
+    }
+  }
+  def(g, "ImageData", ImageData);
+
   /* ---- NodeFilter, TreeWalker, NodeIterator ---- */
   var NodeFilter = { FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3, SHOW_ALL: 4294967295,
     SHOW_ELEMENT: 1, SHOW_ATTRIBUTE: 2, SHOW_TEXT: 4, SHOW_CDATA_SECTION: 8, SHOW_PROCESSING_INSTRUCTION: 64,

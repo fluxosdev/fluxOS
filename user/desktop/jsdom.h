@@ -75,6 +75,9 @@ void jsdom_traverse(struct jsdom *d, int id, const char *old_url, const char *ne
 /* An event for an element, dispatched soon (after the running script): an image,
  * script or style sheet's load or error. */
 void jsdom_queue_event(struct jsdom *d, struct node *n, const char *type);
+/* A page-level event: "beforeunload" and "pagehide" (the page is being left), "visibilitychange"
+ * (hidden: the window was minimized, or has come back). */
+void jsdom_page_event(struct jsdom *d, const char *type, int hidden);
 /* The page was laid out again: observers may want to look. */
 void jsdom_layout_changed(struct jsdom *d);
 /* The document finished loading: DOMContentLoaded, then load. */

@@ -174,10 +174,21 @@ stops at boot and says why.
   shown when booted from the install medium), and **System Properties**.
 
 **Web browser** (the **Web Browser** icon): an Internet Explorer 3 style
-window with Back/Forward/Stop/Refresh/Home, address bar, progress gauge and a
-right-click menu (page actions, link actions, and Cut/Copy/Paste on the
-address bar). Pages come over HTTP or HTTPS (through `httpc`, a fetcher process,
-so the desktop keeps running), or from `file://`.
+window with Back/Forward/Stop/Refresh/Home/History/Downloads/Favorites, address bar,
+progress gauge and a right-click menu (Back, Forward, Refresh, Stop, Home, Add to Favorites,
+Copy Page Address, Find in Page, Save Page As, View Page Source and Print on the page; Open,
+Open in New Window, Copy and Save Link As on a link; Save Image As and Copy Image Address on a
+picture; Cut/Copy/Paste on the address bar). Pages come over HTTP or HTTPS (through `httpc`, a
+fetcher process, so the desktop keeps running), or from `file://`.
+- **Keys**: Ctrl+F finds text (every match is marked, Enter and Shift+Enter step through them, Esc
+  closes; what is selected is looked for), Ctrl++, Ctrl+- and Ctrl+0 zoom the page from 30% to 300%
+  (lengths, text, pictures and form controls all grow, and `@media` queries and `window.innerWidth`
+  see the smaller window), Ctrl+D adds the page to the favorites or drops it (about:bookmarks lists
+  them, kept in `/home/flux/.browser_bookmarks`), Ctrl+P prints the page (up to 5000 pixels of it) to
+  a JPEG picture in `/home/flux/Downloads`, Ctrl+L, F5, Ctrl+H, Ctrl+J and Alt+arrows as before.
+  `view-source:` before an address shows the page's text; Save Page/Link/Image As keep a file in the
+  downloads folder without leaving the page. A page's `title` attributes show as tooltips after the
+  pointer rests for a moment.
 - **Network**: each window has its own `/bin/httpc` (built on libc's `<http.h>`),
   started when a page is first fetched and stopped after 30 idle seconds. It keeps
   connections to servers open between requests (HTTP/1.1 keep-alive; one that the
@@ -214,8 +225,11 @@ so the desktop keeps running), or from `file://`.
   `scroll-behavior`, which are accepted and ignored). More selectors: `:target`,
   `:lang()`, `:read-only`/`:read-write`, `:default`, `:indeterminate`, `:valid`/`:invalid`
   (`required`, `type=email`/`url`/`number` with `min`/`max`, `minlength`, `maxlength`),
-  `:in-range`/`:out-of-range`, and the pseudo-elements `::placeholder`, `::selection`
-  and `::marker`.
+  `:in-range`/`:out-of-range`, `:scope`, `:dir(ltr)`, `:user-invalid`, and the pseudo-elements
+  `::placeholder`, `::selection` and `::marker`. Counters: `counter-reset`, `counter-increment`
+  and `counter()`/`counters()` in `content` (one flat set of counters, not scoped by nesting).
+  Also `tab-size`, `text-align-last`, `-webkit-line-clamp` (the lines are cut off, with no
+  ellipsis), `list-style-image`, and `hyphens` and `resize`, which are accepted and ignored.
   Pictures: `background-image: url()` (the first layer that has one; PNG, JPEG, GIF, ICO,
   SVG, and `data:` URLs) with `background-size` (lengths, percentages, `cover`, `contain`),
   `background-position` (keywords, offsets from an edge), `background-repeat`, `background-origin`
@@ -240,7 +254,15 @@ so the desktop keeps running), or from `file://`.
   follow it until the end of the box they are in (against the window, not a scrolling
   box inside the page). `<progress>`, `<meter>` and `<ruby>` (the annotation above its
   base) are drawn.
-- **Interaction**: `:hover`, `:focus` and `:focus-within` restyle the page as the
+- **Forms**: `<select>` opens a list (arrows, Home/End, typing a letter, Enter, wheel and
+  scroll bar for long ones); fields with a `<datalist>` suggest matches as you type;
+  `<input type=range>` is a slider (drag, or arrows, Home and End; `min`, `max` and `step`),
+  `type=color` a swatch that asks for a `#rrggbb`, `date`, `time`, `datetime-local`, `month`
+  and `week` fields show their pattern and take only the digits and punctuation they need,
+  `type=number` only numbers; `type=file` asks for a path, and a form with
+  `enctype="multipart/form-data"` sends the files (up to 8 MB each) in a proper multipart body;
+  `autofocus` focuses a field at load.
+- **Interaction**: `:hover`, `:active`, `:focus` and `:focus-within` restyle the page as the
   pointer and focus move. Drag to select text, Ctrl+A to select all, Ctrl+C to
   copy to the shared clipboard. The window and taskbar show the page's favicon
   (`<link rel=icon>` or `/favicon.ico`; PNG, ICO, GIF or SVG).
@@ -293,7 +315,10 @@ so the desktop keeps running), or from `file://`.
   (per origin and window), `XMLHttpRequest`, `fetch`,
   `URL`, and more: `FormData`, `Blob`, `TextEncoder`/`TextDecoder`, `crypto.getRandomValues`/`randomUUID`,
   `DOMParser`, `postMessage`, a style element's `sheet.insertRule()`, and stand-ins for `WebSocket`,
-  `Notification`, `element.animate()` (it skips to the end) and web fonts.
+  `Notification`, `element.animate()` (it skips to the end) and web fonts. Also `MessageChannel`
+  and `BroadcastChannel` (within the page), `XMLSerializer`, `Path2D` and `ImageData` (data only: no canvas
+  to draw on), the `beforeunload`, `pagehide` and `visibilitychange` (minimized) events, and
+  `unhandledrejection` for promises that are rejected with nobody to hear it.
   `fetch` and `XMLHttpRequest` send request headers and any method (`PUT`, `DELETE`...). Changes are laid out again when a script returns; runaway
   scripts are stopped. `/usr/share/www/js.html`, `css.html` and `images.html`
   (linked from the home page) are live test pages. `features.html` demonstrates
@@ -634,9 +659,10 @@ cannot be used.
 
 ## Credits
 
-The default wallpaper, `/usr/share/wallpapers/mountains.jpg`, is a photograph
-by Štefan Štefančík on [Unsplash](https://unsplash.com), used under the
-[Unsplash License](https://unsplash.com/license). Thank you for sharing it.
+The default wallpaper, `/usr/share/wallpapers/bamboo.jpg`, is a photograph by
+kazuend on [Unsplash](https://unsplash.com), and `mountains.jpg` one by Štefan
+Štefančík, both used under the [Unsplash License](https://unsplash.com/license).
+Thank you for sharing them.
 
 The icons are from KDE's [Oxygen icon
 theme](https://invent.kde.org/frameworks/oxygen-icons5) (LGPL-3.0-or-later), and the desktop's
