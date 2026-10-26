@@ -492,12 +492,12 @@ static void draw_disk_space(struct fm *f, struct surface *s, int w, int h)
 /* ---- the right-click menu ---- */
 
 enum { CX_SEP, CX_OPEN, CX_CUT, CX_COPY, CX_PASTE, CX_DELETE, CX_RENAME, CX_NEWDIR, CX_REFRESH, CX_TERMINAL,
-       CX_EXTRACT };
+       CX_EXTRACT, CX_PAINT };
 
 static const char *const ctx_labels[] = {
     [CX_OPEN] = "Open", [CX_CUT] = "Cut", [CX_COPY] = "Copy", [CX_PASTE] = "Paste", [CX_DELETE] = "Delete",
     [CX_RENAME] = "Rename", [CX_NEWDIR] = "New Folder", [CX_REFRESH] = "Refresh",
-    [CX_TERMINAL] = "Open Terminal Here", [CX_EXTRACT] = "Extract All...",
+    [CX_TERMINAL] = "Open Terminal Here", [CX_EXTRACT] = "Extract All...", [CX_PAINT] = "Edit in Paint",
 };
 
 #define CTX_W 150
@@ -1153,6 +1153,8 @@ static void open_ctx(struct fm *f, int x, int y, int hit)
             f->ctx_codes[n++] = c[i];
             if (c[i] == CX_OPEN && f->ents[hit].icon == ICON_ARCHIVE)
                 f->ctx_codes[n++] = CX_EXTRACT;
+            if (c[i] == CX_OPEN && f->ents[hit].icon == ICON_IMAGE)
+                f->ctx_codes[n++] = CX_PAINT;
         }
     } else {
         clear_selection(f);
@@ -1182,6 +1184,13 @@ static void ctx_action(struct fm *f, int code)
     case CX_NEWDIR: ask_text("New Folder", "Name of the new folder:", "New Folder", do_mkdir, f); break;
     case CX_REFRESH: reload(f, NULL); break;
     case CX_TERMINAL: terminal_open_in(f->path, "Terminal", NULL, 0); break;
+    case CX_PAINT:
+        if (f->sel >= 0) {
+            char path[PATH_MAX];
+            join(path, sizeof(path), f->path, f->ents[f->sel].name);
+            paint_open(path);
+        }
+        break;
     case CX_EXTRACT:
         if (f->sel >= 0) {
             char path[PATH_MAX];

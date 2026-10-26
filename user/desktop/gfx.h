@@ -86,6 +86,8 @@ int image_is_svg(const uint8_t *data, uint32_t len);
 int image_is_png(const uint8_t *data, uint32_t len);
 int image_is_jpeg(const uint8_t *data, uint32_t len);
 uint8_t *file_read_all(const char *path, uint32_t *len);     /* malloc'd, or NULL */
+/* Write w x h pixels (0xRRGGBB, rows stride pixels apart) as a baseline JPEG; quality 1..100. 0, or -1. */
+int jpeg_encode_file(const char *path, const uint32_t *rgb, int stride, int w, int h, int quality);
 void image_free(struct image *img);
 void gfx_image(struct surface *s, int x, int y, const struct image *img);
 /* Blend `tint` over the image's opaque half, like a selected Win95 icon. */

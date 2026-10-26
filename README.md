@@ -132,6 +132,15 @@ desktop.
   in GRUB's environment block on an installed system.
 - **3D Gears**: the OpenGL demo, drawn by the Radeon or Voodoo 3D engine when
   there is one, else by the software renderer (S switches renderer).
+- **Paint**: a bitmap editor with a canvas of any size up to 2048 x 2048
+  (**New...** and **Size...**), a round **Brush** with an adjustable size (the
+  `-`/`+` buttons or `[`/`]`), a square **Eraser**, flood **Fill**, straight
+  **Line** and color **Pick** tools, and the 16 EGA colors as its palette (left
+  button draws with the foreground, right button with the background;
+  **Color...** takes any `#rrggbb`). One level of undo (Ctrl+Z; again to redo),
+  Open for PNG, JPEG, GIF, SVG and ICO pictures (also **Edit in Paint** in the
+  File Manager's menu), and **Save**/**Save As** write baseline JPEG (quality 90,
+  from the built-in encoder in jpegenc.c).
 - **Archive Manager**: opens ZIP and 7z archives (double-click one in the File
   Manager, or **Extract All...** on its right-click menu) and shows them like
   folders, with sizes, packed sizes, dates and methods; double-clicking a file

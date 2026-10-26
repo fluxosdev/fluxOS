@@ -63,6 +63,7 @@ enum icon_id {
     ICON_MINES,
     ICON_CLOCK,
     ICON_ARCHIVE,
+    ICON_PAINT,
     ICON_COUNT,
 };
 
@@ -251,6 +252,7 @@ void loop_unwatch(int fd);
 struct window *image_view_open(const char *path);
 
 /* Archive Manager (archiver.c): ZIP and 7z archives, browsed and extracted. */
+struct window *paint_open(const char *path);         /* Paint; path NULL: a blank canvas */
 struct window *archiver_open(const char *path);     /* path NULL: nothing open yet */
 void archiver_extract(const char *path);            /* open it and ask where to extract it all */
 void archiver_child_exited(int pid, int status);

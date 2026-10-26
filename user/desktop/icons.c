@@ -148,6 +148,26 @@ static void icon_archive(void)
     frame(13, 14, 6, 6, C_BLACK);
 }
 
+/* A painter's palette with dabs of color, and a brush across it. */
+static void icon_paint(void)
+{
+    color_t wood = RGB(0xE0, 0xB8, 0x78);
+    P(3, 8, 26, 18, wood);
+    P(6, 5, 20, 3, wood);
+    P(6, 26, 20, 3, wood);
+    P(1, 12, 2, 10, wood);
+    P(29, 12, 2, 10, wood);
+    frame(3, 8, 26, 18, C_BLACK);
+    P(8, 11, 4, 4, RGB(0xAA, 0x00, 0x00));
+    P(14, 10, 4, 4, RGB(0xFF, 0xFF, 0x55));
+    P(20, 11, 4, 4, RGB(0x00, 0xAA, 0x00));
+    P(10, 18, 4, 4, RGB(0x00, 0x00, 0xAA));
+    P(18, 18, 4, 4, RGB(0xAA, 0x00, 0xAA));
+    for (int i = 0; i < 12; i++) {                      /* the brush */
+        P(18 + i, 20 - i, 2, 2, i < 3 ? RGB(0xAA, 0x00, 0x00) : C_BLACK);
+    }
+}
+
 /* A round clock face with two hands. */
 static void icon_clock(void)
 {
@@ -272,6 +292,7 @@ static const char *const icon_names[ICON_COUNT] = {
     [ICON_VOLUME] = "audio-volume-high",
     [ICON_MUTED] = "audio-volume-muted",
     [ICON_SOUND] = "audio-x-generic",
+    [ICON_PAINT] = "applications-graphics",
     [ICON_ARCHIVE] = "package-x-generic",     /* not in the set: the built-in one is drawn */
 };
 
@@ -326,6 +347,7 @@ static void draw_builtin(struct surface *s, int x, int y, enum icon_id id, int s
     case ICON_MINES: icon_mines(); break;
     case ICON_CLOCK: icon_clock(); break;
     case ICON_ARCHIVE: icon_archive(); break;
+    case ICON_PAINT: icon_paint(); break;
     default: break;                     /* image-only icons */
     }
 }
