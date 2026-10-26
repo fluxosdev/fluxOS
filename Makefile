@@ -66,14 +66,14 @@ USER_CFLAGS   := $(CFLAGS_COMMON) -mfpmath=sse -fno-math-errno -Iinclude -Iuser/
 # string routines and kmain) is built for any 386, so that an older machine
 # shows why it cannot run fluxOS instead of hanging on an i686 instruction.
 KERNEL_EARLY_OBJS := $(addprefix $(BUILD)/k/,kernel/kmain.o kernel/cpu.o kernel/kprintf.o \
-	kernel/vga.o kernel/fb.o kernel/serial.o lib/string.o lib/vsnprintf.o lib/font8x16.o)
+	kernel/vga.o kernel/fb.o kernel/serial.o kernel/splash.o lib/string.o lib/vsnprintf.o lib/font8x16.o)
 $(KERNEL_EARLY_OBJS): KERNEL_CFLAGS += -march=i386 -mtune=pentium3
 
 LDFLAGS_COMMON := -m elf_i386 -nostdlib -z noexecstack --no-warn-rwx-segments
 
 # ---- kernel ----
 KERNEL_SRCS := kernel/boot.S kernel/entry.S kernel/sse.S kernel/radeon_fw.S kernel/trampoline.S $(wildcard kernel/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c \
-               lib/sha256.c
+               lib/sha256.c lib/logo.c user/desktop/font_archivo.c
 KERNEL_OBJS := $(patsubst %,$(BUILD)/k/%.o,$(basename $(KERNEL_SRCS)))
 
 # ---- user space ----
@@ -97,7 +97,7 @@ $(FONT_OBJS) $(BUILD)/u/user/desktop/webfont.o: USER_CFLAGS += $(FONT_FLAGS)
 $(LIBFONT): $(FONT_OBJS)
 	$(AR) rcs $@ $^
 
-LIBC_SRCS := $(wildcard user/libc/*.c) $(MBEDTLS_SRCS) lib/string.c lib/vsnprintf.c lib/font8x16.c lib/sha256.c
+LIBC_SRCS := $(wildcard user/libc/*.c) $(MBEDTLS_SRCS) lib/string.c lib/vsnprintf.c lib/font8x16.c lib/sha256.c lib/logo.c
 LIBC_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(LIBC_SRCS)))
 CRT0      := $(BUILD)/u/user/libc/crt0.o
 LIBC      := $(BUILD)/libc.a

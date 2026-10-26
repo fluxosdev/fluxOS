@@ -135,6 +135,17 @@ void theme_set(int style, int accent, int save)
     grubenv_update(dir, keys, vals, 1);
 }
 
+/* Kinetik Blue's wallpaper, whatever the theme is (the shutdown screen). */
+void theme_kinetik_blue(struct surface *s, int w, int h)
+{
+    struct theme saved = theme;
+    const struct palette *p = &palettes[ACCENT_BLUE];
+    theme.wall0 = p->wall0, theme.wall1 = p->wall1, theme.wall2 = p->wall2;
+    theme.pale = p->pale, theme.glow = p->glow;
+    wallpaper_kinetik(s, w, h);
+    theme = saved;
+}
+
 void theme_sample(struct surface *s, struct rect r, int style, int accent)
 {
     struct theme saved = theme;

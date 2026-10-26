@@ -82,6 +82,9 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     serial_init();
     int have_fb = magic == MULTIBOOT_BOOT_MAGIC && fb_init(mbi);
     vga_init();
+    if (magic == MULTIBOOT_BOOT_MAGIC && (mbi->flags & MB_INFO_CMDLINE) && mbi->cmdline)
+        strlcpy(cmdline, (const char *)mbi->cmdline, sizeof(cmdline));
+    splash_init();                      /* the startup screen, over the console's messages */
 
     for (uint32_t i = 0; i < ARRAY_SIZE(banner); i++)
         kprintf("\033[1;36m%s\033[0m\n", banner[i]);
@@ -93,8 +96,6 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     if ((mbi->flags & MB_INFO_LOADER) && mbi->boot_loader_name)
         boot_ok("Booted by %s", (const char *)mbi->boot_loader_name);
 
-    if ((mbi->flags & MB_INFO_CMDLINE) && mbi->cmdline)
-        strlcpy(cmdline, (const char *)mbi->cmdline, sizeof(cmdline));
     cpu_init();                         /* everything after this needs a Pentium III */
     kernel_lock();                      /* until the idle loop, like any kernel code */
 
@@ -191,6 +192,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
 
     /* The boot context becomes the idle task, which does not hold the
      * kernel lock: interrupts take it (idt.c). */
+    splash_booted();
     kernel_unlock();
     for (;;)
         __asm__ volatile("sti; hlt" ::: "memory");

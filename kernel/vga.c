@@ -131,8 +131,8 @@ static void update_hw_cursor(void)
 static void flush(void)
 {
     int n = cols * rows;
-    if (graphics && !fb_console_active()) {
-        pending_scroll = 0;             /* the desktop owns the screen */
+    if (graphics && (!fb_console_active() || splash_active())) {
+        pending_scroll = 0;             /* the desktop owns the screen, or the startup screen covers it */
         return;
     }
     if (pending_scroll) {
@@ -357,6 +357,10 @@ void vga_redraw(void)
 {
     if (!graphics)
         return;
+    if (splash_active()) {
+        splash_redraw();
+        return;
+    }
     fb_fill(0, 0, fb.width, fb.height, palette[0]);
     for (int i = 0; i < cols * rows; i++)
         drawn[i] = INVALID;

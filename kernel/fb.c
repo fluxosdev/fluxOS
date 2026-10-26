@@ -239,6 +239,7 @@ int fb_map_user(void)
         return r;
     if (!fb_owner)
         klog("fb: pid %d (%s) took the screen\n", current->pid, current->name);
+    splash_end(0);
     fb_owner = current->pid;
     return (int)USER_MMIO_BASE;
 }

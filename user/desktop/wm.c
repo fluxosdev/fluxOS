@@ -15,6 +15,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <flux/logo.h>
 #include "desktop.h"
 #include "simd.h"
 
@@ -1160,6 +1161,8 @@ static void draw_taskbar_kinetik(void)
     gfx_hline(&screen, tb.x, tb.y + 1, tb.w, gfx_mix(theme.chrome0, 0xFFFFFF, 72));
 
     struct rect sb = start_button_rect();
+    if (!menu_open)
+        gfx_round_fill(&screen, sb, 6, 6, ARGB(52, 0x132C4B));     /* a shade darker than the other buttons */
     glass(sb, 6, menu_open);
     draw_icon(&screen, sb.x + 7, sb.y + (sb.h - 24) / 2, ICON_FLUX, 24);
     gfx_text(&screen, &font_archivo_start, sb.x + 37, sb.y + (sb.h - font_archivo_start.height) / 2, "menu",
@@ -2666,26 +2669,30 @@ void wm_input(const struct input_event *ev)
         key_event(ev);
 }
 
-/* A message alone on a black screen, drawn at twice the 8x16 font's size. */
-void wm_splash(const char *message, color_t color)
+/* The shutdown screen: Kinetik Blue's wallpaper, whatever the theme, with
+ * the logo and the message under it in Archivo, as the startup screen has
+ * them (kernel/splash.c). */
+void wm_splash(const char *message)
 {
     gfx_noclip(&screen);
-    gfx_fill(&screen, 0, 0, screen_w, screen_h, C_BLACK);
-    int len = (int)strlen(message);
-    int x0 = (screen_w - len * 16) / 2, y0 = (screen_h - 32) / 2;
-    struct surface glyph;
-    uint32_t px[8 * 16];
-    glyph.px = px;
-    glyph.w = 8;
-    glyph.h = 16;
-    glyph.stride = 8;
-    gfx_noclip(&glyph);
-    for (int k = 0; k < len; k++) {
-        gfx_glyph8x16(&glyph, 0, 0, (unsigned char)message[k], color, C_BLACK);
-        for (int j = 0; j < 32; j++)
-            for (int i = 0; i < 16; i++)
-                gfx_pixel(&screen, x0 + k * 16 + i, y0 + j, px[(j / 2) * 8 + i / 2]);
+    theme_kinetik_blue(&screen, screen_w, screen_h);
+    int text_h = font_archivo_large.height;
+    int y = (screen_h - (FLUXOS_LOGO_SIZE + 24 + text_h)) / 2;
+    int lx = (screen_w - FLUXOS_LOGO_SIZE) / 2;
+    for (int j = 0; j < FLUXOS_LOGO_SIZE; j++) {
+        if (y + j < 0 || y + j >= screen_h)
+            continue;
+        uint32_t *row = screen.px + (y + j) * screen.stride;
+        for (int i = 0; i < FLUXOS_LOGO_SIZE; i++) {
+            uint32_t p = fluxos_logo[j * FLUXOS_LOGO_SIZE + i];
+            int x = lx + i;
+            if ((p >> 24) && x >= 0 && x < screen_w)
+                row[x] = gfx_mix(row[x], p & 0xFFFFFF, (int)(p >> 24) * 256 / 255);
+        }
     }
+    y += FLUXOS_LOGO_SIZE + 24;
+    gfx_text(&screen, &font_archivo_large, (screen_w - gfx_text_width(&font_archivo_large, message)) / 2, y,
+             message, RGB(0xFF, 0xFF, 0xFF));
     if (hw_cursor)
         hide_cursor();
     struct rect all = mkrect(0, 0, screen_w, screen_h);

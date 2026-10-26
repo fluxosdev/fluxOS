@@ -560,7 +560,7 @@ void run_open(void)
 
 void system_restart(void)
 {
-    wm_splash("Please wait while your computer restarts.", RGB(0xFF, 0xFF, 0xFF));
+    wm_splash("restarting...");
     sync();
     sound_shutdown();
     reboot(REBOOT_RESTART);
@@ -574,12 +574,12 @@ static void shutdown_command(struct dialog *d, int id)
         return;
     switch (choice) {
     case OPT_SHUTDOWN:
-        wm_splash("Please wait while your computer shuts down.", RGB(0xFF, 0xFF, 0xFF));
+        wm_splash("shutting down...");
         sync();
         sound_shutdown();
         reboot(REBOOT_POWEROFF);
         /* still here: the machine cannot switch itself off */
-        wm_splash("It's now safe to turn off your computer.", RGB(0xFF, 0x80, 0x00));
+        wm_splash("it's now safe to turn off your computer");
         reboot(REBOOT_HALT);
         break;
     case OPT_RESTART:

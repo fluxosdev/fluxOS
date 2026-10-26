@@ -39,6 +39,11 @@ stops at boot and says why.
 ## Features
 
 **Kernel**
+- A startup screen over the boot messages on a framebuffer: the logo, "fluxos"
+  in Archivo and a loading bar on black, until the desktop starts. The
+  console comes back on a panic, when a program writes to it, or with
+  `nosplash` (the boot menu's "show boot messages" entry). Shutting down and
+  restarting show the logo on Kinetik Blue's wallpaper.
 - Multiboot entry, GDT/TSS/IDT, one trap dispatcher for exceptions, IRQs and
   the `int 0x80` system call gate.
 - Preemptive round-robin scheduler (PIT at 100 Hz) with sleep/wait queues.
@@ -522,7 +527,8 @@ Makefile, linker.ld        build and kernel link script
 grub/grub.cfg              boot menu
 include/flux/              kernel <-> user ABI (syscall numbers, structs, errno)
 lib/                       string/printf routines and the 8x16 font, shared by kernel and libc
-tools/                     mkfont.py (fonts), oxygen-icons.py (icons), mksounds.py (sounds)
+tools/                     mkfont.py (fonts), oxygen-icons.py (icons), mksounds.py (sounds),
+                           mklogo.py (the logo for the startup and shutdown screens)
 kernel/                    boot.S, entry.S, gdt/idt/pmm/vmm/heap, proc/exec/syscall,
                            vfs/file/initrd, ata/ahci/floppy/blkdev/pci, usb*/uhci/ohci/
                            ehci/xhci, automount, fat32/iso9660, tty/vga/serial/keyboard/

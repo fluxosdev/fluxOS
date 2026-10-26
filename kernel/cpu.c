@@ -11,6 +11,7 @@
  * above all, reach the card in whole bursts instead of one at a time.
  */
 #include "kernel.h"
+#include "drivers.h"
 #include "mm.h"
 #include "x86.h"
 
@@ -81,6 +82,7 @@ static void read_name(uint32_t sig)
 
 static void cannot_run(const char *what, const char *missing)
 {
+    splash_end(1);
     kprintf("\n\033[1;31mfluxOS needs a Pentium III or a newer processor.\033[0m\n"
             "This one (%s) has no %s.\n\nSystem halted.\n", what, missing);
     cli();

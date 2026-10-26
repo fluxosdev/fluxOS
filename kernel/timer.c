@@ -19,6 +19,7 @@ static void timer_irq(struct trapframe *tf)
 {
     (void)tf;
     ticks++;
+    splash_tick();
     spkr_tick();
     hda_tick();
     usb_tick();

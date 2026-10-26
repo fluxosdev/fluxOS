@@ -86,6 +86,15 @@ int opl_present(void);                  /* 0, 2 (OPL2) or 3 (OPL3) */
 void vga_init(void);
 void vga_write(const char *buf, uint32_t len);
 void vga_redraw(void);
+
+/* The startup screen (splash.c), over the console until the desktop starts */
+void splash_init(void);
+int splash_active(void);
+void splash_redraw(void);
+void splash_step(void);                 /* a boot message */
+void splash_booted(void);               /* init is starting */
+void splash_tick(void);
+void splash_end(int show_console);
 void vga_reset_fb(void);                /* the framebuffer's mode changed */
 
 /* COM1 serial port */

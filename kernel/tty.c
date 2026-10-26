@@ -12,6 +12,7 @@
  * is buffered for the master to read.
  */
 #include "kernel.h"
+#include "drivers.h"
 #include "mm.h"
 #include "proc.h"
 #include "tty.h"
@@ -79,6 +80,7 @@ static int output(struct tty *t, const char *s, uint32_t n, int block)
 {
     struct pty *p = t->pty;
     if (!p) {
+        splash_end(1);                  /* a program is talking: show the console */
         console_write(s, n);
         return (int)n;
     }

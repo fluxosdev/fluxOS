@@ -43,6 +43,7 @@ void theme_init(void);
 void theme_set(int style, int accent, int save);
 /* How a style and color would look, drawn into r of s (with the Kinetik wallpaper behind, or the plain desktop). */
 void theme_sample(struct surface *s, struct rect r, int style, int accent);
+void theme_kinetik_blue(struct surface *s, int w, int h);      /* Kinetik Blue's wallpaper */
 
 /* Frame geometry */
 #define BORDER     (theme.border)           /* window frame, beside and below the client area */
@@ -182,7 +183,7 @@ void wm_tray_changed(void);             /* redraw the tray (the volume icon) */
 void wm_restyle(void);
 /* A sample of the theme in use (two windows and the taskbar), drawn into r of s over what is there. */
 void wm_draw_sample(struct surface *s, struct rect r);
-void wm_splash(const char *message, color_t color);     /* full-screen notice */
+void wm_splash(const char *message);    /* the shutdown screen, saying message */
 void wm_tick(void);             /* clock and timers; call a few times a second */
 unsigned int now_ms(void);
 
@@ -286,7 +287,8 @@ void wallpaper_draw(struct surface *s, struct rect clip);
  * and (iw, ih) the real size of img if it is a thumbnail. */
 void wallpaper_render(struct surface *dst, struct rect a, const struct image *img, int iw, int ih,
                       int mode, color_t bg, int lw, int lh);
-void sound_init(void);                  /* see what cards there are; startup sound */
+void sound_init(void);                  /* see what cards there are */
+void sound_startup(void);               /* the startup sound */
 void sound_tick(void);                  /* once a second */
 void sound_beep(void);                  /* the terminal bell */
 void sound_error(void);                 /* an error or warning dialog */

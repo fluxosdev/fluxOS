@@ -167,6 +167,12 @@ void sound_init(void)
     have_dsp = stat("/dev/dsp", &st) == 0;
     if (have_mixer)
         read_levels();
+}
+
+/* The startup sound, once the desktop is on the screen in place of the boot screen. */
+void sound_startup(void)
+{
+    struct stat st;
     if (have_dsp && stat(STARTUP_SOUND, &st) == 0)
         play_in_background(STARTUP_SOUND);
 }

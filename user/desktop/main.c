@@ -71,6 +71,7 @@ int main(void)
     sound_init();
     terminal_open("Terminal", NULL, 0, 1);
     wm_flush();
+    sound_startup();                    /* the desktop has replaced the boot screen */
     wallpaper_init();                   /* after the first frame: decoding takes a moment */
     wm_flush();
 
