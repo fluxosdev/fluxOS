@@ -58,7 +58,10 @@ int main(int argc, char **argv)
         struct row rows[MAXP];
         int n = 0;
         unsigned now = uptime_ms();
-        unsigned elapsed = now - last ? now - last : 1;
+        struct meminfo mi;
+        meminfo(&mi);
+        /* of all the processors' time */
+        unsigned elapsed = (now - last ? now - last : 1) * (mi.ncpu > 1 ? mi.ncpu : 1);
         last = now;
         int tasks = 0, running = 0;
 
@@ -92,8 +95,6 @@ int main(int argc, char **argv)
         nprev = ncur;
         qsort(rows, (size_t)n, sizeof(rows[0]), by_cpu);
 
-        struct meminfo mi;
-        meminfo(&mi);
         unsigned up = now / 1000;
         printf("\033[H\033[1mtop\033[0m - up %u:%02u:%02u, %d tasks, %d running\033[K\n",
                up / 3600, up / 60 % 60, up % 60, tasks, running);

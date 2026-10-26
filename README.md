@@ -42,6 +42,12 @@ stops at boot and says why.
 - Multiboot entry, GDT/TSS/IDT, one trap dispatcher for exceptions, IRQs and
   the `int 0x80` system call gate.
 - Preemptive round-robin scheduler (PIT at 100 Hz) with sleep/wait queues.
+- Multiprocessor (SMP): the other processors and cores, found in the ACPI
+  MADT or the MultiProcessor Specification table, are started with INIT and
+  startup IPIs and run user processes alongside the first. The kernel itself
+  runs on one at a time (a big kernel lock); device interrupts stay on the
+  8259 PIC and the boot processor. `nosmp` on the kernel command line (the
+  boot menu's "one processor" entry) keeps to the first, `maxcpus=N` to N.
 - Processes: `fork`, `execve` (static ELF32 and `#!` scripts), `exit`/
   `waitpid`, process groups, signals (`kill`, `SIGINT`, `SIGPIPE`, fault
   signals; no user handlers), lazy FPU and SSE switching (FXSAVE/FXRSTOR).
@@ -623,7 +629,9 @@ user range and page tables first.
 
 ## Limitations
 
-fluxOS supports a single CPU. The root filesystem lives in RAM; only what you
+Only one processor at a time runs kernel code, so system calls do not
+get faster with more of them, and the I/O APIC is not used. The root
+filesystem lives in RAM; only what you
 write to a mounted FAT volume persists. Permission bits are cosmetic apart from
 the exec bit, there is one user, and signals cannot have user handlers or jobs
 be stopped (no ^Z). The FPU state is saved with FXSAVE, so AVX and later

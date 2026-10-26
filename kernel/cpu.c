@@ -120,3 +120,11 @@ void cpu_init(void)
     }
     boot_ok("Processor: %s%s", name, pte_wc ? ", write-combining framebuffer" : "");
 }
+
+/* Another processor starting (smp.c): the page attribute table must be
+ * the same on all of them. */
+void cpu_init_ap(void)
+{
+    if (pte_wc)
+        wrmsr(MSR_PAT, PAT_VALUE);
+}

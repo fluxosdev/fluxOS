@@ -919,6 +919,9 @@ static int sys_meminfo(uint32_t ubuf, uint32_t b, uint32_t c, uint32_t d, uint32
     mi->kernel_kb = (uint32_t)(kernel_end - kernel_start) / 1024;
     mi->heap_total_kb = htotal / 1024;
     mi->heap_used_kb = hused / 1024;
+    mi->ncpu = (uint32_t)ncpus;
+    for (int i = 0; i < 16; i++)
+        mi->cpu_idle[i] = i < ncpus ? cpus[i].idle_ticks : 0;
     return 0;
 }
 

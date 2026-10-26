@@ -37,6 +37,11 @@ ISR_NOERR \num
 /* System call gate. */
 ISR_NOERR 128
 
+/* Interrupts between processors, and the local APIC's spurious one (smp.h). */
+.irp num, 240,241,242,243,255
+ISR_NOERR \num
+.endr
+
 isr_common:
     pushal
     pushl %ds
@@ -64,6 +69,13 @@ trapret:
     popal
     addl $8, %esp                   /* int_no, err_code */
     iret
+
+/* Where a new process first runs: off the kernel lock if it is a user
+ * process (proc_start), then out through trapret like any trap. */
+.global forkret
+forkret:
+    call proc_start
+    jmp trapret
 
 /*
  * void switch_context(uint32_t *old_esp, uint32_t new_esp)
@@ -100,10 +112,10 @@ gdt_flush:
     ljmp $0x08, $1f
 1:  ret
 
-/* void tss_flush(void) */
+/* void tss_flush(uint32_t selector) */
 .global tss_flush
 tss_flush:
-    movw $0x28, %ax
+    movl 4(%esp), %eax
     ltr %ax
     ret
 

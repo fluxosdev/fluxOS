@@ -13,6 +13,7 @@
 #include "net.h"
 #include "pci.h"
 #include "proc.h"
+#include "smp.h"
 #include "tty.h"
 #include "vfs.h"
 #include "x86.h"
@@ -95,6 +96,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     if ((mbi->flags & MB_INFO_CMDLINE) && mbi->cmdline)
         strlcpy(cmdline, (const char *)mbi->cmdline, sizeof(cmdline));
     cpu_init();                         /* everything after this needs a Pentium III */
+    kernel_lock();                      /* until the idle loop, like any kernel code */
 
     /* Remember the initrd before any allocation can reuse that memory. */
     uint32_t initrd_start = 0, initrd_end = 0;
@@ -129,6 +131,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     }
 
     acpi_init();
+    smp_init();
     rtc_init();
     pit_init(HZ);
     boot_ok("PIT timer at %u Hz, RTC clock read", HZ);
@@ -182,10 +185,13 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     floppy_start();
     usb_start();
     automount_start();
+    smp_start();
     boot_ok("Scheduler started, launching /bin/init");
     kprintf("\n");
 
-    /* The boot context becomes the idle task. */
+    /* The boot context becomes the idle task, which does not hold the
+     * kernel lock: interrupts take it (idt.c). */
+    kernel_unlock();
     for (;;)
         __asm__ volatile("sti; hlt" ::: "memory");
 }

@@ -5,6 +5,12 @@
  * and a process only gives up the CPU inside schedule(), either because
  * it blocked or because the timer asked for a reschedule on its way
  * back to user mode. Slot 0 is the idle process (the boot context).
+ *
+ * With several processors, each runs its own processes, picked from the
+ * one table, and has its own idle process (smp.c), whose time counts as
+ * slot 0's. Only one of them is in the kernel at a time (the kernel lock),
+ * so all of this runs as on one processor; a process blocked or preempted
+ * on one may go on on another.
  */
 #include "kernel.h"
 #include "drivers.h"
@@ -14,10 +20,8 @@
 #include "vfs.h"
 
 struct proc procs[MAX_PROCS];
-struct proc *current;
 static struct proc *init_proc;
 static int next_pid = 1;
-static int slice = QUANTUM;
 
 void proc_init(void)
 {
@@ -26,8 +30,20 @@ void proc_init(void)
     idle->pid = 0;
     idle->state = P_RUNNING;
     idle->pd = kernel_pd;
+    idle->fpu_cpu = -1;
     strcpy(idle->name, "idle");
-    current = idle;
+    struct cpu *c = this_cpu();
+    c->idle = idle;
+    c->proc = idle;
+    c->slice = QUANTUM;
+}
+
+/* p can run: here soon (need_resched), or on an idle processor. */
+static void make_ready(struct proc *p)
+{
+    p->state = P_READY;
+    need_resched = 1;
+    smp_wake_idle();
 }
 
 struct proc *proc_find(int pid)
@@ -51,6 +67,7 @@ static struct proc *proc_alloc(void)
         p->pid = next_pid++;
         p->state = P_EMBRYO;
         p->pd = kernel_pd;
+        p->fpu_cpu = -1;
         p->start_tick = ticks;
         return p;
     }
@@ -67,7 +84,7 @@ static void proc_release(struct proc *p)
 /*
  * Lay out a fresh kernel stack: a trap frame at the very top (where the
  * CPU will push user state on later traps), and below it a context
- * frame that switch_context() "returns" through into trapret.
+ * frame that switch_context() "returns" through into forkret.
  */
 static void setup_kstack(struct proc *p, const struct trapframe *src)
 {
@@ -79,7 +96,7 @@ static void setup_kstack(struct proc *p, const struct trapframe *src)
     else
         memset(p->tf, 0, sizeof(*p->tf));
     sp -= sizeof(uint32_t);
-    *(uint32_t *)sp = (uint32_t)trapret;
+    *(uint32_t *)sp = (uint32_t)forkret;
     sp -= 4 * sizeof(uint32_t);                 /* edi, esi, ebx, ebp */
     memset(sp, 0, 4 * sizeof(uint32_t));
     p->esp = (uint32_t)sp;
@@ -87,13 +104,15 @@ static void setup_kstack(struct proc *p, const struct trapframe *src)
 
 void schedule(void)
 {
-    struct proc *prev = current;
+    struct cpu *c = this_cpu();
+    struct proc *prev = c->proc;
     struct proc *next = NULL;
 
     if (prev->state == P_RUNNING)
         prev->state = P_READY;
 
-    int start = (int)(prev - procs);
+    /* (Another processor's idle process is not in the table: start at the top.) */
+    int start = prev >= procs && prev < procs + MAX_PROCS ? (int)(prev - procs) : 0;
     for (int i = 1; i <= MAX_PROCS; i++) {
         struct proc *p = &procs[(start + i) % MAX_PROCS];
         if (p != &procs[0] && p->state == P_READY) {
@@ -102,36 +121,60 @@ void schedule(void)
         }
     }
     if (!next)
-        next = &procs[0];
+        next = c->idle;
 
     next->state = P_RUNNING;
-    slice = QUANTUM;
+    c->slice = QUANTUM;
+    c->kicked = 0;
     if (next == prev)
         return;
 
-    current = next;
-    fpu_switch(next);
+    c->proc = next;
+    fpu_switch(prev, next);
     if (next->kstack)
         tss_set_kernel_stack((uint32_t)next->kstack + KSTACK_SIZE);
     vmm_switch(next->pd);
+    /* The kernel lock stays with this processor, in whatever context it
+     * goes on in; this one may go on later on another processor. */
+    int depth = c->lock_depth;
     switch_context(&prev->esp, next->esp);
+    this_cpu()->lock_depth = depth;
+}
+
+/* A new process's first run (forkret): kernel threads keep the kernel
+ * lock, as they keep running in the kernel; user processes let it go. */
+void proc_start(void)
+{
+    if (current->kthread)
+        return;
+    this_cpu()->lock_depth = 1;
+    kernel_unlock();
+}
+
+void proc_tick_cpu(void)
+{
+    struct cpu *c = this_cpu();
+    if (c->proc == c->idle) {
+        procs[0].cpu_ticks++;
+        c->idle_ticks++;
+    }
+    else
+        c->proc->cpu_ticks++;
+    if (--c->slice <= 0) {
+        c->slice = QUANTUM;
+        c->resched = 1;
+    }
 }
 
 void proc_tick(void)
 {
-    current->cpu_ticks++;
     for (int i = 1; i < MAX_PROCS; i++) {
         struct proc *p = &procs[i];
         if ((p->state == P_SLEEPING || (p->state == P_BLOCKED && p->timed)) &&
-            (int32_t)(ticks - p->wake_tick) >= 0) {
-            p->state = P_READY;
-            need_resched = 1;
-        }
+            (int32_t)(ticks - p->wake_tick) >= 0)
+            make_ready(p);
     }
-    if (--slice <= 0) {
-        slice = QUANTUM;
-        need_resched = 1;
-    }
+    proc_tick_cpu();
 }
 
 void sleep_on(void *chan)
@@ -153,12 +196,9 @@ void sleep_on_timeout(void *chan, uint32_t deadline)
 
 void wakeup(void *chan)
 {
-    for (int i = 1; i < MAX_PROCS; i++) {
-        if (procs[i].state == P_BLOCKED && procs[i].chan == chan) {
-            procs[i].state = P_READY;
-            need_resched = 1;
-        }
-    }
+    for (int i = 1; i < MAX_PROCS; i++)
+        if (procs[i].state == P_BLOCKED && procs[i].chan == chan)
+            make_ready(&procs[i]);
 }
 
 int sleep_ticks(uint32_t n)
@@ -195,7 +235,7 @@ void proc_spawn_init(const char *path)
 
     init_proc = p;
     tty_set_fg(&console_tty, p->pgid);
-    p->state = P_READY;
+    make_ready(p);
 }
 
 /*
@@ -217,7 +257,7 @@ void proc_spawn_kthread(const char *name, void (*fn)(void))
     p->kthread = 1;
     p->pgid = p->pid;
     strlcpy(p->name, name, sizeof(p->name));
-    p->state = P_READY;
+    make_ready(p);
 }
 
 int do_fork(void)
@@ -249,7 +289,7 @@ int do_fork(void)
     memcpy(child->name, parent->name, sizeof(child->name));
     fpu_fork(child);
 
-    child->state = P_READY;
+    make_ready(child);
     return child->pid;
 }
 
@@ -354,8 +394,10 @@ static void deliver(struct proc *p, int sig)
 {
     p->sig_pending |= 1u << sig;
     if (p->state == P_BLOCKED || p->state == P_SLEEPING) {
-        p->state = P_READY;
         p->chan = NULL;
+        make_ready(p);
+    } else if (p->state == P_RUNNING && p != current) {
+        smp_kick_proc(p);               /* in user mode on another processor */
     }
     need_resched = 1;
 }

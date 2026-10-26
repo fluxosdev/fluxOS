@@ -4,6 +4,7 @@
  */
 #include "kernel.h"
 #include "drivers.h"
+#include "smp.h"
 #include "x86.h"
 
 #define KLOG_SIZE 16384
@@ -92,6 +93,7 @@ void panic(const char *fmt, ...)
     char buf[256];
     va_list ap;
     cli();
+    smp_stop_others();
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);

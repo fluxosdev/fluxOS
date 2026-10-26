@@ -70,7 +70,10 @@ int main(void)
     snprintf(lines[5], sizeof(lines[5]), "\033[1;34mShell\033[0m: %s", getenv("SHELL") ? getenv("SHELL") : "/bin/fsh");
     char cpu[64];
     cpu_name(cpu, sizeof(cpu));
-    snprintf(lines[6], sizeof(lines[6]), "\033[1;34mCPU\033[0m: %.50s", cpu);
+    if (mi.ncpu > 1)
+        snprintf(lines[6], sizeof(lines[6]), "\033[1;34mCPU\033[0m: %.40s (x%u)", cpu, mi.ncpu);
+    else
+        snprintf(lines[6], sizeof(lines[6]), "\033[1;34mCPU\033[0m: %.50s", cpu);
     snprintf(lines[7], sizeof(lines[7]), "\033[1;34mMemory\033[0m: %u MiB / %u MiB",
              (mi.total_kb - mi.free_kb) / 1024, mi.total_kb / 1024);
     lines[8][0] = 0;

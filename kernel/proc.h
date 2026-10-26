@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <flux/abi.h>
 #include "arch.h"
+#include "smp.h"
 
 #define MAX_PROCS   64
 #define MAX_FDS     32
@@ -48,17 +49,20 @@ struct proc {
     uint32_t start_tick;
     char name[32];
     int fpu_used;               /* has FPU registers (in fpu, or in the FPU) */
+    int fpu_cpu;                /* the processor whose FPU last loaded them, or -1 */
     uint8_t fpu[512] __attribute__((aligned(16)));     /* FXSAVE image: x87, MMX, SSE */
 };
 
 extern struct proc procs[MAX_PROCS];
-extern struct proc *current;
+#define current (this_cpu()->proc)     /* the process running on this processor */
 
 void proc_init(void);
 void proc_spawn_init(const char *path);
 void proc_spawn_kthread(const char *name, void (*fn)(void));
 void schedule(void);
-void proc_tick(void);
+void proc_tick(void);                   /* the timer, on the boot processor */
+void proc_tick_cpu(void);               /* every processor, every tick */
+void proc_start(void);
 
 void sleep_on(void *chan);
 void sleep_on_timeout(void *chan, uint32_t deadline);
@@ -84,8 +88,9 @@ int proc_grow_stack(uint32_t addr);
 
 /* Lazy FPU switching (fpu.c) */
 void fpu_init(void);
+void fpu_init_cpu(void);                /* each processor's control bits */
 void fpu_trap(void);
-void fpu_switch(struct proc *next);
+void fpu_switch(struct proc *prev, struct proc *next);
 void fpu_fork(struct proc *child);
 void fpu_release(struct proc *p);
 

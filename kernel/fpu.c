@@ -1,11 +1,17 @@
 /*
  * Lazy FPU switching. The FPU here means the x87, MMX and SSE registers
- * together, the state FXSAVE stores. They hold the registers of one
- * process, fpu_owner. Whenever another process runs, CR0.TS is set, so its
- * first FPU or SSE instruction raises "device not available" (#NM); the
- * handler saves the owner's registers in its struct proc and loads the
- * current process's (or a clean state for a process that never used them).
- * Processes that never touch the FPU never pay for it.
+ * together, the state FXSAVE stores. Each processor's hold the registers of
+ * one process, its fpu_owner. Whenever another process runs, CR0.TS is set,
+ * so its first FPU or SSE instruction raises "device not available" (#NM);
+ * the handler loads the current process's registers from its struct proc
+ * (or a clean state for a process that never used them). Processes that
+ * never touch the FPU never pay for it.
+ *
+ * A process may go on on another processor, so the owner's registers are
+ * saved as it stops running, not when the next one wants the FPU: its
+ * struct proc always has them while it is not running. They are still in
+ * the FPU, so if it runs next on the same processor (fpu_cpu) and nothing
+ * else used the FPU there meanwhile, it need not load them again.
  *
  * CR4.OSFXSR lets processes use SSE, and CR4.OSXMMEXCPT reports unmasked
  * SIMD floating-point exceptions as #XM, which becomes SIGFPE. The kernel's
@@ -32,7 +38,6 @@
 #define FCW_DEFAULT   0x037F            /* FNINIT's: all masked, 64-bit precision */
 #define MXCSR_DEFAULT 0x1F80            /* all masked, round to nearest */
 
-static struct proc *fpu_owner;
 int kernel_sse;
 
 /* What a process starts with: the reset control words and every register
@@ -59,14 +64,18 @@ static inline void fpu_restore(const uint8_t *image)
     __asm__ volatile("fxrstor %0" : : "m"(*(const uint8_t (*)[512])image) : "memory");
 }
 
-void fpu_init(void)
+void fpu_init_cpu(void)
 {
     uint32_t cr0 = read_cr0();
     cr0 &= ~CR0_EM;
     cr0 |= CR0_MP | CR0_NE | CR0_TS;
     write_cr0(cr0);
     write_cr4(read_cr4() | CR4_OSFXSR | CR4_OSXMMEXCPT);
+}
 
+void fpu_init(void)
+{
+    fpu_init_cpu();
     uint16_t fcw = FCW_DEFAULT;
     uint32_t mxcsr = MXCSR_DEFAULT;
     memcpy(fpu_clean + FX_FCW, &fcw, sizeof(fcw));
@@ -74,23 +83,36 @@ void fpu_init(void)
     kernel_sse = 1;
 }
 
-/* #NM from user mode: give the FPU to the current process. */
-void fpu_trap(void)
+/* Does this processor's FPU hold p's registers? */
+static int fpu_holds(struct cpu *c, struct proc *p)
 {
-    clts();
-    if (fpu_owner == current)
-        return;
-    if (fpu_owner)
-        fpu_save(fpu_owner);
-    fpu_restore(current->fpu_used ? current->fpu : fpu_clean);
-    current->fpu_used = 1;
-    fpu_owner = current;
+    return c->fpu_owner == p && p->fpu_cpu == c->index;
 }
 
-/* The scheduler is about to run next: trap its FPU use unless it owns the FPU. */
-void fpu_switch(struct proc *next)
+/* #NM from user mode: give the FPU to the current process. Whoever had
+ * it saved its registers when it stopped running (fpu_switch). */
+void fpu_trap(void)
 {
-    if (next == fpu_owner)
+    struct cpu *c = this_cpu();
+    clts();
+    if (fpu_holds(c, current))
+        return;
+    fpu_restore(current->fpu_used ? current->fpu : fpu_clean);
+    current->fpu_used = 1;
+    current->fpu_cpu = c->index;
+    c->fpu_owner = current;
+}
+
+/* The scheduler is about to run next instead of prev: keep prev's
+ * registers, and trap next's FPU use unless they are already loaded. */
+void fpu_switch(struct proc *prev, struct proc *next)
+{
+    struct cpu *c = this_cpu();
+    if (fpu_holds(c, prev)) {
+        clts();
+        fpu_save(prev);                 /* FXSAVE leaves them loaded too */
+    }
+    if (fpu_holds(c, next))
         clts();
     else
         stts();
@@ -99,21 +121,25 @@ void fpu_switch(struct proc *next)
 /* fork: the child starts with a copy of the current process's FPU registers. */
 void fpu_fork(struct proc *child)
 {
-    if (fpu_owner == current) {
+    if (fpu_holds(this_cpu(), current)) {
         /* Unlike FNSAVE, FXSAVE leaves the registers loaded: the parent keeps them. */
         clts();
         fpu_save(current);
     }
     memcpy(child->fpu, current->fpu, sizeof(child->fpu));
     child->fpu_used = current->fpu_used;
+    child->fpu_cpu = -1;
 }
 
-/* exec or exit: the process's FPU registers are no longer wanted. */
+/* exec or exit: the process's FPU registers are no longer wanted. Another
+ * processor may still name p its owner, but fpu_cpu says it no longer is. */
 void fpu_release(struct proc *p)
 {
-    if (fpu_owner == p) {
-        fpu_owner = NULL;
+    struct cpu *c = this_cpu();
+    if (c->fpu_owner == p) {
+        c->fpu_owner = NULL;
         stts();
     }
     p->fpu_used = 0;
+    p->fpu_cpu = -1;
 }

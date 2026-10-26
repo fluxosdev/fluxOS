@@ -1,5 +1,6 @@
 /*
- * ACPI, just enough to switch the machine off.
+ * ACPI, just enough to switch the machine off, and to list the processors
+ * (the MADT) for smp.c.
  *
  * At boot: find the RSDP in the BIOS areas, follow the RSDT (or XSDT) to
  * the FADT for the PM1 control registers and the SMI port that hands ACPI
@@ -15,6 +16,7 @@
 #include "kernel.h"
 #include "drivers.h"
 #include "mm.h"
+#include "smp.h"
 #include "x86.h"
 
 #define SLP_EN    (1u << 13)
@@ -112,6 +114,19 @@ static uint32_t rd32(const void *p, uint32_t off)
     return v;
 }
 
+/* The MADT ("APIC"): after the local APIC's address and flags, entries of
+ * a type and a length; type 0 is a processor's local APIC. */
+static void read_madt(const struct sdt *t)
+{
+    const uint8_t *p = (const uint8_t *)t + sizeof(*t) + 8;
+    const uint8_t *end = (const uint8_t *)t + t->length;
+    while (p + 2 <= end && p[1] >= 2 && p + p[1] <= end) {
+        if (p[0] == 0 && p[1] >= 8 && (rd32(p, 4) & 1))        /* enabled */
+            smp_add_cpu(p[3]);
+        p += p[1];
+    }
+}
+
 /*
  * \_S5 in an AML table: NameOp "_S5_" (perhaps as "\_S5_") then a package
  * whose first two elements are the PM1a and PM1b sleep types.
@@ -180,6 +195,12 @@ void acpi_init(void)
         nent = 64;
     for (int i = 0; i < nent; i++)
         ents[i] = rd32(root, (uint32_t)sizeof(*root) + (uint32_t)i * (wide ? 8u : 4u));
+
+    for (int i = 0; i < nent; i++) {
+        const struct sdt *t = table(ents[i]);
+        if (t && !memcmp(t->sig, "APIC", 4))
+            read_madt(t);
+    }
 
     /* The FADT ("FACP"): its registers and the DSDT. */
     uint32_t dsdt_pa = 0;

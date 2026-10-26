@@ -443,7 +443,10 @@ static void about_fill(struct dialog *d)
 
     snprintf(t[AB_RELEASE], n, "%s %s", u.sysname, u.release);
     snprintf(t[AB_VERSION], n, "%s", u.version);
-    snprintf(t[AB_CPU], n, "%s processor", u.machine);
+    if (mi.ncpu > 1)
+        snprintf(t[AB_CPU], n, "%u x %s processors", mi.ncpu, u.machine);
+    else
+        snprintf(t[AB_CPU], n, "%s processor", u.machine);
     snprintf(t[AB_MEMORY], n, "%u.%uMB RAM (%u.%uMB free)",
              mi.total_kb / 1024, mi.total_kb % 1024 * 10 / 1024,
              mi.free_kb / 1024, mi.free_kb % 1024 * 10 / 1024);

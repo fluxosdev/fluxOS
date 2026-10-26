@@ -7,6 +7,7 @@
 #include "drivers.h"
 #include "net.h"
 #include "proc.h"
+#include "smp.h"
 #include "x86.h"
 
 #define PIT_FREQ 1193182u
@@ -22,6 +23,7 @@ static void timer_irq(struct trapframe *tf)
     hda_tick();
     usb_tick();
     proc_tick();
+    smp_tick();
     net_tick();
 }
 
@@ -217,6 +219,7 @@ int machine_poweroff(void)
 void machine_halt(void)
 {
     cli();
+    smp_stop_others();
     kprintf("\nSystem halted.\n");
     for (;;)
         hlt();

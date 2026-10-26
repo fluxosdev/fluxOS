@@ -202,6 +202,8 @@ struct meminfo {
     uint32_t kernel_kb;
     uint32_t heap_total_kb;
     uint32_t heap_used_kb;
+    uint32_t ncpu;              /* processors running */
+    uint32_t cpu_idle[16];      /* ticks each has been idle, since boot */
 };
 
 /* ---- filesystems and block devices ---- */

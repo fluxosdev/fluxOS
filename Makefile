@@ -2,6 +2,7 @@
 #
 #   make            build the bootable ISO (fluxOS.iso)
 #   make run        boot the ISO in QEMU (serial console on stdio)
+#   make run-smp    the same with two processors (QEMU_SMP=4 for more)
 #   make run-kernel boot the kernel directly with QEMU's multiboot loader
 #                   (text console only: that loader cannot set a video mode)
 #   make run-disk   boot fluxdisk.img alone (after installing onto it)
@@ -71,7 +72,7 @@ $(KERNEL_EARLY_OBJS): KERNEL_CFLAGS += -march=i386 -mtune=pentium3
 LDFLAGS_COMMON := -m elf_i386 -nostdlib -z noexecstack --no-warn-rwx-segments
 
 # ---- kernel ----
-KERNEL_SRCS := kernel/boot.S kernel/entry.S kernel/sse.S kernel/radeon_fw.S $(wildcard kernel/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c \
+KERNEL_SRCS := kernel/boot.S kernel/entry.S kernel/sse.S kernel/radeon_fw.S kernel/trampoline.S $(wildcard kernel/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c \
                lib/sha256.c
 KERNEL_OBJS := $(patsubst %,$(BUILD)/k/%.o,$(basename $(KERNEL_SRCS)))
 
@@ -112,7 +113,7 @@ BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/fsh $(ROOTFS)/bi
 
 ROOTFS_FILES := $(shell find rootfs -type f 2>/dev/null)
 
-.PHONY: all iso kernel initrd disk floppy run run-kernel run-disk run-q35 run-usb check clean
+.PHONY: all iso kernel initrd disk floppy run run-smp run-kernel run-disk run-q35 run-usb check clean
 .SECONDARY:
 
 all: $(ISO)
@@ -239,6 +240,10 @@ QEMU_SND  ?= $(QEMU_AUDIO) -device sb16,audiodev=snd0
 
 run: $(ISO) $(DISK)
 	$(QEMU) $(QEMU_CPU) -m 1G -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
+
+QEMU_SMP ?= 2
+run-smp: $(ISO) $(DISK)
+	$(QEMU) $(QEMU_CPU) -smp $(QEMU_SMP) -m 1G -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
 
 run-kernel: $(TEXT_KERNEL) $(INITRD) $(DISK)
 	$(QEMU) $(QEMU_CPU) -kernel $(TEXT_KERNEL) -initrd $(INITRD) -m 256M -serial stdio $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)

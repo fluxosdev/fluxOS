@@ -5,9 +5,14 @@
  * The user half (1 GiB - 3 GiB) uses ordinary 4 KiB pages, and page
  * tables are reached through the identity map. User pages marked
  * PTE_MMIO map device memory: they are shared on fork, never freed.
+ *
+ * An address space is loaded on at most one processor, the one running
+ * its process, but that need not be this one: a change to another's
+ * mappings is flushed there too (smp_flush_tlb).
  */
 #include "kernel.h"
 #include "mm.h"
+#include "smp.h"
 #include "x86.h"
 
 #define PDE_INDEX(va) ((va) >> 22)
@@ -57,6 +62,7 @@ void vmm_switch(uint32_t *pd)
 {
     if (read_cr3() != (uint32_t)pd)
         write_cr3((uint32_t)pd);
+    this_cpu()->pd = pd;
 }
 
 uint32_t *vmm_create(void)
@@ -102,10 +108,12 @@ static uint32_t *get_pte(uint32_t *pd, uint32_t va, int create)
     return &pt[PTE_INDEX(va)];
 }
 
-static void flush_if_current(uint32_t *pd, uint32_t va)
+static void flush_page(uint32_t *pd, uint32_t va)
 {
     if (read_cr3() == (uint32_t)pd)
         invlpg(va);
+    else
+        smp_flush_tlb(pd);
 }
 
 int vmm_alloc(uint32_t *pd, uint32_t va)
@@ -123,7 +131,7 @@ int vmm_alloc(uint32_t *pd, uint32_t va)
         return -ENOMEM;
     zero_page(frame);
     *pte = frame | PTE_PRESENT | PTE_WRITE | PTE_USER;
-    flush_if_current(pd, va);
+    flush_page(pd, va);
     return 0;
 }
 
@@ -139,7 +147,7 @@ int vmm_map_phys(uint32_t *pd, uint32_t va, uint32_t phys, uint32_t size, uint32
         if ((*pte & (PTE_PRESENT | PTE_MMIO)) == PTE_PRESENT)
             return -EBUSY;                      /* ordinary memory is there */
         *pte = (phys + off) | PTE_PRESENT | PTE_WRITE | PTE_USER | PTE_MMIO | flags;
-        flush_if_current(pd, va + off);
+        flush_page(pd, va + off);
     }
     return 0;
 }
@@ -151,7 +159,7 @@ void vmm_free_page(uint32_t *pd, uint32_t va)
         if (!(*pte & PTE_MMIO))
             pmm_free(FRAME(*pte));
         *pte = 0;
-        flush_if_current(pd, va);
+        flush_page(pd, va);
     }
 }
 

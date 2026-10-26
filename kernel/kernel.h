@@ -48,6 +48,7 @@ void panic(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)))
 
 /* Check that the processor can run fluxOS (cpu.c); halts if not. */
 void cpu_init(void);
+void cpu_init_ap(void);                 /* the same settings on another processor */
 
 /* Kernel command line (from the boot loader). */
 int cmdline_has(const char *option);

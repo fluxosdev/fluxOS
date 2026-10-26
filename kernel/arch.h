@@ -30,17 +30,17 @@ struct trapframe {
 typedef void (*irq_handler_t)(struct trapframe *tf);
 
 void gdt_init(void);
+void gdt_init_ap(int cpu);              /* another processor: the same GDT, its own TSS */
 void tss_set_kernel_stack(uint32_t esp0);
 
 void idt_init(void);
+void idt_init_ap(void);
 void irq_register(int irq, irq_handler_t handler);
 int irq_registered(int irq);           /* another driver has it */
 void irq_unmask(int irq);
 
-/* Set by the timer or wakeups to request a reschedule on trap exit. */
-extern volatile int need_resched;
-
 void trapret(void);
+void forkret(void);                     /* a new process's first way out of the kernel */
 void switch_context(uint32_t *old_esp, uint32_t new_esp);
 
 #endif

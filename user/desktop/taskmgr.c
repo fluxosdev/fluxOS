@@ -28,6 +28,7 @@
 #define MAXP       128
 #define MAXAPPS    64
 #define HIST       120          /* samples kept: two minutes */
+#define MAXCORES   8            /* processors with a graph of their own */
 #define ROW_H      17
 #define HDR_H      18
 #define TAB_H      21
@@ -85,6 +86,9 @@ static unsigned last_ms;
 static int sampled;
 
 static uint8_t cpu_hist[HIST], mem_hist[HIST];
+static uint8_t core_hist[MAXCORES][HIST];       /* each processor's, when there are several */
+static unsigned core_idle_prev[MAXCORES];
+static int ncores;
 static int cpu_now, mem_now;
 static struct meminfo mi;
 static unsigned up_secs;
@@ -175,7 +179,13 @@ static void refresh_apps(struct tmgr *t)
 static void sample(struct tmgr *t)
 {
     unsigned now = now_ms();
-    unsigned elapsed = (now - last_ms) * HZ / 1000;
+    meminfo(&mi);
+    /* Ticks of processor time there were: shares are of all the processors. */
+    unsigned wall_ticks = (now - last_ms) * HZ / 1000;
+    unsigned elapsed = wall_ticks * (mi.ncpu > 1 ? mi.ncpu : 1);
+    ncores = mi.ncpu > MAXCORES ? MAXCORES : (int)mi.ncpu;
+    if (ncores < 2)
+        ncores = 0;
     int first = !sampled;
     last_ms = now;
     sampled = 1;
@@ -220,12 +230,17 @@ static void sample(struct tmgr *t)
     nrunning = running;
     sort_rows(t);
 
-    meminfo(&mi);
     up_secs = now / 1000;
     if (!first && elapsed) {
         cpu_now = (int)((1000 - (idle10 > 1000 ? 1000 : idle10) + 5) / 10);
         push(cpu_hist, cpu_now);
+        for (int i = 0; i < ncores && wall_ticks; i++) {
+            unsigned idle = (mi.cpu_idle[i] - core_idle_prev[i]) * 100 / wall_ticks;
+            push(core_hist[i], (int)(100 - (idle > 100 ? 100 : idle)));
+        }
     }
+    for (int i = 0; i < ncores; i++)
+        core_idle_prev[i] = mi.cpu_idle[i];
     mem_now = mi.total_kb ? (int)((mi.total_kb - mi.free_kb) / (mi.total_kb / 100 ? mi.total_kb / 100 : 1)) : 0;
     if (!first)
         push(mem_hist, mem_now);
@@ -571,7 +586,8 @@ static void draw_perf(struct tmgr *t, struct surface *s)
         struct rect gl = mkrect(p.x + PAD, y, left_w, row_h);
         struct rect gr = mkrect(p.x + PAD + left_w + 6, y, full - left_w - 6, row_h);
         draw_group(s, gl, k ? "MEM Usage" : "CPU Usage");
-        draw_group(s, gr, k ? "Memory Usage History" : "CPU Usage History");
+        draw_group(s, gr, k ? "Memory Usage History" : ncores ? "CPU Usage History (per processor)"
+                                                              : "CPU Usage History");
         struct rect gauge = mkrect(gl.x + 14, gl.y + 16, left_w - 28, gl.h - 16 - 22);
         draw_gauge(s, gauge, pct);
         if (k) {
@@ -583,7 +599,20 @@ static void draw_perf(struct tmgr *t, struct surface *s)
             int tw = gfx_text_width(&font_sans, buf);
             gfx_text(s, &font_sans, gl.x + (gl.w - tw) / 2, gl.y + gl.h - 18, buf, C_BLACK);
         }
-        draw_graph(s, mkrect(gr.x + 8, gr.y + 16, gr.w - 16, gr.h - 16 - 8), k ? mem_hist : cpu_hist);
+        struct rect gg = mkrect(gr.x + 8, gr.y + 16, gr.w - 16, gr.h - 16 - 8);
+        if (k || !ncores) {
+            draw_graph(s, gg, k ? mem_hist : cpu_hist);
+            continue;
+        }
+        /* one graph for each processor, side by side, each named under it */
+        int cw = (gg.w - (ncores - 1) * 4) / ncores;
+        for (int c = 0; c < ncores; c++) {
+            struct rect cr = mkrect(gg.x + c * (cw + 4), gg.y, cw, gg.h - 14);
+            draw_graph(s, cr, core_hist[c]);
+            snprintf(buf, sizeof(buf), "CPU %d", c);
+            int tw = gfx_text_width(&font_sans, buf);
+            gfx_text(s, &font_sans, cr.x + (cr.w - tw) / 2, cr.y + cr.h + 1, buf, C_BLACK);
+        }
     }
 
     int ty = p.y + p.h - 4 - text_h, gw = (full - 2 * 6) / 3;
@@ -963,6 +992,7 @@ struct window *taskmgr_open(void)
     t->sel_pid = -1;
     t->last_click = -1;
     memset(cpu_hist, 0, sizeof(cpu_hist));
+    memset(core_hist, 0, sizeof(core_hist));
     memset(mem_hist, 0, sizeof(mem_hist));
     cpu_now = 0;
     struct window *w = wm_create("Task Manager", ICON_TASKMGR, TM_W, TM_H, WF_MINIMIZE | WF_MAXIMIZE,

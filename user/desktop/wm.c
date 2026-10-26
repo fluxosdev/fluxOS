@@ -4,8 +4,9 @@
  *
  * Changes only record damaged rectangles; wm_flush() repaints each one
  * from the bottom of the scene to the top into the back buffer and
- * copies it to the framebuffer. Windows are moved by dragging an
- * outline, as in Windows 95, so a drag only repaints the outline.
+ * copies it to the framebuffer. A window moves with its contents as its
+ * caption is dragged; resizing drags an outline, as in Windows 95, so a
+ * resize only repaints the outline until the button is let go.
  */
 #include <fcntl.h>
 #include <flux.h>
@@ -19,7 +20,7 @@
 
 #define MAX_DAMAGE   32
 #define DBLCLICK_MS  500
-#define OUTLINE      3          /* drag outline thickness */
+#define OUTLINE      3          /* resize outline thickness */
 #define ICON_CELL_W  75
 #define ICON_CELL_H  70
 #define MENU_ITEM_H  36
@@ -73,7 +74,7 @@ static int mx, my, mbuttons;
 
 enum drag {
     DRAG_NONE,
-    DRAG_MOVE,                          /* caption: moving the outline */
+    DRAG_MOVE,                          /* caption: moving the window */
     DRAG_RESIZE,                        /* a window edge: resizing the outline */
     DRAG_TITLE_BUTTON,                  /* holding a caption button */
     DRAG_CLIENT,                        /* the client area has the mouse */
@@ -1464,7 +1465,7 @@ static void compose(struct rect r)
         draw_start_menu();
     if (ctx_open)
         draw_ctx_menu();
-    if (drag == DRAG_MOVE || drag == DRAG_RESIZE)
+    if (drag == DRAG_RESIZE)
         draw_outline();
     if (!hw_cursor)
         draw_cursor(&screen, mx, my, cursor_kind);
@@ -1563,7 +1564,7 @@ void wm_destroy(struct window *w)
         }
     }
     if (drag_win == w) {
-        if (drag == DRAG_MOVE)
+        if (drag == DRAG_RESIZE)
             damage_outline();
         drag = DRAG_NONE;
         drag_win = NULL;
@@ -2279,8 +2280,6 @@ static void press_left(void)
         drag_win = w;
         drag_dx = mx - w->r.x;
         drag_dy = my - w->r.y;
-        outline = w->r;
-        damage_outline();
         return;
     }
     int edges = edge_hit(w, mx, my);
@@ -2312,16 +2311,12 @@ static void drag_motion(void)
             y = 0;
         if (y > screen_h - TASKBAR_H - 10)
             y = screen_h - TASKBAR_H - 10;
-        if (x + outline.w < 40)
-            x = 40 - outline.w;
+        if (x + drag_win->r.w < 40)
+            x = 40 - drag_win->r.w;
         if (x > screen_w - 40)
             x = screen_w - 40;
-        if (x != outline.x || y != outline.y) {
-            damage_outline();
-            outline.x = x;
-            outline.y = y;
-            damage_outline();
-        }
+        if (x != drag_win->r.x || y != drag_win->r.y)
+            move_window(drag_win, x, y);
         break;
     }
     case DRAG_RESIZE: {
@@ -2403,9 +2398,7 @@ static void release_left(void)
 
     switch (d) {
     case DRAG_MOVE:
-        damage_outline();
-        move_window(w, outline.x, outline.y);
-        break;
+        break;                          /* already where it was dragged */
     case DRAG_RESIZE:
         damage_outline();
         set_frame(w, outline);

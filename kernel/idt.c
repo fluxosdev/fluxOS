@@ -34,10 +34,9 @@ static struct idt_ptr idt_desc;
 #define IRQ_SHARED 4
 static irq_handler_t irq_handlers[16][IRQ_SHARED];
 
-volatile int need_resched;
-
 extern uint32_t isr_stub_table[48];
 extern void isr128(void);
+extern void isr240(void), isr241(void), isr242(void), isr243(void), isr255(void);
 void idt_load(struct idt_ptr *p);
 
 static const char *exception_names[32] = {
@@ -111,9 +110,19 @@ void idt_init(void)
         idt_set(i, isr_stub_table[i], 0x8E);
     /* 0xEE: same, but callable from ring 3 */
     idt_set(SYSCALL_VEC, (uint32_t)isr128, 0xEE);
+    idt_set(VEC_RESCHED, (uint32_t)isr240, 0x8E);
+    idt_set(VEC_TICK, (uint32_t)isr241, 0x8E);
+    idt_set(VEC_TLB, (uint32_t)isr242, 0x8E);
+    idt_set(VEC_STOP, (uint32_t)isr243, 0x8E);
+    idt_set(VEC_SPURIOUS, (uint32_t)isr255, 0x8E);
 
     idt_desc.limit = sizeof(idt) - 1;
     idt_desc.base = (uint32_t)&idt;
+    idt_load(&idt_desc);
+}
+
+void idt_init_ap(void)
+{
     idt_load(&idt_desc);
 }
 
@@ -186,24 +195,46 @@ static void handle_irq(struct trapframe *tf)
 
 void trap(struct trapframe *tf)
 {
+    /* These need nothing of the kernel, and must not wait for its lock:
+     * whoever sends VEC_TLB holds it until the flush is done. */
+    switch (tf->int_no) {
+    case VEC_TLB:
+        smp_tlb_ipi();
+        return;
+    case VEC_STOP:
+        smp_stopped();
+    case VEC_SPURIOUS:
+        return;
+    }
+
+    kernel_lock();
     int from_user = (tf->cs & 3) == 3;
 
     if (from_user)
         current->tf = tf;
 
-    if (tf->int_no == SYSCALL_VEC)
+    if (tf->int_no == SYSCALL_VEC) {
         syscall_dispatch(tf);
-    else if (tf->int_no < 32)
+    } else if (tf->int_no < 32) {
         handle_exception(tf, from_user);
-    else if (tf->int_no < 48)
+    } else if (tf->int_no < 48) {
         handle_irq(tf);
+    } else if (tf->int_no == VEC_TICK) {
+        lapic_eoi();
+        proc_tick_cpu();
+    } else if (tf->int_no == VEC_RESCHED) {
+        lapic_eoi();
+    }
 
-    if (need_resched) {
-        need_resched = 0;
+    /* An idle processor looks for work on every interrupt. */
+    struct cpu *c = this_cpu();
+    if (c->proc && (c->resched || c->proc == c->idle)) {
+        c->resched = 0;
         schedule();
     }
 
     /* Deliver pending signals right before returning to user mode. */
     if (from_user)
         proc_check_signals();
+    kernel_unlock();
 }

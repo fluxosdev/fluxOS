@@ -117,6 +117,19 @@ static inline void wrmsr(uint32_t msr, uint64_t v)
     __asm__ volatile("wrmsr" : : "c"(msr), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)) : "memory");
 }
 
+static inline uint64_t rdmsr(uint32_t msr)
+{
+    uint32_t lo, hi;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return (uint64_t)hi << 32 | lo;
+}
+
+/* In a spin loop: PAUSE, which older processors take for a plain NOP. */
+static inline void cpu_relax(void)
+{
+    __asm__ volatile("rep; nop" ::: "memory");
+}
+
 static inline uint32_t read_eflags(void)
 {
     uint32_t v;

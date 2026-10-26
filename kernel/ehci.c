@@ -94,7 +94,7 @@ struct qtd {
 };
 
 struct qh {
-    volatile uint32_t link, info1, info2, current;
+    volatile uint32_t link, info1, info2, cur_qtd;
     /* overlay */
     volatile uint32_t next, alt, token;
     volatile uint32_t buf[5];
