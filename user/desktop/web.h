@@ -52,6 +52,16 @@ int wfont_width(const struct wfont *f, const char *s, int n);         /* UTF-8 *
 int wfont_draw(struct surface *s, const struct wfont *f, int x, int y, const char *str, int n,
                color_t c);
 
+/* Text at any size, for <canvas>: a mask (coverage 0-255, w x h, the baseline asc rows down, the pen
+ * starting pad columns in; free cov), the width in 1/16 pixels, and the font's extent. */
+struct wmask {
+    int w, h, ascent, descent, pad;
+    uint8_t *cov;
+};
+int wfont_measure(int family, int bold, int italic, int px, const char *s, int n);
+int wfont_mask(int family, int bold, int italic, int px, const char *s, int n, struct wmask *out);
+void wfont_vmetrics(int family, int bold, int italic, int px, int *ascent, int *descent);
+
 /* A piece of the page's text that a search found: item, the characters of it, and which match it belongs to. */
 struct fhl {
     int item, c0, c1, match;
@@ -244,6 +254,66 @@ struct custom_prop {            /* a CSS custom property (--name: value) */
     struct custom_prop *next;
 };
 
+/* ---- transforms, transitions and animations ---- */
+
+/* transform: a list of functions, applied from the left. The origin of each is the element's transform-origin. */
+enum { TF_TRANSLATE, TF_SCALE, TF_ROTATE, TF_SKEW, TF_MATRIX };
+struct tfop {
+    uint8_t kind;
+    struct len x, y;            /* TF_TRANSLATE */
+    float a, b, c, d, e, f;     /* TF_SCALE: a, b; TF_ROTATE: a (radians); TF_SKEW: a, b (radians); TF_MATRIX: a-f */
+};
+#define MAX_TFOPS 8
+struct css_xform {
+    int n;
+    struct tfop op[MAX_TFOPS];
+};
+
+/* A timing function: cubic-bezier(x1, y1, x2, y2) (linear, ease and the rest are special cases) or steps. */
+enum { JUMP_START, JUMP_END, JUMP_NONE, JUMP_BOTH };
+struct css_timing {
+    uint8_t steps_kind;         /* 0 a cubic bezier, 1 steps */
+    uint8_t jump;               /* JUMP_* */
+    int steps;
+    float x1, y1, x2, y2;
+};
+
+/* The properties that can be animated (the ones anim.c knows how to blend). AP_ALL in transition-property. */
+enum anim_prop {
+    AP_NONE = -2, AP_ALL = -1,
+    AP_COLOR, AP_BACKGROUND_COLOR, AP_BORDER_TOP_COLOR, AP_BORDER_RIGHT_COLOR, AP_BORDER_BOTTOM_COLOR,
+    AP_BORDER_LEFT_COLOR, AP_OUTLINE_COLOR, AP_OPACITY, AP_WIDTH, AP_HEIGHT, AP_MIN_WIDTH, AP_MAX_WIDTH,
+    AP_MIN_HEIGHT, AP_MAX_HEIGHT, AP_MARGIN_TOP, AP_MARGIN_RIGHT, AP_MARGIN_BOTTOM, AP_MARGIN_LEFT,
+    AP_PADDING_TOP, AP_PADDING_RIGHT, AP_PADDING_BOTTOM, AP_PADDING_LEFT, AP_TOP, AP_RIGHT, AP_BOTTOM, AP_LEFT,
+    AP_BORDER_TOP_WIDTH, AP_BORDER_RIGHT_WIDTH, AP_BORDER_BOTTOM_WIDTH, AP_BORDER_LEFT_WIDTH, AP_FONT_SIZE,
+    AP_LETTER_SPACING, AP_WORD_SPACING, AP_LINE_HEIGHT, AP_BORDER_TL_RADIUS, AP_BORDER_TR_RADIUS,
+    AP_BORDER_BR_RADIUS, AP_BORDER_BL_RADIUS, AP_TRANSFORM, AP_TRANSFORM_ORIGIN, AP_BOX_SHADOW, AP_TEXT_SHADOW,
+    AP_FLEX_GROW, AP_FLEX_SHRINK, AP_FLEX_BASIS, AP_ROW_GAP, AP_COLUMN_GAP, AP_TEXT_INDENT, AP_OUTLINE_WIDTH,
+    AP_OUTLINE_OFFSET, AP_Z_INDEX, AP_VISIBILITY, AP_COUNT
+};
+
+struct css_transition {
+    int prop;                   /* enum anim_prop (AP_ALL for all) */
+    int duration, delay;        /* milliseconds */
+    struct css_timing ease;
+};
+
+enum { AD_NORMAL, AD_REVERSE, AD_ALTERNATE, AD_ALTERNATE_REVERSE };
+enum { AF_NONE, AF_FORWARDS, AF_BACKWARDS, AF_BOTH };
+struct css_animation {
+    const char *name;
+    int duration, delay;
+    struct css_timing ease;
+    float iterations;           /* negative: forever */
+    uint8_t direction, fill, paused;
+};
+
+/* The transition and animation properties as written (lists, matched up by finish_motion). */
+struct css_motion_raw {
+    const char *tprop, *tdur, *tdelay, *tease;
+    const char *aname, *adur, *aease, *adelay, *aiter, *adir, *afill, *astate;
+};
+
 struct style {
     uint8_t display;
     uint8_t family, bold, italic;
@@ -260,6 +330,13 @@ struct style {
     int z_index;
     struct len top, right, bottom, left;    /* offsets of positioned boxes */
     uint8_t invisible;          /* opacity 0, off-screen or clipped away: hidden tricks */
+    uint8_t opacity, alpha;     /* opacity (0-255), and what is shown of the box: that times its parents' */
+    const struct css_xform *xf; /* transform: none (NULL) or functions */
+    struct len tox, toy;        /* transform-origin */
+    const struct css_motion_raw *raw_motion;
+    const struct css_transition *trans;
+    const struct css_animation *anims;
+    uint8_t ntrans, nanims;
     uint8_t lh_kind;
     int lh;                     /* LH_FACTOR: times 100; LH_PX: pixels */
     int font_size;              /* pixels */

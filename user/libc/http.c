@@ -42,7 +42,7 @@
 #define DNS_TTL_MS      (5u * 60 * 1000)
 #define SLICE_MS        250             /* how often a wait looks at should_stop */
 #define USER_AGENT      "FluxHTTP/1.0 (fluxOS)"
-#define ACCEPT_DEFAULT  "text/html, text/css, image/png, */*;q=0.5"
+#define ACCEPT_DEFAULT  "text/html, text/css, image/webp, image/png, */*;q=0.5"
 #define MAX_CACHED      (4u << 20)      /* the biggest body worth keeping */
 
 struct conn {

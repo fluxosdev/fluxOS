@@ -469,6 +469,64 @@ static void font_faces(void)
     CHECK(node_find(p.root,T_DIV)->style->family==19);unload(&p);css_font_lookup=NULL;
 }
 
+
+/* The picture items of a page, in order. */
+static int picture_items(const struct page *p, const struct ditem **out, int max)
+{
+    int n = 0;
+    for (int i = 0; i < p->lo.nitems && n < max; i++)
+        if (p->lo.items[i].kind == DK_IMAGE)
+            out[n++] = &p->lo.items[i];
+    return n;
+}
+
+static void canvas_layout(void)
+{
+    struct page p;
+    const struct ditem *it[4];
+    load(&p, "<style>body{margin:0} canvas{display:block}</style>"
+             "<canvas></canvas><canvas width=200 height=50></canvas><canvas style='width:100px'></canvas>"
+             "<canvas width=0 height=10></canvas><canvas width=40 style='max-width:20px'></canvas>", 800, 600);
+    CHECK(picture_items(&p, it, 4) == 0);                       /* nothing is drawn on them yet */
+    struct node *c[5];
+    int k = 0;
+    for (struct node *n = p.root; n; n = node_next(n, p.root))
+        if (n->type == N_ELEMENT && n->tag == T_CANVAS && k < 5)
+            c[k++] = n;
+    CHECK(k == 5);
+    static struct image bitmap = { 1, 1, NULL };
+    for (int i = 0; i < 5; i++)
+        c[i]->img = &bitmap;
+    arena_free(&p.la);
+    layout_document(&p.la, &p.lo, p.root, 800, 600);
+    int n = picture_items(&p, it, 4);
+    CHECK(n == 4);                                              /* the one with no width has no box */
+    CHECK(it[0]->w == 300 && it[0]->h == 150 && it[0]->y == 0);     /* the default size */
+    CHECK(it[1]->w == 200 && it[1]->h == 50 && it[1]->y == 150);    /* what the attributes say */
+    CHECK(it[2]->w == 100 && it[2]->h == 50 && it[2]->y == 200);    /* a CSS width keeps the aspect ratio */
+    CHECK(it[3]->w == 20 && it[3]->h == 75);                        /* max-width scales it down */
+    unload(&p);
+}
+
+/* Chinese and Japanese text breaks after any character, but not before closing punctuation. */
+static void cjk_wrapping(void)
+{
+    struct page p;
+    load(&p, "<style>body{margin:0} div{width:60px;font-size:20px}</style>"
+             "<div>\xe4\xbd\xa0\xe5\xa5\xbd\xe4\xb8\x96\xe7\x95\x8c\xe4\xbd\xa0\xe5\xa5\xbd\xe3\x80\x82</div>"
+             "<div>\xe4\xbd\xa0\xe5\xa5\xbd</div>", 800, 600);
+    const struct ditem *first = word(&p, "\xe4\xbd\xa0"), *last = word(&p, "\xe5\xa5\xbd\xe3\x80\x82");
+    CHECK(first && last);
+    CHECK(last->y > first->y);                                  /* wrapped, though there is not one space */
+    CHECK(last->x == 0);                                        /* the full stop did not start a line: 好 went with it */
+    int lines = 0, y = -1;
+    for (int i = 0; i < p.lo.nitems; i++)
+        if (p.lo.items[i].kind == DK_TEXT && p.lo.items[i].y != y && p.lo.items[i].y < 40)
+            lines++, y = p.lo.items[i].y;
+    CHECK(lines == 2);
+    unload(&p);
+}
+
 int main(void)
 {
     font_faces();
@@ -482,5 +540,7 @@ int main(void)
     object_fit();
     scrolling_boxes();
     shadow_layout();
-    puts("browser layout: spacing, wrapping, fixed and sticky boxes, outlines, tables, ruby, background pictures, object-fit and scrolling boxes passed");
+    canvas_layout();
+    cjk_wrapping();
+    puts("browser layout: spacing, wrapping, fixed and sticky boxes, outlines, tables, ruby, background pictures, object-fit, scrolling boxes, canvases and CJK wrapping passed");
 }

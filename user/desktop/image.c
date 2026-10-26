@@ -1,6 +1,6 @@
 /*
- * Loading pictures of either kind: the file's first bytes say whether it is
- * a PNG or a JPEG, whatever its name is.
+ * Loading pictures of any kind: the file's first bytes say whether it is
+ * a PNG, JPEG, GIF, WebP and so on, whatever its name is.
  */
 #include <fcntl.h>
 #include <stdlib.h>
@@ -54,6 +54,8 @@ struct image *image_decode(const uint8_t *data, uint32_t len)
         return image_decode_png(data, len);
     if (image_is_gif(data, len))
         return image_decode_gif(data, len);
+    if (image_is_webp(data, len))
+        return image_decode_webp(data, len);
     if (image_is_ico(data, len))
         return image_decode_ico(data, len);
     if (image_is_svg(data, len))

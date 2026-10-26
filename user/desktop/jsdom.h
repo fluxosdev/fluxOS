@@ -21,6 +21,7 @@ struct jshost {
     void (*alert)(void *ctx, const char *text);
     void (*status)(void *ctx, const char *text);
     void (*changed)(void *ctx);         /* the tree changed: style, lay out and paint again */
+    void (*repaint)(void *ctx);         /* only pixels changed (a canvas): paint again */
     void (*scroll)(void *ctx, int x, int y, int relative);
     void (*scroll_pos)(void *ctx, int *x, int *y);
     void (*viewport)(void *ctx, int *w, int *h);

@@ -273,7 +273,7 @@ clean:
 
 # Run the browser's actual HTML/DOM/JS code on the host, without booting QEMU.
 HOSTCC ?= cc
-BROWSER_TEST_SRCS := tests/browser-dom.c $(addprefix user/desktop/,js.c jslib.c jslib2.c jsbinary.c jsnet.c jsre.c jsgc.c jsdom.c html.c shadow.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c)
+BROWSER_TEST_SRCS := tests/browser-dom.c tests/canvas-font-stub.c $(addprefix user/desktop/,js.c jslib.c jslib2.c jsbinary.c jsnet.c jsre.c jsgc.c jsdom.c jscanvas.c canvas.c html.c shadow.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c)
 .PHONY: test-browser
 test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout $(BUILD)/tests/browser-policy $(BUILD)/tests/browser-http
 	$< rootfs/usr/share/www/classlist-tests.js 20
@@ -283,6 +283,7 @@ test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-style $(BUILD)/t
 	$(BUILD)/tests/browser-policy
 	$(BUILD)/tests/browser-http
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/modern-core-tests.js 44
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/canvas-tests.js 52
 
 $(BUILD)/tests/browser-dom: $(BROWSER_TEST_SRCS) $(wildcard user/desktop/*.h) user/include/flux.h include/flux/abi.h
 	@mkdir -p $(dir $@)

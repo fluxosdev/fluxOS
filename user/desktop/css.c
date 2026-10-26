@@ -270,7 +270,7 @@ static const char ua_css[] =
     " h4, h5, h6, hgroup, nav, section, dl, dt, dd, ol, ul, menu, dir, fieldset, details,"
     " summary, frameset, frame, noframes, optgroup { display: block }"
     "head, script, style, link, meta, title, base, template, param, area, map, source, track,"
-    " datalist, object, embed, video, audio, canvas, col, colgroup, option,"
+    " datalist, object, embed, video, audio, col, colgroup, option,"
     " input[type=hidden], [hidden], noembed, noscript, dialog:not([open]), datalist { display: none }"
     "li { display: list-item }"
     "table { display: table; border-spacing: 2px; text-indent: 0 }"

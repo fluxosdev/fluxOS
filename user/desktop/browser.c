@@ -2081,6 +2081,13 @@ static void js_changed(void *ctx)
         start_next(b);                  /* style sheets the scripts added */
 }
 
+static void js_repaint(void *ctx)
+{
+    struct browser *b = ctx;
+    if (b->root)
+        paint(b);
+}
+
 static void js_scroll(void *ctx, int x, int y, int relative)
 {
     struct browser *b = ctx;
@@ -2142,14 +2149,14 @@ static void js_load_script(void *ctx, struct node *n, const char *url)
         start_next(b);
 }
 
-/* Formats we cannot decode, by MIME type or file name. */
+/* Formats we cannot decode, by MIME type or file name (WebP we can). */
 static int undecodable(const char *s, int is_type)
 {
     if (is_type)
-        return strcasestr(s, "webp") || strcasestr(s, "avif") || strcasestr(s, "jxl") || strcasestr(s, "heic");
+        return strcasestr(s, "avif") || strcasestr(s, "jxl") || strcasestr(s, "heic");
     const char *q = strpbrk(s, "?#");
     int n = q ? (int)(q - s) : (int)strlen(s);
-    return (n > 5 && !strncasecmp(s + n - 5, ".webp", 5)) || (n > 5 && !strncasecmp(s + n - 5, ".avif", 5)) ||
+    return (n > 5 && !strncasecmp(s + n - 5, ".avif", 5)) ||
            (n > 4 && !strncasecmp(s + n - 4, ".jxl", 4));
 }
 
@@ -2574,7 +2581,7 @@ static void start_scripts(struct browser *b, const char *url)
     struct jshost h = {
         .ctx = b, .arena = &b->arena, .root = b->root, .url = b->url, .base = b->base,
         .navigate = js_navigate, .history = js_history, .reload = js_reload, .alert = js_alert,
-        .status = js_status, .changed = js_changed, .scroll = js_scroll, .scroll_pos = js_scroll_pos,
+        .status = js_status, .changed = js_changed, .repaint = js_repaint, .scroll = js_scroll, .scroll_pos = js_scroll_pos,
         .viewport = js_viewport, .set_title = js_set_title, .load_script = js_load_script,
         .load_image = js_load_image, .node_box = js_node_box, .node_scroll = js_node_scroll,
         .reveal = js_reveal, .flush = js_flush, .focus = js_focus, .http = js_http, .http_cancel=js_http_cancel,
@@ -4143,7 +4150,7 @@ static const char *mime_of(const char *name)
         { ".txt", "text/plain" }, { ".html", "text/html" }, { ".htm", "text/html" }, { ".css", "text/css" },
         { ".js", "text/javascript" }, { ".json", "application/json" }, { ".xml", "application/xml" },
         { ".png", "image/png" }, { ".jpg", "image/jpeg" }, { ".jpeg", "image/jpeg" }, { ".gif", "image/gif" },
-        { ".svg", "image/svg+xml" }, { ".ico", "image/x-icon" }, { ".pdf", "application/pdf" },
+        { ".svg", "image/svg+xml" }, { ".ico", "image/x-icon" }, { ".webp", "image/webp" }, { ".pdf", "application/pdf" },
         { ".zip", "application/zip" }, { ".wav", "audio/wav" }, { ".csv", "text/csv" },
     };
     const char *dot = strrchr(name, '.');

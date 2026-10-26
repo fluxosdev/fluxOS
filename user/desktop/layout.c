@@ -857,7 +857,7 @@ static int is_block_level(int d)
 static int is_replaced(const struct node *n)
 {
     return n->tag == T_IMG || n->tag == T_INPUT || n->tag == T_SELECT || n->tag == T_TEXTAREA ||
-           n->tag == T_IFRAME || n->tag == T_SVG || n->tag == T_PROGRESS || n->tag == T_METER;
+           n->tag == T_IFRAME || n->tag == T_SVG || n->tag == T_CANVAS || n->tag == T_PROGRESS || n->tag == T_METER;
 }
 
 /* ---- list markers ---- */
@@ -1083,12 +1083,99 @@ static void push_break_opportunity(struct flow *f, const struct style *st)
     }
 }
 
+/* Characters of scripts written without spaces: a line may break after each. */
+static int cjk_char(int cp)
+{
+    return (cp >= 0x2E80 && cp <= 0x9FFF) || (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFF00 && cp <= 0xFFEF) ||
+           (cp >= 0x20000 && cp <= 0x3FFFF);
+}
+
+/* Punctuation and small kana that may not start a line. */
+static int no_break_before(int cp)
+{
+    switch (cp) {
+    case 0x3001: case 0x3002: case 0xFF0C: case 0xFF0E: case 0xFF1A: case 0xFF1B: case 0xFF01: case 0xFF1F:
+    case 0xFF09: case 0xFF3D: case 0xFF5D: case 0x300D: case 0x300F: case 0x3011: case 0x3015: case 0x3009:
+    case 0x300B: case 0x30FC: case 0x2026: case 0x30FB: case 0x3005: case 0x309D: case 0x309E: case 0x30FD:
+    case 0x30FE: case 0x3041: case 0x3043: case 0x3045: case 0x3047: case 0x3049: case 0x3063: case 0x3083:
+    case 0x3085: case 0x3087: case 0x308E: case 0x30A1: case 0x30A3: case 0x30A5: case 0x30A7: case 0x30A9:
+    case 0x30C3: case 0x30E3: case 0x30E5: case 0x30E7: case 0x30EE: case 0x30F5: case 0x30F6: case 0xFF5E:
+    case 0x3030: case 0xFF05: case 0x2019: case 0x201D:
+        return 1;
+    }
+    return 0;
+}
+
+/* Opening brackets, which may not end one. */
+static int no_break_after(int cp)
+{
+    switch (cp) {
+    case 0xFF08: case 0xFF3B: case 0xFF5B: case 0x300C: case 0x300E: case 0x3010: case 0x3014: case 0x3008:
+    case 0x300A: case 0x2018: case 0x201C:
+        return 1;
+    }
+    return 0;
+}
+
+static int has_cjk(const char *s, int n)
+{
+    const char *end = s + n;
+    while (s < end) {
+        if ((unsigned char)*s < 0xE2) {
+            s++;
+            continue;
+        }
+        if (cjk_char(utf8_next(&s, end)))
+            return 1;
+    }
+    return 0;
+}
+
+/* The end of the piece that starts at p: one character of CJK text with whatever clings to it, or a run of
+ * anything else. */
+static const char *cjk_piece_end(const char *p, const char *end)
+{
+    const char *q = p;
+    int cp = utf8_next(&q, end), last = cp;
+    if (!cjk_char(cp)) {
+        while (q < end) {
+            const char *r = q;
+            cp = utf8_next(&r, end);
+            if (cjk_char(cp))
+                break;
+            q = r;
+        }
+        return q;
+    }
+    while (q < end) {
+        const char *r = q;
+        cp = utf8_next(&r, end);
+        if (no_break_before(cp) || no_break_after(last)) {
+            q = r;
+            last = cp;
+            if (!cjk_char(cp))          /* a bracket before a Latin word: keep the word with it */
+                while (q < end) {
+                    r = q;
+                    cp = utf8_next(&r, end);
+                    if (cjk_char(cp))
+                        break;
+                    q = r;
+                }
+            continue;
+        }
+        break;
+    }
+    return q;
+}
+
 /* A word, as one item; or in pieces for small capitals (lower case letters become smaller upper
- * case ones) and word-break: break-all (a chance to break after every character). */
+ * case ones), word-break: break-all (a chance to break after every character) and CJK text (the same,
+ * but not where the rules of the script forbid it). */
 static void emit_word(struct lctx *c, struct flow *f, const struct style *st, struct node *parent,
                       const char *text, int len, int word_start)
 {
-    if (!st->small_caps && st->word_break != WB_BREAK_ALL) {
+    int cjk = st->word_break != WB_BREAK_ALL && has_cjk(text, len);
+    if (!st->small_caps && st->word_break != WB_BREAK_ALL && !cjk) {
         push_word(c, f, st, parent, text, len, word_start);
         return;
     }
@@ -1101,6 +1188,9 @@ static void emit_word(struct lctx *c, struct flow *f, const struct style *st, st
             q++;
             while (q < end && ((unsigned char)*q & 0xC0) == 0x80)
                 q++;
+        } else if (cjk) {
+            q = cjk_piece_end(p, end);
+            lower = 0;
         } else {
             while (q < end && (st->small_caps && *q >= 'a' && *q <= 'z') == lower)
                 q++;
@@ -1126,7 +1216,7 @@ static void emit_word(struct lctx *c, struct flow *f, const struct style *st, st
         } else {
             push_word(c, f, st, parent, p, (int)(q - p), word_start && p == text);
         }
-        if (st->word_break == WB_BREAK_ALL && q < end)
+        if (q < end && (st->word_break == WB_BREAK_ALL || cjk))
             push_break_opportunity(f, st);
         p = q;
     }
@@ -1239,6 +1329,18 @@ const char *control_label(const struct node *n)
     return "";
 }
 
+/* A canvas's width or height attribute as a number of pixels (def when it is missing or not one). */
+static int canvas_attr(const struct node *n, const char *name, int def)
+{
+    const char *v = node_attr(n, name);
+    if (!v || *v < '0' || *v > '9')
+        return def;
+    int x = 0;
+    while (*v >= '0' && *v <= '9' && x < 100000)
+        x = x * 10 + (*v++ - '0');
+    return x;
+}
+
 /*
  * Lay out an image or a form control with its margin box at (0, 0).
  * Sets its margin-box size and baseline.
@@ -1305,6 +1407,23 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
             w = h * iw / ih;
         else if (h < 0)
             h = w * ih / iw;
+        if (st->max_width.unit == U_PX || (relative(st->max_width.unit) && !c->measuring)) {
+            int mx = len_px(st->max_width, avail);
+            if (w > mx && mx > 0) {
+                h = h * mx / w;
+                w = mx;
+            }
+        }
+        kind = DK_IMAGE;
+    } else if (n->tag == T_CANVAS) {    /* its pixels are n->img (jscanvas.c), 300 x 150 unless it says */
+        ctrl = 0;
+        int iw = ZOOM(canvas_attr(n, "width", 300)), ih = ZOOM(canvas_attr(n, "height", 150));
+        if (w < 0 && h < 0)
+            w = iw, h = ih;
+        else if (w < 0)
+            w = ih ? h * iw / ih : 0;
+        else if (h < 0)
+            h = iw ? w * ih / iw : 0;
         if (st->max_width.unit == U_PX || (relative(st->max_width.unit) && !c->measuring)) {
             int mx = len_px(st->max_width, avail);
             if (w > mx && mx > 0) {
@@ -1386,17 +1505,19 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
     *ow = b.ml + bw + b.mr;
     *oh = b.mt + bh + b.mb;
     *obase = *oh;
-    if (n->tag != T_IMG && n->tag != T_SVG && !(n->tag == T_INPUT && h <= 13))
+    if (n->tag != T_IMG && n->tag != T_SVG && n->tag != T_CANVAS && !(n->tag == T_INPUT && h <= 13))
         *obase = b.mt + b.bt + b.pt + (h - fh) / 2 + wfont_ascent(f) + 1;
     if (c->measuring || st->hidden)
         return;
 
-    if (n->tag == T_IMG || n->tag == T_SVG)
+    if (n->tag == T_IMG || n->tag == T_SVG || n->tag == T_CANVAS)
         fill(c, bx + b.bl, by + b.bt, b.pl + w + b.pr, b.pt + h + b.pb, st->bg, 0);
     borders(c, st, bx, by, bw, bh);
     outline_box(c, st, bx, by, bw, bh);
     if (w <= 0 || h <= 0)
         return;
+    if (n->tag == T_CANVAS && !n->img)
+        return;                         /* nothing drawn on it yet */
     if (n->tag == T_SVG) {
         if (!n->img || n->img->w != w || n->img->h != h) {
             image_free(n->img);

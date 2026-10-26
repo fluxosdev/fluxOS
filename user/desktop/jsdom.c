@@ -35,6 +35,7 @@
 #include "jsdom.h"
 #include "webpolicy.h"
 #include "jsnet.h"
+#include "jscanvas.h"
 #include "jsdomlib.h"
 
 #define MAX_TIMERS 256
@@ -77,6 +78,7 @@ struct jsdom {
     struct node *current_script;
     struct node *write_after;           /* document.write's insertion point */
     int dirty;
+    int repaint;                        /* pixels changed (a canvas): paint again, no layout */
     int hidden;                         /* the window is minimized: document.hidden */
     int loaded;
     int depth;                          /* nested entries from the browser */
@@ -142,8 +144,18 @@ static void settle(struct jsdom *d)
 {
     if (d->depth == 0 && d->dirty) {
         d->dirty = 0;
+        d->repaint = 0;
         d->h.changed(d->h.ctx);
+    } else if (d->depth == 0 && d->repaint) {
+        d->repaint = 0;
+        if (d->h.repaint)
+            d->h.repaint(d->h.ctx);
     }
+}
+
+void jsdom_canvas_dirty(struct js *J)
+{
+    dom(J)->repaint = 1;
 }
 
 /* ---- the tree ---- */
@@ -371,6 +383,8 @@ static void set_attr(struct jsdom *d, struct node *n, const char *name, const ch
             const char *old = (*pp)->value;
             (*pp)->value = arena_strdup(d->h.arena, value);
             d->dirty = 1;
+            if (n->tag == T_CANVAS && (!strcmp(lname, "width") || !strcmp(lname, "height")))
+                jscanvas_resized(d->J, n, n->js ? js_obj(n->js) : js_undefined);
             if (d->watch_mutations)
                 mutation(d, "attributes", n, NULL, NULL, NULL, NULL, lname, old);
             if (d->custom_on && is_custom(n))
@@ -384,6 +398,8 @@ static void set_attr(struct jsdom *d, struct node *n, const char *name, const ch
     a->value = arena_strdup(d->h.arena, value);
     *pp = a;
     d->dirty = 1;
+    if (n->tag == T_CANVAS && (!strcmp(lname, "width") || !strcmp(lname, "height")))
+        jscanvas_resized(d->J, n, n->js ? js_obj(n->js) : js_undefined);
     if (d->watch_mutations)
         mutation(d, "attributes", n, NULL, NULL, NULL, NULL, lname, NULL);
     if (d->custom_on && is_custom(n))
@@ -1017,6 +1033,11 @@ static struct node *node_of(jsval v)
     return v.t == JS_OBJ ? js_host_data(v.u.o, &node_class) : NULL;
 }
 
+struct node *jsdom_node_of(jsval v)
+{
+    return node_of(v);
+}
+
 static struct node *this_node(struct js *J, jsval self)
 {
     struct node *n = node_of(self);
@@ -1479,6 +1500,12 @@ static int node_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
         *out = js_bool(is_connected(d, n));
         return 1;
     }
+    if (n->tag == T_CANVAS && (IS("width") || IS("height"))) {
+        int w, h;
+        jscanvas_size(n, &w, &h);
+        *out = js_num(IS("width") ? w : h);
+        return 1;
+    }
     if (in_list(reflected, key, attr, sizeof(attr))) {
         const char *v = node_attr(n, attr);
         *out = js_str(J, v ? v : "");
@@ -1603,6 +1630,14 @@ static int node_set(struct js *J, struct jsobj *o, const char *key, jsval v)
     }
     if (IS("contentEditable")) {
         set_attr(d, n, "contenteditable", js_tostr(J, v)->s);
+        return 1;
+    }
+    if (n->tag == T_CANVAS && (IS("width") || IS("height"))) {      /* an unsigned long: 7.9 is 7 */
+        double dv = js_to_number(J, v);
+        char num[16];
+        int def = IS("width") ? 300 : 150;
+        snprintf(num, sizeof(num), "%u", dv >= 0 && dv <= 2147483647.0 ? (unsigned)dv : (unsigned)def);
+        set_attr(d, n, key, num);
         return 1;
     }
     if (in_list(reflected, key, attr, sizeof(attr))) {
@@ -4204,8 +4239,10 @@ static void run_queued(struct jsdom *d)
 
 void jsdom_layout_changed(struct jsdom *d)
 {
-    if (d)
+    if (d) {
         d->layout_gen++;
+        jscanvas_laid_out(d->J);
+    }
 }
 
 /* Has the view scrolled or changed size, or the page (when observers care) been laid out again? */
@@ -5673,6 +5710,8 @@ struct jsdom *jsdom_new(const struct jshost *host)
             while (*t == ' ')
                 t++;
         }
+        if (!strcmp(ifaces[i].name, "HTMLCanvasElement"))
+            jscanvas_install(J, proto);
         if (!strcmp(ifaces[i].name, "HTMLDialogElement")) {
             fn(J, proto, "show", dialog_show, 0);
             fn(J, proto, "showModal", dialog_show, 0);
@@ -5704,6 +5743,7 @@ void jsdom_free(struct jsdom *d)
     if (!d)
         return;
     jsnet_free(d->network);
+    jscanvas_free(d->J);
     js_free(d->J);
     free(d->wraps);
     for (int i = 0; i < d->nim; i++) {
