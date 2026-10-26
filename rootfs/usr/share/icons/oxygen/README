@@ -1,4 +1,6 @@
-Icons from the Tango Desktop Project, released into the public domain.
-Source: https://commons.wikimedia.org/wiki/Tango_icons
-Regenerate with tools/tango-icons.py.
-fluxos.png is the fluxOS logo (assets/fluxos-logo.png), not part of Tango.
+Icons from the Oxygen icon theme (KDE, oxygen-icons5), LGPL-3.0-or-later.
+Source: https://invent.kde.org/frameworks/oxygen-icons5
+Regenerate with tools/oxygen-icons.py.
+media-cdrom is Oxygen's media-optical and system-installer its
+package-x-generic. fluxos.png is the fluxOS logo (assets/fluxos-logo.png),
+not part of Oxygen.

@@ -1,4 +1,4 @@
-group("DOM additions in fluxOS 0.1.4");
+group("DOM additions in fluxOS 0.2.0");
 test("replaceChildren mixes nodes and literal text", function () {
   var e = document.createElement("div"), b = document.createElement("b"); b.textContent = "bold";
   e.innerHTML = "<i>old</i>"; var result = e.replaceChildren("<hello>", b, 42);

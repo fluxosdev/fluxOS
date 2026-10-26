@@ -118,7 +118,7 @@ stops at boot and says why.
 - Windows 95 look: purple desktop with icons, a taskbar (Start button, a
   button per window, clock, volume tray icon), beveled windows. UI text is
   anti-aliased Liberation Sans; terminals keep the sharp 8x16 bitmap font.
-- Tango icons (PNG), PNG, JPEG, GIF and SVG decoding (the first bytes decide,
+- Oxygen icons (PNG), PNG, JPEG, GIF and SVG decoding (the first bytes decide,
   whatever the name), and a wallpaper (Fill, Stretch, Center or Tile).
 - Windows move, minimize, maximize and cascade; the browser, text editor, file
   manager, Task Manager and Gears resize by dragging an edge.
@@ -247,7 +247,7 @@ keeps running), or from `file://`.
   `fetch` and `XMLHttpRequest` send request headers and any method (`PUT`, `DELETE`...). Changes are laid out again when a script returns; runaway
   scripts are stopped. `/usr/share/www/js.html`, `css.html` and `images.html`
   (linked from the home page) are live test pages. `features.html` demonstrates
-  the HTML, CSS and DOM additions in 0.1.4, and `modern.html` the modules,
+  the HTML, CSS and DOM additions in 0.2.0, and `modern.html` the modules,
   observers, custom elements, nesting and colors that came after.
 
 **DOS programs** (`/bin/dos`)
@@ -398,7 +398,7 @@ Makefile, linker.ld        build and kernel link script
 grub/grub.cfg              boot menu
 include/flux/              kernel <-> user ABI (syscall numbers, structs, errno)
 lib/                       string/printf routines and the 8x16 font, shared by kernel and libc
-tools/                     mkfont.py (fonts), tango-icons.py (icons), mksounds.py (sounds)
+tools/                     mkfont.py (fonts), oxygen-icons.py (icons), mksounds.py (sounds)
 kernel/                    boot.S, entry.S, gdt/idt/pmm/vmm/heap, proc/exec/syscall,
                            vfs/file/initrd, ata/ahci/floppy/blkdev/pci, usb*/uhci/ohci/
                            ehci/xhci, automount, fat32/iso9660, tty/vga/serial/keyboard/
@@ -581,6 +581,6 @@ The default wallpaper, `/usr/share/wallpapers/mountains.jpg`, is a photograph
 by Štefan Štefančík on [Unsplash](https://unsplash.com), used under the
 [Unsplash License](https://unsplash.com/license). Thank you for sharing it.
 
-The icons are from the public-domain [Tango Desktop
-Project](https://commons.wikimedia.org/wiki/Tango_icons), and the desktop's
+The icons are from KDE's [Oxygen icon
+theme](https://invent.kde.org/frameworks/oxygen-icons5) (LGPL-3.0-or-later), and the desktop's
 text is rasterised from Liberation Sans, Serif and Mono.

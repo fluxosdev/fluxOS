@@ -1,6 +1,6 @@
 /*
- * Icons and the mouse pointer. Icons are PNG files from the Tango icon
- * theme in /usr/share/icons/tango/<size>x<size>/, loaded the first time
+ * Icons and the mouse pointer. Icons are PNG files from the Oxygen icon
+ * theme in /usr/share/icons/oxygen/<size>x<size>/, loaded the first time
  * they are drawn. If a file is missing, a simple built-in icon drawn
  * with rectangles on a 32x32 design grid takes its place.
  */
@@ -8,7 +8,7 @@
 #include <string.h>
 #include "desktop.h"
 
-#define ICON_DIR "/usr/share/icons/tango"
+#define ICON_DIR "/usr/share/icons/oxygen"
 
 #define PURPLE RGB(0x7B, 0x3F, 0xBF)
 #define ORANGE RGB(0xF0, 0x80, 0x20)
@@ -293,7 +293,10 @@ static const char *const icon_names[ICON_COUNT] = {
     [ICON_MUTED] = "audio-volume-muted",
     [ICON_SOUND] = "audio-x-generic",
     [ICON_PAINT] = "applications-graphics",
-    [ICON_ARCHIVE] = "package-x-generic",     /* not in the set: the built-in one is drawn */
+    [ICON_ARCHIVE] = "utilities-file-archiver",
+    [ICON_TASKMGR] = "utilities-system-monitor",
+    [ICON_MINES] = "edit-bomb",
+    [ICON_CLOCK] = "clock",
 };
 
 static const int icon_sizes[] = { 16, 32, 48 };

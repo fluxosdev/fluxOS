@@ -1,84 +1,55 @@
 #!/usr/bin/env python3
 """
-Fetch the Tango icons the desktop uses from Wikimedia Commons and write
-them, scaled to 16, 32 and 48 pixels, to rootfs/usr/share/icons/tango.
-The output is checked in, so building fluxOS does not need this script,
-network access, Python or PIL.
+Copy the Oxygen icons the desktop uses (16, 32 and 48 pixels) from an
+installed Oxygen theme to rootfs/usr/share/icons/oxygen. The output is
+checked in, so building fluxOS does not need this script. Oxygen is
+LGPL-3.0-or-later: https://invent.kde.org/frameworks/oxygen-icons5
 
-The Tango Desktop Project released these icons into the public domain:
-https://commons.wikimedia.org/wiki/Tango_icons
-
-usage: tools/tango-icons.py   (run from the top of the source tree)
+usage: tools/oxygen-icons.py [THEME_DIR]   (run from the top of the source tree)
+  THEME_DIR defaults to /usr/share/icons/oxygen/base; on Debian/Ubuntu,
+  "apt-get download oxygen-icon-theme" and "dpkg-deb -x" it anywhere.
 """
-import io
 import os
-import urllib.request
+import shutil
+import sys
 
-from PIL import Image
-
-# Commons file name -> icon name in fluxOS (the freedesktop.org name)
+# icon name in fluxOS (the freedesktop.org name) -> name in Oxygen, if different
 ICONS = {
-    "Computer.svg": "computer",
-    "Utilities-terminal.svg": "utilities-terminal",
-    "Text-x-generic.svg": "text-x-generic",
-    "Application-x-executable.svg": "application-x-executable",
-    "System-shutdown.svg": "system-shutdown",
-    "Dialog-information.svg": "dialog-information",
-    "Dialog-warning.svg": "dialog-warning",
-    "Folder.svg": "folder",
-    "Folder-open.svg": "folder-open",
-    "Folder-new.svg": "folder-new",
-    "User-home.svg": "user-home",
-    "Drive-harddisk.svg": "drive-harddisk",
-    "Media-cdrom.svg": "media-cdrom",
-    "Image-x-generic.svg": "image-x-generic",
-    "Go-up.svg": "go-up",
-    "Edit-delete.svg": "edit-delete",
-    "System-installer.svg": "system-installer",
-    "Accessories-text-editor.svg": "accessories-text-editor",
-    "Internet-web-browser.svg": "internet-web-browser",
-    "Accessories-calculator.svg": "accessories-calculator",
-    "Text-html.svg": "text-html",
-    "Go-previous.svg": "go-previous",
-    "Go-next.svg": "go-next",
-    "Go-home.svg": "go-home",
-    "View-refresh.svg": "view-refresh",
-    "Process-stop.svg": "process-stop",
-    "Video-display.svg": "video-display",
-    "Applications-system.svg": "applications-system",
-    "Audio-volume-high.svg": "audio-volume-high",
-    "Audio-volume-muted.svg": "audio-volume-muted",
-    "Audio-x-generic.svg": "audio-x-generic",
+    "computer": None, "utilities-terminal": None, "text-x-generic": None,
+    "application-x-executable": None, "system-shutdown": None,
+    "dialog-information": None, "dialog-warning": None, "folder": None,
+    "folder-open": None, "folder-new": None, "user-home": None,
+    "drive-harddisk": None, "media-cdrom": "media-optical",
+    "image-x-generic": None, "go-up": None, "edit-delete": None,
+    "system-installer": "package-x-generic", "accessories-text-editor": None,
+    "internet-web-browser": None, "accessories-calculator": None,
+    "text-html": None, "go-previous": None, "go-next": None, "go-home": None,
+    "view-refresh": None, "process-stop": None, "video-display": None,
+    "applications-system": None, "audio-volume-high": None,
+    "audio-volume-muted": None, "audio-x-generic": None,
+    "applications-graphics": None, "utilities-file-archiver": None,
+    "utilities-system-monitor": None, "edit-bomb": None, "clock": None,
 }
 SIZES = (16, 32, 48)
-SOURCE_PX = 250         # a standard Commons thumbnail width, scaled down from here
-OUT = "rootfs/usr/share/icons/tango"
-URL = "https://commons.wikimedia.org/wiki/Special:FilePath/%s?width=%d"
+OUT = "rootfs/usr/share/icons/oxygen"
 
 
-def fetch(name):
-    req = urllib.request.Request(URL % (name, SOURCE_PX),
-                                 headers={"User-Agent": "fluxOS-build/1.0 (tools/tango-icons.py)"})
-    with urllib.request.urlopen(req) as r:
-        return Image.open(io.BytesIO(r.read())).convert("RGBA")
+def find(theme, size, name):
+    d = "%s/%dx%d" % (theme, size, size)
+    for root, _, files in os.walk(d):
+        if name + ".png" in files:
+            return os.path.join(root, name + ".png")
+    sys.exit("no %s at %dx%d in %s" % (name, size, size, theme))
 
 
 def main():
+    theme = sys.argv[1] if len(sys.argv) > 1 else "/usr/share/icons/oxygen/base"
     for size in SIZES:
         os.makedirs("%s/%dx%d" % (OUT, size, size), exist_ok=True)
-    for commons, name in ICONS.items():
-        src = fetch(commons)
-        for size in SIZES:
-            # Box filtering from a large rendering keeps thin lines (the text
-            # in text-x-generic) that smoother filters blur into grey.
-            img = src.resize((size, size), Image.BOX)
-            img.save("%s/%dx%d/%s.png" % (OUT, size, size, name), optimize=True)
-        print(name)
-    with open(OUT + "/README", "w") as f:
-        f.write("Icons from the Tango Desktop Project, released into the public domain.\n"
-                "Source: https://commons.wikimedia.org/wiki/Tango_icons\n"
-                "Regenerate with tools/tango-icons.py.\n"
-                "fluxos.png is the fluxOS logo (assets/fluxos-logo.png), not part of Tango.\n")
+        for name, source in ICONS.items():
+            shutil.copyfile(find(theme, size, source or name),
+                            "%s/%dx%d/%s.png" % (OUT, size, size, name))
+    print("%d icons at %d sizes" % (len(ICONS), len(SIZES)))
 
 
 if __name__ == "__main__":
