@@ -123,6 +123,7 @@ int main(void)
             setup_child_exited(pid, status);
             browser_child_exited(pid, status);
             player_child_exited(pid, status);
+            archiver_child_exited(pid, status);
         }
 
         gears_frame();

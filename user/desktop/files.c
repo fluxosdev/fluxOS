@@ -176,6 +176,8 @@ static enum icon_id classify(struct fm *f, const struct entry *e, const char *pa
         return ICON_HTML;
     if (has_suffix(e->name, ".wav") || has_suffix(e->name, ".voc"))
         return ICON_SOUND;
+    if (has_suffix(e->name, ".zip") || has_suffix(e->name, ".7z"))
+        return ICON_ARCHIVE;
     struct stat st;
     if (is_dos_program(path) || (stat(path, &st) == 0 && (st.st_mode & 0111) && is_program(path)))
         return ICON_RUN;
@@ -489,12 +491,13 @@ static void draw_disk_space(struct fm *f, struct surface *s, int w, int h)
 
 /* ---- the right-click menu ---- */
 
-enum { CX_SEP, CX_OPEN, CX_CUT, CX_COPY, CX_PASTE, CX_DELETE, CX_RENAME, CX_NEWDIR, CX_REFRESH, CX_TERMINAL };
+enum { CX_SEP, CX_OPEN, CX_CUT, CX_COPY, CX_PASTE, CX_DELETE, CX_RENAME, CX_NEWDIR, CX_REFRESH, CX_TERMINAL,
+       CX_EXTRACT };
 
 static const char *const ctx_labels[] = {
     [CX_OPEN] = "Open", [CX_CUT] = "Cut", [CX_COPY] = "Copy", [CX_PASTE] = "Paste", [CX_DELETE] = "Delete",
     [CX_RENAME] = "Rename", [CX_NEWDIR] = "New Folder", [CX_REFRESH] = "Refresh",
-    [CX_TERMINAL] = "Open Terminal Here",
+    [CX_TERMINAL] = "Open Terminal Here", [CX_EXTRACT] = "Extract All...",
 };
 
 #define CTX_W 150
@@ -725,40 +728,76 @@ void files_tick(void)
         reload(f, NULL);
 }
 
+/* Open a file (not a folder) by its kind; dir is its folder, for programs. */
+static void open_file(const char *dir, const char *name, const char *path, enum icon_id icon)
+{
+    if (icon == ICON_IMAGE) {
+        if (!image_view_open(path)) {
+            char msg[NAME_MAX + 64];
+            snprintf(msg, sizeof(msg), "%s is not a picture fluxOS can show (PNG, JPEG, GIF, SVG or ICO).", name);
+            message_box("Image Viewer", ICON_WARNING, msg);
+        }
+    } else if (icon == ICON_HTML) {
+        char url[PATH_MAX + 8];
+        snprintf(url, sizeof(url), "file://%s", path);
+        browser_open(url);
+    } else if (icon == ICON_SOUND && has_suffix(name, ".wav")) {
+        player_open(path);
+    } else if (icon == ICON_SOUND) {
+        const char *argv[] = { "/bin/play", path, NULL };
+        terminal_open(name, argv, 0, 0);
+    } else if (icon == ICON_ARCHIVE) {
+        archiver_open(path);
+    } else if (icon == ICON_RUN) {
+        /* DOS programs go through the emulator even without execute permission.
+         * Programs start in their own folder, as on Windows: a DOS game's
+         * setup program runs the game by a name relative to it. */
+        const char *dos_argv[] = { "/bin/dos", path, NULL }, *argv[] = { path, NULL };
+        terminal_open_in(dir, name, is_dos_program(path) ? dos_argv : argv, 1);
+    } else if (is_text_name(name)) {
+        editor_open(path);
+    } else {
+        const char *argv[] = { "/bin/more", path, NULL };
+        terminal_open(name, argv, 0, 0);
+    }
+}
+
 static void open_entry(struct fm *f, int i)
 {
     struct entry *e = &f->ents[i];
     char path[PATH_MAX];
     join(path, sizeof(path), f->path, e->name);
-    if (e->is_dir) {
+    if (e->is_dir)
         navigate(f, path);
-    } else if (e->icon == ICON_IMAGE) {
-        if (!image_view_open(path)) {
-            char msg[NAME_MAX + 64];
-            snprintf(msg, sizeof(msg), "%s is not a picture fluxOS can show (PNG, JPEG, GIF, SVG or ICO).", e->name);
-            message_box("Image Viewer", ICON_WARNING, msg);
-        }
-    } else if (e->icon == ICON_HTML) {
-        char url[PATH_MAX + 8];
-        snprintf(url, sizeof(url), "file://%s", path);
-        browser_open(url);
-    } else if (e->icon == ICON_SOUND && has_suffix(e->name, ".wav")) {
-        player_open(path);
-    } else if (e->icon == ICON_SOUND) {
-        const char *argv[] = { "/bin/play", path, NULL };
-        terminal_open(e->name, argv, 0, 0);
-    } else if (e->icon == ICON_RUN) {
-        /* DOS programs go through the emulator even without execute permission.
-         * Programs start in their own folder, as on Windows: a DOS game's
-         * setup program runs the game by a name relative to it. */
-        const char *dos_argv[] = { "/bin/dos", path, NULL }, *argv[] = { path, NULL };
-        terminal_open_in(f->path, e->name, is_dos_program(path) ? dos_argv : argv, 1);
-    } else if (is_text_name(e->name)) {
-        editor_open(path);
-    } else {
-        const char *argv[] = { "/bin/more", path, NULL };
-        terminal_open(e->name, argv, 0, 0);
+    else
+        open_file(f->path, e->name, path, e->icon);
+}
+
+void files_open_path(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        files_open(path);
+        return;
     }
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    const char *name = slash ? slash + 1 : path;
+    if (slash == dir)
+        dir[1] = 0;                     /* a file in / */
+    else if (slash)
+        *slash = 0;
+    else
+        snprintf(dir, sizeof(dir), ".");
+    /* the same kinds classify() tells apart, from the name alone */
+    struct fm tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    snprintf(tmp.path, sizeof(tmp.path), "%s", dir);
+    struct entry e;
+    memset(&e, 0, sizeof(e));
+    snprintf(e.name, sizeof(e.name), "%s", name);
+    open_file(dir, name, path, classify(&tmp, &e, ""));
 }
 
 /* Prompts call back with the fm; it may have been closed meanwhile. */
@@ -1110,8 +1149,11 @@ static void open_ctx(struct fm *f, int x, int y, int hit)
         else
             f->sel = hit;
         int c[] = { CX_OPEN, CX_SEP, CX_CUT, CX_COPY, CX_PASTE, CX_SEP, CX_DELETE, CX_RENAME };
-        for (int i = 0; i < (int)(sizeof(c) / sizeof(c[0])); i++)
+        for (int i = 0; i < (int)(sizeof(c) / sizeof(c[0])); i++) {
             f->ctx_codes[n++] = c[i];
+            if (c[i] == CX_OPEN && f->ents[hit].icon == ICON_ARCHIVE)
+                f->ctx_codes[n++] = CX_EXTRACT;
+        }
     } else {
         clear_selection(f);
         int c[] = { CX_NEWDIR, CX_SEP, CX_PASTE, CX_SEP, CX_REFRESH, CX_TERMINAL };
@@ -1140,6 +1182,13 @@ static void ctx_action(struct fm *f, int code)
     case CX_NEWDIR: ask_text("New Folder", "Name of the new folder:", "New Folder", do_mkdir, f); break;
     case CX_REFRESH: reload(f, NULL); break;
     case CX_TERMINAL: terminal_open_in(f->path, "Terminal", NULL, 0); break;
+    case CX_EXTRACT:
+        if (f->sel >= 0) {
+            char path[PATH_MAX];
+            join(path, sizeof(path), f->path, f->ents[f->sel].name);
+            archiver_extract(path);
+        }
+        break;
     }
 }
 

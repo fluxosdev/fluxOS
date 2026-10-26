@@ -149,6 +149,11 @@ static void open_minesweeper(void)
     minesweeper_open();
 }
 
+static void open_archiver(void)
+{
+    archiver_open(NULL);
+}
+
 static void open_readme(void)
 {
     editor_open("/home/flux/README.txt");
@@ -201,6 +206,7 @@ static const struct menu_item accessories_items[] = {
     { ICON_EDITOR, "Text Editor", open_editor, NULL, 0 },
     { ICON_CALC, "Calculator", open_calculator, NULL, 0 },
     { ICON_SOUND, "Sound Player", open_player, NULL, 0 },
+    { ICON_ARCHIVE, "Archive Manager", open_archiver, NULL, 0 },
 };
 
 static const struct menu_item system_items[] = {

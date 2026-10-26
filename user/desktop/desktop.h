@@ -62,6 +62,7 @@ enum icon_id {
     ICON_TASKMGR,
     ICON_MINES,
     ICON_CLOCK,
+    ICON_ARCHIVE,
     ICON_COUNT,
 };
 
@@ -178,6 +179,8 @@ void terminal_child_exited(int pid);
 void terminal_blink(void);
 
 struct window *files_open(const char *path);
+/* Open a file as double-clicking it in the File Manager would. */
+void files_open_path(const char *path);
 void files_tick(void);                  /* once a second: follow mounts coming and going */
 struct window *calculator_open(void);
 struct window *player_open(const char *path);      /* path NULL: nothing open yet */
@@ -246,6 +249,11 @@ void system_restart(void);
 int loop_watch(int fd, void (*ready)(void *ctx, int revents), void *ctx);
 void loop_unwatch(int fd);
 struct window *image_view_open(const char *path);
+
+/* Archive Manager (archiver.c): ZIP and 7z archives, browsed and extracted. */
+struct window *archiver_open(const char *path);     /* path NULL: nothing open yet */
+void archiver_extract(const char *path);            /* open it and ask where to extract it all */
+void archiver_child_exited(int pid, int status);
 
 /* Message boxes and prompts (apps.c). Only one is open at a time: while
  * one is, more requests just focus it. ctx is passed back unchanged. */

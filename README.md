@@ -132,6 +132,12 @@ desktop.
   in GRUB's environment block on an installed system.
 - **3D Gears**: the OpenGL demo, drawn by the Radeon or Voodoo 3D engine when
   there is one, else by the software renderer (S switches renderer).
+- **Archive Manager**: opens ZIP and 7z archives (double-click one in the File
+  Manager, or **Extract All...** on its right-click menu) and shows them like
+  folders, with sizes, packed sizes, dates and methods; double-clicking a file
+  inside opens it. Extracting (everything, or the selection) runs `unzip` in
+  the background with a progress bar and Cancel, and asks before replacing
+  files; **Test** checks every CRC.
 - **Task Manager** (applications, processes, CPU/memory performance graphs),
   **Disk Manager** (volumes, partition bars, mount/unmount/format, MBR partition
   editing), **Volume Control**, **Setup** (installs fluxOS on a disk; only
@@ -249,12 +255,20 @@ keeps running), or from `file://`.
   GLX's part. A `<math.h>` on the x87 is included; programs using GL or math
   are built with `USER_FP_CFLAGS`, the rest of user space is integer-only.
 
-**Userland** (`/bin`): basename beep cat chmod clear cp date desktop df dirname
+**Userland** (`/bin`): 7z basename beep cat chmod clear cp date desktop df dirname
 dmesg dos echo env fetch fluxinstall free fsh grep halt head hexdump host
 ifconfig init ls lsblk mkdir mkfs.fat mixer more mount mv nc ping play
 poweroff ps reboot rm rmdir seq sh sleep sort spin stat sync tail tee top
-touch tr umount uname uniq uptime wc wget yes, on a small libc (stdio, malloc,
-dirent, time, sockets, a DNS resolver).
+touch tr umount uname uniq unzip uptime wc wget yes zip, on a small libc (stdio, malloc,
+dirent, time, sockets, a DNS resolver, archives).
+- `unzip [-l|-v|-t|-p] [-o|-n] [-j] [-d DIR] ARCHIVE [NAME...]` lists, tests and
+  extracts ZIP and 7z archives; `7z l|t|x|e [-oDIR] [-y] ARCHIVE` does the same
+  with 7-Zip's syntax; `zip [-r] [-0..-9] [-j] ARCHIVE.zip FILE...` makes ZIP
+  archives (Deflate). libc's `<archive.h>` reads ZIP (stored, Deflate, LZMA;
+  Zip64; UTF-8 and CP437 names) and 7z (Copy, LZMA, LZMA2, Deflate, the BCJ x86
+  and Delta filters, solid blocks, compressed headers), with every CRC checked.
+  Encrypted archives, other methods (BZip2, PPMd, BCJ2...) and creating 7z
+  archives are not supported.
 - `ifconfig` shows the interface and sets a static address or asks DHCP;
   `ping [-c N] HOST`, `host NAME`, `nc` (netcat, TCP and UDP).
 - `wget [-q] [-O FILE] [-T SECONDS] [--save-headers] [--content-on-error]

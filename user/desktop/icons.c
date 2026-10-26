@@ -130,6 +130,24 @@ static void icon_mines(void)
     P(12, 12, 3, 3, C_WHITE);
 }
 
+/* A cardboard box with a zip down its front. */
+static void icon_archive(void)
+{
+    color_t card = RGB(0xD8, 0xA8, 0x60), dark = RGB(0xA0, 0x70, 0x30), lid = RGB(0xE8, 0xC0, 0x80);
+    P(4, 10, 24, 19, card);
+    frame(4, 10, 24, 19, C_BLACK);
+    P(2, 5, 28, 6, lid);                /* the lid */
+    frame(2, 5, 28, 6, C_BLACK);
+    P(5, 27, 22, 1, dark);
+    P(26, 11, 1, 16, dark);
+    for (int y = 5; y < 28; y += 2) {   /* the zip's teeth */
+        P(14, y, 2, 1, C_BLACK);
+        P(16, y + 1, 2, 1, C_BLACK);
+    }
+    P(13, 14, 6, 6, C_FACE);            /* the pull */
+    frame(13, 14, 6, 6, C_BLACK);
+}
+
 /* A round clock face with two hands. */
 static void icon_clock(void)
 {
@@ -254,6 +272,7 @@ static const char *const icon_names[ICON_COUNT] = {
     [ICON_VOLUME] = "audio-volume-high",
     [ICON_MUTED] = "audio-volume-muted",
     [ICON_SOUND] = "audio-x-generic",
+    [ICON_ARCHIVE] = "package-x-generic",     /* not in the set: the built-in one is drawn */
 };
 
 static const int icon_sizes[] = { 16, 32, 48 };
@@ -306,6 +325,7 @@ static void draw_builtin(struct surface *s, int x, int y, enum icon_id id, int s
     case ICON_TASKMGR: icon_taskmgr(); break;
     case ICON_MINES: icon_mines(); break;
     case ICON_CLOCK: icon_clock(); break;
+    case ICON_ARCHIVE: icon_archive(); break;
     default: break;                     /* image-only icons */
     }
 }
