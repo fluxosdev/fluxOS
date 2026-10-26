@@ -664,6 +664,9 @@ kazuend on [Unsplash](https://unsplash.com), and `mountains.jpg` one by Štefan
 Štefančík, both used under the [Unsplash License](https://unsplash.com/license).
 Thank you for sharing them.
 
+The startup, shutdown and error sounds (`/usr/share/sounds/startup.wav`, `shutdown.wav` and
+`error.wav`) are made from the Zero-G sample library.
+
 The icons are from KDE's [Oxygen icon
 theme](https://invent.kde.org/frameworks/oxygen-icons5) (LGPL-3.0-or-later), and the desktop's
 text is rasterised from Liberation Sans, Serif and Mono and, in the Kinetik theme, from
