@@ -27,6 +27,10 @@ uint32_t pmm_free_kb(void);
 #define PTE_GLOBAL  0x100
 #define PTE_MMIO    0x200       /* (available bit) device memory, not ours to free */
 
+/* PTE bits for write-combining device memory (the framebuffer), or 0 if
+ * the processor has no page attribute table (cpu.c). */
+extern uint32_t pte_wc;
+
 extern uint32_t *kernel_pd;
 
 void paging_init(void);
@@ -42,6 +46,17 @@ uint32_t vmm_user_pages(uint32_t *pd);
 /* flags: extra page bits, such as PTE_PCD for device registers */
 void *vmm_map_mmio(uint32_t phys, uint32_t size, uint32_t flags);  /* boot time only */
 int vmm_map_phys(uint32_t *pd, uint32_t va, uint32_t phys, uint32_t size, uint32_t flags);
+
+/*
+ * ---- SSE block moves (sse.S) ----
+ * Only once fpu_init() has enabled SSE, which sets kernel_sse. Each runs
+ * with interrupts off; the page routines take 16-byte aligned pages.
+ */
+extern int kernel_sse;
+void sse_zero_page(void *page);
+void sse_copy_page(void *dst, const void *src);     /* streams: dst is not cached */
+void sse_copy(void *dst, const void *src, size_t n);    /* forwards: dst < src may overlap */
+void sse_fill(void *dst, uint32_t pattern, size_t n);   /* dst and n multiples of 4 */
 
 /* ---- kernel heap ---- */
 void heap_init(void);

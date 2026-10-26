@@ -8,6 +8,7 @@
 #define GLINT_H
 
 #include <stdint.h>
+#include <xmmintrin.h>
 #include <GL/fluxgl.h>
 #include <GL/gl.h>
 
@@ -17,9 +18,12 @@
 #define TEXTURE_DEPTH    2
 #define MAX_VIEWPORT     2048
 
+/* Four-float vectors and matrices are 16-byte aligned for SSE. */
+#define VEC4 __attribute__((aligned(16)))
+
 /* A vertex after transformation: clip coordinates and its color. */
 struct cvert {
-    float clip[4];
+    float clip[4] VEC4;
     float color[4];
 };
 
@@ -31,8 +35,8 @@ struct wvert {
 };
 
 struct light {
-    float ambient[4], diffuse[4], specular[4];
-    float position[4];          /* eye coordinates */
+    float ambient[4] VEC4, diffuse[4] VEC4, specular[4] VEC4;
+    float position[4] VEC4;     /* eye coordinates */
     float spot_dir[3];          /* eye coordinates */
     float spot_exp, spot_cutoff, spot_cos;
     float att[3];               /* constant, linear, quadratic */
@@ -40,7 +44,7 @@ struct light {
 };
 
 struct material {
-    float ambient[4], diffuse[4], specular[4], emission[4];
+    float ambient[4] VEC4, diffuse[4] VEC4, specular[4] VEC4, emission[4] VEC4;
     float shininess;
 };
 
@@ -74,9 +78,9 @@ struct fgl_context {
 
     /* transformation */
     GLenum matrix_mode;
-    float modelview[MODELVIEW_DEPTH][16];
-    float projection[PROJECTION_DEPTH][16];
-    float texture[TEXTURE_DEPTH][16];
+    float modelview[MODELVIEW_DEPTH][16] VEC4;
+    float projection[PROJECTION_DEPTH][16] VEC4;
+    float texture[TEXTURE_DEPTH][16] VEC4;
     int mv_depth, proj_depth, tex_depth;
     float normal_matrix[9];     /* inverse transpose of the modelview's 3x3 */
     int normal_dirty;
@@ -95,11 +99,11 @@ struct fgl_context {
     struct light lights[MAX_LIGHTS];
     int light_on[MAX_LIGHTS];
     struct material mat;
-    float model_ambient[4];
+    float model_ambient[4] VEC4;
     GLenum cm_face, cm_mode;
 
     /* current attributes */
-    float color[4], normal[3];
+    float color[4] VEC4, normal[3];
     float eye_normal[3];
     int eye_normal_valid;
 
@@ -166,12 +170,10 @@ int gl_tdfx_check(struct fgl_context *c);      /* 0: its video memory is still f
 int gl_radeon_attach(struct fgl_context *c);
 int gl_radeon_check(struct fgl_context *c);    /* 0: the engine still runs */
 
-/* Round to the nearest integer without touching the FPU control word. */
+/* Round to the nearest integer (CVTSS2SI, in MXCSR's default rounding). */
 static inline int gl_iround(float f)
 {
-    int i;
-    __asm__("fistpl %0" : "=m"(i) : "t"(f) : "st");
-    return i;
+    return _mm_cvt_ss2si(_mm_set_ss(f));
 }
 
 static inline int gl_iceil(float f)

@@ -84,7 +84,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
 
     for (uint32_t i = 0; i < ARRAY_SIZE(banner); i++)
         kprintf("\033[1;36m%s\033[0m\n", banner[i]);
-    kprintf("\033[1m%s %s\033[0m - a preemptive multitasking Unix-like OS for i686\n\n",
+    kprintf("\033[1m%s %s\033[0m - a preemptive multitasking Unix-like OS for Pentium III-class PCs\n\n",
             FLUXOS_NAME, FLUXOS_RELEASE);
 
     if (magic != MULTIBOOT_BOOT_MAGIC)
@@ -94,6 +94,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
 
     if ((mbi->flags & MB_INFO_CMDLINE) && mbi->cmdline)
         strlcpy(cmdline, (const char *)mbi->cmdline, sizeof(cmdline));
+    cpu_init();                         /* everything after this needs a Pentium III */
 
     /* Remember the initrd before any allocation can reuse that memory. */
     uint32_t initrd_start = 0, initrd_end = 0;

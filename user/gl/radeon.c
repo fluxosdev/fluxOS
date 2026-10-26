@@ -511,6 +511,20 @@ static void radeon_finish(struct fgl_context *c)
         submit();
 }
 
+/* Copy n pixels, four at a time, without the alpha the engine leaves in the top byte. */
+static void copy_rgb(uint32_t *out, const uint32_t *src, int n)
+{
+    static const uint32_t rgb_mask[4] __attribute__((aligned(16))) = {
+        0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF,
+    };
+    __m128 mask = _mm_load_ps((const float *)rgb_mask);
+    int x = 0;
+    for (; x + 3 < n; x += 4)
+        _mm_storeu_ps((float *)(out + x), _mm_and_ps(_mm_loadu_ps((const float *)(src + x)), mask));
+    for (; x < n; x++)
+        out[x] = src[x] & 0xFFFFFF;
+}
+
 static void radeon_read(struct fgl_context *c, uint32_t *dst, int stride)
 {
     struct radeon *t = c->bpriv;
@@ -533,22 +547,16 @@ static void radeon_read(struct fgl_context *c, uint32_t *dst, int stride)
         b.rects[0].w = (int16_t)c->width;
         b.rects[0].h = (int16_t)c->height;
         if (display(DISP_BLIT, &b) == 0) {
-            for (int y = 0; y < c->height; y++) {
-                const uint32_t *src = t->readback + (size_t)y * t->pitch;
-                uint32_t *out = dst + (size_t)y * stride;
-                for (int x = 0; x < c->width; x++)
-                    out[x] = src[x] & 0xFFFFFF;
-            }
+            for (int y = 0; y < c->height; y++)
+                copy_rgb(dst + (size_t)y * stride, t->readback + (size_t)y * t->pitch, c->width);
             return;
         }
     }
-    /* No GART: through the aperture, a word at a time. */
-    for (int y = 0; y < c->height; y++) {
-        const volatile uint32_t *src = (const volatile uint32_t *)(hw.vram + t->color + (size_t)y * t->pitch * 4);
-        uint32_t *out = dst + (size_t)y * stride;
-        for (int x = 0; x < c->width; x++)
-            out[x] = src[x] & 0xFFFFFF;
-    }
+    /* No GART: through the aperture, where 16-byte reads at least make
+     * fewer trips across the bus than words. */
+    for (int y = 0; y < c->height; y++)
+        copy_rgb(dst + (size_t)y * stride, (const uint32_t *)(hw.vram + t->color + (size_t)y * t->pitch * 4),
+                 c->width);
 }
 
 const struct backend gl_radeon_backend = {

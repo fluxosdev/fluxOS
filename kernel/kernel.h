@@ -46,6 +46,9 @@ void boot_ok(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void boot_warn(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void panic(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
 
+/* Check that the processor can run fluxOS (cpu.c); halts if not. */
+void cpu_init(void);
+
 /* Kernel command line (from the boot loader). */
 int cmdline_has(const char *option);
 /* The value of "key=value" on the command line; returns 0 if there is none. */

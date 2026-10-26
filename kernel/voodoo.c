@@ -623,6 +623,15 @@ static void use_native_fb(const struct timing *t, int bpp)
     }
 }
 
+/* Blank the new screen, 64 KiB at a time so interrupts get a look in. */
+static void clear_vram(uint32_t bytes)
+{
+    uint32_t words = bytes & ~3u;
+    for (uint32_t off = 0; off < words; off += 0x10000)
+        sse_fill(vd.vram + off, 0, MIN(0x10000u, words - off));
+    memset(vd.vram + words, 0, bytes & 3);
+}
+
 int voodoo_set_mode(const struct dispmode *m)
 {
     if (!fb_boot.base)
@@ -647,7 +656,7 @@ int voodoo_set_mode(const struct dispmode *m)
 
     struct vregs r;
     build_regs(t, m->bpp, &r);
-    memset(vd.vram, 0, (uint32_t)t->w * t->h * (m->bpp / 8));
+    clear_vram((uint32_t)t->w * t->h * (m->bpp / 8));
     write_regs(&r);
     vd.native = 1;
     fill_mode(&vd.mode, t, m->bpp);

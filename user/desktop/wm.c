@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "desktop.h"
+#include "simd.h"
 
 #define MAX_DAMAGE   32
 #define DBLCLICK_MS  500
@@ -31,7 +32,16 @@ int screen_w, screen_h;
 
 static uint8_t *fb;
 static struct fbinfo fbi;
-static int fb_fast;                     /* 32 bpp with the 0xRRGGBB layout */
+/* How present() writes pixels to the screen. */
+enum {
+    FB_GENERIC,
+    FB_RGB32,                           /* 32 bpp with the 0xRRGGBB layout */
+    FB_RGB24,                           /* the same in 24 bpp */
+    FB_16,                              /* 15 or 16 bpp, red highest */
+};
+static int fb_kind;
+static int fb16_shift[3];               /* FB_16: right shifts of red, green, blue */
+static uint32_t fb16_mask[3];           /* and their bits in the pixel */
 
 /* With two pages of the screen, frames are drawn on the one not shown and
  * flipped to; that page still lacks what changed in the frame before.
@@ -621,6 +631,110 @@ void wm_damage(struct rect r)
         add_rect(damage, &ndamage, r);
 }
 
+static void classify_fb(void)
+{
+    int rgb = fbi.red_pos == 16 && fbi.green_pos == 8 && fbi.blue_pos == 0;
+    fb_kind = FB_GENERIC;
+    if (fbi.bpp == 32 && rgb) {
+        fb_kind = FB_RGB32;
+    } else if (fbi.bpp == 24 && rgb) {
+        fb_kind = FB_RGB24;
+    } else if (fbi.bpp == 15 || fbi.bpp == 16) {
+        /* Each channel's top bits move right into place, masked. */
+        const int from[3] = { 16, 8, 0 };
+        const int pos[3] = { fbi.red_pos, fbi.green_pos, fbi.blue_pos };
+        const int size[3] = { fbi.red_size, fbi.green_size, fbi.blue_size };
+        fb_kind = FB_16;
+        for (int c = 0; c < 3; c++) {
+            fb16_shift[c] = from[c] + 8 - size[c] - pos[c];
+            fb16_mask[c] = ((1u << size[c]) - 1) << pos[c];
+            if (size[c] < 1 || size[c] > 8 || fb16_shift[c] < 0)
+                fb_kind = FB_GENERIC;
+        }
+    }
+}
+
+/*
+ * Rows of pixels to the screen. The framebuffer is write-combining (when
+ * the processor has a PAT), and streaming stores (MOVNTPS, MOVNTQ) fill
+ * whole write-combining buffers without reading anything back.
+ */
+static void put_row32(uint8_t *dst, const uint32_t *src, int n)
+{
+    uint32_t *d = (uint32_t *)dst;
+    int i = 0;
+    for (; i < n && ((uintptr_t)(d + i) & 15); i++)
+        d[i] = src[i];
+    if (((uintptr_t)(src + i) & 15) == 0) {
+        for (; i + 4 <= n; i += 4)
+            _mm_stream_ps((float *)(d + i), _mm_load_ps((const float *)(src + i)));
+    } else {
+        for (; i + 4 <= n; i += 4)
+            _mm_stream_ps((float *)(d + i), _mm_loadu_ps((const float *)(src + i)));
+    }
+    for (; i < n; i++)
+        d[i] = src[i];
+}
+
+/* Four pixels to three words. */
+static void put_row24(uint8_t *dst, const uint32_t *src, int n)
+{
+    int i = 0;
+    for (; i < n && ((uintptr_t)dst & 3); i++, dst += 3) {
+        dst[0] = (uint8_t)src[i];
+        dst[1] = (uint8_t)(src[i] >> 8);
+        dst[2] = (uint8_t)(src[i] >> 16);
+    }
+    uint32_t *d = (uint32_t *)dst;
+    for (; i + 4 <= n; i += 4, d += 3) {
+        uint32_t p0 = src[i], p1 = src[i + 1], p2 = src[i + 2], p3 = src[i + 3];
+        d[0] = (p0 & 0xFFFFFF) | p1 << 24;
+        d[1] = (p1 >> 8 & 0xFFFF) | p2 << 16;
+        d[2] = (p2 >> 16 & 0xFF) | p3 << 8;
+    }
+    for (dst = (uint8_t *)d; i < n; i++, dst += 3) {
+        dst[0] = (uint8_t)src[i];
+        dst[1] = (uint8_t)(src[i] >> 8);
+        dst[2] = (uint8_t)(src[i] >> 16);
+    }
+}
+
+static inline uint16_t pack16(uint32_t p)
+{
+    return (uint16_t)((p >> fb16_shift[0] & fb16_mask[0]) | (p >> fb16_shift[1] & fb16_mask[1]) |
+                      (p >> fb16_shift[2] & fb16_mask[2]));
+}
+
+/* Two pixels' 15/16-bit values, in the low halves of their lanes. */
+static inline __m64 pack16x2(__m64 p, const __m64 *sh, const __m64 *mask)
+{
+    __m64 v = _mm_or_si64(_mm_or_si64(_mm_and_si64(_mm_srl_pi32(p, sh[0]), mask[0]),
+                                      _mm_and_si64(_mm_srl_pi32(p, sh[1]), mask[1])),
+                          _mm_and_si64(_mm_srl_pi32(p, sh[2]), mask[2]));
+    return _mm_srai_pi32(_mm_slli_pi32(v, 16), 16);     /* sign extended: PACKSSDW keeps it */
+}
+
+/* Four pixels at a time in MMX registers; the caller runs simd_done(). */
+static void put_row16(uint8_t *dst, const uint32_t *src, int n)
+{
+    uint16_t *d = (uint16_t *)dst;
+    __m64 sh[3], mask[3];
+    for (int c = 0; c < 3; c++) {
+        sh[c] = _mm_cvtsi32_si64(fb16_shift[c]);
+        mask[c] = _mm_set1_pi32((int)fb16_mask[c]);
+    }
+    int i = 0;
+    for (; i < n && ((uintptr_t)(d + i) & 7); i++)
+        d[i] = pack16(src[i]);
+    for (; i + 4 <= n; i += 4) {
+        __m64 a = pack16x2(*(const __m64_u *)(src + i), sh, mask);
+        __m64 b = pack16x2(*(const __m64_u *)(src + i + 2), sh, mask);
+        _mm_stream_pi((__m64 *)(d + i), _mm_packs_pi32(a, b));
+    }
+    for (; i < n; i++)
+        d[i] = pack16(src[i]);
+}
+
 /* Copy r of the back buffer to a page of the screen. */
 static void present(uint8_t *page, struct rect r)
 {
@@ -628,8 +742,15 @@ static void present(uint8_t *page, struct rect r)
     for (int j = r.y; j < r.y + r.h; j++) {
         const uint32_t *src = screen.px + j * screen.stride + r.x;
         uint8_t *dst = page + (uint32_t)j * fbi.pitch + (uint32_t)r.x * bytespp;
-        if (fb_fast) {
-            memcpy(dst, src, (size_t)r.w * 4);
+        switch (fb_kind) {
+        case FB_RGB32:
+            put_row32(dst, src, r.w);
+            continue;
+        case FB_RGB24:
+            put_row24(dst, src, r.w);
+            continue;
+        case FB_16:
+            put_row16(dst, src, r.w);
             continue;
         }
         for (int i = 0; i < r.w; i++, dst += bytespp) {
@@ -648,6 +769,8 @@ static void present(uint8_t *page, struct rect r)
             }
         }
     }
+    _mm_sfence();                       /* the streamed pixels are on their way */
+    simd_done();
 }
 
 /* The back buffer, laid out for the GPU too: page aligned, lines a
@@ -2218,7 +2341,7 @@ int wm_reconfigure(void)
     fbi = nfi;
     screen_w = (int)fbi.width;
     screen_h = (int)fbi.height;
-    fb_fast = fbi.bpp == 32 && fbi.red_pos == 16 && fbi.green_pos == 8 && fbi.blue_pos == 0;
+    classify_fb();
     shown_page = 0;                     /* a new mode starts on page 0 */
     use_adapter();
     wallpaper_resize();
@@ -2272,7 +2395,7 @@ void wm_init(void)
     }
     screen_w = (int)fbi.width;
     screen_h = (int)fbi.height;
-    fb_fast = fbi.bpp == 32 && fbi.red_pos == 16 && fbi.green_pos == 8 && fbi.blue_pos == 0;
+    classify_fb();
     if (screen_alloc(&screen, screen_w, screen_h) < 0) {
         fprintf(stderr, "desktop: out of memory\n");
         exit(1);

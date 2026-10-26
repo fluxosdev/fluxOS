@@ -21,12 +21,21 @@
 uint32_t *kernel_pd;
 static uint32_t mmio_next = KERNEL_MMIO_BASE;
 
+/* The first page tables are made before fpu_init() enables SSE. */
+static void zero_page(uint32_t phys)
+{
+    if (kernel_sse)
+        sse_zero_page((void *)phys);
+    else
+        memset((void *)phys, 0, PAGE_SIZE);
+}
+
 static uint32_t *alloc_table(void)
 {
     uint32_t phys = pmm_alloc();
     if (!phys)
         return NULL;
-    memset((void *)phys, 0, PAGE_SIZE);
+    zero_page(phys);
     return (uint32_t *)phys;
 }
 
@@ -112,7 +121,7 @@ int vmm_alloc(uint32_t *pd, uint32_t va)
     uint32_t frame = pmm_alloc();
     if (!frame)
         return -ENOMEM;
-    memset((void *)frame, 0, PAGE_SIZE);
+    zero_page(frame);
     *pte = frame | PTE_PRESENT | PTE_WRITE | PTE_USER;
     flush_if_current(pd, va);
     return 0;
@@ -213,7 +222,7 @@ uint32_t *vmm_clone(uint32_t *src)
             uint32_t frame = pmm_alloc();
             if (!frame)
                 goto fail;
-            memcpy((void *)frame, (void *)FRAME(spt[j]), PAGE_SIZE);
+            sse_copy_page((void *)frame, (void *)FRAME(spt[j]));
             dpt[j] = frame | (spt[j] & 0xFFF);
         }
     }

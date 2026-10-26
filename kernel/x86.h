@@ -107,6 +107,16 @@ static inline void invlpg(uint32_t addr)
     __asm__ volatile("invlpg (%0)" : : "r"(addr) : "memory");
 }
 
+static inline void cpuid(uint32_t leaf, uint32_t r[4])
+{
+    __asm__ volatile("cpuid" : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3]) : "a"(leaf), "c"(0));
+}
+
+static inline void wrmsr(uint32_t msr, uint64_t v)
+{
+    __asm__ volatile("wrmsr" : : "c"(msr), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)) : "memory");
+}
+
 static inline uint32_t read_eflags(void)
 {
     uint32_t v;

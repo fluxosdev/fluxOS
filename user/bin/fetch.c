@@ -27,12 +27,18 @@ static void cpu_name(char *out, size_t size)
         strlcpy(out, p, size);
         return;
     }
+    /* Older processors (a Pentium III among them) have no brand string. */
     unsigned vendor[4] = { 0 };
     cpuid(0, &a, &vendor[0], &vendor[2], &vendor[1]);
     char v[13];
     memcpy(v, vendor, 12);
     v[12] = 0;
-    snprintf(out, size, "%s i686-compatible", v);
+    cpuid(1, &a, &b, &c, &d);
+    unsigned family = (a >> 8) & 15, model = (a >> 4) & 15;
+    if (!strcmp(v, "GenuineIntel") && family == 6 && model >= 7 && model <= 11)
+        strlcpy(out, "Intel Pentium III", size);
+    else
+        snprintf(out, size, "%s family %u model %u", v, family, model);
 }
 
 int main(void)

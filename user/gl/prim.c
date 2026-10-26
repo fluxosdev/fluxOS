@@ -72,14 +72,17 @@ static void eye_normal(struct fgl_context *c, float *out)
     memcpy(out, c->eye_normal, 3 * sizeof(float));
 }
 
+/* Colors are worked out as SSE vectors, red, green and blue in the first
+ * three lanes; the geometry stays scalar. */
 static void light_vertex(struct fgl_context *c, const float *eye, float *out)
 {
     const struct material *m = &c->mat;
     float n[3];
     eye_normal(c, n);
-    float r = m->emission[0] + m->ambient[0] * c->model_ambient[0];
-    float g = m->emission[1] + m->ambient[1] * c->model_ambient[1];
-    float b = m->emission[2] + m->ambient[2] * c->model_ambient[2];
+    __m128 m_ambient = _mm_load_ps(m->ambient), m_diffuse = _mm_load_ps(m->diffuse);
+    __m128 m_specular = _mm_load_ps(m->specular);
+    __m128 color = _mm_add_ps(_mm_load_ps(m->emission),
+                              _mm_mul_ps(m_ambient, _mm_load_ps(c->model_ambient)));
     int specular = m->specular[0] != 0 || m->specular[1] != 0 || m->specular[2] != 0;
 
     for (int i = 0; i < MAX_LIGHTS; i++) {
@@ -97,9 +100,10 @@ static void light_vertex(struct fgl_context *c, const float *eye, float *out)
             L[2] = l->position[2] / w - eye[2] / eye[3];
             float d = sqrtf(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
             if (d > 0) {
-                L[0] /= d;
-                L[1] /= d;
-                L[2] /= d;
+                float inv = 1 / d;
+                L[0] *= inv;
+                L[1] *= inv;
+                L[2] *= inv;
             }
             float k = l->att[0] + l->att[1] * d + l->att[2] * d * d;
             att = k > 0 ? 1 / k : 1;
@@ -115,34 +119,27 @@ static void light_vertex(struct fgl_context *c, const float *eye, float *out)
             H[2] = L[2] + 1;
             float hl = sqrtf(H[0] * H[0] + H[1] * H[1] + H[2] * H[2]);
             if (hl > 0) {
-                H[0] /= hl;
-                H[1] /= hl;
-                H[2] /= hl;
+                float inv = 1 / hl;
+                H[0] *= inv;
+                H[1] *= inv;
+                H[2] *= inv;
             }
         }
-        float lr = m->ambient[0] * l->ambient[0];
-        float lg = m->ambient[1] * l->ambient[1];
-        float lb = m->ambient[2] * l->ambient[2];
+        __m128 lit = _mm_mul_ps(m_ambient, _mm_load_ps(l->ambient));
         float nl = n[0] * L[0] + n[1] * L[1] + n[2] * L[2];
         if (nl > 0) {
-            lr += nl * m->diffuse[0] * l->diffuse[0];
-            lg += nl * m->diffuse[1] * l->diffuse[1];
-            lb += nl * m->diffuse[2] * l->diffuse[2];
+            lit = _mm_add_ps(lit, _mm_mul_ps(_mm_set1_ps(nl), _mm_mul_ps(m_diffuse, _mm_load_ps(l->diffuse))));
             float nh = n[0] * H[0] + n[1] * H[1] + n[2] * H[2];
             if (specular && nh > 0) {
                 float s = m->shininess == 0 ? 1 : powf(nh, m->shininess);
-                lr += s * m->specular[0] * l->specular[0];
-                lg += s * m->specular[1] * l->specular[1];
-                lb += s * m->specular[2] * l->specular[2];
+                lit = _mm_add_ps(lit, _mm_mul_ps(_mm_set1_ps(s),
+                                                 _mm_mul_ps(m_specular, _mm_load_ps(l->specular))));
             }
         }
-        r += att * lr;
-        g += att * lg;
-        b += att * lb;
+        color = _mm_add_ps(color, _mm_mul_ps(_mm_set1_ps(att), lit));
     }
-    out[0] = gl_clampf(r);
-    out[1] = gl_clampf(g);
-    out[2] = gl_clampf(b);
+    color = _mm_min_ps(_mm_max_ps(color, _mm_setzero_ps()), _mm_set1_ps(1));
+    _mm_store_ps(out, color);
     out[3] = gl_clampf(m->diffuse[3]);
 }
 
@@ -217,15 +214,24 @@ void glVertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w)
     }
     struct cvert *v = &c->verts[c->nverts++];
     const float *mv = c->modelview[c->mv_depth], *p = c->projection[c->proj_depth];
-    float eye[4];
-    for (int i = 0; i < 4; i++)
-        eye[i] = mv[i] * x + mv[4 + i] * y + mv[8 + i] * z + mv[12 + i] * w;
-    for (int i = 0; i < 4; i++)
-        v->clip[i] = p[i] * eye[0] + p[4 + i] * eye[1] + p[8 + i] * eye[2] + p[12 + i] * eye[3];
+    /* The modelview's columns weighted by x, y, z and w, then the projection's
+     * by the eye coordinates. */
+    float eye[4] VEC4;
+    __m128 e = _mm_add_ps(_mm_add_ps(_mm_add_ps(_mm_mul_ps(_mm_load_ps(mv), _mm_set1_ps(x)),
+                                                _mm_mul_ps(_mm_load_ps(mv + 4), _mm_set1_ps(y))),
+                                     _mm_mul_ps(_mm_load_ps(mv + 8), _mm_set1_ps(z))),
+                          _mm_mul_ps(_mm_load_ps(mv + 12), _mm_set1_ps(w)));
+    _mm_store_ps(eye, e);
+    __m128 clip = _mm_add_ps(_mm_add_ps(_mm_add_ps(
+                      _mm_mul_ps(_mm_load_ps(p), _mm_shuffle_ps(e, e, 0x00)),
+                      _mm_mul_ps(_mm_load_ps(p + 4), _mm_shuffle_ps(e, e, 0x55))),
+                      _mm_mul_ps(_mm_load_ps(p + 8), _mm_shuffle_ps(e, e, 0xAA))),
+                      _mm_mul_ps(_mm_load_ps(p + 12), _mm_shuffle_ps(e, e, 0xFF)));
+    _mm_store_ps(v->clip, clip);
     if (c->lighting)
         light_vertex(c, eye, v->color);
     else
-        memcpy(v->color, c->color, sizeof(v->color));
+        _mm_store_ps(v->color, _mm_load_ps(c->color));
 }
 
 void glVertex2f(GLfloat x, GLfloat y) { glVertex4f(x, y, 0, 1); }
@@ -255,21 +261,27 @@ static inline float plane_dist(const float *v, int k)
     }
 }
 
+/* Bit k set when the vertex is outside plane k. w + (x, y, z) and
+ * w - (x, y, z) are compared with 0 in one go each. */
 static int outcode(const float *v)
 {
-    int code = 0;
-    for (int k = 0; k < NPLANES; k++)
-        if (plane_dist(v, k) < 0)
-            code |= 1 << k;
+    __m128 p = _mm_load_ps(v), w = _mm_shuffle_ps(p, p, 0xFF), zero = _mm_setzero_ps();
+    int plus = _mm_movemask_ps(_mm_cmplt_ps(_mm_add_ps(w, p), zero));     /* planes 0, 2, 4 */
+    int minus = _mm_movemask_ps(_mm_cmplt_ps(_mm_sub_ps(w, p), zero));    /* planes 1, 3, 5 */
+    int code = (plus & 1) | (minus & 1) << 1 | (plus & 2) << 1 | (minus & 2) << 2 |
+               (plus & 4) << 2 | (minus & 4) << 3;
+    if (plane_dist(v, 6) < 0)
+        code |= 1 << 6;
     return code;
 }
 
 static void lerp(struct cvert *out, const struct cvert *a, const struct cvert *b, float t)
 {
-    for (int i = 0; i < 4; i++) {
-        out->clip[i] = a->clip[i] + (b->clip[i] - a->clip[i]) * t;
-        out->color[i] = a->color[i] + (b->color[i] - a->color[i]) * t;
-    }
+    __m128 tt = _mm_set1_ps(t);
+    __m128 ac = _mm_load_ps(a->clip), bc = _mm_load_ps(b->clip);
+    __m128 acol = _mm_load_ps(a->color), bcol = _mm_load_ps(b->color);
+    _mm_store_ps(out->clip, _mm_add_ps(ac, _mm_mul_ps(_mm_sub_ps(bc, ac), tt)));
+    _mm_store_ps(out->color, _mm_add_ps(acol, _mm_mul_ps(_mm_sub_ps(bcol, acol), tt)));
 }
 
 /* Clip the polygon in place against every plane its vertices cross; returns its size. */

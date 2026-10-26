@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "gfx.h"
+#include "simd.h"
 
 #define MAX_DIM  4096
 
@@ -254,30 +255,118 @@ static int paeth(int a, int b, int c)
     return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
 }
 
+enum { F_NONE, F_SUB, F_UP, F_AVERAGE, F_PAETH };
+
+/* Up: every byte from the one above, 8 at a time. */
+static void unfilter_up(uint8_t *cur, const uint8_t *prev, uint32_t n)
+{
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8)
+        *(__m64_u *)(cur + i) = _mm_add_pi8(*(const __m64_u *)(cur + i), *(const __m64_u *)(prev + i));
+    for (; i < n; i++)
+        cur[i] = (uint8_t)(cur[i] + prev[i]);
+}
+
+/* Sub, Average and Paeth a byte at a time, for 1- and 2-byte pixels. */
+static void unfilter_bytes(uint8_t *cur, const uint8_t *prev, uint32_t n, int bpp, int type)
+{
+    for (uint32_t i = 0; i < n; i++) {
+        int a = i >= (uint32_t)bpp ? cur[i - bpp] : 0;
+        int b = prev[i];
+        int c = i >= (uint32_t)bpp ? prev[i - bpp] : 0;
+        if (type == F_SUB)
+            cur[i] = (uint8_t)(cur[i] + a);
+        else if (type == F_AVERAGE)
+            cur[i] = (uint8_t)(cur[i] + ((a + b) >> 1));
+        else
+            cur[i] = (uint8_t)(cur[i] + paeth(a, b, c));
+    }
+}
+
+/* A 3- or 4-byte pixel as bytes in the low half of a register; a 3-byte
+ * one is read whole only where a fourth byte follows inside the row. */
+static inline __m64 load_px(const uint8_t *p, int bpp, int last)
+{
+    uint32_t v = bpp == 4 ? *(const u32_any *)p
+               : last ? (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16
+               : *(const u32_any *)p & 0xFFFFFF;
+    return _mm_cvtsi32_si64((int)v);
+}
+
+static inline void store_px(uint8_t *p, __m64 px, int bpp)
+{
+    uint32_t v = (uint32_t)_mm_cvtsi64_si32(px);
+    if (bpp == 4) {
+        *(u32_any *)p = v;
+    } else {
+        p[0] = (uint8_t)v;
+        p[1] = (uint8_t)(v >> 8);
+        p[2] = (uint8_t)(v >> 16);
+    }
+}
+
+/*
+ * Sub, Average and Paeth for 3- and 4-byte pixels: a pixel at a time, its
+ * channels in the 16-bit lanes of MMX registers, the left neighbour being
+ * the pixel just done. Paeth picks a, b or c per channel by comparing
+ * pa = |b - c|, pb = |a - c| and pc = |a + b - 2c|. The caller runs simd_done().
+ */
+static void unfilter_pixels(uint8_t *cur, const uint8_t *prev, uint32_t n, int bpp, int type)
+{
+    const __m64 zero = _mm_setzero_si64();
+    __m64 a = zero, c = zero;           /* left and upper left, unpacked */
+    for (uint32_t i = 0; i + bpp <= n; i += bpp) {
+        int last = i + bpp == n;
+        __m64 b = _mm_unpacklo_pi8(load_px(prev + i, bpp, last), zero);
+        __m64 pred;
+        if (type == F_SUB) {
+            pred = a;
+        } else if (type == F_AVERAGE) {
+            pred = _mm_srli_pi16(_mm_add_pi16(a, b), 1);
+        } else {
+            __m64 bc = _mm_sub_pi16(b, c), ac = _mm_sub_pi16(a, c);
+            __m64 abc = _mm_add_pi16(bc, ac);
+            __m64 pa = _mm_max_pi16(bc, _mm_sub_pi16(zero, bc));
+            __m64 pb = _mm_max_pi16(ac, _mm_sub_pi16(zero, ac));
+            __m64 pc = _mm_max_pi16(abc, _mm_sub_pi16(zero, abc));
+            __m64 not_a = _mm_or_si64(_mm_cmpgt_pi16(pa, pb), _mm_cmpgt_pi16(pa, pc));
+            __m64 use_c = _mm_and_si64(not_a, _mm_cmpgt_pi16(pb, pc));
+            __m64 use_b = _mm_andnot_si64(use_c, not_a);
+            pred = _mm_or_si64(_mm_andnot_si64(not_a, a),
+                               _mm_or_si64(_mm_and_si64(use_b, b), _mm_and_si64(use_c, c)));
+        }
+        __m64 out = _mm_add_pi8(load_px(cur + i, bpp, last), _mm_packs_pu16(pred, zero));
+        store_px(cur + i, out, bpp);
+        a = _mm_unpacklo_pi8(out, zero);
+        c = b;
+    }
+}
+
 /* Undo the per-row filters in place; rows are 1 filter byte + stride bytes. */
 static int unfilter(uint8_t *data, int h, uint32_t stride, int bpp)
 {
-    uint8_t *prev = NULL;
-    for (int y = 0; y < h; y++) {
+    uint8_t *zeros = calloc(1, stride + 1);     /* what the first row sees above it */
+    if (!zeros)
+        return -1;
+    const uint8_t *prev = zeros;
+    int ok = 1;
+    for (int y = 0; y < h && ok; y++) {
         uint8_t *row = data + (uint32_t)y * (stride + 1);
         int type = row[0];
         uint8_t *cur = row + 1;
-        for (uint32_t i = 0; i < stride; i++) {
-            int a = i >= (uint32_t)bpp ? cur[i - bpp] : 0;
-            int b = prev ? prev[i] : 0;
-            int c = prev && i >= (uint32_t)bpp ? prev[i - bpp] : 0;
-            switch (type) {
-            case 0: break;
-            case 1: cur[i] = (uint8_t)(cur[i] + a); break;
-            case 2: cur[i] = (uint8_t)(cur[i] + b); break;
-            case 3: cur[i] = (uint8_t)(cur[i] + ((a + b) >> 1)); break;
-            case 4: cur[i] = (uint8_t)(cur[i] + paeth(a, b, c)); break;
-            default: return -1;
-            }
-        }
+        if (type > F_PAETH)
+            ok = 0;
+        else if (type == F_UP)
+            unfilter_up(cur, prev, stride);
+        else if (type != F_NONE && bpp >= 3)
+            unfilter_pixels(cur, prev, stride, bpp, type);
+        else if (type != F_NONE)
+            unfilter_bytes(cur, prev, stride, bpp, type);
         prev = cur;
     }
-    return 0;
+    simd_done();
+    free(zeros);
+    return ok ? 0 : -1;
 }
 
 struct image *image_decode_png(const uint8_t *p, uint32_t n)

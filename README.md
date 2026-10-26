@@ -27,6 +27,14 @@ Blaster 16 and HD Audio sound, and a layer that runs DOS programs in the
 terminal. It boots with GRUB (Multiboot) from an ISO image, straight into the
 desktop.
 
+fluxOS needs a **Pentium III** or another processor with SSE (an Athlon XP, a
+Pentium 4 or anything newer). The whole system is built for it: the kernel
+moves pages and framebuffer lines through the SSE registers, the C library
+copies with them, GL transforms and lights vertices four lanes at a time, and
+the desktop, browser and image decoders blend and convert pixels in MMX
+registers with the integer instructions SSE added. On an older processor it
+stops at boot and says why.
+
 ## Features
 
 **Kernel**
@@ -35,9 +43,14 @@ desktop.
 - Preemptive round-robin scheduler (PIT at 100 Hz) with sleep/wait queues.
 - Processes: `fork`, `execve` (static ELF32 and `#!` scripts), `exit`/
   `waitpid`, process groups, signals (`kill`, `SIGINT`, `SIGPIPE`, fault
-  signals; no user handlers), lazy x87 FPU switching (SSE is not supported).
+  signals; no user handlers), lazy FPU and SSE switching (FXSAVE/FXRSTOR).
+- Processor check at boot (a Pentium III with SSE is the minimum), and a
+  write-combining framebuffer through the page attribute table (`pat=off`
+  keeps it uncached).
 - Memory: bitmap frame allocator, paging (first GiB identity-mapped, 4 KiB
-  user pages), growing user stack, `sbrk` heaps, first-fit kernel heap.
+  user pages), growing user stack, `sbrk` heaps, first-fit kernel heap. Pages
+  are cleared and copied (for `fork`) with SSE, the copies streamed past the
+  caches.
 - VFS over an in-memory filesystem unpacked from a ustar initrd at boot, with
   `/dev/{tty,console,null,zero,random,urandom}`, pipes and pseudo-terminals.
   Started from an installed disk (`root=UUID=...`), its FAT32 partition is the
@@ -261,8 +274,10 @@ keeps running), or from `file://`.
   scanline rasterizer. `FGL_NO_RADEON`, `FGL_NO_TDFX`, `FGL_SOFTWARE`,
   `FLUXGL_DRIVER=radeon|tdfx|soft` and `LIBGL_ALWAYS_SOFTWARE` choose.
 - `fglCreateContext`, `fglMakeCurrent`, `fglResize` and `fglSwapBuffers` play
-  GLX's part. A `<math.h>` on the x87 is included; programs using GL or math
-  are built with `USER_FP_CFLAGS`, the rest of user space is integer-only.
+  GLX's part. Matrices, vertex transformation, lighting and clipping use SSE;
+  the software rasterizer sets up its depth and colour planes in one SSE
+  register and fills spans two pixels at a time with MMX. A `<math.h>` is
+  included: floats in SSE, doubles on the x87 (SSE1 has no doubles).
 
 **Userland** (`/bin`): 7z basename beep cat chmod clear cp date desktop df dirname
 dmesg dos echo env fetch fluxinstall free fsh grep halt head hexdump host
@@ -297,7 +312,8 @@ sudo apt install build-essential grub-pc-bin grub-common xorriso mtools qemu-sys
 ```
 
 No cross compiler is needed: everything is built with the host GCC using `-m32
--ffreestanding`, and nothing links against libgcc or the host libc. The first
+-march=pentium3 -ffreestanding`, and nothing links against libgcc or the host
+libc. The first
 `make` downloads Debian 12's GRUB 2.06 into `grub-2.06/` (checked against
 fixed SHA-256 hashes; nothing is installed), because GRUB 2.12 reboots some
 older PCs right after "Welcome to GRUB!". `make GRUB=/ GRUB_DEP=` uses the
@@ -319,16 +335,18 @@ make run-usb    # disk as a USB stick on EHCI, keyboard and mouse on UHCI
 make clean      # removes build/ and the ISO; the disk images are kept
 ```
 
-`make run QEMU_NET="-nic user,model=ne2k_pci -device intel-hda -device
-hda-duplex"` adds HD Audio. To boot real hardware or another VM, write
+The QEMU targets emulate a Pentium III (`QEMU_CPU=-cpu pentium3`), so
+anything newer that slipped into the build would show up there. `make run
+QEMU_NET="-nic user,model=ne2k_pci -device intel-hda -device hda-duplex"` adds
+HD Audio. To boot real hardware or another VM, write
 `fluxOS.iso` to a USB stick or attach it as a CD-ROM and boot in **legacy
 BIOS** mode (UEFI is untested). The default entry starts the desktop at
 1024x768; **fluxOS (text console)** boots to the shell. In QEMU the mouse
 needs no grabbing; elsewhere click into the VM window.
 
 For the 3dfx driver and accelerated GL, give the machine a Voodoo Banshee or
-Voodoo3 (86Box emulates both; QEMU has none, so GL uses the software
-renderer). fluxOS still starts in the BIOS mode: switch drivers in Display
+Voodoo3 (QEMU has none, so GL uses the software renderer there; 86Box emulates
+both, but no processor with SSE, so fluxOS no longer starts in it). fluxOS still starts in the BIOS mode: switch drivers in Display
 Properties, or add `video=1024x768x16@85` to the kernel command line.
 
 ## Installing to a hard disk
@@ -431,7 +449,10 @@ LBA order, merging neighbours, then issues one FLUSH CACHE.
 
 **Graphics.** GRUB sets the video mode. The kernel maps the framebuffer above
 3 GiB with 4 MiB pages; `fbmap` maps it into a process as device memory, which
-`fork` shares and `exit` never frees. A mode change in the 3dfx or Radeon driver
+`fork` shares and `exit` never frees. That mapping is write-combining: the
+kernel reprograms PAT entry 1 (normally write-through) to write-combining, so
+PWT alone selects it, and the desktop's streaming stores reach the card in
+bursts. A mode change in the 3dfx or Radeon driver
 points `fb` at the new screen and the desktop rebuilds its back buffer
 (`wm_reconfigure`).
 
@@ -441,13 +462,21 @@ handler copies a half-buffer into the DMA buffer, padding with silence. The DSP
 pauses once both halves are silent. The PC speaker's queue advances in the
 timer interrupt.
 
-**The FPU.** CR0.TS is set whenever the CPU's process isn't the one whose
-registers the FPU holds. Its first FPU instruction raises #NM, and the handler
-swaps the 108-byte x87 state with FNSAVE/FRSTOR. SSE is never enabled.
+**The FPU and SSE.** CR0.TS is set whenever the CPU's process isn't the one
+whose registers the FPU holds. Its first x87, MMX or SSE instruction raises
+#NM, and the handler swaps the 512-byte FXSAVE state; a process starts from a
+clean image (default control words, every register zero). CR4.OSXMMEXCPT turns
+unmasked SIMD exceptions into SIGFPE. The kernel's C code stays off these
+registers (`-mgeneral-regs-only`); `kernel/sse.S` borrows four XMM registers
+for page and framebuffer moves with interrupts off, saving them on its stack
+and putting CR0.TS back, so whichever process owns the FPU never notices.
+User space does float arithmetic in SSE and doubles on the x87; code using
+MMX (which shares the x87's registers) runs EMMS before returning.
 
 **The desktop** composes the screen in a back buffer: changes record damaged
 rectangles, repainted bottom to top once per pass of the event loop and copied
-to the framebuffer. Each window has its own buffer. One `poll` covers
+to the framebuffer (with streaming stores at 32 bpp, and four pixels at a time
+in MMX registers at 15/16 bpp). Each window has its own buffer. One `poll` covers
 `/dev/input` and every terminal's pty master.
 
 **Networking.** Interrupt handlers pass frames up the stack and TCP timers run
@@ -458,12 +487,13 @@ dropped and resent.
 
 **Pictures.** The JPEG decoder uses a 32-bit bit buffer with a 9-bit Huffman
 lookahead and an integer IDCT; progressive files keep all coefficients until
-the last scan, chroma is upsampled with a triangle filter, and thumbnails use
-only each block's DC coefficient. The wallpaper is drawn once into a
+the last scan, chroma is upsampled with a triangle filter and converted to RGB
+four pixels at a time (MMX), and thumbnails use only each block's DC
+coefficient. PNG's Up filter adds 8 bytes at a time and Average and Paeth work
+a whole pixel per step; the JPEG encoder's DCT is PMADDWD multiply-adds. The wallpaper is drawn once into a
 screen-sized surface so repaints are copies. GIF is decoded with LZW into a
 palette image. SVG shapes are flattened to polygons and filled by a scanline
-rasteriser with four sub-scanlines per pixel (svg.c, the one browser file that
-uses the FPU besides the JavaScript engine).
+rasteriser with four sub-scanlines per pixel.
 
 **The browser** keeps a page in arenas: document tree and style sheets, computed
 styles (rebuilt when a style sheet arrives), and layout (rebuilt when a picture
@@ -480,7 +510,8 @@ user range and page tables first.
 fluxOS supports a single CPU. The root filesystem lives in RAM; only what you
 write to a mounted FAT volume persists. Permission bits are cosmetic apart from
 the exec bit, there is one user, and signals cannot have user handlers or jobs
-be stopped (no ^Z). SSE instructions raise `SIGILL`.
+be stopped (no ^Z). The FPU state is saved with FXSAVE, so AVX and later
+cannot be used.
 
 - **IDE:** DMA needs a legacy-mode PCI controller with bus mastering and a
   drive the firmware put in a DMA mode; anything else uses PIO.

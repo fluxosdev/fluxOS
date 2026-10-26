@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "web.h"
+#include "simd.h"
 
 #ifndef FONT_FILE
 #define FONT_FILE "/usr/share/fonts/web.fnt"
@@ -144,17 +145,6 @@ const struct wfont *wfont_get(int family, int bold, int italic, int px)
     return best;
 }
 
-/* Each channel: (under * (15 - cov) + c * cov) / 15, rounded. */
-static uint32_t blend_coverage(uint32_t under, uint32_t c, int cov)
-{
-    uint32_t out = 0;
-    for (int shift = 0; shift < 24; shift += 8) {
-        uint32_t u = under >> shift & 0xFF, v = c >> shift & 0xFF;
-        out |= ((u * (uint32_t)(15 - cov) + v * (uint32_t)cov + 7) / 15) << shift;
-    }
-    return out;
-}
-
 int wfont_height(const struct wfont *f) { return f->height; }
 int wfont_ascent(const struct wfont *f) { return f->ascent; }
 int wfont_size(const struct wfont *f) { return f->px; }
@@ -176,6 +166,7 @@ int wfont_draw(struct surface *s, const struct wfont *f, int x, int y, const cha
     int pen = 0;
     struct rect clip = s->clip;
     c &= 0xFFFFFF;
+    __m64 cv = px_unpack(c);            /* blended in MMX registers (simd.h) */
     while (str < end) {
         const struct wglyph *g = &f->glyphs[glyph_index(utf8_next(&str, end))];
         int gx = x + ((pen + 8) >> 4) + g->xoff, gy = y + g->top, stride = (g->width + 1) / 2;
@@ -198,9 +189,10 @@ int wfont_draw(struct surface *s, const struct wfont *f, int x, int y, const cha
                 if (cov == 15)
                     dst[px] = c;
                 else if (cov)
-                    dst[px] = blend_coverage(dst[px], c, cov);
+                    dst[px] = px_blend15(dst[px], cv, cov) & 0xFFFFFF;
             }
         }
     }
+    simd_done();
     return (pen + 8) >> 4;
 }

@@ -1,21 +1,94 @@
 /*
  * Freestanding string routines, compiled into both the kernel and libc.
+ *
+ * memcpy, memmove and memset move words with the x86 string instructions.
+ * Built for user space, with SSE, larger blocks go 64 bytes at a time
+ * through the XMM registers, and blocks bigger than a Pentium III's level 2
+ * cache are streamed past it (MOVNTPS) so they do not flush everything
+ * else out. The kernel's build has no SSE: it keeps off those registers.
  */
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
+
+#if defined(__SSE__) && defined(__i386__)
+#include <xmmintrin.h>
+#define USE_SSE
+#define SSE_MIN    256                  /* smaller blocks: the string instructions */
+#define STREAM_MIN (256 * 1024)         /* the L2 cache of a Coppermine */
+#endif
+
+/* A word that may sit at any address. */
+typedef uint32_t __attribute__((may_alias, aligned(1))) uword;
+
+static inline void movs(unsigned char **d, const unsigned char **s, size_t n)
+{
+    size_t words = n >> 2, bytes = n & 3;
+    __asm__ volatile("rep movsl" : "+D"(*d), "+S"(*s), "+c"(words) : : "memory");
+    __asm__ volatile("rep movsb" : "+D"(*d), "+S"(*s), "+c"(bytes) : : "memory");
+}
+
+#ifdef USE_SSE
+/* Copy the 64-byte blocks of n >= SSE_MIN bytes, after aligning d to 16
+ * bytes; returns the bytes left over, under 64. */
+static size_t copy_blocks(unsigned char **pd, const unsigned char **ps, size_t n)
+{
+    size_t head = -(uintptr_t)*pd & 15;
+    movs(pd, ps, head);
+    n -= head;
+    float *d = (float *)*pd;
+    const float *s = (const float *)*ps;
+    size_t blocks = n >> 6;
+    if (n >= STREAM_MIN) {
+        for (; blocks; blocks--, d += 16, s += 16) {
+            _mm_prefetch((const char *)(s + 128), _MM_HINT_NTA);
+            __m128 a = _mm_loadu_ps(s), b = _mm_loadu_ps(s + 4);
+            __m128 c = _mm_loadu_ps(s + 8), e = _mm_loadu_ps(s + 12);
+            _mm_stream_ps(d, a);
+            _mm_stream_ps(d + 4, b);
+            _mm_stream_ps(d + 8, c);
+            _mm_stream_ps(d + 12, e);
+        }
+        _mm_sfence();
+    } else if (((uintptr_t)s & 15) == 0) {
+        for (; blocks; blocks--, d += 16, s += 16) {
+            __m128 a = _mm_load_ps(s), b = _mm_load_ps(s + 4);
+            __m128 c = _mm_load_ps(s + 8), e = _mm_load_ps(s + 12);
+            _mm_store_ps(d, a);
+            _mm_store_ps(d + 4, b);
+            _mm_store_ps(d + 8, c);
+            _mm_store_ps(d + 12, e);
+        }
+    } else {
+        for (; blocks; blocks--, d += 16, s += 16) {
+            __m128 a = _mm_loadu_ps(s), b = _mm_loadu_ps(s + 4);
+            __m128 c = _mm_loadu_ps(s + 8), e = _mm_loadu_ps(s + 12);
+            _mm_store_ps(d, a);
+            _mm_store_ps(d + 4, b);
+            _mm_store_ps(d + 8, c);
+            _mm_store_ps(d + 12, e);
+        }
+    }
+    *pd = (unsigned char *)d;
+    *ps = (const unsigned char *)s;
+    return n & 63;
+}
+#endif
 
 void *memcpy(void *dst, const void *src, size_t n)
 {
     unsigned char *d = dst;
     const unsigned char *s = src;
-    if (((size_t)d & 3) == 0 && ((size_t)s & 3) == 0) {
-        while (n >= 4) {
-            *(unsigned int *)d = *(const unsigned int *)s;
-            d += 4;
-            s += 4;
-            n -= 4;
-        }
+#ifdef USE_SSE
+    if (n >= SSE_MIN)
+        n = copy_blocks(&d, &s, n);
+#endif
+    if (n >= 32) {
+        movs(&d, &s, n);
+        return dst;
     }
+    for (; n >= 4; n -= 4, d += 4, s += 4)
+        *(uword *)d = *(const uword *)s;
     while (n--)
         *d++ = *s++;
     return dst;
@@ -27,32 +100,79 @@ void *memmove(void *dst, const void *src, size_t n)
     const unsigned char *s = src;
     if (d == s || n == 0)
         return dst;
-    if (d < s) {
-        /* memcpy copies front to back, which is safe when moving down. */
-        memcpy(d, s, n);
-    } else {
-        d += n;
-        s += n;
-        while (n--)
-            *--d = *--s;
+    if (d < s || d >= s + n) {
+        /* memcpy copies front to back, which is safe when moving down:
+         * every block is read before anything is written over it. */
+        return memcpy(d, s, n);
     }
+    d += n;
+    s += n;
+#ifdef USE_SSE
+    if (n >= SSE_MIN) {
+        for (; (uintptr_t)d & 15; n--)
+            *--d = *--s;
+        for (; n >= 64; n -= 64) {
+            d -= 64;
+            s -= 64;
+            __m128 a = _mm_loadu_ps((const float *)s), b = _mm_loadu_ps((const float *)(s + 16));
+            __m128 c = _mm_loadu_ps((const float *)(s + 32)), e = _mm_loadu_ps((const float *)(s + 48));
+            _mm_store_ps((float *)(d + 48), e);
+            _mm_store_ps((float *)(d + 32), c);
+            _mm_store_ps((float *)(d + 16), b);
+            _mm_store_ps((float *)d, a);
+        }
+    }
+#endif
+    for (; n >= 4; n -= 4) {
+        d -= 4;
+        s -= 4;
+        *(uword *)d = *(const uword *)s;
+    }
+    while (n--)
+        *--d = *--s;
     return dst;
 }
 
 void *memset(void *dst, int c, size_t n)
 {
     unsigned char *d = dst;
-    unsigned char v = (unsigned char)c;
-    if (((size_t)d & 3) == 0) {
-        unsigned int w = v * 0x01010101u;
-        while (n >= 4) {
-            *(unsigned int *)d = w;
-            d += 4;
-            n -= 4;
+    uint32_t w = (unsigned char)c * 0x01010101u;
+#ifdef USE_SSE
+    if (n >= SSE_MIN) {
+        for (; (uintptr_t)d & 15; n--)
+            *d++ = (unsigned char)c;
+        __m128 v = _mm_load_ss((const float *)&w);
+        v = _mm_shuffle_ps(v, v, 0);
+        float *f = (float *)d;
+        if (n >= STREAM_MIN) {
+            for (; n >= 64; n -= 64, f += 16) {
+                _mm_stream_ps(f, v);
+                _mm_stream_ps(f + 4, v);
+                _mm_stream_ps(f + 8, v);
+                _mm_stream_ps(f + 12, v);
+            }
+            _mm_sfence();
+        } else {
+            for (; n >= 64; n -= 64, f += 16) {
+                _mm_store_ps(f, v);
+                _mm_store_ps(f + 4, v);
+                _mm_store_ps(f + 8, v);
+                _mm_store_ps(f + 12, v);
+            }
         }
+        d = (unsigned char *)f;
     }
+#endif
+    if (n >= 32) {
+        size_t words = n >> 2, bytes = n & 3;
+        __asm__ volatile("rep stosl" : "+D"(d), "+c"(words) : "a"(w) : "memory");
+        __asm__ volatile("rep stosb" : "+D"(d), "+c"(bytes) : "a"(w) : "memory");
+        return dst;
+    }
+    for (; n >= 4; n -= 4, d += 4)
+        *(uword *)d = w;
     while (n--)
-        *d++ = v;
+        *d++ = (unsigned char)c;
     return dst;
 }
 

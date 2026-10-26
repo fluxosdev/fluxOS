@@ -35,14 +35,23 @@ void gl_mat_identity(float *m)
     m[0] = m[5] = m[10] = m[15] = 1;
 }
 
+/* out = a b, any of them the same matrix. Column j of the product is a's
+ * columns weighted by column j of b: four columns of four lanes each. The
+ * matrices may come from the program, so they need not be aligned. */
 void gl_mat_mul(float *out, const float *a, const float *b)
 {
-    float r[16];
+    __m128 a0 = _mm_loadu_ps(a), a1 = _mm_loadu_ps(a + 4);
+    __m128 a2 = _mm_loadu_ps(a + 8), a3 = _mm_loadu_ps(a + 12);
+    __m128 r[4];
+    for (int col = 0; col < 4; col++) {
+        const float *bc = b + col * 4;
+        r[col] = _mm_add_ps(_mm_add_ps(_mm_add_ps(_mm_mul_ps(a0, _mm_set1_ps(bc[0])),
+                                                  _mm_mul_ps(a1, _mm_set1_ps(bc[1]))),
+                                       _mm_mul_ps(a2, _mm_set1_ps(bc[2]))),
+                            _mm_mul_ps(a3, _mm_set1_ps(bc[3])));
+    }
     for (int col = 0; col < 4; col++)
-        for (int row = 0; row < 4; row++)
-            r[col * 4 + row] = a[row] * b[col * 4] + a[4 + row] * b[col * 4 + 1] +
-                               a[8 + row] * b[col * 4 + 2] + a[12 + row] * b[col * 4 + 3];
-    memcpy(out, r, sizeof(r));
+        _mm_storeu_ps(out + col * 4, r[col]);
 }
 
 float *gl_top_matrix(struct fgl_context *c)

@@ -19,6 +19,8 @@ CC      ?= gcc
 LD      ?= ld
 AR      ?= ar
 QEMU    ?= qemu-system-i386
+# The oldest processor fluxOS runs on, so that testing catches anything newer.
+QEMU_CPU ?= -cpu pentium3
 # GRUB 2.06 from Debian 12, fetched once by tools/fetch-grub.sh (2.12 reboots
 # some older PCs right after "Welcome to GRUB!"). For the host's own GRUB:
 #   make GRUB=/ GRUB_DEP=
@@ -41,24 +43,35 @@ MKFS_FAT ?= $(shell command -v mkfs.fat 2>/dev/null || ls /usr/sbin/mkfs.fat /sb
 
 GCC_INC := $(shell $(CC) -print-file-name=include)
 
-CFLAGS_COMMON := -m32 -march=i686 -std=gnu11 -O2 -g \
+# fluxOS needs a Pentium III: everything is built for its instruction set,
+# SSE included (kernel/cpu.c stops the boot on anything older).
+CFLAGS_COMMON := -m32 -march=pentium3 -std=gnu11 -O2 -g \
 	-ffreestanding -fno-pie -fno-pic -fno-stack-protector -fno-builtin \
-	-nostdinc -isystem $(GCC_INC) -mgeneral-regs-only \
+	-nostdinc -isystem $(GCC_INC) \
 	-fno-asynchronous-unwind-tables -fno-strict-aliasing \
 	-fno-tree-loop-distribute-patterns \
 	-Wall -Wextra -Wno-unused-parameter -MMD -MP
 
-KERNEL_CFLAGS := $(CFLAGS_COMMON) -fno-omit-frame-pointer -Iinclude -Ikernel/include -Ikernel
-USER_CFLAGS   := $(CFLAGS_COMMON) -Iinclude -Iuser/include
-# User code that may use the x87 FPU (the kernel switches its state lazily):
-# the math library, the GL library and GL programs. No SSE: it is not enabled.
-USER_FP_CFLAGS := $(filter-out -mgeneral-regs-only,$(USER_CFLAGS)) -mfpmath=387 -mno-sse \
-	-fno-math-errno
+# The kernel's C code keeps off the FPU and SSE registers, which belong to
+# user processes (fpu.c switches them lazily); kernel/sse.S borrows the SSE
+# registers for bulk copies, saving what it touches.
+KERNEL_CFLAGS := $(CFLAGS_COMMON) -mgeneral-regs-only -fno-omit-frame-pointer \
+	-Iinclude -Ikernel/include -Ikernel
+# User code does float arithmetic on SSE (doubles stay on the x87, which
+# SSE1 cannot do) and may use the SSE and MMX intrinsics.
+USER_CFLAGS   := $(CFLAGS_COMMON) -mfpmath=sse -fno-math-errno -Iinclude -Iuser/include
+
+# What runs before kernel/cpu.c has checked the processor (the console, the
+# string routines and kmain) is built for any 386, so that an older machine
+# shows why it cannot run fluxOS instead of hanging on an i686 instruction.
+KERNEL_EARLY_OBJS := $(addprefix $(BUILD)/k/,kernel/kmain.o kernel/cpu.o kernel/kprintf.o \
+	kernel/vga.o kernel/fb.o kernel/serial.o lib/string.o lib/vsnprintf.o lib/font8x16.o)
+$(KERNEL_EARLY_OBJS): KERNEL_CFLAGS += -march=i386 -mtune=pentium3
 
 LDFLAGS_COMMON := -m elf_i386 -nostdlib -z noexecstack --no-warn-rwx-segments
 
 # ---- kernel ----
-KERNEL_SRCS := kernel/boot.S kernel/entry.S kernel/radeon_fw.S $(wildcard kernel/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c \
+KERNEL_SRCS := kernel/boot.S kernel/entry.S kernel/sse.S kernel/radeon_fw.S $(wildcard kernel/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c \
                lib/sha256.c
 KERNEL_OBJS := $(patsubst %,$(BUILD)/k/%.o,$(basename $(KERNEL_SRCS)))
 
@@ -69,11 +82,6 @@ CRT0      := $(BUILD)/u/user/libc/crt0.o
 LIBC      := $(BUILD)/libc.a
 GL_OBJS   := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/gl/*.c)))
 LIBGL     := $(BUILD)/libGL.a
-FP_OBJS   := $(BUILD)/u/user/libc/math.o $(GL_OBJS) $(BUILD)/u/user/desktop/gears.o \
-             $(BUILD)/u/user/desktop/js.o $(BUILD)/u/user/desktop/jslib.o \
-             $(BUILD)/u/user/desktop/jsre.o $(BUILD)/u/user/desktop/jsdom.o \
-             $(BUILD)/u/user/desktop/jslib2.o $(BUILD)/u/user/desktop/jsgc.o \
-             $(BUILD)/u/user/desktop/svg.o $(BUILD)/u/user/desktop/csscolor.o
 
 PROGS     := $(basename $(notdir $(wildcard user/bin/*.c)))
 FSH_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/fsh/*.c)))
@@ -123,8 +131,6 @@ $(BUILD)/u/%.o: %.c
 $(BUILD)/u/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
-
-$(FP_OBJS): USER_CFLAGS := $(USER_FP_CFLAGS)
 
 $(LIBC): $(LIBC_OBJS)
 	@rm -f $@
@@ -208,20 +214,20 @@ endif
 QEMU_NET  ?= -netdev user,id=net0 -device ne2k_pci,netdev=net0
 
 run: $(ISO) $(DISK)
-	$(QEMU) -m 1G -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK) $(QEMU_NET)
+	$(QEMU) $(QEMU_CPU) -m 1G -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK) $(QEMU_NET)
 
 run-kernel: $(TEXT_KERNEL) $(INITRD) $(DISK)
-	$(QEMU) -kernel $(TEXT_KERNEL) -initrd $(INITRD) -m 256M -serial stdio $(QEMU_DISK) $(QEMU_NET)
+	$(QEMU) $(QEMU_CPU) -kernel $(TEXT_KERNEL) -initrd $(INITRD) -m 256M -serial stdio $(QEMU_DISK) $(QEMU_NET)
 
 # Boot fluxdisk.img on its own, after "fluxinstall /dev/hda".
 run-disk: $(DISK)
-	$(QEMU) -m 256M -serial stdio -boot c $(QEMU_DISK) $(QEMU_NET)
+	$(QEMU) $(QEMU_CPU) -m 256M -serial stdio -boot c $(QEMU_DISK) $(QEMU_NET)
 
 # On q35 "if=ide" drives and the CD sit on the chipset's AHCI controller.
 QEMU_XHCI ?= -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0
 
 run-q35: $(ISO) $(DISK)
-	$(QEMU) -M q35 -m 256M -serial stdio -boot d -cdrom $(ISO) \
+	$(QEMU) $(QEMU_CPU) -M q35 -m 256M -serial stdio -boot d -cdrom $(ISO) \
 		-drive file=$(DISK),format=raw,if=ide,index=0 $(QEMU_NET) $(QEMU_XHCI)
 
 QEMU_USB ?= -usb -device usb-kbd,bus=usb-bus.0 -device usb-mouse,bus=usb-bus.0 \
@@ -229,7 +235,7 @@ QEMU_USB ?= -usb -device usb-kbd,bus=usb-bus.0 -device usb-mouse,bus=usb-bus.0 \
 	-device usb-storage,bus=ehci.0,drive=stick
 
 run-usb: $(ISO) $(DISK)
-	$(QEMU) -m 256M -serial stdio -boot d -cdrom $(ISO) $(QEMU_NET) $(QEMU_USB)
+	$(QEMU) $(QEMU_CPU) -m 256M -serial stdio -boot d -cdrom $(ISO) $(QEMU_NET) $(QEMU_USB)
 
 clean:
 	rm -rf $(BUILD) $(ISO)

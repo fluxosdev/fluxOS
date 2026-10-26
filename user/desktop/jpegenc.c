@@ -1,13 +1,15 @@
 /*
  * A baseline JPEG encoder: 8-bit RGB in, a JFIF file out. 4:4:4 (no
  * chroma subsampling, so edges stay sharp), the standard quantization and
- * Huffman tables, and an integer DCT, since desktop code has no FPU.
+ * Huffman tables, and an exact integer DCT done as two passes of 16-bit
+ * multiply-adds on MMX (PMADDWD).
  */
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include "gfx.h"
+#include "simd.h"
 
 static const uint8_t zigzag[64] = {
     0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21,
@@ -44,7 +46,7 @@ static const uint8_t ac_vals[162] = {
 };
 
 /* DCT basis: 8192 * C(u)/2 * cos((2x+1)u*pi/16), so a 2D transform is two passes. */
-static const int16_t basis[8][8] = {
+static const int16_t basis[8][8] __attribute__((aligned(8))) = {
     { 2896, 2896, 2896, 2896, 2896, 2896, 2896, 2896 },
     { 4017, 3406, 2276, 799, -799, -2276, -3406, -4017 },
     { 3784, 1567, -1567, -3784, -3784, -1567, 1567, 3784 },
@@ -140,26 +142,52 @@ static void put_value(struct enc *e, int v, int n)
     put_bits(e, (uint32_t)(v < 0 ? v - 1 : v), n);     /* negatives in ones' complement */
 }
 
-/* One 8x8 block of samples (level-shifted) to the stream; returns the DC for the next. */
-static int encode_block(struct enc *e, const int *samples, const uint8_t *quant, int prev_dc)
+/* The two 32-bit lanes of a PMADDWD result added up. */
+static inline int hsum(__m64 v)
 {
-    int tmp[64], coef[64];
-    for (int y = 0; y < 8; y++)                         /* rows */
+    return _mm_cvtsi64_si32(v) + _mm_cvtsi64_si32(_mm_srli_si64(v, 32));
+}
+
+/* An eight-term dot product of 16-bit values: two PMADDWDs. */
+static inline int dot8(__m64 a0, __m64 a1, const __m64 *b)
+{
+    return hsum(_mm_add_pi32(_mm_madd_pi16(a0, b[0]), _mm_madd_pi16(a1, b[1])));
+}
+
+/*
+ * One 8x8 block of samples (level-shifted) to the stream; returns the DC
+ * for the next. recip holds 2^24 / quant, rounded up: multiplying by it
+ * divides exactly for coefficients this small.
+ */
+static int encode_block(struct enc *e, const int *samples, const uint8_t *quant, const uint32_t *recip,
+                        int prev_dc)
+{
+    const __m64 *b = (const __m64 *)basis;              /* row u: b[2u], b[2u + 1] */
+    /* Rows. The results take 17 bits, too many for PMADDWD, so they are
+     * kept as t >> 8 and t & 255, transposed for the column pass. */
+    int16_t hi[64] __attribute__((aligned(8))), lo[64] __attribute__((aligned(8)));
+    for (int y = 0; y < 8; y++) {
+        const int *s = samples + y * 8;
+        __m64 s0 = _mm_packs_pi32(_mm_set_pi32(s[1], s[0]), _mm_set_pi32(s[3], s[2]));
+        __m64 s1 = _mm_packs_pi32(_mm_set_pi32(s[5], s[4]), _mm_set_pi32(s[7], s[6]));
         for (int u = 0; u < 8; u++) {
-            int sum = 0;
-            for (int x = 0; x < 8; x++)
-                sum += samples[y * 8 + x] * basis[u][x];
-            tmp[y * 8 + u] = (sum + 32) >> 6;
+            int t = (dot8(s0, s1, b + 2 * u) + 32) >> 6;
+            hi[u * 8 + y] = (int16_t)(t >> 8);
+            lo[u * 8 + y] = (int16_t)(t & 255);
         }
-    for (int u = 0; u < 8; u++)                         /* columns */
+    }
+    int coef[64];
+    for (int u = 0; u < 8; u++) {                       /* columns */
+        const __m64 *h = (const __m64 *)(hi + u * 8), *l = (const __m64 *)(lo + u * 8);
         for (int v = 0; v < 8; v++) {
-            int sum = 0;
-            for (int y = 0; y < 8; y++)
-                sum += tmp[y * 8 + u] * basis[v][y];
+            int sum = 256 * dot8(h[0], h[1], b + 2 * v) + dot8(l[0], l[1], b + 2 * v);
             sum = (sum + (1 << 19)) >> 20;
-            int q = quant[v * 8 + u];
-            coef[v * 8 + u] = sum >= 0 ? (sum + q / 2) / q : -((-sum + q / 2) / q);
+            uint32_t mag = (uint32_t)(sum >= 0 ? sum : -sum) + quant[v * 8 + u] / 2;
+            int c = (int)(((uint64_t)mag * recip[v * 8 + u]) >> 24);
+            coef[v * 8 + u] = sum >= 0 ? c : -c;
         }
+    }
+    simd_done();
     int diff = coef[0] - prev_dc, n = nbits(diff);
     put_bits(e, e->dc[n].code, e->dc[n].len);
     if (n)
@@ -211,11 +239,14 @@ int jpeg_encode_file(const char *path, const uint32_t *rgb, int stride, int w, i
     make_codes(e->dc, dc_bits, dc_vals);
     make_codes(e->ac, ac_bits, ac_vals);
     uint8_t ql[64], qc[64], tab[2][64];
+    uint32_t rl[64], rc[64];
     scale_table(ql, q_luma, quality);
     scale_table(qc, q_chroma, quality);
     for (int i = 0; i < 64; i++) {
         tab[0][i] = ql[zigzag[i]];
         tab[1][i] = qc[zigzag[i]];
+        rl[i] = ((1u << 24) + ql[i] - 1) / ql[i];
+        rc[i] = ((1u << 24) + qc[i] - 1) / qc[i];
     }
     put_marker(e, 0xD8, NULL, -1);
     static const uint8_t jfif[] = { 'J', 'F', 'I', 'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0 };
@@ -255,7 +286,7 @@ int jpeg_encode_file(const char *path, const uint32_t *rgb, int stride, int w, i
                     blk[2][y * 8 + x] = ((32768 * r - 27439 * g - 5329 * b + 32768) >> 16);
                 }
             for (int c = 0; c < 3; c++)
-                dc[c] = encode_block(e, blk[c], c ? qc : ql, dc[c]);
+                dc[c] = encode_block(e, blk[c], c ? qc : ql, c ? rc : rl, dc[c]);
         }
     if (e->bitcnt)
         put_bits(e, 0x7F, 8 - e->bitcnt);               /* pad with ones */

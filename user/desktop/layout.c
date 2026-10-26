@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "web.h"
+#include "simd.h"
 
 #define MAX_COLS   128
 #define MAX_ROWS   4096
@@ -3290,17 +3291,21 @@ const struct hotspot *layout_hit(const struct hotspot *h, int n, int x, int y)
 
 /* ---- painting ---- */
 
-static uint32_t blend(uint32_t under, uint32_t over)
+/* over (0xAARRGGBB) on under: (o * a + u * (255 - a)) / 255 in each
+ * channel, in MMX registers, so loops of these end with simd_done(). */
+static inline uint32_t blend_px(uint32_t under, uint32_t over)
 {
     uint32_t a = ALPHA(over);
     if (a == 255)
         return over & 0xFFFFFF;
-    uint32_t out = 0;
-    for (int sh = 0; sh < 24; sh += 8) {
-        uint32_t u = under >> sh & 0xFF, o = over >> sh & 0xFF;
-        out |= ((o * a + u * (255 - a)) / 255) << sh;
-    }
-    return out;
+    return px_blend255(under, over, a, 0) & 0xFFFFFF;
+}
+
+static uint32_t blend(uint32_t under, uint32_t over)
+{
+    uint32_t c = blend_px(under, over);
+    simd_done();
+    return c;
 }
 
 static void fill_blend(struct surface *s, int x, int y, int w, int h, uint32_t color, int dash)
@@ -3325,9 +3330,10 @@ static void fill_blend(struct surface *s, int x, int y, int w, int h, uint32_t c
                 if (along % period >= period / 2)
                     continue;
             }
-            row[i] = blend(row[i], color);
+            row[i] = blend_px(row[i], color);
         }
     }
+    simd_done();
 }
 
 static unsigned isqrt(unsigned v)
@@ -3433,15 +3439,16 @@ static void fill_rich(struct surface *s, const struct ditem *d, int x, int y)
             uint32_t px = row[i];
             if (in) {
                 if (ALPHA(d->color))
-                    px = blend(px, with_alpha(d->color, in));
+                    px = blend_px(px, with_alpha(d->color, in));
                 if (d->grad)
-                    px = blend(px, with_alpha(d->grad == 1 ? rowc : lerp(d->g0, d->g1, bi, d->w), in));
+                    px = blend_px(px, with_alpha(d->grad == 1 ? rowc : lerp(d->g0, d->g1, bi, d->w), in));
             }
             if (ring && out > in)
-                px = blend(px, with_alpha(d->ring_color, out - in));
+                px = blend_px(px, with_alpha(d->ring_color, out - in));
             row[i] = px & 0xFFFFFF;
         }
     }
+    simd_done();
 }
 
 /* An image with its corners rounded off. */
@@ -3463,9 +3470,10 @@ static void draw_image_round(struct surface *s, const struct ditem *d, int x, in
             if (a == 255)
                 dst[i] = p & 0xFFFFFF;
             else if (a)
-                dst[i] = blend(dst[i], (p & 0xFFFFFF) | a << 24);
+                dst[i] = blend_px(dst[i], (p & 0xFFFFFF) | a << 24);
         }
     }
+    simd_done();
 }
 
 void draw_image_scaled(struct surface *s, const struct image *img, int x, int y, int w, int h)
@@ -3483,9 +3491,10 @@ void draw_image_scaled(struct surface *s, const struct image *img, int x, int y,
             if (a == 255)
                 dst[i] = p & 0xFFFFFF;
             else if (a)
-                dst[i] = blend(dst[i], p);
+                dst[i] = blend_px(dst[i], p);
         }
     }
+    simd_done();
 }
 
 static void disc(struct surface *s, int x, int y, int d, uint32_t color, int hollow)

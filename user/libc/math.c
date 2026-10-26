@@ -1,8 +1,10 @@
 /*
- * The math library, on the x87 FPU's own instructions: FSQRT, FSIN, FCOS,
- * FPTAN and FPATAN directly, logarithms with FYL2X and powers of two with
- * F2XM1 and FSCALE. Built with USER_FP_CFLAGS: the rest of the C library
- * may not touch the FPU.
+ * The math library. Doubles use the x87 FPU's own instructions: FSQRT,
+ * FSIN, FCOS, FPTAN and FPATAN directly, logarithms with FYL2X and powers
+ * of two with F2XM1 and FSCALE. Floats live in SSE registers: their square
+ * root, absolute value and rounding stay there, and the rest go through
+ * the double versions. (math.h makes sqrt, sqrtf, fabs and fabsf inline;
+ * the parentheses below keep those macros off the definitions.)
  */
 #include <math.h>
 
@@ -11,7 +13,7 @@
 #define CW_UP         0x0800
 #define CW_CHOP       0x0C00
 
-double sqrt(double x)
+double (sqrt)(double x)
 {
     double r;
     __asm__("fsqrt" : "=t"(r) : "0"(x));
@@ -61,7 +63,7 @@ double acos(double x)
     return atan2(sqrt(1.0 - x * x), x);
 }
 
-double fabs(double x)
+double (fabs)(double x)
 {
     double r;
     __asm__("fabs" : "=t"(r) : "0"(x));
@@ -155,12 +157,32 @@ double pow(double x, double y)
     return fmod(iy, 2.0) != 0 ? -r : r;
 }
 
-float sqrtf(float x) { return (float)sqrt(x); }
+float (sqrtf)(float x) { return __builtin_sqrtf(x); }
 float sinf(float x) { return (float)sin(x); }
 float cosf(float x) { return (float)cos(x); }
 float tanf(float x) { return (float)tan(x); }
 float atan2f(float y, float x) { return (float)atan2(y, x); }
 float powf(float x, float y) { return (float)pow(x, y); }
-float fabsf(float x) { return (float)fabs(x); }
-float floorf(float x) { return (float)floor(x); }
-float ceilf(float x) { return (float)ceil(x); }
+float (fabsf)(float x) { return __builtin_fabsf(x); }
+
+/* Without SSE4's ROUNDSS: truncate with CVTTSS2SI and step down or up.
+ * From 2^23 on every float is already whole. */
+float floorf(float x)
+{
+    if (!(fabsf(x) < 8388608.0f))
+        return x;                       /* whole, infinite or NaN */
+    float t = (float)(int)x;
+    if (t == x)
+        return x;                       /* keeps -0 */
+    return t > x ? t - 1 : t;
+}
+
+float ceilf(float x)
+{
+    if (!(fabsf(x) < 8388608.0f))
+        return x;
+    float t = (float)(int)x;
+    if (t == x)
+        return x;
+    return t < x ? t + 1 : t;
+}

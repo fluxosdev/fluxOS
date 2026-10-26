@@ -1,8 +1,10 @@
-/* Clipped drawing primitives, text and Windows 95 bevels. */
+/* Clipped drawing primitives, text and Windows 95 bevels. Fills go 16
+ * bytes at a time (memset32), and blending uses MMX (simd.h). */
 #include <stdlib.h>
 #include <string.h>
 #include <flux/font.h>
 #include "gfx.h"
+#include "simd.h"
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -75,8 +77,7 @@ void gfx_fill(struct surface *s, int x, int y, int w, int h, color_t c)
         return;
     uint32_t *row = s->px + r.y * s->stride + r.x;
     for (int j = 0; j < r.h; j++, row += s->stride)
-        for (int i = 0; i < r.w; i++)
-            row[i] = c;
+        memset32(row, c, r.w);
 }
 
 void gfx_hline(struct surface *s, int x, int y, int w, color_t c)
@@ -133,14 +134,10 @@ void gfx_blit(struct surface *dst, int x, int y, const struct surface *src,
                src->px + (sy + j) * src->stride + sx, (size_t)r.w * 4);
 }
 
-static uint32_t blend(uint32_t dst, uint32_t src, uint32_t a)
+/* (src * a + dst * (255 - a)) / 255, rounded, in each channel. MMX: callers simd_done(). */
+static inline uint32_t blend(uint32_t dst, uint32_t src, uint32_t a)
 {
-    uint32_t out = 0;
-    for (int shift = 0; shift < 24; shift += 8) {
-        uint32_t d = (dst >> shift) & 0xFF, c = (src >> shift) & 0xFF;
-        out |= ((c * a + d * (255 - a) + 127) / 255) << shift;
-    }
-    return out;
+    return px_blend255(dst, src, a, 127) & 0xFFFFFF;
 }
 
 static void draw_image(struct surface *s, int x, int y, const struct image *img,
@@ -159,6 +156,7 @@ static void draw_image(struct surface *s, int x, int y, const struct image *img,
             dst[i] = a == 255 ? p & 0xFFFFFF : blend(dst[i], p, a);
         }
     }
+    simd_done();
 }
 
 void gfx_image(struct surface *s, int x, int y, const struct image *img)
@@ -179,23 +177,14 @@ static const struct pglyph *glyph(const struct pfont *f, char ch)
     return &f->glyphs[c - 32];
 }
 
-/* Blend c over the pixel under it, cov/15 of the way (cov is 1-14). */
-static uint32_t blend15(uint32_t under, uint32_t c, int cov)
-{
-    uint32_t out = 0;
-    for (int shift = 0; shift < 24; shift += 8) {
-        uint32_t u = under >> shift & 0xFF, v = c >> shift & 0xFF;
-        out |= ((u * (uint32_t)(15 - cov) + v * (uint32_t)cov + 7) / 15) << shift;
-    }
-    return out;
-}
-
-static void put_cov(uint32_t *px, color_t c, int cov)
+/* Blend c over the pixel under it, cov/15 of the way; cv is c unpacked
+ * (px_unpack). MMX: callers simd_done(). */
+static inline void put_cov(uint32_t *px, color_t c, __m64 cv, int cov)
 {
     if (cov >= 15)
         *px = c;
     else if (cov > 0)
-        *px = blend15(*px, c, cov);
+        *px = px_blend15(*px, cv, cov) & 0xFFFFFF;
 }
 
 static void draw_glyph(struct surface *s, const struct pfont *f, const struct pglyph *g,
@@ -205,12 +194,14 @@ static void draw_glyph(struct surface *s, const struct pfont *f, const struct pg
     struct rect r = rect_intersect(mkrect(gx, y, g->width, f->height), s->clip);
     if (rect_empty(r))
         return;
+    __m64 cv = px_unpack(c);
     for (int j = r.y; j < r.y + r.h; j++) {
         const uint8_t *cov = g->cov + (j - y) * g->width;
         uint32_t *row = s->px + j * s->stride;
         for (int i = r.x; i < r.x + r.w; i++)
-            put_cov(&row[i], c, cov[i - gx]);
+            put_cov(&row[i], c, cv, cov[i - gx]);
     }
+    simd_done();
 }
 
 int gfx_text_n(struct surface *s, const struct pfont *f, int x, int y, const char *str,
@@ -240,17 +231,19 @@ int gfx_text_width(const struct pfont *f, const char *str)
 void gfx_text_up(struct surface *s, const struct pfont *f, int x, int y, const char *str, color_t c)
 {
     /* Glyph row j becomes screen column x + j; glyph column i goes up from y. */
+    __m64 cv = px_unpack(c);
     for (; *str; str++) {
         const struct pglyph *g = glyph(f, *str);
         for (int j = 0; j < f->height; j++) {
             for (int i = 0; i < g->width; i++) {
-                int px = x + j, py = y - g->xoff - i, cv = g->cov[j * g->width + i];
-                if (cv && rect_contains(s->clip, px, py))
-                    put_cov(&s->px[py * s->stride + px], c, cv);
+                int px = x + j, py = y - g->xoff - i, cov = g->cov[j * g->width + i];
+                if (cov && rect_contains(s->clip, px, py))
+                    put_cov(&s->px[py * s->stride + px], c, cv, cov);
             }
         }
         y -= g->advance;
     }
+    simd_done();
 }
 
 int gfx_text_wrap(struct surface *s, const struct pfont *f, int x, int y, int w,
@@ -304,12 +297,39 @@ void gfx_ellipsize(const struct pfont *f, const char *str, int max_w, char *out,
     strcpy(out + n, "...");
 }
 
+/* Four pixels' worth of glyph bits (the leftmost highest) as lane masks. */
+#define BIT_MASK(b) ((b) ? 0xFFFFFFFFu : 0)
+#define NIBBLE(n) { BIT_MASK((n) & 8), BIT_MASK((n) & 4), BIT_MASK((n) & 2), BIT_MASK((n) & 1) }
+static const uint32_t nibble_masks[16][4] __attribute__((aligned(16))) = {
+    NIBBLE(0), NIBBLE(1), NIBBLE(2), NIBBLE(3), NIBBLE(4), NIBBLE(5), NIBBLE(6), NIBBLE(7),
+    NIBBLE(8), NIBBLE(9), NIBBLE(10), NIBBLE(11), NIBBLE(12), NIBBLE(13), NIBBLE(14), NIBBLE(15),
+};
+
+static inline __m128 select4(int nibble, __m128 fg, __m128 bg)
+{
+    __m128 m = _mm_load_ps((const float *)nibble_masks[nibble]);
+    return _mm_or_ps(_mm_and_ps(m, fg), _mm_andnot_ps(m, bg));
+}
+
 void gfx_glyph8x16(struct surface *s, int x, int y, unsigned char ch, color_t fg, color_t bg)
 {
     struct rect r = rect_intersect(mkrect(x, y, FONT_W, FONT_H), s->clip);
     if (rect_empty(r))
         return;
     const uint8_t *rows = font8x16_glyph(ch);
+    if (r.w == 8) {
+        /* A whole row at once: two SSE selects between the colors. */
+        __m128 f = _mm_load_ss((const float *)&fg), b = _mm_load_ss((const float *)&bg);
+        f = _mm_shuffle_ps(f, f, 0);
+        b = _mm_shuffle_ps(b, b, 0);
+        for (int j = r.y; j < r.y + r.h; j++) {
+            uint8_t bits = rows[j - y];
+            float *row = (float *)(s->px + j * s->stride + x);
+            _mm_storeu_ps(row, select4(bits >> 4, f, b));
+            _mm_storeu_ps(row + 4, select4(bits & 15, f, b));
+        }
+        return;
+    }
     for (int j = r.y; j < r.y + r.h; j++) {
         uint8_t bits = rows[j - y];
         uint32_t *row = s->px + j * s->stride;

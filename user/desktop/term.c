@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <xmmintrin.h>
 #include <flux/font.h>
 #include "desktop.h"
 
@@ -270,14 +271,19 @@ static void csi_dispatch(struct term *t, char final)
 
 static void invalidate(struct term *t);
 
+/* A row of the 320x200 picture, doubled both ways: two pixels at a time
+ * become c0 c0 c1 c1 in an SSE register, stored on both lines. */
 static void gfx_row(struct term *t, int y)
 {
     struct surface *s = &t->win->content;
-    uint32_t *a = s->px + (PAD + 2 * y) * s->stride + PAD, *b = a + s->stride;
+    float *a = (float *)(s->px + (PAD + 2 * y) * s->stride + PAD), *b = a + s->stride;
     const uint8_t *src = t->fb + y * VGA_W;
-    for (int x = 0; x < VGA_W; x++) {
-        color_t c = t->pal[src[x]];
-        a[2 * x] = a[2 * x + 1] = b[2 * x] = b[2 * x + 1] = c;
+    const float *pal = (const float *)t->pal;           /* colors as bits, never as numbers */
+    for (int x = 0; x < VGA_W; x += 2) {
+        __m128 c = _mm_unpacklo_ps(_mm_load_ss(pal + src[x]), _mm_load_ss(pal + src[x + 1]));
+        c = _mm_unpacklo_ps(c, c);
+        _mm_storeu_ps(a + 2 * x, c);
+        _mm_storeu_ps(b + 2 * x, c);
     }
     if (y < t->gfx_dirty_top)
         t->gfx_dirty_top = y;

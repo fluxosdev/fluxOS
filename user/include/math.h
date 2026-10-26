@@ -1,7 +1,7 @@
 /*
- * Mathematical functions, computed with the x87 FPU. Only programs built
- * with the FPU allowed (not -mgeneral-regs-only, see the Makefile's
- * USER_FP_CFLAGS) can use them.
+ * Mathematical functions. Floats are worked on with SSE and doubles with
+ * the x87 FPU (SSE1 has no double precision); the square roots and
+ * absolute values below compile to single instructions in place.
  */
 #ifndef _MATH_H
 #define _MATH_H
@@ -52,5 +52,10 @@ float powf(float x, float y);
 float fabsf(float x);
 float floorf(float x);
 float ceilf(float x);
+
+#define sqrt(x)  __builtin_sqrt(x)
+#define sqrtf(x) __builtin_sqrtf(x)
+#define fabs(x)  __builtin_fabs(x)
+#define fabsf(x) __builtin_fabsf(x)
 
 #endif

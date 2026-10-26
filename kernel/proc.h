@@ -48,7 +48,7 @@ struct proc {
     uint32_t start_tick;
     char name[32];
     int fpu_used;               /* has FPU registers (in fpu, or in the FPU) */
-    uint8_t fpu[108] __attribute__((aligned(16)));     /* FNSAVE image */
+    uint8_t fpu[512] __attribute__((aligned(16)));     /* FXSAVE image: x87, MMX, SSE */
 };
 
 extern struct proc procs[MAX_PROCS];

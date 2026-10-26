@@ -118,7 +118,8 @@ void fb_mode_changed(void)
 {
     struct proc *p = fb_owner ? proc_find(fb_owner) : NULL;
     if (p && p->state != P_ZOMBIE)
-        vmm_map_phys(p->pd, USER_MMIO_BASE, fb.phys, radeon_present() ? radeon_map_size() : fb.size, 0);
+        vmm_map_phys(p->pd, USER_MMIO_BASE, fb.phys, radeon_present() ? radeon_map_size() : fb.size,
+                     pte_wc);
     vga_reset_fb();
 }
 
@@ -164,7 +165,20 @@ void fb_fill(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color)
     uint8_t *line = fb.base + y * fb.pitch + x * fb.bytespp;
     for (uint32_t r = 0; r < h; r++, line += fb.pitch) {
         uint8_t *p = line;
-        for (uint32_t c = 0; c < w; c++, p += fb.bytespp)
+        uint32_t c = 0;
+        /* Whole words of pixels, 16 bytes per write, where SSE is up. */
+        if (kernel_sse && fb.bytespp != 3 && w >= 8) {
+            if (fb.bytespp == 2 && ((uintptr_t)p & 2)) {
+                put_px(p, color);
+                p += 2;
+                c++;
+            }
+            uint32_t bytes = (w - c) * fb.bytespp & ~3u;
+            sse_fill(p, fb.bytespp == 2 ? color * 0x10001u : color, bytes);
+            p += bytes;
+            c += bytes / fb.bytespp;
+        }
+        for (; c < w; c++, p += fb.bytespp)
             put_px(p, color);
     }
 }
@@ -174,7 +188,15 @@ void fb_scroll(uint32_t y0, uint32_t h, uint32_t dy)
 {
     if (dy >= h)
         return;
-    memmove(fb.base + y0 * fb.pitch, fb.base + (y0 + dy) * fb.pitch, (h - dy) * fb.pitch);
+    uint8_t *dst = fb.base + y0 * fb.pitch, *src = fb.base + (y0 + dy) * fb.pitch;
+    uint32_t n = (h - dy) * fb.pitch;
+    if (!kernel_sse) {
+        memmove(dst, src, n);
+        return;
+    }
+    /* A line at a time, so that interrupts are not held off for a whole screen. */
+    for (uint32_t off = 0; off < n; off += fb.pitch)
+        sse_copy(dst + off, src + off, MIN(fb.pitch, n - off));
 }
 
 /* The console draws on the framebuffer while no process owns it. */
@@ -212,7 +234,7 @@ int fb_map_user(void)
             return -EBUSY;
     }
     uint32_t size = radeon_present() ? radeon_map_size() : fb.size;
-    int r = vmm_map_phys(current->pd, USER_MMIO_BASE, fb.phys, size, 0);
+    int r = vmm_map_phys(current->pd, USER_MMIO_BASE, fb.phys, size, pte_wc);
     if (r < 0)
         return r;
     if (!fb_owner)
