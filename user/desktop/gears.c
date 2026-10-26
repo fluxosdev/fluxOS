@@ -6,8 +6,9 @@
  * which, and how many frames a second it manages.
  *
  * Drag with the mouse or use the arrow keys to turn the view; Space
- * pauses, Home puts the view back, and S moves on to the next renderer
- * there is (Radeon, Voodoo, software), to compare them.
+ * pauses, Home puts the view back, S moves on to the next renderer there
+ * is (Radeon, Voodoo, software), to compare them, and T puts a checked
+ * texture on the gears or takes it off.
  *
  * This file is built with the FPU allowed (USER_FP_CFLAGS).
  */
@@ -28,6 +29,8 @@ struct gears {
     FGLcontext *ctx;
     int ctx_w, ctx_h;                   /* the context's picture size */
     GLuint gear1, gear2, gear3;
+    GLuint texture;
+    int textured;
     float angle, rot_x, rot_y;
     int paused;
     unsigned int last_ms;               /* when the angle last advanced */
@@ -40,6 +43,14 @@ struct gears {
 
 static struct gears *all_gears;
 static unsigned int next_frame_ms;
+
+/* A vertex with texture coordinates from its x and y: the texture lies flat
+ * across the gear's faces (and is drawn out along its sides). */
+static void vtx(float x, float y, float z)
+{
+    glTexCoord2f(x * 0.125f + 0.5f, y * 0.125f + 0.5f);
+    glVertex3f(x, y, z);
+}
 
 /* One gear: a toothed ring of the given radii and width around the z axis. */
 static void gear(float inner, float outer, float width, int teeth, float tooth_depth)
@@ -54,11 +65,11 @@ static void gear(float inner, float outer, float width, int teeth, float tooth_d
     glBegin(GL_QUAD_STRIP);
     for (int i = 0; i <= teeth; i++) {
         float a = i * 2 * (float)M_PI / teeth;
-        glVertex3f(r0 * cosf(a), r0 * sinf(a), w2);
-        glVertex3f(r1 * cosf(a), r1 * sinf(a), w2);
+        vtx(r0 * cosf(a), r0 * sinf(a), w2);
+        vtx(r1 * cosf(a), r1 * sinf(a), w2);
         if (i < teeth) {
-            glVertex3f(r0 * cosf(a), r0 * sinf(a), w2);
-            glVertex3f(r1 * cosf(a + 3 * da), r1 * sinf(a + 3 * da), w2);
+            vtx(r0 * cosf(a), r0 * sinf(a), w2);
+            vtx(r1 * cosf(a + 3 * da), r1 * sinf(a + 3 * da), w2);
         }
     }
     glEnd();
@@ -67,10 +78,10 @@ static void gear(float inner, float outer, float width, int teeth, float tooth_d
     glBegin(GL_QUADS);
     for (int i = 0; i < teeth; i++) {
         float a = i * 2 * (float)M_PI / teeth;
-        glVertex3f(r1 * cosf(a), r1 * sinf(a), w2);
-        glVertex3f(r2 * cosf(a + da), r2 * sinf(a + da), w2);
-        glVertex3f(r2 * cosf(a + 2 * da), r2 * sinf(a + 2 * da), w2);
-        glVertex3f(r1 * cosf(a + 3 * da), r1 * sinf(a + 3 * da), w2);
+        vtx(r1 * cosf(a), r1 * sinf(a), w2);
+        vtx(r2 * cosf(a + da), r2 * sinf(a + da), w2);
+        vtx(r2 * cosf(a + 2 * da), r2 * sinf(a + 2 * da), w2);
+        vtx(r1 * cosf(a + 3 * da), r1 * sinf(a + 3 * da), w2);
     }
     glEnd();
 
@@ -80,11 +91,11 @@ static void gear(float inner, float outer, float width, int teeth, float tooth_d
     glBegin(GL_QUAD_STRIP);
     for (int i = 0; i <= teeth; i++) {
         float a = i * 2 * (float)M_PI / teeth;
-        glVertex3f(r1 * cosf(a), r1 * sinf(a), -w2);
-        glVertex3f(r0 * cosf(a), r0 * sinf(a), -w2);
+        vtx(r1 * cosf(a), r1 * sinf(a), -w2);
+        vtx(r0 * cosf(a), r0 * sinf(a), -w2);
         if (i < teeth) {
-            glVertex3f(r1 * cosf(a + 3 * da), r1 * sinf(a + 3 * da), -w2);
-            glVertex3f(r0 * cosf(a), r0 * sinf(a), -w2);
+            vtx(r1 * cosf(a + 3 * da), r1 * sinf(a + 3 * da), -w2);
+            vtx(r0 * cosf(a), r0 * sinf(a), -w2);
         }
     }
     glEnd();
@@ -93,10 +104,10 @@ static void gear(float inner, float outer, float width, int teeth, float tooth_d
     glBegin(GL_QUADS);
     for (int i = 0; i < teeth; i++) {
         float a = i * 2 * (float)M_PI / teeth;
-        glVertex3f(r1 * cosf(a + 3 * da), r1 * sinf(a + 3 * da), -w2);
-        glVertex3f(r2 * cosf(a + 2 * da), r2 * sinf(a + 2 * da), -w2);
-        glVertex3f(r2 * cosf(a + da), r2 * sinf(a + da), -w2);
-        glVertex3f(r1 * cosf(a), r1 * sinf(a), -w2);
+        vtx(r1 * cosf(a + 3 * da), r1 * sinf(a + 3 * da), -w2);
+        vtx(r2 * cosf(a + 2 * da), r2 * sinf(a + 2 * da), -w2);
+        vtx(r2 * cosf(a + da), r2 * sinf(a + da), -w2);
+        vtx(r1 * cosf(a), r1 * sinf(a), -w2);
     }
     glEnd();
 
@@ -104,25 +115,25 @@ static void gear(float inner, float outer, float width, int teeth, float tooth_d
     glBegin(GL_QUAD_STRIP);
     for (int i = 0; i < teeth; i++) {
         float a = i * 2 * (float)M_PI / teeth;
-        glVertex3f(r1 * cosf(a), r1 * sinf(a), w2);
-        glVertex3f(r1 * cosf(a), r1 * sinf(a), -w2);
+        vtx(r1 * cosf(a), r1 * sinf(a), w2);
+        vtx(r1 * cosf(a), r1 * sinf(a), -w2);
         float u = r2 * cosf(a + da) - r1 * cosf(a), v = r2 * sinf(a + da) - r1 * sinf(a);
         float len = sqrtf(u * u + v * v);
         glNormal3f(v / len, -u / len, 0);
-        glVertex3f(r2 * cosf(a + da), r2 * sinf(a + da), w2);
-        glVertex3f(r2 * cosf(a + da), r2 * sinf(a + da), -w2);
+        vtx(r2 * cosf(a + da), r2 * sinf(a + da), w2);
+        vtx(r2 * cosf(a + da), r2 * sinf(a + da), -w2);
         glNormal3f(cosf(a), sinf(a), 0);
-        glVertex3f(r2 * cosf(a + 2 * da), r2 * sinf(a + 2 * da), w2);
-        glVertex3f(r2 * cosf(a + 2 * da), r2 * sinf(a + 2 * da), -w2);
+        vtx(r2 * cosf(a + 2 * da), r2 * sinf(a + 2 * da), w2);
+        vtx(r2 * cosf(a + 2 * da), r2 * sinf(a + 2 * da), -w2);
         u = r1 * cosf(a + 3 * da) - r2 * cosf(a + 2 * da);
         v = r1 * sinf(a + 3 * da) - r2 * sinf(a + 2 * da);
         glNormal3f(v, -u, 0);
-        glVertex3f(r1 * cosf(a + 3 * da), r1 * sinf(a + 3 * da), w2);
-        glVertex3f(r1 * cosf(a + 3 * da), r1 * sinf(a + 3 * da), -w2);
+        vtx(r1 * cosf(a + 3 * da), r1 * sinf(a + 3 * da), w2);
+        vtx(r1 * cosf(a + 3 * da), r1 * sinf(a + 3 * da), -w2);
         glNormal3f(cosf(a), sinf(a), 0);
     }
-    glVertex3f(r1, 0, w2);
-    glVertex3f(r1, 0, -w2);
+    vtx(r1, 0, w2);
+    vtx(r1, 0, -w2);
     glEnd();
 
     glShadeModel(GL_SMOOTH);
@@ -132,8 +143,8 @@ static void gear(float inner, float outer, float width, int teeth, float tooth_d
     for (int i = 0; i <= teeth; i++) {
         float a = i * 2 * (float)M_PI / teeth;
         glNormal3f(-cosf(a), -sinf(a), 0);
-        glVertex3f(r0 * cosf(a), r0 * sinf(a), -w2);
-        glVertex3f(r0 * cosf(a), r0 * sinf(a), w2);
+        vtx(r0 * cosf(a), r0 * sinf(a), -w2);
+        vtx(r0 * cosf(a), r0 * sinf(a), w2);
     }
     glEnd();
 }
@@ -164,6 +175,27 @@ static void scene_init(struct gears *g)
     g->gear2 = make_gear(green, 0.5f, 2, 2, 10);
     g->gear3 = make_gear(blue, 1.3f, 2, 0.5f, 10);
     glEnable(GL_NORMALIZE);
+
+    /* A 64 x 64 check of light and darker squares with a thin dark line
+     * between them, which the gears' lit colors modulate. */
+    static uint8_t texels[64 * 64 * 3];
+    for (int y = 0; y < 64; y++) {
+        for (int x = 0; x < 64; x++) {
+            uint8_t v = ((x / 8) ^ (y / 8)) & 1 ? 255 : 150;
+            if (x % 8 == 0 || y % 8 == 0)
+                v = 60;
+            uint8_t *p = texels + (y * 64 + x) * 3;
+            p[0] = p[1] = p[2] = v;
+        }
+    }
+    glGenTextures(1, &g->texture);
+    glBindTexture(GL_TEXTURE_2D, g->texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 64, 64, 0, GL_RGB, GL_UNSIGNED_BYTE, texels);
+    if (g->textured)
+        glEnable(GL_TEXTURE_2D);
 }
 
 static void reshape(int w, int h)
@@ -243,11 +275,13 @@ static void update_status(struct gears *g, unsigned int now)
 {
     unsigned int span = now - g->fps_since;
     const char *who = fglIsAccelerated(g->ctx) ? (const char *)glGetString(GL_RENDERER) : "Software";
+    const char *tex = g->textured ? ", textured" : "";
     if (g->paused) {
-        snprintf(g->status, sizeof(g->status), "%s - paused (Space resumes)", who);
+        snprintf(g->status, sizeof(g->status), "%s%s - paused (Space resumes)", who, tex);
     } else if (span > 0) {
         unsigned int tenths = (unsigned int)g->frames * 10000u / span;
-        snprintf(g->status, sizeof(g->status), "%s - %u.%u frames per second", who, tenths / 10, tenths % 10);
+        snprintf(g->status, sizeof(g->status), "%s%s - %u.%u frames per second", who, tex, tenths / 10,
+                 tenths % 10);
     }
     draw_status(g);
     struct surface *s = &g->win->content;
@@ -347,6 +381,14 @@ static void gears_key(struct window *w, const struct input_event *ev)
     case KEY_HOME: g->rot_x = 20; g->rot_y = 30; break;
     case 0x1F:                          /* S */
         switch_renderer(g);
+        break;
+    case 0x14:                          /* T */
+        g->textured = !g->textured;
+        fglMakeCurrent(g->ctx);
+        if (g->textured)
+            glEnable(GL_TEXTURE_2D);
+        else
+            glDisable(GL_TEXTURE_2D);
         break;
     case KEY_SPACE:
         g->paused = !g->paused;

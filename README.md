@@ -159,7 +159,8 @@ stops at boot and says why.
   3dfx and Radeon drivers), monitor type and EDID details. Settings are saved
   in GRUB's environment block on an installed system.
 - **3D Gears**: the OpenGL demo, drawn by the Radeon or Voodoo 3D engine when
-  there is one, else by the software renderer (S switches renderer).
+  there is one, else by the software renderer (S switches renderer, T puts a
+  texture on the gears).
 - **Paint**: a bitmap editor with a canvas of any size up to 2048 x 2048
   (**New...** and **Size...**), a round **Brush** with an adjustable size (the
   `-`/`+` buttons or `[`/`]`), a square **Eraser**, flood **Fill**, straight
@@ -379,6 +380,11 @@ fetcher process, so the desktop keeps running), or from `file://`.
 - A subset of OpenGL 1.1's fixed-function pipeline: `glBegin`/`glEnd`, matrix
   stacks, per-vertex lighting (eight lights), flat/smooth shading, culling,
   depth buffer, scissor, display lists, `glGet*`, and basic GLU.
+- 2D textures: texture objects, `glTexImage2D`/`glTexSubImage2D` from
+  RGB(A), BGR(A), luminance and alpha bytes, nearest or bilinear filtering,
+  repeat or clamp, the modulate, replace, decal and blend environments, and
+  the texture matrix, all perspective-correct. The Radeon samples them in its
+  pixel shader; a Voodoo context goes on in software once it draws with one.
 - Three backends, tried in order: the Radeon 3D engine (PM4 command buffers),
   the 3dfx engine (driven from user space, as Glide does), and a software
   scanline rasterizer. `FGL_NO_RADEON`, `FGL_NO_TDFX`, `FGL_SOFTWARE`,
@@ -703,8 +709,10 @@ cannot be used.
 - **Graphics:** only the 3dfx and Radeon drivers set modes (others keep the BIOS
   mode, changeable only on an installed system at the next start); no 8-bit
   palette, interlaced or doublescan modes; the 3dfx engine renders 16-bit color
-  and is read back over the bus each frame. The GL library has no textures,
-  blending, fog, stencil, vertex arrays or selection; lighting is per vertex;
+  and is read back over the bus each frame. The GL library has no blending,
+  fog, stencil, vertex arrays or selection, and textures have no mipmaps
+  (level 0 serves every filter); the Voodoo does not texture, and the Radeon
+  draws decal as replace and blend as modulate; lighting is per vertex;
   polygons must be convex; only one process at a time can use the 3D hardware.
 - **Pictures:** JPEG arithmetic coding, 12-bit, lossless and CMYK, and
   interlaced PNGs are not shown; EXIF orientation and color profiles are

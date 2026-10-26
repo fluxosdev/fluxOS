@@ -287,6 +287,7 @@ static int *cap_flag(struct fgl_context *c, GLenum cap)
     case GL_COLOR_MATERIAL: return &c->color_material;
     case GL_SCISSOR_TEST: return &c->scissor_test;
     case GL_DITHER: return &c->dither;
+    case GL_TEXTURE_2D: return &c->texture_2d;
     case GL_POINT_SMOOTH: case GL_LINE_SMOOTH: case GL_POLYGON_SMOOTH:
         ignored = 0;
         return &ignored;                /* accepted; nothing is anti-aliased */
@@ -304,7 +305,7 @@ static void set_cap(GLenum cap, int on)
     int *flag = cap_flag(c, cap);
     if (!flag) {
         /* Features this GL lacks: switching them off is fine. */
-        if (!on && (cap == GL_BLEND || cap == GL_TEXTURE_2D || cap == GL_FOG || cap == GL_ALPHA_TEST))
+        if (!on && (cap == GL_BLEND || cap == GL_TEXTURE_1D || cap == GL_FOG || cap == GL_ALPHA_TEST))
             return;
         gl_error(c, GL_INVALID_ENUM);
         return;
@@ -323,7 +324,7 @@ GLboolean glIsEnabled(GLenum cap)
         return GL_FALSE;
     int *flag = cap_flag(c, cap);
     if (!flag) {
-        if (cap != GL_BLEND && cap != GL_TEXTURE_2D && cap != GL_FOG && cap != GL_ALPHA_TEST)
+        if (cap != GL_BLEND && cap != GL_TEXTURE_1D && cap != GL_FOG && cap != GL_ALPHA_TEST)
             gl_error(c, GL_INVALID_ENUM);
         return GL_FALSE;
     }
@@ -733,8 +734,10 @@ static int get_values(struct fgl_context *c, GLenum pname, double *v)
 {
     switch (pname) {
     case GL_MODELVIEW_MATRIX:
-    case GL_PROJECTION_MATRIX: {
+    case GL_PROJECTION_MATRIX:
+    case GL_TEXTURE_MATRIX: {
         const float *m = pname == GL_MODELVIEW_MATRIX ? c->modelview[c->mv_depth]
+                         : pname == GL_TEXTURE_MATRIX ? c->texture[c->tex_depth]
                                                       : c->projection[c->proj_depth];
         for (int i = 0; i < 16; i++)
             v[i] = m[i];
@@ -758,6 +761,23 @@ static int get_values(struct fgl_context *c, GLenum pname, double *v)
     case GL_CURRENT_NORMAL:
         v[0] = c->normal[0]; v[1] = c->normal[1]; v[2] = c->normal[2];
         return 3;
+    case GL_CURRENT_TEXTURE_COORDS:
+        for (int i = 0; i < 4; i++)
+            v[i] = c->texcoord[i];
+        return 4;
+    case GL_TEXTURE_ENV_COLOR:
+        for (int i = 0; i < 4; i++)
+            v[i] = c->tex_env_color[i];
+        return 4;
+    case GL_TEXTURE_ENV_MODE: v[0] = c->tex_env_mode; return 1;
+    case GL_TEXTURE_BINDING_2D: v[0] = c->bound; return 1;
+    case GL_MAX_TEXTURE_SIZE: v[0] = MAX_TEXTURE; return 1;
+    case GL_MAX_TEXTURE_STACK_DEPTH: v[0] = TEXTURE_DEPTH; return 1;
+    case GL_UNPACK_ALIGNMENT: v[0] = c->unpack_align; return 1;
+    case GL_UNPACK_ROW_LENGTH: v[0] = c->unpack_row_length; return 1;
+    case GL_UNPACK_SKIP_ROWS: v[0] = c->unpack_skip_rows; return 1;
+    case GL_UNPACK_SKIP_PIXELS: v[0] = c->unpack_skip_pixels; return 1;
+    case GL_PACK_ALIGNMENT: v[0] = 4; return 1;
     case GL_DEPTH_RANGE:
         v[0] = c->depth_near; v[1] = c->depth_far;
         return 2;
@@ -818,7 +838,7 @@ void glGetIntegerv(GLenum pname, GLint *params)
     GET_CTX(c);
     double v[16];
     int n = get_values(c, pname, v);
-    int colors = pname == GL_CURRENT_COLOR || pname == GL_COLOR_CLEAR_VALUE;
+    int colors = pname == GL_CURRENT_COLOR || pname == GL_COLOR_CLEAR_VALUE || pname == GL_TEXTURE_ENV_COLOR;
     for (int i = 0; i < n; i++)
         params[i] = colors ? (GLint)(v[i] * 2147483647.0) : (GLint)(v[i] < 0 ? v[i] - 0.5 : v[i] + 0.5);
 }
@@ -886,6 +906,7 @@ static void init_state(struct fgl_context *c)
         c->color[k] = 1;
     c->normal[2] = 1;
     c->hw_dirty = 1;
+    gl_tex_init(c);
     gl_prim_init(c);
 }
 
@@ -916,6 +937,7 @@ FGLcontext *fglCreateContext(int width, int height, unsigned int flags)
         c->be = &gl_soft_backend;
         strcpy(c->renderer, gl_soft_backend.name);
         if (c->be->resize(c) < 0) {
+            gl_tex_free_all(c);
             free(c->verts);
             free(c);
             return NULL;
@@ -930,6 +952,7 @@ void fglDestroyContext(FGLcontext *c)
         return;
     if (gl_ctx == c)
         gl_ctx = NULL;
+    gl_tex_free_all(c);
     c->be->destroy(c);
     gl_free_lists(c);
     free(c->verts);
@@ -946,13 +969,24 @@ FGLcontext *fglGetCurrentContext(void)
     return gl_ctx;
 }
 
-/* Fall back to drawing in memory if the hardware cannot keep the context. */
-static int use_software(struct fgl_context *c)
+/* Fall back to drawing in memory if the hardware cannot keep the context
+ * (or cannot draw what it is asked to), perhaps with the picture so far. */
+int gl_use_software(struct fgl_context *c, int keep_picture)
 {
+    uint32_t *picture = keep_picture ? malloc((size_t)c->width * (size_t)c->height * 4) : NULL;
+    if (picture) {
+        c->be->finish(c);
+        c->be->read(c, picture, c->width);
+    }
     c->be->destroy(c);
     c->be = &gl_soft_backend;
     strcpy(c->renderer, gl_soft_backend.name);
-    return c->be->resize(c);
+    int r = c->be->resize(c);
+    if (r == 0 && picture)
+        gl_soft_load(c, picture);
+    free(picture);
+    c->hw_dirty = 1;
+    return r;
 }
 
 int fglResize(FGLcontext *c, int width, int height)
@@ -964,7 +998,7 @@ int fglResize(FGLcontext *c, int width, int height)
     c->height = height;
     if (c->be->resize(c) == 0)
         return 0;
-    if (c->be != &gl_soft_backend && use_software(c) == 0)
+    if (c->be != &gl_soft_backend && gl_use_software(c, 0) == 0)
         return 0;
     c->width = ow;
     c->height = oh;
@@ -982,7 +1016,7 @@ void fglSwapBuffers(FGLcontext *c, uint32_t *dst, int stride)
      * or the engine may have hung. */
     if ((c->be == &gl_tdfx_backend && gl_tdfx_check(c) < 0) ||
         (c->be == &gl_radeon_backend && gl_radeon_check(c) < 0))
-        use_software(c);
+        gl_use_software(c, 0);
 }
 
 int fglIsAccelerated(FGLcontext *c)

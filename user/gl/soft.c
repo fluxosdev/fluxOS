@@ -9,6 +9,12 @@
  * The four planes (depth, red, green, blue) are set up together in the
  * lanes of an SSE register. Spans are filled two pixels at a time in MMX
  * registers, the depth test giving a mask of the pixels to keep.
+ *
+ * A textured triangle has three more planes, 1/w, s/w and t/w, which are
+ * linear in the window; dividing by 1/w at each pixel gives texture
+ * coordinates with perspective. Its spans go a pixel at a time: the
+ * texel (nearest, or bilinear between four), then the texture
+ * environment's mix of it with the fragment's color.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -166,6 +172,85 @@ static void span_less(uint32_t *cp, uint32_t *zp, int n, int write_z, int32_t z,
     }
 }
 
+/* ---- textures ---- */
+
+static inline int ifloor(float f)
+{
+    int i = (int)f;
+    return (float)i > f ? i - 1 : i;
+}
+
+static inline int wrap(int i, int n, GLenum mode)
+{
+    if (mode == GL_REPEAT) {
+        i %= n;
+        return i < 0 ? i + n : i;
+    }
+    return i < 0 ? 0 : i >= n ? n - 1 : i;
+}
+
+static inline uint32_t texel_nearest(const struct gltex *t, float s, float u)
+{
+    int x = wrap(ifloor(s * (float)t->w), t->w, t->wrap_s);
+    int y = wrap(ifloor(u * (float)t->h), t->h, t->wrap_t);
+    return t->texels[(size_t)y * (size_t)t->w + (size_t)x];
+}
+
+/* The four texels around (s, u), weighted by where it falls between them
+ * (in 256ths), channel by channel. */
+static uint32_t texel_linear(const struct gltex *t, float s, float u)
+{
+    float fx = s * (float)t->w - 0.5f, fy = u * (float)t->h - 0.5f;
+    int x0 = ifloor(fx), y0 = ifloor(fy);
+    uint32_t wx = (uint32_t)((fx - (float)x0) * 256), wy = (uint32_t)((fy - (float)y0) * 256);
+    int x1 = wrap(x0 + 1, t->w, t->wrap_s), y1 = wrap(y0 + 1, t->h, t->wrap_t);
+    x0 = wrap(x0, t->w, t->wrap_s);
+    y0 = wrap(y0, t->h, t->wrap_t);
+    const uint32_t *r0 = t->texels + (size_t)y0 * (size_t)t->w, *r1 = t->texels + (size_t)y1 * (size_t)t->w;
+    uint32_t a = r0[x0], b = r0[x1], cc = r1[x0], d = r1[x1], out = 0;
+    for (int sh = 0; sh < 32; sh += 8) {
+        uint32_t top = ((a >> sh) & 0xFF) * (256 - wx) + ((b >> sh) & 0xFF) * wx;
+        uint32_t bot = ((cc >> sh) & 0xFF) * (256 - wx) + ((d >> sh) & 0xFF) * wx;
+        out |= ((top * (256 - wy) + bot * wy) >> 16) << sh;
+    }
+    return out;
+}
+
+static inline uint32_t clamp8(int32_t v16)
+{
+    int32_t v = v16 >> 16;
+    return (uint32_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+}
+
+/* The texture environment: texel tx (0xAABBGGRR) with the fragment's
+ * color (0 to 255 a channel) as 0xRRGGBB. */
+static inline uint32_t tex_env(GLenum mode, uint32_t tx, uint32_t r, uint32_t g, uint32_t b,
+                               const uint32_t *env)
+{
+    uint32_t tr = tx & 0xFF, tg = (tx >> 8) & 0xFF, tb = (tx >> 16) & 0xFF, ta = tx >> 24;
+    switch (mode) {
+    case GL_REPLACE:
+        r = tr; g = tg; b = tb;
+        break;
+    case GL_DECAL:
+        r = (r * (255 - ta) + tr * ta + 127) / 255;
+        g = (g * (255 - ta) + tg * ta + 127) / 255;
+        b = (b * (255 - ta) + tb * ta + 127) / 255;
+        break;
+    case GL_BLEND:
+        r = (r * (255 - tr) + env[0] * tr + 127) / 255;
+        g = (g * (255 - tg) + env[1] * tg + 127) / 255;
+        b = (b * (255 - tb) + env[2] * tb + 127) / 255;
+        break;
+    default:                            /* GL_MODULATE */
+        r = r * (tr + 1) >> 8;
+        g = g * (tg + 1) >> 8;
+        b = b * (tb + 1) >> 8;
+        break;
+    }
+    return r << 16 | g << 8 | b;
+}
+
 /* ---- triangles ---- */
 
 static void triangle(struct fgl_context *c, const struct wvert *v0, const struct wvert *v1,
@@ -205,6 +290,38 @@ static void triangle(struct fgl_context *c, const struct wvert *v0, const struct
     int test = c->depth_test, write_z = c->depth_test && c->depth_mask;
     GLenum func = c->depth_func;
 
+    /* Texturing: the planes 1/w, s/w and t/w, and whether the texture is
+     * magnified or minified here (by its area against the triangle's). */
+    const struct gltex *tex = gl_active_texture(c);
+    __m128 ta0 = _mm_setzero_ps(), tdx = ta0, tdy = ta0;
+    int linear = 0;
+    uint32_t env[3];
+    if (tex) {
+        __m128 q0 = _mm_setr_ps(1 / v0->w, v0->s / v0->w, v0->t / v0->w, 0);
+        __m128 q1 = _mm_sub_ps(_mm_setr_ps(1 / v1->w, v1->s / v1->w, v1->t / v1->w, 0), q0);
+        __m128 q2 = _mm_sub_ps(_mm_setr_ps(1 / v2->w, v2->s / v2->w, v2->t / v2->w, 0), q0);
+        ta0 = q0;
+        tdx = _mm_mul_ps(_mm_sub_ps(_mm_mul_ps(q1, _mm_set1_ps(v2->y - v0->y)),
+                                    _mm_mul_ps(q2, _mm_set1_ps(v1->y - v0->y))), _mm_set1_ps(inv));
+        tdy = _mm_mul_ps(_mm_sub_ps(_mm_mul_ps(q2, _mm_set1_ps(v1->x - v0->x)),
+                                    _mm_mul_ps(q1, _mm_set1_ps(v2->x - v0->x))), _mm_set1_ps(inv));
+        float tex_area = ((v1->s - v0->s) * (v2->t - v0->t) - (v2->s - v0->s) * (v1->t - v0->t)) *
+                         (float)tex->w * (float)tex->h;
+        int minified = tex_area * tex_area > area * area;
+        GLenum f = minified ? tex->min_filter : tex->mag_filter;
+        linear = f == GL_LINEAR || f == GL_LINEAR_MIPMAP_NEAREST || f == GL_LINEAR_MIPMAP_LINEAR;
+        for (int k = 0; k < 3; k++)
+            env[k] = (uint32_t)gl_iround(c->tex_env_color[k] * 255);
+    }
+    float diw = 0, dsw = 0, dtw = 0;
+    if (tex) {
+        float lanes[4] __attribute__((aligned(16)));
+        _mm_store_ps(lanes, tdx);
+        diw = lanes[0];
+        dsw = lanes[1];
+        dtw = lanes[2];
+    }
+
     for (int y = y0; y < y1; y++) {
         float yc = y + 0.5f;
         float xa = t->x + (yc - t->y) * slope_tb;
@@ -229,7 +346,23 @@ static void triangle(struct fgl_context *c, const struct wvert *v0, const struct
         uint32_t *cp = s->color + (size_t)y * c->width + x0;
         uint32_t *zp = s->depth + (size_t)y * c->width + x0;
         int n = x1 - x0;
-        if (!test) {
+        if (tex) {
+            float lanes[4] __attribute__((aligned(16)));
+            _mm_store_ps(lanes, _mm_add_ps(_mm_add_ps(ta0, _mm_mul_ps(_mm_set1_ps(fx), tdx)),
+                                           _mm_mul_ps(_mm_set1_ps(fy), tdy)));
+            float iw = lanes[0], sw = lanes[1], tw = lanes[2];
+            GLenum mode = c->tex_env_mode;
+            for (int i = 0; i < n; i++, z += dz, r += dr, g += dg, bl += db, iw += diw, sw += dsw, tw += dtw) {
+                uint32_t zz = z < 0 ? 0 : (uint32_t)z;
+                if (test && !depth_pass(func, zz, zp[i]))
+                    continue;
+                if (write_z)
+                    zp[i] = zz;
+                float w = 1 / iw;
+                uint32_t tx = linear ? texel_linear(tex, sw * w, tw * w) : texel_nearest(tex, sw * w, tw * w);
+                cp[i] = tex_env(mode, tx, clamp8(r), clamp8(g), clamp8(bl), env);
+            }
+        } else if (!test) {
             span_color(cp, n, r, g, bl, dr, dg, db);
         } else if (func == GL_LESS) {
             span_less(cp, zp, n, write_z, z, r, g, bl, dz, dr, dg, db);
@@ -252,6 +385,13 @@ static void soft_polygon(struct fgl_context *c, const struct wvert *v, int n)
     gl_clip_rect(c, &x0, &y0, &x1, &y1);
     for (int i = 1; i + 1 < n; i++)
         triangle(c, &v[0], &v[i], &v[i + 1], x0, y0, x1, y1);
+}
+
+void gl_soft_load(struct fgl_context *c, const uint32_t *picture)
+{
+    struct soft *s = c->bpriv;
+    if (s)
+        memcpy(s->color, picture, (size_t)c->width * (size_t)c->height * 4);
 }
 
 static void soft_finish(struct fgl_context *c)

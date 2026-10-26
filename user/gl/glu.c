@@ -1,4 +1,5 @@
-/* GLU's view helpers, built on glFrustum, glOrtho and glMultMatrixf. */
+/* GLU's view helpers, built on glFrustum, glOrtho and glMultMatrixf, and
+ * gluBuild2DMipmaps. */
 #include <math.h>
 #include <GL/glu.h>
 
@@ -48,4 +49,11 @@ void gluLookAt(GLdouble eye_x, GLdouble eye_y, GLdouble eye_z,
     };
     glMultMatrixf(m);
     glTranslated(-eye_x, -eye_y, -eye_z);
+}
+
+GLint gluBuild2DMipmaps(GLenum target, GLint internal_format, GLsizei width, GLsizei height,
+                        GLenum format, GLenum type, const void *data)
+{
+    glTexImage2D(target, 0, internal_format, width, height, 0, format, type, data);
+    return glGetError() == GL_NO_ERROR ? 0 : GL_INVALID_VALUE;
 }

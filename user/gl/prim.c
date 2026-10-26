@@ -1,6 +1,7 @@
 /*
  * The vertex pipeline. Each glVertex is transformed to eye coordinates,
- * lit there, and projected to clip coordinates; glEnd assembles the
+ * lit there, and projected to clip coordinates, and takes the current
+ * texture coordinates through the texture matrix; glEnd assembles the
  * vertices into polygons, lines and points. Polygons are clipped against
  * the view volume (Sutherland-Hodgman, in homogeneous coordinates),
  * divided by w, mapped through the viewport, culled by their winding and
@@ -232,6 +233,17 @@ void glVertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w)
         light_vertex(c, eye, v->color);
     else
         _mm_store_ps(v->color, _mm_load_ps(c->color));
+    if (c->texture_2d) {
+        const float *tm = c->texture[c->tex_depth];
+        __m128 tc = _mm_load_ps(c->texcoord);
+        _mm_store_ps(v->tex, _mm_add_ps(_mm_add_ps(_mm_add_ps(
+                                 _mm_mul_ps(_mm_load_ps(tm), _mm_shuffle_ps(tc, tc, 0x00)),
+                                 _mm_mul_ps(_mm_load_ps(tm + 4), _mm_shuffle_ps(tc, tc, 0x55))),
+                                 _mm_mul_ps(_mm_load_ps(tm + 8), _mm_shuffle_ps(tc, tc, 0xAA))),
+                                 _mm_mul_ps(_mm_load_ps(tm + 12), _mm_shuffle_ps(tc, tc, 0xFF))));
+    } else {
+        _mm_store_ps(v->tex, _mm_setr_ps(0, 0, 0, 1));
+    }
 }
 
 void glVertex2f(GLfloat x, GLfloat y) { glVertex4f(x, y, 0, 1); }
@@ -280,8 +292,10 @@ static void lerp(struct cvert *out, const struct cvert *a, const struct cvert *b
     __m128 tt = _mm_set1_ps(t);
     __m128 ac = _mm_load_ps(a->clip), bc = _mm_load_ps(b->clip);
     __m128 acol = _mm_load_ps(a->color), bcol = _mm_load_ps(b->color);
+    __m128 atex = _mm_load_ps(a->tex), btex = _mm_load_ps(b->tex);
     _mm_store_ps(out->clip, _mm_add_ps(ac, _mm_mul_ps(_mm_sub_ps(bc, ac), tt)));
     _mm_store_ps(out->color, _mm_add_ps(acol, _mm_mul_ps(_mm_sub_ps(bcol, acol), tt)));
+    _mm_store_ps(out->tex, _mm_add_ps(atex, _mm_mul_ps(_mm_sub_ps(btex, atex), tt)));
 }
 
 /* Clip the polygon in place against every plane its vertices cross; returns its size. */
@@ -318,6 +332,10 @@ static void to_window(struct fgl_context *c, const struct cvert *v, struct wvert
     w->g = v->color[1];
     w->b = v->color[2];
     w->a = v->color[3];
+    float q = v->tex[3] != 0 ? 1 / v->tex[3] : 1;
+    w->s = v->tex[0] * q;
+    w->t = v->tex[1] * q;
+    w->w = v->clip[3];
 }
 
 static void draw_polygon(struct fgl_context *c, const int *idx, int n, int provoking)
@@ -432,6 +450,7 @@ void glBegin(GLenum mode)
         gl_error(c, GL_INVALID_ENUM);
         return;
     }
+    gl_tex_check_backend(c);
     c->prim = mode;
     c->in_begin = 1;
     c->nverts = 0;

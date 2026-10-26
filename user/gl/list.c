@@ -1,7 +1,9 @@
 /*
  * Display lists. While a list is being compiled, each GL call that can go
  * in one records an opcode, its argument count and its arguments (all as
- * floats; enums and list names fit exactly). glCallList replays them
+ * floats; enums and list and texture names fit exactly, up to 2^24).
+ * glTexImage2D and glTexSubImage2D are not recorded: they take effect
+ * when called, even under GL_COMPILE. glCallList replays them
  * through the same entry points, with recording held off so that a list
  * called during GL_COMPILE_AND_EXECUTE is not copied into the new one.
  */
@@ -204,6 +206,10 @@ static void replay(const struct dlist *l)
         case OP_SCISSOR: glScissor((GLint)a[0], (GLint)a[1], (GLsizei)a[2], (GLsizei)a[3]); break;
         case OP_POINT_SIZE: glPointSize(a[0]); break;
         case OP_LINE_WIDTH: glLineWidth(a[0]); break;
+        case OP_TEXCOORD: glTexCoord4f(a[0], a[1], a[2], a[3]); break;
+        case OP_BIND_TEXTURE: glBindTexture((GLenum)a[0], (GLuint)a[1]); break;
+        case OP_TEX_ENV: glTexEnvfv((GLenum)a[0], (GLenum)a[1], a + 2); break;
+        case OP_TEX_PARAMETER: glTexParameterfv((GLenum)a[0], (GLenum)a[1], a + 2); break;
         }
     }
 }

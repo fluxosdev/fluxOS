@@ -2,11 +2,15 @@
  * fluxOS OpenGL: a subset of OpenGL 1.1's fixed-function pipeline.
  *
  * Supported: immediate mode (glBegin/glEnd with every primitive type),
- * the modelview and projection matrix stacks, per-vertex lighting with
- * eight lights and materials (GL_COLOR_MATERIAL too), flat and smooth
- * shading, back-face culling, the depth buffer, scissoring and display
- * lists. Not supported: textures, blending, fog, stencil, vertex arrays,
- * pixel operations and selection.
+ * the modelview, projection and texture matrix stacks, per-vertex
+ * lighting with eight lights and materials (GL_COLOR_MATERIAL too), flat
+ * and smooth shading, back-face culling, the depth buffer, scissoring,
+ * display lists, and 2D textures: texture objects, perspective-correct,
+ * nearest or bilinear, repeating or clamped, in the modulate, replace,
+ * decal and blend modes. Textures need not be a power of two in size, and
+ * only level 0 is kept: the mipmap filters use it as their nearest or
+ * linear counterparts. Not supported: blending, fog, stencil, vertex
+ * arrays, pixel operations other than texture uploads, and selection.
  *
  * Create a context and see the picture with <GL/fluxgl.h>. Programs that
  * use GL must be built with the FPU allowed (the Makefile's
@@ -95,6 +99,7 @@ typedef double GLclampd;
 #define GL_BLEND           0x0BE2
 #define GL_SCISSOR_TEST    0x0C11
 #define GL_TEXTURE_2D      0x0DE1
+#define GL_TEXTURE_1D      0x0DE0
 #define GL_RESCALE_NORMAL  0x803A
 #define GL_LIGHT0          0x4000
 #define GL_LIGHT1          0x4001
@@ -130,6 +135,54 @@ typedef double GLclampd;
 #define GL_TEXTURE           0x1702
 #define GL_MODELVIEW_MATRIX  0x0BA6
 #define GL_PROJECTION_MATRIX 0x0BA7
+#define GL_TEXTURE_MATRIX    0x0BA8
+
+/* textures */
+#define GL_TEXTURE_WIDTH        0x1000
+#define GL_TEXTURE_HEIGHT       0x1001
+#define GL_TEXTURE_INTERNAL_FORMAT 0x1003
+#define GL_TEXTURE_BORDER_COLOR 0x1004
+#define GL_TEXTURE_MAG_FILTER   0x2800
+#define GL_TEXTURE_MIN_FILTER   0x2801
+#define GL_TEXTURE_WRAP_S       0x2802
+#define GL_TEXTURE_WRAP_T       0x2803
+#define GL_NEAREST              0x2600
+#define GL_LINEAR               0x2601
+#define GL_NEAREST_MIPMAP_NEAREST 0x2700
+#define GL_LINEAR_MIPMAP_NEAREST  0x2701
+#define GL_NEAREST_MIPMAP_LINEAR  0x2702
+#define GL_LINEAR_MIPMAP_LINEAR   0x2703
+#define GL_CLAMP                0x2900
+#define GL_REPEAT               0x2901
+#define GL_CLAMP_TO_EDGE        0x812F
+#define GL_TEXTURE_ENV          0x2300
+#define GL_TEXTURE_ENV_MODE     0x2200
+#define GL_TEXTURE_ENV_COLOR    0x2201
+#define GL_MODULATE             0x2100
+#define GL_DECAL                0x2101
+#define GL_REPLACE              0x1E01
+#define GL_TEXTURE_BINDING_2D   0x8069
+#define GL_MAX_TEXTURE_SIZE     0x0D33
+#define GL_MAX_TEXTURE_STACK_DEPTH 0x0D39
+#define GL_CURRENT_TEXTURE_COORDS 0x0B03
+
+/* pixel formats and types */
+#define GL_UNSIGNED_BYTE        0x1401
+#define GL_ALPHA                0x1906
+#define GL_RGB                  0x1907
+#define GL_RGBA                 0x1908
+#define GL_LUMINANCE            0x1909
+#define GL_LUMINANCE_ALPHA      0x190A
+#define GL_INTENSITY            0x8049
+#define GL_RGB8                 0x8051
+#define GL_RGBA8                0x8058
+#define GL_BGR                  0x80E0
+#define GL_BGRA                 0x80E1
+#define GL_UNPACK_ROW_LENGTH    0x0CF2
+#define GL_UNPACK_SKIP_ROWS     0x0CF3
+#define GL_UNPACK_SKIP_PIXELS   0x0CF4
+#define GL_UNPACK_ALIGNMENT     0x0CF5
+#define GL_PACK_ALIGNMENT       0x0D05
 
 /* display lists */
 #define GL_COMPILE             0x1300
@@ -263,6 +316,33 @@ void glMaterialf(GLenum face, GLenum pname, GLfloat param);
 void glMateriali(GLenum face, GLenum pname, GLint param);
 void glMaterialfv(GLenum face, GLenum pname, const GLfloat *params);
 void glColorMaterial(GLenum face, GLenum mode);
+
+/* textures */
+void glGenTextures(GLsizei n, GLuint *textures);
+void glDeleteTextures(GLsizei n, const GLuint *textures);
+void glBindTexture(GLenum target, GLuint texture);
+GLboolean glIsTexture(GLuint texture);
+void glTexImage2D(GLenum target, GLint level, GLint internal_format, GLsizei width, GLsizei height,
+                  GLint border, GLenum format, GLenum type, const GLvoid *pixels);
+void glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei width, GLsizei height,
+                     GLenum format, GLenum type, const GLvoid *pixels);
+void glTexParameteri(GLenum target, GLenum pname, GLint param);
+void glTexParameterf(GLenum target, GLenum pname, GLfloat param);
+void glTexParameteriv(GLenum target, GLenum pname, const GLint *params);
+void glTexParameterfv(GLenum target, GLenum pname, const GLfloat *params);
+void glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint *params);
+void glTexEnvi(GLenum target, GLenum pname, GLint param);
+void glTexEnvf(GLenum target, GLenum pname, GLfloat param);
+void glTexEnvfv(GLenum target, GLenum pname, const GLfloat *params);
+void glPixelStorei(GLenum pname, GLint param);
+void glTexCoord1f(GLfloat s);
+void glTexCoord2f(GLfloat s, GLfloat t);
+void glTexCoord2d(GLdouble s, GLdouble t);
+void glTexCoord2i(GLint s, GLint t);
+void glTexCoord2fv(const GLfloat *v);
+void glTexCoord3f(GLfloat s, GLfloat t, GLfloat r);
+void glTexCoord4f(GLfloat s, GLfloat t, GLfloat r, GLfloat q);
+void glTexCoord4fv(const GLfloat *v);
 
 /* display lists */
 GLuint glGenLists(GLsizei range);

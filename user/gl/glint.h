@@ -1,7 +1,8 @@
 /*
  * The GL library's insides. gl.c keeps the state, prim.c turns vertices
  * into lit, clipped polygons in window coordinates, list.c records and
- * replays display lists, and a backend draws the polygons: radeon.c on a
+ * replays display lists, tex.c keeps textures, and a backend draws the
+ * polygons: radeon.c on a
  * Radeon HD 4000's 3D engine, tdfx.c on a Voodoo card's, soft.c in memory.
  */
 #ifndef GLINT_H
@@ -17,21 +18,42 @@
 #define PROJECTION_DEPTH 4
 #define TEXTURE_DEPTH    2
 #define MAX_VIEWPORT     2048
+#define MAX_TEXTURE      2048           /* texels on a side */
 
 /* Four-float vectors and matrices are 16-byte aligned for SSE. */
 #define VEC4 __attribute__((aligned(16)))
 
-/* A vertex after transformation: clip coordinates and its color. */
+/* A vertex after transformation: clip coordinates, its color, and its
+ * texture coordinates (through the texture matrix). */
 struct cvert {
     float clip[4] VEC4;
-    float color[4];
+    float color[4] VEC4;
+    float tex[4] VEC4;
 };
 
 /* A vertex as the backends draw it: window pixels with the origin at the
- * top left, depth from 0 to 1, and color components from 0 to 1. */
+ * top left, depth from 0 to 1, color components from 0 to 1, texture
+ * coordinates (divided by q), and the clip w, for interpolating the
+ * texture coordinates with perspective. */
 struct wvert {
     float x, y, z;
     float r, g, b, a;
+    float s, t, w;
+};
+
+/* A texture object. Texels are kept as 0xAABBGGRR (bytes R, G, B, A),
+ * whatever the format they came in; an alpha or luminance texture is
+ * widened to that. */
+struct gltex {
+    GLuint name;
+    int w, h;
+    uint32_t *texels;
+    GLenum format;                      /* the base internal format: GL_RGB, GL_RGBA, ... */
+    GLenum min_filter, mag_filter, wrap_s, wrap_t;
+    float border[4];
+    /* the backend's copy */
+    int hw_stale;                       /* texels changed since it was made */
+    uint32_t hw_off, hw_size, hw_pitch;
 };
 
 struct light {
@@ -66,6 +88,9 @@ struct backend {
     void (*polygon)(struct fgl_context *c, const struct wvert *v, int n);
     void (*finish)(struct fgl_context *c);
     void (*read)(struct fgl_context *c, uint32_t *dst, int stride);
+    /* A texture is going away, or its texels changed: drop the backend's
+     * copy (optional). */
+    void (*tex_free)(struct fgl_context *c, struct gltex *t);
 };
 
 struct fgl_context {
@@ -102,7 +127,17 @@ struct fgl_context {
     float model_ambient[4] VEC4;
     GLenum cm_face, cm_mode;
 
+    /* textures */
+    int texture_2d;                     /* GL_TEXTURE_2D enabled */
+    struct gltex **textures;            /* by name; textures[0] is the default texture */
+    GLuint ntextures;
+    GLuint bound;                       /* GL_TEXTURE_BINDING_2D */
+    GLenum tex_env_mode;
+    float tex_env_color[4];
+    int unpack_align, unpack_row_length, unpack_skip_rows, unpack_skip_pixels;
+
     /* current attributes */
+    float texcoord[4] VEC4;
     float color[4] VEC4, normal[3];
     float eye_normal[3];
     int eye_normal_valid;
@@ -132,6 +167,14 @@ void gl_matrix_changed(struct fgl_context *c);
 /* The drawing rectangle: the buffer, cut down by the scissor box. */
 void gl_clip_rect(struct fgl_context *c, int *x0, int *y0, int *x1, int *y1);
 
+/* tex.c */
+void gl_tex_init(struct fgl_context *c);
+void gl_tex_free_all(struct fgl_context *c);
+/* The texture to draw with: GL_TEXTURE_2D is on and the bound texture has texels. */
+struct gltex *gl_active_texture(struct fgl_context *c);
+/* Before drawing: a backend that cannot texture gives way to software. */
+void gl_tex_check_backend(struct fgl_context *c);
+
 /* prim.c */
 void gl_prim_init(struct fgl_context *c);
 void gl_update_normal_matrix(struct fgl_context *c);
@@ -145,6 +188,7 @@ enum {
     OP_POP_MATRIX, OP_TRANSLATE, OP_ROTATE, OP_SCALE, OP_FRUSTUM, OP_ORTHO, OP_CALL_LIST,
     OP_CULL_FACE, OP_FRONT_FACE, OP_DEPTH_FUNC, OP_DEPTH_MASK, OP_DEPTH_RANGE, OP_CLEAR,
     OP_CLEAR_COLOR, OP_CLEAR_DEPTH, OP_VIEWPORT, OP_SCISSOR, OP_POINT_SIZE, OP_LINE_WIDTH,
+    OP_TEXCOORD, OP_BIND_TEXTURE, OP_TEX_ENV, OP_TEX_PARAMETER,
 };
 int gl_record(struct fgl_context *c, int op, int nargs, const float *args);
 void gl_free_lists(struct fgl_context *c);
@@ -169,6 +213,9 @@ int gl_tdfx_attach(struct fgl_context *c);     /* 0: the hardware took the conte
 int gl_tdfx_check(struct fgl_context *c);      /* 0: its video memory is still free */
 int gl_radeon_attach(struct fgl_context *c);
 int gl_radeon_check(struct fgl_context *c);    /* 0: the engine still runs */
+/* Draw in memory from now on, starting from the picture as it is. */
+int gl_use_software(struct fgl_context *c, int keep_picture);
+void gl_soft_load(struct fgl_context *c, const uint32_t *picture);
 
 /* Round to the nearest integer (CVTSS2SI, in MXCSR's default rounding). */
 static inline int gl_iround(float f)

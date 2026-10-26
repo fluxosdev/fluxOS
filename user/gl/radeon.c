@@ -6,12 +6,21 @@
  *
  *  - Each context gets a 32-bit color buffer (linear, lines a multiple of
  *    64 pixels) and a 24-bit depth buffer (1D tiled) in that memory.
- *  - Polygons become triangles in a vertex buffer: position and color as
- *    floats. They are drawn in runs, one DRAW_INDEX_AUTO per run, and a
- *    run ends when the render state changes. The vertex shader passes
- *    position and color through; the pixel shader writes the interpolated
- *    color, with blue and red swapped so memory holds 0xAARRGGBB. The
- *    engine does the depth test and Gouraud shading.
+ *  - Polygons become triangles in a vertex buffer: position, color and
+ *    texture coordinates as floats. They are drawn in runs, one
+ *    DRAW_INDEX_AUTO per run, and a run ends when the render state
+ *    changes. The vertex shader passes them through; one of three pixel
+ *    shaders writes the interpolated color, the texel times it
+ *    (GL_MODULATE) or the texel alone (GL_REPLACE), with blue and red
+ *    swapped so memory holds 0xAARRGGBB. The engine does the depth test,
+ *    Gouraud shading and the texture fetch.
+ *  - The position goes in as (x, y, z, w): x, y in pixels and z from 0
+ *    to 1, which PA_CL_VTE_CNTL has the engine take as they are, and the
+ *    clip w, which it inverts for interpolating with perspective.
+ *  - A texture is copied into video memory when it is first drawn with,
+ *    and again after it changes, as 8-bit RGBA texels with lines of a
+ *    multiple of 64. GL_DECAL draws as GL_REPLACE and GL_BLEND as
+ *    GL_MODULATE here; GL_CLAMP clamps to the edge texel.
  *  - glClear draws a rectangle at the clear depth with the depth test off
  *    and the color or depth writes masked as asked.
  *  - fglSwapBuffers submits the frame, then has the engine copy the color
@@ -40,6 +49,7 @@
 #define IT_SET_CONFIG_REG  0x68
 #define IT_SET_CONTEXT_REG 0x69
 #define IT_SET_RESOURCE    0x6D
+#define IT_SET_SAMPLER     0x6E
 #define SURFACE_SYNC_TC (1u << 23)
 #define SURFACE_SYNC_VC (1u << 24)
 #define SURFACE_SYNC_SH (1u << 27)
@@ -59,11 +69,20 @@
 #define CB_COLOR0_MASK     0x28100
 #define PA_SC_SCREEN_SCISSOR_TL  0x28030
 #define PA_SC_WINDOW_SCISSOR_TL  0x28204
+#define SPI_VS_OUT_ID_0    0x28614
+#define SPI_PS_INPUT_CNTL_0 0x28644
+#define SPI_PS_INPUT_CNTL_1 0x28648
+#define SPI_VS_OUT_CONFIG  0x286C4
+#define SPI_PS_IN_CONTROL_0 0x286CC
 #define CB_TARGET_MASK     0x28238
 #define CB_SHADER_MASK     0x2823C
 #define PA_SC_GENERIC_SCISSOR_TL 0x28240
 #define VGT_MAX_VTX_INDX   0x28400
 #define DB_DEPTH_CONTROL   0x28800
+#define PA_CL_VTE_CNTL     0x28818
+#define VTX_XY_FMT         (1u << 8)    /* x and y are already divided by w */
+#define VTX_Z_FMT          (1u << 9)    /* and z */
+#define VTX_W0_FMT         (1u << 10)   /* w is w, not 1/w */
 #define SQ_PGM_START_PS    0x28840
 #define SQ_PGM_RESOURCES_PS 0x28850
 #define SQ_PGM_EXPORTS_PS  0x28854
@@ -73,6 +92,11 @@
 #define SQ_PGM_CF_OFFSET_VS 0x288D0
 
 #define COLOR_8_8_8_8      0x1A
+#define FMT_8_8_8_8        0x1A         /* the texture format: the same */
+#define TEX_WRAP           0
+#define TEX_CLAMP_LAST_TEXEL 2
+#define TEX_VALID_TEXTURE  2u
+#define PERSP_GRADIENT_ENA (1u << 28)
 #define CB_FORMAT(x)       ((x) << 2)
 #define CB_ARRAY_LINEAR_ALIGNED (1u << 8)
 #define CB_SOURCE_FORMAT_EXPORT_NORM (1u << 27)
@@ -86,35 +110,70 @@
 #define DI_SRC_SEL_AUTO_INDEX 2
 
 /*
- * The shaders, R700 machine code. The vertex shader's two vertex fetches
- * read color into R1 and position (x, y, z, w) into R0 from buffer 0 (its
- * resource 160), in that order because both take the vertex index from
- * R0.x; it exports R0 as the position and R1 as parameter 0.
- * The pixel shader exports its interpolated parameter 0 as color 0,
- * swizzled (b, g, r, a). The fetch and export words follow the blit
- * shaders of Linux's r600_blit_shaders.c.
+ * The shaders, R700 machine code. The vertex shader's three vertex fetches
+ * read color into R1, texture coordinates into R2 and position (x, y, z,
+ * w) into R0 from buffer 0 (its resource 160), position last because all
+ * take the vertex index from R0.x; it exports R0 as the position and R1
+ * and R2 as parameters 0 and 1. The pixel shaders find those, interpolated,
+ * in R0 and R1, and export color 0 swizzled (b, g, r, a):
+ *  - ps_color: R0, the color.
+ *  - ps_modulate: a TEX clause samples texture 0 (sampler 0) at R1.xy,
+ *    normalized, into R1; an ALU clause multiplies R0 by it, channel by
+ *    channel; R0 goes out.
+ *  - ps_replace: the sample alone.
+ * The fetch, sample and export words follow the blit shaders of Linux's
+ * r600_blit_shaders.c (and the kernel's, radeon_blit_state.h); the ALU
+ * words are R700's (ALU_INST at bit 7 of word 1).
  */
 static const uint32_t vs_code[] = {
-    0x00000004, 0x81000400,         /* VTX clause at 32 bytes, 2 instructions */
+    0x00000004, 0x81000800,         /* VTX clause at 32 bytes, 3 instructions */
     0x0000203C, 0x94000688,         /* EXPORT_DONE POS0 from R0.xyzw */
-    0x0000C000, 0x14200688,         /* EXPORT_DONE PARAM0 from R1.xyzw, end of program */
-    0x00000000, 0x00000000,
+    0x0000C000, 0x13800688,         /* EXPORT PARAM0 from R1.xyzw */
+    0x00014001, 0x14200688,         /* EXPORT_DONE PARAM1 from R2.xyzw, end of program */
     0x3C000000, 0x68CD1001, 0x00080010, 0x00000000,    /* R1 = 4 floats at offset 16 */
+    0x3C000000, 0x68CD1002, 0x00080020, 0x00000000,    /* R2 = 4 floats at offset 32 */
     0x3C000000, 0x68CD1000, 0x00080000, 0x00000000,    /* R0 = 4 floats at offset 0 */
 };
 
-static const uint32_t ps_code[] = {
+static const uint32_t ps_color[] = {
     0x00000000, 0x9420060A,         /* EXPORT_DONE PIXEL0 from R0.zyxw, end of program */
+};
+
+/* An R700 ALU instruction R0.ch = R0.ch * R1.ch, the last of its group at w. */
+#define ALU_MUL_W0(ch) ((uint32_t)(ch) << 10 | 1u << 13 | (uint32_t)(ch) << 23 | ((ch) == 3 ? 1u << 31 : 0))
+#define ALU_MUL_W1(ch) (1u << 4 | 1u << 7 | (uint32_t)(ch) << 29)
+/* TEX: SAMPLE R1.xyzw from R1.xy, normalized, resource 0, sampler 0 */
+#define TEX_SAMPLE_R1 0x00010010, 0x300D1001, 0xB0800000, 0x00000000
+
+static const uint32_t ps_modulate[] = {
+    0x00000008, 0x80800000,         /* TEX clause at 64 bytes, 1 instruction */
+    0x00000004, 0xA00C0000,         /* ALU clause at 32 bytes, 4 instructions */
+    0x00000000, 0x9420060A,         /* EXPORT_DONE PIXEL0 from R0.zyxw, end of program */
+    0x00000000, 0x00000000,
+    ALU_MUL_W0(0), ALU_MUL_W1(0),
+    ALU_MUL_W0(1), ALU_MUL_W1(1),
+    ALU_MUL_W0(2), ALU_MUL_W1(2),
+    ALU_MUL_W0(3), ALU_MUL_W1(3),
+    TEX_SAMPLE_R1,
+};
+
+static const uint32_t ps_replace[] = {
+    0x00000002, 0x80800000,         /* TEX clause at 16 bytes, 1 instruction */
+    0x00008000, 0x9420060A,         /* EXPORT_DONE PIXEL0 from R1.zyxw, end of program */
+    TEX_SAMPLE_R1,
 };
 
 #define SHADER_BYTES 4096               /* at the start of the video memory */
 #define VS_OFF       0
-#define PS_OFF       256
+#define PS_COLOR_OFF 256
+#define PS_MODULATE_OFF 512
+#define PS_REPLACE_OFF 768
+#define VERTEX_BYTES 48                 /* position, color, texture coordinates */
 #define CMD_DWORDS   (64 * 1024)        /* the command buffer */
-#define VB_VERTS     (64 * 1024)        /* the vertex buffer, 32 bytes a vertex */
+#define VB_VERTS     (64 * 1024)        /* the vertex buffer */
 #define CMD_BYTES    (CMD_DWORDS * 4)
-#define VB_BYTES     (VB_VERTS * 32)
-#define MAX_REGIONS  16
+#define VB_BYTES     (VB_VERTS * VERTEX_BYTES)
+#define MAX_REGIONS  512                /* contexts' buffers and textures */
 
 /* The card, shared by every context in the process. */
 static struct {
@@ -191,7 +250,9 @@ static int open_card(void)
     hw.gpu = (uint64_t)d.gpu_hi << 32 | d.gpu_lo;
     strncpy(hw.name, di.adapter, sizeof(hw.name) - 1);
     memcpy(hw.vram + VS_OFF, vs_code, sizeof(vs_code));
-    memcpy(hw.vram + PS_OFF, ps_code, sizeof(ps_code));
+    memcpy(hw.vram + PS_COLOR_OFF, ps_color, sizeof(ps_color));
+    memcpy(hw.vram + PS_MODULATE_OFF, ps_modulate, sizeof(ps_modulate));
+    memcpy(hw.vram + PS_REPLACE_OFF, ps_replace, sizeof(ps_replace));
     hw.low = SHADER_BYTES;
 
     void *mem;
@@ -288,17 +349,17 @@ static void draw_run(void)
     uint32_t n = hw.nvb - hw.run;
     if (!n)
         return;
-    uint64_t addr = hw.vb_gpu + (uint64_t)hw.run * 32;
+    uint64_t addr = hw.vb_gpu + (uint64_t)hw.run * VERTEX_BYTES;
     emit(PACKET3(IT_SET_RESOURCE, 7));
     emit(0x460);                        /* the vertex shader's buffer 0 */
     emit((uint32_t)addr);
-    emit(n * 32 - 1);
-    emit(((uint32_t)(addr >> 32) & 0xFF) | 32u << 8);      /* stride 32 */
+    emit(n * VERTEX_BYTES - 1);
+    emit(((uint32_t)(addr >> 32) & 0xFF) | (uint32_t)VERTEX_BYTES << 8);   /* the stride */
     emit(1);
     emit(0);
     emit(0);
     emit(3u << 30);                     /* a valid buffer */
-    surface_sync(SURFACE_SYNC_TC | SURFACE_SYNC_VC, n * 32, addr);
+    surface_sync(SURFACE_SYNC_TC | SURFACE_SYNC_VC, n * VERTEX_BYTES, addr);
     set_config_reg(VGT_PRIMITIVE_TYPE, DI_PT_TRILIST);
     emit(PACKET3(IT_INDEX_TYPE, 0));
     emit(0);
@@ -325,24 +386,66 @@ static void submit(void)
     hw.loaded = NULL;                   /* the next buffer starts from the default state */
 }
 
-/* Everything a run needs: shaders, buffers, scissor and depth test. */
-static void emit_state(struct fgl_context *c, uint32_t target_mask, uint32_t depth_control)
+/* Texture 0 and sampler 0 of the pixel shader: tex, as copied to video memory. */
+static void emit_texture(const struct gltex *tex)
+{
+    uint64_t addr = hw.gpu + tex->hw_off;
+    surface_sync(SURFACE_SYNC_TC, tex->hw_size, addr);
+    emit(PACKET3(IT_SET_RESOURCE, 7));
+    emit(0);
+    emit(1u /* 2D */ | 1u << 3 /* linear aligned */ | (tex->hw_pitch / 8 - 1) << 8 |
+         (uint32_t)(tex->w - 1) << 19);
+    emit((uint32_t)FMT_8_8_8_8 << 26 | (uint32_t)(tex->h - 1));
+    emit((uint32_t)(addr >> 8));
+    emit((uint32_t)(addr >> 8));
+    emit(1u << 14 | 0u << 16 | 1u << 19 | 2u << 22 | 3u << 25);    /* R, G, B, A as x, y, z, w */
+    emit(0);
+    emit(TEX_VALID_TEXTURE << 30);
+
+    uint32_t clamp_s = tex->wrap_s == GL_REPEAT ? TEX_WRAP : TEX_CLAMP_LAST_TEXEL;
+    uint32_t clamp_t = tex->wrap_t == GL_REPEAT ? TEX_WRAP : TEX_CLAMP_LAST_TEXEL;
+    uint32_t mag = tex->mag_filter == GL_LINEAR;
+    uint32_t min = tex->min_filter == GL_LINEAR || tex->min_filter == GL_LINEAR_MIPMAP_NEAREST ||
+                   tex->min_filter == GL_LINEAR_MIPMAP_LINEAR;
+    emit(PACKET3(IT_SET_SAMPLER, 3));
+    emit(0);
+    emit(clamp_s | clamp_t << 3 | (uint32_t)TEX_CLAMP_LAST_TEXEL << 6 | mag << 9 | min << 12);
+    emit(0);                            /* only level 0 */
+    emit(0);
+}
+
+/* Everything a run needs: shaders, buffers, scissor, depth test, and the
+ * texture (NULL: none). */
+static void emit_state(struct fgl_context *c, uint32_t target_mask, uint32_t depth_control,
+                       const struct gltex *tex)
 {
     struct radeon *t = c->bpriv;
     int x0, y0, x1, y1;
     gl_clip_rect(c, &x0, &y0, &x1, &y1);
-    uint64_t vs = hw.gpu + VS_OFF, ps = hw.gpu + PS_OFF;
+    uint32_t ps_off = !tex ? PS_COLOR_OFF
+                      : c->tex_env_mode == GL_REPLACE || c->tex_env_mode == GL_DECAL ? PS_REPLACE_OFF
+                                                                                     : PS_MODULATE_OFF;
+    uint64_t vs = hw.gpu + VS_OFF, ps = hw.gpu + ps_off;
     uint64_t color = hw.gpu + t->color, depth = hw.gpu + t->depth;
     uint32_t size = (t->pitch / 8 - 1) | (t->pitch * t->height8 / 64 - 1) << 10;
 
     set_context_reg(SQ_PGM_START_VS, (uint32_t)(vs >> 8));
-    set_context_reg(SQ_PGM_RESOURCES_VS, 2);                /* R0 and R1 */
+    set_context_reg(SQ_PGM_RESOURCES_VS, 3);                /* R0 to R2 */
     set_context_reg(SQ_PGM_CF_OFFSET_VS, 0);
     set_context_reg(SQ_PGM_START_PS, (uint32_t)(ps >> 8));
-    set_context_reg(SQ_PGM_RESOURCES_PS, 1 | 1u << 28);
+    set_context_reg(SQ_PGM_RESOURCES_PS, 2 | 1u << 28);     /* R0 and R1 */
     set_context_reg(SQ_PGM_EXPORTS_PS, 2);
     set_context_reg(SQ_PGM_CF_OFFSET_PS, 0);
-    surface_sync(SURFACE_SYNC_SH, SHADER_BYTES, vs);
+    surface_sync(SURFACE_SYNC_SH, SHADER_BYTES, hw.gpu);
+    /* Two parameters from the vertex shader to the pixel shader's two inputs. */
+    set_context_reg(SPI_VS_OUT_ID_0, 0 | 1u << 8);
+    set_context_reg(SPI_VS_OUT_CONFIG, 1u << 1);
+    set_context_reg(SPI_PS_INPUT_CNTL_0, 0 | 3u << 8 | 1u << 11);
+    set_context_reg(SPI_PS_INPUT_CNTL_1, 1 | 3u << 8);
+    set_context_reg(SPI_PS_IN_CONTROL_0, 2 | PERSP_GRADIENT_ENA);
+    set_context_reg(PA_CL_VTE_CNTL, VTX_XY_FMT | VTX_Z_FMT | VTX_W0_FMT);
+    if (tex)
+        emit_texture(tex);
 
     set_context_reg(CB_COLOR0_BASE, (uint32_t)(color >> 8));
     set_context_reg(CB_COLOR0_SIZE, size);
@@ -386,32 +489,81 @@ static uint32_t depth_control(struct fgl_context *c)
 /* Room for verts more vertices and their state; submit first if need be. */
 static void make_room(uint32_t verts)
 {
-    if (hw.nvb + verts > VB_VERTS || hw.ncmd + 200 > CMD_DWORDS)
+    if (hw.nvb + verts > VB_VERTS || hw.ncmd + 250 > CMD_DWORDS)
         submit();
+}
+
+/* Copy the texture's texels to video memory (again, if they changed). */
+static int tex_upload(struct gltex *tex)
+{
+    uint32_t pitch = ((uint32_t)tex->w + 63) & ~63u;
+    uint32_t size = (pitch * (uint32_t)tex->h * 4 + 0xFFF) & ~0xFFFu;
+    if (tex->hw_size && hw.ncmd)
+        submit();                       /* what is queued may still read the old texels */
+    if (tex->hw_size && tex->hw_size < size) {
+        vram_free(tex->hw_off);
+        tex->hw_size = 0;
+    }
+    if (!tex->hw_size) {
+        if (vram_alloc(size, &tex->hw_off) < 0)
+            return -1;
+        tex->hw_size = size;
+    }
+    tex->hw_pitch = pitch;
+    for (int y = 0; y < tex->h; y++)
+        memcpy(hw.vram + tex->hw_off + (size_t)y * pitch * 4, tex->texels + (size_t)y * (size_t)tex->w,
+               (size_t)tex->w * 4);
+    tex->hw_stale = 0;
+    return 0;
+}
+
+static void radeon_tex_free(struct fgl_context *c, struct gltex *tex)
+{
+    (void)c;
+    if (!tex->hw_size)
+        return;
+    if (hw.state > 0 && hw.ncmd)
+        submit();
+    vram_free(tex->hw_off);
+    tex->hw_size = 0;
+    tex->hw_stale = 1;
 }
 
 /* This context's render state, if the command buffer lacks it. */
 static void load_state(struct fgl_context *c)
 {
+    struct gltex *tex = gl_active_texture(c);
+    if (tex && (tex->hw_stale || !tex->hw_size)) {
+        if (tex_upload(tex) < 0)
+            tex = NULL;                 /* no room in video memory: without it */
+        c->hw_dirty = 1;
+    }
+    if (tex && !tex->hw_size)
+        tex = NULL;
     if (hw.loaded == c && !c->hw_dirty)
         return;
     draw_run();
-    emit_state(c, 0xF, depth_control(c));
+    emit_state(c, 0xF, depth_control(c), tex);
     hw.loaded = c;
     c->hw_dirty = 0;
 }
 
-static void add_vertex(float x, float y, float z, const float *rgba)
+/* A vertex at window (x, y), depth z and clip w, with its color and texture coordinates. */
+static void add_vertex(float x, float y, float z, float w, const float *rgba, float s, float t)
 {
-    float *v = hw.vb + (size_t)hw.nvb * 8;
+    float *v = hw.vb + (size_t)hw.nvb * (VERTEX_BYTES / 4);
     v[0] = x;
     v[1] = y;
     v[2] = z;
-    v[3] = 1;
+    v[3] = w;
     v[4] = rgba[0];
     v[5] = rgba[1];
     v[6] = rgba[2];
     v[7] = rgba[3];
+    v[8] = s;
+    v[9] = t;
+    v[10] = 0;
+    v[11] = 1;
     hw.nvb++;
 }
 
@@ -461,6 +613,9 @@ static void radeon_destroy(struct fgl_context *c)
     if (t) {
         if (hw.state > 0)
             submit();
+        for (GLuint i = 0; i < c->ntextures; i++)
+            if (c->textures[i] && c->textures[i]->hw_size)
+                radeon_tex_free(c, c->textures[i]);
         vram_free(t->base);
         if (t->readback_mem)
             unlend(t->readback_mem, t->readback_handle);
@@ -478,15 +633,15 @@ static void radeon_clear(struct fgl_context *c, GLbitfield mask, int x0, int y0,
     make_room(6);
     draw_run();
     uint32_t dc = (mask & GL_DEPTH_BUFFER_BIT) ? Z_ENABLE | Z_WRITE_ENABLE | ZFUNC(ZFUNC_ALWAYS) : 0;
-    emit_state(c, (mask & GL_COLOR_BUFFER_BIT) ? 0xF : 0, dc);
+    emit_state(c, (mask & GL_COLOR_BUFFER_BIT) ? 0xF : 0, dc, NULL);
     float z = c->clear_depth;
     const float *rgba = c->clear_color;
-    add_vertex((float)x0, (float)y0, z, rgba);
-    add_vertex((float)x1, (float)y0, z, rgba);
-    add_vertex((float)x1, (float)y1, z, rgba);
-    add_vertex((float)x0, (float)y0, z, rgba);
-    add_vertex((float)x1, (float)y1, z, rgba);
-    add_vertex((float)x0, (float)y1, z, rgba);
+    add_vertex((float)x0, (float)y0, z, 1, rgba, 0, 0);
+    add_vertex((float)x1, (float)y0, z, 1, rgba, 0, 0);
+    add_vertex((float)x1, (float)y1, z, 1, rgba, 0, 0);
+    add_vertex((float)x0, (float)y0, z, 1, rgba, 0, 0);
+    add_vertex((float)x1, (float)y1, z, 1, rgba, 0, 0);
+    add_vertex((float)x0, (float)y1, z, 1, rgba, 0, 0);
     draw_run();
     hw.loaded = NULL;                   /* polygons need their own state again */
 }
@@ -498,9 +653,9 @@ static void radeon_polygon(struct fgl_context *c, const struct wvert *v, int n)
     make_room((uint32_t)(n - 2) * 3);
     load_state(c);
     for (int i = 1; i + 1 < n; i++) {   /* a fan of triangles */
-        add_vertex(v[0].x, v[0].y, v[0].z, &v[0].r);
-        add_vertex(v[i].x, v[i].y, v[i].z, &v[i].r);
-        add_vertex(v[i + 1].x, v[i + 1].y, v[i + 1].z, &v[i + 1].r);
+        const struct wvert *p[3] = { &v[0], &v[i], &v[i + 1] };
+        for (int k = 0; k < 3; k++)
+            add_vertex(p[k]->x, p[k]->y, p[k]->z, p[k]->w, &p[k]->r, p[k]->s, p[k]->t);
     }
 }
 
@@ -567,6 +722,7 @@ const struct backend gl_radeon_backend = {
     .polygon = radeon_polygon,
     .finish = radeon_finish,
     .read = radeon_read,
+    .tex_free = radeon_tex_free,
 };
 
 int gl_radeon_attach(struct fgl_context *c)
