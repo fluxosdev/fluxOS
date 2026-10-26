@@ -4,12 +4,12 @@
  * host, path and scheme they match. The jar is shared by every browser
  * window. Cookies with an expiry (Max-Age or Expires) are kept in
  * COOKIE_FILE and read back the first time the jar is used; session
- * cookies last until the desktop closes. SameSite is not enforced: a
- * cookie goes to any request it matches.
+ * cookies last until the desktop closes. SameSite defaults to Lax, with
+ * schemeful site comparison using the public suffix list.
  */
 #include <ctype.h>
 #include <fcntl.h>
-#include <flux.h>
+unsigned int uptime_ms(void);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,8 +17,11 @@
 #include <time.h>
 #include <unistd.h>
 #include "web.h"
+#include "webpolicy.h"
 
+#ifndef COOKIE_FILE
 #define COOKIE_FILE "/home/flux/.browser_cookies"
+#endif
 
 #define MAX_COOKIES 300
 #define MAX_COOKIE_LEN 4096
@@ -28,7 +31,7 @@ struct cookie {
     char *path;
     char *name, *value;
     long expires;               /* seconds since 1970; 0: until the browser closes */
-    uint8_t hostonly, secure, httponly;
+    uint8_t hostonly, secure, httponly, samesite; /* 0 Lax, 1 Strict, 2 None */
 };
 
 static struct cookie jar[MAX_COOKIES];
@@ -192,7 +195,7 @@ static void cookies_save(void)
             !plain(c->value))
             continue;                   /* session cookies are not kept */
         fprintf(f, "%s\t%d\t%s\t%d\t%d\t%ld\t%s\t%s\n", c->domain, c->hostonly, c->path, c->secure,
-                c->httponly, c->expires, c->name, c->value);
+                c->httponly | (c->samesite << 1), c->expires, c->name, c->value);
     }
     int bad = ferror(f);
     if (fclose(f) != 0 || bad || rename(tmp, COOKIE_FILE) < 0)
@@ -239,7 +242,8 @@ static void cookies_load(void)
             c->hostonly = (uint8_t)(atoi(f[1]) != 0);
             c->path = strdup(f[2]);
             c->secure = (uint8_t)(atoi(f[3]) != 0);
-            c->httponly = (uint8_t)(atoi(f[4]) != 0);
+            c->httponly = (uint8_t)(atoi(f[4]) & 1);
+            c->samesite = (uint8_t)((atoi(f[4]) >> 1) & 3);
             c->expires = atol(f[5]);
             c->name = strdup(f[6]);
             c->value = strdup(f[7]);
@@ -297,14 +301,17 @@ void cookie_set(const char *url, const char *line, int from_script)
         *--e = 0;
     while (*value == ' ')
         value++;
-    if (!*name) {
+    if (!*name ||
+        strspn(name, "!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") !=
+            strlen(name) ||
+        strpbrk(value, "\r\n\t")) {
         free(copy);
         return;
     }
 
     char domain[256];
     snprintf(domain, sizeof(domain), "%s", host);
-    int hostonly = 1, secure = 0, httponly = 0, remove = 0, have_max = 0;
+    int hostonly = 1, secure = 0, httponly = 0, remove = 0, have_max = 0, samesite = 0;
     long expires = 0;
     char cpath[1024] = "";
     for (char *a = attrs; a && *a;) {
@@ -332,7 +339,7 @@ void cookie_set(const char *url, const char *line, int from_script)
             size_t hl = strlen(host), dl = strlen(d);
             int suffix = dl == hl ? !strcmp(d, host)
                        : hl > dl && host[hl - dl - 1] == '.' && !strcmp(host + hl - dl, d);
-            if (!suffix || !strchr(d, '.') || is_ip(host)) {
+            if (!suffix || web_public_suffix(d) || is_ip(host)) {
                 free(copy);                     /* not the host's, or a bare "com" */
                 return;
             }
@@ -357,11 +364,26 @@ void cookie_set(const char *url, const char *line, int from_script)
             secure = 1;
         } else if (!strcasecmp(a, "httponly")) {
             httponly = 1;
+        } else if (!strcasecmp(a, "samesite") && v) {
+            samesite = !strcasecmp(v, "strict") ? 1 : !strcasecmp(v, "none") ? 2 : 0;
         }
         a = next;
     }
-    if (from_script)
-        httponly = 0;
+    if ((from_script && httponly) || (samesite == 2 && !secure) ||
+        (!strncmp(name, "__Secure-", 9) && (!https || !secure)) ||
+        (!strncmp(name, "__Host-", 7) && (!https || !secure || !hostonly || strcmp(cpath, "/")))) {
+        free(copy);
+        return;
+    }
+    if (!https)
+        for (int i = 0; i < njar; i++) {
+            const struct cookie *old = &jar[i];
+            if (old->secure && !strcmp(old->name, name) && domain_matches(old, host) &&
+                path_matches(old->path, cpath[0] ? cpath : path)) {
+                free(copy);
+                return;
+            }
+        }
     if (secure && !https) {                     /* only a secure page may set a secure cookie */
         free(copy);
         return;
@@ -399,6 +421,7 @@ void cookie_set(const char *url, const char *line, int from_script)
         c->hostonly = (uint8_t)hostonly;
         c->secure = (uint8_t)secure;
         c->httponly = (uint8_t)httponly;
+        c->samesite = (uint8_t)samesite;
         if (c->domain && c->path && c->name && c->value) {
             njar++;
             if (expires)
@@ -440,7 +463,8 @@ void cookie_set_from_headers(const char *url, const char *headers, int hlen)
  * The Cookie header's value for a request to url ("a=1; b=2"), or an empty
  * string. Scripts (scripts_only) do not see HttpOnly cookies.
  */
-void cookie_header(const char *url, int scripts_only, char *out, int size)
+static void cookie_header_for(const char *url, const char *site, int top_level, int safe_method,
+                              int scripts_only, char *out, int size)
 {
     char host[256], path[1024];
     int https;
@@ -450,6 +474,7 @@ void cookie_header(const char *url, int scripts_only, char *out, int size)
     if (split_url(url, host, sizeof(host), path, sizeof(path), &https) < 0)
         return;
     drop_expired();
+    int same = web_same_site(url, site);
     int len = 0;
     /* longer paths first, as the standard asks */
     for (int pass = 2; pass >= 0; pass--) {
@@ -458,7 +483,9 @@ void cookie_header(const char *url, int scripts_only, char *out, int size)
             size_t pl = strlen(c->path);
             int rank = pl > 40 ? 2 : pl > 1 ? 1 : 0;
             if (rank != pass || !domain_matches(c, host) || !path_matches(c->path, path) ||
-                (c->secure && !https) || (scripts_only && c->httponly))
+                (c->secure && !https) || (scripts_only && c->httponly) ||
+                (!scripts_only && !same &&
+                 (c->samesite == 1 || (c->samesite == 0 && !(top_level && safe_method)))))
                 continue;
             int need = (int)(strlen(c->name) + strlen(c->value) + 3);
             if (len + need >= size)
@@ -466,4 +493,14 @@ void cookie_header(const char *url, int scripts_only, char *out, int size)
             len += snprintf(out + len, (size_t)(size - len), "%s%s=%s", len ? "; " : "", c->name, c->value);
         }
     }
+}
+
+void cookie_header(const char *url, int scripts_only, char *out, int size)
+{
+    cookie_header_for(url, url, 0, 0, scripts_only, out, size);
+}
+void cookie_header_context(const char *url, const char *site, int top_level, int safe_method, char *out,
+                           int size)
+{
+    cookie_header_for(url, site, top_level, safe_method, 0, out, size);
 }

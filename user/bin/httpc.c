@@ -4,7 +4,7 @@
  * Starting wget for every picture and style sheet costs a process, a name lookup, a TCP connection
  * and for https a TLS handshake each time. httpc stays running, keeps connections to servers open
  * between requests, keeps a cache of what it fetched and unpacks compressed bodies (libc's <http.h>).
- * It does one request at a time, as the browser does, so the browser can have the desktop go on
+ * Each worker does one request at a time. The browser uses a bounded worker pool, keeping the desktop
  * running while a page loads.
  *
  *   httpc [--cache DIR] [--cache-max BYTES]
@@ -34,7 +34,7 @@
 #define MAX_URL     4096
 #define MAX_HDR     8192
 #define MAX_NHDR    32
-#define MAX_BODY    (8u << 20)
+#define MAX_BODY (16u << 20)
 #define IDLE_MS     15000               /* connections unused this long are closed */
 #define CHUNK       (60 * 1024)
 
@@ -213,7 +213,7 @@ static void run(const char *url, const char *const *headers, int nheaders, const
         for (size_t off = 0; off < rs.body_len; off += CHUNK)
             put_frame('B', id, 0, rs.body + off, rs.body_len - off < CHUNK ? rs.body_len - off : CHUNK);
     }
-    put_frame('E', id, 0, rs.truncated ? "truncated" : "", rs.truncated ? 9 : 0);
+    put_frame('E', id, rs.truncated ? 1 : 0, rs.truncated ? "response exceeds memory limit" : "", rs.truncated ? 29 : 0);
     http_response_free(&rs);
 }
 

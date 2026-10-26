@@ -13,7 +13,8 @@
 > bootloader glue and kernel to the TCP/IP stack, the desktop and the web
 > browser, was written with [Claude](https://claude.ai), Anthropic's AI model,
 > working through [Claude Code](https://claude.com/claude-code), and ChatGPT
-> Codex from instructions given in conversation. No code was written by hand. It has
+> Codex from instructions given in conversation. Apart from bundled third-party code,
+> no project code was written by hand. It has
 > been tested by running it in QEMU, not reviewed or audited by people, so
 > read it with that in mind.
 
@@ -200,6 +201,22 @@ fetcher process, so the desktop keeps running), or from `file://`.
   `304`, `no-store` and `Vary` other than `Accept-Encoding` are respected, and
   Refresh (F5) asks the server about the page itself. If a fetcher cannot be started
   (eight run at most) the page is fetched by `wget` as before.
+- **HTTPS authentication**: Mbed TLS 3.6.7 verifies the server's certificate
+  chain, hostname, validity dates, key usage and TLS 1.3 CertificateVerify
+  signature against `/etc/ssl/ca-certificates.crt`. Invalid authentication
+  fails the connection. The trust bundle contains the Mozilla roots from the
+  build host's Debian ca-certificates package, excluding local additions.
+- **WebSocket**: real `ws://` and authenticated `wss://` connections through
+  `/bin/wsc` workers, including subprotocol negotiation, text and binary messages,
+  fragmentation, ping/pong, close handshakes, cookies and open/message/error/close
+  events. Client frames are masked; invalid handshake proofs, server masking,
+  reserved frame bits and malformed UTF-8 are rejected. HTTPS pages cannot open
+  insecure sockets. Each page has at most eight live sockets, with a 4 MB message
+  and send-queue limit. Compression extensions are not negotiated.
+- **Loading limits**: up to 1024 queued resource entries, with a growing queue;
+  documents and resources may be up to 16 MB. Requests are still serialized per
+  window. Oversized binary/large request bodies require httpc; the wget fallback
+  rejects bodies it cannot represent instead of silently truncating them.
 - **HTML**: follows the main rules of the HTML5 tree builder (implied and
   auto-closed tags, tables, character references, quirks mode); UTF-8,
   Latin-1 and Windows-1252. The complete HTML5 named character-reference table
@@ -271,7 +288,9 @@ fetcher process, so the desktop keeps running), or from `file://`.
   `HttpOnly`, `Max-Age`, `Expires`) and goes out on every request, so
   logins and `fetch` calls keep their session. Cookies with an expiry are kept
   in `/home/flux/.browser_cookies` (plain text) and are there next time; session
-  cookies last until the desktop closes. `SameSite` is not enforced.
+  cookies last until the desktop closes. `SameSite` defaults to Lax and is enforced using schemeful sites and the
+  public suffix list (including private suffixes). Invalid public-suffix Domain,
+  insecure SameSite=None and invalid __Host-/__Secure- cookies are rejected.
 - **Pictures**: PNG, JPEG, GIF (first frame), ICO (the largest icon) and SVG, as `<img>` and as an
   inline `<svg>`. `srcset`/`sizes` and `<picture><source>` choose a picture of
   the right width in a format the browser can decode (not WebP or AVIF). The SVG renderer (svg.c) draws shapes, paths (curves and
@@ -303,7 +322,8 @@ fetcher process, so the desktop keeps running), or from `file://`.
   `mouse*`, `mouseenter`/`mouseleave`), `scroll` and `resize` events,
   `MutationObserver`, `IntersectionObserver` and `ResizeObserver`, custom
   elements (`customElements.define` with upgrades and lifecycle callbacks;
-  `attachShadow` gives the element itself as its shadow root), `<template>`
+  `attachShadow` creates a separate open or closed tree, with scoped styles,
+  named/default slots and event retargeting), `<template>`
   content, `<dialog>`, `HTMLInputElement` and the other interfaces for
   `instanceof`, `TreeWalker`, `Range`/`Selection`, form validation,
   `form.submit()`/`requestSubmit()`, `load`/`error` events for pictures,
@@ -314,12 +334,21 @@ fetcher process, so the desktop keeps running), or from `file://`.
   (per origin, kept in `/home/flux/.browser_storage`) and `sessionStorage`
   (per origin and window), `XMLHttpRequest`, `fetch`,
   `URL`, and more: `FormData`, `Blob`, `TextEncoder`/`TextDecoder`, `crypto.getRandomValues`/`randomUUID`,
-  `DOMParser`, `postMessage`, a style element's `sheet.insertRule()`, and stand-ins for `WebSocket`,
-  `Notification`, `element.animate()` (it skips to the end) and web fonts. Also `MessageChannel`
+  `DOMParser`, `postMessage`, a style element's `sheet.insertRule()`, and a stand-in for `Notification`. Downloaded fonts use FreeType and Brotli, with CSS `@font-face`, `FontFace`, and `document.fonts` loading. `element.animate()` interpolates numeric values,
+  lengths and RGB colors over time, with pause/play/reverse, seeking, fill,
+  direction, iterations and common easing functions. Also `MessageChannel`
   and `BroadcastChannel` (within the page), `XMLSerializer`, `Path2D` and `ImageData` (data only: no canvas
   to draw on), the `beforeunload`, `pagehide` and `visibilitychange` (minimized) events, and
   `unhandledrejection` for promises that are rejected with nobody to hear it.
-  `fetch` and `XMLHttpRequest` send request headers and any method (`PUT`, `DELETE`...). Changes are laid out again when a script returns; runaway
+  `fetch` and `XMLHttpRequest` enforce CORS (including preflights and exposed
+  response headers), credential modes and mixed-content/local-file restrictions.
+  They send request headers and any allowed method (`PUT`, `DELETE`...), and
+  preserve binary request/response bodies. Response supports `arrayBuffer()`,
+  `bytes()`, `blob()` and an incremental `ReadableStream` body. Typed arrays and
+  DataView use shared ArrayBuffer bytes, offsets, endian handling and conversion
+  on indexed writes; core string indexing, lengths, slicing and search use
+  UTF-16 code units. `crypto.getRandomValues` reads the OS random device.
+  Changes are laid out again when a script returns; runaway
   scripts are stopped. `/usr/share/www/js.html`, `css.html` and `images.html`
   (linked from the home page) are live test pages. `features.html` demonstrates
   the HTML, CSS and DOM additions in 0.2.0, and `modern.html` the modules,
@@ -398,7 +427,10 @@ host's GRUB. The ISO boots on legacy BIOS only.
 ```sh
 make            # builds fluxOS.iso
 make check      # verifies the kernel is a valid Multiboot image
-make test-browser # runs DOM/classList regressions on a Linux x86 host
+make test-browser # DOM, CSS/layout, binary/Unicode, shadow/motion and HTTP policy regressions
+make test-browser-fonts # real glyph rendering and malformed-font rejection
+make test-tls     # local OpenSSL servers: authenticated handshakes and rejected certificates
+make test-websocket # local ws/wss transport and browser API integration tests
 make test-kernel # runs allocator, filesystem, pipe and socket regressions on the host
 make test-kernel-qemu # boots kernel regressions with a disposable initrd and scratch disk
 make disk       # fluxdisk.img, a 64 MiB FAT32 data disk (DISK_MB=...)
@@ -410,6 +442,10 @@ make run-q35    # q35 machine: disk and CD on SATA, USB keyboard and tablet on x
 make run-usb    # disk as a USB stick on EHCI, keyboard and mouse on UHCI
 make clean      # removes build/ and the ISO; the disk images are kept
 ```
+
+The TLS host tests additionally need OpenSSL and the Python `cryptography`
+package. They generate temporary CA/server certificates and use loopback-only
+servers, including tampered signature/transcript rejection checks.
 
 The QEMU targets emulate a Pentium III (`QEMU_CPU=-cpu pentium3`), so
 anything newer that slipped into the build would show up there. `make run
@@ -490,8 +526,10 @@ user/desktop/              compositor and window manager (wm.c), apps (files, ed
                            font_archivo.c), PNG/JPEG/GIF/ICO/SVG decoding (png.c, jpeg.c,
                            gif.c, ico.c, svg.c, image.c), the wallpaper, and the browser:
                            window (browser.c), HTML (html.c), CSS (css.c), layout
-                           (layout.c), fonts (webfont.c), URLs (webutil.c), and
-                           JavaScript (js.c, jslib*.c, jsre.c, jsgc.c, jsdom.c)
+                           (layout.c), shadow composition (shadow.c), fonts (webfont.c),
+                           URLs (webutil.c), request policy (webpolicy.c), and
+                           JavaScript (js.c, jslib*.c, jsbinary.c, jsre.c, jsgc.c, jsdom.c)
+third_party/mbedtls/        upstream verification library subset and its fluxOS config
 user/dos/                  the DOS emulator (CPU, DPMI, BIOS, video, files, sound)
 user/bin/                  one program per file (fluxinstall.c is the installer)
 rootfs/                    files copied into the initrd (/etc, /home/flux, icons,
@@ -628,22 +666,30 @@ cannot be used.
 - **Network:** IPv4 only, one card, no IP fragments, no TCP congestion control
   or out-of-order buffering. forcedeth runs at 10/100 Mbit/s without offload,
   VLANs, wake-on-LAN or MSI. HTTPS is TLS 1.3 with TLS_AES_128_GCM_SHA256 and
-  X25519 only, and certificates are not verified.
+  X25519 only; certificate chains and handshake signatures are verified using
+  Mbed TLS and a bundled CA trust store. The trust bundle needs periodic updates.
 - **Browser:** JavaScript has no real BigInt, and `Proxy` cannot wrap a function;
-  strings count UTF-8 bytes, `Symbol`s are strings, `WebSocket` is a stand-in
-  that does nothing, typed arrays are plain arrays, and `eval` runs
+  `Symbol`s are strings,
+  regular expressions still operate on UTF-8 bytes, and `eval` runs
   in the global scope, so many modern web apps won't run. Layout is an
   approximation: the scroll bars of boxes lie over their contents instead of making room
   (text can end up under them), and boxes with `overflow` that are table cells, or `<body>` and
-  `<html>`, do not clip or scroll; text selection and `getBoundingClientRect()` ignore how far
-  boxes are scrolled; backgrounds are not clipped by `background-clip`, `fixed` attachments
+  `<html>`, do not clip or scroll; text selection and `getBoundingClientRect()` account for nested box scrolling,
+  while geometry for some positioned boxes is approximate; backgrounds are not clipped by `background-clip`, `fixed` attachments
   scroll with the box, only the first picture layer is used, `space` and `round` repeat; `z-index` only orders absolute and fixed boxes, `sticky` works
-  against the window only, transforms other than `translate` and all
-  `transition`s and animations are ignored, flex rows are lines of inline-blocks, grids lack named lines and
-  column flow. GIF animations show their
+  against the window only, transforms other than `translate`,
+  CSS `transition`s and CSS animations are ignored (Web Animations has a limited
+  numeric/color interpolator). Flexbox has grow/shrink sizing, wrapping,
+  ordering, alignment and rows/columns, but needs wider conformance testing;
+  grids lack named lines and column flow. Shadow DOM lacks `:host`, `::slotted`,
+  adopted style sheets and complete slotchange/composed-event behavior.
+  Fetch resolves at headers and delivers body chunks incrementally; EventSource
+  parses event streams and reconnects. Each page uses up to four request workers.
+  Stream queues currently have limited backpressure. GIF animations show their
   first frame; SVG ignores clip paths, masks, filters and patterns. There are
-  no font downloads, and characters
-  outside Latin-1 and common punctuation show as `?`. Connections are kept per
+  downloadable TrueType/OpenType, WOFF and WOFF2 fonts, but no complex-script
+  shaping or complete bidirectional text support; the built-in fonts cover Latin
+  Extended, Greek, Cyrillic and common punctuation. Other characters show as `?`. Connections are kept per
   window, not shared between them, and the cache is for the browser only (wget
   does not use it).
 - **Graphics:** only the 3dfx and Radeon drivers set modes (others keep the BIOS
@@ -673,3 +719,13 @@ text is rasterised from Liberation Sans, Serif and Mono and, in the Kinetik them
 [Archivo](https://fonts.google.com/specimen/Archivo) by The Archivo Project Authors (SIL Open
 Font License 1.1; its license is in `/usr/share/doc/fonts/LICENSE.archivo`). Kinetik's look follows the
 Kinetik studies for fluxOS.
+
+Certificate and TLS handshake signature verification uses the bundled
+[Mbed TLS 3.6.7](https://github.com/Mbed-TLS/mbedtls/tree/mbedtls-3.6.7)
+verification subset (Apache-2.0 OR GPL-2.0-or-later; see
+`third_party/mbedtls/LICENSE` and `README.flux`). Cookie site/domain rules use
+[the Public Suffix List](https://publicsuffix.org/) (Mozilla Public License 2.0).
+
+Downloaded font parsing and rasterization use [FreeType 2.14.3](https://freetype.org/)
+under the FreeType License, and WOFF2 decoding uses [Brotli 1.2.1](https://github.com/google/brotli)
+under the MIT license. Source subsets, licenses, and port notes are in `third_party/`.

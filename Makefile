@@ -76,7 +76,27 @@ KERNEL_SRCS := kernel/boot.S kernel/entry.S kernel/sse.S kernel/radeon_fw.S $(wi
 KERNEL_OBJS := $(patsubst %,$(BUILD)/k/%.o,$(basename $(KERNEL_SRCS)))
 
 # ---- user space ----
-LIBC_SRCS := $(wildcard user/libc/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c lib/sha256.c
+MBEDTLS_DIR := third_party/mbedtls
+MBEDTLS_FLAGS := -I$(MBEDTLS_DIR)/include -I$(MBEDTLS_DIR) -DMBEDTLS_CONFIG_FILE='"flux_config.h"'
+USER_CFLAGS += $(MBEDTLS_FLAGS)
+MBEDTLS_SRCS := $(wildcard $(MBEDTLS_DIR)/library/*.c)
+FREETYPE_DIR := third_party/freetype
+BROTLI_DIR := third_party/brotli
+FONT_FLAGS := -I$(FREETYPE_DIR)/include -I$(FREETYPE_DIR) -I$(BROTLI_DIR)/c/include \
+	-DFT2_BUILD_LIBRARY -DFT_CONFIG_MODULES_H='"flux_ftmodule.h"' \
+	-DFT_CONFIG_OPTIONS_H='"flux_ftoption.h"' -DFT_CONFIG_STANDARD_LIBRARY_H='"flux_ftstdlib.h"'
+FREETYPE_SRCS := $(addprefix $(FREETYPE_DIR)/src/,base/ftbase.c base/ftinit.c base/ftsystem.c base/ftdebug.c \
+	base/ftbitmap.c base/ftglyph.c base/ftmm.c base/ftfstype.c sfnt/sfnt.c truetype/truetype.c cff/cff.c \
+	psnames/psnames.c psaux/psaux.c pshinter/pshinter.c raster/raster.c smooth/smooth.c gzip/ftgzip.c)
+BROTLI_SRCS := $(wildcard $(BROTLI_DIR)/c/common/*.c $(BROTLI_DIR)/c/dec/*.c)
+FONT_SRCS := $(FREETYPE_SRCS) $(BROTLI_SRCS)
+FONT_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(FONT_SRCS)))
+LIBFONT := $(BUILD)/libfont.a
+$(FONT_OBJS) $(BUILD)/u/user/desktop/webfont.o: USER_CFLAGS += $(FONT_FLAGS)
+$(LIBFONT): $(FONT_OBJS)
+	$(AR) rcs $@ $^
+
+LIBC_SRCS := $(wildcard user/libc/*.c) $(MBEDTLS_SRCS) lib/string.c lib/vsnprintf.c lib/font8x16.c lib/sha256.c
 LIBC_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(LIBC_SRCS)))
 CRT0      := $(BUILD)/u/user/libc/crt0.o
 LIBC      := $(BUILD)/libc.a
@@ -144,9 +164,9 @@ $(ROOTFS)/bin/fsh: $(CRT0) $(FSH_OBJS) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(FSH_OBJS) $(LIBC)
 
-$(ROOTFS)/bin/desktop: $(CRT0) $(DESKTOP_OBJS) $(LIBGL) $(LIBC) user/user.ld
+$(ROOTFS)/bin/desktop: $(CRT0) $(DESKTOP_OBJS) $(LIBGL) $(LIBFONT) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
-	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(DESKTOP_OBJS) $(LIBGL) $(LIBC)
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(DESKTOP_OBJS) $(LIBGL) $(LIBFONT) $(LIBC)
 
 $(ROOTFS)/bin/dos: $(CRT0) $(DOS_OBJS) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
@@ -248,13 +268,16 @@ clean:
 
 # Run the browser's actual HTML/DOM/JS code on the host, without booting QEMU.
 HOSTCC ?= cc
-BROWSER_TEST_SRCS := tests/browser-dom.c $(addprefix user/desktop/,js.c jslib.c jslib2.c jsre.c jsgc.c jsdom.c html.c webutil.c webstore.c css.c csscolor.c)
+BROWSER_TEST_SRCS := tests/browser-dom.c $(addprefix user/desktop/,js.c jslib.c jslib2.c jsbinary.c jsnet.c jsre.c jsgc.c jsdom.c html.c shadow.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c)
 .PHONY: test-browser
-test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout
+test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout $(BUILD)/tests/browser-policy $(BUILD)/tests/browser-http
 	$< rootfs/usr/share/www/classlist-tests.js 20
 	$< rootfs/usr/share/www/dom-feature-tests.js 31
 	$(BUILD)/tests/browser-style
 	$(BUILD)/tests/browser-layout
+	$(BUILD)/tests/browser-policy
+	$(BUILD)/tests/browser-http
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/modern-core-tests.js 44
 
 $(BUILD)/tests/browser-dom: $(BROWSER_TEST_SRCS) $(wildcard user/desktop/*.h) user/include/flux.h include/flux/abi.h
 	@mkdir -p $(dir $@)
@@ -292,8 +315,59 @@ $(BUILD)/tests/browser-style: tests/browser-style.c user/desktop/html.c user/des
 		-Iuser/desktop tests/browser-style.c user/desktop/html.c user/desktop/css.c user/desktop/csscolor.c \
 		user/desktop/webutil.c -lm -o $@
 
-$(BUILD)/tests/browser-layout: tests/browser-layout.c $(addprefix user/desktop/,layout.c html.c css.c csscolor.c webutil.c) $(wildcard user/desktop/*.h)
+$(BUILD)/tests/browser-layout: tests/browser-layout.c $(addprefix user/desktop/,layout.c html.c css.c csscolor.c cssfont.c webutil.c) $(wildcard user/desktop/*.h)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g -msse -Wall -Wextra -Wno-unused-parameter -Iuser/desktop -Iinclude \
-		tests/browser-layout.c user/desktop/layout.c user/desktop/html.c user/desktop/css.c \
-		user/desktop/csscolor.c user/desktop/webutil.c -lm -o $@
+		tests/browser-layout.c user/desktop/layout.c user/desktop/shadow.c user/desktop/html.c user/desktop/css.c \
+		user/desktop/csscolor.c user/desktop/cssfont.c user/desktop/webutil.c -lm -o $@
+
+# TLS tests use temporary certificates and local OpenSSL servers; never the Internet.
+$(BUILD)/tests/tls-client: tests/tls-client.c user/libc/tls.c user/libc/tlsverify.c lib/sha256.c $(MBEDTLS_SRCS) $(MBEDTLS_DIR)/flux_config.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -Iinclude -idirafter user/include $(MBEDTLS_FLAGS) \
+		-DTLS_CA_FILE='"$(CURDIR)/$(BUILD)/tests/tls/ca.pem"' \
+		tests/tls-client.c user/libc/tls.c user/libc/tlsverify.c lib/sha256.c $(MBEDTLS_SRCS) -o $@
+.PHONY: test-tls
+test-tls: $(BUILD)/tests/tls-client $(BUILD)/tests/tls-signature
+	python3 tools/test-tls.py
+
+$(BUILD)/tests/browser-policy: tests/browser-policy.c user/desktop/webpolicy.c user/desktop/publicsuffix.h user/desktop/cookies.c
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -Iuser/desktop -Iinclude -idirafter user/include \
+		-DCOOKIE_FILE='"$(CURDIR)/$(BUILD)/tests/policy-cookies"' tests/browser-policy.c user/desktop/webpolicy.c user/desktop/cookies.c -o $@
+
+$(BUILD)/tests/browser-http: tests/browser-http.c $(BROWSER_TEST_SRCS) $(wildcard user/desktop/*.h)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -Iuser/desktop -Iinclude -idirafter user/include \
+		tests/browser-http.c $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS)) \
+		-Wl,--defsym=__gc_data_start=__data_start,--defsym=__gc_data_end=_end -lm -o $@
+
+$(BUILD)/tests/browser-font: tests/browser-font.c user/desktop/webfont.c user/desktop/webutil.c $(FONT_SRCS) $(FREETYPE_DIR)/flux_ftoption.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -msse -Iuser/desktop $(FONT_FLAGS) \
+		-DFONT_FILE='"$(CURDIR)/$(BUILD)/tests/font-test.fnt"' $(filter %.c,$^) -o $@
+.PHONY: test-browser-fonts
+test-browser-fonts: $(BUILD)/tests/browser-font
+	python3 tools/test-browser-fonts.py
+
+$(BUILD)/tests/tls-signature: tests/tls-signature.c user/libc/tlsverify.c $(MBEDTLS_SRCS) $(MBEDTLS_DIR)/flux_config.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -Iuser/libc $(MBEDTLS_FLAGS) \
+		-DTLS_CA_FILE='"$(CURDIR)/$(BUILD)/tests/tls/ca.pem"' \
+		tests/tls-signature.c user/libc/tlsverify.c $(MBEDTLS_SRCS) -o $@
+
+$(BUILD)/tests/wsc: user/bin/wsc.c user/libc/tls.c user/libc/tlsverify.c lib/sha256.c $(MBEDTLS_SRCS) $(MBEDTLS_DIR)/flux_config.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -Iinclude -idirafter user/include $(MBEDTLS_FLAGS) \
+		-DTLS_CA_FILE='"$(CURDIR)/$(BUILD)/tests/ws/ca.pem"' \
+		user/bin/wsc.c user/libc/tls.c user/libc/tlsverify.c lib/sha256.c $(MBEDTLS_SRCS) -o $@
+.PHONY: test-websocket
+test-websocket: $(BUILD)/tests/wsc $(BUILD)/tests/browser-ws
+	python3 tools/test-websocket.py
+
+$(BUILD)/tests/browser-ws: tests/browser-ws.c $(BROWSER_TEST_SRCS) $(wildcard user/desktop/*.h)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -Iuser/desktop -Iinclude -idirafter user/include \
+		-DWS_HELPER='"$(CURDIR)/$(BUILD)/tests/wsc"' \
+		tests/browser-ws.c $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS)) \
+		-Wl,--defsym=__gc_data_start=__data_start,--defsym=__gc_data_end=_end -lm -o $@

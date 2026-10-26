@@ -2838,17 +2838,24 @@ static int box_values(const char *value, const struct vctx *v, struct len out[4]
     return 1;
 }
 
+int (*css_font_lookup)(void *,const char *);
+void *css_font_context;
+
 static int family_of(const char *value, int fallback)
 {
-    const char *w[16];
-    int wl[16], n = words(value, w, wl, 16);
-    for (int i = 0; i < n; i++) {
-        char f[64];
-        int fl = 0;
-        for (int k = 0; k < wl[i] && fl < 63; k++)
-            if (w[i][k] != '"' && w[i][k] != '\'')
-                f[fl++] = (char)tolower((unsigned char)w[i][k]);
-        f[fl] = 0;
+    int n=0;
+    const char *p=value;
+    while(*p && n++<16){
+        while(isspace((unsigned char)*p)||*p==',')p++;
+        char f[128];int fl=0,quote=0;
+        while(*p && (quote||*p!=',')){
+            if((*p=='"'||*p=='\'')&&(!quote||quote==*p)){quote=quote?0:*p;p++;continue;}
+            if(fl<127)f[fl++]=(char)tolower((unsigned char)*p);
+            p++;
+        }
+        while(fl&&isspace((unsigned char)f[fl-1]))fl--;
+        f[fl]=0;
+        if(css_font_lookup){int family=css_font_lookup(css_font_context,f);if(family>=3)return family;}
         if (strstr(f, "mono") || strstr(f, "courier") || strstr(f, "consol") || strstr(f, "menlo") ||
             strstr(f, "monaco") || !strcmp(f, "fixed") || strstr(f, "code") || strstr(f, "terminal"))
             return FAM_MONO;
@@ -5383,7 +5390,7 @@ static void cascade_tree(struct arena *a, struct node *root, const struct style 
         if (n->type == N_ELEMENT) {
             const struct style *ps = n->parent && n->parent->style ? n->parent->style : parent;
             compute(a, n, ps, sheets, nsheets, v, mc, buf);
-            if (!n->parent && n->style)
+            if (!n->parent && !n->shadow_host && n->style)
                 v->root_font_size = n->style->font_size;
             if (n->style && n->style->display == D_NONE) {
                 for (struct node *k = n->first; k; k = node_next(k, n))
@@ -5401,6 +5408,27 @@ static void cascade_tree(struct arena *a, struct node *root, const struct style 
         }
         n = next;
     }
+}
+
+/* Shadow styles cascade in their own scope, inheriting only from their host. */
+static void cascade_shadows(struct arena *a, struct node *root, struct vctx *v, const struct mctx *mc,
+                            struct match *buf, int depth)
+{
+    if (depth > 64)
+        return;
+    for (struct node *n = root; n; n = node_next(n, root))
+        if (n->shadow_root) {
+            struct node *shadow = n->shadow_root;
+            struct sheet *sheets[64];
+            int ns = 0;
+            for (struct node *k = shadow; k; k = node_next(k, shadow))
+                if (ns < 64 && k->sheet)
+                    sheets[ns++] = k->sheet;
+                else if (k->tag == T_STYLE && k->first && ns < 64)
+                    sheets[ns++] = css_parse(a, k->first->text, k->first->len, v->vw);
+            cascade_tree(a, shadow, n->style, sheets, ns, v, mc, buf);
+            cascade_shadows(a, shadow, v, mc, buf, depth + 1);
+        }
 }
 
 void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int nsheets,
@@ -5425,5 +5453,6 @@ void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int 
     if (!buf)
         return;
     cascade_tree(a, root, &initial_style, sheets, nsheets, &v, &mc, buf);
+    cascade_shadows(a, root, &v, &mc, buf, 0);
     free(buf);
 }

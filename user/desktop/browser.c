@@ -6,9 +6,8 @@
  * the server's response (headers included) into a pipe, so the desktop
  * keeps running while a page loads. After the page itself come its style
  * sheets and images, one at a time. file:// URLs are read directly.
- * https:// goes through wget's TLS 1.3 client, which encrypts the
- * connection but does not verify the server's certificate; the status bar
- * says so.
+ * HTTPS uses libc's authenticated TLS 1.3 client, with certificate chain,
+ * hostname, validity and handshake signature verification.
  *
  * An <iframe> is a browser of its own with no window: it loads its page,
  * styles, pictures and scripts like a window does, and its parent draws
@@ -37,6 +36,7 @@
 #include "desktop.h"
 #include "jsdom.h"
 #include "web.h"
+#include "webpolicy.h"
 
 #define BR_W        800
 #define BR_H        560
@@ -47,9 +47,9 @@
 #define MAX_SHEETS  128
 #define MAX_LINKS   64              /* <link rel=stylesheet> elements per page */
 #define MAX_IMPORTS 32              /* @import rules per page */
-#define MAX_RES     96              /* style sheets and images per page */
-#define MAX_PAGE    (4 << 20)
-#define MAX_RESOURCE (2 << 20)
+#define MAX_RES 1024                /* style sheets and images per page */
+#define MAX_PAGE (16 << 20)
+#define MAX_RESOURCE (16 << 20)
 #define CACHE_MAX   (24 << 20)      /* decoded image bytes kept */
 #define WGET        "/bin/wget"
 #define HTTPC       "/bin/httpc"            /* the fetcher that keeps connections and a cache */
@@ -84,7 +84,7 @@
 #define KEY_BACKSPACE 0x0E
 #define KEY_F6 0x40
 
-enum { F_PAGE, F_CSS, F_IMG, F_JS, F_XHR, F_ICON, F_MODULE };
+enum { F_PAGE, F_CSS, F_IMG, F_JS, F_XHR, F_ICON, F_MODULE, F_FONT };
 enum { NAV_NEW, NAV_REPLACE, NAV_HISTORY };
 enum { B_BACK, B_FORWARD, B_STOP, B_REFRESH, B_HOME, B_HISTORY, B_DOWNLOADS, B_FAVORITES, B_GO, NBUTTONS };
 /* What a page load is for besides showing the page. */
@@ -108,6 +108,7 @@ struct fetch {
     int slot;                   /* F_CSS: the style sheet slot */
     int redirects;
     int mode;                   /* F_PAGE: NAV_* */
+    int postlen, credentials, streaming;
     char *post;                 /* F_PAGE: a form's POST body */
     int special;                /* F_PAGE: SP_* */
 };
@@ -122,8 +123,12 @@ struct helper {
     int answered;               /* it has sent something: it works */
 };
 
+#define FETCH_LANES 4
+struct loader { struct browser *browser; struct fetch fetch; struct helper hp; };
+
 struct res {                    /* a style sheet, image, script or request waiting to be fetched */
     int kind, slot, redirects;
+    int postlen, credentials;
     char *post;                     /* F_XHR: a POST body (malloc'd) */
     char url[URL_MAX];
 };
@@ -175,6 +180,8 @@ struct browser {
         struct sheet *sheet;
     } imports[MAX_IMPORTS];
     int nimports;
+    struct { char *family, *sources[8]; int nsources, source, bold, italic, id, state; } fonts[96];
+    int nfonts;
     struct imgref *imgs;
     int nimgs;
     struct bgref *bgs;                  /* background pictures, by what asked for them */
@@ -192,10 +199,14 @@ struct browser {
     unsigned int refresh_at;
 
     /* loading */
-    struct fetch fetch;
-    struct helper hp;
+    struct loader lanes[FETCH_LANES];
+    struct loader *lane;
+    struct fetch *fetch;
+    struct helper *hp;
+    int scheduling;
     int reload_next;            /* the next page request asks the server whether the copy is still good */
-    struct res queue[MAX_RES];
+    struct res *queue;
+    int queue_cap;
     int nqueue, qhead;
     int loading, total_res, done_res;
     int need_style, need_layout;
@@ -431,6 +442,29 @@ static struct browser *alive(void *ctx)
     return NULL;
 }
 
+static void select_loader(struct browser *b,struct loader *lane)
+{
+    b->lane=lane;b->fetch=&lane->fetch;b->hp=&lane->hp;
+}
+static void init_loaders(struct browser *b)
+{
+    for(int i=0;i<FETCH_LANES;i++){
+        struct loader *lane=&b->lanes[i];lane->browser=b;
+        lane->fetch.out=lane->fetch.err=lane->hp.to=lane->hp.from=-1;
+    }
+    select_loader(b,&b->lanes[0]);
+}
+static int fetch_busy(const struct browser *b)
+{
+    for(int i=0;i<FETCH_LANES;i++)if(b->lanes[i].fetch.active)return 1;
+    return 0;
+}
+static struct loader *free_loader(struct browser *b)
+{
+    for(int i=0;i<FETCH_LANES;i++)if(!b->lanes[i].fetch.active)return &b->lanes[i];
+    return NULL;
+}
+
 static void set_status(struct browser *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void set_status(struct browser *b, const char *fmt, ...)
 {
@@ -613,7 +647,7 @@ static void helper_cancel(struct browser *b);
 
 static void fetch_stop(struct browser *b)
 {
-    struct fetch *f = &b->fetch;
+    struct fetch *f = b->fetch;
     if (!f->active)
         return;
     if (f->via)
@@ -636,8 +670,15 @@ static void fetch_stop(struct browser *b)
 
 static void stop_all(struct browser *b)
 {
-    fetch_stop(b);
+    struct loader *previous=b->lane;
+    for(int i=0;i<FETCH_LANES;i++){select_loader(b,&b->lanes[i]);fetch_stop(b);}
+    select_loader(b,previous);
+    for (int i = b->qhead; i < b->nqueue; i++)
+        free(b->queue[i].post);
     b->nqueue = b->qhead = 0;
+    free(b->queue);
+    b->queue = NULL;
+    b->queue_cap = 0;
     b->loading = 0;
 }
 
@@ -648,7 +689,7 @@ static void fetch_complete(struct browser *b);
 static int live_helpers;
 static int helper_disabled;             /* a fetcher died without ever answering: use wget from now on */
 static int start_fetch(struct browser *b, int kind, const char *url, const char *post, int slot,
-                       int redirects, int mode);
+                       int redirects, int mode, int postlen, int credentials);
 
 /* Read what the fetcher has sent into h->buf (frames are taken apart by helper_ready); -1 if it has gone. */
 static int helper_pull(struct helper *h)
@@ -708,11 +749,12 @@ static int helper_write(struct helper *h, const void *buf, size_t n)
 }
 
 static void helper_ready(void *ctx, int revents);
+static void fetch_output(void *ctx,int revents);
 
 /* Let the fetcher go (it quits when its input ends); its process is reaped by the main loop. */
 static void helper_close(struct browser *b)
 {
-    struct helper *h = &b->hp;
+    struct helper *h = b->hp;
     if (h->pid <= 0 && h->to < 0 && h->from < 0)
         return;
     if (h->from >= 0) {
@@ -733,7 +775,7 @@ static void helper_close(struct browser *b)
 /* Start the fetcher if there is not one (and not too many already); 0 if it is running. */
 static int helper_start(struct browser *b)
 {
-    struct helper *h = &b->hp;
+    struct helper *h = b->hp;
     if (h->pid > 0)
         return 0;
     if (live_helpers >= HELPERS_MAX)
@@ -778,7 +820,7 @@ static int helper_start(struct browser *b)
     h->to = in[1];
     h->from = out[0];
     live_helpers++;
-    loop_watch(h->from, helper_ready, b);
+    loop_watch(h->from, helper_ready, b->lane);
     return 0;
 }
 
@@ -787,7 +829,7 @@ static int helper_request(struct browser *b, int id, int flags, int timeout_s, s
                           const char *method, const char *url, char *const *hdrs, int nhdrs,
                           const char *body, size_t body_len)
 {
-    struct helper *h = &b->hp;
+    struct helper *h = b->hp;
     size_t cap = strlen(url) + 256 + body_len;
     for (int i = 0; i < nhdrs; i++)
         cap += strlen(hdrs[i]) + 2;
@@ -811,22 +853,19 @@ static int helper_request(struct browser *b, int id, int flags, int timeout_s, s
 /* The current request is not wanted any more. */
 static void helper_cancel(struct browser *b)
 {
-    struct helper *h = &b->hp;
+    struct helper *h = b->hp;
     if (h->pid <= 0 || h->to < 0)
         return;
     char msg[32];
-    int n = snprintf(msg, sizeof(msg), "X %d\n", b->fetch.id);
+    int n = snprintf(msg, sizeof(msg), "X %d\n", b->fetch->id);
     helper_write(h, msg, (size_t)n);
 }
 
 /* Answers from the fetcher: frames "H id status n", "B id 0 n" and "E id code n", each with n bytes after. */
-static void helper_ready(void *ctx, int revents)
+static void helper_ready_selected(struct browser *b,int revents)
 {
-    struct browser *b = alive(ctx);
-    if (!b)
-        return;
-    struct helper *h = &b->hp;
-    struct fetch *f = &b->fetch;
+    struct helper *h = b->hp;
+    struct fetch *f = b->fetch;
     (void)revents;
     int n = helper_pull(h);
     if (n < 0) {                        /* it has died: what was being asked will not come */
@@ -838,9 +877,12 @@ static void helper_ready(void *ctx, int revents)
             int kind = f->kind, slot = f->slot, redirects = f->redirects, mode = f->mode;
             char url[URL_MAX];
             snprintf(url, sizeof(url), "%s", f->url);
-            char *post = f->post ? strdup(f->post) : NULL;
+            int postlen = f->postlen, credentials = f->credentials;
+            char *post = f->post ? malloc((size_t)postlen + 1) : NULL;
+            if (post)
+                memcpy(post, f->post, (size_t)postlen + 1);
             fetch_stop(b);
-            start_fetch(b, kind, url, post, slot, redirects, mode);
+            start_fetch(b, kind, url, post, slot, redirects, mode, postlen, credentials);
             free(post);
             return;
         }
@@ -875,12 +917,17 @@ static void helper_ready(void *ctx, int revents)
         const char *data = h->buf + head;
         if (f->active && f->via && id == f->id) {
             int limit = f->kind == F_PAGE ? MAX_PAGE : MAX_RESOURCE;
-            if (kind == 'H' || kind == 'B') {
+            if (kind == 'B' && f->kind == F_XHR && f->streaming) {
+                if(b->js)jsdom_http_chunk(b->js,f->slot,data,(int)len);
+            } else if (kind == 'H' || kind == 'B') {
                 if (f->cap - f->len < (int)len + 1) {
                     int cap = f->cap ? f->cap : 65536;
                     while (cap < f->len + (int)len + 1)
                         cap *= 2;
-                    char *nbuf = cap <= limit + 65536 + 16384 ? realloc(f->buf, (size_t)cap) : NULL;
+                    int maximum = limit + 65536 + 16384;
+                    if (cap > maximum)
+                        cap = maximum;
+                    char *nbuf = cap >= f->len + (int)len + 1 ? realloc(f->buf, (size_t)cap) : NULL;
                     if (nbuf) {
                         f->buf = nbuf;
                         f->cap = cap;
@@ -888,7 +935,20 @@ static void helper_ready(void *ctx, int revents)
                 }
                 if (f->cap - f->len >= (int)len + 1) {
                     memcpy(f->buf + f->len, data, len);
-                    f->len += (int)len;
+                    f->len += (int)len;f->buf[f->len]=0;
+                    if(f->kind==F_XHR&&b->js){
+                        if(kind=='H'){int accepted=jsdom_http_headers(b->js,f->slot,a,f->buf,f->len);if(f->active&&f->id==id){f->streaming=accepted==2;if(accepted<0)helper_cancel(b);}}
+                        else jsdom_http_chunk(b->js,f->slot,data,(int)len);
+                    }
+                } else {
+                    snprintf(f->errmsg, sizeof(f->errmsg), "response exceeds the browser memory limit");
+                    helper_cancel(b);
+                    f->status = 1 << 8;
+                    f->eof = f->exited = 1;
+                    memmove(h->buf, h->buf + head + len, (size_t)h->len - head - len);
+                    h->len -= (int)(head + len);
+                    fetch_complete(b);
+                    return;
                 }
                 if (f->kind == F_PAGE)
                     set_status(b, "Loading %s (%d KB)...", f->url, f->len / 1024);
@@ -910,12 +970,9 @@ static void helper_ready(void *ctx, int revents)
         paint(b);
 }
 
-static void fetch_output(void *ctx, int revents)
+static void fetch_output_selected(struct browser *b,int revents)
 {
-    struct browser *b = alive(ctx);
-    if (!b)
-        return;
-    struct fetch *f = &b->fetch;
+    struct fetch *f = b->fetch;
     int limit = f->kind == F_PAGE ? MAX_PAGE : MAX_RESOURCE;
     for (;;) {
         if (f->cap - f->len < 16384) {
@@ -955,23 +1012,32 @@ static void fetch_output(void *ctx, int revents)
         paint(b);
 }
 
-void browser_child_exited(int pid, int status)
+static struct browser *loader_alive(void *ctx)
 {
-    for (struct browser *b = browsers; b; b = b->next) {
-        if (b->hp.pid == pid) {         /* a fetcher that ended (its pipe tells the rest) */
-            b->hp.pid = -1;
-            live_helpers--;
-            return;
-        }
-        struct fetch *f = &b->fetch;
-        if (!f->active || f->pid != pid)
-            continue;
-        f->pid = 0;
-        f->exited = 1;
-        f->status = status;
-        if (f->eof)
-            fetch_complete(b);
-        return;
+    for(struct browser *b=browsers;b;b=b->next)for(int i=0;i<FETCH_LANES;i++)if(ctx==&b->lanes[i])return b;
+    return NULL;
+}
+static void helper_ready(void *ctx,int revents)
+{
+    struct loader *lane=ctx;struct browser *b=loader_alive(ctx);if(!b)return;
+    struct loader *previous=b->lane;select_loader(b,lane);helper_ready_selected(b,revents);
+    if(alive(b))select_loader(b,previous);
+}
+static void fetch_output(void *ctx,int revents)
+{
+    struct loader *lane=ctx;struct browser *b=loader_alive(ctx);if(!b)return;
+    struct loader *previous=b->lane;select_loader(b,lane);fetch_output_selected(b,revents);
+    if(alive(b))select_loader(b,previous);
+}
+void browser_child_exited(int pid,int status)
+{
+    for(struct browser *b=browsers;b;b=b->next)for(int i=0;i<FETCH_LANES;i++){
+        struct loader *lane=&b->lanes[i];
+        if(lane->hp.pid==pid){lane->hp.pid=-1;live_helpers--;return;}
+        struct fetch *f=&lane->fetch;if(!f->active||f->pid!=pid)continue;
+        struct loader *previous=b->lane;select_loader(b,lane);
+        f->pid=0;f->exited=1;f->status=status;if(f->eof)fetch_complete(b);
+        if(alive(b))select_loader(b,previous);return;
     }
 }
 
@@ -1079,7 +1145,7 @@ static int read_file(struct fetch *f, const char *url)
  * Returns -1 if there is no fetcher to ask (then wget is used). */
 static int start_via_helper(struct browser *b, int kind, const char *url, const char *post)
 {
-    struct fetch *f = &b->fetch;
+    struct fetch *f = b->fetch;
     if (strpbrk(url, "\r\n"))
         return -1;                      /* (it would break the fetcher's framing; wget copes) */
     if (helper_start(b) < 0)
@@ -1089,7 +1155,9 @@ static int start_via_helper(struct browser *b, int kind, const char *url, const 
     char *hdrs[20];
     int nh = 0;
     const char *body = post;
-    char *packed = kind == F_XHR && post ? strdup(post) : NULL;
+    char *packed = kind == F_XHR && post ? malloc((size_t)f->postlen + 1) : NULL;
+    if (packed)
+        memcpy(packed, post, (size_t)f->postlen + 1);
     if (packed) {
         char *nl = strchr(packed, '\n');
         body = NULL;
@@ -1108,10 +1176,10 @@ static int start_via_helper(struct browser *b, int kind, const char *url, const 
             }
             body = *p == '\n' ? p + 1 : p;
         }
-        if (body && !*body)
+        if (body && body == packed + f->postlen)
             body = NULL;
     }
-    size_t blen = body ? strlen(body) : 0;
+    size_t blen = body ? (packed ? (size_t)f->postlen - (size_t)(body - packed) : strlen(body)) : 0;
     char ctype[sizeof(b->mp_type) + 16];
     if (kind == F_PAGE && b->mp_body && post) {         /* a form with files: its multipart body, NULs and all */
         body = b->mp_body;
@@ -1119,17 +1187,27 @@ static int start_via_helper(struct browser *b, int kind, const char *url, const 
         snprintf(ctype, sizeof(ctype), "Content-Type: %s", b->mp_type);
         hdrs[nh++] = ctype;
     }
+    char origin_header[320], origin[300] = "null";
+    if ((kind == F_MODULE || kind == F_FONT) && !web_same_origin(b->url, url)) {
+        web_origin(b->url, origin, sizeof(origin));
+        snprintf(origin_header, sizeof(origin_header), "Origin: %s", origin);
+        hdrs[nh++] = origin_header;
+    }
     char ua[] = "User-Agent: " BROWSER_USER_AGENT;
     hdrs[nh++] = ua;
     static char cookies[4096 + 16];
     char *cookie_line = NULL;
-    cookie_header(url, 0, cookies + 8, sizeof(cookies) - 24);
+    cookies[8] = 0;
+    if (f->credentials)
+        cookie_header_context(url, top_of(b)->url, kind == F_PAGE && !b->parent,
+                              !strcmp(method, "GET") || !strcmp(method, "HEAD"), cookies + 8,
+                              sizeof(cookies) - 24);
     if (cookies[8]) {                           /* the jar's cookies for this address */
         memcpy(cookies, "Cookie: ", 8);
         cookie_line = cookies;
         hdrs[nh++] = cookie_line;
     }
-    int id = ++b->hp.next_id;
+    int id = ++b->hp->next_id;
     int flags = 0;
     if (kind == F_PAGE && b->reload_next)
         flags = 1;
@@ -1154,10 +1232,10 @@ static int start_via_helper(struct browser *b, int kind, const char *url, const 
 }
 
 static int start_fetch(struct browser *b, int kind, const char *url, const char *post, int slot,
-                       int redirects, int mode)
+                       int redirects, int mode, int postlen, int credentials)
 {
     fetch_stop(b);
-    struct fetch *f = &b->fetch;
+    struct fetch *f = b->fetch;
     f->active = 1;
     f->kind = kind;
     f->special = kind == F_PAGE ? b->next_special : SP_NONE;
@@ -1168,8 +1246,17 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
     f->mode = mode;
     f->out = f->err = -1;
     snprintf(f->url, sizeof(f->url), "%s", url);
-    if (post)
-        f->post = strdup(post);
+    f->credentials = credentials && ((kind != F_MODULE && kind != F_FONT) || web_same_origin(b->url, url));
+    f->postlen = post ? (postlen < 0 ? (int)strlen(post) : postlen) : 0;
+    if (post) {
+        f->post = malloc((size_t)f->postlen + 1);
+        if (!f->post) {
+            f->active = 0;
+            return -1;
+        }
+        memcpy(f->post, post, (size_t)f->postlen);
+        f->post[f->postlen] = 0;
+    }
 
     if (url_is_file(url)) {
         int r = read_file(f, url);
@@ -1189,6 +1276,12 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
     if (!helper_disabled && (url_is_http(url) || url_is_https(url)) && start_via_helper(b, kind, url, post) == 0)
         return 0;
 
+    /* wget's argv cannot carry binary bodies: fail explicitly if the helper is unavailable. */
+    if (kind == F_XHR && post && memchr(post, 0, (size_t)f->postlen)) {
+        snprintf(f->errmsg, sizeof(f->errmsg), "binary requests require httpc");
+        f->active = 0;
+        return -1;
+    }
     int out[2], err[2];
     if (pipe(out) < 0)
         return -1;
@@ -1198,7 +1291,9 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
         return -1;
     }
     /* A script's request packs "METHOD\nHeader: value\n...\n\nbody" into post. */
-    char *packed = kind == F_XHR && post ? strdup(post) : NULL;
+    char *packed = kind == F_XHR && post ? malloc((size_t)f->postlen + 1) : NULL;
+    if (packed)
+        memcpy(packed, post, (size_t)f->postlen + 1);
     char methodarg[40] = "", postarg[URL_MAX + 16];
     char *hdr_arg[14];
     int nhdr = 0;
@@ -1226,20 +1321,45 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
             }
             body = *p == '\n' ? p + 1 : p;
         }
-        if (body && !*body)
+        if (body && body == packed + f->postlen)
             body = NULL;
+    }
+    if (body && strlen(body) + 13 >= sizeof(postarg)) {
+        free(packed);
+        for (int i = 0; i < nhdr; i++)
+            free(hdr_arg[i]);
+        close(out[0]);
+        close(out[1]);
+        close(err[0]);
+        close(err[1]);
+        f->active = 0;
+        snprintf(f->errmsg, sizeof(f->errmsg), "request body requires httpc");
+        return -1;
     }
     if (body)
         snprintf(postarg, sizeof(postarg), "--post-data=%s", body);
     {                                           /* the jar's cookies for this address */
         static char cookies[4096];
-        cookie_header(url, 0, cookies, sizeof(cookies) - 16);
+        cookies[0] = 0;
+        if (f->credentials)
+            cookie_header_context(url, top_of(b)->url, kind == F_PAGE && !b->parent,
+                                  !post || !strncmp(post, "GET\n", 4) || !strncmp(post, "HEAD\n", 5), cookies,
+                                  sizeof(cookies) - 16);
         if (cookies[0] && nhdr < 14) {
             char *h = malloc(strlen(cookies) + 16);
             if (h) {
                 sprintf(h, "--header=Cookie: %s", cookies);
                 hdr_arg[nhdr++] = h;
             }
+        }
+    }
+    if ((kind == F_MODULE || kind == F_FONT) && !web_same_origin(b->url, url) && nhdr < 14) {
+        char origin[300] = "null";
+        web_origin(b->url, origin, sizeof(origin));
+        char *h = malloc(strlen(origin) + 20);
+        if (h) {
+            sprintf(h, "--header=Origin: %s", origin);
+            hdr_arg[nhdr++] = h;
         }
     }
     int pid = fork();
@@ -1290,7 +1410,7 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
     f->pid = pid;
     f->out = out[0];
     f->err = err[0];
-    loop_watch(f->out, fetch_output, b);
+    loop_watch(f->out, fetch_output, b->lane);
     return 0;
 }
 
@@ -1370,14 +1490,30 @@ static int queue_resource(struct browser *b, int kind, const char *url, int slot
         b->qhead = b->nqueue = 0;
     if (b->nqueue == MAX_RES || (!url_is_http(url) && !url_is_https(url) && !url_is_file(url)))
         return 0;
+    if ((url_is_http(b->url) || url_is_https(b->url)) && url_is_file(url))
+        return 0;
+    if (url_is_https(b->url) && url_is_http(url))
+        return 0;
     for (int i = b->qhead; i < b->nqueue; i++)
         if (b->queue[i].kind == kind && kind == F_IMG && !strcmp(b->queue[i].url, url))
             return 1;                   /* already on its way */
+    if (b->nqueue == b->queue_cap) {
+        int cap = b->queue_cap ? b->queue_cap * 2 : 32;
+        if (cap > MAX_RES)
+            cap = MAX_RES;
+        struct res *queue = realloc(b->queue, sizeof(*queue) * (size_t)cap);
+        if (!queue)
+            return 0;
+        b->queue = queue;
+        b->queue_cap = cap;
+    }
     struct res *r = &b->queue[b->nqueue++];
     r->kind = kind;
     r->slot = slot;
     r->redirects = redirects;
     r->post = NULL;
+    r->postlen = 0;
+    r->credentials = 1;
     snprintf(r->url, sizeof(r->url), "%s", url);
     b->total_res++;
     return 1;
@@ -1553,8 +1689,7 @@ static struct browser *new_frame(struct browser *parent, struct node *el)
     struct browser *f = calloc(1, sizeof(*f));
     if (!f)
         return NULL;
-    f->fetch.out = f->fetch.err = -1;
-    f->hp.to = f->hp.from = -1;
+    init_loaders(f);
     f->parent = parent;
     f->frame_el = el;
     f->frame_depth = parent->frame_depth + 1;
@@ -1669,11 +1804,16 @@ static void sync_frames(struct browser *b)
 
 static void free_page(struct browser *b)
 {
+    for(int i=0;i<b->nfonts;i++)if(b->fonts[i].id>=3){
+        int id=b->fonts[i].id;wfont_release(id);
+        for(int j=i;j<b->nfonts;j++)if(b->fonts[j].id==id)b->fonts[j].id=-1;
+    }
+    b->nfonts=0;
     b->frame_vbar = 0;
     while (b->frames)
         drop_frame(b->frames);
     b->mouse_frame = b->key_frame = NULL;
-    for (struct node *n = b->root; n; n = node_next(n, b->root)) {
+    for (struct node *n = b->root; n; n = node_next_shadow(n, b->root)) {
         free(n->value);
         n->value = NULL;
         if (n->type == N_ELEMENT && n->tag == T_SVG) {      /* inline SVG: drawn by us */
@@ -1720,6 +1860,12 @@ static void free_page(struct browser *b)
     b->js_history = b->js_reload = 0;
 }
 
+static int font_lookup(void *ctx,const char *family)
+{
+    struct browser *b=ctx;
+    for(int i=0;i<b->nfonts;i++)if(b->fonts[i].id>=3&&!strcasecmp(b->fonts[i].family,family))return b->fonts[i].id;
+    return -1;
+}
 static void relayout(struct browser *b)
 {
     if (!b->root)
@@ -1730,7 +1876,9 @@ static void relayout(struct browser *b)
         arena_free(&b->sarena);
         css_viewport_h = v.h;
         css_target_id = url_fragment(b->url);
+        css_font_lookup=font_lookup;css_font_context=b;
         css_cascade(&b->sarena, b->root, b->sheets, b->nsheets, v.w, v.h, is_visited, b);
+        css_font_lookup=NULL;css_font_context=NULL;
         b->need_style = 0;
     }
     bg_attach(b);
@@ -1855,7 +2003,7 @@ static int is_text_field(const struct node *n);
 /* Form controls that scripts made: their values, as init_controls gives. */
 static void init_new_controls(struct node *root)
 {
-    for (struct node *n = root; n; n = node_next(n, root)) {
+    for (struct node *n = root; n; n = node_next_shadow(n, root)) {
         if (n->type != N_ELEMENT || n->value)
             continue;
         if (n->tag == T_INPUT) {
@@ -1877,6 +2025,10 @@ static void init_new_controls(struct node *root)
 static void js_navigate(void *ctx, const char *url, int replace)
 {
     struct browser *b = ctx;
+    if ((url_is_http(b->url) || url_is_https(b->url)) && url_is_file(url)) {
+        set_status(b, "Blocked a remote page from opening a local file");
+        return;
+    }
     snprintf(b->js_nav, sizeof(b->js_nav), "%s", url);
     b->js_nav_replace = replace;
 }
@@ -1905,6 +2057,7 @@ static void js_status(void *ctx, const char *text)
 }
 
 static void collect_sheets(struct browser *b);
+static void js_load_image(void *ctx, struct node *n);
 
 static void js_changed(void *ctx)
 {
@@ -1913,9 +2066,18 @@ static void js_changed(void *ctx)
         return;
     init_new_controls(b->root);
     collect_sheets(b);
+    for (struct node *n = b->root; n;) {
+        if (n->tag == T_TEMPLATE || n->tag == T_NOSCRIPT) {
+            n = node_after_shadow(n, b->root);
+            continue;
+        }
+        if (n->tag == T_IMG)
+            js_load_image(b, n);
+        n = node_next_shadow(n, b->root);
+    }
     relayout(b);
     paint(b);
-    if (!b->fetch.active && b->qhead < b->nqueue)
+    if (free_loader(b) && b->qhead < b->nqueue)
         start_next(b);                  /* style sheets the scripts added */
 }
 
@@ -1976,7 +2138,7 @@ static void js_load_script(void *ctx, struct node *n, const char *url)
     if (b->nscripts)
         b->scripts[b->nscripts - 1].module = is_module(n);
     queue_resource(b, F_JS, url, b->nscripts - 1, 0);
-    if (!b->fetch.active)
+    if (free_loader(b))
         start_next(b);
 }
 
@@ -2122,10 +2284,18 @@ static void js_load_image(void *ctx, struct node *n)
     if (!b->imgs || !image_source(b, n, abs, sizeof(abs)))
         return;
     struct cached *c = cache_find_data(b, abs);
-    if (b->nimgs < MAX_RES) {
+    int known = 0;
+    for (int i = 0; i < b->nimgs; i++)
+        if (b->imgs[i].n == n) {
+            if (!strcmp(b->imgs[i].url, abs))
+                return;
+            b->imgs[i].url = arena_strdup(&b->arena, abs);
+            known = 1;
+            break;
+        }
+    if (!known && b->nimgs < MAX_RES) {
         b->imgs[b->nimgs].n = n;
-        b->imgs[b->nimgs].url = arena_strdup(&b->arena, abs);
-        b->nimgs++;
+        b->imgs[b->nimgs++].url = arena_strdup(&b->arena, abs);
     }
     if (c) {
         n->img = c->img;
@@ -2133,7 +2303,7 @@ static void js_load_image(void *ctx, struct node *n)
         return;
     }
     queue_resource(b, F_IMG, abs, 0, 0);
-    if (!b->fetch.active)
+    if (free_loader(b))
         start_next(b);
 }
 
@@ -2223,6 +2393,28 @@ static int js_cookie_get(void *ctx, char *out, int size)
     return 1;
 }
 
+static int js_font_status(void *ctx,const char *family)
+{
+    struct browser *b=ctx;int state=-1;
+    for(int i=0;i<b->nfonts;i++)if(!*family||!strcasecmp(family,b->fonts[i].family)){
+        if(!b->fonts[i].state)return 0;
+        if(b->fonts[i].id>=3)state=1;else if(state<0)state=2;
+    }
+    return state;
+}
+static int js_font_register(void *ctx,const char *family,const void *bytes,int len,int bold,int italic)
+{
+    struct browser *b=ctx;if(!*family||strlen(family)>127||b->nfonts>=96||len<=0)return 0;
+    int id=font_lookup(b,family);id=wfont_register(bytes,(size_t)len,id,bold,italic);if(id<3)return 0;
+    int k=b->nfonts++;memset(&b->fonts[k],0,sizeof(b->fonts[k]));b->fonts[k].family=arena_strdup(&b->arena,family);
+    b->fonts[k].sources[0]=arena_strdup(&b->arena,"");b->fonts[k].bold=bold;b->fonts[k].italic=italic;b->fonts[k].id=id;b->fonts[k].state=1;
+    b->need_style=b->need_layout=1;return 1;
+}
+static int js_ws_cookies(void *ctx,const char *url,char *out,int size)
+{
+    struct browser *b=ctx;cookie_header_context(url,top_of(b)->url,0,0,out,size);return 1;
+}
+
 static int js_cookie_set(void *ctx, const char *value)
 {
     struct browser *b = ctx;
@@ -2233,25 +2425,48 @@ static int js_cookie_set(void *ctx, const char *value)
 }
 
 /* A script's XMLHttpRequest: fetched like the page's other resources. */
-static void js_http(void *ctx, int id, const char *method, const char *url, const char *body,
-                    const char *headers)
+static void js_http_cancel(void *ctx,int id)
+{
+    struct browser *b=ctx;struct loader *previous=b->lane;
+    for(int i=0;i<FETCH_LANES;i++){
+        select_loader(b,&b->lanes[i]);
+        if(b->fetch->active&&b->fetch->kind==F_XHR&&b->fetch->slot==id)fetch_stop(b);
+    }
+    select_loader(b,previous);
+    for(int i=b->qhead;i<b->nqueue;i++)if(b->queue[i].kind==F_XHR&&b->queue[i].slot==id){
+        free(b->queue[i].post);memmove(b->queue+i,b->queue+i+1,(size_t)(b->nqueue-i-1)*sizeof(*b->queue));b->nqueue--;b->total_res--;i--;
+    }
+}
+static void js_http(void *ctx, int id, const char *method, const char *url, const void *body, int body_len,
+                    const char *headers, int credentials)
 {
     struct browser *b = ctx;
     if (!queue_resource(b, F_XHR, url, id, 0)) {
-        jsdom_http_done(b->js, id, 0, NULL, 0, NULL, 0);    /* the queue is full */
+        jsdom_http_done(b->js, id, 0, NULL, 0, NULL, 0);
         return;
     }
-    /* The method, the headers and the body travel together (see start_fetch). */
-    int plain = !strcasecmp(method, "GET") && !headers && !body;
-    if (!plain && strcasecmp(method, "HEAD")) {
-        size_t n = strlen(method) + (headers ? strlen(headers) : 0) + (body ? strlen(body) : 0) + 4;
-        char *packed = malloc(n);
-        if (packed) {
-            snprintf(packed, n, "%s\n%s\n%s", method, headers ? headers : "", body ? body : "");
-            b->queue[b->nqueue - 1].post = packed;
-        }
+    struct res *r = &b->queue[b->nqueue - 1];
+    r->credentials = credentials;
+    size_t head = strlen(method) + (headers ? strlen(headers) : 0) + 3;
+    if (body_len < 0 || body_len > MAX_RESOURCE) {
+        b->nqueue--;
+        b->total_res--;
+        jsdom_http_done(b->js, id, 0, NULL, 0, NULL, 0);
+        return;
     }
-    if (!b->fetch.active)
+    r->post = malloc(head + (size_t)body_len + 1);
+    if (!r->post) {
+        b->nqueue--;
+        b->total_res--;
+        jsdom_http_done(b->js, id, 0, NULL, 0, NULL, 0);
+        return;
+    }
+    int n = snprintf(r->post, head + 1, "%s\n%s\n", method, headers ? headers : "");
+    if (body && body_len)
+        memcpy(r->post + n, body, (size_t)body_len);
+    r->postlen = n + body_len;
+    r->post[r->postlen] = 0;
+    if (free_loader(b))
         start_next(b);
 }
 
@@ -2285,7 +2500,7 @@ static void js_fetch_module(void *ctx, int id, const char *url)
         jsdom_module_fetched(b->js, id, NULL, 0);
         return;
     }
-    if (!b->fetch.active)
+    if (free_loader(b))
         start_next(b);
 }
 
@@ -2362,8 +2577,8 @@ static void start_scripts(struct browser *b, const char *url)
         .status = js_status, .changed = js_changed, .scroll = js_scroll, .scroll_pos = js_scroll_pos,
         .viewport = js_viewport, .set_title = js_set_title, .load_script = js_load_script,
         .load_image = js_load_image, .node_box = js_node_box, .node_scroll = js_node_scroll,
-        .reveal = js_reveal, .flush = js_flush, .focus = js_focus, .http = js_http,
-        .cookie_get = js_cookie_get, .cookie_set = js_cookie_set, .fetch_module = js_fetch_module,
+        .reveal = js_reveal, .flush = js_flush, .focus = js_focus, .http = js_http, .http_cancel=js_http_cancel,
+        .cookie_get = js_cookie_get, .cookie_set = js_cookie_set, .ws_cookies=js_ws_cookies, .font_register=js_font_register, .font_status=js_font_status, .fetch_module = js_fetch_module,
         .module_done = js_module_done, .set_url = js_set_url, .submit = js_submit, .node_at = js_node_at,
     };
     b->js = jsdom_new(&h);
@@ -2483,6 +2698,20 @@ static void import_found(void *ctx, const char *url)
     queue_resource(b, F_CSS, abs, -1 - k, 0);
 }
 
+static void font_found(void *ctx,const struct css_fontface *face)
+{
+    struct import_ctx *ic=ctx;struct browser *b=ic->b;
+    if(b->nfonts>=96)return;
+    char first[URL_MAX];url_resolve(ic->base,face->sources[0],first,sizeof(first));
+    for(int i=0;i<b->nfonts;i++)if(b->fonts[i].bold==face->bold&&b->fonts[i].italic==face->italic&&
+        !strcasecmp(b->fonts[i].family,face->family)&&!strcmp(b->fonts[i].sources[0],first))return;
+    int k=b->nfonts++;b->fonts[k].family=arena_strdup(&b->arena,face->family);
+    b->fonts[k].nsources=face->nsources;b->fonts[k].source=0;b->fonts[k].id=-1;b->fonts[k].state=0;
+    b->fonts[k].bold=face->bold;b->fonts[k].italic=face->italic;
+    for(int j=0;j<face->nsources;j++){char abs[URL_MAX];url_resolve(ic->base,face->sources[j],abs,sizeof(abs));b->fonts[k].sources[j]=arena_strdup(&b->arena,abs);}
+    queue_resource(b,F_FONT,b->fonts[k].sources[0],k,0);
+}
+
 /* Parse a sheet (at base, for its @imports), and ask for what it imports. */
 static struct sheet *parse_sheet(struct browser *b, const char *text, int len, const char *base,
                                  struct node *owner, int parent, int imports)
@@ -2493,8 +2722,9 @@ static struct sheet *parse_sheet(struct browser *b, const char *text, int len, c
     int alen = len;
     char *abs_text = css_absolute_urls(text, len, base, &alen);
     struct sheet *sh = css_parse(&b->arena, abs_text ? abs_text : text, abs_text ? alen : len, vr.w);
-    free(abs_text);
     struct import_ctx ic = { b, base, owner, parent };
+    css_font_faces(abs_text?abs_text:text,abs_text?alen:len,vr.w,vr.h,font_found,&ic);
+    free(abs_text);
     if (imports)
         css_imports(text, len, vr.w, import_found, &ic);
     return sh;
@@ -2521,14 +2751,6 @@ static void add_imports(struct browser *b, struct node *owner, int parent)
 }
 
 /* The next node after n's subtree. */
-static struct node *after_subtree(struct node *n, const struct node *root)
-{
-    for (; n && n != root; n = n->parent)
-        if (n->next)
-            return n->next;
-    return NULL;
-}
-
 /* The document's style sheets, in order: every <style> (parsed again when its
  * text changed) and <link rel=stylesheet> (fetched the first time it is seen),
  * each after the sheets it imports. Scripts may have added or changed any. */
@@ -2539,13 +2761,17 @@ static void collect_sheets(struct browser *b)
     b->nsheets = 0;
     for (struct node *n = b->root; n;) {
         if (n->type != N_ELEMENT) {
-            n = node_next(n, b->root);
+            n = node_next_shadow(n, b->root);
             continue;
         }
         if (n->tag == T_TEMPLATE || n->tag == T_NOSCRIPT) {
-            n = after_subtree(n, b->root);
+            n = node_after_shadow(n, b->root);
             continue;
         }
+        struct node *scope = n;
+        while (scope->parent)
+            scope = scope->parent;
+        int shadow = scope->shadow_host != NULL;
         const char *media = node_attr(n, "media"), *rel, *href;
         if (n->tag == T_STYLE) {
             uintptr_t sig = style_sig(n);
@@ -2567,7 +2793,7 @@ static void collect_sheets(struct browser *b)
                 }
                 n->sheet_sig = sig;
             }
-            if (!media || css_media_query(media, vr.w, vr.h)) {
+            if (!shadow && (!media || css_media_query(media, vr.w, vr.h))) {
                 add_imports(b, n, -1);
                 if (n->sheet && b->nsheets < MAX_SHEETS)
                     b->sheets[b->nsheets++] = n->sheet;
@@ -2583,7 +2809,7 @@ static void collect_sheets(struct browser *b)
                     if (!queue_resource(b, F_CSS, abs, b->nlinks++, 0) && b->js)
                         jsdom_queue_event(b->js, n, "error");   /* those waiting for it may go on */
                 }
-                if (!media || css_media_query(media, vr.w, vr.h)) {
+                if (!shadow && (!media || css_media_query(media, vr.w, vr.h))) {
                     add_imports(b, n, -1);
                     if (n->sheet && b->nsheets < MAX_SHEETS)
                         b->sheets[b->nsheets++] = n->sheet;
@@ -2594,7 +2820,7 @@ static void collect_sheets(struct browser *b)
                     jsdom_queue_event(b->js, n, "load");
             }
         }
-        n = node_next(n, b->root);
+        n = node_next_shadow(n, b->root);
     }
     b->need_style = 1;
 }
@@ -3278,22 +3504,32 @@ static void save_download(struct browser *b, const struct fetch *f, const struct
 static void done_status(struct browser *b)
 {
     if (url_is_https(b->url))
-        set_status(b, "Done - encrypted (TLS 1.3), but the site's certificate is not verified");
+        set_status(b, "Done - secure connection (TLS 1.3, certificate verified)");
     else
         set_status(b, "Done");
 }
 
 static void fetch_complete(struct browser *b)
 {
-    struct fetch *f = &b->fetch;
+    struct fetch *f = b->fetch;
     struct response r;
-    int ok = parse_response(f, &r) == 0;
+    int ok = f->status==0 && parse_response(f, &r) == 0;
     int is_file = url_is_file(f->url);
-    if (ok && !is_file)
+    char origin[300] = "null";
+    web_origin(b->url, origin, sizeof(origin));
+    int module_cors =
+        ok && (f->kind == F_MODULE || f->kind == F_FONT) && !web_same_origin(b->url, f->url) && !web_cors_allow(origin, f->buf, 0);
+    if (module_cors)
+        ok = 0;
+    if (ok && !is_file && f->credentials)
         cookie_set_from_headers(f->url, f->buf, (int)(r.body - f->buf));
     char why[512];
-    if (!ok && !is_file)
-        wget_error(f, why, sizeof(why));
+    if (!ok && !is_file) {
+        if (module_cors)
+            snprintf(why, sizeof(why), "CORS blocked a cross-origin module or font");
+        else
+            wget_error(f, why, sizeof(why));
+    }
     if (is_file && f->buf) {           /* a local file: no headers, guess the type */
         ok = 1;
         memset(&r, 0, sizeof(r));
@@ -3347,7 +3583,7 @@ static void fetch_complete(struct browser *b)
                 }
                 b->next_special = done.special;
                 start_fetch(b, F_PAGE, next, NULL, 0, done.redirects + 1,
-                            done.mode == NAV_NEW ? NAV_REPLACE : done.mode);
+                            done.mode == NAV_NEW ? NAV_REPLACE : done.mode, -1, 1);
                 if (done.mode == NAV_NEW && b->nhist) {
                     free(b->hist[b->hpos].url);
                     b->hist[b->hpos].url = strdup(next);
@@ -3404,7 +3640,8 @@ static void fetch_complete(struct browser *b)
         }
     } else {
         b->done_res++;
-        if (ok && r.status >= 300 && r.status < 400 && r.location[0] && done.redirects < 5) {
+        if (done.kind != F_XHR && ok && r.status >= 300 && r.status < 400 && r.location[0] &&
+            done.redirects < 5) {
             char next[URL_MAX];
             url_resolve(done.url, r.location, next, sizeof(next));
             if (done.kind == F_IMG) {   /* the <img> elements still name the old URL */
@@ -3426,6 +3663,13 @@ static void fetch_complete(struct browser *b)
             if (b->js)
                 jsdom_module_fetched(b->js, done.slot, ok && r.status < 300 ? r.body : NULL,
                                      ok && r.status < 300 ? r.len : 0);
+        } else if(done.kind==F_FONT && done.slot>=0 && done.slot<b->nfonts){
+            int k=done.slot,id=font_lookup(b,b->fonts[k].family);
+            if(ok&&r.status>=200&&r.status<300)id=wfont_register((const unsigned char *)r.body,(size_t)r.len,id,b->fonts[k].bold,b->fonts[k].italic);
+            else id=-1;
+            if(id>=3){b->fonts[k].id=id;b->fonts[k].state=1;b->need_style=b->need_layout=1;}
+            else if(++b->fonts[k].source<b->fonts[k].nsources)queue_resource(b,F_FONT,b->fonts[k].sources[b->fonts[k].source],k,0);
+            else b->fonts[k].state=2;
         } else if (done.kind == F_JS) {
             if (done.slot < b->nscripts) {
                 struct script *sc = &b->scripts[done.slot];
@@ -3467,14 +3711,19 @@ static void fetch_complete(struct browser *b)
 /* Fetch the next style sheet or picture; restyle and lay out when it is time. */
 static void start_next(struct browser *b)
 {
+    if(b->scheduling)return;
+    b->scheduling=1;struct loader *previous=b->lane;
     int css_left = 0;
+    for(int i=0;i<FETCH_LANES;i++)css_left|=b->lanes[i].fetch.active&&b->lanes[i].fetch.kind==F_CSS;
     for (int i = b->qhead; i < b->nqueue; i++)
         css_left |= b->queue[i].kind == F_CSS;
     /* Restyle once the style sheets are in, lay out again as pictures arrive. */
     if ((b->need_style && !css_left) || (b->need_layout && b->qhead >= b->nqueue)) {
         relayout(b);
     }
-    while (b->qhead < b->nqueue) {
+    struct loader *available;
+    while (b->qhead < b->nqueue && (available=free_loader(b))) {
+        select_loader(b,available);
         struct res r = b->queue[b->qhead++];
         if (r.kind == F_IMG && cache_find(b, r.url)) {
             b->done_res++;
@@ -3482,25 +3731,26 @@ static void start_next(struct browser *b)
         }
         set_status(b, "Loading %s %d of %d: %s",
                    r.kind == F_CSS ? "style sheet" : r.kind == F_JS || r.kind == F_MODULE ? "script" :
-                   r.kind == F_XHR ? "request" : "picture",
+                   r.kind == F_XHR ? "request" : r.kind==F_FONT ? "font" : "picture",
                    b->done_res + 1, b->total_res, r.url);
         b->queue[b->qhead - 1].post = NULL;            /* r has it */
-        int started = start_fetch(b, r.kind, r.url, r.post, r.slot, r.redirects, 0) == 0;
+        int started =
+            start_fetch(b, r.kind, r.url, r.post, r.slot, r.redirects, 0, r.postlen, r.credentials) == 0;
         free(r.post);
         if (!started && r.kind == F_XHR && b->js)
             jsdom_http_done(b->js, r.slot, 0, NULL, 0, NULL, 0);
+        if(!started&&r.kind==F_FONT&&r.slot>=0&&r.slot<b->nfonts){
+            int k=r.slot;if(++b->fonts[k].source<b->fonts[k].nsources)queue_resource(b,F_FONT,b->fonts[k].sources[b->fonts[k].source],k,0);else b->fonts[k].state=2;
+        }
         if (!started && r.kind == F_MODULE && b->js)
             jsdom_module_fetched(b->js, r.slot, NULL, 0);
-        if (started) {
-            paint(b);
-            return;
-        }
-        b->done_res++;
+        if(!started)b->done_res++;
     }
     if (b->need_style || b->need_layout)
         relayout(b);
-    if (b->total_res)
+    if (b->total_res&&!fetch_busy(b)&&b->qhead>=b->nqueue)
         done_status(b);
+    select_loader(b,previous);b->scheduling=0;
     paint(b);
 }
 
@@ -3605,7 +3855,7 @@ static void navigate(struct browser *b, const char *url, const char *post, int m
         paint(b);
         if (source)
             b->next_special = SP_SOURCE;
-        int started = start_fetch(b, F_PAGE, fu, post, 0, 0, mode);
+        int started = start_fetch(b, F_PAGE, fu, post, 0, 0, mode, -1, 1);
         free(b->mp_body);               /* whichever way it went, a multipart body is for this request only */
         b->mp_body = NULL;
         if (started < 0) {
@@ -3613,7 +3863,7 @@ static void navigate(struct browser *b, const char *url, const char *post, int m
             b->loading = 0;
             page_failed(b, u, strerror(errno));
         }
-        if (b->loading || b->fetch.active)
+        if (b->loading || fetch_busy(b))
             return;
     }
     done_status(b);
@@ -4310,7 +4560,7 @@ static int button_enabled(struct browser *b, int i)
     switch (i) {
     case B_BACK: return b->hpos > 0;
     case B_FORWARD: return b->hpos + 1 < b->nhist;
-    case B_STOP: return b->loading || b->fetch.active;
+    case B_STOP: return b->loading || fetch_busy(b);
     case B_REFRESH: return b->url[0] != 0;
     default: return 1;
     }
@@ -4383,12 +4633,12 @@ static void draw_status(struct browser *b, struct surface *s)
     gfx_ellipsize(&font_sans, text, r.w - 120, fit, sizeof(fit));
     gfx_text(s, &font_sans, r.x + 6, r.y + 2, fit, C_BLACK);
     /* A progress gauge while loading. */
-    if (b->loading || b->fetch.active) {
+    if (b->loading || fetch_busy(b)) {
         struct rect g = mkrect(r.x + r.w - 104, r.y + 3, 100, r.h - 6);
         gfx_bevel(s, g, BEVEL_THIN_SUNKEN);
         int total = b->total_res + 1, done = b->loading ? 0 : b->done_res + 1;
         int w = (g.w - 2) * done / total;
-        if (b->loading && b->fetch.len)
+        if (b->loading && b->fetch->len)
             w = (g.w - 2) / 8;
         gfx_fill(s, g.x + 1, g.y + 1, w, g.h - 2, C_NAVY);
     }
@@ -5560,7 +5810,7 @@ static void br_key(struct window *w, const struct input_event *ev)
         return;
     }
     if (ev->code == KEY_ESC) {
-        if (t->loading || t->fetch.active)
+        if (t->loading || fetch_busy(t))
             press(t, B_STOP);
         else if (b->focus) {
             b->focus = NULL;
@@ -5837,13 +6087,13 @@ static void start_save(struct browser *t, const char *url)
     url_strip_fragment(u);
     if (!url_is_http(u) && !url_is_https(u) && !url_is_file(u)) {
         set_status(t, "That address cannot be saved");
-    } else if (t->fetch.active || t->loading) {
+    } else if (fetch_busy(t) || t->loading) {
         set_status(t, "Wait for the page to finish loading, then save it");
     } else {
         t->next_special = SP_SAVE;
         t->loading = 1;
         set_status(t, "Saving %s...", u);
-        if (start_fetch(t, F_PAGE, u, NULL, 0, 0, NAV_REPLACE) < 0) {
+        if (start_fetch(t, F_PAGE, u, NULL, 0, 0, NAV_REPLACE, -1, 1) < 0) {
             t->loading = 0;
             t->next_special = SP_NONE;
             set_status(t, "Could not save: %s", strerror(errno));
@@ -6289,7 +6539,7 @@ static void br_close(struct window *w)
 static void destroy_browser(struct browser *b)
 {
     stop_all(b);
-    helper_close(b);
+    for(int i=0;i<FETCH_LANES;i++){select_loader(b,&b->lanes[i]);helper_close(b);}
     free_page(b);                       /* (its frames are dropped, to be freed by sweep_frames) */
     cache_clear(b);
     find_clear(b);
@@ -6373,6 +6623,7 @@ void browser_poll(void)
         }
         if (b->js)
             jsdom_run_timers(b->js);
+        if(b->qhead<b->nqueue&&free_loader(b))start_next(b);
         if (b->js_nav[0]) {
             char u[URL_MAX];
             snprintf(u, sizeof(u), "%s", b->js_nav);
@@ -6402,6 +6653,7 @@ int browser_timeout(void)
 {
     int best = -1;
     for (struct browser *b = browsers; b; b = b->next) {
+        if(b->qhead<b->nqueue&&free_loader(b))return 0;
         if (b->frame_dead || b->frame_nav[0] || b->js_nav[0] || b->js_history || b->js_reload)
             return 0;
         int t = jsdom_next_timer(b->js);
@@ -6422,11 +6674,13 @@ void browser_tick(void)
     cookie_flush();
     jsdom_storage_flush();
     sweep_frames();
-    for (struct browser *b = browsers; b; b = b->next)
-        if (b->hp.pid > 0 && !b->fetch.active && now_ms() - b->hp.used > HELPER_IDLE_MS)
-            helper_close(b);            /* nothing asked of it for a while: its connections go */
+    for(struct browser *b=browsers;b;b=b->next){
+        struct loader *previous=b->lane;
+        for(int i=0;i<FETCH_LANES;i++){select_loader(b,&b->lanes[i]);if(b->hp->pid>0&&!b->fetch->active&&now_ms()-b->hp->used>HELPER_IDLE_MS)helper_close(b);}
+        select_loader(b,previous);
+    }
     for (struct browser *b = browsers; b; b = b->next) {
-        if (b->refresh_url[0] && !b->frame_dead && !b->loading && !b->fetch.active &&
+        if (b->refresh_url[0] && !b->frame_dead && !b->loading && !fetch_busy(b) &&
             (int)(now_ms() - b->refresh_at) >= 0) {
             char u[URL_MAX];
             snprintf(u, sizeof(u), "%s", b->refresh_url);
@@ -6447,8 +6701,7 @@ struct window *browser_open(const char *url)
     struct browser *b = calloc(1, sizeof(*b));
     if (!b)
         return NULL;
-    b->fetch.out = b->fetch.err = -1;
-    b->hp.to = b->hp.from = -1;
+    init_loaders(b);
     struct window *w = wm_create("Web Browser", ICON_BROWSER, BR_W, BR_H, WF_MINIMIZE | WF_MAXIMIZE | WF_RIGHTCLICK,
                                  &br_ops, b);
     if (!w) {

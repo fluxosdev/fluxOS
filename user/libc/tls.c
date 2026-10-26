@@ -6,9 +6,9 @@
  *  - Cipher suite: TLS_AES_128_GCM_SHA256 only. Every TLS 1.3 server has
  *    to support it, so there is no negotiation to get wrong.
  *  - Key schedule: HKDF over HMAC-SHA-256.
- *  - The server's certificate chain and its CertificateVerify signature
- *    are received but not checked; the Finished messages are, so the
- *    keys are known to be shared with whoever answered.
+ *  - Mbed TLS verifies the chain, hostname, validity dates and key usage
+ *    against the bundled CA roots, and verifies CertificateVerify before
+ *    accepting Finished. Verification failures fail the connection.
  *
  * A server that only speaks TLS 1.2, or wants a key exchange other than
  * X25519 (a HelloRetryRequest), is turned down with a message saying so.
@@ -25,6 +25,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <tls.h>
+#include "tlsverify.h"
 #include <unistd.h>
 #include <flux/sha256.h>
 
@@ -472,6 +473,7 @@ struct keys {
 };
 
 struct tls {
+    struct tls_verifier *verifier;
     int fd, timeout_ms;
     char err[160];
     struct sha256 transcript;
@@ -756,11 +758,10 @@ static int client_hello(struct tls *t, const char *host, const uint8_t pub[32])
     static const uint8_t groups[] = { 0, 10, 0, 4, 0, 2, 0x00, 0x1D };
     memcpy(m + n, groups, sizeof(groups));
     n += sizeof(groups);
-    /* signature_algorithms: what servers sign with (not checked here) */
+    /* Signature schemes verified below; PKCS1 schemes are for certificate chains only. */
     static const uint8_t sigs[] = {
-        0, 13, 0, 20, 0, 18,
-        0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05,
-        0x05, 0x01, 0x08, 0x06, 0x06, 0x01, 0x08, 0x07,
+        0,    13,   0,    20,   0,    18,   0x04, 0x03, 0x08, 0x04, 0x04, 0x01,
+        0x05, 0x03, 0x08, 0x05, 0x05, 0x01, 0x08, 0x06, 0x06, 0x01, 0x06, 0x03,
     };
     memcpy(m + n, sigs, sizeof(sigs));
     n += sizeof(sigs);
@@ -875,15 +876,43 @@ static int handshake(struct tls *t, const char *host)
     hmac(derived, 32, zeros, 32, master);
     set_keys(&t->rd, s_hs);
 
-    int cert_requested = 0;
+    int cert_requested = 0, cert_seen = 0, sig_seen = 0, extensions_seen = 0;
     uint8_t cert_ctx[256];
     int cert_ctx_len = 0;
     for (;;) {
         if (next_handshake(t, &type, &body, &len, &whole) <= 0)
             return -1;
-        if (type == HS_FINISHED)
+        if (!extensions_seen) {
+            if (type != HS_ENCRYPTED_EXTENSIONS || len < 2 || (body[0] << 8 | body[1]) != len - 2)
+                return set_error(t, "invalid or missing EncryptedExtensions");
+            extensions_seen = 1;
+            consume_handshake(t, whole, 1);
+            continue;
+        }
+        if (type == HS_ENCRYPTED_EXTENSIONS)
+            return set_error(t, "duplicate EncryptedExtensions");
+        if (type == HS_FINISHED) {
+            if (!cert_seen || !sig_seen)
+                return set_error(t, "server omitted certificate authentication");
             break;
+        }
+        if (type == HS_CERTIFICATE) {
+            if (cert_seen)
+                return set_error(t, "duplicate server Certificate");
+            if (tls_verify_chain(t->verifier, host, body, (size_t)len, t->err, sizeof(t->err)) < 0)
+                return -1;
+            cert_seen = 1;
+        } else if (type == HS_CERTIFICATE_VERIFY) {
+            transcript_hash(t, h);
+            if (!cert_seen || sig_seen)
+                return set_error(t, "unexpected server CertificateVerify");
+            if (tls_verify_signature(t->verifier, h, body, (size_t)len, t->err, sizeof(t->err)) < 0)
+                return -1;
+            sig_seen = 1;
+        }
         if (type == HS_CERTIFICATE_REQUEST && len >= 1 && body[0] + 1 <= len) {
+            if (cert_requested || cert_seen)
+                return set_error(t, "unexpected CertificateRequest");
             cert_requested = 1;
             cert_ctx_len = body[0];
             memcpy(cert_ctx, body + 1, (size_t)cert_ctx_len);
@@ -953,14 +982,23 @@ struct tls *tls_connect(int fd, const char *host, int timeout_ms, char *err, siz
         snprintf(err, errsize, "out of memory");
         return NULL;
     }
+    t->verifier = tls_verifier_new();
+    if (!t->verifier) {
+        free(t);
+        snprintf(err, errsize, "out of memory");
+        return NULL;
+    }
     t->fd = fd;
     t->timeout_ms = timeout_ms > 0 ? timeout_ms : 30000;
     if (handshake(t, host) < 0) {
         snprintf(err, errsize, "TLS: %s", t->err);
+        tls_verifier_free(t->verifier);
         free(t->hs);
         free(t);
         return NULL;
     }
+    tls_verifier_free(t->verifier);
+    t->verifier = NULL;
     return t;
 }
 

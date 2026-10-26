@@ -590,7 +590,7 @@ static struct conn *conn_open(struct http_client *cl, const struct http_request 
             c->sock = -1;
             return NULL;
         }
-        event(rq, "done (TLS 1.3, certificate not verified).\n");
+        event(rq, "done (TLS 1.3, certificate verified).\n");
     }
     c->state = 2;
     c->last = uptime_ms();

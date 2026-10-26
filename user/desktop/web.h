@@ -40,6 +40,8 @@ int utf8_put(char *out, int cp);                   /* returns bytes written (1-4
 /* ---- fonts (webfont.c) ---- */
 enum { FAM_SANS, FAM_SERIF, FAM_MONO };
 struct wfont;
+int wfont_register(const unsigned char *bytes,size_t length,int family,int bold,int italic);
+void wfont_release(int family);
 int wfont_init(void);                               /* load the font file; 0 on success */
 const struct wfont *wfont_get(int family, int bold, int italic, int px);
 int wfont_height(const struct wfont *f);
@@ -109,6 +111,8 @@ struct node {
     char *text;                 /* text nodes: UTF-8, entities decoded */
     int len;
     struct node *parent, *first, *last, *next, *prev;
+    struct node *shadow_root, *shadow_host;
+    uint8_t shadow_closed;
     struct style *style;        /* computed style (elements) */
     int index;                  /* position among its element siblings, from 1 */
 
@@ -143,6 +147,12 @@ struct node {
 struct node *html_parse(struct arena *a, const char *text, int len);
 const char *node_attr(const struct node *n, const char *name);
 struct node *node_next(struct node *n, const struct node *root);       /* pre-order */
+struct shadow_swap;
+struct shadow_swap *shadow_compose(struct arena *a, struct node *root);
+void shadow_restore(struct shadow_swap *patches);
+struct node *shadow_slot(struct node *host, const char *name);
+struct node *node_next_shadow(struct node *n,const struct node *root);
+struct node *node_after_shadow(struct node *n,const struct node *root);
 struct node *node_find(struct node *root, enum tag tag);
 int node_text(const struct node *n, char *out, int size);   /* text content, whitespace collapsed */
 const char *tag_name(int tag);
@@ -323,6 +333,10 @@ struct style {
     int gr_start, gr_span;              /* grid-row */
 };
 
+struct css_fontface { char family[128], sources[8][URL_MAX]; int nsources, bold, italic; };
+void css_font_faces(const char *text,int len,int vw,int vh,void (*found)(void *,const struct css_fontface *),void *ctx);
+extern int (*css_font_lookup)(void *ctx,const char *family);
+extern void *css_font_context;
 struct sheet;
 struct sheet *css_parse(struct arena *a, const char *text, int len, int viewport_w);
 /* Compute the style of every element under root, from the UA style sheet,
@@ -355,6 +369,7 @@ void cookie_set_from_headers(const char *url, const char *headers, int hlen);
 void cookie_flush(void);                /* write the cookies that outlast the desktop to disk, if they changed */
 /* The Cookie header's value for a request to url; scripts do not see HttpOnly cookies. */
 void cookie_header(const char *url, int scripts_only, char *out, int size);
+void cookie_header_context(const char *url, const char *site, int top_level, int safe_method, char *out, int size);
 
 /* ---- SVG (svg.c) ---- */
 /* The size an <svg> element asks for (width, height, viewBox; else 300x150). */

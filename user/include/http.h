@@ -3,7 +3,7 @@
  *
  *  - Connections stay open between requests (keep-alive) in a small pool, and a request on one the
  *    server has closed meanwhile is repeated on a fresh one.
- *  - http:// and https:// (libc's TLS 1.3 client; certificates are not checked, see <tls.h>).
+ *  - http:// and https:// (libc's TLS 1.3 client; certificates are verified, see <tls.h>).
  *  - Bodies may be chunked or sized or end with the connection, and gzip- or deflate-coded:
  *    they are given back decoded, with headers that say so.
  *  - Optionally a cache in a folder: fresh copies are given back without asking the server,

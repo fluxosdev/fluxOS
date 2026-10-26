@@ -409,58 +409,101 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
   def(EP, "showPicker", function () {});
   def(EP, "setRangeText", function (s) { this.value = String(s); });
 
-  /* ---- element.animate(): no frames are drawn; it finishes at once, keeping its end if filled ---- */
-  def(EP, "animate", function (frames, opts) {
-    var el = this, last = null;
-    if (Array.isArray(frames)) last = frames[frames.length - 1] || null;
-    else if (frames && typeof frames === "object") {
-      last = {};
-      Object.keys(frames).forEach(function (k) { var v = frames[k]; last[k] = Array.isArray(v) ? v[v.length - 1] : v; });
+  /* Time-based Web Animations for numeric lengths, opacity and colors. */
+  var animations = [];
+  function easing(name, t) {
+    if (name === "step-start") return 1;
+    if (name === "step-end") return t === 1 ? 1 : 0;
+    var step = new RegExp("^steps\\((\\d+)(?:,\\s*(start|end))?\\)$").exec(name || "");
+    if (step) { var n = Math.max(1, +step[1]); return Math.min(1, (step[2] === "start" ? Math.ceil(t * n) : Math.floor(t * n)) / n); }
+    var curve = name === "ease" ? [0.25,0.1,0.25,1] : name === "ease-in" ? [0.42,0,1,1] :
+                name === "ease-out" ? [0,0,0.58,1] : name === "ease-in-out" ? [0.42,0,0.58,1] : null;
+    var bezier = new RegExp("^cubic-bezier\\(([^)]+)\\)$").exec(name || "");
+    if (bezier) curve = bezier[1].split(",").map(Number);
+    if (!curve || curve.length !== 4) return t;
+    function cubic(a,b,u) { var v = 1-u; return 3*v*v*u*a + 3*v*u*u*b + u*u*u; }
+    var lo=0, hi=1;
+    for(var i=0;i<16;i++){var mid=(lo+hi)/2;if(cubic(curve[0],curve[2],mid)<t)lo=mid;else hi=mid;}
+    return cubic(curve[1],curve[3],(lo+hi)/2);
+  }
+  function mixValue(a,b,t) {
+    a=String(a); b=String(b);
+    var x=/^(-?[0-9.]+)([a-z%]*)$/.exec(a), y=/^(-?[0-9.]+)([a-z%]*)$/.exec(b);
+    if(x && y && x[2]===y[2])return String(+x[1]+(+y[1]-x[1])*t)+x[2];
+    function color(s) {
+      if(/^#[0-9a-f]{3}$/i.test(s))s="#"+s[1]+s[1]+s[2]+s[2]+s[3]+s[3];
+      if(/^#[0-9a-f]{6}$/i.test(s)){var n=parseInt(s.slice(1),16);return [n>>16,(n>>8)&255,n&255];}
+      var m=new RegExp("^rgb\\(\\s*(\\d+)[, ]+\\s*(\\d+)[, ]+\\s*(\\d+)\\s*\\)$").exec(s);return m?[+m[1],+m[2],+m[3]]:null;
     }
-    var fill = opts && typeof opts === "object" && (opts.fill === "forwards" || opts.fill === "both");
-    var done, a = { playState: "running", currentTime: 0, startTime: 0, playbackRate: 1, pending: false, id: "",
-                    effect: { target: el, getKeyframes: function () { return Array.isArray(frames) ? frames : []; } },
-                    timeline: null, onfinish: null, oncancel: null, onremove: null };
-    a.finished = new Promise(function (r) { done = r; });
-    a.ready = Promise.resolve(a);
-    function apply() {
-      if (last) Object.keys(last).forEach(function (k) {
-        if (k !== "offset" && k !== "easing" && k !== "composite") el.style[k] = last[k];
+    var ca=color(a),cb=color(b);
+    if(ca && cb)return "rgb("+ca.map(function(v,i){return Math.round(v+(cb[i]-v)*t);}).join(",")+")";
+    return t<0.5?a:b;
+  }
+  def(EP, "animate", function (frames, opts) {
+    var el=this, options=typeof opts==="number"?{duration:opts}:opts||{};
+    var duration=Math.max(0,Number(options.duration)||0), delay=Number(options.delay)||0;
+    var iterations=options.iterations===undefined?1:Math.max(0,Number(options.iterations));
+    var total=duration*iterations, direction=options.direction||"normal", fill=options.fill||"none";
+    var list=[];
+    if(Array.isArray(frames))list=frames.map(function(f){return Object.assign({},f);});
+    else if(frames){
+      var keys=Object.keys(frames).filter(function(k){return k!=="offset"&&k!=="easing"&&k!=="composite";});
+      var length=0;keys.forEach(function(k){length=Math.max(length,Array.isArray(frames[k])?frames[k].length:1);});
+      for(var i=0;i<length;i++){var f={};keys.forEach(function(k){var v=frames[k];f[k]=Array.isArray(v)?v[Math.min(i,v.length-1)]:v;});list.push(f);}
+    }
+    var properties=[];list.forEach(function(f){Object.keys(f).forEach(function(k){if(k!=="offset"&&k!=="easing"&&k!=="composite"&&properties.indexOf(k)<0)properties.push(k);});});
+    var original={}, computed=getComputedStyle(el);
+    properties.forEach(function(k){original[k]=el.style[k];});
+    if(list.length===1){var initial={};properties.forEach(function(k){initial[k]=computed[k]||original[k]||0;});list.unshift(initial);}
+    list.forEach(function(f,i){f.offset=f.offset===undefined?(list.length<=1?1:i/(list.length-1)):Number(f.offset);});
+    var base=performance.now(), held=0, state="running", rate=1, raf=0, resolve,reject;
+    var a=new EventTarget();a.id="";a.onfinish=a.oncancel=null;
+    function renew(){a.finished=new Promise(function(ok,bad){resolve=ok;reject=bad;});a.finished.catch(function(){});}
+    renew();a.ready=Promise.resolve(a);a.pending=false;a.timeline=document.timeline||null;
+    function current(){return state==="running"?held+(performance.now()-base)*rate:held;}
+    function restore(){properties.forEach(function(k){el.style[k]=original[k];});}
+    function apply(time){
+      var local=time-delay;
+      if(local<0 && fill!=="backwards"&&fill!=="both"){restore();return;}
+      if(local>=total && fill!=="forwards"&&fill!=="both"){restore();return;}
+      var clamped=Math.max(0,Math.min(local,total)), cycle=duration?Math.floor(clamped/duration):0;
+      var t=duration?clamped/duration-cycle:1;
+      if(clamped===total && total>0){cycle=Math.max(0,Math.ceil(iterations)-1);t=iterations-Math.floor(iterations)||1;}
+      if(direction==="reverse" || (direction==="alternate"&&cycle%2) || (direction==="alternate-reverse"&&!(cycle%2)))t=1-t;
+      t=easing(options.easing||"linear",t);
+      properties.forEach(function(k){
+        var entries=list.filter(function(f){return f[k]!==undefined;});if(!entries.length)return;
+        var lo=entries[0],hi=entries[entries.length-1];
+        for(var i=1;i<entries.length;i++)if(t<=entries[i].offset){lo=entries[i-1];hi=entries[i];break;}
+        var p=hi.offset===lo.offset?1:Math.max(0,Math.min(1,(t-lo.offset)/(hi.offset-lo.offset)));
+        el.style[k]=mixValue(lo[k],hi[k],easing(lo.easing||"linear",p));
       });
     }
-    a.finish = function () {
-      if (a.playState === "finished") return;
-      a.playState = "finished";
-      if (fill) apply();
-      done(a);
-      if (typeof a.onfinish === "function") a.onfinish({ type: "finish", target: a });
-    };
-    a.cancel = function () { a.playState = "idle"; if (typeof a.oncancel === "function") a.oncancel({ type: "cancel", target: a }); };
-    a.play = a.reverse = a.persist = a.updatePlaybackRate = function () {};
-    a.pause = function () { a.playState = "paused"; };
-    a.commitStyles = apply;
-    a.addEventListener = function (t, f) { if (t === "finish") a.finished.then(function () { f({ type: "finish", target: a }); }); };
-    a.removeEventListener = function () {};
-    setTimeout(a.finish, 0);
-    return a;
+    function finishEvent(){resolve(a);var e=new Event("finish");a.dispatchEvent(e);if(typeof a.onfinish==="function")a.onfinish(e);}
+    function tick(){
+      if(state!=="running")return;
+      var time=current();apply(time);
+      if((rate>=0&&time>=delay+total)||(rate<0&&time<=0)){held=rate>=0?delay+total:0;state="finished";finishEvent();}
+      else raf=requestAnimationFrame(tick);
+    }
+    getter(a,"playState",function(){return state;});
+    Object.defineProperty(a,"currentTime",{get:current,set:function(v){held=Number(v)||0;base=performance.now();apply(held);}});
+    Object.defineProperty(a,"playbackRate",{get:function(){return rate;},set:function(v){held=current();base=performance.now();rate=Number(v);}});
+    a.pause=function(){held=current();state="paused";cancelAnimationFrame(raf);};
+    a.play=function(){if(state==="finished"||state==="idle"){held=rate<0?delay+total:0;renew();}base=performance.now();state="running";cancelAnimationFrame(raf);raf=requestAnimationFrame(tick);};
+    a.reverse=function(){a.playbackRate=-rate;if(state!=="running")a.play();};
+    a.finish=function(){if(!isFinite(total)||rate===0)throw new DOMException("Cannot finish animation","InvalidStateError");held=rate<0?0:delay+total;state="finished";cancelAnimationFrame(raf);apply(held);finishEvent();};
+    a.cancel=function(){cancelAnimationFrame(raf);state="idle";held=0;restore();reject(new DOMException("Animation cancelled","AbortError"));var e=new Event("cancel");a.dispatchEvent(e);if(typeof a.oncancel==="function")a.oncancel(e);};
+    a.updatePlaybackRate=function(v){a.playbackRate=v;};a.persist=function(){};
+    a.commitStyles=function(){apply(current());properties.forEach(function(k){original[k]=el.style[k];});};
+    a.effect={target:el,getKeyframes:function(){return list.map(function(f){return Object.assign({},f);});},getTiming:function(){return Object.assign({},options);}};
+    animations.push(a);apply(0);raf=requestAnimationFrame(tick);return a;
   });
-  def(EP, "getAnimations", function () { return []; });
-  def(DP, "getAnimations", function () { return []; });
+  def(EP,"getAnimations",function(){var el=this;return animations.filter(function(a){return a.effect.target===el&&(a.playState==="running"||a.playState==="paused");});});
+  def(DP,"getAnimations",function(){return animations.filter(function(a){return a.playState==="running"||a.playState==="paused";});});
 
-  /* ---- shadow DOM: the host is its own shadow root (what it holds is drawn as its children) ---- */
-  def(EP, "attachShadow", function (o) {
-    if (this["%shadow"]) throw new DOMException("Shadow root cannot be created on a host which already hosts a shadow tree.", "NotSupportedError");
-    def(this, "%shadow", true);
-    if (!o || o.mode !== "closed") def(this, "shadowRoot", this);
-    def(this, "host", this);
-    def(this, "mode", o && o.mode || "open");
-    def(this, "adoptedStyleSheets", []);
-    return this;
-  });
-  def(EP, "shadowRoot", null);
-  def(EP, "assignedSlot", null);
-  def(EP, "assignedNodes", function () { return []; });
-  def(EP, "assignedElements", function () { return []; });
+  /* Native shadow roots keep light and shadow trees separate. */
+  def(EP, "assignedElements", function () { return this.assignedNodes().filter(function (n) { return n.nodeType === 1; }); });
 
   /* ---- style sheets: a <style>'s sheet keeps its rules as the element's text ---- */
   function rulesOf(text) {
@@ -524,19 +567,42 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
   def(g, "CSSStyleSheet", CSSStyleSheet);
   def(g, "StyleSheet", CSSStyleSheet);
   def(g, "CSSRule", { STYLE_RULE: 1, IMPORT_RULE: 3, MEDIA_RULE: 4, FONT_FACE_RULE: 5, KEYFRAMES_RULE: 7 });
-  /* fonts: there are no web fonts to wait for */
-  var fonts = { status: "loaded", size: 0, ready: Promise.resolve(), onloadingdone: null,
-    check: function () { return true; }, load: function () { return Promise.resolve([]); },
-    add: function () {}, delete: function () { return false; }, clear: function () {}, has: function () { return false; },
-    forEach: function () {}, values: function () { return [][Symbol.iterator](); },
-    addEventListener: function () {}, removeEventListener: function () {} };
-  fonts.ready = Promise.resolve(fonts);
-  def(DP, "fonts", fonts);
-  def(g, "FontFace", function FontFace(family) {
-    this.family = family; this.status = "loaded";
-    this.load = function () { return Promise.resolve(this); };
-    this.loaded = Promise.resolve(this);
-  });
+  /* Font loading shares the real stylesheet parser and font registry. */
+  var fontSet = [], fontListeners = new EventTarget();
+  function fontName(font) { return String(font).replace(new RegExp("^.*?[0-9]+(?:\\.[0-9]+)?(?:px|pt|em|rem|%)(?:/[^ ]+)?\\s+"), "").split(",")[0].trim().replace(new RegExp("^[\\x22\\x27]|[\\x22\\x27]$", "g"), ""); }
+  function fontCheck(font) { var name=fontName(font), status=document.__fontStatus(name);return status===1 || (status===-1 && /^(serif|sans-serif|monospace|system-ui|cursive|fantasy)$/i.test(name)); }
+  var fonts = { get status() { return document.__fontStatus("")===0 || fontSet.some(function(f){return f.status==="loading";}) ? "loading" : "loaded"; },
+    get size() { return fontSet.length; },
+    get ready() { return new Promise(function(resolve){function wait(){if(fonts.status==="loaded"){resolve(fonts);return;}setTimeout(wait,20);}wait();}); },
+    check: fontCheck,
+    load: function(font,text) { var name=fontName(font), matches=fontSet.filter(function(f){return f.family===name;});
+      return Promise.all(matches.map(function(f){return f.load();})).then(function(){return fonts.ready;}).then(function(){return matches;}); },
+    add: function(f) { if(!(f instanceof FontFace))throw new TypeError("Expected FontFace");if(fontSet.indexOf(f)<0)fontSet.push(f);return fonts; },
+    delete: function(f) { var i=fontSet.indexOf(f);if(i<0)return false;fontSet.splice(i,1);return true; },
+    clear: function() {fontSet=[];}, has: function(f) {return fontSet.indexOf(f)>=0;},
+    forEach: function(f,t) {fontSet.forEach(function(v){f.call(t,v,v,fonts);});}, values: function(){return fontSet[Symbol.iterator]();},
+    addEventListener: function(t,f,o){fontListeners.addEventListener(t,f,o);},removeEventListener:function(t,f,o){fontListeners.removeEventListener(t,f,o);} };
+  def(DP,"fonts",fonts);
+  function FontFace(family,source,descriptors) {
+    var self=this;descriptors=descriptors||{};this.family=String(family);this.style=descriptors.style||"normal";this.weight=descriptors.weight||"normal";this.status="unloaded";
+    this._source=source;this._promise=null;
+    this.loaded=new Promise(function(resolve,reject){self._resolve=resolve;self._reject=reject;});
+    if(source instanceof ArrayBuffer || ArrayBuffer.isView(source))this.load();
+  }
+  FontFace.prototype.load=function(){
+    if(this._promise)return this._promise;
+    var self=this;this.status="loading";
+    var source=this._source;
+    if(source instanceof ArrayBuffer || ArrayBuffer.isView(source))source=Promise.resolve(source);
+    else { var match=String(source).match(new RegExp("url\\(\\s*[\\x22\\x27]?([^\\x22\\x27\\s]+?)[\\x22\\x27]?\\s*\\)"));
+      source=match?fetch(match[1]).then(function(r){if(!r.ok)throw new Error("Font request failed");return r.arrayBuffer();}):Promise.reject(new SyntaxError("Font source requires url() or font bytes")); }
+    this._promise=source.then(function(bytes){
+      if(!document.__fontRegister(self.family,bytes,self.weight==="bold"||parseInt(self.weight)>=600,self.style!=="normal"))throw new Error("Font decoding failed");
+      self.status="loaded";self._resolve(self);fontListeners.dispatchEvent(new Event("loadingdone"));return self;
+    }).catch(function(e){self.status="error";self._reject(e);fontListeners.dispatchEvent(new Event("loadingerror"));throw e;});
+    return this._promise;
+  };
+  def(g,"FontFace",FontFace);
 
   /* ---- smaller things ---- */
   def(DP, "createAttribute", function (n) { return { name: String(n).toLowerCase(), value: "" }; });

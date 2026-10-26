@@ -33,9 +33,13 @@ struct jshost {
     /* document.cookie, through the browser's jar; they return 0 for pages that have none (file:). */
     int (*cookie_get)(void *ctx, char *out, int size);
     int (*cookie_set)(void *ctx, const char *value);
+    int (*font_register)(void *ctx,const char *family,const void *bytes,int len,int bold,int italic);
+    int (*font_status)(void *ctx,const char *family); /* -1 unknown, 0 loading, 1 loaded, 2 failed; empty family aggregates */
+    int (*ws_cookies)(void *ctx,const char *url,char *out,int size);
     /* Start an XMLHttpRequest; the browser calls jsdom_http_done with its id. */
-    void (*http)(void *ctx, int id, const char *method, const char *url, const char *body,
-                 const char *headers);       /* headers: "Name: value\n" lines, or NULL */
+    void (*http_cancel)(void *ctx,int id);
+    void (*http)(void *ctx, int id, const char *method, const char *url, const void *body, int body_len,
+                 const char *headers, int credentials);       /* headers: "Name: value\n" lines, or NULL */
     /* Fetch a module a script imports; the browser calls jsdom_module_fetched with its id. */
     void (*fetch_module)(void *ctx, int id, const char *url);
     /* A module script given to jsdom_run_module has run (or failed). */
@@ -91,6 +95,10 @@ int jsdom_mouse_event(struct jsdom *d, struct node *target, const char *type, in
 /* Timers: run the ones that are due; ms until the next one, or -1. */
 void jsdom_run_timers(struct jsdom *d);
 int jsdom_next_timer(struct jsdom *d);
+/* Incremental HTTP delivery. headers returns 2 for a streaming body, 1 for a
+ * normal XHR body, 0 for redirect/preflight, -1 for a rejected request. */
+int jsdom_http_headers(struct jsdom *d,int id,int status,const char *headers,int hlen);
+void jsdom_http_chunk(struct jsdom *d,int id,const void *bytes,int len);
 /* An XMLHttpRequest finished: status 0 if it failed. headers is the header block. */
 void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, int hlen,
                      const char *body, int blen);

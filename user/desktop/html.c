@@ -735,6 +735,30 @@ struct node *node_next(struct node *n, const struct node *root)
     return NULL;
 }
 
+/* Infrastructure walks include shadow trees; DOM queries continue to use node_next. */
+struct node *node_after_shadow(struct node *n, const struct node *root)
+{
+    while (n && n != root) {
+        if (n->next)
+            return n->next;
+        if (n->shadow_host) {
+            n = n->shadow_host;
+            if (n->first)
+                return n->first;
+        } else
+            n = n->parent;
+    }
+    return NULL;
+}
+struct node *node_next_shadow(struct node *n, const struct node *root)
+{
+    if (n->shadow_root)
+        return n->shadow_root;
+    if (n->first)
+        return n->first;
+    return node_after_shadow(n, root);
+}
+
 struct node *node_find(struct node *root, enum tag tag)
 {
     for (struct node *n = root; n; n = node_next(n, root))

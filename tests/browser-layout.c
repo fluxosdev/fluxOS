@@ -33,6 +33,7 @@ void svg_size(const struct node *n, int *w, int *h) { (void)n; *w = 300; *h = 15
 struct image *svg_render(const struct node *n, int w, int h, uint32_t c) { (void)n; (void)w; (void)h; (void)c; return NULL; }
 
 struct page {
+    struct node *root;
     struct arena a, sa, la;
     struct layout lo;
 };
@@ -43,7 +44,7 @@ static struct image test_img = { 40, 20, NULL };
 static void load(struct page *p, const char *html, int vw, int vh)
 {
     memset(p, 0, sizeof(*p));
-    struct node *root = html_parse(&p->a, html, (int)strlen(html));
+    struct node *root = p->root = html_parse(&p->a, html, (int)strlen(html));
     struct sheet *sheets[4];
     int ns = 0;
     for (struct node *n = root; n; n = node_next(n, root))
@@ -414,8 +415,72 @@ static void scrolling_boxes(void)
     unload(&p);
 }
 
+static void shadow_layout(void)
+{
+    struct page p;
+    load(&p,
+         "<!doctype html><html><body><div id=host><span slot=title>shown</span><span "
+         "slot=unused>hidden</span></div></body></html>",
+         400, 300);
+    struct node *host = node_find(p.root, T_DIV), *light = host->first;
+    const char *text = "<style>span{color:blue}</style><span>shadow</span><slot name=title>fallback</slot>";
+    struct node *parsed = html_parse(&p.a, text, (int)strlen(text));
+    struct node *body = node_find(parsed, T_BODY), *head = node_find(parsed, T_HEAD);
+    struct node *shadow = arena_alloc(&p.a, sizeof(*shadow));
+    shadow->type = N_ELEMENT;
+    shadow->name = "#fragment";
+    shadow->first = head->first;
+    shadow->last = head->last;
+    if (shadow->last)
+        shadow->last->next = body->first;
+    else
+        shadow->first = body->first;
+    if (body->first)
+        body->first->prev = shadow->last;
+    if (body->last)
+        shadow->last = body->last;
+    for (struct node *k = shadow->first; k; k = k->next)
+        k->parent = shadow;
+    host->shadow_root = shadow;
+    shadow->shadow_host = host;
+    struct sheet *sheet = css_parse(&p.a, "span{color:red}", 15, 400);
+    css_cascade(&p.sa, p.root, &sheet, 1, 400, 300, NULL, NULL);
+    arena_free(&p.la);
+    layout_document(&p.la, &p.lo, p.root, 400, 300);
+    CHECK(word(&p, "shadow") && word(&p, "shown") && !word(&p, "hidden") && !word(&p, "fallback"));
+    CHECK(host->first == light && light->parent == host && shadow->first->parent == shadow);
+    CHECK((light->style->color & 0xFFFFFF) == 0xFF0000);
+    CHECK((node_find(shadow, T_SPAN)->style->color & 0xFFFFFF) == 0x0000FF);
+    unload(&p);
+}
+
+static int font_count;
+static void found_font(void *ctx,const struct css_fontface *face)
+{
+    CHECK(ctx==&font_count);CHECK(!strcmp(face->family,"Test Font"));CHECK(face->bold&&face->italic);
+    CHECK(face->nsources==2&&!strcmp(face->sources[0],"a;}.woff2")&&!strcmp(face->sources[1],"fallback.woff"));font_count++;
+}
+static int find_font(void *ctx,const char *family){return !strcmp(family,"test font")?19:-1;}
+static void font_faces(void)
+{
+    const char *css="/* @font-face{bad} */ @media (min-width: 500px){@font-face{font-family:'Test Font';font-weight:700;font-style:italic;src:local('absent'),url('a;}.woff2') format('woff2'),url(fallback.woff)}} @media (max-width: 10px){@font-face{font-family:ignore;src:url(no)}}";
+    css_font_faces(css,(int)strlen(css),800,600,found_font,&font_count);CHECK(font_count==1);
+    struct page p;css_font_lookup=find_font;load(&p,"<div style=\"font-family:Test Font,serif\">x</div>",800,600);
+    CHECK(node_find(p.root,T_DIV)->style->family==19);unload(&p);css_font_lookup=NULL;
+}
+
 int main(void)
 {
-    text_flow(); positioning(); boxes(); background_pictures(); text_extras(); zoom(); ranges(); object_fit(); scrolling_boxes();
+    font_faces();
+    text_flow();
+    positioning();
+    boxes();
+    background_pictures();
+    text_extras();
+    zoom();
+    ranges();
+    object_fit();
+    scrolling_boxes();
+    shadow_layout();
     puts("browser layout: spacing, wrapping, fixed and sticky boxes, outlines, tables, ruby, background pictures, object-fit and scrolling boxes passed");
 }

@@ -10,6 +10,7 @@
 #include <string.h>
 #include "jsint.h"
 #include "jsprelude.h"
+#include "jsbinarylib.h"
 
 #define ARG(i) ((i) < argc ? args[(i)] : js_undefined)
 
@@ -638,18 +639,23 @@ static const struct lazy_chunk {
     int len;
     const char *names[16];
 } lazy_chunks[] = {
-    { js_chunk_weak, sizeof(js_chunk_weak) - 1,
-      { "Reflect", "WeakMap", "WeakSet", "WeakRef", "FinalizationRegistry", "AggregateError",
-        "DOMException", NULL } },
-    { js_chunk_misc, sizeof(js_chunk_misc) - 1, { "structuredClone", "btoa", "atob", "Intl", NULL } },
-    { js_chunk_events, sizeof(js_chunk_events) - 1, { "EventTarget", "AbortSignal", "AbortController", NULL } },
-    { js_chunk_url, sizeof(js_chunk_url) - 1, { "URLSearchParams", "URL", NULL } },
-    { js_chunk_observers, sizeof(js_chunk_observers) - 1,
-      { "MutationObserver", "IntersectionObserver", "ResizeObserver", NULL } },
-    { js_chunk_web, sizeof(js_chunk_web) - 1,
-      { "TextEncoder", "TextDecoder", "crypto", "Blob", "FormData", "DOMParser", "customElements", "CSS",
-        "WebSocket", "Notification", "DOMRect", "postMessage", NULL } },
-    { js_chunk_fetch, sizeof(js_chunk_fetch) - 1, { "Headers", "Response", "Request", "fetch", NULL } },
+    {js_chunk_weak,
+     sizeof(js_chunk_weak) - 1,
+     {"Reflect", "WeakMap", "WeakSet", "WeakRef", "FinalizationRegistry", "AggregateError", "DOMException",
+      NULL}},
+    {js_chunk_misc, sizeof(js_chunk_misc) - 1, {"structuredClone", "btoa", "atob", "Intl", NULL}},
+    {js_chunk_events, sizeof(js_chunk_events) - 1, {"EventTarget", "AbortSignal", "AbortController", NULL}},
+    {js_chunk_url, sizeof(js_chunk_url) - 1, {"URLSearchParams", "URL", NULL}},
+    {js_chunk_observers,
+     sizeof(js_chunk_observers) - 1,
+     {"MutationObserver", "IntersectionObserver", "ResizeObserver", NULL}},
+    {js_chunk_web,
+     sizeof(js_chunk_web) - 1,
+     {"TextEncoder", "TextDecoder", "crypto", "Blob", "FormData", "DOMParser", "customElements", "CSS",
+      "Notification", "DOMRect", "postMessage", NULL}},
+    {js_chunk_fetch,
+     sizeof(js_chunk_fetch) - 1,
+     {"Headers", "Response", "Request", "ReadableStream", "fetch", "EventSource", NULL}},
 };
 
 /* A chunk gives a name its value, unless the page has set it already. */
@@ -724,4 +730,6 @@ void js_init_lib2(struct js *J)
     init_symbol(J);
     init_promise(J);
     init_prelude(J);
+    if (js_eval(J, js_binary_lib, sizeof(js_binary_lib) - 1, "binary library") < 0)
+        fprintf(stderr, "binary library: %s\n", js_error(J));
 }

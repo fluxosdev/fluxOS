@@ -33,6 +33,8 @@
 #include <string.h>
 #include "jsint.h"
 #include "jsdom.h"
+#include "webpolicy.h"
+#include "jsnet.h"
 #include "jsdomlib.h"
 
 #define MAX_TIMERS 256
@@ -48,7 +50,24 @@ struct timer {
     int nargs;
 };
 
+/* Request policy lives in native memory: scripts must not be able to rewrite it in flight. */
+struct xhr_request {
+    struct jsstr *url, *method, *headers, *body;
+    int credentials, credential_mode, mode, cross, preflight, redirects, opened;
+    int received, streaming, chunks, loaded;
+    struct jsstr *partial;
+};
+static const struct jsclass xhr_class = {"XMLHttpRequest", NULL, NULL, NULL};
+
+struct dispatch_path {
+    jsval event;
+    struct node *target;
+    struct dispatch_path *prev;
+};
+
 struct jsdom {
+    struct jsnet *network;
+    struct dispatch_path *dispatch_path;
     struct jshost h;
     struct js *J;
     struct jsobj *window, *document, *element_proto, *document_proto, *event_proto, *location;
@@ -62,6 +81,7 @@ struct jsdom {
     int loaded;
     int depth;                          /* nested entries from the browser */
     char cookies[2048];
+    struct xhr_request requests[MAX_XHR];
     struct jsobj *xhr[MAX_XHR];         /* requests in flight, by id */
     struct jsobj *xhr_proto;
     unsigned int started;               /* uptime when the page's scripts began */
@@ -127,6 +147,8 @@ static void settle(struct jsdom *d)
 }
 
 /* ---- the tree ---- */
+
+static int is_connected(struct jsdom *d, const struct node *n);
 
 static int is_element(const struct node *n)
 {
@@ -198,7 +220,7 @@ static void ce_hook(struct jsdom *d, const char *hook, jsval *args, int n)
 /* n went into the document (connected 1) or out of it: each custom element in it hears. */
 static void ce_tree(struct jsdom *d, struct node *n, int connected)
 {
-    if (!d || !d->custom_on || (connected && !contains(d->h.root, n)))
+    if (!d || !d->custom_on || (connected && !is_connected(d, n)))
         return;
     for (struct node *k = n; k; k = node_next(k, n))
         if (is_custom(k)) {
@@ -214,7 +236,7 @@ static void unlink_node(struct jsdom *d, struct node *n)
         return;
     if (d && d->watch_mutations)
         mutation(d, "childList", p, NULL, n, n->prev, n->next, NULL, NULL);
-    int was_connected = d && d->custom_on && contains(d->h.root, p);
+    int was_connected = d && d->custom_on && is_connected(d, p);
     if (n->prev)
         n->prev->next = n->next;
     else
@@ -237,6 +259,17 @@ static int contains(const struct node *a, const struct node *b)
     return 0;
 }
 
+static int is_connected(struct jsdom *d, const struct node *n)
+{
+    int depth = 0;
+    while (n && depth++ < 256) {
+        if (n == d->h.root)
+            return 1;
+        n = n->parent ? n->parent : n->shadow_host;
+    }
+    return 0;
+}
+
 static int is_fragment(const struct node *n)
 {
     return is_element(n) && !strcmp(n->name, "#fragment");
@@ -247,6 +280,9 @@ static int insert_node(struct jsdom *d, struct node *parent, struct node *n, str
 {
     if (!parent || !n || contains(n, parent))
         return -1;
+    for (struct node *p = parent; p; p = p->parent ? p->parent : p->shadow_host)
+        if (p == n)
+            return -1;
     if (is_fragment(n)) {
         while (n->first) {
             struct node *k = n->first;
@@ -920,12 +956,13 @@ static jsval wrap(struct jsdom *d, struct node *n)
 static int mark_tree(struct jsdom *d, struct node *root)
 {
     int any = 0;
-    root->gcpass = d->gcpass;
-    for (struct node *n = root; n; n = node_next(n, root))
+    for (struct node *n = root; n; n = node_next_shadow(n, root)) {
+        n->gcpass = d->gcpass;
         if (n->js && !js_gc_marked(d->J, n->js)) {
             js_gc_mark(d->J, n->js);
             any = 1;
         }
+    }
     return any;
 }
 
@@ -950,8 +987,8 @@ static int gc_more(struct js *J, void *ctx)
         struct node *r = js_host_data(o, &node_class);
         if (!r)
             continue;
-        while (r->parent)
-            r = r->parent;
+        while (r->parent || r->shadow_host)
+            r = r->parent ? r->parent : r->shadow_host;
         if (r->gcpass != d->gcpass)
             any |= mark_tree(d, r);
     }
@@ -1130,6 +1167,13 @@ static jsval rect_object(struct jsdom *d, struct node *n)
         d->h.node_box(d->h.ctx, n, &x, &y, &w, &h);
     if (d->h.scroll_pos)
         d->h.scroll_pos(d->h.ctx, &sx, &sy);
+    /* Scrolling boxes move descendants, but do not move their own border boxes. */
+    if (d->h.node_scroll)
+        for (struct node *p = n ? n->parent : NULL; p; p = p->parent) {
+            int bx = 0, by = 0, cw, ch, vw, vh;
+            if (d->h.node_scroll(d->h.ctx, p, 0, &bx, &by, &cw, &ch, &vw, &vh))
+                x -= bx, y -= by;
+        }
     struct jsobj *r = js_new_object(J);
     jsval o = js_obj(r);
     js_set(J, o, "x", js_num(x - sx));
@@ -1230,6 +1274,26 @@ static int node_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
     }
     if (n->type != N_ELEMENT)
         return 0;
+    if (IS("shadowRoot")) {
+        *out = wrap(d, n->shadow_root && !n->shadow_root->shadow_closed ? n->shadow_root : NULL);
+        return 1;
+    }
+    if (IS("host") && n->shadow_host) {
+        *out = wrap(d, n->shadow_host);
+        return 1;
+    }
+    if (IS("mode") && n->shadow_host) {
+        *out = js_str(J, n->shadow_closed ? "closed" : "open");
+        return 1;
+    }
+    if (IS("assignedSlot")) {
+        struct node *host = n->parent;
+        const char *name = node_attr(n, "slot");
+        *out = wrap(d, host && host->shadow_root && !host->shadow_root->shadow_closed
+                           ? shadow_slot(host, name ? name : "")
+                           : NULL);
+        return 1;
+    }
     if (IS("innerHTML") || IS("outerHTML")) {
         *out = html_of(J, n, IS("outerHTML"));
         return 1;
@@ -1412,7 +1476,7 @@ static int node_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
         return 1;
     }
     if (IS("isConnected")) {
-        *out = js_bool(contains(d->h.root, n));
+        *out = js_bool(is_connected(d, n));
         return 1;
     }
     if (in_list(reflected, key, attr, sizeof(attr))) {
@@ -2290,6 +2354,50 @@ static jsval el_compare_position(struct js *J, jsval self, jsval *args, int argc
     return js_num(1);
 }
 
+static jsval el_attach_shadow(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct jsdom *d = dom(J);
+    struct node *n = this_node(J, self);
+    if (!n || n->type != N_ELEMENT || is_fragment(n) || n->tag == T_INPUT || n->tag == T_IMG ||
+        n->tag == T_IFRAME || n->tag == T_SCRIPT || n->tag == T_STYLE)
+        return js_throw_error(J, "NotSupportedError: element cannot host a shadow root");
+    if (n->shadow_root)
+        return js_throw_error(J, "NotSupportedError: shadow root already attached");
+    const char *mode = ARG(0).t == JS_OBJ ? js_cstr(js_get(J, ARG(0), "mode")) : "";
+    if (strcmp(mode, "open") && strcmp(mode, "closed"))
+        return js_throw_error(J, "TypeError: shadow mode must be open or closed");
+    struct node *root = new_node(d, N_ELEMENT, "#fragment");
+    if (!root)
+        return js_throw_error(J, "Error: out of memory");
+    n->shadow_root = root;
+    root->shadow_host = n;
+    root->shadow_closed = !strcmp(mode, "closed");
+    d->dirty = 1;
+    return wrap(d, root);
+}
+static jsval el_assigned_nodes(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct jsdom *d = dom(J);
+    struct node *n = this_node(J, self);
+    struct jsobj *list = js_new_array(J);
+    if (!n || strcmp(n->name, "slot"))
+        return js_obj(list);
+    struct node *root = n;
+    while (root->parent)
+        root = root->parent;
+    struct node *host = root->shadow_host;
+    const char *name = node_attr(n, "name");
+    if (!name)
+        name = "";
+    if (host && shadow_slot(host, name) == n)
+        for (struct node *k = host->first; k; k = k->next) {
+            const char *s = node_attr(k, "slot");
+            if (!strcmp(s ? s : "", name))
+                js_array_push(J, list, wrap(d, k));
+        }
+    return js_obj(list);
+}
+
 static jsval el_get_root_node(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)args, (void)argc;
@@ -2297,8 +2405,15 @@ static jsval el_get_root_node(struct js *J, jsval self, jsval *args, int argc)
     struct node *n = this_node(J, self);
     if (!n)
         return js_undefined;
-    while (n->parent)
-        n = n->parent;
+    int composed = ARG(0).t == JS_OBJ && js_truthy(js_get(J, ARG(0), "composed"));
+    do {
+        while (n->parent)
+            n = n->parent;
+        if (composed && n->shadow_host)
+            n = n->shadow_host;
+        else
+            break;
+    } while (n);
     return n == d->h.root ? js_obj(d->document) : wrap(d, n);
 }
 
@@ -2919,22 +3034,29 @@ static jsval event_init(struct js *J, jsval self, jsval *args, int argc)
 /* The targets an event goes through: the target, its ancestors, the document and the window. */
 static jsval event_composed_path(struct js *J, jsval self, jsval *args, int argc)
 {
-    (void)args;
-    (void)argc;
     struct jsdom *d = dom(J);
     struct jsobj *a = js_new_array(J);
-    if (self.t != JS_OBJ || !js_truthy(js_get(J, self, "__dispatching")))
+    struct dispatch_path *path = d->dispatch_path;
+    while (path && (self.t != JS_OBJ || path->event.u.o != self.u.o))
+        path = path->prev;
+    if (!path)
         return js_obj(a);
-    jsval t = js_get(J, self, "target");
-    struct node *n = node_of(t);
-    for (; n; n = n->parent)
+    struct node *current = node_of(js_get(J, self, "currentTarget"));
+    struct node *start = path->target;
+    for (struct node *p = start; p; p = p->parent ? p->parent : p->shadow_host)
+        if (p->shadow_host && p->shadow_closed && !contains(p, current))
+            start = p->shadow_host;
+    int composed = js_truthy(js_get(J, self, "composed")), connected = 0;
+    for (struct node *n = start; n;) {
         js_array_push(J, a, wrap(d, n));
-    if (node_of(t) && contains(d->h.root, node_of(t)))
+        if (n == d->h.root)
+            connected = 1;
+        n = n->parent ? n->parent : composed ? n->shadow_host : NULL;
+    }
+    if (connected) {
         js_array_push(J, a, js_obj(d->document));
-    if (t.t == JS_OBJ && t.u.o != d->window)
         js_array_push(J, a, js_obj(d->window));
-    else if (t.t == JS_OBJ)
-        js_array_push(J, a, t);
+    }
     return js_obj(a);
 }
 
@@ -3082,11 +3204,23 @@ static int may_listen(const struct node *n, const char *on)
 static int dispatch_event(struct jsdom *d, struct node *target, const char *type, jsval ev, int bubbles)
 {
     struct js *J = d->J;
-    struct node *path[256];
-    int np = 0;
-    for (struct node *n = target->parent; n && np < 256; n = n->parent)
-        path[np++] = n;
-    int in_doc = contains(d->h.root, target);
+    struct node *path[256], *visible[256], *retarget = target;
+    int np = 0, in_doc = target == d->h.root, composed = js_truthy(js_get(J, ev, "composed"));
+    for (struct node *n = target->parent; n && np < 256;) {
+        path[np] = n;
+        visible[np++] = retarget;
+        if (n == d->h.root)
+            in_doc = 1;
+        if (n->parent)
+            n = n->parent;
+        else if (composed && n->shadow_host) {
+            retarget = n->shadow_host;
+            n = n->shadow_host;
+        } else
+            n = NULL;
+    }
+    struct dispatch_path live = {ev, target, d->dispatch_path};
+    d->dispatch_path = &live;
     char on[40];
     snprintf(on, sizeof(on), "on%s", type);
     d->depth++;
@@ -3094,19 +3228,26 @@ static int dispatch_event(struct jsdom *d, struct node *target, const char *type
 #define STOPPED() js_truthy(js_get(J, ev, "__stopped"))
     /* capture: the window and the document, then down to the target's parent */
     if (in_doc) {
+        js_set(J, ev, "target", wrap(d, retarget));
         fire_phase(d, js_obj(d->window), NULL, type, ev, 1);
         if (!STOPPED())
             fire_phase(d, js_obj(d->document), NULL, type, ev, 1);
     }
     for (int i = np - 1; i >= 0 && !STOPPED(); i--)
-        if (path[i]->js)
+        if (path[i]->js) {
+            js_set(J, ev, "target", wrap(d, visible[i]));
             fire_phase(d, wrap(d, path[i]), path[i], type, ev, 1);
+        }
+    js_set(J, ev, "target", wrap(d, target));
     if (!STOPPED() && may_listen(target, on))
         fire_phase(d, wrap(d, target), target, type, ev, 2);
     if (bubbles) {
         for (int i = 0; i < np && !STOPPED(); i++)
-            if (may_listen(path[i], on))
+            if (may_listen(path[i], on)) {
+                js_set(J, ev, "target", wrap(d, visible[i]));
                 fire_phase(d, wrap(d, path[i]), path[i], type, ev, 3);
+            }
+        js_set(J, ev, "target", wrap(d, retarget));
         if (in_doc && !STOPPED())
             fire_phase(d, js_obj(d->document), NULL, type, ev, 3);
         if (in_doc && !STOPPED())
@@ -3116,6 +3257,7 @@ static int dispatch_event(struct jsdom *d, struct node *target, const char *type
     js_set(J, ev, "__dispatching", js_bool(0));
     js_set(J, ev, "eventPhase", js_num(0));
     js_set(J, ev, "currentTarget", js_null);
+    d->dispatch_path = live.prev;
     d->depth--;
     int prevented = js_truthy(js_get(J, ev, "defaultPrevented"));
     settle(d);
@@ -3137,6 +3279,7 @@ int jsdom_dispatch(struct jsdom *d, struct node *target, const char *type)
     if (!d || !target)
         return 0;
     jsval ev = new_event(d, type, wrap(d, target));
+    js_set(d->J, ev, "composed", js_bool(1));
     int bubbles = bubbles_by_default(type);
     js_set(d->J, ev, "bubbles", js_bool(bubbles));
     return dispatch_event(d, target, type, ev, bubbles);
@@ -3152,6 +3295,7 @@ int jsdom_mouse_event(struct jsdom *d, struct node *target, const char *type, in
     if (d->h.scroll_pos)
         d->h.scroll_pos(d->h.ctx, &sx, &sy);
     jsval ev = new_event(d, type, wrap(d, target));
+    js_set(d->J, ev, "composed", js_bool(1));
     int bubbles = bubbles_by_default(type);
     js_set(J, ev, "bubbles", js_bool(bubbles));
     js_set(J, ev, "cancelable", js_bool(bubbles));
@@ -4582,6 +4726,16 @@ static void xhr_state(struct jsdom *d, jsval x, int state)
     fire_on(d, x, NULL, "readystatechange", ev);
 }
 
+static jsval document_font_register(struct js *J,jsval self,jsval *args,int argc)
+{
+    struct jsdom *d=dom(J);int len=0;unsigned char *bytes=js_binary_bytes(ARG(1),&len);
+    const char *family=js_tostr(J,ARG(0))->s;
+    return js_bool(bytes&&d->h.font_register&&d->h.font_register(d->h.ctx,family,bytes,len,js_truthy(ARG(2)),js_truthy(ARG(3))));
+}
+static jsval document_font_status(struct js *J,jsval self,jsval *args,int argc)
+{
+    struct jsdom *d=dom(J);return js_num(d->h.font_status?d->h.font_status(d->h.ctx,js_tostr(J,ARG(0))->s):-1);
+}
 static jsval xhr_ctor(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
@@ -4589,6 +4743,8 @@ static jsval xhr_ctor(struct js *J, jsval self, jsval *args, int argc)
     (void)argc;
     struct jsdom *d = dom(J);
     struct jsobj *x = js_mkobj(J, C_OBJECT, d->xhr_proto);
+    x->hcls = &xhr_class;
+    x->hdata = js_alloc(J, sizeof(struct xhr_request));
     jsval xv = js_obj(x);
     js_set(J, xv, "readyState", js_num(0));
     js_set(J, xv, "status", js_num(0));
@@ -4609,7 +4765,33 @@ static jsval xhr_open(struct js *J, jsval self, jsval *args, int argc)
         return js_undefined;
     char abs[URL_MAX];
     url_resolve(d->h.base, js_tostr(J, ARG(1))->s, abs, sizeof(abs));
-    js_put(J, self.u.o, S(J, "__method"), js_to_string(J, ARG(0)), 1);
+    struct jsstr *method = js_tostr(J, ARG(0));
+    if (!method->len ||
+        strspn(method->s, "!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") !=
+            (size_t)method->len)
+        return js_throw_error(J, "SyntaxError: invalid request method");
+    char upper[64];
+    if (method->len >= (int)sizeof(upper))
+        return js_throw_error(J, "SyntaxError: method too long");
+    for (int i = 0; i <= method->len; i++)
+        upper[i] = (char)toupper((unsigned char)method->s[i]);
+    if (!strcmp(upper, "CONNECT") || !strcmp(upper, "TRACE") || !strcmp(upper, "TRACK"))
+        return js_throw_error(J, "SecurityError: forbidden method");
+    if (!strcmp(upper, "GET") || !strcmp(upper, "HEAD") || !strcmp(upper, "POST") || !strcmp(upper, "PUT") ||
+        !strcmp(upper, "DELETE") || !strcmp(upper, "OPTIONS"))
+        method = S(J, upper);
+    if (self.u.o->hcls != &xhr_class)
+        return js_throw_error(J, "TypeError: invalid XMLHttpRequest receiver");
+    for (int i = 0; i < MAX_XHR; i++)
+        if (d->xhr[i] == self.u.o)
+            d->xhr[i] = NULL;
+    struct xhr_request *request = self.u.o->hdata;
+    memset(request, 0, sizeof(*request));
+    request->url = S(J, abs);
+    request->method = method;
+    request->headers = S(J, "");
+    request->opened = 1;
+    js_put(J, self.u.o, S(J, "__method"), (jsval){JS_STR, {.s = method}}, 1);
     js_put(J, self.u.o, S(J, "__url"), js_str(J, abs), 1);
     js_put(J, self.u.o, S(J, "__aborted"), js_bool(0), 1);
     js_put(J, self.u.o, S(J, "__headers"), js_str(J, ""), 1);
@@ -4622,9 +4804,19 @@ static jsval xhr_set_header(struct js *J, jsval self, jsval *args, int argc)
     if (self.t != JS_OBJ)
         return js_undefined;
     const char *name = js_tostr(J, ARG(0))->s, *val = js_tostr(J, ARG(1))->s;
-    if (!*name || strpbrk(name, ":\r\n ") || strpbrk(val, "\r\n"))
+    if (web_forbidden_header(name))
         return js_undefined;
-    const char *old = js_cstr(js_get(J, self, "__headers"));
+    if (!*name ||
+        strspn(name, "!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") !=
+            strlen(name) ||
+        strpbrk(val, "\r\n"))
+        return js_undefined;
+    if (self.u.o->hcls != &xhr_class)
+        return js_throw_error(J, "TypeError: invalid XMLHttpRequest receiver");
+    struct xhr_request *request = self.u.o->hdata;
+    if (!request->opened)
+        return js_throw_error(J, "InvalidStateError: request already sent or not open");
+    const char *old = request->headers->s;
     size_t n = (old ? strlen(old) : 0) + strlen(name) + strlen(val) + 4;
     if (n > 4000)
         return js_undefined;
@@ -4632,35 +4824,121 @@ static jsval xhr_set_header(struct js *J, jsval self, jsval *args, int argc)
     if (!buf)
         return js_undefined;
     snprintf(buf, n, "%s%s: %s\n", old ? old : "", name, val);
+    request->headers = S(J, buf);
     js_put(J, self.u.o, S(J, "__headers"), js_str(J, buf), 1);
     free(buf);
     return js_undefined;
 }
 
+static void xhr_failure(struct jsdom *d, int id, jsval x)
+{
+    struct js *J = d->J;
+    if (id >= 0)
+        d->xhr[id] = NULL;
+    js_set(J, x, "status", js_num(0));
+    js_set(J, x, "statusText", js_str(J, ""));
+    js_set(J, x, "responseText", js_str(J, ""));
+    js_set(J, x, "response", js_null);
+    js_put(J, x.u.o, S(J, "__headers"), js_str(J, ""), 1);
+    xhr_state(d, x, 4);
+    fire_on(d, x, NULL, "error", new_event(d, "error", x));
+    fire_on(d, x, NULL, "loadend", new_event(d, "loadend", x));
+}
+static void xhr_issue(struct jsdom *d, int id, jsval x, int preflight)
+{
+    struct xhr_request *r = &d->requests[id];
+    const char *url = r->url->s, *method = r->method->s, *headers = r->headers->s;
+    char origin[300] = "null", target[300];
+    web_origin(d->h.url, origin, sizeof(origin));
+    int cross = !web_same_origin(d->h.url, url);
+    int local = url_is_file(url) && url_is_file(d->h.url);
+    const char *mode = r->mode == 1 ? "same-origin" : r->mode == 2 ? "no-cors" : "cors";
+    int credentials = r->credential_mode != 1 && (!cross || r->credential_mode == 2);
+    r->credentials = credentials;
+    if ((!web_origin(url, target, sizeof(target)) && !local) ||
+        (url_is_https(d->h.url) && url_is_http(url)) || (cross && !local && !strcmp(mode, "same-origin")) ||
+        (cross && !strcmp(mode, "no-cors") && !web_simple_request(method, headers))) {
+        xhr_failure(d, id, x);
+        return;
+    }
+    int need =
+        preflight && cross && !local && strcmp(mode, "no-cors") && !web_simple_request(method, headers);
+    r->preflight = need;
+    r->received=r->chunks=r->loaded=0;r->partial=NULL;
+    r->cross = cross && !local;
+    char request[8192];
+    if (need) {
+        int n = snprintf(request, sizeof(request), "Origin: %s\nAccess-Control-Request-Method: %s\n", origin,
+                         method);
+        char names[4096] = "";
+        int nn = 0;
+        for (const char *p = headers; *p;) {
+            const char *e = strchr(p, '\n');
+            if (!e)
+                e = p + strlen(p);
+            const char *c = memchr(p, ':', (size_t)(e - p));
+            if (c && nn + (c - p) + 2 < (int)sizeof(names)) {
+                if (nn)
+                    names[nn++] = ',';
+                for (const char *q = p; q < c; q++)
+                    names[nn++] = (char)tolower((unsigned char)*q);
+                names[nn] = 0;
+            }
+            p = *e ? e + 1 : e;
+        }
+        if (nn)
+            snprintf(request + n, sizeof(request) - (size_t)n, "Access-Control-Request-Headers: %s\n", names);
+        d->h.http(d->h.ctx, id, "OPTIONS", url, NULL, 0, request, 0);
+    } else {
+        int send_origin=!local && (cross || (strcmp(method,"GET") && strcmp(method,"HEAD")));
+        snprintf(request,sizeof(request),"%s%s%s%s",headers,send_origin?"Origin: ":"",send_origin?origin:"",send_origin?"\n":"");
+        const void *bytes = r->body ? r->body->s : NULL;
+        int len = r->body ? r->body->len : 0;
+        if (!strcmp(method, "GET") || !strcmp(method, "HEAD"))
+            bytes = NULL, len = 0;
+        d->h.http(d->h.ctx, id, method, url, bytes, len, request, credentials);
+    }
+}
 static jsval xhr_send(struct js *J, jsval self, jsval *args, int argc)
 {
     struct jsdom *d = dom(J);
     if (self.t != JS_OBJ)
         return js_undefined;
+    if (self.u.o->hcls != &xhr_class)
+        return js_throw_error(J, "TypeError: invalid XMLHttpRequest receiver");
+    struct xhr_request *source = self.u.o->hdata;
+    if (!source->opened)
+        return js_throw_error(J, "InvalidStateError: request is not opened");
     int id = -1;
-    for (int i = 0; i < MAX_XHR && id < 0; i++)
-        if (!d->xhr[i])
+    for (int i = 0; i < MAX_XHR; i++) {
+        if (d->xhr[i] == self.u.o)
+            return js_throw_error(J, "InvalidStateError: request already sent");
+        if (!d->xhr[i] && id < 0)
             id = i;
-    const char *url = js_cstr(js_get(J, self, "__url"));
-    if (id < 0 || !d->h.http || (strncmp(url, "http", 4) && strncmp(url, "file:", 5))) {
-        /* cannot go: a network error at once */
-        js_put(J, self.u.o, S(J, "__failed"), js_bool(1), 1);
-        jsval ev = new_event(d, "error", self);
-        fire_on(d, self, NULL, "error", ev);
+    }
+    if (id < 0 || !d->h.http) {
+        xhr_failure(d, -1, self);
         return js_undefined;
     }
     d->xhr[id] = self.u.o;
+    source->opened = 0;
+    struct xhr_request *r = &d->requests[id];
+    *r = *source;
+    r->streaming=js_truthy(js_get(J,self,"__streaming"));
+    const char *creds = js_cstr(js_get(J, self, "__credentials"));
+    r->credential_mode = !strcmp(creds, "omit")                                                       ? 1
+                         : !strcmp(creds, "include") || js_truthy(js_get(J, self, "withCredentials")) ? 2
+                                                                                                      : 0;
+    const char *mode = js_cstr(js_get(J, self, "__mode"));
+    r->mode = !strcmp(mode, "same-origin") ? 1 : !strcmp(mode, "no-cors") ? 2 : 0;
     jsval body = ARG(0);
-    const char *method = js_cstr(js_get(J, self, "__method"));
-    const char *hdrs = js_cstr(js_get(J, self, "__headers"));
-    d->h.http(d->h.ctx, id, method, url,
-              body.t == JS_UNDEF || body.t == JS_NULL ? NULL : js_tostr(J, body)->s,
-              hdrs && *hdrs ? hdrs : NULL);
+    int len = 0;
+    unsigned char *bytes = js_binary_bytes(body, &len);
+    if (bytes)
+        r->body = js_mkstr(J, (const char *)bytes, len);
+    else if (body.t != JS_NULL && body.t != JS_UNDEF)
+        r->body = js_tostr(J, body);
+    xhr_issue(d, id, self, 1);
     return js_undefined;
 }
 
@@ -4671,7 +4949,14 @@ static jsval xhr_abort(struct js *J, jsval self, jsval *args, int argc)
     struct jsdom *d = dom(J);
     for (int i = 0; i < MAX_XHR; i++)
         if (self.t == JS_OBJ && d->xhr[i] == self.u.o)
-            d->xhr[i] = NULL;
+        {
+            d->xhr[i]=NULL;
+            if(d->h.http_cancel)d->h.http_cancel(d->h.ctx,i);
+            js_set(J,self,"status",js_num(0));
+            xhr_state(d,self,4);
+            fire_on(d,self,NULL,"abort",new_event(d,"abort",self));
+            fire_on(d,self,NULL,"loadend",new_event(d,"loadend",self));
+        }
     if (self.t == JS_OBJ)
         js_set(J, self, "readyState", js_num(0));
     return js_undefined;
@@ -4706,17 +4991,20 @@ static jsval xhr_all_headers(struct js *J, jsval self, jsval *args, int argc)
     return h.t == JS_STR ? h : js_str(J, "");
 }
 
-void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, int hlen,
-                     const char *body, int blen)
+int jsdom_http_headers(struct jsdom *d,int id,int status,const char *headers,int hlen)
 {
-    if (!d || id < 0 || id >= MAX_XHR || !d->xhr[id])
-        return;
-    struct js *J = d->J;
-    jsval x = js_obj(d->xhr[id]);
-    d->xhr[id] = NULL;
-    d->depth++;
+    if(!d||id<0||id>=MAX_XHR||!d->xhr[id])return -1;
+    struct js *J=d->J;jsval x=js_obj(d->xhr[id]);struct xhr_request *request=&d->requests[id];
+    if(request->received)return request->streaming?2:1;
+    if(request->preflight || (status>=300&&status<=308&&status!=304))return 0;
+    if(status<200||!headers||hlen<=0)return 0;
+    struct jsstr *bounded=js_mkstr(J,headers,hlen);headers=bounded->s;
+    char origin[300]="null";web_origin(d->h.url,origin,sizeof(origin));int credentials=request->credentials;
+    if(request->cross&&request->mode!=2&&!web_cors_allow(origin,headers,credentials)){xhr_failure(d,id,x);return -1;}
+    int opaque=request->cross&&request->mode==2;
+    if(opaque){status=0;headers=NULL;hlen=0;}
     /* the header block without its status line */
-    const char *h = headers, *hend = headers + hlen;
+    const char *h = headers;
     const char *nl = h ? memchr(h, '\n', (size_t)hlen) : NULL;
     const char *status_text = "";
     char reason[64] = "";
@@ -4730,28 +5018,137 @@ void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, i
     while (rl && (reason[rl - 1] == '\r' || reason[rl - 1] == ' '))
         reason[--rl] = 0;
     status_text = reason;
+    char filtered[16384];
+    int filtered_len = web_response_headers(h, request->cross, credentials, filtered, sizeof(filtered));
     js_put(J, x.u.o, S(J, "__headers"),
-           h && hend > h ? js_strn(J, h, (int)(hend - h)) : js_str(J, ""), 1);
+           filtered_len >= 0 ? js_strn(J, filtered, filtered_len) : js_str(J, ""), 1);
     js_set(J, x, "status", js_num(status));
     js_set(J, x, "statusText", js_str(J, status_text));
-    js_set(J, x, "responseURL", js_get(J, x, "__url"));
+    js_set(J, x, "responseURL", (jsval){JS_STR, {.s = request->url}});
+
+    request->received=1;d->depth++;xhr_state(d,x,2);d->depth--;js_run_jobs(J);settle(d);
+    return request->streaming?2:1;
+}
+void jsdom_http_chunk(struct jsdom *d,int id,const void *data,int len)
+{
+    if(!d||id<0||id>=MAX_XHR||!d->xhr[id]||len<=0)return;
+    struct xhr_request *r=&d->requests[id];if(!r->received || (r->cross&&r->mode==2))return;
+    struct js *J=d->J;jsval x=js_obj(d->xhr[id]);
+    r->chunks++;r->loaded+=len;
+    if(!r->streaming && !*js_cstr(js_get(J,x,"responseType"))){
+        int old=r->partial?r->partial->len:0;
+        if(old<=16*1024*1024-len){char *joined=malloc((size_t)old+(size_t)len);if(joined){if(old)memcpy(joined,r->partial->s,(size_t)old);memcpy(joined+old,data,(size_t)len);r->partial=js_mkstr(J,joined,old+len);free(joined);js_set(J,x,"responseText",(jsval){JS_STR,{.s=r->partial}});}}
+    }
+    jsval view=js_construct(J,js_get(J,js_obj(J->global),"Uint8Array"),(jsval[]){js_num(len)},1);
+    int size=0;unsigned char *bytes=js_binary_bytes(view,&size);if(bytes)memcpy(bytes,data,(size_t)len);
+    d->depth++;xhr_state(d,x,3);jsval ev=new_event(d,"progress",x);
+    js_set(J,ev,"data",view);js_set(J,ev,"loaded",js_num(r->loaded));js_set(J,ev,"lengthComputable",js_bool(0));
+    fire_on(d,x,NULL,"progress",ev);d->depth--;js_run_jobs(J);settle(d);
+}
+
+void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, int hlen,
+                     const char *body, int blen)
+{
+    if (!d || id < 0 || id >= MAX_XHR || !d->xhr[id])
+        return;
+    struct js *J = d->J;
+    jsval x = js_obj(d->xhr[id]);
+    char origin[300] = "null";
+    web_origin(d->h.url, origin, sizeof(origin));
+    struct xhr_request *request = &d->requests[id];
+    int credentials = request->credentials;
+    if (request->preflight) {
+        if (status >= 200 && status < 300 &&
+            web_cors_preflight(origin, headers, credentials, request->method->s, request->headers->s))
+            xhr_issue(d, id, x, 0);
+        else
+            xhr_failure(d, id, x);
+        return;
+    }
+    if (request->cross && request->mode != 2 && !web_cors_allow(origin, headers, credentials)) {
+        xhr_failure(d, id, x);
+        return;
+    }
+    if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
+        char location[URL_MAX], next[URL_MAX];
+        if (web_header_value(headers, "Location", location, sizeof(location)) == 1) {
+            if (++request->redirects > 10) {
+                xhr_failure(d, id, x);
+                return;
+            }
+            url_resolve(request->url->s, location, next, sizeof(next));
+            if (!web_same_origin(request->url->s, next)) {
+                /* Authorization is never forwarded to a different origin. */
+                const char *p = request->headers->s;
+                char kept[4096] = "";
+                size_t used = 0;
+                while (*p) {
+                    const char *e = strchr(p, '\n');
+                    if (!e)
+                        e = p + strlen(p);
+                    if (strncasecmp(p, "Authorization:", 14)) {
+                        size_t n = (size_t)(e - p);
+                        if (used + n + 2 < sizeof(kept)) {
+                            memcpy(kept + used, p, n);
+                            used += n;
+                            kept[used++] = '\n';
+                            kept[used] = 0;
+                        }
+                    }
+                    p = *e ? e + 1 : e;
+                }
+                request->headers = S(J, kept);
+            }
+            request->url = S(J, next);
+            if ((status == 303 && strcmp(request->method->s, "HEAD")) ||
+                ((status == 301 || status == 302) && !strcmp(request->method->s, "POST"))) {
+                request->method = S(J, "GET");
+                request->body = NULL;
+            }
+            xhr_issue(d, id, x, 1);
+            return;
+        }
+    }
+    if (request->cross && request->mode == 2) {
+        status = 0;
+        headers = NULL;
+        hlen = 0;
+        body = NULL;
+        blen = 0;
+    }
+    int opaque = request->cross && request->mode == 2;
+    if(!status&&!opaque){xhr_failure(d,id,x);js_run_jobs(J);return;}
+    if(!request->received){
+        jsdom_http_headers(d,id,status,headers,hlen);
+        if(!d->xhr[id])return;
+        if(body&&blen)jsdom_http_chunk(d,id,body,blen);
+    }
+    d->xhr[id]=NULL;
+    d->depth++;
     jsval text = js_strn(J, body ? body : "", body ? blen : 0);
     js_set(J, x, "responseText", text);
     jsval response = text;
-    if (!strcmp(js_cstr(js_get(J, x, "responseType")), "json")) {
+    if (!strcmp(js_cstr(js_get(J, x, "responseType")), "arraybuffer")) {
+        jsval ctor = js_get(J, js_obj(J->global), "Uint8Array"), length = js_num(body ? blen : 0);
+        jsval view = js_construct(J, ctor, &length, 1);
+        int n;
+        unsigned char *bytes = js_binary_bytes(view, &n);
+        if (bytes && body)
+            memcpy(bytes, body, (size_t)blen);
+        response = js_get(J, view, "buffer");
+    } else if (!strcmp(js_cstr(js_get(J, x, "responseType")), "json")) {
         jsval json = js_get(J, js_obj(J->global), "JSON");
         jsval parse = js_get(J, json, "parse");
         if (js_call(J, parse, json, &text, 1, &response) < 0)
             response = js_null;
     }
     js_set(J, x, "response", response);
-    xhr_state(d, x, 2);
-    xhr_state(d, x, 3);
     xhr_state(d, x, 4);
-    const char *kind = status ? "load" : "error";
+    const char *kind = status || opaque ? "load" : "error";
     fire_on(d, x, NULL, kind, new_event(d, kind, x));
     fire_on(d, x, NULL, "loadend", new_event(d, "loadend", x));
     d->depth--;
+    js_run_jobs(J);
     settle(d);
 }
 
@@ -4759,22 +5156,27 @@ void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, i
  * Each name js_dom_lib defines starts as an accessor that runs it (which
  * puts the real thing in its place) and then reads the name again. */
 
-#define DOM_LIB_NAMES(X) \
-    X(W, MessageChannel) X(W, MessagePort) X(W, BroadcastChannel) X(W, XMLSerializer) X(W, Path2D) \
-    X(W, ImageData) \
-    X(W, NodeFilter) X(W, TreeWalker) X(W, NodeIterator) X(W, Range) X(W, StaticRange) X(W, Selection) \
-    X(W, getSelection) X(W, CSSStyleSheet) X(W, StyleSheet) X(W, CSSRule) X(W, FontFace) \
-    X(D, createTreeWalker) X(D, createNodeIterator) X(D, getSelection) X(D, createRange) X(D, getAnimations) \
-    X(D, createAttribute) X(D, queryCommandSupported) X(D, exitFullscreen) X(D, hasStorageAccess) \
-    X(D, requestStorageAccess) X(D, fonts) X(D, adoptedStyleSheets) X(D, fullscreenElement) \
-    X(D, fullscreenEnabled) X(D, pictureInPictureEnabled) X(D, styleSheets) \
-    X(E, validity) X(E, willValidate) X(E, validationMessage) X(E, setCustomValidity) X(E, checkValidity) \
-    X(E, reportValidity) X(E, showPicker) X(E, setRangeText) X(E, animate) X(E, getAnimations) \
-    X(E, attachShadow) X(E, shadowRoot) X(E, assignedSlot) X(E, assignedNodes) X(E, assignedElements) \
-    X(E, sheet) X(E, requestFullscreen) X(E, scroll) X(E, scrollTo) X(E, scrollBy) X(E, getClientRects) \
-    X(E, checkVisibility) X(E, setPointerCapture) X(E, releasePointerCapture) X(E, hasPointerCapture) \
-    X(E, showPopover) X(E, hidePopover) X(E, togglePopover) X(E, inert) X(E, draggable) X(E, slot) \
-    X(E, part) X(T, splitText) X(T, appendData) X(T, substringData)
+#define DOM_LIB_NAMES(X)                                                                                     \
+    X(W, MessageChannel)                                                                                     \
+    X(W, MessagePort)                                                                                        \
+    X(W, BroadcastChannel) X(W, XMLSerializer) X(W, Path2D) X(W, ImageData) X(W, NodeFilter)                 \
+        X(W, TreeWalker) X(W, NodeIterator) X(W, Range) X(W, StaticRange) X(W, Selection) X(W, getSelection) \
+            X(W, CSSStyleSheet) X(W, StyleSheet) X(W, CSSRule) X(W, FontFace) X(D, createTreeWalker)         \
+                X(D, createNodeIterator) X(D, getSelection) X(D, createRange) X(D, getAnimations)            \
+                    X(D, createAttribute) X(D, queryCommandSupported) X(D, exitFullscreen) X(                \
+                        D, hasStorageAccess) X(D, requestStorageAccess) X(D, fonts) X(D, adoptedStyleSheets) \
+                        X(D, fullscreenElement) X(D, fullscreenEnabled) X(D, pictureInPictureEnabled)        \
+                            X(D, styleSheets) X(E, validity) X(E, willValidate) X(E, validationMessage)      \
+                                X(E, setCustomValidity) X(E, checkValidity) X(E, reportValidity)             \
+                                    X(E, showPicker) X(E, setRangeText) X(E, animate) X(E, getAnimations)    \
+                                        X(E, assignedElements) X(E, sheet) X(E, requestFullscreen)           \
+                                            X(E, scroll) X(E, scrollTo) X(E, scrollBy) X(E, getClientRects)  \
+                                                X(E, checkVisibility) X(E, setPointerCapture)                \
+                                                    X(E, releasePointerCapture) X(E, hasPointerCapture)      \
+                                                        X(E, showPopover) X(E, hidePopover)                  \
+                                                            X(E, togglePopover) X(E, inert) X(E, draggable)  \
+                                                                X(E, slot) X(E, part) X(T, splitText)        \
+                                                                    X(T, appendData) X(T, substringData)
 
 static void dom_lib_load(struct jsdom *d)
 {
@@ -4821,6 +5223,27 @@ static void dom_fetch_module(void *ctx, int id, const char *url);
 static int dom_resolve(void *ctx, const char *spec, const char *base, char *out, int size);
 static void dom_module_done(void *ctx, void *tag, int failed);
 
+static int network_cookies(void *ctx,const char *url,char *out,int size)
+{
+    struct jsdom *d=ctx;return d->h.ws_cookies?d->h.ws_cookies(d->h.ctx,url,out,size):0;
+}
+
+static void network_event(void *ctx,jsval target,const char *type,jsval data,int code,const char *reason,int clean)
+{
+    struct jsdom *d=ctx;struct js *J=d->J;d->depth++;
+    jsval ev=new_event(d,type,target);
+    if(!strcmp(type,"message")){
+        js_set(J,ev,"data",data);const char *url=js_cstr(js_get(J,target,"url"));
+        int secure=!strncmp(url,"wss://",6);char http[URL_MAX],origin[300]="null",serialized[300]="null";
+        snprintf(http,sizeof(http),"%s://%s",secure?"https":"http",url+(secure?6:5));
+        if(web_origin(http,origin,sizeof(origin)))snprintf(serialized,sizeof(serialized),"%s%s",secure?"wss":"ws",strchr(origin,':'));
+        js_set(J,ev,"origin",js_str(J,serialized));
+    }
+    if(!strcmp(type,"error"))js_set(J,ev,"message",js_str(J,reason));
+    if(!strcmp(type,"close")){js_set(J,ev,"code",js_num(code));js_set(J,ev,"reason",js_str(J,reason));js_set(J,ev,"wasClean",js_bool(clean));}
+    fire_on(d,target,NULL,type,ev);d->depth--;settle(d);
+}
+
 struct jsdom *jsdom_new(const struct jshost *host)
 {
     struct jsdom *d = calloc(1, sizeof(*d));
@@ -4844,17 +5267,33 @@ struct jsdom *jsdom_new(const struct jshost *host)
 
     /* nodes: Node, and Text, DocumentFragment and the elements under it */
     struct jsobj *np = d->node_proto = js_new_object(J);
-    static const struct { const char *name; js_native fn; int n; } node_methods[] = {
-        { "appendChild", el_append_child, 1 }, { "insertBefore", el_insert_before, 2 },
-        { "removeChild", el_remove_child, 1 }, { "replaceChild", el_replace_child, 2 },
-        { "remove", el_remove, 0 }, { "before", el_before, 1 }, { "after", el_after, 1 },
-        { "replaceWith", el_replace_with, 1 }, { "cloneNode", el_clone_node, 1 },
-        { "contains", el_contains, 1 }, { "hasChildNodes", el_has_child_nodes, 0 },
-        { "compareDocumentPosition", el_compare_position, 1 }, { "getRootNode", el_get_root_node, 0 },
-        { "isEqualNode", el_is_equal_node, 1 }, { "isSameNode", el_is_same_node, 1 },
-        { "normalize", el_normalize, 0 }, { "addEventListener", add_event_listener, 2 },
-        { "removeEventListener", remove_event_listener, 2 }, { "dispatchEvent", el_dispatch_event, 1 },
-        { "toString", node_to_string, 0 },
+    static const struct {
+        const char *name;
+        js_native fn;
+        int n;
+    } node_methods[] = {
+        {"appendChild", el_append_child, 1},
+        {"insertBefore", el_insert_before, 2},
+        {"removeChild", el_remove_child, 1},
+        {"replaceChild", el_replace_child, 2},
+        {"remove", el_remove, 0},
+        {"before", el_before, 1},
+        {"after", el_after, 1},
+        {"replaceWith", el_replace_with, 1},
+        {"cloneNode", el_clone_node, 1},
+        {"contains", el_contains, 1},
+        {"hasChildNodes", el_has_child_nodes, 0},
+        {"attachShadow", el_attach_shadow, 1},
+        {"assignedNodes", el_assigned_nodes, 0},
+        {"compareDocumentPosition", el_compare_position, 1},
+        {"getRootNode", el_get_root_node, 0},
+        {"isEqualNode", el_is_equal_node, 1},
+        {"isSameNode", el_is_same_node, 1},
+        {"normalize", el_normalize, 0},
+        {"addEventListener", add_event_listener, 2},
+        {"removeEventListener", remove_event_listener, 2},
+        {"dispatchEvent", el_dispatch_event, 1},
+        {"toString", node_to_string, 0},
     };
     for (unsigned i = 0; i < sizeof(node_methods) / sizeof(node_methods[0]); i++)
         fn(J, np, node_methods[i].name, node_methods[i].fn, node_methods[i].n);
@@ -5044,6 +5483,8 @@ struct jsdom *jsdom_new(const struct jshost *host)
     fn(J, nav, "sendBeacon", nav_send_beacon, 2);
     js_set(J, wv, "navigator", nv);
 
+    fn(J,d->document,"__fontRegister",document_font_register,4);
+    fn(J,d->document,"__fontStatus",document_font_status,1);
     struct jsobj *scr = js_new_object(J);
     int vw = 800, vh = 600;
     if (d->h.viewport)
@@ -5253,6 +5694,8 @@ struct jsdom *jsdom_new(const struct jshost *host)
         accessor(J, lazy_on[lazy[i].where], lazy[i].name, lazy[i].get, lazy[i].set);
     if (js_eval(J, js_dom_eager, (int)sizeof(js_dom_eager) - 1, "DOM library") < 0)
         fprintf(stderr, "DOM library: %s\n", js_error(J));
+    char origin[300]="null";web_origin(d->h.url,origin,sizeof(origin));
+    d->network=jsnet_new(J,d->h.base?d->h.base:d->h.url,origin,d,network_event,network_cookies);
     return d;
 }
 
@@ -5260,6 +5703,7 @@ void jsdom_free(struct jsdom *d)
 {
     if (!d)
         return;
+    jsnet_free(d->network);
     js_free(d->J);
     free(d->wraps);
     for (int i = 0; i < d->nim; i++) {
@@ -5491,6 +5935,7 @@ void jsdom_run_timers(struct jsdom *d)
 {
     if (!d)
         return;
+    jsnet_poll(d->network);
     process_view(d);
     run_queued(d);
     unsigned int now = uptime_ms();
@@ -5530,7 +5975,7 @@ int jsdom_next_timer(struct jsdom *d)
     if (d->nqueued || view_changes(d, &sx, &sy, &vw, &vh))
         return 0;
     unsigned int now = uptime_ms();
-    int best = -1;
+    int best=jsnet_wait(d->network);
     for (int i = 0; i < MAX_TIMERS; i++) {
         struct timer *t = &d->timers[i];
         if (!t->active)

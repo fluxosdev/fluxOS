@@ -15,10 +15,10 @@
  * generators, which run as coroutines on stacks of their own (see the
  * coroutine section); promises and their microtask queue; ES modules (see
  * the modules section: the host fetches, the engine links and runs). Not
- * there: BigInt (read as a number) and the 16-bit string model.
+ * there: BigInt (read as a number).
  *
- * Strings are kept as UTF-8, and their length counts bytes, which is the
- * same as JavaScript's count for ASCII text.
+ * Strings are stored as UTF-8/WTF-8; indexed access and core string
+ * operations expose UTF-16 code units. The regex engine still uses bytes.
  *
  * Memory comes from an arena. Call environments that no closure captured
  * are recycled; everything else lasts until the page goes. Running out of
@@ -90,6 +90,73 @@ struct jsstr *js_mkstr(struct js *J, const char *s, int n)
     return r;
 }
 
+/* Keep UTF-8 storage, expose UTF-16 code units to JavaScript. Lone surrogates use WTF-8. */
+static int next_u16(const char **p, const char *end, int *pending)
+{
+    if (*pending) {
+        int unit = *pending;
+        *pending = 0;
+        return unit;
+    }
+    if (*p >= end)
+        return -1;
+    int cp = utf8_next(p, end);
+    if (cp > 0xFFFF) {
+        *pending = 0xDC00 + ((cp - 0x10000) & 1023);
+        return 0xD800 + ((cp - 0x10000) >> 10);
+    }
+    return cp;
+}
+
+int js_u16len(const struct jsstr *s)
+{
+    if (s->utf16_length || !s->len)
+        return s->utf16_length;
+    int n = 0;
+    const char *p = s->s, *end = p + s->len;
+    while (p < end)
+        n += utf8_next(&p, end) > 0xFFFF ? 2 : 1;
+    ((struct jsstr *)s)->utf16_length = n;
+    return n;
+}
+int js_u16unit(const struct jsstr *s, int index)
+{
+    if (index < 0)
+        return -1;
+    const char *p = s->s, *end = p + s->len;
+    while (p < end) {
+        int cp = utf8_next(&p, end);
+        if (cp > 0xFFFF) {
+            if (index-- == 0)
+                return 0xD800 + ((cp - 0x10000) >> 10);
+            cp = 0xDC00 + ((cp - 0x10000) & 1023);
+        }
+        if (index-- == 0)
+            return cp;
+    }
+    return -1;
+}
+struct jsstr *js_u16slice(struct js *J, const struct jsstr *s, int start, int end)
+{
+    if (end <= start)
+        return js_mkstr(J, "", 0);
+    char *buf = js_alloc_atomic(J, (size_t)(end - start) * 3 + 1);
+    const char *p = s->s, *limit = p + s->len;
+    int i = 0, n = 0;
+    while (p < limit && i < end) {
+        int cp = utf8_next(&p, limit), units = cp > 0xFFFF ? 2 : 1;
+        if (units == 2 && (i < start || i + 1 >= end)) {
+            if (i >= start && i < end)
+                n += utf8_put(buf + n, 0xD800 + ((cp - 0x10000) >> 10));
+            if (i + 1 >= start && i + 1 < end)
+                n += utf8_put(buf + n, 0xDC00 + ((cp - 0x10000) & 1023));
+        } else if (i >= start)
+            n += utf8_put(buf + n, cp);
+        i += units;
+    }
+    return js_mkstr(J, buf, n);
+}
+
 struct jsstr *js_concat(struct js *J, struct jsstr *a, struct jsstr *b)
 {
     struct jsstr *r = js_alloc_atomic(J, sizeof(struct jsstr) + (size_t)a->len + (size_t)b->len + 1);
@@ -102,7 +169,20 @@ struct jsstr *js_concat(struct js *J, struct jsstr *a, struct jsstr *b)
 
 static int str_eq(const struct jsstr *a, const struct jsstr *b)
 {
-    return a == b || (a->len == b->len && !memcmp(a->s, b->s, (size_t)a->len));
+    if (a == b || (a->len == b->len && !memcmp(a->s, b->s, (size_t)a->len)))
+        return 1;
+    /* A scalar and its separately produced surrogate pair are the same JS string. */
+    if (js_u16len(a) != js_u16len(b))
+        return 0;
+    const char *ap = a->s, *bp = b->s, *ae = ap + a->len, *be = bp + b->len;
+    int ah = 0, bh = 0;
+    for (;;) {
+        int x = next_u16(&ap, ae, &ah), y = next_u16(&bp, be, &bh);
+        if (x != y)
+            return 0;
+        if (x < 0)
+            return 1;
+    }
 }
 
 static int str_is(const struct jsstr *a, const char *c)
@@ -695,7 +775,7 @@ static int obj_get(struct js *J, struct jsobj *o, struct jsstr *key, jsval self,
         }
         if (x->cls == C_STRING && x == o) {
             if (str_is(key, "length")) {
-                *out = js_num(x->str->len);
+                *out = js_num(js_u16len(x->str));
                 return 1;
             }
         }
@@ -738,10 +818,12 @@ jsval js_get_str(struct js *J, jsval obj, struct jsstr *key)
                               obj.t == JS_NULL ? "null" : "undefined", key->s);
     if (obj.t == JS_STR) {
         if (str_is(key, "length"))
-            return js_num(obj.u.s->len);
+            return js_num(js_u16len(obj.u.s));
         uint32_t i;
         if (js_index(strv(key), &i))
-            return i < (uint32_t)obj.u.s->len ? js_strn(J, obj.u.s->s + i, 1) : js_undefined;
+            return i < (uint32_t)js_u16len(obj.u.s)
+                       ? (jsval){JS_STR, {.s = js_u16slice(J, obj.u.s, (int)i, (int)i + 1)}}
+                       : js_undefined;
     }
     struct jsobj *proto = proto_of_primitive(J, obj);
     if (proto && obj_get(J, proto, key, obj, &out))
@@ -758,7 +840,9 @@ jsval js_getv(struct js *J, jsval obj, jsval key)
         return i < (uint32_t)a->len ? a->items[i] : js_undefined;
     }
     if (obj.t == JS_STR && key.t == JS_NUM && js_index(key, &i))
-        return i < (uint32_t)obj.u.s->len ? js_strn(J, obj.u.s->s + i, 1) : js_undefined;
+        return i < (uint32_t)js_u16len(obj.u.s)
+                   ? (jsval){JS_STR, {.s = js_u16slice(J, obj.u.s, (int)i, (int)i + 1)}}
+                   : js_undefined;
     struct jsstr *k = js_tostr(J, key);
     if (J->throwing)
         return js_undefined;
@@ -855,6 +939,9 @@ int js_has(struct js *J, jsval obj, struct jsstr *key)
 {
     if (obj.t != JS_OBJ)
         return 0;
+    int indexed = js_typed_has(obj, key->s);
+    if (indexed >= 0)
+        return indexed;
     uint32_t i;
     for (struct jsobj *x = obj.u.o; x; x = x->proto) {
         if (x->phandler) {
@@ -882,6 +969,9 @@ int js_delete(struct js *J, jsval obj, struct jsstr *key)
     (void)J;
     if (obj.t != JS_OBJ)
         return 1;
+    int indexed = js_typed_has(obj, key->s);
+    if (indexed >= 0)
+        return !indexed;
     struct jsobj *o = obj.u.o;
     uint32_t i;
     if (o->phandler) {
@@ -910,7 +1000,7 @@ int js_keys(struct js *J, jsval obj, int inherited, struct jsstr ***out)
     int n = 0, cap = 16;
     struct jsstr **keys = js_alloc(J, sizeof(*keys) * (size_t)cap);
     if (obj.t == JS_STR) {
-        for (int i = 0; i < obj.u.s->len; i++) {
+        for (int i = 0, len = js_u16len(obj.u.s); i < len; i++) {
             char b[16];
             snprintf(b, sizeof(b), "%d", i);
             if (n == cap) {
@@ -947,7 +1037,8 @@ int js_keys(struct js *J, jsval obj, int inherited, struct jsstr ***out)
         return js_keys(J, tgt, inherited, out);
     }
     for (struct jsobj *x = obj.u.o; x; x = inherited ? x->proto : NULL) {
-        int count = (x->cls == C_ARRAY || x->cls == C_ARGUMENTS) ? x->len : 0;
+        int typedlen = js_typed_length(js_obj(x));
+        int count = (x->cls == C_ARRAY || x->cls == C_ARGUMENTS) ? x->len : typedlen > 0 ? typedlen : 0;
         for (struct prop *p = x->props; p; p = p->next)
             count++;
         if (n + count > cap) {
@@ -957,8 +1048,8 @@ int js_keys(struct js *J, jsval obj, int inherited, struct jsstr ***out)
             memcpy(nk, keys, sizeof(*nk) * (size_t)n);
             keys = nk;
         }
-        if (x->cls == C_ARRAY || x->cls == C_ARGUMENTS)
-            for (int i = 0; i < x->len; i++) {
+        if (x->cls == C_ARRAY || x->cls == C_ARGUMENTS || typedlen >= 0)
+            for (int i = 0, len = typedlen >= 0 ? typedlen : x->len; i < len; i++) {
                 char b[16];
                 snprintf(b, sizeof(b), "%d", i);
                 keys[n++] = js_mkstr(J, b, (int)strlen(b));
@@ -3837,9 +3928,15 @@ static int compare(struct js *J, jsval a, jsval b, int *undef)
     a = js_to_primitive(J, a, 0);
     b = js_to_primitive(J, b, 0);
     if (a.t == JS_STR && b.t == JS_STR) {
-        int la = a.u.s->len, lb = b.u.s->len;
-        int c = memcmp(a.u.s->s, b.u.s->s, (size_t)(la < lb ? la : lb));
-        return c ? c : la - lb;
+        const char *ap = a.u.s->s, *bp = b.u.s->s, *ae = ap + a.u.s->len, *be = bp + b.u.s->len;
+        int ah = 0, bh = 0;
+        for (;;) {
+            int x = next_u16(&ap, ae, &ah), y = next_u16(&bp, be, &bh);
+            if (x != y)
+                return x - y;
+            if (x < 0)
+                return 0;
+        }
     }
     double x = js_to_number(J, a), y = js_to_number(J, b);
     if (isnan(x) || isnan(y)) {

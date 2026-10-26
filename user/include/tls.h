@@ -3,9 +3,9 @@
  *
  * It offers one cipher suite, TLS_AES_128_GCM_SHA256 (which every TLS 1.3
  * server must support), X25519 key exchange and SNI. The connection is
- * encrypted and protected against tampering, but the server's certificate
- * is not checked: anyone able to intercept the connection could pose as
- * the server.
+ * encrypted and authenticated. Mbed TLS checks the certificate chain,
+ * hostname, validity and key usage against /etc/ssl/ca-certificates.crt,
+ * and verifies the TLS 1.3 CertificateVerify signature. Failures are fatal.
  */
 #ifndef _TLS_H
 #define _TLS_H

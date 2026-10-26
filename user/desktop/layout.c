@@ -4082,6 +4082,7 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
     lo->canvas = OPAQUE(0xFFFFFF);
     if (!root || !root->style)
         return;
+    struct shadow_swap *composed = shadow_compose(a, root);
     struct lctx c = { .a = a, .lo = lo, .vw = vw, .vh = vh, .gen = ++layout_gen };
     lo->vw = vw;
     lo->vh = vh;
@@ -4118,6 +4119,7 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
         if (d->h > 0 && d->y + d->h > lo->height && d->y < BIG)
             lo->height = d->y + d->h;
     }
+    shadow_restore(composed);
 }
 
 const struct hotspot *layout_hit(const struct layout *lo, const struct hotspot *h, int n, int x, int y,

@@ -248,6 +248,19 @@ static void define_property(struct js *J, jsval obj, struct jsstr *key, jsval de
     jsval get = js_get(J, desc, "get"), set = js_get(J, desc, "set");
     jsval enumerable = js_get(J, desc, "enumerable");
     struct jsobj *o = obj.u.o;
+    int indexed = js_typed_has(obj, key->s);
+    if (indexed >= 0) {
+        if (!indexed || js_is_callable(get) || js_is_callable(set) ||
+            (js_has(J, desc, S(J, "writable")) && !js_truthy(js_get(J, desc, "writable"))) ||
+            (js_has(J, desc, S(J, "enumerable")) && !js_truthy(enumerable)) ||
+            (js_has(J, desc, S(J, "configurable")) && !js_truthy(js_get(J, desc, "configurable")))) {
+            js_throw_error(J, "TypeError: invalid typed array descriptor");
+            return;
+        }
+        if (js_has(J, desc, S(J, "value")))
+            js_setv(J, obj, strv(key), js_get(J, desc, "value"));
+        return;
+    }
     if (js_is_callable(get) || js_is_callable(set)) {
         struct prop *p = js_own(o, key);
         if (!p) {
@@ -322,6 +335,8 @@ static jsval object_true(struct js *J, jsval self, jsval *args, int argc)
 /* A property's descriptor: { value, writable, enumerable, configurable } or { get, set, ... }. */
 static jsval descriptor_of(struct js *J, jsval obj, struct jsstr *key)
 {
+    if (js_typed_has(obj, key->s) == 0)
+        return js_undefined;
     if (obj.t != JS_OBJ)
         return js_undefined;
     struct jsobj *o = obj.u.o;
@@ -412,11 +427,14 @@ static jsval proto_has_own(struct js *J, jsval self, jsval *args, int argc)
     struct jsstr *key = js_tostr(J, ARG(0));
     if (self.t == JS_STR) {
         uint32_t i;
-        return js_bool(js_index(strv(key), &i) && i < (uint32_t)self.u.s->len);
+        return js_bool(js_index(strv(key), &i) && i < (uint32_t)js_u16len(self.u.s));
     }
     if (self.t != JS_OBJ)
         return js_bool(0);
     struct jsobj *o = self.u.o;
+    int indexed = js_typed_has(self, key->s);
+    if (indexed >= 0)
+        return js_bool(indexed);
     uint32_t i;
     if (o->phandler)
         return js_bool(js_has(J, self, key));
@@ -1052,25 +1070,40 @@ static jsval string_from_char_code(struct js *J, jsval self, jsval *args, int ar
 static jsval string_char_at(struct js *J, jsval self, jsval *args, int argc)
 {
     struct jsstr *s = this_string(J, self);
-    int i = int_arg(J, args, argc, 0, 0, -1, s->len);
-    return i >= 0 && i < s->len ? js_strn(J, s->s + i, 1) : js_str(J, "");
+    int len = js_u16len(s);
+    int i = int_arg(J, args, argc, 0, 0, -1, len);
+    return strv(js_u16slice(J, s, i < 0 ? len : i, i < 0 ? len : i + 1));
 }
-
 static jsval string_char_code_at(struct js *J, jsval self, jsval *args, int argc)
 {
     struct jsstr *s = this_string(J, self);
-    int i = int_arg(J, args, argc, 0, 0, -1, s->len);
-    if (i < 0 || i >= s->len)
-        return js_num(NAN);
-    unsigned char c = (unsigned char)s->s[i];
-    if (c >= 0x80) {                    /* the code point of a multi-byte character */
-        const char *p = s->s + i;
-        int cp = utf8_next(&p, s->s + s->len);
-        return js_num(cp > 0xFFFF ? 0xD800 + ((cp - 0x10000) >> 10) : cp);
-    }
-    return js_num(c);
+    int i = int_arg(J, args, argc, 0, 0, -1, js_u16len(s));
+    int cp = js_u16unit(s, i);
+    return js_num(cp < 0 ? NAN : cp);
 }
-
+static jsval string_code_point_at(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct jsstr *s = this_string(J, self);
+    int i = int_arg(J, args, argc, 0, 0, -1, js_u16len(s));
+    int hi = js_u16unit(s, i);
+    if (hi < 0)
+        return js_undefined;
+    int lo = js_u16unit(s, i + 1);
+    return js_num(hi >= 0xD800 && hi <= 0xDBFF && lo >= 0xDC00 && lo <= 0xDFFF
+                      ? 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                      : hi);
+}
+static int u16match(const struct jsstr *s, const struct jsstr *sub, int at)
+{
+    int n = js_u16len(sub);
+    if (at < 0 || at + n > js_u16len(s))
+        return 0;
+    for (int i = 0; i < n; i++)
+        if (js_u16unit(s, at + i) != js_u16unit(sub, i))
+            return 0;
+    return 1;
+}
+/* Byte search for the byte-oriented regexp/replacement paths. */
 static int str_find(const struct jsstr *s, const struct jsstr *sub, int from)
 {
     if (from < 0)
@@ -1080,68 +1113,59 @@ static int str_find(const struct jsstr *s, const struct jsstr *sub, int from)
             return i;
     return -1;
 }
-
 static jsval string_index_of(struct js *J, jsval self, jsval *args, int argc)
 {
     struct jsstr *s = this_string(J, self), *sub = js_tostr(J, ARG(0));
-    return js_num(str_find(s, sub, int_arg(J, args, argc, 1, 0, 0, s->len)));
-}
-
-static jsval string_last_index_of(struct js *J, jsval self, jsval *args, int argc)
-{
-    struct jsstr *s = this_string(J, self), *sub = js_tostr(J, ARG(0));
-    int from = int_arg(J, args, argc, 1, s->len, 0, s->len);
-    for (int i = from < s->len - sub->len ? from : s->len - sub->len; i >= 0; i--)
-        if (!memcmp(s->s + i, sub->s, (size_t)sub->len))
+    int len = js_u16len(s);
+    for (int i = int_arg(J, args, argc, 1, 0, 0, len); i <= len; i++)
+        if (u16match(s, sub, i))
             return js_num(i);
     return js_num(-1);
 }
-
-static jsval string_includes(struct js *J, jsval self, jsval *args, int argc)
+static jsval string_last_index_of(struct js *J, jsval self, jsval *args, int argc)
 {
     struct jsstr *s = this_string(J, self), *sub = js_tostr(J, ARG(0));
-    return js_bool(str_find(s, sub, int_arg(J, args, argc, 1, 0, 0, s->len)) >= 0);
+    int len = js_u16len(s);
+    for (int i = int_arg(J, args, argc, 1, len, 0, len); i >= 0; i--)
+        if (u16match(s, sub, i))
+            return js_num(i);
+    return js_num(-1);
 }
-
+static jsval string_includes(struct js *J, jsval self, jsval *args, int argc)
+{
+    jsval r = string_index_of(J, self, args, argc);
+    return js_bool(r.u.n >= 0);
+}
 static jsval string_starts_with(struct js *J, jsval self, jsval *args, int argc)
 {
     struct jsstr *s = this_string(J, self), *sub = js_tostr(J, ARG(0));
-    int at = int_arg(J, args, argc, 1, 0, 0, s->len);
-    return js_bool(at + sub->len <= s->len && !memcmp(s->s + at, sub->s, (size_t)sub->len));
+    return js_bool(u16match(s, sub, int_arg(J, args, argc, 1, 0, 0, js_u16len(s))));
 }
-
 static jsval string_ends_with(struct js *J, jsval self, jsval *args, int argc)
 {
     struct jsstr *s = this_string(J, self), *sub = js_tostr(J, ARG(0));
-    int end = int_arg(J, args, argc, 1, s->len, 0, s->len);
-    return js_bool(end >= sub->len && !memcmp(s->s + end - sub->len, sub->s, (size_t)sub->len));
+    int len = js_u16len(s);
+    return js_bool(u16match(s, sub, int_arg(J, args, argc, 1, len, 0, len) - js_u16len(sub)));
 }
-
 static jsval string_slice(struct js *J, jsval self, jsval *args, int argc)
 {
     struct jsstr *s = this_string(J, self);
-    int from = rel_index(J, args, argc, 0, 0, s->len), to = rel_index(J, args, argc, 1, s->len, s->len);
-    return to > from ? js_strn(J, s->s + from, to - from) : js_str(J, "");
+    int len = js_u16len(s);
+    return strv(
+        js_u16slice(J, s, rel_index(J, args, argc, 0, 0, len), rel_index(J, args, argc, 1, len, len)));
 }
-
 static jsval string_substring(struct js *J, jsval self, jsval *args, int argc)
 {
     struct jsstr *s = this_string(J, self);
-    int a = int_arg(J, args, argc, 0, 0, 0, s->len), b = int_arg(J, args, argc, 1, s->len, 0, s->len);
-    if (a > b) {
-        int t = a;
-        a = b;
-        b = t;
-    }
-    return js_strn(J, s->s + a, b - a);
+    int len = js_u16len(s);
+    int a = int_arg(J, args, argc, 0, 0, 0, len), b = int_arg(J, args, argc, 1, len, 0, len);
+    return strv(js_u16slice(J, s, a < b ? a : b, a < b ? b : a));
 }
-
 static jsval string_substr(struct js *J, jsval self, jsval *args, int argc)
 {
     struct jsstr *s = this_string(J, self);
-    int from = rel_index(J, args, argc, 0, 0, s->len);
-    int len = int_arg(J, args, argc, 1, s->len - from, 0, s->len - from);
-    return js_strn(J, s->s + from, len);
+    int len = js_u16len(s), a = rel_index(J, args, argc, 0, 0, len);
+    return strv(js_u16slice(J, s, a, a + int_arg(J, args, argc, 1, len - a, 0, len - a)));
 }
 
 static jsval change_case(struct js *J, jsval self, int upper)
@@ -1195,16 +1219,23 @@ static jsval string_trim_end(struct js *J, jsval s, jsval *a, int n) { (void)a; 
 static jsval string_pad(struct js *J, jsval self, jsval *args, int argc, int start)
 {
     struct jsstr *s = this_string(J, self);
-    int target = int_arg(J, args, argc, 0, 0, 0, 1 << 20);
+    int len = js_u16len(s);
+    int target = int_arg(J, args, argc, 0, 0, 0, 8 << 20);
     struct jsstr *fill = argc > 1 && args[1].t != JS_UNDEF ? js_tostr(J, args[1]) : S(J, " ");
-    if (target <= s->len || !fill->len)
+    int flen = js_u16len(fill);
+    if (target <= len || !flen)
         return strv(s);
-    int padlen = target - s->len;
-    char *buf = js_alloc(J, (size_t)target + 1);
-    for (int i = 0; i < padlen; i++)
-        buf[(start ? 0 : s->len) + i] = fill->s[i % fill->len];
-    memcpy(buf + (start ? padlen : 0), s->s, (size_t)s->len);
-    return js_strn(J, buf, target);
+    int padlen = target - len;
+    if ((size_t)((padlen + flen - 1) / flen) * fill->len > (8u << 20))
+        return js_throw_error(J, "RangeError: invalid string length");
+    char *buf = js_alloc_atomic(J, (size_t)((padlen + flen - 1) / flen) * fill->len + 1);
+    int n = 0;
+    for (int units = 0; units < padlen; units += flen) {
+        memcpy(buf + n, fill->s, (size_t)fill->len);
+        n += fill->len;
+    }
+    struct jsstr *padding = js_u16slice(J, js_mkstr(J, buf, n), 0, padlen);
+    return strv(start ? js_concat(J, padding, s) : js_concat(J, s, padding));
 }
 
 static jsval string_pad_start(struct js *J, jsval s, jsval *a, int n) { return string_pad(J, s, a, n, 1); }
@@ -1296,12 +1327,8 @@ static jsval string_split(struct js *J, jsval self, jsval *args, int argc)
     }
     struct jsstr *sp = js_tostr(J, sep);
     if (!sp->len) {
-        const char *p = s->s, *end = p + s->len;
-        while (p < end && r->len < limit) {
-            const char *st = p;
-            utf8_next(&p, end);
-            js_array_push(J, r, js_strn(J, st, (int)(p - st)));
-        }
+        for (int i = 0, len = js_u16len(s); i < len && r->len < limit; i++)
+            js_array_push(J, r, strv(js_u16slice(J, s, i, i + 1)));
         return js_obj(r);
     }
     int from = 0;
@@ -1605,10 +1632,11 @@ static jsval string_replace_all(struct js *J, jsval s, jsval *a, int n) { return
 static jsval string_at(struct js *J, jsval self, jsval *args, int argc)
 {
     struct jsstr *s = this_string(J, self);
-    int i = int_arg(J, args, argc, 0, 0, -s->len - 1, s->len);
+    int len = js_u16len(s);
+    int i = int_arg(J, args, argc, 0, 0, -len - 1, len);
     if (i < 0)
-        i += s->len;
-    return i >= 0 && i < s->len ? js_strn(J, s->s + i, 1) : js_undefined;
+        i += len;
+    return i >= 0 && i < len ? strv(js_u16slice(J, s, i, i + 1)) : js_undefined;
 }
 
 /* ---- Number and Boolean ---- */
@@ -3093,126 +3121,6 @@ static jsval string_iterator(struct js *J, jsval self, jsval *args, int argc)
 
 static void put_value(struct js *J, struct jsobj *o, const char *name, jsval v);
 
-/* ---- typed arrays: plain arrays whose elements are converted when they are made ---- */
-
-
-static jsval array_buffer_ctor(struct js *J, jsval self, jsval *args, int argc)
-{
-    (void)self;
-    struct jsobj *b = js_mkobj(J, C_OBJECT, J->buffer_proto);
-    double n = num_arg(J, args, argc, 0);
-    js_put(J, b, S(J, "byteLength"), js_num(isnan(n) || n < 0 ? 0 : trunc(n)), 0);
-    return js_obj(b);
-}
-
-/* Convert to the element type: bits 8/16/32 (negative: signed), 0 float, -1 clamped bytes. */
-static double typed_value(double v, int kind)
-{
-    if (kind == 0)
-        return v;
-    if (isnan(v) || isinf(v))
-        return kind == -1 && v > 0 ? 255 : 0;
-    if (kind == -1)
-        return v < 0 ? 0 : v > 255 ? 255 : floor(v + 0.5);
-    int bits = kind < 0 ? -kind : kind;
-    double m = bits == 32 ? 4294967296.0 : (double)(1u << bits);
-    v = fmod(trunc(v), m);
-    if (v < 0)
-        v += m;
-    if (kind < 0 && v >= m / 2)
-        v -= m;
-    return v;
-}
-
-static jsval typed_make(struct js *J, jsval *args, int argc, int kind, struct jsobj *proto, int bytes)
-{
-    struct jsobj *a = js_mkobj(J, C_ARRAY, proto);
-    jsval src = ARG(0);
-    if (src.t == JS_OBJ && src.u.o->proto == J->buffer_proto) {
-        double len = js_to_number(J, js_get(J, src, "byteLength")) / bytes;
-        if (argc > 2)
-            len = js_to_number(J, args[2]);
-        js_array_set_len(J, a, (int)len);
-        for (int i = 0; i < a->len; i++)
-            a->items[i] = js_num(0);
-    } else if (src.t == JS_OBJ) {
-        jsval len = js_get(J, src, "length");
-        int n = len.t == JS_NUM ? (int)len.u.n : 0;
-        for (int i = 0; i < n; i++)
-            js_array_push(J, a, js_num(typed_value(js_to_number(J, js_getv(J, src, js_num(i))), kind)));
-    } else {
-        double n = js_to_number(J, src);
-        if (isnan(n) || n < 0 || n > (1 << 24))
-            n = 0;
-        js_array_set_len(J, a, (int)n);
-        for (int i = 0; i < a->len; i++)
-            a->items[i] = js_num(0);
-    }
-    struct jsobj *buf = js_mkobj(J, C_OBJECT, J->buffer_proto);
-    js_put(J, buf, S(J, "byteLength"), js_num(a->len * bytes), 0);
-    js_put(J, a, S(J, "buffer"), js_obj(buf), 1);
-    js_put(J, a, S(J, "byteLength"), js_num(a->len * bytes), 1);
-    js_put(J, a, S(J, "byteOffset"), js_num(0), 1);
-    return js_obj(a);
-}
-
-static jsval typed_set(struct js *J, jsval self, jsval *args, int argc)
-{
-    if (!js_is_array(self))
-        return js_undefined;
-    jsval src = ARG(0);
-    int off = int_arg(J, args, argc, 1, 0, 0, self.u.o->len);
-    jsval len = js_get(J, src, "length");
-    for (int i = 0; len.t == JS_NUM && i < (int)len.u.n && off + i < self.u.o->len; i++)
-        self.u.o->items[off + i] = js_num(js_to_number(J, js_getv(J, src, js_num(i))));
-    return js_undefined;
-}
-
-static struct typed_kind {
-    const char *name;
-    int kind, bytes;
-    struct jsobj *proto;
-} typed_kinds[] = {
-    { "Int8Array", -8, 1, NULL }, { "Uint8Array", 8, 1, NULL }, { "Uint8ClampedArray", -1, 1, NULL },
-    { "Int16Array", -16, 2, NULL }, { "Uint16Array", 16, 2, NULL }, { "Int32Array", -32, 4, NULL },
-    { "Uint32Array", 32, 4, NULL }, { "Float32Array", 0, 4, NULL }, { "Float64Array", 0, 8, NULL },
-};
-
-#define TYPED_CTOR(i) \
-    static jsval typed_ctor_##i(struct js *J, jsval self, jsval *args, int argc) \
-    { (void)self; return typed_make(J, args, argc, typed_kinds[i].kind, typed_kinds[i].proto, typed_kinds[i].bytes); }
-
-TYPED_CTOR(0)
-TYPED_CTOR(1)
-TYPED_CTOR(2)
-TYPED_CTOR(3)
-TYPED_CTOR(4)
-TYPED_CTOR(5)
-TYPED_CTOR(6)
-TYPED_CTOR(7)
-TYPED_CTOR(8)
-
-static const js_native typed_ctors[] = {
-    typed_ctor_0, typed_ctor_1, typed_ctor_2, typed_ctor_3, typed_ctor_4, typed_ctor_5,
-    typed_ctor_6, typed_ctor_7, typed_ctor_8,
-};
-
-static void init_typed_arrays(struct js *J)
-{
-    J->buffer_proto = js_mkobj(J, C_OBJECT, J->object_proto);
-    ctor_obj(J, "ArrayBuffer", array_buffer_ctor, 1, J->buffer_proto);
-    for (unsigned i = 0; i < sizeof(typed_kinds) / sizeof(typed_kinds[0]); i++) {
-        struct jsobj *p = js_mkobj(J, C_ARRAY, J->array_proto);
-        typed_kinds[i].proto = p;
-        fn_obj(J, p, "set", typed_set, 2);
-        fn_obj(J, p, "subarray", array_slice, 2);
-        put_value(J, p, "BYTES_PER_ELEMENT", js_num(typed_kinds[i].bytes));
-        struct jsobj *c = ctor_obj(J, typed_kinds[i].name, typed_ctors[i], 1, p);
-        put_value(J, c, "BYTES_PER_ELEMENT", js_num(typed_kinds[i].bytes));
-        fn_obj(J, c, "from", array_from, 1);
-    }
-}
-
 /* ---- console ---- */
 
 static jsval console_log(struct js *J, jsval self, jsval *args, int argc)
@@ -3367,22 +3275,45 @@ void js_init_lib(struct js *J)
     struct jsobj *string = ctor_obj(J, "String", string_ctor, 1, sp);
     fn_obj(J, string, "fromCharCode", string_from_char_code, 1);
     fn_obj(J, string, "fromCodePoint", string_from_char_code, 1);
-    static const struct { const char *name; js_native fn; int n; } string_methods[] = {
-        { "charAt", string_char_at, 1 }, { "charCodeAt", string_char_code_at, 1 },
-        { "codePointAt", string_char_code_at, 1 }, { "indexOf", string_index_of, 1 },
-        { "lastIndexOf", string_last_index_of, 1 }, { "includes", string_includes, 1 },
-        { "startsWith", string_starts_with, 1 }, { "endsWith", string_ends_with, 1 },
-        { "slice", string_slice, 2 }, { "substring", string_substring, 2 }, { "substr", string_substr, 2 },
-        { "toUpperCase", string_upper, 0 }, { "toLowerCase", string_lower, 0 },
-        { "toLocaleUpperCase", string_upper, 0 }, { "toLocaleLowerCase", string_lower, 0 },
-        { "trim", string_trim, 0 }, { "trimStart", string_trim_start, 0 }, { "trimEnd", string_trim_end, 0 },
-        { "trimLeft", string_trim_start, 0 }, { "trimRight", string_trim_end, 0 },
-        { "padStart", string_pad_start, 2 }, { "padEnd", string_pad_end, 2 },
-        { "repeat", string_repeat, 1 }, { "concat", string_concat, 1 }, { "split", string_split, 2 },
-        { "replace", string_replace, 2 }, { "replaceAll", string_replace_all, 2 },
-        { "match", string_match, 1 }, { "matchAll", string_match_all, 1 }, { "search", string_search, 1 },
-        { "localeCompare", string_locale_compare, 1 }, { "toString", string_to_string, 0 },
-        { "valueOf", string_to_string, 0 }, { "at", string_at, 1 },
+    static const struct {
+        const char *name;
+        js_native fn;
+        int n;
+    } string_methods[] = {
+        {"charAt", string_char_at, 1},
+        {"charCodeAt", string_char_code_at, 1},
+        {"codePointAt", string_code_point_at, 1},
+        {"indexOf", string_index_of, 1},
+        {"lastIndexOf", string_last_index_of, 1},
+        {"includes", string_includes, 1},
+        {"startsWith", string_starts_with, 1},
+        {"endsWith", string_ends_with, 1},
+        {"slice", string_slice, 2},
+        {"substring", string_substring, 2},
+        {"substr", string_substr, 2},
+        {"toUpperCase", string_upper, 0},
+        {"toLowerCase", string_lower, 0},
+        {"toLocaleUpperCase", string_upper, 0},
+        {"toLocaleLowerCase", string_lower, 0},
+        {"trim", string_trim, 0},
+        {"trimStart", string_trim_start, 0},
+        {"trimEnd", string_trim_end, 0},
+        {"trimLeft", string_trim_start, 0},
+        {"trimRight", string_trim_end, 0},
+        {"padStart", string_pad_start, 2},
+        {"padEnd", string_pad_end, 2},
+        {"repeat", string_repeat, 1},
+        {"concat", string_concat, 1},
+        {"split", string_split, 2},
+        {"replace", string_replace, 2},
+        {"replaceAll", string_replace_all, 2},
+        {"match", string_match, 1},
+        {"matchAll", string_match_all, 1},
+        {"search", string_search, 1},
+        {"localeCompare", string_locale_compare, 1},
+        {"toString", string_to_string, 0},
+        {"valueOf", string_to_string, 0},
+        {"at", string_at, 1},
     };
     for (unsigned i = 0; i < sizeof(string_methods) / sizeof(string_methods[0]); i++)
         fn_obj(J, sp, string_methods[i].name, string_methods[i].fn, string_methods[i].n);
@@ -3552,7 +3483,7 @@ void js_init_lib(struct js *J)
     J->s_done = S(J, "done");
     fn_obj(J, sp, "@@iterator", string_iterator, 0);
 
-    init_typed_arrays(J);
+    js_init_binary(J);
 
     /* console */
     struct jsobj *console = js_new_object(J);

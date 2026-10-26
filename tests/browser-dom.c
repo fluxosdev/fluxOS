@@ -6,7 +6,11 @@
 #include <string.h>
 #include "jsdom.h"
 
-unsigned int uptime_ms(void) { return 0; }
+static unsigned int host_time;
+unsigned int uptime_ms(void)
+{
+    return host_time;
+}
 int wfont_height(const struct wfont *f) { (void)f; return 16; }
 const struct wfont *wfont_get(int family, int bold, int italic, int px)
 { (void)family; (void)bold; (void)italic; (void)px; return NULL; }

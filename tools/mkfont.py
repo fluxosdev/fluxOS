@@ -209,7 +209,9 @@ LIB = "/usr/share/fonts/truetype/liberation/Liberation%s-%s.ttf"
 WEB_FACES = [(0, "Sans"), (1, "Serif"), (2, "Mono")]
 WEB_STYLES = [(0, "Regular"), (1, "Bold"), (2, "Italic"), (3, "BoldItalic")]
 WEB_SIZES = (10, 11, 12, 13, 14, 16, 18, 20, 24, 28, 32, 40)
-WEB_CHARS = sorted(set(range(32, 127)) | set(range(160, 256)) | {
+# Latin Extended A/B, Greek and Cyrillic cover common European scripts.
+WEB_CHARS = sorted(set(range(32, 127)) | set(range(160, 0x250)) |
+                   set(range(0x370, 0x530)) | set(range(0x1E00, 0x1F00)) | {
     0x0152, 0x0153, 0x0160, 0x0161, 0x0178, 0x017D, 0x017E, 0x0192, 0x02C6, 0x02DC,
     0x2013, 0x2014, 0x2018, 0x2019, 0x201A, 0x201C, 0x201D, 0x201E, 0x2020, 0x2021,
     0x2022, 0x2026, 0x2030, 0x2032, 0x2039, 0x203A, 0x20AC, 0x2122, 0x2190, 0x2191,
@@ -286,6 +288,10 @@ def write_webfonts(path):
 
 
 if __name__ == "__main__":
+    import sys
+    if sys.argv[1:] == ["--web-only"]:
+        write_webfonts("rootfs/usr/share/fonts/web.fnt")
+        raise SystemExit(0)
     write_font8x16("lib/font8x16.c")
     write_sans("user/desktop/font_sans.c")
     write_archivo("user/desktop/font_archivo.c")

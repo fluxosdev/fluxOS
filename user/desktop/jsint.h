@@ -18,6 +18,7 @@
 
 struct jsstr {
     int len;                            /* bytes of UTF-8 */
+    int utf16_length;                   /* cached code-unit length, zero until measured */
     char s[];                           /* NUL-terminated as well */
 };
 
@@ -84,6 +85,7 @@ struct js {
     struct gcheap *heap;                /* jsgc.c */
     int gc_inhibit;                     /* no collections while this is above 0 (parsing) */
     void *host;
+    void *network;                      /* jsnet: WebSocket worker state */
     /* A promise was rejected and nothing had asked for the result by the time the microtasks ran. */
     void (*on_unhandled)(struct js *J, jsval promise, jsval reason);
     struct jsobj *global;
@@ -109,6 +111,7 @@ struct js {
     int in_jobs;
     struct jsobj *promise_proto, *generator_proto, *agen_proto;
     struct jsobj *map_proto, *set_proto, *seqiter_proto, *buffer_proto;
+    struct jsobj *typed_protos[9], *dataview_proto;
     struct jsstr *s_value, *s_done;     /* iterator results' keys */
     struct coro *cur_co, *co_live;      /* the running coroutine, all those with a stack */
     int nco;
@@ -142,6 +145,9 @@ void js_gc_before(struct js *J);        /* drop what the engine keeps only for r
 void *js_alloc(struct js *J, size_t n);
 void *js_alloc_atomic(struct js *J, size_t n);      /* for bytes with no pointers: strings */
 struct jsstr *js_mkstr(struct js *J, const char *s, int n);
+int js_u16len(const struct jsstr *s);
+int js_u16unit(const struct jsstr *s, int index);
+struct jsstr *js_u16slice(struct js *J, const struct jsstr *s, int start, int end);
 struct jsstr *js_concat(struct js *J, struct jsstr *a, struct jsstr *b);
 struct jsobj *js_mkobj(struct js *J, int cls, struct jsobj *proto);
 jsval js_getv(struct js *J, jsval obj, jsval key);
@@ -188,6 +194,10 @@ void js_enqueue(struct js *J, void (*run)(struct js *, struct job *), jsval a, j
 void js_run_jobs(struct js *J);
 
 /* jslib.c */
+void js_init_binary(struct js *J);
+int js_typed_length(jsval v);
+int js_typed_has(jsval v, const char *key);
+unsigned char *js_binary_bytes(jsval v, int *len);
 void js_init_lib(struct js *J);
 void js_init_lib2(struct js *J);          /* jslib2.c: Symbol, Promise, Reflect, ... */
 
