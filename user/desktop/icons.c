@@ -299,7 +299,7 @@ static const char *const icon_names[ICON_COUNT] = {
     [ICON_CLOCK] = "clock",
 };
 
-static const int icon_sizes[] = { 16, 32, 48 };
+static const int icon_sizes[] = { 16, 24, 32, 48 };
 #define NSIZES ((int)(sizeof(icon_sizes) / sizeof(icon_sizes[0])))
 
 static struct {

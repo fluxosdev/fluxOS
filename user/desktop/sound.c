@@ -16,10 +16,13 @@
 #include <string.h>
 #include <sys/soundcard.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include "desktop.h"
 
 #define STARTUP_SOUND "/usr/share/sounds/startup.wav"
+#define SHUTDOWN_SOUND "/usr/share/sounds/shutdown.wav"
+#define ERROR_SOUND   "/usr/share/sounds/error.wav"
 #define BELL_GAP_MS   150               /* at most one bell this often */
 
 #define COL_W    86
@@ -120,11 +123,11 @@ void sound_beep(void)
 }
 
 /* Play a sound file in the background with /bin/play. */
-static void play_in_background(const char *path)
+static int play_in_background(const char *path)
 {
     int pid = fork();
     if (pid != 0)
-        return;
+        return pid;
     int null = open("/dev/null", O_RDWR);
     dup2(null, 0);
     dup2(null, 1);
@@ -136,6 +139,25 @@ static void play_in_background(const char *path)
     char *argv[] = { "play", "-q", (char *)path, NULL };
     execve("/bin/play", argv, NULL);
     _exit(127);
+}
+
+void sound_error(void)
+{
+    struct stat st;
+    if (have_dsp && stat(ERROR_SOUND, &st) == 0)
+        play_in_background(ERROR_SOUND);
+}
+
+/* Play the shutdown sound and wait for it, so the machine is not
+ * switched off in the middle of it. */
+void sound_shutdown(void)
+{
+    struct stat st;
+    if (!have_dsp || stat(SHUTDOWN_SOUND, &st) != 0)
+        return;
+    int pid = play_in_background(SHUTDOWN_SOUND);
+    if (pid > 0)
+        waitpid(pid, NULL, 0);
 }
 
 void sound_init(void)

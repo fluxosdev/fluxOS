@@ -10,7 +10,7 @@
  * that half from a ring of samples that write() fills. With a 16-bit DMA
  * channel the card is always fed signed 16-bit samples (8-bit ones are
  * widened as they are written), otherwise unsigned 8-bit ones. A half lasts
- * about 40 ms at any rate, which is the latency. When the ring runs dry
+ * about 60 ms at any rate, which is the latency. When the ring runs dry
  * the halves are filled with silence, and once nothing but silence is left
  * to play the DSP is stopped. Closing /dev/dsp lets what was written play
  * out; one process at a time may have it open.
@@ -47,7 +47,7 @@
 
 #define DMA_SIZE  32768                 /* both halves; aligned, so no page is crossed */
 #define RING_SIZE 65536
-#define HALF_MS   40
+#define HALF_MS   60
 #define MIN_RATE  5000
 #define MAX_RATE  44100
 
@@ -345,8 +345,8 @@ static int dsp_dev_write(struct vnode *vn, const void *buf, uint32_t off, uint32
         uint32_t frames = MIN(room, (n - used) / uf);
         for (uint32_t i = 0; i < frames; i++, used += uf)
             put_frame(in + used);
-        if (!sb.running && ring_used() >= 2 * sb.half)
-            start();
+        if (!sb.running && ring_used() >= RING_SIZE / 2)
+            start();      /* a deep head start rides out a busy desktop */
     }
     while (used < n)                    /* keep a part frame for next time */
         sb.carry[sb.ncarry++] = in[used++];

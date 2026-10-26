@@ -285,6 +285,8 @@ void wallpaper_render(struct surface *dst, struct rect a, const struct image *im
 void sound_init(void);                  /* see what cards there are; startup sound */
 void sound_tick(void);                  /* once a second */
 void sound_beep(void);                  /* the terminal bell */
+void sound_error(void);                 /* an error or warning dialog */
+void sound_shutdown(void);              /* plays to the end */
 enum icon_id sound_tray_icon(void);     /* ICON_NONE without a mixer */
 void volume_open(void);                 /* Volume Control */
 void display_tick(void);                /* once a second */

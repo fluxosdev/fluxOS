@@ -212,30 +212,34 @@ QEMU_DISK += -drive file=$(FLOPPY),format=raw,if=floppy,index=0
 endif
 # An NE2000 card on QEMU's user-mode network: DHCP, DNS and NAT to the host's network.
 QEMU_NET  ?= -netdev user,id=net0 -device ne2k_pci,netdev=net0
+# A Sound Blaster 16 (ISA, 0x220, IRQ 5, DMA 1 and 5) played through the host's PipeWire/PulseAudio.
+# Another host backend: make run QEMU_AUDIO="-audiodev alsa,id=snd0".
+QEMU_AUDIO ?= -audiodev pa,id=snd0
+QEMU_SND  ?= $(QEMU_AUDIO) -device sb16,audiodev=snd0
 
 run: $(ISO) $(DISK)
-	$(QEMU) $(QEMU_CPU) -m 1G -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK) $(QEMU_NET)
+	$(QEMU) $(QEMU_CPU) -m 1G -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
 
 run-kernel: $(TEXT_KERNEL) $(INITRD) $(DISK)
-	$(QEMU) $(QEMU_CPU) -kernel $(TEXT_KERNEL) -initrd $(INITRD) -m 256M -serial stdio $(QEMU_DISK) $(QEMU_NET)
+	$(QEMU) $(QEMU_CPU) -kernel $(TEXT_KERNEL) -initrd $(INITRD) -m 256M -serial stdio $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
 
 # Boot fluxdisk.img on its own, after "fluxinstall /dev/hda".
 run-disk: $(DISK)
-	$(QEMU) $(QEMU_CPU) -m 256M -serial stdio -boot c $(QEMU_DISK) $(QEMU_NET)
+	$(QEMU) $(QEMU_CPU) -m 256M -serial stdio -boot c $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
 
 # On q35 "if=ide" drives and the CD sit on the chipset's AHCI controller.
 QEMU_XHCI ?= -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0
 
 run-q35: $(ISO) $(DISK)
 	$(QEMU) $(QEMU_CPU) -M q35 -m 256M -serial stdio -boot d -cdrom $(ISO) \
-		-drive file=$(DISK),format=raw,if=ide,index=0 $(QEMU_NET) $(QEMU_XHCI)
+		-drive file=$(DISK),format=raw,if=ide,index=0 $(QEMU_NET) $(QEMU_SND) $(QEMU_XHCI)
 
 QEMU_USB ?= -usb -device usb-kbd,bus=usb-bus.0 -device usb-mouse,bus=usb-bus.0 \
 	-device usb-ehci,id=ehci -drive file=$(DISK),format=raw,if=none,id=stick \
 	-device usb-storage,bus=ehci.0,drive=stick
 
 run-usb: $(ISO) $(DISK)
-	$(QEMU) $(QEMU_CPU) -m 256M -serial stdio -boot d -cdrom $(ISO) $(QEMU_NET) $(QEMU_USB)
+	$(QEMU) $(QEMU_CPU) -m 256M -serial stdio -boot d -cdrom $(ISO) $(QEMU_NET) $(QEMU_SND) $(QEMU_USB)
 
 clean:
 	rm -rf $(BUILD) $(ISO)

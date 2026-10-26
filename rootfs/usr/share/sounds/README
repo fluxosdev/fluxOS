@@ -1,3 +1,4 @@
 ding.wav and chime.voc are synthesized by tools/mksounds.py.
-startup.wav, played when the desktop starts, is a recording.
+startup.wav, shutdown.wav and error.wav are recordings: the desktop plays them
+at startup, at shut down and restart, and when an error or warning dialog opens.
 Play any of them with play(1).

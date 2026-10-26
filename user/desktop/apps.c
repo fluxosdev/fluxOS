@@ -327,6 +327,8 @@ static struct dialog *message_dialog(const char *title, enum icon_id icon, const
         wm_focus(ask_dlg->win);
         return NULL;
     }
+    if (icon == ICON_STOP || icon == ICON_WARNING)
+        sound_error();
     int w = 62 + gfx_text_width(&font_sans, text) + 24;
     int bw = nbuttons * 75 + (nbuttons - 1) * 6;
     if (w < bw + 40)
@@ -557,6 +559,7 @@ void system_restart(void)
 {
     wm_splash("Please wait while your computer restarts.", RGB(0xFF, 0xFF, 0xFF));
     sync();
+    sound_shutdown();
     reboot(REBOOT_RESTART);
 }
 
@@ -570,6 +573,7 @@ static void shutdown_command(struct dialog *d, int id)
     case OPT_SHUTDOWN:
         wm_splash("Please wait while your computer shuts down.", RGB(0xFF, 0xFF, 0xFF));
         sync();
+        sound_shutdown();
         reboot(REBOOT_POWEROFF);
         /* still here: the machine cannot switch itself off */
         wm_splash("It's now safe to turn off your computer.", RGB(0xFF, 0x80, 0x00));
