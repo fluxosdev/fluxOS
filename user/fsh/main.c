@@ -182,7 +182,7 @@ int main(int argc, char **argv)
             i++;
             break;
         } else if (!strcmp(argv[i], "--version")) {
-            printf("fsh 0.2.0 (fluxOS)\n");
+            printf("fsh 0.2.0.1 (fluxOS)\n");
             return 0;
         } else {
             fsh_error("bad option: %s", argv[i]);

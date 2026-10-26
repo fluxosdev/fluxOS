@@ -1600,7 +1600,7 @@ void wm_focus(struct window *w)
         return;
     focused = w;
     if (old) {
-        wm_damage(caption_rect(old));
+        wm_damage(old->r);            /* the border changes colour too */
         if (old->ops && old->ops->focus)
             old->ops->focus(old, 0);
     }
@@ -1977,9 +1977,32 @@ static void set_menu_sub(int p)
     }
 }
 
+static int tri_side(int ax, int ay, int bx, int by, int px, int py)
+{
+    return (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+}
+
+/* Is (x, y) inside the triangle from (px, py) to the near edge of the open submenu? Moving
+ * diagonally toward the submenu then does not trip over the items in between. */
+static int heading_for_sub(int px, int py, int x, int y)
+{
+    struct rect sm = sub_rect(menu_sub);
+    int ax = sm.x, ay = sm.y, bx = sm.x, by = sm.y + sm.h;
+    if (x < px || px >= sm.x)
+        return 0;
+    int d1 = tri_side(px, py, ax, ay, x, y), d2 = tri_side(ax, ay, bx, by, x, y),
+        d3 = tri_side(bx, by, px, py, x, y);
+    int neg = d1 < 0 || d2 < 0 || d3 < 0, pos = d1 > 0 || d2 > 0 || d3 > 0;
+    return !(neg && pos);
+}
+
 /* The pointer moved over the menu: highlight, and open or close submenus. */
 static void menu_pointer(int x, int y)
 {
+    static int last_x, last_y;
+    int px = last_x, py = last_y;
+    last_x = x;
+    last_y = y;
     int j = sub_hit(x, y);
     if (j >= 0) {
         set_menu_hover(-1);
@@ -1989,9 +2012,14 @@ static void menu_pointer(int x, int y)
     if (menu_sub >= 0 && rect_contains(sub_rect(menu_sub), x, y))
         return;                         /* its border */
     int i = menu_hit(x, y);
+    if (menu_sub >= 0 && i != menu_sub && heading_for_sub(px, py, x, y))
+        return;                         /* on the way to the submenu */
     if (i >= 0) {
         set_menu_hover(i);
         set_menu_sub(menu_items[i].sub ? i : -1);
+    } else if (menu_sub >= 0 && y >= menu_item_rect(menu_sub).y &&
+               y < menu_item_rect(menu_sub).y + menu_item_rect(menu_sub).h) {
+        return;                         /* the gap between the item and its submenu */
     } else if (rect_contains(menu_rect(), x, y)) {
         set_menu_hover(-1);             /* a separator or the banner */
         set_menu_sub(-1);
