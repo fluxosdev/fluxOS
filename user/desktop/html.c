@@ -480,6 +480,10 @@ static void start_tag(struct parser *p, const char *name, int nlen)
         if (current(p)->tag == T_OPTION)
             pop_through(p, p->depth - 1);
         break;
+    case T_RB: case T_RT: case T_RP:    /* ruby annotations end each other */
+        if (current(p)->tag == T_RB || current(p)->tag == T_RT || current(p)->tag == T_RP)
+            pop_through(p, p->depth - 1);
+        break;
     case T_OPTGROUP:
         if (current(p)->tag == T_OPTION)
             pop_through(p, p->depth - 1);

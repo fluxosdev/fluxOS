@@ -22,7 +22,7 @@ ICONS = {
     "drive-harddisk": None, "media-cdrom": "media-optical",
     "image-x-generic": None, "go-up": None, "edit-delete": None,
     "system-installer": "package-x-generic", "accessories-text-editor": None,
-    "internet-web-browser": None, "accessories-calculator": None,
+    "internet-web-browser": "applications-internet", "accessories-calculator": None,
     "text-html": None, "go-previous": None, "go-next": None, "go-home": None,
     "view-refresh": None, "process-stop": None, "video-display": None,
     "applications-system": None, "audio-volume-high": None,

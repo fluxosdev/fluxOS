@@ -397,9 +397,66 @@ static const char *const arrow[CURSOR_H] = {
     "       XX   ",
 };
 
-#define RS 15                   /* the resize pointers are RS x RS, hot spot in the middle */
+#define RS 15                   /* the shaped pointers are RS x RS, hot spot in the middle */
 
-/* A double-headed arrow as a white shape with a black outline. */
+/* Pointers drawn pixel by pixel: X black, W white, the hot spot at (hx, hy). */
+struct art {
+    int w, h, hx, hy;
+    const char *const *rows;
+};
+
+static const char *const hand_rows[16] = {
+    "     XX         ",
+    "    XWWX        ",
+    "    XWWX        ",
+    "    XWWX        ",
+    "    XWWXXX      ",
+    "    XWWXWWXXX   ",
+    " XXXXWWXWWXWWX  ",
+    "XWWXXWWWWWWWWX  ",
+    "XWWWXWWWWWWWWX  ",
+    " XWWWWWWWWWWWX  ",
+    "  XWWWWWWWWWWX  ",
+    "  XWWWWWWWWWWX  ",
+    "   XWWWWWWWWX   ",
+    "   XWWWWWWWWX   ",
+    "    XWWWWWWX    ",
+    "    XXXXXXXX    ",
+};
+
+static const char *const ibeam_rows[16] = {
+    "XXXXXXX",
+    "XWWXWWX",
+    "XXXWXXX",
+    "  XWX  ", "  XWX  ", "  XWX  ", "  XWX  ", "  XWX  ",
+    "  XWX  ", "  XWX  ", "  XWX  ", "  XWX  ",
+    "XXXWXXX",
+    "XWWXWWX",
+    "XXXXXXX",
+    "       ",
+};
+
+static const char *const busy_rows[11] = {
+    "XXXXXXXXXXX",
+    "XWWWWWWWWWX",
+    " XWWWWWWWX ",
+    "  XWWWWWX  ",
+    "   XWWWX   ",
+    "    XWX    ",
+    "   XWWWX   ",
+    "  XWWWWWX  ",
+    " XWWWWWWWX ",
+    "XWWWWWWWWWX",
+    "XXXXXXXXXXX",
+};
+
+static const struct art arts[] = {
+    [CUR_HAND] = { 16, 16, 5, 0, hand_rows },
+    [CUR_IBEAM] = { 7, 15, 3, 7, ibeam_rows },
+    [CUR_BUSY] = { 11, 11, 5, 5, busy_rows },
+};
+
+/* A pointer made of a white shape that gets a black outline when drawn. */
 static void resize_mask(enum cursor_kind kind, uint8_t m[RS][RS])
 {
     memset(m, 0, RS * RS);
@@ -407,6 +464,7 @@ static void resize_mask(enum cursor_kind kind, uint8_t m[RS][RS])
     switch (kind) {
     case CUR_EW:
     case CUR_NS:
+    case CUR_MOVE4:
         for (int k = 0; k < 4; k++) {           /* arrow heads, tips at the ends */
             for (int d = -k; d <= k; d++) {
                 m[c + d][1 + k] = m[c + d][RS - 2 - k] = 1;
@@ -414,15 +472,40 @@ static void resize_mask(enum cursor_kind kind, uint8_t m[RS][RS])
         }
         for (int x = 4; x <= RS - 5; x++)
             m[c][x] = 1;
-        if (kind == CUR_NS) {                   /* transpose */
+        if (kind == CUR_NS || kind == CUR_MOVE4) {      /* transpose (move: both) */
             for (int i = 0; i < RS; i++)
                 for (int j = i + 1; j < RS; j++) {
                     uint8_t t = m[i][j];
-                    m[i][j] = m[j][i];
-                    m[j][i] = t;
+                    m[i][j] = kind == CUR_MOVE4 ? (uint8_t)(m[i][j] | m[j][i]) : m[j][i];
+                    m[j][i] = kind == CUR_MOVE4 ? m[i][j] : t;
                 }
         }
         break;
+    case CUR_CROSS:
+        for (int i = 1; i < RS - 1; i++)
+            if (i < c - 1 || i > c + 1)
+                m[c][i] = m[i][c] = 1;
+        break;
+    case CUR_NO:                                /* a ring with a slash through it */
+        for (int j = 0; j < RS; j++)
+            for (int i = 0; i < RS; i++) {
+                int dx = 2 * (i - c), dy = 2 * (j - c), q = dx * dx + dy * dy;
+                if (q <= 13 * 13 && q >= 9 * 9)
+                    m[j][i] = 1;
+            }
+        for (int i = 3; i <= RS - 4; i++)
+            m[i][RS - 1 - i] = m[i][RS - 2 - i] = 1;
+        break;
+    case CUR_HELP: {                            /* a question mark */
+        static const char *const q[9] = {
+            ".###.", "#...#", "....#", "...#.", "..#..", "..#..", ".....", "..#..", ".....",
+        };
+        for (int j = 0; j < 9; j++)             /* two pixels wide, to read at 15 pixels */
+            for (int i = 0; i < 5; i++)
+                if (q[j][i] == '#')
+                    m[3 + j][5 + i] = m[3 + j][6 + i] = 1;
+        break;
+    }
     default:
         /* NW-SE: heads are corner triangles, joined by a diagonal. */
         for (int y = 0; y < 5; y++)
@@ -445,11 +528,27 @@ struct rect cursor_bounds(int x, int y, enum cursor_kind kind)
 {
     if (kind == CUR_ARROW)
         return mkrect(x, y, CURSOR_W, CURSOR_H);
+    if (kind == CUR_HIDDEN)
+        return mkrect(x, y, 1, 1);
+    if (kind == CUR_HAND || kind == CUR_IBEAM || kind == CUR_BUSY)
+        return mkrect(x - arts[kind].hx, y - arts[kind].hy, arts[kind].w, arts[kind].h);
     return mkrect(x - RS / 2, y - RS / 2, RS, RS);
 }
 
 void draw_cursor(struct surface *s, int x, int y, enum cursor_kind kind)
 {
+    if (kind == CUR_HIDDEN)
+        return;
+    if (kind == CUR_HAND || kind == CUR_IBEAM || kind == CUR_BUSY) {
+        const struct art *a = &arts[kind];
+        for (int j = 0; j < a->h; j++)
+            for (int i = 0; i < a->w; i++) {
+                char c = a->rows[j][i];
+                if (c != ' ')
+                    gfx_pixel(s, x - a->hx + i, y - a->hy + j, c == 'X' ? C_BLACK : C_WHITE);
+            }
+        return;
+    }
     if (kind != CUR_ARROW) {
         uint8_t m[RS][RS];
         resize_mask(kind, m);

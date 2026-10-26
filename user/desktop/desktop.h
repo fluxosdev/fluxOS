@@ -82,6 +82,12 @@ struct window_ops {
     void (*destroy)(struct window *w);  /* free app data */
 };
 
+/* The shapes of the mouse pointer (icons.c). */
+enum cursor_kind {
+    CUR_ARROW, CUR_EW, CUR_NS, CUR_NWSE, CUR_NESW,
+    CUR_HAND, CUR_IBEAM, CUR_BUSY, CUR_CROSS, CUR_MOVE4, CUR_NO, CUR_HELP, CUR_HIDDEN,
+};
+
 struct window {
     struct rect r;              /* outer frame, screen coordinates */
     char title[64];
@@ -96,6 +102,7 @@ struct window {
     int maximized;
     struct rect restore;        /* where the frame was before it was maximized */
     int min_w, min_h;           /* smallest client area when resizing */
+    enum cursor_kind cursor;    /* the pointer over the client area (wm_set_cursor) */
 };
 
 /* ---- screen and compositor (wm.c) ---- */
@@ -119,6 +126,8 @@ void wm_focus(struct window *w);
 struct window *wm_focused(void);
 void wm_set_title(struct window *w, const char *title);
 void wm_set_min_size(struct window *w, int client_w, int client_h);
+/* The pointer to show while it is over the window's client area (a page's cursor property). */
+void wm_set_cursor(struct window *w, enum cursor_kind kind);
 void wm_damage_client(struct window *w, struct rect r);  /* client coordinates */
 int wm_window_count(void);
 struct window *wm_nth(int i);           /* the i-th window from the bottom of the stack, or NULL */
@@ -138,7 +147,6 @@ unsigned int now_ms(void);
 /* ---- icons (icons.c) ---- */
 void draw_icon(struct surface *s, int x, int y, enum icon_id id, int size);   /* 16, 32, 48 */
 void draw_icon_selected(struct surface *s, int x, int y, enum icon_id id, int size);
-enum cursor_kind { CUR_ARROW, CUR_EW, CUR_NS, CUR_NWSE, CUR_NESW };
 /* Draw the pointer with its hot spot at (x, y); cursor_bounds is what it covers. */
 void draw_cursor(struct surface *s, int x, int y, enum cursor_kind kind);
 struct rect cursor_bounds(int x, int y, enum cursor_kind kind);

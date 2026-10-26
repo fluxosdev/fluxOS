@@ -91,8 +91,80 @@ static void nth_boundaries(void)
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++)
         CHECK(web_parse_nth(invalid[i], invalid[i] + strlen(invalid[i]), &a, &b, &filter) < 0);
 }
+static void text_and_interaction_properties(void)
+{
+    struct arena arena = {0};
+    const char *html = "<!doctype html><div id='t'><span id='in'>x</span></div>"
+        "<p id='o'>o</p><ul><li id='li'>i</li></ul><table id='tb'><caption id='cap'>c</caption></table>";
+    struct node *root = html_parse(&arena, html, (int)strlen(html));
+    const char *css =
+        "#t { letter-spacing: 2px; word-spacing: -1px; word-break: break-all; cursor: pointer;"
+        " pointer-events: none; user-select: none; text-shadow: 1px 2px 3px #112233;"
+        " font-variant: small-caps; text-decoration: underline wavy #445566 }"
+        "#o { outline: 3px dashed #778899; outline-offset: 2px; text-overflow: ellipsis; overflow-wrap: anywhere }"
+        "#li { list-style: square inside } #li::marker { color: #aabbcc }"
+        "#tb { table-layout: fixed; empty-cells: hide } #cap { caption-side: bottom }"
+        "#in::selection { background-color: #010203 } #in::placeholder { color: #040506 }";
+    struct sheet *sheet = css_parse(&arena, css, (int)strlen(css), 800);
+    css_cascade(&arena, root, &sheet, 1, 800, 600, NULL, NULL);
+    const struct style *t = id(root, "t")->style, *in = id(root, "in")->style, *o = id(root, "o")->style;
+    CHECK(t->letter_spacing == 2 && t->word_spacing == -1 && t->word_break == WB_BREAK_ALL);
+    CHECK(t->cursor == CSSCUR_POINTER && t->pointer_none && t->select_none);
+    CHECK(t->ts_x == 1 && t->ts_y == 2 && t->ts_blur == 3 && t->ts_color == OPAQUE(0x112233));
+    CHECK(t->small_caps && t->deco_style == DS_WAVY && t->deco_color == OPAQUE(0x445566));
+    CHECK(in->letter_spacing == 2 && in->cursor == CSSCUR_POINTER && in->pointer_none);    /* inherited */
+    CHECK(o->outline_w == 3 && o->outline_style == BS_DASHED && o->outline_offset == 2 &&
+          o->outline_color == OPAQUE(0x778899));
+    CHECK(o->text_ellipsis && o->word_break == WB_BREAK_WORD && !o->letter_spacing);
+    const struct style *li = id(root, "li")->style;
+    CHECK(li->list_inside && li->list_style == LS_SQUARE);
+    CHECK(id(root, "li")->pseudo_st[PE_MARKER - 1] &&
+          id(root, "li")->pseudo_st[PE_MARKER - 1]->color == OPAQUE(0xaabbcc));
+    CHECK(id(root, "tb")->style->table_fixed && id(root, "tb")->style->empty_hide);
+    CHECK(id(root, "cap")->style->caption_bottom);
+    CHECK(id(root, "in")->pseudo_st[PE_SELECTION - 1]->bg == OPAQUE(0x010203));
+    CHECK(id(root, "in")->pseudo_st[PE_PLACEHOLDER - 1]->color == OPAQUE(0x040506));
+    CHECK(!id(root, "o")->pseudo_st[PE_SELECTION - 1]);
+    arena_free(&arena);
+}
+static void state_pseudo_classes(void)
+{
+    struct arena arena = {0};
+    const char *html = "<!doctype html><html lang='fr-CA'><body>"
+        "<form id='bad'><input required value=''></form>"
+        "<form id='good'><input required value='x'><input type='email' value='a@b.cc'></form>"
+        "<form id='mail'><input type='email' value='nope'></form>"
+        "<form id='num'><input type='number' min='5' max='9' value='12'></form>"
+        "<input id='ro' readonly><input id='rw'><input id='dis' disabled>"
+        "<input id='ck' type='checkbox' checked><button id='sub'>Go</button>"
+        "<progress id='pg'></progress><p id='fr'>x</p><p id='en' lang='en'>y</p><a id='t' name='t'>t</a>"
+        "</form></body></html>";
+    struct node *root = html_parse(&arena, html, (int)strlen(html));
+    const char *css =
+        "#bad:invalid { z-index: 1 } #good:valid { z-index: 2 } #mail:invalid { z-index: 3 }"
+        "#num:invalid { z-index: 4 } #good:invalid { z-index: 99 }"
+        "#ro:read-only { z-index: 5 } #rw:read-write { z-index: 6 } #dis:read-only { z-index: 7 }"
+        "#ck:default { z-index: 8 } #sub:default { z-index: 9 } #pg:indeterminate { z-index: 10 }"
+        ":lang(fr) #fr { z-index: 11 } #en:lang(fr) { z-index: 99 } #en:lang(en) { z-index: 12 }"
+        "#t:target { z-index: 13 } #num input:out-of-range { z-index: 14 }"
+        "#num input:in-range { z-index: 99 }";
+    struct sheet *sheet = css_parse(&arena, css, (int)strlen(css), 800);
+    css_target_id = "t";
+    css_cascade(&arena, root, &sheet, 1, 800, 600, NULL, NULL);
+    css_target_id = NULL;
+    struct { const char *id; int z; } want[] = {
+        { "bad", 1 }, { "good", 2 }, { "mail", 3 }, { "num", 4 }, { "ro", 5 }, { "rw", 6 }, { "dis", 7 },
+        { "ck", 8 }, { "pg", 10 }, { "fr", 11 }, { "en", 12 }, { "t", 13 },
+    };
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++)
+        CHECK(id(root, want[i].id)->style->z_set && id(root, want[i].id)->style->z_index == want[i].z);
+    struct node *num_input = id(root, "num")->first;
+    CHECK(num_input && num_input->style->z_set && num_input->style->z_index == 14);
+    arena_free(&arena);
+}
 int main(void)
 {
     entities(); cascade(); selector_specificity(); nth_boundaries();
-    puts("browser HTML/CSS: named references, filtered siblings and cascade specificity passed");
+    text_and_interaction_properties(); state_pseudo_classes();
+    puts("browser HTML/CSS: named references, filtered siblings, cascade specificity and new properties passed");
 }

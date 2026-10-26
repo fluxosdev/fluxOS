@@ -244,12 +244,13 @@ clean:
 
 # Run the browser's actual HTML/DOM/JS code on the host, without booting QEMU.
 HOSTCC ?= cc
-BROWSER_TEST_SRCS := tests/browser-dom.c $(addprefix user/desktop/,js.c jslib.c jslib2.c jsre.c jsgc.c jsdom.c html.c webutil.c css.c csscolor.c)
+BROWSER_TEST_SRCS := tests/browser-dom.c $(addprefix user/desktop/,js.c jslib.c jslib2.c jsre.c jsgc.c jsdom.c html.c webutil.c webstore.c css.c csscolor.c)
 .PHONY: test-browser
-test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-style
+test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout
 	$< rootfs/usr/share/www/classlist-tests.js 20
 	$< rootfs/usr/share/www/dom-feature-tests.js 25
 	$(BUILD)/tests/browser-style
+	$(BUILD)/tests/browser-layout
 
 $(BUILD)/tests/browser-dom: $(BROWSER_TEST_SRCS) $(wildcard user/desktop/*.h) user/include/flux.h include/flux/abi.h
 	@mkdir -p $(dir $@)
@@ -286,3 +287,9 @@ $(BUILD)/tests/browser-style: tests/browser-style.c user/desktop/html.c user/des
 	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter \
 		-Iuser/desktop tests/browser-style.c user/desktop/html.c user/desktop/css.c user/desktop/csscolor.c \
 		user/desktop/webutil.c -lm -o $@
+
+$(BUILD)/tests/browser-layout: tests/browser-layout.c $(addprefix user/desktop/,layout.c html.c css.c csscolor.c webutil.c) $(wildcard user/desktop/*.h)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -msse -Wall -Wextra -Wno-unused-parameter -Iuser/desktop -Iinclude \
+		tests/browser-layout.c user/desktop/layout.c user/desktop/html.c user/desktop/css.c \
+		user/desktop/csscolor.c user/desktop/webutil.c -lm -o $@

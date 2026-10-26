@@ -48,22 +48,32 @@ enum prop {
     P_GRID_TEMPLATE_AREAS, P_GRID_AUTO_ROWS, P_GRID_ROW_END, P_GRID_AUTO_FLOW, P_MAX_HEIGHT,
     P_ASPECT_RATIO, P_RIGHT, P_BOTTOM, P_CLEAR, P_INSET, P_TRANSFORM, P_Z_INDEX, P_BOX_SHADOW,
     P_MARGIN_INLINE, P_MARGIN_BLOCK, P_PADDING_INLINE, P_PADDING_BLOCK, P_INSET_INLINE, P_INSET_BLOCK,
+    P_CURSOR, P_POINTER_EVENTS, P_USER_SELECT, P_IGNORED, P_LETTER_SPACING, P_WORD_SPACING,
+    P_WORD_BREAK, P_OVERFLOW_WRAP, P_TEXT_OVERFLOW, P_OUTLINE, P_OUTLINE_STYLE, P_OUTLINE_COLOR,
+    P_OUTLINE_WIDTH, P_OUTLINE_OFFSET, P_TEXT_DECORATION_COLOR, P_TEXT_DECORATION_STYLE,
+    P_FONT_VARIANT, P_LIST_STYLE_POSITION, P_TABLE_LAYOUT, P_CAPTION_SIDE, P_EMPTY_CELLS,
+    P_TEXT_SHADOW,
 };
 
 static const struct { const char *name; uint8_t prop; } prop_names[] = {
-    { "-ms-flex", P_FLEX }, { "-webkit-align-items", P_ALIGN_ITEMS },
-    { "-webkit-align-self", P_ALIGN_SELF }, { "-webkit-border-radius", P_BORDER_RADIUS },
-    { "-webkit-box-shadow", P_BOX_SHADOW }, { "-webkit-box-sizing", P_BOX_SIZING },
-    { "-webkit-flex", P_FLEX }, { "-webkit-flex-basis", P_FLEX_BASIS },
-    { "-webkit-flex-direction", P_FLEX_DIRECTION }, { "-webkit-flex-flow", P_FLEX_FLOW },
-    { "-webkit-flex-grow", P_FLEX_GROW }, { "-webkit-flex-shrink", P_FLEX_SHRINK },
-    { "-webkit-flex-wrap", P_FLEX_WRAP }, { "-webkit-justify-content", P_JUSTIFY_CONTENT },
+    { "-moz-appearance", P_IGNORED }, { "-moz-osx-font-smoothing", P_IGNORED },
+    { "-moz-user-select", P_USER_SELECT }, { "-ms-flex", P_FLEX },
+    { "-ms-user-select", P_USER_SELECT }, { "-webkit-align-items", P_ALIGN_ITEMS },
+    { "-webkit-align-self", P_ALIGN_SELF }, { "-webkit-appearance", P_IGNORED },
+    { "-webkit-border-radius", P_BORDER_RADIUS }, { "-webkit-box-shadow", P_BOX_SHADOW },
+    { "-webkit-box-sizing", P_BOX_SIZING }, { "-webkit-flex", P_FLEX },
+    { "-webkit-flex-basis", P_FLEX_BASIS }, { "-webkit-flex-direction", P_FLEX_DIRECTION },
+    { "-webkit-flex-flow", P_FLEX_FLOW }, { "-webkit-flex-grow", P_FLEX_GROW },
+    { "-webkit-flex-shrink", P_FLEX_SHRINK }, { "-webkit-flex-wrap", P_FLEX_WRAP },
+    { "-webkit-font-smoothing", P_IGNORED }, { "-webkit-justify-content", P_JUSTIFY_CONTENT },
     { "-webkit-mask", P_MASK }, { "-webkit-mask-image", P_MASK }, { "-webkit-order", P_ORDER },
-    { "-webkit-transform", P_TRANSFORM }, { "align-items", P_ALIGN_ITEMS },
-    { "align-self", P_ALIGN_SELF }, { "aspect-ratio", P_ASPECT_RATIO },
-    { "background", P_BACKGROUND }, { "background-color", P_BACKGROUND_COLOR },
-    { "background-image", P_BACKGROUND_IMAGE }, { "block-size", P_HEIGHT }, { "border", P_BORDER },
-    { "border-block-end", P_BORDER_BOTTOM }, { "border-block-end-color", P_BORDER_BOTTOM_COLOR },
+    { "-webkit-tap-highlight-color", P_IGNORED }, { "-webkit-transform", P_TRANSFORM },
+    { "-webkit-user-select", P_USER_SELECT }, { "accent-color", P_IGNORED },
+    { "align-items", P_ALIGN_ITEMS }, { "align-self", P_ALIGN_SELF }, { "appearance", P_IGNORED },
+    { "aspect-ratio", P_ASPECT_RATIO }, { "background", P_BACKGROUND },
+    { "background-color", P_BACKGROUND_COLOR }, { "background-image", P_BACKGROUND_IMAGE },
+    { "block-size", P_HEIGHT }, { "border", P_BORDER }, { "border-block-end", P_BORDER_BOTTOM },
+    { "border-block-end-color", P_BORDER_BOTTOM_COLOR },
     { "border-block-end-width", P_BORDER_BOTTOM_WIDTH }, { "border-block-start", P_BORDER_TOP },
     { "border-block-start-color", P_BORDER_TOP_COLOR },
     { "border-block-start-width", P_BORDER_TOP_WIDTH }, { "border-bottom", P_BORDER_BOTTOM },
@@ -89,12 +99,15 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "border-top-right-radius", P_BORDER_TR_RADIUS }, { "border-top-style", P_BORDER_TOP_STYLE },
     { "border-top-width", P_BORDER_TOP_WIDTH }, { "border-width", P_BORDER_WIDTH },
     { "bottom", P_BOTTOM }, { "box-shadow", P_BOX_SHADOW }, { "box-sizing", P_BOX_SIZING },
-    { "clear", P_CLEAR }, { "clip", P_CLIP }, { "color", P_COLOR }, { "column-gap", P_COLUMN_GAP },
-    { "content", P_CONTENT }, { "display", P_DISPLAY }, { "flex", P_FLEX },
-    { "flex-basis", P_FLEX_BASIS }, { "flex-direction", P_FLEX_DIRECTION },
-    { "flex-flow", P_FLEX_FLOW }, { "flex-grow", P_FLEX_GROW }, { "flex-shrink", P_FLEX_SHRINK },
-    { "flex-wrap", P_FLEX_WRAP }, { "float", P_FLOAT }, { "font", P_FONT },
-    { "font-family", P_FONT_FAMILY }, { "font-size", P_FONT_SIZE }, { "font-style", P_FONT_STYLE },
+    { "caption-side", P_CAPTION_SIDE }, { "caret-color", P_IGNORED }, { "clear", P_CLEAR },
+    { "clip", P_CLIP }, { "color", P_COLOR }, { "column-gap", P_COLUMN_GAP },
+    { "content", P_CONTENT }, { "cursor", P_CURSOR }, { "display", P_DISPLAY },
+    { "empty-cells", P_EMPTY_CELLS }, { "flex", P_FLEX }, { "flex-basis", P_FLEX_BASIS },
+    { "flex-direction", P_FLEX_DIRECTION }, { "flex-flow", P_FLEX_FLOW },
+    { "flex-grow", P_FLEX_GROW }, { "flex-shrink", P_FLEX_SHRINK }, { "flex-wrap", P_FLEX_WRAP },
+    { "float", P_FLOAT }, { "font", P_FONT }, { "font-family", P_FONT_FAMILY },
+    { "font-size", P_FONT_SIZE }, { "font-style", P_FONT_STYLE },
+    { "font-variant", P_FONT_VARIANT }, { "font-variant-caps", P_FONT_VARIANT },
     { "font-weight", P_FONT_WEIGHT }, { "gap", P_GAP }, { "grid-area", P_GRID_AREA },
     { "grid-auto-flow", P_GRID_AUTO_FLOW }, { "grid-auto-rows", P_GRID_AUTO_ROWS },
     { "grid-column", P_GRID_COLUMN }, { "grid-column-end", P_GRID_COLUMN_END },
@@ -109,7 +122,8 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "inset-inline", P_INSET_INLINE }, { "inset-inline-end", P_RIGHT },
     { "inset-inline-start", P_LEFT }, { "justify-content", P_JUSTIFY_CONTENT },
     { "justify-items", P_JUSTIFY_ITEMS }, { "justify-self", P_JUSTIFY_SELF }, { "left", P_LEFT },
-    { "line-height", P_LINE_HEIGHT }, { "list-style", P_LIST_STYLE },
+    { "letter-spacing", P_LETTER_SPACING }, { "line-height", P_LINE_HEIGHT },
+    { "list-style", P_LIST_STYLE }, { "list-style-position", P_LIST_STYLE_POSITION },
     { "list-style-type", P_LIST_STYLE_TYPE }, { "margin", P_MARGIN },
     { "margin-block", P_MARGIN_BLOCK }, { "margin-block-end", P_MARGIN_BOTTOM },
     { "margin-block-start", P_MARGIN_TOP }, { "margin-bottom", P_MARGIN_BOTTOM },
@@ -120,20 +134,31 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "max-inline-size", P_MAX_WIDTH }, { "max-width", P_MAX_WIDTH },
     { "min-block-size", P_MIN_HEIGHT }, { "min-height", P_MIN_HEIGHT },
     { "min-inline-size", P_MIN_WIDTH }, { "min-width", P_MIN_WIDTH }, { "opacity", P_OPACITY },
-    { "order", P_ORDER }, { "overflow", P_OVERFLOW }, { "overflow-x", P_OVERFLOW },
+    { "order", P_ORDER }, { "outline", P_OUTLINE }, { "outline-color", P_OUTLINE_COLOR },
+    { "outline-offset", P_OUTLINE_OFFSET }, { "outline-style", P_OUTLINE_STYLE },
+    { "outline-width", P_OUTLINE_WIDTH }, { "overflow", P_OVERFLOW },
+    { "overflow-wrap", P_OVERFLOW_WRAP }, { "overflow-x", P_OVERFLOW },
     { "overflow-y", P_OVERFLOW }, { "padding", P_PADDING }, { "padding-block", P_PADDING_BLOCK },
     { "padding-block-end", P_PADDING_BOTTOM }, { "padding-block-start", P_PADDING_TOP },
     { "padding-bottom", P_PADDING_BOTTOM }, { "padding-inline", P_PADDING_INLINE },
     { "padding-inline-end", P_PADDING_RIGHT }, { "padding-inline-start", P_PADDING_LEFT },
     { "padding-left", P_PADDING_LEFT }, { "padding-right", P_PADDING_RIGHT },
     { "padding-top", P_PADDING_TOP }, { "place-content", P_PLACE_CONTENT },
-    { "place-items", P_PLACE_ITEMS }, { "place-self", P_PLACE_SELF }, { "position", P_POSITION },
-    { "right", P_RIGHT }, { "row-gap", P_ROW_GAP }, { "text-align", P_TEXT_ALIGN },
-    { "text-decoration", P_TEXT_DECORATION }, { "text-decoration-line", P_TEXT_DECORATION_LINE },
-    { "text-indent", P_TEXT_INDENT }, { "text-transform", P_TEXT_TRANSFORM }, { "top", P_TOP },
-    { "transform", P_TRANSFORM }, { "vertical-align", P_VERTICAL_ALIGN },
+    { "place-items", P_PLACE_ITEMS }, { "place-self", P_PLACE_SELF },
+    { "pointer-events", P_POINTER_EVENTS }, { "position", P_POSITION }, { "right", P_RIGHT },
+    { "row-gap", P_ROW_GAP }, { "scroll-behavior", P_IGNORED }, { "table-layout", P_TABLE_LAYOUT },
+    { "text-align", P_TEXT_ALIGN }, { "text-decoration", P_TEXT_DECORATION },
+    { "text-decoration-color", P_TEXT_DECORATION_COLOR },
+    { "text-decoration-line", P_TEXT_DECORATION_LINE },
+    { "text-decoration-style", P_TEXT_DECORATION_STYLE },
+    { "text-decoration-thickness", P_IGNORED }, { "text-indent", P_TEXT_INDENT },
+    { "text-overflow", P_TEXT_OVERFLOW }, { "text-rendering", P_IGNORED },
+    { "text-shadow", P_TEXT_SHADOW }, { "text-transform", P_TEXT_TRANSFORM },
+    { "text-underline-offset", P_IGNORED }, { "top", P_TOP }, { "transform", P_TRANSFORM },
+    { "user-select", P_USER_SELECT }, { "vertical-align", P_VERTICAL_ALIGN },
     { "visibility", P_VISIBILITY }, { "white-space", P_WHITE_SPACE }, { "width", P_WIDTH },
-    { "z-index", P_Z_INDEX },
+    { "will-change", P_IGNORED }, { "word-break", P_WORD_BREAK },
+    { "word-spacing", P_WORD_SPACING }, { "word-wrap", P_OVERFLOW_WRAP }, { "z-index", P_Z_INDEX },
 };
 
 /* ---- selectors and rules ---- */
@@ -144,8 +169,13 @@ enum {
     PS_CHECKED = 1 << 8, PS_DISABLED = 1 << 9, PS_ENABLED = 1 << 10, PS_FIRST_OF_TYPE = 1 << 11,
     PS_LAST_OF_TYPE = 1 << 12, PS_ONLY_OF_TYPE = 1 << 13, PS_REQUIRED = 1 << 14, PS_OPTIONAL = 1 << 15,
     PS_ANY_LINK = 1 << 16, PS_PLACEHOLDER = 1 << 17, PS_HOVER = 1 << 18, PS_FOCUS = 1 << 19,
-    PS_FOCUS_WITHIN = 1 << 20,
+    PS_FOCUS_WITHIN = 1 << 20, PS_TARGET = 1 << 21, PS_READ_ONLY = 1 << 22, PS_READ_WRITE = 1 << 23,
+    PS_DEFAULT = 1 << 24, PS_INDETERMINATE = 1 << 25, PS_VALID = 1 << 26, PS_INVALID = 1 << 27,
+    PS_IN_RANGE = 1 << 28, PS_OUT_RANGE = 1 << 29,
 };
+
+/* The fragment of the page's address, for :target (set by the browser before it cascades). */
+const char *css_target_id;
 
 struct attr_sel {
     const char *name, *value;
@@ -164,6 +194,7 @@ struct compound {
     struct attr_sel *attrs;
     int nattrs;
     uint32_t pseudo;
+    const char *lang;           /* :lang(xx) */
     int nth_a, nth_b, has_nth, nth_of_type, nth_last;
     struct selector *nth_list;   /* siblings matching the optional nth-child "of" filter */
     int nnth;
@@ -175,7 +206,7 @@ struct compound {
     struct selector *is_list;   /* :is(a, b) / :where(): matches one of them */
     int nis;
     char comb;                  /* how it relates to the compound before it */
-    uint8_t pe;                 /* 1 ::before, 2 ::after */
+    uint8_t pe;                 /* PE_* */
 };
 
 struct selector {
@@ -277,7 +308,12 @@ static const char ua_css[] =
     "dialog { position: absolute; left: 0; right: 0; width: fit-content; height: fit-content; margin: auto;"
     " border: 2px solid; padding: 1em; background-color: white; color: black }"
     "[popover]:not([data-popover-open]) { display: none }"
-    "slot { display: contents }";
+    "slot { display: contents }"
+    "progress, meter { display: inline-block; vertical-align: middle }"
+    "ruby { display: inline-flex; flex-direction: column-reverse; align-items: center;"
+    " text-align: center; vertical-align: text-bottom }"
+    "rt { display: block; font-size: .5em; line-height: 1.1; text-align: center }"
+    "rp { display: none }";
 
 /* In quirks mode tables do not inherit these (the HTML standard's rendering section). */
 static const char ua_quirks_css[] =
@@ -524,7 +560,23 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
                 s = close;
             }
             if (!strcmp(name, "before") || !strcmp(name, "after")) {
-                c->pe = name[0] == 'b' ? 1 : 2;
+                c->pe = name[0] == 'b' ? PE_BEFORE : PE_AFTER;
+                *spec += 1;
+                continue;
+            }
+            if (element && (!strcmp(name, "placeholder") || !strcmp(name, "-webkit-input-placeholder") ||
+                            !strcmp(name, "-moz-placeholder") || !strcmp(name, "-ms-input-placeholder"))) {
+                c->pe = PE_PLACEHOLDER;
+                *spec += 1;
+                continue;
+            }
+            if (element && (!strcmp(name, "selection") || !strcmp(name, "-moz-selection"))) {
+                c->pe = PE_SELECTION;
+                *spec += 1;
+                continue;
+            }
+            if (element && !strcmp(name, "marker")) {
+                c->pe = PE_MARKER;
                 *spec += 1;
                 continue;
             }
@@ -565,6 +617,38 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
                 c->pseudo |= PS_VISITED;
             else if (!strcmp(name, "root"))
                 c->pseudo |= PS_ROOT;
+            else if (!strcmp(name, "target")) {
+                c->pseudo |= PS_TARGET;
+                css_dynamic_rules++;
+            } else if (!strcmp(name, "read-only"))
+                c->pseudo |= PS_READ_ONLY;
+            else if (!strcmp(name, "read-write"))
+                c->pseudo |= PS_READ_WRITE;
+            else if (!strcmp(name, "default"))
+                c->pseudo |= PS_DEFAULT;
+            else if (!strcmp(name, "indeterminate"))
+                c->pseudo |= PS_INDETERMINATE;
+            else if (!strcmp(name, "valid")) {
+                c->pseudo |= PS_VALID;
+                css_dynamic_rules++;
+            } else if (!strcmp(name, "invalid")) {
+                c->pseudo |= PS_INVALID;
+                css_dynamic_rules++;
+            } else if (!strcmp(name, "in-range"))
+                c->pseudo |= PS_IN_RANGE;
+            else if (!strcmp(name, "out-of-range"))
+                c->pseudo |= PS_OUT_RANGE;
+            else if (!strcmp(name, "lang") && args) {
+                const char *l = args;
+                while (l < args_end && (isspace((unsigned char)*l) || *l == '"' || *l == '\''))
+                    l++;
+                const char *le = args_end;
+                while (le > l && (isspace((unsigned char)le[-1]) || le[-1] == '"' || le[-1] == '\''))
+                    le--;
+                c->lang = arena_strndup(a, l, (size_t)(le - l));
+                if (!c->lang)
+                    return NULL;
+            }
             else if (!strcmp(name, "empty"))
                 c->pseudo |= PS_EMPTY;
             else if (!strcmp(name, "checked"))
@@ -1557,6 +1641,211 @@ static int is_link(const struct node *n)
 
 static int match_from(const struct selector *s, int i, const struct node *n, const struct mctx *m);
 
+/* ---- form state for :valid, :read-only, :default and friends ---- */
+
+static const char *input_kind(const struct node *n)
+{
+    const char *t = node_attr(n, "type");
+    return t ? t : "text";
+}
+
+/* A text-like field the user can type in: text, search, tel, url, email, password, number... */
+static int is_typing_field(const struct node *n)
+{
+    if (n->tag == T_TEXTAREA)
+        return 1;
+    if (n->tag != T_INPUT)
+        return 0;
+    const char *t = input_kind(n);
+    static const char *const other[] = {
+        "hidden", "checkbox", "radio", "submit", "reset", "button", "image", "file", "range", "color",
+    };
+    for (size_t i = 0; i < sizeof(other) / sizeof(other[0]); i++)
+        if (!strcasecmp(t, other[i]))
+            return 0;
+    return 1;
+}
+
+static int read_write(const struct node *n)
+{
+    if (node_attr(n, "disabled") || node_attr(n, "readonly"))
+        return 0;
+    return is_typing_field(n);
+}
+
+/* The control's current value: what was typed, else the attribute. */
+static const char *field_value(const struct node *n)
+{
+    if (n->value)
+        return n->value;
+    if (n->tag == T_TEXTAREA)
+        return n->first && n->first->type == N_TEXT ? n->first->text : "";
+    const char *v = node_attr(n, "value");
+    return v ? v : "";
+}
+
+static int checked_state(const struct node *n)
+{
+    return n->value ? n->checked : node_attr(n, "checked") != NULL;
+}
+
+/* The chosen option of a <select>: the one asked for, else the first that says selected, else the first. */
+static const struct node *chosen_option(const struct node *sel)
+{
+    int k = 0, want = sel->value || sel->checked ? sel->checked : -1;
+    const struct node *first = NULL, *selected = NULL;
+    for (const struct node *o = sel->first; o; o = node_next((struct node *)o, sel)) {
+        if (o->type != N_ELEMENT || o->tag != T_OPTION)
+            continue;
+        if (!first)
+            first = o;
+        if (!selected && node_attr(o, "selected"))
+            selected = o;
+        if (k++ == want)
+            return o;
+    }
+    return selected ? selected : first;
+}
+
+static int is_number(const char *s, long *out)
+{
+    char *e;
+    long v = strtol(s, &e, 10);
+    if (e == s)
+        return 0;
+    while (*e == '.' || (*e >= '0' && *e <= '9'))
+        e++;                            /* fractions: whole parts are enough for min and max */
+    if (*e)
+        return 0;
+    *out = v;
+    return 1;
+}
+
+/* 1 if the control passes its constraints, 0 if not; -1 for one that has none to check. */
+static int control_validity(const struct node *n)
+{
+    if (n->tag == T_SELECT) {
+        if (node_attr(n, "disabled"))
+            return -1;
+        if (node_attr(n, "required")) {
+            const struct node *o = chosen_option(n);
+            const char *v = o ? (node_attr(o, "value") ? node_attr(o, "value") : o->value ? o->value : "") : "";
+            if (!o || !*v)
+                return 0;
+        }
+        return 1;
+    }
+    if (n->tag != T_INPUT && n->tag != T_TEXTAREA)
+        return -1;
+    const char *t = n->tag == T_INPUT ? input_kind(n) : "textarea";
+    if (node_attr(n, "disabled") || (is_typing_field(n) && node_attr(n, "readonly")))
+        return -1;
+    if (!strcasecmp(t, "hidden") || !strcasecmp(t, "reset") || !strcasecmp(t, "button") ||
+        !strcasecmp(t, "image") || !strcasecmp(t, "submit"))
+        return -1;
+    int required = node_attr(n, "required") != NULL;
+    if (!strcasecmp(t, "checkbox"))
+        return required && !checked_state(n) ? 0 : 1;
+    if (!strcasecmp(t, "radio")) {
+        if (!required)
+            return 1;
+        const char *name = node_attr(n, "name");
+        if (!name || !*name)
+            return checked_state(n);
+        const struct node *form = n;
+        while (form->parent && form->tag != T_FORM)
+            form = form->parent;
+        for (const struct node *o = form; o; o = node_next((struct node *)o, form))
+            if (o->type == N_ELEMENT && o->tag == T_INPUT && !strcasecmp(input_kind(o), "radio") &&
+                node_attr(o, "name") && !strcmp(node_attr(o, "name"), name) && checked_state(o))
+                return 1;
+        return 0;
+    }
+    if (!strcasecmp(t, "file"))
+        return required ? 0 : 1;
+    const char *v = field_value(n);
+    if (!*v)
+        return required ? 0 : 1;
+    if (!strcasecmp(t, "email")) {
+        const char *at = strchr(v, '@');
+        if (!at || at == v || !at[1] || strchr(at + 1, '@') || strpbrk(v, " \t"))
+            return 0;
+    } else if (!strcasecmp(t, "url")) {
+        const char *colon = strstr(v, ":");
+        if (!colon || colon == v || !colon[1] || strpbrk(v, " \t"))
+            return 0;
+    } else if (!strcasecmp(t, "number") || !strcasecmp(t, "range")) {
+        long x, lo, hi;
+        if (!is_number(v, &x))
+            return 0;
+        const char *mn = node_attr(n, "min"), *mx = node_attr(n, "max");
+        if ((mn && is_number(mn, &lo) && x < lo) || (mx && is_number(mx, &hi) && x > hi))
+            return 0;
+    }
+    int len = 0;
+    for (const char *p = v; *p; p++)
+        len += ((unsigned char)*p & 0xC0) != 0x80;
+    const char *ml = node_attr(n, "minlength"), *xl = node_attr(n, "maxlength");
+    if (xl && atoi(xl) > 0 && len > atoi(xl))
+        return 0;
+    if (ml && atoi(ml) > 0 && len < atoi(ml))
+        return 0;
+    return 1;
+}
+
+/* A form or fieldset is valid when every control in it is. */
+static int tree_valid(const struct node *n)
+{
+    for (const struct node *k = n->first; k; k = node_next((struct node *)k, n))
+        if (k->type == N_ELEMENT && control_validity(k) == 0)
+            return 0;
+    return 1;
+}
+
+static int match_valid(const struct node *n, int want_valid)
+{
+    int v;
+    if (n->tag == T_FORM || n->tag == T_FIELDSET)
+        v = tree_valid(n);
+    else if ((v = control_validity(n)) < 0)
+        return 0;
+    return v ? want_valid : !want_valid;
+}
+
+/* The nearest lang attribute up the tree, or NULL. */
+static const char *lang_of(const struct node *n)
+{
+    for (; n; n = n->parent) {
+        const char *l = n->type == N_ELEMENT ? node_attr(n, "lang") : NULL;
+        if (l)
+            return l;
+    }
+    return NULL;
+}
+
+/* The default button of a form: the first submit button in it. */
+static int is_default_button(const struct node *n)
+{
+    int submit = n->tag == T_BUTTON ? (!node_attr(n, "type") || !strcasecmp(node_attr(n, "type"), "submit"))
+               : n->tag == T_INPUT && (!strcasecmp(input_kind(n), "submit") || !strcasecmp(input_kind(n), "image"));
+    if (!submit)
+        return 0;
+    const struct node *form = n->parent;
+    while (form && form->tag != T_FORM)
+        form = form->parent;
+    if (!form)
+        return 0;
+    for (const struct node *o = form->first; o; o = node_next((struct node *)o, form)) {
+        if (o->type != N_ELEMENT)
+            continue;
+        int sub = o->tag == T_BUTTON ? (!node_attr(o, "type") || !strcasecmp(node_attr(o, "type"), "submit"))
+                : o->tag == T_INPUT && (!strcasecmp(input_kind(o), "submit") || !strcasecmp(input_kind(o), "image"));
+        if (sub)
+            return o == n;
+    }
+    return 0;
+}
+
 static int match_nth_filter(const struct compound *c, const struct node *n, const struct mctx *m)
 {
     if (!c->nnth)
@@ -1645,11 +1934,60 @@ static int match_compound(const struct compound *c, const struct node *n, const 
             for (const struct node *k = n->first; k; k = k->next)
                 if (k->type == N_ELEMENT || k->len)
                     return 0;
-        if ((ps & PS_CHECKED) && !(node_attr(n, "checked") || node_attr(n, "selected")))
+        if (ps & PS_CHECKED) {
+            int on = n->tag == T_INPUT && (!strcasecmp(input_kind(n), "checkbox") ||
+                                           !strcasecmp(input_kind(n), "radio"))
+                   ? checked_state(n) : node_attr(n, "checked") || node_attr(n, "selected");
+            if (!on)
+                return 0;
+        }
+        if (ps & PS_TARGET) {
+            const char *id = node_attr(n, "id");
+            if (!css_target_id || !*css_target_id || !id || strcmp(id, css_target_id))
+                return 0;
+        }
+        if ((ps & PS_READ_WRITE) && !(read_write(n) || node_attr(n, "contenteditable")))
             return 0;
+        if ((ps & PS_READ_ONLY) && (read_write(n) || node_attr(n, "contenteditable")))
+            return 0;
+        if (ps & PS_DEFAULT) {
+            int on = (n->tag == T_INPUT && (!strcasecmp(input_kind(n), "checkbox") ||
+                                            !strcasecmp(input_kind(n), "radio")) &&
+                      node_attr(n, "checked")) ||
+                     (n->tag == T_OPTION && node_attr(n, "selected")) || is_default_button(n);
+            if (!on)
+                return 0;
+        }
+        if (ps & PS_INDETERMINATE) {
+            int on = (n->tag == T_INPUT && !strcasecmp(input_kind(n), "checkbox") && node_attr(n, "indeterminate")) ||
+                     (n->tag == T_PROGRESS && !node_attr(n, "value"));
+            if (!on)
+                return 0;
+        }
+        if ((ps & PS_VALID) && !match_valid(n, 1))
+            return 0;
+        if ((ps & PS_INVALID) && !match_valid(n, 0))
+            return 0;
+        if (ps & (PS_IN_RANGE | PS_OUT_RANGE)) {
+            long x, lo, hi;
+            const char *t = n->tag == T_INPUT ? input_kind(n) : "";
+            const char *mn = node_attr(n, "min"), *mx = node_attr(n, "max");
+            if ((strcasecmp(t, "number") && strcasecmp(t, "range")) || (!mn && !mx))
+                return 0;
+            const char *v = field_value(n);
+            int out = is_number(v, &x) && ((mn && is_number(mn, &lo) && x < lo) || (mx && is_number(mx, &hi) && x > hi));
+            if (((ps & PS_IN_RANGE) && out) || ((ps & PS_OUT_RANGE) && !out))
+                return 0;
+        }
         if ((ps & PS_DISABLED) && !node_attr(n, "disabled"))
             return 0;
         if ((ps & PS_ENABLED) && node_attr(n, "disabled"))
+            return 0;
+    }
+    if (c->lang) {
+        const char *l = lang_of(n);
+        size_t cl = strlen(c->lang);
+        if (!l || strncasecmp(l, c->lang, cl) || (l[cl] && l[cl] != '-'))
             return 0;
     }
     if (c->has_nth) {
@@ -2332,6 +2670,8 @@ static void init_initial(void)
     s->align_items = s->justify = s->justify_items = AL_NORMAL;
     s->lh_kind = LH_NORMAL;
     s->list_style = LS_DISC;
+    s->outline_color = 1;
+    s->outline_w = 3;
 }
 
 static void inherit(struct style *st, const struct style *p)
@@ -2355,6 +2695,19 @@ static void inherit(struct style *st, const struct style *p)
     st->border_spacing = p->border_spacing;
     st->vars = p->vars;
     st->text_indent = p->text_indent;
+    st->letter_spacing = p->letter_spacing;
+    st->word_spacing = p->word_spacing;
+    st->word_break = p->word_break;
+    st->small_caps = p->small_caps;
+    st->list_inside = p->list_inside;
+    st->empty_hide = p->empty_hide;
+    st->deco_style = p->deco_style;
+    st->deco_color = p->deco_color;
+    st->ts_x = p->ts_x, st->ts_y = p->ts_y, st->ts_blur = p->ts_blur;
+    st->ts_color = p->ts_color;
+    st->cursor = p->cursor;
+    st->pointer_none = p->pointer_none;
+    st->select_none = p->select_none;
 }
 
 static int parse_border_style(const char *w, int wl)
@@ -3275,7 +3628,193 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
                 st->decoration |= DECO_STRIKE;
             else if (word_is(w[i], wl[i], "overline"))
                 st->decoration |= DECO_OVERLINE;
+            else if (prop == P_TEXT_DECORATION && css_parse_color(w[i], wl[i], &c) == 0)
+                st->deco_color = c;     /* the shorthand also takes a color and a style */
+            else if (prop == P_TEXT_DECORATION && (word_is(w[i], wl[i], "double") ||
+                     word_is(w[i], wl[i], "dotted") || word_is(w[i], wl[i], "dashed") ||
+                     word_is(w[i], wl[i], "wavy") || word_is(w[i], wl[i], "solid")))
+                st->deco_style = word_is(w[i], wl[i], "double") ? DS_DOUBLE
+                               : word_is(w[i], wl[i], "dotted") ? DS_DOTTED
+                               : word_is(w[i], wl[i], "dashed") ? DS_DASHED
+                               : word_is(w[i], wl[i], "wavy") ? DS_WAVY : DS_SOLID;
         }
+        if (prop == P_TEXT_DECORATION && n && (word_is(w[0], wl[0], "none") || word_is(w[0], wl[0], "initial")))
+            st->deco_color = 0, st->deco_style = DS_SOLID;
+        break;
+    case P_TEXT_DECORATION_COLOR:
+        if (initial_kw || !strcasecmp(value, "currentcolor"))
+            st->deco_color = 0;
+        else if (css_parse_color(value, (int)strlen(value), &c) == 0)
+            st->deco_color = c;
+        break;
+    case P_TEXT_DECORATION_STYLE:
+        st->deco_style = !strcasecmp(value, "double") ? DS_DOUBLE : !strcasecmp(value, "dotted") ? DS_DOTTED
+                       : !strcasecmp(value, "dashed") ? DS_DASHED : !strcasecmp(value, "wavy") ? DS_WAVY
+                       : DS_SOLID;
+        break;
+    case P_LETTER_SPACING:
+    case P_WORD_SPACING: {
+        struct len l;
+        int px = 0;
+        if (!strcasecmp(value, "normal") || initial_kw)
+            px = 0;
+        else if (inherit_kw)
+            px = prop == P_LETTER_SPACING ? parent->letter_spacing : parent->word_spacing;
+        else if (length_value(value, v, &l) && l.unit == U_PX)
+            px = l.v;
+        else
+            break;
+        if (px < -50)
+            px = -50;
+        if (px > 100)
+            px = 100;
+        *(prop == P_LETTER_SPACING ? &st->letter_spacing : &st->word_spacing) = px;
+        break;
+    }
+    case P_WORD_BREAK:
+    case P_OVERFLOW_WRAP:
+        if (prop == P_WORD_BREAK && !strcasecmp(value, "break-all"))
+            st->word_break = WB_BREAK_ALL;
+        else if (!strcasecmp(value, "break-word") || !strcasecmp(value, "anywhere"))
+            st->word_break = st->word_break == WB_BREAK_ALL ? WB_BREAK_ALL : WB_BREAK_WORD;
+        else if (prop == P_WORD_BREAK && (!strcasecmp(value, "normal") || !strcasecmp(value, "keep-all")))
+            st->word_break = WB_NORMAL;
+        else if (prop == P_OVERFLOW_WRAP && (!strcasecmp(value, "normal") || initial_kw) &&
+                 st->word_break == WB_BREAK_WORD)
+            st->word_break = WB_NORMAL;
+        break;
+    case P_TEXT_OVERFLOW:
+        st->text_ellipsis = !strncasecmp(value, "ellipsis", 8);
+        break;
+    case P_FONT_VARIANT:
+        st->small_caps = strcasestr(value, "small-caps") != NULL || strcasestr(value, "all-small-caps") != NULL;
+        if (!strcasecmp(value, "normal") || initial_kw)
+            st->small_caps = 0;
+        break;
+    case P_TABLE_LAYOUT:
+        st->table_fixed = !strcasecmp(value, "fixed");
+        break;
+    case P_CAPTION_SIDE:
+        st->caption_bottom = !strcasecmp(value, "bottom") || !strcasecmp(value, "bottom-outside");
+        break;
+    case P_EMPTY_CELLS:
+        st->empty_hide = !strcasecmp(value, "hide");
+        break;
+    case P_LIST_STYLE_POSITION:
+        st->list_inside = !strcasecmp(value, "inside");
+        break;
+    case P_CURSOR: {
+        static const struct { const char *kw; uint8_t c; } cursors[] = {
+            { "auto", CSSCUR_AUTO }, { "default", CSSCUR_DEFAULT }, { "pointer", CSSCUR_POINTER },
+            { "text", CSSCUR_TEXT }, { "vertical-text", CSSCUR_TEXT }, { "wait", CSSCUR_WAIT },
+            { "progress", CSSCUR_PROGRESS }, { "crosshair", CSSCUR_CROSSHAIR }, { "move", CSSCUR_MOVE },
+            { "grab", CSSCUR_MOVE }, { "grabbing", CSSCUR_MOVE }, { "all-scroll", CSSCUR_MOVE },
+            { "help", CSSCUR_HELP }, { "not-allowed", CSSCUR_NOT_ALLOWED }, { "no-drop", CSSCUR_NOT_ALLOWED },
+            { "none", CSSCUR_NONE }, { "ns-resize", CSSCUR_RESIZE_NS }, { "n-resize", CSSCUR_RESIZE_NS },
+            { "s-resize", CSSCUR_RESIZE_NS }, { "row-resize", CSSCUR_RESIZE_NS }, { "ew-resize", CSSCUR_RESIZE_EW },
+            { "e-resize", CSSCUR_RESIZE_EW }, { "w-resize", CSSCUR_RESIZE_EW }, { "col-resize", CSSCUR_RESIZE_EW },
+            { "nesw-resize", CSSCUR_RESIZE_ALL }, { "nwse-resize", CSSCUR_RESIZE_ALL },
+            { "ne-resize", CSSCUR_RESIZE_ALL }, { "nw-resize", CSSCUR_RESIZE_ALL },
+            { "se-resize", CSSCUR_RESIZE_ALL }, { "sw-resize", CSSCUR_RESIZE_ALL },
+        };
+        if (inherit_kw) {
+            st->cursor = parent->cursor;
+            break;
+        }
+        /* a list: url(...) fallbacks first, a keyword last; the last keyword that we know wins */
+        n = words(value, w, wl, 8);
+        for (int i = 0; i < n; i++) {
+            char kw[24];
+            snprintf(kw, sizeof(kw), "%.*s", wl[i] > 20 ? 20 : wl[i], w[i]);
+            char *comma = strchr(kw, ',');
+            if (comma)
+                *comma = 0;
+            for (size_t k = 0; k < sizeof(cursors) / sizeof(cursors[0]); k++)
+                if (!strcasecmp(kw, cursors[k].kw))
+                    st->cursor = cursors[k].c;
+        }
+        if (initial_kw)
+            st->cursor = CSSCUR_AUTO;
+        break;
+    }
+    case P_POINTER_EVENTS:
+        st->pointer_none = inherit_kw ? parent->pointer_none : !strcasecmp(value, "none");
+        break;
+    case P_USER_SELECT:
+        st->select_none = inherit_kw ? parent->select_none : !strcasecmp(value, "none");
+        break;
+    case P_OUTLINE:
+    case P_OUTLINE_STYLE:
+    case P_OUTLINE_COLOR:
+    case P_OUTLINE_WIDTH: {
+        if (initial_kw) {
+            st->outline_style = BS_NONE;
+            st->outline_w = 3;
+            st->outline_color = 1;
+            break;
+        }
+        n = words(value, w, wl, 8);
+        if (prop == P_OUTLINE) {
+            st->outline_style = BS_NONE;
+            st->outline_w = 3;
+            st->outline_color = 1;
+        }
+        for (int i = 0; i < n; i++) {
+            int bs = parse_border_style(w[i], wl[i]), px;
+            if (word_is(w[i], wl[i], "auto"))
+                bs = BS_SOLID;
+            if (bs >= 0 && (prop == P_OUTLINE || prop == P_OUTLINE_STYLE))
+                st->outline_style = (uint8_t)bs;
+            else if ((prop == P_OUTLINE || prop == P_OUTLINE_WIDTH) && border_width_kw(w[i], wl[i], v, &px))
+                st->outline_w = px;
+            else if ((prop == P_OUTLINE || prop == P_OUTLINE_COLOR) && css_parse_color(w[i], wl[i], &c) == 0)
+                st->outline_color = c;
+            else if ((prop == P_OUTLINE || prop == P_OUTLINE_COLOR) && word_is(w[i], wl[i], "currentcolor"))
+                st->outline_color = 1;
+        }
+        break;
+    }
+    case P_OUTLINE_OFFSET: {
+        struct len l;
+        if (length_value(value, v, &l) && l.unit == U_PX)
+            st->outline_offset = l.v;
+        break;
+    }
+    case P_TEXT_SHADOW: {
+        st->ts_color = 0;
+        if (!strcasecmp(value, "none") || initial_kw)
+            break;
+        if (inherit_kw) {
+            st->ts_x = parent->ts_x, st->ts_y = parent->ts_y, st->ts_blur = parent->ts_blur;
+            st->ts_color = parent->ts_color;
+            break;
+        }
+        const char *vend = value + strlen(value), *comma = find_top(value, vend, ',');
+        char first[160];
+        snprintf(first, sizeof(first), "%.*s", (int)(comma - value), value);
+        const char *w2[8];
+        int wl2[8], nw = words(first, w2, wl2, 8), nl = 0, num[3] = { 0, 0, 0 };
+        uint32_t col = 0;
+        for (int i = 0; i < nw; i++) {
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "%.*s", wl2[i], w2[i]);
+            struct len l;
+            uint32_t cc;
+            if (css_parse_color(tmp, (int)strlen(tmp), &cc) == 0 &&
+                !(isdigit((unsigned char)tmp[0]) || tmp[0] == '-' || tmp[0] == '.'))
+                col = cc;
+            else if (length_value(tmp, v, &l) && l.unit == U_PX && nl < 3)
+                num[nl++] = l.v;
+        }
+        if (!col)
+            col = 1;                    /* currentColor, resolved when the element's style is done */
+        if (nl >= 2 && (col == 1 || ALPHA(col))) {
+            st->ts_x = num[0], st->ts_y = num[1], st->ts_blur = num[2] < 0 ? 0 : num[2];
+            st->ts_color = col;
+        }
+        break;
+    }
+    case P_IGNORED:
         break;
     case P_TEXT_TRANSFORM:
         st->text_transform = !strcasecmp(value, "uppercase") ? TT_UPPER
@@ -3319,10 +3858,15 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
             { "lower-roman", LS_LOWER_ROMAN }, { "upper-roman", LS_UPPER_ROMAN }, { "none", LS_NONE },
         };
         n = words(value, w, wl, 8);
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < n; i++) {
             for (size_t k = 0; k < sizeof(ls) / sizeof(ls[0]); k++)
                 if (word_is(w[i], wl[i], ls[k].kw))
                     st->list_style = ls[k].ls;
+            if (prop == P_LIST_STYLE && word_is(w[i], wl[i], "inside"))
+                st->list_inside = 1;
+            else if (prop == P_LIST_STYLE && word_is(w[i], wl[i], "outside"))
+                st->list_inside = 0;
+        }
         break;
     }
     case P_MARGIN:
@@ -4012,6 +4556,8 @@ static void compute(struct arena *a, struct node *n, const struct style *parent,
         return;
     inherit(st, parent);
     n->style = st;
+    memset(n->pseudo_st, 0, sizeof(n->pseudo_st));     /* the last cascade's styles are gone */
+    memset(n->pseudo_text, 0, sizeof(n->pseudo_text));
 
     struct collect c = { buf, 0, mc };
     match_sheet(&c, ua_sheet, n, R_UA, 0);
@@ -4113,12 +4659,18 @@ static void compute(struct arena *a, struct node *n, const struct style *parent,
         if (st->border_color[i] == 1)
             st->border_color[i] = st->color;
     }
+    if (st->outline_style == BS_NONE)
+        st->outline_w = 0;
+    if (st->outline_color == 1)
+        st->outline_color = st->color;
+    if (st->ts_color == 1)
+        st->ts_color = st->color;
     if (st->font_size > 200)
         st->font_size = 200;
     st->font = wfont_get(st->family, st->bold, st->italic, st->font_size);
 
     if (st->display != D_NONE)
-        for (int pe = 1; pe <= 2; pe++)
+        for (int pe = PE_BEFORE; pe <= PE_MARKER; pe++)
             pseudo(a, n, st, &c, pe, &v);
 }
 
@@ -4188,19 +4740,29 @@ static const char *content_text(struct arena *a, const struct node *n, const cha
     return arena_strndup(a, out, (size_t)o);
 }
 
-/* The style and text of n's ::before (pe 1) or ::after (pe 2), if it has one. */
+/* The style (and for ::before and ::after the text) of one of n's pseudo-elements, if it has one:
+ * generated content needs a "content"; ::placeholder, ::selection and ::marker only declarations. */
 static void pseudo(struct arena *a, struct node *n, const struct style *st, const struct collect *c,
                    int pe, const struct vctx *base)
 {
-    const char *content = NULL;
-    for (int i = 0; i < c->n; i++)
-        if (c->m[i].pe == (uint32_t)pe && c->m[i].d->prop == P_CONTENT)
+    const char *content = NULL, *text = NULL;
+    int any = 0;
+    for (int i = 0; i < c->n; i++) {
+        if (c->m[i].pe != (uint32_t)pe)
+            continue;
+        any = 1;
+        if (c->m[i].d->prop == P_CONTENT)
             content = c->m[i].d->value;
-    if (!content)
+    }
+    if (!any)
         return;
-    const char *text = content_text(a, n, content);
-    if (!text)
-        return;
+    if (pe <= PE_AFTER) {
+        if (!content)
+            return;
+        text = content_text(a, n, content);
+        if (!text)
+            return;
+    }
     struct style *ps = arena_alloc(a, sizeof(*ps));
     if (!ps)
         return;
@@ -4224,7 +4786,7 @@ static void pseudo(struct arena *a, struct node *n, const struct style *st, cons
             apply(ps, st, d->prop, value, &v);
         }
     }
-    if (ps->display == D_NONE || (ps->positioned && (ps->hidden || ps->invisible)))
+    if (pe <= PE_AFTER && (ps->display == D_NONE || (ps->positioned && (ps->hidden || ps->invisible))))
         return;
     for (int i = 0; i < 4; i++) {
         if (ps->border_style[i] == BS_NONE)
@@ -4232,11 +4794,14 @@ static void pseudo(struct arena *a, struct node *n, const struct style *st, cons
         if (ps->border_color[i] == 1)
             ps->border_color[i] = ps->color;
     }
+    if (ps->ts_color == 1)
+        ps->ts_color = ps->color;
     if (ps->invisible & 8)
         ps->bg = TRANSPARENT;
     ps->font = wfont_get(ps->family, ps->bold, ps->italic, ps->font_size);
     n->pseudo_st[pe - 1] = ps;
-    n->pseudo_text[pe - 1] = text;
+    if (pe <= PE_AFTER)
+        n->pseudo_text[pe - 1] = text;
 }
 
 static void cascade_tree(struct arena *a, struct node *root, const struct style *parent,

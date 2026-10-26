@@ -52,6 +52,11 @@
 #define MAX_RESOURCE (2 << 20)
 #define CACHE_MAX   (24 << 20)      /* decoded image bytes kept */
 #define WGET        "/bin/wget"
+#define HTTPC       "/bin/httpc"            /* the fetcher that keeps connections and a cache */
+#define HTTP_CACHE_DIR "/home/flux/.cache/http"
+#define HTTP_CACHE_MAX (16 << 20)
+#define HELPERS_MAX 8                       /* fetchers running at once, over all windows and frames */
+#define HELPER_IDLE_MS 30000                /* one that has nothing to do for this long is stopped */
 #define HOME_URL    "file:///usr/share/www/home.html"
 #define LINE_STEP   40
 #define HISTORY_FILE   "/home/flux/.browser_history"
@@ -80,6 +85,8 @@ struct fetch {
     int active;
     int kind;
     int pid, out, err;
+    int via, id;                /* asked of the fetcher (not wget), with this request id */
+    char errmsg[256];           /* the fetcher's reason, when it failed */
     char *buf;
     int len, cap;
     int eof, exited, status;
@@ -88,6 +95,16 @@ struct fetch {
     int redirects;
     int mode;                   /* F_PAGE: NAV_* */
     char *post;                 /* F_PAGE: a form's POST body */
+};
+
+/* A browser's fetcher process (httpc): requests go down one pipe, frames of answers come back up the other. */
+struct helper {
+    int pid, to, from;
+    char *buf;                  /* answers read but not yet taken apart */
+    int len, cap;
+    int next_id;
+    unsigned used;              /* when the last request was made */
+    int answered;               /* it has sent something: it works */
 };
 
 struct res {                    /* a style sheet, image, script or request waiting to be fetched */
@@ -153,6 +170,8 @@ struct browser {
 
     /* loading */
     struct fetch fetch;
+    struct helper hp;
+    int reload_next;            /* the next page request asks the server whether the copy is still good */
     struct res queue[MAX_RES];
     int nqueue, qhead;
     int loading, total_res, done_res;
@@ -456,11 +475,15 @@ static void cache_clear(struct browser *b)
 
 /* ---- fetching ---- */
 
+static void helper_cancel(struct browser *b);
+
 static void fetch_stop(struct browser *b)
 {
     struct fetch *f = &b->fetch;
     if (!f->active)
         return;
+    if (f->via)
+        helper_cancel(b);               /* the fetcher goes on, for the next request */
     if (f->pid > 0) {
         kill(f->pid, SIGKILL);
         f->pid = 0;                     /* the main loop reaps it */
@@ -485,6 +508,273 @@ static void stop_all(struct browser *b)
 }
 
 static void fetch_complete(struct browser *b);
+
+/* ---- the fetcher (httpc) ---- */
+
+static int live_helpers;
+static int helper_disabled;             /* a fetcher died without ever answering: use wget from now on */
+static int start_fetch(struct browser *b, int kind, const char *url, const char *post, int slot,
+                       int redirects, int mode);
+
+/* Read what the fetcher has sent into h->buf (frames are taken apart by helper_ready); -1 if it has gone. */
+static int helper_pull(struct helper *h)
+{
+    struct pollfd p = { h->from, POLLIN, 0 };
+    if (poll(&p, 1, 0) <= 0)
+        return 0;
+    if (h->cap - h->len < 16384) {
+        int cap = h->cap ? h->cap * 2 : 65536;
+        char *nb = realloc(h->buf, (size_t)cap);
+        if (!nb)
+            return 0;
+        h->buf = nb;
+        h->cap = cap;
+    }
+    int n = (int)read(h->from, h->buf + h->len, (size_t)(h->cap - h->len));
+    if (n <= 0)
+        return -1;
+    h->len += n;
+    return 1;
+}
+
+/*
+ * Write all of buf to the fetcher, without being killed if it has gone away. The pipe holds 4 KiB,
+ * so a long request waits for the fetcher to read; meanwhile what it writes to us is taken in, or
+ * the two would wait on each other.
+ */
+static int helper_write(struct helper *h, const void *buf, size_t n)
+{
+    const char *p = buf;
+    signal(SIGPIPE, SIG_IGN);
+    int ok = 1;
+    while (n > 0) {
+        struct pollfd pf[2] = { { h->to, POLLOUT, 0 }, { h->from, POLLIN, 0 } };
+        if (poll(pf, 2, 10000) <= 0 || (pf[0].revents & (POLLERR | POLLHUP))) {
+            ok = 0;
+            break;
+        }
+        if (pf[1].revents & POLLIN) {
+            if (helper_pull(h) < 0 && !(pf[0].revents & POLLOUT)) {
+                ok = 0;
+                break;
+            }
+        }
+        if (!(pf[0].revents & POLLOUT))
+            continue;
+        int w = (int)write(h->to, p, n);
+        if (w <= 0) {
+            ok = 0;
+            break;
+        }
+        p += w;
+        n -= (size_t)w;
+    }
+    signal(SIGPIPE, SIG_DFL);
+    return ok ? 0 : -1;
+}
+
+static void helper_ready(void *ctx, int revents);
+
+/* Let the fetcher go (it quits when its input ends); its process is reaped by the main loop. */
+static void helper_close(struct browser *b)
+{
+    struct helper *h = &b->hp;
+    if (h->pid <= 0 && h->to < 0 && h->from < 0)
+        return;
+    if (h->from >= 0) {
+        loop_unwatch(h->from);
+        close(h->from);
+    }
+    if (h->to >= 0)
+        close(h->to);
+    if (h->pid > 0)
+        live_helpers--;
+    free(h->buf);
+    int next = h->next_id;
+    memset(h, 0, sizeof(*h));
+    h->to = h->from = -1;
+    h->next_id = next;
+}
+
+/* Start the fetcher if there is not one (and not too many already); 0 if it is running. */
+static int helper_start(struct browser *b)
+{
+    struct helper *h = &b->hp;
+    if (h->pid > 0)
+        return 0;
+    if (live_helpers >= HELPERS_MAX)
+        return -1;
+    mkdir("/home/flux/.cache", 0755);
+    int in[2], out[2];
+    if (pipe(in) < 0)
+        return -1;
+    if (pipe(out) < 0) {
+        close(in[0]);
+        close(in[1]);
+        return -1;
+    }
+    int pid = fork();
+    if (pid == 0) {
+        dup2(in[0], 0);
+        dup2(out[1], 1);
+        int null = open("/dev/null", O_WRONLY);
+        if (null >= 0)
+            dup2(null, 2);
+        for (int fd = 3; fd < 32; fd++)
+            close(fd);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        char max[16];
+        snprintf(max, sizeof(max), "%d", HTTP_CACHE_MAX);
+        char *argv[] = { "httpc", "--cache", HTTP_CACHE_DIR, "--cache-max", max, NULL };
+        execve(HTTPC, argv, environ);
+        _exit(127);
+    }
+    close(in[0]);
+    close(out[1]);
+    if (pid < 0) {
+        close(in[1]);
+        close(out[0]);
+        return -1;
+    }
+    int next = h->next_id;
+    memset(h, 0, sizeof(*h));
+    h->next_id = next;
+    h->pid = pid;
+    h->to = in[1];
+    h->from = out[0];
+    live_helpers++;
+    loop_watch(h->from, helper_ready, b);
+    return 0;
+}
+
+/* Send a request; the answer comes back through helper_ready. */
+static int helper_request(struct browser *b, int id, int flags, int timeout_s, size_t max_body,
+                          const char *method, const char *url, char *const *hdrs, int nhdrs,
+                          const char *body, size_t body_len)
+{
+    struct helper *h = &b->hp;
+    size_t cap = strlen(url) + 256 + body_len;
+    for (int i = 0; i < nhdrs; i++)
+        cap += strlen(hdrs[i]) + 2;
+    char *msg = malloc(cap);
+    if (!msg)
+        return -1;
+    size_t o = (size_t)snprintf(msg, cap, "Q %d %d %d %u %d %u %s\n%s\n", id, flags, timeout_s,
+                                (unsigned)max_body, nhdrs, (unsigned)body_len, method, url);
+    for (int i = 0; i < nhdrs; i++)
+        o += (size_t)snprintf(msg + o, cap - o, "%s\n", hdrs[i]);
+    if (body_len) {
+        memcpy(msg + o, body, body_len);
+        o += body_len;
+    }
+    int r = helper_write(h, msg, o);
+    free(msg);
+    h->used = now_ms();
+    return r;
+}
+
+/* The current request is not wanted any more. */
+static void helper_cancel(struct browser *b)
+{
+    struct helper *h = &b->hp;
+    if (h->pid <= 0 || h->to < 0)
+        return;
+    char msg[32];
+    int n = snprintf(msg, sizeof(msg), "X %d\n", b->fetch.id);
+    helper_write(h, msg, (size_t)n);
+}
+
+/* Answers from the fetcher: frames "H id status n", "B id 0 n" and "E id code n", each with n bytes after. */
+static void helper_ready(void *ctx, int revents)
+{
+    struct browser *b = alive(ctx);
+    if (!b)
+        return;
+    struct helper *h = &b->hp;
+    struct fetch *f = &b->fetch;
+    (void)revents;
+    int n = helper_pull(h);
+    if (n < 0) {                        /* it has died: what was being asked will not come */
+        int active = f->active && f->via;
+        int answered = h->answered;
+        helper_close(b);
+        if (active && !answered && !f->len) {   /* it never worked (not installed?): ask wget instead */
+            helper_disabled = 1;
+            int kind = f->kind, slot = f->slot, redirects = f->redirects, mode = f->mode;
+            char url[URL_MAX];
+            snprintf(url, sizeof(url), "%s", f->url);
+            char *post = f->post ? strdup(f->post) : NULL;
+            fetch_stop(b);
+            start_fetch(b, kind, url, post, slot, redirects, mode);
+            free(post);
+            return;
+        }
+        if (active) {
+            snprintf(f->errmsg, sizeof(f->errmsg), "the fetcher stopped");
+            f->status = 1 << 8;
+            f->eof = f->exited = 1;
+            fetch_complete(b);
+        }
+        return;
+    }
+    if (h->len > 0)
+        h->answered = 1;
+    while (h->len > 0) {
+        char *nl = memchr(h->buf, '\n', (size_t)h->len);
+        if (!nl)
+            break;
+        char kind = h->buf[0];
+        int id = 0, a = 0;
+        unsigned len = 0;
+        *nl = 0;
+        {
+            char *p = h->buf + 1;
+            id = (int)strtol(p, &p, 10);
+            a = (int)strtol(p, &p, 10);
+            len = (unsigned)strtoul(p, &p, 10);
+        }
+        *nl = '\n';
+        size_t head = (size_t)(nl - h->buf) + 1;
+        if ((size_t)h->len < head + len)
+            break;                      /* the rest of this frame is still coming */
+        const char *data = h->buf + head;
+        if (f->active && f->via && id == f->id) {
+            int limit = f->kind == F_PAGE ? MAX_PAGE : MAX_RESOURCE;
+            if (kind == 'H' || kind == 'B') {
+                if (f->cap - f->len < (int)len + 1) {
+                    int cap = f->cap ? f->cap : 65536;
+                    while (cap < f->len + (int)len + 1)
+                        cap *= 2;
+                    char *nbuf = cap <= limit + 65536 + 16384 ? realloc(f->buf, (size_t)cap) : NULL;
+                    if (nbuf) {
+                        f->buf = nbuf;
+                        f->cap = cap;
+                    }
+                }
+                if (f->cap - f->len >= (int)len + 1) {
+                    memcpy(f->buf + f->len, data, len);
+                    f->len += (int)len;
+                }
+                if (f->kind == F_PAGE)
+                    set_status(b, "Loading %s (%d KB)...", f->url, f->len / 1024);
+            } else if (kind == 'E') {
+                snprintf(f->errmsg, sizeof(f->errmsg), "%.*s", (int)(len < sizeof(f->errmsg) - 1 ? len : sizeof(f->errmsg) - 1), data);
+                f->status = a == 0 ? 0 : 1 << 8;
+                f->eof = f->exited = 1;
+                memmove(h->buf, h->buf + head + len, (size_t)h->len - head - len);
+                h->len -= (int)(head + len);
+                h->used = now_ms();
+                fetch_complete(b);
+                return;                 /* (b may have started the next request) */
+            }
+        }
+        memmove(h->buf, h->buf + head + len, (size_t)h->len - head - len);
+        h->len -= (int)(head + len);
+    }
+    if (f->active && f->via && f->kind == F_PAGE)
+        paint(b);
+}
 
 static void fetch_output(void *ctx, int revents)
 {
@@ -534,6 +824,11 @@ static void fetch_output(void *ctx, int revents)
 void browser_child_exited(int pid, int status)
 {
     for (struct browser *b = browsers; b; b = b->next) {
+        if (b->hp.pid == pid) {         /* a fetcher that ended (its pipe tells the rest) */
+            b->hp.pid = -1;
+            live_helpers--;
+            return;
+        }
         struct fetch *f = &b->fetch;
         if (!f->active || f->pid != pid)
             continue;
@@ -646,6 +941,72 @@ static int read_file(struct fetch *f, const char *url)
     return f->buf ? 0 : -ENOMEM;
 }
 
+/* Ask the fetcher for http(s) url. A script's request packs "METHOD\nHeader: value\n...\n\nbody" into post.
+ * Returns -1 if there is no fetcher to ask (then wget is used). */
+static int start_via_helper(struct browser *b, int kind, const char *url, const char *post)
+{
+    struct fetch *f = &b->fetch;
+    if (strpbrk(url, "\r\n"))
+        return -1;                      /* (it would break the fetcher's framing; wget copes) */
+    if (helper_start(b) < 0)
+        return -1;
+    char method[40];
+    snprintf(method, sizeof(method), "%s", post ? "POST" : "GET");
+    char *hdrs[20];
+    int nh = 0;
+    const char *body = post;
+    char *packed = kind == F_XHR && post ? strdup(post) : NULL;
+    if (packed) {
+        char *nl = strchr(packed, '\n');
+        body = NULL;
+        if (nl) {
+            *nl = 0;
+            snprintf(method, sizeof(method), "%.30s", packed);
+            char *p = nl + 1;
+            while (*p && *p != '\n') {                 /* header lines end at an empty line */
+                char *e = strchr(p, '\n');
+                if (!e)
+                    break;
+                *e = 0;
+                if (nh < 14)
+                    hdrs[nh++] = p;
+                p = e + 1;
+            }
+            body = *p == '\n' ? p + 1 : p;
+        }
+        if (body && !*body)
+            body = NULL;
+    }
+    char ua[] = "User-Agent: " BROWSER_USER_AGENT;
+    hdrs[nh++] = ua;
+    static char cookies[4096 + 16];
+    char *cookie_line = NULL;
+    cookie_header(url, 0, cookies + 8, sizeof(cookies) - 24);
+    if (cookies[8]) {                           /* the jar's cookies for this address */
+        memcpy(cookies, "Cookie: ", 8);
+        cookie_line = cookies;
+        hdrs[nh++] = cookie_line;
+    }
+    int id = ++b->hp.next_id;
+    int flags = 0;
+    if (kind == F_PAGE && b->reload_next)
+        flags = 1;
+    if (kind == F_PAGE)
+        b->reload_next = 0;
+    int r = helper_request(b, id, flags, kind == F_IMG ? 10 : 30, kind == F_PAGE ? MAX_PAGE : MAX_RESOURCE,
+                           method, url, hdrs, nh, body, body ? strlen(body) : 0);
+    free(packed);
+    if (r < 0) {
+        helper_close(b);                        /* it was gone: the next request starts another */
+        return -1;
+    }
+    f->via = 1;
+    f->id = id;
+    f->pid = 0;
+    f->out = f->err = -1;
+    return 0;
+}
+
 static int start_fetch(struct browser *b, int kind, const char *url, const char *post, int slot,
                        int redirects, int mode)
 {
@@ -675,6 +1036,9 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
         fetch_complete(b);
         return 0;
     }
+
+    if (!helper_disabled && (url_is_http(url) || url_is_https(url)) && start_via_helper(b, kind, url, post) == 0)
+        return 0;
 
     int out[2], err[2];
     if (pipe(out) < 0)
@@ -905,6 +1269,7 @@ static struct browser *new_frame(struct browser *parent, struct node *el)
     if (!f)
         return NULL;
     f->fetch.out = f->fetch.err = -1;
+    f->hp.to = f->hp.from = -1;
     f->parent = parent;
     f->frame_el = el;
     f->frame_depth = parent->frame_depth + 1;
@@ -1057,6 +1422,7 @@ static void relayout(struct browser *b)
     if (b->need_style) {
         arena_free(&b->sarena);
         css_viewport_h = v.h;
+        css_target_id = url_fragment(b->url);
         css_cascade(&b->sarena, b->root, b->sheets, b->nsheets, v.w, v.h, is_visited, b);
         b->need_style = 0;
     }
@@ -2032,6 +2398,12 @@ static void wget_error(struct fetch *f, char *out, int size)
 {
     char err[512];
     int n = 0, r;
+    if (f->via) {                       /* the fetcher's own words */
+        snprintf(out, (size_t)size, "%s", f->errmsg[0] ? f->errmsg : "the connection failed");
+        if (*out >= 'a' && *out <= 'z')
+            *out = (char)(*out - 'a' + 'A');
+        return;
+    }
     if (f->err >= 0)
         while (n < (int)sizeof(err) - 1 && (r = (int)read(f->err, err + n, sizeof(err) - 1 - (size_t)n)) > 0)
             n += r;
@@ -2678,6 +3050,10 @@ static void navigate(struct browser *b, const char *url, const char *post, int m
         set_addr(b, u);
         b->addr_focus = 0;
         snprintf(b->url, sizeof(b->url), "%s", u);
+        if (css_dynamic_rules) {                /* :target rules follow the fragment */
+            b->need_style = 1;
+            relayout(b);
+        }
         scroll_to_fragment(b, url_fragment(u));
         if (b->js && strcmp(old, u))
             jsdom_traverse(b->js, b->hist[b->hpos].id, old, u);
@@ -2762,6 +3138,7 @@ static void reload(struct browser *b)
     snprintf(u, sizeof(u), "%s", b->url);
     b->restore_scroll = b->scroll_y;
     b->url[0] = 0;                      /* not a fragment jump */
+    b->reload_next = 1;                 /* ask the server whether the cached page is still good */
     navigate(b, u, NULL, NAV_HISTORY);
 }
 
@@ -3022,7 +3399,9 @@ static void activate(struct browser *b, struct node *n)
         jsdom_dispatch(b->js, n, "input");
         jsdom_dispatch(b->js, n, "change");
     }
-    if (b->need_layout)
+    if (changed && css_dynamic_rules)   /* :checked, :valid and friends */
+        b->need_style = 1;
+    if (b->need_layout || b->need_style)
         relayout(b);
     paint(b);
 }
@@ -3032,8 +3411,14 @@ static struct node *element_at(struct browser *b, int x, int y)
 {
     for (int i = b->lo.nitems - 1; i >= 0; i--) {
         const struct ditem *d = &b->lo.items[i];
-        if (d->node && d->node->type == N_ELEMENT && x >= d->x && x < d->x + d->w && y >= d->y &&
-            y < d->y + d->h)
+        if (!d->node || d->node->type != N_ELEMENT)
+            continue;
+        int dx = 0, dy = 0;
+        if (d->dyn)                     /* fixed and sticky boxes are where scrolling has put them */
+            layout_dyn_offset(&b->lo, d->dyn, b->scroll_x, b->scroll_y, &dx, &dy);
+        if (d->node->style && d->node->style->pointer_none)
+            continue;                   /* pointer-events: none */
+        if (x >= d->x + dx && x < d->x + dx + d->w && y >= d->y + dy && y < d->y + dy + d->h)
             return d->node;
     }
     return NULL;
@@ -3131,6 +3516,8 @@ static void edit_field(struct browser *b, struct node *n, const struct input_eve
     n->value = v;
     n->cursor = cur;
     caret_on = 1;
+    if (css_dynamic_rules)              /* :valid, :invalid and :placeholder-shown depend on the text */
+        b->need_style = 1;
 }
 
 static void focus_next_control(struct browser *b, int dir)
@@ -3741,17 +4128,49 @@ static void js_pointer_moved(struct browser *b, struct node *under, int px, int 
     }
 }
 
+/* The pointer a page asks for over an element: its cursor property, or the usual one for what it is. */
+static enum cursor_kind page_cursor(const struct node *under, const struct node *link)
+{
+    int css = under && under->style ? under->style->cursor : CSSCUR_AUTO;
+    switch (css) {
+    case CSSCUR_DEFAULT: return CUR_ARROW;
+    case CSSCUR_POINTER: return CUR_HAND;
+    case CSSCUR_TEXT: return CUR_IBEAM;
+    case CSSCUR_WAIT: case CSSCUR_PROGRESS: return CUR_BUSY;
+    case CSSCUR_CROSSHAIR: return CUR_CROSS;
+    case CSSCUR_MOVE: return CUR_MOVE4;
+    case CSSCUR_HELP: return CUR_HELP;
+    case CSSCUR_NOT_ALLOWED: return CUR_NO;
+    case CSSCUR_NONE: return CUR_HIDDEN;
+    case CSSCUR_RESIZE_NS: return CUR_NS;
+    case CSSCUR_RESIZE_EW: return CUR_EW;
+    case CSSCUR_RESIZE_ALL: return CUR_NWSE;
+    default: break;
+    }
+    if (link)
+        return CUR_HAND;
+    if (under && (under->tag == T_TEXTAREA ||
+                  (under->tag == T_INPUT && is_text_field(under))))
+        return CUR_IBEAM;
+    return CUR_ARROW;
+}
+
 static void update_hover(struct browser *b, int x, int y)
 {
     struct rect v = view_rect(b);
     struct node *link = NULL;
     struct node *under = NULL;
+    struct browser *top = top_of(b);
+    enum cursor_kind ck = CUR_ARROW;
     if (b->root && rect_contains(v, x, y)) {
-        const struct hotspot *h = layout_hit(b->lo.links, b->lo.nlinks, x - v.x + b->scroll_x,
-                                             y - v.y + b->scroll_y);
+        const struct hotspot *h = layout_hit(&b->lo, b->lo.links, b->lo.nlinks, x - v.x + b->scroll_x,
+                                             y - v.y + b->scroll_y, b->scroll_x, b->scroll_y);
         link = h ? h->node : NULL;
         under = element_at(b, x - v.x + b->scroll_x, y - v.y + b->scroll_y);
+        ck = page_cursor(under, link);
     }
+    if (top->win)
+        wm_set_cursor(top->win, ck);
     if (b->js) {
         js_pointer_moved(b, under, x - v.x + b->scroll_x, y - v.y + b->scroll_y);
         if (!b->root || b->js_nav[0])
@@ -3790,7 +4209,8 @@ static void open_ctx(struct browser *b, int x, int y)
     } else if (rect_contains(view_rect(b), x, y) || is_frame(b)) {
         struct rect v = view_rect(b);
         const struct hotspot *h = b->root ?
-            layout_hit(b->lo.links, b->lo.nlinks, x - v.x + b->scroll_x, y - v.y + b->scroll_y) : NULL;
+            layout_hit(&b->lo, b->lo.links, b->lo.nlinks, x - v.x + b->scroll_x, y - v.y + b->scroll_y,
+                       b->scroll_x, b->scroll_y) : NULL;
         if (h && node_attr(h->node, "href")) {
             url_resolve(b->base, node_attr(h->node, "href"), t->ctx_url, sizeof(t->ctx_url));
             ctx_add(t, CB_OPENLINK);
@@ -3986,9 +4406,9 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             t->key_frame = is_frame(b) ? b : NULL;     /* the keys go where the click was */
             int was_addr = t->addr_focus;
             t->addr_focus = 0;
-            const struct hotspot *h = layout_hit(b->lo.controls, b->lo.ncontrols, px, py);
+            const struct hotspot *h = layout_hit(&b->lo, b->lo.controls, b->lo.ncontrols, px, py, b->scroll_x, b->scroll_y);
             b->press_ctrl = h ? h->node : NULL;
-            h = layout_hit(b->lo.links, b->lo.nlinks, px, py);
+            h = layout_hit(&b->lo, b->lo.links, b->lo.nlinks, px, py, b->scroll_x, b->scroll_y);
             b->press_link = h && !b->press_ctrl ? h->node : NULL;
             b->sel_start = !b->press_ctrl && !b->press_link;
             b->sel_ax = b->sel_fx = px;
@@ -4039,12 +4459,12 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
                 return;                 /* it was a drag: not a click */
             if (page_click(b, px, py))
                 return;
-            const struct hotspot *h = layout_hit(b->lo.controls, b->lo.ncontrols, px, py);
+            const struct hotspot *h = layout_hit(&b->lo, b->lo.controls, b->lo.ncontrols, px, py, b->scroll_x, b->scroll_y);
             if (b->press_ctrl && h && h->node == b->press_ctrl) {
                 activate(b, b->press_ctrl);
                 return;
             }
-            h = layout_hit(b->lo.links, b->lo.nlinks, px, py);
+            h = layout_hit(&b->lo, b->lo.links, b->lo.nlinks, px, py, b->scroll_x, b->scroll_y);
             if (b->press_link && h && h->node == b->press_link) {
                 follow_link(b, b->press_link);
                 return;
@@ -4147,6 +4567,7 @@ static void br_close(struct window *w)
 static void destroy_browser(struct browser *b)
 {
     stop_all(b);
+    helper_close(b);
     free_page(b);                       /* (its frames are dropped, to be freed by sweep_frames) */
     cache_clear(b);
     for (int i = 0; i < b->nhist; i++)
@@ -4264,7 +4685,12 @@ int browser_timeout(void)
 
 void browser_tick(void)
 {
+    cookie_flush();
+    jsdom_storage_flush();
     sweep_frames();
+    for (struct browser *b = browsers; b; b = b->next)
+        if (b->hp.pid > 0 && !b->fetch.active && now_ms() - b->hp.used > HELPER_IDLE_MS)
+            helper_close(b);            /* nothing asked of it for a while: its connections go */
     for (struct browser *b = browsers; b; b = b->next) {
         if (b->refresh_url[0] && !b->frame_dead && !b->loading && !b->fetch.active &&
             (int)(now_ms() - b->refresh_at) >= 0) {
@@ -4288,6 +4714,7 @@ struct window *browser_open(const char *url)
     if (!b)
         return NULL;
     b->fetch.out = b->fetch.err = -1;
+    b->hp.to = b->hp.from = -1;
     struct window *w = wm_create("Web Browser", ICON_BROWSER, BR_W, BR_H, WF_MINIMIZE | WF_MAXIMIZE | WF_RIGHTCLICK,
                                  &br_ops, b);
     if (!w) {

@@ -86,5 +86,7 @@ void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, i
                      const char *body, int blen);
 /* A node that the page's scripts have handlers on (clicks there matter). */
 int jsdom_has_handlers(struct jsdom *d);
+/* Write localStorage to disk if it changed (called now and then; at most every two seconds). */
+void jsdom_storage_flush(void);
 
 #endif

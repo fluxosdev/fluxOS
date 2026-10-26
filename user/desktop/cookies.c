@@ -1,16 +1,24 @@
 /*
  * The browser's cookie jar. Cookies come from Set-Cookie response headers
  * and from scripts (document.cookie), and go out on every request whose
- * host, path and scheme they match. The jar lives as long as the desktop
- * does (nothing is written to disk) and is shared by every browser window.
- * SameSite is not enforced: a cookie goes to any request it matches.
+ * host, path and scheme they match. The jar is shared by every browser
+ * window. Cookies with an expiry (Max-Age or Expires) are kept in
+ * COOKIE_FILE and read back the first time the jar is used; session
+ * cookies last until the desktop closes. SameSite is not enforced: a
+ * cookie goes to any request it matches.
  */
 #include <ctype.h>
+#include <fcntl.h>
+#include <flux.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 #include "web.h"
+
+#define COOKIE_FILE "/home/flux/.browser_cookies"
 
 #define MAX_COOKIES 300
 #define MAX_COOKIE_LEN 4096
@@ -25,6 +33,8 @@ struct cookie {
 
 static struct cookie jar[MAX_COOKIES];
 static int njar;
+static int loaded, dirty;               /* the file is read; a persistent cookie changed since it was written */
+static unsigned last_save;
 
 /* Pieces of an http(s) URL: the host (lower case), the path without a query, and whether it is https. */
 static int split_url(const char *url, char *host, int hsize, char *path, int psize, int *https)
@@ -151,6 +161,7 @@ static void drop_expired(void)
     long now = (long)time(NULL);
     for (int i = 0; i < njar;) {
         if (jar[i].expires && jar[i].expires <= now) {
+            dirty = 1;
             free_cookie(&jar[i]);
             jar[i] = jar[--njar];
             memset(&jar[njar], 0, sizeof(jar[njar]));
@@ -158,6 +169,97 @@ static void drop_expired(void)
             i++;
         }
     }
+}
+
+/* ---- the file: one cookie a line, fields separated by tabs ---- */
+
+static int plain(const char *s)
+{
+    return !strpbrk(s, "\t\r\n");
+}
+
+static void cookies_save(void)
+{
+    char tmp[sizeof(COOKIE_FILE) + 8];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", COOKIE_FILE);
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        return;
+    long now = (long)time(NULL);
+    for (int i = 0; i < njar; i++) {
+        const struct cookie *c = &jar[i];
+        if (!c->expires || c->expires <= now || !plain(c->domain) || !plain(c->path) || !plain(c->name) ||
+            !plain(c->value))
+            continue;                   /* session cookies are not kept */
+        fprintf(f, "%s\t%d\t%s\t%d\t%d\t%ld\t%s\t%s\n", c->domain, c->hostonly, c->path, c->secure,
+                c->httponly, c->expires, c->name, c->value);
+    }
+    int bad = ferror(f);
+    if (fclose(f) != 0 || bad || rename(tmp, COOKIE_FILE) < 0)
+        unlink(tmp);
+    dirty = 0;
+    last_save = uptime_ms();
+}
+
+static void cookies_load(void)
+{
+    loaded = 1;
+    int fd = open(COOKIE_FILE, O_RDONLY);
+    if (fd < 0)
+        return;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size <= 0 || st.st_size > (1 << 20)) {
+        close(fd);
+        return;
+    }
+    char *buf = malloc((size_t)st.st_size + 1);
+    int len = buf ? (int)read(fd, buf, (size_t)st.st_size) : 0;
+    close(fd);
+    if (len <= 0) {
+        free(buf);
+        return;
+    }
+    buf[len] = 0;
+    long now = (long)time(NULL);
+    for (char *line = buf; *line;) {
+        char *eol = strchr(line, '\n');
+        if (eol)
+            *eol = 0;
+        char *f[8];
+        int nf = 0;
+        f[nf++] = line;
+        for (char *p = line; *p && nf < 8; p++)
+            if (*p == '\t') {
+                *p = 0;
+                f[nf++] = p + 1;
+            }
+        if (nf == 8 && f[0][0] && f[2][0] == '/' && f[6][0] && atol(f[5]) > now && njar < MAX_COOKIES) {
+            struct cookie *c = &jar[njar];
+            c->domain = strdup(f[0]);
+            c->hostonly = (uint8_t)(atoi(f[1]) != 0);
+            c->path = strdup(f[2]);
+            c->secure = (uint8_t)(atoi(f[3]) != 0);
+            c->httponly = (uint8_t)(atoi(f[4]) != 0);
+            c->expires = atol(f[5]);
+            c->name = strdup(f[6]);
+            c->value = strdup(f[7]);
+            if (c->domain && c->path && c->name && c->value)
+                njar++;
+            else
+                free_cookie(c);
+        }
+        if (!eol)
+            break;
+        line = eol + 1;
+    }
+    free(buf);
+}
+
+/* Write the jar out if a cookie that outlasts the desktop changed (at most once a second). */
+void cookie_flush(void)
+{
+    if (dirty && (unsigned)(uptime_ms() - last_save) >= 1000)
+        cookies_save();
 }
 
 /*
@@ -168,6 +270,8 @@ void cookie_set(const char *url, const char *line, int from_script)
 {
     char host[256], path[1024];
     int https;
+    if (!loaded)
+        cookies_load();
     if (split_url(url, host, sizeof(host), path, sizeof(path), &https) < 0 || strlen(line) > MAX_COOKIE_LEN)
         return;
     char *copy = strdup(line);
@@ -278,6 +382,8 @@ void cookie_set(const char *url, const char *line, int from_script)
             free(copy);
             return;
         }
+        if (c->expires)
+            dirty = 1;                  /* a kept cookie is replaced or removed */
         free_cookie(c);
         jar[i] = jar[--njar];
         memset(&jar[njar], 0, sizeof(jar[njar]));
@@ -293,12 +399,16 @@ void cookie_set(const char *url, const char *line, int from_script)
         c->hostonly = (uint8_t)hostonly;
         c->secure = (uint8_t)secure;
         c->httponly = (uint8_t)httponly;
-        if (c->domain && c->path && c->name && c->value)
+        if (c->domain && c->path && c->name && c->value) {
             njar++;
-        else
+            if (expires)
+                dirty = 1;
+        } else {
             free_cookie(c);
+        }
     }
     free(copy);
+    cookie_flush();
 }
 
 /* Every Set-Cookie line in a response's header block. */
@@ -335,6 +445,8 @@ void cookie_header(const char *url, int scripts_only, char *out, int size)
     char host[256], path[1024];
     int https;
     out[0] = 0;
+    if (!loaded)
+        cookies_load();
     if (split_url(url, host, sizeof(host), path, sizeof(path), &https) < 0)
         return;
     drop_expired();

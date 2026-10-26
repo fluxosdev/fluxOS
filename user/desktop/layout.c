@@ -81,6 +81,8 @@ struct lctx {
     int marker_kind;            /* LS_* */
     int marker_x;               /* the list item's content box left */
     int marker_pending;
+    char inside_text[24];       /* list-style-position: inside: the marker, to start the item's text */
+    const struct style *inside_st;
     int last_baseline;          /* of the most recent line */
     struct node *skip_bg;       /* the element whose background became the canvas */
     struct node *contain;       /* a flex or grid item: its children's margins stay inside */
@@ -97,6 +99,7 @@ struct lctx {
 };
 
 static unsigned layout_gen;
+static int len_px(struct len l, int base);
 
 static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw, int force_bw,
                             int *mb, int *bg_slot);
@@ -155,7 +158,7 @@ static void add_hotspot(struct lctx *c, struct hotspot **arr, int *n, int *cap, 
     if (!na)
         return;
     *arr = na;
-    (*arr)[(*n)++] = (struct hotspot){ x, y, w, h, node };
+    (*arr)[(*n)++] = (struct hotspot){ x, y, w, h, node, 0 };
 }
 
 static void add_anchor(struct lctx *c, const char *name, int y)
@@ -186,17 +189,142 @@ static struct mark mark_now(struct lctx *c)
     return (struct mark){ lo->nitems, lo->nlinks, lo->ncontrols, lo->nanchors };
 }
 
+/* Does dyn (1 + an index into lo->dyn) belong to a fixed box, or to one inside a fixed box? */
+static int under_fixed(const struct layout *lo, int dyn)
+{
+    for (int k = dyn, depth = 0; k && depth < 16; k = lo->dyn[k - 1].parent, depth++)
+        if (lo->dyn[k - 1].fixed)
+            return 1;
+    return 0;
+}
+
 static void shift(struct lctx *c, struct mark from, struct mark to, int dx, int dy)
 {
     struct layout *lo = c->lo;
     for (int i = from.items; i < to.items; i++)
-        lo->items[i].x += dx, lo->items[i].y += dy;
+        if (!lo->items[i].dyn || !under_fixed(lo, lo->items[i].dyn))     /* fixed ones stay on the screen */
+            lo->items[i].x += dx, lo->items[i].y += dy;
     for (int i = from.links; i < to.links; i++)
-        lo->links[i].x += dx, lo->links[i].y += dy;
+        if (!lo->links[i].dyn || !under_fixed(lo, lo->links[i].dyn))
+            lo->links[i].x += dx, lo->links[i].y += dy;
     for (int i = from.controls; i < to.controls; i++)
-        lo->controls[i].x += dx, lo->controls[i].y += dy;
+        if (!lo->controls[i].dyn || !under_fixed(lo, lo->controls[i].dyn))
+            lo->controls[i].x += dx, lo->controls[i].y += dy;
     for (int i = from.anchors; i < to.anchors; i++)
         lo->anchors[i].y += dy;
+    for (int k = 0; k < lo->ndyn; k++) {        /* sticky boxes and their containers move with their items */
+        struct dynbox *d = &lo->dyn[k];
+        if (d->fixed || d->i0 < from.items || d->i1 > to.items)
+            continue;
+        d->x += dx, d->y += dy;
+        if (d->cy1 != DYN_NONE)
+            d->cx0 += dx, d->cx1 += dx, d->cy0 += dy, d->cy1 += dy;
+    }
+}
+
+/* A box that moves as the page scrolls: it owns the items, links and controls laid out since m0. */
+static void dyn_register(struct lctx *c, struct mark m0, int fixed, int x, int y, int w, int h,
+                         const struct style *st, struct node *container)
+{
+    struct layout *lo = c->lo;
+    if (lo->ndyn >= MAX_DYNBOX || !lo->dyn)
+        return;
+    int idx = lo->ndyn++;
+    struct dynbox *d = &lo->dyn[idx];
+    memset(d, 0, sizeof(*d));
+    d->fixed = (uint8_t)fixed;
+    d->x = x, d->y = y, d->w = w, d->h = h;
+    d->top = st->top.unit == U_AUTO ? DYN_NONE : len_px(st->top, c->vh);
+    d->bottom = st->bottom.unit == U_AUTO ? DYN_NONE : len_px(st->bottom, c->vh);
+    d->left = st->left.unit == U_AUTO ? DYN_NONE : len_px(st->left, c->vw);
+    d->right = st->right.unit == U_AUTO ? DYN_NONE : len_px(st->right, c->vw);
+    d->cy0 = d->cy1 = d->cx0 = d->cx1 = DYN_NONE;
+    d->container = fixed ? NULL : container;
+    d->i0 = m0.items;
+    d->i1 = lo->nitems;
+    /* Whatever is not in an inner moving box yet moves with this one; inner ones are now inside it. */
+    for (int i = m0.items; i < lo->nitems; i++) {
+        struct ditem *it = &lo->items[i];
+        if (!it->dyn) {
+            it->dyn = (uint8_t)(idx + 1);
+            continue;
+        }
+        int k = it->dyn - 1, depth = 0;
+        while (lo->dyn[k].parent && depth++ < 16)
+            k = lo->dyn[k].parent - 1;
+        if (k != idx)
+            lo->dyn[k].parent = (uint8_t)(idx + 1);
+    }
+    struct hotspot *arrs[2] = { lo->links, lo->controls };
+    int from[2] = { m0.links, m0.controls }, to[2] = { lo->nlinks, lo->ncontrols };
+    for (int a = 0; a < 2; a++)
+        for (int i = from[a]; i < to[a]; i++) {
+            struct hotspot *h2 = &arrs[a][i];
+            if (!h2->dyn) {
+                h2->dyn = (uint8_t)(idx + 1);
+                continue;
+            }
+            int k = h2->dyn - 1, depth = 0;
+            while (lo->dyn[k].parent && depth++ < 16)
+                k = lo->dyn[k].parent - 1;
+            if (k != idx)
+                lo->dyn[k].parent = (uint8_t)(idx + 1);
+        }
+}
+
+/* A block box is done: the sticky boxes inside it (first_dyn on) stay within its content area. */
+static void dyn_set_container(struct lctx *c, int first_dyn, struct node *n, int x0, int y0, int x1, int y1)
+{
+    struct layout *lo = c->lo;
+    for (int k = first_dyn; k < lo->ndyn; k++)
+        if (!lo->dyn[k].fixed && lo->dyn[k].container == n && lo->dyn[k].cy1 == DYN_NONE) {
+            lo->dyn[k].cx0 = x0, lo->dyn[k].cx1 = x1, lo->dyn[k].cy0 = y0, lo->dyn[k].cy1 = y1;
+        }
+}
+
+void layout_dyn_offset(const struct layout *lo, int dyn, int sx, int sy, int *dx, int *dy)
+{
+    int chain[16], n = 0;
+    for (int k = dyn; k && n < 16; k = lo->dyn[k - 1].parent)
+        chain[n++] = k - 1;
+    int ox = 0, oy = 0;
+    for (int i = n - 1; i >= 0; i--) {              /* outermost first: what moved it is added in */
+        const struct dynbox *d = &lo->dyn[chain[i]];
+        if (d->fixed) {
+            ox += sx;
+            oy += sy;
+            continue;
+        }
+        /* Sticky: kept inside the window's edges (inset by the offsets), then inside its container. */
+        int vy = d->y + oy - sy, vx = d->x + ox - sx, ny = vy, nx = vx;
+        if (d->bottom != DYN_NONE && lo->vh > 0 && ny + d->h > lo->vh - d->bottom)
+            ny = lo->vh - d->bottom - d->h;
+        if (d->top != DYN_NONE && ny < d->top)
+            ny = d->top;
+        if (d->right != DYN_NONE && lo->vw > 0 && nx + d->w > lo->vw - d->right)
+            nx = lo->vw - d->right - d->w;
+        if (d->left != DYN_NONE && nx < d->left)
+            nx = d->left;
+        int py = ny + sy, px = nx + sx;                 /* in page coordinates */
+        if (d->cy1 != DYN_NONE) {
+            if (py + d->h > d->cy1 + oy)
+                py = d->cy1 + oy - d->h;
+            if (py < d->cy0 + oy)
+                py = d->cy0 + oy;
+            if (px + d->w > d->cx1 + ox)
+                px = d->cx1 + ox - d->w;
+            if (px < d->cx0 + ox)
+                px = d->cx0 + ox;
+        }
+        if (py < d->y + oy && d->top != DYN_NONE && d->bottom == DYN_NONE)
+            py = d->y + oy;                             /* top-sticky boxes never rise above their place */
+        if (px < d->x + ox && d->left != DYN_NONE && d->right == DYN_NONE)
+            px = d->x + ox;
+        oy += py - (d->y + oy);
+        ox += px - (d->x + ox);
+    }
+    *dx = ox;
+    *dy = oy;
 }
 
 /* ---- colors and borders ---- */
@@ -282,7 +410,42 @@ static void borders(struct lctx *c, const struct style *st, int x, int y, int w,
  * borders: as a ring round the background when the corners are rounded
  * and the border is the same all round.
  */
+static void finish_box_inner(struct lctx *c, struct node *n, int slot, int x, int y, int w, int h);
+
+/* outline: four strips outside the border box (further out by outline-offset); it takes no room. */
+static void outline_box(struct lctx *c, const struct style *st, int x, int y, int w, int h)
+{
+    int t = st->outline_w;
+    if (!t || st->outline_style == BS_NONE || st->hidden || w <= 0 || h <= 0)
+        return;
+    int o = st->outline_offset;
+    x -= o + t, y -= o + t, w += 2 * (o + t), h += 2 * (o + t);
+    if (w <= 2 * t || h <= 2 * t)
+        return;
+    uint32_t col = st->outline_color;
+    int bs = st->outline_style;
+    int dash = bs == BS_DOTTED ? 1 : bs == BS_DASHED ? 2 : 0;
+    if (bs == BS_DOUBLE && t >= 3) {
+        int th = t / 3 > 0 ? t / 3 : 1;
+        fill(c, x, y, w, th, col, 0), fill(c, x, y + h - th, w, th, col, 0);
+        fill(c, x, y + th, th, h - 2 * th, col, 0), fill(c, x + w - th, y + th, th, h - 2 * th, col, 0);
+        x += t - th, y += t - th, w -= 2 * (t - th), h -= 2 * (t - th);
+        t = th;
+    }
+    fill(c, x, y, w, t, col, dash);
+    fill(c, x, y + h - t, w, t, col, dash);
+    fill(c, x, y + t, t, h - 2 * t, col, dash);
+    fill(c, x + w - t, y + t, t, h - 2 * t, col, dash);
+}
+
 static void finish_box(struct lctx *c, struct node *n, int slot, int x, int y, int w, int h)
+{
+    finish_box_inner(c, n, slot, x, y, w, h);
+    if (n->style->outline_w)
+        outline_box(c, n->style, x, y, w, h);
+}
+
+static void finish_box_inner(struct lctx *c, struct node *n, int slot, int x, int y, int w, int h)
 {
     const struct style *st = n->style;
     if (slot < 0) {
@@ -431,7 +594,7 @@ static int is_block_level(int d)
 static int is_replaced(const struct node *n)
 {
     return n->tag == T_IMG || n->tag == T_INPUT || n->tag == T_SELECT || n->tag == T_TEXTAREA ||
-           n->tag == T_IFRAME || n->tag == T_SVG;
+           n->tag == T_IFRAME || n->tag == T_SVG || n->tag == T_PROGRESS || n->tag == T_METER;
 }
 
 /* ---- list markers ---- */
@@ -475,9 +638,10 @@ static void start_marker(struct lctx *c, struct node *li, int content_x)
 {
     const struct style *st = li->style;
     c->marker_pending = 0;
+    c->inside_text[0] = 0;
     if (st->list_style == LS_NONE || st->hidden)
         return;
-    c->marker_st = st;
+    c->marker_st = li->pseudo_st[PE_MARKER - 1] ? li->pseudo_st[PE_MARKER - 1] : st;
     c->marker_kind = st->list_style;
     c->marker_x = content_x;
     c->marker_text[0] = 0;
@@ -498,6 +662,14 @@ static void start_marker(struct lctx *c, struct node *li, int content_x)
         break;
     default:
         break;
+    }
+    if (st->list_inside) {              /* the marker is the first thing on the first line */
+        const char *glyph = c->marker_text[0] ? c->marker_text
+                          : st->list_style == LS_CIRCLE ? "o" : st->list_style == LS_SQUARE ? "-"
+                          : "\xE2\x80\xA2";
+        snprintf(c->inside_text, sizeof(c->inside_text), "%s ", glyph);
+        c->inside_st = c->marker_st;
+        return;
     }
     c->marker_pending = 1;
 }
@@ -557,9 +729,27 @@ static struct item *push_item(struct flow *f, int kind, const struct style *st)
     return it;
 }
 
+/* UTF-8 characters in s[0..n). */
+static int utf8_count(const char *s, int n)
+{
+    int k = 0;
+    for (int i = 0; i < n; i++)
+        k += ((unsigned char)s[i] & 0xC0) != 0x80;
+    return k;
+}
+
+/* Text width with letter-spacing, which goes after every character. */
+static int text_width(const struct style *st, const char *s, int n)
+{
+    int w = wfont_width(st->font, s, n);
+    if (st->letter_spacing)
+        w += utf8_count(s, n) * st->letter_spacing;
+    return w;
+}
+
 static int space_width(const struct style *st)
 {
-    return wfont_width(st->font, " ", 1);
+    return wfont_width(st->font, " ", 1) + st->letter_spacing + st->word_spacing;
 }
 
 static int wraps(const struct style *st)
@@ -586,6 +776,77 @@ static const char *transform(struct lctx *c, const struct style *st, const char 
         }
     }
     return t;
+}
+
+static void push_word(struct lctx *c, struct flow *f, const struct style *st, struct node *parent,
+                      const char *text, int len, int word_start)
+{
+    struct item *it = push_item(f, I_WORD, st);
+    if (!it)
+        return;
+    it->text = transform(c, st, text, len, word_start);
+    it->len = len;
+    it->w = text_width(st, it->text, len);
+    it->node = parent;
+}
+
+/* A break opportunity that takes no room (like <wbr>). */
+static void push_break_opportunity(struct flow *f, const struct style *st)
+{
+    struct item *it = push_item(f, I_SPACE, st);
+    if (it) {
+        it->wrap = 1;
+        it->invisible = 1;
+    }
+}
+
+/* A word, as one item; or in pieces for small capitals (lower case letters become smaller upper
+ * case ones) and word-break: break-all (a chance to break after every character). */
+static void emit_word(struct lctx *c, struct flow *f, const struct style *st, struct node *parent,
+                      const char *text, int len, int word_start)
+{
+    if (!st->small_caps && st->word_break != WB_BREAK_ALL) {
+        push_word(c, f, st, parent, text, len, word_start);
+        return;
+    }
+    struct style *small = NULL;
+    const char *p = text, *end = text + len;
+    while (p < end) {
+        const char *q = p;
+        int lower = st->small_caps && *p >= 'a' && *p <= 'z';
+        if (st->word_break == WB_BREAK_ALL) {
+            q++;
+            while (q < end && ((unsigned char)*q & 0xC0) == 0x80)
+                q++;
+        } else {
+            while (q < end && (st->small_caps && *q >= 'a' && *q <= 'z') == lower)
+                q++;
+        }
+        if (lower) {
+            if (!small && (small = arena_alloc(c->a, sizeof(*small)))) {
+                *small = *st;
+                small->font_size = st->font_size * 8 / 10 > 1 ? st->font_size * 8 / 10 : 1;
+                small->font = wfont_get(st->family, st->bold, st->italic, small->font_size);
+                small->text_transform = TT_NONE;
+                small->small_caps = 0;
+                if (!small->font)
+                    small = NULL;
+            }
+            char *up = small ? arena_strndup(c->a, p, (size_t)(q - p)) : NULL;
+            if (up) {
+                for (char *u = up; *u; u++)
+                    *u = (char)(*u - 32);
+                push_word(c, f, small, parent, up, (int)(q - p), 0);
+            } else {
+                push_word(c, f, st, parent, p, (int)(q - p), 0);
+            }
+        } else {
+            push_word(c, f, st, parent, p, (int)(q - p), word_start && p == text);
+        }
+        if (st->word_break == WB_BREAK_ALL && q < end)
+            push_break_opportunity(f, st);
+        p = q;
+    }
 }
 
 /* Text in st, from a text node (or generated content) inside `parent`. */
@@ -650,13 +911,7 @@ static void add_text(struct lctx *c, struct flow *f, const char *text, int tlen,
         while (s < end && *s != ' ' && *s != '\t' && *s != '\n' && *s != '\r' && *s != '\f')
             s++;
         int len = (int)(s - w0);
-        struct item *it = push_item(f, I_WORD, st);
-        if (it) {
-            it->text = transform(c, st, w0, len, w0 == text || f->space_before);
-            it->len = len;
-            it->w = wfont_width(st->font, it->text, len);
-            it->node = parent;
-        }
+        emit_word(c, f, st, parent, w0, len, w0 == text || f->space_before);
         col += len;
         f->space_before = 0;
     }
@@ -806,6 +1061,12 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
         }
         if (h < 0)
             h = fh + 6;
+    } else if (n->tag == T_PROGRESS || n->tag == T_METER) {     /* a gauge, drawn by draw_control */
+        ctrl = 0;
+        if (w < 0)
+            w = n->tag == T_PROGRESS ? 160 : 80;
+        if (h < 0)
+            h = 16;
     } else if (n->tag == T_IFRAME) {    /* its page is drawn by the browser */
         ctrl = 0;
         kind = DK_IFRAME;
@@ -837,6 +1098,7 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
     if (n->tag == T_IMG || n->tag == T_SVG)
         fill(c, bx + b.bl, by + b.bt, b.pl + w + b.pr, b.pt + h + b.pb, st->bg, 0);
     borders(c, st, bx, by, bw, bh);
+    outline_box(c, st, bx, by, bw, bh);
     if (w <= 0 || h <= 0)
         return;
     if (n->tag == T_SVG) {
@@ -1071,6 +1333,119 @@ static void open_box_rect(struct lctx *c, const struct style *st, int x0, int x1
         borders(c, st, x0, top, x1 - x0, bottom - top);
 }
 
+/*
+ * text-overflow: ellipsis. A line of a clipping box that is wider than the box ends in "..." where
+ * the room runs out: the word that crosses the limit is cut, and what follows is dropped. Lines
+ * with a picture or an inline-block at or after that place are left alone (their boxes are
+ * already laid out). Returns the new end of the line.
+ */
+static int ellipsize_line(struct lctx *c, struct flow *f, int from, int to, int avail)
+{
+    struct item *items = f->items;
+    const struct style *cs = f->st;
+    int dots = text_width(cs, "...", 3), limit = avail - dots, x = 0, k = from;
+    if (limit < 0)
+        limit = 0;
+    while (k < to && x + items[k].w <= limit)
+        x += items[k++].w;
+    for (int i = k; i < to; i++)
+        if (items[i].kind == I_ATOMIC)
+            return to;
+    if (k >= to)
+        return to;
+    struct item *it = &items[k];
+    if (it->kind == I_WORD) {
+        int keep = 0, w = 0;
+        while (keep < it->len) {
+            int e = keep + 1;
+            while (e < it->len && ((unsigned char)it->text[e] & 0xC0) == 0x80)
+                e++;
+            int cw = text_width(it->st, it->text + keep, e - keep);
+            if (x + w + cw > limit)
+                break;
+            w += cw;
+            keep = e;
+        }
+        char *cut = arena_alloc(c->a, (size_t)keep + 4);
+        if (!cut)
+            return to;
+        memcpy(cut, it->text, (size_t)keep);
+        memcpy(cut + keep, "...", 4);
+        it->text = cut;
+        it->len = keep + 3;
+        it->w = text_width(it->st, cut, it->len);
+    } else {
+        it->kind = I_WORD;
+        it->text = "...";
+        it->len = 3;
+        it->w = text_width(it->st, "...", 3);
+        it->invisible = 0;
+        it->wrap = 0;
+    }
+    return k + 1;
+}
+
+/*
+ * word-break: break-word and overflow-wrap: a word wider than a whole line goes in pieces of at most
+ * that width, with a chance to break between them.
+ */
+static void split_long_words(struct flow *f, int avail)
+{
+    int extra = 0;
+    for (int i = 0; i < f->n; i++)
+        if (f->items[i].kind == I_WORD && f->items[i].st->word_break == WB_BREAK_WORD &&
+            f->items[i].w > avail && avail > 0)
+            extra += f->items[i].len * 2;
+    if (!extra)
+        return;
+    struct item *out = malloc(sizeof(struct item) * (size_t)(f->n + extra));
+    if (!out)
+        return;
+    int n = 0;
+    for (int i = 0; i < f->n; i++) {
+        const struct item *it = &f->items[i];
+        if (!(it->kind == I_WORD && it->st->word_break == WB_BREAK_WORD && it->w > avail && avail > 0)) {
+            out[n++] = *it;
+            continue;
+        }
+        int start = 0, w = 0, pos = 0;
+        while (pos < it->len) {
+            int e = pos + 1;
+            while (e < it->len && ((unsigned char)it->text[e] & 0xC0) == 0x80)
+                e++;
+            int cw = text_width(it->st, it->text + pos, e - pos);
+            if (w + cw > avail && pos > start) {
+                out[n] = *it;
+                out[n].text = it->text + start;
+                out[n].len = pos - start;
+                out[n].w = w;
+                n++;
+                out[n] = *it;
+                out[n].kind = I_SPACE;
+                out[n].wrap = 1;
+                out[n].invisible = 1;
+                out[n].w = 0;
+                out[n].text = NULL;
+                out[n].len = 0;
+                n++;
+                start = pos;
+                w = 0;
+            }
+            w += cw;
+            pos = e;
+        }
+        out[n] = *it;
+        out[n].text = it->text + start;
+        out[n].len = it->len - start;
+        out[n].w = w;
+        n++;
+    }
+    free(f->items);
+    f->items = out;
+    f->n = n;
+    f->cap = n + extra;
+}
+
 static void place_line(struct lctx *c, struct flow *f, int from, int to)
 {
     struct item *items = f->items;
@@ -1079,6 +1454,12 @@ static void place_line(struct lctx *c, struct flow *f, int from, int to)
     int lw = 0;
     for (int i = from; i < to; i++)
         lw += items[i].w;
+    if (f->st->text_ellipsis && f->st->clips && lw > avail && avail > 0) {
+        to = ellipsize_line(c, f, from, to, avail);
+        lw = 0;
+        for (int i = from; i < to; i++)
+            lw += items[i].w;
+    }
 
     /* Vertical extent: the container's strut, then every item. */
     const struct style *cs = f->st;
@@ -1165,6 +1546,14 @@ static void place_line(struct lctx *c, struct flow *f, int from, int to)
                     d->len = it->kind == I_WORD ? it->len : 1;
                     d->color = st->color;
                     d->deco = st->decoration;
+                    d->ls = (int8_t)st->letter_spacing;
+                    if (st->ts_color) {
+                        d->sh_color = st->ts_color;
+                        d->sh_x = (int8_t)st->ts_x, d->sh_y = (int8_t)st->ts_y;
+                        d->sh_blur = (int8_t)st->ts_blur;
+                    }
+                    d->deco_color = st->deco_color;
+                    d->deco_style = st->deco_style;
                     d->node = it->node;         /* the element the text is in: for clicks */
                     if (it->kind == I_SPACE && it->w > d->w)
                         d->w = it->w;
@@ -1250,6 +1639,7 @@ static void flush_run(struct lctx *c, struct flow *f)
         f->cy += f->pm;
         f->pm = 0;
     }
+    split_long_words(f, f->w - (f->lines == 0 ? f->st->text_indent : 0));
     struct item *items = f->items;
     int n = f->n, i = 0;
     int ox = f->x, ow = f->w;           /* the container; a line beside floats is narrower */
@@ -1487,6 +1877,10 @@ static int block_content(struct lctx *c, struct node *n, int x, int y, int w, in
     f.st = st;
     f.space_before = 1;
     f.link = enclosing_link(n);
+    if (c->inside_text[0] && n->style->display == D_LIST_ITEM && c->inside_st) {
+        add_text(c, &f, c->inside_text, (int)strlen(c->inside_text), c->inside_st, n);
+        c->inside_text[0] = 0;
+    }
     add_pseudo(c, &f, n, 0);
     flow_children(c, &f, n);
     add_pseudo(c, &f, n, 1);
@@ -1539,6 +1933,8 @@ static void layout_abs(struct lctx *c, const struct pend *p, int cbx, int cby, i
     shift(c, m0, mark_now(c), x, y);
     if (st->z_set && st->z_index != 0 && c->nzr < (int)(sizeof(c->zr) / sizeof(c->zr[0])))
         c->zr[c->nzr++] = (struct zrange){ m0.items, c->lo->nitems, st->z_index };
+    if (st->position == POS_FIXED)      /* it stays where it is in the window as the page scrolls */
+        dyn_register(c, m0, 1, x, y, ow, oh, st, NULL);
 }
 
 /*
@@ -1560,6 +1956,7 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
         b.ml = (cw - bw) / 2 > 0 ? (cw - bw) / 2 : 0;
     int bx = x + b.ml;
     struct mark m_start = mark_now(c);
+    int first_dyn = c->lo->ndyn;
     /* Positioned boxes (and boxes that will be moved as a whole) place absolute descendants;
      * boxes that start a formatting context keep their floats to themselves. */
     int is_cb = st->position != POS_STATIC || c->force_container || bg_slot || n == c->contain || !n->parent;
@@ -1596,6 +1993,7 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
     if (st->min_height.unit == U_PX)
         minh = st->min_height.v - vt > 0 ? st->min_height.v - vt : 0;
     int ch = block_content(c, n, cx, cy, b.w, defh, minh, &pm);
+    c->inside_text[0] = 0;
     if (c->marker_pending && st->display == D_LIST_ITEM)
         place_marker(c, cy + wfont_ascent(st->font));
     if (bfc) {                          /* a formatting context contains its floats */
@@ -1688,6 +2086,14 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
         if (dx || dy)
             shift(c, m_start, mark_now(c), dx, dy);
     }
+    /* Sticky boxes inside this one stay within its content area; this one may be sticky too. */
+    if (c->lo->ndyn > first_dyn)
+        dyn_set_container(c, first_dyn, n, bx + b.bl + b.pl, y + b.bt + b.pt,
+                          bx + bw - b.br - b.pr, y + bh - b.bb - b.pb);
+    if (st->position == POS_STICKY && !bg_slot && n->parent &&
+        (st->top.unit != U_AUTO || st->bottom.unit != U_AUTO || st->left.unit != U_AUTO ||
+         st->right.unit != U_AUTO))
+        dyn_register(c, m_start, 0, bx, y, bw, bh, st, n->parent);
     return bh;
 }
 
@@ -2812,6 +3218,59 @@ static int is_cell(const struct node *n)
     return n->type == N_ELEMENT && n->style && n->style->display == D_TABLE_CELL;
 }
 
+/* A cell with nothing in it: no elements and no text but white space (empty-cells: hide). */
+static int cell_is_empty(const struct node *cell)
+{
+    for (const struct node *k = cell->first; k; k = k->next) {
+        if (k->type == N_ELEMENT)
+            return 0;
+        for (int i = 0; i < k->len; i++)
+            if (k->text[i] != ' ' && k->text[i] != '\t' && k->text[i] != '\n' && k->text[i] != '\r' &&
+                k->text[i] != '\f')
+                return 0;
+    }
+    return 1;
+}
+
+/*
+ * table-layout: fixed (with a width): the columns take the widths of the first row's cells, the
+ * rest share what is left, whatever the content; with room to spare every column grows alike.
+ */
+static void fixed_columns(const struct tcell *cells, int ncells, int ncols, int total, int *colw)
+{
+    int known = 0, unknown = 0;
+    for (int k = 0; k < ncols; k++)
+        colw[k] = -1;
+    for (int i = 0; i < ncells; i++) {
+        const struct tcell *t = &cells[i];
+        if (t->row != 0 || t->colspan != 1 || colw[t->col] >= 0)
+            continue;
+        const struct style *cst = t->n->style;
+        int edges = cst->box_sizing_border ? 0
+                  : cst->border_w[1] + cst->border_w[3] + len_px(cst->padding[1], 0) + len_px(cst->padding[3], 0);
+        if (cst->width.unit == U_PX)
+            colw[t->col] = cst->width.v + edges;
+        else if (cst->width.unit == U_PCT)
+            colw[t->col] = muldiv(total, cst->width.v, 10000);
+    }
+    for (int k = 0; k < ncols; k++) {
+        if (colw[k] >= 0)
+            known += colw[k];
+        else
+            unknown++;
+    }
+    int rest = total - known;
+    for (int k = 0; k < ncols; k++)
+        if (colw[k] < 0)
+            colw[k] = unknown && rest > 0 ? rest / unknown : 0;
+    int sum = 0;
+    for (int k = 0; k < ncols; k++)
+        sum += colw[k];
+    if (sum < total && ncols)
+        for (int k = 0, extra = total - sum; k < ncols; k++)
+            colw[k] += extra / ncols + (k < extra % ncols);
+}
+
 /* Gather the rows of a table: rows of row groups, rows, and cells loose in
  * the table (which form rows of their own). Returns the number of cells. */
 static int table_cells(struct node *table, struct tcell **out, int *nrows_out, struct node ***rows_out,
@@ -3087,9 +3546,13 @@ static int layout_table(struct lctx *c, struct node *n, int x, int y, int cw, in
     } else {
         content = sum_max < avail - edges ? sum_max : avail - edges;
     }
-    if (content < sum_min)
+    int fixed_layout = st->table_fixed && st->width.unit != U_AUTO && ncols;
+    if (content < sum_min && !fixed_layout)      /* a fixed table ignores what its content needs */
         content = sum_min;
-    distribute(colw, colmin, colmax, colpct, ncols, content - s * (ncols + 1), stretch);
+    if (fixed_layout)
+        fixed_columns(cells, ncells, ncols, content - s * (ncols + 1), colw);
+    else
+        distribute(colw, colmin, colmax, colpct, ncols, content - s * (ncols + 1), stretch);
     int used = s * (ncols + 1);
     for (int k = 0; k < ncols; k++)
         used += colw[k];
@@ -3113,6 +3576,8 @@ static int layout_table(struct lctx *c, struct node *n, int x, int y, int cw, in
     int cy = y + b.bt + b.pt;
     for (int i = 0; i < ncaps; i++) {
         int cmb;
+        if (caps[i]->style->caption_bottom)
+            continue;                   /* after the rows */
         cy += layout_block_box(c, caps[i], cx, cy, content, -1, &cmb, NULL) + cmb;
     }
     int rows_top = cy;
@@ -3171,6 +3636,11 @@ static int layout_table(struct lctx *c, struct node *n, int x, int y, int cw, in
                     from.items++;               /* the background stays where the cell is */
                 shift(c, from, t->m1, 0, dy);
             }
+            if (t->n->style->empty_hide && s > 0 && cell_is_empty(t->n)) {
+                if (t->slot >= 0)
+                    c->lo->items[t->slot].h = 0, c->lo->items[t->slot].color = TRANSPARENT;
+                continue;               /* empty-cells: hide: no background and no border */
+            }
             if (t->slot >= 0)
                 c->lo->items[t->slot].h = c->lo->items[t->slot].h ? full : 0;
             borders(c, t->n->style, t->x, t->y, t->w, full);
@@ -3183,6 +3653,11 @@ static int layout_table(struct lctx *c, struct node *n, int x, int y, int cw, in
     }
     if (!nrows)
         cy = rows_top;
+    for (int i = 0; i < ncaps; i++) {
+        int cmb;
+        if (caps[i]->style->caption_bottom)
+            cy += layout_block_box(c, caps[i], cx, cy, content, -1, &cmb, NULL) + cmb;
+    }
     int bh = cy - y + b.pb + b.bb;
     if (st->height.unit == U_PX && st->height.v > bh)
         bh = st->height.v;
@@ -3193,6 +3668,7 @@ static int layout_table(struct lctx *c, struct node *n, int x, int y, int cw, in
         d->color = st->bg;
     }
     borders(c, st, bx, y, bw, bh);
+    outline_box(c, st, bx, y, bw, bh);
     free(row_slot);
     free(colmin), free(cells), free(rows), free(caps);
     return bh;
@@ -3253,6 +3729,9 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
     if (!root || !root->style)
         return;
     struct lctx c = { .a = a, .lo = lo, .vw = vw, .vh = vh, .gen = ++layout_gen };
+    lo->vw = vw;
+    lo->vh = vh;
+    lo->dyn = arena_alloc(a, sizeof(struct dynbox) * MAX_DYNBOX);
     /* The root's background, or else the body's, covers the whole canvas. */
     struct node *body = NULL;
     for (struct node *k = root->first; k; k = k->next)
@@ -3274,6 +3753,8 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
     apply_z_order(&c);
     for (int i = 0; i < lo->nitems; i++) {
         const struct ditem *d = &lo->items[i];
+        if (d->dyn && under_fixed(lo, d->dyn))      /* a fixed box is in the window, not in the page */
+            continue;
         if (d->w > 0 && d->x + d->w > lo->width && d->x < BIG)
             lo->width = d->x + d->w;
         if (d->h > 0 && d->y + d->h > lo->height && d->y < BIG)
@@ -3281,11 +3762,18 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
     }
 }
 
-const struct hotspot *layout_hit(const struct hotspot *h, int n, int x, int y)
+const struct hotspot *layout_hit(const struct layout *lo, const struct hotspot *h, int n, int x, int y,
+                                 int sx, int sy)
 {
-    for (int i = n - 1; i >= 0; i--)
-        if (x >= h[i].x && x < h[i].x + h[i].w && y >= h[i].y && y < h[i].y + h[i].h)
+    for (int i = n - 1; i >= 0; i--) {
+        int dx = 0, dy = 0;
+        if (h[i].dyn)
+            layout_dyn_offset(lo, h[i].dyn, sx, sy, &dx, &dy);
+        if (h[i].node && h[i].node->style && h[i].node->style->pointer_none)
+            continue;                   /* pointer-events: none */
+        if (x >= h[i].x + dx && x < h[i].x + dx + h[i].w && y >= h[i].y + dy && y < h[i].y + dy + h[i].h)
             return &h[i];
+    }
     return NULL;
 }
 
@@ -3518,6 +4006,72 @@ static void draw_text_clipped(struct surface *s, const struct wfont *f, struct r
     s->clip = saved;
 }
 
+/* An attribute's number times 1000 ("0.75" is 750), or def. */
+static int milli_attr(const struct node *n, const char *name, int def)
+{
+    const char *v = node_attr(n, name);
+    if (!v)
+        return def;
+    while (*v == ' ')
+        v++;
+    int neg = *v == '-', whole = 0, frac = 0, scale = 100;
+    if (*v == '-' || *v == '+')
+        v++;
+    if (!(*v >= '0' && *v <= '9') && *v != '.')
+        return def;
+    while (*v >= '0' && *v <= '9')
+        whole = whole * 10 + (*v++ - '0');
+    if (*v == '.')
+        for (v++; *v >= '0' && *v <= '9'; v++, scale /= 10)
+            frac += (*v - '0') * scale;
+    int r = whole * 1000 + frac;
+    return neg ? -r : r;
+}
+
+/* <progress> and <meter>: a sunken trough with a bar. */
+static void draw_gauge(struct surface *s, const struct ditem *d, int x, int y)
+{
+    const struct node *n = d->node;
+    struct rect r = mkrect(x, y, d->w, d->h);
+    gfx_fill(s, x, y, d->w, d->h, C_WHITE);
+    gfx_bevel(s, r, BEVEL_SUNKEN);
+    struct rect in = mkrect(x + 2, y + 2, d->w - 4, d->h - 4);
+    if (in.w <= 0 || in.h <= 0)
+        return;
+    if (n->tag == T_PROGRESS) {
+        int max = milli_attr(n, "max", 1000);
+        if (max <= 0)
+            max = 1000;
+        if (!node_attr(n, "value")) {           /* no value: working on it; a few blocks */
+            for (int bx = in.x + 4; bx + 8 <= in.x + in.w && bx < in.x + in.w / 2 + 16; bx += 10)
+                if (bx > in.x + in.w / 2 - 20)
+                    gfx_fill(s, bx, in.y, 8, in.h, C_NAVY);
+            return;
+        }
+        int v = milli_attr(n, "value", 0);
+        v = v < 0 ? 0 : v > max ? max : v;
+        int full = muldiv(in.w, v, max);
+        for (int bx = in.x; bx < in.x + full; bx += 10)     /* blocks, as in Windows 95 */
+            gfx_fill(s, bx, in.y, in.x + full - bx < 8 ? in.x + full - bx : 8, in.h, C_NAVY);
+        return;
+    }
+    int min = milli_attr(n, "min", 0), max = milli_attr(n, "max", 1000);
+    if (max <= min)
+        max = min + 1000;
+    int v = milli_attr(n, "value", 0);
+    v = v < min ? min : v > max ? max : v;
+    int low = milli_attr(n, "low", min), high = milli_attr(n, "high", max);
+    int opt = milli_attr(n, "optimum", (min + max) / 2);
+    low = low < min ? min : low > max ? max : low;
+    high = high < low ? low : high > max ? max : high;
+    #define REGION(x) ((x) < low ? 0 : (x) > high ? 2 : 1)
+    int dist = REGION(v) - REGION(opt);
+    #undef REGION
+    uint32_t col = dist == 0 ? 0x00A000 : dist == 1 || dist == -1 ? 0xE0C000 : 0xD00000;
+    int full = muldiv(in.w, v - min, max - min);
+    gfx_fill(s, in.x, in.y, full, in.h, col);
+}
+
 static void draw_control(struct surface *s, const struct ditem *d, int x, int y, int focused, int caret_on)
 {
     struct node *n = d->node;
@@ -3526,6 +4080,13 @@ static void draw_control(struct surface *s, const struct ditem *d, int x, int y,
     struct rect r = mkrect(x, y, d->w, d->h);
     const char *type = n->tag == T_INPUT ? input_type(n) : "";
     const char *value = n->value ? n->value : "";
+
+    if (n->tag == T_PROGRESS || n->tag == T_METER) {
+        draw_gauge(s, d, x, y);
+        return;
+    }
+    uint32_t ph_color = n->pseudo_st[PE_PLACEHOLDER - 1] ? n->pseudo_st[PE_PLACEHOLDER - 1]->color
+                                                         : OPAQUE(0x808080);
 
     if (n->tag == T_INPUT && (!strcasecmp(type, "checkbox") || !strcasecmp(type, "radio"))) {
         if (!strcasecmp(type, "radio")) {
@@ -3574,6 +4135,11 @@ static void draw_control(struct surface *s, const struct ditem *d, int x, int y,
     }
     if (n->tag == T_TEXTAREA) {
         int ly = y + 2, start = 0, len = (int)strlen(value);
+        if (!len && !focused && node_attr(n, "placeholder")) {
+            const char *ph = node_attr(n, "placeholder");
+            draw_text_clipped(s, f, inner, inner.x, ly, ph, (int)strlen(ph), ph_color);
+            return;
+        }
         for (int i = 0; i <= len; i++) {
             if (i == len || value[i] == '\n') {
                 draw_text_clipped(s, f, inner, inner.x, ly, value + start, i - start, 0);
@@ -3600,7 +4166,7 @@ static void draw_control(struct surface *s, const struct ditem *d, int x, int y,
     int caret_x = wfont_width(f, shown, cur), scroll = caret_x > inner.w - 2 ? caret_x - inner.w + 2 : 0;
     if (!len && !focused && node_attr(n, "placeholder")) {
         const char *ph = node_attr(n, "placeholder");
-        draw_text_clipped(s, f, inner, inner.x, ty, ph, (int)strlen(ph), OPAQUE(0x808080));
+        draw_text_clipped(s, f, inner, inner.x, ty, ph, (int)strlen(ph), ph_color);
     } else {
         draw_text_clipped(s, f, inner, inner.x - scroll, ty, shown, len, 0);
     }
@@ -3611,13 +4177,26 @@ static void draw_control(struct surface *s, const struct ditem *d, int x, int y,
 /* ---- selecting text ---- */
 
 /* The character of a text item that x falls at, counted in bytes. */
+/* The width of the first n bytes of a text item, with its letter-spacing. */
+static int item_width(const struct ditem *d, int n)
+{
+    int w = wfont_width(d->font, d->text, n);
+    return d->ls ? w + utf8_count(d->text, n) * d->ls : w;
+}
+
+/* Text that user-select: none keeps out of selections. */
+static int selectable(const struct ditem *d)
+{
+    return !(d->node && d->node->type == N_ELEMENT && d->node->style && d->node->style->select_none);
+}
+
 static int char_at(const struct ditem *d, int px)
 {
     int prev = 0, pw = 0;
     for (int n = 1; n <= d->len; n++) {
         if (n < d->len && ((unsigned char)d->text[n] & 0xC0) == 0x80)
             continue;                   /* inside a UTF-8 character */
-        int w = wfont_width(d->font, d->text, n);
+        int w = item_width(d, n);
         if (d->x + w >= px)
             return px - (d->x + pw) < d->x + w - px ? prev : n;
         prev = n;
@@ -3631,7 +4210,7 @@ static void sel_pos(const struct layout *lo, int px, int py, int *item, int *ch)
     int last = -1;
     for (int i = 0; i < lo->nitems; i++) {
         const struct ditem *d = &lo->items[i];
-        if (d->kind != DK_TEXT || !d->len)
+        if (d->kind != DK_TEXT || !d->len || !selectable(d))
             continue;
         last = i;
         if (d->y + d->h > py && (d->y > py || d->x + d->w > px)) {
@@ -3667,7 +4246,7 @@ void layout_select_all(struct layout *lo)
 {
     int first = -1, last = -1;
     for (int i = 0; i < lo->nitems; i++)
-        if (lo->items[i].kind == DK_TEXT && lo->items[i].len) {
+        if (lo->items[i].kind == DK_TEXT && lo->items[i].len && selectable(&lo->items[i])) {
             if (first < 0)
                 first = i;
             last = i;
@@ -3685,7 +4264,7 @@ int layout_selection_text(const struct layout *lo, char *out, int size)
     const struct ditem *prev = NULL;
     for (int i = lo->sel_from; i <= lo->sel_to && i < lo->nitems; i++) {
         const struct ditem *d = &lo->items[i];
-        if (d->kind != DK_TEXT || !d->len)
+        if (d->kind != DK_TEXT || !d->len || !selectable(d))
             continue;
         int a = i == lo->sel_from ? lo->sel_c0 : 0, b = i == lo->sel_to ? lo->sel_c1 : d->len;
         if (b > d->len)
@@ -3709,6 +4288,79 @@ int layout_selection_text(const struct layout *lo, char *out, int size)
     return o;
 }
 
+/* Text, a character at a time when it has letter-spacing. */
+static void draw_text(struct surface *s, const struct ditem *d, int x, int y, const char *text, int len,
+                      uint32_t col)
+{
+    if (!d->ls) {
+        wfont_draw(s, d->font, x, y, text, len, col);
+        return;
+    }
+    for (int i = 0; i < len;) {
+        int e = i + 1;
+        while (e < len && ((unsigned char)text[e] & 0xC0) == 0x80)
+            e++;
+        x += wfont_draw(s, d->font, x, y, text + i, e - i, col) + d->ls;
+        i = e;
+    }
+}
+
+/* text-shadow: the text again, offset and in the shadow's color; a blur is a few fainter copies round it. */
+static void draw_shadow(struct surface *s, const struct ditem *d, int x, int y)
+{
+    uint32_t col = ALPHA(d->sh_color) == 255 ? d->sh_color : blend(0xFFFFFF, d->sh_color);
+    if (d->sh_blur > 0) {
+        uint32_t soft = shade(col, 1, 2, 1) & 0xFFFFFF;
+        static const int step[4][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
+        for (int k = 0; k < 4; k++)
+            draw_text(s, d, x + d->sh_x + step[k][0], y + d->sh_y + step[k][1], d->text, d->len, soft);
+    }
+    draw_text(s, d, x + d->sh_x, y + d->sh_y, d->text, d->len, col & 0xFFFFFF);
+}
+
+/* One decoration line, w wide: solid, double, dotted, dashed or wavy. */
+static void deco_line(struct surface *s, int x, int y, int w, int thick, uint32_t col, int style)
+{
+    switch (style) {
+    case DS_DOUBLE:
+        gfx_fill(s, x, y, w, thick, col);
+        gfx_fill(s, x, y + thick + 1, w, thick, col);
+        break;
+    case DS_DOTTED:
+    case DS_DASHED:
+        fill_blend(s, x, y, w, thick, OPAQUE(col), style == DS_DOTTED ? 1 : 2);
+        break;
+    case DS_WAVY:
+        for (int i = 0; i < w; i++)
+            gfx_fill(s, x + i, y + (i / 2) % 2, 1, thick, col);
+        break;
+    default:
+        gfx_fill(s, x, y, w, thick, col);
+        break;
+    }
+}
+
+static void draw_decoration(struct surface *s, const struct ditem *d, int x, int y, uint32_t col)
+{
+    int size = wfont_size(d->font), thick = size >= 24 ? 2 : 1;
+    int asc = wfont_ascent(d->font);
+    if (d->deco & DECO_UNDERLINE)
+        deco_line(s, x, y + asc + 1 + (size >= 20), d->w, thick, col, d->deco_style);
+    if (d->deco & DECO_STRIKE)
+        deco_line(s, x, y + asc - size * 3 / 10, d->w, thick, col, d->deco_style);
+    if (d->deco & DECO_OVERLINE)
+        deco_line(s, x, y + (wfont_height(d->font) - size) / 2, d->w, thick, col, d->deco_style);
+}
+
+/* The ::selection style that applies to text in n: its own or the nearest ancestor's. */
+static const struct style *selection_style(const struct node *n)
+{
+    for (; n; n = n->parent)
+        if (n->type == N_ELEMENT && n->pseudo_st[PE_SELECTION - 1])
+            return n->pseudo_st[PE_SELECTION - 1];
+    return NULL;
+}
+
 void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, int sx, int sy,
                     const struct node *focus, int caret_on)
 {
@@ -3717,9 +4369,13 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
     gfx_fill(s, view.x, view.y, view.w, view.h, lo->canvas & 0xFFFFFF);
     for (int i = 0; i < lo->nitems; i++) {
         const struct ditem *d = &lo->items[i];
-        if (d->y >= vy + view.h || d->y + d->h + 4 <= vy || d->x >= vx + view.w || d->x + d->w <= vx)
+        int ddx = 0, ddy = 0;
+        if (d->dyn)
+            layout_dyn_offset(lo, d->dyn, sx, sy, &ddx, &ddy);
+        if (d->y + ddy >= vy + view.h || d->y + ddy + d->h + 4 <= vy || d->x + ddx >= vx + view.w ||
+            d->x + ddx + d->w <= vx)
             continue;
-        int x = d->x - sx + ox, y = d->y - sy + oy;
+        int x = d->x + ddx - sx + ox, y = d->y + ddy - sy + oy;
         switch (d->kind) {
         case DK_FILL:
             if (!ALPHA(d->color) && !d->grad && !d->ring)
@@ -3731,16 +4387,24 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
             break;
         case DK_TEXT: {
             uint32_t col = ALPHA(d->color) == 255 ? d->color : blend(0xFFFFFF, d->color);
-            if (d->text[0] != ' ' || d->len != 1)
-                wfont_draw(s, d->font, x, y, d->text, d->len, col);
-            if (lo->sel_on && i >= lo->sel_from && i <= lo->sel_to && d->len) {
+            int shown = d->text[0] != ' ' || d->len != 1;
+            if (shown && d->sh_color)
+                draw_shadow(s, d, x, y);
+            if (shown)
+                draw_text(s, d, x, y, d->text, d->len, col);
+            if (lo->sel_on && i >= lo->sel_from && i <= lo->sel_to && d->len && selectable(d)) {
                 int a = i == lo->sel_from ? lo->sel_c0 : 0, e = i == lo->sel_to ? lo->sel_c1 : d->len;
                 if (e > d->len)
                     e = d->len;
                 if (a < e) {
-                    int xa = wfont_width(d->font, d->text, a), xb = wfont_width(d->font, d->text, e);
-                    gfx_fill(s, x + xa, y, xb - xa, d->h, 0x000080);
-                    wfont_draw(s, d->font, x + xa, y, d->text + a, e - a, 0xFFFFFF);
+                    const struct style *ss = selection_style(d->node);
+                    uint32_t sbg = ss && ALPHA(ss->bg) ? ss->bg & 0xFFFFFF : 0x000080;
+                    uint32_t sfg = ss && ss->color != col ? ss->color & 0xFFFFFF : 0xFFFFFF;
+                    int xa = item_width(d, a), xb = item_width(d, e);
+                    gfx_fill(s, x + xa, y, xb - xa, d->h, sbg);
+                    struct ditem part = *d;
+                    part.sh_color = 0;
+                    draw_text(s, &part, x + xa, y, d->text + a, e - a, sfg);
                     if (i > lo->sel_from) {         /* the space between words on this line */
                         for (int j = i - 1; j >= lo->sel_from; j--) {
                             const struct ditem *p = &lo->items[j];
@@ -3748,20 +4412,14 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
                                 continue;
                             int dy = p->y - d->y;
                             if ((dy < 0 ? -dy : dy) <= d->h / 2 && p->x + p->w < d->x)
-                                gfx_fill(s, p->x + p->w - sx + ox, y, d->x - p->x - p->w, d->h, 0x000080);
+                                gfx_fill(s, p->x + p->w - sx + ox, y, d->x - p->x - p->w, d->h, sbg);
                             break;
                         }
                     }
                 }
             }
-            int size = wfont_size(d->font), thick = size >= 24 ? 2 : 1;
-            int asc = wfont_ascent(d->font);
-            if (d->deco & DECO_UNDERLINE)
-                gfx_fill(s, x, y + asc + 1 + (size >= 20), d->w, thick, col & 0xFFFFFF);
-            if (d->deco & DECO_STRIKE)
-                gfx_fill(s, x, y + asc - size * 3 / 10, d->w, thick, col & 0xFFFFFF);
-            if (d->deco & DECO_OVERLINE)
-                gfx_fill(s, x, y + (wfont_height(d->font) - size) / 2, d->w, thick, col & 0xFFFFFF);
+            if (d->deco)
+                draw_decoration(s, d, x, y, d->deco_color ? d->deco_color & 0xFFFFFF : col & 0xFFFFFF);
             break;
         }
         case DK_IMAGE:

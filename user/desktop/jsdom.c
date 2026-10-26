@@ -4020,8 +4020,11 @@ static void process_view(struct jsdom *d)
 }
 
 /* ---- localStorage and sessionStorage ----
- * Kept in the desktop's memory, so they last while it runs: localStorage
- * for each origin, sessionStorage for each origin in each window. */
+ * localStorage for each origin is kept in STORAGE_FILE, read the first time any
+ * page uses storage and written back (at most every two seconds) when it changes;
+ * sessionStorage for each origin in each window lives in the desktop's memory. */
+
+#define STORAGE_FILE "/home/flux/.browser_storage"
 
 #define STORE_MAX (4u << 20)            /* bytes of keys and values, all origins together */
 
@@ -4033,9 +4036,142 @@ struct kv {
 static struct kv *store;
 static size_t store_bytes;
 static int local_marker, session_marker;    /* the storages' host data: which one */
+static int store_loaded, store_dirty;
+static unsigned store_saved;
+
+static struct kv **kv_find(const char *scope, const char *key);
+
+/* One more byte or escape sequence of text into a growing buffer. */
+struct sbuf {
+    char *p;
+    size_t len, cap;
+    int bad;
+};
+
+static void sb_put(struct sbuf *b, const char *s, size_t n)
+{
+    if (b->bad)
+        return;
+    if (b->len + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 4096;
+        while (cap < b->len + n + 1)
+            cap *= 2;
+        char *np = realloc(b->p, cap);
+        if (!np) {
+            b->bad = 1;
+            return;
+        }
+        b->p = np;
+        b->cap = cap;
+    }
+    memcpy(b->p + b->len, s, n);
+    b->len += n;
+}
+
+/* Backslash, tab and line ends are written as \\, \t, \n and \r. */
+/* Backslash, tab and line ends are written as \\, \t, \n and \r (one entry a line, fields apart by tabs). */
+static void store_escape(struct sbuf *b, const char *s)
+{
+    while (*s) {
+        size_t run = strcspn(s, "\\\t\n\r");
+        sb_put(b, s, run);
+        s += run;
+        if (!*s)
+            break;
+        const char *esc = *s == '\\' ? "\\\\" : *s == '\t' ? "\\t" : *s == '\n' ? "\\n" : "\\r";
+        sb_put(b, esc, 2);
+        s++;
+    }
+}
+
+static void store_unescape(char *s)
+{
+    char *o = s;
+    for (; *s; s++) {
+        if (*s == '\\' && s[1]) {
+            s++;
+            *o++ = *s == 't' ? '\t' : *s == 'n' ? '\n' : *s == 'r' ? '\r' : *s;
+        } else {
+            *o++ = *s;
+        }
+    }
+    *o = 0;
+}
+
+static void store_save(void)
+{
+    struct sbuf b = { NULL, 0, 0, 0 };
+    for (struct kv *e = store; e; e = e->next) {
+        if (e->scope[0] != 'l')
+            continue;                   /* session storage stays in memory */
+        store_escape(&b, e->scope + 2);
+        sb_put(&b, "\t", 1);
+        store_escape(&b, e->key);
+        sb_put(&b, "\t", 1);
+        store_escape(&b, e->value);
+        sb_put(&b, "\n", 1);
+    }
+    if (!b.bad)
+        store_write_file(STORAGE_FILE, b.p ? b.p : "", b.len);
+    free(b.p);
+    store_dirty = 0;
+    store_saved = uptime_ms();
+}
+
+static void store_load(void)
+{
+    store_loaded = 1;
+    long len;
+    char *buf = store_read_file(STORAGE_FILE, 3 * (long)STORE_MAX, &len);
+    if (!buf)
+        return;
+    for (char *line = buf; *line;) {
+        char *eol = strchr(line, '\n');
+        if (eol)
+            *eol = 0;
+        char *key = strchr(line, '\t'), *value = key ? strchr(key + 1, '\t') : NULL;
+        if (value) {
+            *key++ = 0;
+            *value++ = 0;
+            store_unescape(line);
+            store_unescape(key);
+            store_unescape(value);
+            char scope[URL_MAX + 40];
+            snprintf(scope, sizeof(scope), "l %s", line);
+            size_t add = strlen(key) + strlen(value);
+            struct kv **pp = kv_find(scope, key);
+            if (!*pp && store_bytes + add <= STORE_MAX) {
+                struct kv *e = calloc(1, sizeof(*e));
+                if (e) {
+                    e->scope = strdup(scope);
+                    e->key = strdup(key);
+                    e->value = strdup(value);
+                }
+                if (e && e->scope && e->key && e->value) {
+                    *pp = e;
+                    store_bytes += add;
+                } else if (e) {
+                    free(e->scope), free(e->key), free(e->value), free(e);
+                }
+            }
+        }
+        if (!eol)
+            break;
+        line = eol + 1;
+    }
+    free(buf);
+}
+
+void jsdom_storage_flush(void)
+{
+    if (store_dirty && (unsigned)(uptime_ms() - store_saved) >= 2000)
+        store_save();
+}
 
 static void storage_scope(struct jsdom *d, int session, char *out, int size)
 {
+    if (!store_loaded)
+        store_load();
     const char *url = d->h.url, *p = strstr(url, "://");
     int n = p ? (int)(strcspn(p + 3, "/?#") + (size_t)(p + 3 - url)) : (int)strcspn(url, "/?#");
     if (session)
@@ -4096,6 +4232,8 @@ static int storage_write(struct js *J, int session, const char *key, const char 
         *pp = e;
     }
     store_bytes = store_bytes - old + strlen(key) + strlen(value);
+    if (!session)
+        store_dirty = 1;
     return 0;
 }
 
@@ -4107,6 +4245,8 @@ static void storage_remove_key(struct jsdom *d, int session, const char *key)
     if (*pp) {
         struct kv *e = *pp;
         *pp = e->next;
+        if (!session)
+            store_dirty = 1;
         store_bytes -= strlen(e->key) + strlen(e->value);
         free(e->scope);
         free(e->key);

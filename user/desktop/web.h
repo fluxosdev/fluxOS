@@ -65,10 +65,11 @@ int wfont_draw(struct surface *s, const struct wfont *f, int x, int y, const cha
     X(HGROUP, "hgroup") X(HR, "hr") X(HTML, "html") X(I, "i") X(IFRAME, "iframe") \
     X(IMG, "img") X(INPUT, "input") X(INS, "ins") X(KBD, "kbd") X(LABEL, "label") \
     X(LEGEND, "legend") X(LI, "li") X(LINK, "link") X(LISTING, "listing") X(MAIN, "main") \
-    X(MAP, "map") X(MARK, "mark") X(MENU, "menu") X(META, "meta") X(NAV, "nav") \
+    X(MAP, "map") X(MARK, "mark") X(MENU, "menu") X(META, "meta") X(METER, "meter") X(NAV, "nav") \
     X(NOBR, "nobr") X(NOFRAMES, "noframes") X(NOSCRIPT, "noscript") X(OBJECT, "object") \
     X(OL, "ol") X(OPTGROUP, "optgroup") X(OPTION, "option") X(P, "p") X(PARAM, "param") \
-    X(PICTURE, "picture") X(PLAINTEXT, "plaintext") X(PRE, "pre") X(Q, "q") X(S, "s") \
+    X(PICTURE, "picture") X(PLAINTEXT, "plaintext") X(PRE, "pre") X(PROGRESS, "progress") \
+    X(Q, "q") X(RB, "rb") X(RP, "rp") X(RT, "rt") X(RUBY, "ruby") X(S, "s") \
     X(SAMP, "samp") X(SCRIPT, "script") X(SECTION, "section") X(SELECT, "select") \
     X(SMALL, "small") X(SOURCE, "source") X(SPAN, "span") X(STRIKE, "strike") \
     X(STRONG, "strong") X(STYLE, "style") X(SUB, "sub") X(SUMMARY, "summary") X(SUP, "sup") \
@@ -121,7 +122,7 @@ struct node {
     uint8_t quirks;             /* the root: no standards-mode doctype */
 
     /* generated content: ::before and ::after with a string "content" */
-    struct style *pseudo_st[2];
+    struct style *pseudo_st[5];         /* ::before, ::after, ::placeholder, ::selection, ::marker */
     const char *pseudo_text[2];
 
     int bx0, by0, bx1, by1;             /* browser.c: its box in the last layout, for scripts */
@@ -146,6 +147,12 @@ int web_parse_nth(const char *s, const char *end, int *a, int *b, const char **f
 int web_nth_fits(int a, int b, int position);
 
 /* ---- styles (css.c) ---- */
+/* pseudo-elements: node.pseudo_st[PE_x - 1] is the style of an element's ::before and the rest */
+enum { PE_NONE, PE_BEFORE, PE_AFTER, PE_PLACEHOLDER, PE_SELECTION, PE_MARKER };
+
+/* The fragment of the page's address, for :target (css.c; the browser sets it before cascading). */
+extern const char *css_target_id;
+
 enum unit { U_PX, U_PCT, U_AUTO, U_CALC, U_MIN, U_MAX };
 
 struct len {
@@ -169,6 +176,13 @@ enum {
 enum { TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY };
 enum { WS_NORMAL, WS_PRE, WS_NOWRAP, WS_PRE_WRAP, WS_PRE_LINE };
 enum { DECO_UNDERLINE = 1, DECO_STRIKE = 2, DECO_OVERLINE = 4 };
+enum { DS_SOLID, DS_DOUBLE, DS_DOTTED, DS_DASHED, DS_WAVY };     /* text-decoration-style */
+/* cursor: the pointer shapes a page can ask for */
+enum {
+    CSSCUR_AUTO, CSSCUR_DEFAULT, CSSCUR_POINTER, CSSCUR_TEXT, CSSCUR_WAIT, CSSCUR_PROGRESS, CSSCUR_CROSSHAIR, CSSCUR_MOVE,
+    CSSCUR_HELP, CSSCUR_NOT_ALLOWED, CSSCUR_NONE, CSSCUR_RESIZE_NS, CSSCUR_RESIZE_EW, CSSCUR_RESIZE_ALL,
+};
+enum { WB_NORMAL, WB_BREAK_ALL, WB_BREAK_WORD };   /* word-break and overflow-wrap */
 enum { TT_NONE, TT_UPPER, TT_LOWER, TT_CAPITALIZE };
 enum { VA_BASELINE, VA_SUB, VA_SUPER, VA_MIDDLE, VA_TOP, VA_BOTTOM, VA_TEXT_TOP };
 enum {
@@ -232,6 +246,22 @@ struct style {
     int font_size;              /* pixels */
     uint32_t color, bg;
     uint32_t link_color;        /* inherited: the color <body link=...> asks for */
+    /* text: spacing, wrapping, shadows and decoration styles (all inherited here) */
+    int letter_spacing, word_spacing;   /* pixels */
+    uint8_t word_break;                 /* WB_* */
+    uint8_t small_caps, list_inside, empty_hide;
+    uint8_t deco_style;                 /* DS_* */
+    uint32_t deco_color;                /* 0: the text color */
+    int ts_x, ts_y, ts_blur;            /* text-shadow (the first) */
+    uint32_t ts_color;                  /* 0: none */
+    /* not inherited: ellipsis, table layout, caption side, outline */
+    uint8_t text_ellipsis, table_fixed, caption_bottom;
+    uint8_t outline_style;              /* BS_* */
+    int outline_w, outline_offset;
+    uint32_t outline_color;             /* 1: currentColor */
+    /* interaction (inherited) */
+    uint8_t cursor;                     /* CUR_* */
+    uint8_t pointer_none, select_none;  /* pointer-events: none; user-select: none */
     struct len margin[4], padding[4];   /* top, right, bottom, left */
     int border_w[4];
     uint8_t border_style[4];
@@ -291,6 +321,7 @@ extern int css_dynamic_rules;
 /* ---- cookies (cookies.c) ---- */
 void cookie_set(const char *url, const char *set_cookie_value, int from_script);
 void cookie_set_from_headers(const char *url, const char *headers, int hlen);
+void cookie_flush(void);                /* write the cookies that outlast the desktop to disk, if they changed */
 /* The Cookie header's value for a request to url; scripts do not see HttpOnly cookies. */
 void cookie_header(const char *url, int scripts_only, char *out, int size);
 
@@ -314,6 +345,13 @@ struct ditem {
     int len;
     struct image *img;          /* image */
     struct node *node;          /* control */
+    /* text: letter spacing, a shadow and the decoration's color and style */
+    int8_t ls;
+    int8_t sh_x, sh_y, sh_blur;
+    uint32_t sh_color;          /* 0: no shadow */
+    uint32_t deco_color;        /* 0: the text color */
+    uint8_t deco_style;
+    uint8_t dyn;                /* 1 + the index of the fixed or sticky box it moves with, or 0 */
     /* fills and images: rounded corners; fills: a gradient over the color,
        and a border of ring pixels all round in ring_color */
     int rad[4];
@@ -326,7 +364,22 @@ struct ditem {
 struct hotspot {                /* a link or a form control */
     int x, y, w, h;
     struct node *node;          /* the <a href> or the control */
+    uint8_t dyn;                /* like ditem.dyn */
 };
+
+/* A box that moves as the page scrolls: position: fixed stays where it is on the screen,
+ * position: sticky stays on the screen between its place and the end of its container. */
+struct dynbox {
+    uint8_t fixed;              /* else sticky */
+    uint8_t parent;             /* 1 + the dynbox it is inside, or 0 */
+    int x, y, w, h;             /* where layout put it (page coordinates; fixed: window coordinates) */
+    int top, right, bottom, left;       /* sticky offsets in pixels; DYN_NONE for auto */
+    int cy0, cy1, cx0, cx1;     /* sticky: the containing block */
+    struct node *container;     /* sticky: the box whose content area it stays in */
+    int i0, i1;                 /* its items while the page is being laid out (layout moves them) */
+};
+#define DYN_NONE (-0x40000000)
+#define MAX_DYNBOX 200
 
 struct anchor {
     const char *name;           /* an id, or the name of <a name=...> */
@@ -343,6 +396,9 @@ struct layout {
     struct anchor *anchors;
     int nanchors, anchorcap;
     int width, height;          /* the document's extent */
+    int vw, vh;                 /* the window it was laid out for: where fixed and sticky boxes go */
+    struct dynbox *dyn;
+    int ndyn;
     uint32_t canvas;            /* the background behind everything */
     /* the selected text: items sel_from..sel_to, from character sel_c0 of the first to sel_c1 of the last */
     int sel_on, sel_from, sel_to, sel_c0, sel_c1;
@@ -360,11 +416,19 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
 /* Paint the part of the document at (sx, sy) into s at (ox, oy), within s's clip. */
 void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, int sx, int sy,
                     const struct node *focus, int caret_on);
-const struct hotspot *layout_hit(const struct hotspot *h, int n, int x, int y);
+/* The hotspot at a page point, with the page scrolled to (sx, sy): fixed and sticky ones move with it. */
+const struct hotspot *layout_hit(const struct layout *lo, const struct hotspot *h, int n, int x, int y,
+                                 int sx, int sy);
+/* How far scrolling to (sx, sy) moves the item or hotspot with this dyn from where it was laid out. */
+void layout_dyn_offset(const struct layout *lo, int dyn, int sx, int sy, int *dx, int *dy);
 /* The text a button, submit input or select shows. */
 const char *control_label(const struct node *n);
 /* Draw img scaled to w x h, alpha-blended. */
 void draw_image_scaled(struct surface *s, const struct image *img, int x, int y, int w, int h);
+
+/* ---- files the browser keeps (webstore.c) ---- */
+char *store_read_file(const char *path, long max, long *len);   /* malloc'd; NULL if missing or too big */
+int store_write_file(const char *path, const char *data, size_t len);
 
 /* ---- URLs (webutil.c, like the arena and UTF-8 helpers) ---- */
 /* Resolve ref against base (an absolute URL). Fragments are kept. */

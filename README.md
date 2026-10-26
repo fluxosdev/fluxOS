@@ -168,8 +168,19 @@ stops at boot and says why.
 **Web browser** (the **Web Browser** icon): an Internet Explorer 3 style
 window with Back/Forward/Stop/Refresh/Home, address bar, progress gauge and a
 right-click menu (page actions, link actions, and Cut/Copy/Paste on the
-address bar). Pages come over HTTP or HTTPS (through `wget`, so the desktop
-keeps running), or from `file://`.
+address bar). Pages come over HTTP or HTTPS (through `httpc`, a fetcher process,
+so the desktop keeps running), or from `file://`.
+- **Network**: each window has its own `/bin/httpc` (built on libc's `<http.h>`),
+  started when a page is first fetched and stopped after 30 idle seconds. It keeps
+  connections to servers open between requests (HTTP/1.1 keep-alive; one that the
+  server closed meanwhile is retried on a new one), remembers host names for five
+  minutes, decodes chunked, gzip and deflate bodies, and keeps a cache in
+  `/home/flux/.cache/http` (16 MB): fresh copies (`Cache-Control: max-age`,
+  `Expires`, or a tenth of the time since `Last-Modified`) are used without asking,
+  stale ones are checked with `If-None-Match`/`If-Modified-Since` and reused on a
+  `304`, `no-store` and `Vary` other than `Accept-Encoding` are respected, and
+  Refresh (F5) asks the server about the page itself. If a fetcher cannot be started
+  (eight run at most) the page is fetched by `wget` as before.
 - **HTML**: follows the main rules of the HTML5 tree builder (implied and
   auto-closed tags, tables, character references, quirks mode); UTF-8,
   Latin-1 and Windows-1252. The complete HTML5 named character-reference table
@@ -186,21 +197,38 @@ keeps running), or from `file://`.
   csscolor.c) and logical properties (`margin-inline`, `padding-block`,
   `inset-inline`, `inline-size`...). `<style>` and `<link>` elements that
   scripts add or change apply as soon as the script returns.
+  Text: `letter-spacing`, `word-spacing`, `word-break: break-all`, `overflow-wrap`
+  (`break-word`, `anywhere`), `text-overflow: ellipsis`, `font-variant: small-caps`,
+  `text-shadow`, `text-decoration-color`/`-style` (solid, double, dotted, dashed, wavy);
+  boxes: `outline` (with `outline-offset`), `list-style-position`, `table-layout: fixed`,
+  `caption-side`, `empty-cells`; interaction: `cursor`, `pointer-events: none`,
+  `user-select: none` (and `accent-color`, `appearance`, `will-change` and
+  `scroll-behavior`, which are accepted and ignored). More selectors: `:target`,
+  `:lang()`, `:read-only`/`:read-write`, `:default`, `:indeterminate`, `:valid`/`:invalid`
+  (`required`, `type=email`/`url`/`number` with `min`/`max`, `minlength`, `maxlength`),
+  `:in-range`/`:out-of-range`, and the pseudo-elements `::placeholder`, `::selection`
+  and `::marker`.
 - **Layout**: blocks with margin collapsing, inline text, inline-blocks, lists,
   tables, flex rows, grids (columns, rows, areas, auto rows, spans, `dense`),
   borders, backgrounds, images and form controls. Floats (`float`, `clear`,
   clearfixes, text wrapping, new formatting contexts beside floats) and
-  positioning (`relative`, `absolute` and `fixed` with `top`/`right`/`bottom`/
+  positioning (`relative`, `absolute`, `fixed` and `sticky` with `top`/`right`/`bottom`/
   `left`, `inset`) work, with `z-index` for absolute and fixed boxes, `box-shadow`
   (the first outer shadow, drawn as fading layers) and `transform: translate()`.
+  `fixed` boxes stay where they are in the window as the page scrolls; `sticky` boxes
+  follow it until the end of the box they are in (against the window, not a scrolling
+  box inside the page). `<progress>`, `<meter>` and `<ruby>` (the annotation above its
+  base) are drawn.
 - **Interaction**: `:hover`, `:focus` and `:focus-within` restyle the page as the
   pointer and focus move. Drag to select text, Ctrl+A to select all, Ctrl+C to
   copy to the shared clipboard. The window and taskbar show the page's favicon
   (`<link rel=icon>` or `/favicon.ico`; PNG, ICO, GIF or SVG).
-- **Cookies**: a jar shared by every window (kept in memory only) fills from
+- **Cookies**: a jar shared by every window fills from
   `Set-Cookie` headers and `document.cookie` (domain, path, `Secure`,
   `HttpOnly`, `Max-Age`, `Expires`) and goes out on every request, so
-  logins and `fetch` calls keep their session. `SameSite` is not enforced.
+  logins and `fetch` calls keep their session. Cookies with an expiry are kept
+  in `/home/flux/.browser_cookies` (plain text) and are there next time; session
+  cookies last until the desktop closes. `SameSite` is not enforced.
 - **Pictures**: PNG, JPEG, GIF (first frame), ICO (the largest icon) and SVG, as `<img>` and as an
   inline `<svg>`. `srcset`/`sizes` and `<picture><source>` choose a picture of
   the right width in a format the browser can decode (not WebP or AVIF). The SVG renderer (svg.c) draws shapes, paths (curves and
@@ -239,8 +267,9 @@ keeps running), or from `file://`.
   scripts and style sheets,
   `replaceChildren`, `insertAdjacentText` and `insertAdjacentElement`,
   timers, `location`, `history` (`pushState`/`replaceState` with `popstate`,
-  and `hashchange`, without reloading), `matchMedia`, `localStorage` and
-  `sessionStorage` (per origin, kept while the desktop runs), `XMLHttpRequest`, `fetch`,
+  and `hashchange`, without reloading), `matchMedia`, `localStorage`
+  (per origin, kept in `/home/flux/.browser_storage`) and `sessionStorage`
+  (per origin and window), `XMLHttpRequest`, `fetch`,
   `URL`, and more: `FormData`, `Blob`, `TextEncoder`/`TextDecoder`, `crypto.getRandomValues`/`randomUUID`,
   `DOMParser`, `postMessage`, a style element's `sheet.insertRule()`, and stand-ins for `WebSocket`,
   `Notification`, `element.animate()` (it skips to the end) and web fonts.
@@ -283,8 +312,9 @@ keeps running), or from `file://`.
 dmesg dos echo env fetch fluxinstall free fsh grep halt head hexdump host
 ifconfig init ls lsblk mkdir mkfs.fat mixer more mount mv nc ping play
 poweroff ps reboot rm rmdir seq sh sleep sort spin stat sync tail tee top
-touch tr umount uname uniq unzip uptime wc wget yes zip, on a small libc (stdio, malloc,
-dirent, time, sockets, a DNS resolver, archives).
+touch tr umount uname uniq unzip uptime wc wget yes zip (and httpc, the browser's
+fetcher), on a small libc (stdio, malloc, dirent, time, sockets, a DNS resolver,
+archives, an HTTP/1.1 client and inflate).
 - `unzip [-l|-v|-t|-p] [-o|-n] [-j] [-d DIR] ARCHIVE [NAME...]` lists, tests and
   extracts ZIP and 7z archives; `7z l|t|x|e [-oDIR] [-y] ARCHIVE` does the same
   with 7-Zip's syntax; `zip [-r] [-0..-9] [-j] ARCHIVE.zip FILE...` makes ZIP
@@ -297,7 +327,7 @@ dirent, time, sockets, a DNS resolver, archives).
   `ping [-c N] HOST`, `host NAME`, `nc` (netcat, TCP and UDP).
 - `wget [-q] [-O FILE] [-T SECONDS] [--save-headers] [--content-on-error]
   [--max-redirect=N] [--post-data=STRING] [--method=VERB] [--header=LINE]... URL` follows redirects and decodes
-  chunked bodies. `https://` uses libc's own TLS 1.3 client (`<tls.h>`: X25519,
+  chunked bodies (HTTP/1.1, through libc's `<http.h>`, writing the body as it arrives). `https://` uses libc's own TLS 1.3 client (`<tls.h>`: X25519,
   AES-128-GCM). It encrypts but does not verify the server's certificate.
 - `beep [-f HZ] [-l MS] [-r N] [-d MS] [-n ...]` and `beep -m MUSIC` (BASIC's
   PLAY language); `play [-q] [-s SECONDS] FILE...` plays WAV (8 to 32-bit PCM)
@@ -404,7 +434,8 @@ kernel/                    boot.S, entry.S, gdt/idt/pmm/vmm/heap, proc/exec/sysc
                            ehci/xhci, automount, fat32/iso9660, tty/vga/serial/keyboard/
                            timer, fb/mouse/input, voodoo, radeon*, pcspkr/sb16/opl/hda,
                            fpu, ne2000/forcedeth/mii/net/tcp/socket, kmain
-user/libc, user/include    the C library (math.c is the x87 math library) and headers
+user/libc, user/include    the C library (math.c is the x87 math library; http.c and
+                           inflate.c are the HTTP/1.1 client and Deflate) and headers
 user/gl/                   the OpenGL library and its backends
 user/fsh/                  the shell
 user/desktop/              compositor and window manager (wm.c), apps (files, edit,
@@ -551,19 +582,19 @@ cannot be used.
   or out-of-order buffering. forcedeth runs at 10/100 Mbit/s without offload,
   VLANs, wake-on-LAN or MSI. HTTPS is TLS 1.3 with TLS_AES_128_GCM_SHA256 and
   X25519 only, and certificates are not verified.
-- **Browser:** JavaScript has no async generators, modules or real
-  BigInt, and `Proxy` cannot wrap a function; strings count UTF-8 bytes,
-  `Symbol`s are strings, `WebSocket` and
-  `customElements` are stand-ins that do nothing, typed arrays are plain arrays, and `eval` runs
+- **Browser:** JavaScript has no real BigInt, and `Proxy` cannot wrap a function;
+  strings count UTF-8 bytes, `Symbol`s are strings, `WebSocket` is a stand-in
+  that does nothing, typed arrays are plain arrays, and `eval` runs
   in the global scope, so many modern web apps won't run. Layout is an
-  approximation: `fixed` boxes scroll with the page, `z-index` only orders absolute and fixed
-  boxes, `sticky` acts as `relative`, transforms other than `translate` and all
+  approximation: `z-index` only orders absolute and fixed boxes, `sticky` works
+  against the window only, transforms other than `translate` and all
   `transition`s and animations are ignored, flex rows are lines of inline-blocks, grids lack named lines and
   column flow, and `calc()` takes its first length. GIF animations show their
   first frame; SVG ignores clip paths, masks, filters and patterns. There are
-  no font downloads, page cache or text selection, cookies last only until the
-  desktop closes, and characters
-  outside Latin-1 and common punctuation show as `?`.
+  no font downloads, and characters
+  outside Latin-1 and common punctuation show as `?`. Connections are kept per
+  window, not shared between them, and the cache is for the browser only (wget
+  does not use it).
 - **Graphics:** only the 3dfx and Radeon drivers set modes (others keep the BIOS
   mode, changeable only on an installed system at the next start); no 8-bit
   palette, interlaced or doublescan modes; the 3dfx engine renders 16-bit color

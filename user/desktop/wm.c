@@ -1763,8 +1763,11 @@ static void update_cursor(void)
         k = kind_for_edges(drag_edges);
     } else if (drag == DRAG_NONE && !menu_open) {
         struct window *w = window_at(mx, my);
-        if (w)
+        if (w) {
             k = kind_for_edges(edge_hit(w, mx, my));
+            if (k == CUR_ARROW && rect_contains(wm_client_rect(w), mx, my))
+                k = w->cursor;          /* what the program in the window asked for */
+        }
     }
     if (k == cursor_kind)
         return;
@@ -1777,6 +1780,14 @@ static void update_cursor(void)
     wm_damage(cursor_bounds(mx, my, cursor_kind));
     cursor_kind = k;
     wm_damage(cursor_bounds(mx, my, cursor_kind));
+}
+
+void wm_set_cursor(struct window *w, enum cursor_kind kind)
+{
+    if (!w || w->cursor == kind)
+        return;
+    w->cursor = kind;
+    update_cursor();
 }
 
 static void press_left(void)
