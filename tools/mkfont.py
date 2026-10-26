@@ -19,11 +19,10 @@ building fluxOS does not need this script, Python or PIL.
                            SIL Open Font License 1.1): Medium and Bold at 12
                            pixels for text (as wide as Liberation Sans, so
                            dialogs still fit), Medium 14 for captions, Regular
-                           24 for the Start menu's heading and Bold Italic 18
+                           24 for the Start menu's heading and Bold 18
                            for the Start button, set on the weight axis of the
-                           variable fonts Google Fonts ships (Archivo[wdth,wght].ttf
-                           and Archivo-Italic[wdth,wght].ttf), which are looked
-                           for in $ARCHIVO_DIR (default
+                           variable font Google Fonts ships (Archivo[wdth,wght].ttf),
+                           which is looked for in $ARCHIVO_DIR (default
                            /usr/share/fonts/truetype/archivo)
   rootfs/usr/share/fonts/web.fnt
                            the web browser's fonts: Liberation Sans, Serif
@@ -58,11 +57,10 @@ SANS_PX = 12
 BANNER_PX = 16
 ARCHIVO_DIR = os.environ.get("ARCHIVO_DIR", "/usr/share/fonts/truetype/archivo")
 ARCHIVO = "Archivo[wdth,wght].ttf"
-ARCHIVO_ITALIC = "Archivo-Italic[wdth,wght].ttf"
 ARCHIVO_FONTS = (("font_archivo", ARCHIVO, 12, 500, "Medium"), ("font_archivo_bold", ARCHIVO, 12, 700, "Bold"),
                  ("font_archivo_title", ARCHIVO, 14, 500, "Medium"),
                  ("font_archivo_large", ARCHIVO, 24, 400, "Regular"),
-                 ("font_archivo_start", ARCHIVO_ITALIC, 18, 700, "Bold Italic"))
+                 ("font_archivo_start", ARCHIVO, 18, 700, "Bold"))
 CANVAS_W, ORIGIN = 64, 8                # glyphs are drawn this far in, so italics can overhang
 FIRST, LAST = 32, 126
 LAST_CP437 = 255
