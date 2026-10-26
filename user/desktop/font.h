@@ -28,6 +28,6 @@ extern const struct pfont font_banner;           /* the Start menu's side banner
 extern const struct pfont font_archivo, font_archivo_bold;
 extern const struct pfont font_archivo_title;      /* captions */
 extern const struct pfont font_archivo_large;      /* the Start menu's heading */
-extern const struct pfont font_archivo_start;      /* the Start button */
+extern const struct pfont font_archivo_start;      /* the Menu button */
 
 #endif

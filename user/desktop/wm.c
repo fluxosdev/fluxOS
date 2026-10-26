@@ -431,7 +431,7 @@ static struct rect taskbar_rect(void)
 static struct rect start_button_rect(void)
 {
     if (KINETIK)
-        return mkrect(4, screen_h - TASKBAR_H + 3, 7 + 24 + 6 + gfx_text_width(&font_archivo_start, "Start") + 12,
+        return mkrect(4, screen_h - TASKBAR_H + 3, 7 + 24 + 6 + gfx_text_width(&font_archivo_start, "Menu") + 12,
                       TASKBAR_H - 6);
     return mkrect(2, screen_h - TASKBAR_H + 4, 54, 22);
 }
@@ -1160,7 +1160,7 @@ static void draw_taskbar_kinetik(void)
     struct rect sb = start_button_rect();
     glass(sb, 6, menu_open);
     draw_icon(&screen, sb.x + 7, sb.y + (sb.h - 24) / 2, ICON_FLUX, 24);
-    gfx_text(&screen, &font_archivo_start, sb.x + 37, sb.y + (sb.h - font_archivo_start.height) / 2, "Start",
+    gfx_text(&screen, &font_archivo_start, sb.x + 37, sb.y + (sb.h - font_archivo_start.height) / 2, "Menu",
              theme.on_chrome);
 
     for (int i = 0; i < ntasks; i++) {
@@ -1306,7 +1306,7 @@ static void draw_taskbar(void)
     int down = menu_open;
     gfx_bevel(&screen, sb, down ? BEVEL_PRESSED : BEVEL_RAISED);
     draw_icon(&screen, sb.x + 4 + down, sb.y + 3 + down, ICON_FLUX, 16);
-    gfx_text(&screen, &font_sans_bold, sb.x + 22 + down, sb.y + 4 + down, "Start", C_BLACK);
+    gfx_text(&screen, &font_sans_bold, sb.x + 22 + down, sb.y + 4 + down, "Menu", C_BLACK);
     if (down)
         gfx_focus_rect(&screen, mkrect(sb.x + 3, sb.y + 3, sb.w - 6, sb.h - 6));
 

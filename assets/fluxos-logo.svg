@@ -27,19 +27,19 @@
       }
     </style>
     <radialGradient id="radial-gradient" cx="256" cy="256" fx="256" fy="256" r="256" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#001f5f" stop-opacity=".5"/>
-      <stop offset=".8" stop-color="#001f5f" stop-opacity=".5"/>
-      <stop offset="1" stop-color="#001f5f" stop-opacity="0"/>
+      <stop offset="0" stop-color="#0c2944" stop-opacity=".5"/>
+      <stop offset=".8" stop-color="#0c2944" stop-opacity=".5"/>
+      <stop offset="1" stop-color="#0c2944" stop-opacity="0"/>
     </radialGradient>
     <radialGradient id="radial-gradient-2" cx="253.77" cy="380.93" fx="253.77" fy="380.93" r="366.93" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#fff"/>
-      <stop offset=".5" stop-color="#00bfff"/>
-      <stop offset="1" stop-color="#003f9f"/>
+      <stop offset=".5" stop-color="#448cca"/>
+      <stop offset="1" stop-color="#16467d"/>
     </radialGradient>
     <radialGradient id="radial-gradient-3" cx="256" cy="256" fx="256" fy="256" r="165.31" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#fff"/>
-      <stop offset=".7" stop-color="#d7efff"/>
-      <stop offset="1" stop-color="#9fdfff"/>
+      <stop offset=".7" stop-color="#e4edf6"/>
+      <stop offset="1" stop-color="#bcdefe"/>
     </radialGradient>
     <radialGradient id="radial-gradient-4" cx="256" cy="256" fx="256" fy="256" r="240.94" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#fff" stop-opacity="0"/>

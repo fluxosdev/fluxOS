@@ -214,7 +214,7 @@ endif
 QEMU_NET  ?= -netdev user,id=net0 -device ne2k_pci,netdev=net0
 # A Sound Blaster 16 (ISA, 0x220, IRQ 5, DMA 1 and 5) played through the host's PipeWire/PulseAudio.
 # Another host backend: make run QEMU_AUDIO="-audiodev alsa,id=snd0".
-QEMU_AUDIO ?= -audiodev pa,id=snd0
+QEMU_AUDIO ?= -audiodev pa,id=snd0,out.latency=150000
 QEMU_SND  ?= $(QEMU_AUDIO) -device sb16,audiodev=snd0
 
 run: $(ISO) $(DISK)
