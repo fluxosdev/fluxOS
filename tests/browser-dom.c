@@ -7,6 +7,8 @@
 #include "jsdom.h"
 
 unsigned int uptime_ms(void) { return 0; }
+const struct wfont *wfont_get(int family, int bold, int italic, int px)
+{ (void)family; (void)bold; (void)italic; (void)px; return NULL; }
 int meminfo(struct meminfo *info) { (void)info; return -1; }
 static int errors;
 static void changed(void *ctx) { (void)ctx; }

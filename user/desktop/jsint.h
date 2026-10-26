@@ -105,13 +105,21 @@ struct js {
     struct jsstr *s_home;               /* the hidden variable that holds a method's home object */
     struct job *jobs, *jobs_tail;       /* the microtask queue (promises) */
     int in_jobs;
-    struct jsobj *promise_proto, *generator_proto;
+    struct jsobj *promise_proto, *generator_proto, *agen_proto;
     struct jsobj *map_proto, *set_proto, *seqiter_proto, *buffer_proto;
     struct jsstr *s_value, *s_done;     /* iterator results' keys */
     struct coro *cur_co, *co_live;      /* the running coroutine, all those with a stack */
     int nco;
     unsigned lazy_done;                 /* which lazily loaded library chunks have run (jslib2.c) */
     struct jsobj *return_marker;        /* thrown to unwind a generator that is being closed */
+    /* ES modules (js.c) */
+    struct js_modhost modhost;
+    struct jsmod *mods;                 /* every module the page has asked for */
+    struct jsentry *entries;            /* module scripts and import()s waiting for their graphs */
+    int mod_ids, mod_busy, mod_again;
+    unsigned mod_mark;
+    struct jsstr *s_default, *s_meta;   /* the hidden bindings of export default and import.meta */
+    struct jsobj *super_this;           /* while super() runs a native constructor: the new object */
     char err[512];
     char textbuf[1024];
 };

@@ -1,0 +1,179 @@
+<!doctype html>
+<html>
+<head>
+<title>Modern web features</title>
+<script type="importmap">
+{ "imports": { "greeting": "./modern-greeting.js", "shapes/": "./" } }
+</script>
+<style>
+:root { --accent: oklch(45% 0.15 300); --soft: color-mix(in oklab, var(--accent) 12%, white); }
+body { font-family: sans-serif; max-width: 720px; margin: 20px auto; padding: 0 16px; line-height: 1.5;
+       color: #26202d; background: #f5f2f8; }
+h1, h2 { color: var(--accent); }
+.card {
+  padding-block: 14px; padding-inline: 18px; margin-block: 16px; background: white;
+  border: 1px solid #d6c6e2; border-radius: 8px;
+  & h2 { margin-top: 0; font-size: 1.2em; }
+  & .result { font-weight: bold; }
+}
+.swatches { display: flex; flex-wrap: wrap; gap: 6px; }
+.swatches > div { inline-size: 96px; block-size: 40px; color: white; font-size: 12px; padding: 4px; }
+.lab { background: lab(52% 40 -50); }
+.lch { background: lch(55% 60 30); }
+.hwb { background: hwb(150 10% 30%); }
+.p3 { background: color(display-p3 0.2 0.5 0.8); }
+.mix { background: color-mix(in oklch, red 40%, blue); }
+#supports-no { color: red; }
+@supports (display: grid) and (not (display: no-such-thing)) {
+  #supports-no { display: none; }
+}
+@supports not (display: grid) { #supports-yes { display: none; } }
+@media (400px <= width <= 4000px) { #range { color: green; } }
+.fade { opacity: 0; }
+.fade.seen { opacity: 1; background: var(--soft); }
+fl-counter { display: inline-block; padding: 2px 8px; border: 1px solid var(--accent); border-radius: 4px; }
+button { margin: 3px; padding: 5px 10px; }
+code { font-family: monospace; }
+</style>
+<script type="module">
+import greet, { count, bump } from "greeting";
+import * as shapes from "shapes/modern-shapes.js";
+const out = document.getElementById("modules");
+const before = count;
+bump();
+out.textContent = greet("module") + "; live binding " + before + " -> " + count +
+  "; namespace exports " + Object.keys(shapes).sort().join(", ") + "; area " + shapes.area(3);
+const lazy = await import("./modern-lazy.js");
+document.getElementById("dynamic").textContent = lazy.message + " (import.meta.url ends with " +
+  import.meta.url.split("/").pop() + ")";
+</script>
+<script nomodule>document.title = "nomodule ran: modules are not supported";</script>
+</head>
+<body>
+<h1>Modern web features</h1>
+<p><a href="home.html">Home</a> &middot; <a href="features.html">0.1.4 additions</a></p>
+
+<div class="card">
+<h2>ES modules</h2>
+<p>Static imports through an import map, a live binding, a namespace object, then <code>import()</code>
+after a top-level <code>await</code>.</p>
+<p class="result" id="modules">(module not run)</p>
+<p class="result" id="dynamic">(dynamic import not done)</p>
+</div>
+
+<div class="card">
+<h2>CSS: nesting, colors, @supports, ranges</h2>
+<p>This card's heading and padding come from nested rules and logical properties.</p>
+<div class="swatches">
+<div class="lab">lab()</div><div class="lch">lch()</div><div class="hwb">hwb()</div>
+<div class="p3">color(display-p3)</div><div class="mix">color-mix()</div>
+</div>
+<p id="supports-yes">@supports (display: grid) matched.</p>
+<p id="supports-no">If you can read this in red, @supports did not match.</p>
+<p id="range">This line is green when the range media query matches.</p>
+<p>CSS.supports("color", "oklch(50% 0.1 200)"): <span class="result" id="css-supports"></span></p>
+</div>
+
+<div class="card">
+<h2>Custom elements</h2>
+<p><fl-counter start="5"></fl-counter> <fl-counter></fl-counter>
+<button id="add-counter">Add a counter</button></p>
+<p class="result" id="ce-log"></p>
+</div>
+
+<div class="card">
+<h2>Observers</h2>
+<p class="result" id="mo-log">MutationObserver: no changes yet</p>
+<button id="mutate">Change the list</button>
+<ul id="watched"><li>one</li></ul>
+<p class="result" id="ro-log"></p>
+<p>Scroll down: the boxes below fade in as an IntersectionObserver sees them.</p>
+<div style="height: 500px"></div>
+<p class="fade card">Seen by the IntersectionObserver (1)</p>
+<div style="height: 300px"></div>
+<p class="fade card">Seen by the IntersectionObserver (2)</p>
+</div>
+
+<div class="card">
+<h2>History, events, dialog, storage</h2>
+<button id="push">pushState to ?page=2</button> <button id="hash">Go to #section</button>
+<p class="result" id="hist-log"></p>
+<button id="open-dialog">Open the dialog</button>
+<dialog id="dlg"><p>A &lt;dialog&gt;.</p><button id="close-dialog">Close</button></dialog>
+<p class="result" id="events-log"></p>
+<p class="result" id="storage-log"></p>
+<template id="tpl"><li class="from-template">made from a &lt;template&gt;</li></template>
+</div>
+
+<script>
+document.getElementById("css-supports").textContent =
+  CSS.supports("color", "oklch(50% 0.1 200)") + ", and display: no-such-thing: " + CSS.supports("display: no-such-thing");
+
+customElements.define("fl-counter", class extends HTMLElement {
+  static observedAttributes = ["start"];
+  constructor() { super(); this.n = 0; }
+  connectedCallback() {
+    this.n = Number(this.getAttribute("start") || 0);
+    this.render();
+    this.addEventListener("click", () => { this.n++; this.render(); });
+  }
+  attributeChangedCallback(name, old, value) { this.n = Number(value); }
+  render() { this.textContent = "count " + this.n + " (click)"; }
+});
+document.getElementById("add-counter").addEventListener("click", () => {
+  const c = document.createElement("fl-counter");
+  c.setAttribute("start", "100");
+  document.getElementById("add-counter").before(c);
+});
+document.getElementById("ce-log").textContent = "instanceof HTMLElement: " +
+  (document.querySelector("fl-counter") instanceof HTMLElement) + "; defined: " + !!customElements.get("fl-counter");
+
+const mo = new MutationObserver(records => {
+  document.getElementById("mo-log").textContent = "MutationObserver: " + records.length + " record(s), " +
+    records.map(r => r.type + (r.addedNodes.length ? " +" + r.addedNodes.length : "")).join(", ");
+});
+mo.observe(document.getElementById("watched"), { childList: true, subtree: true, attributes: true });
+document.getElementById("mutate").addEventListener("click", () => {
+  const ul = document.getElementById("watched");
+  ul.append(document.getElementById("tpl").content.cloneNode(true));
+  ul.setAttribute("data-changed", "yes");
+});
+
+new ResizeObserver(entries => {
+  document.getElementById("ro-log").textContent = "ResizeObserver: the list is " +
+    Math.round(entries[0].contentRect.width) + " x " + Math.round(entries[0].contentRect.height);
+}).observe(document.getElementById("watched"));
+
+const io = new IntersectionObserver(entries => {
+  for (const e of entries) if (e.isIntersecting) { e.target.classList.add("seen"); io.unobserve(e.target); }
+}, { rootMargin: "0px 0px -40px 0px" });
+document.querySelectorAll(".fade").forEach(el => io.observe(el));
+
+const hist = document.getElementById("hist-log");
+document.getElementById("push").addEventListener("click", () => {
+  history.pushState({ page: 2 }, "", "?page=2");
+  hist.textContent = "pushState: location.search is " + location.search + ", history.state.page is " + history.state.page;
+});
+document.getElementById("hash").addEventListener("click", () => { location.hash = "section"; });
+addEventListener("popstate", e => { hist.textContent = "popstate: state " + JSON.stringify(e.state) + ", URL " + location.href.split("/").pop(); });
+addEventListener("hashchange", e => { hist.textContent += " | hashchange to " + location.hash; });
+
+const dlg = document.getElementById("dlg");
+document.getElementById("open-dialog").addEventListener("click", () => dlg.showModal());
+document.getElementById("close-dialog").addEventListener("click", () => dlg.close("closed"));
+dlg.addEventListener("close", () => { document.getElementById("events-log").textContent = "dialog closed: " + dlg.returnValue; });
+
+const phases = [];
+document.body.addEventListener("pointerdown", e => phases.push("capture " + e.eventPhase), { capture: true, once: true });
+document.addEventListener("pointerdown", e => {
+  phases.push("bubble " + e.eventPhase + " (" + e.constructor.name + ")");
+  document.getElementById("events-log").textContent = "pointerdown: " + phases.join(", ");
+}, { once: true });
+
+const visits = Number(localStorage.getItem("modern-visits") || 0) + 1;
+localStorage.setItem("modern-visits", visits);
+document.getElementById("storage-log").textContent = "localStorage: you have opened this page " + visits + " time(s)";
+</script>
+<h2 id="section">#section</h2>
+</body>
+</html>

@@ -11,11 +11,11 @@
  * booleans; every operator; if, for, for-in, for-of, for await, while,
  * do-while, switch, labels, break and continue; try, catch, finally and
  * throw; template literals (tagged too), regular expression literals,
- * optional chaining, spread; generators and async functions, which run as
- * coroutines on stacks of their own (see the coroutine section); promises
- * and their microtask queue. Not there: async generators, proxies,
- * modules, BigInt (read as a number), static blocks, and the 16-bit
- * string model.
+ * optional chaining, spread; generators, async functions and async
+ * generators, which run as coroutines on stacks of their own (see the
+ * coroutine section); promises and their microtask queue; ES modules (see
+ * the modules section: the host fetches, the engine links and runs). Not
+ * there: BigInt (read as a number) and the 16-bit string model.
  *
  * Strings are kept as UTF-8, and their length counts bytes, which is the
  * same as JavaScript's count for ASCII text.
@@ -1559,11 +1559,15 @@ enum {
     N_NUM, N_STR, N_TEMPLATE, N_REGEX, N_IDENT, N_THIS, N_TRUE, N_FALSE, N_NULL, N_ARRAY, N_OBJECT,
     N_PROP, N_GETTER, N_SETTER, N_SPREAD, N_HOLE, N_FUNC, N_CALL, N_NEW, N_MEMBER, N_INDEX,
     N_UNARY, N_PREINC, N_POSTINC, N_BINARY, N_AND, N_OR, N_NULLISH, N_ASSIGN, N_COND, N_SEQ,
-    N_DESTRUCT, N_CLASS, N_FIELD, N_SUPER, N_AWAIT, N_YIELD,
+    N_DESTRUCT, N_CLASS, N_FIELD, N_SUPER, N_AWAIT, N_YIELD, N_IMPORT, N_IMPORT_META,
     /* statements */
     S_VAR, S_EXPR, S_BLOCK, S_IF, S_FOR, S_FORIN, S_FOROF, S_WHILE, S_DOWHILE, S_RETURN,
     S_BREAK, S_CONTINUE, S_THROW, S_TRY, S_SWITCH, S_CASE, S_FUNCDECL, S_EMPTY, S_LABEL,
+    S_IMPORT, S_EXPORT,
 };
+
+/* S_EXPORT's op: export var/function/class, export default <value>, export {...}, export * */
+enum { EX_DECL, EX_DEFAULT, EX_LIST, EX_ALL };
 
 enum { V_VAR, V_LET, V_CONST };
 
@@ -1608,6 +1612,7 @@ struct ast {
 #define F_ASYNC    8                    /* async function: returns a promise, may await */
 #define F_NOPARAMS 32                   /* a class static block: no parameter list */
 #define F_GEN      16                   /* function*: returns a generator, may yield */
+#define F_MODULE   64                   /* a module's body: runs in the module's scope */
 
 struct parser {
     struct js *J;
@@ -1621,6 +1626,9 @@ struct parser {
     int in_async, in_gen;               /* parsing the body of an async function, a generator */
     struct jsstr **names;               /* the names seen so far, hashed (tok_name) */
     int names_cap, nnames;
+    int module;                         /* parsing a module: import and export, top-level await */
+    int fn_depth;                       /* functions the parser is inside */
+    int tla;                            /* the module awaits at its top level */
 };
 
 static struct ast *mk(struct parser *P, int kind)
@@ -1866,8 +1874,6 @@ static struct ast *object_literal(struct parser *P)
                 mflags |= F_ASYNC;
             }
             if (accept(P, "*")) {
-                if (mflags & F_ASYNC)
-                    return fail_parse(P, "async generators are not supported"), NULL;
                 mflags |= F_GEN;
             }
             struct tok *key = peek(P);
@@ -1925,7 +1931,9 @@ static struct ast *function_body(struct parser *P, struct ast *fn, int arrow)
     int saved_async = P->in_async, saved_gen = P->in_gen;
     P->in_async = (fn->flags & F_ASYNC) != 0;
     P->in_gen = (fn->flags & F_GEN) != 0;
+    P->fn_depth++;
     struct ast *r = function_body_inner(P, fn, arrow);
+    P->fn_depth--;
     P->in_async = saved_async;
     P->in_gen = saved_gen;
     return r;
@@ -2096,8 +2104,6 @@ static struct ast *class_expr(struct parser *P)
             mflags |= F_ASYNC;
         }
         if (accept(P, "*")) {
-            if (mflags & F_ASYNC)
-                return fail_parse(P, "async generators are not supported"), NULL;
             mflags |= F_GEN;
         }
         if (!prop_key(P, m))
@@ -2235,8 +2241,6 @@ static struct ast *primary(struct parser *P)
             if (async)
                 n->flags |= F_ASYNC;
             if (accept(P, "*")) {
-                if (async)
-                    return fail_parse(P, "async generators are not supported"), NULL;
                 n->flags |= F_GEN;
             }
             if (peek(P)->kind == K_IDENT && !at(P, "(")) {
@@ -2257,6 +2261,27 @@ static struct ast *primary(struct parser *P)
         }
         if (tok_is(t, "class"))
             return class_expr(P);
+        if (tok_is(t, "import") && tok_is(peek2(P), "(")) {      /* import(specifier) */
+            P->pos += 2;
+            n = mk(P, N_IMPORT);
+            n->str = js_mkstr(P->J, P->where, (int)strlen(P->where));
+            int saved = P->noin;
+            P->noin = 0;
+            n->a = assignment(P);
+            if (n->a && accept(P, ",") && !at(P, ")") && !assignment(P))    /* options */
+                n->a = NULL;
+            accept(P, ",");
+            P->noin = saved;
+            return n->a && expect(P, ")") ? n : NULL;
+        }
+        if (tok_is(t, "import") && tok_is(peek2(P), ".")) {      /* import.meta */
+            P->pos += 2;
+            if (!accept(P, "meta"))
+                return fail_parse(P, "expected import.meta"), NULL;
+            if (!P->module)
+                return fail_parse(P, "import.meta is only valid in a module"), NULL;
+            return mk(P, N_IMPORT_META);
+        }
         if (tok_is(t, "super") && (tok_is(peek2(P), "(") || tok_is(peek2(P), ".") || tok_is(peek2(P), "["))) {
             P->pos++;
             return mk(P, N_SUPER);
@@ -2479,6 +2504,8 @@ static struct ast *unary(struct parser *P)
     }
     if (P->in_async && tok_is(t, "await")) {
         P->pos++;
+        if (!P->fn_depth)
+            P->tla = 1;
         struct ast *u = mk(P, N_AWAIT);
         u->a = unary(P);
         return u->a ? u : NULL;
@@ -2757,6 +2784,8 @@ static struct ast *for_statement(struct parser *P)
             return fail_parse(P, "for await is only valid in an async function"), NULL;
         P->pos++;
         await_loop = 1;
+        if (!P->fn_depth)
+            P->tla = 1;
     }
     if (!expect(P, "("))
         return NULL;
@@ -2832,8 +2861,6 @@ static struct ast *statement(struct parser *P)
         int async = tok_is(t, "async"), flags = async ? F_ASYNC : 0;
         P->pos += async ? 2 : 1;
         if (accept(P, "*")) {
-            if (async)
-                return fail_parse(P, "async generators are not supported"), NULL;
             flags |= F_GEN;
         }
         struct tok *name = peek(P);
@@ -2862,8 +2889,9 @@ static struct ast *statement(struct parser *P)
         list_add(P, &n->list, &n->n, &ncap, d);
         return n;
     }
-    if (tok_is(t, "import") || tok_is(t, "export"))
-        return fail_parse(P, "modules are not supported"), NULL;
+    if ((tok_is(t, "import") && !tok_is(peek2(P), "(") && !tok_is(peek2(P), ".")) || tok_is(t, "export"))
+        return fail_parse(P, P->module ? "import and export may only appear at the top level"
+                                       : "import and export may only appear in a module"), NULL;
     if (accept(P, "if")) {
         n = mk(P, S_IF);
         if (!expect(P, "(") || !(n->a = expression(P)) || !expect(P, ")") || !(n->b = statement(P)))
@@ -3085,6 +3113,8 @@ static void prepare_body(struct js *J, struct ast *body, struct fninfo *fi)
     fi->prepared = 1;
     for (int i = 0; i < body->n; i++) {
         struct ast *s = body->list[i];
+        if (s->kind == S_EXPORT && s->op == EX_DECL)
+            s = s->a;
         if (s->kind == S_FUNCDECL) {
             if (fi->nfuncs == fcap) {
                 int nc = fcap ? fcap * 2 : 4;
@@ -3101,7 +3131,217 @@ static void prepare_body(struct js *J, struct ast *body, struct fninfo *fi)
     }
 }
 
-/* No collections while parsing: the tokens' strings are in memory the collector does not scan. */
+/* ---- modules: import and export declarations ---- */
+
+/* A pair of names, a in one module (or "*", or "default") and b in the other. */
+static struct ast *name_pair(struct parser *P, struct jsstr *a, struct jsstr *b)
+{
+    struct ast *p = mk(P, N_PROP);
+    p->a = mk(P, N_STR);
+    p->a->str = a;
+    p->b = mk(P, N_STR);
+    p->b->str = b;
+    return p;
+}
+
+/* A name in an import or export list: an identifier (keywords too) or a string. */
+static struct jsstr *module_name(struct parser *P)
+{
+    struct tok *t = peek(P);
+    if (t->kind != K_IDENT && t->kind != K_STR)
+        return fail_parse(P, "expected a name"), NULL;
+    P->pos++;
+    return t->kind == K_STR ? t->str : tok_name(P, t);
+}
+
+static struct jsstr *local_name(struct parser *P)
+{
+    struct tok *t = peek(P);
+    if (t->kind != K_IDENT || is_keyword(t))
+        return fail_parse(P, "expected a name"), NULL;
+    P->pos++;
+    return tok_name(P, t);
+}
+
+/* from "specifier" [with { type: "json" }]; */
+static int module_from(struct parser *P, struct ast *n)
+{
+    if (!accept(P, "from"))
+        return fail_parse(P, "expected 'from'");
+    struct tok *t = peek(P);
+    if (t->kind != K_STR)
+        return fail_parse(P, "expected a module specifier");
+    n->str = t->str;
+    P->pos++;
+    if ((at(P, "with") || at(P, "assert")) && !peek(P)->nl && tok_is(peek2(P), "{")) {
+        P->pos += 2;
+        for (int depth = 1; depth && peek(P)->kind != K_EOF; P->pos++)
+            depth += at(P, "{") - at(P, "}");
+    }
+    return semicolon(P);
+}
+
+static struct ast *import_declaration(struct parser *P)
+{
+    struct ast *n = mk(P, S_IMPORT);
+    int cap = 0;
+    struct jsstr *star = js_mkstr(P->J, "*", 1), *dflt = js_mkstr(P->J, "default", 7);
+    if (peek(P)->kind == K_STR) {                /* import "x"; */
+        n->str = peek(P)->str;
+        P->pos++;
+        return semicolon(P) ? n : NULL;
+    }
+    if (peek(P)->kind == K_IDENT) {              /* import name from "x" */
+        struct jsstr *local = local_name(P);
+        if (!local)
+            return NULL;
+        list_add(P, &n->list, &n->n, &cap, name_pair(P, dflt, local));
+        if (!accept(P, ","))
+            return module_from(P, n) ? n : NULL;
+    }
+    if (accept(P, "*")) {                        /* * as ns */
+        struct jsstr *local;
+        if (!accept(P, "as"))
+            return fail_parse(P, "expected 'as'"), NULL;
+        if (!(local = local_name(P)))
+            return NULL;
+        list_add(P, &n->list, &n->n, &cap, name_pair(P, star, local));
+    } else if (accept(P, "{")) {                 /* { a, b as c, "d" as e } */
+        while (!accept(P, "}")) {
+            struct jsstr *name = module_name(P), *local = name;
+            if (!name)
+                return NULL;
+            if (accept(P, "as") && !(local = local_name(P)))
+                return NULL;
+            list_add(P, &n->list, &n->n, &cap, name_pair(P, name, local));
+            if (!at(P, "}") && !expect(P, ","))
+                return NULL;
+        }
+    } else {
+        return fail_parse(P, "bad import"), NULL;
+    }
+    return module_from(P, n) ? n : NULL;
+}
+
+/* The names a declaration exports as themselves. */
+static void export_pattern(struct parser *P, struct ast *p, struct ast *n, int *cap)
+{
+    if (!p)
+        return;
+    switch (p->kind) {
+    case N_IDENT:
+        list_add(P, &n->list, &n->n, cap, name_pair(P, p->str, p->str));
+        break;
+    case N_ASSIGN:
+    case N_SPREAD:
+        export_pattern(P, p->a, n, cap);
+        break;
+    case N_ARRAY:
+        for (int i = 0; i < p->n; i++)
+            export_pattern(P, p->list[i], n, cap);
+        break;
+    case N_OBJECT:
+        for (int i = 0; i < p->n; i++)
+            export_pattern(P, p->list[i]->a, n, cap);
+        break;
+    default:
+        break;
+    }
+}
+
+static struct ast *export_declaration(struct parser *P)
+{
+    struct ast *n = mk(P, S_EXPORT);
+    int cap = 0;
+    struct jsstr *star = js_mkstr(P->J, "*", 1), *dflt = js_mkstr(P->J, "default", 7);
+    if (accept(P, "default")) {
+        struct tok *t = peek(P);
+        int fn = tok_is(t, "function") || (tok_is(t, "async") && tok_is(peek2(P), "function") && !peek2(P)->nl);
+        if (fn || tok_is(t, "class")) {
+            /* export default function f() {}: a declaration, exported as default */
+            int k = P->pos + (tok_is(t, "async") ? 2 : 1);
+            if (k < P->n && tok_is(&P->t[k], "*"))
+                k++;
+            if (k < P->n && P->t[k].kind == K_IDENT && !is_keyword(&P->t[k])) {
+                n->op = EX_DECL;
+                if (!(n->a = statement(P)))
+                    return NULL;
+                struct jsstr *name = n->a->kind == S_FUNCDECL ? n->a->a->str : n->a->list[0]->str;
+                list_add(P, &n->list, &n->n, &cap, name_pair(P, name, dflt));
+                return n;
+            }
+        }
+        n->op = EX_DEFAULT;
+        if (!(n->a = assignment(P)))
+            return NULL;
+        if (fn || tok_is(t, "class"))
+            accept(P, ";");
+        else if (!semicolon(P))
+            return NULL;
+        return n;
+    }
+    if (accept(P, "*")) {                        /* export * [as ns] from "x" */
+        n->op = EX_ALL;
+        if (accept(P, "as")) {
+            struct jsstr *name = module_name(P);
+            if (!name)
+                return NULL;
+            list_add(P, &n->list, &n->n, &cap, name_pair(P, star, name));
+        }
+        return module_from(P, n) ? n : NULL;
+    }
+    if (accept(P, "{")) {                        /* export { a, b as c } [from "x"] */
+        n->op = EX_LIST;
+        while (!accept(P, "}")) {
+            struct jsstr *local = module_name(P), *name = local;
+            if (!local)
+                return NULL;
+            if (accept(P, "as") && !(name = module_name(P)))
+                return NULL;
+            list_add(P, &n->list, &n->n, &cap, name_pair(P, local, name));
+            if (!at(P, "}") && !expect(P, ","))
+                return NULL;
+        }
+        if (at(P, "from"))
+            return module_from(P, n) ? n : NULL;
+        return semicolon(P) ? n : NULL;
+    }
+    struct tok *t = peek(P);
+    if (!var_keyword(P) && !tok_is(t, "function") && !tok_is(t, "async") && !tok_is(t, "class"))
+        return fail_parse(P, "bad export"), NULL;
+    n->op = EX_DECL;
+    if (!(n->a = statement(P)))
+        return NULL;
+    if (n->a->kind == S_FUNCDECL) {
+        list_add(P, &n->list, &n->n, &cap, name_pair(P, n->a->a->str, n->a->a->str));
+    } else if (n->a->kind == S_VAR) {
+        for (int i = 0; i < n->a->n; i++) {
+            struct ast *d = n->a->list[i];
+            export_pattern(P, d->kind == N_DESTRUCT ? d->b : d, n, &cap);
+        }
+    } else {
+        return fail_parse(P, "bad export"), NULL;
+    }
+    return n;
+}
+
+/* A statement at a module's top level, where import and export may be. */
+static struct ast *module_item(struct parser *P)
+{
+    struct tok *t = peek(P);
+    if (tok_is(t, "import") && !tok_is(peek2(P), "(") && !tok_is(peek2(P), ".")) {
+        P->pos++;
+        return import_declaration(P);
+    }
+    if (tok_is(t, "export")) {
+        P->pos++;
+        return export_declaration(P);
+    }
+    return statement(P);
+}
+
+/* No collections while parsing: the tokens' strings are in memory the collector does not scan.
+ * expr_only: 0 a script, 1 an expression, 2 a module (prog->op is 1 if it awaits at its top level). */
 static struct ast *parse(struct js *J, const char *src, int len, const char *where, int expr_only)
 {
     struct lexer L = { J, src, src + len, 1, NULL, 0, 0, NULL, 0 };
@@ -3113,9 +3353,22 @@ static struct ast *parse(struct js *J, const char *src, int len, const char *whe
         J->gc_inhibit--;
         return NULL;
     }
-    struct parser P = { J, L.toks, 0, L.n, NULL, 0, 0, 0, where, 0, 0, NULL, 0, 0 };
+    struct parser P = { J, L.toks, 0, L.n, NULL, 0, 0, 0, where, 0, 0, NULL, 0, 0, 0, 0, 0 };
     struct ast *prog;
-    if (expr_only) {
+    if (expr_only == 2) {
+        P.module = 1;
+        P.in_async = 1;
+        prog = mk(&P, S_BLOCK);
+        int cap = 0;
+        while (peek(&P)->kind != K_EOF) {
+            struct ast *s = module_item(&P);
+            if (!s)
+                break;
+            list_add(&P, &prog->list, &prog->n, &cap, s);
+        }
+        prog->op = (uint8_t)P.tla;
+        prog->info = js_alloc(J, sizeof(struct fninfo));
+    } else if (expr_only) {
         prog = expression(&P);
         if (prog && peek(&P)->kind != K_EOF)
             fail_parse(&P, "unexpected token");
@@ -3156,6 +3409,7 @@ struct binding {
     jsval v;
     struct binding *next;
     uint8_t konst;
+    struct binding *alias;              /* an import: the exporting module's binding */
 };
 
 struct env {
@@ -3224,6 +3478,7 @@ static struct binding *declare(struct js *J, struct env *e, struct jsstr *name, 
     b->name = name;
     b->v = v;
     b->konst = (uint8_t)konst;
+    b->alias = NULL;
     b->next = e->vars;
     e->vars = b;
     return b;
@@ -3250,8 +3505,11 @@ static struct binding *lookup(struct env *e, struct jsstr *name, struct jsobj **
     *in_obj = NULL;
     for (; e; e = e->parent) {
         for (struct binding *b = e->vars; b; b = b->next)
-            if (str_eq(b->name, name))
+            if (str_eq(b->name, name)) {
+                while (b->alias)
+                    b = b->alias;
                 return b;
+            }
         if (e->obj) {
             for (struct jsobj *o = e->obj; o; o = o->proto)
                 if (js_own(o, name)) {
@@ -3270,6 +3528,8 @@ enum { CN, CR, CB, CC, CT };            /* normal, return, break, continue, thro
 enum { B_ASSIGN, B_VAR, B_LET, B_CONST };      /* how bind_pattern declares what it binds */
 
 static jsval eval(struct js *J, struct ast *n, struct env *e);
+static jsval mod_import(struct js *J, const char *spec, const char *base);
+static int in_async_gen(struct js *J);
 static void bind_pattern(struct js *J, struct ast *p, jsval v, struct env *e, int mode);
 static jsval super_call(struct js *J, struct ast *n, struct env *e);
 static jsval super_get(struct js *J, struct ast *n, struct env *e, jsval key);
@@ -3349,6 +3609,11 @@ static jsval run_user(struct js *J, struct jsobj *f, jsval self, jsval *args, in
     if (++J->depth > JS_MAX_DEPTH) {
         J->depth--;
         return js_throw_error(J, "RangeError: maximum call stack size exceeded");
+    }
+    if (fn->flags & F_MODULE) {         /* its bindings were made when it was linked */
+        exec_list(J, fn->a->list, fn->a->n, f->scope);
+        J->depth--;
+        return js_undefined;
     }
     struct env *e = new_env(J, f->scope);
     if (f->home)
@@ -4055,6 +4320,8 @@ static void adopt(struct js *J, struct jsobj *self, struct jsobj *from)
             q->setter = p->setter;
         }
     }
+    if (from->cls == C_HOST && from->hcls && from->hcls->adopt)
+        from->hcls->adopt(J, self, from);
 }
 
 /* super(...) in a constructor: the parent runs on the same this. */
@@ -4079,7 +4346,10 @@ static jsval super_call(struct js *J, struct ast *n, struct env *e)
     while (parent->bound)
         parent = parent->bound;
     if (parent->native) {
+        struct jsobj *saved = J->super_this;
+        J->super_this = self.u.o;
         jsval made = js_construct(J, js_obj(parent), args, argc);
+        J->super_this = saved;
         TRY();
         if (made.t == JS_OBJ && made.u.o != self.u.o)
             adopt(J, self.u.o, made.u.o);
@@ -4314,10 +4584,23 @@ static jsval eval(struct js *J, struct ast *n, struct env *e)
         TRY();
         return await_value(J, v);
     }
+    case N_IMPORT: {
+        jsval spec = eval(J, n->a, e);
+        TRY();
+        struct jsstr *s = js_tostr(J, spec);
+        TRY();
+        return mod_import(J, s->s, n->str->s);
+    }
+    case N_IMPORT_META:
+        return read_var(J, e, J->s_meta, 1);
     case N_YIELD: {
         if (!n->op) {
             jsval v = n->a ? eval(J, n->a, e) : js_undefined;
             TRY();
+            if (in_async_gen(J) && js_is_promise(v)) {     /* async: yield await v */
+                v = await_value(J, v);
+                TRY();
+            }
             return yield_value(J, v);
         }
         jsval src = eval(J, n->a, e);       /* yield*: pass on everything the other iterable gives */
@@ -4744,6 +5027,19 @@ static int exec(struct js *J, struct ast *n, struct env *e)
     switch (n->kind) {
     case S_EMPTY:
     case S_FUNCDECL:                    /* hoisted */
+    case S_IMPORT:                      /* bound when the module was linked */
+        return CN;
+    case S_EXPORT:
+        if (n->op == EX_DECL)
+            return exec(J, n->a, e);
+        if (n->op == EX_DEFAULT) {
+            jsval v = eval(J, n->a, e);
+            if (J->throwing)
+                return CT;
+            if (js_is_callable(v) && v.u.o->fn && (!v.u.o->name || !*v.u.o->name))
+                v.u.o->name = "default";
+            declare(J, e, J->s_default, v, 0);
+        }
         return CN;
     case S_EXPR:
         J->completion = eval(J, n->a, e);
@@ -5161,7 +5457,7 @@ static jsval co_suspend(struct js *J, struct coro *co, int kind, jsval out)
 static jsval await_value(struct js *J, jsval v)
 {
     struct coro *co = J->cur_co;
-    if (!co || co->is_gen)
+    if (!co || co->is_gen == 1)
         return js_throw_error(J, "SyntaxError: await is only valid in an async function");
     return co_suspend(J, co, OUT_AWAIT, v);
 }
@@ -5176,7 +5472,7 @@ static jsval yield_value(struct js *J, jsval v)
 
 /* ---- async functions ---- */
 
-static const struct jsclass coro_class = { "Coroutine", NULL, NULL };
+static const struct jsclass coro_class = { "Coroutine", NULL, NULL, NULL };
 
 static void co_step(struct js *J, struct coro *co, jsval v, int mode);
 
@@ -5218,7 +5514,7 @@ struct gen {
     int running;
 };
 
-static const struct jsclass gen_class = { "Generator", NULL, NULL };
+static const struct jsclass gen_class = { "Generator", NULL, NULL, NULL };
 
 static jsval iter_result(struct js *J, jsval value, int done)
 {
@@ -5281,6 +5577,15 @@ static jsval gen_self(struct js *J, jsval self, jsval *args, int argc)
     return self;
 }
 
+static jsval agen_next(struct js *J, jsval self, jsval *args, int argc);
+static jsval agen_return(struct js *J, jsval self, jsval *args, int argc);
+static jsval agen_throw(struct js *J, jsval self, jsval *args, int argc);
+
+static int in_async_gen(struct js *J)
+{
+    return J->cur_co && J->cur_co->is_gen == 2;
+}
+
 static void init_generators(struct js *J)
 {
     struct jsobj *gp = J->generator_proto = js_mkobj(J, C_OBJECT, J->object_proto);
@@ -5289,10 +5594,156 @@ static void init_generators(struct js *J)
     js_define_native(J, gp, "throw", gen_throw, 1);
     js_define_native(J, gp, "@@iterator", gen_self, 0);
     J->return_marker = js_new_object(J);
+    struct jsobj *ap = J->agen_proto = js_mkobj(J, C_OBJECT, J->object_proto);
+    js_define_native(J, ap, "next", agen_next, 1);
+    js_define_native(J, ap, "return", agen_return, 1);
+    js_define_native(J, ap, "throw", agen_throw, 1);
+    js_define_native(J, ap, "@@asyncIterator", gen_self, 0);
+}
+
+/* ---- async generators ----
+ * next(), throw() and return() queue a request and return its promise; the
+ * coroutine serves them in order, waiting through its awaits. */
+
+struct agen_req {
+    struct agen_req *next;
+    int mode;
+    jsval v, promise;
+};
+
+struct agen {
+    struct coro *co;
+    struct agen_req *head, *tail;
+    int running;
+};
+
+static const struct jsclass agen_class = { "AsyncGenerator", NULL, NULL, NULL };
+
+static void agen_drain(struct js *J, struct agen *g);
+
+/* The request at the head is answered: settle it and serve the next. */
+static void agen_answer(struct js *J, struct agen *g, int reject, jsval v, int done)
+{
+    struct agen_req *r = g->head;
+    g->head = r->next;
+    if (!g->head)
+        g->tail = NULL;
+    g->running = 0;
+    if (reject)
+        js_promise_settle(J, r->promise, 2, v);
+    else
+        js_promise_resolve(J, r->promise, iter_result(J, v, done));
+}
+
+static void agen_after(struct js *J, struct agen *g);
+
+static jsval agen_on_ok(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct agen *g = self.t == JS_OBJ ? js_host_data(self.u.o, &agen_class) : NULL;
+    if (g) {
+        co_resume(J, g->co, argc ? args[0] : js_undefined, CO_NEXT);
+        agen_after(J, g);
+    }
+    return js_undefined;
+}
+
+static jsval agen_on_err(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct agen *g = self.t == JS_OBJ ? js_host_data(self.u.o, &agen_class) : NULL;
+    if (g) {
+        co_resume(J, g->co, argc ? args[0] : js_undefined, CO_THROW);
+        agen_after(J, g);
+    }
+    return js_undefined;
+}
+
+/* The coroutine stopped: it finished, yielded, or awaits something. */
+static void agen_after(struct js *J, struct agen *g)
+{
+    struct coro *co = g->co;
+    if (co->state == CO_DONE) {
+        int threw = co->threw;
+        co->threw = 0;
+        agen_answer(J, g, threw, threw ? co->exc : co->result, 1);
+        agen_drain(J, g);
+        return;
+    }
+    if (co->out_kind == OUT_AWAIT) {
+        jsval p = js_promise_from(J, co->out_val);
+        js_promise_watch(J, p, agen_on_ok, agen_on_err, js_obj(js_new_host(J, &agen_class, g)));
+        return;
+    }
+    agen_answer(J, g, 0, co->out_val, 0);
+    agen_drain(J, g);
+}
+
+static void agen_drain(struct js *J, struct agen *g)
+{
+    while (g->head && !g->running) {
+        struct agen_req *r = g->head;
+        struct coro *co = g->co;
+        if (co->state == CO_NEW && r->mode != CO_NEXT) {        /* closed before it started */
+            co->state = CO_DONE;
+            co_unlink(co);
+        }
+        if (co->state == CO_DONE) {
+            agen_answer(J, g, r->mode == CO_THROW, r->mode == CO_NEXT ? js_undefined : r->v, 1);
+            continue;
+        }
+        g->running = 1;
+        co_resume(J, co, r->v, r->mode);
+        agen_after(J, g);
+    }
+}
+
+static jsval agen_request(struct js *J, jsval self, jsval v, int mode)
+{
+    struct agen *g = self.t == JS_OBJ ? js_host_data(self.u.o, &agen_class) : NULL;
+    jsval p = js_promise_new(J);
+    if (!g) {
+        js_promise_settle(J, p, 2, js_make_error(J, "TypeError", "not an async generator"));
+        return p;
+    }
+    struct agen_req *r = js_alloc(J, sizeof(*r));
+    r->mode = mode;
+    r->v = v;
+    r->promise = p;
+    if (g->tail)
+        g->tail->next = r;
+    else
+        g->head = r;
+    g->tail = r;
+    agen_drain(J, g);
+    return p;
+}
+
+static jsval agen_next(struct js *J, jsval self, jsval *args, int argc)
+{
+    return agen_request(J, self, argc ? args[0] : js_undefined, CO_NEXT);
+}
+
+static jsval agen_throw(struct js *J, jsval self, jsval *args, int argc)
+{
+    return agen_request(J, self, argc ? args[0] : js_undefined, CO_THROW);
+}
+
+static jsval agen_return(struct js *J, jsval self, jsval *args, int argc)
+{
+    return agen_request(J, self, argc ? args[0] : js_undefined, CO_RETURN);
 }
 
 static jsval start_coroutine(struct js *J, struct jsobj *f, jsval self, jsval *args, int argc)
 {
+    if ((f->fn->flags & F_GEN) && (f->fn->flags & F_ASYNC)) {
+        struct coro *co = co_new(J, f, self, args, argc, 2);
+        if (!co)
+            return js_undefined;
+        struct agen *g = js_alloc(J, sizeof(*g));
+        g->co = co;
+        struct jsobj *o = js_new_host(J, &agen_class, g);
+        o->proto = J->agen_proto;
+        return js_obj(o);
+    }
     if (f->fn->flags & F_GEN) {
         struct coro *co = co_new(J, f, self, args, argc, 1);
         if (!co)
@@ -5549,6 +6000,644 @@ jsval js_compile_handler(struct js *J, const char *body, const char *where)
     return f;
 }
 
+/* ---- modules ----
+ *
+ * Every module the page imports is fetched once (by URL) and kept here.
+ * A module script or import() waits as an entry until every module in
+ * its graph is parsed (or one failed); then the graph is linked, each
+ * module getting a scope whose imports alias the exporters' bindings,
+ * and run dependencies first. A module that awaits at its top level runs
+ * as an async function, and what comes after it waits for it.
+ */
+
+enum { MS_FETCHING, MS_LOADED, MS_LINKED, MS_EVALUATING, MS_DONE, MS_FAILED };
+
+struct jsmod {
+    struct jsmod *next;
+    int id;
+    struct jsstr *url;
+    uint8_t state, inline_src, async;
+    struct ast *prog;
+    struct env *env;
+    struct jsobj *ns;                   /* the namespace object, once asked for */
+    jsval error;                        /* MS_FAILED */
+    jsval promise;                      /* an async module's evaluation */
+    struct jsmod **deps;                /* one per import or export ... from, in order */
+    int ndeps;
+    unsigned mark;
+};
+
+struct jsentry {
+    struct jsentry *next;
+    struct jsmod *m;
+    void *tag;                          /* a module script's, for the host */
+    jsval promise;                      /* import(): settles with the namespace */
+    int dynamic;
+};
+
+struct modjob {                         /* running a graph: its modules in order */
+    struct jsentry *en;
+    struct jsmod **order;
+    int n, i;
+};
+
+struct resolved {
+    struct jsmod *m;                    /* the module and binding that hold the export */
+    struct jsstr *local;
+    struct jsmod *ns;                   /* or: the export is this module's namespace */
+};
+
+void js_module_host(struct js *J, const struct js_modhost *h)
+{
+    J->modhost = *h;
+}
+
+static struct jsmod *mod_new(struct js *J, const char *url, int inline_src)
+{
+    struct jsmod *m = js_alloc(J, sizeof(*m));
+    m->id = ++J->mod_ids;
+    m->url = js_mkstr(J, url, (int)strlen(url));
+    m->inline_src = (uint8_t)inline_src;
+    m->error = js_undefined;
+    m->promise = js_undefined;
+    m->next = J->mods;
+    J->mods = m;
+    return m;
+}
+
+static void mod_fail(struct js *J, struct jsmod *m, jsval error)
+{
+    m->state = MS_FAILED;
+    m->error = error;
+    (void)J;
+}
+
+/* The module at url, asked for from the host if it is new. */
+static struct jsmod *mod_request(struct js *J, const char *url)
+{
+    for (struct jsmod *m = J->mods; m; m = m->next)
+        if (!m->inline_src && !strcmp(m->url->s, url))
+            return m;
+    struct jsmod *m = mod_new(J, url, 0);
+    if (J->modhost.fetch)
+        J->modhost.fetch(J->modhost.ctx, m->id, url);
+    else
+        mod_fail(J, m, js_make_error(J, "TypeError", "modules cannot be fetched here"));
+    return m;
+}
+
+static int resolve_spec(struct js *J, const char *spec, const char *base, char *out, int size)
+{
+    if (J->modhost.resolve)
+        return J->modhost.resolve(J->modhost.ctx, spec, base, out, size);
+    snprintf(out, (size_t)size, "%s", spec);
+    return 0;
+}
+
+/* A module's source is here: parse it and ask for what it imports. */
+static void mod_set_source(struct js *J, struct jsmod *m, const char *src, int len)
+{
+    struct ast *prog = parse(J, src, len, m->url->s, 2);
+    if (!prog) {
+        mod_fail(J, m, js_make_error(J, "SyntaxError", J->err));
+        return;
+    }
+    prepare_body(J, prog, prog->info);
+    int n = 0;
+    for (int i = 0; i < prog->n; i++)
+        if ((prog->list[i]->kind == S_IMPORT || prog->list[i]->kind == S_EXPORT) && prog->list[i]->str)
+            prog->list[i]->num = n++;
+    struct jsmod **deps = js_alloc(J, sizeof(*deps) * (size_t)(n ? n : 1));
+    char url[URL_MAX];
+    for (int i = 0; i < n; i++)
+        deps[i] = NULL;
+    m->prog = prog;
+    m->async = prog->op;
+    m->deps = deps;
+    m->ndeps = n;
+    m->state = MS_LOADED;
+    for (int i = 0, k = 0; i < prog->n; i++) {
+        struct ast *s = prog->list[i];
+        if ((s->kind != S_IMPORT && s->kind != S_EXPORT) || !s->str)
+            continue;
+        if (resolve_spec(J, s->str->s, m->url->s, url, sizeof(url)) < 0) {
+            char msg[300];
+            snprintf(msg, sizeof(msg), "Failed to resolve module specifier \"%.200s\"", s->str->s);
+            mod_fail(J, m, js_make_error(J, "TypeError", msg));
+            return;
+        }
+        deps[k++] = mod_request(J, url);
+    }
+}
+
+/* Is every module m leads to here? 1 yes, 0 not yet, -1 one failed (its error in *err). */
+static int graph_state(struct js *J, struct jsmod *m, jsval *err)
+{
+    if (m->mark == J->mod_mark)
+        return 1;
+    m->mark = J->mod_mark;
+    if (m->state == MS_FAILED) {
+        *err = m->error;
+        return -1;
+    }
+    if (m->state == MS_FETCHING)
+        return 0;
+    int r = 1;
+    for (int i = 0; i < m->ndeps; i++) {
+        int s = m->deps[i] ? graph_state(J, m->deps[i], err) : 0;
+        if (s < 0)
+            return -1;
+        if (!s)
+            r = 0;
+    }
+    return r;
+}
+
+/* The modules m leads to, dependencies before what imports them. */
+static void post_order(struct js *J, struct jsmod *m, struct jsmod ***list, int *n, int *cap)
+{
+    if (!m || m->mark == J->mod_mark)
+        return;
+    m->mark = J->mod_mark;
+    for (int i = 0; i < m->ndeps; i++)
+        post_order(J, m->deps[i], list, n, cap);
+    if (*n == *cap) {
+        int nc = *cap ? *cap * 2 : 16;
+        struct jsmod **nl = js_alloc(J, sizeof(*nl) * (size_t)nc);
+        if (*n)
+            memcpy(nl, *list, sizeof(*nl) * (size_t)*n);
+        *list = nl;
+        *cap = nc;
+    }
+    (*list)[(*n)++] = m;
+}
+
+static struct binding *find_binding(struct env *e, struct jsstr *name)
+{
+    for (struct binding *b = e->vars; b; b = b->next)
+        if (str_eq(b->name, name))
+            return b;
+    return NULL;
+}
+
+/* Where module m's export `name` lives, following re-exports. */
+static int resolve_export(struct js *J, struct jsmod *m, const char *name, struct resolved *r, int depth)
+{
+    if (depth > 64 || !m || !m->prog)
+        return 0;
+    struct ast *prog = m->prog;
+    for (int i = 0; i < prog->n; i++) {
+        struct ast *s = prog->list[i];
+        if (s->kind != S_EXPORT)
+            continue;
+        if (s->op == EX_DEFAULT) {
+            if (!strcmp(name, "default")) {
+                r->m = m, r->local = J->s_default, r->ns = NULL;
+                return 1;
+            }
+            continue;
+        }
+        for (int k = 0; k < s->n; k++) {
+            struct ast *p = s->list[k];
+            if (strcmp(p->b->str->s, name))
+                continue;
+            if (!s->str) {
+                r->m = m, r->local = p->a->str, r->ns = NULL;
+                return 1;
+            }
+            struct jsmod *dep = m->deps[(int)s->num];
+            if (str_is(p->a->str, "*")) {
+                r->m = NULL, r->local = NULL, r->ns = dep;
+                return 1;
+            }
+            return resolve_export(J, dep, p->a->str->s, r, depth + 1);
+        }
+    }
+    if (!strcmp(name, "default"))
+        return 0;
+    for (int i = 0; i < prog->n; i++) {         /* export * from "x" */
+        struct ast *s = prog->list[i];
+        if (s->kind == S_EXPORT && s->op == EX_ALL && !s->n &&
+            resolve_export(J, m->deps[(int)s->num], name, r, depth + 1))
+            return 1;
+    }
+    return 0;
+}
+
+static struct jsobj *mod_namespace(struct js *J, struct jsmod *m);
+
+/* The value an import sees: live, from the exporter's binding. */
+static int ns_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
+{
+    struct jsmod *m = o->hdata;
+    struct resolved r;
+    if (!resolve_export(J, m, key, &r, 0))
+        return 0;
+    if (r.ns) {
+        *out = js_obj(mod_namespace(J, r.ns));
+        return 1;
+    }
+    struct binding *b = r.m->env ? find_binding(r.m->env, r.local) : NULL;
+    while (b && b->alias)
+        b = b->alias;
+    *out = b ? b->v : js_undefined;
+    return 1;
+}
+
+static int ns_set(struct js *J, struct jsobj *o, const char *key, jsval v)
+{
+    (void)J, (void)o, (void)key, (void)v;
+    return 1;                           /* read-only */
+}
+
+static const struct jsclass ns_class = { "Module", ns_get, ns_set, NULL };
+
+/* Every name module m exports: own properties of the namespace, for Object.keys. */
+static void ns_names(struct js *J, struct jsmod *m, struct jsobj *ns, int star, int depth)
+{
+    if (!m || !m->prog || depth > 16)
+        return;
+    for (int i = 0; i < m->prog->n; i++) {
+        struct ast *s = m->prog->list[i];
+        if (s->kind != S_EXPORT)
+            continue;
+        if (s->op == EX_ALL && !s->n) {
+            ns_names(J, m->deps[(int)s->num], ns, 1, depth + 1);
+            continue;
+        }
+        if (s->op == EX_DEFAULT) {
+            if (!star && !js_own(ns, J->s_default))
+                js_put(J, ns, js_mkstr(J, "default", 7), js_undefined, 0);
+            continue;
+        }
+        for (int k = 0; k < s->n; k++) {
+            struct jsstr *name = s->list[k]->b->str;
+            if ((!star || !str_is(name, "default")) && !js_own(ns, name))
+                js_put(J, ns, name, js_undefined, 0);
+        }
+    }
+}
+
+static struct jsobj *mod_namespace(struct js *J, struct jsmod *m)
+{
+    if (!m->ns) {
+        struct jsobj *ns = js_new_host(J, &ns_class, m);
+        ns->proto = NULL;
+        ns_names(J, m, ns, 0, 0);
+        m->ns = ns;
+    }
+    return m->ns;
+}
+
+/* Give a loaded module its scope: hoisted functions, and every top-level name. */
+static void mod_instantiate(struct js *J, struct jsmod *m)
+{
+    struct env *e = js_alloc(J, sizeof(*e));
+    e->parent = J->genv;
+    e->has_self = 1;                    /* this is undefined at a module's top level */
+    e->self = js_undefined;
+    e->captured = 1;
+    m->env = e;
+    struct fninfo *fi = m->prog->info, lex = { 0 };
+    int cap = 0;
+    for (int i = 0; i < m->prog->n; i++) {
+        struct ast *s = m->prog->list[i];
+        if (s->kind == S_EXPORT && s->op == EX_DECL)
+            s = s->a;
+        if (s->kind != S_VAR || s->flags == V_VAR)
+            continue;
+        for (int k = 0; k < s->n; k++) {
+            if (s->list[k]->kind == N_DESTRUCT)
+                pattern_vars(J, s->list[k]->b, &lex, &cap);
+            else
+                add_var(J, &lex, &cap, s->list[k]->str);
+        }
+    }
+    for (int i = 0; i < lex.nvars; i++)
+        declare(J, e, lex.vars[i], js_undefined, 0);
+    for (int i = 0; i < fi->nvars; i++)
+        if (!find_binding(e, fi->vars[i]))
+            declare(J, e, fi->vars[i], js_undefined, 0);
+    declare(J, e, J->s_default, js_undefined, 0);
+    struct jsobj *meta = js_new_object(J);
+    js_put(J, meta, js_mkstr(J, "url", 3), strv(m->url), 0);
+    declare(J, e, J->s_meta, js_obj(meta), 1);
+    for (int i = 0; i < fi->nfuncs; i++)
+        declare(J, e, fi->funcs[i]->str, make_function(J, fi->funcs[i], e), 0);
+    m->state = MS_LINKED;
+}
+
+/* Point a linked module's imports at what they import; 0, or -1 with it failed. */
+static int mod_bind_imports(struct js *J, struct jsmod *m)
+{
+    for (int i = 0; i < m->prog->n; i++) {
+        struct ast *s = m->prog->list[i];
+        if (s->kind != S_IMPORT || !s->str)
+            continue;
+        struct jsmod *dep = m->deps[(int)s->num];
+        for (int k = 0; k < s->n; k++) {
+            struct jsstr *name = s->list[k]->a->str, *local = s->list[k]->b->str;
+            struct resolved r;
+            if (str_is(name, "*")) {
+                declare(J, m->env, local, js_obj(mod_namespace(J, dep)), 1);
+                continue;
+            }
+            if (!resolve_export(J, dep, name->s, &r, 0)) {
+                char msg[400];
+                snprintf(msg, sizeof(msg), "The requested module '%.150s' does not provide an export named '%.100s'",
+                         s->str->s, name->s);
+                mod_fail(J, m, js_make_error(J, "SyntaxError", msg));
+                return -1;
+            }
+            if (r.ns) {
+                declare(J, m->env, local, js_obj(mod_namespace(J, r.ns)), 1);
+                continue;
+            }
+            struct binding *target = r.m->env ? find_binding(r.m->env, r.local) : NULL;
+            struct binding *b = declare(J, m->env, local, js_undefined, 1);
+            if (target != b)
+                b->alias = target;
+        }
+    }
+    return 0;
+}
+
+/* Link every module in m's graph that is not linked yet. */
+static int mod_link(struct js *J, struct jsmod *m, jsval *err)
+{
+    struct jsmod **list = NULL;
+    int n = 0, cap = 0;
+    J->mod_mark++;
+    post_order(J, m, &list, &n, &cap);
+    int fresh = 0;
+    for (int i = 0; i < n; i++)
+        if (list[i]->state == MS_LOADED) {
+            mod_instantiate(J, list[i]);
+            list[fresh++] = list[i];
+        }
+    for (int i = 0; i < fresh; i++)
+        if (mod_bind_imports(J, list[i]) < 0) {
+            *err = list[i]->error;
+            return -1;
+        }
+    return 0;
+}
+
+static void mod_entry_done(struct js *J, struct jsentry *en, int failed, jsval err)
+{
+    if (en->dynamic) {
+        if (failed)
+            js_promise_settle(J, en->promise, 2, err);
+        else
+            js_promise_resolve(J, en->promise, js_obj(mod_namespace(J, en->m)));
+        return;
+    }
+    if (failed)
+        error_text(J, err);
+    if (J->modhost.done)
+        J->modhost.done(J->modhost.ctx, en->tag, failed);
+}
+
+static const struct jsclass modjob_class = { "ModuleJob", NULL, NULL, NULL };
+static void mod_job_run(struct js *J, struct modjob *job);
+
+static jsval mod_job_resume(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)args, (void)argc;
+    struct modjob *job = self.t == JS_OBJ ? js_host_data(self.u.o, &modjob_class) : NULL;
+    if (job)
+        mod_job_run(J, job);
+    return js_undefined;
+}
+
+/* An async module that has finished: done, or failed. */
+static void mod_settle(struct js *J, struct jsmod *m)
+{
+    jsval v;
+    int st;
+    if (m->state != MS_EVALUATING || (st = js_promise_state(m->promise, &v)) <= 0)
+        return;
+    if (st == 1)
+        m->state = MS_DONE;
+    else
+        mod_fail(J, m, v);
+}
+
+/* Wait for promise p, then go on with the job. */
+static void mod_job_wait(struct js *J, struct modjob *job, jsval p)
+{
+    jsval self = js_obj(js_new_host(J, &modjob_class, job));
+    js_promise_watch(J, p, mod_job_resume, mod_job_resume, self);
+}
+
+static void mod_job_run(struct js *J, struct modjob *job)
+{
+    while (job->i < job->n) {
+        struct jsmod *m = job->order[job->i];
+        mod_settle(J, m);
+        if (m->state == MS_FAILED) {
+            mod_entry_done(J, job->en, 1, m->error);
+            return;
+        }
+        if (m->state == MS_DONE) {
+            job->i++;
+            continue;
+        }
+        if (m->state == MS_EVALUATING) {        /* an async module, still running */
+            mod_job_wait(J, job, m->promise);
+            return;
+        }
+        for (int i = 0; i < m->ndeps; i++) {    /* run elsewhere and not finished yet */
+            struct jsmod *d = m->deps[i];
+            mod_settle(J, d);
+            if (d->state == MS_EVALUATING && d->async) {
+                mod_job_wait(J, job, d->promise);
+                return;
+            }
+            if (d->state == MS_FAILED) {
+                mod_fail(J, m, d->error);
+                break;
+            }
+        }
+        if (m->state == MS_FAILED)
+            continue;
+        struct ast *fn = js_alloc(J, sizeof(*fn));
+        fn->kind = N_FUNC;
+        fn->flags = F_MODULE | (m->async ? F_ASYNC : 0);
+        fn->a = m->prog;
+        fn->info = m->prog->info;
+        struct jsobj *f = js_mkobj(J, C_FUNCTION, J->function_proto);
+        f->fn = fn;
+        f->scope = m->env;
+        f->name = "";
+        m->state = MS_EVALUATING;
+        jsval r = js_call_value(J, js_obj(f), js_undefined, NULL, 0);
+        if (J->throwing) {
+            jsval exc = J->exc;
+            J->throwing = 0;
+            J->exc = js_undefined;
+            mod_fail(J, m, exc);
+            continue;
+        }
+        if (m->async)
+            m->promise = r;
+        else
+            m->state = MS_DONE;
+    }
+    mod_entry_done(J, job->en, 0, js_undefined);
+}
+
+/* Link and run the entries whose graphs are all here; fail those that cannot be. */
+static void mod_progress(struct js *J)
+{
+    if (J->mod_busy) {
+        J->mod_again = 1;
+        return;
+    }
+    J->mod_busy = 1;
+    do {
+        J->mod_again = 0;
+        struct jsentry **pp = &J->entries;
+        while (*pp) {
+            struct jsentry *en = *pp;
+            jsval err = js_undefined;
+            J->mod_mark++;
+            int st = graph_state(J, en->m, &err);
+            if (!st) {
+                pp = &en->next;
+                continue;
+            }
+            *pp = en->next;
+            if (st > 0 && mod_link(J, en->m, &err) < 0)
+                st = -1;
+            if (st < 0) {
+                mod_entry_done(J, en, 1, err);
+                continue;
+            }
+            struct modjob *job = js_alloc(J, sizeof(*job));
+            job->en = en;
+            int cap = 0;
+            J->mod_mark++;
+            post_order(J, en->m, &job->order, &job->n, &cap);
+            mod_job_run(J, job);        /* their import()s wait for a microtask */
+        }
+    } while (J->mod_again);
+    J->mod_busy = 0;
+}
+
+static void mod_add_entry(struct js *J, struct jsentry *en)
+{
+    struct jsentry **pp = &J->entries;
+    while (*pp)
+        pp = &(*pp)->next;
+    *pp = en;
+}
+
+static void mod_progress_job(struct js *J, struct job *job)
+{
+    (void)job;
+    mod_progress(J);
+}
+
+/* import(spec): a promise of the module's namespace. */
+static jsval mod_import(struct js *J, const char *spec, const char *base)
+{
+    jsval p = js_promise_new(J);
+    char url[URL_MAX];
+    if (resolve_spec(J, spec, base, url, sizeof(url)) < 0) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "Failed to resolve module specifier \"%.200s\"", spec);
+        js_promise_settle(J, p, 2, js_make_error(J, "TypeError", msg));
+        return p;
+    }
+    struct jsentry *en = js_alloc(J, sizeof(*en));
+    en->promise = p;
+    en->dynamic = 1;
+    en->m = mod_request(J, url);
+    mod_add_entry(J, en);
+    /* never synchronously: the importing code goes on first */
+    js_enqueue(J, mod_progress_job, js_undefined, js_undefined, js_undefined, js_undefined);
+    return p;
+}
+
+void js_run_module(struct js *J, const char *url, int inline_src, const char *src, int len, void *tag)
+{
+    if (enter(J) < 0) {
+        if (J->modhost.done)
+            J->modhost.done(J->modhost.ctx, tag, 1);
+        return;
+    }
+    int outer = !entered;
+    if (outer) {
+        entered = 1;
+        if (__builtin_setjmp(jmp_target)) {
+            entered = 0;
+            free_owner = NULL;
+            J->mod_busy = 0;
+            if (J->modhost.done)
+                J->modhost.done(J->modhost.ctx, tag, 1);
+            return;
+        }
+    }
+    struct jsmod *m = NULL;
+    if (!inline_src)
+        for (m = J->mods; m && (m->inline_src || strcmp(m->url->s, url)); m = m->next)
+            ;
+    if (!m)
+        m = mod_new(J, url, inline_src);
+    if (m->state == MS_FETCHING) {      /* new, or imported and on its way: the source is here */
+        J->mod_busy++;
+        mod_set_source(J, m, src, len);
+        J->mod_busy--;
+    }
+    struct jsentry *en = js_alloc(J, sizeof(*en));
+    en->m = m;
+    en->tag = tag;
+    mod_add_entry(J, en);
+    mod_progress(J);
+    J->throwing = 0;
+    if (outer) {
+        js_run_jobs(J);
+        entered = 0;
+    }
+}
+
+void js_module_source(struct js *J, int id, const char *src, int len)
+{
+    if (enter(J) < 0)
+        return;
+    int outer = !entered;
+    if (outer) {
+        entered = 1;
+        if (__builtin_setjmp(jmp_target)) {
+            entered = 0;
+            free_owner = NULL;
+            J->mod_busy = 0;
+            return;
+        }
+    }
+    struct jsmod *m = J->mods;
+    while (m && m->id != id)
+        m = m->next;
+    if (m && m->state == MS_FETCHING) {
+        J->mod_busy++;
+        if (src) {
+            mod_set_source(J, m, src, len);
+        } else {
+            char msg[URL_MAX + 64];
+            snprintf(msg, sizeof(msg), "Failed to fetch module %s", m->url->s);
+            mod_fail(J, m, js_make_error(J, "TypeError", msg));
+        }
+        J->mod_busy--;
+        mod_progress(J);
+    }
+    J->throwing = 0;
+    if (outer) {
+        js_run_jobs(J);
+        entered = 0;
+    }
+}
+
 const char *js_error(struct js *J)
 {
     return J->err;
@@ -5572,6 +6661,8 @@ struct js *js_new(void *host)
     if (meminfo(&mi) == 0 && mi.free_kb / 2 > (JS_HEAP_MIN >> 10))
         J->heap_limit = mi.free_kb / 2 < (JS_HEAP_MAX >> 10) ? (size_t)(mi.free_kb / 2) << 10 : JS_HEAP_MAX;
     J->s_home = js_mkstr(J, "%home", 5);
+    J->s_default = js_mkstr(J, "*default*", 9);
+    J->s_meta = js_mkstr(J, "%meta", 5);
     J->object_proto = js_mkobj(J, C_OBJECT, NULL);
     J->function_proto = js_mkobj(J, C_FUNCTION, J->object_proto);
     J->global = js_mkobj(J, C_OBJECT, J->object_proto);

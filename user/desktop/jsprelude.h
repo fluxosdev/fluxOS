@@ -117,7 +117,65 @@ static const char js_core[] = JS_SOURCE(
     return o;
   });
   def(String.prototype, "normalize", function () { return String(this); });
+  /* strings are UTF-8 here: there are no lone surrogates */
+  def(String.prototype, "isWellFormed", function () { return true; });
+  def(String.prototype, "toWellFormed", function () { return String(this); });
+  def(Array, "fromAsync", async function (items, f, t) {
+    var r = [], i = 0;
+    if (items && items[Symbol.asyncIterator]) {
+      for await (var x of items) r.push(f ? await f.call(t, x, i++) : x);
+    } else {
+      for (var y of Array.from(items)) { var v = await y; r.push(f ? await f.call(t, v, i++) : v); }
+    }
+    return r;
+  });
+
+  /* ---- Set methods (ES2025) ---- */
+  var SP = Set.prototype;
+  function setLike(o) {
+    if (o instanceof Set || o instanceof Map) return o;
+    if (o && typeof o.has === "function" && typeof o.keys === "function") return o;
+    throw new TypeError("The argument is not set-like");
+  }
+  function keysOf(o) { return o instanceof Set ? Array.from(o) : Array.from(o.keys()); }
+  def(SP, "union", function (o) {
+    var r = new Set(this);
+    keysOf(setLike(o)).forEach(function (k) { r.add(k); });
+    return r;
+  });
+  def(SP, "intersection", function (o) {
+    o = setLike(o);
+    var r = new Set();
+    this.forEach(function (k) { if (o.has(k)) r.add(k); });
+    return r;
+  });
+  def(SP, "difference", function (o) {
+    o = setLike(o);
+    var r = new Set();
+    this.forEach(function (k) { if (!o.has(k)) r.add(k); });
+    return r;
+  });
+  def(SP, "symmetricDifference", function (o) {
+    var self = this, r = new Set(this);
+    keysOf(setLike(o)).forEach(function (k) { if (self.has(k)) r.delete(k); else r.add(k); });
+    return r;
+  });
+  def(SP, "isSubsetOf", function (o) {
+    o = setLike(o);
+    for (var k of Array.from(this)) if (!o.has(k)) return false;
+    return true;
+  });
+  def(SP, "isSupersetOf", function (o) {
+    var self = this;
+    return keysOf(setLike(o)).every(function (k) { return self.has(k); });
+  });
+  def(SP, "isDisjointFrom", function (o) {
+    o = setLike(o);
+    for (var k of Array.from(this)) if (o.has(k)) return false;
+    return true;
+  });
   var M = Math;
+  def(M, "fround", function (x) { return Number(x); });
   def(M, "sinh", function (x) { return (M.exp(x) - M.exp(-x)) / 2; });
   def(M, "cosh", function (x) { return (M.exp(x) + M.exp(-x)) / 2; });
   def(M, "tanh", function (x) {
@@ -144,12 +202,16 @@ static const char js_core[] = JS_SOURCE(
     return ((al * bl) + (((ah * bl + al * bh) << 16) >>> 0) | 0);
   });
 
+  /* addEventListener(type, f, { signal }): the DOM's listeners go when the signal aborts */
+  def(g, "%onAbort", function (signal, target, type, f, capture) {
+    signal.addEventListener("abort", function () { target.removeEventListener(type, f, capture); }, { once: true });
+  });
   /* ---- stubs for what pages look for ---- */
   function Observer() {
     return { observe: function () {}, unobserve: function () {}, disconnect: function () {},
              takeRecords: function () { return []; } };
   }
-  ["MutationObserver", "IntersectionObserver", "ResizeObserver", "PerformanceObserver"].forEach(function (n) {
+  ["PerformanceObserver"].forEach(function (n) {
     if (!(n in g)) def(g, n, function () { return Observer(); });
   });
   if (!("requestIdleCallback" in g)) {
@@ -316,10 +378,90 @@ static const char js_chunk_misc[] = JS_SOURCE(
                resolvedOptions: function () { return { locale: "en-US" }; } };
     },
     DateTimeFormat: function (loc, o) {
-      return { format: function (d) { return (d === undefined ? new Date() : new Date(d)).toLocaleDateString(loc, o); },
-               resolvedOptions: function () { return { locale: "en-US", timeZone: "UTC" }; } };
-    }
+      var fmt = function (d) { return (d === undefined ? new Date() : new Date(d)).toLocaleDateString(loc, o); };
+      return { format: fmt,
+               formatToParts: function (d) { return [{ type: "literal", value: fmt(d) }]; },
+               formatRange: function (a, b) { return fmt(a) + " – " + fmt(b); },
+               resolvedOptions: function () { return { locale: "en-US", timeZone: "UTC", calendar: "gregory" }; } };
+    },
+    Collator: function (loc, o) {
+      var base = o && (o.sensitivity === "base" || o.sensitivity === "accent");
+      var num = o && o.numeric;
+      return {
+        compare: function (a, b) {
+          a = String(a); b = String(b);
+          if (base) { a = a.toLowerCase(); b = b.toLowerCase(); }
+          if (num) {
+            var na = parseFloat(a), nb = parseFloat(b);
+            if (!isNaN(na) && !isNaN(nb) && na !== nb) return na < nb ? -1 : 1;
+          }
+          return a.localeCompare(b);
+        },
+        resolvedOptions: function () { return { locale: "en-US", sensitivity: base ? "base" : "variant" }; }
+      };
+    },
+    PluralRules: function (loc, o) {
+      var ordinal = o && o.type === "ordinal";
+      return {
+        select: function (n) {
+          n = Math.abs(Number(n));
+          if (!ordinal) return n === 1 ? "one" : "other";
+          var t = n % 10, h = n % 100;
+          return t === 1 && h !== 11 ? "one" : t === 2 && h !== 12 ? "two" : t === 3 && h !== 13 ? "few" : "other";
+        },
+        resolvedOptions: function () { return { locale: "en-US", type: ordinal ? "ordinal" : "cardinal" }; }
+      };
+    },
+    RelativeTimeFormat: function (loc, o) {
+      var auto = o && o.numeric === "auto";
+      return {
+        format: function (v, unit) {
+          v = Number(v);
+          unit = String(unit).replace(/s$/, "");
+          if (auto && unit === "day" && Math.abs(v) <= 1) return v === 0 ? "today" : v > 0 ? "tomorrow" : "yesterday";
+          if (auto && v === 0) return "this " + unit;
+          var n = Math.abs(v), u = n === 1 ? unit : unit + "s";
+          return v < 0 ? n + " " + u + " ago" : "in " + n + " " + u;
+        },
+        resolvedOptions: function () { return { locale: "en-US" }; }
+      };
+    },
+    ListFormat: function (loc, o) {
+      var word = o && o.type === "disjunction" ? "or" : "and";
+      return {
+        format: function (list) {
+          var a = Array.from(list).map(String);
+          if (a.length < 2) return a.join("");
+          if (a.length === 2) return a[0] + " " + word + " " + a[1];
+          return a.slice(0, -1).join(", ") + ", " + word + " " + a[a.length - 1];
+        }
+      };
+    },
+    Segmenter: function (loc, o) {
+      var g = o && o.granularity || "grapheme";
+      return {
+        segment: function (s) {
+          s = String(s);
+          /* (no backslashes outside strings here: the C preprocessor would keep them bare) */
+          var parts = g === "word" ? s.split(new RegExp("(\\s+)")).filter(function (p) { return p !== ""; }) :
+                      g === "sentence" ? s.split(new RegExp("(?<=[.!?])\\s+")) : Array.from(s);
+          var at = 0, out = parts.map(function (p) {
+            var r = { segment: p, index: at, input: s };
+            if (g === "word") r.isWordLike = new RegExp("\\w").test(p);
+            at += p.length;
+            return r;
+          });
+          return out;
+        }
+      };
+    },
+    getCanonicalLocales: function (l) { return l === undefined ? [] : [].concat(l); },
+    supportedValuesOf: function () { return []; }
   });
+  ["NumberFormat", "DateTimeFormat", "Collator", "PluralRules", "RelativeTimeFormat", "ListFormat", "Segmenter"]
+    .forEach(function (n) {
+      g.Intl[n].supportedLocalesOf = function (l) { return l === undefined ? [] : [].concat(l); };
+    });
 })(globalThis);
 );
 
@@ -331,9 +473,13 @@ static const char js_chunk_events[] = JS_SOURCE(
     constructor() { def(this, "_l", Object.create(null)); }
     addEventListener(t, f, o) {
       if (!f) return;
+      var sig = o && typeof o === "object" ? o.signal : null;
+      if (sig && sig.aborted) return;
       var l = this._l[t] || (this._l[t] = []);
       for (var i = 0; i < l.length; i++) if (l[i].f === f) return;
       l.push({ f: f, once: !!(o && typeof o === "object" && o.once) });
+      var self = this;
+      if (sig) sig.addEventListener("abort", function () { self.removeEventListener(t, f); }, { once: true });
     }
     removeEventListener(t, f) {
       var l = this._l[t];
@@ -364,6 +510,19 @@ static const char js_chunk_events[] = JS_SOURCE(
     }
     throwIfAborted() { if (this.aborted) throw this.reason; }
     static abort(reason) { var c = new AbortController(); c.abort(reason); return c.signal; }
+    static timeout(ms) {
+      var c = new AbortController();
+      setTimeout(function () { c.abort(new DOMException("The operation timed out.", "TimeoutError")); }, ms);
+      return c.signal;
+    }
+    static any(signals) {
+      var c = new AbortController();
+      Array.from(signals).forEach(function (s) {
+        if (s.aborted) c.abort(s.reason);
+        else s.addEventListener("abort", function () { c.abort(s.reason); });
+      });
+      return c.signal;
+    }
   }
   class AbortController {
     constructor() { this.signal = new AbortSignal(); }
@@ -378,6 +537,176 @@ static const char js_chunk_events[] = JS_SOURCE(
   lz("AbortSignal", AbortSignal);
   lz("AbortController", AbortController);
 
+})(globalThis);
+);
+
+static const char js_chunk_observers[] = JS_SOURCE(
+(function (g) {
+  var def = g["%def"], lz = g["%lazy"];
+  /* ---- MutationObserver: jsdom.c reports each change to %mutation while any observes ---- */
+  var mos = [], pending = false;
+  function deliver() {
+    pending = false;
+    mos.slice().forEach(function (mo) {
+      var q = mo.takeRecords();
+      if (q.length) { try { mo._cb.call(mo, q, mo); } catch (e) { console.error(e); } }
+    });
+  }
+  class MutationObserver {
+    constructor(cb) {
+      if (typeof cb !== "function") throw new TypeError("MutationObserver needs a callback");
+      def(this, "_cb", cb);
+      def(this, "_t", []);
+      def(this, "_q", []);
+    }
+    observe(target, o) {
+      o = Object.assign({}, o || {});
+      if ((o.attributeOldValue || o.attributeFilter) && o.attributes === undefined) o.attributes = true;
+      if (o.characterDataOldValue && o.characterData === undefined) o.characterData = true;
+      if (!o.childList && !o.attributes && !o.characterData)
+        throw new TypeError("MutationObserver.observe needs childList, attributes or characterData");
+      for (var i = 0; i < this._t.length; i++) if (this._t[i].n === target) { this._t[i].o = o; return; }
+      this._t.push({ n: target, o: o });
+      if (mos.indexOf(this) < 0) mos.push(this);
+      g["%watchMutations"](true);
+    }
+    disconnect() {
+      this._t = [];
+      this._q = [];
+      var i = mos.indexOf(this);
+      if (i >= 0) mos.splice(i, 1);
+      if (!mos.length) g["%watchMutations"](false);
+    }
+    takeRecords() { var q = this._q; this._q = []; return q; }
+  }
+  def(g, "%mutation", function (r) {
+    for (var i = 0; i < mos.length; i++) {
+      var mo = mos[i];
+      for (var k = 0; k < mo._t.length; k++) {
+        var t = mo._t[k], o = t.o;
+        if (t.n !== r.target && !(o.subtree && t.n.contains && t.n.contains(r.target))) continue;
+        if (r.type === "childList" && !o.childList) continue;
+        if (r.type === "attributes" && (!o.attributes || (o.attributeFilter && o.attributeFilter.indexOf(r.attributeName) < 0))) continue;
+        if (r.type === "characterData" && !o.characterData) continue;
+        var rec = Object.assign({}, r);
+        if ((r.type === "attributes" && !o.attributeOldValue) || (r.type === "characterData" && !o.characterDataOldValue))
+          rec.oldValue = null;
+        mo._q.push(rec);
+        break;
+      }
+    }
+    if (!pending) { pending = true; queueMicrotask(deliver); }
+  });
+  lz("MutationObserver", MutationObserver);
+
+  /* ---- IntersectionObserver and ResizeObserver: checked after layout and scrolling (%viewChanged) ---- */
+  var watchers = [], queued = false;
+  function checkAll() {
+    queued = false;
+    watchers.slice().forEach(function (w) { try { w._check(); } catch (e) { console.error(e); } });
+  }
+  function soon() { if (!queued) { queued = true; setTimeout(checkAll, 0); } }
+  function watch(w) {
+    if (watchers.indexOf(w) < 0) watchers.push(w);
+    g["%watchView"](true);
+    soon();
+  }
+  function unwatch(w) {
+    var i = watchers.indexOf(w);
+    if (i >= 0) watchers.splice(i, 1);
+    if (!watchers.length) g["%watchView"](false);
+  }
+  def(g, "%viewChanged", checkAll);
+  function margins(s, w, h) {
+    var p = String(s || "0px").trim().split(new RegExp("\\s+")).map(function (v, i) {
+      var n = parseFloat(v) || 0;
+      return v.indexOf("%") >= 0 ? n * (i % 2 ? w : h) / 100 : n;
+    });
+    if (p.length === 1) p = [p[0], p[0], p[0], p[0]];
+    else if (p.length === 2) p = [p[0], p[1], p[0], p[1]];
+    else if (p.length === 3) p = [p[0], p[1], p[2], p[1]];
+    return p;
+  }
+  function rect(x, y, w, h) {
+    return { x: x, y: y, left: x, top: y, width: w, height: h, right: x + w, bottom: y + h };
+  }
+  class IntersectionObserver {
+    constructor(cb, o) {
+      if (typeof cb !== "function") throw new TypeError("IntersectionObserver needs a callback");
+      o = o || {};
+      def(this, "_cb", cb);
+      def(this, "_t", []);
+      this.root = o.root || null;
+      this.rootMargin = o.rootMargin || "0px 0px 0px 0px";
+      this.thresholds = (o.threshold === undefined ? [0] : [].concat(o.threshold)).slice().sort();
+      this.delay = 0;
+      this.trackVisibility = false;
+    }
+    observe(el) {
+      for (var i = 0; i < this._t.length; i++) if (this._t[i].el === el) return;
+      this._t.push({ el: el, state: -1 });
+      watch(this);
+    }
+    unobserve(el) {
+      this._t = this._t.filter(function (t) { return t.el !== el; });
+      if (!this._t.length) unwatch(this);
+    }
+    disconnect() { this._t = []; unwatch(this); }
+    takeRecords() { return []; }
+    _check() {
+      var vw = innerWidth, vh = innerHeight, entries = [], self = this;
+      var root = this.root ? this.root.getBoundingClientRect() : rect(0, 0, vw, vh);
+      var m = margins(this.rootMargin, root.width, root.height);
+      var R = rect(root.left - m[3], root.top - m[0], root.width + m[1] + m[3], root.height + m[0] + m[2]);
+      this._t.forEach(function (t) {
+        var r = t.el.getBoundingClientRect(), laid = r.width > 0 || r.height > 0;
+        var x0 = Math.max(r.left, R.left), y0 = Math.max(r.top, R.top);
+        var x1 = Math.min(r.right, R.right), y1 = Math.min(r.bottom, R.bottom);
+        var hit = laid && t.el.isConnected && x1 >= x0 && y1 >= y0;
+        var area = r.width * r.height;
+        var ratio = !hit ? 0 : area > 0 ? Math.max(0, x1 - x0) * Math.max(0, y1 - y0) / area : 1;
+        var state = hit ? self.thresholds.filter(function (x) { return ratio >= x; }).length : 0;
+        if (state === t.state) return;
+        t.state = state;
+        entries.push({ target: t.el, isIntersecting: hit, intersectionRatio: ratio, isVisible: hit,
+                       boundingClientRect: r, rootBounds: R, time: performance.now(),
+                       intersectionRect: hit ? rect(x0, y0, x1 - x0, y1 - y0) : rect(0, 0, 0, 0) });
+      });
+      if (entries.length) this._cb.call(this, entries, this);
+    }
+  }
+  lz("IntersectionObserver", IntersectionObserver);
+  class ResizeObserver {
+    constructor(cb) {
+      if (typeof cb !== "function") throw new TypeError("ResizeObserver needs a callback");
+      def(this, "_cb", cb);
+      def(this, "_t", []);
+    }
+    observe(el) {
+      for (var i = 0; i < this._t.length; i++) if (this._t[i].el === el) return;
+      this._t.push({ el: el, w: 0, h: 0 });
+      watch(this);
+    }
+    unobserve(el) {
+      this._t = this._t.filter(function (t) { return t.el !== el; });
+      if (!this._t.length) unwatch(this);
+    }
+    disconnect() { this._t = []; unwatch(this); }
+    _check() {
+      var entries = [];
+      this._t.forEach(function (t) {
+        var r = t.el.getBoundingClientRect();
+        if (r.width === t.w && r.height === t.h) return;
+        t.w = r.width;
+        t.h = r.height;
+        var size = [{ inlineSize: r.width, blockSize: r.height }];
+        entries.push({ target: t.el, contentRect: rect(0, 0, r.width, r.height), borderBoxSize: size,
+                       contentBoxSize: size, devicePixelContentBoxSize: size });
+      });
+      if (entries.length) this._cb.call(this, entries, this);
+    }
+  }
+  lz("ResizeObserver", ResizeObserver);
 })(globalThis);
 );
 
@@ -673,22 +1002,82 @@ static const char js_chunk_web[] = JS_SOURCE(
       };
     }
   }
-  /* ---- stubs for APIs a page may probe for ---- */
-  var registry = Object.create(null), pending = Object.create(null);
+  /* ---- custom elements: jsdom.c calls the % hooks once one is defined ---- */
+  var registry = Object.create(null), pending = Object.create(null), names = new Map();
+  function upgrade(el) {
+    var C = registry[el.localName];
+    if (!C || el["%ce"]) return el;
+    g["%upgrading"] = el;
+    var inst;
+    try { inst = new C(); } catch (e) { g["%upgrading"] = null; console.error(e); return el; }
+    g["%upgrading"] = null;
+    def(inst, "%ce", true);
+    var obs = C.observedAttributes;
+    if (obs && typeof inst.attributeChangedCallback === "function")
+      Array.from(obs).forEach(function (a) {
+        if (inst.hasAttribute(a)) inst.attributeChangedCallback(a, null, inst.getAttribute(a));
+      });
+    return inst;
+  }
   var customElements = {
     define: function (name, ctor) {
+      name = String(name);
+      if (name.indexOf("-") < 0) throw new DOMException("Not a valid custom element name: " + name, "SyntaxError");
+      if (registry[name]) throw new DOMException("This name has already been defined: " + name, "NotSupportedError");
       registry[name] = ctor;
-      if (pending[name]) pending[name](ctor);
+      names.set(ctor, name);
+      g["%watchCustom"](true);
+      Array.from(document.querySelectorAll(name)).forEach(function (el) {
+        var u = upgrade(el);
+        if (u.isConnected && typeof u.connectedCallback === "function") u.connectedCallback();
+      });
+      if (pending[name]) { pending[name](ctor); delete pending[name]; }
     },
     get: function (name) { return registry[name]; },
+    getName: function (ctor) { return names.get(ctor) || null; },
     whenDefined: function (name) {
       if (registry[name]) return Promise.resolve(registry[name]);
-      return new Promise(function (res) { pending[name] = res; });
+      var p = pending["%p" + name];
+      if (!p) {
+        p = pending["%p" + name] = new Promise(function (res) { pending[name] = res; });
+      }
+      return p;
     },
-    upgrade: function () {}
+    upgrade: function (root) {
+      Array.from(root.querySelectorAll ? root.querySelectorAll("*") : []).forEach(function (el) {
+        if (registry[el.localName]) upgrade(el);
+      });
+    }
   };
+  def(g, "%ceName", function (C) { return names.get(C); });
+  def(g, "%ceCreate", function (name) {
+    var C = registry[name];
+    if (!C) return undefined;
+    var el = new C();
+    def(el, "%ce", true);
+    return el;
+  });
+  def(g, "%ceConnected", function (el) {
+    var u = upgrade(el);
+    if (u["%ce"] && typeof u.connectedCallback === "function") u.connectedCallback();
+  });
+  def(g, "%ceDisconnected", function (el) {
+    if (el["%ce"] && typeof el.disconnectedCallback === "function") el.disconnectedCallback();
+  });
+  def(g, "%ceAttr", function (el, n, o, v) {
+    var C = registry[el.localName];
+    if (el["%ce"] && C && typeof el.attributeChangedCallback === "function" && C.observedAttributes &&
+        Array.from(C.observedAttributes).indexOf(n) >= 0)
+      el.attributeChangedCallback(n, o, v);
+  });
+  /* ---- stubs for APIs a page may probe for ---- */
   var CSS = {
-    supports: function () { return true; },
+    supports: function (a, b) {
+      return g["%cssSupports"](arguments.length > 1 ? "(" + a + ": " + b + ")" : String(a));
+    },
+    registerProperty: function () {},
+    highlights: new Map(),
+    px: function (n) { return n + "px"; },
     escape: function (s) { return String(s).replace(/[^a-zA-Z0-9_-]/g, function (c) { return "\\" + c; }); }
   };
   class WebSocket {

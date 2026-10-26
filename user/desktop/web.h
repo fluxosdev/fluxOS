@@ -124,6 +124,11 @@ struct node {
     struct style *pseudo_st[2];
     const char *pseudo_text[2];
 
+    int bx0, by0, bx1, by1;             /* browser.c: its box in the last layout, for scripts */
+    struct sheet *sheet;                /* browser.c: <style> and <link rel=stylesheet>: its sheet */
+    uintptr_t sheet_sig;                /* what it was parsed from (<style>), or 1 once fetched (<link>) */
+    unsigned bgen;                      /* the layout bx0... belong to */
+
     void *js;                           /* the script engine's wrapper (jsdom.c) */
     unsigned gcpass;                    /* jsdom.c: its tree's wrappers marked in this collection */
 };
@@ -268,6 +273,16 @@ void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int 
                  int viewport_w, int viewport_h, int (*visited)(const char *href, void *ctx),
                  void *ctx);
 int css_parse_color(const char *s, int n, uint32_t *out);
+/* oklch(), lab(), hwb(), color(), color-mix() and the rest (csscolor.c, in floating point). */
+int css_color_function(const char *s, uint32_t *out);
+/* An @supports condition ("(display: grid) and (not (color: oklch(0 0 0)))"), or a declaration. */
+int css_supports(const char *cond);
+/* Does a media query list ("screen and (min-width: 600px)") match a vw x vh viewport? */
+int css_media_query(const char *query, int vw, int vh);
+/* The URLs a sheet's @import rules name (if their media match): found() is called for each. */
+int css_imports(const char *text, int len, int vw, void (*found)(void *ctx, const char *url), void *ctx);
+/* The viewport height media queries in css_parse see (the width is css_parse's argument). */
+extern int css_viewport_h;
 
 /* ---- :hover and :focus (css.c): the elements they match; css_dynamic_rules counts the rules that use them ---- */
 extern const struct node *css_hover_node, *css_focus_node;

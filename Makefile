@@ -73,7 +73,7 @@ FP_OBJS   := $(BUILD)/u/user/libc/math.o $(GL_OBJS) $(BUILD)/u/user/desktop/gear
              $(BUILD)/u/user/desktop/js.o $(BUILD)/u/user/desktop/jslib.o \
              $(BUILD)/u/user/desktop/jsre.o $(BUILD)/u/user/desktop/jsdom.o \
              $(BUILD)/u/user/desktop/jslib2.o $(BUILD)/u/user/desktop/jsgc.o \
-             $(BUILD)/u/user/desktop/svg.o
+             $(BUILD)/u/user/desktop/svg.o $(BUILD)/u/user/desktop/csscolor.o
 
 PROGS     := $(basename $(notdir $(wildcard user/bin/*.c)))
 FSH_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/fsh/*.c)))
@@ -238,7 +238,7 @@ clean:
 
 # Run the browser's actual HTML/DOM/JS code on the host, without booting QEMU.
 HOSTCC ?= cc
-BROWSER_TEST_SRCS := tests/browser-dom.c $(addprefix user/desktop/,js.c jslib.c jslib2.c jsre.c jsgc.c jsdom.c html.c webutil.c)
+BROWSER_TEST_SRCS := tests/browser-dom.c $(addprefix user/desktop/,js.c jslib.c jslib2.c jsre.c jsgc.c jsdom.c html.c webutil.c css.c csscolor.c)
 .PHONY: test-browser
 test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-style
 	$< rootfs/usr/share/www/classlist-tests.js 20
@@ -275,8 +275,8 @@ $(BUILD)/tests/kernel-guest.o: tests/kernel-guest.c
 $(BUILD)/tests/kernel-guest: $(BUILD)/tests/kernel-guest.o $(CRT0) $(LIBC) user/user.ld
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 
-$(BUILD)/tests/browser-style: tests/browser-style.c user/desktop/html.c user/desktop/html_entities.h user/desktop/css.c user/desktop/webutil.c user/desktop/web.h
+$(BUILD)/tests/browser-style: tests/browser-style.c user/desktop/html.c user/desktop/html_entities.h user/desktop/css.c user/desktop/csscolor.c user/desktop/webutil.c user/desktop/web.h
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter \
-		-Iuser/desktop tests/browser-style.c user/desktop/html.c user/desktop/css.c \
-		user/desktop/webutil.c -o $@
+		-Iuser/desktop tests/browser-style.c user/desktop/html.c user/desktop/css.c user/desktop/csscolor.c \
+		user/desktop/webutil.c -lm -o $@

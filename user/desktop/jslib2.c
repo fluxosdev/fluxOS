@@ -92,7 +92,7 @@ struct promise {
     int locked;                         /* resolved, perhaps to another promise still pending */
 };
 
-static const struct jsclass promise_class = { "Promise", NULL, NULL };
+static const struct jsclass promise_class = { "Promise", NULL, NULL, NULL };
 
 static struct promise *pdata(jsval v)
 {
@@ -630,6 +630,8 @@ static const struct lazy_chunk {
     { js_chunk_misc, sizeof(js_chunk_misc) - 1, { "structuredClone", "btoa", "atob", "Intl", NULL } },
     { js_chunk_events, sizeof(js_chunk_events) - 1, { "EventTarget", "AbortSignal", "AbortController", NULL } },
     { js_chunk_url, sizeof(js_chunk_url) - 1, { "URLSearchParams", "URL", NULL } },
+    { js_chunk_observers, sizeof(js_chunk_observers) - 1,
+      { "MutationObserver", "IntersectionObserver", "ResizeObserver", NULL } },
     { js_chunk_web, sizeof(js_chunk_web) - 1,
       { "TextEncoder", "TextDecoder", "crypto", "Blob", "FormData", "DOMParser", "customElements", "CSS",
         "WebSocket", "Notification", "DOMRect", "postMessage", NULL } },

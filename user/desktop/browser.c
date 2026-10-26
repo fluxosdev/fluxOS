@@ -44,7 +44,9 @@
 #define ADDR_H      26
 #define STATUS_H    20
 #define HIST_MAX    64
-#define MAX_SHEETS  32
+#define MAX_SHEETS  128
+#define MAX_LINKS   64              /* <link rel=stylesheet> elements per page */
+#define MAX_IMPORTS 32              /* @import rules per page */
 #define MAX_RES     96              /* style sheets and images per page */
 #define MAX_PAGE    (4 << 20)
 #define MAX_RESOURCE (2 << 20)
@@ -69,7 +71,7 @@
 #define KEY_BACKSPACE 0x0E
 #define KEY_F6 0x40
 
-enum { F_PAGE, F_CSS, F_IMG, F_JS, F_XHR, F_ICON };
+enum { F_PAGE, F_CSS, F_IMG, F_JS, F_XHR, F_ICON, F_MODULE };
 enum { NAV_NEW, NAV_REPLACE, NAV_HISTORY };
 enum { B_BACK, B_FORWARD, B_STOP, B_REFRESH, B_HOME, B_HISTORY, B_DOWNLOADS, B_GO, NBUTTONS };
 enum hold { H_NONE, H_BUTTON, H_VBAR, H_HBAR, H_PAGE };
@@ -109,6 +111,7 @@ struct cached {
 struct hist {
     char *url;
     int scroll;
+    int doc, id;                /* the document it belongs to (doc_serial), its id there (pushState) */
 };
 
 struct browser {
@@ -124,16 +127,27 @@ struct browser {
     struct arena larena;        /* layout */
     struct node *root;
     struct layout lo;
-    struct sheet *sheets[MAX_SHEETS];
+    struct sheet *sheets[MAX_SHEETS];   /* in order: <style>, <link> and their @imports */
     int nsheets;
+    struct node *link_nodes[MAX_LINKS]; /* the <link>s whose sheets were asked for (F_CSS slot) */
+    int nlinks;
+    struct {                            /* @import: owner's (or import parent's), F_CSS slot -1 - index */
+        struct node *owner;
+        int parent;
+        struct sheet *sheet;
+    } imports[MAX_IMPORTS];
+    int nimports;
     struct imgref *imgs;
     int nimgs;
     int laid_out_w;
+    unsigned layouts, boxes_for;        /* layouts done; the one the nodes' boxes are of */
     int scroll_x, scroll_y;
     int restore_scroll;         /* back/forward: where the page was */
     const char *pending_fragment;
     struct node *focus;         /* the focused form field */
     struct node *hover;         /* the link under the mouse */
+    struct node *js_hover;      /* the element under it, as the page's scripts were told */
+    unsigned int js_moved;      /* when they last heard of a mousemove */
     char refresh_url[URL_MAX];  /* <meta http-equiv=refresh> */
     unsigned int refresh_at;
 
@@ -148,6 +162,7 @@ struct browser {
     /* history */
     struct hist hist[HIST_MAX];
     int nhist, hpos;
+    int doc_serial, entry_ids;  /* documents loaded, history entries their scripts made */
 
     /* the address bar */
     char addr[URL_MAX];
@@ -174,11 +189,15 @@ struct browser {
         char *owned;                    /* fetched text */
         int pending;                    /* its src is still loading */
         int done;
+        int module;                     /* type=module */
+        int waiting;                    /* a module whose imports are still loading */
     } *scripts;
     int nscripts, script_cap, next_script;
+    int running_scripts;                /* run_scripts is on the stack */
     int scripts_finished;               /* the load event has fired */
     /* what scripts asked for, done once they have returned */
     char js_nav[URL_MAX];
+    char *js_post;                      /* a form a script submitted: the POST body for js_nav */
     int js_nav_replace, js_history, js_reload;
 
     /* frames: an <iframe> is a browser too, with no window (win is NULL) */
@@ -831,13 +850,16 @@ static int parse_response(const struct fetch *f, struct response *r)
     return 0;
 }
 
-static void queue_resource(struct browser *b, int kind, const char *url, int slot, int redirects)
+/* 1 if it was queued (or is already on its way), 0 if it cannot be. */
+static int queue_resource(struct browser *b, int kind, const char *url, int slot, int redirects)
 {
+    if (b->qhead == b->nqueue)          /* everything queued has been taken: start again */
+        b->qhead = b->nqueue = 0;
     if (b->nqueue == MAX_RES || (!url_is_http(url) && !url_is_https(url) && !url_is_file(url)))
-        return;
+        return 0;
     for (int i = b->qhead; i < b->nqueue; i++)
         if (b->queue[i].kind == kind && kind == F_IMG && !strcmp(b->queue[i].url, url))
-            return;                     /* already on its way */
+            return 1;                   /* already on its way */
     struct res *r = &b->queue[b->nqueue++];
     r->kind = kind;
     r->slot = slot;
@@ -845,6 +867,7 @@ static void queue_resource(struct browser *b, int kind, const char *url, int slo
     r->post = NULL;
     snprintf(r->url, sizeof(r->url), "%s", url);
     b->total_res++;
+    return 1;
 }
 
 /* ---- frames ---- */
@@ -993,6 +1016,7 @@ static void free_page(struct browser *b)
         }
     }
     css_hover_node = css_focus_node = NULL;
+    b->js_hover = NULL;
     b->sel_active = b->sel_start = 0;
     if (b->win && b->win->icon_img) {   /* the old page's icon */
         image_free(b->win->icon_img);
@@ -1004,7 +1028,7 @@ static void free_page(struct browser *b)
     arena_free(&b->arena);
     memset(&b->lo, 0, sizeof(b->lo));
     b->root = NULL;
-    b->nsheets = 0;
+    b->nsheets = b->nlinks = b->nimports = 0;
     b->imgs = NULL;
     b->nimgs = 0;
     b->focus = NULL;
@@ -1020,6 +1044,8 @@ static void free_page(struct browser *b)
     b->nscripts = b->script_cap = b->next_script = 0;
     b->scripts_finished = 0;
     b->js_nav[0] = 0;
+    free(b->js_post);
+    b->js_post = NULL;
     b->js_history = b->js_reload = 0;
 }
 
@@ -1030,11 +1056,13 @@ static void relayout(struct browser *b)
     struct rect v = view_rect(b);
     if (b->need_style) {
         arena_free(&b->sarena);
+        css_viewport_h = v.h;
         css_cascade(&b->sarena, b->root, b->sheets, b->nsheets, v.w, v.h, is_visited, b);
         b->need_style = 0;
     }
     arena_free(&b->larena);
     layout_document(&b->larena, &b->lo, b->root, v.w, v.h);
+    b->layouts++;
     if (b->sel_active)
         layout_select(&b->lo, b->sel_ax, b->sel_ay, b->sel_fx, b->sel_fy);
     b->laid_out_w = v.w;
@@ -1043,6 +1071,8 @@ static void relayout(struct browser *b)
         b->frame_vbar = 1;              /* (narrower now: laid out again when next painted) */
     clamp_scroll(b);
     sync_frames(b);
+    if (b->js)
+        jsdom_layout_changed(b->js);
 }
 
 static void scroll_to_fragment(struct browser *b, const char *frag)
@@ -1198,15 +1228,19 @@ static void js_status(void *ctx, const char *text)
     paint(b);
 }
 
+static void collect_sheets(struct browser *b);
+
 static void js_changed(void *ctx)
 {
     struct browser *b = ctx;
     if (!b->root)
         return;
     init_new_controls(b->root);
-    b->need_style = 1;
+    collect_sheets(b);
     relayout(b);
     paint(b);
+    if (!b->fetch.active && b->qhead < b->nqueue)
+        start_next(b);                  /* style sheets the scripts added */
 }
 
 static void js_scroll(void *ctx, int x, int y, int relative)
@@ -1257,24 +1291,154 @@ static void add_script(struct browser *b, struct node *n, int pending)
     }
 }
 
+static int is_module(const struct node *n);
+
 static void js_load_script(void *ctx, struct node *n, const char *url)
 {
     struct browser *b = ctx;
     add_script(b, n, 1);
+    if (b->nscripts)
+        b->scripts[b->nscripts - 1].module = is_module(n);
     queue_resource(b, F_JS, url, b->nscripts - 1, 0);
     if (!b->fetch.active)
         start_next(b);
 }
 
+/* Formats we cannot decode, by MIME type or file name. */
+static int undecodable(const char *s, int is_type)
+{
+    if (is_type)
+        return strcasestr(s, "webp") || strcasestr(s, "avif") || strcasestr(s, "jxl") || strcasestr(s, "heic");
+    const char *q = strpbrk(s, "?#");
+    int n = q ? (int)(q - s) : (int)strlen(s);
+    return (n > 5 && !strncasecmp(s + n - 5, ".webp", 5)) || (n > 5 && !strncasecmp(s + n - 5, ".avif", 5)) ||
+           (n > 4 && !strncasecmp(s + n - 4, ".jxl", 4));
+}
+
+/* The width (px) a sizes attribute asks for: the first entry whose media match. */
+static int sizes_width(struct browser *b, const char *sizes)
+{
+    struct rect v = view_rect(b);
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", sizes ? sizes : "100vw");
+    for (char *save, *e = strtok_r(buf, ",", &save); e; e = strtok_r(NULL, ",", &save)) {
+        while (*e == ' ')
+            e++;
+        char *len = e;
+        if (*e == '(') {                /* "(max-width: 600px) 100vw" */
+            char *close = strchr(e, ')');
+            if (!close)
+                continue;
+            char saved = close[1];
+            close[1] = 0;
+            int ok = css_media_query(e, v.w, v.h);
+            close[1] = saved;
+            if (!ok)
+                continue;
+            len = close + 1;
+        }
+        while (*len == ' ')
+            len++;
+        int n = atoi(len);
+        if (strstr(len, "vw"))
+            return v.w * n / 100;
+        if (strstr(len, "px") || (n > 0 && !strchr(len, '(')))
+            return n;
+        return v.w;                     /* calc() and the like: the whole width */
+    }
+    return v.w;
+}
+
+/* Choose from a srcset: the smallest picture wide enough (w), or the 1x one; 0 if none we can decode. */
+static int pick_srcset(struct browser *b, const char *srcset, const char *sizes, char *out, int size)
+{
+    int want = sizes_width(b, sizes), best_w = 0, have = 0, best_bad = 1;
+    int best_x = 0;                     /* densities times 100: no floating point here */
+    char cand[URL_MAX];
+    for (const char *p = srcset; p && *p;) {
+        while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\t')
+            p++;
+        if (!*p)
+            break;
+        const char *u = p;
+        while (*p && *p != ' ' && *p != '\n' && *p != '\t' && !(*p == ',' && (p[1] == ' ' || !p[1])))
+            p++;
+        snprintf(cand, sizeof(cand), "%.*s", (int)(p - u), u);
+        while (*p == ' ')
+            p++;
+        int w = 0, x = 100;
+        if (isdigit((unsigned char)*p) || *p == '.') {
+            int n = 0, frac = 0, scale = 100;
+            for (; isdigit((unsigned char)*p); p++)
+                n = n * 10 + (*p - '0');
+            if (*p == '.')
+                for (p++; isdigit((unsigned char)*p); p++)
+                    if (scale /= 10)
+                        frac += (*p - '0') * scale;
+            if (*p == 'w')
+                w = n;
+            else if (*p == 'x')
+                x = n * 100 + frac;
+        }
+        while (*p && *p != ',')
+            p++;
+        int bad = undecodable(cand, 0);
+        int better;
+        if (!have)
+            better = 1;
+        else if (bad != best_bad)
+            better = !bad;
+        else if (w)
+            better = best_w < want ? w > best_w : w >= want && w < best_w;
+        else
+            better = (best_x > 100 && x < best_x) || x == 100;
+        if (better && cand[0]) {
+            snprintf(out, (size_t)size, "%s", cand);
+            best_w = w, best_x = x, best_bad = bad, have = 1;
+        }
+    }
+    return have && !best_bad;
+}
+
+/* Where an <img>'s picture comes from: a <picture>'s first <source> that fits
+ * (media, and a type we can decode), else its srcset, else its src. */
+static int image_source(struct browser *b, struct node *n, char *out, int size)
+{
+    char pick[URL_MAX];
+    const char *src = node_attr(n, "src");
+    if (n->parent && n->parent->tag == T_PICTURE) {
+        struct rect v = view_rect(b);
+        for (struct node *s = n->parent->first; s && s != n; s = s->next) {
+            if (s->type != N_ELEMENT || s->tag != T_SOURCE)
+                continue;
+            const char *media = node_attr(s, "media"), *type = node_attr(s, "type");
+            const char *srcset = node_attr(s, "srcset");
+            if (!srcset || (media && !css_media_query(media, v.w, v.h)) || (type && undecodable(type, 1)))
+                continue;
+            if (pick_srcset(b, srcset, node_attr(s, "sizes"), pick, sizeof(pick))) {
+                url_resolve(b->base, pick, out, size);
+                return 1;
+            }
+        }
+    }
+    const char *srcset = node_attr(n, "srcset");
+    if (srcset && *srcset && (!src || !*src || undecodable(src, 0) || strstr(src, "data:image/gif") ||
+                              strstr(src, "data:image/svg")) &&
+        pick_srcset(b, srcset, node_attr(n, "sizes"), pick, sizeof(pick)))
+        src = pick;
+    if (!src || !*src)
+        return 0;
+    url_resolve(b->base, src, out, size);
+    url_strip_fragment(out);
+    return 1;
+}
+
 static void js_load_image(void *ctx, struct node *n)
 {
     struct browser *b = ctx;
-    const char *src = node_attr(n, "src");
-    if (!src || !*src || !b->imgs)
-        return;
     char abs[URL_MAX];
-    url_resolve(b->base, src, abs, sizeof(abs));
-    url_strip_fragment(abs);
+    if (!b->imgs || !image_source(b, n, abs, sizeof(abs)))
+        return;
     struct cached *c = cache_find(b, abs);
     if (b->nimgs < MAX_RES) {
         b->imgs[b->nimgs].n = n;
@@ -1283,6 +1447,7 @@ static void js_load_image(void *ctx, struct node *n)
     }
     if (c) {
         n->img = c->img;
+        jsdom_queue_event(b->js, n, c->img ? "load" : "error");
         return;
     }
     queue_resource(b, F_IMG, abs, 0, 0);
@@ -1290,31 +1455,40 @@ static void js_load_image(void *ctx, struct node *n)
         start_next(b);
 }
 
-/* An element's box: everything laid out for it and its descendants. */
+/* An element's box: everything laid out for it and its descendants. Worked
+ * out for every element at once, the first time a script asks after a layout. */
 static int js_node_box(void *ctx, struct node *n, int *x, int *y, int *w, int *h)
 {
     struct browser *b = ctx;
-    int x0 = 0, y0 = 0, x1 = 0, y1 = 0, any = 0;
-    for (int i = 0; i < b->lo.nitems; i++) {
-        const struct ditem *d = &b->lo.items[i];
-        if (!d->node || d->w <= 0 || d->h <= 0)
-            continue;
-        const struct node *k = d->node;
-        while (k && k != n)
-            k = k->parent;
-        if (!k)
-            continue;
-        if (!any || d->x < x0) x0 = d->x;
-        if (!any || d->y < y0) y0 = d->y;
-        if (!any || d->x + d->w > x1) x1 = d->x + d->w;
-        if (!any || d->y + d->h > y1) y1 = d->y + d->h;
-        any = 1;
+    unsigned gen = b->layouts * 2 + 1;  /* never 0 */
+    if (b->boxes_for != gen) {
+        b->boxes_for = gen;
+        for (int i = 0; i < b->lo.nitems; i++) {
+            const struct ditem *d = &b->lo.items[i];
+            if (!d->node || d->w <= 0 || d->h <= 0)
+                continue;
+            for (struct node *k = d->node; k; k = k->parent) {
+                if (k->bgen != gen) {
+                    k->bgen = gen;
+                    k->bx0 = d->x, k->by0 = d->y, k->bx1 = d->x + d->w, k->by1 = d->y + d->h;
+                    continue;
+                }
+                if (d->x < k->bx0) k->bx0 = d->x;
+                if (d->y < k->by0) k->by0 = d->y;
+                if (d->x + d->w > k->bx1) k->bx1 = d->x + d->w;
+                if (d->y + d->h > k->by1) k->by1 = d->y + d->h;
+            }
+        }
     }
-    *x = x0;
-    *y = y0;
-    *w = x1 - x0;
-    *h = y1 - y0;
-    return any;
+    if (n->bgen != gen) {
+        *x = *y = *w = *h = 0;
+        return 0;
+    }
+    *x = n->bx0;
+    *y = n->by0;
+    *w = n->bx1 - n->bx0;
+    *h = n->by1 - n->by0;
+    return 1;
 }
 
 static int js_cookie_get(void *ctx, char *out, int size)
@@ -1340,9 +1514,7 @@ static void js_http(void *ctx, int id, const char *method, const char *url, cons
                     const char *headers)
 {
     struct browser *b = ctx;
-    int before = b->nqueue;
-    queue_resource(b, F_XHR, url, id, 0);
-    if (b->nqueue == before) {
+    if (!queue_resource(b, F_XHR, url, id, 0)) {
         jsdom_http_done(b->js, id, 0, NULL, 0, NULL, 0);    /* the queue is full */
         return;
     }
@@ -1358,6 +1530,54 @@ static void js_http(void *ctx, int id, const char *method, const char *url, cons
     }
     if (!b->fetch.active)
         start_next(b);
+}
+
+static void push_history(struct browser *b, const char *url);
+
+/* history.pushState and replaceState: a new URL for the document, no load. */
+static int js_set_url(void *ctx, const char *url, int replace)
+{
+    struct browser *b = ctx;
+    if (!replace || !b->nhist) {
+        push_history(b, url);
+        b->hist[b->hpos].id = ++b->entry_ids;
+    } else {
+        free(b->hist[b->hpos].url);
+        b->hist[b->hpos].url = strdup(url);
+    }
+    b->hist[b->hpos].doc = b->doc_serial;
+    if (!strcmp(b->base, b->url))       /* no <base>: links are relative to the document */
+        snprintf(b->base, sizeof(b->base), "%s", url);
+    snprintf(b->url, sizeof(b->url), "%s", url);
+    set_addr(b, url);
+    paint(b);
+    return b->hist[b->hpos].id;
+}
+
+/* A module that a script imports. */
+static void js_fetch_module(void *ctx, int id, const char *url)
+{
+    struct browser *b = ctx;
+    if (!queue_resource(b, F_MODULE, url, id, 0)) {
+        jsdom_module_fetched(b->js, id, NULL, 0);
+        return;
+    }
+    if (!b->fetch.active)
+        start_next(b);
+}
+
+static void run_scripts(struct browser *b);
+
+static void js_module_done(void *ctx, int tag)
+{
+    struct browser *b = ctx;
+    if (tag >= 0 && tag < b->nscripts) {
+        b->scripts[tag].waiting = 0;
+        if (node_attr(b->scripts[tag].n, "src") && b->js)
+            jsdom_queue_event(b->js, b->scripts[tag].n, "load");
+    }
+    if (!b->running_scripts)
+        run_scripts(b);
 }
 
 static void js_focus(void *ctx, struct node *n)
@@ -1381,14 +1601,34 @@ static int in_noscript(const struct node *n)
     return 0;
 }
 
+static int is_module(const struct node *n)
+{
+    const char *type = node_attr(n, "type");
+    return type && !strcasecmp(type, "module");
+}
+
 static int runnable_script(const struct node *n)
 {
     const char *type = node_attr(n, "type"), *lang = node_attr(n, "language");
+    if (is_module(n))
+        return 1;
+    if (node_attr(n, "nomodule"))       /* the fallback for browsers without modules */
+        return 0;
     if (type && *type)
         return strcasestr(type, "javascript") || strcasestr(type, "ecmascript") ||
                strcasestr(type, "jscript");
     return !lang || strcasestr(lang, "javascript");
 }
+
+/* Deferred: modules, and classic scripts with src and defer, which run after the others. */
+static int deferred_script(const struct node *n)
+{
+    const char *src = node_attr(n, "src");
+    return is_module(n) || (src && *src && node_attr(n, "defer") && !node_attr(n, "async"));
+}
+
+static void js_submit(void *ctx, struct node *form, int fire);
+static struct node *js_node_at(void *ctx, int x, int y);
 
 /* Start the page's scripts: make the engine and queue the external ones. */
 static void start_scripts(struct browser *b, const char *url)
@@ -1399,45 +1639,76 @@ static void start_scripts(struct browser *b, const char *url)
         .status = js_status, .changed = js_changed, .scroll = js_scroll, .scroll_pos = js_scroll_pos,
         .viewport = js_viewport, .set_title = js_set_title, .load_script = js_load_script,
         .load_image = js_load_image, .node_box = js_node_box, .focus = js_focus, .http = js_http,
-        .cookie_get = js_cookie_get, .cookie_set = js_cookie_set,
+        .cookie_get = js_cookie_get, .cookie_set = js_cookie_set, .fetch_module = js_fetch_module,
+        .module_done = js_module_done, .set_url = js_set_url, .submit = js_submit, .node_at = js_node_at,
     };
     b->js = jsdom_new(&h);
     if (!b->js)
         return;
     for (struct node *n = b->root; n; n = node_next(n, b->root)) {
-        if (n->type != N_ELEMENT || n->tag != T_SCRIPT || !runnable_script(n) || in_noscript(n))
-            continue;
-        const char *src = node_attr(n, "src");
-        if (src && *src) {
-            char abs[URL_MAX];
-            url_resolve(b->base, src, abs, sizeof(abs));
-            add_script(b, n, 1);
-            queue_resource(b, F_JS, abs, b->nscripts - 1, 0);
-        } else {
-            add_script(b, n, 0);
-        }
+        const char *type;
+        if (n->type == N_ELEMENT && n->tag == T_SCRIPT && !in_noscript(n) && (type = node_attr(n, "type")) &&
+            !strcasecmp(type, "importmap") && n->first && n->first->type == N_TEXT)
+            jsdom_import_map(b->js, n->first->text, n->first->len);
     }
+    /* the scripts in order, then the deferred ones (and modules) in order */
+    for (int pass = 0; pass < 2; pass++)
+        for (struct node *n = b->root; n; n = node_next(n, b->root)) {
+            if (n->type != N_ELEMENT || n->tag != T_SCRIPT || !runnable_script(n) || in_noscript(n) ||
+                deferred_script(n) != pass)
+                continue;
+            const char *src = node_attr(n, "src");
+            if (src && *src) {
+                char abs[URL_MAX];
+                url_resolve(b->base, src, abs, sizeof(abs));
+                add_script(b, n, 1);
+                queue_resource(b, F_JS, abs, b->nscripts - 1, 0);
+            } else {
+                add_script(b, n, 0);
+            }
+            b->scripts[b->nscripts - 1].module = is_module(n);
+        }
     (void)url;
 }
 
 /* Run the scripts that are ready, in order; the load event after the last. */
 static void run_scripts(struct browser *b)
 {
+    b->running_scripts++;
     while (b->js && b->next_script < b->nscripts) {
-        struct script *sc = &b->scripts[b->next_script];
-        if (sc->pending)
-            return;
+        int i = b->next_script;
+        struct script *sc = &b->scripts[i];
+        if (sc->pending || sc->waiting)
+            break;
         b->next_script++;
         if (sc->done)
             continue;
         sc->done = 1;
-        if (sc->text) {
+        if (sc->text && sc->module) {
+            const char *src = node_attr(sc->n, "src");
+            char abs[URL_MAX];
+            if (src && *src)
+                url_resolve(b->base, src, abs, sizeof(abs));
+            sc->waiting = 1;
+            jsdom_run_module(b->js, src && *src ? abs : b->base, !(src && *src), sc->text, sc->len, i);
+            if (b->scripts[i].waiting) {        /* its imports are loading */
+                b->running_scripts--;
+                return;
+            }
+        } else if (sc->text) {
             char where[96];
             const char *src = node_attr(sc->n, "src");
             snprintf(where, sizeof(where), "%s", src ? src : "inline script");
             jsdom_run_script(b->js, sc->n, sc->text, sc->len, where);
+            if (src && *src && b->js)
+                jsdom_queue_event(b->js, b->scripts[i].n, "load");
+        } else if (node_attr(sc->n, "src")) {
+            jsdom_queue_event(b->js, sc->n, "error");   /* it could not be fetched */
         }
     }
+    b->running_scripts--;
+    if (b->next_script < b->nscripts)
+        return;
     if (b->js && !b->scripts_finished) {
         b->scripts_finished = 1;
         jsdom_loaded(b->js);
@@ -1464,12 +1735,152 @@ static void run_js_url(struct browser *b, const char *url)
     jsdom_run_script(b->js, NULL, code, n, "javascript: URL");
 }
 
+/* ---- style sheets ---- */
+
+struct import_ctx {
+    struct browser *b;
+    const char *base;
+    struct node *owner;
+    int parent;
+};
+
+static void import_found(void *ctx, const char *url)
+{
+    struct import_ctx *ic = ctx;
+    struct browser *b = ic->b;
+    if (b->nimports == MAX_IMPORTS)
+        return;
+    char abs[URL_MAX];
+    url_resolve(ic->base, url, abs, sizeof(abs));
+    int k = b->nimports++;
+    b->imports[k].owner = ic->owner;
+    b->imports[k].parent = ic->parent;
+    b->imports[k].sheet = NULL;
+    queue_resource(b, F_CSS, abs, -1 - k, 0);
+}
+
+/* Parse a sheet (at base, for its @imports), and ask for what it imports. */
+static struct sheet *parse_sheet(struct browser *b, const char *text, int len, const char *base,
+                                 struct node *owner, int parent, int imports)
+{
+    struct rect vr = view_rect(b);
+    css_viewport_h = vr.h;
+    struct sheet *sh = css_parse(&b->arena, text, len, vr.w);
+    struct import_ctx ic = { b, base, owner, parent };
+    if (imports)
+        css_imports(text, len, vr.w, import_found, &ic);
+    return sh;
+}
+
+/* A <style>'s text, as it is now: its text nodes, told apart by where they are. */
+static uintptr_t style_sig(const struct node *n)
+{
+    uintptr_t sig = 7;
+    for (const struct node *k = n->first; k; k = k->next)
+        if (k->type == N_TEXT)
+            sig = sig * 31 + (uintptr_t)k + (uintptr_t)k->text + (uintptr_t)k->len * 131;
+    return sig | 2;                     /* never 0 (not parsed) or 1 */
+}
+
+static void add_imports(struct browser *b, struct node *owner, int parent)
+{
+    for (int i = 0; i < b->nimports; i++)
+        if (b->imports[i].owner == owner && b->imports[i].parent == parent) {
+            add_imports(b, owner, i);
+            if (b->imports[i].sheet && b->nsheets < MAX_SHEETS)
+                b->sheets[b->nsheets++] = b->imports[i].sheet;
+        }
+}
+
+/* The next node after n's subtree. */
+static struct node *after_subtree(struct node *n, const struct node *root)
+{
+    for (; n && n != root; n = n->parent)
+        if (n->next)
+            return n->next;
+    return NULL;
+}
+
+/* The document's style sheets, in order: every <style> (parsed again when its
+ * text changed) and <link rel=stylesheet> (fetched the first time it is seen),
+ * each after the sheets it imports. Scripts may have added or changed any. */
+static void collect_sheets(struct browser *b)
+{
+    struct rect vr = view_rect(b);
+    b->nsheets = 0;
+    for (struct node *n = b->root; n;) {
+        if (n->type != N_ELEMENT) {
+            n = node_next(n, b->root);
+            continue;
+        }
+        if (n->tag == T_TEMPLATE || n->tag == T_NOSCRIPT) {
+            n = after_subtree(n, b->root);
+            continue;
+        }
+        const char *media = node_attr(n, "media"), *rel, *href;
+        if (n->tag == T_STYLE) {
+            uintptr_t sig = style_sig(n);
+            if (n->sheet_sig != sig) {
+                int len = 0;
+                for (const struct node *k = n->first; k; k = k->next)
+                    len += k->type == N_TEXT ? k->len : 0;
+                char *text = malloc((size_t)len + 1);
+                if (text) {
+                    int o = 0;
+                    for (const struct node *k = n->first; k; k = k->next)
+                        if (k->type == N_TEXT) {
+                            memcpy(text + o, k->text, (size_t)k->len);
+                            o += k->len;
+                        }
+                    text[o] = 0;
+                    n->sheet = parse_sheet(b, text, o, b->base, n, -1, !n->sheet_sig);
+                    free(text);
+                }
+                n->sheet_sig = sig;
+            }
+            if (!media || css_media_query(media, vr.w, vr.h)) {
+                add_imports(b, n, -1);
+                if (n->sheet && b->nsheets < MAX_SHEETS)
+                    b->sheets[b->nsheets++] = n->sheet;
+            }
+        } else if (n->tag == T_LINK && (rel = node_attr(n, "rel"))) {
+            if (strcasestr(rel, "stylesheet") && !strcasestr(rel, "alternate") && (href = node_attr(n, "href")) &&
+                *href) {
+                if (!n->sheet_sig && b->nlinks < MAX_LINKS) {
+                    char abs[URL_MAX];
+                    url_resolve(b->base, href, abs, sizeof(abs));
+                    n->sheet_sig = 1;
+                    b->link_nodes[b->nlinks] = n;
+                    if (!queue_resource(b, F_CSS, abs, b->nlinks++, 0) && b->js)
+                        jsdom_queue_event(b->js, n, "error");   /* those waiting for it may go on */
+                }
+                if (!media || css_media_query(media, vr.w, vr.h)) {
+                    add_imports(b, n, -1);
+                    if (n->sheet && b->nsheets < MAX_SHEETS)
+                        b->sheets[b->nsheets++] = n->sheet;
+                }
+            } else if ((strcasestr(rel, "preload") || strcasestr(rel, "prefetch")) && !n->sheet_sig) {
+                n->sheet_sig = 1;               /* not fetched ahead of time, but those waiting may go on */
+                if (b->js)
+                    jsdom_queue_event(b->js, n, "load");
+            }
+        }
+        n = node_next(n, b->root);
+    }
+    b->need_style = 1;
+}
+
 static void load_document(struct browser *b, const char *text, int len, const char *url,
                           const char *charset)
 {
     free_page(b);
     snprintf(b->url, sizeof(b->url), "%s", url);
     snprintf(b->base, sizeof(b->base), "%s", url);
+    b->doc_serial++;
+    if (b->nhist) {
+        b->hist[b->hpos].doc = b->doc_serial;
+        b->hist[b->hpos].id = 0;
+    }
     set_addr(b, url);
     b->scroll_x = b->scroll_y = 0;
 
@@ -1498,6 +1909,7 @@ static void load_document(struct browser *b, const char *text, int len, const ch
     /* <base>, <title>, <meta refresh>, style sheets and pictures. */
     char title[256] = "";
     char icon_href[URL_MAX] = "";
+    char abs_img[URL_MAX];
     b->imgs = arena_alloc(&b->arena, sizeof(struct imgref) * MAX_RES);
     for (struct node *n = b->root; n; n = node_next(n, b->root)) {
         if (n->type != N_ELEMENT || in_noscript(n))
@@ -1533,35 +1945,18 @@ static void load_document(struct browser *b, const char *text, int len, const ch
         history_add(url, title);
     b->total_res = b->done_res = 0;
     start_scripts(b, url);              /* external scripts are fetched first */
+    collect_sheets(b);                  /* then style sheets, then pictures */
     for (struct node *n = b->root; n; n = node_next(n, b->root)) {
         if (n->type != N_ELEMENT || in_noscript(n))
             continue;
         const char *v;
-        if (n->tag == T_STYLE && b->nsheets < MAX_SHEETS) {
-            const char *media = node_attr(n, "media");
-            if (n->first && n->first->type == N_TEXT && (!media || !strcasestr(media, "print")))
-                b->sheets[b->nsheets++] = css_parse(&b->arena, n->first->text, n->first->len,
-                                                    view_rect(b).w);
-        } else if (n->tag == T_LINK && !icon_href[0] && (v = node_attr(n, "rel")) && strcasestr(v, "icon") &&
+        if (n->tag == T_LINK && !icon_href[0] && (v = node_attr(n, "rel")) && strcasestr(v, "icon") &&
                    !strcasestr(v, "stylesheet") && (v = node_attr(n, "href")) && *v) {
             snprintf(icon_href, sizeof(icon_href), "%s", v);
-        } else if (n->tag == T_LINK && (v = node_attr(n, "rel")) && strcasestr(v, "stylesheet") &&
-                   !strcasestr(v, "alternate") && (v = node_attr(n, "href")) && b->nsheets < MAX_SHEETS) {
-            const char *media = node_attr(n, "media");
-            if (media && (strcasestr(media, "print") || strcasestr(media, "speech")) &&
-                !strcasestr(media, "screen") && !strcasestr(media, "all"))
-                continue;
-            char abs[URL_MAX];
-            url_resolve(b->base, v, abs, sizeof(abs));
-            b->sheets[b->nsheets] = NULL;
-            queue_resource(b, F_CSS, abs, b->nsheets, 0);
-            b->nsheets++;
         } else if ((n->tag == T_IMG || (n->tag == T_INPUT && (v = node_attr(n, "type")) &&
                                          !strcasecmp(v, "image"))) &&
-                   (v = node_attr(n, "src")) && *v && b->imgs && b->nimgs < MAX_RES) {
-            char abs[URL_MAX];
-            url_resolve(b->base, v, abs, sizeof(abs));
-            url_strip_fragment(abs);
+                   b->imgs && b->nimgs < MAX_RES && image_source(b, n, abs_img, sizeof(abs_img))) {
+            char *abs = abs_img;
             struct cached *c = cache_find(b, abs);
             b->imgs[b->nimgs].n = n;
             b->imgs[b->nimgs].url = arena_strdup(&b->arena, abs);
@@ -1703,12 +2098,14 @@ static void image_done(struct browser *b, const char *url, const char *data, int
 {
     struct image *img = len > 8 ? image_decode((const uint8_t *)data, (uint32_t)len) : NULL;
     cache_add(b, url, img);
-    if (!img)
-        return;
     for (int i = 0; i < b->nimgs; i++)
         if (!strcmp(b->imgs[i].url, url)) {
-            b->imgs[i].n->img = img;
-            b->need_layout = 1;
+            if (img) {
+                b->imgs[i].n->img = img;
+                b->need_layout = 1;
+            }
+            if (b->js)
+                jsdom_queue_event(b->js, b->imgs[i].n, img ? "load" : "error");
         }
 }
 
@@ -2152,6 +2549,10 @@ static void fetch_complete(struct browser *b)
                 jsdom_http_done(b->js, done.slot, ok ? r.status : 0, ok ? done.buf : NULL, hlen,
                                 ok ? r.body : NULL, ok ? r.len : 0);
             }
+        } else if (done.kind == F_MODULE) {
+            if (b->js)
+                jsdom_module_fetched(b->js, done.slot, ok && r.status < 300 ? r.body : NULL,
+                                     ok && r.status < 300 ? r.len : 0);
         } else if (done.kind == F_JS) {
             if (done.slot < b->nscripts) {
                 struct script *sc = &b->scripts[done.slot];
@@ -2164,9 +2565,20 @@ static void fetch_complete(struct browser *b)
                 sc->pending = 0;
             }
             run_scripts(b);
-        } else if (ok && r.status < 300 && done.kind == F_CSS && done.slot < b->nsheets) {
-            b->sheets[done.slot] = css_parse(&b->arena, r.body, r.len, view_rect(b).w);
-            b->need_style = 1;
+        } else if (done.kind == F_CSS) {
+            int good = ok && r.status < 300;
+            if (done.slot >= 0 && done.slot < b->nlinks) {
+                struct node *n = b->link_nodes[done.slot];
+                if (good)
+                    n->sheet = parse_sheet(b, r.body, r.len, done.url, n, -1, 1);
+                if (b->js)
+                    jsdom_queue_event(b->js, n, good ? "load" : "error");
+            } else if (done.slot < 0 && -1 - done.slot < b->nimports && good) {
+                int k = -1 - done.slot;
+                b->imports[k].sheet = parse_sheet(b, r.body, r.len, done.url, b->imports[k].owner, k, 1);
+            }
+            if (b->root)
+                collect_sheets(b);
         } else if (done.kind == F_IMG) {
             image_done(b, done.url, ok && r.status < 300 ? r.body : "", ok && r.status < 300 ? r.len : 0);
         } else if (done.kind == F_ICON) {
@@ -2196,14 +2608,16 @@ static void start_next(struct browser *b)
             continue;
         }
         set_status(b, "Loading %s %d of %d: %s",
-                   r.kind == F_CSS ? "style sheet" : r.kind == F_JS ? "script" :
+                   r.kind == F_CSS ? "style sheet" : r.kind == F_JS || r.kind == F_MODULE ? "script" :
                    r.kind == F_XHR ? "request" : "picture",
                    b->done_res + 1, b->total_res, r.url);
+        b->queue[b->qhead - 1].post = NULL;            /* r has it */
         int started = start_fetch(b, r.kind, r.url, r.post, r.slot, r.redirects, 0) == 0;
         free(r.post);
-        b->queue[b->qhead - 1].post = NULL;
         if (!started && r.kind == F_XHR && b->js)
             jsdom_http_done(b->js, r.slot, 0, NULL, 0, NULL, 0);
+        if (!started && r.kind == F_MODULE && b->js)
+            jsdom_module_fetched(b->js, r.slot, NULL, 0);
         if (started) {
             paint(b);
             return;
@@ -2234,6 +2648,7 @@ static void push_history(struct browser *b, const char *url)
     }
     b->hist[b->nhist].url = strdup(url);
     b->hist[b->nhist].scroll = 0;
+    b->hist[b->nhist].doc = b->hist[b->nhist].id = 0;
     b->hpos = b->nhist++;
 }
 
@@ -2245,25 +2660,36 @@ static void navigate(struct browser *b, const char *url, const char *post, int m
     }
     char u[URL_MAX];
     snprintf(u, sizeof(u), "%s", url);
-    stop_all(b);
-    b->refresh_url[0] = 0;
-    if (mode == NAV_NEW)
-        push_history(b, u);
-    set_addr(b, u);
-    b->addr_focus = 0;
 
-    /* Only the fragment changed: scroll, do not reload. */
+    /* Only the fragment changed: scroll, do not reload (nor stop what is loading). */
     char a[URL_MAX], cur[URL_MAX];
     snprintf(a, sizeof(a), "%s", u);
     snprintf(cur, sizeof(cur), "%s", b->url);
     url_strip_fragment(a);
     url_strip_fragment(cur);
     if (!post && b->root && !strcmp(a, cur) && url_fragment(u) && mode != NAV_HISTORY) {
+        char old[URL_MAX];
+        snprintf(old, sizeof(old), "%s", b->url);
+        if (mode == NAV_NEW && strcmp(old, u)) {
+            push_history(b, u);
+            b->hist[b->hpos].doc = b->doc_serial;
+            b->hist[b->hpos].id = ++b->entry_ids;
+        }
+        set_addr(b, u);
+        b->addr_focus = 0;
         snprintf(b->url, sizeof(b->url), "%s", u);
         scroll_to_fragment(b, url_fragment(u));
+        if (b->js && strcmp(old, u))
+            jsdom_traverse(b->js, b->hist[b->hpos].id, old, u);
         paint(b);
         return;
     }
+    stop_all(b);
+    b->refresh_url[0] = 0;
+    if (mode == NAV_NEW)
+        push_history(b, u);
+    set_addr(b, u);
+    b->addr_focus = 0;
 
     if (!strcasecmp(u, "about:blank")) {
         load_document(b, "", 0, u, "utf-8");
@@ -2307,6 +2733,21 @@ static void go_history(struct browser *b, int delta)
     int to = b->hpos + delta;
     if (to < 0 || to >= b->nhist)
         return;
+    if (b->root && b->js && b->hist[to].doc && b->hist[to].doc == b->hist[b->hpos].doc &&
+        b->hist[to].doc == b->doc_serial) {
+        /* an entry pushState (or a fragment) made in this document: no reload */
+        char old[URL_MAX];
+        snprintf(old, sizeof(old), "%s", b->url);
+        b->hist[b->hpos].scroll = b->scroll_y;
+        b->hpos = to;
+        snprintf(b->url, sizeof(b->url), "%s", b->hist[to].url);
+        set_addr(b, b->url);
+        if (url_fragment(b->url))
+            scroll_to_fragment(b, url_fragment(b->url));
+        jsdom_traverse(b->js, b->hist[to].id, old, b->url);
+        paint(b);
+        return;
+    }
     b->hist[b->hpos].scroll = b->scroll_y;
     b->hpos = to;
     b->restore_scroll = b->hist[to].scroll;
@@ -2434,13 +2875,10 @@ static void add_pair(char *q, int size, const char *name, const char *value)
     url_encode_form(q, size, value);
 }
 
-static void submit(struct browser *b, struct node *form, struct node *submitter)
+/* The request a form makes: target gets its URL; returns 1 for a POST, with the body in q. */
+static int form_request(struct browser *b, struct node *form, struct node *submitter, char *target, int tsize,
+                        char *q, int qsize)
 {
-    if (b->js && jsdom_dispatch(b->js, form, "submit"))
-        return;                         /* a handler said no */
-    if (b->js_nav[0])
-        return;                         /* or went somewhere else */
-    char q[URL_MAX];
     q[0] = 0;
     for (struct node *n = form; n; n = node_next(n, form)) {
         if (n->type != N_ELEMENT || node_attr(n, "disabled"))
@@ -2452,44 +2890,73 @@ static void submit(struct browser *b, struct node *form, struct node *submitter)
             const char *t = type_of(n);
             if (!strcasecmp(t, "checkbox") || !strcasecmp(t, "radio")) {
                 if (n->checked)
-                    add_pair(q, sizeof(q), name, node_attr(n, "value") ? node_attr(n, "value") : "on");
+                    add_pair(q, qsize, name, node_attr(n, "value") ? node_attr(n, "value") : "on");
             } else if (!strcasecmp(t, "submit") || !strcasecmp(t, "image") || !strcasecmp(t, "button")) {
                 if (n == submitter)
-                    add_pair(q, sizeof(q), name, control_label(n));
+                    add_pair(q, qsize, name, control_label(n));
             } else if (strcasecmp(t, "reset") && strcasecmp(t, "file")) {
-                add_pair(q, sizeof(q), name, n->value ? n->value : "");
+                add_pair(q, qsize, name, n->value ? n->value : "");
             }
         } else if (n->tag == T_TEXTAREA) {
-            add_pair(q, sizeof(q), name, n->value ? n->value : "");
+            add_pair(q, qsize, name, n->value ? n->value : "");
         } else if (n->tag == T_SELECT) {
             int k = 0;
             for (struct node *o = n; o; o = node_next(o, n)) {
                 if (o->type != N_ELEMENT || o->tag != T_OPTION)
                     continue;
                 if (k++ == n->checked)
-                    add_pair(q, sizeof(q), name, node_attr(o, "value") ? node_attr(o, "value")
-                                                                         : (o->value ? o->value : ""));
+                    add_pair(q, qsize, name, node_attr(o, "value") ? node_attr(o, "value")
+                                                                   : (o->value ? o->value : ""));
             }
         } else if (n->tag == T_BUTTON && n == submitter) {
-            add_pair(q, sizeof(q), name, node_attr(n, "value") ? node_attr(n, "value") : "");
+            add_pair(q, qsize, name, node_attr(n, "value") ? node_attr(n, "value") : "");
         }
     }
     const char *action = node_attr(form, "action");
     const char *method = node_attr(form, "method");
-    char target[URL_MAX];
-    url_resolve(b->base, action && *action ? action : b->url, target, sizeof(target));
+    url_resolve(b->base, action && *action ? action : b->url, target, tsize);
     url_strip_fragment(target);
-    struct browser *to = target_of(b, node_attr(form, "target"));
-    if (method && !strcasecmp(method, "post")) {
-        navigate(to, target, q, NAV_NEW);
-        return;
-    }
+    if (method && !strcasecmp(method, "post"))
+        return 1;
     char *qm = strchr(target, '?');
     if (qm)
         *qm = 0;
     size_t l = strlen(target);
-    snprintf(target + l, sizeof(target) - l, "?%s", q);
-    navigate(to, target, NULL, NAV_NEW);
+    snprintf(target + l, (size_t)tsize - l, "?%s", q);
+    return 0;
+}
+
+static void submit(struct browser *b, struct node *form, struct node *submitter)
+{
+    if (b->js && jsdom_dispatch(b->js, form, "submit"))
+        return;                         /* a handler said no */
+    if (b->js_nav[0])
+        return;                         /* or went somewhere else */
+    char q[URL_MAX], target[URL_MAX];
+    int post = form_request(b, form, submitter, target, sizeof(target), q, sizeof(q));
+    navigate(target_of(b, node_attr(form, "target")), target, post ? q : NULL, NAV_NEW);
+}
+
+/* form.submit() (no submit event) and requestSubmit(): done once the script returns. */
+static void js_submit(void *ctx, struct node *form, int fire)
+{
+    struct browser *b = ctx;
+    if (fire && b->js && jsdom_dispatch(b->js, form, "submit"))
+        return;
+    if (b->js_nav[0])
+        return;
+    char q[URL_MAX];
+    int post = form_request(b, form, NULL, b->js_nav, sizeof(b->js_nav), q, sizeof(q));
+    free(b->js_post);
+    b->js_post = post ? strdup(q) : NULL;
+    b->js_nav_replace = 0;
+}
+
+static struct node *element_at(struct browser *b, int x, int y);
+
+static struct node *js_node_at(void *ctx, int x, int y)
+{
+    return element_at(ctx, x, y);
 }
 
 static void reset_form(struct node *form)
@@ -2612,10 +3079,10 @@ static int page_click(struct browser *b, int px, int py)
     if (target == b->press_ctrl && (!strcasecmp(t, "checkbox") || !strcasecmp(t, "radio"))) {
         activate(b, target);            /* the box changes first, handlers see it */
         if (b->js)
-            jsdom_dispatch(b->js, target, "click");
+            jsdom_mouse_event(b->js, target, "click", px, py, 0, NULL);
         return 1;
     }
-    int prevented = jsdom_dispatch(b->js, target, "click");
+    int prevented = jsdom_mouse_event(b->js, target, "click", px, py, 0, NULL);
     if (!b->root || b->js_nav[0])
         return 1;                       /* the page is going away */
     if (prevented)
@@ -3224,6 +3691,56 @@ static void sync_dynamic(struct browser *b, const struct node *hov, int hover_to
     }
 }
 
+/* The pointer moved onto another element: the page's scripts hear of it as
+ * mouseout and mouseleave on what it left, mouseover and mouseenter on what
+ * it entered (and the pointer* events), and mousemove now and then. */
+static void js_pointer_moved(struct browser *b, struct node *under, int px, int py)
+{
+    struct node *old = b->js_hover;
+    if (under == old) {
+        if (under && now_ms() - b->js_moved >= 40) {
+            b->js_moved = now_ms();
+            jsdom_mouse_event(b->js, under, "pointermove", px, py, -1, NULL);
+            if (b->js && b->root && !b->js_nav[0])
+                jsdom_mouse_event(b->js, under, "mousemove", px, py, -1, NULL);
+        }
+        return;
+    }
+    b->js_hover = under;
+    static const char *const out[] = { "pointerout", "mouseout" }, *const over[] = { "pointerover", "mouseover" };
+    static const char *const leave[] = { "pointerleave", "mouseleave" }, *const enter[] = { "pointerenter", "mouseenter" };
+    for (int k = 0; k < 2 && old; k++) {
+        if (!b->js || !b->root || b->js_nav[0])
+            return;
+        jsdom_mouse_event(b->js, old, out[k], px, py, -1, under);
+        for (struct node *n = old; n && n->type == N_ELEMENT && b->js; n = n->parent) {
+            struct node *c = under;
+            while (c && c != n)
+                c = c->parent;
+            if (c)
+                break;                  /* still inside n */
+            jsdom_mouse_event(b->js, n, leave[k], px, py, -1, under);
+        }
+    }
+    for (int k = 0; k < 2 && under; k++) {
+        if (!b->js || !b->root || b->js_nav[0])
+            return;
+        jsdom_mouse_event(b->js, under, over[k], px, py, -1, old);
+        struct node *chain[128];
+        int n = 0;
+        for (struct node *e = under; e && e->type == N_ELEMENT && n < 128; e = e->parent) {
+            struct node *c = old;
+            while (c && c != e)
+                c = c->parent;
+            if (c)
+                break;
+            chain[n++] = e;
+        }
+        while (n-- > 0 && b->js)         /* outermost first */
+            jsdom_mouse_event(b->js, chain[n], enter[k], px, py, -1, old);
+    }
+}
+
 static void update_hover(struct browser *b, int x, int y)
 {
     struct rect v = view_rect(b);
@@ -3234,6 +3751,11 @@ static void update_hover(struct browser *b, int x, int y)
                                              y - v.y + b->scroll_y);
         link = h ? h->node : NULL;
         under = element_at(b, x - v.x + b->scroll_x, y - v.y + b->scroll_y);
+    }
+    if (b->js) {
+        js_pointer_moved(b, under, x - v.x + b->scroll_x, y - v.y + b->scroll_y);
+        if (!b->root || b->js_nav[0])
+            return;
     }
     sync_dynamic(b, under, 1);
     if (link != b->hover) {
@@ -3483,6 +4005,11 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
                 set_addr(t, t->url);
                 paint(b);
             }
+            struct node *under = b->js ? element_at(b, px, py) : NULL;
+            if (under)
+                jsdom_mouse_event(b->js, under, "pointerdown", px, py, 0, NULL);
+            if (under && b->js && b->root && !b->js_nav[0])
+                jsdom_mouse_event(b->js, under, "mousedown", px, py, 0, NULL);
         }
         return;
     }
@@ -3501,6 +4028,13 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             paint(b);
         } else if (hold == H_PAGE) {
             b->sel_start = 0;
+            struct node *under = b->js && b->root ? element_at(b, px, py) : NULL;
+            if (under)
+                jsdom_mouse_event(b->js, under, "pointerup", px, py, 0, NULL);
+            if (under && b->js && b->root && !b->js_nav[0])
+                jsdom_mouse_event(b->js, under, "mouseup", px, py, 0, NULL);
+            if (!b->root || b->js_nav[0])
+                return;
             if (b->sel_active)
                 return;                 /* it was a drag: not a click */
             if (page_click(b, px, py))
@@ -3694,7 +4228,10 @@ void browser_poll(void)
             char u[URL_MAX];
             snprintf(u, sizeof(u), "%s", b->js_nav);
             b->js_nav[0] = 0;
-            navigate(b, u, NULL, b->js_nav_replace ? NAV_REPLACE : NAV_NEW);
+            char *post = b->js_post;
+            b->js_post = NULL;
+            navigate(b, u, post, b->js_nav_replace ? NAV_REPLACE : NAV_NEW);
+            free(post);
             return;                     /* the list may have changed */
         }
         if (b->js_history) {

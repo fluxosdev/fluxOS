@@ -40,6 +40,8 @@ struct jsclass {
     const char *name;
     int (*get)(struct js *J, struct jsobj *o, const char *key, jsval *out);
     int (*set)(struct js *J, struct jsobj *o, const char *key, jsval v);
+    /* A subclass's constructor called super() and self became what from was (from is dropped). */
+    void (*adopt)(struct js *J, struct jsobj *self, struct jsobj *from);
 };
 
 /*
@@ -74,6 +76,28 @@ const char *js_error(struct js *J);
 int js_call(struct js *J, jsval fn, jsval self, jsval *args, int argc, jsval *result);
 /* Compile a handler attribute ("onclick") into a function of (event). */
 jsval js_compile_handler(struct js *J, const char *body, const char *where);
+
+/*
+ * ES modules. The host fetches each module's source and resolves
+ * specifiers; the engine parses every module of a graph, links their
+ * imports to the exports (live bindings) and runs them, dependencies
+ * first, once the whole graph is here. import() works the same way.
+ */
+struct js_modhost {
+    void *ctx;
+    /* Fetch module id from url; answer with js_module_source(). */
+    void (*fetch)(void *ctx, int id, const char *url);
+    /* spec as imported by the module or script at base: an absolute URL, or -1. */
+    int (*resolve)(void *ctx, const char *spec, const char *base, char *out, int size);
+    /* A module script given to js_run_module has run, or failed (the error in js_error()). */
+    void (*done)(void *ctx, void *tag, int failed);
+};
+void js_module_host(struct js *J, const struct js_modhost *h);
+/* Run a module script: an inline one (url is the document's, for resolving)
+ * or the module at url with the source fetched for it. tag goes to done(). */
+void js_run_module(struct js *J, const char *url, int inline_src, const char *src, int len, void *tag);
+/* What fetch() got for module id: its source, or NULL if it could not be fetched. */
+void js_module_source(struct js *J, int id, const char *src, int len);
 
 /* ---- values ---- */
 extern const jsval js_undefined, js_null;

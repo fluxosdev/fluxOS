@@ -9,9 +9,13 @@
  *
  * Changes to the tree mark the page dirty; when the engine returns to the
  * browser, a dirty page is styled, laid out and painted again. Events
- * (click, input, change, submit, keydown, load) go to listeners added
- * with addEventListener, on* properties and on* attributes, from the
- * target up to the window.
+ * (pointer and mouse, click, input, change, submit, keys, focus, load,
+ * scroll, resize) go to listeners added with addEventListener, on*
+ * properties and on* attributes: down from the window to the target in
+ * the capture phase, then back up. MutationObservers hear of changes as
+ * they happen; Intersection and Resize observers look after each layout
+ * and scroll. Module scripts go through the engine's module loader, which
+ * fetches with the browser and resolves through the page's import map.
  *
  * XMLHttpRequest goes through the browser's own fetching (wget), always
  * asynchronously; performance.timing, mark and measure are there for the
@@ -29,6 +33,7 @@
 #include <string.h>
 #include "jsint.h"
 #include "jsdom.h"
+#include "jsdomlib.h"
 
 #define MAX_TIMERS 256
 #define MAX_XHR    64
@@ -62,6 +67,24 @@ struct jsdom {
     struct jsobj **wraps;               /* every node's wrapper, for the collector (not roots) */
     int nwraps, wrap_cap;
     unsigned gcpass;
+    struct jsobj *ev_protos[32];        /* Event, MouseEvent...: by EV_* */
+    struct jsobj *node_proto, *text_proto, *frag_proto;     /* Node, Text, DocumentFragment */
+    struct jsobj *tag_protos[T_COUNT];  /* HTMLInputElement and the rest, by tag (NULL: HTMLElement) */
+    struct node *active;                /* document.activeElement, when a script focused one */
+    int custom_on;                      /* customElements.define was called: tell it of custom elements */
+    int dom_lib;                        /* jsdomlib.h's js_dom_lib has been run */
+    struct { struct node *n; char type[8]; } queued[128];      /* jsdom_queue_event */
+    int nqueued;
+    int watch_mutations;                /* a MutationObserver observes: report changes to %mutation */
+    int in_mutation;
+    int watch_view;                     /* an IntersectionObserver or ResizeObserver observes */
+    int last_sx, last_sy, last_vw, last_vh;     /* the view as the scripts last heard of it */
+    unsigned layout_gen, seen_gen;
+    struct jsobj *history, *states;     /* history, and the state of each entry (by id) */
+    int entry, hist_len;                /* the current entry's id; history.length */
+    /* the import map: specifiers (or prefixes ending in /) and the URLs they stand for */
+    char **im_from, **im_to;
+    int nim;
 };
 
 static const struct jsclass node_class, document_class, style_class, classlist_class,
@@ -119,11 +142,78 @@ static void renumber(struct node *parent)
             k->index = i++;
 }
 
-static void unlink_node(struct node *n)
+static jsval wrap(struct jsdom *d, struct node *n);
+static int contains(const struct node *a, const struct node *b);
+
+/* A change for the MutationObservers: childList (added or removed, between
+ * prev and next), attributes (name, old value) or characterData (old value). */
+static void mutation(struct jsdom *d, const char *type, struct node *target, struct node *added,
+                     struct node *removed, struct node *prev, struct node *next, const char *attr,
+                     const char *old)
+{
+    if (!d || !d->watch_mutations || d->in_mutation || !target || !contains(d->h.root, target))
+        return;
+    struct js *J = d->J;
+    jsval hook = js_get(J, js_obj(d->window), "%mutation");
+    if (!js_is_callable(hook))
+        return;
+    d->in_mutation = 1;
+    jsval r = js_obj(js_new_object(J));
+    js_set(J, r, "type", js_str(J, type));
+    js_set(J, r, "target", wrap(d, target));
+    struct jsobj *a = js_new_array(J), *rm = js_new_array(J);
+    if (added)
+        js_array_push(J, a, wrap(d, added));
+    if (removed)
+        js_array_push(J, rm, wrap(d, removed));
+    js_set(J, r, "addedNodes", js_obj(a));
+    js_set(J, r, "removedNodes", js_obj(rm));
+    js_set(J, r, "previousSibling", wrap(d, prev));
+    js_set(J, r, "nextSibling", wrap(d, next));
+    js_set(J, r, "attributeName", attr ? js_str(J, attr) : js_null);
+    js_set(J, r, "attributeNamespace", js_null);
+    js_set(J, r, "oldValue", old ? js_str(J, old) : js_null);
+    jsval out;
+    if (js_call(J, hook, js_undefined, &r, 1, &out) < 0)
+        report(d, "MutationObserver");
+    d->in_mutation = 0;
+}
+
+/* Custom elements (their names have a dash): the customElements code in
+ * jsprelude.h upgrades them and calls connectedCallback and the rest. */
+static int is_custom(const struct node *n)
+{
+    return n && n->type == N_ELEMENT && n->name && strchr(n->name, '-') && n->name[0] != '#';
+}
+
+static void ce_hook(struct jsdom *d, const char *hook, jsval *args, int n)
+{
+    struct js *J = d->J;
+    jsval f = js_get(J, js_obj(d->window), hook), r;
+    if (js_is_callable(f) && js_call(J, f, js_undefined, args, n, &r) < 0)
+        report(d, hook);
+}
+
+/* n went into the document (connected 1) or out of it: each custom element in it hears. */
+static void ce_tree(struct jsdom *d, struct node *n, int connected)
+{
+    if (!d || !d->custom_on || (connected && !contains(d->h.root, n)))
+        return;
+    for (struct node *k = n; k; k = node_next(k, n))
+        if (is_custom(k)) {
+            jsval w = wrap(d, k);
+            ce_hook(d, connected ? "%ceConnected" : "%ceDisconnected", &w, 1);
+        }
+}
+
+static void unlink_node(struct jsdom *d, struct node *n)
 {
     struct node *p = n->parent;
     if (!p)
         return;
+    if (d && d->watch_mutations)
+        mutation(d, "childList", p, NULL, n, n->prev, n->next, NULL, NULL);
+    int was_connected = d && d->custom_on && contains(d->h.root, p);
     if (n->prev)
         n->prev->next = n->next;
     else
@@ -134,6 +224,8 @@ static void unlink_node(struct node *n)
         p->last = n->prev;
     n->parent = n->prev = n->next = NULL;
     renumber(p);
+    if (was_connected)
+        ce_tree(d, n, 0);
 }
 
 static int contains(const struct node *a, const struct node *b)
@@ -157,7 +249,7 @@ static int insert_node(struct jsdom *d, struct node *parent, struct node *n, str
     if (is_fragment(n)) {
         while (n->first) {
             struct node *k = n->first;
-            unlink_node(k);
+            unlink_node(d, k);
             insert_node(d, parent, k, ref);
         }
         return 0;
@@ -166,7 +258,7 @@ static int insert_node(struct jsdom *d, struct node *parent, struct node *n, str
         ref = NULL;
     if (n == ref)
         return 0;
-    unlink_node(n);
+    unlink_node(d, n);
     n->parent = parent;
     if (ref) {
         n->next = ref;
@@ -186,6 +278,10 @@ static int insert_node(struct jsdom *d, struct node *parent, struct node *n, str
     }
     renumber(parent);
     d->dirty = 1;
+    if (d->watch_mutations)
+        mutation(d, "childList", parent, n, NULL, n->prev, n->next, NULL, NULL);
+    if (d->custom_on)
+        ce_tree(d, n, 1);
     return 0;
 }
 
@@ -217,6 +313,13 @@ static struct node *new_text(struct jsdom *d, const char *text, int len)
     return n;
 }
 
+static void ce_attr(struct jsdom *d, struct node *n, const char *name, const char *old, const char *value)
+{
+    struct js *J = d->J;
+    jsval a[4] = { wrap(d, n), js_str(J, name), old ? js_str(J, old) : js_null, value ? js_str(J, value) : js_null };
+    ce_hook(d, "%ceAttr", a, 4);
+}
+
 static void set_attr(struct jsdom *d, struct node *n, const char *name, const char *value)
 {
     if (!is_element(n))
@@ -228,8 +331,13 @@ static void set_attr(struct jsdom *d, struct node *n, const char *name, const ch
     struct attr **pp = &n->attrs;
     for (; *pp; pp = &(*pp)->next)
         if (!strcmp((*pp)->name, lname)) {
+            const char *old = (*pp)->value;
             (*pp)->value = arena_strdup(d->h.arena, value);
             d->dirty = 1;
+            if (d->watch_mutations)
+                mutation(d, "attributes", n, NULL, NULL, NULL, NULL, lname, old);
+            if (d->custom_on && is_custom(n))
+                ce_attr(d, n, lname, old, value);
             return;
         }
     struct attr *a = arena_alloc(d->h.arena, sizeof(*a));
@@ -239,6 +347,10 @@ static void set_attr(struct jsdom *d, struct node *n, const char *name, const ch
     a->value = arena_strdup(d->h.arena, value);
     *pp = a;
     d->dirty = 1;
+    if (d->watch_mutations)
+        mutation(d, "attributes", n, NULL, NULL, NULL, NULL, lname, NULL);
+    if (d->custom_on && is_custom(n))
+        ce_attr(d, n, lname, NULL, value);
 }
 
 static void remove_attr(struct jsdom *d, struct node *n, const char *name)
@@ -247,8 +359,13 @@ static void remove_attr(struct jsdom *d, struct node *n, const char *name)
         return;
     for (struct attr **pp = &n->attrs; *pp; pp = &(*pp)->next)
         if (!strcasecmp((*pp)->name, name)) {
-            *pp = (*pp)->next;
+            struct attr *gone = *pp;
+            *pp = gone->next;
             d->dirty = 1;
+            if (d->watch_mutations)
+                mutation(d, "attributes", n, NULL, NULL, NULL, NULL, gone->name, gone->value);
+            if (d->custom_on && is_custom(n))
+                ce_attr(d, n, gone->name, gone->value, NULL);
             return;
         }
 }
@@ -287,16 +404,19 @@ static jsval text_content(struct js *J, const struct node *n)
 static void remove_children(struct jsdom *d, struct node *n)
 {
     while (n->first)
-        unlink_node(n->first);
+        unlink_node(d, n->first);
     d->dirty = 1;
 }
 
 static void set_text_content(struct jsdom *d, struct node *n, const char *s, int len)
 {
     if (n->type == N_TEXT) {
+        const char *old = n->text;
         n->text = arena_strndup(d->h.arena, s, (size_t)len);
         n->len = len;
         d->dirty = 1;
+        if (d->watch_mutations)
+            mutation(d, "characterData", n, NULL, NULL, NULL, NULL, NULL, old);
         return;
     }
     remove_children(d, n);
@@ -423,7 +543,7 @@ static struct node *parse_fragment(struct jsdom *d, const char *html, int len)
         return frag;
     while (body->first) {
         struct node *k = body->first;
-        unlink_node(k);
+        unlink_node(d, k);
         insert_node(d, frag, k, NULL);
     }
     return frag;
@@ -772,7 +892,8 @@ static jsval wrap(struct jsdom *d, struct node *n)
         return js_null;
     if (!n->js) {
         struct jsobj *o = js_new_host(d->J, &node_class, n);
-        o->proto = d->element_proto;
+        o->proto = n->type == N_TEXT ? d->text_proto : is_fragment(n) ? d->frag_proto
+                 : d->tag_protos[n->tag] ? d->tag_protos[n->tag] : d->element_proto;
         if (d->nwraps == d->wrap_cap) {
             int cap = d->wrap_cap ? d->wrap_cap * 2 : 256;
             struct jsobj **nw = realloc(d->wraps, sizeof(*nw) * (size_t)cap);
@@ -948,7 +1069,9 @@ static const char *const reflected[] = {
     "placeholder", "role", "width", "height", "colspan", "rowspan", "content", "charset",
     "media", "enctype", "accept", "autocomplete", "dir", "accesskey", "tabindex", "label",
     "maxlength", "size", "pattern", "min", "max", "step", "cols", "rows", "wrap", "download",
-    NULL,
+    "srcset", "sizes", "loading", "decoding", "referrerpolicy", "integrity", "nonce", "as", "hreflang",
+    "inputmode", "enterkeyhint", "autocapitalize", "translate", "is", "minlength", "form", "popover",
+    "fetchpriority", "crossorigin", NULL,
 };
 
 static const char *const boolean_attrs[] = {
@@ -1083,6 +1206,15 @@ static int node_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
             *out = js_obj(a);
         return 1;
     }
+    if (IS("innerText") && n->type == N_ELEMENT) {      /* as rendered: white space collapsed */
+        char *buf = malloc(65536);
+        if (buf) {
+            node_text(n, buf, 65536);
+            *out = js_str(J, buf);
+            free(buf);
+            return 1;
+        }
+    }
     if (IS("textContent") || IS("innerText") || IS("nodeValue") || IS("data") || IS("wholeText")) {
         if ((IS("nodeValue") || IS("data")) && n->type != N_TEXT) {
             *out = js_null;
@@ -1195,7 +1327,64 @@ static int node_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
         return 1;
     }
     if (IS("scrollTop") || IS("scrollLeft")) {
-        *out = js_num(0);
+        int sx = 0, sy = 0;                 /* the root and body scroll with the window; nothing else does */
+        if ((n == d->h.root || n->tag == T_BODY) && d->h.scroll_pos)
+            d->h.scroll_pos(d->h.ctx, &sx, &sy);
+        *out = js_num(IS("scrollTop") ? sy : sx);
+        return 1;
+    }
+    if (IS("content") && n->tag == T_TEMPLATE) {     /* its children, moved into a fragment */
+        jsval c = js_get(J, wrap(d, n), "__content");
+        if (c.t != JS_OBJ) {
+            struct node *frag = new_node(d, N_ELEMENT, "#fragment");
+            while (frag && n->first) {
+                struct node *k = n->first;
+                unlink_node(NULL, k);
+                insert_node(d, frag, k, NULL);
+            }
+            c = wrap(d, frag);
+            js_put(J, ((struct jsobj *)n->js), S(J, "__content"), c, 1);
+        }
+        *out = c;
+        return 1;
+    }
+    if ((IS("naturalWidth") || IS("naturalHeight")) && n->tag == T_IMG) {
+        *out = js_num(n->img ? (IS("naturalWidth") ? n->img->w : n->img->h) : 0);
+        return 1;
+    }
+    if (IS("complete") && n->tag == T_IMG) {
+        const char *src = node_attr(n, "src");
+        *out = js_bool(n->img || !src || !*src);
+        return 1;
+    }
+    if (IS("currentSrc") && (n->tag == T_IMG || n->tag == T_VIDEO || n->tag == T_AUDIO)) {
+        const char *v = node_attr(n, "src");
+        char abs[URL_MAX] = "";
+        if (v)
+            url_resolve(d->h.base, v, abs, sizeof(abs));
+        *out = js_str(J, abs);
+        return 1;
+    }
+    if (IS("isContentEditable") || IS("contentEditable")) {
+        const struct node *k = n;
+        const char *v = NULL;
+        while (k && k->type == N_ELEMENT && !(v = node_attr(k, "contenteditable")))
+            k = IS("isContentEditable") ? k->parent : NULL;
+        int on = v && strcasecmp(v, "false");
+        *out = IS("isContentEditable") ? js_bool(on) : js_str(J, !v ? "inherit" : on ? "true" : "false");
+        return 1;
+    }
+    if (IS("labels") && n->type == N_ELEMENT) {
+        struct jsobj *a = js_new_array(J);
+        const char *id = node_attr(n, "id");
+        for (struct node *k = d->h.root; k; k = node_next(k, d->h.root)) {
+            if (k->type != N_ELEMENT || k->tag != T_LABEL)
+                continue;
+            const char *f = node_attr(k, "for");
+            if ((f && id && !strcmp(f, id)) || (!f && contains(k, n)))
+                js_array_push(J, a, wrap(d, k));
+        }
+        *out = js_obj(a);
         return 1;
     }
     if (IS("offsetParent")) {
@@ -1246,7 +1435,7 @@ static int node_set(struct js *J, struct jsobj *o, const char *key, jsval v)
         struct node *frag = parse_fragment(d, s->s, s->len);
         if (frag && n->parent) {
             struct node *p = n->parent, *next = n->next;
-            unlink_node(n);
+            unlink_node(d, n);
             insert_node(d, p, frag, next);
         }
         return 1;
@@ -1302,8 +1491,23 @@ static int node_set(struct js *J, struct jsobj *o, const char *key, jsval v)
         set_attr(d, n, "style", js_tostr(J, v)->s);
         return 1;
     }
+    if (IS("scrollTop") || IS("scrollLeft")) {
+        double p = js_to_number(J, v);
+        int sx = 0, sy = 0;
+        if ((n == d->h.root || n->tag == T_BODY) && d->h.scroll && d->h.scroll_pos && p == p) {
+            d->h.scroll_pos(d->h.ctx, &sx, &sy);
+            d->h.scroll(d->h.ctx, IS("scrollLeft") ? (int)p : sx, IS("scrollTop") ? (int)p : sy, 0);
+        }
+        return 1;
+    }
+    if (IS("contentEditable")) {
+        set_attr(d, n, "contenteditable", js_tostr(J, v)->s);
+        return 1;
+    }
     if (in_list(reflected, key, attr, sizeof(attr))) {
         set_attr(d, n, attr, js_tostr(J, v)->s);
+        if ((IS("srcset") || IS("sizes")) && n->tag == T_IMG && d->h.load_image)
+            d->h.load_image(d->h.ctx, n);
         return 1;
     }
     if (in_list(boolean_attrs, key, attr, sizeof(attr)) || IS("readOnly")) {
@@ -1319,7 +1523,19 @@ static int node_set(struct js *J, struct jsobj *o, const char *key, jsval v)
 #undef IS
 }
 
-static const struct jsclass node_class = { "HTMLElement", node_get, node_set };
+/* A custom element's constructor: its object is the node's wrapper from now on. */
+static void node_adopt(struct js *J, struct jsobj *self, struct jsobj *from)
+{
+    struct jsdom *d = dom(J);
+    struct node *n = from->hdata;
+    if (n && n->js == from)
+        n->js = self;
+    for (int i = 0; i < d->nwraps; i++)
+        if (d->wraps[i] == from)
+            d->wraps[i] = self;
+}
+
+static const struct jsclass node_class = { "HTMLElement", node_get, node_set, node_adopt };
 
 /* ---- style ---- */
 
@@ -1432,7 +1648,7 @@ static int style_set(struct js *J, struct jsobj *o, const char *key, jsval v)
     return 1;
 }
 
-static const struct jsclass style_class = { "CSSStyleDeclaration", style_get, style_set };
+static const struct jsclass style_class = { "CSSStyleDeclaration", style_get, style_set, NULL };
 
 static jsval style_set_property(struct js *J, jsval self, jsval *args, int argc)
 {
@@ -1508,7 +1724,7 @@ static int computed_get(struct js *J, struct jsobj *o, const char *key, jsval *o
     return style_get(J, &tmp, key, out);
 }
 
-static const struct jsclass computed_class = { "CSSStyleDeclaration", computed_get, NULL };
+static const struct jsclass computed_class = { "CSSStyleDeclaration", computed_get, NULL, NULL };
 
 /* ---- classList and dataset ---- */
 
@@ -1588,7 +1804,7 @@ static int classlist_set(struct js *J, struct jsobj *o, const char *key, jsval v
     return 1;
 }
 
-static const struct jsclass classlist_class = { "DOMTokenList", classlist_get, classlist_set };
+static const struct jsclass classlist_class = { "DOMTokenList", classlist_get, classlist_set, NULL };
 
 static struct node *classlist_node(jsval self)
 {
@@ -1778,7 +1994,7 @@ static int dataset_set(struct js *J, struct jsobj *o, const char *key, jsval v)
     return 1;
 }
 
-static const struct jsclass dataset_class = { "DOMStringMap", dataset_get, dataset_set };
+static const struct jsclass dataset_class = { "DOMStringMap", dataset_get, dataset_set, NULL };
 
 /* ---- element methods ---- */
 
@@ -1790,13 +2006,24 @@ static struct node *arg_node(struct js *J, jsval v)
     return n;
 }
 
+/* What a script element is: 0 data (JSON, templates...), 1 a classic script, 2 a module. */
+static int script_kind(const struct node *n)
+{
+    const char *type = node_attr(n, "type");
+    if (!type || !*type)
+        return 1;
+    if (!strcasecmp(type, "module"))
+        return 2;
+    return strcasestr(type, "javascript") || strcasestr(type, "ecmascript") ? 1 : 0;
+}
+
 static jsval el_append_child(struct js *J, jsval self, jsval *args, int argc)
 {
     struct node *p = this_node(J, self), *c = arg_node(J, ARG(0));
     if (!p || !c)
         return js_undefined;
     struct jsdom *d = dom(J);
-    int script = is_element(c) && c->tag == T_SCRIPT;
+    int script = is_element(c) && c->tag == T_SCRIPT ? script_kind(c) : 0;
     if (insert_node(d, p, c, NULL) < 0)
         return js_throw_error(J, "HierarchyRequestError: the new child contains the parent");
     /* A script added to the document runs (or loads). */
@@ -1807,7 +2034,10 @@ static jsval el_append_child(struct js *J, jsval self, jsval *args, int argc)
             url_resolve(d->h.base, src, abs, sizeof(abs));
             d->h.load_script(d->h.ctx, c, abs);
         } else if (!src && c->first && c->first->type == N_TEXT) {
-            jsdom_run_script(d, c, c->first->text, c->first->len, "inserted script");
+            if (script == 2)
+                jsdom_run_module(d, d->h.base, 1, c->first->text, c->first->len, -1);
+            else
+                jsdom_run_script(d, c, c->first->text, c->first->len, "inserted script");
         }
     }
     if (is_element(c) && c->tag == T_IMG && d->h.load_image)
@@ -1838,7 +2068,7 @@ static jsval el_remove_child(struct js *J, jsval self, jsval *args, int argc)
         return js_undefined;
     if (c->parent != p)
         return js_throw_error(J, "NotFoundError: the node is not a child of this node");
-    unlink_node(c);
+    unlink_node(dom(J), c);
     dom(J)->dirty = 1;
     return ARG(0);
 }
@@ -1849,7 +2079,7 @@ static jsval el_replace_child(struct js *J, jsval self, jsval *args, int argc)
     if (!p || !nw || !old || old->parent != p)
         return js_undefined;
     struct node *next = old->next;
-    unlink_node(old);
+    unlink_node(dom(J), old);
     insert_node(dom(J), p, nw, next);
     return ARG(1);
 }
@@ -1860,7 +2090,7 @@ static jsval el_remove(struct js *J, jsval self, jsval *args, int argc)
     (void)argc;
     struct node *n = this_node(J, self);
     if (n && n->parent) {
-        unlink_node(n);
+        unlink_node(dom(J), n);
         dom(J)->dirty = 1;
     }
     return js_undefined;
@@ -1887,7 +2117,7 @@ static jsval insert_items(struct js *J, jsval self, jsval *args, int argc, int w
             insert_node(d, parent, c, ref);
     }
     if (where == 4) {
-        unlink_node(n);
+        unlink_node(d, n);
         d->dirty = 1;
     }
     return js_undefined;
@@ -1959,6 +2189,14 @@ static struct node *clone(struct jsdom *d, const struct node *n, int deep)
             if (kc)
                 insert_node(d, c, kc, NULL);
         }
+    if (deep && n->tag == T_TEMPLATE && n->js) {   /* a template's content went to its fragment */
+        struct node *content = node_of(js_get(d->J, js_obj(n->js), "__content"));
+        for (const struct node *k = content ? content->first : NULL; k; k = k->next) {
+            struct node *kc = clone(d, k, 1);
+            if (kc)
+                insert_node(d, c, kc, NULL);
+        }
+    }
     return c;
 }
 
@@ -1968,6 +2206,254 @@ static jsval el_clone_node(struct js *J, jsval self, jsval *args, int argc)
     if (!n)
         return js_undefined;
     return wrap(dom(J), clone(dom(J), n, js_truthy(ARG(0))));
+}
+
+static jsval el_get_attribute_names(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)args, (void)argc;
+    struct node *n = this_node(J, self);
+    struct jsobj *a = js_new_array(J);
+    for (const struct attr *at = n && n->type == N_ELEMENT ? n->attrs : NULL; at; at = at->next)
+        js_array_push(J, a, js_str(J, at->name));
+    return js_obj(a);
+}
+
+static jsval el_has_attributes(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)args, (void)argc;
+    struct node *n = this_node(J, self);
+    return js_bool(n && n->type == N_ELEMENT && n->attrs);
+}
+
+/* Node.compareDocumentPosition: DISCONNECTED 1, PRECEDING 2, FOLLOWING 4, CONTAINS 8, CONTAINED_BY 16. */
+static jsval el_compare_position(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct node *a = this_node(J, self), *b = node_of(ARG(0));
+    if (!a || !b)
+        return js_num(0);
+    if (a == b)
+        return js_num(0);
+    if (contains(a, b))
+        return js_num(16 | 4);
+    if (contains(b, a))
+        return js_num(8 | 2);
+    struct node *ra = a, *rb = b;
+    while (ra->parent)
+        ra = ra->parent;
+    while (rb->parent)
+        rb = rb->parent;
+    if (ra != rb)
+        return js_num(1 | 32 | (a < b ? 4 : 2));
+    for (struct node *k = ra; k; k = node_next(k, ra)) {
+        if (k == a)
+            return js_num(4);
+        if (k == b)
+            return js_num(2);
+    }
+    return js_num(1);
+}
+
+static jsval el_get_root_node(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)args, (void)argc;
+    struct jsdom *d = dom(J);
+    struct node *n = this_node(J, self);
+    if (!n)
+        return js_undefined;
+    while (n->parent)
+        n = n->parent;
+    return n == d->h.root ? js_obj(d->document) : wrap(d, n);
+}
+
+static int equal_nodes(const struct node *a, const struct node *b)
+{
+    if (a->type != b->type)
+        return 0;
+    if (a->type == N_TEXT)
+        return a->len == b->len && !memcmp(a->text, b->text, (size_t)a->len);
+    if (strcmp(a->name, b->name))
+        return 0;
+    int na = 0, nb = 0;
+    for (const struct attr *x = a->attrs; x; x = x->next, na++) {
+        const char *v = node_attr(b, x->name);
+        if (!v || strcmp(v, x->value ? x->value : ""))
+            return 0;
+    }
+    for (const struct attr *x = b->attrs; x; x = x->next)
+        nb++;
+    if (na != nb)
+        return 0;
+    const struct node *p = a->first, *q = b->first;
+    for (; p && q; p = p->next, q = q->next)
+        if (!equal_nodes(p, q))
+            return 0;
+    return !p && !q;
+}
+
+static jsval el_is_equal_node(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct node *a = this_node(J, self), *b = node_of(ARG(0));
+    return js_bool(a && b && equal_nodes(a, b));
+}
+
+static jsval el_is_same_node(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct node *a = this_node(J, self), *b = node_of(ARG(0));
+    return js_bool(a && a == b);
+}
+
+/* Join adjacent text nodes and drop empty ones. */
+static jsval el_normalize(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)args, (void)argc;
+    struct jsdom *d = dom(J);
+    struct node *root = this_node(J, self);
+    for (struct node *n = root; n; n = node_next(n, root)) {
+        if (n->type != N_ELEMENT)
+            continue;
+        for (struct node *k = n->first; k;) {
+            struct node *next = k->next;
+            if (k->type == N_TEXT && next && next->type == N_TEXT) {
+                char *t = arena_alloc(d->h.arena, (size_t)(k->len + next->len) + 1);
+                if (!t)
+                    break;
+                memcpy(t, k->text, (size_t)k->len);
+                memcpy(t + k->len, next->text, (size_t)next->len);
+                k->text = t;
+                k->len += next->len;
+                unlink_node(d, next);
+                d->dirty = 1;
+                continue;
+            }
+            if (k->type == N_TEXT && !k->len) {
+                unlink_node(d, k);
+                d->dirty = 1;
+            }
+            k = next;
+        }
+    }
+    return js_undefined;
+}
+
+static jsval new_event(struct jsdom *d, const char *type, jsval target);
+static int dispatch_event(struct jsdom *d, struct node *target, const char *type, jsval ev, int bubbles);
+
+/* <dialog>: show(), showModal() and close(returnValue). */
+static jsval dialog_show(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)args, (void)argc;
+    struct node *n = this_node(J, self);
+    if (n && !node_attr(n, "open"))
+        set_attr(dom(J), n, "open", "");
+    return js_undefined;
+}
+
+static jsval dialog_close(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct jsdom *d = dom(J);
+    struct node *n = this_node(J, self);
+    if (!n || !node_attr(n, "open"))
+        return js_undefined;
+    if (argc && ARG(0).t != JS_UNDEF)
+        js_set(J, self, "returnValue", js_to_string(J, ARG(0)));
+    remove_attr(d, n, "open");
+    jsval ev = new_event(d, "close", self);
+    js_set(J, ev, "bubbles", js_bool(0));
+    js_set(J, ev, "cancelable", js_bool(0));
+    dispatch_event(d, n, "close", ev, 0);
+    return js_undefined;
+}
+
+/* form.submit(), requestSubmit() and reset() */
+static jsval form_submit(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)args, (void)argc;
+    struct jsdom *d = dom(J);
+    struct node *n = this_node(J, self);
+    if (n && n->tag == T_FORM && d->h.submit)
+        d->h.submit(d->h.ctx, n, 0);
+    return js_undefined;
+}
+
+static jsval form_request_submit(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)args, (void)argc;
+    struct jsdom *d = dom(J);
+    struct node *n = this_node(J, self);
+    jsval ok = js_get(J, self, "checkValidity");
+    if (js_is_callable(ok) && !js_truthy(js_call_value(J, ok, self, NULL, 0)))
+        return js_undefined;
+    if (n && n->tag == T_FORM && d->h.submit)
+        d->h.submit(d->h.ctx, n, 1);
+    return js_undefined;
+}
+
+static jsval form_reset(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)args, (void)argc;
+    struct jsdom *d = dom(J);
+    struct node *form = this_node(J, self);
+    for (struct node *n = form; n; n = node_next(n, form)) {
+        if (n->type != N_ELEMENT)
+            continue;
+        if (n->tag == T_INPUT) {
+            const char *v = node_attr(n, "value");
+            free(n->value);
+            n->value = strdup(v ? v : "");
+            n->checked = node_attr(n, "checked") != NULL;
+        } else if (n->tag == T_TEXTAREA) {
+            free(n->value);
+            n->value = strdup(n->first && n->first->type == N_TEXT ? n->first->text : "");
+        } else if (n->tag == T_SELECT) {
+            n->checked = 0;
+        }
+    }
+    d->dirty = 1;
+    return js_undefined;
+}
+
+static jsval doc_import_node(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    struct node *n = arg_node(J, ARG(0));
+    return n ? wrap(dom(J), clone(dom(J), n, js_truthy(ARG(1)))) : js_undefined;
+}
+
+static jsval doc_adopt_node(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    struct node *n = arg_node(J, ARG(0));
+    if (n && n->parent)
+        unlink_node(dom(J), n);
+    return ARG(0);
+}
+
+/* document.elementFromPoint(x, y), in the viewport's coordinates. */
+static jsval doc_element_from_point(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    struct jsdom *d = dom(J);
+    double x = js_to_number(J, ARG(0)), y = js_to_number(J, ARG(1));
+    int sx = 0, sy = 0;
+    if (!d->h.node_at || x != x || y != y || x < 0 || y < 0)
+        return js_null;
+    if (d->h.scroll_pos)
+        d->h.scroll_pos(d->h.ctx, &sx, &sy);
+    struct node *n = d->h.node_at(d->h.ctx, (int)x + sx, (int)y + sy);
+    return n ? wrap(d, n) : wrap(d, node_find(d->h.root, T_BODY));
+}
+
+static jsval el_blur(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)args, (void)argc;
+    struct jsdom *d = dom(J);
+    struct node *n = node_of(self);
+    if (n && d->active == n) {
+        d->active = NULL;
+        jsdom_dispatch(d, n, "blur");
+        jsdom_dispatch(d, n, "focusout");
+    }
+    return js_undefined;
 }
 
 static jsval el_contains(struct js *J, jsval self, jsval *args, int argc)
@@ -2004,7 +2490,7 @@ static jsval el_set_attribute(struct js *J, jsval self, jsval *args, int argc)
         free(n->value);
         n->value = strdup(value->s);
     }
-    if (!strcasecmp(name->s, "src") && n->tag == T_IMG && dom(J)->h.load_image)
+    if ((!strcasecmp(name->s, "src") || !strcasecmp(name->s, "srcset")) && n->tag == T_IMG && dom(J)->h.load_image)
         dom(J)->h.load_image(dom(J)->h.ctx, n);
     return js_undefined;
 }
@@ -2179,9 +2665,20 @@ static jsval el_focus(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)args;
     (void)argc;
+    struct jsdom *d = dom(J);
     struct node *n = this_node(J, self);
-    if (n && dom(J)->h.focus)
-        dom(J)->h.focus(dom(J)->h.ctx, n);
+    if (!n || n->type != N_ELEMENT || d->active == n)
+        return js_undefined;
+    struct node *old = d->active;
+    d->active = n;
+    if (old) {
+        jsdom_dispatch(d, old, "blur");
+        jsdom_dispatch(d, old, "focusout");
+    }
+    if (d->h.focus)
+        d->h.focus(d->h.ctx, n);
+    jsdom_dispatch(d, n, "focus");
+    jsdom_dispatch(d, n, "focusin");
     return js_undefined;
 }
 
@@ -2232,7 +2729,14 @@ static jsval node_to_string(struct js *J, jsval self, jsval *args, int argc)
     return js_str(J, b);
 }
 
-/* ---- events ---- */
+/* ---- events ----
+ *
+ * A target's listeners are kept in its hidden __listeners object, by type:
+ * arrays of entries { f, c, o }: the listener (a function, or an object
+ * with handleEvent), whether it is for the capture phase, and whether it
+ * goes after one call. Dispatching runs the capture phase from the window
+ * down, the target, then (if the event bubbles) back up to the window.
+ */
 
 static struct jsstr *listener_key(struct js *J)
 {
@@ -2246,11 +2750,26 @@ static jsval target_of(struct js *J, jsval self)
     return self;
 }
 
+static int capture_option(struct js *J, jsval opts)
+{
+    if (opts.t == JS_OBJ)
+        return js_truthy(js_get(J, opts, "capture"));
+    return js_truthy(opts);
+}
+
 static jsval add_event_listener(struct js *J, jsval self, jsval *args, int argc)
 {
-    jsval t = target_of(J, self), f = ARG(1);
-    if (t.t != JS_OBJ || !js_is_callable(f))
+    jsval t = target_of(J, self), f = ARG(1), opts = ARG(2);
+    if (t.t != JS_OBJ || f.t != JS_OBJ)
         return js_undefined;
+    int capture = capture_option(J, opts), once = 0;
+    jsval signal = js_undefined;
+    if (opts.t == JS_OBJ) {
+        once = js_truthy(js_get(J, opts, "once"));
+        signal = js_get(J, opts, "signal");
+        if (signal.t == JS_OBJ && js_truthy(js_get(J, signal, "aborted")))
+            return js_undefined;
+    }
     struct prop *p = js_own(t.u.o, listener_key(J));
     if (!p) {
         js_put(J, t.u.o, listener_key(J), js_obj(js_new_object(J)), 1);
@@ -2265,14 +2784,25 @@ static jsval add_event_listener(struct js *J, jsval self, jsval *args, int argc)
         key.u.s = type;
         js_setv(J, p->v, key, list);
     }
-    for (int i = 0; i < list.u.o->len; i++)
-        if (js_strict_equal(list.u.o->items[i], f))
+    for (int i = 0; i < list.u.o->len; i++) {
+        jsval e = list.u.o->items[i];
+        if (js_strict_equal(js_get(J, e, "f"), f) && js_truthy(js_get(J, e, "c")) == capture)
             return js_undefined;
-    js_array_push(J, list.u.o, f);
-    /* { once: true } */
-    jsval opts = ARG(2);
-    if (opts.t == JS_OBJ && js_truthy(js_get(J, opts, "once")))
-        js_put(J, f.u.o, S(J, "__once"), js_bool(1), 1);
+    }
+    jsval e = js_obj(js_new_object(J));
+    js_set(J, e, "f", f);
+    js_set(J, e, "c", js_bool(capture));
+    js_set(J, e, "o", js_bool(once));
+    js_array_push(J, list.u.o, e);
+    /* { signal }: aborting it removes the listener */
+    jsval helper = js_get(J, js_obj(J->global), "%onAbort");
+    if (signal.t == JS_OBJ && js_is_callable(helper)) {
+        jsval tv;
+        tv.t = JS_STR;
+        tv.u.s = type;
+        jsval a[5] = { signal, t, tv, f, js_bool(capture) };
+        js_call_value(J, helper, js_undefined, a, 5);
+    }
     return js_undefined;
 }
 
@@ -2287,13 +2817,17 @@ static jsval remove_event_listener(struct js *J, jsval self, jsval *args, int ar
     jsval list = js_get_str(J, p->v, js_tostr(J, ARG(0)));
     if (!js_is_array(list))
         return js_undefined;
+    int capture = capture_option(J, ARG(2));
     struct jsobj *a = list.u.o;
-    for (int i = 0; i < a->len; i++)
-        if (js_strict_equal(a->items[i], ARG(1))) {
+    for (int i = 0; i < a->len; i++) {
+        jsval e = a->items[i];
+        if (js_strict_equal(js_get(J, e, "f"), ARG(1)) && js_truthy(js_get(J, e, "c")) == capture) {
+            js_set(J, e, "r", js_bool(1));      /* a dispatch under way skips it */
             memmove(a->items + i, a->items + i + 1, sizeof(jsval) * (size_t)(a->len - i - 1));
             a->len--;
             break;
         }
+    }
     return js_undefined;
 }
 
@@ -2301,8 +2835,10 @@ static jsval event_prevent_default(struct js *J, jsval self, jsval *args, int ar
 {
     (void)args;
     (void)argc;
-    if (self.t == JS_OBJ)
+    if (self.t == JS_OBJ && js_truthy(js_get(J, self, "cancelable")) && !js_truthy(js_get(J, self, "__passive")))
         js_put(J, self.u.o, S(J, "defaultPrevented"), js_bool(1), 0);
+    if (self.t == JS_OBJ)
+        js_put(J, self.u.o, S(J, "returnValue"), js_bool(0), 0);
     return js_undefined;
 }
 
@@ -2310,8 +2846,10 @@ static jsval event_stop_propagation(struct js *J, jsval self, jsval *args, int a
 {
     (void)args;
     (void)argc;
-    if (self.t == JS_OBJ)
+    if (self.t == JS_OBJ) {
         js_put(J, self.u.o, S(J, "__stopped"), js_bool(1), 1);
+        js_put(J, self.u.o, S(J, "cancelBubble"), js_bool(1), 0);
+    }
     return js_undefined;
 }
 
@@ -2333,13 +2871,80 @@ static jsval event_init(struct js *J, jsval self, jsval *args, int argc)
     js_set(J, self, "type", js_to_string(J, ARG(0)));
     js_set(J, self, "bubbles", js_bool(js_truthy(ARG(1))));
     js_set(J, self, "cancelable", js_bool(js_truthy(ARG(2))));
+    if (argc > 3)
+        js_set(J, self, "detail", ARG(3));      /* initCustomEvent */
     return js_undefined;
 }
 
-static jsval new_event(struct jsdom *d, const char *type, jsval target)
+/* The targets an event goes through: the target, its ancestors, the document and the window. */
+static jsval event_composed_path(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)args;
+    (void)argc;
+    struct jsdom *d = dom(J);
+    struct jsobj *a = js_new_array(J);
+    if (self.t != JS_OBJ || !js_truthy(js_get(J, self, "__dispatching")))
+        return js_obj(a);
+    jsval t = js_get(J, self, "target");
+    struct node *n = node_of(t);
+    for (; n; n = n->parent)
+        js_array_push(J, a, wrap(d, n));
+    if (node_of(t) && contains(d->h.root, node_of(t)))
+        js_array_push(J, a, js_obj(d->document));
+    if (t.t == JS_OBJ && t.u.o != d->window)
+        js_array_push(J, a, js_obj(d->window));
+    else if (t.t == JS_OBJ)
+        js_array_push(J, a, t);
+    return js_obj(a);
+}
+
+/* The kinds of event, each with its prototype: what an event's type makes it. */
+#define EVENT_KINDS(X) \
+    X(EV_EVENT, "Event", -1) X(EV_UI, "UIEvent", EV_EVENT) X(EV_MOUSE, "MouseEvent", EV_UI) \
+    X(EV_POINTER, "PointerEvent", EV_MOUSE) X(EV_WHEEL, "WheelEvent", EV_MOUSE) \
+    X(EV_DRAG, "DragEvent", EV_MOUSE) X(EV_KEYBOARD, "KeyboardEvent", EV_UI) \
+    X(EV_FOCUS, "FocusEvent", EV_UI) X(EV_INPUT, "InputEvent", EV_UI) \
+    X(EV_COMPOSITION, "CompositionEvent", EV_UI) X(EV_TOUCH, "TouchEvent", EV_UI) \
+    X(EV_CUSTOM, "CustomEvent", EV_EVENT) X(EV_SUBMIT, "SubmitEvent", EV_EVENT) \
+    X(EV_PROGRESS, "ProgressEvent", EV_EVENT) X(EV_ERROR, "ErrorEvent", EV_EVENT) \
+    X(EV_MESSAGE, "MessageEvent", EV_EVENT) X(EV_POPSTATE, "PopStateEvent", EV_EVENT) \
+    X(EV_HASHCHANGE, "HashChangeEvent", EV_EVENT) X(EV_ANIMATION, "AnimationEvent", EV_EVENT) \
+    X(EV_TRANSITION, "TransitionEvent", EV_EVENT) X(EV_CLIPBOARD, "ClipboardEvent", EV_EVENT) \
+    X(EV_STORAGE, "StorageEvent", EV_EVENT) X(EV_PAGETRANSITION, "PageTransitionEvent", EV_EVENT) \
+    X(EV_BEFOREUNLOAD, "BeforeUnloadEvent", EV_EVENT) X(EV_TOGGLE, "ToggleEvent", EV_EVENT)
+
+enum {
+#define X(id, name, parent) id,
+    EVENT_KINDS(X)
+#undef X
+    EV_COUNT
+};
+
+static int event_kind(const char *type)
+{
+    static const struct { const char *type; int kind; } kinds[] = {
+        { "click", EV_MOUSE }, { "dblclick", EV_MOUSE }, { "mousedown", EV_MOUSE }, { "mouseup", EV_MOUSE },
+        { "mousemove", EV_MOUSE }, { "mouseover", EV_MOUSE }, { "mouseout", EV_MOUSE },
+        { "mouseenter", EV_MOUSE }, { "mouseleave", EV_MOUSE }, { "contextmenu", EV_MOUSE },
+        { "auxclick", EV_POINTER }, { "pointerdown", EV_POINTER }, { "pointerup", EV_POINTER },
+        { "pointermove", EV_POINTER }, { "pointerover", EV_POINTER }, { "pointerout", EV_POINTER },
+        { "pointerenter", EV_POINTER }, { "pointerleave", EV_POINTER }, { "pointercancel", EV_POINTER },
+        { "wheel", EV_WHEEL }, { "keydown", EV_KEYBOARD }, { "keyup", EV_KEYBOARD },
+        { "keypress", EV_KEYBOARD }, { "focus", EV_FOCUS }, { "blur", EV_FOCUS }, { "focusin", EV_FOCUS },
+        { "focusout", EV_FOCUS }, { "input", EV_INPUT }, { "beforeinput", EV_INPUT },
+        { "submit", EV_SUBMIT }, { "popstate", EV_POPSTATE }, { "hashchange", EV_HASHCHANGE },
+        { "message", EV_MESSAGE }, { "toggle", EV_TOGGLE }, { "beforetoggle", EV_TOGGLE },
+    };
+    for (unsigned i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++)
+        if (!strcmp(kinds[i].type, type))
+            return kinds[i].kind;
+    return EV_EVENT;
+}
+
+static jsval new_event_kind(struct jsdom *d, const char *type, jsval target, int kind)
 {
     struct js *J = d->J;
-    struct jsobj *e = js_mkobj(J, C_OBJECT, d->event_proto);
+    struct jsobj *e = js_mkobj(J, C_OBJECT, d->ev_protos[kind]);
     jsval ev = js_obj(e);
     js_set(J, ev, "type", js_str(J, type));
     js_set(J, ev, "target", target);
@@ -2349,17 +2954,23 @@ static jsval new_event(struct jsdom *d, const char *type, jsval target)
     js_set(J, ev, "cancelable", js_bool(1));
     js_set(J, ev, "defaultPrevented", js_bool(0));
     js_set(J, ev, "isTrusted", js_bool(1));
-    js_set(J, ev, "timeStamp", js_num(uptime_ms()));
-    js_set(J, ev, "button", js_num(0));
-    js_set(J, ev, "which", js_num(1));
+    js_set(J, ev, "timeStamp", js_num(uptime_ms()));      /* the same clock as performance.now() */
+    js_set(J, ev, "eventPhase", js_num(0));
     return ev;
 }
 
-/* Run the listeners and on-handler of one object for an event. */
-static void fire_on(struct jsdom *d, jsval obj, struct node *n, const char *type, jsval ev)
+static jsval new_event(struct jsdom *d, const char *type, jsval target)
+{
+    return new_event_kind(d, type, target, event_kind(type));
+}
+
+/* Run one object's listeners for an event in a phase (1 capture, 2 at the target, 3 bubbling),
+   and its on-handler outside the capture phase. */
+static void fire_phase(struct jsdom *d, jsval obj, struct node *n, const char *type, jsval ev, int phase)
 {
     struct js *J = d->J;
     js_set(J, ev, "currentTarget", obj);
+    js_set(J, ev, "eventPhase", js_num(phase));
     struct prop *p = js_own(obj.u.o, listener_key(J));
     if (p) {
         jsval list = js_get(J, p->v, type);
@@ -2368,18 +2979,29 @@ static void fire_on(struct jsdom *d, jsval obj, struct node *n, const char *type
             jsval *copy = js_alloc(J, sizeof(jsval) * (size_t)count);
             memcpy(copy, list.u.o->items, sizeof(jsval) * (size_t)count);
             for (int i = 0; i < count; i++) {
-                jsval r;
-                if (js_get(J, js_obj(copy[i].u.o), "__once").t == JS_BOOL) {
-                    jsval a[2] = { js_str(J, type), copy[i] };
-                    remove_event_listener(J, obj, a, 2);
+                jsval e = copy[i], r;
+                int capture = js_truthy(js_get(J, e, "c"));
+                if ((phase == 1 && !capture) || (phase == 3 && capture) || js_truthy(js_get(J, e, "r")))
+                    continue;
+                jsval f = js_get(J, e, "f");
+                if (js_truthy(js_get(J, e, "o"))) {
+                    jsval a[3] = { js_str(J, type), f, js_bool(capture) };
+                    remove_event_listener(J, obj, a, 3);
                 }
-                if (js_call(J, copy[i], obj, &ev, 1, &r) < 0)
+                jsval self = obj;
+                if (!js_is_callable(f)) {           /* { handleEvent(e) { ... } } */
+                    self = f;
+                    f = js_get(J, f, "handleEvent");
+                }
+                if (js_is_callable(f) && js_call(J, f, self, &ev, 1, &r) < 0)
                     report(d, type);
                 if (js_truthy(js_get(J, ev, "__stopnow")))
                     return;
             }
         }
     }
+    if (phase == 1)
+        return;
     char on[40];
     snprintf(on, sizeof(on), "on%s", type);
     jsval handler = js_get(J, obj, on);
@@ -2402,35 +3024,72 @@ static void fire_on(struct jsdom *d, jsval obj, struct node *n, const char *type
         if (js_call(J, handler, obj, &ev, 1, &r) < 0)
             report(d, on);
         else if (r.t == JS_BOOL && !r.u.b)
-            js_set(J, ev, "defaultPrevented", js_bool(1));
+            event_prevent_default(J, ev, NULL, 0);
     }
+}
+
+static void fire_on(struct jsdom *d, jsval obj, struct node *n, const char *type, jsval ev)
+{
+    fire_phase(d, obj, n, type, ev, 2);
+}
+
+/* Could n have listeners or a handler attribute for an event? */
+static int may_listen(const struct node *n, const char *on)
+{
+    return n->js || (n->type == N_ELEMENT && n->attrs && node_attr(n, on));
 }
 
 static int dispatch_event(struct jsdom *d, struct node *target, const char *type, jsval ev, int bubbles)
 {
     struct js *J = d->J;
+    struct node *path[256];
+    int np = 0;
+    for (struct node *n = target->parent; n && np < 256; n = n->parent)
+        path[np++] = n;
+    int in_doc = contains(d->h.root, target);
+    char on[40];
+    snprintf(on, sizeof(on), "on%s", type);
     d->depth++;
-    for (struct node *n = target; n; n = bubbles ? n->parent : NULL) {
-        int has_attr = n->type == N_ELEMENT && n->attrs;
-        if (!n->js && !has_attr)
-            continue;
-        char on[40];
-        snprintf(on, sizeof(on), "on%s", type);
-        if (!n->js && !node_attr(n, on))
-            continue;
-        fire_on(d, wrap(d, n), n, type, ev);
-        if (js_truthy(js_get(J, ev, "__stopped")))
-            break;
+    js_set(J, ev, "__dispatching", js_bool(1));
+#define STOPPED() js_truthy(js_get(J, ev, "__stopped"))
+    /* capture: the window and the document, then down to the target's parent */
+    if (in_doc) {
+        fire_phase(d, js_obj(d->window), NULL, type, ev, 1);
+        if (!STOPPED())
+            fire_phase(d, js_obj(d->document), NULL, type, ev, 1);
     }
-    if (bubbles && !js_truthy(js_get(J, ev, "__stopped"))) {
-        fire_on(d, js_obj(d->document), NULL, type, ev);
-        if (!js_truthy(js_get(J, ev, "__stopped")))
-            fire_on(d, js_obj(d->window), NULL, type, ev);
+    for (int i = np - 1; i >= 0 && !STOPPED(); i--)
+        if (path[i]->js)
+            fire_phase(d, wrap(d, path[i]), path[i], type, ev, 1);
+    if (!STOPPED() && may_listen(target, on))
+        fire_phase(d, wrap(d, target), target, type, ev, 2);
+    if (bubbles) {
+        for (int i = 0; i < np && !STOPPED(); i++)
+            if (may_listen(path[i], on))
+                fire_phase(d, wrap(d, path[i]), path[i], type, ev, 3);
+        if (in_doc && !STOPPED())
+            fire_phase(d, js_obj(d->document), NULL, type, ev, 3);
+        if (in_doc && !STOPPED())
+            fire_phase(d, js_obj(d->window), NULL, type, ev, 3);
     }
+#undef STOPPED
+    js_set(J, ev, "__dispatching", js_bool(0));
+    js_set(J, ev, "eventPhase", js_num(0));
+    js_set(J, ev, "currentTarget", js_null);
     d->depth--;
     int prevented = js_truthy(js_get(J, ev, "defaultPrevented"));
     settle(d);
     return prevented;
+}
+
+static int bubbles_by_default(const char *type)
+{
+    static const char *const no[] = { "focus", "blur", "load", "mouseenter", "mouseleave", "pointerenter",
+                                      "pointerleave", "scroll", "resize", "toggle", "error", "abort", NULL };
+    for (int i = 0; no[i]; i++)
+        if (!strcmp(type, no[i]))
+            return 0;
+    return 1;
 }
 
 int jsdom_dispatch(struct jsdom *d, struct node *target, const char *type)
@@ -2438,7 +3097,47 @@ int jsdom_dispatch(struct jsdom *d, struct node *target, const char *type)
     if (!d || !target)
         return 0;
     jsval ev = new_event(d, type, wrap(d, target));
-    int bubbles = strcmp(type, "focus") && strcmp(type, "blur") && strcmp(type, "load");
+    int bubbles = bubbles_by_default(type);
+    js_set(d->J, ev, "bubbles", js_bool(bubbles));
+    return dispatch_event(d, target, type, ev, bubbles);
+}
+
+int jsdom_mouse_event(struct jsdom *d, struct node *target, const char *type, int x, int y, int button,
+                      struct node *related)
+{
+    if (!d || !target)
+        return 0;
+    struct js *J = d->J;
+    int sx = 0, sy = 0;
+    if (d->h.scroll_pos)
+        d->h.scroll_pos(d->h.ctx, &sx, &sy);
+    jsval ev = new_event(d, type, wrap(d, target));
+    int bubbles = bubbles_by_default(type);
+    js_set(J, ev, "bubbles", js_bool(bubbles));
+    js_set(J, ev, "cancelable", js_bool(bubbles));
+    js_set(J, ev, "clientX", js_num(x - sx));
+    js_set(J, ev, "clientY", js_num(y - sy));
+    js_set(J, ev, "x", js_num(x - sx));
+    js_set(J, ev, "y", js_num(y - sy));
+    js_set(J, ev, "pageX", js_num(x));
+    js_set(J, ev, "pageY", js_num(y));
+    js_set(J, ev, "screenX", js_num(x - sx));
+    js_set(J, ev, "screenY", js_num(y - sy));
+    int bx = 0, by = 0, bw, bh;
+    if (d->h.node_box && d->h.node_box(d->h.ctx, target, &bx, &by, &bw, &bh)) {
+        js_set(J, ev, "offsetX", js_num(x - bx));
+        js_set(J, ev, "offsetY", js_num(y - by));
+    }
+    if (button < 0 && strncmp(type, "pointer", 7))
+        button = 0;                     /* mouse events say 0 when no button changed; pointer events -1 */
+    js_set(J, ev, "button", js_num(button));
+    js_set(J, ev, "which", js_num(button + 1));
+    int down = !strcmp(type, "mousedown") || !strcmp(type, "pointerdown") || !strcmp(type, "mousemove") ||
+               !strcmp(type, "pointermove");
+    js_set(J, ev, "buttons", js_num(down && button >= 0 ? 1 << button : 0));
+    js_set(J, ev, "detail", js_num(!strcmp(type, "click") ? 1 : 0));
+    if (related)
+        js_set(J, ev, "relatedTarget", wrap(d, related));
     return dispatch_event(d, target, type, ev, bubbles);
 }
 
@@ -2455,7 +3154,16 @@ int jsdom_key_event(struct jsdom *d, struct node *target, const char *type, int 
     js_set(J, ev, "which", js_num(keycode));
     js_set(J, ev, "charCode", js_num(key && key[0] && !key[1] ? (unsigned char)key[0] : 0));
     js_set(J, ev, "key", js_str(J, key ? key : ""));
-    js_set(J, ev, "code", js_str(J, key ? key : ""));
+    char code[24] = "";
+    if (key && key[0] && !key[1] && isalpha((unsigned char)key[0]))
+        snprintf(code, sizeof(code), "Key%c", toupper((unsigned char)key[0]));
+    else if (key && key[0] && !key[1] && isdigit((unsigned char)key[0]))
+        snprintf(code, sizeof(code), "Digit%c", key[0]);
+    else if (key && !strcmp(key, " "))
+        snprintf(code, sizeof(code), "Space");
+    else
+        snprintf(code, sizeof(code), "%s", key ? key : "");
+    js_set(J, ev, "code", js_str(J, code));
     return dispatch_event(d, t, type, ev, 1);
 }
 
@@ -2464,30 +3172,75 @@ static jsval el_dispatch_event(struct js *J, jsval self, jsval *args, int argc)
     struct jsdom *d = dom(J);
     jsval ev = ARG(0);
     if (ev.t != JS_OBJ)
-        return js_bool(0);
+        return js_throw_error(J, "TypeError: dispatchEvent needs an event");
     struct node *n = node_of(self);
     const char *type = js_tostr(J, js_get(J, ev, "type"))->s;
-    js_set(J, ev, "target", self);
+    jsval t = target_of(J, self);
+    js_set(J, ev, "target", t);
+    js_set(J, ev, "srcElement", t);
+    js_put(J, ev.u.o, S(J, "__stopped"), js_bool(0), 1);
+    js_put(J, ev.u.o, S(J, "__stopnow"), js_bool(0), 1);
     if (n) {
         d->depth++;
         int r = !dispatch_event(d, n, type, ev, js_truthy(js_get(J, ev, "bubbles")));
         d->depth--;
         return js_bool(r);
     }
-    fire_on(d, target_of(J, self), NULL, type, ev);
+    js_set(J, ev, "__dispatching", js_bool(1));
+    fire_on(d, t, NULL, type, ev);
+    if (t.t == JS_OBJ && t.u.o == d->document && js_truthy(js_get(J, ev, "bubbles")) &&
+        !js_truthy(js_get(J, ev, "__stopped")))
+        fire_phase(d, js_obj(d->window), NULL, type, ev, 3);
+    js_set(J, ev, "__dispatching", js_bool(0));
+    js_set(J, ev, "eventPhase", js_num(0));
     return js_bool(!js_truthy(js_get(J, ev, "defaultPrevented")));
 }
 
-static jsval event_ctor(struct js *J, jsval self, jsval *args, int argc)
+/* new Event(type, init) and the rest: init's members become the event's. */
+static jsval make_event(struct js *J, jsval *args, int argc, int kind)
+{
+    struct jsdom *d = dom(J);
+    if (!argc)
+        return js_throw_error(J, "TypeError: an event needs a type");
+    jsval ev = new_event_kind(d, js_tostr(J, ARG(0))->s, js_null, kind);
+    jsval opts = ARG(1);
+    js_set(J, ev, "bubbles", js_bool(0));
+    js_set(J, ev, "cancelable", js_bool(0));
+    js_set(J, ev, "composed", js_bool(0));
+    js_set(J, ev, "isTrusted", js_bool(0));
+    if (opts.t == JS_OBJ) {
+        struct jsstr **keys;
+        int n = js_keys(J, opts, 1, &keys);
+        for (int i = 0; i < n; i++) {
+            jsval key;
+            key.t = JS_STR;
+            key.u.s = keys[i];
+            jsval v = js_get_str(J, opts, keys[i]);
+            if (!strcmp(keys[i]->s, "bubbles") || !strcmp(keys[i]->s, "cancelable") ||
+                !strcmp(keys[i]->s, "composed"))
+                v = js_bool(js_truthy(v));
+            js_setv(J, ev, key, v);
+        }
+    }
+    return ev;
+}
+
+#define X(id, name, parent) \
+    static jsval ctor_##id(struct js *J, jsval self, jsval *args, int argc) \
+    { (void)self; return make_event(J, args, argc, id); }
+EVENT_KINDS(X)
+#undef X
+
+/* document.createEvent("MouseEvents"): initEvent gives it a type later. */
+static jsval doc_create_event(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
-    struct jsdom *d = dom(J);
-    jsval ev = new_event(d, js_tostr(J, ARG(0))->s, js_null);
-    jsval opts = ARG(1);
-    js_set(J, ev, "bubbles", js_bool(opts.t == JS_OBJ && js_truthy(js_get(J, opts, "bubbles"))));
+    const char *what = js_tostr(J, ARG(0))->s;
+    int kind = !strncasecmp(what, "Mouse", 5) ? EV_MOUSE : !strncasecmp(what, "Keyboard", 8) ? EV_KEYBOARD
+             : !strncasecmp(what, "Custom", 6) ? EV_CUSTOM : !strncasecmp(what, "UI", 2) ? EV_UI
+             : !strncasecmp(what, "Focus", 5) ? EV_FOCUS : EV_EVENT;
+    jsval ev = new_event_kind(dom(J), "", js_null, kind);
     js_set(J, ev, "isTrusted", js_bool(0));
-    if (opts.t == JS_OBJ)
-        js_set(J, ev, "detail", js_get(J, opts, "detail"));
     return ev;
 }
 
@@ -2530,7 +3283,15 @@ static int document_get(struct js *J, struct jsobj *o, const char *key, jsval *o
     if (IS("visibilityState")) { *out = js_str(J, "visible"); return 1; }
     if (IS("hidden")) { *out = js_bool(0); return 1; }
     if (IS("defaultView")) { *out = js_obj(d->window); return 1; }
-    if (IS("activeElement")) { *out = wrap(d, node_find(root, T_BODY)); return 1; }
+    if (IS("activeElement")) {
+        *out = wrap(d, d->active && contains(root, d->active) ? d->active : node_find(root, T_BODY));
+        return 1;
+    }
+    if (IS("scrollingElement")) { *out = wrap(d, root); return 1; }
+    if (IS("dir")) { const char *v = node_attr(root, "dir"); *out = js_str(J, v ? v : ""); return 1; }
+    if (IS("lastModified")) { *out = js_str(J, "01/01/2026 00:00:00"); return 1; }
+    if (IS("designMode")) { *out = js_str(J, "off"); return 1; }
+    if (IS("doctype")) { *out = js_null; return 1; }
     if (IS("currentScript")) { *out = wrap(d, d->current_script); return 1; }
     if (IS("forms")) { *out = collect(d, root, test_tag, "form", 0); return 1; }
     if (IS("images")) { *out = collect(d, root, test_tag, "img", 0); return 1; }
@@ -2606,13 +3367,19 @@ static int document_set(struct js *J, struct jsobj *o, const char *key, jsval v)
     return 0;
 }
 
-static const struct jsclass document_class = { "HTMLDocument", document_get, document_set };
+static const struct jsclass document_class = { "HTMLDocument", document_get, document_set, NULL };
 
 static jsval doc_get_by_id(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
     struct jsdom *d = dom(J);
     return wrap(d, by_id(d->h.root, js_tostr(J, ARG(0))->s));
+}
+
+static jsval frag_get_by_id(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct node *n = this_node(J, self);
+    return n ? wrap(dom(J), by_id(n, js_tostr(J, ARG(0))->s)) : js_null;
 }
 
 static jsval doc_get_by_name(struct js *J, jsval self, jsval *args, int argc)
@@ -2625,9 +3392,52 @@ static jsval doc_get_by_name(struct js *J, jsval self, jsval *args, int argc)
 static jsval doc_create_element(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
+    struct jsdom *d = dom(J);
     struct jsstr *name = js_tostr(J, ARG(0));
-    struct node *n = new_node(dom(J), N_ELEMENT, name->s);
-    return wrap(dom(J), n);
+    if (d->custom_on && strchr(name->s, '-')) {     /* a defined custom element is constructed */
+        jsval f = js_get(J, js_obj(d->window), "%ceCreate"), nv = js_strn(J, name->s, name->len);
+        jsval made = js_is_callable(f) ? js_call_value(J, f, js_undefined, &nv, 1) : js_undefined;
+        if (J->throwing || node_of(made))
+            return made;
+    }
+    struct node *n = new_node(d, N_ELEMENT, name->s);
+    return wrap(d, n);
+}
+
+/* new HTMLElement(), from a custom element's constructor (super()): the
+ * element being upgraded, or a new one named as the class was defined. */
+static jsval html_element_ctor(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self, (void)args, (void)argc;
+    struct jsdom *d = dom(J);
+    jsval up = js_get(J, js_obj(d->window), "%upgrading");
+    if (node_of(up)) {
+        js_set(J, js_obj(d->window), "%upgrading", js_null);
+        return up;
+    }
+    jsval cls = J->super_this && J->super_this->proto ? js_get(J, js_obj(J->super_this->proto), "constructor")
+                                                      : js_undefined;
+    jsval f = js_get(J, js_obj(d->window), "%ceName");
+    jsval name = js_is_callable(f) && cls.t == JS_OBJ ? js_call_value(J, f, js_undefined, &cls, 1) : js_undefined;
+    if (J->throwing)
+        return js_undefined;
+    if (name.t != JS_STR)
+        return js_throw_error(J, "TypeError: Illegal constructor");
+    struct node *n = new_node(d, N_ELEMENT, js_cstr(name));
+    return wrap(d, n);
+}
+
+static jsval win_css_supports(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    return js_bool(css_supports(js_tostr(J, ARG(0))->s));
+}
+
+static jsval win_watch_custom(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    dom(J)->custom_on = js_truthy(ARG(0));
+    return js_undefined;
 }
 
 static jsval doc_create_text(struct js *J, jsval self, jsval *args, int argc)
@@ -2800,7 +3610,7 @@ static int location_set(struct js *J, struct jsobj *o, const char *key, jsval v)
     return 1;
 }
 
-static const struct jsclass location_class = { "Location", location_get, location_set };
+static const struct jsclass location_class = { "Location", location_get, location_set, NULL };
 
 static jsval location_assign(struct js *J, jsval self, jsval *args, int argc)
 {
@@ -2974,10 +3784,15 @@ static jsval win_get_computed_style(struct js *J, jsval self, jsval *args, int a
 static jsval win_match_media(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
+    struct jsdom *d = dom(J);
     struct jsobj *m = js_new_object(J);
-    jsval mv = js_obj(m);
-    js_set(J, mv, "matches", js_bool(0));
-    js_set(J, mv, "media", js_to_string(J, ARG(0)));
+    jsval mv = js_obj(m), q = js_to_string(J, ARG(0));
+    int vw = 800, vh = 600;
+    if (d->h.viewport)
+        d->h.viewport(d->h.ctx, &vw, &vh);
+    js_set(J, mv, "matches", js_bool(css_media_query(js_cstr(q), vw, vh)));
+    js_set(J, mv, "media", q);
+    js_set(J, mv, "onchange", js_null);
     fn(J, m, "addListener", nothing, 1);
     fn(J, m, "removeListener", nothing, 1);
     fn(J, m, "addEventListener", nothing, 2);
@@ -3026,24 +3841,313 @@ static jsval history_go(struct js *J, jsval self, jsval *args, int argc)
     return js_undefined;
 }
 
+/* history.pushState(state, title, url) and replaceState */
+static jsval history_change(struct js *J, jsval *args, int argc, int replace)
+{
+    struct jsdom *d = dom(J);
+    jsval url = ARG(2);
+    char abs[URL_MAX];
+    if (url.t == JS_UNDEF || url.t == JS_NULL)
+        snprintf(abs, sizeof(abs), "%s", d->h.url);
+    else
+        url_resolve(d->h.url, js_tostr(J, url)->s, abs, sizeof(abs));
+    /* the same origin only: scheme, host and port */
+    const char *a = strstr(abs, "://"), *b = strstr(d->h.url, "://");
+    if (a && b) {
+        size_t la = strcspn(a + 3, "/?#") + (size_t)(a + 3 - abs), lb = strcspn(b + 3, "/?#") + (size_t)(b + 3 - d->h.url);
+        if (la != lb || strncasecmp(abs, d->h.url, la))
+            return js_throw_error(J, "SecurityError: a history state cannot change the origin");
+    }
+    int id = d->entry;
+    if (d->h.set_url)
+        id = d->h.set_url(d->h.ctx, abs, replace);
+    else if (!replace)
+        id = d->entry + 1;
+    if (!replace)
+        d->hist_len++;
+    d->entry = id;
+    char key[16];
+    snprintf(key, sizeof(key), "%d", id);
+    js_set(J, js_obj(d->states), key, ARG(0));
+    return js_undefined;
+}
+
+static jsval history_push(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    return history_change(J, args, argc, 0);
+}
+
+static jsval history_replace(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    return history_change(J, args, argc, 1);
+}
+
+static jsval history_state(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self, (void)args, (void)argc;
+    struct jsdom *d = dom(J);
+    char key[16];
+    snprintf(key, sizeof(key), "%d", d->entry);
+    jsval v = js_get(J, js_obj(d->states), key);
+    return v.t == JS_UNDEF ? js_null : v;
+}
+
+static jsval history_length(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self, (void)args, (void)argc;
+    return js_num(dom(J)->hist_len);
+}
+
+void jsdom_traverse(struct jsdom *d, int id, const char *old_url, const char *new_url)
+{
+    if (!d)
+        return;
+    struct js *J = d->J;
+    d->entry = id;
+    d->depth++;
+    jsval ev = new_event(d, "popstate", js_obj(d->window));
+    js_set(J, ev, "bubbles", js_bool(0));
+    js_set(J, ev, "cancelable", js_bool(0));
+    js_set(J, ev, "state", history_state(J, js_undefined, NULL, 0));
+    fire_on(d, js_obj(d->window), NULL, "popstate", ev);
+    const char *fo = url_fragment(old_url), *fn_ = url_fragment(new_url);
+    if ((fo || fn_) && (!fo || !fn_ || strcmp(fo, fn_))) {
+        jsval hc = new_event(d, "hashchange", js_obj(d->window));
+        js_set(J, hc, "bubbles", js_bool(0));
+        js_set(J, hc, "cancelable", js_bool(0));
+        js_set(J, hc, "oldURL", js_str(J, old_url));
+        js_set(J, hc, "newURL", js_str(J, new_url));
+        fire_on(d, js_obj(d->window), NULL, "hashchange", hc);
+    }
+    d->depth--;
+    settle(d);
+}
+
+/* ---- the view: scroll and resize events, and the observers ---- */
+
+static jsval win_watch_mutations(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    dom(J)->watch_mutations = js_truthy(ARG(0));
+    return js_undefined;
+}
+
+static jsval win_watch_view(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    dom(J)->watch_view = js_truthy(ARG(0));
+    return js_undefined;
+}
+
+void jsdom_queue_event(struct jsdom *d, struct node *n, const char *type)
+{
+    if (!d || !n || d->nqueued == (int)(sizeof(d->queued) / sizeof(d->queued[0])))
+        return;
+    d->queued[d->nqueued].n = n;
+    snprintf(d->queued[d->nqueued].type, sizeof(d->queued[0].type), "%s", type);
+    d->nqueued++;
+}
+
+static void run_queued(struct jsdom *d)
+{
+    int n = d->nqueued;
+    if (!n)
+        return;
+    struct node *nodes[128];
+    char types[128][8];
+    for (int i = 0; i < n; i++) {
+        nodes[i] = d->queued[i].n;
+        memcpy(types[i], d->queued[i].type, sizeof(types[i]));
+    }
+    d->nqueued = 0;
+    for (int i = 0; i < n; i++)
+        jsdom_dispatch(d, nodes[i], types[i]);
+}
+
+void jsdom_layout_changed(struct jsdom *d)
+{
+    if (d)
+        d->layout_gen++;
+}
+
+/* Has the view scrolled or changed size, or the page (when observers care) been laid out again? */
+static int view_changes(struct jsdom *d, int *sx, int *sy, int *vw, int *vh)
+{
+    *sx = *sy = 0;
+    *vw = d->last_vw;
+    *vh = d->last_vh;
+    if (d->h.scroll_pos)
+        d->h.scroll_pos(d->h.ctx, sx, sy);
+    if (d->h.viewport)
+        d->h.viewport(d->h.ctx, vw, vh);
+    return (*sx != d->last_sx || *sy != d->last_sy ? 1 : 0) | (*vw != d->last_vw || *vh != d->last_vh ? 2 : 0) |
+           (d->watch_view && d->layout_gen != d->seen_gen ? 4 : 0);
+}
+
+static void process_view(struct jsdom *d)
+{
+    int sx, sy, vw, vh;
+    int what = view_changes(d, &sx, &sy, &vw, &vh);
+    d->seen_gen = d->layout_gen;
+    if (!what)
+        return;
+    struct js *J = d->J;
+    d->last_sx = sx, d->last_sy = sy, d->last_vw = vw, d->last_vh = vh;
+    d->depth++;
+    if (what & 1) {
+        jsval ev = new_event(d, "scroll", js_obj(d->document));
+        js_set(J, ev, "bubbles", js_bool(0));
+        js_set(J, ev, "cancelable", js_bool(0));
+        fire_on(d, js_obj(d->document), NULL, "scroll", ev);
+        fire_phase(d, js_obj(d->window), NULL, "scroll", ev, 3);
+    }
+    if (what & 2) {
+        jsval ev = new_event(d, "resize", js_obj(d->window));
+        js_set(J, ev, "bubbles", js_bool(0));
+        js_set(J, ev, "cancelable", js_bool(0));
+        fire_on(d, js_obj(d->window), NULL, "resize", ev);
+    }
+    jsval hook = js_get(J, js_obj(d->window), "%viewChanged");
+    if (d->watch_view && js_is_callable(hook)) {
+        jsval r;
+        if (js_call(J, hook, js_undefined, NULL, 0, &r) < 0)
+            report(d, "observer");
+    }
+    d->depth--;
+    settle(d);
+}
+
+/* ---- localStorage and sessionStorage ----
+ * Kept in the desktop's memory, so they last while it runs: localStorage
+ * for each origin, sessionStorage for each origin in each window. */
+
+#define STORE_MAX (4u << 20)            /* bytes of keys and values, all origins together */
+
+struct kv {
+    struct kv *next;
+    char *scope, *key, *value;
+};
+
+static struct kv *store;
+static size_t store_bytes;
+static int local_marker, session_marker;    /* the storages' host data: which one */
+
+static void storage_scope(struct jsdom *d, int session, char *out, int size)
+{
+    const char *url = d->h.url, *p = strstr(url, "://");
+    int n = p ? (int)(strcspn(p + 3, "/?#") + (size_t)(p + 3 - url)) : (int)strcspn(url, "/?#");
+    if (session)
+        snprintf(out, (size_t)size, "s %p %.*s", d->h.ctx, n, url);
+    else
+        snprintf(out, (size_t)size, "l %.*s", n, url);
+}
+
+static int storage_session(jsval self)
+{
+    return self.t == JS_OBJ && self.u.o->cls == C_HOST && self.u.o->hdata == &session_marker;
+}
+
+static struct kv **kv_find(const char *scope, const char *key)
+{
+    struct kv **pp = &store;
+    for (; *pp; pp = &(*pp)->next)
+        if (!strcmp((*pp)->scope, scope) && !strcmp((*pp)->key, key))
+            return pp;
+    return pp;
+}
+
+static const char *storage_read(struct jsdom *d, int session, const char *key)
+{
+    char scope[URL_MAX + 40];
+    storage_scope(d, session, scope, sizeof(scope));
+    struct kv **pp = kv_find(scope, key);
+    return *pp ? (*pp)->value : NULL;
+}
+
+static int storage_write(struct js *J, int session, const char *key, const char *value)
+{
+    struct jsdom *d = dom(J);
+    char scope[URL_MAX + 40];
+    storage_scope(d, session, scope, sizeof(scope));
+    struct kv **pp = kv_find(scope, key);
+    size_t old = *pp ? strlen((*pp)->key) + strlen((*pp)->value) : 0;
+    if (store_bytes - old + strlen(key) + strlen(value) > STORE_MAX) {
+        js_throw_value(J, js_make_error(J, "QuotaExceededError", "The storage quota has been exceeded."));
+        return -1;
+    }
+    char *v = strdup(value);
+    if (!v)
+        return -1;
+    if (*pp) {
+        free((*pp)->value);
+        (*pp)->value = v;
+    } else {
+        struct kv *e = calloc(1, sizeof(*e));
+        if (!e || !(e->scope = strdup(scope)) || !(e->key = strdup(key))) {
+            if (e)
+                free(e->scope);
+            free(e);
+            free(v);
+            return -1;
+        }
+        e->value = v;
+        *pp = e;
+    }
+    store_bytes = store_bytes - old + strlen(key) + strlen(value);
+    return 0;
+}
+
+static void storage_remove_key(struct jsdom *d, int session, const char *key)
+{
+    char scope[URL_MAX + 40];
+    storage_scope(d, session, scope, sizeof(scope));
+    struct kv **pp = kv_find(scope, key);
+    if (*pp) {
+        struct kv *e = *pp;
+        *pp = e->next;
+        store_bytes -= strlen(e->key) + strlen(e->value);
+        free(e->scope);
+        free(e->key);
+        free(e->value);
+        free(e);
+    }
+}
+
+/* The scope's i-th key, or how many there are (i < 0). */
+static int storage_nth(struct jsdom *d, int session, int i, const char **key)
+{
+    char scope[URL_MAX + 40];
+    storage_scope(d, session, scope, sizeof(scope));
+    int n = 0;
+    for (struct kv *e = store; e; e = e->next)
+        if (!strcmp(e->scope, scope)) {
+            if (n == i) {
+                *key = e->key;
+                return n;
+            }
+            n++;
+        }
+    return i < 0 ? n : -1;
+}
+
 static jsval storage_get(struct js *J, jsval self, jsval *args, int argc)
 {
-    jsval data = js_get(J, self, "__data");
-    jsval v = js_get_str(J, data, js_tostr(J, ARG(0)));
-    return v.t == JS_UNDEF ? js_null : v;
+    const char *v = storage_read(dom(J), storage_session(self), js_tostr(J, ARG(0))->s);
+    return v ? js_str(J, v) : js_null;
 }
 
 static jsval storage_set(struct js *J, jsval self, jsval *args, int argc)
 {
-    jsval data = js_get(J, self, "__data");
-    js_setv(J, data, js_to_string(J, ARG(0)), js_to_string(J, ARG(1)));
+    struct jsstr *k = js_tostr(J, ARG(0)), *v = js_tostr(J, ARG(1));
+    storage_write(J, storage_session(self), k->s, v->s);
     return js_undefined;
 }
 
 static jsval storage_remove(struct js *J, jsval self, jsval *args, int argc)
 {
-    jsval data = js_get(J, self, "__data");
-    js_delete(J, data, js_tostr(J, ARG(0)));
+    storage_remove_key(dom(J), storage_session(self), js_tostr(J, ARG(0))->s);
     return js_undefined;
 }
 
@@ -3051,28 +4155,62 @@ static jsval storage_clear(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)args;
     (void)argc;
-    js_put(J, self.u.o, S(J, "__data"), js_obj(js_new_object(J)), 1);
+    struct jsdom *d = dom(J);
+    int session = storage_session(self);
+    const char *key;
+    while (storage_nth(d, session, 0, &key) == 0)
+        storage_remove_key(d, session, key);
     return js_undefined;
 }
 
 static jsval storage_key(struct js *J, jsval self, jsval *args, int argc)
 {
-    struct jsstr **keys;
-    int n = js_keys(J, js_get(J, self, "__data"), 0, &keys);
-    int i = (int)js_to_number(J, ARG(0));
-    return i >= 0 && i < n ? js_str(J, keys[i]->s) : js_null;
+    const char *key;
+    double i = js_to_number(J, ARG(0));
+    if (i != i || i < 0 || storage_nth(dom(J), storage_session(self), (int)i, &key) < 0)
+        return js_null;
+    return js_str(J, key);
 }
 
-static jsval make_storage(struct jsdom *d)
+/* localStorage.name reads and writes an item too, unless the name is a method's. */
+static int storage_prop_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
+{
+    int session = o->hdata == &session_marker;
+    if (!strcmp(key, "length")) {
+        const char *k;
+        *out = js_num(storage_nth(dom(J), session, -1, &k));
+        return 1;
+    }
+    if (o->proto && js_has(J, js_obj(o->proto), S(J, key)))
+        return 0;
+    const char *v = storage_read(dom(J), session, key);
+    if (!v)
+        return 0;
+    *out = js_str(J, v);
+    return 1;
+}
+
+static int storage_prop_set(struct js *J, struct jsobj *o, const char *key, jsval v)
+{
+    if (o->proto && js_has(J, js_obj(o->proto), S(J, key)))
+        return 0;
+    storage_write(J, o->hdata == &session_marker, key, js_tostr(J, v)->s);
+    return 1;
+}
+
+static const struct jsclass storage_class = { "Storage", storage_prop_get, storage_prop_set, NULL };
+
+static jsval make_storage(struct jsdom *d, int session)
 {
     struct js *J = d->J;
-    struct jsobj *s = js_new_object(J);
-    js_put(J, s, S(J, "__data"), js_obj(js_new_object(J)), 1);
-    fn(J, s, "getItem", storage_get, 1);
-    fn(J, s, "setItem", storage_set, 2);
-    fn(J, s, "removeItem", storage_remove, 1);
-    fn(J, s, "clear", storage_clear, 0);
-    fn(J, s, "key", storage_key, 1);
+    struct jsobj *proto = js_new_object(J);
+    fn(J, proto, "getItem", storage_get, 1);
+    fn(J, proto, "setItem", storage_set, 2);
+    fn(J, proto, "removeItem", storage_remove, 1);
+    fn(J, proto, "clear", storage_clear, 0);
+    fn(J, proto, "key", storage_key, 1);
+    struct jsobj *s = js_new_host(J, &storage_class, session ? &session_marker : &local_marker);
+    s->proto = proto;
     return js_obj(s);
 }
 
@@ -3385,7 +4523,69 @@ void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, i
     settle(d);
 }
 
+/* ---- the DOM library, loaded when first used ----
+ * Each name js_dom_lib defines starts as an accessor that runs it (which
+ * puts the real thing in its place) and then reads the name again. */
+
+#define DOM_LIB_NAMES(X) \
+    X(W, NodeFilter) X(W, TreeWalker) X(W, NodeIterator) X(W, Range) X(W, StaticRange) X(W, Selection) \
+    X(W, getSelection) X(W, CSSStyleSheet) X(W, StyleSheet) X(W, CSSRule) X(W, FontFace) \
+    X(D, createTreeWalker) X(D, createNodeIterator) X(D, getSelection) X(D, createRange) X(D, getAnimations) \
+    X(D, createAttribute) X(D, queryCommandSupported) X(D, exitFullscreen) X(D, hasStorageAccess) \
+    X(D, requestStorageAccess) X(D, fonts) X(D, adoptedStyleSheets) X(D, fullscreenElement) \
+    X(D, fullscreenEnabled) X(D, pictureInPictureEnabled) X(D, styleSheets) \
+    X(E, validity) X(E, willValidate) X(E, validationMessage) X(E, setCustomValidity) X(E, checkValidity) \
+    X(E, reportValidity) X(E, showPicker) X(E, setRangeText) X(E, animate) X(E, getAnimations) \
+    X(E, attachShadow) X(E, shadowRoot) X(E, assignedSlot) X(E, assignedNodes) X(E, assignedElements) \
+    X(E, sheet) X(E, requestFullscreen) X(E, scroll) X(E, scrollTo) X(E, scrollBy) X(E, getClientRects) \
+    X(E, checkVisibility) X(E, setPointerCapture) X(E, releasePointerCapture) X(E, hasPointerCapture) \
+    X(E, showPopover) X(E, hidePopover) X(E, togglePopover) X(E, inert) X(E, draggable) X(E, slot) \
+    X(E, part) X(T, splitText) X(T, appendData) X(T, substringData)
+
+static void dom_lib_load(struct jsdom *d)
+{
+    if (d->dom_lib)
+        return;
+    d->dom_lib = 1;
+    if (js_eval(d->J, js_dom_lib, (int)sizeof(js_dom_lib) - 1, "DOM library") < 0)
+        fprintf(stderr, "DOM library: %s\n", js_error(d->J));
+}
+
+static jsval dom_lib_get(struct js *J, jsval self, const char *name)
+{
+    struct jsdom *d = dom(J);
+    if (d->dom_lib)
+        return js_undefined;            /* the library did not define it after all */
+    dom_lib_load(d);
+    return js_get(J, self.t == JS_OBJ ? self : js_obj(d->window), name);
+}
+
+static jsval dom_lib_set(struct js *J, jsval self, const char *name, jsval v)
+{
+    struct jsdom *d = dom(J);
+    dom_lib_load(d);
+    if (self.t != JS_OBJ)
+        return js_undefined;
+    struct prop *p = js_own(self.u.o, S(J, name));
+    if (p)
+        p->getter = p->setter = NULL;   /* the page's own value from now on */
+    js_put(J, self.u.o, S(J, name), v, 0);
+    return js_undefined;
+}
+
+#define X(where, name) \
+    static jsval lazy_get_##where##_##name(struct js *J, jsval self, jsval *args, int argc) \
+    { (void)args, (void)argc; return dom_lib_get(J, self, #name); } \
+    static jsval lazy_set_##where##_##name(struct js *J, jsval self, jsval *args, int argc) \
+    { return dom_lib_set(J, self, #name, ARG(0)); }
+DOM_LIB_NAMES(X)
+#undef X
+
 /* ---- setting up ---- */
+
+static void dom_fetch_module(void *ctx, int id, const char *url);
+static int dom_resolve(void *ctx, const char *spec, const char *base, char *out, int size);
+static void dom_module_done(void *ctx, void *tag, int failed);
 
 struct jsdom *jsdom_new(const struct jshost *host)
 {
@@ -3402,36 +4602,76 @@ struct jsdom *jsdom_new(const struct jshost *host)
     js_gc_root(J, d, sizeof(*d));       /* the window, prototypes, timers and requests */
     struct js_gc_hooks hooks = { d, gc_mark, gc_more, gc_sweep };
     js_gc_hooks(J, &hooks);
+    struct js_modhost mh = { d, dom_fetch_module, dom_resolve, dom_module_done };
+    js_module_host(J, &mh);
     struct jsobj *w = d->window = js_global(J);
     jsval wv = js_obj(w);
 
-    /* elements */
-    struct jsobj *ep = d->element_proto = js_new_object(J);
-    static const struct { const char *name; js_native fn; int n; } element_methods[] = {
+    /* nodes: Node, and Text, DocumentFragment and the elements under it */
+    struct jsobj *np = d->node_proto = js_new_object(J);
+    static const struct { const char *name; js_native fn; int n; } node_methods[] = {
         { "appendChild", el_append_child, 1 }, { "insertBefore", el_insert_before, 2 },
         { "removeChild", el_remove_child, 1 }, { "replaceChild", el_replace_child, 2 },
-        { "remove", el_remove, 0 }, { "append", el_append, 1 }, { "prepend", el_prepend, 1 },
-        { "replaceChildren", el_replace_children, 0 },
-        { "before", el_before, 1 }, { "after", el_after, 1 }, { "replaceWith", el_replace_with, 1 },
-        { "cloneNode", el_clone_node, 1 }, { "contains", el_contains, 1 },
-        { "hasChildNodes", el_has_child_nodes, 0 }, { "getAttribute", el_get_attribute, 1 },
+        { "remove", el_remove, 0 }, { "before", el_before, 1 }, { "after", el_after, 1 },
+        { "replaceWith", el_replace_with, 1 }, { "cloneNode", el_clone_node, 1 },
+        { "contains", el_contains, 1 }, { "hasChildNodes", el_has_child_nodes, 0 },
+        { "compareDocumentPosition", el_compare_position, 1 }, { "getRootNode", el_get_root_node, 0 },
+        { "isEqualNode", el_is_equal_node, 1 }, { "isSameNode", el_is_same_node, 1 },
+        { "normalize", el_normalize, 0 }, { "addEventListener", add_event_listener, 2 },
+        { "removeEventListener", remove_event_listener, 2 }, { "dispatchEvent", el_dispatch_event, 1 },
+        { "toString", node_to_string, 0 },
+    };
+    for (unsigned i = 0; i < sizeof(node_methods) / sizeof(node_methods[0]); i++)
+        fn(J, np, node_methods[i].name, node_methods[i].fn, node_methods[i].n);
+    static const char *const node_types[] = {
+        "ELEMENT_NODE", "ATTRIBUTE_NODE", "TEXT_NODE", "CDATA_SECTION_NODE", "ENTITY_REFERENCE_NODE",
+        "ENTITY_NODE", "PROCESSING_INSTRUCTION_NODE", "COMMENT_NODE", "DOCUMENT_NODE",
+        "DOCUMENT_TYPE_NODE", "DOCUMENT_FRAGMENT_NODE", "NOTATION_NODE",
+    };
+    static const char *const positions[] = {
+        "DOCUMENT_POSITION_DISCONNECTED", "DOCUMENT_POSITION_PRECEDING", "DOCUMENT_POSITION_FOLLOWING",
+        "DOCUMENT_POSITION_CONTAINS", "DOCUMENT_POSITION_CONTAINED_BY",
+        "DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC",
+    };
+    for (int i = 0; i < 12; i++)
+        js_put(J, np, S(J, node_types[i]), js_num(i + 1), 1);
+    for (int i = 0; i < 6; i++)
+        js_put(J, np, S(J, positions[i]), js_num(1 << i), 1);
+    struct jsobj *ep = d->element_proto = js_new_object(J);
+    ep->proto = np;
+    static const struct { const char *name; js_native fn; int n; } element_methods[] = {
+        { "append", el_append, 1 }, { "prepend", el_prepend, 1 },
+        { "replaceChildren", el_replace_children, 0 }, { "getAttribute", el_get_attribute, 1 },
         { "setAttribute", el_set_attribute, 2 }, { "removeAttribute", el_remove_attribute, 1 },
         { "hasAttribute", el_has_attribute, 1 }, { "toggleAttribute", el_toggle_attribute, 1 },
+        { "getAttributeNames", el_get_attribute_names, 0 }, { "hasAttributes", el_has_attributes, 0 },
         { "querySelector", el_query_selector, 1 }, { "querySelectorAll", el_query_selector_all, 1 },
         { "getElementsByTagName", el_get_by_tag, 1 }, { "getElementsByClassName", el_get_by_class, 1 },
-        { "matches", el_matches, 1 }, { "closest", el_closest, 1 },
+        { "matches", el_matches, 1 }, { "webkitMatchesSelector", el_matches, 1 }, { "closest", el_closest, 1 },
         { "getBoundingClientRect", el_get_bounding_rect, 0 },
         { "insertAdjacentText", el_insert_adjacent_text, 2 },
         { "insertAdjacentElement", el_insert_adjacent_element, 2 },
-        { "insertAdjacentHTML", el_insert_adjacent_html, 2 }, { "addEventListener", add_event_listener, 2 },
-        { "removeEventListener", remove_event_listener, 2 }, { "dispatchEvent", el_dispatch_event, 1 },
-        { "click", el_click, 0 }, { "focus", el_focus, 0 }, { "blur", nothing, 0 },
+        { "insertAdjacentHTML", el_insert_adjacent_html, 2 },
+        { "click", el_click, 0 }, { "focus", el_focus, 0 }, { "blur", el_blur, 0 },
         { "select", nothing, 0 }, { "scrollIntoView", el_scroll_into_view, 0 },
-        { "toString", node_to_string, 0 }, { "setSelectionRange", nothing, 2 },
-        { "submit", nothing, 0 }, { "reset", nothing, 0 },
+        { "setSelectionRange", nothing, 2 }, { "submit", form_submit, 0 },
+        { "requestSubmit", form_request_submit, 0 }, { "reset", form_reset, 0 },
     };
     for (unsigned i = 0; i < sizeof(element_methods) / sizeof(element_methods[0]); i++)
         fn(J, ep, element_methods[i].name, element_methods[i].fn, element_methods[i].n);
+    struct jsobj *cdp = js_new_object(J);
+    cdp->proto = np;
+    d->text_proto = js_new_object(J);
+    d->text_proto->proto = cdp;
+    struct jsobj *fp = d->frag_proto = js_new_object(J);
+    fp->proto = np;
+    fn(J, fp, "append", el_append, 1);
+    fn(J, fp, "prepend", el_prepend, 1);
+    fn(J, fp, "replaceChildren", el_replace_children, 0);
+    fn(J, fp, "querySelector", el_query_selector, 1);
+    fn(J, fp, "querySelectorAll", el_query_selector_all, 1);
+    fn(J, fp, "getElementById", frag_get_by_id, 1);
+    fn(J, cdp, "remove", el_remove, 0);
 
     /* style, classList */
     struct jsobj *stp = js_new_object(J);
@@ -3449,17 +4689,79 @@ struct jsdom *jsdom_new(const struct jshost *host)
     d->style_proto = stp;
     d->classlist_proto = clp;
 
-    /* events */
-    struct jsobj *evp = d->event_proto = js_new_object(J);
+    /* events: Event, and the kinds that inherit from it */
+    static const struct { const char *name; int parent; js_native ctor; } kinds[] = {
+#define X(id, name, parent) { name, parent, ctor_##id },
+        EVENT_KINDS(X)
+#undef X
+    };
+    for (int k = 0; k < EV_COUNT; k++) {
+        struct jsobj *proto = js_new_object(J);
+        if (kinds[k].parent >= 0)
+            proto->proto = d->ev_protos[kinds[k].parent];
+        d->ev_protos[k] = proto;
+        jsval c = js_new_function(J, kinds[k].ctor, kinds[k].name, 2);
+        c.u.o->ctor = 1;
+        js_set(J, c, "prototype", js_obj(proto));
+        js_put(J, proto, S(J, "constructor"), c, 1);
+        js_set(J, wv, kinds[k].name, c);
+        if (k == EV_EVENT) {
+            static const char *const phases[] = { "NONE", "CAPTURING_PHASE", "AT_TARGET", "BUBBLING_PHASE" };
+            for (int i = 0; i < 4; i++) {
+                js_set(J, c, phases[i], js_num(i));
+                js_put(J, proto, S(J, phases[i]), js_num(i), 1);
+            }
+        }
+    }
+    struct jsobj *evp = d->event_proto = d->ev_protos[EV_EVENT];
     fn(J, evp, "preventDefault", event_prevent_default, 0);
     fn(J, evp, "stopPropagation", event_stop_propagation, 0);
     fn(J, evp, "stopImmediatePropagation", event_stop_immediate, 0);
     fn(J, evp, "initEvent", event_init, 3);
-    jsval ev_ctor = js_new_function(J, event_ctor, "Event", 2);
-    ev_ctor.u.o->ctor = 1;
-    js_set(J, ev_ctor, "prototype", js_obj(evp));
-    js_set(J, wv, "Event", ev_ctor);
-    js_set(J, wv, "CustomEvent", ev_ctor);
+    fn(J, evp, "composedPath", event_composed_path, 0);
+    fn(J, d->ev_protos[EV_CUSTOM], "initCustomEvent", event_init, 4);
+    js_put(J, evp, S(J, "composed"), js_bool(0), 1);
+    js_put(J, evp, S(J, "returnValue"), js_bool(1), 1);
+    js_put(J, evp, S(J, "cancelBubble"), js_bool(0), 1);
+    js_put(J, d->ev_protos[EV_UI], S(J, "detail"), js_num(0), 1);
+    js_put(J, d->ev_protos[EV_UI], S(J, "view"), wv, 1);
+    js_put(J, d->ev_protos[EV_CUSTOM], S(J, "detail"), js_null, 1);
+    static const char *const zero_mouse[] = { "clientX", "clientY", "screenX", "screenY", "pageX", "pageY",
+                                             "offsetX", "offsetY", "movementX", "movementY", "x", "y",
+                                             "button", "buttons", NULL };
+    static const char *const modifiers[] = { "ctrlKey", "shiftKey", "altKey", "metaKey", NULL };
+    for (int i = 0; zero_mouse[i]; i++)
+        js_put(J, d->ev_protos[EV_MOUSE], S(J, zero_mouse[i]), js_num(0), 1);
+    for (int i = 0; modifiers[i]; i++) {
+        js_put(J, d->ev_protos[EV_MOUSE], S(J, modifiers[i]), js_bool(0), 1);
+        js_put(J, d->ev_protos[EV_KEYBOARD], S(J, modifiers[i]), js_bool(0), 1);
+        js_put(J, d->ev_protos[EV_TOUCH], S(J, modifiers[i]), js_bool(0), 1);
+    }
+    fn(J, d->ev_protos[EV_MOUSE], "getModifierState", js_false, 1);
+    fn(J, d->ev_protos[EV_KEYBOARD], "getModifierState", js_false, 1);
+    js_put(J, d->ev_protos[EV_MOUSE], S(J, "relatedTarget"), js_null, 1);
+    js_put(J, d->ev_protos[EV_FOCUS], S(J, "relatedTarget"), js_null, 1);
+    js_put(J, d->ev_protos[EV_POINTER], S(J, "pointerId"), js_num(1), 1);
+    js_put(J, d->ev_protos[EV_POINTER], S(J, "pointerType"), js_str(J, "mouse"), 1);
+    js_put(J, d->ev_protos[EV_POINTER], S(J, "isPrimary"), js_bool(1), 1);
+    js_put(J, d->ev_protos[EV_POINTER], S(J, "width"), js_num(1), 1);
+    js_put(J, d->ev_protos[EV_POINTER], S(J, "height"), js_num(1), 1);
+    js_put(J, d->ev_protos[EV_POINTER], S(J, "pressure"), js_num(0), 1);
+    static const char *const key_strings[] = { "key", "code", NULL };
+    for (int i = 0; key_strings[i]; i++)
+        js_put(J, d->ev_protos[EV_KEYBOARD], S(J, key_strings[i]), js_str(J, ""), 1);
+    js_put(J, d->ev_protos[EV_KEYBOARD], S(J, "keyCode"), js_num(0), 1);
+    js_put(J, d->ev_protos[EV_KEYBOARD], S(J, "charCode"), js_num(0), 1);
+    js_put(J, d->ev_protos[EV_KEYBOARD], S(J, "location"), js_num(0), 1);
+    js_put(J, d->ev_protos[EV_KEYBOARD], S(J, "repeat"), js_bool(0), 1);
+    js_put(J, d->ev_protos[EV_KEYBOARD], S(J, "isComposing"), js_bool(0), 1);
+    js_put(J, d->ev_protos[EV_INPUT], S(J, "data"), js_null, 1);
+    js_put(J, d->ev_protos[EV_INPUT], S(J, "inputType"), js_str(J, "insertText"), 1);
+    js_put(J, d->ev_protos[EV_INPUT], S(J, "isComposing"), js_bool(0), 1);
+    js_put(J, d->ev_protos[EV_SUBMIT], S(J, "submitter"), js_null, 1);
+    js_put(J, d->ev_protos[EV_POPSTATE], S(J, "state"), js_null, 1);
+    js_put(J, d->ev_protos[EV_MESSAGE], S(J, "data"), js_null, 1);
+    js_put(J, d->ev_protos[EV_MESSAGE], S(J, "origin"), js_str(J, ""), 1);
 
     /* document */
     struct jsobj *dp = d->document_proto = js_new_object(J);
@@ -3473,7 +4775,9 @@ struct jsdom *jsdom_new(const struct jshost *host)
         { "writeln", doc_writeln, 1 }, { "open", nothing, 0 }, { "close", nothing, 0 },
         { "addEventListener", add_event_listener, 2 }, { "removeEventListener", remove_event_listener, 2 },
         { "dispatchEvent", el_dispatch_event, 1 }, { "hasFocus", js_true, 0 },
-        { "execCommand", js_false, 1 }, { "createEvent", event_ctor, 1 },
+        { "execCommand", js_false, 1 }, { "createEvent", doc_create_event, 1 },
+        { "importNode", doc_import_node, 2 }, { "adoptNode", doc_adopt_node, 1 },
+        { "elementFromPoint", doc_element_from_point, 2 },
     };
     for (unsigned i = 0; i < sizeof(document_methods) / sizeof(document_methods[0]); i++)
         fn(J, dp, document_methods[i].name, document_methods[i].fn, document_methods[i].n);
@@ -3514,18 +4818,27 @@ struct jsdom *jsdom_new(const struct jshost *host)
     js_set(J, js_obj(scr), "availWidth", js_num(1024));
     js_set(J, js_obj(scr), "availHeight", js_num(740));
     js_set(J, js_obj(scr), "colorDepth", js_num(24));
+    js_set(J, js_obj(scr), "pixelDepth", js_num(24));
+    d->last_vw = vw;
+    d->last_vh = vh;
     js_set(J, wv, "screen", js_obj(scr));
 
-    struct jsobj *hist = js_new_object(J);
+    struct jsobj *hist = d->history = js_new_object(J);
+    d->states = js_new_object(J);
+    d->hist_len = 1;
     fn(J, hist, "back", history_back, 0);
     fn(J, hist, "forward", history_forward, 0);
     fn(J, hist, "go", history_go, 1);
-    fn(J, hist, "pushState", nothing, 3);
-    fn(J, hist, "replaceState", nothing, 3);
-    js_set(J, js_obj(hist), "length", js_num(1));
+    fn(J, hist, "pushState", history_push, 3);
+    fn(J, hist, "replaceState", history_replace, 3);
+    accessor(J, hist, "state", history_state, NULL);
+    accessor(J, hist, "length", history_length, NULL);
+    js_set(J, js_obj(hist), "scrollRestoration", js_str(J, "auto"));
     js_set(J, wv, "history", js_obj(hist));
-    js_set(J, wv, "localStorage", make_storage(d));
-    js_set(J, wv, "sessionStorage", make_storage(d));
+    js_put(J, w, S(J, "%watchMutations"), js_new_function(J, win_watch_mutations, "watchMutations", 1), 1);
+    js_put(J, w, S(J, "%watchView"), js_new_function(J, win_watch_view, "watchView", 1), 1);
+    js_set(J, wv, "localStorage", make_storage(d, 0));
+    js_set(J, wv, "sessionStorage", make_storage(d, 1));
 
     /* performance: navigation timing, all at the moment the scripts started */
     d->started = uptime_ms();
@@ -3618,13 +4931,93 @@ struct jsdom *jsdom_new(const struct jshost *host)
     img.u.o->ctor = 1;
     js_set(J, wv, "Image", img);
     /* the constructors scripts test with instanceof or typeof */
-    jsval node_ctor = js_new_function(J, nothing, "HTMLElement", 0);
-    js_set(J, node_ctor, "prototype", js_obj(ep));
-    js_set(J, wv, "HTMLElement", node_ctor);
-    js_set(J, wv, "Element", node_ctor);
+    jsval node_ctor = js_new_function(J, nothing, "Node", 0);
+    js_set(J, node_ctor, "prototype", js_obj(np));
+    js_put(J, np, S(J, "constructor"), node_ctor, 1);
     js_set(J, wv, "Node", node_ctor);
-    js_set(J, node_ctor, "ELEMENT_NODE", js_num(1));
-    js_set(J, node_ctor, "TEXT_NODE", js_num(3));
+    for (int i = 0; i < 12; i++)
+        js_set(J, node_ctor, node_types[i], js_num(i + 1));
+    for (int i = 0; i < 6; i++)
+        js_set(J, node_ctor, positions[i], js_num(1 << i));
+    jsval el_ctor = js_new_function(J, html_element_ctor, "HTMLElement", 0);
+    el_ctor.u.o->ctor = 1;
+    js_put(J, w, S(J, "%watchCustom"), js_new_function(J, win_watch_custom, "watchCustom", 1), 1);
+    js_put(J, w, S(J, "%cssSupports"), js_new_function(J, win_css_supports, "cssSupports", 1), 1);
+    js_set(J, el_ctor, "prototype", js_obj(ep));
+    js_put(J, ep, S(J, "constructor"), el_ctor, 1);
+    js_set(J, wv, "HTMLElement", el_ctor);
+    js_set(J, wv, "Element", el_ctor);
+    static const char *const plain[] = { "CharacterData", "Text", "DocumentFragment", "Document", "HTMLDocument" };
+    struct jsobj *plain_protos[] = { cdp, d->text_proto, fp, dp, dp };
+    for (int i = 0; i < 5; i++) {
+        jsval c = js_new_function(J, nothing, plain[i], 0);
+        js_set(J, c, "prototype", js_obj(plain_protos[i]));
+        js_put(J, plain_protos[i], S(J, "constructor"), c, 1);
+        js_set(J, wv, plain[i], c);
+    }
+    dp->proto = np;
+    /* HTMLInputElement and the rest: the tags each interface is for */
+    static const struct { const char *name; const char *tags; } ifaces[] = {
+        { "HTMLAnchorElement", "a" }, { "HTMLAreaElement", "area" }, { "HTMLAudioElement", "audio" },
+        { "HTMLBaseElement", "base" }, { "HTMLBodyElement", "body" }, { "HTMLBRElement", "br" },
+        { "HTMLButtonElement", "button" }, { "HTMLCanvasElement", "canvas" },
+        { "HTMLTableCaptionElement", "caption" }, { "HTMLTableColElement", "col colgroup" },
+        { "HTMLModElement", "del ins" }, { "HTMLDetailsElement", "details" }, { "HTMLDialogElement", "dialog" },
+        { "HTMLDivElement", "div" }, { "HTMLDListElement", "dl" }, { "HTMLEmbedElement", "embed" },
+        { "HTMLFieldSetElement", "fieldset" }, { "HTMLFormElement", "form" },
+        { "HTMLHeadingElement", "h1 h2 h3 h4 h5 h6" }, { "HTMLHeadElement", "head" }, { "HTMLHRElement", "hr" },
+        { "HTMLHtmlElement", "html" }, { "HTMLIFrameElement", "iframe" }, { "HTMLImageElement", "img" },
+        { "HTMLInputElement", "input" }, { "HTMLLabelElement", "label" }, { "HTMLLegendElement", "legend" },
+        { "HTMLLIElement", "li" }, { "HTMLLinkElement", "link" }, { "HTMLMapElement", "map" },
+        { "HTMLMenuElement", "menu" }, { "HTMLMetaElement", "meta" }, { "HTMLObjectElement", "object" },
+        { "HTMLOListElement", "ol" }, { "HTMLOptGroupElement", "optgroup" }, { "HTMLOptionElement", "option" },
+        { "HTMLParagraphElement", "p" }, { "HTMLParamElement", "param" }, { "HTMLPictureElement", "picture" },
+        { "HTMLPreElement", "pre listing xmp" }, { "HTMLQuoteElement", "q blockquote" },
+        { "HTMLScriptElement", "script" }, { "HTMLSelectElement", "select" }, { "HTMLSourceElement", "source" },
+        { "HTMLSpanElement", "span" }, { "HTMLStyleElement", "style" }, { "HTMLTableElement", "table" },
+        { "HTMLTableSectionElement", "tbody thead tfoot" }, { "HTMLTableCellElement", "td th" },
+        { "HTMLTemplateElement", "template" }, { "HTMLTextAreaElement", "textarea" },
+        { "HTMLTimeElement", "time" }, { "HTMLTitleElement", "title" }, { "HTMLTableRowElement", "tr" },
+        { "HTMLTrackElement", "track" }, { "HTMLUListElement", "ul" }, { "HTMLVideoElement", "video" },
+        { "SVGElement", "svg" },
+    };
+    for (unsigned i = 0; i < sizeof(ifaces) / sizeof(ifaces[0]); i++) {
+        struct jsobj *proto = js_new_object(J);
+        proto->proto = ep;
+        jsval c = js_new_function(J, nothing, ifaces[i].name, 0);
+        js_set(J, c, "prototype", js_obj(proto));
+        js_put(J, proto, S(J, "constructor"), c, 1);
+        js_set(J, wv, ifaces[i].name, c);
+        for (const char *t = ifaces[i].tags; *t;) {
+            int len = (int)strcspn(t, " ");
+            int tag = tag_lookup(t, len);
+            if (tag > 0)
+                d->tag_protos[tag] = proto;
+            t += len;
+            while (*t == ' ')
+                t++;
+        }
+        if (!strcmp(ifaces[i].name, "HTMLDialogElement")) {
+            fn(J, proto, "show", dialog_show, 0);
+            fn(J, proto, "showModal", dialog_show, 0);
+            fn(J, proto, "close", dialog_close, 1);
+            js_put(J, proto, S(J, "returnValue"), js_str(J, ""), 0);
+        }
+    }
+    jsval media_ctor = js_get(J, wv, "HTMLAudioElement");   /* HTMLMediaElement: audio and video */
+    if (media_ctor.t == JS_OBJ)
+        js_set(J, wv, "HTMLMediaElement", media_ctor);
+    struct jsobj *lazy_on[] = { w, dp, ep, d->text_proto };     /* W, D, E, T */
+    enum { W, D, E, T };
+    static const struct { int where; const char *name; js_native get, set; } lazy[] = {
+#define X(where, name) { where, #name, lazy_get_##where##_##name, lazy_set_##where##_##name },
+        DOM_LIB_NAMES(X)
+#undef X
+    };
+    for (unsigned i = 0; i < sizeof(lazy) / sizeof(lazy[0]); i++)
+        accessor(J, lazy_on[lazy[i].where], lazy[i].name, lazy[i].get, lazy[i].set);
+    if (js_eval(J, js_dom_eager, (int)sizeof(js_dom_eager) - 1, "DOM library") < 0)
+        fprintf(stderr, "DOM library: %s\n", js_error(J));
     return d;
 }
 
@@ -3634,7 +5027,197 @@ void jsdom_free(struct jsdom *d)
         return;
     js_free(d->J);
     free(d->wraps);
+    for (int i = 0; i < d->nim; i++) {
+        free(d->im_from[i]);
+        free(d->im_to[i]);
+    }
+    free(d->im_from);
+    free(d->im_to);
     free(d);
+}
+
+/* ---- modules ---- */
+
+static int url_like(const char *s)
+{
+    if (s[0] == '/' || !strncmp(s, "./", 2) || !strncmp(s, "../", 3))
+        return 1;
+    const char *p = s;
+    while (isalnum((unsigned char)*p) || *p == '+' || *p == '-' || *p == '.')
+        p++;
+    return p > s && *p == ':';
+}
+
+static void dom_fetch_module(void *ctx, int id, const char *url)
+{
+    struct jsdom *d = ctx;
+    if (d->h.fetch_module)
+        d->h.fetch_module(d->h.ctx, id, url);
+    else
+        js_module_source(d->J, id, NULL, 0);
+}
+
+/* A specifier as imported at base (a module's URL, or a script's src or name):
+ * through the import map, then against base. */
+static int dom_resolve(void *ctx, const char *spec, const char *base, char *out, int size)
+{
+    struct jsdom *d = ctx;
+    char from[URL_MAX], key[URL_MAX];
+    url_resolve(d->h.base, base, from, sizeof(from));
+    if (url_like(spec))
+        url_resolve(from, spec, key, sizeof(key));
+    else
+        snprintf(key, sizeof(key), "%s", spec);
+    int best = -1;
+    size_t best_len = 0;
+    for (int i = 0; i < d->nim; i++) {
+        size_t l = strlen(d->im_from[i]);
+        if (!strcmp(key, d->im_from[i])) {
+            best = i;
+            best_len = l;
+            break;
+        }
+        if (l > best_len && d->im_from[i][l - 1] == '/' && !strncmp(key, d->im_from[i], l))
+            best = i, best_len = l;
+    }
+    if (best >= 0) {
+        snprintf(out, (size_t)size, "%s%s", d->im_to[best], key + best_len);
+        return 0;
+    }
+    if (!url_like(spec))
+        return -1;                      /* a bare name the map does not know */
+    snprintf(out, (size_t)size, "%s", key);
+    return 0;
+}
+
+static void dom_module_done(void *ctx, void *tag, int failed)
+{
+    struct jsdom *d = ctx;
+    if (failed)
+        report(d, "module script");
+    settle(d);
+    if (d->h.module_done)
+        d->h.module_done(d->h.ctx, (int)(intptr_t)tag);
+}
+
+void jsdom_run_module(struct jsdom *d, const char *url, int inline_src, const char *text, int len, int tag)
+{
+    if (!d)
+        return;
+    d->depth++;
+    js_run_module(d->J, url, inline_src, text, len, (void *)(intptr_t)tag);
+    d->depth--;
+    settle(d);
+}
+
+void jsdom_module_fetched(struct jsdom *d, int id, const char *text, int len)
+{
+    if (!d)
+        return;
+    d->depth++;
+    js_module_source(d->J, id, text, len);
+    d->depth--;
+    settle(d);
+}
+
+/* A JSON string at *p (after its opening quote), unescaped into a new string. */
+static char *json_string(const char **p, const char *end)
+{
+    char *out = malloc((size_t)(end - *p) + 1);
+    int n = 0;
+    const char *s = *p;
+    if (!out)
+        return NULL;
+    while (s < end && *s != '"') {
+        if (*s == '\\' && s + 1 < end) {
+            s++;
+            char c = *s++;
+            if (c == 'u' && end - s >= 4) {
+                char hex[5] = { s[0], s[1], s[2], s[3], 0 };
+                n += utf8_put(out + n, (int)strtol(hex, NULL, 16));
+                s += 4;
+            } else {
+                out[n++] = c == 'n' ? '\n' : c == 't' ? '\t' : c == 'r' ? '\r' : c == 'b' ? '\b' :
+                           c == 'f' ? '\f' : c;
+            }
+        } else {
+            out[n++] = *s++;
+        }
+    }
+    out[n] = 0;
+    *p = s < end ? s + 1 : s;
+    return out;
+}
+
+void jsdom_import_map(struct jsdom *d, const char *json, int len)
+{
+    if (!d)
+        return;
+    const char *end = json + len, *p = json;
+    /* find "imports": { ... } at the top level (scopes are not looked at) */
+    int depth = 0;
+    for (; p < end; p++) {
+        if (*p == '{')
+            depth++;
+        else if (*p == '}')
+            depth--;
+        else if (*p == '"') {
+            const char *q = p + 1;
+            char *key = json_string(&q, end);
+            int is_imports = key && depth == 1 && !strcmp(key, "imports");
+            free(key);
+            p = q - 1;
+            if (!is_imports)
+                continue;
+            while (p < end && *p != '{')
+                p++;
+            break;
+        }
+    }
+    if (p >= end)
+        return;
+    p++;
+    while (p < end && *p != '}') {
+        if (*p != '"') {
+            p++;
+            continue;
+        }
+        p++;
+        char *from = json_string(&p, end);
+        while (p < end && *p != '"' && *p != '}')
+            p++;
+        if (p >= end || *p != '"') {
+            free(from);
+            break;
+        }
+        p++;
+        char *to = json_string(&p, end);
+        char **nf = realloc(d->im_from, sizeof(char *) * (size_t)(d->nim + 1));
+        if (nf)
+            d->im_from = nf;
+        char **nt = realloc(d->im_to, sizeof(char *) * (size_t)(d->nim + 1));
+        if (nt)
+            d->im_to = nt;
+        if (from && to && nf && nt) {
+            char abs[URL_MAX];
+            if (url_like(from)) {
+                url_resolve(d->h.base, from, abs, sizeof(abs));
+                free(from);
+                from = strdup(abs);
+            }
+            url_resolve(d->h.base, to, abs, sizeof(abs));
+            free(to);
+            to = strdup(abs);
+            if (from && to) {
+                d->im_from[d->nim] = from;
+                d->im_to[d->nim] = to;
+                d->nim++;
+                continue;
+            }
+        }
+        free(from);
+        free(to);
+    }
 }
 
 void jsdom_run_script(struct jsdom *d, struct node *script, const char *text, int len, const char *where)
@@ -3673,6 +5256,8 @@ void jsdom_run_timers(struct jsdom *d)
 {
     if (!d)
         return;
+    process_view(d);
+    run_queued(d);
     unsigned int now = uptime_ms();
     int ran = 0;
     for (int i = 0; i < MAX_TIMERS && ran < 32; i++) {
@@ -3706,6 +5291,9 @@ int jsdom_next_timer(struct jsdom *d)
 {
     if (!d)
         return -1;
+    int sx, sy, vw, vh;
+    if (d->nqueued || view_changes(d, &sx, &sy, &vw, &vh))
+        return 0;
     unsigned int now = uptime_ms();
     int best = -1;
     for (int i = 0; i < MAX_TIMERS; i++) {

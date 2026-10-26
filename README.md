@@ -150,7 +150,14 @@ keeps running), or from `file://`.
   combinators, `:not()`/`:is()` with full selectors, specificity, `!important`,
   `:has()`, `:nth-child()`/`:nth-last-child()` with `of <selector-list>` filters, `@media`, custom properties and `var()`, `calc()`,
   `max-height`, `aspect-ratio`, `::before`/`::after` text,
-  gradients, rounded corners, and the old presentational attributes.
+  gradients, rounded corners, and the old presentational attributes. Nesting
+  (`&` and nested `@media`), `@supports` (and `CSS.supports()`), `@import`,
+  media queries level 4 (ranges such as `400px <= width <= 700px`, `or`,
+  heights, `prefers-reduced-motion`...), CSS Color 4/5 (`oklch()`, `oklab()`,
+  `lab()`, `lch()`, `hwb()`, `color()`, `color-mix()`; worked out in
+  csscolor.c) and logical properties (`margin-inline`, `padding-block`,
+  `inset-inline`, `inline-size`...). `<style>` and `<link>` elements that
+  scripts add or change apply as soon as the script returns.
 - **Layout**: blocks with margin collapsing, inline text, inline-blocks, lists,
   tables, flex rows, grids (columns, rows, areas, auto rows, spans, `dense`),
   borders, backgrounds, images and form controls. Floats (`float`, `clear`,
@@ -167,31 +174,53 @@ keeps running), or from `file://`.
   `HttpOnly`, `Max-Age`, `Expires`) and goes out on every request, so
   logins and `fetch` calls keep their session. `SameSite` is not enforced.
 - **Pictures**: PNG, JPEG, GIF (first frame), ICO (the largest icon) and SVG, as `<img>` and as an
-  inline `<svg>`. The SVG renderer (svg.c) draws shapes, paths (curves and
+  inline `<svg>`. `srcset`/`sizes` and `<picture><source>` choose a picture of
+  the right width in a format the browser can decode (not WebP or AVIF). The SVG renderer (svg.c) draws shapes, paths (curves and
   arcs), groups, `use`, text, transforms, `viewBox`, solid and gradient fills,
   dashed strokes with caps and joins, opacity, and simple `<style>` rules.
 - `<details>`/`<summary>` open and close when clicked. Links, `GET`/`POST` forms, `<meta refresh>`, fragments, redirects, iframes,
   `:visited` colors, and anti-aliased text (Liberation Sans, Serif and Mono in
   12 sizes, rasterised by `tools/mkfont.py`).
 - **JavaScript**: a tree-walking interpreter (js.c, jslib.c, jslib2.c, jsre.c)
-  that runs inline and external scripts, then `DOMContentLoaded` and `load`.
+  that runs inline and external scripts (`defer` ones and modules after the
+  rest), then `DOMContentLoaded` and `load`.
   It covers most of ES2020 and some later: `let`/`const`, arrow functions,
   template literals, destructuring, spread, optional chaining, classes
   (fields, `#private`, `extends`, `super`, statics and `static {}` blocks),
-  generators and `async`/`await` (run as coroutines on their own stacks),
+  ES modules (`<script type=module>`, `import`/`export` in all their forms with
+  live bindings, `import()`, `import.meta`, top-level `await`, import maps;
+  `nomodule` scripts are skipped), generators, async generators and
+  `async`/`await` (run as coroutines on their own stacks),
   Promises with a microtask queue, regular expressions with lookbehind and
   named groups, and the usual built-ins (Map, Set, Weak*, typed arrays, JSON,
-  Date, Reflect, `Proxy` (get, set, has, deleteProperty and ownKeys traps), a small Intl, `structuredClone`...). The DOM (jsdom.c) has
+  Date, Reflect, `Proxy` (get, set, has, deleteProperty and ownKeys traps), the ES2025 Set methods,
+  `Array.fromAsync`, `Error` causes, a small Intl (`NumberFormat`, `DateTimeFormat`, `Collator`,
+  `PluralRules`, `RelativeTimeFormat`, `ListFormat`, `Segmenter`), `structuredClone`...). The DOM (jsdom.c) has
   `document`, `querySelector` (including `:is()`, `:where()`, complex `:not()`
-  and filtered sibling selectors), `innerHTML`, `classList`, `dataset`, events,
+  and filtered sibling selectors), `innerHTML`, `classList`, `dataset`, events
+  (capture and bubbling phases, `once`/`signal` options, `handleEvent` objects,
+  `MouseEvent`, `PointerEvent`, `KeyboardEvent` and the other event classes;
+  the pointer's moves, presses and hovering reach scripts as `pointer*`,
+  `mouse*`, `mouseenter`/`mouseleave`), `scroll` and `resize` events,
+  `MutationObserver`, `IntersectionObserver` and `ResizeObserver`, custom
+  elements (`customElements.define` with upgrades and lifecycle callbacks;
+  `attachShadow` gives the element itself as its shadow root), `<template>`
+  content, `<dialog>`, `HTMLInputElement` and the other interfaces for
+  `instanceof`, `TreeWalker`, `Range`/`Selection`, form validation,
+  `form.submit()`/`requestSubmit()`, `load`/`error` events for pictures,
+  scripts and style sheets,
   `replaceChildren`, `insertAdjacentText` and `insertAdjacentElement`,
-  timers, `location`, `history`, `localStorage`, `XMLHttpRequest`, `fetch`,
+  timers, `location`, `history` (`pushState`/`replaceState` with `popstate`,
+  and `hashchange`, without reloading), `matchMedia`, `localStorage` and
+  `sessionStorage` (per origin, kept while the desktop runs), `XMLHttpRequest`, `fetch`,
   `URL`, and more: `FormData`, `Blob`, `TextEncoder`/`TextDecoder`, `crypto.getRandomValues`/`randomUUID`,
-  `DOMParser`, `postMessage`, and stand-ins for `customElements`, `WebSocket`, `Notification` and `CSS.supports`.
+  `DOMParser`, `postMessage`, a style element's `sheet.insertRule()`, and stand-ins for `WebSocket`,
+  `Notification`, `element.animate()` (it skips to the end) and web fonts.
   `fetch` and `XMLHttpRequest` send request headers and any method (`PUT`, `DELETE`...). Changes are laid out again when a script returns; runaway
   scripts are stopped. `/usr/share/www/js.html`, `css.html` and `images.html`
   (linked from the home page) are live test pages. `features.html` demonstrates
-  the HTML, CSS and DOM additions in 0.1.4.
+  the HTML, CSS and DOM additions in 0.1.4, and `modern.html` the modules,
+  observers, custom elements, nesting and colors that came after.
 
 **DOS programs** (`/bin/dos`)
 - Runs `.COM` and MZ `.EXE` files in the terminal (`./GAME.EXE`, `dos game`, or

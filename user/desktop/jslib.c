@@ -2764,6 +2764,8 @@ static jsval error_ctor_named(struct js *J, jsval *args, int argc, const char *t
         js_put(J, e, S(J, "message"), js_to_string(J, args[0]), 1);
     else
         js_put(J, e, S(J, "message"), js_str(J, ""), 1);
+    if (argc > 1 && args[1].t == JS_OBJ && js_has(J, args[1], S(J, "cause")))     /* new Error(m, { cause }) */
+        js_put(J, e, S(J, "cause"), js_get(J, args[1], "cause"), 1);
     return js_obj(e);
 }
 
@@ -2992,7 +2994,7 @@ struct seqiter {
     int done;
 };
 
-static const struct jsclass seqiter_class = { "Iterator", NULL, NULL };
+static const struct jsclass seqiter_class = { "Iterator", NULL, NULL, NULL };
 
 static jsval make_seqiter(struct js *J, jsval keys, jsval vals, int kind, int index_keys)
 {

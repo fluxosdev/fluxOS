@@ -3,7 +3,9 @@
  *
  * A sheet is a list of rules (selector list + declarations). @media
  * blocks are kept when their query matches a screen of the viewport's
- * width in light mode; other at-rules are skipped. Selectors support
+ * size in light mode, @supports blocks when this file can do what they
+ * ask; nested rules (CSS nesting) become rules of their own with the
+ * parent's selector put in for &. Other at-rules are skipped. Selectors support
  * type, class, id, attribute and the structural pseudo-classes, with
  * all four combinators; :hover and the like never match, and rules for
  * pseudo-elements are dropped.
@@ -45,35 +47,51 @@ enum prop {
     P_GRID_COLUMN_END, P_GRID_ROW, P_GRID_ROW_START, P_GRID_AREA, P_GRID_TEMPLATE_ROWS,
     P_GRID_TEMPLATE_AREAS, P_GRID_AUTO_ROWS, P_GRID_ROW_END, P_GRID_AUTO_FLOW, P_MAX_HEIGHT,
     P_ASPECT_RATIO, P_RIGHT, P_BOTTOM, P_CLEAR, P_INSET, P_TRANSFORM, P_Z_INDEX, P_BOX_SHADOW,
+    P_MARGIN_INLINE, P_MARGIN_BLOCK, P_PADDING_INLINE, P_PADDING_BLOCK, P_INSET_INLINE, P_INSET_BLOCK,
 };
 
 static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "-ms-flex", P_FLEX }, { "-webkit-align-items", P_ALIGN_ITEMS },
-    { "-webkit-border-radius", P_BORDER_RADIUS }, { "-webkit-flex", P_FLEX },
-    { "-webkit-flex-direction", P_FLEX_DIRECTION }, { "-webkit-flex-wrap", P_FLEX_WRAP },
-    { "-webkit-justify-content", P_JUSTIFY_CONTENT }, { "-webkit-mask", P_MASK },
-    { "-webkit-mask-image", P_MASK }, { "align-items", P_ALIGN_ITEMS },
-    { "align-self", P_ALIGN_SELF }, { "aspect-ratio", P_ASPECT_RATIO }, { "background", P_BACKGROUND },
-    { "background-color", P_BACKGROUND_COLOR }, { "background-image", P_BACKGROUND_IMAGE },
-    { "border", P_BORDER }, { "border-bottom", P_BORDER_BOTTOM },
+    { "-webkit-align-self", P_ALIGN_SELF }, { "-webkit-border-radius", P_BORDER_RADIUS },
+    { "-webkit-box-shadow", P_BOX_SHADOW }, { "-webkit-box-sizing", P_BOX_SIZING },
+    { "-webkit-flex", P_FLEX }, { "-webkit-flex-basis", P_FLEX_BASIS },
+    { "-webkit-flex-direction", P_FLEX_DIRECTION }, { "-webkit-flex-flow", P_FLEX_FLOW },
+    { "-webkit-flex-grow", P_FLEX_GROW }, { "-webkit-flex-shrink", P_FLEX_SHRINK },
+    { "-webkit-flex-wrap", P_FLEX_WRAP }, { "-webkit-justify-content", P_JUSTIFY_CONTENT },
+    { "-webkit-mask", P_MASK }, { "-webkit-mask-image", P_MASK }, { "-webkit-order", P_ORDER },
+    { "-webkit-transform", P_TRANSFORM }, { "align-items", P_ALIGN_ITEMS },
+    { "align-self", P_ALIGN_SELF }, { "aspect-ratio", P_ASPECT_RATIO },
+    { "background", P_BACKGROUND }, { "background-color", P_BACKGROUND_COLOR },
+    { "background-image", P_BACKGROUND_IMAGE }, { "block-size", P_HEIGHT }, { "border", P_BORDER },
+    { "border-block-end", P_BORDER_BOTTOM }, { "border-block-end-color", P_BORDER_BOTTOM_COLOR },
+    { "border-block-end-width", P_BORDER_BOTTOM_WIDTH }, { "border-block-start", P_BORDER_TOP },
+    { "border-block-start-color", P_BORDER_TOP_COLOR },
+    { "border-block-start-width", P_BORDER_TOP_WIDTH }, { "border-bottom", P_BORDER_BOTTOM },
     { "border-bottom-color", P_BORDER_BOTTOM_COLOR },
     { "border-bottom-left-radius", P_BORDER_BL_RADIUS },
     { "border-bottom-right-radius", P_BORDER_BR_RADIUS },
     { "border-bottom-style", P_BORDER_BOTTOM_STYLE },
     { "border-bottom-width", P_BORDER_BOTTOM_WIDTH }, { "border-collapse", P_BORDER_COLLAPSE },
-    { "border-color", P_BORDER_COLOR }, { "border-left", P_BORDER_LEFT },
+    { "border-color", P_BORDER_COLOR }, { "border-end-end-radius", P_BORDER_BR_RADIUS },
+    { "border-end-start-radius", P_BORDER_BL_RADIUS }, { "border-inline-end", P_BORDER_RIGHT },
+    { "border-inline-end-color", P_BORDER_RIGHT_COLOR },
+    { "border-inline-end-width", P_BORDER_RIGHT_WIDTH }, { "border-inline-start", P_BORDER_LEFT },
+    { "border-inline-start-color", P_BORDER_LEFT_COLOR },
+    { "border-inline-start-width", P_BORDER_LEFT_WIDTH }, { "border-left", P_BORDER_LEFT },
     { "border-left-color", P_BORDER_LEFT_COLOR }, { "border-left-style", P_BORDER_LEFT_STYLE },
     { "border-left-width", P_BORDER_LEFT_WIDTH }, { "border-radius", P_BORDER_RADIUS },
     { "border-right", P_BORDER_RIGHT }, { "border-right-color", P_BORDER_RIGHT_COLOR },
     { "border-right-style", P_BORDER_RIGHT_STYLE }, { "border-right-width", P_BORDER_RIGHT_WIDTH },
-    { "border-spacing", P_BORDER_SPACING }, { "border-style", P_BORDER_STYLE },
+    { "border-spacing", P_BORDER_SPACING }, { "border-start-end-radius", P_BORDER_TR_RADIUS },
+    { "border-start-start-radius", P_BORDER_TL_RADIUS }, { "border-style", P_BORDER_STYLE },
     { "border-top", P_BORDER_TOP }, { "border-top-color", P_BORDER_TOP_COLOR },
     { "border-top-left-radius", P_BORDER_TL_RADIUS },
     { "border-top-right-radius", P_BORDER_TR_RADIUS }, { "border-top-style", P_BORDER_TOP_STYLE },
     { "border-top-width", P_BORDER_TOP_WIDTH }, { "border-width", P_BORDER_WIDTH },
-    { "bottom", P_BOTTOM }, { "box-shadow", P_BOX_SHADOW }, { "box-sizing", P_BOX_SIZING }, { "clear", P_CLEAR }, { "clip", P_CLIP }, { "color", P_COLOR },
-    { "column-gap", P_COLUMN_GAP }, { "content", P_CONTENT }, { "display", P_DISPLAY },
-    { "flex", P_FLEX }, { "flex-basis", P_FLEX_BASIS }, { "flex-direction", P_FLEX_DIRECTION },
+    { "bottom", P_BOTTOM }, { "box-shadow", P_BOX_SHADOW }, { "box-sizing", P_BOX_SIZING },
+    { "clear", P_CLEAR }, { "clip", P_CLIP }, { "color", P_COLOR }, { "column-gap", P_COLUMN_GAP },
+    { "content", P_CONTENT }, { "display", P_DISPLAY }, { "flex", P_FLEX },
+    { "flex-basis", P_FLEX_BASIS }, { "flex-direction", P_FLEX_DIRECTION },
     { "flex-flow", P_FLEX_FLOW }, { "flex-grow", P_FLEX_GROW }, { "flex-shrink", P_FLEX_SHRINK },
     { "flex-wrap", P_FLEX_WRAP }, { "float", P_FLOAT }, { "font", P_FONT },
     { "font-family", P_FONT_FAMILY }, { "font-size", P_FONT_SIZE }, { "font-style", P_FONT_STYLE },
@@ -82,33 +100,40 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "grid-column", P_GRID_COLUMN }, { "grid-column-end", P_GRID_COLUMN_END },
     { "grid-column-gap", P_COLUMN_GAP }, { "grid-column-start", P_GRID_COLUMN_START },
     { "grid-gap", P_GAP }, { "grid-row", P_GRID_ROW }, { "grid-row-end", P_GRID_ROW_END },
-    { "grid-row-gap", P_ROW_GAP },
-    { "grid-row-start", P_GRID_ROW_START }, { "grid-template", P_GRID_TEMPLATE },
-    { "grid-template-areas", P_GRID_TEMPLATE_AREAS },
+    { "grid-row-gap", P_ROW_GAP }, { "grid-row-start", P_GRID_ROW_START },
+    { "grid-template", P_GRID_TEMPLATE }, { "grid-template-areas", P_GRID_TEMPLATE_AREAS },
     { "grid-template-columns", P_GRID_TEMPLATE_COLUMNS },
     { "grid-template-rows", P_GRID_TEMPLATE_ROWS }, { "height", P_HEIGHT },
-    { "inset", P_INSET }, { "justify-content", P_JUSTIFY_CONTENT }, { "justify-items", P_JUSTIFY_ITEMS },
-    { "justify-self", P_JUSTIFY_SELF }, { "left", P_LEFT }, { "line-height", P_LINE_HEIGHT },
-    { "list-style", P_LIST_STYLE }, { "list-style-type", P_LIST_STYLE_TYPE },
-    { "margin", P_MARGIN }, { "margin-block-end", P_MARGIN_BOTTOM },
+    { "inline-size", P_WIDTH }, { "inset", P_INSET }, { "inset-block", P_INSET_BLOCK },
+    { "inset-block-end", P_BOTTOM }, { "inset-block-start", P_TOP },
+    { "inset-inline", P_INSET_INLINE }, { "inset-inline-end", P_RIGHT },
+    { "inset-inline-start", P_LEFT }, { "justify-content", P_JUSTIFY_CONTENT },
+    { "justify-items", P_JUSTIFY_ITEMS }, { "justify-self", P_JUSTIFY_SELF }, { "left", P_LEFT },
+    { "line-height", P_LINE_HEIGHT }, { "list-style", P_LIST_STYLE },
+    { "list-style-type", P_LIST_STYLE_TYPE }, { "margin", P_MARGIN },
+    { "margin-block", P_MARGIN_BLOCK }, { "margin-block-end", P_MARGIN_BOTTOM },
     { "margin-block-start", P_MARGIN_TOP }, { "margin-bottom", P_MARGIN_BOTTOM },
-    { "margin-inline-end", P_MARGIN_RIGHT }, { "margin-inline-start", P_MARGIN_LEFT },
-    { "margin-left", P_MARGIN_LEFT }, { "margin-right", P_MARGIN_RIGHT },
-    { "margin-top", P_MARGIN_TOP }, { "mask", P_MASK }, { "mask-image", P_MASK },
-    { "max-height", P_MAX_HEIGHT }, { "max-width", P_MAX_WIDTH }, { "min-height", P_MIN_HEIGHT }, { "min-width", P_MIN_WIDTH },
-    { "opacity", P_OPACITY }, { "order", P_ORDER }, { "overflow", P_OVERFLOW },
-    { "overflow-x", P_OVERFLOW }, { "padding", P_PADDING },
+    { "margin-inline", P_MARGIN_INLINE }, { "margin-inline-end", P_MARGIN_RIGHT },
+    { "margin-inline-start", P_MARGIN_LEFT }, { "margin-left", P_MARGIN_LEFT },
+    { "margin-right", P_MARGIN_RIGHT }, { "margin-top", P_MARGIN_TOP }, { "mask", P_MASK },
+    { "mask-image", P_MASK }, { "max-block-size", P_MAX_HEIGHT }, { "max-height", P_MAX_HEIGHT },
+    { "max-inline-size", P_MAX_WIDTH }, { "max-width", P_MAX_WIDTH },
+    { "min-block-size", P_MIN_HEIGHT }, { "min-height", P_MIN_HEIGHT },
+    { "min-inline-size", P_MIN_WIDTH }, { "min-width", P_MIN_WIDTH }, { "opacity", P_OPACITY },
+    { "order", P_ORDER }, { "overflow", P_OVERFLOW }, { "overflow-x", P_OVERFLOW },
+    { "overflow-y", P_OVERFLOW }, { "padding", P_PADDING }, { "padding-block", P_PADDING_BLOCK },
     { "padding-block-end", P_PADDING_BOTTOM }, { "padding-block-start", P_PADDING_TOP },
-    { "padding-bottom", P_PADDING_BOTTOM }, { "padding-inline-end", P_PADDING_RIGHT },
-    { "padding-inline-start", P_PADDING_LEFT }, { "padding-left", P_PADDING_LEFT },
-    { "padding-right", P_PADDING_RIGHT }, { "padding-top", P_PADDING_TOP },
-    { "place-content", P_PLACE_CONTENT }, { "place-items", P_PLACE_ITEMS },
-    { "place-self", P_PLACE_SELF }, { "position", P_POSITION }, { "right", P_RIGHT }, { "row-gap", P_ROW_GAP },
-    { "text-align", P_TEXT_ALIGN }, { "text-decoration", P_TEXT_DECORATION },
-    { "text-decoration-line", P_TEXT_DECORATION_LINE }, { "text-indent", P_TEXT_INDENT },
-    { "text-transform", P_TEXT_TRANSFORM }, { "top", P_TOP }, { "transform", P_TRANSFORM },
-    { "vertical-align", P_VERTICAL_ALIGN }, { "visibility", P_VISIBILITY },
-    { "white-space", P_WHITE_SPACE }, { "width", P_WIDTH }, { "z-index", P_Z_INDEX },
+    { "padding-bottom", P_PADDING_BOTTOM }, { "padding-inline", P_PADDING_INLINE },
+    { "padding-inline-end", P_PADDING_RIGHT }, { "padding-inline-start", P_PADDING_LEFT },
+    { "padding-left", P_PADDING_LEFT }, { "padding-right", P_PADDING_RIGHT },
+    { "padding-top", P_PADDING_TOP }, { "place-content", P_PLACE_CONTENT },
+    { "place-items", P_PLACE_ITEMS }, { "place-self", P_PLACE_SELF }, { "position", P_POSITION },
+    { "right", P_RIGHT }, { "row-gap", P_ROW_GAP }, { "text-align", P_TEXT_ALIGN },
+    { "text-decoration", P_TEXT_DECORATION }, { "text-decoration-line", P_TEXT_DECORATION_LINE },
+    { "text-indent", P_TEXT_INDENT }, { "text-transform", P_TEXT_TRANSFORM }, { "top", P_TOP },
+    { "transform", P_TRANSFORM }, { "vertical-align", P_VERTICAL_ALIGN },
+    { "visibility", P_VISIBILITY }, { "white-space", P_WHITE_SPACE }, { "width", P_WIDTH },
+    { "z-index", P_Z_INDEX },
 };
 
 /* ---- selectors and rules ---- */
@@ -248,7 +273,11 @@ static const char ua_css[] =
     "details[open] > :not(summary) { display: block }"
     "q::before { content: open-quote } q::after { content: close-quote }"
     "img { vertical-align: baseline }"
-    "iframe { border: 2px inset #808080 }";
+    "iframe { border: 2px inset #808080 }"
+    "dialog { position: absolute; left: 0; right: 0; width: fit-content; height: fit-content; margin: auto;"
+    " border: 2px solid; padding: 1em; background-color: white; color: black }"
+    "[popover]:not([data-popover-open]) { display: none }"
+    "slot { display: contents }";
 
 /* In quirks mode tables do not inherit these (the HTML standard's rendering section). */
 static const char ua_quirks_css[] =
@@ -795,11 +824,47 @@ static int parse_decls(struct arena *a, const char *s, const char *end, struct d
 
 static int length_px(const char *s, int base);
 
+int css_viewport_h = 600;
+
+/* One side of a range: "width >= 600px" compares v (the viewport's width or height). */
+static int media_compare(int v, const char *op, int px, int flip)
+{
+    int ge = op[0] == '>' && op[1] == '=', le = op[0] == '<' && op[1] == '=';
+    int gt = op[0] == '>' && !ge, lt = op[0] == '<' && !le;
+    if (flip) {                         /* "600px < width": the other way round */
+        int t;
+        t = ge, ge = le, le = t;
+        t = gt, gt = lt, lt = t;
+    }
+    return ge ? v >= px : le ? v <= px : gt ? v > px : lt ? v < px : v == px;
+}
+
+/* "1.5" as 150: a number times 100. */
+static int fixed100(const char *s)
+{
+    int v = atoi(s) * 100, k = 0, frac = 0;
+    const char *dot = strchr(s, '.');
+    if (dot)
+        for (const char *p = dot + 1; isdigit((unsigned char)*p) && k < 2; p++, k++)
+            frac = frac * 10 + (*p - '0');
+    return v + (k == 1 ? frac * 10 : frac);
+}
+
+/* aspect-ratio values: "16/9", "16 / 9" or "1.5", as times 100. */
+static int ratio_value(const char *s)
+{
+    const char *slash = strchr(s, '/');
+    if (!slash)
+        return fixed100(s);
+    int b = atoi(slash + 1);
+    return b > 0 ? atoi(s) * 100 / b : 0;
+}
+
 static int media_feature(const char *f, int vw)
 {
-    /* "(min-width: 600px)", "(width >= 600px)", "(prefers-color-scheme: dark)" */
+    /* "(min-width: 600px)", "(width >= 600px)", "(400px <= width <= 700px)", "(prefers-color-scheme: dark)" */
     char buf[128];
-    int n = 0;
+    int n = 0, vh = css_viewport_h;
     for (; *f && *f != ')' && n < 127; f++)
         if (*f != '(')
             buf[n++] = (char)tolower((unsigned char)*f);
@@ -821,10 +886,44 @@ static int media_feature(const char *f, int vw)
             return vw <= length_px(value, 16);
         if (!strcmp(name, "width"))
             return vw == length_px(value, 16);
+        if (!strcmp(name, "min-height"))
+            return vh >= length_px(value, 16);
+        if (!strcmp(name, "max-height"))
+            return vh <= length_px(value, 16);
+        if (!strcmp(name, "height"))
+            return vh == length_px(value, 16);
+        if (!strcmp(name, "min-aspect-ratio"))
+            return vw * 100 >= ratio_value(value) * vh;
+        if (!strcmp(name, "max-aspect-ratio"))
+            return vw * 100 <= ratio_value(value) * vh;
         if (!strcmp(name, "prefers-color-scheme"))
             return !strncmp(value, "light", 5);
         if (!strcmp(name, "orientation"))
-            return !strncmp(value, "landscape", 9);
+            return !strncmp(value, vw >= vh ? "landscape" : "portrait", 8);
+        if (!strcmp(name, "prefers-reduced-motion") || !strcmp(name, "prefers-reduced-transparency") ||
+            !strcmp(name, "prefers-reduced-data") || !strcmp(name, "prefers-contrast"))
+            return !strncmp(value, "no-preference", 13);
+        if (!strcmp(name, "forced-colors") || !strcmp(name, "inverted-colors"))
+            return !strncmp(value, "none", 4);
+        if (!strcmp(name, "scripting"))
+            return !strncmp(value, "enabled", 7);
+        if (!strcmp(name, "update"))
+            return !strncmp(value, "fast", 4);
+        if (!strcmp(name, "display-mode"))
+            return !strncmp(value, "browser", 7);
+        if (!strcmp(name, "color-gamut") || !strcmp(name, "dynamic-range") || !strcmp(name, "video-dynamic-range"))
+            return !strncmp(value, "srgb", 4) || !strncmp(value, "standard", 8);
+        if (!strcmp(name, "min-resolution") || !strcmp(name, "max-resolution") || !strcmp(name, "resolution") ||
+            strstr(name, "device-pixel-ratio")) {
+            int dppx = strstr(value, "dpi") ? atoi(value) * 100 / 96 : strstr(value, "dpcm") ? atoi(value) * 254 / 96
+                     : fixed100(value);
+            return name[1] == 'i' || !strncmp(name, "-webkit-min", 11) ? dppx <= 100
+                 : name[1] == 'a' || !strncmp(name, "-webkit-max", 11) ? dppx >= 100 : dppx == 100;
+        }
+        if (!strcmp(name, "color") || !strcmp(name, "min-color"))
+            return atoi(value) <= 8;
+        if (!strcmp(name, "monochrome"))
+            return atoi(value) == 0;
         if (!strcmp(name, "hover") || !strcmp(name, "any-hover"))
             return !strncmp(value, "hover", 5);
         if (!strcmp(name, "pointer") || !strcmp(name, "any-pointer"))
@@ -835,29 +934,23 @@ static int media_feature(const char *f, int vw)
             return 1024 <= length_px(value, 16);
         return 0;
     }
-    /* Range syntax: "width >= 600px", "600px < width" */
+    /* Range syntax: "width >= 600px", "600px < width", "400px <= width <= 700px" */
     char *op = strpbrk(buf, "<>=");
-    if (op && strstr(buf, "width")) {
-        int ge = 0, le = 0, gt = 0, lt = 0;
-        int width_first = strstr(buf, "width") < op;
-        char *val = op;
-        while (*val == '<' || *val == '>' || *val == '=' || *val == ' ')
-            val++;
-        if (op[0] == '>' && op[1] == '=')
-            ge = 1;
-        else if (op[0] == '<' && op[1] == '=')
-            le = 1;
-        else if (op[0] == '>')
-            gt = 1;
-        else if (op[0] == '<')
-            lt = 1;
-        int px = length_px(width_first ? val : buf, 16);
-        if (!width_first) {             /* "600px < width": swap the sense */
-            int t;
-            t = ge, ge = le, le = t;
-            t = gt, gt = lt, lt = t;
+    char *feat = strstr(buf, "width") ? strstr(buf, "width") : strstr(buf, "height");
+    if (op && feat) {
+        int v = feat[0] == 'w' ? vw : vh;
+        char *op2 = strpbrk(feat, "<>=");
+        int ok = 1;
+        if (op < feat) {                /* a value before the name: "400px <= width" */
+            ok = media_compare(v, op, length_px(buf, 16), 1);
         }
-        return ge ? vw >= px : le ? vw <= px : gt ? vw > px : lt ? vw < px : vw == px;
+        if (op2) {                      /* and after it: "width <= 700px" */
+            char *val = op2;
+            while (*val == '<' || *val == '>' || *val == '=' || *val == ' ')
+                val++;
+            ok = ok && media_compare(v, op2, length_px(val, 16), 0);
+        }
+        return ok;
     }
     if (!strncmp(buf, "color", 5) || !strcmp(buf, "hover"))
         return 1;
@@ -888,18 +981,96 @@ static int media_matches(const char *s, const char *end, int vw)
         if (!strncmp(query, "print", 5) || !strncmp(query, "speech", 6) ||
             !strncmp(query, "tv", 2) || !strncmp(query, "handheld", 8))
             ok = 0;
-        for (char *f = strchr(query, '('); f && ok; f = strchr(f + 1, '(')) {
+        /* features joined by "and" (all must match) or "or" (one must) */
+        int any = 0, first = 1, use_or = strstr(query, " or ") != NULL;
+        for (char *f = strchr(query, '('); f && (use_or || ok); f = strchr(f + 1, '(')) {
+            int r;
             if (f > query && !strncmp(f - 4 > query ? f - 4 : query, "not ", 4))
-                ok = !media_feature(f, vw);
+                r = !media_feature(f, vw);
             else
-                ok = media_feature(f, vw);
+                r = media_feature(f, vw);
+            if (use_or)
+                any |= r;
+            else
+                ok = r;
+            first = 0;
+            char *close = strchr(f, ')');
+            if (!close)
+                break;
+            f = close;
         }
+        if (use_or && !first)
+            ok = ok && any;
         if (negate)
             ok = !ok;
         if (ok)
             return 1;
     }
     return 0;
+}
+
+/* The URLs a style sheet's @import rules name (those whose media match), one after another:
+ * calls found(url) for each; returns how many. */
+int css_imports(const char *text, int len, int vw, void (*found)(void *ctx, const char *url), void *ctx)
+{
+    const char *p = text, *end = text + len;
+    int n = 0;
+    while (p < end) {
+        struct scan sc = { p, end };
+        skip_ws(&sc);
+        p = sc.s;
+        if (p >= end || *p != '@')
+            break;                      /* @import must come first (after @charset and @layer) */
+        const char *kw = p + 1, *k = kw;
+        while (k < end && is_ident_char(*k))
+            k++;
+        const char *semi = find_top(k, end, ';'), *brace = find_top(k, end, '{');
+        if (brace < semi)
+            break;                      /* a block (@media, @layer {...}): the imports are over */
+        if (k - kw == 6 && !strncasecmp(kw, "import", 6)) {
+            const char *q = k;
+            while (q < semi && isspace((unsigned char)*q))
+                q++;
+            if (q + 4 <= semi && !strncasecmp(q, "url(", 4))
+                q += 4;
+            while (q < semi && isspace((unsigned char)*q))
+                q++;
+            char quote = q < semi && (*q == '"' || *q == '\'') ? *q++ : 0;
+            const char *u = q;
+            while (q < semi && (quote ? *q != quote : *q != ')' && !isspace((unsigned char)*q)))
+                q++;
+            char url[URL_MAX];
+            snprintf(url, sizeof(url), "%.*s", (int)(q - u), u);
+            if (q < semi)
+                q++;
+            while (q < semi && (*q == ')' || isspace((unsigned char)*q)))
+                q++;
+            /* what follows: layer(...), supports(...), a media query list */
+            while (q < semi && (!strncasecmp(q, "layer", 5) || !strncasecmp(q, "supports(", 9))) {
+                const char *paren = q;
+                while (paren < semi && *paren != '(' && !isspace((unsigned char)*paren))
+                    paren++;
+                q = paren < semi && *paren == '(' ? skip_group(paren, semi) : paren;
+                while (q < semi && isspace((unsigned char)*q))
+                    q++;
+            }
+            if (url[0] && media_matches(q, semi, vw)) {
+                found(ctx, url);
+                n++;
+            }
+        }
+        p = semi < end ? semi + 1 : end;
+    }
+    return n;
+}
+
+int css_media_query(const char *query, int vw, int vh)
+{
+    int saved = css_viewport_h;
+    css_viewport_h = vh;
+    int r = media_matches(query, query + strlen(query), vw);
+    css_viewport_h = saved;
+    return r;
 }
 
 /* ---- sheets ---- */
@@ -940,6 +1111,269 @@ static void add_rule(struct sheet *sh, const char *sel_s, const char *sel_e, con
     sh->rules[sh->nrules++] = r;
 }
 
+/* ---- @supports ---- */
+
+static int is_length(const char *s);
+static int supports_expr(struct arena *a, const char **pp, const char *e);
+
+static int word_at(const char *p, const char *e, const char *w)
+{
+    size_t n = strlen(w);
+    return (size_t)(e - p) > n && !strncasecmp(p, w, n) && (isspace((unsigned char)p[n]) || p[n] == '(');
+}
+
+/* (property: value): a property we know, with a value it can take. */
+static int supports_decl(const char *ns, const char *ne, const char *vs, const char *ve)
+{
+    while (ns < ne && isspace((unsigned char)*ns))
+        ns++;
+    while (ne > ns && isspace((unsigned char)ne[-1]))
+        ne--;
+    while (vs < ve && isspace((unsigned char)*vs))
+        vs++;
+    while (ve > vs && isspace((unsigned char)ve[-1]))
+        ve--;
+    char name[64], value[256];
+    if (ne - ns <= 0 || ne - ns >= (int)sizeof(name) || ve - vs >= (int)sizeof(value))
+        return 0;
+    if (ne - ns > 2 && ns[0] == '-' && ns[1] == '-')
+        return 1;                       /* custom properties take anything */
+    for (int i = 0; i < ne - ns; i++)
+        name[i] = (char)tolower((unsigned char)ns[i]);
+    name[ne - ns] = 0;
+    snprintf(value, sizeof(value), "%.*s", (int)(ve - vs), vs);
+    int prop = prop_lookup(name);
+    if (prop == P_UNKNOWN || !value[0])
+        return 0;
+    if (!strncasecmp(value, "var(", 4) || !strcasecmp(value, "inherit") || !strcasecmp(value, "initial") ||
+        !strcasecmp(value, "unset") || !strcasecmp(value, "revert"))
+        return 1;
+    uint32_t c;
+    switch (prop) {
+    case P_COLOR: case P_BACKGROUND_COLOR: case P_BORDER_COLOR: case P_BORDER_TOP_COLOR:
+    case P_BORDER_RIGHT_COLOR: case P_BORDER_BOTTOM_COLOR: case P_BORDER_LEFT_COLOR:
+        return css_parse_color(value, (int)strlen(value), &c) == 0 || !strcasecmp(value, "currentcolor");
+    case P_DISPLAY: {
+        static const char *const ok[] = { "none", "block", "inline", "inline-block", "flex", "inline-flex", "grid",
+            "inline-grid", "table", "inline-table", "table-row", "table-cell", "table-row-group",
+            "table-header-group", "table-footer-group", "table-caption", "table-column", "table-column-group",
+            "list-item", "contents", "flow-root", "run-in", "-webkit-box", "-webkit-flex", "-ms-flexbox", NULL };
+        for (int i = 0; ok[i]; i++)
+            if (!strcasecmp(value, ok[i]))
+                return 1;
+        return 0;
+    }
+    case P_POSITION:
+        return !strcasecmp(value, "static") || !strcasecmp(value, "relative") || !strcasecmp(value, "absolute") ||
+               !strcasecmp(value, "fixed") || !strcasecmp(value, "sticky") || !strcasecmp(value, "-webkit-sticky");
+    case P_WIDTH: case P_HEIGHT: case P_MIN_WIDTH: case P_MAX_WIDTH: case P_MIN_HEIGHT: case P_MAX_HEIGHT:
+    case P_TOP: case P_RIGHT: case P_BOTTOM: case P_LEFT: case P_GAP: case P_ROW_GAP: case P_COLUMN_GAP:
+        return is_length(value) || !strcasecmp(value, "fit-content") || !strcasecmp(value, "min-content") ||
+               !strcasecmp(value, "max-content");
+    default:
+        return 1;
+    }
+}
+
+static int supports_term(struct arena *a, const char **pp, const char *e)
+{
+    const char *p = *pp;
+    while (p < e && isspace((unsigned char)*p))
+        p++;
+    if (word_at(p, e, "not")) {
+        *pp = p + 3;
+        return !supports_term(a, pp, e);
+    }
+    if (e - p > 9 && !strncasecmp(p, "selector(", 9)) {
+        const char *close = skip_group(p + 8, e);
+        struct selector sel;
+        *pp = close;
+        return parse_selector(a, p + 9, close - 1, &sel) == 0;
+    }
+    if (p < e && *p == '(') {
+        const char *close = skip_group(p, e), *in = p + 1, *ie = close - 1;
+        *pp = close;
+        while (in < ie && isspace((unsigned char)*in))
+            in++;
+        const char *colon = find_top(in, ie, ':');
+        if (in < ie && (*in == '(' || word_at(in, ie, "not") || colon >= ie ||
+                        (ie - in > 9 && !strncasecmp(in, "selector(", 9))))
+            return supports_expr(a, &in, ie);
+        return supports_decl(in, colon, colon + 1, ie);
+    }
+    /* a function this does not know (font-tech() and the like): false */
+    while (p < e && *p != '(' && !isspace((unsigned char)*p))
+        p++;
+    *pp = p < e && *p == '(' ? skip_group(p, e) : e;
+    return 0;
+}
+
+static int supports_expr(struct arena *a, const char **pp, const char *e)
+{
+    int r = supports_term(a, pp, e);
+    for (;;) {
+        const char *p = *pp;
+        while (p < e && isspace((unsigned char)*p))
+            p++;
+        if (word_at(p, e, "and")) {
+            *pp = p + 3;
+            int t = supports_term(a, pp, e);
+            r = r && t;
+        } else if (word_at(p, e, "or")) {
+            *pp = p + 2;
+            int t = supports_term(a, pp, e);
+            r = r || t;
+        } else {
+            *pp = p;
+            return r;
+        }
+    }
+}
+
+static int supports_matches(struct arena *a, const char *s, const char *e)
+{
+    return supports_expr(a, &s, e);
+}
+
+int css_supports(const char *cond)
+{
+    struct arena a = { 0 };
+    char buf[512];
+    const char *c = cond;
+    while (isspace((unsigned char)*c))
+        c++;
+    /* CSS.supports("display: flex") is a declaration without its parentheses */
+    if (*c != '(' && strncasecmp(c, "not", 3) && strncasecmp(c, "selector(", 9) && strchr(c, ':'))
+        snprintf(buf, sizeof(buf), "(%s)", c);
+    else
+        snprintf(buf, sizeof(buf), "%s", c);
+    int r = supports_matches(&a, buf, buf + strlen(buf));
+    arena_free(&a);
+    return r;
+}
+
+/* ---- nesting ---- */
+
+static void style_rule(struct sheet *sh, const char *sel_s, const char *sel_e, const char *body_s,
+                       const char *body_e, int vw, int depth);
+
+/* Does a selector list hold just one compound (so & can stand for it as it is)? */
+static int single_compound(const char *s, const char *e)
+{
+    for (const char *p = s; p < e; p++) {
+        if (*p == '(' || *p == '[' || *p == '"' || *p == '\'') {
+            p = skip_group(p, e) - 1;
+            continue;
+        }
+        if (*p == ',' || *p == ' ' || *p == '>' || *p == '+' || *p == '~' || *p == '\t' || *p == '\n')
+            return 0;
+    }
+    return 1;
+}
+
+/* A nested rule's selectors, with the parent's put in: "&:hover" is the parent
+ * hovered; one without & is a descendant (or sibling, after + or ~) of it. */
+static char *nest_selector(struct arena *a, const char *ps, const char *pe, const char *cs, const char *ce,
+                           int *len)
+{
+    while (ps < pe && isspace((unsigned char)*ps))
+        ps++;
+    while (pe > ps && isspace((unsigned char)pe[-1]))
+        pe--;
+    int simple = single_compound(ps, pe), plen = (int)(pe - ps);
+    int amps = 0, parts = 1;
+    for (const char *p = cs; p < ce; p++)
+        amps += *p == '&', parts += *p == ',';
+    size_t cap = (size_t)(ce - cs) + (size_t)(amps + parts) * (size_t)(plen + 8) + 8;
+    char *out = arena_alloc(a, cap);
+    if (!out)
+        return NULL;
+    int o = 0;
+#define PUT_PARENT() do { if (!simple) { memcpy(out + o, ":is(", 4); o += 4; }                           memcpy(out + o, ps, (size_t)plen); o += plen; if (!simple) out[o++] = ')'; } while (0)
+    for (const char *s = cs; s < ce;) {
+        const char *comma = find_top(s, ce, ',');
+        const char *a0 = s, *a1 = comma;
+        while (a0 < a1 && isspace((unsigned char)*a0))
+            a0++;
+        while (a1 > a0 && isspace((unsigned char)a1[-1]))
+            a1--;
+        if (a1 > a0) {
+            if (o)
+                out[o++] = ',';
+            if (!memchr(a0, '&', (size_t)(a1 - a0))) {
+                PUT_PARENT();
+                out[o++] = ' ';
+            }
+            for (const char *p = a0; p < a1; p++) {
+                if (*p == '&')
+                    PUT_PARENT();
+                else
+                    out[o++] = *p;
+            }
+        }
+        s = comma < ce ? comma + 1 : ce;
+    }
+#undef PUT_PARENT
+    out[o] = 0;
+    *len = o;
+    return out;
+}
+
+/* A style rule. Its body may hold rules of its own (CSS nesting), and
+ * @media and @supports blocks whose declarations are the rule's. */
+static void style_rule(struct sheet *sh, const char *sel_s, const char *sel_e, const char *body_s,
+                       const char *body_e, int vw, int depth)
+{
+    if (!memchr(body_s, '{', (size_t)(body_e - body_s)) || depth >= 8) {
+        add_rule(sh, sel_s, sel_e, body_s, body_e);
+        return;
+    }
+    /* the declarations first, then what is nested, in order */
+    char *decls = arena_alloc(sh->a, (size_t)(body_e - body_s) + 2);
+    int dn = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        const char *p = body_s;
+        while (p < body_e) {
+            struct scan sc = { p, body_e };
+            skip_ws(&sc);
+            p = sc.s;
+            if (p >= body_e)
+                break;
+            const char *semi = find_top(p, body_e, ';'), *brace = find_top(p, body_e, '{');
+            if (brace >= semi) {                /* a declaration */
+                if (!pass && decls) {
+                    memcpy(decls + dn, p, (size_t)(semi - p));
+                    dn += (int)(semi - p);
+                    decls[dn++] = ';';
+                }
+                p = semi < body_e ? semi + 1 : body_e;
+                continue;
+            }
+            const char *close = skip_group(brace, body_e);
+            if (pass) {
+                if (*p == '@') {
+                    const char *kw = p + 1, *k = kw;
+                    while (k < brace && is_ident_char(*k))
+                        k++;
+                    int kl = (int)(k - kw);
+                    if ((kl == 5 && !strncasecmp(kw, "media", 5) && media_matches(k, brace, vw)) ||
+                        (kl == 8 && !strncasecmp(kw, "supports", 8) && supports_matches(sh->a, k, brace)) ||
+                        (kl == 5 && !strncasecmp(kw, "layer", 5)))
+                        style_rule(sh, sel_s, sel_e, brace + 1, close - 1, vw, depth + 1);
+                } else {
+                    int len;
+                    char *sel = nest_selector(sh->a, sel_s, sel_e, p, brace, &len);
+                    if (sel)
+                        style_rule(sh, sel, sel + len, brace + 1, close - 1, vw, depth + 1);
+                }
+            }
+            p = close;
+        }
+        if (!pass && decls && dn)
+            add_rule(sh, sel_s, sel_e, decls, decls + dn);
+    }
+}
+
 static void parse_block(struct sheet *sh, const char *s, const char *end, int vw, int depth)
 {
     struct scan sc = { s, end };
@@ -966,6 +1400,7 @@ static void parse_block(struct sheet *sh, const char *s, const char *end, int vw
             const char *close = skip_group(brace, sc.end);
             if (depth < 8 && ((kl == 5 && !strncasecmp(kw, "media", 5) && media_matches(k, brace, vw)) ||
                               (kl == 5 && !strncasecmp(kw, "layer", 5)) ||
+                              (kl == 8 && !strncasecmp(kw, "supports", 8) && supports_matches(sh->a, k, brace)) ||
                               (kl == 8 && !strncasecmp(kw, "document", 8))))
                 parse_block(sh, brace + 1, close - 1, vw, depth + 1);
             sc.s = close;
@@ -975,7 +1410,7 @@ static void parse_block(struct sheet *sh, const char *s, const char *end, int vw
         if (brace >= sc.end)
             break;
         const char *close = skip_group(brace, sc.end);
-        add_rule(sh, sc.s, brace, brace + 1, close - 1);
+        style_rule(sh, sc.s, brace, brace + 1, close - 1, vw, 0);
         sc.s = close;
     }
 }
@@ -1420,7 +1855,7 @@ static int hue_rgb(int p, int q, int t)
 
 int css_parse_color(const char *s, int n, uint32_t *out)
 {
-    char buf[96];
+    char buf[320];
     while (n > 0 && isspace((unsigned char)*s))
         s++, n--;
     while (n > 0 && isspace((unsigned char)s[n - 1]))
@@ -1496,6 +1931,10 @@ int css_parse_color(const char *s, int n, uint32_t *out)
                (uint32_t)clamp255(g) << 8 | (uint32_t)clamp255(b);
         return 0;
     }
+    if (!strncmp(buf, "oklab(", 6) || !strncmp(buf, "oklch(", 6) || !strncmp(buf, "lab(", 4) ||
+        !strncmp(buf, "lch(", 4) || !strncmp(buf, "hwb(", 4) || !strncmp(buf, "color(", 6) ||
+        !strncmp(buf, "color-mix(", 10))
+        return css_color_function(buf, out);       /* csscolor.c */
     if (!strncmp(buf, "light-dark(", 11)) {         /* we are always in light mode */
         const char *p = buf + 11;
         const char *comma = find_top(p, buf + n, ',');
@@ -1811,6 +2250,14 @@ static int len_on(struct len l, int base)
         return (l.unit == U_MIN) == (p < l.v) ? p : l.v;
     }
     return l.v;
+}
+
+/* Something length_value can read (for @supports). */
+static int is_length(const char *s)
+{
+    struct vctx v = { 16, 16, 1024, 768, NULL };
+    struct len l;
+    return length_value(s, &v, &l);
 }
 
 static int length_px(const char *s, int base)
@@ -2889,6 +3336,31 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         if (box_values(value, v, box))
             memcpy(st->padding, box, sizeof(box));
         break;
+    case P_MARGIN_INLINE: case P_MARGIN_BLOCK: case P_PADDING_INLINE: case P_PADDING_BLOCK:
+    case P_INSET_INLINE: case P_INSET_BLOCK: {      /* start [end]: left and right, or top and bottom */
+        const char *w[2];
+        int wl[2], nw = words(value, w, wl, 2);
+        char first[96], second[96];
+        if (!nw || wl[0] >= (int)sizeof(first) || wl[nw - 1] >= (int)sizeof(second))
+            break;
+        snprintf(first, sizeof(first), "%.*s", wl[0], w[0]);
+        snprintf(second, sizeof(second), "%.*s", wl[nw - 1], w[nw - 1]);
+        int inl = prop == P_MARGIN_INLINE || prop == P_PADDING_INLINE || prop == P_INSET_INLINE;
+        struct len *pair[2];
+        if (prop == P_MARGIN_INLINE || prop == P_MARGIN_BLOCK)
+            pair[0] = &st->margin[inl ? 3 : 0], pair[1] = &st->margin[inl ? 1 : 2];
+        else if (prop == P_PADDING_INLINE || prop == P_PADDING_BLOCK)
+            pair[0] = &st->padding[inl ? 3 : 0], pair[1] = &st->padding[inl ? 1 : 2];
+        else
+            pair[0] = inl ? &st->left : &st->top, pair[1] = inl ? &st->right : &st->bottom;
+        set_len(pair[0], first, v);
+        set_len(pair[1], second, v);
+        if (prop == P_PADDING_INLINE || prop == P_PADDING_BLOCK)
+            for (int i = 0; i < 2; i++)
+                if (pair[i]->unit == U_AUTO)
+                    *pair[i] = (struct len){ .unit = U_PX };
+        break;
+    }
     case P_PADDING_TOP: case P_PADDING_RIGHT: case P_PADDING_BOTTOM: case P_PADDING_LEFT:
         set_len(&st->padding[prop - P_PADDING_TOP], value, v);
         if (st->padding[prop - P_PADDING_TOP].unit == U_AUTO)
