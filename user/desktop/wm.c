@@ -1091,6 +1091,19 @@ static void chrome_fill(struct rect r, int rt, int rb, const color_t *c)
     gfx_gradient(&screen, r, rt, rb, 3, argb, pos);
 }
 
+/* A color with its chroma pushed out from its gray, by k/4 (k 4 leaves it as it is). */
+static color_t saturate(color_t c, int k)
+{
+    int r = (int)(c >> 16 & 0xFF), g = (int)(c >> 8 & 0xFF), b = (int)(c & 0xFF);
+    int m = (r + g + b) / 3;
+    int out[3] = { r, g, b };
+    for (int i = 0; i < 3; i++) {
+        int v = m + (out[i] - m) * k / 4;
+        out[i] = v < 0 ? 0 : v > 255 ? 255 : v;
+    }
+    return RGB(out[0], out[1], out[2]);
+}
+
 /* A glassy button on the chrome, or (pressed) a hollow one. */
 static void glass(struct rect r, int rad, int pressed)
 {
@@ -1173,8 +1186,8 @@ static void draw_taskbar_kinetik(void)
     gfx_hline(&screen, tb.x, tb.y + 1, tb.w, gfx_mix(theme.chrome0, 0xFFFFFF, 72));
 
     struct rect sb = start_button_rect();
-    if (!menu_open)
-        gfx_round_fill(&screen, sb, 6, 6, ARGB(120, 0x0A1A2E));    /* darker than the other buttons */
+    if (!menu_open)     /* darker than the other buttons, in the color scheme's own hue, more saturated */
+        gfx_round_fill(&screen, sb, 6, 6, ARGB(120, gfx_mix(saturate(theme.chrome1, 11), 0, 176)));
     glass(sb, 6, menu_open);
     draw_icon(&screen, sb.x + 7, sb.y + (sb.h - 24) / 2, ICON_FLUX, 24);
     gfx_text(&screen, &font_archivo_start, sb.x + 37, sb.y + (sb.h - font_archivo_start.height) / 2, "menu",
