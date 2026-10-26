@@ -45,6 +45,13 @@ struct jshost {
     int (*set_url)(void *ctx, const char *url, int replace);
     /* Submit a form (after its submit event, if fire), once the script returns. */
     void (*submit)(void *ctx, struct node *form, int fire);
+    /* An element with overflow that scrolls: where it is scrolled and how big it and its contents are; with
+       set, it is first scrolled to (*sx, *sy). 0 if the element does not scroll (or nothing is laid out). */
+    int (*node_scroll)(void *ctx, struct node *n, int set, int *sx, int *sy, int *cw, int *ch, int *vw, int *vh);
+    /* Lay the page out now (the tree has changed), for a script that reads how far a box scrolls. */
+    void (*flush)(void *ctx);
+    /* Scroll the boxes that clip an element, and the page, until it shows. */
+    void (*reveal)(void *ctx, struct node *n);
     /* The element drawn at a page point, or NULL. */
     struct node *(*node_at)(void *ctx, int x, int y);
 };

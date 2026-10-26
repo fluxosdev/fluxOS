@@ -111,6 +111,7 @@ struct node {
     char *value;                /* the current value of a text field (malloc'd) */
     int checked;                /* checkbox, radio; select: the chosen option */
     int cursor;                 /* caret position in value */
+    int scroll_x, scroll_y;     /* a box with overflow: how far its contents are scrolled */
 
     /* images */
     struct image *img;
@@ -189,6 +190,9 @@ enum {
     LS_DISC, LS_CIRCLE, LS_SQUARE, LS_DECIMAL, LS_LOWER_ALPHA, LS_UPPER_ALPHA,
     LS_LOWER_ROMAN, LS_UPPER_ROMAN, LS_NONE,
 };
+enum { BGS_AUTO, BGS_COVER, BGS_CONTAIN, BGS_LEN };             /* background-size */
+enum { OF_FILL, OF_CONTAIN, OF_COVER, OF_NONE, OF_SCALE_DOWN };   /* object-fit */
+enum { OV_VISIBLE, OV_HIDDEN, OV_SCROLL, OV_AUTO };               /* overflow-x and -y */
 enum { BS_NONE, BS_SOLID, BS_DOTTED, BS_DASHED, BS_DOUBLE, BS_INSET, BS_OUTSET, BS_GROOVE, BS_RIDGE };
 enum { LH_NORMAL, LH_FACTOR, LH_PX };
 enum { POS_STATIC, POS_RELATIVE, POS_ABSOLUTE, POS_FIXED, POS_STICKY };
@@ -277,11 +281,24 @@ struct style {
     uint32_t g0, g1;            /* a linear gradient over the background, from g0 to g1 */
     uint8_t grad;               /* 0 none, 1 downwards, 2 rightwards */
 
+    /* the background picture (the first layer that has a url()); bg_img is filled in by the browser */
+    const char *bg_url;
+    struct image *bg_img;
+    uint8_t bg_size;                    /* BGS_*; BGS_LEN: bg_w and bg_h */
+    uint8_t bg_norep_x, bg_norep_y;     /* background-repeat: no-repeat along an axis */
+    uint8_t bg_origin;                  /* 0 padding-box, 1 border-box, 2 content-box */
+    struct len bg_w, bg_h, bg_px, bg_py;
+
+    /* object-fit and object-position, for pictures */
+    uint8_t obj_fit;                    /* OF_* */
+    struct len obj_px, obj_py;
+
     /* flex and grid containers, and their items */
     uint8_t inner;              /* IN_* */
     uint8_t flex_wrap, flex_reverse;
     uint8_t justify, align_items, align_self, justify_items, justify_self;   /* AL_* */
     uint8_t clips;              /* overflow other than visible */
+    uint8_t ov_x, ov_y;         /* OV_*: what overflow-x and overflow-y come to */
     int flex_grow, flex_shrink; /* times 100 */
     struct len flex_basis;
     int order;
@@ -332,8 +349,17 @@ void svg_size(const struct node *svg, int *w, int *h);
 struct image *svg_render(const struct node *svg, int w, int h, uint32_t color);
 
 /* ---- layout and painting (layout.c) ---- */
-/* DK_FRAME: a picture that could not be shown; DK_IFRAME: where an <iframe>'s page goes (browser.c) */
-enum dkind { DK_FILL, DK_TEXT, DK_IMAGE, DK_DISC, DK_CIRCLE, DK_CONTROL, DK_FRAME, DK_IFRAME };
+/* DK_FRAME: a picture that could not be shown; DK_IFRAME: where an <iframe>'s page goes (browser.c);
+ * DK_BGIMG: a background picture (bgp); DK_SBOX: the scroll bars of a box that scrolls (sbi), drawn last */
+enum dkind { DK_FILL, DK_TEXT, DK_IMAGE, DK_DISC, DK_CIRCLE, DK_CONTROL, DK_FRAME, DK_IFRAME, DK_BGIMG,
+             DK_SBOX };
+
+/* A background picture, placed: the item is the area it is painted in, and these are measured from its corner. */
+struct bgpaint {
+    struct image *img;
+    int tx, ty, tw, th;         /* the first tile: where it is and how big (tw, th > 0) */
+    uint8_t norep_x, norep_y;   /* one tile only along the axis */
+};
 
 struct ditem {
     uint8_t kind;
@@ -359,13 +385,36 @@ struct ditem {
     uint32_t g0, g1;
     int ring;
     uint32_t ring_color;
+    const struct bgpaint *bgp;  /* DK_BGIMG */
+    /* images: object-fit puts the picture at fit_x, fit_y (fit_w x fit_h) in the item and clips it to the item */
+    int fit_x, fit_y, fit_w, fit_h;     /* fit_w == 0: the picture fills the item */
+    uint16_t sb;                /* 1 + the scrolling box it is inside (and clipped by), or 0 */
+    uint16_t sbi;               /* DK_SBOX: its box */
 };
 
 struct hotspot {                /* a link or a form control */
     int x, y, w, h;
     struct node *node;          /* the <a href> or the control */
     uint8_t dyn;                /* like ditem.dyn */
+    uint16_t sb;                /* like ditem.sb */
 };
+
+/* A box with overflow other than visible whose contents are clipped to its padding box; with
+ * overflow: scroll or auto (or a script) they can be scrolled, and the box gets scroll bars. */
+struct sbox {
+    int x, y, w, h;             /* the padding box, as laid out (a box in a fixed one moves with dyn) */
+    int cw, ch;                 /* what can be scrolled over: the contents' size from x, y */
+    int sx, sy;                 /* how far it is scrolled */
+    int max_x, max_y;           /* the furthest it can be */
+    uint8_t ov_x, ov_y;         /* OV_* */
+    uint8_t bar_x, bar_y;       /* the scroll bars it shows */
+    uint8_t active;             /* anything to clip or scroll */
+    uint8_t dyn;                /* like ditem.dyn */
+    uint16_t parent;            /* 1 + the box it is inside, or 0 */
+    struct node *node;
+};
+#define MAX_SBOX 1500
+#define SB_BAR 16               /* a scroll bar's thickness */
 
 /* A box that moves as the page scrolls: position: fixed stays where it is on the screen,
  * position: sticky stays on the screen between its place and the end of its container. */
@@ -399,6 +448,8 @@ struct layout {
     int vw, vh;                 /* the window it was laid out for: where fixed and sticky boxes go */
     struct dynbox *dyn;
     int ndyn;
+    struct sbox *sb;
+    int nsb;
     uint32_t canvas;            /* the background behind everything */
     /* the selected text: items sel_from..sel_to, from character sel_c0 of the first to sel_c1 of the last */
     int sel_on, sel_from, sel_to, sel_c0, sel_c1;
@@ -421,6 +472,29 @@ const struct hotspot *layout_hit(const struct layout *lo, const struct hotspot *
                                  int sx, int sy);
 /* How far scrolling to (sx, sy) moves the item or hotspot with this dyn from where it was laid out. */
 void layout_dyn_offset(const struct layout *lo, int dyn, int sx, int sy, int *dx, int *dy);
+/* ---- boxes that scroll (overflow: auto, scroll) ---- */
+enum { SBP_NONE, SBP_ARROW1, SBP_ARROW2, SBP_PAGE1, SBP_PAGE2, SBP_THUMB };
+struct sbhit {                  /* a point on a scroll bar */
+    int box, axis, part;        /* index into lo->sb, 0 horizontal 1 vertical, SBP_* */
+    int thumb;                  /* where its thumb starts along the axis, in page coordinates */
+};
+/* The scroll bar at a page point (the page scrolled to psx, psy); 1 if there is one. */
+int layout_sbar_hit(const struct layout *lo, int px, int py, int psx, int psy, struct sbhit *out);
+/* A press on an arrow or the track: scroll a step or a page; 1 if the box moved. */
+int layout_sbar_press(struct layout *lo, const struct sbhit *h);
+/* The thumb grabbed `grab` pixels from its start and dragged to mouse (page coordinates along the axis). */
+void layout_sbar_drag(struct layout *lo, const struct sbhit *h, int mouse, int grab, int psx, int psy);
+/* The wheel turned over a page point: the innermost box that can scroll that way takes it; 1 if one did. */
+int layout_wheel(struct layout *lo, int px, int py, int psx, int psy, int dx, int dy);
+/* A box's scroll position: get (0 if n is not a box that scrolls) and set (clamped, kept when the page is laid out again). */
+int layout_node_scroll(const struct layout *lo, const struct node *n, int *sx, int *sy, int *cw, int *ch,
+                       int *vw, int *vh);
+int layout_set_node_scroll(struct layout *lo, struct node *n, int sx, int sy);
+/* Scroll the boxes that clip n so that its rectangle (page coordinates) shows. */
+void layout_reveal(struct layout *lo, const struct node *n, int x, int y, int w, int h);
+/* How the scrolling boxes round an item (its sb) move it, and the page rectangle that clips it. */
+void layout_sb_view(const struct layout *lo, int sb, int psx, int psy, int *dx, int *dy, struct rect *clip);
+
 /* The text a button, submit input or select shows. */
 const char *control_label(const struct node *n);
 /* Draw img scaled to w x h, alpha-blended. */

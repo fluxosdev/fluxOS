@@ -8,11 +8,23 @@ building fluxOS does not need this script, Python or PIL.
                            box drawing and symbols, for DOS programs), from
                            the Linux console fonts Lat15-VGA16 (ASCII) and
                            Uni2-VGA16 (the rest), both in the kbd package
-  user/desktop/font_sans.c proportional UI fonts (regular and bold, and a
-                           larger bold one for the Start menu banner), ASCII
-                           32-126, rasterised anti-aliased (4 bits of coverage
-                           per pixel) from Liberation Sans (SIL Open Font
-                           License 1.1)
+  user/desktop/font_sans.c the classic theme's proportional UI fonts (regular
+                           and bold, and a larger bold one for the Start menu
+                           banner), ASCII 32-126, rasterised anti-aliased (4
+                           bits of coverage per pixel) from Liberation Sans
+                           (SIL Open Font License 1.1)
+  user/desktop/font_archivo.c
+                           the Kinetik theme's UI fonts, the same way, from
+                           Archivo (https://fonts.google.com/specimen/Archivo,
+                           SIL Open Font License 1.1): Medium and Bold at 12
+                           pixels for text (as wide as Liberation Sans, so
+                           dialogs still fit), Medium 14 for captions, Regular
+                           24 for the Start menu's heading and Bold Italic 18
+                           for the Start button, set on the weight axis of the
+                           variable fonts Google Fonts ships (Archivo[wdth,wght].ttf
+                           and Archivo-Italic[wdth,wght].ttf), which are looked
+                           for in $ARCHIVO_DIR (default
+                           /usr/share/fonts/truetype/archivo)
   rootfs/usr/share/fonts/web.fnt
                            the web browser's fonts: Liberation Sans, Serif
                            and Mono in regular, bold, italic and bold italic
@@ -44,6 +56,14 @@ SANS = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
 SANS_BOLD = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
 SANS_PX = 12
 BANNER_PX = 16
+ARCHIVO_DIR = os.environ.get("ARCHIVO_DIR", "/usr/share/fonts/truetype/archivo")
+ARCHIVO = "Archivo[wdth,wght].ttf"
+ARCHIVO_ITALIC = "Archivo-Italic[wdth,wght].ttf"
+ARCHIVO_FONTS = (("font_archivo", ARCHIVO, 12, 500, "Medium"), ("font_archivo_bold", ARCHIVO, 12, 700, "Bold"),
+                 ("font_archivo_title", ARCHIVO, 14, 500, "Medium"),
+                 ("font_archivo_large", ARCHIVO, 24, 400, "Regular"),
+                 ("font_archivo_start", ARCHIVO_ITALIC, 18, 700, "Bold Italic"))
+CANVAS_W, ORIGIN = 64, 8                # glyphs are drawn this far in, so italics can overhang
 FIRST, LAST = 32, 126
 LAST_CP437 = 255
 
@@ -114,56 +134,77 @@ def write_font8x16(path):
         f.write("};\n")
 
 
-def rasterise(ttf, px):
+def rasterise(ttf, px, weight=None):
     font = ImageFont.truetype(ttf, px)
+    if weight:                          # a variable font: its weight, at normal width
+        font.set_variation_by_axes([weight, 100])
     ascent, descent = font.getmetrics()
     height = ascent + descent
     glyphs = []
     for c in range(FIRST, LAST + 1):
         ch = chr(c)
         advance = int(round(font.getlength(ch)))
-        img = Image.new("L", (32, height), 0)
+        img = Image.new("L", (CANVAS_W, height), 0)
         d = ImageDraw.Draw(img)
-        d.text((1, ascent), ch, font=font, fill=255, anchor="ls")
+        d.text((ORIGIN, ascent), ch, font=font, fill=255, anchor="ls")
         pix = img.load()
-        cols = [x for x in range(32) for y in range(height) if pix[x, y]]
-        left = min(cols) if cols else 1
-        right = max(cols) + 1 if cols else 1
-        # Keep the ink, starting at the origin (column 1) or where the ink
-        # starts if it overhangs to the left.
-        x0 = min(left, 1)
+        cols = [x for x in range(CANVAS_W) for y in range(height) if pix[x, y]]
+        left = min(cols) if cols else ORIGIN
+        right = max(cols) + 1 if cols else ORIGIN
+        # Keep the ink, starting at the origin or where the ink starts if it
+        # overhangs to the left.
+        x0 = min(left, ORIGIN)
         width = max(right - x0, 0)
-        assert width <= 16, "glyph %r too wide" % ch
+        assert 0 < left and right < CANVAS_W or not cols, "glyph %r does not fit" % ch
         cov = [(pix[x0 + x, y] + 8) // 17 for y in range(height) for x in range(width)]
-        glyphs.append((ch, advance, x0 - 1, width, cov))
+        glyphs.append((ch, advance, x0 - ORIGIN, width, cov))
     return ascent, height, glyphs
+
+
+def write_pfonts(f, fonts):
+    """Each (C name, TTF path, pixel size[, weight]) as a struct pfont."""
+    f.write('#include "font.h"\n')
+    for name, ttf, px, *weight in fonts:
+        ascent, height, glyphs = rasterise(ttf, px, *weight)
+        f.write("\nstatic const uint8_t %s_cov[] = {\n" % name)
+        offsets, pos = [], 0
+        for ch, _, _, _, cov in glyphs:
+            offsets.append(pos)
+            pos += len(cov)
+            if cov:
+                f.write("    %s,  /* %r */\n" % (", ".join(str(v) for v in cov), ch))
+            else:
+                f.write("    /* %r: no ink */\n" % ch)
+        f.write("    0\n};\n\n")
+        f.write("const struct pfont %s = {\n    .height = %d,\n    .ascent = %d,\n"
+                "    .glyphs = {\n" % (name, height, ascent))
+        for (ch, adv, xoff, width, _), off in zip(glyphs, offsets):
+            f.write("        { %d, %d, %d, %s_cov + %d },  /* %r */\n" % (adv, xoff, width, name, off, ch))
+        f.write("    },\n};\n")
 
 
 def write_sans(path):
     with open(path, "w") as f:
-        f.write("/*\n * Proportional UI fonts, ASCII 32-126 (generated by tools/mkfont.py).\n"
-                " * Rasterised anti-aliased at %dpx (the banner font at %dpx) from Liberation\n"
-                " * Sans, which is licensed under the SIL Open Font License 1.1. Each pixel\n"
-                " * is 4 bits of coverage (0-15), one per byte, row by row.\n */\n" % (SANS_PX, BANNER_PX))
-        f.write('#include "font.h"\n')
-        for name, ttf, px in (("font_sans", SANS, SANS_PX), ("font_sans_bold", SANS_BOLD, SANS_PX),
-                              ("font_banner", SANS_BOLD, BANNER_PX)):
-            ascent, height, glyphs = rasterise(ttf, px)
-            f.write("\nstatic const uint8_t %s_cov[] = {\n" % name)
-            offsets, pos = [], 0
-            for ch, _, _, _, cov in glyphs:
-                offsets.append(pos)
-                pos += len(cov)
-                if cov:
-                    f.write("    %s,  /* %r */\n" % (", ".join(str(v) for v in cov), ch))
-                else:
-                    f.write("    /* %r: no ink */\n" % ch)
-            f.write("    0\n};\n\n")
-            f.write("const struct pfont %s = {\n    .height = %d,\n    .ascent = %d,\n"
-                    "    .glyphs = {\n" % (name, height, ascent))
-            for (ch, adv, xoff, width, _), off in zip(glyphs, offsets):
-                f.write("        { %d, %d, %d, %s_cov + %d },  /* %r */\n" % (adv, xoff, width, name, off, ch))
-            f.write("    },\n};\n")
+        f.write("/*\n * The classic theme's proportional UI fonts, ASCII 32-126 (generated by\n"
+                " * tools/mkfont.py). Rasterised anti-aliased at %dpx (the banner font at %dpx)\n"
+                " * from Liberation Sans, which is licensed under the SIL Open Font License\n"
+                " * 1.1. Each pixel is 4 bits of coverage (0-15), one per byte, row by row.\n"
+                " */\n" % (SANS_PX, BANNER_PX))
+        write_pfonts(f, (("font_classic", SANS, SANS_PX), ("font_classic_bold", SANS_BOLD, SANS_PX),
+                         ("font_banner", SANS_BOLD, BANNER_PX)))
+
+
+def write_archivo(path):
+    with open(path, "w") as f:
+        f.write("/*\n * The Kinetik theme's UI fonts, ASCII 32-126 (generated by tools/mkfont.py),\n"
+                " * rasterised anti-aliased from Archivo, Copyright 2020 The Archivo Project\n"
+                " * Authors (https://github.com/Omnibus-Type/Archivo), licensed under the SIL\n"
+                " * Open Font License 1.1. Each pixel is 4 bits of coverage (0-15), one per\n"
+                " * byte, row by row.\n *\n")
+        for n, _, px, _, style in ARCHIVO_FONTS:
+            f.write(" *   %-20s Archivo %s, %d pixels\n" % (n, style, px))
+        f.write(" */\n")
+        write_pfonts(f, tuple((n, os.path.join(ARCHIVO_DIR, t), px, w) for n, t, px, w, _ in ARCHIVO_FONTS))
 
 
 LIB = "/usr/share/fonts/truetype/liberation/Liberation%s-%s.ttf"
@@ -249,4 +290,5 @@ def write_webfonts(path):
 if __name__ == "__main__":
     write_font8x16("lib/font8x16.c")
     write_sans("user/desktop/font_sans.c")
+    write_archivo("user/desktop/font_archivo.c")
     write_webfonts("rootfs/usr/share/fonts/web.fnt")

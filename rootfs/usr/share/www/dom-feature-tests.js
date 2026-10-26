@@ -108,3 +108,9 @@ test("HTML legacy references distinguish text from attributes", function () {
   var e = document.createElement("div"); e.innerHTML = '<b title="&notit; &copy=1 &copy;">&notit; &copy &NotEqualTilde</b>';
   return [e.textContent, e.firstChild.getAttribute("title")];
 }, ["¬it; © &NotEqualTilde", "&notit; &copy=1 ©"]);
+group("Scrolling boxes");
+test("scrollTo, scroll and scrollBy exist on elements and take numbers or options", function () {
+  var e = document.createElement("div");
+  e.scrollTo(3, 4); e.scroll({ left: 1, top: 2 }); e.scrollBy(1, 1); e.scrollBy({ top: 5 });
+  return [typeof e.scrollTo, typeof e.scroll, typeof e.scrollBy, e.scrollTop >= 0, e.scrollLeft >= 0];
+}, ["function", "function", "function", true, true]);

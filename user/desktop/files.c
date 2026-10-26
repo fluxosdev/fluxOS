@@ -1567,7 +1567,18 @@ static void iv_destroy(struct window *w)
     image_free(w->priv);
 }
 
+/* The picture on a shaded background, in the middle (clipped if too large). */
+static void iv_paint(struct window *w)
+{
+    const struct image *img = w->priv;
+    struct surface *s = &w->content;
+    gfx_fill(s, 0, 0, s->w, s->h, C_SHADOW);
+    gfx_image(s, (s->w - img->w) / 2, (s->h - img->h) / 2, img);
+    wm_damage_client(w, mkrect(0, 0, s->w, s->h));
+}
+
 static const struct window_ops iv_ops = {
+    .restyle = iv_paint,
     .destroy = iv_destroy,
 };
 
@@ -1593,9 +1604,6 @@ struct window *image_view_open(const char *path)
         image_free(img);
         return NULL;
     }
-    struct surface *s = &w->content;
-    gfx_fill(s, 0, 0, cw, ch, C_SHADOW);
-    gfx_image(s, (cw - img->w) / 2, (ch - img->h) / 2, img);    /* clipped if too large */
-    wm_damage_client(w, mkrect(0, 0, cw, ch));
+    iv_paint(w);
     return w;
 }

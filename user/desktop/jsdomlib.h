@@ -436,9 +436,17 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
   def(DP, "hasStorageAccess", function () { return Promise.resolve(true); });
   def(DP, "requestStorageAccess", function () { return Promise.resolve(); });
   def(EP, "requestFullscreen", function () { return Promise.reject(new DOMException("Fullscreen is not supported", "NotSupportedError")); });
-  def(EP, "scroll", function () {});
-  def(EP, "scrollTo", function () {});
-  def(EP, "scrollBy", function () {});
+  def(EP, "scrollTo", function (x, y) {
+    if (x !== null && typeof x === "object") { y = x.top; x = x.left; }
+    if (x !== undefined && x !== null) this.scrollLeft = x;
+    if (y !== undefined && y !== null) this.scrollTop = y;
+  });
+  def(EP, "scroll", EP.scrollTo);
+  def(EP, "scrollBy", function (x, y) {
+    if (x !== null && typeof x === "object") { y = x.top; x = x.left; }
+    if (x) this.scrollLeft = this.scrollLeft + Number(x);
+    if (y) this.scrollTop = this.scrollTop + Number(y);
+  });
   def(EP, "getClientRects", function () { return [this.getBoundingClientRect()]; });
   def(EP, "checkVisibility", function () { var r = this.getBoundingClientRect(); return r.width > 0 || r.height > 0; });
   def(EP, "setPointerCapture", function () {});

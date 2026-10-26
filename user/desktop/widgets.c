@@ -1,10 +1,34 @@
-/* Windows 95 controls: push buttons, caption buttons, radio buttons, text fields. */
+/* Windows 95 controls: push buttons, caption buttons, radio buttons, text fields, scroll bars
+ * (the Kinetik theme draws them flat and rounded, in its colors). */
 #include <string.h>
 #include "desktop.h"
+
+/* Kinetik: a light, softly shaded button with round corners; the default one is outlined in the color. */
+static void kinetik_button(struct surface *s, struct rect r, const char *label, int pressed,
+                           int is_default, int focused)
+{
+    static const int pos[2] = { 0, 256 };
+    color_t up[2] = { ARGB(255, 0xFFFFFF), ARGB(255, 0xE1EAF3) };
+    color_t down[2] = { ARGB(255, 0xD3DFEB), ARGB(255, 0xE6EEF6) };
+    gfx_fill(s, r.x, r.y, r.w, r.h, C_FACE);
+    gfx_gradient(s, r, 4, 4, 2, pressed ? down : up, pos);
+    gfx_round_frame(s, r, 4, 4, ARGB(255, is_default || pressed ? theme.wall2 : sys.edge));
+    if (is_default && !pressed)
+        gfx_round_frame(s, mkrect(r.x + 1, r.y + 1, r.w - 2, r.h - 2), 3, 3, ARGB(96, theme.wall2));
+    int tw = gfx_text_width(&font_sans, label);
+    int tx = r.x + (r.w - tw) / 2, ty = r.y + (r.h - font_sans.height) / 2 + pressed;
+    gfx_text(s, &font_sans, tx, ty, label, C_BLACK);
+    if (focused)
+        gfx_focus_rect(s, mkrect(r.x + 3, r.y + 3, r.w - 6, r.h - 6));
+}
 
 void draw_button(struct surface *s, struct rect r, const char *label, int pressed,
                  int is_default, int focused)
 {
+    if (KINETIK) {
+        kinetik_button(s, r, label, pressed, is_default, focused);
+        return;
+    }
     gfx_fill(s, r.x, r.y, r.w, r.h, C_FACE);
     struct rect b = r;
     if (is_default || pressed) {
@@ -70,8 +94,42 @@ static void draw_art(struct surface *s, int x, int y, const char *const *rows, i
                 gfx_pixel(s, x + i, y + j, c);
 }
 
+/* Kinetik: the glyph alone, in the caption's text color, a glassy patch behind it while held. */
+static void kinetik_title_button(struct surface *s, struct rect r, int glyph, int pressed, int disabled)
+{
+    if (pressed)
+        gfx_round_fill(s, r, 4, 4, ARGB(70, 0xFFFFFF));
+    color_t c = ARGB(disabled ? 90 : 215, theme.on_chrome);
+    int cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+    switch (glyph) {
+    case TB_CLOSE:
+        gfx_line(s, cx - 4, cy - 4, cx + 4, cy + 4, 2, c);
+        gfx_line(s, cx - 4, cy + 4, cx + 4, cy - 4, 2, c);
+        break;
+    case TB_MINIMIZE:
+        gfx_round_fill(s, mkrect(cx - 5, cy + 3, 10, 2), 0, 0, c);
+        break;
+    case TB_RESTORE:                    /* a window in front of another: only the back one's edges that show */
+        gfx_round_fill(s, mkrect(cx - 2, cy - 5, 8, 1), 0, 0, c);
+        gfx_round_fill(s, mkrect(cx + 5, cy - 4, 1, 6), 0, 0, c);
+        gfx_round_fill(s, mkrect(cx - 2, cy - 4, 1, 2), 0, 0, c);
+        gfx_round_fill(s, mkrect(cx + 3, cy + 1, 2, 1), 0, 0, c);
+        gfx_round_frame(s, mkrect(cx - 5, cy - 2, 8, 7), 0, 0, c);
+        gfx_round_fill(s, mkrect(cx - 4, cy - 1, 6, 1), 0, 0, c);
+        break;
+    default:
+        gfx_round_frame(s, mkrect(cx - 5, cy - 4, 10, 9), 0, 0, c);
+        gfx_round_fill(s, mkrect(cx - 4, cy - 3, 8, 1), 0, 0, c);
+        break;
+    }
+}
+
 void draw_title_button(struct surface *s, struct rect r, int glyph, int pressed, int disabled)
 {
+    if (KINETIK) {
+        kinetik_title_button(s, r, glyph, pressed, disabled);
+        return;
+    }
     gfx_fill(s, r.x, r.y, r.w, r.h, C_FACE);
     gfx_bevel(s, r, pressed ? BEVEL_PRESSED : BEVEL_RAISED);
     const char *const *art;
@@ -112,8 +170,14 @@ void draw_title_button(struct surface *s, struct rect r, int glyph, int pressed,
 
 void draw_radio(struct surface *s, int x, int y, const char *label, int checked, int focused)
 {
+    if (KINETIK) {                      /* a white circle outlined, the color's dot in it */
+        gfx_round_fill(s, mkrect(x, y, 12, 12), 6, 6, ARGB(255, 0xFFFFFF));
+        gfx_round_frame(s, mkrect(x, y, 12, 12), 6, 6, ARGB(255, checked ? theme.wall2 : sys.field_edge));
+        if (checked)
+            gfx_round_fill(s, mkrect(x + 3, y + 3, 6, 6), 3, 3, ARGB(255, theme.wall2));
+    }
     /* A 12x12 sunken circle: grey/white outer ring, black/light inner ring. */
-    for (int j = 0; j < 12; j++)
+    for (int j = 0; j < 12 && !KINETIK; j++)
         for (int i = 0; i < 12; i++) {
             int dx = 2 * i - 11, dy = 2 * j - 11, d = dx * dx + dy * dy;
             int upper_left = dx + dy < 0;
@@ -134,8 +198,31 @@ void draw_radio(struct surface *s, int x, int y, const char *label, int checked,
         gfx_focus_rect(s, mkrect(tx - 2, ty, gfx_text_width(&font_sans, label) + 4, font_sans.height + 1));
 }
 
+void draw_tab_edges(struct surface *s, struct rect r, int selected)
+{
+    if (KINETIK) {                      /* rounded at the top, a shade darker unless chosen; open at the bottom */
+        struct rect saved = s->clip;
+        s->clip = rect_intersect(saved, r);
+        if (!selected)
+            gfx_round_fill(s, mkrect(r.x, r.y, r.w, r.h + 4), 3, 0, ARGB(255, gfx_mix(sys.face, sys.edge, 56)));
+        gfx_round_frame(s, mkrect(r.x, r.y, r.w, r.h + 4), 3, 0, ARGB(255, sys.field_edge));
+        s->clip = saved;
+        return;
+    }
+    gfx_hline(s, r.x + 2, r.y, r.w - 4, C_WHITE);
+    gfx_vline(s, r.x, r.y + 2, r.h - 2, C_WHITE);
+    gfx_pixel(s, r.x + 1, r.y + 1, C_WHITE);
+    gfx_vline(s, r.x + r.w - 1, r.y + 2, r.h - 2, C_BLACK);
+    gfx_pixel(s, r.x + r.w - 2, r.y + 1, C_BLACK);
+    gfx_vline(s, r.x + r.w - 2, r.y + 2, r.h - 2, C_SHADOW);
+}
+
 void draw_separator(struct surface *s, int x, int y, int w)
 {
+    if (KINETIK) {
+        gfx_hline(s, x, y, w, RGB(0xBE, 0xCD, 0xDD));
+        return;
+    }
     gfx_hline(s, x, y, w, C_SHADOW);
     gfx_hline(s, x, y + 1, w, C_WHITE);
 }
@@ -167,6 +254,20 @@ void draw_text_field(struct surface *s, struct rect r, const char *text, int cur
 static void sbar_arrow(struct surface *s, struct rect r, int vertical, int second, int enabled,
                        int pressed)
 {
+    if (KINETIK) {                      /* no button: a small triangle, on a patch while held */
+        if (pressed)
+            gfx_round_fill(s, mkrect(r.x + 2, r.y + 2, r.w - 4, r.h - 4), 3, 3, ARGB(255, 0xC9D6E4));
+        int mx = r.x + r.w / 2 - 1, my = r.y + r.h / 2 - 1;
+        color_t col = enabled ? RGB(0x4E, 0x63, 0x7A) : RGB(0xB4, 0xC2, 0xD1);
+        for (int i = 0; i < 4; i++) {
+            int k = second ? i : 3 - i;
+            if (vertical)
+                gfx_hline(s, mx - 3 + k, my - 2 + i, 7 - 2 * k, col);
+            else
+                gfx_vline(s, mx - 2 + i, my - 3 + k, 7 - 2 * k, col);
+        }
+        return;
+    }
     gfx_fill(s, r.x, r.y, r.w, r.h, C_FACE);
     gfx_bevel(s, r, pressed ? BEVEL_PRESSED : BEVEL_RAISED);
     /* A 4-step triangle: `i` steps from the base, the tip being one pixel wide. */
@@ -209,8 +310,9 @@ struct rect sbar_thumb(const struct sbar *b)
 void sbar_draw(struct surface *s, const struct sbar *b, enum sbar_part pressed)
 {
     struct rect r = b->r;
-    gfx_fill(s, r.x, r.y, r.w, r.h, C_FACE);
-    gfx_dither(s, r.x, r.y, r.w, r.h, C_WHITE);
+    gfx_fill(s, r.x, r.y, r.w, r.h, KINETIK ? RGB(0xEB, 0xF1, 0xF7) : C_FACE);
+    if (!KINETIK)
+        gfx_dither(s, r.x, r.y, r.w, r.h, C_WHITE);
     int enabled = sbar_max(b) > 0;
     struct rect a1, a2;
     if (b->vertical) {
@@ -223,7 +325,10 @@ void sbar_draw(struct surface *s, const struct sbar *b, enum sbar_part pressed)
     sbar_arrow(s, a1, b->vertical, 0, enabled, pressed == SBAR_ARROW1);
     sbar_arrow(s, a2, b->vertical, 1, enabled, pressed == SBAR_ARROW2);
     struct rect t = sbar_thumb(b);
-    if (!rect_empty(t)) {
+    if (!rect_empty(t) && KINETIK) {    /* a rounded bar, narrower than the track */
+        struct rect in = b->vertical ? mkrect(t.x + 3, t.y + 1, t.w - 6, t.h - 2) : mkrect(t.x + 1, t.y + 3, t.w - 2, t.h - 6);
+        gfx_round_fill(s, in, 4, 4, ARGB(255, pressed == SBAR_THUMB ? 0x93A9C1 : 0xB2C3D6));
+    } else if (!rect_empty(t)) {
         gfx_fill(s, t.x, t.y, t.w, t.h, C_FACE);
         gfx_bevel(s, t, BEVEL_RAISED);
     }

@@ -390,12 +390,7 @@ static void draw_tabs(struct tmgr *t, struct surface *s)
                 continue;
             struct rect r = tab_rect(t, i);
             gfx_fill(s, r.x, r.y, r.w, r.h + (i == t->tab ? 1 : 0), C_FACE);
-            gfx_hline(s, r.x + 2, r.y, r.w - 4, C_WHITE);
-            gfx_vline(s, r.x, r.y + 2, r.h - 2, C_WHITE);
-            gfx_pixel(s, r.x + 1, r.y + 1, C_WHITE);
-            gfx_vline(s, r.x + r.w - 1, r.y + 2, r.h - 2, C_BLACK);
-            gfx_vline(s, r.x + r.w - 2, r.y + 2, r.h - 2, C_SHADOW);
-            gfx_pixel(s, r.x + r.w - 2, r.y + 1, C_BLACK);
+            draw_tab_edges(s, r, i == t->tab);
             int tw = gfx_text_width(&font_sans, tab_names[i]);
             gfx_text(s, &font_sans, r.x + (r.w - tw) / 2, r.y + (TAB_H - font_sans.height) / 2 + 1,
                      tab_names[i], C_BLACK);

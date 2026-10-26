@@ -26,6 +26,10 @@
 #define MENU_SEP_H   8
 #define SUB_ITEM_H   24         /* items of a cascading menu: 16 pixel icons */
 #define BANNER_W     21
+#define KHEAD        46         /* Kinetik: the Start menu's heading */
+#define SHADOW_BLUR  12         /* Kinetik: the shadow under frames and menus */
+#define SHADOW_DY    5
+#define SHADOW_COLOR ARGB(0x48, 0x020B19)
 
 struct surface screen;
 int screen_w, screen_h;
@@ -312,6 +316,20 @@ static int ctx_hover = -1;
 static int ctx_x, ctx_y;
 static int ctx_icon = -1;               /* the icon the menu was opened on */
 
+/* What a frame or menu covers, its shadow included. */
+static struct rect shadowed(struct rect r)
+{
+    if (!KINETIK)
+        return r;
+    return mkrect(r.x - SHADOW_BLUR, r.y - SHADOW_BLUR + SHADOW_DY, r.w + 2 * SHADOW_BLUR, r.h + 2 * SHADOW_BLUR);
+}
+
+/* The Start menu's labels: larger in Kinetik. */
+static const struct pfont *menu_font(void)
+{
+    return KINETIK ? &font_archivo_title : &font_sans;
+}
+
 static int ctx_item_height(int i)
 {
     return ctx_items[i].label ? CTX_ITEM_H : CTX_SEP_H;
@@ -359,7 +377,7 @@ static int ctx_hit(int x, int y)
 static void set_ctx(const struct ctx_item *items, int n, int x, int y, int icon)
 {
     if (ctx_open)
-        wm_damage(ctx_rect());
+        wm_damage(shadowed(ctx_rect()));
     ctx_open = items != NULL;
     ctx_hover = -1;
     if (items) {
@@ -368,7 +386,7 @@ static void set_ctx(const struct ctx_item *items, int n, int x, int y, int icon)
         ctx_x = x;
         ctx_y = y;
         ctx_icon = icon;
-        wm_damage(ctx_rect());
+        wm_damage(shadowed(ctx_rect()));
     }
 }
 
@@ -412,6 +430,9 @@ static struct rect taskbar_rect(void)
 
 static struct rect start_button_rect(void)
 {
+    if (KINETIK)
+        return mkrect(4, screen_h - TASKBAR_H + 3, 8 + 16 + 6 + gfx_text_width(&font_archivo_start, "Start") + 12,
+                      TASKBAR_H - 6);
     return mkrect(2, screen_h - TASKBAR_H + 4, 54, 22);
 }
 
@@ -420,13 +441,13 @@ static struct rect tray_rect(void)
     int w = gfx_text_width(&font_sans, "88:88 PM") + 18;
     if (sound_tray_icon() != ICON_NONE)
         w += 20;                        /* the speaker */
-    return mkrect(screen_w - 2 - w, screen_h - TASKBAR_H + 4, w, 22);
+    return mkrect(screen_w - 2 - w, screen_h - TASKBAR_H + 4, w, TASKBAR_H - 8);
 }
 
 static struct rect tray_icon_rect(void)
 {
     struct rect tr = tray_rect();
-    return mkrect(tr.x + 3, tr.y + 3, 16, 16);
+    return mkrect(tr.x + 3, tr.y + (tr.h - 16) / 2, 16, 16);
 }
 
 void wm_tray_changed(void)
@@ -440,12 +461,13 @@ static int ntasks;
 
 static struct rect task_button_rect(int i)
 {
-    int x0 = 60, x1 = tray_rect().x - 4;
+    struct rect sb = start_button_rect();
+    int x0 = sb.x + sb.w + (KINETIK ? 10 : 4), x1 = tray_rect().x - 4, gap = KINETIK ? 5 : 3;
     int n = ntasks ? ntasks : 1;
-    int w = (x1 - x0 - (n - 1) * 3) / n;
-    if (w > 160)
-        w = 160;
-    return mkrect(x0 + i * (w + 3), screen_h - TASKBAR_H + 4, w, 22);
+    int w = (x1 - x0 - (n - 1) * gap) / n;
+    if (w > (KINETIK ? 180 : 160))
+        w = KINETIK ? 180 : 160;
+    return mkrect(x0 + i * (w + gap), screen_h - TASKBAR_H + 4, w, TASKBAR_H - 8);
 }
 
 static int menu_item_height(int i)
@@ -453,18 +475,21 @@ static int menu_item_height(int i)
     return menu_items[i].label ? MENU_ITEM_H : MENU_SEP_H;
 }
 
+/* Classic: a banner down the left, items beside it. Kinetik: a heading across the top, items below. */
 static struct rect menu_rect(void)
 {
-    int h = 6;
+    int h = KINETIK ? KHEAD + 12 : 6;
     int tw = 0;
     for (int i = 0; i < NMENU; i++) {
         h += menu_item_height(i);
         if (menu_items[i].label) {
-            int w = gfx_text_width(&font_sans, menu_items[i].label);
+            int w = gfx_text_width(menu_font(), menu_items[i].label);
             if (w > tw)
                 tw = w;
         }
     }
+    if (KINETIK)
+        return mkrect(4, screen_h - TASKBAR_H - h - 2, 12 + 32 + 12 + tw + 40, h);
     int w = 6 + BANNER_W + 4 + 32 + 10 + tw + 24;
     return mkrect(2, screen_h - TASKBAR_H - h + 2, w, h);
 }
@@ -472,9 +497,11 @@ static struct rect menu_rect(void)
 static struct rect menu_item_rect(int idx)
 {
     struct rect m = menu_rect();
-    int y = m.y + 3;
+    int y = KINETIK ? m.y + KHEAD + 6 : m.y + 3;
     for (int i = 0; i < idx; i++)
         y += menu_item_height(i);
+    if (KINETIK)
+        return mkrect(m.x + 6, y, m.w - 12, menu_item_height(idx));
     return mkrect(m.x + 3 + BANNER_W, y, m.w - 6 - BANNER_W, menu_item_height(idx));
 }
 
@@ -488,18 +515,20 @@ static struct rect sub_rect(int p)
         if (w > tw)
             tw = w;
     }
-    int w = 6 + 4 + 16 + 8 + tw + 20, h = 6 + it->nsub * SUB_ITEM_H;
+    int pad = KINETIK ? 4 : 3;
+    int w = 2 * pad + 4 + 16 + 8 + tw + 20, h = 2 * pad + it->nsub * SUB_ITEM_H;
     struct rect m = menu_rect(), r = menu_item_rect(p);
-    int y = r.y - 3;
+    int y = r.y - pad;
     if (y + h > screen_h - TASKBAR_H + 2)
         y = screen_h - TASKBAR_H + 2 - h;
-    return mkrect(m.x + m.w - 3, y, w, h);
+    return mkrect(m.x + m.w - (KINETIK ? 2 : 3), y, w, h);
 }
 
 static struct rect sub_item_rect(int p, int j)
 {
     struct rect m = sub_rect(p);
-    return mkrect(m.x + 3, m.y + 3 + j * SUB_ITEM_H, m.w - 6, SUB_ITEM_H);
+    int pad = KINETIK ? 4 : 3;
+    return mkrect(m.x + pad, m.y + pad + j * SUB_ITEM_H, m.w - 2 * pad, SUB_ITEM_H);
 }
 
 static struct rect desk_icon_rect(int i)
@@ -557,12 +586,13 @@ static void place_icon(int i)
 
 static struct rect caption_rect(struct window *w)
 {
-    return mkrect(w->r.x + 3, w->r.y + 3, w->r.w - 6, TITLE_H);
+    int in = theme.cap_inset;
+    return mkrect(w->r.x + in, w->r.y + in, w->r.w - 2 * in, TITLE_H);
 }
 
 struct rect wm_client_rect(struct window *w)
 {
-    return mkrect(w->r.x + BORDER, w->r.y + 3 + TITLE_H + 1, w->content.w, w->content.h);
+    return mkrect(w->r.x + BORDER, w->r.y + FRAME_TOP, w->content.w, w->content.h);
 }
 
 static int resizable(const struct window *w)
@@ -580,18 +610,19 @@ static int button_disabled(const struct window *w, int kind)
 static int title_buttons(struct window *w, struct rect *rects, int *kinds)
 {
     struct rect c = caption_rect(w);
-    int x = c.x + c.w - 2 - 16, y = c.y + 2, n = 0;
-    rects[n] = mkrect(x, y, 16, 14);
+    int bw = KINETIK ? 22 : 16, bh = KINETIK ? 20 : 14, gap = KINETIK ? 1 : 2;
+    int x = c.x + c.w - (KINETIK ? 6 : 2) - bw, y = c.y + (TITLE_H - bh) / 2, n = 0;
+    rects[n] = mkrect(x, y, bw, bh);
     kinds[n++] = TB_CLOSE;
-    x -= 2;
+    x -= gap;
     if (w->flags & WF_MAXIMIZE) {
-        x -= 16;
-        rects[n] = mkrect(x, y, 16, 14);
+        x -= bw;
+        rects[n] = mkrect(x, y, bw, bh);
         kinds[n++] = w->maximized ? TB_RESTORE : TB_MAXIMIZE;
     }
     if (w->flags & WF_MINIMIZE) {
-        x -= 16;
-        rects[n] = mkrect(x, y, 16, 14);
+        x -= bw;
+        rects[n] = mkrect(x, y, bw, bh);
         kinds[n++] = TB_MINIMIZE;
     }
     return n;
@@ -1024,11 +1055,207 @@ static void draw_desktop(void)
     }
 }
 
+/* ---- the Kinetik theme's chrome ---- */
+
+static void draw_menu_arrow(int x, int y, color_t c);
+
+/* A caption or taskbar's three colors, dimmed for a window that is not active. */
+static void chrome_colors(int active, color_t *c)
+{
+    c[0] = theme.chrome0, c[1] = theme.chrome1, c[2] = theme.chrome2;
+    if (!active)
+        for (int i = 0; i < 3; i++)
+            c[i] = gfx_mix(c[i], RGB(0xD3, 0xDC, 0xE6), 176);
+}
+
+/* The chrome's gradient down r: top corners rounded by rt. */
+static void chrome_fill(struct rect r, int rt, int rb, const color_t *c)
+{
+    static const int pos[3] = { 0, 115, 256 };
+    color_t argb[3] = { ARGB(255, c[0]), ARGB(255, c[1]), ARGB(255, c[2]) };
+    gfx_gradient(&screen, r, rt, rb, 3, argb, pos);
+}
+
+/* A glassy button on the chrome, or (pressed) a hollow one. */
+static void glass(struct rect r, int rad, int pressed)
+{
+    static const int pos[3] = { 0, 154, 256 };
+    if (pressed) {
+        static const int p2[2] = { 0, 256 };
+        color_t c[2] = { ARGB(255, theme.stroke), ARGB(255, theme.chrome1) };
+        gfx_gradient(&screen, r, rad, rad, 2, c, p2);
+    } else {
+        color_t c[3] = { ARGB(48, 0xFFFFFF), ARGB(13, 0xFFFFFF), ARGB(20, 0x132C4B) };
+        gfx_gradient(&screen, r, rad, rad, 3, c, pos);
+    }
+    gfx_round_frame(&screen, r, rad, rad, ARGB(255, theme.stroke));
+}
+
+/* The pale surface of menus, under a shadow, outlined in ink. */
+static void menu_surface(struct rect m)
+{
+    static const int pos[2] = { 0, 256 };
+    static const color_t c[2] = { ARGB(255, 0xFFFFFF), ARGB(255, 0xE4EDF6) };
+    gfx_shadow(&screen, m, 7, SHADOW_DY, SHADOW_BLUR, SHADOW_COLOR);
+    gfx_gradient(&screen, m, 7, 7, 2, c, pos);
+    gfx_round_frame(&screen, m, 7, 7, ARGB(255, theme.ink));
+}
+
+/* A highlighted menu item. */
+static void menu_hot(struct rect r)
+{
+    gfx_round_fill(&screen, r, 3, 3, ARGB(255, theme.pale));
+    gfx_round_frame(&screen, r, 3, 3, ARGB(255, theme.wall2));
+}
+
+static void draw_window_kinetik(struct window *w)
+{
+    struct rect r = w->r, cl = wm_client_rect(w), cap = caption_rect(w);
+    int active = w == focused, rt = w->maximized ? 0 : theme.radius, rb = w->maximized ? 0 : 3;
+    color_t c[3];
+    chrome_colors(active, c);
+    if (!w->maximized)
+        gfx_shadow(&screen, r, rt, SHADOW_DY, SHADOW_BLUR, SHADOW_COLOR);
+    /* The frame round the client area is the caption's last color; the caption runs down to it. */
+    gfx_round_fill(&screen, r, rt, rb, ARGB(255, c[2]));
+    chrome_fill(mkrect(r.x, r.y, r.w, theme.cap_inset + TITLE_H), rt, 0, c);
+    gfx_round_fill(&screen, mkrect(r.x + rt, r.y + 1, r.w - 2 * rt, 1), 0, 0, ARGB(64, 0xFFFFFF));
+    gfx_round_frame(&screen, r, rt, rb, ARGB(255, active ? theme.stroke : gfx_mix(theme.stroke, 0x9AA9B9, 176)));
+
+    color_t text = active ? theme.on_chrome : RGB(0x5A, 0x6C, 0x80);
+    if (w->icon_img)
+        gfx_image(&screen, cap.x + 7, cap.y + (TITLE_H - 16) / 2, w->icon_img);
+    else
+        draw_icon(&screen, cap.x + 7, cap.y + (TITLE_H - 16) / 2, w->icon, 16);
+    struct rect br[3];
+    int kinds[3];
+    int nb = title_buttons(w, br, kinds);
+    /* The title in the middle of the caption, as far as the icon and buttons leave room. */
+    const struct pfont *f = theme.title_font;
+    int left = cap.x + 28, right = br[nb - 1].x - 6;
+    char title[64];
+    gfx_ellipsize(f, w->title, right - left, title, sizeof(title));
+    int tw = gfx_text_width(f, title), tx = cap.x + (cap.w - tw) / 2;
+    if (tx + tw > right)
+        tx = right - tw;
+    if (tx < left)
+        tx = left;
+    gfx_text(&screen, f, tx, cap.y + (TITLE_H - f->height) / 2, title, text);
+    for (int i = 0; i < nb; i++) {
+        int pushed = drag == DRAG_TITLE_BUTTON && drag_win == w && drag_button == kinds[i] && drag_pressed;
+        draw_title_button(&screen, br[i], kinds[i], pushed, button_disabled(w, kinds[i]));
+    }
+    gfx_blit(&screen, cl.x, cl.y, &w->content, 0, 0, cl.w, cl.h);
+}
+
+static void draw_taskbar_kinetik(void)
+{
+    struct rect tb = taskbar_rect();
+    color_t c[3];
+    chrome_colors(1, c);
+    chrome_fill(tb, 0, 0, c);
+    gfx_hline(&screen, tb.x, tb.y, tb.w, theme.stroke);
+    gfx_hline(&screen, tb.x, tb.y + 1, tb.w, gfx_mix(theme.chrome0, 0xFFFFFF, 72));
+
+    struct rect sb = start_button_rect();
+    glass(sb, 6, menu_open);
+    draw_icon(&screen, sb.x + 8, sb.y + (sb.h - 16) / 2, ICON_FLUX, 16);
+    gfx_text(&screen, &font_archivo_start, sb.x + 30, sb.y + (sb.h - font_archivo_start.height) / 2, "Start",
+             theme.on_chrome);
+
+    for (int i = 0; i < ntasks; i++) {
+        struct window *w = task_order[i];
+        struct rect b = task_button_rect(i);
+        int active = (w == focused && !w->minimized) || task_pressed_idx == i;
+        glass(b, 3, active);
+        if (w->icon_img)
+            gfx_image(&screen, b.x + 7, b.y + (b.h - 16) / 2, w->icon_img);
+        else
+            draw_icon(&screen, b.x + 7, b.y + (b.h - 16) / 2, w->icon, 16);
+        char label[64];
+        gfx_ellipsize(&font_sans, w->title, b.w - 34, label, sizeof(label));
+        gfx_text(&screen, &font_sans, b.x + 29, b.y + (b.h - font_sans.height) / 2, label, theme.on_chrome);
+    }
+
+    struct rect tr = tray_rect();
+    enum icon_id speaker = sound_tray_icon();
+    if (speaker != ICON_NONE) {
+        struct rect ir = tray_icon_rect();
+        draw_icon(&screen, ir.x, ir.y, speaker, 16);
+    }
+    int cw = gfx_text_width(&font_sans, clock_text);
+    gfx_text(&screen, &font_sans, tr.x + tr.w - 9 - cw, tr.y + (tr.h - font_sans.height) / 2, clock_text,
+             theme.on_chrome);
+}
+
+static void draw_start_menu_kinetik(void)
+{
+    struct rect m = menu_rect();
+    if (rect_overlaps(shadowed(m), screen.clip)) {
+        menu_surface(m);
+        color_t c[3];
+        chrome_colors(1, c);
+        chrome_fill(mkrect(m.x + 1, m.y + 1, m.w - 2, KHEAD), 6, 0, c);
+        gfx_text(&screen, &font_archivo_large, m.x + 16, m.y + 1 + (KHEAD - font_archivo_large.height) / 2, "fluxOS",
+                 theme.on_chrome);
+        const struct pfont *f = menu_font();
+        for (int i = 0; i < NMENU; i++) {
+            struct rect r = menu_item_rect(i);
+            if (!menu_items[i].label) {
+                gfx_hline(&screen, r.x + 8, r.y + r.h / 2, r.w - 16, RGB(0xBE, 0xCD, 0xDD));
+                continue;
+            }
+            if (i == menu_hover || i == menu_sub)
+                menu_hot(r);
+            draw_icon(&screen, r.x + 6, r.y + 2, menu_items[i].icon, 32);
+            gfx_text(&screen, f, r.x + 6 + 32 + 12, r.y + (r.h - f->height) / 2, menu_items[i].label, theme.ink);
+            if (menu_items[i].sub)
+                draw_menu_arrow(r.x + r.w - 14, r.y + r.h / 2, theme.ink);
+        }
+    }
+    if (menu_sub >= 0) {
+        struct rect sm = sub_rect(menu_sub);
+        menu_surface(sm);
+        const struct menu_item *it = &menu_items[menu_sub];
+        for (int j = 0; j < it->nsub; j++) {
+            struct rect r = sub_item_rect(menu_sub, j);
+            if (j == sub_hover)
+                menu_hot(r);
+            draw_icon(&screen, r.x + 4, r.y + (r.h - 16) / 2, it->sub[j].icon, 16);
+            gfx_text(&screen, &font_sans, r.x + 4 + 16 + 8, r.y + (r.h - font_sans.height) / 2,
+                     it->sub[j].label, theme.ink);
+        }
+    }
+}
+
+static void draw_ctx_menu_kinetik(void)
+{
+    struct rect m = ctx_rect();
+    menu_surface(m);
+    for (int i = 0; i < ctx_n; i++) {
+        struct rect r = ctx_item_rect(i);
+        if (!ctx_items[i].label) {
+            gfx_hline(&screen, r.x + 6, r.y + r.h / 2, r.w - 12, RGB(0xBE, 0xCD, 0xDD));
+            continue;
+        }
+        if (i == ctx_hover)
+            menu_hot(r);
+        if (ctx_items[i].icon != ICON_NONE)
+            draw_icon(&screen, r.x + 4, r.y + (r.h - 16) / 2, ctx_items[i].icon, 16);
+        gfx_text(&screen, &font_sans, r.x + 4 + 16 + 8, r.y + (r.h - font_sans.height) / 2,
+                 ctx_items[i].label, theme.ink);
+    }
+}
+
 static void draw_window(struct window *w)
 {
     struct rect r = w->r;
-    if (!rect_overlaps(r, screen.clip))
+    if (!rect_overlaps(KINETIK ? shadowed(r) : r, screen.clip))
         return;
+    if (KINETIK) {
+        draw_window_kinetik(w);
+        return;
+    }
     struct rect cl = wm_client_rect(w);
 
     /* Frame face around the client, then the bevel and caption. */
@@ -1067,6 +1294,10 @@ static void draw_taskbar(void)
     struct rect tb = taskbar_rect();
     if (!rect_overlaps(tb, screen.clip))
         return;
+    if (KINETIK) {
+        draw_taskbar_kinetik();
+        return;
+    }
     gfx_fill(&screen, tb.x, tb.y, tb.w, tb.h, C_FACE);
     gfx_hline(&screen, tb.x, tb.y, tb.w, C_LIGHT);
     gfx_hline(&screen, tb.x, tb.y + 1, tb.w, C_WHITE);
@@ -1121,8 +1352,13 @@ static void draw_menu_arrow(int x, int y, color_t c)
 static void draw_start_menu(void)
 {
     struct rect m = menu_rect();
-    if (!rect_overlaps(m, screen.clip) && (menu_sub < 0 || !rect_overlaps(sub_rect(menu_sub), screen.clip)))
+    if (!rect_overlaps(shadowed(m), screen.clip) &&
+        (menu_sub < 0 || !rect_overlaps(shadowed(sub_rect(menu_sub)), screen.clip)))
         return;
+    if (KINETIK) {
+        draw_start_menu_kinetik();
+        return;
+    }
     gfx_fill(&screen, m.x, m.y, m.w, m.h, C_FACE);
     gfx_bevel(&screen, m, BEVEL_WINDOW);
 
@@ -1169,8 +1405,12 @@ static void draw_start_menu(void)
 static void draw_ctx_menu(void)
 {
     struct rect m = ctx_rect();
-    if (!rect_overlaps(m, screen.clip))
+    if (!rect_overlaps(shadowed(m), screen.clip))
         return;
+    if (KINETIK) {
+        draw_ctx_menu_kinetik();
+        return;
+    }
     gfx_fill(&screen, m.x, m.y, m.w, m.h, C_FACE);
     gfx_bevel(&screen, m, BEVEL_WINDOW);
     for (int i = 0; i < ctx_n; i++) {
@@ -1274,7 +1514,7 @@ struct window *wm_create(const char *title, enum icon_id icon, int client_w, int
     w->priv = priv;
     w->min_w = 200;
     w->min_h = 120;
-    w->r = mkrect(0, 0, client_w + 2 * BORDER, client_h + 3 + TITLE_H + 1 + BORDER);
+    w->r = mkrect(0, 0, client_w + 2 * BORDER, client_h + FRAME_TOP + BORDER);
 
     struct window **pp = &bottom;
     while (*pp)
@@ -1312,7 +1552,7 @@ static struct window *topmost_visible(void)
 
 void wm_destroy(struct window *w)
 {
-    wm_damage(w->flags & WF_MODAL ? mkrect(0, 0, screen_w, screen_h) : w->r);
+    wm_damage(w->flags & WF_MODAL ? mkrect(0, 0, screen_w, screen_h) : shadowed(w->r));
     unlink_window(w);
     for (int i = 0; i < ntasks; i++) {
         if (task_order[i] == w) {
@@ -1353,7 +1593,7 @@ void wm_focus(struct window *w)
             while (*pp)
                 pp = &(*pp)->above;
             *pp = w;
-            wm_damage(w->r);
+            wm_damage(shadowed(w->r));
         }
     }
     if (old == w)
@@ -1365,7 +1605,7 @@ void wm_focus(struct window *w)
             old->ops->focus(old, 0);
     }
     if (w) {
-        wm_damage(w->r);
+        wm_damage(shadowed(w->r));
         if (w->ops && w->ops->focus)
             w->ops->focus(w, 1);
     }
@@ -1382,7 +1622,7 @@ struct window *wm_focused(void)
 static void minimize(struct window *w)
 {
     w->minimized = 1;
-    wm_damage(w->r);
+    wm_damage(shadowed(w->r));
     if (focused == w) {
         focused = NULL;
         if (w->ops && w->ops->focus)
@@ -1396,10 +1636,10 @@ static void minimize(struct window *w)
 
 static void move_window(struct window *w, int x, int y)
 {
-    wm_damage(w->r);
+    wm_damage(shadowed(w->r));
     w->r.x = x;
     w->r.y = y;
-    wm_damage(w->r);
+    wm_damage(shadowed(w->r));
 }
 
 static int set_frame(struct window *w, struct rect r);
@@ -1413,7 +1653,7 @@ int wm_resize_client(struct window *w, int client_w, int client_h)
 {
     struct rect r = w->r;
     r.w = client_w + 2 * BORDER;
-    r.h = client_h + 3 + TITLE_H + 1 + BORDER;
+    r.h = client_h + FRAME_TOP + BORDER;
     if (r.x + r.w > screen_w)
         r.x = screen_w > r.w ? screen_w - r.w : 0;
     if (r.y + r.h > screen_h - TASKBAR_H)
@@ -1452,7 +1692,7 @@ void wm_set_min_size(struct window *w, int client_w, int client_h)
  */
 static int set_frame(struct window *w, struct rect r)
 {
-    int cw = r.w - 2 * BORDER, ch = r.h - (3 + TITLE_H + 1 + BORDER);
+    int cw = r.w - 2 * BORDER, ch = r.h - (FRAME_TOP + BORDER);
     if (cw < 1 || ch < 1)
         return -1;
     struct rect old = w->r;
@@ -1469,8 +1709,8 @@ static int set_frame(struct window *w, struct rect r)
     } else {
         w->r = r;
     }
-    wm_damage(old);
-    wm_damage(w->r);
+    wm_damage(shadowed(old));
+    wm_damage(shadowed(w->r));
     return 0;
 }
 
@@ -1488,6 +1728,114 @@ static void toggle_maximize(struct window *w)
         w->restore = from;
     w->maximized = !w->maximized;
     wm_damage(caption_rect(w));
+}
+
+/* ---- a sample of the theme, for Display Properties ---- */
+
+static void sample_noop(struct window *w)
+{
+    (void)w;
+}
+
+static const struct window_ops sample_ops = { .resize = sample_noop };
+
+/* A window's client area in the sample: a line of text and a button. */
+static void sample_client(struct window *w, const char *text, int button)
+{
+    struct surface *c = &w->content;
+    gfx_fill(c, 0, 0, c->w, c->h, C_FACE);
+    gfx_text(c, &font_sans, 8, 8, text, C_BLACK);
+    if (button)
+        draw_button(c, mkrect(8, c->h - 31, 75, 23), "OK", 0, 1, 0);
+}
+
+void wm_draw_sample(struct surface *s, struct rect r)
+{
+    struct rect cl = rect_intersect(s->clip, r);
+    if (rect_empty(cl))
+        return;
+    /* Draw as if r were the screen: the scene's own code, on a view of s. */
+    struct surface saved = screen;
+    int saved_w = screen_w, saved_h = screen_h, saved_tasks = ntasks, saved_menu = menu_open;
+    int saved_pressed = task_pressed_idx;
+    struct window *saved_focus = focused;
+    screen.px = s->px + r.y * s->stride + r.x;
+    screen.w = screen_w = r.w;
+    screen.h = screen_h = r.h;
+    screen.stride = s->stride;
+    screen.clip = mkrect(cl.x - r.x, cl.y - r.y, cl.w, cl.h);
+    ntasks = 0;
+    menu_open = 0;
+    task_pressed_idx = -1;
+
+    struct window back = { 0 }, front = { 0 };
+    int bw = r.w * 11 / 20, fw = r.w * 3 / 5, top = r.h - TASKBAR_H;
+    snprintf(back.title, sizeof(back.title), "Inactive window");
+    back.icon = ICON_FOLDER;
+    back.flags = WF_MINIMIZE | WF_MAXIMIZE;
+    back.ops = &sample_ops;
+    snprintf(front.title, sizeof(front.title), "Active window");
+    front.icon = ICON_DISPLAY;
+    front.flags = WF_MINIMIZE | WF_MAXIMIZE;
+    front.ops = &sample_ops;
+    int bh = top * 11 / 20, fh = top * 3 / 4;
+    if (surface_init(&back.content, bw - 2 * BORDER, bh - FRAME_TOP - BORDER) == 0 &&
+        surface_init(&front.content, fw - 2 * BORDER, fh - FRAME_TOP - BORDER) == 0) {
+        back.r = mkrect(r.w - bw - 10, 10, bw, bh);
+        front.r = mkrect(12, top - fh - 8, fw, fh);
+        sample_client(&back, "Window text", 0);
+        sample_client(&front, "Window text", 1);
+        focused = &front;
+        draw_window(&back);
+        draw_window(&front);
+    }
+    surface_free(&back.content);
+    surface_free(&front.content);
+    draw_taskbar();
+
+    screen = saved;
+    screen_w = saved_w;
+    screen_h = saved_h;
+    ntasks = saved_tasks;
+    menu_open = saved_menu;
+    task_pressed_idx = saved_pressed;
+    focused = saved_focus;
+}
+
+/* What the frame adds to the client area, across and down, in the theme the frames were made for. */
+static int frame_dw, frame_dh;
+
+void wm_restyle(void)
+{
+    int dw = 2 * BORDER, dh = FRAME_TOP + BORDER;
+    for (struct window *w = bottom; w; w = w->above) {
+        int cw = w->content.w, ch = w->content.h;
+        if (w->maximized) {             /* still filling the screen above the taskbar */
+            w->restore.w += dw - frame_dw;
+            w->restore.h += dh - frame_dh;
+            set_frame(w, mkrect(0, 0, screen_w, screen_h - TASKBAR_H));
+        } else {
+            w->r.w = cw + dw;
+            w->r.h = ch + dh;
+        }
+        if (w->ops && w->ops->restyle) {
+            w->ops->restyle(w);
+        } else if (w->ops && w->ops->resize) {
+            gfx_fill(&w->content, 0, 0, w->content.w, w->content.h, C_FACE);
+            w->ops->resize(w);
+        } else if (w->ops && w->ops->focus) {
+            w->ops->focus(w, w == focused);
+        }
+    }
+    frame_dw = dw;
+    frame_dh = dh;
+    /* A taller taskbar may cover icons in the bottom row: lay them out again. */
+    for (int i = 0; i < NDESK; i++)
+        if (desk_icons[i].y + ICON_CELL_H > screen_h - TASKBAR_H) {
+            arrange_icons();
+            break;
+        }
+    wm_damage(mkrect(0, 0, screen_w, screen_h));
 }
 
 void wm_set_title(struct window *w, const char *title)
@@ -1544,10 +1892,10 @@ static void set_menu(int open)
         return;
     struct rect m = menu_rect();
     if (menu_sub >= 0)
-        wm_damage(sub_rect(menu_sub));
+        wm_damage(shadowed(sub_rect(menu_sub)));
     menu_open = open;
     menu_hover = menu_sub = sub_hover = -1;
-    wm_damage(m);
+    wm_damage(shadowed(m));
     wm_damage(start_button_rect());
 }
 
@@ -1618,13 +1966,13 @@ static void set_menu_sub(int p)
     if (p == menu_sub)
         return;
     if (menu_sub >= 0) {
-        wm_damage(sub_rect(menu_sub));
+        wm_damage(shadowed(sub_rect(menu_sub)));
         wm_damage(menu_item_rect(menu_sub));
     }
     menu_sub = p;
     sub_hover = -1;
     if (p >= 0) {
-        wm_damage(sub_rect(p));
+        wm_damage(shadowed(sub_rect(p)));
         wm_damage(menu_item_rect(p));
     }
 }
@@ -1718,7 +2066,7 @@ static struct rect resized_frame(void)
     struct window *w = drag_win;
     struct rect s = drag_start;
     int dx = mx - drag_mx, dy = my - drag_my;
-    int min_w = w->min_w + 2 * BORDER, min_h = w->min_h + 3 + TITLE_H + 1 + BORDER;
+    int min_w = w->min_w + 2 * BORDER, min_h = w->min_h + FRAME_TOP + BORDER;
     int l = s.x, r = s.x + s.w, t = s.y, b = s.y + s.h;
     if (drag_edges & E_L)
         l = s.x + dx < 0 ? 0 : s.x + dx;
@@ -2395,6 +2743,9 @@ int wm_reconfigure(void)
 
 void wm_init(void)
 {
+    theme_init();
+    frame_dw = 2 * BORDER;
+    frame_dh = FRAME_TOP + BORDER;
     if (fbinfo(&fbi) < 0) {
         perror("desktop: no framebuffer");
         exit(1);

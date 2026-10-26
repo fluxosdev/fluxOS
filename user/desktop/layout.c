@@ -100,6 +100,8 @@ struct lctx {
 
 static unsigned layout_gen;
 static int len_px(struct len l, int base);
+static int bg_picture_wanted(const struct style *st);
+static void bg_picture_finish(struct lctx *c, struct node *n, int slot);
 
 static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw, int force_bw,
                             int *mb, int *bg_slot);
@@ -158,7 +160,7 @@ static void add_hotspot(struct lctx *c, struct hotspot **arr, int *n, int *cap, 
     if (!na)
         return;
     *arr = na;
-    (*arr)[(*n)++] = (struct hotspot){ x, y, w, h, node, 0 };
+    (*arr)[(*n)++] = (struct hotspot){ x, y, w, h, node, 0, 0 };
 }
 
 static void add_anchor(struct lctx *c, const char *name, int y)
@@ -327,6 +329,174 @@ void layout_dyn_offset(const struct layout *lo, int dyn, int sx, int sy, int *dx
     *dy = oy;
 }
 
+/* ---- boxes that clip and scroll ---- */
+
+struct sbrange {                /* what a box holds, as ranges of the output (a box's own borders are outside) */
+    int i0, i1, l0, l1, k0, k1;
+};
+
+/* An item (or hotspot) tag joins the box idx: if it is in an inner box already, that one is inside idx now. */
+static void sb_adopt(struct layout *lo, uint16_t *tag, int idx)
+{
+    if (!*tag) {
+        *tag = (uint16_t)(idx + 1);
+        return;
+    }
+    int k = *tag - 1, depth = 0;
+    while (lo->sb[k].parent && depth++ < 64)
+        k = lo->sb[k].parent - 1;
+    if (k != idx)
+        lo->sb[k].parent = (uint16_t)(idx + 1);
+}
+
+/*
+ * A box with overflow other than visible: its contents (the ranges r) are clipped to its padding box
+ * and, with overflow auto or scroll, scrolled. (x, y, w, h) is its border box; the box itself, its
+ * borders and its shadow stay put. How far they overflow is learned once everything is in place.
+ */
+static void sbox_register(struct lctx *c, struct node *n, int x, int y, int w, int h,
+                          const struct sbrange *r, int nr)
+{
+    struct layout *lo = c->lo;
+    const struct style *st = n->style;
+    if (!st->clips || c->measuring || !lo->sb || lo->nsb >= MAX_SBOX || !n->parent || n->tag == T_BODY ||
+        n->tag == T_HTML)
+        return;
+    int px = x + st->border_w[3], py = y + st->border_w[0];
+    int pw = w - st->border_w[3] - st->border_w[1], ph = h - st->border_w[0] - st->border_w[2];
+    if (pw <= 0 || ph <= 0)
+        return;
+    int idx = lo->nsb++;
+    struct sbox *b = &lo->sb[idx];
+    memset(b, 0, sizeof(*b));
+    b->x = px, b->y = py, b->w = pw, b->h = ph;
+    b->ov_x = st->ov_x, b->ov_y = st->ov_y;
+    b->node = n;
+    for (int k = 0; k < nr; k++) {
+        for (int i = r[k].i0; i < r[k].i1 && i < lo->nitems; i++) {
+            struct ditem *it = &lo->items[i];
+            if (it->dyn && under_fixed(lo, it->dyn))        /* a fixed box is not clipped by what it is in */
+                continue;
+            sb_adopt(lo, &it->sb, idx);
+        }
+        for (int i = r[k].l0; i < r[k].l1 && i < lo->nlinks; i++)
+            if (!lo->links[i].dyn || !under_fixed(lo, lo->links[i].dyn))
+                sb_adopt(lo, &lo->links[i].sb, idx);
+        for (int i = r[k].k0; i < r[k].k1 && i < lo->ncontrols; i++)
+            if (!lo->controls[i].dyn || !under_fixed(lo, lo->controls[i].dyn))
+                sb_adopt(lo, &lo->controls[i].sb, idx);
+    }
+    struct ditem *d = emit(c, DK_SBOX);     /* where the box is, and its scroll bars: moves with the page */
+    if (d) {
+        d->x = px, d->y = py, d->w = pw, d->h = ph;
+        d->sbi = (uint16_t)idx;
+    }
+}
+
+static int rect_has(struct rect r, int x, int y)
+{
+    return x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h;
+}
+
+static struct rect rect_and(struct rect a, struct rect b)
+{
+    int x0 = a.x > b.x ? a.x : b.x, y0 = a.y > b.y ? a.y : b.y;
+    int x1 = a.x + a.w < b.x + b.w ? a.x + a.w : b.x + b.w, y1 = a.y + a.h < b.y + b.h ? a.y + a.h : b.y + b.h;
+    return mkrect(x0, y0, x1 > x0 ? x1 - x0 : 0, y1 > y0 ? y1 - y0 : 0);
+}
+
+/* A box's size is known (the layout is done): how far it overflows, which scroll bars it has, where it is scrolled. */
+static void sbox_finalize(struct layout *lo)
+{
+    if (!lo->nsb)
+        return;
+    for (int i = 0; i < lo->nitems; i++) {
+        const struct ditem *d = &lo->items[i];
+        if (d->kind == DK_SBOX && d->sbi < lo->nsb) {
+            struct sbox *b = &lo->sb[d->sbi];
+            b->x = d->x, b->y = d->y, b->w = d->w, b->h = d->h;
+            b->dyn = d->dyn;
+        }
+    }
+    for (int k = 0; k < lo->nsb; k++)
+        lo->sb[k].cw = lo->sb[k].x, lo->sb[k].ch = lo->sb[k].y;      /* the right and bottom edges, for now */
+    for (int i = 0; i < lo->nitems; i++) {
+        const struct ditem *d = &lo->items[i];
+        if (!d->sb || d->w <= 0 || d->h <= 0 || d->x >= BIG || d->y >= BIG ||
+            (d->kind == DK_FILL && !d->node) || (d->kind == DK_TEXT && d->len == 1 && d->text[0] == ' '))
+            continue;
+        struct sbox *b = &lo->sb[d->sb - 1];
+        if (d->dyn != b->dyn)           /* in a sticky box of its own, or the like: not where it was laid out */
+            continue;
+        if (d->x + d->w > b->cw)
+            b->cw = d->x + d->w;
+        if (d->y + d->h > b->ch)
+            b->ch = d->y + d->h;
+    }
+    for (int k = 0; k < lo->nsb; k++) {
+        struct sbox *b = &lo->sb[k];
+        b->cw -= b->x, b->ch -= b->y;
+        if (b->cw <= b->w + 1)          /* a pixel of rounding is not overflow */
+            b->cw = b->w;
+        if (b->ch <= b->h + 1)
+            b->ch = b->h;
+        int mx = b->cw - b->w, my = b->ch - b->h;
+        b->bar_x = b->ov_x == OV_SCROLL || (b->ov_x == OV_AUTO && mx > 0);
+        b->bar_y = b->ov_y == OV_SCROLL || (b->ov_y == OV_AUTO && my > 0);
+        /* the bars lie over the box, not beside it: once one axis scrolls, the other bar covers a little more */
+        b->max_x = mx > 0 ? b->cw - (b->w - (b->bar_y ? SB_BAR : 0)) : 0;
+        b->max_y = my > 0 ? b->ch - (b->h - (b->bar_x ? SB_BAR : 0)) : 0;
+        b->active = mx > 0 || my > 0 || b->bar_x || b->bar_y;
+        struct node *n = b->node;
+        b->sx = n->scroll_x < 0 ? 0 : n->scroll_x > b->max_x ? b->max_x : n->scroll_x;
+        b->sy = n->scroll_y < 0 ? 0 : n->scroll_y > b->max_y ? b->max_y : n->scroll_y;
+        if (b->sx != n->scroll_x || b->sy != n->scroll_y) {
+            n->scroll_x = b->sx;
+            n->scroll_y = b->sy;
+        }
+    }
+}
+
+/*
+ * How the scrolling boxes round an item (the sb of an item or hotspot) move it: (dx, dy) is what to add to its
+ * position, clip the page rectangle that shows it (the page scrolled to psx, psy).
+ */
+void layout_sb_view(const struct layout *lo, int sb, int psx, int psy, int *dx, int *dy, struct rect *clip)
+{
+    int chain[32], n = 0;
+    for (int k = sb; k > 0 && k <= lo->nsb && n < 32; k = lo->sb[k - 1].parent)
+        chain[n++] = k - 1;
+    int ox = 0, oy = 0;
+    struct rect cl = mkrect(-BIG, -BIG, 2 * BIG, 2 * BIG);
+    for (int i = n - 1; i >= 0; i--) {              /* the outermost first: it moves what is in it */
+        const struct sbox *b = &lo->sb[chain[i]];
+        if (!b->active)
+            continue;
+        int ddx = 0, ddy = 0;
+        if (b->dyn)
+            layout_dyn_offset(lo, b->dyn, psx, psy, &ddx, &ddy);
+        cl = rect_and(cl, mkrect(b->x + ddx + ox, b->y + ddy + oy, b->w, b->h));
+        ox -= b->sx, oy -= b->sy;
+    }
+    *dx = ox, *dy = oy;
+    if (clip)
+        *clip = cl;
+}
+
+/* The page rectangle a box's padding box is at (its own scrolling does not count), and what clips it. */
+static struct rect sbox_rect(const struct layout *lo, int idx, int psx, int psy, struct rect *clip)
+{
+    const struct sbox *b = &lo->sb[idx];
+    int ox = 0, oy = 0, ddx = 0, ddy = 0;
+    struct rect cl;
+    layout_sb_view(lo, b->parent, psx, psy, &ox, &oy, &cl);
+    if (b->dyn)
+        layout_dyn_offset(lo, b->dyn, psx, psy, &ddx, &ddy);
+    if (clip)
+        *clip = cl;
+    return mkrect(b->x + ddx + ox, b->y + ddy + oy, b->w, b->h);
+}
+
 /* ---- colors and borders ---- */
 
 static uint32_t shade(uint32_t c, int num, int den, int toward_white)
@@ -441,6 +611,7 @@ static void outline_box(struct lctx *c, const struct style *st, int x, int y, in
 static void finish_box(struct lctx *c, struct node *n, int slot, int x, int y, int w, int h)
 {
     finish_box_inner(c, n, slot, x, y, w, h);
+    bg_picture_finish(c, n, slot);
     if (n->style->outline_w)
         outline_box(c, n->style, x, y, w, h);
 }
@@ -474,6 +645,96 @@ static void finish_box_inner(struct lctx *c, struct node *n, int slot, int x, in
         return;
     }
     borders(c, st, x, y, w, h);
+}
+
+/* ---- background pictures ---- */
+
+/* Does this box get a place reserved for a background picture (the item after its background)? */
+static int bg_picture_wanted(const struct style *st)
+{
+    return st->bg_img && st->bg_img->w > 0 && st->bg_img->h > 0 && !st->hidden;
+}
+
+/*
+ * The item after a box's background slot is its background picture (reserved when the box began): now that the
+ * slot has its size, work out the size and place of the tile, and where it is painted. A gradient goes over the
+ * picture, so it moves to this item.
+ */
+static void bg_picture_finish(struct lctx *c, struct node *n, int slot)
+{
+    struct layout *lo = c->lo;
+    const struct style *st = n->style;
+    if (slot < 0 || slot + 1 >= lo->nitems || lo->items[slot + 1].kind != DK_BGIMG)
+        return;
+    struct ditem *s0 = &lo->items[slot], *d = &lo->items[slot + 1];
+    d->bgp = NULL;
+    d->w = d->h = 0;
+    d->grad = 0;
+    d->color = TRANSPARENT;
+    if (!bg_picture_wanted(st) || s0->w <= 0 || s0->h <= 0)
+        return;
+    int w = s0->w, h = s0->h;
+    int ox = 0, oy = 0, ow = w, oh = h;                 /* the area the picture is placed in */
+    if (st->bg_origin != 1) {
+        ox = st->border_w[3], oy = st->border_w[0];
+        ow = w - ox - st->border_w[1], oh = h - oy - st->border_w[2];
+        if (st->bg_origin == 2) {
+            int pl = len_px(st->padding[3], w), pt = len_px(st->padding[0], w);
+            ox += pl, oy += pt;
+            ow -= pl + len_px(st->padding[1], w), oh -= pt + len_px(st->padding[2], w);
+        }
+    }
+    if (ow <= 0 || oh <= 0)
+        return;
+    const struct image *img = st->bg_img;
+    int iw = img->w, ih = img->h, tw = iw, th = ih;
+    switch (st->bg_size) {
+    case BGS_COVER:
+    case BGS_CONTAIN: {
+        int wide = (long long)ow * ih > (long long)oh * iw;     /* the area is wider than the picture */
+        if (wide == (st->bg_size == BGS_COVER))
+            tw = ow, th = muldiv(ih, ow, iw);
+        else
+            th = oh, tw = muldiv(iw, oh, ih);
+        break;
+    }
+    case BGS_LEN: {
+        int lw = st->bg_w.unit == U_AUTO ? -1 : len_px(st->bg_w, ow);
+        int lh = st->bg_h.unit == U_AUTO ? -1 : len_px(st->bg_h, oh);
+        if (lw >= 0 && lh >= 0)
+            tw = lw, th = lh;
+        else if (lw >= 0)
+            tw = lw, th = muldiv(ih, lw, iw);
+        else if (lh >= 0)
+            th = lh, tw = muldiv(iw, lh, ih);
+        break;
+    }
+    default:
+        break;
+    }
+    if (tw <= 0 || th <= 0)
+        return;
+    if (tw > 16384)
+        tw = 16384;
+    if (th > 16384)
+        th = 16384;
+    struct bgpaint *bp = arena_alloc(c->a, sizeof(*bp));
+    if (!bp)
+        return;
+    bp->img = st->bg_img;
+    bp->tw = tw, bp->th = th;
+    bp->tx = ox + len_px(st->bg_px, ow - tw);
+    bp->ty = oy + len_px(st->bg_py, oh - th);
+    bp->norep_x = st->bg_norep_x, bp->norep_y = st->bg_norep_y;
+    d->bgp = bp;
+    d->x = s0->x, d->y = s0->y, d->w = w, d->h = h;
+    round_corners(d, st, w, h);
+    if (st->grad) {
+        d->grad = st->grad;
+        d->g0 = st->g0;
+        d->g1 = st->g1;
+        s0->grad = 0;
+    }
 }
 
 /* ---- boxes ---- */
@@ -1120,8 +1381,29 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
     d->node = n;
     d->font = f;
     d->color = st->color;
-    if (kind == DK_IMAGE)
+    if (kind == DK_IMAGE) {
         round_corners(d, st, w, h);
+        if (st->obj_fit != OF_FILL && n->tag == T_IMG && n->img && n->img->w > 0 && n->img->h > 0) {
+            int iw = n->img->w, ih = n->img->h, fw = iw, fh = ih;
+            int fit = st->obj_fit;
+            if (fit == OF_SCALE_DOWN)
+                fit = iw <= w && ih <= h ? OF_NONE : OF_CONTAIN;
+            if (fit == OF_CONTAIN || fit == OF_COVER) {
+                int wide = (long long)iw * h > (long long)ih * w;      /* the picture is wider than the box */
+                if (wide == (fit == OF_CONTAIN))
+                    fw = w, fh = muldiv(ih, w, iw);
+                else
+                    fh = h, fw = muldiv(iw, h, ih);
+            }
+            if (fw < 1)
+                fw = 1;
+            if (fh < 1)
+                fh = 1;
+            d->fit_w = fw, d->fit_h = fh;
+            d->fit_x = len_px(st->obj_px, w - fw);
+            d->fit_y = len_px(st->obj_py, h - fh);
+        }
+    }
     if (kind == DK_FRAME && alt && *alt) {
         struct ditem *t = emit(c, DK_TEXT);
         if (t) {
@@ -1983,6 +2265,9 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
     fill(c, 0, 0, 1, 1, OPAQUE(0), 0);          /* the background, sized below */
     if (c->lo->nitems == slot)
         slot = -1;
+    else if (bg_picture_wanted(st))
+        emit(c, DK_BGIMG);                      /* its picture goes just after it */
+    struct mark mc0 = mark_now(c);              /* the contents start here */
 
     int cx = bx + b.bl + b.pl, cy = y + b.bt + b.pt;
     if (st->display == D_LIST_ITEM)
@@ -1996,6 +2281,7 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
     c->inside_text[0] = 0;
     if (c->marker_pending && st->display == D_LIST_ITEM)
         place_marker(c, cy + wfont_ascent(st->font));
+    struct mark mc1 = mark_now(c);              /* ...and end here */
     if (bfc) {                          /* a formatting context contains its floats */
         int low = float_clear_y(c, 3);
         if (low > cy + ch)
@@ -2052,6 +2338,7 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
         }
     }
 
+    struct mark mf = mc1;
     if (bg_slot) {
         *bg_slot = slot;
         if (slot >= 0) {
@@ -2060,9 +2347,11 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
             d->x = bx, d->y = y, d->w = bw, d->h = bh;
             d->color = paint ? st->bg : TRANSPARENT;
             d->node = n;
+            bg_picture_finish(c, n, slot);
         }
     } else {
         finish_box(c, n, slot, bx, y, bw, bh);
+        mf = mark_now(c);                       /* what follows is not the box's own */
     }
     if (is_cb && c->npend > pfirst) {
         int end = c->npend;
@@ -2074,6 +2363,14 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
                 layout_abs(c, &p, bx + b.bl, y + b.bt, bw - b.bl - b.br, bh - b.bt - b.bb);
         }
         c->npend = pfirst;
+    }
+    if (st->clips && !bg_slot) {                        /* overflow: its contents are clipped, perhaps scrolled */
+        struct mark mp = mark_now(c);
+        struct sbrange rg[2] = {
+            { mc0.items, mc1.items, mc0.links, mc1.links, mc0.controls, mc1.controls },
+            { mf.items, mp.items, mf.links, mp.links, mf.controls, mp.controls },   /* absolute descendants */
+        };
+        sbox_register(c, n, bx, y, bw, bh, rg, 2);
     }
     if (!bg_slot && (st->tx.v || st->ty.v)) {           /* transform: translate() */
         int dx = len_px(st->tx, bw), dy = len_px(st->ty, bh);
@@ -2371,6 +2668,17 @@ static void item_place(struct lctx *c, struct fitem *it, int x, int y, int h)
     if (it->kind != FI_BLOCK)
         return;
     finish_box(c, it->n, it->slot, x, y, it->bw, h);
+    if (it->n->style->clips) {                          /* overflow: clip (and scroll) what the item holds */
+        struct mark from = it->m0;
+        if (it->slot >= 0 && from.items == it->slot) {  /* not its background, nor its picture */
+            from.items++;
+            if (from.items < it->m1.items && c->lo->items[from.items].kind == DK_BGIMG)
+                from.items++;
+        }
+        struct sbrange rg = { from.items, it->m1.items, from.links, it->m1.links, from.controls,
+                              it->m1.controls };
+        sbox_register(c, it->n, x, y, it->bw, h, &rg, 1);
+    }
     if (it->n->tag == T_BUTTON && !it->st->hidden)
         add_hotspot(c, &c->lo->controls, &c->lo->ncontrols, &c->lo->controlcap, it->n, x, y, it->bw, h);
     struct node *link = enclosing_link(it->n);
@@ -2527,7 +2835,10 @@ static int flex_row(struct lctx *c, const struct style *st, struct fitem *it, in
     for (int l = 0; l < nlines; l++)
         total += cross[l];
     int target = defh >= 0 ? defh : minh;
-    if (!st->flex_wrap && nlines == 1 && target > cross[0]) {
+    if (!st->flex_wrap && nlines == 1 && defh >= 0 && defh < cross[0]) {
+        total += defh - cross[0];       /* one line in a container of a set height: the line is that tall */
+        cross[0] = defh;
+    } else if (!st->flex_wrap && nlines == 1 && target > cross[0]) {
         total += target - cross[0];
         cross[0] = target;
     } else if (target > total && nlines) {
@@ -2564,8 +2875,9 @@ static int flex_row(struct lctx *c, const struct style *st, struct fitem *it, in
             int al = item_align(st, t), h = t->bh, top;
             int outer = t->mt + h + t->mb;
             if (al == AL_STRETCH && t->kind == FI_BLOCK && t->st->height.unit == U_AUTO &&
-                !t->amt && !t->amb && cross[l] - t->mt - t->mb > h)
-                h = cross[l] - t->mt - t->mb;
+                !t->amt && !t->amb && (cross[l] - t->mt - t->mb > h ||
+                                       (t->st->clips && cross[l] - t->mt - t->mb >= 0)))
+                h = cross[l] - t->mt - t->mb;           /* (one that clips or scrolls may be made shorter) */
             if (t->amt && t->amb)
                 top = (cross[l] - outer) / 2 + t->mt;
             else if (t->amt)
@@ -2629,8 +2941,8 @@ static int flex_column(struct lctx *c, const struct style *st, struct fitem *it,
 
     int spare = avail - gap * (ni - 1), nauto = 0;
     for (int i = 0; i < ni; i++) {
-        if (it[i].main < it[i].bh)
-            it[i].main = it[i].bh;
+        if (it[i].main < it[i].bh && !(it[i].kind == FI_BLOCK && !anonymous(&it[i]) && it[i].st->clips))
+            it[i].main = it[i].bh;      /* never shorter than its content, unless it clips or scrolls it */
         spare -= it[i].main + it[i].mm;
         nauto += it[i].amt + it[i].amb;
     }
@@ -3632,8 +3944,11 @@ static int layout_table(struct lctx *c, struct node *n, int x, int y, int cw, in
                 dy = full - t->h;
             if (dy > 0) {
                 struct mark from = t->m0;
-                if (t->slot >= 0 && from.items == t->slot)
+                if (t->slot >= 0 && from.items == t->slot) {
                     from.items++;               /* the background stays where the cell is */
+                    if (from.items < t->m1.items && c->lo->items[from.items].kind == DK_BGIMG)
+                        from.items++;
+                }
                 shift(c, from, t->m1, 0, dy);
             }
             if (t->n->style->empty_hide && s > 0 && cell_is_empty(t->n)) {
@@ -3641,8 +3956,10 @@ static int layout_table(struct lctx *c, struct node *n, int x, int y, int cw, in
                     c->lo->items[t->slot].h = 0, c->lo->items[t->slot].color = TRANSPARENT;
                 continue;               /* empty-cells: hide: no background and no border */
             }
-            if (t->slot >= 0)
+            if (t->slot >= 0) {
                 c->lo->items[t->slot].h = c->lo->items[t->slot].h ? full : 0;
+                bg_picture_finish(c, t->n, t->slot);
+            }
             borders(c, t->n->style, t->x, t->y, t->w, full);
         }
         if (row_slot[r] >= 0) {
@@ -3732,6 +4049,7 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
     lo->vw = vw;
     lo->vh = vh;
     lo->dyn = arena_alloc(a, sizeof(struct dynbox) * MAX_DYNBOX);
+    lo->sb = arena_alloc(a, sizeof(struct sbox) * MAX_SBOX);
     /* The root's background, or else the body's, covers the whole canvas. */
     struct node *body = NULL;
     for (struct node *k = root->first; k; k = k->next)
@@ -3751,9 +4069,12 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
     lo->height = h + (mb > 0 ? mb : 0);
     lo->width = vw;
     apply_z_order(&c);
+    sbox_finalize(lo);
     for (int i = 0; i < lo->nitems; i++) {
         const struct ditem *d = &lo->items[i];
         if (d->dyn && under_fixed(lo, d->dyn))      /* a fixed box is in the window, not in the page */
+            continue;
+        if (d->sb)                                  /* what a box clips does not stretch the page */
             continue;
         if (d->w > 0 && d->x + d->w > lo->width && d->x < BIG)
             lo->width = d->x + d->w;
@@ -3771,6 +4092,14 @@ const struct hotspot *layout_hit(const struct layout *lo, const struct hotspot *
             layout_dyn_offset(lo, h[i].dyn, sx, sy, &dx, &dy);
         if (h[i].node && h[i].node->style && h[i].node->style->pointer_none)
             continue;                   /* pointer-events: none */
+        if (h[i].sb) {                  /* inside scrolling boxes: moved by them, and only where they show it */
+            int bx, by;
+            struct rect clip;
+            layout_sb_view(lo, h[i].sb, sx, sy, &bx, &by, &clip);
+            if (!rect_has(clip, x, y))
+                continue;
+            dx += bx, dy += by;
+        }
         if (x >= h[i].x + dx && x < h[i].x + dx + h[i].w && y >= h[i].y + dy && y < h[i].y + dy + h[i].h)
             return &h[i];
     }
@@ -3939,21 +4268,29 @@ static void fill_rich(struct surface *s, const struct ditem *d, int x, int y)
     simd_done();
 }
 
-/* An image with its corners rounded off. */
+/* An image with its corners rounded off, or put (object-fit) somewhere other than filling its box. */
 static void draw_image_round(struct surface *s, const struct ditem *d, int x, int y)
 {
     const struct image *img = d->img;
     struct rect r = rect_intersect(mkrect(x, y, d->w, d->h), s->clip);
     if (rect_empty(r) || !img || img->w <= 0 || img->h <= 0)
         return;
+    int fx = x, fy = y, fw = d->w, fh = d->h;
+    if (d->fit_w > 0 && d->fit_h > 0)
+        fx = x + d->fit_x, fy = y + d->fit_y, fw = d->fit_w, fh = d->fit_h;
+    int rounded = d->rad[0] || d->rad[1] || d->rad[2] || d->rad[3];
     for (int j = r.y; j < r.y + r.h; j++) {
-        const uint32_t *src = img->px + (j - y) * img->h / d->h * img->w;
+        if (j < fy || j >= fy + fh)
+            continue;
+        const uint32_t *src = img->px + ((j - fy) * img->h / fh) * img->w;
         uint32_t *dst = s->px + j * s->stride;
         for (int i = r.x; i < r.x + r.w; i++) {
-            int cov = coverage(i - x, j - y, d->w, d->h, d->rad);
+            if (i < fx || i >= fx + fw)
+                continue;
+            int cov = rounded ? coverage(i - x, j - y, d->w, d->h, d->rad) : 256;
             if (!cov)
                 continue;
-            uint32_t p = src[(i - x) * img->w / d->w];
+            uint32_t p = src[((i - fx) * img->w / fw)];
             uint32_t a = (p >> 24) * (uint32_t)cov / 256;
             if (a == 255)
                 dst[i] = p & 0xFFFFFF;
@@ -3962,6 +4299,61 @@ static void draw_image_round(struct surface *s, const struct ditem *d, int x, in
         }
     }
     simd_done();
+}
+
+/* A background picture: tiles of bgp from its corner, over the item's box (rounded if it is), then a gradient. */
+static void draw_bgimg(struct surface *s, const struct ditem *d, int x, int y)
+{
+    const struct bgpaint *bp = d->bgp;
+    struct rect r = rect_intersect(mkrect(x, y, d->w, d->h), s->clip);
+    if (rect_empty(r))
+        return;
+    if (bp && bp->img && bp->img->w > 0 && bp->img->h > 0 && bp->tw > 0 && bp->th > 0) {
+        const struct image *img = bp->img;
+        int *xs = malloc(sizeof(int) * (size_t)r.w);
+        if (xs) {
+            for (int i = 0; i < r.w; i++) {             /* the picture's column under each pixel, or -1 */
+                int rel = r.x + i - (x + bp->tx);
+                if (bp->norep_x && (rel < 0 || rel >= bp->tw)) {
+                    xs[i] = -1;
+                    continue;
+                }
+                rel %= bp->tw;
+                if (rel < 0)
+                    rel += bp->tw;
+                xs[i] = (rel * img->w / bp->tw);
+            }
+            int rounded = d->rad[0] || d->rad[1] || d->rad[2] || d->rad[3];
+            for (int j = r.y; j < r.y + r.h; j++) {
+                int rel = j - (y + bp->ty);
+                if (bp->norep_y && (rel < 0 || rel >= bp->th))
+                    continue;
+                rel %= bp->th;
+                if (rel < 0)
+                    rel += bp->th;
+                const uint32_t *src = img->px + (rel * img->h / bp->th) * img->w;
+                uint32_t *dst = s->px + j * s->stride;
+                for (int i = 0; i < r.w; i++) {
+                    if (xs[i] < 0)
+                        continue;
+                    uint32_t p = src[xs[i]];
+                    uint32_t a = p >> 24;
+                    if (rounded) {
+                        int cov = coverage(r.x + i - x, j - y, d->w, d->h, d->rad);
+                        a = a * (uint32_t)cov / 256;
+                    }
+                    if (a == 255)
+                        dst[r.x + i] = p & 0xFFFFFF;
+                    else if (a)
+                        dst[r.x + i] = blend_px(dst[r.x + i], (p & 0xFFFFFF) | a << 24);
+                }
+            }
+            free(xs);
+            simd_done();
+        }
+    }
+    if (d->grad)
+        fill_rich(s, d, x, y);
 }
 
 void draw_image_scaled(struct surface *s, const struct image *img, int x, int y, int w, int h)
@@ -4174,6 +4566,84 @@ static void draw_control(struct surface *s, const struct ditem *d, int x, int y,
         gfx_vline(s, inner.x + caret_x - scroll, ty, fh, C_BLACK);
 }
 
+/* ---- scroll bars of boxes ---- */
+
+#define SB_STEP 40              /* an arrow's step, in pixels */
+
+/* One of a box's scroll bars at its padding box's corner (ox, oy): where it lies, and what it shows. */
+static struct rect sbar_geometry(const struct sbox *b, int axis, int ox, int oy, int *page, int *total, int *pos)
+{
+    if (axis) {
+        *page = b->h - (b->bar_x ? SB_BAR : 0), *total = *page + b->max_y, *pos = b->sy;
+        return mkrect(ox + b->w - SB_BAR, oy, SB_BAR, *page);
+    }
+    *page = b->w - (b->bar_y ? SB_BAR : 0), *total = *page + b->max_x, *pos = b->sx;
+    return mkrect(ox, oy + b->h - SB_BAR, *page, SB_BAR);
+}
+
+/* The thumb's start and length along a bar of this length (arrows excluded from the track). */
+static void sbar_thumb_span(int len, int page, int total, int pos, int max, int *start, int *tlen)
+{
+    int track = len - 2 * SB_BAR;
+    *start = SB_BAR, *tlen = 0;
+    if (max <= 0 || track < 8 || total <= 0)
+        return;
+    int t = muldiv(track, page, total);
+    if (t < 8)
+        t = 8;
+    *tlen = t;
+    *start = SB_BAR + muldiv(track - t, pos, max);
+}
+
+static void sbar_arrow_draw(struct surface *s, struct rect r, int vertical, int second, int enabled)
+{
+    gfx_fill(s, r.x, r.y, r.w, r.h, C_FACE);
+    gfx_bevel(s, r, BEVEL_RAISED);
+    int mx = r.x + r.w / 2 - 1, my = r.y + r.h / 2 - 1;
+    for (int i = 0; i < 4; i++) {
+        int k = second ? i : 3 - i;
+        for (int shadow = !enabled; shadow >= 0; shadow--) {
+            color_t col = shadow ? C_WHITE : enabled ? C_BLACK : C_SHADOW;
+            if (vertical)
+                gfx_hline(s, mx - 3 + k + shadow, my - 2 + i + shadow, 7 - 2 * k, col);
+            else
+                gfx_vline(s, mx - 2 + i + shadow, my - 3 + k + shadow, 7 - 2 * k, col);
+        }
+    }
+}
+
+static void draw_sbox_bars(struct surface *s, const struct sbox *b, int ox, int oy)
+{
+    if (!b->active)
+        return;
+    for (int axis = 0; axis < 2; axis++) {
+        if (!(axis ? b->bar_y : b->bar_x))
+            continue;
+        int page, total, pos;
+        struct rect r = sbar_geometry(b, axis, ox, oy, &page, &total, &pos);
+        int max = axis ? b->max_y : b->max_x;
+        gfx_fill(s, r.x, r.y, r.w, r.h, C_FACE);
+        gfx_dither(s, r.x, r.y, r.w, r.h, C_WHITE);
+        int len = axis ? r.h : r.w;
+        if (len < 2 * SB_BAR)
+            continue;
+        struct rect a1 = mkrect(r.x, r.y, SB_BAR, SB_BAR);
+        struct rect a2 = axis ? mkrect(r.x, r.y + r.h - SB_BAR, SB_BAR, SB_BAR)
+                              : mkrect(r.x + r.w - SB_BAR, r.y, SB_BAR, SB_BAR);
+        sbar_arrow_draw(s, a1, axis, 0, max > 0);
+        sbar_arrow_draw(s, a2, axis, 1, max > 0);
+        int ts, tl;
+        sbar_thumb_span(len, page, total, pos, max, &ts, &tl);
+        if (tl) {
+            struct rect t = axis ? mkrect(r.x, r.y + ts, SB_BAR, tl) : mkrect(r.x + ts, r.y, tl, SB_BAR);
+            gfx_fill(s, t.x, t.y, t.w, t.h, C_FACE);
+            gfx_bevel(s, t, BEVEL_RAISED);
+        }
+    }
+    if (b->bar_x && b->bar_y)
+        gfx_fill(s, ox + b->w - SB_BAR, oy + b->h - SB_BAR, SB_BAR, SB_BAR, C_FACE);
+}
+
 /* ---- selecting text ---- */
 
 /* The character of a text item that x falls at, counted in bytes. */
@@ -4213,9 +4683,15 @@ static void sel_pos(const struct layout *lo, int px, int py, int *item, int *ch)
         if (d->kind != DK_TEXT || !d->len || !selectable(d))
             continue;
         last = i;
-        if (d->y + d->h > py && (d->y > py || d->x + d->w > px)) {
+        int qx = px, qy = py;           /* the point as the item's box has it (it may be scrolled) */
+        if (d->sb) {
+            int sdx, sdy;
+            layout_sb_view(lo, d->sb, 0, 0, &sdx, &sdy, NULL);
+            qx -= sdx, qy -= sdy;
+        }
+        if (d->y + d->h > qy && (d->y > qy || d->x + d->w > qx)) {
             *item = i;
-            *ch = d->y <= py && d->x < px ? char_at(d, px) : 0;
+            *ch = d->y <= qy && d->x < qx ? char_at(d, qx) : 0;
             return;
         }
     }
@@ -4367,15 +4843,33 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
     struct rect view = s->clip;
     int vx = view.x - ox + sx, vy = view.y - oy + sy;   /* the clip in page coordinates */
     gfx_fill(s, view.x, view.y, view.w, view.h, lo->canvas & 0xFFFFFF);
+    int last_sb = 0, sbdx = 0, sbdy = 0;
+    struct rect sbclip = view;
     for (int i = 0; i < lo->nitems; i++) {
         const struct ditem *d = &lo->items[i];
         int ddx = 0, ddy = 0;
         if (d->dyn)
             layout_dyn_offset(lo, d->dyn, sx, sy, &ddx, &ddy);
-        if (d->y + ddy >= vy + view.h || d->y + ddy + d->h + 4 <= vy || d->x + ddx >= vx + view.w ||
-            d->x + ddx + d->w <= vx)
+        if (d->sb != last_sb) {                 /* clipped (and moved) by the scrolling boxes round it */
+            last_sb = d->sb;
+            sbdx = sbdy = 0;
+            if (d->sb) {
+                struct rect pc;
+                layout_sb_view(lo, d->sb, sx, sy, &sbdx, &sbdy, &pc);
+                sbclip = rect_intersect(view, mkrect(pc.x - sx + ox, pc.y - sy + oy, pc.w, pc.h));
+            } else {
+                sbclip = view;
+            }
+        }
+        int idx = d->sb ? sbdx : 0, idy = d->sb ? sbdy : 0;
+        if (d->y + ddy + idy >= vy + view.h || d->y + ddy + idy + d->h + 4 <= vy ||
+            d->x + ddx + idx >= vx + view.w || d->x + ddx + idx + d->w <= vx)
             continue;
-        int x = d->x + ddx - sx + ox, y = d->y + ddy - sy + oy;
+        if (d->sb && rect_empty(sbclip))
+            continue;
+        int x = d->x + ddx + idx - sx + ox, y = d->y + ddy + idy - sy + oy;
+        if (d->sb)
+            s->clip = sbclip;
         switch (d->kind) {
         case DK_FILL:
             if (!ALPHA(d->color) && !d->grad && !d->ring)
@@ -4423,10 +4917,16 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
             break;
         }
         case DK_IMAGE:
-            if (d->rad[0] || d->rad[1] || d->rad[2] || d->rad[3])
+            if (d->rad[0] || d->rad[1] || d->rad[2] || d->rad[3] || d->fit_w)
                 draw_image_round(s, d, x, y);
             else
                 draw_image_scaled(s, d->img, x, y, d->w, d->h);
+            break;
+        case DK_BGIMG:
+            draw_bgimg(s, d, x, y);
+            break;
+        case DK_SBOX:
+            draw_sbox_bars(s, &lo->sb[d->sbi], x, y);
             break;
         case DK_FRAME:
             gfx_frame(s, x, y, d->w, d->h, 0xC0C0C0);
@@ -4442,5 +4942,181 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
             draw_control(s, d, x, y, d->node == focus, caret_on);
             break;
         }
+        if (d->sb)
+            s->clip = view;
+    }
+}
+
+/* ---- scrolling boxes: what the browser asks of them ---- */
+
+static int sbox_depth(const struct layout *lo, int k)
+{
+    int d = 0;
+    for (int p = lo->sb[k].parent; p && d < 64; p = lo->sb[p - 1].parent)
+        d++;
+    return d;
+}
+
+/* Is the page point inside the box, where what clips it shows it? r gets the box's padding box on the page. */
+static int sbox_contains(const struct layout *lo, int k, int px, int py, int psx, int psy, struct rect *r)
+{
+    struct rect clip;
+    *r = sbox_rect(lo, k, psx, psy, &clip);
+    return rect_has(clip, px, py) && rect_has(*r, px, py);
+}
+
+/* Scroll a box to (sx, sy), clamped; the node keeps it for the next layout. 1 if it moved. */
+static int sbox_set(struct layout *lo, int k, int sx, int sy)
+{
+    struct sbox *b = &lo->sb[k];
+    sx = sx < 0 ? 0 : sx > b->max_x ? b->max_x : sx;
+    sy = sy < 0 ? 0 : sy > b->max_y ? b->max_y : sy;
+    int moved = sx != b->sx || sy != b->sy;
+    b->sx = b->node->scroll_x = sx;
+    b->sy = b->node->scroll_y = sy;
+    return moved;
+}
+
+int layout_sbar_hit(const struct layout *lo, int px, int py, int psx, int psy, struct sbhit *out)
+{
+    for (int k = lo->nsb - 1; k >= 0; k--) {
+        const struct sbox *b = &lo->sb[k];
+        struct rect r;
+        if (!b->active || (!b->bar_x && !b->bar_y) || !sbox_contains(lo, k, px, py, psx, psy, &r))
+            continue;
+        for (int axis = 0; axis < 2; axis++) {
+            if (!(axis ? b->bar_y : b->bar_x))
+                continue;
+            int page, total, pos;
+            struct rect bar = sbar_geometry(b, axis, r.x, r.y, &page, &total, &pos);
+            if (!rect_has(bar, px, py))
+                continue;
+            int len = axis ? bar.h : bar.w, along = axis ? py - bar.y : px - bar.x;
+            int ts, tl;
+            sbar_thumb_span(len, page, total, pos, axis ? b->max_y : b->max_x, &ts, &tl);
+            out->box = k, out->axis = axis;
+            out->thumb = (axis ? bar.y : bar.x) + ts;
+            out->part = along < SB_BAR ? SBP_ARROW1 : along >= len - SB_BAR ? SBP_ARROW2 : !tl ? SBP_NONE
+                      : along < ts ? SBP_PAGE1 : along >= ts + tl ? SBP_PAGE2 : SBP_THUMB;
+            return 1;
+        }
+        if (b->bar_x && b->bar_y && px >= r.x + r.w - SB_BAR && py >= r.y + r.h - SB_BAR) {
+            out->box = k, out->axis = 0, out->part = SBP_NONE, out->thumb = 0;      /* the corner */
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int layout_sbar_press(struct layout *lo, const struct sbhit *h)
+{
+    const struct sbox *b = &lo->sb[h->box];
+    int page = h->axis ? b->h - (b->bar_x ? SB_BAR : 0) : b->w - (b->bar_y ? SB_BAR : 0);
+    int d = h->part == SBP_ARROW1 ? -SB_STEP : h->part == SBP_ARROW2 ? SB_STEP
+          : h->part == SBP_PAGE1 ? -(page - SB_STEP / 2) : h->part == SBP_PAGE2 ? page - SB_STEP / 2 : 0;
+    if (!d)
+        return 0;
+    return h->axis ? sbox_set(lo, h->box, b->sx, b->sy + d) : sbox_set(lo, h->box, b->sx + d, b->sy);
+}
+
+void layout_sbar_drag(struct layout *lo, const struct sbhit *h, int mouse, int grab, int psx, int psy)
+{
+    const struct sbox *b = &lo->sb[h->box];
+    struct rect clip;
+    struct rect r = sbox_rect(lo, h->box, psx, psy, &clip);
+    int page, total, pos;
+    struct rect bar = sbar_geometry(b, h->axis, r.x, r.y, &page, &total, &pos);
+    int len = h->axis ? bar.h : bar.w, max = h->axis ? b->max_y : b->max_x;
+    int ts, tl;
+    sbar_thumb_span(len, page, total, pos, max, &ts, &tl);
+    int span = len - 2 * SB_BAR - tl;
+    if (span <= 0 || max <= 0)
+        return;
+    int start = (h->axis ? bar.y : bar.x) + SB_BAR;
+    int np = muldiv(mouse - grab - start, max, span);
+    if (h->axis)
+        sbox_set(lo, h->box, b->sx, np);
+    else
+        sbox_set(lo, h->box, np, b->sy);
+}
+
+int layout_wheel(struct layout *lo, int px, int py, int psx, int psy, int dx, int dy)
+{
+    int best = -1, best_depth = -1;
+    for (int k = 0; k < lo->nsb; k++) {
+        struct rect r;
+        if (!lo->sb[k].active || !(lo->sb[k].max_x || lo->sb[k].max_y) ||
+            !sbox_contains(lo, k, px, py, psx, psy, &r))
+            continue;
+        int depth = sbox_depth(lo, k);
+        if (depth > best_depth)
+            best = k, best_depth = depth;
+    }
+    for (int k = best, n = 0; k >= 0 && n < 64; k = lo->sb[k].parent - 1, n++) {
+        const struct sbox *b = &lo->sb[k];
+        int user_x = b->ov_x == OV_SCROLL || b->ov_x == OV_AUTO, user_y = b->ov_y == OV_SCROLL || b->ov_y == OV_AUTO;
+        int can_x = user_x && ((dx < 0 && b->sx > 0) || (dx > 0 && b->sx < b->max_x));
+        int can_y = user_y && ((dy < 0 && b->sy > 0) || (dy > 0 && b->sy < b->max_y));
+        if (can_x || can_y) {
+            sbox_set(lo, k, b->sx + (can_x ? dx : 0), b->sy + (can_y ? dy : 0));
+            return 1;
+        }
+        if (!b->parent)
+            break;
+    }
+    return 0;
+}
+
+static int sbox_of_node(const struct layout *lo, const struct node *n)
+{
+    for (int k = 0; k < lo->nsb; k++)
+        if (lo->sb[k].node == n)
+            return k;
+    return -1;
+}
+
+int layout_node_scroll(const struct layout *lo, const struct node *n, int *sx, int *sy, int *cw, int *ch,
+                       int *vw, int *vh)
+{
+    int k = sbox_of_node(lo, n);
+    if (k < 0)
+        return 0;
+    const struct sbox *b = &lo->sb[k];
+    *sx = b->sx, *sy = b->sy, *cw = b->cw, *ch = b->ch, *vw = b->w, *vh = b->h;
+    return 1;
+}
+
+int layout_set_node_scroll(struct layout *lo, struct node *n, int sx, int sy)
+{
+    int k = sbox_of_node(lo, n);
+    if (k >= 0)
+        sbox_set(lo, k, sx, sy);
+    /* Kept as asked, even by a box that is not laid out yet (or is stale): the next layout clamps it. */
+    n->scroll_x = sx < 0 ? 0 : sx;
+    n->scroll_y = sy < 0 ? 0 : sy;
+    return k >= 0;
+}
+
+void layout_reveal(struct layout *lo, const struct node *n, int x, int y, int w, int h)
+{
+    int accx = 0, accy = 0;
+    for (const struct node *a = n->parent; a; a = a->parent) {
+        int k = sbox_of_node(lo, a);
+        if (k < 0)
+            continue;
+        const struct sbox *b = &lo->sb[k];
+        int rx = x - accx - b->x, ry = y - accy - b->y;
+        int vw = b->w - (b->bar_y ? SB_BAR : 0), vh = b->h - (b->bar_x ? SB_BAR : 0);
+        int nx = b->sx, ny = b->sy;
+        if (ry + h > ny + vh)
+            ny = ry + h - vh;
+        if (ry < ny)
+            ny = ry;
+        if (rx + w > nx + vw)
+            nx = rx + w - vw;
+        if (rx < nx)
+            nx = rx;
+        sbox_set(lo, k, nx, ny);
+        accx += b->sx, accy += b->sy;
     }
 }

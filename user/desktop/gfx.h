@@ -13,15 +13,33 @@ typedef uint32_t color_t;
 
 #define RGB(r, g, b) ((color_t)(((r) << 16) | ((g) << 8) | (b)))
 
-/* The Windows 95 system colors. */
+/* With an alpha byte (0 transparent, 255 opaque), for the blending primitives below. */
+#define ARGB(a, rgb) ((color_t)(((uint32_t)(a) << 24) | ((rgb) & 0xFFFFFF)))
+
+/*
+ * The system colors. Black and white are always black and white; the
+ * rest belong to the theme (theme.c), and start as Windows 95's. C_FACE
+ * is the face of dialogs and controls, C_LIGHT and C_SHADOW its lit and
+ * shaded edges (and disabled text), C_NAVY the highlight behind what is
+ * selected (white text goes on it), C_DESKTOP the plain desktop.
+ */
+struct syscolors {
+    color_t face, light, shadow, highlight, desktop, teal;
+    int flat;                   /* bevels are flat outlines in these (the Kinetik theme): */
+    color_t edge;               /* buttons and other raised things */
+    color_t edge_dark;          /* windows, menus and pressed buttons */
+    color_t field_edge;         /* text fields and other sunken things */
+};
+extern struct syscolors sys;
+
 #define C_BLACK      RGB(0x00, 0x00, 0x00)
 #define C_WHITE      RGB(0xFF, 0xFF, 0xFF)
-#define C_FACE       RGB(0xC0, 0xC0, 0xC0)
-#define C_LIGHT      RGB(0xDF, 0xDF, 0xDF)
-#define C_SHADOW     RGB(0x80, 0x80, 0x80)
-#define C_NAVY       RGB(0x00, 0x00, 0x80)
-#define C_TEAL       RGB(0x00, 0x80, 0x80)
-#define C_DESKTOP    RGB(0x3F, 0x17, 0x5F)
+#define C_FACE       (sys.face)
+#define C_LIGHT      (sys.light)
+#define C_SHADOW     (sys.shadow)
+#define C_NAVY       (sys.highlight)
+#define C_TEAL       (sys.teal)
+#define C_DESKTOP    (sys.desktop)
 #define C_TOOLTIP    RGB(0xFF, 0xFF, 0xE1)
 
 struct rect {
@@ -110,7 +128,25 @@ void gfx_ellipsize(const struct pfont *f, const char *str, int max_w, char *out,
 /* One cell of 8x16 terminal text. */
 void gfx_glyph8x16(struct surface *s, int x, int y, unsigned char ch, color_t fg, color_t bg);
 
-/* Windows 95 3D borders. */
+/* ---- rounded, blended shapes (the Kinetik theme) ---- */
+/* r filled top to bottom through n colors (ARGB, so they may be see-through) at
+ * positions 0..256 down it, its top corners rounded off by rt and its bottom ones by rb,
+ * anti-aliased. */
+void gfx_gradient(struct surface *s, struct rect r, int rt, int rb, int n, const color_t *colors,
+                  const int *pos);
+/* One color, the same way. */
+void gfx_round_fill(struct surface *s, struct rect r, int rt, int rb, color_t argb);
+/* A one-pixel outline of that shape. */
+void gfx_round_frame(struct surface *s, struct rect r, int rt, int rb, color_t argb);
+/* A soft shadow round a rounded box (radius rad), dy lower, fading out over blur pixels;
+ * its darkest is argb. Only what is outside the box is painted. */
+void gfx_shadow(struct surface *s, struct rect r, int rad, int dy, int blur, color_t argb);
+/* A line of any slope, anti-aliased, w pixels wide. */
+void gfx_line(struct surface *s, int x0, int y0, int x1, int y1, int w, color_t argb);
+/* Mix two colors: t out of 256 of the way from a to b. */
+color_t gfx_mix(color_t a, color_t b, int t);
+
+/* Windows 95 3D borders (flat outlines in the Kinetik theme). */
 enum bevel {
     BEVEL_RAISED,               /* buttons */
     BEVEL_WINDOW,               /* window frames, menus */

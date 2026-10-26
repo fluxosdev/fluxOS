@@ -17,6 +17,11 @@
  * than twice too big (so a 1920x1080 photograph shrunk to 640x480 is not
  * left with aliasing), then interpolates linearly.
  *
+ * The Kinetik theme has a wallpaper of its own, drawn rather than decoded
+ * (WALLPAPER_KINETIK): its color's gradient running from the top left
+ * corner, a glow towards the top right and three sweeping curves, as in
+ * the Kinetik studies, at whatever size the screen is.
+ *
  * The choice is kept for the next start in GRUB's environment block when
  * the system runs from a hard disk (fluxos_wall, fluxos_wallmode).
  */
@@ -26,6 +31,7 @@
 #include "desktop.h"
 
 static struct image *src;               /* the picture, as decoded */
+static int kinetik;                     /* the Kinetik theme's own instead */
 static struct surface wall;             /* screen-sized, drawn from src; px NULL if none */
 static char cur_path[256];
 static int cur_mode = WALL_FILL;
@@ -225,9 +231,100 @@ void wallpaper_render(struct surface *dst, struct rect a, const struct image *im
     flatten(dst, a, bg);
 }
 
+/* ---- the Kinetik wallpaper ---- */
+
+/* One of the curves, in the studies' 1280 x 800 coordinates: a cubic from p0 to p3 */
+static const struct curve {
+    float x[4], y[4];
+    float width, opacity;
+} curves[3] = {
+    { { -140, 230, 600, 1430 }, { 710, 180, 960, 210 }, 125, 0.22f },
+    { { -110, 350, 700, 1390 }, { 765, 250, 960, 310 }, 3, 0.27f },
+    { { -150, 350, 650, 1400 }, { 790, 280, 1030, 385 }, 48, 0.17f },
+};
+
+static float bezier(const float *p, float t)
+{
+    float u = 1.0f - t;
+    return u * u * u * p[0] + 3.0f * u * u * t * p[1] + 3.0f * u * t * t * p[2] + t * t * t * p[3];
+}
+
+static inline void over(uint32_t *px, color_t c, float a)
+{
+    if (a <= 0.0f)
+        return;
+    int t = a >= 1.0f ? 256 : (int)(a * 256.0f);
+    *px = gfx_mix(*px, c, t) & 0xFFFFFF;
+}
+
+/* A curve stroked in c: its x only grows along it, so each column has one point of it to measure from. */
+static void stroke_curve(struct surface *s, const struct curve *cv, int w, int h, color_t c)
+{
+    enum { N = 512 };
+    float sx = (float)w / 1280.0f, sy = (float)h / 800.0f, half = cv->width * (sx + sy) / 4.0f;
+    float px[N + 1], py[N + 1];
+    for (int i = 0; i <= N; i++) {
+        float t = (float)i / N;
+        px[i] = bezier(cv->x, t) * sx;
+        py[i] = bezier(cv->y, t) * sy;
+    }
+    int k = 0;
+    for (int x = 0; x < w; x++) {
+        float fx = (float)x + 0.5f;
+        while (k < N - 1 && px[k + 1] < fx)
+            k++;
+        if (fx < px[0] || fx > px[N])
+            continue;
+        float span = px[k + 1] - px[k], f = span > 0.0f ? (fx - px[k]) / span : 0.0f;
+        float y = py[k] + (py[k + 1] - py[k]) * f;
+        float slope = span > 0.0f ? (py[k + 1] - py[k]) / span : 0.0f;
+        float cosine = 1.0f / __builtin_sqrtf(1.0f + slope * slope);     /* across the stroke, not down */
+        float reach = (half + 1.0f) / cosine;
+        int y0 = (int)(y - reach), y1 = (int)(y + reach) + 1;
+        if (y0 < 0)
+            y0 = 0;
+        if (y1 > h)
+            y1 = h;
+        for (int j = y0; j < y1; j++) {
+            float d = ((float)j + 0.5f - y) * cosine;
+            if (d < 0.0f)
+                d = -d;
+            float cov = half + 0.5f - d;
+            over(&s->px[j * s->stride + x], c, (cov >= 1.0f ? 1.0f : cov) * cv->opacity);
+        }
+    }
+}
+
+void wallpaper_kinetik(struct surface *s, int w, int h)
+{
+    /* The gradient runs from the top left corner towards (0.8 w, h): wall0, wall1 at 52%, wall2. */
+    color_t lut[1025];
+    for (int i = 0; i <= 1024; i++)
+        lut[i] = i < 532 ? gfx_mix(theme.wall0, theme.wall1, i * 256 / 532)
+                         : gfx_mix(theme.wall1, theme.wall2, (i - 532) * 256 / (1024 - 532));
+    /* The glow: an ellipse fading from pale (80%) to the bright color (none). */
+    float gx = 0.71875f * (float)w, gy = 0.25f * (float)h, grx = 0.53125f * (float)w, gry = 0.575f * (float)h;
+    for (int j = 0; j < h; j++) {
+        uint32_t *row = s->px + j * s->stride;
+        float v = ((float)j + 0.5f) / (float)h, ey = ((float)j + 0.5f - gy) / gry;
+        for (int i = 0; i < w; i++) {
+            float u = ((float)i + 0.5f) / (float)w;
+            float t = (0.8f * u + v) / 1.64f;
+            row[i] = lut[t <= 0.0f ? 0 : t >= 1.0f ? 1024 : (int)(t * 1024.0f)];
+            float ex = ((float)i + 0.5f - gx) / grx, r2 = ex * ex + ey * ey;
+            if (r2 < 1.0f) {
+                float r = __builtin_sqrtf(r2);
+                over(&row[i], gfx_mix(theme.pale, theme.glow, (int)(r * 256.0f)), 0.8f * (1.0f - r));
+            }
+        }
+    }
+    for (int i = 0; i < 3; i++)
+        stroke_curve(s, &curves[i], w, h, theme.pale);
+}
+
 /* ---- the desktop's wallpaper ---- */
 
-static uint32_t desk_color = C_DESKTOP;
+static uint32_t desk_color = RGB(0x3F, 0x17, 0x5F);     /* (the classic desktop's purple) */
 
 uint32_t wallpaper_color(void)
 {
@@ -236,7 +333,7 @@ uint32_t wallpaper_color(void)
 
 static void rebuild(void)
 {
-    if (!src) {
+    if (!src && !kinetik) {
         surface_free(&wall);
         return;
     }
@@ -245,7 +342,12 @@ static void rebuild(void)
     if (!wall.px && surface_init(&wall, screen_w, screen_h) < 0) {
         image_free(src);                /* no room to draw it: no wallpaper */
         src = NULL;
+        kinetik = 0;
         cur_path[0] = 0;
+        return;
+    }
+    if (kinetik) {
+        wallpaper_kinetik(&wall, screen_w, screen_h);
         return;
     }
     wallpaper_render(&wall, mkrect(0, 0, screen_w, screen_h), src, src->w, src->h, cur_mode,
@@ -277,7 +379,7 @@ void wallpaper_draw(struct surface *s, struct rect clip)
 
 void wallpaper_resize(void)
 {
-    if (src)
+    if (src || kinetik)
         rebuild();
 }
 
@@ -328,10 +430,12 @@ void wallpaper_set_color(uint32_t rgb, int save)
 int wallpaper_set(const char *path, int mode, int save)
 {
     struct image *img = NULL;
-    if (path && path[0] && !(img = image_load(path)))
+    int drawn = path && !strcmp(path, WALLPAPER_KINETIK);
+    if (path && path[0] && !drawn && !(img = image_load(path)))
         return -1;
     image_free(src);
     src = img;
+    kinetik = drawn;
     snprintf(cur_path, sizeof(cur_path), "%s", path ? path : "");
     cur_mode = mode >= 0 && mode < WALL_MODES ? mode : WALL_FILL;
     rebuild();
@@ -341,11 +445,21 @@ int wallpaper_set(const char *path, int mode, int save)
     return 0;
 }
 
-/* At startup: the saved choice, or the photograph, filled. */
+void wallpaper_theme_changed(int old_style)
+{
+    if (KINETIK && old_style != THEME_KINETIK && (!strcmp(cur_path, WALLPAPER_DEFAULT) || !cur_path[0]))
+        wallpaper_set(WALLPAPER_KINETIK, cur_mode, 1);  /* the stock picture gives way to the theme's own */
+    else if (!KINETIK && kinetik && wallpaper_set(WALLPAPER_DEFAULT, cur_mode, 1) < 0)
+        wallpaper_set("", cur_mode, 1);                 /* (the picture is gone: the plain desktop) */
+    else if (kinetik)
+        wallpaper_set(WALLPAPER_KINETIK, cur_mode, 0);  /* in the new color */
+}
+
+/* At startup: the saved choice, or the theme's (the photograph, filled, for Classic). */
 void wallpaper_init(void)
 {
     char dir[128], path[256], name[16];
-    const char *use = WALLPAPER_DEFAULT;
+    const char *use = KINETIK ? WALLPAPER_KINETIK : WALLPAPER_DEFAULT;
     int mode = WALL_FILL;
     if (grubenv_boot_dir(dir, sizeof(dir))) {
         if (grubenv_get(dir, "fluxos_wall", path, sizeof(path)) && path[0])

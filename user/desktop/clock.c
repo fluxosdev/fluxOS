@@ -224,7 +224,14 @@ static void clock_destroy(struct window *w)
     clock_win = NULL;
 }
 
+static void clock_restyle(struct window *w)
+{
+    (void)w;
+    paint();
+}
+
 static const struct window_ops clock_ops = {
+    .restyle = clock_restyle,
     .key = clock_key,
     .mouse = clock_mouse,
     .destroy = clock_destroy,

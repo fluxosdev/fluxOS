@@ -1,0 +1,118 @@
+<!doctype html>
+<html>
+<head>
+<title>Pictures behind boxes, object-fit and scrolling boxes</title>
+<style>
+body { font-family: sans-serif; max-width: 760px; margin: 20px auto; padding: 0 16px; line-height: 1.4; color: #26202d; background: #f5f2f8; }
+h1, h2 { color: #4b2569; }
+h2 { margin-top: 26px; border-bottom: 1px solid #c9b8da; padding-bottom: 3px; }
+.row { display: flex; flex-wrap: wrap; gap: 12px; }
+.cell { width: 170px; }
+.cell p { margin: 3px 0 10px; font-size: 12px; color: #665c70; }
+.bg { width: 170px; height: 90px; border: 3px solid #4b2569; background-color: #fff; }
+.t1 { background-image: url(tile.svg); }
+.t2 { background: url(tile.svg) repeat-x; }
+.t3 { background: url(tile.svg) no-repeat center; }
+.t4 { background: url(tile.svg) 10px 20px / 60px 30px; }
+.t5 { background: url(wide.svg) center / cover; }
+.t6 { background: url(wide.svg) center / contain no-repeat #223; }
+.t7 { background: linear-gradient(rgba(75,37,105,.6), rgba(75,37,105,.1)), url(wide.svg) center / cover; }
+.t8 { background: url(wide.svg) center / cover; border-radius: 24px; }
+.t9 { background: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><rect width='8' height='8' fill='%23c06'/><rect x='8' y='8' width='8' height='8' fill='%23c06'/></svg>"); }
+.t10 { background: url(tile.svg) right bottom no-repeat; }
+.t11 { background: url(tile.svg) 0 0 / 50% 100%; }
+.fit { width: 170px; height: 90px; border: 1px solid #4b2569; background: #ddd; display: block; }
+.avatar { width: 90px; height: 90px; border-radius: 50%; object-fit: cover; border: 3px solid #4b2569; }
+.sc { border: 2px solid #4b2569; background: white; padding: 4px; margin: 6px 0; }
+.v { width: 300px; height: 90px; overflow: auto; }
+.h { width: 300px; overflow-x: auto; white-space: nowrap; }
+.both { width: 240px; height: 90px; overflow: scroll; }
+.hid { width: 240px; height: 50px; overflow: hidden; }
+.always { width: 240px; height: 60px; overflow: scroll; }
+.layout { display: flex; height: 140px; border: 2px solid #4b2569; background: white; }
+.layout .side { width: 130px; overflow: auto; background: #efe6f7; padding: 6px; }
+.layout .main { flex: 1; overflow: auto; padding: 6px; }
+.outer { width: 300px; height: 130px; overflow: auto; background: #efe6f7; }
+.inner { width: 230px; height: 70px; overflow: auto; margin: 60px 0 60px 8px; background: white; border: 1px solid #4b2569; }
+#log { width: 300px; height: 70px; overflow: auto; border: 2px solid #4b2569; background: white; font-size: 12px; }
+button { margin: 3px; padding: 4px 10px; }
+a.item { display: block; padding: 2px 4px; }
+</style>
+</head>
+<body>
+<h1>Boxes, pictures and scrolling</h1>
+<p><a href="home.html">Home</a></p>
+
+<h2>Background pictures</h2>
+<div class="row">
+<div class="cell"><div class="bg t1"></div><p>background-image (tiled)</p></div>
+<div class="cell"><div class="bg t2"></div><p>repeat-x</p></div>
+<div class="cell"><div class="bg t3"></div><p>no-repeat center</p></div>
+<div class="cell"><div class="bg t4"></div><p>10px 20px / 60px 30px</p></div>
+<div class="cell"><div class="bg t5"></div><p>center / cover</p></div>
+<div class="cell"><div class="bg t6"></div><p>contain, no-repeat</p></div>
+<div class="cell"><div class="bg t7"></div><p>gradient over a picture</p></div>
+<div class="cell"><div class="bg t8"></div><p>rounded corners</p></div>
+<div class="cell"><div class="bg t9"></div><p>a data: URL (SVG)</p></div>
+<div class="cell"><div class="bg t10"></div><p>right bottom</p></div>
+<div class="cell"><div class="bg t11"></div><p>50% 100%</p></div>
+</div>
+
+<h2>object-fit</h2>
+<div class="row">
+<div class="cell"><img class="fit" src="wide.svg" alt="wide"><p>fill (the default)</p></div>
+<div class="cell"><img class="fit" src="wide.svg" alt="wide" style="object-fit:contain"><p>contain</p></div>
+<div class="cell"><img class="fit" src="wide.svg" alt="wide" style="object-fit:cover"><p>cover</p></div>
+<div class="cell"><img class="fit" src="wide.svg" alt="wide" style="object-fit:none"><p>none</p></div>
+<div class="cell"><img class="fit" src="wide.svg" alt="wide" style="object-fit:scale-down"><p>scale-down</p></div>
+<div class="cell"><img class="fit" src="wide.svg" alt="wide" style="object-fit:cover;object-position:left top"><p>cover, left top</p></div>
+<div class="cell"><img class="avatar" src="wide.svg" alt="wide"><p>an avatar: round, cover</p></div>
+</div>
+
+<h2>Boxes that scroll</h2>
+<p>Use the wheel over a box, drag its bar, or click the arrows. When a box is at its end the page scrolls.</p>
+<div class="sc v" id="v">
+<p>This box is 90 pixels high with <code>overflow: auto</code>.</p>
+<p>Line two of a long text that wraps inside the box and goes on for a while.</p>
+<p>Line three.</p><p>Line four.</p><p>Line five: <a href="home.html">a link inside</a>.</p>
+<p>Line six.</p><p>Line seven.</p><p>The end.</p>
+</div>
+<div class="sc h">A line that goes on and on and on to the right, further than the box is wide, so it scrolls sideways: 0123456789 0123456789 0123456789 0123456789 0123456789.</div>
+<div class="sc both"><div style="width:420px;height:200px;background:linear-gradient(#fff, #c9b8da)">A 420 x 200 box in a 240 x 90 one, both bars. <button onclick="this.textContent='clicked'">Button</button></div></div>
+<div class="sc hid"><div style="height:120px">overflow: hidden cuts this off after 50 pixels. The rest of this text is not shown, and the page does not get any longer for it.</div></div>
+<div class="sc always">overflow: scroll shows the bars even when nothing needs scrolling.</div>
+
+<p>A scrolling pane in a flex layout:</p>
+<div class="layout">
+<div class="side"><a class="item" href="#">One</a><a class="item" href="#">Two</a><a class="item" href="#">Three</a><a class="item" href="#">Four</a><a class="item" href="#">Five</a><a class="item" href="#">Six</a><a class="item" href="#">Seven</a><a class="item" href="#">Eight</a><a class="item" href="#">Nine</a></div>
+<div class="main"><p>Main pane. It scrolls on its own, and so does the list at the left.</p><p>Paragraph.</p><p>Paragraph.</p><p>Paragraph.</p><p>Paragraph.</p><p>Paragraph.</p><p>Paragraph.</p><p>The end of the pane.</p></div>
+</div>
+
+<p>A box in a box (scroll the outer one to reach the inner one):</p>
+<div class="outer"><div class="inner"><p>Inner one.</p><p>Second line.</p><p>Third line.</p><p>Fourth line.</p><p>Fifth line.</p><p>Sixth line.</p></div></div>
+
+<h2>From scripts</h2>
+<p><button onclick="document.getElementById('v').scrollTop = 0">scrollTop = 0</button>
+<button onclick="document.getElementById('v').scrollTop += 30">scrollTop += 30</button>
+<button onclick="var e = document.getElementById('v'); e.scrollTop = e.scrollHeight">scrollTop = scrollHeight</button>
+<button onclick="addLine()">Add a line to the log</button></p>
+<div id="log"><div>log</div></div>
+<p id="info">scrollTop: <span id="st">0</span>, scrollHeight: <span id="sh">0</span>, clientHeight: <span id="ch">0</span></p>
+<script>
+var n = 0;
+function addLine() {
+  var log = document.getElementById("log"), d = document.createElement("div");
+  d.textContent = "line " + (++n);
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+}
+function show() {
+  var v = document.getElementById("v");
+  document.getElementById("st").textContent = v.scrollTop;
+  document.getElementById("sh").textContent = v.scrollHeight;
+  document.getElementById("ch").textContent = v.clientHeight;
+}
+setInterval(show, 300);
+</script>
+</body>
+</html>

@@ -1321,15 +1321,34 @@ static int node_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
     if (IS("offsetWidth") || IS("offsetHeight") || IS("clientWidth") || IS("clientHeight") ||
         IS("offsetTop") || IS("offsetLeft") || IS("scrollWidth") || IS("scrollHeight")) {
         int x = 0, y = 0, w = 0, h = 0;
+        if (d->dirty && d->h.flush && (IS("scrollWidth") || IS("scrollHeight"))) {   /* content was just added: how big now? */
+            d->dirty = 0;
+            d->h.flush(d->h.ctx);
+        }
         if (d->h.node_box)
             d->h.node_box(d->h.ctx, n, &x, &y, &w, &h);
+        int ssx, ssy, scw, sch, svw, svh;
+        if ((IS("scrollWidth") || IS("scrollHeight") || IS("clientWidth") || IS("clientHeight")) &&
+            d->h.node_scroll && d->h.node_scroll(d->h.ctx, n, 0, &ssx, &ssy, &scw, &sch, &svw, &svh)) {
+            w = IS("scrollWidth") ? scw : svw;      /* a box that scrolls: its contents, or what it shows of them */
+            h = IS("scrollHeight") ? sch : svh;
+        }
         *out = js_num(strstr(key, "Width") ? w : strstr(key, "Height") ? h : IS("offsetTop") ? y : x);
         return 1;
     }
     if (IS("scrollTop") || IS("scrollLeft")) {
-        int sx = 0, sy = 0;                 /* the root and body scroll with the window; nothing else does */
-        if ((n == d->h.root || n->tag == T_BODY) && d->h.scroll_pos)
-            d->h.scroll_pos(d->h.ctx, &sx, &sy);
+        int sx = n->scroll_x, sy = n->scroll_y, cw, ch, vw, vh;
+        if (n == d->h.root || n->tag == T_BODY) {   /* the root and body scroll with the window */
+            sx = sy = 0;
+            if (d->h.scroll_pos)
+                d->h.scroll_pos(d->h.ctx, &sx, &sy);
+        } else if (d->h.node_scroll) {
+            if (d->dirty && d->h.flush) {
+                d->dirty = 0;
+                d->h.flush(d->h.ctx);
+            }
+            d->h.node_scroll(d->h.ctx, n, 0, &sx, &sy, &cw, &ch, &vw, &vh);
+        }
         *out = js_num(IS("scrollTop") ? sy : sx);
         return 1;
     }
@@ -1494,9 +1513,26 @@ static int node_set(struct js *J, struct jsobj *o, const char *key, jsval v)
     if (IS("scrollTop") || IS("scrollLeft")) {
         double p = js_to_number(J, v);
         int sx = 0, sy = 0;
-        if ((n == d->h.root || n->tag == T_BODY) && d->h.scroll && d->h.scroll_pos && p == p) {
+        if (p != p)
+            p = 0;
+        if (p > 1e9)
+            p = 1e9;                        /* scrollTop = Infinity means as far as it goes */
+        if ((n == d->h.root || n->tag == T_BODY) && d->h.scroll && d->h.scroll_pos) {
             d->h.scroll_pos(d->h.ctx, &sx, &sy);
             d->h.scroll(d->h.ctx, IS("scrollLeft") ? (int)p : sx, IS("scrollTop") ? (int)p : sy, 0);
+        } else if (d->h.node_scroll) {
+            int cw, ch, vw, vh;
+            if (d->dirty && d->h.flush) {
+                d->dirty = 0;
+                d->h.flush(d->h.ctx);
+            }
+            sx = n->scroll_x, sy = n->scroll_y;
+            d->h.node_scroll(d->h.ctx, n, 0, &sx, &sy, &cw, &ch, &vw, &vh);
+            if (IS("scrollLeft"))
+                sx = (int)p;
+            else
+                sy = (int)p;
+            d->h.node_scroll(d->h.ctx, n, 1, &sx, &sy, &cw, &ch, &vw, &vh);
         }
         return 1;
     }
@@ -2689,7 +2725,9 @@ static jsval el_scroll_into_view(struct js *J, jsval self, jsval *args, int argc
     struct node *n = this_node(J, self);
     struct jsdom *d = dom(J);
     int x, y, w, h;
-    if (n && d->h.node_box && d->h.node_box(d->h.ctx, n, &x, &y, &w, &h) && d->h.scroll)
+    if (n && d->h.reveal)
+        d->h.reveal(d->h.ctx, n);
+    else if (n && d->h.node_box && d->h.node_box(d->h.ctx, n, &x, &y, &w, &h) && d->h.scroll)
         d->h.scroll(d->h.ctx, 0, y, 0);
     return js_undefined;
 }

@@ -762,7 +762,13 @@ static void calc_destroy(struct window *w)
     free(w->priv);
 }
 
+static void calc_restyle(struct window *w)
+{
+    paint(w->priv);
+}
+
 static const struct window_ops calc_ops = {
+    .restyle = calc_restyle,
     .key = calc_key,
     .mouse = calc_mouse,
     .destroy = calc_destroy,

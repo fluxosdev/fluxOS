@@ -12,10 +12,44 @@
 #include <flux/abi.h>
 #include "gfx.h"
 
+/* ---- themes (theme.c) ---- */
+/* How the desktop looks: Classic is Windows 95's grays and bevels; Kinetik has rounded,
+ * shaded frames with gradient captions in one of six colors, and Archivo for its text. */
+enum theme_style { THEME_CLASSIC, THEME_KINETIK, THEME_STYLES };
+enum { ACCENT_BLUE, ACCENT_PURPLE, ACCENT_ORANGE, ACCENT_GREEN, ACCENT_WHITE, ACCENT_BLACK, ACCENTS };
+
+struct theme {
+    int style, accent;
+    /* frame geometry */
+    int border;                 /* the frame below and beside the client area */
+    int cap_inset;              /* the caption's distance from the frame's top and sides */
+    int cap_gap;                /* between the caption and the client area */
+    int title_h, taskbar_h;
+    int radius;                 /* round corners on frames and menus (0: square) */
+    const struct pfont *title_font;
+    /* Kinetik's colors: the wallpaper's gradient (wall0, wall1, wall2) and glow (pale, glow),
+     * the captions and taskbar (chrome0 to chrome2 down them), their outline, text on menus
+     * (ink) and on the chrome (on_chrome) */
+    color_t wall0, wall1, wall2, pale, glow, chrome0, chrome1, chrome2, stroke, ink, on_chrome;
+};
+extern struct theme theme;
+extern const char *const theme_style_names[THEME_STYLES];
+extern const char *const accent_names[ACCENTS];
+extern const color_t accent_swatches[ACCENTS];
+
+/* The look in use, at startup: the saved one (fluxos_theme in grubenv), or Kinetik. */
+void theme_init(void);
+/* Change it: everything is drawn again (and kept for the next start, if save). */
+void theme_set(int style, int accent, int save);
+/* How a style and color would look, drawn into r of s (with the Kinetik wallpaper behind, or the plain desktop). */
+void theme_sample(struct surface *s, struct rect r, int style, int accent);
+
 /* Frame geometry */
-#define BORDER     4            /* window frame, each side */
-#define TITLE_H    18           /* caption bar */
-#define TASKBAR_H  28
+#define BORDER     (theme.border)           /* window frame, beside and below the client area */
+#define TITLE_H    (theme.title_h)          /* caption bar */
+#define TASKBAR_H  (theme.taskbar_h)
+#define FRAME_TOP  (theme.cap_inset + TITLE_H + theme.cap_gap)     /* the frame above the client area */
+#define KINETIK    (theme.style == THEME_KINETIK)
 
 /* Window flags */
 #define WF_MINIMIZE 0x1         /* has a minimize button */
@@ -79,6 +113,9 @@ struct window_ops {
     void (*resize)(struct window *w);
     void (*focus)(struct window *w, int focused);
     void (*close)(struct window *w);    /* close button or Alt+F4 */
+    /* The theme changed: draw the client area again. Without it the wm calls resize, or
+     * else focus, which most windows redraw themselves for. */
+    void (*restyle)(struct window *w);
     void (*destroy)(struct window *w);  /* free app data */
 };
 
@@ -140,6 +177,10 @@ int wm_reconfigure(void);
 int wm_accel(void);
 void wm_set_accel(int on);
 void wm_tray_changed(void);             /* redraw the tray (the volume icon) */
+/* The theme changed: frames get its geometry, windows draw again, everything is repainted. */
+void wm_restyle(void);
+/* A sample of the theme in use (two windows and the taskbar), drawn into r of s over what is there. */
+void wm_draw_sample(struct surface *s, struct rect r);
 void wm_splash(const char *message, color_t color);     /* full-screen notice */
 void wm_tick(void);             /* clock and timers; call a few times a second */
 unsigned int now_ms(void);
@@ -160,6 +201,8 @@ void draw_title_button(struct surface *s, struct rect r, int glyph, int pressed,
 enum { TB_CLOSE, TB_MINIMIZE, TB_MAXIMIZE, TB_RESTORE };
 void draw_radio(struct surface *s, int x, int y, const char *label, int checked, int focused);
 void draw_separator(struct surface *s, int x, int y, int w);
+/* The edges of a tab r over a tabbed panel (the caller fills it, and the panel). */
+void draw_tab_edges(struct surface *s, struct rect r, int selected);
 
 /* A scroll bar along one axis. pos, page and total share one unit (lines,
  * columns, ...): the view shows [pos, pos + page) of total. */
@@ -219,6 +262,11 @@ enum { WALL_FILL, WALL_STRETCH, WALL_CENTER, WALL_TILE, WALL_MODES };
 extern const char *const wall_mode_names[WALL_MODES];
 #define WALLPAPER_DIR     "/usr/share/wallpapers"
 #define WALLPAPER_DEFAULT WALLPAPER_DIR "/mountains.jpg"
+#define WALLPAPER_KINETIK "kinetik"     /* not a file: the Kinetik theme's own, drawn in its color */
+/* The Kinetik wallpaper at w x h, into s at (0, 0). */
+void wallpaper_kinetik(struct surface *s, int w, int h);
+/* The theme changed from old_style: a theme's own wallpaper goes with it. */
+void wallpaper_theme_changed(int old_style);
 void wallpaper_init(void);              /* the saved wallpaper, or the default */
 /* "" shows none; save keeps it for the next start. -1 if the file cannot be shown. */
 int wallpaper_set(const char *path, int mode, int save);

@@ -9,6 +9,12 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
+/* Windows 95's, until theme.c chooses. */
+struct syscolors sys = {
+    .face = RGB(0xC0, 0xC0, 0xC0), .light = RGB(0xDF, 0xDF, 0xDF), .shadow = RGB(0x80, 0x80, 0x80),
+    .highlight = RGB(0x00, 0x00, 0x80), .desktop = RGB(0x3F, 0x17, 0x5F), .teal = RGB(0x00, 0x80, 0x80),
+};
+
 int rect_empty(struct rect r)
 {
     return r.w <= 0 || r.h <= 0;
@@ -353,8 +359,214 @@ static void bevel2(struct surface *s, struct rect r, color_t otl, color_t obr,
     gfx_vline(s, x + w - 2, y + 1, h - 2, ibr);
 }
 
+/* ---- rounded and blended shapes ---- */
+
+color_t gfx_mix(color_t a, color_t b, int t)
+{
+    color_t out = 0;
+    for (int sh = 0; sh < 32; sh += 8) {
+        int u = (int)(a >> sh & 0xFF), v = (int)(b >> sh & 0xFF);
+        out |= (color_t)(u + (v - u) * t / 256) << sh;
+    }
+    return out;
+}
+
+/* How much of pixel (i, j) a w x h box with these corner radii covers, out of 256. */
+static int round_cov(int i, int j, int w, int h, int rt, int rb)
+{
+    if (i < 0 || j < 0 || i >= w || j >= h)
+        return 0;
+    int r, cx, cy;
+    if (j < rt && i < rt)
+        r = rt, cx = rt, cy = rt;
+    else if (j < rt && i >= w - rt)
+        r = rt, cx = w - rt, cy = rt;
+    else if (j >= h - rb && i < rb)
+        r = rb, cx = rb, cy = h - rb;
+    else if (j >= h - rb && i >= w - rb)
+        r = rb, cx = w - rb, cy = h - rb;
+    else
+        return 256;
+    float dx = (float)i + 0.5f - (float)cx, dy = (float)j + 0.5f - (float)cy;
+    float c = (float)r - __builtin_sqrtf(dx * dx + dy * dy) + 0.5f;
+    return c <= 0.0f ? 0 : c >= 1.0f ? 256 : (int)(c * 256.0f);
+}
+
+/* argb over the pixel, with cov (out of 256) of its alpha. MMX: callers simd_done(). */
+static inline void put_argb(uint32_t *px, color_t argb, int cov)
+{
+    uint32_t a = (argb >> 24) * (uint32_t)cov / 256;
+    if (a >= 255)
+        *px = argb & 0xFFFFFF;
+    else if (a)
+        *px = blend(*px, argb, a);
+}
+
+/* The color n stops make at t (0..256), alpha included. */
+static color_t stop_color(int n, const color_t *colors, const int *pos, int t)
+{
+    if (t <= pos[0])
+        return colors[0];
+    for (int k = 1; k < n; k++)
+        if (t <= pos[k]) {
+            int span = pos[k] - pos[k - 1];
+            return span > 0 ? gfx_mix(colors[k - 1], colors[k], (t - pos[k - 1]) * 256 / span) : colors[k];
+        }
+    return colors[n - 1];
+}
+
+void gfx_gradient(struct surface *s, struct rect r, int rt, int rb, int n, const color_t *colors,
+                  const int *pos)
+{
+    struct rect c = rect_intersect(r, s->clip);
+    if (rect_empty(c) || n < 1)
+        return;
+    for (int j = c.y; j < c.y + c.h; j++) {
+        int bj = j - r.y;
+        color_t col = stop_color(n, colors, pos, r.h > 1 ? bj * 256 / (r.h - 1) : 0);
+        uint32_t *row = s->px + j * s->stride;
+        int corner_row = bj < rt || bj >= r.h - rb;
+        if (!corner_row && (col >> 24) == 255) {
+            memset32(row + c.x, col & 0xFFFFFF, (size_t)c.w);
+            continue;
+        }
+        for (int i = c.x; i < c.x + c.w; i++)
+            put_argb(&row[i], col, corner_row ? round_cov(i - r.x, bj, r.w, r.h, rt, rb) : 256);
+    }
+    simd_done();
+}
+
+void gfx_round_fill(struct surface *s, struct rect r, int rt, int rb, color_t argb)
+{
+    static const int pos[1] = { 0 };
+    gfx_gradient(s, r, rt, rb, 1, &argb, pos);
+}
+
+void gfx_round_frame(struct surface *s, struct rect r, int rt, int rb, color_t argb)
+{
+    struct rect c = rect_intersect(r, s->clip);
+    if (rect_empty(c))
+        return;
+    int it = rt > 0 ? rt - 1 : 0, ib = rb > 0 ? rb - 1 : 0;
+    for (int j = c.y; j < c.y + c.h; j++) {
+        int bj = j - r.y;
+        uint32_t *row = s->px + j * s->stride;
+        int corner_row = bj < rt || bj >= r.h - rb;
+        for (int i = c.x; i < c.x + c.w; i++) {
+            int bi = i - r.x;
+            if (!corner_row && bj > 0 && bj < r.h - 1 && bi > 0 && bi < r.w - 1) {
+                i = r.x + r.w - 2;              /* the inside of a straight stretch */
+                if (i < c.x)
+                    i = c.x;
+                continue;
+            }
+            int cov = round_cov(bi, bj, r.w, r.h, rt, rb) - round_cov(bi - 1, bj - 1, r.w - 2, r.h - 2, it, ib);
+            if (cov > 0)
+                put_argb(&row[i], argb, cov);
+        }
+    }
+    simd_done();
+}
+
+/* How far (x, y) is outside a box (centre cx, cy, half size hw, hh, corners of radius rad); 0 inside. */
+static float box_distance(float x, float y, float cx, float cy, float hw, float hh, float rad)
+{
+    float qx = (x < cx ? cx - x : x - cx) - (hw - rad), qy = (y < cy ? cy - y : y - cy) - (hh - rad);
+    if (qx < 0.0f)
+        qx = 0.0f;
+    if (qy < 0.0f)
+        qy = 0.0f;
+    float d = __builtin_sqrtf(qx * qx + qy * qy) - rad;
+    return d > 0.0f ? d : 0.0f;
+}
+
+void gfx_shadow(struct surface *s, struct rect r, int rad, int dy, int blur, color_t argb)
+{
+    struct rect area = mkrect(r.x - blur, r.y - blur + dy, r.w + 2 * blur, r.h + 2 * blur);
+    struct rect c = rect_intersect(area, s->clip);
+    if (rect_empty(c) || blur <= 0)
+        return;
+    float cx = (float)r.x + (float)r.w / 2.0f, cy = (float)(r.y + dy) + (float)r.h / 2.0f;
+    float hw = (float)r.w / 2.0f, hh = (float)r.h / 2.0f, fb = (float)blur;
+    for (int j = c.y; j < c.y + c.h; j++) {
+        uint32_t *row = s->px + j * s->stride;
+        int bj = j - r.y;
+        int inside_rows = bj >= rad && bj < r.h - rad;     /* the box covers its whole width here */
+        for (int i = c.x; i < c.x + c.w; i++) {
+            if (inside_rows && i >= r.x && i < r.x + r.w) {
+                i = r.x + r.w - 1;
+                continue;
+            }
+            if (round_cov(i - r.x, bj, r.w, r.h, rad, rad) == 256)
+                continue;
+            float d = box_distance((float)i + 0.5f, (float)j + 0.5f, cx, cy, hw, hh, (float)rad);
+            if (d >= fb)
+                continue;
+            float k = 1.0f - d / fb;
+            put_argb(&row[i], argb, (int)(k * k * 256.0f));
+        }
+    }
+    simd_done();
+}
+
+void gfx_line(struct surface *s, int x0, int y0, int x1, int y1, int w, color_t argb)
+{
+    int pad = w / 2 + 2;
+    struct rect box = mkrect(MIN(x0, x1) - pad, MIN(y0, y1) - pad, abs(x1 - x0) + 2 * pad + 1,
+                             abs(y1 - y0) + 2 * pad + 1);
+    struct rect c = rect_intersect(box, s->clip);
+    if (rect_empty(c))
+        return;
+    float ax = (float)x0 + 0.5f, ay = (float)y0 + 0.5f, bx = (float)x1 + 0.5f, by = (float)y1 + 0.5f;
+    float dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy, half = (float)w / 2.0f;
+    for (int j = c.y; j < c.y + c.h; j++) {
+        uint32_t *row = s->px + j * s->stride;
+        for (int i = c.x; i < c.x + c.w; i++) {
+            float px = (float)i + 0.5f, py = (float)j + 0.5f;
+            float t = len2 > 0.0f ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0.0f;
+            t = t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t;
+            float ex = ax + t * dx - px, ey = ay + t * dy - py;
+            float cov = half + 0.5f - __builtin_sqrtf(ex * ex + ey * ey);
+            if (cov > 0.0f)
+                put_argb(&row[i], argb, cov >= 1.0f ? 256 : (int)(cov * 256.0f));
+        }
+    }
+    simd_done();
+}
+
+/* ---- bevels ---- */
+
+/* The Kinetik theme's: one-pixel outlines, a raised one lit along its top. */
+static void flat_bevel(struct surface *s, struct rect r, enum bevel style)
+{
+    switch (style) {
+    case BEVEL_RAISED:
+        gfx_frame(s, r.x, r.y, r.w, r.h, sys.edge);
+        gfx_hline(s, r.x + 1, r.y + 1, r.w - 2, C_WHITE);
+        break;
+    case BEVEL_THIN_RAISED:
+        gfx_frame(s, r.x, r.y, r.w, r.h, sys.edge);
+        break;
+    case BEVEL_WINDOW:
+        gfx_frame(s, r.x, r.y, r.w, r.h, sys.edge_dark);
+        break;
+    case BEVEL_PRESSED:
+        gfx_frame(s, r.x, r.y, r.w, r.h, sys.edge_dark);
+        gfx_hline(s, r.x + 1, r.y + 1, r.w - 2, gfx_mix(sys.face, sys.edge_dark, 96));
+        break;
+    case BEVEL_SUNKEN:
+    case BEVEL_THIN_SUNKEN:
+        gfx_frame(s, r.x, r.y, r.w, r.h, sys.field_edge);
+        break;
+    }
+}
+
 void gfx_bevel(struct surface *s, struct rect r, enum bevel style)
 {
+    if (sys.flat) {
+        flat_bevel(s, r, style);
+        return;
+    }
     switch (style) {
     case BEVEL_RAISED:
         bevel2(s, r, C_WHITE, C_BLACK, C_LIGHT, C_SHADOW);

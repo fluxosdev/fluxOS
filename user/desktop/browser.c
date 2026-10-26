@@ -79,7 +79,7 @@
 enum { F_PAGE, F_CSS, F_IMG, F_JS, F_XHR, F_ICON, F_MODULE };
 enum { NAV_NEW, NAV_REPLACE, NAV_HISTORY };
 enum { B_BACK, B_FORWARD, B_STOP, B_REFRESH, B_HOME, B_HISTORY, B_DOWNLOADS, B_GO, NBUTTONS };
-enum hold { H_NONE, H_BUTTON, H_VBAR, H_HBAR, H_PAGE };
+enum hold { H_NONE, H_BUTTON, H_VBAR, H_HBAR, H_PAGE, H_SBOX };
 
 struct fetch {
     int active;
@@ -116,6 +116,12 @@ struct res {                    /* a style sheet, image, script or request waiti
 struct imgref {                 /* an <img> and the URL its picture comes from */
     struct node *n;
     char *url;
+};
+
+struct bgref {                  /* a background picture some element's style asks for */
+    char *url;                  /* absolute, or a data: URL as written */
+    char *via;                  /* where a redirect sent the request, or NULL */
+    struct image *img;          /* NULL until it has arrived (or if it never will) */
 };
 
 struct cached {
@@ -156,6 +162,8 @@ struct browser {
     int nimports;
     struct imgref *imgs;
     int nimgs;
+    struct bgref *bgs;                  /* background pictures, by what asked for them */
+    int nbgs;
     int laid_out_w;
     unsigned layouts, boxes_for;        /* layouts done; the one the nodes' boxes are of */
     int scroll_x, scroll_y;
@@ -195,6 +203,8 @@ struct browser {
     int sel_ax, sel_ay, sel_fx, sel_fy; /* its ends, in page coordinates */
     enum sbar_part sbar_pressed;
     int grab;
+    struct sbhit sb_hit;                /* H_SBOX: the scroll bar of a box on the page that is held */
+    int sb_grab;
 
     struct cached *cache;
     size_t cache_bytes;
@@ -427,6 +437,66 @@ static struct cached *cache_find(struct browser *b, const char *url)
     return NULL;
 }
 
+static void cache_add(struct browser *b, const char *url, struct image *img);
+
+/* The picture a data: URL holds (base64, or percent-encoded text), or NULL. */
+static struct image *data_url_image(const char *url)
+{
+    const char *comma = strchr(url, ',');
+    if (!comma || strncasecmp(url, "data:", 5))
+        return NULL;
+    int b64 = 0;
+    for (const char *p = url + 5; p < comma; p++)
+        if (!strncasecmp(p, ";base64", 7))
+            b64 = 1;
+    size_t n = strlen(comma + 1);
+    uint8_t *buf = malloc(n + 1);
+    if (!buf)
+        return NULL;
+    size_t o = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (const char *p = comma + 1; *p; p++) {
+        int c = (unsigned char)*p;
+        if (c == '%' && isxdigit((unsigned char)p[1]) && isxdigit((unsigned char)p[2])) {
+            char hex[3] = { p[1], p[2], 0 };
+            c = (int)strtol(hex, NULL, 16);
+            p += 2;
+            if (!b64) {
+                buf[o++] = (uint8_t)c;
+                continue;
+            }
+        } else if (!b64) {
+            buf[o++] = (uint8_t)c;
+            continue;
+        }
+        int v = c >= 'A' && c <= 'Z' ? c - 'A' : c >= 'a' && c <= 'z' ? c - 'a' + 26 : c >= '0' && c <= '9' ? c - '0' + 52
+              : c == '+' || c == '-' ? 62 : c == '/' || c == '_' ? 63 : -1;
+        if (v < 0)
+            continue;                   /* padding and white space */
+        acc = acc << 6 | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            buf[o++] = (uint8_t)(acc >> bits);
+        }
+    }
+    struct image *img = o > 8 ? image_decode(buf, (uint32_t)o) : NULL;
+    free(buf);
+    return img;
+}
+
+/* cache_find, and a data: URL is decoded on the spot (and cached) the first time. */
+static struct cached *cache_find_data(struct browser *b, const char *url)
+{
+    struct cached *c = cache_find(b, url);
+    if (!c && !strncasecmp(url, "data:", 5)) {
+        cache_add(b, url, data_url_image(url));
+        c = cache_find(b, url);
+    }
+    return c;
+}
+
 static void cache_add(struct browser *b, const char *url, struct image *img)
 {
     struct cached *c = calloc(1, sizeof(*c));
@@ -447,6 +517,8 @@ static void cache_add(struct browser *b, const char *url, struct image *img)
             int used = 0;
             for (int i = 0; i < b->nimgs && !used; i++)
                 used = b->imgs[i].n->img && b->imgs[i].n->img == (*pp)->img;
+            for (int i = 0; i < b->nbgs && !used; i++)      /* styles point at background pictures */
+                used = b->bgs[i].img && b->bgs[i].img == (*pp)->img;
             if (!used && (*pp)->img)
                 victim = pp;
         }
@@ -1234,6 +1306,129 @@ static int queue_resource(struct browser *b, int kind, const char *url, int slot
     return 1;
 }
 
+/* ---- background pictures ---- */
+
+static struct bgref *bg_find(struct browser *b, const char *url)
+{
+    for (int i = 0; i < b->nbgs; i++)
+        if (!strcmp(b->bgs[i].url, url))
+            return &b->bgs[i];
+    return NULL;
+}
+
+/*
+ * Give every style whose background names a picture that picture (or none yet): asks for the ones not asked
+ * for before. Styles are made afresh at each cascade, so this runs before each layout.
+ */
+static void bg_attach(struct browser *b)
+{
+    if (!b->root || !b->bgs)
+        return;
+    for (struct node *n = b->root; n; n = node_next(n, b->root)) {
+        if (n->type != N_ELEMENT || !n->style || !n->style->bg_url)
+            continue;
+        char abs[URL_MAX];
+        const char *key = n->style->bg_url;
+        if (strncasecmp(key, "data:", 5)) {
+            url_resolve(b->base, key, abs, sizeof(abs));
+            url_strip_fragment(abs);
+            key = abs;
+        }
+        struct bgref *r = bg_find(b, key);
+        if (!r && b->nbgs < MAX_RES) {
+            r = &b->bgs[b->nbgs++];
+            r->url = arena_strdup(&b->arena, key);
+            r->via = NULL;
+            r->img = NULL;
+            struct cached *c = r->url ? cache_find_data(b, r->url) : NULL;
+            if (c)
+                r->img = c->img;
+            else if (r->url)
+                queue_resource(b, F_IMG, r->url, 0, 0);
+        }
+        n->style->bg_img = r ? r->img : NULL;
+    }
+}
+
+/* A picture arrived (img is NULL if it could not be used): the styles that wanted it are given it by the next layout. */
+static void bg_arrived(struct browser *b, const char *url, struct image *img)
+{
+    for (int i = 0; i < b->nbgs; i++) {
+        struct bgref *r = &b->bgs[i];
+        if (img && (!strcmp(r->url, url) || (r->via && !strcmp(r->via, url)))) {
+            r->img = img;
+            b->need_layout = 1;
+        }
+    }
+}
+
+/*
+ * Turn the address in every url() of a style sheet (fetched from base) into an absolute one, so that
+ * a picture is found wherever the rules end up. NULL when there is nothing to change.
+ */
+static char *css_absolute_urls(const char *text, int len, const char *base, int *outlen)
+{
+    int cap = len + 256, o = 0, changed = 0;
+    char *out = malloc((size_t)cap);
+    if (!out)
+        return NULL;
+    for (int i = 0; i < len;) {
+        if (i + 4 < len && !strncasecmp(text + i, "url(", 4) && (i == 0 || !(isalnum((unsigned char)text[i - 1]) ||
+                                                                              text[i - 1] == '-' || text[i - 1] == '_'))) {
+            int q = i + 4;
+            while (q < len && isspace((unsigned char)text[q]))
+                q++;
+            char quote = q < len && (text[q] == '"' || text[q] == '\'') ? text[q++] : 0;
+            int s0 = q;
+            while (q < len && (quote ? text[q] != quote : text[q] != ')' && !isspace((unsigned char)text[q])))
+                q++;
+            int e0 = q;
+            while (q < len && text[q] != ')')
+                q++;
+            int rel = e0 > s0 && text[s0] != '#' && strncasecmp(text + s0, "data:", 5) &&
+                      strncasecmp(text + s0, "http:", 5) && strncasecmp(text + s0, "https:", 6) &&
+                      strncasecmp(text + s0, "file:", 5) && strncasecmp(text + s0, "about:", 6) &&
+                      strncasecmp(text + s0, "blob:", 5) && e0 - s0 < URL_MAX;
+            if (rel && q < len) {
+                char ref[URL_MAX], abs[URL_MAX];
+                snprintf(ref, sizeof(ref), "%.*s", e0 - s0, text + s0);
+                url_resolve(base, ref, abs, sizeof(abs));
+                int need = (int)strlen(abs) + 8;
+                if (o + need + (len - q) > cap) {
+                    cap = (o + need + (len - q)) * 2;
+                    char *no = realloc(out, (size_t)cap);
+                    if (!no) {
+                        free(out);
+                        return NULL;
+                    }
+                    out = no;
+                }
+                o += snprintf(out + o, (size_t)(cap - o), "url(\"%s\")", abs);
+                i = q + 1;
+                changed = 1;
+                continue;
+            }
+        }
+        if (o + 2 > cap) {
+            cap *= 2;
+            char *no = realloc(out, (size_t)cap);
+            if (!no) {
+                free(out);
+                return NULL;
+            }
+            out = no;
+        }
+        out[o++] = text[i++];
+    }
+    if (!changed) {
+        free(out);
+        return NULL;
+    }
+    out[o] = 0;
+    *outlen = o;
+    return out;
+}
+
 /* ---- frames ---- */
 
 /* Take a frame (and its frames) out of the page. It may be running code
@@ -1297,8 +1492,24 @@ static int frame_box(struct browser *b, const struct browser *f, struct rect *r)
     if (!d)
         return 0;
     struct rect v = view_rect(b);
-    *r = mkrect(v.x + d->x - b->scroll_x, v.y + d->y - b->scroll_y, d->w, d->h);
+    int sbx = 0, sby = 0;
+    if (d->sb)                          /* in a box that scrolls: where it has moved it */
+        layout_sb_view(&b->lo, d->sb, b->scroll_x, b->scroll_y, &sbx, &sby, NULL);
+    *r = mkrect(v.x + d->x + sbx - b->scroll_x, v.y + d->y + sby - b->scroll_y, d->w, d->h);
     return 1;
+}
+
+/* The part of b's view that shows the frame's box: all of it, but for boxes that scroll round it. */
+static struct rect frame_clip(struct browser *b, const struct browser *f)
+{
+    struct rect v = view_rect(b);
+    const struct ditem *d = frame_item(b, f);
+    if (!d || !d->sb)
+        return v;
+    int sbx, sby;
+    struct rect c;
+    layout_sb_view(&b->lo, d->sb, b->scroll_x, b->scroll_y, &sbx, &sby, &c);
+    return rect_intersect(v, mkrect(v.x + c.x - b->scroll_x, v.y + c.y - b->scroll_y, c.w, c.h));
 }
 
 /* The frame whose box is at (x, y), in b's page. */
@@ -1307,7 +1518,7 @@ static struct browser *frame_at(struct browser *b, int x, int y, struct rect *r)
     if (!rect_contains(view_rect(b), x, y))
         return NULL;
     for (struct browser *f = b->frames; f; f = f->next_frame)
-        if (frame_box(b, f, r) && rect_contains(*r, x, y))
+        if (frame_box(b, f, r) && rect_contains(*r, x, y) && rect_contains(frame_clip(b, f), x, y))
             return f;
     return NULL;
 }
@@ -1396,6 +1607,8 @@ static void free_page(struct browser *b)
     b->nsheets = b->nlinks = b->nimports = 0;
     b->imgs = NULL;
     b->nimgs = 0;
+    b->bgs = NULL;
+    b->nbgs = 0;
     b->focus = NULL;
     b->hover = NULL;
     b->press_link = b->press_ctrl = NULL;
@@ -1426,6 +1639,7 @@ static void relayout(struct browser *b)
         css_cascade(&b->sarena, b->root, b->sheets, b->nsheets, v.w, v.h, is_visited, b);
         b->need_style = 0;
     }
+    bg_attach(b);
     arena_free(&b->larena);
     layout_document(&b->larena, &b->lo, b->root, v.w, v.h);
     b->layouts++;
@@ -1794,6 +2008,12 @@ static int image_source(struct browser *b, struct node *n, char *out, int size)
         src = pick;
     if (!src || !*src)
         return 0;
+    if (!strncasecmp(src, "data:", 5)) {        /* the picture is in it: too long for a URL buffer, no picture */
+        if ((int)strlen(src) >= size)
+            return 0;
+        snprintf(out, (size_t)size, "%s", src);
+        return 1;
+    }
     url_resolve(b->base, src, out, size);
     url_strip_fragment(out);
     return 1;
@@ -1805,7 +2025,7 @@ static void js_load_image(void *ctx, struct node *n)
     char abs[URL_MAX];
     if (!b->imgs || !image_source(b, n, abs, sizeof(abs)))
         return;
-    struct cached *c = cache_find(b, abs);
+    struct cached *c = cache_find_data(b, abs);
     if (b->nimgs < MAX_RES) {
         b->imgs[b->nimgs].n = n;
         b->imgs[b->nimgs].url = arena_strdup(&b->arena, abs);
@@ -1821,6 +2041,42 @@ static void js_load_image(void *ctx, struct node *n)
         start_next(b);
 }
 
+static void js_flush(void *ctx)
+{
+    js_changed(ctx);
+}
+
+/* An element with overflow that scrolls (jsdom.c's scrollTop and friends). */
+static int js_node_scroll(void *ctx, struct node *n, int set, int *sx, int *sy, int *cw, int *ch, int *vw, int *vh)
+{
+    struct browser *b = ctx;
+    if (set) {
+        layout_set_node_scroll(&b->lo, n, *sx, *sy);
+        paint(b);
+    }
+    return layout_node_scroll(&b->lo, n, sx, sy, cw, ch, vw, vh);
+}
+
+static int js_node_box(void *ctx, struct node *n, int *x, int *y, int *w, int *h);
+
+/* element.scrollIntoView(): the boxes that scroll round it, then the page. */
+static void js_reveal(void *ctx, struct node *n)
+{
+    struct browser *b = ctx;
+    int x, y, w, h;
+    if (!js_node_box(ctx, n, &x, &y, &w, &h))
+        return;
+    layout_reveal(&b->lo, n, x, y, w, h);
+    for (const struct node *a = n->parent; a; a = a->parent) {      /* it is that much higher up the page now */
+        int sx, sy, cw, ch, vw, vh;
+        if (layout_node_scroll(&b->lo, a, &sx, &sy, &cw, &ch, &vw, &vh))
+            y -= sy;
+    }
+    b->scroll_y = y;
+    clamp_scroll(b);
+    paint(b);
+}
+
 /* An element's box: everything laid out for it and its descendants. Worked
  * out for every element at once, the first time a script asks after a layout. */
 static int js_node_box(void *ctx, struct node *n, int *x, int *y, int *w, int *h)
@@ -1833,16 +2089,21 @@ static int js_node_box(void *ctx, struct node *n, int *x, int *y, int *w, int *h
             const struct ditem *d = &b->lo.items[i];
             if (!d->node || d->w <= 0 || d->h <= 0)
                 continue;
+            const struct node *stop = d->sb ? b->lo.sb[d->sb - 1].node : NULL;   /* what a box clips is its own business */
             for (struct node *k = d->node; k; k = k->parent) {
                 if (k->bgen != gen) {
                     k->bgen = gen;
                     k->bx0 = d->x, k->by0 = d->y, k->bx1 = d->x + d->w, k->by1 = d->y + d->h;
+                    if (k == stop)
+                        break;
                     continue;
                 }
                 if (d->x < k->bx0) k->bx0 = d->x;
                 if (d->y < k->by0) k->by0 = d->y;
                 if (d->x + d->w > k->bx1) k->bx1 = d->x + d->w;
                 if (d->y + d->h > k->by1) k->by1 = d->y + d->h;
+                if (k == stop)
+                    break;
             }
         }
     }
@@ -2004,7 +2265,8 @@ static void start_scripts(struct browser *b, const char *url)
         .navigate = js_navigate, .history = js_history, .reload = js_reload, .alert = js_alert,
         .status = js_status, .changed = js_changed, .scroll = js_scroll, .scroll_pos = js_scroll_pos,
         .viewport = js_viewport, .set_title = js_set_title, .load_script = js_load_script,
-        .load_image = js_load_image, .node_box = js_node_box, .focus = js_focus, .http = js_http,
+        .load_image = js_load_image, .node_box = js_node_box, .node_scroll = js_node_scroll,
+        .reveal = js_reveal, .flush = js_flush, .focus = js_focus, .http = js_http,
         .cookie_get = js_cookie_get, .cookie_set = js_cookie_set, .fetch_module = js_fetch_module,
         .module_done = js_module_done, .set_url = js_set_url, .submit = js_submit, .node_at = js_node_at,
     };
@@ -2131,7 +2393,10 @@ static struct sheet *parse_sheet(struct browser *b, const char *text, int len, c
 {
     struct rect vr = view_rect(b);
     css_viewport_h = vr.h;
-    struct sheet *sh = css_parse(&b->arena, text, len, vr.w);
+    int alen = len;
+    char *abs_text = css_absolute_urls(text, len, base, &alen);
+    struct sheet *sh = css_parse(&b->arena, abs_text ? abs_text : text, abs_text ? alen : len, vr.w);
+    free(abs_text);
     struct import_ctx ic = { b, base, owner, parent };
     if (imports)
         css_imports(text, len, vr.w, import_found, &ic);
@@ -2277,6 +2542,8 @@ static void load_document(struct browser *b, const char *text, int len, const ch
     char icon_href[URL_MAX] = "";
     char abs_img[URL_MAX];
     b->imgs = arena_alloc(&b->arena, sizeof(struct imgref) * MAX_RES);
+    b->bgs = arena_alloc(&b->arena, sizeof(struct bgref) * MAX_RES);
+    b->nbgs = 0;
     for (struct node *n = b->root; n; n = node_next(n, b->root)) {
         if (n->type != N_ELEMENT || in_noscript(n))
             continue;
@@ -2323,7 +2590,7 @@ static void load_document(struct browser *b, const char *text, int len, const ch
                                          !strcasecmp(v, "image"))) &&
                    b->imgs && b->nimgs < MAX_RES && image_source(b, n, abs_img, sizeof(abs_img))) {
             char *abs = abs_img;
-            struct cached *c = cache_find(b, abs);
+            struct cached *c = cache_find_data(b, abs);
             b->imgs[b->nimgs].n = n;
             b->imgs[b->nimgs].url = arena_strdup(&b->arena, abs);
             b->nimgs++;
@@ -2470,6 +2737,7 @@ static void image_done(struct browser *b, const char *url, const char *data, int
 {
     struct image *img = len > 8 ? image_decode((const uint8_t *)data, (uint32_t)len) : NULL;
     cache_add(b, url, img);
+    bg_arrived(b, url, img);
     for (int i = 0; i < b->nimgs; i++)
         if (!strcmp(b->imgs[i].url, url)) {
             if (img) {
@@ -2910,10 +3178,14 @@ static void fetch_complete(struct browser *b)
         if (ok && r.status >= 300 && r.status < 400 && r.location[0] && done.redirects < 5) {
             char next[URL_MAX];
             url_resolve(done.url, r.location, next, sizeof(next));
-            if (done.kind == F_IMG)     /* the <img> elements still name the old URL */
+            if (done.kind == F_IMG) {   /* the <img> elements still name the old URL */
                 for (int i = 0; i < b->nimgs; i++)
                     if (!strcmp(b->imgs[i].url, done.url))
                         b->imgs[i].url = arena_strdup(&b->arena, next);
+                for (int i = 0; i < b->nbgs; i++)
+                    if (!strcmp(b->bgs[i].url, done.url) || (b->bgs[i].via && !strcmp(b->bgs[i].via, done.url)))
+                        b->bgs[i].via = arena_strdup(&b->arena, next);
+            }
             queue_resource(b, done.kind, next, done.slot, done.redirects + 1);
         } else if (done.kind == F_XHR) {
             if (b->js) {
@@ -3416,6 +3688,14 @@ static struct node *element_at(struct browser *b, int x, int y)
         int dx = 0, dy = 0;
         if (d->dyn)                     /* fixed and sticky boxes are where scrolling has put them */
             layout_dyn_offset(&b->lo, d->dyn, b->scroll_x, b->scroll_y, &dx, &dy);
+        if (d->sb) {                    /* in a box that scrolls: moved by it, and seen only where it shows */
+            int sbx, sby;
+            struct rect clip;
+            layout_sb_view(&b->lo, d->sb, b->scroll_x, b->scroll_y, &sbx, &sby, &clip);
+            if (x < clip.x || y < clip.y || x >= clip.x + clip.w || y >= clip.y + clip.h)
+                continue;
+            dx += sbx, dy += sby;
+        }
         if (d->node->style && d->node->style->pointer_none)
             continue;                   /* pointer-events: none */
         if (x >= d->x + dx && x < d->x + dx + d->w && y >= d->y + dy && y < d->y + dy + d->h)
@@ -3537,6 +3817,7 @@ static void focus_next_control(struct browser *b, int dir)
     /* Keep it in view. */
     struct rect v = view_rect(b);
     const struct hotspot *h = &b->lo.controls[next];
+    layout_reveal(&b->lo, b->focus, h->x, h->y, h->w, h->h);
     if (h->y < b->scroll_y || h->y + h->h > b->scroll_y + v.h)
         b->scroll_y = h->y - v.h / 3;
     clamp_scroll(b);
@@ -3664,7 +3945,9 @@ static void paint_page(struct browser *b, struct surface *s, int ox, int oy)
     for (struct browser *f = b->frames; f; f = f->next_frame) {
         if (!frame_box(b, f, &box))
             continue;
+        struct rect fc = frame_clip(b, f);
         s->clip = rect_intersect(page, mkrect(box.x + ox, box.y + oy, box.w, box.h));
+        s->clip = rect_intersect(s->clip, mkrect(fc.x + ox, fc.y + oy, fc.w, fc.h));
         if (!rect_empty(s->clip))
             paint_page(f, s, box.x + ox, box.y + oy);
     }
@@ -4400,6 +4683,18 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             paint(b);
             return;
         }
+        struct sbhit sh;
+        if (rect_contains(v, x, y) && b->root &&
+            layout_sbar_hit(&b->lo, px, py, b->scroll_x, b->scroll_y, &sh)) {    /* a scroll bar inside the page */
+            b->hold = H_SBOX;
+            b->sb_hit = sh;
+            if (sh.part == SBP_THUMB)
+                b->sb_grab = (sh.axis ? py : px) - sh.thumb;
+            else
+                layout_sbar_press(&b->lo, &sh);
+            paint(b);
+            return;
+        }
         if (rect_contains(v, x, y) && b->root) {
             struct browser *t = top_of(b);
             b->hold = H_PAGE;
@@ -4444,7 +4739,7 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             paint(b);
             if (over)
                 press(b, i);
-        } else if (hold == H_VBAR || hold == H_HBAR) {
+        } else if (hold == H_VBAR || hold == H_HBAR || hold == H_SBOX) {
             paint(b);
         } else if (hold == H_PAGE) {
             b->sel_start = 0;
@@ -4489,6 +4784,11 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
         else
             b->scroll_x = sbar_drag(&sb, x, b->grab);
         paint(b);
+    } else if (b->hold == H_SBOX) {
+        if (b->sb_hit.part == SBP_THUMB && b->sb_hit.box < b->lo.nsb) {
+            layout_sbar_drag(&b->lo, &b->sb_hit, b->sb_hit.axis ? py : px, b->sb_grab, b->scroll_x, b->scroll_y);
+            paint(b);
+        }
     } else if (b->hold == H_PAGE && b->sel_start && left) {
         int dx = px - b->sel_ax, dy = py - b->sel_ay;
         if (!b->sel_active && (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy) > 4)
@@ -4526,6 +4826,13 @@ static int wheel(struct browser *b, int x, int y, int delta)
     struct browser *f = frame_at(b, x, y, &box);
     if (f && wheel(f, x - box.x, y - box.y, delta))
         return 1;
+    struct rect v = view_rect(b);
+    if (b->root && rect_contains(v, x, y) &&            /* a box on the page that scrolls takes it first */
+        layout_wheel(&b->lo, x - v.x + b->scroll_x, y - v.y + b->scroll_y, b->scroll_x, b->scroll_y, 0,
+                     -delta * 3 * LINE_STEP / 2)) {
+        paint(b);
+        return 1;
+    }
     if (is_frame(b) && (!frame_scrolls(b) || b->lo.height <= view_rect(b).h))
         return 0;
     int before = b->scroll_y;

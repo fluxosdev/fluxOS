@@ -1,12 +1,14 @@
 /*
- * Display Properties: the wallpaper, the display driver, the video mode
- * and the monitor.
+ * Display Properties: the wallpaper, the look of the desktop, the display
+ * driver, the video mode and the monitor.
  *
  * The Background page picks the wallpaper (a JPEG or PNG picture) and how
  * it fills the screen: a preview monitor shows the choice, drawn from a
  * thumbnail (a JPEG decodes at an eighth of its size, which is quick).
  * The Settings page picks the driver, color depth, desktop area and
- * refresh rate. The Monitor page picks the kind of monitor, which limits
+ * refresh rate. The Appearance page picks the theme (theme.c), Classic or
+ * Kinetik and Kinetik's color, with a sample of how it looks drawn by the
+ * window manager's own code. The Monitor page picks the kind of monitor, which limits
  * the modes offered, and shows what the monitor's EDID says about it and
  * the timing of the mode on the screen.
  *
@@ -40,19 +42,20 @@
 #define ITEM_H 16                       /* rows of an open drop-down list */
 #define CONFIRM_SECS 15
 
-enum page { PAGE_BACKGROUND, PAGE_SETTINGS, PAGE_MONITOR, PAGE_COUNT };
+enum page { PAGE_BACKGROUND, PAGE_APPEARANCE, PAGE_SETTINGS, PAGE_MONITOR, PAGE_COUNT };
 enum driver { DRV_STANDARD, DRV_NATIVE, DRV_RADEON };
 
 /* Controls, in Tab order. */
 enum ctl {
     K_TABS, K_DRIVER, K_COLORS, K_AREA, K_REFRESH, K_MONITOR,
-    K_WALL, K_BROWSE, K_WALLMODE, K_COLOR,
+    K_WALL, K_BROWSE, K_WALLMODE, K_COLOR, K_THEME, K_ACCENT,
     K_OK, K_CANCEL, K_APPLY, K_COUNT
 };
 #define IS_PUSH(k) ((k) >= K_OK || (k) == K_BROWSE)     /* push buttons */
 
 #define MAX_WALLS 40
 #define WALL_ROWS 6                     /* rows of the wallpaper list in view */
+#define SWATCH_W 46                     /* the Appearance page's colors, side by side */
 
 /* What a monitor can show: line rate in kHz, refresh in Hz, largest mode. */
 struct monitor {
@@ -128,6 +131,9 @@ struct dprops {
     int hexlen, hexcur;
     uint32_t color;                     /* the last valid one */
     int sb_drag, sb_grab;               /* the list's scroll bar thumb is held */
+
+    /* the Appearance page */
+    int style, accent;
 };
 
 static struct dprops *dlg;
@@ -381,12 +387,12 @@ static int mode_controls_enabled(struct dprops *d)
 
 /* ---- geometry ---- */
 
-static const enum page tab_pages[PAGE_COUNT] = { PAGE_BACKGROUND, PAGE_SETTINGS, PAGE_MONITOR };
-static const char *const tab_names[PAGE_COUNT] = { "Background", "Settings", "Monitor" };
+static const enum page tab_pages[PAGE_COUNT] = { PAGE_BACKGROUND, PAGE_APPEARANCE, PAGE_SETTINGS, PAGE_MONITOR };
+static const char *const tab_names[PAGE_COUNT] = { "Background", "Appearance", "Settings", "Monitor" };
 
 static struct rect tab_rect(int i)
 {
-    static const int x[PAGE_COUNT + 1] = { 6, 86, 152, 216 };
+    static const int x[PAGE_COUNT + 1] = { 6, 86, 168, 234, 298 };
     return mkrect(x[i], 6, x[i + 1] - x[i] - 2, 20);
 }
 
@@ -403,7 +409,9 @@ static const struct rect panel_r = { 6, 25, DLG_W - 12, 398 };
 static struct rect ctl_rect(enum ctl k)
 {
     switch (k) {
-    case K_TABS: return mkrect(6, 4, 208, 22);
+    case K_TABS: return mkrect(6, 4, 292, 22);
+    case K_THEME: return mkrect(78, 226, 150, 21);
+    case K_ACCENT: return mkrect(78, 258, ACCENTS * SWATCH_W, 42);
     case K_WALL: return mkrect(18, 190, 268, WALL_ROWS * ITEM_H + 4);
     case K_BROWSE: return mkrect(298, 190, 90, 23);
     case K_WALLMODE: return mkrect(78, 302, 150, 21);
@@ -429,6 +437,8 @@ static int on_page(struct dprops *d, enum ctl k)
         return d->page == PAGE_MONITOR;
     case K_WALL: case K_BROWSE: case K_WALLMODE: case K_COLOR:
         return d->page == PAGE_BACKGROUND;
+    case K_THEME: case K_ACCENT:
+        return d->page == PAGE_APPEARANCE;
     default:
         return 1;
     }
@@ -441,6 +451,7 @@ static int ctl_enabled(struct dprops *d, enum ctl k)
     case K_COLORS: case K_AREA: return mode_controls_enabled(d);
     case K_REFRESH: return own_modes(d) && d->nrates > 1;
     case K_COLOR: return d->wall_sel == 0;      /* only with no picture */
+    case K_ACCENT: return d->style == THEME_KINETIK;
     default: return 1;
     }
 }
@@ -487,6 +498,11 @@ static int combo_items(struct dprops *d, enum ctl k, char rows[][48], int *chose
             snprintf(rows[i], 48, "%s", wall_mode_names[i]);
         *chosen = d->wall_mode;
         return WALL_MODES;
+    case K_THEME:
+        for (int i = 0; i < THEME_STYLES; i++)
+            snprintf(rows[i], 48, "%s", theme_style_names[i]);
+        *chosen = d->style;
+        return THEME_STYLES;
     default:
         return 0;
     }
@@ -517,6 +533,10 @@ static void choose_item(struct dprops *d, enum ctl k, int i)
     case K_WALLMODE:
         if (i >= 0 && i < WALL_MODES)
             d->wall_mode = i;
+        return;
+    case K_THEME:
+        if (i >= 0 && i < THEME_STYLES)
+            d->style = i;
         return;
     default:
         return;
@@ -613,6 +633,24 @@ static void wall_make_visible(struct dprops *d)
     d->wall_top = d->wall_top < 0 ? 0 : d->wall_top > max ? max : d->wall_top;
 }
 
+/* The Kinetik wallpaper, small, as a picture the preview can scale (in the theme's color as it is now). */
+static struct image *kinetik_thumb(int *full_w, int *full_h)
+{
+    int w = 160, h = 160 * screen_h / (screen_w > 0 ? screen_w : 1);
+    struct surface s;
+    struct image *img = malloc(sizeof(*img));
+    if (!img || h < 1 || surface_init(&s, w, h) < 0) {
+        free(img);
+        return NULL;
+    }
+    wallpaper_kinetik(&s, w, h);
+    for (int i = 0; i < w * h; i++)
+        s.px[i] |= 0xFF000000u;         /* opaque */
+    img->w = w, img->h = h, img->px = s.px;
+    *full_w = screen_w, *full_h = screen_h;
+    return img;
+}
+
 /* The choice of entry i, with the thumbnail the preview will show. */
 static void wall_select(struct dprops *d, int i)
 {
@@ -620,7 +658,10 @@ static void wall_select(struct dprops *d, int i)
         return;
     d->wall_sel = i;
     struct wall_entry *e = &d->walls[i];
-    if (!e->tried && e->path[0]) {
+    if (!e->tried && !strcmp(e->path, WALLPAPER_KINETIK)) {
+        e->thumb = kinetik_thumb(&e->full_w, &e->full_h);
+        e->tried = 1;
+    } else if (!e->tried && e->path[0]) {
         e->thumb = image_load_thumb(e->path, &e->full_w, &e->full_h);
         e->tried = 1;
     }
@@ -631,7 +672,9 @@ static void wall_init(struct dprops *d)
 {
     memset(d->walls, 0, sizeof(d->walls));
     snprintf(d->walls[0].name, sizeof(d->walls[0].name), "(None)");
-    d->nwalls = 1;
+    snprintf(d->walls[1].path, sizeof(d->walls[1].path), "%s", WALLPAPER_KINETIK);
+    snprintf(d->walls[1].name, sizeof(d->walls[1].name), "Kinetik (drawn in its color)");
+    d->nwalls = 2;
     wall_scan(d, WALLPAPER_DIR);
     const char *home = getenv("HOME");
     if (home && home[0])
@@ -791,12 +834,16 @@ static void draw_preview(struct dprops *d, struct surface *s, int background)
 static void draw_tabs(struct dprops *d, struct surface *s)
 {
     struct rect p = panel_r;
-    gfx_hline(s, p.x, p.y, p.w - 1, C_WHITE);
-    gfx_vline(s, p.x, p.y, p.h - 1, C_WHITE);
-    gfx_hline(s, p.x, p.y + p.h - 1, p.w, C_BLACK);
-    gfx_vline(s, p.x + p.w - 1, p.y, p.h, C_BLACK);
-    gfx_hline(s, p.x + 1, p.y + p.h - 2, p.w - 2, C_SHADOW);
-    gfx_vline(s, p.x + p.w - 2, p.y + 1, p.h - 2, C_SHADOW);
+    if (KINETIK) {
+        gfx_frame(s, p.x, p.y, p.w, p.h, sys.field_edge);
+    } else {
+        gfx_hline(s, p.x, p.y, p.w - 1, C_WHITE);
+        gfx_vline(s, p.x, p.y, p.h - 1, C_WHITE);
+        gfx_hline(s, p.x, p.y + p.h - 1, p.w, C_BLACK);
+        gfx_vline(s, p.x + p.w - 1, p.y, p.h, C_BLACK);
+        gfx_hline(s, p.x + 1, p.y + p.h - 2, p.w - 2, C_SHADOW);
+        gfx_vline(s, p.x + p.w - 2, p.y + 1, p.h - 2, C_SHADOW);
+    }
     for (int i = 0; i < PAGE_COUNT; i++) {
         struct rect t = tab_rect(i);
         int sel = d->page == tab_pages[i];
@@ -805,12 +852,7 @@ static void draw_tabs(struct dprops *d, struct surface *s)
         else
             t.h -= 1;
         gfx_fill(s, t.x, t.y, t.w, t.h, C_FACE);
-        gfx_hline(s, t.x + 2, t.y, t.w - 4, C_WHITE);
-        gfx_vline(s, t.x, t.y + 2, t.h - 2, C_WHITE);
-        gfx_pixel(s, t.x + 1, t.y + 1, C_WHITE);
-        gfx_vline(s, t.x + t.w - 1, t.y + 2, t.h - 2, C_BLACK);
-        gfx_pixel(s, t.x + t.w - 2, t.y + 1, C_BLACK);
-        gfx_vline(s, t.x + t.w - 2, t.y + 2, t.h - 2, C_SHADOW);
+        draw_tab_edges(s, t, sel);
         int tw = gfx_text_width(&font_sans, tab_names[i]);
         int tx = t.x + (t.w - tw) / 2, ty = t.y + (sel ? 4 : 3);
         gfx_text(s, &font_sans, tx, ty, tab_names[i], C_BLACK);
@@ -1032,6 +1074,51 @@ static void monitor_page(struct dprops *d, struct surface *s)
     draw_combo(s, ctl_rect(K_MONITOR), rows[chosen], 1, d->focus == K_MONITOR, d->open == K_MONITOR);
 }
 
+static void appearance_page(struct dprops *d, struct surface *s)
+{
+    char rows[8][48];
+    int chosen;
+    struct rect sample = mkrect(18, 38, DLG_W - 36, 172);
+    gfx_fill(s, sample.x - 1, sample.y - 1, sample.w + 2, sample.h + 2, C_BLACK);
+    struct rect saved = s->clip;
+    s->clip = rect_intersect(saved, sample);
+    theme_sample(s, sample, d->style, d->accent);
+    s->clip = saved;
+
+    gfx_text(s, &font_sans, 18, 230, "Theme:", C_BLACK);
+    int on = ctl_enabled(d, K_ACCENT);
+    gfx_text(s, &font_sans, 18, 262, "Color:", on ? C_BLACK : C_SHADOW);
+    struct rect a = ctl_rect(K_ACCENT);
+    for (int i = 0; i < ACCENTS; i++) {
+        struct rect sw = mkrect(a.x + i * SWATCH_W, a.y, SWATCH_W - 6, 24);
+        int sel = on && i == d->accent;
+        if (sel)
+            gfx_frame(s, sw.x - 2, sw.y - 2, sw.w + 4, sw.h + 4, C_BLACK);
+        gfx_fill(s, sw.x, sw.y, sw.w, sw.h, on ? accent_swatches[i] : C_FACE);
+        gfx_bevel(s, sw, BEVEL_SUNKEN);
+        if (!on)
+            gfx_dither(s, sw.x + 2, sw.y + 2, sw.w - 4, sw.h - 4, accent_swatches[i]);
+        const struct pfont *f = sel ? &font_sans_bold : &font_sans;
+        int tw = gfx_text_width(f, accent_names[i]);
+        gfx_text(s, f, sw.x + (sw.w - tw) / 2, sw.y + sw.h + 3, accent_names[i], on ? C_BLACK : C_SHADOW);
+        if (sel && d->focus == K_ACCENT)
+            gfx_focus_rect(s, mkrect(sw.x - 4, sw.y - 4, sw.w + 8, sw.h + 8));
+    }
+    gfx_text_wrap(s, &font_sans, 18, 314, 368,
+                  d->style == THEME_KINETIK
+                      ? "Kinetik: rounded frames with soft shadows, captions and taskbar in the color "
+                        "chosen, light faces and the Archivo typeface. Its own wallpaper, drawn in the "
+                        "same color, replaces the standard picture."
+                      : "Classic: gray faces and raised 3D edges, navy captions and Liberation Sans, "
+                        "as in Windows 95.",
+                  C_BLACK);
+    gfx_text_wrap(s, &font_sans, 18, 370, 368,
+                  d->bootdir[0] ? "Kept for the next start." : "Lasts until you restart: fluxOS is running from its CD.",
+                  C_BLACK);
+    combo_items(d, K_THEME, rows, &chosen);
+    draw_combo(s, ctl_rect(K_THEME), rows[chosen], 1, d->focus == K_THEME, d->open == K_THEME);
+}
+
 static void dp_paint(struct dprops *d)
 {
     struct surface *s = &d->win->content;
@@ -1040,6 +1127,8 @@ static void dp_paint(struct dprops *d)
     draw_tabs(d, s);
     if (d->page == PAGE_BACKGROUND)
         background_page(d, s);
+    else if (d->page == PAGE_APPEARANCE)
+        appearance_page(d, s);
     else if (d->page == PAGE_SETTINGS)
         settings_page(d, s);
     else
@@ -1157,7 +1246,13 @@ static void confirm_destroy(struct window *w)
     free(c);
 }
 
+static void confirm_restyle(struct window *w)
+{
+    confirm_paint(w->priv);
+}
+
 static const struct window_ops confirm_ops = {
+    .restyle = confirm_restyle,
     .key = confirm_key,
     .mouse = confirm_mouse,
     .close = confirm_window_close,
@@ -1356,6 +1451,42 @@ static int apply_background(struct dprops *d)
     return 0;
 }
 
+/* Has the Background page been changed from what is on the desktop? */
+static int background_changed(struct dprops *d)
+{
+    return strcmp(d->walls[d->wall_sel].path, wallpaper_path()) || d->wall_mode != wallpaper_mode() ||
+           d->color != wallpaper_color();
+}
+
+/* The Background page shows the wallpaper on the desktop again (a theme may have changed it). */
+static void background_sync(struct dprops *d)
+{
+    const char *cur = wallpaper_path();
+    int i = cur[0] ? wall_add(d, cur) : 0;
+    d->wall_mode = wallpaper_mode();
+    if (d->walls[1].tried) {            /* drawn in the old color */
+        image_free(d->walls[1].thumb);
+        d->walls[1].thumb = NULL;
+        d->walls[1].tried = 0;
+    }
+    wall_select(d, i < 0 ? 0 : i);
+}
+
+/* Put the chosen theme on, and the chosen wallpaper (but for one the theme brings, if the
+ * Background page was left alone). */
+static int apply_look(struct dprops *d)
+{
+    int touched = background_changed(d);
+    if (d->style != theme.style || (d->style == THEME_KINETIK && d->accent != theme.accent)) {
+        theme_set(d->style, d->accent, 1);
+        if (!touched) {
+            background_sync(d);
+            return 0;
+        }
+    }
+    return apply_background(d);
+}
+
 /* Browse...: the path of a picture was typed in. */
 static void wall_browsed(void *ctx, const char *text)
 {
@@ -1376,12 +1507,12 @@ static void wall_browsed(void *ctx, const char *text)
 static void activate(struct dprops *d, enum ctl k)
 {
     if (k == K_OK) {
-        if (apply_background(d) == 0 && apply(d) == 0)
+        if (apply_look(d) == 0 && apply(d) == 0)
             dp_close(d);
     } else if (k == K_CANCEL) {
         dp_close(d);
     } else if (k == K_APPLY) {
-        apply_background(d);
+        apply_look(d);
         apply(d);
         if (dlg)
             dp_paint(dlg);
@@ -1452,10 +1583,15 @@ static void step(struct dprops *d, int dir)
             update_lists(d);
         }
         break;
+    case K_ACCENT:
+        if (d->accent + dir >= 0 && d->accent + dir < ACCENTS)
+            d->accent += dir;
+        break;
     case K_COLORS:
     case K_REFRESH:
     case K_MONITOR:
     case K_WALLMODE:
+    case K_THEME:
         n = combo_items(d, d->focus, rows, &chosen);
         if (chosen + dir >= 0 && chosen + dir < n)
             choose_item(d, d->focus, chosen + dir);
@@ -1550,7 +1686,7 @@ static void dp_key(struct window *w, const struct input_event *ev)
         wall_select(d, to < 0 ? 0 : to >= d->nwalls ? d->nwalls - 1 : to);
     } else if (code == KEY_DOWN && (ev->mods & KMOD_ALT) &&
                (d->focus == K_COLORS || d->focus == K_REFRESH || d->focus == K_MONITOR ||
-                d->focus == K_WALLMODE) && ctl_enabled(d, d->focus)) {
+                d->focus == K_WALLMODE || d->focus == K_THEME) && ctl_enabled(d, d->focus)) {
         d->open = d->focus;
         d->hover = -1;
     } else if (code == KEY_LEFT || code == KEY_UP) {
@@ -1695,6 +1831,10 @@ static void dp_mouse(struct window *w, int x, int y, int buttons, int changed)
                     if (rect_contains(radio_rect(i), x, y) && driver_ok(d, i))
                         d->driver = (enum driver)i;
                 update_lists(d);
+            } else if (k == K_ACCENT) {
+                int i = (x - r.x) / SWATCH_W;
+                if (i >= 0 && i < ACCENTS)
+                    d->accent = i;
             } else if (k == K_AREA) {
                 int tx = slider_x(d, ctl_rect(K_AREA));
                 if (x >= tx && x < tx + 11)
@@ -1815,6 +1955,8 @@ void display_open(void)
     d->hover = -1;
     find_boot_dir(d->bootdir, sizeof(d->bootdir));
     read_grubenv(d->bootdir, d->saved_gfx, d->saved_video, d->saved_driver);
+    d->style = theme.style;
+    d->accent = theme.accent;
     wall_init(d);
     dp_reload(d);
     d->win = wm_create("Display Properties", ICON_DISPLAY, DLG_W, DLG_H, 0, &dp_ops, d);

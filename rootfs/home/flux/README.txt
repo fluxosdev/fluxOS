@@ -24,8 +24,9 @@ The desktop
                    Space pauses, S switches between hardware and software)
   Volume Control   click the speaker in the taskbar
   Display Properties (Start menu)
-                   wallpaper (Fill, Stretch, Center, Tile), video mode,
-                   monitor and refresh rate
+                   wallpaper (Fill, Stretch, Center, Tile), the theme
+                   (Appearance: Kinetik in six colors, or Windows 95 style
+                   Classic), video mode, monitor and refresh rate
 
 
 Pictures and sound
@@ -110,4 +111,5 @@ System
 
 More about fluxOS is in README.md in the source tree, and the credits are
 there too: the default wallpaper is a photograph by Stefan Stefancik on
-Unsplash.
+Unsplash, and the Kinetik theme's text is set in Archivo (SIL Open Font
+License, in /usr/share/doc/fonts/LICENSE.archivo).

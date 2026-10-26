@@ -52,7 +52,9 @@ enum prop {
     P_WORD_BREAK, P_OVERFLOW_WRAP, P_TEXT_OVERFLOW, P_OUTLINE, P_OUTLINE_STYLE, P_OUTLINE_COLOR,
     P_OUTLINE_WIDTH, P_OUTLINE_OFFSET, P_TEXT_DECORATION_COLOR, P_TEXT_DECORATION_STYLE,
     P_FONT_VARIANT, P_LIST_STYLE_POSITION, P_TABLE_LAYOUT, P_CAPTION_SIDE, P_EMPTY_CELLS,
-    P_TEXT_SHADOW,
+    P_TEXT_SHADOW, P_BACKGROUND_SIZE, P_BACKGROUND_POSITION, P_BACKGROUND_POSITION_X,
+    P_BACKGROUND_POSITION_Y, P_BACKGROUND_REPEAT, P_BACKGROUND_ORIGIN, P_OBJECT_FIT,
+    P_OBJECT_POSITION, P_OVERFLOW_X, P_OVERFLOW_Y,
 };
 
 static const struct { const char *name; uint8_t prop; } prop_names[] = {
@@ -71,7 +73,12 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "-webkit-user-select", P_USER_SELECT }, { "accent-color", P_IGNORED },
     { "align-items", P_ALIGN_ITEMS }, { "align-self", P_ALIGN_SELF }, { "appearance", P_IGNORED },
     { "aspect-ratio", P_ASPECT_RATIO }, { "background", P_BACKGROUND },
+    { "background-attachment", P_IGNORED }, { "background-clip", P_IGNORED },
     { "background-color", P_BACKGROUND_COLOR }, { "background-image", P_BACKGROUND_IMAGE },
+    { "background-origin", P_BACKGROUND_ORIGIN }, { "background-position", P_BACKGROUND_POSITION },
+    { "background-position-x", P_BACKGROUND_POSITION_X },
+    { "background-position-y", P_BACKGROUND_POSITION_Y }, { "background-repeat", P_BACKGROUND_REPEAT },
+    { "background-size", P_BACKGROUND_SIZE },
     { "block-size", P_HEIGHT }, { "border", P_BORDER }, { "border-block-end", P_BORDER_BOTTOM },
     { "border-block-end-color", P_BORDER_BOTTOM_COLOR },
     { "border-block-end-width", P_BORDER_BOTTOM_WIDTH }, { "border-block-start", P_BORDER_TOP },
@@ -133,12 +140,13 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "mask-image", P_MASK }, { "max-block-size", P_MAX_HEIGHT }, { "max-height", P_MAX_HEIGHT },
     { "max-inline-size", P_MAX_WIDTH }, { "max-width", P_MAX_WIDTH },
     { "min-block-size", P_MIN_HEIGHT }, { "min-height", P_MIN_HEIGHT },
-    { "min-inline-size", P_MIN_WIDTH }, { "min-width", P_MIN_WIDTH }, { "opacity", P_OPACITY },
+    { "min-inline-size", P_MIN_WIDTH }, { "min-width", P_MIN_WIDTH }, { "object-fit", P_OBJECT_FIT },
+    { "object-position", P_OBJECT_POSITION }, { "opacity", P_OPACITY },
     { "order", P_ORDER }, { "outline", P_OUTLINE }, { "outline-color", P_OUTLINE_COLOR },
     { "outline-offset", P_OUTLINE_OFFSET }, { "outline-style", P_OUTLINE_STYLE },
     { "outline-width", P_OUTLINE_WIDTH }, { "overflow", P_OVERFLOW },
-    { "overflow-wrap", P_OVERFLOW_WRAP }, { "overflow-x", P_OVERFLOW },
-    { "overflow-y", P_OVERFLOW }, { "padding", P_PADDING }, { "padding-block", P_PADDING_BLOCK },
+    { "overflow-wrap", P_OVERFLOW_WRAP }, { "overflow-x", P_OVERFLOW_X },
+    { "overflow-y", P_OVERFLOW_Y }, { "padding", P_PADDING }, { "padding-block", P_PADDING_BLOCK },
     { "padding-block-end", P_PADDING_BOTTOM }, { "padding-block-start", P_PADDING_TOP },
     { "padding-bottom", P_PADDING_BOTTOM }, { "padding-inline", P_PADDING_INLINE },
     { "padding-inline-end", P_PADDING_RIGHT }, { "padding-inline-start", P_PADDING_LEFT },
@@ -2672,6 +2680,8 @@ static void init_initial(void)
     s->list_style = LS_DISC;
     s->outline_color = 1;
     s->outline_w = 3;
+    s->bg_w.unit = s->bg_h.unit = U_AUTO;
+    s->obj_px = s->obj_py = (struct len){ 5000, 0, U_PCT };
 }
 
 static void inherit(struct style *st, const struct style *p)
@@ -3025,6 +3035,240 @@ static int parse_gradient(const char *value, uint32_t *g0, uint32_t *g1, uint8_t
     }
     *dir = horizontal ? 2 : 1;
     return 1;
+}
+
+/*
+ * The first url() in text (up to end): its address, in the arena. *after is where the closing
+ * bracket was. NULL when there is none, or it is empty.
+ */
+static const char *url_arg(struct arena *a, const char *text, const char *end, const char **after)
+{
+    for (const char *p = text; p + 4 < end; p++) {
+        if (strncasecmp(p, "url(", 4) || (p > text && (isalnum((unsigned char)p[-1]) || p[-1] == '-')))
+            continue;
+        const char *q = p + 4;
+        while (q < end && isspace((unsigned char)*q))
+            q++;
+        char quote = q < end && (*q == '"' || *q == '\'') ? *q++ : 0;
+        const char *s = q;
+        while (q < end && (quote ? *q != quote : *q != ')' && !isspace((unsigned char)*q))) {
+            if (*q == '\\' && q + 1 < end)
+                q++;
+            q++;
+        }
+        const char *e = q;
+        while (q < end && *q != ')')
+            q++;
+        if (after)
+            *after = q < end ? q + 1 : end;
+        if (!a || e == s)
+            return NULL;
+        return arena_strndup(a, s, (size_t)(e - s));
+    }
+    return NULL;
+}
+
+/* A background-position (or object-position) value into a point; one value leaves the other axis centered. */
+static void parse_position(const char *value, const struct vctx *v, struct len *px, struct len *py)
+{
+    const char *w[4];
+    int wl[4], n = words(value, w, wl, 4);
+    struct len pos[2] = { { 5000, 0, U_PCT }, { 5000, 0, U_PCT } };
+    int set[2] = { 0, 0 };
+    if (!n)
+        return;
+    /* three or four words: edge keywords with offsets ("right 10px bottom 20px") */
+    if (n >= 3) {
+        for (int i = 0; i < n; i++) {
+            int right = word_is(w[i], wl[i], "right"), bottom = word_is(w[i], wl[i], "bottom");
+            int axis = right || word_is(w[i], wl[i], "left") ? 0 : bottom || word_is(w[i], wl[i], "top") ? 1 : -1;
+            if (axis < 0)
+                continue;
+            struct len off = { 0, 0, U_PX };
+            if (i + 1 < n) {
+                char tmp[64];
+                snprintf(tmp, sizeof(tmp), "%.*s", wl[i + 1], w[i + 1]);
+                struct len l;
+                if (word_is(w[i + 1], wl[i + 1], "center") || (!isalpha((unsigned char)tmp[0]) && length_value(tmp, v, &l) &&
+                                                                  l.unit != U_AUTO)) {
+                    if (!word_is(w[i + 1], wl[i + 1], "center"))
+                        off = l;
+                    i++;
+                }
+            }
+            if (right || bottom) {
+                pos[axis].unit = U_CALC;
+                pos[axis].pct = 10000 - (off.unit == U_PCT ? off.v : 0);
+                pos[axis].v = off.unit == U_PCT ? 0 : -off.v;
+            } else {
+                pos[axis] = off;
+            }
+            set[axis] = 1;
+        }
+        *px = pos[0], *py = pos[1];
+        return;
+    }
+    int axis_of[2] = { -1, -1 };        /* 0: x, 1: y, -1: either */
+    struct len each[2];
+    int kinds[2];                       /* 0 keyword, 1 length */
+    for (int i = 0; i < n && i < 2; i++) {
+        char tmp[64];
+        snprintf(tmp, sizeof(tmp), "%.*s", wl[i], w[i]);
+        kinds[i] = 0;
+        if (word_is(w[i], wl[i], "left"))
+            axis_of[i] = 0, each[i] = (struct len){ 0, 0, U_PCT };
+        else if (word_is(w[i], wl[i], "right"))
+            axis_of[i] = 0, each[i] = (struct len){ 10000, 0, U_PCT };
+        else if (word_is(w[i], wl[i], "top"))
+            axis_of[i] = 1, each[i] = (struct len){ 0, 0, U_PCT };
+        else if (word_is(w[i], wl[i], "bottom"))
+            axis_of[i] = 1, each[i] = (struct len){ 10000, 0, U_PCT };
+        else if (word_is(w[i], wl[i], "center"))
+            each[i] = (struct len){ 5000, 0, U_PCT };
+        else if (length_value(tmp, v, &each[i]) && each[i].unit != U_AUTO)
+            kinds[i] = 1;
+        else
+            return;                     /* not a position */
+    }
+    if (n == 1) {
+        int ax = axis_of[0] < 0 ? 0 : axis_of[0];
+        pos[ax] = each[0];
+        if (axis_of[0] < 0 && !kinds[0])
+            pos[1] = each[0];
+    } else {
+        int first = axis_of[0], second = axis_of[1];
+        if (first == 1 || second == 0)  /* "top left", "bottom right": y first */
+            pos[1] = each[0], pos[0] = each[1];
+        else
+            pos[0] = each[0], pos[1] = each[1];
+    }
+    (void)set;
+    *px = pos[0], *py = pos[1];
+}
+
+/* One background layer (a comma-separated part of background): the picture and how it is placed. */
+static void parse_bg_layer(struct style *st, const char *layer, const char *end, const struct vctx *v)
+{
+    char buf[1024];
+    int o = 0;
+    for (const char *p = layer; p < end && o < (int)sizeof(buf) - 4; p++) {
+        if (!strncasecmp(p, "url(", 4) && (p == layer || !(isalnum((unsigned char)p[-1]) || p[-1] == '-'))) {
+            p = skip_group(p + 3, end) - 1;     /* the picture is not a word of the layout */
+            buf[o++] = ' ';
+        } else if (*p == '(' || *p == '"' || *p == '\'') {      /* a function stays whole */
+            const char *e = skip_group(p, end);
+            int len = (int)(e - p);
+            if (o + len >= (int)sizeof(buf) - 4)
+                break;
+            memcpy(buf + o, p, (size_t)len);
+            o += len;
+            p = e - 1;
+        } else if (*p == '/') {
+            buf[o++] = ' ', buf[o++] = '/', buf[o++] = ' ';
+        } else {
+            buf[o++] = *p;
+        }
+    }
+    buf[o] = 0;
+    const char *w[16];
+    int wl[16], n = words(buf, w, wl, 16);
+    char pos[256] = "", size[128] = "";
+    int in_size = 0;
+    int rep[2] = { 0, 0 }, nrep = 0;
+    for (int i = 0; i < n; i++) {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "%.*s", wl[i], w[i]);
+        if (wl[i] == 1 && w[i][0] == '/') {
+            in_size = 1;
+        } else if (!strncasecmp(tmp, "url(", 4) || strcasestr(tmp, "gradient(")) {
+            continue;
+        } else if (!strcasecmp(tmp, "repeat-x")) {
+            st->bg_norep_x = 0, st->bg_norep_y = 1;
+        } else if (!strcasecmp(tmp, "repeat-y")) {
+            st->bg_norep_x = 1, st->bg_norep_y = 0;
+        } else if (!strcasecmp(tmp, "no-repeat") || !strcasecmp(tmp, "repeat") || !strcasecmp(tmp, "space") ||
+                   !strcasecmp(tmp, "round")) {
+            if (nrep < 2)
+                rep[nrep++] = !strcasecmp(tmp, "no-repeat");
+            if (nrep == 1)
+                st->bg_norep_x = st->bg_norep_y = (uint8_t)rep[0];
+            else
+                st->bg_norep_y = (uint8_t)rep[1];
+        } else if (!strcasecmp(tmp, "border-box") && !in_size) {
+            st->bg_origin = 1;
+        } else if (!strcasecmp(tmp, "content-box") && !in_size) {
+            st->bg_origin = 2;
+        } else if (!strcasecmp(tmp, "padding-box") || !strcasecmp(tmp, "scroll") || !strcasecmp(tmp, "fixed") ||
+                   !strcasecmp(tmp, "local") || !strcasecmp(tmp, "text")) {
+            continue;
+        } else if (in_size) {
+            if (strlen(size) + strlen(tmp) + 2 < sizeof(size))
+                strcat(size, tmp), strcat(size, " ");
+        } else {
+            uint32_t col;
+            if (css_parse_color(tmp, (int)strlen(tmp), &col) == 0)
+                continue;               /* the color is the caller's */
+            if (strlen(pos) + strlen(tmp) + 2 < sizeof(pos))
+                strcat(pos, tmp), strcat(pos, " ");
+        }
+    }
+    if (pos[0])
+        parse_position(pos, v, &st->bg_px, &st->bg_py);
+    if (size[0]) {
+        const char *sw[2];
+        int sl[2], sn = words(size, sw, sl, 2);
+        char t0[64], t1[64] = "auto";
+        snprintf(t0, sizeof(t0), "%.*s", sl[0], sw[0]);
+        if (sn > 1)
+            snprintf(t1, sizeof(t1), "%.*s", sl[1], sw[1]);
+        if (!strcasecmp(t0, "cover"))
+            st->bg_size = BGS_COVER;
+        else if (!strcasecmp(t0, "contain"))
+            st->bg_size = BGS_CONTAIN;
+        else if (length_value(t0, v, &st->bg_w) && length_value(t1, v, &st->bg_h))
+            st->bg_size = st->bg_w.unit == U_AUTO && st->bg_h.unit == U_AUTO ? BGS_AUTO : BGS_LEN;
+    }
+}
+
+/* Everything about the background picture goes back to its defaults (the shorthand resets it). */
+static void reset_bg_picture(struct style *st)
+{
+    st->bg_url = NULL;
+    st->bg_size = BGS_AUTO;
+    st->bg_w.unit = st->bg_h.unit = U_AUTO;
+    st->bg_w.v = st->bg_h.v = 0;
+    st->bg_px = st->bg_py = (struct len){ 0, 0, U_PX };
+    st->bg_norep_x = st->bg_norep_y = 0;
+    st->bg_origin = 0;
+}
+
+/* The first layer of a background value that has a url(), parsed into the style. */
+static void apply_bg_layers(struct style *st, const char *value, const struct vctx *v)
+{
+    const char *end = value + strlen(value);
+    for (const char *p = value; p <= end;) {
+        const char *e = find_top(p, end, ',');
+        if (e > end)
+            e = end;
+        const char *after;
+        const char *url = url_arg(v->a, p, e, &after);
+        if (url) {
+            reset_bg_picture(st);
+            st->bg_url = url;
+            parse_bg_layer(st, p, e, v);
+            return;
+        }
+        if (e >= end)
+            break;
+        p = e + 1;
+    }
+}
+
+/* overflow: visible, hidden, clip, scroll or auto. */
+static int overflow_kw(const char *w, int wl)
+{
+    return word_is(w, wl, "hidden") || word_is(w, wl, "clip") ? OV_HIDDEN
+         : word_is(w, wl, "scroll") ? OV_SCROLL : word_is(w, wl, "auto") ? OV_AUTO : OV_VISIBLE;
 }
 
 /* One track size: 100px, 20%, 1fr, auto, min-content, max-content. */
@@ -3425,8 +3669,96 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
             st->col_gap = prop == P_GAP ? l[1] : l[0];
         break;
     }
-    case P_OVERFLOW:
-        st->clips = strcasecmp(value, "visible") != 0 && !inherit_kw;
+    case P_OVERFLOW: {
+        n = words(value, w, wl, 2);
+        st->ov_x = st->ov_y = OV_VISIBLE;
+        if (n && !inherit_kw && !initial_kw) {
+            st->ov_x = (uint8_t)overflow_kw(w[0], wl[0]);
+            st->ov_y = n > 1 ? (uint8_t)overflow_kw(w[1], wl[1]) : st->ov_x;
+        }
+        break;
+    }
+    case P_OVERFLOW_X:
+        st->ov_x = inherit_kw || initial_kw ? OV_VISIBLE : (uint8_t)overflow_kw(value, (int)strlen(value));
+        break;
+    case P_OVERFLOW_Y:
+        st->ov_y = inherit_kw || initial_kw ? OV_VISIBLE : (uint8_t)overflow_kw(value, (int)strlen(value));
+        break;
+    case P_OBJECT_FIT:
+        st->obj_fit = !strcasecmp(value, "contain") ? OF_CONTAIN : !strcasecmp(value, "cover") ? OF_COVER
+                    : !strcasecmp(value, "none") ? OF_NONE : !strcasecmp(value, "scale-down") ? OF_SCALE_DOWN
+                    : OF_FILL;
+        break;
+    case P_OBJECT_POSITION:
+        if (initial_kw || inherit_kw)
+            st->obj_px = st->obj_py = (struct len){ 5000, 0, U_PCT };
+        else
+            parse_position(value, v, &st->obj_px, &st->obj_py);
+        break;
+    case P_BACKGROUND_SIZE: {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "%s", value);
+        st->bg_size = BGS_AUTO;
+        st->bg_w.unit = st->bg_h.unit = U_AUTO;
+        const char *sw[2];
+        int sl[2], sn = initial_kw ? 0 : words(tmp, sw, sl, 2);
+        if (!sn)
+            break;
+        char t0[64], t1[64] = "auto";
+        snprintf(t0, sizeof(t0), "%.*s", sl[0], sw[0]);
+        if (sn > 1)
+            snprintf(t1, sizeof(t1), "%.*s", sl[1], sw[1]);
+        if (!strcasecmp(t0, "cover"))
+            st->bg_size = BGS_COVER;
+        else if (!strcasecmp(t0, "contain"))
+            st->bg_size = BGS_CONTAIN;
+        else if (length_value(t0, v, &st->bg_w) && length_value(t1, v, &st->bg_h))
+            st->bg_size = st->bg_w.unit == U_AUTO && st->bg_h.unit == U_AUTO ? BGS_AUTO : BGS_LEN;
+        break;
+    }
+    case P_BACKGROUND_POSITION:
+        st->bg_px = st->bg_py = (struct len){ 0, 0, U_PX };
+        if (!initial_kw && !inherit_kw)
+            parse_position(value, v, &st->bg_px, &st->bg_py);
+        break;
+    case P_BACKGROUND_POSITION_X:
+    case P_BACKGROUND_POSITION_Y: {
+        struct len l = { 0, 0, U_PX };
+        char kw[64];
+        snprintf(kw, sizeof(kw), "%s", value);
+        if (!initial_kw && !inherit_kw) {
+            /* one axis of a position: run the other axis through as 50% and take ours */
+            struct len ox, oy;
+            char two[96];
+            snprintf(two, sizeof(two), prop == P_BACKGROUND_POSITION_X ? "%s center" : "center %s", kw);
+            if (!strcasecmp(kw, "top") || !strcasecmp(kw, "bottom") || !strcasecmp(kw, "left") ||
+                !strcasecmp(kw, "right"))
+                snprintf(two, sizeof(two), "%s", kw);
+            ox = oy = l;
+            parse_position(two, v, &ox, &oy);
+            l = prop == P_BACKGROUND_POSITION_X ? ox : oy;
+        }
+        if (prop == P_BACKGROUND_POSITION_X)
+            st->bg_px = l;
+        else
+            st->bg_py = l;
+        break;
+    }
+    case P_BACKGROUND_REPEAT: {
+        n = initial_kw ? 0 : words(value, w, wl, 2);
+        st->bg_norep_x = st->bg_norep_y = 0;
+        if (n && word_is(w[0], wl[0], "repeat-x"))
+            st->bg_norep_y = 1;
+        else if (n && word_is(w[0], wl[0], "repeat-y"))
+            st->bg_norep_x = 1;
+        else if (n) {
+            st->bg_norep_x = word_is(w[0], wl[0], "no-repeat");
+            st->bg_norep_y = n > 1 ? word_is(w[1], wl[1], "no-repeat") : st->bg_norep_x;
+        }
+        break;
+    }
+    case P_BACKGROUND_ORIGIN:
+        st->bg_origin = !strcasecmp(value, "border-box") ? 1 : !strcasecmp(value, "content-box") ? 2 : 0;
         break;
     case P_GRID_TEMPLATE_COLUMNS:
         st->grid_cols = !strcasecmp(value, "none") || initial_kw ? NULL : parse_tracks(value, v);
@@ -3527,6 +3859,7 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
     case P_BACKGROUND_IMAGE:
         if (!parse_gradient(value, &st->g0, &st->g1, &st->grad))
             st->grad = 0;
+        st->bg_url = url_arg(v->a, value, value + strlen(value), NULL);
         break;
     case P_FLOAT:
         st->floated = !strcasecmp(value, "left") ? 1 : !strcasecmp(value, "right") ? 2 : 0;
@@ -3552,6 +3885,8 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
     case P_BACKGROUND:
         if (!parse_gradient(value, &st->g0, &st->g1, &st->grad))
             st->grad = 0;
+        reset_bg_picture(st);
+        apply_bg_layers(st, value, v);
         if (!strcasecmp(value, "none") || initial_kw) {
             st->bg = TRANSPARENT;
             break;
@@ -4267,6 +4602,15 @@ static void hint_add(char *buf, int size, const char *text)
     snprintf(buf + n, (size_t)(size - n), "%s", text);
 }
 
+/* The old background="picture.png" attribute. */
+static void hint_background(char *buf, int size, const char *url)
+{
+    if (!url || !*url || strpbrk(url, "\"\\\n"))
+        return;
+    int n = (int)strlen(buf);
+    snprintf(buf + n, (size_t)(size - n), "background-image: url(\"%.400s\");", url);
+}
+
 static const struct node *ancestor(const struct node *n, int tag)
 {
     for (n = n->parent; n; n = n->parent)
@@ -4297,6 +4641,7 @@ static void hints(const struct node *n, char *buf, int size)
     switch (n->tag) {
     case T_BODY:
         hint_color(buf, size, "background-color", node_attr(n, "bgcolor"));
+        hint_background(buf, size, node_attr(n, "background"));
         hint_color(buf, size, "color", node_attr(n, "text"));
         hint_len(buf, size, "margin", node_attr(n, "marginwidth"));
         if ((v = node_attr(n, "leftmargin")) || (v = node_attr(n, "topmargin")))
@@ -4321,6 +4666,7 @@ static void hints(const struct node *n, char *buf, int size)
         break;
     case T_TABLE:
         hint_color(buf, size, "background-color", node_attr(n, "bgcolor"));
+        hint_background(buf, size, node_attr(n, "background"));
         hint_len(buf, size, "width", node_attr(n, "width"));
         hint_len(buf, size, "height", node_attr(n, "height"));
         hint_len(buf, size, "border-spacing", node_attr(n, "cellspacing"));
@@ -4337,6 +4683,7 @@ static void hints(const struct node *n, char *buf, int size)
     case T_TD:
     case T_TH: {
         hint_color(buf, size, "background-color", node_attr(n, "bgcolor"));
+        hint_background(buf, size, node_attr(n, "background"));
         hint_len(buf, size, "width", node_attr(n, "width"));
         hint_len(buf, size, "height", node_attr(n, "height"));
         hint_align(buf, size, node_attr(n, "align"), 0);
@@ -4649,7 +4996,14 @@ static void compute(struct arena *a, struct node *n, const struct style *parent,
     if (st->invisible & 1)
         st->hidden = 1;
     if (st->invisible & 8)
-        st->bg = TRANSPARENT, st->grad = 0;
+        st->bg = TRANSPARENT, st->grad = 0, st->bg_url = NULL;
+    if (st->ov_x != st->ov_y && (!st->ov_x || !st->ov_y)) {      /* visible becomes auto beside a clipped axis */
+        if (!st->ov_x)
+            st->ov_x = OV_AUTO;
+        else
+            st->ov_y = OV_AUTO;
+    }
+    st->clips = st->ov_x || st->ov_y;
     if (st->floated && st->display != D_NONE)
         st->display = (st->display == D_TABLE || st->display == D_INLINE_TABLE) ? D_INLINE_TABLE
                                                                                : D_INLINE_BLOCK;

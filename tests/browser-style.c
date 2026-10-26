@@ -162,9 +162,55 @@ static void state_pseudo_classes(void)
     CHECK(num_input && num_input->style->z_set && num_input->style->z_index == 14);
     arena_free(&arena);
 }
+static void backgrounds_and_overflow(void)
+{
+    struct arena arena = {0};
+    const char *html = "<!doctype html><body>"
+        "<div id='a'></div><div id='b'></div><div id='c'></div><div id='d'></div><div id='e' style=\"background-image: url('s.png')\"></div>"
+        "<div id='f'></div><div id='g'></div><div id='h'></div><div id='i'></div><div id='j'></div>"
+        "<img id='k'><div id='l'></div></body>";
+    struct node *root = html_parse(&arena, html, (int)strlen(html));
+    const char *css =
+        "#a { background: #123 url(img/a.png) no-repeat 10px 20% / 50% auto }"
+        "#b { background: url( \"b(1).png\" ) repeat-y, url(under.png) red }"
+        "#c { background: linear-gradient(red, blue), url(//x.org/c.png) center / contain }"
+        "#d { background-image: url(d.png); background-repeat: no-repeat repeat; background-position: right 5px bottom 7px }"
+        "#f { overflow: hidden } #g { overflow: auto hidden } #h { overflow-y: scroll } #i { overflow: clip }"
+        "#j { background: url(j.png); background: green }"
+        "#k { object-fit: cover; object-position: 10% bottom }"
+        "#l { background: url(data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg'/>) border-box }";
+    struct sheet *sheet = css_parse(&arena, css, (int)strlen(css), 800);
+    css_cascade(&arena, root, &sheet, 1, 800, 600, NULL, NULL);
+    struct style *a = id(root, "a")->style, *b = id(root, "b")->style, *c = id(root, "c")->style,
+                 *d = id(root, "d")->style;
+    CHECK(a->bg == OPAQUE(0x112233) && a->bg_url && !strcmp(a->bg_url, "img/a.png"));
+    CHECK(a->bg_norep_x && a->bg_norep_y);
+    CHECK(a->bg_px.unit == U_PX && a->bg_px.v == 10 && a->bg_py.unit == U_PCT && a->bg_py.v == 2000);
+    CHECK(a->bg_size == BGS_LEN && a->bg_w.unit == U_PCT && a->bg_w.v == 5000 && a->bg_h.unit == U_AUTO);
+    CHECK(b->bg_url && !strcmp(b->bg_url, "b(1).png") && b->bg_norep_x && !b->bg_norep_y);
+    CHECK(b->bg == OPAQUE(0xff0000));                       /* the color is in the last layer */
+    CHECK(c->bg_url && !strcmp(c->bg_url, "//x.org/c.png") && c->grad && c->bg_size == BGS_CONTAIN);
+    CHECK(c->bg_px.unit == U_PCT && c->bg_px.v == 5000 && c->bg_py.v == 5000);
+    CHECK(d->bg_url && d->bg_norep_x && !d->bg_norep_y);
+    CHECK(d->bg_px.unit == U_CALC && d->bg_px.pct == 10000 && d->bg_px.v == -5);     /* 100% - 5px */
+    CHECK(d->bg_py.unit == U_CALC && d->bg_py.pct == 10000 && d->bg_py.v == -7);
+    CHECK(id(root, "e")->style->bg_url && !strcmp(id(root, "e")->style->bg_url, "s.png"));
+    CHECK(id(root, "f")->style->ov_x == OV_HIDDEN && id(root, "f")->style->ov_y == OV_HIDDEN);
+    CHECK(id(root, "f")->style->clips);
+    CHECK(id(root, "g")->style->ov_x == OV_AUTO && id(root, "g")->style->ov_y == OV_HIDDEN);
+    CHECK(id(root, "h")->style->ov_y == OV_SCROLL && id(root, "h")->style->ov_x == OV_AUTO);   /* visible turns auto */
+    CHECK(id(root, "i")->style->ov_x == OV_HIDDEN);
+    CHECK(!id(root, "j")->style->bg_url && id(root, "j")->style->bg == OPAQUE(0x008000));  /* the shorthand resets it */
+    CHECK(!id(root, "a")->style->clips);
+    struct style *k = id(root, "k")->style;
+    CHECK(k->obj_fit == OF_COVER && k->obj_px.unit == U_PCT && k->obj_px.v == 1000 && k->obj_py.v == 10000);
+    struct style *l = id(root, "l")->style;
+    CHECK(l->bg_url && !strncmp(l->bg_url, "data:image/svg+xml;utf8,<svg", 28) && l->bg_origin == 1);
+    arena_free(&arena);
+}
 int main(void)
 {
     entities(); cascade(); selector_specificity(); nth_boundaries();
-    text_and_interaction_properties(); state_pseudo_classes();
+    text_and_interaction_properties(); state_pseudo_classes(); backgrounds_and_overflow();
     puts("browser HTML/CSS: named references, filtered siblings, cascade specificity and new properties passed");
 }

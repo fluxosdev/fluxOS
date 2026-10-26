@@ -21,7 +21,7 @@ fluxOS is a small 32-bit x86 Unix-like operating system with preemptive
 multitasking, ring-3 processes, paging, a root filesystem in RAM (from the CD)
 or on an installed hard disk, IDE/SATA/floppy/USB storage, FAT and ISO9660, an
 NE2000 and nForce network driver with a TCP/IP stack, a zsh-flavoured shell
-(**fsh**), a Windows 95 style desktop with a web browser, 3dfx Voodoo3 and
+(**fsh**), a desktop with a web browser and two themes (Kinetik and Windows 95 style Classic), 3dfx Voodoo3 and
 Radeon HD 4000 display drivers with a small OpenGL library, PC speaker, Sound
 Blaster 16 and HD Audio sound, and a layer that runs DOS programs in the
 terminal. It boots with GRUB (Multiboot) from an ISO image, straight into the
@@ -115,9 +115,16 @@ stops at boot and says why.
   (`!! !$ !n !str`), aliases, `source`, `~/.fshrc`, `~/.fsh_history`, AUTO_CD.
 
 **The desktop** (`/bin/desktop`), started by init at boot
-- Windows 95 look: purple desktop with icons, a taskbar (Start button, a
-  button per window, clock, volume tray icon), beveled windows. UI text is
-  anti-aliased Liberation Sans; terminals keep the sharp 8x16 bitmap font.
+- Two themes, chosen on the **Appearance** page of Display Properties. **Kinetik**
+  (the default): frames with rounded corners and a soft shadow, captions, taskbar
+  and Start menu heading in a gradient of the theme's color with centered titles,
+  glassy Start and taskbar buttons, light blue-gray faces with flat outlines, and its
+  own wallpaper (a gradient, a glow and sweeping curves, drawn at the screen's size),
+  in Blue, Purple, Orange, Green, White or Black; UI text is anti-aliased Archivo.
+  **Classic**: the Windows 95 look, a purple desktop, gray beveled windows with navy
+  captions, and Liberation Sans. Either way the desktop has icons and a taskbar
+  (Start button, a button per window, clock, volume tray icon), and terminals keep
+  the sharp 8x16 bitmap font. Switching redraws every open window at once.
 - Oxygen icons (PNG), PNG, JPEG, GIF and SVG decoding (the first bytes decide,
   whatever the name), and a wallpaper (Fill, Stretch, Center or Tile).
 - Windows move, minimize, maximize and cascade; the browser, text editor, file
@@ -139,7 +146,8 @@ stops at boot and says why.
   Play, Pause, Stop and a seek bar. It runs `play(1)` (`play -s SECONDS`
   starts part-way in) so the desktop keeps running.
 - **Display Properties**: wallpaper and fill mode with a preview (with **(None)** chosen, a
-  `#rrggbb` field sets the solid desktop color), resolution,
+  `#rrggbb` field sets the solid desktop color; **Kinetik** is the theme's drawn
+  wallpaper), the theme and its color with a live sample, resolution,
   color depth and refresh rate (with a 15 s "keep this mode?" prompt on the
   3dfx and Radeon drivers), monitor type and EDID details. Settings are saved
   in GRUB's environment block on an installed system.
@@ -208,6 +216,13 @@ so the desktop keeps running), or from `file://`.
   (`required`, `type=email`/`url`/`number` with `min`/`max`, `minlength`, `maxlength`),
   `:in-range`/`:out-of-range`, and the pseudo-elements `::placeholder`, `::selection`
   and `::marker`.
+  Pictures: `background-image: url()` (the first layer that has one; PNG, JPEG, GIF, ICO,
+  SVG, and `data:` URLs) with `background-size` (lengths, percentages, `cover`, `contain`),
+  `background-position` (keywords, offsets from an edge), `background-repeat`, `background-origin`
+  and the `background` shorthand, under any gradient, inside rounded corners; the old
+  `background=` attribute; `object-fit` and `object-position` on `<img>` (also with rounded
+  corners, as for round avatars). Relative addresses in a style sheet are
+  resolved against the sheet's own address. `overflow`, `overflow-x` and `overflow-y`.
 - **Layout**: blocks with margin collapsing, inline text, inline-blocks, lists,
   tables, flex rows, grids (columns, rows, areas, auto rows, spans, `dense`),
   borders, backgrounds, images and form controls. Floats (`float`, `clear`,
@@ -215,7 +230,13 @@ so the desktop keeps running), or from `file://`.
   positioning (`relative`, `absolute`, `fixed` and `sticky` with `top`/`right`/`bottom`/
   `left`, `inset`) work, with `z-index` for absolute and fixed boxes, `box-shadow`
   (the first outer shadow, drawn as fading layers) and `transform: translate()`.
-  `fixed` boxes stay where they are in the window as the page scrolls; `sticky` boxes
+  `overflow` other than `visible` clips a box's contents to its padding box, and
+  `overflow: auto`/`scroll` boxes scroll: scroll bars (laid over the box's right and bottom
+  edge) with arrows, thumb and track, the wheel over the box (the page scrolls when the box
+  is at its end), nested boxes, flex and grid items such as side panes, boxes inside
+  `position: fixed` ones, and links and controls inside them; scripts read and set
+  `scrollTop`, `scrollLeft`, `scrollWidth`, `scrollHeight`, `scrollTo()`, `scrollBy()` and
+  `scrollIntoView()` on them. `fixed` boxes stay where they are in the window as the page scrolls; `sticky` boxes
   follow it until the end of the box they are in (against the window, not a scrolling
   box inside the page). `<progress>`, `<meter>` and `<ruby>` (the annotation above its
   base) are drawn.
@@ -440,7 +461,8 @@ user/gl/                   the OpenGL library and its backends
 user/fsh/                  the shell
 user/desktop/              compositor and window manager (wm.c), apps (files, edit,
                            calc, player, taskmgr, diskmgr, display, setup, gears,
-                           mines, sound), PNG/JPEG/GIF/ICO/SVG decoding (png.c, jpeg.c,
+                           mines, sound), the themes (theme.c; fonts in font_sans.c and
+                           font_archivo.c), PNG/JPEG/GIF/ICO/SVG decoding (png.c, jpeg.c,
                            gif.c, ico.c, svg.c, image.c), the wallpaper, and the browser:
                            window (browser.c), HTML (html.c), CSS (css.c), layout
                            (layout.c), fonts (webfont.c), URLs (webutil.c), and
@@ -586,10 +608,14 @@ cannot be used.
   strings count UTF-8 bytes, `Symbol`s are strings, `WebSocket` is a stand-in
   that does nothing, typed arrays are plain arrays, and `eval` runs
   in the global scope, so many modern web apps won't run. Layout is an
-  approximation: `z-index` only orders absolute and fixed boxes, `sticky` works
+  approximation: the scroll bars of boxes lie over their contents instead of making room
+  (text can end up under them), and boxes with `overflow` that are table cells, or `<body>` and
+  `<html>`, do not clip or scroll; text selection and `getBoundingClientRect()` ignore how far
+  boxes are scrolled; backgrounds are not clipped by `background-clip`, `fixed` attachments
+  scroll with the box, only the first picture layer is used, `space` and `round` repeat; `z-index` only orders absolute and fixed boxes, `sticky` works
   against the window only, transforms other than `translate` and all
   `transition`s and animations are ignored, flex rows are lines of inline-blocks, grids lack named lines and
-  column flow, and `calc()` takes its first length. GIF animations show their
+  column flow. GIF animations show their
   first frame; SVG ignores clip paths, masks, filters and patterns. There are
   no font downloads, and characters
   outside Latin-1 and common punctuation show as `?`. Connections are kept per
@@ -614,4 +640,7 @@ by Štefan Štefančík on [Unsplash](https://unsplash.com), used under the
 
 The icons are from KDE's [Oxygen icon
 theme](https://invent.kde.org/frameworks/oxygen-icons5) (LGPL-3.0-or-later), and the desktop's
-text is rasterised from Liberation Sans, Serif and Mono.
+text is rasterised from Liberation Sans, Serif and Mono and, in the Kinetik theme, from
+[Archivo](https://fonts.google.com/specimen/Archivo) by The Archivo Project Authors (SIL Open
+Font License 1.1; its license is in `/usr/share/doc/fonts/LICENSE.archivo`). Kinetik's look follows the
+Kinetik studies for fluxOS.
