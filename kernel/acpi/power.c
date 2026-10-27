@@ -14,8 +14,8 @@
  * the disks and switches off, the sleep button and closing the lid
  * suspend, a critical battery or temperature switches off.
  *
- * "lid=ignore" on the command line keeps the lid from suspending when no
- * desktop runs.
+ * "lid=ignore" on the command line keeps the lid from suspending the
+ * machine, with or without the desktop (it is not even told).
  *
  * SYS_power reads what the thread last saw (POWER_INFO), suspends
  * (POWER_SLEEP, sleep.c) and sets the brightness (POWER_BRIGHTNESS).
@@ -714,9 +714,11 @@ static void check_lid(int report)
     if (closed == was || !report)
         return;
     klog("power: lid %s\n", closed ? "closed" : "opened");
+    if (cmdline_has("lid=ignore"))
+        return;
     if (input_grabbed())
         event(closed ? PEV_LID_CLOSED : PEV_LID_OPENED, 0);
-    else if (closed && !cmdline_has("lid=ignore"))
+    else if (closed)
         acpi_suspend();
 }
 

@@ -1432,3 +1432,101 @@ void radeon_modeset_init(void)
     if (fb_video_option(&m) && radeon_native_set(&m) < 0)
         kprintf("radeon: cannot set that video= mode, keeping the boot mode\n");
 }
+
+/*
+ * Evergreen (the Llano APUs): before native modes there, what does the
+ * video BIOS say the outputs are? A laptop's panel may hang straight off
+ * a UNIPHY transmitter (LVDS), be DisplayPort itself (eDP), or sit
+ * behind a DisplayPort-to-LVDS bridge (NUTMEG, encoder 22h; TRAVIS, 23h,
+ * is the VGA one), and each wants different mode-setting code. Logged,
+ * nothing changed: every display path with its connector and encoder
+ * chain, the panel's timing from LCD_Info, the revisions of the command
+ * tables mode setting would run, and whether the lit output's DDC line
+ * gives an EDID.
+ */
+void radeon_modeset_probe(void)
+{
+    static const char *const devname[12] = {
+        "CRT1", "LCD1", "TV1", "DFP1", "CRT2", "LCD2", "DFP6", "DFP2", "CV", "DFP3", "DFP4", "DFP5",
+    };
+    if (load_bios() < 0) {
+        kprintf("radeon: no AtomBIOS image found at C0000h or in the ROM BAR\n");
+        return;
+    }
+    read_clock_info();
+    uint16_t active = (uint16_t)(rd(BIOS_3_SCRATCH) & 0xFFF);
+    klog("radeon: AtomBIOS %s, reference clock %u kHz, active devices %03x\n", atom.name,
+         pll.reference_freq * 10, active);
+
+    uint8_t frev, crev;
+    uint16_t hdr = atom_data_table(&atom, ATOM_DATA_OBJECT_HEADER, NULL, &frev, &crev);
+    if (hdr && crev >= 2) {
+        uint32_t con_tab = hdr + atom_u16(&atom, hdr + 6u);
+        uint32_t path_tab = hdr + atom_u16(&atom, hdr + 14u);
+        int npaths = atom_u8(&atom, path_tab);
+        uint32_t path = path_tab + 4;
+        for (int i = 0; i < npaths && i < 8; i++) {
+            uint16_t tag = atom_u16(&atom, path), size = atom_u16(&atom, path + 2);
+            uint16_t conn = atom_u16(&atom, path + 4);
+            if (size < 8)
+                break;
+            char objs[48] = "";
+            for (int j = 0; j < (size - 8) / 2 && j < 6; j++) {
+                char one[8];
+                snprintf(one, sizeof(one), " %04x", atom_u16(&atom, path + 8u + 2u * (uint32_t)j));
+                strlcat(objs, one, sizeof(objs));
+            }
+            uint8_t i2c = 0;
+            for (int k = 0; k < atom_u8(&atom, con_tab); k++) {
+                uint32_t o = con_tab + 4u + 8u * (uint32_t)k;
+                if (atom_u16(&atom, o) == conn)
+                    i2c = object_i2c(hdr + atom_u16(&atom, o + 4));
+            }
+            int d = device_index(tag);
+            klog("radeon: path %d: %s, connector %04x (type %02x), encoders%s, DDC %02x%s\n", i,
+                 d < 12 ? devname[d] : "?", conn, conn & 0xFF, objs, i2c, (tag & active) ? ", lit" : "");
+            path += size;
+        }
+    }
+
+    uint16_t lcd = atom_data_table(&atom, ATOM_DATA_LCD_INFO, NULL, &frev, &crev);
+    if (lcd) {
+        uint32_t t = lcd + 4u;
+        klog("radeon: LCD_Info %u.%u: %ux%u, %u kHz, blank %u/%u, sync %u+%u/%u+%u, misc %02x, caps %02x\n",
+             frev, crev, atom_u16(&atom, t + 2), atom_u16(&atom, t + 6), atom_u16(&atom, t) * 10u,
+             atom_u16(&atom, t + 4), atom_u16(&atom, t + 8), atom_u16(&atom, t + 10), atom_u16(&atom, t + 12),
+             atom_u16(&atom, t + 14), atom_u16(&atom, t + 16), atom_u8(&atom, lcd + 40u), atom_u8(&atom, lcd + 48u));
+    }
+
+    static const struct { int index; const char *name; } tabs[] = {
+        { ATOM_CMD_SET_PIXEL_CLOCK, "pixclk" }, { ATOM_CMD_ADJUST_DISPLAY_PLL, "adjpll" },
+        { ATOM_CMD_SELECT_CRTC_SOURCE, "crtcsrc" }, { ATOM_CMD_DIG1_ENCODER, "dig1enc" },
+        { ATOM_CMD_UNIPHY_TRANSMITTER, "dig1tx" }, { ATOM_CMD_LVTMA_TRANSMITTER, "dig2tx" },
+        { ATOM_CMD_EXTERNAL_ENCODER, "extenc" }, { ATOM_CMD_PROCESS_AUX, "aux" },
+        { ATOM_CMD_DP_ENCODER_SERVICE, "dpsvc" }, { ATOM_CMD_ENABLE_SCALER, "scaler" },
+        { ATOM_CMD_DAC1_ENCODER, "dac1" },
+    };
+    char line[160] = "";
+    for (uint32_t i = 0; i < ARRAY_SIZE(tabs); i++) {
+        char one[24];
+        if (atom_cmd_revision(&atom, tabs[i].index, &frev, &crev))
+            snprintf(one, sizeof(one), " %s %u.%u", tabs[i].name, frev, crev);
+        else
+            snprintf(one, sizeof(one), " %s -", tabs[i].name);
+        strlcat(line, one, sizeof(line));
+    }
+    klog("radeon: tables:%s\n", line);
+
+    if (find_output() == 0) {
+        rv.edid_ok = read_edid();
+        klog("radeon: lit output: connector %04x, encoder %04x, DDC %02x: %s\n", out.connector,
+             out.encoder, out.i2c_id, rv.edid_ok ? "EDID read" : "no EDID on its DDC line");
+        if (rv.edid_ok) {
+            struct timing t;
+            if (parse_dtd(rv.edid + 54, &t))
+                klog("radeon: EDID preferred %ux%u at %u Hz, %u kHz\n", t.w, t.h, t.refresh, t.clock);
+        }
+    } else {
+        klog("radeon: no lit output found among the display paths\n");
+    }
+}

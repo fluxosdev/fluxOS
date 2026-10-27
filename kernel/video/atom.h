@@ -62,6 +62,7 @@ struct atom_context {
 
 /* Data table indexes (ATOM_MASTER_LIST_OF_DATA_TABLES) */
 #define ATOM_DATA_FIRMWARE_INFO   4
+#define ATOM_DATA_LCD_INFO        6
 #define ATOM_DATA_GPIO_I2C_INFO   10
 #define ATOM_DATA_VRAM_USAGE      11
 #define ATOM_DATA_OBJECT_HEADER   22
@@ -80,6 +81,9 @@ struct atom_context {
 #define ATOM_CMD_UPDATE_CRTC_DBUF     44
 #define ATOM_CMD_SET_CRTC_DTD_TIMING  49
 #define ATOM_CMD_ENABLE_YUV           73    /* EnableYUV is GetDispObjectInfo's slot */
+#define ATOM_CMD_EXTERNAL_ENCODER     50
+#define ATOM_CMD_PROCESS_AUX          78    /* ProcessAuxChannelTransaction */
+#define ATOM_CMD_DP_ENCODER_SERVICE   79
 #define ATOM_CMD_DAC1_OUTPUT          68
 #define ATOM_CMD_DAC2_OUTPUT          69
 #define ATOM_CMD_DIG1_ENCODER         74

@@ -122,7 +122,7 @@ stops at boot and says why.
   USB controllers (devices are found again), HD Audio, the network card and
   the PS/2 devices are set up again, and the display's VESA mode is restored
   from real mode. Options: `acpi=off`, `acpi=basic` (tables only, as before:
-  power-off without AML), `ec=off`, `lid=ignore`, `s3_bios` (run the video
+  power-off without AML), `ec=off`, `lid=ignore` (closing the lid does nothing), `s3_bios` (run the video
   BIOS on waking), `s3_nomode`, `s3_beep` (beep as soon as the firmware hands
   back, to debug a machine that does not wake).
 - Display drivers:

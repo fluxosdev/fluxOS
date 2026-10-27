@@ -507,6 +507,7 @@ void radeon_late_init(void)
     if (!rv.present)
         return;
     if (RADEON_EVERGREEN()) {
+        radeon_modeset_probe();
         boot_ok("%s: the boot loader's mode (native modes and 3D not yet for this chip)", rv.name);
         return;
     }

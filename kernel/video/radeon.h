@@ -152,6 +152,7 @@ void radeon_accel_proc_exit(int pid);
 
 /* radeon_modeset.c */
 void radeon_modeset_init(void);     /* after the timer and the heap */
+void radeon_modeset_probe(void);    /* Evergreen: report the BIOS's outputs, change nothing */
 int radeon_native_modes(struct dispmode *out, int max);
 int radeon_native_set(const struct dispmode *m);
 
