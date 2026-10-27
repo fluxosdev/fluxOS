@@ -1,5 +1,5 @@
 /*
- * The startup screen: on black, the logo, "fluxos" in Archivo and a
+ * The startup screen: on black, the logo, "fluxOS" in Archivo and a
  * loading bar, drawn on the framebuffer from early in the boot until a
  * process (the desktop) takes the screen. Behind it the console goes on
  * taking the boot messages, and comes out instead on a panic, when a
@@ -143,7 +143,7 @@ static void draw_all(void)
                 put(lx + i, y + j, scale(p & 0xFFFFFF, p >> 24));
         }
     y += FLUXOS_LOGO_SIZE + 20;
-    draw_text(&font_archivo_large, (w - text_width(&font_archivo_large, "fluxos")) / 2, y, "fluxos", TEXT_WHITE);
+    draw_text(&font_archivo_large, (w - text_width(&font_archivo_large, "fluxOS")) / 2, y, "fluxOS", TEXT_WHITE);
     y += text_h + 26;
     bar_x = (w - BAR_W) / 2;
     bar_y = y;
