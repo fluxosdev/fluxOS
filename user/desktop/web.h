@@ -18,7 +18,7 @@
 
 #define URL_MAX 2048
 /* How the browser names itself: in its requests, and to scripts (navigator.userAgent). */
-#define BROWSER_USER_AGENT "Mozilla/5.0 (fluxOS; i686) FluxBrowser/1.0"
+#define BROWSER_USER_AGENT "Mozilla/5.0 (fluxOS; i686) Wave/1.0"
 /* Where what is typed in the address bar that is not an address goes. */
 #define SEARCH_URL "https://html.duckduckgo.com/html/?q="
 

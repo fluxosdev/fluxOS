@@ -186,7 +186,7 @@ stops at boot and says why.
   editing), **Volume Control**, **Setup** (installs fluxOS on a disk; only
   shown when booted from the install medium), and **System Properties**.
 
-**Web browser** (the **Web Browser** icon): an Internet Explorer 3 style
+**Web browser** (the **Wave** icon): an Internet Explorer 3 style
 window with Back/Forward/Stop/Refresh/Home/History/Downloads/Favorites, address bar,
 progress gauge and a right-click menu (Back, Forward, Refresh, Stop, Home, Add to Favorites,
 Copy Page Address, Find in Page, Save Page As, View Page Source and Print on the page; Open,
@@ -494,7 +494,7 @@ the disk on `/mnt/hda1`.
 ## Things to try
 
 On the desktop: open **My Computer**, drag windows, open terminals, try
-**Run...** with `ls -l /bin`, open the **Web Browser** (68k.news, wiby.me and
+**Run...** with `ls -l /bin`, open **Wave** (68k.news, wiby.me and
 textfiles.com suit simple browsers; or type `example.com`), and **Shut Down...**.
 In a terminal:
 

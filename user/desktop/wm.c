@@ -190,7 +190,7 @@ struct desk_icon {
 static struct desk_icon desk_icons[] = {
     { ICON_COMPUTER, "My Computer", open_computer, 0, 0 },
     { ICON_TERMINAL, "Terminal", open_terminal, 0, 0 },
-    { ICON_BROWSER, "Web Browser", open_browser, 0, 0 },
+    { ICON_BROWSER, "Wave", open_browser, 0, 0 },
     { ICON_CALC, "Calculator", open_calculator, 0, 0 },
     { ICON_README, "Read Me", open_readme, 0, 0 },
     { ICON_INSTALL, "Install fluxOS", setup_open, 0, 0 },
@@ -216,7 +216,7 @@ struct menu_item {
 #define COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))
 
 static const struct menu_item programs_items[] = {
-    { ICON_BROWSER, "Web Browser", open_browser, NULL, 0 },
+    { ICON_BROWSER, "Wave", open_browser, NULL, 0 },
     { ICON_TERMINAL, "Terminal", open_terminal, NULL, 0 },
     { ICON_GEARS, "3D Gears", open_gears, NULL, 0 },
     { ICON_MINES, "Minesweeper", open_minesweeper, NULL, 0 },

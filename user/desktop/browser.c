@@ -516,9 +516,9 @@ static void update_title(struct browser *b, const char *title)
 {
     char t[96];
     if (title && *title)
-        snprintf(t, sizeof(t), "%.60s - Web Browser", title);
+        snprintf(t, sizeof(t), "%.60s - Wave", title);
     else
-        snprintf(t, sizeof(t), "Web Browser");
+        snprintf(t, sizeof(t), "Wave");
     if (b->win)                         /* a frame's title is nobody's */
         wm_set_title(b->win, t);
 }
@@ -2046,7 +2046,7 @@ static void js_reload(void *ctx)
 static void js_alert(void *ctx, const char *text)
 {
     (void)ctx;
-    message_box("Web Browser", ICON_INFO, text && *text ? text : " ");
+    message_box("Wave", ICON_INFO, text && *text ? text : " ");
 }
 
 static void js_status(void *ctx, const char *text)
@@ -6701,7 +6701,7 @@ void browser_tick(void)
 struct window *browser_open(const char *url)
 {
     if (wfont_init() < 0) {
-        message_box("Web Browser", ICON_WARNING,
+        message_box("Wave", ICON_WARNING,
                     "The browser's fonts (/usr/share/fonts/web.fnt) could not be loaded.");
         return NULL;
     }
@@ -6709,7 +6709,7 @@ struct window *browser_open(const char *url)
     if (!b)
         return NULL;
     init_loaders(b);
-    struct window *w = wm_create("Web Browser", ICON_BROWSER, BR_W, BR_H, WF_MINIMIZE | WF_MAXIMIZE | WF_RIGHTCLICK,
+    struct window *w = wm_create("Wave", ICON_BROWSER, BR_W, BR_H, WF_MINIMIZE | WF_MAXIMIZE | WF_RIGHTCLICK,
                                  &br_ops, b);
     if (!w) {
         free(b);

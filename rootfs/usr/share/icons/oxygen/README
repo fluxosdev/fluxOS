@@ -3,4 +3,5 @@ Source: https://invent.kde.org/frameworks/oxygen-icons5
 Regenerate with tools/oxygen-icons.py.
 media-cdrom is Oxygen's media-optical, internet-web-browser its applications-internet (a plain globe) and system-installer its
 package-x-generic. fluxos.png is the fluxOS logo (assets/fluxos-logo.png),
-not part of Oxygen.
+not part of Oxygen. wave.png is the Wave browser icon, rendered from
+assets/wave.svg (user-supplied artwork), also not part of Oxygen.

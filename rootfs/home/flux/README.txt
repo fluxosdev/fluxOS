@@ -18,7 +18,7 @@ The desktop
   Terminal         a shell (fsh) in a window; open as many as you like
   File Manager     folders, disks and pictures; double-click to open things
   Text Editor      this file is open in it
-  Web Browser      plain HTTP pages (no HTTPS yet): try 68k.news or wiby.me
+  Wave             plain HTTP pages (no HTTPS yet): try 68k.news or wiby.me
   Calculator       exact decimal arithmetic
   3D Gears         the classic OpenGL demo (arrow keys or drag to turn it,
                    Space pauses, S switches between hardware and software)
