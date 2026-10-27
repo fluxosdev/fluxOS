@@ -148,6 +148,10 @@ struct node {
     int bx0, by0, bx1, by1;             /* browser.c: its box in the last layout, for scripts */
     struct sheet *sheet;                /* browser.c: <style> and <link rel=stylesheet>: its sheet */
     uintptr_t sheet_sig;                /* what it was parsed from (<style>), or 1 once fetched (<link>) */
+    const char *adopted_text;           /* constructed sheets, outside the DOM child list */
+    struct node **assigned_nodes;
+    int assigned_count;
+    uint8_t slot_pending;
     unsigned bgen;                      /* the layout bx0... belong to */
 
     void *js;                           /* the script engine's wrapper (jsdom.c) */
@@ -244,6 +248,7 @@ struct gridspec {
     uint8_t auto_repeat;        /* 1 auto-fill, 2 auto-fit: tracks [rep, rep + nrep) repeat */
     int rep, nrep;
     struct track t[MAX_TRACKS];
+    const char *line_names[MAX_TRACKS + 1];
 };
 
 /* grid-template-areas: named rectangles of cells (0-based, end exclusive). */
@@ -392,6 +397,9 @@ struct style {
     uint8_t bg_norep_x, bg_norep_y;     /* background-repeat: no-repeat along an axis */
     uint8_t bg_origin;                  /* 0 padding-box, 1 border-box, 2 content-box */
     struct len bg_w, bg_h, bg_px, bg_py;
+    uint8_t bg_clip, bg_attachment;     /* clip: border/padding/content; attachment: scroll/fixed/local */
+    const char *bg_values[10];          /* declaration lists, resolved into layers after the cascade */
+    struct style *bg_layers, *bg_next;  /* topmost first; each layer has its own image and geometry */
 
     /* object-fit and object-position, for pictures */
     uint8_t obj_fit;                    /* OF_* */
@@ -468,12 +476,18 @@ enum dkind { DK_FILL, DK_TEXT, DK_IMAGE, DK_DISC, DK_CIRCLE, DK_CONTROL, DK_FRAM
 
 /* A background picture, placed: the item is the area it is painted in, and these are measured from its corner. */
 struct bgpaint {
+    struct bgpaint *next;       /* paint bottommost first */
     struct image *img;
     int tx, ty, tw, th;         /* the first tile: where it is and how big (tw, th > 0) */
     uint8_t norep_x, norep_y;   /* one tile only along the axis */
+    uint8_t grad, fixed;
+    uint32_t g0, g1;
+    struct rect clip;
 };
 
 struct ditem {
+    struct rect bgclip;
+    uint8_t bg_clipped;
     uint8_t kind;
     uint8_t deco;               /* text: DECO_* */
     int x, y, w, h;             /* in page coordinates */

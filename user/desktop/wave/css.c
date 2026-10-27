@@ -56,7 +56,7 @@ enum prop {
     P_BACKGROUND_POSITION_Y, P_BACKGROUND_REPEAT, P_BACKGROUND_ORIGIN, P_OBJECT_FIT,
     P_OBJECT_POSITION, P_OVERFLOW_X, P_OVERFLOW_Y, P_TAB_SIZE, P_TEXT_ALIGN_LAST, P_LINE_CLAMP,
     P_LIST_STYLE_IMAGE, P_COUNTER_RESET, P_COUNTER_INCREMENT,
-    P_DECO_THICKNESS, P_UNDERLINE_OFFSET,
+    P_DECO_THICKNESS, P_UNDERLINE_OFFSET, P_BACKGROUND_CLIP, P_BACKGROUND_ATTACHMENT,
 };
 
 static const struct { const char *name; uint8_t prop; } prop_names[] = {
@@ -77,7 +77,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "-webkit-user-select", P_USER_SELECT }, { "accent-color", P_IGNORED },
     { "align-items", P_ALIGN_ITEMS }, { "align-self", P_ALIGN_SELF }, { "appearance", P_IGNORED },
     { "aspect-ratio", P_ASPECT_RATIO }, { "background", P_BACKGROUND },
-    { "background-attachment", P_IGNORED }, { "background-clip", P_IGNORED },
+    { "background-attachment", P_BACKGROUND_ATTACHMENT }, { "background-clip", P_BACKGROUND_CLIP },
     { "background-color", P_BACKGROUND_COLOR }, { "background-image", P_BACKGROUND_IMAGE },
     { "background-origin", P_BACKGROUND_ORIGIN }, { "background-position", P_BACKGROUND_POSITION },
     { "background-position-x", P_BACKGROUND_POSITION_X },
@@ -206,6 +206,9 @@ struct attr_sel {
 struct selector;
 
 struct compound {
+    uint8_t host;
+    struct selector *host_args, *slot_args;
+    int nhost, nslot;
     int tag;                    /* -1: any */
     const char *tagname;        /* for elements we have no tag id for */
     const char *id;
@@ -244,7 +247,16 @@ struct decl {
     const char *value;
 };
 
+/* Layers are registered in first-appearance order, including empty statements.
+ * A parent's own declarations sort after its child layers. */
+struct layer {
+    const char *name;
+    struct layer *parent, *next, *canonical;
+    int order;
+};
+
 struct rule {
+    struct layer *layer;
     struct selector *sels;
     int nsels;
     struct decl *decls;
@@ -257,6 +269,8 @@ struct ref {                    /* a selector, filed in the index */
 };
 
 struct sheet {
+    struct layer *layers, *last_layer, *active_layer;
+    unsigned anonymous_layer;
     struct rule *rules;
     int nrules, cap;
     struct arena *a;
@@ -601,9 +615,22 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
                 *spec += 1;
                 continue;
             }
+            if (element && !strcmp(name, "slotted") && args) {
+                if (parse_compound_list(a, args, args_end, &c->slot_args, &c->nslot) < 0 || c->nslot != 1 ||
+                    c->slot_args[0].nparts != 1 || c->slot_args[0].pe) return NULL;
+                *spec += 1 + list_specificity(c->slot_args, c->nslot);
+                continue;
+            }
             if (element || !strcmp(name, "first-line") || !strcmp(name, "first-letter"))
                 return NULL;            /* other pseudo-elements: not generated */
-            if (!strcmp(name, "first-child"))
+            if (!strcmp(name, "host")) {
+                c->host = 1;
+                if (args) {
+                    if (parse_compound_list(a, args, args_end, &c->host_args, &c->nhost) < 0 ||
+                        c->nhost != 1 || c->host_args[0].nparts != 1 || c->host_args[0].pe) return NULL;
+                    *spec += list_specificity(c->host_args, c->nhost);
+                }
+            } else if (!strcmp(name, "first-child"))
                 c->pseudo |= PS_FIRST_CHILD;
             else if (!strcmp(name, "last-child"))
                 c->pseudo |= PS_LAST_CHILD;
@@ -1203,6 +1230,7 @@ static void add_rule(struct sheet *sh, const char *sel_s, const char *sel_e, con
 {
     struct arena *a = sh->a;
     struct rule r = { 0 };
+    r.layer = sh->active_layer;
     r.ndecls = parse_decls(a, body_s, body_e, &r.decls);
     if (!r.ndecls)
         return;
@@ -1377,6 +1405,40 @@ int css_supports(const char *cond)
 
 /* ---- nesting ---- */
 
+static struct layer *layer_name(struct sheet *sh, const char *s, const char *e)
+{
+    struct layer *parent = sh->active_layer;
+    while (s < e && isspace((unsigned char)*s)) s++;
+    while (e > s && isspace((unsigned char)e[-1])) e--;
+    char anonymous[64];
+    if (s == e) {
+        snprintf(anonymous, sizeof(anonymous), "@%p:%u", (void *)sh, ++sh->anonymous_layer);
+        s = anonymous;
+        e = s + strlen(s);
+    }
+    while (s < e) {
+        const char *dot = memchr(s, '.', (size_t)(e - s));
+        const char *end = dot ? dot : e;
+        if (end == s) return NULL;
+        struct layer *l;
+        for (l = sh->layers; l; l = l->next)
+            if (l->parent == parent && strlen(l->name) == (size_t)(end - s) &&
+                !strncmp(l->name, s, (size_t)(end - s))) break;
+        if (!l) {
+            l = arena_alloc(sh->a, sizeof(*l));
+            if (!l) return NULL;
+            l->name = arena_strndup(sh->a, s, (size_t)(end - s));
+            l->parent = parent;
+            if (sh->last_layer) sh->last_layer->next = l;
+            else sh->layers = l;
+            sh->last_layer = l;
+        }
+        parent = l;
+        s = dot ? dot + 1 : e;
+    }
+    return parent;
+}
+
 static void style_rule(struct sheet *sh, const char *sel_s, const char *sel_e, const char *body_s,
                        const char *body_e, int vw, int depth);
 
@@ -1479,9 +1541,13 @@ static void style_rule(struct sheet *sh, const char *sel_s, const char *sel_e, c
                     while (k < brace && is_ident_char(*k))
                         k++;
                     int kl = (int)(k - kw);
-                    if ((kl == 5 && !strncasecmp(kw, "media", 5) && media_matches(k, brace, vw)) ||
-                        (kl == 8 && !strncasecmp(kw, "supports", 8) && supports_matches(sh->a, k, brace)) ||
-                        (kl == 5 && !strncasecmp(kw, "layer", 5)))
+                    if (kl == 5 && !strncasecmp(kw, "layer", 5)) {
+                        struct layer *saved = sh->active_layer;
+                        sh->active_layer = layer_name(sh, k, brace);
+                        style_rule(sh, sel_s, sel_e, brace + 1, close - 1, vw, depth + 1);
+                        sh->active_layer = saved;
+                    } else if ((kl == 5 && !strncasecmp(kw, "media", 5) && media_matches(k, brace, vw)) ||
+                        (kl == 8 && !strncasecmp(kw, "supports", 8) && supports_matches(sh->a, k, brace)))
                         style_rule(sh, sel_s, sel_e, brace + 1, close - 1, vw, depth + 1);
                 } else {
                     int len;
@@ -1515,14 +1581,27 @@ static void parse_block(struct sheet *sh, const char *s, const char *end, int vw
             int kl = (int)(k - kw);
             const char *brace = find_top(k, sc.end, '{'), *semi = find_top(k, sc.end, ';');
             if (semi < brace) {         /* @import, @charset, @namespace, @layer a, b; */
+                if (kl == 5 && !strncasecmp(kw, "layer", 5))
+                    for (const char *p = k; p < semi;) {
+                        const char *comma = find_top(p, semi, ',');
+                        layer_name(sh, p, comma);
+                        p = comma < semi ? comma + 1 : semi;
+                    }
                 sc.s = semi + 1;
                 continue;
             }
             if (brace >= sc.end)
                 break;
             const char *close = skip_group(brace, sc.end);
+            if (depth < 8 && kl == 5 && !strncasecmp(kw, "layer", 5)) {
+                struct layer *saved = sh->active_layer;
+                sh->active_layer = layer_name(sh, k, brace);
+                parse_block(sh, brace + 1, close - 1, vw, depth + 1);
+                sh->active_layer = saved;
+                sc.s = close;
+                continue;
+            }
             if (depth < 8 && ((kl == 5 && !strncasecmp(kw, "media", 5) && media_matches(k, brace, vw)) ||
-                              (kl == 5 && !strncasecmp(kw, "layer", 5)) ||
                               (kl == 8 && !strncasecmp(kw, "supports", 8) && supports_matches(sh->a, k, brace)) ||
                               (kl == 8 && !strncasecmp(kw, "document", 8))))
                 parse_block(sh, brace + 1, close - 1, vw, depth + 1);
@@ -1592,6 +1671,7 @@ struct mctx {
     int (*visited)(const char *href, void *ctx);
     void *ctx;
     int quirks;
+    const struct node *host, *slotted;
 };
 
 static const struct node *prev_element(const struct node *n)
@@ -1897,6 +1977,14 @@ static int match_nth_filter(const struct compound *c, const struct node *n, cons
 
 static int match_compound(const struct compound *c, const struct node *n, const struct mctx *m)
 {
+    if (c->host) {
+        if (!m->host || n != m->host) return 0;
+        if (c->nhost) {
+            struct mctx outer = *m;
+            outer.host = NULL;
+            if (!match_from(c->host_args, 0, n, &outer)) return 0;
+        }
+    } else if (m->host && n == m->host) return 0;
     if (c->tag >= 0 && (c->tag != n->tag || (c->tag == T_UNKNOWN && strcmp(c->tagname, n->name))))
         return 0;
     if (c->id) {
@@ -2096,6 +2184,16 @@ static int match_compound(const struct compound *c, const struct node *n, const 
 
 static int match_from(const struct selector *s, int i, const struct node *n, const struct mctx *m)
 {
+    if (!n) return 0;
+    if (s->parts[i].nslot) {
+        if (!m->host || n->parent != m->host || n->type != N_ELEMENT) return 0;
+        struct mctx outer = *m;
+        outer.host = NULL;
+        if (!match_from(s->parts[i].slot_args, 0, n, &outer)) return 0;
+        const char *name = node_attr(n, "slot");
+        n = shadow_slot((struct node *)m->host, name ? name : "");
+        if (!n) return 0;
+    }
     if (!match_compound(&s->parts[i], n, m))
         return 0;
     if (i == 0)
@@ -2103,7 +2201,9 @@ static int match_from(const struct selector *s, int i, const struct node *n, con
     const struct node *p;
     switch (s->parts[i].comb) {
     case '>':
-        return n->parent && match_from(s, i - 1, n->parent, m);
+        p = n->parent;
+        if (p && p->shadow_host == m->host && m->host) p = m->host;
+        return p && match_from(s, i - 1, p, m);
     case '+':
         p = prev_element(n);
         return p && match_from(s, i - 1, p, m);
@@ -2113,9 +2213,11 @@ static int match_from(const struct selector *s, int i, const struct node *n, con
                 return 1;
         return 0;
     default:
-        for (p = n->parent; p; p = p->parent)
+        for (p = n->parent; p; p = p == m->host ? NULL : p->parent) {
+            if (p->shadow_host == m->host && m->host) p = m->host;
             if (match_from(s, i - 1, p, m))
                 return 1;
+        }
         return 0;
     }
 }
@@ -2670,7 +2772,7 @@ static int words(const char *s, const char **w, int *wl, int max)
             break;
         const char *e = s;
         while (e < end && !isspace((unsigned char)*e) && *e != ',') {
-            if (*e == '(' || *e == '"' || *e == '\'')
+            if (*e == '(' || *e == '[' || *e == '"' || *e == '\'')
                 e = skip_group(e, end);
             else
                 e++;
@@ -3230,7 +3332,7 @@ static void parse_bg_layer(struct style *st, const char *layer, const char *end,
     int wl[16], n = words(buf, w, wl, 16);
     char pos[256] = "", size[128] = "";
     int in_size = 0;
-    int rep[2] = { 0, 0 }, nrep = 0;
+    int rep[2] = { 0, 0 }, nrep = 0, nbox = 0;
     for (int i = 0; i < n; i++) {
         char tmp[256];
         snprintf(tmp, sizeof(tmp), "%.*s", wl[i], w[i]);
@@ -3250,13 +3352,14 @@ static void parse_bg_layer(struct style *st, const char *layer, const char *end,
                 st->bg_norep_x = st->bg_norep_y = (uint8_t)rep[0];
             else
                 st->bg_norep_y = (uint8_t)rep[1];
-        } else if (!strcasecmp(tmp, "border-box") && !in_size) {
-            st->bg_origin = 1;
-        } else if (!strcasecmp(tmp, "content-box") && !in_size) {
-            st->bg_origin = 2;
-        } else if (!strcasecmp(tmp, "padding-box") || !strcasecmp(tmp, "scroll") || !strcasecmp(tmp, "fixed") ||
-                   !strcasecmp(tmp, "local") || !strcasecmp(tmp, "text")) {
-            continue;
+        } else if (!strcasecmp(tmp, "border-box") || !strcasecmp(tmp, "content-box") || !strcasecmp(tmp, "padding-box")) {
+            int box = !strcasecmp(tmp, "border-box") ? 0 : !strcasecmp(tmp, "padding-box") ? 1 : 2;
+            if (!nbox++) st->bg_origin = box == 0 ? 1 : box == 1 ? 0 : 2;
+            st->bg_clip = (uint8_t)box;
+            in_size = 0;
+        } else if (!strcasecmp(tmp, "scroll") || !strcasecmp(tmp, "fixed") || !strcasecmp(tmp, "local")) {
+            st->bg_attachment = !strcasecmp(tmp, "fixed") ? 1 : !strcasecmp(tmp, "local") ? 2 : 0;
+            in_size = 0;
         } else if (in_size) {
             if (strlen(size) + strlen(tmp) + 2 < sizeof(size))
                 strcat(size, tmp), strcat(size, " ");
@@ -3388,6 +3491,18 @@ static void add_track(struct gridspec *g, const char *w, int wl, const struct vc
     g->n++;
 }
 
+static void add_line_names(struct gridspec *g, const char *s, int len, const struct vctx *v)
+{
+    if (len < 2 || *s != '[' || s[len-1] != ']') return;
+    s++; len -= 2;
+    const char *old = g->line_names[g->n];
+    size_t size = (old ? strlen(old) : 0) + (size_t)len + 2;
+    char *names = arena_alloc(v->a,size);
+    if (!names) return;
+    snprintf(names,size,"%s%.*s ",old ? old : "",len,s);
+    g->line_names[g->n] = names;
+}
+
 /* grid-template-columns: "200px 1fr", "repeat(3, 1fr)", "repeat(auto-fill, minmax(180px, 1fr))". */
 static const struct gridspec *parse_tracks(const char *value, const struct vctx *v)
 {
@@ -3401,6 +3516,7 @@ static const struct gridspec *parse_tracks(const char *value, const struct vctx 
     int wl[64], n = words(value, w, wl, 64), in_names = 0;
     for (int i = 0; i < n; i++) {
         if (in_names || w[i][0] == '[') {               /* [line names] */
+            add_line_names(g,w[i],wl[i],v);
             in_names = w[i][wl[i] - 1] != ']';
             continue;
         }
@@ -3430,6 +3546,7 @@ static const struct gridspec *parse_tracks(const char *value, const struct vctx 
                 int names = 0;
                 for (int j = 1; j < rn; j++) {
                     if (names || rw[j][0] == '[') {
+                        add_line_names(g,rw[j],rwl[j],v);
                         names = rw[j][rwl[j] - 1] != ']';
                         continue;
                     }
@@ -3504,7 +3621,7 @@ static const struct gridareas *parse_areas(const char *value, const struct vctx 
 }
 
 /* A grid line: "3", "-1", "span 2"; names and auto give 0. */
-static void grid_line(const char *s, const char *end, int *line, int *span)
+static void grid_line(const char *s, const char *end, int *line, int *span, const struct gridspec *g)
 {
     char buf[64];
     while (s < end && isspace((unsigned char)*s))
@@ -3524,18 +3641,41 @@ static void grid_line(const char *s, const char *end, int *line, int *span)
     }
     if (isdigit((unsigned char)buf[0]) || buf[0] == '-')
         *line = atoi(buf);
+    const char *w[3];
+    int wl[3], n = words(buf,w,wl,3), occurrence = 1;
+    const char *name = NULL;
+    int name_len = 0;
+    for (int i = 0; i < n; i++) {
+        if (isdigit((unsigned char)w[i][0]) || w[i][0] == '-') occurrence = atoi(w[i]);
+        else if (!word_is(w[i],wl[i],"auto")) name = w[i], name_len = wl[i];
+    }
+    if (!name || !g || !occurrence) return;
+    *line = 0;
+    long long remaining = occurrence > 0 ? occurrence : -(long long)occurrence;
+    for (int i = occurrence > 0 ? 0 : g->n; i >= 0 && i <= g->n; i += occurrence > 0 ? 1 : -1) {
+        const char *names = g->line_names[i];
+        int found = 0;
+        for (const char *p = names; p && *p;) {
+            while (isspace((unsigned char)*p)) p++;
+            const char *e = p;
+            while (*e && !isspace((unsigned char)*e)) e++;
+            if (e-p == name_len && !strncmp(p,name,(size_t)name_len)) found = 1;
+            p = e;
+        }
+        if (found && !--remaining) { *line = i+1; return; }
+    }
 }
 
 /* "start / end": a line and a span, or a line to a line. */
-static void grid_placement(const char *value, int *start, int *end, int *span)
+static void grid_placement(const char *value, int *start, int *end, int *span, const struct gridspec *g)
 {
     const char *vend = value + strlen(value), *slash = find_top(value, vend, '/');
     int sspan, espan;
-    grid_line(value, slash, start, &sspan);
+    grid_line(value, slash, start, &sspan, g);
     *end = 0;
     *span = sspan;
     if (slash < vend) {
-        grid_line(slash + 1, vend, end, &espan);
+        grid_line(slash + 1, vend, end, &espan, g);
         if (espan)
             *span = espan;
     }
@@ -3560,6 +3700,16 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
     int inherit_kw = !strcasecmp(value, "inherit");
     int initial_kw = !strcasecmp(value, "initial") || !strcasecmp(value, "unset") ||
                      !strcasecmp(value, "revert") || !strcasecmp(value, "revert-layer");
+
+    static const int backgrounds[] = { P_BACKGROUND, P_BACKGROUND_IMAGE, P_BACKGROUND_SIZE,
+        P_BACKGROUND_POSITION, P_BACKGROUND_REPEAT, P_BACKGROUND_ORIGIN, P_BACKGROUND_CLIP,
+        P_BACKGROUND_ATTACHMENT, P_BACKGROUND_POSITION_X, P_BACKGROUND_POSITION_Y };
+    for (unsigned k = 0; k < sizeof(backgrounds)/sizeof(backgrounds[0]); k++)
+        if (prop == backgrounds[k]) {
+            if (!k) memset(st->bg_values, 0, sizeof(st->bg_values));
+            st->bg_values[k] = v->a ? arena_strdup(v->a, value) : value;
+            break;
+        }
 
     switch (prop) {
     case P_DISPLAY:
@@ -3816,6 +3966,12 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
     case P_BACKGROUND_ORIGIN:
         st->bg_origin = !strcasecmp(value, "border-box") ? 1 : !strcasecmp(value, "content-box") ? 2 : 0;
         break;
+    case P_BACKGROUND_CLIP:
+        st->bg_clip = !strcasecmp(value, "padding-box") ? 1 : !strcasecmp(value, "content-box") ? 2 : 0;
+        break;
+    case P_BACKGROUND_ATTACHMENT:
+        st->bg_attachment = !strcasecmp(value, "fixed") ? 1 : !strcasecmp(value, "local") ? 2 : 0;
+        break;
     case P_GRID_TEMPLATE_COLUMNS:
         st->grid_cols = !strcasecmp(value, "none") || initial_kw ? NULL : parse_tracks(value, v);
         break;
@@ -3842,25 +3998,25 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         break;
     }
     case P_GRID_COLUMN:
-        grid_placement(value, &st->gc_start, &st->gc_end, &st->gc_span);
+        grid_placement(value, &st->gc_start, &st->gc_end, &st->gc_span, parent->grid_cols);
         break;
     case P_GRID_COLUMN_START: {
         int span;
-        grid_line(value, value + strlen(value), &st->gc_start, &span);
+        grid_line(value, value + strlen(value), &st->gc_start, &span, parent->grid_cols);
         if (span)
             st->gc_span = span;
         break;
     }
     case P_GRID_COLUMN_END: {
         int span;
-        grid_line(value, value + strlen(value), &st->gc_end, &span);
+        grid_line(value, value + strlen(value), &st->gc_end, &span, parent->grid_cols);
         if (span)
             st->gc_span = span;
         break;
     }
     case P_GRID_ROW: {
         int end;
-        grid_placement(value, &st->gr_start, &end, &st->gr_span);
+        grid_placement(value, &st->gr_start, &end, &st->gr_span, parent->grid_rows);
         st->gr_end = end;
         if (end > st->gr_start && st->gr_start > 0)
             st->gr_span = end - st->gr_start;
@@ -3868,14 +4024,14 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
     }
     case P_GRID_ROW_END: {
         int span;
-        grid_line(value, value + strlen(value), &st->gr_end, &span);
+        grid_line(value, value + strlen(value), &st->gr_end, &span, parent->grid_rows);
         if (span)
             st->gr_span = span;
         break;
     }
     case P_GRID_ROW_START: {
         int span;
-        grid_line(value, value + strlen(value), &st->gr_start, &span);
+        grid_line(value, value + strlen(value), &st->gr_start, &span, parent->grid_rows);
         if (span)
             st->gr_span = span;
         break;
@@ -3891,7 +4047,7 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         int part[4] = { 0, 0, 0, 0 }, spans[4] = { 0, 0, 0, 0 };
         for (int i = 0; i < 4 && p <= e; i++) {
             const char *slash = find_top(p, e, '/');
-            grid_line(p, slash, &part[i], &spans[i]);
+            grid_line(p, slash, &part[i], &spans[i], i & 1 ? parent->grid_cols : parent->grid_rows);
             p = slash + 1;
         }
         st->gr_start = part[0], st->gc_start = part[1], st->gc_end = part[3];
@@ -4589,6 +4745,66 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
     }
 }
 
+static int background_parts(const char *value)
+{
+    int n = 1;
+    if (!value) return 0;
+    const char *end = value + strlen(value);
+    for (const char *p = value; p < end;) {
+        p = find_top(p, end, ',');
+        if (p < end) n++, p++;
+    }
+    return n;
+}
+
+static const char *background_part(struct arena *a, const char *value, int i)
+{
+    int count = background_parts(value);
+    if (!count) return NULL;
+    i %= count;
+    const char *p = value, *end = p + strlen(p);
+    while (i--) p = find_top(p, end, ',') + 1;
+    return trimmed(a, p, find_top(p, end, ','));
+}
+
+/* Image layers determine the length. Other lists repeat, as CSS requires. */
+static void finish_background(struct style *st, const struct style *parent, const struct vctx *v)
+{
+    const char **raw = st->bg_values;
+    if (!raw[0] && !raw[1]) return;
+    int n = background_parts(raw[1] ? raw[1] : raw[0]);
+    if (n > 64) n = 64;
+    struct style **tail = &st->bg_layers;
+    static const int props[] = { P_BACKGROUND_SIZE, P_BACKGROUND_POSITION, P_BACKGROUND_REPEAT,
+        P_BACKGROUND_ORIGIN, P_BACKGROUND_CLIP, P_BACKGROUND_ATTACHMENT,
+        P_BACKGROUND_POSITION_X, P_BACKGROUND_POSITION_Y };
+    for (int i = 0; i < n; i++) {
+        struct style *l = arena_alloc(v->a, sizeof(*l));
+        if (!l) break;
+        *l = *st;
+        l->bg_layers = l->bg_next = NULL;
+        reset_bg_picture(l);
+        l->bg_clip = l->bg_attachment = l->grad = 0;
+        const char *part = background_part(v->a, raw[0], i);
+        if (part) {
+            l->bg_url = url_arg(v->a, part, part + strlen(part), NULL);
+            parse_gradient(part, &l->g0, &l->g1, &l->grad);
+            parse_bg_layer(l, part, part + strlen(part), v);
+        }
+        if (raw[1]) {
+            part = background_part(v->a, raw[1], i);
+            l->bg_url = url_arg(v->a, part, part + strlen(part), NULL);
+            l->grad = 0;
+            parse_gradient(part, &l->g0, &l->g1, &l->grad);
+        }
+        for (int k = 2; k < 10; k++)
+            if (raw[k]) apply(l, parent, props[k - 2], background_part(v->a, raw[k], i), v);
+        *tail = l;
+        tail = &l->bg_next;
+        if (i == n - 1) st->bg_clip = l->bg_clip;
+    }
+}
+
 /* ---- var() ---- */
 
 static const char *lookup_var(const struct style *st, const char *name, int len)
@@ -4901,29 +5117,43 @@ struct match {
     uint32_t spec;
     uint32_t order;
     uint32_t pe;                /* for ::before (1) or ::after (2) */
+    int layer;
+    int scope;                 /* inner tree normal rules precede outer rules; important reverses */
 };
+
+enum { R_UA, R_HINT, R_AUTHOR, R_INLINE, R_AUTHOR_IMPORTANT, R_INLINE_IMPORTANT };
 
 static int cmp_match(const void *a, const void *b)
 {
     const struct match *x = a, *y = b;
+    if (x->rank != y->rank && (x->rank < R_AUTHOR || y->rank < R_AUTHOR ||
+                              x->d->important != y->d->important))
+        return x->rank < y->rank ? -1 : 1;
+    if (x->scope != y->scope)
+        return x->d->important ? (x->scope < y->scope ? 1 : -1)
+                               : (x->scope < y->scope ? -1 : 1);
     if (x->rank != y->rank)
         return x->rank < y->rank ? -1 : 1;
+    if (x->layer != y->layer)
+        return x->d->important ? (x->layer < y->layer ? 1 : -1)
+                               : (x->layer < y->layer ? -1 : 1);
     if (x->spec != y->spec)
         return x->spec < y->spec ? -1 : 1;
     return x->order < y->order ? -1 : x->order > y->order;
 }
 
 /* Origins, lowest first. Important author declarations beat everything. */
-enum { R_UA, R_HINT, R_AUTHOR, R_INLINE, R_AUTHOR_IMPORTANT, R_INLINE_IMPORTANT };
+
 
 struct collect {
     struct match *m;
     int n;
     const struct mctx *mc;
+    int scope;
 };
 
 static void add_decls(struct collect *c, const struct decl *d, int nd, int base_rank,
-                      uint32_t spec, uint32_t order, int pe)
+                      uint32_t spec, uint32_t order, int pe, int layer)
 {
     for (int i = 0; i < nd && c->n < MAX_MATCHES; i++) {
         uint32_t rank = (uint32_t)base_rank;
@@ -4931,7 +5161,7 @@ static void add_decls(struct collect *c, const struct decl *d, int nd, int base_
             rank = R_AUTHOR_IMPORTANT;
         else if (d[i].important && base_rank == R_INLINE)
             rank = R_INLINE_IMPORTANT;
-        c->m[c->n++] = (struct match){ &d[i], rank, spec, order + (uint32_t)i, (uint32_t)pe };
+        c->m[c->n++] = (struct match){ &d[i], rank, spec, order + (uint32_t)i, (uint32_t)pe, layer, c->scope };
     }
 }
 
@@ -4943,13 +5173,27 @@ static void match_list(struct collect *c, const struct sheet *sh, const struct r
         const struct selector *sel = &r->sels[ref->sel];
         if (match_from(sel, sel->nparts - 1, n, c->mc))
             add_decls(c, r->decls, r->ndecls, rank, sel->spec,
-                      sheet_order + (uint32_t)ref->rule * 256, sel->pe);
+                      sheet_order + (uint32_t)ref->rule * 256, sel->pe,
+                      r->layer ? r->layer->canonical->order : 0x7fffffff);
     }
 }
 
 static void match_sheet(struct collect *c, const struct sheet *sh, const struct node *n, int rank,
                         uint32_t sheet_order)
 {
+    if (c->mc->host && (n == c->mc->host || n == c->mc->slotted)) {
+        for (int i = 0; i < sh->nrules; i++) {
+            const struct rule *r = &sh->rules[i];
+            for (int j = 0; j < r->nsels; j++) {
+                const struct selector *sel = &r->sels[j];
+                if (n == c->mc->slotted && !sel->parts[sel->nparts-1].nslot) continue;
+                if (match_from(sel, sel->nparts-1, n, c->mc))
+                    add_decls(c,r->decls,r->ndecls,rank,sel->spec,sheet_order+(uint32_t)i*256,sel->pe,
+                              r->layer ? r->layer->canonical->order : 0x7fffffff);
+            }
+        }
+        return;
+    }
     const char *id = node_attr(n, "id");
     if (id)
         match_list(c, sh, sh->by_id[hash_str(id) % INDEX_BUCKETS], n, rank, sheet_order);
@@ -4986,9 +5230,271 @@ static void match_sheet(struct collect *c, const struct sheet *sh, const struct 
     match_list(c, sh, sh->other, n, rank, sheet_order);
 }
 
+/* Copy only the property being rolled back. In particular, reverting a
+ * longhand must preserve the other values set by a higher-layer shorthand. */
+static void restore_property(struct style *st, const struct style *src, int prop)
+{
+#define COPY(f) memcpy(&st->f, &src->f, sizeof(st->f))
+    switch (prop) {
+    case P_DISPLAY: COPY(display); COPY(inner); break;
+    case P_FLEX_DIRECTION: COPY(flex_column); COPY(flex_reverse); break;
+    case P_FLEX_FLOW: COPY(flex_column); COPY(flex_reverse); COPY(flex_wrap); break;
+    case P_FLEX_WRAP: COPY(flex_wrap); break;
+    case P_FLEX: COPY(flex_grow); COPY(flex_shrink); COPY(flex_basis); break;
+    case P_FLEX_GROW: COPY(flex_grow); break;
+    case P_FLEX_SHRINK: COPY(flex_shrink); break;
+    case P_FLEX_BASIS: COPY(flex_basis); break;
+    case P_JUSTIFY_CONTENT: COPY(justify); break;
+    case P_ALIGN_ITEMS: COPY(align_items); break;
+    case P_ALIGN_SELF: COPY(align_self); break;
+    case P_JUSTIFY_ITEMS: COPY(justify_items); break;
+    case P_JUSTIFY_SELF: COPY(justify_self); break;
+    case P_PLACE_CONTENT: COPY(justify); break;
+    case P_PLACE_ITEMS: COPY(align_items); COPY(justify_items); break;
+    case P_PLACE_SELF: COPY(align_self); COPY(justify_self); break;
+    case P_ORDER: COPY(order); break;
+    case P_GAP: COPY(row_gap); COPY(col_gap); break;
+    case P_ROW_GAP: COPY(row_gap); break;
+    case P_COLUMN_GAP: COPY(col_gap); break;
+    case P_OVERFLOW: COPY(ov_x); COPY(ov_y); break;
+    case P_OVERFLOW_X: COPY(ov_x); break;
+    case P_OVERFLOW_Y: COPY(ov_y); break;
+    case P_OBJECT_FIT: COPY(obj_fit); break;
+    case P_OBJECT_POSITION: COPY(obj_px); COPY(obj_py); break;
+    case P_BACKGROUND_SIZE: COPY(bg_size); COPY(bg_w); COPY(bg_h); break;
+    case P_BACKGROUND_POSITION: COPY(bg_px); COPY(bg_py); break;
+    case P_BACKGROUND_POSITION_X: COPY(bg_px); break;
+    case P_BACKGROUND_POSITION_Y: COPY(bg_py); break;
+    case P_BACKGROUND_REPEAT: COPY(bg_norep_x); COPY(bg_norep_y); break;
+    case P_BACKGROUND_ORIGIN: COPY(bg_origin); break;
+    case P_GRID_TEMPLATE_COLUMNS: COPY(grid_cols); break;
+    case P_GRID_TEMPLATE_ROWS: COPY(grid_rows); break;
+    case P_GRID_AUTO_ROWS: COPY(grid_auto_rows); break;
+    case P_GRID_TEMPLATE_AREAS: COPY(grid_areas); break;
+    case P_GRID_AUTO_FLOW: COPY(grid_dense); break;
+    case P_GRID_TEMPLATE: COPY(grid_cols); COPY(grid_rows); COPY(grid_areas); break;
+    case P_GRID_COLUMN: COPY(gc_start); COPY(gc_end); COPY(gc_span); break;
+    case P_GRID_COLUMN_START: COPY(gc_start); COPY(gc_span); break;
+    case P_GRID_COLUMN_END: COPY(gc_end); COPY(gc_span); break;
+    case P_GRID_ROW: COPY(gr_start); COPY(gr_end); COPY(gr_span); break;
+    case P_GRID_ROW_START: COPY(gr_start); COPY(gr_span); break;
+    case P_GRID_ROW_END: COPY(gr_end); COPY(gr_span); break;
+    case P_GRID_AREA: COPY(grid_area); COPY(gr_start); COPY(gr_end); COPY(gr_span); COPY(gc_start); COPY(gc_end); COPY(gc_span); break;
+    case P_BACKGROUND_IMAGE: COPY(g0); COPY(g1); COPY(grad); COPY(bg_url); COPY(bg_img); break;
+    case P_BACKGROUND_COLOR: COPY(bg); break;
+    case P_BACKGROUND: COPY(bg); COPY(g0); COPY(g1); COPY(grad); COPY(bg_url); COPY(bg_img); COPY(bg_size); COPY(bg_w); COPY(bg_h); COPY(bg_px); COPY(bg_py); COPY(bg_norep_x); COPY(bg_norep_y); COPY(bg_origin); break;
+    case P_FLOAT: COPY(floated); break;
+    case P_COLOR: COPY(color); break;
+    case P_FONT_SIZE: COPY(font_size); break;
+    case P_FONT_WEIGHT: COPY(bold); break;
+    case P_FONT_STYLE: COPY(italic); break;
+    case P_FONT_FAMILY: COPY(family); break;
+    case P_FONT: COPY(font_size); COPY(bold); COPY(italic); COPY(family); COPY(lh); COPY(lh_kind); break;
+    case P_LINE_HEIGHT: COPY(lh); COPY(lh_kind); break;
+    case P_TEXT_ALIGN: COPY(text_align); COPY(center_blocks); break;
+    case P_TEXT_DECORATION: COPY(decoration); COPY(deco_color); COPY(deco_style); break;
+    case P_TEXT_DECORATION_LINE: COPY(decoration); break;
+    case P_DECO_THICKNESS: COPY(deco_thickness); break;
+    case P_UNDERLINE_OFFSET: COPY(underline_offset); break;
+    case P_TEXT_DECORATION_COLOR: COPY(deco_color); break;
+    case P_TEXT_DECORATION_STYLE: COPY(deco_style); break;
+    case P_LETTER_SPACING: COPY(letter_spacing); break;
+    case P_WORD_SPACING: COPY(word_spacing); break;
+    case P_WORD_BREAK: COPY(word_break); break;
+    case P_OVERFLOW_WRAP: COPY(word_break); break;
+    case P_TEXT_OVERFLOW: COPY(text_ellipsis); break;
+    case P_FONT_VARIANT: COPY(small_caps); break;
+    case P_TABLE_LAYOUT: COPY(table_fixed); break;
+    case P_CAPTION_SIDE: COPY(caption_bottom); break;
+    case P_EMPTY_CELLS: COPY(empty_hide); break;
+    case P_LIST_STYLE_POSITION: COPY(list_inside); break;
+    case P_LIST_STYLE_IMAGE: COPY(ls_url); COPY(ls_img); break;
+    case P_TAB_SIZE: COPY(tab_size); break;
+    case P_TEXT_ALIGN_LAST: COPY(text_align_last); break;
+    case P_LINE_CLAMP: COPY(line_clamp); break;
+    case P_COUNTER_RESET: COPY(counter_reset); break;
+    case P_COUNTER_INCREMENT: COPY(counter_inc); break;
+    case P_CURSOR: COPY(cursor); break;
+    case P_POINTER_EVENTS: COPY(pointer_none); break;
+    case P_USER_SELECT: COPY(select_none); break;
+    case P_OUTLINE: COPY(outline_style); COPY(outline_w); COPY(outline_color); break;
+    case P_OUTLINE_STYLE: COPY(outline_style); break;
+    case P_OUTLINE_WIDTH: COPY(outline_w); break;
+    case P_OUTLINE_COLOR: COPY(outline_color); break;
+    case P_OUTLINE_OFFSET: COPY(outline_offset); break;
+    case P_TEXT_SHADOW: COPY(ts_x); COPY(ts_y); COPY(ts_blur); COPY(ts_color); break;
+    case P_TEXT_TRANSFORM: COPY(text_transform); break;
+    case P_TEXT_INDENT: COPY(text_indent); break;
+    case P_WHITE_SPACE: COPY(white_space); break;
+    case P_VERTICAL_ALIGN: COPY(vertical_align); break;
+    case P_LIST_STYLE: COPY(list_style); COPY(list_inside); COPY(ls_url); COPY(ls_img); break;
+    case P_LIST_STYLE_TYPE: COPY(list_style); break;
+    case P_WIDTH: COPY(width); break;
+    case P_HEIGHT: COPY(height); break;
+    case P_MIN_WIDTH: COPY(min_width); break;
+    case P_MAX_WIDTH: COPY(max_width); break;
+    case P_MIN_HEIGHT: COPY(min_height); break;
+    case P_MAX_HEIGHT: COPY(max_height); break;
+    case P_ASPECT_RATIO: COPY(aspect_w); COPY(aspect_h); break;
+    case P_BOX_SIZING: COPY(box_sizing_border); break;
+    case P_VISIBILITY: COPY(hidden); break;
+    case P_BORDER_SPACING: COPY(border_spacing); break;
+    case P_BORDER_COLLAPSE: COPY(border_spacing); break;
+    case P_POSITION: COPY(positioned); COPY(position); break;
+    case P_BOX_SHADOW: COPY(sh_color); COPY(sh_x); COPY(sh_y); COPY(sh_blur); COPY(sh_spread); break;
+    case P_TRANSFORM: COPY(tx); COPY(ty); break;
+    case P_Z_INDEX: COPY(z_set); COPY(z_index); break;
+    case P_CLEAR: COPY(clear); break;
+    case P_TOP: COPY(top); break;
+    case P_RIGHT: COPY(right); break;
+    case P_BOTTOM: COPY(bottom); break;
+    case P_LEFT: COPY(left); break;
+    case P_INSET: COPY(top); COPY(right); COPY(bottom); COPY(left); break;
+    case P_OPACITY: COPY(invisible); COPY(opacity); break;
+    case P_MASK: COPY(invisible); break;
+    case P_CLIP: COPY(invisible); break;
+    case P_MARGIN: COPY(margin); break;
+    case P_PADDING: COPY(padding); break;
+    case P_BORDER_RADIUS: COPY(radius); break;
+    case P_BORDER_WIDTH: COPY(border_w); break;
+    case P_BORDER_STYLE: COPY(border_style); break;
+    case P_BORDER_COLOR: COPY(border_color); break;
+    case P_MARGIN_TOP: COPY(margin[0]); break;
+    case P_MARGIN_RIGHT: COPY(margin[1]); break;
+    case P_MARGIN_BOTTOM: COPY(margin[2]); break;
+    case P_MARGIN_LEFT: COPY(margin[3]); break;
+    case P_PADDING_TOP: COPY(padding[0]); break;
+    case P_PADDING_RIGHT: COPY(padding[1]); break;
+    case P_PADDING_BOTTOM: COPY(padding[2]); break;
+    case P_PADDING_LEFT: COPY(padding[3]); break;
+    case P_BORDER_TL_RADIUS: COPY(radius[0]); break;
+    case P_BORDER_TR_RADIUS: COPY(radius[1]); break;
+    case P_BORDER_BR_RADIUS: COPY(radius[2]); break;
+    case P_BORDER_BL_RADIUS: COPY(radius[3]); break;
+    case P_BORDER: COPY(border_w); COPY(border_style); COPY(border_color); break;
+    case P_BORDER_TOP: COPY(border_w[0]); COPY(border_style[0]); COPY(border_color[0]); break;
+    case P_BORDER_TOP_WIDTH: COPY(border_w[0]); break;
+    case P_BORDER_TOP_STYLE: COPY(border_style[0]); break;
+    case P_BORDER_TOP_COLOR: COPY(border_color[0]); break;
+    case P_BORDER_RIGHT: COPY(border_w[1]); COPY(border_style[1]); COPY(border_color[1]); break;
+    case P_BORDER_RIGHT_WIDTH: COPY(border_w[1]); break;
+    case P_BORDER_RIGHT_STYLE: COPY(border_style[1]); break;
+    case P_BORDER_RIGHT_COLOR: COPY(border_color[1]); break;
+    case P_BORDER_BOTTOM: COPY(border_w[2]); COPY(border_style[2]); COPY(border_color[2]); break;
+    case P_BORDER_BOTTOM_WIDTH: COPY(border_w[2]); break;
+    case P_BORDER_BOTTOM_STYLE: COPY(border_style[2]); break;
+    case P_BORDER_BOTTOM_COLOR: COPY(border_color[2]); break;
+    case P_BORDER_LEFT: COPY(border_w[3]); COPY(border_style[3]); COPY(border_color[3]); break;
+    case P_BORDER_LEFT_WIDTH: COPY(border_w[3]); break;
+    case P_BORDER_LEFT_STYLE: COPY(border_style[3]); break;
+    case P_BORDER_LEFT_COLOR: COPY(border_color[3]); break;
+    case P_MARGIN_INLINE: COPY(margin[3]); COPY(margin[1]); break;
+    case P_MARGIN_BLOCK: COPY(margin[0]); COPY(margin[2]); break;
+    case P_PADDING_INLINE: COPY(padding[3]); COPY(padding[1]); break;
+    case P_PADDING_BLOCK: COPY(padding[0]); COPY(padding[2]); break;
+    case P_INSET_INLINE: COPY(left); COPY(right); break;
+    case P_INSET_BLOCK: COPY(top); COPY(bottom); break;
+    case P_BACKGROUND_CLIP: COPY(bg_clip); break;
+    case P_BACKGROUND_ATTACHMENT: COPY(bg_attachment); break;
+    default: break;
+    }
+#undef COPY
+    static const int backgrounds[] = { P_BACKGROUND, P_BACKGROUND_IMAGE, P_BACKGROUND_SIZE,
+        P_BACKGROUND_POSITION, P_BACKGROUND_REPEAT, P_BACKGROUND_ORIGIN, P_BACKGROUND_CLIP,
+        P_BACKGROUND_ATTACHMENT, P_BACKGROUND_POSITION_X, P_BACKGROUND_POSITION_Y };
+    for (int k = 0; k < 10; k++)
+        if (prop == backgrounds[k]) {
+            if (!k) memcpy(st->bg_values, src->bg_values, sizeof(st->bg_values));
+            else st->bg_values[k] = src->bg_values[k];
+            break;
+        }
+}
+
+struct rollback {
+    int layer, origin, scope;
+    const struct rollback *next;
+};
+
+static int match_origin(const struct match *m)
+{
+    return m->rank == R_AUTHOR_IMPORTANT ? R_AUTHOR :
+           m->rank == R_INLINE_IMPORTANT ? R_INLINE : (int)m->rank;
+}
+
+static const char *custom_cascade_value(const struct collect *c, int i,
+                                        const struct style *parent,
+                                        const struct rollback *skip)
+{
+    const struct match *m = &c->m[i];
+    const char *value = m->d->value;
+    if (strcasecmp(value, "revert") && strcasecmp(value, "revert-layer")) return value;
+    struct rollback exclude = { !strcasecmp(value, "revert") ? -1 : m->layer,
+                                 match_origin(m), m->scope, skip };
+    for (int j = i - 1; j >= 0; j--) {
+        const struct match *p = &c->m[j];
+        if (p->pe != m->pe || p->d->prop != P_CUSTOM || strcmp(p->d->name, m->d->name)) continue;
+        int hidden = 0;
+        for (const struct rollback *r = &exclude; r; r = r->next)
+            if (match_origin(p) == r->origin && p->scope == r->scope && (r->layer < 0 || r->layer == p->layer)) hidden = 1;
+        if (!hidden) return custom_cascade_value(c, j, parent, &exclude);
+    }
+    return lookup_var(parent, m->d->name, (int)strlen(m->d->name));
+}
+
+static void apply_match(struct style *st, const struct style *parent, const struct collect *c,
+                         int i, const struct vctx *v, int pass, const struct rollback *skip,
+                         int *budget)
+{
+    const struct match *m = &c->m[i];
+    const struct decl *d = m->d;
+    for (const struct rollback *r = skip; r; r = r->next)
+        if (match_origin(m) == r->origin && m->scope == r->scope && (r->layer < 0 || m->layer == r->layer)) return;
+    const char *value = d->value;
+    char expanded[1024];
+    if (strstr(value, "var(")) {
+        if (!substitute(st, value, expanded, sizeof(expanded), 0)) return;
+        value = expanded;
+    }
+    if (strcasecmp(value, "revert-layer") && strcasecmp(value, "revert")) {
+        apply(st, parent, d->prop, value, v);
+        return;
+    }
+    if (--*budget < 0) return;
+    struct rollback exclude = { !strcasecmp(value, "revert") ? -1 : m->layer,
+                                 match_origin(m), m->scope, skip };
+    struct style lower;
+    inherit(&lower, parent);
+    lower.vars = st->vars;
+    struct vctx ctx = *v;
+    ctx.font_size = parent->font_size;
+    for (int phase = 2; phase <= pass; phase++) {
+        if (phase == 3) ctx.font_size = lower.font_size;
+        for (int j = 0; j < i; j++) {
+            int prop = c->m[j].d->prop;
+            int early = prop == P_FONT_SIZE || prop == P_FONT;
+            if (c->m[j].pe != m->pe || prop == P_CUSTOM || (phase == 2) != early) continue;
+            apply_match(&lower, parent, c, j, &ctx, phase, &exclude, budget);
+        }
+    }
+    restore_property(st, &lower, d->prop);
+}
+
 static void pseudo(struct arena *a, struct node *n, const struct style *st, const struct collect *c,
                    int pe, const struct vctx *base);
 static void counter_apply(const char *spec, int reset);
+static void prepare_layers(struct arena *a, struct sheet **sheets, int nsheets);
+
+static int shadow_sheets(struct arena *a, struct node *shadow, struct sheet **sheets, int vw)
+{
+    int ns = 0;
+    for (struct node *k = shadow; k; k = node_next(k, shadow))
+        if (ns < 64 && k->sheet) sheets[ns++] = k->sheet;
+        else if (k->tag == T_STYLE && k->first && ns < 64)
+            sheets[ns++] = css_parse(a, k->first->text, k->first->len, vw);
+    if (shadow->adopted_text && ns < 64)
+        sheets[ns++] = css_parse(a, shadow->adopted_text, (int)strlen(shadow->adopted_text), vw);
+    return ns;
+}
 
 static void compute(struct arena *a, struct node *n, const struct style *parent,
                     struct sheet **sheets, int nsheets, const struct vctx *base,
@@ -5002,7 +5508,7 @@ static void compute(struct arena *a, struct node *n, const struct style *parent,
     memset(n->pseudo_st, 0, sizeof(n->pseudo_st));     /* the last cascade's styles are gone */
     memset(n->pseudo_text, 0, sizeof(n->pseudo_text));
 
-    struct collect c = { buf, 0, mc };
+    struct collect c = { .m = buf, .mc = mc };
     match_sheet(&c, ua_sheet, n, R_UA, 0);
     if (mc->quirks)
         match_sheet(&c, ua_quirks, n, R_UA, 1u << 23);
@@ -5011,16 +5517,33 @@ static void compute(struct arena *a, struct node *n, const struct style *parent,
     if (hint[0]) {
         struct decl *d;
         int nd = parse_decls(a, hint, hint + strlen(hint), &d);
-        add_decls(&c, d, nd, R_HINT, 0, 0, 0);
+        add_decls(&c, d, nd, R_HINT, 0, 0, 0, 0x7fffffff);
     }
     for (int i = 0; i < nsheets; i++)
         if (sheets[i])
             match_sheet(&c, sheets[i], n, R_AUTHOR, (uint32_t)(i + 1) << 24);
+    struct node *host = n->shadow_root ? n : n->parent && n->parent->shadow_root ? n->parent : NULL;
+    if (host) {
+        struct sheet *inner[64];
+        int count = shadow_sheets(a, host->shadow_root, inner, base->vw);
+        prepare_layers(a, inner, count);
+        struct mctx scope = *mc;
+        scope.host = host;
+        scope.slotted = host == n ? NULL : n;
+        c.mc = &scope;
+        c.scope = -1;
+        for (int i = 0; i < count; i++)
+            if (inner[i]) match_sheet(&c, inner[i], n, R_AUTHOR, (uint32_t)(i+1)<<24);
+        c.mc = mc;
+        c.scope = 0;
+        /* A shared sheet can also be adopted into another scope. Restore its layer numbering. */
+        prepare_layers(a, sheets, nsheets);
+    }
     const char *inline_style = node_attr(n, "style");
     if (inline_style) {
         struct decl *d;
         int nd = parse_decls(a, inline_style, inline_style + strlen(inline_style), &d);
-        add_decls(&c, d, nd, R_INLINE, 0, 0, 0);
+        add_decls(&c, d, nd, R_INLINE, 0, 0, 0, 0x7fffffff);
     }
     qsort(c.m, (size_t)c.n, sizeof(struct match), cmp_match);
 
@@ -5033,11 +5556,12 @@ static void compute(struct arena *a, struct node *n, const struct style *parent,
         if (!cp)
             break;
         cp->name = d->name;
-        cp->value = d->value;
+        cp->value = custom_cascade_value(&c, i, parent, NULL);
+        if (!cp->value) cp->value = "";
         /* var() inside a custom property refers to the inherited values. */
-        if (strstr(d->value, "var(")) {
+        if (strstr(cp->value, "var(")) {
             char buf2[1024];
-            if (substitute(st, d->value, buf2, sizeof(buf2), 0))
+            if (substitute(st, cp->value, buf2, sizeof(buf2), 0))
                 cp->value = arena_strdup(a, buf2);
         }
         cp->next = st->vars;
@@ -5048,6 +5572,7 @@ static void compute(struct arena *a, struct node *n, const struct style *parent,
     v.a = a;
     /* Pass 2: font-size, which em units in everything else depend on. Pass 3: the rest. */
     int author_color = 0;
+    int rollback_budget = 8192;
     for (int pass = 2; pass <= 3; pass++) {
         if (pass == 3)
             v.font_size = st->font_size;
@@ -5056,14 +5581,7 @@ static void compute(struct arena *a, struct node *n, const struct style *parent,
             int early = d->prop == P_FONT_SIZE || d->prop == P_FONT;
             if (d->prop == P_CUSTOM || (pass == 2) != early || c.m[i].pe)
                 continue;
-            const char *value = d->value;
-            char expanded[1024];
-            if (strstr(value, "var(")) {
-                if (!substitute(st, value, expanded, sizeof(expanded), 0))
-                    continue;
-                value = expanded;
-            }
-            apply(st, parent, d->prop, value, &v);
+            apply_match(st, parent, &c, i, &v, pass, NULL, &rollback_budget);
             if (d->prop == P_COLOR && c.m[i].rank != R_UA)
                 author_color = 1;
         }
@@ -5122,6 +5640,7 @@ static void compute(struct arena *a, struct node *n, const struct style *parent,
         st->ts_color = st->color;
     if (st->font_size > 200)
         st->font_size = 200;
+    finish_background(st, parent, &v);
     st->font = wfont_get(st->family, st->bold, st->italic, st->font_size);
     if (st->line_clamp && st->max_height.unit == U_AUTO) {         /* -webkit-line-clamp: that many lines, the rest cut off */
         int lh = st->lh_kind == LH_PX ? st->lh : st->lh_kind == LH_FACTOR ? st->font_size * st->lh / 100
@@ -5368,6 +5887,7 @@ static void pseudo(struct arena *a, struct node *n, const struct style *st, cons
         return;
     inherit(ps, st);
     struct vctx v = *base;
+    int rollback_budget = 8192;
     for (int pass = 2; pass <= 3; pass++) {
         if (pass == 3)
             v.font_size = ps->font_size;
@@ -5376,14 +5896,7 @@ static void pseudo(struct arena *a, struct node *n, const struct style *st, cons
             int early = d->prop == P_FONT_SIZE || d->prop == P_FONT;
             if (c->m[i].pe != (uint32_t)pe || d->prop == P_CUSTOM || (pass == 2) != early)
                 continue;
-            const char *value = d->value;
-            char expanded[1024];
-            if (strstr(value, "var(")) {
-                if (!substitute(ps, value, expanded, sizeof(expanded), 0))
-                    continue;
-                value = expanded;
-            }
-            apply(ps, st, d->prop, value, &v);
+            apply_match(ps, st, c, i, &v, pass, NULL, &rollback_budget);
         }
     }
     if (pe <= PE_AFTER && (ps->display == D_NONE || (ps->positioned && (ps->hidden || ps->invisible))))
@@ -5398,16 +5911,54 @@ static void pseudo(struct arena *a, struct node *n, const struct style *st, cons
         ps->ts_color = ps->color;
     if (ps->invisible & 8)
         ps->bg = TRANSPARENT;
+    finish_background(ps, st, &v);
     ps->font = wfont_get(ps->family, ps->bold, ps->italic, ps->font_size);
     n->pseudo_st[pe - 1] = ps;
     if (pe <= PE_AFTER)
         n->pseudo_text[pe - 1] = text;
 }
 
+static void layer_number(struct layer *all, struct layer *parent, int *order)
+{
+    for (struct layer *l = all; l; l = l->next)
+        if (l->parent == parent) {
+            layer_number(all, l, order);
+            l->order = ++*order;
+        }
+}
+
+/* Layer names belong to the whole style scope, rather than one <style>. */
+static void prepare_layers(struct arena *a, struct sheet **sheets, int nsheets)
+{
+    struct layer *all = NULL, *last = NULL;
+    for (int i = 0; i < nsheets; i++) {
+        if (!sheets[i]) continue;
+        for (struct layer *l = sheets[i]->layers; l; l = l->next) {
+            struct layer *parent = l->parent ? l->parent->canonical : NULL;
+            struct layer *found;
+            for (found = all; found; found = found->next)
+                if (found->parent == parent && !strcmp(found->name, l->name)) break;
+            if (!found) {
+                found = arena_alloc(a, sizeof(*found));
+                if (!found) return;
+                found->name = l->name;
+                found->parent = parent;
+                if (last) last->next = found;
+                else all = found;
+                last = found;
+            }
+            l->canonical = found;
+        }
+    }
+    int order = 0;
+    layer_number(all, NULL, &order);
+}
+
 static void cascade_tree(struct arena *a, struct node *root, const struct style *parent,
                          struct sheet **sheets, int nsheets, struct vctx *v,
                          const struct mctx *mc, struct match *buf)
 {
+    prepare_layers(a, sheets, nsheets);
     /* Iterative pre-order walk; a display:none subtree is skipped (and shares its root's style). */
     struct node *n = root;
     while (n) {
@@ -5445,13 +5996,11 @@ static void cascade_shadows(struct arena *a, struct node *root, struct vctx *v, 
         if (n->shadow_root) {
             struct node *shadow = n->shadow_root;
             struct sheet *sheets[64];
-            int ns = 0;
-            for (struct node *k = shadow; k; k = node_next(k, shadow))
-                if (ns < 64 && k->sheet)
-                    sheets[ns++] = k->sheet;
-                else if (k->tag == T_STYLE && k->first && ns < 64)
-                    sheets[ns++] = css_parse(a, k->first->text, k->first->len, v->vw);
-            cascade_tree(a, shadow, n->style, sheets, ns, v, mc, buf);
+            int ns = shadow_sheets(a, shadow, sheets, v->vw);
+            struct mctx scope = *mc;
+            scope.host = n;
+            scope.slotted = NULL;
+            cascade_tree(a, shadow, n->style, sheets, ns, v, &scope, buf);
             cascade_shadows(a, shadow, v, mc, buf, depth + 1);
         }
 }
@@ -5473,11 +6022,18 @@ void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int 
         initial_style.border_w[i] = ZOOM(3);
     initial_style.outline_w = ZOOM(3);
     struct vctx v = { ZOOM(16), ZOOM(16), viewport_w, viewport_h, a };
-    struct mctx mc = { visited, ctx, root->quirks };
+    struct mctx mc = { .visited = visited, .ctx = ctx, .quirks = root->quirks };
     struct match *buf = malloc(sizeof(struct match) * MAX_MATCHES);
     if (!buf)
         return;
-    cascade_tree(a, root, &initial_style, sheets, nsheets, &v, &mc, buf);
+    struct sheet **combined = sheets;
+    if (root->adopted_text) {
+        combined = arena_alloc(a, sizeof(*combined) * (size_t)(nsheets + 1));
+        if (!combined) { free(buf); return; }
+        if (nsheets) memcpy(combined, sheets, sizeof(*combined) * (size_t)nsheets);
+        combined[nsheets++] = css_parse(a, root->adopted_text, (int)strlen(root->adopted_text), v.vw);
+    }
+    cascade_tree(a, root, &initial_style, combined, nsheets, &v, &mc, buf);
     cascade_shadows(a, root, &v, &mc, buf, 0);
     free(buf);
 }

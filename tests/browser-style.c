@@ -235,9 +235,71 @@ static void counters_and_selectors(void)
     CHECK(lc->tab_size == 4 && lc->text_align_last == TA_RIGHT + 1);
     arena_free(&arena);
 }
+static void cascade_layers(void)
+{
+    struct arena a = {0};
+    const char *html = "<!doctype html><div id=x><span id=y></span></div>";
+    struct node *root = html_parse(&a, html, (int)strlen(html));
+    const char *first =
+        "@layer reset, theme, app;"
+        "@layer app { #x {color:red; margin:9px; padding:9px} }"
+        "@layer reset { #x {color:blue!important; background-color:red!important} }"
+        "@layer theme { #x {color:green!important; margin:4px; padding:4px} }"
+        "@layer app { #x {margin-left:revert-layer; padding:revert-layer} }"
+        "@layer app { @layer base, overrides; @layer overrides {#y{color:blue}}"
+        " @layer base {#y{color:red}} #y {color:green} }"
+        "#x{background-color:green!important; border-left:7px solid red}"
+        "@layer theme {#x{border-left:3px solid blue}}";
+    const char *second =
+        "@layer theme { #x {background-color:blue!important} }"
+        "@layer app {#x {margin-right:11px}}"
+        "@layer {#y {background-color:red}} @layer {#y{background-color:blue}}";
+    struct sheet *sheets[] = {css_parse(&a, first, (int)strlen(first),800),
+                             css_parse(&a, second, (int)strlen(second),800)};
+    css_cascade(&a, root, sheets, 2, 800, 600, NULL, NULL);
+    const struct style *x = id(root,"x")->style, *y = id(root,"y")->style;
+    CHECK(x->color == OPAQUE(0x0000ff));
+    CHECK(x->bg == OPAQUE(0xff0000));
+    CHECK(x->margin[3].v == 4 && x->margin[1].v == 11 && x->margin[0].v == 9);
+    CHECK(x->padding[0].v == 4 && x->padding[3].v == 4);
+    CHECK(x->border_w[3] == 7);
+    CHECK(y->color == OPAQUE(0x008000) && y->bg == OPAQUE(0x0000ff));
+    arena_free(&a);
+}
+
+static void shadow_selectors_and_adoption(void)
+{
+    struct arena a = {0};
+    const char *html = "<!doctype html><div id=host class=card><b slot=title id=light>title</b></div><p id=outside>x</p>";
+    struct node *root = html_parse(&a,html,(int)strlen(html));
+    struct node *host = id(root,"host");
+    const char *inside = "<div><span id=inner>x</span><slot name=title></slot></div>";
+    struct node *parsed = html_parse(&a,inside,(int)strlen(inside));
+    struct node *shadow = arena_alloc(&a,sizeof(*shadow));
+    shadow->type=N_ELEMENT;
+    shadow->name=arena_strdup(&a,"#fragment");
+    struct node *content=node_find(parsed,T_DIV);
+    content->parent=shadow;content->prev=content->next=NULL;
+    shadow->first=shadow->last=content;
+    shadow->shadow_host=host;host->shadow_root=shadow;
+    shadow->adopted_text=":host{color:red} :host(.card){padding:12px} :host > div > span{color:blue}"
+        "slot::slotted(b){background-color:green} #outside{color:red} :host{border-left:4px solid red!important}";
+    root->adopted_text="#host{color:green;border-left:9px solid blue!important} #outside{color:blue}";
+    css_cascade(&a,root,NULL,0,800,600,NULL,NULL);
+    CHECK(host->style->color==OPAQUE(0x008000)); /* outer normal rule wins */
+    CHECK(host->style->padding[0].v==12 && host->style->border_w[3]==4); /* inner important wins */
+    CHECK(id(shadow,"inner")->style->color==OPAQUE(0x0000ff));
+    CHECK(id(root,"light")->style->bg==OPAQUE(0x008000));
+    CHECK(id(root,"outside")->style->color==OPAQUE(0x0000ff));
+    shadow->adopted_text=":host{padding:6px}";
+    css_cascade(&a,root,NULL,0,800,600,NULL,NULL);
+    CHECK(host->style->padding[0].v==6 && host->style->border_w[3]==9);
+    arena_free(&a);
+}
+
 int main(void)
 {
-    entities(); cascade(); selector_specificity(); nth_boundaries();
+    entities(); cascade(); cascade_layers(); shadow_selectors_and_adoption(); selector_specificity(); nth_boundaries();
     text_and_interaction_properties(); state_pseudo_classes(); backgrounds_and_overflow(); counters_and_selectors();
     puts("browser HTML/CSS: named references, filtered siblings, cascade specificity and new properties passed");
 }

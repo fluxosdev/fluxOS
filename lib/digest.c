@@ -1,6 +1,7 @@
 #include <flux/digest.h>
 #include <flux/sha256.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 static uint64_t r64(uint64_t x, int n) { return (x >> n) | (x << (64-n)); }
@@ -71,4 +72,36 @@ int flux_digest(const char *name,const void *data,size_t length,unsigned char ou
     uint64_t bits=(uint64_t)length*8;for(int i=0;i<8;i++)tail[blocks*128-1-i]=(unsigned char)(bits>>(i*8));
     for(int i=0;i<blocks;i++)sha512_block(h,tail+i*128);
     int len=small?48:64;for(int i=0;i<len;i++)out[i]=(unsigned char)(h[i/8]>>(56-8*(i%8)));return len;
+}
+
+int flux_hmac(const char *name, const void *key, size_t key_length,
+              const void *data, size_t length, unsigned char out[64])
+{
+    unsigned char normalized[128] = {0}, inner[64], outer[192];
+    int digest = flux_digest(name, "", 0, inner);
+    if (!digest) return 0;
+    size_t block = digest > 32 ? 128 : 64;
+    if (length > (size_t)-1 - block) return 0;
+    if (key_length > block) flux_digest(name, key, key_length, normalized);
+    else if (key_length) memcpy(normalized, key, key_length);
+    unsigned char *input = malloc(block + length);
+    if (!input) return 0;
+    for (size_t i = 0; i < block; i++) {
+        input[i] = normalized[i] ^ 0x36;
+        outer[i] = normalized[i] ^ 0x5c;
+    }
+    if (length) memcpy(input + block, data, length);
+    flux_digest(name, input, block + length, inner);
+    memcpy(outer + block, inner, (size_t)digest);
+    flux_digest(name, outer, block + (size_t)digest, out);
+    volatile unsigned char *wipe = input;
+    for (size_t i = 0; i < block + length; i++) wipe[i] = 0;
+    free(input);
+    wipe = normalized;
+    for (size_t i = 0; i < sizeof(normalized); i++) wipe[i] = 0;
+    wipe = outer;
+    for (size_t i = 0; i < sizeof(outer); i++) wipe[i] = 0;
+    wipe = inner;
+    for (size_t i = 0; i < sizeof(inner); i++) wipe[i] = 0;
+    return digest;
 }

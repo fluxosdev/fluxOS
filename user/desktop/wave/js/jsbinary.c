@@ -443,9 +443,36 @@ static jsval digest_bytes(struct js *J, jsval self, jsval *args, int argc)
     memcpy(buffer_of(b)->data, hash, (size_t)n);
     return b;
 }
+
+static jsval hmac_bytes(struct js *J, jsval self, jsval *args, int argc)
+{
+    int kl = 0, len = 0;
+    unsigned char *key = js_binary_bytes(ARG(1), &kl), *data = js_binary_bytes(ARG(2), &len), hash[64];
+    if (!key || !data) return js_throw_error(J, "TypeError: HMAC requires BufferSource inputs");
+    int size = flux_hmac(js_tostr(J, ARG(0))->s, key, (size_t)kl, data, (size_t)len, hash);
+    if (!size) return js_throw_error(J, "OperationError: HMAC failed");
+    jsval out = new_buffer(J, size);
+    if (out.t == JS_OBJ) memcpy(buffer_of(out)->data, hash, (size_t)size);
+    memset(hash, 0, sizeof(hash));
+    return out;
+}
+
+static jsval crypto_compare(struct js *J, jsval self, jsval *args, int argc)
+{
+    int al = 0, bl = 0;
+    unsigned char *a = js_binary_bytes(ARG(0), &al), *b = js_binary_bytes(ARG(1), &bl);
+    if (!a || !b) return js_throw_error(J, "TypeError: signature requires a BufferSource");
+    if (al != bl) return js_bool(0);
+    volatile unsigned difference = 0;
+    for (int i = 0; i < al; i++) difference |= a[i] ^ b[i];
+    return js_bool(difference == 0);
+}
+
 void js_init_binary(struct js *J)
 {
     js_define_native(J, J->global, "%digest", digest_bytes, 2);
+    js_define_native(J, J->global, "%hmac", hmac_bytes, 3);
+    js_define_native(J, J->global, "%cryptoCompare", crypto_compare, 2);
     js_define_native(J, J->global, "%randomFill", random_fill, 1);
     js_define_native(J, J->global, "%encodeUTF8", encode_utf8, 1);
     js_define_native(J, J->global, "%decodeUTF8", decode_utf8, 1);

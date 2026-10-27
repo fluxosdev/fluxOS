@@ -651,11 +651,12 @@ static const struct lazy_chunk {
      {"MutationObserver", "IntersectionObserver", "ResizeObserver", NULL}},
     {js_chunk_web,
      sizeof(js_chunk_web) - 1,
-     {"TextEncoder", "TextDecoder", "crypto", "Blob", "FormData", "DOMParser", "customElements", "CSS",
+     {"TextEncoder", "TextDecoder", "crypto", "CryptoKey", "Blob", "FormData", "DOMParser", "customElements", "CSS",
       "Notification", "DOMRect", "postMessage", NULL}},
     {js_chunk_fetch,
      sizeof(js_chunk_fetch) - 1,
-     {"Headers", "Response", "Request", "ReadableStream", "fetch", "EventSource", NULL}},
+     {"Headers", "Response", "Request", "ReadableStream", "WritableStream", "TransformStream",
+      "CountQueuingStrategy", "ByteLengthQueuingStrategy", "fetch", "EventSource", NULL}},
 };
 
 /* A chunk gives a name its value, unless the page has set it already. */

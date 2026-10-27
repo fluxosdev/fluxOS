@@ -19,9 +19,16 @@ int wfont_draw(struct surface *s, const struct wfont *f, int x, int y, const cha
 { (void)s; (void)x; (void)y; (void)str; (void)c; return wfont_width(f, str, n); }
 struct syscolors sys;
 int rect_empty(struct rect r) { return r.w <= 0 || r.h <= 0; }
-struct rect rect_intersect(struct rect a, struct rect b) { (void)b; return a; }
+struct rect rect_intersect(struct rect a, struct rect b) {
+ int x=a.x>b.x?a.x:b.x,y=a.y>b.y?a.y:b.y;
+ int right=a.x+a.w<b.x+b.w?a.x+a.w:b.x+b.w,bottom=a.y+a.h<b.y+b.h?a.y+a.h:b.y+b.h;
+ return mkrect(x,y,right>x?right-x:0,bottom>y?bottom-y:0);
+}
 void gfx_bevel(struct surface *s, struct rect r, enum bevel st) { (void)s; (void)r; (void)st; }
-void gfx_fill(struct surface *s, int x, int y, int w, int h, color_t c) { (void)s; (void)x; (void)y; (void)w; (void)h; (void)c; }
+void gfx_fill(struct surface *s, int x, int y, int w, int h, color_t c) {
+ struct rect r=rect_intersect(mkrect(x,y,w,h),s->clip);
+ for(int j=r.y;j<r.y+r.h;j++)for(int i=r.x;i<r.x+r.w;i++)s->px[j*s->stride+i]=c;
+}
 void gfx_focus_rect(struct surface *s, struct rect r) { (void)s; (void)r; }
 void gfx_dither(struct surface *s, int x, int y, int w, int h, color_t c) { (void)s; (void)x; (void)y; (void)w; (void)h; (void)c; }
 void gfx_frame(struct surface *s, int x, int y, int w, int h, color_t c) { (void)s; (void)x; (void)y; (void)w; (void)h; (void)c; }
@@ -57,6 +64,9 @@ static void load(struct page *p, const char *html, int vw, int vh)
             continue;
         if (n->style && n->style->bg_url)
             n->style->bg_img = &test_img;
+        if (n->style)
+            for (struct style *l = n->style->bg_layers; l; l = l->bg_next)
+                if (l->bg_url) l->bg_img = &test_img;
         if (n->style && n->style->ls_url)
             n->style->ls_img = &test_img;
         if (n->tag == T_IMG)
@@ -205,12 +215,64 @@ static void background_pictures(void)
     CHECK(pic[3]->bgp->tw == 40 && pic[3]->bgp->th == 20);      /* its own size */
     CHECK(pic[3]->bgp->tx == 3 + 5 && pic[3]->bgp->ty == 3 + 7);   /* from the padding box */
     CHECK(!pic[3]->bgp->norep_x && pic[3]->bgp->norep_y);       /* repeat-x */
-    CHECK(pic[4]->grad && !pic[4]->bgp->norep_x);               /* the gradient is over the picture */
+    CHECK(pic[4]->bgp->img && pic[4]->bgp->next && pic[4]->bgp->next->grad);
     unload(&p);
 
     /* the old attribute, and a data: URL that is not cut short */
     load(&p, "<body background='img/tile.gif'>x</body>", 800, 600);
     CHECK(first_of(&p, DK_BGIMG) && first_of(&p, DK_BGIMG)->bgp);
+    unload(&p);
+}
+
+static void background_pixels(void)
+{
+    struct page p;
+    load(&p, "<style>body{margin:0}div{width:4px;height:4px;background-image:url(top),url(bottom)}</style><div></div>",8,8);
+    struct node *box=node_find(p.root,T_DIV);
+    uint32_t red=0x80ff0000u,blue=0xff0000ffu;
+    struct image top={1,1,&red},bottom={1,1,&blue};
+    box->style->bg_layers->bg_img=&top;
+    box->style->bg_layers->bg_next->bg_img=&bottom;
+    arena_free(&p.la);
+    layout_document(&p.la,&p.lo,p.root,8,8);
+    uint32_t pixels[64]={0};
+    struct surface surface={pixels,8,8,8,{0,0,8,8}};
+    paint_document(&p.lo,&surface,0,0,0,0,NULL,0);
+    CHECK(pixels[0]==0x80007f && pixels[3*8+3]==0x80007f && pixels[4]==0xffffff);
+    unload(&p);
+    load(&p,"<style>body{margin:0}div{width:4px;height:4px;padding:1px;border:1px solid red;"
+            "background:blue;background-clip:content-box}</style><div></div>",12,12);
+    uint32_t clipped[144]={0};
+    surface=(struct surface){clipped,12,12,12,{0,0,12,12}};
+    paint_document(&p.lo,&surface,0,0,0,0,NULL,0);
+    CHECK(clipped[1*12+1]==0xffffff && clipped[2*12+2]==0x0000ff);
+    unload(&p);
+}
+
+static void named_grid_lines(void)
+{
+    struct page p;
+    load(&p,"<style>body{margin:0}.g{display:grid;width:160px;"
+            "grid-template-columns:[edge] 30px [content center] 80px [end] 50px [edge];"
+            "grid-template-rows:[top] 20px [body] 40px [bottom]}"
+            ".a{grid-column:content / end;grid-row:body / bottom}</style>"
+            "<div class=g><div class=a>A</div></div>",200,200);
+    CHECK(word(&p,"A") && word(&p,"A")->x==30 && word(&p,"A")->y==20);
+    unload(&p);
+    load(&p,"<style>body{margin:0}.g{display:grid;width:80px;grid-template-columns:repeat(2, [start] 40px [end])}"
+            ".a{grid-column:start 2 / end 2}.b{grid-column:start -1 / end -1}</style>"
+            "<div class=g><div class=a>A</div><div class=b>B</div></div>",200,200);
+    CHECK(word(&p,"A") && word(&p,"A")->x==40);
+    CHECK(word(&p,"B") && word(&p,"B")->x==40);
+    unload(&p);
+}
+
+static void inside_marker_lifetime(void)
+{
+    struct page p;
+    load(&p,"<ol style='list-style-position:inside'><li>one</li><li>two</li></ol>",200,200);
+    CHECK(word(&p,"1.") && word(&p,"2."));
+    CHECK(word(&p,"1.")->text != word(&p,"2.")->text);
     unload(&p);
 }
 
@@ -533,7 +595,7 @@ int main(void)
     text_flow();
     positioning();
     boxes();
-    background_pictures();
+    background_pictures(); background_pixels(); named_grid_lines(); inside_marker_lifetime();
     text_extras();
     zoom();
     ranges();

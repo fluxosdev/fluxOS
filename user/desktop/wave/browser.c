@@ -1636,21 +1636,31 @@ static struct bgref *bg_want(struct browser *b, const char *url)
     return r;
 }
 
+static void bg_attach_style(struct browser *b, struct style *st)
+{
+    if (!st) return;
+    for (struct style *l = st->bg_layers; l; l = l->bg_next)
+        if (l->bg_url) {
+            struct bgref *r = bg_want(b, l->bg_url);
+            l->bg_img = r ? r->img : NULL;
+        }
+    if (st->bg_url) {
+        struct bgref *r = bg_want(b, st->bg_url);
+        st->bg_img = r ? r->img : NULL;
+    }
+    if (st->ls_url) {
+        struct bgref *r = bg_want(b, st->ls_url);
+        st->ls_img = r ? r->img : NULL;
+    }
+}
+
 static void bg_attach(struct browser *b)
 {
-    if (!b->root || !b->bgs)
-        return;
-    for (struct node *n = b->root; n; n = node_next(n, b->root)) {
-        if (n->type != N_ELEMENT || !n->style || !(n->style->bg_url || n->style->ls_url))
-            continue;
-        if (n->style->bg_url) {
-            struct bgref *r = bg_want(b, n->style->bg_url);
-            n->style->bg_img = r ? r->img : NULL;
-        }
-        if (n->style->ls_url) {
-            struct bgref *r = bg_want(b, n->style->ls_url);
-            n->style->ls_img = r ? r->img : NULL;
-        }
+    if (!b->root || !b->bgs) return;
+    for (struct node *n = b->root; n; n = node_next_shadow(n, b->root)) {
+        if (n->type != N_ELEMENT) continue;
+        bg_attach_style(b, n->style);
+        for (int i = 0; i < 5; i++) bg_attach_style(b, n->pseudo_st[i]);
     }
 }
 
@@ -3784,9 +3794,10 @@ static void fetch_complete(struct browser *b)
         int css = ul > 4 && !strncasecmp(u + ul - 4, ".css", 4);
         int gif = ul > 4 && !strncasecmp(u + ul - 4, ".gif", 4);
         int svg = ul > 4 && !strncasecmp(u + ul - 4, ".svg", 4);
+        int webp = ul > 5 && !strncasecmp(u + ul - 5, ".webp", 5);
         int ico = ul > 4 && !strncasecmp(u + ul - 4, ".ico", 4);
         snprintf(r.type, sizeof(r.type), "%s", html ? "text/html" : png ? "image/png" : jpg ? "image/jpeg" :
-             gif ? "image/gif" : svg ? "image/svg+xml" : ico ? "image/x-icon" : css ? "text/css" : "text/plain");
+             gif ? "image/gif" : webp ? "image/webp" : svg ? "image/svg+xml" : ico ? "image/x-icon" : css ? "text/css" : "text/plain");
     } else if (is_file) {
         snprintf(why, sizeof(why), "%s", b->status);
     }
@@ -7188,6 +7199,10 @@ void browser_poll(void)
     for (struct browser *b = browsers; b; b = b->next) {
         if (b->frame_dead)
             continue;
+        int animated = 0;
+        for (struct cached *c = b->cache; c; c = c->next)
+            if (c->img) animated |= image_animate(c->img, now_ms());
+        if (animated) paint(b);
         if (b->frame_nav[0]) {          /* a frame's iframe asked for a page */
             char u[URL_MAX];
             snprintf(u, sizeof(u), "%s", b->frame_nav);

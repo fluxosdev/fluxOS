@@ -543,7 +543,17 @@ static void round_corners(struct ditem *d, const struct style *st, int w, int h)
 static void decorate(struct ditem *d, const struct style *st, int w, int h)
 {
     round_corners(d, st, w, h);
-    if (st->grad) {
+    if (st->bg_clip) {
+        int left = st->border_w[3], right = st->border_w[1];
+        int top = st->border_w[0], bottom = st->border_w[2];
+        if (st->bg_clip == 2) {
+            left += len_px(st->padding[3], w), right += len_px(st->padding[1], w);
+            top += len_px(st->padding[0], w), bottom += len_px(st->padding[2], w);
+        }
+        d->bg_clipped = 1;
+        d->bgclip = mkrect(left, top, w-left-right, h-top-bottom);
+    }
+    if (st->grad && !st->bg_layers) {
         d->grad = st->grad;
         d->g0 = st->g0;
         d->g1 = st->g1;
@@ -654,7 +664,13 @@ static void finish_box_inner(struct lctx *c, struct node *n, int slot, int x, in
 /* Does this box get a place reserved for a background picture (the item after its background)? */
 static int bg_picture_wanted(const struct style *st)
 {
-    return st->bg_img && st->bg_img->w > 0 && st->bg_img->h > 0 && !st->hidden;
+    if (st->hidden) return 0;
+    if (st->bg_layers) {
+        for (const struct style *l = st->bg_layers; l; l = l->bg_next)
+            if (l->grad || (l->bg_img && l->bg_img->w > 0 && l->bg_img->h > 0)) return 1;
+        return 0;
+    }
+    return st->bg_img && st->bg_img->w > 0 && st->bg_img->h > 0;
 }
 
 /*
@@ -662,19 +678,8 @@ static int bg_picture_wanted(const struct style *st)
  * slot has its size, work out the size and place of the tile, and where it is painted. A gradient goes over the
  * picture, so it moves to this item.
  */
-static void bg_picture_finish(struct lctx *c, struct node *n, int slot)
+static struct bgpaint *bg_picture_layer(struct lctx *c, const struct style *st, const struct ditem *s0)
 {
-    struct layout *lo = c->lo;
-    const struct style *st = n->style;
-    if (slot < 0 || slot + 1 >= lo->nitems || lo->items[slot + 1].kind != DK_BGIMG)
-        return;
-    struct ditem *s0 = &lo->items[slot], *d = &lo->items[slot + 1];
-    d->bgp = NULL;
-    d->w = d->h = 0;
-    d->grad = 0;
-    d->color = TRANSPARENT;
-    if (!bg_picture_wanted(st) || s0->w <= 0 || s0->h <= 0)
-        return;
     int w = s0->w, h = s0->h;
     int ox = 0, oy = 0, ow = w, oh = h;                 /* the area the picture is placed in */
     if (st->bg_origin != 1) {
@@ -687,9 +692,11 @@ static void bg_picture_finish(struct lctx *c, struct node *n, int slot)
         }
     }
     if (ow <= 0 || oh <= 0)
-        return;
+        return NULL;
     const struct image *img = st->bg_img;
-    int iw = img->w, ih = img->h, tw = ZOOM(iw), th = ZOOM(ih);
+    int iw = img ? img->w : ow, ih = img ? img->h : oh;
+    int tw = ZOOM(iw), th = ZOOM(ih);
+    if (st->bg_attachment == 1) ox = oy = 0, ow = c->vw, oh = c->vh;
     switch (st->bg_size) {
     case BGS_COVER:
     case BGS_CONTAIN: {
@@ -715,28 +722,54 @@ static void bg_picture_finish(struct lctx *c, struct node *n, int slot)
         break;
     }
     if (tw <= 0 || th <= 0)
-        return;
+        return NULL;
     if (tw > 16384)
         tw = 16384;
     if (th > 16384)
         th = 16384;
     struct bgpaint *bp = arena_alloc(c->a, sizeof(*bp));
     if (!bp)
-        return;
+        return NULL;
     bp->img = st->bg_img;
     bp->tw = tw, bp->th = th;
     bp->tx = ox + len_px(st->bg_px, ow - tw);
     bp->ty = oy + len_px(st->bg_py, oh - th);
     bp->norep_x = st->bg_norep_x, bp->norep_y = st->bg_norep_y;
-    d->bgp = bp;
-    d->x = s0->x, d->y = s0->y, d->w = w, d->h = h;
-    round_corners(d, st, w, h);
-    if (st->grad) {
-        d->grad = st->grad;
-        d->g0 = st->g0;
-        d->g1 = st->g1;
-        s0->grad = 0;
+    bp->grad = st->grad;
+    bp->g0 = st->g0, bp->g1 = st->g1;
+    bp->fixed = st->bg_attachment == 1;
+    int left = 0, top = 0, right = 0, bottom = 0;
+    if (st->bg_clip) {
+        left = st->border_w[3], top = st->border_w[0];
+        right = st->border_w[1], bottom = st->border_w[2];
+        if (st->bg_clip == 2) {
+            left += len_px(st->padding[3], w), top += len_px(st->padding[0], w);
+            right += len_px(st->padding[1], w), bottom += len_px(st->padding[2], w);
+        }
     }
+    bp->clip = mkrect(left, top, w-left-right, h-top-bottom);
+    return bp;
+}
+
+static void bg_picture_finish(struct lctx *c, struct node *n, int slot)
+{
+    struct layout *lo = c->lo;
+    const struct style *st = n->style;
+    if (slot < 0 || slot + 1 >= lo->nitems || lo->items[slot + 1].kind != DK_BGIMG) return;
+    struct ditem *s0 = &lo->items[slot], *d = &lo->items[slot+1];
+    d->bgp = NULL;
+    d->grad = 0;
+    d->color = TRANSPARENT;
+    d->x = s0->x, d->y = s0->y, d->w = s0->w, d->h = s0->h;
+    if (!bg_picture_wanted(st) || s0->w <= 0 || s0->h <= 0) return;
+    for (const struct style *l = st->bg_layers ? st->bg_layers : st; l;
+         l = st->bg_layers ? l->bg_next : NULL) {
+        if (!l->grad && (!l->bg_img || l->bg_img->w <= 0 || l->bg_img->h <= 0)) continue;
+        struct bgpaint *bp = bg_picture_layer(c, l, s0);
+        if (bp) bp->next = (struct bgpaint *)d->bgp, d->bgp = bp;
+    }
+    round_corners(d, st, s0->w, s0->h);
+    s0->grad = 0;
 }
 
 /* ---- boxes ---- */
@@ -2323,7 +2356,8 @@ static int block_content(struct lctx *c, struct node *n, int x, int y, int w, in
     f.space_before = 1;
     f.link = enclosing_link(n);
     if (c->inside_text[0] && n->style->display == D_LIST_ITEM && c->inside_st) {
-        add_text(c, &f, c->inside_text, (int)strlen(c->inside_text), c->inside_st, n);
+        const char *marker = arena_strdup(c->a, c->inside_text);
+        if (marker) add_text(c, &f, marker, (int)strlen(marker), c->inside_st, n);
         c->inside_text[0] = 0;
     }
     add_pseudo(c, &f, n, 0);
@@ -4467,18 +4501,20 @@ static void draw_image_round(struct surface *s, const struct ditem *d, int x, in
 }
 
 /* A background picture: tiles of bgp from its corner, over the item's box (rounded if it is), then a gradient. */
-static void draw_bgimg(struct surface *s, const struct ditem *d, int x, int y)
+static void draw_bgimg_layer(struct surface *s, const struct ditem *d, const struct bgpaint *bp,
+                              int x, int y, int ox, int oy)
 {
-    const struct bgpaint *bp = d->bgp;
+    struct rect saved = s->clip;
+    struct rect area = bp->clip;
+    s->clip = rect_intersect(saved, mkrect(x+area.x, y+area.y, area.w, area.h));
     struct rect r = rect_intersect(mkrect(x, y, d->w, d->h), s->clip);
-    if (rect_empty(r))
-        return;
+    if (rect_empty(r)) { s->clip = saved; return; }
     if (bp && bp->img && bp->img->w > 0 && bp->img->h > 0 && bp->tw > 0 && bp->th > 0) {
         const struct image *img = bp->img;
         int *xs = malloc(sizeof(int) * (size_t)r.w);
         if (xs) {
             for (int i = 0; i < r.w; i++) {             /* the picture's column under each pixel, or -1 */
-                int rel = r.x + i - (x + bp->tx);
+                int rel = r.x + i - ((bp->fixed ? ox : x) + bp->tx);
                 if (bp->norep_x && (rel < 0 || rel >= bp->tw)) {
                     xs[i] = -1;
                     continue;
@@ -4490,7 +4526,7 @@ static void draw_bgimg(struct surface *s, const struct ditem *d, int x, int y)
             }
             int rounded = d->rad[0] || d->rad[1] || d->rad[2] || d->rad[3];
             for (int j = r.y; j < r.y + r.h; j++) {
-                int rel = j - (y + bp->ty);
+                int rel = j - ((bp->fixed ? oy : y) + bp->ty);
                 if (bp->norep_y && (rel < 0 || rel >= bp->th))
                     continue;
                 rel %= bp->th;
@@ -4517,8 +4553,19 @@ static void draw_bgimg(struct surface *s, const struct ditem *d, int x, int y)
             simd_done();
         }
     }
-    if (d->grad)
-        fill_rich(s, d, x, y);
+    if (bp->grad) {
+        struct ditem gradient = *d;
+        gradient.grad = bp->grad;
+        gradient.g0 = bp->g0, gradient.g1 = bp->g1;
+        fill_rich(s, &gradient, x, y);
+    }
+    s->clip = saved;
+}
+
+static void draw_bgimg(struct surface *s, const struct ditem *d, int x, int y, int ox, int oy)
+{
+    for (const struct bgpaint *bp = d->bgp; bp; bp = bp->next)
+        draw_bgimg_layer(s, d, bp, x, y, ox, oy);
 }
 
 void draw_image_scaled(struct surface *s, const struct image *img, int x, int y, int w, int h)
@@ -5187,7 +5234,21 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
         case DK_FILL:
             if (!ALPHA(d->color) && !d->grad && !d->ring)
                 break;
-            if (d->grad || d->ring || d->rad[0] || d->rad[1] || d->rad[2] || d->rad[3])
+            if (d->bg_clipped) {
+                struct rect saved = s->clip;
+                struct rect r = d->bgclip;
+                s->clip = rect_intersect(saved, mkrect(x+r.x,y+r.y,r.w,r.h));
+                struct ditem fill = *d;
+                fill.ring = 0;
+                fill_rich(s, &fill, x, y);
+                s->clip = saved;
+                if (d->ring) {
+                    fill = *d;
+                    fill.color = TRANSPARENT;
+                    fill.grad = 0;
+                    fill_rich(s, &fill, x, y);
+                }
+            } else if (d->grad || d->ring || d->rad[0] || d->rad[1] || d->rad[2] || d->rad[3])
                 fill_rich(s, d, x, y);
             else if (ALPHA(d->color))
                 fill_blend(s, x, y, d->w, d->h, d->color, d->deco);
@@ -5238,7 +5299,7 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
                 draw_image_scaled(s, d->img, x, y, d->w, d->h);
             break;
         case DK_BGIMG:
-            draw_bgimg(s, d, x, y);
+            draw_bgimg(s, d, x, y, ox, oy);
             break;
         case DK_SBOX:
             draw_sbox_bars(s, &lo->sb[d->sbi], x, y);

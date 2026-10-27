@@ -518,6 +518,10 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
   }
   function sheetFor(owner) {
     if (owner["%sheet"]) return owner["%sheet"];
+    function setText(text) {
+      owner.textContent = String(text);
+      if (sh["%notify"]) sh["%notify"]();
+    }
     var sh = {
       ownerNode: owner, disabled: false, type: "text/css", media: { mediaText: owner.getAttribute("media") || "" },
       get href() { return owner.localName === "link" ? owner.href : null; },
@@ -530,18 +534,19 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
         if (owner.localName !== "style") return 0;
         var r = rulesOf(owner.textContent);
         at = at === undefined ? 0 : at;
-        if (at > r.length) throw new DOMException("The index is not in the allowed range.", "IndexSizeError");
+        if (at < 0 || at > r.length) throw new DOMException("The index is not in the allowed range.", "IndexSizeError");
         r.splice(at, 0, String(rule));
-        owner.textContent = r.join("\n");
+        setText(r.join("\n"));
         return at;
       },
       deleteRule: function (at) {
         var r = rulesOf(owner.textContent);
+        if (at < 0 || at >= r.length) throw new DOMException("Invalid rule index", "IndexSizeError");
         r.splice(at, 1);
-        owner.textContent = r.join("\n");
+        setText(r.join("\n"));
       },
-      replaceSync: function (t) { owner.textContent = String(t); },
-      replace: function (t) { owner.textContent = String(t); return Promise.resolve(sh); }
+      replaceSync: function (t) { setText(t); },
+      replace: function (t) { setText(t); return Promise.resolve(sh); }
     };
     sh.rules = sh.cssRules;
     sh.addRule = function (sel, body, at) { return sh.insertRule(sel + " { " + body + " }", at === undefined ? sh.cssRules.length : at); };
@@ -556,13 +561,80 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
   getter(DP, "styleSheets", function () {
     return Array.from(document.querySelectorAll("style, link[rel~=stylesheet]")).map(sheetFor);
   });
-  def(DP, "adoptedStyleSheets", []);
-  /* new CSSStyleSheet(): its rules go into a <style> of its own, in the head */
+  var adoptions = new WeakMap();
+  function syncAdoption(root) {
+    var state = adoptions.get(root);
+    if (state) g["%adoptSheets"](root, state.items.filter(function (s) { return !s.disabled; })
+      .map(function (s) { return s["%owner"].textContent; }).join("\n"));
+  }
+  function validateSheet(s) {
+    if (!s || !s["%constructed"]) throw new DOMException("Only constructed sheets can be adopted", "NotAllowedError");
+  }
+  function adoption(root) {
+    var state = adoptions.get(root);
+    if (state) return state;
+    state = { items: [] };
+    state.view = new Proxy(state.items, {
+      get: function (a, k) {
+        var value = a[k];
+        if (typeof value !== "function") return value;
+        return function () {
+          var mutates = ["push", "pop", "shift", "unshift", "splice", "reverse", "sort", "fill", "copyWithin"].indexOf(k) >= 0;
+          if (mutates) {
+            var trial = a.slice();
+            value.apply(trial, arguments);
+            trial.forEach(validateSheet);
+            trial.forEach(function (sheet) { watchSheet(sheet, root); });
+          }
+          var result = value.apply(a, arguments);
+          if (mutates) syncAdoption(root);
+          return result === a ? state.view : result;
+        };
+      },
+      set: function (a, k, value) {
+        if (k !== "length") { validateSheet(value); watchSheet(value, root); }
+        a[k] = value;
+        syncAdoption(root);
+        return true;
+      },
+      deleteProperty: function (a, k) { delete a[k]; syncAdoption(root); return true; }
+    });
+    adoptions.set(root, state);
+    return state;
+  }
+  function watchSheet(sheet, root) {
+    var roots = sheet["%adopters"];
+    if (roots.indexOf(root) < 0) roots.push(root);
+  }
+  function installAdoption(proto) {
+    Object.defineProperty(proto, "adoptedStyleSheets", {
+      configurable: true,
+      get: function () { return adoption(this).view; },
+      set: function (sheets) {
+        var items = Array.from(sheets);
+        items.forEach(validateSheet);
+        var state = adoption(this);
+        state.items.length = 0;
+        var root = this;
+        items.forEach(function (sheet) { state.items.push(sheet); watchSheet(sheet, root); });
+        syncAdoption(root);
+      }
+    });
+  }
+  installAdoption(DP);
+  installAdoption(DocumentFragment.prototype);
   function CSSStyleSheet() {
     var st = document.createElement("style");
-    st.setAttribute("data-constructed", "");
-    (document.head || document.documentElement).appendChild(st);
-    return sheetFor(st);
+    var sheet = sheetFor(st), disabled = false;
+    Object.setPrototypeOf(sheet, CSSStyleSheet.prototype);
+    sheet.ownerNode = null;
+    def(sheet, "%constructed", true);
+    def(sheet, "%owner", st);
+    def(sheet, "%adopters", []);
+    def(sheet, "%notify", function () { sheet["%adopters"].forEach(syncAdoption); });
+    Object.defineProperty(sheet, "disabled", { get: function () { return disabled; },
+      set: function (v) { disabled = !!v; sheet["%notify"](); }, configurable: true });
+    return sheet;
   }
   def(g, "CSSStyleSheet", CSSStyleSheet);
   def(g, "StyleSheet", CSSStyleSheet);

@@ -963,6 +963,102 @@ static const char js_chunk_web[] = JS_SOURCE(
       catch(e) { if(String(e).indexOf("NotSupportedError")>=0)e.name="NotSupportedError"; return Promise.reject(e); }
     } }
   };
+  var keyMaterial = new WeakMap();
+  function CryptoKey() { throw new TypeError("Illegal constructor"); }
+  function cryptoError(name, text) { return new DOMException(text, name); }
+  function cryptoName(algorithm) {
+    var name = typeof algorithm === "string" ? algorithm : algorithm && algorithm.name;
+    if (typeof name !== "string") throw new TypeError("An algorithm name is required");
+    return name.toUpperCase();
+  }
+  function cryptoHash(hash) {
+    var name = cryptoName(hash);
+    if (["SHA-1", "SHA-256", "SHA-384", "SHA-512"].indexOf(name) < 0) throw cryptoError("NotSupportedError", "Unsupported hash");
+    return name;
+  }
+  function cryptoBytes(data) {
+    if (data instanceof ArrayBuffer) return new Uint8Array(data).slice();
+    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice();
+    throw new TypeError("Expected a BufferSource");
+  }
+  function hmacKey(bytes, hash, extractable, usages) {
+    usages = Array.from(usages);
+    if (!usages.length) throw cryptoError("SyntaxError", "A secret key needs usages");
+    usages.forEach(function (u) { if (u !== "sign" && u !== "verify") throw cryptoError("SyntaxError", "Invalid HMAC key usage"); });
+    var key = Object.create(CryptoKey.prototype);
+    Object.defineProperties(key, {
+      type: { value: "secret", enumerable: true }, extractable: { value: !!extractable, enumerable: true },
+      algorithm: { value: Object.freeze({ name: "HMAC", hash: Object.freeze({ name: hash }), length: bytes.length * 8 }), enumerable: true },
+      usages: { value: Object.freeze(usages.slice()), enumerable: true }
+    });
+    keyMaterial.set(key, { bytes: bytes, hash: hash, extractable: !!extractable, usages: usages });
+    return key;
+  }
+  function usableKey(key, usage) {
+    var record = keyMaterial.get(key);
+    if (!record || record.usages.indexOf(usage) < 0) throw cryptoError("InvalidAccessError", "Key does not allow this operation");
+    return record;
+  }
+  function base64url(bytes) {
+    var text = "";
+    for (var i = 0; i < bytes.length; i++) text += String.fromCharCode(bytes[i]);
+    return btoa(text).replace(new RegExp("\\+", "g"), "-").replace(new RegExp("/", "g"), "_").replace(/=+$/, "");
+  }
+  function decodeBase64url(text) {
+    if (typeof text !== "string" || !/^[A-Za-z0-9_-]*$/.test(text) || text.length % 4 === 1)
+      throw cryptoError("DataError", "Invalid JWK key data");
+    text = text.replace(/-/g, "+").replace(/_/g, "/");
+    while (text.length % 4) text += "=";
+    var decoded = atob(text), bytes = new Uint8Array(decoded.length);
+    for (var i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
+    return bytes;
+  }
+  crypto.subtle.importKey = async function (format, data, algorithm, extractable, usages) {
+    if (cryptoName(algorithm) !== "HMAC") throw cryptoError("NotSupportedError", "Unsupported key algorithm");
+    var hash = cryptoHash(algorithm.hash), bytes;
+    if (format === "raw") bytes = cryptoBytes(data);
+    else if (format === "jwk") {
+      if (!data || data.kty !== "oct" || (data.ext === false && extractable) || (data.use && data.use !== "sig"))
+        throw cryptoError("DataError", "Invalid JWK");
+      var expected = hash === "SHA-1" ? "HS1" : "HS" + hash.slice(4);
+      if (data.alg && data.alg !== expected) throw cryptoError("DataError", "JWK algorithm mismatch");
+      if (data.key_ops) Array.from(usages).forEach(function (u) {
+        if (data.key_ops.indexOf(u) < 0) throw cryptoError("DataError", "JWK usage mismatch");
+      });
+      bytes = decodeBase64url(data.k);
+    } else throw cryptoError("NotSupportedError", "Unsupported key format");
+    if (!bytes.length) throw cryptoError("DataError", "An HMAC key cannot be empty");
+    if (algorithm.length !== undefined && algorithm.length !== bytes.length * 8)
+      throw cryptoError("NotSupportedError", "Only whole imported keys are supported");
+    return hmacKey(bytes, hash, extractable, usages);
+  };
+  crypto.subtle.generateKey = async function (algorithm, extractable, usages) {
+    if (cryptoName(algorithm) !== "HMAC") throw cryptoError("NotSupportedError", "Unsupported key algorithm");
+    var hash = cryptoHash(algorithm.hash);
+    var bits = algorithm.length === undefined ? (hash === "SHA-384" || hash === "SHA-512" ? 1024 : 512) : Number(algorithm.length);
+    if (!isFinite(bits) || bits <= 0 || bits % 8 || bits > 524288) throw cryptoError("OperationError", "Invalid key length");
+    var bytes = new Uint8Array(bits / 8); crypto.getRandomValues(bytes);
+    return hmacKey(bytes, hash, extractable, usages);
+  };
+  crypto.subtle.exportKey = async function (format, key) {
+    var record = keyMaterial.get(key);
+    if (!record || !record.extractable) throw cryptoError("InvalidAccessError", "Key is not extractable");
+    if (format === "raw") return record.bytes.slice().buffer;
+    if (format === "jwk") return { kty: "oct", k: base64url(record.bytes), alg: record.hash === "SHA-1" ? "HS1" : "HS" + record.hash.slice(4), key_ops: record.usages.slice(), ext: true };
+    throw cryptoError("NotSupportedError", "Unsupported key format");
+  };
+  crypto.subtle.sign = async function (algorithm, key, data) {
+    if (cryptoName(algorithm) !== "HMAC") throw cryptoError("NotSupportedError", "Unsupported signing algorithm");
+    var record = usableKey(key, "sign");
+    return g["%hmac"](record.hash, record.bytes, cryptoBytes(data));
+  };
+  crypto.subtle.verify = async function (algorithm, key, signature, data) {
+    if (cryptoName(algorithm) !== "HMAC") throw cryptoError("NotSupportedError", "Unsupported signing algorithm");
+    var record = usableKey(key, "verify");
+    var expected = g["%hmac"](record.hash, record.bytes, cryptoBytes(data));
+    return g["%cryptoCompare"](expected, cryptoBytes(signature));
+  };
+  lz("CryptoKey", CryptoKey);
   /* ---- Blob, FormData ---- */
   class Blob {
     constructor(parts, opts) {
@@ -1164,63 +1260,301 @@ static const char js_chunk_fetch[] = JS_SOURCE(
     entries() { return this._m.entries(); }
     [Symbol.iterator]() { return this._m.entries(); }
   }
+  function streamStrategy(strategy, defaultMark) {
+    strategy = strategy || {};
+    var mark = strategy.highWaterMark === undefined ? defaultMark : Number(strategy.highWaterMark);
+    if (mark !== mark || mark < 0) throw new RangeError("Invalid highWaterMark");
+    if (strategy.size !== undefined && typeof strategy.size !== "function") throw new TypeError("Invalid size function");
+    return { mark: mark, size: strategy.size || function () { return 1; } };
+  }
+  function streamDeferred() {
+    var d = {};
+    d.promise = new Promise(function (resolve, reject) { d.resolve = resolve; d.reject = reject; });
+    d.promise.catch(function () {});
+    return d;
+  }
   class ReadableStream {
-    constructor(source) {
-      def(this, "_q", []); def(this, "_wait", []); def(this, "_closed", false);
-      def(this, "_error", null); def(this, "_errored", false); def(this, "_disturbed", false); def(this, "_locked", false); def(this, "_source", source || {});
-      var stream = this;
-      def(this, "_controller", {
+    constructor(source, strategy) {
+      source = source || {};
+      if (source.type !== undefined) throw new TypeError("Byte streams are not supported");
+      this._source = source; this._strategy = streamStrategy(strategy, 1);
+      this._q = []; this._wait = []; this._total = 0; this._state = "readable";
+      this._closeRequested = false; this._disturbed = false; this._locked = false;
+      this._pulling = false; this._again = false; this._started = false;
+      this._readerClosed = null;
+      var s = this;
+      this._controller = {
         enqueue: function (chunk) {
-          if (stream._closed || stream._errored) throw new TypeError("Stream is not readable");
-          if (stream._wait.length) stream._wait.shift().resolve({ value: chunk, done: false });
-          else stream._q.push(chunk);
+          if (s._state !== "readable" || s._closeRequested) throw new TypeError("Stream is not readable");
+          if (s._wait.length) s._wait.shift().resolve({ value: chunk, done: false });
+          else {
+            var size;
+            try { size = Number(s._strategy.size(chunk)); if (!isFinite(size) || size < 0) throw new RangeError("Invalid chunk size"); }
+            catch (e) { s._error(e); throw e; }
+            s._q.push({ value: chunk, size: size }); s._total += size;
+          }
+          s._pull();
         },
-        close: function () { stream._closed = true; stream._flush(); },
-        error: function (e) { stream._error = e; stream._errored = true; stream._q = []; stream._flush(); },
-        get desiredSize() { return 1 - stream._q.length; }
-      });
-      try { if (this._source.start) this._source.start(this._controller); } catch (e) { this._controller.error(e); }
+        close: function () {
+          if (s._state !== "readable" || s._closeRequested) throw new TypeError("Stream is not readable");
+          s._closeRequested = true; s._finish();
+        },
+        error: function (e) { s._error(e); },
+        get desiredSize() { return s._state === "errored" ? null : s._state === "closed" ? 0 : s._strategy.mark - s._total; }
+      };
+      try {
+        var started = source.start ? source.start(this._controller) : undefined;
+        Promise.resolve(started).then(function () { s._started = true; s._pull(); }, function (e) { s._error(e); });
+      } catch (e) { this._error(e); }
     }
     get locked() { return this._locked; }
-    _flush() {
-      while (this._wait.length && (this._errored || (this._closed && !this._q.length))) {
-        var w = this._wait.shift(); if (this._errored) w.reject(this._error); else w.resolve({ value: undefined, done: true });
-      }
+    _finish() {
+      if (this._state !== "readable" || !this._closeRequested || this._q.length) return;
+      this._state = "closed";
+      while (this._wait.length) this._wait.shift().resolve({ value: undefined, done: true });
+      if (this._readerClosed) this._readerClosed.resolve();
     }
-    getReader() {
+    _error(e) {
+      if (this._state !== "readable") return;
+      this._state = "errored"; this._storedError = e; this._q = []; this._total = 0;
+      while (this._wait.length) this._wait.shift().reject(e);
+      if (this._readerClosed) this._readerClosed.reject(e);
+    }
+    _pull() {
+      if (!this._started || this._state !== "readable" || this._closeRequested ||
+          (!this._wait.length && this._controller.desiredSize <= 0) || !this._source.pull) return;
+      if (this._pulling) { this._again = true; return; }
+      this._pulling = true; var s = this;
+      Promise.resolve().then(function () { return s._source.pull(s._controller); }).then(function () {
+        s._pulling = false;
+        if (s._again) { s._again = false; s._pull(); }
+      }, function (e) { s._pulling = false; s._error(e); });
+    }
+    getReader(options) {
       if (this._locked) throw new TypeError("Stream is locked");
-      this._locked = true; var s = this, released = false, pending = 0;
+      if (options && options.mode !== undefined) throw new TypeError("BYOB readers are not supported");
+      this._locked = true;
+      var s = this, released = false, pending = 0, closed = streamDeferred();
+      this._readerClosed = closed;
+      if (s._state === "closed") closed.resolve();
+      if (s._state === "errored") closed.reject(s._storedError);
       return {
+        get closed() { return closed.promise; },
         read: function () {
           if (released) return Promise.reject(new TypeError("Reader was released"));
           s._disturbed = true;
-          if (s._errored) return Promise.reject(s._error);
-          if (s._q.length) return Promise.resolve({ value: s._q.shift(), done: false });
-          if (s._closed) return Promise.resolve({ value: undefined, done: true });
-          var p = new Promise(function (resolve, reject) { s._wait.push({ resolve: resolve, reject: reject }); });
-          if (s._source.pull) Promise.resolve().then(function () { return s._source.pull(s._controller); }).catch(function (e) { s._controller.error(e); });
-          pending++; return p.then(function (v) { pending--; return v; }, function (e) { pending--; throw e; });
+          if (s._q.length) {
+            var entry = s._q.shift(); s._total -= entry.size; s._finish(); s._pull();
+            return Promise.resolve({ value: entry.value, done: false });
+          }
+          if (s._state === "closed") return Promise.resolve({ value: undefined, done: true });
+          if (s._state === "errored") return Promise.reject(s._storedError);
+          var wait = streamDeferred(); s._wait.push(wait); pending++; s._pull();
+          return wait.promise.then(function (v) { pending--; return v; }, function (e) { pending--; throw e; });
         },
-        cancel: function (reason) { if (released) return Promise.reject(new TypeError("Reader was released")); return s._cancel(reason); },
-        releaseLock: function () { if (pending) throw new TypeError("Reads are pending"); released = true; s._locked = false; }
+        cancel: function (reason) { return released ? Promise.reject(new TypeError("Reader was released")) : s._cancel(reason); },
+        releaseLock: function () {
+          if (released) return;
+          released = true; s._locked = false; s._readerClosed = null;
+          var error = new TypeError("Reader was released");
+          while (s._wait.length) s._wait.shift().reject(error);
+          closed.reject(error);
+        }
       };
     }
-    _cancel(reason) { this._disturbed = true; this._q = []; this._closed = true; this._flush(); return Promise.resolve(this._source.cancel ? this._source.cancel(reason) : undefined); }
+    _cancel(reason) {
+      this._disturbed = true;
+      if (this._state === "closed") return Promise.resolve();
+      if (this._state === "errored") return Promise.reject(this._storedError);
+      this._q = []; this._total = 0; this._closeRequested = true; this._finish();
+      try { return Promise.resolve(this._source.cancel ? this._source.cancel(reason) : undefined).then(function () {}); }
+      catch (e) { return Promise.reject(e); }
+    }
     cancel(reason) { return this._locked ? Promise.reject(new TypeError("Stream is locked")) : this._cancel(reason); }
+    async pipeTo(destination, options) {
+      options = options || {};
+      if (this.locked || destination.locked) throw new TypeError("Stream is locked");
+      var reader = this.getReader(), writer = destination.getWriter(), signal = options.signal;
+      var aborted = streamDeferred(), abort;
+      var sinkFailed = streamDeferred();
+      writer.closed.catch(function (e) { sinkFailed.reject(e); });
+      if (signal) {
+        abort = function () { aborted.reject(signal.reason); };
+        if (signal.aborted) abort(); else signal.addEventListener("abort", abort, { once: true });
+      }
+      function step(p) { return Promise.race(signal ? [p, aborted.promise, sinkFailed.promise] : [p, sinkFailed.promise]); }
+      try {
+        while (true) {
+          await step(writer.ready);
+          var item = await step(reader.read());
+          if (item.done) break;
+          await step(writer.write(item.value));
+        }
+        if (!options.preventClose) await step(writer.close());
+      } catch (error) {
+        var cleanup = [];
+        if (!options.preventCancel) cleanup.push(reader.cancel(error).catch(function () {}));
+        if (!options.preventAbort) cleanup.push(writer.abort(error).catch(function () {}));
+        await Promise.all(cleanup);
+        throw error;
+      } finally {
+        if (signal) signal.removeEventListener("abort", abort);
+        reader.releaseLock(); writer.releaseLock();
+      }
+    }
+    pipeThrough(transform, options) {
+      if (this.locked || transform.writable.locked) throw new TypeError("Stream is locked");
+      this.pipeTo(transform.writable, options).catch(function () {});
+      return transform.readable;
+    }
     tee() {
-      var reader=this.getReader(), controllers=[], canceled=[false,false], reasons=[];
-      function branch(i){return new ReadableStream({start:function(c){controllers[i]=c;},cancel:function(reason){canceled[i]=true;reasons[i]=reason;if(canceled[0]&&canceled[1])return reader.cancel(reasons);}});}
-      var a=branch(0),b=branch(1);
-      function pump(){reader.read().then(function(v){
-        for(var i=0;i<2;i++)if(!canceled[i]){if(v.done)controllers[i].close();else controllers[i].enqueue(v.value instanceof Uint8Array?v.value.slice():v.value);}
-        if(v.done)reader.releaseLock();else if(!canceled[0]||!canceled[1])pump();
-      },function(e){for(var i=0;i<2;i++)if(!canceled[i])controllers[i].error(e);reader.releaseLock();});}
-      pump();return [a,b];
+      var reader = this.getReader(), controls = [], canceled = [false, false], reasons = [], reading = false;
+      var cancelDone = streamDeferred();
+      function pull() {
+        if (reading) return;
+        reading = true;
+        return reader.read().then(function (item) {
+          reading = false;
+          for (var i = 0; i < 2; i++) if (!canceled[i]) {
+            if (item.done) controls[i].close();
+            else controls[i].enqueue(item.value);
+          }
+          if (item.done) { reader.releaseLock(); cancelDone.resolve(); }
+        }, function (e) {
+          reading = false;
+          for (var i = 0; i < 2; i++) if (!canceled[i]) controls[i].error(e);
+          reader.releaseLock(); cancelDone.resolve();
+        });
+      }
+      function branch(i) {
+        return new ReadableStream({ start: function (c) { controls[i] = c; }, pull: pull,
+          cancel: function (reason) {
+            canceled[i] = true; reasons[i] = reason;
+            if (canceled[0] && canceled[1]) reader.cancel(reasons).then(function () { reader.releaseLock(); cancelDone.resolve(); }, cancelDone.reject);
+            return cancelDone.promise;
+          }
+        });
+      }
+      return [branch(0), branch(1)];
     }
     async *[Symbol.asyncIterator]() {
-      var r = this.getReader(); try { while (true) { var v = await r.read(); if (v.done) return; yield v.value; } }
-      finally { r.releaseLock(); }
+      var reader = this.getReader(), done = false;
+      try { while (true) { var item = await reader.read(); if (item.done) { done = true; return; } yield item.value; } }
+      finally { if (!done) await reader.cancel(); reader.releaseLock(); }
     }
+  }
+  class WritableStream {
+    constructor(sink, strategy) {
+      this._sink = sink || {}; this._strategy = streamStrategy(strategy, 1);
+      if (this._sink.type !== undefined) throw new RangeError("Invalid sink type");
+      this._state = "writable"; this._locked = false; this._total = 0;
+      this._closed = streamDeferred(); this._ready = streamDeferred();
+      this._controller = new AbortController();
+      var s = this;
+      var controller = { signal: this._controller.signal, error: function (e) { s._fail(e); } };
+      try { this._chain = Promise.resolve(this._sink.start ? this._sink.start(controller) : undefined); }
+      catch (e) { this._chain = Promise.reject(e); }
+      this._chain = this._chain.catch(function (e) { s._fail(e); });
+      this._updateReady();
+    }
+    get locked() { return this._locked; }
+    _updateReady() {
+      if (this._total < this._strategy.mark || this._state === "closed") this._ready.resolve();
+      else if (!this._backpressure) this._ready = streamDeferred();
+      this._backpressure = this._total >= this._strategy.mark;
+    }
+    _fail(e) {
+      if (this._state === "closed" || this._state === "errored") return;
+      this._state = "errored"; this._storedError = e;
+      this._closed.reject(e); this._ready.reject(e);
+      this._ready = streamDeferred(); this._ready.reject(e);
+    }
+    _write(chunk) {
+      if (this._state !== "writable") return Promise.reject(this._state === "errored" ? this._storedError : new TypeError("Stream is not writable"));
+      var size;
+      try { size = Number(this._strategy.size(chunk)); if (!isFinite(size) || size < 0) throw new RangeError("Invalid chunk size"); }
+      catch (e) { this._fail(e); return Promise.reject(e); }
+      this._total += size; this._updateReady();
+      var s = this;
+      var work = this._chain.then(function () {
+        if (s._state === "errored") throw s._storedError;
+        return s._sink.write ? s._sink.write(chunk, { signal: s._controller.signal, error: function (e) { s._fail(e); } }) : undefined;
+      }).then(function () { s._total -= size; s._updateReady(); }, function (e) { s._fail(e); throw e; });
+      this._chain = work.catch(function () {});
+      return work;
+    }
+    _close() {
+      if (this._state !== "writable") return Promise.reject(this._state === "errored" ? this._storedError : new TypeError("Stream cannot close"));
+      this._state = "closing"; var s = this;
+      var work = this._chain.then(function () {
+        if (s._state === "errored") throw s._storedError;
+        return s._sink.close ? s._sink.close() : undefined;
+      }).then(function () { s._state = "closed"; s._closed.resolve(); s._ready.resolve(); }, function (e) { s._fail(e); throw e; });
+      this._chain = work.catch(function () {});
+      return work;
+    }
+    _abort(reason) {
+      if (this._state === "closed" || this._state === "errored") return Promise.resolve();
+      this._controller.abort(reason); this._fail(reason); var s = this;
+      return this._chain.then(function () { return s._sink.abort ? s._sink.abort(reason) : undefined; }).then(function () {});
+    }
+    abort(reason) { return this.locked ? Promise.reject(new TypeError("Stream is locked")) : this._abort(reason); }
+    close() { return this.locked ? Promise.reject(new TypeError("Stream is locked")) : this._close(); }
+    getWriter() {
+      if (this.locked) throw new TypeError("Stream is locked");
+      this._locked = true; var s = this, released = false;
+      return {
+        get ready() { return released ? Promise.reject(new TypeError("Writer was released")) : s._ready.promise; },
+        get closed() { return released ? Promise.reject(new TypeError("Writer was released")) : s._closed.promise; },
+        get desiredSize() { if (released) throw new TypeError("Writer was released"); return s._state === "errored" ? null : s._state === "closed" ? 0 : s._strategy.mark - s._total; },
+        write: function (chunk) { return released ? Promise.reject(new TypeError("Writer was released")) : s._write(chunk); },
+        close: function () { return released ? Promise.reject(new TypeError("Writer was released")) : s._close(); },
+        abort: function (reason) { return released ? Promise.reject(new TypeError("Writer was released")) : s._abort(reason); },
+        releaseLock: function () { if (!released) { released = true; s._locked = false; } }
+      };
+    }
+  }
+  class TransformStream {
+    constructor(transformer, writableStrategy, readableStrategy) {
+      transformer = transformer || {};
+      if (transformer.readableType !== undefined || transformer.writableType !== undefined) throw new RangeError("Invalid transform type");
+      var control, writableControl, drain = streamDeferred(), t = this, pending = 0, terminated = false;
+      function fail(e) { control.error(e); if (writableControl) writableControl.error(e); drain.reject(e); }
+      this.readable = new ReadableStream({
+        start: function (c) { control = c; },
+        pull: function () { pending++; drain.resolve(); },
+        cancel: function (reason) { fail(reason); }
+      }, readableStrategy === undefined ? { highWaterMark: 0 } : readableStrategy);
+      var controller = {
+        enqueue: function (chunk) { control.enqueue(chunk); pending = Math.max(0, pending - 1); if (control.desiredSize <= 0 && !pending) drain = streamDeferred(); },
+        error: fail,
+        terminate: function () { terminated = true; control.close(); if (writableControl) writableControl.error(new TypeError("Transform terminated")); drain.reject(new TypeError("Transform terminated")); },
+        get desiredSize() { return control.desiredSize; }
+      };
+      this.writable = new WritableStream({
+        start: function (c) {
+          writableControl = c;
+          try { return Promise.resolve(transformer.start ? transformer.start(controller) : undefined).catch(function (e) { fail(e); throw e; }); }
+          catch (e) { fail(e); throw e; }
+        },
+        write: async function (chunk) {
+          if (control.desiredSize <= 0 && !pending) await drain.promise;
+          if (terminated) throw new TypeError("Transform terminated");
+          try { if (transformer.transform) await transformer.transform(chunk, controller); else controller.enqueue(chunk); }
+          catch (e) { fail(e); throw e; }
+        },
+        close: async function () { try { if (transformer.flush) await transformer.flush(controller); if (!terminated) control.close(); } catch (e) { fail(e); throw e; } },
+        abort: function (reason) { control.error(reason); drain.reject(reason); }
+      }, writableStrategy);
+    }
+  }
+  class CountQueuingStrategy {
+    constructor(options) { this.highWaterMark = Number(options.highWaterMark); }
+    size() { return 1; }
+  }
+  class ByteLengthQueuingStrategy {
+    constructor(options) { this.highWaterMark = Number(options.highWaterMark); }
+    size(chunk) { return chunk.byteLength; }
   }
   function bytesOf(body) {
     if (body === undefined || body === null) return new Uint8Array(0);
@@ -1289,6 +1623,8 @@ static const char js_chunk_fetch[] = JS_SOURCE(
     for (var i = 0; i < lines.length; i++) { var c = lines[i].indexOf(":"); if (c > 0) h.append(lines[i].slice(0, c).trim(), lines[i].slice(c + 1).trim()); }
     return h;
   }
+  lz("WritableStream", WritableStream); lz("TransformStream", TransformStream);
+  lz("CountQueuingStrategy", CountQueuingStrategy); lz("ByteLengthQueuingStrategy", ByteLengthQueuingStrategy);
   lz("Headers", Headers); lz("Response", Response); lz("Request", Request); lz("ReadableStream", ReadableStream);
   lz("fetch", function (input, init) {
     return new Promise(function (resolve, reject) {

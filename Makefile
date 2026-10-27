@@ -318,7 +318,7 @@ BROWSER_TEST_SRCS := lib/digest.c lib/sha256.c tests/browser-dom.c tests/canvas-
 	$(addprefix user/desktop/wave/js/,js.c jslib.c jslib2.c jsbinary.c jsnet.c jsre.c jsgc.c jsdom.c jscanvas.c) \
 	$(addprefix user/desktop/wave/,canvas.c html.c shadow.c webblob.c webintegrity.c webinput.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c)
 .PHONY: test-browser
-test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout $(BUILD)/tests/browser-policy $(BUILD)/tests/browser-http
+test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout $(BUILD)/tests/browser-policy $(BUILD)/tests/browser-http $(BUILD)/tests/browser-images
 	$< rootfs/usr/share/www/classlist-tests.js 20
 	$< rootfs/usr/share/www/dom-feature-tests.js 31
 	$(BUILD)/tests/browser-style
@@ -326,6 +326,8 @@ test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine $(BUILD)/tests
 	$(BUILD)/tests/browser-policy
 	$(BUILD)/tests/browser-http
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/modern-core-tests.js 44
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/compatibility-tests.js 30
+	$(BUILD)/tests/browser-images
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/canvas-tests.js 52
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 127
 	$(BUILD)/tests/js-engine
@@ -365,11 +367,11 @@ $(BUILD)/tests/kernel-guest.o: tests/kernel-guest.c
 $(BUILD)/tests/kernel-guest: $(BUILD)/tests/kernel-guest.o $(CRT0) $(LIBC) user/user.ld
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 
-$(BUILD)/tests/browser-style: tests/browser-style.c user/desktop/wave/html.c user/desktop/wave/html_entities.h user/desktop/wave/css.c user/desktop/wave/csscolor.c user/desktop/wave/webutil.c user/desktop/wave/web.h
+$(BUILD)/tests/browser-style: tests/browser-style.c user/desktop/wave/html.c user/desktop/wave/html_entities.h user/desktop/wave/css.c user/desktop/wave/csscolor.c user/desktop/wave/shadow.c user/desktop/wave/webutil.c user/desktop/wave/web.h
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter \
 		$(DESKTOP_INC) tests/browser-style.c user/desktop/wave/html.c user/desktop/wave/css.c user/desktop/wave/csscolor.c \
-		user/desktop/wave/webutil.c -lm -o $@
+		user/desktop/wave/shadow.c user/desktop/wave/webutil.c -lm -o $@
 
 $(BUILD)/tests/browser-layout: tests/browser-layout.c user/desktop/wave/layout.c user/desktop/wave/html.c user/desktop/wave/css.c user/desktop/wave/csscolor.c user/desktop/wave/cssfont.c user/desktop/wave/webutil.c $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
@@ -455,3 +457,11 @@ $(BUILD)/tests/browser-bench: $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS) user/include/
 	$(HOSTCC) -std=gnu11 -O2 -g -fno-pie -no-pie -DJS_HOST_TEST -pthread \
 		$(DESKTOP_INC) -Iinclude -idirafter user/include $(BROWSER_TEST_SRCS) \
 		-lm -o $@
+
+.PHONY: test-browser-images
+test-browser-images: $(BUILD)/tests/browser-images
+	$<
+
+$(BUILD)/tests/browser-images: tests/browser-images.c user/desktop/image/gif.c user/desktop/image/webp.c user/desktop/image/webp_tables.h $(DESKTOP_HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra $(DESKTOP_INC) tests/browser-images.c user/desktop/image/gif.c user/desktop/image/webp.c -o $@

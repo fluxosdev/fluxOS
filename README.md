@@ -253,7 +253,9 @@ fetcher process, so the desktop keeps running), or from `file://`.
   combinators, `:not()`/`:is()` with full selectors, specificity, `!important`,
   `:has()`, `:nth-child()`/`:nth-last-child()` with `of <selector-list>` filters, `@media`, custom properties and `var()`, `calc()`,
   `max-height`, `aspect-ratio`, `::before`/`::after` text,
-  gradients, rounded corners, and the old presentational attributes. Nesting
+  gradients, rounded corners, and the old presentational attributes. Cascade layers
+  (`@layer`, including nested/anonymous layers, ordering statements, cross-sheet names,
+  reversed important precedence and `revert-layer`) participate before specificity. Nesting
   (`&` and nested `@media`), `@supports` (and `CSS.supports()`), `@import`,
   media queries level 4 (ranges such as `400px <= width <= 700px`, `or`,
   heights, `prefers-reduced-motion`...), CSS Color 4/5 (`oklch()`, `oklab()`,
@@ -275,15 +277,17 @@ fetcher process, so the desktop keeps running), or from `file://`.
   and `counter()`/`counters()` in `content` (one flat set of counters, not scoped by nesting).
   Also `tab-size`, `text-align-last`, `-webkit-line-clamp` (the lines are cut off, with no
   ellipsis), `list-style-image`, and `hyphens` and `resize`, which are accepted and ignored.
-  Pictures: `background-image: url()` (the first layer that has one; PNG, JPEG, GIF, ICO,
-  SVG, and `data:` URLs) with `background-size` (lengths, percentages, `cover`, `contain`),
-  `background-position` (keywords, offsets from an edge), `background-repeat`, `background-origin`
-  and the `background` shorthand, under any gradient, inside rounded corners; the old
+  Pictures: comma-separated `background-image` layers (PNG, JPEG, GIF, WebP, ICO,
+  SVG, gradients and `data:` URLs) with `background-size` (lengths, percentages, `cover`, `contain`),
+  `background-position` (keywords, offsets from an edge), `background-repeat`, `background-origin`,
+  border/padding/content `background-clip`, fixed picture attachments and the `background`
+  shorthand, painted from the bottom layer up inside rounded corners; the old
   `background=` attribute; `object-fit` and `object-position` on `<img>` (also with rounded
   corners, as for round avatars). Relative addresses in a style sheet are
   resolved against the sheet's own address. `overflow`, `overflow-x` and `overflow-y`.
 - **Layout**: blocks with margin collapsing, inline text, inline-blocks, lists,
-  tables, flex rows, grids (columns, rows, areas, auto rows, spans, `dense`),
+  tables, flex rows, grids (columns, rows, areas, auto rows, spans, `dense`, named
+  lines and positive/negative named-line occurrences in explicit and integer-repeat tracks),
   borders, backgrounds, images and form controls. Floats (`float`, `clear`,
   clearfixes, text wrapping, new formatting contexts beside floats) and
   positioning (`relative`, `absolute`, `fixed` and `sticky` with `top`/`right`/`bottom`/
@@ -319,9 +323,11 @@ fetcher process, so the desktop keeps running), or from `file://`.
   cookies last until the desktop closes. `SameSite` defaults to Lax and is enforced using schemeful sites and the
   public suffix list (including private suffixes). Invalid public-suffix Domain,
   insecure SameSite=None and invalid __Host-/__Secure- cookies are rejected.
-- **Pictures**: PNG, JPEG, GIF (first frame), ICO (the largest icon) and SVG, as `<img>` and as an
+- **Pictures**: PNG, JPEG, WebP, animated GIF, ICO (the largest icon) and SVG, as `<img>` and as an
   inline `<svg>`. `srcset`/`sizes` and `<picture><source>` choose a picture of
-  the right width in a format the browser can decode (not WebP or AVIF). The SVG renderer (svg.c) draws shapes, paths (curves and
+  the right width in a format the browser can decode (including WebP, excluding AVIF).
+  GIF frames decode on demand with delay, disposal, transparency and loop-count handling.
+  WebP animations still show their first frame. The SVG renderer (svg.c) draws shapes, paths (curves and
   arcs), groups, `use`, text, transforms, `viewBox`, solid and gradient fills,
   dashed strokes with caps and joins, opacity, and simple `<style>` rules.
 - `<details>`/`<summary>` open and close when clicked. Links, `GET`/`POST` forms, `<meta refresh>`, fragments, redirects, iframes,
@@ -357,7 +363,7 @@ fetcher process, so the desktop keeps running), or from `file://`.
   `MutationObserver`, `IntersectionObserver` and `ResizeObserver`, custom
   elements (`customElements.define` with upgrades and lifecycle callbacks;
   `attachShadow` creates a separate open or closed tree, with scoped styles,
-  named/default slots and event retargeting), `<template>`
+  named/default slots, coalesced `slotchange` events, slotted event paths and event retargeting), `<template>`
   content, `<dialog>`, `HTMLInputElement` and the other interfaces for
   `instanceof`, `TreeWalker`, `Range`/`Selection`, form validation,
   `form.submit()`/`requestSubmit()`, `load`/`error` events for pictures,
@@ -368,7 +374,12 @@ fetcher process, so the desktop keeps running), or from `file://`.
   (per origin, kept in `/home/flux/.browser_storage`) and `sessionStorage`
   (per origin and window), `XMLHttpRequest`, `fetch`,
   `URL`, and more: `FormData`, `Blob`, `TextEncoder`/`TextDecoder`, `crypto.getRandomValues`/`randomUUID`,
-  `DOMParser`, `postMessage`, a style element's `sheet.insertRule()`, and a stand-in for `Notification`. Downloaded fonts use FreeType and Brotli, with CSS `@font-face`, `FontFace`, and `document.fonts` loading. `element.animate()` interpolates numeric values,
+  `DOMParser`, `postMessage`, a style element's `sheet.insertRule()`, and a stand-in for `Notification`.
+  Constructed `CSSStyleSheet` objects remain outside the DOM; documents and shadow roots
+  adopt shared, mutable sheet lists, and replacements, rule edits and disabling update adopters.
+  Shadow styles support `:host`, `:host(...)` and `::slotted(...)`, with outer/inner cascade precedence.
+  Web Crypto adds HMAC key import/generation/export and signing/verification with SHA-1/256/384/512,
+  raw and JWK formats, usage/extractability checks and native signature comparison. Downloaded fonts use FreeType and Brotli, with CSS `@font-face`, `FontFace`, and `document.fonts` loading. `element.animate()` interpolates numeric values,
   lengths and RGB colors over time, with pause/play/reverse, seeking, fill,
   direction, iterations and common easing functions. Also `MessageChannel`
   and `BroadcastChannel` (within the page), `XMLSerializer`, `Path2D` and `ImageData` (data only: no canvas
@@ -378,7 +389,9 @@ fetcher process, so the desktop keeps running), or from `file://`.
   response headers), credential modes and mixed-content/local-file restrictions.
   They send request headers and any allowed method (`PUT`, `DELETE`...), and
   preserve binary request/response bodies. Response supports `arrayBuffer()`,
-  `bytes()`, `blob()` and an incremental `ReadableStream` body. Typed arrays and
+  `bytes()`, `blob()` and an incremental `ReadableStream` body. Default streams support
+  queue-size strategies, serialized pulls, cancellation, locking and piping; `WritableStream`,
+  `TransformStream`, `CountQueuingStrategy` and `ByteLengthQueuingStrategy` are available. Typed arrays and
   DataView use shared ArrayBuffer bytes, offsets, endian handling and conversion
   on indexed writes; core string indexing, lengths, slicing and search use
   UTF-16 code units. `crypto.getRandomValues` reads the OS random device.
@@ -745,18 +758,22 @@ cannot be used.
   approximation: the scroll bars of boxes lie over their contents instead of making room
   (text can end up under them), and boxes with `overflow` that are table cells, or `<body>` and
   `<html>`, do not clip or scroll; text selection and `getBoundingClientRect()` account for nested box scrolling,
-  while geometry for some positioned boxes is approximate; backgrounds are not clipped by `background-clip`, `fixed` attachments
-  scroll with the box, only the first picture layer is used, `space` and `round` repeat; `z-index` only orders absolute and fixed boxes, `sticky` works
+  while geometry for some positioned boxes is approximate; background `space` and `round`
+  still repeat, `local` attachments do not track inner scrolling, and gradients use a limited
+  two-color renderer; `z-index` only orders absolute and fixed boxes, `sticky` works
   against the window only, transforms other than `translate`,
   CSS `transition`s and CSS animations are ignored (Web Animations has a limited
   numeric/color interpolator). Flexbox has grow/shrink sizing, wrapping,
   ordering, alignment and rows/columns, but needs wider conformance testing;
-  grids lack named lines and column flow. Shadow DOM lacks `:host`, `::slotted`,
-  adopted style sheets and complete slotchange/composed-event behavior.
+  grids lack subgrid, column flow, named spans and complete named-line behavior for auto-repeat.
+  Container queries are missing. Shadow DOM still needs wider composed-event and slot
+  conformance testing; adopted sheets do not register downloadable font faces.
   Fetch resolves at headers and delivers body chunks incrementally; EventSource
   parses event streams and reconnects. Each page uses up to four request workers.
-  Stream queues currently have limited backpressure. GIF animations show their
-  first frame; SVG ignores clip paths, masks, filters and patterns. There are
+  Fetch does not yet pause network delivery when a stream queue fills. BYOB/byte-stream
+  controllers are missing. WebP animations show their first frame; SVG ignores clip paths,
+  masks, filters and patterns. Workers, IndexedDB and cross-window messaging remain missing;
+  Web Crypto encryption, asymmetric keys and key derivation are missing. There are
   downloadable TrueType/OpenType, WOFF and WOFF2 fonts, but no complex-script
   shaping or complete bidirectional text support; the built-in fonts cover Latin
   Extended, Greek, Cyrillic and common punctuation. Other characters show as `?`. Connections are kept per

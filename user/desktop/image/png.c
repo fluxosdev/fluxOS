@@ -490,6 +490,7 @@ struct image *image_load_png(const char *path)
 void image_free(struct image *img)
 {
     if (img) {
+        image_animation_free(img);
         free(img->px);
         free(img);
     }

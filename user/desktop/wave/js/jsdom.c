@@ -52,6 +52,11 @@ struct timer {
     int nargs;
 };
 
+struct shadow_scope {
+    struct node *root;
+    struct shadow_scope *next;
+};
+
 /* Request policy lives in native memory: scripts must not be able to rewrite it in flight. */
 struct xhr_request {
     struct jsstr *url, *method, *headers, *body;
@@ -112,6 +117,7 @@ struct jsdom {
     /* the import map: specifiers (or prefixes ending in /) and the URLs they stand for */
     char **im_from, **im_to;
     int nim;
+    struct shadow_scope *shadows;
 };
 
 static const struct jsclass node_class, document_class, style_class, classlist_class,
@@ -145,6 +151,7 @@ static void report(struct jsdom *d, const char *what)
 
 /* Leaving the engine: a changed tree is laid out again. */
 static int is_connected(struct jsdom *d,const struct node *n);
+static void assign_slots(struct jsdom *d);
 static void settle(struct jsdom *d)
 {
     if(d->depth==0 && d->active && (!is_connected(d,d->active)||!web_focusable(d->active)))jsdom_focus(d,NULL);
@@ -264,6 +271,7 @@ static void unlink_node(struct jsdom *d, struct node *n)
     else
         p->last = n->prev;
     n->parent = n->prev = n->next = NULL;
+    assign_slots(d);
     renumber(p);
     if (was_connected)
         ce_tree(d, n, 0);
@@ -332,6 +340,7 @@ static int insert_node(struct jsdom *d, struct node *parent, struct node *n, str
         parent->last = n;
     }
     renumber(parent);
+    assign_slots(d);
     d->dirty = 1;
     if (d->watch_mutations)
         mutation(d, "childList", parent, n, NULL, n->prev, n->next, NULL, NULL);
@@ -388,6 +397,7 @@ static void set_attr(struct jsdom *d, struct node *n, const char *name, const ch
         if (!strcmp((*pp)->name, lname)) {
             const char *old = (*pp)->value;
             (*pp)->value = arena_strdup(d->h.arena, value);
+            if (!strcmp(lname, "slot") || !strcmp(lname, "name")) assign_slots(d);
             d->dirty = 1;
             if (n->tag == T_CANVAS && (!strcmp(lname, "width") || !strcmp(lname, "height")))
                 jscanvas_resized(d->J, n, n->js ? js_obj(n->js) : js_undefined);
@@ -403,6 +413,7 @@ static void set_attr(struct jsdom *d, struct node *n, const char *name, const ch
     a->name = arena_strdup(d->h.arena, lname);
     a->value = arena_strdup(d->h.arena, value);
     *pp = a;
+    if (!strcmp(lname, "slot") || !strcmp(lname, "name")) assign_slots(d);
     d->dirty = 1;
     if (n->tag == T_CANVAS && (!strcmp(lname, "width") || !strcmp(lname, "height")))
         jscanvas_resized(d->J, n, n->js ? js_obj(n->js) : js_undefined);
@@ -420,6 +431,7 @@ static void remove_attr(struct jsdom *d, struct node *n, const char *name)
         if (!strcasecmp((*pp)->name, name)) {
             struct attr *gone = *pp;
             *pp = gone->next;
+            if (!strcmp(gone->name, "slot") || !strcmp(gone->name, "name")) assign_slots(d);
             d->dirty = 1;
             if (d->watch_mutations)
                 mutation(d, "attributes", n, NULL, NULL, NULL, NULL, gone->name, gone->value);
@@ -2431,8 +2443,28 @@ static jsval el_attach_shadow(struct js *J, jsval self, jsval *args, int argc)
     n->shadow_root = root;
     root->shadow_host = n;
     root->shadow_closed = !strcmp(mode, "closed");
+    struct shadow_scope *scope = arena_alloc(d->h.arena, sizeof(*scope));
+    if (scope) {
+        scope->root = root;
+        scope->next = d->shadows;
+        d->shadows = scope;
+    }
     d->dirty = 1;
     return wrap(d, root);
+}
+
+static jsval adopt_sheets(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct jsdom *d = dom(J);
+    struct node *root = this_node(J, ARG(0));
+    if (!root || (root != d->h.root && !root->shadow_host))
+        return js_throw_error(J, "NotSupportedError: sheets require a Document or ShadowRoot");
+    struct jsstr *text = js_tostr(J, ARG(1));
+    if (!root->adopted_text || strcmp(root->adopted_text, text->s)) {
+        root->adopted_text = arena_strndup(d->h.arena, text->s, (size_t)text->len);
+        d->dirty = 1;
+    }
+    return js_undefined;
 }
 static jsval el_assigned_nodes(struct js *J, jsval self, jsval *args, int argc)
 {
@@ -3078,6 +3110,17 @@ static jsval event_init(struct js *J, jsval self, jsval *args, int argc)
     return js_undefined;
 }
 
+/* Slotted nodes enter their assigned slot before climbing the shadow tree. */
+static struct node *event_parent(struct node *n)
+{
+    if (n->parent && n->parent->shadow_root) {
+        const char *name = n->type == N_ELEMENT ? node_attr(n, "slot") : "";
+        struct node *slot = shadow_slot(n->parent, name ? name : "");
+        if (slot) return slot;
+    }
+    return n->parent;
+}
+
 /* The targets an event goes through: the target, its ancestors, the document and the window. */
 static jsval event_composed_path(struct js *J, jsval self, jsval *args, int argc)
 {
@@ -3095,10 +3138,15 @@ static jsval event_composed_path(struct js *J, jsval self, jsval *args, int argc
             start = p->shadow_host;
     int composed = js_truthy(js_get(J, self, "composed")), connected = 0;
     for (struct node *n = start; n;) {
-        js_array_push(J, a, wrap(d, n));
+        int visible = 1;
+        for (struct node *r = n; r; r = r->parent)
+            if (r->shadow_host && r->shadow_closed && !contains(r, current)) visible = 0;
+        if (visible) js_array_push(J, a, wrap(d, n));
         if (n == d->h.root)
             connected = 1;
-        n = n->parent ? n->parent : composed ? n->shadow_host : NULL;
+        struct node *parent = event_parent(n);
+        n = parent ? parent : n->shadow_host && (composed || contains(n->shadow_host, path->target))
+            ? n->shadow_host : NULL;
     }
     if (connected) {
         js_array_push(J, a, js_obj(d->document));
@@ -3254,15 +3302,16 @@ static int dispatch_event(struct jsdom *d, struct node *target, const char *type
     struct js *J = d->J;
     struct node *path[256], *visible[256], *retarget = target;
     int np = 0, in_doc = target == d->h.root, composed = js_truthy(js_get(J, ev, "composed"));
-    for (struct node *n = target->parent; n && np < 256;) {
+    for (struct node *n = event_parent(target); n && np < 256;) {
         path[np] = n;
         visible[np++] = retarget;
         if (n == d->h.root)
             in_doc = 1;
-        if (n->parent)
-            n = n->parent;
-        else if (composed && n->shadow_host) {
-            retarget = n->shadow_host;
+        struct node *parent = event_parent(n);
+        if (parent)
+            n = parent;
+        else if (n->shadow_host && (composed || contains(n->shadow_host, target))) {
+            if (contains(n, target)) retarget = n->shadow_host;
             n = n->shadow_host;
         } else
             n = NULL;
@@ -3310,6 +3359,56 @@ static int dispatch_event(struct jsdom *d, struct node *target, const char *type
     int prevented = js_truthy(js_get(J, ev, "defaultPrevented"));
     settle(d);
     return prevented;
+}
+
+static void slotchange_job(struct js *J, struct job *job)
+{
+    struct jsdom *d = dom(J);
+    struct node *slot = node_of(job->a);
+    if (!slot) return;
+    slot->slot_pending = 0;
+    jsval event = new_event(d, "slotchange", job->a);
+    js_set(J, event, "composed", js_bool(0));
+    js_set(J, event, "cancelable", js_bool(0));
+    dispatch_event(d, slot, "slotchange", event, 1);
+}
+
+/* Reassign after every mutation, then signal each changed slot once per
+ * microtask checkpoint. The snapshot also covers transient assignments. */
+static void assign_slots(struct jsdom *d)
+{
+    for (struct shadow_scope *scope = d->shadows; scope; scope = scope->next) {
+        struct node *root = scope->root, *host = root->shadow_host;
+        for (struct node *slot = root; slot; slot = node_next(slot, root)) {
+            if (slot->type != N_ELEMENT || strcmp(slot->name, "slot")) continue;
+            const char *name = node_attr(slot, "name");
+            if (!name) name = "";
+            int count = 0, changed = 0;
+            if (shadow_slot(host, name) == slot)
+                for (struct node *n = host->first; n; n = n->next) {
+                    const char *s = n->type == N_ELEMENT ? node_attr(n, "slot") : "";
+                    if (strcmp(s ? s : "", name)) continue;
+                    if (count >= slot->assigned_count || slot->assigned_nodes[count] != n) changed = 1;
+                    count++;
+                }
+            changed |= count != slot->assigned_count;
+            if (!changed) continue;
+            struct node **nodes = count ? arena_alloc(d->h.arena, sizeof(*nodes)*(size_t)count) : NULL;
+            if (count && !nodes) continue;
+            int i = 0;
+            if (count)
+                for (struct node *n = host->first; n; n = n->next) {
+                    const char *s = n->type == N_ELEMENT ? node_attr(n, "slot") : "";
+                    if (!strcmp(s ? s : "", name)) nodes[i++] = n;
+                }
+            slot->assigned_nodes = nodes;
+            slot->assigned_count = count;
+            if (!slot->slot_pending) {
+                slot->slot_pending = 1;
+                js_enqueue(d->J, slotchange_job, wrap(d, slot), js_undefined, js_undefined, js_undefined);
+            }
+        }
+    }
 }
 
 static int bubbles_by_default(const char *type)
@@ -5240,7 +5339,7 @@ void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, i
  * puts the real thing in its place) and then reads the name again. */
 
 #define DOM_LIB_NAMES(X)                                                                                     \
-    X(W, MessageChannel)                                                                                     \
+    X(F, adoptedStyleSheets) X(W, MessageChannel)                                                                                     \
     X(W, MessagePort)                                                                                        \
     X(W, BroadcastChannel) X(W, XMLSerializer) X(W, Path2D) X(W, ImageData) X(W, NodeFilter)                 \
         X(W, TreeWalker) X(W, NodeIterator) X(W, Range) X(W, StaticRange) X(W, Selection) X(W, getSelection) \
@@ -5285,10 +5384,7 @@ static jsval dom_lib_set(struct js *J, jsval self, const char *name, jsval v)
     dom_lib_load(d);
     if (self.t != JS_OBJ)
         return js_undefined;
-    struct prop *p = js_own(self.u.o, S(J, name));
-    if (p)
-        p->getter = p->setter = NULL;   /* the page's own value from now on */
-    js_put(J, self.u.o, S(J, name), v, 0);
+    js_set(J, self, name, v);
     return js_undefined;
 }
 
@@ -5822,8 +5918,8 @@ struct jsdom *jsdom_new(const struct jshost *host)
     jsval media_ctor = js_get(J, wv, "HTMLAudioElement");   /* HTMLMediaElement: audio and video */
     if (media_ctor.t == JS_OBJ)
         js_set(J, wv, "HTMLMediaElement", media_ctor);
-    struct jsobj *lazy_on[] = { w, dp, ep, d->text_proto };     /* W, D, E, T */
-    enum { W, D, E, T };
+    struct jsobj *lazy_on[] = { w, dp, ep, d->text_proto, d->frag_proto };     /* W, D, E, T */
+    enum { W, D, E, T, F };
     static const struct { int where; const char *name; js_native get, set; } lazy[] = {
 #define X(where, name) { where, #name, lazy_get_##where##_##name, lazy_set_##where##_##name },
         DOM_LIB_NAMES(X)
@@ -5832,6 +5928,7 @@ struct jsdom *jsdom_new(const struct jshost *host)
     for (unsigned i = 0; i < sizeof(lazy) / sizeof(lazy[0]); i++)
         accessor(J, lazy_on[lazy[i].where], lazy[i].name, lazy[i].get, lazy[i].set);
     fn(J,w,"%blobURL",blob_url_api,2);
+    fn(J,w,"%adoptSheets",adopt_sheets,2);
     fn(J,w,"%clipboard",clipboard_text,1);
     fn(J,w,"%pointerCapture",pointer_capture_api,2);
     if (js_eval(J, js_dom_eager, (int)sizeof(js_dom_eager) - 1, "DOM library") < 0)
