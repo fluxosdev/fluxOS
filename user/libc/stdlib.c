@@ -50,95 +50,206 @@ void abort(void)
     _exit(127);
 }
 
-/* ---- malloc: address-ordered free list with coalescing ---- */
+/*
+ * ---- malloc: boundary tags and size-class bins ----
+ *
+ * Blocks are 16-byte multiples with a 16-byte header, so payloads stay
+ * 16-byte aligned. The header holds the block's size and two flags: in
+ * use, and whether the block just below is in use. A free block also
+ * keeps its size in its last word (a footer) and its list links in its
+ * payload, so free() finds both neighbours at once and merges with them:
+ * no two free blocks are ever adjacent. Free blocks wait in bins by size,
+ * exact below 1 KiB and four to each power of two above, with a bitmap
+ * of the bins in use: malloc() looks at one bin, then jumps to the next
+ * non-empty one. Neither walks the heap, which a long-running program
+ * (the desktop) makes large.
+ *
+ * Each stretch from sbrk() ends in a fence, a header marking 16 bytes in
+ * use, so merging stops there; the next stretch, if it follows on, takes
+ * the fence's place.
+ */
 
-#define ALIGN 16
-#define CHUNK (64 * 1024)
+#define ALIGN     16u
+#define HDR       16u                   /* header, before the payload */
+#define MIN_BLOCK 32u                   /* header, two links and a footer */
+#define CHUNK     (64u * 1024)
+#define INUSE     1u
+#define PINUSE    2u                    /* the block below is in use */
+#define SMALL     1024u                 /* exact bins below this */
+#define NBINS     160
+#define MAX_REQ   0x7FF00000u           /* what sbrk(int) can be asked for */
 
-struct header {
-    size_t size;                /* payload bytes */
-    int free;
-    struct header *next;
-    uint32_t pad;
+struct block {
+    size_t head;                        /* size | INUSE | PINUSE */
+    uint32_t pad[3];
+    struct block *next, *prev;          /* free blocks only: their bin */
 };
 
-static struct header *heap_first, *heap_last;
+/* The links fit in the smallest block, ahead of its footer. */
+_Static_assert(HDR + 2 * sizeof(void *) + sizeof(size_t) <= MIN_BLOCK, "block too small");
 
-static struct header *grow(size_t size)
+static struct block *bins[NBINS];
+static uint32_t binmap[(NBINS + 31) / 32];
+static struct block *fence;             /* the end of the latest stretch */
+
+static inline size_t bsize(const struct block *b) { return b->head & ~(size_t)(ALIGN - 1); }
+static inline struct block *after(struct block *b) { return (struct block *)((char *)b + bsize(b)); }
+static inline void set_footer(struct block *b) { *(size_t *)((char *)b + bsize(b) - sizeof(size_t)) = bsize(b); }
+
+static int bin_of(size_t size)
 {
-    size_t total = size + sizeof(struct header);
-    if (total < CHUNK)
-        total = CHUNK;
-    struct header *h = sbrk((int)total);
-    if (h == (void *)-1)
-        return NULL;
-    h->size = total - sizeof(struct header);
-    h->free = 1;
-    h->next = NULL;
-    if (heap_last && heap_last->free &&
-        (char *)(heap_last + 1) + heap_last->size == (char *)h) {
-        heap_last->size += total;
-        return heap_last;
-    }
-    if (heap_last)
-        heap_last->next = h;
-    else
-        heap_first = h;
-    heap_last = h;
-    return h;
+    if (size < SMALL)
+        return (int)(size >> 4);
+    int lg = 31 - __builtin_clz((unsigned)size);
+    int i = 64 + (lg - 10) * 4 + (int)((size >> (lg - 2)) & 3);
+    return i < NBINS ? i : NBINS - 1;
 }
 
-static void split(struct header *h, size_t size)
+static void bin_insert(struct block *b)
 {
-    if (h->size < size + sizeof(struct header) + ALIGN)
+    int i = bin_of(bsize(b));
+    b->prev = NULL;
+    b->next = bins[i];
+    if (b->next)
+        b->next->prev = b;
+    bins[i] = b;
+    binmap[i / 32] |= 1u << (i % 32);
+}
+
+static void bin_remove(struct block *b)
+{
+    int i = bin_of(bsize(b));
+    if (b->prev)
+        b->prev->next = b->next;
+    else
+        bins[i] = b->next;
+    if (b->next)
+        b->next->prev = b->prev;
+    if (!bins[i])
+        binmap[i / 32] &= ~(1u << (i % 32));
+}
+
+/* The first non-empty bin from i on, or -1. */
+static int bin_next(int i)
+{
+    for (int w = i / 32; w < (NBINS + 31) / 32; w++) {
+        uint32_t m = binmap[w];
+        if (w == i / 32)
+            m &= ~0u << (i % 32);
+        if (m)
+            return w * 32 + __builtin_ctz(m);
+    }
+    return -1;
+}
+
+/* b (in use, any size) becomes free: merge with free neighbours and bin it. */
+static void release(struct block *b)
+{
+    size_t size = bsize(b);
+    struct block *n = after(b);
+    if (!(n->head & INUSE)) {
+        bin_remove(n);
+        size += bsize(n);
+    }
+    if (!(b->head & PINUSE)) {
+        size_t psize = *(size_t *)((char *)b - sizeof(size_t));
+        b = (struct block *)((char *)b - psize);
+        bin_remove(b);
+        size += psize;
+    }
+    b->head = size | PINUSE;            /* what is below a free block is in use */
+    set_footer(b);
+    after(b)->head &= ~PINUSE;
+    bin_insert(b);
+}
+
+/* Room for at least `need` more: a free block from sbrk(). */
+static int grow(size_t need)
+{
+    size_t total = need < CHUNK ? CHUNK : need;
+    if (total > MAX_REQ - HDR)
+        return -1;
+    char *p = sbrk((int)(total + HDR));
+    if (p == (void *)-1)
+        return -1;
+    struct block *b;
+    if (fence && (char *)fence + HDR == p) {
+        b = fence;                      /* follows on: the old fence is the new block's header */
+        b->head = (total + HDR) | INUSE | (fence->head & PINUSE);
+    } else {
+        b = (struct block *)p;          /* a new stretch: nothing below to merge with */
+        b->head = total | INUSE | PINUSE;
+    }
+    fence = after(b);
+    fence->head = HDR | INUSE | PINUSE;
+    release(b);
+    return 0;
+}
+
+/* The block size for n bytes of payload, or 0 if too big. */
+static size_t block_size(size_t n)
+{
+    if (n > MAX_REQ - 2 * HDR)
+        return 0;
+    size_t size = (n + HDR + ALIGN - 1) & ~(size_t)(ALIGN - 1);
+    return size < MIN_BLOCK ? MIN_BLOCK : size;
+}
+
+/* b (in use) keeps `size` bytes; the rest, if a block's worth, is freed. */
+static void trim(struct block *b, size_t size)
+{
+    size_t rest = bsize(b) - size;
+    if (rest < MIN_BLOCK)
         return;
-    struct header *n = (struct header *)((char *)(h + 1) + size);
-    n->size = h->size - size - sizeof(struct header);
-    n->free = 1;
-    n->next = h->next;
-    h->next = n;
-    h->size = size;
-    if (heap_last == h)
-        heap_last = n;
+    b->head = size | (b->head & (INUSE | PINUSE));
+    struct block *r = after(b);
+    r->head = rest | INUSE | PINUSE;
+    release(r);
+}
+
+static struct block *find(size_t size)
+{
+    int i = bin_of(size);
+    if (size >= SMALL)                  /* a range: look for one that fits */
+        for (struct block *b = bins[i]; b; b = b->next)
+            if (bsize(b) >= size)
+                return b;
+    if (size < SMALL && bins[i])
+        return bins[i];
+    i = bin_next(i + 1);                /* anything in a bigger bin fits */
+    return i < 0 ? NULL : bins[i];
 }
 
 void *malloc(size_t n)
 {
-    if (!n)
-        n = 1;
-    size_t size = (n + ALIGN - 1) & ~(size_t)(ALIGN - 1);
-    struct header *h;
-    for (h = heap_first; h; h = h->next)
-        if (h->free && h->size >= size)
-            break;
-    if (!h) {
-        h = grow(size);
-        if (!h) {
+    size_t size = block_size(n ? n : 1);
+    if (!size) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    struct block *b = find(size);
+    if (!b) {
+        if (grow(size) < 0) {
             errno = ENOMEM;
             return NULL;
         }
+        b = find(size);
     }
-    split(h, size);
-    h->free = 0;
-    return h + 1;
+    bin_remove(b);
+    b->head |= INUSE;
+    after(b)->head |= PINUSE;
+    trim(b, size);
+    return (char *)b + HDR;
 }
 
 void free(void *p)
 {
     if (!p)
         return;
-    struct header *h = (struct header *)p - 1;
-    h->free = 1;
-    /* Merge with physically adjacent free neighbours. */
-    for (struct header *c = heap_first; c; c = c->next) {
-        while (c->free && c->next && c->next->free &&
-               (char *)(c + 1) + c->size == (char *)c->next) {
-            if (heap_last == c->next)
-                heap_last = c;
-            c->size += sizeof(struct header) + c->next->size;
-            c->next = c->next->next;
-        }
-    }
+    struct block *b = (struct block *)((char *)p - HDR);
+    if (!(b->head & INUSE))
+        return;                         /* freed already */
+    release(b);
 }
 
 void *calloc(size_t count, size_t size)
@@ -159,18 +270,31 @@ void *realloc(void *p, size_t n)
         free(p);
         return NULL;
     }
-    struct header *h = (struct header *)p - 1;
-    if (h->size >= n)
+    struct block *b = (struct block *)((char *)p - HDR);
+    size_t size = block_size(n);
+    if (!size) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    if (bsize(b) >= size) {
+        trim(b, size);
         return p;
+    }
+    struct block *nb = after(b);        /* grow into a free block above */
+    if (!(nb->head & INUSE) && bsize(b) + bsize(nb) >= size) {
+        bin_remove(nb);
+        b->head += bsize(nb);
+        after(b)->head |= PINUSE;
+        trim(b, size);
+        return p;
+    }
     void *q = malloc(n);
     if (!q)
         return NULL;
-    memcpy(q, p, h->size);
+    memcpy(q, p, bsize(b) - HDR);
     free(p);
     return q;
 }
-
-/* ---- environment ---- */
 
 static int env_owned;
 
