@@ -46,7 +46,7 @@ SETUP   := $(BUILD)/setup.tar
 ROOTFS  := $(BUILD)/rootfs
 SETUPFS := $(BUILD)/setupfs
 DISK    := fluxdisk.img
-DISK_MB ?= 64
+DISK_MB ?= 256
 FLOPPY  := fluxfloppy.img
 MKFS_FAT ?= $(shell command -v mkfs.fat 2>/dev/null || ls /usr/sbin/mkfs.fat /sbin/mkfs.fat 2>/dev/null | head -1)
 

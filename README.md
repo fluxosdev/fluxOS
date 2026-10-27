@@ -470,7 +470,7 @@ make test-kernel-qemu # boots kernel regressions with a disposable initrd and sc
 make test-kernel-qemu KERNEL_TEST_CPUS=4 # same tests on four Pentium III CPUs
 make test-kernel-qemu KERNEL_TEST_CPUS=4 KERNEL_TEST_CMDLINE=nosmp # single-core fallback
 make test-kernel-qemu KERNEL_TEST_CPUS=4 KERNEL_TEST_CMDLINE=maxcpus=2 # CPU limit
-make disk       # fluxdisk.img, a 64 MiB FAT32 data disk (DISK_MB=...)
+make disk       # fluxdisk.img, a 256 MiB FAT32 data disk (DISK_MB=...)
 make floppy     # fluxfloppy.img, a 1.44 MB FAT12 floppy for drive A:
 make run        # boots the install CD in QEMU with the disk, floppy (if any) and an NE2000
 make run-kernel # boots the kernel directly, the whole system in memory (text console)
