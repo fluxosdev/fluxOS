@@ -115,7 +115,8 @@ stops at boot and says why.
   batteries (charge, rate, time left), the lid, the power and sleep buttons, a
   thermal zone (critical temperature shuts down cleanly) and the backlight
   (brightness keys and `power bright`). `SYS_power` and the `power` command
-  report it all. **Suspend to RAM (S3)** from the desktop's Shut Down dialog,
+  report it all. **Suspend to RAM (S3)**, not yet working on real hardware
+  (see *Work in progress*), from the desktop's Shut Down dialog,
   the Power dialog, the sleep key, closing the lid, or `power sleep`: disks are
   flushed and parked, the other processors parked, and on waking the
   processor, PICs, PCI configuration, IDE (with its DMA mode), AHCI, all four
@@ -140,7 +141,7 @@ stops at boot and says why.
     6550D, 6620G and the rest of 0x9640-0x964F): Evergreen's display
     controllers, with page flipping and the hardware pointer in the boot
     loader's mode, over the memory the BIOS shares with them. Native modes and
-    3D are not there yet for these.
+    3D are not there yet for these (see *Work in progress*).
 - Sound:
   - PC speaker (`/dev/speaker`) with background tone queue.
   - **Sound Blaster 16**: `/dev/dsp` (OSS-style, 8/16-bit, mono/stereo, 5-44.1
@@ -755,6 +756,23 @@ fixed point with two decimals.
 **System calls.** `int 0x80`, number in `eax`, arguments in `ebx`, `ecx`, `edx`,
 `esi`, `edi`; failures return `-errno`. Every user pointer is checked against the
 user range and page tables first.
+
+## Work in progress
+
+- **Suspend to RAM does not come back yet.** On the first machine tried (an
+  HP ProBook with a Llano APU) closing the lid or `power sleep` suspends, but
+  on waking the screen stays black and the system does not answer. The
+  likeliest culprit is the video BIOS call (`int 10h`) wakeup.S makes to set
+  the mode again, which can hang if the firmware left the graphics cold;
+  `s3_nomode`, `s3_bios` and `s3_beep` are there to find out. Until it works,
+  boot with `lid=ignore` so closing the lid does nothing.
+- **The Radeon driver on Llano APUs (HD 6520G and kin) is partial:** page
+  flipping and the hardware pointer only, in the boot loader's mode. Native
+  modes come next: the panel on these machines is DisplayPort (eDP, or LVDS
+  behind a NUTMEG bridge), so they need DisplayPort link training over the AUX
+  channel. `radeon_modeset_probe()` logs what the video BIOS says the outputs
+  are (`dmesg | grep radeon`). After that, 3D: Sumo's own microcode
+  (SUMO_pfp, SUMO_me, SUMO_rlc) and Evergreen's shader instruction set.
 
 ## Limitations
 

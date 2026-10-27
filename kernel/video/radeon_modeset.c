@@ -513,11 +513,20 @@ static void i2c_scl(const struct gpio_i2c *b, int v) { setbits(b->en_clk, b->en_
 static void i2c_sda(const struct gpio_i2c *b, int v) { setbits(b->en_data, b->en_data_m, !v); udelay(5); }
 static int i2c_get_sda(const struct gpio_i2c *b) { return (rd(b->y_data) & b->y_data_m) != 0; }
 
+/* The clock line stayed low: nothing pulls it up (no monitor, or the
+ * output's DDC is not on these pins). Everything after gives up at once
+ * rather than waiting out every bit. */
+static int i2c_stuck;
+
 static void i2c_scl_high(const struct gpio_i2c *b)
 {
     i2c_scl(b, 1);
+    if (i2c_stuck)
+        return;
     for (int i = 0; i < 1000 && !(rd(b->y_clk) & b->y_clk_m); i++)
         udelay(10);                 /* the monitor holds the clock low */
+    if (!(rd(b->y_clk) & b->y_clk_m))
+        i2c_stuck = 1;
 }
 
 static void i2c_start(const struct gpio_i2c *b)
@@ -582,7 +591,8 @@ static int read_edid(void)
     setbits(b.mask_data, b.mask_data_m, 1);
 
     int ok = 0;
-    for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+    i2c_stuck = 0;
+    for (int attempt = 0; attempt < 3 && !ok && !i2c_stuck; attempt++) {
         i2c_start(&b);
         if (i2c_write(&b, 0xA0) && i2c_write(&b, 0)) {      /* EEPROM 0x50, offset 0 */
             i2c_start(&b);
@@ -597,6 +607,8 @@ static int read_edid(void)
         }
         i2c_stop(&b);
     }
+    if (i2c_stuck)
+        klog("radeon: DDC line %02x: the clock stays low; no EDID there\n", out.i2c_id);
     /* post_xfer: the GPIO back to the hardware */
     setbits(b.mask_clk, b.mask_clk_m, 0);
     setbits(b.mask_data, b.mask_data_m, 0);
