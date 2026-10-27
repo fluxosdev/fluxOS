@@ -136,6 +136,11 @@ stops at boot and says why.
     `LICENSE.radeon`) over PM4 command buffers. A GART lets the GPU copy the
     desktop's back buffer to the screen. Options: `video=1920x1080x32@60`,
     `radeon.modeset=0`, `radeon.accel=0`, `radeon.gart=0`, `radeon=off`.
+  - **AMD Radeon HD 6000 graphics of the Llano APUs** (Sumo: HD 6520G, 6480G,
+    6550D, 6620G and the rest of 0x9640-0x964F): Evergreen's display
+    controllers, with page flipping and the hardware pointer in the boot
+    loader's mode, over the memory the BIOS shares with them. Native modes and
+    3D are not there yet for these.
 - Sound:
   - PC speaker (`/dev/speaker`) with background tone queue.
   - **Sound Blaster 16**: `/dev/dsp` (OSS-style, 8/16-bit, mono/stereo, 5-44.1
@@ -763,8 +768,9 @@ cannot be used.
 
 - **IDE:** DMA needs a legacy-mode PCI controller with bus mastering and a
   drive the firmware put in a DMA mode; anything else uses PIO.
-- **Suspend to RAM:** not with the Radeon or Voodoo drivers (they cannot set
-  their cards up again: boot with `radeon=off`), nor with a USB disk mounted
+- **Suspend to RAM:** not with the Voodoo driver, nor with the Radeon driver's
+  own modes or 3D engine (they cannot set the card up again: `radeon.modeset=0
+  radeon.accel=0`; the Llano driver keeps to the BIOS mode, so it can), nor with a USB disk mounted
   (USB devices are let go of and found again). The screen comes back only
   where the VESA BIOS can set its mode again on waking (`s3_bios` helps some
   machines). No hibernation (S4), no processor frequency scaling, and

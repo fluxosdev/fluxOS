@@ -67,6 +67,8 @@ int radeon_unmapbuf(const struct dispbuf *b);
 int radeon_map3d_user(struct disp3d *d);
 int radeon_submit_user(const struct dispsubmit *s);
 void radeon_proc_exit(int pid);         /* its buffers and the 3D engine */
+int radeon_can_resume(void);            /* suspend to RAM: in the BIOS mode, without the 3D engine */
+void radeon_resume(void);               /* the page and the pointer, after waking */
 /* Are any of pid's pages in [start, end) lent to the GPU (DISP_MAPBUF)? */
 int radeon_pinned(int pid, uint32_t start, uint32_t end);
 

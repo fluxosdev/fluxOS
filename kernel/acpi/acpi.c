@@ -18,9 +18,11 @@
  * "acpi=off" leaves ACPI alone altogether (no power-off, one processor).
  */
 #include <string.h>
+#include <uacpi/acpi.h>
 #include <uacpi/uacpi.h>
 #include <uacpi/event.h>
 #include <uacpi/sleep.h>
+#include <uacpi/tables.h>
 #include <uacpi/utilities.h>
 #include "kernel.h"
 #include "acpi.h"
@@ -340,6 +342,7 @@ void acpi_namespace_init(void)
         return;
     }
     uacpi_set_interrupt_model(UACPI_INTERRUPT_MODEL_PIC);
+    power_early();
     ec_init();
     st = uacpi_namespace_initialize();
     if (uacpi_unlikely_error(st)) {
@@ -430,10 +433,17 @@ void acpi_power_start(void)
 {
     if (acpi_aml) {
         osl_start();
-        if (uacpi_install_fixed_event_handler(UACPI_FIXED_EVENT_POWER_BUTTON, fixed_power, NULL) ==
+        /* The FADT says which buttons are fixed ones; the others are
+         * devices (PNP0C0C, PNP0C0E) that power.c hears through Notify(). */
+        struct acpi_fadt *fadt;
+        uint32_t fflags = uacpi_table_fadt(&fadt) == UACPI_STATUS_OK ? fadt->flags
+                                                                      : ACPI_PWR_BUTTON | ACPI_SLP_BUTTON;
+        if (!(fflags & ACPI_PWR_BUTTON) &&
+            uacpi_install_fixed_event_handler(UACPI_FIXED_EVENT_POWER_BUTTON, fixed_power, NULL) ==
             UACPI_STATUS_OK)
             fixed_buttons |= 1;
-        if (uacpi_install_fixed_event_handler(UACPI_FIXED_EVENT_SLEEP_BUTTON, fixed_sleep, NULL) ==
+        if (!(fflags & ACPI_SLP_BUTTON) &&
+            uacpi_install_fixed_event_handler(UACPI_FIXED_EVENT_SLEEP_BUTTON, fixed_sleep, NULL) ==
             UACPI_STATUS_OK)
             fixed_buttons |= 2;
         uacpi_finalize_gpe_initialization();

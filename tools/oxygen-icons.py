@@ -30,6 +30,11 @@ ICONS = {
     "applications-graphics": None, "utilities-file-archiver": None,
     "utilities-system-monitor": None, "edit-bomb": None, "clock": None,
     "preferences-system-time": None,
+    "battery-caution": None, "battery-low": None, "battery-040": None,
+    "battery-060": None, "battery-080": None, "battery-100": None,
+    "battery-charging-caution": None, "battery-charging-low": None,
+    "battery-charging-040": None, "battery-charging-060": None,
+    "battery-charging-080": None, "battery-charging": None, "battery-missing": None,
 }
 SIZES = (16, 32, 48)
 OUT = "rootfs/usr/share/icons/oxygen"

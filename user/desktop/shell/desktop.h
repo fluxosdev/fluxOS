@@ -100,6 +100,20 @@ enum icon_id {
     ICON_DATETIME,
     ICON_ARCHIVE,
     ICON_PAINT,
+    /* the battery in the tray: its charge, on battery and charging */
+    ICON_BATTERY_CAUTION,
+    ICON_BATTERY_LOW,
+    ICON_BATTERY_40,
+    ICON_BATTERY_60,
+    ICON_BATTERY_80,
+    ICON_BATTERY_100,
+    ICON_CHARGING_CAUTION,
+    ICON_CHARGING_LOW,
+    ICON_CHARGING_40,
+    ICON_CHARGING_60,
+    ICON_CHARGING_80,
+    ICON_CHARGING_100,
+    ICON_BATTERY_MISSING,
     ICON_COUNT,
 };
 
@@ -338,7 +352,7 @@ void power_init(void);
 void power_tick(void);                  /* once a second */
 void power_event(const struct input_event *ev);
 int power_tray_present(void);           /* the machine has a battery */
-void power_draw_tray(struct surface *s, struct rect r, color_t fg);    /* r: 16 x 16 */
+enum icon_id power_tray_icon(void);     /* the battery's charge, for the tray */
 void power_battery_text(char *out, size_t size);
 const struct powerinfo *power_info(void);       /* NULL if the kernel did not answer */
 void system_sleep(void);                /* suspend to RAM, and back */

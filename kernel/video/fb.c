@@ -472,11 +472,12 @@ static int display_op(int op, void *arg)
 /*
  * The VESA mode to set again when the machine wakes (the BIOS forgets
  * it), 0 for text mode, or -1 if the screen is a driver's and only that
- * driver could set it up again.
+ * driver could set it up again (the Radeon driver can while it keeps to
+ * the BIOS mode without its 3D engine).
  */
 int fb_wake_mode(void)
 {
-    if (voodoo_present() || radeon_present())
+    if (voodoo_present() || (radeon_present() && !radeon_can_resume()))
         return -1;
     if (!fb.base)
         return 0;
@@ -492,6 +493,8 @@ void fb_suspend(void)
 
 void fb_resume(void)
 {
+    if (radeon_present())
+        radeon_resume();
     mutex_unlock(&display_mutex);
     if (fb_console_active())
         vga_redraw();                   /* the console's text, if the screen is its */

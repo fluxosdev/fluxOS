@@ -78,7 +78,7 @@ const char *acpi_sleep_blocker(void)
     if (!sleep_supported())
         return "the firmware has no S3 sleep state";
     if (fb_wake_mode() < 0)
-        return radeon_present() ? "not with the Radeon driver (boot with radeon=off)"
+        return radeon_present() ? "the Radeon driver's own mode or 3D is in use"
                                 : "not with the 3dfx driver (boot with voodoo=off)";
     if (usbmsc_in_use())
         return "a USB disk is in use: unmount it first";

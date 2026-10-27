@@ -643,7 +643,7 @@ void shutdown_open(void)
 /* ---- Power ---- */
 
 enum { PW_SOURCE, PW_BATTERY, PW_LID, PW_TEMP, PW_BRIGHT, PW_LINES };
-static int power_line[PW_LINES];
+static int power_line[PW_LINES], power_icon_ctl;
 
 static void power_fill(struct dialog *d)
 {
@@ -656,6 +656,8 @@ static void power_fill(struct dialog *d)
     }
     if (!pi)
         return;
+    if (power_tray_present())
+        d->ctl[power_icon_ctl].id = power_tray_icon();      /* the charge, as in the tray */
     if (pi->flags & PWR_AC_KNOWN)
         snprintf(t[PW_SOURCE], n, "Power source: %s", (pi->flags & PWR_AC_ONLINE) ? "AC adapter" : "battery");
     char b[64];
@@ -696,13 +698,15 @@ void power_open(void)
         return;
     }
     const struct powerinfo *pi = power_info();
-    struct dialog *d = dialog_new("Power", ICON_INFO, 380, 214, 0, &power_dlg);
+    enum icon_id icon = power_tray_present() ? power_tray_icon() : ICON_INFO;
+    struct dialog *d = dialog_new("Power", icon, 380, 214, 0, &power_dlg);
     if (!d)
         return;
     d->command = power_command;
     d->default_id = ID_OK;
     d->cancel_id = ID_OK;
-    add(d, CT_ICON, 14, 14, 32, 32, NULL, ICON_INFO);
+    power_icon_ctl = d->n;
+    add(d, CT_ICON, 14, 14, 32, 32, NULL, icon);
     add(d, CT_BOLD, 62, 14, 0, 0, "Power", 0);
     for (int i = 0; i < PW_LINES; i++) {
         power_line[i] = d->n;

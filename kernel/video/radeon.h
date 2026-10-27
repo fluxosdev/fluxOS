@@ -1,4 +1,4 @@
-/* The Radeon HD 4000 driver's state, shared by radeon.c and radeon_modeset.c. */
+/* The Radeon driver's state, shared by radeon.c, radeon_modeset.c and radeon_accel.c. */
 #ifndef RADEON_H
 #define RADEON_H
 
@@ -8,7 +8,14 @@
 
 #define VENDOR_ATI 0x1002
 
-enum radeon_family { CHIP_RV770, CHIP_RV730, CHIP_RV740, CHIP_RV710 };
+enum radeon_family {
+    CHIP_RV770, CHIP_RV730, CHIP_RV740, CHIP_RV710,
+    CHIP_SUMO, CHIP_SUMO2,                  /* Evergreen generation: the Llano APUs' graphics */
+};
+
+/* Evergreen's display controllers (DCE 4) moved their registers; native
+ * modes and the 3D engine (radeon_modeset.c, radeon_accel.c) are R700 only. */
+#define RADEON_EVERGREEN() (rv.family >= CHIP_SUMO)
 
 #define MM_INDEX       0x0000       /* registers past BAR2's 64 KiB, by index and data */
 #define MM_DATA        0x0004

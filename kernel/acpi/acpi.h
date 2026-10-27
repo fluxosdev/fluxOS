@@ -39,6 +39,7 @@ void ec_poll(void);                     /* an event whose GPE went unseen */
 void ec_resume(void);
 
 /* power.c */
+void power_early(void);                 /* hear every Notify(); before the namespace's _INIs */
 void power_init(void);                  /* find the devices; after the namespace */
 void power_start(void);                 /* the power thread */
 void power_fixed_button(int sleep);     /* the fixed power (0) or sleep (1) button; IRQ context */

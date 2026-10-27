@@ -298,6 +298,19 @@ static const char *const icon_names[ICON_COUNT] = {
     [ICON_MINES] = "edit-bomb",
     [ICON_CLOCK] = "clock",
     [ICON_DATETIME] = "preferences-system-time",
+    [ICON_BATTERY_CAUTION] = "battery-caution",
+    [ICON_BATTERY_LOW] = "battery-low",
+    [ICON_BATTERY_40] = "battery-040",
+    [ICON_BATTERY_60] = "battery-060",
+    [ICON_BATTERY_80] = "battery-080",
+    [ICON_BATTERY_100] = "battery-100",
+    [ICON_CHARGING_CAUTION] = "battery-charging-caution",
+    [ICON_CHARGING_LOW] = "battery-charging-low",
+    [ICON_CHARGING_40] = "battery-charging-040",
+    [ICON_CHARGING_60] = "battery-charging-060",
+    [ICON_CHARGING_80] = "battery-charging-080",
+    [ICON_CHARGING_100] = "battery-charging",
+    [ICON_BATTERY_MISSING] = "battery-missing",
 };
 
 static const int icon_sizes[] = { 16, 24, 32, 48 };

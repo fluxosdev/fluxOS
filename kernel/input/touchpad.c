@@ -56,7 +56,7 @@
 #define EXT_CLICKPAD(e)     ((e) & (1u << 20) || (e) & (1u << 8))
 #define EXT_MAX_COORDS(e)   ((e) & (1u << 17))
 #define EXT_MIN_COORDS(e)   ((e) & (1u << 13))
-#define MODEL_NEWABS(m)     ((m) & (1u << 17))
+#define MODEL_NEWABS(m)     ((m) & (1u << 7))
 
 /* The gestures, in the pad's units: about 55 to the millimetre on most. */
 #define Z_TOUCH      30                 /* pressure that is a finger */
@@ -215,6 +215,9 @@ static int synaptics_probe(void)
             tp.ymin = y;
         }
     }
+    klog("touchpad: Synaptics identity %02x%02x%02x, caps %06x, model %06x, ext %06x, "
+         "x %d-%d, y %d-%d, %d units/mm\n", minor, 0x47, major, tp.caps, tp.model, tp.ext,
+         tp.xmin, tp.xmax, tp.ymin, tp.ymax, tp.xres);
     tp.clickpad = EXT_CLICKPAD(tp.ext) != 0;
     tp.passthrough = CAP_PASSTHROUGH(tp.caps) != 0;
     snprintf(tp.name, sizeof(tp.name), "Synaptics %d.%d%s%s%s", major, minor,

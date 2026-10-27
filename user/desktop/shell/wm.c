@@ -1255,8 +1255,10 @@ static void draw_taskbar_kinetik(void)
         struct rect ir = tray_icon_rect();
         draw_icon(&screen, ir.x, ir.y, speaker, 16);
     }
-    if (power_tray_present())
-        power_draw_tray(&screen, battery_icon_rect(), theme.on_chrome);
+    if (power_tray_present()) {
+        struct rect br = battery_icon_rect();
+        draw_icon(&screen, br.x, br.y, power_tray_icon(), 16);
+    }
     int cw = gfx_text_width(&font_sans, clock_text);
     gfx_text(&screen, &font_sans, tr.x + tr.w - 9 - cw, tr.y + (tr.h - font_sans.height) / 2, clock_text,
              theme.on_chrome);
@@ -1423,8 +1425,10 @@ static void draw_taskbar(void)
         struct rect ir = tray_icon_rect();
         draw_icon(&screen, ir.x, ir.y, speaker, 16);
     }
-    if (power_tray_present())
-        power_draw_tray(&screen, battery_icon_rect(), C_BLACK);
+    if (power_tray_present()) {
+        struct rect br = battery_icon_rect();
+        draw_icon(&screen, br.x, br.y, power_tray_icon(), 16);
+    }
     int cw = gfx_text_width(&font_sans, clock_text);
     gfx_text(&screen, &font_sans, tr.x + tr.w - 9 - cw, tr.y + 4, clock_text, C_BLACK);
 }

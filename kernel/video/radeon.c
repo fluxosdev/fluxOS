@@ -1,6 +1,11 @@
 /*
  * ATI Radeon HD 4000 display driver: the R700 chips (RV770 and RV790 in
- * the HD 4800s, RV740, RV730 and RV710 below them).
+ * the HD 4800s, RV740, RV730 and RV710 below them). Also the Radeon HD
+ * 6000 graphics of AMD's Llano APUs (Sumo, such as the HD 6520G), an
+ * Evergreen-generation design whose display controllers (DCE 4.1) are
+ * the same in kind with their registers elsewhere; on those, for now,
+ * the boot loader's mode with page flipping and the hardware pointer
+ * (native modes and the 3D engine are the R700's code).
  *
  * The card comes up in the mode its VESA BIOS set for the boot loader.
  * The driver:
@@ -18,13 +23,15 @@
  *    the two pages (DISP_COPYRECTS) once it passes a self-test
  *    (radeon_accel.c).
  *
- * BAR0 is the video memory aperture (its first 256 MiB, usually), BAR2
- * holds 64 KiB of memory-mapped registers and BAR4 the I/O ports. The
- * display controllers are the AVIVO ones of the R500 and R600, D1 and D2,
- * with D2's registers 0x800 above D1's. They address video memory in the
- * memory controller's 40-bit address space; where the aperture starts
- * there follows from the address the BIOS mode scans out from. Register
- * names follow Linux's radeon driver (avivod.h, rv770d.h).
+ * BAR0 is the video memory aperture (its first 256 MiB, usually; on an
+ * APU, the system memory the BIOS set aside for graphics), BAR2 holds the
+ * memory-mapped registers and BAR4 the I/O ports. The display controllers
+ * are the AVIVO ones of the R500 and R600, D1 and D2, with D2's registers
+ * 0x800 above D1's; Evergreen's two are 0xC00 apart, from 0x6800. They
+ * address video memory in the memory controller's 40-bit address space;
+ * where the aperture starts there follows from the address the BIOS mode
+ * scans out from. Register names follow Linux's radeon driver (avivod.h,
+ * rv770d.h, evergreen_reg.h).
  */
 #include "kernel.h"
 #include "drivers.h"
@@ -36,20 +43,46 @@
 /* Registers, as offsets into BAR2 */
 #define CONFIG_MEMSIZE 0x5428       /* video memory, in bytes */
 
-#define DCUR_CONTROL   0x6400
 #define DCURSOR_EN     (1u << 0)
 #define DCURSOR_ARGB   (2u << 8)    /* 32 bits, premultiplied alpha */
-#define DCUR_SURFACE_ADDRESS 0x6408
-#define DCUR_SIZE      0x6410
-#define DCUR_POSITION  0x6414
-#define DCUR_HOT_SPOT  0x6418
-#define DCUR_UPDATE    0x6424
+#define DCURSOR_URGENT_HALF (4u << 24)      /* Evergreen: fetch when half used */
 #define DCURSOR_UPDATE_LOCK (1u << 16)
 
-/* Bits 32-39 of the addresses, new in the R700 and not at D1 + 0x800. */
-static const uint32_t grph_primary_high[2] = { 0x6914, 0x6114 };
-static const uint32_t grph_secondary_high[2] = { 0x691C, 0x611C };
-static const uint32_t cur_surface_high[2] = { 0x6C0C, 0x640C };
+/* Where each generation keeps the display controllers' registers: D1's
+ * (or CRTC0's) address, the second's `stride` above. The high bits of
+ * the addresses are not at a stride on the R700, so they are listed. */
+struct dc_regs {
+    uint32_t stride;
+    uint32_t crtc_control, grph_enable, grph_pitch;
+    uint32_t primary, secondary, update, flip_control;
+    uint32_t primary_high[2], secondary_high[2];
+    uint32_t cur_control, cur_surface, cur_size, cur_position, cur_hot_spot, cur_update;
+    uint32_t cur_surface_high[2];
+    uint32_t cur_mode;              /* CUR_CONTROL's bits for the 64x64 ARGB pointer */
+};
+
+static const struct dc_regs avivo_regs = {
+    .stride = CRTC_STRIDE,
+    .crtc_control = DCRTC_CONTROL, .grph_enable = DGRPH_ENABLE, .grph_pitch = DGRPH_PITCH,
+    .primary = DGRPH_PRIMARY_SURFACE_ADDRESS, .secondary = DGRPH_SECONDARY_SURFACE_ADDRESS,
+    .update = DGRPH_UPDATE, .flip_control = DGRPH_FLIP_CONTROL,
+    .primary_high = { 0x6914, 0x6114 }, .secondary_high = { 0x691C, 0x611C },
+    .cur_control = 0x6400, .cur_surface = 0x6408, .cur_size = 0x6410, .cur_position = 0x6414,
+    .cur_hot_spot = 0x6418, .cur_update = 0x6424, .cur_surface_high = { 0x6C0C, 0x640C },
+    .cur_mode = DCURSOR_ARGB,
+};
+
+static const struct dc_regs evergreen_regs = {
+    .stride = 0xC00,
+    .crtc_control = 0x6E70, .grph_enable = 0x6800, .grph_pitch = 0x6818,
+    .primary = 0x6810, .secondary = 0x6814, .update = 0x6844, .flip_control = 0x6848,
+    .primary_high = { 0x681C, 0x681C + 0xC00 }, .secondary_high = { 0x6820, 0x6820 + 0xC00 },
+    .cur_control = 0x6998, .cur_surface = 0x699C, .cur_size = 0x69A0, .cur_position = 0x69A8,
+    .cur_hot_spot = 0x69AC, .cur_update = 0x69B8, .cur_surface_high = { 0x69A4, 0x69A4 + 0xC00 },
+    .cur_mode = DCURSOR_ARGB | DCURSOR_URGENT_HALF,
+};
+
+static const struct dc_regs *dc = &avivo_regs;
 
 /* Named cards first, then each chip's whole range of device IDs. */
 static const struct chip {
@@ -65,10 +98,17 @@ static const struct chip {
     { 0x9498, 0x9498, CHIP_RV730, "ATI Radeon HD 4650" },
     { 0x94B3, 0x94B3, CHIP_RV740, "ATI Radeon HD 4770" },
     { 0x954F, 0x954F, CHIP_RV710, "ATI Radeon HD 4350" },
+    { 0x9640, 0x9640, CHIP_SUMO, "AMD Radeon HD 6550D" },
+    { 0x9641, 0x9641, CHIP_SUMO, "AMD Radeon HD 6620G" },
+    { 0x9647, 0x9647, CHIP_SUMO, "AMD Radeon HD 6520G" },
+    { 0x9648, 0x9648, CHIP_SUMO, "AMD Radeon HD 6480G" },
     { 0x9440, 0x947B, CHIP_RV770, "ATI Radeon HD 4800 Series" },        /* RV770, RV790 */
     { 0x9480, 0x949F, CHIP_RV730, "ATI Radeon HD 4600 Series" },
     { 0x94A0, 0x94B9, CHIP_RV740, "ATI Radeon HD 4700 Series" },
     { 0x9540, 0x9557, CHIP_RV710, "ATI Radeon HD 4300/4500 Series" },
+    { 0x9642, 0x9645, CHIP_SUMO2, "AMD Radeon HD 6300/6400 Series" },  /* Llano, two SIMDs fewer */
+    { 0x9649, 0x9649, CHIP_SUMO2, "AMD Radeon HD 6480G" },
+    { 0x9640, 0x964F, CHIP_SUMO, "AMD Radeon HD 6000 Series (Llano)" },
 };
 
 struct radeon rv;
@@ -115,14 +155,14 @@ static void find_crtcs(void)
     rv.page0 = fb_boot.phys - rv.aper_phys;
     uint64_t surface = 0;
     for (int c = 0; c < 2; c++) {
-        uint32_t off = (uint32_t)c * CRTC_STRIDE;
-        if (!(rd(DCRTC_CONTROL + off) & DCRTC_EN) || !(rd(DGRPH_ENABLE + off) & 1) ||
+        uint32_t off = (uint32_t)c * dc->stride;
+        if (!(rd(dc->crtc_control + off) & DCRTC_EN) || !(rd(dc->grph_enable + off) & 1) ||
             (rd(c ? D2VGA_CONTROL : D1VGA_CONTROL) & DVGA_MODE_ENABLE))
             continue;
-        if ((rd(DGRPH_PITCH + off) & 0x3FFF) != fb_boot.pitch / fb_boot.bytespp)
+        if ((rd(dc->grph_pitch + off) & 0x3FFF) != fb_boot.pitch / fb_boot.bytespp)
             continue;               /* showing something else */
-        uint64_t s = (uint64_t)(rd(grph_primary_high[c]) & 0xFF) << 32 |
-                     (rd(DGRPH_PRIMARY_SURFACE_ADDRESS + off) & ~0xFFu);
+        uint64_t s = (uint64_t)(rd(dc->primary_high[c]) & 0xFF) << 32 |
+                     (rd(dc->primary + off) & ~0xFFu);
         if (rv.crtcs && s != surface)
             continue;
         surface = s;
@@ -154,7 +194,7 @@ static void plan_vram(void)
 static int flip_pending(void)
 {
     FOR_EACH_CRTC(c)
-        if (rd(DGRPH_UPDATE + (uint32_t)c * CRTC_STRIDE) & DGRPH_SURFACE_UPDATE_PENDING)
+        if (rd(dc->update + (uint32_t)c * dc->stride) & DGRPH_SURFACE_UPDATE_PENDING)
             return 1;
     return 0;
 }
@@ -165,18 +205,18 @@ void radeon_show_page(int page)
     uint64_t addr = rv.mc_base + rv.page0 + (uint32_t)page * rv.page_size;
     uint32_t lo = (uint32_t)addr, hi = (uint32_t)(addr >> 32) & 0xFF;
     FOR_EACH_CRTC(c) {
-        uint32_t off = (uint32_t)c * CRTC_STRIDE;
-        uint32_t update = rd(DGRPH_UPDATE + off);
+        uint32_t off = (uint32_t)c * dc->stride;
+        uint32_t update = rd(dc->update + off);
         /* Locked, the controller cannot take half of the new address. */
-        wr(DGRPH_UPDATE + off, update | DGRPH_UPDATE_LOCK);
-        wr(DGRPH_FLIP_CONTROL + off, 0);
-        wr(grph_secondary_high[c], hi);
-        wr(grph_primary_high[c], hi);
-        wr(DGRPH_SECONDARY_SURFACE_ADDRESS + off, lo);
-        wr(DGRPH_PRIMARY_SURFACE_ADDRESS + off, lo);
-        for (int i = 0; i < 1000 && !(rd(DGRPH_UPDATE + off) & DGRPH_SURFACE_UPDATE_PENDING); i++)
+        wr(dc->update + off, update | DGRPH_UPDATE_LOCK);
+        wr(dc->flip_control + off, 0);
+        wr(dc->secondary_high[c], hi);
+        wr(dc->primary_high[c], hi);
+        wr(dc->secondary + off, lo);
+        wr(dc->primary + off, lo);
+        for (int i = 0; i < 1000 && !(rd(dc->update + off) & DGRPH_SURFACE_UPDATE_PENDING); i++)
             udelay(1);
-        wr(DGRPH_UPDATE + off, update & ~DGRPH_UPDATE_LOCK);
+        wr(dc->update + off, update & ~DGRPH_UPDATE_LOCK);
     }
     rv.page = page;
 }
@@ -206,9 +246,9 @@ int radeon_flip(int page)
 static void lock_cursor(int lock)
 {
     FOR_EACH_CRTC(c) {
-        uint32_t off = (uint32_t)c * CRTC_STRIDE;
-        uint32_t v = rd(DCUR_UPDATE + off);
-        wr(DCUR_UPDATE + off, lock ? v | DCURSOR_UPDATE_LOCK : v & ~DCURSOR_UPDATE_LOCK);
+        uint32_t off = (uint32_t)c * dc->stride;
+        uint32_t v = rd(dc->cur_update + off);
+        wr(dc->cur_update + off, lock ? v | DCURSOR_UPDATE_LOCK : v & ~DCURSOR_UPDATE_LOCK);
     }
 }
 
@@ -242,11 +282,11 @@ static void place_cursor(void)
             show = 0;
     }
     FOR_EACH_CRTC(c) {
-        uint32_t off = (uint32_t)c * CRTC_STRIDE;
-        wr(DCUR_CONTROL + off, show ? DCURSOR_EN | DCURSOR_ARGB : 0);
-        wr(DCUR_POSITION + off, (uint32_t)x << 16 | (uint32_t)y);
-        wr(DCUR_HOT_SPOT + off, (uint32_t)xorigin << 16 | (uint32_t)yorigin);
-        wr(DCUR_SIZE + off, (uint32_t)(w - 1) << 16 | (uint32_t)(h - 1));
+        uint32_t off = (uint32_t)c * dc->stride;
+        wr(dc->cur_control + off, show ? DCURSOR_EN | dc->cur_mode : dc->cur_mode);
+        wr(dc->cur_position + off, (uint32_t)x << 16 | (uint32_t)y);
+        wr(dc->cur_hot_spot + off, (uint32_t)xorigin << 16 | (uint32_t)yorigin);
+        wr(dc->cur_size + off, (uint32_t)(w - 1) << 16 | (uint32_t)(h - 1));
     }
 }
 
@@ -254,8 +294,8 @@ static void point_cursor(void)
 {
     uint64_t addr = rv.mc_base + CURSOR_VRAM_OFF + (uint32_t)rv.cursor_slot * CUR_BYTES;
     FOR_EACH_CRTC(c) {
-        wr(cur_surface_high[c], (uint32_t)(addr >> 32) & 0xFF);
-        wr(DCUR_SURFACE_ADDRESS + (uint32_t)c * CRTC_STRIDE, (uint32_t)addr);
+        wr(dc->cur_surface_high[c], (uint32_t)(addr >> 32) & 0xFF);
+        wr(dc->cur_surface + (uint32_t)c * dc->stride, (uint32_t)addr);
     }
 }
 
@@ -439,7 +479,9 @@ void radeon_init(void)
         return;
     rv.name = chip->name;
     rv.family = chip->family;
-    rv.vram_size = rd(CONFIG_MEMSIZE);
+    if (RADEON_EVERGREEN())
+        dc = &evergreen_regs;
+    rv.vram_size = rd(CONFIG_MEMSIZE);  /* in bytes on these, the APUs too (MiB on later Evergreens) */
     if (rv.vram_size < (64u << 20))
         rv.vram_size = rv.aper_size;        /* not a size the card could have */
     if (fb_boot.base) {
@@ -451,8 +493,9 @@ void radeon_init(void)
     find_crtcs();
     plan_vram();
     rv.present = 1;
-    boot_ok("%s: %u MiB video memory, registers at %08x%s", rv.name, rv.vram_size >> 20,
-            reg_phys, rv.flip ? ", page flipping and hardware pointer" : "");
+    boot_ok("%s: %u MiB %s memory, registers at %08x%s", rv.name, rv.vram_size >> 20,
+            RADEON_EVERGREEN() ? "shared" : "video", reg_phys,
+            rv.flip ? ", page flipping and hardware pointer" : "");
     if (fb_boot.base && !rv.crtcs)
         kprintf("radeon: cannot tell which display controller shows the screen\n");
 }
@@ -463,6 +506,29 @@ void radeon_late_init(void)
 {
     if (!rv.present)
         return;
+    if (RADEON_EVERGREEN()) {
+        boot_ok("%s: the boot loader's mode (native modes and 3D not yet for this chip)", rv.name);
+        return;
+    }
     radeon_modeset_init();
     radeon_accel_init();
+}
+
+/* ---- suspend to RAM ---- */
+
+/* The video BIOS sets the boot loader's mode again on waking (wakeup.S),
+ * which is all there is to set up while that mode is in use and the 3D
+ * engine is not: then the page and the pointer go back. */
+int radeon_can_resume(void)
+{
+    return !rv.native && !rv.accel;
+}
+
+void radeon_resume(void)
+{
+    if (!rv.present || !radeon_can_resume())
+        return;
+    if (rv.flip)
+        radeon_show_page(rv.page);
+    radeon_cursor_reload();
 }

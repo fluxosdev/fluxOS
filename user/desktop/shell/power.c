@@ -2,7 +2,7 @@
  * Power on the desktop: the battery in the taskbar's tray, the kernel's
  * news about power (IEV_POWER events), and sleep.
  *
- * The battery icon shows the charge, red when it runs low, with a bolt
+ * The battery icon (Oxygen's) shows the charge in six steps, with a bolt
  * while the AC adapter is in; clicking it opens the Power dialog
  * (apps.c). Closing the lid, the sleep button or the Shut Down dialog's
  * Sleep suspend the machine; once it is back everything is drawn again,
@@ -59,28 +59,16 @@ static const struct battery_info *battery(void)
     return NULL;
 }
 
-/* A battery on its side in the 16 x 16 at r: the charge filled in. */
-void power_draw_tray(struct surface *s, struct rect r, color_t fg)
+/* The charge in KDE's steps: under 10% caution, under 30% low, then
+ * 40, 60, 80 and full; the charging set while the AC adapter is in. */
+enum icon_id power_tray_icon(void)
 {
-    int x = r.x, y = r.y;
-    gfx_frame(s, x, y + 4, 14, 9, fg);
-    gfx_fill(s, x + 14, y + 6, 2, 5, fg);
     const struct battery_info *b = battery();
-    if (!b) {                           /* none in: a cross */
-        gfx_line(s, x + 4, y + 6, x + 9, y + 10, 1, 0xFF000000u | fg);
-        gfx_line(s, x + 9, y + 6, x + 4, y + 10, 1, 0xFF000000u | fg);
-        return;
-    }
-    int w = (b->percent * 12 + 50) / 100;
-    color_t c = b->percent <= 15 && !(pi.flags & PWR_AC_ONLINE) ? RGB(0xD8, 0x30, 0x28) : RGB(0x3C, 0xA8, 0x3C);
-    if (w > 0)
-        gfx_fill(s, x + 1, y + 5, w, 7, c);
-    if (pi.flags & PWR_AC_ONLINE) {     /* a bolt across it */
-        color_t bolt = 0xFF000000u | RGB(0xFF, 0xD8, 0x30);
-        gfx_line(s, x + 8, y + 2, x + 5, y + 8, 2, bolt);
-        gfx_line(s, x + 5, y + 8, x + 9, y + 8, 2, bolt);
-        gfx_line(s, x + 9, y + 8, x + 6, y + 14, 2, bolt);
-    }
+    if (!b)
+        return ICON_BATTERY_MISSING;
+    int step = b->percent < 10 ? 0 : b->percent < 30 ? 1 : b->percent < 50 ? 2
+             : b->percent < 70 ? 3 : b->percent < 90 ? 4 : 5;
+    return (enum icon_id)((pi.flags & PWR_AC_ONLINE ? ICON_CHARGING_CAUTION : ICON_BATTERY_CAUTION) + step);
 }
 
 /* "73%, 2:15 left" and the like, for the Power dialog. */

@@ -35,6 +35,7 @@
 #define MAX_ACS    2
 #define MAX_LEVELS 32
 #define MAX_WAKERS 4
+#define MAX_ZONES  4
 
 #define UNKNOWN 0xFFFFFFFFu
 
@@ -50,13 +51,14 @@ static struct {
     struct battery bat[MAX_BATTERIES];
     int nbat;
     uacpi_namespace_node *lid;
-    uacpi_namespace_node *thermal;
+    uacpi_namespace_node *zones[MAX_ZONES];     /* thermal zones with a _TMP */
+    int nzones;
     uacpi_namespace_node *backlight;    /* the output device with _BCM */
     int has_bqc;
     uint8_t levels[MAX_LEVELS];         /* _BCL's levels, ascending */
     int nlevels;
     int level;                          /* the last one set or read */
-    int crit_high;                      /* readings over _CRT in a row */
+    int crit_high[MAX_ZONES];           /* readings over _CRT in a row */
     struct {                            /* devices that can wake the machine: their _PRW GPEs */
         uacpi_namespace_node *dev;
         uint16_t gpe;
@@ -70,7 +72,7 @@ static spinlock_t info_lock = SPINLOCK_INIT("power");
 
 /* Kept by the notify handlers and the interrupts, for kpwrd. */
 static volatile uint32_t power_presses, sleep_presses;
-static volatile int status_dirty, lid_dirty, bright_note;
+static volatile int status_dirty, lid_dirty, bright_note, thermal_dirty;
 static volatile uint32_t resumed_at;    /* ticks; buttons just after are the wake's own */
 static int pwr_chan;
 static struct mutex backlight_mutex = MUTEX_INIT("backlight");
@@ -210,10 +212,10 @@ int power_lid_closed(void)
 }
 
 /* Tenths of a degree Celsius from tenths of a kelvin. */
-static int read_temp(const char *what, int32_t *out)
+static int read_temp(uacpi_namespace_node *zone, const char *what, int32_t *out)
 {
     uint64_t v;
-    if (!pw.thermal || acpi_eval_int(pw.thermal, what, &v) < 0 || v < 2000 || v > 5000)
+    if (acpi_eval_int(zone, what, &v) < 0 || v < 2000 || v > 5000)
         return -1;                      /* nothing sensible: below -73 or above 226 C */
     *out = (int32_t)v - 2732;
     return 0;
@@ -398,6 +400,26 @@ static uacpi_status notify_video(uacpi_handle ctx, uacpi_namespace_node *node, u
     return UACPI_STATUS_OK;
 }
 
+/* Every Notify() comes here too (installed on the root): thermal zones,
+ * which tell of a new temperature or new trip points, and anything sent
+ * before power_init() has its handlers in (read then anyway). */
+static uacpi_status notify_any(uacpi_handle ctx, uacpi_namespace_node *node, uacpi_u64 value)
+{
+    (void)ctx;
+    (void)value;
+    uacpi_object_type type;
+    if (uacpi_namespace_node_type(node, &type) == UACPI_STATUS_OK && type == UACPI_OBJECT_THERMAL_ZONE) {
+        thermal_dirty = 1;
+        kick();
+    }
+    return UACPI_STATUS_OK;
+}
+
+void power_early(void)
+{
+    uacpi_install_notify_handler(uacpi_namespace_root(), notify_any, NULL);
+}
+
 void power_fixed_button(int sleep)
 {
     if (sleep)
@@ -513,10 +535,9 @@ static uacpi_iteration_decision found_thermal(void *user, uacpi_namespace_node *
     (void)user;
     (void)depth;
     uint64_t v;
-    if (acpi_eval_int(node, "_TMP", &v) < 0)
-        return UACPI_ITERATION_DECISION_CONTINUE;
-    pw.thermal = node;
-    return UACPI_ITERATION_DECISION_BREAK;
+    if (pw.nzones < MAX_ZONES && acpi_eval_int(node, "_TMP", &v) == 0)
+        pw.zones[pw.nzones++] = node;
+    return UACPI_ITERATION_DECISION_CONTINUE;
 }
 
 static int has_child(uacpi_namespace_node *node, const char *name)
@@ -565,7 +586,7 @@ void power_init(void)
     info.nbatteries = (uint8_t)pw.nbat;
     info.nlevels = (uint8_t)pw.nlevels;
     info.brightness = (uint8_t)pw.level;
-    if (pw.nac || pw.nbat || pw.lid || pw.backlight || pw.thermal) {
+    if (pw.nac || pw.nbat || pw.lid || pw.backlight || pw.nzones) {
         char path[64] = "";
         if (pw.backlight) {
             const char *p = uacpi_namespace_node_generate_absolute_path(pw.backlight);
@@ -574,9 +595,9 @@ void power_init(void)
                 uacpi_free_absolute_path(p);
             }
         }
-        boot_ok("ACPI power: %d AC adapter%s, %d batter%s%s%s%s%s", pw.nac, pw.nac == 1 ? "" : "s",
-                pw.nbat, pw.nbat == 1 ? "y" : "ies", pw.lid ? ", lid" : "", pw.thermal ? ", thermal zone" : "",
-                pw.backlight ? ", backlight " : "", path);
+        boot_ok("ACPI power: %d AC adapter%s, %d batter%s%s, %d thermal zone%s%s%s", pw.nac,
+                pw.nac == 1 ? "" : "s", pw.nbat, pw.nbat == 1 ? "y" : "ies", pw.lid ? ", lid" : "",
+                pw.nzones, pw.nzones == 1 ? "" : "s", pw.backlight ? ", backlight " : "", path);
     }
 }
 
@@ -643,30 +664,42 @@ static void refresh_status(void)
     }
 }
 
+/* Every zone; SYS_power reports the hottest. Twice in a row over a
+ * believable critical point: switch off, as the firmware's _CRT asks. */
 static void check_thermal(void)
 {
-    int32_t t, crit = 0;
-    if (read_temp("_TMP", &t) < 0)
+    int32_t hot = 0, hot_crit = 0;
+    int any = 0;
+    for (int i = 0; i < pw.nzones; i++) {
+        int32_t t, crit = 0;
+        if (read_temp(pw.zones[i], "_TMP", &t) < 0)
+            continue;
+        read_temp(pw.zones[i], "_CRT", &crit);
+        if (!any || t > hot) {
+            hot = t;
+            hot_crit = crit;
+        }
+        any = 1;
+        if (crit >= 400 && crit <= 1500 && t >= crit) {
+            if (++pw.crit_high[i] == 2) {
+                klog("power: thermal zone %d at %d.%d C, critical is %d.%d C\n", i, t / 10, t % 10,
+                     crit / 10, crit % 10);
+                if (input_grabbed())
+                    event(PEV_THERMAL_CRITICAL, t / 10);
+                else
+                    switch_off("critical temperature");
+            }
+        } else {
+            pw.crit_high[i] = 0;
+        }
+    }
+    if (!any)
         return;
-    read_temp("_CRT", &crit);
     spin_lock(&info_lock);
     info.flags |= PWR_THERMAL;
-    info.temp = t;
-    info.temp_crit = crit;
+    info.temp = hot;
+    info.temp_crit = hot_crit;
     spin_unlock(&info_lock);
-    /* Twice in a row over a believable critical point: switch off, as the
-     * firmware's _CRT asks of the OS. */
-    if (crit >= 400 && crit <= 1500 && t >= crit) {
-        if (++pw.crit_high == 2) {
-            klog("power: %d.%d C, critical is %d.%d C\n", t / 10, t % 10, crit / 10, crit % 10);
-            if (input_grabbed())
-                event(PEV_THERMAL_CRITICAL, t / 10);
-            else
-                switch_off("critical temperature");
-        }
-    } else {
-        pw.crit_high = 0;
-    }
 }
 
 static void check_lid(int report)
@@ -700,7 +733,7 @@ static void kpwrd(void)
     for (;;) {
         wait_event_timeout(&pwr_chan,
                            power_presses != seen_power || sleep_presses != seen_sleep || status_dirty ||
-                           lid_dirty || bright_note,
+                           lid_dirty || bright_note || thermal_dirty,
                            ticks + HZ);
         current->sig_pending = 0;
 
@@ -747,7 +780,8 @@ static void kpwrd(void)
             if (told)
                 event(PEV_STATUS, 0);
         }
-        if ((int32_t)(ticks - last_thermal) >= 10 * HZ) {
+        if (thermal_dirty || (int32_t)(ticks - last_thermal) >= 10 * HZ) {
+            thermal_dirty = 0;
             last_thermal = ticks;
             check_thermal();
         }
