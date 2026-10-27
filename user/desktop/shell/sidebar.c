@@ -161,8 +161,8 @@ static void place_cards(int w, int h)
 
 /* ---- colors ---- */
 
-/* Kinetik's body runs from the captions' middle color down to the darkest of the
- * wallpaper (White's is pale throughout, with dark text). */
+/* Kinetik's body runs from the captions' middle color down to a shade of it toward the
+ * wallpaper's darkest, not all the way (White's is pale throughout, with dark text). */
 static int light_body(void)
 {
     return theme.accent == ACCENT_WHITE;
@@ -225,7 +225,7 @@ static void paint_body(struct surface *s, int w, int h)
         static const int pos[2] = { 0, 256 };
         color_t body[2] = {
             ARGB(255, light_body() ? RGB(0xCB, 0xD6, 0xE3) : theme.chrome1),
-            ARGB(255, light_body() ? RGB(0xA6, 0xB5, 0xC7) : theme.wall0),
+            ARGB(255, light_body() ? RGB(0xA6, 0xB5, 0xC7) : gfx_mix(theme.chrome1, theme.wall0, 104)),
         };
         gfx_gradient(s, mkrect(0, 0, w, h), 0, 0, 2, body, pos);
         for (int i = 0; i < 6; i++)     /* light along the edge it shows the desktop */
