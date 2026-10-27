@@ -5,9 +5,11 @@
  * do the work (partition table, GRUB, FAT32, copying) and follows its
  * progress through a pipe.
  *
- * Pages: Welcome, Choose a Disk, Ready to Install, Installing, and
- * Complete (or Failed).
+ * Pages: Welcome, Choose a Disk, Name This Computer, Ready to Install,
+ * Installing, and Complete (or Failed). The name goes to fluxinstall -n,
+ * which writes it to the installed system's /etc/hostname.
  */
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <flux.h>
@@ -32,8 +34,9 @@
 #define INSTALLER   "/bin/fluxinstall"
 #define MIN_SECTORS (2048 + 67584)      /* fluxinstall's minimum: 34 MiB */
 #define STEPS       4                   /* fluxinstall prints [1/4] .. [4/4] */
+#define HOST_MAX    63                  /* a host name's longest */
 
-enum page { P_WELCOME, P_DISK, P_CONFIRM, P_INSTALL, P_DONE };
+enum page { P_WELCOME, P_DISK, P_NAME, P_CONFIRM, P_INSTALL, P_DONE };
 enum { B_BACK, B_NEXT, B_CANCEL, NBUTTONS };
 
 struct disk {
@@ -51,6 +54,8 @@ struct setup {
     int ndisks;
     int choice;                         /* selected disk, or -1 */
     int agreed;                         /* the "erase this disk" box */
+    char host[HOST_MAX + 1];            /* the computer's name, as typed */
+    int host_len, host_cur;
     int pressed, pressed_in;            /* button held with the mouse */
 
     /* the running installer */
@@ -139,6 +144,20 @@ static void find_disks(struct setup *s)
     }
 }
 
+/* RFC 1123: letters, digits and hyphens, no hyphen at either end. NULL if fine, else what is wrong. */
+static const char *hostname_problem(const char *h)
+{
+    size_t n = strlen(h);
+    if (n == 0)
+        return "Type a name for this computer.";
+    if (h[0] == '-' || h[n - 1] == '-')
+        return "The name cannot start or end with a hyphen.";
+    for (size_t i = 0; i < n; i++)
+        if (!isalnum((unsigned char)h[i]) && h[i] != '-')
+            return "Use only letters, digits and hyphens (no spaces).";
+    return NULL;
+}
+
 /* ---- layout ---- */
 
 static struct rect button_rect(int b)
@@ -161,6 +180,11 @@ static struct rect agree_rect(void)
     return mkrect(TEXT_X, 214, TEXT_W, 18);
 }
 
+static struct rect host_field(void)
+{
+    return mkrect(TEXT_X, 118, 200, 21);
+}
+
 static const char *button_label(struct setup *s, int b)
 {
     if (b == B_BACK)
@@ -181,6 +205,8 @@ static int button_enabled(struct setup *s, int b)
         return b == B_CANCEL || (b == B_NEXT && s->source[0]);
     case P_DISK:
         return b != B_NEXT || (s->choice >= 0 && !s->disks[s->choice].why_not);
+    case P_NAME:
+        return b != B_NEXT || !hostname_problem(s->host);
     case P_CONFIRM:
         return b != B_NEXT || s->agreed;
     case P_INSTALL:
@@ -294,6 +320,19 @@ static void paint(struct setup *s)
         gfx_text(sf, &font_sans, TEXT_X, BUTTONS_Y - 42, buf, C_SHADOW);
         break;
 
+    case P_NAME: {
+        y = title(sf, "Name This Computer");
+        y = gfx_text_wrap(sf, &font_sans, TEXT_X, y, TEXT_W,
+                          "Choose a name for this computer. It appears in the shell's prompt and "
+                          "can be changed later in /etc/hostname.", C_BLACK);
+        gfx_text(sf, &font_sans, TEXT_X, host_field().y - 18, "Computer name:", C_BLACK);
+        draw_text_field(sf, host_field(), s->host, s->host_cur, 1);
+        const char *why = hostname_problem(s->host);
+        gfx_text_wrap(sf, &font_sans, TEXT_X, host_field().y + 30, TEXT_W,
+                      why ? why : "Up to 63 letters, digits and hyphens.", why ? C_BLACK : C_SHADOW);
+        break;
+    }
+
     case P_CONFIRM:
         y = title(sf, "Ready to Install");
         draw_icon(sf, TEXT_X, y, ICON_WARNING, 32);
@@ -301,9 +340,10 @@ static void paint(struct setup *s)
         gfx_text_wrap(sf, &font_sans_bold, TEXT_X + 44, y + 1, TEXT_W - 44, buf, C_BLACK);
         snprintf(buf, sizeof(buf),
                  "Setup will create one FAT32 partition, /dev/%s1, install GRUB and make "
-                 "the disk bootable. Any volumes on this disk are unmounted first.\n\n"
+                 "the disk bootable, and name the computer %s. Any volumes on this disk are "
+                 "unmounted first.\n\n"
                  "Click Install to begin. This takes a moment and cannot be interrupted.",
-                 d->name);
+                 d->name, s->host);
         gfx_text_wrap(sf, &font_sans, TEXT_X, y + 48, TEXT_W, buf, C_BLACK);
         snprintf(buf, sizeof(buf), "Erase /dev/%s and install fluxOS", d->name);
         draw_checkbox(sf, agree_rect().x, agree_rect().y, buf, s->agreed);
@@ -461,7 +501,7 @@ static void start_install(struct setup *s)
             close(fd);
         signal(SIGINT, SIG_DFL);
         signal(SIGQUIT, SIG_DFL);
-        char *argv[] = { "fluxinstall", "-y", "-s", s->source, dev, NULL };
+        char *argv[] = { "fluxinstall", "-y", "-s", s->source, "-n", s->host, dev, NULL };
         execve(INSTALLER, argv, environ);
         fprintf(stderr, "fluxinstall: cannot run %s: %s\n", INSTALLER, strerror(errno));
         _exit(127);
@@ -510,6 +550,9 @@ static void press_button(struct setup *s, int b)
             s->page = P_DISK;
             break;
         case P_DISK:
+            s->page = P_NAME;
+            break;
+        case P_NAME:
             s->agreed = 0;
             s->page = P_CONFIRM;
             break;
@@ -530,11 +573,43 @@ static void press_button(struct setup *s, int b)
     paint(s);
 }
 
+/* Editing the computer's name; returns 1 if the key was the field's. */
+static int host_key(struct setup *s, const struct input_event *ev)
+{
+    if (ev->code == KEY_LEFT && s->host_cur > 0)
+        s->host_cur--;
+    else if (ev->code == KEY_RIGHT && s->host_cur < s->host_len)
+        s->host_cur++;
+    else if (ev->code == KEY_HOME)
+        s->host_cur = 0;
+    else if (ev->code == KEY_END)
+        s->host_cur = s->host_len;
+    else if (ev->code == KEY_DELETE && s->host_cur < s->host_len) {
+        memmove(s->host + s->host_cur, s->host + s->host_cur + 1, (size_t)(s->host_len - s->host_cur));
+        s->host_len--;
+    } else if (ev->len == 1 && ev->text[0] == 0x7F && s->host_cur > 0) {
+        memmove(s->host + s->host_cur - 1, s->host + s->host_cur, (size_t)(s->host_len - s->host_cur + 1));
+        s->host_cur--;
+        s->host_len--;
+    } else if (ev->len == 1 && ev->text[0] > 32 && ev->text[0] < 127 && s->host_len < HOST_MAX) {
+        memmove(s->host + s->host_cur + 1, s->host + s->host_cur, (size_t)(s->host_len - s->host_cur + 1));
+        s->host[s->host_cur++] = ev->text[0];
+        s->host_len++;
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
 static void setup_key(struct window *w, const struct input_event *ev)
 {
     struct setup *s = w->priv;
     if (!(ev->flags & IEV_PRESSED))
         return;
+    if (s->page == P_NAME && host_key(s, ev)) {
+        paint(s);
+        return;
+    }
     if (ev->code == KEY_ENTER) {
         press_button(s, B_NEXT);
     } else if (ev->code == KEY_ESC) {
@@ -570,6 +645,18 @@ static void setup_mouse(struct window *w, int x, int y, int buttons, int changed
             for (int i = 0; i < s->ndisks; i++)
                 if (rect_contains(disk_row(i), x, y) && !s->disks[i].why_not)
                     s->choice = i;
+        } else if (s->page == P_NAME && rect_contains(host_field(), x, y)) {
+            /* the caret to the character clicked on */
+            int cx = host_field().x + 4;
+            s->host_cur = 0;
+            while (s->host_cur < s->host_len) {
+                char one[2] = { s->host[s->host_cur], 0 };
+                int w = gfx_text_width(&font_sans, one);
+                if (x < cx + w / 2)
+                    break;
+                cx += w;
+                s->host_cur++;
+            }
         } else if (s->page == P_CONFIRM && rect_contains(agree_rect(), x, y)) {
             s->agreed = !s->agreed;
         }
@@ -627,6 +714,9 @@ void setup_open(void)
         return;
     s->pressed = -1;
     s->fd = -1;
+    const char *host = getenv("HOST");
+    snprintf(s->host, sizeof(s->host), "%s", host && !hostname_problem(host) ? host : "fluxOS");
+    s->host_len = s->host_cur = (int)strlen(s->host);
     find_source(s);
     setup = s;
     s->win = wm_create("fluxOS Setup", ICON_INSTALL, SW, SH, WF_MINIMIZE, &setup_ops, s);

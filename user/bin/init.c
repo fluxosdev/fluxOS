@@ -31,6 +31,24 @@ static void cat_file(const char *path)
 }
 
 /* Start a program in its own process group, in the console's foreground. */
+/* The first line of /etc/hostname (written by fluxinstall -n), or "fluxOS". */
+static void read_hostname(char *out, size_t size)
+{
+    snprintf(out, size, "fluxOS");
+    int fd = open("/etc/hostname", O_RDONLY);
+    if (fd < 0)
+        return;
+    char buf[64];
+    int n = (int)read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return;
+    buf[n] = 0;
+    buf[strcspn(buf, "\r\n \t")] = 0;
+    if (buf[0])
+        snprintf(out, size, "%s", buf);
+}
+
 static int spawn(const char *path, char *argv0)
 {
     int pid = fork();
@@ -76,7 +94,9 @@ int main(void)
     setenv("LOGNAME", "flux", 1);
     setenv("SHELL", SHELL, 1);
     setenv("TERM", "vt100", 1);
-    setenv("HOST", "fluxOS", 1);
+    char host[64];
+    read_hostname(host, sizeof(host));
+    setenv("HOST", host, 1);
 
     mkdir("/home", 0755);
     mkdir("/home/flux", 0755);

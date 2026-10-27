@@ -1,7 +1,7 @@
 /*
  * fluxinstall - install fluxOS onto a hard disk.
  *
- *   fluxinstall [-y] [-s SOURCE] /dev/hdX
+ *   fluxinstall [-y] [-s SOURCE] [-n HOSTNAME] /dev/hdX
  *
  * The disk gets a new MBR partition table with one bootable FAT32
  * partition starting at 1 MiB. GRUB's boot sector goes into the MBR and
@@ -14,6 +14,7 @@
  * The initrd's contents (/bin, /etc, /home, /usr) are unpacked onto the
  * partition as well: an installed system runs from the disk, with the
  * partition as /, and keeps the initrd only for the boot menu's safe mode.
+ * With -n the installed system's /etc/hostname gets the name given.
  */
 #include <ctype.h>
 #include <dirent.h>
@@ -44,6 +45,7 @@
 #define CORE_SEGMENT       0x0820       /* where diskboot loads the rest of core */
 
 static const char *source = "/mnt/cdrom";
+static const char *hostname;            /* -n: for the installed /etc/hostname */
 static int mounted;
 
 static void die(const char *fmt, ...)
@@ -221,10 +223,23 @@ static int run_mkfs(const char *dev)
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: fluxinstall [-y] [-s SOURCE] /dev/hdX\n"
-                    "  -y         do not ask for confirmation\n"
-                    "  -s SOURCE  install medium (default /mnt/cdrom)\n");
+    fprintf(stderr, "usage: fluxinstall [-y] [-s SOURCE] [-n HOSTNAME] /dev/hdX\n"
+                    "  -y           do not ask for confirmation\n"
+                    "  -s SOURCE    install medium (default /mnt/cdrom)\n"
+                    "  -n HOSTNAME  the installed computer's name (letters, digits, hyphens)\n");
     exit(2);
+}
+
+/* A host name as RFC 1123 has it: 1-63 letters, digits and hyphens, no hyphen at either end. */
+static int valid_hostname(const char *s)
+{
+    size_t n = strlen(s);
+    if (n == 0 || n > 63 || s[0] == '-' || s[n - 1] == '-')
+        return 0;
+    for (size_t i = 0; i < n; i++)
+        if (!isalnum((unsigned char)s[i]) && s[i] != '-')
+            return 0;
+    return 1;
 }
 
 int main(int argc, char **argv)
@@ -235,11 +250,16 @@ int main(int argc, char **argv)
             yes = 1;
         else if (!strcmp(argv[i], "-s") && i + 1 < argc)
             source = argv[++i];
+        else if (!strcmp(argv[i], "-n") && i + 1 < argc)
+            hostname = argv[++i];
         else
             usage();
     }
     if (i != argc - 1)
         usage();
+    if (hostname && !valid_hostname(hostname))
+        die("%s: a host name is 1-63 letters, digits and hyphens, not starting or ending with a hyphen",
+            hostname);
 
     /* Line by line even into a pipe, so a front end (the desktop's
      * Setup wizard) sees each step as it starts. */
@@ -435,6 +455,13 @@ int main(int argc, char **argv)
     path_join(src, sizeof(src), source, "boot/initrd.tar");
     extract_tar(src, MOUNTPOINT, &bytes, &files);
     printf("      %u files, %lu KiB\n", files, bytes / 1024);
+    if (hostname) {
+        path_join(dst, sizeof(dst), MOUNTPOINT, "etc/hostname");
+        FILE *f = fopen(dst, "w");
+        if (!f || fprintf(f, "%s\n", hostname) < 0 || fclose(f) != 0)
+            die("%s: %s", dst, strerror(errno));
+        printf("      host name: %s\n", hostname);
+    }
 
     /* ---- [4/4] finish ---- */
     printf("[4/4] Writing everything to disk\n");
