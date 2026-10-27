@@ -2,6 +2,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <flux.h>
+#include <flux/syscall.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mount.h>
@@ -17,8 +19,66 @@ static void stop(void)
     printf("KERNEL REGRESSION FAILED line %d: %s (errno %d)\n", __LINE__, #x, errno); \
     stop(); \
 } } while (0)
+
+static void scheduler_stress(void)
+{
+    struct meminfo mi;
+    CHECK(meminfo(&mi) == 0);
+    printf("guest: %u CPUs online\n", mi.ncpu);
+    int children[8], workers = mi.ncpu < 4 ? (int)mi.ncpu * 2 : 8;
+    for (int i = 0; i < workers; i++) {
+        children[i] = fork(); CHECK(children[i] >= 0);
+        if (!children[i]) {
+            for (int round = 0; round < 6; round++) {
+                float seed[4] = { i + 1, i + 2, i + 3, i + 4 };
+                const float ones[4] __attribute__((aligned(16))) = { 1, 1, 1, 1 };
+                float out[4];
+                /* Keep live SSE state across raw yields: a normal C call
+                 * could spill it and hide a broken context switch. */
+                __asm__ volatile(
+                    "movups %1, %%xmm7; movl $200000, %%ecx\n"
+                    "1: addps %2, %%xmm7; decl %%ecx\n"
+                    "testl $8191, %%ecx; jnz 2f\n"
+                    "movl %3, %%eax; int $0x80\n"
+                    "2: testl %%ecx, %%ecx; jnz 1b\n"
+                    "movups %%xmm7, %0"
+                    : "=m"(out) : "m"(seed), "m"(ones), "i"(SYS_yield)
+                    : "eax", "ecx", "xmm7", "memory", "cc");
+                for (int k = 0; k < 4; k++)
+                    if (out[k] != seed[k] + 200000.0f) _exit(1);
+                msleep(10);
+            }
+            _exit(0);
+        }
+    }
+    int status;
+    for (int i = 0; i < workers; i++)
+        CHECK(waitpid(children[i], &status, 0) == children[i] && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    /* More CPU-bound processes than cores: every child must reach its
+     * handshake, and the parent must wake and kill them without yields. */
+    int gate[2]; CHECK(pipe(gate) == 0);
+    for (int i = 0; i < workers; i++) {
+        children[i] = fork(); CHECK(children[i] >= 0);
+        if (!children[i]) {
+            close(gate[0]);
+            if (write(gate[1], "r", 1) != 1) _exit(1);
+            close(gate[1]);
+            for (;;) __asm__ volatile("rep; nop" ::: "memory");
+        }
+    }
+    close(gate[1]);
+    for (int i = 0; i < workers; i++) { char c; CHECK(read(gate[0], &c, 1) == 1); }
+    close(gate[0]);
+    CHECK(msleep(120) == 0);
+    for (int i = 0; i < workers; i++) CHECK(kill(children[i], SIGKILL) == 0);
+    for (int i = 0; i < workers; i++)
+        CHECK(waitpid(children[i], &status, 0) == children[i] && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+    puts("guest: scheduler saturation, timed wakeups, signals and live SSE state passed");
+}
 int main(void)
 {
+    scheduler_stress();
     int fd = open("/tmp/size-test", O_CREAT | O_RDWR, 0600);
     CHECK(fd >= 0);
     CHECK(write(fd, "safe", 4) == 4);

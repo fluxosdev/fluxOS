@@ -292,7 +292,7 @@ $(BUILD)/tests/browser-dom: $(BROWSER_TEST_SRCS) $(wildcard user/desktop/*.h) us
 		-Wl,--defsym=__gc_data_start=__data_start,--defsym=__gc_data_end=_end -lm -o $@
 
 # Host regression tests use production kernel code with mocked hardware/I/O.
-KERNEL_TEST_NAMES := heap pipe socket storage syscall block
+KERNEL_TEST_NAMES := heap pipe socket storage syscall block sched
 KERNEL_TEST_BINS := $(addprefix $(BUILD)/tests/kernel-,$(KERNEL_TEST_NAMES))
 .PHONY: test-kernel
 test-kernel: $(KERNEL_TEST_BINS)
@@ -305,8 +305,11 @@ $(BUILD)/tests/kernel-%: tests/kernel-%.c tests/kernel-test.h $(wildcard kernel/
 		-Iinclude -Ikernel $< -Wl,--gc-sections -o $@
 
 .PHONY: test-kernel-qemu
+# Override to exercise SMP, nosmp and maxcpus without touching a real disk.
+KERNEL_TEST_CPUS ?= 1
+KERNEL_TEST_CMDLINE ?=
 test-kernel-qemu: $(TEXT_KERNEL) $(INITRD) $(BUILD)/tests/kernel-guest
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(INITRD) $(BUILD)/tests/kernel-guest
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(INITRD) $(BUILD)/tests/kernel-guest --cpus $(KERNEL_TEST_CPUS) --append "$(KERNEL_TEST_CMDLINE)"
 
 $(BUILD)/tests/kernel-guest.o: tests/kernel-guest.c
 	@mkdir -p $(dir $@)

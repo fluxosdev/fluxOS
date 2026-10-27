@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
 """Boot the kernel regressions with a temporary initrd and blank scratch disk."""
+import argparse
 import pathlib
 import subprocess
-import sys
 import tarfile
 import tempfile
 
-qemu, kernel, initrd, guest = sys.argv[1:]
+parser = argparse.ArgumentParser(description=__doc__)
+for name in ("qemu", "kernel", "initrd", "guest"):
+    parser.add_argument(name)
+parser.add_argument("--cpus", type=int, default=1, choices=range(1, 17))
+parser.add_argument("--append", default="")
+args = parser.parse_args()
+qemu, kernel, initrd, guest = args.qemu, args.kernel, args.initrd, args.guest
+expected_cpus = args.cpus
+for option in args.append.split():
+    if option.startswith("maxcpus="):
+        expected_cpus = min(expected_cpus, max(1, int(option.split("=", 1)[1])))
+if "nosmp" in args.append.split():
+    expected_cpus = 1
 with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
     temp = pathlib.Path(directory)
     overlay = temp / "initrd.tar"
@@ -23,7 +35,8 @@ with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
     scratch = temp / "disk.img"
     with scratch.open("wb") as disk:
         disk.truncate(32 * 1024 * 1024)
-    command = [qemu, "-kernel", kernel, "-initrd", str(overlay), "-append", "automount=off",
+    command = [qemu, "-cpu", "pentium3", "-smp", str(args.cpus),
+               "-kernel", kernel, "-initrd", str(overlay), "-append", "automount=off " + args.append,
                "-m", "256M", "-display", "none", "-monitor", "none", "-serial", "stdio",
                "-no-reboot", "-nic", "none", "-drive", f"file={scratch},format=raw,if=ide,index=0"]
     try:
@@ -35,3 +48,5 @@ with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
     print(output)
     if result.returncode or "KERNEL REGRESSIONS PASSED" not in output:
         raise SystemExit("QEMU kernel regressions failed")
+    if f"guest: {expected_cpus} CPUs online" not in output:
+        raise SystemExit(f"QEMU expected {expected_cpus} active CPUs")

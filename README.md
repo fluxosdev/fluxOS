@@ -53,6 +53,13 @@ stops at boot and says why.
   runs on one at a time (a big kernel lock); device interrupts stay on the
   8259 PIC and the boot processor. `nosmp` on the kernel command line keeps
   to the first, `maxcpus=N` to N.
+  Processes prefer their previous core to retain warm caches, but idle cores
+  can steal work immediately and tasks waiting a full time slice take priority
+  over affinity. The boot CPU accounts ticks for all cores; secondary cores
+  receive a timer reschedule interrupt only at the end of a 50 ms slice,
+  and idle cores receive none. Reschedule requests are coalesced, and per-core
+  state and ticket-lock counters occupy separate cache lines. Single-core
+  systems retain the same round-robin scheduling and need no APIC timer.
 - Processes: `fork`, `execve` (static ELF32 and `#!` scripts), `exit`/
   `waitpid`, process groups, signals (`kill`, `SIGINT`, `SIGPIPE`, fault
   signals; no user handlers), lazy FPU and SSE switching (FXSAVE/FXRSTOR).
@@ -450,6 +457,9 @@ make test-tls     # local OpenSSL servers: authenticated handshakes and rejected
 make test-websocket # local ws/wss transport and browser API integration tests
 make test-kernel # runs allocator, filesystem, pipe and socket regressions on the host
 make test-kernel-qemu # boots kernel regressions with a disposable initrd and scratch disk
+make test-kernel-qemu KERNEL_TEST_CPUS=4 # same tests on four Pentium III CPUs
+make test-kernel-qemu KERNEL_TEST_CPUS=4 KERNEL_TEST_CMDLINE=nosmp # single-core fallback
+make test-kernel-qemu KERNEL_TEST_CPUS=4 KERNEL_TEST_CMDLINE=maxcpus=2 # CPU limit
 make disk       # fluxdisk.img, a 64 MiB FAT32 data disk (DISK_MB=...)
 make floppy     # fluxfloppy.img, a 1.44 MB FAT12 floppy for drive A:
 make run        # boots the ISO in QEMU with the disk, floppy (if any) and an NE2000

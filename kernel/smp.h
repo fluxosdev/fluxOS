@@ -13,6 +13,7 @@
 #include "arch.h"
 
 #define MAX_CPUS 16
+#define CPU_CACHE_LINE 64
 
 /* Interrupts between processors (and the local APIC's spurious one). */
 #define VEC_RESCHED  0xF0               /* something to run: look */
@@ -37,7 +38,7 @@ struct cpu {
     volatile int kicked;                /* sent VEC_RESCHED, not yet scheduled */
     volatile int tlb_flush;             /* asked to flush its TLB */
     uint32_t idle_ticks;                /* timer ticks it found itself idle */
-};
+} __attribute__((aligned(CPU_CACHE_LINE)));
 
 extern struct cpu cpus[MAX_CPUS];
 extern int ncpus;                       /* processors running */
@@ -60,7 +61,7 @@ void smp_add_cpu(uint8_t apic_id);      /* from the ACPI MADT */
 void smp_init(void);                    /* find the processors; before the first process */
 void smp_start(void);                   /* start the others; after proc_init() */
 void smp_tick(void);                    /* the timer ticked: pass it on */
-int smp_wake_idle(void);                /* a process became ready: 1 if an idle processor takes it */
+int smp_wake_idle(int preferred);       /* prefer its last CPU if idle; -1 means any */
 void smp_kick_proc(struct proc *p);     /* p, running elsewhere, has a signal */
 void smp_flush_tlb(uint32_t *pd);       /* pd's mappings changed */
 void smp_tlb_ipi(void);

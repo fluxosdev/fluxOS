@@ -43,7 +43,8 @@ void proc_init(void)
 static void make_ready(struct proc *p)
 {
     p->state = P_READY;
-    if (!smp_wake_idle())
+    p->ready_tick = ticks;
+    if (!smp_wake_idle(p->last_cpu))
         need_resched = 1;
 }
 
@@ -69,6 +70,7 @@ static struct proc *proc_alloc(void)
         p->state = P_EMBRYO;
         p->pd = kernel_pd;
         p->fpu_cpu = -1;
+        p->last_cpu = -1;
         p->start_tick = ticks;
         return p;
     }
@@ -103,34 +105,53 @@ static void setup_kstack(struct proc *p, const struct trapframe *src)
     p->esp = (uint32_t)sp;
 }
 
+/* Preserve round-robin order within each preference. A remote task that
+ * has waited a quantum takes precedence over locality; an idle core can
+ * always steal work immediately. The single-core order is unchanged. */
+static struct proc *pick_ready(struct cpu *c, struct proc *prev)
+{
+    struct proc *first = NULL, *local = NULL;
+    int start = prev == c->idle ? 0 : (int)(prev - procs);
+    for (int i = 1; i <= MAX_PROCS; i++) {
+        struct proc *p = &procs[(start + i) % MAX_PROCS];
+        if (p != &procs[0] && p->state == P_READY) {
+            if (ncpus == 1 || (uint32_t)(ticks - p->ready_tick) >= QUANTUM)
+                return p;
+            if (!first)
+                first = p;
+            if (!local && (p->last_cpu < 0 || p->last_cpu == c->index))
+                local = p;
+        }
+    }
+    return local ? local : first ? first : c->idle;
+}
+
 void schedule(void)
 {
     struct cpu *c = this_cpu();
     struct proc *prev = c->proc;
-    struct proc *next = NULL;
-
-    if (prev->state == P_RUNNING)
+    if (prev->state == P_RUNNING) {
         prev->state = P_READY;
-
-    /* (Another processor's idle process is not in the table: start at the top.) */
-    int start = prev >= procs && prev < procs + MAX_PROCS ? (int)(prev - procs) : 0;
-    for (int i = 1; i <= MAX_PROCS; i++) {
-        struct proc *p = &procs[(start + i) % MAX_PROCS];
-        if (p != &procs[0] && p->state == P_READY) {
-            next = p;
-            break;
-        }
+        prev->ready_tick = ticks;
     }
-    if (!next)
-        next = c->idle;
+    struct proc *next = pick_ready(c, prev);
 
     next->state = P_RUNNING;
+    next->last_cpu = c->index;
     c->slice = QUANTUM;
     c->kicked = 0;
+    c->proc = next;
+    /* Wakeups made while this CPU was idle may have selected it repeatedly.
+     * Hand any remaining work to another idle core, including at boot. */
+    if (ncpus > 1 && next != c->idle)
+        for (int i = 1; i < MAX_PROCS; i++)
+            if (procs[i].state == P_READY) {
+                smp_wake_idle(procs[i].last_cpu);
+                break;
+            }
     if (next == prev)
         return;
 
-    c->proc = next;
     fpu_switch(prev, next);
     if (next->kstack)
         tss_set_kernel_stack((uint32_t)next->kstack + KSTACK_SIZE);
@@ -152,12 +173,12 @@ void proc_start(void)
     kernel_unlock();
 }
 
-void proc_tick_cpu(void)
+void proc_tick_on_cpu(struct cpu *c)
 {
-    struct cpu *c = this_cpu();
     if (c->proc == c->idle) {
         procs[0].cpu_ticks++;
         c->idle_ticks++;
+        return;
     }
     else
         c->proc->cpu_ticks++;
@@ -165,6 +186,11 @@ void proc_tick_cpu(void)
         c->slice = QUANTUM;
         c->resched = 1;
     }
+}
+
+void proc_tick_cpu(void)
+{
+    proc_tick_on_cpu(this_cpu());
 }
 
 void proc_tick(void)

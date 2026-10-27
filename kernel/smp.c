@@ -8,8 +8,8 @@
  * as Linux does with "noapic"), and the I/O APIC is left alone, so every
  * device interrupt still arrives on the boot processor. The others are
  * woken by INIT and startup IPIs into trampoline.S and wait in their own
- * idle loops; the timer's tick reaches them as VEC_TICK, and new work as
- * VEC_RESCHED.
+ * idle loops. The boot CPU accounts all timer ticks under the kernel lock;
+ * other CPUs receive VEC_RESCHED only for expired slices or new work.
  *
  * The kernel lock is a ticket lock held by a processor, not a process:
  * schedule() switches contexts with it held, and whichever context runs
@@ -87,8 +87,10 @@ void ap_main(void) __attribute__((noreturn));
 
 /* ---- the kernel lock ---- */
 
-static volatile uint32_t lock_next, lock_serving;
-static volatile int lock_owner = -1;
+/* Arrivals must not invalidate the line every waiter is polling. */
+static volatile uint32_t lock_next __attribute__((aligned(CPU_CACHE_LINE)));
+static volatile uint32_t lock_serving __attribute__((aligned(CPU_CACHE_LINE)));
+static volatile int lock_owner __attribute__((aligned(CPU_CACHE_LINE))) = -1;
 
 static void flush_local(struct cpu *c)
 {
@@ -421,28 +423,52 @@ void ap_main(void)
 
 /* ---- interrupts between processors ---- */
 
-/* The boot processor's timer ticked. */
+/* Coalesce wakeups, signals and quantum expiration until the target schedules. */
+static void resched_cpu(struct cpu *c)
+{
+    c->resched = 1;
+    if (!c->kicked) {
+        c->kicked = 1;
+        send_ipi(c, VEC_RESCHED);
+    }
+}
+
+/* The kernel lock makes remote process/slice accounting safe. This avoids
+ * waking idle CPUs and reduces busy-CPU timer IPIs from HZ to HZ / QUANTUM. */
 void smp_tick(void)
 {
     struct cpu *self = this_cpu();
-    for (int i = 0; i < ncpus; i++)
-        if (&cpus[i] != self)
-            send_ipi(&cpus[i], VEC_TICK);
+    for (int i = 0; i < ncpus; i++) {
+        struct cpu *c = &cpus[i];
+        if (c == self || !c->online)
+            continue;
+        proc_tick_on_cpu(c);
+        if (c->proc != c->idle && c->resched)
+            resched_cpu(c);
+    }
 }
 
 /* A process became ready: 1 if an idle processor will run it, this one
  * (which looks for work on its way out of the kernel) or another, woken
  * by VEC_RESCHED; 0 if every processor is busy. */
-int smp_wake_idle(void)
+int smp_wake_idle(int preferred)
 {
     struct cpu *self = this_cpu();
+    if (preferred >= 0 && preferred < ncpus) {
+        struct cpu *c = &cpus[preferred];
+        if (c == self && c->proc == c->idle)
+            return 1;
+        if (c != self && c->online && c->proc == c->idle && !c->kicked) {
+            resched_cpu(c);
+            return 1;
+        }
+    }
     if (self->proc == self->idle)
         return 1;
     for (int i = 0; i < ncpus; i++) {
         struct cpu *c = &cpus[i];
         if (c != self && c->online && c->proc == c->idle && !c->kicked) {
-            c->kicked = 1;
-            send_ipi(c, VEC_RESCHED);
+            resched_cpu(c);
             return 1;
         }
     }
@@ -455,7 +481,7 @@ void smp_kick_proc(struct proc *p)
     struct cpu *self = this_cpu();
     for (int i = 0; i < ncpus; i++)
         if (&cpus[i] != self && cpus[i].proc == p)
-            send_ipi(&cpus[i], VEC_RESCHED);
+            resched_cpu(&cpus[i]);
 }
 
 /* With the kernel lock: the mappings of pd changed. */

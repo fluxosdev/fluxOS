@@ -47,6 +47,8 @@ struct proc {
     uint32_t stack_low;         /* lowest mapped stack page */
     uint32_t cpu_ticks;
     uint32_t start_tick;
+    uint32_t ready_tick;         /* affinity yields to tasks waiting a full quantum */
+    int last_cpu;               /* soft affinity, -1 until first scheduled */
     char name[32];
     int fpu_used;               /* has FPU registers (in fpu, or in the FPU) */
     int fpu_cpu;                /* the processor whose FPU last loaded them, or -1 */
@@ -61,7 +63,8 @@ void proc_spawn_init(const char *path);
 void proc_spawn_kthread(const char *name, void (*fn)(void));
 void schedule(void);
 void proc_tick(void);                   /* the timer, on the boot processor */
-void proc_tick_cpu(void);               /* every processor, every tick */
+void proc_tick_cpu(void);               /* account a tick on the calling CPU */
+void proc_tick_on_cpu(struct cpu *c);   /* account under the kernel lock, even remotely */
 void proc_start(void);
 
 void sleep_on(void *chan);
