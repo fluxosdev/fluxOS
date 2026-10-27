@@ -291,7 +291,7 @@ run-kernel: $(TEXT_KERNEL) $(SYSTEM) $(DISK)
 
 # Boot fluxdisk.img on its own, after "fluxinstall /dev/hda".
 run-disk: $(DISK)
-	$(QEMU) $(QEMU_CPU) -m 256M -serial stdio -boot c $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
+	$(QEMU) $(QEMU_CPU) -m 1G -serial stdio -boot c $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
 
 # On q35 "if=ide" drives and the CD sit on the chipset's AHCI controller.
 QEMU_XHCI ?= -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0
