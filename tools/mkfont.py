@@ -19,7 +19,7 @@ building fluxOS does not need this script, Python or PIL.
                            SIL Open Font License 1.1): Medium and Bold at 12
                            pixels for text (as wide as Liberation Sans, so
                            dialogs still fit), Medium 14 for captions, Regular
-                           24 for the Start menu's heading and Bold 18
+                           24 for the Start menu's heading and SemiBold 18
                            for the Start button, set on the weight axis of the
                            variable font Google Fonts ships (Archivo[wdth,wght].ttf),
                            which is looked for in $ARCHIVO_DIR (default
@@ -60,7 +60,7 @@ ARCHIVO = "Archivo[wdth,wght].ttf"
 ARCHIVO_FONTS = (("font_archivo", ARCHIVO, 12, 500, "Medium"), ("font_archivo_bold", ARCHIVO, 12, 700, "Bold"),
                  ("font_archivo_title", ARCHIVO, 14, 500, "Medium"),
                  ("font_archivo_large", ARCHIVO, 24, 400, "Regular"),
-                 ("font_archivo_start", ARCHIVO, 18, 700, "Bold"))
+                 ("font_archivo_start", ARCHIVO, 18, 600, "SemiBold"))
 CANVAS_W, ORIGIN = 64, 8                # glyphs are drawn this far in, so italics can overhang
 FIRST, LAST = 32, 126
 LAST_CP437 = 255
