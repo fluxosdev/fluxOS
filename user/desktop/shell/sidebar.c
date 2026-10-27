@@ -32,7 +32,7 @@
 #define FOOT_H  30              /* "Add widgets..." */
 #define MARGIN  10              /* from the sidebar's sides to its cards */
 #define GAP     10              /* between cards */
-#define CAP_H   20              /* a card's title strip */
+#define CAP_H   22              /* a card's title strip */
 #define FACE_R  54              /* the clock's face */
 #define CAL_ROW 20              /* a week of the calendar */
 #define GRAPH_H 56
@@ -105,7 +105,7 @@ static int cos60(int i)
 
 static int full_width(void)
 {
-    return screen_w >= 1280 ? 248 : 224;
+    return screen_w >= 1280 ? 196 : 180;
 }
 
 int sidebar_width(void)
@@ -255,7 +255,7 @@ static void paint_card(struct surface *s, struct rect r, const char *title, cons
         gfx_fill(s, r.x, r.y, r.w, r.h, C_FACE);
         gfx_bevel(s, r, BEVEL_THIN_RAISED);
         gfx_fill(s, r.x + 2, r.y + 2, r.w - 4, CAP_H - 3, C_NAVY);
-        gfx_text(s, &font_sans, r.x + 8, r.y + (CAP_H - font_sans.height) / 2, title, C_WHITE);
+        gfx_text(s, &font_sans_bold, r.x + 8, r.y + (CAP_H - font_sans_bold.height) / 2, title, C_WHITE);
         if (right[0])
             gfx_text(s, &font_sans, r.x + r.w - 8 - gfx_text_width(&font_sans, right),
                      r.y + (CAP_H - font_sans.height) / 2, right, C_WHITE);
@@ -272,7 +272,7 @@ static void paint_card(struct surface *s, struct rect r, const char *title, cons
     struct rect strip = mkrect(r.x + 1, r.y + 1, r.w - 2, CAP_H);
     chrome_fill(s, strip, 4, 0);
     tint(s, mkrect(strip.x + 6, strip.y + 1, strip.w - 12, 1), ARGB(64, 0xFFFFFF));
-    gfx_text(s, &font_sans, r.x + 10, r.y + (CAP_H - font_sans.height) / 2 + 1, title, ink());
+    gfx_text(s, &font_sans_bold, r.x + 10, r.y + (CAP_H - font_sans_bold.height) / 2 + 1, title, ink());
     if (right[0])
         gfx_text(s, &font_sans, r.x + r.w - 10 - gfx_text_width(&font_sans, right),
                  r.y + (CAP_H - font_sans.height) / 2 + 1, right, muted());
