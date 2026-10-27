@@ -8,7 +8,9 @@
  * The Settings page picks the driver, color depth, desktop area and
  * refresh rate. The Appearance page picks the theme (theme.c), Classic or
  * Kinetik and Kinetik's color, with a sample of how it looks drawn by the
- * window manager's own code. The Monitor page picks the kind of monitor, which limits
+ * window manager's own code. The Screen Saver page turns on the bouncing logo
+ * (screensaver.c) and sets how long the desktop is left alone before it starts
+ * and how big the logo is. The Monitor page picks the kind of monitor, which limits
  * the modes offered, and shows what the monitor's EDID says about it and
  * the timing of the mode on the screen.
  *
@@ -35,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <flux/logo.h>
 #include "desktop.h"
 
 #define DLG_W 404
@@ -42,13 +45,14 @@
 #define ITEM_H 16                       /* rows of an open drop-down list */
 #define CONFIRM_SECS 15
 
-enum page { PAGE_BACKGROUND, PAGE_APPEARANCE, PAGE_SETTINGS, PAGE_MONITOR, PAGE_COUNT };
+enum page { PAGE_BACKGROUND, PAGE_APPEARANCE, PAGE_SAVER, PAGE_SETTINGS, PAGE_MONITOR, PAGE_COUNT };
 enum driver { DRV_STANDARD, DRV_NATIVE, DRV_RADEON };
 
 /* Controls, in Tab order. */
 enum ctl {
     K_TABS, K_DRIVER, K_COLORS, K_AREA, K_REFRESH, K_MONITOR,
     K_WALL, K_BROWSE, K_WALLMODE, K_COLOR, K_THEME, K_ACCENT,
+    K_SAVER, K_SAVER_TIME, K_SAVER_SIZE,
     K_OK, K_CANCEL, K_APPLY, K_COUNT
 };
 #define IS_PUSH(k) ((k) >= K_OK || (k) == K_BROWSE)     /* push buttons */
@@ -134,6 +138,9 @@ struct dprops {
 
     /* the Appearance page */
     int style, accent;
+
+    /* the Screen Saver page */
+    struct saver_config saver;
 };
 
 static struct dprops *dlg;
@@ -387,12 +394,12 @@ static int mode_controls_enabled(struct dprops *d)
 
 /* ---- geometry ---- */
 
-static const enum page tab_pages[PAGE_COUNT] = { PAGE_BACKGROUND, PAGE_APPEARANCE, PAGE_SETTINGS, PAGE_MONITOR };
-static const char *const tab_names[PAGE_COUNT] = { "Background", "Appearance", "Settings", "Monitor" };
+static const enum page tab_pages[PAGE_COUNT] = { PAGE_BACKGROUND, PAGE_APPEARANCE, PAGE_SAVER, PAGE_SETTINGS, PAGE_MONITOR };
+static const char *const tab_names[PAGE_COUNT] = { "Background", "Appearance", "Screen Saver", "Settings", "Monitor" };
 
 static struct rect tab_rect(int i)
 {
-    static const int x[PAGE_COUNT + 1] = { 6, 86, 168, 234, 298 };
+    static const int x[PAGE_COUNT + 1] = { 6, 78, 156, 248, 312, 376 };
     return mkrect(x[i], 6, x[i + 1] - x[i] - 2, 20);
 }
 
@@ -409,7 +416,7 @@ static const struct rect panel_r = { 6, 25, DLG_W - 12, 398 };
 static struct rect ctl_rect(enum ctl k)
 {
     switch (k) {
-    case K_TABS: return mkrect(6, 4, 292, 22);
+    case K_TABS: return mkrect(6, 4, 370, 22);
     case K_THEME: return mkrect(78, 226, 150, 21);
     case K_ACCENT: return mkrect(78, 258, ACCENTS * SWATCH_W, 42);
     case K_WALL: return mkrect(18, 190, 268, WALL_ROWS * ITEM_H + 4);
@@ -421,6 +428,9 @@ static struct rect ctl_rect(enum ctl k)
     case K_AREA: return mkrect(250, 288, 96, 26);
     case K_REFRESH: return mkrect(116, 353, 130, 21);
     case K_MONITOR: return mkrect(116, 36, 272, 21);
+    case K_SAVER: return mkrect(118, 216, 150, 21);
+    case K_SAVER_TIME: return mkrect(118, 248, 150, 21);
+    case K_SAVER_SIZE: return mkrect(118, 280, 150, 21);
     case K_OK: return mkrect(DLG_W - 12 - 3 * 75 - 12, DLG_H - 10 - 23, 75, 23);
     case K_CANCEL: return mkrect(DLG_W - 12 - 2 * 75 - 6, DLG_H - 10 - 23, 75, 23);
     case K_APPLY: return mkrect(DLG_W - 12 - 75, DLG_H - 10 - 23, 75, 23);
@@ -439,6 +449,8 @@ static int on_page(struct dprops *d, enum ctl k)
         return d->page == PAGE_BACKGROUND;
     case K_THEME: case K_ACCENT:
         return d->page == PAGE_APPEARANCE;
+    case K_SAVER: case K_SAVER_TIME: case K_SAVER_SIZE:
+        return d->page == PAGE_SAVER;
     default:
         return 1;
     }
@@ -452,6 +464,7 @@ static int ctl_enabled(struct dprops *d, enum ctl k)
     case K_REFRESH: return own_modes(d) && d->nrates > 1;
     case K_COLOR: return d->wall_sel == 0;      /* only with no picture */
     case K_ACCENT: return d->style == THEME_KINETIK;
+    case K_SAVER_TIME: case K_SAVER_SIZE: return d->saver.enabled;
     default: return 1;
     }
 }
@@ -498,6 +511,33 @@ static int combo_items(struct dprops *d, enum ctl k, char rows[][48], int *chose
             snprintf(rows[i], 48, "%s", wall_mode_names[i]);
         *chosen = d->wall_mode;
         return WALL_MODES;
+    case K_SAVER:
+        snprintf(rows[0], 48, "(None)");
+        snprintf(rows[1], 48, "Bouncing logo");
+        *chosen = d->saver.enabled;
+        return 2;
+    case K_SAVER_TIME:
+        for (int i = 0; i < SAVER_TIMEOUTS; i++) {
+            int t = saver_timeouts[i];
+            if (t < 60)
+                snprintf(rows[i], 48, "%d seconds", t);
+            else if (t == 60)
+                snprintf(rows[i], 48, "1 minute");
+            else if (t < 3600)
+                snprintf(rows[i], 48, "%d minutes", t / 60);
+            else
+                snprintf(rows[i], 48, "1 hour");
+            if (t == d->saver.timeout)
+                *chosen = i;
+        }
+        return SAVER_TIMEOUTS;
+    case K_SAVER_SIZE:
+        for (int i = 0; i < SAVER_SIZES; i++) {
+            snprintf(rows[i], 48, "%d pixels%s", saver_sizes[i], saver_sizes[i] == 128 ? " (actual size)" : "");
+            if (saver_sizes[i] == d->saver.size)
+                *chosen = i;
+        }
+        return SAVER_SIZES;
     case K_THEME:
         for (int i = 0; i < THEME_STYLES; i++)
             snprintf(rows[i], 48, "%s", theme_style_names[i]);
@@ -537,6 +577,17 @@ static void choose_item(struct dprops *d, enum ctl k, int i)
     case K_THEME:
         if (i >= 0 && i < THEME_STYLES)
             d->style = i;
+        return;
+    case K_SAVER:
+        d->saver.enabled = i == 1;
+        return;
+    case K_SAVER_TIME:
+        if (i >= 0 && i < SAVER_TIMEOUTS)
+            d->saver.timeout = saver_timeouts[i];
+        return;
+    case K_SAVER_SIZE:
+        if (i >= 0 && i < SAVER_SIZES)
+            d->saver.size = saver_sizes[i];
         return;
     default:
         return;
@@ -1119,6 +1170,50 @@ static void appearance_page(struct dprops *d, struct surface *s)
     draw_combo(s, ctl_rect(K_THEME), rows[chosen], 1, d->focus == K_THEME, d->open == K_THEME);
 }
 
+static void saver_page(struct dprops *d, struct surface *s)
+{
+    char rows[8][48];
+    int chosen;
+    /* a monitor showing the logo at its size on the real screen */
+    struct rect mon = mkrect(122, 40, 160, 120);
+    gfx_fill(s, mon.x - 1, mon.y - 1, mon.w + 2, mon.h + 2, C_BLACK);
+    gfx_bevel(s, mkrect(mon.x - 8, mon.y - 8, mon.w + 16, mon.h + 16), BEVEL_SUNKEN);
+    gfx_fill(s, mon.x, mon.y, mon.w, mon.h, RGB(0, 0, 0));
+    if (d->saver.enabled) {
+        int sz = d->saver.size * mon.w / screen_w;
+        if (sz < 4)
+            sz = 4;
+        if (sz > mon.h)
+            sz = mon.h;
+        int lx = mon.x + (mon.w - sz) / 2, ly = mon.y + (mon.h - sz) / 2;
+        for (int j = 0; j < sz; j++) {
+            for (int i = 0; i < sz; i++) {
+                uint32_t p = fluxos_logo[(j * FLUXOS_LOGO_SIZE / sz) * FLUXOS_LOGO_SIZE + i * FLUXOS_LOGO_SIZE / sz];
+                if (p >> 24)
+                    gfx_fill(s, lx + i, ly + j, 1, 1, gfx_mix(RGB(0, 0, 0), p & 0xFFFFFF, (int)(p >> 24) * 256 / 255));
+            }
+        }
+    }
+    int on = ctl_enabled(d, K_SAVER_TIME);
+    gfx_text(s, &font_sans, 18, 220, "Screen saver:", C_BLACK);
+    gfx_text(s, &font_sans, 18, 252, "Wait:", on ? C_BLACK : C_SHADOW);
+    gfx_text(s, &font_sans, 18, 284, "Logo size:", on ? C_BLACK : C_SHADOW);
+    gfx_text_wrap(s, &font_sans, 18, 322, 368,
+                  "The screen goes black and the fluxOS logo bounces around it once the keyboard and "
+                  "mouse have been left alone for the time chosen. Press a key or move the mouse to "
+                  "come back.",
+                  C_BLACK);
+    gfx_text_wrap(s, &font_sans, 18, 380, 368,
+                  d->bootdir[0] ? "Kept for the next start." : "Lasts until you restart: fluxOS is running from its CD.",
+                  C_BLACK);
+    static const int combos[] = { K_SAVER, K_SAVER_TIME, K_SAVER_SIZE };
+    for (int i = 0; i < 3; i++) {
+        combo_items(d, combos[i], rows, &chosen);
+        draw_combo(s, ctl_rect(combos[i]), rows[chosen], ctl_enabled(d, combos[i]), d->focus == combos[i],
+                   d->open == combos[i]);
+    }
+}
+
 static void dp_paint(struct dprops *d)
 {
     struct surface *s = &d->win->content;
@@ -1129,6 +1224,8 @@ static void dp_paint(struct dprops *d)
         background_page(d, s);
     else if (d->page == PAGE_APPEARANCE)
         appearance_page(d, s);
+    else if (d->page == PAGE_SAVER)
+        saver_page(d, s);
     else if (d->page == PAGE_SETTINGS)
         settings_page(d, s);
     else
@@ -1507,11 +1604,13 @@ static void wall_browsed(void *ctx, const char *text)
 static void activate(struct dprops *d, enum ctl k)
 {
     if (k == K_OK) {
+        saver_set(d->saver, 1);
         if (apply_look(d) == 0 && apply(d) == 0)
             dp_close(d);
     } else if (k == K_CANCEL) {
         dp_close(d);
     } else if (k == K_APPLY) {
+        saver_set(d->saver, 1);
         apply_look(d);
         apply(d);
         if (dlg)
@@ -1592,6 +1691,9 @@ static void step(struct dprops *d, int dir)
     case K_MONITOR:
     case K_WALLMODE:
     case K_THEME:
+    case K_SAVER:
+    case K_SAVER_TIME:
+    case K_SAVER_SIZE:
         n = combo_items(d, d->focus, rows, &chosen);
         if (chosen + dir >= 0 && chosen + dir < n)
             choose_item(d, d->focus, chosen + dir);
@@ -1686,7 +1788,8 @@ static void dp_key(struct window *w, const struct input_event *ev)
         wall_select(d, to < 0 ? 0 : to >= d->nwalls ? d->nwalls - 1 : to);
     } else if (code == KEY_DOWN && (ev->mods & KMOD_ALT) &&
                (d->focus == K_COLORS || d->focus == K_REFRESH || d->focus == K_MONITOR ||
-                d->focus == K_WALLMODE || d->focus == K_THEME) && ctl_enabled(d, d->focus)) {
+                d->focus == K_WALLMODE || d->focus == K_THEME || d->focus == K_SAVER ||
+                d->focus == K_SAVER_TIME || d->focus == K_SAVER_SIZE) && ctl_enabled(d, d->focus)) {
         d->open = d->focus;
         d->hover = -1;
     } else if (code == KEY_LEFT || code == KEY_UP) {
@@ -1957,6 +2060,7 @@ void display_open(void)
     read_grubenv(d->bootdir, d->saved_gfx, d->saved_video, d->saved_driver);
     d->style = theme.style;
     d->accent = theme.accent;
+    d->saver = saver_get();
     wall_init(d);
     dp_reload(d);
     d->win = wm_create("Display Properties", ICON_DISPLAY, DLG_W, DLG_H, 0, &dp_ops, d);

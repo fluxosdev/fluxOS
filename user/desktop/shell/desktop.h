@@ -309,6 +309,7 @@ void gears_frame(void);                 /* draw the next frame when it is due */
 int gears_timeout(void);                /* ms until the next frame, -1 if none */
 void setup_child_exited(int pid, int status);
 void system_restart(void);
+void system_shutdown(void);             /* splash, sync and power off */
 
 /* The event loop (main.c): call ready(ctx, revents) when fd is readable. */
 int loop_watch(int fd, void (*ready)(void *ctx, int revents), void *ctx);
@@ -335,5 +336,25 @@ void about_open(void);
 void about_tick(void);
 void run_open(void);
 void shutdown_open(void);
+
+/* ---- the screen saver (screensaver.c) ---- */
+#define SAVER_TIMEOUTS 8
+#define SAVER_SIZES 7
+extern const int saver_timeouts[SAVER_TIMEOUTS];    /* seconds of no input */
+extern const int saver_sizes[SAVER_SIZES];          /* the logo's size in pixels */
+struct saver_config {
+    int enabled;
+    int timeout;                        /* one of saver_timeouts */
+    int size;                           /* one of saver_sizes */
+};
+void saver_init(void);
+struct saver_config saver_get(void);
+void saver_set(struct saver_config c, int save);
+int saver_active(void);
+int saver_input(const struct input_event *ev);      /* 1: it only woke the screen */
+int saver_timeout(void);                /* ms until saver_frame has work, or -1 */
+void saver_frame(void);
+void saver_draw(struct surface *s, struct rect r);  /* wm.c: compose while it runs */
+void wm_saver(int on);                  /* the saver started or stopped: pointer and redraw */
 
 #endif

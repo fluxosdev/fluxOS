@@ -186,6 +186,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     floppy_start();
     usb_start();
     automount_start();
+    acpi_power_start();
     smp_start();
     boot_ok("Scheduler started, launching /bin/init");
     kprintf("\n");

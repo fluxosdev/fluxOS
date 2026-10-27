@@ -69,6 +69,7 @@ int main(void)
     wm_init();
     datetime_init();
     sound_init();
+    saver_init();
     terminal_open("Terminal", NULL, 0, 1);
     wm_flush();
     sound_startup();                    /* the desktop has replaced the boot screen */
@@ -100,6 +101,9 @@ int main(void)
         int js = browser_timeout();             /* a page's timers */
         if (js >= 0 && js < timeout)
             timeout = js;
+        int sv = saver_timeout();               /* the screen saver starting, or moving */
+        if (sv >= 0 && sv < timeout)
+            timeout = sv;
         poll(fds, (unsigned int)(n + nw), timeout);
 
         /* Terminals first: input handling may close their windows. */
@@ -128,6 +132,7 @@ int main(void)
             archiver_child_exited(pid, status);
         }
 
+        saver_frame();
         gears_frame();
         browser_poll();
         unsigned int now = now_ms();

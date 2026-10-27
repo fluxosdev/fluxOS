@@ -522,6 +522,7 @@ struct opl_write {
 #define KEY_LWIN  0xDB
 #define KEY_RWIN  0xDC
 #define KEY_MENU  0xDD
+#define KEY_POWER 0xDE          /* the ACPI power button (sent by the kernel) */
 
 struct input_event {
     uint8_t  type;              /* IEV_KEY or IEV_MOUSE */

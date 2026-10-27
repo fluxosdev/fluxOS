@@ -566,6 +566,17 @@ void system_restart(void)
     reboot(REBOOT_RESTART);
 }
 
+void system_shutdown(void)
+{
+    wm_splash("shutting down...");
+    sync();
+    sound_shutdown();
+    reboot(REBOOT_POWEROFF);
+    /* still here: the machine cannot switch itself off */
+    wm_splash("it's now safe to turn off your computer");
+    reboot(REBOOT_HALT);
+}
+
 static void shutdown_command(struct dialog *d, int id)
 {
     int choice = d->radio;
@@ -574,13 +585,7 @@ static void shutdown_command(struct dialog *d, int id)
         return;
     switch (choice) {
     case OPT_SHUTDOWN:
-        wm_splash("shutting down...");
-        sync();
-        sound_shutdown();
-        reboot(REBOOT_POWEROFF);
-        /* still here: the machine cannot switch itself off */
-        wm_splash("it's now safe to turn off your computer");
-        reboot(REBOOT_HALT);
+        system_shutdown();
         break;
     case OPT_RESTART:
         system_restart();

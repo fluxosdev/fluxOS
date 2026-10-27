@@ -1464,6 +1464,11 @@ static struct window *modal_window(void)
 static void compose(struct rect r)
 {
     gfx_clip(&screen, r);
+    if (saver_active()) {
+        saver_draw(&screen, r);
+        gfx_noclip(&screen);
+        return;
+    }
     draw_desktop();
     struct window *modal = modal_window();
     for (struct window *w = bottom; w; w = w->above)
@@ -2658,6 +2663,11 @@ static int menu_step(int from, int dir)
 
 static void key_event(const struct input_event *ev)
 {
+    if (ev->code == KEY_POWER) {
+        if (ev->flags & IEV_PRESSED)
+            system_shutdown();          /* the power button: shut down cleanly */
+        return;
+    }
     if (!(ev->flags & IEV_PRESSED)) {
         /* Releases only matter to a window that follows keys held down. */
         if (!menu_open && focused && focused->ops && focused->ops->key)
@@ -2734,8 +2744,21 @@ static void key_event(const struct input_event *ev)
         desk_icons[desk_selected].open();
 }
 
+void wm_saver(int on)
+{
+    if (hw_cursor) {
+        if (on)
+            hide_cursor();
+        else if (load_cursor() < 0)
+            software_cursor();
+    }
+    wm_damage(mkrect(0, 0, screen_w, screen_h));
+}
+
 void wm_input(const struct input_event *ev)
 {
+    if (saver_input(ev))
+        return;
     if (ev->type == IEV_MOUSE)
         mouse_event(ev);
     else if (ev->type == IEV_KEY)

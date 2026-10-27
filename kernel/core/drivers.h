@@ -139,6 +139,7 @@ void time_set(uint32_t now);
 void machine_reboot(void) __attribute__((noreturn));
 int machine_poweroff(void);             /* returns only if it failed */
 void acpi_init(void);                   /* acpi.c: find the tables, at boot */
+void acpi_power_start(void);            /* acpi.c: the power button thread */
 void acpi_poweroff(void);               /* returns only if it failed */
 void machine_halt(void) __attribute__((noreturn));
 
