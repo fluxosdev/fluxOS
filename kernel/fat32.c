@@ -4,8 +4,8 @@
  *
  * Every vnode remembers where its 32-byte directory entry lives (the
  * parent directory's first cluster and the entry's byte offset), so
- * size and timestamp changes can be written back in place. All writes
- * go straight to disk; FAT updates are mirrored to every FAT copy.
+ * size and timestamp changes can be written back in place. Metadata writes
+ * use the write-back cache; FAT updates are mirrored to every FAT copy.
  *
  * FAT12 and FAT16 keep the root directory in a fixed area after the
  * FATs instead of a cluster chain; it is addressed as cluster FIXED_ROOT,
@@ -33,6 +33,14 @@
 #define LFN_CHARS 13
 #define MAX_DIR_BYTES (4u << 20)
 
+struct fat_edit {
+    uint32_t count;
+    uint32_t free_count, next_free;
+    int fsinfo_dirty;
+    struct bcache_update updates[BCACHE_BATCH_MAX];
+    uint8_t sectors[BCACHE_BATCH_MAX][512];
+};
+
 struct fat_fs {
     struct fs *fs;
     struct blockdev *bd;
@@ -52,6 +60,7 @@ struct fat_fs {
     uint32_t next_free;
     int fsinfo_dirty;
     uint8_t *clbuf;             /* one-cluster scratch buffer */
+    struct fat_edit *edit;      /* staged metadata, with the VFS lock held */
 };
 
 struct fat_node {
@@ -68,6 +77,60 @@ static uint32_t rd16(const uint8_t *p) { return p[0] | (uint32_t)p[1] << 8; }
 static uint32_t rd32(const uint8_t *p) { return rd16(p) | rd16(p + 2) << 16; }
 static void wr16(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void wr32(uint8_t *p, uint32_t v) { wr16(p, v); wr16(p + 2, v >> 16); }
+
+static const uint8_t *meta_read(struct fat_fs *f, uint32_t lba)
+{
+    if (f->edit)
+        for (uint32_t i = 0; i < f->edit->count; i++)
+            if (f->edit->updates[i].lba == lba)
+                return f->edit->sectors[i];
+    return bcache_read(f->bd, lba);
+}
+
+static int meta_write(struct fat_fs *f, uint32_t lba, const void *data)
+{
+    struct fat_edit *e = f->edit;
+    if (!e)
+        return bcache_write(f->bd, lba, data);
+    uint32_t i;
+    for (i = 0; i < e->count; i++)
+        if (e->updates[i].lba == lba)
+            break;
+    if (i == BCACHE_BATCH_MAX)
+        return -E2BIG;
+    if (i == e->count) {
+        e->updates[i].lba = lba;
+        e->updates[i].data = e->sectors[i];
+        e->count++;
+    }
+    memcpy(e->sectors[i], data, 512);
+    return 0;
+}
+
+static int edit_begin(struct fat_fs *f)
+{
+    f->edit = kzalloc(sizeof(*f->edit));
+    if (!f->edit)
+        return -ENOMEM;
+    f->edit->free_count = f->free_count;
+    f->edit->next_free = f->next_free;
+    f->edit->fsinfo_dirty = f->fsinfo_dirty;
+    return 0;
+}
+
+static int edit_end(struct fat_fs *f, int error)
+{
+    struct fat_edit *e = f->edit;
+    int r = error < 0 ? error : bcache_write_batch(f->bd, e->updates, e->count);
+    if (r < 0) {
+        f->free_count = e->free_count;
+        f->next_free = e->next_free;
+        f->fsinfo_dirty = e->fsinfo_dirty;
+    }
+    f->edit = NULL;
+    kfree(e);
+    return r;
+}
 
 /* ---- time conversion ---- */
 
@@ -128,11 +191,11 @@ static uint32_t fat_offset(struct fat_fs *f, uint32_t c)
  * entry may straddle two sectors. */
 static int fat_read16(struct fat_fs *f, uint32_t base, uint32_t off, uint32_t *v)
 {
-    const uint8_t *s = bcache_read(f->bd, base + off / 512);
+    const uint8_t *s = meta_read(f, base + off / 512);
     if (!s)
         return -EIO;
     *v = s[off % 512];
-    if (off % 512 == 511 && !(s = bcache_read(f->bd, base + off / 512 + 1)))
+    if (off % 512 == 511 && !(s = meta_read(f, base + off / 512 + 1)))
         return -EIO;
     *v |= (uint32_t)s[(off + 1) % 512] << 8;
     return 0;
@@ -147,12 +210,12 @@ static int fat_write16(struct fat_fs *f, uint32_t base, uint32_t off, uint32_t m
         if (!m)
             continue;
         uint32_t lba = base + (off + k) / 512, at = (off + k) % 512;
-        const uint8_t *s = bcache_read(f->bd, lba);
+        const uint8_t *s = meta_read(f, lba);
         if (!s)
             return -EIO;
         memcpy(sec, s, 512);
         sec[at] = (uint8_t)((sec[at] & ~m) | ((v >> (8 * k)) & m));
-        if (bcache_write(f->bd, lba, sec) < 0)
+        if (meta_write(f, lba, sec) < 0)
             return -EIO;
     }
     return 0;
@@ -163,7 +226,7 @@ static uint32_t fat_get(struct fat_fs *f, uint32_t c)
 {
     uint32_t off = fat_offset(f, c);
     if (f->bits == 32) {
-        const uint8_t *s = bcache_read(f->bd, f->reserved + off / 512);
+        const uint8_t *s = meta_read(f, f->reserved + off / 512);
         return s ? rd32(s + off % 512) & FAT_MASK : FAT_END;
     }
     uint32_t v;
@@ -195,13 +258,13 @@ static int fat_set(struct fat_fs *f, uint32_t c, uint32_t v)
     }
     for (uint32_t i = 0; i < f->nfats; i++) {
         uint32_t lba = f->reserved + i * f->fat_size + off / 512;
-        const uint8_t *s = bcache_read(f->bd, lba);
+        const uint8_t *s = meta_read(f, lba);
         if (!s)
             return -EIO;
         memcpy(sec, s, 512);
         uint32_t old = rd32(sec + off % 512);
         wr32(sec + off % 512, (old & ~FAT_MASK) | (v & FAT_MASK));
-        if (bcache_write(f->bd, lba, sec) < 0)
+        if (meta_write(f, lba, sec) < 0)
             return -EIO;
     }
     return 0;
@@ -239,7 +302,7 @@ static int flush_fsinfo(struct fat_fs *f)
     if (!f->fsinfo_dirty || f->fsinfo == 0 || f->fsinfo >= f->reserved)
         return 0;
     uint8_t sec[512];
-    const uint8_t *s = bcache_read(f->bd, f->fsinfo);
+    const uint8_t *s = meta_read(f, f->fsinfo);
     if (!s)
         return -EIO;
     if (rd32(s) != 0x41615252 || rd32(s + 484) != 0x61417272)
@@ -247,7 +310,7 @@ static int flush_fsinfo(struct fat_fs *f)
     memcpy(sec, s, 512);
     wr32(sec + 488, f->free_count);
     wr32(sec + 492, f->next_free);
-    int r = bcache_write(f->bd, f->fsinfo, sec);
+    int r = meta_write(f, f->fsinfo, sec);
     if (r == 0)
         f->fsinfo_dirty = 0;
     return r;
@@ -278,17 +341,18 @@ static uint32_t alloc_cluster(struct fat_fs *f)
     return 0;
 }
 
-static void free_chain(struct fat_fs *f, uint32_t c)
+static int free_chain(struct fat_fs *f, uint32_t c)
 {
     for (uint32_t guard = 0; !is_end(f, c) && guard < f->nclusters; guard++) {
         uint32_t next = fat_get(f, c);
         if (fat_set(f, c, 0) < 0)
-            return;
+            return -EIO;
         if (f->free_count != 0xFFFFFFFFu)
             f->free_count++;
         f->fsinfo_dirty = 1;
         c = next;
     }
+    return 0;
 }
 
 /* Cluster number `idx` of a chain, optionally extending the chain. */
@@ -387,7 +451,7 @@ static int slot_read(struct fat_fs *f, uint32_t dir_first, uint32_t off, uint8_t
     uint32_t lba;
     if (slot_location(f, dir_first, off, &lba) < 0)
         return -EIO;
-    const uint8_t *s = bcache_read(f->bd, lba);
+    const uint8_t *s = meta_read(f, lba);
     if (!s)
         return -EIO;
     memcpy(ent, s + off % 512, 32);
@@ -400,12 +464,12 @@ static int slot_write(struct fat_fs *f, uint32_t dir_first, uint32_t off, const 
     uint32_t lba;
     if (slot_location(f, dir_first, off, &lba) < 0)
         return -EIO;
-    const uint8_t *s = bcache_read(f->bd, lba);
+    const uint8_t *s = meta_read(f, lba);
     if (!s)
         return -EIO;
     memcpy(sec, s, 512);
     memcpy(sec + off % 512, ent, 32);
-    return bcache_write(f->bd, lba, sec);
+    return meta_write(f, lba, sec);
 }
 
 static uint8_t short_checksum(const uint8_t *name11)
@@ -811,6 +875,7 @@ static int update_entry(struct fat_fs *f, struct vnode *vn)
         return -EIO;
     uint32_t date, time;
     unix_to_fat(vn->mtime, &date, &time);
+    e[11] = n->attr;
     wr16(e + 20, n->first >> 16);
     wr16(e + 26, n->first & 0xFFFF);
     wr32(e + 28, vn->type == VN_DIR ? 0 : vn->size);
@@ -938,27 +1003,49 @@ static int fat_truncate(struct vnode *vn, uint32_t size)
     struct fat_fs *f = vn->fs->priv;
     struct fat_node *nd = vn->fs_data;
     int r = 0;
-    if (size > vn->size) {
-        r = zero_fill(f, vn, vn->size, size);
-    } else if (size < vn->size) {
+    if (size < vn->size) {
+        /* Commit the smaller size and detached chain together before any
+         * cluster can be reused. An error leaves the original file intact. */
+        struct fat_node saved = *nd;
+        uint32_t old_size = vn->size, old_mtime = vn->mtime;
+        uint32_t tail = 0;
+        r = edit_begin(f);
+        if (r < 0)
+            return r;
         uint32_t keep = (size + f->cluster_bytes - 1) / f->cluster_bytes;
-        if (keep == 0) {
-            free_chain(f, nd->first);
+        if (!keep) {
+            tail = nd->first;
             nd->first = 0;
         } else {
             uint32_t c = node_cluster(f, nd, keep - 1, 0);
-            if (c) {
-                uint32_t next = fat_get(f, c);
-                if (!is_end(f, next)) {
-                    fat_set(f, c, FAT_END);
-                    free_chain(f, next);
-                }
+            if (!c) {
+                r = -EIO;
+            } else {
+                tail = fat_get(f, c);
+                if (!is_end(f, tail))
+                    r = fat_set(f, c, FAT_END);
             }
         }
-        nd->seek_idx = 0;
-        nd->seek_clus = 0;
         vn->size = size;
+        vn->mtime = time_now();
+        if (!r)
+            r = update_entry(f, vn);
+        r = edit_end(f, r);
+        if (r < 0) {
+            *nd = saved;
+            vn->size = old_size;
+            vn->mtime = old_mtime;
+            return r;
+        }
+        nd->seek_idx = nd->seek_clus = 0;
+        /* A later free failure can leak space, but cannot leave a live file
+         * pointing at freed clusters. Report it rather than claim success. */
+        r = free_chain(f, tail);
+        int info = flush_fsinfo(f);
+        return r < 0 ? r : info;
     }
+    if (size > vn->size)
+        r = zero_fill(f, vn, vn->size, size);
     vn->mtime = time_now();
     int meta = update_entry(f, vn);
     int info = flush_fsinfo(f);
@@ -1035,33 +1122,57 @@ static int fat_remove(struct vnode *vn)
     return 0;
 }
 
-static int fat_rename(struct vnode *vn, struct vnode *newdir, const char *newname)
+static int fat_rename(struct vnode *vn, struct vnode *newdir, const char *newname,
+                      struct vnode *dst)
 {
     struct fat_fs *f = vn->fs->priv;
     struct fat_node *n = vn->fs_data;
     struct fat_node *nd = newdir->fs_data;
-    uint32_t ent_off, lfn_count;
-    int r = add_entry(f, newdir, newname, n->attr, n->first,
-                      vn->type == VN_DIR ? 0 : vn->size, vn->mtime, &ent_off, &lfn_count);
-    if (r < 0)
-        return r;
-    r = delete_entry(f, n);
+    struct fat_node saved_dir = *nd;
+    struct fat_node target = *n;
+    int r = edit_begin(f);
     if (r < 0)
         return r;
 
-    if (vn->type == VN_DIR && n->dir_first != nd->first && n->first) {
+    target.dir_first = nd->first;
+    if (dst) {
+        /* Reuse the destination's name slots, keeping its old chain alive
+         * for open descriptors until VFS drops the last reference. */
+        struct fat_node *old = dst->fs_data;
+        target.ent_off = old->ent_off;
+        target.lfn_count = old->lfn_count;
+        struct vnode moved = *vn;
+        moved.fs_data = &target;
+        r = update_entry(f, &moved);
+    } else {
+        r = add_entry(f, newdir, newname, n->attr, n->first,
+                      vn->type == VN_DIR ? 0 : vn->size, vn->mtime,
+                      &target.ent_off, &target.lfn_count);
+    }
+    if (!r)
+        r = delete_entry(f, n);
+    if (!r && vn->type == VN_DIR && n->dir_first != nd->first && n->first) {
         uint8_t e[32];
         uint32_t parent = nd->first == f->root_clus ? 0 : nd->first;
-        if (slot_read(f, n->first, 32, e) == 0 && e[0] == '.' && e[1] == '.') {
+        r = slot_read(f, n->first, 32, e);
+        if (!r && (e[0] != '.' || e[1] != '.'))
+            r = -EIO;
+        if (!r) {
             wr16(e + 20, parent >> 16);
             wr16(e + 26, parent & 0xFFFF);
-            slot_write(f, n->first, 32, e);
+            r = slot_write(f, n->first, 32, e);
         }
     }
-    n->dir_first = nd->first;
-    n->ent_off = ent_off;
-    n->lfn_count = lfn_count;
-    flush_fsinfo(f);
+    if (!r)
+        r = flush_fsinfo(f);
+    r = edit_end(f, r);
+    if (r < 0) {
+        *nd = saved_dir;
+        return r;
+    }
+    *n = target;
+    if (dst)
+        ((struct fat_node *)dst->fs_data)->unlinked = 1;
     return 0;
 }
 

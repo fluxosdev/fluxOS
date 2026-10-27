@@ -63,6 +63,15 @@ int blk_write_at(struct blockdev *bd, uint32_t base, uint32_t off, uint32_t n, c
 const uint8_t *bcache_read(struct blockdev *bd, uint32_t lba);
 int bcache_write(struct blockdev *bd, uint32_t lba, const void *data);
 
+/* Stage a bounded metadata change atomically in the write-back cache. The
+ * caller holds the VFS lock. This does not provide power-loss atomicity. */
+#define BCACHE_BATCH_MAX 16
+struct bcache_update {
+    uint32_t lba;
+    const void *data;
+};
+int bcache_write_batch(struct blockdev *bd, const struct bcache_update *updates, uint32_t count);
+
 /* Write back dirty cached sectors and flush the drive (VFS lock held). */
 int blk_sync(struct blockdev *bd);
 int blk_sync_all(void);

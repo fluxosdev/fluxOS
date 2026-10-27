@@ -436,15 +436,14 @@ int vfs_rename(const char *from, const char *to, struct vnode *cwd)
         } else if (src->type == VN_DIR) {
             return -ENOTDIR;
         }
-        if (dst->fs && (r = dst->fs->ops->remove(dst)) < 0)
-            return r;
+    }
+    if (src->fs && (r = src->fs->ops->rename(src, dir, name, dst)) < 0)
+        return r;
+    if (dst) {
         detach(dst);
         if (dst->refs <= 0)
             vnode_free(dst);
     }
-    if (src->fs && (r = src->fs->ops->rename(src, dir, name)) < 0)
-        return r;
-
     detach(src);
     strcpy(src->name, name);
     attach(dir, src);

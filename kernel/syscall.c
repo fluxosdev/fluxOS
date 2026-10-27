@@ -341,8 +341,11 @@ static int sys_open(uint32_t upath, uint32_t flags, uint32_t c, uint32_t d, uint
         return -ENOTDIR;
     if (vn->type == VN_DIR && writable)
         return -EISDIR;
-    if ((flags & O_TRUNC) && writable && vn->type == VN_FILE)
-        vfs_truncate(vn, 0);
+    if ((flags & O_TRUNC) && writable && vn->type == VN_FILE) {
+        r = vfs_truncate(vn, 0);
+        if (r < 0)
+            return r;
+    }
 
     if (vn->type == VN_CHR && vn->dev_open && (r = vn->dev_open(vn, (int)flags)) < 0)
         return r;

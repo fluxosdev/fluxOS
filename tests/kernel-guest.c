@@ -56,12 +56,25 @@ int main(void)
     CHECK(close(fd) == 0);
     CHECK(umount("/mnt/regress") == -1 && errno == EBUSY);
     CHECK(close(alias) == 0);
+    int src = open("/mnt/regress/SOURCE.TXT", O_CREAT | O_RDWR, 0600); CHECK(src >= 0);
+    CHECK(write(src, "source", 6) == 6);
+    int dst = open("/mnt/regress/TARGET.TXT", O_CREAT | O_RDWR, 0600); CHECK(dst >= 0);
+    CHECK(write(dst, "target", 6) == 6);
+    CHECK(rename("/mnt/regress/SOURCE.TXT", "/mnt/regress/TARGET.TXT") == 0);
+    CHECK(lseek(dst, 0, SEEK_SET) == 0);
+    CHECK(read(dst, buf, 6) == 6 && !memcmp(buf, "target", 6));
+    CHECK(ftruncate(src, 3) == 0);
+    CHECK(close(src) == 0 && close(dst) == 0);
     CHECK(umount("/mnt/regress") == 0);
     CHECK(mount("/dev/hda", "/mnt/regress", "fat32") == 0);
     fresh = open("/mnt/regress/NEW.TXT", O_RDONLY); CHECK(fresh >= 0);
     CHECK(read(fresh, buf, 8) == 8 && !memcmp(buf, "new data", 8));
-    CHECK(close(fresh) == 0 && umount("/mnt/regress") == 0);
-    puts("guest: open/unlink/write/close and FAT remount persistence passed");
+    CHECK(close(fresh) == 0);
+    CHECK(open("/mnt/regress/SOURCE.TXT", O_RDONLY) == -1 && errno == ENOENT);
+    dst = open("/mnt/regress/TARGET.TXT", O_RDONLY); CHECK(dst >= 0);
+    CHECK(read(dst, buf, sizeof(buf)) == 3 && !memcmp(buf, "sou", 3));
+    CHECK(close(dst) == 0 && umount("/mnt/regress") == 0);
+    puts("guest: unlink/rename open-file lifetime, truncate and FAT remount persistence passed");
     puts("KERNEL REGRESSIONS PASSED");
     stop();
 }

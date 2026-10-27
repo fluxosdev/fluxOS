@@ -10,6 +10,11 @@
 #undef WEXITSTATUS
 #undef WIFSIGNALED
 #undef WTERMSIG
+/* Host tests have no kernel TSS. Keep process selection in the harness
+ * while including the production process layout and kernel sources. */
+#include "../kernel/proc.h"
+#undef current
+extern struct proc *current;
 /* glibc versions before 2.38 do not declare these kernel string helpers. */
 size_t strlcpy(char *dst, const char *src, size_t size);
 size_t strlcat(char *dst, const char *src, size_t size);

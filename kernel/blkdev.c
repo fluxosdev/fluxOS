@@ -25,6 +25,7 @@ struct bcache_entry {
     uint32_t stamp;
     int valid;
     int dirty;                  /* newer than the disk */
+    int pinned;                 /* reserved by a metadata batch */
     uint8_t data[BLK_MAX_SECTOR];
 };
 
@@ -142,12 +143,16 @@ static struct bcache_entry *lookup(struct blockdev *disk, uint32_t lba, int *hit
             e->stamp = ++bcache_clock;
             return e;
         }
+        if (e->pinned)
+            continue;
         struct bcache_entry **best = e->dirty ? &dirty : &clean;
         if (!*best || e->stamp < (*best)->stamp)
             *best = e;
     }
     *hit = 0;
     struct bcache_entry *v = free ? free : clean ? clean : dirty;
+    if (!v)
+        return NULL;
     if (v->valid && v->dirty && write_entry(v) < 0)
         return NULL;
     v->valid = 0;
@@ -196,6 +201,38 @@ int bcache_write(struct blockdev *bd, uint32_t lba, const void *data)
     e->dirty = 1;
     e->stamp = ++bcache_clock;
     return 0;
+}
+
+int bcache_write_batch(struct blockdev *bd, const struct bcache_update *updates, uint32_t count)
+{
+    struct bcache_entry *held[BCACHE_BATCH_MAX];
+    uint32_t n = 0;
+    int r = -EIO;
+    if (count > BCACHE_BATCH_MAX)
+        return -E2BIG;
+    if (bd->readonly || !(bd->parent ? bd->parent : bd)->write)
+        return -EROFS;
+    /* Resolve all fallible cache misses/evictions before changing any bytes.
+     * Pin earlier entries so a later miss cannot evict part of the batch. */
+    for (; n < count; n++) {
+        if (!bcache_read(bd, updates[n].lba))
+            goto out;
+        uint32_t lba = updates[n].lba;
+        struct blockdev *disk = translate(bd, &lba);
+        int hit;
+        held[n] = lookup(disk, lba, &hit);
+        held[n]->pinned++;
+    }
+    /* No I/O or allocation below this point: commit under the VFS lock. */
+    for (uint32_t i = 0; i < count; i++) {
+        memcpy(held[i]->data, updates[i].data, bd->sector_size);
+        held[i]->dirty = 1;
+    }
+    r = 0;
+out:
+    while (n)
+        held[--n]->pinned--;
+    return r;
 }
 
 static void drop_cache(struct blockdev *disk)

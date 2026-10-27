@@ -27,7 +27,9 @@ struct fs_ops {
     int (*truncate)(struct vnode *vn, uint32_t size);
     int (*create)(struct vnode *dir, const char *name, int type, struct vnode **out);
     int (*remove)(struct vnode *vn);
-    int (*rename)(struct vnode *vn, struct vnode *newdir, const char *newname);
+    /* On success, replace dst's directory entry (if present). On failure,
+     * leave both names intact. VFS detaches dst only after success. */
+    int (*rename)(struct vnode *vn, struct vnode *newdir, const char *newname, struct vnode *dst);
     void (*release)(struct vnode *vn);
     void (*statfs)(struct fs *fs, struct statfs *st);
 };

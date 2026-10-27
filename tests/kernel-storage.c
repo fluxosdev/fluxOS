@@ -8,11 +8,12 @@ static struct blockdev bd;
 static struct proc task = { .pid = 7 };
 struct proc *current = &task;
 static int fail_lba = -1, fail_sync, synced, require_lock, sync_calls;
+static int fail_alloc, fail_once;
 static struct fs *mounted_fs;
 static struct vnode *cover;
 void *kmalloc(size_t n) { return malloc(n); }
-void *kzalloc(size_t n) { return calloc(1, n); }
-void *krealloc(void *p, size_t n) { return realloc(p, n); }
+void *kzalloc(size_t n) { return fail_alloc ? NULL : calloc(1, n); }
+void *krealloc(void *p, size_t n) { return fail_alloc ? NULL : realloc(p, n); }
 void kfree(void *p) { free(p); }
 void panic(const char *fmt, ...) { (void)fmt; abort(); }
 void sleep_on(void *p) { (void)p; abort(); } /* no competing tasks in this harness */
@@ -42,8 +43,24 @@ const uint8_t *bcache_read(struct blockdev *dev, uint32_t lba)
 int bcache_write(struct blockdev *dev, uint32_t lba, const void *in)
 {
     if (require_lock) CHECK(lock_owner == current->pid);
-    if ((int)lba == fail_lba) return -EIO;
+    if ((int)lba == fail_lba) {
+        if (fail_once) { fail_lba = -1; fail_once = 0; }
+        return -EIO;
+    }
     return blk_write(dev, lba, 1, in);
+}
+int bcache_write_batch(struct blockdev *dev, const struct bcache_update *u, uint32_t n)
+{
+    CHECK(n <= BCACHE_BATCH_MAX);
+    if (require_lock) CHECK(lock_owner == current->pid);
+    for (uint32_t i = 0; i < n; i++) {
+        if (u[i].lba >= 64 || (int)u[i].lba == fail_lba) {
+            if (fail_once) { fail_lba = -1; fail_once = 0; }
+            return -EIO;
+        }
+    }
+    for (uint32_t i = 0; i < n; i++) CHECK(blk_write(dev, u[i].lba, 1, u[i].data) == 0);
+    return 0;
 }
 int blk_sync(struct blockdev *dev)
 {
@@ -58,6 +75,7 @@ static void setup(void)
 {
     memset(disk, 0, sizeof(disk)); memset(&bd, 0, sizeof(bd));
     fail_lba = -1; fail_sync = synced = require_lock = sync_calls = 0;
+    fail_alloc = fail_once = 0;
     bd.sector_size = 512; bd.nsectors = 64;
     wr16(disk[0] + 11, 512); disk[0][13] = 1;
     wr16(disk[0] + 14, 2); disk[0][16] = 1;
@@ -187,8 +205,161 @@ static void unlinked_directory(void)
     CHECK(umount_fs(mounted_fs, 0) == -EBUSY);
     vfs_unref(dir); finish();
 }
+/* A failed truncate must preserve both metadata and data, and never make
+ * clusters reachable from a live file available to another allocation. */
+static void truncate_errors(void)
+{
+    const int sectors[] = { 2, 3 }; /* FAT and directory metadata */
+    for (unsigned i = 0; i < sizeof(sectors) / sizeof(sectors[0]); i++) {
+        for (int zero = 0; zero < 2; zero++) {
+            if (zero && sectors[i] == 2) continue; /* freeing is after commit */
+            setup();
+            struct vnode *vn = create_file("CHAIN.TXT", "a");
+            char data[1024]; memset(data, 'A', sizeof(data));
+            CHECK(vfs_write(vn, data, 0, sizeof(data)) == sizeof(data));
+            struct fat_fs *f = mounted_fs->priv;
+            struct fat_node *nd = vn->fs_data;
+            uint32_t first = nd->first, second = fat_get(f, first);
+            uint8_t before[sizeof(disk)]; memcpy(before, disk, sizeof(disk));
+            fail_lba = sectors[i]; fail_once = 1;
+            CHECK(vfs_truncate(vn, zero ? 0 : 512) == -EIO);
+            CHECK(vn->size == 1024 && nd->first == first);
+            CHECK(!memcmp(before, disk, sizeof(disk)));
+            CHECK(vfs_truncate(vn, 512) == 0);
+            CHECK(fat_get(f, first) == FAT_END && fat_get(f, second) == 0);
+            f->next_free = second;
+            struct vnode *other = create_file("OTHER.TXT", "other data");
+            CHECK(((struct fat_node *)other->fs_data)->first == second);
+            CHECK(vfs_write(vn, "new tail", 512, 8) == 8);
+            char buf[10];
+            CHECK(vfs_read(other, buf, 0, sizeof(buf)) == sizeof(buf));
+            CHECK(!memcmp(buf, "other data", sizeof(buf)));
+            finish();
+        }
+    }
+    /* Failure while reclaiming an already detached chain is reported. */
+    setup(); struct vnode *vn = create_file("ZERO.TXT", "data");
+    uint32_t first = ((struct fat_node *)vn->fs_data)->first;
+    fail_lba = 2; fail_once = 1;
+    CHECK(vfs_truncate(vn, 0) == -EIO);
+    CHECK(vn->size == 0 && ((struct fat_node *)vn->fs_data)->first == 0);
+    CHECK(fat_get(mounted_fs->priv, first) == FAT_END);
+    finish();
+}
+
+static void rename_errors(void)
+{
+    for (int replace = 0; replace < 2; replace++) {
+        /* Allocation failure, source-sector failure, destination-sector failure. */
+        for (int failure = 0; failure < 3; failure++) {
+            setup();
+            struct vnode *srcdir, *dstdir, *src, *dst = NULL, *found;
+            CHECK(vfs_create(mounted_fs->root, "SRC", VN_DIR, &srcdir) == 0);
+            CHECK(vfs_create(mounted_fs->root, "DST", VN_DIR, &dstdir) == 0);
+            CHECK(vfs_create(srcdir, "long source name.txt", VN_FILE, &src) == 0);
+            CHECK(vfs_write(src, "source", 0, 6) == 6);
+            if (replace) {
+                CHECK(vfs_create(dstdir, "long target name.txt", VN_FILE, &dst) == 0);
+                CHECK(vfs_write(dst, "target", 0, 6) == 6);
+                vfs_ref(dst);
+            }
+            struct fat_fs *f = mounted_fs->priv;
+            uint8_t before[sizeof(disk)]; memcpy(before, disk, sizeof(disk));
+            if (!failure) fail_alloc = 1;
+            else fail_lba = (int)cluster_lba(f, ((struct fat_node *)(failure == 1 ? srcdir : dstdir)->fs_data)->first);
+            CHECK(vfs_rename("/mnt/SRC/long source name.txt", "/mnt/DST/long target name.txt", NULL)
+                  == (!failure ? -ENOMEM : -EIO));
+            fail_alloc = 0; fail_lba = -1;
+            CHECK(!memcmp(before, disk, sizeof(disk)));
+            CHECK(vfs_resolve("/mnt/SRC/long source name.txt", NULL, &found) == 0 && found == src);
+            int r = vfs_resolve("/mnt/DST/long target name.txt", NULL, &found);
+            CHECK(replace ? r == 0 && found == dst : r == -ENOENT);
+            CHECK(vfs_rename("/mnt/SRC/long source name.txt", "/mnt/DST/long target name.txt", NULL) == 0);
+            CHECK(vfs_resolve("/mnt/DST/long target name.txt", NULL, &found) == 0 && found == src);
+            if (dst) {
+                char buf[6];
+                CHECK(vfs_read(dst, buf, 0, 6) == 6 && !memcmp(buf, "target", 6));
+                vfs_unref(dst);
+            }
+            finish();
+        }
+    }
+}
+
+static void directory_rename_errors(void)
+{
+    setup();
+    struct vnode *dir, *parent, *found;
+    CHECK(vfs_create(mounted_fs->root, "MOVE", VN_DIR, &dir) == 0);
+    CHECK(vfs_create(mounted_fs->root, "PARENT", VN_DIR, &parent) == 0);
+    struct fat_fs *f = mounted_fs->priv;
+    uint8_t before[sizeof(disk)]; memcpy(before, disk, sizeof(disk));
+    fail_lba = (int)cluster_lba(f, ((struct fat_node *)dir->fs_data)->first);
+    CHECK(vfs_rename("/mnt/MOVE", "/mnt/PARENT/MOVED", NULL) == -EIO);
+    CHECK(!memcmp(before, disk, sizeof(disk)));
+    CHECK(vfs_resolve("/mnt/MOVE", NULL, &found) == 0 && found == dir);
+    fail_lba = -1;
+    CHECK(vfs_rename("/mnt/MOVE", "/mnt/PARENT/MOVED", NULL) == 0);
+    uint8_t e[32];
+    CHECK(slot_read(f, ((struct fat_node *)dir->fs_data)->first, 32, e) == 0);
+    CHECK(rd16(e + 26) == ((struct fat_node *)parent->fs_data)->first);
+    finish();
+
+    /* Growing a full destination directory also stages FAT and FSInfo. */
+    setup();
+    create_file("SOURCE.TXT", "data");
+    CHECK(vfs_create(mounted_fs->root, "FULL", VN_DIR, &dir) == 0);
+    for (int i = 0; i < 14; i++) {
+        char name[16]; snprintf(name, sizeof(name), "F%d.TXT", i);
+        CHECK(vfs_create(dir, name, VN_FILE, &found) == 0);
+    }
+    f = mounted_fs->priv;
+    struct fat_node saved = *(struct fat_node *)dir->fs_data;
+    uint32_t free_before = f->free_count, next_before = f->next_free;
+    memcpy(before, disk, sizeof(disk));
+    fail_lba = 3;
+    CHECK(vfs_rename("/mnt/SOURCE.TXT", "/mnt/FULL/long destination name.txt", NULL) == -EIO);
+    CHECK(!memcmp(before, disk, sizeof(disk)));
+    CHECK(!memcmp(&saved, dir->fs_data, sizeof(saved)));
+    CHECK(f->free_count == free_before && f->next_free == next_before);
+    fail_lba = -1;
+    CHECK(vfs_rename("/mnt/SOURCE.TXT", "/mnt/FULL/long destination name.txt", NULL) == 0);
+    CHECK(vfs_resolve("/mnt/FULL/long destination name.txt", NULL, &found) == 0);
+    finish();
+}
+
+static void mirrored_truncate_errors(void)
+{
+    /* FAT12 cluster 341 straddles a sector boundary. Also exercise both
+     * FAT copies for FAT16/32 without requiring a large host disk image. */
+    const int bits[] = { 12, 16, 32 };
+    for (unsigned i = 0; i < sizeof(bits) / sizeof(bits[0]); i++) {
+        memset(disk, 0, sizeof(disk)); memset(&bd, 0, sizeof(bd));
+        synced = fail_once = fail_alloc = 0; fail_lba = -1;
+        bd.sector_size = 512; bd.nsectors = 64;
+        struct fat_fs f = { .bd = &bd, .bits = bits[i], .reserved = 2, .nfats = 2,
+                            .fat_size = 8, .cluster_bytes = 512, .nclusters = 512,
+                            .root_lba = 20, .root_secs = 1 };
+        struct fs fs = { .priv = &f };
+        struct fat_node nd = { .first = 341, .dir_first = FIXED_ROOT };
+        struct vnode vn = { .fs = &fs, .fs_data = &nd, .type = VN_FILE, .size = 1024 };
+        CHECK(fat_set(&f, 341, 342) == 0 && fat_set(&f, 342, FAT_END) == 0);
+        CHECK(update_entry(&f, &vn) == 0);
+        uint8_t before[sizeof(disk)]; memcpy(before, disk, sizeof(disk));
+        fail_lba = (int)(f.reserved + f.fat_size + fat_offset(&f, 341) / 512);
+        CHECK(fat_truncate(&vn, 512) == -EIO);
+        CHECK(vn.size == 1024 && !memcmp(before, disk, sizeof(disk)));
+        fail_lba = -1;
+        CHECK(fat_truncate(&vn, 512) == 0);
+        CHECK(is_end(&f, fat_get(&f, 341)) && fat_get(&f, 342) == 0);
+        f.reserved += f.fat_size;
+        CHECK(is_end(&f, fat_get(&f, 341)) && fat_get(&f, 342) == 0);
+    }
+}
+
 int main(void)
 {
     unlink_lifetime(); rename_lifetime(); metadata_errors(); unmount_errors(); unlinked_directory();
-    puts("kernel storage: unlink/rename lifetime, mount references, metadata errors and flush retries passed");
+    truncate_errors(); rename_errors(); directory_rename_errors(); mirrored_truncate_errors();
+    puts("kernel storage: lifetime, mount references, atomic rename/truncate failures and flush retries passed");
 }
