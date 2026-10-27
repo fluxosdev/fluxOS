@@ -1,5 +1,5 @@
 #include "kernel-test.h"
-#include "../kernel/proc.c"
+#include "../kernel/core/proc.c"
 
 struct cpu cpus[MAX_CPUS];
 int ncpus;

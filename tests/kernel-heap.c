@@ -1,5 +1,5 @@
 #include "kernel-test.h"
-#include "../kernel/heap.c"
+#include "../kernel/core/heap.c"
 void klog(const char *fmt, ...) { (void)fmt; }
 void panic(const char *fmt, ...) { (void)fmt; abort(); }
 int main(void)

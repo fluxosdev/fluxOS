@@ -8,12 +8,12 @@ building fluxOS does not need this script, Python or PIL.
                            box drawing and symbols, for DOS programs), from
                            the Linux console fonts Lat15-VGA16 (ASCII) and
                            Uni2-VGA16 (the rest), both in the kbd package
-  user/desktop/font_sans.c the classic theme's proportional UI fonts (regular
+  user/desktop/shell/font_sans.c the classic theme's proportional UI fonts (regular
                            and bold, and a larger bold one for the Start menu
                            banner), ASCII 32-126, rasterised anti-aliased (4
                            bits of coverage per pixel) from Liberation Sans
                            (SIL Open Font License 1.1)
-  user/desktop/font_archivo.c
+  user/desktop/shell/font_archivo.c
                            the Kinetik theme's UI fonts, the same way, from
                            Archivo (https://fonts.google.com/specimen/Archivo,
                            SIL Open Font License 1.1): Medium and Bold at 12
@@ -293,6 +293,6 @@ if __name__ == "__main__":
         write_webfonts("rootfs/usr/share/fonts/web.fnt")
         raise SystemExit(0)
     write_font8x16("lib/font8x16.c")
-    write_sans("user/desktop/font_sans.c")
-    write_archivo("user/desktop/font_archivo.c")
+    write_sans("user/desktop/shell/font_sans.c")
+    write_archivo("user/desktop/shell/font_archivo.c")
     write_webfonts("rootfs/usr/share/fonts/web.fnt")

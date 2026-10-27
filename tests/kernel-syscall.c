@@ -1,6 +1,6 @@
 #include "kernel-test.h"
 #include <sys/mman.h>
-#include "../kernel/syscall.c"
+#include "../kernel/core/syscall.c"
 struct proc *current;
 static int calls, truncate_error, opens;
 static struct vnode open_vnode = { .type = VN_FILE };

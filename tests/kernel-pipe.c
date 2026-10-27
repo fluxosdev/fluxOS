@@ -1,5 +1,5 @@
 #include "kernel-test.h"
-#include "../kernel/file.c"
+#include "../kernel/fs/file.c"
 struct proc *current;
 static int sleeps;
 void sleep_on(void *p) { (void)p; sleeps++; }

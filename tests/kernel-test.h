@@ -12,7 +12,7 @@
 #undef WTERMSIG
 /* Host tests have no kernel TSS. Keep process selection in the harness
  * while including the production process layout and kernel sources. */
-#include "../kernel/proc.h"
+#include "../kernel/core/proc.h"
 #undef current
 extern struct proc *current;
 /* glibc versions before 2.38 do not declare these kernel string helpers. */

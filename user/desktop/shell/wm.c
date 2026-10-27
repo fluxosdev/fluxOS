@@ -2744,7 +2744,7 @@ void wm_input(const struct input_event *ev)
 
 /* The shutdown screen: Kinetik Blue's wallpaper, whatever the theme, with
  * the logo and the message under it in Archivo, as the startup screen has
- * them (kernel/splash.c). */
+ * them (kernel/video/splash.c). */
 void wm_splash(const char *message)
 {
     gfx_noclip(&screen);

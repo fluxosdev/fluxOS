@@ -10,12 +10,12 @@
  * way; once the kernel has started init it creeps on with the timer,
  * slower as it nears the end, until the desktop takes over.
  *
- * Like the console, this runs before kernel/cpu.c has checked the
+ * Like the console, this runs before kernel/core/cpu.c has checked the
  * processor, so it is built for any 386 (see the Makefile).
  */
 #include "kernel.h"
 #include "drivers.h"
-#include "../user/desktop/font.h"
+#include "../../user/desktop/shell/font.h"
 #include <flux/logo.h>
 
 #define FULL       1000                 /* progress, in thousandths */

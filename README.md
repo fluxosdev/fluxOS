@@ -539,24 +539,30 @@ include/flux/              kernel <-> user ABI (syscall numbers, structs, errno)
 lib/                       string/printf routines and the 8x16 font, shared by kernel and libc
 tools/                     mkfont.py (fonts), oxygen-icons.py (icons), mksounds.py (sounds),
                            mklogo.py (the logo for the startup and shutdown screens)
-kernel/                    boot.S, entry.S, gdt/idt/pmm/vmm/heap, proc/exec/syscall,
-                           vfs/file/initrd, ata/ahci/floppy/blkdev/pci, usb*/uhci/ohci/
-                           ehci/xhci, automount, fat32/iso9660, tty/vga/serial/keyboard/
-                           timer, fb/mouse/input, voodoo, radeon*, pcspkr/sb16/opl/hda,
-                           fpu, ne2000/forcedeth/mii/net/tcp/socket, kmain
+kernel/core/               boot.S, entry.S, kmain, cpu/fpu/sse, gdt/idt, smp, timer,
+                           pmm/vmm/heap, proc/exec/syscall, acpi/pci, tty/serial/kprintf
+kernel/fs/                 vfs/file/initrd, blkdev, automount, fat32/iso9660
+kernel/storage/            ata, ahci, floppy
+kernel/usb/                usb core, hid/hub/msc, uhci/ohci/ehci/xhci
+kernel/input/              input, keyboard, mouse
+kernel/net/                net/tcp/socket, ne2000, forcedeth/mii
+kernel/sound/              pcspkr, sb16/opl/isadma, hda
+kernel/video/              fb/vga, the startup screen (splash.c), voodoo, radeon*, atom
 user/libc, user/include    the C library (math.c is the x87 math library; http.c and
                            inflate.c are the HTTP/1.1 client and Deflate) and headers
 user/gl/                   the OpenGL library and its backends
 user/fsh/                  the shell
-user/desktop/              compositor and window manager (wm.c), apps (files, edit,
-                           calc, player, taskmgr, diskmgr, display, setup, gears,
-                           mines, sound), the themes (theme.c; fonts in font_sans.c and
-                           font_archivo.c), PNG/JPEG/GIF/ICO/SVG decoding (png.c, jpeg.c,
-                           gif.c, ico.c, svg.c, image.c), the wallpaper, and the browser:
-                           window (browser.c), HTML (html.c), CSS (css.c), layout
-                           (layout.c), shadow composition (shadow.c), fonts (webfont.c),
-                           URLs (webutil.c), request policy (webpolicy.c), and
-                           JavaScript (js.c, jslib*.c, jsbinary.c, jsre.c, jsgc.c, jsdom.c)
+user/desktop/shell/        compositor and window manager (wm.c), widgets, drawing (gfx.c),
+                           icons, sound, the wallpaper, dialogs (apps.c) and the themes
+                           (theme.c; fonts in font_sans.c and font_archivo.c)
+user/desktop/apps/         files, edit, calc, player, paint, term, taskmgr, diskmgr,
+                           display, datetime, setup, archiver, clock, gears, mines
+user/desktop/image/        PNG/JPEG/GIF/WebP/ICO/SVG decoding (image.c picks the decoder)
+user/desktop/wave/         the Wave browser: window (browser.c), HTML (html.c), CSS
+                           (css.c), layout (layout.c), shadow composition (shadow.c),
+                           fonts (webfont.c), URLs (webutil.c), request policy
+                           (webpolicy.c), cookies, storage and <canvas> (canvas.c)
+user/desktop/wave/js/      JavaScript (js.c, jslib*.c, jsbinary.c, jsre.c, jsgc.c, jsdom.c)
 third_party/mbedtls/        upstream verification library subset and its fluxOS config
 user/dos/                  the DOS emulator (CPU, DPMI, BIOS, video, files, sound)
 user/bin/                  one program per file (fluxinstall.c is the installer)
@@ -611,7 +617,7 @@ whose registers the FPU holds. Its first x87, MMX or SSE instruction raises
 #NM, and the handler swaps the 512-byte FXSAVE state; a process starts from a
 clean image (default control words, every register zero). CR4.OSXMMEXCPT turns
 unmasked SIMD exceptions into SIGFPE. The kernel's C code stays off these
-registers (`-mgeneral-regs-only`); `kernel/sse.S` borrows four XMM registers
+registers (`-mgeneral-regs-only`); `kernel/core/sse.S` borrows four XMM registers
 for page and framebuffer moves with interrupts off, saving them on its stack
 and putting CR0.TS back, so whichever process owns the FPU never notices.
 User space does float arithmetic in SSE and doubles on the x87; code using

@@ -16,4 +16,4 @@ for name, value in sorted(html5.items()):
     assert 1 <= len(points) <= 2
     output.append(f'    {{ "{name}", 0x{points[0]:X}, 0x{points[1] if len(points) > 1 else 0:X} }},')
 output.append("};\n")
-Path(__file__).resolve().parents[1].joinpath("user/desktop/html_entities.h").write_text("\n".join(output))
+Path(__file__).resolve().parents[1].joinpath("user/desktop/wave/html_entities.h").write_text("\n".join(output))

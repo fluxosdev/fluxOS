@@ -1,6 +1,6 @@
 #include "kernel-test.h"
-#include "../kernel/vfs.c"
-#include "../kernel/fat32.c"
+#include "../kernel/fs/vfs.c"
+#include "../kernel/fs/fat32.c"
 
 /* A tiny FAT32 volume in memory, with injectable metadata/flush failures. */
 static uint8_t disk[64][512];

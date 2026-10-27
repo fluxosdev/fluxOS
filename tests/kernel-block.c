@@ -1,5 +1,5 @@
 #include "kernel-test.h"
-#include "../kernel/blkdev.c"
+#include "../kernel/fs/blkdev.c"
 
 static uint8_t media[BCACHE_SIZE + 32][512];
 static int fail_read = -1, fail_write;

@@ -1,5 +1,5 @@
 #include "kernel-test.h"
-#include "../kernel/socket.c"
+#include "../kernel/net/socket.c"
 struct netif netif;
 struct proc *current;
 void *kmalloc(size_t n) { return malloc(n); }

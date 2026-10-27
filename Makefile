@@ -45,7 +45,7 @@ MKFS_FAT ?= $(shell command -v mkfs.fat 2>/dev/null || ls /usr/sbin/mkfs.fat /sb
 GCC_INC := $(shell $(CC) -print-file-name=include)
 
 # fluxOS needs a Pentium III: everything is built for its instruction set,
-# SSE included (kernel/cpu.c stops the boot on anything older).
+# SSE included (kernel/core/cpu.c stops the boot on anything older).
 CFLAGS_COMMON := -m32 -march=pentium3 -std=gnu11 -O2 -g \
 	-ffreestanding -fno-pie -fno-pic -fno-stack-protector -fno-builtin \
 	-nostdinc -isystem $(GCC_INC) \
@@ -54,26 +54,26 @@ CFLAGS_COMMON := -m32 -march=pentium3 -std=gnu11 -O2 -g \
 	-Wall -Wextra -Wno-unused-parameter -MMD -MP
 
 # The kernel's C code keeps off the FPU and SSE registers, which belong to
-# user processes (fpu.c switches them lazily); kernel/sse.S borrows the SSE
+# user processes (fpu.c switches them lazily); kernel/core/sse.S borrows the SSE
 # registers for bulk copies, saving what it touches.
 KERNEL_CFLAGS := $(CFLAGS_COMMON) -mgeneral-regs-only -fno-omit-frame-pointer \
-	-Iinclude -Ikernel/include -Ikernel
+	-Iinclude -Ikernel/include -Ikernel/core -Ikernel/fs -Ikernel/net -Ikernel/usb -Ikernel/input -Ikernel/storage -Ikernel/sound -Ikernel/video
 # User code does float arithmetic on SSE (doubles stay on the x87, which
 # SSE1 cannot do) and may use the SSE and MMX intrinsics.
 USER_CFLAGS   := $(CFLAGS_COMMON) -mfpmath=sse -fno-math-errno -Iinclude -Iuser/include
 
-# What runs before kernel/cpu.c has checked the processor (the console, the
+# What runs before kernel/core/cpu.c has checked the processor (the console, the
 # string routines and kmain) is built for any 386, so that an older machine
 # shows why it cannot run fluxOS instead of hanging on an i686 instruction.
-KERNEL_EARLY_OBJS := $(addprefix $(BUILD)/k/,kernel/kmain.o kernel/cpu.o kernel/kprintf.o \
-	kernel/vga.o kernel/fb.o kernel/serial.o kernel/splash.o lib/string.o lib/vsnprintf.o lib/font8x16.o)
+KERNEL_EARLY_OBJS := $(addprefix $(BUILD)/k/,kernel/core/kmain.o kernel/core/cpu.o kernel/core/kprintf.o \
+	kernel/video/vga.o kernel/video/fb.o kernel/core/serial.o kernel/video/splash.o lib/string.o lib/vsnprintf.o lib/font8x16.o)
 $(KERNEL_EARLY_OBJS): KERNEL_CFLAGS += -march=i386 -mtune=pentium3
 
 LDFLAGS_COMMON := -m elf_i386 -nostdlib -z noexecstack --no-warn-rwx-segments
 
 # ---- kernel ----
-KERNEL_SRCS := kernel/boot.S kernel/entry.S kernel/sse.S kernel/radeon_fw.S kernel/trampoline.S $(wildcard kernel/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c \
-               lib/sha256.c lib/logo.c user/desktop/font_archivo.c
+KERNEL_SRCS := $(wildcard kernel/*/*.S kernel/*/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c \
+               lib/sha256.c lib/logo.c user/desktop/shell/font_archivo.c
 KERNEL_OBJS := $(patsubst %,$(BUILD)/k/%.o,$(basename $(KERNEL_SRCS)))
 
 # ---- user space ----
@@ -93,7 +93,7 @@ BROTLI_SRCS := $(wildcard $(BROTLI_DIR)/c/common/*.c $(BROTLI_DIR)/c/dec/*.c)
 FONT_SRCS := $(FREETYPE_SRCS) $(BROTLI_SRCS)
 FONT_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(FONT_SRCS)))
 LIBFONT := $(BUILD)/libfont.a
-$(FONT_OBJS) $(BUILD)/u/user/desktop/webfont.o: USER_CFLAGS += $(FONT_FLAGS)
+$(FONT_OBJS) $(BUILD)/u/user/desktop/wave/webfont.o: USER_CFLAGS += $(FONT_FLAGS)
 $(LIBFONT): $(FONT_OBJS)
 	$(AR) rcs $@ $^
 
@@ -106,7 +106,12 @@ LIBGL     := $(BUILD)/libGL.a
 
 PROGS     := $(basename $(notdir $(wildcard user/bin/*.c)))
 FSH_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/fsh/*.c)))
-DESKTOP_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/desktop/*.c)))
+DESKTOP_DIRS := user/desktop/apps user/desktop/image user/desktop/shell user/desktop/wave user/desktop/wave/js
+DESKTOP_INC  := $(addprefix -I,$(DESKTOP_DIRS))
+DESKTOP_SRCS := $(foreach d,$(DESKTOP_DIRS),$(wildcard $(d)/*.c))
+DESKTOP_HDRS := $(foreach d,$(DESKTOP_DIRS),$(wildcard $(d)/*.h))
+DESKTOP_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(DESKTOP_SRCS)))
+$(DESKTOP_OBJS): USER_CFLAGS += $(DESKTOP_INC)
 DOS_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/dos/*.c)))
 BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/fsh $(ROOTFS)/bin/desktop \
              $(ROOTFS)/bin/dos
@@ -130,17 +135,17 @@ $(BUILD)/k/%.o: %.S
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 # The Radeon microcode is pulled in with .incbin.
-$(BUILD)/k/kernel/radeon_fw.o: $(wildcard firmware/radeon/*.bin)
+$(BUILD)/k/kernel/video/radeon_fw.o: $(wildcard firmware/radeon/*.bin)
 
 $(KERNEL): $(KERNEL_OBJS) linker.ld
 	$(LD) $(LDFLAGS_COMMON) -T linker.ld -o $@ $(KERNEL_OBJS)
 
 # The same kernel without the Multiboot video request, for run-kernel.
-$(BUILD)/k/kernel/boot-text.o: kernel/boot.S
+$(BUILD)/k/kernel/core/boot-text.o: kernel/core/boot.S
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -DMB_TEXT_ONLY -c $< -o $@
 
-TEXT_KERNEL_OBJS := $(BUILD)/k/kernel/boot-text.o $(filter-out $(BUILD)/k/kernel/boot.o,$(KERNEL_OBJS))
+TEXT_KERNEL_OBJS := $(BUILD)/k/kernel/core/boot-text.o $(filter-out $(BUILD)/k/kernel/core/boot.o,$(KERNEL_OBJS))
 
 $(TEXT_KERNEL): $(TEXT_KERNEL_OBJS) linker.ld
 	$(LD) $(LDFLAGS_COMMON) -T linker.ld -o $@ $(TEXT_KERNEL_OBJS)
@@ -273,7 +278,9 @@ clean:
 
 # Run the browser's actual HTML/DOM/JS code on the host, without booting QEMU.
 HOSTCC ?= cc
-BROWSER_TEST_SRCS := tests/browser-dom.c tests/canvas-font-stub.c $(addprefix user/desktop/,js.c jslib.c jslib2.c jsbinary.c jsnet.c jsre.c jsgc.c jsdom.c jscanvas.c canvas.c html.c shadow.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c)
+BROWSER_TEST_SRCS := tests/browser-dom.c tests/canvas-font-stub.c \
+	$(addprefix user/desktop/wave/js/,js.c jslib.c jslib2.c jsbinary.c jsnet.c jsre.c jsgc.c jsdom.c jscanvas.c) \
+	$(addprefix user/desktop/wave/,canvas.c html.c shadow.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c)
 .PHONY: test-browser
 test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout $(BUILD)/tests/browser-policy $(BUILD)/tests/browser-http
 	$< rootfs/usr/share/www/classlist-tests.js 20
@@ -285,10 +292,10 @@ test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-style $(BUILD)/t
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/modern-core-tests.js 44
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/canvas-tests.js 52
 
-$(BUILD)/tests/browser-dom: $(BROWSER_TEST_SRCS) $(wildcard user/desktop/*.h) user/include/flux.h include/flux/abi.h
+$(BUILD)/tests/browser-dom: $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS) user/include/flux.h include/flux/abi.h
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -Wall -Wextra -Wno-unused-parameter \
-		-Iuser/desktop -Iinclude -idirafter user/include $(BROWSER_TEST_SRCS) \
+		$(DESKTOP_INC) -Iinclude -idirafter user/include $(BROWSER_TEST_SRCS) \
 		-Wl,--defsym=__gc_data_start=__data_start,--defsym=__gc_data_end=_end -lm -o $@
 
 # Host regression tests use production kernel code with mocked hardware/I/O.
@@ -298,11 +305,11 @@ KERNEL_TEST_BINS := $(addprefix $(BUILD)/tests/kernel-,$(KERNEL_TEST_NAMES))
 test-kernel: $(KERNEL_TEST_BINS)
 	@set -e; for test in $(KERNEL_TEST_BINS); do $$test; done
 
-$(BUILD)/tests/kernel-%: tests/kernel-%.c tests/kernel-test.h $(wildcard kernel/*.c kernel/*.h include/flux/*.h)
+$(BUILD)/tests/kernel-%: tests/kernel-%.c tests/kernel-test.h $(wildcard kernel/*/*.c kernel/*/*.h include/flux/*.h)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter \
 		-Wno-int-to-pointer-cast -Wno-pointer-to-int-cast -ffunction-sections -fdata-sections \
-		-Iinclude -Ikernel $< -Wl,--gc-sections -o $@
+		-Iinclude -Ikernel/core -Ikernel/fs -Ikernel/net -Ikernel/usb -Ikernel/input -Ikernel/storage -Ikernel/sound -Ikernel/video $< -Wl,--gc-sections -o $@
 
 .PHONY: test-kernel-qemu
 # Override to exercise SMP, nosmp and maxcpus without touching a real disk.
@@ -318,17 +325,17 @@ $(BUILD)/tests/kernel-guest.o: tests/kernel-guest.c
 $(BUILD)/tests/kernel-guest: $(BUILD)/tests/kernel-guest.o $(CRT0) $(LIBC) user/user.ld
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 
-$(BUILD)/tests/browser-style: tests/browser-style.c user/desktop/html.c user/desktop/html_entities.h user/desktop/css.c user/desktop/csscolor.c user/desktop/webutil.c user/desktop/web.h
+$(BUILD)/tests/browser-style: tests/browser-style.c user/desktop/wave/html.c user/desktop/wave/html_entities.h user/desktop/wave/css.c user/desktop/wave/csscolor.c user/desktop/wave/webutil.c user/desktop/wave/web.h
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter \
-		-Iuser/desktop tests/browser-style.c user/desktop/html.c user/desktop/css.c user/desktop/csscolor.c \
-		user/desktop/webutil.c -lm -o $@
+		$(DESKTOP_INC) tests/browser-style.c user/desktop/wave/html.c user/desktop/wave/css.c user/desktop/wave/csscolor.c \
+		user/desktop/wave/webutil.c -lm -o $@
 
-$(BUILD)/tests/browser-layout: tests/browser-layout.c $(addprefix user/desktop/,layout.c html.c css.c csscolor.c cssfont.c webutil.c) $(wildcard user/desktop/*.h)
+$(BUILD)/tests/browser-layout: tests/browser-layout.c user/desktop/wave/layout.c user/desktop/wave/html.c user/desktop/wave/css.c user/desktop/wave/csscolor.c user/desktop/wave/cssfont.c user/desktop/wave/webutil.c $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=gnu11 -O1 -g -msse -Wall -Wextra -Wno-unused-parameter -Iuser/desktop -Iinclude \
-		tests/browser-layout.c user/desktop/layout.c user/desktop/shadow.c user/desktop/html.c user/desktop/css.c \
-		user/desktop/csscolor.c user/desktop/cssfont.c user/desktop/webutil.c -lm -o $@
+	$(HOSTCC) -std=gnu11 -O1 -g -msse -Wall -Wextra -Wno-unused-parameter $(DESKTOP_INC) -Iinclude \
+		tests/browser-layout.c user/desktop/wave/layout.c user/desktop/wave/shadow.c user/desktop/wave/html.c user/desktop/wave/css.c \
+		user/desktop/wave/csscolor.c user/desktop/wave/cssfont.c user/desktop/wave/webutil.c -lm -o $@
 
 # TLS tests use temporary certificates and local OpenSSL servers; never the Internet.
 $(BUILD)/tests/tls-client: tests/tls-client.c user/libc/tls.c user/libc/tlsverify.c lib/sha256.c $(MBEDTLS_SRCS) $(MBEDTLS_DIR)/flux_config.h
@@ -340,20 +347,20 @@ $(BUILD)/tests/tls-client: tests/tls-client.c user/libc/tls.c user/libc/tlsverif
 test-tls: $(BUILD)/tests/tls-client $(BUILD)/tests/tls-signature
 	python3 tools/test-tls.py
 
-$(BUILD)/tests/browser-policy: tests/browser-policy.c user/desktop/webpolicy.c user/desktop/publicsuffix.h user/desktop/cookies.c
+$(BUILD)/tests/browser-policy: tests/browser-policy.c user/desktop/wave/webpolicy.c user/desktop/wave/publicsuffix.h user/desktop/wave/cookies.c
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=gnu11 -O1 -g -Iuser/desktop -Iinclude -idirafter user/include \
-		-DCOOKIE_FILE='"$(CURDIR)/$(BUILD)/tests/policy-cookies"' tests/browser-policy.c user/desktop/webpolicy.c user/desktop/cookies.c -o $@
+	$(HOSTCC) -std=gnu11 -O1 -g $(DESKTOP_INC) -Iinclude -idirafter user/include \
+		-DCOOKIE_FILE='"$(CURDIR)/$(BUILD)/tests/policy-cookies"' tests/browser-policy.c user/desktop/wave/webpolicy.c user/desktop/wave/cookies.c -o $@
 
-$(BUILD)/tests/browser-http: tests/browser-http.c $(BROWSER_TEST_SRCS) $(wildcard user/desktop/*.h)
+$(BUILD)/tests/browser-http: tests/browser-http.c $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -Iuser/desktop -Iinclude -idirafter user/include \
+	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie $(DESKTOP_INC) -Iinclude -idirafter user/include \
 		tests/browser-http.c $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS)) \
 		-Wl,--defsym=__gc_data_start=__data_start,--defsym=__gc_data_end=_end -lm -o $@
 
-$(BUILD)/tests/browser-font: tests/browser-font.c user/desktop/webfont.c user/desktop/webutil.c $(FONT_SRCS) $(FREETYPE_DIR)/flux_ftoption.h
+$(BUILD)/tests/browser-font: tests/browser-font.c user/desktop/wave/webfont.c user/desktop/wave/webutil.c $(FONT_SRCS) $(FREETYPE_DIR)/flux_ftoption.h
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=gnu11 -O1 -g -msse -Iuser/desktop $(FONT_FLAGS) \
+	$(HOSTCC) -std=gnu11 -O1 -g -msse $(DESKTOP_INC) $(FONT_FLAGS) \
 		-DFONT_FILE='"$(CURDIR)/$(BUILD)/tests/font-test.fnt"' $(filter %.c,$^) -o $@
 .PHONY: test-browser-fonts
 test-browser-fonts: $(BUILD)/tests/browser-font
@@ -374,9 +381,9 @@ $(BUILD)/tests/wsc: user/bin/wsc.c user/libc/tls.c user/libc/tlsverify.c lib/sha
 test-websocket: $(BUILD)/tests/wsc $(BUILD)/tests/browser-ws
 	python3 tools/test-websocket.py
 
-$(BUILD)/tests/browser-ws: tests/browser-ws.c $(BROWSER_TEST_SRCS) $(wildcard user/desktop/*.h)
+$(BUILD)/tests/browser-ws: tests/browser-ws.c $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -Iuser/desktop -Iinclude -idirafter user/include \
+	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie $(DESKTOP_INC) -Iinclude -idirafter user/include \
 		-DWS_HELPER='"$(CURDIR)/$(BUILD)/tests/wsc"' \
 		tests/browser-ws.c $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS)) \
 		-Wl,--defsym=__gc_data_start=__data_start,--defsym=__gc_data_end=_end -lm -o $@
