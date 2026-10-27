@@ -115,6 +115,33 @@ static void shared_offset_stress(void)
     puts("guest: shared lseek/lseek64 offsets preserve concurrent writes passed");
 }
 
+static void cached_files(void)
+{
+    static unsigned char block[64*1024];
+    const char *paths[]={"/mnt/regress/CACHE-A.BIN","/mnt/regress/CACHE-B.BIN"};
+    int files[2];
+    for(int f=0;f<2;f++) {
+        files[f]=open(paths[f],O_CREAT|O_RDWR|O_TRUNC,0600);CHECK(files[f]>=0);
+        for(int k=0;k<48;k++) {
+            memset(block,k+f*64,sizeof(block));
+            CHECK(write(files[f],block,sizeof(block))==(int)sizeof(block));
+        }
+        CHECK(fsync(files[f])==0);
+    }
+    /* Six MiB across two open descriptions, checked cold and warm. */
+    for(int pass=0;pass<2;pass++) {
+        for(int f=0;f<2;f++)CHECK(lseek(files[f],0,SEEK_SET)==0);
+        for(int k=0;k<48;k++)for(int f=0;f<2;f++) {
+            CHECK(read(files[f],block,sizeof(block))==(int)sizeof(block));
+            for(unsigned i=0;i<sizeof(block);i++)CHECK(block[i]==k+f*64);
+        }
+    }
+    CHECK(lseek(files[0],512,SEEK_SET)==512 && write(files[0],"fresh",5)==5);
+    CHECK(lseek(files[0],512,SEEK_SET)==512 && read(files[0],block,5)==5 && !memcmp(block,"fresh",5));
+    for(int f=0;f<2;f++){CHECK(close(files[f])==0);CHECK(unlink(paths[f])==0);}
+    puts("guest: interleaved 6 MiB file reads, warm rereads and cached write coherence passed");
+}
+
 int main(void)
 {
     scheduler_stress();
@@ -141,6 +168,7 @@ int main(void)
     CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     CHECK(mkdir("/mnt/regress", 0755) == 0);
     CHECK(mount("/dev/hda", "/mnt/regress", "fat32") == 0);
+    cached_files();
     fd = open("/mnt/regress/OLD.TXT", O_CREAT | O_RDWR, 0600); CHECK(fd >= 0);
     CHECK(write(fd, "old data", 8) == 8);
     int alias = dup(fd); CHECK(alias >= 0);

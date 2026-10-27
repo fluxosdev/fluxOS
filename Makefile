@@ -326,7 +326,7 @@ BROWSER_TEST_SRCS := lib/digest.c lib/sha256.c tests/browser-dom.c tests/canvas-
 	$(addprefix user/desktop/wave/js/,js.c jslib.c jslib2.c jsbinary.c jsnet.c jsre.c jsgc.c jsdom.c jscanvas.c) \
 	$(addprefix user/desktop/wave/,canvas.c html.c shadow.c webblob.c webintegrity.c webinput.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c)
 .PHONY: test-browser
-test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout $(BUILD)/tests/browser-policy $(BUILD)/tests/browser-http $(BUILD)/tests/browser-images
+test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout $(BUILD)/tests/browser-policy $(BUILD)/tests/browser-http $(BUILD)/tests/browser-images $(BUILD)/tests/browser-navigation
 	$< rootfs/usr/share/www/classlist-tests.js 20
 	$< rootfs/usr/share/www/dom-feature-tests.js 31
 	$(BUILD)/tests/browser-style
@@ -336,6 +336,7 @@ test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine $(BUILD)/tests
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/modern-core-tests.js 44
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/compatibility-tests.js 30
 	$(BUILD)/tests/browser-images
+	$(BUILD)/tests/browser-navigation
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/canvas-tests.js 52
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 127
 	$(BUILD)/tests/js-engine
@@ -347,7 +348,7 @@ $(BUILD)/tests/browser-dom: $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS) user/include/fl
 		-lm -o $@
 
 # Host regression tests use production kernel code with mocked hardware/I/O.
-KERNEL_TEST_NAMES := heap pipe socket storage syscall block sched signal
+KERNEL_TEST_NAMES := heap pmm pipe socket storage syscall block sched signal
 KERNEL_TEST_BINS := $(addprefix $(BUILD)/tests/kernel-,$(KERNEL_TEST_NAMES))
 .PHONY: test-kernel
 test-kernel: $(KERNEL_TEST_BINS)
@@ -355,18 +356,19 @@ test-kernel: $(KERNEL_TEST_BINS)
 
 $(BUILD)/tests/kernel-signal: KERNEL_TEST_FLAGS = -pthread
 
-$(BUILD)/tests/kernel-%: tests/kernel-%.c tests/kernel-test.h $(wildcard kernel/*/*.c kernel/*/*.h include/flux/*.h)
+$(BUILD)/tests/kernel-%: tests/kernel-%.c tests/kernel-test.h tests/kernel-readcache-stub.c $(wildcard kernel/*/*.c kernel/*/*.h include/flux/*.h)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(KERNEL_TEST_FLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter \
 		-Wno-int-to-pointer-cast -Wno-pointer-to-int-cast -ffunction-sections -fdata-sections \
-		-Iinclude -Ikernel/core -Ikernel/fs -Ikernel/net -Ikernel/usb -Ikernel/input -Ikernel/storage -Ikernel/sound -Ikernel/video $< -Wl,--gc-sections -o $@
+		-Iinclude -Ikernel/core -Ikernel/fs -Ikernel/net -Ikernel/usb -Ikernel/input -Ikernel/storage -Ikernel/sound -Ikernel/video $< tests/kernel-readcache-stub.c -Wl,--gc-sections -o $@
 
 .PHONY: test-kernel-qemu
 # Override to exercise SMP, nosmp and maxcpus without touching a real disk.
 KERNEL_TEST_CPUS ?= 1
+KERNEL_TEST_MEMORY ?= 256
 KERNEL_TEST_CMDLINE ?=
 test-kernel-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest --cpus $(KERNEL_TEST_CPUS) --append "$(KERNEL_TEST_CMDLINE)"
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest --cpus $(KERNEL_TEST_CPUS) --memory $(KERNEL_TEST_MEMORY) --append "$(KERNEL_TEST_CMDLINE)"
 
 $(BUILD)/tests/kernel-guest.o: tests/kernel-guest.c
 	@mkdir -p $(dir $@)
@@ -492,3 +494,7 @@ $(BUILD)/tests/desktop-imagejobs-guest: $(BUILD)/tests/desktop-imagejobs-guest.o
 .PHONY: test-desktop-jobs-qemu
 test-desktop-jobs-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/desktop-imagejobs-guest
 	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/desktop-imagejobs-guest --cpus $(KERNEL_TEST_CPUS) --success-marker "DESKTOP JOB REGRESSIONS PASSED"
+
+$(BUILD)/tests/browser-navigation: tests/browser-navigation.c user/desktop/wave/webutil.c $(DESKTOP_HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra $(DESKTOP_INC) tests/browser-navigation.c user/desktop/wave/webutil.c -o $@

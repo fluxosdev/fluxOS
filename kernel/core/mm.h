@@ -14,6 +14,8 @@ void pmm_release(uint32_t start, uint32_t end);
 uint32_t pmm_alloc(void);                   /* below 1 GiB; 0 when out of memory */
 uint32_t pmm_alloc_user(void);              /* anywhere, for user pages (vmm_kmap) */
 uint32_t pmm_alloc_contig(uint32_t frames); /* below 1 GiB */
+uint32_t pmm_alloc_reserved(uint32_t reserve); /* cache pages; never reclaim, retain low frames */
+void pmm_set_reclaimer(uint32_t (*reclaim)(uint32_t pages)); /* boot-time registration */
 void pmm_free(uint32_t phys);
 uint32_t pmm_total_kb(void);
 uint32_t pmm_free_kb(void);

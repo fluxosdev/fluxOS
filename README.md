@@ -88,9 +88,11 @@ stops at boot and says why.
   - `/dev/hdX`, `/dev/sdX`, `/dev/srN` with MBR partitions behind a write-back
     sector cache, flushed by `kflushd` every 5 s, by `sync`/`fsync`, on
     `umount` and before `reboot`/`poweroff`.
-  - A separate clean read cache uses up to 4 MiB, scaled down with available
-    heap memory. Sequential small reads fetch ahead within a 4 KiB block;
-    bulk reads retain multi-sector disk commands.
+  - A separate clean read cache grows on demand to 1/32 of usable RAM, capped
+    at 64 MiB. Cached data uses reclaimable physical pages outside the kernel
+    heap. `readcache=16`, `readcache=32` or `readcache=64` sets the cap in MiB;
+    `readcache=0` disables it. Sequential small reads fetch ahead within a
+    4 KiB block; bulk reads retain multi-sector disk commands.
 - USB: **UHCI, OHCI, EHCI and xHCI** controllers, hubs (up to five deep),
   boot-protocol keyboards, HID mice and tablets, and Bulk-Only mass storage.
   Hot plugging via the `kusbd` thread; `lsusb` lists devices. Options:
@@ -243,6 +245,9 @@ Copy Page Address, Find in Page, Save Page As, View Page Source and Print on the
 Open in New Window, Copy and Save Link As on a link; Save Image As and Copy Image Address on a
 picture; Cut/Copy/Paste on the address bar). Pages come over HTTP or HTTPS (through `httpc`, a
 fetcher process, so the desktop keeps running), or from `file://`.
+- **Archives and downloads**: local ZIP and 7z links open in Archive Manager
+  without loading the archive into the browser. Binary response prefixes are
+  checked before text layout, so an archive served as `text/plain` is downloaded.
 - **Keys**: Ctrl+F finds text (every match is marked, Enter and Shift+Enter step through them, Esc
   closes; what is selected is looked for), Ctrl++, Ctrl+- and Ctrl+0 zoom the page from 30% to 300%
   (lengths, text, pictures and form controls all grow, and `@media` queries and `window.innerWidth`
@@ -525,6 +530,8 @@ make test-desktop-jobs # decoder helper responsiveness, transfers, cancellation 
 make test-desktop-jobs-qemu # same protocol tests with fluxOS's blocking pipes
 make test-kernel-qemu # boots kernel regressions with a disposable initrd and scratch disk
 make test-kernel-qemu KERNEL_TEST_CPUS=4 # same tests on four Pentium III CPUs
+make test-kernel-qemu KERNEL_TEST_CPUS=2 KERNEL_TEST_MEMORY=2048 # larger RAM and read cache
+make test-kernel-qemu KERNEL_TEST_CMDLINE=readcache=0 # direct-read fallback
 make test-kernel-qemu KERNEL_TEST_CPUS=4 KERNEL_TEST_CMDLINE=nosmp # single-core fallback
 make test-kernel-qemu KERNEL_TEST_CPUS=4 KERNEL_TEST_CMDLINE=maxcpus=2 # CPU limit
 make disk       # fluxdisk.img, a 256 MiB FAT32 data disk (DISK_MB=...)
@@ -690,9 +697,14 @@ is serialised by one FIFO "VFS lock", taken per call (per 64 KiB chunk for
 `read`/`write`). Terminals and pipes never take it. FAT, directory and FSInfo
 updates are dirty sectors in the write-back cache. Reads use a separate bounded
 cache of clean 4 KiB blocks, keyed by physical disk and sector so partition and
-raw-device views agree. Sequential small reads fetch the remainder of a block;
-random reads fetch only the requested sectors. Writes update resident clean
-copies without filling the read cache. A run of contiguous clusters is still
+raw-device views agree. Cache pages are allocated individually on demand,
+leaving a reserve of low physical memory for kernel allocations. The physical
+allocator reclaims clean pages when low memory runs short, without waiting for
+the VFS lock or doing disk I/O. Cache metadata remains resident (about 400 KiB).
+Sequential tracking belongs to each open file description, shared by dup/fork,
+so interleaved file reads retain read-ahead. Sequential small reads fetch the
+remainder of a block; random reads fetch only the requested sectors. Writes
+update resident clean copies without filling the read cache. A run of contiguous clusters is still
 written as one DMA command. A sync writes dirty sectors in LBA order, merging
 neighbours, then issues one FLUSH CACHE.
 

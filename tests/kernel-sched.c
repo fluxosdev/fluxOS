@@ -19,6 +19,7 @@ static void reset(int cores)
 static void ready(int slot, int cpu, uint32_t since)
 {
     procs[slot].state = P_READY;
+    procs[slot].pin_cpu = -1; /* normal tasks are unpinned, as in allocproc() */
     procs[slot].last_cpu = cpu;
     procs[slot].ready_tick = since;
 }

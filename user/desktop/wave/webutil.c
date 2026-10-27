@@ -289,6 +289,60 @@ int url_is_http(const char *url) { return !strncasecmp(url, "http://", 7); }
 int url_is_https(const char *url) { return !strncasecmp(url, "https://", 8); }
 int url_is_file(const char *url) { return !strncasecmp(url, "file:", 5); }
 
+/* Match local navigation and local fetches, including escaped extensions.
+ * Reject truncation and encoded NULs rather than opening a different path. */
+int url_file_path(const char *url, char *out, size_t size)
+{
+    if (!url_is_file(url) || !size) return 0;
+    const char *p = url + 5;
+    if (!strncmp(p, "//", 2)) {
+        p = strchr(p + 2, '/');
+        if (!p) p = "/";
+    }
+    size_t used = 0;
+    while (*p && *p != '?' && *p != '#') {
+        unsigned char c = (unsigned char)*p++;
+        if (c == '%' && p[0] && p[1] && isxdigit((unsigned char)p[0]) && isxdigit((unsigned char)p[1])) {
+            char hex[3] = {p[0], p[1], 0};
+            c = (unsigned char)strtol(hex, NULL, 16);
+            p += 2;
+            if (!c) return 0;
+        }
+        if (used + 1 >= size) return 0;
+        out[used++] = (char)c;
+    }
+    out[used] = 0;
+    return used && out[0] == '/';
+}
+
+int web_archive_path(const char *path)
+{
+    size_t n = strlen(path);
+    return (n >= 3 && !strcasecmp(path + n - 3, ".7z")) ||
+           (n >= 4 && !strcasecmp(path + n - 4, ".zip"));
+}
+
+/* Binary navigation must never feed compressed bytes to HTML/text layout on
+ * the desktop thread. Sniff a bounded prefix even if the server says text. */
+int web_document_download(const char *type, const void *body, size_t len)
+{
+    const unsigned char *p = body;
+    if (!p || !len) return 0;
+    if ((len >= 6 && !memcmp(p, "7z\xbc\xaf\x27\x1c", 6)) ||
+        (len >= 4 && (!memcmp(p, "PK\003\004", 4) || !memcmp(p, "PK\005\006", 4) ||
+                      !memcmp(p, "PK\007\010", 4) || !memcmp(p, "\177ELF", 4))) ||
+        (len >= 7 && !memcmp(p, "Rar!\x1a\007", 6)) ||
+        (len >= 2 && p[0] == 0x1f && p[1] == 0x8b) ||
+        (len >= 5 && !memcmp(p, "%PDF-", 5))) return 1;
+    if (type && !strncasecmp(type, "image/", 6)) return 0;
+    size_t n = len < 1024 ? len : 1024, controls = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!p[i]) return 1;
+        if (p[i] < 9 || p[i] == 11 || (p[i] > 13 && p[i] < 32)) controls++;
+    }
+    return controls > n / 20;
+}
+
 void url_strip_fragment(char *url)
 {
     char *h = strchr(url, '#');

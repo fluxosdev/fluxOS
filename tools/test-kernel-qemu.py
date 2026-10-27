@@ -11,6 +11,7 @@ for name in ("qemu", "kernel", "initrd", "guest"):
     parser.add_argument(name)
 parser.add_argument("--cpus", type=int, default=1, choices=range(1, 17))
 parser.add_argument("--append", default="")
+parser.add_argument("--memory", type=int, default=256, choices=range(64, 4097), help="guest RAM in MiB")
 parser.add_argument("--success-marker", default="KERNEL REGRESSIONS PASSED")
 args = parser.parse_args()
 qemu, kernel, initrd, guest = args.qemu, args.kernel, args.initrd, args.guest
@@ -38,7 +39,7 @@ with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
         disk.truncate(32 * 1024 * 1024)
     command = [qemu, "-cpu", "pentium3", "-smp", str(args.cpus),
                "-kernel", kernel, "-initrd", str(overlay), "-append", "automount=off " + args.append,
-               "-m", "256M", "-display", "none", "-monitor", "none", "-serial", "stdio",
+               "-m", f"{args.memory}M", "-display", "none", "-monitor", "none", "-serial", "stdio",
                "-no-reboot", "-nic", "none", "-drive", f"file={scratch},format=raw,if=ide,index=0"]
     try:
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=45)

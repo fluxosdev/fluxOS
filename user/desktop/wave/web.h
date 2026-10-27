@@ -647,6 +647,9 @@ void url_resolve(const char *base, const char *ref, char *out, int size);
 int url_is_http(const char *url);
 int url_is_https(const char *url);
 int url_is_file(const char *url);
+int url_file_path(const char *url, char *out, size_t size); /* decoded, no query/fragment; 0 if invalid */
+int web_archive_path(const char *path);                    /* Archive Manager's ZIP/7z formats */
+int web_document_download(const char *type, const void *body, size_t len);
 void url_strip_fragment(char *url);
 const char *url_fragment(const char *url);         /* after '#', or NULL */
 /* Append s to out, form-encoded (application/x-www-form-urlencoded). */

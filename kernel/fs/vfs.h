@@ -4,6 +4,7 @@
 
 #include <stdint.h>
 #include <flux/abi.h>
+#include "readcache.h"
 
 enum { VN_FILE = 1, VN_DIR, VN_CHR, VN_BLK };
 
@@ -108,6 +109,7 @@ struct file {
     struct vnode *vn;
     struct pipe *pipe;
     struct socket *sock;
+    struct readcache_stream read_stream;
 };
 
 struct file *file_open(struct vnode *vn, int flags);

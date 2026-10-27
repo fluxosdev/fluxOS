@@ -1109,27 +1109,7 @@ static int list_folder(struct fetch *f, const char *path)
 static int read_file(struct fetch *f, const char *url)
 {
     char path[URL_MAX];
-    const char *p = url + 5;
-    if (!strncmp(p, "//", 2)) {
-        p += 2;
-        p = strchr(p, '/');             /* skip a host name */
-        if (!p)
-            p = "/";
-    }
-    size_t n = strcspn(p, "?#");
-    snprintf(path, sizeof(path), "%.*s", (int)n, p);
-    /* %20 and friends */
-    char *o = path;
-    for (const char *s = path; *s; s++) {
-        if (*s == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2])) {
-            char hex[3] = { s[1], s[2], 0 };
-            *o++ = (char)strtol(hex, NULL, 16);
-            s += 2;
-        } else {
-            *o++ = *s;
-        }
-    }
-    *o = 0;
+    if (!url_file_path(url, path, sizeof(path))) return -EINVAL;
     struct stat st;
     if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
         return list_folder(f, path);
@@ -3829,7 +3809,8 @@ static void fetch_complete(struct browser *b)
                 paint(b);
                 return;
             }
-        } else if (done.special == SP_SAVE || strcasestr(r.disp, "attachment")) {
+        } else if (done.special == SP_SAVE || strcasestr(r.disp, "attachment") ||
+                   web_document_download(r.type, r.body, (size_t)r.len)) {
             save_download(b, &done, &r);
         } else if (!strncmp(r.type, "image/", 6)) {
             char html[URL_MAX * 2 + 128], eurl[URL_MAX * 2];
@@ -4018,6 +3999,18 @@ static void navigate(struct browser *b, const char *url, const char *post, int m
     snprintf(u, sizeof(u), "%s", url);
     int source = !strncasecmp(u, "view-source:", 12);      /* its text, not the page it makes */
     const char *fu = source ? u + 12 : u;                  /* what is fetched */
+
+    /* Use the same asynchronous archive opener as File Manager, before reading
+     * the file or changing the current page. Archives can exceed MAX_PAGE. */
+    char archive_path[URL_MAX];
+    struct stat archive_stat;
+    if (!source && !post && !is_frame(b) && url_file_path(fu, archive_path, sizeof(archive_path)) &&
+        web_archive_path(archive_path) && stat(archive_path, &archive_stat) == 0 && S_ISREG(archive_stat.st_mode)) {
+        archiver_open(archive_path);
+        set_status(b, "Opened %.120s in Archive Manager", archive_path);
+        paint(b);
+        return;
+    }
 
     /* Only the fragment changed: scroll, do not reload (nor stop what is loading). */
     char a[URL_MAX], cur[URL_MAX];

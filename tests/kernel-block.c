@@ -1,4 +1,5 @@
 #include "kernel-test.h"
+#include <sys/mman.h>
 #include "../kernel/fs/readcache.c"
 #include "../kernel/fs/blkdev.c"
 
@@ -8,7 +9,28 @@ static unsigned reads, sectors_read;
 static uint8_t optical[12][2048];
 void *kmalloc(size_t n) { return malloc(n); }
 void *kzalloc(size_t n) { return calloc(1,n); }
-void heap_stats(uint32_t *total, uint32_t *used) { *total=8u<<20;*used=0; }
+static uint32_t test_total_kb = 2u << 20;
+static int allocation_failure;
+static uint32_t (*test_reclaimer)(uint32_t);
+static const char *cache_option;
+uint32_t pmm_total_kb(void) { return test_total_kb; }
+void pmm_set_reclaimer(uint32_t (*callback)(uint32_t)) { test_reclaimer=callback; }
+uint32_t pmm_alloc_reserved(uint32_t reserve)
+{
+    CHECK(reserve >= 2048);
+    if (allocation_failure) return 0;
+    void *page=mmap(NULL,PAGE_SIZE,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_32BIT,-1,0);
+    CHECK(page!=MAP_FAILED && (uintptr_t)page<=UINT32_MAX);
+    return (uint32_t)(uintptr_t)page;
+}
+void pmm_free(uint32_t phys) { CHECK(munmap((void *)(uintptr_t)phys,PAGE_SIZE)==0); }
+int cmdline_value(const char *key,char *out,size_t size)
+{
+    CHECK(!strcmp(key,"readcache"));
+    if (!cache_option) return 0;
+    snprintf(out,size,"%s",cache_option);return 1;
+}
+
 void klog(const char *fmt, ...) { (void)fmt; }
 static int read_disk(struct blockdev *bd, uint32_t lba, uint32_t n, void *out)
 {
@@ -30,6 +52,12 @@ static int read_cd(struct blockdev *bd,uint32_t lba,uint32_t n,void *out)
 {
     CHECK(lba<bd->nsectors && n<=bd->nsectors-lba);
     reads++;memcpy(out,optical[lba],n*2048);return 0;
+}
+static int read_generated(struct blockdev *bd,uint32_t lba,uint32_t n,void *out)
+{
+    CHECK(lba<bd->nsectors && n<=bd->nsectors-lba);reads++;
+    for(uint32_t i=0;i<n;i++)memset((uint8_t *)out+i*512,(int)((lba+i)%251),512);
+    return 0;
 }
 static void unpinned(void)
 {
@@ -82,7 +110,7 @@ int main(void)
 
     /* Cold bulk I/O stays batched; identical reads issue no disk command. */
     CHECK(blk_sync(&bd)==0);
-    readcache_init(); CHECK(blocks && capacity>=8);
+    readcache_init(); CHECK(capacity==RC_MAX_BLOCKS && !resident && test_reclaimer);
     uint8_t bulk[64*512];
     unsigned before=reads;
     CHECK(blk_read(&bd,64,64,bulk)==0 && reads==before+1);
@@ -127,7 +155,7 @@ int main(void)
     CHECK(blk_read(&bd,bd.nsectors-1,1,bulk)==0);
     CHECK(blk_read(&bd,bd.nsectors,1,bulk)==-EIO);
     /* A small budget evicts clean blocks without changing returned bytes. */
-    readcache_discard(&bd);capacity=8;hand=0;
+    readcache_discard(&bd);CHECK(!resident);capacity=8;hand=0;
     for(unsigned i=0;i<RC_BUCKETS;i++)buckets[i]=-1;
     memset(blocks,0,capacity*sizeof(*blocks));
     for(unsigned i=0;i<144;i+=8)CHECK(blk_read(&bd,i,8,bulk)==0);
@@ -140,7 +168,65 @@ int main(void)
     CHECK(blk_read(&cd,10,1,bulk)==0);
     before=reads;CHECK(blk_read(&cd,11,1,bulk)==0 && reads==before);
     CHECK(blk_write(&cd,0,1,old)==-EROFS);
-    free(blocks);
+    readcache_discard(&bd);readcache_discard(&cd);CHECK(!resident);
+    /* Open-file streams remain sequential despite interleaved reads on a disk. */
+    struct readcache_stream file_a={0},file_b={0};
+    before=reads;
+    for (unsigned i=0;i<8;i++) {
+        CHECK(!readcache_use_stream(&file_a));
+        CHECK(blk_read(&bd,128+i,1,bulk)==0);
+        CHECK(readcache_use_stream(NULL)==&file_a);
+        CHECK(!readcache_use_stream(&file_b));
+        CHECK(blk_read(&bd,144+i,1,bulk)==0);
+        CHECK(readcache_use_stream(NULL)==&file_b);
+    }
+    CHECK(reads==before+4);
+    /* Reclaim clean pages immediately, then recover through demand I/O. */
+    CHECK(resident==2);
+    CHECK(test_reclaimer(1)==1 && resident==1);
+    CHECK(test_reclaimer(100)==1 && !resident);
+    before=reads;CHECK(blk_read(&bd,128,1,bulk)==0 && reads==before+1 && resident==1);
+    allocation_failure=1;
+    CHECK(blk_read(&bd,152,1,bulk)==0 && resident==1); /* reuse at the reserve */
+    CHECK(!memcmp(bulk,media[152],512));
+    CHECK(test_reclaimer(100)==1);
+    CHECK(blk_read(&bd,160,1,bulk)==0 && !resident); /* no memory: direct I/O */
+    allocation_failure=0;
+    CHECK(blk_read(&bd,168,1,bulk)==0 && resident==1);
+    readcache_discard(&bd);CHECK(!resident);
+    const char *options[]={"0","16","32","64","65","bad","-1","999999999999"};
+    for(unsigned i=0;i<sizeof(options)/sizeof(options[0]);i++) {
+        cache_option=options[i];initialized=0;hand=0;readcache_init();
+        unsigned mb=i==0?0:i==1?16:i==2?32:64;
+        CHECK(capacity==(mb<<20)/RC_BYTES && !resident);
+    }
+    cache_option="0";initialized=0;readcache_init();before=reads;
+    CHECK(blk_read(&bd,168,1,bulk)==0 && blk_read(&bd,168,1,bulk)==0 && reads==before+2);
+    cache_option=NULL;test_total_kb=256u<<10;initialized=0;readcache_init();
+    CHECK(capacity==(8u<<20)/RC_BYTES && !resident);
+    test_total_kb=512u<<10;initialized=0;hand=0;readcache_init();
+    CHECK(capacity==(16u<<20)/RC_BYTES);
+    /* An 8 MiB working set exceeds the former 4 MiB cache. */
+    struct blockdev large={.sector_size=512,.nsectors=16384,.read=read_generated};
+    before=reads;
+    for(unsigned sector=0;sector<large.nsectors;sector+=64) {
+        CHECK(blk_read(&large,sector,64,bulk)==0);
+        CHECK(bulk[0]==sector%251 && bulk[sizeof(bulk)-1]==(sector+63)%251);
+    }
+    unsigned cold_reads=reads-before;before=reads;
+    CHECK(resident==2048);
+    for(unsigned sector=0;sector<large.nsectors;sector+=64) {
+        CHECK(blk_read(&large,sector,64,bulk)==0);
+        CHECK(bulk[0]==sector%251 && bulk[sizeof(bulk)-1]==(sector+63)%251);
+    }
+    CHECK(reads==before);
+    CHECK(test_reclaimer(1024)==1024 && resident==1024);
+    for(unsigned sector=0;sector<large.nsectors;sector+=64) {
+        CHECK(blk_read(&large,sector,64,bulk)==0);
+        CHECK(bulk[0]==sector%251 && bulk[sizeof(bulk)-1]==(sector+63)%251);
+    }
+    readcache_discard(&large);CHECK(!resident);
+    printf("read cache: 8 MiB working set, %u cold commands, 0 warm commands; pressure/refill passed\n",cold_reads);
     free(bcache);
     puts("kernel block cache: atomic metadata, data-cache hits/coherence, bounded read-ahead and failures passed");
 }

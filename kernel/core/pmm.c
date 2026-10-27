@@ -17,9 +17,15 @@
 
 static uint32_t bitmap[MAX_FRAMES / 32];
 static uint32_t total_frames;
-static uint32_t free_frames;
+static uint32_t free_frames, low_free_frames;
+static uint32_t (*reclaim_pages)(uint32_t);
 static uint32_t search_hint, high_hint;
 static spinlock_t pmm_lock = SPINLOCK_INIT("pmm");
+
+void pmm_set_reclaimer(uint32_t (*reclaim)(uint32_t))
+{
+    reclaim_pages = reclaim;
+}
 
 static inline int frame_used(uint32_t f)
 {
@@ -31,6 +37,7 @@ static inline void frame_set(uint32_t f)
     if (!frame_used(f)) {
         bitmap[f / 32] |= 1u << (f % 32);
         free_frames--;
+        if (f < LOW_FRAMES) low_free_frames--;
     }
 }
 
@@ -39,6 +46,7 @@ static inline void frame_clear(uint32_t f)
     if (frame_used(f)) {
         bitmap[f / 32] &= ~(1u << (f % 32));
         free_frames++;
+        if (f < LOW_FRAMES) low_free_frames++;
     }
 }
 
@@ -83,7 +91,7 @@ void pmm_release(uint32_t start, uint32_t end)
 void pmm_init(struct multiboot_info *mbi)
 {
     memset(bitmap, 0xFF, sizeof(bitmap));
-    free_frames = 0;
+    free_frames = low_free_frames = 0;
     total_frames = 0;
 
     if (mbi->flags & MB_INFO_MMAP) {
@@ -111,10 +119,11 @@ void pmm_init(struct multiboot_info *mbi)
     }
 }
 
-/* A frame of low memory, for the kernel. */
-uint32_t pmm_alloc(void)
+/* A low frame with a caller-selected reserve; no callbacks or recursive reclaim. */
+uint32_t pmm_alloc_reserved(uint32_t reserve)
 {
     spin_lock(&pmm_lock);
+    if (low_free_frames <= reserve) { spin_unlock(&pmm_lock); return 0; }
     for (uint32_t i = 0; i < LOW_FRAMES / 32; i++) {
         uint32_t w = (search_hint + i) % (LOW_FRAMES / 32);
         if (bitmap[w] != 0xFFFFFFFF) {
@@ -128,6 +137,17 @@ uint32_t pmm_alloc(void)
     }
     spin_unlock(&pmm_lock);
     return 0;
+}
+
+/* Reclaim outside the allocator lock. The callback must not allocate or wait.
+ * Restore a small low-memory cushion before allocations start failing. */
+uint32_t pmm_alloc(void)
+{
+    if (reclaim_pages && __atomic_load_n(&low_free_frames, __ATOMIC_RELAXED) < 2048)
+        reclaim_pages(64);
+    uint32_t page = pmm_alloc_reserved(0);
+    if (!page && reclaim_pages && reclaim_pages(1)) page = pmm_alloc_reserved(0);
+    return page;
 }
 
 /* A frame for a user page: high memory first, so low memory stays for the kernel. */
@@ -150,7 +170,7 @@ uint32_t pmm_alloc_user(void)
 }
 
 /* Contiguous low memory (DMA buffers, the heap). */
-uint32_t pmm_alloc_contig(uint32_t frames)
+static uint32_t try_contig(uint32_t frames)
 {
     uint32_t run = 0;
     spin_lock(&pmm_lock);
@@ -166,6 +186,14 @@ uint32_t pmm_alloc_contig(uint32_t frames)
     }
     spin_unlock(&pmm_lock);
     return 0;
+}
+
+uint32_t pmm_alloc_contig(uint32_t frames)
+{
+    if (!frames || frames > LOW_FRAMES) return 0;
+    uint32_t page = try_contig(frames);
+    if (!page && reclaim_pages && reclaim_pages(frames)) page = try_contig(frames);
+    return page;
 }
 
 void pmm_free(uint32_t phys)

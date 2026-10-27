@@ -148,7 +148,12 @@ int file_read(struct file *f, void *buf, uint32_t n)
         return pipe_read(f->pipe, buf, n);
     if (f->type == FT_SOCKET)
         return sock_recvfrom(f->sock, buf, n, 0, NULL);
+    /* Pipes, sockets and character devices do not own the VFS mutex. */
+    struct readcache_stream *previous = NULL;
+    int scoped = f->vn->type != VN_CHR;
+    if (scoped) previous = readcache_use_stream(&f->read_stream);
     int r = vfs_read(f->vn, buf, f->off, n);
+    if (scoped) readcache_use_stream(previous);
     if (r > 0)
         f->off += (uint64_t)r;
     return r;
