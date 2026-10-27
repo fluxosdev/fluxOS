@@ -19,14 +19,15 @@
 > read it with that in mind.
 
 fluxOS is a small 32-bit x86 Unix-like operating system with preemptive
-multitasking, ring-3 processes, paging, a root filesystem in RAM (from the CD)
-or on an installed hard disk, IDE/SATA/floppy/USB storage, FAT and ISO9660, an
+multitasking, ring-3 processes, paging, a root filesystem on the hard disk it
+is installed on, IDE/SATA/floppy/USB storage, FAT and ISO9660, an
 NE2000 and nForce network driver with a TCP/IP stack, a zsh-flavoured shell
 (**fsh**), a desktop with a web browser and two themes (Kinetik and Windows 95 style Classic), 3dfx Voodoo3 and
 Radeon HD 4000 display drivers with a small OpenGL library, PC speaker, Sound
 Blaster 16 and HD Audio sound, and a layer that runs DOS programs in the
-terminal. It boots with GRUB (Multiboot) from an ISO image, straight into the
-desktop.
+terminal. The ISO image is an install CD: GRUB (Multiboot) starts fluxOS
+Setup, which installs fluxOS onto a hard disk, and the installed system boots
+straight into the desktop.
 
 fluxOS needs a **Pentium III** or another processor with SSE (an Athlon XP, a
 Pentium 4 or anything newer). The whole system is built for it: the kernel
@@ -73,7 +74,9 @@ stops at boot and says why.
 - VFS over an in-memory filesystem unpacked from a ustar initrd at boot, with
   `/dev/{tty,console,null,zero,random,urandom}`, pipes and pseudo-terminals.
   Started from an installed disk (`root=UUID=...`), its FAT32 partition is the
-  root instead and only `/dev`, `/tmp` and `/mnt` stay in memory.
+  root instead and only `/dev`, `/tmp` and `/mnt` stay in memory. The CD's
+  initrd is a small setup system, not the whole one: files in memory live in
+  the kernel heap, a quarter of RAM.
 - Storage:
   - IDE (ATA LBA28/48 and ATAPI) with bus-master DMA, interrupt driven, falling
     back to PIO on failure; native-mode PCI IDE controllers. Options:
@@ -149,7 +152,7 @@ stops at boot and says why.
 - Windows move, minimize, maximize and cascade; the browser, text editor, file
   manager, Task Manager and Gears resize by dragging an edge.
 - Start menu with cascading submenus (Programs, Accessories, System Tools,
-  Settings), Read Me, Run..., Install fluxOS... and Shut Down.... Keys: Windows
+  Settings), Read Me, Run... and Shut Down.... Keys: Windows
   key or Ctrl+Esc for Start, Alt+Tab, Alt+F4.
 - **Terminal**: 80x25 VGA-style, running fsh on a pty, as many as you like.
 - **File manager**: Explorer-style icon view with an address field, Up, New
@@ -190,8 +193,7 @@ stops at boot and says why.
   files; **Test** checks every CRC.
 - **Task Manager** (applications, processes, CPU/memory performance graphs),
   **Disk Manager** (volumes, partition bars, mount/unmount/format, MBR partition
-  editing), **Volume Control**, **Setup** (installs fluxOS on a disk; only
-  shown when booted from the install medium), and **System Properties**.
+  editing), **Volume Control** and **System Properties**.
 
 **Web browser** (the **Wave** icon): an Internet Explorer 3 style
 window with Back/Forward/Stop/Refresh/Home/History/Downloads/Favorites, address bar,
@@ -462,8 +464,8 @@ make test-kernel-qemu KERNEL_TEST_CPUS=4 KERNEL_TEST_CMDLINE=nosmp # single-core
 make test-kernel-qemu KERNEL_TEST_CPUS=4 KERNEL_TEST_CMDLINE=maxcpus=2 # CPU limit
 make disk       # fluxdisk.img, a 64 MiB FAT32 data disk (DISK_MB=...)
 make floppy     # fluxfloppy.img, a 1.44 MB FAT12 floppy for drive A:
-make run        # boots the ISO in QEMU with the disk, floppy (if any) and an NE2000
-make run-kernel # boots the kernel directly (text console)
+make run        # boots the install CD in QEMU with the disk, floppy (if any) and an NE2000
+make run-kernel # boots the kernel directly, the whole system in memory (text console)
 make run-disk   # boots fluxdisk.img alone, after installing fluxOS onto it
 make run-q35    # q35 machine: disk and CD on SATA, USB keyboard and tablet on xHCI
 make run-usb    # disk as a USB stick on EHCI, keyboard and mouse on UHCI
@@ -479,9 +481,10 @@ anything newer that slipped into the build would show up there. `make run
 QEMU_NET="-nic user,model=ne2k_pci -device intel-hda -device hda-duplex"` adds
 HD Audio. To boot real hardware or another VM, write
 `fluxOS.iso` to a USB stick or attach it as a CD-ROM and boot in **legacy
-BIOS** mode (UEFI is untested). The default entry starts the desktop at
-1024x768; **fluxOS (text console)** boots to the shell. In QEMU the mouse
-needs no grabbing; elsewhere click into the VM window.
+BIOS** mode (UEFI is untested), then install (below). On the installed disk
+the default entry starts the desktop at 1024x768; **fluxOS (text console)**
+boots to the shell. In QEMU the mouse needs no grabbing; elsewhere click into
+the VM window.
 
 For the 3dfx driver and accelerated GL, give the machine a Voodoo Banshee or
 Voodoo3 (QEMU has none, so GL uses the software renderer there; 86Box emulates
@@ -490,16 +493,28 @@ Properties, or add `video=1024x768x16@85` to the kernel command line.
 
 ## Installing to a hard disk
 
-Boot the CD and double-click **Install fluxOS**, or from a shell run
-`fluxinstall /dev/hda` on a whole disk (see `lsblk`; it asks you to type
-"yes", `-y` skips that). It writes an MBR with one bootable FAT32 partition at
-1 MiB, installs GRUB, formats the partition, and copies the kernel, initrd,
-`grub.cfg` and files onto it. **This erases the whole disk**, which must be at
-least 34 MiB. The installed disk boots by itself and can install onto another
-(`fluxinstall -s / /dev/hdb`). In QEMU, install with `make run`, then quit and
-`make run-disk`. The installed system runs from disk, so anything saved outside
-`/tmp` stays; the boot menu's **safe mode** runs from the initrd in memory with
-the disk on `/mnt/hda1`.
+The CD starts **fluxOS Setup**, as a Windows CD does: a full-screen wizard
+that lists its steps down the left (Welcome, Choose a disk, Name this
+computer, Ready to install, Installing, Finishing), installs onto the disk you
+choose with a progress bar, then restarts into the installed system. **Disk
+Manager...** on the Choose a Disk page (and after a failed install) opens Disk
+Manager, to see what is on the disks, unmount or explore their volumes and
+copy files off them before one is erased. **Quit** leaves Setup by restarting
+or shutting down, and **Shift+F10** opens a command prompt. Without a framebuffer, or with the menu's **Install fluxOS (text
+mode)**, the same questions come on the console; from that console (or the
+command prompt) `fluxinstall /dev/hda` installs directly (it asks you to type
+"yes", `-y` skips that).
+
+Setup writes an MBR with one bootable FAT32 partition at 1 MiB, installs GRUB,
+formats the partition, copies the kernel and GRUB's files onto it and unpacks
+the system (`boot/system.tar` on the CD). **This erases the whole disk**, which
+must be at least 34 MiB. Once a disk has fluxOS, the CD's menu starts the hard
+disk by default, so a CD left in the drive does no harm. In QEMU, install with
+`make run`, then quit and `make run-disk`. The installed system runs from disk,
+so anything saved outside `/tmp` stays. Its boot menu's **safe mode** starts on
+one processor in the BIOS display mode, without the Radeon and Voodoo drivers;
+if the disk itself cannot be used, start Setup from the CD again (Shift+F10
+gives a shell).
 
 ## Things to try
 
@@ -514,7 +529,7 @@ spin A 5 & spin B 5 & top      # CPU-bound jobs sharing the CPU; ^C quits top
 cat ~/README.txt; ./demo.sh    # tour and a scripting demo
 echo {1..3} $((6*7)) ~         # brace, arithmetic and tilde expansion
 lsblk; df -h; mount            # disks, CD-ROM and mounted filesystems
-cp -r ~ /mnt/hda/home          # FAT32 writes survive reboots
+echo hi > ~/note.txt; sync    # saved on the disk: it survives reboots
 ifconfig; ping -c 3 10.0.2.2   # the network card, and QEMU's gateway
 host example.com; wget -O - https://example.com/    # DNS, HTTP, TLS 1.3
 nc -l 7777 &  echo hi | nc localhost 7777           # a TCP server and client
@@ -525,7 +540,7 @@ play /usr/share/sounds/startup.wav; mixer pcm 60    # the Sound Blaster
 dmesg | tail; poweroff
 ```
 
-Files on `/mnt/hda` live in `fluxdisk.img`, and those on `/mnt/fd0` in
+The installed system lives in `fluxdisk.img`, and files on `/mnt/fd0` in
 `fluxfloppy.img`. On a Linux host inspect them with `mdir -i fluxdisk.img ::`
 or `fsck.fat -n fluxdisk.img`, and add DOS programs with `mcopy -i
 fluxfloppy.img GAME.EXE ::`.
@@ -566,8 +581,11 @@ user/desktop/wave/js/      JavaScript (js.c, jslib*.c, jsbinary.c, jsre.c, jsgc.
 third_party/mbedtls/        upstream verification library subset and its fluxOS config
 user/dos/                  the DOS emulator (CPU, DPMI, BIOS, video, files, sound)
 user/bin/                  one program per file (fluxinstall.c is the installer)
-rootfs/                    files copied into the initrd (/etc, /home/flux, icons,
+rootfs/                    the installed system's files (/etc, /home/flux, icons,
                            the browser's fonts and home page in /usr/share/www)
+setupfs/                   the CD's setup system's own files (/etc/setup, its motd)
+grub/                      the CD's boot menu (install.cfg) and the installed disk's
+                           (grub.cfg)
 ```
 
 ## Design notes

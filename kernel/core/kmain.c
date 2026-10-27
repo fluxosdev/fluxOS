@@ -56,9 +56,9 @@ int cmdline_value(const char *key, char *out, size_t size)
 
 /*
  * /etc/boot-source says where the system was started from: "cdrom" for
- * an ISO9660 volume, "disk" for anything else, or nothing if the boot
- * loader did not say (QEMU's -kernel). The desktop uses it to offer the
- * installer only when booted from the install medium.
+ * an ISO9660 volume (the install CD's setup system), "disk" for anything
+ * else, or nothing if the boot loader did not say (QEMU's -kernel). The
+ * desktop keeps its settings in GRUB's environment only on a disk.
  */
 static void record_boot_source(void)
 {
@@ -146,8 +146,11 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     /*
      * The root: the installed disk named by root= (the system then runs
      * from the disk, as Windows does from C:), or else the initrd
-     * unpacked into memory, as from the CD. The initrd is also the
-     * fallback when the disk cannot be used.
+     * unpacked into memory: the CD's small setup system, or for
+     * development (make run-kernel) the whole system. An initrd is also
+     * the fallback when the disk cannot be used. Files in memory live in
+     * the kernel heap, which is why the CD carries the system it installs
+     * as a file rather than running it from memory.
      */
     vfs_init();
     int have_initrd = initrd_start && initrd_end > initrd_start;
@@ -167,7 +170,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     if (want_root && r < 0) {
         if (!have_initrd)
             panic("cannot use %s as the root filesystem (error %d): "
-                  "choose the safe mode entry in the boot menu", root, r);
+                  "start the computer from the fluxOS CD to install it again", root, r);
         kprintf("Cannot use %s as the root filesystem (error %d); running from the initrd\n",
                 root, r);
     }

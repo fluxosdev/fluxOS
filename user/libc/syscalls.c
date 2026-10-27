@@ -103,6 +103,14 @@ int dup2(int oldfd, int newfd) { return ret(sc2(SYS_dup2, oldfd, newfd)); }
 int pipe(int fds[2]) { return ret(sc1(SYS_pipe, (int)fds)); }
 off_t lseek(int fd, off_t off, int whence) { return ret(sc3(SYS_lseek, fd, off, whence)); }
 
+off64_t lseek64(int fd, off64_t off, int whence)
+{
+    uint64_t pos;
+    if (ret(sc5(SYS_llseek, fd, (int)((uint64_t)off >> 32), (int)off, (int)&pos, whence)) < 0)
+        return -1;
+    return (off64_t)pos;
+}
+
 pid_t waitpid(pid_t pid, int *status, int options)
 {
     return ret(sc3(SYS_waitpid, pid, (int)status, options));

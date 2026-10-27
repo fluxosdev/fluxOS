@@ -1,20 +1,23 @@
 /*
  * fluxinstall - install fluxOS onto a hard disk.
  *
- *   fluxinstall [-y] [-s SOURCE] [-n HOSTNAME] /dev/hdX
+ *   fluxinstall [-y] [-p] [-s SOURCE] [-n HOSTNAME] [/dev/hdX]
  *
  * The disk gets a new MBR partition table with one bootable FAT32
  * partition starting at 1 MiB. GRUB's boot sector goes into the MBR and
  * its core image into the gap before the partition, which is what
- * grub-install does for a BIOS disk. The partition is formatted and the
- * kernel, initrd and GRUB files are copied from SOURCE, the install
- * medium (the fluxOS CD, mounted on /mnt/cdrom, by default). An
- * installed disk carries the same files, so it can be a SOURCE too.
+ * grub-install does for a BIOS disk. The partition is formatted, and the
+ * kernel, GRUB's modules and its menu for a hard disk are copied there
+ * from SOURCE, the install medium: the fluxOS CD, or a USB stick written
+ * from it, found wherever it is mounted unless -s names it. The system
+ * itself, boot/system.tar on the medium, is unpacked onto the partition,
+ * which the installed system runs from as its root. With -n the installed
+ * system's /etc/hostname gets the name given.
  *
- * The initrd's contents (/bin, /etc, /home, /usr) are unpacked onto the
- * partition as well: an installed system runs from the disk, with the
- * partition as /, and keeps the initrd only for the boot menu's safe mode.
- * With -n the installed system's /etc/hostname gets the name given.
+ * Without a disk, fluxinstall guides the user through choosing one and
+ * naming the computer: the CD's setup in text mode, when there is no
+ * framebuffer for the graphical one. -p prints "progress N" lines (N in
+ * 0-100) for a front end, fluxOS Setup, to follow.
  */
 #include <ctype.h>
 #include <dirent.h>
@@ -36,6 +39,7 @@
 #define PART_START  2048                /* 1 MiB: room for GRUB's core image */
 #define MIN_PART    67584               /* 33 MiB: enough clusters for FAT32 */
 #define MOUNTPOINT  "/mnt/install"
+#define MAX_DISKS   8
 
 /* Offsets inside GRUB's boot.img and core.img (grub/boot/i386/pc). */
 #define BOOT_KERNEL_SECTOR 0x5C         /* 64-bit LBA of core.img */
@@ -44,9 +48,40 @@
 #define MBR_PARTITIONS     0x1BE
 #define CORE_SEGMENT       0x0820       /* where diskboot loads the rest of core */
 
-static const char *source = "/mnt/cdrom";
+static const char *source;              /* -s, or found */
 static const char *hostname;            /* -n: for the installed /etc/hostname */
 static int mounted;
+static int progress_lines;              /* -p */
+
+/* Overall progress: the copying is most of it. */
+#define COPY_FROM 5
+#define COPY_TO   95
+static unsigned long copy_total, copy_done;
+static int shown_percent = -1;
+
+static void progress(int percent)
+{
+    if (percent == shown_percent)
+        return;
+    shown_percent = percent;
+    if (progress_lines)
+        printf("progress %d\n", percent);
+}
+
+/* bytes more have been copied. */
+static void copied(unsigned long bytes)
+{
+    copy_done += bytes;
+    unsigned long part = copy_total ? copy_done * 100 / copy_total : 100;
+    if (part > 100)
+        part = 100;
+    int before = shown_percent;
+    progress(COPY_FROM + (int)(part * (COPY_TO - COPY_FROM) / 100));
+    if (!progress_lines && isatty(1) && shown_percent != before) {
+        printf("\r      %lu%%  (%lu of %lu MiB)", part, copy_done >> 20, copy_total >> 20);
+        fflush(stdout);
+    }
+}
 
 static void die(const char *fmt, ...)
 {
@@ -111,6 +146,7 @@ static void copy_file(const char *src, const char *dst, unsigned long *bytes)
         if (write(out, buf, (size_t)n) != n)
             die("writing %s: %s", dst, strerror(errno));
         *bytes += (unsigned long)n;
+        copied((unsigned long)n);
     }
     if (n < 0)
         die("reading %s: %s", src, strerror(errno));
@@ -177,6 +213,7 @@ static void extract_tar(const char *tar, const char *dir, unsigned long *bytes, 
                 if (data && write(out, buf, data) != (int)data)
                     die("writing %s: %s", dst, strerror(errno));
                 left -= chunk;
+                copied(chunk);
             }
             close(out);
             *bytes += size;
@@ -185,6 +222,7 @@ static void extract_tar(const char *tar, const char *dir, unsigned long *bytes, 
         }
         if (padded && lseek(in, padded, SEEK_CUR) < 0)
             die("%s: %s", tar, strerror(errno));
+        copied(padded);
     }
     close(in);
 }
@@ -223,10 +261,12 @@ static int run_mkfs(const char *dev)
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: fluxinstall [-y] [-s SOURCE] [-n HOSTNAME] /dev/hdX\n"
+    fprintf(stderr, "usage: fluxinstall [-y] [-p] [-s SOURCE] [-n HOSTNAME] [/dev/hdX]\n"
                     "  -y           do not ask for confirmation\n"
-                    "  -s SOURCE    install medium (default /mnt/cdrom)\n"
-                    "  -n HOSTNAME  the installed computer's name (letters, digits, hyphens)\n");
+                    "  -p           print \"progress N\" lines (N: 0-100)\n"
+                    "  -s SOURCE    install medium (default: the fluxOS CD, wherever mounted)\n"
+                    "  -n HOSTNAME  the installed computer's name (letters, digits, hyphens)\n"
+                    "Without a disk, fluxinstall asks which one to use.\n");
     exit(2);
 }
 
@@ -242,12 +282,134 @@ static int valid_hostname(const char *s)
     return 1;
 }
 
+/* The files an install medium has. */
+static const char *const needed[] = {
+    "boot/fluxos.kernel", "boot/system.tar", "boot/install/grub.cfg",
+    "boot/install/boot.img", "boot/install/core.img", NULL,
+};
+
+static int is_medium(const char *dir)
+{
+    char path[PATH_MAX];
+    struct stat st;
+    for (int k = 0; needed[k]; k++) {
+        path_join(path, sizeof(path), dir, needed[k]);
+        if (stat(path, &st) < 0)
+            return 0;
+    }
+    return 1;
+}
+
+/* The fluxOS CD (or a stick written from it), wherever it was mounted. */
+static const char *find_source(void)
+{
+    static char found[PATH_MAX];
+    if (is_medium("/mnt/cdrom"))
+        return "/mnt/cdrom";
+    struct blkinfo bi;
+    for (int k = 0; blkinfo(k, &bi) == 0; k++) {
+        if (bi.mountpoint[0] && is_medium(bi.mountpoint)) {
+            snprintf(found, sizeof(found), "%s", bi.mountpoint);
+            return found;
+        }
+    }
+    return NULL;
+}
+
+/* A line typed by the user, without its newline; "" at the end of input. */
+static void ask(const char *prompt, char *out, size_t size)
+{
+    printf("%s", prompt);
+    fflush(stdout);
+    if (!fgets(out, (int)size, stdin)) {
+        out[0] = 0;
+        return;
+    }
+    out[strcspn(out, "\r\n")] = 0;
+}
+
+/*
+ * Guided mode: choose a disk and a name, and agree to erasing the disk.
+ * Returns the disk's name; exits if the user quits.
+ */
+static const char *guided(void)
+{
+    static char disk[16], name[64];
+    struct blkinfo bi;
+    struct { char name[16]; int ok; } disks[MAX_DISKS];
+    int n = 0, usable = 0;
+    char source_dev[32] = "";
+    struct statfs sfs;
+    if (statfs(source, &sfs) == 0 && !strncmp(sfs.f_source, "/dev/", 5))
+        snprintf(source_dev, sizeof(source_dev), "%s", sfs.f_source + 5);
+
+    printf("\033[2J\033[H\033[1mfluxOS Setup\033[0m\n============\n\n");
+    printf("Setup installs fluxOS on a hard disk in this computer, so that it starts\n"
+           "from the disk without the CD.\n\n");
+    printf("Hard disks in this computer:\n\n");
+    for (int k = 0; blkinfo(k, &bi) == 0 && n < MAX_DISKS; k++) {
+        if (bi.type != BLK_DISK)
+            continue;
+        char size[32];
+        size_str(bi.sectors, size, sizeof(size));
+        const char *why = bi.sector_size != SECTOR ? "unsupported sector size"
+                        : bi.sectors < PART_START + MIN_PART ? "too small, needs 34 MiB"
+                        : source_dev[0] && on_disk(source_dev, bi.name) ? "holds the install files"
+                        : NULL;
+        snprintf(disks[n].name, sizeof(disks[n].name), "%s", bi.name);
+        disks[n].ok = !why;
+        usable += !why;
+        printf("  %d. %-5s %s, %s%s%s%s\n", n + 1, bi.name, bi.model[0] ? bi.model : "Hard disk", size,
+               why ? " (" : "", why ? why : "", why ? ")" : "");
+        n++;
+    }
+    if (!n)
+        printf("  (none)\n");
+    printf("\n");
+    if (!usable)
+        die("there is no hard disk fluxOS can be installed on");
+
+    int choice = -1;
+    for (int k = 0; k < n && choice < 0; k++)
+        if (disks[k].ok)
+            choice = k;
+    for (;;) {
+        char answer[16], prompt[64];
+        snprintf(prompt, sizeof(prompt), "Install fluxOS on which disk? [%d]: ", choice + 1);
+        ask(prompt, answer, sizeof(answer));
+        if (!answer[0])
+            break;
+        int k = atoi(answer) - 1;
+        if (k >= 0 && k < n && disks[k].ok) {
+            choice = k;
+            break;
+        }
+        printf("Type the number of a disk that can be used.\n");
+    }
+    snprintf(disk, sizeof(disk), "%s", disks[choice].name);
+
+    if (!hostname) {
+        for (;;) {
+            ask("Name for this computer [fluxOS]: ", name, sizeof(name));
+            if (!name[0])
+                snprintf(name, sizeof(name), "fluxOS");
+            if (valid_hostname(name))
+                break;
+            printf("Use 1-63 letters, digits and hyphens, not starting or ending with a hyphen.\n");
+        }
+        hostname = name;
+    }
+    return disk;
+}
+
 int main(int argc, char **argv)
 {
     int yes = 0, i = 1;
     for (; i < argc && argv[i][0] == '-'; i++) {
         if (!strcmp(argv[i], "-y"))
             yes = 1;
+        else if (!strcmp(argv[i], "-p"))
+            progress_lines = 1;
         else if (!strcmp(argv[i], "-s") && i + 1 < argc)
             source = argv[++i];
         else if (!strcmp(argv[i], "-n") && i + 1 < argc)
@@ -255,17 +417,24 @@ int main(int argc, char **argv)
         else
             usage();
     }
-    if (i != argc - 1)
+    if (i < argc - 1)
         usage();
     if (hostname && !valid_hostname(hostname))
         die("%s: a host name is 1-63 letters, digits and hyphens, not starting or ending with a hyphen",
             hostname);
 
-    /* Line by line even into a pipe, so a front end (the desktop's
-     * Setup wizard) sees each step as it starts. */
+    /* Line by line even into a pipe, so a front end (fluxOS Setup) sees
+     * each step as it starts. */
     setvbuf(stdout, NULL, _IOLBF, 0);
 
-    const char *dev = argv[i];
+    /* ---- the install medium ---- */
+    if (!source && !(source = find_source()))
+        die("cannot find the fluxOS installation files: is the fluxOS CD in the drive? (use -s DIR)");
+    if (!is_medium(source))
+        die("%s is not a fluxOS install medium: boot/system.tar or GRUB's files are missing", source);
+
+    int guided_mode = i == argc;
+    const char *dev = guided_mode ? guided() : argv[i];
     const char *disk = strrchr(dev, '/') ? strrchr(dev, '/') + 1 : dev;
     char devpath[64], partpath[64];
     snprintf(devpath, sizeof(devpath), "/dev/%s", disk);
@@ -288,18 +457,7 @@ int main(int argc, char **argv)
     if (target.sectors < PART_START + MIN_PART)
         die("%s is too small: fluxOS needs a disk of at least 34 MiB", dev);
 
-    /* ---- the install medium ---- */
-    static const char *const needed[] = {
-        "boot/fluxos.kernel", "boot/initrd.tar", "boot/grub/grub.cfg",
-        "boot/install/boot.img", "boot/install/core.img", NULL,
-    };
     char path[PATH_MAX];
-    for (int k = 0; needed[k]; k++) {
-        struct stat st;
-        path_join(path, sizeof(path), source, needed[k]);
-        if (stat(path, &st) < 0)
-            die("%s not found: is the fluxOS CD mounted on %s? (use -s DIR)", path, source);
-    }
     struct statfs sfs;
     if (statfs(source, &sfs) == 0 && !strncmp(sfs.f_source, "/dev/", 5) &&
         on_disk(sfs.f_source + 5, disk))
@@ -321,19 +479,22 @@ int main(int argc, char **argv)
     size_str(target.sectors, size, sizeof(size));
     printf("fluxOS installer\n\n");
     printf("  Target:  %s  %s, %s\n", devpath, target.model, size);
-    printf("  Source:  %s\n\n", source);
+    printf("  Source:  %s\n", source);
+    if (hostname)
+        printf("  Name:    %s\n", hostname);
+    printf("\n");
     printf("This creates one FAT32 partition (%s1) and installs GRUB and fluxOS.\n", devpath);
     printf("\033[1;31mALL DATA ON %s WILL BE ERASED.\033[0m\n", devpath);
     if (!yes) {
         char answer[16];
-        printf("Type 'yes' to continue: ");
-        fflush(stdout);
-        if (!fgets(answer, sizeof(answer), stdin) || strcmp(answer, "yes\n") != 0) {
-            printf("Aborted; nothing was changed.\n");
+        ask("Type 'yes' to continue: ", answer, sizeof(answer));
+        if (strcmp(answer, "yes") != 0) {
+            printf("Quit; nothing was changed.\n");
             return 1;
         }
     }
     printf("\n");
+    progress(0);
 
     /* ---- release the disk ---- */
     for (int k = 0; blkinfo(k, &bi) == 0; k++) {
@@ -405,12 +566,14 @@ int main(int argc, char **argv)
         die("re-reading the partition table of %s: %s", devpath, strerror(errno));
 
     /* ---- [2/4] filesystem ---- */
+    progress(2);
     printf("[2/4] Formatting %s as FAT32\n", partpath);
     if (run_mkfs(partpath) < 0)
         die("formatting %s failed", partpath);
 
     /* ---- [3/4] files ---- */
-    printf("[3/4] Copying fluxOS and GRUB from %s\n", source);
+    progress(COPY_FROM);
+    printf("[3/4] Copying fluxOS from %s\n", source);
     make_dir(MOUNTPOINT);
     if (mount(partpath, MOUNTPOINT, "fat32") < 0)
         die("mount %s: %s", partpath, strerror(errno));
@@ -419,27 +582,48 @@ int main(int argc, char **argv)
     unsigned long bytes = 0;
     unsigned files = 0;
     char src[PATH_MAX], dst[PATH_MAX];
+
+    /* What is to be copied, for the progress: the kernel, GRUB's modules
+     * and the system's archive. */
+    static const char *const top[][2] = {
+        { "boot/fluxos.kernel", "boot/fluxos.kernel" },
+        { "boot/install/grub.cfg", "boot/grub/grub.cfg" },     /* the hard disk's menu */
+        { NULL, NULL },
+    };
+    struct stat st;
+    for (int k = 0; top[k][0]; k++) {
+        path_join(src, sizeof(src), source, top[k][0]);
+        if (stat(src, &st) == 0)
+            copy_total += st.st_size;
+    }
+    path_join(src, sizeof(src), source, "boot/system.tar");
+    if (stat(src, &st) == 0)
+        copy_total += st.st_size;
+    path_join(src, sizeof(src), source, "boot/grub/i386-pc");
+    DIR *d = opendir(src);
+    if (!d)
+        die("%s: %s", src, strerror(errno));
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        char s2[PATH_MAX];
+        snprintf(s2, sizeof(s2), "%s/%s", src, de->d_name);
+        if (de->d_type == DT_REG && stat(s2, &st) == 0)
+            copy_total += st.st_size;
+    }
+
     make_dir(MOUNTPOINT "/boot");
     make_dir(MOUNTPOINT "/boot/grub");
-    make_dir(MOUNTPOINT "/boot/install");
-    static const char *const top[] = {
-        "boot/fluxos.kernel", "boot/initrd.tar", "boot/grub/grub.cfg",
-        "boot/install/boot.img", "boot/install/core.img", NULL,
-    };
-    for (int k = 0; top[k]; k++) {
-        path_join(src, sizeof(src), source, top[k]);
-        path_join(dst, sizeof(dst), MOUNTPOINT, top[k]);
+    for (int k = 0; top[k][0]; k++) {
+        path_join(src, sizeof(src), source, top[k][0]);
+        path_join(dst, sizeof(dst), MOUNTPOINT, top[k][1]);
         copy_file(src, dst, &bytes);
         files++;
     }
 
     /* GRUB's modules: core.img loads normal.mod and friends from here. */
     path_join(src, sizeof(src), source, "boot/grub/i386-pc");
-    DIR *d = opendir(src);
-    if (!d)
-        die("%s: %s", src, strerror(errno));
+    rewinddir(d);
     make_dir(MOUNTPOINT "/boot/grub/i386-pc");
-    struct dirent *de;
     while ((de = readdir(d))) {
         if (de->d_type != DT_REG)
             continue;
@@ -452,8 +636,10 @@ int main(int argc, char **argv)
     closedir(d);
 
     /* The system itself, which runs from this partition. */
-    path_join(src, sizeof(src), source, "boot/initrd.tar");
+    path_join(src, sizeof(src), source, "boot/system.tar");
     extract_tar(src, MOUNTPOINT, &bytes, &files);
+    if (!progress_lines && isatty(1))
+        printf("\n");
     printf("      %u files, %lu KiB\n", files, bytes / 1024);
     if (hostname) {
         path_join(dst, sizeof(dst), MOUNTPOINT, "etc/hostname");
@@ -464,14 +650,23 @@ int main(int argc, char **argv)
     }
 
     /* ---- [4/4] finish ---- */
+    progress(COPY_TO);
     printf("[4/4] Writing everything to disk\n");
     sync();
     if (umount(MOUNTPOINT) < 0)
         die("umount: %s", strerror(errno));
     mounted = 0;
     rmdir(MOUNTPOINT);
+    progress(100);
 
     printf("\n\033[1;32mfluxOS is installed on %s.\033[0m\n", devpath);
-    printf("Remove the CD (or boot from the disk) and reboot.\n");
+    if (guided_mode) {
+        char answer[16];
+        ask("Remove the CD from the drive, then press Enter to restart the computer. ", answer,
+            sizeof(answer));
+        sync();
+        reboot(REBOOT_RESTART);
+    }
+    printf("Remove the CD and restart the computer to start fluxOS from the disk.\n");
     return 0;
 }

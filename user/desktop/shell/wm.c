@@ -193,7 +193,6 @@ static struct desk_icon desk_icons[] = {
     { ICON_BROWSER, "Wave", open_browser, 0, 0 },
     { ICON_CALC, "Calculator", open_calculator, 0, 0 },
     { ICON_README, "Read Me", open_readme, 0, 0 },
-    { ICON_INSTALL, "Install fluxOS", setup_open, 0, 0 },
 };
 static int ndesk = (int)(sizeof(desk_icons) / sizeof(desk_icons[0]));
 #define NDESK ndesk
@@ -250,37 +249,24 @@ static struct menu_item menu_items[] = {
     { ICON_NONE, NULL, NULL, NULL, 0 },
     { ICON_README, "Read Me", open_readme, NULL, 0 },
     { ICON_RUN, "Run...", run_open, NULL, 0 },
-    { ICON_INSTALL, "Install fluxOS...", setup_open, NULL, 0 },
     { ICON_NONE, NULL, NULL, NULL, 0 },
     { ICON_SHUTDOWN, "Shut Down...", shutdown_open, NULL, 0 },
 };
 static int nmenu = (int)(sizeof(menu_items) / sizeof(menu_items[0]));
 #define NMENU nmenu
 
-/* Started from the hard disk, not the install medium: nothing to install. */
-static int booted_from_disk(void)
-{
-    char buf[16] = "";
-    int fd = open("/etc/boot-source", O_RDONLY);
-    if (fd < 0)
-        return 0;
-    int n = (int)read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    return n >= 4 && !strncmp(buf, "disk", 4);
-}
+/*
+ * Setup mode: the desktop as the install CD starts it, for fluxOS Setup
+ * alone. Setup paints the whole background; there is no taskbar, Start
+ * menu or desktop icons, and Shift+F10 opens a command prompt for when
+ * something needs looking into, as in Windows Setup.
+ */
+static int setup_mode;
 
-static void remove_installer(void)
+/* Where windows end: above the taskbar, or at the bottom in setup mode. */
+static int work_bottom(void)
 {
-    int k = 0;
-    for (int i = 0; i < ndesk; i++)
-        if (desk_icons[i].open != setup_open)
-            desk_icons[k++] = desk_icons[i];
-    ndesk = k;
-    k = 0;
-    for (int i = 0; i < nmenu; i++)
-        if (menu_items[i].run != setup_open)
-            menu_items[k++] = menu_items[i];
-    nmenu = k;
+    return setup_mode ? screen_h : screen_h - TASKBAR_H;
 }
 
 /* ---- the desktop context menu ---- */
@@ -440,6 +426,8 @@ static int update_clock(void)
 
 static struct rect taskbar_rect(void)
 {
+    if (setup_mode)
+        return mkrect(0, screen_h, 0, 0);
     return mkrect(0, screen_h - TASKBAR_H, screen_w, TASKBAR_H);
 }
 
@@ -635,7 +623,7 @@ static int title_buttons(struct window *w, struct rect *rects, int *kinds)
         rects[n] = mkrect(x, y, bw, bh);
         kinds[n++] = w->maximized ? TB_RESTORE : TB_MAXIMIZE;
     }
-    if (w->flags & WF_MINIMIZE) {
+    if ((w->flags & WF_MINIMIZE) && !setup_mode) {    /* no taskbar to bring it back */
         x -= bw;
         rects[n] = mkrect(x, y, bw, bh);
         kinds[n++] = TB_MINIMIZE;
@@ -1044,6 +1032,10 @@ void wm_set_accel(int on)
 static void draw_desktop(void)
 {
     struct rect c = screen.clip;
+    if (setup_mode) {
+        setup_draw_backdrop(&screen, c);
+        return;
+    }
     wallpaper_draw(&screen, c);
 
     for (int i = 0; i < NDESK; i++) {
@@ -1476,7 +1468,8 @@ static void compose(struct rect r)
     for (struct window *w = bottom; w; w = w->above)
         if (!w->minimized && w != modal)
             draw_window(w);
-    draw_taskbar();
+    if (!setup_mode)
+        draw_taskbar();
     if (modal) {
         gfx_dither(&screen, r.x, r.y, r.w, r.h, C_BLACK);
         draw_window(modal);
@@ -1678,15 +1671,15 @@ int wm_resize_client(struct window *w, int client_w, int client_h)
     r.h = client_h + FRAME_TOP + BORDER;
     if (r.x + r.w > screen_w)
         r.x = screen_w > r.w ? screen_w - r.w : 0;
-    if (r.y + r.h > screen_h - TASKBAR_H)
-        r.y = screen_h - TASKBAR_H > r.h ? screen_h - TASKBAR_H - r.h : 0;
+    if (r.y + r.h > work_bottom())
+        r.y = work_bottom() > r.h ? work_bottom() - r.h : 0;
     return set_frame(w, r);
 }
 
 void wm_center(struct window *w)
 {
     int x = (screen_w - w->r.w) / 2;
-    int y = (screen_h - TASKBAR_H - w->r.h) / 2;
+    int y = (work_bottom() - w->r.h) / 2;
     move_window(w, x > 0 ? x : 0, y > 0 ? y : 0);
 }
 
@@ -1697,8 +1690,8 @@ void wm_cascade(struct window *w)
     slot++;
     if (x + w->r.w > screen_w)
         x = screen_w - w->r.w > 0 ? screen_w - w->r.w : 0;
-    if (y + w->r.h > screen_h - TASKBAR_H)
-        y = screen_h - TASKBAR_H - w->r.h > 0 ? screen_h - TASKBAR_H - w->r.h : 0;
+    if (y + w->r.h > work_bottom())
+        y = work_bottom() - w->r.h > 0 ? work_bottom() - w->r.h : 0;
     move_window(w, x, y);
 }
 
@@ -1742,7 +1735,7 @@ static void toggle_maximize(struct window *w)
         return;
     struct rect to = w->restore;
     if (!w->maximized)
-        to = mkrect(0, 0, screen_w, screen_h - TASKBAR_H);
+        to = mkrect(0, 0, screen_w, work_bottom());
     struct rect from = w->r;
     if (set_frame(w, to) < 0)
         return;
@@ -1779,7 +1772,7 @@ static void tile(int by_rows)
     /* at most four windows deep, so that none gets too thin */
     int lines = n < 4 ? n : 4, across = (n + lines - 1) / lines;
     int rows = by_rows ? lines : across, cols = by_rows ? across : lines;
-    int w = screen_w, h = screen_h - TASKBAR_H;
+    int w = screen_w, h = work_bottom();
     for (int i = 0; i < n; i++) {
         int r = by_rows ? i / cols : i % rows, c = by_rows ? i % cols : i / rows;
         struct rect cell = mkrect(c * w / cols, r * h / rows, (c + 1) * w / cols - c * w / cols,
@@ -1894,7 +1887,7 @@ void wm_restyle(void)
         if (w->maximized) {             /* still filling the screen above the taskbar */
             w->restore.w += dw - frame_dw;
             w->restore.h += dh - frame_dh;
-            set_frame(w, mkrect(0, 0, screen_w, screen_h - TASKBAR_H));
+            set_frame(w, mkrect(0, 0, screen_w, work_bottom()));
         } else {
             w->r.w = cw + dw;
             w->r.h = ch + dh;
@@ -2184,7 +2177,7 @@ static struct rect resized_frame(void)
     if (drag_edges & E_T)
         t = s.y + dy < 0 ? 0 : s.y + dy;
     if (drag_edges & E_B)
-        b = s.y + s.h + dy > screen_h - TASKBAR_H ? screen_h - TASKBAR_H : s.y + s.h + dy;
+        b = s.y + s.h + dy > work_bottom() ? work_bottom() : s.y + s.h + dy;
     if (r - l < min_w) {
         if (drag_edges & E_L)
             l = r - min_w;
@@ -2388,8 +2381,8 @@ static void drag_motion(void)
         /* Keep part of the caption on screen. */
         if (y < 0)
             y = 0;
-        if (y > screen_h - TASKBAR_H - 10)
-            y = screen_h - TASKBAR_H - 10;
+        if (y > work_bottom() - 10)
+            y = work_bottom() - 10;
         if (x + drag_win->r.w < 40)
             x = 40 - drag_win->r.w;
         if (x > screen_w - 40)
@@ -2558,7 +2551,7 @@ static void press_right(void)
         set_ctx(taskbar_ctx, COUNT(taskbar_ctx), mx, my, -1);
         return;
     }
-    if (modal_window() || drag != DRAG_NONE || rect_contains(taskbar_rect(), mx, my) ||
+    if (setup_mode || modal_window() || drag != DRAG_NONE || rect_contains(taskbar_rect(), mx, my) ||
         window_at(mx, my)) {
         set_ctx(NULL, 0, 0, 0, -1);
         return;
@@ -2679,8 +2672,12 @@ static void key_event(const struct input_event *ev)
     int code = ev->code;
     int ctrl = ev->mods & KMOD_CTRL, alt = ev->mods & KMOD_ALT;
 
+    if (setup_mode && code == KEY_F10 && (ev->mods & KMOD_SHIFT)) {
+        terminal_open("Command Prompt", NULL, 0, 0);
+        return;
+    }
     if (code == KEY_LWIN || code == KEY_RWIN || (ctrl && code == KEY_ESC)) {
-        if (!modal_window())
+        if (!modal_window() && !setup_mode)
             set_menu(!menu_open);
         return;
     }
@@ -2731,7 +2728,7 @@ static void key_event(const struct input_event *ev)
     if (alt && code == KEY_F4) {
         if (focused)
             close_window(focused);
-        else
+        else if (!setup_mode)
             shutdown_open();
         return;
     }
@@ -2799,7 +2796,7 @@ void wm_splash(const char *message)
 
 void wm_tick(void)
 {
-    if (update_clock())
+    if (update_clock() && !setup_mode)
         wm_damage(tray_rect());
 }
 
@@ -2846,14 +2843,14 @@ int wm_reconfigure(void)
         my = screen_h - 1;
     for (struct window *w = bottom; w; w = w->above) {
         if (w->maximized) {
-            set_frame(w, mkrect(0, 0, screen_w, screen_h - TASKBAR_H));
+            set_frame(w, mkrect(0, 0, screen_w, work_bottom()));
             continue;
         }
         int x = w->r.x, y = w->r.y;
         if (x + w->r.w > screen_w)
             x = screen_w - w->r.w;
-        if (y + w->r.h > screen_h - TASKBAR_H)
-            y = screen_h - TASKBAR_H - w->r.h;
+        if (y + w->r.h > work_bottom())
+            y = work_bottom() - w->r.h;
         w->r.x = x < 0 ? 0 : x;
         w->r.y = y < 0 ? 0 : y;
     }
@@ -2868,8 +2865,9 @@ int wm_reconfigure(void)
     return 0;
 }
 
-void wm_init(void)
+void wm_init(int setup)
 {
+    setup_mode = setup;
     theme_init();
     frame_dw = 2 * BORDER;
     frame_dh = FRAME_TOP + BORDER;
@@ -2889,8 +2887,8 @@ void wm_init(void)
         fprintf(stderr, "desktop: out of memory\n");
         exit(1);
     }
-    if (booted_from_disk())
-        remove_installer();
+    if (setup_mode)
+        ndesk = 0;
     arrange_icons();
     mx = screen_w / 2;
     my = screen_h / 2;

@@ -30,7 +30,7 @@ void fb_scroll(uint32_t y0, uint32_t h, uint32_t dy);
 int fb_console_active(void);
 int fb_get_info(struct fbinfo *fi);
 int fb_map_user(void);
-void fb_proc_exit(int pid);
+void fb_proc_exit(int pid);             /* at exit and exec: the screen and GPU it held */
 
 /* 3dfx Banshee/Voodoo3 display driver (voodoo.c) */
 void voodoo_init(void);
@@ -61,6 +61,8 @@ int radeon_unmapbuf(const struct dispbuf *b);
 int radeon_map3d_user(struct disp3d *d);
 int radeon_submit_user(const struct dispsubmit *s);
 void radeon_proc_exit(int pid);         /* its buffers and the 3D engine */
+/* Are any of pid's pages in [start, end) lent to the GPU (DISP_MAPBUF)? */
+int radeon_pinned(int pid, uint32_t start, uint32_t end);
 
 /* ISA DMA (isadma.c). Modes: single transfers 0x40, auto-init 0x10, and
  * 0x08 to read memory (play) or 0x04 to write it (record). */

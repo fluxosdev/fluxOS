@@ -244,7 +244,8 @@ int fb_map_user(void)
     return (int)USER_MMIO_BASE;
 }
 
-/* Called for every exiting process; the console comes back with the screen. */
+/* Called for every process that exits or execs, which takes its mappings
+ * of device memory with it; the console comes back with the screen. */
 void fb_proc_exit(int pid)
 {
     voodoo_proc_exit(pid);

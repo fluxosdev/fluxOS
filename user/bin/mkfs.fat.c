@@ -22,7 +22,7 @@ static void wr32(unsigned char *p, unsigned v) { wr16(p, v); wr16(p + 2, v >> 16
 
 static int put(int fd, unsigned sector, const void *buf, unsigned count)
 {
-    if (lseek(fd, (off_t)(sector * 512u), SEEK_SET) < 0)
+    if (lseek64(fd, (off64_t)sector * 512, SEEK_SET) < 0)
         return -1;
     return write(fd, buf, count * 512u) == (int)(count * 512u) ? 0 : -1;
 }

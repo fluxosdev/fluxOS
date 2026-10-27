@@ -50,7 +50,7 @@ void input_push(const struct input_event *ev)
     poll_wakeup();
 }
 
-static int input_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
+static int input_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
 {
     (void)vn; (void)off;
     if (n < sizeof(struct input_event))

@@ -370,13 +370,13 @@ void tty_exec_attach(struct proc *p)
 
 /* ---- device nodes ---- */
 
-int tty_dev_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
+int tty_dev_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
 {
     (void)off;
     return tty_read(vnode_tty(vn), buf, n);
 }
 
-int tty_dev_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n)
+int tty_dev_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
 {
     (void)off;
     return tty_write(vnode_tty(vn), buf, n);
@@ -395,7 +395,7 @@ int tty_dev_poll(struct vnode *vn)
 
 /* ---- pseudo-terminals ---- */
 
-static int master_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
+static int master_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
 {
     (void)off;
     struct pty *p = vn->dev_priv;
@@ -414,7 +414,7 @@ static int master_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
     return (int)i;
 }
 
-static int master_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n)
+static int master_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
 {
     (void)off;
     struct pty *p = vn->dev_priv;

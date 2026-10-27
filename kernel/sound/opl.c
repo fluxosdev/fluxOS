@@ -100,7 +100,7 @@ static void opl_close(struct vnode *vn, int flags)
     opl_owner = 0;
 }
 
-static int opl_dev_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n)
+static int opl_dev_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
 {
     (void)vn; (void)off;
     const struct opl_write *w = buf;

@@ -6,6 +6,7 @@
  *   sp -> argc, argv[0..argc-1], NULL, envp[0..n-1], NULL, strings...
  */
 #include "kernel.h"
+#include "drivers.h"
 #include "mm.h"
 #include "proc.h"
 #include "vfs.h"
@@ -260,7 +261,10 @@ int proc_exec(struct proc *p, const char *path, char *const argv[], char *const 
         return r;
     }
 
-    /* Point of no return: replace the old image. */
+    /* Point of no return: replace the old image. The screen, the 3D
+     * engine and buffers lent to the GPU were the old image's: give them
+     * up before its memory is freed, as at exit. */
+    fb_proc_exit(p->pid);
     uint32_t *old = p->pd;
     p->pd = pd;
     if (p == current)

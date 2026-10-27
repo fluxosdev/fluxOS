@@ -3,9 +3,8 @@ Welcome to fluxOS 0.2.2
 
 fluxOS is an experimental hobby operating system, built with AI assistance
 from Claude and ChatGPT Codex. Run it in a virtual machine, and do not keep
-anything you care about on it. The root filesystem lives in RAM: files you
-create in your home folder are lost on reboot unless you copy them to a disk
-(see "Disks" below).
+anything you care about on it. fluxOS runs from the hard disk Setup installed
+it on, so what you save stays across reboots; only /tmp is kept in memory.
 
 
 The desktop
@@ -56,8 +55,8 @@ Disks
   Unmount a floppy (umount /mnt/fd0) before pulling it out: changes that
   have not been written yet are lost with it.
 
-  To install fluxOS on a hard disk, double-click "Install fluxOS" on the
-  desktop (only shown when started from the CD).
+  To install fluxOS on another hard disk, start the computer from the
+  fluxOS CD: it runs Setup.
 
 
 Multitasking

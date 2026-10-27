@@ -863,7 +863,7 @@ static int make_room(void)
     return 0;
 }
 
-static int dsp_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n)
+static int dsp_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
 {
     (void)vn; (void)off;
     const uint8_t *in = buf;

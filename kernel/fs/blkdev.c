@@ -374,14 +374,14 @@ void blk_start_flusher(void)
 
 /* ---- byte-granular access ---- */
 
-int blk_read_at(struct blockdev *bd, uint32_t base, uint32_t off, uint32_t n, void *buf)
+int blk_read_at(struct blockdev *bd, uint32_t base, uint64_t off, uint32_t n, void *buf)
 {
-    uint32_t ss = bd->sector_size;
+    uint32_t ss = bd->sector_size, shift = (uint32_t)__builtin_ctz(ss);
     uint8_t *out = buf;
     uint32_t done = 0;
     while (done < n) {
-        uint32_t lba = base + off / ss;
-        uint32_t within = off % ss;
+        uint32_t lba = base + (uint32_t)(off >> shift);
+        uint32_t within = (uint32_t)off & (ss - 1);
         if (within == 0 && n - done >= ss) {
             uint32_t count = MIN((n - done) / ss, 128u);
             int r = blk_read(bd, lba, count, out + done);
@@ -402,14 +402,14 @@ int blk_read_at(struct blockdev *bd, uint32_t base, uint32_t off, uint32_t n, vo
     return (int)done;
 }
 
-int blk_write_at(struct blockdev *bd, uint32_t base, uint32_t off, uint32_t n, const void *buf)
+int blk_write_at(struct blockdev *bd, uint32_t base, uint64_t off, uint32_t n, const void *buf)
 {
-    uint32_t ss = bd->sector_size;
+    uint32_t ss = bd->sector_size, shift = (uint32_t)__builtin_ctz(ss);
     const uint8_t *in = buf;
     uint32_t done = 0;
     while (done < n) {
-        uint32_t lba = base + off / ss;
-        uint32_t within = off % ss;
+        uint32_t lba = base + (uint32_t)(off >> shift);
+        uint32_t within = (uint32_t)off & (ss - 1);
         int r;
         if (within == 0 && n - done >= ss) {
             uint32_t count = MIN((n - done) / ss, 128u);
@@ -436,32 +436,42 @@ int blk_write_at(struct blockdev *bd, uint32_t base, uint32_t off, uint32_t n, c
 
 /* ---- /dev nodes ---- */
 
-static uint32_t dev_bytes(struct blockdev *bd)
+uint64_t blk_bytes(struct blockdev *bd)
 {
-    uint32_t limit = 0xFFFFFFFFu / bd->sector_size;
-    return bd->nsectors > limit ? 0xFFFFFFFFu : bd->nsectors * bd->sector_size;
+    return (uint64_t)bd->nsectors * bd->sector_size;
 }
 
-static int dev_blk_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
+/* What stat() shows: the size, or as much of it as 32 bits hold. */
+static uint32_t dev_bytes(struct blockdev *bd)
+{
+    uint64_t bytes = blk_bytes(bd);
+    return bytes > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)bytes;
+}
+
+static int dev_blk_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
 {
     struct blockdev *bd = vn->dev_priv;
     if (bd->refresh && bd->nsectors == 0)
         bd->refresh(bd);
     vn->size = dev_bytes(bd);
-    if (off >= vn->size)
+    uint64_t size = blk_bytes(bd);
+    if (off >= size)
         return 0;
-    n = MIN(n, vn->size - off);
+    if (n > size - off)
+        n = (uint32_t)(size - off);
     int r = blk_read_at(bd, 0, off, n, buf);
     return r < 0 ? -EIO : r;
 }
 
-static int dev_blk_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n)
+static int dev_blk_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
 {
     struct blockdev *bd = vn->dev_priv;
     vn->size = dev_bytes(bd);
-    if (off >= vn->size)
+    uint64_t size = blk_bytes(bd);
+    if (off >= size)
         return -ENOSPC;
-    n = MIN(n, vn->size - off);
+    if (n > size - off)
+        n = (uint32_t)(size - off);
     return blk_write_at(bd, 0, off, n, buf);
 }
 

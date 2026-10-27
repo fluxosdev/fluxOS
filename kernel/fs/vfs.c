@@ -475,7 +475,7 @@ struct vnode *vfs_mknod_anon(uint32_t rdev, dev_read_t rd, dev_write_t wr)
     return vn;
 }
 
-int vfs_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
+int vfs_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
 {
     if (vn->type == VN_CHR || vn->type == VN_BLK)
         return vn->dev_read ? vn->dev_read(vn, buf, off, n) : 0;
@@ -483,9 +483,9 @@ int vfs_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
         return -EISDIR;
     if (off >= vn->size)
         return 0;
-    n = MIN(n, vn->size - off);
+    n = MIN(n, vn->size - (uint32_t)off);
     if (vn->fs)
-        return vn->fs->ops->read(vn, buf, off, n);
+        return vn->fs->ops->read(vn, buf, (uint32_t)off, n);
     memcpy(buf, vn->data + off, n);
     return (int)n;
 }
@@ -504,7 +504,7 @@ static int reserve(struct vnode *vn, uint32_t size)
     return 0;
 }
 
-int vfs_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n)
+int vfs_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
 {
     if (vn->type == VN_CHR || vn->type == VN_BLK)
         return vn->dev_write ? vn->dev_write(vn, buf, off, n) : (int)n;
@@ -512,20 +512,21 @@ int vfs_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n)
         return -EISDIR;
     if (!n)
         return 0;
-    if (off + n < off)
+    if (off + n > UINT32_MAX)
         return -EFBIG;
+    uint32_t pos = (uint32_t)off;
     if (vn->fs) {
         if (vn->fs->readonly || !vn->fs->ops->write)
             return -EROFS;
-        return vn->fs->ops->write(vn, buf, off, n);
+        return vn->fs->ops->write(vn, buf, pos, n);
     }
-    int r = reserve(vn, off + n);
+    int r = reserve(vn, pos + n);
     if (r < 0)
         return r;
-    if (off > vn->size)
-        memset(vn->data + vn->size, 0, off - vn->size);
-    memcpy(vn->data + off, buf, n);
-    vn->size = MAX(vn->size, off + n);
+    if (pos > vn->size)
+        memset(vn->data + vn->size, 0, pos - vn->size);
+    memcpy(vn->data + pos, buf, n);
+    vn->size = MAX(vn->size, pos + n);
     vn->mtime = time_now();
     return (int)n;
 }
@@ -1049,26 +1050,26 @@ void vfs_automount(void)
 
 /* ---- device nodes ---- */
 
-static int dev_null_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
+static int dev_null_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
 {
     (void)vn; (void)buf; (void)off; (void)n;
     return 0;
 }
 
-static int dev_null_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n)
+static int dev_null_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
 {
     (void)vn; (void)buf; (void)off;
     return (int)n;
 }
 
-static int dev_zero_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
+static int dev_zero_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
 {
     (void)vn; (void)off;
     memset(buf, 0, n);
     return (int)n;
 }
 
-static int dev_random_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
+static int dev_random_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
 {
     (void)vn; (void)off;
     random_bytes(buf, n);

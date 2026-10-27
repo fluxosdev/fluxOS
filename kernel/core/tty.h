@@ -29,8 +29,8 @@ void tty_exec_attach(struct proc *p);
 struct tty *tty_current(void);
 
 /* Device node callbacks; a NULL dev_priv means the controlling terminal. */
-int tty_dev_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n);
-int tty_dev_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n);
+int tty_dev_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n);
+int tty_dev_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n);
 int tty_dev_poll(struct vnode *vn);
 
 int pty_create(struct file **master, struct file **slave);

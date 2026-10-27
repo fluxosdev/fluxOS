@@ -75,7 +75,8 @@
 #define SYS_ioctl     67
 #define SYS_usbinfo   68
 #define SYS_stime     69
+#define SYS_llseek    70    /* fd, offset high, offset low, uint64_t *result, whence */
 
-#define NSYSCALLS     70
+#define NSYSCALLS     71
 
 #endif

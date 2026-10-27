@@ -3,6 +3,10 @@
  * when there is a framebuffer. Without one, or once the desktop exits,
  * it shows the message of the day, starts a login shell on the console
  * and respawns it when it exits. It also reaps orphaned processes.
+ *
+ * On the install CD, whose small setup system has /etc/setup, it starts
+ * fluxOS Setup instead: the desktop's graphical one, or without a
+ * framebuffer fluxinstall's guided text mode.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -15,8 +19,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define SHELL   "/bin/fsh"
-#define DESKTOP "/bin/desktop"
+#define SHELL     "/bin/fsh"
+#define DESKTOP   "/bin/desktop"
+#define INSTALLER "/bin/fluxinstall"
+#define SETUP_MARK "/etc/setup"         /* only in the CD's setup system */
 
 static void cat_file(const char *path)
 {
@@ -49,7 +55,7 @@ static void read_hostname(char *out, size_t size)
         snprintf(out, size, "%s", buf);
 }
 
-static int spawn(const char *path, char *argv0)
+static int spawn(const char *path, char *const argv[])
 {
     int pid = fork();
     if (pid < 0) {
@@ -60,7 +66,6 @@ static int spawn(const char *path, char *argv0)
         setpgid(0, 0);
         tcsetpgrp(0, getpid());
         chdir(getenv("HOME"));
-        char *argv[] = { argv0, NULL };
         execve(path, argv, environ);
         fprintf(stderr, "init: exec %s: %s\n", path, strerror(errno));
         _exit(127);
@@ -102,21 +107,31 @@ int main(void)
     mkdir("/home/flux", 0755);
     mkdir("/root", 0700);
 
+    int setup = access(SETUP_MARK, F_OK) == 0;
     struct fbinfo fi;
     if (fbinfo(&fi) == 0 && access(DESKTOP, X_OK) == 0) {
-        int desktop = spawn(DESKTOP, "desktop");
+        char *argv[] = { "desktop", setup ? "--setup" : NULL, NULL };
+        int desktop = spawn(DESKTOP, argv);
         int status = desktop > 0 ? wait_for(desktop) : -1;
         tcsetpgrp(0, getpgrp());
         if (status == 0)
             printf("\nThe desktop has closed. Type 'desktop' to start it again.\n\n");
         else
             printf("\ninit: the desktop stopped (status %d), starting a console session\n\n", status);
+    } else if (setup && access(INSTALLER, X_OK) == 0) {
+        char *argv[] = { "fluxinstall", NULL };
+        int installer = spawn(INSTALLER, argv);
+        if (installer > 0)
+            wait_for(installer);
+        tcsetpgrp(0, getpgrp());
+        printf("\n");
     }
 
     cat_file("/etc/motd");
 
     for (;;) {
-        int shell = spawn(SHELL, "-fsh");
+        char *argv[] = { "-fsh", NULL };
+        int shell = spawn(SHELL, argv);
         if (shell < 0) {
             sleep(1);
             continue;

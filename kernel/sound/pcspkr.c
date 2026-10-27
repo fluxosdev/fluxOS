@@ -85,7 +85,7 @@ void spkr_beep(uint32_t freq, uint32_t ms)
     queue_tone(freq, ms);
 }
 
-static int spkr_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n)
+static int spkr_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
 {
     (void)vn; (void)off;
     const struct spkr_tone *t = buf;

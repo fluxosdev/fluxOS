@@ -4,6 +4,9 @@
  * console shell. Exiting it (Shut Down... > exit to the console) gives
  * the screen back to the text console.
  *
+ * "desktop --setup" is what the install CD starts instead: fluxOS Setup
+ * on a screen of its own, with no taskbar or desktop icons.
+ *
  * One loop polls the input device and every terminal's pty, handles
  * what is ready, runs the timers and repaints what changed.
  */
@@ -11,6 +14,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include "desktop.h"
@@ -56,25 +60,31 @@ static int watching(const struct watch *w)
     return 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     signal(SIGINT, SIG_IGN);
     signal(SIGQUIT, SIG_IGN);
+    int setup = argc > 1 && !strcmp(argv[1], "--setup");
 
     int input = open("/dev/input", O_RDONLY);
     if (input < 0) {
         perror("desktop: /dev/input");
         return 1;
     }
-    wm_init();
+    wm_init(setup);
     datetime_init();
     sound_init();
-    saver_init();
-    terminal_open("Terminal", NULL, 0, 1);
-    wm_flush();
-    sound_startup();                    /* the desktop has replaced the boot screen */
-    wallpaper_init();                   /* after the first frame: decoding takes a moment */
-    wm_flush();
+    if (setup) {
+        setup_open();
+        wm_flush();
+    } else {
+        saver_init();
+        terminal_open("Terminal", NULL, 0, 1);
+        wm_flush();
+        sound_startup();                /* the desktop has replaced the boot screen */
+        wallpaper_init();               /* after the first frame: decoding takes a moment */
+        wm_flush();
+    }
 
     unsigned int last_blink = now_ms(), last_tick = last_blink;
     for (;;) {
@@ -156,6 +166,7 @@ int main(void)
             taskmgr_tick();
             diskmgr_tick();
             browser_tick();
+            setup_tick();
         }
         wm_flush();
     }

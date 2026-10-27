@@ -4,7 +4,8 @@
  * only), and device memory (the framebuffer) mapped at boot above 3 GiB.
  * The user half (1 GiB - 3 GiB) uses ordinary 4 KiB pages, and page
  * tables are reached through the identity map. User pages marked
- * PTE_MMIO map device memory: they are shared on fork, never freed.
+ * PTE_MMIO map device memory, lent to one process: never freed, and
+ * not copied into a forked child, which has no claim on the device.
  *
  * An address space is loaded on at most one processor, the one running
  * its process, but that need not be this one: a change to another's
@@ -206,7 +207,7 @@ void vmm_destroy(uint32_t *pd)
     pmm_free((uint32_t)pd);
 }
 
-/* Deep copy of the user half (fork). */
+/* Deep copy of the user half (fork), without the device memory. */
 uint32_t *vmm_clone(uint32_t *src)
 {
     uint32_t *pd = vmm_create();
@@ -221,12 +222,8 @@ uint32_t *vmm_clone(uint32_t *src)
             goto fail;
         pd[i] = (uint32_t)dpt | PTE_PRESENT | PTE_WRITE | PTE_USER;
         for (int j = 0; j < 1024; j++) {
-            if (!(spt[j] & PTE_PRESENT))
+            if ((spt[j] & (PTE_PRESENT | PTE_MMIO)) != PTE_PRESENT)
                 continue;
-            if (spt[j] & PTE_MMIO) {
-                dpt[j] = spt[j];
-                continue;
-            }
             uint32_t frame = pmm_alloc();
             if (!frame)
                 goto fail;

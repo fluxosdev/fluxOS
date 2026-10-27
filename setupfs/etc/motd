@@ -1,0 +1,7 @@
+
+fluxOS Setup
+
+ * Type 'fluxinstall' to install fluxOS on a hard disk (it asks which).
+ * Type 'desktop --setup' for the graphical Setup, if the screen allows it.
+ * 'lsblk' lists the disks; 'reboot' and 'poweroff' leave Setup.
+

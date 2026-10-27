@@ -9,8 +9,9 @@ enum { VN_FILE = 1, VN_DIR, VN_CHR, VN_BLK };
 
 struct vnode;
 struct fs;
-typedef int (*dev_read_t)(struct vnode *vn, void *buf, uint32_t off, uint32_t n);
-typedef int (*dev_write_t)(struct vnode *vn, const void *buf, uint32_t off, uint32_t n);
+/* off is the file position, which may be past 4 GiB on a disk. */
+typedef int (*dev_read_t)(struct vnode *vn, void *buf, uint64_t off, uint32_t n);
+typedef int (*dev_write_t)(struct vnode *vn, const void *buf, uint64_t off, uint32_t n);
 typedef int (*dev_poll_t)(struct vnode *vn);            /* POLL* events ready */
 typedef void (*dev_release_t)(struct vnode *vn);        /* last reference gone */
 typedef int (*dev_open_t)(struct vnode *vn, int flags);  /* before a file opens it */
@@ -74,8 +75,9 @@ struct vnode *vfs_mknod(struct vnode *dir, const char *name, uint32_t rdev,
                         dev_read_t rd, dev_write_t wr);
 struct vnode *vfs_mknod_anon(uint32_t rdev, dev_read_t rd, dev_write_t wr);
 
-int vfs_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n);
-int vfs_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n);
+/* Files end before 4 GiB (their size is 32 bits); devices may go on. */
+int vfs_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n);
+int vfs_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n);
 int vfs_truncate(struct vnode *vn, uint32_t size);
 void vfs_stat(struct vnode *vn, struct stat *st);
 int vfs_dirent(struct vnode *dir, uint32_t index, struct dirent *de);
@@ -97,7 +99,7 @@ struct socket;
 struct file {
     int type;
     int flags;                  /* O_* access and status flags */
-    uint32_t off;
+    uint64_t off;
     int refs;
     struct vnode *vn;
     struct pipe *pipe;

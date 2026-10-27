@@ -313,7 +313,7 @@ static void dsp_close(struct vnode *vn, int flags)
     start();                            /* the rest plays out by itself */
 }
 
-static int dsp_dev_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n)
+static int dsp_dev_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
 {
     (void)vn; (void)off;
     const uint8_t *in = buf;

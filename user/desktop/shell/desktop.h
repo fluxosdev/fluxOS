@@ -148,7 +148,8 @@ struct window {
 extern struct surface screen;
 extern int screen_w, screen_h;
 
-void wm_init(void);
+/* setup: the install CD's desktop, for fluxOS Setup alone (no taskbar or icons). */
+void wm_init(int setup);
 void wm_damage(struct rect r);
 void wm_flush(void);
 struct rect wm_client_rect(struct window *w);
@@ -250,7 +251,9 @@ int browser_timeout(void);              /* ms until browser_poll is needed, -1 i
 void browser_child_exited(int pid, int status);
 void browser_blink(void);
 void browser_tick(void);
-void setup_open(void);
+void setup_open(void);                  /* fluxOS Setup, full screen (wm_init's setup mode) */
+void setup_draw_backdrop(struct surface *s, struct rect clip);  /* behind Setup's window */
+void setup_tick(void);                  /* once a second */
 void display_open(void);                /* Display Properties */
 void datetime_open(void);               /* Date and Time Properties: zone, NTP sync */
 void datetime_tick(void);               /* once a second */

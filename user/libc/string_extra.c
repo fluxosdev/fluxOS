@@ -113,6 +113,7 @@ char *strerror(int err)
     case ENAMETOOLONG: return "File name too long";
     case ENOSYS: return "Function not implemented";
     case ENOTEMPTY: return "Directory not empty";
+    case EOVERFLOW: return "Value too large for defined data type";
     case ENOTSOCK: return "Socket operation on non-socket";
     case EDESTADDRREQ: return "Destination address required";
     case EMSGSIZE: return "Message too long";

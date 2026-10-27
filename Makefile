@@ -1,10 +1,13 @@
 # fluxOS build
 #
-#   make            build the bootable ISO (fluxOS.iso)
-#   make run        boot the ISO in QEMU (serial console on stdio)
+#   make            build the bootable install CD (fluxOS.iso), which starts
+#                   fluxOS Setup and installs fluxOS onto a hard disk
+#   make run        boot the ISO in QEMU (serial console on stdio), with
+#                   fluxdisk.img to install onto
 #   make run-smp    the same with two processors (QEMU_SMP=4 for more)
-#   make run-kernel boot the kernel directly with QEMU's multiboot loader
-#                   (text console only: that loader cannot set a video mode)
+#   make run-kernel boot the kernel directly with QEMU's multiboot loader,
+#                   running the whole system from memory (for development;
+#                   text console only: that loader cannot set a video mode)
 #   make run-disk   boot fluxdisk.img alone (after installing onto it)
 #   make run-q35    boot the ISO on a q35 machine: fluxdisk.img and the CD on
 #                   its SATA (AHCI) controller, a USB keyboard and tablet on xHCI
@@ -31,12 +34,17 @@ MKRESCUE ?= $(GRUB)/usr/bin/grub-mkrescue
 GRUB_MKIMAGE ?= $(GRUB)/usr/bin/grub-mkimage
 GRUB_PC_DIR ?= $(GRUB)/usr/lib/grub/i386-pc
 
+# Plain "make" builds the ISO, whatever rule comes first below.
+.DEFAULT_GOAL := all
+
 BUILD   := build
 ISO     := fluxOS.iso
 KERNEL  := $(BUILD)/fluxos.kernel
 TEXT_KERNEL := $(BUILD)/fluxos-text.kernel
-INITRD  := $(BUILD)/initrd.tar
+SYSTEM  := $(BUILD)/system.tar
+SETUP   := $(BUILD)/setup.tar
 ROOTFS  := $(BUILD)/rootfs
+SETUPFS := $(BUILD)/setupfs
 DISK    := fluxdisk.img
 DISK_MB ?= 64
 FLOPPY  := fluxfloppy.img
@@ -117,14 +125,24 @@ BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/fsh $(ROOTFS)/bi
              $(ROOTFS)/bin/dos
 
 ROOTFS_FILES := $(shell find rootfs -type f 2>/dev/null)
+SETUPFS_FILES := $(shell find setupfs -type f 2>/dev/null)
 
-.PHONY: all iso kernel initrd disk floppy run run-smp run-kernel run-disk run-q35 run-usb check clean
+# The install CD's setup system, the one GRUB loads into memory: fluxOS
+# Setup (the desktop and fluxinstall), its icons, and a few tools for the
+# command prompt Shift+F10 opens. Small, so that it fits the kernel heap of
+# a machine with little memory; the system it installs is $(SYSTEM), which
+# fluxinstall reads from the CD.
+SETUP_BINS := init desktop fluxinstall mkfs.fat fsh cat ls lsblk mount umount df dmesg \
+              ps free uname clear more mkdir rm cp mv sync reboot poweroff halt
+
+.PHONY: all iso kernel system setup disk floppy run run-smp run-kernel run-disk run-q35 run-usb check clean
 .SECONDARY:
 
 all: $(ISO)
 iso: $(ISO)
 kernel: $(KERNEL)
-initrd: $(INITRD)
+system: $(SYSTEM)
+setup: $(SETUP)
 
 $(BUILD)/k/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -187,26 +205,42 @@ $(BUILD)/.rootfs-stamp: $(ROOTFS_FILES)
 	cp -r rootfs/. $(ROOTFS)/
 	@touch $@
 
-$(INITRD): $(BUILD)/.rootfs-stamp $(BINS)
+$(SYSTEM): $(BUILD)/.rootfs-stamp $(BINS)
 	cp $(ROOTFS)/bin/fsh $(ROOTFS)/bin/sh
 	chmod 755 $(ROOTFS)/home/flux/demo.sh
 	tar --format=ustar --owner=0 --group=0 --numeric-owner -cf $@ -C $(ROOTFS) .
 
+$(SETUP): $(BUILD)/.rootfs-stamp $(BINS) $(SETUPFS_FILES)
+	rm -rf $(SETUPFS)
+	mkdir -p $(SETUPFS)/bin $(SETUPFS)/etc $(SETUPFS)/usr/share
+	cp $(addprefix $(ROOTFS)/bin/,$(SETUP_BINS)) $(SETUPFS)/bin/
+	cp $(SETUPFS)/bin/fsh $(SETUPFS)/bin/sh
+	cp $(ROOTFS)/etc/fshrc $(SETUPFS)/etc/
+	cp -r $(ROOTFS)/usr/share/icons $(SETUPFS)/usr/share/
+	cp -r setupfs/. $(SETUPFS)/
+	tar --format=ustar --owner=0 --group=0 --numeric-owner -cf $@ -C $(SETUPFS) .
+
 $(GRUB)/usr/bin/grub-mkimage:
 	sh tools/fetch-grub.sh $(GRUB)
 
-$(ISO): $(KERNEL) $(INITRD) grub/grub.cfg $(GRUB_DEP)
+# The CD: GRUB's menu (grub/install.cfg), the kernel, the setup system it
+# loads and the system Setup installs.
+$(ISO): $(KERNEL) $(SETUP) $(SYSTEM) grub/grub.cfg grub/install.cfg $(GRUB_DEP)
+	@rm -f $(BUILD)/iso/boot/initrd.tar
 	@mkdir -p $(BUILD)/iso/boot/grub
 	cp $(KERNEL) $(BUILD)/iso/boot/fluxos.kernel
-	cp $(INITRD) $(BUILD)/iso/boot/initrd.tar
-	cp grub/grub.cfg $(BUILD)/iso/boot/grub/grub.cfg
+	cp $(SETUP) $(BUILD)/iso/boot/setup.tar
+	cp $(SYSTEM) $(BUILD)/iso/boot/system.tar
+	cp grub/install.cfg $(BUILD)/iso/boot/grub/grub.cfg
 	@# GRUB for hard disks, written to disk by /bin/fluxinstall: boot.img
 	@# goes in the MBR, core.img in the gap before the first partition and
-	@# reads its modules from /boot/grub on that FAT32 partition.
+	@# reads its modules and menu (grub/grub.cfg) from /boot/grub on that
+	@# FAT32 partition.
 	@mkdir -p $(BUILD)/iso/boot/install
 	$(GRUB_MKIMAGE) -O i386-pc -d $(GRUB_PC_DIR) -o $(BUILD)/iso/boot/install/core.img \
 		-p '(,msdos1)/boot/grub' biosdisk part_msdos fat
 	cp $(GRUB_PC_DIR)/boot.img $(BUILD)/iso/boot/install/boot.img
+	cp grub/grub.cfg $(BUILD)/iso/boot/install/grub.cfg
 	PATH="$(abspath $(GRUB))/usr/bin:$$PATH" $(MKRESCUE) -d $(GRUB_PC_DIR) -o $@ $(BUILD)/iso
 
 check: $(KERNEL)
@@ -250,8 +284,8 @@ QEMU_SMP ?= 2
 run-smp: $(ISO) $(DISK)
 	$(QEMU) $(QEMU_CPU) -smp $(QEMU_SMP) -m 1G -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
 
-run-kernel: $(TEXT_KERNEL) $(INITRD) $(DISK)
-	$(QEMU) $(QEMU_CPU) -kernel $(TEXT_KERNEL) -initrd $(INITRD) -m 256M -serial stdio $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
+run-kernel: $(TEXT_KERNEL) $(SYSTEM) $(DISK)
+	$(QEMU) $(QEMU_CPU) -kernel $(TEXT_KERNEL) -initrd $(SYSTEM) -m 256M -serial stdio $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
 
 # Boot fluxdisk.img on its own, after "fluxinstall /dev/hda".
 run-disk: $(DISK)
@@ -315,8 +349,8 @@ $(BUILD)/tests/kernel-%: tests/kernel-%.c tests/kernel-test.h $(wildcard kernel/
 # Override to exercise SMP, nosmp and maxcpus without touching a real disk.
 KERNEL_TEST_CPUS ?= 1
 KERNEL_TEST_CMDLINE ?=
-test-kernel-qemu: $(TEXT_KERNEL) $(INITRD) $(BUILD)/tests/kernel-guest
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(INITRD) $(BUILD)/tests/kernel-guest --cpus $(KERNEL_TEST_CPUS) --append "$(KERNEL_TEST_CMDLINE)"
+test-kernel-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest --cpus $(KERNEL_TEST_CPUS) --append "$(KERNEL_TEST_CMDLINE)"
 
 $(BUILD)/tests/kernel-guest.o: tests/kernel-guest.c
 	@mkdir -p $(dir $@)

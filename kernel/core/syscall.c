@@ -194,6 +194,9 @@ static int sys_sbrk(uint32_t incr, uint32_t b, uint32_t c, uint32_t d, uint32_t 
     } else if (delta < 0) {
         if (nbrk < p->heap_start || nbrk > old)
             return -EINVAL;
+        /* Pages lent to the GPU stay until they are taken back (DISP_UNMAPBUF). */
+        if (radeon_pinned(p->pid, ALIGN_UP(nbrk, PAGE_SIZE), ALIGN_UP(old, PAGE_SIZE)))
+            return -EBUSY;
         for (uint32_t va = ALIGN_UP(nbrk, PAGE_SIZE); va < ALIGN_UP(old, PAGE_SIZE); va += PAGE_SIZE)
             vmm_free_page(p->pd, va);
     }
@@ -456,29 +459,70 @@ static int sys_poll(uint32_t ufds, uint32_t nfds, uint32_t timeout, uint32_t d, 
     return do_poll((struct pollfd *)ufds, nfds, (int)timeout);
 }
 
+/*
+ * The new position of f, moved by the signed offset off. Positions are
+ * 64-bit: a disk's device node goes past 4 GiB, and a file up to 4 GiB.
+ */
+static int seek(struct file *f, int64_t off, uint32_t whence, uint64_t *out)
+{
+    if (f->type == FT_PIPE || f->type == FT_SOCKET)
+        return -ESPIPE;
+    if (f->vn->type == VN_CHR) {
+        *out = 0;
+        return 1;                       /* terminals and the like: nowhere to go */
+    }
+    int64_t base;
+    switch (whence) {
+    case SEEK_SET: base = 0; break;
+    case SEEK_CUR: base = (int64_t)f->off; break;
+    case SEEK_END: {
+        struct blockdev *bd = blk_by_vnode(f->vn);
+        base = bd ? (int64_t)blk_bytes(bd) : (int64_t)f->vn->size;
+        break;
+    }
+    default: return -EINVAL;
+    }
+    if ((off > 0 && base > INT64_MAX - off) || base + off < 0)
+        return -EINVAL;
+    *out = (uint64_t)(base + off);
+    return 0;
+}
+
+/* The 32-bit lseek: a position past 2 GiB cannot be its result. */
 static int sys_lseek(uint32_t fd, uint32_t off, uint32_t whence, uint32_t d, uint32_t e)
 {
     (void)d; (void)e;
     struct file *f = get_file(fd);
     if (!f)
         return -EBADF;
-    if (f->type == FT_PIPE || f->type == FT_SOCKET)
-        return -ESPIPE;
-    if (f->vn->type == VN_CHR)
-        return 0;
-
-    int32_t base;
-    switch (whence) {
-    case SEEK_SET: base = 0; break;
-    case SEEK_CUR: base = (int32_t)f->off; break;
-    case SEEK_END: base = (int32_t)f->vn->size; break;
-    default: return -EINVAL;
+    uint64_t pos;
+    int r = seek(f, (int32_t)off, whence, &pos);
+    if (r < 0)
+        return r;
+    if (r == 0) {
+        if (pos > INT32_MAX)
+            return -EOVERFLOW;
+        f->off = pos;
     }
-    int32_t pos = base + (int32_t)off;
-    if (pos < 0)
-        return -EINVAL;
-    f->off = (uint32_t)pos;
-    return pos;
+    return (int)pos;
+}
+
+/* lseek with a 64-bit offset (high, low) and result (written to *uresult). */
+static int sys_llseek(uint32_t fd, uint32_t hi, uint32_t lo, uint32_t uresult, uint32_t whence)
+{
+    struct file *f = get_file(fd);
+    if (!f)
+        return -EBADF;
+    if (user_check((void *)uresult, sizeof(uint64_t)) < 0)
+        return -EFAULT;
+    uint64_t pos;
+    int r = seek(f, (int64_t)((uint64_t)hi << 32 | lo), whence, &pos);
+    if (r < 0)
+        return r;
+    if (r == 0)
+        f->off = pos;
+    memcpy((void *)uresult, &pos, sizeof(pos));
+    return 0;
 }
 
 static int sys_stat(uint32_t upath, uint32_t ust, uint32_t c, uint32_t d, uint32_t e)
@@ -565,7 +609,7 @@ static int sys_getdents(uint32_t fd, uint32_t ubuf, uint32_t count, uint32_t d, 
         return -EFAULT;
     uint32_t used = 0;
     struct dirent de;
-    while (count - used >= sizeof(de) && vfs_dirent(f->vn, f->off, &de)) {
+    while (count - used >= sizeof(de) && f->off < UINT32_MAX && vfs_dirent(f->vn, (uint32_t)f->off, &de)) {
         memcpy((uint8_t *)ubuf + used, &de, sizeof(de));
         used += sizeof(de);
         f->off++;
@@ -1131,6 +1175,7 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_ioctl] = sys_ioctl,
     [SYS_usbinfo] = sys_usbinfo,
     [SYS_stime] = sys_stime,
+    [SYS_llseek] = sys_llseek,
 };
 
 /* Calls that walk or change the VFS tree; read and write lock per chunk. */

@@ -135,7 +135,7 @@ int file_read(struct file *f, void *buf, uint32_t n)
         return sock_recvfrom(f->sock, buf, n, 0, NULL);
     int r = vfs_read(f->vn, buf, f->off, n);
     if (r > 0)
-        f->off += (uint32_t)r;
+        f->off += (uint64_t)r;
     return r;
 }
 
@@ -151,7 +151,7 @@ int file_write(struct file *f, const void *buf, uint32_t n)
         f->off = f->vn->size;
     int r = vfs_write(f->vn, buf, f->off, n);
     if (r > 0)
-        f->off += (uint32_t)r;
+        f->off += (uint64_t)r;
     return r;
 }
 

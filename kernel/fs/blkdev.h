@@ -53,9 +53,11 @@ struct blockdev *blk_by_vnode(struct vnode *vn);
 /* Multi-sector access, relative to the start of the device/partition. */
 int blk_read(struct blockdev *bd, uint32_t lba, uint32_t count, void *buf);
 int blk_write(struct blockdev *bd, uint32_t lba, uint32_t count, const void *buf);
-/* Byte-granular access from sector `base`. */
-int blk_read_at(struct blockdev *bd, uint32_t base, uint32_t off, uint32_t n, void *buf);
-int blk_write_at(struct blockdev *bd, uint32_t base, uint32_t off, uint32_t n, const void *buf);
+/* Byte-granular access from sector `base`. Sector sizes are powers of two. */
+int blk_read_at(struct blockdev *bd, uint32_t base, uint64_t off, uint32_t n, void *buf);
+int blk_write_at(struct blockdev *bd, uint32_t base, uint64_t off, uint32_t n, const void *buf);
+/* The device's size in bytes, which may be past 4 GiB. */
+uint64_t blk_bytes(struct blockdev *bd);
 
 /* Cached single sectors. Reads return a pointer valid until the next
  * cache call; writes replace the whole sector and are written back

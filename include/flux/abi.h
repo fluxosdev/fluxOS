@@ -42,6 +42,7 @@
 #define ENAMETOOLONG 36
 #define ENOSYS       38
 #define ENOTEMPTY    39
+#define EOVERFLOW    75
 #define ENOTSOCK     88
 #define EDESTADDRREQ 89
 #define EMSGSIZE     90
@@ -510,6 +511,7 @@ struct opl_write {
 #define KEY_F2    0x3C
 #define KEY_F4    0x3E
 #define KEY_F5    0x3F
+#define KEY_F10   0x44
 #define KEY_HOME  0xC7
 #define KEY_PGUP  0xC9
 #define KEY_END   0xCF

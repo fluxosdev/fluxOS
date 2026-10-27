@@ -24,9 +24,11 @@
  * the desktop has the engine copy its back buffer to the screen, the GL
  * library gets its pictures back that way. A process can take the 3D
  * engine (DISP_MAP3D): it gets 128 MiB of video memory for its buffers
- * and shaders, and runs command buffers it writes itself (DISP_SUBMIT).
+ * and shaders, and runs command buffers it writes itself (DISP_SUBMIT),
+ * which the kernel checks and copies into its own video memory first.
  * Everything is synchronous: each call returns with the engine idle, so
- * no buffer is ever in use behind a process's back.
+ * no buffer is ever in use behind a process's back. Lent pages stay put
+ * while lent: the heap cannot shrink over them (radeon_pinned).
  */
 #include "kernel.h"
 #include "drivers.h"
@@ -319,6 +321,8 @@ extern const uint8_t radeon_fw_rv710_pfp[], radeon_fw_rv710_me[];
 #define SCRATCH_OFF 0x17000         /* read back to flush the HDP */
 #define TEST_OFF    0x20000         /* the self-test's surfaces */
 #define PT_OFF      0x40000         /* the GART's page table: 8 bytes a page */
+#define UIB_OFF     0x80000         /* a 3D client's command buffer, checked */
+#define UIB_DWORDS  (64 * 1024)     /* the most one may have */
 
 /* The GART: 64 MiB of GPU addresses right after video memory. */
 #define GTT_PAGES   16384
@@ -389,6 +393,7 @@ static struct {
         int pid;                    /* 0: free */
         uint32_t first, npages;     /* GART pages */
         uint32_t offset, size;      /* the buffer within them */
+        uint32_t va;                /* the first page, in the process */
     } slots[MAX_SLOTS];
 } gart;
 
@@ -1248,6 +1253,7 @@ int radeon_map_buffer(struct dispbuf *b)
     sl->pid = current->pid;
     sl->first = first;
     sl->npages = npages;
+    sl->va = first_va;
     sl->offset = b->addr & 0xFFF;
     sl->size = b->size;
     b->handle = (uint32_t)free_idx + 1;
@@ -1263,6 +1269,16 @@ int radeon_unmap_buffer(const struct dispbuf *b)
     if (!sl)
         return -EINVAL;
     unmap_slot(sl);
+    return 0;
+}
+
+int radeon_pinned(int pid, uint32_t start, uint32_t end)
+{
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        const struct slot *sl = &gart.slots[i];
+        if (sl->pid && sl->pid == pid && sl->va < end && start < sl->va + sl->npages * 4096)
+            return 1;
+    }
     return 0;
 }
 
@@ -1309,24 +1325,363 @@ static int caller_owns(uint64_t addr, uint64_t bytes)
     return 0;
 }
 
+/* ---- checking a 3D client's command buffer ----
+ *
+ * A command buffer runs only as the kernel's copy, in the engine's own
+ * video memory, which nothing a process draws can reach; the process's
+ * buffer is read once, so changing it afterwards changes nothing. The
+ * copy is checked packet by packet, as Linux's r600_cs.c does: only the
+ * packets and registers the GL library writes are let through, every
+ * address in them must be the caller's (caller_owns), and each draw is
+ * checked against the state before it. The color and depth buffers and
+ * the shaders must have been set by this buffer, which cannot know what
+ * the kernel or another process left in them; only color buffer 0 may
+ * be drawn to. What is drawn then stays in the caller's memory.
+ */
+
+/* Registers and fields the check looks at */
+#define DB_DEPTH_SIZE   0x28000
+#define DB_DEPTH_VIEW   0x28004
+#define DB_DEPTH_BASE   0x2800C
+#define DB_DEPTH_INFO   0x28010
+#define DB_FORMAT(v)    ((v) & 7)
+#define DB_ARRAY_MODE(v) ((v) >> 15 & 0xF)
+#define DB_TILE_SURFACE_ENABLE (1u << 25)   /* HTILE, at an address of its own */
+#define CB_COLOR0_FORMAT(v) ((v) >> 2 & 0x3F)
+#define CB_COLOR0_ARRAY_MODE(v) ((v) >> 8 & 0xF)
+#define CB_COLOR0_TILE_MODE(v) ((v) >> 18 & 3)  /* CMASK and FMASK */
+#define ARRAY_1D_TILED_THIN1 2
+#define CB_TARGET_MASK  0x28238
+#define CB_SHADER_MASK  0x2823C
+#define VGT_MAX_VTX_INDX 0x28400
+#define SPI_VS_OUT_ID_0 0x28614
+#define SPI_VS_OUT_ID_9 0x28638
+#define SPI_PS_INPUT_CNTL_0 0x28644
+#define SPI_PS_INPUT_CNTL_31 0x286C0
+#define SPI_VS_OUT_CONFIG 0x286C4
+#define DB_DEPTH_CONTROL 0x28800
+#define PA_CL_VTE_CNTL  0x28818
+#define PACKET3_SET_SAMPLER 0x6E
+#define SET_CONTEXT_REG_END 0x29000
+#define SET_RESOURCE_START 0x38000
+#define SET_RESOURCE_END 0x3C000
+#define SET_SAMPLER_START 0x3C000
+#define SET_SAMPLER_END 0x3CFF0
+
+/* What a context register may hold */
+enum { REG_ANY, REG_ZERO, REG_KEPT, REG_SHADER };
+
+static const struct {
+    uint32_t first, last;
+    uint8_t kind;
+} context_regs[] = {
+    { DB_DEPTH_SIZE, DB_DEPTH_VIEW, REG_KEPT },
+    { DB_DEPTH_BASE, DB_DEPTH_INFO, REG_KEPT },
+    { PA_SC_SCREEN_SCISSOR_TL, PA_SC_SCREEN_SCISSOR_TL + 4, REG_ANY },
+    { CB_COLOR0_BASE, CB_COLOR0_BASE, REG_KEPT },
+    { CB_COLOR0_SIZE, CB_COLOR0_SIZE, REG_KEPT },
+    { CB_COLOR0_VIEW, CB_COLOR0_VIEW, REG_KEPT },
+    { CB_COLOR0_INFO, CB_COLOR0_INFO, REG_KEPT },
+    { CB_COLOR0_TILE, CB_COLOR0_TILE, REG_ZERO },
+    { CB_COLOR0_FRAG, CB_COLOR0_FRAG, REG_ZERO },
+    { CB_COLOR0_MASK, CB_COLOR0_MASK, REG_ZERO },
+    { PA_SC_WINDOW_SCISSOR_TL, PA_SC_WINDOW_SCISSOR_TL + 4, REG_ANY },
+    { CB_TARGET_MASK, CB_TARGET_MASK, REG_KEPT },
+    { CB_SHADER_MASK, CB_SHADER_MASK, REG_ANY },
+    { PA_SC_GENERIC_SCISSOR_TL, PA_SC_GENERIC_SCISSOR_TL + 4, REG_ANY },
+    { VGT_MAX_VTX_INDX, VGT_MAX_VTX_INDX, REG_ANY },
+    { SPI_VS_OUT_ID_0, SPI_VS_OUT_ID_9, REG_ANY },
+    { SPI_PS_INPUT_CNTL_0, SPI_PS_INPUT_CNTL_31, REG_ANY },
+    { SPI_VS_OUT_CONFIG, SPI_VS_OUT_CONFIG, REG_ANY },
+    { SPI_PS_IN_CONTROL_0, SPI_PS_IN_CONTROL_0, REG_ANY },
+    { DB_DEPTH_CONTROL, DB_DEPTH_CONTROL, REG_ANY },
+    { PA_CL_VTE_CNTL, PA_CL_VTE_CNTL, REG_ANY },
+    { SQ_PGM_START_PS, SQ_PGM_START_PS, REG_SHADER },
+    { SQ_PGM_RESOURCES_PS, SQ_PGM_EXPORTS_PS, REG_ANY },
+    { SQ_PGM_START_VS, SQ_PGM_START_VS, REG_SHADER },
+    { SQ_PGM_RESOURCES_VS, SQ_PGM_RESOURCES_VS, REG_ANY },
+    { SQ_PGM_CF_OFFSET_PS, SQ_PGM_CF_OFFSET_VS, REG_ANY },
+};
+
+/* The registers a draw depends on, as this buffer set them */
+enum {
+    K_CB_BASE, K_CB_SIZE, K_CB_VIEW, K_CB_INFO, K_TARGET_MASK,
+    K_DB_BASE, K_DB_SIZE, K_DB_VIEW, K_DB_INFO, K_VS, K_PS, NKEPT,
+};
+
+struct cs {
+    uint32_t set;                   /* bit K_*: set by this buffer */
+    uint32_t v[NKEPT];
+    const char *why;                /* the reason a buffer was refused */
+};
+
+static int kept_index(uint32_t reg)
+{
+    switch (reg) {
+    case CB_COLOR0_BASE: return K_CB_BASE;
+    case CB_COLOR0_SIZE: return K_CB_SIZE;
+    case CB_COLOR0_VIEW: return K_CB_VIEW;
+    case CB_COLOR0_INFO: return K_CB_INFO;
+    case CB_TARGET_MASK: return K_TARGET_MASK;
+    case DB_DEPTH_BASE: return K_DB_BASE;
+    case DB_DEPTH_SIZE: return K_DB_SIZE;
+    case DB_DEPTH_VIEW: return K_DB_VIEW;
+    case DB_DEPTH_INFO: return K_DB_INFO;
+    case SQ_PGM_START_VS: return K_VS;
+    case SQ_PGM_START_PS: return K_PS;
+    }
+    return -1;
+}
+
+static int refuse(struct cs *cs, const char *why)
+{
+    cs->why = why;
+    return -1;
+}
+
+static int check_context_reg(struct cs *cs, uint32_t reg, uint32_t v)
+{
+    for (uint32_t i = 0; i < ARRAY_SIZE(context_regs); i++) {
+        if (reg < context_regs[i].first || reg > context_regs[i].last)
+            continue;
+        switch (context_regs[i].kind) {
+        case REG_ZERO:
+            return v ? refuse(cs, "CMASK or FMASK address") : 0;
+        case REG_SHADER:
+            if (!caller_owns((uint64_t)v << 8, 4))
+                return refuse(cs, "shader not in the caller's memory");
+            /* fall through */
+        case REG_KEPT: {
+            int k = kept_index(reg);
+            cs->v[k] = v;
+            cs->set |= 1u << k;
+            return 0;
+        }
+        default:
+            return 0;
+        }
+    }
+    return refuse(cs, "context register not allowed");
+}
+
+/* The bytes a color or depth buffer covers: its SIZE register gives the
+ * line in units of 8 pixels and the whole in units of 64. Lines must be
+ * a multiple of 64 pixels and the height of 8, as the GL library has
+ * them, so that the engine covers no more than that. */
+static int surface_bytes(uint32_t size, uint32_t bpp, uint64_t *out)
+{
+    uint32_t pitch = ((size & 0x3FF) + 1) * 8;
+    uint32_t pixels = ((size >> 10 & 0xFFFFF) + 1) * 64;
+    if (pitch % 64 || pixels % (pitch * 8))
+        return -1;
+    *out = (uint64_t)pixels * bpp;
+    return 0;
+}
+
+static int buffer_ok(struct cs *cs, int base, int size, int view, uint32_t bpp)
+{
+    uint32_t need = 1u << base | 1u << size | 1u << view;
+    uint64_t bytes;
+    if ((cs->set & need) != need)
+        return refuse(cs, "draw before its buffer is set");
+    if (cs->v[view])
+        return refuse(cs, "more than one slice");
+    if (surface_bytes(cs->v[size], bpp, &bytes) < 0)
+        return refuse(cs, "buffer lines not aligned");
+    if (!caller_owns((uint64_t)cs->v[base] << 8, bytes))
+        return refuse(cs, "buffer not in the caller's memory");
+    return 0;
+}
+
+/* What a draw writes: color buffer 0 and the depth buffer. */
+static int check_draw(struct cs *cs)
+{
+    uint32_t need = 1u << K_TARGET_MASK | 1u << K_CB_INFO | 1u << K_DB_INFO | 1u << K_VS | 1u << K_PS;
+    if ((cs->set & need) != need)
+        return refuse(cs, "draw before its state is set");
+    if (cs->v[K_TARGET_MASK] & ~0xFu)
+        return refuse(cs, "color buffers other than 0");
+    uint32_t cb = cs->v[K_CB_INFO];
+    if ((cs->v[K_TARGET_MASK] & 0xF) && CB_COLOR0_FORMAT(cb)) {
+        if (CB_COLOR0_FORMAT(cb) != FMT_8_8_8_8 || CB_COLOR0_ARRAY_MODE(cb) != ARRAY_LINEAR_ALIGNED ||
+            CB_COLOR0_TILE_MODE(cb))
+            return refuse(cs, "color buffer format");
+        if (buffer_ok(cs, K_CB_BASE, K_CB_SIZE, K_CB_VIEW, 4) < 0)
+            return -1;
+    }
+    uint32_t db = cs->v[K_DB_INFO];
+    if (DB_FORMAT(db)) {
+        uint32_t mode = DB_ARRAY_MODE(db);
+        uint32_t bpp = DB_FORMAT(db) == 1 ? 2 : DB_FORMAT(db) == 7 ? 8 : 4;
+        if ((mode != ARRAY_LINEAR_ALIGNED && mode != ARRAY_1D_TILED_THIN1) || (db & DB_TILE_SURFACE_ENABLE))
+            return refuse(cs, "depth buffer format");
+        if (buffer_ok(cs, K_DB_BASE, K_DB_SIZE, K_DB_VIEW, bpp) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+/* One SET_RESOURCE entry: a vertex buffer or a 2D texture, read from. */
+static int check_resource(struct cs *cs, const uint32_t *w)
+{
+    switch (w[6] >> 30) {
+    case 0:                                     /* not valid: unused */
+        return 0;
+    case SQ_TEX_VTX_VALID_BUFFER: {
+        uint64_t addr = (uint64_t)(w[2] & 0xFF) << 32 | w[0];
+        if (!caller_owns(addr, (uint64_t)w[1] + 1))
+            return refuse(cs, "vertex buffer not in the caller's memory");
+        return 0;
+    }
+    case SQ_TEX_VTX_VALID_TEXTURE: {
+        uint32_t dim = w[0] & 7, mode = w[0] >> 3 & 0xF;
+        uint32_t pitch = ((w[0] >> 8 & 0x7FF) + 1) * 8, width = (w[0] >> 19) + 1;
+        uint32_t height = (w[1] & 0x1FFF) + 1, depth = w[1] >> 13 & 0x1FFF;
+        if (dim > 1 || mode > ARRAY_LINEAR_ALIGNED || depth || w[1] >> 26 != FMT_8_8_8_8 ||
+            width > pitch || (mode == ARRAY_LINEAR_ALIGNED && pitch % 64) ||
+            w[4] >> 28 || (w[5] & 0x3FFFFFFF))  /* one level, no arrays */
+            return refuse(cs, "texture format");
+        if (!caller_owns((uint64_t)w[2] << 8, (uint64_t)pitch * height * 4))
+            return refuse(cs, "texture not in the caller's memory");
+        return 0;
+    }
+    }
+    return refuse(cs, "resource type");
+}
+
+/* count registers from the packet's index into a block of [first, end). */
+static int in_range(uint32_t index, uint32_t count, uint32_t first, uint32_t end)
+{
+    uint32_t regs = (end - first) / 4;
+    return index < regs && count <= regs - index;
+}
+
+/* Check the buffer of n dwords, packet by packet. */
+static int check_buffer(struct cs *cs, const uint32_t *ib, uint32_t n, uint32_t *at)
+{
+    uint32_t i = 0;
+    while (i < n) {
+        *at = i;
+        uint32_t hdr = ib[i];
+        if (hdr >> 30 == 2) {                   /* PACKET2: filler */
+            i++;
+            continue;
+        }
+        if (hdr >> 30 != 3)
+            return refuse(cs, "packet type 0 or 1");
+        uint32_t op = hdr >> 8 & 0xFF, count = (hdr >> 16 & 0x3FFF) + 1;
+        if (count > n - i - 1)
+            return refuse(cs, "packet past the end");
+        const uint32_t *d = ib + i + 1;
+        switch (op) {
+        case PACKET3_SET_CONTEXT_REG:
+            if (count < 2 || !in_range(d[0], count - 1, 0x28000u, SET_CONTEXT_REG_END))
+                return refuse(cs, "context registers out of range");
+            for (uint32_t k = 1; k < count; k++)
+                if (check_context_reg(cs, 0x28000u + (d[0] + k - 1) * 4, d[k]) < 0)
+                    return -1;
+            break;
+        case PACKET3_SET_CONFIG_REG:
+            if (count != 2 || d[0] != CONFIG_REG(VGT_PRIMITIVE_TYPE))
+                return refuse(cs, "config register not allowed");
+            break;
+        case PACKET3_SET_RESOURCE:
+            if (count < 8 || (count - 1) % 7 || d[0] % 7 ||
+                !in_range(d[0], count - 1, SET_RESOURCE_START, SET_RESOURCE_END))
+                return refuse(cs, "resources out of range");
+            for (uint32_t k = 1; k < count; k += 7)
+                if (check_resource(cs, d + k) < 0)
+                    return -1;
+            break;
+        case PACKET3_SET_SAMPLER:
+            if (count < 4 || (count - 1) % 3 || d[0] % 3 ||
+                !in_range(d[0], count - 1, SET_SAMPLER_START, SET_SAMPLER_END))
+                return refuse(cs, "samplers out of range");
+            break;
+        case PACKET3_SURFACE_SYNC:              /* caches only */
+            if (count != 4)
+                return refuse(cs, "SURFACE_SYNC length");
+            break;
+        case PACKET3_INDEX_TYPE:
+        case PACKET3_NUM_INSTANCES:
+            if (count != 1)
+                return refuse(cs, "packet length");
+            break;
+        case PACKET3_DRAW_INDEX_AUTO:
+            if (count != 2 || (d[1] & 3) != DI_SRC_SEL_AUTO_INDEX)
+                return refuse(cs, "DRAW_INDEX_AUTO");
+            if (check_draw(cs) < 0)
+                return -1;
+            break;
+        default:
+            return refuse(cs, "packet not allowed");
+        }
+        i += 1 + count;
+    }
+    return 0;
+}
+
+/* Read n dwords at the caller's GPU address addr, which caller_owns. */
+static int fetch(uint64_t addr, uint32_t *dst, uint32_t n)
+{
+    uint64_t gl = rv.mc_base + GL_VRAM_OFF, bytes = (uint64_t)n * 4;
+    if (gl3d.owner == current->pid && addr >= gl && addr + bytes <= gl + gl3d.size) {
+        /* through the caller's own mapping (DISP_MAP3D): the kernel maps less */
+        memcpy(dst, (const void *)(USER_GL_BASE + (uint32_t)(addr - gl)), (uint32_t)bytes);
+        return 0;
+    }
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        const struct slot *sl = &gart.slots[i];
+        if (sl->pid != current->pid || addr < slot_gpu(sl) || addr + bytes > slot_gpu(sl) + sl->size)
+            continue;
+        uint8_t *out = (uint8_t *)dst;
+        uint32_t off = (uint32_t)(addr - gart.start);   /* within the GART */
+        for (uint32_t left = (uint32_t)bytes; left;) {
+            uint32_t pte = gart.pt[2 * (off >> 12)];
+            if (!(pte & PTE_VALID))
+                return -1;
+            uint32_t chunk = MIN(left, 4096 - (off & 0xFFF));
+            memcpy(out, (const void *)((pte & ~0xFFFu) + (off & 0xFFF)), chunk);
+            out += chunk;
+            off += chunk;
+            left -= chunk;
+        }
+        return 0;
+    }
+    return -1;
+}
+
 int radeon_submit(const struct dispsubmit *sub)
 {
+    static uint32_t ib[UIB_DWORDS + 16];
     if (!rv.accel)
         return -ENODEV;
     if (gl3d.owner != current->pid)
         return -EPERM;
     uint64_t addr = (uint64_t)sub->gpu_hi << 32 | sub->gpu_lo;
-    if (!sub->dwords || sub->dwords > (1u << 20) || (addr & 3) || !caller_owns(addr, sub->dwords * 4ull))
+    uint32_t n = sub->dwords;
+    if (!n || n > UIB_DWORDS || (addr & 3) || !caller_owns(addr, n * 4ull) || fetch(addr, ib, n) < 0)
         return -EINVAL;
+    struct cs cs = { 0 };
+    uint32_t at = 0;
+    if (check_buffer(&cs, ib, n, &at) < 0) {
+        klog("radeon: pid %d (%s): command buffer refused at dword %u of %u: %s\n",
+             current->pid, current->name, at, n, cs.why);
+        return -EINVAL;
+    }
+    while (n & 15)
+        ib[n++] = PACKET2;
     if (cp.busy)
         return -EBUSY;
     cp.busy = 1;
+    memcpy(cp.cpu + UIB_OFF, ib, n * 4);
+    uint64_t copy = cp.gpu + UIB_OFF;
     int r = begin_state();
     if (r == 0 && (r = ring_space(4)) == 0) {
         emit(PACKET3(PACKET3_INDIRECT_BUFFER, 2));
-        emit((uint32_t)addr);
-        emit((uint32_t)(addr >> 32) & 0xFF);
-        emit(sub->dwords);
+        emit((uint32_t)copy);
+        emit((uint32_t)(copy >> 32) & 0xFF);
+        emit(n);
         r = finish();
     }
     cp.busy = 0;

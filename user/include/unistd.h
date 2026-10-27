@@ -31,6 +31,7 @@ int dup(int fd);
 int dup2(int oldfd, int newfd);
 int pipe(int fds[2]);
 off_t lseek(int fd, off_t off, int whence);
+off64_t lseek64(int fd, off64_t off, int whence);
 int unlink(const char *path);
 int rmdir(const char *path);
 int chdir(const char *path);
