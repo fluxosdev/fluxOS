@@ -6,14 +6,15 @@
  * the cache and reaches the disk later, sorted and merged into runs:
  * when an entry is evicted, on sync()/fsync(), on unmount, before a
  * reboot or power-off, and every few seconds from the kflushd thread.
- * Bulk data bypasses the cache with blk_read/blk_write, which stay
- * coherent with it. A disk's write cache is flushed only on sync.
+ * Bulk reads use a bounded clean-data cache, kept coherent with both
+ * metadata and direct writes. A disk's write cache is flushed only on sync.
  */
 #include "kernel.h"
 #include "blkdev.h"
 #include "mm.h"
 #include "proc.h"
 #include "vfs.h"
+#include "readcache.h"
 
 #define BCACHE_SIZE  256
 #define SYNC_RUN_MAX 64                 /* sectors merged into one write */
@@ -71,7 +72,7 @@ int blk_read(struct blockdev *bd, uint32_t lba, uint32_t count, void *buf)
     if (check_range(bd, lba, count) < 0)
         return -EIO;
     struct blockdev *disk = translate(bd, &lba);
-    int r = disk->read(disk, lba, count, buf);
+    int r = readcache_read(disk, lba, count, buf);
     if (r < 0 || !bcache)
         return r;
     /* Sectors still waiting in the cache are newer than the disk. */
@@ -96,8 +97,11 @@ int blk_write(struct blockdev *bd, uint32_t lba, uint32_t count, const void *buf
     if (!disk->write)
         return -EROFS;
     int r = disk->write(disk, lba, count, buf);
-    if (r < 0)
+    if (r < 0) {
+        readcache_forget(disk, lba, count); /* a failed transfer may have written a prefix */
         return r;
+    }
+    readcache_written(disk, lba, count, buf);
     disk->unflushed = 1;
     if (!bcache)
         return r;
@@ -116,8 +120,11 @@ int blk_write(struct blockdev *bd, uint32_t lba, uint32_t count, const void *buf
 static int write_entry(struct bcache_entry *e)
 {
     int r = e->dev->write(e->dev, e->lba, 1, e->data);
-    if (r < 0)
+    if (r < 0) {
+        readcache_forget(e->dev, e->lba, 1);
         return r;
+    }
+    readcache_written(e->dev, e->lba, 1, e->data);
     e->dirty = 0;
     e->dev->unflushed = 1;
     return 0;
@@ -237,6 +244,7 @@ out:
 
 static void drop_cache(struct blockdev *disk)
 {
+    readcache_discard(disk);
     for (int i = 0; i < BCACHE_SIZE; i++)
         if (bcache[i].dev == disk)
             bcache[i].valid = 0;
@@ -289,10 +297,13 @@ int blk_sync(struct blockdev *bd)
             r = disk->write(disk, order[i]->lba, (uint32_t)k, runbuf);
         }
         if (r < 0) {
+            readcache_forget(disk, order[i]->lba, (uint32_t)k);
             err = -EIO;
         } else {
-            for (int j = 0; j < k; j++)
+            for (int j = 0; j < k; j++) {
+                readcache_written(disk, order[i+j]->lba, 1, order[i+j]->data);
                 order[i + j]->dirty = 0;
+            }
             disk->unflushed = 1;
         }
         i += k;
@@ -344,6 +355,7 @@ int blk_rescan(struct blockdev *disk)
 void blk_invalidate(struct blockdev *bd)
 {
     struct blockdev *disk = disk_of(bd);
+    readcache_discard(disk);
     for (int i = 0; i < BCACHE_SIZE && bcache; i++)
         if (bcache[i].valid && !bcache[i].dirty && bcache[i].dev == disk)
             bcache[i].valid = 0;
@@ -484,6 +496,7 @@ int blk_register(struct blockdev *bd)
         if (!bcache)
             return -ENOMEM;
     }
+    readcache_init();
     bd->index = ndevices;
     devices[ndevices++] = bd;
     if (!bd->parent)

@@ -87,6 +87,9 @@ stops at boot and says why.
   - `/dev/hdX`, `/dev/sdX`, `/dev/srN` with MBR partitions behind a write-back
     sector cache, flushed by `kflushd` every 5 s, by `sync`/`fsync`, on
     `umount` and before `reboot`/`poweroff`.
+  - A separate clean read cache uses up to 4 MiB, scaled down with available
+    heap memory. Sequential small reads fetch ahead within a 4 KiB block;
+    bulk reads retain multi-sector disk commands.
 - USB: **UHCI, OHCI, EHCI and xHCI** controllers, hubs (up to five deep),
   boot-protocol keyboards, HID mice and tablets, and Bulk-Only mass storage.
   Hot plugging via the `kusbd` thread; `lsusb` lists devices. Options:
@@ -487,6 +490,8 @@ make test-browser-fonts # real glyph rendering and malformed-font rejection
 make test-tls     # local OpenSSL servers: authenticated handshakes and rejected certificates
 make test-websocket # local ws/wss transport and browser API integration tests
 make test-kernel # runs allocator, filesystem, pipe and socket regressions on the host
+make test-desktop-jobs # decoder helper responsiveness, transfers, cancellation and recovery
+make test-desktop-jobs-qemu # same protocol tests with fluxOS's blocking pipes
 make test-kernel-qemu # boots kernel regressions with a disposable initrd and scratch disk
 make test-kernel-qemu KERNEL_TEST_CPUS=4 # same tests on four Pentium III CPUs
 make test-kernel-qemu KERNEL_TEST_CPUS=4 KERNEL_TEST_CMDLINE=nosmp # single-core fallback
@@ -640,9 +645,13 @@ set `need_resched` and the trap is about to return to user mode.
 **Disk I/O.** Filesystem and block-device work may sleep mid-operation, so it
 is serialised by one FIFO "VFS lock", taken per call (per 64 KiB chunk for
 `read`/`write`). Terminals and pipes never take it. FAT, directory and FSInfo
-updates are dirty sectors in the cache; file data bypasses it, a run of
-contiguous clusters written as one DMA command. A sync writes dirty sectors in
-LBA order, merging neighbours, then issues one FLUSH CACHE.
+updates are dirty sectors in the write-back cache. Reads use a separate bounded
+cache of clean 4 KiB blocks, keyed by physical disk and sector so partition and
+raw-device views agree. Sequential small reads fetch the remainder of a block;
+random reads fetch only the requested sectors. Writes update resident clean
+copies without filling the read cache. A run of contiguous clusters is still
+written as one DMA command. A sync writes dirty sectors in LBA order, merging
+neighbours, then issues one FLUSH CACHE.
 
 **Graphics.** GRUB sets the video mode. The kernel maps the framebuffer above
 3 GiB with 4 MiB pages; `fbmap` maps it into a process as device memory, which
@@ -691,6 +700,16 @@ a whole pixel per step; the JPEG encoder's DCT is PMADDWD multiply-adds. The wal
 screen-sized surface so repaints are copies. GIF is decoded with LZW into a
 palette image. SVG shapes are flattened to polygons and filled by a scanline
 rasteriser with four sub-scanlines per pixel.
+
+The desktop starts one decoder helper before opening its windows. Browser
+images (including data URLs and favicons), image-viewer and Paint opens,
+wallpaper previews and full wallpaper rendering run there. The desktop keeps
+handling input while the helper works, transferring results in bounded chunks
+through credit-controlled pipes. Closing a window or navigating cancels its
+requests; a failed helper is restarted for subsequent work. JavaScript DOM
+discovery is batched once per event-loop turn, while explicit geometry queries
+still flush pending changes immediately. JavaScript execution, layout and
+subsequent GIF animation frames still run in the desktop process.
 
 **The browser** keeps a page in arenas: document tree and style sheets, computed
 styles (rebuilt when a style sheet arrives), and layout (rebuilt when a picture

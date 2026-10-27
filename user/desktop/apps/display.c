@@ -39,6 +39,7 @@
 #include <unistd.h>
 #include <flux/logo.h>
 #include "desktop.h"
+#include "imagejobs.h"
 
 #define DLG_W 404
 #define DLG_H 464
@@ -703,6 +704,17 @@ static struct image *kinetik_thumb(int *full_w, int *full_h)
     return img;
 }
 
+struct preview_request { struct dprops *props; int entry; char path[160]; };
+static void preview_ready(void *context, struct image *image, int w, int h)
+{
+    struct preview_request *request=context;
+    struct dprops *d=request->props;
+    if(request->entry>=d->nwalls || strcmp(d->walls[request->entry].path,request->path)) {image_free(image);return;}
+    struct wall_entry *e=&d->walls[request->entry];
+    image_free(e->thumb);e->thumb=image;e->full_w=w;e->full_h=h;
+    if(d->wall_sel==request->entry)dp_paint(d);
+}
+
 /* The choice of entry i, with the thumbnail the preview will show. */
 static void wall_select(struct dprops *d, int i)
 {
@@ -714,7 +726,12 @@ static void wall_select(struct dprops *d, int i)
         e->thumb = kinetik_thumb(&e->full_w, &e->full_h);
         e->tried = 1;
     } else if (!e->tried && e->path[0]) {
-        e->thumb = image_load_thumb(e->path, &e->full_w, &e->full_h);
+        struct preview_request *request=calloc(1,sizeof(*request));
+        if(request) {
+            request->props=d;request->entry=i;
+            snprintf(request->path,sizeof(request->path),"%s",e->path);
+            if(image_job_path(d,e->path,1,preview_ready,request,free)<0)free(request);
+        }
         e->tried = 1;
     }
     wall_make_visible(d);
@@ -1991,6 +2008,7 @@ static void dp_window_close(struct window *w)
 static void dp_destroy(struct window *w)
 {
     struct dprops *d = w->priv;
+    image_jobs_cancel(d);
     if (dlg == d)
         dlg = NULL;
     for (int i = 0; i < d->nwalls; i++)

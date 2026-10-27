@@ -725,6 +725,10 @@ void terminal_ready(struct window *w, int revents)
     struct term *t = term_of(w);
     if (!t || t->finished)
         return;
+    /* Input may have destroyed/replaced a window since the loop's poll snapshot. */
+    struct pollfd ready = { t->master, POLLIN, 0 };
+    if (poll(&ready, 1, 0) <= 0) return;
+    revents = ready.revents;
     static char buf[32768];
     int n = 0;
     if (revents & POLLIN)

@@ -8,10 +8,9 @@
  *   Center   at its own size in the middle, the desktop color around it;
  *   Tile     at its own size, repeated across the screen from the top left.
  *
- * The picture is kept as it was decoded, and drawn once into a surface the
- * size of the screen, which the compositor copies from, so painting a
- * window's damage costs a copy and nothing more. When the screen changes
- * size the surface is drawn again from the original.
+ * A helper decodes and draws the picture into a screen-sized surface.
+ * The compositor copies that surface, keeping the old wallpaper visible
+ * while a replacement is prepared. Screen changes queue a fresh render.
  *
  * Scaling averages whole blocks of pixels first when the picture is more
  * than twice too big (so a 1920x1080 photograph shrunk to 640x480 is not
@@ -29,10 +28,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include "desktop.h"
+#include "imagejobs.h"
 
-static struct image *src;               /* the picture, as decoded */
+static int wallpaper_owner;
+static char applied_path[256];
+static int applied_mode = WALL_FILL;
 static int kinetik;                     /* the Kinetik theme's own instead */
-static struct surface wall;             /* screen-sized, drawn from src; px NULL if none */
+static struct surface wall;             /* screen-sized; px NULL if none */
 static char cur_path[256];
 static int cur_mode = WALL_FILL;
 
@@ -331,27 +333,12 @@ uint32_t wallpaper_color(void)
     return desk_color;
 }
 
+/* Rendering and scaling happen in the decoder process. Keep the current
+ * surface visible until its replacement has been transferred completely. */
 static void rebuild(void)
 {
-    if (!src && !kinetik) {
-        surface_free(&wall);
-        return;
-    }
-    if (wall.px && (wall.w != screen_w || wall.h != screen_h))
-        surface_free(&wall);
-    if (!wall.px && surface_init(&wall, screen_w, screen_h) < 0) {
-        image_free(src);                /* no room to draw it: no wallpaper */
-        src = NULL;
-        kinetik = 0;
-        cur_path[0] = 0;
-        return;
-    }
-    if (kinetik) {
-        wallpaper_kinetik(&wall, screen_w, screen_h);
-        return;
-    }
-    wallpaper_render(&wall, mkrect(0, 0, screen_w, screen_h), src, src->w, src->h, cur_mode,
-                     desk_color, screen_w, screen_h);
+    if (cur_path[0]) wallpaper_set(cur_path,cur_mode,0);
+    else surface_free(&wall);
 }
 
 int wallpaper_active(void)
@@ -379,7 +366,7 @@ void wallpaper_draw(struct surface *s, struct rect clip)
 
 void wallpaper_resize(void)
 {
-    if (src || kinetik)
+    if (cur_path[0])
         rebuild();
 }
 
@@ -427,21 +414,57 @@ void wallpaper_set_color(uint32_t rgb, int save)
     wm_damage(mkrect(0, 0, screen_w, screen_h));
 }
 
+struct wall_request {
+    char path[256];
+    int mode, save, w, h;
+};
+static void wallpaper_ready(void *context, struct image *image, int full_w, int full_h)
+{
+    (void)full_w;(void)full_h;
+    struct wall_request *request=context;
+    if (!image) {
+        snprintf(cur_path,sizeof(cur_path),"%s",applied_path);
+        cur_mode=applied_mode;
+        kinetik=!strcmp(cur_path,WALLPAPER_KINETIK);
+        if (request->save) message_box("Wallpaper",ICON_WARNING,"The wallpaper could not be loaded.");
+        else if (!applied_path[0] && strcmp(request->path,WALLPAPER_DEFAULT))
+            wallpaper_set(WALLPAPER_DEFAULT,request->mode,0);
+        return;
+    }
+    if (request->w!=screen_w || request->h!=screen_h) {
+        image_free(image);
+        wallpaper_set(request->path,request->mode,request->save);
+        return;
+    }
+    surface_free(&wall);
+    wall.px=image->px;wall.w=image->w;wall.h=image->h;wall.stride=image->w;
+    wall.clip=mkrect(0,0,wall.w,wall.h);
+    image->px=NULL;image_free(image);
+    snprintf(cur_path,sizeof(cur_path),"%s",request->path);
+    snprintf(applied_path,sizeof(applied_path),"%s",request->path);
+    applied_mode=cur_mode=request->mode;
+    kinetik=!strcmp(cur_path,WALLPAPER_KINETIK);
+    if (request->save) save_setting();
+    wm_damage(mkrect(0,0,screen_w,screen_h));
+}
 int wallpaper_set(const char *path, int mode, int save)
 {
-    struct image *img = NULL;
-    int drawn = path && !strcmp(path, WALLPAPER_KINETIK);
-    if (path && path[0] && !drawn && !(img = image_load(path)))
-        return -1;
-    image_free(src);
-    src = img;
-    kinetik = drawn;
-    snprintf(cur_path, sizeof(cur_path), "%s", path ? path : "");
-    cur_mode = mode >= 0 && mode < WALL_MODES ? mode : WALL_FILL;
-    rebuild();
-    if (save)
-        save_setting();
-    wm_damage(mkrect(0, 0, screen_w, screen_h));
+    struct wall_request *request=calloc(1,sizeof(*request));
+    if (!request) return -1;
+    snprintf(request->path,sizeof(request->path),"%s",path ? path : "");
+    request->mode=mode>=0 && mode<WALL_MODES ? mode : WALL_FILL;
+    request->save=save;request->w=screen_w;request->h=screen_h;
+    image_jobs_cancel(&wallpaper_owner);
+    if (!request->path[0]) {
+        surface_free(&wall);cur_path[0]=applied_path[0]=0;kinetik=0;
+        applied_mode=cur_mode=request->mode;
+        if (save) save_setting();
+        free(request);wm_damage(mkrect(0,0,screen_w,screen_h));return 0;
+    }
+    if (image_job_wallpaper(&wallpaper_owner,request->path,request->mode,desk_color,screen_w,screen_h,
+                            wallpaper_ready,request,free)<0) {free(request);return -1;}
+    snprintf(cur_path,sizeof(cur_path),"%s",request->path);
+    cur_mode=request->mode;kinetik=!strcmp(cur_path,WALLPAPER_KINETIK);
     return 0;
 }
 

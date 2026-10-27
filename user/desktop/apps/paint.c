@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "desktop.h"
+#include "imagejobs.h"
 
 #define MAX_DIM     2048
 #define DEF_W       400
@@ -54,6 +55,7 @@ struct paint {
     color_t fg, bg, custom;
     int sx, sy;                         /* the canvas point at the view's top left */
     int modified;
+    unsigned revision;
     char path[512];                     /* where it was opened from or saved to ("" for none) */
     char pending[512];                  /* a path waiting for an overwrite answer */
     char status[96];                    /* the last thing that happened */
@@ -473,6 +475,7 @@ static void remember(struct paint *p)
 
 static void changed(struct paint *p)
 {
+    p->revision++;
     if (!p->modified) {
         p->modified = 1;
         set_title(p);
@@ -498,6 +501,7 @@ static int resize_canvas(struct paint *p, int cw, int ch, int keep)
     free(p->undo);
     p->px = px;
     p->undo = undo;
+    p->revision++;
     p->cw = cw;
     p->ch = ch;
     p->have_undo = 0;
@@ -563,15 +567,20 @@ static void ask_new_size(void *ctx)
     ask_text("New Picture", "Canvas size (width x height):", def, new_size_chosen, p);
 }
 
-static void open_chosen(void *ctx, const char *text)
+struct paint_request { struct paint *paint; unsigned revision; char path[512]; };
+static void open_ready(void *context, struct image *img, int full_w, int full_h)
 {
-    struct paint *p = alive(ctx);
-    if (!p)
+    (void)full_w;(void)full_h;
+    struct paint_request *request=context;
+    struct paint *p=alive(request->paint);
+    if(!p || p->revision!=request->revision) {
+        image_free(img);
+        if(p){set_status(p,"%s","Open canceled because the canvas changed");paint_all(p);}
         return;
-    struct image *img = image_load(text);
+    }
     if (!img) {
         char msg[600];
-        snprintf(msg, sizeof(msg), "Cannot open %s as a picture (PNG, JPEG, GIF, SVG or ICO).", base_name(text));
+        snprintf(msg, sizeof(msg), "Cannot open %s as a picture (PNG, JPEG, GIF, SVG or ICO).", base_name(request->path));
         message_box("Paint", ICON_WARNING, msg);
         return;
     }
@@ -598,11 +607,26 @@ static void open_chosen(void *ctx, const char *text)
         p->px[i] = r8 << 16 | g8 << 8 | b8;
     }
     image_free(img);
-    snprintf(p->path, sizeof(p->path), "%s", text);
+    snprintf(p->path, sizeof(p->path), "%s", request->path);
     p->modified = 0;
     set_title(p);
-    set_status(p, "Opened %s", base_name(text));
+    set_status(p, "Opened %s", base_name(request->path));
     paint_all(p);
+}
+
+static void open_chosen(void *ctx, const char *text)
+{
+    struct paint *p=alive(ctx);
+    if(!p)return;
+    struct paint_request *request=calloc(1,sizeof(*request));
+    if(!request)return;
+    request->paint=p;request->revision=p->revision;
+    snprintf(request->path,sizeof(request->path),"%s",text);
+    image_jobs_cancel(p);
+    if(image_job_path(p,request->path,0,open_ready,request,free)<0) {
+        free(request);message_box("Paint",ICON_WARNING,"The image decoder is busy. Try again shortly.");return;
+    }
+    set_status(p,"Loading %s",base_name(text));paint_all(p);
 }
 
 static void ask_open(void *ctx)
@@ -1054,6 +1078,7 @@ static void pt_close(struct window *win)
 static void pt_destroy(struct window *win)
 {
     struct paint *p = win->priv;
+    image_jobs_cancel(p);
     for (struct paint **pp = &paints; *pp; pp = &(*pp)->next)
         if (*pp == p) {
             *pp = p->next;

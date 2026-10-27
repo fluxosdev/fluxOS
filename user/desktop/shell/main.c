@@ -18,9 +18,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "desktop.h"
+#include "imagejobs.h"
 
 #define MAX_TERMS   32
-#define MAX_WATCHES 16
+#define MAX_WATCHES 24
 #define BLINK_MS    500
 
 /* Other descriptors the loop waits on, such as the installer's pipe. */
@@ -64,6 +65,8 @@ int main(int argc, char **argv)
 {
     signal(SIGINT, SIG_IGN);
     signal(SIGQUIT, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
+    image_workers_init();              /* fork before windows and page heaps exist */
     int setup = argc > 1 && !strcmp(argv[1], "--setup");
 
     int input = open("/dev/input", O_RDONLY);
@@ -111,12 +114,22 @@ int main(int argc, char **argv)
         int js = browser_timeout();             /* a page's timers */
         if (js >= 0 && js < timeout)
             timeout = js;
+        int images = image_jobs_timeout();
+        if (images >= 0 && images < timeout) timeout = images;
         int sv = saver_timeout();               /* the screen saver starting, or moving */
         if (sv >= 0 && sv < timeout)
             timeout = sv;
         poll(fds, (unsigned int)(n + nw), timeout);
 
-        /* Terminals first: input handling may close their windows. */
+        /* Input first, before background I/O callbacks. A callback may close
+         * windows or remove watches; the snapshots below are checked again. */
+        if (fds[0].revents & POLLIN) {
+            struct input_event ev[64];
+            int r = (int)read(input, ev, sizeof(ev));
+            for (int i = 0; i < r / (int)sizeof(ev[0]); i++) wm_input(&ev[i]);
+        }
+
+        /* Terminals whose windows survived input handling. */
         for (int i = 1; i < n; i++)
             if (fds[i].revents)
                 terminal_ready(owners[i], fds[i].revents);
@@ -126,15 +139,9 @@ int main(int argc, char **argv)
             if (fds[n + i].revents && watching(&w[i]))
                 w[i].ready(w[i].ctx, fds[n + i].revents);
 
-        if (fds[0].revents & POLLIN) {
-            struct input_event ev[64];
-            int r = (int)read(input, ev, sizeof(ev));
-            for (int i = 0; i < r / (int)sizeof(ev[0]); i++)
-                wm_input(&ev[i]);
-        }
-
         int pid, status;
         while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+            image_worker_child_exited(pid);
             terminal_child_exited(pid);
             setup_child_exited(pid, status);
             browser_child_exited(pid, status);
@@ -144,6 +151,7 @@ int main(int argc, char **argv)
 
         saver_frame();
         gears_frame();
+        image_jobs_poll();
         browser_poll();
         unsigned int now = now_ms();
         if (now - last_blink >= BLINK_MS) {

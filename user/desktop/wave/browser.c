@@ -36,6 +36,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "desktop.h"
+#include "imagejobs.h"
 #include "jsdom.h"
 #include "webintegrity.h"
 #include "webblob.h"
@@ -157,6 +158,7 @@ struct cached {
     char *url;
     struct image *img;          /* NULL: could not be loaded or decoded */
     size_t bytes;
+    int pending;
     struct cached *next;
 };
 
@@ -229,6 +231,8 @@ struct browser {
     int nqueue, qhead;
     int loading, total_res, done_res;
     int need_style, need_layout;
+    int pending_images;
+    int discover_changes;
     char status[256];
     char page_title[128];       /* the document's title, for favorites */
     int zoom;                   /* page zoom in percent, 0 for 100 (a window's; its frames follow it) */
@@ -580,60 +584,15 @@ static struct cached *cache_find(struct browser *b, const char *url)
 
 static void cache_add(struct browser *b, const char *url, struct image *img);
 
-/* The picture a data: URL holds (base64, or percent-encoded text), or NULL. */
-static struct image *data_url_image(const char *url)
-{
-    const char *comma = strchr(url, ',');
-    if (!comma || strncasecmp(url, "data:", 5))
-        return NULL;
-    int b64 = 0;
-    for (const char *p = url + 5; p < comma; p++)
-        if (!strncasecmp(p, ";base64", 7))
-            b64 = 1;
-    size_t n = strlen(comma + 1);
-    uint8_t *buf = malloc(n + 1);
-    if (!buf)
-        return NULL;
-    size_t o = 0;
-    uint32_t acc = 0;
-    int bits = 0;
-    for (const char *p = comma + 1; *p; p++) {
-        int c = (unsigned char)*p;
-        if (c == '%' && isxdigit((unsigned char)p[1]) && isxdigit((unsigned char)p[2])) {
-            char hex[3] = { p[1], p[2], 0 };
-            c = (int)strtol(hex, NULL, 16);
-            p += 2;
-            if (!b64) {
-                buf[o++] = (uint8_t)c;
-                continue;
-            }
-        } else if (!b64) {
-            buf[o++] = (uint8_t)c;
-            continue;
-        }
-        int v = c >= 'A' && c <= 'Z' ? c - 'A' : c >= 'a' && c <= 'z' ? c - 'a' + 26 : c >= '0' && c <= '9' ? c - '0' + 52
-              : c == '+' || c == '-' ? 62 : c == '/' || c == '_' ? 63 : -1;
-        if (v < 0)
-            continue;                   /* padding and white space */
-        acc = acc << 6 | (uint32_t)v;
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            buf[o++] = (uint8_t)(acc >> bits);
-        }
-    }
-    struct image *img = o > 8 ? image_decode(buf, (uint32_t)o) : NULL;
-    free(buf);
-    return img;
-}
+static void queue_decoding(struct browser *b,const char *url,const char *data,int len,int kind);
 
-/* cache_find, and a data: URL is decoded on the spot (and cached) the first time. */
+/* Data URLs use the same decoder queue and pending cache entry as network images. */
 static struct cached *cache_find_data(struct browser *b, const char *url)
 {
-    struct cached *c = cache_find(b, url);
-    if (!c && !strncasecmp(url, "data:", 5)) {
-        cache_add(b, url, data_url_image(url));
-        c = cache_find(b, url);
+    struct cached *c=cache_find(b,url);
+    if(!c && !strncasecmp(url,"data:",5)) {
+        queue_decoding(b,url,url,(int)strlen(url),2);
+        c=cache_find(b,url);
     }
     return c;
 }
@@ -651,6 +610,10 @@ static void cache_add(struct browser *b, const char *url, struct image *img)
     c->next = b->cache;
     b->cache = c;
     b->cache_bytes += c->bytes;
+}
+
+static void cache_trim(struct browser *b)
+{
     /* Over budget: drop the oldest pictures the current page does not show. */
     while (b->cache_bytes > CACHE_MAX) {
         struct cached **pp = &b->cache, **victim = NULL;
@@ -1892,6 +1855,13 @@ static void sync_frames(struct browser *b)
 
 static void free_page(struct browser *b)
 {
+    image_jobs_cancel(b);
+    b->pending_images=0;b->discover_changes=0;
+    /* Pending cache placeholders belong to the old page, not future visits. */
+    for(struct cached **p=&b->cache;*p;) {
+        struct cached *c=*p;
+        if(c->pending){*p=c->next;free(c->url);free(c);}else p=&c->next;
+    }
     for(int i=0;i<b->nfonts;i++)if(b->fonts[i].id>=3){
         int id=b->fonts[i].id;wfont_release(id);
         for(int j=i;j<b->nfonts;j++)if(b->fonts[j].id==id)b->fonts[j].id=-1;
@@ -2177,9 +2147,15 @@ static void js_load_image(void *ctx, struct node *n);
 
 static void js_changed(void *ctx)
 {
+    ((struct browser *)ctx)->discover_changes=1;
+}
+
+static void flush_changes(void *ctx)
+{
     struct browser *b = ctx;
     if (!b->root)
         return;
+    b->discover_changes=0;
     init_new_controls(b->root);
     collect_sheets(b);
     for (struct node *n = b->root; n;) {
@@ -2430,7 +2406,7 @@ static void js_load_image(void *ctx, struct node *n)
     }
     if (c) {
         n->img = c->img;
-        jsdom_queue_event(b->js, n, c->img ? "load" : "error");
+        if (!c->pending) jsdom_queue_event(b->js, n, c->img ? "load" : "error");
         return;
     }
     if(lazy_image(b,n))return;
@@ -2441,7 +2417,7 @@ static void js_load_image(void *ctx, struct node *n)
 
 static void js_flush(void *ctx)
 {
-    js_changed(ctx);
+    flush_changes(ctx);              /* synchronous geometry reads still observe mutations */
 }
 
 /* An element with overflow that scrolls (jsdom.c's scrollTop and friends). */
@@ -3160,67 +3136,74 @@ static void wget_error(struct fetch *f, char *out, int size)
         *out = (char)(*out - 'a' + 'A');
 }
 
-/* The page's icon, shrunk to 16x16 (averaging the pixels that fall in each), for the window. */
-static void set_favicon(struct browser *b, const char *data, int len)
+struct decoded_image { struct browser *browser; char *url; int icon; };
+static void done_status(struct browser *b);
+static void decoded_cleanup(void *context)
 {
-    struct image *src = len > 8 ? image_decode((const uint8_t *)data, (uint32_t)len) : NULL;
-    if (!src || !b->win || src->w <= 0 || src->h <= 0) {
-        image_free(src);
-        return;
-    }
-    struct image *icon = malloc(sizeof(*icon));
-    uint32_t *px = icon ? calloc(16 * 16, sizeof(uint32_t)) : NULL;
-    if (!px) {
-        free(icon);
-        image_free(src);
-        return;
-    }
-    icon->w = icon->h = 16;
-    icon->px = px;
-    for (int y = 0; y < 16; y++)
-        for (int x = 0; x < 16; x++) {
-            int x0 = x * src->w / 16, x1 = (x + 1) * src->w / 16, y0 = y * src->h / 16, y1 = (y + 1) * src->h / 16;
-            if (x1 <= x0)
-                x1 = x0 + 1;
-            if (y1 <= y0)
-                y1 = y0 + 1;
-            unsigned long a = 0, r = 0, g = 0, bl = 0, n = 0;
-            for (int j = y0; j < y1 && j < src->h; j++)
-                for (int i = x0; i < x1 && i < src->w; i++) {
-                    uint32_t p = src->px[j * src->w + i], pa = p >> 24;
-                    a += pa;
-                    r += (p >> 16 & 255) * pa;
-                    g += (p >> 8 & 255) * pa;
-                    bl += (p & 255) * pa;
-                    n++;
-                }
-            if (!n || !a)
-                continue;
-            px[y * 16 + x] = (uint32_t)(a / n) << 24 | (uint32_t)(r / a) << 16 | (uint32_t)(g / a) << 8 | (uint32_t)(bl / a);
-        }
-    image_free(src);
-    image_free(b->favicon);
-    b->favicon = icon;
-    if (tab_active(b)) {
-        b->win->icon_img = icon;
-        wm_damage(b->win->r);
-    }
+    struct decoded_image *request=context;
+    free(request->url);free(request);
 }
-
-static void image_done(struct browser *b, const char *url, const char *data, int len)
+static void image_received(struct browser *b, const char *url, struct image *image)
 {
-    struct image *img = len > 8 ? image_decode((const uint8_t *)data, (uint32_t)len) : NULL;
-    cache_add(b, url, img);
-    bg_arrived(b, url, img);
-    for (int i = 0; i < b->nimgs; i++)
-        if (!strcmp(b->imgs[i].url, url)) {
-            if (img) {
-                b->imgs[i].n->img = img;
-                b->need_layout = 1;
-            }
-            if (b->js)
-                jsdom_queue_event(b->js, b->imgs[i].n, img ? "load" : "error");
-        }
+    struct cached *cached=cache_find(b,url);
+    if(cached && cached->pending) {
+        cached->pending=0;cached->img=image;
+        cached->bytes=image ? (size_t)image->w*image->h*4 : 0;
+        b->cache_bytes+=cached->bytes;
+    } else {
+        cache_add(b,url,image);
+        /* cache_add owns the image, including allocation failure. */
+        if(!cache_find(b,url))image=NULL;
+    }
+    bg_arrived(b,url,image);
+    for(int i=0;i<b->nimgs;i++)if(!strcmp(b->imgs[i].url,url)) {
+        if(image){b->imgs[i].n->img=image;b->need_layout=1;}
+        if(b->js)jsdom_queue_event(b->js,b->imgs[i].n,image?"load":"error");
+    }
+    cache_trim(b);
+}
+static void decoded_ready(void *context, struct image *image, int full_w, int full_h)
+{
+    (void)full_w;(void)full_h;
+    struct decoded_image *request=context;
+    struct browser *b=request->browser;
+    if(b->pending_images)b->pending_images--;
+    if(request->icon) {
+        if(image && b->win) {
+            image_free(b->favicon);b->favicon=image;
+            if(tab_active(b)){b->win->icon_img=image;wm_damage(b->win->r);}
+        } else image_free(image);
+    } else image_received(b,request->url,image);
+    if(!b->pending_images && !fetch_busy(b) && b->qhead>=b->nqueue)done_status(b);
+}
+static void queue_decoding(struct browser *b,const char *url,const char *data,int len,int icon)
+{
+    if(icon != 1) {
+        struct cached *cached=cache_find(b,url);
+        if(cached)return;
+        cache_add(b,url,NULL);cached=cache_find(b,url);
+        if(cached)cached->pending=1;
+    }
+    struct decoded_image *request=calloc(1,sizeof(*request));
+    if(request){request->browser=b;request->icon=icon==1;request->url=strdup(url?url:"");}
+    if(!request || !request->url) {
+        if(request)decoded_cleanup(request);
+        if(icon != 1)image_received(b,url,NULL);
+        return;
+    }
+    b->pending_images++;
+    int queued=len>8 ? (icon==1 ? image_job_icon(b,data,(unsigned)len,decoded_ready,request,decoded_cleanup)
+        : icon==2 ? image_job_url(b,data,decoded_ready,request,decoded_cleanup)
+        : image_job_data(b,data,(unsigned)len,decoded_ready,request,decoded_cleanup)) : -1;
+    if(queued<0){decoded_ready(request,NULL,0,0);decoded_cleanup(request);}
+}
+static void set_favicon(struct browser *b,const char *data,int len)
+{
+    queue_decoding(b,"",data,len,1);
+}
+static void image_done(struct browser *b,const char *url,const char *data,int len)
+{
+    queue_decoding(b,url,data,len,0);
 }
 
 /* ---- history and downloads: logs kept in the home folder ---- */
@@ -3998,7 +3981,7 @@ static void start_next(struct browser *b)
     }
     if (b->need_style || b->need_layout)
         relayout(b);
-    if (b->total_res&&!fetch_busy(b)&&b->qhead>=b->nqueue)
+    if (b->total_res&&!fetch_busy(b)&&b->qhead>=b->nqueue&&!b->pending_images)
         done_status(b);
     select_loader(b,previous);b->scheduling=0;
     paint(b);
@@ -7224,6 +7207,8 @@ void browser_poll(void)
         }
         if (b->js)
             jsdom_run_timers(b->js);
+        if (b->root && b->discover_changes) flush_changes(b);
+        else if (b->root && (b->need_style || b->need_layout)) { relayout(b); paint(b); }
         if(b->qhead<b->nqueue&&free_loader(b))start_next(b);
         if (b->js_open[0]) {
             char u[URL_MAX];
@@ -7261,7 +7246,8 @@ int browser_timeout(void)
 {
     int best = -1;
     for (struct browser *b = browsers; b; b = b->next) {
-        if(b->qhead<b->nqueue&&free_loader(b))return 0;
+        if((b->root && (b->discover_changes || b->need_style || b->need_layout)) ||
+           (b->qhead<b->nqueue&&free_loader(b)))return 0;
         if (b->frame_dead || b->frame_nav[0] || b->js_open[0] || b->js_nav[0] || b->js_history || b->js_reload)
             return 0;
         int t = jsdom_next_timer(b->js);

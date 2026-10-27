@@ -465,3 +465,22 @@ test-browser-images: $(BUILD)/tests/browser-images
 $(BUILD)/tests/browser-images: tests/browser-images.c user/desktop/image/gif.c user/desktop/image/webp.c user/desktop/image/webp_tables.h $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra $(DESKTOP_INC) tests/browser-images.c user/desktop/image/gif.c user/desktop/image/webp.c -o $@
+
+.PHONY: test-desktop-jobs
+test-desktop-jobs: $(BUILD)/tests/desktop-imagejobs
+	$<
+
+$(BUILD)/tests/desktop-imagejobs: tests/desktop-imagejobs.c tests/desktop-host.h user/desktop/shell/imagejobs.c $(DESKTOP_HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra $(DESKTOP_INC) -Iinclude -include tests/desktop-host.h tests/desktop-imagejobs.c -o $@
+
+$(BUILD)/tests/desktop-imagejobs-guest.o: tests/desktop-imagejobs.c user/desktop/shell/imagejobs.c $(DESKTOP_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(DESKTOP_INC) -DIMAGEJOBS_GUEST -c $< -o $@
+
+$(BUILD)/tests/desktop-imagejobs-guest: $(BUILD)/tests/desktop-imagejobs-guest.o $(CRT0) $(LIBC) user/user.ld
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
+
+.PHONY: test-desktop-jobs-qemu
+test-desktop-jobs-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/desktop-imagejobs-guest
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/desktop-imagejobs-guest --cpus $(KERNEL_TEST_CPUS) --success-marker "DESKTOP JOB REGRESSIONS PASSED"

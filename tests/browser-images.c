@@ -37,6 +37,16 @@ int main(void){
     CHECK(image_animate(img,200) && img->px[0]==0xff00ff00u && img->px[1]==0xffff0000u);
     CHECK(image_animate(img,250) && img->px[0]==0xffff0000u && img->px[1]==0xff0000ffu);
     CHECK(!image_animate(img,300) && !image_animate(img,400));image_free(img);
+    /* A helper's first-frame pixels resume animation without another LZW decode. */
+    img=image_decode_gif(data,len);CHECK(img);
+    struct image *transferred=malloc(sizeof(*transferred));CHECK(transferred);
+    *transferred=*img;transferred->px=malloc(8);CHECK(transferred->px);
+    memcpy(transferred->px,img->px,8);image_free(img);
+    CHECK(image_gif_adopt(transferred,data,len)==0 && transferred->px[0]==0xffff0000u);
+    CHECK(!image_animate(transferred,0));
+    CHECK(image_animate(transferred,50) && transferred->px[1]==0xff0000ffu);
+    CHECK(image_animate(transferred,100) && transferred->px[0]==0xff00ff00u && transferred->px[1]==0xffff0000u);
+    image_free(transferred);
     begin(1);frame(0,2,0,0,1,0);frame(0,2,1,1,1,0);byte(0x3b);
     img=image_decode_gif(data,len);CHECK(img);image_animate(img,0);
     CHECK(image_animate(img,50) && img->px[0]==0xff0000ffu);

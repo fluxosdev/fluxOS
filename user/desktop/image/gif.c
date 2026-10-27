@@ -152,7 +152,7 @@ static void dispose_frame(struct gif_animation *a)
 }
 
 /* Decode exactly one displayed frame; reject truncated blocks before changing pixels. */
-static int next_frame(struct gif_animation *a)
+static int next_frame(struct gif_animation *a, int adopted)
 {
     const uint8_t *p=a->p, *end=a->end;
     int transparent=-1, disposal=0, delay=100;
@@ -194,6 +194,14 @@ static int next_frame(struct gif_animation *a)
         int min_size=*p++;
         const uint8_t *after=skip_blocks(p,end);
         if (!after) return -1;
+        if (adopted) {
+            /* The helper already decoded these pixels. Only reconstruct the
+             * cursor/timing state, without doing the expensive LZW work again. */
+            if (disposal == 3) {
+                a->restore=calloc((size_t)a->img->w*a->img->h,sizeof(uint32_t));
+                if (!a->restore) return -1;
+            }
+        } else {
         uint8_t *indices=malloc((size_t)w*h);
         if (!indices) return -1;
         if (lzw_decode(p,after,min_size,indices,w*h)<0) {free(indices);return -1;}
@@ -221,6 +229,7 @@ static int next_frame(struct gif_animation *a)
             } else row++;
         }
         free(indices);
+        }
         a->p=after;
         a->x=x;a->y=y;a->w=w;a->h=h;
         a->transparent=transparent;a->disposal=disposal;a->delay=delay;
@@ -249,32 +258,30 @@ int image_animate(struct image *img, uint32_t now)
     if (!a || a->stopped) return 0;
     if (!a->started) {a->started=1;a->due=now+(uint32_t)a->delay;return 0;}
     if ((int32_t)(now-a->due)<0) return 0;
-    int result=next_frame(a);
+    int result=next_frame(a,0);
     if (!result && a->frames>1 && (a->repeats==0 || a->loops<a->repeats)) {
         a->loops++;
         a->p=a->start;
         a->disposal=0;
         free(a->restore);a->restore=NULL;
         memset(img->px,0,(size_t)img->w*img->h*sizeof(uint32_t));
-        result=next_frame(a);
+        result=next_frame(a,0);
     }
     if (result<=0) { image_animation_free(img); return 0; }
     a->due=now+(uint32_t)a->delay;
     return result>0;
 }
 
-struct image *image_decode_gif(const uint8_t *data, uint32_t len)
+static int attach_gif(struct image *img, const uint8_t *data, uint32_t len, int adopted)
 {
-    if (len<13 || !image_is_gif(data,len)) return NULL;
+    if (len<13 || !image_is_gif(data,len)) return -1;
     int w=data[6]|data[7]<<8, h=data[8]|data[9]<<8;
-    if (!w || !h || w>MAX_DIM || h>MAX_DIM || (size_t)w*h>16u*1024*1024) return NULL;
+    if (!w || !h || w>MAX_DIM || h>MAX_DIM || (size_t)w*h>16u*1024*1024 ||
+        img->w!=w || img->h!=h) return -1;
     struct gif_animation *a=calloc(1,sizeof(*a));
-    struct image *img=calloc(1,sizeof(*img));
-    if (!a || !img) {free(a);free(img);return NULL;}
-    img->w=w;img->h=h;
-    img->px=calloc((size_t)w*h,sizeof(uint32_t));
+    if (!a) return -1;
     a->data=malloc(len);
-    if (!img->px || !a->data) {free(img->px);free(img);free(a->data);free(a);return NULL;}
+    if (!a->data) {free(a);return -1;}
     memcpy(a->data,data,len);
     a->img=img;a->p=a->data+13;a->end=a->data+len;
     a->transparent=-1;a->repeats=-1;
@@ -285,12 +292,32 @@ struct image *image_decode_gif(const uint8_t *data, uint32_t len)
         a->gct=a->p;a->p+=a->gsize*3;
     }
     a->start=a->p;
-    if (next_frame(a)!=1) goto fail;
+    if (next_frame(a,adopted)!=1) goto fail;
     a->next=animations;animations=a;
-    return img;
+    return 0;
 fail:
-    free(a->data);free(a->restore);free(a);free(img->px);free(img);
-    return NULL;
+    free(a->data);free(a->restore);free(a);
+    return -1;
+}
+
+/* Retain animation semantics when the first frame came from another process. */
+int image_gif_adopt(struct image *img, const uint8_t *data, uint32_t len)
+{
+    image_animation_free(img);
+    return attach_gif(img,data,len,1);
+}
+
+struct image *image_decode_gif(const uint8_t *data, uint32_t len)
+{
+    if (len<13 || !image_is_gif(data,len)) return NULL;
+    int w=data[6]|data[7]<<8, h=data[8]|data[9]<<8;
+    if (!w || !h || w>MAX_DIM || h>MAX_DIM || (size_t)w*h>16u*1024*1024) return NULL;
+    struct image *img=calloc(1,sizeof(*img));
+    if (!img) return NULL;
+    img->w=w;img->h=h;
+    img->px=calloc((size_t)w*h,sizeof(uint32_t));
+    if (!img->px || attach_gif(img,data,len,0)<0) {free(img->px);free(img);return NULL;}
+    return img;
 }
 
 int image_is_gif(const uint8_t *data, uint32_t len)

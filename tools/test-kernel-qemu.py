@@ -11,6 +11,7 @@ for name in ("qemu", "kernel", "initrd", "guest"):
     parser.add_argument(name)
 parser.add_argument("--cpus", type=int, default=1, choices=range(1, 17))
 parser.add_argument("--append", default="")
+parser.add_argument("--success-marker", default="KERNEL REGRESSIONS PASSED")
 args = parser.parse_args()
 qemu, kernel, initrd, guest = args.qemu, args.kernel, args.initrd, args.guest
 expected_cpus = args.cpus
@@ -46,7 +47,7 @@ with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
         print((error.stdout or b"").decode(errors="replace"))
         raise SystemExit("QEMU kernel regressions timed out")
     print(output)
-    if result.returncode or "KERNEL REGRESSIONS PASSED" not in output:
+    if result.returncode or args.success_marker not in output:
         raise SystemExit("QEMU kernel regressions failed")
     if f"guest: {expected_cpus} CPUs online" not in output:
         raise SystemExit(f"QEMU expected {expected_cpus} active CPUs")
