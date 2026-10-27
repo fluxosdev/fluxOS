@@ -394,6 +394,28 @@ void volume_open(void)
     vc_paint(v);
 }
 
+/* The laptop's volume keys: the master volume a step at a time, or muted. */
+void sound_key(int code)
+{
+    if (!have_mixer)
+        return;
+    if (code == KEY_MUTE) {
+        if (muted[0]) {
+            muted[0] = 0;
+            set_level(vc_win, 0, saved[0] ? saved[0] : 75);
+        } else {
+            saved[0] = level[0];
+            set_level(vc_win, 0, 0);
+            muted[0] = 1;
+            wm_tray_changed();
+            if (vc_win)
+                vc_paint(vc_win);
+        }
+        return;
+    }
+    set_level(vc_win, 0, level[0] + (code == KEY_VOLUMEUP ? STEP : -STEP));
+}
+
 /* Once a second: follow changes made by other programs. */
 void sound_tick(void)
 {

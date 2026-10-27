@@ -12,7 +12,7 @@
 #include "lock.h"
 
 #define FLUXOS_NAME    "fluxOS"
-#define FLUXOS_RELEASE "0.2.2"
+#define FLUXOS_RELEASE "0.2.3"
 
 #define PAGE_SIZE 4096u
 #define ALIGN_UP(x, a)   (((x) + ((a) - 1)) & ~((a) - 1))

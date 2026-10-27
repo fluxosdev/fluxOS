@@ -45,10 +45,10 @@ struct dialog {
     void *ctx;
 };
 
-enum { ID_OK = 1, ID_CANCEL, ID_YES, ID_NO };
-enum { OPT_SHUTDOWN, OPT_RESTART, OPT_CONSOLE };
+enum { ID_OK = 1, ID_CANCEL, ID_YES, ID_NO, ID_SLEEP, ID_DIMMER, ID_BRIGHTER };
+enum { OPT_SHUTDOWN, OPT_RESTART, OPT_SLEEP, OPT_CONSOLE };
 
-static struct dialog *about_dlg, *run_dlg, *shutdown_dlg, *ask_dlg;
+static struct dialog *about_dlg, *run_dlg, *shutdown_dlg, *ask_dlg, *power_dlg;
 
 static struct control *add(struct dialog *d, enum ctl_type type, int x, int y, int w, int h,
                            const char *text, int id)
@@ -602,6 +602,9 @@ static void shutdown_command(struct dialog *d, int id)
     case OPT_RESTART:
         system_restart();
         break;
+    case OPT_SLEEP:
+        system_sleep();
+        break;
     case OPT_CONSOLE:
         exit(0);
     }
@@ -613,7 +616,10 @@ void shutdown_open(void)
         wm_focus(shutdown_dlg->win);
         return;
     }
-    struct dialog *d = dialog_new("Shut Down fluxOS", ICON_SHUTDOWN, 344, 150,
+    const struct powerinfo *pi = power_info();
+    int sleep = pi && (pi->flags & PWR_CAN_SLEEP);
+    int h = sleep ? 170 : 150, y = 40;
+    struct dialog *d = dialog_new("Shut Down fluxOS", ICON_SHUTDOWN, 344, h,
                                   WF_MODAL | WF_NOTASK, &shutdown_dlg);
     if (!d)
         return;
@@ -624,10 +630,103 @@ void shutdown_open(void)
     add(d, CT_ICON, 14, 14, 32, 32, NULL, ICON_SHUTDOWN);
     add(d, CT_LABEL, 62, 14, 0, 0, "Are you sure you want to:", 0);
     int first = d->n;
-    add(d, CT_RADIO, 66, 40, 0, 0, "Shut down the computer?", OPT_SHUTDOWN);
-    add(d, CT_RADIO, 66, 60, 0, 0, "Restart the computer?", OPT_RESTART);
-    add(d, CT_RADIO, 66, 80, 0, 0, "Close all programs and exit to the console?", OPT_CONSOLE);
-    add(d, CT_BUTTON, 344 / 2 - 6 - 75, 150 - 12 - 23, 75, 23, "Yes", ID_YES);
-    add(d, CT_BUTTON, 344 / 2 + 6, 150 - 12 - 23, 75, 23, "No", ID_NO);
+    add(d, CT_RADIO, 66, y, 0, 0, "Shut down the computer?", OPT_SHUTDOWN);
+    add(d, CT_RADIO, 66, y += 20, 0, 0, "Restart the computer?", OPT_RESTART);
+    if (sleep)
+        add(d, CT_RADIO, 66, y += 20, 0, 0, "Put the computer to sleep?", OPT_SLEEP);
+    add(d, CT_RADIO, 66, y += 20, 0, 0, "Close all programs and exit to the console?", OPT_CONSOLE);
+    add(d, CT_BUTTON, 344 / 2 - 6 - 75, h - 12 - 23, 75, 23, "Yes", ID_YES);
+    add(d, CT_BUTTON, 344 / 2 + 6, h - 12 - 23, 75, 23, "No", ID_NO);
     dialog_show(d, first);
+}
+
+/* ---- Power ---- */
+
+enum { PW_SOURCE, PW_BATTERY, PW_LID, PW_TEMP, PW_BRIGHT, PW_LINES };
+static int power_line[PW_LINES];
+
+static void power_fill(struct dialog *d)
+{
+    const struct powerinfo *pi = power_info();
+    char *t[PW_LINES];
+    size_t n = sizeof(d->ctl[0].text);
+    for (int i = 0; i < PW_LINES; i++) {
+        t[i] = d->ctl[power_line[i]].text;
+        t[i][0] = 0;
+    }
+    if (!pi)
+        return;
+    if (pi->flags & PWR_AC_KNOWN)
+        snprintf(t[PW_SOURCE], n, "Power source: %s", (pi->flags & PWR_AC_ONLINE) ? "AC adapter" : "battery");
+    char b[64];
+    power_battery_text(b, sizeof(b));
+    snprintf(t[PW_BATTERY], n, "Battery: %s", b);
+    if (pi->flags & PWR_LID)
+        snprintf(t[PW_LID], n, "Lid: %s (closing it puts the computer to sleep)",
+                 (pi->flags & PWR_LID_CLOSED) ? "closed" : "open");
+    if (pi->flags & PWR_THERMAL)
+        snprintf(t[PW_TEMP], n, "Temperature: %d C", pi->temp / 10);
+    if (pi->flags & PWR_BACKLIGHT)
+        snprintf(t[PW_BRIGHT], n, "Screen brightness: %u%%", pi->brightness);
+    else
+        snprintf(t[PW_BRIGHT], n, "Screen brightness: not adjustable here");
+}
+
+static void power_command(struct dialog *d, int id)
+{
+    switch (id) {
+    case ID_SLEEP:
+        close_dialog(d);
+        system_sleep();
+        return;
+    case ID_DIMMER:
+    case ID_BRIGHTER:
+        power(POWER_BRIGHTNESS, id == ID_BRIGHTER ? BRIGHTNESS_UP : BRIGHTNESS_DOWN);
+        power_tick();
+        power_dialog_tick();
+        return;
+    }
+    close_dialog(d);
+}
+
+void power_open(void)
+{
+    if (power_dlg) {
+        wm_focus(power_dlg->win);
+        return;
+    }
+    const struct powerinfo *pi = power_info();
+    struct dialog *d = dialog_new("Power", ICON_INFO, 380, 214, 0, &power_dlg);
+    if (!d)
+        return;
+    d->command = power_command;
+    d->default_id = ID_OK;
+    d->cancel_id = ID_OK;
+    add(d, CT_ICON, 14, 14, 32, 32, NULL, ICON_INFO);
+    add(d, CT_BOLD, 62, 14, 0, 0, "Power", 0);
+    for (int i = 0; i < PW_LINES; i++) {
+        power_line[i] = d->n;
+        add(d, CT_LABEL, 62, 38 + 20 * i, 0, 0, NULL, 0);
+    }
+    add(d, CT_SEPARATOR, 10, 214 - 50, 360, 2, NULL, 0);
+    int x = 10;
+    if (pi && (pi->flags & PWR_CAN_SLEEP)) {
+        add(d, CT_BUTTON, x, 214 - 10 - 23, 75, 23, "Sleep", ID_SLEEP);
+        x += 81;
+    }
+    if (pi && (pi->flags & PWR_BACKLIGHT)) {
+        add(d, CT_BUTTON, x, 214 - 10 - 23, 75, 23, "Dimmer", ID_DIMMER);
+        add(d, CT_BUTTON, x + 81, 214 - 10 - 23, 75, 23, "Brighter", ID_BRIGHTER);
+    }
+    add(d, CT_BUTTON, 380 - 10 - 75, 214 - 10 - 23, 75, 23, "Close", ID_OK);
+    power_fill(d);
+    dialog_show(d, d->n - 1);
+}
+
+void power_dialog_tick(void)
+{
+    if (!power_dlg)
+        return;
+    power_fill(power_dlg);
+    paint(power_dlg);
 }

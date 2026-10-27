@@ -482,3 +482,19 @@ const struct usb_driver usbmsc_driver = {
     .probe = msc_probe,
     .disconnect = msc_disconnect,
 };
+
+/* Is a file system mounted from a USB disk (or one of its partitions)?
+ * Suspend to RAM lets go of every USB device, which such a disk would not
+ * survive. */
+int usbmsc_in_use(void)
+{
+    for (int i = 0; i < BLK_MAX_DEVS; i++) {
+        struct blockdev *bd = blk_get(i);
+        if (!bd || !bd->fs)
+            continue;
+        struct blockdev *disk = bd->parent ? bd->parent : bd;
+        if (disk->read == msc_read)
+            return 1;
+    }
+    return 0;
+}

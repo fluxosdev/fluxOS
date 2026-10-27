@@ -1,30 +1,31 @@
 /*
- * ACPI, just enough to switch the machine off, and to list the processors
- * (the MADT) for smp.c.
+ * ACPI: the firmware's description of the machine, and its AML.
  *
- * At boot: find the RSDP in the BIOS areas, follow the RSDT (or XSDT) to
- * the FADT for the PM1 control registers and the SMI port that hands ACPI
- * to the OS, and find the \_S5 package (soft off) in the DSDT, or an SSDT,
- * for the sleep type values to write. There is no AML interpreter: \_S5
- * is read straight out of the table's bytes, which is how it is written
- * in practice, and \_PTS is not run.
+ * At boot, acpi_init() finds the RSDP in the BIOS areas and walks the
+ * RSDT (or XSDT) itself: the MADT lists the processors for smp.c, and the
+ * FADT and the \_S5 package (read straight out of the DSDT's bytes) are
+ * enough to switch the machine off. Then uACPI (third_party/uacpi) takes
+ * the tables too, and later, once PCI is up, acpi_namespace_init() has it
+ * load and run the AML: the embedded controller first (ec.c), as so much
+ * of a laptop's AML reads it, then the namespace's _INI methods, then the
+ * devices power.c looks after. From then on the SCI is uACPI's: it runs
+ * the GPE methods and passes on Notify()s, and the fixed power and sleep
+ * buttons come to power.c.
  *
- * To power off: enable ACPI mode if the firmware has not, then write the
- * S5 sleep type with SLP_EN to PM1a (and PM1b) control.
- *
- * The power button: with ACPI mode on, pressing it raises the SCI instead of
- * cutting the power. The handler only counts presses; the kpwrd thread then
- * tells the desktop (a KEY_POWER event on /dev/input) so it can shut down
- * cleanly, or, with no desktop running or on a second press, syncs the
- * disks and powers off itself.
+ * If uACPI cannot load the namespace, or "acpi=basic" is on the command
+ * line, the old way stays: no AML, power-off by the \_S5 bytes (without
+ * _PTS), and the power button through a handler of our own on the SCI.
+ * "acpi=off" leaves ACPI alone altogether (no power-off, one processor).
  */
 #include <string.h>
+#include <uacpi/uacpi.h>
+#include <uacpi/event.h>
+#include <uacpi/sleep.h>
+#include <uacpi/utilities.h>
 #include "kernel.h"
+#include "acpi.h"
 #include "drivers.h"
 #include "mm.h"
-#include "blkdev.h"
-#include "proc.h"
-#include "vfs.h"
 #include "smp.h"
 #include "x86.h"
 
@@ -52,8 +53,11 @@ static struct {
     uint8_t evt_len;
     uint16_t gpe0;                      /* GPE0 block: status, then enable at +len/2 */
     uint8_t gpe0_len;
-    volatile uint32_t presses;          /* power button presses seen by the SCI handler */
 } acpi;
+
+int acpi_aml;                           /* uACPI runs the AML */
+static int uacpi_tables;                /* uACPI has the tables */
+static uint32_t rsdp_phys;
 
 /* ---- reading physical memory at boot ---- */
 
@@ -121,6 +125,12 @@ static const uint8_t *find_rsdp(void)
     if (ebda >= 0x80000 && ebda < 0xA0000)
         r = find_rsdp_in(ebda, 1024);
     return r ? r : find_rsdp_in(0xE0000, 0x20000);
+}
+
+/* Below 1 MiB, so its virtual address is its physical one. */
+uint32_t acpi_rsdp_phys(void)
+{
+    return rsdp_phys;
 }
 
 static uint32_t rd32(const void *p, uint32_t off)
@@ -192,6 +202,7 @@ static void enable_acpi_mode(void)
     }
 }
 
+/* Without uACPI: the SCI's only source is the power button. */
 static void sci_handler(struct trapframe *tf)
 {
     (void)tf;
@@ -199,7 +210,7 @@ static void sci_handler(struct trapframe *tf)
     if (acpi.evt1b)
         sts |= inw(acpi.evt1b);
     if (sts & PWRBTN_EN)
-        acpi.presses++;
+        power_fixed_button(0);
     outw(acpi.evt1a, sts);              /* writing a 1 clears a status bit */
     if (acpi.evt1b)
         outw(acpi.evt1b, sts);
@@ -207,11 +218,16 @@ static void sci_handler(struct trapframe *tf)
 
 void acpi_init(void)
 {
+    if (cmdline_has("acpi=off")) {
+        boot_ok("ACPI: off (acpi=off)");
+        return;
+    }
     const uint8_t *rsdp = find_rsdp();
     if (!rsdp) {
         boot_warn("ACPI: no tables found (power-off will not work)");
         return;
     }
+    rsdp_phys = (uint32_t)rsdp;
     uint8_t rev = rsdp[15];
     uint32_t rsdt_pa = rd32(rsdp, 16), xsdt_pa = 0;
     if (rev >= 2 && sum_ok(rsdp, rd32(rsdp, 20) < 36 ? 20 : 36) && rd32(rsdp, 28) == 0)
@@ -287,15 +303,81 @@ void acpi_init(void)
         return;
     }
     acpi.found = 1;
-    boot_ok("ACPI %s: power-off by PM1 control at %04x, sleep type %u",
-            rev >= 2 ? "2.0+" : "1.0", acpi.pm1a, acpi.slp_typa);
     acpi.gpe0 = gpe0;
     acpi.gpe0_len = gpe0_len;
+    boot_ok("ACPI %s: power-off by PM1 control at %04x, sleep type %u",
+            rev >= 2 ? "2.0+" : "1.0", acpi.pm1a, acpi.slp_typa);
+    if (cmdline_has("acpi=basic")) {
+        boot_ok("ACPI: firmware methods not run (acpi=basic)");
+        return;
+    }
+
+    /* uACPI takes the tables too (and switches to ACPI mode). */
+    osl_init();
+    uacpi_status st = uacpi_initialize(0);
+    if (uacpi_unlikely_error(st)) {
+        boot_warn("ACPI: uACPI cannot use the tables (%s): firmware methods not run",
+                  uacpi_status_to_string(st));
+        return;
+    }
+    uacpi_tables = 1;
 }
 
-/* Switch off. Returns only if the machine is still on. */
+/*
+ * Load and run the firmware's AML. After PCI is usable (AML reads the
+ * chipset's configuration) and the timer runs; before the drivers that
+ * want to know about power.
+ */
+void acpi_namespace_init(void)
+{
+    if (!uacpi_tables)
+        return;
+    ec_early();
+    uacpi_status st = uacpi_namespace_load();
+    if (uacpi_unlikely_error(st)) {
+        boot_warn("ACPI: the firmware's AML did not load (%s): firmware methods not run",
+                  uacpi_status_to_string(st));
+        return;
+    }
+    uacpi_set_interrupt_model(UACPI_INTERRUPT_MODEL_PIC);
+    ec_init();
+    st = uacpi_namespace_initialize();
+    if (uacpi_unlikely_error(st)) {
+        boot_warn("ACPI: the namespace did not initialise (%s): firmware methods not run",
+                  uacpi_status_to_string(st));
+        return;
+    }
+    acpi_aml = 1;
+    ec_start();
+    power_init();
+    boot_ok("ACPI: firmware methods running (uACPI)%s", sleep_supported() ? ", suspend to RAM available" : "");
+}
+
+/* An integer from a method or named object; 0 if there was one. */
+int acpi_eval_int(uacpi_namespace_node *node, const char *path, uint64_t *out)
+{
+    uacpi_u64 v;
+    if (uacpi_eval_simple_integer(node, path, &v) != UACPI_STATUS_OK)
+        return -1;
+    *out = v;
+    return 0;
+}
+
+/* Before switching off, with interrupts as they are: _PTS(5) (AML, perhaps
+ * the EC). */
+void acpi_prepare_poweroff(void)
+{
+    if (acpi_aml)
+        uacpi_prepare_for_sleep_state(UACPI_SLEEP_STATE_S5);
+}
+
+/* Switch off, interrupts off. Returns only if the machine is still on. */
 void acpi_poweroff(void)
 {
+    if (acpi_aml) {
+        uacpi_enter_sleep_state(UACPI_SLEEP_STATE_S5);
+        udelay(500000);
+    }
     if (!acpi.found)
         return;
     /* Ask the firmware to hand ACPI over, unless it already has. */
@@ -314,38 +396,50 @@ void acpi_poweroff(void)
     udelay(500000);                     /* it takes a moment to go */
 }
 
-/* ---- the power button's thread ---- */
+/* ---- events ---- */
 
-static void kpwrd(void)
+static int fixed_buttons;               /* which fixed events have handlers: 1 power, 2 sleep */
+
+/* After S3 the fixed buttons' enable bits may be off again, as ACPICA
+ * knows: on again (sleep.c). */
+void acpi_events_resume(void)
 {
-    uint32_t seen = 0;
-    int asked = 0;                      /* the desktop has been told */
-    for (;;) {
-        sleep_ticks(HZ / 10);
-        current->sig_pending = 0;
-        if (acpi.presses == seen)
-            continue;
-        seen = acpi.presses;
-        if (input_grabbed() && !asked) {
-            struct input_event ev = { .type = IEV_KEY, .code = KEY_POWER };
-            ev.flags = IEV_PRESSED;
-            input_push(&ev);
-            ev.flags = 0;
-            input_push(&ev);
-            asked = 1;
-            continue;
-        }
-        kprintf("\nfluxOS: power button, powering off...\n");
-        vfs_lock();
-        blk_sync_all();
-        vfs_unlock();
-        machine_poweroff();             /* returns only if the machine stays on */
-        asked = 0;
-    }
+    if (fixed_buttons & 1)
+        uacpi_enable_fixed_event(UACPI_FIXED_EVENT_POWER_BUTTON);
+    if (fixed_buttons & 2)
+        uacpi_enable_fixed_event(UACPI_FIXED_EVENT_SLEEP_BUTTON);
 }
 
+static uacpi_interrupt_ret fixed_power(uacpi_handle ctx)
+{
+    (void)ctx;
+    power_fixed_button(0);
+    return UACPI_INTERRUPT_HANDLED;
+}
+
+static uacpi_interrupt_ret fixed_sleep(uacpi_handle ctx)
+{
+    (void)ctx;
+    power_fixed_button(1);
+    return UACPI_INTERRUPT_HANDLED;
+}
+
+/* Once processes run: the worker threads, the GPEs, the buttons, and the
+ * power thread. */
 void acpi_power_start(void)
 {
+    if (acpi_aml) {
+        osl_start();
+        if (uacpi_install_fixed_event_handler(UACPI_FIXED_EVENT_POWER_BUTTON, fixed_power, NULL) ==
+            UACPI_STATUS_OK)
+            fixed_buttons |= 1;
+        if (uacpi_install_fixed_event_handler(UACPI_FIXED_EVENT_SLEEP_BUTTON, fixed_sleep, NULL) ==
+            UACPI_STATUS_OK)
+            fixed_buttons |= 2;
+        uacpi_finalize_gpe_initialization();
+        power_start();
+        return;
+    }
     if (!acpi.found || !acpi.evt1a || acpi.evt_len < 4 || acpi.sci_irq == 0 || acpi.sci_irq > 15 ||
         cmdline_has("acpibutton=off"))
         return;
@@ -361,6 +455,6 @@ void acpi_power_start(void)
         outw((uint16_t)(acpi.evt1b + half), PWRBTN_EN);
     }
     irq_register(acpi.sci_irq, sci_handler);
-    proc_spawn_kthread("kpwrd", kpwrd);
+    power_start();
     boot_ok("ACPI power button on IRQ %u", acpi.sci_irq);
 }

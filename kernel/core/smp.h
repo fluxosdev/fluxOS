@@ -23,6 +23,7 @@
 #define VEC_TICK     0xF1               /* the timer ticked (on the boot processor) */
 #define VEC_TLB      0xF2               /* flush the TLB; needs no lock */
 #define VEC_STOP     0xF3               /* panic: halt */
+#define VEC_PARK     0xF4               /* suspend to RAM: save your state and halt */
 #define VEC_SPURIOUS 0xFF
 
 struct proc;
@@ -71,6 +72,12 @@ void smp_tlb_ipi(void);
 void smp_tlb_check(void);               /* waiting with interrupts off: flush if asked */
 void smp_stop_others(void);
 void smp_stopped(void) __attribute__((noreturn));
+/* Suspend to RAM: the others save their state and halt (park), and are
+ * started again into it (unpark); interrupts off on the caller, the boot
+ * processor. smp_park() is their side, from VEC_PARK. */
+int smp_park_others(void);             /* 0, or -1 (and nothing parked) */
+void smp_unpark_others(void);
+void smp_park(void);
 void lapic_eoi(void);
 
 #endif

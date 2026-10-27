@@ -17,6 +17,12 @@ int blkinfo(int index, struct blkinfo *bi);
 int blkrescan(const char *disk);         /* re-read the partition table */
 int usbinfo(int index, struct usbinfo *ui); /* the index-th USB device plugged in */
 
+/* Batteries, the AC adapter, the lid, suspend and the backlight: op is
+ * POWER_INFO (arg: struct powerinfo *), POWER_SLEEP (returns once the
+ * machine is back), or POWER_BRIGHTNESS (arg: a percentage, BRIGHTNESS_UP
+ * or BRIGHTNESS_DOWN; returns the percentage set). See <flux/abi.h>. */
+int power(int op, unsigned int arg);
+
 /* Pseudo-terminal: fds[0] is the master, fds[1] the slave (a terminal). */
 int openpty(int fds[2]);
 

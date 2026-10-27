@@ -138,6 +138,7 @@ struct xslot {
 
 struct xhci {
     struct usb_hc hc;
+    struct pci_dev pci;
     volatile uint8_t *cap, *op, *rt;
     volatile uint32_t *db;
     int csz;                            /* context size: 32 or 64 */
@@ -146,6 +147,7 @@ struct xhci {
     uint64_t *dcbaa;
     struct ring cmd;
     struct trb *events;
+    uint32_t *erst;                     /* the event ring segment table */
     uint32_t ev_deq, ev_cycle;
     struct xslot *slots[256];
     uint8_t port_usb3[256];
@@ -200,6 +202,19 @@ static int ring_init(struct ring *r)
     r->enq = 0;
     r->cycle = 1;
     return 0;
+}
+
+/* Empty again, for a controller that starts over. */
+static void ring_reset(struct ring *r)
+{
+    memset(r->trbs, 0, (RING_TRBS - 1) * sizeof(struct trb));
+    struct trb *link = &r->trbs[RING_TRBS - 1];
+    link->p0 = (uint32_t)r->trbs;
+    link->p1 = 0;
+    link->status = 0;
+    link->control = TRB_TYPE(TRB_LINK) | TRB_TC;
+    r->enq = 0;
+    r->cycle = 1;
 }
 
 static void ring_free(struct ring *r)
@@ -789,6 +804,9 @@ static void xhci_port_disable(struct usb_hub *h, int port)
         *r = (*r & PORT_KEEP) | PORT_PED;   /* PED is write-1-to-disable */
 }
 
+static void xhci_suspend(struct usb_hc *hc);
+static void xhci_resume(struct usb_hc *hc);
+
 static const struct usb_hc_ops xhci_ops = {
     .submit = xhci_submit,
     .cancel = xhci_cancel,
@@ -799,6 +817,8 @@ static const struct usb_hc_ops xhci_ops = {
     .dev_hub = xhci_dev_hub,
     .dev_free = xhci_dev_free,
     .ep_reset = xhci_ep_reset,
+    .suspend = xhci_suspend,
+    .resume = xhci_resume,
 };
 
 #define MAX_XHCI 4
@@ -868,6 +888,80 @@ static void intel_switch_ports(const struct pci_dev *pci)
     }
 }
 
+/* From the BIOS, reset, the device context array and the rings in,
+ * running, the ports powered. The rings are empty: there are no devices. */
+static int xhci_setup(struct xhci *x)
+{
+    struct usb_hc *hc = &x->hc;
+    uint32_t hcc1 = *(volatile uint32_t *)(x->cap + CAP_HCCPARAMS1);
+    intel_switch_ports(&x->pci);
+    ext_caps(x, hcc1);
+
+    /* Stop and reset it (the BIOS may have left it running). */
+    op_wr(x, OP_USBCMD, op_rd(x, OP_USBCMD) & ~(CMD_RS | CMD_INTE));
+    for (int i = 0; i < 20 && !(op_rd(x, OP_USBSTS) & STS_HCH); i++)
+        usb_mdelay(1);
+    op_wr(x, OP_USBCMD, CMD_HCRST);
+    for (int i = 0; i < 1000 && (op_rd(x, OP_USBCMD) & CMD_HCRST); i++)
+        usb_mdelay(1);
+    for (int i = 0; i < 1000 && (op_rd(x, OP_USBSTS) & STS_CNR); i++)
+        usb_mdelay(1);
+    if (op_rd(x, OP_USBSTS) & STS_CNR) {
+        klog("xhci: controller did not come out of reset\n");
+        x->dead = 1;
+        return -1;
+    }
+
+    for (int i = 1; i <= x->maxslots; i++)
+        x->dcbaa[i] = 0;
+    ring_reset(&x->cmd);
+    memset(x->events, 0, RING_TRBS * sizeof(struct trb));
+    x->cmd_busy = 0;
+    x->cmd_done = 0;
+    x->dead = 0;
+
+    op_wr(x, OP_CONFIG, (op_rd(x, OP_CONFIG) & ~0xFFu) | (uint32_t)x->maxslots);
+    op_wr64(x, OP_DCBAAP, (uint32_t)x->dcbaa);
+    op_wr64(x, OP_CRCR, (uint32_t)x->cmd.trbs | 1);
+    x->erst[0] = (uint32_t)x->events;
+    x->erst[1] = 0;
+    x->erst[2] = RING_TRBS;
+    x->ev_deq = 0;
+    x->ev_cycle = 1;
+    rt_wr(x, IR_ERSTSZ, 1);
+    rt_wr(x, IR_ERDP, (uint32_t)x->events);
+    rt_wr(x, IR_ERDP + 4, 0);
+    rt_wr(x, IR_ERSTBA, (uint32_t)x->erst);
+    rt_wr(x, IR_ERSTBA + 4, 0);
+    rt_wr(x, IR_IMOD, 0);
+
+    rt_wr(x, IR_IMAN, IMAN_IP | (hc->irq >= 0 ? IMAN_IE : 0));
+    op_wr(x, OP_USBSTS, STS_EINT | STS_PCD | STS_HSE);
+    op_wr(x, OP_USBCMD, CMD_RS | CMD_HSEE | (hc->irq >= 0 ? CMD_INTE : 0));
+    for (int i = 0; i < 20 && (op_rd(x, OP_USBSTS) & STS_HCH); i++)
+        usb_mdelay(1);
+
+    if (hcc1 & (1u << 3)) {             /* port power control */
+        for (int p = 1; p <= hc->root.nports; p++)
+            *portsc(x, p) = (*portsc(x, p) & PORT_KEEP) | PORT_PP;
+        usb_mdelay(20);
+    }
+    return 0;
+}
+
+static void xhci_suspend(struct usb_hc *hc)
+{
+    struct xhci *x = hc->priv;
+    op_wr(x, OP_USBCMD, op_rd(x, OP_USBCMD) & ~(CMD_RS | CMD_INTE));
+    for (int i = 0; i < 20 && !(op_rd(x, OP_USBSTS) & STS_HCH); i++)
+        usb_mdelay(1);
+}
+
+static void xhci_resume(struct usb_hc *hc)
+{
+    xhci_setup(hc->priv);
+}
+
 static void xhci_init(const struct pci_dev *pci)
 {
     struct xhci *x = kzalloc(sizeof(*x));
@@ -891,27 +985,12 @@ static void xhci_init(const struct pci_dev *pci)
     x->maxslots = (int)MIN(hcs1 & 0xFF, 32u);
     int nports = (int)(hcs1 >> 24);
 
-    intel_switch_ports(pci);
-    ext_caps(x, hcc1);
-
-    /* Stop and reset it (the BIOS may have left it running). */
-    op_wr(x, OP_USBCMD, op_rd(x, OP_USBCMD) & ~(CMD_RS | CMD_INTE));
-    for (int i = 0; i < 20 && !(op_rd(x, OP_USBSTS) & STS_HCH); i++)
-        usb_mdelay(1);
-    op_wr(x, OP_USBCMD, CMD_HCRST);
-    for (int i = 0; i < 1000 && (op_rd(x, OP_USBCMD) & CMD_HCRST); i++)
-        usb_mdelay(1);
-    for (int i = 0; i < 1000 && (op_rd(x, OP_USBSTS) & STS_CNR); i++)
-        usb_mdelay(1);
-    if (op_rd(x, OP_USBSTS) & STS_CNR) {
-        klog("xhci: controller did not come out of reset\n");
-        return;
-    }
+    x->pci = *pci;
 
     x->dcbaa = usb_dma_alloc((uint32_t)(x->maxslots + 1) * 8);
     x->events = usb_dma_alloc(RING_TRBS * sizeof(struct trb));
-    uint32_t *erst = usb_dma_alloc(64);
-    if (!x->dcbaa || !x->events || !erst || ring_init(&x->cmd) < 0) {
+    x->erst = usb_dma_alloc(64);
+    if (!x->dcbaa || !x->events || !x->erst || ring_init(&x->cmd) < 0) {
         klog("xhci: out of memory\n");
         x->events = NULL;
         return;
@@ -935,43 +1014,19 @@ static void xhci_init(const struct pci_dev *pci)
         x->dcbaa[0] = (uint32_t)arr;
     }
 
-    op_wr(x, OP_CONFIG, (op_rd(x, OP_CONFIG) & ~0xFFu) | (uint32_t)x->maxslots);
-    op_wr64(x, OP_DCBAAP, (uint32_t)x->dcbaa);
-    op_wr64(x, OP_CRCR, (uint32_t)x->cmd.trbs | 1);
-    erst[0] = (uint32_t)x->events;
-    erst[1] = 0;
-    erst[2] = RING_TRBS;
-    x->ev_deq = 0;
-    x->ev_cycle = 1;
-    rt_wr(x, IR_ERSTSZ, 1);
-    rt_wr(x, IR_ERDP, (uint32_t)x->events);
-    rt_wr(x, IR_ERDP + 4, 0);
-    rt_wr(x, IR_ERSTBA, (uint32_t)erst);
-    rt_wr(x, IR_ERSTBA + 4, 0);
-    rt_wr(x, IR_IMOD, 0);
-
     struct usb_hc *hc = &x->hc;
     hc->name = "xHCI";
     hc->ops = &xhci_ops;
     hc->priv = x;
     hc->sets_address = 1;
     hc->irq = cmdline_has("usb.poll") ? -1 : pci_irq(pci);
-    rt_wr(x, IR_IMAN, IMAN_IP | (hc->irq >= 0 ? IMAN_IE : 0));
-    op_wr(x, OP_USBSTS, STS_EINT | STS_PCD | STS_HSE);
-    op_wr(x, OP_USBCMD, CMD_RS | CMD_HSEE | (hc->irq >= 0 ? CMD_INTE : 0));
-    for (int i = 0; i < 20 && (op_rd(x, OP_USBSTS) & STS_HCH); i++)
-        usb_mdelay(1);
-
     hc->root.nports = MIN(nports, USB_MAX_PORTS);
     hc->root.port_status = xhci_port_status;
     hc->root.port_reset = xhci_port_reset;
     hc->root.port_disable = xhci_port_disable;
     hc->root.priv = x;
-    if (hcc1 & (1u << 3)) {             /* port power control */
-        for (int p = 1; p <= hc->root.nports; p++)
-            *portsc(x, p) = (*portsc(x, p) & PORT_KEEP) | PORT_PP;
-        usb_mdelay(20);
-    }
+    if (xhci_setup(x) < 0)
+        return;
 
     xhcis[nxhci++] = x;
     if (hc->irq >= 0)

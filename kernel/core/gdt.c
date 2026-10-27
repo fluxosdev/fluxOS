@@ -72,10 +72,19 @@ void gdt_init(void)
     tss_flush(SEG_TSS);
 }
 
+/* Load a processor's TSS. LTR marks the descriptor busy and refuses one
+ * already marked, as it still is after the processor was switched off
+ * (suspend to RAM): it is made available again first. */
+void gdt_load_tr(int cpu)
+{
+    gdt[5 + cpu].access = 0x89;
+    tss_flush(SEG_TSS + 8 * (uint32_t)cpu);
+}
+
 void gdt_init_ap(int cpu)
 {
     gdt_flush(&gdt_desc);
-    tss_flush(SEG_TSS + 8 * (uint32_t)cpu);
+    gdt_load_tr(cpu);
 }
 
 void tss_set_kernel_stack(uint32_t esp0)

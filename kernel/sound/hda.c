@@ -153,6 +153,8 @@ struct widget {
 
 static struct {
     int present;
+    int asleep;                         /* suspend to RAM: the hardware is not to be touched */
+    struct pci_dev pci;
     volatile uint8_t *regs;
     int irq;
     uint32_t *corb, *rirb;
@@ -463,6 +465,8 @@ static void set_amp(int nid, int out, int index, uint32_t gain, int mute)
 /* The DACs' volume: mute at 0, then the top three quarters of their range. */
 static void apply_master(void)
 {
+    if (hda.asleep)
+        return;                         /* the volume is set again on resume */
     for (int i = 0; i < hda.ndacs; i++) {
         int nid = hda.dacs[i];
         uint32_t caps = hda.w[nid].amp_out, top = amp_unity(caps);
@@ -722,7 +726,7 @@ static void stop(void)
 
 static void start(void)
 {
-    if (hda.running || !ring_used())
+    if (hda.running || !ring_used() || hda.asleep)
         return;
     fill_half(0);
     fill_half(1);
@@ -1151,6 +1155,7 @@ void hda_init(struct vnode *devdir)
         if (!page && (!(page = pmm_alloc()) || !(buf = pmm_alloc_contig(4))))
             return;
         hda.irq = pci_irq(&pci);
+        hda.pci = pci;
         found = controller_init(&pci, (uint8_t *)page) == 0;
         if (!found && hda.regs)
             wr32(GCTL, rd32(GCTL) & ~GCTL_CRST);        /* leave it in reset */
@@ -1189,4 +1194,45 @@ void hda_init(struct vnode *devdir)
     boot_ok("HD Audio: %s (rev %06x) on codec %d, %d output%s, %d Hz, IRQ %d%s", hda.name,
             hda.revision >> 8, hda.cad, hda.nouts, hda.nouts == 1 ? "" : "s", hda.out_rate,
             hda.irq, second ? " (/dev/dsp1)" : "");
+}
+
+/* ---- suspend to RAM ---- */
+
+void hda_suspend(void)
+{
+    if (!hda.present)
+        return;
+    spin_lock(&snd_lock);
+    stop();
+    hda.asleep = 1;
+    wr32(INTCTL, 0);
+    spin_unlock(&snd_lock);
+}
+
+/* The controller and codec lost their settings: set them up as at boot
+ * (the same codec, so the same paths), then play on what is waiting. The
+ * codec's setup sleeps, so this runs without snd_lock; meanwhile asleep
+ * keeps writers and the mixer off the hardware. */
+void hda_resume(void)
+{
+    if (!hda.present)
+        return;
+    pci_quirks(&hda.pci);
+    wr32(INTCTL, 0);
+    if (controller_reset() < 0) {
+        klog("hda: controller did not come out of reset after suspend\n");
+        return;
+    }
+    rings_init((uint8_t *)hda.bdl - 0xC00);
+    if (codec_init(hda.cad) < 0) {
+        klog("hda: codec %d did not come back after suspend\n", hda.cad);
+        return;
+    }
+    spin_lock(&snd_lock);
+    hda.asleep = 0;
+    apply_master();
+    if (hda.irq >= 0)
+        wr32(INTCTL, INTCTL_GIE | 1u << hda.sindex);
+    start();
+    spin_unlock(&snd_lock);
 }

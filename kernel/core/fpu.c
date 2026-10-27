@@ -151,3 +151,21 @@ void fpu_release(struct proc *p)
     p->fpu_cpu = -1;
     irq_restore(flags);
 }
+
+/* Suspend to RAM: this processor's FPU is about to lose its registers.
+ * The running process's go to its struct proc (the others' are there
+ * already), and nothing counts on what the FPU holds. Interrupts off. */
+void fpu_suspend_cpu(void)
+{
+    struct cpu *c = this_cpu();
+    struct proc *p = c->fpu_owner;
+    if (p && fpu_holds(c, p)) {
+        if (p == c->proc) {
+            clts();
+            fpu_save(p);
+        }
+        p->fpu_cpu = -1;
+    }
+    c->fpu_owner = NULL;
+    stts();
+}

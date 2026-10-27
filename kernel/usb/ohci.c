@@ -500,12 +500,17 @@ static void ohci_port_disable(struct usb_hub *h, int port)
     wr(o, port_reg(port), PS_CLEAR_ENABLE);
 }
 
+static void ohci_suspend(struct usb_hc *hc);
+static void ohci_resume(struct usb_hc *hc);
+
 static const struct usb_hc_ops ohci_ops = {
     .submit = ohci_submit,
     .cancel = ohci_cancel,
     .poll = ohci_poll,
     .dev_free = ohci_dev_free,
     .ep_reset = ohci_ep_reset,
+    .suspend = ohci_suspend,
+    .resume = ohci_resume,
 };
 
 #define MAX_OHCI 8
@@ -544,20 +549,10 @@ static void take_ownership(struct ohci *o)
     }
 }
 
-static void ohci_init(const struct pci_dev *pci)
+/* From SMM or the BIOS, reset, the schedule in, running, the ports powered. */
+static void ohci_setup(struct ohci *o)
 {
-    struct ohci *o = kzalloc(sizeof(*o));
-    if (!o)
-        return;
-    o->regs = pci_map_bar(pci, PCI_BAR0);
-    o->hcca = usb_dma_alloc(256);
-    for (int l = 0; l < 3; l++)
-        o->head[l] = ed_new(l == 0 ? USB_EP_INTR : l == 1 ? USB_EP_CONTROL : USB_EP_BULK);
-    if (!o->regs || !o->hcca || !o->head[0] || !o->head[1] || !o->head[2]) {
-        klog("ohci: cannot set up the controller\n");
-        return;
-    }
-    pci_enable(pci, PCI_CMD_MEM | PCI_CMD_MASTER);
+    struct usb_hc *hc = &o->hc;
     take_ownership(o);
 
     uint32_t fi = rd(o, HC_FMINTERVAL) & 0x3FFF;
@@ -583,28 +578,58 @@ static void ohci_init(const struct pci_dev *pci)
     wr(o, HC_CTRLCUR, 0);
     wr(o, HC_BULKCUR, 0);
     wr(o, HC_INTSTATUS, 0xFFFFFFFFu);
-
-    struct usb_hc *hc = &o->hc;
-    hc->name = "OHCI";
-    hc->ops = &ohci_ops;
-    hc->priv = o;
-    hc->irq = cmdline_has("usb.poll") ? -1 : pci_irq(pci);
     if (hc->irq >= 0)
         wr(o, HC_INTENABLE, INT_MIE | INT_WDH | INT_UE);
     wr(o, HC_CONTROL, CTL_PLE | CTL_CLE | CTL_BLE | CTL_OPER | 3);
 
     uint32_t rha = rd(o, HC_RHDESCA);
     hc->root.nports = (int)MIN(rha & 0xFF, (uint32_t)USB_MAX_PORTS);
-    hc->root.port_status = ohci_port_status;
-    hc->root.port_reset = ohci_port_reset;
-    hc->root.port_disable = ohci_port_disable;
-    hc->root.priv = o;
     if (!(rha & RH_NPS)) {
         wr(o, HC_RHSTATUS, RH_LPSC);    /* global power, then each port's */
         for (int p = 1; p <= hc->root.nports; p++)
             wr(o, port_reg(p), PS_SET_POWER);
     }
     usb_mdelay(MAX((rha >> 24) * 2, 20u));
+    o->dead = 0;
+}
+
+static void ohci_suspend(struct usb_hc *hc)
+{
+    struct ohci *o = hc->priv;
+    wr(o, HC_INTDISABLE, 0xFFFFFFFFu);
+    wr(o, HC_CONTROL, 0);
+}
+
+static void ohci_resume(struct usb_hc *hc)
+{
+    ohci_setup(hc->priv);
+}
+
+static void ohci_init(const struct pci_dev *pci)
+{
+    struct ohci *o = kzalloc(sizeof(*o));
+    if (!o)
+        return;
+    o->regs = pci_map_bar(pci, PCI_BAR0);
+    o->hcca = usb_dma_alloc(256);
+    for (int l = 0; l < 3; l++)
+        o->head[l] = ed_new(l == 0 ? USB_EP_INTR : l == 1 ? USB_EP_CONTROL : USB_EP_BULK);
+    if (!o->regs || !o->hcca || !o->head[0] || !o->head[1] || !o->head[2]) {
+        klog("ohci: cannot set up the controller\n");
+        return;
+    }
+    pci_enable(pci, PCI_CMD_MEM | PCI_CMD_MASTER);
+
+    struct usb_hc *hc = &o->hc;
+    hc->name = "OHCI";
+    hc->ops = &ohci_ops;
+    hc->priv = o;
+    hc->irq = cmdline_has("usb.poll") ? -1 : pci_irq(pci);
+    hc->root.port_status = ohci_port_status;
+    hc->root.port_reset = ohci_port_reset;
+    hc->root.port_disable = ohci_port_disable;
+    hc->root.priv = o;
+    ohci_setup(o);
 
     ohcis[nohci++] = o;
     if (hc->irq >= 0)

@@ -101,7 +101,30 @@ stops at boot and says why.
 - Console: ANSI/VT100 text console on the framebuffer (8x16 CP437 font) or VGA
   text mode, PS/2 keyboard, mirrored COM1, canonical and raw line discipline.
 - Input: PS/2 mouse with wheel and the VMware/QEMU absolute-pointer interface,
-  USB keyboards, mice and tablets, delivered through `/dev/input`.
+  USB keyboards, mice and tablets, delivered through `/dev/input`. A
+  **Synaptics touchpad** runs in absolute mode: tap to click (two fingers for
+  the right button, three for the middle), tap and drag, two-finger scrolling
+  (or the right edge on pads that cannot count fingers), clickpads' bottom
+  right corner as the right button, palm and while-typing tap rejection, and a
+  ThinkPad's TrackPoint through it (middle button held scrolls). ALPS and
+  Elantech pads are recognised and stay in their mouse emulation.
+  `touchpad=off`, `touchpad.tap=0`. Caps Lock lights its LED; laptop and
+  multimedia keys (volume, mute, sleep, power) reach the desktop.
+- **ACPI** through [uACPI](https://github.com/uACPI/uACPI), which runs the
+  firmware's AML: the embedded controller (EC) and its events, the AC adapter,
+  batteries (charge, rate, time left), the lid, the power and sleep buttons, a
+  thermal zone (critical temperature shuts down cleanly) and the backlight
+  (brightness keys and `power bright`). `SYS_power` and the `power` command
+  report it all. **Suspend to RAM (S3)** from the desktop's Shut Down dialog,
+  the Power dialog, the sleep key, closing the lid, or `power sleep`: disks are
+  flushed and parked, the other processors parked, and on waking the
+  processor, PICs, PCI configuration, IDE (with its DMA mode), AHCI, all four
+  USB controllers (devices are found again), HD Audio, the network card and
+  the PS/2 devices are set up again, and the display's VESA mode is restored
+  from real mode. Options: `acpi=off`, `acpi=basic` (tables only, as before:
+  power-off without AML), `ec=off`, `lid=ignore`, `s3_bios` (run the video
+  BIOS on waking), `s3_nomode`, `s3_beep` (beep as soon as the firmware hands
+  back, to debug a machine that does not wake).
 - Display drivers:
   - Standard: keeps the VESA BIOS mode.
   - **3dfx Voodoo Banshee/3/4/5**: reads EDID, sets modes from 640x480 to
@@ -127,7 +150,8 @@ stops at boot and says why.
   and fast retransmit; a DHCP client (or `net.ip=... net.gw=... net.dns=...`
   on the kernel command line); BSD sockets for TCP, UDP and ping; DNS from
   `/etc/hosts` and then the DHCP server.
-- Kernel log (`dmesg`), CMOS clock, reboot and ACPI power-off.
+- Kernel log (`dmesg`), CMOS clock, reboot and ACPI power-off (running the
+  firmware's `_PTS`).
 
 **fsh, the flux shell (zsh-flavoured)**
 - zsh prompt escapes (`%n %m %~ %# %?  %F{color} %B`...), live syntax
@@ -571,6 +595,8 @@ lsusb -v                       # USB devices (make run-usb or run-q35)
 cp /mnt/fd0/GAME.EXE ~; ./GAME.EXE    # a DOS program (make floppy first)
 beep -m "T160 L8 CDEGEC4"      # the PC speaker
 play /usr/share/sounds/startup.wav; mixer pcm 60    # the Sound Blaster
+power -v; power bright +       # a laptop's battery, lid and backlight
+power sleep                    # suspend to RAM; the power button wakes it
 dmesg | tail; poweroff
 ```
 
@@ -589,11 +615,14 @@ lib/                       string/printf routines and the 8x16 font, shared by k
 tools/                     mkfont.py (fonts), oxygen-icons.py (icons), mksounds.py (sounds),
                            mklogo.py (the logo for the startup and shutdown screens)
 kernel/core/               boot.S, entry.S, kmain, cpu/fpu/sse, gdt/idt, smp, timer,
-                           pmm/vmm/heap, proc/exec/syscall, acpi/pci, tty/serial/kprintf
+                           pmm/vmm/heap, proc/exec/syscall, pci, tty/serial/kprintf
+kernel/acpi/               acpi (tables, namespace, power-off), osl (uACPI's kernel
+                           services), ec, power (battery, lid, buttons, backlight),
+                           sleep and wakeup.S (suspend to RAM)
 kernel/fs/                 vfs/file/initrd, blkdev, automount, fat32/iso9660
 kernel/storage/            ata, ahci, floppy
 kernel/usb/                usb core, hid/hub/msc, uhci/ohci/ehci/xhci
-kernel/input/              input, keyboard, mouse
+kernel/input/              input, keyboard, mouse, touchpad
 kernel/net/                net/tcp/socket, ne2000, forcedeth/mii
 kernel/sound/              pcspkr, sb16/opl/isadma, hda
 kernel/video/              fb/vga, the startup screen (splash.c), voodoo, radeon*, atom
@@ -613,6 +642,7 @@ user/desktop/wave/         the Wave browser: window (browser.c), HTML (html.c), 
                            (webpolicy.c), cookies, storage and <canvas> (canvas.c)
 user/desktop/wave/js/      JavaScript (js.c, jslib*.c, jsbinary.c, jsre.c, jsgc.c, jsdom.c)
 third_party/mbedtls/        upstream verification library subset and its fluxOS config
+third_party/uacpi/         uACPI 6.1.1, the AML interpreter (unmodified)
 user/dos/                  the DOS emulator (CPU, DPMI, BIOS, video, files, sound)
 user/bin/                  one program per file (fluxinstall.c is the installer)
 rootfs/                    the installed system's files (/etc, /home/flux, icons,
@@ -733,6 +763,12 @@ cannot be used.
 
 - **IDE:** DMA needs a legacy-mode PCI controller with bus mastering and a
   drive the firmware put in a DMA mode; anything else uses PIO.
+- **Suspend to RAM:** not with the Radeon or Voodoo drivers (they cannot set
+  their cards up again: boot with `radeon=off`), nor with a USB disk mounted
+  (USB devices are let go of and found again). The screen comes back only
+  where the VESA BIOS can set its mode again on waking (`s3_bios` helps some
+  machines). No hibernation (S4), no processor frequency scaling, and
+  touchpads other than Synaptics have no scrolling.
 - **SATA:** AHCI only, no NCQ, port multipliers or hot plugging; a controller
   above 4 GiB can't be reached.
 - **USB:** no isochronous transfers or UAS, only LUN 0 of mass storage, no
@@ -837,3 +873,6 @@ verification subset (Apache-2.0 OR GPL-2.0-or-later; see
 Downloaded font parsing and rasterization use [FreeType 2.14.3](https://freetype.org/)
 under the FreeType License, and WOFF2 decoding uses [Brotli 1.2.1](https://github.com/google/brotli)
 under the MIT license. Source subsets, licenses, and port notes are in `third_party/`.
+
+The firmware's ACPI tables and AML run on [uACPI 6.1.1](https://github.com/uACPI/uACPI) by
+Daniil Tatianin and contributors, under the MIT license (`third_party/uacpi/LICENSE`).

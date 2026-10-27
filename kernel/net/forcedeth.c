@@ -222,6 +222,8 @@ static struct {
     uint32_t tx_next, tx_done;
     uint32_t linkspeed;
     int duplex, link_up, polls;
+    uint32_t power2;                    /* R_POWERSTATE2 with the PHY and MAC powered */
+    int irq;
     struct mii_phy phy;
     struct netdev dev;
 } fd;
@@ -655,6 +657,49 @@ static void start(void)
     start_tx();
 }
 
+/* Out of low power, our address in, pause frames off, the PHY's polling
+ * quiet: before looking for the PHY, at boot and after suspend. */
+static void wake_up(void)
+{
+    if (fd.flags & C_POWER)
+        wr(R_POWERSTATE2, fd.power2);
+    wr(R_WAKEUP, 0);
+    wr(R_IRQMASK, 0);
+    write_mac(fd.dev.mac);
+
+    /* Pause frames left on while the MAC sat idle (by the BIOS, or another
+     * OS before a warm reboot) can freeze it: off, then a transmitter start
+     * and stop recovers it, as Linux does. We never turn them on. */
+    if (fd.flags & C_PAUSE) {
+        wr(R_TXPAUSE, TXPAUSE_OFF);
+        wr(R_MISC1, rd(R_MISC1) & ~MISC1_PAUSE_TX);
+        start_tx();
+        stop_tx();
+    }
+
+    wr(R_MIIMASK, 0);
+    wr(R_ADAPTCTL, rd(R_ADAPTCTL) & ~ADAPTCTL_RUNNING);
+    wr(R_MIISTATUS, MIISTAT_MASK_ALL);
+}
+
+static void fd_suspend(void)
+{
+    wr(R_IRQMASK, 0);
+    stop_rx();
+    stop_tx();
+}
+
+/* The MAC and PHY lost everything: as at boot, from the power up. */
+static void fd_resume(void)
+{
+    wake_up();
+    if (mii_init(&fd.phy) < 0)
+        klog("%s: PHY %s did not reset after suspend\n", fd.dev.name, fd.phy.name);
+    start();
+    if (fd.irq >= 0)
+        wr(R_IRQMASK, fd.irqmask);
+}
+
 int forcedeth_init(void)
 {
     if (cmdline_has("forcedeth=off"))
@@ -696,30 +741,12 @@ int forcedeth_init(void)
     pci_enable(&pci, PCI_CMD_MEM | PCI_CMD_MASTER);
 
     if (fd.flags & C_POWER) {           /* the PHY and the MAC out of low power */
-        uint32_t ps = rd(R_POWERSTATE2) & ~POWER2_UP_MASK;
+        fd.power2 = rd(R_POWERSTATE2) & ~POWER2_UP_MASK;
         if ((id == 0x0268 || id == 0x0269) && rev >= 0xA3)
-            ps |= POWER2_UP_REV_A3;
-        wr(R_POWERSTATE2, ps);
+            fd.power2 |= POWER2_UP_REV_A3;
     }
-    wr(R_WAKEUP, 0);
-    wr(R_IRQMASK, 0);
     read_mac(fd.dev.mac);
-    write_mac(fd.dev.mac);
-
-    /* Pause frames left on while the MAC sat idle (by the BIOS, or another
-     * OS before a warm reboot) can freeze it: off, then a transmitter start
-     * and stop recovers it, as Linux does. We never turn them on. */
-    if (fd.flags & C_PAUSE) {
-        wr(R_TXPAUSE, TXPAUSE_OFF);
-        wr(R_MISC1, rd(R_MISC1) & ~MISC1_PAUSE_TX);
-        start_tx();
-        stop_tx();
-    }
-
-    /* Quiet the PHY polling while we look for the PHY. */
-    wr(R_MIIMASK, 0);
-    wr(R_ADAPTCTL, rd(R_ADAPTCTL) & ~ADAPTCTL_RUNNING);
-    wr(R_MIISTATUS, MIISTAT_MASK_ALL);
+    wake_up();
     fd.phy.read = mii_read;
     fd.phy.write = mii_write;
     fd.phy.nv_fix = (fd.flags & C_PHYFIX) != 0;
@@ -735,6 +762,9 @@ int forcedeth_init(void)
     fd.dev.irq = irq >= 0 ? (uint32_t)irq : 0;
     fd.dev.transmit = fd_transmit;
     fd.dev.poll = fd_poll;
+    fd.dev.suspend = fd_suspend;
+    fd.dev.resume = fd_resume;
+    fd.irq = irq;
     net_register(&fd.dev);
     if (irq >= 0) {
         irq_register(irq, fd_irq);

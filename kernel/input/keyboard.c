@@ -3,6 +3,13 @@
  * to bytes and VT100/xterm escape sequences and fed into the console tty, or,
  * while the desktop has /dev/input open, reported there as key events
  * that carry the same bytes.
+ *
+ * A laptop's Fn keys are the keyboard controller's business: volume,
+ * mute and the like arrive as the multimedia keys (E0-prefixed codes, to
+ * the desktop as KEY_VOLUMEUP and so on), brightness and suspend mostly
+ * through ACPI (power.c). The power and sleep keys, with no desktop to
+ * hear them, go to ACPI's handling of its buttons. Caps Lock's light
+ * follows Caps Lock.
  */
 #include "kernel.h"
 #include "arch.h"
@@ -38,8 +45,56 @@ static const char keymap_shift[128] = {
 #define SC_LALT   0x38
 #define SC_CAPS   0x3A
 #define SC_DEL    0x53
+#define SC_POWER  0x5E                  /* E0-prefixed */
+#define SC_SLEEP  0x5F
+
+#define KBD_ACK    0xFA
+#define KBD_RESEND 0xFE
+#define KBD_SET_LEDS 0xED
+#define LED_CAPS   0x04
 
 static int shift, ctrl, alt, caps, extended;
+static int e1_skip;                     /* Pause's E1 sequence: bytes still to come */
+volatile uint32_t keyboard_last_tick;
+
+/* Setting the lights is a command and a byte, each acknowledged; the
+ * acknowledgements arrive as interrupts, so it goes a step at a time. */
+static int led_step;                    /* 0 idle, 1 command sent, 2 value sent */
+static uint32_t led_tick;
+static uint8_t leds;
+
+static void kbd_write(uint8_t b)
+{
+    for (int i = 0; i < 100000 && (inb(0x64) & 0x02); i++)
+        ;
+    outb(0x60, b);
+}
+
+static void set_leds(void)
+{
+    leds = caps ? LED_CAPS : 0;
+    if (led_step && (int32_t)(ticks - led_tick) < HZ)
+        return;                         /* under way: the newest value goes with it */
+    led_step = 1;
+    led_tick = ticks;
+    kbd_write(KBD_SET_LEDS);
+}
+
+/* An acknowledgement or a resend request: 1 if it was for the lights. */
+static int led_answer(uint8_t b)
+{
+    if (!led_step)
+        return 0;
+    if (b == KBD_RESEND) {
+        kbd_write(led_step == 1 ? KBD_SET_LEDS : leds);
+    } else if (led_step == 1) {
+        led_step = 2;
+        kbd_write(leds);
+    } else {
+        led_step = 0;
+    }
+    return 1;
+}
 
 static int mods(void)
 {
@@ -118,9 +173,15 @@ void keyboard_key(uint8_t sc, int ext, int released)
 
 static void key(uint8_t sc, int ext, int released)
 {
+    if (!released && sc != SC_LSHIFT && sc != SC_RSHIFT && sc != SC_LCTRL && sc != SC_LALT)
+        keyboard_last_tick = ticks;
     if (ext) {
         if (sc == SC_LSHIFT || sc == SC_RSHIFT)
             return;                     /* fake shifts around nav keys */
+        if (!released && (sc == SC_POWER || sc == SC_SLEEP) && !input_grabbed()) {
+            acpi_button(sc == SC_SLEEP);
+            return;
+        }
         if (sc == SC_LCTRL)
             ctrl = !released;
         else if (sc == SC_LALT)
@@ -147,8 +208,10 @@ static void key(uint8_t sc, int ext, int released)
         key_event(sc, !released, "", 0);
         return;
     case SC_CAPS:
-        if (!released)
+        if (!released) {
             caps = !caps;
+            set_leds();
+        }
         return;
     }
 
@@ -198,6 +261,18 @@ static void keyboard_irq(struct trapframe *tf)
         return;                         /* nothing, or mouse data (IRQ12) */
     uint8_t sc = inb(0x60);
 
+    if (sc == KBD_ACK || sc == KBD_RESEND) {
+        led_answer(sc);                 /* not keys, whatever they answer */
+        return;
+    }
+    if (e1_skip) {
+        e1_skip--;
+        return;
+    }
+    if (sc == 0xE1) {
+        e1_skip = 5;                    /* Pause: E1 1D 45 E1 9D C5, no release */
+        return;
+    }
     if (sc == 0xE0) {
         extended = 1;
         return;
@@ -213,4 +288,26 @@ void keyboard_init(void)
     for (int i = 0; i < 64 && (inb(0x64) & 0x01); i++)
         (void)inb(0x60);
     irq_register(IRQ_KBD, keyboard_irq);
+}
+
+/* After suspend to RAM, from i8042_resume() with interrupts off: the
+ * keyboard scanning again, with its lights. */
+void keyboard_resume(void)
+{
+    extended = 0;
+    e1_skip = 0;
+    led_step = 0;
+    kbd_write(0xF4);                    /* enable scanning */
+    for (int i = 0; i < 1000 && !(inb(0x64) & 0x01); i++)
+        udelay(100);
+    if ((inb(0x64) & 0x21) == 0x01)
+        (void)inb(0x60);                /* its acknowledgement */
+    if (caps) {
+        kbd_write(KBD_SET_LEDS);
+        udelay(5000);
+        kbd_write(LED_CAPS);
+        udelay(5000);
+        for (int i = 0; i < 4 && (inb(0x64) & 0x01); i++)
+            (void)inb(0x60);
+    }
 }

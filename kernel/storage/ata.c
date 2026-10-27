@@ -64,6 +64,9 @@
 #define CMD_PACKET      0xA0
 #define CMD_ID_PACKET   0xA1
 #define CMD_IDENTIFY    0xEC
+#define CMD_STANDBY_NOW 0xE0
+#define CMD_SET_FEATURES 0xEF
+#define FEAT_XFER_MODE  0x03
 
 #define ATAPI_SECTOR 2048
 #define TIMEOUT      2000000
@@ -122,6 +125,7 @@ struct ata_dev {
     int atapi;
     int lba48;
     int dma_capable;                    /* IDENTIFY: a DMA mode is selected */
+    uint8_t xfer_mode;                  /* that mode, as SET FEATURES names it */
     int dma;                            /* use DMA for data transfers */
     int flush_ext;                      /* flush with FLUSH CACHE EXT */
     int no_flush;                       /* the drive rejects FLUSH CACHE */
@@ -749,6 +753,18 @@ static int dma_mode_selected(const uint16_t *id)
     return 0;
 }
 
+/* The DMA mode selected, as SET FEATURES' transfer mode code: 40h + n
+ * for Ultra DMA mode n, 20h + n for multiword DMA mode n; 0 for none. */
+static uint8_t selected_mode(const uint16_t *id)
+{
+    if (!dma_mode_selected(id))
+        return 0;
+    uint32_t udma = (id[88] >> 8) & 0x7F, mwdma = (id[63] >> 8) & 0x07;
+    if ((id[53] & (1 << 2)) && udma)
+        return (uint8_t)(0x40 | (31 - __builtin_clz(udma)));
+    return (uint8_t)(0x20 | (31 - __builtin_clz(mwdma)));
+}
+
 /* Give each channel its controller's bus-master registers, and enable DMA. */
 static void dma_init(void)
 {
@@ -894,6 +910,7 @@ void ata_init(void)
                          : d->lba48 && lba48 ? lba48 : lba28;
         }
         d->dma_capable = dma_mode_selected(id);
+        d->xfer_mode = selected_mode(id);
         blk_register(bd);
         if (d->atapi)
             boot_ok("%s: ATAPI %s, %s", bd->name, bd->model,
@@ -925,4 +942,72 @@ void ata_init(void)
         boot_ok("IDE: PIO only (ata.nodma)");
     else
         dma_init();
+}
+
+/* ---- suspend to RAM ---- */
+
+/* A command without data; 0 or -EIO. */
+static int simple_cmd(struct ata_dev *d, uint8_t cmd, uint8_t features, uint8_t count)
+{
+    select_drive(d, 0);
+    if (wait_not_busy(d) < 0)
+        return -EIO;
+    outb(d->io + REG_FEATURES, features);
+    outb(d->io + REG_COUNT, count);
+    arm(d);
+    outb(d->io + REG_COMMAND, cmd);
+    int st = wait_irq(d);
+    disarm(d);
+    return st < 0 || (st & (ST_ERR | ST_DF)) ? -EIO : 0;
+}
+
+/* The VFS lock is held, so no command is under way. The disks write back
+ * their caches and park their heads, as on a proper power-off. */
+void ata_suspend(void)
+{
+    for (int i = 0; i < MAX_DRIVES; i++) {
+        struct ata_dev *d = &drives[i];
+        if (!d->bd.name[0] || d->atapi)
+            continue;
+        ata_flush_cache(&d->bd);
+        simple_cmd(d, CMD_STANDBY_NOW, 0, 0);
+    }
+}
+
+/*
+ * The drives lost power: they start again in their default PIO mode,
+ * spinning up. The controller's timings came back with its PCI
+ * configuration (pci.c); each drive gets the DMA mode it had at boot,
+ * or, if it will not take it, goes on in PIO.
+ */
+void ata_resume(void)
+{
+    for (int c = 0; c < nchans; c++) {
+        struct ata_chan *ch = &chans[c];
+        if (!drives[2 * c].bd.name[0] && !drives[2 * c + 1].bd.name[0])
+            continue;
+        chan_reset(ch);
+        for (int t = 0; t < 300 && (inb(ch->io + REG_STATUS) & ST_BSY); t++)
+            mdelay(100);                /* up to 30 s to spin up */
+        if (ch->bm)
+            outb((uint16_t)(ch->bm + BM_STATUS), BM_ERR | BM_INTR);
+    }
+    uint16_t *id = kmalloc(512);
+    for (int i = 0; i < 2 * nchans; i++) {
+        struct ata_dev *d = &drives[i];
+        if (!d->bd.name[0])
+            continue;
+        if (d->atapi)
+            d->media_changed = 1;
+        if (!d->dma || !d->xfer_mode || !id)
+            continue;
+        if (identify(d, id) == 0 && selected_mode(id) == d->xfer_mode)
+            continue;
+        simple_cmd(d, CMD_SET_FEATURES, FEAT_XFER_MODE, d->xfer_mode);
+        if (identify(d, id) < 0 || selected_mode(id) != d->xfer_mode) {
+            klog("%s: DMA mode %02x lost after suspend; using PIO\n", d->bd.name, d->xfer_mode);
+            d->dma = 0;
+        }
+    }
+    kfree(id);
 }

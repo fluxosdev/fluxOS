@@ -55,10 +55,12 @@ uint32_t csum_pseudo(uint32_t src, uint32_t dst, uint8_t proto, uint32_t len)
 
 /* ---- Ethernet ---- */
 
+static int net_asleep;                  /* suspend to RAM: the card is not to be touched */
+
 static int eth_send(const uint8_t *dst_mac, uint16_t type, const void *payload, uint32_t len)
 {
     uint8_t frame[ETH_FRAME_MAX];
-    if (!netif.present || len > ETH_MTU)
+    if (!netif.present || net_asleep || len > ETH_MTU)
         return -ENETDOWN;
     struct eth_hdr *eh = (struct eth_hdr *)frame;
     memcpy(eh->dst, dst_mac, ETH_ALEN);
@@ -716,6 +718,37 @@ void net_init(void)
     dhcp.timeout = ticks;
 }
 
+/* ---- suspend to RAM ---- */
+
+void net_suspend(void)
+{
+    if (!netif.present)
+        return;
+    spin_lock(&net_lock);
+    net_asleep = 1;
+    spin_unlock(&net_lock);
+    if (netif.dev.suspend)
+        netif.dev.suspend();
+}
+
+/* The card back; and a new lease, as the machine may have been carried
+ * to another network while it slept. */
+void net_resume(void)
+{
+    if (!netif.present)
+        return;
+    if (netif.dev.resume)
+        netif.dev.resume();
+    spin_lock(&net_lock);
+    net_asleep = 0;
+    if (netif.use_dhcp) {
+        dhcp.state = DHCP_INIT;
+        dhcp.timeout = ticks;
+        dhcp.tries = 0;
+    }
+    spin_unlock(&net_lock);
+}
+
 int net_configure(const struct netinfo *ni)
 {
     if (!netif.present)
@@ -781,7 +814,7 @@ void net_tick(void)
         return;
     loop_tick();
     tcp_timer();
-    if ((uint32_t)(ticks - last_slow) >= HZ / 10 && netif.present) {
+    if ((uint32_t)(ticks - last_slow) >= HZ / 10 && netif.present && !net_asleep) {
         last_slow = ticks;
         if (netif.dev.poll)
             netif.dev.poll();

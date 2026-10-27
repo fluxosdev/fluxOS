@@ -88,6 +88,12 @@ int blk_rescan(struct blockdev *disk);
 void ata_init(void);
 void ahci_init(void);
 void floppy_init(void);
+/* Suspend to RAM, with the VFS lock held: caches flushed and the disks
+ * parked; then the controllers and drives set up again. */
+void ata_suspend(void);
+void ata_resume(void);
+void ahci_suspend(void);
+void ahci_resume(void);
 void floppy_start(void);                /* after the scheduler: needs a thread */
 void automount_start(void);             /* the thread that mounts media as they are inserted */
 

@@ -34,6 +34,9 @@ int fb_get_info(struct fbinfo *fi);
 int fb_map_user(void);
 void fb_proc_exit(int pid);             /* at exit and exec: the screen and GPU it held */
 int fb_pinned(int pid, uint32_t start, uint32_t end);  /* radeon_pinned, under the display lock */
+int fb_wake_mode(void);                 /* VESA mode to set on waking, 0 text, -1 none possible */
+void fb_suspend(void);                  /* holds the display lock until fb_resume() */
+void fb_resume(void);
 
 /* 3dfx Banshee/Voodoo3 display driver (voodoo.c) */
 void voodoo_init(void);
@@ -89,6 +92,8 @@ void opl_init(struct vnode *devdir);
 void hda_init(struct vnode *devdir);
 void hda_tick(void);
 int hda_get_info(struct sound_info *si);
+void hda_suspend(void);                 /* suspend to RAM: playback stopped */
+void hda_resume(void);                  /* the controller and codec set up again */
 int opl_present(void);                  /* 0, 2 (OPL2) or 3 (OPL3) */
 
 /* Console: VGA text mode or the framebuffer (a subset of ANSI escapes) */
@@ -120,10 +125,14 @@ int panic_screen(const char *msg);
 void serial_init(void);
 void serial_enable_irq(void);
 void serial_write(const char *buf, uint32_t len);
+void serial_resume(void);
 
-/* PS/2 keyboard and mouse */
+/* PS/2 keyboard and mouse, or touchpad (touchpad.c), on the i8042 */
 void keyboard_init(void);
 void mouse_init(void);
+void i8042_resume(void);                /* after suspend: both set up again */
+void keyboard_resume(void);             /* (from i8042_resume) */
+extern volatile uint32_t keyboard_last_tick;   /* when a key last went down (touchpad.c) */
 /* A key by its scancode set 1 code (extended: after an E0 prefix), from
  * the PS/2 or a USB keyboard. Called from interrupt handlers. */
 void keyboard_key(uint8_t sc, int extended, int released);
@@ -133,6 +142,11 @@ void usb_init(void);
 void usb_start(void);                   /* after the scheduler: the hotplug thread */
 void usb_tick(void);                    /* from the timer interrupt */
 int usb_info(int index, struct usbinfo *ui);
+/* Suspend to RAM: every device let go of and the controllers stopped;
+ * then set up again, and the devices found anew. */
+void usb_suspend(void);
+void usb_resume(void);
+int usbmsc_in_use(void);                /* a USB disk has a file system mounted */
 
 /*
  * Input events for the desktop (/dev/input). While that device is open,
@@ -146,11 +160,13 @@ void input_push(const struct input_event *ev);
 extern volatile uint32_t ticks;
 extern spinlock_t pit_lock;
 void pit_init(uint32_t hz);
+void pit_resume(void);
 void udelay(uint32_t us);               /* spins; works with interrupts off */
 void mdelay(uint32_t ms);               /* sleeps in a process, spins at boot */
 
 /* CMOS real-time clock */
 void rtc_init(void);
+void rtc_resync(void);                  /* after suspend: the time it is now */
 uint32_t rtc_boot_epoch(void);
 uint32_t time_now(void);
 void time_set(uint32_t now);
@@ -158,9 +174,17 @@ void time_set(uint32_t now);
 /* Power management */
 void machine_reboot(void) __attribute__((noreturn));
 int machine_poweroff(void);             /* returns only if it failed */
-void acpi_init(void);                   /* acpi.c: find the tables, at boot */
-void acpi_power_start(void);            /* acpi.c: the power button thread */
-void acpi_poweroff(void);               /* returns only if it failed */
 void machine_halt(void) __attribute__((noreturn));
+/* ACPI (kernel/acpi) */
+void acpi_init(void);                   /* the tables, at boot (after the timer) */
+void acpi_namespace_init(void);         /* the firmware's AML, once PCI is up */
+void acpi_power_start(void);            /* its threads and events, once processes run */
+void acpi_prepare_poweroff(void);       /* _PTS, before interrupts go off */
+void acpi_poweroff(void);               /* interrupts off; returns only if it failed */
+void acpi_button(int sleep);            /* the keyboard's power (0) or sleep (1) key, with no desktop */
+int power_syscall(uint32_t op, uint32_t arg);  /* SYS_power; arg checked by the caller */
+/* Suspend to RAM (sleep.c): 0 once the machine is back, or -errno. */
+int acpi_suspend(void);
+const char *acpi_sleep_blocker(void);   /* why suspend cannot be tried, or NULL */
 
 #endif

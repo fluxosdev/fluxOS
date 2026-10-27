@@ -191,3 +191,63 @@ void *pci_map_bar(const struct pci_dev *p, int bar)
 
     return vmm_map_mmio(base, size, PTE_PCD | PTE_PWT);
 }
+
+/* ---- suspend to RAM ---- */
+
+/*
+ * Devices lose their configuration with the power, and the firmware puts
+ * back only some of it. The standard header (the BARs, the command
+ * register, a bridge's bus numbers and windows) of every function is
+ * kept, and for IDE controllers their timing registers too (0x40-0x5F on
+ * Intel's and most others'), which the drives' DMA modes depend on.
+ * Bridges come before what is behind them, in the order they were found.
+ */
+#define MAX_SAVED 96
+#define IDE_DWORDS 8
+
+static struct saved_fn {
+    struct pci_dev d;
+    int ide;
+    uint32_t cfg[16 + IDE_DWORDS];
+} saved[MAX_SAVED];
+static int nsaved;
+
+static int save_fn(const struct pci_dev *p, const void *arg)
+{
+    (void)arg;
+    if (nsaved == MAX_SAVED)
+        return 1;
+    struct saved_fn *f = &saved[nsaved++];
+    f->d = *p;
+    for (int i = 0; i < 16; i++)
+        f->cfg[i] = pci_read32(p, i * 4);
+    f->ide = (f->cfg[2] >> 16) == 0x0101;
+    for (int i = 0; f->ide && i < IDE_DWORDS; i++)
+        f->cfg[16 + i] = pci_read32(p, 0x40 + i * 4);
+    return 0;
+}
+
+void pci_suspend(void)
+{
+    struct pci_dev unused;
+    nsaved = 0;
+    pci_scan(save_fn, NULL, &unused);
+}
+
+/* Interrupts off, before any driver touches its device again. Last to
+ * first, as Linux does, so the command register (decoding, bus mastering)
+ * comes after the BARs; only what changed is written. */
+void pci_resume(void)
+{
+    for (int n = 0; n < nsaved; n++) {
+        struct saved_fn *f = &saved[n];
+        if (pci_read32(&f->d, 0) != f->cfg[0])
+            continue;                   /* not there now */
+        for (int i = f->ide ? IDE_DWORDS - 1 : -1; i >= 0; i--)
+            if (pci_read32(&f->d, 0x40 + i * 4) != f->cfg[16 + i])
+                pci_write32(&f->d, 0x40 + i * 4, f->cfg[16 + i]);
+        for (int i = 15; i >= 1; i--)
+            if (pci_read32(&f->d, i * 4) != f->cfg[i])
+                pci_write32(&f->d, i * 4, f->cfg[i]);
+    }
+}

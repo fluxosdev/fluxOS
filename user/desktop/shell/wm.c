@@ -463,6 +463,8 @@ static struct rect tray_rect(void)
     int w = gfx_text_width(&font_sans, "88:88 PM") + 18;
     if (sound_tray_icon() != ICON_NONE)
         w += 20;                        /* the speaker */
+    if (power_tray_present())
+        w += 20;                        /* the battery */
     return mkrect(screen_w - 2 - w, screen_h - TASKBAR_H + 4, w, TASKBAR_H - 8);
 }
 
@@ -470,6 +472,15 @@ static struct rect tray_icon_rect(void)
 {
     struct rect tr = tray_rect();
     return mkrect(tr.x + 3, tr.y + (tr.h - 16) / 2, 16, 16);
+}
+
+/* The battery: after the speaker, if there is one. */
+static struct rect battery_icon_rect(void)
+{
+    struct rect r = tray_icon_rect();
+    if (sound_tray_icon() != ICON_NONE)
+        r.x += 20;
+    return power_tray_present() ? r : mkrect(r.x, r.y, 0, 0);
 }
 
 #define SB_BUTTON_W 22
@@ -483,9 +494,10 @@ static struct rect sidebar_button_rect(void)
     return mkrect(tr.x - 3 - SB_BUTTON_W, tr.y, SB_BUTTON_W, tr.h);
 }
 
+/* The tray may have grown or shrunk too: the whole taskbar. */
 void wm_tray_changed(void)
 {
-    wm_damage(tray_rect());
+    wm_damage(taskbar_rect());
 }
 
 /* Taskbar buttons are in creation order, which is kept in task_order. */
@@ -1243,6 +1255,8 @@ static void draw_taskbar_kinetik(void)
         struct rect ir = tray_icon_rect();
         draw_icon(&screen, ir.x, ir.y, speaker, 16);
     }
+    if (power_tray_present())
+        power_draw_tray(&screen, battery_icon_rect(), theme.on_chrome);
     int cw = gfx_text_width(&font_sans, clock_text);
     gfx_text(&screen, &font_sans, tr.x + tr.w - 9 - cw, tr.y + (tr.h - font_sans.height) / 2, clock_text,
              theme.on_chrome);
@@ -1409,6 +1423,8 @@ static void draw_taskbar(void)
         struct rect ir = tray_icon_rect();
         draw_icon(&screen, ir.x, ir.y, speaker, 16);
     }
+    if (power_tray_present())
+        power_draw_tray(&screen, battery_icon_rect(), C_BLACK);
     int cw = gfx_text_width(&font_sans, clock_text);
     gfx_text(&screen, &font_sans, tr.x + tr.w - 9 - cw, tr.y + 4, clock_text, C_BLACK);
 }
@@ -2345,6 +2361,10 @@ static void press_left(void)
             volume_open();
             return;
         }
+        if (rect_contains(battery_icon_rect(), mx, my)) {
+            power_open();
+            return;
+        }
         if (rect_contains(tray_rect(), mx, my)) {
             clock_open();
             return;
@@ -2745,6 +2765,16 @@ static void key_event(const struct input_event *ev)
             system_shutdown();          /* the power button: shut down cleanly */
         return;
     }
+    if (ev->code == KEY_SLEEP) {
+        if ((ev->flags & IEV_PRESSED) && !setup_mode)
+            system_sleep();             /* the sleep button or key */
+        return;
+    }
+    if (ev->code == KEY_VOLUMEUP || ev->code == KEY_VOLUMEDOWN || ev->code == KEY_MUTE) {
+        if (ev->flags & IEV_PRESSED)
+            sound_key(ev->code);
+        return;
+    }
     if (!(ev->flags & IEV_PRESSED)) {
         /* Releases only matter to a window that follows keys held down. */
         if (!menu_open && focused && focused->ops && focused->ops->key)
@@ -2844,6 +2874,17 @@ void wm_input(const struct input_event *ev)
         mouse_event(ev);
     else if (ev->type == IEV_KEY)
         key_event(ev);
+    else if (ev->type == IEV_POWER && !setup_mode)
+        power_event(ev);
+}
+
+/* Back from sleep: the screen's memory may have lost what was on it, and
+ * the adapter its pointer. */
+void wm_resumed(void)
+{
+    if (hw_cursor && load_cursor() < 0)
+        software_cursor();
+    wm_damage(mkrect(0, 0, screen_w, screen_h));
 }
 
 /* The shutdown screen: Kinetik Blue's wallpaper, whatever the theme, with

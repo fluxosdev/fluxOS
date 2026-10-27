@@ -2,6 +2,9 @@
  * Paging. Every address space shares the kernel half: the first GiB of
  * physical memory identity-mapped with 4 MiB global pages (supervisor
  * only), and device memory (the framebuffer) mapped at boot above 3 GiB.
+ * Above that is a window of 4 KiB pages for what is mapped later, such
+ * as ACPI's firmware memory: its page tables exist from the start, so
+ * every address space has them, and filling one in reaches them all.
  * The user half (1 GiB - 3 GiB) uses ordinary 4 KiB pages, and page
  * tables are reached through the identity map. User pages marked
  * PTE_MMIO map device memory, lent to one process: never freed, and
@@ -26,6 +29,11 @@
 
 uint32_t *kernel_pd;
 static uint32_t mmio_next = KERNEL_MMIO_BASE;
+
+#define LATE_PDES 4                     /* 16 MiB of late mappings */
+static uint32_t late_base, late_next;   /* the window, and its first unused page */
+static uint32_t *late_pt[LATE_PDES];
+static spinlock_t late_lock = SPINLOCK_INIT("vmm-late");
 
 /* The first page tables are made before fpu_init() enables SSE. */
 static void zero_page(uint32_t phys)
@@ -53,10 +61,44 @@ void paging_init(void)
     for (uint32_t i = 0; i < KERNEL_PDES; i++)
         kernel_pd[i] = (i << 22) | PTE_PRESENT | PTE_WRITE | PTE_LARGE | PTE_GLOBAL;
 
+    /* The late window, at the very top. */
+    late_base = late_next = 0u - LATE_PDES * 0x400000u;
+    for (int i = 0; i < LATE_PDES; i++) {
+        late_pt[i] = alloc_table();
+        if (!late_pt[i])
+            panic("paging: out of memory");
+        kernel_pd[PDE_INDEX(late_base) + (uint32_t)i] = (uint32_t)late_pt[i] | PTE_PRESENT | PTE_WRITE;
+    }
+
     write_cr4(read_cr4() | (1u << 4) | (1u << 7));      /* PSE, PGE */
     write_cr3((uint32_t)kernel_pd);
     /* PG, WP (honour read-only pages in ring 0); fpu_init() sets the FPU bits */
     write_cr0(read_cr0() | (1u << 31) | (1u << 16));
+}
+
+/*
+ * Map physical memory into the late window, at any time. Nothing was
+ * mapped there before, so no processor can have a stale translation
+ * (not-present entries are never cached) and none needs flushing. The
+ * mapping stays for good; callers keep what they map.
+ */
+void *vmm_map_late(uint32_t phys, uint32_t size, uint32_t flags)
+{
+    uint32_t base = ALIGN_DOWN(phys, PAGE_SIZE);
+    uint32_t end = ALIGN_UP(phys + size, PAGE_SIZE);
+    if (!size || end <= base)
+        return NULL;
+    spin_lock(&late_lock);
+    uint32_t va = late_next;
+    if (end - base > late_base + LATE_PDES * 0x400000u - va) {
+        spin_unlock(&late_lock);
+        return NULL;
+    }
+    late_next += end - base;
+    for (uint32_t pa = base, v = va; pa != end; pa += PAGE_SIZE, v += PAGE_SIZE)
+        late_pt[(v - late_base) >> 22][PTE_INDEX(v)] = pa | PTE_PRESENT | PTE_WRITE | PTE_GLOBAL | flags;
+    spin_unlock(&late_lock);
+    return (void *)(va + (phys - base));
 }
 
 void vmm_switch(uint32_t *pd)
@@ -86,7 +128,7 @@ void *vmm_map_mmio(uint32_t phys, uint32_t size, uint32_t flags)
     uint32_t base = ALIGN_DOWN(phys, 0x400000u);
     uint32_t end = ALIGN_UP(phys + size, 0x400000u);
     uint32_t va = mmio_next;
-    if (end - base > 0u - va)
+    if (end - base > late_base - va)
         return NULL;
     for (uint32_t pa = base; pa != end; pa += 0x400000u, mmio_next += 0x400000u)
         kernel_pd[PDE_INDEX(mmio_next)] = pa | PTE_PRESENT | PTE_WRITE | PTE_LARGE | PTE_GLOBAL | flags;

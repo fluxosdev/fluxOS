@@ -61,3 +61,12 @@ void serial_write(const char *buf, uint32_t len)
         serial_putc(buf[i]);
     }
 }
+
+/* After suspend to RAM: the UART forgot its settings. */
+void serial_resume(void)
+{
+    int was = serial_ok;
+    serial_init();
+    if (was && serial_ok && irq_registered(IRQ_COM1))
+        outb(COM1 + 1, 0x01);
+}

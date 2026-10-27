@@ -491,6 +491,7 @@ struct opl_write {
 /* ---- input events, read from /dev/input ---- */
 #define IEV_KEY   1
 #define IEV_MOUSE 2
+#define IEV_POWER 3             /* code: PEV_*; the kernel's power news */
 
 #define IEV_PRESSED 0x1         /* key: pressed (else released) */
 #define IEV_ABS     0x2         /* mouse: x, y are a position in 0..32767 */
@@ -524,7 +525,31 @@ struct opl_write {
 #define KEY_LWIN  0xDB
 #define KEY_RWIN  0xDC
 #define KEY_MENU  0xDD
-#define KEY_POWER 0xDE          /* the ACPI power button (sent by the kernel) */
+#define KEY_POWER 0xDE          /* the power button (the keyboard's, or ACPI's from the kernel) */
+#define KEY_SLEEP 0xDF          /* the sleep button or key (likewise) */
+#define KEY_WAKE  0xE3
+/* Laptop and multimedia keys (Fn combinations send most of these) */
+#define KEY_MUTE       0xA0
+#define KEY_CALC       0xA1
+#define KEY_PLAYPAUSE  0xA2
+#define KEY_STOPCD     0xA4
+#define KEY_VOLUMEDOWN 0xAE
+#define KEY_VOLUMEUP   0xB0
+#define KEY_WWW        0xB2
+#define KEY_PREVSONG   0x90
+#define KEY_NEXTSONG   0x99
+#define KEY_MAIL       0xEC
+#define KEY_COMPUTER   0xEB
+
+/* IEV_POWER codes; x carries a value where noted */
+#define PEV_LID_CLOSED  1
+#define PEV_LID_OPENED  2
+#define PEV_RESUMED     3       /* back from suspend: the screen may need repainting */
+#define PEV_STATUS      4       /* the AC adapter or a battery changed: read SYS_power */
+#define PEV_BATTERY_LOW 5       /* x: percent left */
+#define PEV_BATTERY_CRITICAL 6  /* the firmware says so: shut down now */
+#define PEV_BRIGHTNESS  7       /* a brightness key: x is the new percentage */
+#define PEV_THERMAL_CRITICAL 8  /* too hot: shut down now */
 
 struct input_event {
     uint8_t  type;              /* IEV_KEY or IEV_MOUSE */
@@ -606,6 +631,57 @@ struct netinfo {
     uint32_t rx_packets, tx_packets, rx_bytes, tx_bytes;
     uint32_t rx_errors, tx_errors, rx_dropped;
     uint32_t lease_secs;        /* DHCP lease time left */
+};
+
+/* ---- power: batteries, AC adapter, lid, sleep and backlight (SYS_power) ---- */
+#define POWER_INFO       0      /* arg: struct powerinfo * to fill */
+#define POWER_SLEEP      1      /* suspend to RAM; returns once the machine is back */
+#define POWER_BRIGHTNESS 2      /* arg: a percentage, or BRIGHTNESS_UP or _DOWN */
+
+#define BRIGHTNESS_UP   0x101   /* one step */
+#define BRIGHTNESS_DOWN 0x102
+
+#define PWR_ACPI       0x001    /* the firmware's methods are running */
+#define PWR_AC_KNOWN   0x002    /* there is an AC adapter to ask */
+#define PWR_AC_ONLINE  0x004    /* running on mains power */
+#define PWR_LID        0x008    /* there is a lid */
+#define PWR_LID_CLOSED 0x010
+#define PWR_CAN_SLEEP  0x020    /* suspend to RAM can be tried */
+#define PWR_BACKLIGHT  0x040    /* brightness can be set */
+#define PWR_THERMAL    0x080    /* temp is a reading */
+
+#define BAT_DISCHARGING 0x1     /* battery_info.state, as the firmware's _BST has it */
+#define BAT_CHARGING    0x2
+#define BAT_CRITICAL    0x4
+
+#define MAX_BATTERIES 2
+
+struct battery_info {
+    uint8_t  present;
+    uint8_t  state;             /* BAT_* */
+    uint8_t  percent;           /* of the last full charge, 0-100 */
+    uint8_t  mwh;               /* capacities in mWh (rate in mW); else mAh (mA) */
+    uint32_t remaining;         /* capacity left */
+    uint32_t full;              /* capacity when last full */
+    uint32_t design;            /* capacity when new */
+    uint32_t rate;              /* charge or discharge rate; 0 if unknown */
+    uint32_t voltage;           /* mV; 0 if unknown */
+    int32_t  minutes;           /* to empty, or to full while charging; -1 if unknown */
+    char     model[16];
+    char     tech[8];           /* "LION", "NiMH", ... */
+};
+
+struct powerinfo {
+    uint32_t flags;             /* PWR_* */
+    uint8_t  nbatteries;
+    uint8_t  brightness;        /* percent, with PWR_BACKLIGHT */
+    uint8_t  nlevels;           /* brightness steps */
+    uint8_t  reserved;
+    int32_t  temp;              /* tenths of a degree Celsius, with PWR_THERMAL */
+    int32_t  temp_crit;         /* the firmware's critical temperature, or 0 */
+    uint32_t sleeps;            /* times resumed from suspend since boot */
+    char     nosleep[48];       /* without PWR_CAN_SLEEP: why not */
+    struct battery_info bat[MAX_BATTERIES];
 };
 
 /* timer frequency; SYS_uptime reports milliseconds */

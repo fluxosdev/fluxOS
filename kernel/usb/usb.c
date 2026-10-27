@@ -33,6 +33,7 @@ static int kusbd_chan;
 static volatile int kusbd_kicked;
 static int started;
 static int in_callback;                 /* a completion callback is running */
+static int suspended;                   /* suspend to RAM: the controllers are not to be touched */
 
 spinlock_t usb_lock = SPINLOCK_INIT("usb");
 
@@ -648,6 +649,10 @@ static void kusbd(void)
         kusbd_kicked = 0;
         current->sig_pending = 0;
         spin_lock(&usb_lock);
+        if (suspended) {
+            spin_unlock(&usb_lock);
+            continue;
+        }
         /* Hub devices report changes; every few seconds look anyway. */
         int all = (int32_t)(ticks - last_full) >= 3 * HZ;
         if (all)
@@ -665,6 +670,10 @@ void usb_tick(void)
 {
     if (!hcs || !spin_trylock(&usb_lock))
         return;
+    if (suspended) {
+        spin_unlock(&usb_lock);
+        return;
+    }
     for (struct usb_hc *hc = hcs; hc; hc = hc->next)
         hc->ops->poll(hc);
     usbhid_tick();
@@ -694,6 +703,50 @@ void usb_start(void)
     started = 1;
     if (hcs)
         proc_spawn_kthread("kusbd", kusbd);
+}
+
+/* ---- suspend to RAM ---- */
+
+/*
+ * Every device goes, as if unplugged (their drivers let go of them), and
+ * the controllers stop. The power then goes from the controllers, so
+ * coming back they are set up from the start and the hotplug thread
+ * finds the devices again, EHCI first so it hands its full- and
+ * low-speed devices to its companions as at boot.
+ */
+void usb_suspend(void)
+{
+    if (!hcs)
+        return;
+    spin_lock(&usb_lock);
+    for (struct usb_hc *hc = hcs; hc; hc = hc->next) {
+        for (int port = 1; port <= hc->root.nports && port <= USB_MAX_PORTS; port++) {
+            struct usb_dev *child = hc->root.child[port];
+            hc->root.child[port] = NULL;
+            if (child)
+                usb_disconnect(child);
+        }
+    }
+    for (struct usb_hc *hc = hcs; hc; hc = hc->next)
+        if (hc->ops->suspend)
+            hc->ops->suspend(hc);
+    suspended = 1;
+    spin_unlock(&usb_lock);
+}
+
+void usb_resume(void)
+{
+    if (!hcs)
+        return;
+    spin_lock(&usb_lock);
+    for (struct usb_hc *hc = hcs; hc; hc = hc->next) {
+        if (hc->ops->resume)
+            hc->ops->resume(hc);
+        memset(hc->root.failed, 0, sizeof(hc->root.failed));
+    }
+    suspended = 0;
+    spin_unlock(&usb_lock);
+    usb_kick();
 }
 
 /* ---- usbinfo(2) ---- */

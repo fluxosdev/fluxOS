@@ -220,6 +220,10 @@ struct usb_hc_ops {
     void (*dev_free)(struct usb_hc *hc, struct usb_dev *dev);
     /* After a halt was cleared: the endpoint starts again with DATA0. */
     void (*ep_reset)(struct usb_hc *hc, struct usb_dev *dev, struct usb_ep *ep);
+    /* Suspend to RAM, with no devices left: stop; then, the power having
+     * gone, take the controller from the BIOS and set it up again. */
+    void (*suspend)(struct usb_hc *hc);
+    void (*resume)(struct usb_hc *hc);
 };
 
 struct usb_hc {

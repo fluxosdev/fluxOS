@@ -36,7 +36,7 @@ static irq_handler_t irq_handlers[16][IRQ_SHARED];
 
 extern uint32_t isr_stub_table[48];
 extern void isr128(void);
-extern void isr240(void), isr241(void), isr242(void), isr243(void), isr255(void);
+extern void isr240(void), isr241(void), isr242(void), isr243(void), isr244(void), isr255(void);
 void idt_load(struct idt_ptr *p);
 
 static const char *exception_names[32] = {
@@ -78,6 +78,28 @@ static void pic_remap(void)
 
 static spinlock_t pic_lock = SPINLOCK_INIT("pic");
 
+/* What the 8259s had before suspend to RAM: their masks, and the
+ * edge/level control registers, which the firmware need not restore. */
+static uint8_t saved_mask[2], saved_elcr[2];
+
+void pic_suspend(void)
+{
+    saved_mask[0] = inb(PIC1_DATA);
+    saved_mask[1] = inb(PIC2_DATA);
+    saved_elcr[0] = inb(0x4D0);
+    saved_elcr[1] = inb(0x4D1);
+}
+
+/* Interrupts off: the firmware set the PICs up for real mode again. */
+void pic_resume(void)
+{
+    pic_remap();
+    outb(0x4D0, saved_elcr[0] & 0xF8);      /* IRQs 0-2 are always edge */
+    outb(0x4D1, saved_elcr[1] & 0xDE);      /* and so are 8 and 13 */
+    outb(PIC1_DATA, saved_mask[0]);
+    outb(PIC2_DATA, saved_mask[1]);
+}
+
 void irq_unmask(int irq)
 {
     uint16_t port = irq < 8 ? PIC1_DATA : PIC2_DATA;
@@ -118,6 +140,7 @@ void idt_init(void)
     idt_set(VEC_TICK, (uint32_t)isr241, 0x8E);
     idt_set(VEC_TLB, (uint32_t)isr242, 0x8E);
     idt_set(VEC_STOP, (uint32_t)isr243, 0x8E);
+    idt_set(VEC_PARK, (uint32_t)isr244, 0x8E);
     idt_set(VEC_SPURIOUS, (uint32_t)isr255, 0x8E);
 
     idt_desc.limit = sizeof(idt) - 1;
@@ -218,6 +241,9 @@ void trap(struct trapframe *tf)
         return;
     case VEC_STOP:
         smp_stopped();
+    case VEC_PARK:
+        smp_park();
+        return;
     case VEC_SPURIOUS:
         return;
     }

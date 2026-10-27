@@ -356,13 +356,25 @@ static int find_isa(uint32_t *irq)
     return -1;
 }
 
+static int ne_pci;                      /* found on PCI */
+
+/* After suspend to RAM: reset, and our settings again. */
+static void ne_resume(void)
+{
+    spin_lock(&net_lock);
+    if (ne_reset(ne_pci) == 0)
+        ne_start();
+    spin_unlock(&net_lock);
+}
+
 int ne2000_init(void)
 {
     if (cmdline_has("ne2k.off"))
         return -1;
     const char *name = "ISA NE2000";
     uint32_t irq;
-    if (find_pci(&name, &irq) < 0 && find_isa(&irq) < 0)
+    ne_pci = find_pci(&name, &irq) == 0;
+    if (!ne_pci && find_isa(&irq) < 0)
         return -1;
     if (irq >= 16)
         return -1;
@@ -372,6 +384,7 @@ int ne2000_init(void)
     dev.io_base = io;
     dev.irq = irq;
     dev.transmit = ne_transmit;
+    dev.resume = ne_resume;
     net_register(&dev);
     irq_register((int)irq, ne_irq);
     boot_ok("Network: %s at I/O %04x, IRQ %u, MAC %02x:%02x:%02x:%02x:%02x:%02x%s",

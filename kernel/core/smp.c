@@ -81,6 +81,9 @@ uint32_t ap_stack_top;                  /* trampoline.S takes its stack from her
 static volatile int ap_index;           /* the processor starting */
 static volatile int ap_abort;           /* one did not start in time: stop if it ever does */
 
+static volatile int unparking;          /* ap_main() goes back to a parked state */
+static struct cpu_context park_ctx[MAX_CPUS];
+static uint8_t unpark_stack[4096] __attribute__((aligned(16)));
 extern char ap_trampoline[], ap_trampoline_end[];
 void ap_main(void) __attribute__((noreturn));
 
@@ -290,6 +293,8 @@ static void cmos_write(uint8_t reg, uint8_t val)
     outb(0x71, val);
 }
 
+static int wake_ap(struct cpu *c, uint32_t stack_top);
+
 /* Wake the processor with this APIC ID as cpus[ncpus]; 0 if it does not answer. */
 static int start_ap(uint8_t apic_id)
 {
@@ -309,10 +314,21 @@ static int start_ap(uint8_t apic_id)
     c->idle = idle;
     c->pd = kernel_pd;
     c->slice = QUANTUM;
-    ap_index = i;
-    ap_stack_top = (uint32_t)stack + KSTACK_SIZE;
+    if (!wake_ap(c, (uint32_t)stack + KSTACK_SIZE)) {
+        ap_abort = 1;                   /* (its stack stays: it might still come) */
+        return 0;
+    }
+    ncpus++;
+    return 1;
+}
 
-    /* INIT, then two startup IPIs, as the MultiProcessor Specification has it. */
+/* INIT, then two startup IPIs, as the MultiProcessor Specification has it,
+ * into trampoline.S and ap_main() on the stack given. 1 once it is up. */
+static int wake_ap(struct cpu *c, uint32_t stack_top)
+{
+    uint8_t apic_id = c->apic_id;
+    ap_index = c->index;
+    ap_stack_top = stack_top;
     lapic_write(LAPIC_ESR, 0);
     lapic_ipi(apic_id, ICR_LEVEL | ICR_ASSERT | DM_INIT);
     lapic_wait_icr();
@@ -328,12 +344,23 @@ static int start_ap(uint8_t apic_id)
     }
     for (int t = 0; t < 10000 && !c->online; t++)       /* up to a second */
         udelay(100);
-    if (!c->online) {
-        ap_abort = 1;                   /* (its stack stays: it might still come) */
-        return 0;
-    }
-    ncpus++;
-    return 1;
+    return c->online;
+}
+
+/* The trampoline below 1 MiB, and the warm reset vector (shutdown code
+ * 0Ah: jump to 40:67), which the oldest APICs start through instead. */
+static void trampoline_in(void)
+{
+    memcpy(low(TRAMP_BASE), ap_trampoline, (size_t)(ap_trampoline_end - ap_trampoline));
+    cmos_write(0x0F, 0x0A);
+    *(volatile uint16_t *)low(0x467) = 0;
+    *(volatile uint16_t *)low(0x469) = TRAMP_BASE >> 4;
+}
+
+static void trampoline_out(void)
+{
+    cmos_write(0x0F, 0);                /* a reset POSTs as usual again */
+    *(volatile uint32_t *)low(0x467) = 0;
 }
 
 void smp_start(void)
@@ -356,12 +383,7 @@ void smp_start(void)
             max = 1;
     }
 
-    memcpy(low(TRAMP_BASE), ap_trampoline, (size_t)(ap_trampoline_end - ap_trampoline));
-    /* The warm reset vector (shutdown code 0Ah: jump to 40:67), which the
-     * oldest APICs start through instead. */
-    cmos_write(0x0F, 0x0A);
-    *(volatile uint16_t *)low(0x467) = 0;
-    *(volatile uint16_t *)low(0x469) = TRAMP_BASE >> 4;
+    trampoline_in();
 
     for (int i = 0; i < napic && ncpus < max; i++) {
         if (apic_ids[i] == boot->apic_id)
@@ -372,8 +394,7 @@ void smp_start(void)
         }
     }
 
-    cmos_write(0x0F, 0);                /* a reset POSTs as usual again */
-    *(volatile uint32_t *)low(0x467) = 0;
+    trampoline_out();
     if (ncpus > 1)
         boot_ok("SMP: %d processors running", ncpus);
     else
@@ -395,6 +416,8 @@ void ap_main(void)
     cpu_init_ap();
     fpu_init_cpu();
     lapic_setup(0);
+    if (unparking)
+        context_restore(&park_ctx[c->index]);  /* back into smp_park() */
     c->proc = c->idle;
     __atomic_store_n(&c->online, 1, __ATOMIC_RELEASE);
     /* The idle loop: interrupts call schedule() (idt.c). */
@@ -512,4 +535,74 @@ void smp_stopped(void)
 {
     for (;;)
         __asm__ volatile("cli; hlt" ::: "memory");
+}
+
+/* ---- suspend to RAM ---- */
+
+/*
+ * VEC_PARK, with interrupts off. Whatever ran here is left as it was,
+ * its state on its stack and the processor's in park_ctx; the processor
+ * halts with its caches written back. smp_unpark_others() starts it
+ * again, through ap_main(), which puts it back here to return from the
+ * interrupt.
+ */
+void smp_park(void)
+{
+    lapic_eoi();
+    fpu_suspend_cpu();
+    if (context_save(&park_ctx[this_cpu()->index])) {
+        __atomic_store_n(&this_cpu()->online, 1, __ATOMIC_RELEASE);
+        return;                         /* back where the interrupt came */
+    }
+    __asm__ volatile("wbinvd" ::: "memory");
+    __atomic_store_n(&this_cpu()->online, 0, __ATOMIC_RELEASE);
+    for (;;)
+        __asm__ volatile("cli; hlt" ::: "memory");
+}
+
+/* Park every other processor. If one does not stop within a second (it
+ * cannot be holding a spinlock, which would only delay the interrupt),
+ * the rest are started again: then -1. */
+int smp_park_others(void)
+{
+    if (ncpus < 2)
+        return 0;
+    struct cpu *self = this_cpu();
+    for (int i = 0; i < ncpus; i++)
+        if (&cpus[i] != self)
+            send_ipi(&cpus[i], VEC_PARK);
+    for (int i = 0; i < ncpus; i++) {
+        for (int t = 0; &cpus[i] != self && __atomic_load_n(&cpus[i].online, __ATOMIC_ACQUIRE); t++) {
+            if (t == 100000) {
+                klog("smp: processor %d did not stop for suspend\n", i);
+                smp_unpark_others();
+                return -1;
+            }
+            smp_tlb_check();
+            udelay(10);
+        }
+    }
+    return 0;
+}
+
+/* Interrupts off, on the boot processor: its local APIC again (the power
+ * went), and the parked processors back to work. */
+void smp_unpark_others(void)
+{
+    if (!lapic)
+        return;
+    lapic_setup(1);
+    struct cpu *self = this_cpu();
+    trampoline_in();
+    unparking = 1;
+    for (int i = 0; i < ncpus; i++) {
+        struct cpu *c = &cpus[i];
+        if (c == self || c->online)
+            continue;
+        /* The stack only until context_restore() leaves it: one at a time. */
+        if (!wake_ap(c, (uint32_t)unpark_stack + sizeof(unpark_stack)))
+            klog("smp: processor %d did not come back from suspend\n", i);
+    }
+    unparking = 0;
+    trampoline_out();
 }

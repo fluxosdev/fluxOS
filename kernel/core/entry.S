@@ -38,7 +38,7 @@ ISR_NOERR \num
 ISR_NOERR 128
 
 /* Interrupts between processors, and the local APIC's spurious one (smp.h). */
-.irp num, 240,241,242,243,255
+.irp num, 240,241,242,243,244,255
 ISR_NOERR \num
 .endr
 
@@ -119,6 +119,86 @@ tss_flush:
     movl 4(%esp), %eax
     ltr %ax
     ret
+
+/*
+ * A processor's state across a power cut (suspend to RAM): what it needs
+ * to go on where it left off, as setjmp() keeps it, plus the control and
+ * descriptor table registers. Offsets as in struct cpu_context (arch.h).
+ */
+#define C_EBX    0
+#define C_ESI    4
+#define C_EDI    8
+#define C_EBP    12
+#define C_ESP    16
+#define C_EIP    20
+#define C_CR0    24
+#define C_CR3    28
+#define C_CR4    32
+#define C_EFLAGS 36
+#define C_GDT    40
+#define C_IDT    48
+
+/* int context_save(struct cpu_context *): 0, and 1 when context_restore()
+ * comes back here. */
+.global context_save
+context_save:
+    movl 4(%esp), %eax
+    movl %ebx, C_EBX(%eax)
+    movl %esi, C_ESI(%eax)
+    movl %edi, C_EDI(%eax)
+    movl %ebp, C_EBP(%eax)
+    leal 4(%esp), %ecx              /* the stack once this returns */
+    movl %ecx, C_ESP(%eax)
+    movl (%esp), %ecx
+    movl %ecx, C_EIP(%eax)
+    movl %cr0, %ecx
+    movl %ecx, C_CR0(%eax)
+    movl %cr3, %ecx
+    movl %ecx, C_CR3(%eax)
+    movl %cr4, %ecx
+    movl %ecx, C_CR4(%eax)
+    pushfl
+    popl C_EFLAGS(%eax)
+    sgdt C_GDT(%eax)
+    sidt C_IDT(%eax)
+    xorl %eax, %eax
+    ret
+
+/*
+ * void context_restore(struct cpu_context *): back to where context_save()
+ * was, from 32-bit protected mode with paging on or off (the kernel's
+ * addresses are its physical ones). The task register is the caller's
+ * to load again.
+ */
+.global context_restore
+context_restore:
+    movl 4(%esp), %eax
+    movl C_CR4(%eax), %ecx
+    movl %ecx, %cr4
+    movl C_CR3(%eax), %ecx
+    movl %ecx, %cr3
+    movl C_CR0(%eax), %ecx
+    movl %ecx, %cr0
+    jmp 1f
+1:  lgdt C_GDT(%eax)
+    lidt C_IDT(%eax)
+    ljmp $0x08, $2f
+2:  movw $0x10, %cx
+    movw %cx, %ds
+    movw %cx, %es
+    movw %cx, %fs
+    movw %cx, %gs
+    movw %cx, %ss
+    movl C_ESP(%eax), %esp
+    movl C_EBX(%eax), %ebx
+    movl C_ESI(%eax), %esi
+    movl C_EDI(%eax), %edi
+    movl C_EBP(%eax), %ebp
+    pushl C_EFLAGS(%eax)
+    popfl
+    movl C_EIP(%eax), %ecx
+    movl $1, %eax
+    jmp *%ecx
 
 /* void idt_load(struct idt_ptr *) */
 .global idt_load

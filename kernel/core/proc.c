@@ -68,7 +68,7 @@ static void make_ready(struct proc *p)
     }
     p->state = P_READY;
     p->ready_tick = ticks;
-    if (!smp_wake_idle(p->last_cpu))
+    if (!smp_wake_idle(p->pin_cpu >= 0 ? p->pin_cpu : p->last_cpu))
         this_cpu()->resched = 1;
 }
 
@@ -107,6 +107,7 @@ static struct proc *proc_alloc(void)
         p->pd = kernel_pd;
         p->fpu_cpu = -1;
         p->last_cpu = -1;
+        p->pin_cpu = -1;
         p->start_tick = ticks;
         spin_unlock(&sched_lock);
         return p;
@@ -157,7 +158,7 @@ static struct proc *pick_ready(struct cpu *c, struct proc *prev)
     int start = prev == c->idle ? 0 : (int)(prev - procs);
     for (int i = 1; i <= MAX_PROCS; i++) {
         struct proc *p = &procs[(start + i) % MAX_PROCS];
-        if (p != &procs[0] && p->state == P_READY) {
+        if (p != &procs[0] && p->state == P_READY && (p->pin_cpu < 0 || p->pin_cpu == c->index)) {
             if (ncpus == 1 || (uint32_t)(ticks - p->ready_tick) >= QUANTUM)
                 return p;
             if (!first)
@@ -461,6 +462,23 @@ void proc_spawn_kthread(const char *name, void (*fn)(void))
     spin_lock(&sched_lock);
     make_ready(p);
     spin_unlock(&sched_lock);
+}
+
+/* Run only on processor cpu from now on (or anywhere, for -1), moving
+ * there first. A processor that is not running stays where it is. */
+void proc_pin(int cpu)
+{
+    if (cpu >= ncpus)
+        cpu = -1;
+    current->pin_cpu = cpu;
+    while (cpu >= 0) {
+        uint32_t flags = irq_save();
+        int here = this_cpu()->index;
+        irq_restore(flags);
+        if (here == cpu)
+            break;
+        schedule();
+    }
 }
 
 int do_fork(void)

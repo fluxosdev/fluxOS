@@ -27,13 +27,25 @@ static void timer_irq(struct trapframe *tf)
     net_tick();
 }
 
-void pit_init(uint32_t hz)
+static void pit_program(uint32_t hz)
 {
     uint32_t divisor = PIT_FREQ / hz;
     outb(0x43, 0x36);                   /* channel 0, lo/hi, mode 3 */
     outb(0x40, divisor & 0xFF);
     outb(0x40, (divisor >> 8) & 0xFF);
+}
+
+void pit_init(uint32_t hz)
+{
+    pit_program(hz);
     irq_register(IRQ_TIMER, timer_irq);
+}
+
+/* After suspend to RAM, with interrupts off: the firmware left the PIT at
+ * its own rate. */
+void pit_resume(void)
+{
+    pit_program(HZ);
 }
 
 spinlock_t pit_lock = SPINLOCK_INIT("pit");      /* port 43h: the timer and the speaker */
@@ -109,7 +121,8 @@ static uint32_t days_from_civil(int y, int m, int d)
     return (uint32_t)(era * 146097 + doe - 719468);
 }
 
-void rtc_init(void)
+/* The RTC's time, in seconds since 1970. */
+static uint32_t rtc_read(void)
 {
     /* Wait for any update in progress to finish. */
     for (int i = 0; i < 100000 && (cmos_read(0x0A) & 0x80); i++)
@@ -130,8 +143,18 @@ void rtc_init(void)
         hour = ((hour & 0x7F) + 12) % 24;
     year += 2000;
 
-    boot_epoch = days_from_civil(year, mon, day) * 86400u +
-                 (uint32_t)(hour * 3600 + min * 60 + sec);
+    return days_from_civil(year, mon, day) * 86400u + (uint32_t)(hour * 3600 + min * 60 + sec);
+}
+
+void rtc_init(void)
+{
+    boot_epoch = rtc_read();
+}
+
+/* After suspend to RAM: the RTC kept time, the tick count did not. */
+void rtc_resync(void)
+{
+    boot_epoch = rtc_read() - ticks / HZ;
 }
 
 uint32_t rtc_boot_epoch(void)
@@ -215,6 +238,7 @@ void machine_reboot(void)
 int machine_poweroff(void)
 {
     uint32_t flags = read_eflags();
+    acpi_prepare_poweroff();            /* the firmware's _PTS, which may want interrupts */
     cli();
     acpi_poweroff();
     /* Emulators whose tables we could not use answer at fixed ports. */

@@ -914,6 +914,14 @@ static int sys_usbinfo(uint32_t idx, uint32_t ubuf, uint32_t c, uint32_t d, uint
     return usb_info((int)idx, (struct usbinfo *)ubuf);
 }
 
+static int sys_power(uint32_t op, uint32_t arg, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    if (op == POWER_INFO && user_check((void *)arg, sizeof(struct powerinfo)) < 0)
+        return -EFAULT;
+    return power_syscall(op, arg);
+}
+
 /* ---- system information ---- */
 
 static int sys_time(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
@@ -1179,6 +1187,7 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_display] = sys_display,
     [SYS_ioctl] = sys_ioctl,
     [SYS_usbinfo] = sys_usbinfo,
+    [SYS_power] = sys_power,
     [SYS_stime] = sys_stime,
     [SYS_llseek] = sys_llseek,
 };

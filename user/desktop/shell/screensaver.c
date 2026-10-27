@@ -194,11 +194,16 @@ int saver_active(void)
 /* Called with every input event; returns 1 if it only woke the screen up. */
 int saver_input(const struct input_event *ev)
 {
+    /* The kernel's power news is not the user: only opening the lid or
+     * waking up wakes the screen too, and the rest still gets handled. */
+    if (ev->type == IEV_POWER && ev->code != PEV_LID_OPENED && ev->code != PEV_RESUMED)
+        return 0;
     last_input = now_ms();
     if (!active)
         return 0;
     stop();
-    return ev->type == IEV_KEY && ev->code == KEY_POWER ? 0 : 1;
+    return (ev->type == IEV_KEY && (ev->code == KEY_POWER || ev->code == KEY_SLEEP)) ||
+           ev->type == IEV_POWER ? 0 : 1;
 }
 
 /* Milliseconds until saver_frame has something to do, or -1. */

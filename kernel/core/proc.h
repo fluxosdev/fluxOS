@@ -50,6 +50,7 @@ struct proc {
     uint32_t start_tick;
     uint32_t ready_tick;         /* affinity yields to tasks waiting a full quantum */
     int last_cpu;               /* soft affinity, -1 until first scheduled */
+    int pin_cpu;                /* runs only there, or -1 (proc_pin) */
     char name[32];
     int fpu_used;               /* has FPU registers (in fpu, or in the FPU) */
     int fpu_cpu;                /* the processor whose FPU last loaded them, or -1 */
@@ -76,6 +77,7 @@ static inline struct proc *get_current(void)
 void proc_init(void);
 void proc_spawn_init(const char *path);
 void proc_spawn_kthread(const char *name, void (*fn)(void));
+void proc_pin(int cpu);                 /* keep the caller to one processor (-1: any) */
 void schedule(void);
 void preempt(void);                     /* from a trap's way out (idt.c) */
 void proc_tick(void);                   /* the timer, on the boot processor */
@@ -153,5 +155,6 @@ void fpu_trap(void);
 void fpu_switch(struct proc *prev, struct proc *next);
 void fpu_fork(struct proc *child);
 void fpu_release(struct proc *p);
+void fpu_suspend_cpu(void);              /* its registers are about to be lost */
 
 #endif

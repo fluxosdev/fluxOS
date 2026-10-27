@@ -53,4 +53,8 @@ int pci_irq(const struct pci_dev *p);
  */
 void *pci_map_bar(const struct pci_dev *p, int bar);
 
+/* Suspend to RAM: every function's configuration, kept and put back. */
+void pci_suspend(void);
+void pci_resume(void);
+
 #endif

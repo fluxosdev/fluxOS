@@ -77,6 +77,7 @@ int main(int argc, char **argv)
     wm_init(setup);
     datetime_init();
     sound_init();
+    power_init();
     if (setup) {
         setup_open();
         wm_flush();
@@ -170,6 +171,7 @@ int main(int argc, char **argv)
             about_tick();
             display_tick();
             sound_tick();
+            power_tick();
             files_tick();
             taskmgr_tick();
             diskmgr_tick();

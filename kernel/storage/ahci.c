@@ -83,6 +83,7 @@
 #define ATA_PACKET        0xA0
 #define ATA_ID_PACKET     0xA1
 #define ATA_IDENTIFY      0xEC
+#define ATA_STANDBY_NOW   0xE0
 
 #define ATAPI_SECTOR 2048
 #define BOUNCE_SIZE  65536u
@@ -723,5 +724,62 @@ void ahci_init(void)
         if (!bounce && !(bounce = kmalloc(BOUNCE_SIZE)))
             return;
         hba_init(&pci);
+    }
+}
+
+/* ---- suspend to RAM ---- */
+
+/* The VFS lock is held, so no command is under way. The disks write back
+ * their caches and park their heads, as on a proper power-off. */
+void ahci_suspend(void)
+{
+    for (int i = 0; i < nhbas; i++) {
+        for (int n = 0; n < 32; n++) {
+            struct ahci_port *p = hbas[i].ports[n];
+            if (!p || p->atapi)
+                continue;
+            ahci_flush(&p->bd);
+            struct ata_cmd c = { .command = ATA_STANDBY_NOW };
+            port_exec(p, &c, NULL, 0, 0, 10000);
+        }
+    }
+}
+
+/* The controller was reset by the power going: AHCI mode, each port's
+ * memory, the link and the drive's first status again, as at boot. */
+void ahci_resume(void)
+{
+    for (int i = 0; i < nhbas; i++) {
+        struct hba *h = &hbas[i];
+        bios_handoff(h);
+        hba_wr(h, HBA_GHC, hba_rd(h, HBA_GHC) | GHC_AE);
+        hba_wr(h, HBA_GHC, hba_rd(h, HBA_GHC) & ~GHC_IE);
+        for (int n = 0; n < 32; n++) {
+            struct ahci_port *p = h->ports[n];
+            if (!p)
+                continue;
+            if (port_stop(p) < 0) {
+                port_comreset(p);
+                port_stop(p);
+            }
+            px_wr(p, PX_CLB, (uint32_t)p->cl);
+            px_wr(p, PX_CLBU, 0);
+            px_wr(p, PX_FB, (uint32_t)p->fis);
+            px_wr(p, PX_FBU, 0);
+            if (port_link(p, (hba_rd(h, HBA_CAP) & CAP_SSS) != 0) < 0) {
+                klog("%s: the drive did not come back\n", p->bd.name);
+                continue;
+            }
+            if (p->atapi) {
+                px_wr(p, PX_CMD, px_rd(p, PX_CMD) | CMD_ATAPI);
+                p->media_changed = 1;
+            }
+            port_start(p);
+            px_wr(p, PX_IE, h->irq >= 0 ? IE_MASK : 0);
+        }
+        if (h->irq >= 0) {
+            hba_wr(h, HBA_IS, 0xFFFFFFFFu);
+            hba_wr(h, HBA_GHC, hba_rd(h, HBA_GHC) | GHC_IE);
+        }
     }
 }

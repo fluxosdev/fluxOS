@@ -45,6 +45,7 @@ int vmm_copy_to(uint32_t *pd, uint32_t va, const void *src, uint32_t len);
 uint32_t vmm_user_pages(uint32_t *pd);
 /* flags: extra page bits, such as PTE_PCD for device registers */
 void *vmm_map_mmio(uint32_t phys, uint32_t size, uint32_t flags);  /* boot time only */
+void *vmm_map_late(uint32_t phys, uint32_t size, uint32_t flags);  /* any time; kept for good */
 int vmm_map_phys(uint32_t *pd, uint32_t va, uint32_t phys, uint32_t size, uint32_t flags);
 
 /*

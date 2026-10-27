@@ -194,7 +194,8 @@ int wm_reconfigure(void);
 /* The adapter's page flipping and hardware pointer (radeon), on or off. */
 int wm_accel(void);
 void wm_set_accel(int on);
-void wm_tray_changed(void);             /* redraw the tray (the volume icon) */
+void wm_tray_changed(void);             /* redraw the tray (the volume and battery icons) */
+void wm_resumed(void);                  /* back from sleep: everything drawn again */
 /* The theme changed: frames get its geometry, windows draw again, everything is repainted. */
 void wm_restyle(void);
 /* A sample of the theme in use (two windows and the taskbar), drawn into r of s over what is there. */
@@ -330,6 +331,19 @@ void sound_error(void);                 /* an error or warning dialog */
 void sound_shutdown(void);              /* plays to the end */
 enum icon_id sound_tray_icon(void);     /* ICON_NONE without a mixer */
 void volume_open(void);                 /* Volume Control */
+void sound_key(int code);               /* KEY_VOLUMEUP, KEY_VOLUMEDOWN, KEY_MUTE */
+
+/* Power (power.c): the battery in the tray, sleep, the kernel's IEV_POWER news. */
+void power_init(void);
+void power_tick(void);                  /* once a second */
+void power_event(const struct input_event *ev);
+int power_tray_present(void);           /* the machine has a battery */
+void power_draw_tray(struct surface *s, struct rect r, color_t fg);    /* r: 16 x 16 */
+void power_battery_text(char *out, size_t size);
+const struct powerinfo *power_info(void);       /* NULL if the kernel did not answer */
+void system_sleep(void);                /* suspend to RAM, and back */
+void power_open(void);                  /* the Power dialog (apps.c) */
+void power_dialog_tick(void);           /* the information changed */
 void display_tick(void);                /* once a second */
 struct window *taskmgr_open(void);      /* Task Manager: applications, processes, performance */
 void taskmgr_tick(void);                /* once a second: sample the system */

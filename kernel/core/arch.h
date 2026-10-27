@@ -39,6 +39,25 @@ void irq_register(int irq, irq_handler_t handler);
 int irq_registered(int irq);           /* another driver has it */
 void irq_unmask(int irq);
 
+/* A processor's state across suspend to RAM (entry.S). context_save()
+ * returns 0, then 1 again when context_restore() brings it back. */
+struct cpu_context {
+    uint32_t ebx, esi, edi, ebp, esp, eip;
+    uint32_t cr0, cr3, cr4, eflags;
+    uint8_t gdtr[8], idtr[8];           /* 6 bytes each, as SGDT and SIDT store them */
+};
+_Static_assert(__builtin_offsetof(struct cpu_context, eflags) == 36 &&
+               __builtin_offsetof(struct cpu_context, gdtr) == 40 &&
+               __builtin_offsetof(struct cpu_context, idtr) == 48, "the offsets entry.S uses");
+int context_save(struct cpu_context *c) __attribute__((returns_twice));
+void context_restore(struct cpu_context *c) __attribute__((noreturn));
+
+/* Across suspend (idt.c, gdt.c): the 8259s' masks and trigger modes,
+ * and the task register, which must be loaded again. */
+void pic_suspend(void);
+void pic_resume(void);
+void gdt_load_tr(int cpu);
+
 void trapret(void);
 void forkret(void);                     /* a new process's first way out of the kernel */
 void switch_context(uint32_t *old_esp, uint32_t new_esp);

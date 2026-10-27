@@ -29,6 +29,7 @@ static struct mutex display_mutex = MUTEX_INIT("display");
 /* What the VESA BIOS says about the adapter, for the standard driver. */
 static char vesa_name[48];
 static uint32_t vesa_vram_kb;
+static uint16_t vesa_mode;              /* the mode the boot loader set, or 0 */
 
 struct vbe_info {
     char sig[4];                        /* "VESA" */
@@ -63,6 +64,7 @@ static void read_vbe_info(struct multiboot_info *mbi)
 {
     if (!(mbi->flags & MB_INFO_VBE) || !mbi->vbe_control_info)
         return;
+    vesa_mode = mbi->vbe_mode;
     const struct vbe_info *vi = (const struct vbe_info *)mbi->vbe_control_info;
     if (memcmp(vi->sig, "VESA", 4) != 0)
         return;
@@ -463,4 +465,34 @@ static int display_op(int op, void *arg)
         return radeon_present() ? radeon_submit_user(arg) : -ENODEV;
     }
     return -EINVAL;
+}
+
+/* ---- suspend to RAM ---- */
+
+/*
+ * The VESA mode to set again when the machine wakes (the BIOS forgets
+ * it), 0 for text mode, or -1 if the screen is a driver's and only that
+ * driver could set it up again.
+ */
+int fb_wake_mode(void)
+{
+    if (voodoo_present() || radeon_present())
+        return -1;
+    if (!fb.base)
+        return 0;
+    return vesa_mode ? (vesa_mode & 0x1FF) | 0x4000 : 0;    /* with the linear framebuffer */
+}
+
+/* Nothing draws through SYS_display while the machine sleeps; the desktop
+ * repaints when it hears it is back (PEV_RESUMED). */
+void fb_suspend(void)
+{
+    mutex_lock(&display_mutex);
+}
+
+void fb_resume(void)
+{
+    mutex_unlock(&display_mutex);
+    if (fb_console_active())
+        vga_redraw();                   /* the console's text, if the screen is its */
 }

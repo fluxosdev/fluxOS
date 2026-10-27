@@ -1,4 +1,4 @@
-Welcome to fluxOS 0.2.2
+Welcome to fluxOS 0.2.3
 =======================
 
 fluxOS is an experimental hobby operating system, built with AI assistance
@@ -107,6 +107,9 @@ DOS programs
 System
 ------
   free, uname -a, uptime, date, dmesg, fetch, reboot, poweroff
+  power              a laptop's battery, AC adapter, lid and temperature
+  power sleep        suspend to RAM (the power button wakes it again)
+  power bright +     the screen brighter (- dimmer, or a percentage)
 
 More about fluxOS is in README.md in the source tree, and the credits are
 there too: the default wallpaper is a photograph by kazuend on Unsplash

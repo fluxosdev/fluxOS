@@ -82,6 +82,7 @@ struct uhci_qh {
 
 struct uhci {
     struct usb_hc hc;
+    struct pci_dev pci;
     uint16_t io;
     uint32_t *frames;
     struct uhci_qh *skel[3];            /* interrupt, control, bulk */
@@ -457,11 +458,16 @@ static void uhci_port_disable(struct usb_hub *h, int port)
 
 static void uhci_irq(struct trapframe *tf);
 
+static void uhci_suspend(struct usb_hc *hc);
+static void uhci_resume(struct usb_hc *hc);
+
 static const struct usb_hc_ops uhci_ops = {
     .submit = uhci_submit,
     .cancel = uhci_cancel,
     .poll = uhci_poll,
     .dev_free = uhci_dev_free,
+    .suspend = uhci_suspend,
+    .resume = uhci_resume,
 };
 
 #define MAX_UHCI 8
@@ -495,6 +501,47 @@ static int count_ports(uint16_t io)
     return n == 0 || n == 8 ? 2 : n;
 }
 
+/* Take it from the BIOS (no more SMIs or PS/2 emulation), then reset. */
+static void uhci_reset(struct uhci *u)
+{
+    pci_write16(&u->pci, LEGSUP, LEGSUP_RWC);
+    outw(u->io + USBINTR, 0);
+    outw(u->io + USBCMD, 0);
+    for (int i = 0; i < 20 && !(inw(u->io + USBSTS) & STS_HCH); i++)
+        usb_mdelay(1);
+    outw(u->io + USBCMD, CMD_HCRESET);
+    for (int i = 0; i < 50 && (inw(u->io + USBCMD) & CMD_HCRESET); i++)
+        usb_mdelay(1);
+    outw(u->io + USBINTR, 0);
+}
+
+/* The schedule in, interrupts on, running. */
+static void uhci_run(struct uhci *u)
+{
+    outl(u->io + FRBASEADD, phys(u->frames));
+    outw(u->io + FRNUM, 0);
+    outb(u->io + SOFMOD, 0x40);
+    outw(u->io + USBSTS, 0xFFFF);
+    outw(u->io + USBINTR, u->hc.irq >= 0 ? 0x000D : 0);    /* CRC/timeout, IOC, short packet */
+    outw(u->io + USBCMD, CMD_RS | CMD_CF | CMD_MAXP);
+    pci_write16(&u->pci, LEGSUP, LEGSUP_PIRQ);
+    u->halted = 0;
+}
+
+static void uhci_suspend(struct usb_hc *hc)
+{
+    struct uhci *u = hc->priv;
+    outw(u->io + USBINTR, 0);
+    outw(u->io + USBCMD, 0);
+}
+
+static void uhci_resume(struct usb_hc *hc)
+{
+    struct uhci *u = hc->priv;
+    uhci_reset(u);
+    uhci_run(u);
+}
+
 static void uhci_init(const struct pci_dev *pci)
 {
     uint32_t bar = pci_read32(pci, PCI_BAR4);
@@ -507,18 +554,9 @@ static void uhci_init(const struct pci_dev *pci)
         return;
     }
     u->io = (uint16_t)(bar & 0xFFE0);
+    u->pci = *pci;
     pci_enable(pci, PCI_CMD_IO | PCI_CMD_MASTER);
-
-    /* Take it from the BIOS (no more SMIs or PS/2 emulation), then reset. */
-    pci_write16(pci, LEGSUP, LEGSUP_RWC);
-    outw(u->io + USBINTR, 0);
-    outw(u->io + USBCMD, 0);
-    for (int i = 0; i < 20 && !(inw(u->io + USBSTS) & STS_HCH); i++)
-        usb_mdelay(1);
-    outw(u->io + USBCMD, CMD_HCRESET);
-    for (int i = 0; i < 50 && (inw(u->io + USBCMD) & CMD_HCRESET); i++)
-        usb_mdelay(1);
-    outw(u->io + USBINTR, 0);
+    uhci_reset(u);
 
     for (int s = 0; s < 3; s++)
         u->skel[s] = qh_new(s == 0 ? USB_EP_INTR : s == 1 ? USB_EP_CONTROL : USB_EP_BULK);
@@ -533,11 +571,6 @@ static void uhci_init(const struct pci_dev *pci)
     for (int i = 0; i < 1024; i++)
         u->frames[i] = phys(u->skel[0]) | LP_QH;
 
-    outl(u->io + FRBASEADD, page);
-    outw(u->io + FRNUM, 0);
-    outb(u->io + SOFMOD, 0x40);
-    outw(u->io + USBSTS, 0xFFFF);
-
     struct usb_hc *hc = &u->hc;
     hc->name = "UHCI";
     hc->ops = &uhci_ops;
@@ -548,10 +581,7 @@ static void uhci_init(const struct pci_dev *pci)
     hc->root.port_reset = uhci_port_reset;
     hc->root.port_disable = uhci_port_disable;
     hc->root.priv = u;
-
-    outw(u->io + USBINTR, hc->irq >= 0 ? 0x000D : 0);  /* CRC/timeout, IOC, short packet */
-    outw(u->io + USBCMD, CMD_RS | CMD_CF | CMD_MAXP);
-    pci_write16(pci, LEGSUP, LEGSUP_PIRQ);
+    uhci_run(u);
 
     uhcis[nuhci++] = u;
     if (hc->irq >= 0)

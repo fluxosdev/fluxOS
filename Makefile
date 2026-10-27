@@ -65,7 +65,7 @@ CFLAGS_COMMON := -m32 -march=pentium3 -std=gnu11 -O2 -g \
 # user processes (fpu.c switches them lazily); kernel/core/sse.S borrows the SSE
 # registers for bulk copies, saving what it touches.
 KERNEL_CFLAGS := $(CFLAGS_COMMON) -mgeneral-regs-only -fno-omit-frame-pointer \
-	-Iinclude -Ikernel/include -Ikernel/core -Ikernel/fs -Ikernel/net -Ikernel/usb -Ikernel/input -Ikernel/storage -Ikernel/sound -Ikernel/video
+	-Iinclude -Ikernel/include -Ikernel/core -Ikernel/fs -Ikernel/net -Ikernel/usb -Ikernel/input -Ikernel/storage -Ikernel/sound -Ikernel/video -Ikernel/acpi
 # User code does float arithmetic on SSE (doubles stay on the x87, which
 # SSE1 cannot do) and may use the SSE and MMX intrinsics.
 USER_CFLAGS   := $(CFLAGS_COMMON) -mfpmath=sse -fno-math-errno -Iinclude -Iuser/include
@@ -81,9 +81,17 @@ $(KERNEL_EARLY_OBJS): KERNEL_CFLAGS += -march=i386 -mtune=pentium3
 LDFLAGS_COMMON := -m elf_i386 -nostdlib -z noexecstack --no-warn-rwx-segments
 
 # ---- kernel ----
+# uACPI, the AML interpreter behind kernel/acpi: its sources and the kernel's
+# ACPI code share one configuration (kernel/acpi/uacpi_flux.h).
+UACPI_DIR := third_party/uacpi
+UACPI_SRCS := $(wildcard $(UACPI_DIR)/source/*.c)
+UACPI_FLAGS := -I$(UACPI_DIR)/include -include kernel/acpi/uacpi_flux.h
+
 KERNEL_SRCS := $(wildcard kernel/*/*.S kernel/*/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c \
-               lib/sha256.c lib/logo.c user/desktop/shell/font_archivo.c
+               lib/sha256.c lib/logo.c user/desktop/shell/font_archivo.c $(UACPI_SRCS)
 KERNEL_OBJS := $(patsubst %,$(BUILD)/k/%.o,$(basename $(KERNEL_SRCS)))
+UACPI_OBJS := $(patsubst %,$(BUILD)/k/%.o,$(basename $(UACPI_SRCS) $(wildcard kernel/acpi/*.c)))
+$(UACPI_OBJS): KERNEL_CFLAGS += $(UACPI_FLAGS)
 
 # ---- user space ----
 MBEDTLS_DIR := third_party/mbedtls

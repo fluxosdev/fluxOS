@@ -131,11 +131,11 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
         boot_ok("Kernel heap: %u KiB", total / 1024);
     }
 
-    acpi_init();
-    smp_init();
     rtc_init();
     pit_init(HZ);
     boot_ok("PIT timer at %u Hz, RTC clock read", HZ);
+    acpi_init();                        /* times its waits with the PIT */
+    smp_init();
     radeon_late_init();
     tty_init();
     keyboard_init();
@@ -162,6 +162,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
         panic("no initrd module: check the GRUB configuration");
 
     pci_log_devices();
+    acpi_namespace_init();              /* the firmware's AML: battery, lid, EC, sleep */
     ata_init();
     ahci_init();
     floppy_init();

@@ -110,6 +110,7 @@ struct qh {
 
 struct ehci {
     struct usb_hc hc;
+    struct pci_dev pci;
     volatile uint8_t *cap, *op;
     uint32_t *frames;
     struct qh *async_head;              /* the ring's fixed head */
@@ -563,12 +564,17 @@ static void ehci_port_disable(struct usb_hub *h, int port)
     op_wr(e, port_reg(port), v & ~(PORT_RWC | PORT_PE));
 }
 
+static void ehci_suspend(struct usb_hc *hc);
+static void ehci_resume(struct usb_hc *hc);
+
 static const struct usb_hc_ops ehci_ops = {
     .submit = ehci_submit,
     .cancel = ehci_cancel,
     .poll = ehci_poll,
     .dev_free = ehci_dev_free,
     .ep_reset = ehci_ep_reset,
+    .suspend = ehci_suspend,
+    .resume = ehci_resume,
 };
 
 #define MAX_EHCI 4
@@ -615,24 +621,13 @@ static void bios_handoff(const struct pci_dev *pci, uint32_t hccparams)
     }
 }
 
-static void ehci_init(const struct pci_dev *pci)
+/* From the BIOS, reset, the schedules in, running, every port ours and powered. */
+static void ehci_setup(struct ehci *e)
 {
-    struct ehci *e = kzalloc(sizeof(*e));
-    if (!e)
-        return;
-    e->cap = pci_map_bar(pci, PCI_BAR0);
-    uint32_t page = pmm_alloc();
-    e->async_head = qh_alloc();
-    e->intr_head = qh_alloc();
-    if (!e->cap || !page || !e->async_head || !e->intr_head) {
-        klog("ehci: cannot set up the controller\n");
-        return;
-    }
-    e->op = e->cap + *(volatile uint8_t *)(e->cap + CAP_LENGTH);
+    struct usb_hc *hc = &e->hc;
     uint32_t hcs = *(volatile uint32_t *)(e->cap + CAP_HCSPARAMS);
     uint32_t hcc = *(volatile uint32_t *)(e->cap + CAP_HCCPARAMS);
-    pci_enable(pci, PCI_CMD_MEM | PCI_CMD_MASTER);
-    bios_handoff(pci, hcc);
+    bios_handoff(&e->pci, hcc);
 
     op_wr(e, OP_USBINTR, 0);
     op_wr(e, OP_USBCMD, op_rd(e, OP_USBCMD) & ~CMD_RS);
@@ -651,18 +646,12 @@ static void ehci_init(const struct pci_dev *pci)
     ah->token = QTD_HALTED;
     ah->type = USB_EP_CONTROL;
     e->intr_head->type = USB_EP_INTR;
-    e->frames = (uint32_t *)page;
     for (int i = 0; i < 1024; i++)
         e->frames[i] = (uint32_t)e->intr_head | LP_QH;
-    op_wr(e, OP_PERIODIC, page);
+    op_wr(e, OP_PERIODIC, (uint32_t)e->frames);
     op_wr(e, OP_ASYNC, (uint32_t)ah);
     op_wr(e, OP_USBSTS, STS_ACK);
 
-    struct usb_hc *hc = &e->hc;
-    hc->name = "EHCI";
-    hc->ops = &ehci_ops;
-    hc->priv = e;
-    hc->irq = cmdline_has("usb.poll") ? -1 : pci_irq(pci);
     if (hc->irq >= 0)
         op_wr(e, OP_USBINTR, STS_INT | STS_ERR | STS_HSE);
     op_wr(e, OP_USBCMD, CMD_ITC8 | CMD_PSE | CMD_ASE | CMD_RS);
@@ -673,15 +662,53 @@ static void ehci_init(const struct pci_dev *pci)
 
     e->ncompanions = (hcs >> 12) & 0xF;
     hc->root.nports = (int)MIN(hcs & 0xF, (uint32_t)USB_MAX_PORTS);
-    hc->root.port_status = ehci_port_status;
-    hc->root.port_reset = ehci_port_reset;
-    hc->root.port_disable = ehci_port_disable;
-    hc->root.priv = e;
     if (hcs & (1u << 4)) {              /* port power control */
         for (int p = 1; p <= hc->root.nports; p++)
             op_wr(e, port_reg(p), (op_rd(e, port_reg(p)) & ~PORT_RWC) | PORT_PP);
         usb_mdelay(20);
     }
+}
+
+static void ehci_suspend(struct usb_hc *hc)
+{
+    struct ehci *e = hc->priv;
+    op_wr(e, OP_USBINTR, 0);
+    op_wr(e, OP_USBCMD, op_rd(e, OP_USBCMD) & ~CMD_RS);
+}
+
+static void ehci_resume(struct usb_hc *hc)
+{
+    ehci_setup(hc->priv);
+}
+
+static void ehci_init(const struct pci_dev *pci)
+{
+    struct ehci *e = kzalloc(sizeof(*e));
+    if (!e)
+        return;
+    e->cap = pci_map_bar(pci, PCI_BAR0);
+    uint32_t page = pmm_alloc();
+    e->async_head = qh_alloc();
+    e->intr_head = qh_alloc();
+    if (!e->cap || !page || !e->async_head || !e->intr_head) {
+        klog("ehci: cannot set up the controller\n");
+        return;
+    }
+    e->op = e->cap + *(volatile uint8_t *)(e->cap + CAP_LENGTH);
+    e->pci = *pci;
+    e->frames = (uint32_t *)page;
+    pci_enable(pci, PCI_CMD_MEM | PCI_CMD_MASTER);
+
+    struct usb_hc *hc = &e->hc;
+    hc->name = "EHCI";
+    hc->ops = &ehci_ops;
+    hc->priv = e;
+    hc->irq = cmdline_has("usb.poll") ? -1 : pci_irq(pci);
+    hc->root.port_status = ehci_port_status;
+    hc->root.port_reset = ehci_port_reset;
+    hc->root.port_disable = ehci_port_disable;
+    hc->root.priv = e;
+    ehci_setup(e);
 
     ehcis[nehci++] = e;
     if (hc->irq >= 0)

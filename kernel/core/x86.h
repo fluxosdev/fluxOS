@@ -124,6 +124,13 @@ static inline uint64_t rdmsr(uint32_t msr)
     return (uint64_t)hi << 32 | lo;
 }
 
+static inline uint64_t rdtsc(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return (uint64_t)hi << 32 | lo;
+}
+
 /* In a spin loop: PAUSE, which older processors take for a plain NOP. */
 static inline void cpu_relax(void)
 {

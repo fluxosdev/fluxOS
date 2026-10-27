@@ -96,6 +96,10 @@ struct netdev {
     uint32_t io_base, irq;
     int (*transmit)(const void *frame, uint32_t len);
     void (*poll)(void);                 /* optional: from the timer, ten times a second */
+    /* Optional, for suspend to RAM: stop; then set the card up again
+     * (from a process, without net_lock: the stack sends nothing meanwhile). */
+    void (*suspend)(void);
+    void (*resume)(void);
 };
 
 /* An Ethernet PHY on a MAC's MII management bus (mii.c). */
@@ -129,6 +133,8 @@ extern struct netif netif;
 extern spinlock_t net_lock;
 
 void net_init(void);
+void net_suspend(void);                 /* suspend to RAM: the card stopped */
+void net_resume(void);                  /* and set up again */
 void net_tick(void);                    /* timer interrupt, every tick */
 void net_register(const struct netdev *dev);
 void net_receive(const uint8_t *frame, uint32_t len);   /* driver, in its IRQ */
