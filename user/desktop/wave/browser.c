@@ -1,6 +1,6 @@
 /*
  * The web browser: a window with Back, Forward, Stop, Refresh and Home
- * buttons, an address bar, the page, and a status bar.
+ * buttons, a tab strip, an address bar, the page, and a status bar.
  *
  * Pages are fetched by running /bin/wget in a child process that writes
  * the server's response (headers included) into a pipe, so the desktop
@@ -17,7 +17,9 @@
  *
  * Keys: Alt+Left/Backspace back, Alt+Right forward, F5 reload, Esc stop,
  * Ctrl+L or F6 the address bar, arrows/PgUp/PgDn/Space/Home/End scroll,
- * Tab moves between form fields, Enter in a field submits its form.
+ * Tab moves between focusable elements, Enter in a field submits its form.
+ * Ctrl+T opens a tab, Ctrl+W closes it, Ctrl+Tab/Ctrl+Shift+Tab cycle tabs,
+ * and Ctrl+1..8/Ctrl+9 select a numbered tab or the last tab.
  */
 #include <ctype.h>
 #include <dirent.h>
@@ -42,6 +44,8 @@
 
 #define BR_W        800
 #define BR_H        560
+#define TABBAR_H    28
+#define TAB_LIMIT    32
 #define TOOLBAR_H   30
 #define ADDR_H      26
 #define STATUS_H    20
@@ -69,6 +73,8 @@
 #define FRAME_DEPTH 3               /* iframes inside iframes, at most */
 
 /* PS/2 scancodes of the letters used for shortcuts */
+#define SC_T 0x14
+#define SC_W 0x11
 #define SC_L 0x26
 #define SC_C 0x2E
 #define SC_A 0x1E
@@ -160,8 +166,17 @@ struct hist {
     int doc, id;                /* the document it belongs to (doc_serial), its id there (pushState) */
 };
 
+/* Pages remain independently registered in browsers, including background tabs.
+ * A tab group owns the shared window; its priv always points at the active tab. */
+struct tab_group {
+    struct browser *first, *active;
+    int count, first_visible;
+};
 struct browser {
     struct window *win;
+    struct tab_group *tabs;
+    struct browser *next_tab;
+    struct image *favicon;
     struct browser *next;
     int focused;
 
@@ -285,6 +300,7 @@ struct browser {
     int scripts_finished;               /* the load event has fired */
     /* what scripts asked for, done once they have returned */
     char js_nav[URL_MAX];
+    char js_open[URL_MAX];              /* window.open: processed after the script returns */
     char *js_post;                      /* a form a script submitted: the POST body for js_nav */
     int js_nav_replace, js_history, js_reload;
 
@@ -327,6 +343,14 @@ static void pop_open(struct browser *b, struct node *n, int list);
 static void suggest(struct browser *b, struct node *f);
 static void start_next(struct browser *b);
 static void history_add(const char *url, const char *title);
+static struct browser *tab_new(struct browser *from, const char *url, int activate);
+static void tab_select(struct browser *b);
+static void tab_close(struct browser *b);
+static void tab_cycle(struct browser *b, int direction);
+static void tab_ensure_visible(struct browser *b);
+static void tab_visibility(struct browser *b, int hidden);
+static void draw_tabs(struct browser *b, struct surface *s);
+static int tab_mouse(struct browser *b, int x, int y, int buttons, int changed);
 
 /* ---- geometry ---- */
 
@@ -335,16 +359,16 @@ static struct rect button_rect(struct browser *b, int i)
     static const int widths[] = { 62, 74, 56, 70, 60, 68, 90, 82 };
     int x = 4;
     if (i == B_GO)
-        return mkrect(b->win->content.w - 44, TOOLBAR_H + 2, 40, ADDR_H - 4);
+        return mkrect(b->win->content.w - 44, TABBAR_H + TOOLBAR_H + 2, 40, ADDR_H - 4);
     for (int k = 0; k < i; k++)
         x += widths[k] + 2;
-    return mkrect(x, 3, widths[i], TOOLBAR_H - 6);
+    return mkrect(x, TABBAR_H + 3, widths[i], TOOLBAR_H - 6);
 }
 
 static struct rect addr_rect(struct browser *b)
 {
     int lx = 4 + gfx_text_width(&font_sans, "Address") + 8;
-    return mkrect(lx, TOOLBAR_H + 2, b->win->content.w - 52 - lx, ADDR_H - 4);
+    return mkrect(lx, TABBAR_H + TOOLBAR_H + 2, b->win->content.w - 52 - lx, ADDR_H - 4);
 }
 
 static int is_frame(const struct browser *b)
@@ -366,6 +390,18 @@ static struct browser *top_of(struct browser *b)
     return b;
 }
 
+static int tab_active(struct browser *b)
+{
+    b = top_of(b);
+    return b->win && (!b->tabs || b->tabs->active == b);
+}
+
+static int tab_hidden(struct browser *b)
+{
+    struct browser *top = top_of(b);
+    return !tab_active(top) || (top->win && top->win->minimized);
+}
+
 /* The zoom of the window b is in (frames follow it), made the one the style and layout code use. */
 static int zoom_of(struct browser *b)
 {
@@ -383,7 +419,7 @@ static struct rect frame_rect(struct browser *b)
 {
     if (is_frame(b))
         return mkrect(0, 0, b->frame_w, b->frame_h);
-    int y = TOOLBAR_H + ADDR_H;
+    int y = TABBAR_H + TOOLBAR_H + ADDR_H;
     return mkrect(2, y, b->win->content.w - 4, b->win->content.h - y - STATUS_H - 2);
 }
 
@@ -521,12 +557,15 @@ static void set_addr(struct browser *b, const char *url)
 static void update_title(struct browser *b, const char *title)
 {
     char t[96];
+    snprintf(b->page_title, sizeof(b->page_title), "%s", title ? title : "");
     if (title && *title)
         snprintf(t, sizeof(t), "%.60s - Wave", title);
     else
         snprintf(t, sizeof(t), "Wave");
-    if (b->win)                         /* a frame's title is nobody's */
+    if (tab_active(b) && !is_frame(b))
         wm_set_title(b->win, t);
+    if (b->win && b->tabs)
+        paint(b->tabs->active);
 }
 
 /* ---- the image cache ---- */
@@ -1863,10 +1902,13 @@ static void free_page(struct browser *b)
     css_hover_node = css_focus_node = css_focus_visible_node = NULL;
     b->js_hover = NULL;
     b->sel_active = b->sel_start = 0;
-    if (b->win && b->win->icon_img) {   /* the old page's icon */
-        image_free(b->win->icon_img);
-        b->win->icon_img = NULL;
-        wm_damage(b->win->r);
+    if (b->favicon) {
+        if (b->win && b->win->icon_img == b->favicon) {
+            b->win->icon_img = NULL;
+            wm_damage(b->win->r);
+        }
+        image_free(b->favicon);
+        b->favicon = NULL;
     }
     arena_free(&b->larena);
     arena_free(&b->sarena);
@@ -1893,7 +1935,7 @@ static void free_page(struct browser *b)
     b->scripts = NULL;
     b->nscripts = b->script_cap = b->next_script = 0;
     b->scripts_finished = 0;
-    b->js_nav[0] = 0;
+    b->js_nav[0] = b->js_open[0] = 0;
     free(b->js_post);
     b->js_post = NULL;
     b->js_history = b->js_reload = 0;
@@ -2173,6 +2215,12 @@ static void js_viewport(void *ctx, int *w, int *h)
     struct rect v = view_rect(ctx);
     *w = v.w * 100 / zoom_of(ctx);              /* in CSS pixels: a zoomed page is a smaller window */
     *h = v.h * 100 / zoom_of(ctx);
+}
+
+static void js_open_tab(void *ctx, const char *url)
+{
+    struct browser *b = ctx;
+    snprintf(b->js_open, sizeof(b->js_open), "%s", url);
 }
 
 static void js_set_title(void *ctx, const char *title)
@@ -2658,11 +2706,13 @@ static void start_scripts(struct browser *b, const char *url)
         .reveal = js_reveal, .flush = js_flush, .focus = js_focus, .http = js_http, .http_cancel=js_http_cancel,
         .has_focus=js_has_focus, .clipboard_read=js_clipboard_read, .clipboard_write=js_clipboard_write,
         .cookie_get = js_cookie_get, .cookie_set = js_cookie_set, .ws_cookies=js_ws_cookies, .font_register=js_font_register, .font_status=js_font_status, .fetch_module = js_fetch_module,
-        .module_done = js_module_done, .set_url = js_set_url, .submit = js_submit, .node_at = js_node_at,
+        .open_tab = js_open_tab, .module_done = js_module_done, .set_url = js_set_url, .submit = js_submit, .node_at = js_node_at,
     };
     b->js = jsdom_new(&h);
     if (!b->js)
         return;
+    if (tab_hidden(b))
+        jsdom_page_event(b->js, "visibilitychange", 1);
     for (struct node *n = b->root; n; n = node_next(n, b->root)) {
         const char *type;
         if (n->type == N_ELEMENT && n->tag == T_SCRIPT && !in_noscript(n) && (type = node_attr(n, "type")) &&
@@ -3139,9 +3189,12 @@ static void set_favicon(struct browser *b, const char *data, int len)
             px[y * 16 + x] = (uint32_t)(a / n) << 24 | (uint32_t)(r / a) << 16 | (uint32_t)(g / a) << 8 | (uint32_t)(bl / a);
         }
     image_free(src);
-    image_free(b->win->icon_img);
-    b->win->icon_img = icon;
-    wm_damage(b->win->r);
+    image_free(b->favicon);
+    b->favicon = icon;
+    if (tab_active(b)) {
+        b->win->icon_img = icon;
+        wm_damage(b->win->r);
+    }
 }
 
 static void image_done(struct browser *b, const char *url, const char *data, int len)
@@ -4131,14 +4184,18 @@ static struct browser *named_frame(struct browser *b, const char *name)
 }
 
 /* Where a link or form with this target opens: here, the parent, the
- * window (_top, and _blank: there are no new windows), or a named frame. */
+ * tab (_top), a new tab (_blank), or a named frame. */
 static struct browser *target_of(struct browser *b, const char *target)
 {
     if (!target || !*target || !strcasecmp(target, "_self"))
         return b;
     if (!strcasecmp(target, "_parent"))
         return b->parent ? b->parent : b;
-    if (!strcasecmp(target, "_top") || !strcasecmp(target, "_blank"))
+    if (!strcasecmp(target, "_blank")) {
+        struct browser *tab = tab_new(top_of(b), NULL, 1);
+        return tab;
+    }
+    if (!strcasecmp(target, "_top"))
         return top_of(b);
     struct browser *f = named_frame(top_of(b), target);
     return f ? f : top_of(b);
@@ -4162,7 +4219,9 @@ static void follow_link(struct browser *b, struct node *a)
     }
     char abs[URL_MAX];
     url_resolve(b->base, href, abs, sizeof(abs));
-    navigate(target_of(b, node_attr(a, "target")), abs, NULL, NAV_NEW);
+    struct browser *target = target_of(b, node_attr(a, "target"));
+    if (target)
+        navigate(target, abs, NULL, NAV_NEW);
 }
 
 /* ---- forms ---- */
@@ -4397,6 +4456,8 @@ static void submit(struct browser *b, struct node *form, struct node *submitter)
     char q[URL_MAX], target[URL_MAX];
     int post = form_request(b, form, submitter, target, sizeof(target), q, sizeof(q));
     struct browser *tb = target_of(b, node_attr(form, "target"));
+    if (!tb)
+        return;
     const char *enc = node_attr(form, "enctype");
     if (post && enc && strcasestr(enc, "multipart/form-data") && build_multipart(tb, form, submitter) == 0) {
         q[0] = 0;                       /* the body is the multipart one (the request picks it up) */
@@ -4736,8 +4797,8 @@ static int button_enabled(struct browser *b, int i)
 
 static void draw_toolbar(struct browser *b, struct surface *s)
 {
-    gfx_fill(s, 0, 0, s->w, TOOLBAR_H + ADDR_H, C_FACE);
-    draw_separator(s, 0, TOOLBAR_H - 1, s->w);
+    gfx_fill(s, 0, TABBAR_H, s->w, TOOLBAR_H + ADDR_H, C_FACE);
+    draw_separator(s, 0, TABBAR_H + TOOLBAR_H - 1, s->w);
     for (int i = 0; i < B_GO; i++) {
         struct rect r = button_rect(b, i);
         int en = button_enabled(b, i), down = b->hold == H_BUTTON && b->button_pressed == i && b->button_down;
@@ -4753,7 +4814,7 @@ static void draw_toolbar(struct browser *b, struct surface *s)
         gfx_text(s, &font_sans, x + 20, ty, button_labels[i], en ? C_BLACK : C_SHADOW);
     }
     /* The address bar. */
-    gfx_text(s, &font_sans, 6, TOOLBAR_H + (ADDR_H - font_sans.height) / 2 - 1, "Address", C_BLACK);
+    gfx_text(s, &font_sans, 6, TABBAR_H + TOOLBAR_H + (ADDR_H - font_sans.height) / 2 - 1, "Address", C_BLACK);
     struct rect a = addr_rect(b);
     gfx_fill(s, a.x, a.y, a.w, a.h, C_WHITE);
     gfx_bevel(s, a, BEVEL_SUNKEN);
@@ -4816,7 +4877,7 @@ static void draw_status(struct browser *b, struct surface *s)
 static int has_keys(struct browser *b)
 {
     struct browser *t = top_of(b);
-    return t->focused && !t->addr_focus && (t->key_frame ? t->key_frame == b : b == t);
+    return tab_active(t) && t->focused && !t->addr_focus && (t->key_frame ? t->key_frame == b : b == t);
 }
 
 /* A page, its frames in their boxes, and its scroll bars, with b's
@@ -4866,13 +4927,14 @@ static void paint_page(struct browser *b, struct surface *s, int ox, int oy)
 
 enum {
     CB_SEP, CB_BACK, CB_FORWARD, CB_REFRESH, CB_STOP, CB_HOME, CB_COPYPAGE,
-    CB_OPENLINK, CB_NEWWIN, CB_COPYLINK, CB_CUT, CB_COPY, CB_PASTE,
+    CB_OPENLINK, CB_NEWTAB, CB_NEWWIN, CB_COPYLINK, CB_CUT, CB_COPY, CB_PASTE,
     CB_SAVELINK, CB_SAVEIMG, CB_COPYIMG, CB_FAVORITE, CB_FIND, CB_SAVEPAGE, CB_SOURCE, CB_PRINT,
 };
 
 static const char *const ctx_labels[] = {
     [CB_BACK] = "Back", [CB_FORWARD] = "Forward", [CB_REFRESH] = "Refresh", [CB_STOP] = "Stop",
     [CB_HOME] = "Home", [CB_COPYPAGE] = "Copy Page Address", [CB_OPENLINK] = "Open Link",
+    [CB_NEWTAB] = "Open Link in New Tab",
     [CB_NEWWIN] = "Open Link in New Window", [CB_COPYLINK] = "Copy Link Address",
     [CB_CUT] = "Cut", [CB_COPY] = "Copy", [CB_PASTE] = "Paste",
     [CB_SAVELINK] = "Save Link As...", [CB_SAVEIMG] = "Save Image As...",
@@ -4941,7 +5003,7 @@ static int ctx_enabled(struct browser *b, int code)
     case CB_REFRESH: return button_enabled(b, B_REFRESH);
     case CB_STOP: return button_enabled(b, B_STOP);
     case CB_COPYPAGE: return b->url[0] != 0;
-    case CB_OPENLINK: case CB_NEWWIN:
+    case CB_OPENLINK: case CB_NEWTAB: case CB_NEWWIN:
         return strncasecmp(b->ctx_url, "javascript:", 11) && strncasecmp(b->ctx_url, "mailto:", 7);
     case CB_SAVELINK:
         return url_is_http(b->ctx_url) || url_is_https(b->ctx_url) || url_is_file(b->ctx_url);
@@ -5629,8 +5691,11 @@ static void paint(struct browser *b)
     b = top_of(b);
     if (!b->win)
         return;                         /* a dropped frame */
+    if (b->tabs)
+        b = b->tabs->active;
     struct surface *s = &b->win->content;
     gfx_noclip(s);
+    draw_tabs(b, s);
     draw_toolbar(b, s);
     gfx_bevel(s, frame_rect(b), BEVEL_SUNKEN);
     paint_page(b, s, 0, 0);
@@ -5882,6 +5947,32 @@ static void br_key(struct window *w, const struct input_event *ev)
     if (ev->flags & IEV_PRESSED) {
         b->keyboard_focus=1;
         int ctrl = ev->mods & KMOD_CTRL;
+        int shift = ev->mods & KMOD_SHIFT;
+        if (ctrl && ev->code == SC_T) {
+            struct browser *tab = tab_new(t, HOME_URL, 1);
+            if (tab) {
+                tab->addr_focus = tab->addr_all = 1;
+                tab->addr_cur = tab->addr_len;
+                paint(tab);
+            }
+            return;
+        }
+        if (ctrl && (ev->code == SC_W || ev->code == KEY_F4)) {
+            tab_close(t);
+            return;
+        }
+        if (ctrl && ev->code == KEY_TAB) {
+            tab_cycle(t, shift ? -1 : 1);
+            return;
+        }
+        if (ctrl && ev->code >= 0x02 && ev->code <= 0x0A && t->tabs) {
+            int index = ev->code == 0x0A ? t->tabs->count - 1 : ev->code - 0x02;
+            struct browser *tab = t->tabs->first;
+            while (tab && index-- > 0)
+                tab = tab->next_tab;
+            if (tab) tab_select(tab);
+            return;
+        }
         if (t->tip_node || t->tip_shown)
             tip_hide(t);
         if (ctrl && ev->code == SC_F) {
@@ -6229,6 +6320,7 @@ static void open_ctx(struct browser *b, int x, int y)
         if (h && node_attr(h->node, "href")) {
             url_resolve(b->base, node_attr(h->node, "href"), t->ctx_url, sizeof(t->ctx_url));
             ctx_add(t, CB_OPENLINK);
+            ctx_add(t, CB_NEWTAB);
             ctx_add(t, CB_NEWWIN);
             ctx_add(t, CB_COPYLINK);
             ctx_add(t, CB_SAVELINK);
@@ -6295,6 +6387,7 @@ static void ctx_action(struct browser *t, int code)
     case CB_HOME: press(t, B_HOME); break;
     case CB_COPYPAGE: clipboard_set(t->url); break;
     case CB_OPENLINK: navigate(t, t->ctx_url, NULL, NAV_NEW); break;
+    case CB_NEWTAB: tab_new(t, t->ctx_url, 0); break;
     case CB_NEWWIN: browser_open(t->ctx_url); break;
     case CB_COPYLINK: clipboard_set(t->ctx_url); break;
     case CB_SAVELINK: start_save(t, t->ctx_url); break;
@@ -6444,6 +6537,21 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             }
     }
 
+    if (changed & MOUSE_MIDDLE) {
+        if ((buttons & MOUSE_MIDDLE) && b->root && rect_contains(v, x, y)) {
+            const struct hotspot *h = layout_hit(&b->lo, b->lo.links, b->lo.nlinks,
+                                                 px, py, b->scroll_x, b->scroll_y);
+            if (h && !web_inert(h->node)) {
+                const char *href = node_attr(h->node, "href");
+                if (href && strncasecmp(href, "javascript:", 11) && strncasecmp(href, "mailto:", 7)) {
+                    char url[URL_MAX];
+                    url_resolve(b->base, href, url, sizeof(url));
+                    tab_new(top_of(b), url, 0);
+                }
+            }
+        }
+        return;
+    }
     if (changed & MOUSE_RIGHT) {
         if (buttons & MOUSE_RIGHT)
             open_ctx(b, x, y);
@@ -6654,6 +6762,8 @@ static void br_mouse(struct window *w, int x, int y, int buttons, int changed)
     struct browser *b = w->priv;
     b->mouse_x = x;
     b->mouse_y = y;
+    if (tab_mouse(b, x, y, buttons, changed))
+        return;
     if (b->ctx_open && ctx_mouse(b, x, y, buttons, changed))
         return;
     mouse(b, x, y, buttons, changed);
@@ -6704,7 +6814,9 @@ static void br_wheel(struct window *w, int delta)
 static void br_resize(struct window *w)
 {
     struct browser *b = w->priv;
-    b->need_layout = 1;
+    tab_ensure_visible(b);
+    for (struct browser *tab = b->tabs ? b->tabs->first : b; tab; tab = tab->next_tab)
+        tab->need_layout = 1;
     relayout(b);
     paint(b);
 }
@@ -6714,8 +6826,8 @@ static void br_focus(struct window *w, int focused)
     struct browser *b = w->priv;
     b->focused = focused;
     b->ctx_open = 0;
-    if (b->js)                          /* minimized: the page is hidden; back: visible */
-        jsdom_page_event(b->js, "visibilitychange", !focused && w->minimized);
+    for (struct browser *tab = b->tabs ? b->tabs->first : b; tab; tab = tab->next_tab)
+        tab_visibility(tab, tab != b || w->minimized);
     if (b->win)
         paint(b);
 }
@@ -6738,16 +6850,301 @@ static void destroy_browser(struct browser *b)
     free(b);
 }
 
+static void unlink_browser(struct browser *b)
+{
+    for (struct browser **p = &browsers; *p; p = &(*p)->next)
+        if (*p == b) { *p = b->next; return; }
+}
+
 static void br_destroy(struct window *w)
 {
     struct browser *b = w->priv;
-    for (struct browser **pp = &browsers; *pp; pp = &(*pp)->next) {
-        if (*pp == b) {
-            *pp = b->next;
-            break;
+    struct tab_group *group = b->tabs;
+    w->icon_img = NULL;                 /* each tab owns its favicon */
+    w->priv = NULL;
+    for (struct browser *tab = group ? group->first : b; tab;) {
+        struct browser *next = tab->next_tab;
+        unlink_browser(tab);
+        destroy_browser(tab);
+        tab = next;
+    }
+    free(group);
+}
+
+/* ---- tabs ---- */
+
+static int tab_capacity(struct browser *b)
+{
+    int available = b->win->content.w - 92;
+    int capacity = available / 110;
+    return capacity > 0 ? capacity : 1;
+}
+
+static struct browser *tab_number(struct tab_group *group, int index)
+{
+    struct browser *b = group->first;
+    while (b && index-- > 0)
+        b = b->next_tab;
+    return b;
+}
+
+static void tab_ensure_visible(struct browser *b)
+{
+    struct tab_group *group = b->tabs;
+    if (!group)
+        return;
+    int index = 0, capacity = tab_capacity(b);
+    for (struct browser *tab = group->first; tab && tab != group->active; tab = tab->next_tab)
+        index++;
+    if (index < group->first_visible)
+        group->first_visible = index;
+    if (index >= group->first_visible + capacity)
+        group->first_visible = index - capacity + 1;
+    int last = group->count > capacity ? group->count - capacity : 0;
+    if (group->first_visible > last)
+        group->first_visible = last;
+    if (group->first_visible < 0)
+        group->first_visible = 0;
+}
+
+static struct rect tab_rect(struct browser *b, int index)
+{
+    struct tab_group *group = b->tabs;
+    int count = group->count, capacity = tab_capacity(b);
+    if (count > capacity)
+        count = capacity;
+    int width = (b->win->content.w - 92) / (count ? count : 1);
+    if (width > 200)
+        width = 200;
+    return mkrect(58 + (index - group->first_visible) * width, 2, width - 2, TABBAR_H - 4);
+}
+
+static void draw_tab_button(struct surface *s, struct rect r, const char *label, int disabled)
+{
+    draw_button(s, r, label, 0, 0, 0);
+    if (disabled)
+        gfx_dither(s, r.x + 3, r.y + 3, r.w - 6, r.h - 6, C_FACE);
+}
+
+static void draw_tabs(struct browser *b, struct surface *s)
+{
+    struct tab_group *group = b->tabs;
+    if (!group)
+        return;
+    gfx_fill(s, 0, 0, s->w, TABBAR_H, C_FACE);
+    draw_separator(s, 0, TABBAR_H - 1, s->w);
+    int capacity = tab_capacity(b), first = group->first_visible;
+    draw_tab_button(s, mkrect(4, 3, 24, TABBAR_H - 6), "<", first == 0);
+    draw_tab_button(s, mkrect(30, 3, 24, TABBAR_H - 6), ">", first + capacity >= group->count);
+    draw_tab_button(s, mkrect(s->w - 30, 3, 26, TABBAR_H - 6), "+", group->count >= TAB_LIMIT);
+    struct browser *tab = tab_number(group, first);
+    for (int index = first; tab && index < first + capacity; tab = tab->next_tab, index++) {
+        struct rect r = tab_rect(b, index);
+        int active = tab == group->active;
+        gfx_fill(s, r.x, r.y, r.w, r.h, active ? C_WHITE : C_FACE);
+        gfx_frame(s, r.x, r.y, r.w, r.h, C_SHADOW);
+        int label_x = r.x + 6;
+        if (tab->favicon) {
+            gfx_image(s, label_x, r.y + (r.h - 16) / 2, tab->favicon);
+            label_x += 20;
+        }
+        const char *title = tab->page_title[0] ? tab->page_title :
+                            tab->loading ? "Loading..." : tab->url[0] ? tab->url : "New Tab";
+        char label[160];
+        gfx_ellipsize(&font_sans, title, r.x + r.w - 22 - label_x, label, sizeof(label));
+        gfx_text(s, &font_sans, label_x, r.y + (r.h - font_sans.height) / 2, label, C_BLACK);
+        gfx_text(s, &font_sans, r.x + r.w - 17, r.y + (r.h - font_sans.height) / 2, "x", C_BLACK);
+    }
+}
+
+static void tab_visibility(struct browser *b, int hidden)
+{
+    if (b->js)
+        jsdom_page_event(b->js, "visibilitychange", hidden);
+    for (struct browser *frame = b->frames; frame; frame = frame->next_frame)
+        tab_visibility(frame, hidden);
+}
+
+static void tab_reset_input(struct browser *b)
+{
+    if (b->js) {
+        struct node *capture = jsdom_pointer_capture(b->js);
+        if (capture)
+            jsdom_mouse_event(b->js, capture, "pointercancel", 0, 0, -1, NULL);
+    }
+    b->hold = H_NONE;
+    b->mouse_frame = NULL;
+    b->drag_range = NULL;
+    b->press_link = b->press_ctrl = NULL;
+    b->sel_start = 0;
+    b->js_hover = NULL;
+    b->tip_node = NULL;
+    b->tip_shown = b->ctx_open = 0;
+    for (struct browser *frame = b->frames; frame; frame = frame->next_frame)
+        tab_reset_input(frame);
+}
+
+static void tab_select(struct browser *b)
+{
+    struct tab_group *group = b->tabs;
+    if (!group)
+        return;
+    struct browser *old = group->active;
+    if (old == b)
+        return;
+    group->active = b;
+    b->win->priv = b;
+    b->focused = old ? old->focused : 0;
+    b->win->icon_img = b->favicon;
+    if (old) {
+        old->focused = 0;
+        tab_reset_input(old);
+        tab_visibility(old, 1);
+    }
+    tab_ensure_visible(b);
+    css_hover_node = css_focus_node = css_focus_visible_node = css_active_node = NULL;
+    b->need_style = 1;
+    if (b->root)
+        relayout(b);
+    tab_visibility(b, b->win->minimized);
+    /* update_title also maintains page_title: avoid overlapping snprintf inputs. */
+    char title[sizeof(b->page_title)];
+    snprintf(title, sizeof(title), "%s", b->page_title);
+    update_title(b, title);
+    wm_damage(b->win->r);
+    paint(b);
+}
+
+static struct browser *tab_new(struct browser *from, const char *url, int activate)
+{
+    from = top_of(from);
+    struct tab_group *group = from->tabs;
+    if (!group || group->count >= TAB_LIMIT) {
+        set_status(from, "The maximum of %d tabs is already open", TAB_LIMIT);
+        paint(from);
+        return NULL;
+    }
+    struct browser *b = calloc(1, sizeof(*b));
+    if (!b) {
+        set_status(from, "Not enough memory to open a tab");
+        paint(from);
+        return NULL;
+    }
+    init_loaders(b);
+    b->win = from->win;
+    b->tabs = group;
+    b->zoom = zoom_of(from);
+    struct browser **last = &group->first;
+    while (*last)
+        last = &(*last)->next_tab;
+    *last = b;
+    group->count++;
+    b->next = browsers;
+    browsers = b;
+    set_status(b, "Ready");
+    if (activate)
+        tab_select(b);
+    if (url)
+        navigate(b, url, NULL, NAV_NEW);
+    paint(group->active);
+    return b;
+}
+
+static void tab_cycle(struct browser *b, int direction)
+{
+    struct tab_group *group = b->tabs;
+    if (!group || group->count < 2)
+        return;
+    struct browser *next = group->first, *previous = NULL;
+    for (struct browser *tab = group->first; tab; tab = tab->next_tab) {
+        if (tab == group->active) {
+            if (direction > 0) {
+                next = tab->next_tab ? tab->next_tab : group->first;
+                break;
+            }
+            if (previous) {
+                next = previous;
+                break;
+            }
+        }
+        previous = tab;
+        if (direction < 0)
+            next = tab;
+    }
+    tab_select(next);
+}
+
+static void tab_close(struct browser *b)
+{
+    struct tab_group *group = b->tabs;
+    if (!group)
+        return;
+    if (group->count == 1) {
+        wm_destroy(b->win);
+        return;
+    }
+    struct browser **entry = &group->first, *previous = NULL;
+    while (*entry && *entry != b) {
+        previous = *entry;
+        entry = &(*entry)->next_tab;
+    }
+    if (!*entry)
+        return;
+    if (group->active == b)
+        tab_select(b->next_tab ? b->next_tab : previous);
+    *entry = b->next_tab;
+    group->count--;
+    unlink_browser(b);
+    destroy_browser(b);
+    tab_ensure_visible(group->active);
+    paint(group->active);
+}
+
+/* The entire strip consumes input so a release cannot activate page content. */
+static int tab_mouse(struct browser *b, int x, int y, int buttons, int changed)
+{
+    struct tab_group *group = b->tabs;
+    if (!group || y < 0 || y >= TABBAR_H)
+        return 0;
+    b->ctx_open = 0;
+    if ((changed & MOUSE_LEFT) && !(buttons & MOUSE_LEFT)) {
+        tab_reset_input(b);
+        return 1;
+    }
+    if (!(changed & (MOUSE_LEFT | MOUSE_MIDDLE)) || !(buttons & changed & (MOUSE_LEFT | MOUSE_MIDDLE)))
+        return 1;
+    int capacity = tab_capacity(b), first = group->first_visible;
+    if (buttons & MOUSE_LEFT) {
+        if (rect_contains(mkrect(b->win->content.w - 30, 3, 26, TABBAR_H - 6), x, y)) {
+            struct browser *tab = tab_new(b, HOME_URL, 1);
+            if (tab) {
+                tab->addr_focus = tab->addr_all = 1;
+                tab->addr_cur = tab->addr_len;
+                paint(tab);
+            }
+            return 1;
+        }
+        if (x >= 4 && x < 54) {
+            if (x < 28 && first > 0)
+                group->first_visible--;
+            else if (x >= 30 && first + capacity < group->count)
+                group->first_visible++;
+            paint(b);
+            return 1;
         }
     }
-    destroy_browser(b);
+    struct browser *tab = tab_number(group, first);
+    for (int index = first; tab && index < first + capacity; tab = tab->next_tab, index++) {
+        struct rect r = tab_rect(b, index);
+        if (!rect_contains(r, x, y))
+            continue;
+        if ((buttons & MOUSE_MIDDLE) || x >= r.x + r.w - 22)
+            tab_close(tab);
+        else
+            tab_select(tab);
+        return 1;                       /* tab_close can destroy the window */
+    }
+    return 1;
 }
 
 /* Free the frames that have been dropped. Only from the main loop: nothing of theirs is on the stack. */
@@ -6813,6 +7210,13 @@ void browser_poll(void)
         if (b->js)
             jsdom_run_timers(b->js);
         if(b->qhead<b->nqueue&&free_loader(b))start_next(b);
+        if (b->js_open[0]) {
+            char u[URL_MAX];
+            snprintf(u, sizeof(u), "%s", b->js_open);
+            b->js_open[0] = 0;
+            tab_new(top_of(b), u, 1);
+            return;                     /* the list may have changed */
+        }
         if (b->js_nav[0]) {
             char u[URL_MAX];
             snprintf(u, sizeof(u), "%s", b->js_nav);
@@ -6843,7 +7247,7 @@ int browser_timeout(void)
     int best = -1;
     for (struct browser *b = browsers; b; b = b->next) {
         if(b->qhead<b->nqueue&&free_loader(b))return 0;
-        if (b->frame_dead || b->frame_nav[0] || b->js_nav[0] || b->js_history || b->js_reload)
+        if (b->frame_dead || b->frame_nav[0] || b->js_open[0] || b->js_nav[0] || b->js_history || b->js_reload)
             return 0;
         int t = jsdom_next_timer(b->js);
         if (t >= 0 && (best < 0 || t < best))
@@ -6890,10 +7294,15 @@ struct window *browser_open(const char *url)
     struct browser *b = calloc(1, sizeof(*b));
     if (!b)
         return NULL;
+    b->tabs = calloc(1, sizeof(*b->tabs));
+    if (!b->tabs) { free(b); return NULL; }
+    b->tabs->first = b->tabs->active = b;
+    b->tabs->count = 1;
     init_loaders(b);
     struct window *w = wm_create("Wave", ICON_BROWSER, BR_W, BR_H, WF_MINIMIZE | WF_MAXIMIZE | WF_RIGHTCLICK,
                                  &br_ops, b);
     if (!w) {
+        free(b->tabs);
         free(b);
         return NULL;
     }

@@ -26,6 +26,7 @@ struct jshost {
     void (*scroll_pos)(void *ctx, int *x, int *y);
     void (*viewport)(void *ctx, int *w, int *h);
     void (*set_title)(void *ctx, const char *title);
+    void (*open_tab)(void *ctx, const char *url);
     void (*load_script)(void *ctx, struct node *script, const char *url);
     void (*load_image)(void *ctx, struct node *img);
     /* The element's border box in page coordinates; 0 if it has none. */

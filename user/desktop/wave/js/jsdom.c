@@ -4050,10 +4050,18 @@ static jsval win_open(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
     struct jsdom *d = dom(J);
+    if (d->h.open_tab && (!argc || ARG(0).t == JS_UNDEF || (ARG(0).t == JS_STR && !ARG(0).u.s->len))) {
+        d->h.open_tab(d->h.ctx, "about:blank");
+        return js_null;
+    }
     if (argc && ARG(0).t == JS_STR && ARG(0).u.s->len) {
         char abs[URL_MAX];
         url_resolve(d->h.base, args[0].u.s->s, abs, sizeof(abs));
-        d->h.navigate(d->h.ctx, abs, 0);
+        const char *target = argc > 1 ? js_cstr(ARG(1)) : "_blank";
+        if (d->h.open_tab && strcmp(target, "_self") && strcmp(target, "_parent") && strcmp(target, "_top"))
+            d->h.open_tab(d->h.ctx, abs);
+        else
+            d->h.navigate(d->h.ctx, abs, 0);
     }
     return js_null;
 }
