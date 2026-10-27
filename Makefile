@@ -337,15 +337,17 @@ $(BUILD)/tests/browser-dom: $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS) user/include/fl
 		-lm -o $@
 
 # Host regression tests use production kernel code with mocked hardware/I/O.
-KERNEL_TEST_NAMES := heap pipe socket storage syscall block sched
+KERNEL_TEST_NAMES := heap pipe socket storage syscall block sched signal
 KERNEL_TEST_BINS := $(addprefix $(BUILD)/tests/kernel-,$(KERNEL_TEST_NAMES))
 .PHONY: test-kernel
 test-kernel: $(KERNEL_TEST_BINS)
 	@set -e; for test in $(KERNEL_TEST_BINS); do $$test; done
 
+$(BUILD)/tests/kernel-signal: KERNEL_TEST_FLAGS = -pthread
+
 $(BUILD)/tests/kernel-%: tests/kernel-%.c tests/kernel-test.h $(wildcard kernel/*/*.c kernel/*/*.h include/flux/*.h)
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter \
+	$(HOSTCC) $(KERNEL_TEST_FLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter \
 		-Wno-int-to-pointer-cast -Wno-pointer-to-int-cast -ffunction-sections -fdata-sections \
 		-Iinclude -Ikernel/core -Ikernel/fs -Ikernel/net -Ikernel/usb -Ikernel/input -Ikernel/storage -Ikernel/sound -Ikernel/video $< -Wl,--gc-sections -o $@
 

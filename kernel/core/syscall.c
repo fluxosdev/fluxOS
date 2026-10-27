@@ -225,14 +225,16 @@ static int sys_signal(uint32_t sig, uint32_t disp, uint32_t c, uint32_t d, uint3
         return -EINVAL;
     uint32_t bit = 1u << sig;
     struct proc *p = current;
+    /* Serialize the disposition and pending-bit update with signal_locked(). */
+    spin_lock(&sched_lock);
     int old = (p->sig_ignored & bit) ? SIGDISP_IGN : SIGDISP_DFL;
-    /* Another processor may be delivering a signal meanwhile. */
     if (disp == SIGDISP_IGN) {
         __atomic_or_fetch(&p->sig_ignored, bit, __ATOMIC_RELAXED);
         __atomic_and_fetch(&p->sig_pending, ~bit, __ATOMIC_RELAXED);
     } else {
         __atomic_and_fetch(&p->sig_ignored, ~bit, __ATOMIC_RELAXED);
     }
+    spin_unlock(&sched_lock);
     return old;
 }
 
@@ -1181,13 +1183,14 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_llseek] = sys_llseek,
 };
 
-/* Calls that walk or change the VFS tree; read and write lock per chunk. */
+/* VFS operations and shared file offsets; read and write lock per chunk. */
 static const uint8_t takes_vfs_lock[NSYSCALLS] = {
     [SYS_open] = 1, [SYS_execve] = 1, [SYS_chdir] = 1, [SYS_getcwd] = 1,
     [SYS_getdents] = 1, [SYS_mkdir] = 1, [SYS_rmdir] = 1, [SYS_unlink] = 1,
     [SYS_rename] = 1, [SYS_chmod] = 1, [SYS_stat] = 1, [SYS_mount] = 1,
     [SYS_umount] = 1, [SYS_statfs] = 1, [SYS_getmounts] = 1, [SYS_blkinfo] = 1,
     [SYS_sync] = 1, [SYS_fsync] = 1, [SYS_blkrescan] = 1, [SYS_ftruncate] = 1,
+    [SYS_lseek] = 1, [SYS_llseek] = 1,
 };
 
 void syscall_dispatch(struct trapframe *tf)

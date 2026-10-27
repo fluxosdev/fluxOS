@@ -76,9 +76,49 @@ static void scheduler_stress(void)
         CHECK(waitpid(children[i], &status, 0) == children[i] && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
     puts("guest: scheduler saturation, timed wakeups, signals and live SSE state passed");
 }
+
+static void shared_offset_stress(void)
+{
+    /* A zero-distance SEEK_CUR only observes the shared offset: it must
+     * never roll back a write made by the other process. Exercise both
+     * syscall entry points through libc on the real SMP kernel. */
+    for (int wide = 0; wide < 2; wide++) {
+        int fd = open("/tmp/seek-race", O_CREAT | O_RDWR | O_TRUNC, 0600);
+        CHECK(fd >= 0);
+        int gate[2]; CHECK(pipe(gate) == 0);
+        int child = fork(); CHECK(child >= 0);
+        if (!child) {
+            close(gate[0]);
+            if (write(gate[1], "r", 1) != 1) _exit(1);
+            close(gate[1]);
+            for (;;) {
+                if (wide ? lseek64(fd, 0, SEEK_CUR) < 0 : lseek(fd, 0, SEEK_CUR) < 0)
+                    _exit(1);
+            }
+        }
+        close(gate[1]);
+        char ready;
+        CHECK(read(gate[0], &ready, 1) == 1);
+        close(gate[0]);
+        const int count = 100000;
+        for (int i = 0; i < count; i++)
+            CHECK(write(fd, "x", 1) == 1);
+        CHECK(kill(child, SIGKILL) == 0);
+        int status;
+        CHECK(waitpid(child, &status, 0) == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+        struct stat st;
+        CHECK(fstat(fd, &st) == 0 && st.st_size == count);
+        CHECK(lseek64(fd, 0, SEEK_CUR) == count);
+        CHECK(close(fd) == 0);
+    }
+    CHECK(unlink("/tmp/seek-race") == 0);
+    puts("guest: shared lseek/lseek64 offsets preserve concurrent writes passed");
+}
+
 int main(void)
 {
     scheduler_stress();
+    shared_offset_stress();
     int fd = open("/tmp/size-test", O_CREAT | O_RDWR, 0600);
     CHECK(fd >= 0);
     CHECK(write(fd, "safe", 4) == 4);
