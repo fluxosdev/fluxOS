@@ -44,7 +44,8 @@ int main(int argc, char **argv)
     struct arena arena = { 0 };
     const char *html = "<!doctype html><html><head></head><body></body></html>";
     struct jshost host = { .arena = &arena, .root = html_parse(&arena, html, (int)strlen(html)),
-                           .url = "file:///tests.html", .status = status, .changed = changed };
+                           .url = "file:///tests.html", .base = "file:///tests.html",
+                           .status = status, .changed = changed };
     struct jsdom *dom = jsdom_new(&host);
     if (!dom)
         return 2;

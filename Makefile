@@ -312,11 +312,11 @@ clean:
 
 # Run the browser's actual HTML/DOM/JS code on the host, without booting QEMU.
 HOSTCC ?= cc
-BROWSER_TEST_SRCS := tests/browser-dom.c tests/canvas-font-stub.c \
+BROWSER_TEST_SRCS := tests/browser-dom.c tests/canvas-font-stub.c tests/js-host-stack.c \
 	$(addprefix user/desktop/wave/js/,js.c jslib.c jslib2.c jsbinary.c jsnet.c jsre.c jsgc.c jsdom.c jscanvas.c) \
 	$(addprefix user/desktop/wave/,canvas.c html.c shadow.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c)
 .PHONY: test-browser
-test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout $(BUILD)/tests/browser-policy $(BUILD)/tests/browser-http
+test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout $(BUILD)/tests/browser-policy $(BUILD)/tests/browser-http
 	$< rootfs/usr/share/www/classlist-tests.js 20
 	$< rootfs/usr/share/www/dom-feature-tests.js 31
 	$(BUILD)/tests/browser-style
@@ -325,12 +325,14 @@ test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-style $(BUILD)/t
 	$(BUILD)/tests/browser-http
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/modern-core-tests.js 44
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/canvas-tests.js 52
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 127
+	$(BUILD)/tests/js-engine
 
 $(BUILD)/tests/browser-dom: $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS) user/include/flux.h include/flux/abi.h
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -Wall -Wextra -Wno-unused-parameter \
+	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DJS_VM_VERIFY -pthread -Wall -Wextra -Wno-unused-parameter \
 		$(DESKTOP_INC) -Iinclude -idirafter user/include $(BROWSER_TEST_SRCS) \
-		-Wl,--defsym=__gc_data_start=__data_start,--defsym=__gc_data_end=_end -lm -o $@
+		-lm -o $@
 
 # Host regression tests use production kernel code with mocked hardware/I/O.
 KERNEL_TEST_NAMES := heap pipe socket storage syscall block sched
@@ -388,9 +390,9 @@ $(BUILD)/tests/browser-policy: tests/browser-policy.c user/desktop/wave/webpolic
 
 $(BUILD)/tests/browser-http: tests/browser-http.c $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie $(DESKTOP_INC) -Iinclude -idirafter user/include \
+	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DJS_VM_VERIFY -pthread $(DESKTOP_INC) -Iinclude -idirafter user/include \
 		tests/browser-http.c $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS)) \
-		-Wl,--defsym=__gc_data_start=__data_start,--defsym=__gc_data_end=_end -lm -o $@
+		-lm -o $@
 
 $(BUILD)/tests/browser-font: tests/browser-font.c user/desktop/wave/webfont.c user/desktop/wave/webutil.c $(FONT_SRCS) $(FREETYPE_DIR)/flux_ftoption.h
 	@mkdir -p $(dir $@)
@@ -417,7 +419,35 @@ test-websocket: $(BUILD)/tests/wsc $(BUILD)/tests/browser-ws
 
 $(BUILD)/tests/browser-ws: tests/browser-ws.c $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie $(DESKTOP_INC) -Iinclude -idirafter user/include \
+	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DJS_VM_VERIFY -pthread $(DESKTOP_INC) -Iinclude -idirafter user/include \
 		-DWS_HELPER='"$(CURDIR)/$(BUILD)/tests/wsc"' \
 		tests/browser-ws.c $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS)) \
-		-Wl,--defsym=__gc_data_start=__data_start,--defsym=__gc_data_end=_end -lm -o $@
+		-lm -o $@
+
+# Engine-level tests include real collections on the host's main and coroutine stacks.
+JS_ENGINE_SRCS := tests/js-engine.c tests/js-host-stack.c \
+	$(addprefix user/desktop/wave/js/,js.c jslib.c jslib2.c jsbinary.c jsre.c jsgc.c) \
+	user/desktop/wave/webutil.c
+$(BUILD)/tests/js-engine: $(JS_ENGINE_SRCS) $(DESKTOP_HDRS) include/flux/abi.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DJS_VM_VERIFY -pthread \
+		-Wall -Wextra -Wno-unused-parameter $(DESKTOP_INC) -Iinclude -idirafter user/include \
+		$(JS_ENGINE_SRCS) -lm -o $@
+
+.PHONY: test-js bench-js
+test-js: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 127
+	$(BUILD)/tests/js-engine
+
+# Each case is a separate entry so the page's step budget applies per case.
+bench-js: $(BUILD)/tests/browser-bench
+	@set -e; for case in tests/js-bench/*.js; do \
+		/usr/bin/time -f '%e seconds, %M KiB peak RSS' $< $$case 1; \
+	done
+
+# Measure the optimized VM without the test runner's per-instruction assertions.
+$(BUILD)/tests/browser-bench: $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS) user/include/flux.h include/flux/abi.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -g -fno-pie -no-pie -DJS_HOST_TEST -pthread \
+		$(DESKTOP_INC) -Iinclude -idirafter user/include $(BROWSER_TEST_SRCS) \
+		-lm -o $@

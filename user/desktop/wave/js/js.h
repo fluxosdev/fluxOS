@@ -1,7 +1,7 @@
 /*
- * The browser's JavaScript engine (js.c): a tree-walking interpreter for
- * a practical subset of ES5 and ES6, and its built-in objects. jsdom.c
- * binds it to the document.
+ * The browser's JavaScript engine (js.c, jsvm.h): a bytecode compiler and
+ * virtual machine, with built-in objects in jslib*.c. jsdom.c binds it to
+ * the document.
  *
  * What a page's scripts allocate is garbage collected (jsgc.c), within a
  * limit. A script that runs too long, or keeps too much, is stopped with

@@ -1098,6 +1098,8 @@ static int u16match(const struct jsstr *s, const struct jsstr *sub, int at)
     int n = js_u16len(sub);
     if (at < 0 || at + n > js_u16len(s))
         return 0;
+    if (js_u16len(s) == s->len)                 /* ASCII: positions are byte offsets */
+        return sub->len == n && !memcmp(s->s + at, sub->s, (size_t)n);
     for (int i = 0; i < n; i++)
         if (js_u16unit(s, at + i) != js_u16unit(sub, i))
             return 0;
@@ -1117,7 +1119,24 @@ static jsval string_index_of(struct js *J, jsval self, jsval *args, int argc)
 {
     struct jsstr *s = this_string(J, self), *sub = js_tostr(J, ARG(0));
     int len = js_u16len(s);
-    for (int i = int_arg(J, args, argc, 1, 0, 0, len); i <= len; i++)
+    int from = int_arg(J, args, argc, 1, 0, 0, len);
+    if (len == s->len) {                        /* ASCII: a byte search */
+        if (js_u16len(sub) != sub->len)
+            return js_num(sub->len ? -1 : from);
+        if (!sub->len)
+            return js_num(from);
+        if (sub->len > s->len - from)
+            return js_num(-1);
+        for (const char *p = s->s + from, *last = s->s + s->len - sub->len; p <= last; p++) {
+            p = memchr(p, sub->s[0], (size_t)(last - p + 1));
+            if (!p)
+                break;
+            if (!memcmp(p, sub->s, (size_t)sub->len))
+                return js_num((double)(p - s->s));
+        }
+        return js_num(-1);
+    }
+    for (int i = from; i <= len; i++)
         if (u16match(s, sub, i))
             return js_num(i);
     return js_num(-1);

@@ -353,7 +353,15 @@ static void drain(struct gcheap *h)
     }
 }
 
+#ifdef JS_HOST_TEST
+/* Use the final ELF symbols directly. A command-line --defsym alias to
+ * _end can retain its pre-relaxation value with the host linker. */
+extern char __data_start[], _end[];
+#define __gc_data_start __data_start
+#define __gc_data_end _end
+#else
 extern char __gc_data_start[], __gc_data_end[];
+#endif
 
 /* Scan everything from this frame up: mark_roots's, with the registers it saved, and above. */
 static int __attribute__((noinline)) scan_roots(struct js *J)
@@ -466,7 +474,6 @@ void gc_collect(struct js *J)
     if (!h || J->gc_inhibit)
         return;
     J->gc_inhibit++;                    /* hooks must not allocate; nor start another */
-    js_gc_before(J);
     h->sp = 0;
     h->overflow = 0;
     if (mark_roots(J) < 0) {

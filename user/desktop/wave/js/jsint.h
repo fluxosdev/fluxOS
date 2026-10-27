@@ -1,6 +1,6 @@
 /*
  * The JavaScript engine's insides, shared by js.c (values, the parser and
- * the interpreter), jslib.c (the built-in objects) and jsre.c (regular
+ * compiler and VM), jslib.c (the built-in objects) and jsre.c (regular
  * expressions). Nothing outside the engine includes this.
  */
 #ifndef JSINT_H
@@ -19,6 +19,7 @@
 struct jsstr {
     int len;                            /* bytes of UTF-8 */
     int utf16_length;                   /* cached code-unit length, zero until measured */
+    uint32_t hash;                      /* of the UTF-16 code units, zero until needed */
     char s[];                           /* NUL-terminated as well */
 };
 
@@ -37,6 +38,7 @@ enum {
 
 struct ast;
 struct coro;
+struct vcompile;
 struct env;
 struct regex;
 
@@ -52,7 +54,11 @@ struct jsobj {
     uint8_t arrow;                      /* an arrow function: this from its scope */
     uint8_t ctor;                       /* a native that may be called with new */
     struct jsobj *proto;
-    struct prop *props;
+    struct prop *props;                 /* in the order they were added */
+    struct prop *last;
+    /* With more than a few properties, a hash table of them too (js_own). */
+    struct prop **tab;
+    uint32_t tabcap, tabused, nprops;
     /* C_ARRAY, C_ARGUMENTS */
     jsval *items;
     int len, cap;
@@ -96,10 +102,7 @@ struct js {
     /* a thrown value in flight */
     int throwing;
     jsval exc;
-    /* control flow */
-    jsval retval;
     jsval completion;                   /* the last expression statement's value (eval) */
-    struct jsstr *label;                /* break/continue label */
     int constructing;                   /* a native called with new */
     unsigned steps, step_limit;
     size_t heap_limit;
@@ -107,6 +110,7 @@ struct js {
     int depth;
     int dead;                           /* out of memory or time: no more scripts */
     struct jsstr *s_home;               /* the hidden variable that holds a method's home object */
+    struct jsstr *s_prototype;          /* "prototype", made once: every new and instanceof asks */
     struct job *jobs, *jobs_tail;       /* the microtask queue (promises) */
     int in_jobs;
     struct jsobj *promise_proto, *generator_proto, *agen_proto;
@@ -115,6 +119,7 @@ struct js {
     struct jsstr *s_value, *s_done;     /* iterator results' keys */
     struct coro *cur_co, *co_live;      /* the running coroutine, all those with a stack */
     int nco;
+    struct vcompile *compiler;          /* reusable compilation stack, separate from coroutine stacks */
     unsigned lazy_done;                 /* which lazily loaded library chunks have run (jslib2.c) */
     struct jsobj *return_marker;        /* thrown to unwind a generator that is being closed */
     /* ES modules (js.c) */
@@ -139,7 +144,6 @@ size_t gc_heap_bytes(struct js *J);                     /* in use, garbage inclu
  * running on (sp is where this one is now); -1 if sp is on none it knows. */
 int js_gc_scan_stacks(struct js *J, const char *sp,
                       void (*scan)(struct js *J, const void *lo, const void *hi));
-void js_gc_before(struct js *J);        /* drop what the engine keeps only for reuse */
 
 /* js.c */
 void *js_alloc(struct js *J, size_t n);
@@ -155,6 +159,7 @@ void js_setv(struct js *J, jsval obj, jsval key, jsval v);
 jsval js_get_str(struct js *J, jsval obj, struct jsstr *key);
 void js_put(struct js *J, struct jsobj *o, struct jsstr *key, jsval v, int hidden);
 struct prop *js_own(struct jsobj *o, struct jsstr *key);
+uint32_t js_str_hash(struct jsstr *s);
 int js_has(struct js *J, jsval obj, struct jsstr *key);
 int js_delete(struct js *J, jsval obj, struct jsstr *key);
 jsval js_call_value(struct js *J, jsval f, jsval self, jsval *args, int argc);

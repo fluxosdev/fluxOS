@@ -320,9 +320,15 @@ fetcher process, so the desktop keeps running), or from `file://`.
 - `<details>`/`<summary>` open and close when clicked. Links, `GET`/`POST` forms, `<meta refresh>`, fragments, redirects, iframes,
   `:visited` colors, and anti-aliased text (Liberation Sans, Serif and Mono in
   12 sizes, rasterised by `tools/mkfont.py`).
-- **JavaScript**: a tree-walking interpreter (js.c, jslib.c, jslib2.c, jsre.c)
+- **JavaScript**: a bytecode compiler and virtual machine (js.c, jsvm.h,
+  jslib.c, jslib2.c, jsre.c)
   that runs inline and external scripts (`defer` ones and modules after the
-  rest), then `DOMContentLoaded` and `load`.
+  rest), then `DOMContentLoaded` and `load`. Scope analysis resolves local
+  variables to frame slots and captured variables to heap environment slots;
+  functions compile on first use. Ordinary functions, generators, async
+  functions, classes, destructuring, modules, `eval` and event handlers all run
+  as bytecode. Property hash tables preserve insertion order, and ASCII
+  string operations have direct byte paths while retaining UTF-16 semantics.
   It covers most of ES2020 and some later: `let`/`const`, arrow functions,
   template literals, destructuring, spread, optional chaining, classes
   (fields, `#private`, `extends`, `super`, statics and `static {}` blocks),
@@ -454,6 +460,8 @@ host's GRUB. The ISO boots on legacy BIOS only.
 make            # builds fluxOS.iso
 make check      # verifies the kernel is a valid Multiboot image
 make test-browser # DOM, CSS/layout, binary/Unicode, shadow/motion and HTTP policy regressions
+make test-js     # language, module, suspended-frame and real garbage-collection regressions
+make bench-js   # ten standalone JavaScript workloads with wall time and peak memory
 make test-browser-fonts # real glyph rendering and malformed-font rejection
 make test-tls     # local OpenSSL servers: authenticated handshakes and rejected certificates
 make test-websocket # local ws/wss transport and browser API integration tests

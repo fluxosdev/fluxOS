@@ -1,7 +1,7 @@
 /*
  * The JavaScript engine: values, objects, the lexer, the parser and a
- * tree-walking interpreter. The built-in objects are in jslib.c and
- * regular expressions in jsre.c.
+ * bytecode compiler and VM (jsvm.h). The built-in objects are in jslib.c
+ * and regular expressions in jsre.c.
  *
  * The language is most of ES2020 and some later: var, let and const;
  * functions, closures and arrow functions with default and rest
@@ -20,8 +20,8 @@
  * Strings are stored as UTF-8/WTF-8; indexed access and core string
  * operations expose UTF-16 code units. The regex engine still uses bytes.
  *
- * Memory comes from an arena. Call environments that no closure captured
- * are recycled; everything else lasts until the page goes. Running out of
+ * Memory is garbage collected. Uncaptured locals live in VM frame slots;
+ * closures keep captured locals in heap environments. Running out of
  * memory, or of steps, ends the page's scripts: the engine jumps back to
  * the outermost entry (with GCC's builtin setjmp).
  */
@@ -123,6 +123,8 @@ int js_u16unit(const struct jsstr *s, int index)
 {
     if (index < 0)
         return -1;
+    if (js_u16len(s) == s->len)                 /* ASCII: a unit is a byte */
+        return index < s->len ? (unsigned char)s->s[index] : -1;
     const char *p = s->s, *end = p + s->len;
     while (p < end) {
         int cp = utf8_next(&p, end);
@@ -140,6 +142,15 @@ struct jsstr *js_u16slice(struct js *J, const struct jsstr *s, int start, int en
 {
     if (end <= start)
         return js_mkstr(J, "", 0);
+    if (js_u16len(s) == s->len) {               /* ASCII: units are bytes */
+        if (start < 0)
+            start = 0;
+        if (start > s->len)
+            start = s->len;
+        if (end > s->len)
+            end = s->len;
+        return js_mkstr(J, s->s + start, end > start ? end - start : 0);
+    }
     char *buf = js_alloc_atomic(J, (size_t)(end - start) * 3 + 1);
     const char *p = s->s, *limit = p + s->len;
     int i = 0, n = 0;
@@ -171,8 +182,9 @@ static int str_eq(const struct jsstr *a, const struct jsstr *b)
 {
     if (a == b || (a->len == b->len && !memcmp(a->s, b->s, (size_t)a->len)))
         return 1;
-    /* A scalar and its separately produced surrogate pair are the same JS string. */
-    if (js_u16len(a) != js_u16len(b))
+    /* A scalar and its separately produced surrogate pair are the same JS
+     * string; ASCII strings that differ in bytes are simply different. */
+    if (js_u16len(a) != js_u16len(b) || js_u16len(a) == a->len || js_u16len(b) == b->len)
         return 0;
     const char *ap = a->s, *bp = b->s, *ae = ap + a->len, *be = bp + b->len;
     int ah = 0, bh = 0;
@@ -183,6 +195,33 @@ static int str_eq(const struct jsstr *a, const struct jsstr *b)
         if (x < 0)
             return 1;
     }
+}
+
+/* A hash that agrees with str_eq: over UTF-16 code units, so the two ways
+ * of writing a character outside the BMP hash alike. */
+uint32_t js_str_hash(struct jsstr *s)
+{
+    if (s->hash)
+        return s->hash;
+    uint32_t h = 2166136261u;
+    int ascii = 1;
+    for (int i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->s[i];
+        if (c >= 0x80) {
+            ascii = 0;
+            break;
+        }
+        h = (h ^ c) * 16777619u;
+    }
+    if (!ascii) {
+        h = 2166136261u;
+        const char *p = s->s, *end = p + s->len;
+        int pending = 0;
+        for (int u; (u = next_u16(&p, end, &pending)) >= 0;)
+            h = (h ^ (uint32_t)u) * 16777619u;
+    }
+    s->hash = h ? h : 1;
+    return s->hash;
 }
 
 static int str_is(const struct jsstr *a, const char *c)
@@ -652,12 +691,56 @@ void *js_host_data(struct jsobj *o, const struct jsclass *cls)
     return o && o->cls == C_HOST && o->hcls == cls ? o->hdata : NULL;
 }
 
+/*
+ * Properties are a list in the order they were added, which enumeration
+ * follows. An object with more than PROP_TAB_MIN of them also gets an open
+ * addressing hash table over the list, so lookups do not walk it; a deleted
+ * property leaves a tombstone until the table is next rebuilt.
+ */
+#define PROP_TAB_MIN 8
+
+static struct prop prop_tomb;
+
+static int key_eq(struct jsstr *a, struct jsstr *b)
+{
+    return a == b || (js_str_hash(a) == js_str_hash(b) && str_eq(a, b));
+}
+
 struct prop *js_own(struct jsobj *o, struct jsstr *key)
 {
+    if (o->tab) {
+        uint32_t mask = o->tabcap - 1, i = js_str_hash(key) & mask;
+        for (struct prop *p; (p = o->tab[i]) != NULL; i = (i + 1) & mask)
+            if (p != &prop_tomb && key_eq(p->key, key))
+                return p;
+        return NULL;
+    }
     for (struct prop *p = o->props; p; p = p->next)
-        if (str_eq(p->key, key))
+        if (key_eq(p->key, key))
             return p;
     return NULL;
+}
+
+static void tab_add(struct prop **tab, uint32_t cap, struct prop *p)
+{
+    uint32_t mask = cap - 1, i = js_str_hash(p->key) & mask;
+    while (tab[i] && tab[i] != &prop_tomb)
+        i = (i + 1) & mask;
+    tab[i] = p;
+}
+
+/* (Re)build o's table from its list, with room to spare and no tombstones. */
+static void tab_build(struct js *J, struct jsobj *o)
+{
+    uint32_t cap = 16;
+    while (cap < o->nprops * 2 + 2)
+        cap *= 2;
+    struct prop **tab = js_alloc(J, sizeof(*tab) * cap);
+    for (struct prop *p = o->props; p; p = p->next)
+        tab_add(tab, cap, p);
+    o->tab = tab;
+    o->tabcap = cap;
+    o->tabused = o->nprops;
 }
 
 void js_put(struct js *J, struct jsobj *o, struct jsstr *key, jsval v, int hidden)
@@ -668,12 +751,41 @@ void js_put(struct js *J, struct jsobj *o, struct jsstr *key, jsval v, int hidde
         p->key = key;
         p->hidden = (uint8_t)hidden;
         /* Append, so enumeration follows insertion order. */
-        struct prop **pp = &o->props;
-        while (*pp)
-            pp = &(*pp)->next;
-        *pp = p;
+        if (o->last)
+            o->last->next = p;
+        else
+            o->props = p;
+        o->last = p;
+        o->nprops++;
+        if (o->tab && (o->tabused + 1) * 2 <= o->tabcap) {
+            tab_add(o->tab, o->tabcap, p);
+            o->tabused++;
+        } else if (o->tab || o->nprops > PROP_TAB_MIN) {
+            tab_build(J, o);
+        }
     }
     p->v = v;
+}
+
+/* Take p off o's list and out of its table. */
+static void prop_unlink(struct jsobj *o, struct prop **pp)
+{
+    struct prop *p = *pp;
+    *pp = p->next;
+    if (o->last == p) {
+        o->last = NULL;
+        for (struct prop *q = o->props; q; q = q->next)
+            o->last = q;
+    }
+    o->nprops--;
+    if (o->tab) {
+        uint32_t mask = o->tabcap - 1, i = js_str_hash(p->key) & mask;
+        for (; o->tab[i]; i = (i + 1) & mask)
+            if (o->tab[i] == p) {
+                o->tab[i] = &prop_tomb;
+                break;
+            }
+    }
 }
 
 static void array_reserve(struct js *J, struct jsobj *a, int n)
@@ -785,7 +897,7 @@ static int obj_get(struct js *J, struct jsobj *o, struct jsstr *key, jsval self,
 
 static jsval fn_prototype(struct js *J, struct jsobj *f)
 {
-    struct jsstr *name = js_mkstr(J, "prototype", 9);
+    struct jsstr *name = J->s_prototype;
     struct prop *p = js_own(f, name);
     if (p)
         return p->v;
@@ -989,7 +1101,7 @@ int js_delete(struct js *J, jsval obj, struct jsstr *key)
     }
     for (struct prop **pp = &o->props; *pp; pp = &(*pp)->next)
         if (str_eq((*pp)->key, key)) {
-            *pp = (*pp)->next;
+            prop_unlink(o, pp);
             return 1;
         }
     return 1;
@@ -1693,6 +1805,7 @@ struct ast {
     struct regex *re;
     struct jsstr *re_flags;
     struct fninfo *info;
+    void *vm;                           /* jsvm.h: a function's or root's vfunc, a scope's vscope */
 };
 
 #define F_OPTIONAL 1                    /* ?. */
@@ -2132,6 +2245,7 @@ static struct ast *this_member(struct parser *P, struct ast *field)
         target = mk(P, N_INDEX);
         target->a = mk(P, N_THIS);
         target->b = field->b;
+        field->c = target;             /* analysis replaces its key with a captured definition-time key */
     } else {
         target = mk(P, N_MEMBER);
         target->a = mk(P, N_THIS);
@@ -3503,53 +3617,20 @@ struct binding {
     struct binding *alias;              /* an import: the exporting module's binding */
 };
 
+/*
+ * An environment: the dynamic scopes (the global one, a module's) keep
+ * named bindings; the scopes compiled code makes (jsvm.h) keep slots, which
+ * that code reaches by number.
+ */
 struct env {
     struct env *parent;
     struct binding *vars;
     struct jsobj *obj;                  /* the global object, for the global scope */
     jsval self;
     uint8_t has_self;
-    uint8_t captured;                   /* a closure holds it: never recycled */
+    int nslots;
+    jsval slots[];
 };
-
-static struct env *free_envs;
-static struct binding *free_bindings;
-static struct js *free_owner;
-
-static struct env *new_env(struct js *J, struct env *parent)
-{
-    struct env *e;
-    if (free_owner == J && free_envs) {
-        e = free_envs;
-        free_envs = e->parent;
-        memset(e, 0, sizeof(*e));
-    } else {
-        e = js_alloc(J, sizeof(*e));
-    }
-    e->parent = parent;
-    return e;
-}
-
-static void recycle_env(struct js *J, struct env *e)
-{
-    if (e->captured || free_owner != J)
-        return;
-    struct binding *b = e->vars;
-    while (b) {
-        struct binding *next = b->next;
-        b->next = free_bindings;
-        free_bindings = b;
-        b = next;
-    }
-    e->parent = free_envs;
-    free_envs = e;
-}
-
-static void capture(struct env *e)
-{
-    for (; e && !e->captured; e = e->parent)
-        e->captured = 1;
-}
 
 static struct binding *declare(struct js *J, struct env *e, struct jsstr *name, jsval v, int konst)
 {
@@ -3559,13 +3640,7 @@ static struct binding *declare(struct js *J, struct env *e, struct jsstr *name, 
             b->konst = (uint8_t)konst;
             return b;
         }
-    struct binding *b;
-    if (free_owner == J && free_bindings) {
-        b = free_bindings;
-        free_bindings = b->next;
-    } else {
-        b = js_alloc(J, sizeof(*b));
-    }
+    struct binding *b = js_alloc(J, sizeof(*b));
     b->name = name;
     b->v = v;
     b->konst = (uint8_t)konst;
@@ -3612,22 +3687,29 @@ static struct binding *lookup(struct env *e, struct jsstr *name, struct jsobj **
     return NULL;
 }
 
-/* ---- the interpreter ---- */
+/* ---- execution helpers shared with the VM ---- */
 
-enum { CN, CR, CB, CC, CT };            /* normal, return, break, continue, throw */
-
-enum { B_ASSIGN, B_VAR, B_LET, B_CONST };      /* how bind_pattern declares what it binds */
-
-static jsval eval(struct js *J, struct ast *n, struct env *e);
 static jsval mod_import(struct js *J, const char *spec, const char *base);
 static int in_async_gen(struct js *J);
-static void bind_pattern(struct js *J, struct ast *p, jsval v, struct env *e, int mode);
-static jsval super_call(struct js *J, struct ast *n, struct env *e);
-static jsval super_get(struct js *J, struct ast *n, struct env *e, jsval key);
 static jsval await_value(struct js *J, jsval v);
 static jsval yield_value(struct js *J, jsval v);
-static int exec(struct js *J, struct ast *n, struct env *e);
-static int exec_list(struct js *J, struct ast **list, int n, struct env *e);
+/* jsvm.h */
+struct vfunc;
+struct vproto;
+#define COMPILE_STACK (1024u * 1024u)
+struct vcompile {
+    struct js *J;
+    void *stack, *sp, *caller_sp;
+    struct vfunc *vf;
+    struct vproto *result;
+    int root, active;
+};
+static struct vproto *compile_on_stack(struct js *J, struct vfunc *vf, int root);
+static struct vfunc *an_root(struct js *J, struct ast *prog);
+static struct vproto *compile_function(struct js *J, struct vfunc *vf);
+static struct vproto *compile_root(struct js *J, struct vfunc *vf);
+static jsval vm_run(struct js *J, struct vproto *P, struct jsobj *f, struct env *e, jsval self,
+                    jsval *args, int argc);
 
 #define TRY(v) do { if (J->throwing) return js_undefined; } while (0)
 
@@ -3680,15 +3762,7 @@ static jsval make_function(struct js *J, struct ast *fn, struct env *e)
     f->name = fn->str ? fn->str->s : "";
     f->nargs = fn->n - ((fn->flags & F_REST) ? 1 : 0);
     f->arrow = (fn->flags & F_ARROW) != 0;
-    if (fn->b == fn) {                  /* a named function expression sees its name */
-        struct env *own = new_env(J, e);
-        declare(J, own, fn->str, js_obj(f), 0);
-        e = own;
-    }
-    capture(e);
     f->scope = e;
-    if (fn->a && fn->a->kind == S_BLOCK && fn->info && !fn->info->prepared)
-        prepare_body(J, fn->a, fn->info);
     return js_obj(f);
 }
 
@@ -3701,77 +3775,18 @@ static jsval run_user(struct js *J, struct jsobj *f, jsval self, jsval *args, in
         J->depth--;
         return js_throw_error(J, "RangeError: maximum call stack size exceeded");
     }
+    jsval result;
     if (fn->flags & F_MODULE) {         /* its bindings were made when it was linked */
-        exec_list(J, fn->a->list, fn->a->n, f->scope);
-        J->depth--;
-        return js_undefined;
-    }
-    struct env *e = new_env(J, f->scope);
-    if (f->home)
-        declare(J, e, J->s_home, js_obj(f->home), 0);
-    if (!f->arrow) {
-        e->has_self = 1;
-        if (self.t == JS_UNDEF || self.t == JS_NULL)
-            self = js_obj(J->global);           /* sloppy mode */
-        e->self = self;
-        if (fn->info && fn->info->uses_args) {
-            struct jsobj *a = js_mkobj(J, C_ARGUMENTS, J->object_proto);
-            for (int i = 0; i < argc; i++)
-                js_array_push(J, a, args[i]);
-            js_put(J, a, js_mkstr(J, "callee", 6), js_obj(f), 1);
-            declare(J, e, js_mkstr(J, "arguments", 9), js_obj(a), 0);
-            capture(e);                         /* arguments may outlive the call */
-        }
-    }
-    for (int i = 0; i < fn->n; i++) {
-        struct ast *p = fn->list[i];
-        jsval v;
-        if ((fn->flags & F_REST) && i == fn->n - 1) {
-            struct jsobj *rest = js_new_array(J);
-            for (int k = i; k < argc; k++)
-                js_array_push(J, rest, args[k]);
-            v = js_obj(rest);
-        } else {
-            v = i < argc ? args[i] : js_undefined;
-            if (v.t == JS_UNDEF && p->a) {
-                v = eval(J, p->a, e);
-                if (J->throwing) {
-                    J->depth--;
-                    return js_undefined;
-                }
-            }
-        }
-        if (p->kind == N_DESTRUCT) {
-            bind_pattern(J, p->b, v, e, B_LET);
-            if (J->throwing) {
-                J->depth--;
-                return js_undefined;
-            }
-        } else {
-            declare(J, e, p->str, v, 0);
-        }
-    }
-    jsval result = js_undefined;
-    if (fn->flags & F_EXPRBODY) {
-        result = eval(J, fn->a, e);
+        vm_run(J, compile_on_stack(J, fn->a->vm, 1), NULL, f->scope, js_undefined, NULL, 0);
+        result = js_undefined;
+    } else if (!fn->vm) {
+        result = js_throw_error(J, "InternalError: function %s was not compiled", f->name ? f->name : "");
     } else {
-        struct fninfo *fi = fn->info;
-        for (int i = 0; fi && i < fi->nvars; i++) {
-            struct binding *b;
-            for (b = e->vars; b; b = b->next)
-                if (str_eq(b->name, fi->vars[i]))
-                    break;
-            if (!b)
-                declare(J, e, fi->vars[i], js_undefined, 0);
-        }
-        for (int i = 0; fi && i < fi->nfuncs; i++)
-            declare(J, e, fi->funcs[i]->str, make_function(J, fi->funcs[i], e), 0);
-        int c = exec_list(J, fn->a->list, fn->a->n, e);
-        if (c == CR)
-            result = J->retval;
+        if (!f->arrow && (self.t == JS_UNDEF || self.t == JS_NULL))
+            self = js_obj(J->global);           /* sloppy mode */
+        result = vm_run(J, compile_on_stack(J, fn->vm, 0), f, f->scope, self, args, argc);
     }
     J->depth--;
-    recycle_env(J, e);
     return J->throwing ? js_undefined : result;
 }
 
@@ -3841,56 +3856,13 @@ jsval js_construct(struct js *J, jsval fv, jsval *args, int argc)
         J->constructing = saved;
         return r;
     }
-    jsval proto = js_get(J, js_obj(f), "prototype");
+    jsval proto = js_get_str(J, js_obj(f), J->s_prototype);
     struct jsobj *o = js_mkobj(J, C_OBJECT, proto.t == JS_OBJ ? proto.u.o : J->object_proto);
     step(J);
     jsval r = call_user(J, f, js_obj(o), args, argc);
     if (J->throwing)
         return js_undefined;
     return r.t == JS_OBJ ? r : js_obj(o);
-}
-
-/* Evaluate a call's arguments, spreading arrays; returns the count. */
-static int eval_args(struct js *J, struct ast *call, struct env *e, jsval **out, jsval *local, int nlocal)
-{
-    int n = 0, cap = nlocal;
-    jsval *args = local;
-    for (int i = 0; i < call->n; i++) {
-        struct ast *a = call->list[i];
-        if (a->kind == N_SPREAD) {
-            jsval v = eval(J, a->a, e);
-            if (J->throwing)
-                return -1;
-            struct iter it;
-            if (js_iter_open(J, v, &it) < 0)
-                return -1;
-            jsval item;
-            int r;
-            while ((r = js_iter_next(J, &it, &item)) > 0) {
-                if (n == cap) {
-                    jsval *na = js_alloc(J, sizeof(jsval) * (size_t)cap * 2);
-                    memcpy(na, args, sizeof(jsval) * (size_t)n);
-                    args = na;
-                    cap *= 2;
-                }
-                args[n++] = item;
-            }
-            if (r < 0)
-                return -1;
-            continue;
-        }
-        if (n == cap) {
-            jsval *na = js_alloc(J, sizeof(jsval) * (size_t)cap * 2);
-            memcpy(na, args, sizeof(jsval) * (size_t)n);
-            args = na;
-            cap *= 2;
-        }
-        args[n++] = eval(J, a, e);
-        if (J->throwing)
-            return -1;
-    }
-    *out = args;
-    return n;
 }
 
 static const char *type_of(jsval v)
@@ -3957,7 +3929,7 @@ static int instance_of(struct js *J, jsval v, jsval ctor)
     struct jsobj *f = ctor.u.o;
     while (f->bound)
         f = f->bound;
-    jsval proto = js_get(J, js_obj(f), "prototype");
+    jsval proto = js_get_str(J, js_obj(f), J->s_prototype);
     if (proto.t != JS_OBJ)
         return 0;
     for (struct jsobj *o = v.u.o->proto; o; o = o->proto)
@@ -4000,48 +3972,6 @@ static jsval binary_op(struct js *J, int op, jsval a, jsval b)
         return js_bool(js_has(J, b, js_tostr(J, a)));
     }
     return js_undefined;
-}
-
-/* A reference: where an assignment or ++ goes. */
-struct ref {
-    int kind;                           /* N_IDENT, N_MEMBER, N_INDEX */
-    jsval obj, key;
-    struct jsstr *name;
-};
-
-static int make_ref(struct js *J, struct ast *n, struct env *e, struct ref *r)
-{
-    r->kind = n->kind;
-    if (n->kind == N_IDENT) {
-        r->name = n->str;
-        return 0;
-    }
-    r->obj = eval(J, n->a, e);
-    if (J->throwing)
-        return -1;
-    if (n->kind == N_MEMBER)
-        r->key = strv(n->str);
-    else {
-        r->key = eval(J, n->b, e);
-        if (J->throwing)
-            return -1;
-    }
-    return 0;
-}
-
-static jsval ref_get(struct js *J, struct ref *r, struct env *e)
-{
-    if (r->kind == N_IDENT)
-        return read_var(J, e, r->name, 0);
-    return js_getv(J, r->obj, r->key);
-}
-
-static void ref_put(struct js *J, struct ref *r, struct env *e, jsval v)
-{
-    if (r->kind == N_IDENT)
-        write_var(J, e, r->name, v);
-    else
-        js_setv(J, r->obj, r->key, v);
 }
 
 /* ---- iteration ---- */
@@ -4174,227 +4104,6 @@ void js_iter_close(struct js *J, struct iter *it)
     }
 }
 
-/* ---- destructuring ---- */
-
-static void bind_name(struct js *J, struct env *e, struct jsstr *name, jsval v, int mode)
-{
-    if (mode == B_ASSIGN || mode == B_VAR)
-        write_var(J, e, name, v);
-    else if (e->obj)
-        js_put(J, e->obj, name, v, 0);          /* top-level let/const: global */
-    else
-        declare(J, e, name, v, mode == B_CONST);
-}
-
-static void bind_pattern(struct js *J, struct ast *p, jsval v, struct env *e, int mode)
-{
-    switch (p->kind) {
-    case N_IDENT:
-        bind_name(J, e, p->str, v, mode);
-        return;
-    case N_MEMBER:
-    case N_INDEX: {
-        struct ref r;
-        if (make_ref(J, p, e, &r) == 0)
-            ref_put(J, &r, e, v);
-        return;
-    }
-    case N_ASSIGN:                      /* a target with a default */
-        if (v.t == JS_UNDEF) {
-            v = eval(J, p->b, e);
-            if (J->throwing)
-                return;
-            if (p->a->kind == N_IDENT && js_is_callable(v) && v.u.o->fn &&
-                (!v.u.o->name || !*v.u.o->name))
-                v.u.o->name = p->a->str->s;
-        }
-        bind_pattern(J, p->a, v, e, mode);
-        return;
-    case N_ARRAY: {
-        struct iter it;
-        if (js_iter_open(J, v, &it) < 0)
-            return;
-        int done = 0;
-        for (int i = 0; i < p->n && !J->throwing; i++) {
-            struct ast *x = p->list[i];
-            jsval item = js_undefined;
-            if (x->kind == N_SPREAD) {
-                struct jsobj *rest = js_new_array(J);
-                while (!done) {
-                    int r = js_iter_next(J, &it, &item);
-                    if (r < 0)
-                        return;
-                    if (!r)
-                        done = 1;
-                    else
-                        js_array_push(J, rest, item);
-                }
-                bind_pattern(J, x->a, js_obj(rest), e, mode);
-                return;
-            }
-            if (!done) {
-                int r = js_iter_next(J, &it, &item);
-                if (r < 0)
-                    return;
-                if (!r) {
-                    done = 1;
-                    item = js_undefined;
-                }
-            }
-            if (x->kind != N_HOLE)
-                bind_pattern(J, x, item, e, mode);
-        }
-        if (!done)
-            js_iter_close(J, &it);
-        return;
-    }
-    case N_OBJECT: {
-        if (v.t == JS_UNDEF || v.t == JS_NULL) {
-            js_throw_error(J, "TypeError: cannot destructure '%s'", v.t == JS_NULL ? "null" : "undefined");
-            return;
-        }
-        struct jsstr *used[32];
-        int nused = 0;
-        for (int i = 0; i < p->n; i++) {
-            struct ast *pr = p->list[i];
-            if (pr->kind == N_SPREAD) {         /* {a, ...rest} */
-                struct jsobj *rest = js_new_object(J);
-                struct jsstr **keys;
-                int nk = js_keys(J, v, 0, &keys);
-                for (int k = 0; k < nk; k++) {
-                    int skip = 0;
-                    for (int u = 0; u < nused; u++)
-                        skip |= str_eq(used[u], keys[k]);
-                    if (!skip)
-                        js_put(J, rest, keys[k], js_get_str(J, v, keys[k]), 0);
-                }
-                bind_pattern(J, pr->a, js_obj(rest), e, mode);
-                return;
-            }
-            struct jsstr *key = pr->str;
-            if (pr->b) {
-                jsval kv = eval(J, pr->b, e);
-                if (J->throwing)
-                    return;
-                key = js_tostr(J, kv);
-            }
-            if (nused < 32)
-                used[nused++] = key;
-            jsval item = js_get_str(J, v, key);
-            if (J->throwing)
-                return;
-            bind_pattern(J, pr->a, item, e, mode);
-            if (J->throwing)
-                return;
-        }
-        return;
-    }
-    default:
-        js_throw_error(J, "SyntaxError: invalid destructuring target");
-    }
-}
-
-static jsval eval_unary(struct js *J, struct ast *n, struct env *e)
-{
-    if (n->op == OP_TYPEOF && n->a->kind == N_IDENT) {
-        jsval v = read_var(J, e, n->a->str, 1);
-        TRY();
-        return js_str(J, type_of(v));
-    }
-    if (n->op == OP_DELETE) {
-        if (n->a->kind == N_MEMBER || n->a->kind == N_INDEX) {
-            struct ref r;
-            if (make_ref(J, n->a, e, &r) < 0)
-                return js_undefined;
-            struct jsstr *k = js_tostr(J, r.key);
-            TRY();
-            return js_bool(js_delete(J, r.obj, k));
-        }
-        return js_bool(1);
-    }
-    jsval v = eval(J, n->a, e);
-    TRY();
-    switch (n->op) {
-    case OP_NOT: return js_bool(!js_truthy(v));
-    case OP_BNOT: return js_num((double)~to_int32(J, v));
-    case OP_NEG: return js_num(-js_to_number(J, v));
-    case OP_PLUS: return js_num(js_to_number(J, v));
-    case OP_TYPEOF: return js_str(J, type_of(v));
-    case OP_VOID: return js_undefined;
-    }
-    return js_undefined;
-}
-
-/* The arguments of a tagged template: the strings (with .raw), then each ${value}. */
-static int eval_tagged(struct js *J, struct ast *tl, struct env *e, jsval **out)
-{
-    struct jsobj *strings = js_new_array(J), *raw = js_new_array(J);
-    jsval *args = js_alloc(J, sizeof(jsval) * (size_t)(tl->n / 2 + 1));
-    int n = 1;
-    for (int i = 0; i < tl->n; i++) {
-        if (i % 2 == 0) {
-            js_array_push(J, strings, strv(tl->list[i]->str));
-            js_array_push(J, raw, strv(tl->list[i]->a ? tl->list[i]->a->str : tl->list[i]->str));
-        } else {
-            args[n++] = eval(J, tl->list[i], e);
-            if (J->throwing)
-                return -1;
-        }
-    }
-    js_put(J, strings, js_mkstr(J, "raw", 3), js_obj(raw), 1);
-    args[0] = js_obj(strings);
-    *out = args;
-    return n;
-}
-
-static jsval eval_call(struct js *J, struct ast *n, struct env *e)
-{
-    jsval fn, self = js_undefined;
-    struct ast *callee = n->a;
-    if (callee->kind == N_SUPER)
-        return super_call(J, n, e);
-    if ((callee->kind == N_MEMBER || callee->kind == N_INDEX) && callee->a->kind == N_SUPER) {
-        jsval key = callee->kind == N_MEMBER ? strv(callee->str) : eval(J, callee->b, e);
-        TRY();
-        fn = super_get(J, callee, e, key);
-        TRY();
-        if (!js_is_callable(fn))
-            return js_throw_error(J, "TypeError: super.%s is not a function", js_tostr(J, key)->s);
-        self = this_value(e);
-        jsval local[16], *args;
-        int argc = eval_args(J, n, e, &args, local, 16);
-        if (argc < 0)
-            return js_undefined;
-        return js_call_value(J, fn, self, args, argc);
-    }
-    if (callee->kind == N_MEMBER || callee->kind == N_INDEX) {
-        self = eval(J, callee->a, e);
-        TRY();
-        if ((callee->flags & F_OPTIONAL) && (self.t == JS_UNDEF || self.t == JS_NULL))
-            return js_undefined;
-        jsval key = callee->kind == N_MEMBER ? strv(callee->str) : eval(J, callee->b, e);
-        TRY();
-        fn = js_getv(J, self, key);
-        TRY();
-        if (!js_is_callable(fn) && !(n->flags & F_OPTIONAL)) {
-            struct jsstr *k = js_tostr(J, key);
-            return js_throw_error(J, "TypeError: %s is not a function", k->s);
-        }
-    } else {
-        fn = eval(J, callee, e);
-        TRY();
-        if (!js_is_callable(fn) && !(n->flags & F_OPTIONAL) && callee->kind == N_IDENT)
-            return js_throw_error(J, "TypeError: %s is not a function", callee->str->s);
-    }
-    if ((n->flags & F_OPTIONAL) && (fn.t == JS_UNDEF || fn.t == JS_NULL))
-        return js_undefined;
-    jsval local[16], *args;
-    int argc = n->op == 1 ? eval_tagged(J, n->list[0], e, &args) : eval_args(J, n, e, &args, local, 16);
-    if (argc < 0)
-        return js_undefined;
-    return js_call_value(J, fn, self, args, argc);
-}
-
 /* ---- classes ---- */
 
 /* A native base class built an object for us: make `self` that object. */
@@ -4421,859 +4130,21 @@ static void adopt(struct js *J, struct jsobj *self, struct jsobj *from)
         from->hcls->adopt(J, self, from);
 }
 
-/* super(...) in a constructor: the parent runs on the same this. */
-static jsval super_call(struct js *J, struct ast *n, struct env *e)
+/* ---- the compiler and the machine ---- */
+
+#include "jsvm.h"
+
+/* A script's code, in the global scope: its vars and functions first. */
+static void run_script(struct js *J, struct ast *prog)
 {
-    struct jsobj *obj;
-    struct binding *b = lookup(e, J->s_home, &obj);
-    if (!b || b->v.t != JS_OBJ)
-        return js_throw_error(J, "SyntaxError: 'super' is only valid in a class constructor");
-    jsval ctor = js_get(J, b->v, "constructor");
-    TRY();
-    struct jsobj *parent = ctor.t == JS_OBJ ? ctor.u.o->proto : NULL;
-    if (!parent || parent == J->function_proto || !js_is_callable(js_obj(parent)))
-        return js_throw_error(J, "TypeError: super constructor is not a constructor");
-    jsval local[16], *args;
-    int argc = eval_args(J, n, e, &args, local, 16);
-    if (argc < 0)
-        return js_undefined;
-    jsval self = this_value(e);
-    if (self.t != JS_OBJ)
-        return js_throw_error(J, "ReferenceError: 'this' is not available here");
-    while (parent->bound)
-        parent = parent->bound;
-    if (parent->native) {
-        struct jsobj *saved = J->super_this;
-        J->super_this = self.u.o;
-        jsval made = js_construct(J, js_obj(parent), args, argc);
-        J->super_this = saved;
-        TRY();
-        if (made.t == JS_OBJ && made.u.o != self.u.o)
-            adopt(J, self.u.o, made.u.o);
-    } else {
-        step(J);
-        call_user(J, parent, self, args, argc);
-        TRY();
-    }
-    return self;
-}
-
-/* super.name: looked up from the home object's prototype, with this as the receiver. */
-static jsval super_get(struct js *J, struct ast *n, struct env *e, jsval key)
-{
-    struct jsobj *obj;
-    struct binding *b = lookup(e, J->s_home, &obj);
-    if (!b || b->v.t != JS_OBJ)
-        return js_throw_error(J, "SyntaxError: 'super' is only valid inside a method");
-    struct jsobj *proto = b->v.u.o->proto;
-    if (!proto)
-        return js_undefined;
-    struct jsstr *k = js_tostr(J, key);
-    jsval out;
-    if (!obj_get(J, proto, k, this_value(e), &out))
-        return js_undefined;
-    (void)n;
-    return out;
-}
-
-static jsval eval_class(struct js *J, struct ast *n, struct env *e)
-{
-    struct jsobj *pproto = J->object_proto;
-    jsval parent = js_undefined;
-    if (n->a) {
-        parent = eval(J, n->a, e);
-        TRY();
-        if (parent.t == JS_NULL) {
-            pproto = NULL;
-        } else if (!js_is_callable(parent) || parent.u.o->arrow) {
-            return js_throw_error(J, "TypeError: class extends value is not a constructor or null");
-        } else {
-            jsval pp = js_get(J, parent, "prototype");
-            TRY();
-            pproto = pp.t == JS_OBJ ? pp.u.o : NULL;
-        }
-    }
-    struct env *ce = new_env(J, e);             /* the scope that holds the class's own name */
-    struct jsobj *proto = js_mkobj(J, C_OBJECT, pproto);
-    jsval fv = make_function(J, n->b, ce);
-    struct jsobj *F = fv.u.o;
-    F->is_class = 1;
-    F->home = proto;
-    F->name = n->str ? n->str->s : "";
-    if (parent.t == JS_OBJ)
-        F->proto = parent.u.o;                  /* static members are inherited */
-    js_put(J, F, js_mkstr(J, "prototype", 9), js_obj(proto), 1);
-    js_put(J, proto, js_mkstr(J, "constructor", 11), fv, 1);
-    if (n->str)
-        declare(J, ce, n->str, fv, 1);
-    capture(ce);
-
-    for (int i = 0; i < n->n; i++) {
-        struct ast *m = n->list[i];
-        struct jsobj *target = m->op ? F : proto;
-        struct jsstr *key = m->str;
-        if (m->b) {
-            jsval kv = eval(J, m->b, ce);
-            TRY();
-            key = js_tostr(J, kv);
-        }
-        if (m->kind == N_FIELD && m->op == 2) {
-            jsval bf = make_function(J, m->a, ce);
-            bf.u.o->home = F;
-            js_call_value(J, bf, fv, NULL, 0);
-            TRY();
-            continue;
-        }
-        if (m->kind == N_FIELD) {
-            if (!m->op)
-                continue;                       /* instance fields run in the constructor */
-            struct env *se = new_env(J, ce);
-            se->has_self = 1;
-            se->self = fv;
-            jsval v = js_undefined;
-            if (m->a) {
-                v = eval(J, m->a, se);
-                TRY();
-                if (js_is_callable(v) && v.u.o->fn && (!v.u.o->name || !*v.u.o->name))
-                    v.u.o->name = key->s;
-            }
-            capture(se);
-            js_put(J, F, key, v, 0);
-            continue;
-        }
-        jsval f = make_function(J, m->a, ce);
-        f.u.o->home = target;
-        f.u.o->name = key->s;
-        if (m->kind == N_GETTER || m->kind == N_SETTER) {
-            struct prop *pr = js_own(target, key);
-            if (!pr) {
-                js_put(J, target, key, js_undefined, 1);
-                pr = js_own(target, key);
-            }
-            if (m->kind == N_GETTER)
-                pr->getter = f.u.o;
-            else
-                pr->setter = f.u.o;
-        } else {
-            js_put(J, target, key, f, 1);
-        }
-    }
-    return fv;
-}
-
-static jsval eval_object(struct js *J, struct ast *n, struct env *e)
-{
-    struct jsobj *o = js_new_object(J);
-    for (int i = 0; i < n->n; i++) {
-        struct ast *p = n->list[i];
-        if (p->kind == N_SPREAD) {
-            jsval src = eval(J, p->a, e);
-            TRY();
-            struct jsstr **keys;
-            int nk = js_keys(J, src, 0, &keys);
-            for (int k = 0; k < nk; k++)
-                js_put(J, o, keys[k], js_get_str(J, src, keys[k]), 0);
-            continue;
-        }
-        struct jsstr *key = p->str;
-        if (p->b) {
-            jsval kv = eval(J, p->b, e);
-            TRY();
-            key = js_tostr(J, kv);
-        }
-        jsval v = eval(J, p->a, e);
-        TRY();
-        if (p->kind == N_GETTER || p->kind == N_SETTER) {
-            struct prop *pr = js_own(o, key);
-            if (!pr) {
-                js_put(J, o, key, js_undefined, 0);
-                pr = js_own(o, key);
-            }
-            if (p->kind == N_GETTER)
-                pr->getter = v.u.o;
-            else
-                pr->setter = v.u.o;
-            continue;
-        }
-        if (js_is_callable(v) && v.u.o->fn && (!v.u.o->name || !*v.u.o->name))
-            v.u.o->name = key->s;
-        js_put(J, o, key, v, 0);
-    }
-    return js_obj(o);
-}
-
-/* new F(...): out of line, so that eval's own stack frame stays small. */
-static __attribute__((noinline)) jsval eval_new(struct js *J, struct ast *n, struct env *e)
-{
-    jsval fn = eval(J, n->a, e);
-    TRY();
-    jsval local[16], *args;
-    int argc = eval_args(J, n, e, &args, local, 16);
-    if (argc < 0)
-        return js_undefined;
-    if (!js_is_callable(fn))
-        return js_throw_error(J, "TypeError: %s is not a constructor",
-                              n->a->kind == N_IDENT ? n->a->str->s : "value");
-    return js_construct(J, fn, args, argc);
-}
-
-static jsval eval(struct js *J, struct ast *n, struct env *e)
-{
-    step(J);
-    switch (n->kind) {
-    case N_NUM: return js_num(n->num);
-    case N_STR: return strv(n->str);
-    case N_TRUE: return js_bool(1);
-    case N_FALSE: return js_bool(0);
-    case N_NULL: return js_null;
-    case N_THIS: return this_value(e);
-    case N_IDENT: return read_var(J, e, n->str, 0);
-    case N_TEMPLATE: {
-        struct jsstr *s = js_mkstr(J, "", 0);
-        for (int i = 0; i < n->n; i++) {
-            jsval v = eval(J, n->list[i], e);
-            TRY();
-            s = js_concat(J, s, js_tostr(J, v));
-            TRY();
-        }
-        return strv(s);
-    }
-    case N_REGEX: {
-        if (!n->re)
-            return js_throw_error(J, "SyntaxError: invalid regular expression /%s/: %s", n->str->s,
-                                  n->a ? n->a->str->s : "?");
-        struct jsobj *o = js_mkobj(J, C_REGEXP, J->regexp_proto);
-        o->re = n->re;
-        js_put(J, o, js_mkstr(J, "lastIndex", 9), js_num(0), 1);
-        return js_obj(o);
-    }
-    case N_ARRAY: {
-        struct jsobj *a = js_new_array(J);
-        for (int i = 0; i < n->n; i++) {
-            struct ast *x = n->list[i];
-            if (x->kind == N_HOLE) {
-                js_array_push(J, a, js_undefined);
-                continue;
-            }
-            jsval v = eval(J, x->kind == N_SPREAD ? x->a : x, e);
-            TRY();
-            if (x->kind == N_SPREAD) {
-                struct iter it;
-                if (js_iter_open(J, v, &it) < 0)
-                    return js_undefined;
-                jsval item;
-                int r;
-                while ((r = js_iter_next(J, &it, &item)) > 0)
-                    js_array_push(J, a, item);
-                if (r < 0)
-                    return js_undefined;
-            } else {
-                js_array_push(J, a, v);
-            }
-        }
-        return js_obj(a);
-    }
-    case N_OBJECT: return eval_object(J, n, e);
-    case N_FUNC: return make_function(J, n, e);
-    case N_CLASS: return eval_class(J, n, e);
-    case N_AWAIT: {
-        jsval v = eval(J, n->a, e);
-        TRY();
-        return await_value(J, v);
-    }
-    case N_IMPORT: {
-        jsval spec = eval(J, n->a, e);
-        TRY();
-        struct jsstr *s = js_tostr(J, spec);
-        TRY();
-        return mod_import(J, s->s, n->str->s);
-    }
-    case N_IMPORT_META:
-        return read_var(J, e, J->s_meta, 1);
-    case N_YIELD: {
-        if (!n->op) {
-            jsval v = n->a ? eval(J, n->a, e) : js_undefined;
-            TRY();
-            if (in_async_gen(J) && js_is_promise(v)) {     /* async: yield await v */
-                v = await_value(J, v);
-                TRY();
-            }
-            return yield_value(J, v);
-        }
-        jsval src = eval(J, n->a, e);       /* yield*: pass on everything the other iterable gives */
-        TRY();
-        struct iter it;
-        if (js_iter_open(J, src, &it) < 0)
-            return js_undefined;
-        for (;;) {
-            jsval item;
-            int r = js_iter_next(J, &it, &item);
-            if (r < 0)
-                return js_undefined;
-            if (!r)
-                break;
-            yield_value(J, item);
-            if (J->throwing) {              /* thrown in, or the generator is being closed */
-                js_iter_close(J, &it);
-                return js_undefined;
-            }
-        }
-        return js_undefined;
-    }
-    case N_MEMBER:
-    case N_INDEX: {
-        if (n->a->kind == N_SUPER) {
-            jsval key = n->kind == N_MEMBER ? strv(n->str) : eval(J, n->b, e);
-            TRY();
-            return super_get(J, n, e, key);
-        }
-        jsval obj = eval(J, n->a, e);
-        TRY();
-        if ((n->flags & F_OPTIONAL) && (obj.t == JS_UNDEF || obj.t == JS_NULL))
-            return js_undefined;
-        if (n->kind == N_MEMBER)
-            return js_get_str(J, obj, n->str);
-        jsval key = eval(J, n->b, e);
-        TRY();
-        return js_getv(J, obj, key);
-    }
-    case N_CALL: return eval_call(J, n, e);
-    case N_NEW: return eval_new(J, n, e);
-    case N_UNARY: return eval_unary(J, n, e);
-    case N_PREINC:
-    case N_POSTINC: {
-        struct ref r;
-        if (make_ref(J, n->a, e, &r) < 0)
-            return js_undefined;
-        double old = js_to_number(J, ref_get(J, &r, e));
-        TRY();
-        double nv = n->op == OP_INC ? old + 1 : old - 1;
-        ref_put(J, &r, e, js_num(nv));
-        return js_num(n->kind == N_PREINC ? nv : old);
-    }
-    case N_BINARY: {
-        jsval a = eval(J, n->a, e);
-        TRY();
-        jsval b = eval(J, n->b, e);
-        TRY();
-        return binary_op(J, n->op, a, b);
-    }
-    case N_AND: {
-        jsval a = eval(J, n->a, e);
-        TRY();
-        return js_truthy(a) ? eval(J, n->b, e) : a;
-    }
-    case N_OR: {
-        jsval a = eval(J, n->a, e);
-        TRY();
-        return js_truthy(a) ? a : eval(J, n->b, e);
-    }
-    case N_NULLISH: {
-        jsval a = eval(J, n->a, e);
-        TRY();
-        return a.t == JS_UNDEF || a.t == JS_NULL ? eval(J, n->b, e) : a;
-    }
-    case N_COND: {
-        jsval c = eval(J, n->a, e);
-        TRY();
-        return eval(J, js_truthy(c) ? n->b : n->c, e);
-    }
-    case N_SEQ: {
-        jsval v = js_undefined;
-        for (int i = 0; i < n->n; i++) {
-            v = eval(J, n->list[i], e);
-            TRY();
-        }
-        return v;
-    }
-    case N_ASSIGN: {
-        struct ref r;
-        if (n->a->kind == N_ARRAY || n->a->kind == N_OBJECT) {
-            jsval v = eval(J, n->b, e);         /* [a, b] = [b, a] */
-            TRY();
-            bind_pattern(J, n->a, v, e, B_ASSIGN);
-            return J->throwing ? js_undefined : v;
-        }
-        if (make_ref(J, n->a, e, &r) < 0)
-            return js_undefined;
-        jsval v;
-        if (n->op == OP_NONE) {
-            v = eval(J, n->b, e);
-            TRY();
-            if (js_is_callable(v) && v.u.o->fn && (!v.u.o->name || !*v.u.o->name) && r.kind == N_IDENT)
-                v.u.o->name = r.name->s;
-        } else {
-            jsval old = ref_get(J, &r, e);
-            TRY();
-            if (n->op == OP_AND || n->op == OP_OR || n->op == OP_NULLISH) {
-                int keep = n->op == OP_AND ? !js_truthy(old) : n->op == OP_OR ? js_truthy(old) :
-                           !(old.t == JS_UNDEF || old.t == JS_NULL);
-                if (keep)
-                    return old;
-                v = eval(J, n->b, e);
-            } else {
-                jsval rhs = eval(J, n->b, e);
-                TRY();
-                v = binary_op(J, n->op, old, rhs);
-            }
-            TRY();
-        }
-        ref_put(J, &r, e, v);
-        TRY();
-        return v;
-    }
-    default:
-        return js_throw_error(J, "SyntaxError: unexpected expression");
-    }
-}
-
-/* ---- statements ---- */
-
-static int throwing(struct js *J)
-{
-    return J->throwing ? CT : CN;
-}
-
-static int exec_var(struct js *J, struct ast *n, struct env *e)
-{
-    for (int i = 0; i < n->n; i++) {
-        struct ast *d = n->list[i];
-        jsval v = js_undefined;
-        if (d->kind == N_DESTRUCT) {
-            if (!d->a) {
-                js_throw_error(J, "SyntaxError: a destructuring declaration needs a value");
-                return CT;
-            }
-            v = eval(J, d->a, e);
-            if (J->throwing)
-                return CT;
-            bind_pattern(J, d->b, v, e, n->flags == V_VAR ? B_VAR : n->flags == V_LET ? B_LET : B_CONST);
-            if (J->throwing)
-                return CT;
-            continue;
-        }
-        if (d->a) {
-            v = eval(J, d->a, e);
-            if (J->throwing)
-                return CT;
-            if (js_is_callable(v) && v.u.o->fn && (!v.u.o->name || !*v.u.o->name))
-                v.u.o->name = d->str->s;
-        }
-        if (n->flags == V_VAR) {
-            if (!d->a)
-                continue;
-            /* the hoisted binding, wherever it is */
-            struct env *s = e;
-            struct binding *b = NULL;
-            for (; s; s = s->parent) {
-                for (b = s->vars; b; b = b->next)
-                    if (str_eq(b->name, d->str))
-                        break;
-                if (b || s->obj || s->has_self)
-                    break;
-            }
-            if (b)
-                b->v = v;
-            else if (s && s->obj)
-                js_put(J, s->obj, d->str, v, 0);
-            else if (s)
-                declare(J, s, d->str, v, 0);
-            else
-                write_var(J, e, d->str, v);
-        } else {
-            if (e->obj)
-                js_put(J, e->obj, d->str, v, 0);    /* top-level let/const: global */
-            else
-                declare(J, e, d->str, v, n->flags == V_CONST);
-        }
-    }
-    return CN;
-}
-
-/* Bind a for-in/of loop variable. */
-static void bind_loop_var(struct js *J, struct ast *target, struct env *e, jsval v)
-{
-    if (target->kind == S_VAR && target->list[0]->kind == N_DESTRUCT) {
-        bind_pattern(J, target->list[0]->b, v, e,
-                     target->flags == V_VAR ? B_VAR : target->flags == V_LET ? B_LET : B_CONST);
-        return;
-    }
-    if (target->kind == N_ARRAY || target->kind == N_OBJECT) {
-        bind_pattern(J, target, v, e, B_ASSIGN);
-        return;
-    }
-    if (target->kind == S_VAR) {
-        struct jsstr *name = target->list[0]->str;
-        if (target->flags == V_VAR)
-            write_var(J, e, name, v);
-        else
-            declare(J, e, name, v, target->flags == V_CONST);
-        return;
-    }
-    struct ref r;
-    if (make_ref(J, target, e, &r) == 0)
-        ref_put(J, &r, e, v);
-}
-
-/* A loop body's completion: 1 to leave the loop with *result. */
-static int loop_body_done(struct js *J, int c, struct jsstr *label, int *result)
-{
-    if (c == CB) {
-        if (!J->label || (label && str_eq(J->label, label))) {
-            J->label = NULL;
-            *result = CN;
-        } else {
-            *result = CB;
-        }
-        return 1;
-    }
-    if (c == CC) {
-        if (!J->label || (label && str_eq(J->label, label))) {
-            J->label = NULL;
-            return 0;
-        }
-        *result = CC;
-        return 1;
-    }
-    if (c == CR || c == CT) {
-        *result = c;
-        return 1;
-    }
-    return 0;
-}
-
-static int exec_loop(struct js *J, struct ast *n, struct env *e, struct jsstr *label)
-{
-    int result = CN, c;
-    switch (n->kind) {
-    case S_WHILE:
-        for (;;) {
-            jsval t = eval(J, n->a, e);
-            if (J->throwing)
-                return CT;
-            if (!js_truthy(t))
-                return CN;
-            c = exec(J, n->b, e);
-            if (loop_body_done(J, c, label, &result))
-                return result;
-        }
-    case S_DOWHILE:
-        for (;;) {
-            c = exec(J, n->b, e);
-            if (loop_body_done(J, c, label, &result))
-                return result;
-            jsval t = eval(J, n->a, e);
-            if (J->throwing)
-                return CT;
-            if (!js_truthy(t))
-                return CN;
-        }
-    case S_FOR: {
-        struct env *le = e;
-        int lexical = n->a && n->a->kind == S_VAR && n->a->flags != V_VAR;
-        if (lexical)
-            le = new_env(J, e);
-        if (n->a) {
-            if (n->a->kind == S_VAR)
-                c = exec_var(J, n->a, le);
-            else {
-                eval(J, n->a, le);
-                c = throwing(J);
-            }
-            if (c == CT)
-                return CT;
-        }
-        for (;;) {
-            if (n->b) {
-                jsval t = eval(J, n->b, le);
-                if (J->throwing)
-                    return CT;
-                if (!js_truthy(t))
-                    break;
-            }
-            c = exec(J, n->d, le);
-            if (loop_body_done(J, c, label, &result))
-                return result;
-            if (lexical && le->captured) {
-                /* closures keep this iteration's variables: copy into a fresh scope */
-                struct env *next = new_env(J, e);
-                for (struct binding *b = le->vars; b; b = b->next)
-                    declare(J, next, b->name, b->v, b->konst);
-                le = next;
-            }
-            if (n->c) {
-                eval(J, n->c, le);
-                if (J->throwing)
-                    return CT;
-            }
-        }
-        return CN;
-    }
-    case S_FORIN:
-    case S_FOROF: {
-        jsval obj = eval(J, n->b, e);
-        if (J->throwing)
-            return CT;
-        int lexical = n->a->kind == S_VAR && n->a->flags != V_VAR;
-        if (n->kind == S_FORIN) {
-            if (obj.t == JS_UNDEF || obj.t == JS_NULL)
-                return CN;
-            struct jsstr **keys;
-            int nk = js_keys(J, obj, 1, &keys);
-            for (int i = 0; i < nk; i++) {
-                struct env *le = lexical ? new_env(J, e) : e;
-                bind_loop_var(J, n->a, le, strv(keys[i]));
-                if (J->throwing)
-                    return CT;
-                c = exec(J, n->c, le);
-                if (le != e)
-                    recycle_env(J, le);
-                if (loop_body_done(J, c, label, &result))
-                    return result;
-            }
-            return CN;
-        }
-        struct iter it;
-        memset(&it, 0, sizeof(it));
-        jsval async_it = js_undefined, async_next = js_undefined;
-        if (n->op) {                            /* for await: an async iterator, or a sync one whose values are awaited */
-            jsval m = obj.t == JS_OBJ ? js_get(J, obj, "@@asyncIterator") : js_undefined;
-            if (J->throwing)
-                return CT;
-            if (js_is_callable(m)) {
-                async_it = js_call_value(J, m, obj, NULL, 0);
-                if (J->throwing)
-                    return CT;
-                async_next = js_get(J, async_it, "next");
-                if (J->throwing)
-                    return CT;
-                if (!js_is_callable(async_next)) {
-                    js_throw_error(J, "TypeError: the async iterator has no next() method");
-                    return CT;
-                }
-            }
-        }
-        if (async_next.t == JS_UNDEF && js_iter_open(J, obj, &it) < 0)
-            return CT;
-        for (;;) {
-            jsval item;
-            int r;
-            if (async_next.t != JS_UNDEF) {
-                jsval res = js_call_value(J, async_next, async_it, NULL, 0);
-                if (J->throwing)
-                    return CT;
-                res = await_value(J, res);
-                if (J->throwing)
-                    return CT;
-                if (res.t != JS_OBJ) {
-                    js_throw_error(J, "TypeError: iterator result is not an object");
-                    return CT;
-                }
-                jsval done = js_get(J, res, "done");
-                if (J->throwing)
-                    return CT;
-                if (js_truthy(done))
-                    break;
-                item = js_get(J, res, "value");
-                r = J->throwing ? -1 : 1;
-            } else {
-                r = js_iter_next(J, &it, &item);
-                if (r > 0 && n->op) {
-                    item = await_value(J, item);
-                    if (J->throwing)
-                        return CT;
-                }
-            }
-            if (r < 0)
-                return CT;
-            if (!r)
-                break;
-            struct env *le = lexical ? new_env(J, e) : e;
-            bind_loop_var(J, n->a, le, item);
-            if (J->throwing) {
-                js_iter_close(J, &it);
-                return CT;
-            }
-            c = exec(J, n->c, le);
-            if (le != e)
-                recycle_env(J, le);
-            if (loop_body_done(J, c, label, &result)) {
-                js_iter_close(J, &it);
-                return result;
-            }
-        }
-        return CN;
-    }
-    }
-    return CN;
-}
-
-static int exec_list(struct js *J, struct ast **list, int n, struct env *e)
-{
-    for (int i = 0; i < n; i++) {
-        int c = exec(J, list[i], e);
-        if (c != CN)
-            return c;
-    }
-    return CN;
-}
-
-static int exec(struct js *J, struct ast *n, struct env *e)
-{
-    step(J);
-    switch (n->kind) {
-    case S_EMPTY:
-    case S_FUNCDECL:                    /* hoisted */
-    case S_IMPORT:                      /* bound when the module was linked */
-        return CN;
-    case S_EXPORT:
-        if (n->op == EX_DECL)
-            return exec(J, n->a, e);
-        if (n->op == EX_DEFAULT) {
-            jsval v = eval(J, n->a, e);
-            if (J->throwing)
-                return CT;
-            if (js_is_callable(v) && v.u.o->fn && (!v.u.o->name || !*v.u.o->name))
-                v.u.o->name = "default";
-            declare(J, e, J->s_default, v, 0);
-        }
-        return CN;
-    case S_EXPR:
-        J->completion = eval(J, n->a, e);
-        return throwing(J);
-    case S_VAR:
-        return exec_var(J, n, e);
-    case S_BLOCK: {
-        struct env *be = e;
-        if (n->flags & F_SCOPED) {
-            be = new_env(J, e);
-            for (int i = 0; i < n->n; i++)
-                if (n->list[i]->kind == S_FUNCDECL) {
-                    struct ast *fn = n->list[i]->a;
-                    jsval f = make_function(J, fn, be);
-                    declare(J, be, fn->str, f, 0);
-                    /* sloppy mode: visible in the function too */
-                    struct env *fe = e;
-                    while (fe && !fe->has_self && !fe->obj)
-                        fe = fe->parent;
-                    if (fe && fe->obj)
-                        js_put(J, fe->obj, fn->str, f, 0);
-                    else if (fe)
-                        declare(J, fe, fn->str, f, 0);
-                }
-        }
-        int c = exec_list(J, n->list, n->n, be);
-        if (be != e)
-            recycle_env(J, be);
-        return c;
-    }
-    case S_IF: {
-        jsval t = eval(J, n->a, e);
-        if (J->throwing)
-            return CT;
-        if (js_truthy(t))
-            return exec(J, n->b, e);
-        return n->c ? exec(J, n->c, e) : CN;
-    }
-    case S_FOR:
-    case S_FORIN:
-    case S_FOROF:
-    case S_WHILE:
-    case S_DOWHILE:
-        return exec_loop(J, n, e, NULL);
-    case S_LABEL: {
-        struct ast *body = n->a;
-        int c;
-        if (body->kind == S_FOR || body->kind == S_FORIN || body->kind == S_FOROF ||
-            body->kind == S_WHILE || body->kind == S_DOWHILE)
-            c = exec_loop(J, body, e, n->str);
-        else
-            c = exec(J, body, e);
-        if (c == CB && J->label && str_eq(J->label, n->str)) {
-            J->label = NULL;
-            return CN;
-        }
-        return c;
-    }
-    case S_RETURN:
-        J->retval = n->a ? eval(J, n->a, e) : js_undefined;
-        return J->throwing ? CT : CR;
-    case S_BREAK:
-        J->label = n->str;
-        return CB;
-    case S_CONTINUE:
-        J->label = n->str;
-        return CC;
-    case S_THROW: {
-        jsval v = eval(J, n->a, e);
-        if (J->throwing)
-            return CT;
-        js_throw_value(J, v);
-        return CT;
-    }
-    case S_TRY: {
-        int c = exec(J, n->a, e);
-        if (c == CT && n->b && !(J->exc.t == JS_OBJ && J->exc.u.o == J->return_marker)) {
-            jsval exc = J->exc;
-            J->throwing = 0;
-            J->exc = js_undefined;
-            struct env *ce = new_env(J, e);
-            if (n->str)
-                declare(J, ce, n->str, exc, 0);
-            else if (n->d)
-                bind_pattern(J, n->d, exc, ce, B_LET);
-            c = J->throwing ? CT : exec(J, n->b, ce);
-            recycle_env(J, ce);
-        }
-        if (n->c) {
-            int saved_throw = J->throwing;
-            jsval saved_exc = J->exc, saved_ret = J->retval;
-            struct jsstr *saved_label = J->label;
-            J->throwing = 0;
-            int f = exec(J, n->c, e);
-            if (f != CN)
-                return f;
-            J->throwing = saved_throw;
-            J->exc = saved_exc;
-            J->retval = saved_ret;
-            J->label = saved_label;
-        }
-        return c;
-    }
-    case S_SWITCH: {
-        jsval d = eval(J, n->a, e);
-        if (J->throwing)
-            return CT;
-        int start = -1;
-        for (int i = 0; i < n->n && start < 0; i++) {
-            struct ast *cs = n->list[i];
-            if (!cs->a)
-                continue;
-            jsval v = eval(J, cs->a, e);
-            if (J->throwing)
-                return CT;
-            if (js_strict_equal(d, v))
-                start = i;
-        }
-        if (start < 0)
-            for (int i = 0; i < n->n; i++)
-                if (!n->list[i]->a)
-                    start = i;
-        if (start < 0)
-            return CN;
-        struct env *se = new_env(J, e);
-        int c = CN;
-        for (int i = start; i < n->n && c == CN; i++)
-            c = exec_list(J, n->list[i]->list, n->list[i]->n, se);
-        recycle_env(J, se);
-        if (c == CB && !J->label)
-            return CN;
-        return c;
-    }
-    default:
-        js_throw_error(J, "SyntaxError: unexpected statement");
-        return CT;
-    }
+    prepare_body(J, prog, prog->info);
+    struct vfunc *vf = an_root(J, prog);
+    struct env *g = J->genv;
+    for (int i = 0; i < prog->info->nvars; i++)
+        declare_global(J, g, prog->info->vars[i], js_undefined, 0);
+    for (int i = 0; i < prog->info->nfuncs; i++)
+        declare_global(J, g, prog->info->funcs[i]->str, make_function(J, prog->info->funcs[i], g), 1);
+    vm_run(J, compile_on_stack(J, vf, 1), NULL, g, this_value(g), NULL, 0);
 }
 
 /* eval(): the code runs in the global scope (an indirect eval), and gives
@@ -5286,15 +4157,9 @@ static jsval global_eval(struct js *J, jsval self, jsval *args, int argc)
     struct ast *prog = parse(J, args[0].u.s->s, args[0].u.s->len, "eval", 0);
     if (!prog)
         return js_throw_error(J, "%s", J->err);
-    prepare_body(J, prog, prog->info);
-    struct env *g = J->genv;
-    for (int i = 0; i < prog->info->nvars; i++)
-        declare_global(J, g, prog->info->vars[i], js_undefined, 0);
-    for (int i = 0; i < prog->info->nfuncs; i++)
-        declare_global(J, g, prog->info->funcs[i]->str, make_function(J, prog->info->funcs[i], g), 1);
     jsval saved = J->completion;
     J->completion = js_undefined;
-    exec_list(J, prog->list, prog->n, g);
+    run_script(J, prog);
     jsval r = J->completion;
     J->completion = saved;
     return J->throwing ? js_undefined : r;
@@ -5431,31 +4296,76 @@ static void co_main(void *arg)
     __builtin_unreachable();
 }
 
-/* Lay out a new stack so that the first switch into it calls co_main(co). */
-static void co_prepare(struct coro *co)
+/* Lay out a new stack so that the first switch into it calls entry(arg). */
+static void *prepare_stack(void *stack, size_t size, void (*entry)(void *), void *arg)
 {
-    uintptr_t top = ((uintptr_t)co->stack + CORO_STACK) & ~(uintptr_t)15;
+    uintptr_t top = ((uintptr_t)stack + size) & ~(uintptr_t)15;
 #if defined(__i386__)
     uint32_t *sp = (uint32_t *)(top - 16);
-    sp[0] = (uint32_t)(uintptr_t)co;            /* the argument, 16-byte aligned */
+    sp[0] = (uint32_t)(uintptr_t)arg;            /* the argument, 16-byte aligned */
     *--sp = 0;                                  /* co_main never returns */
-    *--sp = (uint32_t)(uintptr_t)co_main;       /* where the first switch's ret goes */
+    *--sp = (uint32_t)(uintptr_t)entry;       /* where the first switch's ret goes */
     *--sp = 0;                                  /* ebp, ebx, esi, edi as the switch pops them */
     *--sp = 0;
     *--sp = 0;
     *--sp = 0;
-    co->sp = sp;
+    return sp;
 #else
     uint64_t *sp = (uint64_t *)(top - 24);
     sp[0] = (uint64_t)(uintptr_t)js_coro_boot;
     *--sp = 0;                                  /* rbp */
     *--sp = 0;                                  /* rbx */
-    *--sp = (uint64_t)(uintptr_t)co;            /* r12 */
-    *--sp = (uint64_t)(uintptr_t)co_main;       /* r13 */
+    *--sp = (uint64_t)(uintptr_t)arg;            /* r12 */
+    *--sp = (uint64_t)(uintptr_t)entry;       /* r13 */
     *--sp = 0;                                  /* r14 */
     *--sp = 0;                                  /* r15 */
-    co->sp = sp;
+    return sp;
 #endif
+}
+
+static void co_prepare(struct coro *co)
+{
+    co->sp = prepare_stack(co->stack, CORO_STACK, co_main, co);
+}
+
+static void compiler_main(void *arg) __attribute__((noreturn, used));
+static void compiler_main(void *arg)
+{
+    struct vcompile *c = arg;
+    c->result = c->root ? compile_root(c->J, c->vf) : compile_function(c->J, c->vf);
+    js_coro_switch(&c->sp, c->caller_sp);
+    __builtin_unreachable();
+}
+
+/* Compilation can recurse through source much more deeply than running
+ * its bytecode. Give it its own stack even when called from a generator. */
+static struct vproto *compile_on_stack(struct js *J, struct vfunc *vf, int root)
+{
+    if (vf->proto)
+        return vf->proto;
+    if (!J->compiler) {
+        struct vcompile *c = calloc(1, sizeof(*c));
+        if (!c)
+            bail(J, "out of memory for the script compiler");
+        c->stack = malloc(COMPILE_STACK);
+        if (!c->stack) {
+            free(c);
+            bail(J, "out of memory for the script compiler");
+        }
+        J->compiler = c;
+        c->J = J;
+    }
+    struct vcompile *c = J->compiler;
+    c->vf = vf;
+    c->root = root;
+    c->active = 1;
+    c->sp = prepare_stack(c->stack, COMPILE_STACK, compiler_main, c);
+    js_coro_switch(&c->caller_sp, c->sp);
+    struct vproto *result = c->result;
+    c->active = 0;
+    c->vf = NULL;
+    c->result = NULL;
+    return result;
 }
 
 static void co_unlink(struct coro *co)
@@ -5522,14 +4432,10 @@ static void co_resume(struct js *J, struct coro *co, jsval v, int mode)
     J->cur_co = co;
     co->state = CO_RUNNING;
     int saved_depth = J->depth;
-    struct jsstr *saved_label = J->label;
-    jsval saved_ret = J->retval;
     J->depth = co->depth;
     js_coro_switch(&co->caller_sp, co->sp);
     co->depth = J->depth;
     J->depth = saved_depth;
-    J->label = saved_label;
-    J->retval = saved_ret;
     J->cur_co = co->resumer;
     if (co->state == CO_DONE)
         co_unlink(co);
@@ -5848,7 +4754,7 @@ static jsval start_coroutine(struct js *J, struct jsobj *f, jsval self, jsval *a
         struct gen *g = js_alloc(J, sizeof(*g));
         g->co = co;
         struct jsobj *o = js_new_host(J, &gen_class, g);
-        jsval proto = js_get(J, js_obj(f), "prototype");    /* generator.prototype inherits next() */
+        jsval proto = js_get_str(J, js_obj(f), J->s_prototype);    /* generator.prototype inherits next() */
         o->proto = proto.t == JS_OBJ && proto.u.o->proto == J->object_proto ? proto.u.o : J->generator_proto;
         if (o->proto != J->generator_proto && o->proto->proto == J->object_proto)
             o->proto->proto = J->generator_proto;
@@ -5894,14 +4800,36 @@ static int on_stack(const char *p, const char *lo, const char *hi)
 int js_gc_scan_stacks(struct js *J, const char *sp,
                       void (*scan)(struct js *J, const void *lo, const void *hi))
 {
+#ifdef JS_HOST_TEST
+    /* The Linux regression runner has a different main-stack mapping. */
+    extern void js_test_stack_bounds(const char **lo, const char **hi);
+    const char *mlo, *mhi;
+    js_test_stack_bounds(&mlo, &mhi);
+#else
     const char *mlo = (const char *)MAIN_STACK_LOW, *mhi = (const char *)MAIN_STACK_TOP;
+#endif
     int known = on_stack(sp, mlo, mhi);
     const char *main_from = known ? sp : NULL;
+    struct vcompile *compiler = J->compiler;
+    if (compiler && compiler->active) {
+        scan(J, compiler, compiler + 1);
+        const char *lo = compiler->stack, *hi = lo + COMPILE_STACK;
+        if (on_stack(sp, lo, hi)) {
+            known = 1;
+            scan(J, sp, hi);
+        }
+        if (on_stack(compiler->caller_sp, mlo, mhi) &&
+            (!main_from || (const char *)compiler->caller_sp < main_from))
+            main_from = compiler->caller_sp;
+    }
     for (struct coro *co = J->co_live; co; co = co->next_live) {
         if (!co->stack)
             continue;
         const char *lo = co->stack, *hi = (const char *)co->stack + CORO_STACK;
         const char *from = on_stack(co->sp, lo, hi) ? co->sp : lo;
+        if (compiler && compiler->active && on_stack(compiler->caller_sp, lo, hi) &&
+            (const char *)compiler->caller_sp < from)
+            from = compiler->caller_sp;
         if (on_stack(sp, lo, hi)) {
             known = 1;
             if (sp < from)
@@ -5920,14 +4848,6 @@ int js_gc_scan_stacks(struct js *J, const char *sp,
     if (main_from)
         scan(J, main_from, mhi);
     return 0;
-}
-
-void js_gc_before(struct js *J)
-{
-    if (free_owner == J) {              /* recycled scopes: garbage now, unless still in use */
-        free_envs = NULL;
-        free_bindings = NULL;
-    }
 }
 
 /* ---- microtasks ---- */
@@ -5976,11 +4896,6 @@ static int enter(struct js *J)
         J->depth = 0;
     }
     active = J;
-    if (free_owner != J) {
-        free_owner = J;
-        free_envs = NULL;
-        free_bindings = NULL;
-    }
     return 0;
 }
 
@@ -6006,7 +4921,6 @@ int js_eval(struct js *J, const char *src, int len, const char *where)
         entered = 1;
         if (__builtin_setjmp(jmp_target)) {
             entered = 0;
-            free_owner = NULL;
             return -1;
         }
     }
@@ -6015,14 +4929,8 @@ int js_eval(struct js *J, const char *src, int len, const char *where)
     if (!prog) {
         r = -1;
     } else {
-        prepare_body(J, prog, prog->info);
-        struct env *g = J->genv;
-        for (int i = 0; i < prog->info->nvars; i++)
-            declare_global(J, g, prog->info->vars[i], js_undefined, 0);
-        for (int i = 0; i < prog->info->nfuncs; i++)
-            declare_global(J, g, prog->info->funcs[i]->str, make_function(J, prog->info->funcs[i], g), 1);
-        int c = exec_list(J, prog->list, prog->n, g);
-        if (c == CT) {
+        run_script(J, prog);
+        if (J->throwing) {
             error_text(J, J->exc);
             r = -1;
         }
@@ -6044,7 +4952,6 @@ int js_call(struct js *J, jsval fn, jsval self, jsval *args, int argc, jsval *re
         entered = 1;
         if (__builtin_setjmp(jmp_target)) {
             entered = 0;
-            free_owner = NULL;
             return -1;
         }
     }
@@ -6077,7 +4984,6 @@ jsval js_compile_handler(struct js *J, const char *body, const char *where)
         entered = 1;
         if (__builtin_setjmp(jmp_target)) {
             entered = 0;
-            free_owner = NULL;
             return js_undefined;
         }
     }
@@ -6088,8 +4994,10 @@ jsval js_compile_handler(struct js *J, const char *body, const char *where)
         int n = snprintf(src, len + 32, "(function(event){%s\n})", body);
         struct ast *x = parse(J, src, n, where, 1);
         free(src);
-        if (x)
-            f = eval(J, x, J->genv);
+        if (x && x->kind == N_FUNC) {
+            an_root(J, x);
+            f = make_function(J, x, J->genv);
+        }
         J->throwing = 0;
     }
     if (outer)
@@ -6200,6 +5108,7 @@ static void mod_set_source(struct js *J, struct jsmod *m, const char *src, int l
         return;
     }
     prepare_body(J, prog, prog->info);
+    an_root(J, prog);                   /* before linking makes its functions */
     int n = 0;
     for (int i = 0; i < prog->n; i++)
         if ((prog->list[i]->kind == S_IMPORT || prog->list[i]->kind == S_EXPORT) && prog->list[i]->str)
@@ -6393,7 +5302,6 @@ static void mod_instantiate(struct js *J, struct jsmod *m)
     e->parent = J->genv;
     e->has_self = 1;                    /* this is undefined at a module's top level */
     e->self = js_undefined;
-    e->captured = 1;
     m->env = e;
     struct fninfo *fi = m->prog->info, lex = { 0 };
     int cap = 0;
@@ -6669,7 +5577,6 @@ void js_run_module(struct js *J, const char *url, int inline_src, const char *sr
         entered = 1;
         if (__builtin_setjmp(jmp_target)) {
             entered = 0;
-            free_owner = NULL;
             J->mod_busy = 0;
             if (J->modhost.done)
                 J->modhost.done(J->modhost.ctx, tag, 1);
@@ -6708,7 +5615,6 @@ void js_module_source(struct js *J, int id, const char *src, int len)
         entered = 1;
         if (__builtin_setjmp(jmp_target)) {
             entered = 0;
-            free_owner = NULL;
             J->mod_busy = 0;
             return;
         }
@@ -6758,6 +5664,7 @@ struct js *js_new(void *host)
     if (meminfo(&mi) == 0 && mi.free_kb / 2 > (JS_HEAP_MIN >> 10))
         J->heap_limit = mi.free_kb / 2 < (JS_HEAP_MAX >> 10) ? (size_t)(mi.free_kb / 2) << 10 : JS_HEAP_MAX;
     J->s_home = js_mkstr(J, "%home", 5);
+    J->s_prototype = js_mkstr(J, "prototype", 9);
     J->s_default = js_mkstr(J, "*default*", 9);
     J->s_meta = js_mkstr(J, "%meta", 5);
     J->object_proto = js_mkobj(J, C_OBJECT, NULL);
@@ -6767,7 +5674,6 @@ struct js *js_new(void *host)
     J->genv->obj = J->global;
     J->genv->has_self = 1;
     J->genv->self = js_obj(J->global);
-    J->genv->captured = 1;
     js_init_lib(J);
     js_define_native(J, J->global, "eval", global_eval, 1);
     init_generators(J);
@@ -6779,14 +5685,13 @@ void js_free(struct js *J)
 {
     if (!J)
         return;
-    if (free_owner == J) {
-        free_owner = NULL;
-        free_envs = NULL;
-        free_bindings = NULL;
-    }
     if (active == J)
         active = NULL;
     co_free_all(J);
+    if (J->compiler) {
+        free(J->compiler->stack);
+        free(J->compiler);
+    }
     gc_destroy(J);
     free(J);
 }
