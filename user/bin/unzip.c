@@ -157,6 +157,18 @@ static char **read_list(const char *path, int *n)
 
 int main(int argc, char **argv)
 {
+    /* Archive Manager passes an inherited private index file on descriptor 3.
+     * Parsing and compressed-header decoding stay outside the desktop process. */
+    if (argc == 4 && !strcmp(argv[1], "--index-fd") && !strcmp(argv[2], "3")) {
+        char err[256];
+        struct archive *a = arc_open(argv[3], err, sizeof(err));
+        if (!a) { fprintf(stderr, "unzip: %s\n", err); return 1; }
+        int result = arc_write_index(a, 3);
+        arc_close(a);
+        if (result < 0) fprintf(stderr, "unzip: archive directory is too large or cannot be written\n");
+        return result < 0 ? 1 : 0;
+    }
+
     int mode = 'x', flags = 0, i, nlist = 0;
     char **list_names = NULL;
     const char *dest = ".";

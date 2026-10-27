@@ -2,8 +2,9 @@
  * Archive Manager: browse ZIP and 7z archives like folders and extract
  * what they hold.
  *
- * The archive's directory is read here (libc's archive.c), and shown one
- * folder at a time. Extracting runs /bin/unzip with -P, which reports its
+ * The archive's directory is read by an unzip helper and returned as a
+ * bounded metadata snapshot, then shown one folder at a time. Compressed
+ * 7z headers never decode on the desktop event loop. Extracting runs /bin/unzip with -P, which reports its
  * progress line by line through a pipe, so the desktop goes on while a big
  * archive unpacks: a progress bar and a Cancel button take the status
  * bar's place. Opening a file in the archive extracts it to /tmp first.
@@ -44,7 +45,7 @@ enum { COL_NAME, COL_SIZE, COL_PACKED, COL_DATE, COL_METHOD, NCOLS };
 static const char *const col_names[NCOLS] = { "Name", "Size", "Packed", "Modified", "Method" };
 static const int col_w[NCOLS] = { 0, 76, 76, 112, 86 };     /* the name takes the rest */
 
-enum { JOB_NONE, JOB_EXTRACT, JOB_TEST, JOB_VIEW };
+enum { JOB_NONE, JOB_EXTRACT, JOB_TEST, JOB_VIEW, JOB_OPEN };
 enum { HOLD_NONE, HOLD_BTN, HOLD_HDR, HOLD_ARROW, HOLD_THUMB };
 
 struct row {
@@ -83,6 +84,9 @@ struct arcwin {
     char listfile[64];                  /* the names unzip is to extract, while it runs */
     char line[PATH_LEN + 64];
     int linelen;
+    int index_fd;
+    char indexfile[80], opening_path[PATH_LEN], reload_cwd[PATH_LEN];
+    int extract_after_open;
     int overwrite;                      /* for the job about to start */
     uint8_t *pending;                   /* names chosen before the destination was asked */
 };
@@ -156,11 +160,23 @@ static struct row *add_row(struct arcwin *w, const char *name, int len, int dir)
     return r;
 }
 
-static struct row *find_dir(struct arcwin *w, const char *name, int len)
+/* Directory rows use indices, since add_row can move the rows allocation. */
+static struct row *find_dir(struct arcwin *w, const char *name, int len,
+                            int *slots, unsigned mask, unsigned *slot)
 {
-    for (int i = w->nrows - 1; i >= 0; i--)
-        if (w->rows[i].dir && (int)strlen(w->rows[i].name) == len && !memcmp(w->rows[i].name, name, (size_t)len))
-            return &w->rows[i];
+    uint32_t hash = 2166136261u;
+    for (int i = 0; i < len; i++)
+        hash = (hash ^ (unsigned char)name[i]) * 16777619u;
+    unsigned at = hash & mask;
+    while (slots[at]) {
+        struct row *r = &w->rows[slots[at] - 1];
+        if ((int)strlen(r->name) == len && !memcmp(r->name, name, (size_t)len)) {
+            *slot = at;
+            return r;
+        }
+        at = (at + 1) & mask;
+    }
+    *slot = at;
     return NULL;
 }
 
@@ -199,6 +215,15 @@ static void build_rows(struct arcwin *w)
     if (!w->a)
         return;
     size_t plen = strlen(w->cwd);
+    unsigned capacity = 64;
+    while (capacity < (unsigned)arc_count(w->a) * 2)
+        capacity *= 2;
+    int *directories = calloc(capacity, sizeof(*directories));
+    if (!directories) {
+        w->cursor = w->anchor = -1;
+        message_box("Archive Manager", ICON_WARNING, "Not enough memory to list this folder.");
+        return;
+    }
     for (int i = 0; i < arc_count(w->a); i++) {
         const struct arc_entry *e = arc_entry(w->a, i);
         const char *rest = e->name;
@@ -212,9 +237,13 @@ static void build_rows(struct arcwin *w)
         const char *slash = strchr(rest, '/');
         if (slash || e->is_dir) {
             int len = slash ? (int)(slash - rest) : (int)strlen(rest);
-            struct row *r = find_dir(w, rest, len);
-            if (!r && !(r = add_row(w, rest, len, 1)))
-                break;
+            unsigned slot;
+            struct row *r = find_dir(w, rest, len, directories, capacity - 1, &slot);
+            if (!r) {
+                r = add_row(w, rest, len, 1);
+                if (!r) break;
+                directories[slot] = w->nrows;
+            }
             if (!slash) {
                 r->entry = i;
                 r->mtime = e->mtime;
@@ -232,6 +261,7 @@ static void build_rows(struct arcwin *w)
             r->method = e->encrypted ? "Encrypted" : e->method;
         }
     }
+    free(directories);
     sort_rows(w);
     w->scroll = 0;
     w->cursor = w->nrows ? 0 : -1;
@@ -500,7 +530,8 @@ static void draw_status(struct arcwin *w, struct surface *s)
             fill = bar.w - 4;
         if (fill > 0)
             gfx_fill(s, bar.x + 2, bar.y + 2, fill, bar.h - 4, C_NAVY);
-        snprintf(text, sizeof(text), "%s %s", w->job == JOB_TEST ? "Testing" : "Extracting",
+        snprintf(text, sizeof(text), "%s %s", w->job == JOB_OPEN ? "Opening" :
+                 w->job == JOB_TEST ? "Testing" : "Extracting",
                  w->current[0] ? base_name(w->current) : "...");
         struct rect t = mkrect(bar.x + bar.w + 4, st.y, c.x - bar.x - bar.w - 8, st.h);
         gfx_bevel(s, t, BEVEL_THIN_SUNKEN);
@@ -554,23 +585,23 @@ static void set_title(struct arcwin *w)
     wm_set_title(w->win, t);
 }
 
+static void start_job(struct arcwin *w, int job, const char *dest, char **names, int nnames, int flat);
+static void ask_extract(struct arcwin *w, int selected);
+
 static int load(struct arcwin *w, const char *path)
 {
-    char err[256];
-    struct archive *a = arc_open(path, err, sizeof(err));
-    if (!a) {
-        char msg[PATH_LEN + 300];
-        snprintf(msg, sizeof(msg), "Cannot open %s: %s.", base_name(path), err);
-        message_box("Archive Manager", ICON_WARNING, msg);
+    if (w->job)
         return -1;
-    }
-    arc_close(w->a);
-    w->a = a;
-    snprintf(w->path, sizeof(w->path), "%s", path);
-    w->cwd[0] = 0;
-    build_rows(w);
-    set_title(w);
-    return 0;
+    snprintf(w->opening_path, sizeof(w->opening_path), "%s", path);
+    w->reload_cwd[0] = 0;
+    start_job(w, JOB_OPEN, NULL, NULL, 0, 0);
+    return w->job == JOB_OPEN ? 0 : -1;
+}
+
+static void close_index(struct arcwin *w)
+{
+    if (w->index_fd >= 0) { close(w->index_fd); w->index_fd = -1; }
+    if (w->indexfile[0]) { unlink(w->indexfile); w->indexfile[0] = 0; }
 }
 
 static void go_to(struct arcwin *w, const char *dir)
@@ -709,6 +740,35 @@ static void finish_job(struct arcwin *w)
 {
     int job = w->job;
     w->job = JOB_NONE;
+    if (job == JOB_OPEN) {
+        char err[256] = "";
+        struct archive *a = !w->cancelled && w->exit_ok ?
+                            arc_read_index(w->index_fd, err, sizeof(err)) : NULL;
+        close_index(w);
+        w->hold = HOLD_NONE;
+        if (a) {
+            arc_close(w->a);
+            w->a = a;
+            snprintf(w->path, sizeof(w->path), "%s", w->opening_path);
+            w->cwd[0] = 0;
+            build_rows(w);
+            if (w->reload_cwd[0])
+                go_to(w, w->reload_cwd);
+            set_title(w);
+        }
+        paint(w);
+        int extract = w->extract_after_open;
+        w->extract_after_open = 0;
+        if (!a && !w->cancelled) {
+            char msg[PATH_LEN + 900];
+            snprintf(msg, sizeof(msg), "Cannot open %s.\n%s", base_name(w->opening_path),
+                     w->errors[0] ? w->errors : err[0] ? err : "The archive reader failed.");
+            message_box("Archive Manager", ICON_WARNING, msg);
+        } else if (a && extract) {
+            ask_extract(w, 0);
+        }
+        return;
+    }
     if (w->listfile[0]) {
         unlink(w->listfile);
         w->listfile[0] = 0;
@@ -756,6 +816,22 @@ static void finish_job(struct arcwin *w)
 static void start_job(struct arcwin *w, int job, const char *dest, char **names, int nnames, int flat)
 {
     static int serial;
+    if (w->job)
+        return;
+    if (job == JOB_OPEN) {
+        mkdir("/tmp", 01777);
+        for (int attempt = 0; attempt < 16; attempt++) {
+            snprintf(w->indexfile, sizeof(w->indexfile), "/tmp/archive-index-%d-%d", getpid(), ++serial);
+            w->index_fd = open(w->indexfile, O_CREAT | O_EXCL | O_RDWR, 0600);
+            if (w->index_fd >= 0 || errno != EEXIST)
+                break;
+        }
+        if (w->index_fd < 0) {
+            w->indexfile[0] = 0;
+            message_box("Archive Manager", ICON_WARNING, "Cannot create a temporary archive directory.");
+            return;
+        }
+    }
     char listfile[64] = "";
     if (nnames > 0) {                   /* the names go in a file: there may be many */
         mkdir("/tmp", 01777);
@@ -771,6 +847,8 @@ static void start_job(struct arcwin *w, int job, const char *dest, char **names,
     }
     int fds[2];
     if (pipe(fds) < 0) {
+        close_index(w);
+        if (listfile[0]) unlink(listfile);
         message_box("Archive Manager", ICON_WARNING, "Cannot start unzip.");
         return;
     }
@@ -780,7 +858,9 @@ static void start_job(struct arcwin *w, int job, const char *dest, char **names,
         dup2(null, 0);
         dup2(fds[1], 1);
         dup2(fds[1], 2);
-        for (int fd = 3; fd < 64; fd++)
+        if (job == JOB_OPEN && dup2(w->index_fd, 3) < 0)
+            _exit(127);
+        for (int fd = job == JOB_OPEN ? 4 : 3; fd < 64; fd++)
             close(fd);
         signal(SIGINT, SIG_DFL);
         signal(SIGQUIT, SIG_DFL);
@@ -788,6 +868,15 @@ static void start_job(struct arcwin *w, int job, const char *dest, char **names,
         char *argv[16];
         int n = 0;
         argv[n++] = "unzip";
+        if (job == JOB_OPEN) {
+            argv[n++] = "--index-fd";
+            argv[n++] = "3";
+            argv[n++] = w->opening_path;
+            argv[n] = NULL;
+            execve(UNZIP, argv, environ);
+            printf("unzip: cannot run %s: %s\n", UNZIP, strerror(errno));
+            _exit(127);
+        }
         argv[n++] = "-P";
         argv[n++] = job == JOB_TEST ? "-t" : w->overwrite ? "-o" : "-n";
         if (flat)
@@ -809,6 +898,7 @@ static void start_job(struct arcwin *w, int job, const char *dest, char **names,
     close(fds[1]);
     if (pid < 0) {
         close(fds[0]);
+        close_index(w);
         if (listfile[0])
             unlink(listfile);
         message_box("Archive Manager", ICON_WARNING, "Cannot start unzip.");
@@ -822,6 +912,8 @@ static void start_job(struct arcwin *w, int job, const char *dest, char **names,
     w->done = w->total = 0;
     w->nbegun = w->nfailed = w->nskipped = 0;
     w->current[0] = w->errors[0] = 0;
+    if (job == JOB_OPEN)
+        snprintf(w->current, sizeof(w->current), "%s", w->opening_path);
     w->linelen = 0;
     snprintf(w->dest, sizeof(w->dest), "%s", dest ? dest : "");
     loop_watch(w->fd, output_ready, w);
@@ -988,7 +1080,7 @@ static void cancel_job(struct arcwin *w)
         return;
     w->cancelled = 1;
     if (w->pid > 0)
-        kill(w->pid, SIGTERM);
+        kill(w->pid, w->job == JOB_OPEN ? SIGKILL : SIGTERM);
 }
 
 static void button_action(struct arcwin *w, int b)
@@ -1212,7 +1304,7 @@ static void aw_key(struct window *win, const struct input_event *ev)
         char cwd[PATH_LEN];
         snprintf(cwd, sizeof(cwd), "%s", w->cwd);
         if (load(w, path) == 0)
-            go_to(w, cwd);
+            snprintf(w->reload_cwd, sizeof(w->reload_cwd), "%s", cwd);
     } else {
         return;
     }
@@ -1237,7 +1329,7 @@ static void aw_destroy(struct window *win)
 {
     struct arcwin *w = win->priv;
     if (w->pid > 0)
-        kill(w->pid, SIGTERM);
+        kill(w->pid, w->job == JOB_OPEN ? SIGKILL : SIGTERM);
     if (w->fd >= 0) {
         loop_unwatch(w->fd);
         close(w->fd);
@@ -1250,6 +1342,7 @@ static void aw_destroy(struct window *win)
     free_rows(w);
     free(w->rows);
     free(w->pending);
+    close_index(w);
     arc_close(w->a);
     free(w);
 }
@@ -1268,7 +1361,7 @@ struct window *archiver_open(const char *path)
     struct arcwin *w = calloc(1, sizeof(*w));
     if (!w)
         return NULL;
-    w->fd = -1;
+    w->fd = w->index_fd = -1;
     w->cursor = w->anchor = w->last_click = -1;
     w->sort_col = COL_NAME;
     struct window *win = wm_create("Archive Manager", ICON_ARCHIVE, AW_W, AW_H, WF_MINIMIZE | WF_MAXIMIZE,
@@ -1291,6 +1384,8 @@ void archiver_extract(const char *path)
 {
     struct window *win = archiver_open(path);
     struct arcwin *w = win ? win->priv : NULL;
-    if (w && w->a)
+    if (w && w->job == JOB_OPEN)
+        w->extract_after_open = 1;
+    else if (w && w->a)
         ask_extract(w, 0);
 }

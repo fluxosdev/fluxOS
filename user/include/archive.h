@@ -39,6 +39,10 @@ struct archive;
 /* Open a ZIP or 7z file (told apart by their signatures); NULL with err set. */
 struct archive *arc_open(const char *path, char *err, int errsize);
 void arc_close(struct archive *a);
+/* Private directory-only snapshots for Archive Manager's worker. The imported
+ * archive supports listing only; extraction must reopen the original path. */
+int arc_write_index(const struct archive *a, int fd);
+struct archive *arc_read_index(int fd, char *err, int errsize);
 int arc_type(const struct archive *a);                  /* ARC_ZIP or ARC_7Z */
 int arc_count(const struct archive *a);
 const struct arc_entry *arc_entry(const struct archive *a, int i);

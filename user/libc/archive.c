@@ -592,12 +592,17 @@ static void parse_folder(struct hbuf *b, struct z7_folder *f)
             nin = (int)hb_num32(b);
             nout = (int)hb_num32(b);
         }
+        if (nin < 1 || nout < 1 || nin > MAX_STREAMS - f->nin || nout > MAX_STREAMS - f->nout) {
+            b->err = 1;
+            return;
+        }
         if (nin != 1 || nout != 1)
             f->simple = 0;
         f->nin += nin;
         f->nout += nout;
         if (flags & 0x20) {
             uint32_t n = hb_num32(b);
+            if (b->err || n > (uint32_t)(b->end - b->p)) { b->err = 1; return; }
             for (uint32_t k = 0; k < n; k++) {
                 int v = hb_byte(b);
                 if (k < sizeof(c->props))
@@ -614,6 +619,13 @@ static void parse_folder(struct hbuf *b, struct z7_folder *f)
     for (int k = 0; k < f->nbind; k++) {
         f->bind_in[k] = hb_num32(b);
         f->bind_out[k] = hb_num32(b);
+        if (f->bind_in[k] >= (uint32_t)f->nin || f->bind_out[k] >= (uint32_t)f->nout) {
+            b->err = 1; return;
+        }
+        for (int j = 0; j < k; j++)
+            if (f->bind_in[j] == f->bind_in[k] || f->bind_out[j] == f->bind_out[k]) {
+                b->err = 1; return;
+            }
     }
     f->npacked = f->nin - f->nbind;
     if (f->npacked < 1) {
@@ -631,8 +643,10 @@ static void parse_folder(struct hbuf *b, struct z7_folder *f)
             }
         }
     } else {
-        for (int k = 0; k < f->npacked; k++)
+        for (int k = 0; k < f->npacked; k++) {
             f->packed_in[k] = hb_num32(b);
+            if (f->packed_in[k] >= (uint32_t)f->nin) { b->err = 1; return; }
+        }
     }
 }
 
@@ -887,7 +901,10 @@ static int folder_chain(const struct z7_folder *f, int *order)
     if (!f->simple || f->npacked != 1)
         return -1;
     int cur = (int)f->packed_in[0], n = 0;
+    unsigned seen = 0;
     while (n < f->ncoders) {
+        if (cur < 0 || cur >= f->ncoders || (seen & (1u << cur))) return -1;
+        seen |= 1u << cur;
         order[n++] = cur;                       /* one stream each: coder i reads in i, writes out i */
         int next = -1;
         for (int k = 0; k < f->nbind; k++)
@@ -994,7 +1011,7 @@ struct msink {
 static int msink_write(struct arc_sink *s, const uint8_t *p, uint32_t n)
 {
     struct msink *m = (struct msink *)s;
-    if (m->n + n > m->cap)
+    if (n > m->cap - m->n)
         return ARC_EDATA;
     memcpy(m->buf + m->n, p, n);
     m->n += n;
@@ -1175,8 +1192,8 @@ static int z7_open(struct archive *a, char *err, int esz)
         return -1;
     }
     uint64_t next_off = le64(sh + 12), next_size = le64(sh + 20);
-    if (arc_crc32(0, sh + 12, 20) != le32(sh + 8) || next_off + next_size + 32 > a->file_size ||
-        next_size > 0x10000000u) {
+    if (arc_crc32(0, sh + 12, 20) != le32(sh + 8) || next_off > a->file_size - 32u ||
+        next_size > a->file_size - 32u - next_off || next_size > (32u << 20)) {
         seterr(err, esz, "the 7z archive is damaged or incomplete", NULL);
         return -1;
     }
@@ -1201,8 +1218,15 @@ static int z7_open(struct archive *a, char *err, int esz)
             break;
         }
         uint32_t n = folder_size(&s.folders[0]);
+        if (n > (32u << 20)) {
+            streams_free(&s);
+            free(hdr);
+            seterr(err, esz, "the 7z directory is too large to open", NULL);
+            return -1;
+        }
         struct msink m = { { msink_write }, malloc(n + 1), 0, n };
         int d = m.buf ? folder_decode(a, &s.folders[0], &m.sink) : ARC_ENOMEM;
+        if (!d && m.n != n) d = ARC_EDATA;
         if (!d && s.folders[0].has_crc && arc_crc32(0, m.buf, m.n) != s.folders[0].crc)
             d = ARC_EDATA;
         streams_free(&s);
@@ -1301,6 +1325,91 @@ struct archive *arc_open(const char *path, char *err, int errsize)
         return NULL;
     }
     return a;
+}
+
+/* Private, bounded directory snapshots for the GUI helper. No decoder state or
+ * pointers cross the process boundary; extraction always reopens the archive. */
+#define INDEX_LIMIT (16u << 20)
+#define INDEX_ENTRIES 65536u
+struct index_header { uint32_t magic, version, type, count, solid; };
+struct index_record {
+    uint32_t size, csize, mtime, crc, mode, namelen;
+    uint8_t is_dir, has_crc, supported, encrypted;
+    char method[16];
+};
+static int index_write_all(int fd, const void *data, size_t len)
+{
+    const uint8_t *p = data;
+    while (len) {
+        ssize_t n = write(fd, p, len);
+        if (n <= 0) return -1;
+        p += n; len -= (size_t)n;
+    }
+    return 0;
+}
+int arc_write_index(const struct archive *a, int fd)
+{
+    if (!a || a->n < 0 || a->n > (int)INDEX_ENTRIES) return -1;
+    size_t total = sizeof(struct index_header);
+    for (int i = 0; i < a->n; i++) {
+        size_t len = strlen(a->ents[i].name);
+        if (len > 65535 || total > INDEX_LIMIT - sizeof(struct index_record) - len) return -1;
+        total += sizeof(struct index_record) + len;
+    }
+    struct index_header h = { 0x58435241u, 1, a->type, a->n, a->solid };
+    if (index_write_all(fd, &h, sizeof(h))) return -1;
+    for (int i = 0; i < a->n; i++) {
+        const struct arc_entry *e = &a->ents[i];
+        struct index_record r = {0};
+        r.size=e->size; r.csize=e->csize; r.mtime=e->mtime; r.crc=e->crc; r.mode=e->mode;
+        r.namelen=(uint32_t)strlen(e->name);
+        r.is_dir=e->is_dir; r.has_crc=e->has_crc; r.supported=e->supported; r.encrypted=e->encrypted;
+        memcpy(r.method,e->method,sizeof(r.method));
+        if (index_write_all(fd,&r,sizeof(r)) || index_write_all(fd,e->name,r.namelen)) return -1;
+    }
+    return 0;
+}
+struct archive *arc_read_index(int fd, char *err, int errsize)
+{
+    struct stat st;
+    uint8_t *data = NULL;
+    struct archive *a = NULL;
+    if (fstat(fd,&st) < 0 || st.st_size < (off_t)sizeof(struct index_header) || st.st_size > INDEX_LIMIT)
+        goto bad;
+    size_t size = (size_t)st.st_size;
+    data = malloc(size);
+    if (!data || read_at(fd,0,data,(uint32_t)size)) goto bad;
+    struct index_header h;
+    memcpy(&h,data,sizeof(h));
+    if (h.magic!=0x58435241u || h.version!=1 || (h.type!=ARC_ZIP && h.type!=ARC_7Z) ||
+        h.count>INDEX_ENTRIES || h.solid>1 || h.count>(size-sizeof(h))/sizeof(struct index_record)) goto bad;
+    a=calloc(1,sizeof(*a));
+    if (!a) goto bad;
+    a->fd=-1; a->type=(int)h.type; a->solid=(int)h.solid;
+    size_t pos=sizeof(h);
+    for (uint32_t i=0;i<h.count;i++) {
+        struct index_record r;
+        if (sizeof(r)>size-pos) goto bad;
+        memcpy(&r,data+pos,sizeof(r)); pos+=sizeof(r);
+        if (r.namelen>65535 || r.namelen>size-pos || memchr(data+pos,0,r.namelen) ||
+            !memchr(r.method,0,sizeof(r.method))) goto bad;
+        struct arc_entry *e=new_entry(a);
+        if (!e) goto bad;
+        e->name=malloc((size_t)r.namelen+1);
+        if (!e->name) goto bad;
+        memcpy(e->name,data+pos,r.namelen); e->name[r.namelen]=0; pos+=r.namelen;
+        e->size=r.size; e->csize=r.csize; e->mtime=r.mtime; e->crc=r.crc; e->mode=r.mode;
+        e->is_dir=!!r.is_dir; e->has_crc=!!r.has_crc; e->supported=!!r.supported; e->encrypted=!!r.encrypted;
+        memcpy(e->method,r.method,sizeof(e->method));
+    }
+    if (pos!=size) goto bad;
+    free(data);
+    return a;
+bad:
+    free(data);
+    arc_close(a);
+    seterr(err,errsize,"cannot read the archive directory (damaged, too large, or out of memory)",NULL);
+    return NULL;
 }
 
 void arc_close(struct archive *a)
@@ -1627,6 +1736,8 @@ static int z7_folder_extract(struct archive *a, int f, const uint8_t *want, cons
 int arc_extract(struct archive *a, const uint8_t *want, const char *dest, int flags,
                 const struct arc_events *ev)
 {
+    if (!a || a->fd < 0)
+        return -1;                     /* directory snapshots have no compressed data */
     struct xctx x = { ev, 0, 0, 0 };
     for (int i = 0; i < a->n; i++)
         if (!want || want[i])
@@ -1709,6 +1820,10 @@ int arc_extract(struct archive *a, const uint8_t *want, const char *dest, int fl
 
 int arc_extract_fd(struct archive *a, int i, int fd, char *err, int errsize)
 {
+    if (!a || a->fd < 0) {
+        seterr(err, errsize, "reopen the original archive to extract files", NULL);
+        return -1;
+    }
     const struct arc_entry *e = arc_entry(a, i);
     if (!e || e->is_dir) {
         seterr(err, errsize, "not a file", NULL);
