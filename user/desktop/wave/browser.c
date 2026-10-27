@@ -3449,6 +3449,113 @@ static void download_name(const char *url, const char *disp, char *out, int size
         snprintf(out, (size_t)size, "download");
 }
 
+/* Is b still open? A download can finish after its window has gone. */
+static int browser_alive(const struct browser *b)
+{
+    for (const struct browser *x = browsers; x; x = x->next)
+        if (x == b)
+            return 1;
+    return 0;
+}
+
+/* Never overwrite: if path exists, put a number in front of the file's name. */
+static void unique_path(char *path, size_t size)
+{
+    char dir[256], base[128];
+    const char *slash = strrchr(path, '/');
+    snprintf(dir, sizeof(dir), "%.*s", slash ? (int)(slash - path) : 0, path);
+    snprintf(base, sizeof(base), "%s", slash ? slash + 1 : path);
+    for (int i = 1; access(path, F_OK) == 0 && i < 1000; i++)
+        snprintf(path, size, "%s/%d-%s", dir, i, base);
+}
+
+/* Write the file. `want` is the path chosen, or a folder to put name in. b is NULL if the window is gone. */
+static void finish_save(struct browser *b, const char *url, int quiet, const char *name, const char *body,
+                        int len, const char *want)
+{
+    char path[256], msg[URL_MAX + 512], eurl[URL_MAX * 2];
+    struct stat st;
+    escape(url, eurl, sizeof(eurl));
+    mkdir(DOWNLOADS_DIR, 0755);
+    snprintf(path, sizeof(path), "%s", want);
+    size_t pl = strlen(path);
+    if (pl && path[pl - 1] == '/') {            /* a folder, perhaps one to make */
+        path[pl - 1] = 0;
+        mkdir(path, 0755);
+    }
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        char dir[256];
+        snprintf(dir, sizeof(dir), "%s", path);
+        snprintf(path, sizeof(path), "%s/%s", dir, name);
+    }
+    unique_path(path, sizeof(path));
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int ok = fd >= 0;
+    for (int off = 0; ok && off < len;) {
+        int n = (int)write(fd, body + off, (size_t)(len - off));
+        if (n <= 0)
+            ok = 0;
+        else
+            off += n;
+    }
+    if (fd >= 0)
+        close(fd);
+    if (!ok && quiet) {
+        if (b)
+            set_status(b, "Could not save %.100s: %s", url, strerror(errno));
+        return;
+    }
+    if (!ok) {
+        snprintf(msg, sizeof(msg), "<code>%s</code> could not be saved: %s.", eurl, strerror(errno));
+        if (b)
+            show_message(b, url, "Download failed", msg);
+        return;
+    }
+    logs_init();
+    log_push(DOWNLOADS_FILE, dl_log, &ndl_log, url, path, len);
+    if (!b)
+        return;
+    if (quiet) {
+        set_status(b, "Saved %s", path);
+        return;
+    }
+    char size[32], epath[512];
+    format_size(len, size, sizeof(size));
+    escape(path, epath, sizeof(epath));
+    snprintf(msg, sizeof(msg),
+             "Saved <code>%s</code> (%s).<p><a href=\"file://%s\">Open</a> &middot; "
+             "<a href=\"about:downloads\">All downloads</a></p>", epath, size, epath);
+    show_message(b, url, "Download complete", msg);
+    set_status(b, "Downloaded %s", path);
+}
+
+/* A download waiting for the Save To box: the page's fetch is over, so it keeps its own copy. */
+struct pending_save {
+    struct browser *b;
+    char url[URL_MAX];
+    char name[128];
+    int quiet;
+    char *body;
+    int len;
+};
+
+static void save_to_done(void *ctx, const char *text)
+{
+    struct pending_save *p = ctx;
+    finish_save(browser_alive(p->b) ? p->b : NULL, p->url, p->quiet, p->name, p->body, p->len, text);
+    free(p->body);
+    free(p);
+}
+
+static void save_to_cancel(void *ctx)
+{
+    struct pending_save *p = ctx;
+    if (browser_alive(p->b))
+        set_status(p->b, "Download of %.100s cancelled", p->url);
+    free(p->body);
+    free(p);
+}
+
 static void save_download(struct browser *b, const struct fetch *f, const struct response *r)
 {
     char name[128], path[256], msg[URL_MAX + 512], eurl[URL_MAX * 2];
@@ -3469,42 +3576,29 @@ static void save_download(struct browser *b, const struct fetch *f, const struct
     mkdir(DOWNLOADS_DIR, 0755);
     download_name(f->url, r->disp, name, sizeof(name));
     snprintf(path, sizeof(path), "%s/%s", DOWNLOADS_DIR, name);
-    for (int i = 1; access(path, F_OK) == 0 && i < 1000; i++)
-        snprintf(path, sizeof(path), "%s/%d-%s", DOWNLOADS_DIR, i, name);
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    int ok = fd >= 0;
-    for (int off = 0; ok && off < r->len;) {
-        int n = (int)write(fd, r->body + off, (size_t)(r->len - off));
-        if (n <= 0)
-            ok = 0;
-        else
-            off += n;
+    unique_path(path, sizeof(path));
+
+    /* Ask where to put it, starting from the Downloads folder. */
+    struct pending_save *p = calloc(1, sizeof(*p));
+    if (p) {
+        p->b = b;
+        p->quiet = quiet;
+        p->len = r->len;
+        snprintf(p->url, sizeof(p->url), "%s", f->url);
+        snprintf(p->name, sizeof(p->name), "%s", name);
+        p->body = malloc((size_t)(r->len > 0 ? r->len : 1));
+        if (p->body) {
+            memcpy(p->body, r->body, (size_t)r->len);
+            if (ask_text_cancel("Save Download", "Save to:", path, save_to_done, save_to_cancel, p)) {
+                set_status(b, "Choose where to save %.100s", f->url);
+                return;
+            }
+        }
+        free(p->body);
+        free(p);
     }
-    if (fd >= 0)
-        close(fd);
-    if (!ok && quiet) {
-        set_status(b, "Could not save %.100s: %s", f->url, strerror(errno));
-        return;
-    }
-    if (!ok) {
-        snprintf(msg, sizeof(msg), "<code>%s</code> could not be saved: %s.", eurl, strerror(errno));
-        show_message(b, f->url, "Download failed", msg);
-        return;
-    }
-    logs_init();
-    log_push(DOWNLOADS_FILE, dl_log, &ndl_log, f->url, path, r->len);
-    if (quiet) {
-        set_status(b, "Saved %s", path);
-        return;
-    }
-    char size[32], epath[512];
-    format_size(r->len, size, sizeof(size));
-    escape(path, epath, sizeof(epath));
-    snprintf(msg, sizeof(msg),
-             "Saved <code>%s</code> (%s).<p><a href=\"file://%s\">Open</a> &middot; "
-             "<a href=\"about:downloads\">All downloads</a></p>", epath, size, epath);
-    show_message(b, f->url, "Download complete", msg);
-    set_status(b, "Downloaded %s", path);
+    /* No box to be had (one is already open): the Downloads folder. */
+    finish_save(b, f->url, quiet, name, r->body, r->len, path);
 }
 
 /* The status bar once a page is in: a secure page says what that means here. */
@@ -4269,14 +4363,6 @@ static void reset_form(struct node *form)
 
 /* A click on a form control. */
 static void control_commit(struct browser *b, struct node *n, int changed);
-
-static int browser_alive(const struct browser *b)
-{
-    for (const struct browser *x = browsers; x; x = x->next)
-        if (x == b)
-            return 1;
-    return 0;
-}
 
 static void set_control_value(struct browser *b, struct node *n, const char *v)
 {

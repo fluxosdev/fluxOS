@@ -41,6 +41,7 @@ struct dialog {
     void (*on_yes)(void *ctx);
     void (*on_no)(void *ctx);
     void (*on_text)(void *ctx, const char *text);
+    void (*on_cancel)(void *ctx);       /* a prompt closed without an answer */
     void *ctx;
 };
 
@@ -307,6 +308,7 @@ static void ask_command(struct dialog *d, int id)
     void (*on_yes)(void *) = d->on_yes;
     void (*on_no)(void *) = d->on_no;
     void (*on_text)(void *, const char *) = d->on_text;
+    void (*on_cancel)(void *) = d->on_cancel;
     void *ctx = d->ctx;
     char text[sizeof(d->edit)];
     snprintf(text, sizeof(text), "%s", d->edit);
@@ -317,6 +319,8 @@ static void ask_command(struct dialog *d, int id)
         on_no(ctx);
     else if (id == ID_OK && on_text && text[0])
         on_text(ctx, text);
+    else if (on_cancel && (id == ID_CANCEL || id == ID_OK))
+        on_cancel(ctx);
 }
 
 /* A box with an icon, a line of text and the given buttons; NULL if one is open. */
@@ -383,16 +387,17 @@ void ask_yes_no_cancel(const char *title, enum icon_id icon, const char *text,
     }
 }
 
-void ask_text(const char *title, const char *label, const char *initial,
-              void (*done)(void *ctx, const char *text), void *ctx)
+int ask_text_cancel(const char *title, const char *label, const char *initial,
+                    void (*done)(void *ctx, const char *text), void (*cancel)(void *ctx), void *ctx)
 {
     if (ask_dlg) {
         wm_focus(ask_dlg->win);
-        return;
+        return 0;
     }
     struct dialog *d = dialog_new(title, ICON_NONE, 320, 104, WF_NOTASK, &ask_dlg);
     if (!d)
-        return;
+        return 0;
+    d->on_cancel = cancel;
     d->command = ask_command;
     d->default_id = ID_OK;
     d->cancel_id = ID_CANCEL;
@@ -406,6 +411,13 @@ void ask_text(const char *title, const char *label, const char *initial,
     snprintf(d->edit, sizeof(d->edit), "%s", initial);
     d->edit_len = d->edit_cur = (int)strlen(d->edit);
     dialog_show(d, edit);
+    return 1;
+}
+
+void ask_text(const char *title, const char *label, const char *initial,
+              void (*done)(void *ctx, const char *text), void *ctx)
+{
+    ask_text_cancel(title, label, initial, done, NULL, ctx);
 }
 
 /* ---- System Properties ---- */

@@ -331,6 +331,10 @@ void ask_yes_no_cancel(const char *title, enum icon_id icon, const char *text,
                        void (*yes)(void *ctx), void (*no)(void *ctx), void *ctx);
 void ask_text(const char *title, const char *label, const char *initial,
               void (*done)(void *ctx, const char *text), void *ctx);
+/* The same, but cancel is called if it is closed without an answer. Returns 0, calling
+ * neither, if a prompt is already open. */
+int ask_text_cancel(const char *title, const char *label, const char *initial,
+                    void (*done)(void *ctx, const char *text), void (*cancel)(void *ctx), void *ctx);
 
 void about_open(void);
 void about_tick(void);
