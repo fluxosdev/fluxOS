@@ -67,8 +67,9 @@ stops at boot and says why.
 - Processor check at boot (a Pentium III with SSE is the minimum), and a
   write-combining framebuffer through the page attribute table (`pat=off`
   keeps it uncached).
-- Memory: bitmap frame allocator, paging (first GiB identity-mapped, 4 KiB
-  user pages), growing user stack, `sbrk` heaps, first-fit kernel heap. Pages
+- Memory: bitmap frame allocator over the first 4 GiB of RAM, paging (first
+  GiB identity-mapped for the kernel, user pages in the RAM above it first,
+  4 KiB user pages), growing user stack, `sbrk` heaps, first-fit kernel heap. Pages
   are cleared and copied (for `fork`) with SSE, the copies streamed past the
   caches.
 - VFS over an in-memory filesystem unpacked from a ustar initrd at boot, with
@@ -669,9 +670,15 @@ grub/                      the CD's boot menu (install.cfg) and the installed di
 | `0xB0000000 - ...`          | the framebuffer, in the process that mapped it   |
 | `0xBF800000 - 0xBFFFFFFF`   | user stack (up to 8 MiB, grown on page faults)   |
 | `0xC0000000 - ...`          | kernel mappings of device memory (framebuffer)   |
+| `0xFEC00000 - 0xFEFFFFFF`   | temporary mappings of high user pages (kmap)     |
+| `0xFF000000 - 0xFFFFFFFF`   | late mappings (ACPI's firmware memory)           |
 
-The kernel reaches page tables and user frames through the identity map, so
-physical memory is used only up to 1 GiB.
+The kernel's own memory (page tables, heap, stacks, DMA buffers) comes from
+the first GiB, which it reaches through the identity map. User pages come
+from the RAM above it first; the kernel reaches those, to clear them, copy
+them for `fork` or load a program into them, through two pages per
+processor mapped for a moment with interrupts off. Without PAE, RAM past
+4 GiB is out of reach.
 
 **Scheduling.** Each trap pushes a `struct trapframe` on the process's 16 KiB
 kernel stack. The kernel is not preemptible (interrupt gates keep IF clear): a

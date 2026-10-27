@@ -5,6 +5,8 @@
  * Above that is a window of 4 KiB pages for what is mapped later, such
  * as ACPI's firmware memory: its page tables exist from the start, so
  * every address space has them, and filling one in reaches them all.
+ * Just below it, each processor has two pages through which it reaches
+ * user pages in high memory (past the first GiB) for a moment: kmap.
  * The user half (1 GiB - 3 GiB) uses ordinary 4 KiB pages, and page
  * tables are reached through the identity map. User pages marked
  * PTE_MMIO map device memory, lent to one process: never freed, and
@@ -32,16 +34,40 @@ static uint32_t mmio_next = KERNEL_MMIO_BASE;
 
 #define LATE_PDES 4                     /* 16 MiB of late mappings */
 static uint32_t late_base, late_next;   /* the window, and its first unused page */
+static uint32_t kmap_base;              /* the temporary mappings' 4 MiB, below it */
+static uint32_t *kmap_pt;
 static uint32_t *late_pt[LATE_PDES];
 static spinlock_t late_lock = SPINLOCK_INIT("vmm-late");
+
+/*
+ * A frame through this processor's temporary slot (0 or 1), or the
+ * identity map below 1 GiB. Interrupts stay off from here to the last
+ * use: the slot is this processor's, and nothing else touches the
+ * address, so only this processor's TLB needs telling.
+ */
+static void *kmap(uint32_t phys, int slot)
+{
+    if (phys < KERNEL_SPACE_END) {
+        void *p = (void *)phys;
+        __asm__("" : "+r"(p));
+        return p;
+    }
+    uint32_t va = kmap_base + (uint32_t)(this_cpu()->index * 2 + slot) * PAGE_SIZE;
+    kmap_pt[PTE_INDEX(va)] = phys | PTE_PRESENT | PTE_WRITE;
+    invlpg(va);
+    return (void *)va;
+}
 
 /* The first page tables are made before fpu_init() enables SSE. */
 static void zero_page(uint32_t phys)
 {
+    uint32_t flags = irq_save();
+    void *p = kmap(phys, 0);
     if (kernel_sse)
-        sse_zero_page((void *)phys);
+        sse_zero_page(p);
     else
-        memset((void *)phys, 0, PAGE_SIZE);
+        memset(p, 0, PAGE_SIZE);
+    irq_restore(flags);
 }
 
 static uint32_t *alloc_table(void)
@@ -61,7 +87,7 @@ void paging_init(void)
     for (uint32_t i = 0; i < KERNEL_PDES; i++)
         kernel_pd[i] = (i << 22) | PTE_PRESENT | PTE_WRITE | PTE_LARGE | PTE_GLOBAL;
 
-    /* The late window, at the very top. */
+    /* The late window, at the very top, and the temporary mappings below it. */
     late_base = late_next = 0u - LATE_PDES * 0x400000u;
     for (int i = 0; i < LATE_PDES; i++) {
         late_pt[i] = alloc_table();
@@ -69,6 +95,11 @@ void paging_init(void)
             panic("paging: out of memory");
         kernel_pd[PDE_INDEX(late_base) + (uint32_t)i] = (uint32_t)late_pt[i] | PTE_PRESENT | PTE_WRITE;
     }
+    kmap_base = late_base - 0x400000u;
+    kmap_pt = alloc_table();
+    if (!kmap_pt)
+        panic("paging: out of memory");
+    kernel_pd[PDE_INDEX(kmap_base)] = (uint32_t)kmap_pt | PTE_PRESENT | PTE_WRITE;
 
     write_cr4(read_cr4() | (1u << 4) | (1u << 7));      /* PSE, PGE */
     write_cr3((uint32_t)kernel_pd);
@@ -128,7 +159,7 @@ void *vmm_map_mmio(uint32_t phys, uint32_t size, uint32_t flags)
     uint32_t base = ALIGN_DOWN(phys, 0x400000u);
     uint32_t end = ALIGN_UP(phys + size, 0x400000u);
     uint32_t va = mmio_next;
-    if (end - base > late_base - va)
+    if (end - base > kmap_base - va)
         return NULL;
     for (uint32_t pa = base; pa != end; pa += 0x400000u, mmio_next += 0x400000u)
         kernel_pd[PDE_INDEX(mmio_next)] = pa | PTE_PRESENT | PTE_WRITE | PTE_LARGE | PTE_GLOBAL | flags;
@@ -169,7 +200,7 @@ int vmm_alloc(uint32_t *pd, uint32_t va)
         return -ENOMEM;
     if (*pte & PTE_PRESENT)
         return 0;
-    uint32_t frame = pmm_alloc();
+    uint32_t frame = pmm_alloc_user();
     if (!frame)
         return -ENOMEM;
     zero_page(frame);
@@ -216,7 +247,7 @@ uint32_t vmm_translate(uint32_t *pd, uint32_t va)
     return FRAME(*pte) | (va & 0xFFF);
 }
 
-/* Copy into another address space through the identity map. */
+/* Copy kernel memory into another address space, a page at a time. */
 int vmm_copy_to(uint32_t *pd, uint32_t va, const void *src, uint32_t len)
 {
     const uint8_t *s = src;
@@ -225,7 +256,9 @@ int vmm_copy_to(uint32_t *pd, uint32_t va, const void *src, uint32_t len)
         if (!phys)
             return -EFAULT;
         uint32_t chunk = MIN(len, PAGE_SIZE - (va & 0xFFF));
-        memcpy((void *)phys, s, chunk);
+        uint32_t flags = irq_save();
+        memcpy(kmap(phys, 0), s, chunk);
+        irq_restore(flags);
         s += chunk;
         va += chunk;
         len -= chunk;
@@ -266,10 +299,12 @@ uint32_t *vmm_clone(uint32_t *src)
         for (int j = 0; j < 1024; j++) {
             if ((spt[j] & (PTE_PRESENT | PTE_MMIO)) != PTE_PRESENT)
                 continue;
-            uint32_t frame = pmm_alloc();
+            uint32_t frame = pmm_alloc_user();
             if (!frame)
                 goto fail;
-            sse_copy_page((void *)frame, (void *)FRAME(spt[j]));
+            uint32_t flags = irq_save();
+            sse_copy_page(kmap(frame, 0), kmap(FRAME(spt[j]), 1));
+            irq_restore(flags);
             dpt[j] = frame | (spt[j] & 0xFFF);
         }
     }
