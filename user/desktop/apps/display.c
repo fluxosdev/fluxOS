@@ -52,10 +52,10 @@ enum driver { DRV_STANDARD, DRV_NATIVE, DRV_RADEON };
 enum ctl {
     K_TABS, K_DRIVER, K_COLORS, K_AREA, K_REFRESH, K_MONITOR,
     K_WALL, K_BROWSE, K_WALLMODE, K_COLOR, K_THEME, K_ACCENT,
-    K_SAVER, K_SAVER_TIME, K_SAVER_SIZE,
+    K_SAVER, K_SAVER_TIME, K_SAVER_SIZE, K_PREVIEW,
     K_OK, K_CANCEL, K_APPLY, K_COUNT
 };
-#define IS_PUSH(k) ((k) >= K_OK || (k) == K_BROWSE)     /* push buttons */
+#define IS_PUSH(k) ((k) >= K_OK || (k) == K_BROWSE || (k) == K_PREVIEW)     /* push buttons */
 
 #define MAX_WALLS 40
 #define WALL_ROWS 6                     /* rows of the wallpaper list in view */
@@ -431,6 +431,7 @@ static struct rect ctl_rect(enum ctl k)
     case K_SAVER: return mkrect(118, 216, 150, 21);
     case K_SAVER_TIME: return mkrect(118, 248, 150, 21);
     case K_SAVER_SIZE: return mkrect(118, 280, 150, 21);
+    case K_PREVIEW: return mkrect(298, 216, 90, 23);
     case K_OK: return mkrect(DLG_W - 12 - 3 * 75 - 12, DLG_H - 10 - 23, 75, 23);
     case K_CANCEL: return mkrect(DLG_W - 12 - 2 * 75 - 6, DLG_H - 10 - 23, 75, 23);
     case K_APPLY: return mkrect(DLG_W - 12 - 75, DLG_H - 10 - 23, 75, 23);
@@ -449,7 +450,7 @@ static int on_page(struct dprops *d, enum ctl k)
         return d->page == PAGE_BACKGROUND;
     case K_THEME: case K_ACCENT:
         return d->page == PAGE_APPEARANCE;
-    case K_SAVER: case K_SAVER_TIME: case K_SAVER_SIZE:
+    case K_SAVER: case K_SAVER_TIME: case K_SAVER_SIZE: case K_PREVIEW:
         return d->page == PAGE_SAVER;
     default:
         return 1;
@@ -464,7 +465,7 @@ static int ctl_enabled(struct dprops *d, enum ctl k)
     case K_REFRESH: return own_modes(d) && d->nrates > 1;
     case K_COLOR: return d->wall_sel == 0;      /* only with no picture */
     case K_ACCENT: return d->style == THEME_KINETIK;
-    case K_SAVER_TIME: case K_SAVER_SIZE: return d->saver.enabled;
+    case K_SAVER_TIME: case K_SAVER_SIZE: case K_PREVIEW: return d->saver.enabled;
     default: return 1;
     }
 }
@@ -1206,6 +1207,9 @@ static void saver_page(struct dprops *d, struct surface *s)
     gfx_text_wrap(s, &font_sans, 18, 380, 368,
                   d->bootdir[0] ? "Kept for the next start." : "Lasts until you restart: fluxOS is running from its CD.",
                   C_BLACK);
+    if (d->saver.enabled)
+        draw_button(s, ctl_rect(K_PREVIEW), "Preview", d->pressed == K_PREVIEW && d->pressed_in, 0,
+                    d->focus == K_PREVIEW);
     static const int combos[] = { K_SAVER, K_SAVER_TIME, K_SAVER_SIZE };
     for (int i = 0; i < 3; i++) {
         combo_items(d, combos[i], rows, &chosen);
@@ -1615,6 +1619,8 @@ static void activate(struct dprops *d, enum ctl k)
         apply(d);
         if (dlg)
             dp_paint(dlg);
+    } else if (k == K_PREVIEW) {
+        saver_preview(d->saver);
     } else if (k == K_BROWSE) {
         const char *home = getenv("HOME");
         char initial[128];

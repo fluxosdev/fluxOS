@@ -23,6 +23,7 @@ const int saver_timeouts[SAVER_TIMEOUTS] = { 30, 60, 120, 300, 600, 900, 1800, 3
 const int saver_sizes[SAVER_SIZES] = { 32, 48, 64, 96, 128, 192, 256 };
 
 static struct saver_config cfg = { 0, 300, 128 };
+static int run_size;                    /* the size of the logo that is running (a preview may differ) */
 static unsigned int last_input;
 static int active;
 
@@ -149,17 +150,18 @@ static int build_image(int size)
 
 static struct rect logo_rect(void)
 {
-    return mkrect(lx, ly, cfg.size, cfg.size);
+    return mkrect(lx, ly, run_size, run_size);
 }
 
 /* ---- running ---- */
 
-static void start(void)
+static void start(int size)
 {
-    if (build_image(cfg.size) < 0)
+    if (build_image(size) < 0)
         return;
+    run_size = size;
     active = 1;
-    int rx = screen_w - cfg.size, ry = screen_h - cfg.size;
+    int rx = screen_w - size, ry = screen_h - size;
     lx = rx > 0 ? (int)(now_ms() * 7u % (unsigned)rx) : 0;
     ly = ry > 0 ? (int)(now_ms() * 13u % (unsigned)ry) : 0;
     dx = dy = 1;
@@ -175,6 +177,13 @@ static void stop(void)
     free(img);                          /* only a screen saver needs it */
     img = NULL;
     wm_saver(0);
+}
+
+/* Preview: run now with the logo size c asks for, without saving anything. */
+void saver_preview(struct saver_config c)
+{
+    if (!active)
+        start(nearest(saver_sizes, SAVER_SIZES, c.size));
 }
 
 int saver_active(void)
@@ -227,7 +236,7 @@ void saver_frame(void)
     unsigned int now = now_ms();
     if (!active) {
         if (cfg.enabled && now - last_input >= (unsigned)cfg.timeout * 1000u)
-            start();
+            start(cfg.size);
         return;
     }
     if (now - last_frame < FRAME_MS)
@@ -235,8 +244,8 @@ void saver_frame(void)
     int dt = (int)(now - last_frame);
     last_frame = now;
     wm_damage(logo_rect());
-    step_axis(&lx, &dx, &carry_x, dt, screen_w - cfg.size);
-    step_axis(&ly, &dy, &carry_y, dt, screen_h - cfg.size);
+    step_axis(&lx, &dx, &carry_x, dt, screen_w - run_size);
+    step_axis(&ly, &dy, &carry_y, dt, screen_h - run_size);
     wm_damage(logo_rect());
 }
 

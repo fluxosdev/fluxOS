@@ -350,6 +350,7 @@ struct saver_config {
 void saver_init(void);
 struct saver_config saver_get(void);
 void saver_set(struct saver_config c, int save);
+void saver_preview(struct saver_config c);  /* run now, as the Preview button does */
 int saver_active(void);
 int saver_input(const struct input_event *ev);      /* 1: it only woke the screen */
 int saver_timeout(void);                /* ms until saver_frame has work, or -1 */
