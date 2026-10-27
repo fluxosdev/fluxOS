@@ -1588,7 +1588,7 @@ struct window *image_view_open(const char *path)
     if (!img)
         return NULL;
     int cw = img->w + 16, ch = img->h + 16;
-    int maxw = screen_w - 2 * BORDER - 40, maxh = screen_h - TASKBAR_H - TITLE_H - 60;
+    int maxw = wm_work_right() - 2 * BORDER - 40, maxh = screen_h - TASKBAR_H - TITLE_H - 60;
     if (cw < 160)
         cw = 160;
     if (ch < 100)

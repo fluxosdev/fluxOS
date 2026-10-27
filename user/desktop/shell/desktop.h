@@ -173,6 +173,21 @@ int wm_window_count(void);
 struct window *wm_nth(int i);           /* the i-th window from the bottom of the stack, or NULL */
 void wm_close(struct window *w);        /* as the close button does */
 
+/* The space windows are placed in: left of the sidebar, above the taskbar. */
+int wm_work_right(void);
+/* The sidebar came or went: maximized windows refit, everything is drawn again. */
+void wm_work_changed(void);
+
+/* A pop-up menu at (x, y), kept on the screen: what the desktop and taskbar's right
+ * buttons open. An item with checked is drawn ticked while it returns nonzero. */
+struct ctx_item {
+    const char *label;                  /* NULL for a separator */
+    enum icon_id icon;
+    void (*run)(void);
+    int (*checked)(void);
+};
+void wm_popup(const struct ctx_item *items, int n, int x, int y);
+
 void wm_input(const struct input_event *ev);
 /* The video mode changed: map the new screen and lay the desktop out for it. */
 int wm_reconfigure(void);
@@ -187,6 +202,22 @@ void wm_draw_sample(struct surface *s, struct rect r);
 void wm_splash(const char *message);    /* the shutdown screen, saying message */
 void wm_tick(void);             /* clock and timers; call a few times a second */
 unsigned int now_ms(void);
+
+/* ---- the sidebar (sidebar.c) ----
+ * A column of widgets down the right edge, from the top of the screen to the
+ * taskbar, always in view as the taskbar is: windows maximize beside it. Its
+ * widgets (an analog clock, the month's calendar, a graph of the processor and
+ * memory) are chosen from its menu; the choice is kept in grubenv. */
+void sidebar_init(void);                /* the saved choice */
+int sidebar_width(void);                /* 0 while it is hidden */
+int sidebar_shown(void);
+void sidebar_show(int on);              /* and keep the choice */
+struct rect sidebar_rect(void);
+void sidebar_draw(struct surface *s);   /* over what is there, within s's clip */
+void sidebar_press(int x, int y);       /* the left button, on it */
+void sidebar_menu(int x, int y);        /* the right button, on it */
+void sidebar_layout(void);              /* the theme or the screen changed */
+void sidebar_tick(void);                /* once a second */
 
 /* ---- icons (icons.c) ---- */
 void draw_icon(struct surface *s, int x, int y, enum icon_id id, int size);   /* 16, 32, 48 */

@@ -1,6 +1,8 @@
 /*
  * Window manager and compositor: windows, the taskbar with its Start
  * menu and clock, desktop icons, the mouse pointer, and input routing.
+ * The sidebar (sidebar.c) is composed over the windows as the taskbar is,
+ * and windows are placed and maximized beside it.
  *
  * Changes only record damaged rectangles; wm_flush() repaints each one
  * from the bottom of the scene to the top into the back buffer and
@@ -269,13 +271,18 @@ static int work_bottom(void)
     return setup_mode ? screen_h : screen_h - TASKBAR_H;
 }
 
-/* ---- the desktop context menu ---- */
+/* And on the right: beside the sidebar. */
+static int work_right(void)
+{
+    return setup_mode ? screen_w : screen_w - sidebar_width();
+}
 
-struct ctx_item {
-    const char *label;                  /* NULL for a separator */
-    enum icon_id icon;
-    void (*run)(void);
-};
+int wm_work_right(void)
+{
+    return work_right();
+}
+
+/* ---- the desktop context menu ---- */
 
 #define CTX_ITEM_H 22
 #define CTX_SEP_H 8
@@ -287,27 +294,34 @@ static void minimize_all(void);
 static void tile_horizontally(void);
 static void tile_vertically(void);
 
+static void toggle_sidebar(void)
+{
+    sidebar_show(!sidebar_shown());
+}
+
 /* What right-clicking the taskbar offers. */
 static const struct ctx_item taskbar_ctx[] = {
-    { "Task Manager", ICON_TASKMGR, open_taskmgr },
-    { NULL, ICON_NONE, NULL },
-    { "Minimize All Windows", ICON_NONE, minimize_all },
-    { "Tile Windows Horizontally", ICON_NONE, tile_horizontally },
-    { "Tile Windows Vertically", ICON_NONE, tile_vertically },
+    { "Task Manager", ICON_TASKMGR, open_taskmgr, NULL },
+    { NULL, ICON_NONE, NULL, NULL },
+    { "Show Sidebar", ICON_NONE, toggle_sidebar, sidebar_shown },
+    { NULL, ICON_NONE, NULL, NULL },
+    { "Minimize All Windows", ICON_NONE, minimize_all, NULL },
+    { "Tile Windows Horizontally", ICON_NONE, tile_horizontally, NULL },
+    { "Tile Windows Vertically", ICON_NONE, tile_vertically, NULL },
 };
 
 static const struct ctx_item desktop_ctx[] = {
-    { "Arrange Icons", ICON_NONE, arrange_icons },
-    { NULL, ICON_NONE, NULL },
-    { "Terminal", ICON_TERMINAL, open_terminal },
-    { "File Manager", ICON_FOLDER, open_home },
-    { "Task Manager", ICON_TASKMGR, open_taskmgr },
-    { NULL, ICON_NONE, NULL },
-    { "Display Properties", ICON_DISPLAY, display_open },
+    { "Arrange Icons", ICON_NONE, arrange_icons, NULL },
+    { NULL, ICON_NONE, NULL, NULL },
+    { "Terminal", ICON_TERMINAL, open_terminal, NULL },
+    { "File Manager", ICON_FOLDER, open_home, NULL },
+    { "Task Manager", ICON_TASKMGR, open_taskmgr, NULL },
+    { NULL, ICON_NONE, NULL, NULL },
+    { "Display Properties", ICON_DISPLAY, display_open, NULL },
 };
 
 static const struct ctx_item icon_ctx[] = {
-    { "Open", ICON_NONE, open_ctx_icon },
+    { "Open", ICON_NONE, open_ctx_icon, NULL },
 };
 
 static const struct ctx_item *ctx_items;
@@ -389,6 +403,11 @@ static void set_ctx(const struct ctx_item *items, int n, int x, int y, int icon)
         ctx_icon = icon;
         wm_damage(shadowed(ctx_rect()));
     }
+}
+
+void wm_popup(const struct ctx_item *items, int n, int x, int y)
+{
+    set_ctx(items, n, x, y, -1);
 }
 
 static void set_ctx_hover(int i)
@@ -564,7 +583,7 @@ static void place_icon(int i)
 {
     int cx = (desk_icons[i].x - ICON_MARGIN + ICON_CELL_W / 2) / ICON_CELL_W;
     int cy = (desk_icons[i].y - 6 + ICON_CELL_H / 2) / ICON_CELL_H;
-    int maxx = (screen_w - ICON_CELL_W - ICON_MARGIN) / ICON_CELL_W;
+    int maxx = (work_right() - ICON_CELL_W - ICON_MARGIN) / ICON_CELL_W;
     int maxy = (screen_h - TASKBAR_H - 6 - ICON_CELL_H) / ICON_CELL_H;
     if (cx < 0)
         cx = 0;
@@ -1237,6 +1256,14 @@ static void draw_start_menu_kinetik(void)
     }
 }
 
+/* An item's tick, in its icon's place. */
+static void draw_check(struct rect r, color_t c)
+{
+    int x = r.x + 4, y = r.y + (r.h - 16) / 2;
+    gfx_line(&screen, x + 3, y + 8, x + 6, y + 11, 2, ARGB(255, c));
+    gfx_line(&screen, x + 6, y + 11, x + 12, y + 4, 2, ARGB(255, c));
+}
+
 static void draw_ctx_menu_kinetik(void)
 {
     struct rect m = ctx_rect();
@@ -1249,7 +1276,9 @@ static void draw_ctx_menu_kinetik(void)
         }
         if (i == ctx_hover)
             menu_hot(r);
-        if (ctx_items[i].icon != ICON_NONE)
+        if (ctx_items[i].checked && ctx_items[i].checked())
+            draw_check(r, theme.ink);
+        else if (ctx_items[i].icon != ICON_NONE)
             draw_icon(&screen, r.x + 4, r.y + (r.h - 16) / 2, ctx_items[i].icon, 16);
         gfx_text(&screen, &font_sans, r.x + 4 + 16 + 8, r.y + (r.h - font_sans.height) / 2,
                  ctx_items[i].label, theme.ink);
@@ -1431,7 +1460,9 @@ static void draw_ctx_menu(void)
         int hot = i == ctx_hover;
         if (hot)
             gfx_fill(&screen, r.x, r.y, r.w, r.h, C_NAVY);
-        if (ctx_items[i].icon != ICON_NONE)
+        if (ctx_items[i].checked && ctx_items[i].checked())
+            draw_check(r, hot ? C_WHITE : C_BLACK);
+        else if (ctx_items[i].icon != ICON_NONE)
             draw_icon(&screen, r.x + 4, r.y + (r.h - 16) / 2, ctx_items[i].icon, 16);
         gfx_text(&screen, &font_sans, r.x + 4 + 16 + 8, r.y + (r.h - font_sans.height) / 2,
                  ctx_items[i].label, hot ? C_WHITE : C_BLACK);
@@ -1468,8 +1499,10 @@ static void compose(struct rect r)
     for (struct window *w = bottom; w; w = w->above)
         if (!w->minimized && w != modal)
             draw_window(w);
-    if (!setup_mode)
+    if (!setup_mode) {
+        sidebar_draw(&screen);
         draw_taskbar();
+    }
     if (modal) {
         gfx_dither(&screen, r.x, r.y, r.w, r.h, C_BLACK);
         draw_window(modal);
@@ -1669,8 +1702,8 @@ int wm_resize_client(struct window *w, int client_w, int client_h)
     struct rect r = w->r;
     r.w = client_w + 2 * BORDER;
     r.h = client_h + FRAME_TOP + BORDER;
-    if (r.x + r.w > screen_w)
-        r.x = screen_w > r.w ? screen_w - r.w : 0;
+    if (r.x + r.w > work_right())
+        r.x = work_right() > r.w ? work_right() - r.w : 0;
     if (r.y + r.h > work_bottom())
         r.y = work_bottom() > r.h ? work_bottom() - r.h : 0;
     return set_frame(w, r);
@@ -1678,7 +1711,7 @@ int wm_resize_client(struct window *w, int client_w, int client_h)
 
 void wm_center(struct window *w)
 {
-    int x = (screen_w - w->r.w) / 2;
+    int x = (work_right() - w->r.w) / 2;
     int y = (work_bottom() - w->r.h) / 2;
     move_window(w, x > 0 ? x : 0, y > 0 ? y : 0);
 }
@@ -1688,8 +1721,8 @@ void wm_cascade(struct window *w)
     static int slot;
     int x = 96 + (slot % 8) * 26, y = 24 + (slot % 8) * 26;
     slot++;
-    if (x + w->r.w > screen_w)
-        x = screen_w - w->r.w > 0 ? screen_w - w->r.w : 0;
+    if (x + w->r.w > work_right())
+        x = work_right() - w->r.w > 0 ? work_right() - w->r.w : 0;
     if (y + w->r.h > work_bottom())
         y = work_bottom() - w->r.h > 0 ? work_bottom() - w->r.h : 0;
     move_window(w, x, y);
@@ -1735,7 +1768,7 @@ static void toggle_maximize(struct window *w)
         return;
     struct rect to = w->restore;
     if (!w->maximized)
-        to = mkrect(0, 0, screen_w, work_bottom());
+        to = mkrect(0, 0, work_right(), work_bottom());
     struct rect from = w->r;
     if (set_frame(w, to) < 0)
         return;
@@ -1772,7 +1805,7 @@ static void tile(int by_rows)
     /* at most four windows deep, so that none gets too thin */
     int lines = n < 4 ? n : 4, across = (n + lines - 1) / lines;
     int rows = by_rows ? lines : across, cols = by_rows ? across : lines;
-    int w = screen_w, h = work_bottom();
+    int w = work_right(), h = work_bottom();
     for (int i = 0; i < n; i++) {
         int r = by_rows ? i / cols : i % rows, c = by_rows ? i % cols : i / rows;
         struct rect cell = mkrect(c * w / cols, r * h / rows, (c + 1) * w / cols - c * w / cols,
@@ -1882,12 +1915,13 @@ static int frame_dw, frame_dh;
 void wm_restyle(void)
 {
     int dw = 2 * BORDER, dh = FRAME_TOP + BORDER;
+    sidebar_layout();
     for (struct window *w = bottom; w; w = w->above) {
         int cw = w->content.w, ch = w->content.h;
         if (w->maximized) {             /* still filling the screen above the taskbar */
             w->restore.w += dw - frame_dw;
             w->restore.h += dh - frame_dh;
-            set_frame(w, mkrect(0, 0, screen_w, work_bottom()));
+            set_frame(w, mkrect(0, 0, work_right(), work_bottom()));
         } else {
             w->r.w = cw + dw;
             w->r.h = ch + dh;
@@ -2108,6 +2142,8 @@ static struct window *window_at(int x, int y)
     struct window *modal = modal_window();
     if (modal)
         return rect_contains(modal->r, x, y) ? modal : NULL;
+    if (!setup_mode && rect_contains(sidebar_rect(), x, y))
+        return NULL;                    /* the sidebar is over them */
     for (struct window *w = bottom; w; w = w->above)
         if (!w->minimized && rect_contains(w->r, x, y))
             hit = w;
@@ -2284,6 +2320,11 @@ static void press_left(void)
                 return;
             }
         }
+        return;
+    }
+    if (!setup_mode && rect_contains(sidebar_rect(), mx, my)) {
+        if (!modal)
+            sidebar_press(mx, my);
         return;
     }
 
@@ -2551,6 +2592,10 @@ static void press_right(void)
         set_ctx(taskbar_ctx, COUNT(taskbar_ctx), mx, my, -1);
         return;
     }
+    if (!setup_mode && !modal_window() && drag == DRAG_NONE && rect_contains(sidebar_rect(), mx, my)) {
+        sidebar_menu(mx, my);
+        return;
+    }
     if (setup_mode || modal_window() || drag != DRAG_NONE || rect_contains(taskbar_rect(), mx, my) ||
         window_at(mx, my)) {
         set_ctx(NULL, 0, 0, 0, -1);
@@ -2604,7 +2649,7 @@ static void mouse_event(const struct input_event *ev)
 
     /* The wheel scrolls the window under the pointer. */
     int16_t wheel = (int16_t)ev->code;
-    if (wheel && !menu_open && drag == DRAG_NONE) {
+    if (wheel && !menu_open && drag == DRAG_NONE && (setup_mode || !rect_contains(sidebar_rect(), mx, my))) {
         struct window *w = window_at(mx, my);
         if (!w)
             w = focused;
@@ -2798,6 +2843,22 @@ void wm_tick(void)
 {
     if (update_clock() && !setup_mode)
         wm_damage(tray_rect());
+    if (!setup_mode)
+        sidebar_tick();
+}
+
+/* Maximized windows fill the space the sidebar now leaves, and icons it would cover move. */
+void wm_work_changed(void)
+{
+    for (struct window *w = bottom; w; w = w->above)
+        if (w->maximized)
+            set_frame(w, mkrect(0, 0, work_right(), work_bottom()));
+    for (int i = 0; i < NDESK; i++)
+        if (desk_icons[i].x + ICON_CELL_W > work_right()) {
+            arrange_icons();
+            break;
+        }
+    wm_damage(mkrect(0, 0, screen_w, screen_h));
 }
 
 /*
@@ -2841,21 +2902,22 @@ int wm_reconfigure(void)
         mx = screen_w - 1;
     if (my >= screen_h)
         my = screen_h - 1;
+    sidebar_layout();
     for (struct window *w = bottom; w; w = w->above) {
         if (w->maximized) {
-            set_frame(w, mkrect(0, 0, screen_w, work_bottom()));
+            set_frame(w, mkrect(0, 0, work_right(), work_bottom()));
             continue;
         }
         int x = w->r.x, y = w->r.y;
-        if (x + w->r.w > screen_w)
-            x = screen_w - w->r.w;
+        if (x + w->r.w > work_right())
+            x = work_right() - w->r.w;
         if (y + w->r.h > work_bottom())
             y = work_bottom() - w->r.h;
         w->r.x = x < 0 ? 0 : x;
         w->r.y = y < 0 ? 0 : y;
     }
     for (int i = 0; i < NDESK; i++) {
-        if (desk_icons[i].x > screen_w - ICON_CELL_W || desk_icons[i].y > screen_h - TASKBAR_H - ICON_CELL_H) {
+        if (desk_icons[i].x > work_right() - ICON_CELL_W || desk_icons[i].y > screen_h - TASKBAR_H - ICON_CELL_H) {
             arrange_icons();
             break;
         }
@@ -2889,6 +2951,8 @@ void wm_init(int setup)
     }
     if (setup_mode)
         ndesk = 0;
+    else
+        sidebar_init();
     arrange_icons();
     mx = screen_w / 2;
     my = screen_h / 2;

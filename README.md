@@ -147,6 +147,13 @@ stops at boot and says why.
   captions, and Liberation Sans. Either way the desktop has icons and a taskbar
   (Start button, a button per window, clock, volume tray icon), and terminals keep
   the sharp 8x16 bitmap font. Switching redraws every open window at once.
+- **Sidebar** down the right edge, as in Longhorn: always in view like the taskbar,
+  with maximized windows stopping beside it. Its widgets are an analog clock
+  (click for Date and Time), a month calendar (arrows page it, the month's name
+  comes back to today) and a graph of the last minute of processor and memory use
+  (click for Task Manager), added or removed from its menu (the heading's button,
+  "Add widgets...", or a right click). Right-click the taskbar for **Show
+  Sidebar**. It is on by default at 1024 pixels wide and more; the choice is kept.
 - Oxygen icons (PNG), PNG, JPEG, GIF and SVG decoding (the first bytes decide,
   whatever the name), and a wallpaper (Fill, Stretch, Center or Tile).
 - Windows move, minimize, maximize and cascade; the browser, text editor, file

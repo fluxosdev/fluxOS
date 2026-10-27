@@ -257,6 +257,6 @@ void clock_open(void)
     struct tm *tm = localtime(&t);
     view_year = tm->tm_year + 1900;
     view_month = tm->tm_mon;
-    wm_move(clock_win, screen_w - clock_win->r.w - 2, screen_h - TASKBAR_H - clock_win->r.h - 2);
+    wm_move(clock_win, wm_work_right() - clock_win->r.w - 2, screen_h - TASKBAR_H - clock_win->r.h - 2);
     paint();
 }
