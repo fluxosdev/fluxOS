@@ -1531,7 +1531,7 @@ void dos_init(char **envp)
     uint16_t largest, env;
     mem_alloc(0x10, 8, &root_psp, &largest);       /* owner 8: DOS, until set */
     const char *vars[] = {
-        "COMSPEC=C:\\COMMAND.COM", "PATH=C:\\", "PROMPT=$P$G", "TEMP=C:\\TMP", "TMP=C:\\TMP",
+        "COMSPEC=C:\\COMMAND.COM", "PATH=C:\\", "PROMPT=$P$G", "TEMP=E:\\TMP", "TMP=E:\\TMP",
         sound_blaster_env(),            /* last: NULL without a Sound Blaster */
     };
     unsigned nvars = sizeof(vars) / sizeof(vars[0]) - (vars[5] ? 0 : 1);

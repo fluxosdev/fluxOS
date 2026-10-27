@@ -4,8 +4,9 @@
  * FCB ones included.
  *
  * Drives: A: and B: are /mnt/fd0 and /mnt/fd1 (a floppy is mounted
- * there the first time a program looks at the drive), C: is the root
- * and D: is /mnt/cdrom. Path components are matched case-insensitively,
+ * there the first time a program looks at the drive), C: is /dos, the
+ * folder DOS programs install to, D: is /mnt/cdrom and E: is the root,
+ * so programs elsewhere can still be reached. Path components are matched case-insensitively,
  * and directory listings show only names that fit in 8.3, upper case.
  *
  * Handles follow DOS: each program's PSP holds a table of indexes into
@@ -33,7 +34,9 @@
 #define NSEARCH   16
 #define FCB_MAGIC 0xF5                  /* marks our SFT index in an FCB's reserved bytes */
 
-static const char *const drive_root[26] = { "/mnt/fd0", "/mnt/fd1", "/", "/mnt/cdrom" };
+#define ROOT_DRIVE 4                    /* E: */
+
+static const char *const drive_root[26] = { "/mnt/fd0", "/mnt/fd1", "/dos", "/mnt/cdrom", "/" };
 static char cwd[26][DOS_PATH];          /* "HOME\FLUX": no drive, no leading backslash */
 static int cur_drive = 2;
 static uint32_t mount_tried[2];
@@ -250,9 +253,9 @@ int host_to_dos(const char *host, char *dos, int size)
         p = q + 1;
     }
 
-    int best = 2, best_len = 0;
+    int best = ROOT_DRIVE, best_len = 0;
     for (int d = 0; d < 26; d++) {
-        if (!drive_root[d] || d == 2 || !drive_valid(d))
+        if (!drive_root[d] || d == ROOT_DRIVE || !drive_valid(d))
             continue;
         /* Count the root's components and check they lead the path. */
         int k = 0, ok = 1;
@@ -1781,6 +1784,7 @@ int files_int21(void)
 void files_init(void)
 {
     char here[PATH_MAX], dos[DOS_PATH];
+    mkdir(drive_root[2], 0755);         /* C:, on a system installed before it was there */
     if (!getcwd(here, sizeof(here)))
         strcpy(here, "/");
     cur_drive = host_to_dos(here, dos, sizeof(dos));

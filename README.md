@@ -386,8 +386,9 @@ fetcher process, so the desktop keeps running), or from `file://`.
   double-click). `dos` emulates a PC in user space: an x86 CPU (8086 to 486, no
   FPU), 640 KiB of memory, a BIOS and DOS 5 services, and a DPMI 0.9 host for
   extenders such as DOS/4GW (DOOM and similar).
-- Drives: `C:` is the fluxOS root, `A:`/`B:` are `/mnt/fd0`/`fd1`, `D:` is
-  `/mnt/cdrom`. Standard handles are fluxOS descriptors, so pipes and
+- Drives: `C:` is `/dos`, the folder DOS programs install to (`C:\GAMES` is
+  `/dos/GAMES`), `E:` is the fluxOS root, `A:`/`B:` are `/mnt/fd0`/`fd1`, `D:`
+  is `/mnt/cdrom`. Standard handles are fluxOS descriptors, so pipes and
   redirection work. EXEC of a fluxOS program runs it as a real process, and
   `COMMAND.COM` runs the shell.
 - Screen: text mode (80x25 with colors and box drawing, ANSI.SYS), and VGA
