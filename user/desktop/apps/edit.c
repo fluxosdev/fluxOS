@@ -29,6 +29,9 @@
 #define MAX_TEXT   (1 << 20)
 #define TABSTOP    8
 #define PAD        2
+#define EFONT      font_archivo
+#define LINE_H     (EFONT.height + 3)
+#define HSTEP      16                   /* pixels an arrow of the horizontal scroll bar moves */
 
 /* PS/2 scancodes of the letters used for shortcuts */
 #define SC_A 0x1E
@@ -93,10 +96,10 @@ struct ed {
     int want_col;                       /* column to return to on up/down */
     int *lines;                         /* start index of every line */
     int nlines;
-    int maxcol;                         /* the longest line, in columns */
+    int maxcol;                         /* the longest line, in pixels */
     int lines_ok;
     int anchor;                         /* where a mouse selection started */
-    int vscroll, hscroll;               /* first visible line and column */
+    int vscroll, hscroll;               /* first visible line, and pixels scrolled left */
     char path[PATH_MAX];                /* "" for an untitled document */
     int modified, crlf;
     enum action after;                  /* what to do once a pending save is done */
@@ -222,8 +225,40 @@ static int line_end(struct ed *e, int line)      /* index of the line's newline,
     return line + 1 < e->nlines ? e->lines[line + 1] - 1 : e->len;
 }
 
-/* The display column of index idx, which is on `line`. */
+/* Archivo is proportional, so a position in a line is a distance in pixels from its left edge. */
+static int adv(unsigned char ch)
+{
+    static int width[128];
+    if (ch < 32 || ch > 126)
+        ch = '?';
+    if (!width[ch]) {
+        char one[2] = { (char)ch, 0 };
+        width[ch] = gfx_text_width(&EFONT, one);
+    }
+    return width[ch];
+}
+
+/* Where the pen is after the character ch that began at x (tabs go to the next multiple of 8 spaces). */
+static int pen_after(int x, unsigned char ch)
+{
+    if (ch == '\t') {
+        int tab = TABSTOP * adv(' ');
+        return (x / tab + 1) * tab;
+    }
+    return x + adv(ch);
+}
+
+/* The distance in pixels to index idx, which is on `line`. */
 static int column_of(struct ed *e, int line, int idx)
+{
+    int x = 0;
+    for (int i = e->lines[line]; i < idx; i++)
+        x = pen_after(x, (unsigned char)e->text[i]);
+    return x;
+}
+
+/* The character column of idx (what the status bar counts, tabs to multiples of TABSTOP). */
+static int char_column_of(struct ed *e, int line, int idx)
 {
     int col = 0;
     for (int i = e->lines[line]; i < idx; i++)
@@ -231,13 +266,13 @@ static int column_of(struct ed *e, int line, int idx)
     return col;
 }
 
-/* The index on `line` nearest to display column col. */
-static int index_at(struct ed *e, int line, int col)
+/* The index on `line` nearest to pixel x. */
+static int index_at(struct ed *e, int line, int x)
 {
     int c = 0, end = line_end(e, line);
     for (int i = e->lines[line]; i < end; i++) {
-        int next = e->text[i] == '\t' ? (c / TABSTOP + 1) * TABSTOP : c + 1;
-        if (col < c + (next - c + 1) / 2)
+        int next = pen_after(c, (unsigned char)e->text[i]);
+        if (x < c + (next - c + 1) / 2)
             return i;
         c = next;
     }
@@ -259,12 +294,12 @@ static struct rect text_rect(struct ed *e)
 
 static int rows(struct ed *e)
 {
-    return text_rect(e).h / FONT_H;
+    return text_rect(e).h / LINE_H;
 }
 
 static int cols(struct ed *e)
 {
-    return (text_rect(e).w - 2 * PAD) / FONT_W;
+    return text_rect(e).w - 2 * PAD;          /* pixels */
 }
 
 static struct sbar vbar(struct ed *e)
@@ -278,9 +313,9 @@ static struct sbar hbar(struct ed *e)
 {
     struct rect t = text_rect(e);
     build_lines(e);
-    /* One column more than the longest line, so the caret at its end shows. */
+    /* A little more than the longest line, so the caret at its end shows. */
     return (struct sbar){ mkrect(t.x, t.y + t.h, t.w, SBAR_W), 0, e->hscroll, cols(e),
-                          e->maxcol + 1 };
+                          e->maxcol + 2 * PAD };
 }
 
 static struct rect menu_title_rect(int i)
@@ -425,30 +460,29 @@ static void draw_text(struct ed *e, struct surface *s)
 
     int from, to;
     sel_range(e, &from, &to);
-    int vis_cols = cols(e) + 1;
-    int x0 = t.x + PAD - e->hscroll * FONT_W;
+    int vis = cols(e) + 2 * adv('W');
+    int x0 = t.x + PAD - e->hscroll;
 
     for (int r = 0; r < rows(e) + 1; r++) {
         int line = e->vscroll + r;
         if (line >= e->nlines)
             break;
-        int y = t.y + r * FONT_H, end = line_end(e, line), col = 0;
-        for (int i = e->lines[line]; i <= end && col < e->hscroll + vis_cols; i++) {
+        int y = t.y + r * LINE_H, end = line_end(e, line), col = 0;
+        for (int i = e->lines[line]; i <= end && col < e->hscroll + vis; i++) {
             int selected = i >= from && i < to;
             if (i == end) {             /* the newline: shown as a selected blank */
                 if (selected && end < e->len)
-                    gfx_fill(s, x0 + col * FONT_W, y, FONT_W, FONT_H, C_NAVY);
+                    gfx_fill(s, x0 + col, y, adv(' '), LINE_H, C_NAVY);
                 break;
             }
             unsigned char ch = (unsigned char)e->text[i];
-            int next = ch == '\t' ? (col / TABSTOP + 1) * TABSTOP : col + 1;
+            int next = pen_after(col, ch);
             if (next > e->hscroll) {
-                if (ch == '\t') {
-                    if (selected)
-                        gfx_fill(s, x0 + col * FONT_W, y, (next - col) * FONT_W, FONT_H, C_NAVY);
-                } else {
-                    gfx_glyph8x16(s, x0 + col * FONT_W, y, ch, selected ? C_WHITE : C_BLACK,
-                                  selected ? C_NAVY : C_WHITE);
+                if (selected)
+                    gfx_fill(s, x0 + col, y, next - col, LINE_H, C_NAVY);
+                if (ch != '\t') {
+                    char one[2] = { (char)ch, 0 };
+                    gfx_text(s, &EFONT, x0 + col, y + 1, one, selected ? C_WHITE : C_BLACK);
                 }
             }
             col = next;
@@ -458,7 +492,7 @@ static void draw_text(struct ed *e, struct surface *s)
     if (e->focused && blink_on && !has_selection(e)) {
         int line = line_of(e, e->cur), col = column_of(e, line, e->cur);
         if (line >= e->vscroll && line <= e->vscroll + rows(e) && col >= e->hscroll)
-            gfx_fill(s, x0 + col * FONT_W, t.y + (line - e->vscroll) * FONT_H, 2, FONT_H, C_BLACK);
+            gfx_fill(s, x0 + col, t.y + (line - e->vscroll) * LINE_H, 2, LINE_H, C_BLACK);
     }
     s->clip = saved;
 }
@@ -482,7 +516,7 @@ static void paint(struct ed *e)
     /* Status bar */
     int line = line_of(e, e->cur);
     char buf[64];
-    snprintf(buf, sizeof(buf), "Ln %d, Col %d", line + 1, column_of(e, line, e->cur) + 1);
+    snprintf(buf, sizeof(buf), "Ln %d, Col %d", line + 1, char_column_of(e, line, e->cur) + 1);
     gfx_bevel(s, mkrect(2, s->h - STATUS_H, s->w - 4, STATUS_H - 2), BEVEL_THIN_SUNKEN);
     gfx_text(s, &font_sans, 8, s->h - STATUS_H + 2, buf, C_BLACK);
     snprintf(buf, sizeof(buf), "%d byte%s%s", e->len, e->len == 1 ? "" : "s",
@@ -519,7 +553,7 @@ static void show_caret(struct ed *e)
     if (col < e->hscroll)
         e->hscroll = col;
     else if (col >= e->hscroll + cols(e))
-        e->hscroll = col - cols(e) + 1;
+        e->hscroll = col - cols(e) + 2;
     clamp_scroll(e);
     blink_on = 1;
 }
@@ -1038,23 +1072,25 @@ static int index_at_point(struct ed *e, int x, int y)
 {
     struct rect t = text_rect(e);
     build_lines(e);
-    int line = e->vscroll + (y - t.y) / FONT_H - (y < t.y ? 1 : 0);
+    int line = e->vscroll + (y - t.y) / LINE_H - (y < t.y ? 1 : 0);
     if (line < 0)
         line = 0;
     if (line >= e->nlines)
         line = e->nlines - 1;
-    int col = (x - t.x - PAD + FONT_W / 2) / FONT_W + e->hscroll - (x < t.x + PAD - FONT_W / 2 ? 1 : 0);
-    return index_at(e, line, col < 0 ? 0 : col);
+    int px = x - t.x - PAD + e->hscroll;
+    return index_at(e, line, px < 0 ? 0 : px);
 }
 
 static void scroll_step(struct ed *e, struct sbar *b, enum sbar_part part)
 {
     int *pos = b->vertical ? &e->vscroll : &e->hscroll;
+    int unit = b->vertical ? 1 : HSTEP;
+    int page = b->page > unit ? b->page - unit : unit;
     switch (part) {
-    case SBAR_ARROW1: *pos -= 1; break;
-    case SBAR_ARROW2: *pos += 1; break;
-    case SBAR_PAGE1: *pos -= b->page > 1 ? b->page - 1 : 1; break;
-    case SBAR_PAGE2: *pos += b->page > 1 ? b->page - 1 : 1; break;
+    case SBAR_ARROW1: *pos -= unit; break;
+    case SBAR_ARROW2: *pos += unit; break;
+    case SBAR_PAGE1: *pos -= page; break;
+    case SBAR_PAGE2: *pos += page; break;
     default: break;
     }
     clamp_scroll(e);

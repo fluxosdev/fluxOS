@@ -1174,7 +1174,9 @@ static void draw_taskbar_kinetik(void)
 
     struct rect sb = start_button_rect();
     glass(sb, 6, menu_open);
-    draw_icon(&screen, sb.x + 7, sb.y + (sb.h - 24) / 2, ICON_FLUX, 24);
+    struct rect orb = mkrect(sb.x + 7, sb.y + (sb.h - 24) / 2, 24, 24);
+    gfx_shadow(&screen, orb, 12, 0, 4, ARGB(0x48, 0x020B19));      /* the orb sits above the button */
+    draw_icon(&screen, orb.x, orb.y, ICON_FLUX, 24);
     gfx_text(&screen, &font_archivo_start, sb.x + 37, sb.y + (sb.h - font_archivo_start.height) / 2, "menu",
              theme.on_chrome);
 
