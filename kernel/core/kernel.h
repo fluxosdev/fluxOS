@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <flux/abi.h>
+#include "lock.h"
 
 #define FLUXOS_NAME    "fluxOS"
 #define FLUXOS_RELEASE "0.2.2"

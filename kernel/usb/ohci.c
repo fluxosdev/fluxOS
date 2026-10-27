@@ -484,7 +484,7 @@ static int ohci_port_reset(struct usb_hub *h, int port)
     struct ohci *o = h->hc->priv;
     wr(o, port_reg(port), PS_PRS);
     for (int i = 0; i < 50 && !(rd(o, port_reg(port)) & PS_PRSC); i++)
-        mdelay(2);
+        usb_mdelay(2);
     wr(o, port_reg(port), PS_PRSC);
     uint32_t v = rd(o, port_reg(port));
     if (!(v & PS_CCS))
@@ -515,6 +515,7 @@ static int nohci;
 static void ohci_irq(struct trapframe *tf)
 {
     (void)tf;
+    spin_lock(&usb_lock);
     for (int i = 0; i < nohci; i++) {
         struct ohci *o = ohcis[i];
         uint32_t sts = rd(o, HC_INTSTATUS) & rd(o, HC_INTENABLE);
@@ -523,6 +524,7 @@ static void ohci_irq(struct trapframe *tf)
             ohci_poll(&o->hc);
         }
     }
+    spin_unlock(&usb_lock);
 }
 
 /* Take the controller from SMM or from the BIOS driver. */
@@ -533,12 +535,12 @@ static void take_ownership(struct ohci *o)
         wr(o, HC_INTENABLE, INT_MIE | (1u << 30));     /* ownership change interrupt */
         wr(o, HC_CMDSTATUS, CMD_OCR);
         for (int i = 0; i < 200 && (rd(o, HC_CONTROL) & CTL_IR); i++)
-            mdelay(5);
+            usb_mdelay(5);
         if (rd(o, HC_CONTROL) & CTL_IR)
             klog("ohci: SMM would not let go; resetting anyway\n");
     } else if ((ctl & CTL_HCFS) != 0 && (ctl & CTL_HCFS) != CTL_OPER) {
         wr(o, HC_CONTROL, (ctl & ~CTL_HCFS) | CTL_RESUME);
-        mdelay(20);
+        usb_mdelay(20);
     }
 }
 
@@ -563,7 +565,7 @@ static void ohci_init(const struct pci_dev *pci)
         fi = 0x2EDF;
     wr(o, HC_INTDISABLE, 0xFFFFFFFFu);
     wr(o, HC_CONTROL, 0);               /* USB reset on every port */
-    mdelay(50);
+    usb_mdelay(50);
     wr(o, HC_CMDSTATUS, CMD_HCR);
     for (int i = 0; i < 100 && (rd(o, HC_CMDSTATUS) & CMD_HCR); i++)
         udelay(10);
@@ -602,7 +604,7 @@ static void ohci_init(const struct pci_dev *pci)
         for (int p = 1; p <= hc->root.nports; p++)
             wr(o, port_reg(p), PS_SET_POWER);
     }
-    mdelay(MAX((rha >> 24) * 2, 20u));
+    usb_mdelay(MAX((rha >> 24) * 2, 20u));
 
     ohcis[nohci++] = o;
     if (hc->irq >= 0)

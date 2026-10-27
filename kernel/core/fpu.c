@@ -89,8 +89,11 @@ static int fpu_holds(struct cpu *c, struct proc *p)
     return c->fpu_owner == p && p->fpu_cpu == c->index;
 }
 
-/* #NM from user mode: give the FPU to the current process. Whoever had
- * it saved its registers when it stopped running (fpu_switch). */
+/* #NM from user mode, with interrupts off: give the FPU to the current
+ * process. Whoever had it saved its registers when it stopped running
+ * (fpu_switch, with sched_lock held). The rest here keep interrupts off
+ * too: preempted, the process could go on on another processor, with
+ * another's registers in its FPU. */
 void fpu_trap(void)
 {
     struct cpu *c = this_cpu();
@@ -121,20 +124,24 @@ void fpu_switch(struct proc *prev, struct proc *next)
 /* fork: the child starts with a copy of the current process's FPU registers. */
 void fpu_fork(struct proc *child)
 {
-    if (fpu_holds(this_cpu(), current)) {
+    uint32_t flags = irq_save();
+    struct proc *p = this_cpu()->proc;
+    if (fpu_holds(this_cpu(), p)) {
         /* Unlike FNSAVE, FXSAVE leaves the registers loaded: the parent keeps them. */
         clts();
-        fpu_save(current);
+        fpu_save(p);
     }
-    memcpy(child->fpu, current->fpu, sizeof(child->fpu));
-    child->fpu_used = current->fpu_used;
+    memcpy(child->fpu, p->fpu, sizeof(child->fpu));
+    child->fpu_used = p->fpu_used;
     child->fpu_cpu = -1;
+    irq_restore(flags);
 }
 
 /* exec or exit: the process's FPU registers are no longer wanted. Another
  * processor may still name p its owner, but fpu_cpu says it no longer is. */
 void fpu_release(struct proc *p)
 {
+    uint32_t flags = irq_save();
     struct cpu *c = this_cpu();
     if (c->fpu_owner == p) {
         c->fpu_owner = NULL;
@@ -142,4 +149,5 @@ void fpu_release(struct proc *p)
     }
     p->fpu_used = 0;
     p->fpu_cpu = -1;
+    irq_restore(flags);
 }

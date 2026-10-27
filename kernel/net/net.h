@@ -4,8 +4,8 @@
  * kernel and converted at the system call boundary and on the wire.
  *
  * Packets are processed in the network card's interrupt handler and
- * the timer interrupt. Both run with interrupts off, like all kernel
- * code, so nothing else runs in the middle of them.
+ * the timer interrupt, holding net_lock as the socket calls do, so
+ * nothing else in the stack runs in the middle of them.
  */
 #ifndef NET_H
 #define NET_H
@@ -124,6 +124,9 @@ struct netif {
     uint32_t rx_errors, tx_errors, rx_dropped;
 };
 extern struct netif netif;
+/* Held by everything in the network stack (socket.c): the socket calls,
+ * the network cards' interrupt handlers and net_tick. */
+extern spinlock_t net_lock;
 
 void net_init(void);
 void net_tick(void);                    /* timer interrupt, every tick */

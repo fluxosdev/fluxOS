@@ -7,6 +7,9 @@
 #define CONFIG_ADDR 0xCF8
 #define CONFIG_DATA 0xCFC
 
+/* Each access is two port writes or reads: they must not interleave. */
+static spinlock_t pci_lock = SPINLOCK_INIT("pci");
+
 static uint32_t config_addr(const struct pci_dev *p, int off)
 {
     return 0x80000000u | (uint32_t)p->bus << 16 | (uint32_t)p->dev << 11 |
@@ -15,38 +18,53 @@ static uint32_t config_addr(const struct pci_dev *p, int off)
 
 uint32_t pci_read32(const struct pci_dev *p, int off)
 {
+    spin_lock(&pci_lock);
     outl(CONFIG_ADDR, config_addr(p, off));
-    return inl(CONFIG_DATA);
+    uint32_t v = inl(CONFIG_DATA);
+    spin_unlock(&pci_lock);
+    return v;
 }
 
 void pci_write32(const struct pci_dev *p, int off, uint32_t v)
 {
+    spin_lock(&pci_lock);
     outl(CONFIG_ADDR, config_addr(p, off));
     outl(CONFIG_DATA, v);
+    spin_unlock(&pci_lock);
 }
 
 uint16_t pci_read16(const struct pci_dev *p, int off)
 {
+    spin_lock(&pci_lock);
     outl(CONFIG_ADDR, config_addr(p, off));
-    return inw((uint16_t)(CONFIG_DATA + (off & 2)));
+    uint16_t v = inw((uint16_t)(CONFIG_DATA + (off & 2)));
+    spin_unlock(&pci_lock);
+    return v;
 }
 
 void pci_write16(const struct pci_dev *p, int off, uint16_t v)
 {
+    spin_lock(&pci_lock);
     outl(CONFIG_ADDR, config_addr(p, off));
     outw((uint16_t)(CONFIG_DATA + (off & 2)), v);
+    spin_unlock(&pci_lock);
 }
 
 uint8_t pci_read8(const struct pci_dev *p, int off)
 {
+    spin_lock(&pci_lock);
     outl(CONFIG_ADDR, config_addr(p, off));
-    return inb((uint16_t)(CONFIG_DATA + (off & 3)));
+    uint8_t v = inb((uint16_t)(CONFIG_DATA + (off & 3)));
+    spin_unlock(&pci_lock);
+    return v;
 }
 
 void pci_write8(const struct pci_dev *p, int off, uint8_t v)
 {
+    spin_lock(&pci_lock);
     outl(CONFIG_ADDR, config_addr(p, off));
     outb((uint16_t)(CONFIG_DATA + (off & 3)), v);
+    spin_unlock(&pci_lock);
 }
 
 /* Call match on every function present; stop at the first that returns 1. */

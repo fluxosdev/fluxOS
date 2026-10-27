@@ -100,12 +100,23 @@ static const char *function_text(uint8_t sc)
     return "";
 }
 
+static void key(uint8_t sc, int ext, int released);
+
 /*
  * One key going down or up. Both keyboards come here: the PS/2 interrupt
  * with the codes it reads, and USB keyboards with their keys translated
- * to the same codes.
+ * to the same codes, perhaps on another processor at the same time: the
+ * modifier keys' state has a lock.
  */
 void keyboard_key(uint8_t sc, int ext, int released)
+{
+    static spinlock_t kbd_lock = SPINLOCK_INIT("keyboard");
+    spin_lock(&kbd_lock);
+    key(sc, ext, released);
+    spin_unlock(&kbd_lock);
+}
+
+static void key(uint8_t sc, int ext, int released)
 {
     if (ext) {
         if (sc == SC_LSHIFT || sc == SC_RSHIFT)

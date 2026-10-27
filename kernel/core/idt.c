@@ -76,11 +76,15 @@ static void pic_remap(void)
     outb(PIC2_DATA, 0xFF);
 }
 
+static spinlock_t pic_lock = SPINLOCK_INIT("pic");
+
 void irq_unmask(int irq)
 {
     uint16_t port = irq < 8 ? PIC1_DATA : PIC2_DATA;
     uint8_t bit = (uint8_t)(1u << (irq & 7));
+    spin_lock(&pic_lock);
     outb(port, inb(port) & (uint8_t)~bit);
+    spin_unlock(&pic_lock);
 }
 
 int irq_registered(int irq)
@@ -149,16 +153,22 @@ static void handle_exception(struct trapframe *tf, int from_user)
 {
     uint32_t vec = tf->int_no;
 
+    uint32_t addr = read_cr2();         /* before anything can fault again */
     if (from_user) {
-        if (vec == 14 && proc_grow_stack(read_cr2()))
-            return;
+        if (vec == 14) {
+            sti();                      /* growing the stack may take a while */
+            int grown = proc_grow_stack(addr);
+            cli();
+            if (grown)
+                return;
+        }
         if (vec == 7) {                 /* first FPU use since a task switch */
             fpu_trap();
             return;
         }
         klog("pid %d (%s): %s at eip %08x, addr %08x, err %x\n",
              current->pid, current->name, exception_names[vec], tf->eip,
-             read_cr2(), tf->err_code);
+             addr, tf->err_code);
         proc_signal_force(current, exception_signal(vec));
         return;
     }
@@ -193,10 +203,15 @@ static void handle_irq(struct trapframe *tf)
     outb(PIC1_CMD, PIC_EOI);
 }
 
+/*
+ * Every exception, interrupt and system call. Interrupt gates turn
+ * interrupts off on the way in; system calls and user page faults turn
+ * them on again, so the kernel can be preempted while it works for a
+ * process, and device interrupt handlers run with them off.
+ */
 void trap(struct trapframe *tf)
 {
-    /* These need nothing of the kernel, and must not wait for its lock:
-     * whoever sends VEC_TLB holds it until the flush is done. */
+    /* These need nothing of the kernel and take no lock. */
     switch (tf->int_no) {
     case VEC_TLB:
         smp_tlb_ipi();
@@ -207,14 +222,15 @@ void trap(struct trapframe *tf)
         return;
     }
 
-    kernel_lock();
     int from_user = (tf->cs & 3) == 3;
-
+    struct cpu *c = this_cpu();
     if (from_user)
-        current->tf = tf;
+        c->proc->tf = tf;
 
     if (tf->int_no == SYSCALL_VEC) {
+        sti();
         syscall_dispatch(tf);
+        cli();
     } else if (tf->int_no < 32) {
         handle_exception(tf, from_user);
     } else if (tf->int_no < 48) {
@@ -226,15 +242,15 @@ void trap(struct trapframe *tf)
         lapic_eoi();
     }
 
-    /* An idle processor looks for work on every interrupt. */
-    struct cpu *c = this_cpu();
-    if (c->proc && (c->resched || c->proc == c->idle)) {
-        c->resched = 0;
-        schedule();
-    }
+    /* Switch processes on the way back to user mode, or to kernel code
+     * that had interrupts on (and so holds no spinlock). An idle
+     * processor looks for work on every interrupt. */
+    c = this_cpu();
+    if (c->proc && (from_user || (tf->eflags & EFLAGS_IF)) &&
+        (c->resched || c->proc == c->idle))
+        preempt();
 
     /* Deliver pending signals right before returning to user mode. */
     if (from_user)
         proc_check_signals();
-    kernel_unlock();
 }

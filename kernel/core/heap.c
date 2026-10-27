@@ -20,6 +20,7 @@ struct block {
 static struct block *heap_head;
 static uint32_t heap_size;
 static uint32_t heap_used;
+static spinlock_t heap_lock = SPINLOCK_INIT("heap");    /* interrupt handlers allocate too */
 
 void heap_init(void)
 {
@@ -77,14 +78,17 @@ void *kmalloc(size_t n)
     if (n > UINT32_MAX - (HEAP_ALIGN - 1u) || n > heap_size)
         return NULL;
     uint32_t size = ALIGN_UP((uint32_t)n, HEAP_ALIGN);
+    spin_lock(&heap_lock);
     for (struct block *b = heap_head; b; b = b->next) {
         if (b->free && b->size >= size) {
             split(b, size);
             b->free = 0;
             heap_used += b->size + sizeof(struct block);
+            spin_unlock(&heap_lock);
             return b + 1;
         }
     }
+    spin_unlock(&heap_lock);
     klog("kmalloc: out of memory (%u bytes)\n", (uint32_t)n);
     return NULL;
 }
@@ -102,14 +106,18 @@ void kfree(void *p)
     if (!p)
         return;
     struct block *b = (struct block *)p - 1;
-    if (b->magic != HEAP_MAGIC || b->free)
+    spin_lock(&heap_lock);
+    if (b->magic != HEAP_MAGIC || b->free) {
+        spin_unlock(&heap_lock);
         panic("kfree: bad pointer %p", p);
+    }
     b->free = 1;
     heap_used -= b->size + sizeof(struct block);
     if (b->next && b->next->free)
         merge_next(b);
     if (b->prev && b->prev->free)
         merge_next(b->prev);
+    spin_unlock(&heap_lock);
 }
 
 void *krealloc(void *p, size_t n)
@@ -120,16 +128,21 @@ void *krealloc(void *p, size_t n)
         return kmalloc(n);
     struct block *b = (struct block *)p - 1;
     uint32_t size = ALIGN_UP((uint32_t)n, HEAP_ALIGN);
-    if (b->size >= size)
+    spin_lock(&heap_lock);
+    if (b->size >= size) {
+        spin_unlock(&heap_lock);
         return p;
+    }
     if (b->next && b->next->free &&
         b->size + sizeof(struct block) + b->next->size >= size) {
         heap_used -= b->size;
         merge_next(b);
         split(b, size);
         heap_used += b->size;
+        spin_unlock(&heap_lock);
         return p;
     }
+    spin_unlock(&heap_lock);
     void *q = kmalloc(n);
     if (!q)
         return NULL;
@@ -140,6 +153,8 @@ void *krealloc(void *p, size_t n)
 
 void heap_stats(uint32_t *total, uint32_t *used)
 {
+    spin_lock(&heap_lock);
     *total = heap_size;
     *used = heap_used;
+    spin_unlock(&heap_lock);
 }

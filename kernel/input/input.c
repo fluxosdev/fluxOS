@@ -14,6 +14,7 @@
 static struct input_event queue[QSIZE];
 static uint32_t qhead, qtail;           /* free-running */
 static struct vnode *input_vn;
+static spinlock_t input_lock = SPINLOCK_INIT("input");
 
 int input_grabbed(void)
 {
@@ -31,6 +32,7 @@ void input_push(const struct input_event *ev)
 {
     if (!input_grabbed())
         return;
+    spin_lock(&input_lock);
     /* Merge motion with the newest unread event when no button changed. */
     if (qhead != qtail && same_motion(&queue[(qhead - 1) % QSIZE], ev)) {
         struct input_event *last = &queue[(qhead - 1) % QSIZE];
@@ -48,29 +50,36 @@ void input_push(const struct input_event *ev)
     }
     wakeup(queue);
     poll_wakeup();
+    spin_unlock(&input_lock);
 }
 
+/* buf is the reader's, checked beforehand: it is filled holding the lock. */
 static int input_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
 {
     (void)vn; (void)off;
     if (n < sizeof(struct input_event))
         return -EINVAL;
+    spin_lock(&input_lock);
     while (qhead == qtail) {
-        if (signal_pending(current))
+        if (signal_pending(current)) {
+            spin_unlock(&input_lock);
             return -EINTR;
-        sleep_on(queue);
+        }
+        sleep_on_lock(queue, &input_lock);
     }
     struct input_event *out = buf;
     uint32_t i = 0;
     while (qtail != qhead && (i + 1) * sizeof(*out) <= n)
         out[i++] = queue[qtail++ % QSIZE];
+    spin_unlock(&input_lock);
     return (int)(i * sizeof(*out));
 }
 
 static int input_poll(struct vnode *vn)
 {
     (void)vn;
-    return qhead != qtail ? POLLIN : 0;
+    return __atomic_load_n(&qhead, __ATOMIC_RELAXED) != __atomic_load_n(&qtail, __ATOMIC_RELAXED)
+           ? POLLIN : 0;
 }
 
 void input_register(struct vnode *devdir)

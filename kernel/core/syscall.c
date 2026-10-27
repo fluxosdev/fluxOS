@@ -195,7 +195,7 @@ static int sys_sbrk(uint32_t incr, uint32_t b, uint32_t c, uint32_t d, uint32_t 
         if (nbrk < p->heap_start || nbrk > old)
             return -EINVAL;
         /* Pages lent to the GPU stay until they are taken back (DISP_UNMAPBUF). */
-        if (radeon_pinned(p->pid, ALIGN_UP(nbrk, PAGE_SIZE), ALIGN_UP(old, PAGE_SIZE)))
+        if (fb_pinned(p->pid, ALIGN_UP(nbrk, PAGE_SIZE), ALIGN_UP(old, PAGE_SIZE)))
             return -EBUSY;
         for (uint32_t va = ALIGN_UP(nbrk, PAGE_SIZE); va < ALIGN_UP(old, PAGE_SIZE); va += PAGE_SIZE)
             vmm_free_page(p->pd, va);
@@ -214,7 +214,7 @@ static int sys_sleep(uint32_t ms, uint32_t b, uint32_t c, uint32_t d, uint32_t e
 static int sys_yield(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)a; (void)b; (void)c; (void)d; (void)e;
-    need_resched = 1;
+    set_resched();
     return 0;
 }
 
@@ -224,12 +224,14 @@ static int sys_signal(uint32_t sig, uint32_t disp, uint32_t c, uint32_t d, uint3
     if (sig == 0 || sig >= NSIG || sig == SIGKILL)
         return -EINVAL;
     uint32_t bit = 1u << sig;
-    int old = (current->sig_ignored & bit) ? SIGDISP_IGN : SIGDISP_DFL;
+    struct proc *p = current;
+    int old = (p->sig_ignored & bit) ? SIGDISP_IGN : SIGDISP_DFL;
+    /* Another processor may be delivering a signal meanwhile. */
     if (disp == SIGDISP_IGN) {
-        current->sig_ignored |= bit;
-        current->sig_pending &= ~bit;
+        __atomic_or_fetch(&p->sig_ignored, bit, __ATOMIC_RELAXED);
+        __atomic_and_fetch(&p->sig_pending, ~bit, __ATOMIC_RELAXED);
     } else {
-        current->sig_ignored &= ~bit;
+        __atomic_and_fetch(&p->sig_ignored, ~bit, __ATOMIC_RELAXED);
     }
     return old;
 }
@@ -395,9 +397,10 @@ static int sys_dup2(uint32_t oldfd, uint32_t newfd, uint32_t c, uint32_t d, uint
         return -EBADF;
     if (oldfd == newfd)
         return (int)newfd;
-    if (current->fds[newfd])
-        file_close(current->fds[newfd]);
+    struct file *prev = current->fds[newfd];
     current->fds[newfd] = file_dup(f);
+    if (prev)
+        file_close(prev);
     return (int)newfd;
 }
 

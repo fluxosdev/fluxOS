@@ -265,11 +265,7 @@ int proc_exec(struct proc *p, const char *path, char *const argv[], char *const 
      * engine and buffers lent to the GPU were the old image's: give them
      * up before its memory is freed, as at exit. */
     fb_proc_exit(p->pid);
-    uint32_t *old = p->pd;
-    p->pd = pd;
-    if (p == current)
-        vmm_switch(pd);
-    vmm_destroy(old);
+    vmm_destroy(proc_set_pd(p, pd));
 
     fpu_release(p);
     p->heap_start = p->brk = ALIGN_UP(top, PAGE_SIZE);

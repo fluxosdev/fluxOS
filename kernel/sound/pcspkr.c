@@ -26,6 +26,8 @@ static int playing;                     /* a queued tone is sounding */
 static int32_t left_ms;                 /* of the current tone */
 static uint32_t held_freq;              /* SPKR_SET's tone, between queued ones */
 static int held_pid;
+/* The queue and the speaker: the console's bell and the timer use them too. */
+static spinlock_t spkr_lock = SPINLOCK_INIT("speaker");
 
 static void sound(uint32_t freq)
 {
@@ -34,9 +36,11 @@ static void sound(uint32_t freq)
         return;
     }
     uint32_t div = PIT_HZ / freq;
+    spin_lock(&pit_lock);               /* the timer reads channel 0 through 43h too */
     outb(0x43, 0xB6);                   /* channel 2, lo/hi byte, square wave */
     outb(0x42, (uint8_t)div);
     outb(0x42, (uint8_t)(div >> 8));
+    spin_unlock(&pit_lock);
     outb(0x61, inb(0x61) | 0x03);
 }
 
@@ -60,9 +64,11 @@ void spkr_tick(void)
 {
     if (!playing)
         return;
+    spin_lock(&spkr_lock);
     left_ms -= MS_PER_TICK;
-    if (left_ms <= 0)
+    if (playing && left_ms <= 0)
         next_tone();
+    spin_unlock(&spkr_lock);
 }
 
 static int queue_tone(uint32_t freq, uint32_t ms)
@@ -82,23 +88,30 @@ static int queue_tone(uint32_t freq, uint32_t ms)
 /* A short beep, unless the queue is full (the console bell). */
 void spkr_beep(uint32_t freq, uint32_t ms)
 {
+    spin_lock(&spkr_lock);
     queue_tone(freq, ms);
+    spin_unlock(&spkr_lock);
 }
 
+/* buf is the writer's, checked beforehand: it is read holding the lock. */
 static int spkr_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
 {
     (void)vn; (void)off;
     const struct spkr_tone *t = buf;
     uint32_t count = n / sizeof(*t), done = 0;
+    spin_lock(&spkr_lock);
     while (done < count) {
         if (queue_tone(t[done].freq, t[done].ms) == 0) {
             done++;
             continue;
         }
-        if (signal_pending(current))
+        if (signal_pending(current)) {
+            spin_unlock(&spkr_lock);
             return done ? (int)(done * sizeof(*t)) : -EINTR;
-        sleep_on(queue);
+        }
+        sleep_on_lock(queue, &spkr_lock);
     }
+    spin_unlock(&spkr_lock);
     return (int)(done * sizeof(*t));
 }
 
@@ -110,28 +123,38 @@ static int spkr_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
         if (!user_access_ok((void *)arg, sizeof(struct spkr_tone)))
             return -EFAULT;
         const struct spkr_tone *t = (const struct spkr_tone *)arg;
+        spin_lock(&spkr_lock);
         while (queue_tone(t->freq, t->ms) < 0) {
-            if (signal_pending(current))
+            if (signal_pending(current)) {
+                spin_unlock(&spkr_lock);
                 return -EINTR;
-            sleep_on(queue);
+            }
+            sleep_on_lock(queue, &spkr_lock);
         }
+        spin_unlock(&spkr_lock);
         return 0;
     }
-    case SPKR_SET:
+    case SPKR_SET: {
+        int pid = arg ? current->pid : 0;
+        spin_lock(&spkr_lock);
         qtail = qhead;
         playing = 0;
         held_freq = arg;
-        held_pid = arg ? current->pid : 0;
+        held_pid = pid;
         sound(arg);
         wakeup(queue);
+        spin_unlock(&spkr_lock);
         return 0;
+    }
     case SPKR_STOP:
+        spin_lock(&spkr_lock);
         qtail = qhead;
         playing = 0;
         held_freq = 0;
         held_pid = 0;
         sound(0);
         wakeup(queue);
+        spin_unlock(&spkr_lock);
         return 0;
     case SOUND_INFO:
         if (!user_access_ok((void *)arg, sizeof(struct sound_info)))
@@ -145,12 +168,15 @@ static int spkr_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
 static void spkr_close(struct vnode *vn, int flags)
 {
     (void)vn; (void)flags;
-    if (held_pid && held_pid == current->pid) {
+    int pid = current->pid;
+    spin_lock(&spkr_lock);
+    if (held_pid && held_pid == pid) {
         held_freq = 0;
         held_pid = 0;
         if (!playing)
             sound(0);
     }
+    spin_unlock(&spkr_lock);
 }
 
 void spkr_init(struct vnode *devdir)

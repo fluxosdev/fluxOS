@@ -30,7 +30,7 @@ static struct vnode *vnode_new(const char *name, int type)
         return NULL;
     strlcpy(vn->name, name, sizeof(vn->name));
     vn->type = type;
-    vn->ino = next_ino++;
+    vn->ino = __atomic_fetch_add(&next_ino, 1, __ATOMIC_RELAXED);   /* ptys come without the lock */
     vn->mode = type == VN_DIR ? 0755 : type == VN_CHR ? 0666 : 0644;
     vn->mtime = time_now();
     return vn;
@@ -46,29 +46,21 @@ static void vnode_free(struct vnode *vn)
     kfree(vn);
 }
 
-static uint32_t lock_next, lock_serving;
-static int lock_owner = -1;
+static struct mutex vfs_mutex = MUTEX_INIT("vfs");
 
 void vfs_lock(void)
 {
-    if (!current)
-        return;
-    if (lock_owner == current->pid && lock_next != lock_serving)
-        panic("vfs_lock: pid %d already holds the lock", current->pid);
-    uint32_t ticket = lock_next++;
-    /* Uninterruptible: a signal only takes effect once we are done. */
-    while (lock_serving != ticket)
-        sleep_on(&lock_serving);
-    lock_owner = current->pid;
+    mutex_lock(&vfs_mutex);
 }
 
 void vfs_unlock(void)
 {
-    if (!current)
-        return;
-    lock_owner = -1;
-    lock_serving++;
-    wakeup(&lock_serving);
+    mutex_unlock(&vfs_mutex);
+}
+
+int vfs_locked(void)
+{
+    return mutex_held(&vfs_mutex);
 }
 
 struct vnode *fs_vnode_new(struct fs *fs, const char *name, int type)
@@ -116,26 +108,32 @@ static struct vnode *cross(struct vnode *vn)
     return vn;
 }
 
+/* References are counted under the lock, taken here when the caller (fork,
+ * close, dup2, exit, a pty) does not hold it already. */
 void vfs_ref(struct vnode *vn)
 {
-    if (vn) {
-        vn->refs++;
-        if (vn->fs)
-            vn->fs->refs++;
-    }
+    if (!vn)
+        return;
+    int lock = !vfs_locked();
+    if (lock)
+        vfs_lock();
+    vn->refs++;
+    if (vn->fs)
+        vn->fs->refs++;
+    if (lock)
+        vfs_unlock();
 }
 
 void vfs_unref(struct vnode *vn)
 {
     if (!vn)
         return;
-    struct fs *fs = vn->fs;
     /* Releasing an unlinked disk file may free its clusters and sleep for
-     * I/O. Hold the mount reference until release finishes, and serialize
-     * that I/O even when called from close(), dup2() or process exit. */
-    int lock = fs && vn->refs == 1 && !vn->linked && current && lock_owner != current->pid;
+     * I/O; the mount reference is held until release finishes. */
+    int lock = !vfs_locked();
     if (lock)
         vfs_lock();
+    struct fs *fs = vn->fs;
     if (--vn->refs <= 0 && !vn->linked && vn != vfs_root)
         vnode_free(vn);
     if (fs)

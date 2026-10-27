@@ -1,6 +1,7 @@
 #include "kernel-test.h"
 #include "../kernel/net/socket.c"
 struct netif netif;
+spinlock_t net_lock;
 struct proc *current;
 void *kmalloc(size_t n) { return malloc(n); }
 void kfree(void *p) { free(p); }

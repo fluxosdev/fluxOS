@@ -12,6 +12,7 @@ static uint32_t bitmap[MAX_FRAMES / 32];
 static uint32_t total_frames;
 static uint32_t free_frames;
 static uint32_t search_hint;
+static spinlock_t pmm_lock = SPINLOCK_INIT("pmm");
 
 static inline int frame_used(uint32_t f)
 {
@@ -55,16 +56,20 @@ void pmm_reserve(uint32_t start, uint32_t end)
 {
     uint32_t s = ALIGN_DOWN(start, PAGE_SIZE) / PAGE_SIZE;
     uint32_t e = MIN(ALIGN_UP(end, PAGE_SIZE) / PAGE_SIZE, MAX_FRAMES);
+    spin_lock(&pmm_lock);
     for (uint32_t f = s; f < e; f++)
         frame_set(f);
+    spin_unlock(&pmm_lock);
 }
 
 void pmm_release(uint32_t start, uint32_t end)
 {
     uint32_t s = ALIGN_UP(start, PAGE_SIZE) / PAGE_SIZE;
     uint32_t e = MIN(ALIGN_DOWN(end, PAGE_SIZE) / PAGE_SIZE, MAX_FRAMES);
+    spin_lock(&pmm_lock);
     for (uint32_t f = s; f < e; f++)
         frame_clear(f);
+    spin_unlock(&pmm_lock);
 }
 
 void pmm_init(struct multiboot_info *mbi)
@@ -100,6 +105,7 @@ void pmm_init(struct multiboot_info *mbi)
 
 uint32_t pmm_alloc(void)
 {
+    spin_lock(&pmm_lock);
     for (uint32_t i = 0; i < MAX_FRAMES / 32; i++) {
         uint32_t w = (search_hint + i) % (MAX_FRAMES / 32);
         if (bitmap[w] != 0xFFFFFFFF) {
@@ -107,32 +113,40 @@ uint32_t pmm_alloc(void)
             uint32_t f = w * 32 + bit;
             frame_set(f);
             search_hint = w;
+            spin_unlock(&pmm_lock);
             return f * PAGE_SIZE;
         }
     }
+    spin_unlock(&pmm_lock);
     return 0;
 }
 
 uint32_t pmm_alloc_contig(uint32_t frames)
 {
     uint32_t run = 0;
+    spin_lock(&pmm_lock);
     for (uint32_t f = 0; f < MAX_FRAMES; f++) {
         run = frame_used(f) ? 0 : run + 1;
         if (run == frames) {
             uint32_t first = f + 1 - frames;
             for (uint32_t k = first; k <= f; k++)
                 frame_set(k);
+            spin_unlock(&pmm_lock);
             return first * PAGE_SIZE;
         }
     }
+    spin_unlock(&pmm_lock);
     return 0;
 }
 
 void pmm_free(uint32_t phys)
 {
     uint32_t f = phys / PAGE_SIZE;
-    if (f < MAX_FRAMES)
-        frame_clear(f);
+    if (f >= MAX_FRAMES)
+        return;
+    spin_lock(&pmm_lock);
+    frame_clear(f);
+    spin_unlock(&pmm_lock);
 }
 
 uint32_t pmm_total_kb(void)
@@ -142,5 +156,5 @@ uint32_t pmm_total_kb(void)
 
 uint32_t pmm_free_kb(void)
 {
-    return free_frames * (PAGE_SIZE / 1024);
+    return __atomic_load_n(&free_frames, __ATOMIC_RELAXED) * (PAGE_SIZE / 1024);
 }

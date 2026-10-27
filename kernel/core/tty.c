@@ -10,6 +10,10 @@
  * windows, to a slave side that a shell uses like the console: bytes
  * written to the master are the slave's input, and the slave's output
  * is buffered for the master to read.
+ *
+ * tty_lock guards every terminal: the keyboard and serial interrupts
+ * type into the console's. Echo goes to the screen holding it; output a
+ * process writes to the console does not, as it may be long.
  */
 #include "kernel.h"
 #include "drivers.h"
@@ -49,6 +53,7 @@ struct pty {
 
 struct tty console_tty;
 static struct pty *ptys[MAX_PTYS];
+static spinlock_t tty_lock = SPINLOCK_INIT("tty");
 
 static uint32_t ibuf_count(struct tty *t)
 {
@@ -72,9 +77,10 @@ static int readable(struct tty *t)
 }
 
 /*
- * Terminal output. A pty buffers it for the master; a writer that fills
- * the buffer waits for the master to catch up, but echo (which happens
- * while the master itself is writing) never waits and may be dropped.
+ * Terminal output, with tty_lock held. A pty buffers it for the master;
+ * a writer that fills the buffer waits for the master to catch up, but
+ * echo (which happens while the master itself is writing) never waits
+ * and may be dropped.
  */
 static int output(struct tty *t, const char *s, uint32_t n, int block)
 {
@@ -95,7 +101,7 @@ static int output(struct tty *t, const char *s, uint32_t n, int block)
             poll_wakeup();
             if (signal_pending(current))
                 return i ? (int)i : -EINTR;
-            sleep_on(p->obuf);
+            sleep_on_lock(p->obuf, &tty_lock);
             continue;
         }
         p->obuf[p->ohead++ % OBUF_SIZE] = s[i++];
@@ -214,23 +220,29 @@ static void input_char(struct tty *t, char c)
     }
 }
 
+/* From the keyboard's and serial port's interrupts. */
 void tty_input(char c)
 {
+    spin_lock(&tty_lock);
     input_char(&console_tty, c);
+    spin_unlock(&tty_lock);
 }
 
+/* buf is the caller's, checked beforehand: it is filled holding the lock. */
 int tty_read(struct tty *t, char *buf, uint32_t n)
 {
     if (!n)
         return 0;
+    spin_lock(&tty_lock);
     for (;;) {
         if (readable(t))
             break;
-        if (t->pty && t->pty->hungup)
-            return 0;
-        if (signal_pending(current))
-            return -EINTR;
-        sleep_on(t->ibuf);
+        if ((t->pty && t->pty->hungup) || signal_pending(current)) {
+            int r = t->pty && t->pty->hungup ? 0 : -EINTR;
+            spin_unlock(&tty_lock);
+            return r;
+        }
+        sleep_on_lock(t->ibuf, &tty_lock);
     }
 
     uint32_t i = 0;
@@ -251,19 +263,31 @@ int tty_read(struct tty *t, char *buf, uint32_t n)
         while (i < n && ibuf_count(t))
             buf[i++] = ibuf_pop(t);
     }
+    spin_unlock(&tty_lock);
     return (int)i;
 }
 
 int tty_write(struct tty *t, const char *buf, uint32_t n)
 {
-    return output(t, buf, n, 1);
+    if (!t->pty) {
+        splash_end(1);
+        console_write(buf, n);
+        return (int)n;
+    }
+    spin_lock(&tty_lock);
+    int r = output(t, buf, n, 1);
+    spin_unlock(&tty_lock);
+    return r;
 }
 
 int tty_set_mode(struct tty *t, int newmode)
 {
+    spin_lock(&tty_lock);
     int old = t->mode;
-    if (newmode < 0)
+    if (newmode < 0) {
+        spin_unlock(&tty_lock);
         return old;
+    }
 
     if ((old & TTY_ICANON) && !(newmode & TTY_ICANON)) {
         /* Hand type-ahead to the raw reader; drop EOF markers. */
@@ -294,17 +318,18 @@ int tty_set_mode(struct tty *t, int newmode)
         }
     }
     input_ready(t);
+    spin_unlock(&tty_lock);
     return old;
 }
 
 int tty_get_fg(struct tty *t)
 {
-    return t->fg_pgid;
+    return __atomic_load_n(&t->fg_pgid, __ATOMIC_RELAXED);
 }
 
 void tty_set_fg(struct tty *t, int pgid)
 {
-    t->fg_pgid = pgid;
+    __atomic_store_n(&t->fg_pgid, pgid, __ATOMIC_RELAXED);
 }
 
 static void tty_reset(struct tty *t)
@@ -324,16 +349,22 @@ void tty_init(void)
 
 static void pty_put(struct pty *p)
 {
-    if (--p->refs > 0)
-        return;
-    ptys[p->index] = NULL;
-    kfree(p);
+    spin_lock(&tty_lock);
+    int last = --p->refs <= 0;
+    if (last)
+        ptys[p->index] = NULL;
+    spin_unlock(&tty_lock);
+    if (last)
+        kfree(p);
 }
 
 struct tty *tty_hold(struct tty *t)
 {
-    if (t && t->pty)
+    if (t && t->pty) {
+        spin_lock(&tty_lock);
         t->pty->refs++;
+        spin_unlock(&tty_lock);
+    }
     return t;
 }
 
@@ -386,10 +417,12 @@ int tty_dev_poll(struct vnode *vn)
 {
     struct tty *t = vnode_tty(vn);
     int ev = POLLOUT;
+    spin_lock(&tty_lock);
     if (readable(t))
         ev |= POLLIN;
     if (t->pty && t->pty->hungup)
         ev |= POLLHUP;
+    spin_unlock(&tty_lock);
     return ev;
 }
 
@@ -399,28 +432,35 @@ static int master_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
 {
     (void)off;
     struct pty *p = vn->dev_priv;
+    spin_lock(&tty_lock);
     while (p->ohead == p->otail) {
-        if (p->slave_closed)
-            return 0;
-        if (signal_pending(current))
-            return -EINTR;
-        sleep_on(p->obuf);
+        if (p->slave_closed || signal_pending(current)) {
+            spin_unlock(&tty_lock);
+            return p->slave_closed ? 0 : -EINTR;
+        }
+        sleep_on_lock(p->obuf, &tty_lock);
     }
     uint32_t i = 0;
     char *d = buf;
     while (i < n && p->otail != p->ohead)
         d[i++] = p->obuf[p->otail++ % OBUF_SIZE];
     wakeup(p->obuf);
+    spin_unlock(&tty_lock);
     return (int)i;
 }
 
+/* A piece at a time, so a long paste does not keep interrupts off. */
 static int master_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
 {
     (void)off;
     struct pty *p = vn->dev_priv;
     const char *s = buf;
-    for (uint32_t i = 0; i < n; i++)
-        input_char(&p->tty, s[i]);
+    for (uint32_t i = 0; i < n; ) {
+        spin_lock(&tty_lock);
+        for (uint32_t end = MIN(n, i + 256); i < end; i++)
+            input_char(&p->tty, s[i]);
+        spin_unlock(&tty_lock);
+    }
     return (int)n;
 }
 
@@ -428,10 +468,12 @@ static int master_poll(struct vnode *vn)
 {
     struct pty *p = vn->dev_priv;
     int ev = POLLOUT;
+    spin_lock(&tty_lock);
     if (p->ohead != p->otail)
         ev |= POLLIN;
     if (p->slave_closed)
         ev |= POLLHUP;
+    spin_unlock(&tty_lock);
     return ev;
 }
 
@@ -439,35 +481,42 @@ static int master_poll(struct vnode *vn)
 static void master_release(struct vnode *vn)
 {
     struct pty *p = vn->dev_priv;
+    spin_lock(&tty_lock);
     p->hungup = 1;
-    for (int i = 1; i < MAX_PROCS; i++)
-        if (procs[i].state != P_UNUSED && procs[i].ctty == &p->tty)
-            proc_signal(&procs[i], SIGHUP);
     wakeup(p->tty.ibuf);
     wakeup(p->obuf);
+    spin_unlock(&tty_lock);
+    proc_signal_ctty(&p->tty, SIGHUP);
     pty_put(p);
 }
 
 static void slave_release(struct vnode *vn)
 {
     struct pty *p = ((struct tty *)vn->dev_priv)->pty;
+    spin_lock(&tty_lock);
     p->slave_closed = 1;
     wakeup(p->obuf);
     poll_wakeup();
+    spin_unlock(&tty_lock);
     pty_put(p);
 }
 
 int pty_create(struct file **master, struct file **slave)
 {
-    int idx = 0;
-    while (idx < MAX_PTYS && ptys[idx])
-        idx++;
-    if (idx == MAX_PTYS)
-        return -EAGAIN;
-
     struct pty *p = kzalloc(sizeof(*p));
     if (!p)
         return -ENOMEM;
+    spin_lock(&tty_lock);
+    int idx = 0;
+    while (idx < MAX_PTYS && ptys[idx])
+        idx++;
+    if (idx < MAX_PTYS)
+        ptys[idx] = p;                  /* taken, though not ready for use yet */
+    spin_unlock(&tty_lock);
+    if (idx == MAX_PTYS) {
+        kfree(p);
+        return -EAGAIN;
+    }
     tty_reset(&p->tty);
     p->tty.pty = p;
     p->index = idx;
@@ -486,6 +535,9 @@ int pty_create(struct file **master, struct file **slave)
             file_close(sf);
         else
             vfs_unref(sv);
+        spin_lock(&tty_lock);
+        ptys[idx] = NULL;
+        spin_unlock(&tty_lock);
         kfree(p);
         return -ENOMEM;
     }
@@ -496,7 +548,6 @@ int pty_create(struct file **master, struct file **slave)
     sv->dev_poll = tty_dev_poll;
     sv->dev_release = slave_release;
     p->refs = 2;
-    ptys[idx] = p;
     *master = mf;
     *slave = sf;
     return 0;

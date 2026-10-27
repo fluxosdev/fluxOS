@@ -54,6 +54,8 @@
 /* ISA DMA modes: single transfers, auto-init, memory to device. */
 #define DMA_PLAY_AUTO 0x58
 
+spinlock_t snd_lock = SPINLOCK_INIT("sound");    /* drivers.h */
+
 static uint8_t dma_buf[DMA_SIZE] __attribute__((aligned(DMA_SIZE)));
 static uint8_t ring[RING_SIZE];
 
@@ -221,7 +223,7 @@ static void start(void)
     sb.running = 1;
 }
 
-static void sb_irq(struct trapframe *tf)
+static void sb_irq_locked(struct trapframe *tf)
 {
     (void)tf;
     uint8_t st = mix_read(MIX_STATUS);
@@ -248,7 +250,7 @@ static int wait_for_irq(void)
     int was_running = sb.running;
     if (!was_running)
         return -EIO;                    /* nothing will wake us: the DMA did not start */
-    sleep_on_timeout(&sb, ticks + HZ);
+    sleep_on_lock_timeout(&sb, &snd_lock, ticks + HZ);
     if (signal_pending(current))
         return -EINTR;
     if (was_running && sb.running && sb.irqs == seen) {
@@ -289,7 +291,7 @@ static void set_defaults(void)
     choose_half();
 }
 
-static int dsp_open(struct vnode *vn, int flags)
+static int dsp_open_locked(struct vnode *vn, int flags)
 {
     (void)vn;
     if ((flags & O_ACCMODE) == O_RDONLY)
@@ -305,7 +307,7 @@ static int dsp_open(struct vnode *vn, int flags)
     return 0;
 }
 
-static void dsp_close(struct vnode *vn, int flags)
+static void dsp_close_locked(struct vnode *vn, int flags)
 {
     (void)vn; (void)flags;
     sb.open_pid = 0;
@@ -313,7 +315,7 @@ static void dsp_close(struct vnode *vn, int flags)
     start();                            /* the rest plays out by itself */
 }
 
-static int dsp_dev_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
+static int dsp_dev_write_locked(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
 {
     (void)vn; (void)off;
     const uint8_t *in = buf;
@@ -353,7 +355,7 @@ static int dsp_dev_write(struct vnode *vn, const void *buf, uint64_t off, uint32
     return (int)n;
 }
 
-static int dsp_poll(struct vnode *vn)
+static int dsp_poll_locked(struct vnode *vn)
 {
     (void)vn;
     return RING_SIZE - ring_used() >= sb.half ? POLLOUT : 0;
@@ -387,7 +389,7 @@ static int put_int(uint32_t arg, int v)
     return 0;
 }
 
-static int dsp_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
+static int dsp_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg)
 {
     (void)vn;
     int v, r;
@@ -480,7 +482,7 @@ static uint8_t reg_from_level(uint32_t level, int bits)
     return (uint8_t)(((level * max + 50) / 100) << (8 - bits));
 }
 
-static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
+static int mixer_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg)
 {
     (void)vn;
     if (req == SOUND_INFO) {
@@ -507,6 +509,62 @@ static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
             mix_write((uint8_t)(reg + 1), reg_from_level(ml->right, bits));
     }
     return 0;
+}
+
+/* ---- the device calls and the interrupt, under snd_lock ---- */
+
+static int dsp_open(struct vnode *vn, int flags)
+{
+    spin_lock(&snd_lock);
+    int r = dsp_open_locked(vn, flags);
+    spin_unlock(&snd_lock);
+    return r;
+}
+
+static void dsp_close(struct vnode *vn, int flags)
+{
+    spin_lock(&snd_lock);
+    dsp_close_locked(vn, flags);
+    spin_unlock(&snd_lock);
+}
+
+static int dsp_poll(struct vnode *vn)
+{
+    spin_lock(&snd_lock);
+    int r = dsp_poll_locked(vn);
+    spin_unlock(&snd_lock);
+    return r;
+}
+
+static int dsp_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
+{
+    spin_lock(&snd_lock);
+    int r = dsp_ioctl_locked(vn, req, arg);
+    spin_unlock(&snd_lock);
+    return r;
+}
+
+static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
+{
+    spin_lock(&snd_lock);
+    int r = mixer_ioctl_locked(vn, req, arg);
+    spin_unlock(&snd_lock);
+    return r;
+}
+
+static int dsp_dev_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
+{
+    spin_lock(&snd_lock);
+    int r = dsp_dev_write_locked(vn, buf, off, n);
+    spin_unlock(&snd_lock);
+    return r;
+}
+
+static void sb_irq(struct trapframe *tf)
+{
+    spin_lock(&snd_lock);
+    sb_irq_locked(tf);
+    spin_unlock(&snd_lock);
 }
 
 /* ---- setup ---- */

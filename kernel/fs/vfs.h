@@ -54,11 +54,15 @@ void vfs_init(void);
 
 /*
  * Serialises filesystem and block-device work, which may sleep waiting
- * for disk interrupts. FIFO (ticket) order, so a process doing a long
- * copy cannot starve others. No-op before the first process exists.
+ * for disk interrupts: the VFS tree, mounted filesystems, the block cache
+ * and the disk drivers. A mutex (lock.h), so waiters get it in FIFO
+ * order and a process doing a long copy cannot starve others. No-op
+ * before the first process exists. Device nodes' read, write, poll and
+ * ioctl run without it: their drivers have their own locks.
  */
 void vfs_lock(void);
 void vfs_unlock(void);
+int vfs_locked(void);                   /* by the calling process */
 void vfs_ref(struct vnode *vn);
 void vfs_unref(struct vnode *vn);
 

@@ -171,8 +171,8 @@ static void ata_irq(struct trapframe *tf)
         if (ch->irq_line != irq)
             continue;
         (void)inb(ch->io + REG_STATUS); /* acknowledge INTRQ */
-        if (ch->armed) {
-            ch->fired = 1;
+        if (__atomic_load_n(&ch->armed, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&ch->fired, 1, __ATOMIC_RELEASE);
             wakeup(ch);
         }
     }
@@ -198,18 +198,16 @@ static void disarm(struct ata_dev *d)
 
 /*
  * Wait for the end of a phase: sleep until the drive interrupts (other
- * processes run meanwhile), then read the settled status. Interrupts
- * stay off in the kernel, so the IRQ cannot slip in between the check
- * and the sleep. Without processes, or if the IRQ never comes, poll.
+ * processes run meanwhile), then read the settled status. wait_event
+ * looks at fired after preparing to sleep, so an interrupt in between is
+ * not missed. Without processes, or if the IRQ never comes, poll.
  */
 static int wait_irq(struct ata_dev *d)
 {
     struct ata_chan *ch = d->ch;
-    if (chan_irq(ch) && current && current->pid > 0) {
-        uint32_t deadline = ticks + IRQ_TIMEOUT;
-        while (!ch->fired && (int32_t)(ticks - deadline) < 0)
-            sleep_on_timeout(ch, deadline);
-    }
+    if (chan_irq(ch) && current && current->pid > 0)
+        wait_event_timeout(ch, __atomic_load_n(&ch->fired, __ATOMIC_ACQUIRE),
+                           ticks + IRQ_TIMEOUT);
     ch->fired = 0;
     return wait_not_busy(d);
 }
@@ -302,12 +300,8 @@ static int dma_wait(struct ata_dev *d)
 {
     struct ata_chan *ch = d->ch;
     if (chan_irq(ch) && current && current->pid > 0) {
-        uint32_t deadline = ticks + IRQ_TIMEOUT;
-        while (!(inb(ch->bm + BM_STATUS) & (BM_INTR | BM_ERR)) &&
-               (int32_t)(ticks - deadline) < 0) {
-            ch->fired = 0;
-            sleep_on_timeout(ch, deadline);
-        }
+        wait_event_timeout(ch, inb(ch->bm + BM_STATUS) & (BM_INTR | BM_ERR),
+                           ticks + IRQ_TIMEOUT);
     } else {
         delay400(d);                    /* BSY is set within 400 ns */
     }

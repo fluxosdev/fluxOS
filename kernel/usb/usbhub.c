@@ -84,7 +84,7 @@ static int hub_port_reset(struct usb_hub *h, int port)
     if (port_feature(hd, port, HUB_SET_FEATURE, PORT_RESET) < 0)
         return -EIO;
     for (int i = 0; i < 50; i++) {
-        mdelay(10);
+        usb_mdelay(10);
         if (get_port_status(hd, port, &st, &ch) < 0)
             return -EIO;
         if ((ch & CH_RESET) && !(st & ST_RESET))
@@ -172,7 +172,7 @@ static int hub_probe(struct usb_dev *dev, const struct usb_iface_desc *ifd,
         usb_control(dev, USB_RT_CLASS, HUB_SET_DEPTH, (uint16_t)dev->depth, 0, NULL, 0);
     for (int p = 1; p <= h->nports; p++)
         port_feature(hd, p, HUB_SET_FEATURE, PORT_POWER);
-    mdelay(MAX(power_ms, 20u) + 100);   /* power good, then devices connect */
+    usb_mdelay(MAX(power_ms, 20u) + 100);   /* power good, then devices connect */
 
     hd->status.dev = dev;
     hd->status.ep = ep;

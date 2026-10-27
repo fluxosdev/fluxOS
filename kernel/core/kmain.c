@@ -97,7 +97,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
         boot_ok("Booted by %s", (const char *)mbi->boot_loader_name);
 
     cpu_init();                         /* everything after this needs a Pentium III */
-    kernel_lock();                      /* until the idle loop, like any kernel code */
+    lock_init();
 
     /* Remember the initrd before any allocation can reuse that memory. */
     uint32_t initrd_start = 0, initrd_end = 0;
@@ -194,10 +194,9 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     boot_ok("Scheduler started, launching /bin/init");
     kprintf("\n");
 
-    /* The boot context becomes the idle task, which does not hold the
-     * kernel lock: interrupts take it (idt.c). */
+    /* The boot context becomes the idle task. Interrupts were off all
+     * through the boot; now each one looks for work for it (idt.c). */
     splash_booted();
-    kernel_unlock();
     for (;;)
         __asm__ volatile("sti; hlt" ::: "memory");
 }

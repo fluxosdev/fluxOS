@@ -389,7 +389,7 @@ static int command(struct xhci *x, uint32_t p0, uint32_t status, uint32_t contro
     if (x->dead)
         return -1;
     while (x->cmd_busy && usb_in_process())
-        sleep_on((void *)&x->cmd_busy);
+        sleep_on_lock((void *)&x->cmd_busy, &usb_lock);
     x->cmd_busy = 1;
     x->cmd_done = 0;
     x->cmd_trb = ring_put(&x->cmd, p0, 0, status, control, 0);
@@ -404,7 +404,7 @@ static int command(struct xhci *x, uint32_t p0, uint32_t status, uint32_t contro
         if (usb_in_process()) {
             if ((int32_t)(ticks - deadline) >= 0)
                 break;
-            sleep_on_timeout((void *)&x->cmd_done, ticks + 1);
+            sleep_on_lock_timeout((void *)&x->cmd_done, &usb_lock, ticks + 1);
         } else {
             if (us >= CMD_TIMEOUT * 1000)
                 break;
@@ -761,16 +761,16 @@ static int xhci_port_reset(struct usb_hub *h, int port)
     if (x->port_usb3[port]) {
         /* USB 3 links train by themselves; a warm reset if one is stuck. */
         for (int i = 0; i < 20 && !(*r & PORT_PED); i++)
-            mdelay(5);
+            usb_mdelay(5);
         if (!(*r & PORT_PED)) {
             *r = (*r & PORT_KEEP) | PORT_WPR;
             for (int i = 0; i < 50 && !(*r & (PORT_WRC | PORT_PRC)); i++)
-                mdelay(10);
+                usb_mdelay(10);
         }
     } else {
         *r = (*r & PORT_KEEP) | PORT_PR;
         for (int i = 0; i < 50 && !(*r & PORT_PRC); i++)
-            mdelay(10);
+            usb_mdelay(10);
     }
     uint32_t v = *r;
     *r = (v & PORT_KEEP) | (v & (PORT_PRC | PORT_WRC | PORT_PEC));
@@ -808,6 +808,7 @@ static int nxhci;
 static void xhci_irq(struct trapframe *tf)
 {
     (void)tf;
+    spin_lock(&usb_lock);
     for (int i = 0; i < nxhci; i++) {
         struct xhci *x = xhcis[i];
         if (!(op_rd(x, OP_USBSTS) & STS_EINT) && !(rt_rd(x, IR_IMAN) & IMAN_IP))
@@ -816,6 +817,7 @@ static void xhci_irq(struct trapframe *tf)
         rt_wr(x, IR_IMAN, IMAN_IE | IMAN_IP);
         xhci_poll(&x->hc);
     }
+    spin_unlock(&usb_lock);
 }
 
 /* Walk the extended capabilities: take over from the BIOS, learn which
@@ -831,7 +833,7 @@ static void ext_caps(struct xhci *x, uint32_t hcc1)
             if (v & (1u << 16)) {
                 c[0] = v | (1u << 24);
                 for (int i = 0; i < 100 && (c[0] & (1u << 16)); i++)
-                    mdelay(10);
+                    usb_mdelay(10);
                 if (c[0] & (1u << 16)) {
                     klog("xhci: BIOS would not let go; taking the controller anyway\n");
                     c[0] = (c[0] & ~(1u << 16)) | (1u << 24);
@@ -895,12 +897,12 @@ static void xhci_init(const struct pci_dev *pci)
     /* Stop and reset it (the BIOS may have left it running). */
     op_wr(x, OP_USBCMD, op_rd(x, OP_USBCMD) & ~(CMD_RS | CMD_INTE));
     for (int i = 0; i < 20 && !(op_rd(x, OP_USBSTS) & STS_HCH); i++)
-        mdelay(1);
+        usb_mdelay(1);
     op_wr(x, OP_USBCMD, CMD_HCRST);
     for (int i = 0; i < 1000 && (op_rd(x, OP_USBCMD) & CMD_HCRST); i++)
-        mdelay(1);
+        usb_mdelay(1);
     for (int i = 0; i < 1000 && (op_rd(x, OP_USBSTS) & STS_CNR); i++)
-        mdelay(1);
+        usb_mdelay(1);
     if (op_rd(x, OP_USBSTS) & STS_CNR) {
         klog("xhci: controller did not come out of reset\n");
         return;
@@ -958,7 +960,7 @@ static void xhci_init(const struct pci_dev *pci)
     op_wr(x, OP_USBSTS, STS_EINT | STS_PCD | STS_HSE);
     op_wr(x, OP_USBCMD, CMD_RS | CMD_HSEE | (hc->irq >= 0 ? CMD_INTE : 0));
     for (int i = 0; i < 20 && (op_rd(x, OP_USBSTS) & STS_HCH); i++)
-        mdelay(1);
+        usb_mdelay(1);
 
     hc->root.nports = MIN(nports, USB_MAX_PORTS);
     hc->root.port_status = xhci_port_status;
@@ -968,7 +970,7 @@ static void xhci_init(const struct pci_dev *pci)
     if (hcc1 & (1u << 3)) {             /* port power control */
         for (int p = 1; p <= hc->root.nports; p++)
             *portsc(x, p) = (*portsc(x, p) & PORT_KEEP) | PORT_PP;
-        mdelay(20);
+        usb_mdelay(20);
     }
 
     xhcis[nxhci++] = x;

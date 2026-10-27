@@ -1,16 +1,28 @@
 /*
  * Process management and the preemptive round-robin scheduler.
  *
- * The kernel itself is not preemptible: traps run with interrupts off,
- * and a process only gives up the CPU inside schedule(), either because
- * it blocked or because the timer asked for a reschedule on its way
- * back to user mode. Slot 0 is the idle process (the boot context).
+ * The kernel is preemptible (lock.h): a process gives up the processor
+ * when it sleeps, or when an interrupt finds its time slice used up on
+ * the way back to user mode, or to kernel code that had interrupts on.
+ * Slot 0 is the idle process (the boot context).
+ *
+ * sched_lock guards the process table (states, wait channels, the family
+ * tree) and the processors' fields in smp.h. It is the innermost lock,
+ * so wakeup() may be called holding any other. schedule() holds it
+ * across the switch, and the process switched to lets it go (where it
+ * once stopped in schedule(), or in proc_start() if it is new), so no
+ * processor can pick a process before its registers are saved.
+ *
+ * Waiting without missing the wakeup: prepare_wait() marks the process
+ * blocked on a channel, the caller checks its condition, and do_wait()
+ * sleeps unless a wakeup came in between, which marks it running again.
+ * sleep_on_lock() does the same around the spinlock that guards the
+ * condition. A process preempted in between stays runnable and looks
+ * again, so a wakeup that came just before prepare_wait() is not lost.
  *
  * With several processors, each runs its own processes, picked from the
  * one table, and has its own idle process (smp.c), whose time counts as
- * slot 0's. Only one of them is in the kernel at a time (the kernel lock),
- * so all of this runs as on one processor; a process blocked or preempted
- * on one may go on on another.
+ * slot 0's. A process blocked or preempted on one may go on on another.
  */
 #include "kernel.h"
 #include "drivers.h"
@@ -22,6 +34,7 @@
 struct proc procs[MAX_PROCS];
 static struct proc *init_proc;
 static int next_pid = 1;
+spinlock_t sched_lock = SPINLOCK_INIT("sched");
 
 void proc_init(void)
 {
@@ -38,17 +51,28 @@ void proc_init(void)
     c->slice = QUANTUM;
 }
 
-/* p can run: on an idle processor if there is one, so that what runs here
- * goes on; or else here, soon (need_resched). */
+/* With sched_lock: is p some processor's current process? */
+static int on_cpu(struct proc *p)
+{
+    return p->last_cpu >= 0 && p->last_cpu < MAX_CPUS && cpus[p->last_cpu].proc == p;
+}
+
+/* With sched_lock: p can run. One that was about to sleep but has not
+ * switched away yet just goes on. Otherwise on an idle processor if
+ * there is one, so that what runs here goes on; or else here, soon. */
 static void make_ready(struct proc *p)
 {
+    if (on_cpu(p)) {
+        p->state = P_RUNNING;
+        return;
+    }
     p->state = P_READY;
     p->ready_tick = ticks;
     if (!smp_wake_idle(p->last_cpu))
-        need_resched = 1;
+        this_cpu()->resched = 1;
 }
 
-struct proc *proc_find(int pid)
+static struct proc *proc_find_locked(int pid)
 {
     for (int i = 1; i < MAX_PROCS; i++)
         if (procs[i].state != P_UNUSED && procs[i].pid == pid)
@@ -56,32 +80,51 @@ struct proc *proc_find(int pid)
     return NULL;
 }
 
+/* The process may be gone by the time the caller looks: only for a
+ * glance at whether it still exists. */
+struct proc *proc_find(int pid)
+{
+    spin_lock(&sched_lock);
+    struct proc *p = proc_find_locked(pid);
+    spin_unlock(&sched_lock);
+    return p;
+}
+
 static struct proc *proc_alloc(void)
 {
+    uint8_t *kstack = kmalloc(KSTACK_SIZE);
+    if (!kstack)
+        return NULL;
+    spin_lock(&sched_lock);
     for (int i = 1; i < MAX_PROCS; i++) {
         struct proc *p = &procs[i];
         if (p->state != P_UNUSED)
             continue;
         memset(p, 0, sizeof(*p));
-        p->kstack = kmalloc(KSTACK_SIZE);
-        if (!p->kstack)
-            return NULL;
+        p->kstack = kstack;
         p->pid = next_pid++;
         p->state = P_EMBRYO;
         p->pd = kernel_pd;
         p->fpu_cpu = -1;
         p->last_cpu = -1;
         p->start_tick = ticks;
+        spin_unlock(&sched_lock);
         return p;
     }
+    spin_unlock(&sched_lock);
+    kfree(kstack);
     return NULL;
 }
 
+/* An embryo that could not be finished. */
 static void proc_release(struct proc *p)
 {
-    kfree(p->kstack);
+    spin_lock(&sched_lock);
+    uint8_t *kstack = p->kstack;
     p->kstack = NULL;
     p->state = P_UNUSED;
+    spin_unlock(&sched_lock);
+    kfree(kstack);
 }
 
 /*
@@ -126,10 +169,14 @@ static struct proc *pick_ready(struct cpu *c, struct proc *prev)
     return local ? local : first ? first : c->idle;
 }
 
-void schedule(void)
+/* With sched_lock (and nothing else) held: run the next process here. */
+static void sched_switch(void)
 {
     struct cpu *c = this_cpu();
     struct proc *prev = c->proc;
+    if (c->nlocks != 1)
+        panic("pid %d (%s) would sleep holding spinlock %s", prev->pid, prev->name,
+              c->nlocks > 1 && c->nlocks <= CPU_HELD_NAMES ? c->held[c->nlocks - 2] : "?");
     if (prev->state == P_RUNNING) {
         prev->state = P_READY;
         prev->ready_tick = ticks;
@@ -140,6 +187,7 @@ void schedule(void)
     next->last_cpu = c->index;
     c->slice = QUANTUM;
     c->kicked = 0;
+    c->resched = 0;
     c->proc = next;
     /* Wakeups made while this CPU was idle may have selected it repeatedly.
      * Hand any remaining work to another idle core, including at boot. */
@@ -156,21 +204,40 @@ void schedule(void)
     if (next->kstack)
         tss_set_kernel_stack((uint32_t)next->kstack + KSTACK_SIZE);
     vmm_switch(next->pd);
-    /* The kernel lock stays with this processor, in whatever context it
-     * goes on in; this one may go on later on another processor. */
-    int depth = c->lock_depth;
     switch_context(&prev->esp, next->esp);
-    this_cpu()->lock_depth = depth;
 }
 
-/* A new process's first run (forkret): kernel threads keep the kernel
- * lock, as they keep running in the kernel; user processes let it go. */
+/* Interrupts are off in here whatever they were, as sched_lock's saved
+ * state is let go by another context: each puts back its own. */
+void schedule(void)
+{
+    uint32_t flags = irq_save();
+    spin_lock(&sched_lock);
+    sched_switch();
+    spin_unlock(&sched_lock);
+    irq_restore(flags);
+}
+
+/* An interrupt or trap on its way out found the time slice used up (or
+ * this processor idle). A process caught between prepare_wait() and
+ * do_wait() stays runnable, and looks at its condition again. */
+void preempt(void)
+{
+    uint32_t flags = irq_save();
+    spin_lock(&sched_lock);
+    struct proc *p = this_cpu()->proc;
+    if (p->state == P_BLOCKED)
+        p->state = P_RUNNING;
+    sched_switch();
+    spin_unlock(&sched_lock);
+    irq_restore(flags);
+}
+
+/* A new process's first run (forkret): the switch to it left sched_lock
+ * held, and interrupts off until trapret takes it to its code. */
 void proc_start(void)
 {
-    if (current->kthread)
-        return;
-    this_cpu()->lock_depth = 1;
-    kernel_unlock();
+    spin_unlock(&sched_lock);
 }
 
 void proc_tick_on_cpu(struct cpu *c)
@@ -190,50 +257,155 @@ void proc_tick_on_cpu(struct cpu *c)
 
 void proc_tick_cpu(void)
 {
+    spin_lock(&sched_lock);
     proc_tick_on_cpu(this_cpu());
+    spin_unlock(&sched_lock);
 }
 
+/* The timer, on the boot processor: timed sleeps that are over, and every
+ * processor's time slice. */
 void proc_tick(void)
 {
+    spin_lock(&sched_lock);
     for (int i = 1; i < MAX_PROCS; i++) {
         struct proc *p = &procs[i];
         if ((p->state == P_SLEEPING || (p->state == P_BLOCKED && p->timed)) &&
             (int32_t)(ticks - p->wake_tick) >= 0)
             make_ready(p);
     }
-    proc_tick_cpu();
+    proc_tick_on_cpu(this_cpu());
+    smp_tick();
+    spin_unlock(&sched_lock);
+}
+
+static void prepare(void *chan, int timed, uint32_t deadline)
+{
+    spin_lock(&sched_lock);
+    struct cpu *c = this_cpu();
+    struct proc *p = c->proc;
+    if (p == c->idle) {                 /* the boot code: nothing else could run */
+        spin_unlock(&sched_lock);
+        return;
+    }
+    p->chan = chan;
+    p->timed = timed;
+    p->wake_tick = deadline;
+    p->state = P_BLOCKED;
+    spin_unlock(&sched_lock);
+}
+
+void prepare_wait(void *chan)
+{
+    prepare(chan, 0, 0);
+}
+
+/* As prepare_wait(), but `ticks` reaching deadline wakes it too. */
+void prepare_wait_timeout(void *chan, uint32_t deadline)
+{
+    prepare(chan, 1, deadline);
+}
+
+/* Sleep, unless a wakeup (or a signal) came since prepare_wait(). */
+void do_wait(void)
+{
+    uint32_t flags = irq_save();
+    spin_lock(&sched_lock);
+    struct cpu *c = this_cpu();
+    struct proc *p = c->proc;
+    if (p && p != c->idle) {
+        if (p->state == P_BLOCKED)
+            sched_switch();
+        p->chan = NULL;
+        p->timed = 0;
+    }
+    spin_unlock(&sched_lock);
+    irq_restore(flags);
+}
+
+/* The condition held after prepare_wait(): no need to sleep. */
+void cancel_wait(void)
+{
+    spin_lock(&sched_lock);
+    struct cpu *c = this_cpu();
+    struct proc *p = c->proc;
+    if (p && p != c->idle) {
+        p->state = P_RUNNING;
+        p->chan = NULL;
+        p->timed = 0;
+    }
+    spin_unlock(&sched_lock);
 }
 
 void sleep_on(void *chan)
 {
-    current->chan = chan;
-    current->state = P_BLOCKED;
-    schedule();
-    current->chan = NULL;
+    prepare_wait(chan);
+    do_wait();
 }
 
 /* Block on chan, but give up once `ticks` reaches deadline. */
 void sleep_on_timeout(void *chan, uint32_t deadline)
 {
-    current->wake_tick = deadline;
-    current->timed = 1;
-    sleep_on(chan);
-    current->timed = 0;
+    prepare_wait_timeout(chan, deadline);
+    do_wait();
 }
 
-void wakeup(void *chan)
+void sleep_on_lock(void *chan, spinlock_t *lk)
+{
+    prepare_wait(chan);
+    spin_unlock(lk);
+    do_wait();
+    spin_lock(lk);
+}
+
+void sleep_on_lock_timeout(void *chan, spinlock_t *lk, uint32_t deadline)
+{
+    prepare_wait_timeout(chan, deadline);
+    spin_unlock(lk);
+    do_wait();
+    spin_lock(lk);
+}
+
+static void wakeup_locked(void *chan)
 {
     for (int i = 1; i < MAX_PROCS; i++)
         if (procs[i].state == P_BLOCKED && procs[i].chan == chan)
             make_ready(&procs[i]);
 }
 
+void wakeup(void *chan)
+{
+    spin_lock(&sched_lock);
+    wakeup_locked(chan);
+    spin_unlock(&sched_lock);
+}
+
 int sleep_ticks(uint32_t n)
 {
-    current->wake_tick = ticks + n;
-    current->state = P_SLEEPING;
-    schedule();
-    return signal_pending(current) ? -EINTR : 0;
+    uint32_t flags = irq_save();
+    spin_lock(&sched_lock);
+    struct cpu *c = this_cpu();
+    struct proc *p = c->proc;
+    if (p != c->idle) {
+        p->wake_tick = ticks + n;
+        p->state = P_SLEEPING;
+        sched_switch();
+    }
+    spin_unlock(&sched_lock);
+    irq_restore(flags);
+    return signal_pending(p) ? -EINTR : 0;
+}
+
+/* Give p (current, or one not running) the address space pd; returns the
+ * one it had, now loaded nowhere and free to destroy. */
+uint32_t *proc_set_pd(struct proc *p, uint32_t *pd)
+{
+    spin_lock(&sched_lock);
+    uint32_t *old = p->pd;
+    p->pd = pd;
+    if (p == this_cpu()->proc)
+        vmm_switch(pd);
+    spin_unlock(&sched_lock);
+    return old;
 }
 
 void proc_spawn_init(const char *path)
@@ -262,13 +434,15 @@ void proc_spawn_init(const char *path)
 
     init_proc = p;
     tty_set_fg(&console_tty, p->pgid);
+    spin_lock(&sched_lock);
     make_ready(p);
+    spin_unlock(&sched_lock);
 }
 
 /*
  * A kernel thread starts by "returning" through trapret into fn in ring
- * 0, with interrupts off like all kernel code: it only gives up the CPU
- * when it sleeps, so it never runs in the middle of another syscall.
+ * 0, with interrupts on: it is preemptible like any kernel code, and
+ * takes the locks of whatever it works on.
  */
 void proc_spawn_kthread(const char *name, void (*fn)(void))
 {
@@ -279,12 +453,14 @@ void proc_spawn_kthread(const char *name, void (*fn)(void))
     struct trapframe *tf = p->tf;
     tf->cs = SEG_KCODE;
     tf->ds = tf->es = tf->fs = tf->gs = SEG_KDATA;
-    tf->eflags = 0x002;                         /* IF clear */
+    tf->eflags = 0x202;                         /* IF set */
     tf->eip = (uint32_t)fn;
     p->kthread = 1;
     p->pgid = p->pid;
     strlcpy(p->name, name, sizeof(p->name));
+    spin_lock(&sched_lock);
     make_ready(p);
+    spin_unlock(&sched_lock);
 }
 
 int do_fork(void)
@@ -294,11 +470,12 @@ int do_fork(void)
     if (!child)
         return -EAGAIN;
 
-    child->pd = vmm_clone(parent->pd);
-    if (!child->pd) {
+    uint32_t *pd = vmm_clone(parent->pd);
+    if (!pd) {
         proc_release(child);
         return -ENOMEM;
     }
+    proc_set_pd(child, pd);
     setup_kstack(child, parent->tf);
     child->tf->eax = 0;                         /* fork() returns 0 in the child */
 
@@ -316,7 +493,9 @@ int do_fork(void)
     memcpy(child->name, parent->name, sizeof(child->name));
     fpu_fork(child);
 
+    spin_lock(&sched_lock);
     make_ready(child);
+    spin_unlock(&sched_lock);
     return child->pid;
 }
 
@@ -325,11 +504,13 @@ void do_exit(int status)
     struct proc *p = current;
     if (p == init_proc)
         panic("init exited with status %d", status);
+    sti();                              /* from a trap's way out, they may be off */
 
     for (int i = 0; i < MAX_FDS; i++) {
         if (p->fds[i]) {
-            file_close(p->fds[i]);
+            struct file *f = p->fds[i];
             p->fds[i] = NULL;
+            file_close(f);
         }
     }
     vfs_unref(p->cwd);
@@ -339,101 +520,117 @@ void do_exit(int status)
     fb_proc_exit(p->pid);
     fpu_release(p);
 
-    if (p->pd != kernel_pd) {
-        vmm_switch(kernel_pd);
-        vmm_destroy(p->pd);
-        p->pd = kernel_pd;
-    }
+    uint32_t *old = proc_set_pd(p, kernel_pd);
+    if (old != kernel_pd)
+        vmm_destroy(old);
 
+    /* Until the switch away, so the parent cannot free this stack under us. */
+    cli();
+    spin_lock(&sched_lock);
     /* Orphans are adopted by init, which reaps them. */
     for (int i = 1; i < MAX_PROCS; i++) {
         struct proc *q = &procs[i];
         if (q->state != P_UNUSED && q->ppid == p->pid) {
             q->ppid = init_proc->pid;
             if (q->state == P_ZOMBIE)
-                wakeup(init_proc);
+                wakeup_locked(init_proc);
         }
     }
 
     p->exit_status = status;
     p->state = P_ZOMBIE;
-    struct proc *parent = proc_find(p->ppid);
+    struct proc *parent = proc_find_locked(p->ppid);
     if (parent)
-        wakeup(parent);
+        wakeup_locked(parent);
 
-    schedule();
+    sched_switch();
     panic("zombie %d was scheduled", p->pid);
 }
 
 int do_waitpid(int pid, int *status, int options)
 {
+    struct proc *me = current;
     for (;;) {
         int have_children = 0;
+        prepare_wait(me);               /* an exiting child wakes its parent */
+        spin_lock(&sched_lock);
         for (int i = 1; i < MAX_PROCS; i++) {
             struct proc *q = &procs[i];
-            if (q->state == P_UNUSED || q->ppid != current->pid)
+            if (q->state == P_UNUSED || q->ppid != me->pid)
                 continue;
             if (pid > 0 && q->pid != pid)
                 continue;
-            if (pid == 0 && q->pgid != current->pgid)
+            if (pid == 0 && q->pgid != me->pgid)
                 continue;
             if (pid < -1 && q->pgid != -pid)
                 continue;
             have_children = 1;
             if (q->state == P_ZOMBIE) {
-                int r = q->pid;
+                int r = q->pid, code = q->exit_status;
+                uint8_t *kstack = q->kstack;
+                q->kstack = NULL;
+                q->state = P_UNUSED;
+                spin_unlock(&sched_lock);
+                cancel_wait();
+                kfree(kstack);
                 if (status)
-                    *status = q->exit_status;
-                proc_release(q);
+                    *status = code;
                 return r;
             }
         }
-        if (!have_children)
-            return -ECHILD;
-        if (options & WNOHANG)
-            return 0;
-        if (signal_pending(current))
-            return -EINTR;
-        sleep_on(current);
+        spin_unlock(&sched_lock);
+        if (!have_children || (options & WNOHANG) || signal_pending(me)) {
+            cancel_wait();
+            return !have_children ? -ECHILD : (options & WNOHANG) ? 0 : -EINTR;
+        }
+        do_wait();
     }
 }
 
 int do_setpgid(int pid, int pgid)
 {
-    struct proc *p = pid == 0 ? current : proc_find(pid);
-    if (!p || p->state == P_ZOMBIE)
-        return -ESRCH;
-    if (p != current && p->ppid != current->pid)
-        return -ESRCH;
     if (pgid < 0)
         return -EINVAL;
-    p->pgid = pgid == 0 ? p->pid : pgid;
-    return 0;
+    struct proc *me = current;
+    spin_lock(&sched_lock);
+    struct proc *p = pid == 0 ? me : proc_find_locked(pid);
+    int r = 0;
+    if (!p || p->state == P_ZOMBIE || (p != me && p->ppid != me->pid))
+        r = -ESRCH;
+    else
+        p->pgid = pgid == 0 ? p->pid : pgid;
+    spin_unlock(&sched_lock);
+    return r;
 }
 
 int do_getpgid(int pid)
 {
-    struct proc *p = pid == 0 ? current : proc_find(pid);
-    return p ? p->pgid : -ESRCH;
+    struct proc *me = current;
+    spin_lock(&sched_lock);
+    struct proc *p = pid == 0 ? me : proc_find_locked(pid);
+    int r = p ? p->pgid : -ESRCH;
+    spin_unlock(&sched_lock);
+    return r;
 }
 
+/* With sched_lock. */
 static void deliver(struct proc *p, int sig)
 {
-    p->sig_pending |= 1u << sig;
+    __atomic_or_fetch(&p->sig_pending, 1u << sig, __ATOMIC_RELAXED);
     if (p->state == P_BLOCKED || p->state == P_SLEEPING) {
         p->chan = NULL;
         make_ready(p);
-    } else if (p->state == P_RUNNING && p != current) {
-        smp_kick_proc(p);               /* in user mode on another processor */
+    } else if (p->state == P_RUNNING && p != this_cpu()->proc) {
+        smp_kick_proc(p);               /* running on another processor */
     }
-    need_resched = 1;
+    this_cpu()->resched = 1;
 }
 
-void proc_signal(struct proc *p, int sig)
+static void signal_locked(struct proc *p, int sig)
 {
     if (sig <= 0 || sig >= NSIG || !p || p->pid <= 1 || p->kthread)
         return;
-    if (p->state == P_UNUSED || p->state == P_ZOMBIE)
+    if (p->state == P_UNUSED || p->state == P_ZOMBIE || p->state == P_EMBRYO)
         return;
     if (sig == SIGCHLD)
         return;                                 /* default action: ignore */
@@ -442,65 +639,91 @@ void proc_signal(struct proc *p, int sig)
     deliver(p, sig);
 }
 
+void proc_signal(struct proc *p, int sig)
+{
+    spin_lock(&sched_lock);
+    signal_locked(p, sig);
+    spin_unlock(&sched_lock);
+}
+
 /* Synchronous faults cannot be ignored. */
 void proc_signal_force(struct proc *p, int sig)
 {
     if (p->pid == 0)
         panic("fault in idle task");
+    spin_lock(&sched_lock);
     deliver(p, sig);
+    spin_unlock(&sched_lock);
 }
 
 void proc_signal_group(int pgid, int sig)
 {
+    spin_lock(&sched_lock);
     for (int i = 1; i < MAX_PROCS; i++)
         if (procs[i].state != P_UNUSED && procs[i].pgid == pgid)
-            proc_signal(&procs[i], sig);
+            signal_locked(&procs[i], sig);
+    spin_unlock(&sched_lock);
+}
+
+/* Every process whose controlling terminal is t (a pty hanging up). */
+void proc_signal_ctty(struct tty *t, int sig)
+{
+    spin_lock(&sched_lock);
+    for (int i = 1; i < MAX_PROCS; i++)
+        if (procs[i].state != P_UNUSED && procs[i].ctty == t)
+            signal_locked(&procs[i], sig);
+    spin_unlock(&sched_lock);
 }
 
 int do_kill(int pid, int sig)
 {
     if (sig < 0 || sig >= NSIG)
         return -EINVAL;
+    struct proc *me = current;
+    spin_lock(&sched_lock);
+    int r = 0;
     if (pid > 0) {
-        struct proc *p = proc_find(pid);
-        if (!p || p->state == P_ZOMBIE)
-            return -ESRCH;
-        if (p->pid == 1 || p->kthread)
-            return -EPERM;
-        if (sig)
-            proc_signal(p, sig);
-        return 0;
+        struct proc *p = proc_find_locked(pid);
+        if (!p || p->state == P_ZOMBIE || p->state == P_EMBRYO)
+            r = -ESRCH;
+        else if (p->pid == 1 || p->kthread)
+            r = -EPERM;
+        else if (sig)
+            signal_locked(p, sig);
+        spin_unlock(&sched_lock);
+        return r;
     }
 
-    int pgid = pid == 0 ? current->pgid : -pid;
+    int pgid = pid == 0 ? me->pgid : -pid;
     int found = 0;
     for (int i = 1; i < MAX_PROCS; i++) {
         struct proc *p = &procs[i];
-        if (p->state == P_UNUSED || p->state == P_ZOMBIE || p->pid == 1)
+        if (p->state == P_UNUSED || p->state == P_ZOMBIE || p->state == P_EMBRYO || p->pid == 1)
             continue;
-        if (pid == -1 ? p == current : p->pgid != pgid)
+        if (pid == -1 ? p == me : p->pgid != pgid)
             continue;
         found = 1;
         if (sig)
-            proc_signal(p, sig);
+            signal_locked(p, sig);
     }
+    spin_unlock(&sched_lock);
     return found ? 0 : -ESRCH;
 }
 
 int signal_pending(struct proc *p)
 {
-    return p->sig_pending != 0;
+    return __atomic_load_n(&p->sig_pending, __ATOMIC_RELAXED) != 0;
 }
 
 /* Every signal we deliver has "terminate" as its action. */
 void proc_check_signals(void)
 {
-    uint32_t pending = current->sig_pending;
-    if (!pending)
+    struct proc *p = current;
+    if (!__atomic_load_n(&p->sig_pending, __ATOMIC_RELAXED))
         return;
-    int sig = __builtin_ctz(pending);
-    current->sig_pending = 0;
-    do_exit(sig);
+    uint32_t pending = __atomic_exchange_n(&p->sig_pending, 0, __ATOMIC_RELAXED);
+    if (pending)
+        do_exit(__builtin_ctz(pending));
 }
 
 /* Demand-grow the user stack on a fault just below it. */
@@ -521,18 +744,25 @@ int proc_info(int slot, struct procinfo *pi)
 {
     if (slot < 0 || slot >= MAX_PROCS)
         return -ESRCH;
+    struct procinfo info;
+    memset(&info, 0, sizeof(info));
+    /* With the lock, p's page tables cannot be freed while they are counted. */
+    spin_lock(&sched_lock);
     struct proc *p = &procs[slot];
-    if (p->state == P_UNUSED)
+    if (p->state == P_UNUSED) {
+        spin_unlock(&sched_lock);
         return 0;
-    memset(pi, 0, sizeof(*pi));
-    pi->pid = p->pid;
-    pi->ppid = p->ppid;
-    pi->pgid = p->pgid;
-    pi->state = p->state;
-    pi->mem_kb = vmm_user_pages(p->pd) * (PAGE_SIZE / 1024) +
-                 (p->kstack ? KSTACK_SIZE / 1024 : 0);
-    pi->cpu_ticks = p->cpu_ticks;
-    pi->start_tick = p->start_tick;
-    strlcpy(pi->name, p->name, sizeof(pi->name));
+    }
+    info.pid = p->pid;
+    info.ppid = p->ppid;
+    info.pgid = p->pgid;
+    info.state = p->state;
+    info.mem_kb = vmm_user_pages(p->pd) * (PAGE_SIZE / 1024) +
+                  (p->kstack ? KSTACK_SIZE / 1024 : 0);
+    info.cpu_ticks = p->cpu_ticks;
+    info.start_tick = p->start_tick;
+    strlcpy(info.name, p->name, sizeof(info.name));
+    spin_unlock(&sched_lock);
+    *pi = info;
     return 1;
 }

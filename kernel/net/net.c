@@ -23,6 +23,8 @@
 #define DHCP_MAGIC       0x63825363u
 
 struct netif netif;
+/* The whole stack: socket calls, the cards' interrupts and the timer. */
+spinlock_t net_lock = SPINLOCK_INIT("net");
 
 static const uint8_t broadcast_mac[ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 static uint16_t ip_id;
@@ -718,11 +720,13 @@ int net_configure(const struct netinfo *ni)
 {
     if (!netif.present)
         return -ENODEV;
+    spin_lock(&net_lock);
     if (ni->flags & NETF_DHCP) {
         netif.use_dhcp = 1;
         netif.ip = 0;
         dhcp.state = DHCP_INIT;
         dhcp.timeout = ticks;
+        spin_unlock(&net_lock);
         return 0;
     }
     netif.use_dhcp = 0;
@@ -736,11 +740,13 @@ int net_configure(const struct netinfo *ni)
         arp_drop_pending(&arp_table[i]);
         memset(&arp_table[i], 0, sizeof(arp_table[i]));
     }
+    spin_unlock(&net_lock);
     return 0;
 }
 
 void net_get_info(struct netinfo *ni)
 {
+    spin_lock(&net_lock);
     memset(ni, 0, sizeof(*ni));
     strlcpy(ni->name, !netif.present ? "lo" : netif.dev.name[0] ? netif.dev.name : "ne0",
             sizeof(ni->name));
@@ -763,16 +769,24 @@ void net_get_info(struct netinfo *ni)
     ni->rx_dropped = netif.rx_dropped;
     if (netif.use_dhcp && netif.ip && (int32_t)(netif.lease_end - ticks) > 0)
         ni->lease_secs = (netif.lease_end - ticks) / HZ;
+    spin_unlock(&net_lock);
 }
 
+/* From the timer interrupt. A processor busy in the network stack has it
+ * for now: the tick's work waits for the next one. */
 void net_tick(void)
 {
+    static uint32_t last_slow;
+    if (!spin_trylock(&net_lock))
+        return;
     loop_tick();
     tcp_timer();
-    if (ticks % (HZ / 10) == 0 && netif.present) {
+    if ((uint32_t)(ticks - last_slow) >= HZ / 10 && netif.present) {
+        last_slow = ticks;
         if (netif.dev.poll)
             netif.dev.poll();
         arp_tick();
         dhcp_tick();
     }
+    spin_unlock(&net_lock);
 }

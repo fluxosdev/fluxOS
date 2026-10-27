@@ -1,3 +1,4 @@
+#define KTEST_PROC
 #include "kernel-test.h"
 #include "../kernel/core/proc.c"
 

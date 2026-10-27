@@ -6,6 +6,7 @@
 #include <flux/abi.h>
 #include "arch.h"
 #include "smp.h"
+#include "x86.h"
 
 #define MAX_PROCS   64
 #define MAX_FDS     32
@@ -56,21 +57,75 @@ struct proc {
 };
 
 extern struct proc procs[MAX_PROCS];
-#define current (this_cpu()->proc)     /* the process running on this processor */
+extern spinlock_t sched_lock;
+
+/* The process running on this processor: read with interrupts off, as it
+ * could otherwise go on on another between finding the processor and
+ * reading its process. */
+static inline struct proc *get_current(void)
+{
+    uint32_t flags = read_eflags();
+    cli();
+    struct proc *p = this_cpu()->proc;
+    if (flags & EFLAGS_IF)
+        sti();
+    return p;
+}
+#define current (get_current())
 
 void proc_init(void);
 void proc_spawn_init(const char *path);
 void proc_spawn_kthread(const char *name, void (*fn)(void));
 void schedule(void);
+void preempt(void);                     /* from a trap's way out (idt.c) */
 void proc_tick(void);                   /* the timer, on the boot processor */
 void proc_tick_cpu(void);               /* account a tick on the calling CPU */
-void proc_tick_on_cpu(struct cpu *c);   /* account under the kernel lock, even remotely */
+void proc_tick_on_cpu(struct cpu *c);   /* account under sched_lock, even remotely */
 void proc_start(void);
 
+/*
+ * Waiting (see proc.c). The pattern, when an interrupt or another
+ * processor may make cond true and wake chan:
+ *     for (;;) { prepare_wait(chan); if (cond) break; do_wait(); }
+ *     cancel_wait();
+ * which wait_event() spells out. With a spinlock guarding cond, hold it
+ * and use sleep_on_lock(), which lets it go while asleep. A bare
+ * sleep_on() suits only naps that look again anyway.
+ */
+void prepare_wait(void *chan);
+void prepare_wait_timeout(void *chan, uint32_t deadline);
+void do_wait(void);
+void cancel_wait(void);
 void sleep_on(void *chan);
 void sleep_on_timeout(void *chan, uint32_t deadline);
+void sleep_on_lock(void *chan, spinlock_t *lk);
+void sleep_on_lock_timeout(void *chan, spinlock_t *lk, uint32_t deadline);
 void wakeup(void *chan);
 int sleep_ticks(uint32_t n);
+
+#define wait_event(chan, cond)                                  \
+    do {                                                        \
+        for (;;) {                                              \
+            prepare_wait(chan);                                 \
+            if (cond)                                           \
+                break;                                          \
+            do_wait();                                          \
+        }                                                       \
+        cancel_wait();                                          \
+    } while (0)
+
+/* Until cond, or until `ticks` reaches deadline. */
+#define wait_event_timeout(chan, cond, deadline)                \
+    do {                                                        \
+        uint32_t _dl = (deadline);                              \
+        for (;;) {                                              \
+            prepare_wait_timeout(chan, _dl);                    \
+            if ((cond) || (int32_t)(ticks - _dl) >= 0)          \
+                break;                                          \
+            do_wait();                                          \
+        }                                                       \
+        cancel_wait();                                          \
+    } while (0)
 
 int do_fork(void);
 void do_exit(int status) __attribute__((noreturn));
@@ -85,6 +140,8 @@ struct proc *proc_find(int pid);
 void proc_signal(struct proc *p, int sig);
 void proc_signal_force(struct proc *p, int sig);
 void proc_signal_group(int pgid, int sig);
+void proc_signal_ctty(struct tty *t, int sig);
+uint32_t *proc_set_pd(struct proc *p, uint32_t *pd);    /* returns the old one */
 int signal_pending(struct proc *p);
 void proc_check_signals(void);
 int proc_grow_stack(uint32_t addr);

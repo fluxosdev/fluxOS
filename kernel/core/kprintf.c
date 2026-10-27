@@ -11,28 +11,64 @@
 
 static char klog_buf[KLOG_SIZE];
 static uint32_t klog_head;      /* total bytes ever written */
+static spinlock_t log_lock = SPINLOCK_INIT("log");
+/* The screen and serial port: messages come from anywhere, interrupt
+ * handlers included, and must not be drawn over each other. */
+static spinlock_t console_lock = SPINLOCK_INIT("console");
 
 static void klog_append(const char *s, uint32_t len)
 {
+    spin_lock(&log_lock);
     for (uint32_t i = 0; i < len; i++)
         klog_buf[(klog_head + i) % KLOG_SIZE] = s[i];
     klog_head += len;
+    spin_unlock(&log_lock);
 }
 
 int klog_read(char *buf, uint32_t size)
 {
+    spin_lock(&log_lock);
     uint32_t avail = MIN(klog_head, (uint32_t)KLOG_SIZE);
     uint32_t n = MIN(avail, size);
     uint32_t start = klog_head - n;
     for (uint32_t i = 0; i < n; i++)
         buf[i] = klog_buf[(start + i) % KLOG_SIZE];
+    spin_unlock(&log_lock);
     return (int)n;
 }
 
+void console_lock_take(void)
+{
+    spin_lock(&console_lock);
+}
+
+void console_lock_give(void)
+{
+    spin_unlock(&console_lock);
+}
+
+int spin_trylock_console(void)
+{
+    return spin_trylock(&console_lock);
+}
+
+/* A piece at a time: the serial port takes about a second for 10 KiB,
+ * and interrupts are off while the lock is held. The bell (on the PC
+ * speaker, which has a lock of its own) rings after. */
 void console_write(const char *buf, uint32_t len)
 {
-    vga_write(buf, len);
-    serial_write(buf, len);
+    uint32_t done = 0;
+    do {
+        uint32_t n = MIN(len - done, 128u);
+        spin_lock(&console_lock);
+        vga_write(buf + done, n);
+        serial_write(buf + done, n);
+        int bell = vga_take_bell();
+        spin_unlock(&console_lock);
+        if (bell)
+            spkr_beep(750, 120);
+        done += n;
+    } while (done < len);
 }
 
 void kputs(const char *s)
@@ -130,15 +166,16 @@ static void __attribute__((noreturn)) wait_for_restart(void)
 
 void panic(const char *fmt, ...)
 {
-    static int panicking;
+    static int nested;
     char buf[256];
     uint32_t trace[TRACE_MAX];
     va_list ap;
     cli();
+    panicking = 1;                      /* locks stop waiting (lock.c) */
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (panicking++) {
+    if (nested++) {
         /* Drawing the first one went wrong: that one is what matters. */
         serial_write("panic while panicking: ", 23);
         serial_write(buf, strlen(buf));

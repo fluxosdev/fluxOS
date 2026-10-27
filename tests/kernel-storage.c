@@ -1,3 +1,4 @@
+#define KTEST_OWN_MUTEX
 #include "kernel-test.h"
 #include "../kernel/fs/vfs.c"
 #include "../kernel/fs/fat32.c"
@@ -17,6 +18,11 @@ void *krealloc(void *p, size_t n) { return fail_alloc ? NULL : realloc(p, n); }
 void kfree(void *p) { free(p); }
 void panic(const char *fmt, ...) { (void)fmt; abort(); }
 void sleep_on(void *p) { (void)p; abort(); } /* no competing tasks in this harness */
+/* The VFS lock is the only mutex: who holds it, for the tests to check. */
+static struct proc *mutex_owner;
+void mutex_lock(struct mutex *m) { (void)m; CHECK(!mutex_owner); mutex_owner = current; }
+void mutex_unlock(struct mutex *m) { (void)m; CHECK(mutex_owner == current); mutex_owner = NULL; }
+int mutex_held(const struct mutex *m) { (void)m; return mutex_owner && mutex_owner == current; }
 void wakeup(void *p) { (void)p; }
 uint32_t time_now(void) { return 1700000000; }
 size_t strlcpy(char *dst, const char *src, size_t size)
@@ -42,7 +48,7 @@ const uint8_t *bcache_read(struct blockdev *dev, uint32_t lba)
 { (void)dev; return lba < 64 ? disk[lba] : NULL; }
 int bcache_write(struct blockdev *dev, uint32_t lba, const void *in)
 {
-    if (require_lock) CHECK(lock_owner == current->pid);
+    if (require_lock) CHECK(mutex_owner == current);
     if ((int)lba == fail_lba) {
         if (fail_once) { fail_lba = -1; fail_once = 0; }
         return -EIO;
@@ -52,7 +58,7 @@ int bcache_write(struct blockdev *dev, uint32_t lba, const void *in)
 int bcache_write_batch(struct blockdev *dev, const struct bcache_update *u, uint32_t n)
 {
     CHECK(n <= BCACHE_BATCH_MAX);
-    if (require_lock) CHECK(lock_owner == current->pid);
+    if (require_lock) CHECK(mutex_owner == current);
     for (uint32_t i = 0; i < n; i++) {
         if (u[i].lba >= 64 || (int)u[i].lba == fail_lba) {
             if (fail_once) { fail_lba = -1; fail_once = 0; }
@@ -140,7 +146,7 @@ static void unlink_lifetime(void)
     CHECK(mounted_fs->refs == 1 && umount_fs(mounted_fs, 0) == -EBUSY);
     vfs_unref(old); /* must acquire the VFS lock before deferred FAT I/O */
     require_lock = 0;
-    CHECK(mounted_fs->refs == 0 && lock_owner == -1);
+    CHECK(mounted_fs->refs == 0 && mutex_owner == NULL);
     CHECK(fat_get(mounted_fs->priv, old_cluster) == 0);
     finish();
 }

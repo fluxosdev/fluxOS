@@ -763,7 +763,7 @@ static void service(void)
     poll_wakeup();
 }
 
-static void hda_irq(struct trapframe *tf)
+static void hda_irq_locked(struct trapframe *tf)
 {
     (void)tf;
     uint32_t st = rd32(INTSTS);
@@ -773,10 +773,13 @@ static void hda_irq(struct trapframe *tf)
     service();
 }
 
+/* From the timer interrupt; the card's own interrupt does it too. */
 void hda_tick(void)
 {
-    if (hda.present && hda.running)
-        service();
+    if (!hda.present || !hda.running || !spin_trylock(&snd_lock))
+        return;
+    service();
+    spin_unlock(&snd_lock);
 }
 
 /* Sleep until the buffer moves on; -EIO if it has stopped moving. */
@@ -785,7 +788,7 @@ static int wait_progress(void)
     uint32_t seen = hda.progress;
     if (!hda.running)
         return -EIO;
-    sleep_on_timeout(&hda, ticks + HZ);
+    sleep_on_lock_timeout(&hda, &snd_lock, ticks + HZ);
     if (signal_pending(current))
         return -EINTR;
     if (hda.running && hda.progress == seen) {
@@ -828,7 +831,7 @@ static void set_defaults(void)
     reset_resampler();
 }
 
-static int dsp_open(struct vnode *vn, int flags)
+static int dsp_open_locked(struct vnode *vn, int flags)
 {
     (void)vn;
     if ((flags & O_ACCMODE) == O_RDONLY)
@@ -844,7 +847,7 @@ static int dsp_open(struct vnode *vn, int flags)
     return 0;
 }
 
-static void dsp_close(struct vnode *vn, int flags)
+static void dsp_close_locked(struct vnode *vn, int flags)
 {
     (void)vn; (void)flags;
     hda.open_pid = 0;
@@ -863,7 +866,7 @@ static int make_room(void)
     return 0;
 }
 
-static int dsp_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
+static int dsp_write_locked(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
 {
     (void)vn; (void)off;
     const uint8_t *in = buf;
@@ -896,7 +899,7 @@ static int dsp_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n
     return (int)n;
 }
 
-static int dsp_poll(struct vnode *vn)
+static int dsp_poll_locked(struct vnode *vn)
 {
     (void)vn;
     return RING_SIZE - ring_used() >= HALF ? POLLOUT : 0;
@@ -930,7 +933,7 @@ static uint32_t user_bytes(uint32_t codec_bytes)
     return frames * (uint32_t)hda.rate / (uint32_t)hda.out_rate * user_frame();
 }
 
-static int dsp_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
+static int dsp_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg)
 {
     (void)vn;
     int v, r;
@@ -999,7 +1002,7 @@ static int dsp_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
 
 /* ---- /dev/mixer: master (the DACs' amplifiers) and pcm (in software) ---- */
 
-static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
+static int mixer_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg)
 {
     (void)vn;
     if (req == SOUND_INFO) {
@@ -1026,6 +1029,62 @@ static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
     if (ml->channel == MIXER_MASTER && hda.hw_master)
         apply_master();
     return 0;
+}
+
+/* ---- the device calls and the interrupt, under snd_lock ---- */
+
+static int dsp_open(struct vnode *vn, int flags)
+{
+    spin_lock(&snd_lock);
+    int r = dsp_open_locked(vn, flags);
+    spin_unlock(&snd_lock);
+    return r;
+}
+
+static void dsp_close(struct vnode *vn, int flags)
+{
+    spin_lock(&snd_lock);
+    dsp_close_locked(vn, flags);
+    spin_unlock(&snd_lock);
+}
+
+static int dsp_poll(struct vnode *vn)
+{
+    spin_lock(&snd_lock);
+    int r = dsp_poll_locked(vn);
+    spin_unlock(&snd_lock);
+    return r;
+}
+
+static int dsp_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
+{
+    spin_lock(&snd_lock);
+    int r = dsp_ioctl_locked(vn, req, arg);
+    spin_unlock(&snd_lock);
+    return r;
+}
+
+static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
+{
+    spin_lock(&snd_lock);
+    int r = mixer_ioctl_locked(vn, req, arg);
+    spin_unlock(&snd_lock);
+    return r;
+}
+
+static int dsp_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
+{
+    spin_lock(&snd_lock);
+    int r = dsp_write_locked(vn, buf, off, n);
+    spin_unlock(&snd_lock);
+    return r;
+}
+
+static void hda_irq(struct trapframe *tf)
+{
+    spin_lock(&snd_lock);
+    hda_irq_locked(tf);
+    spin_unlock(&snd_lock);
 }
 
 /* ---- setup ---- */

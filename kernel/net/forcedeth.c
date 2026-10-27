@@ -471,10 +471,11 @@ static void rx_process(void)
 static void fd_irq(struct trapframe *tf)
 {
     (void)tf;
+    spin_lock(&net_lock);
     for (int round = 0; round < 8; round++) {
         uint32_t ev = rd(R_IRQSTATUS) & NVI_STAT_MASK;
         if (!ev)
-            return;
+            break;
         wr(R_IRQSTATUS, ev);
         if (ev & NVI_RX_ALL)
             rx_process();
@@ -489,6 +490,7 @@ static void fd_irq(struct trapframe *tf)
         if (ev & NVI_RECOVER)
             netif.rx_errors++;
     }
+    spin_unlock(&net_lock);
 }
 
 /* From the timer: anything the interrupt missed, and the link every 2 s. */

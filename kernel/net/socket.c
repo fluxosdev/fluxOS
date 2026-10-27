@@ -5,6 +5,11 @@
  *
  * Calls that wait (connect, accept, send on a full buffer, receive on
  * an empty one) sleep on the socket; the network interrupt wakes them.
+ *
+ * The whole network stack runs holding net_lock (net.c): these calls,
+ * the network cards' interrupts and the timer tick. A call lets it go
+ * while it sleeps. Buffers passed in are the caller's, checked
+ * beforehand, so they are copied holding it.
  */
 #include "kernel.h"
 #include "drivers.h"
@@ -102,7 +107,7 @@ static int no_route(void)
     return netif.present ? -ENETUNREACH : -ENETDOWN;
 }
 
-int sock_create(int domain, int type, int proto, struct socket **out)
+static int sock_create_locked(int domain, int type, int proto, struct socket **out)
 {
     if (domain != AF_INET)
         return -EAFNOSUPPORT;
@@ -126,7 +131,7 @@ int sock_create(int domain, int type, int proto, struct socket **out)
     return 0;
 }
 
-int sock_bind(struct socket *s, const struct sockaddr_in *sin)
+static int sock_bind_locked(struct socket *s, const struct sockaddr_in *sin)
 {
     if (sin->sin_family != AF_INET)
         return -EAFNOSUPPORT;
@@ -154,7 +159,7 @@ static int bind_ephemeral(struct socket *s)
     return s->lport ? 0 : -EADDRNOTAVAIL;
 }
 
-int sock_connect(struct socket *s, const struct sockaddr_in *sin)
+static int sock_connect_locked(struct socket *s, const struct sockaddr_in *sin)
 {
     if (sin->sin_family != AF_INET)
         return -EAFNOSUPPORT;
@@ -193,7 +198,7 @@ int sock_connect(struct socket *s, const struct sockaddr_in *sin)
             s->rtx_on = 0;
             return -EINTR;
         }
-        sleep_on(s);
+        sleep_on_lock(s, &net_lock);
     }
     if (s->state == TCP_CLOSED) {
         int err = s->error ? s->error : ECONNREFUSED;
@@ -203,7 +208,7 @@ int sock_connect(struct socket *s, const struct sockaddr_in *sin)
     return 0;
 }
 
-int sock_listen(struct socket *s, int backlog)
+static int sock_listen_locked(struct socket *s, int backlog)
 {
     if (s->type != SOCK_STREAM)
         return -EOPNOTSUPP;
@@ -213,7 +218,7 @@ int sock_listen(struct socket *s, int backlog)
     return r < 0 ? r : tcp_listen(s, backlog);
 }
 
-int sock_accept(struct socket *s, struct socket **out, struct sockaddr_in *peer)
+static int sock_accept_locked(struct socket *s, struct socket **out, struct sockaddr_in *peer)
 {
     if (s->type != SOCK_STREAM)
         return -EOPNOTSUPP;
@@ -222,7 +227,7 @@ int sock_accept(struct socket *s, struct socket **out, struct sockaddr_in *peer)
     while (!s->acceptq) {
         if (signal_pending(current))
             return -EINTR;
-        sleep_on(s);
+        sleep_on_lock(s, &net_lock);
     }
     struct socket *c = s->acceptq;
     s->acceptq = c->aq_next;
@@ -258,14 +263,14 @@ static int stream_send(struct socket *s, const uint8_t *buf, uint32_t n, int fla
                 return done ? (int)done : -EAGAIN;
             if (signal_pending(current))
                 return done ? (int)done : -EINTR;
-            sleep_on(s);
+            sleep_on_lock(s, &net_lock);
         }
     }
     return (int)done;
 }
 
-int sock_sendto(struct socket *s, const void *buf, uint32_t n, int flags,
-                const struct sockaddr_in *to)
+static int sock_sendto_locked(struct socket *s, const void *buf, uint32_t n, int flags,
+                              const struct sockaddr_in *to)
 {
     if (s->shut_wr) {
         proc_signal(current, SIGPIPE);
@@ -325,7 +330,8 @@ int sock_sendto(struct socket *s, const void *buf, uint32_t n, int flags,
     return r < 0 ? r : (int)n;
 }
 
-int sock_recvfrom(struct socket *s, void *buf, uint32_t n, int flags, struct sockaddr_in *from)
+static int sock_recvfrom_locked(struct socket *s, void *buf, uint32_t n, int flags,
+                                struct sockaddr_in *from)
 {
     if (s->type == SOCK_STREAM) {
         if (s->state == TCP_LISTEN)
@@ -349,7 +355,7 @@ int sock_recvfrom(struct socket *s, void *buf, uint32_t n, int flags, struct soc
                 return -EAGAIN;
             if (signal_pending(current))
                 return -EINTR;
-            sleep_on(s);
+            sleep_on_lock(s, &net_lock);
         }
     }
 
@@ -365,7 +371,7 @@ int sock_recvfrom(struct socket *s, void *buf, uint32_t n, int flags, struct soc
             return -EAGAIN;
         if (signal_pending(current))
             return -EINTR;
-        sleep_on(s);
+        sleep_on_lock(s, &net_lock);
     }
     struct dgram *d = s->rq;
     uint32_t k = MIN(n, (uint32_t)d->len);
@@ -382,7 +388,7 @@ int sock_recvfrom(struct socket *s, void *buf, uint32_t n, int flags, struct soc
     return (int)k;
 }
 
-int sock_shutdown(struct socket *s, int how)
+static int sock_shutdown_locked(struct socket *s, int how)
 {
     if (how != SHUT_RD && how != SHUT_WR && how != SHUT_RDWR)
         return -EINVAL;
@@ -399,7 +405,7 @@ int sock_shutdown(struct socket *s, int how)
     return 0;
 }
 
-int sock_name(struct socket *s, int peer, struct sockaddr_in *sin)
+static int sock_name_locked(struct socket *s, int peer, struct sockaddr_in *sin)
 {
     if (peer && !s->connected)
         return -ENOTCONN;
@@ -410,7 +416,7 @@ int sock_name(struct socket *s, int peer, struct sockaddr_in *sin)
     return 0;
 }
 
-int sock_poll(struct socket *s)
+static int sock_poll_locked(struct socket *s)
 {
     int ev = 0;
     if (s->error)
@@ -432,7 +438,7 @@ int sock_poll(struct socket *s)
     return ev;
 }
 
-void sock_close(struct socket *s)
+static void sock_close_locked(struct socket *s)
 {
     s->has_file = 0;
     if (s->type == SOCK_STREAM)
@@ -500,4 +506,94 @@ void icmp_socket_input(uint32_t src, const uint8_t *data, uint32_t len)
             return;
         }
     }
+}
+
+/* ---- the calls, under net_lock ---- */
+
+int sock_create(int domain, int type, int proto, struct socket **out)
+{
+    spin_lock(&net_lock);
+    int r = sock_create_locked(domain, type, proto, out);
+    spin_unlock(&net_lock);
+    return r;
+}
+
+int sock_bind(struct socket *s, const struct sockaddr_in *sin)
+{
+    spin_lock(&net_lock);
+    int r = sock_bind_locked(s, sin);
+    spin_unlock(&net_lock);
+    return r;
+}
+
+int sock_connect(struct socket *s, const struct sockaddr_in *sin)
+{
+    spin_lock(&net_lock);
+    int r = sock_connect_locked(s, sin);
+    spin_unlock(&net_lock);
+    return r;
+}
+
+int sock_listen(struct socket *s, int backlog)
+{
+    spin_lock(&net_lock);
+    int r = sock_listen_locked(s, backlog);
+    spin_unlock(&net_lock);
+    return r;
+}
+
+int sock_accept(struct socket *s, struct socket **out, struct sockaddr_in *peer)
+{
+    spin_lock(&net_lock);
+    int r = sock_accept_locked(s, out, peer);
+    spin_unlock(&net_lock);
+    return r;
+}
+
+int sock_sendto(struct socket *s, const void *buf, uint32_t n, int flags,
+                const struct sockaddr_in *to)
+{
+    spin_lock(&net_lock);
+    int r = sock_sendto_locked(s, buf, n, flags, to);
+    spin_unlock(&net_lock);
+    return r;
+}
+
+int sock_recvfrom(struct socket *s, void *buf, uint32_t n, int flags, struct sockaddr_in *from)
+{
+    spin_lock(&net_lock);
+    int r = sock_recvfrom_locked(s, buf, n, flags, from);
+    spin_unlock(&net_lock);
+    return r;
+}
+
+int sock_shutdown(struct socket *s, int how)
+{
+    spin_lock(&net_lock);
+    int r = sock_shutdown_locked(s, how);
+    spin_unlock(&net_lock);
+    return r;
+}
+
+int sock_name(struct socket *s, int peer, struct sockaddr_in *sin)
+{
+    spin_lock(&net_lock);
+    int r = sock_name_locked(s, peer, sin);
+    spin_unlock(&net_lock);
+    return r;
+}
+
+int sock_poll(struct socket *s)
+{
+    spin_lock(&net_lock);
+    int r = sock_poll_locked(s);
+    spin_unlock(&net_lock);
+    return r;
+}
+
+void sock_close(struct socket *s)
+{
+    spin_lock(&net_lock);
+    sock_close_locked(s);
+    spin_unlock(&net_lock);
 }

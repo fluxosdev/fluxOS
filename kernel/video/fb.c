@@ -20,6 +20,11 @@ struct framebuffer fb;
 struct framebuffer fb_boot;
 static int fb_owner;                    /* pid with the screen mapped, or 0 */
 static int panicked;                    /* the panic screen is up: nobody else draws */
+static int switching;                   /* a driver is changing fb: the console keeps off it */
+
+/* Everything SYS_display, SYS_fbmap and the display drivers do; they may
+ * sleep waiting for the GPU. The console has its own lock (kprintf.c). */
+static struct mutex display_mutex = MUTEX_INIT("display");
 
 /* What the VESA BIOS says about the adapter, for the standard driver. */
 static char vesa_name[48];
@@ -208,7 +213,7 @@ void fb_scroll(uint32_t y0, uint32_t h, uint32_t dy)
 /* The console draws on the framebuffer while no process owns it. */
 int fb_console_active(void)
 {
-    return fb.base && !fb_owner && !panicked;
+    return fb.base && !fb_owner && !panicked && !switching;
 }
 
 /* A panic takes the screen from whoever has it, and keeps the console off
@@ -225,8 +230,11 @@ int fb_panic(void)
 
 int fb_get_info(struct fbinfo *fi)
 {
-    if (!fb.base)
+    mutex_lock(&display_mutex);
+    if (!fb.base) {
+        mutex_unlock(&display_mutex);
         return -ENODEV;
+    }
     memset(fi, 0, sizeof(*fi));
     fi->width = fb.width;
     fi->height = fb.height;
@@ -238,11 +246,22 @@ int fb_get_info(struct fbinfo *fi)
     fi->green_size = fb.green_size;
     fi->blue_pos = fb.blue_pos;
     fi->blue_size = fb.blue_size;
+    mutex_unlock(&display_mutex);
     return 0;
 }
 
+static int map_user(void);
+
 /* Map the framebuffer into the calling process and take the screen. */
 int fb_map_user(void)
+{
+    mutex_lock(&display_mutex);
+    int r = map_user();
+    mutex_unlock(&display_mutex);
+    return r;
+}
+
+static int map_user(void)
 {
     if (!fb.base)
         return -ENODEV;
@@ -266,14 +285,25 @@ int fb_map_user(void)
  * of device memory with it; the console comes back with the screen. */
 void fb_proc_exit(int pid)
 {
+    mutex_lock(&display_mutex);
     voodoo_proc_exit(pid);
     radeon_proc_exit(pid);
-    if (!fb_owner || pid != fb_owner)
-        return;
-    fb_owner = 0;
-    radeon_release();
-    klog("fb: screen returned to the console\n");
-    vga_redraw();
+    if (fb_owner && pid == fb_owner) {
+        fb_owner = 0;
+        radeon_release();
+        klog("fb: screen returned to the console\n");
+        vga_redraw();
+    }
+    mutex_unlock(&display_mutex);
+}
+
+/* Are any of pid's pages in [start, end) lent to the GPU? */
+int fb_pinned(int pid, uint32_t start, uint32_t end)
+{
+    mutex_lock(&display_mutex);
+    int r = radeon_pinned(pid, start, end);
+    mutex_unlock(&display_mutex);
+    return r;
 }
 
 /* video=WxH[xD][@R] on the command line: the mode a display driver starts in. */
@@ -329,7 +359,33 @@ static int screen_owner(void)
     return fb_owner && fb_owner == current->pid;
 }
 
+static int display_op(int op, void *arg);
+
 int fb_display(int op, void *arg)
+{
+    mutex_lock(&display_mutex);
+    int r = display_op(op, arg);
+    mutex_unlock(&display_mutex);
+    return r;
+}
+
+/* The console keeps off the screen while the driver changes fb under it,
+ * and lays itself out again once it has. */
+static int set_mode(struct dispmode *m)
+{
+    console_lock_take();
+    switching = 1;
+    console_lock_give();
+    int r = voodoo_present() ? voodoo_set_mode(m) : radeon_set_mode(m);
+    console_lock_take();
+    switching = 0;
+    if (fb_console_active())
+        vga_redraw_locked();
+    console_lock_give();
+    return r;
+}
+
+static int display_op(int op, void *arg)
 {
     switch (op) {
     case DISP_INFO: {
@@ -365,7 +421,7 @@ int fb_display(int op, void *arg)
                 return -EBUSY;
         }
         struct dispmode m = *(const struct dispmode *)arg;
-        return voodoo_present() ? voodoo_set_mode(&m) : radeon_set_mode(&m);
+        return set_mode(&m);
     }
     case DISP_MAP3D:
         if (voodoo_present())

@@ -74,7 +74,8 @@ USER_CFLAGS   := $(CFLAGS_COMMON) -mfpmath=sse -fno-math-errno -Iinclude -Iuser/
 # string routines and kmain) is built for any 386, so that an older machine
 # shows why it cannot run fluxOS instead of hanging on an i686 instruction.
 KERNEL_EARLY_OBJS := $(addprefix $(BUILD)/k/,kernel/core/kmain.o kernel/core/cpu.o kernel/core/kprintf.o \
-	kernel/video/vga.o kernel/video/fb.o kernel/core/serial.o kernel/video/splash.o lib/string.o lib/vsnprintf.o lib/font8x16.o)
+	kernel/core/lock.o kernel/video/vga.o kernel/video/fb.o kernel/core/serial.o kernel/video/splash.o \
+	lib/string.o lib/vsnprintf.o lib/font8x16.o)
 $(KERNEL_EARLY_OBJS): KERNEL_CFLAGS += -march=i386 -mtune=pentium3
 
 LDFLAGS_COMMON := -m elf_i386 -nostdlib -z noexecstack --no-warn-rwx-segments

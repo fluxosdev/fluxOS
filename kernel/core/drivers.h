@@ -33,6 +33,7 @@ int fb_panic(void);                     /* the panic screen takes the screen */
 int fb_get_info(struct fbinfo *fi);
 int fb_map_user(void);
 void fb_proc_exit(int pid);             /* at exit and exec: the screen and GPU it held */
+int fb_pinned(int pid, uint32_t start, uint32_t end);  /* radeon_pinned, under the display lock */
 
 /* 3dfx Banshee/Voodoo3 display driver (voodoo.c) */
 void voodoo_init(void);
@@ -70,6 +71,10 @@ int radeon_pinned(int pid, uint32_t start, uint32_t end);
  * 0x08 to read memory (play) or 0x04 to write it (record). */
 int isa_dma_start(int ch, uint32_t phys, uint32_t len, uint8_t mode);
 void isa_dma_stop(int ch);
+extern spinlock_t isa_dma_lock;         /* for programming a channel by hand (floppy.c) */
+/* The Sound Blaster's and HD Audio's state: their device calls, interrupts
+ * and ticks. Callers sleeping for the card let it go meanwhile. */
+extern spinlock_t snd_lock;
 
 /* Sound: the PC speaker (pcspkr.c), the Sound Blaster 16 (sb16.c) and the
  * OPL FM synthesizer (opl.c), as /dev/speaker, /dev/dsp, /dev/mixer, /dev/opl */
@@ -88,13 +93,20 @@ int opl_present(void);                  /* 0, 2 (OPL2) or 3 (OPL3) */
 
 /* Console: VGA text mode or the framebuffer (a subset of ANSI escapes) */
 void vga_init(void);
+/* The console lock (kprintf.c) guards the console and the startup screen:
+ * console_write() takes it; vga_write() and vga_redraw_locked() want it held. */
+void console_lock_take(void);
+void console_lock_give(void);
+int spin_trylock_console(void);         /* 1 if taken */
 void vga_write(const char *buf, uint32_t len);
 void vga_redraw(void);
+void vga_redraw_locked(void);
+int vga_take_bell(void);
 
 /* The startup screen (splash.c), over the console until the desktop starts */
 void splash_init(void);
 int splash_active(void);
-void splash_redraw(void);
+void splash_redraw(void);              /* with the console lock */
 void splash_step(void);                 /* a boot message */
 void splash_booted(void);               /* init is starting */
 void splash_tick(void);
@@ -132,6 +144,7 @@ void input_push(const struct input_event *ev);
 
 /* Programmable interval timer */
 extern volatile uint32_t ticks;
+extern spinlock_t pit_lock;
 void pit_init(uint32_t hz);
 void udelay(uint32_t us);               /* spins; works with interrupts off */
 void mdelay(uint32_t ms);               /* sleeps in a process, spins at boot */

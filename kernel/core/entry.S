@@ -70,8 +70,9 @@ trapret:
     addl $8, %esp                   /* int_no, err_code */
     iret
 
-/* Where a new process first runs: off the kernel lock if it is a user
- * process (proc_start), then out through trapret like any trap. */
+/* Where a new process first runs: off the scheduler's lock, which the
+ * switch to it left held (proc_start), then out through trapret like
+ * any trap. */
 .global forkret
 forkret:
     call proc_start

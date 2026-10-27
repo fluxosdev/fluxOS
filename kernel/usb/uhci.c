@@ -430,7 +430,7 @@ static int uhci_port_reset(struct usb_hub *h, int port)
 {
     uint16_t reg = port_reg(h, port);
     outw(reg, (uint16_t)((inw(reg) & PORT_RW) | PORT_PR));
-    mdelay(50);
+    usb_mdelay(50);
     outw(reg, (uint16_t)(inw(reg) & PORT_RW & ~PORT_PR));
     udelay(100);
     for (int i = 0; i < 10; i++) {
@@ -444,7 +444,7 @@ static int uhci_port_reset(struct usb_hub *h, int port)
         if (v & PORT_PE)
             return (v & PORT_LSDA) ? USB_SPEED_LOW : USB_SPEED_FULL;
         outw(reg, (uint16_t)((v & PORT_RW) | PORT_PE));
-        mdelay(10);
+        usb_mdelay(10);
     }
     return -EIO;
 }
@@ -471,9 +471,11 @@ static int nuhci;
 static void uhci_irq(struct trapframe *tf)
 {
     (void)tf;
+    spin_lock(&usb_lock);
     for (int i = 0; i < nuhci; i++)
         if (inw(uhcis[i]->io + USBSTS) & STS_ACK)
             uhci_poll(&uhcis[i]->hc);
+    spin_unlock(&usb_lock);
 }
 
 /*
@@ -512,10 +514,10 @@ static void uhci_init(const struct pci_dev *pci)
     outw(u->io + USBINTR, 0);
     outw(u->io + USBCMD, 0);
     for (int i = 0; i < 20 && !(inw(u->io + USBSTS) & STS_HCH); i++)
-        mdelay(1);
+        usb_mdelay(1);
     outw(u->io + USBCMD, CMD_HCRESET);
     for (int i = 0; i < 50 && (inw(u->io + USBCMD) & CMD_HCRESET); i++)
-        mdelay(1);
+        usb_mdelay(1);
     outw(u->io + USBINTR, 0);
 
     for (int s = 0; s < 3; s++)

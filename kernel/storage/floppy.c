@@ -149,13 +149,11 @@ static void fd_irq(struct trapframe *tf)
     wakeup((void *)&fired);
 }
 
-/* Interrupts stay off in the kernel, so the IRQ cannot slip in between
- * clearing `fired`, starting the command and going to sleep. */
+/* `fired` is cleared before a command starts; wait_event looks at it
+ * after preparing to sleep, so an IRQ in between is not missed. */
 static int wait_irq(uint32_t timeout)
 {
-    uint32_t deadline = ticks + timeout;
-    while (!fired && (int32_t)(ticks - deadline) < 0)
-        sleep_on_timeout((void *)&fired, deadline);
+    wait_event_timeout((void *)&fired, fired, ticks + timeout);
     int ok = fired;
     fired = 0;
     return ok ? 0 : -EIO;
@@ -314,6 +312,7 @@ static int read_id(struct fd_drive *d)
 
 static void dma_setup(uint32_t addr, uint32_t len, int to_device)
 {
+    spin_lock(&isa_dma_lock);           /* the sound card uses this controller too */
     outb(0x0A, 0x06);                   /* mask channel 2 */
     outb(0x0C, 0xFF);                   /* reset the byte flip-flop */
     outb(0x04, (uint8_t)addr);
@@ -326,6 +325,7 @@ static void dma_setup(uint32_t addr, uint32_t len, int to_device)
      * read), 0x4A reads memory (disk write). */
     outb(0x0B, to_device ? 0x4A : 0x46);
     outb(0x0A, 0x02);                   /* unmask channel 2 */
+    spin_unlock(&isa_dma_lock);
 }
 
 /* One READ or WRITE of sectors [sector, sector + count) of a track side,

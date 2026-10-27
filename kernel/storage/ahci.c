@@ -335,10 +335,8 @@ static int port_exec(struct ahci_port *p, const struct ata_cmd *c, void *buf, ui
 
     int st;
     if (in_process()) {
-        /* The interrupt wakes us; the one-tick timeout covers a lost one. */
-        uint32_t deadline = ticks + timeout_ms / (1000 / HZ) + 1;
-        while (!(st = cmd_state(p)) && (int32_t)(ticks - deadline) < 0)
-            sleep_on_timeout(p, ticks + 1);
+        /* The interrupt wakes us. */
+        wait_event_timeout(p, (st = cmd_state(p)) != 0, ticks + timeout_ms / (1000 / HZ) + 1);
     } else {
         for (uint32_t i = 0; !(st = cmd_state(p)) && i < timeout_ms * 50; i++)
             udelay(20);

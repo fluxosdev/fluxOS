@@ -1,24 +1,27 @@
 /*
- * Multiprocessing (smp.c): the processors, the kernel lock, and the
- * interrupts they send each other.
+ * Multiprocessing (smp.c): the processors and the interrupts they send
+ * each other. Every processor runs kernel and user code at once; the
+ * locks of lock.h keep what they share consistent.
  *
- * The kernel runs on one processor at a time: whichever holds the kernel
- * lock, taken on every way in (trap) and let go on the way back to user
- * mode or to the idle loop. User processes run on all of them at once.
+ * this_cpu() names the processor it ran on, which may already be another
+ * once it returns if interrupts are on (the process can be preempted and
+ * go on elsewhere): use it with interrupts off, or holding a spinlock.
  */
 #ifndef SMP_H
 #define SMP_H
 
 #include <stdint.h>
 #include "arch.h"
+#include "lock.h"
 
 #define MAX_CPUS 16
 #define CPU_CACHE_LINE 64
+#define CPU_HELD_NAMES 4
 
 /* Interrupts between processors (and the local APIC's spurious one). */
 #define VEC_RESCHED  0xF0               /* something to run: look */
 #define VEC_TICK     0xF1               /* the timer ticked (on the boot processor) */
-#define VEC_TLB      0xF2               /* flush the TLB; taken without the kernel lock */
+#define VEC_TLB      0xF2               /* flush the TLB; needs no lock */
 #define VEC_STOP     0xF3               /* panic: halt */
 #define VEC_SPURIOUS 0xFF
 
@@ -34,7 +37,8 @@ struct cpu {
     uint32_t *pd;                       /* the page directory in CR3 */
     int slice;                          /* timer ticks left in this time slice */
     volatile int resched;               /* schedule() on the way out of the kernel */
-    int lock_depth;                     /* kernel lock, taken this many times here */
+    int nlocks;                         /* spinlocks held here */
+    const char *held[CPU_HELD_NAMES];   /* the first few of them, for panics */
     volatile int kicked;                /* sent VEC_RESCHED, not yet scheduled */
     volatile int tlb_flush;             /* asked to flush its TLB */
     uint32_t idle_ticks;                /* timer ticks it found itself idle */
@@ -52,10 +56,9 @@ static inline struct cpu *this_cpu(void)
     return &cpus[i < MAX_CPUS ? i : 0];
 }
 
-#define need_resched (this_cpu()->resched)
-
-void kernel_lock(void);
-void kernel_unlock(void);
+/* Switch processes on the way out of the kernel, on whatever processor
+ * the caller is on by then. */
+void set_resched(void);
 
 void smp_add_cpu(uint8_t apic_id);      /* from the ACPI MADT */
 void smp_init(void);                    /* find the processors; before the first process */
@@ -65,6 +68,7 @@ int smp_wake_idle(int preferred);       /* prefer its last CPU if idle; -1 means
 void smp_kick_proc(struct proc *p);     /* p, running elsewhere, has a signal */
 void smp_flush_tlb(uint32_t *pd);       /* pd's mappings changed */
 void smp_tlb_ipi(void);
+void smp_tlb_check(void);               /* waiting with interrupts off: flush if asked */
 void smp_stop_others(void);
 void smp_stopped(void) __attribute__((noreturn));
 void lapic_eoi(void);

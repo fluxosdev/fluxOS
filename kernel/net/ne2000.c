@@ -220,6 +220,7 @@ static void overflow(void)
 static void ne_irq(struct trapframe *tf)
 {
     (void)tf;
+    spin_lock(&net_lock);
     uint8_t isr;
     /* PCI interrupts are level-triggered: clear every cause before returning. */
     for (int round = 0; round < 16 && (isr = ne_in(NE_ISR) & 0x3F); round++) {
@@ -235,6 +236,7 @@ static void ne_irq(struct trapframe *tf)
             netif.tx_errors++;
         ne_out(NE_ISR, isr & (ISR_PTX | ISR_TXE | ISR_CNT));
     }
+    spin_unlock(&net_lock);
 }
 
 /* Reset the card and read its MAC address. Returns 0, or -1 if nothing answers. */

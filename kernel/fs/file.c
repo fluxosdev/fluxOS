@@ -11,6 +11,9 @@
 
 /* Every poller sleeps here; anything that may make a file ready wakes it. */
 static int poll_chan;
+/* All pipes' buffers and ends. A file's reference count is atomic: a
+ * description shared after fork may be closed by two processes at once. */
+static spinlock_t pipe_lock = SPINLOCK_INIT("pipe");
 
 void poll_wakeup(void)
 {
@@ -45,7 +48,7 @@ struct file *file_socket(struct socket *s)
 struct file *file_dup(struct file *f)
 {
     if (f)
-        f->refs++;
+        __atomic_add_fetch(&f->refs, 1, __ATOMIC_RELAXED);
     return f;
 }
 
@@ -61,7 +64,7 @@ static int can_read(struct file *f)
 
 void file_close(struct file *f)
 {
-    if (!f || --f->refs > 0)
+    if (!f || __atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) > 0)
         return;
     if (f->type == FT_VNODE) {
         if (f->vn->dev_close)
@@ -71,57 +74,69 @@ void file_close(struct file *f)
         sock_close(f->sock);
     } else if (f->type == FT_PIPE) {
         struct pipe *p = f->pipe;
+        spin_lock(&pipe_lock);
         if (can_write(f))
             p->writers--;
         else
             p->readers--;
+        int gone = p->readers <= 0 && p->writers <= 0;
         wakeup(p);
         poll_wakeup();
-        if (p->readers <= 0 && p->writers <= 0)
+        spin_unlock(&pipe_lock);
+        if (gone)
             kfree(p);
     }
     kfree(f);
 }
 
+/* buf is the caller's, checked beforehand: copying it holding the lock
+ * cannot fault. */
 static int pipe_read(struct pipe *p, uint8_t *buf, uint32_t n)
 {
     if (!n)
         return 0;
+    spin_lock(&pipe_lock);
     while (p->wpos == p->rpos) {
-        if (p->writers <= 0)
-            return 0;
-        if (signal_pending(current))
-            return -EINTR;
-        sleep_on(p);
+        if (p->writers <= 0 || signal_pending(current)) {
+            spin_unlock(&pipe_lock);
+            return p->writers <= 0 ? 0 : -EINTR;
+        }
+        sleep_on_lock(p, &pipe_lock);
     }
     uint32_t i = 0;
     while (i < n && p->rpos != p->wpos)
         buf[i++] = (uint8_t)p->buf[p->rpos++ % PIPE_SIZE];
     wakeup(p);
     poll_wakeup();
+    spin_unlock(&pipe_lock);
     return (int)i;
 }
 
 static int pipe_write(struct pipe *p, const uint8_t *buf, uint32_t n)
 {
     uint32_t i = 0;
+    spin_lock(&pipe_lock);
     while (i < n) {
         if (p->readers <= 0) {
+            spin_unlock(&pipe_lock);
             proc_signal(current, SIGPIPE);
             return i ? (int)i : -EPIPE;
         }
         if (p->wpos - p->rpos == PIPE_SIZE) {
             wakeup(p);
             poll_wakeup();
-            if (signal_pending(current))
+            if (signal_pending(current)) {
+                spin_unlock(&pipe_lock);
                 return i ? (int)i : -EINTR;
-            sleep_on(p);
+            }
+            sleep_on_lock(p, &pipe_lock);
             continue;
         }
         p->buf[p->wpos++ % PIPE_SIZE] = (char)buf[i++];
     }
     wakeup(p);
     poll_wakeup();
+    spin_unlock(&pipe_lock);
     return (int)i;
 }
 
@@ -183,6 +198,7 @@ int file_poll(struct file *f, int events)
     int ready;
     if (f->type == FT_PIPE) {
         struct pipe *p = f->pipe;
+        spin_lock(&pipe_lock);
         if (can_write(f)) {
             ready = p->readers <= 0 ? POLLERR : p->wpos - p->rpos < PIPE_SIZE ? POLLOUT : 0;
         } else {
@@ -190,6 +206,7 @@ int file_poll(struct file *f, int events)
             if (p->writers <= 0)
                 ready |= POLLHUP;
         }
+        spin_unlock(&pipe_lock);
     } else if (f->type == FT_SOCKET) {
         ready = sock_poll(f->sock);
     } else if (f->vn->type == VN_CHR && f->vn->dev_poll) {
@@ -200,10 +217,16 @@ int file_poll(struct file *f, int events)
     return ready & (events | POLLERR | POLLHUP);
 }
 
+/* Ready before the scan or woken after it: prepare_wait() comes first, so
+ * a file that becomes ready during the scan is not slept through. */
 int do_poll(struct pollfd *fds, uint32_t nfds, int timeout_ms)
 {
     uint32_t deadline = ticks + ((uint32_t)timeout_ms + 1000 / HZ - 1) / (1000 / HZ);
     for (;;) {
+        if (timeout_ms > 0)
+            prepare_wait_timeout(&poll_chan, deadline);
+        else
+            prepare_wait(&poll_chan);
         int n = 0;
         for (uint32_t i = 0; i < nfds; i++) {
             struct pollfd *pfd = &fds[i];
@@ -217,15 +240,18 @@ int do_poll(struct pollfd *fds, uint32_t nfds, int timeout_ms)
             if (pfd->revents)
                 n++;
         }
-        if (n || timeout_ms == 0)
+        if (n || timeout_ms == 0) {
+            cancel_wait();
             return n;
-        if (timeout_ms > 0 && (int32_t)(ticks - deadline) >= 0)
+        }
+        if (timeout_ms > 0 && (int32_t)(ticks - deadline) >= 0) {
+            cancel_wait();
             return 0;
-        if (signal_pending(current))
+        }
+        if (signal_pending(current)) {
+            cancel_wait();
             return -EINTR;
-        if (timeout_ms > 0)
-            sleep_on_timeout(&poll_chan, deadline);
-        else
-            sleep_on(&poll_chan);
+        }
+        do_wait();
     }
 }

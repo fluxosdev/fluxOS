@@ -212,14 +212,21 @@ static int msc_rw(struct blockdev *bd, uint32_t lba, uint32_t count, void *buf, 
     return 0;
 }
 
+/* The block operations, from the VFS (with its lock): into the USB code. */
 static int msc_read(struct blockdev *bd, uint32_t lba, uint32_t count, void *buf)
 {
-    return msc_rw(bd, lba, count, buf, 0);
+    int taken = usb_enter();
+    int r = msc_rw(bd, lba, count, buf, 0);
+    usb_leave(taken);
+    return r;
 }
 
 static int msc_write(struct blockdev *bd, uint32_t lba, uint32_t count, const void *buf)
 {
-    return msc_rw(bd, lba, count, (void *)buf, 1);
+    int taken = usb_enter();
+    int r = msc_rw(bd, lba, count, (void *)buf, 1);
+    usb_leave(taken);
+    return r;
 }
 
 /* SYNCHRONIZE CACHE; plenty of sticks do not know it, which is fine. */
@@ -227,22 +234,35 @@ static int msc_flush(struct blockdev *bd)
 {
     struct msc *m = bd->priv;
     uint8_t cdb[12] = { 0x35, 0 };
+    int taken = usb_enter();
     int r = scsi(m, cdb, NULL, 0, 0, IO_TIMEOUT);
     if (r == 1)
         request_sense(m, NULL);
+    usb_leave(taken);
     return r < 0 ? -EIO : 0;
 }
 
 static int msc_refresh(struct blockdev *bd)
 {
     struct msc *m = bd->priv;
-    if (!m->dev || m->dev->gone)
-        return -ENODEV;
-    return bd->nsectors ? 0 : read_capacity(m);
+    int taken = usb_enter();
+    int r = !m->dev || m->dev->gone ? -ENODEV : bd->nsectors ? 0 : read_capacity(m);
+    usb_leave(taken);
+    return r;
+}
+
+static int media(struct blockdev *bd);
+
+static int msc_media(struct blockdev *bd)
+{
+    int taken = usb_enter();
+    int r = media(bd);
+    usb_leave(taken);
+    return r;
 }
 
 /* Unplugged: nothing. Removable media (sticks say so too): ask the device. */
-static int msc_media(struct blockdev *bd)
+static int media(struct blockdev *bd)
 {
     struct msc *m = bd->priv;
     if (!m->dev || m->dev->gone)
@@ -340,7 +360,7 @@ static int msc_probe(struct usb_dev *dev, const struct usb_iface_desc *ifd,
     t->iface = ifd->bInterfaceNumber;
     t->cdb_len = sub == 6 ? 10 : 12;
     t->bounce = kmalloc(512);
-    mdelay(300);                        /* many sticks need a moment after configuration */
+    usb_mdelay(300);                    /* many sticks need a moment after configuration */
 
     uint8_t inq[36];
     uint8_t cdb[12] = { 0x12, 0, 0, 0, sizeof(inq), 0 };
@@ -376,12 +396,15 @@ static int msc_probe(struct usb_dev *dev, const struct usb_iface_desc *ifd,
     for (int i = 0; i < 10 && ready != T_READY && ready != T_NOMEDIUM; i++) {
         ready = test_ready(t);
         if (ready == T_BUSY)
-            mdelay(100);
+            usb_mdelay(100);
     }
     if (ready == T_READY)
         read_capacity(t);
 
+    /* The VFS lock comes before usb_lock: a command in progress holds it. */
+    spin_unlock(&usb_lock);
     vfs_lock();
+    spin_lock(&usb_lock);
     int fresh;
     struct msc *m = get_slot(type, &fresh);
     if (!m) {
@@ -445,7 +468,9 @@ static void msc_disconnect(struct usb_dev *dev, void *priv)
 {
     (void)dev;
     struct msc *m = priv;
+    spin_unlock(&usb_lock);
     vfs_lock();                         /* waits for a command in progress to end */
+    spin_lock(&usb_lock);
     m->dev = NULL;
     m->in = m->out = NULL;
     m->bd.nsectors = 0;

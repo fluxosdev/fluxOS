@@ -23,8 +23,7 @@ static void timer_irq(struct trapframe *tf)
     spkr_tick();
     hda_tick();
     usb_tick();
-    proc_tick();
-    smp_tick();
+    proc_tick();                        /* and the other processors' slices */
     net_tick();
 }
 
@@ -37,17 +36,24 @@ void pit_init(uint32_t hz)
     irq_register(IRQ_TIMER, timer_irq);
 }
 
+spinlock_t pit_lock = SPINLOCK_INIT("pit");      /* port 43h: the timer and the speaker */
+static spinlock_t cmos_lock = SPINLOCK_INIT("cmos");
+
 static uint32_t pit_count(void)
 {
+    spin_lock(&pit_lock);
     outb(0x43, 0x00);                   /* latch channel 0 */
     uint32_t lo = inb(0x40);
-    return lo | (uint32_t)inb(0x40) << 8;
+    uint32_t v = lo | (uint32_t)inb(0x40) << 8;
+    spin_unlock(&pit_lock);
+    return v;
 }
 
 /*
  * Busy-wait for at least `us` microseconds. This works with interrupts
  * off, as during boot, by watching PIT channel 0 count down: in mode 3
  * it steps by 2 per PIT clock from the divisor to 0, twice per tick.
+ * Preempted for longer than a tick, it only waits longer.
  */
 void udelay(uint32_t us)
 {
@@ -80,8 +86,11 @@ void mdelay(uint32_t ms)
 
 static uint8_t cmos_read(uint8_t reg)
 {
+    spin_lock(&cmos_lock);
     outb(0x70, reg);
-    return inb(0x71);
+    uint8_t v = inb(0x71);
+    spin_unlock(&cmos_lock);
+    return v;
 }
 
 static int bcd(int v)
@@ -137,8 +146,10 @@ uint32_t time_now(void)
 
 static void cmos_write(uint8_t reg, uint8_t val)
 {
+    spin_lock(&cmos_lock);
     outb(0x70, reg);
     outb(0x71, val);
+    spin_unlock(&cmos_lock);
 }
 
 static uint8_t to_bcd(int v)

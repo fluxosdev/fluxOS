@@ -3,9 +3,12 @@
  * ohci.c, ehci.c, xhci.c) and the device drivers (usbhub.c, usbhid.c,
  * usbmsc.c).
  *
- * Everything runs with interrupts off, as the rest of the kernel does:
- * a controller's completions are handled from its interrupt, from the
- * timer tick, or by a waiting caller polling, never two at once.
+ * Everything here runs holding usb_lock, a spinlock (so with interrupts
+ * off): a controller's completions are handled from its interrupt, from
+ * the timer tick, or by a waiting caller polling, never two at once.
+ * Whatever waits lets it go meanwhile (usb_wait, usb_mdelay, and the
+ * storage driver around the VFS lock, which comes first in lock order),
+ * so other USB work may run there, as it always could while one slept.
  */
 #ifndef USB_H
 #define USB_H
@@ -273,5 +276,11 @@ void uhci_probe(void);
 void ohci_probe(void);
 void ehci_probe(void);
 void xhci_probe(void);
+
+/* ---- locking (usb.c) ---- */
+extern spinlock_t usb_lock;
+int usb_enter(void);                    /* take usb_lock unless held: 1 if taken */
+void usb_leave(int taken);
+void usb_mdelay(uint32_t ms);           /* mdelay(), letting usb_lock go meanwhile */
 
 #endif

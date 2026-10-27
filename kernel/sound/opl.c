@@ -28,13 +28,17 @@ static void opl_wait(int reads)
         (void)inb(OPL_BASE);
 }
 
+/* A register's number, then its value: two programs must not interleave them. */
 static void opl_out(uint16_t reg, uint8_t val)
 {
+    static spinlock_t opl_lock = SPINLOCK_INIT("opl");
     uint16_t port = (uint16_t)(OPL_BASE + ((reg & 0x100) ? 2 : 0));
+    spin_lock(&opl_lock);
     outb(port, (uint8_t)reg);
     opl_wait(opl_type == 3 ? 2 : 6);
     outb((uint16_t)(port + 1), val);
     opl_wait(opl_type == 3 ? 2 : 35);
+    spin_unlock(&opl_lock);
 }
 
 /* Key every voice off, turn every operator down and leave OPL3 mode. */

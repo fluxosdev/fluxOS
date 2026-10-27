@@ -180,10 +180,12 @@ void splash_step(void)
 {
     if (!active || booted)
         return;
+    console_lock_take();
     progress += BOOT_SHARE / BOOT_STEPS;
     if (progress > BOOT_SHARE)
         progress = BOOT_SHARE;
     update_bar();
+    console_lock_give();
 }
 
 /* The kernel has started init: from here the timer moves the bar. */
@@ -193,16 +195,21 @@ void splash_booted(void)
     ticks_seen = ticks;
 }
 
-/* Every timer tick. */
+/* Every timer tick. One busy drawing the console is left to it. */
 void splash_tick(void)
 {
     if (!active || !booted || ticks - ticks_seen < TICKS_PER_STEP)
         return;
-    ticks_seen = ticks;
-    progress += (FULL - progress) / 16 + 1;
-    if (progress > FULL)
-        progress = FULL;
-    update_bar();
+    if (!spin_trylock_console())
+        return;
+    if (active && fb_console_active()) {
+        ticks_seen = ticks;
+        progress += (FULL - progress) / 16 + 1;
+        if (progress > FULL)
+            progress = FULL;
+        update_bar();
+    }
+    console_lock_give();
 }
 
 /* Done: a process took the screen (show_console 0), or the console's
@@ -211,7 +218,11 @@ void splash_end(int show_console)
 {
     if (!active)
         return;
-    active = 0;
-    if (show_console)
-        vga_redraw();
+    console_lock_take();
+    if (active) {
+        active = 0;
+        if (show_console)
+            vga_redraw_locked();
+    }
+    console_lock_give();
 }

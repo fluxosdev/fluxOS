@@ -13,6 +13,9 @@
  * Controllers report completions by interrupt; the timer tick polls them
  * too, so a controller whose interrupt never arrives still works.
  * "usb=off" on the kernel command line leaves USB alone.
+ *
+ * usb_lock (usb.h) is taken on every way in: the controllers' interrupts,
+ * the tick, kusbd, usbinfo(2) and the storage driver's block operations.
  */
 #include "kernel.h"
 #include "drivers.h"
@@ -31,11 +34,40 @@ static volatile int kusbd_kicked;
 static int started;
 static int in_callback;                 /* a completion callback is running */
 
+spinlock_t usb_lock = SPINLOCK_INIT("usb");
+
 static const struct usb_driver *const drivers[] = {
     &usbhub_driver, &usbhid_driver, &usbmsc_driver,
 };
 
 static const char *const speed_names[] = { "low", "full", "high", "super" };
+
+/* The storage driver's block operations come both from the VFS and from
+ * its own probe (reading the partition table), which holds the lock. */
+int usb_enter(void)
+{
+    if (spin_held(&usb_lock))
+        return 0;
+    spin_lock(&usb_lock);
+    return 1;
+}
+
+void usb_leave(int taken)
+{
+    if (taken)
+        spin_unlock(&usb_lock);
+}
+
+void usb_mdelay(uint32_t ms)
+{
+    if (!spin_held(&usb_lock)) {
+        mdelay(ms);
+        return;
+    }
+    spin_unlock(&usb_lock);
+    mdelay(ms);
+    spin_lock(&usb_lock);
+}
 
 int usb_in_process(void)
 {
@@ -158,7 +190,7 @@ int usb_wait(struct usb_xfer *x, uint32_t timeout_ms)
             hc->ops->poll(hc);
             if (x->status != USB_PENDING)
                 break;
-            sleep_on_timeout(x, ticks + 1);
+            sleep_on_lock_timeout(x, &usb_lock, ticks + 1);
         }
     } else {
         for (uint32_t us = 0; x->status == USB_PENDING && us < timeout_ms * 1000; us += 50) {
@@ -458,7 +490,7 @@ static struct usb_dev *usb_enumerate(struct usb_hub *h, int port, int speed)
         for (int tries = 0; tries < 3; tries++) {
             if ((r = get_descriptor(dev, USB_DT_DEVICE, 0, 0, &dev->desc, 8)) >= 8)
                 break;
-            mdelay(20);
+            usb_mdelay(20);
         }
         if (r < 8)
             goto fail;
@@ -476,7 +508,7 @@ static struct usb_dev *usb_enumerate(struct usb_hub *h, int port, int speed)
             goto fail;
         }
         dev->addr = addr;
-        mdelay(10);
+        usb_mdelay(10);
     }
 
     step = "device descriptor";
@@ -576,7 +608,7 @@ void usb_hub_scan(struct usb_hub *h, int all)
         if (child || !(st & PORT_CONNECT) || h->failed[port])
             continue;
 
-        mdelay(100);                    /* let the contacts settle */
+        usb_mdelay(100);                /* let the contacts settle */
         st = h->port_status(h, port);
         if (!(st & PORT_CONNECT))
             continue;
@@ -585,7 +617,7 @@ void usb_hub_scan(struct usb_hub *h, int all)
             h->failed[port] = 1;
             continue;
         }
-        mdelay(10);                     /* reset recovery */
+        usb_mdelay(10);                 /* reset recovery */
         struct usb_dev *dev = usb_enumerate(h, port, speed);
         if (!dev) {
             h->failed[port] = 1;
@@ -612,10 +644,10 @@ static void kusbd(void)
 {
     uint32_t last_full = ticks;
     for (;;) {
-        if (!kusbd_kicked)
-            sleep_on_timeout(&kusbd_chan, ticks + HZ / 4);
+        wait_event_timeout(&kusbd_chan, kusbd_kicked, ticks + HZ / 4);
         kusbd_kicked = 0;
         current->sig_pending = 0;
+        spin_lock(&usb_lock);
         /* Hub devices report changes; every few seconds look anyway. */
         int all = (int32_t)(ticks - last_full) >= 3 * HZ;
         if (all)
@@ -623,31 +655,38 @@ static void kusbd(void)
         for (struct usb_hc *hc = hcs; hc; hc = hc->next)
             usb_hub_scan(&hc->root, all);
         usbhid_service();
+        spin_unlock(&usb_lock);
     }
 }
 
+/* From the timer interrupt. Another processor in the USB code is already
+ * looking at the controllers. */
 void usb_tick(void)
 {
+    if (!hcs || !spin_trylock(&usb_lock))
+        return;
     for (struct usb_hc *hc = hcs; hc; hc = hc->next)
         hc->ops->poll(hc);
-    if (hcs)
-        usbhid_tick();
+    usbhid_tick();
+    spin_unlock(&usb_lock);
 }
 
 void usb_init(void)
 {
     if (cmdline_has("usb=off"))
         return;
+    spin_lock(&usb_lock);
     /* EHCI before its companions: it decides which ports they get. */
     xhci_probe();
     ehci_probe();
     ohci_probe();
     uhci_probe();
-    if (!hcs)
-        return;
-    mdelay(100);                        /* devices on freshly powered ports to connect */
-    for (struct usb_hc *hc = hcs; hc; hc = hc->next)
-        usb_hub_scan(&hc->root, 1);
+    if (hcs) {
+        usb_mdelay(100);                /* devices on freshly powered ports to connect */
+        for (struct usb_hc *hc = hcs; hc; hc = hc->next)
+            usb_hub_scan(&hc->root, 1);
+    }
+    spin_unlock(&usb_lock);
 }
 
 void usb_start(void)
@@ -659,10 +698,21 @@ void usb_start(void)
 
 /* ---- usbinfo(2) ---- */
 
+static int info(int index, struct usbinfo *ui);
+
+/* ui is the caller's, checked beforehand: it is filled holding the lock. */
 int usb_info(int index, struct usbinfo *ui)
 {
     if (index < 0)
         return -ENODEV;
+    spin_lock(&usb_lock);
+    int r = info(index, ui);
+    spin_unlock(&usb_lock);
+    return r;
+}
+
+static int info(int index, struct usbinfo *ui)
+{
     for (int i = 0; i < MAX_DEVS; i++) {
         struct usb_dev *dev = devtab[i];
         if (!dev || index-- > 0)

@@ -23,6 +23,9 @@ static const struct dma_ports ports[8] = {
 #define MODE_REG(ch)     ((ch) < 4 ? 0x0B : 0xD6)
 #define FLIPFLOP_REG(ch) ((ch) < 4 ? 0x0C : 0xD8)
 
+/* The floppy driver's channel 2 shares the first controller's flip-flop. */
+spinlock_t isa_dma_lock = SPINLOCK_INIT("isadma");
+
 void isa_dma_stop(int ch)
 {
     outb(MASK_REG(ch), (uint8_t)(0x04 | (ch & 3)));
@@ -40,6 +43,7 @@ int isa_dma_start(int ch, uint32_t phys, uint32_t len, uint8_t mode)
     uint32_t count = (wide ? len / 2 : len) - 1;
     const struct dma_ports *p = &ports[ch];
 
+    spin_lock(&isa_dma_lock);
     isa_dma_stop(ch);
     outb(FLIPFLOP_REG(ch), 0xFF);
     outb(p->addr, (uint8_t)addr);
@@ -50,5 +54,6 @@ int isa_dma_start(int ch, uint32_t phys, uint32_t len, uint8_t mode)
     outb(p->count, (uint8_t)(count >> 8));
     outb(MODE_REG(ch), (uint8_t)(mode | (ch & 3)));
     outb(MASK_REG(ch), (uint8_t)(ch & 3));       /* unmask */
+    spin_unlock(&isa_dma_lock);
     return 0;
 }

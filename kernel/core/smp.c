@@ -8,19 +8,18 @@
  * as Linux does with "noapic"), and the I/O APIC is left alone, so every
  * device interrupt still arrives on the boot processor. The others are
  * woken by INIT and startup IPIs into trampoline.S and wait in their own
- * idle loops. The boot CPU accounts all timer ticks under the kernel lock;
+ * idle loops. The boot CPU accounts all timer ticks under sched_lock;
  * other CPUs receive VEC_RESCHED only for expired slices or new work.
  *
- * The kernel lock is a ticket lock held by a processor, not a process:
- * schedule() switches contexts with it held, and whichever context runs
- * next lets it go on its way out of the kernel. A processor may take it
- * again while it has it (an interrupt in the boot code), so it counts.
+ * Every processor runs kernel code at once; the locks of lock.h keep
+ * what they share consistent, the scheduler's (sched_lock, proc.c) the
+ * process table and the per-processor fields here.
  *
  * Every processor's TLB must forget a mapping that changes. Only the
  * processor running a process has its address space loaded, so a change
  * made from elsewhere sends VEC_TLB to that one and waits for it; the
- * interrupt is taken without the lock, and a processor waiting for the
- * lock looks for the request as it spins.
+ * interrupt needs no lock, and a processor spinning with interrupts off
+ * (for a lock, or for another's flush) looks for the request as it spins.
  *
  * "nosmp" on the kernel command line keeps to the boot processor, and
  * "maxcpus=N" to N processors.
@@ -85,43 +84,25 @@ static volatile int ap_abort;           /* one did not start in time: stop if it
 extern char ap_trampoline[], ap_trampoline_end[];
 void ap_main(void) __attribute__((noreturn));
 
-/* ---- the kernel lock ---- */
-
-/* Arrivals must not invalidate the line every waiter is polling. */
-static volatile uint32_t lock_next __attribute__((aligned(CPU_CACHE_LINE)));
-static volatile uint32_t lock_serving __attribute__((aligned(CPU_CACHE_LINE)));
-static volatile int lock_owner __attribute__((aligned(CPU_CACHE_LINE))) = -1;
-
 static void flush_local(struct cpu *c)
 {
     write_cr3(read_cr3());
     __atomic_store_n(&c->tlb_flush, 0, __ATOMIC_RELEASE);
 }
 
-void kernel_lock(void)
+/* Interrupts off: VEC_TLB cannot arrive, so look for the request here. */
+void smp_tlb_check(void)
 {
     struct cpu *c = this_cpu();
-    if (lock_owner == c->index) {
-        c->lock_depth++;
-        return;
-    }
-    uint32_t ticket = __atomic_fetch_add(&lock_next, 1, __ATOMIC_RELAXED);
-    while (__atomic_load_n(&lock_serving, __ATOMIC_ACQUIRE) != ticket) {
-        if (c->tlb_flush)
-            flush_local(c);             /* the holder is waiting for it */
-        cpu_relax();
-    }
-    lock_owner = c->index;
-    c->lock_depth = 1;
+    if (__atomic_load_n(&c->tlb_flush, __ATOMIC_ACQUIRE))
+        flush_local(c);
 }
 
-void kernel_unlock(void)
+void set_resched(void)
 {
-    struct cpu *c = this_cpu();
-    if (c->lock_depth <= 0 || --c->lock_depth > 0)
-        return;
-    lock_owner = -1;
-    __atomic_store_n(&lock_serving, lock_serving + 1, __ATOMIC_RELEASE);
+    uint32_t flags = irq_save();
+    this_cpu()->resched = 1;
+    irq_restore(flags);
 }
 
 /* ---- the local APIC ---- */
@@ -423,7 +404,8 @@ void ap_main(void)
 
 /* ---- interrupts between processors ---- */
 
-/* Coalesce wakeups, signals and quantum expiration until the target schedules. */
+/* With sched_lock, as are all of these that look at other processors:
+ * coalesce wakeups, signals and quantum expiration until the target schedules. */
 static void resched_cpu(struct cpu *c)
 {
     c->resched = 1;
@@ -433,7 +415,7 @@ static void resched_cpu(struct cpu *c)
     }
 }
 
-/* The kernel lock makes remote process/slice accounting safe. This avoids
+/* sched_lock makes remote process/slice accounting safe. This avoids
  * waking idle CPUs and reduces busy-CPU timer IPIs from HZ to HZ / QUANTUM. */
 void smp_tick(void)
 {
@@ -484,22 +466,29 @@ void smp_kick_proc(struct proc *p)
             resched_cpu(&cpus[i]);
 }
 
-/* With the kernel lock: the mappings of pd changed. */
+/* The mappings of pd changed. Two processors may do this at once, each
+ * waiting for the other's flush, so each flushes for the other meanwhile. */
 void smp_flush_tlb(uint32_t *pd)
 {
     if (ncpus < 2)
         return;
+    uint32_t flags = irq_save();
     struct cpu *self = this_cpu();
     for (int i = 0; i < ncpus; i++) {
         struct cpu *c = &cpus[i];
         if (c != self && c->pd == pd) {
-            c->tlb_flush = 1;
+            __atomic_store_n(&c->tlb_flush, 1, __ATOMIC_RELEASE);
             send_ipi(c, VEC_TLB);
         }
     }
     for (int i = 0; i < ncpus; i++)
-        while (__atomic_load_n(&cpus[i].tlb_flush, __ATOMIC_ACQUIRE))
+        while (&cpus[i] != self && __atomic_load_n(&cpus[i].tlb_flush, __ATOMIC_ACQUIRE)) {
+            if (panicking)
+                smp_stopped();
+            smp_tlb_check();
             cpu_relax();
+        }
+    irq_restore(flags);
 }
 
 void smp_tlb_ipi(void)

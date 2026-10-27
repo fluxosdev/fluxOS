@@ -34,6 +34,7 @@ static int wrap_pending;                /* the last column was written: wrap on 
 static int fg = 7, bg = 0, bold, reverse;
 static uint8_t attr = 0x07;
 static int cursor_visible = 1;
+static int bell;                        /* a BEL was written */
 
 static int state;
 static int params[MAX_PARAMS];
@@ -191,7 +192,7 @@ static void put_char(char c)
             newline();
         return;
     case '\a':
-        spkr_beep(750, 120);            /* the bell, on the PC speaker */
+        bell = 1;                       /* rung once the console lock is let go */
         return;
     }
     if ((unsigned char)c < 32)
@@ -345,6 +346,16 @@ static void vga_putc(char c)
     }
 }
 
+/* With the console lock: was the bell rung since last asked? */
+int vga_take_bell(void)
+{
+    int b = bell;
+    bell = 0;
+    return b;
+}
+
+/* With the console lock, as is everything here but vga_redraw() and
+ * vga_reset_fb(), which take it. */
 void vga_write(const char *buf, uint32_t len)
 {
     for (uint32_t i = 0; i < len; i++)
@@ -354,6 +365,13 @@ void vga_write(const char *buf, uint32_t len)
 
 /* Repaint the whole console, after a process gave the framebuffer back. */
 void vga_redraw(void)
+{
+    console_lock_take();
+    vga_redraw_locked();
+    console_lock_give();
+}
+
+void vga_redraw_locked(void)
 {
     if (!graphics)
         return;
@@ -373,7 +391,16 @@ void vga_redraw(void)
  * mode). Re-lay the grid out for it, keeping the text at the top left
  * and, if there are fewer rows now, the rows nearest the cursor.
  */
+static void reset_fb(void);
+
 void vga_reset_fb(void)
+{
+    console_lock_take();
+    reset_fb();
+    console_lock_give();
+}
+
+static void reset_fb(void)
 {
     if (!graphics || !fb.base)
         return;
@@ -410,7 +437,7 @@ void vga_reset_fb(void)
     wrap_pending = 0;
     pending_scroll = 0;
     if (fb_console_active())
-        vga_redraw();
+        vga_redraw_locked();
     else
         for (int i = 0; i < cols * rows; i++)
             drawn[i] = INVALID;

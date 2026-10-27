@@ -543,11 +543,11 @@ static int ehci_port_reset(struct usb_hub *h, int port)
     if ((v & PORT_LS) == PORT_LS_K)
         return hand_over(e, port);
     op_wr(e, reg, (v & ~(PORT_RWC | PORT_PE)) | PORT_PR);
-    mdelay(50);
+    usb_mdelay(50);
     op_wr(e, reg, op_rd(e, reg) & ~(PORT_RWC | PORT_PR));
     for (int i = 0; i < 20 && (op_rd(e, reg) & PORT_PR); i++)
-        mdelay(1);
-    mdelay(2);
+        usb_mdelay(1);
+    usb_mdelay(2);
     v = op_rd(e, reg);
     if (!(v & PORT_CCS))
         return -ENODEV;
@@ -578,6 +578,7 @@ static int nehci;
 static void ehci_irq(struct trapframe *tf)
 {
     (void)tf;
+    spin_lock(&usb_lock);
     for (int i = 0; i < nehci; i++) {
         struct ehci *e = ehcis[i];
         uint32_t sts = op_rd(e, OP_USBSTS) & op_rd(e, OP_USBINTR);
@@ -588,6 +589,7 @@ static void ehci_irq(struct trapframe *tf)
             ehci_poll(&e->hc);
         }
     }
+    spin_unlock(&usb_lock);
 }
 
 /* Take the controller from the BIOS (the USB legacy support capability). */
@@ -600,7 +602,7 @@ static void bios_handoff(const struct pci_dev *pci, uint32_t hccparams)
             if (v & (1u << 16)) {
                 pci_write32(pci, eecp, v | (1u << 24));
                 for (int i = 0; i < 100 && (pci_read32(pci, eecp) & (1u << 16)); i++)
-                    mdelay(10);
+                    usb_mdelay(10);
                 if (pci_read32(pci, eecp) & (1u << 16)) {
                     klog("ehci: BIOS would not let go; taking the controller anyway\n");
                     pci_write32(pci, eecp, (pci_read32(pci, eecp) & ~(1u << 16)) | (1u << 24));
@@ -635,10 +637,10 @@ static void ehci_init(const struct pci_dev *pci)
     op_wr(e, OP_USBINTR, 0);
     op_wr(e, OP_USBCMD, op_rd(e, OP_USBCMD) & ~CMD_RS);
     for (int i = 0; i < 20 && !(op_rd(e, OP_USBSTS) & STS_HALTED); i++)
-        mdelay(1);
+        usb_mdelay(1);
     op_wr(e, OP_USBCMD, CMD_HCRESET);
     for (int i = 0; i < 250 && (op_rd(e, OP_USBCMD) & CMD_HCRESET); i++)
-        mdelay(1);
+        usb_mdelay(1);
     if (hcc & 1)
         op_wr(e, OP_CTRLDSSEG, 0);      /* 64-bit capable: our structures are below 4 GiB */
 
@@ -665,9 +667,9 @@ static void ehci_init(const struct pci_dev *pci)
         op_wr(e, OP_USBINTR, STS_INT | STS_ERR | STS_HSE);
     op_wr(e, OP_USBCMD, CMD_ITC8 | CMD_PSE | CMD_ASE | CMD_RS);
     for (int i = 0; i < 20 && (op_rd(e, OP_USBSTS) & STS_HALTED); i++)
-        mdelay(1);
+        usb_mdelay(1);
     op_wr(e, OP_CONFIGFLAG, 1);         /* every port is ours unless handed over */
-    mdelay(5);
+    usb_mdelay(5);
 
     e->ncompanions = (hcs >> 12) & 0xF;
     hc->root.nports = (int)MIN(hcs & 0xF, (uint32_t)USB_MAX_PORTS);
@@ -678,7 +680,7 @@ static void ehci_init(const struct pci_dev *pci)
     if (hcs & (1u << 4)) {              /* port power control */
         for (int p = 1; p <= hc->root.nports; p++)
             op_wr(e, port_reg(p), (op_rd(e, port_reg(p)) & ~PORT_RWC) | PORT_PP);
-        mdelay(20);
+        usb_mdelay(20);
     }
 
     ehcis[nehci++] = e;
