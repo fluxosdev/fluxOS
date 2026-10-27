@@ -19,6 +19,7 @@
 struct framebuffer fb;
 struct framebuffer fb_boot;
 static int fb_owner;                    /* pid with the screen mapped, or 0 */
+static int panicked;                    /* the panic screen is up: nobody else draws */
 
 /* What the VESA BIOS says about the adapter, for the standard driver. */
 static char vesa_name[48];
@@ -148,6 +149,11 @@ static inline void put_px(uint8_t *p, uint32_t v)
     }
 }
 
+void fb_pixel(uint32_t x, uint32_t y, uint32_t color)
+{
+    put_px(fb.base + y * fb.pitch + x * fb.bytespp, color);
+}
+
 /* fg and bg are packed pixel values (fb_pack). */
 void fb_glyph(uint32_t x, uint32_t y, const uint8_t *rows, uint32_t h, uint32_t fg, uint32_t bg)
 {
@@ -202,7 +208,19 @@ void fb_scroll(uint32_t y0, uint32_t h, uint32_t dy)
 /* The console draws on the framebuffer while no process owns it. */
 int fb_console_active(void)
 {
-    return fb.base && !fb_owner;
+    return fb.base && !fb_owner && !panicked;
+}
+
+/* A panic takes the screen from whoever has it, and keeps the console off
+ * it from then on; 0 if there is no framebuffer. */
+int fb_panic(void)
+{
+    if (!fb.base)
+        return 0;
+    panicked = 1;
+    if (fb_owner)
+        radeon_release();               /* page 0 on show, the pointer hidden */
+    return 1;
 }
 
 int fb_get_info(struct fbinfo *fi)

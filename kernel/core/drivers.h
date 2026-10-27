@@ -25,9 +25,11 @@ int fb_display(int op, void *arg);      /* SYS_display; arg checked by the calle
 int fb_video_option(struct dispmode *m);    /* video= on the command line; 1 if given */
 uint32_t fb_pack(uint32_t rgb);
 void fb_glyph(uint32_t x, uint32_t y, const uint8_t *rows, uint32_t h, uint32_t fg, uint32_t bg);
+void fb_pixel(uint32_t x, uint32_t y, uint32_t color);
 void fb_fill(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color);
 void fb_scroll(uint32_t y0, uint32_t h, uint32_t dy);
 int fb_console_active(void);
+int fb_panic(void);                     /* the panic screen takes the screen */
 int fb_get_info(struct fbinfo *fi);
 int fb_map_user(void);
 void fb_proc_exit(int pid);             /* at exit and exec: the screen and GPU it held */
@@ -98,6 +100,9 @@ void splash_booted(void);               /* init is starting */
 void splash_tick(void);
 void splash_end(int show_console);
 void vga_reset_fb(void);                /* the framebuffer's mode changed */
+
+/* The panic screen (panic.c); 0 without a framebuffer */
+int panic_screen(const char *msg);
 
 /* COM1 serial port */
 void serial_init(void);

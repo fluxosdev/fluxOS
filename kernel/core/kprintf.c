@@ -90,18 +90,73 @@ void boot_warn(const char *fmt, ...)
     splash_step();
 }
 
+#define TRACE_MAX 8
+
+/* Return addresses up the frame-pointer chain from panic()'s caller. */
+static int backtrace(uint32_t *out, int max)
+{
+    uint32_t *fp = __builtin_frame_address(0);
+    int n = 0;
+    while (n < max && !((uint32_t)fp & 3) && (uint32_t)fp >= PAGE_SIZE &&
+           (uint32_t)fp < KERNEL_SPACE_END - 8) {
+        uint32_t ret = fp[1];
+        if (ret < (uint32_t)kernel_start || ret >= (uint32_t)kernel_end)
+            break;
+        out[n++] = ret;
+        uint32_t *next = (uint32_t *)fp[0];
+        if (next <= fp)
+            break;
+        fp = next;
+    }
+    return n;
+}
+
+/* Enter on the PS/2 keyboard (or the BIOS's emulation of one) restarts. */
+static void __attribute__((noreturn)) wait_for_restart(void)
+{
+    for (int i = 0; i < 64 && (inb(0x64) & 1); i++)
+        (void)inb(0x60);
+    for (;;) {
+        uint8_t st = inb(0x64);
+        if (!(st & 1)) {
+            cpu_relax();
+            continue;
+        }
+        uint8_t sc = inb(0x60);
+        if (!(st & 0x20) && sc == 0x1C)     /* not the mouse; Enter pressed */
+            machine_reboot();
+    }
+}
+
 void panic(const char *fmt, ...)
 {
+    static int panicking;
     char buf[256];
+    uint32_t trace[TRACE_MAX];
     va_list ap;
     cli();
-    smp_stop_others();
-    splash_end(1);
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    if (panicking++) {
+        /* Drawing the first one went wrong: that one is what matters. */
+        serial_write("panic while panicking: ", 23);
+        serial_write(buf, strlen(buf));
+        serial_write("\n", 1);
+        for (;;)
+            hlt();
+    }
+    smp_stop_others();
+    splash_end(1);
+    int n = backtrace(trace, TRACE_MAX);
     kprintf("\n\033[1;37;41m KERNEL PANIC \033[0m \033[1;31m%s\033[0m\n", buf);
-    kprintf("System halted.\n");
-    for (;;)
-        hlt();
+    if (n) {
+        kprintf("Call trace:");
+        for (int i = 0; i < n; i++)
+            kprintf(" %08x", trace[i]);
+        kprintf("\n");
+    }
+    if (!panic_screen(buf))
+        kprintf("System halted. Press Enter to restart.\n");
+    wait_for_restart();
 }

@@ -163,10 +163,10 @@ static void handle_exception(struct trapframe *tf, int from_user)
         return;
     }
 
-    kprintf("\n\033[1;37;41m KERNEL PANIC \033[0m %s (vector %u) in kernel mode\n",
-            exception_names[vec], vec);
+    /* The registers go to the log, where the panic screen shows them. */
+    kprintf("\n%s (vector %u) in kernel mode\n", exception_names[vec], vec);
     dump_frame(tf);
-    panic("unrecoverable exception");
+    panic("%s at %08x", exception_names[vec], tf->eip);
 }
 
 static void handle_irq(struct trapframe *tf)
