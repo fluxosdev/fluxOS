@@ -364,6 +364,15 @@ static void an_expr(struct an *A, struct ast *n)
     case N_NUM: case N_STR: case N_REGEX: case N_TRUE: case N_FALSE: case N_NULL: case N_HOLE:
     case N_IMPORT_META:
         return;
+    case N_NEWTARGET: {
+        struct vfunc *tf = this_fn(A->fn);
+        if (!tf || tf->is_root) {
+            js_throw_error(A->J, "SyntaxError: new.target outside a function");
+            return;
+        }
+        tf->needs_env = 1;
+        return;
+    }
     case N_THIS: {
         struct vfunc *tf = this_fn(A->fn);
         if (tf && tf != A->fn && !tf->is_root)
@@ -705,6 +714,7 @@ static void lay_out(struct vfunc *f)
     X(VARNAME)      /* hops name  v     -- v: a top-level var's value */           \
     X(CONSTERR)     /* name             -- (throws) */                              \
     X(THIS)         /*                  -- this */                                  \
+    X(NEWTARGET)    /* lexical constructor target */                              \
     X(THISDYN)      /*                  -- this, from the environments */           \
     X(PUSHENV)      /* nslots           -- */                                       \
     X(POPENV)       /*                  -- */                                       \
@@ -1503,6 +1513,7 @@ static void ex_inner(struct cg *C, struct ast *n)
     case N_TRUE: op(C, I_TRUE, 1); return;
     case N_FALSE: op(C, I_FALSE, 1); return;
     case N_NULL: op(C, I_NULL, 1); return;
+    case N_NEWTARGET: op(C, I_NEWTARGET, 1); return;
     case N_THIS:
         op(C, C->vf->arrow || C->vf->is_root ? I_THISDYN : I_THIS, 1);
         return;
@@ -2683,6 +2694,12 @@ L_CONSTERR:
     js_throw_error(J, "TypeError: assignment to constant variable '%s'", KSTR(A)->s);
     pc++;
     goto unwind;
+L_NEWTARGET: {
+    struct env *nt = e;
+    while (nt && !nt->has_self) nt = nt->parent;
+    *sp++ = nt ? nt->new_target : js_undefined;
+    NEXT;
+}
 L_THIS: *sp++ = self; NEXT;
 L_THISDYN: *sp++ = this_value(e); NEXT;
 L_PUSHENV: e = env_new(J, e, (int)A); pc++; NEXT;
@@ -2699,6 +2716,7 @@ L_FUNCENV:
     if (f && !f->arrow) {
         e->has_self = 1;
         e->self = self;
+        e->new_target = J->new_target ? js_obj(J->new_target) : js_undefined;
     }
     if (f && f->home)
         declare(J, e, J->s_home, js_obj(f->home), 0);

@@ -35,6 +35,8 @@
 #include <unistd.h>
 #include "desktop.h"
 #include "jsdom.h"
+#include "webintegrity.h"
+#include "webblob.h"
 #include "web.h"
 #include "webpolicy.h"
 
@@ -134,6 +136,7 @@ struct res {                    /* a style sheet, image, script or request waiti
 };
 
 struct imgref {                 /* an <img> and the URL its picture comes from */
+    int lazy;
     struct node *n;
     char *url;
 };
@@ -191,6 +194,7 @@ struct browser {
     int scroll_x, scroll_y;
     int restore_scroll;         /* back/forward: where the page was */
     const char *pending_fragment;
+    int keyboard_focus;
     struct node *focus;         /* the focused form field */
     struct node *hover;         /* the link under the mouse */
     struct node *js_hover;      /* the element under it, as the page's scripts were told */
@@ -314,6 +318,8 @@ static int nvisited;
 
 static void navigate(struct browser *b, const char *url, const char *post, int mode);
 static void paint(struct browser *b);
+static int is_text_field(const struct node *n);
+static int has_keys(struct browser *b);
 static void draw_pop(struct browser *b, struct surface *s, int ox, int oy);
 static void find_run(struct browser *t, int jump);
 static void pop_close(struct browser *b);
@@ -1141,6 +1147,24 @@ static int read_file(struct fetch *f, const char *url)
     return f->buf ? 0 : -ENOMEM;
 }
 
+static struct node *resource_node(struct browser *b,int kind,int slot)
+{
+    if(kind==F_JS&&slot>=0&&slot<b->nscripts)return b->scripts[slot].n;
+    if(kind==F_CSS&&slot>=0&&slot<b->nlinks)return b->link_nodes[slot];
+    return NULL;
+}
+static int resource_cors(struct browser *b,int kind,int slot)
+{
+    struct node *n=resource_node(b,kind,slot);
+    return kind==F_MODULE||kind==F_FONT||(n&&(node_attr(n,"crossorigin")||node_attr(n,"integrity")));
+}
+static int resource_credentials(struct browser *b,int kind,int slot,const char *url)
+{
+    if(!resource_cors(b,kind,slot)||web_same_origin(b->url,url))return 1;
+    const char *mode=node_attr(resource_node(b,kind,slot),"crossorigin");
+    return mode&&!strcasecmp(mode,"use-credentials");
+}
+
 /* Ask the fetcher for http(s) url. A script's request packs "METHOD\nHeader: value\n...\n\nbody" into post.
  * Returns -1 if there is no fetcher to ask (then wget is used). */
 static int start_via_helper(struct browser *b, int kind, const char *url, const char *post)
@@ -1188,7 +1212,7 @@ static int start_via_helper(struct browser *b, int kind, const char *url, const 
         hdrs[nh++] = ctype;
     }
     char origin_header[320], origin[300] = "null";
-    if ((kind == F_MODULE || kind == F_FONT) && !web_same_origin(b->url, url)) {
+    if (resource_cors(b,kind,b->fetch->slot) && !web_same_origin(b->url, url)) {
         web_origin(b->url, origin, sizeof(origin));
         snprintf(origin_header, sizeof(origin_header), "Origin: %s", origin);
         hdrs[nh++] = origin_header;
@@ -1246,7 +1270,7 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
     f->mode = mode;
     f->out = f->err = -1;
     snprintf(f->url, sizeof(f->url), "%s", url);
-    f->credentials = credentials && ((kind != F_MODULE && kind != F_FONT) || web_same_origin(b->url, url));
+    f->credentials = credentials && resource_credentials(b,kind,slot,url);
     f->postlen = post ? (postlen < 0 ? (int)strlen(post) : postlen) : 0;
     if (post) {
         f->post = malloc((size_t)f->postlen + 1);
@@ -1256,6 +1280,21 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
         }
         memcpy(f->post, post, (size_t)f->postlen);
         f->post[f->postlen] = 0;
+    }
+
+    if(!strncmp(url,"blob:",5)){
+        char origin[300]="null",type[128];unsigned char *bytes=NULL;size_t len=0;
+        web_origin(b->url,origin,sizeof(origin));
+        if(!web_blob_read(b->js,origin,url,&bytes,&len,type)){
+            f->status=1<<8;snprintf(f->errmsg,sizeof(f->errmsg),"Blob URL was revoked or is not accessible");
+        } else {
+            size_t cap=len+512;f->buf=malloc(cap);
+            if(f->buf){int h=snprintf(f->buf,cap,"HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %u\r\n\r\n",*type?type:"application/octet-stream",(unsigned)len);
+                memcpy(f->buf+h,bytes,len);f->len=h+(int)len;f->buf[f->len]=0;f->cap=(int)cap;
+            }else f->status=1<<8;
+            free(bytes);
+        }
+        f->eof=f->exited=1;fetch_complete(b);return 0;
     }
 
     if (url_is_file(url)) {
@@ -1353,7 +1392,7 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
             }
         }
     }
-    if ((kind == F_MODULE || kind == F_FONT) && !web_same_origin(b->url, url) && nhdr < 14) {
+    if (resource_cors(b,kind,b->fetch->slot) && !web_same_origin(b->url, url) && nhdr < 14) {
         char origin[300] = "null";
         web_origin(b->url, origin, sizeof(origin));
         char *h = malloc(strlen(origin) + 20);
@@ -1488,7 +1527,7 @@ static int queue_resource(struct browser *b, int kind, const char *url, int slot
 {
     if (b->qhead == b->nqueue)          /* everything queued has been taken: start again */
         b->qhead = b->nqueue = 0;
-    if (b->nqueue == MAX_RES || (!url_is_http(url) && !url_is_https(url) && !url_is_file(url)))
+    if (b->nqueue == MAX_RES || (!url_is_http(url) && !url_is_https(url) && !url_is_file(url) && strncmp(url,"blob:",5)))
         return 0;
     if ((url_is_http(b->url) || url_is_https(b->url)) && url_is_file(url))
         return 0;
@@ -1821,7 +1860,7 @@ static void free_page(struct browser *b)
             n->img = NULL;
         }
     }
-    css_hover_node = css_focus_node = NULL;
+    css_hover_node = css_focus_node = css_focus_visible_node = NULL;
     b->js_hover = NULL;
     b->sel_active = b->sel_start = 0;
     if (b->win && b->win->icon_img) {   /* the old page's icon */
@@ -1866,11 +1905,35 @@ static int font_lookup(void *ctx,const char *family)
     for(int i=0;i<b->nfonts;i++)if(b->fonts[i].id>=3&&!strcasecmp(b->fonts[i].family,family))return b->fonts[i].id;
     return -1;
 }
+static int js_node_box(void *ctx,struct node *n,int *x,int *y,int *w,int *h);
+static int image_near_view(struct browser *b,struct node *n)
+{
+    int x,y,w,h;struct rect v=view_rect(b);
+    if(!b->layouts || !js_node_box(b,n,&x,&y,&w,&h))return 0;
+    return x+w>=b->scroll_x-300 && x<=b->scroll_x+v.w+300 &&
+           y+h>=b->scroll_y-300 && y<=b->scroll_y+v.h+300;
+}
+static int lazy_image(struct browser *b,struct node *n)
+{
+    const char *loading=node_attr(n,"loading");
+    return loading&&!strcasecmp(loading,"lazy")&&!image_near_view(b,n);
+}
+static void load_lazy_images(struct browser *b)
+{
+    for(int i=0;i<b->nimgs;i++)if(b->imgs[i].lazy&&!lazy_image(b,b->imgs[i].n)){
+        b->imgs[i].lazy=0;
+        queue_resource(b,F_IMG,b->imgs[i].url,0,0);
+    }
+}
+
 static void relayout(struct browser *b)
 {
     if (!b->root)
         return;
     zoom_sync(b);
+    if(b->focus&&!web_focusable(b->focus)){if(b->js)jsdom_focus(b->js,NULL);b->focus=NULL;}
+    css_focus_node=b->focus;
+    css_focus_visible_node=b->focus&&(b->keyboard_focus||is_text_field(b->focus))?b->focus:NULL;
     struct rect v = view_rect(b);
     if (b->need_style) {
         arena_free(&b->sarena);
@@ -1893,6 +1956,7 @@ static void relayout(struct browser *b)
         b->frame_vbar = 1;              /* (narrower now: laid out again when next painted) */
     clamp_scroll(b);
     sync_frames(b);
+    load_lazy_images(b);
     if (b->js)
         jsdom_layout_changed(b->js);
     if (b->find_open && !is_frame(b))
@@ -2294,14 +2358,16 @@ static void js_load_image(void *ctx, struct node *n)
     int known = 0;
     for (int i = 0; i < b->nimgs; i++)
         if (b->imgs[i].n == n) {
-            if (!strcmp(b->imgs[i].url, abs))
+            if (!strcmp(b->imgs[i].url, abs) && !b->imgs[i].lazy)
                 return;
             b->imgs[i].url = arena_strdup(&b->arena, abs);
+            b->imgs[i].lazy = lazy_image(b,n);
             known = 1;
             break;
         }
     if (!known && b->nimgs < MAX_RES) {
         b->imgs[b->nimgs].n = n;
+        b->imgs[b->nimgs].lazy=lazy_image(b,n);
         b->imgs[b->nimgs++].url = arena_strdup(&b->arena, abs);
     }
     if (c) {
@@ -2309,6 +2375,7 @@ static void js_load_image(void *ctx, struct node *n)
         jsdom_queue_event(b->js, n, c->img ? "load" : "error");
         return;
     }
+    if(lazy_image(b,n))return;
     queue_resource(b, F_IMG, abs, 0, 0);
     if (free_loader(b))
         start_next(b);
@@ -2525,10 +2592,14 @@ static void js_module_done(void *ctx, int tag)
         run_scripts(b);
 }
 
+static const char *js_clipboard_read(void *ctx) { (void)ctx; int len; return clipboard_get(&len); }
+static void js_clipboard_write(void *ctx,const char *text) { (void)ctx; clipboard_set(text); }
+static int js_has_focus(void *ctx) { return has_keys(ctx); }
+
 static void js_focus(void *ctx, struct node *n)
 {
     struct browser *b = ctx;
-    if (is_text_field(n)) {
+    if (!n || web_focusable(n)) {
         b->focus = n;
         b->addr_focus = 0;
         paint(b);
@@ -2585,6 +2656,7 @@ static void start_scripts(struct browser *b, const char *url)
         .viewport = js_viewport, .set_title = js_set_title, .load_script = js_load_script,
         .load_image = js_load_image, .node_box = js_node_box, .node_scroll = js_node_scroll,
         .reveal = js_reveal, .flush = js_flush, .focus = js_focus, .http = js_http, .http_cancel=js_http_cancel,
+        .has_focus=js_has_focus, .clipboard_read=js_clipboard_read, .clipboard_write=js_clipboard_write,
         .cookie_get = js_cookie_get, .cookie_set = js_cookie_set, .ws_cookies=js_ws_cookies, .font_register=js_font_register, .font_status=js_font_status, .fetch_module = js_fetch_module,
         .module_done = js_module_done, .set_url = js_set_url, .submit = js_submit, .node_at = js_node_at,
     };
@@ -2930,11 +3002,12 @@ static void load_document(struct browser *b, const char *text, int len, const ch
             char *abs = abs_img;
             struct cached *c = cache_find_data(b, abs);
             b->imgs[b->nimgs].n = n;
+            b->imgs[b->nimgs].lazy=lazy_image(b,n);
             b->imgs[b->nimgs].url = arena_strdup(&b->arena, abs);
             b->nimgs++;
             if (c)
                 n->img = c->img;
-            else
+            else if(!b->imgs[b->nimgs-1].lazy)
                 queue_resource(b, F_IMG, abs, 0, 0);
         }
     }
@@ -3610,6 +3683,17 @@ static void done_status(struct browser *b)
         set_status(b, "Done");
 }
 
+static int resource_integrity(struct browser *b,struct node *n,const char *url,const struct response *r,const char *headers)
+{
+    const char *metadata=node_attr(n,"integrity");
+    if(!metadata||!*metadata)return 1;
+    char origin[300]="null";web_origin(b->url,origin,sizeof(origin));
+    int cross=!web_same_origin(b->url,url) && !(url_is_file(b->url)&&url_is_file(url));
+    const char *mode=node_attr(n,"crossorigin");
+    if(cross && !web_cors_allow(origin,headers,mode&&!strcasecmp(mode,"use-credentials")))return 0;
+    return web_integrity(metadata,r->body,(size_t)r->len);
+}
+
 static void fetch_complete(struct browser *b)
 {
     struct fetch *f = b->fetch;
@@ -3774,7 +3858,7 @@ static void fetch_complete(struct browser *b)
         } else if (done.kind == F_JS) {
             if (done.slot < b->nscripts) {
                 struct script *sc = &b->scripts[done.slot];
-                if (ok && r.status < 300 && (sc->owned = malloc((size_t)r.len + 1))) {
+                if (ok && r.status < 300 && resource_integrity(b, sc->n, done.url, &r, done.buf) && (sc->owned = malloc((size_t)r.len + 1))) {
                     memcpy(sc->owned, r.body, (size_t)r.len);
                     sc->owned[r.len] = 0;
                     sc->text = sc->owned;
@@ -3787,6 +3871,7 @@ static void fetch_complete(struct browser *b)
             int good = ok && r.status < 300;
             if (done.slot >= 0 && done.slot < b->nlinks) {
                 struct node *n = b->link_nodes[done.slot];
+                good = good && resource_integrity(b,n,done.url,&r,done.buf);
                 if (good)
                     n->sheet = parse_sheet(b, r.body, r.len, done.url, n, -1, 1);
                 if (b->js)
@@ -3946,7 +4031,7 @@ static void navigate(struct browser *b, const char *url, const char *post, int m
         } else {
             page_failed(b, u, "There is no such about: page");
         }
-    } else if (!url_is_http(fu) && !url_is_https(fu) && !url_is_file(fu)) {
+    } else if (!url_is_http(fu) && !url_is_https(fu) && !url_is_file(fu) && strncmp(fu,"blob:",5)) {
         char msg[256];
         snprintf(msg, sizeof(msg), "Only http://, https:// and file:// addresses can be opened");
         page_failed(b, u, msg);
@@ -4415,6 +4500,7 @@ static void ask_control(struct browser *b, struct node *n)
 
 static void activate(struct browser *b, struct node *n)
 {
+    if (!n || web_inert(n) || web_disabled(n)) return;
     int changed = 0;
     struct node *form = form_of(n);
     const char *t = n->tag == T_INPUT ? type_of(n) : n->tag == T_BUTTON ? (node_attr(n, "type") ? node_attr(n, "type") : "submit") : "";
@@ -4498,7 +4584,7 @@ static struct node *element_at(struct browser *b, int x, int y)
                 continue;
             dx += sbx, dy += sby;
         }
-        if (d->node->style && d->node->style->pointer_none)
+        if (web_inert(d->node) || (d->node->style && d->node->style->pointer_none))
             continue;                   /* pointer-events: none */
         if (x >= d->x + dx && x < d->x + dx + d->w && y >= d->y + dy && y < d->y + dy + d->h)
             return d->node;
@@ -4542,6 +4628,7 @@ static int page_click(struct browser *b, int px, int py)
     struct node *target = b->press_ctrl ? b->press_ctrl : element_at(b, px, py);
     if (!target)
         return 0;
+    if(web_inert(target)||web_disabled(target))return 1;
     const char *t = target->tag == T_INPUT ? type_of(target) : "";
     if (target == b->press_ctrl && (!strcasecmp(t, "checkbox") || !strcasecmp(t, "radio"))) {
         activate(b, target);            /* the box changes first, handlers see it */
@@ -4620,25 +4707,13 @@ static void edit_field(struct browser *b, struct node *n, const struct input_eve
 
 static void focus_next_control(struct browser *b, int dir)
 {
-    int n = b->lo.ncontrols;
-    if (!n)
-        return;
-    int at = -1;
-    for (int i = 0; i < n; i++)
-        if (b->lo.controls[i].node == b->focus)
-            at = i;
-    int next = at < 0 ? (dir > 0 ? 0 : n - 1) : (at + dir + n) % n;
-    b->focus = b->lo.controls[next].node;
-    b->addr_focus = 0;
-    if (b->focus->value)
-        b->focus->cursor = (int)strlen(b->focus->value);
-    /* Keep it in view. */
-    struct rect v = view_rect(b);
-    const struct hotspot *h = &b->lo.controls[next];
-    layout_reveal(&b->lo, b->focus, h->x, h->y, h->w, h->h);
-    if (h->y < b->scroll_y || h->y + h->h > b->scroll_y + v.h)
-        b->scroll_y = h->y - v.h / 3;
-    clamp_scroll(b);
+    struct node *n=web_focus_next(b->root,b->focus,dir);
+    if(!n)return;
+    b->keyboard_focus=1;
+    if(b->js)jsdom_focus(b->js,n);
+    b->focus=n;b->addr_focus=0;
+    js_reveal(b,n);
+    b->need_style=1;
 }
 
 /* ---- drawing ---- */
@@ -4748,6 +4823,7 @@ static int has_keys(struct browser *b)
  * coordinates at (ox, oy) in s. */
 static void paint_page(struct browser *b, struct surface *s, int ox, int oy)
 {
+    load_lazy_images(b);
     if (b->root && b->laid_out_w != view_rect(b).w)
         relayout(b);
     struct rect v = view_rect(b);
@@ -5672,6 +5748,8 @@ static void scroll_by(struct browser *b, int dx, int dy)
     b->scroll_x += dx;
     b->scroll_y += dy;
     clamp_scroll(b);
+    load_lazy_images(b);
+    if(free_loader(b)&&b->qhead<b->nqueue)start_next(b);
 }
 
 static void press(struct browser *b, int i)
@@ -5802,6 +5880,7 @@ static void br_key(struct window *w, const struct input_event *ev)
         paint(t);
     }
     if (ev->flags & IEV_PRESSED) {
+        b->keyboard_focus=1;
         int ctrl = ev->mods & KMOD_CTRL;
         if (t->tip_node || t->tip_shown)
             tip_hide(t);
@@ -5947,6 +6026,10 @@ static void br_key(struct window *w, const struct input_event *ev)
         return;
     }
     if (f && (ev->code == KEY_SPACE || ev->code == KEY_ENTER)) {
+        if(web_inert(f)||web_disabled(f))return;
+        if(b->js && jsdom_mouse_event(b->js,f,"click",f->bx0,f->by0,0,NULL))return;
+        if(f->tag==T_A||f->tag==T_AREA){if(ev->code==KEY_ENTER)follow_link(b,f);return;}
+        if(f->tag==T_SUMMARY){toggle_details(b,f->bx0+1,f->by0+1);return;}
         activate(b, f);
         return;
     }
@@ -5987,6 +6070,8 @@ static void sync_dynamic(struct browser *b, const struct node *hov, int hover_to
         css_hover_node = hov;
         changed = 1;
     }
+    const struct node *visible=b->focus && (b->keyboard_focus || is_text_field(b->focus)) ? b->focus : NULL;
+    if(css_focus_visible_node!=visible){css_focus_visible_node=visible;changed=1;}
     if (css_focus_node != b->focus) {
         css_focus_node = b->focus;
         changed = 1;
@@ -6008,6 +6093,9 @@ static void sync_dynamic(struct browser *b, const struct node *hov, int hover_to
  * it entered (and the pointer* events), and mousemove now and then. */
 static void js_pointer_moved(struct browser *b, struct node *under, int px, int py)
 {
+    struct node *captured=jsdom_pointer_capture(b->js);
+    if(captured)under=captured;
+    if(under&&web_inert(under))under=NULL;
     struct node *old = b->js_hover;
     if (under == old) {
         if (under && now_ms() - b->js_moved >= 40) {
@@ -6428,12 +6516,13 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
         }
         if (rect_contains(v, x, y) && b->root) {
             struct browser *t = top_of(b);
+            b->keyboard_focus=0;
             b->hold = H_PAGE;
             t->key_frame = is_frame(b) ? b : NULL;     /* the keys go where the click was */
             int was_addr = t->addr_focus;
             t->addr_focus = 0;
             const struct hotspot *h = layout_hit(&b->lo, b->lo.controls, b->lo.ncontrols, px, py, b->scroll_x, b->scroll_y);
-            b->press_ctrl = h ? h->node : NULL;
+            b->press_ctrl = h && !web_inert(h->node) && !web_disabled(h->node) ? h->node : NULL;
             if (b->press_ctrl && b->press_ctrl->tag == T_INPUT && !strcasecmp(type_of(b->press_ctrl), "range") &&
                 !node_attr(b->press_ctrl, "disabled")) {
                 b->drag_range = b->press_ctrl;      /* a press sets the value, and a drag goes on setting it */
@@ -6441,7 +6530,7 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
                 range_drag_to(b, b->drag_range, x);
             }
             h = layout_hit(&b->lo, b->lo.links, b->lo.nlinks, px, py, b->scroll_x, b->scroll_y);
-            b->press_link = h && !b->press_ctrl ? h->node : NULL;
+            b->press_link = h && !b->press_ctrl && !web_inert(h->node) ? h->node : NULL;
             b->sel_start = !b->press_ctrl && !b->press_link;
             b->sel_ax = b->sel_fx = px;
             b->sel_ay = b->sel_fy = py;
@@ -6460,8 +6549,14 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             struct node *under = b->js ? element_at(b, px, py) : NULL;
             if (under)
                 jsdom_mouse_event(b->js, under, "pointerdown", px, py, 0, NULL);
-            if (under && b->js && b->root && !b->js_nav[0])
-                jsdom_mouse_event(b->js, under, "mousedown", px, py, 0, NULL);
+            if (under && b->js && b->root && !b->js_nav[0]) {
+                int prevented=jsdom_mouse_event(b->js,under,"mousedown",px,py,0,NULL);
+                if(!prevented){
+                    struct node *focus=under;
+                    while(focus&&!web_focusable(focus))focus=focus->parent?focus->parent:focus->shadow_host;
+                    jsdom_focus(b->js,focus);
+                }
+            }
         }
         return;
     }
@@ -6480,6 +6575,7 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             paint(b);
         } else if (hold == H_PAGE && b->drag_range) {
             struct node *r = b->drag_range;
+            if(b->js)jsdom_mouse_event(b->js,r,"pointerup",px,py,0,NULL);
             b->drag_range = NULL;
             if (b->js && b->root)
                 jsdom_dispatch(b->js, r, "change");
@@ -6487,7 +6583,7 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
         } else if (hold == H_PAGE) {
             b->sel_start = 0;
             struct node *under = b->js && b->root ? element_at(b, px, py) : NULL;
-            if (under)
+            if (b->js && (under || jsdom_pointer_capture(b->js)))
                 jsdom_mouse_event(b->js, under, "pointerup", px, py, 0, NULL);
             if (under && b->js && b->root && !b->js_nav[0])
                 jsdom_mouse_event(b->js, under, "mouseup", px, py, 0, NULL);

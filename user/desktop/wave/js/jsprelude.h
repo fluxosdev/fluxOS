@@ -874,7 +874,7 @@ static const char js_chunk_url[] = JS_SOURCE(
     get port() { return this._u.port; }
     set port(v) { this._u.port = String(v) === DEFAULT_PORTS[this._u.protocol] ? "" : String(v); }
     get host() { return this._u.hostname + (this._u.port ? ":" + this._u.port : ""); }
-    get origin() { return this._u.opaque ? "null" : this._u.protocol + "//" + this.host; }
+    get origin() { if(this.protocol==="blob:"){try{return new URL(this.pathname).origin;}catch(e){return "null";}} return this._u.opaque ? "null" : this._u.protocol + "//" + this.host; }
     get pathname() { return this._u.pathname; }
     set pathname(v) { v = String(v); this._u.pathname = v[0] === "/" ? v : "/" + v; }
     get search() { return this._u.search; }
@@ -958,7 +958,10 @@ static const char js_chunk_web[] = JS_SOURCE(
       var hex = Array.from(bytes).map(function (b) { return (b < 16 ? "0" : "") + b.toString(16); }).join("");
       return hex.slice(0,8) + "-" + hex.slice(8,12) + "-" + hex.slice(12,16) + "-" + hex.slice(16,20) + "-" + hex.slice(20);
     },
-    subtle: {}
+    subtle: { digest: function (algorithm, data) {
+      try { return Promise.resolve(g["%digest"](typeof algorithm === "string" ? algorithm : algorithm.name, data)); }
+      catch(e) { if(String(e).indexOf("NotSupportedError")>=0)e.name="NotSupportedError"; return Promise.reject(e); }
+    } }
   };
   /* ---- Blob, FormData ---- */
   class Blob {

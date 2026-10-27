@@ -1,5 +1,6 @@
 /* ArrayBuffer, typed array views and DataView. Buffers own bytes; views share them. */
 #include <math.h>
+#include <flux/digest.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdint.h>
@@ -429,8 +430,22 @@ ACCESS(Int16, 3) ACCESS(Uint16, 4) ACCESS(Int32, 5) ACCESS(Uint32, 6) ACCESS(Flo
     ACCESS(Float64, 8) static jsval random_fill(struct js *, jsval, jsval *, int);
 static jsval encode_utf8(struct js *, jsval, jsval *, int);
 static jsval decode_utf8(struct js *, jsval, jsval *, int);
+static jsval digest_bytes(struct js *J, jsval self, jsval *args, int argc)
+{
+    int len = 0;
+    unsigned char *p = js_binary_bytes(ARG(1), &len), hash[64];
+    if (!p) return js_throw_error(J, "TypeError: digest requires a BufferSource");
+    struct jsstr *name = js_tostr(J, ARG(0));
+    int n = flux_digest(name->s, p, (size_t)len, hash);
+    if (!n) return js_throw_error(J, "NotSupportedError: unsupported digest algorithm");
+    jsval b = new_buffer(J, n);
+    if (b.t != JS_OBJ) return js_undefined;
+    memcpy(buffer_of(b)->data, hash, (size_t)n);
+    return b;
+}
 void js_init_binary(struct js *J)
 {
+    js_define_native(J, J->global, "%digest", digest_bytes, 2);
     js_define_native(J, J->global, "%randomFill", random_fill, 1);
     js_define_native(J, J->global, "%encodeUTF8", encode_utf8, 1);
     js_define_native(J, J->global, "%decodeUTF8", decode_utf8, 1);

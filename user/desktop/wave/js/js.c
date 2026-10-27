@@ -1762,7 +1762,7 @@ enum {
     N_NUM, N_STR, N_TEMPLATE, N_REGEX, N_IDENT, N_THIS, N_TRUE, N_FALSE, N_NULL, N_ARRAY, N_OBJECT,
     N_PROP, N_GETTER, N_SETTER, N_SPREAD, N_HOLE, N_FUNC, N_CALL, N_NEW, N_MEMBER, N_INDEX,
     N_UNARY, N_PREINC, N_POSTINC, N_BINARY, N_AND, N_OR, N_NULLISH, N_ASSIGN, N_COND, N_SEQ,
-    N_DESTRUCT, N_CLASS, N_FIELD, N_SUPER, N_AWAIT, N_YIELD, N_IMPORT, N_IMPORT_META,
+    N_DESTRUCT, N_CLASS, N_FIELD, N_SUPER, N_NEWTARGET, N_AWAIT, N_YIELD, N_IMPORT, N_IMPORT_META,
     /* statements */
     S_VAR, S_EXPR, S_BLOCK, S_IF, S_FOR, S_FORIN, S_FOROF, S_WHILE, S_DOWHILE, S_RETURN,
     S_BREAK, S_CONTINUE, S_THROW, S_TRY, S_SWITCH, S_CASE, S_FUNCDECL, S_EMPTY, S_LABEL,
@@ -2576,8 +2576,9 @@ static struct ast *call_member(struct parser *P)
     struct ast *e;
     if (accept(P, "new")) {
         if (accept(P, ".")) {               /* new.target */
-            P->pos++;
-            return mk(P, N_NULL);
+            if(!expect(P, "target"))return NULL;
+            e = mk(P, N_NEWTARGET);
+            goto suffix;
         }
         struct ast *callee = NULL;
         if (at(P, "new"))
@@ -2606,6 +2607,7 @@ static struct ast *call_member(struct parser *P)
     } else {
         e = primary(P);
     }
+suffix:
     while (e) {
         if (accept(P, ".")) {
             e = member_name(P, e, 0);
@@ -3627,6 +3629,7 @@ struct env {
     struct binding *vars;
     struct jsobj *obj;                  /* the global object, for the global scope */
     jsval self;
+    jsval new_target;
     uint8_t has_self;
     int nslots;
     jsval slots[];
@@ -3811,7 +3814,16 @@ static jsval call_user(struct js *J, struct jsobj *f, jsval self, jsval *args, i
     return run_user(J, f, self, args, argc);
 }
 
+static jsval call_value_impl(struct js *J, jsval fv, jsval self, jsval *args, int argc);
 jsval js_call_value(struct js *J, jsval fv, jsval self, jsval *args, int argc)
+{
+    struct jsobj *saved = J->new_target;
+    J->new_target = NULL;
+    jsval r = call_value_impl(J, fv, self, args, argc);
+    J->new_target = saved;
+    return r;
+}
+static jsval call_value_impl(struct js *J, jsval fv, jsval self, jsval *args, int argc)
 {
     if (!js_is_callable(fv))
         return js_throw_error(J, "TypeError: %s is not a function",
@@ -3833,7 +3845,16 @@ jsval js_call_value(struct js *J, jsval fv, jsval self, jsval *args, int argc)
     return call_user(J, f, self, args, argc);
 }
 
+static jsval construct_impl(struct js *J, jsval fv, jsval *args, int argc);
 jsval js_construct(struct js *J, jsval fv, jsval *args, int argc)
+{
+    struct jsobj *saved = J->new_target;
+    J->new_target = fv.t == JS_OBJ ? fv.u.o : NULL;
+    jsval r = construct_impl(J, fv, args, argc);
+    J->new_target = saved;
+    return r;
+}
+static jsval construct_impl(struct js *J, jsval fv, jsval *args, int argc)
 {
     if (!js_is_callable(fv) || fv.u.o->arrow)
         return js_throw_error(J, "TypeError: not a constructor");

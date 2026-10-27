@@ -103,6 +103,7 @@ struct js {
     int throwing;
     jsval exc;
     jsval completion;                   /* the last expression statement's value (eval) */
+    struct jsobj *new_target;            /* constructor currently entering a user frame */
     int constructing;                   /* a native called with new */
     unsigned steps, step_limit;
     size_t heap_limit;

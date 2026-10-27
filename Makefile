@@ -102,10 +102,11 @@ FONT_SRCS := $(FREETYPE_SRCS) $(BROTLI_SRCS)
 FONT_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(FONT_SRCS)))
 LIBFONT := $(BUILD)/libfont.a
 $(FONT_OBJS) $(BUILD)/u/user/desktop/wave/webfont.o: USER_CFLAGS += $(FONT_FLAGS)
+$(BUILD)/u/user/libc/brdecode.o: USER_CFLAGS += -I$(BROTLI_DIR)/c/include
 $(LIBFONT): $(FONT_OBJS)
 	$(AR) rcs $@ $^
 
-LIBC_SRCS := $(wildcard user/libc/*.c) $(MBEDTLS_SRCS) lib/string.c lib/vsnprintf.c lib/font8x16.c lib/sha256.c lib/logo.c
+LIBC_SRCS := $(wildcard user/libc/*.c) $(BROTLI_SRCS) $(MBEDTLS_SRCS) lib/string.c lib/vsnprintf.c lib/font8x16.c lib/sha256.c lib/digest.c lib/logo.c
 LIBC_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(LIBC_SRCS)))
 CRT0      := $(BUILD)/u/user/libc/crt0.o
 LIBC      := $(BUILD)/libc.a
@@ -312,9 +313,9 @@ clean:
 
 # Run the browser's actual HTML/DOM/JS code on the host, without booting QEMU.
 HOSTCC ?= cc
-BROWSER_TEST_SRCS := tests/browser-dom.c tests/canvas-font-stub.c tests/js-host-stack.c \
+BROWSER_TEST_SRCS := lib/digest.c lib/sha256.c tests/browser-dom.c tests/canvas-font-stub.c tests/js-host-stack.c \
 	$(addprefix user/desktop/wave/js/,js.c jslib.c jslib2.c jsbinary.c jsnet.c jsre.c jsgc.c jsdom.c jscanvas.c) \
-	$(addprefix user/desktop/wave/,canvas.c html.c shadow.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c)
+	$(addprefix user/desktop/wave/,canvas.c html.c shadow.c webblob.c webintegrity.c webinput.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c)
 .PHONY: test-browser
 test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout $(BUILD)/tests/browser-policy $(BUILD)/tests/browser-http
 	$< rootfs/usr/share/www/classlist-tests.js 20
@@ -425,7 +426,7 @@ $(BUILD)/tests/browser-ws: tests/browser-ws.c $(BROWSER_TEST_SRCS) $(DESKTOP_HDR
 		-lm -o $@
 
 # Engine-level tests include real collections on the host's main and coroutine stacks.
-JS_ENGINE_SRCS := tests/js-engine.c tests/js-host-stack.c \
+JS_ENGINE_SRCS := lib/digest.c lib/sha256.c tests/js-engine.c tests/js-host-stack.c \
 	$(addprefix user/desktop/wave/js/,js.c jslib.c jslib2.c jsbinary.c jsre.c jsgc.c) \
 	user/desktop/wave/webutil.c
 $(BUILD)/tests/js-engine: $(JS_ENGINE_SRCS) $(DESKTOP_HDRS) include/flux/abi.h

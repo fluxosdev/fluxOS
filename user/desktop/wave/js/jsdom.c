@@ -34,6 +34,7 @@
 #include "jsint.h"
 #include "jsdom.h"
 #include "webpolicy.h"
+#include "webblob.h"
 #include "jsnet.h"
 #include "jscanvas.h"
 #include "jsdomlib.h"
@@ -93,6 +94,9 @@ struct jsdom {
     struct jsobj *ev_protos[32];        /* Event, MouseEvent...: by EV_* */
     struct jsobj *node_proto, *text_proto, *frag_proto;     /* Node, Text, DocumentFragment */
     struct jsobj *tag_protos[T_COUNT];  /* HTMLInputElement and the rest, by tag (NULL: HTMLElement) */
+    unsigned int activation;
+    int activated, pointer_down, pointer_buttons;
+    struct node *capture, *pending_capture;
     struct node *active;                /* document.activeElement, when a script focused one */
     int custom_on;                      /* customElements.define was called: tell it of custom elements */
     int dom_lib;                        /* jsdomlib.h's js_dom_lib has been run */
@@ -140,12 +144,14 @@ static void report(struct jsdom *d, const char *what)
 }
 
 /* Leaving the engine: a changed tree is laid out again. */
+static int is_connected(struct jsdom *d,const struct node *n);
 static void settle(struct jsdom *d)
 {
+    if(d->depth==0 && d->active && (!is_connected(d,d->active)||!web_focusable(d->active)))jsdom_focus(d,NULL);
     if (d->depth == 0 && d->dirty) {
         d->dirty = 0;
         d->repaint = 0;
-        d->h.changed(d->h.ctx);
+        if(d->h.changed)d->h.changed(d->h.ctx);
     } else if (d->depth == 0 && d->repaint) {
         d->repaint = 0;
         if (d->h.repaint)
@@ -990,6 +996,8 @@ static void gc_mark(struct js *J, void *ctx)
         d->gcpass = 1;
     if (d->h.root)
         mark_tree(d, d->h.root);
+    if(d->capture&&d->capture->js)js_gc_mark(J,d->capture->js);
+    if(d->pending_capture&&d->pending_capture->js)js_gc_mark(J,d->pending_capture->js);
 }
 
 static int gc_more(struct js *J, void *ctx)
@@ -1135,7 +1143,7 @@ static const char *const reflected[] = {
 
 static const char *const boolean_attrs[] = {
     "disabled", "readonly", "required", "hidden", "multiple", "autofocus", "async", "defer",
-    "open", "novalidate", "selected", NULL,
+    "open", "novalidate", "selected", "inert", NULL,
 };
 
 static int in_list(const char *const *list, const char *key, char *attr, int size)
@@ -1506,6 +1514,7 @@ static int node_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
         *out = js_num(IS("width") ? w : h);
         return 1;
     }
+    if (IS("tabIndex")) { *out = js_num(web_tabindex(n)); return 1; }
     if (in_list(reflected, key, attr, sizeof(attr))) {
         const char *v = node_attr(n, attr);
         *out = js_str(J, v ? v : "");
@@ -1640,9 +1649,15 @@ static int node_set(struct js *J, struct jsobj *o, const char *key, jsval v)
         set_attr(d, n, key, num);
         return 1;
     }
+    if (IS("tabIndex")) {
+        char text[24]; double number = js_to_number(J, v);
+        int index = number != number ? 0 : number < -32768 ? -32768 : number > 32767 ? 32767 : (int)number;
+        snprintf(text, sizeof(text), "%d", index);
+        set_attr(d, n, "tabindex", text); return 1;
+    }
     if (in_list(reflected, key, attr, sizeof(attr))) {
         set_attr(d, n, attr, js_tostr(J, v)->s);
-        if ((IS("srcset") || IS("sizes")) && n->tag == T_IMG && d->h.load_image)
+        if ((IS("srcset") || IS("sizes") || IS("loading")) && n->tag == T_IMG && d->h.load_image)
             d->h.load_image(d->h.ctx, n);
         return 1;
     }
@@ -1839,6 +1854,15 @@ static int computed_get(struct js *J, struct jsobj *o, const char *key, jsval *o
             snprintf(b, sizeof(b), "rgba(%u, %u, %u, 0)", (c >> 16) & 255, (c >> 8) & 255, c & 255);
         *out = js_str(J, b);
         return 1;
+    }
+    if(!strcmp(key,"textDecorationThickness")||!strcmp(key,"text-decoration-thickness")||
+       !strcmp(key,"textUnderlineOffset")||!strcmp(key,"text-underline-offset")){
+        int thickness=strstr(key,"Thickness")||strstr(key,"thickness");
+        struct len length=st?(thickness?st->deco_thickness:st->underline_offset):(struct len){.unit=U_AUTO};
+        if(length.unit==U_AUTO)strcpy(b,"auto");
+        else if(length.unit==U_PCT)snprintf(b,sizeof(b),"%g%%",length.v/100.0);
+        else snprintf(b,sizeof(b),"%dpx",length.v);
+        *out=js_str(J,b);return 1;
     }
     if (!strcmp(key, "fontSize")) {
         snprintf(b, sizeof(b), "%dpx", st ? st->font_size : 16);
@@ -2633,14 +2657,8 @@ static jsval doc_element_from_point(struct js *J, jsval self, jsval *args, int a
 
 static jsval el_blur(struct js *J, jsval self, jsval *args, int argc)
 {
-    (void)args, (void)argc;
-    struct jsdom *d = dom(J);
-    struct node *n = node_of(self);
-    if (n && d->active == n) {
-        d->active = NULL;
-        jsdom_dispatch(d, n, "blur");
-        jsdom_dispatch(d, n, "focusout");
-    }
+    struct jsdom *d=dom(J);
+    if(node_of(self)==d->active)jsdom_focus(d,NULL);
     return js_undefined;
 }
 
@@ -2849,24 +2867,18 @@ static jsval el_insert_adjacent_element(struct js *J, jsval self, jsval *args, i
     return ARG(1);
 }
 
-static jsval el_focus(struct js *J, jsval self, jsval *args, int argc)
+void jsdom_focus(struct jsdom *d, struct node *n)
 {
-    (void)args;
-    (void)argc;
-    struct jsdom *d = dom(J);
-    struct node *n = this_node(J, self);
-    if (!n || n->type != N_ELEMENT || d->active == n)
-        return js_undefined;
+    if (!d || (n && (!is_connected(d,n) || !web_focusable(n))) || d->active == n) return;
     struct node *old = d->active;
     d->active = n;
-    if (old) {
-        jsdom_dispatch(d, old, "blur");
-        jsdom_dispatch(d, old, "focusout");
-    }
-    if (d->h.focus)
-        d->h.focus(d->h.ctx, n);
-    jsdom_dispatch(d, n, "focus");
-    jsdom_dispatch(d, n, "focusin");
+    if (old) { jsdom_dispatch(d,old,"blur"); jsdom_dispatch(d,old,"focusout"); }
+    if (d->h.focus) d->h.focus(d->h.ctx,n);
+    if (n) { jsdom_dispatch(d,n,"focus"); jsdom_dispatch(d,n,"focusin"); }
+}
+static jsval el_focus(struct js *J, jsval self, jsval *args, int argc)
+{
+    jsdom_focus(dom(J), this_node(J,self));
     return js_undefined;
 }
 
@@ -2898,7 +2910,7 @@ static jsval el_click(struct js *J, jsval self, jsval *args, int argc)
     (void)args;
     (void)argc;
     struct node *n = this_node(J, self);
-    if (n)
+    if (n && !web_inert(n) && !web_disabled(n))
         jsdom_dispatch(dom(J), n, "click");
     return js_undefined;
 }
@@ -3126,6 +3138,7 @@ static int event_kind(const char *type)
         { "auxclick", EV_POINTER }, { "pointerdown", EV_POINTER }, { "pointerup", EV_POINTER },
         { "pointermove", EV_POINTER }, { "pointerover", EV_POINTER }, { "pointerout", EV_POINTER },
         { "pointerenter", EV_POINTER }, { "pointerleave", EV_POINTER }, { "pointercancel", EV_POINTER },
+        { "gotpointercapture", EV_POINTER }, { "lostpointercapture", EV_POINTER },
         { "wheel", EV_WHEEL }, { "keydown", EV_KEYBOARD }, { "keyup", EV_KEYBOARD },
         { "keypress", EV_KEYBOARD }, { "focus", EV_FOCUS }, { "blur", EV_FOCUS }, { "focusin", EV_FOCUS },
         { "focusout", EV_FOCUS }, { "input", EV_INPUT }, { "beforeinput", EV_INPUT },
@@ -3320,11 +3333,19 @@ int jsdom_dispatch(struct jsdom *d, struct node *target, const char *type)
     return dispatch_event(d, target, type, ev, bubbles);
 }
 
+static void update_pointer_capture(struct jsdom *d);
+
 int jsdom_mouse_event(struct jsdom *d, struct node *target, const char *type, int x, int y, int button,
                       struct node *related)
 {
-    if (!d || !target)
-        return 0;
+    if (!d) return 0;
+    int pointer=!strncmp(type,"pointer",7);
+    if(!strcmp(type,"pointerdown")){d->pointer_down=1;d->pointer_buttons=button>=0?1<<button:0;}
+    if(!strcmp(type,"pointerup")||!strcmp(type,"pointercancel"))d->pointer_buttons=0;
+    if(pointer)update_pointer_capture(d);
+    if(d->capture && (pointer || !strcmp(type,"mousemove") || !strcmp(type,"mouseup")))target=d->capture;
+    if (!target || web_inert(target)) return 0;
+    if(!strcmp(type,"pointerdown") || !strcmp(type,"mousedown")) {d->activated=1;d->activation=uptime_ms();}
     struct js *J = d->J;
     int sx = 0, sy = 0;
     if (d->h.scroll_pos)
@@ -3353,11 +3374,15 @@ int jsdom_mouse_event(struct jsdom *d, struct node *target, const char *type, in
     js_set(J, ev, "which", js_num(button + 1));
     int down = !strcmp(type, "mousedown") || !strcmp(type, "pointerdown") || !strcmp(type, "mousemove") ||
                !strcmp(type, "pointermove");
-    js_set(J, ev, "buttons", js_num(down && button >= 0 ? 1 << button : 0));
+    js_set(J, ev, "buttons", js_num(pointer ? d->pointer_buttons : down && button >= 0 ? 1 << button : 0));
     js_set(J, ev, "detail", js_num(!strcmp(type, "click") ? 1 : 0));
     if (related)
         js_set(J, ev, "relatedTarget", wrap(d, related));
-    return dispatch_event(d, target, type, ev, bubbles);
+    int prevented=dispatch_event(d, target, type, ev, bubbles);
+    if(!strcmp(type,"pointerup")||!strcmp(type,"pointercancel")){
+        d->pointer_down=0;d->pointer_buttons=0;d->pending_capture=NULL;update_pointer_capture(d);
+    }
+    return prevented;
 }
 
 int jsdom_key_event(struct jsdom *d, struct node *target, const char *type, int keycode, const char *key)
@@ -3365,6 +3390,8 @@ int jsdom_key_event(struct jsdom *d, struct node *target, const char *type, int 
     if (!d)
         return 0;
     struct js *J = d->J;
+    if(!strcmp(type,"keydown")){d->activated=1;d->activation=uptime_ms();}
+    if(target && web_inert(target))target=NULL;
     struct node *t = target ? target : node_find(d->h.root, T_BODY);
     if (!t)
         t = d->h.root;
@@ -3503,7 +3530,7 @@ static int document_get(struct js *J, struct jsobj *o, const char *key, jsval *o
     if (IS("hidden")) { *out = js_bool(d->hidden); return 1; }
     if (IS("defaultView")) { *out = js_obj(d->window); return 1; }
     if (IS("activeElement")) {
-        *out = wrap(d, d->active && contains(root, d->active) ? d->active : node_find(root, T_BODY));
+        *out = wrap(d, d->active && is_connected(d,d->active) && web_focusable(d->active) ? d->active : node_find(root, T_BODY));
         return 1;
     }
     if (IS("scrollingElement")) { *out = wrap(d, root); return 1; }
@@ -4885,6 +4912,17 @@ static void xhr_issue(struct jsdom *d, int id, jsval x, int preflight)
 {
     struct xhr_request *r = &d->requests[id];
     const char *url = r->url->s, *method = r->method->s, *headers = r->headers->s;
+    if(!strncmp(url,"blob:",5)){
+        char origin[300]="null",type[128];unsigned char *bytes=NULL;size_t len=0;
+        web_origin(d->h.url,origin,sizeof(origin));
+        if((strcmp(method,"GET")&&strcmp(method,"HEAD")) || !web_blob_read(d,origin,url,&bytes,&len,type)){
+            xhr_failure(d,id,x);return;
+        }
+        char head[300];int n=snprintf(head,sizeof(head),"Content-Type: %s\r\nContent-Length: %u\r\n",*type?type:"application/octet-stream",(unsigned)len);
+        r->cross=0;r->preflight=0;r->received=0;
+        jsdom_http_done(d,id,200,head,n,bytes,!strcmp(method,"HEAD")?0:(int)len);
+        free(bytes);return;
+    }
     char origin[300] = "null", target[300];
     web_origin(d->h.url, origin, sizeof(origin));
     int cross = !web_same_origin(d->h.url, url);
@@ -4953,7 +4991,7 @@ static jsval xhr_send(struct js *J, jsval self, jsval *args, int argc)
         if (!d->xhr[i] && id < 0)
             id = i;
     }
-    if (id < 0 || !d->h.http) {
+    if (id < 0 || (!d->h.http && strncmp(source->url->s,"blob:",5))) {
         xhr_failure(d, -1, self);
         return js_undefined;
     }
@@ -5279,6 +5317,60 @@ static void network_event(void *ctx,jsval target,const char *type,jsval data,int
     if(!strcmp(type,"error"))js_set(J,ev,"message",js_str(J,reason));
     if(!strcmp(type,"close")){js_set(J,ev,"code",js_num(code));js_set(J,ev,"reason",js_str(J,reason));js_set(J,ev,"wasClean",js_bool(clean));}
     fire_on(d,target,NULL,type,ev);d->depth--;settle(d);
+}
+
+static jsval blob_url_api(struct js *J,jsval self,jsval *args,int argc)
+{
+    struct jsdom *d=dom(J);
+    if(argc<2){web_blob_revoke(d,js_tostr(J,ARG(0))->s);return js_undefined;}
+    int len=0;unsigned char *p=js_binary_bytes(ARG(0),&len);
+    if(!p)return js_throw_error(J,"TypeError: createObjectURL requires a Blob");
+    struct jsstr *type=js_tostr(J,ARG(1));char origin[300]="null";
+    web_origin(d->h.url,origin,sizeof(origin));
+    const char *url=web_blob_create(d,origin,p,(size_t)len,type->s);
+    return url?js_str(J,url):js_throw_error(J,"QuotaExceededError: cannot retain Blob URL");
+}
+
+static jsval clipboard_text(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct jsdom *d=dom(J);
+    char origin[300];
+    int secure=url_is_https(d->h.url) || !strncmp(d->h.url,"file:",5);
+    if(web_origin(d->h.url,origin,sizeof(origin)))
+        secure |= !strncmp(origin,"https://",8) || !strcmp(origin,"http://localhost") || !strncmp(origin,"http://localhost:",17) ||
+                  !strcmp(origin,"http://127.0.0.1") || !strncmp(origin,"http://127.0.0.1:",17);
+    if(!secure || d->hidden || (d->h.has_focus&&!d->h.has_focus(d->h.ctx)) || !d->activated || (unsigned)(uptime_ms()-d->activation)>5000 ||
+       (argc ? !d->h.clipboard_write : !d->h.clipboard_read))
+        return js_throw_error(J,"NotAllowedError: clipboard requires a recent user gesture in a secure page");
+    if(argc) { struct jsstr *text=js_tostr(J,args[0]); if(!js_throwing(J))d->h.clipboard_write(d->h.ctx,text->s);return js_undefined; }
+    const char *text=d->h.clipboard_read(d->h.ctx);
+    return js_str(J,text?text:"");
+}
+static jsval pointer_capture_api(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct jsdom *d=dom(J);struct node *n=this_node(J,self);
+    double id=js_to_number(J,ARG(0));int mode=(int)js_to_number(J,ARG(1));
+    if(mode==2)return js_bool(id==1&&d->pending_capture==n);
+    if(id!=1)return js_throw_error(J,"NotFoundError: unknown pointer");
+    if(mode==1) {
+        if(!is_connected(d,n))return js_throw_error(J,"InvalidStateError: disconnected capture target");
+        if(d->pointer_down && !web_inert(n))d->pending_capture=n;
+    } else if(d->pending_capture==n)d->pending_capture=NULL;
+    return js_undefined;
+}
+struct node *jsdom_pointer_capture(struct jsdom *d)
+{
+    if(!d)return NULL;
+    if(d->pending_capture && (!is_connected(d,d->pending_capture)||web_inert(d->pending_capture)))d->pending_capture=NULL;
+    return d->pending_capture;
+}
+static void update_pointer_capture(struct jsdom *d)
+{
+    struct node *next=jsdom_pointer_capture(d),*old=d->capture;
+    if(next==old)return;
+    d->capture=next;
+    if(old)jsdom_dispatch(d,old,"lostpointercapture");
+    if(next)jsdom_dispatch(d,next,"gotpointercapture");
 }
 
 struct jsdom *jsdom_new(const struct jshost *host)
@@ -5731,6 +5823,9 @@ struct jsdom *jsdom_new(const struct jshost *host)
     };
     for (unsigned i = 0; i < sizeof(lazy) / sizeof(lazy[0]); i++)
         accessor(J, lazy_on[lazy[i].where], lazy[i].name, lazy[i].get, lazy[i].set);
+    fn(J,w,"%blobURL",blob_url_api,2);
+    fn(J,w,"%clipboard",clipboard_text,1);
+    fn(J,w,"%pointerCapture",pointer_capture_api,2);
     if (js_eval(J, js_dom_eager, (int)sizeof(js_dom_eager) - 1, "DOM library") < 0)
         fprintf(stderr, "DOM library: %s\n", js_error(J));
     char origin[300]="null";web_origin(d->h.url,origin,sizeof(origin));
@@ -5742,6 +5837,7 @@ void jsdom_free(struct jsdom *d)
 {
     if (!d)
         return;
+    web_blob_free(d);
     jsnet_free(d->network);
     jscanvas_free(d->J);
     js_free(d->J);

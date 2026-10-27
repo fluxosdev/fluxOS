@@ -31,6 +31,9 @@ struct jshost {
     /* The element's border box in page coordinates; 0 if it has none. */
     int (*node_box)(void *ctx, struct node *n, int *x, int *y, int *w, int *h);
     void (*focus)(void *ctx, struct node *n);
+    int (*has_focus)(void *ctx);
+    const char *(*clipboard_read)(void *ctx);
+    void (*clipboard_write)(void *ctx, const char *text);
     /* document.cookie, through the browser's jar; they return 0 for pages that have none (file:). */
     int (*cookie_get)(void *ctx, char *out, int size);
     int (*cookie_set)(void *ctx, const char *value);
@@ -65,6 +68,8 @@ struct jsdom;
 
 struct jsdom *jsdom_new(const struct jshost *host);
 void jsdom_free(struct jsdom *d);
+void jsdom_focus(struct jsdom *d, struct node *n);
+struct node *jsdom_pointer_capture(struct jsdom *d);
 /* Run a script element's code (inline text, or what was fetched for its src). */
 void jsdom_run_script(struct jsdom *d, struct node *script, const char *text, int len, const char *where);
 /* Run a module script: inline (url is the document's) or fetched from url.

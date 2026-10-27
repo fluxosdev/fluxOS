@@ -56,6 +56,7 @@ enum prop {
     P_BACKGROUND_POSITION_Y, P_BACKGROUND_REPEAT, P_BACKGROUND_ORIGIN, P_OBJECT_FIT,
     P_OBJECT_POSITION, P_OVERFLOW_X, P_OVERFLOW_Y, P_TAB_SIZE, P_TEXT_ALIGN_LAST, P_LINE_CLAMP,
     P_LIST_STYLE_IMAGE, P_COUNTER_RESET, P_COUNTER_INCREMENT,
+    P_DECO_THICKNESS, P_UNDERLINE_OFFSET,
 };
 
 static const struct { const char *name; uint8_t prop; } prop_names[] = {
@@ -165,10 +166,10 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "text-decoration-color", P_TEXT_DECORATION_COLOR },
     { "text-decoration-line", P_TEXT_DECORATION_LINE },
     { "text-decoration-style", P_TEXT_DECORATION_STYLE },
-    { "text-decoration-thickness", P_IGNORED }, { "text-indent", P_TEXT_INDENT },
+    { "text-decoration-thickness", P_DECO_THICKNESS }, { "text-indent", P_TEXT_INDENT },
     { "text-overflow", P_TEXT_OVERFLOW }, { "text-rendering", P_IGNORED },
     { "text-shadow", P_TEXT_SHADOW }, { "text-transform", P_TEXT_TRANSFORM },
-    { "text-underline-offset", P_IGNORED }, { "top", P_TOP }, { "transform", P_TRANSFORM },
+    { "text-underline-offset", P_UNDERLINE_OFFSET }, { "top", P_TOP }, { "transform", P_TRANSFORM },
     { "user-select", P_USER_SELECT }, { "vertical-align", P_VERTICAL_ALIGN },
     { "visibility", P_VISIBILITY }, { "white-space", P_WHITE_SPACE }, { "width", P_WIDTH },
     { "will-change", P_IGNORED }, { "word-break", P_WORD_BREAK },
@@ -213,6 +214,7 @@ struct compound {
     struct attr_sel *attrs;
     int nattrs;
     uint32_t pseudo;
+    uint8_t focus_visible;
     const char *lang;           /* :lang(xx) */
     int nth_a, nth_b, has_nth, nth_of_type, nth_last;
     struct selector *nth_list;   /* siblings matching the optional nth-child "of" filter */
@@ -628,7 +630,11 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
             } else if (!strcmp(name, "user-invalid")) {
                 c->pseudo |= PS_USER_INVALID;
                 css_dynamic_rules++;
-            } else if (!strcmp(name, "focus") || !strcmp(name, "focus-visible")) {
+            } else if (!strcmp(name, "focus-visible")) {
+                c->focus_visible = 1;
+                c->pseudo |= PS_FOCUS;
+                css_dynamic_rules = 1;
+            } else if (!strcmp(name, "focus")) {
                 c->pseudo |= PS_FOCUS;
                 css_dynamic_rules++;
             } else if (!strcmp(name, "focus-within")) {
@@ -1579,7 +1585,7 @@ struct sheet *css_parse(struct arena *a, const char *text, int len, int viewport
 
 /* ---- matching ---- */
 
-const struct node *css_hover_node, *css_focus_node, *css_active_node;
+const struct node *css_hover_node, *css_focus_node, *css_active_node, *css_focus_visible_node;
 int css_dynamic_rules;
 
 struct mctx {
@@ -1954,6 +1960,8 @@ static int match_compound(const struct compound *c, const struct node *n, const 
         }
         if ((ps & PS_USER_INVALID) && (!match_valid(n, 0) || !((n->value && *n->value) || n == css_focus_node)))
             return 0;                   /* invalid, and the user has typed in it */
+        if (c->focus_visible && n != css_focus_visible_node)
+            return 0;
         if ((ps & PS_FOCUS) && n != css_focus_node)
             return 0;
         if (ps & PS_FOCUS_WITHIN) {
@@ -2709,6 +2717,7 @@ static void init_initial(void)
     s->max_height.unit = U_AUTO;
     s->top.unit = s->right.unit = s->bottom.unit = s->left.unit = U_AUTO;
     s->flex_basis.unit = U_AUTO;
+    s->deco_thickness.unit = s->underline_offset.unit = U_AUTO;
     s->flex_shrink = 100;
     s->align_items = s->justify = s->justify_items = AL_NORMAL;
     s->lh_kind = LH_NORMAL;
@@ -2750,6 +2759,8 @@ static void inherit(struct style *st, const struct style *p)
     st->list_inside = p->list_inside;
     st->empty_hide = p->empty_hide;
     st->deco_style = p->deco_style;
+    st->deco_thickness = p->deco_thickness;
+    st->underline_offset = p->underline_offset;
     st->deco_color = p->deco_color;
     st->ts_x = p->ts_x, st->ts_y = p->ts_y, st->ts_blur = p->ts_blur;
     st->ts_color = p->ts_color;
@@ -4021,6 +4032,20 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         if (prop == P_TEXT_DECORATION && n && (word_is(w[0], wl[0], "none") || word_is(w[0], wl[0], "initial")))
             st->deco_color = 0, st->deco_style = DS_SOLID;
         break;
+    case P_DECO_THICKNESS:
+    case P_UNDERLINE_OFFSET: {
+        struct len *dst = prop == P_DECO_THICKNESS ? &st->deco_thickness : &st->underline_offset;
+        struct len l;
+        if (inherit_kw)
+            *dst = prop == P_DECO_THICKNESS ? parent->deco_thickness : parent->underline_offset;
+        else if (initial_kw || !strcasecmp(value, "auto") ||
+                 (prop == P_DECO_THICKNESS && !strcasecmp(value, "from-font")))
+            *dst = (struct len){ .unit = U_AUTO };
+        else if (length_value(value, v, &l) && l.unit != U_AUTO &&
+                 (prop != P_DECO_THICKNESS || l.v >= 0))
+            *dst = l;
+        break;
+    }
     case P_TEXT_DECORATION_COLOR:
         if (initial_kw || !strcasecmp(value, "currentcolor"))
             st->deco_color = 0;

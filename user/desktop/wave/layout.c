@@ -1993,6 +1993,11 @@ static void place_line(struct lctx *c, struct flow *f, int from, int to)
                     }
                     d->deco_color = st->deco_color;
                     d->deco_style = st->deco_style;
+                    int fs = wfont_size(st->font);
+                    struct len t = st->deco_thickness, u = st->underline_offset;
+                    d->deco_thickness = t.unit == U_AUTO ? 0 : t.unit == U_PCT ? fs * t.v / 10000 : t.v;
+                    if (t.unit != U_AUTO && d->deco_thickness < 1) d->deco_thickness = 1;
+                    d->underline_offset = u.unit == U_AUTO ? (-2147483647-1) : u.unit == U_PCT ? fs * u.v / 10000 : u.v;
                     d->node = it->node;         /* the element the text is in: for clicks */
                     if (it->kind == I_SPACE && it->w > d->w)
                         d->w = it->w;
@@ -5125,9 +5130,11 @@ static void deco_line(struct surface *s, int x, int y, int w, int thick, uint32_
 static void draw_decoration(struct surface *s, const struct ditem *d, int x, int y, uint32_t col)
 {
     int size = wfont_size(d->font), thick = size >= 24 ? 2 : 1;
+    if (d->deco_thickness) thick = d->deco_thickness;
     int asc = wfont_ascent(d->font);
+    int offset = d->underline_offset == (-2147483647-1) ? 1 + (size >= 20) : d->underline_offset;
     if (d->deco & DECO_UNDERLINE)
-        deco_line(s, x, y + asc + 1 + (size >= 20), d->w, thick, col, d->deco_style);
+        deco_line(s, x, y + asc + offset, d->w, thick, col, d->deco_style);
     if (d->deco & DECO_STRIKE)
         deco_line(s, x, y + asc - size * 3 / 10, d->w, thick, col, d->deco_style);
     if (d->deco & DECO_OVERLINE)

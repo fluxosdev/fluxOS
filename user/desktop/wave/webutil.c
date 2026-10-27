@@ -406,3 +406,4 @@ int web_nth_fits(int a, int b, int position)
         return 0;
     return ((uint32_t)b - (uint32_t)position) % (0u - (uint32_t)a) == 0;
 }
+

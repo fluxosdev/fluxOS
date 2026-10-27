@@ -161,6 +161,11 @@ struct shadow_swap;
 struct shadow_swap *shadow_compose(struct arena *a, struct node *root);
 void shadow_restore(struct shadow_swap *patches);
 struct node *shadow_slot(struct node *host, const char *name);
+int web_inert(const struct node *n);
+int web_disabled(const struct node *n);
+int web_tabindex(const struct node *n);
+int web_focusable(const struct node *n);
+struct node *web_focus_next(struct node *root,struct node *current,int dir);
 struct node *node_next_shadow(struct node *n,const struct node *root);
 struct node *node_after_shadow(struct node *n,const struct node *root);
 struct node *node_find(struct node *root, enum tag tag);
@@ -353,6 +358,7 @@ struct style {
     struct image *ls_img;               /* ...and the picture, set by the browser */
     const char *counter_reset, *counter_inc;   /* the declared values; applied by the cascade */
     uint8_t deco_style;                 /* DS_* */
+    struct len deco_thickness, underline_offset;
     uint32_t deco_color;                /* 0: the text color */
     int ts_x, ts_y, ts_blur;            /* text-shadow (the first) */
     uint32_t ts_color;                  /* 0: none */
@@ -437,7 +443,7 @@ extern int css_zoom;
 #define ZOOM(n) ((n) * css_zoom / 100)
 
 /* ---- :hover and :focus (css.c): the elements they match; css_dynamic_rules counts the rules that use them ---- */
-extern const struct node *css_hover_node, *css_focus_node, *css_active_node;
+extern const struct node *css_hover_node, *css_focus_node, *css_active_node, *css_focus_visible_node;
 extern int css_dynamic_rules;
 
 /* ---- cookies (cookies.c) ---- */
@@ -483,6 +489,7 @@ struct ditem {
     uint32_t sh_color;          /* 0: no shadow */
     uint32_t deco_color;        /* 0: the text color */
     uint8_t deco_style;
+    int deco_thickness, underline_offset; /* -1: automatic underline offset */
     uint8_t dyn;                /* 1 + the index of the fixed or sticky box it moves with, or 0 */
     /* fills and images: rounded corners; fills: a gradient over the color,
        and a border of ring pixels all round in ring_color */

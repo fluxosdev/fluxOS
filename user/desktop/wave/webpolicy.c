@@ -53,6 +53,8 @@ int web_origin(const char *url, char *out, size_t size)
 {
     if (!url || !out || !size)
         return 0;
+    if(!strncmp(url,"blob:",5) && (!strncmp(url+5,"https://",8)||!strncmp(url+5,"http://",7)))
+        return web_origin(url+5,out,size);
     for (const unsigned char *q = (const unsigned char *)url; *q; q++)
         if (*q < 32 || *q == 127 || *q == '\\')
             return 0;

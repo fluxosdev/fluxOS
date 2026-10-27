@@ -23,6 +23,7 @@
 #include <flux.h>
 #include <http.h>
 #include <inflate.h>
+#include <brdecode.h>
 #include <netdb.h>
 #include <poll.h>
 #include <stdarg.h>
@@ -1277,7 +1278,7 @@ static int one_request(struct http_client *cl, const struct http_request *rq, co
         n += snprintf(req + n, sizeof(req) - (size_t)n, "Accept: %s\r\n", ACCEPT_DEFAULT);
     if (!has_request_header(rq, "Accept-Encoding"))
         n += snprintf(req + n, sizeof(req) - (size_t)n, "Accept-Encoding: %s\r\n",
-                      (rq->flags & HTTP_IDENTITY) ? "identity" : "gzip, deflate");
+                      (rq->flags & HTTP_IDENTITY) ? "identity" : "gzip, deflate, br");
     n += snprintf(req + n, sizeof(req) - (size_t)n, "Connection: keep-alive\r\n");
     for (int i = 0; i < rq->nheaders && n < (int)sizeof(req) - 1200; i++)
         n += snprintf(req + n, sizeof(req) - (size_t)n, "%s\r\n", rq->headers[i]);
@@ -1355,7 +1356,8 @@ static int one_request(struct http_client *cl, const struct http_request *rq, co
     int chunked = header_get(h.raw, h.len, "Transfer-Encoding", v, sizeof(v)) && strcasestr(v, "chunked");
     char encoding[64];
     header_get(h.raw, h.len, "Content-Encoding", encoding, sizeof(encoding));
-    int coded = has_token(encoding, "gzip") || has_token(encoding, "x-gzip") || has_token(encoding, "deflate");
+    int brotli = !strcasecmp(encoding,"br");
+    int coded = brotli || has_token(encoding, "gzip") || has_token(encoding, "x-gzip") || has_token(encoding, "deflate");
     int no_body = !strcmp(method, "HEAD") || h.status == 204 || h.status == 304 || (h.status >= 100 && h.status < 200);
     int close_after = h.minor == 0 ? !(header_get(h.raw, h.len, "Connection", v, sizeof(v)) &&
                                        has_token(v, "keep-alive"))
@@ -1423,12 +1425,12 @@ static int one_request(struct http_client *cl, const struct http_request *rq, co
 
     /* Decode. */
     int decoded = 0;
-    if (coded && bb.len) {
+    if (coded && !no_body) {
         uint8_t *dec;
         size_t dl;
         int fmt = has_token(encoding, "deflate") ? INFLATE_AUTO : INFLATE_GZIP;
-        int ir = inflate_buf(bb.p, bb.len, fmt, &dec, &dl, max);
-        if (ir < 0 && !dl && !truncated) {
+        int ir = brotli ? brotli_buf(bb.p, bb.len, &dec, &dl, max) : inflate_buf(bb.p, bb.len, fmt, &dec, &dl, max);
+        if (ir < 0 && (brotli || !dl) && !truncated) {
             free(dec);
             free(bb.p);
             set_err(rs, "the response's compressed data is damaged");
@@ -1440,7 +1442,7 @@ static int one_request(struct http_client *cl, const struct http_request *rq, co
         bb.p = dec;
         bb.len = dl;
         decoded = 1;
-        if (ir < 0)
+        if (ir != 0)
             truncated = rs->truncated = 1;
     }
 

@@ -627,15 +627,15 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
   });
   def(EP, "getClientRects", function () { return [this.getBoundingClientRect()]; });
   def(EP, "checkVisibility", function () { var r = this.getBoundingClientRect(); return r.width > 0 || r.height > 0; });
-  def(EP, "setPointerCapture", function () {});
-  def(EP, "releasePointerCapture", function () {});
-  def(EP, "hasPointerCapture", function () { return false; });
+  def(EP, "setPointerCapture", function (id) { return g["%pointerCapture"].call(this, id, 1); });
+  def(EP, "releasePointerCapture", function (id) { return g["%pointerCapture"].call(this, id, 0); });
+  def(EP, "hasPointerCapture", function (id) { return g["%pointerCapture"].call(this, id, 2); });
   def(EP, "showPopover", function () { this.setAttribute("data-popover-open", ""); this.style.display = "block"; });
   def(EP, "hidePopover", function () { this.removeAttribute("data-popover-open"); this.style.display = ""; });
   def(EP, "togglePopover", function () {
     if (this.hasAttribute("data-popover-open")) this.hidePopover(); else this.showPopover();
   });
-  getter(EP, "inert", function () { return this.hasAttribute("inert"); });
+  Object.defineProperty(EP, "inert", { configurable:true, get:function(){return this.hasAttribute("inert");}, set:function(v){if(v)this.setAttribute("inert", "");else this.removeAttribute("inert");} });
   getter(EP, "draggable", function () { return this.getAttribute("draggable") === "true"; });
   getter(EP, "slot", function () { return this.getAttribute("slot") || ""; });
   getter(EP, "part", function () { return this.classList; });
@@ -664,8 +664,12 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
   nav.product = "Gecko";
   nav.userAgentData = { brands: [], mobile: false, platform: "fluxOS",
     getHighEntropyValues: function () { return Promise.resolve({ brands: [], mobile: false, platform: "fluxOS" }); } };
-  nav.clipboard = { writeText: function () { return Promise.resolve(); }, readText: function () { return Promise.resolve(""); },
-    write: function () { return Promise.resolve(); }, read: function () { return Promise.resolve([]); } };
+  URL.createObjectURL = function (blob) { if(!(blob instanceof Blob))throw new TypeError("createObjectURL requires a Blob");return g["%blobURL"](blob._bytes,blob.type); };
+  URL.revokeObjectURL = function (url) { g["%blobURL"](String(url)); };
+  nav.clipboard = {
+    writeText: function (text) { try { return Promise.resolve(g["%clipboard"](String(text))); } catch(e) { return Promise.reject(new DOMException(String(e), "NotAllowedError")); } },
+    readText: function () { try { return Promise.resolve(g["%clipboard"]()); } catch(e) { return Promise.reject(new DOMException(String(e), "NotAllowedError")); } }
+  };
   nav.permissions = { query: function (d) { return Promise.resolve({ name: d && d.name, state: "denied", onchange: null }); } };
   nav.mediaDevices = { enumerateDevices: function () { return Promise.resolve([]); },
     getUserMedia: function () { return Promise.reject(new DOMException("No devices", "NotFoundError")); } };
