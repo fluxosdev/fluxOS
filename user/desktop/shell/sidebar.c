@@ -32,7 +32,7 @@
 #define FOOT_H  30              /* "Add widgets..." */
 #define MARGIN  10              /* from the sidebar's sides to its cards */
 #define GAP     10              /* between cards */
-#define CAP_H   22              /* a card's title strip */
+#define CAP_H   20              /* a card's title strip */
 #define FACE_R  54              /* the clock's face */
 #define CAL_ROW 20              /* a week of the calendar */
 #define GRAPH_H 56
@@ -118,6 +118,12 @@ int sidebar_shown(void)
     return shown;
 }
 
+/* Hidden by choice, on a screen it would fit: the taskbar offers a button to bring it back. */
+int sidebar_collapsed(void)
+{
+    return !shown && screen_w >= 640;
+}
+
 struct rect sidebar_rect(void)
 {
     int w = sidebar_width();
@@ -199,16 +205,6 @@ static void tint(struct surface *s, struct rect r, color_t argb)
     gfx_round_fill(s, r, 0, 0, argb);
 }
 
-/* Text in capitals spaced apart, as the studies' card titles are. */
-static void spaced(struct surface *s, const struct pfont *f, int x, int y, const char *text, color_t c)
-{
-    for (const char *p = text; *p; p++) {
-        char ch[2] = { *p >= 'a' && *p <= 'z' ? (char)(*p - 32) : *p, 0 };
-        gfx_text(s, f, x, y, ch, c);
-        x += gfx_text_width(f, ch) + 1;
-    }
-}
-
 /* ---- the body ---- */
 
 static void paint_body(struct surface *s, int w, int h)
@@ -259,7 +255,7 @@ static void paint_card(struct surface *s, struct rect r, const char *title, cons
         gfx_fill(s, r.x, r.y, r.w, r.h, C_FACE);
         gfx_bevel(s, r, BEVEL_THIN_RAISED);
         gfx_fill(s, r.x + 2, r.y + 2, r.w - 4, CAP_H - 3, C_NAVY);
-        gfx_text(s, &font_sans_bold, r.x + 8, r.y + (CAP_H - font_sans_bold.height) / 2, title, C_WHITE);
+        gfx_text(s, &font_sans, r.x + 8, r.y + (CAP_H - font_sans.height) / 2, title, C_WHITE);
         if (right[0])
             gfx_text(s, &font_sans, r.x + r.w - 8 - gfx_text_width(&font_sans, right),
                      r.y + (CAP_H - font_sans.height) / 2, right, C_WHITE);
@@ -276,7 +272,7 @@ static void paint_card(struct surface *s, struct rect r, const char *title, cons
     struct rect strip = mkrect(r.x + 1, r.y + 1, r.w - 2, CAP_H);
     chrome_fill(s, strip, 4, 0);
     tint(s, mkrect(strip.x + 6, strip.y + 1, strip.w - 12, 1), ARGB(64, 0xFFFFFF));
-    spaced(s, &font_sans_bold, r.x + 10, r.y + (CAP_H - font_sans_bold.height) / 2 + 1, title, ink());
+    gfx_text(s, &font_sans, r.x + 10, r.y + (CAP_H - font_sans.height) / 2 + 1, title, ink());
     if (right[0])
         gfx_text(s, &font_sans, r.x + r.w - 10 - gfx_text_width(&font_sans, right),
                  r.y + (CAP_H - font_sans.height) / 2 + 1, right, muted());
@@ -297,7 +293,7 @@ static void hand(struct surface *s, int cx, int cy, int i, int len, int width, c
 
 static void paint_clock(struct surface *s, struct rect r, const struct tm *tm)
 {
-    paint_card(s, r, "Local time", "");
+    paint_card(s, r, "local time", "");
     int cx = r.x + r.w / 2, cy = r.y + CAP_H + 8 + FACE_R;
     color_t face_ink = KINETIK ? ink() : C_BLACK, sec = hot();
     if (KINETIK) {
@@ -344,7 +340,7 @@ static void arrow(struct surface *s, struct rect r, int right, color_t c)
 /* A month from Monday to Sunday, with the days around it in the weeks it takes. */
 static void paint_calendar(struct surface *s, struct rect r, const struct tm *tm)
 {
-    paint_card(s, r, "Calendar", "");
+    paint_card(s, r, "calendar", "");
     char buf[32];
     arrow(s, r_prev, 0, muted());
     arrow(s, r_next, 1, muted());
@@ -404,8 +400,8 @@ static void bar(struct surface *s, struct rect r, int pct)
 static void paint_system(struct surface *s, struct rect r)
 {
     char right[24], buf[48];
-    snprintf(right, sizeof(right), "CPU %d%%", cpu_now);
-    paint_card(s, r, "System", right);
+    snprintf(right, sizeof(right), "cpu %d%%", cpu_now);
+    paint_card(s, r, "system", right);
 
     struct rect g = mkrect(r.x + 8, r.y + CAP_H + 8, r.w - 16, GRAPH_H);
     color_t cpu_c = hot(), mem_c = KINETIK ? (light_body() ? theme.ink : theme.pale) : RGB(0xFF, 0xFF, 0x00);
@@ -448,7 +444,7 @@ static void paint_system(struct surface *s, struct rect r)
     gfx_text(s, &font_sans, r.x + 10, y, "Memory", muted());
     gfx_text(s, &font_sans, r.x + r.w - 10 - gfx_text_width(&font_sans, buf), y, buf, ink());
     bar(s, mkrect(r.x + 10, y + 18, r.w - 20, 4),
-        mem_total_kb ? (int)((uint64_t)mem_used_kb * 100 / mem_total_kb) : 0);
+        mem_total_kb ? (int)(mem_used_kb * 100 / mem_total_kb) : 0);
 }
 
 /* ---- drawing into the cache ---- */
@@ -557,7 +553,7 @@ static void sample(void)
     }
     mem_total_kb = mi.total_kb;
     mem_used_kb = mi.total_kb - mi.free_kb;
-    push(mem_hist, mi.total_kb ? (int)((uint64_t)mem_used_kb * 100 / mi.total_kb) : 0);
+    push(mem_hist, mi.total_kb ? (int)(mem_used_kb * 100 / mi.total_kb) : 0);
     prev_idle = idle;
     prev_ms = now;
     sampled = 1;
@@ -619,7 +615,7 @@ static const struct ctx_item menu[] = {
     { "Calendar", ICON_NONE, toggle_calendar, calendar_on },
     { "System Resources", ICON_NONE, toggle_system, system_on },
     { NULL, ICON_NONE, NULL, NULL },
-    { "Close Sidebar", ICON_NONE, close_sidebar, NULL },
+    { "Collapse Sidebar", ICON_NONE, close_sidebar, NULL },
 };
 
 void sidebar_menu(int x, int y)

@@ -211,6 +211,7 @@ unsigned int now_ms(void);
 void sidebar_init(void);                /* the saved choice */
 int sidebar_width(void);                /* 0 while it is hidden */
 int sidebar_shown(void);
+int sidebar_collapsed(void);           /* hidden, though it would fit: the taskbar has a button for it */
 void sidebar_show(int on);              /* and keep the choice */
 struct rect sidebar_rect(void);
 void sidebar_draw(struct surface *s);   /* over what is there, within s's clip */

@@ -472,6 +472,17 @@ static struct rect tray_icon_rect(void)
     return mkrect(tr.x + 3, tr.y + (tr.h - 16) / 2, 16, 16);
 }
 
+#define SB_BUTTON_W 22
+
+/* While the sidebar is collapsed: a button before the tray to open it again. */
+static struct rect sidebar_button_rect(void)
+{
+    struct rect tr = tray_rect();
+    if (setup_mode || !sidebar_collapsed())
+        return mkrect(tr.x, tr.y, 0, 0);
+    return mkrect(tr.x - 3 - SB_BUTTON_W, tr.y, SB_BUTTON_W, tr.h);
+}
+
 void wm_tray_changed(void)
 {
     wm_damage(tray_rect());
@@ -485,6 +496,8 @@ static struct rect task_button_rect(int i)
 {
     struct rect sb = start_button_rect();
     int x0 = sb.x + sb.w + (KINETIK ? 10 : 4), x1 = tray_rect().x - 4, gap = KINETIK ? 5 : 3;
+    if (!rect_empty(sidebar_button_rect()))
+        x1 -= SB_BUTTON_W + 3;
     int n = ntasks ? ntasks : 1;
     int w = (x1 - x0 - (n - 1) * gap) / n;
     if (w > (KINETIK ? 180 : 160))
@@ -1174,6 +1187,24 @@ static void draw_window_kinetik(struct window *w)
     gfx_blit(&screen, cl.x, cl.y, &w->content, 0, 0, cl.w, cl.h);
 }
 
+/* The sidebar button: an arrow pointing left, to where the sidebar comes from. */
+static void draw_sidebar_button(void)
+{
+    struct rect b = sidebar_button_rect();
+    if (rect_empty(b))
+        return;
+    int cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+    if (KINETIK) {
+        glass(b, 3, 0);
+        gfx_line(&screen, cx + 2, cy - 5, cx - 2, cy, 2, ARGB(255, theme.on_chrome));
+        gfx_line(&screen, cx - 2, cy, cx + 2, cy + 5, 2, ARGB(255, theme.on_chrome));
+        return;
+    }
+    gfx_bevel(&screen, b, BEVEL_RAISED);
+    for (int i = 0; i < 4; i++)
+        gfx_vline(&screen, cx + 1 - i, cy - 3 + i, 7 - 2 * i, C_BLACK);
+}
+
 static void draw_taskbar_kinetik(void)
 {
     struct rect tb = taskbar_rect();
@@ -1205,6 +1236,7 @@ static void draw_taskbar_kinetik(void)
         gfx_text(&screen, &font_sans, b.x + 29, b.y + (b.h - font_sans.height) / 2, label, theme.on_chrome);
     }
 
+    draw_sidebar_button();
     struct rect tr = tray_rect();
     enum icon_id speaker = sound_tray_icon();
     if (speaker != ICON_NONE) {
@@ -1369,6 +1401,7 @@ static void draw_taskbar(void)
         gfx_text(&screen, f, b.x + 23 + active, b.y + 4 + active, label, C_BLACK);
     }
 
+    draw_sidebar_button();
     struct rect tr = tray_rect();
     gfx_bevel(&screen, tr, BEVEL_THIN_SUNKEN);
     enum icon_id speaker = sound_tray_icon();
@@ -2302,6 +2335,10 @@ static void press_left(void)
         if (rect_contains(start_button_rect(), mx, my)) {
             set_menu(1);
             drag = DRAG_MENU;
+            return;
+        }
+        if (rect_contains(sidebar_button_rect(), mx, my)) {
+            sidebar_show(1);
             return;
         }
         if (sound_tray_icon() != ICON_NONE && rect_contains(tray_icon_rect(), mx, my)) {
