@@ -53,9 +53,9 @@ static void *kmap(uint32_t phys, int slot)
         return p;
     }
     uint32_t va = kmap_base + (uint32_t)(this_cpu()->index * 2 + slot) * PAGE_SIZE;
-    kmap_pt[PTE_INDEX(va)] = phys | PTE_PRESENT | PTE_WRITE;
+    kmap_pt[PTE_INDEX(va)] = ALIGN_DOWN(phys, PAGE_SIZE) | PTE_PRESENT | PTE_WRITE;
     invlpg(va);
-    return (void *)va;
+    return (void *)(va + (phys & (PAGE_SIZE - 1)));     /* the offset in the page kept */
 }
 
 /* The first page tables are made before fpu_init() enables SSE. */
