@@ -6,9 +6,9 @@
  *
  * A display driver (voodoo.c, radeon.c) may later switch to a mode of its
  * own and point fb at it; fb_boot keeps the boot loader's mode. SYS_display
- * reports the adapter and sets modes through that driver. The Radeon one
- * also lends the screen's owner a second page to flip to and a hardware
- * pointer.
+ * reports the adapter and sets modes through that driver. The Radeon and
+ * Intel ones (intel.c) also lend the screen's owner a second page to flip
+ * to and a hardware pointer.
  */
 #include "kernel.h"
 #include "drivers.h"
@@ -117,6 +117,21 @@ void fb_map(void)
     fb_boot = fb;
 }
 
+/* How much of the screen fbmap maps: two pages where the driver flips. */
+static uint32_t map_size(void)
+{
+    if (intel_present())
+        return intel_map_size();
+    return radeon_present() ? radeon_map_size() : fb.size;
+}
+
+/* The screen's owner is gone: page 0 on show, the pointer hidden. */
+static void release_screen(void)
+{
+    intel_release();
+    radeon_release();
+}
+
 /*
  * The driver switched modes and updated fb. The process that has the
  * screen gets the new one mapped in place of the old (it must read
@@ -126,8 +141,7 @@ void fb_mode_changed(void)
 {
     struct proc *p = fb_owner ? proc_find(fb_owner) : NULL;
     if (p && p->state != P_ZOMBIE)
-        vmm_map_phys(p->pd, USER_MMIO_BASE, fb.phys, radeon_present() ? radeon_map_size() : fb.size,
-                     pte_wc);
+        vmm_map_phys(p->pd, USER_MMIO_BASE, fb.phys, map_size(), pte_wc);
     vga_reset_fb();
 }
 
@@ -226,7 +240,7 @@ int fb_panic(void)
         return 0;
     panicked = 1;
     if (fb_owner)
-        radeon_release();               /* page 0 on show, the pointer hidden */
+        release_screen();
     return 1;
 }
 
@@ -272,8 +286,7 @@ static int map_user(void)
         if (p && p->state != P_ZOMBIE)
             return -EBUSY;
     }
-    uint32_t size = radeon_present() ? radeon_map_size() : fb.size;
-    int r = vmm_map_phys(current->pd, USER_MMIO_BASE, fb.phys, size, pte_wc);
+    int r = vmm_map_phys(current->pd, USER_MMIO_BASE, fb.phys, map_size(), pte_wc);
     if (r < 0)
         return r;
     if (!fb_owner)
@@ -292,7 +305,7 @@ void fb_proc_exit(int pid)
     radeon_proc_exit(pid);
     if (fb_owner && pid == fb_owner) {
         fb_owner = 0;
-        radeon_release();
+        release_screen();
         klog("fb: screen returned to the console\n");
         vga_redraw();
     }
@@ -396,6 +409,8 @@ static int display_op(int op, void *arg)
         if (voodoo_present()) {
             voodoo_info(di);
             di->screen_bytes = (uint32_t)voodoo_screen_bytes();
+        } else if (intel_present()) {
+            intel_info(di);
         } else if (radeon_present()) {
             radeon_info(di);
         } else {
@@ -430,24 +445,26 @@ static int display_op(int op, void *arg)
             return voodoo_map3d(arg);
         return radeon_present() ? radeon_map3d_user(arg) : -ENODEV;
     case DISP_FLIP:
-        if (!radeon_present())
+        if (!radeon_present() && !intel_present())
             return -ENODEV;
         if (!screen_owner())
             return -EPERM;
+        if (intel_present())
+            return intel_flip((int)((const struct dispflip *)arg)->page);
         return radeon_flip((int)((const struct dispflip *)arg)->page);
     case DISP_CURSOR:
-        if (!radeon_present())
+        if (!radeon_present() && !intel_present())
             return -ENODEV;
         if (!screen_owner())
             return -EPERM;
-        return radeon_cursor(arg);
+        return intel_present() ? intel_cursor(arg) : radeon_cursor(arg);
     case DISP_CURSORPOS: {
-        if (!radeon_present())
+        if (!radeon_present() && !intel_present())
             return -ENODEV;
         if (!screen_owner())
             return -EPERM;
         struct disppos pos = *(const struct disppos *)arg;
-        return radeon_cursor_pos(&pos);
+        return intel_present() ? intel_cursor_pos(&pos) : radeon_cursor_pos(&pos);
     }
     case DISP_COPYRECTS:
         if (!radeon_present())
@@ -530,6 +547,7 @@ void fb_resume(void)
 {
     if (radeon_present())
         radeon_resume();
+    intel_resume();
     mutex_unlock(&display_mutex);
     if (fb_console_active())
         vga_redraw();                   /* the console's text, if the screen is its */

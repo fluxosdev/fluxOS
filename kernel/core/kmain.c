@@ -124,6 +124,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
                 fb.width, fb.height, fb.bpp, fb.phys);
     voodoo_init();
     radeon_init();
+    intel_init();
     heap_init();
     {
         uint32_t total, used;

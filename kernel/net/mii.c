@@ -8,8 +8,8 @@
  * The Realtek RTL8201 family (RTL8201CP/CL/N: single-port 10/100) is
  * recognised by name, and gets the extra setup the nForce MACs need with
  * it (as Linux's forcedeth does). Any other PHY that follows the IEEE
- * 802.3 clause 22 registers works the same way; a gigabit PHY is kept at
- * 100 Mbit/s, which is all the MAC drivers here set up.
+ * 802.3 clause 22 registers works the same way. A gigabit PHY is kept at
+ * 100 Mbit/s unless the MAC driver says it handles 1000 Mbit/s (e1000e.c).
  */
 #include "kernel.h"
 #include "drivers.h"
@@ -22,6 +22,7 @@
 #define MII_ADVERTISE 0x04
 #define MII_LPA      0x05
 #define MII_CTRL1000 0x09
+#define MII_STAT1000 0x0A
 
 #define BMCR_RESET     0x8000
 #define BMCR_ANENABLE  0x1000
@@ -40,6 +41,9 @@
 #define ADV_PAUSE    0x0400
 #define ADV_ASYM     0x0800
 #define ADV_ALL      (ADV_10HALF | ADV_10FULL | ADV_100HALF | ADV_100FULL)
+#define ADV_1000HALF 0x0100             /* in MII_CTRL1000 */
+#define ADV_1000FULL 0x0200
+#define LPA_1000FULL 0x0800             /* in MII_STAT1000 */
 
 /* RTL8201 (on an nForce MAC): register 0x11, bit 12, as forcedeth sets it. */
 #define RTL8201_REG11     0x11
@@ -102,12 +106,16 @@ int mii_init(struct mii_phy *phy)
     adv |= ADV_ALL | ADV_PAUSE | ADV_ASYM;
     phy->write(phy->addr, MII_ADVERTISE, (uint16_t)adv);
 
-    /* A gigabit PHY: not 1000 Mbit/s, the MAC is not set up for it. */
+    /* A gigabit PHY: 1000 Mbit/s full duplex only if the MAC is set up for it. */
     int bmsr = phy->read(phy->addr, MII_BMSR);
     if (bmsr >= 0 && (bmsr & BMSR_ESTATEN)) {
         int c1000 = phy->read(phy->addr, MII_CTRL1000);
-        if (c1000 >= 0)
-            phy->write(phy->addr, MII_CTRL1000, (uint16_t)(c1000 & ~0x0300));
+        if (c1000 >= 0) {
+            c1000 &= ~(ADV_1000HALF | ADV_1000FULL);
+            if (phy->gigabit)
+                c1000 |= ADV_1000FULL;
+            phy->write(phy->addr, MII_CTRL1000, (uint16_t)c1000);
+        }
     }
 
     /* Reset it (with autonegotiation on: some PHYs want BMCR set up with
@@ -164,6 +172,14 @@ int mii_link(struct mii_phy *phy, int *speed, int *full)
     if (adv < 0 || lpa < 0)
         return 0;
     int common = adv & lpa;
+    if (phy->gigabit) {
+        int c1000 = phy->read(phy->addr, MII_CTRL1000), s1000 = phy->read(phy->addr, MII_STAT1000);
+        if (c1000 >= 0 && s1000 >= 0 && (c1000 & ADV_1000FULL) && (s1000 & LPA_1000FULL)) {
+            *speed = 1000;
+            *full = 1;
+            return 1;
+        }
+    }
     if (common & ADV_100FULL) {
         *speed = 100;
         *full = 1;

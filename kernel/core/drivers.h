@@ -74,6 +74,18 @@ void radeon_resume(void);               /* the page and the pointer, after wakin
 /* Are any of pid's pages in [start, end) lent to the GPU (DISP_MAPBUF)? */
 int radeon_pinned(int pid, uint32_t start, uint32_t end);
 
+/* Intel HD Graphics (Haswell) display driver (intel.c): the boot
+ * loader's mode, with page flipping and a hardware pointer */
+void intel_init(void);
+int intel_present(void);
+void intel_info(struct dispinfo *di);
+uint32_t intel_map_size(void);          /* what fbmap maps */
+int intel_flip(int page);
+int intel_cursor(const struct dispcursor *dc);
+int intel_cursor_pos(const struct disppos *p);
+void intel_release(void);               /* the screen goes back to the console */
+void intel_resume(void);                /* the pages and the pointer, after waking */
+
 /* ISA DMA (isadma.c). Modes: single transfers 0x40, auto-init 0x10, and
  * 0x08 to read memory (play) or 0x04 to write it (record). */
 int isa_dma_start(int ch, uint32_t phys, uint32_t len, uint8_t mode);

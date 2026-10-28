@@ -21,9 +21,10 @@
 fluxOS is a small 32-bit x86 Unix-like operating system with preemptive
 multitasking, ring-3 processes, paging, a root filesystem on the hard disk it
 is installed on, IDE/SATA/floppy/USB storage, FAT and ISO9660, an
-NE2000 and nForce network driver with a TCP/IP stack, a zsh-flavoured shell
+NE2000, nForce and Intel I217 network drivers with a TCP/IP stack, a zsh-flavoured shell
 (**fsh**), a desktop with a web browser and two themes (Kinetik and Windows 95 style Classic), 3dfx Voodoo3 and
-Radeon HD 4000 display drivers with a small OpenGL library, PC speaker, Sound
+Radeon HD 4000 display drivers with a small OpenGL library, an Intel HD Graphics
+4600 display driver, PC speaker, Sound
 Blaster 16 and HD Audio sound, and a layer that runs DOS programs in the
 terminal. The ISO image is an install CD: GRUB (Multiboot) starts fluxOS
 Setup, which installs fluxOS onto a hard disk, and the installed system boots
@@ -146,6 +147,11 @@ stops at boot and says why.
     controllers, with page flipping and the hardware pointer in the boot
     loader's mode, over the memory the BIOS shares with them. Native modes and
     3D are not there yet for these (see *Work in progress*).
+  - **Intel HD Graphics of Haswell processors** (HD 4600, 4400, 4200, 5000,
+    Iris 5100, Iris Pro 5200): page flipping at vblank and the hardware
+    pointer in the boot loader's mode. The second page lives in the stolen
+    memory the BIOS gives the GPU, mapped through its GTT. No native modes or
+    3D yet (see *Work in progress*). `intelgfx=off`.
 - Sound:
   - PC speaker (`/dev/speaker`) with background tone queue.
   - **Sound Blaster 16**: `/dev/dsp` (OSS-style, 8/16-bit, mono/stereo, 5-44.1
@@ -154,8 +160,10 @@ stops at boot and says why.
   - **Intel HD Audio** (and codecs such as the Realtek ALC888) as `/dev/dsp`
     when there is no Sound Blaster; output only, every jack plays the same
     stereo. `hda=off`.
-- Networking: NE2000 (PCI and ISA) and **nVidia nForce** ("forcedeth", `eth0`,
-  with MII PHY support) drivers; Ethernet, ARP, IPv4 (no fragments), ICMP, UDP,
+- Networking: NE2000 (PCI and ISA), **nVidia nForce** ("forcedeth", `eth0`,
+  with MII PHY support) and **Intel I217-LM/V** gigabit (the Haswell 8-series
+  chipsets' MAC; "e1000e", shares the PHY with the Management Engine,
+  `e1000e=off`) drivers; Ethernet, ARP, IPv4 (no fragments), ICMP, UDP,
   loopback; TCP with the full state machine, RTT estimation, retransmission
   and fast retransmit; a DHCP client (or `net.ip=... net.gw=... net.dns=...`
   on the kernel command line); BSD sockets for TCP, UDP and ping; DNS from
@@ -585,7 +593,7 @@ must be at least 34 MiB. Once a disk has fluxOS, the CD's menu starts the hard
 disk by default, so a CD left in the drive does no harm. In QEMU, install with
 `make run`, then quit and `make run-disk`. The installed system runs from disk,
 so anything saved outside `/tmp` stays. Its boot menu's **safe mode** starts on
-one processor in the BIOS display mode, without the Radeon and Voodoo drivers;
+one processor in the BIOS display mode, without the Radeon, Intel and Voodoo drivers;
 if the disk itself cannot be used, start Setup from the CD again (Shift+F10
 gives a shell).
 
@@ -638,9 +646,9 @@ kernel/fs/                 vfs/file/initrd, blkdev, automount, fat32/iso9660
 kernel/storage/            ata, ahci, floppy
 kernel/usb/                usb core, hid/hub/msc, uhci/ohci/ehci/xhci
 kernel/input/              input, keyboard, mouse, touchpad
-kernel/net/                net/tcp/socket, ne2000, forcedeth/mii
+kernel/net/                net/tcp/socket, ne2000, forcedeth/mii, e1000e
 kernel/sound/              pcspkr, sb16/opl/isadma, hda
-kernel/video/              fb/vga, the startup screen (splash.c), voodoo, radeon*, atom
+kernel/video/              fb/vga, the startup screen (splash.c), voodoo, radeon*, atom, intel
 user/libc, user/include    the C library (math.c is the x87 math library; http.c and
                            inflate.c are the HTTP/1.1 client and Deflate) and headers
 user/gl/                   the OpenGL library and its backends
@@ -800,6 +808,10 @@ user range and page tables first.
   channel. `radeon_modeset_probe()` logs what the video BIOS says the outputs
   are (`dmesg | grep radeon`). After that, 3D: Sumo's own microcode
   (SUMO_pfp, SUMO_me, SUMO_rlc) and Evergreen's shader instruction set.
+- **The Intel HD Graphics driver (Haswell) is partial:** page flipping and the
+  hardware pointer in the boot loader's mode. `dmesg | grep intel` shows the
+  planes, stolen memory and watermarks it found. Native modes need the DDI
+  ports, their PLLs and DisplayPort link training.
 
 ## Limitations
 

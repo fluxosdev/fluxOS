@@ -111,10 +111,11 @@ struct mii_phy {
     char name[24];
     int rtl8201;                        /* a Realtek RTL8201CP/CL/N */
     int nv_fix;                         /* the MAC is an nForce that needs the RTL8201 fix */
+    int gigabit;                        /* the MAC does 1000 Mbit/s: advertise it */
 };
 
 int mii_probe(struct mii_phy *phy);     /* find it: 0, or -1 */
-int mii_init(struct mii_phy *phy);      /* reset, advertise 10/100, autonegotiate */
+int mii_init(struct mii_phy *phy);      /* reset, advertise 10/100 (1000), autonegotiate */
 void mii_power_up(struct mii_phy *phy);
 int mii_link(struct mii_phy *phy, int *speed, int *full);  /* 1 if the link is up */
 
@@ -143,6 +144,7 @@ int net_configure(const struct netinfo *ni);
 
 int ne2000_init(void);
 int forcedeth_init(void);
+int e1000e_init(void);
 
 /* Ones' complement sums: accumulate with csum_add, finish with csum_fold. */
 uint32_t csum_add(uint32_t sum, const void *data, uint32_t len);

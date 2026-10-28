@@ -21,13 +21,14 @@
  * whether to keep the new mode, and goes back to the old one by itself
  * after 15 seconds, in case the monitor cannot show it. An ATI Radeon's
  * driver sets modes too, and draws without tearing (page flipping) and
- * with a hardware pointer; choosing it asks the same question.
+ * with a hardware pointer, as Intel HD Graphics' driver does in the BIOS
+ * mode; choosing either asks the same question.
  *
  * Choices are saved in GRUB's environment block, /boot/grub/grubenv on the
  * partition fluxOS started from: fluxos_gfx is the mode GRUB asks the BIOS
  * for, fluxos_video the 3dfx or Radeon driver's mode, which GRUB passes to
- * the kernel as video=, and fluxos_driver "radeon" when the Radeon driver
- * is chosen, which the desktop reads when it starts. Started from the CD
+ * the kernel as video=, and fluxos_driver "radeon" or "intel" when the
+ * Radeon or Intel driver is chosen, which the desktop reads when it starts. Started from the CD
  * there is nowhere to save them, and they last until a restart.
  */
 #include <dirent.h>
@@ -47,7 +48,7 @@
 #define CONFIRM_SECS 15
 
 enum page { PAGE_BACKGROUND, PAGE_APPEARANCE, PAGE_SAVER, PAGE_SETTINGS, PAGE_MONITOR, PAGE_COUNT };
-enum driver { DRV_STANDARD, DRV_NATIVE, DRV_RADEON };
+enum driver { DRV_STANDARD, DRV_NATIVE, DRV_RADEON };    /* DRV_RADEON: or Intel's */
 
 /* Controls, in Tab order. */
 enum ctl {
@@ -110,7 +111,7 @@ struct dprops {
     struct dispmode modes[DISP_MAX_MODES];
     int nmodes;
     int native_ok;                      /* the 3dfx driver can set modes */
-    int radeon_ok;                      /* there is a Radeon driver */
+    int radeon_ok;                      /* there is a Radeon (or Intel) driver */
     int radeon_modes;                   /* and it can set modes */
     char bootdir[128];                  /* the partition with GRUB, or "" */
     char saved_gfx[32], saved_video[32], saved_driver[16];
@@ -960,12 +961,14 @@ static void settings_page(struct dprops *d, struct surface *s)
         gfx_text(s, &font_sans, 44, radio_rect(1).y - 1, "No 3dfx Voodoo card was found.", C_SHADOW);
     }
     if (d->radeon_ok) {
-        draw_radio(s, radio_rect(2).x, radio_rect(2).y,
-                   d->radeon_modes ? "ATI Radeon driver: set modes, no tearing"
-                                   : "ATI Radeon driver: no tearing, hardware pointer",
+        const char *name = !strcmp(d->di.driver, "intel") ? "Intel graphics" : "ATI Radeon";
+        snprintf(buf, sizeof(buf), d->radeon_modes ? "%s driver: set modes, no tearing"
+                                                   : "%s driver: no tearing, hardware pointer", name);
+        draw_radio(s, radio_rect(2).x, radio_rect(2).y, buf,
                    d->driver == DRV_RADEON, focus_drv && d->driver == DRV_RADEON);
     } else {
-        gfx_text(s, &font_sans, 44, radio_rect(2).y - 1, "No ATI Radeon card was found.", C_SHADOW);
+        gfx_text(s, &font_sans, 44, radio_rect(2).y - 1, "No ATI Radeon or Intel graphics was found.",
+                 C_SHADOW);
     }
 
     int on = mode_controls_enabled(d);
@@ -1462,7 +1465,7 @@ static int apply(struct dprops *d)
     snprintf(gfx, sizeof(gfx), "%s", d->saved_gfx);
     video[0] = 0;
 
-    const char *driver = d->driver == DRV_RADEON ? "radeon" : "";
+    const char *driver = d->driver == DRV_RADEON ? d->di.driver : "";    /* "radeon" or "intel" */
     int accel = wm_accel();
 
     if (own_modes(d)) {
@@ -2032,7 +2035,7 @@ static void dp_reload(struct dprops *d)
     display(DISP_INFO, &d->di);
     int n = display(DISP_MODES, d->modes);
     d->nmodes = n > 0 ? n : 0;
-    d->radeon_ok = !strcmp(d->di.driver, "radeon");
+    d->radeon_ok = !strcmp(d->di.driver, "radeon") || !strcmp(d->di.driver, "intel");
     d->native_ok = !d->radeon_ok && (d->di.flags & DISPF_NATIVE) && d->nmodes > 0;
     d->radeon_modes = d->radeon_ok && (d->di.flags & DISPF_NATIVE) && d->nmodes > 0;
 

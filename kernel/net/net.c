@@ -695,7 +695,7 @@ void net_register(const struct netdev *dev)
 
 void net_init(void)
 {
-    if (forcedeth_init() < 0 && ne2000_init() < 0) {
+    if (e1000e_init() < 0 && forcedeth_init() < 0 && ne2000_init() < 0) {
         boot_ok("Network: no network card found (loopback only)");
         return;
     }
