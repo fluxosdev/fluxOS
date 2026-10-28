@@ -44,6 +44,7 @@ static const char *state_name(int s)
     case PSTATE_BLOCKED: return "wait";
     case PSTATE_SLEEPING: return "sleep";
     case PSTATE_ZOMBIE: return "zombie";
+    case PSTATE_STOPPED: return "stop";
     }
     return "?";
 }

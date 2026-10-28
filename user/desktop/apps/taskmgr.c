@@ -147,6 +147,7 @@ static const char *state_name(int s, int pid)
     case PSTATE_BLOCKED: return "Waiting";
     case PSTATE_SLEEPING: return "Sleeping";
     case PSTATE_ZOMBIE: return "Zombie";
+    case PSTATE_STOPPED: return "Stopped";
     }
     return "?";
 }

@@ -65,7 +65,7 @@ static int input_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
             spin_unlock(&input_lock);
             return -EINTR;
         }
-        sleep_on_lock(queue, &input_lock);
+        sleep_on_lock_intr(queue, &input_lock);
     }
     struct input_event *out = buf;
     uint32_t i = 0;

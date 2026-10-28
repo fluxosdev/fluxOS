@@ -232,7 +232,7 @@ static int sys_sleep(uint32_t ms, uint32_t b, uint32_t c, uint32_t d, uint32_t e
 {
     (void)b; (void)c; (void)d; (void)e;
     uint32_t t = (ms + (1000 / HZ) - 1) / (1000 / HZ);
-    return sleep_ticks(t ? t : 1);
+    return sleep_ticks_intr(t ? t : 1);
 }
 
 static int sys_yield(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)

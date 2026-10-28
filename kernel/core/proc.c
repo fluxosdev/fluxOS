@@ -359,6 +359,21 @@ void sleep_on_lock(void *chan, spinlock_t *lk)
     spin_lock(lk);
 }
 
+/* As sleep_on_lock(), for a caller that checked signal_pending() holding lk:
+ * a signal sent since then woke nothing (the process was not blocked yet),
+ * so look again once it is. */
+void sleep_on_lock_intr(void *chan, spinlock_t *lk)
+{
+    struct proc *p = current;
+    prepare_wait(chan);
+    spin_unlock(lk);
+    if (signal_pending(p))
+        cancel_wait();
+    else
+        do_wait();
+    spin_lock(lk);
+}
+
 void sleep_on_lock_timeout(void *chan, spinlock_t *lk, uint32_t deadline)
 {
     prepare_wait_timeout(chan, deadline);
@@ -381,13 +396,14 @@ void wakeup(void *chan)
     spin_unlock(&sched_lock);
 }
 
-int sleep_ticks(uint32_t n)
+static int sleep_ticks_common(uint32_t n, int intr)
 {
     uint32_t flags = irq_save();
     spin_lock(&sched_lock);
     struct cpu *c = this_cpu();
     struct proc *p = c->proc;
-    if (p != c->idle) {
+    /* Signals are sent holding sched_lock: one not seen here wakes the sleep. */
+    if (p != c->idle && !(intr && signal_pending(p))) {
         p->wake_tick = ticks + n;
         p->state = P_SLEEPING;
         sched_switch();
@@ -395,6 +411,17 @@ int sleep_ticks(uint32_t n)
     spin_unlock(&sched_lock);
     irq_restore(flags);
     return signal_pending(p) ? -EINTR : 0;
+}
+
+int sleep_ticks(uint32_t n)
+{
+    return sleep_ticks_common(n, 0);
+}
+
+/* sleep(2): a signal that came before the sleep began ends it too. */
+int sleep_ticks_intr(uint32_t n)
+{
+    return sleep_ticks_common(n, 1);
 }
 
 /* Give p (current, or one not running) the address space pd; returns the
@@ -562,6 +589,10 @@ void do_exit(int status)
             if (q->state == P_ZOMBIE) {
                 signal_locked(init_proc, SIGCHLD);
                 wakeup_locked(init_proc);
+            } else if (q->state == P_STOPPED) {
+                /* Nobody is left to continue it: hang up, and let it see that. */
+                signal_locked(q, SIGHUP);
+                signal_locked(q, SIGCONT);
             }
         }
     }
@@ -609,6 +640,22 @@ int do_waitpid(int pid, int *status, int options)
                     *status = code;
                 return r;
             }
+            int code = -1;
+            if ((options & WUNTRACED) && q->state == P_STOPPED && q->stop_report) {
+                q->stop_report = 0;
+                code = (q->stop_sig << 8) | 0x7f;
+            } else if ((options & WCONTINUED) && q->cont_report) {
+                q->cont_report = 0;
+                code = 0xffff;
+            }
+            if (code >= 0) {
+                int r = q->pid;
+                spin_unlock(&sched_lock);
+                cancel_wait();
+                if (status)
+                    *status = code;
+                return r;
+            }
         }
         spin_unlock(&sched_lock);
         if (!have_children || (options & WNOHANG) || signal_pending(me)) {
@@ -650,19 +697,48 @@ static int sig_default_ignore(int sig)
     return sig == SIGCHLD || sig == SIGCONT || sig == SIGURG || sig == SIGWINCH;
 }
 
+/* Signals whose default action stops the process. */
+#define STOP_SIGS ((1u << SIGSTOP) | (1u << SIGTSTP) | (1u << SIGTTIN) | (1u << SIGTTOU))
+
 /* With sched_lock. */
 static void deliver(struct proc *p, int sig)
 {
     __atomic_or_fetch(&p->sig_pending, 1u << sig, __ATOMIC_RELAXED);
     if (sig != SIGKILL && sig != SIGSTOP && (p->sig_blocked & (1u << sig)))
         return;
-    if (p->state == P_BLOCKED || p->state == P_SLEEPING) {
+    if (p->state == P_BLOCKED || p->state == P_SLEEPING ||
+        (p->state == P_STOPPED && sig == SIGKILL)) {
         p->chan = NULL;
         make_ready(p);
     } else if (p->state == P_RUNNING && p != this_cpu()->proc) {
         smp_kick_proc(p);               /* running on another processor */
     }
     this_cpu()->resched = 1;
+}
+
+/* With sched_lock: tell p's parent that p stopped or went on (SIGCHLD,
+ * unless it asked for none with SA_NOCLDSTOP), and wake its waitpid(). */
+static void notify_parent_locked(struct proc *p)
+{
+    struct proc *parent = proc_find_locked(p->ppid);
+    if (!parent)
+        return;
+    if (!(parent->sig_actions[SIGCHLD].fsa_flags & SA_NOCLDSTOP))
+        signal_locked(parent, SIGCHLD);
+    wakeup_locked(parent);
+}
+
+/* With sched_lock: SIGCONT, whatever its disposition, cancels pending stop
+ * signals and sets a stopped process going again. */
+static void continue_locked(struct proc *p)
+{
+    __atomic_and_fetch(&p->sig_pending, ~STOP_SIGS, __ATOMIC_RELAXED);
+    if (p->state != P_STOPPED)
+        return;
+    p->stop_report = 0;
+    p->cont_report = 1;
+    make_ready(p);
+    notify_parent_locked(p);
 }
 
 static void signal_locked(struct proc *p, int sig)
@@ -674,6 +750,10 @@ static void signal_locked(struct proc *p, int sig)
     uint32_t h = p->sig_actions[sig].fsa_handler;
     if (p->pid == 1 && h < USER_BASE)
         return;
+    if (sig == SIGCONT)
+        continue_locked(p);
+    else if (STOP_SIGS & (1u << sig))
+        __atomic_and_fetch(&p->sig_pending, ~(1u << SIGCONT), __ATOMIC_RELAXED);
     if (sig != SIGKILL && sig != SIGSTOP) {
         if ((p->sig_ignored & (1u << sig)) || h == SIGDISP_IGN)
             return;
@@ -794,6 +874,43 @@ static int user_write_range(struct proc *p, uint32_t va, const void *src, uint32
     return 0;
 }
 
+/*
+ * sig, a stop signal, is the next for the current process p. If it takes
+ * its default action, stop here, on the way to user mode with nothing
+ * held, until SIGCONT or SIGKILL; returns 1 then (or if SIGCONT cancelled
+ * it meanwhile), 0 if it is handled or ignored like any other signal.
+ */
+static int try_stop(struct proc *p, int sig, uint32_t mask)
+{
+    uint32_t bit = 1u << sig;
+    spin_lock(&sched_lock);
+    if (sig != SIGSTOP && ((p->sig_ignored & bit) || p->sig_actions[sig].fsa_handler != SIGDISP_DFL)) {
+        spin_unlock(&sched_lock);
+        return 0;
+    }
+    /* Taken off the queue under the lock SIGCONT clears it with, so a
+     * SIGCONT sent since it was seen is not lost. SIGKILL goes first. */
+    uint32_t pending = __atomic_fetch_and(&p->sig_pending, ~bit, __ATOMIC_RELAXED);
+    if ((pending & bit) && !(pending & (1u << SIGKILL))) {
+        /* A system call the stop interrupted goes on once continued, unless
+         * another signal's handler is about to run and decide that. */
+        struct trapframe *tf = p->tf;
+        if (p->in_syscall > 0 && tf->eax == (uint32_t)-EINTR && !(pending & ~mask & ~bit)) {
+            tf->eax = p->syscall_orig_eax;
+            tf->eip -= 2;
+            p->in_syscall = 0;
+        }
+        p->state = P_STOPPED;
+        p->stop_sig = sig;
+        p->stop_report = 1;
+        p->cont_report = 0;
+        notify_parent_locked(p);
+        sched_switch();
+    }
+    spin_unlock(&sched_lock);
+    return 1;
+}
+
 void proc_check_signals(void)
 {
     struct proc *p = current;
@@ -806,9 +923,11 @@ void proc_check_signals(void)
             break;
         int sig = __builtin_ctz(deliverable);
         uint32_t bit = 1u << sig;
+        if ((bit & STOP_SIGS) && try_stop(p, sig, mask))
+            continue;
         __atomic_and_fetch(&p->sig_pending, ~bit, __ATOMIC_RELAXED);
 
-        if (sig == SIGKILL || sig == SIGSTOP)
+        if (sig == SIGKILL)
             do_exit(sig);
         spin_lock(&sched_lock);
         struct flux_sigaction sa = p->sig_actions[sig];
@@ -934,6 +1053,21 @@ uint32_t proc_vma_lowest(const struct proc *p)
     return low;
 }
 
+/* Free VMA slots once [addr, end) is unmapped: negative if splitting a
+ * mapping around it would not fit. */
+static int vma_slots_after_unmap(const struct proc *p, uint32_t addr, uint32_t end)
+{
+    int slots = 0;
+    for (int i = 0; i < MAX_VMAS; i++) {
+        const struct proc_vma *v = &p->vmas[i];
+        if (v->end <= v->start || (addr <= v->start && end >= v->end))
+            slots++;                            /* free, or about to be */
+        else if (v->start < addr && end < v->end)
+            slots--;                            /* split in two */
+    }
+    return slots;
+}
+
 int proc_munmap(struct proc *p, uint32_t addr, uint32_t len)
 {
     if (!len || (addr & (PAGE_SIZE - 1)))
@@ -943,16 +1077,7 @@ int proc_munmap(struct proc *p, uint32_t addr, uint32_t len)
         return -EINVAL;
     if (fb_pinned(p->pid, addr, end))
         return -EBUSY;
-
-    int free_slots = 0, need_split = 0;
-    for (int i = 0; i < MAX_VMAS; i++) {
-        const struct proc_vma *v = &p->vmas[i];
-        if (v->end <= v->start)
-            free_slots++;
-        else if (v->start < addr && end < v->end)
-            need_split++;
-    }
-    if (need_split > free_slots)
+    if (vma_slots_after_unmap(p, addr, end) < 0)
         return -ENOMEM;
 
     for (int i = 0; i < MAX_VMAS; i++) {
@@ -1068,6 +1193,9 @@ int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint32_t *out)
         if ((a->addr & (PAGE_SIZE - 1)) || a->addr < brk_end ||
             a->addr >= USER_MMIO_BASE || len > USER_MMIO_BASE - a->addr)
             return -EINVAL;
+        /* The new mapping's slot must be there before the old one goes. */
+        if (vma_slots_after_unmap(p, a->addr, a->addr + len) < 1)
+            return -ENOMEM;
         int r = proc_munmap(p, a->addr, len);
         if (r < 0)
             return r;

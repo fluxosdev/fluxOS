@@ -198,7 +198,7 @@ static int sock_connect_locked(struct socket *s, const struct sockaddr_in *sin)
             s->rtx_on = 0;
             return -EINTR;
         }
-        sleep_on_lock(s, &net_lock);
+        sleep_on_lock_intr(s, &net_lock);
     }
     if (s->state == TCP_CLOSED) {
         int err = s->error ? s->error : ECONNREFUSED;
@@ -227,7 +227,7 @@ static int sock_accept_locked(struct socket *s, struct socket **out, struct sock
     while (!s->acceptq) {
         if (signal_pending(current))
             return -EINTR;
-        sleep_on_lock(s, &net_lock);
+        sleep_on_lock_intr(s, &net_lock);
     }
     struct socket *c = s->acceptq;
     s->acceptq = c->aq_next;
@@ -263,7 +263,7 @@ static int stream_send(struct socket *s, const uint8_t *buf, uint32_t n, int fla
                 return done ? (int)done : -EAGAIN;
             if (signal_pending(current))
                 return done ? (int)done : -EINTR;
-            sleep_on_lock(s, &net_lock);
+            sleep_on_lock_intr(s, &net_lock);
         }
     }
     return (int)done;
@@ -355,7 +355,7 @@ static int sock_recvfrom_locked(struct socket *s, void *buf, uint32_t n, int fla
                 return -EAGAIN;
             if (signal_pending(current))
                 return -EINTR;
-            sleep_on_lock(s, &net_lock);
+            sleep_on_lock_intr(s, &net_lock);
         }
     }
 
@@ -371,7 +371,7 @@ static int sock_recvfrom_locked(struct socket *s, void *buf, uint32_t n, int fla
             return -EAGAIN;
         if (signal_pending(current))
             return -EINTR;
-        sleep_on_lock(s, &net_lock);
+        sleep_on_lock_intr(s, &net_lock);
     }
     struct dgram *d = s->rq;
     uint32_t k = MIN(n, (uint32_t)d->len);

@@ -109,7 +109,7 @@ static int pipe_read_flags(struct pipe *p, uint8_t *buf, uint32_t n, int nonbloc
             spin_unlock(&pipe_lock);
             return -EINTR;
         }
-        sleep_on_lock(p, &pipe_lock);
+        sleep_on_lock_intr(p, &pipe_lock);
     }
     uint32_t i = 0;
     while (i < n && p->rpos != p->wpos)
@@ -146,7 +146,7 @@ static int pipe_write_flags(struct pipe *p, const uint8_t *buf, uint32_t n, int 
                 spin_unlock(&pipe_lock);
                 return i ? (int)i : -EINTR;
             }
-            sleep_on_lock(p, &pipe_lock);
+            sleep_on_lock_intr(p, &pipe_lock);
             continue;
         }
         p->buf[p->wpos++ % PIPE_SIZE] = (char)buf[i++];

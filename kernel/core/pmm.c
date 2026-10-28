@@ -158,6 +158,11 @@ uint32_t pmm_alloc(void)
 uint32_t pmm_alloc_user(void)
 {
     spin_lock(&pmm_lock);
+    if (free_frames == low_free_frames) {
+        /* None free past 1 GiB (or none there at all): skip the scan. */
+        spin_unlock(&pmm_lock);
+        return pmm_alloc();
+    }
     const uint32_t first = LOW_FRAMES / 32, n = (MAX_FRAMES - LOW_FRAMES) / 32;
     for (uint32_t i = 0; i < n; i++) {
         uint32_t w = first + (high_hint + i) % n;

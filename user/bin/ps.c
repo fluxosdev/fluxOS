@@ -12,6 +12,7 @@ static char state_char(int s)
     case PSTATE_SLEEPING: return 'S';
     case PSTATE_ZOMBIE: return 'Z';
     case PSTATE_EMBRYO: return 'E';
+    case PSTATE_STOPPED: return 'T';
     }
     return '?';
 }

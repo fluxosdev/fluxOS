@@ -7,8 +7,8 @@
  * goes through the filesystem's ops.
  *
  * Started from an installed disk, the root is that disk's filesystem
- * instead (vfs_mount_root); only /dev, /tmp and /mnt stay in ramfs,
- * grafted onto it.
+ * instead (vfs_mount_root); only /dev and /mnt stay in ramfs, grafted
+ * onto it, and /tmp too if the disk is read-only.
  */
 #include "kernel.h"
 #include "blkdev.h"

@@ -28,6 +28,7 @@ enum {
     P_SLEEPING = PSTATE_SLEEPING,
     P_ZOMBIE   = PSTATE_ZOMBIE,
     P_EMBRYO   = PSTATE_EMBRYO,
+    P_STOPPED  = PSTATE_STOPPED,     /* by a stop signal, until SIGCONT or SIGKILL */
 };
 
 struct file;
@@ -46,6 +47,9 @@ struct proc {
     int timed;                  /* P_BLOCKED with a deadline */
     int kthread;                /* kernel thread: ring 0, no signals */
     int exit_status;
+    int stop_sig;               /* the signal that stopped it (P_STOPPED) */
+    int stop_report;            /* stopped, not yet reported to waitpid() */
+    int cont_report;            /* continued, not yet reported to waitpid() */
     uint32_t sig_pending;
     uint32_t sig_ignored;
     uint32_t sig_blocked;
@@ -107,8 +111,10 @@ void proc_start(void);
  *     for (;;) { prepare_wait(chan); if (cond) break; do_wait(); }
  *     cancel_wait();
  * which wait_event() spells out. With a spinlock guarding cond, hold it
- * and use sleep_on_lock(), which lets it go while asleep. A bare
- * sleep_on() suits only naps that look again anyway.
+ * and use sleep_on_lock(), which lets it go while asleep; a caller that
+ * gives up on a signal (cond includes signal_pending()) uses
+ * sleep_on_lock_intr() instead. A bare sleep_on() suits only naps that
+ * look again anyway.
  */
 void prepare_wait(void *chan);
 void prepare_wait_timeout(void *chan, uint32_t deadline);
@@ -117,9 +123,11 @@ void cancel_wait(void);
 void sleep_on(void *chan);
 void sleep_on_timeout(void *chan, uint32_t deadline);
 void sleep_on_lock(void *chan, spinlock_t *lk);
+void sleep_on_lock_intr(void *chan, spinlock_t *lk);
 void sleep_on_lock_timeout(void *chan, spinlock_t *lk, uint32_t deadline);
 void wakeup(void *chan);
 int sleep_ticks(uint32_t n);
+int sleep_ticks_intr(uint32_t n);       /* a pending signal ends it, or skips it */
 
 #define wait_event(chan, cond)                                  \
     do {                                                        \

@@ -99,7 +99,7 @@ static int load_segments(uint32_t *pd, const struct image *vn, uint32_t *entry, 
             continue;
         uint32_t end = ph->vaddr + ph->memsz;
         if (ph->memsz < ph->filesz || ph->vaddr < USER_BASE || end < ph->vaddr ||
-            end > USER_STACK_LIMIT || ph->offset > vn->size ||
+            end > USER_MMIO_BASE || ph->offset > vn->size ||
             ph->filesz > vn->size - ph->offset)
             return -ENOEXEC;
         for (uint32_t va = ALIGN_DOWN(ph->vaddr, PAGE_SIZE); va < end; va += PAGE_SIZE)

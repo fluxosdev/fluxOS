@@ -379,8 +379,16 @@ int stime(const time_t *t) { return ret(sc1(SYS_stime, (int)*t)); }
 int gettimeofday(struct timeval *tv, struct timezone *tz)
 {
     if (tv) {
-        tv->tv_sec = sc0(SYS_time);
-        tv->tv_usec = (suseconds_t)((uptime_ms() % 1000) * 1000);
+        /* Both count the same ticks: read the milliseconds within a second
+         * that did not roll over meanwhile, or the time could go back. */
+        int sec;
+        unsigned int ms;
+        do {
+            sec = sc0(SYS_time);
+            ms = uptime_ms();
+        } while (sc0(SYS_time) != sec);
+        tv->tv_sec = sec;
+        tv->tv_usec = (suseconds_t)((ms % 1000) * 1000);
     }
     if (tz) {
         tz->tz_minuteswest = -tz_get();

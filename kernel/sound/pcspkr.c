@@ -109,7 +109,7 @@ static int spkr_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t 
             spin_unlock(&spkr_lock);
             return done ? (int)(done * sizeof(*t)) : -EINTR;
         }
-        sleep_on_lock(queue, &spkr_lock);
+        sleep_on_lock_intr(queue, &spkr_lock);
     }
     spin_unlock(&spkr_lock);
     return (int)(done * sizeof(*t));
@@ -129,7 +129,7 @@ static int spkr_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
                 spin_unlock(&spkr_lock);
                 return -EINTR;
             }
-            sleep_on_lock(queue, &spkr_lock);
+            sleep_on_lock_intr(queue, &spkr_lock);
         }
         spin_unlock(&spkr_lock);
         return 0;

@@ -280,11 +280,16 @@ struct flux_tms {
 };
 
 /* ---- waitpid(2) ---- */
-#define WNOHANG 1
+#define WNOHANG    1
+#define WUNTRACED  2            /* also report children that stopped */
+#define WCONTINUED 8            /* also report stopped children that went on */
 #define WIFEXITED(s)   (((s) & 0x7f) == 0)
 #define WEXITSTATUS(s) (((s) >> 8) & 0xff)
-#define WIFSIGNALED(s) (((s) & 0x7f) != 0)
+#define WIFSIGNALED(s) (((s) & 0x7f) != 0 && ((s) & 0x7f) != 0x7f)
 #define WTERMSIG(s)    ((s) & 0x7f)
+#define WIFSTOPPED(s)  (((s) & 0xff) == 0x7f)
+#define WSTOPSIG(s)    WEXITSTATUS(s)
+#define WIFCONTINUED(s) ((s) == 0xffff)
 
 /* ---- terminal line discipline flags (SYS_ttymode) ---- */
 #define TTY_ECHO   0x1
@@ -309,6 +314,7 @@ struct utsname {
 #define PSTATE_SLEEPING 4
 #define PSTATE_ZOMBIE   5
 #define PSTATE_EMBRYO   6
+#define PSTATE_STOPPED  7
 
 struct procinfo {
     int32_t  pid;

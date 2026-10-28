@@ -101,7 +101,7 @@ static int output(struct tty *t, const char *s, uint32_t n, int block)
             poll_wakeup();
             if (signal_pending(current))
                 return i ? (int)i : -EINTR;
-            sleep_on_lock(p->obuf, &tty_lock);
+            sleep_on_lock_intr(p->obuf, &tty_lock);
             continue;
         }
         p->obuf[p->ohead++ % OBUF_SIZE] = s[i++];
@@ -242,7 +242,7 @@ int tty_read(struct tty *t, char *buf, uint32_t n)
             spin_unlock(&tty_lock);
             return r;
         }
-        sleep_on_lock(t->ibuf, &tty_lock);
+        sleep_on_lock_intr(t->ibuf, &tty_lock);
     }
 
     uint32_t i = 0;
@@ -438,7 +438,7 @@ static int master_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
             spin_unlock(&tty_lock);
             return p->slave_closed ? 0 : -EINTR;
         }
-        sleep_on_lock(p->obuf, &tty_lock);
+        sleep_on_lock_intr(p->obuf, &tty_lock);
     }
     uint32_t i = 0;
     char *d = buf;
