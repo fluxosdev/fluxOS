@@ -9,6 +9,7 @@ void spin_unlock(spinlock_t *l) { (void)l; CHECK(locked); locked=0; }
 static void reset(void)
 {
     memset(bitmap,0xff,sizeof(bitmap));
+    memset(share_count,0,sizeof(share_count));
     free_frames=low_free_frames=0;search_hint=high_hint=0;reclaim_pages=NULL;
     reclaimed_calls=0;release_count=0;
 }
@@ -49,5 +50,19 @@ int main(void)
     pmm_free(500*PAGE_SIZE);pmm_free(501*PAGE_SIZE);
     CHECK(!pmm_alloc_reserved(2));
     CHECK(pmm_alloc_reserved(1)==500*PAGE_SIZE && low_free_frames==1);
+    /* COW share reference counts delay freeing until the last holder drops it. */
+    uint32_t cow=501*PAGE_SIZE;
+    CHECK(pmm_alloc_reserved(0)==cow && low_free_frames==0);
+    pmm_ref(cow);
+    pmm_ref(cow);
+    CHECK(!pmm_claim_sole(cow));
+    pmm_free(cow);
+    CHECK(free_frames==0);
+    CHECK(!pmm_claim_sole(cow));
+    pmm_free(cow);
+    CHECK(free_frames==0);
+    CHECK(pmm_claim_sole(cow));
+    pmm_free(cow);
+    CHECK(free_frames==1 && low_free_frames==1);
     puts("kernel physical memory: low reserve, high pages, pressure reclaim and contiguous retry passed");
 }
