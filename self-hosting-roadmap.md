@@ -252,8 +252,9 @@ Done:
 
 Left:
 
-- [ ] Run `make test-libc-qemu`, and then the cross-built `make`, `as` and
-      `ld` on fluxOS.
+- [x] `make test-libc-qemu` passes on the real kernel (2026-10-28), and a
+      system built with this libc installs, boots and runs the desktop.
+- [ ] Run the cross-built `make`, `as` and `ld` on fluxOS.
 - [ ] `PATH_MAX` stays 512: the kernel copies paths onto its 16 KiB stacks
       (`rename` holds three), so a larger one needs those buffers on the
       heap first.
