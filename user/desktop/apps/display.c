@@ -511,7 +511,7 @@ static int combo_items(struct dprops *d, enum ctl k, char rows[][48], int *chose
         snprintf(rows[DROW_VGA], 48, "Standard VGA");
         snprintf(rows[DROW_VOODOO], 48, "3dfx Voodoo%s", item_ok(d, k, DROW_VOODOO) ? "" : " (not found)");
         snprintf(rows[DROW_RADEON], 48, "ATI Radeon%s", item_ok(d, k, DROW_RADEON) ? "" : " (not found)");
-        snprintf(rows[DROW_INTEL], 48, "Intel HD Graphics%s", item_ok(d, k, DROW_INTEL) ? "" : " (not found)");
+        snprintf(rows[DROW_INTEL], 48, "Intel HD Graphics (incomplete)%s", item_ok(d, k, DROW_INTEL) ? "" : " (not found)");
         *chosen = d->driver == DRV_STANDARD ? DROW_VGA : d->driver == DRV_NATIVE ? DROW_VOODOO
                   : is_intel(d) ? DROW_INTEL : DROW_RADEON;
         return DRIVER_ROWS;

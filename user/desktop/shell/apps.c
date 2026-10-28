@@ -323,7 +323,64 @@ static void ask_command(struct dialog *d, int id)
         on_cancel(ctx);
 }
 
-/* A box with an icon, a line of text and the given buttons; NULL if one is open. */
+#define MSG_TEXT_W    420               /* message text wraps at this width */
+#define MSG_MAX_LINES (MAX_CONTROLS - 4) /* room left beside the icon and three buttons */
+
+/* Break a message into lines no wider than MSG_TEXT_W: at each '\n', and
+ * between words. Tabs become spaces and other control characters go, as
+ * the font has no glyphs for them. Returns the number of lines; a message
+ * too long for MSG_MAX_LINES ends in "...". */
+static int message_lines(const char *text, char lines[][sizeof(((struct control *)0)->text)])
+{
+    const int cap = (int)sizeof(lines[0]) - 1;
+    int n = 0;
+    const char *p = text;
+    while (*p && n < MSG_MAX_LINES) {
+        char *out = lines[n++];
+        int len = 0, width = 0, last_space = -1;
+        const char *after_space = NULL;
+        for (; *p && *p != '\n'; p++) {
+            char ch = *p == '\t' ? ' ' : *p;
+            if ((unsigned char)ch < 32)
+                continue;
+            int a = gfx_text_width(&font_sans, (char[]){ ch, 0 });
+            if (len && (width + a > MSG_TEXT_W || len == cap)) {
+                if (ch != ' ' && last_space > 0) {
+                    len = last_space;   /* the word goes to the next line */
+                    p = after_space;
+                }
+                break;
+            }
+            if (ch == ' ') {
+                last_space = len;
+                after_space = p + 1;
+            }
+            out[len++] = ch;
+            width += a;
+        }
+        while (len && out[len - 1] == ' ')
+            len--;
+        out[len] = 0;
+        if (*p == '\n')
+            p++;
+        else
+            while (*p == ' ')
+                p++;
+    }
+    if (!*p)
+        while (n > 1 && !lines[n - 1][0])
+            n--;
+    if (*p && n) {
+        char *last = lines[n - 1];
+        size_t l = strlen(last);
+        if (l > (size_t)cap - 3)
+            l = (size_t)cap - 3;
+        memcpy(last + l, "...", 4);
+    }
+    return n ? n : 1;
+}
+
+/* A box with an icon, its text and the given buttons; NULL if one is open. */
 static struct dialog *message_dialog(const char *title, enum icon_id icon, const char *text,
                                      const char *const *labels, const int *ids, int nbuttons)
 {
@@ -333,13 +390,27 @@ static struct dialog *message_dialog(const char *title, enum icon_id icon, const
     }
     if (icon == ICON_STOP || icon == ICON_WARNING)
         sound_error();
-    int w = 62 + gfx_text_width(&font_sans, text) + 24;
+    char lines[MSG_MAX_LINES][sizeof(((struct control *)0)->text)];
+    lines[0][0] = 0;
+    int nlines = message_lines(text, lines);
+    int text_w = 0;
+    for (int i = 0; i < nlines; i++) {
+        int lw = gfx_text_width(&font_sans, lines[i]);
+        if (lw > text_w)
+            text_w = lw;
+    }
+    int w = 62 + text_w + 24;
     int bw = nbuttons * 75 + (nbuttons - 1) * 6;
     if (w < bw + 40)
         w = bw + 40;
     if (w < 240)
         w = 240;
-    int h = 100;
+    /* One line sits level with the middle of the icon; more start at its top. */
+    int line_h = font_sans.height + 2;
+    int text_y = nlines == 1 ? 23 : 14;
+    int h = text_y + nlines * line_h + 62;
+    if (h < 100)
+        h = 100;
     struct dialog *d = dialog_new(title, icon, w, h, WF_NOTASK, &ask_dlg);
     if (!d)
         return NULL;
@@ -347,7 +418,8 @@ static struct dialog *message_dialog(const char *title, enum icon_id icon, const
     d->default_id = ids[0];
     d->cancel_id = ids[nbuttons - 1];
     add(d, CT_ICON, 14, 14, 32, 32, NULL, icon);
-    add(d, CT_LABEL, 62, 23, 0, 0, text, 0);
+    for (int i = 0; i < nlines; i++)
+        add(d, CT_LABEL, 62, text_y + i * line_h, 0, 0, lines[i], 0);
     int first = d->n;
     for (int i = 0; i < nbuttons; i++)
         add(d, CT_BUTTON, (w - bw) / 2 + i * 81, h - 12 - 23, 75, 23, labels[i], ids[i]);
