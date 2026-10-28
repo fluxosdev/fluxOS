@@ -17,8 +17,10 @@
  * is sent.
  *
  * The PHY is reached through MDIC. Its standard registers are at MDIO
- * address 2; Intel's own pages from 768 up are at address 1, chosen by
- * writing the page to register 31 there (Linux's "HV" PHY access). The
+ * address 2; Intel's own pages from 768 up are at address 1, where 768
+ * counts as page 0. Registers 0-15 are the same on every page; for 16-31
+ * the page is written to register 31 at address 1 first, page 0 too
+ * (Linux's "HV" PHY access). The
  * MAC learns the negotiated speed and duplex from the PHY by itself, and
  * the STATUS register reports the link, so after setup only the MAC's
  * registers are read. The PHY is never reset by hardware here (that
@@ -71,7 +73,10 @@
 #define R_TARC0       0x03840
 #define R_TXDCTL1     0x03928
 #define R_TARC1       0x03940
-#define R_MPC         0x04010           /* missed packets, cleared when read */
+#define R_CRCERRS     0x04000           /* the statistics are cleared when read */
+#define R_MPC         0x04010           /* missed packets */
+#define R_GPRC        0x04074           /* good packets received */
+#define R_GPTC        0x04080           /* good packets sent */
 #define R_RFCTL       0x05008
 #define R_MTA         0x05200           /* 32 words on these chips */
 #define R_RAL0        0x05400
@@ -166,6 +171,7 @@
 #define PHY_PAGE_SELECT   0x1F
 #define PHY_PAGE_SHIFT    5
 #define HV_PAGE_START     768
+#define MAX_UNPAGED_REG   15
 #define PHY_REG(page, reg) ((page) << 5 | (reg))
 
 #define MII_BMCR          0x00
@@ -231,6 +237,8 @@ static struct {
     uint32_t tx_next, tx_done;          /* free-running */
     int link_up, speed, full, polls;
     uint32_t max_ltr;                   /* the most latency the BIOS lets us report, encoded */
+    uint32_t hw_rx, hw_tx, hw_crc;      /* the controller's own counts, for the log */
+    int diag, diag_polls;               /* reports left to log after the link came up */
     int irq;
     struct mii_phy phy;
     struct netdev dev;
@@ -326,12 +334,15 @@ static int mdic(int addr, int reg, int value, int write)
     return (int)(v & 0xFFFF);
 }
 
-/* A register by page and number (PHY_REG), the semaphore held. */
+/* A register by page and number (PHY_REG), the semaphore held: page 0,
+ * or 768 and up (the pages between are reached another way, unused here). */
 static int hv_rw(int preg, int value, int write)
 {
     int page = preg >> 5, reg = preg & 0x1F;
     int addr = page >= HV_PAGE_START ? PHY_ADDR_HV : PHY_ADDR;
-    if (page > 0 && mdic(PHY_ADDR_HV, PHY_PAGE_SELECT, page << PHY_PAGE_SHIFT, 1) < 0)
+    if (page == HV_PAGE_START)
+        page = 0;
+    if (reg > MAX_UNPAGED_REG && mdic(PHY_ADDR_HV, PHY_PAGE_SELECT, page << PHY_PAGE_SHIFT, 1) < 0)
         return -1;
     return mdic(addr, reg, value, write);
 }
@@ -592,8 +603,10 @@ static void update_link(int force)
     int full = up && (st & STATUS_FD);
     if (!force && up == e.link_up && speed == e.speed && full == e.full)
         return;
-    if (up)
+    if (up) {
         klog("%s: link up, %d Mbit/s, %s duplex\n", e.dev.name, speed, full ? "full" : "half");
+        e.diag = 6;
+    }
     else if (!force)
         klog("%s: link down\n", e.dev.name);
     e.link_up = up;
@@ -695,6 +708,17 @@ static void e_poll(void)
         e.polls = 0;
         update_link(0);
         netif.rx_dropped += rd(R_MPC);
+        e.hw_rx += rd(R_GPRC);
+        e.hw_tx += rd(R_GPTC);
+        e.hw_crc += rd(R_CRCERRS);
+        /* For the first minute of a link, every 10 s: whether frames get
+         * through the controller at all. */
+        if (e.diag && ++e.diag_polls % 5 == 0) {
+            e.diag--;
+            klog("%s: controller sent %u frames, received %u (CRC errors %u, missed %u); "
+                 "stack sent %u, received %u\n", e.dev.name, e.hw_tx, e.hw_rx, e.hw_crc,
+                 netif.rx_dropped, netif.tx_packets, netif.rx_packets);
+        }
     }
 }
 
@@ -816,6 +840,8 @@ int e1000e_init(void)
     pci_enable(&e.pci, PCI_CMD_MEM | PCI_CMD_MASTER);
     pci_write16(&e.pci, PCI_COMMAND, pci_read16(&e.pci, PCI_COMMAND) & ~0x400);   /* INTx on */
     int me = me_active();
+    klog("eth0: FWSM %08x CTRL %08x CTRL_EXT %08x STATUS %08x EXTCNF_CTRL %08x PHY_CTRL %08x\n",
+         rd(R_FWSM), rd(R_CTRL), rd(R_CTRL_EXT), rd(R_STATUS), rd(R_EXTCNF_CTRL), rd(R_PHY_CTRL));
     e.max_ltr = MAX(pci_read16(&e.pci, PCI_LTR_CAP), pci_read16(&e.pci, PCI_LTR_CAP + 2));
 
     read_mac(e.dev.mac);
