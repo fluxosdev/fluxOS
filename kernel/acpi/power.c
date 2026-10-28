@@ -75,6 +75,7 @@ static spinlock_t info_lock = SPINLOCK_INIT("power");
 static volatile uint32_t power_presses, sleep_presses;
 static volatile int status_dirty, lid_dirty, bright_note, thermal_dirty;
 static volatile uint32_t resumed_at;    /* ticks; buttons just after are the wake's own */
+static volatile int bl_restore;         /* back from S3: the backlight level again */
 static int pwr_chan;
 static struct mutex backlight_mutex = MUTEX_INIT("backlight");
 
@@ -764,6 +765,16 @@ static void kpwrd(void)
         }
         if (!acpi_aml)
             continue;
+        if (bl_restore) {
+            /* The firmware need not bring the panel's backlight back at
+             * the level it had (Linux's acpi_video sets it again too). */
+            bl_restore = 0;
+            if (pw.backlight && pw.nlevels) {
+                mutex_lock(&backlight_mutex);
+                set_level(pw.level);
+                mutex_unlock(&backlight_mutex);
+            }
+        }
         if (bright_note) {
             int note = bright_note;
             bright_note = 0;
@@ -812,6 +823,7 @@ void power_resumed(void)
     resumed_at = ticks;
     status_dirty = 1;
     lid_dirty = 1;
+    bl_restore = 1;
     spin_lock(&info_lock);
     info.sleeps++;
     spin_unlock(&info_lock);

@@ -11,6 +11,15 @@
  * timings it names. Analog (DAC) and DVI/HDMI (TMDS on a UNIPHY) outputs
  * are handled; DisplayPort and laptop panels keep the BIOS mode.
  *
+ * On Evergreen (the Llano APUs, DCE 4.1) the output handled is a laptop
+ * panel behind a DisplayPort bridge (atombios_encoders.c's DCE 4.1 paths):
+ * the UNIPHY transmitter sends DisplayPort to a TRAVIS chip, which turns
+ * it into LVDS for the panel. The panel's own timing comes from the
+ * BIOS's LCD_Info, the bridge's DPCD and the panel's EDID over the AUX
+ * channel (radeon_dp.c). The panel always runs at its own timing; smaller
+ * modes are stretched to it by the scaler. The link is trained on every
+ * mode change.
+ *
  * A mode change follows the DRM helper's order: the encoder is prepared
  * (routed to the controller), the controller turned off, its pixel clock,
  * timing and scanout surface programmed, the encoder set up, and both
@@ -70,19 +79,76 @@
 static const uint32_t grph_primary_high[2] = { 0x6914, 0x6114 };
 static const uint32_t grph_secondary_high[2] = { 0x691C, 0x611C };
 
+#define BIOS_2_SCRATCH 0x172C
+#define S2_CURRENT_BL_LEVEL(s2) (((s2) >> 8) & 0xFF)
+
+/* Evergreen (DCE 4.1): per controller, EG_CRTC_STRIDE apart */
+#define EG_CRTC_STRIDE 0xC00
+#define EG_GRPH_ENABLE 0x6800
+#define EG_GRPH_CONTROL 0x6804
+#define EG_GRPH_LUT_10BIT_BYPASS 0x6808
+#define EG_LUT_10BIT_BYPASS_EN (1u << 8)
+#define EG_GRPH_SWAP_CONTROL 0x680C
+#define EG_GRPH_PRIMARY_SURFACE_ADDRESS 0x6810
+#define EG_GRPH_SECONDARY_SURFACE_ADDRESS 0x6814
+#define EG_GRPH_PITCH  0x6818
+#define EG_GRPH_PRIMARY_HIGH 0x681C
+#define EG_GRPH_SECONDARY_HIGH 0x6820
+#define EG_GRPH_SURFACE_OFFSET_X 0x6824
+#define EG_GRPH_SURFACE_OFFSET_Y 0x6828
+#define EG_GRPH_X_START 0x682C
+#define EG_GRPH_Y_START 0x6830
+#define EG_GRPH_X_END  0x6834
+#define EG_GRPH_Y_END  0x6838
+#define EG_GRPH_FLIP_CONTROL 0x6848
+#define EG_DC_LUT_RW_MODE  0x69E0
+#define EG_DC_LUT_RW_INDEX 0x69E4
+#define EG_DC_LUT_30_COLOR 0x69F0
+#define EG_DC_LUT_WRITE_EN_MASK 0x69F8
+#define EG_DC_LUT_CONTROL  0x6A00
+#define EG_DC_LUT_BLACK_OFFSET_BLUE 0x6A04
+#define EG_DC_LUT_WHITE_OFFSET_BLUE 0x6A10
+#define EG_DESKTOP_HEIGHT  0x6B04
+#define EG_VIEWPORT_START  0x6D70
+#define EG_VIEWPORT_SIZE   0x6D74
+#define EG_MASTER_UPDATE_MODE 0x6EF8
+#define EG_P1PLL_SS_CNTL 0x414
+#define EG_P2PLL_SS_CNTL 0x454
+#define EG_PxPLL_SS_EN   (1u << 12)
+#define EG_DC_GPIO_HPD_A 0x64B4
+
 /* AtomBIOS values */
 #define ATOM_DISABLE 0
 #define ATOM_ENABLE  1
+#define ATOM_ENCODER_MODE_DP  0
+#define ATOM_ENCODER_MODE_LVDS 1
 #define ATOM_ENCODER_MODE_DVI 2
 #define ATOM_ENCODER_MODE_CRT 15
 #define ATOM_DAC1_PS2 1
 #define ATOM_TRANSMITTER_ACTION_DISABLE 0
 #define ATOM_TRANSMITTER_ACTION_ENABLE  1
+#define ATOM_TRANSMITTER_ACTION_LCD_BLOFF 2
+#define ATOM_TRANSMITTER_ACTION_LCD_BLON  3
+#define ATOM_TRANSMITTER_ACTION_BL_BRIGHTNESS_CONTROL 4
 #define ATOM_TRANSMITTER_ACTION_INIT    7
 #define ATOM_TRANSMITTER_ACTION_SETUP   10
+#define ATOM_TRANSMITTER_ACTION_SETUP_VSEMPH 11
+#define EXTERNAL_ENCODER_ACTION_V3_DISABLE_OUTPUT 0x00
+#define EXTERNAL_ENCODER_ACTION_V3_ENABLE_OUTPUT  0x01
+#define EXTERNAL_ENCODER_ACTION_V3_ENCODER_INIT   0x07
+#define EXTERNAL_ENCODER_ACTION_V3_ENCODER_SETUP  0x0F
+#define EXTERNAL_ENCODER_ACTION_V3_DDC_SETUP      0x14
+#define ATOM_PPLL1 0
+#define ATOM_PPLL_INVALID 0xFF      /* SetPixelClock: only the DisplayPort clock divider */
+#define ATOM_SCALER_DISABLE   0
+#define ATOM_SCALER_EXPANSION 2
 #define ATOM_HSYNC_POLARITY 0x02
 #define ATOM_VSYNC_POLARITY 0x04
+#define PANEL_6BIT_PER_COLOR 1
 #define PANEL_8BIT_PER_COLOR 2
+#define ATOM_PANEL_MISC_V13_6BIT_PER_COLOR 0x10
+#define ATOM_PANEL_MISC_V13_8BIT_PER_COLOR 0x20
+#define ATOM_BIOS_INFO_BL_CONTROLLED_BY_GPU 0x0020
 #define PIXEL_CLOCK_MISC_CRTC_SEL_CRTC2 0x04
 #define DISPPLL_CONFIG_COHERENT_MODE 0x20
 #define DISPPLL_CONFIG_DUAL_LINK     0x40
@@ -103,7 +169,10 @@ static const uint32_t grph_secondary_high[2] = { 0x691C, 0x611C };
 #define ENCODER_INTERNAL_KLDSCP_LVTMA 0x1F
 #define ENCODER_INTERNAL_UNIPHY1      0x20
 #define ENCODER_INTERNAL_UNIPHY2      0x21
+#define ENCODER_NUTMEG                0x22  /* DisplayPort to VGA bridge */
+#define ENCODER_TRAVIS                0x23  /* DisplayPort to LVDS bridge */
 
+#define CONNECTOR_VGA             0x05
 #define CONNECTOR_DUAL_LINK_DVI_I 0x02
 #define CONNECTOR_DUAL_LINK_DVI_D 0x04
 #define CONNECTOR_HDMI_TYPE_B     0x0D
@@ -113,6 +182,7 @@ static const uint32_t grph_secondary_high[2] = { 0x691C, 0x611C };
 
 #define OBJECT_TYPE_ENCODER 2
 #define ATOM_I2C_RECORD_TYPE 1
+#define ATOM_HPD_INT_RECORD_TYPE 2
 #define ATOM_MAX_OBJECT_RECORD_NUMBER 21
 
 /* Command table arguments */
@@ -141,11 +211,27 @@ union adjust_args {
 };
 struct dac_args { uint16_t clock; uint8_t standard, action; } PACKED;
 struct output_args { uint8_t action, pad[3]; } PACKED;
+struct pixclk_v5_args {
+    uint8_t crtc, reserved;
+    uint16_t clock, fb_div;
+    uint8_t post_div, ref_div, ppll, transmitter, encoder_mode, misc;
+    uint32_t fb_div_frac;           /* millionths */
+} PACKED;
 struct dig_enc_args {
     uint16_t clock;
-    uint8_t config, action, encoder_mode, lanes, v3_bpc, reserved;
+    uint8_t config, action;
+    uint8_t encoder_mode;           /* or the panel mode, for SETUP_PANEL_MODE */
+    uint8_t lanes, v3_bpc, v4_hpd;
 } PACKED;
-struct dig_tx_args { uint16_t clock; uint8_t config, action, reserved[4]; } PACKED;
+struct dig_tx_args {
+    uint16_t clock;                 /* or the connector (INIT), or lane select and set (SETUP_VSEMPH) */
+    uint8_t config, action, v3_lanes, reserved[3];
+} PACKED;
+struct ext_enc_args {
+    uint16_t clock;                 /* or the connector, for ENCODER_INIT */
+    uint8_t config, action, encoder_mode, lanes, bpc, reserved;
+    uint32_t reserved2[2];
+} PACKED;
 struct crtc_src_args { uint8_t crtc, v1_device_v2_encoder, v2_encode_mode, pad; } PACKED;
 struct yuv_args { uint8_t enable, crtc, pad[2]; } PACKED;
 
@@ -154,6 +240,7 @@ struct yuv_args { uint8_t enable, crtc, pad[2]; } PACKED;
 struct pll {
     uint32_t reference_freq;
     uint32_t pll_out_min, pll_out_max;
+    uint32_t lcd_out_min, lcd_out_max;  /* the range for a panel */
     uint32_t min_ref_div, max_ref_div;
     uint32_t min_post_div, max_post_div;
     uint32_t min_feedback_div, max_feedback_div;
@@ -162,14 +249,21 @@ struct pll {
 #define PLL_USE_REF_DIV      (1u << 0)
 #define PLL_USE_POST_DIV     (1u << 1)
 #define PLL_USE_FRAC_FB_DIV  (1u << 2)
+#define PLL_IS_LCD           (1u << 3)
 
 /* The output the BIOS lit. */
 static struct {
     uint16_t device;                /* ATOM_DEVICE_*_SUPPORT bit of its display path */
     uint16_t connector;             /* object IDs */
     uint16_t encoder;
+    uint16_t ext_encoder;           /* a DisplayPort bridge after it, or 0 */
     uint8_t i2c_id;                 /* its DDC line in GPIO_I2C_Info, 0 for none */
+    uint8_t hpd;                    /* its hot plug detect pin, 0xFF for none */
 } out;
+
+/* A laptop panel's own timing, from LCD_Info, and its colour depth. */
+static struct timing panel;
+static int panel_bpc;
 
 /* A GPIO pair driven as an I2C bus (radeon_i2c.c). */
 struct gpio_i2c {
@@ -182,7 +276,10 @@ static struct atom_context atom;
 static uint8_t *bios;
 static struct pll pll;
 static uint32_t max_pixclock;       /* kHz, from the BIOS */
+static uint32_t dp_extclk;          /* 10 kHz: DisplayPort's reference from outside, or 0 */
+static uint16_t fw_caps;            /* FirmwareInfo's capability flags */
 static int crtc_id;                 /* the controller we drive; its PLL has the same number */
+static int pll_id;                  /* Evergreen: the PLL it runs from */
 static int tx_initialised;
 
 static struct modelist ml;
@@ -244,6 +341,21 @@ static int run(int index, void *args, uint32_t size)
     return atom_execute(&atom, index, args, size);
 }
 
+int radeon_atom_run(int index, void *args, uint32_t size)
+{
+    return run(index, args, size);
+}
+
+uint8_t *radeon_atom_scratch(void)
+{
+    return (uint8_t *)atom.scratch;
+}
+
+static uint32_t crtc_off(int c)
+{
+    return (uint32_t)c * (RADEON_EVERGREEN() ? EG_CRTC_STRIDE : CRTC_STRIDE);
+}
+
 /* ---- the video BIOS ---- */
 
 #define BIOS_MAX (128u * 1024)
@@ -286,6 +398,17 @@ static int read_clock_info(void)
     pll.pll_out_max = atom_u32(&atom, fw + 32u);
     if (!pll.pll_out_min)
         pll.pll_out_min = 64800;
+    pll.lcd_out_min = pll.pll_out_min;
+    pll.lcd_out_max = pll.pll_out_max;
+    if (frev >= 2 || crev >= 4) {
+        if (atom_u16(&atom, fw + 48u))
+            pll.lcd_out_min = (uint32_t)atom_u16(&atom, fw + 48u) * 100;     /* MHz */
+        if (atom_u16(&atom, fw + 50u))
+            pll.lcd_out_max = (uint32_t)atom_u16(&atom, fw + 50u) * 100;
+    }
+    fw_caps = atom_u16(&atom, fw + 80u);
+    if (RADEON_EVERGREEN())
+        dp_extclk = atom_u16(&atom, fw + 86u);      /* FirmwareInfo 2.1 */
     pll.min_post_div = 2;
     pll.max_post_div = 0x7F;
     pll.min_ref_div = 2;
@@ -341,6 +464,8 @@ static int is_duallink(uint32_t clock)
 
 static int encoder_mode(void)
 {
+    if (out.ext_encoder)
+        return ATOM_ENCODER_MODE_DP;        /* what a bridge takes in */
     return is_dig() ? ATOM_ENCODER_MODE_DVI : ATOM_ENCODER_MODE_CRT;
 }
 
@@ -352,18 +477,55 @@ static int device_index(uint16_t device)
     return 0;
 }
 
-/* Walk an object's records for its I2C line. */
-static uint8_t object_i2c(uint32_t records)
+/* Walk an object's records for one of a type; its offset, or 0. */
+static uint32_t object_record(uint32_t records, uint8_t want)
 {
     for (int guard = 0; guard < 32; guard++) {
         uint8_t type = atom_u8(&atom, records), size = atom_u8(&atom, records + 1);
         if (!size || !type || type > ATOM_MAX_OBJECT_RECORD_NUMBER)
             break;
-        if (type == ATOM_I2C_RECORD_TYPE)
-            return atom_u8(&atom, records + 2);
+        if (type == want)
+            return records;
         records += size;
     }
     return 0;
+}
+
+static uint8_t object_i2c(uint32_t records)
+{
+    uint32_t rec = object_record(records, ATOM_I2C_RECORD_TYPE);
+    return rec ? atom_u8(&atom, rec + 2) : 0;
+}
+
+/* The hot plug detect pin an object's HPD record names: its GPIO in
+ * GPIO_Pin_LUT is a bit of DC_GPIO_HPD_A (Evergreen's address), one per
+ * pin (radeon_atom_get_hpd_info_from_gpio). 0xFF for none. */
+static uint8_t object_hpd(uint32_t records)
+{
+    static const uint8_t shifts[6] = { 0, 8, 16, 24, 26, 28 };
+    uint32_t rec = object_record(records, ATOM_HPD_INT_RECORD_TYPE);
+    uint16_t size;
+    uint16_t lut = atom_data_table(&atom, ATOM_DATA_GPIO_PIN_LUT, &size, NULL, NULL);
+    if (!rec || !lut)
+        return 0xFF;
+    uint8_t gpio = atom_u8(&atom, rec + 2);
+    for (uint32_t o = lut + 4u; o + 4 <= (uint32_t)lut + size; o += 4) {
+        if (atom_u8(&atom, o + 3) != gpio)
+            continue;
+        if (atom_u16(&atom, o) * 4u != EG_DC_GPIO_HPD_A)
+            return 0xFF;
+        for (uint8_t pin = 0; pin < 6; pin++)
+            if (atom_u8(&atom, o + 2) == shifts[pin])
+                return pin;
+        return 0xFF;
+    }
+    return 0xFF;
+}
+
+static int is_bridge(uint16_t obj)
+{
+    return ((obj >> 12) & 7) == OBJECT_TYPE_ENCODER &&
+           ((obj & 0xFF) == ENCODER_NUTMEG || (obj & 0xFF) == ENCODER_TRAVIS);
 }
 
 /* Find the display path of the active device in Object_Header
@@ -388,26 +550,35 @@ static int find_output(void)
         if (size < 8)
             break;
         if ((tag & supported & active) && !(tag & (ATOM_DEVICE_TV_SUPPORT | ATOM_DEVICE_CV_SUPPORT))) {
-            uint16_t encoder = 0;
-            for (int j = 0; j < (size - 8) / 2 && !encoder; j++) {
+            uint16_t encoder = 0, ext = 0;
+            for (int j = 0; j < (size - 8) / 2; j++) {
                 uint16_t obj = atom_u16(&atom, path + 8u + 2u * (uint32_t)j);
-                if (((obj >> 12) & 7) == OBJECT_TYPE_ENCODER) {
-                    for (int k = 0; k < atom_u8(&atom, enc_tab); k++)
-                        if (atom_u16(&atom, enc_tab + 4u + 8u * (uint32_t)k) == obj)
-                            encoder = obj;
+                if (((obj >> 12) & 7) != OBJECT_TYPE_ENCODER)
+                    continue;
+                for (int k = 0; k < atom_u8(&atom, enc_tab); k++) {
+                    if (atom_u16(&atom, enc_tab + 4u + 8u * (uint32_t)k) != obj)
+                        continue;
+                    if (is_bridge(obj))
+                        ext = obj;
+                    else if (!encoder)
+                        encoder = obj;
                 }
             }
-            uint8_t i2c = 0;
+            uint8_t i2c = 0, hpd = 0xFF;
             for (int k = 0; k < atom_u8(&atom, con_tab); k++) {
                 uint32_t o = con_tab + 4u + 8u * (uint32_t)k;
-                if (atom_u16(&atom, o) == conn)
+                if (atom_u16(&atom, o) == conn) {
                     i2c = object_i2c(hdr + atom_u16(&atom, o + 4));
+                    hpd = object_hpd(hdr + atom_u16(&atom, o + 4));
+                }
             }
             if (encoder) {
                 out.device = tag;
                 out.connector = conn;
                 out.encoder = encoder;
+                out.ext_encoder = ext;
                 out.i2c_id = i2c;
+                out.hpd = hpd;
                 return 0;
             }
         }
@@ -693,7 +864,8 @@ static void compute_pll(uint32_t flags, uint32_t ref_div_in, uint32_t post_div_i
     if (flags & PLL_USE_POST_DIV) {
         post_div_min = post_div_max = post_div_in;
     } else {
-        uint32_t vco_min = pll.pll_out_min, vco_max = pll.pll_out_max;
+        uint32_t vco_min = flags & PLL_IS_LCD ? pll.lcd_out_min : pll.pll_out_min;
+        uint32_t vco_max = flags & PLL_IS_LCD ? pll.lcd_out_max : pll.pll_out_max;
         if (frac) {
             vco_min *= 10;
             vco_max *= 10;
@@ -796,7 +968,13 @@ static void select_crtc_source(void)
             a.v1_device_v2_encoder = ASIC_INT_DAC2_ENCODER_ID;
         else
             a.v1_device_v2_encoder = ASIC_INT_DAC1_ENCODER_ID;
-        a.v2_encode_mode = (uint8_t)encoder_mode();
+        /* A bridge is routed as what comes out of it. */
+        if (out.device & ATOM_DEVICE_LCD_SUPPORT)
+            a.v2_encode_mode = ATOM_ENCODER_MODE_LVDS;
+        else if (out.ext_encoder && (out.connector & 0xFF) == CONNECTOR_VGA)
+            a.v2_encode_mode = ATOM_ENCODER_MODE_CRT;
+        else
+            a.v2_encode_mode = (uint8_t)encoder_mode();
     }
     run(ATOM_CMD_SELECT_CRTC_SOURCE, &a, sizeof(a));
 }
@@ -805,7 +983,10 @@ static void select_crtc_source(void)
  * divider choices it implies. */
 static uint32_t adjust_pll(uint32_t clock, uint32_t *flags, uint32_t *ref_div, uint32_t *post_div)
 {
-    *flags = clock > 165000 ? PLL_USE_FRAC_FB_DIV : 0;
+    /* The APUs always use the fractional feedback divider. */
+    *flags = clock > 165000 || RADEON_EVERGREEN() ? PLL_USE_FRAC_FB_DIV : 0;
+    if (out.device & ATOM_DEVICE_LCD_SUPPORT)
+        *flags |= PLL_IS_LCD;
     uint8_t frev, crev;
     if (!atom_cmd_revision(&atom, ATOM_CMD_ADJUST_DISPLAY_PLL, &frev, &crev) || frev != 1)
         return clock;
@@ -823,11 +1004,16 @@ static uint32_t adjust_pll(uint32_t clock, uint32_t *flags, uint32_t *ref_div, u
     a.v3in.clock = (uint16_t)(clock / 10);
     a.v3in.transmitter = (uint8_t)enc_obj();
     a.v3in.encode_mode = (uint8_t)encoder_mode();
-    if (out.device & ATOM_DEVICE_DFP_SUPPORT) {
+    if (encoder_mode() == ATOM_ENCODER_MODE_DP) {
+        /* The PLL clocks the link, not the pixels. */
+        a.v3in.disp_pll_config = DISPPLL_CONFIG_COHERENT_MODE;
+        a.v3in.clock = (uint16_t)(dpsink.link_clock / 10);
+    } else if (out.device & ATOM_DEVICE_DFP_SUPPORT) {
         a.v3in.disp_pll_config = DISPPLL_CONFIG_COHERENT_MODE;
         if (is_duallink(clock))
             a.v3in.disp_pll_config |= DISPPLL_CONFIG_DUAL_LINK;
     }
+    a.v3in.ext_transmitter = (uint8_t)(out.ext_encoder & 0xFF);
     run(ATOM_CMD_ADJUST_DISPLAY_PLL, &a, sizeof(a));
     uint32_t adjusted = a.v3out.disp_pll_freq * 10;
     if (a.v3out.ref_div) {
@@ -1059,15 +1245,290 @@ static void disable_other_crtc(void)
     crtc_id = other;
     crtc_call(ATOM_CMD_UPDATE_CRTC_DBUF, ATOM_ENABLE);
     crtc_dpms(0);
-    wr(DGRPH_ENABLE + (uint32_t)other * CRTC_STRIDE, 0);
+    wr((RADEON_EVERGREEN() ? EG_GRPH_ENABLE : DGRPH_ENABLE) + crtc_off(other), 0);
     crtc_call(ATOM_CMD_UPDATE_CRTC_DBUF, ATOM_DISABLE);
     crtc_id = saved;
     rv.crtcs = 1 << crtc_id;
 }
 
+/* ---- Evergreen: a panel behind a DisplayPort bridge (DCE 4.1) ---- */
+
+static uint8_t bpc_code(void)
+{
+    return panel_bpc == 6 ? PANEL_6BIT_PER_COLOR : PANEL_8BIT_PER_COLOR;
+}
+
+/* DIGxEncoderControl (atombios_dig_encoder_setup2). Llano's DIG encoder
+ * n serves controller n. */
+static void dig_encoder_dce4(int action, int panel_mode)
+{
+    uint8_t frev, crev;
+    if (!atom_cmd_revision(&atom, ATOM_CMD_DIGX_ENCODER, &frev, &crev) || frev != 1 || crev < 2 ||
+        crev > 4)
+        return;
+    struct dig_enc_args a;
+    memset(&a, 0, sizeof(a));
+    a.clock = (uint16_t)(panel.clock / 10);
+    a.action = (uint8_t)action;
+    a.encoder_mode = (uint8_t)(action == ATOM_ENCODER_CMD_SETUP_PANEL_MODE ? panel_mode : encoder_mode());
+    a.lanes = (uint8_t)dpsink.lanes;
+    a.v3_bpc = bpc_code();
+    a.config = (uint8_t)(crtc_id << 4);
+    if (crev < 4) {
+        a.config |= dpsink.link_clock == 270000 ? 0x01 : 0;
+    } else {
+        a.config |= dpsink.link_clock == 540000 ? 0x02 : dpsink.link_clock == 270000 ? 0x01 : 0;
+        a.v4_hpd = out.hpd == 0xFF ? 0 : (uint8_t)(out.hpd + 1);
+    }
+    run(ATOM_CMD_DIGX_ENCODER, &a, sizeof(a));
+}
+
+/* UNIPHYTransmitterControl 1.3 for DisplayPort (atombios_dig_transmitter_setup2) */
+static void dig_transmitter_dce4(int action, uint8_t lane_set)
+{
+    uint8_t frev, crev;
+    if (!atom_cmd_revision(&atom, ATOM_CMD_UNIPHY_TRANSMITTER, &frev, &crev) || frev != 1 || crev != 3)
+        return;
+    int init = action == ATOM_TRANSMITTER_ACTION_INIT;
+    int dig = init ? 0 : crtc_id;
+    int sel = enc_obj() == ENCODER_INTERNAL_UNIPHY1 ? 1 : enc_obj() == ENCODER_INTERNAL_UNIPHY2 ? 2 : 0;
+    int refclk = dp_extclk ? 2 : init ? 0 : pll_id;   /* PPLL1, PPLL2 or the external clock */
+    struct dig_tx_args a;
+    memset(&a, 0, sizeof(a));
+    a.action = (uint8_t)action;
+    if (init)
+        a.clock = out.connector & 0xFF;
+    else if (action == ATOM_TRANSMITTER_ACTION_SETUP_VSEMPH)
+        a.clock = (uint16_t)(lane_set << 8);    /* lane select 0: all of them */
+    else
+        a.clock = (uint16_t)(dpsink.link_clock / 10);
+    a.v3_lanes = (uint8_t)dpsink.lanes;
+    /* coherent (DisplayPort wants it), link B, the DIG, the reference, the PHY */
+    a.config = (uint8_t)(0x02 | (linkb() ? 0x04 : 0) | (dig & 1) << 3 | (refclk & 3) << 4 | sel << 6);
+    run(ATOM_CMD_UNIPHY_TRANSMITTER, &a, sizeof(a));
+}
+
+/* ExternalEncoderControl 2.3: the bridge (atombios_external_encoder_setup).
+ * Which bridge is in its config, by the object's enum ID. */
+static void ext_encoder(int action)
+{
+    uint8_t frev, crev;
+    if (!out.ext_encoder || !atom_cmd_revision(&atom, ATOM_CMD_EXTERNAL_ENCODER, &frev, &crev) ||
+        frev != 2 || crev != 3)
+        return;
+    int which = MAX(((out.ext_encoder >> 8) & 7) - 1, 0);
+    struct ext_enc_args a;
+    memset(&a, 0, sizeof(a));
+    a.action = (uint8_t)action;
+    a.clock = action == EXTERNAL_ENCODER_ACTION_V3_ENCODER_INIT ? out.connector & 0xFF
+                                                                 : (uint16_t)(panel.clock / 10);
+    a.encoder_mode = ATOM_ENCODER_MODE_DP;
+    a.config = (uint8_t)((dpsink.link_clock == 540000 ? 0x02 : dpsink.link_clock == 270000 ? 0x01 : 0) |
+                         which << 4);
+    a.lanes = (uint8_t)dpsink.lanes;
+    a.bpc = bpc_code();
+    run(ATOM_CMD_EXTERNAL_ENCODER, &a, sizeof(a));
+}
+
+void radeon_dp_encoder(int action)
+{
+    dig_encoder_dce4(action, 0);
+}
+
+void radeon_dp_vsemph(uint8_t lane_set)
+{
+    dig_transmitter_dce4(ATOM_TRANSMITTER_ACTION_SETUP_VSEMPH, lane_set);
+}
+
+/*
+ * The controller's clock (atombios_crtc_set_pll). The PLL clocks the
+ * DisplayPort link, and the controller's pixels come from a divider of
+ * it; with an external DisplayPort reference there is no PLL to set
+ * (ATOM_PPLL_INVALID), only that divider. Llano does not share PLLs;
+ * the other controller is off, so PPLL1 is free.
+ */
+static int set_pll_dce4(uint32_t clock)
+{
+    pll_id = dp_extclk ? ATOM_PPLL_INVALID : ATOM_PPLL1;
+    uint32_t flags, ref_div = 0, post_div = 0, fb_div, frac_fb_div;
+    uint32_t adjusted = adjust_pll(clock, &flags, &ref_div, &post_div);
+    compute_pll(flags, ref_div, post_div, adjusted, &fb_div, &frac_fb_div, &ref_div, &post_div);
+    if (pll_id == ATOM_PPLL1)
+        wr(EG_P1PLL_SS_CNTL, rd(EG_P1PLL_SS_CNTL) & ~EG_PxPLL_SS_EN);  /* no spread spectrum */
+
+    uint8_t frev, crev;
+    if (!atom_cmd_revision(&atom, ATOM_CMD_SET_PIXEL_CLOCK, &frev, &crev) || frev != 1 || crev != 5) {
+        klog("radeon: no SetPixelClock table this driver knows (%u.%u)\n", frev, crev);
+        return -1;
+    }
+    struct pixclk_v5_args a;
+    memset(&a, 0, sizeof(a));
+    a.crtc = (uint8_t)crtc_id;
+    a.clock = (uint16_t)(clock / 10);
+    a.ref_div = (uint8_t)ref_div;
+    a.fb_div = (uint16_t)fb_div;
+    a.fb_div_frac = frac_fb_div * 100000;
+    a.post_div = (uint8_t)post_div;
+    a.ppll = (uint8_t)pll_id;
+    a.transmitter = (uint8_t)enc_obj();
+    a.encoder_mode = (uint8_t)encoder_mode();
+    if (pll_id == ATOM_PPLL_INVALID)
+        klog("radeon: pixel clock %u kHz from the external DisplayPort clock\n", clock);
+    else
+        klog("radeon: pixel clock %u kHz, PPLL1 at %u kHz: fb %u.%u ref %u post %u\n", clock, adjusted,
+             fb_div, frac_fb_div, ref_div, post_div);
+    return run(ATOM_CMD_SET_PIXEL_CLOCK, &a, sizeof(a));
+}
+
+/* Scan out a w x h surface at page 0 (dce4_crtc_do_set_base). */
+static void set_base_dce4(const struct timing *t, int bpp, uint32_t pitch_px)
+{
+    uint32_t off = crtc_off(crtc_id);
+    uint64_t addr = rv.mc_base + rv.page0;
+    wr(crtc_id ? D2VGA_CONTROL : D1VGA_CONTROL, 0);
+    wr(EG_GRPH_FLIP_CONTROL + off, 0);
+    wr(EG_GRPH_PRIMARY_HIGH + off, (uint32_t)(addr >> 32) & 0xFF);
+    wr(EG_GRPH_SECONDARY_HIGH + off, (uint32_t)(addr >> 32) & 0xFF);
+    wr(EG_GRPH_PRIMARY_SURFACE_ADDRESS + off, (uint32_t)addr & ~0xFFu);
+    wr(EG_GRPH_SECONDARY_SURFACE_ADDRESS + off, (uint32_t)addr & ~0xFFu);
+    wr(EG_GRPH_CONTROL + off, bpp == 16 ? GRPH_DEPTH_16BPP | GRPH_RGB565 : GRPH_DEPTH_32BPP);  /* linear */
+    wr(EG_GRPH_SWAP_CONTROL + off, 0);
+    wr(EG_GRPH_LUT_10BIT_BYPASS + off, rd(EG_GRPH_LUT_10BIT_BYPASS + off) & ~EG_LUT_10BIT_BYPASS_EN);
+    wr(EG_GRPH_SURFACE_OFFSET_X + off, 0);
+    wr(EG_GRPH_SURFACE_OFFSET_Y + off, 0);
+    wr(EG_GRPH_X_START + off, 0);
+    wr(EG_GRPH_Y_START + off, 0);
+    wr(EG_GRPH_X_END + off, t->w);
+    wr(EG_GRPH_Y_END + off, t->h);
+    wr(EG_GRPH_PITCH + off, pitch_px);
+    wr(EG_GRPH_ENABLE + off, 1);
+    wr(EG_DESKTOP_HEIGHT + off, t->h);
+    wr(EG_VIEWPORT_START + off, 0);
+    wr(EG_VIEWPORT_SIZE + off, (uint32_t)t->w << 16 | ((t->h + 1u) & ~1u));
+    wr(EG_MASTER_UPDATE_MODE + off, 0);     /* flips anywhere in the vertical blank */
+}
+
+/* An identity gamma ramp (dce4_crtc_load_lut). */
+static void load_lut_dce4(void)
+{
+    uint32_t off = crtc_off(crtc_id);
+    wr(EG_DC_LUT_CONTROL + off, 0);
+    for (uint32_t i = 0; i < 3; i++) {
+        wr(EG_DC_LUT_BLACK_OFFSET_BLUE + off + 4 * i, 0);
+        wr(EG_DC_LUT_WHITE_OFFSET_BLUE + off + 4 * i, 0xFFFF);
+    }
+    wr(EG_DC_LUT_RW_MODE + off, 0);
+    wr(EG_DC_LUT_WRITE_EN_MASK + off, 7);
+    wr(EG_DC_LUT_RW_INDEX + off, 0);
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t v = i << 2 | i >> 6;
+        wr(EG_DC_LUT_30_COLOR + off, v << 20 | v << 10 | v);
+    }
+}
+
+/* The output on or off (radeon_atom_encoder_dpms_dig, DCE 4.1). On: the
+ * encoder set up, the transmitter on, the link trained, the video
+ * started, the backlight on, the bridge's output on. The TRAVIS bridge
+ * wants the sink powered down only after the transmitter. Returns the
+ * link training's result. */
+static int encoder_dpms_dce4(int on)
+{
+    int lcd = (out.device & ATOM_DEVICE_LCD_SUPPORT) != 0;
+    int travis = lcd && (out.ext_encoder & 0xFF) == ENCODER_TRAVIS;
+    if (on) {
+        int panel_mode = radeon_dp_panel_mode(out.ext_encoder != 0);
+        dig_encoder_dce4(ATOM_ENCODER_CMD_SETUP, 0);
+        dig_encoder_dce4(ATOM_ENCODER_CMD_SETUP_PANEL_MODE, panel_mode);
+        ext_encoder(EXTERNAL_ENCODER_ACTION_V3_ENCODER_SETUP);
+        dig_transmitter_dce4(ATOM_TRANSMITTER_ACTION_ENABLE, 0);
+        int r = radeon_dp_link_train(panel_mode);
+        dig_encoder_dce4(ATOM_ENCODER_CMD_DP_VIDEO_ON, 0);
+        if (lcd) {
+            /* At the level the BIOS keeps in scratch register 2, if the
+             * backlight is the GPU's to drive. */
+            if ((fw_caps & ATOM_BIOS_INFO_BL_CONTROLLED_BY_GPU) && S2_CURRENT_BL_LEVEL(rd(BIOS_2_SCRATCH)))
+                dig_transmitter_dce4(ATOM_TRANSMITTER_ACTION_BL_BRIGHTNESS_CONTROL, 0);
+            dig_transmitter_dce4(ATOM_TRANSMITTER_ACTION_LCD_BLON, 0);
+        }
+        ext_encoder(EXTERNAL_ENCODER_ACTION_V3_ENABLE_OUTPUT);
+        return r;
+    }
+    dig_encoder_dce4(ATOM_ENCODER_CMD_DP_VIDEO_OFF, 0);
+    ext_encoder(EXTERNAL_ENCODER_ACTION_V3_DISABLE_OUTPUT);
+    if (lcd)
+        dig_transmitter_dce4(ATOM_TRANSMITTER_ACTION_LCD_BLOFF, 0);
+    if (!travis)
+        radeon_dp_set_power(0);
+    dig_transmitter_dce4(ATOM_TRANSMITTER_ACTION_DISABLE, 0);
+    if (travis)
+        radeon_dp_set_power(0);
+    return 0;
+}
+
+/* The bridge's DPCD, and a link for the panel's clock: without them the
+ * mode cannot be set, and nothing has been changed. */
+static int link_ready(void)
+{
+    if (!dpsink.dpcd_ok) {
+        ext_encoder(EXTERNAL_ENCODER_ACTION_V3_DDC_SETUP);
+        radeon_dp_read_dpcd();
+    }
+    if (!dpsink.dpcd_ok) {
+        klog("radeon: the DisplayPort bridge does not answer on AUX channel %02x\n", dpsink.channel);
+        return -1;
+    }
+    if (radeon_dp_link_config(panel.clock, panel_bpc * 3, (out.ext_encoder & 0xFF) == ENCODER_NUTMEG) < 0) {
+        klog("radeon: no DisplayPort link carries %u kHz (sink: %u lanes, rate code %02x)\n", panel.clock,
+             dpsink.dpcd[2] & 0x1F, dpsink.dpcd[1]);
+        return -1;
+    }
+    return 0;
+}
+
+/* The mode change for Evergreen. The controller always runs the panel's
+ * timing; a smaller view is stretched to it. */
+static int program_mode_dce4(const struct timing *view, int bpp, uint32_t pitch_px)
+{
+    disable_other_crtc();
+    if (!tx_initialised) {
+        dig_transmitter_dce4(ATOM_TRANSMITTER_ACTION_INIT, 0);
+        ext_encoder(EXTERNAL_ENCODER_ACTION_V3_ENCODER_INIT);
+        tx_initialised = 1;
+    }
+    /* encoder prepare */
+    output_lock(1);
+    select_crtc_source();
+    /* controller prepare */
+    crtc_call(ATOM_CMD_UPDATE_CRTC_DBUF, ATOM_ENABLE);
+    crtc_dpms(0);
+    /* controller mode set */
+    int r = set_pll_dce4(panel.clock);
+    set_timing(&panel);
+    set_base_dce4(view, bpp, pitch_px);
+    struct overscan_args ov;
+    memset(&ov, 0, sizeof(ov));
+    ov.crtc = (uint8_t)crtc_id;
+    run(ATOM_CMD_SET_CRTC_OVERSCAN, &ov, sizeof(ov));
+    int scaled = view->w != panel.w || view->h != panel.h;
+    struct scaler_args sc = { (uint8_t)crtc_id, scaled ? ATOM_SCALER_EXPANSION : ATOM_SCALER_DISABLE, 0, 0 };
+    run(ATOM_CMD_ENABLE_SCALER, &sc, sizeof(sc));
+    /* encoder mode set */
+    encoder_dpms_dce4(0);
+    /* controller commit */
+    crtc_dpms(1);
+    load_lut_dce4();
+    crtc_call(ATOM_CMD_UPDATE_CRTC_DBUF, ATOM_DISABLE);
+    /* encoder commit */
+    int link = encoder_dpms_dce4(1);
+    output_lock(0);
+    return r < 0 ? r : link;
+}
+
 /* The whole mode change, in the DRM helper's order. */
 static int program_mode(const struct timing *t, int bpp, uint32_t pitch_px)
 {
+    if (RADEON_EVERGREEN())
+        return program_mode_dce4(t, bpp, pitch_px);
     uint32_t clock = t->clock;
     disable_other_crtc();
     if (is_dig() && !tx_initialised) {
@@ -1131,35 +1592,55 @@ static void use_native_fb(const struct timing *t, int bpp, uint32_t pitch_px)
 
 static int busy;
 
+/* What a native mode put on the screen, to set again after waking. */
+static const struct timing *cur_timing;
+static int cur_bpp;
+static uint32_t cur_pitch;
+
 int radeon_native_set(const struct dispmode *m)
 {
     if (busy)
         return -EBUSY;
+    const struct timing *t;
+    int bpp;
+    uint32_t pitch_px;
     if (m->width == 0) {            /* back to the BIOS mode */
         if (!rv.native)
             return 0;
         if (!boot_timing_ok)
             return -EINVAL;
-        busy = 1;
-        memset(fb_boot.base, 0, fb_boot.pitch * fb_boot.height);
-        program_mode(&boot_timing, (int)fb_boot.bpp, fb_boot.pitch / fb_boot.bytespp);
-        fb = fb_boot;
-        rv.native = 0;
+        t = &boot_timing;
+        bpp = (int)fb_boot.bpp;
+        pitch_px = fb_boot.pitch / fb_boot.bytespp;
     } else {
         if (m->bpp != 16 && m->bpp != 32)
             return -EINVAL;
-        const struct timing *t = modes_find(&ml, m->width, m->height, m->refresh);
+        t = modes_find(&ml, m->width, m->height, m->refresh);
         if (!t)
             return -EINVAL;
-        uint32_t pitch_px = pitch_pixels(t->w, m->bpp);
-        busy = 1;
-        memset(rv.vram, 0, pitch_px * (uint32_t)m->bpp / 8 * t->h);
-        if (program_mode(t, m->bpp, pitch_px) < 0)
-            klog("radeon: the BIOS could not set the pixel clock\n");
-        use_native_fb(t, m->bpp, pitch_px);
-        timing_dispmode(&rv.mode, t, m->bpp);
+        bpp = m->bpp;
+        pitch_px = pitch_pixels(t->w, bpp);
+    }
+    if (RADEON_EVERGREEN() && link_ready() < 0)
+        return -EIO;                /* nothing changed */
+    busy = 1;
+    if (m->width == 0) {
+        memset(fb_boot.base, 0, fb_boot.pitch * fb_boot.height);
+        if (program_mode(t, bpp, pitch_px) < 0)
+            klog("radeon: the BIOS mode did not come back cleanly (see above)\n");
+        fb = fb_boot;
+        rv.native = 0;
+    } else {
+        memset(rv.vram, 0, pitch_px * (uint32_t)bpp / 8 * t->h);
+        if (program_mode(t, bpp, pitch_px) < 0)
+            klog("radeon: the mode change did not complete (see above)\n");
+        use_native_fb(t, bpp, pitch_px);
+        timing_dispmode(&rv.mode, t, bpp);
         rv.native = 1;
     }
+    cur_timing = t;
+    cur_bpp = bpp;
+    cur_pitch = pitch_px;
     rv.page_size = fb.size;
     rv.flip = rv.page0 + 2 * rv.page_size <= CURSOR_VRAM_OFF;
     rv.page = 0;
@@ -1169,6 +1650,26 @@ int radeon_native_set(const struct dispmode *m)
     fb_mode_changed();
     radeon_cursor_reload();
     return 0;
+}
+
+/* Waking: the video BIOS's POST set its own mode up again (wakeup.S);
+ * ours goes back on top, the encoders initialised from the start. */
+void radeon_native_resume(void)
+{
+    if (!rv.native || !cur_timing || !RADEON_EVERGREEN())
+        return;
+    tx_initialised = 0;
+    dig_transmitter_dce4(ATOM_TRANSMITTER_ACTION_INIT, 0);
+    ext_encoder(EXTERNAL_ENCODER_ACTION_V3_ENCODER_INIT);
+    tx_initialised = 1;
+    ext_encoder(EXTERNAL_ENCODER_ACTION_V3_DDC_SETUP);
+    radeon_dp_read_dpcd();
+    if (link_ready() < 0) {
+        klog("radeon: cannot set %ux%u again after waking\n", cur_timing->w, cur_timing->h);
+        return;
+    }
+    if (program_mode(cur_timing, cur_bpp, cur_pitch) < 0)
+        klog("radeon: the mode change after waking did not complete (see above)\n");
 }
 
 static const char *output_name(void)
@@ -1181,76 +1682,21 @@ static const char *output_name(void)
     return dual_link_connector() ? "dual-link DVI" : "DVI";
 }
 
-void radeon_modeset_init(void)
-{
-    if (cmdline_has("radeon.modeset=0") || !rv.crtcs || !rv.vram)
-        return;
-    if (fb_boot.bpp != 16 && fb_boot.bpp != 32)
-        return;
-    if (load_bios() < 0) {
-        kprintf("radeon: no AtomBIOS found, keeping the BIOS mode\n");
-        return;
-    }
-    if (read_clock_info() < 0 || find_output() < 0) {
-        kprintf("radeon: cannot tell which output the BIOS uses, keeping its mode\n");
-        return;
-    }
-    crtc_id = (rv.crtcs & 1) ? 0 : 1;
-    int c = out.connector & 0xFF;
-    if (!is_dac() && !is_dig()) {
-        kprintf("radeon: output encoder %02x is not supported, keeping the BIOS mode\n", enc_obj());
-        return;
-    }
-    if (c == CONNECTOR_DISPLAYPORT || c == CONNECTOR_EDP || c == CONNECTOR_LVDS ||
-        (out.device & ATOM_DEVICE_LCD_SUPPORT)) {
-        kprintf("radeon: DisplayPort and panel outputs keep the BIOS mode\n");
-        return;
-    }
-    rv.max_clock = is_dac() ? max_pixclock : dual_link_connector() ? 330000 : 165000;
-    rv.max_clock = MIN(rv.max_clock, max_pixclock);
-    rv.edid_ok = read_edid();
-    ml.fits = mode_fits;
-    modes_build(&ml, rv.edid_ok ? rv.edid : NULL);
-    find_boot_timing();
-    if (boot_timing_ok) {
-        modes_add(&ml, &boot_timing);
-        modes_sort(&ml);
-    }
-    if (!ml.n)
-        return;
-    rv.native_ok = 1;
-    boot_ok("%s: AtomBIOS %s, %s output, %d modes%s", rv.name, atom.name, output_name(), ml.n,
-            rv.edid_ok ? " from the monitor's EDID" : "");
-
-    struct dispmode m;
-    if (fb_video_option(&m) && radeon_native_set(&m) < 0)
-        kprintf("radeon: cannot set that video= mode, keeping the boot mode\n");
-}
-
 /*
- * Evergreen (the Llano APUs): before native modes there, what does the
- * video BIOS say the outputs are? A laptop's panel may hang straight off
- * a UNIPHY transmitter (LVDS), be DisplayPort itself (eDP), or sit
- * behind a DisplayPort-to-LVDS bridge (NUTMEG, encoder 22h; TRAVIS, 23h,
- * is the VGA one), and each wants different mode-setting code. Logged,
- * nothing changed: every display path with its connector and encoder
- * chain, the panel's timing from LCD_Info, the revisions of the command
- * tables mode setting would run, and whether the lit output's DDC line
- * gives an EDID.
+ * What the video BIOS says the outputs are, logged: every display path
+ * with its connector and encoder chain (a DisplayPort bridge, NUTMEG 22h
+ * for VGA or TRAVIS 23h for LVDS, comes after the UNIPHY that feeds it),
+ * the panel's timing from LCD_Info, and the revisions of the command
+ * tables mode setting runs.
  */
-void radeon_modeset_probe(void)
+static void log_outputs(void)
 {
     static const char *const devname[12] = {
         "CRT1", "LCD1", "TV1", "DFP1", "CRT2", "LCD2", "DFP6", "DFP2", "CV", "DFP3", "DFP4", "DFP5",
     };
-    if (load_bios() < 0) {
-        kprintf("radeon: no AtomBIOS image found at C0000h or in the ROM BAR\n");
-        return;
-    }
-    read_clock_info();
     uint16_t active = (uint16_t)(rd(BIOS_3_SCRATCH) & 0xFFF);
-    klog("radeon: AtomBIOS %s, reference clock %u kHz, active devices %03x\n", atom.name,
-         pll.reference_freq * 10, active);
+    klog("radeon: AtomBIOS %s, reference clock %u kHz, DisplayPort clock %s, active devices %03x\n",
+         atom.name, pll.reference_freq * 10, dp_extclk ? "external" : "from a PPLL", active);
 
     uint8_t frev, crev;
     uint16_t hdr = atom_data_table(&atom, ATOM_DATA_OBJECT_HEADER, NULL, &frev, &crev);
@@ -1294,11 +1740,9 @@ void radeon_modeset_probe(void)
 
     static const struct { int index; const char *name; } tabs[] = {
         { ATOM_CMD_SET_PIXEL_CLOCK, "pixclk" }, { ATOM_CMD_ADJUST_DISPLAY_PLL, "adjpll" },
-        { ATOM_CMD_SELECT_CRTC_SOURCE, "crtcsrc" }, { ATOM_CMD_DIG1_ENCODER, "dig1enc" },
-        { ATOM_CMD_UNIPHY_TRANSMITTER, "dig1tx" }, { ATOM_CMD_LVTMA_TRANSMITTER, "dig2tx" },
-        { ATOM_CMD_EXTERNAL_ENCODER, "extenc" }, { ATOM_CMD_PROCESS_AUX, "aux" },
-        { ATOM_CMD_DP_ENCODER_SERVICE, "dpsvc" }, { ATOM_CMD_ENABLE_SCALER, "scaler" },
-        { ATOM_CMD_DAC1_ENCODER, "dac1" },
+        { ATOM_CMD_SELECT_CRTC_SOURCE, "crtcsrc" }, { ATOM_CMD_DIGX_ENCODER, "digxenc" },
+        { ATOM_CMD_UNIPHY_TRANSMITTER, "dig1tx" }, { ATOM_CMD_EXTERNAL_ENCODER, "extenc" },
+        { ATOM_CMD_PROCESS_AUX, "aux" }, { ATOM_CMD_ENABLE_SCALER, "scaler" },
     };
     char line[160] = "";
     for (uint32_t i = 0; i < ARRAY_SIZE(tabs); i++) {
@@ -1310,17 +1754,202 @@ void radeon_modeset_probe(void)
         strlcat(line, one, sizeof(line));
     }
     klog("radeon: tables:%s\n", line);
+}
 
-    if (find_output() == 0) {
-        rv.edid_ok = read_edid();
-        klog("radeon: lit output: connector %04x, encoder %04x, DDC %02x: %s\n", out.connector,
-             out.encoder, out.i2c_id, rv.edid_ok ? "EDID read" : "no EDID on its DDC line");
-        if (rv.edid_ok) {
-            struct timing t;
-            if (edid_parse_dtd(rv.edid + 54, &t))
-                klog("radeon: EDID preferred %ux%u at %u Hz, %u kHz\n", t.w, t.h, t.refresh, t.clock);
+/* A laptop panel's own timing from LCD_Info (radeon_atombios_get_lvds_info):
+ * its DTD, and from version 1.3 its colour depth. */
+static int read_panel(void)
+{
+    uint8_t frev, crev;
+    uint16_t lcd = atom_data_table(&atom, ATOM_DATA_LCD_INFO, NULL, &frev, &crev);
+    if (!lcd)
+        return -1;
+    uint32_t d = lcd + 4u;
+    uint16_t hblank = atom_u16(&atom, d + 4), vblank = atom_u16(&atom, d + 8);
+    uint16_t misc = atom_u16(&atom, d + 24);
+    memset(&panel, 0, sizeof(panel));
+    panel.clock = (uint32_t)atom_u16(&atom, d) * 10;
+    panel.w = atom_u16(&atom, d + 2);
+    panel.h = atom_u16(&atom, d + 6);
+    panel.hfp = atom_u16(&atom, d + 10);
+    panel.hsync = atom_u16(&atom, d + 12);
+    panel.vfp = atom_u16(&atom, d + 14);
+    panel.vsync = atom_u16(&atom, d + 16);
+    if (!panel.clock || panel.w < 320 || panel.h < 240 || hblank < panel.hfp + panel.hsync ||
+        vblank < panel.vfp + panel.vsync)
+        return -1;
+    panel.hbp = (uint16_t)(hblank - panel.hfp - panel.hsync);
+    panel.vbp = (uint16_t)(vblank - panel.vfp - panel.vsync);
+    panel.flags = (misc & ATOM_HSYNC_POLARITY ? NHSYNC : 0) | (misc & ATOM_VSYNC_POLARITY ? NVSYNC : 0);
+    uint32_t frame = timing_htotal(&panel) * timing_vtotal(&panel);
+    panel.refresh = (uint16_t)((panel.clock * 1000 + frame / 2) / frame);
+    uint8_t lcd_misc = atom_u8(&atom, lcd + 40u);
+    panel_bpc = crev >= 3 && (lcd_misc & ATOM_PANEL_MISC_V13_6BIT_PER_COLOR) ? 6 : 8;
+    return 0;
+}
+
+/* A smaller view of the panel, which the scaler stretches to it: the
+ * panel's timing with that size, the totals kept. */
+static struct timing scaled_view(uint16_t w, uint16_t h)
+{
+    struct timing s = panel;
+    s.hbp = (uint16_t)(panel.hbp + panel.w - w);
+    s.vbp = (uint16_t)(panel.vbp + panel.h - h);
+    s.w = w;
+    s.h = h;
+    return s;
+}
+
+/* The panel's own mode, and the common sizes below it, stretched. */
+static void panel_modes(void)
+{
+    ml.n = 0;
+    ml.preferred = -1;
+    ml.fits = mode_fits;
+    modes_add(&ml, &panel);
+    for (int i = 0; i < ndmt_modes; i++) {
+        const struct timing *d = &dmt_modes[i];
+        if (d->w <= panel.w && d->h <= panel.h && (d->w != panel.w || d->h != panel.h)) {
+            struct timing s = scaled_view(d->w, d->h);
+            modes_add(&ml, &s);
         }
-    } else {
-        klog("radeon: no lit output found among the display paths\n");
     }
+    modes_sort(&ml);
+    const struct timing *b = modes_find(&ml, (int)fb_boot.width, (int)fb_boot.height, 0);
+    if (b) {
+        boot_timing = *b;
+        boot_timing_ok = 1;
+        rv.boot_mode.refresh = b->refresh;
+        rv.boot_mode.pixclock = b->clock;
+        rv.boot_mode.hfreq = b->clock * 1000 / timing_htotal(b);
+    }
+}
+
+/* Evergreen: native modes for a panel behind a DisplayPort bridge, if
+ * the BIOS has the tables Linux runs for one and the bridge answers. */
+static void modeset_init_dce4(void)
+{
+    static const struct {
+        int index;
+        uint8_t frev, crev_min, crev_max;
+        const char *name;
+    } need[] = {
+        { ATOM_CMD_DIGX_ENCODER, 1, 2, 4, "DIGxEncoderControl" },
+        { ATOM_CMD_UNIPHY_TRANSMITTER, 1, 3, 3, "UNIPHYTransmitterControl" },
+        { ATOM_CMD_EXTERNAL_ENCODER, 2, 3, 3, "ExternalEncoderControl" },
+        { ATOM_CMD_PROCESS_AUX, 1, 1, 2, "ProcessAuxChannelTransaction" },
+        { ATOM_CMD_SET_PIXEL_CLOCK, 1, 5, 5, "SetPixelClock" },
+    };
+    if (!(out.device & ATOM_DEVICE_LCD_SUPPORT) || !out.ext_encoder || !is_dig()) {
+        kprintf("radeon: native modes on this chip are for a laptop panel behind a DisplayPort "
+                "bridge; keeping the BIOS mode\n");
+        return;
+    }
+    for (uint32_t i = 0; i < ARRAY_SIZE(need); i++) {
+        uint8_t frev = 0, crev = 0;
+        if (!atom_cmd_revision(&atom, need[i].index, &frev, &crev) || frev != need[i].frev ||
+            crev < need[i].crev_min || crev > need[i].crev_max) {
+            kprintf("radeon: the BIOS's %s table is version %u.%u, which this driver does not know; "
+                    "keeping the BIOS mode\n", need[i].name, frev, crev);
+            return;
+        }
+    }
+    if (read_panel() < 0) {
+        kprintf("radeon: no usable panel timing in LCD_Info, keeping the BIOS mode\n");
+        return;
+    }
+    klog("radeon: panel %ux%u at %u Hz, %u kHz, %d bits per colour; bridge %04x, AUX channel %02x, "
+         "hot plug pin %d\n", panel.w, panel.h, panel.refresh, panel.clock, panel_bpc, out.ext_encoder,
+         out.i2c_id, out.hpd == 0xFF ? -1 : out.hpd);
+
+    /* Only reads here: the BIOS's picture stays up. */
+    dpsink.channel = out.i2c_id;
+    dpsink.hpd = out.hpd;
+    ext_encoder(EXTERNAL_ENCODER_ACTION_V3_DDC_SETUP);
+    if (radeon_dp_read_dpcd() < 0) {
+        kprintf("radeon: the panel's DisplayPort bridge does not answer over AUX, keeping the BIOS mode\n");
+        return;
+    }
+    const uint8_t *c = dpsink.dpcd;
+    klog("radeon: DPCD %02x %02x %02x %02x ... %02x: DisplayPort %u.%u, %u lane%s at up to %u.%02u GHz\n",
+         c[0], c[1], c[2], c[3], c[13], c[0] >> 4, c[0] & 0xF, c[2] & 0x1F, (c[2] & 0x1F) == 1 ? "" : "s",
+         c[1] * 27 / 100, c[1] * 27 % 100);
+    if (radeon_dp_link_config(panel.clock, panel_bpc * 3, (out.ext_encoder & 0xFF) == ENCODER_NUTMEG) < 0) {
+        kprintf("radeon: no DisplayPort link the bridge offers carries the panel's %u kHz, keeping the "
+                "BIOS mode\n", panel.clock);
+        return;
+    }
+    rv.edid_ok = radeon_dp_read_edid(rv.edid);
+    if (rv.edid_ok) {
+        struct timing t;
+        if (edid_parse_dtd(rv.edid + 54, &t))
+            klog("radeon: the panel's EDID prefers %ux%u at %u Hz, %u kHz\n", t.w, t.h, t.refresh, t.clock);
+    } else {
+        klog("radeon: no EDID through the bridge; the panel's timing is LCD_Info's\n");
+    }
+
+    rv.max_clock = panel.clock;
+    panel_modes();
+    if (!ml.n)
+        return;
+    rv.native_ok = 1;
+    boot_ok("%s: AtomBIOS %s, %ux%u panel behind a DisplayPort bridge, %d modes", rv.name, atom.name,
+            panel.w, panel.h, ml.n);
+
+    struct dispmode m;
+    if (fb_video_option(&m) && radeon_native_set(&m) < 0)
+        kprintf("radeon: cannot set that video= mode, keeping the boot mode\n");
+}
+
+void radeon_modeset_init(void)
+{
+    if (cmdline_has("radeon.modeset=0") || !rv.crtcs || !rv.vram)
+        return;
+    if (fb_boot.bpp != 16 && fb_boot.bpp != 32)
+        return;
+    if (load_bios() < 0) {
+        kprintf("radeon: no AtomBIOS found, keeping the BIOS mode\n");
+        return;
+    }
+    int found = read_clock_info() == 0 && find_output() == 0;
+    if (RADEON_EVERGREEN())
+        log_outputs();
+    if (!found) {
+        kprintf("radeon: cannot tell which output the BIOS uses, keeping its mode\n");
+        return;
+    }
+    crtc_id = (rv.crtcs & 1) ? 0 : 1;
+    if (RADEON_EVERGREEN()) {
+        modeset_init_dce4();
+        return;
+    }
+    int c = out.connector & 0xFF;
+    if (!is_dac() && !is_dig()) {
+        kprintf("radeon: output encoder %02x is not supported, keeping the BIOS mode\n", enc_obj());
+        return;
+    }
+    if (c == CONNECTOR_DISPLAYPORT || c == CONNECTOR_EDP || c == CONNECTOR_LVDS ||
+        (out.device & ATOM_DEVICE_LCD_SUPPORT)) {
+        kprintf("radeon: DisplayPort and panel outputs keep the BIOS mode\n");
+        return;
+    }
+    rv.max_clock = is_dac() ? max_pixclock : dual_link_connector() ? 330000 : 165000;
+    rv.max_clock = MIN(rv.max_clock, max_pixclock);
+    rv.edid_ok = read_edid();
+    ml.fits = mode_fits;
+    modes_build(&ml, rv.edid_ok ? rv.edid : NULL);
+    find_boot_timing();
+    if (boot_timing_ok) {
+        modes_add(&ml, &boot_timing);
+        modes_sort(&ml);
+    }
+    if (!ml.n)
+        return;
+    rv.native_ok = 1;
+    boot_ok("%s: AtomBIOS %s, %s output, %d modes%s", rv.name, atom.name, output_name(), ml.n,
+            rv.edid_ok ? " from the monitor's EDID" : "");
+
+    struct dispmode m;
+    if (fb_video_option(&m) && radeon_native_set(&m) < 0)
+        kprintf("radeon: cannot set that video= mode, keeping the boot mode\n");
 }

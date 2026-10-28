@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inflate.h>
 #include "jsint.h"
 #define ARG(i) ((i) < argc ? args[(i)] : js_undefined)
 #define BUFFER_MAX (64u << 20)
@@ -503,8 +504,221 @@ static jsval binary_clone(struct js *J, jsval self, jsval *args, int argc)
     return js_obj(o);
 }
 
+/* A new Uint8Array holding a copy of n bytes. */
+jsval js_new_bytes(struct js *J, const unsigned char *p, int n)
+{
+    jsval buf = new_buffer(J, n);
+    if (n)
+        memcpy(buffer_of(buf)->data, p, (size_t)n);
+    return new_typed(J, buf, 0, n, 1);
+}
+
+/* ---- CompressionStream's deflate and gzip: a small LZ77 encoder with the fixed Huffman codes ---- */
+
+struct bitw {
+    unsigned char *out;
+    size_t n, cap;
+    uint32_t bits;
+    int nbits;
+    int failed;
+};
+
+static void bw_byte(struct bitw *w, unsigned char b)
+{
+    if (w->n == w->cap) {
+        size_t cap = w->cap ? w->cap * 2 : 4096;
+        unsigned char *o = realloc(w->out, cap);
+        if (!o) {
+            w->failed = 1;
+            return;
+        }
+        w->out = o, w->cap = cap;
+    }
+    w->out[w->n++] = b;
+}
+
+static void bw_put(struct bitw *w, uint32_t v, int n)          /* least significant bit first */
+{
+    w->bits |= v << w->nbits;
+    w->nbits += n;
+    while (w->nbits >= 8) {
+        bw_byte(w, (unsigned char)w->bits);
+        w->bits >>= 8;
+        w->nbits -= 8;
+    }
+}
+
+static void bw_code(struct bitw *w, uint32_t code, int len)    /* Huffman codes go most significant bit first */
+{
+    uint32_t r = 0;
+    for (int i = 0; i < len; i++)
+        r = r << 1 | (code >> i & 1);
+    bw_put(w, r, len);
+}
+
+static void fixed_literal(struct bitw *w, int sym)
+{
+    if (sym < 144)
+        bw_code(w, 0x30 + (uint32_t)sym, 8);
+    else if (sym < 256)
+        bw_code(w, 0x190 + (uint32_t)(sym - 144), 9);
+    else if (sym < 280)
+        bw_code(w, (uint32_t)(sym - 256), 7);
+    else
+        bw_code(w, 0xC0 + (uint32_t)(sym - 280), 8);
+}
+
+static void deflate_fixed(struct bitw *w, const unsigned char *in, size_t n)
+{
+    static const uint16_t lbase[29] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59,
+                                        67, 83, 99, 115, 131, 163, 195, 227, 258 };
+    static const uint8_t lextra[29] = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4,
+                                        5, 5, 5, 5, 0 };
+    static const uint16_t dbase[30] = { 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513,
+                                        769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
+    static const uint8_t dextra[30] = { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10,
+                                        11, 11, 12, 12, 13, 13 };
+    enum { WSIZE = 32768, HSIZE = 1 << 15, CHAIN = 48 };
+    int32_t *head = malloc(sizeof(int32_t) * HSIZE), *prev = malloc(sizeof(int32_t) * WSIZE);
+    bw_put(w, 1, 1);                    /* one block, the last */
+    bw_put(w, 1, 2);                    /* fixed codes */
+    if (!head || !prev) {
+        for (size_t i = 0; i < n; i++)
+            fixed_literal(w, in[i]);
+    } else {
+        memset(head, 0xFF, sizeof(int32_t) * HSIZE);
+        size_t i = 0;
+        while (i < n) {
+            int best = 0, dist = 0;
+            if (i + 3 <= n) {
+                uint32_t h = ((uint32_t)in[i] << 10 ^ (uint32_t)in[i + 1] << 5 ^ in[i + 2]) & (HSIZE - 1);
+                int32_t cand = head[h];
+                for (int k = 0; cand >= 0 && k < CHAIN && i - (size_t)cand <= WSIZE - 1; k++) {
+                    int len = 0, max = n - i < 258 ? (int)(n - i) : 258;
+                    while (len < max && in[cand + len] == in[i + len])
+                        len++;
+                    if (len > best)
+                        best = len, dist = (int)(i - (size_t)cand);
+                    if (len == max)
+                        break;
+                    cand = prev[cand & (WSIZE - 1)];
+                }
+                prev[i & (WSIZE - 1)] = head[h];
+                head[h] = (int32_t)i;
+            }
+            if (best >= 3) {
+                int li = 28;
+                while (lbase[li] > best)
+                    li--;
+                fixed_literal(w, 257 + li);
+                bw_put(w, (uint32_t)(best - lbase[li]), lextra[li]);
+                int di = 29;
+                while (dbase[di] > dist)
+                    di--;
+                bw_code(w, (uint32_t)di, 5);
+                bw_put(w, (uint32_t)(dist - dbase[di]), dextra[di]);
+                for (size_t k = i + 1; k < i + (size_t)best && k + 3 <= n; k++) {   /* the hash sees the match */
+                    uint32_t h = ((uint32_t)in[k] << 10 ^ (uint32_t)in[k + 1] << 5 ^ in[k + 2]) & (HSIZE - 1);
+                    prev[k & (WSIZE - 1)] = head[h];
+                    head[h] = (int32_t)k;
+                }
+                i += (size_t)best;
+            } else {
+                fixed_literal(w, in[i++]);
+            }
+        }
+    }
+    fixed_literal(w, 256);              /* end of block */
+    if (w->nbits)
+        bw_put(w, 0, 8 - w->nbits);
+    free(head);
+    free(prev);
+}
+
+static uint32_t crc32_of(const unsigned char *p, size_t n)
+{
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) {
+        c ^= p[i];
+        for (int k = 0; k < 8; k++)
+            c = c >> 1 ^ (0xEDB88320u & (0u - (c & 1)));
+    }
+    return ~c;
+}
+
+static uint32_t adler32_of(const unsigned char *p, size_t n)
+{
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < n; i++) {
+        a = (a + p[i]) % 65521;
+        b = (b + a) % 65521;
+    }
+    return b << 16 | a;
+}
+
+/* %compress(bytes, "gzip" | "deflate" | "deflate-raw"): a Uint8Array. */
+static jsval compress_bytes(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    int len = 0;
+    unsigned char *in = js_binary_bytes(ARG(0), &len);
+    const char *fmt = js_tostr(J, ARG(1))->s;
+    if (!in && len)
+        return js_throw_error(J, "TypeError: compress needs bytes");
+    struct bitw w = { 0 };
+    int gzip = !strcmp(fmt, "gzip"), zlib = !strcmp(fmt, "deflate");
+    if (gzip) {
+        static const unsigned char hdr[10] = { 0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 0xFF };
+        for (int i = 0; i < 10; i++)
+            bw_byte(&w, hdr[i]);
+    } else if (zlib) {
+        bw_byte(&w, 0x78);
+        bw_byte(&w, 0x01);
+    }
+    deflate_fixed(&w, in ? in : (const unsigned char *)"", (size_t)len);
+    if (gzip) {
+        uint32_t crc = crc32_of(in, (size_t)len), sz = (uint32_t)len;
+        for (int i = 0; i < 4; i++)
+            bw_byte(&w, (unsigned char)(crc >> (8 * i)));
+        for (int i = 0; i < 4; i++)
+            bw_byte(&w, (unsigned char)(sz >> (8 * i)));
+    } else if (zlib) {
+        uint32_t ad = adler32_of(in, (size_t)len);
+        for (int i = 3; i >= 0; i--)
+            bw_byte(&w, (unsigned char)(ad >> (8 * i)));
+    }
+    if (w.failed || w.n > BUFFER_MAX) {
+        free(w.out);
+        return js_throw_error(J, "RangeError: out of memory compressing");
+    }
+    jsval r = js_new_bytes(J, w.out, (int)w.n);
+    free(w.out);
+    return r;
+}
+
+/* %decompress(bytes, format): a Uint8Array, or a TypeError for damaged data. */
+static jsval decompress_bytes(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    int len = 0;
+    unsigned char *in = js_binary_bytes(ARG(0), &len);
+    const char *fmt = js_tostr(J, ARG(1))->s;
+    int f = !strcmp(fmt, "gzip") ? INFLATE_GZIP : !strcmp(fmt, "deflate") ? INFLATE_ZLIB : INFLATE_RAW;
+    uint8_t *out = NULL;
+    size_t outlen = 0;
+    if (!in || inflate_buf(in, (size_t)len, f, &out, &outlen, BUFFER_MAX) < 0) {
+        free(out);
+        return js_throw_error(J, "TypeError: the compressed data is damaged");
+    }
+    jsval r = js_new_bytes(J, out, (int)outlen);
+    free(out);
+    return r;
+}
+
 void js_init_binary(struct js *J)
 {
+    js_define_native(J, J->global, "%compress", compress_bytes, 2);
+    js_define_native(J, J->global, "%decompress", decompress_bytes, 2);
     js_define_native(J, J->global, "%binaryType", binary_type, 1);
     js_define_native(J, J->global, "%binaryClone", binary_clone, 2);
     js_define_native(J, J->global, "%digest", digest_bytes, 2);

@@ -1,5 +1,6 @@
 /* Minimal PCI bus enumeration, enough to find the storage, USB and network controllers. */
 #include "kernel.h"
+#include "drivers.h"
 #include "mm.h"
 #include "pci.h"
 #include "x86.h"
@@ -201,16 +202,44 @@ void *pci_map_bar(const struct pci_dev *p, int bar)
  * kept, and for IDE controllers their timing registers too (0x40-0x5F on
  * Intel's and most others'), which the drives' DMA modes depend on.
  * Bridges come before what is behind them, in the order they were found.
+ * A function the firmware left in a low power state (D1-D3) is brought
+ * back to D0 first, as Linux does: in D3 its memory and I/O decoding is
+ * off whatever the command register says, and its registers are blank.
  */
 #define MAX_SAVED 96
 #define IDE_DWORDS 8
 
+#define PCI_STATUS      0x06
+#define PCI_CAP_LIST    0x10            /* status: there is a capability list */
+#define PCI_CAP_PTR     0x34
+#define PCI_HEADER_TYPE 0x0E
+#define PCI_CAP_ID_PM   0x01
+#define PCI_PM_CTRL     0x04            /* PMCSR, in the capability */
+#define PCI_PM_STATE_MASK 0x0003
+
 static struct saved_fn {
     struct pci_dev d;
     int ide;
+    uint8_t pm;                         /* the power management capability, or 0 */
     uint32_t cfg[16 + IDE_DWORDS];
 } saved[MAX_SAVED];
 static int nsaved;
+
+static uint8_t find_pm_cap(const struct pci_dev *p)
+{
+    if (!(pci_read16(p, PCI_STATUS) & PCI_CAP_LIST) || (pci_read8(p, PCI_HEADER_TYPE) & 0x7F) > 1)
+        return 0;
+    uint8_t pos = pci_read8(p, PCI_CAP_PTR) & 0xFC;
+    for (int n = 0; pos >= 0x40 && n < 48; n++) {
+        uint8_t id = pci_read8(p, pos);
+        if (id == 0xFF)
+            break;
+        if (id == PCI_CAP_ID_PM)
+            return pos;
+        pos = pci_read8(p, pos + 1) & 0xFC;
+    }
+    return 0;
+}
 
 static int save_fn(const struct pci_dev *p, const void *arg)
 {
@@ -222,6 +251,7 @@ static int save_fn(const struct pci_dev *p, const void *arg)
     for (int i = 0; i < 16; i++)
         f->cfg[i] = pci_read32(p, i * 4);
     f->ide = (f->cfg[2] >> 16) == 0x0101;
+    f->pm = find_pm_cap(p);
     for (int i = 0; f->ide && i < IDE_DWORDS; i++)
         f->cfg[16 + i] = pci_read32(p, 0x40 + i * 4);
     return 0;
@@ -243,6 +273,13 @@ void pci_resume(void)
         struct saved_fn *f = &saved[n];
         if (pci_read32(&f->d, 0) != f->cfg[0])
             continue;                   /* not there now */
+        if (f->pm) {
+            uint16_t pmcsr = pci_read16(&f->d, f->pm + PCI_PM_CTRL);
+            if ((pmcsr & PCI_PM_STATE_MASK) != 0) {
+                pci_write16(&f->d, f->pm + PCI_PM_CTRL, pmcsr & ~PCI_PM_STATE_MASK);
+                udelay(10000);          /* D3hot to D0: 10 ms before it is addressed */
+            }
+        }
         for (int i = f->ide ? IDE_DWORDS - 1 : -1; i >= 0; i--)
             if (pci_read32(&f->d, 0x40 + i * 4) != f->cfg[16 + i])
                 pci_write32(&f->d, 0x40 + i * 4, f->cfg[16 + i]);

@@ -65,9 +65,11 @@ struct atom_context {
 #define ATOM_DATA_LCD_INFO        6
 #define ATOM_DATA_GPIO_I2C_INFO   10
 #define ATOM_DATA_VRAM_USAGE      11
+#define ATOM_DATA_GPIO_PIN_LUT    12
 #define ATOM_DATA_OBJECT_HEADER   22
 
 /* Command table indexes (ATOM_MASTER_LIST_OF_COMMAND_TABLES) */
+#define ATOM_CMD_DIGX_ENCODER         4     /* DIGxEncoderControl, DCE 4's DIG encoders */
 #define ATOM_CMD_ENABLE_CRTC_MEMREQ   6
 #define ATOM_CMD_SET_PIXEL_CLOCK      12
 #define ATOM_CMD_ADJUST_DISPLAY_PLL   17

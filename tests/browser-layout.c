@@ -215,7 +215,7 @@ static void background_pictures(void)
     CHECK(pic[3]->bgp->tw == 40 && pic[3]->bgp->th == 20);      /* its own size */
     CHECK(pic[3]->bgp->tx == 3 + 5 && pic[3]->bgp->ty == 3 + 7);   /* from the padding box */
     CHECK(!pic[3]->bgp->norep_x && pic[3]->bgp->norep_y);       /* repeat-x */
-    CHECK(pic[4]->bgp->img && pic[4]->bgp->next && pic[4]->bgp->next->grad);
+    CHECK(pic[4]->bgp->img && pic[4]->bgp->next && pic[4]->bgp->next->gr);
     unload(&p);
 
     /* the old attribute, and a data: URL that is not cut short */

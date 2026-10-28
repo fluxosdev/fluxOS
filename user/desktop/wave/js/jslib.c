@@ -1381,6 +1381,30 @@ static jsval match_array(struct js *J, struct jsstr *s, struct regex *re, int *c
         groups = js_obj(go);
     }
     js_put(J, m, S(J, "groups"), groups, 0);
+    if (strchr(re_flags(re), 'd')) {
+        /* hasIndices: [start, end] of the match and of each group (offsets as index gives them) */
+        struct jsobj *ix = js_new_array(J);
+        for (int g = 0; g < re_ngroups(re); g++) {
+            jsval pair = js_undefined;
+            if (caps[2 * g] >= 0) {
+                struct jsobj *pr = js_new_array(J);
+                js_array_push(J, pr, js_num(caps[2 * g]));
+                js_array_push(J, pr, js_num(caps[2 * g + 1]));
+                pair = js_obj(pr);
+            }
+            js_array_push(J, ix, pair);
+        }
+        jsval igroups = js_undefined;
+        if (re_has_names(re)) {
+            struct jsobj *go = js_new_object(J);
+            for (int g = 1; g < re_ngroups(re); g++)
+                if (re_group_name(re, g))
+                    js_put(J, go, S(J, re_group_name(re, g)), ix->items[g], 0);
+            igroups = js_obj(go);
+        }
+        js_put(J, ix, S(J, "groups"), igroups, 0);
+        js_put(J, m, S(J, "indices"), js_obj(ix), 0);
+    }
     return js_obj(m);
 }
 
@@ -3200,8 +3224,30 @@ static jsval regexp_flags_get(struct js *J, jsval self, jsval *args, int argc)
     (void)args;
     (void)argc;
     struct regex *re = regex_of(self);
-    return js_str(J, re ? re_flags(re) : "");
+    char out[16];
+    int n = 0;
+    for (const char *f = "dgimsuvy"; re && *f; f++)      /* in the order the standard lists them */
+        if (strchr(re_flags(re), *f))
+            out[n++] = *f;
+    out[n] = 0;
+    return js_str(J, out);
 }
+
+/* sticky, multiline and the other flags' getters. */
+#define REGEXP_FLAG(fn, ch)                                                     \
+    static jsval fn(struct js *J, jsval self, jsval *args, int argc)          \
+    {                                                                           \
+        (void)J, (void)args, (void)argc;                                        \
+        struct regex *re = regex_of(self);                                      \
+        return js_bool(re && strchr(re_flags(re), ch));                         \
+    }
+REGEXP_FLAG(regexp_multiline_get, 'm')
+REGEXP_FLAG(regexp_dotall_get, 's')
+REGEXP_FLAG(regexp_sticky_get, 'y')
+REGEXP_FLAG(regexp_unicode_get, 'u')
+REGEXP_FLAG(regexp_unicode_sets_get, 'v')
+REGEXP_FLAG(regexp_has_indices_get, 'd')
+#undef REGEXP_FLAG
 
 static jsval regexp_global_get(struct js *J, jsval self, jsval *args, int argc)
 {
@@ -3450,6 +3496,12 @@ void js_init_lib(struct js *J)
     define_getter(J, rp, "flags", regexp_flags_get);
     define_getter(J, rp, "global", regexp_global_get);
     define_getter(J, rp, "ignoreCase", regexp_icase_get);
+    define_getter(J, rp, "multiline", regexp_multiline_get);
+    define_getter(J, rp, "dotAll", regexp_dotall_get);
+    define_getter(J, rp, "sticky", regexp_sticky_get);
+    define_getter(J, rp, "unicode", regexp_unicode_get);
+    define_getter(J, rp, "unicodeSets", regexp_unicode_sets_get);
+    define_getter(J, rp, "hasIndices", regexp_has_indices_get);
 
     /* Errors */
     struct jsobj *ep = J->error_proto = js_mkobj(J, C_OBJECT, op);

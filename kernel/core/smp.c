@@ -413,7 +413,10 @@ void ap_main(void)
     write_cr0(read_cr0() | CR0_PG | CR0_WP);
     gdt_init_ap(c->index);
     idt_init_ap();
-    cpu_init_ap();
+    if (unparking)
+        cpu_resume();                   /* its MTRRs too: the power went */
+    else
+        cpu_init_ap();
     fpu_init_cpu();
     lapic_setup(0);
     if (unparking)

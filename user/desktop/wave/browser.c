@@ -1612,7 +1612,7 @@ static void bg_attach(struct browser *b)
     for (struct node *n = b->root; n; n = node_next_shadow(n, b->root)) {
         if (n->type != N_ELEMENT) continue;
         bg_attach_style(b, n->style);
-        for (int i = 0; i < 5; i++) bg_attach_style(b, n->pseudo_st[i]);
+        for (int i = 0; i < PE_COUNT; i++) bg_attach_style(b, n->pseudo_st[i]);
     }
 }
 
@@ -2093,7 +2093,9 @@ static void init_new_controls(struct node *root)
         if (n->type != N_ELEMENT || n->value)
             continue;
         if (n->tag == T_INPUT) {
-            const char *v = node_attr(n, "value");
+            const char *v = node_attr(n, "value"), *t = node_attr(n, "type");
+            if (t && !strcasecmp(t, "file"))
+                v = NULL;                       /* a page cannot pick the file */
             n->value = strdup(v ? v : "");
             n->cursor = n->value ? (int)strlen(n->value) : 0;
             if (node_attr(n, "checked"))
@@ -2989,6 +2991,7 @@ static void load_document(struct browser *b, const char *text, int len, const ch
     free(converted);
     if (!b->root)
         return;
+    html_declarative_shadows(&b->arena, b->root);
     init_controls(b->root);
     for (struct node *n = b->root; n; n = node_next(n, b->root))        /* autofocus: the first field that asks */
         if (n->type == N_ELEMENT && node_attr(n, "autofocus") && !node_attr(n, "disabled") && is_text_field(n)) {
@@ -3060,6 +3063,18 @@ static void load_document(struct browser *b, const char *text, int len, const ch
                 n->img = c->img;
             else if(!b->imgs[b->nimgs-1].lazy)
                 queue_resource(b, F_IMG, abs, 0, 0);
+        } else if (n->tag == T_VIDEO && (v = node_attr(n, "poster")) && *v && b->imgs && b->nimgs < MAX_RES &&
+                   strncasecmp(v, "data:", 5)) {
+            url_resolve(b->base, v, abs_img, sizeof(abs_img));     /* the poster shows where the video would */
+            struct cached *c = cache_find_data(b, abs_img);
+            b->imgs[b->nimgs].n = n;
+            b->imgs[b->nimgs].lazy = 0;
+            b->imgs[b->nimgs].url = arena_strdup(&b->arena, abs_img);
+            b->nimgs++;
+            if (c)
+                n->img = c->img;
+            else
+                queue_resource(b, F_IMG, abs_img, 0, 0);
         }
     }
     if (b->win && (url_is_http(b->url) || url_is_https(b->url))) {      /* the window's icon */
@@ -4436,7 +4451,8 @@ static void mp_field(void *ctx, const char *name, const char *value, struct node
     const char *base = strrchr(value, '/');
     base = base ? base + 1 : value;
     long len = 0;
-    char *data = *value ? store_read_file(value, 8L << 20, &len) : NULL;   /* up to 8 MB a file */
+    /* up to 8 MB a file, and only one the user picked (never a path a page put there) */
+    char *data = *value && file->file_chosen ? store_read_file(value, 8L << 20, &len) : NULL;
     mp_str(m, "\"; filename=\"");
     mp_quoted(m, data ? base : "");
     mp_str(m, "\"\r\nContent-Type: ");
@@ -4519,6 +4535,8 @@ static void reset_form(struct node *form)
             continue;
         if (n->tag == T_INPUT) {
             const char *v = node_attr(n, "value");
+            if (!strcasecmp(type_of(n), "file"))
+                v = NULL, n->file_chosen = 0;
             free(n->value);
             n->value = strdup(v ? v : "");
             n->cursor = 0;
@@ -4570,6 +4588,7 @@ static void control_answered(void *ctx, const char *text)
         paint(b);
         return;
     }
+    n->file_chosen = *text != 0;
     set_control_value(b, n, text);
 }
 
@@ -4584,6 +4603,22 @@ static void ask_control(struct browser *b, struct node *n)
 static void activate(struct browser *b, struct node *n)
 {
     if (!n || web_inert(n) || web_disabled(n)) return;
+    if (n->tag == T_VIDEO || n->tag == T_AUDIO) {
+        /* nothing here plays them: fetch the file (its src, or its first <source>) to the downloads */
+        const char *src = node_attr(n, "src");
+        for (struct node *k = n->first; (!src || !*src) && k; k = k->next)
+            if (k->type == N_ELEMENT && k->tag == T_SOURCE)
+                src = node_attr(k, "src");
+        if (!src || !*src) {
+            set_status(b, "This %s has no file to download", n->tag == T_VIDEO ? "video" : "audio");
+            paint(b);
+            return;
+        }
+        char abs[URL_MAX];
+        url_resolve(b->base, src, abs, sizeof(abs));
+        navigate(b, abs, NULL, NAV_NEW);
+        return;
+    }
     int changed = 0;
     struct node *form = form_of(n);
     const char *t = n->tag == T_INPUT ? type_of(n) : n->tag == T_BUTTON ? (node_attr(n, "type") ? node_attr(n, "type") : "submit") : "";

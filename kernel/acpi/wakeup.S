@@ -5,6 +5,11 @@
  * here in real mode, much as at power-on, and everything of ours in
  * memory is as we left it.
  *
+ * WAKE_BASE is 512 KiB: above the first 64 KiB, which some firmware
+ * writes over while it resumes (Linux keeps out of them for that reason),
+ * and below any extended BIOS data area. The segment holds the code and
+ * a 32 KiB stack: a video BIOS's initialisation wants a deep one.
+ *
  * In real mode, while the BIOS can still be called, the display gets
  * what it needs to show something again (the flags sleep.c fills in):
  * the video BIOS run again from its start (the firmware may not have,
@@ -14,8 +19,8 @@
  * with the state sleep.c saved, which turns paging on again and goes on
  * in acpi_suspend() where it went to sleep.
  */
-#define WAKE_BASE  0x9000
-#define WAKE_STACK 0x1FF0               /* the stack's top, in the second page */
+#define WAKE_BASE  0x80000
+#define WAKE_STACK 0x8000               /* the stack's top: 32 KiB, from the code up */
 #define W(x) ((x) - wakeup_start)
 
 #define WF_POST  0x1                    /* run the video BIOS's start */
@@ -60,6 +65,11 @@ wakeup_start:
 
 2:  testb $WF_POST, W(wakeup_flags)
     jz 3f
+    movw $0xC000, %ax                   /* only with a ROM there (55 AA) */
+    movw %ax, %es
+    cmpw $0xAA55, %es:0
+    jne 3f
+    movw W(wakeup_vga_bdf), %ax         /* bus:device.function, as the PCI firmware spec has it */
     lcallw $0xC000, $3                  /* the option ROM's initialisation entry */
     movw %cs, %ax                       /* which may have used anything */
     movw %ax, %ds
@@ -76,6 +86,7 @@ wakeup_start:
     int $0x10
     movw %cs, %ax
     movw %ax, %ds
+    movw %ax, %es
     movw %ax, %ss
     movl $WAKE_STACK, %esp
     cli
@@ -87,6 +98,7 @@ wakeup_start:
     int $0x10
     movw %cs, %ax
     movw %ax, %ds
+    movw %ax, %es
     movw %ax, %ss
     movl $WAKE_STACK, %esp
     cli
@@ -132,11 +144,13 @@ wakeup_gdt_desc:
     .word 3 * 8 - 1
     .long WAKE_BASE + W(wakeup_gdt)
 
-.global wakeup_flags, wakeup_vbe_mode
+.global wakeup_flags, wakeup_vbe_mode, wakeup_vga_bdf
 wakeup_flags:
     .byte 0
 .align 2
 wakeup_vbe_mode:
+    .word 0
+wakeup_vga_bdf:
     .word 0
 
 .global wakeup_end

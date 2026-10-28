@@ -271,7 +271,8 @@ static void unlink_node(struct jsdom *d, struct node *n)
     else
         p->last = n->prev;
     n->parent = n->prev = n->next = NULL;
-    assign_slots(d);
+    if (d)                              /* (a template's content moves without one) */
+        assign_slots(d);
     renumber(p);
     if (was_connected)
         ce_tree(d, n, 0);
@@ -392,6 +393,8 @@ static void set_attr(struct jsdom *d, struct node *n, const char *name, const ch
     snprintf(lname, sizeof(lname), "%s", name);
     for (char *p = lname; *p; p++)
         *p = (char)tolower((unsigned char)*p);
+    if (!strcmp(lname, "type"))
+        n->file_chosen = 0;                     /* a file the user picked was for the old kind of input */
     struct attr **pp = &n->attrs;
     for (; *pp; pp = &(*pp)->next)
         if (!strcmp((*pp)->name, lname)) {
@@ -1201,6 +1204,12 @@ static struct node *selected_option(struct node *sel)
     return NULL;
 }
 
+static int is_file_input(const struct node *n)
+{
+    const char *t = n->tag == T_INPUT ? node_attr(n, "type") : NULL;
+    return t && !strcasecmp(t, "file");
+}
+
 static const char *control_value(struct node *n)
 {
     if (n->tag == T_SELECT) {
@@ -1383,6 +1392,13 @@ static int node_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
         return 1;
     }
     if (IS("value")) {
+        if (is_file_input(n)) {                 /* the file's name only, as browsers show it */
+            const char *v = n->file_chosen && n->value ? n->value : "", *base = strrchr(v, '/');
+            char fake[300];
+            snprintf(fake, sizeof(fake), "%s%s", *v ? "C:\\fakepath\\" : "", base ? base + 1 : v);
+            *out = js_str(J, fake);
+            return 1;
+        }
         *out = js_str(J, control_value(n));
         return 1;
     }
@@ -1623,6 +1639,12 @@ static int node_set(struct js *J, struct jsobj *o, const char *key, jsval v)
                         n->checked = k;
                     k++;
                 }
+        } else if (is_file_input(n)) {
+            if (!s->s[0]) {                     /* only clearing it: a page cannot pick the file */
+                free(n->value);
+                n->value = strdup("");
+                n->file_chosen = 0;
+            }
         } else {
             free(n->value);
             n->value = strdup(s->s);
@@ -2674,9 +2696,10 @@ static jsval form_reset(struct js *J, jsval self, jsval *args, int argc)
         if (n->type != N_ELEMENT)
             continue;
         if (n->tag == T_INPUT) {
-            const char *v = node_attr(n, "value");
+            const char *v = is_file_input(n) ? NULL : node_attr(n, "value");
             free(n->value);
             n->value = strdup(v ? v : "");
+            n->file_chosen = 0;
             n->checked = node_attr(n, "checked") != NULL;
         } else if (n->tag == T_TEXTAREA) {
             free(n->value);
@@ -2757,7 +2780,7 @@ static jsval el_set_attribute(struct js *J, jsval self, jsval *args, int argc)
         return js_undefined;
     struct jsstr *name = js_tostr(J, ARG(0)), *value = js_tostr(J, ARG(1));
     set_attr(dom(J), n, name->s, value->s);
-    if (!strcasecmp(name->s, "value") && n->tag == T_INPUT) {
+    if (!strcasecmp(name->s, "value") && n->tag == T_INPUT && !is_file_input(n)) {
         free(n->value);
         n->value = strdup(value->s);
     }
@@ -5395,7 +5418,13 @@ void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, i
                                                         X(E, showPopover) X(E, hidePopover)                  \
                                                             X(E, togglePopover) X(E, inert) X(E, draggable)  \
                                                                 X(E, slot) X(E, part) X(T, splitText)        \
-                                                                    X(T, appendData) X(T, substringData)
+                                                                    X(T, appendData) X(T, substringData)     \
+    X(W, ReportingObserver) X(W, TaskController) X(W, scheduler) X(W, SpeechSynthesisUtterance)              \
+    X(W, speechSynthesis) X(W, ElementInternals) X(W, CustomStateSet) X(W, Sanitizer) X(W, TrustedHTML)      \
+    X(W, TrustedScript) X(W, TrustedScriptURL) X(W, TrustedTypePolicy) X(W, TrustedTypePolicyFactory)        \
+    X(W, trustedTypes) X(D, pointerLockElement) X(D, exitPointerLock) X(D, caretPositionFromPoint)           \
+    X(D, caretRangeFromPoint) X(E, requestPointerLock) X(E, attachInternals) X(E, setHTML)                   \
+    X(E, setHTMLUnsafe)
 
 static void dom_lib_load(struct jsdom *d)
 {
@@ -5472,6 +5501,42 @@ static jsval blob_url_api(struct js *J,jsval self,jsval *args,int argc)
     return url?js_str(J,url):js_throw_error(J,"QuotaExceededError: cannot retain Blob URL");
 }
 
+/* %chosenFile(input): the file the user picked for an <input type=file> (never a path a page
+ * set) as { name, type, lastModified, bytes }, or null. Up to 8 MB, as a form would send. */
+static jsval chosen_file(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    struct node *n = node_of(ARG(0));
+    if (!n || !is_file_input(n) || !n->file_chosen || !n->value || !n->value[0])
+        return js_null;
+    long len = 0;
+    char *data = store_read_file(n->value, 8L << 20, &len);
+    if (!data)
+        return js_null;
+    static const struct { const char *ext, *type; } types[] = {
+        { ".txt", "text/plain" }, { ".html", "text/html" }, { ".htm", "text/html" }, { ".css", "text/css" },
+        { ".js", "text/javascript" }, { ".json", "application/json" }, { ".xml", "application/xml" },
+        { ".png", "image/png" }, { ".jpg", "image/jpeg" }, { ".jpeg", "image/jpeg" }, { ".gif", "image/gif" },
+        { ".svg", "image/svg+xml" }, { ".webp", "image/webp" }, { ".pdf", "application/pdf" },
+        { ".zip", "application/zip" }, { ".wav", "audio/wav" }, { ".mp3", "audio/mpeg" }, { ".csv", "text/csv" },
+    };
+    const char *base = strrchr(n->value, '/'), *dot;
+    base = base ? base + 1 : n->value;
+    const char *type = "";
+    if ((dot = strrchr(base, '.')))
+        for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++)
+            if (!strcasecmp(dot, types[i].ext))
+                type = types[i].type;
+    double modified = (double)store_file_mtime(n->value) * 1000;
+    struct jsobj *o = js_new_object(J);
+    js_put(J, o, js_mkstr(J, "name", 4), js_str(J, base), 1);
+    js_put(J, o, js_mkstr(J, "type", 4), js_str(J, type), 1);
+    js_put(J, o, js_mkstr(J, "lastModified", 12), js_num(modified), 1);
+    js_put(J, o, js_mkstr(J, "bytes", 5), js_new_bytes(J, (const unsigned char *)data, (int)len), 1);
+    free(data);
+    return js_obj(o);
+}
+
 static jsval clipboard_text(struct js *J, jsval self, jsval *args, int argc)
 {
     struct jsdom *d=dom(J);
@@ -5527,6 +5592,16 @@ struct jsdom *jsdom_new(const struct jshost *host)
     }
     struct js *J = d->J;
     J->on_unhandled = host_unhandled;
+    /* shadow roots the page's HTML declared (<template shadowrootmode>) */
+    for (struct node *n = d->h.root; n; n = node_next_shadow(n, d->h.root))
+        if (n->shadow_root) {
+            struct shadow_scope *scope = arena_alloc(d->h.arena, sizeof(*scope));
+            if (scope) {
+                scope->root = n->shadow_root;
+                scope->next = d->shadows;
+                d->shadows = scope;
+            }
+        }
     js_gc_root(J, d, sizeof(*d));       /* the window, prototypes, timers and requests */
     struct js_gc_hooks hooks = { d, gc_mark, gc_more, gc_sweep };
     js_gc_hooks(J, &hooks);
@@ -5967,6 +6042,7 @@ struct jsdom *jsdom_new(const struct jshost *host)
     fn(J,w,"%blobURL",blob_url_api,2);
     fn(J,w,"%adoptSheets",adopt_sheets,2);
     fn(J,w,"%clipboard",clipboard_text,1);
+    fn(J,w,"%chosenFile",chosen_file,1);
     fn(J,w,"%pointerCapture",pointer_capture_api,2);
     if (js_eval(J, js_dom_eager, (int)sizeof(js_dom_eager) - 1, "DOM library") < 0)
         fprintf(stderr, "DOM library: %s\n", js_error(J));

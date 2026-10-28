@@ -5698,6 +5698,13 @@ struct js *js_new(void *host)
     js_init_lib(J);
     js_define_native(J, J->global, "eval", global_eval, 1);
     init_generators(J);
+    {
+        /* generators are iterators: theirs is Iterator.prototype's child (Iterator is the prelude's) */
+        jsval it = js_get(J, js_obj(J->global), "Iterator");
+        jsval ip = it.t == JS_OBJ ? js_get(J, it, "prototype") : js_undefined;
+        if (ip.t == JS_OBJ)
+            J->generator_proto->proto = ip.u.o;
+    }
     J->gc_inhibit = 0;
     return J;
 }

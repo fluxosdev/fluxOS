@@ -204,6 +204,7 @@ void js_init_binary(struct js *J);
 int js_typed_length(jsval v);
 int js_typed_has(jsval v, const char *key);
 unsigned char *js_binary_bytes(jsval v, int *len);
+jsval js_new_bytes(struct js *J, const unsigned char *p, int n);    /* a Uint8Array with a copy */
 void js_init_lib(struct js *J);
 void js_init_lib2(struct js *J);          /* jslib2.c: Symbol, Promise, Reflect, ... */
 

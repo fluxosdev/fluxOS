@@ -69,6 +69,8 @@ struct flow {
     int min, max;               /* measuring */
     struct open_el open[16];
     int nopen;
+    const struct style *fl_letter;      /* the block's ::first-letter, until its first letter is out */
+    const struct style *fl_line;        /* the block's ::first-line, until its first line is placed */
 };
 
 struct lctx {
@@ -114,6 +116,7 @@ static int layout_table(struct lctx *c, struct node *n, int x, int y, int cw, in
 static void measure(struct lctx *c, struct node *n, int *min, int *max);
 static void flow_children(struct lctx *c, struct flow *f, struct node *n);
 static void flush_run(struct lctx *c, struct flow *f);
+static int has_text(const char *t, int len, const struct style *st);
 static int layout_flex(struct lctx *c, struct node *n, int x, int y, int w, int defh, int minh);
 static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int defh, int minh);
 static int muldiv(int a, int b, int c);
@@ -578,11 +581,8 @@ static void decorate(struct ditem *d, const struct style *st, int w, int h)
         d->bg_clipped = 1;
         d->bgclip = mkrect(left, top, w-left-right, h-top-bottom);
     }
-    if (st->grad && !st->bg_layers) {
-        d->grad = st->grad;
-        d->g0 = st->g0;
-        d->g1 = st->g1;
-    }
+    if (st->gr && !st->bg_layers)
+        d->gr = st->gr;
 }
 
 /* The four sides of a border box. */
@@ -692,7 +692,7 @@ static int bg_picture_wanted(const struct style *st)
     if (st->hidden) return 0;
     if (st->bg_layers) {
         for (const struct style *l = st->bg_layers; l; l = l->bg_next)
-            if (l->grad || (l->bg_img && l->bg_img->w > 0 && l->bg_img->h > 0)) return 1;
+            if (l->gr || (l->bg_img && l->bg_img->w > 0 && l->bg_img->h > 0)) return 1;
         return 0;
     }
     return st->bg_img && st->bg_img->w > 0 && st->bg_img->h > 0;
@@ -718,11 +718,15 @@ static struct bgpaint *bg_picture_layer(struct lctx *c, const struct style *st, 
     }
     if (ow <= 0 || oh <= 0)
         return NULL;
-    const struct image *img = st->bg_img;
-    int iw = img ? img->w : ow, ih = img ? img->h : oh;
-    int tw = ZOOM(iw), th = ZOOM(ih);
+    const struct image *img = st->bg_img && st->bg_img->w > 0 && st->bg_img->h > 0 ? st->bg_img : NULL;
     if (st->bg_attachment == 1) ox = oy = 0, ow = c->vw, oh = c->vh;
-    switch (st->bg_size) {
+    int iw = img ? img->w : ow, ih = img ? img->h : oh;
+    int tw = img ? ZOOM(iw) : ow, th = img ? ZOOM(ih) : oh;
+    if (!img && st->bg_size == BGS_LEN) {
+        /* a gradient has no size of its own: auto is the whole area */
+        tw = st->bg_w.unit == U_AUTO ? ow : len_px(st->bg_w, ow);
+        th = st->bg_h.unit == U_AUTO ? oh : len_px(st->bg_h, oh);
+    } else switch (img ? st->bg_size : BGS_AUTO) {
     case BGS_COVER:
     case BGS_CONTAIN: {
         int wide = (long long)ow * ih > (long long)oh * iw;     /* the area is wider than the picture */
@@ -755,13 +759,12 @@ static struct bgpaint *bg_picture_layer(struct lctx *c, const struct style *st, 
     struct bgpaint *bp = arena_alloc(c->a, sizeof(*bp));
     if (!bp)
         return NULL;
-    bp->img = st->bg_img;
+    bp->img = img ? st->bg_img : NULL;
     bp->tw = tw, bp->th = th;
     bp->tx = ox + len_px(st->bg_px, ow - tw);
     bp->ty = oy + len_px(st->bg_py, oh - th);
     bp->norep_x = st->bg_norep_x, bp->norep_y = st->bg_norep_y;
-    bp->grad = st->grad;
-    bp->g0 = st->g0, bp->g1 = st->g1;
+    bp->gr = img ? NULL : st->gr;
     bp->fixed = st->bg_attachment == 1;
     int left = 0, top = 0, right = 0, bottom = 0;
     if (st->bg_clip) {
@@ -783,18 +786,18 @@ static void bg_picture_finish(struct lctx *c, struct node *n, int slot)
     if (slot < 0 || slot + 1 >= lo->nitems || lo->items[slot + 1].kind != DK_BGIMG) return;
     struct ditem *s0 = &lo->items[slot], *d = &lo->items[slot+1];
     d->bgp = NULL;
-    d->grad = 0;
+    d->gr = NULL;
     d->color = TRANSPARENT;
     d->x = s0->x, d->y = s0->y, d->w = s0->w, d->h = s0->h;
     if (!bg_picture_wanted(st) || s0->w <= 0 || s0->h <= 0) return;
     for (const struct style *l = st->bg_layers ? st->bg_layers : st; l;
          l = st->bg_layers ? l->bg_next : NULL) {
-        if (!l->grad && (!l->bg_img || l->bg_img->w <= 0 || l->bg_img->h <= 0)) continue;
+        if (!l->gr && (!l->bg_img || l->bg_img->w <= 0 || l->bg_img->h <= 0)) continue;
         struct bgpaint *bp = bg_picture_layer(c, l, s0);
         if (bp) bp->next = (struct bgpaint *)d->bgp, d->bgp = bp;
     }
     round_corners(d, st, s0->w, s0->h);
-    s0->grad = 0;
+    s0->gr = NULL;
 }
 
 /* ---- boxes ---- */
@@ -915,7 +918,8 @@ static int is_block_level(int d)
 static int is_replaced(const struct node *n)
 {
     return n->tag == T_IMG || n->tag == T_INPUT || n->tag == T_SELECT || n->tag == T_TEXTAREA ||
-           n->tag == T_IFRAME || n->tag == T_SVG || n->tag == T_CANVAS || n->tag == T_PROGRESS || n->tag == T_METER;
+           n->tag == T_IFRAME || n->tag == T_SVG || n->tag == T_CANVAS || n->tag == T_PROGRESS || n->tag == T_METER ||
+           n->tag == T_VIDEO || n->tag == T_AUDIO;
 }
 
 /* ---- list markers ---- */
@@ -1541,6 +1545,27 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
             w = ZOOM(n->tag == T_PROGRESS ? 160 : 80);
         if (h < 0)
             h = ZOOM(16);
+    } else if (n->tag == T_VIDEO) {     /* nothing plays here: a box with the poster that offers the file */
+        int iw = ZOOM(canvas_attr(n, "width", n->img && n->img->w > 0 ? n->img->w : 300));
+        int ih = ZOOM(canvas_attr(n, "height", n->img && n->img->h > 0 ? n->img->h : 150));
+        if (w < 0 && h < 0)
+            w = iw, h = ih;
+        else if (w < 0)
+            w = ih ? h * iw / ih : 0;
+        else if (h < 0)
+            h = iw ? w * ih / iw : 0;
+        if (st->max_width.unit == U_PX || (relative(st->max_width.unit) && !c->measuring)) {
+            int mx = len_px(st->max_width, avail);
+            if (w > mx && mx > 0) {
+                h = h * mx / w;
+                w = mx;
+            }
+        }
+    } else if (n->tag == T_AUDIO) {     /* <audio controls>: a bar that offers the file */
+        if (w < 0)
+            w = ZOOM(300);
+        if (h < 0)
+            h = ZOOM(32);
     } else if (n->tag == T_IFRAME) {    /* its page is drawn by the browser */
         ctrl = 0;
         kind = DK_IFRAME;
@@ -1564,7 +1589,7 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
     *ow = b.ml + bw + b.mr;
     *oh = b.mt + bh + b.mb;
     *obase = *oh;
-    if (n->tag != T_IMG && n->tag != T_SVG && n->tag != T_CANVAS && !(n->tag == T_INPUT && h <= 13))
+    if (n->tag != T_IMG && n->tag != T_SVG && n->tag != T_CANVAS && n->tag != T_VIDEO && !(n->tag == T_INPUT && h <= 13))
         *obase = b.mt + b.bt + b.pt + (h - fh) / 2 + wfont_ascent(f) + 1;
     if (c->measuring || st->hidden)
         return;
@@ -1684,6 +1709,7 @@ static void layout_inline_block(struct lctx *c, struct node *n, int avail, int *
 
 static void add_atomic(struct lctx *c, struct flow *f, struct node *n)
 {
+    f->fl_letter = NULL;                /* the first thing on the line is not a letter */
     struct item *it = push_item(f, I_ATOMIC, n->style);
     if (!it)
         return;
@@ -2129,6 +2155,60 @@ static void measure_run(struct flow *f)
         f->min = group;
 }
 
+/*
+ * ::first-line: give the run's items (from `from` on) the pseudo-element's style for working out the
+ * first line: text in the block's own style takes it whole; text of inline elements inside keeps its
+ * own font and takes the color, if it was the block's. What the items had is kept in saved
+ * (malloc'd), for the items that end up on later lines.
+ */
+struct fl_saved {
+    const struct style *st;
+    int w;
+};
+
+static struct fl_saved *first_line_styles(struct lctx *c, struct flow *f, int from)
+{
+    const struct style *fls = f->fl_line;
+    struct fl_saved *saved = malloc(sizeof(*saved) * (size_t)f->n);
+    if (!saved)
+        return NULL;
+    const struct style *from_st[8], *to_st[8];
+    int ncache = 0;
+    for (int k = 0; k < f->n; k++) {
+        struct item *it = &f->items[k];
+        saved[k].st = it->st;
+        saved[k].w = it->w;
+        if (k < from || (it->kind != I_WORD && it->kind != I_SPACE) || !it->st)
+            continue;
+        const struct style *ns = NULL;
+        if (it->st == f->st) {
+            ns = fls;
+        } else if (it->st->color == f->st->color && fls->color != f->st->color) {
+            for (int m = 0; m < ncache && !ns; m++)
+                if (from_st[m] == it->st)
+                    ns = to_st[m];
+            if (!ns) {
+                struct style *copy = arena_alloc(c->a, sizeof(*copy));
+                if (!copy)
+                    continue;
+                *copy = *it->st;
+                copy->color = fls->color;
+                ns = copy;
+                if (ncache < 8)
+                    from_st[ncache] = it->st, to_st[ncache++] = ns;
+            }
+        }
+        if (!ns || !ns->font)
+            continue;
+        it->st = ns;
+        if (it->kind == I_WORD)
+            it->w = text_width(ns, it->text, it->len);
+        else if (!it->invisible && it->w)
+            it->w = space_width(ns);
+    }
+    return saved;
+}
+
 static void flush_run(struct lctx *c, struct flow *f)
 {
     if (!f->n)
@@ -2149,6 +2229,7 @@ static void flush_run(struct lctx *c, struct flow *f)
     split_long_words(f, f->w - (f->lines == 0 ? f->st->text_indent : 0));
     struct item *items = f->items;
     int n = f->n, i = 0;
+    struct fl_saved *fl_saved = NULL;
     int ox = f->x, ow = f->w;           /* the container; a line beside floats is narrower */
     while (any && i < n) {
         /* Collapsible spaces at the start of a line go. */
@@ -2156,6 +2237,8 @@ static void flush_run(struct lctx *c, struct flow *f)
             i++;
         if (i >= n)
             break;
+        if (f->fl_line && f->lines == 0 && !fl_saved)
+            fl_saved = first_line_styles(c, f, i);
         f->x = ox;
         f->w = ow;
         if (c->nfloats > c->float_base) {
@@ -2211,8 +2294,16 @@ static void flush_run(struct lctx *c, struct flow *f)
             place_line(c, f, start, e);
         else if (forced)
             place_line(c, f, start, start);
+        if (fl_saved) {                 /* the first line is out: the rest go back to their own style */
+            for (int k = next; k < n; k++)
+                items[k].st = fl_saved[k].st, items[k].w = fl_saved[k].w;
+            free(fl_saved);
+            fl_saved = NULL;
+            f->fl_line = NULL;
+        }
         i = next;
     }
+    free(fl_saved);
     f->x = ox;
     f->w = ow;
     f->n = 0;
@@ -2225,6 +2316,8 @@ static void flush_run(struct lctx *c, struct flow *f)
 static void block_child(struct lctx *c, struct flow *f, struct node *n)
 {
     flush_run(c, f);
+    f->fl_letter = NULL;                /* the first line was this block's, or it was not ours */
+    f->fl_line = NULL;
     if (c->measuring) {
         int mn, mx;
         measure(c, n, &mn, &mx);
@@ -2271,6 +2364,8 @@ static void add_pseudo(struct lctx *c, struct flow *f, struct node *n, int which
     const struct style *ps = n->pseudo_st[which];
     if (!ps || !n->pseudo_text[which])
         return;
+    if (has_text(n->pseudo_text[which], (int)strlen(n->pseudo_text[which]), ps))
+        f->fl_letter = NULL;
     int base = c->measuring ? 0 : f->w;
     struct item *it = push_item(f, I_OPEN, ps);
     if (it)
@@ -2281,10 +2376,63 @@ static void add_pseudo(struct lctx *c, struct flow *f, struct node *n, int which
         it->w = len_px(ps->padding[1], base) + ps->border_w[1] + len_px(ps->margin[1], base);
 }
 
+/* Punctuation that goes with a first letter (before or after it). */
+static int letter_punct(int cp)
+{
+    return (cp < 128 && strchr("\"'([{<.,:;!?-*", cp) && cp) || cp == 0xAB || cp == 0xBB || cp == 0xA1 ||
+           cp == 0xBF || (cp >= 0x2018 && cp <= 0x201F) || cp == 0x2039 || cp == 0x203A;
+}
+
+/*
+ * ::first-letter: the first letter of the block's first text (with punctuation round it), in an
+ * inline box of the pseudo-element's style. Returns 0 if the text has no letter yet (it is all
+ * spaces), so the next text is looked at.
+ */
+static int first_letter(struct lctx *c, struct flow *f, const char *text, int len, const struct style *st,
+                        struct node *parent)
+{
+    const char *p = text, *end = text + len;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\f'))
+        p++;
+    if (p >= end)
+        return 0;
+    const char *lead = p, *q = p;
+    int cp = 0;
+    while (q < end) {                   /* opening punctuation, then the letter */
+        const char *r = q;
+        cp = utf8_next(&r, end);
+        q = r;
+        if (!letter_punct(cp))
+            break;
+    }
+    while (q < end) {                   /* and punctuation after it */
+        const char *r = q;
+        if (!letter_punct(utf8_next(&r, end)))
+            break;
+        q = r;
+    }
+    const struct style *ps = f->fl_letter;
+    f->fl_letter = NULL;
+    add_text(c, f, text, (int)(lead - text), st, parent);
+    int base = c->measuring ? 0 : f->w;
+    struct item *it = push_item(f, I_OPEN, ps);
+    if (it)
+        it->w = len_px(ps->margin[3], base) + ps->border_w[3] + len_px(ps->padding[3], base);
+    add_text(c, f, lead, (int)(q - lead), ps, parent);
+    it = push_item(f, I_CLOSE, ps);
+    if (it)
+        it->w = len_px(ps->padding[1], base) + ps->border_w[1] + len_px(ps->margin[1], base);
+    add_text(c, f, q, (int)(end - q), st, parent);
+    return 1;
+}
+
 static void flow_node(struct lctx *c, struct flow *f, struct node *n)
 {
     if (n->type == N_TEXT) {
-        add_text(c, f, n->text, n->len, n->parent ? n->parent->style : NULL, n->parent);
+        const struct style *pst = n->parent ? n->parent->style : NULL;
+        if (f->fl_letter && pst && pst->font && first_letter(c, f, n->text, n->len, pst, n->parent))
+            return;
+        add_text(c, f, n->text, n->len, pst, n->parent);
         return;
     }
     const struct style *st = n->style;
@@ -2385,6 +2533,8 @@ static int block_content(struct lctx *c, struct node *n, int x, int y, int w, in
     f.st = st;
     f.space_before = 1;
     f.link = enclosing_link(n);
+    f.fl_letter = n->pseudo_st[PE_FIRST_LETTER - 1];
+    f.fl_line = n->pseudo_st[PE_FIRST_LINE - 1];
     if (c->inside_text[0] && n->style->display == D_LIST_ITEM && c->inside_st) {
         const char *marker = arena_strdup(c->a, c->inside_text);
         if (marker) add_text(c, &f, marker, (int)strlen(marker), c->inside_st, n);
@@ -3054,7 +3204,9 @@ static int flex_row(struct lctx *c, const struct style *st, struct fitem *it, in
     }
     starts[nlines] = ni;
 
-    /* A single line fills the container's height; several share what is spare. */
+    /* A single line fills the container's height; several share what is spare (or align-content
+     * spreads them out). */
+    int line_off = 0, line_gap = rgap;
     int total = rgap * (nlines - 1);
     for (int l = 0; l < nlines; l++)
         total += cross[l];
@@ -3066,16 +3218,20 @@ static int flex_row(struct lctx *c, const struct style *st, struct fitem *it, in
         total += target - cross[0];
         cross[0] = target;
     } else if (target > total && nlines) {
-        int extra = target - total;
-        for (int l = 0; l < nlines; l++)
-            cross[l] += extra / nlines;
+        int extra = target - total, ac = st->align_content;
+        if (st->flex_wrap && ac != AL_NORMAL && ac != AL_STRETCH && ac != AL_AUTO) {
+            justify_space(ac, extra, nlines, rgap, &line_off, &line_gap);      /* align-content */
+        } else {
+            for (int l = 0; l < nlines; l++)
+                cross[l] += extra / nlines;
+        }
         total = target;
     }
 
     int jst = st->justify;
     if (st->flex_reverse)
         jst = jst == AL_END ? AL_START : jst == AL_START || jst == AL_NORMAL ? AL_END : jst;
-    int ly = y;
+    int ly = y + line_off;
     for (int l = 0; l < nlines; l++) {
         int a = starts[l], b = starts[l + 1], cnt = b - a;
         int spare = w - gap * (cnt - 1), nauto = 0;
@@ -3117,7 +3273,7 @@ static int flex_row(struct lctx *c, const struct style *st, struct fitem *it, in
             if (t->amr)
                 cx += per_auto;
         }
-        ly += cross[l] + rgap;
+        ly += cross[l] + line_gap;
     }
     free(starts);
     return total;
@@ -3281,7 +3437,7 @@ static int grid_tracks(const struct gridspec *g, int w, int gap, int nitems, str
  * items want, then fr tracks share the rest; with no fr tracks, auto
  * ones stretch to fill. */
 static void size_columns(struct lctx *c, const struct track *tr, int nt, struct fitem *it, int ni,
-                         int w, int avail, int *colw)
+                         int w, int avail, int *colw, int stretch_auto)
 {
     int cmin[MAX_TRACKS], cmax[MAX_TRACKS], limit[MAX_TRACKS];
     memset(cmin, 0, sizeof(cmin));
@@ -3355,15 +3511,31 @@ static void size_columns(struct lctx *c, const struct track *tr, int nt, struct 
                     colw[k] = muldiv(unit, tr[k].vmax, 100);
             break;
         }
-    } else if (spare > 0 && nauto) {
+    } else if (spare > 0 && nauto && stretch_auto) {
         for (int k = 0; k < nt; k++)
             if (tr[k].max == TK_AUTO)
                 colw[k] += spare / nauto;
     }
 }
 
-/* Put items into cells: explicit columns and rows, then the rest in reading order. */
-static int grid_place(struct fitem *it, int ni, int nt, const struct style *cst)
+/* justify-content and align-content other than normal and stretch: they place the tracks instead
+ * of stretching auto ones. */
+static int distributes(int al)
+{
+    return al != AL_NORMAL && al != AL_STRETCH && al != AL_AUTO;
+}
+
+/* Tracks the grid adds past its template: grid-auto-columns' (or grid-auto-rows') sizes in turn, or auto. */
+static void implicit_tracks(struct track *tr, int from, int to, const struct gridspec *autos)
+{
+    for (int k = from; k < to; k++)
+        tr[k] = autos && autos->n ? autos->t[(k - from) % autos->n] : (struct track){ TK_AUTO, TK_AUTO, 0, 0 };
+}
+
+/* Put items into cells: explicit columns and rows, then the rest in reading order. With colflow
+ * (grid-auto-flow: column) the grid is worked on transposed: nt is then the number of rows, items
+ * fill columns top to bottom, and the return value is the number of columns. */
+static int grid_place(struct fitem *it, int ni, int nt, const struct style *cst, int colflow)
 {
     int rows_cap = 16, nrows = 0;
     uint8_t *occ = calloc((size_t)(rows_cap * nt), 1);
@@ -3375,26 +3547,33 @@ static int grid_place(struct fitem *it, int ni, int nt, const struct style *cst)
             struct fitem *t = &it[i];
             const struct style *st = t->st;
             int anon = anonymous(t);
-            int col = -1, cs = !anon && st->gc_span > 0 ? st->gc_span : 1;
-            int row = !anon && st->gr_start > 0 ? st->gr_start - 1 : -1;
-            int rs = !anon && st->gr_span > 0 ? st->gr_span : 1;
+            /* the placement along the axis items flow across (c_) and the one lines grow along (r_) */
+            int c_start = anon ? 0 : colflow ? st->gr_start : st->gc_start;
+            int c_end = anon ? 0 : colflow ? st->gr_end : st->gc_end;
+            int c_span = anon ? 0 : colflow ? st->gr_span : st->gc_span;
+            int r_start = anon ? 0 : colflow ? (st->gc_start > 0 ? st->gc_start : 0) : st->gr_start;
+            int r_end = anon ? 0 : colflow ? (st->gc_end > 0 ? st->gc_end : 0) : st->gr_end;
+            int r_span = anon ? 0 : colflow ? st->gc_span : st->gr_span;
+            int col = -1, cs = c_span > 0 ? c_span : 1;
+            int row = r_start > 0 ? r_start - 1 : -1;
+            int rs = r_span > 0 ? r_span : 1;
             if (!anon && st->grid_area && cst->grid_areas) {      /* grid-area: name */
                 const struct gridareas *ga = cst->grid_areas;
                 for (int k = 0; k < ga->n; k++)
                     if (!strcmp(ga->a[k].name, st->grid_area)) {
-                        col = ga->a[k].c0;
-                        cs = ga->a[k].c1 - ga->a[k].c0;
-                        row = ga->a[k].r0;
-                        rs = ga->a[k].r1 - ga->a[k].r0;
+                        col = colflow ? ga->a[k].r0 : ga->a[k].c0;
+                        cs = colflow ? ga->a[k].r1 - ga->a[k].r0 : ga->a[k].c1 - ga->a[k].c0;
+                        row = colflow ? ga->a[k].c0 : ga->a[k].r0;
+                        rs = colflow ? ga->a[k].c1 - ga->a[k].c0 : ga->a[k].r1 - ga->a[k].r0;
                         break;
                     }
             }
-            if (!anon && st->gc_start && col < 0)
-                col = (st->gc_start > 0 ? st->gc_start : nt + 2 + st->gc_start) - 1;
-            if (!anon && st->gr_end > 0 && row >= 0 && st->gr_end - 1 > row && !st->grid_area)
-                rs = st->gr_end - 1 - row;
-            if (!anon && st->gc_end) {
-                int end = (st->gc_end > 0 ? st->gc_end : nt + 2 + st->gc_end) - 1;
+            if (c_start && col < 0)
+                col = (c_start > 0 ? c_start : nt + 2 + c_start) - 1;
+            if (r_end > 0 && row >= 0 && r_end - 1 > row && !st->grid_area)
+                rs = r_end - 1 - row;
+            if (c_end) {
+                int end = (c_end > 0 ? c_end : nt + 2 + c_end) - 1;
                 if (col >= 0 && end > col)
                     cs = end - col;
                 else if (col < 0 && end - cs >= 0)
@@ -3452,7 +3631,10 @@ static int grid_place(struct fitem *it, int ni, int nt, const struct style *cst)
             for (int a = r; a < r + rs; a++)
                 for (int b = cc; b < cc + cs; b++)
                     occ[a * nt + b] = 1;
-            t->row = r, t->col = cc, t->rspan = rs, t->cspan = cs;
+            if (colflow)
+                t->row = cc, t->col = r, t->rspan = cs, t->cspan = rs;
+            else
+                t->row = r, t->col = cc, t->rspan = rs, t->cspan = cs;
             if (r + rs > nrows)
                 nrows = r + rs;
             if (pass == 1 && row < 0) {
@@ -3476,12 +3658,51 @@ static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int 
     }
     int cgap = len_px(st->col_gap, w), rgap = len_px(st->row_gap, w);
     struct track tr[MAX_TRACKS];
-    int nt = grid_tracks(st->grid_cols, w, cgap, ni, tr);
+    int explicit_cols = st->grid_cols && st->grid_cols->n;
+    int nt = explicit_cols ? grid_tracks(st->grid_cols, w, cgap, ni, tr) : 0;
     for (int i = 0; i < ni; i++)
         item_edges(&it[i], w);
-    int nrows = grid_place(it, ni, nt, st);
     const struct gridspec *rspec = st->grid_rows, *aspec = st->grid_auto_rows;
     int erows = rspec ? rspec->n : 0;
+    int nrows;
+    if (st->grid_col_flow) {
+        /* grid-auto-flow: column: the rows are the template's (or one), columns are added as items need them */
+        nrows = erows > 0 ? erows : 1;
+        int ncols = grid_place(it, ni, nrows, st, 1);
+        if (ncols > MAX_TRACKS)
+            ncols = MAX_TRACKS;
+        if (ncols > nt) {
+            implicit_tracks(tr, nt, ncols, st->grid_auto_cols);
+            nt = ncols;
+        }
+        for (int i = 0; i < ni; i++)            /* what did not fit the columns there can be shares the last */
+            if (it[i].col + it[i].cspan > nt) {
+                it[i].cspan = it[i].cspan < nt ? it[i].cspan : nt;
+                it[i].col = nt - it[i].cspan;
+            }
+    } else {
+        /* lines named past the template's columns make columns of grid-auto-columns' size */
+        int need = nt ? nt : 1;
+        for (int i = 0; i < ni; i++) {
+            const struct style *ist = it[i].st;
+            if (anonymous(&it[i]))
+                continue;
+            int span = ist->gc_span > 0 ? ist->gc_span : 1, end = 0;
+            if (ist->gc_start > 0)
+                end = ist->gc_start - 1 + span;
+            if (ist->gc_end > 0 && ist->gc_end - 1 > end)
+                end = ist->gc_end - 1;
+            if (end > need)
+                need = end;
+        }
+        if (need > MAX_TRACKS)
+            need = MAX_TRACKS;
+        if (need > nt) {
+            implicit_tracks(tr, nt, need, st->grid_auto_cols);
+            nt = need;
+        }
+        nrows = grid_place(it, ni, nt, st, 0);
+    }
     if (nrows < erows)
         nrows = erows;
     if (nrows <= 0) {
@@ -3489,10 +3710,15 @@ static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int 
         return 0;
     }
     int colw[MAX_TRACKS], colx[MAX_TRACKS + 1];
-    size_columns(c, tr, nt, it, ni, w, w - cgap * (nt - 1), colw);
-    colx[0] = 0;
+    size_columns(c, tr, nt, it, ni, w, w - cgap * (nt - 1), colw, !distributes(st->justify));
+    int used_w = cgap * (nt - 1), coff = 0, cstep = cgap;
     for (int k = 0; k < nt; k++)
-        colx[k + 1] = colx[k] + colw[k] + cgap;
+        used_w += colw[k];
+    if (distributes(st->justify) && used_w < w)
+        justify_space(st->justify, w - used_w, nt, cgap, &coff, &cstep);       /* justify-content */
+    colx[0] = coff;
+    for (int k = 0; k < nt; k++)
+        colx[k + 1] = colx[k] + colw[k] + cstep;
 
     int *rowh = calloc((size_t)(nrows + 1) * 2, sizeof(int));
     if (!rowh) {
@@ -3502,7 +3728,7 @@ static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int 
     int *rowy = rowh + nrows + 1;
     for (int i = 0; i < ni; i++) {
         struct fitem *t = &it[i];
-        int cw = colx[t->col + t->cspan] - colx[t->col] - cgap;
+        int cw = colx[t->col + t->cspan] - colx[t->col] - cstep;
         int js = item_justify(st, t), bw;
         if (t->kind == FI_REPLACED)
             bw = -1;
@@ -3552,7 +3778,11 @@ static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int 
     for (int r = 0; r < nrows; r++)
         total += rowh[r];
     int target = defh >= 0 ? defh : minh;
-    if (target > total && nrows && nrows <= 1100) {
+    int roff = 0, rstep = rgap;
+    if (target > total && nrows && distributes(st->align_content) && !sumfr) {
+        justify_space(st->align_content, target - total, nrows, rgap, &roff, &rstep);     /* align-content */
+        total = target;
+    } else if (target > total && nrows && nrows <= 1100) {
         if (sumfr) {                            /* fr rows share what is left */
             int left = target - total, given = 0, last = -1;
             for (int r = 0; r < nrows; r++)
@@ -3578,14 +3808,14 @@ static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int 
             total = target;
         }
     }
-    rowy[0] = 0;
+    rowy[0] = roff;
     for (int r = 0; r < nrows; r++)
-        rowy[r + 1] = rowy[r] + rowh[r] + rgap;
+        rowy[r + 1] = rowy[r] + rowh[r] + rstep;
 
     for (int i = 0; i < ni; i++) {
         struct fitem *t = &it[i];
-        int cx = x + colx[t->col], cw = colx[t->col + t->cspan] - colx[t->col] - cgap;
-        int cy = y + rowy[t->row], ch = rowy[t->row + t->rspan] - rowy[t->row] - rgap;
+        int cx = x + colx[t->col], cw = colx[t->col + t->cspan] - colx[t->col] - cstep;
+        int cy = y + rowy[t->row], ch = rowy[t->row + t->rspan] - rowy[t->row] - rstep;
         int al = item_align(st, t), js = item_justify(st, t), h = t->bh, top, left;
         int outer = t->mt + h + t->mb, oute = t->ml + t->bw + t->mr;
         if (al == AL_STRETCH && t->kind == FI_BLOCK && t->st->height.unit == U_AUTO &&
@@ -3703,6 +3933,7 @@ static void measure(struct lctx *c, struct node *n, int *min, int *max)
         f.st = st;
         f.space_before = 1;
         f.w = BIG;
+        f.fl_letter = n->pseudo_st[PE_FIRST_LETTER - 1];
         add_pseudo(c, &f, n, 0);
         flow_children(c, &f, n);
         add_pseudo(c, &f, n, 1);
@@ -4557,16 +4788,174 @@ static uint32_t with_alpha(uint32_t c, int cov)
     return (c & 0xFFFFFF) | (uint32_t)((int)ALPHA(c) * cov / 256) << 24;
 }
 
-/* k of the way from a to b, in n steps. */
-static uint32_t lerp(uint32_t a, uint32_t b, int k, int n)
+/* ---- gradients ---- */
+
+#define GLUT 1024
+/* A gradient made ready to paint at a size: its geometry, and its colors along the gradient line
+ * in a table (t from t0 to t1; repeating ones repeat lo..lo + period). */
+struct gpaint {
+    const struct css_gradient *g;
+    double ax, ay, len;             /* linear: unit direction, and the gradient line's length */
+    double cx, cy, rx, ry;          /* radial and conic: the centre; radial: the radii */
+    double a0;                      /* conic: where it starts, in turns */
+    double t0, t1, lo, period;
+    int degenerate;                 /* a radius or length of 0: the last color everywhere */
+    uint32_t last;
+    uint32_t lut[GLUT];
+};
+
+static double glen(struct len l, double base)
 {
-    int t = n > 1 ? k * 256 / (n - 1) : 0;
-    uint32_t out = 0;
-    for (int sh = 0; sh < 32; sh += 8) {
-        int u = (int)(a >> sh & 0xFF), v = (int)(b >> sh & 0xFF);
-        out |= (uint32_t)(u + (v - u) * t / 256) << sh;
+    return css_transform_length(l, (int)(base + 0.5));
+}
+
+/* Colors are interpolated premultiplied, so a fade to transparent does not go grey. */
+static uint32_t gmix(uint32_t a, uint32_t b, double t)
+{
+    double aa = (a >> 24) / 255.0, ba = (b >> 24) / 255.0;
+    double al = aa + (ba - aa) * t;
+    if (al <= 0)
+        return 0;
+    uint32_t out = (uint32_t)(al * 255 + 0.5) << 24;
+    for (int sh = 0; sh < 24; sh += 8) {
+        double ca = ((a >> sh) & 255) * aa, cb = ((b >> sh) & 255) * ba;
+        double c = (ca + (cb - ca) * t) / al;
+        out |= (uint32_t)(c < 0 ? 0 : c > 255 ? 255 : c + 0.5) << sh;
     }
     return out;
+}
+
+static void gpaint_setup(struct gpaint *gp, const struct css_gradient *g, int w, int h)
+{
+    memset(gp, 0, offsetof(struct gpaint, lut));
+    gp->g = g;
+    double scale = 1;                   /* stop lengths are measured in this many pixels */
+    if (g->kind == GK_LINEAR) {
+        double th = g->angle * M_PI / 180;
+        if (g->corner_x || g->corner_y)
+            th = atan2(g->corner_x * (double)h, -g->corner_y * (double)w);
+        gp->ax = sin(th), gp->ay = -cos(th);
+        gp->len = fabs(w * gp->ax) + fabs(h * gp->ay);
+        gp->cx = w / 2.0, gp->cy = h / 2.0;     /* the line runs through the middle */
+        scale = gp->len;
+    } else {
+        gp->cx = glen(g->cx, w), gp->cy = glen(g->cy, h);
+        double l = gp->cx, r = w - gp->cx, t = gp->cy, b = h - gp->cy;
+        if (g->kind == GK_RADIAL) {
+            if (g->rx.unit != U_AUTO) {
+                gp->rx = glen(g->rx, w);
+                gp->ry = g->circle ? gp->rx : glen(g->ry, h);
+            } else {
+                double sx = fabs(l) < fabs(r) ? fabs(l) : fabs(r), sy = fabs(t) < fabs(b) ? fabs(t) : fabs(b);
+                double fx = fabs(l) > fabs(r) ? fabs(l) : fabs(r), fy = fabs(t) > fabs(b) ? fabs(t) : fabs(b);
+                int far = g->extent == GX_FARTHEST_SIDE || g->extent == GX_FARTHEST_CORNER;
+                int corner = g->extent == GX_FARTHEST_CORNER || g->extent == GX_CLOSEST_CORNER;
+                double x = far ? fx : sx, y = far ? fy : sy;
+                if (g->circle) {
+                    double rr = corner ? sqrt(x * x + y * y) : far ? (x > y ? x : y) : (x < y ? x : y);
+                    gp->rx = gp->ry = rr;
+                } else {
+                    gp->rx = corner ? x * M_SQRT2 : x;
+                    gp->ry = corner ? y * M_SQRT2 : y;
+                }
+            }
+            scale = gp->rx;
+            if (gp->rx <= 0.01 || gp->ry <= 0.01)
+                gp->degenerate = 1;
+        } else {
+            gp->a0 = g->angle / 360.0;
+            scale = 1;
+        }
+    }
+    if (g->kind == GK_LINEAR && gp->len <= 0.01)
+        gp->degenerate = 1;
+
+    /* stop positions as fractions of the gradient line, with the gaps filled in */
+    int n = g->nstops;
+    double pos[MAX_GSTOPS];
+    int has[MAX_GSTOPS];
+    for (int i = 0; i < n; i++) {
+        has[i] = g->stops[i].has_pos;
+        if (has[i])
+            pos[i] = g->kind == GK_CONIC ? g->stops[i].pos.v / 10000.0 * (g->stops[i].pos.unit == U_PCT)
+                   : glen(g->stops[i].pos, scale) / (scale > 0 ? scale : 1);
+    }
+    if (!has[0])
+        pos[0] = 0, has[0] = 1;
+    if (!has[n - 1])
+        pos[n - 1] = 1, has[n - 1] = 1;
+    double hi = pos[0];
+    for (int i = 0; i < n; i++)
+        if (has[i]) {
+            if (pos[i] < hi)
+                pos[i] = hi;
+            hi = pos[i];
+        }
+    for (int i = 1; i < n; i++)
+        if (!has[i]) {
+            int k = i;
+            while (!has[k])
+                k++;
+            for (int m = i; m < k; m++)
+                pos[m] = pos[i - 1] + (pos[k] - pos[i - 1]) * (m - i + 1) / (k - i + 1);
+            i = k;
+        }
+    gp->last = g->stops[n - 1].color;
+    gp->lo = pos[0];
+    gp->period = pos[n - 1] - pos[0];
+    if (g->repeating && gp->period > 1e-6) {
+        gp->t0 = pos[0], gp->t1 = pos[n - 1];
+    } else {
+        gp->t0 = pos[0] < 0 ? pos[0] : 0, gp->t1 = pos[n - 1] > 1 ? pos[n - 1] : 1;
+        gp->period = 0;
+    }
+    if (gp->t1 - gp->t0 < 1e-6)
+        gp->t1 = gp->t0 + 1e-6;
+    int k = 0;
+    for (int i = 0; i < GLUT; i++) {
+        double t = gp->t0 + (gp->t1 - gp->t0) * i / (GLUT - 1);
+        while (k < n - 1 && t > pos[k + 1])
+            k++;
+        if (t <= pos[0])
+            gp->lut[i] = g->stops[0].color;
+        else if (k >= n - 1)
+            gp->lut[i] = g->stops[n - 1].color;
+        else {
+            double span = pos[k + 1] - pos[k];
+            gp->lut[i] = span > 1e-9 ? gmix(g->stops[k].color, g->stops[k + 1].color, (t - pos[k]) / span)
+                                     : g->stops[k + 1].color;
+        }
+    }
+}
+
+/* Linear gradients that run straight down (1) or across (2) are the same all along a row or column. */
+static int gpaint_axis(const struct gpaint *gp)
+{
+    if (gp->g->kind != GK_LINEAR || gp->degenerate)
+        return 0;
+    return fabs(gp->ax) < 1e-9 ? 1 : fabs(gp->ay) < 1e-9 ? 2 : 0;
+}
+
+/* The gradient's color at pixel (i, j) of its w x h area. */
+static uint32_t gpaint_at(const struct gpaint *gp, int i, int j)
+{
+    const struct css_gradient *g = gp->g;
+    if (gp->degenerate)
+        return gp->last;
+    double x = i + 0.5, y = j + 0.5, t;
+    if (g->kind == GK_LINEAR) {
+        t = ((x - gp->cx) * gp->ax + (y - gp->cy) * gp->ay) / gp->len + 0.5;
+    } else if (g->kind == GK_RADIAL) {
+        double dx = (x - gp->cx) / gp->rx, dy = (y - gp->cy) / gp->ry;
+        t = sqrt(dx * dx + dy * dy);
+    } else {
+        t = atan2(x - gp->cx, gp->cy - y) / (2 * M_PI) - gp->a0;
+        t -= floor(t);
+    }
+    if (gp->period > 0)
+        t = gp->lo + fmod(fmod(t - gp->lo, gp->period) + gp->period, gp->period);
+    int idx = (int)((t - gp->t0) * (GLUT - 1) / (gp->t1 - gp->t0) + 0.5);
+    return gp->lut[idx < 0 ? 0 : idx >= GLUT ? GLUT - 1 : idx];
 }
 
 /* A fill with rounded corners, a gradient or a border ring. */
@@ -4583,25 +4972,30 @@ static void fill_rich(struct surface *s, const struct ditem *d, int x, int y)
     }
     if (maxr < ring)
         maxr = ring;
+    struct gpaint *gp = d->gr ? malloc(sizeof(*gp)) : NULL;
+    uint32_t *colc = NULL;              /* a gradient across: its colors along a row, once */
+    int axis = 0;
+    if (gp) {
+        gpaint_setup(gp, d->gr, d->w, d->h);
+        axis = gpaint_axis(gp);
+        if (axis == 2 && (colc = malloc(sizeof(uint32_t) * (size_t)d->w)))
+            for (int i = 0; i < d->w; i++)
+                colc[i] = gpaint_at(gp, i, 0);
+    }
     for (int j = r.y; j < r.y + r.h; j++) {
         int bj = j - y;
         uint32_t *row = s->px + j * s->stride;
-        uint32_t rowc = d->grad == 1 ? lerp(d->g0, d->g1, bj, d->h) : 0;
         int edge_row = bj < maxr || bj >= d->h - maxr;
-        if (!edge_row && !ring && d->grad != 2) {
+        uint32_t rowc = axis == 1 ? gpaint_at(gp, 0, bj) : 0;
+        if (!edge_row && !ring && (!gp ? ALPHA(d->color) == 255 : axis == 1 && ALPHA(rowc) == 255)) {
             /* away from the corners a row is one color */
-            uint32_t col = d->grad && ALPHA(rowc) == 255 ? rowc : d->color;
-            if (d->grad && ALPHA(rowc) < 255)
-                col = 0;
-            if (ALPHA(col) == 255) {
-                gfx_fill(s, r.x, j, r.w, 1, col & 0xFFFFFF);
-                continue;
-            }
+            gfx_fill(s, r.x, j, r.w, 1, (gp ? rowc : d->color) & 0xFFFFFF);
+            continue;
         }
         for (int i = r.x; i < r.x + r.w; i++) {
             int bi = i - x, out, in;
             if (!edge_row && bi >= maxr && bi < d->w - maxr) {
-                if (!ALPHA(d->color) && !d->grad) {     /* a ring's empty middle */
+                if (!ALPHA(d->color) && !gp) {          /* a ring's empty middle */
                     i = x + d->w - maxr - 1;
                     continue;
                 }
@@ -4618,14 +5012,16 @@ static void fill_rich(struct surface *s, const struct ditem *d, int x, int y)
             if (in) {
                 if (ALPHA(d->color))
                     px = blend_px(px, with_alpha(d->color, in));
-                if (d->grad)
-                    px = blend_px(px, with_alpha(d->grad == 1 ? rowc : lerp(d->g0, d->g1, bi, d->w), in));
+                if (gp)
+                    px = blend_px(px, with_alpha(axis == 1 ? rowc : colc ? colc[bi] : gpaint_at(gp, bi, bj), in));
             }
             if (ring && out > in)
                 px = blend_px(px, with_alpha(d->ring_color, out - in));
             row[i] = px & 0xFFFFFF;
         }
     }
+    free(colc);
+    free(gp);
 }
 
 /* An image with its corners rounded off, or put (object-fit) somewhere other than filling its box. */
@@ -4712,11 +5108,46 @@ static void draw_bgimg_layer(struct surface *s, const struct ditem *d, const str
             free(xs);
         }
     }
-    if (bp->grad) {
-        struct ditem gradient = *d;
-        gradient.grad = bp->grad;
-        gradient.g0 = bp->g0, gradient.g1 = bp->g1;
-        fill_rich(s, &gradient, x, y);
+    if (bp->gr && bp->tw > 0 && bp->th > 0) {
+        /* a gradient is a picture of the tile's size, placed and repeated like one */
+        struct gpaint *gp = malloc(sizeof(*gp));
+        if (gp) {
+            gpaint_setup(gp, bp->gr, bp->tw, bp->th);
+            int axis = gpaint_axis(gp);
+            uint32_t *colc = axis == 2 ? malloc(sizeof(uint32_t) * (size_t)bp->tw) : NULL;
+            for (int i = 0; colc && i < bp->tw; i++)
+                colc[i] = gpaint_at(gp, i, 0);
+            int rounded = d->rad[0] || d->rad[1] || d->rad[2] || d->rad[3];
+            int bx = (bp->fixed ? ox : x) + bp->tx, by = (bp->fixed ? oy : y) + bp->ty;
+            for (int j = r.y; j < r.y + r.h; j++) {
+                int ry = j - by;
+                if (bp->norep_y && (ry < 0 || ry >= bp->th))
+                    continue;
+                ry %= bp->th;
+                if (ry < 0)
+                    ry += bp->th;
+                uint32_t *dst = s->px + j * s->stride;
+                uint32_t rowc = axis == 1 ? gpaint_at(gp, 0, ry) : 0;
+                for (int i = r.x; i < r.x + r.w; i++) {
+                    int rx = i - bx;
+                    if (bp->norep_x && (rx < 0 || rx >= bp->tw))
+                        continue;
+                    rx %= bp->tw;
+                    if (rx < 0)
+                        rx += bp->tw;
+                    uint32_t p = axis == 1 ? rowc : colc ? colc[rx] : gpaint_at(gp, rx, ry);
+                    uint32_t a = p >> 24;
+                    if (rounded)
+                        a = a * (uint32_t)coverage(i - x, j - y, d->w, d->h, d->rad) / 256;
+                    if (a == 255)
+                        dst[i] = p & 0xFFFFFF;
+                    else if (a)
+                        dst[i] = blend_px(dst[i], (p & 0xFFFFFF) | a << 24);
+                }
+            }
+            free(colc);
+            free(gp);
+        }
     }
     s->clip = saved;
 }
@@ -4870,6 +5301,75 @@ const char *input_pattern(const char *type)
 }
 
 /* <progress> and <meter>: a sunken trough with a bar. */
+/* The name of the file a <video> or <audio> would play: its src, or its first <source>'s. */
+static const char *media_file(const struct node *n)
+{
+    const char *src = node_attr(n, "src");
+    for (const struct node *k = n->first; (!src || !*src) && k; k = k->next)
+        if (k->type == N_ELEMENT && k->tag == T_SOURCE)
+            src = node_attr(k, "src");
+    if (!src || !*src)
+        return "";
+    const char *slash = strrchr(src, '/');
+    return slash && slash[1] ? slash + 1 : src;
+}
+
+/* A play button: a triangle pointing right, its left edge at x, h tall, centred on cy. */
+static void play_triangle(struct surface *s, int x, int cy, int h, color_t c)
+{
+    for (int i = 0; i < h * 3 / 4; i++) {
+        int half = (h / 2) - i * 2 / 3;
+        if (half <= 0)
+            break;
+        gfx_fill(s, x + i, cy - half, 1, 2 * half, c);
+    }
+}
+
+/* <video> and <audio controls>: nothing here can play them, so they show what they are (the poster
+ * for a video) and a click downloads the file (browser.c). */
+static void draw_media(struct surface *s, const struct ditem *d, int x, int y, int focused)
+{
+    const struct node *n = d->node;
+    const struct wfont *f = d->font;
+    int fh = wfont_height(f);
+    char label[160];
+    const char *file = media_file(n);
+    if (n->tag == T_VIDEO) {
+        gfx_fill(s, x, y, d->w, d->h, 0x101010);
+        if (d->img && d->img->w > 0 && d->img->h > 0) {         /* the poster, contained */
+            int pw = d->w, ph = muldiv(d->img->h, d->w, d->img->w);
+            if (ph > d->h)
+                ph = d->h, pw = muldiv(d->img->w, d->h, d->img->h);
+            draw_image_scaled(s, d->img, x + (d->w - pw) / 2, y + (d->h - ph) / 2, pw, ph);
+        }
+        int bs = d->h / 4 < 48 ? d->h / 4 : 48;
+        if (bs >= 12) {
+            int cx = x + d->w / 2, cy = y + d->h / 2;
+            gfx_fill(s, cx - bs, cy - bs * 3 / 4, 2 * bs, bs * 3 / 2, 0x303030);
+            play_triangle(s, cx - bs / 3, cy, bs, 0xFFFFFF);
+        }
+        snprintf(label, sizeof(label), "Video%s%s - click to download", *file ? ": " : "", file);
+        if (d->h > fh * 3) {
+            int len = (int)strlen(label);
+            while (len > 0 && wfont_width(f, label, len) > d->w - 8)
+                len--;
+            gfx_fill(s, x, y + d->h - fh - 6, d->w, fh + 6, 0x000000);
+            wfont_draw(s, f, x + 4, y + d->h - fh - 3, label, len, 0xE0E0E0);
+        }
+    } else {
+        gfx_fill(s, x, y, d->w, d->h, 0xF1F3F4);
+        gfx_frame(s, x, y, d->w, d->h, 0xC0C0C0);
+        play_triangle(s, x + 10, y + d->h / 2, d->h / 2 > 6 ? d->h / 2 : 6, 0x202020);
+        snprintf(label, sizeof(label), "0:00  %s - click to download", *file ? file : "audio");
+        int len = (int)strlen(label);
+        while (len > 0 && wfont_width(f, label, len) > d->w - 30)
+            len--;
+        wfont_draw(s, f, x + 26, y + (d->h - fh) / 2, label, len, 0x202020);
+    }
+    if (focused)
+        gfx_focus_rect(s, mkrect(x + 1, y + 1, d->w - 2, d->h - 2));
+}
+
 static void draw_gauge(struct surface *s, const struct ditem *d, int x, int y)
 {
     const struct node *n = d->node;
@@ -4924,6 +5424,10 @@ static void draw_control(struct surface *s, const struct ditem *d, int x, int y,
 
     if (n->tag == T_PROGRESS || n->tag == T_METER) {
         draw_gauge(s, d, x, y);
+        return;
+    }
+    if (n->tag == T_VIDEO || n->tag == T_AUDIO) {
+        draw_media(s, d, x, y, focused);
         return;
     }
     uint32_t ph_color = n->pseudo_st[PE_PLACEHOLDER - 1] ? n->pseudo_st[PE_PLACEHOLDER - 1]->color
@@ -5483,7 +5987,7 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
             s->clip = sbclip;
         switch (d->kind) {
         case DK_FILL:
-            if (!ALPHA(d->color) && !d->grad && !d->ring)
+            if (!ALPHA(d->color) && !d->gr && !d->ring)
                 break;
             if (d->bg_clipped) {
                 struct rect saved = s->clip;
@@ -5496,10 +6000,10 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
                 if (d->ring) {
                     fill = *d;
                     fill.color = TRANSPARENT;
-                    fill.grad = 0;
+                    fill.gr = NULL;
                     fill_rich(s, &fill, x, y);
                 }
-            } else if (d->grad || d->ring || d->rad[0] || d->rad[1] || d->rad[2] || d->rad[3])
+            } else if (d->gr || d->ring || d->rad[0] || d->rad[1] || d->rad[2] || d->rad[3])
                 fill_rich(s, d, x, y);
             else if (ALPHA(d->color))
                 fill_blend(s, x, y, d->w, d->h, d->color, d->deco);

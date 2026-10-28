@@ -19,16 +19,136 @@ static const char js_core[] = JS_SOURCE(
     Object.defineProperty(o, k, { value: v, writable: true, configurable: true, enumerable: false });
   };
   var ITER = Symbol.iterator;
-  /* ---- iterators ---- */
+  /* ---- iterators: Iterator.prototype and its helpers (map, filter, take...) ---- */
+  function Iterator() {
+    if (new.target === undefined || new.target === Iterator) throw new TypeError("Iterator cannot be constructed");
+  }
+  var IP = Iterator.prototype;
+  def(IP, ITER, function () { return this; });
+  Object.defineProperty(IP, Symbol.toStringTag, { value: "Iterator", writable: true, configurable: true });
+  var HP = Object.create(IP);
+  function helper(src, step) {
+    var h = Object.create(HP);
+    def(h, "_src", src);
+    def(h, "_step", step);
+    def(h, "_done", false);
+    return h;
+  }
+  def(HP, "next", function () {
+    if (this._done) return { value: undefined, done: true };
+    var r = this._step();
+    if (r.done) this._done = true;
+    return r;
+  });
+  def(HP, "return", function () {
+    if (!this._done) {
+      this._done = true;
+      var ret = this._src["return"];
+      if (typeof ret === "function") ret.call(this._src);
+    }
+    return { value: undefined, done: true };
+  });
+  Object.defineProperty(HP, Symbol.toStringTag, { value: "Iterator Helper", configurable: true });
+  function fnArg(f) { if (typeof f !== "function") throw new TypeError(f + " is not a function"); return f; }
+  function countArg(n) {
+    n = Number(n);
+    if (n !== n || n < 0) throw new RangeError(n + " must be a positive number");
+    return n === Infinity ? n : Math.floor(n);
+  }
+  var DONE = { value: undefined, done: true };
+  def(IP, "map", function (f) {
+    var src = this, i = 0; fnArg(f);
+    return helper(src, function () { var r = src.next(); return r.done ? DONE : { value: f(r.value, i++), done: false }; });
+  });
+  def(IP, "filter", function (f) {
+    var src = this, i = 0; fnArg(f);
+    return helper(src, function () {
+      for (;;) { var r = src.next(); if (r.done) return DONE; if (f(r.value, i++)) return { value: r.value, done: false }; }
+    });
+  });
+  def(IP, "take", function (n) {
+    var src = this, left = countArg(n);
+    return helper(src, function () {
+      if (left <= 0) { var ret = src["return"]; if (typeof ret === "function") ret.call(src); return DONE; }
+      left--;
+      var r = src.next(); return r.done ? DONE : { value: r.value, done: false };
+    });
+  });
+  def(IP, "drop", function (n) {
+    var src = this, left = countArg(n);
+    return helper(src, function () {
+      while (left > 0) { left--; if (src.next().done) return DONE; }
+      var r = src.next(); return r.done ? DONE : { value: r.value, done: false };
+    });
+  });
+  def(IP, "flatMap", function (f) {
+    var src = this, i = 0, inner = null; fnArg(f);
+    return helper(src, function () {
+      for (;;) {
+        if (inner) { var x = inner.next(); if (!x.done) return { value: x.value, done: false }; inner = null; }
+        var r = src.next();
+        if (r.done) return DONE;
+        var m = f(r.value, i++);
+        if (m === null || (typeof m !== "object" && typeof m !== "function")) throw new TypeError("flatMap: not an iterable or iterator");
+        inner = typeof m[ITER] === "function" ? m[ITER]() : m;
+      }
+    });
+  });
+  def(IP, "reduce", function (f) {
+    fnArg(f);
+    var acc, i = 0, r;
+    if (arguments.length > 1) acc = arguments[1];
+    else { r = this.next(); if (r.done) throw new TypeError("Reduce of empty iterator with no initial value"); acc = r.value; i = 1; }
+    while (!(r = this.next()).done) acc = f(acc, r.value, i++);
+    return acc;
+  });
+  def(IP, "toArray", function () { var a = [], r; while (!(r = this.next()).done) a.push(r.value); return a; });
+  def(IP, "forEach", function (f) { fnArg(f); var r, i = 0; while (!(r = this.next()).done) f(r.value, i++); });
+  function closeIter(it) { var ret = it["return"]; if (typeof ret === "function") ret.call(it); }
+  def(IP, "some", function (f) {
+    fnArg(f); var r, i = 0;
+    while (!(r = this.next()).done) if (f(r.value, i++)) { closeIter(this); return true; }
+    return false;
+  });
+  def(IP, "every", function (f) {
+    fnArg(f); var r, i = 0;
+    while (!(r = this.next()).done) if (!f(r.value, i++)) { closeIter(this); return false; }
+    return true;
+  });
+  def(IP, "find", function (f) {
+    fnArg(f); var r, i = 0;
+    while (!(r = this.next()).done) if (f(r.value, i++)) { closeIter(this); return r.value; }
+    return undefined;
+  });
+  var WP = Object.create(IP);
+  def(WP, "next", function () { return this._it.next(); });
+  def(WP, "return", function () { closeIter(this._it); return DONE; });
+  def(Iterator, "from", function (o) {
+    if (typeof o === "string") o = Object(o);
+    var it = typeof o[ITER] === "function" ? o[ITER]() : o;
+    if (it instanceof Iterator) return it;
+    var w = Object.create(WP);
+    def(w, "_it", it);
+    return w;
+  });
+  def(g, "Iterator", Iterator);
+  def(Number.prototype, "toLocaleString", function (l, o) { return new g.Intl.NumberFormat(l, o).format(Number(this)); });
+  /* (generators get Iterator.prototype under theirs once the engine has made them: js.c) */
+  /* The engine's own iterators (keys(), values()...): under Iterator.prototype too. */
+  function adoptIter(r) {
+    if (r && typeof r === "object" && !(r instanceof Iterator)) {
+      var p = Object.getPrototypeOf(r);
+      try { if (p && p !== Object.prototype) Object.setPrototypeOf(p, IP); else Object.setPrototypeOf(r, IP); } catch (e) {}
+    }
+    return r;
+  }
   function listIter(a) {
     var i = 0;
-    var it = {
-      next: function () {
-        if (i < a.length) return { value: a[i++], done: false };
-        return { value: undefined, done: true };
-      }
-    };
-    def(it, ITER, function () { return this; });
+    var it = Object.create(IP);
+    def(it, "next", function () {
+      if (i < a.length) return { value: a[i++], done: false };
+      return { value: undefined, done: true };
+    });
     return it;
   }
   def(g, "%def", def);
@@ -37,7 +157,7 @@ static const char js_core[] = JS_SOURCE(
     var P = g[n].prototype;
     ["keys", "values", "entries"].forEach(function (m) {
       var orig = P[m];
-      if (orig) def(P, m, function () { return listIter(orig.call(this)); });
+      if (orig) def(P, m, function () { var r = orig.call(this); return Array.isArray(r) ? listIter(r) : adoptIter(r); });
     });
   });
   def(Array.prototype, ITER, function () { return listIter(this.slice()); });
@@ -387,11 +507,280 @@ static const char js_chunk_misc[] = JS_SOURCE(
   });
 
   /* ---- Intl, console ---- */
+  /* Number formatting: grouping and decimal marks for a few locale families, the rest as en-US. */
+  function numberSymbols(loc) {
+    var l = String(Array.isArray(loc) ? loc[0] || "en" : loc || "en").toLowerCase().split("-")[0];
+    if (["de", "es", "it", "pt", "nl", "id", "tr", "da", "el", "ro", "hr", "sl", "sr"].indexOf(l) >= 0) return { group: ".", decimal: ",", after: true };
+    if (["fr", "ru", "sv", "nb", "no", "fi", "pl", "cs", "uk", "sk", "hu", "bg", "lt", "lv", "et"].indexOf(l) >= 0) return { group: " ", decimal: ",", after: true };
+    if (l === "de-ch" || l === "ch") return { group: "’", decimal: ".", after: false };
+    return { group: ",", decimal: ".", after: false };
+  }
+  var CURRENCY = { USD: "$", EUR: "€", GBP: "£", JPY: "¥", CNY: "CN¥", INR: "₹", KRW: "₩",
+    CAD: "CA$", AUD: "A$", NZD: "NZ$", HKD: "HK$", MXN: "MX$", BRL: "R$", ILS: "₪", VND: "₫", TWD: "NT$",
+    PHP: "₱", RUB: "RUB", CHF: "CHF", SEK: "SEK", NOK: "NOK", DKK: "DKK", PLN: "PLN" };
+  var CURRENCY_NAME = { USD: "US dollars", EUR: "euros", GBP: "British pounds", JPY: "Japanese yen", CNY: "Chinese yuan",
+    INR: "Indian rupees", CAD: "Canadian dollars", AUD: "Australian dollars", CHF: "Swiss francs", RUB: "Russian rubles" };
+  var UNITS = { kilometer: ["km", "kilometer"], meter: ["m", "meter"], centimeter: ["cm", "centimeter"], millimeter: ["mm", "millimeter"],
+    mile: ["mi", "mile"], yard: ["yd", "yard"], foot: ["ft", "foot", "feet"], inch: ["in", "inch", "inches"],
+    kilogram: ["kg", "kilogram"], gram: ["g", "gram"], pound: ["lb", "pound"], ounce: ["oz", "ounce"],
+    liter: ["L", "liter"], milliliter: ["mL", "milliliter"], gallon: ["gal", "gallon"],
+    second: ["sec", "second"], minute: ["min", "minute"], hour: ["hr", "hour"], day: ["day", "day"], week: ["wk", "week"],
+    month: ["mth", "month"], year: ["yr", "year"], millisecond: ["ms", "millisecond"],
+    bit: ["bit", "bit"], byte: ["byte", "byte"], kilobyte: ["kB", "kilobyte"], megabyte: ["MB", "megabyte"],
+    gigabyte: ["GB", "gigabyte"], terabyte: ["TB", "terabyte"], petabyte: ["PB", "petabyte"],
+    percent: ["%", "percent"], celsius: ["°C", "degree Celsius", "degrees Celsius"], fahrenheit: ["°F", "degree Fahrenheit", "degrees Fahrenheit"],
+    degree: ["deg", "degree"], "kilometer-per-hour": ["km/h", "kilometer per hour", "kilometers per hour"],
+    "mile-per-hour": ["mph", "mile per hour", "miles per hour"], "meter-per-second": ["m/s", "meter per second", "meters per second"],
+    acre: ["ac", "acre"], hectare: ["ha", "hectare"] };
+  function NumberFormat(loc, o) {
+    if (!(this instanceof NumberFormat)) return new NumberFormat(loc, o);
+    o = o || {};
+    var style = o.style || "decimal", cur = o.currency ? String(o.currency).toUpperCase() : undefined;
+    if (style === "currency" && !cur) throw new TypeError("Currency code is required with currency style.");
+    var notation = o.notation || "standard";
+    var minFD = o.minimumFractionDigits, maxFD = o.maximumFractionDigits;
+    var defMin = style === "currency" ? (cur === "JPY" || cur === "KRW" || cur === "VND" ? 0 : 2) : 0;
+    var defMax = style === "currency" ? defMin : style === "percent" ? 0 : 3;
+    if (minFD === undefined) minFD = maxFD !== undefined ? Math.min(defMin, maxFD) : defMin;
+    if (maxFD === undefined) maxFD = Math.max(minFD, defMax);
+    if (minFD > maxFD) throw new RangeError("maximumFractionDigits value is out of range.");
+    var opts = { locale: "en-US", numberingSystem: "latn", style: style, currency: cur,
+      currencyDisplay: o.currencyDisplay || "symbol", currencySign: o.currencySign || "standard",
+      unit: o.unit, unitDisplay: o.unitDisplay || "short",
+      minimumIntegerDigits: o.minimumIntegerDigits || 1, minimumFractionDigits: minFD, maximumFractionDigits: maxFD,
+      minimumSignificantDigits: o.minimumSignificantDigits, maximumSignificantDigits: o.maximumSignificantDigits,
+      useGrouping: o.useGrouping === undefined ? (notation === "compact" ? "min2" : "auto") : o.useGrouping,
+      notation: notation, compactDisplay: o.compactDisplay || "short", signDisplay: o.signDisplay || "auto",
+      roundingMode: o.roundingMode || "halfExpand" };
+    if (opts.maximumSignificantDigits !== undefined && opts.minimumSignificantDigits === undefined) opts.minimumSignificantDigits = 1;
+    def(this, "_o", opts);
+    def(this, "_sym", numberSymbols(loc));
+    def(this, "_fd", o.minimumFractionDigits !== undefined || o.maximumFractionDigits !== undefined);
+  }
+  function groupDigits(int, sep, mode) {
+    if (mode === false || mode === "false") return int;
+    if (mode === "min2" && int.length < 5) return int;
+    var out = "";
+    for (var i = int.length; i > 0; i -= 3) out = int.slice(Math.max(0, i - 3), i) + (out ? sep + out : "");
+    return out;
+  }
+  function roundTo(x, o, fdSet) {
+    var s;
+    if (o.maximumSignificantDigits !== undefined) {
+      /* to so many significant digits (the place the last one is at, from the number's size) */
+      var e = x === 0 ? 0 : Math.floor(Math.log(x) / Math.LN10 + 1e-12);
+      var places = o.maximumSignificantDigits - 1 - e, f = Math.pow(10, places);
+      s = (Math.round(x * f) / f).toFixed(Math.max(0, places));
+      if (s.indexOf(".") >= 0) s = s.replace(new RegExp("0+$"), "").replace(new RegExp("[.]$"), "");
+      var digits = s.replace(".", "").replace(/^0+/, "").length;
+      if (digits < o.minimumSignificantDigits) {
+        var add = o.minimumSignificantDigits - digits;
+        s = s.indexOf(".") < 0 ? s + "." + "0".repeat(add) : s + "0".repeat(add);
+      }
+      return s;
+    }
+    s = x.toFixed(o.maximumFractionDigits);
+    if (s.indexOf(".") >= 0) {
+      var keep = s.length - (o.maximumFractionDigits - o.minimumFractionDigits);
+      while (s.length > keep && s[s.length - 1] === "0") s = s.slice(0, -1);
+      if (s[s.length - 1] === ".") s = s.slice(0, -1);
+    }
+    return s;
+  }
+  NumberFormat.prototype.formatToParts = function (n) {
+    var o = this._o, sym = this._sym, parts = [];
+    var x = typeof n === "bigint" ? Number(n) : Number(n);
+    if (x !== x) return [{ type: "nan", value: "NaN" }];
+    var neg = x < 0 || (x === 0 && 1 / x < 0);
+    x = Math.abs(x);
+    if (o.style === "percent") x *= 100;
+    var exponent = 0, compact = "";
+    if (x === Infinity) {
+      parts.push({ type: "infinity", value: "∞" });
+    } else {
+      var ro = o;
+      if (o.notation === "compact") {
+        var long = o.compactDisplay === "long";
+        var steps = [[1e12, long ? " trillion" : "T"], [1e9, long ? " billion" : "B"], [1e6, long ? " million" : "M"], [1e3, long ? " thousand" : "K"]];
+        for (var k = 0; k < steps.length; k++) if (x >= steps[k][0] * 0.9995) { x /= steps[k][0]; compact = steps[k][1]; break; }
+        if (!this._fd && o.maximumSignificantDigits === undefined)
+          ro = x >= 100 ? { maximumFractionDigits: 0, minimumFractionDigits: 0 } : { maximumSignificantDigits: 2, minimumSignificantDigits: 1 };
+        if (compact && Number(roundTo(x, ro, this._fd)) >= 1000 && steps[0][1] !== compact) {
+          for (var k2 = steps.length - 1; k2 >= 0; k2--) if (steps[k2][1] === compact && k2 > 0) { x /= 1000; compact = steps[k2 - 1][1]; break; }
+        }
+      } else if ((o.notation === "scientific" || o.notation === "engineering") && x !== 0) {
+        exponent = Math.floor(Math.log(x) / Math.LN10 + 1e-12);
+        if (o.notation === "engineering") exponent -= ((exponent % 3) + 3) % 3;
+        x /= Math.pow(10, exponent);
+        if (Number(roundTo(x, o, this._fd)) >= (o.notation === "engineering" ? 1000 : 10)) { x /= o.notation === "engineering" ? 1000 : 10; exponent += o.notation === "engineering" ? 3 : 1; }
+      }
+      var str = roundTo(x, ro, this._fd), dot = str.indexOf(".");
+      var int = dot < 0 ? str : str.slice(0, dot), frac = dot < 0 ? "" : str.slice(dot + 1);
+      while (int.length < o.minimumIntegerDigits) int = "0" + int;
+      var grouped = groupDigits(int, sym.group, o.useGrouping).split(sym.group);
+      for (var gi = 0; gi < grouped.length; gi++) {
+        if (gi) parts.push({ type: "group", value: sym.group });
+        parts.push({ type: "integer", value: grouped[gi] });
+      }
+      if (frac) { parts.push({ type: "decimal", value: sym.decimal }); parts.push({ type: "fraction", value: frac }); }
+      if (exponent || o.notation === "scientific" || o.notation === "engineering") {
+        parts.push({ type: "exponentSeparator", value: "E" });
+        if (exponent < 0) parts.push({ type: "exponentMinusSign", value: "-" });
+        parts.push({ type: "exponentInteger", value: String(Math.abs(exponent)) });
+      }
+      if (compact) parts.push(compact[0] === " " ? { type: "literal", value: " " } : null, { type: "compact", value: compact.trim() });
+      parts = parts.filter(function (p) { return p; });
+      if (Number(str) === 0 && o.signDisplay !== "always" && o.signDisplay !== "negative") neg = false;
+    }
+    var sign = "";
+    var isZero = parts.every(function (p) { return p.type !== "integer" && p.type !== "fraction" || /^0*$/.test(p.value); });
+    if (neg && o.signDisplay !== "never" && !(isZero && (o.signDisplay === "exceptZero" || o.signDisplay === "negative"))) sign = "-";
+    else if (!neg && (o.signDisplay === "always" || (o.signDisplay === "exceptZero" && !isZero))) sign = "+";
+    var pre = [], post = [];
+    if (sign) pre.push({ type: sign === "-" ? "minusSign" : "plusSign", value: sign });
+    if (o.style === "currency") {
+      var cs = o.currencyDisplay === "code" ? o.currency + " " : o.currencyDisplay === "name" ? "" :
+               (CURRENCY[o.currency] || o.currency + " ");
+      if (o.currencyDisplay === "name") post.push({ type: "literal", value: " " }, { type: "currency", value: CURRENCY_NAME[o.currency] || o.currency });
+      else if (sym.after) post.push({ type: "literal", value: " " }, { type: "currency", value: cs.trim() });
+      else {
+        if (cs[cs.length - 1] === " ") pre.push({ type: "currency", value: cs.slice(0, -1) }, { type: "literal", value: " " });
+        else pre.push({ type: "currency", value: cs });
+      }
+    } else if (o.style === "percent") {
+      if (sym.after) post.push({ type: "literal", value: " " });
+      post.push({ type: "percentSign", value: "%" });
+    } else if (o.style === "unit" && o.unit) {
+      var u = UNITS[o.unit], plural = Math.abs(Number(n)) !== 1;
+      var text = !u ? o.unit : o.unitDisplay === "long" ? (plural ? u[2] || u[1] + "s" : u[1]) :
+                 o.unit === "day" || o.unit === "week" || o.unit === "month" || o.unit === "year" ? (plural ? u[0] + "s" : u[0]) : u[0];
+      if (o.unitDisplay === "narrow" || text === "%" || text[0] === "°") post.push({ type: "unit", value: text });
+      else post.push({ type: "literal", value: " " }, { type: "unit", value: text });
+    }
+    return pre.concat(parts, post);
+  };
+  NumberFormat.prototype.format = function (n) {
+    return this.formatToParts(n).map(function (p) { return p.value; }).join("");
+  };
+  NumberFormat.prototype.formatRange = function (a, b) { return this.format(a) + "–" + this.format(b); };
+  NumberFormat.prototype.resolvedOptions = function () { return Object.assign({}, this._o); };
+
+  /* Intl.Locale: a language tag's parts, and the likely ones for the commonest languages. */
+  var LIKELY = { en: "en-Latn-US", de: "de-Latn-DE", fr: "fr-Latn-FR", es: "es-Latn-ES", it: "it-Latn-IT", pt: "pt-Latn-BR",
+    nl: "nl-Latn-NL", sv: "sv-Latn-SE", pl: "pl-Latn-PL", ru: "ru-Cyrl-RU", uk: "uk-Cyrl-UA", ja: "ja-Jpan-JP",
+    zh: "zh-Hans-CN", ko: "ko-Kore-KR", ar: "ar-Arab-EG", he: "he-Hebr-IL", hi: "hi-Deva-IN", tr: "tr-Latn-TR",
+    el: "el-Grek-GR", fa: "fa-Arab-IR", th: "th-Thai-TH", vi: "vi-Latn-VN", id: "id-Latn-ID", cs: "cs-Latn-CZ" };
+  class Locale {
+    constructor(tag, o) {
+      if (tag instanceof Locale) tag = tag.toString();
+      if (typeof tag !== "string" || !tag) throw new TypeError("Incorrect locale information provided");
+      var parts = tag.replace(/_/g, "-").split("-"), ext = {}, i = 1;
+      var language = parts[0].toLowerCase();
+      if (!/^[a-z]{2,8}$/.test(language)) throw new RangeError("Incorrect locale information provided");
+      var script, region;
+      if (parts[i] && /^[a-z]{4}$/i.test(parts[i])) { script = parts[i][0].toUpperCase() + parts[i].slice(1).toLowerCase(); i++; }
+      if (parts[i] && /^([a-z]{2}|[0-9]{3})$/i.test(parts[i])) { region = parts[i].toUpperCase(); i++; }
+      for (; i < parts.length; i++) {
+        if (parts[i].toLowerCase() === "u") {
+          for (i++; i + 1 < parts.length && parts[i].length === 2; i += 2) ext[parts[i].toLowerCase()] = parts[i + 1];
+          i--;
+        }
+      }
+      o = o || {};
+      def(this, "_p", {
+        language: o.language || language, script: o.script || script, region: o.region || region,
+        calendar: o.calendar || ext.ca, collation: o.collation || ext.co, hourCycle: o.hourCycle || ext.hc,
+        caseFirst: o.caseFirst || ext.kf, numberingSystem: o.numberingSystem || ext.nu,
+        numeric: o.numeric !== undefined ? !!o.numeric : ext.kn === "true" || ext.kn === "" ? true : false
+      });
+    }
+    get language() { return this._p.language; }
+    get script() { return this._p.script; }
+    get region() { return this._p.region; }
+    get calendar() { return this._p.calendar; }
+    get collation() { return this._p.collation; }
+    get hourCycle() { return this._p.hourCycle; }
+    get caseFirst() { return this._p.caseFirst; }
+    get numberingSystem() { return this._p.numberingSystem; }
+    get numeric() { return this._p.numeric; }
+    get baseName() { var p = this._p; return [p.language, p.script, p.region].filter(Boolean).join("-"); }
+    get textInfo() { return { direction: ["ar", "he", "fa", "ur", "yi", "ps", "sd"].indexOf(this._p.language) >= 0 ? "rtl" : "ltr" }; }
+    getTextInfo() { return this.textInfo; }
+    get hourCycles() { return [this._p.hourCycle || (this._p.region === "US" || !this._p.region && this._p.language === "en" ? "h12" : "h23")]; }
+    getHourCycles() { return this.hourCycles; }
+    getCalendars() { return [this._p.calendar || "gregory"]; }
+    getWeekInfo() { return { firstDay: this._p.region === "US" ? 7 : 1, weekend: [6, 7], minimalDays: 1 }; }
+    maximize() {
+      var p = this._p, l = LIKELY[p.language];
+      var full = l ? l.split("-") : [p.language];
+      return new Locale([p.language, p.script || full[1], p.region || full[2]].filter(Boolean).join("-"));
+    }
+    minimize() { return new Locale(this._p.language); }
+    toString() {
+      var p = this._p, u = [];
+      if (p.calendar) u.push("ca", p.calendar);
+      if (p.collation) u.push("co", p.collation);
+      if (p.hourCycle) u.push("hc", p.hourCycle);
+      if (p.numberingSystem) u.push("nu", p.numberingSystem);
+      return this.baseName + (u.length ? "-u-" + u.join("-") : "");
+    }
+    toJSON() { return this.toString(); }
+  }
+
+  /* Intl.DisplayNames: English names for the commoner codes; others come back as the code. */
+  var NAMES = {
+    language: { en: "English", "en-US": "American English", "en-GB": "British English", de: "German", fr: "French",
+      es: "Spanish", it: "Italian", pt: "Portuguese", "pt-BR": "Brazilian Portuguese", nl: "Dutch", sv: "Swedish",
+      no: "Norwegian", nb: "Norwegian Bokmål", da: "Danish", fi: "Finnish", pl: "Polish", cs: "Czech", sk: "Slovak",
+      hu: "Hungarian", ro: "Romanian", el: "Greek", tr: "Turkish", ru: "Russian", uk: "Ukrainian", ja: "Japanese",
+      zh: "Chinese", "zh-Hans": "Simplified Chinese", "zh-Hant": "Traditional Chinese", ko: "Korean", ar: "Arabic",
+      he: "Hebrew", hi: "Hindi", fa: "Persian", th: "Thai", vi: "Vietnamese", id: "Indonesian", ms: "Malay",
+      bg: "Bulgarian", hr: "Croatian", sr: "Serbian", ca: "Catalan", eu: "Basque", ga: "Irish", la: "Latin" },
+    region: { US: "United States", GB: "United Kingdom", DE: "Germany", FR: "France", ES: "Spain", IT: "Italy",
+      PT: "Portugal", NL: "Netherlands", BE: "Belgium", CH: "Switzerland", AT: "Austria", SE: "Sweden", NO: "Norway",
+      DK: "Denmark", FI: "Finland", PL: "Poland", CZ: "Czechia", IE: "Ireland", GR: "Greece", TR: "Turkey",
+      RU: "Russia", UA: "Ukraine", CA: "Canada", MX: "Mexico", BR: "Brazil", AR: "Argentina", CL: "Chile",
+      CO: "Colombia", PE: "Peru", AU: "Australia", NZ: "New Zealand", JP: "Japan", CN: "China", KR: "South Korea",
+      TW: "Taiwan", HK: "Hong Kong SAR China", IN: "India", ID: "Indonesia", TH: "Thailand", VN: "Vietnam",
+      PH: "Philippines", SG: "Singapore", MY: "Malaysia", IL: "Israel", SA: "Saudi Arabia", AE: "United Arab Emirates",
+      EG: "Egypt", ZA: "South Africa", NG: "Nigeria", KE: "Kenya", "419": "Latin America", "001": "world", "150": "Europe" },
+    script: { Latn: "Latin", Cyrl: "Cyrillic", Arab: "Arabic", Hebr: "Hebrew", Grek: "Greek", Hans: "Simplified Han",
+      Hant: "Traditional Han", Jpan: "Japanese", Kore: "Korean", Deva: "Devanagari", Thai: "Thai" },
+    currency: { USD: "US Dollar", EUR: "Euro", GBP: "British Pound", JPY: "Japanese Yen", CNY: "Chinese Yuan",
+      INR: "Indian Rupee", CAD: "Canadian Dollar", AUD: "Australian Dollar", CHF: "Swiss Franc", SEK: "Swedish Krona",
+      NOK: "Norwegian Krone", DKK: "Danish Krone", PLN: "Polish Zloty", RUB: "Russian Ruble", BRL: "Brazilian Real",
+      MXN: "Mexican Peso", KRW: "South Korean Won", HKD: "Hong Kong Dollar", NZD: "New Zealand Dollar" },
+    calendar: { gregory: "Gregorian Calendar", buddhist: "Buddhist Calendar", chinese: "Chinese Calendar",
+      hebrew: "Hebrew Calendar", islamic: "Hijri Calendar", japanese: "Japanese Calendar", iso8601: "ISO-8601 Calendar" },
+    dateTimeField: { era: "era", year: "year", quarter: "quarter", month: "month", weekOfYear: "week", weekday: "day of the week",
+      day: "day", dayPeriod: "AM/PM", hour: "hour", minute: "minute", second: "second", timeZoneName: "time zone" }
+  };
+  class DisplayNames {
+    constructor(loc, o) {
+      if (!o || !o.type || !NAMES[o.type]) throw new TypeError("Required option type is missing or invalid");
+      def(this, "_o", { locale: "en-US", style: o.style || "long", type: o.type, fallback: o.fallback || "code",
+        languageDisplay: o.languageDisplay || "dialect" });
+    }
+    of(code) {
+      code = String(code);
+      var t = this._o.type, table = NAMES[t];
+      var key = t === "region" || t === "currency" ? code.toUpperCase() : t === "script" ? code[0].toUpperCase() + code.slice(1).toLowerCase() : code;
+      if (table[key] !== undefined) return table[key];
+      if (t === "language") {
+        var parts = code.split("-"), base = table[parts[0].toLowerCase()];
+        if (base && parts.length > 1) {
+          var extra = parts.slice(1).map(function (p) { return NAMES.region[p.toUpperCase()] || NAMES.script[p] || p; });
+          return base + " (" + extra.join(", ") + ")";
+        }
+      }
+      return this._o.fallback === "none" ? undefined : key;
+    }
+    resolvedOptions() { return Object.assign({}, this._o); }
+  }
   lz("Intl", {
-    NumberFormat: function (loc, o) {
-      return { format: function (n) { return Number(n).toLocaleString(loc, o); },
-               resolvedOptions: function () { return { locale: "en-US" }; } };
-    },
+    NumberFormat: NumberFormat,
+    Locale: Locale,
+    DisplayNames: DisplayNames,
     DateTimeFormat: function (loc, o) {
       var fmt = function (d) { return (d === undefined ? new Date() : new Date(d)).toLocaleDateString(loc, o); };
       return { format: fmt,
@@ -470,10 +859,10 @@ static const char js_chunk_misc[] = JS_SOURCE(
         }
       };
     },
-    getCanonicalLocales: function (l) { return l === undefined ? [] : [].concat(l); },
+    getCanonicalLocales: function (l) { return l === undefined ? [] : [].concat(l).map(function (t) { return new Locale(String(t)).toString(); }); },
     supportedValuesOf: function () { return []; }
   });
-  ["NumberFormat", "DateTimeFormat", "Collator", "PluralRules", "RelativeTimeFormat", "ListFormat", "Segmenter"]
+  ["NumberFormat", "DateTimeFormat", "Collator", "PluralRules", "RelativeTimeFormat", "ListFormat", "Segmenter", "DisplayNames"]
     .forEach(function (n) {
       g.Intl[n].supportedLocalesOf = function (l) { return l === undefined ? [] : [].concat(l); };
     });
@@ -914,6 +1303,155 @@ static const char js_chunk_url[] = JS_SOURCE(
     toJSON() { return this.href; }
     static canParse(url, base) { try { new URL(url, base); return true; } catch (e) { return false; } }
   }
+  /* ---- URLPattern: each component's pattern (:name, *, (regex), {...} and ?, +, *) as a RegExp ---- */
+  var URLP_PARTS = ["protocol", "username", "password", "hostname", "port", "pathname", "search", "hash"];
+  function urlpEscape(c) { return "^$.+*?()[]{}|/".indexOf(c) >= 0 || c === "\\" ? "\\" + c : c; }
+  function urlpCompile(pattern, part, ignoreCase) {
+    var segment = part === "pathname" ? "[^/]+?" : part === "hostname" ? "[^.]+?" : ".+?";
+    var names = [], re = "", i = 0, anon = 0, p = String(pattern), hasRegexp = false;
+    function token() {
+      var c = p[i];
+      if (c === ":") {
+        var m = /^:([A-Za-z_$][A-Za-z0-9_$]*)/.exec(p.slice(i));
+        if (!m) throw new TypeError("Invalid URLPattern: bad name in " + p);
+        i += m[0].length;
+        var body = segment;
+        if (p[i] === "(") body = regexpGroup();
+        names.push(m[1]);
+        return "(" + body + ")";
+      }
+      if (c === "*") { i++; names.push(String(anon++)); return "(.*)"; }
+      if (c === "(") { var b = regexpGroup(); names.push(String(anon++)); return "(" + b + ")"; }
+      if (c === "{") {
+        i++;
+        var inner = "";
+        while (i < p.length && p[i] !== "}") inner += token();
+        if (p[i] !== "}") throw new TypeError("Invalid URLPattern: unclosed { in " + p);
+        i++;
+        return "(?:" + inner + ")";
+      }
+      if (c === "\\" && i + 1 < p.length) { i += 2; return urlpEscape(p[i - 1]); }
+      i++;
+      return urlpEscape(c);
+    }
+    function regexpGroup() {
+      var depth = 0, start = ++i;
+      for (; i < p.length; i++) {
+        if (p[i] === "\\") { i++; continue; }
+        if (p[i] === "(") depth++;
+        else if (p[i] === ")") { if (!depth) break; depth--; }
+      }
+      if (p[i] !== ")") throw new TypeError("Invalid URLPattern: unclosed ( in " + p);
+      hasRegexp = true;
+      var body = p.slice(start, i++);
+      return body.replace(new RegExp("\\((?!\\?)", "g"), "(?:");
+    }
+    while (i < p.length) {
+      var prefix = "";
+      /* "/:name?" in a path: the slash goes with the optional part */
+      if (part === "pathname" && p[i] === "/" && (p[i + 1] === ":" || p[i + 1] === "*" || p[i + 1] === "(")) { prefix = "\\/"; i++; }
+      var t = token(), mod = p[i];
+      if (mod === "?" || mod === "+" || (mod === "*" && t !== "(.*)")) {
+        i++;
+        if (mod === "?") re += "(?:" + prefix + t + ")?";
+        else re += "(?:" + prefix + t + ")" + mod;
+      } else {
+        re += prefix + t;
+      }
+    }
+    return { re: new RegExp("^" + re + "$", ignoreCase ? "i" : ""), names: names, pattern: p, hasRegexp: hasRegexp };
+  }
+  function urlpSplit(s, base) {
+    var o = {}, rest = String(s), m;
+    if ((m = new RegExp("^([a-zA-Z][a-zA-Z0-9+.*-]*)://").exec(rest))) {
+      o.protocol = m[1]; rest = rest.slice(m[0].length);
+      var slash = rest.search(new RegExp("[/?#]")), host = slash < 0 ? rest : rest.slice(0, slash);
+      rest = slash < 0 ? "" : rest.slice(slash);
+      var at = host.lastIndexOf("@");
+      if (at >= 0) {
+        var cred = host.slice(0, at).split(":");
+        o.username = cred[0]; if (cred.length > 1) o.password = cred.slice(1).join(":");
+        host = host.slice(at + 1);
+      }
+      var colon = host.match(new RegExp(":([0-9]*|:?[a-z_]\\w*|\\*)$"));
+      if (colon && host[0] !== "[") { o.port = colon[1]; host = host.slice(0, colon.index); }
+      o.hostname = host;
+    } else if (base) {
+      var b = new URL(base);
+      o.protocol = b.protocol.slice(0, -1); o.hostname = b.hostname; o.port = b.port;
+      o.username = b.username; o.password = b.password;
+      if (rest[0] !== "/" && rest[0] !== "?" && rest[0] !== "#") rest = b.pathname.replace(new RegExp("[^/]*$"), "") + rest;
+    }
+    var hash = rest.indexOf("#");
+    if (hash >= 0) { o.hash = rest.slice(hash + 1); rest = rest.slice(0, hash); }
+    var q = rest.search(new RegExp("\\?(?![^(]*\\))"));
+    if (q >= 0) { o.search = rest.slice(q + 1); rest = rest.slice(0, q); }
+    if (rest || o.protocol) o.pathname = rest || "/";
+    return o;
+  }
+  class URLPattern {
+    constructor(input, base, options) {
+      if (base && typeof base === "object") { options = base; base = undefined; }
+      var ic = !!(options && options.ignoreCase), init = {};
+      if (input === undefined) input = {};
+      if (typeof input === "string") {
+        init = urlpSplit(input, base);
+        URLP_PARTS.forEach(function (k) { if (init[k] === undefined) init[k] = k === "search" || k === "hash" ? (init.protocol && !base ? "*" : "*") : "*"; });
+      } else {
+        URLP_PARTS.forEach(function (k) { if (input[k] !== undefined) init[k] = String(input[k]); });
+        if (input.baseURL) {
+          var b = new URL(input.baseURL);
+          var inherit = { protocol: b.protocol.slice(0, -1), hostname: b.hostname, port: b.port, username: b.username, password: b.password };
+          for (var k in inherit) if (init[k] === undefined) init[k] = inherit[k];
+          if (init.pathname === undefined) init.pathname = b.pathname;
+        }
+        URLP_PARTS.forEach(function (k) { if (init[k] === undefined) init[k] = "*"; });
+      }
+      var compiled = {}, regexps = false;
+      URLP_PARTS.forEach(function (k) {
+        var pat = init[k];
+        if (k === "protocol") pat = pat.replace(/:$/, "");
+        if (k === "search") pat = pat.replace(new RegExp("^\\?"), "");
+        if (k === "hash") pat = pat.replace(/^#/, "");
+        compiled[k] = urlpCompile(pat, k, ic && k !== "protocol");
+        regexps = regexps || compiled[k].hasRegexp;
+      });
+      def(this, "_c", compiled);
+      def(this, "_r", regexps);
+    }
+    get protocol() { return this._c.protocol.pattern; }
+    get username() { return this._c.username.pattern; }
+    get password() { return this._c.password.pattern; }
+    get hostname() { return this._c.hostname.pattern; }
+    get port() { return this._c.port.pattern; }
+    get pathname() { return this._c.pathname.pattern; }
+    get search() { return this._c.search.pattern; }
+    get hash() { return this._c.hash.pattern; }
+    get hasRegExpGroups() { return this._r; }
+    exec(input, base) {
+      var u, values = {};
+      try {
+        if (typeof input === "string" || input instanceof URL) u = new URL(String(input), base);
+        else {
+          var o = input || {};
+          URLP_PARTS.forEach(function (k) { values[k] = o[k] === undefined ? "" : String(o[k]); });
+        }
+      } catch (e) { return null; }
+      if (u) values = { protocol: u.protocol.slice(0, -1), username: u.username, password: u.password, hostname: u.hostname,
+                        port: u.port, pathname: u.pathname, search: u.search.slice(1), hash: u.hash.slice(1) };
+      var result = { inputs: base === undefined ? [input] : [input, base] };
+      for (var i = 0; i < URLP_PARTS.length; i++) {
+        var k = URLP_PARTS[i], c = this._c[k], m = c.re.exec(values[k]);
+        if (!m) return null;
+        var groups = {};
+        for (var j = 0; j < c.names.length; j++) groups[c.names[j]] = m[j + 1];
+        result[k] = { input: values[k], groups: groups };
+      }
+      return result;
+    }
+    test(input, base) { return this.exec(input, base) !== null; }
+  }
+  lz("URLPattern", URLPattern);
   lz("URLSearchParams", URLSearchParams);
   lz("URL", URL);
 
@@ -1096,8 +1634,95 @@ static const char js_chunk_web[] = JS_SOURCE(
     slice(a, b, t) { return new Blob([this._bytes.slice(a, b)], { type: t || "" }); }
     stream() { var b = this._bytes.slice(); return new ReadableStream({ start: function (c) { c.enqueue(b); c.close(); } }); }
   }
+  /* ---- File, FileList, FileReader ---- */
+  class File extends Blob {
+    constructor(bits, name, opts) {
+      if (arguments.length < 2) throw new TypeError("File requires a name");
+      super(bits, opts);
+      def(this, "_n", String(name));
+      def(this, "_m", opts && opts.lastModified !== undefined ? Number(opts.lastModified) : Date.now());
+    }
+    get name() { return this._n; }
+    get lastModified() { return this._m; }
+    get lastModifiedDate() { return new Date(this._m); }
+    get webkitRelativePath() { return ""; }
+  }
+  Object.defineProperty(File.prototype, Symbol.toStringTag, { value: "File", configurable: true });
+  class FileList {
+    constructor() { def(this, "_f", []); }
+    get length() { return this._f.length; }
+    item(i) { return this._f[i] || null; }
+    [ITER]() { return this._f[ITER](); }
+  }
+  def(g, "%fileList", function (files) {
+    var l = new FileList();
+    files.forEach(function (f, i) { l._f.push(f); Object.defineProperty(l, i, { value: f, enumerable: true }); });
+    return l;
+  });
+  class FileReader extends EventTarget {
+    constructor() {
+      super();
+      def(this, "_state", 0);
+      def(this, "_result", null);
+      def(this, "_error", null);
+      def(this, "_job", 0);
+      this.onloadstart = this.onprogress = this.onload = this.onerror = this.onabort = this.onloadend = null;
+    }
+    get readyState() { return this._state; }
+    get result() { return this._result; }
+    get error() { return this._error; }
+    _read(blob, how, encoding) {
+      if (this._state === 1) throw new DOMException("The object is already busy reading Blobs.", "InvalidStateError");
+      if (!(blob instanceof Blob)) throw new TypeError("FileReader: parameter is not a Blob");
+      var r = this, job = ++this._job, total = blob.size;
+      this._state = 1;
+      this._result = null;
+      this._error = null;
+      function fire(type) {
+        var e = new Event(type);
+        e.lengthComputable = true; e.loaded = type === "loadstart" ? 0 : total; e.total = total;
+        r.dispatchEvent(e);
+        var h = r["on" + type];
+        if (typeof h === "function") h.call(r, e);
+      }
+      setTimeout(function () {
+        if (job !== r._job) return;
+        fire("loadstart");
+        var bytes = blob._bytes, out;
+        if (how === "text") out = new TextDecoder(encoding || "utf-8").decode(bytes);
+        else if (how === "buffer") out = bytes.slice().buffer;
+        else {
+          var bin = "";
+          for (var i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 8192)));
+          out = how === "binary" ? bin : "data:" + (blob.type || "application/octet-stream") + ";base64," + btoa(bin);
+        }
+        r._result = out;
+        r._state = 2;
+        fire("progress");
+        fire("load");
+        fire("loadend");
+      }, 0);
+    }
+    readAsText(b, enc) { this._read(b, "text", enc); }
+    readAsArrayBuffer(b) { this._read(b, "buffer"); }
+    readAsDataURL(b) { this._read(b, "url"); }
+    readAsBinaryString(b) { this._read(b, "binary"); }
+    abort() {
+      if (this._state !== 1) return;
+      this._job++;
+      this._state = 2;
+      this._result = null;
+      var e = new Event("abort");
+      this.dispatchEvent(e);
+      if (typeof this.onabort === "function") this.onabort(e);
+      var end = new Event("loadend");
+      this.dispatchEvent(end);
+      if (typeof this.onloadend === "function") this.onloadend(end);
+    }
+  }
+  FileReader.EMPTY = 0; FileReader.LOADING = 1; FileReader.DONE = 2;
   class FormData {
-    constructor(form) {
+    constructor(form, submitter) {
       def(this, "_l", []);
       if (!form) return;
       var els = form.elements || form.querySelectorAll("input,select,textarea");
@@ -1105,12 +1730,25 @@ static const char js_chunk_web[] = JS_SOURCE(
         var e = els[i], t = (e.type || "").toLowerCase();
         if (!e.name || e.disabled) continue;
         if ((t === "checkbox" || t === "radio") && !e.checked) continue;
-        if (t === "submit" || t === "button" || t === "reset" || t === "file") continue;
+        if ((t === "submit" || t === "image") && e === submitter) { this._l.push([e.name, String(e.value || "")]); continue; }
+        if (t === "submit" || t === "button" || t === "reset" || t === "image") continue;
+        if (t === "file") {
+          var files = e.files;
+          if (files && files.length) for (var k = 0; k < files.length; k++) this._l.push([e.name, files[k]]);
+          else this._l.push([e.name, new File([], "", { type: "application/octet-stream" })]);
+          continue;
+        }
         this._l.push([e.name, String(e.value === undefined ? "" : e.value)]);
       }
+      var assoc = g["%formAssociated"];          /* custom elements with ElementInternals.setFormValue */
+      if (assoc) assoc(form, this._l);
     }
-    append(k, v) { this._l.push([String(k), v instanceof Blob ? v : String(v)]); }
-    set(k, v) { this.delete(k); this.append(k, v); }
+    append(k, v, name) {
+      if (v instanceof Blob && !(v instanceof File)) v = new File([v], name === undefined ? "blob" : String(name), { type: v.type });
+      else if (v instanceof File && name !== undefined) v = new File([v], String(name), { type: v.type, lastModified: v.lastModified });
+      this._l.push([String(k), v instanceof Blob ? v : String(v)]);
+    }
+    set(k, v, name) { this.delete(k); this.append(k, v, name); }
     get(k) { for (var i = 0; i < this._l.length; i++) if (this._l[i][0] === k) return this._l[i][1]; return null; }
     getAll(k) { return this._l.filter(function (p) { return p[0] === k; }).map(function (p) { return p[1]; }); }
     has(k) { return this.get(k) !== null; }
@@ -1263,6 +1901,7 @@ static const char js_chunk_web[] = JS_SOURCE(
   }
   lz("TextEncoder", TextEncoder); lz("TextDecoder", TextDecoder); lz("crypto", crypto);
   lz("Blob", Blob); lz("FormData", FormData); lz("DOMParser", DOMParser);
+  lz("File", File); lz("FileList", FileList); lz("FileReader", FileReader);
   lz("customElements", customElements); lz("CSS", CSS);
   lz("Notification", Notification); lz("DOMRect", DOMRect); lz("postMessage", postMessage);
 })(globalThis);
@@ -1658,6 +2297,59 @@ static const char js_chunk_fetch[] = JS_SOURCE(
     for (var i = 0; i < lines.length; i++) { var c = lines[i].indexOf(":"); if (c > 0) h.append(lines[i].slice(0, c).trim(), lines[i].slice(c + 1).trim()); }
     return h;
   }
+  /* ---- streams that decode, encode, compress and decompress ---- */
+  class TextDecoderStream extends TransformStream {
+    constructor(label, options) {
+      var dec = new TextDecoder(label, options);
+      super({
+        transform: function (chunk, c) { var t = dec.decode(chunk, { stream: true }); if (t) c.enqueue(t); },
+        flush: function (c) { var t = dec.decode(); if (t) c.enqueue(t); }
+      });
+      def(this, "_d", dec);
+    }
+    get encoding() { return this._d.encoding; }
+    get fatal() { return !!this._d.fatal; }
+    get ignoreBOM() { return !!this._d.ignoreBOM; }
+  }
+  class TextEncoderStream extends TransformStream {
+    constructor() {
+      var enc = new TextEncoder(), pending = "";
+      super({
+        transform: function (chunk, c) {
+          var t = pending + String(chunk);
+          pending = "";
+          var last = t.charCodeAt(t.length - 1);
+          if (last >= 0xD800 && last <= 0xDBFF) { pending = t.slice(-1); t = t.slice(0, -1); }   /* half a surrogate pair waits */
+          if (t) c.enqueue(enc.encode(t));
+        },
+        flush: function (c) { if (pending) c.enqueue(enc.encode(pending)); }
+      });
+    }
+    get encoding() { return "utf-8"; }
+  }
+  function streamBytes(chunk) {
+    if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+    if (ArrayBuffer.isView(chunk)) return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+    throw new TypeError("The chunk is not an ArrayBuffer or ArrayBufferView");
+  }
+  function codecStream(format, work) {
+    format = String(format);
+    if (format !== "gzip" && format !== "deflate" && format !== "deflate-raw")
+      throw new TypeError("Unsupported compression format: " + format);
+    var parts = [], length = 0;
+    return {
+      transform: function (chunk) { var b = streamBytes(chunk); parts.push(b.slice()); length += b.length; },
+      flush: function (c) {
+        var all = new Uint8Array(length), at = 0;
+        parts.forEach(function (b) { all.set(b, at); at += b.length; });
+        c.enqueue(g[work](all, format));
+      }
+    };
+  }
+  class CompressionStream extends TransformStream { constructor(format) { super(codecStream(format, "%compress")); } }
+  class DecompressionStream extends TransformStream { constructor(format) { super(codecStream(format, "%decompress")); } }
+  lz("TextDecoderStream", TextDecoderStream); lz("TextEncoderStream", TextEncoderStream);
+  lz("CompressionStream", CompressionStream); lz("DecompressionStream", DecompressionStream);
   lz("WritableStream", WritableStream); lz("TransformStream", TransformStream);
   lz("CountQueuingStrategy", CountQueuingStrategy); lz("ByteLengthQueuingStrategy", ByteLengthQueuingStrategy);
   lz("Headers", Headers); lz("Response", Response); lz("Request", Request); lz("ReadableStream", ReadableStream);

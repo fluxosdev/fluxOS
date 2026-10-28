@@ -3,16 +3,17 @@
  * the HD 4800s, RV740, RV730 and RV710 below them). Also the Radeon HD
  * 6000 graphics of AMD's Llano APUs (Sumo, such as the HD 6520G), an
  * Evergreen-generation design whose display controllers (DCE 4.1) are
- * the same in kind with their registers elsewhere; on those, for now,
- * the boot loader's mode with page flipping and the hardware pointer
- * (native modes and the 3D engine are the R700's code).
+ * the same in kind with their registers elsewhere; on those, page
+ * flipping, the hardware pointer and native modes for a laptop panel
+ * behind a DisplayPort bridge, without the 3D engine (the R700's code).
  *
  * The card comes up in the mode its VESA BIOS set for the boot loader.
  * The driver:
  *  - reports the adapter and its real amount of video memory;
  *  - sets modes of its own (DISP_SETMODE, or video=WxH[xD][@R] on the
  *    command line) by running the video BIOS's AtomBIOS tables, for the
- *    monitor's EDID modes (radeon_modeset.c);
+ *    monitor's EDID modes, or a Llano laptop's panel over DisplayPort
+ *    (radeon_modeset.c, radeon_dp.c);
  *  - lends the screen's owner a second page right after the first in
  *    video memory (DISPF_FLIP). DISP_FLIP points the display controller
  *    at either page; it takes the new address at the next vertical blank,
@@ -506,12 +507,9 @@ void radeon_late_init(void)
 {
     if (!rv.present)
         return;
-    if (RADEON_EVERGREEN()) {
-        radeon_modeset_probe();
-        boot_ok("%s: the boot loader's mode (native modes and 3D not yet for this chip)", rv.name);
-        return;
-    }
     radeon_modeset_init();
+    if (RADEON_EVERGREEN())
+        return;                     /* no 3D engine for it yet */
     radeon_accel_init();
 }
 
@@ -519,16 +517,18 @@ void radeon_late_init(void)
 
 /* The video BIOS sets the boot loader's mode again on waking (wakeup.S),
  * which is all there is to set up while that mode is in use and the 3D
- * engine is not: then the page and the pointer go back. */
+ * engine is not: then the page and the pointer go back. On Evergreen a
+ * native mode is set again on top of it. */
 int radeon_can_resume(void)
 {
-    return !rv.native && !rv.accel;
+    return (!rv.native || RADEON_EVERGREEN()) && !rv.accel;
 }
 
 void radeon_resume(void)
 {
     if (!rv.present || !radeon_can_resume())
         return;
+    radeon_native_resume();
     if (rv.flip)
         radeon_show_page(rv.page);
     radeon_cursor_reload();

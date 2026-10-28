@@ -720,6 +720,373 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
   def(Text.prototype, "appendData", function (s) { this.data += s; });
   def(Text.prototype, "substringData", function (o, n) { return this.data.substr(o, n); });
 
+  /* ---- stand-ins for what this browser cannot do: they answer the way a browser without it would ---- */
+  class ReportingObserver {
+    constructor(callback, options) { def(this, "_q", []); }
+    observe() {}
+    disconnect() {}
+    takeRecords() { var q = this._q; this._q = []; return q; }
+  }
+  def(g, "ReportingObserver", ReportingObserver);
+  class TaskController extends AbortController {
+    constructor(init) { super(); def(this, "_p", init && init.priority || "user-visible"); }
+    setPriority(p) { this._p = String(p); }
+  }
+  def(g, "TaskController", TaskController);
+  def(g, "scheduler", {
+    postTask: function (callback, options) {
+      options = options || {};
+      return new Promise(function (resolve, reject) {
+        var signal = options.signal;
+        if (signal && signal.aborted) { reject(signal.reason); return; }
+        var id = setTimeout(function () { try { resolve(callback()); } catch (e) { reject(e); } }, options.delay || 0);
+        if (signal) signal.addEventListener("abort", function () { clearTimeout(id); reject(signal.reason); }, { once: true });
+      });
+    },
+    yield: function () { return new Promise(function (resolve) { setTimeout(resolve, 0); }); }
+  });
+  class SpeechSynthesisUtterance extends EventTarget {
+    constructor(text) {
+      super();
+      this.text = text === undefined ? "" : String(text);
+      this.lang = ""; this.voice = null; this.volume = 1; this.rate = 1; this.pitch = 1;
+      this.onstart = this.onend = this.onerror = this.onpause = this.onresume = this.onboundary = this.onmark = null;
+    }
+  }
+  def(g, "SpeechSynthesisUtterance", SpeechSynthesisUtterance);
+  def(g, "speechSynthesis", {
+    pending: false, speaking: false, paused: false, onvoiceschanged: null,
+    speak: function (u) {
+      setTimeout(function () {                 /* there is no voice to speak with */
+        var e = new Event("error");
+        e.error = "synthesis-unavailable"; e.utterance = u; e.charIndex = 0; e.elapsedTime = 0;
+        if (u && u.dispatchEvent) u.dispatchEvent(e);
+        if (u && typeof u.onerror === "function") u.onerror(e);
+      }, 0);
+    },
+    cancel: function () {}, pause: function () {}, resume: function () {},
+    getVoices: function () { return []; },
+    addEventListener: function () {}, removeEventListener: function () {}, dispatchEvent: function () { return true; }
+  });
+  def(EP, "requestPointerLock", function () {
+    setTimeout(function () { document.dispatchEvent(new Event("pointerlockerror")); }, 0);
+    var p = Promise.reject(new DOMException("Pointer lock is not available", "NotSupportedError"));
+    p.catch(function () {});
+    return p;
+  });
+  getter(DP, "pointerLockElement", function () { return null; });
+  def(DP, "exitPointerLock", function () {});
+
+  /* ---- caretPositionFromPoint: the text under a point, and how far along it ---- */
+  function caretAt(x, y) {
+    var el = document.elementFromPoint(x, y);
+    if (!el) return null;
+    var best = null, bestD = Infinity, w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (var t = w.nextNode(); t; t = w.nextNode()) {
+      if (!t.data.trim()) continue;
+      var r = document.createRange();
+      r.selectNodeContents(t);
+      var b = r.getBoundingClientRect();
+      if (!b.width && !b.height) continue;
+      var dy = y < b.top ? b.top - y : y > b.bottom ? y - b.bottom : 0;
+      var dx = x < b.left ? b.left - x : x > b.right ? x - b.right : 0;
+      if (dy * 10000 + dx < bestD) { bestD = dy * 10000 + dx; best = { t: t, b: b }; }
+    }
+    if (!best) return { node: el, offset: 0 };
+    var len = best.t.data.length, frac = best.b.width > 0 ? (x - best.b.left) / best.b.width : 0;
+    return { node: best.t, offset: Math.max(0, Math.min(len, Math.round(frac * len))) };
+  }
+  def(DP, "caretPositionFromPoint", function (x, y) {
+    var c = caretAt(x, y);
+    if (!c) return null;
+    return { offsetNode: c.node, offset: c.offset,
+      getClientRect: function () {
+        var r = document.createRange();
+        r.setStart(c.node, c.offset);
+        r.collapse(true);
+        return r.getBoundingClientRect();
+      } };
+  });
+  def(DP, "caretRangeFromPoint", function (x, y) {
+    var c = caretAt(x, y);
+    if (!c) return null;
+    var r = document.createRange();
+    r.setStart(c.node, c.offset);
+    r.collapse(true);
+    return r;
+  });
+
+  /* ---- ElementInternals: form-associated custom elements ---- */
+  var EI_KEY = {}, INTERNALS = new WeakMap();
+  var VALIDITY = ["valueMissing", "typeMismatch", "patternMismatch", "tooLong", "tooShort", "rangeUnderflow",
+                  "rangeOverflow", "stepMismatch", "badInput", "customError"];
+  class CustomStateSet {
+    constructor(key) { if (key !== EI_KEY) throw new TypeError("Illegal constructor"); def(this, "_s", new Set()); }
+    add(v) { this._s.add(String(v)); return this; }
+    delete(v) { return this._s.delete(String(v)); }
+    has(v) { return this._s.has(String(v)); }
+    clear() { this._s.clear(); }
+    get size() { return this._s.size; }
+    forEach(f, t) { var me = this; this._s.forEach(function (v) { f.call(t, v, v, me); }); }
+    values() { return this._s.values(); }
+    keys() { return this._s.values(); }
+    entries() { return this._s.entries(); }
+    [Symbol.iterator]() { return this._s.values(); }
+  }
+  function formAssociated(i) {
+    if (!i._el.constructor || !i._el.constructor.formAssociated)
+      throw new DOMException("The target element is not a form-associated custom element.", "NotSupportedError");
+  }
+  class ElementInternals {
+    constructor(key, el) {
+      if (key !== EI_KEY) throw new TypeError("Illegal constructor");
+      def(this, "_el", el); def(this, "_value", null); def(this, "_state", null);
+      def(this, "_flags", {}); def(this, "_msg", ""); def(this, "_states", new CustomStateSet(EI_KEY));
+    }
+    get shadowRoot() { return this._el.shadowRoot || null; }
+    get form() { formAssociated(this); return this._el.closest("form"); }
+    get states() { return this._states; }
+    setFormValue(value, state) { formAssociated(this); this._value = value; this._state = state === undefined ? value : state; }
+    get willValidate() { formAssociated(this); return !this._el.hasAttribute("disabled") && !this._el.hasAttribute("readonly"); }
+    get validity() {
+      formAssociated(this);
+      var f = this._flags, v = {}, any = false;
+      VALIDITY.forEach(function (k) { v[k] = !!f[k]; any = any || v[k]; });
+      v.valid = !any;
+      return v;
+    }
+    get validationMessage() { formAssociated(this); return this.validity.valid ? "" : this._msg; }
+    setValidity(flags, message, anchor) {
+      formAssociated(this);
+      flags = flags || {};
+      var any = VALIDITY.some(function (k) { return !!flags[k]; });
+      if (any && !message) throw new TypeError("A message is required when the element is invalid");
+      this._flags = Object.assign({}, flags);
+      this._msg = any ? String(message) : "";
+    }
+    checkValidity() {
+      if (!this.willValidate || this.validity.valid) return true;
+      this._el.dispatchEvent(new Event("invalid", { cancelable: true }));
+      return false;
+    }
+    reportValidity() { return this.checkValidity(); }
+    get labels() {
+      formAssociated(this);
+      var id = this._el.id, el = this._el;
+      return Array.from(document.querySelectorAll("label")).filter(function (l) {
+        return (id && l.htmlFor === id) || l.contains(el);
+      });
+    }
+  }
+  def(g, "ElementInternals", ElementInternals);
+  def(g, "CustomStateSet", CustomStateSet);
+  def(EP, "attachInternals", function () {
+    var name = String(this.localName || this.tagName).toLowerCase();
+    if (name.indexOf("-") < 0 || !customElements.get(name))
+      throw new DOMException("Unable to attach ElementInternals to non-custom elements.", "NotSupportedError");
+    if (INTERNALS.has(this))
+      throw new DOMException("ElementInternals for the specified element was already attached.", "NotSupportedError");
+    var i = new ElementInternals(EI_KEY, this);
+    INTERNALS.set(this, i);
+    return i;
+  });
+  /* FormData(form) asks for the values form-associated elements gave */
+  def(g, "%formAssociated", function (form, list) {
+    var els = form.querySelectorAll("*");
+    for (var k = 0; k < els.length; k++) {
+      var e = els[k], i = INTERNALS.get(e);
+      if (!i || !e.constructor.formAssociated || e.hasAttribute("disabled")) continue;
+      var name = e.getAttribute("name"), v = i._value;
+      if (v === null || v === undefined) continue;
+      if (v instanceof FormData) { v.forEach(function (val, key) { list.push([key, val]); }); continue; }
+      if (name) list.push([name, v instanceof Blob ? v : String(v)]);
+    }
+  });
+
+  /* ---- setHTML, setHTMLUnsafe and the Sanitizer ---- */
+  var UNSAFE_ELEMENTS = ["script", "iframe", "frame", "frameset", "object", "embed", "applet", "base", "meta", "link",
+                         "style", "noscript", "template", "portal", "fencedframe"];
+  var URL_ATTRS = ["href", "src", "action", "formaction", "xlink:href", "data", "poster", "background", "cite", "ping"];
+  function sanitizerConfig(c) {
+    var o = { elements: null, removeElements: [], replaceWithChildrenElements: [], attributes: null,
+              removeAttributes: [], comments: false, dataAttributes: true };
+    if (!c) return o;
+    function names(l) { return (l || []).map(function (x) { return String(typeof x === "object" ? x.name : x).toLowerCase(); }); }
+    if (c.elements) o.elements = names(c.elements);
+    o.removeElements = names(c.removeElements);
+    o.replaceWithChildrenElements = names(c.replaceWithChildrenElements);
+    if (c.attributes) o.attributes = names(c.attributes);
+    o.removeAttributes = names(c.removeAttributes);
+    if (c.comments !== undefined) o.comments = !!c.comments;
+    if (c.dataAttributes !== undefined) o.dataAttributes = !!c.dataAttributes;
+    return o;
+  }
+  class Sanitizer {
+    constructor(config) {
+      if (config === "default" || config === undefined) config = {};
+      def(this, "_c", config instanceof Sanitizer ? JSON.parse(JSON.stringify(config._c)) : sanitizerConfig(config));
+    }
+    get() { return JSON.parse(JSON.stringify(this._c)); }
+    allowElement(n) { n = String(n).toLowerCase(); if (this._c.elements && this._c.elements.indexOf(n) < 0) this._c.elements.push(n); this._c.removeElements = this._c.removeElements.filter(function (x) { return x !== n; }); }
+    removeElement(n) { n = String(n).toLowerCase(); this._c.removeElements.push(n); if (this._c.elements) this._c.elements = this._c.elements.filter(function (x) { return x !== n; }); }
+    replaceElementWithChildren(n) { this._c.replaceWithChildrenElements.push(String(n).toLowerCase()); }
+    allowAttribute(n) { n = String(n).toLowerCase(); if (this._c.attributes && this._c.attributes.indexOf(n) < 0) this._c.attributes.push(n); this._c.removeAttributes = this._c.removeAttributes.filter(function (x) { return x !== n; }); }
+    removeAttribute(n) { this._c.removeAttributes.push(String(n).toLowerCase()); }
+    setComments(b) { this._c.comments = !!b; }
+    setDataAttributes(b) { this._c.dataAttributes = !!b; }
+    removeUnsafe() { var c = this._c; UNSAFE_ELEMENTS.forEach(function (n) { if (c.removeElements.indexOf(n) < 0) c.removeElements.push(n); }); }
+  }
+  def(g, "Sanitizer", Sanitizer);
+  function scriptURL(v) {
+    var t = String(v).replace(new RegExp("[\\u0000-\\u0020]", "g"), "").toLowerCase();
+    return t.indexOf("javascript:") === 0 || t.indexOf("vbscript:") === 0 || t.indexOf("data:text/html") === 0;
+  }
+  function sanitize(root, c, safe) {
+    var kids = Array.from(root.childNodes);
+    for (var i = 0; i < kids.length; i++) {
+      var n = kids[i];
+      if (n.nodeType === 8) { if (!c.comments || safe) n.remove(); continue; }
+      if (n.nodeType !== 1) continue;
+      var name = n.localName || String(n.tagName).toLowerCase();
+      if ((safe && UNSAFE_ELEMENTS.indexOf(name) >= 0) || c.removeElements.indexOf(name) >= 0) { n.remove(); continue; }
+      if (c.replaceWithChildrenElements.indexOf(name) >= 0) {
+        sanitize(n, c, safe);
+        while (n.firstChild) n.parentNode.insertBefore(n.firstChild, n);
+        n.remove();
+        continue;
+      }
+      if (c.elements && c.elements.indexOf(name) < 0) { n.remove(); continue; }
+      Array.from(n.attributes || []).forEach(function (a) {
+        var an = a.name.toLowerCase();
+        var drop = c.removeAttributes.indexOf(an) >= 0 ||
+                   (c.attributes && c.attributes.indexOf(an) < 0 && !(c.dataAttributes && an.indexOf("data-") === 0)) ||
+                   (!c.dataAttributes && an.indexOf("data-") === 0) ||
+                   (safe && (an.indexOf("on") === 0 || an === "srcdoc" || (URL_ATTRS.indexOf(an) >= 0 && scriptURL(a.value))));
+        if (drop) n.removeAttribute(a.name);
+      });
+      sanitize(n, c, safe);
+    }
+  }
+  function declarativeShadows(root) {
+    var ts = Array.from(root.querySelectorAll("template[shadowrootmode]"));
+    ts.forEach(function (t) {
+      var mode = String(t.getAttribute("shadowrootmode")).toLowerCase(), host = t.parentNode;
+      if ((mode !== "open" && mode !== "closed") || !host || host.nodeType !== 1 || host.shadowRoot) return;
+      try {
+        var sr = host.attachShadow({ mode: mode }), content = t.content || t;
+        while (content.firstChild) sr.appendChild(content.firstChild);
+        t.remove();
+        declarativeShadows(sr);
+      } catch (e) {}
+    });
+  }
+  function parsed(html) {
+    var t = document.createElement("template");
+    t.innerHTML = String(html);
+    return t.content || t;
+  }
+  function replaceChildren(el, frag) {
+    while (el.firstChild) el.removeChild(el.firstChild);
+    while (frag.firstChild) el.appendChild(frag.firstChild);
+  }
+  function sanitizerOf(o) {
+    var s = o && o.sanitizer;
+    return s instanceof Sanitizer ? s._c : sanitizerConfig(s === "default" ? null : s);
+  }
+  def(EP, "setHTML", function (html, options) {
+    var frag = parsed(html);
+    sanitize(frag, sanitizerOf(options), true);         /* script and event handlers go whatever the config says */
+    replaceChildren(this, frag);
+  });
+  def(EP, "setHTMLUnsafe", function (html, options) {
+    var frag = parsed(html);
+    if (options && options.sanitizer) sanitize(frag, sanitizerOf(options), false);
+    replaceChildren(this, frag);
+    declarativeShadows(this);
+  });
+  def(g, "%parseHTML", function (html, options, safe) {
+    var d = new DOMParser().parseFromString(String(html), "text/html");
+    var root = d.documentElement;
+    if (safe || (options && options.sanitizer)) sanitize(root, sanitizerOf(options), safe);
+    if (!safe) declarativeShadows(root);
+    return d;
+  });
+
+  /* ---- Trusted Types: the policy objects and the trusted values (nothing here enforces them) ---- */
+  var TT_KEY = {};
+  function trusted(Kind, v) { var o = Object.create(Kind.prototype); def(o, "_v", String(v)); return o; }
+  class TrustedHTML {
+    constructor(k) { if (k !== TT_KEY) throw new TypeError("Illegal constructor"); }
+    toString() { return this._v; }
+    toJSON() { return this._v; }
+    static fromLiteral(s) { return trusted(TrustedHTML, s && s.raw ? s.raw.join("") : s); }
+  }
+  class TrustedScript {
+    constructor(k) { if (k !== TT_KEY) throw new TypeError("Illegal constructor"); }
+    toString() { return this._v; }
+    toJSON() { return this._v; }
+    static fromLiteral(s) { return trusted(TrustedScript, s && s.raw ? s.raw.join("") : s); }
+  }
+  class TrustedScriptURL {
+    constructor(k) { if (k !== TT_KEY) throw new TypeError("Illegal constructor"); }
+    toString() { return this._v; }
+    toJSON() { return this._v; }
+    static fromLiteral(s) { return trusted(TrustedScriptURL, s && s.raw ? s.raw.join("") : s); }
+  }
+  class TrustedTypePolicy {
+    constructor(k, name, rules) {
+      if (k !== TT_KEY) throw new TypeError("Illegal constructor");
+      def(this, "_n", name); def(this, "_r", rules || {});
+    }
+    get name() { return this._n; }
+    _make(Kind, rule, args) {
+      var f = this._r[rule];
+      if (typeof f !== "function") throw new TypeError("Policy " + this._n + " has no " + rule + " member");
+      var v = f.apply(undefined, args);
+      return trusted(Kind, v === undefined || v === null ? "" : v);
+    }
+    createHTML() { return this._make(TrustedHTML, "createHTML", Array.from(arguments)); }
+    createScript() { return this._make(TrustedScript, "createScript", Array.from(arguments)); }
+    createScriptURL() { return this._make(TrustedScriptURL, "createScriptURL", Array.from(arguments)); }
+  }
+  class TrustedTypePolicyFactory {
+    constructor(k) { if (k !== TT_KEY) throw new TypeError("Illegal constructor"); def(this, "_d", null); }
+    createPolicy(name, rules) {
+      var p = new TrustedTypePolicy(TT_KEY, String(name), rules);
+      if (String(name) === "default") {
+        if (this._d) throw new TypeError("A default policy already exists");
+        this._d = p;
+      }
+      return p;
+    }
+    isHTML(v) { return v instanceof TrustedHTML; }
+    isScript(v) { return v instanceof TrustedScript; }
+    isScriptURL(v) { return v instanceof TrustedScriptURL; }
+    get emptyHTML() { return trusted(TrustedHTML, ""); }
+    get emptyScript() { return trusted(TrustedScript, ""); }
+    get defaultPolicy() { return this._d; }
+    getAttributeType(tag, attr) {
+      tag = String(tag).toLowerCase(); attr = String(attr).toLowerCase();
+      if (attr.indexOf("on") === 0) return "TrustedScript";
+      if (tag === "iframe" && attr === "srcdoc") return "TrustedHTML";
+      if ((tag === "script" && attr === "src") || (tag === "embed" && attr === "src") || (tag === "object" && attr === "data")) return "TrustedScriptURL";
+      return null;
+    }
+    getPropertyType(tag, prop) {
+      tag = String(tag).toLowerCase(); prop = String(prop);
+      if (prop === "innerHTML" || prop === "outerHTML" || (tag === "iframe" && prop === "srcdoc")) return "TrustedHTML";
+      if (tag === "script" && prop === "src") return "TrustedScriptURL";
+      if (tag === "script" && (prop === "text" || prop === "textContent" || prop === "innerText")) return "TrustedScript";
+      return null;
+    }
+  }
+  def(g, "TrustedHTML", TrustedHTML);
+  def(g, "TrustedScript", TrustedScript);
+  def(g, "TrustedScriptURL", TrustedScriptURL);
+  def(g, "TrustedTypePolicy", TrustedTypePolicy);
+  def(g, "TrustedTypePolicyFactory", TrustedTypePolicyFactory);
+  def(g, "trustedTypes", new TrustedTypePolicyFactory(TT_KEY));
+
 })(globalThis);
 );
 
@@ -764,5 +1131,101 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
   def(g, "reportError", function (e) { console.error(e); });
   def(g, "find", function () { return false; });
   def(g, "getScreenDetails", function () { return Promise.reject(new DOMException("Not allowed", "NotAllowedError")); });
+
+  /* What this computer has no way to give a page: the answers a browser without it gives. */
+  nav.geolocation = {
+    getCurrentPosition: function (ok, fail) {
+      if (typeof fail === "function")
+        setTimeout(function () { fail({ code: 2, message: "Position unavailable", PERMISSION_DENIED: 1, POSITION_UNAVAILABLE: 2, TIMEOUT: 3 }); }, 0);
+    },
+    watchPosition: function (ok, fail) { this.getCurrentPosition(ok, fail); return 1; },
+    clearWatch: function () {}
+  };
+  nav.credentials = {
+    get: function () { return Promise.resolve(null); },
+    store: function (c) { return Promise.resolve(c); },
+    create: function () { return Promise.reject(new DOMException("Credentials are not supported", "NotSupportedError")); },
+    preventSilentAccess: function () { return Promise.resolve(); }
+  };
+  nav.getBattery = function () {
+    return Promise.resolve({ charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1,
+      onchargingchange: null, onchargingtimechange: null, ondischargingtimechange: null, onlevelchange: null,
+      addEventListener: function () {}, removeEventListener: function () {}, dispatchEvent: function () { return true; } });
+  };
+  nav.getGamepads = function () { return [null, null, null, null]; };
+  if (g.screen && !g.screen.orientation)
+    g.screen.orientation = {
+      get type() { return innerWidth >= innerHeight ? "landscape-primary" : "portrait-primary"; }, angle: 0, onchange: null,
+      lock: function () { var p = Promise.reject(new DOMException("The screen cannot be turned", "NotSupportedError")); p.catch(function () {}); return p; },
+      unlock: function () {}, addEventListener: function () {}, removeEventListener: function () {},
+      dispatchEvent: function () { return true; }
+    };
+
+  /* <video> and <audio>: nothing plays here (a click on one downloads its file), so play() fails
+   * as it does for a format a browser cannot play, and the rest reads as an element with no media. */
+  var mediaProtos = [g.HTMLMediaElement, g.HTMLAudioElement, g.HTMLVideoElement].filter(function (c) { return c; })
+    .map(function (c) { return c.prototype; });
+  mediaProtos.forEach(function (MP) {
+    var notSupported = function () { return new DOMException("This browser cannot play media", "NotSupportedError"); };
+    def(MP, "play", function () {
+      var el = this;
+      setTimeout(function () { el.dispatchEvent(new Event("error")); }, 0);
+      var p = Promise.reject(notSupported());
+      return p;
+    });
+    def(MP, "pause", function () {});
+    def(MP, "load", function () { var el = this; setTimeout(function () { el.dispatchEvent(new Event("emptied")); }, 0); });
+    def(MP, "canPlayType", function () { return ""; });
+    def(MP, "fastSeek", function () {});
+    def(MP, "addTextTrack", function () { return { mode: "disabled", cues: [], addCue: function () {}, removeCue: function () {} }; });
+    def(MP, "setSinkId", function () { return Promise.reject(notSupported()); });
+    def(MP, "captureStream", function () { throw notSupported(); });
+    var EMPTY_RANGES = { length: 0, start: function () { throw new DOMException("Index out of range", "IndexSizeError"); },
+                         end: function () { throw new DOMException("Index out of range", "IndexSizeError"); } };
+    var media = { paused: true, ended: false, seeking: false, duration: NaN, readyState: 0, networkState: 3,
+                  videoWidth: 0, videoHeight: 0, buffered: EMPTY_RANGES, played: EMPTY_RANGES, seekable: EMPTY_RANGES,
+                  textTracks: [], audioTracks: [], videoTracks: [], currentSrc: "", srcObject: null,
+                  error: { code: 4, message: "This browser cannot play media", MEDIA_ERR_SRC_NOT_SUPPORTED: 4 } };
+    Object.keys(media).forEach(function (k) {
+      Object.defineProperty(MP, k, { configurable: true, get: function () { return this["%m_" + k] !== undefined ? this["%m_" + k] : media[k]; },
+                                     set: function (v) { def(this, "%m_" + k, v); } });
+    });
+    var settable = { currentTime: 0, volume: 1, muted: false, playbackRate: 1, defaultPlaybackRate: 1, preservesPitch: true };
+    Object.keys(settable).forEach(function (k) {
+      Object.defineProperty(MP, k, { configurable: true,
+        get: function () { var v = this["%m_" + k]; return v === undefined ? settable[k] : v; },
+        set: function (v) { def(this, "%m_" + k, typeof settable[k] === "boolean" ? !!v : Number(v)); } });
+    });
+    [["NETWORK_EMPTY", 0], ["NETWORK_IDLE", 1], ["NETWORK_LOADING", 2], ["NETWORK_NO_SOURCE", 3], ["HAVE_NOTHING", 0],
+     ["HAVE_METADATA", 1], ["HAVE_CURRENT_DATA", 2], ["HAVE_FUTURE_DATA", 3], ["HAVE_ENOUGH_DATA", 4]].forEach(function (c) {
+      def(MP, c[0], c[1]);
+      def(MP.constructor, c[0], c[1]);
+    });
+  });
+  if (g.HTMLAudioElement) {
+    var Audio = function Audio(src) {
+      var a = document.createElement("audio");
+      a.setAttribute("preload", "auto");
+      if (src !== undefined) a.setAttribute("src", String(src));
+      return a;
+    };
+    Audio.prototype = g.HTMLAudioElement.prototype;
+    def(g, "Audio", Audio);
+  }
+
+  /* input.files: the file the user picked, as a File in a FileList */
+  if (g.HTMLInputElement)
+    Object.defineProperty(g.HTMLInputElement.prototype, "files", { configurable: true, get: function () {
+      if (String(this.type).toLowerCase() !== "file") return null;
+      var F = g.File, picked = g["%chosenFile"](this), files = [];
+      if (picked) files.push(new F([picked.bytes], picked.name, { type: picked.type, lastModified: picked.lastModified }));
+      return g["%fileList"](files);
+    }, set: function () {} });
+
+  /* Document.parseHTMLUnsafe and Document.parseHTML (sanitized): the DOM library does the work */
+  if (g.Document) {
+    def(g.Document, "parseHTMLUnsafe", function (html, options) { return g.Sanitizer && g["%parseHTML"](html, options, false); });
+    def(g.Document, "parseHTML", function (html, options) { return g.Sanitizer && g["%parseHTML"](html, options, true); });
+  }
 })(globalThis);
 );

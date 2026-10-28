@@ -126,12 +126,18 @@ says why.
   flushed and parked, the other processors parked, and on waking the
   processor, PICs, PCI configuration, IDE (with its DMA mode), AHCI, all four
   USB controllers (devices are found again), HD Audio, the network card and
-  the PS/2 devices are set up again. Video BIOS calls on wake are opt-in
-  because some firmware hangs in them before the kernel can resume. Options: `acpi=off`, `acpi=basic` (tables only, as before:
-  power-off without AML), `ec=off`, `lid=ignore` (closing the lid does nothing), `s3_mode` (restore the boot video mode),
-  `s3_bios` (run the video ROM first, then restore the mode), `s3_nomode`
-  (override mode restoration), `s3_beep` (beep as soon as the firmware hands
-  back, to debug a machine that does not wake).
+  the PS/2 devices are set up again, with the processors' MTRRs and PCI
+  functions brought back to D0 first. On real hardware the wake code runs the
+  video ROM's initialisation and sets the boot loader's VESA mode again
+  (what pre-KMS Linux needed as `acpi_sleep=s3_bios,s3_mode`); under a
+  hypervisor it does neither, since the virtual BIOS restores the display
+  itself. Options: `acpi=off`, `acpi=basic` (tables only, as before:
+  power-off without AML), `ec=off`, `lid=ignore` (closing the lid does nothing),
+  `s3_nobios` / `s3_nomode` (skip the video ROM / the mode set), `s3_bios` /
+  `s3_mode` (do them under a hypervisor too), `s3_beep` (beeps on the speaker
+  for a machine without a picture: one when the firmware hands back to the
+  wake code, two when the kernel is running again, three when the devices
+  are back).
 - Display drivers:
   - Standard: keeps the VESA BIOS mode.
   - **3dfx Voodoo Banshee/3/4/5**: reads EDID, sets modes from 640x480 to
@@ -145,9 +151,11 @@ says why.
     `radeon.modeset=0`, `radeon.accel=0`, `radeon.gart=0`, `radeon=off`.
   - **AMD Radeon HD 6000 graphics of the Llano APUs** (Sumo: HD 6520G, 6480G,
     6550D, 6620G and the rest of 0x9640-0x964F): Evergreen's display
-    controllers, with page flipping and the hardware pointer in the boot
-    loader's mode, over the memory the BIOS shares with them. Native modes and
-    3D are not there yet for these (see *Work in progress*).
+    controllers, with page flipping and the hardware pointer over the memory
+    the BIOS shares with them. A laptop panel behind a DisplayPort-to-LVDS
+    bridge (TRAVIS) gets native modes: its own timing from the BIOS, smaller
+    sizes stretched to it by the scaler, the DisplayPort link trained over
+    the AUX channel. No 3D for these yet (see *Work in progress*).
   - **Intel HD Graphics of Haswell processors** (HD 4600, 4400, 4200, 5000,
     Iris 5100, Iris Pro 5200): page flipping at vblank and the hardware
     pointer in the boot loader's mode. The second page lives in the stolen
@@ -331,17 +339,36 @@ fetcher process, so the desktop keeps running), or from `file://`.
   and `counter()`/`counters()` in `content` (one flat set of counters, not scoped by nesting).
   Also `tab-size`, `text-align-last`, `-webkit-line-clamp` (the lines are cut off, with no
   ellipsis), `list-style-image`, and `hyphens` and `resize`, which are accepted and ignored.
+  `::first-letter` (its own size, color and box) and `::first-line` (the line is broken with its
+  font; nested inline text takes its color), `all` (`initial`, `inherit`, `unset`; `revert` works as
+  `unset`), `text-wrap: nowrap`, `display: ruby`, the individual `translate`, `rotate` and `scale`
+  properties, the math functions `round()`, `mod()`, `rem()`, `abs()`, `sign()`, `sin()` and the other
+  trigonometric functions, `pow()`, `sqrt()`, `hypot()`, `log()`, `exp()` and the constants `pi` and
+  `e`, the `lh`, `rlh`, `ic` and `cap` units (and `cq*` units, which are the viewport's, there being
+  no container queries), relative colors (`rgb(from <color> r g b / alpha)`, and `hsl()`, `hwb()`,
+  `lab()`, `lch()`, `oklab()` and `oklch()` forms) and the system colors (`AccentColor`, `Canvas`,
+  `Mark`...). Around 120 properties that change nothing this renderer draws (`color-scheme`,
+  `touch-action`, `overscroll-behavior`, `scrollbar-width`, `content-visibility`, `contain`,
+  `font-feature-settings`, `scroll-margin`, `scroll-snap-*`...) are accepted and ignored, so
+  `@supports` and `CSS.supports()` answer as a modern browser does.
   Pictures: comma-separated `background-image` layers (PNG, JPEG, GIF, WebP, ICO,
   SVG, gradients and `data:` URLs) with `background-size` (lengths, percentages, `cover`, `contain`),
   `background-position` (keywords, offsets from an edge), `background-repeat`, `background-origin`,
   border/padding/content `background-clip`, fixed picture attachments and the `background`
   shorthand, painted from the bottom layer up inside rounded corners; the old
   `background=` attribute; `object-fit` and `object-position` on `<img>` (also with rounded
-  corners, as for round avatars). Relative addresses in a style sheet are
+  corners, as for round avatars). Gradients are `linear-gradient()` (angles, sides and corners),
+  `radial-gradient()` (circles and ellipses, the four extent keywords or sizes, `at` a position),
+  `conic-gradient()` (`from` an angle, `at` a position) and their `repeating-` forms, with any number of
+  color stops (one or two positions each, in lengths, percentages or angles), interpolated with
+  premultiplied alpha, and sized, placed and tiled by `background-size`, `-position` and `-repeat`
+  like pictures (the old `-webkit-` forms are read too). Relative addresses in a style sheet are
   resolved against the sheet's own address. `overflow`, `overflow-x` and `overflow-y`.
 - **Layout**: blocks with margin collapsing, inline text, inline-blocks, lists,
-  tables, flex rows, grids (columns, rows, areas, auto rows, spans, `dense`, named
-  lines and positive/negative named-line occurrences in explicit and integer-repeat tracks),
+  tables, flex rows, grids (columns, rows, areas, auto rows and columns, implicit columns past the
+  template, `grid-auto-flow: column`, spans, `dense`, named lines and positive/negative named-line
+  occurrences in explicit and integer-repeat tracks; `justify-content` and `align-content` place the
+  tracks), `align-content` for the lines of a wrapping flex container,
   borders, backgrounds, images and form controls. Floats (`float`, `clear`,
   clearfixes, text wrapping, new formatting contexts beside floats) and
   positioning (`relative`, `absolute`, `fixed` and `sticky` with `top`/`right`/`bottom`/
@@ -356,7 +383,11 @@ fetcher process, so the desktop keeps running), or from `file://`.
   `scrollIntoView()` on them. `fixed` boxes stay where they are in the window as the page scrolls; `sticky` boxes
   follow it until the end of the box they are in (against the window, not a scrolling
   box inside the page). `<progress>`, `<meter>` and `<ruby>` (the annotation above its
-  base) are drawn.
+  base) are drawn. Nothing plays `<video>` or `<audio>`: a video is a box of its size with its poster
+  and a play button, `<audio controls>` a bar, and a click on either downloads the file (its `src`
+  or first `<source>`); the fallback inside them is not shown, as in a browser that plays them. An
+  `<object>` shows its fallback content. `<template shadowrootmode>` in a page's HTML attaches a
+  shadow root (declarative shadow DOM).
 - **Forms**: `<select>` opens a list (arrows, Home/End, typing a letter, Enter, wheel and
   scroll bar for long ones); fields with a `<datalist>` suggest matches as you type;
   `<input type=range>` is a slider (drag, or arrows, Home and End; `min`, `max` and `step`),
@@ -403,11 +434,25 @@ fetcher process, so the desktop keeps running), or from `file://`.
   live bindings, `import()`, `import.meta`, top-level `await`, import maps;
   `nomodule` scripts are skipped), generators, async generators and
   `async`/`await` (run as coroutines on their own stacks),
-  Promises with a microtask queue, regular expressions with lookbehind and
-  named groups, and the usual built-ins (Map, Set, Weak*, typed arrays, JSON,
-  Date, Reflect, `Proxy` (get, set, has, deleteProperty and ownKeys traps), the ES2025 Set methods,
-  `Array.fromAsync`, `Error` causes, a small Intl (`NumberFormat`, `DateTimeFormat`, `Collator`,
-  `PluralRules`, `RelativeTimeFormat`, `ListFormat`, `Segmenter`), `structuredClone`...). The DOM (jsdom.c) has
+  Promises with a microtask queue, regular expressions with lookbehind,
+  named groups, sticky (`y`) matching and match indices (`d`), and the usual built-ins (Map, Set,
+  Weak*, typed arrays, JSON, Date, Reflect, `Proxy` (get, set, has, deleteProperty and ownKeys
+  traps), the ES2025 Set methods, iterator helpers (`Iterator.from`, `map`, `filter`, `take`,
+  `drop`, `flatMap`, `reduce`, `toArray`... on arrays', collections' and generators' iterators),
+  `Array.fromAsync`, `Error` causes, a small Intl (`NumberFormat` with currencies, percentages,
+  units, compact, scientific and engineering notation, significant digits, sign display and
+  `formatToParts`, also behind `toLocaleString`; `Locale`, `DisplayNames`, `DateTimeFormat`,
+  `Collator`, `PluralRules`, `RelativeTimeFormat`, `ListFormat`, `Segmenter`), `structuredClone`...).
+  `URLPattern` (named groups, wildcards, regular expression groups, `{}` and modifiers),
+  `File`, `FileList`, `FileReader` and `input.files` (only the file the user picked: a page
+  cannot set a file input's value), `CompressionStream` and `DecompressionStream` (gzip, deflate,
+  deflate-raw), `TextDecoderStream` and `TextEncoderStream`. Form-associated custom elements get
+  `attachInternals()` (form values for `FormData`, validity, custom states); `setHTML()` with the
+  `Sanitizer` (and `setHTMLUnsafe()`, `Document.parseHTMLUnsafe()`), Trusted Types' policies and
+  values (nothing enforces them), and `caretPositionFromPoint()`. What there is no hardware or
+  service for answers as a browser without it would: geolocation fails, `play()` rejects,
+  speech has no voices, pointer lock and screen orientation lock are refused, there are no
+  gamepads or credentials, `scheduler.postTask()` and `ReportingObserver` exist. The DOM (jsdom.c) has
   `document`, `querySelector` (including `:is()`, `:where()`, complex `:not()`
   and filtered sibling selectors), `innerHTML`, `classList`, `dataset`, events
   (capture and bubbling phases, `once`/`signal` options, `handleEvent` objects,
@@ -800,26 +845,31 @@ user range and page tables first.
 ## Work in progress
 
 - **Suspend to RAM on physical hardware still needs validation.** The wake
-  path previously called the video BIOS unconditionally, which hangs in
-  a GRUB-booted QEMU guest. Video BIOS calls are now opt-in; the default
-  path passes repeated S3 cycles in QEMU. On the HP ProBook with a Llano
-  APU, retest both system responsiveness and the screen: firmware may
-  leave the display dark without restoring its mode. `s3_mode` requests
-  that restoration, `s3_bios` also runs the video ROM first, and `s3_beep`
-  confirms entry to the wake code. These BIOS options can hang on affected
-  firmware. `lid=ignore` prevents automatic sleep while investigating.
+  path passes repeated S3 cycles in QEMU, where the video BIOS is left
+  alone (its ROM call hung there). On real hardware it now runs the video
+  ROM and sets the VESA mode again by default, keeps its real-mode code out
+  of the first 64 KiB (which some firmware overwrites while resuming),
+  restores the MTRRs and brings PCI functions back to D0. On the HP ProBook
+  with a Llano APU, test with `s3_beep`: one beep means the firmware came
+  back to the wake code, two that the kernel is running again, three that
+  the devices are back. One beep then nothing points at the video ROM
+  (`s3_nobios`, then `s3_nomode`); no beep at all means the firmware never
+  came back to the waking vector. `lid=ignore` prevents automatic sleep
+  while investigating.
   For QEMU S3 tests, boot through GRUB (ISO or installed disk), not
   `make run-kernel`: QEMU's direct kernel loader reloads kernel memory on
   wake, destroying the saved resume context. `make test-suspend-qemu`
   uses a disposable GRUB ISO and checks three sleep/wake cycles;
   `KERNEL_TEST_CPUS=2` also exercises restarting the other processor.
 - **The Radeon driver on Llano APUs (HD 6520G and kin) is partial:** page
-  flipping and the hardware pointer only, in the boot loader's mode. Native
-  modes come next: the panel on these machines is DisplayPort (eDP, or LVDS
-  behind a NUTMEG bridge), so they need DisplayPort link training over the AUX
-  channel. `radeon_modeset_probe()` logs what the video BIOS says the outputs
-  are (`dmesg | grep radeon`). After that, 3D: Sumo's own microcode
-  (SUMO_pfp, SUMO_me, SUMO_rlc) and Evergreen's shader instruction set.
+  flipping, the hardware pointer, and native modes only for a laptop panel
+  behind a DisplayPort bridge (TRAVIS, as on the HP ProBook); eDP panels and
+  the VGA, HDMI and DisplayPort connectors keep the boot loader's mode. The
+  native modes are untested on hardware: `dmesg | grep radeon` shows the
+  bridge's DPCD, the clock and the link training's result, and
+  `radeon.modeset=0` turns them off. A native mode is set again after
+  waking from sleep. Next, 3D: Sumo's own microcode (SUMO_pfp, SUMO_me,
+  SUMO_rlc) and Evergreen's shader instruction set.
 - **The Intel HD Graphics driver (Haswell) is partial:** page flipping, the
   hardware pointer and blitter copies; native modes only on the VGA output
   (DisplayPort and HDMI keep the boot loader's mode), and suspend to RAM
@@ -840,8 +890,9 @@ cannot be used.
 - **IDE:** DMA needs a legacy-mode PCI controller with bus mastering and a
   drive the firmware put in a DMA mode; anything else uses PIO.
 - **Suspend to RAM:** not with the Voodoo driver, nor with the Radeon driver's
-  own modes or 3D engine (they cannot set the card up again: `radeon.modeset=0
-  radeon.accel=0`; the Llano driver keeps to the BIOS mode, so it can), nor with a USB disk mounted
+  own modes or 3D engine on the HD 4000s (they cannot set the card up again:
+  `radeon.modeset=0 radeon.accel=0`; the Llano driver sets its panel mode
+  again after the video BIOS), nor with a USB disk mounted
   (USB devices are let go of and found again). The screen comes back only
   where firmware restores it, or where the opt-in `s3_mode` / `s3_bios`
   video restoration works. No hibernation (S4), no processor frequency scaling, and
@@ -891,8 +942,7 @@ cannot be used.
   (text can end up under them), and boxes with `overflow` that are table cells, or `<body>` and
   `<html>`, do not clip or scroll; text selection and `getBoundingClientRect()` account for nested box scrolling,
   while geometry for some positioned boxes is approximate; background `space` and `round`
-  still repeat, `local` attachments do not track inner scrolling, and gradients use a limited
-  two-color renderer; `z-index` only orders absolute and fixed boxes, `sticky` works
+  still repeat, and `local` attachments do not track inner scrolling; `z-index` only orders absolute and fixed boxes, `sticky` works
   against the window only. CSS 2D translate, scale, rotate, skew and matrix transforms
   support origins, nesting, painting, hit testing and visual geometry; 3D transforms,
   CSS `transition`s and CSS animations are ignored (Web Animations has a limited
@@ -903,7 +953,7 @@ cannot be used.
   Try `file:///usr/share/www/transforms.html` for an interactive example.
   Flexbox has grow/shrink sizing, wrapping,
   ordering, alignment and rows/columns, but needs wider conformance testing;
-  grids lack subgrid, column flow, named spans and complete named-line behavior for auto-repeat.
+  grids lack subgrid, named spans and complete named-line behavior for auto-repeat.
   Container queries are missing. Shadow DOM still needs wider composed-event and slot
   conformance testing; adopted sheets do not register downloadable font faces.
   Fetch resolves at headers and delivers body chunks incrementally; EventSource

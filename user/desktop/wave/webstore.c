@@ -4,6 +4,7 @@
  * which the host tests build with the host's headers.)
  */
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,4 +64,11 @@ int store_write_file(const char *path, const char *data, size_t len)
         return -1;
     }
     return 0;
+}
+
+/* When the file was last changed, in seconds since 1970 (0 if it cannot be told). */
+long store_file_mtime(const char *path)
+{
+    struct stat sb;
+    return stat(path, &sb) == 0 ? (long)sb.st_mtime : 0;
 }

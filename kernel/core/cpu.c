@@ -123,6 +123,7 @@ void cpu_init(void)
         pte_wc = PTE_PWT;
     }
     boot_ok("Processor: %s%s", name, pte_wc ? ", write-combining framebuffer" : "");
+    mtrr_save();
 }
 
 /* Another processor starting (smp.c): the page attribute table must be
@@ -131,4 +132,101 @@ void cpu_init_ap(void)
 {
     if (pte_wc)
         wrmsr(MSR_PAT, PAT_VALUE);
+}
+
+/*
+ * The memory type range registers, across suspend to RAM. The firmware
+ * set them at power-on and should set them again on waking, but not all
+ * firmware does: left at their reset state they make every byte of memory
+ * uncacheable, and the machine crawls as if hung. Linux puts them back
+ * itself, and so do we: the boot processor's are kept at boot and written
+ * to every processor that comes back (the SDM's procedure: caches off and
+ * flushed, the MTRRs disabled while they change).
+ */
+#define CR0_NW (1u << 29)
+#define CR0_CD (1u << 30)
+#define CR4_PGE (1u << 7)
+#define MSR_MTRRCAP     0xFE
+#define MSR_MTRRDEFTYPE 0x2FF
+#define MSR_MTRRFIX_FIRST 0x250         /* 64K_00000; then 0x258, 0x259, 0x268-0x26F */
+#define MSR_MTRRPHYSBASE0 0x200
+#define F_MTRR (1u << 12)
+#define MAX_VAR_MTRRS 16
+
+static const uint32_t fixed_msrs[11] = {
+    0x250, 0x258, 0x259, 0x268, 0x269, 0x26A, 0x26B, 0x26C, 0x26D, 0x26E, 0x26F
+};
+static struct {
+    int valid, have_fixed;
+    uint32_t nvar;
+    uint64_t deftype;
+    uint64_t fixed[11];
+    uint64_t var[MAX_VAR_MTRRS][2];     /* base, mask */
+} mtrr;
+
+void mtrr_save(void)
+{
+    uint32_t r[4];
+    cpuid(0, r);
+    if (r[0] < 1)
+        return;
+    cpuid(1, r);
+    if (!(r[3] & F_MTRR) || !(r[3] & (1u << 5)))      /* MSRs */
+        return;
+    uint64_t cap = rdmsr(MSR_MTRRCAP);
+    mtrr.nvar = MIN((uint32_t)(cap & 0xFF), (uint32_t)MAX_VAR_MTRRS);
+    mtrr.have_fixed = (cap >> 8) & 1;
+    mtrr.deftype = rdmsr(MSR_MTRRDEFTYPE);
+    if (mtrr.have_fixed)
+        for (int i = 0; i < 11; i++)
+            mtrr.fixed[i] = rdmsr(fixed_msrs[i]);
+    for (uint32_t i = 0; i < mtrr.nvar; i++) {
+        mtrr.var[i][0] = rdmsr(MSR_MTRRPHYSBASE0 + 2 * i);
+        mtrr.var[i][1] = rdmsr(MSR_MTRRPHYSBASE0 + 2 * i + 1);
+    }
+    mtrr.valid = 1;
+}
+
+/* Interrupts off. Nothing changes if what is there matches already. */
+static void mtrr_restore(void)
+{
+    if (!mtrr.valid)
+        return;
+    int same = rdmsr(MSR_MTRRDEFTYPE) == mtrr.deftype;
+    for (int i = 0; same && mtrr.have_fixed && i < 11; i++)
+        same = rdmsr(fixed_msrs[i]) == mtrr.fixed[i];
+    for (uint32_t i = 0; same && i < mtrr.nvar; i++)
+        same = rdmsr(MSR_MTRRPHYSBASE0 + 2 * i) == mtrr.var[i][0] &&
+               rdmsr(MSR_MTRRPHYSBASE0 + 2 * i + 1) == mtrr.var[i][1];
+    if (same)
+        return;
+
+    uint32_t cr4 = read_cr4();
+    if (cr4 & CR4_PGE)
+        write_cr4(cr4 & ~CR4_PGE);      /* global pages out of the TLB too */
+    uint32_t cr0 = read_cr0();
+    write_cr0((cr0 | CR0_CD) & ~CR0_NW);        /* no-fill cache mode */
+    __asm__ volatile("wbinvd" ::: "memory");
+    write_cr3(read_cr3());
+    wrmsr(MSR_MTRRDEFTYPE, mtrr.deftype & ~0xC00ull);      /* E and FE off while they change */
+    if (mtrr.have_fixed)
+        for (int i = 0; i < 11; i++)
+            wrmsr(fixed_msrs[i], mtrr.fixed[i]);
+    for (uint32_t i = 0; i < mtrr.nvar; i++) {
+        wrmsr(MSR_MTRRPHYSBASE0 + 2 * i, mtrr.var[i][0]);
+        wrmsr(MSR_MTRRPHYSBASE0 + 2 * i + 1, mtrr.var[i][1]);
+    }
+    __asm__ volatile("wbinvd" ::: "memory");
+    write_cr3(read_cr3());
+    wrmsr(MSR_MTRRDEFTYPE, mtrr.deftype);
+    write_cr0(cr0 & ~(CR0_CD | CR0_NW));
+    write_cr4(cr4);
+}
+
+/* A processor back from suspend to RAM (the boot processor in sleep.c,
+ * the others in smp.c), with interrupts off: what the power took. */
+void cpu_resume(void)
+{
+    cpu_init_ap();
+    mtrr_restore();
 }

@@ -637,7 +637,7 @@ static void init_promise(struct js *J)
 static const struct lazy_chunk {
     const char *src;
     int len;
-    const char *names[16];
+    const char *names[24];
 } lazy_chunks[] = {
     {js_chunk_weak,
      sizeof(js_chunk_weak) - 1,
@@ -645,18 +645,19 @@ static const struct lazy_chunk {
       NULL}},
     {js_chunk_misc, sizeof(js_chunk_misc) - 1, {"structuredClone", "btoa", "atob", "Intl", NULL}},
     {js_chunk_events, sizeof(js_chunk_events) - 1, {"EventTarget", "AbortSignal", "AbortController", NULL}},
-    {js_chunk_url, sizeof(js_chunk_url) - 1, {"URLSearchParams", "URL", NULL}},
+    {js_chunk_url, sizeof(js_chunk_url) - 1, {"URLSearchParams", "URL", "URLPattern", NULL}},
     {js_chunk_observers,
      sizeof(js_chunk_observers) - 1,
      {"MutationObserver", "IntersectionObserver", "ResizeObserver", NULL}},
     {js_chunk_web,
      sizeof(js_chunk_web) - 1,
      {"TextEncoder", "TextDecoder", "crypto", "CryptoKey", "Blob", "FormData", "DOMParser", "customElements", "CSS",
-      "Notification", "DOMRect", "postMessage", NULL}},
+      "Notification", "DOMRect", "postMessage", "File", "FileList", "FileReader", NULL}},
     {js_chunk_fetch,
      sizeof(js_chunk_fetch) - 1,
      {"Headers", "Response", "Request", "ReadableStream", "WritableStream", "TransformStream",
-      "CountQueuingStrategy", "ByteLengthQueuingStrategy", "fetch", "EventSource", NULL}},
+      "CountQueuingStrategy", "ByteLengthQueuingStrategy", "fetch", "EventSource", "TextDecoderStream",
+      "TextEncoderStream", "CompressionStream", "DecompressionStream", NULL}},
 };
 
 /* A chunk gives a name its value, unless the page has set it already. */

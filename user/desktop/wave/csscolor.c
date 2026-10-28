@@ -400,6 +400,255 @@ static int color_fn(const char *p, struct rgba *out)
     return 0;
 }
 
+/* ---- relative colors: rgb(from <color> r g b / alpha) and the like ---- */
+
+static double cmax(double a, double b) { return a > b ? a : b; }
+static double cmin(double a, double b) { return a < b ? a : b; }
+
+static void to_lab(struct rgba c, double *L, double *A, double *B)
+{
+    /* linear sRGB to XYZ (D65), adapted to D50 (Bradford), then Lab */
+    double x = 0.4123907993 * c.r + 0.3575843394 * c.g + 0.1804807884 * c.b;
+    double y = 0.2126390059 * c.r + 0.7151686788 * c.g + 0.0721923054 * c.b;
+    double z = 0.0193308187 * c.r + 0.1191947798 * c.g + 0.9505321522 * c.b;
+    double X = 1.0479298208 * x + 0.0229467933 * y - 0.0501922295 * z;
+    double Y = 0.0296278156 * x + 0.9904344268 * y - 0.0170738250 * z;
+    double Z = -0.0092430581 * x + 0.0150551448 * y + 0.7518742899 * z;
+    const double eps = 216.0 / 24389, kappa = 24389.0 / 27;
+    double f[3], v[3] = { X / 0.96422, Y, Z / 0.82521 };
+    for (int i = 0; i < 3; i++)
+        f[i] = v[i] > eps ? cube_root(v[i]) : (kappa * v[i] + 16) / 116;
+    *L = 116 * f[1] - 16;
+    *A = 500 * (f[0] - f[1]);
+    *B = 200 * (f[1] - f[2]);
+}
+
+static void to_hsl(struct rgba c, double *h, double *s, double *l)
+{
+    double r = to_gamma(c.r), g = to_gamma(c.g), b = to_gamma(c.b);
+    double mx = cmax(r, cmax(g, b)), mn = cmin(r, cmin(g, b)), d = mx - mn;
+    *l = (mx + mn) / 2;
+    *s = d == 0 ? 0 : d / (1 - fabs(2 * *l - 1));
+    if (d == 0)
+        *h = 0;
+    else if (mx == r)
+        *h = 60 * fmod((g - b) / d + 6, 6);
+    else if (mx == g)
+        *h = 60 * ((b - r) / d + 2);
+    else
+        *h = 60 * ((r - g) / d + 4);
+}
+
+/* What a relative color's channel keywords stand for, in the space its function names. */
+struct rel {
+    const char *names[3];
+    double val[3], alpha;
+};
+
+/* A channel expression: a keyword, a number (with %, deg...), or calc() of them. */
+static double rel_expr(const char **p, const struct rel *r, int *ok);
+
+static double rel_term(const char **p, const struct rel *r, int *ok)
+{
+    *p = skip(*p);
+    if (!strncasecmp(*p, "calc(", 5) || **p == '(') {
+        *p += **p == '(' ? 1 : 5;
+        double v = rel_expr(p, r, ok);
+        *p = skip(*p);
+        if (**p != ')')
+            *ok = 0;
+        else
+            (*p)++;
+        return v;
+    }
+    if (**p == '-' && !isdigit((unsigned char)(*p)[1]) && (*p)[1] != '.') {
+        (*p)++;
+        return -rel_term(p, r, ok);
+    }
+    if (isalpha((unsigned char)**p)) {
+        const char *q = *p;
+        while (isalpha((unsigned char)*q))
+            q++;
+        int l = (int)(q - *p);
+        for (int i = 0; i < 3; i++)
+            if ((int)strlen(r->names[i]) == l && !strncasecmp(*p, r->names[i], (size_t)l)) {
+                *p = q;
+                return r->val[i];
+            }
+        if (l == 5 && !strncasecmp(*p, "alpha", 5)) {
+            *p = q;
+            return r->alpha;
+        }
+        if (l == 4 && !strncasecmp(*p, "none", 4)) {
+            *p = q;
+            return 0;
+        }
+        *ok = 0;
+        return 0;
+    }
+    struct arg a;
+    int n = read_arg(*p, &a);
+    if (!n) {
+        *ok = 0;
+        return 0;
+    }
+    *p += n;
+    return a.v;
+}
+
+static double rel_product(const char **p, const struct rel *r, int *ok)
+{
+    double v = rel_term(p, r, ok);
+    for (;;) {
+        const char *q = skip(*p);
+        if (*q != '*' && *q != '/')
+            return v;
+        *p = q + 1;
+        double b = rel_term(p, r, ok);
+        v = *q == '*' ? v * b : b != 0 ? v / b : 0;
+    }
+}
+
+static double rel_expr(const char **p, const struct rel *r, int *ok)
+{
+    double v = rel_product(p, r, ok);
+    for (;;) {
+        const char *q = skip(*p);
+        if ((*q != '+' && *q != '-') || !isspace((unsigned char)q[1]))
+            return v;
+        *p = q + 1;
+        double b = rel_product(p, r, ok);
+        v = *q == '+' ? v + b : v - b;
+    }
+}
+
+/* One channel of a relative color; pct100 is what 100% means for it. */
+static double rel_channel(const char **p, const struct rel *r, double pct100, int *ok)
+{
+    *p = skip(*p);
+    struct arg a;
+    const char *q = *p;
+    int n = read_arg(q, &a);
+    if (n && a.pct && (q[n] == ' ' || q[n] == ')' || q[n] == '/' || !q[n])) {
+        *p += n;
+        return a.v / 100 * pct100;
+    }
+    return rel_term(p, r, ok);          /* arithmetic needs calc(): a bare / starts the alpha */
+}
+
+static int relative_color(const char *name, const char *p, struct rgba *out)
+{
+    /* the origin color: a word, or a function with its parentheses */
+    p = skip(p);
+    const char *q = p;
+    while (*q && !isspace((unsigned char)*q) && *q != '(')
+        q++;
+    if (*q == '(') {
+        int depth = 0;
+        do {
+            if (*q == '(') depth++;
+            else if (*q == ')') depth--;
+            q++;
+        } while (*q && depth);
+    }
+    char col[160];
+    if (q - p <= 0 || q - p >= (int)sizeof(col))
+        return -1;
+    memcpy(col, p, (size_t)(q - p));
+    col[q - p] = 0;
+    struct rgba origin;
+    uint32_t packed;
+    if (function_color(col, &origin) < 0) {
+        if (css_parse_color(col, (int)strlen(col), &packed) < 0)
+            return -1;
+        origin = unpack(packed);
+    }
+    struct rel r = { { "r", "g", "b" }, { 0, 0, 0 }, origin.a };
+    int rgb = !strncmp(name, "rgb", 3), hsl = !strncmp(name, "hsl", 3), hwb = !strcmp(name, "hwb");
+    int lab = !strcmp(name, "lab"), lch = !strcmp(name, "lch"), oklab = !strcmp(name, "oklab");
+    int oklch = !strcmp(name, "oklch");
+    double pct[3] = { 255, 255, 255 };
+    if (rgb) {
+        for (int i = 0; i < 3; i++)
+            r.val[i] = to_gamma(i == 0 ? origin.r : i == 1 ? origin.g : origin.b) * 255;
+    } else if (hsl || hwb) {
+        double h, sat, l;
+        to_hsl(origin, &h, &sat, &l);
+        r.names[0] = "h";
+        r.names[1] = hsl ? "s" : "w";
+        r.names[2] = hsl ? "l" : "b";
+        r.val[0] = h;
+        if (hsl) {
+            r.val[1] = sat * 100, r.val[2] = l * 100;
+        } else {
+            double R = to_gamma(origin.r), G = to_gamma(origin.g), B = to_gamma(origin.b);
+            r.val[1] = cmin(R, cmin(G, B)) * 100, r.val[2] = (1 - cmax(R, cmax(G, B))) * 100;
+        }
+        pct[0] = 360, pct[1] = pct[2] = 100;
+    } else if (lab || lch) {
+        double L, A, B;
+        to_lab(origin, &L, &A, &B);
+        r.names[0] = "l";
+        r.val[0] = L, pct[0] = 100;
+        if (lab) {
+            r.names[1] = "a", r.names[2] = "b";
+            r.val[1] = A, r.val[2] = B, pct[1] = pct[2] = 125;
+        } else {
+            r.names[1] = "c", r.names[2] = "h";
+            r.val[1] = sqrt(A * A + B * B), r.val[2] = fmod(atan2(B, A) * 180 / PI + 360, 360);
+            pct[1] = 150, pct[2] = 360;
+        }
+    } else if (oklab || oklch) {
+        double L, A, B;
+        to_oklab(origin, &L, &A, &B);
+        r.names[0] = "l";
+        r.val[0] = L, pct[0] = 1;
+        if (oklab) {
+            r.names[1] = "a", r.names[2] = "b";
+            r.val[1] = A, r.val[2] = B, pct[1] = pct[2] = 0.4;
+        } else {
+            r.names[1] = "c", r.names[2] = "h";
+            r.val[1] = sqrt(A * A + B * B), r.val[2] = fmod(atan2(B, A) * 180 / PI + 360, 360);
+            pct[1] = 0.4, pct[2] = 360;
+        }
+    } else {
+        return -1;
+    }
+    int ok = 1;
+    p = q;
+    double ch[3], alpha = origin.a;
+    for (int i = 0; i < 3; i++)
+        ch[i] = rel_channel(&p, &r, pct[i], &ok);
+    p = skip(p);
+    if (*p == '/') {
+        p++;
+        alpha = rel_channel(&p, &r, 1, &ok);
+        p = skip(p);
+    }
+    if (!ok || *p != ')')
+        return -1;
+    alpha = alpha < 0 ? 0 : alpha > 1 ? 1 : alpha;
+    if (rgb) {
+        struct rgba o = { to_linear(ch[0] / 255), to_linear(ch[1] / 255), to_linear(ch[2] / 255), alpha };
+        *out = o;
+    } else if (hsl) {
+        *out = from_hsl(ch[0], ch[1] / 100, ch[2] / 100, alpha);
+    } else if (hwb) {
+        *out = from_hwb(ch[0], ch[1] / 100, ch[2] / 100, alpha);
+    } else if (lab) {
+        *out = from_lab(ch[0], ch[1], ch[2], alpha);
+    } else if (lch) {
+        double H = ch[2] * PI / 180;
+        *out = from_lab(ch[0], ch[1] * cos(H), ch[1] * sin(H), alpha);
+    } else if (oklab) {
+        *out = from_oklab(ch[0], ch[1], ch[2], alpha);
+    } else {
+        double H = ch[2] * PI / 180;
+        *out = from_oklab(ch[0], ch[1] * cos(H), ch[1] * sin(H), alpha);
+    }
+    return 0;
+}
+
 static int function_color(const char *s, struct rgba *out)
 {
     char name[16];
@@ -412,6 +661,9 @@ static int function_color(const char *s, struct rgba *out)
     if (s[n] != '(')
         return -1;
     const char *p = s + n + 1;
+    const char *from = skip(p);
+    if (!strncasecmp(from, "from", 4) && isspace((unsigned char)from[4]))
+        return relative_color(name, from + 5, out);
     if (!strcmp(name, "color-mix"))
         return color_mix(p, out);
     if (!strcmp(name, "color"))

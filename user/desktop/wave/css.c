@@ -58,123 +58,160 @@ enum prop {
     P_OBJECT_POSITION, P_OVERFLOW_X, P_OVERFLOW_Y, P_TAB_SIZE, P_TEXT_ALIGN_LAST, P_LINE_CLAMP,
     P_LIST_STYLE_IMAGE, P_COUNTER_RESET, P_COUNTER_INCREMENT,
     P_DECO_THICKNESS, P_UNDERLINE_OFFSET, P_BACKGROUND_CLIP, P_BACKGROUND_ATTACHMENT,
+    P_ALL, P_ALIGN_CONTENT, P_GRID_AUTO_COLUMNS, P_TRANSLATE, P_ROTATE, P_SCALE, P_TEXT_WRAP,
 };
 
 static const struct { const char *name; uint8_t prop; } prop_names[] = {
-    { "-moz-appearance", P_IGNORED }, { "-moz-osx-font-smoothing", P_IGNORED },
-    { "-moz-user-select", P_USER_SELECT }, { "-ms-flex", P_FLEX },
-    { "-ms-user-select", P_USER_SELECT }, { "-webkit-align-items", P_ALIGN_ITEMS },
+    { "-moz-appearance", P_IGNORED }, { "-moz-font-feature-settings", P_IGNORED },
+    { "-moz-osx-font-smoothing", P_IGNORED }, { "-moz-text-size-adjust", P_IGNORED },
+    { "-moz-user-select", P_USER_SELECT }, { "-ms-flex", P_FLEX }, { "-ms-overflow-style", P_IGNORED },
+    { "-ms-text-size-adjust", P_IGNORED }, { "-ms-user-select", P_USER_SELECT },
+    { "-webkit-align-content", P_ALIGN_CONTENT }, { "-webkit-align-items", P_ALIGN_ITEMS },
     { "-webkit-align-self", P_ALIGN_SELF }, { "-webkit-appearance", P_IGNORED },
-    { "-webkit-border-radius", P_BORDER_RADIUS }, { "-webkit-box-orient", P_IGNORED },
-    { "-webkit-box-shadow", P_BOX_SHADOW },
-    { "-webkit-box-sizing", P_BOX_SIZING }, { "-webkit-flex", P_FLEX },
+    { "-webkit-backface-visibility", P_IGNORED }, { "-webkit-border-radius", P_BORDER_RADIUS },
+    { "-webkit-box-decoration-break", P_IGNORED }, { "-webkit-box-orient", P_IGNORED },
+    { "-webkit-box-shadow", P_BOX_SHADOW }, { "-webkit-box-sizing", P_BOX_SIZING }, { "-webkit-flex", P_FLEX },
     { "-webkit-flex-basis", P_FLEX_BASIS }, { "-webkit-flex-direction", P_FLEX_DIRECTION },
     { "-webkit-flex-flow", P_FLEX_FLOW }, { "-webkit-flex-grow", P_FLEX_GROW },
     { "-webkit-flex-shrink", P_FLEX_SHRINK }, { "-webkit-flex-wrap", P_FLEX_WRAP },
-    { "-webkit-font-smoothing", P_IGNORED }, { "-webkit-hyphens", P_IGNORED },
-    { "-webkit-justify-content", P_JUSTIFY_CONTENT }, { "-webkit-line-clamp", P_LINE_CLAMP },
-    { "-webkit-mask", P_MASK }, { "-webkit-mask-image", P_MASK }, { "-webkit-order", P_ORDER },
-    { "-webkit-tap-highlight-color", P_IGNORED }, { "-webkit-transform", P_TRANSFORM }, { "-webkit-transform-origin", P_TRANSFORM_ORIGIN },
-    { "-webkit-user-select", P_USER_SELECT }, { "accent-color", P_IGNORED },
-    { "align-items", P_ALIGN_ITEMS }, { "align-self", P_ALIGN_SELF }, { "appearance", P_IGNORED },
-    { "aspect-ratio", P_ASPECT_RATIO }, { "background", P_BACKGROUND },
+    { "-webkit-font-feature-settings", P_IGNORED }, { "-webkit-font-smoothing", P_IGNORED },
+    { "-webkit-hyphens", P_IGNORED }, { "-webkit-justify-content", P_JUSTIFY_CONTENT },
+    { "-webkit-line-clamp", P_LINE_CLAMP }, { "-webkit-mask", P_MASK }, { "-webkit-mask-image", P_MASK },
+    { "-webkit-order", P_ORDER }, { "-webkit-overflow-scrolling", P_IGNORED },
+    { "-webkit-print-color-adjust", P_IGNORED }, { "-webkit-tap-highlight-color", P_IGNORED },
+    { "-webkit-text-size-adjust", P_IGNORED }, { "-webkit-touch-callout", P_IGNORED },
+    { "-webkit-transform", P_TRANSFORM }, { "-webkit-transform-origin", P_TRANSFORM_ORIGIN },
+    { "-webkit-user-drag", P_IGNORED }, { "-webkit-user-select", P_USER_SELECT }, { "accent-color", P_IGNORED },
+    { "align-content", P_ALIGN_CONTENT }, { "align-items", P_ALIGN_ITEMS }, { "align-self", P_ALIGN_SELF },
+    { "alignment-baseline", P_IGNORED }, { "all", P_ALL }, { "appearance", P_IGNORED },
+    { "aspect-ratio", P_ASPECT_RATIO }, { "backface-visibility", P_IGNORED }, { "background", P_BACKGROUND },
     { "background-attachment", P_BACKGROUND_ATTACHMENT }, { "background-clip", P_BACKGROUND_CLIP },
     { "background-color", P_BACKGROUND_COLOR }, { "background-image", P_BACKGROUND_IMAGE },
     { "background-origin", P_BACKGROUND_ORIGIN }, { "background-position", P_BACKGROUND_POSITION },
-    { "background-position-x", P_BACKGROUND_POSITION_X },
-    { "background-position-y", P_BACKGROUND_POSITION_Y }, { "background-repeat", P_BACKGROUND_REPEAT },
-    { "background-size", P_BACKGROUND_SIZE },
-    { "block-size", P_HEIGHT }, { "border", P_BORDER }, { "border-block-end", P_BORDER_BOTTOM },
-    { "border-block-end-color", P_BORDER_BOTTOM_COLOR },
+    { "background-position-x", P_BACKGROUND_POSITION_X }, { "background-position-y", P_BACKGROUND_POSITION_Y },
+    { "background-repeat", P_BACKGROUND_REPEAT }, { "background-size", P_BACKGROUND_SIZE },
+    { "baseline-shift", P_IGNORED }, { "block-size", P_HEIGHT }, { "border", P_BORDER },
+    { "border-block-end", P_BORDER_BOTTOM }, { "border-block-end-color", P_BORDER_BOTTOM_COLOR },
     { "border-block-end-width", P_BORDER_BOTTOM_WIDTH }, { "border-block-start", P_BORDER_TOP },
-    { "border-block-start-color", P_BORDER_TOP_COLOR },
-    { "border-block-start-width", P_BORDER_TOP_WIDTH }, { "border-bottom", P_BORDER_BOTTOM },
-    { "border-bottom-color", P_BORDER_BOTTOM_COLOR },
-    { "border-bottom-left-radius", P_BORDER_BL_RADIUS },
-    { "border-bottom-right-radius", P_BORDER_BR_RADIUS },
-    { "border-bottom-style", P_BORDER_BOTTOM_STYLE },
-    { "border-bottom-width", P_BORDER_BOTTOM_WIDTH }, { "border-collapse", P_BORDER_COLLAPSE },
-    { "border-color", P_BORDER_COLOR }, { "border-end-end-radius", P_BORDER_BR_RADIUS },
-    { "border-end-start-radius", P_BORDER_BL_RADIUS }, { "border-inline-end", P_BORDER_RIGHT },
-    { "border-inline-end-color", P_BORDER_RIGHT_COLOR },
+    { "border-block-start-color", P_BORDER_TOP_COLOR }, { "border-block-start-width", P_BORDER_TOP_WIDTH },
+    { "border-bottom", P_BORDER_BOTTOM }, { "border-bottom-color", P_BORDER_BOTTOM_COLOR },
+    { "border-bottom-left-radius", P_BORDER_BL_RADIUS }, { "border-bottom-right-radius", P_BORDER_BR_RADIUS },
+    { "border-bottom-style", P_BORDER_BOTTOM_STYLE }, { "border-bottom-width", P_BORDER_BOTTOM_WIDTH },
+    { "border-collapse", P_BORDER_COLLAPSE }, { "border-color", P_BORDER_COLOR },
+    { "border-end-end-radius", P_BORDER_BR_RADIUS }, { "border-end-start-radius", P_BORDER_BL_RADIUS },
+    { "border-inline-end", P_BORDER_RIGHT }, { "border-inline-end-color", P_BORDER_RIGHT_COLOR },
     { "border-inline-end-width", P_BORDER_RIGHT_WIDTH }, { "border-inline-start", P_BORDER_LEFT },
-    { "border-inline-start-color", P_BORDER_LEFT_COLOR },
-    { "border-inline-start-width", P_BORDER_LEFT_WIDTH }, { "border-left", P_BORDER_LEFT },
-    { "border-left-color", P_BORDER_LEFT_COLOR }, { "border-left-style", P_BORDER_LEFT_STYLE },
-    { "border-left-width", P_BORDER_LEFT_WIDTH }, { "border-radius", P_BORDER_RADIUS },
-    { "border-right", P_BORDER_RIGHT }, { "border-right-color", P_BORDER_RIGHT_COLOR },
-    { "border-right-style", P_BORDER_RIGHT_STYLE }, { "border-right-width", P_BORDER_RIGHT_WIDTH },
-    { "border-spacing", P_BORDER_SPACING }, { "border-start-end-radius", P_BORDER_TR_RADIUS },
-    { "border-start-start-radius", P_BORDER_TL_RADIUS }, { "border-style", P_BORDER_STYLE },
-    { "border-top", P_BORDER_TOP }, { "border-top-color", P_BORDER_TOP_COLOR },
-    { "border-top-left-radius", P_BORDER_TL_RADIUS },
+    { "border-inline-start-color", P_BORDER_LEFT_COLOR }, { "border-inline-start-width", P_BORDER_LEFT_WIDTH },
+    { "border-left", P_BORDER_LEFT }, { "border-left-color", P_BORDER_LEFT_COLOR },
+    { "border-left-style", P_BORDER_LEFT_STYLE }, { "border-left-width", P_BORDER_LEFT_WIDTH },
+    { "border-radius", P_BORDER_RADIUS }, { "border-right", P_BORDER_RIGHT },
+    { "border-right-color", P_BORDER_RIGHT_COLOR }, { "border-right-style", P_BORDER_RIGHT_STYLE },
+    { "border-right-width", P_BORDER_RIGHT_WIDTH }, { "border-spacing", P_BORDER_SPACING },
+    { "border-start-end-radius", P_BORDER_TR_RADIUS }, { "border-start-start-radius", P_BORDER_TL_RADIUS },
+    { "border-style", P_BORDER_STYLE }, { "border-top", P_BORDER_TOP },
+    { "border-top-color", P_BORDER_TOP_COLOR }, { "border-top-left-radius", P_BORDER_TL_RADIUS },
     { "border-top-right-radius", P_BORDER_TR_RADIUS }, { "border-top-style", P_BORDER_TOP_STYLE },
-    { "border-top-width", P_BORDER_TOP_WIDTH }, { "border-width", P_BORDER_WIDTH },
-    { "bottom", P_BOTTOM }, { "box-shadow", P_BOX_SHADOW }, { "box-sizing", P_BOX_SIZING },
-    { "caption-side", P_CAPTION_SIDE }, { "caret-color", P_IGNORED }, { "clear", P_CLEAR },
-    { "clip", P_CLIP }, { "color", P_COLOR }, { "column-gap", P_COLUMN_GAP },
-    { "content", P_CONTENT }, { "counter-increment", P_COUNTER_INCREMENT },
-    { "counter-reset", P_COUNTER_RESET }, { "cursor", P_CURSOR }, { "display", P_DISPLAY },
-    { "empty-cells", P_EMPTY_CELLS }, { "flex", P_FLEX }, { "flex-basis", P_FLEX_BASIS },
-    { "flex-direction", P_FLEX_DIRECTION }, { "flex-flow", P_FLEX_FLOW },
+    { "border-top-width", P_BORDER_TOP_WIDTH }, { "border-width", P_BORDER_WIDTH }, { "bottom", P_BOTTOM },
+    { "box-decoration-break", P_IGNORED }, { "box-shadow", P_BOX_SHADOW }, { "box-sizing", P_BOX_SIZING },
+    { "break-after", P_IGNORED }, { "break-before", P_IGNORED }, { "break-inside", P_IGNORED },
+    { "caption-side", P_CAPTION_SIDE }, { "caret-color", P_IGNORED }, { "clear", P_CLEAR }, { "clip", P_CLIP },
+    { "color", P_COLOR }, { "color-interpolation", P_IGNORED }, { "color-interpolation-filters", P_IGNORED },
+    { "color-rendering", P_IGNORED }, { "color-scheme", P_IGNORED }, { "column-gap", P_COLUMN_GAP },
+    { "contain", P_IGNORED }, { "contain-intrinsic-block-size", P_IGNORED },
+    { "contain-intrinsic-height", P_IGNORED }, { "contain-intrinsic-inline-size", P_IGNORED },
+    { "contain-intrinsic-size", P_IGNORED }, { "contain-intrinsic-width", P_IGNORED },
+    { "container", P_IGNORED }, { "container-name", P_IGNORED }, { "container-type", P_IGNORED },
+    { "content", P_CONTENT }, { "content-visibility", P_IGNORED }, { "counter-increment", P_COUNTER_INCREMENT },
+    { "counter-reset", P_COUNTER_RESET }, { "counter-set", P_IGNORED }, { "cursor", P_CURSOR },
+    { "display", P_DISPLAY }, { "dominant-baseline", P_IGNORED }, { "dynamic-range-limit", P_IGNORED },
+    { "empty-cells", P_EMPTY_CELLS }, { "field-sizing", P_IGNORED }, { "flex", P_FLEX },
+    { "flex-basis", P_FLEX_BASIS }, { "flex-direction", P_FLEX_DIRECTION }, { "flex-flow", P_FLEX_FLOW },
     { "flex-grow", P_FLEX_GROW }, { "flex-shrink", P_FLEX_SHRINK }, { "flex-wrap", P_FLEX_WRAP },
-    { "float", P_FLOAT }, { "font", P_FONT }, { "font-family", P_FONT_FAMILY },
-    { "font-size", P_FONT_SIZE }, { "font-style", P_FONT_STYLE },
-    { "font-variant", P_FONT_VARIANT }, { "font-variant-caps", P_FONT_VARIANT },
-    { "font-weight", P_FONT_WEIGHT }, { "gap", P_GAP }, { "grid-area", P_GRID_AREA },
-    { "grid-auto-flow", P_GRID_AUTO_FLOW }, { "grid-auto-rows", P_GRID_AUTO_ROWS },
-    { "grid-column", P_GRID_COLUMN }, { "grid-column-end", P_GRID_COLUMN_END },
-    { "grid-column-gap", P_COLUMN_GAP }, { "grid-column-start", P_GRID_COLUMN_START },
-    { "grid-gap", P_GAP }, { "grid-row", P_GRID_ROW }, { "grid-row-end", P_GRID_ROW_END },
-    { "grid-row-gap", P_ROW_GAP }, { "grid-row-start", P_GRID_ROW_START },
+    { "float", P_FLOAT }, { "font", P_FONT }, { "font-display", P_IGNORED }, { "font-family", P_FONT_FAMILY },
+    { "font-feature-settings", P_IGNORED }, { "font-kerning", P_IGNORED },
+    { "font-language-override", P_IGNORED }, { "font-optical-sizing", P_IGNORED },
+    { "font-palette", P_IGNORED }, { "font-size", P_FONT_SIZE }, { "font-size-adjust", P_IGNORED },
+    { "font-smooth", P_IGNORED }, { "font-style", P_FONT_STYLE }, { "font-synthesis", P_IGNORED },
+    { "font-synthesis-small-caps", P_IGNORED }, { "font-synthesis-style", P_IGNORED },
+    { "font-synthesis-weight", P_IGNORED }, { "font-variant", P_FONT_VARIANT },
+    { "font-variant-alternates", P_IGNORED }, { "font-variant-caps", P_FONT_VARIANT },
+    { "font-variant-east-asian", P_IGNORED }, { "font-variant-ligatures", P_IGNORED },
+    { "font-variant-numeric", P_IGNORED }, { "font-variant-position", P_IGNORED },
+    { "font-variation-settings", P_IGNORED }, { "font-weight", P_FONT_WEIGHT },
+    { "forced-color-adjust", P_IGNORED }, { "gap", P_GAP }, { "grid-area", P_GRID_AREA },
+    { "grid-auto-columns", P_GRID_AUTO_COLUMNS }, { "grid-auto-flow", P_GRID_AUTO_FLOW },
+    { "grid-auto-rows", P_GRID_AUTO_ROWS }, { "grid-column", P_GRID_COLUMN },
+    { "grid-column-end", P_GRID_COLUMN_END }, { "grid-column-gap", P_COLUMN_GAP },
+    { "grid-column-start", P_GRID_COLUMN_START }, { "grid-gap", P_GAP }, { "grid-row", P_GRID_ROW },
+    { "grid-row-end", P_GRID_ROW_END }, { "grid-row-gap", P_ROW_GAP }, { "grid-row-start", P_GRID_ROW_START },
     { "grid-template", P_GRID_TEMPLATE }, { "grid-template-areas", P_GRID_TEMPLATE_AREAS },
-    { "grid-template-columns", P_GRID_TEMPLATE_COLUMNS },
-    { "grid-template-rows", P_GRID_TEMPLATE_ROWS }, { "height", P_HEIGHT }, { "hyphens", P_IGNORED },
-    { "inline-size", P_WIDTH }, { "inset", P_INSET }, { "inset-block", P_INSET_BLOCK },
-    { "inset-block-end", P_BOTTOM }, { "inset-block-start", P_TOP },
-    { "inset-inline", P_INSET_INLINE }, { "inset-inline-end", P_RIGHT },
-    { "inset-inline-start", P_LEFT }, { "justify-content", P_JUSTIFY_CONTENT },
+    { "grid-template-columns", P_GRID_TEMPLATE_COLUMNS }, { "grid-template-rows", P_GRID_TEMPLATE_ROWS },
+    { "hanging-punctuation", P_IGNORED }, { "height", P_HEIGHT }, { "hyphens", P_IGNORED },
+    { "image-rendering", P_IGNORED }, { "inline-size", P_WIDTH }, { "inset", P_INSET },
+    { "inset-block", P_INSET_BLOCK }, { "inset-block-end", P_BOTTOM }, { "inset-block-start", P_TOP },
+    { "inset-inline", P_INSET_INLINE }, { "inset-inline-end", P_RIGHT }, { "inset-inline-start", P_LEFT },
+    { "interpolate-size", P_IGNORED }, { "isolation", P_IGNORED }, { "justify-content", P_JUSTIFY_CONTENT },
     { "justify-items", P_JUSTIFY_ITEMS }, { "justify-self", P_JUSTIFY_SELF }, { "left", P_LEFT },
-    { "letter-spacing", P_LETTER_SPACING }, { "line-height", P_LINE_HEIGHT },
-    { "list-style", P_LIST_STYLE }, { "list-style-image", P_LIST_STYLE_IMAGE },
-    { "list-style-position", P_LIST_STYLE_POSITION },
-    { "list-style-type", P_LIST_STYLE_TYPE }, { "margin", P_MARGIN },
-    { "margin-block", P_MARGIN_BLOCK }, { "margin-block-end", P_MARGIN_BOTTOM },
-    { "margin-block-start", P_MARGIN_TOP }, { "margin-bottom", P_MARGIN_BOTTOM },
-    { "margin-inline", P_MARGIN_INLINE }, { "margin-inline-end", P_MARGIN_RIGHT },
-    { "margin-inline-start", P_MARGIN_LEFT }, { "margin-left", P_MARGIN_LEFT },
-    { "margin-right", P_MARGIN_RIGHT }, { "margin-top", P_MARGIN_TOP }, { "mask", P_MASK },
-    { "mask-image", P_MASK }, { "max-block-size", P_MAX_HEIGHT }, { "max-height", P_MAX_HEIGHT },
-    { "max-inline-size", P_MAX_WIDTH }, { "max-width", P_MAX_WIDTH },
-    { "min-block-size", P_MIN_HEIGHT }, { "min-height", P_MIN_HEIGHT },
-    { "min-inline-size", P_MIN_WIDTH }, { "min-width", P_MIN_WIDTH }, { "object-fit", P_OBJECT_FIT },
-    { "object-position", P_OBJECT_POSITION }, { "opacity", P_OPACITY },
-    { "order", P_ORDER }, { "outline", P_OUTLINE }, { "outline-color", P_OUTLINE_COLOR },
-    { "outline-offset", P_OUTLINE_OFFSET }, { "outline-style", P_OUTLINE_STYLE },
-    { "outline-width", P_OUTLINE_WIDTH }, { "overflow", P_OVERFLOW },
-    { "overflow-wrap", P_OVERFLOW_WRAP }, { "overflow-x", P_OVERFLOW_X },
-    { "overflow-y", P_OVERFLOW_Y }, { "padding", P_PADDING }, { "padding-block", P_PADDING_BLOCK },
+    { "letter-spacing", P_LETTER_SPACING }, { "line-break", P_IGNORED }, { "line-clamp", P_LINE_CLAMP },
+    { "line-height", P_LINE_HEIGHT }, { "list-style", P_LIST_STYLE },
+    { "list-style-image", P_LIST_STYLE_IMAGE }, { "list-style-position", P_LIST_STYLE_POSITION },
+    { "list-style-type", P_LIST_STYLE_TYPE }, { "margin", P_MARGIN }, { "margin-block", P_MARGIN_BLOCK },
+    { "margin-block-end", P_MARGIN_BOTTOM }, { "margin-block-start", P_MARGIN_TOP },
+    { "margin-bottom", P_MARGIN_BOTTOM }, { "margin-inline", P_MARGIN_INLINE },
+    { "margin-inline-end", P_MARGIN_RIGHT }, { "margin-inline-start", P_MARGIN_LEFT },
+    { "margin-left", P_MARGIN_LEFT }, { "margin-right", P_MARGIN_RIGHT }, { "margin-top", P_MARGIN_TOP },
+    { "margin-trim", P_IGNORED }, { "mask", P_MASK }, { "mask-image", P_MASK }, { "mask-type", P_IGNORED },
+    { "math-depth", P_IGNORED }, { "math-style", P_IGNORED }, { "max-block-size", P_MAX_HEIGHT },
+    { "max-height", P_MAX_HEIGHT }, { "max-inline-size", P_MAX_WIDTH }, { "max-width", P_MAX_WIDTH },
+    { "min-block-size", P_MIN_HEIGHT }, { "min-height", P_MIN_HEIGHT }, { "min-inline-size", P_MIN_WIDTH },
+    { "min-width", P_MIN_WIDTH }, { "object-fit", P_OBJECT_FIT }, { "object-position", P_OBJECT_POSITION },
+    { "opacity", P_OPACITY }, { "order", P_ORDER }, { "orphans", P_IGNORED }, { "outline", P_OUTLINE },
+    { "outline-color", P_OUTLINE_COLOR }, { "outline-offset", P_OUTLINE_OFFSET },
+    { "outline-style", P_OUTLINE_STYLE }, { "outline-width", P_OUTLINE_WIDTH }, { "overflow", P_OVERFLOW },
+    { "overflow-anchor", P_IGNORED }, { "overflow-clip-margin", P_IGNORED },
+    { "overflow-wrap", P_OVERFLOW_WRAP }, { "overflow-x", P_OVERFLOW_X }, { "overflow-y", P_OVERFLOW_Y },
+    { "overscroll-behavior", P_IGNORED }, { "overscroll-behavior-block", P_IGNORED },
+    { "overscroll-behavior-inline", P_IGNORED }, { "overscroll-behavior-x", P_IGNORED },
+    { "overscroll-behavior-y", P_IGNORED }, { "padding", P_PADDING }, { "padding-block", P_PADDING_BLOCK },
     { "padding-block-end", P_PADDING_BOTTOM }, { "padding-block-start", P_PADDING_TOP },
     { "padding-bottom", P_PADDING_BOTTOM }, { "padding-inline", P_PADDING_INLINE },
     { "padding-inline-end", P_PADDING_RIGHT }, { "padding-inline-start", P_PADDING_LEFT },
-    { "padding-left", P_PADDING_LEFT }, { "padding-right", P_PADDING_RIGHT },
-    { "padding-top", P_PADDING_TOP }, { "place-content", P_PLACE_CONTENT },
-    { "place-items", P_PLACE_ITEMS }, { "place-self", P_PLACE_SELF },
-    { "pointer-events", P_POINTER_EVENTS }, { "position", P_POSITION }, { "resize", P_IGNORED }, { "right", P_RIGHT },
-    { "row-gap", P_ROW_GAP }, { "scroll-behavior", P_IGNORED }, { "tab-size", P_TAB_SIZE },
-    { "table-layout", P_TABLE_LAYOUT }, { "text-align", P_TEXT_ALIGN },
-    { "text-align-last", P_TEXT_ALIGN_LAST }, { "text-decoration", P_TEXT_DECORATION },
-    { "text-decoration-color", P_TEXT_DECORATION_COLOR },
-    { "text-decoration-line", P_TEXT_DECORATION_LINE },
-    { "text-decoration-style", P_TEXT_DECORATION_STYLE },
+    { "padding-left", P_PADDING_LEFT }, { "padding-right", P_PADDING_RIGHT }, { "padding-top", P_PADDING_TOP },
+    { "page-break-after", P_IGNORED }, { "page-break-before", P_IGNORED }, { "page-break-inside", P_IGNORED },
+    { "paint-order", P_IGNORED }, { "perspective", P_IGNORED }, { "perspective-origin", P_IGNORED },
+    { "place-content", P_PLACE_CONTENT }, { "place-items", P_PLACE_ITEMS }, { "place-self", P_PLACE_SELF },
+    { "pointer-events", P_POINTER_EVENTS }, { "position", P_POSITION }, { "print-color-adjust", P_IGNORED },
+    { "quotes", P_IGNORED }, { "resize", P_IGNORED }, { "right", P_RIGHT }, { "rotate", P_ROTATE },
+    { "row-gap", P_ROW_GAP }, { "ruby-align", P_IGNORED }, { "ruby-position", P_IGNORED }, { "scale", P_SCALE },
+    { "scroll-behavior", P_IGNORED }, { "scroll-margin", P_IGNORED }, { "scroll-margin-block", P_IGNORED },
+    { "scroll-margin-bottom", P_IGNORED }, { "scroll-margin-inline", P_IGNORED },
+    { "scroll-margin-left", P_IGNORED }, { "scroll-margin-right", P_IGNORED },
+    { "scroll-margin-top", P_IGNORED }, { "scroll-padding", P_IGNORED }, { "scroll-padding-block", P_IGNORED },
+    { "scroll-padding-bottom", P_IGNORED }, { "scroll-padding-inline", P_IGNORED },
+    { "scroll-padding-left", P_IGNORED }, { "scroll-padding-right", P_IGNORED },
+    { "scroll-padding-top", P_IGNORED }, { "scroll-snap-align", P_IGNORED }, { "scroll-snap-stop", P_IGNORED },
+    { "scroll-snap-type", P_IGNORED }, { "scrollbar-color", P_IGNORED }, { "scrollbar-gutter", P_IGNORED },
+    { "scrollbar-width", P_IGNORED }, { "shape-rendering", P_IGNORED }, { "speak", P_IGNORED },
+    { "speak-as", P_IGNORED }, { "tab-size", P_TAB_SIZE }, { "table-layout", P_TABLE_LAYOUT },
+    { "text-align", P_TEXT_ALIGN }, { "text-align-last", P_TEXT_ALIGN_LAST }, { "text-anchor", P_IGNORED },
+    { "text-box", P_IGNORED }, { "text-box-edge", P_IGNORED }, { "text-box-trim", P_IGNORED },
+    { "text-decoration", P_TEXT_DECORATION }, { "text-decoration-color", P_TEXT_DECORATION_COLOR },
+    { "text-decoration-line", P_TEXT_DECORATION_LINE }, { "text-decoration-skip", P_IGNORED },
+    { "text-decoration-skip-ink", P_IGNORED }, { "text-decoration-style", P_TEXT_DECORATION_STYLE },
     { "text-decoration-thickness", P_DECO_THICKNESS }, { "text-indent", P_TEXT_INDENT },
-    { "text-overflow", P_TEXT_OVERFLOW }, { "text-rendering", P_IGNORED },
-    { "text-shadow", P_TEXT_SHADOW }, { "text-transform", P_TEXT_TRANSFORM },
-    { "text-underline-offset", P_UNDERLINE_OFFSET }, { "top", P_TOP }, { "transform", P_TRANSFORM }, { "transform-origin", P_TRANSFORM_ORIGIN },
-    { "user-select", P_USER_SELECT }, { "vertical-align", P_VERTICAL_ALIGN },
-    { "visibility", P_VISIBILITY }, { "white-space", P_WHITE_SPACE }, { "width", P_WIDTH },
-    { "will-change", P_IGNORED }, { "word-break", P_WORD_BREAK },
+    { "text-justify", P_IGNORED }, { "text-overflow", P_TEXT_OVERFLOW }, { "text-rendering", P_IGNORED },
+    { "text-shadow", P_TEXT_SHADOW }, { "text-size-adjust", P_IGNORED }, { "text-transform", P_TEXT_TRANSFORM },
+    { "text-underline-offset", P_UNDERLINE_OFFSET }, { "text-underline-position", P_IGNORED },
+    { "text-wrap", P_TEXT_WRAP }, { "text-wrap-mode", P_TEXT_WRAP }, { "text-wrap-style", P_IGNORED },
+    { "top", P_TOP }, { "touch-action", P_IGNORED }, { "transform", P_TRANSFORM },
+    { "transform-box", P_IGNORED }, { "transform-origin", P_TRANSFORM_ORIGIN },
+    { "transform-style", P_IGNORED }, { "translate", P_TRANSLATE }, { "unicode-bidi", P_IGNORED },
+    { "user-select", P_USER_SELECT }, { "vector-effect", P_IGNORED }, { "vertical-align", P_VERTICAL_ALIGN },
+    { "view-transition-class", P_IGNORED }, { "view-transition-name", P_IGNORED },
+    { "visibility", P_VISIBILITY }, { "white-space", P_WHITE_SPACE }, { "white-space-collapse", P_IGNORED },
+    { "widows", P_IGNORED }, { "width", P_WIDTH }, { "will-change", P_IGNORED }, { "word-break", P_WORD_BREAK },
     { "word-spacing", P_WORD_SPACING }, { "word-wrap", P_OVERFLOW_WRAP }, { "z-index", P_Z_INDEX },
+    { "zoom", P_IGNORED },
 };
 
 /* ---- selectors and rules ---- */
@@ -292,8 +329,10 @@ static const char ua_css[] =
     " h4, h5, h6, hgroup, nav, section, dl, dt, dd, ol, ul, menu, dir, fieldset, details,"
     " summary, frameset, frame, noframes, optgroup { display: block }"
     "head, script, style, link, meta, title, base, template, param, area, map, source, track,"
-    " datalist, object, embed, video, audio, col, colgroup, option,"
+    " datalist, embed, audio:not([controls]), col, colgroup, option,"
     " input[type=hidden], [hidden], noembed, noscript, dialog:not([open]), datalist { display: none }"
+    /* <video> and <audio controls> are boxes that offer the file (layout.c); an <object> shows
+     * what it holds for browsers that cannot show it */
     "li { display: list-item }"
     "table { display: table; border-spacing: 2px; text-indent: 0 }"
     "caption { display: table-caption; text-align: center }"
@@ -627,7 +666,12 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
                 *spec += 1 + list_specificity(c->slot_args, c->nslot);
                 continue;
             }
-            if (element || !strcmp(name, "first-line") || !strcmp(name, "first-letter"))
+            if (!strcmp(name, "first-letter") || !strcmp(name, "first-line")) {
+                c->pe = name[7] == 'e' ? PE_FIRST_LETTER : PE_FIRST_LINE;      /* (one colon or two) */
+                *spec += 1;
+                continue;
+            }
+            if (element)
                 return NULL;            /* other pseudo-elements: not generated */
             if (!strcmp(name, "host")) {
                 c->host = 1;
@@ -1286,6 +1330,7 @@ static int word_at(const char *p, const char *e, const char *w)
 
 /* (property: value): a property we know, with a value it can take. */
 static int transform_supported(const char *value);
+static int individual_supported(int prop, const char *value);
 static int supports_decl(const char *ns, const char *ne, const char *vs, const char *ve)
 {
     while (ns < ne && isspace((unsigned char)*ns))
@@ -1320,13 +1365,17 @@ static int supports_decl(const char *ns, const char *ne, const char *vs, const c
         static const char *const ok[] = { "none", "block", "inline", "inline-block", "flex", "inline-flex", "grid",
             "inline-grid", "table", "inline-table", "table-row", "table-cell", "table-row-group",
             "table-header-group", "table-footer-group", "table-caption", "table-column", "table-column-group",
-            "list-item", "contents", "flow-root", "run-in", "-webkit-box", "-webkit-flex", "-ms-flexbox", NULL };
+            "list-item", "contents", "flow-root", "run-in", "-webkit-box", "-webkit-flex", "-ms-flexbox", "ruby",
+            "ruby-text", "ruby-base", "ruby-base-container", "ruby-text-container", "block flex", "inline flex",
+            "block grid", "inline grid", "block flow", "inline flow", "block flow-root", "inline flow-root",
+            "inline list-item", NULL };
         for (int i = 0; ok[i]; i++)
             if (!strcasecmp(value, ok[i]))
                 return 1;
         return 0;
     }
     case P_TRANSFORM: return transform_supported(value);
+    case P_TRANSLATE: case P_ROTATE: case P_SCALE: return individual_supported(prop, value);
     case P_POSITION:
         return !strcasecmp(value, "static") || !strcasecmp(value, "relative") || !strcasecmp(value, "absolute") ||
                !strcasecmp(value, "fixed") || !strcasecmp(value, "sticky") || !strcasecmp(value, "-webkit-sticky");
@@ -2430,7 +2479,15 @@ static int match_from(const struct selector *s, int i, const struct node *n, con
 struct vctx {                   /* what relative units are relative to */
     int font_size, root_font_size, vw, vh;
     struct arena *a;            /* for values kept in the style (grid tracks) */
+    int lh, root_lh;            /* the line height (lh units) and the root's (rlh); 0: 1.2em */
 };
+
+/* A style's line height in pixels, for lh units: normal counts as 1.2. */
+static int line_px(const struct style *st)
+{
+    return st->lh_kind == LH_PX ? st->lh : st->lh_kind == LH_FACTOR ? st->font_size * st->lh / 100
+         : st->font_size * 6 / 5;
+}
 
 static const struct named_color {
     const char *name;
@@ -2588,6 +2645,10 @@ int css_parse_color(const char *s, int n, uint32_t *out)
         if (!p)
             return -1;
         p++;
+        while (*p == ' ')
+            p++;
+        if (!strncmp(p, "from ", 5))
+            return css_color_function(buf, out);   /* a relative color (csscolor.c) */
         int v[4] = { 0, 0, 0, 100 }, pct[4] = { 0 }, k = 0;
         while (*p && *p != ')' && k < 4) {
             while (*p == ' ' || *p == ',' || *p == '/')
@@ -2646,19 +2707,28 @@ int css_parse_color(const char *s, int n, uint32_t *out)
         else
             hi = mid - 1;
     }
-    /* The Windows system colors some old pages use. */
-    if (!strcmp(buf, "buttonface") || !strcmp(buf, "threedface") || !strcmp(buf, "menu")) {
-        *out = OPAQUE(0xc0c0c0);
-        return 0;
-    }
-    if (!strcmp(buf, "window") || !strcmp(buf, "canvas")) {
-        *out = OPAQUE(0xffffff);
-        return 0;
-    }
-    if (!strcmp(buf, "windowtext") || !strcmp(buf, "buttontext") || !strcmp(buf, "canvastext")) {
-        *out = OPAQUE(0x000000);
-        return 0;
-    }
+    /* System colors (CSS Color 4's, and the older Windows ones some pages use), in light mode. */
+    static const struct named_color system_colors[] = {
+        { "accentcolor", 0x0a64d6 }, { "accentcolortext", 0xffffff }, { "activeborder", 0xc0c0c0 },
+        { "activecaption", 0x000080 }, { "activetext", 0xee0000 }, { "appworkspace", 0x808080 },
+        { "background", 0x008080 }, { "buttonborder", 0x767676 }, { "buttonface", 0xc0c0c0 },
+        { "buttonhighlight", 0xffffff }, { "buttonshadow", 0x808080 }, { "buttontext", 0x000000 },
+        { "canvas", 0xffffff }, { "canvastext", 0x000000 }, { "captiontext", 0xffffff }, { "field", 0xffffff },
+        { "fieldtext", 0x000000 }, { "graytext", 0x6d6d6d }, { "highlight", 0x0a64d6 },
+        { "highlighttext", 0xffffff }, { "inactiveborder", 0xc0c0c0 }, { "inactivecaption", 0x808080 },
+        { "inactivecaptiontext", 0xc0c0c0 }, { "infobackground", 0xffffe1 }, { "infotext", 0x000000 },
+        { "linktext", 0x0000ee }, { "mark", 0xffff00 }, { "marktext", 0x000000 }, { "menu", 0xc0c0c0 },
+        { "menutext", 0x000000 }, { "scrollbar", 0xc0c0c0 }, { "selecteditem", 0x0a64d6 },
+        { "selecteditemtext", 0xffffff }, { "threeddarkshadow", 0x000000 }, { "threedface", 0xc0c0c0 },
+        { "threedhighlight", 0xffffff }, { "threedlightshadow", 0xdfdfdf }, { "threedshadow", 0x808080 },
+        { "visitedtext", 0x551a8b }, { "window", 0xffffff }, { "windowframe", 0x000000 },
+        { "windowtext", 0x000000 },
+    };
+    for (size_t i = 0; i < sizeof(system_colors) / sizeof(system_colors[0]); i++)
+        if (!strcmp(buf, system_colors[i].name)) {
+            *out = OPAQUE(system_colors[i].rgb);
+            return 0;
+        }
     return -1;
 }
 
@@ -2673,6 +2743,14 @@ static int unit_px100(const char *unit, long num, const struct vctx *v, long *ou
         px = num * v->font_size, absolute = 0;      /* the font size is zoomed already */
     else if (!strcmp(unit, "rem"))
         px = num * v->root_font_size, absolute = 0;
+    else if (!strcmp(unit, "lh"))
+        px = num * (v->lh ? v->lh : v->font_size * 6 / 5), absolute = 0;
+    else if (!strcmp(unit, "rlh"))
+        px = num * (v->root_lh ? v->root_lh : v->root_font_size * 6 / 5), absolute = 0;
+    else if (!strcmp(unit, "ic"))
+        px = num * v->font_size, absolute = 0;         /* a CJK ideograph: about an em */
+    else if (!strcmp(unit, "cap"))
+        px = num * v->font_size * 7 / 10, absolute = 0;
     else if (!strcmp(unit, "ex") || !strcmp(unit, "ch"))
         px = num * v->font_size / 2, absolute = 0;
     else if (!strcmp(unit, "pt"))
@@ -2685,13 +2763,17 @@ static int unit_px100(const char *unit, long num, const struct vctx *v, long *ou
         px = num * 96 * 100 / 254;
     else if (!strcmp(unit, "mm"))
         px = num * 96 * 10 / 254;
-    else if (!strcmp(unit, "vw") || !strcmp(unit, "dvw") || !strcmp(unit, "svw") || !strcmp(unit, "lvw"))
+    else if (!strcmp(unit, "vw") || !strcmp(unit, "dvw") || !strcmp(unit, "svw") || !strcmp(unit, "lvw") ||
+             !strcmp(unit, "vi") || !strcmp(unit, "cqw") || !strcmp(unit, "cqi"))      /* no containers: the viewport */
         px = num * v->vw / 100, absolute = 0;
-    else if (!strcmp(unit, "vh") || !strcmp(unit, "dvh") || !strcmp(unit, "svh") || !strcmp(unit, "lvh"))
+    else if (!strcmp(unit, "vh") || !strcmp(unit, "dvh") || !strcmp(unit, "svh") || !strcmp(unit, "lvh") ||
+             !strcmp(unit, "vb") || !strcmp(unit, "cqh") || !strcmp(unit, "cqb"))
         px = num * v->vh / 100, absolute = 0;
-    else if (!strcmp(unit, "vmin"))
+    else if (!strcmp(unit, "vmin") || !strcmp(unit, "cqmin") || !strcmp(unit, "dvmin") || !strcmp(unit, "svmin") ||
+             !strcmp(unit, "lvmin"))
         px = num * (v->vw < v->vh ? v->vw : v->vh) / 100, absolute = 0;
-    else if (!strcmp(unit, "vmax"))
+    else if (!strcmp(unit, "vmax") || !strcmp(unit, "cqmax") || !strcmp(unit, "dvmax") || !strcmp(unit, "svmax") ||
+             !strcmp(unit, "lvmax"))
         px = num * (v->vw > v->vh ? v->vw : v->vh) / 100, absolute = 0;
     else
         return 0;
@@ -2706,6 +2788,7 @@ struct cval {
     int num;                    /* a plain number (times 100), held in px */
     int ok;
     int pick;                   /* 1 the smaller, 2 the larger of px and pct (not a sum) */
+    int angle;                  /* a number that is an angle, in degrees (times 100) */
 };
 
 /* A value to do arithmetic on: a pick of px and percent becomes the percent. */
@@ -2740,7 +2823,7 @@ static struct cval calc_pick(struct cval a, struct cval b, int larger)
     if (!a.px && !b.px)
         return (larger ? a.pct >= b.pct : a.pct <= b.pct) ? a : b;
     if ((!a.pct && !b.px) || (!a.px && !b.pct)) {
-        struct cval r = { a.px + b.px, a.pct + b.pct, 0, 1, larger ? 2 : 1 };
+        struct cval r = { a.px + b.px, a.pct + b.pct, 0, 1, larger ? 2 : 1, 0 };
         return r;
     }
     return a.pct ? a : b;
@@ -2749,7 +2832,7 @@ static struct cval calc_pick(struct cval a, struct cval b, int larger)
 /* min(a, b, ...) (kind 0), max(...) (1) or clamp(lo, val, hi) (2), *p past the '('. */
 static struct cval calc_func(const char **p, const struct vctx *v, int kind)
 {
-    struct cval args[8], r = { 0, 0, 0, 0, 0 };
+    struct cval args[8], r = { 0, 0, 0, 0, 0, 0 };
     int n = 0;
     for (;;) {
         struct cval a = calc_sum(p, v);
@@ -2771,12 +2854,174 @@ static struct cval calc_func(const char **p, const struct vctx *v, int kind)
     return r;
 }
 
+/* The comma-separated arguments of a math function, *p past its '('; returns how many (-1 if broken). */
+static int calc_args(const char **p, const struct vctx *v, struct cval *args, int max)
+{
+    int n = 0;
+    for (;;) {
+        struct cval a = calc_flat(calc_sum(p, v));
+        if (n < max)
+            args[n++] = a;
+        calc_ws(p);
+        if (**p != ',')
+            break;
+        (*p)++;
+    }
+    if (**p != ')')
+        return -1;
+    (*p)++;
+    return n;
+}
+
+static struct cval calc_number(double x, int angle)
+{
+    struct cval r = { 0, 0, 1, 1, 0, angle };
+    if (x != x)
+        x = 0;                          /* NaN */
+    if (x > 1e7)
+        x = 1e7;
+    if (x < -1e7)
+        x = -1e7;
+    r.px = (long)(x * 100 + (x < 0 ? -0.5 : 0.5));
+    return r;
+}
+
+/* A value's magnitude to compare or divide with another's of the same kind: its pixels, its
+ * percentage, or its number. -1 in *kind when it is a mix (10px + 5%), which cannot be. */
+static double calc_scalar(struct cval a, int *kind)
+{
+    if (a.pct && a.px && !a.num) {
+        *kind = -1;
+        return 0;
+    }
+    *kind = a.num ? 0 : a.pct ? 2 : 1;
+    return a.pct && !a.num ? a.pct / 100.0 : a.px / 100.0;
+}
+
+static struct cval calc_like(struct cval like, double x)
+{
+    struct cval r = like;
+    long v = (long)(x * 100 + (x < 0 ? -0.5 : 0.5));
+    r.pick = 0;
+    if (like.pct && !like.num)
+        r.pct = v, r.px = 0;
+    else
+        r.px = v, r.pct = 0;
+    return r;
+}
+
+/* round(), mod(), rem(), abs(), sign(), the trigonometric functions, pow(), sqrt(), hypot(), log() and exp(). */
+static struct cval calc_math(const char **p, const struct vctx *v, const char *fn)
+{
+    struct cval bad = { 0, 0, 0, 0, 0, 0 }, a[8];
+    int strategy = 0;                   /* round(): 0 nearest, 1 up, 2 down, 3 to-zero */
+    if (!strcmp(fn, "round")) {
+        static const char *const names[] = { "nearest", "up", "down", "to-zero" };
+        calc_ws(p);
+        for (int k = 0; k < 4; k++) {
+            size_t l = strlen(names[k]);
+            if (!strncasecmp(*p, names[k], l) && ((*p)[l] == ',' || isspace((unsigned char)(*p)[l]))) {
+                strategy = k;
+                *p += l;
+                calc_ws(p);
+                if (**p == ',')
+                    (*p)++;
+                break;
+            }
+        }
+    }
+    int n = calc_args(p, v, a, 8);
+    if (n < 1)
+        return bad;
+    for (int i = 0; i < n; i++)
+        if (!a[i].ok)
+            return bad;
+    int k0, k1;
+    double x = calc_scalar(a[0], &k0);
+    if (k0 < 0)
+        return bad;
+    if (!strcmp(fn, "abs"))
+        return calc_like(a[0], fabs(x));
+    if (!strcmp(fn, "sign"))
+        return calc_number(x > 0 ? 1 : x < 0 ? -1 : 0, 0);
+    if (!strcmp(fn, "round") || !strcmp(fn, "mod") || !strcmp(fn, "rem")) {
+        double y = 1;
+        if (n >= 2) {
+            y = calc_scalar(a[1], &k1);
+            if (k1 < 0 || (k1 != k0 && k1 && k0))
+                return bad;
+        } else if (strcmp(fn, "round")) {
+            return bad;
+        }
+        if (y == 0)
+            return bad;
+        double q = x / y, r;
+        if (!strcmp(fn, "round")) {
+            double f = floor(q);
+            r = strategy == 1 ? ceil(q) : strategy == 2 ? f : strategy == 3 ? (q < 0 ? ceil(q) : f)
+              : (q - f >= 0.5 ? f + 1 : f);
+            return calc_like(a[0], r * y);
+        }
+        r = fmod(x, y);                 /* rem: the sign of x */
+        if (!strcmp(fn, "mod") && r != 0 && (r < 0) != (y < 0))
+            r += y;                     /* mod: the sign of y */
+        return calc_like(a[0], r);
+    }
+    if (!strcmp(fn, "hypot")) {
+        double sum = 0;
+        for (int i = 0; i < n; i++) {
+            double t = calc_scalar(a[i], &k1);
+            if (k1 < 0 || (k1 != k0 && k1 && k0))
+                return bad;
+            sum += t * t;
+        }
+        return calc_like(a[0], sqrt(sum));
+    }
+    /* the rest take numbers (and angles) */
+    double rad = a[0].angle ? x * M_PI / 180 : x;
+    if (!strcmp(fn, "sin")) return calc_number(sin(rad), 0);
+    if (!strcmp(fn, "cos")) return calc_number(cos(rad), 0);
+    if (!strcmp(fn, "tan")) return calc_number(tan(rad), 0);
+    if (!strcmp(fn, "asin")) return calc_number(asin(x) * 180 / M_PI, 1);
+    if (!strcmp(fn, "acos")) return calc_number(acos(x) * 180 / M_PI, 1);
+    if (!strcmp(fn, "atan")) return calc_number(atan(x) * 180 / M_PI, 1);
+    if (!strcmp(fn, "atan2") && n == 2) {
+        double y = calc_scalar(a[1], &k1);
+        return k1 == k0 ? calc_number(atan2(x, y) * 180 / M_PI, 1) : bad;
+    }
+    if (!strcmp(fn, "pow") && n == 2) return calc_number(pow(x, a[1].px / 100.0), 0);
+    if (!strcmp(fn, "sqrt")) return x < 0 ? bad : calc_number(sqrt(x), 0);
+    if (!strcmp(fn, "exp")) return calc_number(exp(x), 0);
+    if (!strcmp(fn, "log")) {
+        if (x <= 0)
+            return bad;
+        double base = n == 2 ? a[1].px / 100.0 : 0;
+        return calc_number(base > 0 && base != 1 ? log(x) / log(base) : log(x), 0);
+    }
+    return bad;
+}
+
+/* Is s a CSS math function's name and '(' (calc(), round()...)? Returns the name's length. */
+static int calc_function_at(const char *s)
+{
+    static const char *const names[] = {
+        "calc", "-webkit-calc", "min", "max", "clamp", "round", "mod", "rem", "abs", "sign", "sin", "cos", "tan",
+        "asin", "acos", "atan", "atan2", "pow", "sqrt", "hypot", "log", "exp",
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        size_t l = strlen(names[i]);
+        if (!strncasecmp(s, names[i], l) && s[l] == '(')
+            return (int)l;
+    }
+    return 0;
+}
+
 static struct cval calc_term(const char **p, const struct vctx *v)
 {
     static const struct { const char *name; int kind; } funcs[] = {
         { "calc(", -1 }, { "-webkit-calc(", -1 }, { "min(", 0 }, { "max(", 1 }, { "clamp(", 2 },
     };
-    struct cval r = { 0, 0, 0, 0, 0 };
+    struct cval r = { 0, 0, 0, 0, 0, 0 };
     calc_ws(p);
     for (size_t i = 0; i < sizeof(funcs) / sizeof(funcs[0]); i++) {
         size_t fl = strlen(funcs[i].name);
@@ -2788,6 +3033,15 @@ static struct cval calc_term(const char **p, const struct vctx *v)
         (*p)--;                         /* calc( is a bracket */
         break;
     }
+    int fl = **p != '(' ? calc_function_at(*p) : 0;
+    if (fl) {
+        char fn[16];
+        snprintf(fn, sizeof(fn), "%.*s", fl, *p);
+        for (char *q = fn; *q; q++)
+            *q = (char)tolower((unsigned char)*q);
+        *p += fl + 1;
+        return calc_math(p, v, fn);
+    }
     if (**p == '(') {
         (*p)++;
         r = calc_sum(p, v);
@@ -2796,6 +3050,20 @@ static struct cval calc_term(const char **p, const struct vctx *v)
             r.ok = 0;
         else
             (*p)++;
+        return r;
+    }
+    /* the constants */
+    if (isalpha((unsigned char)**p) || (**p == '-' && isalpha((unsigned char)(*p)[1]))) {
+        static const struct { const char *name; double v; } consts[] = {
+            { "pi", M_PI }, { "e", M_E }, { "infinity", 1e7 }, { "-infinity", -1e7 }, { "nan", 0 },
+        };
+        for (size_t i = 0; i < sizeof(consts) / sizeof(consts[0]); i++) {
+            size_t l = strlen(consts[i].name);
+            if (!strncasecmp(*p, consts[i].name, l) && !isalnum((unsigned char)(*p)[l]) && (*p)[l] != '-') {
+                *p += l;
+                return calc_number(consts[i].v, 0);
+            }
+        }
         return r;
     }
     int num, used = parse_num(*p, &num);
@@ -2813,6 +3081,8 @@ static struct cval calc_term(const char **p, const struct vctx *v)
         r.num = 1, r.px = num;
     else if (!strcmp(unit, "%"))
         r.pct = num;
+    else if (!strcmp(unit, "deg") || !strcmp(unit, "rad") || !strcmp(unit, "grad") || !strcmp(unit, "turn"))
+        r = calc_number(num / 100.0 * (unit[0] == 'd' ? 1 : unit[0] == 'r' ? 180 / M_PI : unit[0] == 'g' ? 0.9 : 360), 1);
     else if (!unit_px100(unit, num, v, &r.px))
         r.ok = 0;
     return r;
@@ -2830,7 +3100,7 @@ static struct cval calc_product(const char **p, const struct vctx *v)
         struct cval b = calc_flat(calc_term(p, v));
         a = calc_flat(a);
         if (!a.ok || !b.ok)
-            return (struct cval){ 0, 0, 0, 0, 0 };
+            return (struct cval){ 0, 0, 0, 0, 0, 0 };
         if (op == '*' && (b.num || a.num)) {
             struct cval k = b.num ? b : a, x = b.num ? a : b;
             x.px = x.px * k.px / 100;
@@ -2859,7 +3129,7 @@ static struct cval calc_sum(const char **p, const struct vctx *v)
         struct cval b = calc_flat(calc_product(p, v));
         a = calc_flat(a);
         if (!a.ok || !b.ok)
-            return (struct cval){ 0, 0, 0, 0, 0 };
+            return (struct cval){ 0, 0, 0, 0, 0, 0 };
         long sign = op == '-' ? -1 : 1;
         a.px += sign * b.px;
         a.pct += sign * b.pct;
@@ -2883,11 +3153,12 @@ static int length_value(const char *s, const struct vctx *v, struct len *out)
         out->v = 0;
         return 1;
     }
-    if (!strncasecmp(s, "calc(", 5) || !strncasecmp(s, "min(", 4) || !strncasecmp(s, "max(", 4) ||
-        !strncasecmp(s, "clamp(", 6) || !strncasecmp(s, "-webkit-calc(", 13)) {
+    if (calc_function_at(s)) {
         const char *p = s;
         struct cval r = calc_term(&p, v);
-        if (!r.ok)
+        if (!r.ok || (r.num && r.px && !r.angle))
+            return r.ok && r.num ? (out->unit = U_PX, out->v = (int)(r.px * css_zoom / 10000), 1) : 0;
+        if (r.angle)
             return 0;
         long px = (r.px + (r.px >= 0 ? 50 : -50)) / 100;
         if (r.pick) {
@@ -2949,14 +3220,14 @@ static int len_on(struct len l, int base)
 /* Something length_value can read (for @supports). */
 static int is_length(const char *s)
 {
-    struct vctx v = { ZOOM(16), ZOOM(16), 1024, 768, NULL };
+    struct vctx v = { ZOOM(16), ZOOM(16), 1024, 768, NULL, 0, 0 };
     struct len l;
     return length_value(s, &v, &l);
 }
 
 static int length_px(const char *s, int base)
 {
-    struct vctx v = { base, 16, 1024, 768, NULL };
+    struct vctx v = { base, 16, 1024, 768, NULL, 0, 0 };
     struct len l;
     if (!length_value(s, &v, &l) || l.unit != U_PX)
         return 0;
@@ -3325,84 +3596,211 @@ static const char *first_word(const char *value, char *buf, int size, const char
     return buf;
 }
 
+/* ---- gradients ---- */
+
+static void parse_position(const char *value, const struct vctx *v, struct len *px, struct len *py);
+
+/* An angle ("45deg", "0.25turn", "1rad", "100grad", or a bare 0) in degrees; 0 if it is not one. */
+static int angle_deg(const char *w, int wl, float *out)
+{
+    char t[64];
+    if (wl <= 0 || wl >= (int)sizeof(t))
+        return 0;
+    snprintf(t, sizeof(t), "%.*s", wl, w);
+    int num, used = parse_num(t, &num);
+    if (!used)
+        return 0;
+    const char *end = t + used;
+    double x = num / 100.0;
+    if (!strcasecmp(end, "deg"))
+        ;
+    else if (!strcasecmp(end, "turn"))
+        x *= 360;
+    else if (!strcasecmp(end, "rad"))
+        x *= 180 / M_PI;
+    else if (!strcasecmp(end, "grad"))
+        x *= 0.9;
+    else if (*end || x != 0)
+        return 0;
+    *out = (float)x;
+    return 1;
+}
+
+/* A stop position: a length or percentage (an angle for conic gradients, as a percentage of a turn). */
+static int stop_position(const char *w, int wl, int conic, const struct vctx *v, struct len *out)
+{
+    char t[64];
+    float deg;
+    if (wl <= 0 || wl >= (int)sizeof(t))
+        return 0;
+    snprintf(t, sizeof(t), "%.*s", wl, w);
+    if (conic && t[wl - 1] != '%' && angle_deg(w, wl, &deg)) {
+        *out = (struct len){ (int)(deg * 10000 / 360 + (deg < 0 ? -0.5f : 0.5f)), 0, U_PCT };
+        return 1;
+    }
+    return !isalpha((unsigned char)t[0]) && length_value(t, v, out) && out->unit != U_AUTO;
+}
+
+/* Side and corner keywords ("top", "bottom right") into x and y directions (-1, 0, 1). */
+static int side_words(const char **w, const int *wl, int n, int *dx, int *dy)
+{
+    *dx = *dy = 0;
+    for (int i = 0; i < n; i++) {
+        if (word_is(w[i], wl[i], "left")) *dx = -1;
+        else if (word_is(w[i], wl[i], "right")) *dx = 1;
+        else if (word_is(w[i], wl[i], "top")) *dy = -1;
+        else if (word_is(w[i], wl[i], "bottom")) *dy = 1;
+        else if (!word_is(w[i], wl[i], "center")) return 0;
+    }
+    return n > 0;
+}
+
 /*
- * A linear-gradient() somewhere in a background value: its first and last
- * colors and which way it runs (1 down, 2 right; swapped for up and left).
- * Radial gradients come out as one color, between their first and last.
+ * The first gradient function in a value: linear-gradient(), radial-gradient(), conic-gradient(),
+ * their repeating-* forms, and the old -webkit-/-moz- ones (whose sides name where they start and
+ * whose angles count anticlockwise from the right). current is currentColor. NULL if there is none.
  */
-static int parse_gradient(const char *value, uint32_t *g0, uint32_t *g1, uint8_t *dir)
+static const struct css_gradient *parse_gradient(struct arena *a, const char *value, const struct vctx *v,
+                                                 uint32_t current)
 {
     const char *g = strcasestr(value, "gradient(");
-    if (!g)
-        return 0;
-    int radial = g >= value + 6 && !strncasecmp(g - 6, "radial", 6);
-    const char *p = strchr(g, '(') + 1, *end = skip_group(p - 1, p + strlen(p)) - 1;
-    int down = 1, horizontal = 0, ncolors = 0;
+    if (!g || !a)
+        return NULL;
+    const char *name = g;
+    while (name > value && (isalpha((unsigned char)name[-1]) || name[-1] == '-'))
+        name--;
+    int nl = (int)(g - name);
+    char fn[48];
+    snprintf(fn, sizeof(fn), "%.*s", nl < 47 ? nl : 47, name);
+    for (char *q = fn; *q; q++)
+        *q = (char)tolower((unsigned char)*q);
+    const char *f = fn;
+    int legacy = 0;
+    if (!strncmp(f, "-webkit-", 8) || !strncmp(f, "-moz-", 5) || !strncmp(f, "-o-", 3) || !strncmp(f, "-ms-", 4)) {
+        legacy = 1;
+        f = strchr(f + 1, '-') + 1;
+    }
+    struct css_gradient *gr = arena_alloc(a, sizeof(*gr));
+    if (!gr)
+        return NULL;
+    if (!strncmp(f, "repeating-", 10))
+        gr->repeating = 1, f += 10;
+    if (!strcmp(f, "linear-"))
+        gr->kind = GK_LINEAR, gr->angle = 180;
+    else if (!strcmp(f, "radial-"))
+        gr->kind = GK_RADIAL;
+    else if (!strcmp(f, "conic-"))
+        gr->kind = GK_CONIC;
+    else
+        return NULL;
+    gr->cx = gr->cy = (struct len){ 5000, 0, U_PCT };
+    gr->rx.unit = gr->ry.unit = U_AUTO;
+
+    const char *open = g + 8, *end = skip_group(open, open + strlen(open)) - 1, *p = open + 1;
+    int conic = gr->kind == GK_CONIC;
     for (int arg = 0; p < end; arg++) {
         const char *e = find_top(p, end, ',');
-        char buf[128];
+        char buf[256];
         int len = (int)(e - p) < (int)sizeof(buf) - 1 ? (int)(e - p) : (int)sizeof(buf) - 1;
         memcpy(buf, p, (size_t)len);
         buf[len] = 0;
         p = e + 1;
-        const char *w[4];
-        int wl[4], n = words(buf, w, wl, 4);
+        const char *w[8];
+        int wl[8], n = words(buf, w, wl, 8);
         if (!n)
             continue;
         uint32_t col;
-        if (css_parse_color(w[0], wl[0], &col) == 0) {
-            if (!ncolors++)
-                *g0 = col;
-            *g1 = col;
-            continue;
-        }
-        if (arg || radial)
-            continue;
-        /* the direction: "to right", or an angle */
-        if (word_is(w[0], wl[0], "to")) {
-            for (int i = 1; i < n; i++) {
-                if (word_is(w[i], wl[i], "right") || word_is(w[i], wl[i], "left")) {
-                    horizontal = n == 2;        /* "to bottom right" stays vertical */
-                    if (horizontal)
-                        down = word_is(w[i], wl[i], "right");
-                } else if (word_is(w[i], wl[i], "top")) {
-                    down = 0;
+        /* the color may come first or (in old syntax) after its position */
+        int ci = -1;
+        for (int i = 0; i < n && ci < 0; i++)
+            if (css_parse_color(w[i], wl[i], &col) == 0 || word_is(w[i], wl[i], "currentcolor")) {
+                if (word_is(w[i], wl[i], "currentcolor"))
+                    col = current;
+                ci = i;
+            }
+        if (ci < 0 && arg == 0) {
+            /* the gradient's shape: direction, size, centre */
+            if (gr->kind == GK_LINEAR) {
+                float deg;
+                int dx, dy, has_to = word_is(w[0], wl[0], "to");
+                if (angle_deg(w[0], wl[0], &deg)) {
+                    gr->angle = legacy ? 90 - deg : deg;
+                } else if (side_words(w + has_to, wl + has_to, n - has_to, &dx, &dy)) {
+                    if (legacy && !has_to)
+                        dx = -dx, dy = -dy;            /* the old syntax names where it starts */
+                    if (dx && dy)
+                        gr->corner_x = (int8_t)dx, gr->corner_y = (int8_t)dy;
+                    else
+                        gr->angle = dx > 0 ? 90 : dx < 0 ? 270 : dy < 0 ? 0 : 180;
+                }
+            } else {
+                int at = -1;
+                for (int i = 0; i < n; i++)
+                    if (word_is(w[i], wl[i], "at"))
+                        at = i;
+                int shape_end = at >= 0 ? at : n;
+                if (legacy && gr->kind == GK_RADIAL && at < 0) {
+                    /* -webkit-radial-gradient(center, ellipse cover, ...): a position here, the shape next */
+                    shape_end = 0;
+                    at = -1;
+                    char pos[256];
+                    snprintf(pos, sizeof(pos), "%s", buf);
+                    parse_position(pos, v, &gr->cx, &gr->cy);
+                }
+                int nlen = 0;
+                for (int i = 0; i < shape_end; i++) {
+                    float deg;
+                    if (word_is(w[i], wl[i], "circle")) gr->circle = 1;
+                    else if (word_is(w[i], wl[i], "ellipse")) gr->circle = 0;
+                    else if (word_is(w[i], wl[i], "closest-side") || word_is(w[i], wl[i], "contain")) gr->extent = GX_CLOSEST_SIDE;
+                    else if (word_is(w[i], wl[i], "closest-corner")) gr->extent = GX_CLOSEST_CORNER;
+                    else if (word_is(w[i], wl[i], "farthest-side")) gr->extent = GX_FARTHEST_SIDE;
+                    else if (word_is(w[i], wl[i], "farthest-corner") || word_is(w[i], wl[i], "cover")) gr->extent = GX_FARTHEST_CORNER;
+                    else if (word_is(w[i], wl[i], "from") && i + 1 < shape_end && angle_deg(w[i + 1], wl[i + 1], &deg))
+                        gr->angle = deg, i++;
+                    else if (gr->kind == GK_RADIAL && nlen < 2) {
+                        struct len l;
+                        if (stop_position(w[i], wl[i], 0, v, &l))
+                            *(nlen++ ? &gr->ry : &gr->rx) = l;
+                    }
+                }
+                if (nlen == 1 && gr->rx.unit != U_PCT)
+                    gr->circle = 1, gr->ry = gr->rx;
+                else if (nlen == 2)
+                    gr->circle = 0;
+                if (at >= 0 && at + 1 < n) {
+                    char pos[256];
+                    int o = 0;
+                    for (int i = at + 1; i < n && o < (int)sizeof(pos) - 70; i++)
+                        o += snprintf(pos + o, sizeof(pos) - (size_t)o, "%.*s ", wl[i], w[i]);
+                    parse_position(pos, v, &gr->cx, &gr->cy);
                 }
             }
-        } else {
-            int num, used = parse_num(w[0], &num);
-            if (!used)
-                continue;
-            long deg = num;                     /* times 100 */
-            if (!strncasecmp(w[0] + used, "turn", 4))
-                deg = (long)num * 360;
-            else if (!strncasecmp(w[0] + used, "rad", 3))
-                deg = (long)num * 5730 / 100;
-            deg = (deg / 100 % 360 + 360) % 360;
-            horizontal = (deg > 45 && deg < 135) || (deg > 225 && deg < 315);
-            down = horizontal ? deg < 180 : deg > 90 && deg < 270;
+            continue;
         }
+        if (ci < 0)
+            continue;                   /* a colour hint on its own: the midpoint is taken as halfway */
+        /* a stop, with up to two positions: "red", "red 10%", "red 10% 20%" (or "10% red") */
+        int added = 0;
+        for (int i = 0; i < n && gr->nstops < MAX_GSTOPS; i++) {
+            if (i == ci)
+                continue;
+            struct len l;
+            if (!stop_position(w[i], wl[i], conic, v, &l))
+                continue;
+            gr->stops[gr->nstops++] = (struct gstop){ col, l, 1 };
+            added++;
+        }
+        if (!added && gr->nstops < MAX_GSTOPS)
+            gr->stops[gr->nstops++] = (struct gstop){ col, { 0, 0, U_PX }, 0 };
     }
-    if (!ncolors)
-        return 0;
-    if (radial || ncolors == 1) {
-        uint32_t mix = 0;
-        for (int sh = 0; sh < 32; sh += 8)
-            mix |= (((*g0 >> sh & 0xFF) + (*g1 >> sh & 0xFF)) / 2) << sh;
-        *g0 = *g1 = mix;
-    } else if (!down) {
-        uint32_t t = *g0;
-        *g0 = *g1;
-        *g1 = t;
-    }
-    *dir = horizontal ? 2 : 1;
-    return 1;
+    if (gr->nstops == 0)
+        return NULL;
+    if (gr->nstops == 1)                /* one color: a plain fill */
+        gr->stops[gr->nstops++] = gr->stops[0];
+    return gr;
 }
 
-/*
- * The first url() in text (up to end): its address, in the arena. *after is where the closing
- * bracket was. NULL when there is none, or it is empty.
- */
 static const char *url_arg(struct arena *a, const char *text, const char *end, const char **after)
 {
     for (const char *p = text; p + 4 < end; p++) {
@@ -4024,8 +4422,98 @@ void css_transform_matrix(const struct style *st,int w,int h,double out[6])
 }
 static int transform_supported(const char *value)
 {
-    const struct vctx v={16,16,1024,768,NULL};struct css_xform parsed;
+    const struct vctx v={16,16,1024,768,NULL, 0, 0 };struct css_xform parsed;
     return parse_transform(value,&v,&parsed);
+}
+
+/*
+ * The individual transform properties: translate: x [y [z]], rotate: angle (or about the z axis:
+ * "z 45deg", "0 0 1 45deg"), scale: x [y [z]] (numbers or percentages). The third dimension does
+ * nothing in 2D. Returns 1 with *set 0 for none, 1 with *set 1 and op filled in, 0 for nonsense.
+ */
+static int individual_transform(int prop, const char *value, const struct vctx *v, struct tfop *op, int *set)
+{
+    const char *w[4];
+    int wl[4], n = words(value, w, wl, 4);
+    char a[3][64];
+    memset(op, 0, sizeof(*op));
+    *set = 0;
+    if (n == 1 && word_is(w[0], wl[0], "none"))
+        return 1;
+    if (n < 1)
+        return 0;
+    for (int i = 0; i < n && i < 3; i++)
+        snprintf(a[i], sizeof(a[i]), "%.*s", wl[i], w[i]);
+    if (prop == P_TRANSLATE) {
+        if (n > 3)
+            return 0;
+        op->kind = TF_TRANSLATE;
+        if (!length_value(a[0], v, &op->x) || op->x.unit == U_AUTO)
+            return 0;
+        if (n >= 2 && (!length_value(a[1], v, &op->y) || op->y.unit == U_AUTO))
+            return 0;
+    } else if (prop == P_ROTATE) {
+        op->kind = TF_ROTATE;
+        const char *angle = n == 1 ? a[0] : NULL;
+        char last[64];
+        snprintf(last, sizeof(last), "%.*s", wl[n - 1], w[n - 1]);
+        if (n == 2 && (word_is(w[0], wl[0], "z")))
+            angle = last;
+        else if (n == 4 && word_is(w[0], wl[0], "0") && word_is(w[1], wl[1], "0") && word_is(w[2], wl[2], "1"))
+            angle = last;
+        else if (n == 2 && (word_is(w[0], wl[0], "x") || word_is(w[0], wl[0], "y")))
+            return transform_number(last, &op->a, 1) ? (*set = 0, 1) : 0;     /* about x or y: flat in 2D */
+        if (!angle || !transform_number(angle, &op->a, 1))
+            return 0;
+    } else {
+        if (n > 3)
+            return 0;
+        op->kind = TF_SCALE;
+        float s[2];
+        for (int i = 0; i < 2; i++) {
+            const char *t = a[i < n ? i : 0];
+            size_t tl = strlen(t);
+            if (tl && t[tl - 1] == '%') {
+                char num[64];
+                snprintf(num, sizeof(num), "%.*s", (int)tl - 1, t);
+                if (!transform_number(num, &s[i], 0))
+                    return 0;
+                s[i] /= 100;
+            } else if (!transform_number(t, &s[i], 0)) {
+                return 0;
+            }
+        }
+        op->a = s[0], op->b = s[1];
+    }
+    *set = 1;
+    return 1;
+}
+
+static int individual_supported(int prop, const char *value)
+{
+    const struct vctx v = { 16, 16, 1024, 768, NULL, 0, 0 };
+    struct tfop op;
+    int set;
+    return individual_transform(prop, value, &v, &op, &set);
+}
+
+/* Put translate, rotate and scale before transform's own functions, in that order (as CSS has them). */
+static void finish_transform(struct arena *a, struct style *st)
+{
+    if (!st->xf_ind || !a)
+        return;
+    struct css_xform *xf = arena_alloc(a, sizeof(*xf));
+    if (!xf)
+        return;
+    if (st->xf_ind & 1)
+        xf->op[xf->n++] = st->xf_translate;
+    if (st->xf_ind & 2)
+        xf->op[xf->n++] = st->xf_rotate;
+    if (st->xf_ind & 4)
+        xf->op[xf->n++] = st->xf_scale;
+    for (int k = 0; st->xf && k < st->xf->n && xf->n < MAX_TFOPS; k++)
+        xf->op[xf->n++] = st->xf->op[k];
+    st->xf = xf;
 }
 
 static void apply(struct style *st, const struct style *parent, int prop, const char *value,
@@ -4073,6 +4561,11 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
                 { "-ms-inline-flexbox", D_INLINE_BLOCK, IN_FLEX },
                 { "grid", D_BLOCK, IN_GRID }, { "block grid", D_BLOCK, IN_GRID },
                 { "inline-grid", D_INLINE_BLOCK, IN_GRID }, { "inline grid", D_INLINE_BLOCK, IN_GRID },
+                /* ruby is drawn as the user agent sheet sets <ruby> up: an inline flex column */
+                { "ruby", D_INLINE_BLOCK, IN_FLEX }, { "ruby-text", D_BLOCK, 0 }, { "ruby-base", D_BLOCK, 0 },
+                { "ruby-base-container", D_BLOCK, 0 }, { "ruby-text-container", D_BLOCK, 0 },
+                { "inline list-item", D_LIST_ITEM, 0 }, { "block flow", D_BLOCK, 0 }, { "inline flow", D_INLINE, 0 },
+                { "block flow-root", D_BLOCK, 0 }, { "inline-list-item", D_LIST_ITEM, 0 },
             };
             for (size_t i = 0; i < sizeof(ds) / sizeof(ds[0]); i++)
                 if (!strcasecmp(value, ds[i].kw)) {
@@ -4152,6 +4645,7 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
             set_len(&st->flex_basis, value, v);
         break;
     case P_JUSTIFY_CONTENT:
+    case P_ALIGN_CONTENT:
     case P_ALIGN_ITEMS:
     case P_ALIGN_SELF:
     case P_JUSTIFY_ITEMS:
@@ -4161,6 +4655,7 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
             break;
         switch (prop) {
         case P_JUSTIFY_CONTENT: st->justify = (uint8_t)al; break;
+        case P_ALIGN_CONTENT: st->align_content = (uint8_t)al; break;
         case P_ALIGN_ITEMS: st->align_items = (uint8_t)al; break;
         case P_ALIGN_SELF: st->align_self = (uint8_t)al; break;
         case P_JUSTIFY_ITEMS: st->justify_items = (uint8_t)al; break;
@@ -4181,7 +4676,7 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         if (!rest || !align_value(rest, &a2))
             a2 = a1;
         if (prop == P_PLACE_CONTENT)
-            st->justify = (uint8_t)a2;
+            st->align_content = (uint8_t)a1, st->justify = (uint8_t)a2;
         else if (prop == P_PLACE_ITEMS)
             st->align_items = (uint8_t)a1, st->justify_items = (uint8_t)a2;
         else
@@ -4324,7 +4819,51 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         break;
     case P_GRID_AUTO_FLOW:
         st->grid_dense = strcasestr(value, "dense") != NULL;
+        st->grid_col_flow = strcasestr(value, "column") != NULL;
         break;
+    case P_GRID_AUTO_COLUMNS:
+        st->grid_auto_cols = !strcasecmp(value, "auto") || initial_kw ? NULL : parse_tracks(value, v);
+        break;
+    case P_TRANSLATE:
+    case P_ROTATE:
+    case P_SCALE: {
+        int bit = prop == P_TRANSLATE ? 1 : prop == P_ROTATE ? 2 : 4, set;
+        struct tfop op;
+        if (initial_kw) {
+            st->xf_ind &= (uint8_t)~bit;
+        } else if (individual_transform(prop, value, v, &op, &set)) {
+            st->xf_ind = (uint8_t)(set ? st->xf_ind | bit : st->xf_ind & ~bit);
+            *(prop == P_TRANSLATE ? &st->xf_translate : prop == P_ROTATE ? &st->xf_rotate : &st->xf_scale) = op;
+        }
+        break;
+    }
+    case P_TEXT_WRAP:                           /* text-wrap: nowrap is white-space: nowrap; balance and pretty are hints */
+        n = words(value, w, wl, 8);
+        for (int i = 0; i < n; i++) {
+            if (word_is(w[i], wl[i], "nowrap"))
+                st->white_space = st->white_space == WS_PRE_WRAP ? WS_PRE : WS_NOWRAP;
+            else if (word_is(w[i], wl[i], "wrap") && (st->white_space == WS_NOWRAP || st->white_space == WS_PRE))
+                st->white_space = st->white_space == WS_PRE ? WS_PRE_WRAP : WS_NORMAL;
+        }
+        break;
+    case P_ALL: {
+        /* Every property but custom ones (and direction) back to their initial or inherited
+         * value. revert and revert-layer cannot bring back what a lower origin said here, so
+         * they work as unset. Font size was settled in its own pass. */
+        struct custom_prop *vars = st->vars;
+        int fs = st->font_size;
+        if (inherit_kw)
+            *st = *parent;
+        else if (!strcasecmp(value, "initial"))
+            *st = initial_style;
+        else
+            inherit(st, parent);
+        st->vars = vars;
+        st->font_size = fs;
+        memset(st->bg_values, 0, sizeof(st->bg_values));
+        st->bg_layers = st->bg_next = NULL;
+        break;
+    }
     case P_GRID_TEMPLATE: {                     /* rows / columns, or areas with their row sizes */
         const char *vend = value + strlen(value), *slash = find_top(value, vend, '/');
         char rows[512];
@@ -4407,8 +4946,7 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         break;
     }
     case P_BACKGROUND_IMAGE:
-        if (!parse_gradient(value, &st->g0, &st->g1, &st->grad))
-            st->grad = 0;
+        st->gr = parse_gradient(v->a, value, v, st->color);
         st->bg_url = url_arg(v->a, value, value + strlen(value), NULL);
         break;
     case P_FLOAT:
@@ -4433,8 +4971,7 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
             st->bg = c;
         break;
     case P_BACKGROUND:
-        if (!parse_gradient(value, &st->g0, &st->g1, &st->grad))
-            st->grad = 0;
+        st->gr = parse_gradient(v->a, value, v, st->color);
         reset_bg_picture(st);
         apply_bg_layers(st, value, v);
         if (!strcasecmp(value, "none") || initial_kw) {
@@ -5100,18 +5637,18 @@ static void finish_background(struct style *st, const struct style *parent, cons
         *l = *st;
         l->bg_layers = l->bg_next = NULL;
         reset_bg_picture(l);
-        l->bg_clip = l->bg_attachment = l->grad = 0;
+        l->bg_clip = l->bg_attachment = 0;
+        l->gr = NULL;
         const char *part = background_part(v->a, raw[0], i);
         if (part) {
             l->bg_url = url_arg(v->a, part, part + strlen(part), NULL);
-            parse_gradient(part, &l->g0, &l->g1, &l->grad);
+            l->gr = parse_gradient(v->a, part, v, st->color);
             parse_bg_layer(l, part, part + strlen(part), v);
         }
         if (raw[1]) {
             part = background_part(v->a, raw[1], i);
             l->bg_url = url_arg(v->a, part, part + strlen(part), NULL);
-            l->grad = 0;
-            parse_gradient(part, &l->g0, &l->g1, &l->grad);
+            l->gr = parse_gradient(v->a, part, v, st->color);
         }
         for (int k = 2; k < 10; k++)
             if (raw[k]) apply(l, parent, props[k - 2], background_part(v->a, raw[k], i), v);
@@ -5587,10 +6124,16 @@ static void restore_property(struct style *st, const struct style *src, int prop
     case P_FLEX_BASIS: COPY(flex_basis); break;
     case P_JUSTIFY_CONTENT: COPY(justify); break;
     case P_ALIGN_ITEMS: COPY(align_items); break;
+    case P_ALIGN_CONTENT: COPY(align_content); break;
+    case P_GRID_AUTO_COLUMNS: COPY(grid_auto_cols); break;
+    case P_TRANSLATE: COPY(xf_translate); COPY(xf_ind); break;
+    case P_ROTATE: COPY(xf_rotate); COPY(xf_ind); break;
+    case P_SCALE: COPY(xf_scale); COPY(xf_ind); break;
+    case P_TEXT_WRAP: COPY(white_space); break;
     case P_ALIGN_SELF: COPY(align_self); break;
     case P_JUSTIFY_ITEMS: COPY(justify_items); break;
     case P_JUSTIFY_SELF: COPY(justify_self); break;
-    case P_PLACE_CONTENT: COPY(justify); break;
+    case P_PLACE_CONTENT: COPY(justify); COPY(align_content); break;
     case P_PLACE_ITEMS: COPY(align_items); COPY(justify_items); break;
     case P_PLACE_SELF: COPY(align_self); COPY(justify_self); break;
     case P_ORDER: COPY(order); break;
@@ -5612,7 +6155,7 @@ static void restore_property(struct style *st, const struct style *src, int prop
     case P_GRID_TEMPLATE_ROWS: COPY(grid_rows); break;
     case P_GRID_AUTO_ROWS: COPY(grid_auto_rows); break;
     case P_GRID_TEMPLATE_AREAS: COPY(grid_areas); break;
-    case P_GRID_AUTO_FLOW: COPY(grid_dense); break;
+    case P_GRID_AUTO_FLOW: COPY(grid_dense); COPY(grid_col_flow); break;
     case P_GRID_TEMPLATE: COPY(grid_cols); COPY(grid_rows); COPY(grid_areas); break;
     case P_GRID_COLUMN: COPY(gc_start); COPY(gc_end); COPY(gc_span); break;
     case P_GRID_COLUMN_START: COPY(gc_start); COPY(gc_span); break;
@@ -5621,9 +6164,9 @@ static void restore_property(struct style *st, const struct style *src, int prop
     case P_GRID_ROW_START: COPY(gr_start); COPY(gr_span); break;
     case P_GRID_ROW_END: COPY(gr_end); COPY(gr_span); break;
     case P_GRID_AREA: COPY(grid_area); COPY(gr_start); COPY(gr_end); COPY(gr_span); COPY(gc_start); COPY(gc_end); COPY(gc_span); break;
-    case P_BACKGROUND_IMAGE: COPY(g0); COPY(g1); COPY(grad); COPY(bg_url); COPY(bg_img); break;
+    case P_BACKGROUND_IMAGE: COPY(gr); COPY(bg_url); COPY(bg_img); break;
     case P_BACKGROUND_COLOR: COPY(bg); break;
-    case P_BACKGROUND: COPY(bg); COPY(g0); COPY(g1); COPY(grad); COPY(bg_url); COPY(bg_img); COPY(bg_size); COPY(bg_w); COPY(bg_h); COPY(bg_px); COPY(bg_py); COPY(bg_norep_x); COPY(bg_norep_y); COPY(bg_origin); break;
+    case P_BACKGROUND: COPY(bg); COPY(gr); COPY(bg_url); COPY(bg_img); COPY(bg_size); COPY(bg_w); COPY(bg_h); COPY(bg_px); COPY(bg_py); COPY(bg_norep_x); COPY(bg_norep_y); COPY(bg_origin); break;
     case P_FLOAT: COPY(floated); break;
     case P_COLOR: COPY(color); break;
     case P_FONT_SIZE: COPY(font_size); break;
@@ -5956,12 +6499,17 @@ static int compute(struct arena *a, struct node *n, const struct style *parent,
     int author_color = 0;
     int rollback_budget = 8192;
     for (int pass = 2; pass <= 3; pass++) {
-        if (pass == 3)
+        if (pass == 3) {
             v.font_size = st->font_size;
+            for (int i = 0; i < c.n; i++)       /* line-height first, for lh units in the rest */
+                if (c.m[i].d->prop == P_LINE_HEIGHT && !c.m[i].pe)
+                    apply_match(st, parent, &c, i, &v, pass, NULL, &rollback_budget);
+            v.lh = line_px(st);
+        }
         for (int i = 0; i < c.n; i++) {
             const struct decl *d = c.m[i].d;
             int early = d->prop == P_FONT_SIZE || d->prop == P_FONT;
-            if (d->prop == P_CUSTOM || (pass == 2) != early || c.m[i].pe)
+            if (d->prop == P_CUSTOM || (pass == 2) != early || c.m[i].pe || (pass == 3 && d->prop == P_LINE_HEIGHT))
                 continue;
             apply_match(st, parent, &c, i, &v, pass, NULL, &rollback_budget);
             if (d->prop == P_COLOR && c.m[i].rank != R_UA)
@@ -5997,7 +6545,7 @@ static int compute(struct arena *a, struct node *n, const struct style *parent,
     if (st->invisible & 1)
         st->hidden = 1;
     if (st->invisible & 8)
-        st->bg = TRANSPARENT, st->grad = 0, st->bg_url = NULL;
+        st->bg = TRANSPARENT, st->gr = NULL, st->bg_url = NULL;
     if (st->ov_x != st->ov_y && (!st->ov_x || !st->ov_y)) {      /* visible becomes auto beside a clipped axis */
         if (!st->ov_x)
             st->ov_x = OV_AUTO;
@@ -6023,6 +6571,7 @@ static int compute(struct arena *a, struct node *n, const struct style *parent,
     if (st->font_size > 200)
         st->font_size = 200;
     finish_background(st, parent, &v);
+    finish_transform(a, st);
     st->font = wfont_get(st->family, st->bold, st->italic, st->font_size);
     if (st->line_clamp && st->max_height.unit == U_AUTO) {         /* -webkit-line-clamp: that many lines, the rest cut off */
         int lh = st->lh_kind == LH_PX ? st->lh : st->lh_kind == LH_FACTOR ? st->font_size * st->lh / 100
@@ -6034,7 +6583,7 @@ static int compute(struct arena *a, struct node *n, const struct style *parent,
     }
 
     if (st->display != D_NONE)
-        for (int pe = PE_BEFORE; pe <= PE_MARKER; pe++)
+        for (int pe = PE_BEFORE; pe <= PE_FIRST_LINE; pe++)
             pseudo(a, n, st, &c, pe, &v);
     if (counter_calls != calls)
         n->style_flags |= SF_NOSHARE;   /* a sibling copying it would not count */
@@ -6275,12 +6824,18 @@ static void pseudo(struct arena *a, struct node *n, const struct style *st, cons
     struct vctx v = *base;
     int rollback_budget = 8192;
     for (int pass = 2; pass <= 3; pass++) {
-        if (pass == 3)
+        if (pass == 3) {
             v.font_size = ps->font_size;
+            for (int i = 0; i < c->n; i++)
+                if (c->m[i].pe == (uint32_t)pe && c->m[i].d->prop == P_LINE_HEIGHT)
+                    apply_match(ps, st, c, i, &v, pass, NULL, &rollback_budget);
+            v.lh = line_px(ps);
+        }
         for (int i = 0; i < c->n; i++) {
             const struct decl *d = c->m[i].d;
             int early = d->prop == P_FONT_SIZE || d->prop == P_FONT;
-            if (c->m[i].pe != (uint32_t)pe || d->prop == P_CUSTOM || (pass == 2) != early)
+            if (c->m[i].pe != (uint32_t)pe || d->prop == P_CUSTOM || (pass == 2) != early ||
+                (pass == 3 && d->prop == P_LINE_HEIGHT))
                 continue;
             apply_match(ps, st, c, i, &v, pass, NULL, &rollback_budget);
         }
@@ -6298,6 +6853,7 @@ static void pseudo(struct arena *a, struct node *n, const struct style *st, cons
     if (ps->invisible & 8)
         ps->bg = TRANSPARENT;
     finish_background(ps, st, &v);
+    finish_transform(a, ps);
     ps->font = wfont_get(ps->family, ps->bold, ps->italic, ps->font_size);
     n->pseudo_st[pe - 1] = ps;
     if (pe <= PE_AFTER)
@@ -6410,8 +6966,10 @@ static int cascade_tree(struct arena *a, struct node *root, const struct style *
                     compute(a, n, ps, sheets, nsheets, v, mc, buf, 0);
                 }
             }
-            if (!n->parent && !n->shadow_host && n->style)
+            if (!n->parent && !n->shadow_host && n->style) {
                 v->root_font_size = n->style->font_size;
+                v->root_lh = line_px(n->style);
+            }
             if (n->style && n->style->display == D_NONE) {
                 if (redone)
                     for (struct node *k = n->first; k; k = node_next(k, n))
@@ -6512,7 +7070,7 @@ void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int 
     for (int i = 0; i < 4; i++)
         initial_style.border_w[i] = ZOOM(3);
     initial_style.outline_w = ZOOM(3);
-    struct vctx v = { ZOOM(16), ZOOM(16), viewport_w, viewport_h, a };
+    struct vctx v = { ZOOM(16), ZOOM(16), viewport_w, viewport_h, a, 0, 0 };
     struct mctx mc = { .visited = visited, .ctx = ctx, .quirks = root->quirks };
     struct match *buf = malloc(sizeof(struct match) * MAX_MATCHES);
     struct bloom *bloom = calloc(1, sizeof(*bloom));
@@ -6570,7 +7128,7 @@ int css_restyle_dynamic(struct arena *a, struct node *root, struct sheet **sheet
         for (struct node *n = (struct node *)rec->state[i]; n; n = n->parent)
             n->dgen = gen;
     }
-    struct vctx v = { ZOOM(16), root->style->font_size, viewport_w, viewport_h, a };
+    struct vctx v = { ZOOM(16), root->style->font_size, viewport_w, viewport_h, a, 0, 0 };
     struct mctx mc = { .visited = visited, .ctx = ctx, .quirks = root->quirks };
     struct match *buf = malloc(sizeof(struct match) * MAX_MATCHES);
     struct bloom *bloom = calloc(1, sizeof(*bloom));

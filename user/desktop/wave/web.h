@@ -140,9 +140,11 @@ struct node {
     unsigned mgen;
 
     uint8_t quirks;             /* the root: no standards-mode doctype */
+    uint8_t file_chosen;        /* <input type=file>: value is a file the user picked (only that is sent) */
 
     /* generated content: ::before and ::after with a string "content" */
-    struct style *pseudo_st[5];         /* ::before, ::after, ::placeholder, ::selection, ::marker */
+    struct style *pseudo_st[7];         /* ::before, ::after, ::placeholder, ::selection, ::marker,
+                                           ::first-letter, ::first-line */
     const char *pseudo_text[2];
 
     int bx0, by0, bx1, by1;             /* browser.c: its box in the last layout, for scripts */
@@ -166,6 +168,8 @@ struct node {
 };
 
 struct node *html_parse(struct arena *a, const char *text, int len);
+/* <template shadowrootmode> in a page's HTML: attach those shadow roots (after html_parse). */
+void html_declarative_shadows(struct arena *a, struct node *root);
 const char *node_attr(const struct node *n, const char *name);
 struct node *node_next(struct node *n, const struct node *root);       /* pre-order */
 struct shadow_swap;
@@ -190,7 +194,8 @@ int web_nth_fits(int a, int b, int position);
 
 /* ---- styles (css.c) ---- */
 /* pseudo-elements: node.pseudo_st[PE_x - 1] is the style of an element's ::before and the rest */
-enum { PE_NONE, PE_BEFORE, PE_AFTER, PE_PLACEHOLDER, PE_SELECTION, PE_MARKER };
+enum { PE_NONE, PE_BEFORE, PE_AFTER, PE_PLACEHOLDER, PE_SELECTION, PE_MARKER, PE_FIRST_LETTER, PE_FIRST_LINE };
+#define PE_COUNT 7
 
 /* The fragment of the page's address, for :target (css.c; the browser sets it before cascading). */
 extern const char *css_target_id;
@@ -271,6 +276,32 @@ struct custom_prop {            /* a CSS custom property (--name: value) */
     struct custom_prop *next;
 };
 
+/* ---- gradients ---- */
+
+/* linear-gradient(), radial-gradient() and conic-gradient(), and their repeating-* forms (parsed
+ * by css.c, painted by layout.c as background layers, sized and tiled like pictures). Stop
+ * positions are lengths or percentages along the gradient line (radial: along the ray; conic:
+ * percentages of a turn); has_pos 0 means the position is worked out from its neighbours. */
+enum { GK_LINEAR, GK_RADIAL, GK_CONIC };
+enum { GX_FARTHEST_CORNER, GX_FARTHEST_SIDE, GX_CLOSEST_CORNER, GX_CLOSEST_SIDE };
+#define MAX_GSTOPS 32
+struct css_gradient {
+    uint8_t kind;               /* GK_* */
+    uint8_t repeating;
+    uint8_t circle;             /* radial: a circle, not an ellipse */
+    uint8_t extent;             /* radial: GX_* (unless rx is set) */
+    int8_t corner_x, corner_y;  /* linear "to top right" and the like: -1, 0 or 1 (0, 0: by angle) */
+    float angle;                /* linear: degrees clockwise from "to top"; conic: where it starts */
+    struct len cx, cy;          /* radial and conic: the centre */
+    struct len rx, ry;          /* radial: an explicit size (rx.unit U_AUTO: by extent) */
+    int nstops;
+    struct gstop {
+        uint32_t color;
+        struct len pos;
+        uint8_t has_pos;
+    } stops[MAX_GSTOPS];
+};
+
 /* ---- transforms, transitions and animations ---- */
 
 /* Functions compose in written order; the rightmost acts on a point first. */
@@ -280,7 +311,7 @@ struct tfop {
     struct len x, y;            /* TF_TRANSLATE */
     float a, b, c, d, e, f;     /* TF_SCALE: a, b; TF_ROTATE: a (radians); TF_SKEW: a, b (radians); TF_MATRIX: a-f */
 };
-#define MAX_TFOPS 8
+#define MAX_TFOPS 11            /* transform's eight, after translate, rotate and scale */
 struct css_xform {
     int n;
     struct tfop op[MAX_TFOPS];
@@ -350,7 +381,9 @@ struct style {
     struct len top, right, bottom, left;    /* offsets of positioned boxes */
     uint8_t invisible;          /* opacity 0, off-screen or clipped away: hidden tricks */
     uint8_t opacity, alpha;     /* opacity (0-255), and what is shown of the box: that times its parents' */
-    const struct css_xform *xf; /* transform: none (NULL) or functions */
+    const struct css_xform *xf; /* transform: none (NULL) or functions; translate, rotate and scale first */
+    struct tfop xf_translate, xf_rotate, xf_scale;  /* the individual transform properties */
+    uint8_t xf_ind;             /* which of them are set: 1 translate, 2 rotate, 4 scale */
     struct len tox, toy;        /* transform-origin */
     const struct css_motion_raw *raw_motion;
     const struct css_transition *trans;
@@ -396,8 +429,7 @@ struct style {
     const struct wfont *font;
 
     struct len radius[4];       /* border-radius: top left, top right, bottom right, bottom left */
-    uint32_t g0, g1;            /* a linear gradient over the background, from g0 to g1 */
-    uint8_t grad;               /* 0 none, 1 downwards, 2 rightwards */
+    const struct css_gradient *gr;  /* a gradient over the background (NULL: none) */
 
     /* the background picture (the first layer that has a url()); bg_img is filled in by the browser */
     const char *bg_url;
@@ -418,17 +450,19 @@ struct style {
     uint8_t inner;              /* IN_* */
     uint8_t flex_wrap, flex_reverse;
     uint8_t justify, align_items, align_self, justify_items, justify_self;   /* AL_* */
+    uint8_t align_content;      /* AL_*: lines of a wrapping flex container, rows of a grid */
     uint8_t clips;              /* overflow other than visible */
     uint8_t ov_x, ov_y;         /* OV_*: what overflow-x and overflow-y come to */
     int flex_grow, flex_shrink; /* times 100 */
     struct len flex_basis;
     int order;
     struct len row_gap, col_gap;
-    const struct gridspec *grid_cols, *grid_rows, *grid_auto_rows;
+    const struct gridspec *grid_cols, *grid_rows, *grid_auto_rows, *grid_auto_cols;
     const struct gridareas *grid_areas;     /* on the container */
     const char *grid_area;              /* on an item: grid-area: name */
     int gr_end;                         /* grid-row-end line */
     uint8_t grid_dense;                 /* grid-auto-flow: dense */
+    uint8_t grid_col_flow;              /* grid-auto-flow: column */
     int gc_start, gc_end, gc_span;      /* grid-column: lines from 1 (negative: from the end), 0 auto */
     int gr_start, gr_span;              /* grid-row */
 };
@@ -496,8 +530,8 @@ struct bgpaint {
     struct image *img;
     int tx, ty, tw, th;         /* the first tile: where it is and how big (tw, th > 0) */
     uint8_t norep_x, norep_y;   /* one tile only along the axis */
-    uint8_t grad, fixed;
-    uint32_t g0, g1;
+    uint8_t fixed;
+    const struct css_gradient *gr;  /* a gradient tile instead of a picture */
     struct rect clip;
 };
 
@@ -524,8 +558,7 @@ struct ditem {
     /* fills and images: rounded corners; fills: a gradient over the color,
        and a border of ring pixels all round in ring_color */
     int rad[4];
-    uint8_t grad;
-    uint32_t g0, g1;
+    const struct css_gradient *gr;
     int ring;
     uint32_t ring_color;
     const struct bgpaint *bgp;  /* DK_BGIMG */
@@ -676,6 +709,7 @@ void draw_image_scaled(struct surface *s, const struct image *img, int x, int y,
 /* ---- files the browser keeps (webstore.c) ---- */
 char *store_read_file(const char *path, long max, long *len);   /* malloc'd; NULL if missing or too big */
 int store_write_file(const char *path, const char *data, size_t len);
+long store_file_mtime(const char *path);                         /* seconds since 1970; 0 if unknown */
 
 /* ---- URLs (webutil.c, like the arena and UTF-8 helpers) ---- */
 /* Resolve ref against base (an absolute URL). Fragments are kept. */

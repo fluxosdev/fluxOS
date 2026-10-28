@@ -790,3 +790,48 @@ int node_text(const struct node *n, char *out, int size)
         out[o < size ? o : size - 1] = 0;
     return o;
 }
+
+/*
+ * Declarative shadow DOM: each <template shadowrootmode="open"> (or "closed") becomes the
+ * shadow root of the element it is in, holding what the template held. Only for the page's
+ * own HTML (not innerHTML), as the standard has it; an element keeps the first such root.
+ */
+void html_declarative_shadows(struct arena *a, struct node *root)
+{
+    for (struct node *n = root; n;) {
+        if (n->type != N_ELEMENT || n->tag != T_TEMPLATE || !n->parent || n->parent->shadow_root ||
+            n->parent->type != N_ELEMENT) {
+            n = node_next(n, root);
+            continue;
+        }
+        const char *mode = node_attr(n, "shadowrootmode");
+        if (!mode || (strcasecmp(mode, "open") && strcasecmp(mode, "closed"))) {
+            n = node_next(n, root);
+            continue;
+        }
+        struct node *host = n->parent, *after = n;
+        while (after && after != root && !after->next)    /* what comes after the template's subtree */
+            after = after->parent;
+        after = after && after != root ? after->next : NULL;
+        struct node *sr = arena_alloc(a, sizeof(*sr));
+        if (!sr)
+            return;
+        sr->type = N_ELEMENT;
+        sr->tag = T_UNKNOWN;
+        sr->name = arena_strdup(a, "#fragment");
+        sr->first = n->first;
+        sr->last = n->last;
+        for (struct node *k = sr->first; k; k = k->next)
+            k->parent = sr;
+        sr->shadow_host = host;
+        sr->shadow_closed = !strcasecmp(mode, "closed");
+        host->shadow_root = sr;
+        /* the template itself goes */
+        if (n->prev) n->prev->next = n->next; else host->first = n->next;
+        if (n->next) n->next->prev = n->prev; else host->last = n->prev;
+        n->parent = n->prev = n->next = NULL;
+        n->first = n->last = NULL;
+        html_declarative_shadows(a, sr);        /* roots declared inside this one */
+        n = after;
+    }
+}

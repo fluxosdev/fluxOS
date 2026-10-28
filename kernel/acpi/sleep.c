@@ -22,12 +22,18 @@
  * display driver (Radeon, Voodoo) that cannot set its card up again, a
  * USB disk in use.
  *
- * The screen is blanked just before SLP_EN. Firmware video calls on
- * resume are opt-in: some BIOSes leave INT 10h unusable after S3 and
- * hang before we can restore the kernel. "s3_mode" restores the boot
- * video mode; "s3_bios" additionally runs the video ROM first.
- * "s3_nomode" overrides mode restoration, and "s3_beep" beeps on entry
- * to the waking vector to distinguish a failed wake from a dark screen.
+ * The screen is blanked just before SLP_EN. On real hardware the wake
+ * path runs the video ROM's initialisation again and sets the boot
+ * loader's VESA mode (what pre-KMS Linux needed on most laptops as
+ * "acpi_sleep=s3_bios,s3_mode"): the firmware seldom brings a laptop's
+ * panel back by itself, and a driver that only flips pages in the
+ * firmware's mode cannot. Under a hypervisor neither is done: its BIOS
+ * initialises the display itself on waking, and the ROM call has hung
+ * there. "s3_bios" and "s3_mode" ask for them anyway, "s3_nobios" and
+ * "s3_nomode" refuse them. "s3_beep" marks the stages on the speaker,
+ * for a machine without a picture: one beep as the firmware hands back
+ * to wakeup.S, two once the kernel is running again, three once the
+ * devices are back.
  */
 #include <uacpi/acpi.h>
 #include <uacpi/event.h>
@@ -47,14 +53,14 @@
 #include "vfs.h"
 #include "x86.h"
 
-#define WAKE_BASE 0x9000                /* as in wakeup.S: two pages below 1 MiB */
+#define WAKE_BASE 0x80000               /* as in wakeup.S: 512 KiB, a 64 KiB segment */
 
 #define WF_POST 0x1
 #define WF_VBE  0x2
 #define WF_TEXT 0x4
 #define WF_BEEP 0x8
 
-extern char wakeup_start[], wakeup_end[], wakeup_flags[], wakeup_vbe_mode[];
+extern char wakeup_start[], wakeup_end[], wakeup_flags[], wakeup_vbe_mode[], wakeup_vga_bdf[];
 
 struct cpu_context wake_context;        /* wakeup.S passes it to context_restore() */
 
@@ -64,6 +70,8 @@ static struct mutex sleep_mutex = MUTEX_INIT("sleep");
 static uint32_t irq_flags;
 static volatile int slept;              /* power was lost (the firmware woke us) */
 static volatile int sleep_failed;
+static int beeps;                       /* s3_beep: mark the stages on the speaker */
+extern spinlock_t pit_lock;             /* timer.c: port 43h */
 
 int sleep_supported(void)
 {
@@ -93,21 +101,62 @@ static void *low(uint32_t pa)
     return p;
 }
 
+/* A beep from the speaker with interrupts off and the other processors
+ * parked: straight to the timer's channel 2, as wakeup.S does. */
+static void beep(int n)
+{
+    if (!beeps)
+        return;
+    for (int i = 0; i < n; i++) {
+        spin_lock(&pit_lock);
+        outb(0x43, 0xB6);
+        outb(0x42, 0xA9);               /* about 1 kHz */
+        outb(0x42, 0x04);
+        spin_unlock(&pit_lock);
+        outb(0x61, inb(0x61) | 0x03);
+        udelay(150000);
+        outb(0x61, inb(0x61) & 0xFC);
+        udelay(150000);
+    }
+}
+
+static int under_hypervisor(void)
+{
+    uint32_t r[4];
+    cpuid(0, r);
+    if (r[0] < 1)
+        return 0;
+    cpuid(1, r);
+    return (r[2] >> 31) & 1;
+}
+
 /* wakeup.S below 1 MiB, told what to do for the screen. */
 static void place_trampoline(void)
 {
     uint8_t *dst = low(WAKE_BASE);
     memcpy(dst, wakeup_start, (size_t)(wakeup_end - wakeup_start));
     int mode = fb_wake_mode();
+    int bare = !under_hypervisor();
+    int post = (cmdline_has("s3_bios") || bare) && !cmdline_has("s3_nobios");
+    int set = (cmdline_has("s3_mode") || post) && !cmdline_has("s3_nomode");
     uint8_t flags = 0;
-    if (cmdline_has("s3_bios"))
+    if (post)
         flags |= WF_POST;
-    if ((cmdline_has("s3_mode") || cmdline_has("s3_bios")) && !cmdline_has("s3_nomode"))
+    if (set)
         flags |= mode > 0 ? WF_VBE : WF_TEXT;
-    if (cmdline_has("s3_beep"))
+    if (beeps)
         flags |= WF_BEEP;
     dst[wakeup_flags - wakeup_start] = flags;
     memcpy(dst + (wakeup_vbe_mode - wakeup_start), &(uint16_t){ (uint16_t)(mode > 0 ? mode : 0) }, 2);
+    /* The ROM's initialisation takes its device in AX (PCI firmware spec). */
+    struct pci_dev vga;
+    uint8_t pif;
+    uint16_t bdf = pci_find_class(0x0300, &vga, &pif) == 0
+                   ? (uint16_t)(vga.bus << 8 | vga.dev << 3 | vga.fn) : 0;
+    memcpy(dst + (wakeup_vga_bdf - wakeup_start), &bdf, 2);
+    klog("power: wake vector %05x: %s%s%s\n", WAKE_BASE,
+         post ? "video ROM, " : "", set ? (mode > 0 ? "VESA mode, " : "text mode, ") : "",
+         beeps ? "beeps" : "no beeps");
 }
 
 /* ---- the devices ---- */
@@ -159,12 +208,14 @@ static void machine_sleep(void)
     /* This processor first: its TSS, its settings that the power took. */
     gdt_load_tr(0);
     if (slept) {
-        cpu_init_ap();
+        cpu_resume();
         fpu_init_cpu();
     }
     pic_resume();
     pit_resume();
     serial_resume();
+    if (slept)
+        beep(2);
     klog("power: %s; restoring devices\n", slept ? "CPU resumed from S3" : "S3 entry returned");
     pci_resume();
     fb_unblank();                       /* once the card answers its VGA ports again */
@@ -189,6 +240,7 @@ int acpi_suspend(void)
     }
     mutex_lock(&sleep_mutex);
     klog("power: suspending to RAM\n");
+    beeps = cmdline_has("s3_beep");
     proc_pin(0);
 
     /* What is written stays written; then USB storage can go (which
@@ -206,14 +258,22 @@ int acpi_suspend(void)
 
     sleep_failed = 0;
     slept = 0;
+    int screen_back = 0;
     uacpi_status st = uacpi_prepare_for_sleep_state(UACPI_SLEEP_STATE_S3);
     if (st != UACPI_STATUS_OK) {
         klog("power: the firmware's _PTS failed: %s\n", uacpi_status_to_string(st));
         sleep_failed = 1;
     } else {
+        /* Nothing of uACPI's half done when interrupts go off: a GPE
+         * method still running on kacpid would hold the event lock that
+         * entering S3 takes, and with nothing else running, for ever. */
+        uacpi_kernel_wait_for_work_completion();
         irq_flags = irq_save();
         machine_sleep();
         irq_restore(irq_flags);
+        /* The screen first, so that whatever follows is seen to happen. */
+        fb_resume();
+        screen_back = 1;
         uacpi_wake_from_sleep_state(UACPI_SLEEP_STATE_S3);
         acpi_events_resume();
     }
@@ -221,7 +281,10 @@ int acpi_suspend(void)
     power_arm_wake(0);
     devices_resume();
     rtc_resync();
-    fb_resume();
+    if (!screen_back)
+        fb_resume();
+    if (slept)
+        beep(3);
     vfs_unlock();
     usb_resume();
     ec_resume();

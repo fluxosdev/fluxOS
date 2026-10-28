@@ -14,8 +14,9 @@ enum radeon_family {
     CHIP_SUMO, CHIP_SUMO2,                  /* Evergreen generation: the Llano APUs' graphics */
 };
 
-/* Evergreen's display controllers (DCE 4) moved their registers; native
- * modes and the 3D engine (radeon_modeset.c, radeon_accel.c) are R700 only. */
+/* Evergreen's display controllers (DCE 4) moved their registers. Native
+ * modes there drive a laptop panel behind a DisplayPort bridge
+ * (radeon_dp.c); the 3D engine (radeon_accel.c) is R700 only. */
 #define RADEON_EVERGREEN() (rv.family >= CHIP_SUMO)
 
 #define MM_INDEX       0x0000       /* registers past BAR2's 64 KiB, by index and data */
@@ -142,8 +143,49 @@ void radeon_accel_proc_exit(int pid);
 
 /* radeon_modeset.c */
 void radeon_modeset_init(void);     /* after the timer and the heap */
-void radeon_modeset_probe(void);    /* Evergreen: report the BIOS's outputs, change nothing */
 int radeon_native_modes(struct dispmode *out, int max);
 int radeon_native_set(const struct dispmode *m);
+void radeon_native_resume(void);    /* the native mode again, after waking */
+
+/* radeon_modeset.c, for radeon_dp.c */
+int radeon_atom_run(int index, void *args, uint32_t size);
+uint8_t *radeon_atom_scratch(void); /* the interpreter's scratch area */
+void radeon_dp_encoder(int action); /* a DIG encoder command (ATOM_ENCODER_CMD_*) */
+void radeon_dp_vsemph(uint8_t lane_set);    /* the transmitter's swing and pre-emphasis */
+
+/* DIGxEncoderControl commands */
+#define ATOM_ENCODER_CMD_DP_LINK_TRAINING_START    0x08
+#define ATOM_ENCODER_CMD_DP_LINK_TRAINING_PATTERN1 0x09
+#define ATOM_ENCODER_CMD_DP_LINK_TRAINING_PATTERN2 0x0A
+#define ATOM_ENCODER_CMD_DP_LINK_TRAINING_COMPLETE 0x0B
+#define ATOM_ENCODER_CMD_DP_VIDEO_OFF              0x0C
+#define ATOM_ENCODER_CMD_DP_VIDEO_ON               0x0D
+#define ATOM_ENCODER_CMD_SETUP                     0x0F
+#define ATOM_ENCODER_CMD_SETUP_PANEL_MODE          0x10
+
+/* How the DIG encoder talks to the sink */
+#define DP_PANEL_MODE_EXTERNAL_DP_MODE  0x00
+#define DP_PANEL_MODE_INTERNAL_DP2_MODE 0x01
+#define DP_PANEL_MODE_INTERNAL_DP1_MODE 0x11    /* NUTMEG and TRAVIS bridges */
+
+/* radeon_dp.c: the DisplayPort sink on the output in use */
+struct dp_sink {
+    uint8_t channel;                /* AUX channel: the connector's DDC line ID */
+    uint8_t hpd;                    /* its hot plug detect pin, 0xFF for none */
+    uint8_t dpcd[15];               /* receiver capabilities, DPCD 000h on */
+    int dpcd_ok;
+    uint32_t link_clock;            /* kHz: 162000, 270000 or 540000 */
+    int lanes;
+};
+extern struct dp_sink dpsink;
+
+int radeon_dp_read(uint32_t addr, void *buf, int n);       /* DPCD */
+int radeon_dp_write(uint32_t addr, const void *buf, int n);
+int radeon_dp_read_dpcd(void);
+int radeon_dp_read_edid(uint8_t *edid);     /* 128 bytes over I2C-over-AUX; 1 if valid */
+int radeon_dp_link_config(uint32_t pixclock, int bpp, int nutmeg);
+int radeon_dp_panel_mode(int bridge);
+void radeon_dp_set_power(int on);
+int radeon_dp_link_train(int panel_mode);   /* transmitter on; 0 when the link is up */
 
 #endif

@@ -190,7 +190,7 @@ static void backgrounds_and_overflow(void)
     CHECK(a->bg_size == BGS_LEN && a->bg_w.unit == U_PCT && a->bg_w.v == 5000 && a->bg_h.unit == U_AUTO);
     CHECK(b->bg_url && !strcmp(b->bg_url, "b(1).png") && b->bg_norep_x && !b->bg_norep_y);
     CHECK(b->bg == OPAQUE(0xff0000));                       /* the color is in the last layer */
-    CHECK(c->bg_url && !strcmp(c->bg_url, "//x.org/c.png") && c->grad && c->bg_size == BGS_CONTAIN);
+    CHECK(c->bg_url && !strcmp(c->bg_url, "//x.org/c.png") && c->gr && c->bg_size == BGS_CONTAIN);
     CHECK(c->bg_px.unit == U_PCT && c->bg_px.v == 5000 && c->bg_py.v == 5000);
     CHECK(d->bg_url && d->bg_norep_x && !d->bg_norep_y);
     CHECK(d->bg_px.unit == U_CALC && d->bg_px.pct == 10000 && d->bg_px.v == -5);     /* 100% - 5px */

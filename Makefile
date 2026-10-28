@@ -320,7 +320,8 @@ clean:
 HOSTCC ?= cc
 BROWSER_TEST_SRCS := lib/digest.c lib/sha256.c tests/browser-dom.c tests/canvas-font-stub.c tests/js-host-stack.c \
 	$(addprefix user/desktop/wave/js/,js.c jslib.c jslib2.c jsbinary.c jsnet.c jsre.c jsgc.c jsdom.c jscanvas.c) \
-	$(addprefix user/desktop/wave/,canvas.c html.c shadow.c webblob.c webintegrity.c webinput.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c)
+	$(addprefix user/desktop/wave/,canvas.c html.c shadow.c webblob.c webintegrity.c webinput.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c) \
+	user/libc/inflate.c
 .PHONY: test-browser
 test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout $(BUILD)/tests/browser-policy $(BUILD)/tests/browser-http $(BUILD)/tests/browser-images $(BUILD)/tests/browser-navigation $(BUILD)/tests/browser-geometry
 	$< rootfs/usr/share/www/classlist-tests.js 20
@@ -441,7 +442,7 @@ $(BUILD)/tests/browser-ws: tests/browser-ws.c $(BROWSER_TEST_SRCS) $(DESKTOP_HDR
 # Engine-level tests include real collections on the host's main and coroutine stacks.
 JS_ENGINE_SRCS := lib/digest.c lib/sha256.c tests/js-engine.c tests/js-host-stack.c \
 	$(addprefix user/desktop/wave/js/,js.c jslib.c jslib2.c jsbinary.c jsre.c jsgc.c) \
-	user/desktop/wave/webutil.c
+	user/desktop/wave/webutil.c user/libc/inflate.c
 $(BUILD)/tests/js-engine: $(JS_ENGINE_SRCS) $(DESKTOP_HDRS) include/flux/abi.h
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DJS_VM_VERIFY -pthread \
