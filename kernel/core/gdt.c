@@ -1,7 +1,9 @@
 /*
- * Global descriptor table: flat kernel and user segments plus a TSS for
- * each processor, used to find the kernel stack when an interrupt arrives
- * from ring 3 (and by this_cpu() to tell the processors apart).
+ * Global descriptor table: flat kernel and user segments, the segments
+ * a Win32 program runs in (based at the start of user space, so that it
+ * sees its own addresses: winrun), plus a TSS for each processor, used
+ * to find the kernel stack when an interrupt arrives from ring 3 (and by
+ * this_cpu() to tell the processors apart).
  */
 #include "kernel.h"
 #include "arch.h"
@@ -34,7 +36,8 @@ struct tss {
     uint16_t iomap_base;
 } __attribute__((packed));
 
-static struct gdt_entry gdt[5 + MAX_CPUS];
+#define GDT_FIXED 8                     /* entries before the TSSs */
+static struct gdt_entry gdt[GDT_FIXED + MAX_CPUS];
 static struct gdt_ptr gdt_desc;
 static struct tss tss[MAX_CPUS];
 
@@ -58,12 +61,16 @@ void gdt_init(void)
     gdt_set(2, 0, 0xFFFFF, 0x92, 0xCF);     /* kernel data, ring 0 */
     gdt_set(3, 0, 0xFFFFF, 0xFA, 0xCF);     /* user code, ring 3 */
     gdt_set(4, 0, 0xFFFFF, 0xF2, 0xCF);     /* user data, ring 3 */
+    /* Win32 programs: 2 GiB from WIN_SEG_BASE, and the thread block */
+    gdt_set(5, WIN_SEG_BASE, (WIN_SEG_LIMIT >> 12) - 1, 0xFA, 0xC0);
+    gdt_set(6, WIN_SEG_BASE, (WIN_SEG_LIMIT >> 12) - 1, 0xF2, 0xC0);
+    gdt_set(7, WIN_TEB_LINEAR, (WIN_TEB_SIZE >> 12) - 1, 0xF2, 0xC0);
 
     memset(tss, 0, sizeof(tss));
     for (int i = 0; i < MAX_CPUS; i++) {
         tss[i].ss0 = SEG_KDATA;
         tss[i].iomap_base = sizeof(tss[i]);     /* no I/O permission bitmap */
-        gdt_set(5 + i, (uint32_t)&tss[i], sizeof(tss[i]) - 1, 0x89, 0x00);
+        gdt_set(GDT_FIXED + i, (uint32_t)&tss[i], sizeof(tss[i]) - 1, 0x89, 0x00);
     }
 
     gdt_desc.limit = sizeof(gdt) - 1;
@@ -77,7 +84,7 @@ void gdt_init(void)
  * (suspend to RAM): it is made available again first. */
 void gdt_load_tr(int cpu)
 {
-    gdt[5 + cpu].access = 0x89;
+    gdt[GDT_FIXED + cpu].access = 0x89;
     tss_flush(SEG_TSS + 8 * (uint32_t)cpu);
 }
 

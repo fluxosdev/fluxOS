@@ -1,7 +1,8 @@
 /*
- * execve: load a static ELF32 executable (or a "#!" script, or a DOS
- * program, which runs under /bin/dos) into a new address space and
- * build the initial user stack:
+ * execve: load a static ELF32 executable (or a "#!" script, a Windows
+ * program, which runs under /bin/winrun, or a DOS program, which runs
+ * under /bin/dos) into a new address space and build the initial user
+ * stack:
  *
  *   sp -> argc, argv[0..argc-1], NULL, envp[0..n-1], NULL, strings...
  */
@@ -19,6 +20,7 @@
 #define PF_W      2
 
 #define DOS_LOADER "/bin/dos"
+#define WIN_LOADER "/bin/winrun"
 
 #define MAX_ARG_BYTES (256 * 1024)
 #define MAX_ARGS      4096
@@ -295,6 +297,24 @@ static int exec_script(struct proc *p, struct image *vn, const char *path,
     return exec_interp(p, interp, path, argv, envp);
 }
 
+/* A Windows program: an "MZ" executable whose header points at a "PE" one. */
+static int is_pe_program(const struct image *img)
+{
+    if (img->have < 0x40 || !((img->data[0] == 'M' && img->data[1] == 'Z') ||
+                              (img->data[0] == 'Z' && img->data[1] == 'M')))
+        return 0;
+    uint32_t off;
+    memcpy(&off, img->data + 0x3C, 4);
+    if (off < 0x40 || off > img->size - 4 || (off & 3))
+        return 0;
+    uint8_t sig[4];
+    if (off + 4 <= img->have)
+        memcpy(sig, img->data + off, 4);
+    else if (vfs_read(img->vn, sig, off, 4) != 4)
+        return 0;
+    return sig[0] == 'P' && sig[1] == 'E' && sig[2] == 0 && sig[3] == 0;
+}
+
 /* A DOS program: an "MZ" executable, or a .COM file, which has no header. */
 static int is_dos_program(const struct image *img, const char *path)
 {
@@ -325,6 +345,10 @@ int proc_exec(struct proc *p, const char *path, char *const argv[], char *const 
         return r;
     if (img.have >= 2 && img.data[0] == '#' && img.data[1] == '!')
         return exec_script(p, &img, path, argv, envp);
+    if (is_pe_program(&img)) {
+        image_free(&img);
+        return exec_interp(p, WIN_LOADER, path, argv, envp);
+    }
     if (is_dos_program(&img, path)) {
         image_free(&img);
         return exec_interp(p, DOS_LOADER, path, argv, envp);

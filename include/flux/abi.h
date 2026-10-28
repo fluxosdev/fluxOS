@@ -266,6 +266,20 @@ struct flux_mmap_args {
     uint32_t offset;
 };
 
+/* ---- Win32 programs (winrun) ----
+ * A Windows program keeps its own addresses: it runs through code and
+ * data segments whose base is the start of user space, so its address 0
+ * is linear WIN_SEG_BASE and its 2 GiB lie over the user half. Its FS
+ * segment is the thread block, which the loader maps at WIN_TEB_LINEAR.
+ * The descriptors are constant and in every address space (gdt.c). */
+#define WIN_SEG_BASE   0x40000000u
+#define WIN_SEG_LIMIT  0x80000000u
+#define WIN_TEB_LINEAR 0xAFFF0000u
+#define WIN_TEB_SIZE   0x10000u
+#define SEG_WIN_CODE   (0x28 | 3)
+#define SEG_WIN_DATA   (0x30 | 3)
+#define SEG_WIN_FS     (0x38 | 3)
+
 /* ---- utime(2) and times(2) ---- */
 struct flux_utimbuf {
     int32_t actime;
