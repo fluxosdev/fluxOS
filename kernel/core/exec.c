@@ -15,13 +15,16 @@
 #define ET_EXEC   2
 #define EM_386    3
 #define PT_LOAD   1
+#define PF_X      1
+#define PF_W      2
 
 #define DOS_LOADER "/bin/dos"
 
 #define MAX_ARG_BYTES (256 * 1024)
-#define MAX_IMAGE     (32u << 20)
 #define MAX_ARGS      4096
 #define STACK_SLACK   (4 * PAGE_SIZE)
+#define HEAD_BYTES    4096              /* of a file on disk: enough for the ELF header, "#!" or "MZ" */
+#define COPY_CHUNK    (64 * 1024)       /* a segment is read in pieces this big */
 
 struct elf32_ehdr {
     uint8_t ident[16];
@@ -45,32 +48,42 @@ static int count_strings(char *const v[], uint32_t *bytes)
     return n;
 }
 
-/* An executable's bytes: ramfs files are used in place, others read in. */
+/*
+ * An executable's bytes: a ramfs file whole, in place; a file on disk by
+ * its first HEAD_BYTES, the rest read straight into the new address space
+ * as it is loaded, so that a large program never needs the kernel heap
+ * to hold all of it.
+ */
 struct image {
+    struct vnode *vn;
     const uint8_t *data;
-    uint32_t size;
+    uint32_t size;                      /* of the file */
+    uint32_t have;                      /* bytes at data */
     uint8_t *owned;
 };
 
 static int image_load(struct vnode *vn, struct image *img)
 {
+    img->vn = vn;
     img->owned = NULL;
     img->size = vn->size;
     if (!vn->fs) {
         img->data = vn->data;
+        img->have = vn->size;
         return 0;
     }
-    if (vn->size > MAX_IMAGE)
-        return -E2BIG;
-    img->owned = kmalloc(vn->size ? vn->size : 1);
+    uint32_t n = MIN(vn->size, (uint32_t)HEAD_BYTES);
+    img->owned = kmalloc(n ? n : 1);
     if (!img->owned)
         return -ENOMEM;
-    int r = vfs_read(vn, img->owned, 0, vn->size);
-    if (r != (int)vn->size) {
+    int r = vfs_read(vn, img->owned, 0, n);
+    if (r != (int)n) {
         kfree(img->owned);
+        img->owned = NULL;
         return r < 0 ? r : -EIO;
     }
     img->data = img->owned;
+    img->have = n;
     return 0;
 }
 
@@ -80,39 +93,111 @@ static void image_free(struct image *img)
     img->owned = NULL;
 }
 
-static int load_segments(uint32_t *pd, const struct image *vn, uint32_t *entry, uint32_t *top)
+/* n bytes of the file from off into the new address space at va. */
+static int image_copy_in(uint32_t *pd, const struct image *img, uint32_t va, uint32_t off, uint32_t n)
 {
-    const struct elf32_ehdr *eh = (const struct elf32_ehdr *)vn->data;
+    if (!n)
+        return 0;
+    if (off + n <= img->have)
+        return vmm_copy_to(pd, va, img->data + off, n) < 0 ? -EFAULT : 0;
+    uint8_t *buf = kmalloc(COPY_CHUNK);
+    if (!buf)
+        return -ENOMEM;
+    int r = 0;
+    while (n && r == 0) {
+        uint32_t chunk = MIN(n, (uint32_t)COPY_CHUNK);
+        int got = vfs_read(img->vn, buf, off, chunk);
+        if (got != (int)chunk)
+            r = got < 0 ? got : -EIO;
+        else if (vmm_copy_to(pd, va, buf, chunk) < 0)
+            r = -EFAULT;
+        va += chunk;
+        off += chunk;
+        n -= chunk;
+    }
+    kfree(buf);
+    return r;
+}
 
-    if (vn->size < sizeof(*eh) || memcmp(eh->ident, ELF_MAGIC, 4) != 0)
+/* Is the page at va part of a writable segment? */
+static int page_writable(const struct elf32_phdr *ph, int nph, uint32_t va)
+{
+    for (int i = 0; i < nph; i++) {
+        if (ph[i].type != PT_LOAD || !ph[i].memsz || !(ph[i].flags & PF_W))
+            continue;
+        if (va + PAGE_SIZE > ALIGN_DOWN(ph[i].vaddr, PAGE_SIZE) && va < ph[i].vaddr + ph[i].memsz)
+            return 1;
+    }
+    return 0;
+}
+
+static int load_segments(uint32_t *pd, const struct image *img, uint32_t *entry, uint32_t *top)
+{
+    const struct elf32_ehdr *eh = (const struct elf32_ehdr *)img->data;
+
+    if (img->have < sizeof(*eh) || memcmp(eh->ident, ELF_MAGIC, 4) != 0)
         return -ENOEXEC;
     if (eh->ident[4] != 1 || eh->ident[5] != 1 || eh->type != ET_EXEC ||
         eh->machine != EM_386 || eh->phentsize != sizeof(struct elf32_phdr))
         return -ENOEXEC;
-    if (eh->phoff > vn->size || eh->phnum * sizeof(struct elf32_phdr) > vn->size - eh->phoff)
+    uint32_t ph_bytes = (uint32_t)eh->phnum * sizeof(struct elf32_phdr);
+    if (eh->phoff > img->size || ph_bytes > img->size - eh->phoff)
         return -ENOEXEC;
 
-    const struct elf32_phdr *ph = (const struct elf32_phdr *)(vn->data + eh->phoff);
+    /* The program headers: in the head read already, or else fetched. */
+    struct elf32_phdr *fetched = NULL;
+    const struct elf32_phdr *ph;
+    if (eh->phoff + ph_bytes <= img->have) {
+        ph = (const struct elf32_phdr *)(img->data + eh->phoff);
+    } else {
+        fetched = kmalloc(ph_bytes ? ph_bytes : 1);
+        if (!fetched)
+            return -ENOMEM;
+        if (vfs_read(img->vn, fetched, eh->phoff, ph_bytes) != (int)ph_bytes) {
+            kfree(fetched);
+            return -EIO;
+        }
+        ph = fetched;
+    }
+
+    int r = 0;
     *top = 0;
-    for (int i = 0; i < eh->phnum; i++, ph++) {
-        if (ph->type != PT_LOAD || ph->memsz == 0)
+    for (int i = 0; i < eh->phnum && r == 0; i++) {
+        const struct elf32_phdr *p = &ph[i];
+        if (p->type != PT_LOAD || p->memsz == 0)
             continue;
-        uint32_t end = ph->vaddr + ph->memsz;
-        if (ph->memsz < ph->filesz || ph->vaddr < USER_BASE || end < ph->vaddr ||
-            end > USER_MMIO_BASE || ph->offset > vn->size ||
-            ph->filesz > vn->size - ph->offset)
-            return -ENOEXEC;
-        for (uint32_t va = ALIGN_DOWN(ph->vaddr, PAGE_SIZE); va < end; va += PAGE_SIZE)
+        uint32_t end = p->vaddr + p->memsz;
+        if (p->memsz < p->filesz || p->vaddr < USER_BASE || end < p->vaddr ||
+            end > USER_MMIO_BASE || p->offset > img->size ||
+            p->filesz > img->size - p->offset) {
+            r = -ENOEXEC;
+            break;
+        }
+        for (uint32_t va = ALIGN_DOWN(p->vaddr, PAGE_SIZE); va < end && r == 0; va += PAGE_SIZE)
             if (vmm_alloc(pd, va) < 0)
-                return -ENOMEM;
-        if (vmm_copy_to(pd, ph->vaddr, vn->data + ph->offset, ph->filesz) < 0)
-            return -EFAULT;
+                r = -ENOMEM;
+        if (r == 0)
+            r = image_copy_in(pd, img, p->vaddr, p->offset, p->filesz);
         *top = MAX(*top, end);
     }
-    if (*top == 0 || eh->entry < USER_BASE || eh->entry >= *top)
-        return -ENOEXEC;
-    *entry = eh->entry;
-    return 0;
+    if (r == 0 && (*top == 0 || eh->entry < USER_BASE || eh->entry >= *top))
+        r = -ENOEXEC;
+
+    /* The segments' own permissions: code and read-only data stay as the
+     * compiler left them, unless a writable segment shares the page. */
+    for (int i = 0; i < eh->phnum && r == 0; i++) {
+        const struct elf32_phdr *p = &ph[i];
+        if (p->type != PT_LOAD || p->memsz == 0 || (p->flags & PF_W))
+            continue;
+        uint32_t prot = PROT_READ | ((p->flags & PF_X) ? PROT_EXEC : 0);
+        for (uint32_t va = ALIGN_DOWN(p->vaddr, PAGE_SIZE); va < p->vaddr + p->memsz; va += PAGE_SIZE)
+            if (!page_writable(ph, eh->phnum, va))
+                vmm_protect_page(pd, va, prot);
+    }
+    kfree(fetched);
+    if (r == 0)
+        *entry = eh->entry;
+    return r;
 }
 
 static int build_stack(uint32_t *pd, char *const argv[], char *const envp[], uint32_t *sp_out)
@@ -198,9 +283,9 @@ static int exec_script(struct proc *p, struct image *vn, const char *path,
 {
     char interp[PATH_MAX];
     uint32_t i = 2, n = 0;
-    while (i < vn->size && vn->data[i] == ' ')
+    while (i < vn->have && vn->data[i] == ' ')
         i++;
-    while (i < vn->size && n < sizeof(interp) - 1 && vn->data[i] != '\n' &&
+    while (i < vn->have && n < sizeof(interp) - 1 && vn->data[i] != '\n' &&
            vn->data[i] != ' ' && vn->data[i] != '\r')
         interp[n++] = (char)vn->data[i++];
     interp[n] = 0;
@@ -213,10 +298,10 @@ static int exec_script(struct proc *p, struct image *vn, const char *path,
 /* A DOS program: an "MZ" executable, or a .COM file, which has no header. */
 static int is_dos_program(const struct image *img, const char *path)
 {
-    if (img->size >= 2 && ((img->data[0] == 'M' && img->data[1] == 'Z') ||
+    if (img->have >= 2 && ((img->data[0] == 'M' && img->data[1] == 'Z') ||
                            (img->data[0] == 'Z' && img->data[1] == 'M')))
         return 1;
-    if (img->size >= 4 && memcmp(img->data, ELF_MAGIC, 4) == 0)
+    if (img->have >= 4 && memcmp(img->data, ELF_MAGIC, 4) == 0)
         return 0;
     uint32_t n = strlen(path);
     return n > 4 && img->size > 0 && img->size <= 0xFF00 && path[n - 4] == '.' &&
@@ -238,7 +323,7 @@ int proc_exec(struct proc *p, const char *path, char *const argv[], char *const 
     r = image_load(vn, &img);
     if (r < 0)
         return r;
-    if (img.size >= 2 && img.data[0] == '#' && img.data[1] == '!')
+    if (img.have >= 2 && img.data[0] == '#' && img.data[1] == '!')
         return exec_script(p, &img, path, argv, envp);
     if (is_dos_program(&img, path)) {
         image_free(&img);

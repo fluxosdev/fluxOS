@@ -1647,7 +1647,9 @@ static int fetch(uint64_t addr, uint32_t *dst, uint32_t n)
             if (!(pte & PTE_VALID))
                 return -1;
             uint32_t chunk = MIN(left, 4096 - (off & 0xFFF));
-            memcpy(out, (const void *)((pte & ~0xFFFu) + (off & 0xFFF)), chunk);
+            /* The page is the process's, perhaps in high memory, which the
+             * kernel only reaches through a temporary mapping. */
+            vmm_read_phys(out, (pte & ~0xFFFu) + (off & 0xFFF), chunk);
             out += chunk;
             off += chunk;
             left -= chunk;

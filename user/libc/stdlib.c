@@ -296,7 +296,15 @@ void *realloc(void *p, size_t n)
     return q;
 }
 
-static int env_owned;
+/*
+ * The environment starts on the stack, as the kernel laid it out. Before
+ * the first change it is moved to the heap, array and strings alike, so
+ * that entries can be freed when they are replaced or removed; the array
+ * grows by doubling. A program that points environ at an array of its
+ * own gets that array left alone (and copied again on the next change).
+ */
+static char **owned_env;                /* the array we allocated, if environ still is it */
+static int env_cap;
 
 static int env_count(void)
 {
@@ -306,20 +314,35 @@ static int env_count(void)
     return n;
 }
 
-/* Move environ to the heap before the first modification. */
+/* Room for `extra` more entries in an environ that is ours. */
 static int env_own(int extra)
 {
     int n = env_count();
-    char **e = malloc(sizeof(char *) * (size_t)(n + extra + 1));
+    int owned = environ && environ == owned_env;
+    if (owned && n + extra + 1 <= env_cap)
+        return 0;
+    int cap = n + extra + 1;
+    if (owned && cap < 2 * env_cap)
+        cap = 2 * env_cap;
+    if (cap < 16)
+        cap = 16;
+    char **e = malloc(sizeof(char *) * (size_t)cap);
     if (!e)
         return -1;
-    for (int i = 0; i < n; i++)
-        e[i] = environ[i];
+    for (int i = 0; i < n; i++) {
+        e[i] = owned ? environ[i] : strdup(environ[i]);
+        if (!e[i]) {
+            while (i-- > 0)
+                free(e[i]);
+            free(e);
+            return -1;
+        }
+    }
     e[n] = NULL;
-    if (env_owned)
+    if (owned)
         free(environ);
-    environ = e;
-    env_owned = 1;
+    environ = owned_env = e;
+    env_cap = cap;
     return 0;
 }
 
@@ -358,6 +381,7 @@ int setenv(const char *name, const char *value, int overwrite)
         return -1;
     }
     if (i >= 0) {
+        free(environ[i]);               /* ours, once env_own() has run */
         environ[i] = entry;
     } else {
         int n = env_count();
@@ -374,6 +398,7 @@ int unsetenv(const char *name)
         return 0;
     if (env_own(0) < 0)
         return -1;
+    free(environ[i]);
     for (; environ[i]; i++)
         environ[i] = environ[i + 1];
     return 0;

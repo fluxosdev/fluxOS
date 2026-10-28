@@ -37,6 +37,7 @@ int mutex_held(const struct mutex *m) { (void)m; return 0; }
 #ifndef KTEST_PROC
 void sleep_on(void *chan);
 void sleep_on_lock(void *chan, spinlock_t *lk) { (void)lk; sleep_on(chan); }
+void sleep_on_lock_intr(void *chan, spinlock_t *lk) { (void)lk; sleep_on(chan); }
 void prepare_wait(void *chan) { (void)chan; }
 void prepare_wait_timeout(void *chan, uint32_t deadline) { (void)chan; (void)deadline; }
 void cancel_wait(void) {}

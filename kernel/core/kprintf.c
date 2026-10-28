@@ -7,8 +7,6 @@
 #include "smp.h"
 #include "x86.h"
 
-#define KLOG_SIZE 16384
-
 static char klog_buf[KLOG_SIZE];
 static uint32_t klog_head;      /* total bytes ever written */
 static spinlock_t log_lock = SPINLOCK_INIT("log");

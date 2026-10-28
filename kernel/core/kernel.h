@@ -38,6 +38,7 @@ extern char kernel_start[], kernel_end[];
 void kprintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void klog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void kputs(const char *s);
+#define KLOG_SIZE 16384                 /* the ring buffer: the most klog_read() gives */
 int klog_read(char *buf, uint32_t size);
 
 /* Random numbers (random.c): interrupts add timing, readers get SHA-256 output. */

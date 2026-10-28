@@ -69,8 +69,12 @@ static void make_ready(struct proc *p)
     }
     p->state = P_READY;
     p->ready_tick = ticks;
-    if (!smp_wake_idle(p->pin_cpu >= 0 ? p->pin_cpu : p->last_cpu))
+    if (p->pin_cpu >= 0) {              /* only that processor may run it: tell it */
+        if (!smp_wake_cpu(p->pin_cpu))
+            this_cpu()->resched = 1;
+    } else if (!smp_wake_idle(p->last_cpu)) {
         this_cpu()->resched = 1;
+    }
 }
 
 static struct proc *proc_find_locked(int pid)
@@ -192,13 +196,24 @@ static void sched_switch(void)
     c->resched = 0;
     c->proc = next;
     /* Wakeups made while this CPU was idle may have selected it repeatedly.
-     * Hand any remaining work to another idle core, including at boot. */
-    if (ncpus > 1 && next != c->idle)
-        for (int i = 1; i < MAX_PROCS; i++)
-            if (procs[i].state == P_READY) {
-                smp_wake_idle(procs[i].last_cpu);
-                break;
+     * Hand any remaining work to another idle core, including at boot; a
+     * process pinned to another processor is that processor's whatever
+     * this one does next, so it is told even if this one goes idle. */
+    if (ncpus > 1) {
+        int handed = next == c->idle;
+        for (int i = 1; i < MAX_PROCS; i++) {
+            struct proc *q = &procs[i];
+            if (q->state != P_READY)
+                continue;
+            if (q->pin_cpu >= 0) {
+                if (q->pin_cpu != c->index)
+                    smp_wake_cpu(q->pin_cpu);
+            } else if (!handed) {
+                smp_wake_idle(q->last_cpu);
+                handed = 1;
             }
+        }
+    }
     if (next == prev)
         return;
 
@@ -713,7 +728,8 @@ static void deliver(struct proc *p, int sig)
     } else if (p->state == P_RUNNING && p != this_cpu()->proc) {
         smp_kick_proc(p);               /* running on another processor */
     }
-    this_cpu()->resched = 1;
+    /* The current process sees it on its way back to user mode, and a
+     * ready one when it next runs: no reschedule of this processor needed. */
 }
 
 /* With sched_lock: tell p's parent that p stopped or went on (SIGCHLD,

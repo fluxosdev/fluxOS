@@ -357,9 +357,15 @@ int msleep(unsigned int ms) { return ret(sc1(SYS_sleep, (int)ms)); }
 unsigned int sleep(unsigned int seconds)
 {
     unsigned int start = uptime_ms();
-    if (msleep(seconds * 1000) < 0) {
-        unsigned int elapsed = (uptime_ms() - start) / 1000;
-        return elapsed < seconds ? seconds - elapsed : 0;
+    /* An hour at a time: the kernel takes milliseconds, which seconds
+     * beyond 49 days would not fit in. */
+    for (unsigned int left = seconds; left; ) {
+        unsigned int chunk = left > 3600 ? 3600 : left;
+        if (msleep(chunk * 1000) < 0) {
+            unsigned int elapsed = (uptime_ms() - start) / 1000;
+            return elapsed < seconds ? seconds - elapsed : 0;
+        }
+        left -= chunk;
     }
     return 0;
 }

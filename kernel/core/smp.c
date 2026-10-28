@@ -480,6 +480,24 @@ int smp_wake_idle(int preferred)
     return 0;
 }
 
+/* A process that may only run on processor cpu is ready: make that one
+ * look, whether it is idle (an IPI wakes it) or busy (it switches on its
+ * way out of the kernel). 1 if it was told, or is this processor. */
+int smp_wake_cpu(int cpu)
+{
+    if (cpu < 0 || cpu >= ncpus)
+        return 0;
+    struct cpu *c = &cpus[cpu];
+    if (c == this_cpu()) {
+        c->resched = 1;
+        return 1;
+    }
+    if (!c->online)
+        return 0;
+    resched_cpu(c);
+    return 1;
+}
+
 /* p runs on another processor: make it come into the kernel (for a signal). */
 void smp_kick_proc(struct proc *p)
 {

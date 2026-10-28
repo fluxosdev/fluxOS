@@ -120,9 +120,10 @@ static int spkr_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
     (void)vn;
     switch (req) {
     case SPKR_TONE: {
-        if (!user_access_ok((void *)arg, sizeof(struct spkr_tone)))
+        struct spkr_tone tone;
+        if (copy_from_user(&tone, (const void *)arg, sizeof(tone)) < 0)
             return -EFAULT;
-        const struct spkr_tone *t = (const struct spkr_tone *)arg;
+        const struct spkr_tone *t = &tone;
         spin_lock(&spkr_lock);
         while (queue_tone(t->freq, t->ms) < 0) {
             if (signal_pending(current)) {

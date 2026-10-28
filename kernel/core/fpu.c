@@ -44,6 +44,13 @@ int kernel_sse;
  * zero, so nothing of an earlier process shows through. */
 static uint8_t fpu_clean[512] __attribute__((aligned(16)));
 
+/* The MXCSR bits this processor has (bits 31:16 never, bit 6 only with
+ * DAZ): FXRSTOR faults on any other, so a process's saved MXCSR is cut
+ * down to these before it is loaded. FXSAVE reports the mask (0 meaning
+ * the original 0xFFBF). */
+#define FX_MXCSR_MASK 28
+static uint32_t mxcsr_mask = 0xFFBF;
+
 static inline void clts(void)
 {
     __asm__ volatile("clts" ::: "memory");
@@ -76,6 +83,16 @@ void fpu_init_cpu(void)
 void fpu_init(void)
 {
     fpu_init_cpu();
+    /* FXSAVE a zeroed image to learn the MXCSR mask: a zero in the image
+     * afterwards means the processor leaves it at the default. */
+    static uint8_t probe[512] __attribute__((aligned(16)));
+    clts();
+    __asm__ volatile("fxsave %0" : "=m"(probe) : : "memory");
+    stts();
+    uint32_t mask;
+    memcpy(&mask, probe + FX_MXCSR_MASK, sizeof(mask));
+    if (mask)
+        mxcsr_mask = mask;
     uint16_t fcw = FCW_DEFAULT;
     uint32_t mxcsr = MXCSR_DEFAULT;
     memcpy(fpu_clean + FX_FCW, &fcw, sizeof(fcw));
@@ -186,7 +203,7 @@ void fpu_restore_from(struct proc *p, int32_t used, const uint8_t in[512])
         memcpy(p->fpu, in, 512);
         uint32_t mxcsr;
         memcpy(&mxcsr, p->fpu + FX_MXCSR, sizeof(mxcsr));
-        mxcsr &= 0xFFBFu;               /* clear reserved MXCSR bits before FXRSTOR */
+        mxcsr &= mxcsr_mask;            /* reserved bits set would fault FXRSTOR, in ring 0 */
         memcpy(p->fpu + FX_MXCSR, &mxcsr, sizeof(mxcsr));
     }
     irq_restore(flags);

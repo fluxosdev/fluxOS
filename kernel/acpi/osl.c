@@ -300,7 +300,7 @@ static int sem_take(struct sem *s, uint16_t timeout)
 {
     int sleep = osl_can_sleep();
     uint64_t deadline = now_ns() + (uint64_t)timeout * 1000000u;
-    uint32_t tick_deadline = ticks + (timeout + 9) / 10 + 1;
+    uint32_t tick_deadline = ticks + ((uint32_t)timeout * HZ + 999) / 1000 + 1;
     spin_lock(&s->lk);
     for (;;) {
         if (s->count) {

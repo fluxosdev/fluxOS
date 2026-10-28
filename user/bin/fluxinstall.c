@@ -456,6 +456,13 @@ int main(int argc, char **argv)
         die("%s: unsupported sector size %u", dev, target.sector_size);
     if (target.sectors < PART_START + MIN_PART)
         die("%s is too small: fluxOS needs a disk of at least 34 MiB", dev);
+    /* Nothing may be mounted from it (the system itself, say): the kernel
+     * would refuse the partition rescan, but only after the boot sector
+     * had been written. */
+    for (int k = 0; blkinfo(k, &bi) == 0; k++)
+        if (bi.mountpoint[0] && on_disk(bi.name, disk))
+            die("%s is in use: /dev/%s is mounted on %s (unmount it first)", dev, bi.name,
+                bi.mountpoint);
 
     char path[PATH_MAX];
     struct statfs sfs;

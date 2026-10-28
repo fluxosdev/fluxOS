@@ -62,4 +62,9 @@ void trapret(void);
 void forkret(void);                     /* a new process's first way out of the kernel */
 void switch_context(uint32_t *old_esp, uint32_t new_esp);
 
+/* A copy that survives a missing user page (entry.S): 0, or -EFAULT. The
+ * page fault handler turns a fault at uaccess_copy_ip into uaccess_fixup. */
+int uaccess_copy(void *dst, const void *src, uint32_t n);
+extern char uaccess_copy_ip[], uaccess_fixup[];
+
 #endif

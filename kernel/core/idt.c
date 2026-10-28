@@ -187,6 +187,11 @@ static void handle_exception(struct trapframe *tf, int from_user)
         if (grown)
             return;
     }
+    /* copy_from_user/copy_to_user found the page gone: they return -EFAULT. */
+    if (!from_user && vec == 14 && tf->eip == (uint32_t)uaccess_copy_ip) {
+        tf->eip = (uint32_t)uaccess_fixup;
+        return;
+    }
     if (from_user) {
         if (vec == 7) {                 /* first FPU use since a task switch */
             fpu_trap();

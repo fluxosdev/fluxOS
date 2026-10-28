@@ -949,10 +949,12 @@ static int set_format(int *field, int value)
 
 static int get_int(uint32_t arg, int *v)
 {
-    if (!user_access_ok((void *)arg, sizeof(int)))
-        return -EFAULT;
-    *v = *(int *)arg;
-    return 0;
+    return copy_from_user(v, (const void *)arg, sizeof(*v));
+}
+
+static int put_int(uint32_t arg, int v)
+{
+    return copy_to_user((void *)arg, &v, sizeof(v));
 }
 
 /* Codec bytes as the bytes of write()'s format that make them. */
@@ -984,47 +986,39 @@ static int dsp_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg)
         v = v < MIN_RATE ? MIN_RATE : v > MAX_RATE ? MAX_RATE : v;
         if ((r = set_format(&hda.rate, v)) < 0)
             return r;
-        *(int *)arg = hda.rate;
-        return 0;
+        return put_int(arg, hda.rate);
     case SNDCTL_DSP_CHANNELS:
         if ((r = get_int(arg, &v)) < 0)
             return r;
         if ((r = set_format(&hda.channels, v >= 2 ? 2 : 1)) < 0)
             return r;
-        *(int *)arg = hda.channels;
-        return 0;
+        return put_int(arg, hda.channels);
     case SNDCTL_DSP_SETFMT:
         if ((r = get_int(arg, &v)) < 0)
             return r;
         if ((r = set_format(&hda.fmt_user, v == AFMT_S16_LE ? AFMT_S16_LE : AFMT_U8)) < 0)
             return r;
-        *(int *)arg = hda.fmt_user;
-        return 0;
+        return put_int(arg, hda.fmt_user);
     case SNDCTL_DSP_GETOSPACE: {
-        if (!user_access_ok((void *)arg, sizeof(struct audio_buf_info)))
-            return -EFAULT;
-        struct audio_buf_info *bi = (struct audio_buf_info *)arg;
+        struct audio_buf_info bi;
         uint32_t room = RING_SIZE - ring_used();
         room = room > MAX_PER_IN * FRAME ? room - MAX_PER_IN * FRAME : 0;
         uint32_t frag = user_bytes(HALF);
-        bi->bytes = (int32_t)user_bytes(room);
-        bi->fragsize = (int32_t)frag;
-        bi->fragstotal = RING_SIZE / HALF;
-        bi->fragments = frag ? bi->bytes / (int32_t)frag : 0;
-        return 0;
+        bi.bytes = (int32_t)user_bytes(room);
+        bi.fragsize = (int32_t)frag;
+        bi.fragstotal = RING_SIZE / HALF;
+        bi.fragments = frag ? bi.bytes / (int32_t)frag : 0;
+        return copy_to_user((void *)arg, &bi, sizeof(bi));
     }
     case SNDCTL_DSP_GETODELAY: {
-        if (!user_access_ok((void *)arg, sizeof(int)))
-            return -EFAULT;
         uint32_t queued = ring_used() + (hda.running ? hda.real[0] + hda.real[1] : 0);
-        *(int *)arg = (int)user_bytes(queued);
-        return 0;
+        return put_int(arg, (int)user_bytes(queued));
     }
-    case SOUND_INFO:
-        if (!user_access_ok((void *)arg, sizeof(struct sound_info)))
-            return -EFAULT;
-        sound_get_info((struct sound_info *)arg);
-        return 0;
+    case SOUND_INFO: {
+        struct sound_info si;
+        sound_get_info(&si);
+        return copy_to_user((void *)arg, &si, sizeof(si));
+    }
     }
     return -EINVAL;
 }
@@ -1035,27 +1029,26 @@ static int mixer_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg)
 {
     (void)vn;
     if (req == SOUND_INFO) {
-        if (!user_access_ok((void *)arg, sizeof(struct sound_info)))
-            return -EFAULT;
-        sound_get_info((struct sound_info *)arg);
-        return 0;
+        struct sound_info si;
+        sound_get_info(&si);
+        return copy_to_user((void *)arg, &si, sizeof(si));
     }
     if (req != MIXER_READ && req != MIXER_WRITE)
         return -EINVAL;
-    if (!user_access_ok((void *)arg, sizeof(struct mixer_level)))
+    struct mixer_level ml;
+    if (copy_from_user(&ml, (const void *)arg, sizeof(ml)) < 0)
         return -EFAULT;
-    struct mixer_level *ml = (struct mixer_level *)arg;
-    int *level = ml->channel == MIXER_MASTER ? &hda.master :
-                 ml->channel == MIXER_PCM ? &hda.pcm : NULL;
+    int *level = ml.channel == MIXER_MASTER ? &hda.master :
+                 ml.channel == MIXER_PCM ? &hda.pcm : NULL;
     if (!level)
         return -EINVAL;
     if (req == MIXER_READ) {
-        ml->left = ml->right = (uint32_t)*level;
-        return 0;
+        ml.left = ml.right = (uint32_t)*level;
+        return copy_to_user((void *)arg, &ml, sizeof(ml));
     }
-    uint32_t v = (ml->left + ml->right) / 2;
+    uint32_t v = (ml.left + ml.right) / 2;
     *level = (int)MIN(v, 100u);
-    if (ml->channel == MIXER_MASTER && hda.hw_master)
+    if (ml.channel == MIXER_MASTER && hda.hw_master)
         apply_master();
     return 0;
 }

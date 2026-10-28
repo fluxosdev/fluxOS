@@ -327,7 +327,7 @@ static void vga_putc(char c)
         if (c >= '0' && c <= '9') {
             if (nparams == 0)
                 nparams = 1;
-            if (nparams <= MAX_PARAMS)
+            if (nparams <= MAX_PARAMS && params[nparams - 1] < 10000)   /* no overflow on a runaway number */
                 params[nparams - 1] = params[nparams - 1] * 10 + (c - '0');
         } else if (c == ';') {
             if (nparams == 0)

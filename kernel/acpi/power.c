@@ -29,6 +29,7 @@
 #include "acpi.h"
 #include "blkdev.h"
 #include "drivers.h"
+#include "syscall.h"
 #include "proc.h"
 #include "vfs.h"
 
@@ -824,7 +825,6 @@ int power_syscall(uint32_t op, uint32_t arg)
 {
     switch (op) {
     case POWER_INFO: {
-        struct powerinfo *out = (struct powerinfo *)arg;
         struct powerinfo pi;
         spin_lock(&info_lock);
         pi = info;
@@ -834,8 +834,7 @@ int power_syscall(uint32_t op, uint32_t arg)
             pi.flags |= PWR_CAN_SLEEP;
         else
             strlcpy(pi.nosleep, why, sizeof(pi.nosleep));
-        *out = pi;
-        return 0;
+        return copy_to_user((void *)arg, &pi, sizeof(pi));
     }
     case POWER_SLEEP:
         return acpi_suspend();

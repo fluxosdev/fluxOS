@@ -182,7 +182,8 @@ static int sock_connect_locked(struct socket *s, const struct sockaddr_in *sin)
         return -EINVAL;
     if (s->connected)
         return -EISCONN;
-    uint32_t src = s->laddr ? s->laddr : ip_source_for(addr);
+    uint32_t had_laddr = s->laddr;      /* bind()'s, if any: kept whatever happens */
+    uint32_t src = had_laddr ? had_laddr : ip_source_for(addr);
     if (!src)
         return no_route();
     s->laddr = src;
@@ -191,21 +192,30 @@ static int sock_connect_locked(struct socket *s, const struct sockaddr_in *sin)
     s->connected = 1;
     r = tcp_connect(s);
     if (r < 0)
-        return r;
+        goto failed;
     while (s->state == TCP_SYN_SENT || s->state == TCP_SYN_RECEIVED) {
         if (signal_pending(current)) {
             s->state = TCP_CLOSED;
             s->rtx_on = 0;
-            return -EINTR;
+            r = -EINTR;
+            goto failed;
         }
         sleep_on_lock_intr(s, &net_lock);
     }
     if (s->state == TCP_CLOSED) {
-        int err = s->error ? s->error : ECONNREFUSED;
+        r = -(s->error ? s->error : ECONNREFUSED);
         s->error = 0;
-        return -err;
+        goto failed;
     }
     return 0;
+
+failed:
+    /* Not connected after all: the socket is as before, and may try again. */
+    s->connected = 0;
+    s->laddr = had_laddr;
+    s->raddr = 0;
+    s->rport = 0;
+    return r;
 }
 
 static int sock_listen_locked(struct socket *s, int backlog)

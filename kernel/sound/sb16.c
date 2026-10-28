@@ -377,16 +377,12 @@ static int set_format(int *field, int value)
 
 static int get_int(uint32_t arg, int *v)
 {
-    if (!user_access_ok((void *)arg, sizeof(int)))
-        return -EFAULT;
-    *v = *(int *)arg;
-    return 0;
+    return copy_from_user(v, (const void *)arg, sizeof(*v));
 }
 
 static int put_int(uint32_t arg, int v)
 {
-    *(int *)arg = v;
-    return 0;
+    return copy_to_user((void *)arg, &v, sizeof(v));
 }
 
 static int dsp_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg)
@@ -426,28 +422,24 @@ static int dsp_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg)
             return r;
         return put_int(arg, sb.fmt);
     case SNDCTL_DSP_GETOSPACE: {
-        if (!user_access_ok((void *)arg, sizeof(struct audio_buf_info)))
-            return -EFAULT;
-        struct audio_buf_info *bi = (struct audio_buf_info *)arg;
+        struct audio_buf_info bi;
         uint32_t frames = (RING_SIZE - ring_used()) / dev_frame();
         uint32_t frag = sb.half / dev_frame() * user_frame();
-        bi->bytes = (int32_t)(frames * user_frame());
-        bi->fragsize = (int32_t)frag;
-        bi->fragstotal = (int32_t)(RING_SIZE / sb.half);
-        bi->fragments = frag ? bi->bytes / (int32_t)frag : 0;
-        return 0;
+        bi.bytes = (int32_t)(frames * user_frame());
+        bi.fragsize = (int32_t)frag;
+        bi.fragstotal = (int32_t)(RING_SIZE / sb.half);
+        bi.fragments = frag ? bi.bytes / (int32_t)frag : 0;
+        return copy_to_user((void *)arg, &bi, sizeof(bi));
     }
     case SNDCTL_DSP_GETODELAY: {
-        if (!user_access_ok((void *)arg, sizeof(int)))
-            return -EFAULT;
         uint32_t queued = ring_used() + (sb.running ? sb.real[0] + sb.real[1] : 0);
         return put_int(arg, (int)(queued / dev_frame() * user_frame()));
     }
-    case SOUND_INFO:
-        if (!user_access_ok((void *)arg, sizeof(struct sound_info)))
-            return -EFAULT;
-        sound_get_info((struct sound_info *)arg);
-        return 0;
+    case SOUND_INFO: {
+        struct sound_info si;
+        sound_get_info(&si);
+        return copy_to_user((void *)arg, &si, sizeof(si));
+    }
     }
     return -EINVAL;
 }
@@ -486,28 +478,27 @@ static int mixer_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg)
 {
     (void)vn;
     if (req == SOUND_INFO) {
-        if (!user_access_ok((void *)arg, sizeof(struct sound_info)))
-            return -EFAULT;
-        sound_get_info((struct sound_info *)arg);
-        return 0;
+        struct sound_info si;
+        sound_get_info(&si);
+        return copy_to_user((void *)arg, &si, sizeof(si));
     }
     if (req != MIXER_READ && req != MIXER_WRITE)
         return -EINVAL;
-    if (!user_access_ok((void *)arg, sizeof(struct mixer_level)))
+    struct mixer_level ml;
+    if (copy_from_user(&ml, (const void *)arg, sizeof(ml)) < 0)
         return -EFAULT;
-    struct mixer_level *ml = (struct mixer_level *)arg;
-    if (ml->channel >= MIXER_CHANNELS)
+    if (ml.channel >= MIXER_CHANNELS)
         return -EINVAL;
-    uint8_t reg = mixer_regs[ml->channel].reg;
-    int bits = mixer_regs[ml->channel].bits, stereo = mixer_regs[ml->channel].stereo;
+    uint8_t reg = mixer_regs[ml.channel].reg;
+    int bits = mixer_regs[ml.channel].bits, stereo = mixer_regs[ml.channel].stereo;
     if (req == MIXER_READ) {
-        ml->left = level_from_reg(mix_read(reg), bits);
-        ml->right = stereo ? level_from_reg(mix_read((uint8_t)(reg + 1)), bits) : ml->left;
-    } else {
-        mix_write(reg, reg_from_level(stereo ? ml->left : (ml->left + ml->right) / 2, bits));
-        if (stereo)
-            mix_write((uint8_t)(reg + 1), reg_from_level(ml->right, bits));
+        ml.left = level_from_reg(mix_read(reg), bits);
+        ml.right = stereo ? level_from_reg(mix_read((uint8_t)(reg + 1)), bits) : ml.left;
+        return copy_to_user((void *)arg, &ml, sizeof(ml));
     }
+    mix_write(reg, reg_from_level(stereo ? ml.left : (ml.left + ml.right) / 2, bits));
+    if (stereo)
+        mix_write((uint8_t)(reg + 1), reg_from_level(ml.right, bits));
     return 0;
 }
 

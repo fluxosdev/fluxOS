@@ -403,7 +403,7 @@ static void term_putc(struct term *t, char c)
         if (c >= '0' && c <= '9') {
             if (t->nparams == 0)
                 t->nparams = 1;
-            if (t->nparams <= MAX_PARAMS)
+            if (t->nparams <= MAX_PARAMS && t->params[t->nparams - 1] < 10000)   /* no overflow on a runaway number */
                 t->params[t->nparams - 1] = t->params[t->nparams - 1] * 10 + (c - '0');
         } else if (c == ';') {
             if (t->nparams == 0)

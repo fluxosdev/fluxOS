@@ -339,6 +339,22 @@ int vmm_resolve_cow(uint32_t *pd, uint32_t va)
     return 1;
 }
 
+/* Copy n bytes of physical memory, any frame (high memory included, which
+ * the identity map does not reach), into kernel memory. */
+void vmm_read_phys(void *dst, uint32_t phys, uint32_t n)
+{
+    uint8_t *d = dst;
+    while (n) {
+        uint32_t chunk = MIN(n, PAGE_SIZE - (phys & 0xFFF));
+        uint32_t flags = irq_save();
+        memcpy(d, kmap(phys, 0), chunk);
+        irq_restore(flags);
+        d += chunk;
+        phys += chunk;
+        n -= chunk;
+    }
+}
+
 /* Copy kernel memory into another address space, a page at a time. */
 int vmm_copy_to(uint32_t *pd, uint32_t va, const void *src, uint32_t len)
 {

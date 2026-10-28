@@ -13,6 +13,7 @@
  */
 #include "kernel.h"
 #include "arch.h"
+#include "drivers.h"
 #include "net.h"
 #include "pci.h"
 #include "x86.h"
@@ -144,9 +145,15 @@ static int ne_transmit(const void *frame, uint32_t len)
 {
     if (len > ETH_FRAME_MAX)
         return -EMSGSIZE;
-    /* There is one transmit buffer: wait for the previous frame to leave. */
-    for (int i = 0; i < 1000000 && (ne_in(NE_CR) & CR_TXP); i++)
-        ;
+    /* There is one transmit buffer: wait for the previous frame to leave,
+     * which takes a frame's time on the wire (1.2 ms at 10 Mbit/s). A card
+     * still busy after a few of those is stuck: the frame is dropped (TCP
+     * sends it again) rather than spinning on with interrupts off. */
+    int busy = 0;
+    for (int i = 0; i < 500 && (busy = (ne_in(NE_CR) & CR_TXP) != 0); i++)
+        udelay(10);
+    if (busy)
+        return -EAGAIN;
     uint32_t n = len < 60 ? 60 : len;  /* Ethernet's minimum frame */
     memcpy(txbuf, frame, len);
     memset(txbuf + len, 0, n + 1 - len);

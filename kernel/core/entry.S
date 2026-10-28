@@ -79,6 +79,34 @@ forkret:
     jmp trapret
 
 /*
+ * int uaccess_copy(void *dst, const void *src, uint32_t n): a copy where
+ * either side may be a process's memory that turns out not to be there.
+ * One instruction can fault; the page fault handler (idt.c) knows its
+ * address, uaccess_copy_ip, and resumes at uaccess_fixup instead, which
+ * returns -EFAULT with the stack as the fault left it (the string
+ * instruction pushes nothing). Returns 0 when the whole copy went.
+ */
+.global uaccess_copy
+.global uaccess_copy_ip
+.global uaccess_fixup
+uaccess_copy:
+    pushl %esi
+    pushl %edi
+    movl 12(%esp), %edi
+    movl 16(%esp), %esi
+    movl 20(%esp), %ecx
+    cld
+uaccess_copy_ip:
+    rep movsb
+    xorl %eax, %eax
+1:  popl %edi
+    popl %esi
+    ret
+uaccess_fixup:
+    movl $-14, %eax                 /* -EFAULT */
+    jmp 1b
+
+/*
  * void switch_context(uint32_t *old_esp, uint32_t new_esp)
  * Saves callee-saved registers on the current kernel stack, stores the
  * stack pointer in *old_esp and resumes the context saved at new_esp.

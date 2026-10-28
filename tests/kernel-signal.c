@@ -41,6 +41,7 @@ void spin_unlock(spinlock_t *l)
 }
 
 int smp_wake_idle(int preferred) { (void)preferred; return 0; }
+int smp_wake_cpu(int cpu) { (void)cpu; return 0; }
 void smp_kick_proc(struct proc *p) { (void)p; }
 
 static uint32_t interleave_or(uint32_t *p, uint32_t bits, int order)

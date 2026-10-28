@@ -121,6 +121,20 @@ static uint32_t days_from_civil(int y, int m, int d)
     return (uint32_t)(era * 146097 + doe - 719468);
 }
 
+/* The century register, where the firmware keeps one (0x32 on nearly every
+ * PC that does): 19 to 29 in the clock's own encoding, or 0 if what is
+ * there is not a century. */
+static int rtc_century(int binary)
+{
+    int c = cmos_read(0x32);
+    if (!binary) {
+        if ((c & 0x0F) > 9 || (c >> 4) > 9)
+            return 0;
+        c = bcd(c);
+    }
+    return c >= 19 && c <= 29 ? c : 0;
+}
+
 /* The RTC's time, in seconds since 1970. */
 static uint32_t rtc_read(void)
 {
@@ -130,8 +144,9 @@ static uint32_t rtc_read(void)
     int sec = cmos_read(0x00), min = cmos_read(0x02), hour = cmos_read(0x04);
     int day = cmos_read(0x07), mon = cmos_read(0x08), year = cmos_read(0x09);
     uint8_t regb = cmos_read(0x0B);
+    int binary = regb & 0x04;
 
-    if (!(regb & 0x04)) {               /* BCD encoded */
+    if (!binary) {                      /* BCD encoded */
         sec = bcd(sec);
         min = bcd(min);
         hour = bcd(hour & 0x7F) | (hour & 0x80);
@@ -141,7 +156,9 @@ static uint32_t rtc_read(void)
     }
     if (!(regb & 0x02) && (hour & 0x80)) /* 12-hour clock, PM */
         hour = ((hour & 0x7F) + 12) % 24;
-    year += 2000;
+    /* The century from its register; without one, years 70-99 are 19xx. */
+    int century = rtc_century(binary);
+    year += century ? century * 100 : year < 70 ? 2000 : 1900;
 
     return days_from_civil(year, mon, day) * 86400u + (uint32_t)(hour * 3600 + min * 60 + sec);
 }
@@ -216,6 +233,8 @@ void time_set(uint32_t now)
     cmos_write(0x07, ENC(day));
     cmos_write(0x08, ENC(mon));
     cmos_write(0x09, ENC(year % 100));
+    if (rtc_century(binary))            /* only where the firmware keeps one there */
+        cmos_write(0x32, ENC(year / 100));
     cmos_write(0x0B, regb & 0x7F);
 #undef ENC
 }
