@@ -30,6 +30,7 @@ struct fs_ops {
     /* On success, replace dst's directory entry (if present). On failure,
      * leave both names intact. VFS detaches dst only after success. */
     int (*rename)(struct vnode *vn, struct vnode *newdir, const char *newname, struct vnode *dst);
+    int (*setattr)(struct vnode *vn);
     void (*release)(struct vnode *vn);
     void (*statfs)(struct fs *fs, struct statfs *st);
 };

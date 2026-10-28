@@ -103,6 +103,7 @@ int main(void)
     read_hostname(host, sizeof(host));
     setenv("HOST", host, 1);
 
+    mkdir("/tmp", 01777);
     mkdir("/home", 0755);
     mkdir("/home/flux", 0755);
     mkdir("/root", 0700);

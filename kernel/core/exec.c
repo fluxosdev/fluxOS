@@ -18,9 +18,9 @@
 
 #define DOS_LOADER "/bin/dos"
 
-#define MAX_ARG_BYTES (64 * 1024)
+#define MAX_ARG_BYTES (256 * 1024)
 #define MAX_IMAGE     (32u << 20)
-#define MAX_ARGS      1024
+#define MAX_ARGS      4096
 #define STACK_SLACK   (4 * PAGE_SIZE)
 
 struct elf32_ehdr {
@@ -268,6 +268,16 @@ int proc_exec(struct proc *p, const char *path, char *const argv[], char *const 
     vmm_destroy(proc_set_pd(p, pd));
 
     fpu_release(p);
+    memset(p->vmas, 0, sizeof(p->vmas));
+    proc_signal_exec(p);
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (p->fds[i] && (p->fd_cloexec & (1u << i))) {
+            struct file *f = p->fds[i];
+            p->fds[i] = NULL;
+            p->fd_cloexec &= ~(1u << i);
+            file_close(f);
+        }
+    }
     p->heap_start = p->brk = ALIGN_UP(top, PAGE_SIZE);
     p->stack_low = ALIGN_DOWN(sp, PAGE_SIZE) - STACK_SLACK;
 

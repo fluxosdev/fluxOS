@@ -49,6 +49,9 @@
 #define EPROTOTYPE   91
 #define EPROTONOSUPPORT 93
 #define EOPNOTSUPP   95
+#ifndef ENOTSUP
+#define ENOTSUP      EOPNOTSUPP
+#endif
 #define EAFNOSUPPORT 97
 #define EADDRINUSE   98
 #define EADDRNOTAVAIL 99
@@ -62,7 +65,7 @@
 #define ECONNREFUSED 111
 #define EHOSTUNREACH 113
 
-/* ---- open(2) flags ---- */
+/* ---- open(2) and fcntl(2) ---- */
 #define O_RDONLY     0x0000
 #define O_WRONLY     0x0001
 #define O_RDWR       0x0002
@@ -71,7 +74,27 @@
 #define O_EXCL       0x0080
 #define O_TRUNC      0x0200
 #define O_APPEND     0x0400
+#ifndef O_NONBLOCK
+#define O_NONBLOCK   0x0800
+#endif
 #define O_DIRECTORY  0x10000
+#ifndef O_CLOEXEC
+#define O_CLOEXEC    0x80000
+#endif
+
+#ifndef F_DUPFD
+#define F_DUPFD         0
+#define F_GETFD         1
+#define F_SETFD         2
+#define F_GETFL         3
+#define F_SETFL         4
+#endif
+#ifndef F_DUPFD_CLOEXEC
+#define F_DUPFD_CLOEXEC 1030
+#endif
+#ifndef FD_CLOEXEC
+#define FD_CLOEXEC      1
+#endif
 
 #define SEEK_SET 0
 #define SEEK_CUR 1
@@ -133,27 +156,124 @@ struct dirent {
 };
 
 /* ---- signals ---- */
-#define SIGHUP   1
-#define SIGINT   2
-#define SIGQUIT  3
-#define SIGILL   4
-#define SIGTRAP  5
-#define SIGABRT  6
-#define SIGBUS   7
-#define SIGFPE   8
-#define SIGKILL  9
-#define SIGUSR1 10
-#define SIGSEGV 11
-#define SIGUSR2 12
-#define SIGPIPE 13
-#define SIGALRM 14
-#define SIGTERM 15
-#define SIGCHLD 17
-#define NSIG    32
+#define SIGHUP    1
+#define SIGINT    2
+#define SIGQUIT   3
+#define SIGILL    4
+#define SIGTRAP   5
+#define SIGABRT   6
+#define SIGBUS    7
+#define SIGFPE    8
+#define SIGKILL   9
+#define SIGUSR1  10
+#define SIGSEGV  11
+#define SIGUSR2  12
+#define SIGPIPE  13
+#define SIGALRM  14
+#define SIGTERM  15
+#define SIGCHLD  17
+#define SIGCONT  18
+#define SIGSTOP  19
+#define SIGTSTP  20
+#define SIGTTIN  21
+#define SIGTTOU  22
+#define SIGURG   23
+#define SIGXCPU  24
+#define SIGXFSZ  25
+#define SIGVTALRM 26
+#define SIGPROF  27
+#define SIGWINCH 28
+#define SIGIO    29
+#define SIGSYS   31
+#define NSIG     32
 
-/* dispositions understood by SYS_signal */
-#define SIGDISP_DFL 0
-#define SIGDISP_IGN 1
+/* dispositions understood by SYS_signal and SYS_sigaction */
+#define SIGDISP_DFL 0u
+#define SIGDISP_IGN 1u
+
+#ifndef SA_NOCLDSTOP
+#define SA_NOCLDSTOP 0x00000001u
+#define SA_NOCLDWAIT 0x00000002u
+#define SA_SIGINFO   0x00000004u
+#define SA_ONSTACK   0x08000000u
+#define SA_RESTART   0x10000000u
+#define SA_NODEFER   0x40000000u
+#define SA_RESETHAND 0x80000000u
+#endif
+
+#ifndef SIG_BLOCK
+#define SIG_BLOCK   0
+#define SIG_UNBLOCK 1
+#define SIG_SETMASK 2
+#endif
+
+struct flux_siginfo {
+    int32_t  si_signo;
+    int32_t  si_errno;
+    int32_t  si_code;
+    int32_t  si_pid;
+    uint32_t si_uid;
+    int32_t  si_status;
+    uint32_t si_addr;
+};
+
+struct flux_sigcontext {
+    uint32_t gs, fs, es, ds;
+    uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax;
+    uint32_t eip, cs, eflags, useresp, ss;
+    uint32_t oldmask;
+    uint32_t cr2;
+    int32_t  fpu_used;
+    uint8_t  fpu[512] __attribute__((aligned(16)));
+};
+
+struct flux_sigaction {
+    uint32_t sa_handler;        /* user handler address, SIGDISP_DFL or SIGDISP_IGN */
+    uint32_t sa_mask;
+    uint32_t sa_flags;
+    uint32_t sa_restorer;       /* user signal return trampoline */
+};
+
+/* ---- mmap(2), munmap(2), mprotect(2) ---- */
+#ifndef PROT_NONE
+#define PROT_NONE  0x0
+#define PROT_READ  0x1
+#define PROT_WRITE 0x2
+#define PROT_EXEC  0x4
+#endif
+
+#ifndef MAP_SHARED
+#define MAP_SHARED    0x01
+#define MAP_PRIVATE   0x02
+#define MAP_FIXED     0x10
+#define MAP_ANONYMOUS 0x20
+#define MAP_ANON      MAP_ANONYMOUS
+#endif
+#ifndef MAP_FAILED
+#define MAP_FAILED ((void *)-1)
+#endif
+
+struct flux_mmap_args {
+    uint32_t addr;
+    uint32_t len;
+    uint32_t prot;
+    uint32_t flags;
+    int32_t  fd;
+    uint32_t offset;
+};
+
+/* ---- utime(2) and times(2) ---- */
+struct flux_utimbuf {
+    int32_t actime;
+    int32_t modtime;
+};
+
+struct flux_tms {
+    uint32_t tms_utime;
+    uint32_t tms_stime;
+    uint32_t tms_cutime;
+    uint32_t tms_cstime;
+};
 
 /* ---- waitpid(2) ---- */
 #define WNOHANG 1

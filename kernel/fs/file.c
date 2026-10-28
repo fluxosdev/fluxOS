@@ -91,15 +91,23 @@ void file_close(struct file *f)
 
 /* buf is the caller's, checked beforehand: copying it holding the lock
  * cannot fault. */
-static int pipe_read(struct pipe *p, uint8_t *buf, uint32_t n)
+static int pipe_read_flags(struct pipe *p, uint8_t *buf, uint32_t n, int nonblock)
 {
     if (!n)
         return 0;
     spin_lock(&pipe_lock);
     while (p->wpos == p->rpos) {
-        if (p->writers <= 0 || signal_pending(current)) {
+        if (p->writers <= 0) {
             spin_unlock(&pipe_lock);
-            return p->writers <= 0 ? 0 : -EINTR;
+            return 0;
+        }
+        if (nonblock) {
+            spin_unlock(&pipe_lock);
+            return -EAGAIN;
+        }
+        if (signal_pending(current)) {
+            spin_unlock(&pipe_lock);
+            return -EINTR;
         }
         sleep_on_lock(p, &pipe_lock);
     }
@@ -112,7 +120,12 @@ static int pipe_read(struct pipe *p, uint8_t *buf, uint32_t n)
     return (int)i;
 }
 
-static int pipe_write(struct pipe *p, const uint8_t *buf, uint32_t n)
+static int pipe_read(struct pipe *p, uint8_t *buf, uint32_t n)
+{
+    return pipe_read_flags(p, buf, n, 0);
+}
+
+static int pipe_write_flags(struct pipe *p, const uint8_t *buf, uint32_t n, int nonblock)
 {
     uint32_t i = 0;
     spin_lock(&pipe_lock);
@@ -125,6 +138,10 @@ static int pipe_write(struct pipe *p, const uint8_t *buf, uint32_t n)
         if (p->wpos - p->rpos == PIPE_SIZE) {
             wakeup(p);
             poll_wakeup();
+            if (nonblock) {
+                spin_unlock(&pipe_lock);
+                return i ? (int)i : -EAGAIN;
+            }
             if (signal_pending(current)) {
                 spin_unlock(&pipe_lock);
                 return i ? (int)i : -EINTR;
@@ -140,14 +157,20 @@ static int pipe_write(struct pipe *p, const uint8_t *buf, uint32_t n)
     return (int)i;
 }
 
+static int pipe_write(struct pipe *p, const uint8_t *buf, uint32_t n)
+{
+    return pipe_write_flags(p, buf, n, 0);
+}
+
 int file_read(struct file *f, void *buf, uint32_t n)
 {
     if (!can_read(f))
         return -EBADF;
+    int nonblock = (f->flags & O_NONBLOCK) != 0;
     if (f->type == FT_PIPE)
-        return pipe_read(f->pipe, buf, n);
+        return nonblock ? pipe_read_flags(f->pipe, buf, n, 1) : pipe_read(f->pipe, buf, n);
     if (f->type == FT_SOCKET)
-        return sock_recvfrom(f->sock, buf, n, 0, NULL);
+        return sock_recvfrom(f->sock, buf, n, nonblock ? MSG_DONTWAIT : 0, NULL);
     /* Pipes, sockets and character devices do not own the VFS mutex. */
     struct readcache_stream *previous = NULL;
     int scoped = f->vn->type != VN_CHR;
@@ -163,10 +186,11 @@ int file_write(struct file *f, const void *buf, uint32_t n)
 {
     if (!can_write(f))
         return -EBADF;
+    int nonblock = (f->flags & O_NONBLOCK) != 0;
     if (f->type == FT_PIPE)
-        return pipe_write(f->pipe, buf, n);
+        return nonblock ? pipe_write_flags(f->pipe, buf, n, 1) : pipe_write(f->pipe, buf, n);
     if (f->type == FT_SOCKET)
-        return sock_sendto(f->sock, buf, n, 0, NULL);
+        return sock_sendto(f->sock, buf, n, nonblock ? MSG_DONTWAIT : 0, NULL);
     if ((f->flags & O_APPEND) && f->vn->type == VN_FILE)
         f->off = f->vn->size;
     int r = vfs_write(f->vn, buf, f->off, n);

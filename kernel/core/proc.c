@@ -30,6 +30,7 @@
 #include "proc.h"
 #include "tty.h"
 #include "vfs.h"
+#include <flux/syscall.h>
 
 struct proc procs[MAX_PROCS];
 static struct proc *init_proc;
@@ -416,6 +417,7 @@ void proc_spawn_init(const char *path)
         panic("cannot allocate init process");
     setup_kstack(p, NULL);
     p->pgid = p->pid;
+    p->umask = 022;
     p->cwd = vfs_root;
     vfs_ref(vfs_root);
     p->ctty = &console_tty;
@@ -501,13 +503,18 @@ int do_fork(void)
     child->pgid = parent->pgid;
     for (int i = 0; i < MAX_FDS; i++)
         child->fds[i] = file_dup(parent->fds[i]);
+    child->fd_cloexec = parent->fd_cloexec;
+    child->umask = parent->umask;
     child->cwd = parent->cwd;
     vfs_ref(child->cwd);
     child->ctty = tty_hold(parent->ctty);
     child->heap_start = parent->heap_start;
     child->brk = parent->brk;
     child->stack_low = parent->stack_low;
+    memcpy(child->vmas, parent->vmas, sizeof(child->vmas));
     child->sig_ignored = parent->sig_ignored;
+    child->sig_blocked = parent->sig_blocked;
+    memcpy(child->sig_actions, parent->sig_actions, sizeof(child->sig_actions));
     memcpy(child->name, parent->name, sizeof(child->name));
     fpu_fork(child);
 
@@ -516,6 +523,8 @@ int do_fork(void)
     spin_unlock(&sched_lock);
     return child->pid;
 }
+
+static void signal_locked(struct proc *p, int sig);
 
 void do_exit(int status)
 {
@@ -550,16 +559,20 @@ void do_exit(int status)
         struct proc *q = &procs[i];
         if (q->state != P_UNUSED && q->ppid == p->pid) {
             q->ppid = init_proc->pid;
-            if (q->state == P_ZOMBIE)
+            if (q->state == P_ZOMBIE) {
+                signal_locked(init_proc, SIGCHLD);
                 wakeup_locked(init_proc);
+            }
         }
     }
 
     p->exit_status = status;
     p->state = P_ZOMBIE;
     struct proc *parent = proc_find_locked(p->ppid);
-    if (parent)
+    if (parent) {
+        signal_locked(parent, SIGCHLD);
         wakeup_locked(parent);
+    }
 
     sched_switch();
     panic("zombie %d was scheduled", p->pid);
@@ -586,6 +599,7 @@ int do_waitpid(int pid, int *status, int options)
             if (q->state == P_ZOMBIE) {
                 int r = q->pid, code = q->exit_status;
                 uint8_t *kstack = q->kstack;
+                me->child_ticks += q->cpu_ticks + q->child_ticks;
                 q->kstack = NULL;
                 q->state = P_UNUSED;
                 spin_unlock(&sched_lock);
@@ -631,10 +645,17 @@ int do_getpgid(int pid)
     return r;
 }
 
+static int sig_default_ignore(int sig)
+{
+    return sig == SIGCHLD || sig == SIGCONT || sig == SIGURG || sig == SIGWINCH;
+}
+
 /* With sched_lock. */
 static void deliver(struct proc *p, int sig)
 {
     __atomic_or_fetch(&p->sig_pending, 1u << sig, __ATOMIC_RELAXED);
+    if (sig != SIGKILL && sig != SIGSTOP && (p->sig_blocked & (1u << sig)))
+        return;
     if (p->state == P_BLOCKED || p->state == P_SLEEPING) {
         p->chan = NULL;
         make_ready(p);
@@ -646,14 +667,19 @@ static void deliver(struct proc *p, int sig)
 
 static void signal_locked(struct proc *p, int sig)
 {
-    if (sig <= 0 || sig >= NSIG || !p || p->pid <= 1 || p->kthread)
+    if (sig <= 0 || sig >= NSIG || !p || p->pid <= 0 || p->kthread)
         return;
     if (p->state == P_UNUSED || p->state == P_ZOMBIE || p->state == P_EMBRYO)
         return;
-    if (sig == SIGCHLD)
-        return;                                 /* default action: ignore */
-    if (sig != SIGKILL && (p->sig_ignored & (1u << sig)))
+    uint32_t h = p->sig_actions[sig].sa_handler;
+    if (p->pid == 1 && h < USER_BASE)
         return;
+    if (sig != SIGKILL && sig != SIGSTOP) {
+        if ((p->sig_ignored & (1u << sig)) || h == SIGDISP_IGN)
+            return;
+        if (h == SIGDISP_DFL && sig_default_ignore(sig))
+            return;
+    }
     deliver(p, sig);
 }
 
@@ -664,12 +690,19 @@ void proc_signal(struct proc *p, int sig)
     spin_unlock(&sched_lock);
 }
 
-/* Synchronous faults cannot be ignored. */
+/* Synchronous faults cannot be ignored or blocked into an infinite loop. */
 void proc_signal_force(struct proc *p, int sig)
 {
     if (p->pid == 0)
         panic("fault in idle task");
     spin_lock(&sched_lock);
+    uint32_t bit = 1u << sig;
+    if ((p->sig_ignored & bit) || p->sig_actions[sig].sa_handler == SIGDISP_IGN ||
+        (p->sig_blocked & bit)) {
+        p->sig_ignored &= ~bit;
+        p->sig_blocked &= ~bit;
+        p->sig_actions[sig].sa_handler = SIGDISP_DFL;
+    }
     deliver(p, sig);
     spin_unlock(&sched_lock);
 }
@@ -693,6 +726,22 @@ void proc_signal_ctty(struct tty *t, int sig)
     spin_unlock(&sched_lock);
 }
 
+void proc_signal_exec(struct proc *p)
+{
+    spin_lock(&sched_lock);
+    for (int i = 1; i < NSIG; i++) {
+        if (p->sig_actions[i].sa_handler != SIGDISP_IGN && !(p->sig_ignored & (1u << i))) {
+            memset(&p->sig_actions[i], 0, sizeof(p->sig_actions[i]));
+        } else {
+            p->sig_actions[i].sa_handler = SIGDISP_IGN;
+            p->sig_actions[i].sa_mask = 0;
+            p->sig_actions[i].sa_flags = 0;
+            p->sig_actions[i].sa_restorer = 0;
+        }
+    }
+    spin_unlock(&sched_lock);
+}
+
 int do_kill(int pid, int sig)
 {
     if (sig < 0 || sig >= NSIG)
@@ -704,7 +753,7 @@ int do_kill(int pid, int sig)
         struct proc *p = proc_find_locked(pid);
         if (!p || p->state == P_ZOMBIE || p->state == P_EMBRYO)
             r = -ESRCH;
-        else if (p->pid == 1 || p->kthread)
+        else if (p->kthread || (p->pid == 1 && sig && (sig == SIGKILL || p->sig_actions[sig].sa_handler < USER_BASE)))
             r = -EPERM;
         else if (sig)
             signal_locked(p, sig);
@@ -730,24 +779,379 @@ int do_kill(int pid, int sig)
 
 int signal_pending(struct proc *p)
 {
-    return __atomic_load_n(&p->sig_pending, __ATOMIC_RELAXED) != 0;
+    uint32_t mask = p->sig_blocked & ~((1u << SIGKILL) | (1u << SIGSTOP));
+    return (__atomic_load_n(&p->sig_pending, __ATOMIC_RELAXED) & ~mask) != 0;
 }
 
-/* Every signal we deliver has "terminate" as its action. */
+static int user_write_range(struct proc *p, uint32_t va, const void *src, uint32_t len)
+{
+    if (va < USER_BASE || va >= USER_TOP || len > USER_TOP - va)
+        return -EFAULT;
+    for (uint32_t pg = ALIGN_DOWN(va, PAGE_SIZE); pg < va + len; pg += PAGE_SIZE)
+        if (!vmm_write_ok(p->pd, pg) && !proc_page_fault(pg, 1))
+            return -EFAULT;
+    memcpy((void *)(uintptr_t)va, src, len);
+    return 0;
+}
+
 void proc_check_signals(void)
 {
     struct proc *p = current;
-    if (!__atomic_load_n(&p->sig_pending, __ATOMIC_RELAXED))
+    if (!p || p->kthread)
         return;
-    uint32_t pending = __atomic_exchange_n(&p->sig_pending, 0, __ATOMIC_RELAXED);
-    if (pending)
-        do_exit(__builtin_ctz(pending));
+    for (;;) {
+        uint32_t mask = p->sig_blocked & ~((1u << SIGKILL) | (1u << SIGSTOP));
+        uint32_t deliverable = __atomic_load_n(&p->sig_pending, __ATOMIC_RELAXED) & ~mask;
+        if (!deliverable)
+            break;
+        int sig = __builtin_ctz(deliverable);
+        uint32_t bit = 1u << sig;
+        __atomic_and_fetch(&p->sig_pending, ~bit, __ATOMIC_RELAXED);
+
+        if (sig == SIGKILL || sig == SIGSTOP)
+            do_exit(sig);
+        struct flux_sigaction sa = p->sig_actions[sig];
+        if ((p->sig_ignored & bit) || sa.sa_handler == SIGDISP_IGN)
+            continue;
+        if (sa.sa_handler == SIGDISP_DFL) {
+            if (sig_default_ignore(sig))
+                continue;
+            do_exit(sig);
+        }
+
+        if (sa.sa_flags & SA_RESETHAND)
+            p->sig_actions[sig].sa_handler = SIGDISP_DFL;
+
+        struct trapframe *tf = p->tf;
+        if (p->in_syscall > 0 && tf->eax == (uint32_t)-EINTR) {
+            if ((sa.sa_flags & SA_RESTART) &&
+                p->in_syscall != SYS_sleep && p->in_syscall != SYS_poll) {
+                tf->eax = p->syscall_orig_eax;
+                tf->eip -= 2;
+            }
+            p->in_syscall = 0;
+        }
+
+        struct flux_sigcontext ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.gs = tf->gs; ctx.fs = tf->fs; ctx.es = tf->es; ctx.ds = tf->ds;
+        ctx.edi = tf->edi; ctx.esi = tf->esi; ctx.ebp = tf->ebp;
+        ctx.esp = tf->esp_dummy;
+        ctx.ebx = tf->ebx; ctx.edx = tf->edx; ctx.ecx = tf->ecx; ctx.eax = tf->eax;
+        ctx.eip = tf->eip; ctx.cs = tf->cs; ctx.eflags = tf->eflags;
+        ctx.useresp = tf->useresp; ctx.ss = tf->ss;
+        ctx.oldmask = p->sig_blocked;
+        ctx.cr2 = p->fault_addr;
+        fpu_save_to(p, &ctx.fpu_used, ctx.fpu);
+
+        struct flux_siginfo info;
+        memset(&info, 0, sizeof(info));
+        info.si_signo = sig;
+        info.si_addr = p->fault_addr;
+
+        uint8_t tramp[16] = {
+            0x8b, 0x5c, 0x24, 0x08,             /* movl 8(%esp), %ebx */
+            0xb8, (uint8_t)SYS_sigreturn, 0x00, 0x00, 0x00,
+            0xcd, 0x80, 0x90, 0x90, 0x90, 0x90, 0x90
+        };
+
+        uint32_t sp = tf->useresp;
+        uint32_t tramp_va = ALIGN_DOWN(sp - sizeof(tramp), 16u);
+        uint32_t ctx_va = ALIGN_DOWN(tramp_va - sizeof(ctx), 16u);
+        uint32_t info_va = ALIGN_DOWN(ctx_va - sizeof(info), 16u);
+        uint32_t args_va = ALIGN_DOWN(info_va - 16u, 16u);
+        uint32_t frame_sp = args_va - 4u;
+        uint32_t call_frame[4] = {
+            sa.sa_restorer ? sa.sa_restorer : tramp_va,
+            (uint32_t)sig,
+            info_va,
+            ctx_va,
+        };
+
+        if (user_write_range(p, tramp_va, tramp, sizeof(tramp)) < 0 ||
+            user_write_range(p, ctx_va, &ctx, sizeof(ctx)) < 0 ||
+            user_write_range(p, info_va, &info, sizeof(info)) < 0 ||
+            user_write_range(p, frame_sp, call_frame, sizeof(call_frame)) < 0)
+            do_exit(SIGSEGV);
+
+        p->sig_blocked |= sa.sa_mask;
+        if (!(sa.sa_flags & SA_NODEFER))
+            p->sig_blocked |= bit;
+        p->sig_blocked &= ~((1u << SIGKILL) | (1u << SIGSTOP));
+
+        tf->eip = sa.sa_handler;
+        tf->useresp = frame_sp;
+        tf->eflags &= ~0x400u;                  /* clear DF for handler entry */
+        break;
+    }
+    p->in_syscall = 0;
 }
 
-/* Demand-grow the user stack on a fault just below it. */
-int proc_grow_stack(uint32_t addr)
+static struct proc_vma *find_vma(struct proc *p, uint32_t addr)
+{
+    for (int i = 0; i < MAX_VMAS; i++) {
+        struct proc_vma *v = &p->vmas[i];
+        if (v->end > v->start && addr >= v->start && addr < v->end)
+            return v;
+    }
+    return NULL;
+}
+
+static void coalesce_vmas(struct proc *p)
+{
+    for (int changed = 1; changed;) {
+        changed = 0;
+        for (int i = 0; i < MAX_VMAS; i++) {
+            struct proc_vma *a = &p->vmas[i];
+            if (a->end <= a->start)
+                continue;
+            for (int j = 0; j < MAX_VMAS; j++) {
+                struct proc_vma *b = &p->vmas[j];
+                if (i == j || b->end <= b->start)
+                    continue;
+                if (a->end == b->start && a->prot == b->prot && a->flags == b->flags) {
+                    a->end = b->end;
+                    b->start = b->end = 0;
+                    changed = 1;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+uint32_t proc_vma_lowest(const struct proc *p)
+{
+    uint32_t low = USER_MMIO_BASE;
+    for (int i = 0; i < MAX_VMAS; i++)
+        if (p->vmas[i].end > p->vmas[i].start && p->vmas[i].start < low)
+            low = p->vmas[i].start;
+    return low;
+}
+
+int proc_munmap(struct proc *p, uint32_t addr, uint32_t len)
+{
+    if (!len || (addr & (PAGE_SIZE - 1)))
+        return -EINVAL;
+    uint32_t end = ALIGN_UP(addr + len, PAGE_SIZE);
+    if (addr < USER_BASE || end > USER_MMIO_BASE || end <= addr)
+        return -EINVAL;
+    if (fb_pinned(p->pid, addr, end))
+        return -EBUSY;
+
+    int free_slots = 0, need_split = 0;
+    for (int i = 0; i < MAX_VMAS; i++) {
+        const struct proc_vma *v = &p->vmas[i];
+        if (v->end <= v->start)
+            free_slots++;
+        else if (v->start < addr && end < v->end)
+            need_split++;
+    }
+    if (need_split > free_slots)
+        return -ENOMEM;
+
+    for (int i = 0; i < MAX_VMAS; i++) {
+        struct proc_vma *v = &p->vmas[i];
+        if (v->end <= v->start || end <= v->start || addr >= v->end)
+            continue;
+        if (addr <= v->start && end >= v->end) {
+            v->start = v->end = 0;
+        } else if (addr <= v->start) {
+            v->start = end;
+        } else if (end >= v->end) {
+            v->end = addr;
+        } else {
+            uint32_t old_end = v->end;
+            v->end = addr;
+            for (int k = 0; k < MAX_VMAS; k++) {
+                if (p->vmas[k].end <= p->vmas[k].start) {
+                    p->vmas[k].start = end;
+                    p->vmas[k].end = old_end;
+                    p->vmas[k].prot = v->prot;
+                    p->vmas[k].flags = v->flags;
+                    break;
+                }
+            }
+        }
+    }
+    for (uint32_t va = addr; va < end; va += PAGE_SIZE)
+        vmm_free_page(p->pd, va);
+    return 0;
+}
+
+int proc_mprotect(struct proc *p, uint32_t addr, uint32_t len, uint32_t prot)
+{
+    if ((addr & (PAGE_SIZE - 1)) || (prot & ~(uint32_t)(PROT_READ | PROT_WRITE | PROT_EXEC)))
+        return -EINVAL;
+    if (!len)
+        return 0;
+    uint32_t end = ALIGN_UP(addr + len, PAGE_SIZE);
+    if (addr < USER_BASE || end > USER_STACK_TOP || end <= addr)
+        return -EINVAL;
+
+    int free_slots = 0, need_slots = 0;
+    for (int i = 0; i < MAX_VMAS; i++) {
+        const struct proc_vma *v = &p->vmas[i];
+        if (v->end <= v->start) {
+            free_slots++;
+        } else if (v->prot != prot && end > v->start && addr < v->end) {
+            if (v->start < addr)
+                need_slots++;
+            if (end < v->end)
+                need_slots++;
+        }
+    }
+    if (need_slots > free_slots)
+        return -ENOMEM;
+
+    for (uint32_t va = addr; va < end; va += PAGE_SIZE) {
+        if (!vmm_pte_present(p->pd, va) && !find_vma(p, va))
+            return -ENOMEM;
+    }
+
+    for (int i = 0; i < MAX_VMAS; i++) {
+        struct proc_vma *v = &p->vmas[i];
+        if (v->end <= v->start || v->prot == prot || end <= v->start || addr >= v->end)
+            continue;
+        uint32_t orig_start = v->start, orig_end = v->end;
+        uint32_t orig_prot = v->prot, orig_flags = v->flags;
+        uint32_t mid_s = MAX(addr, orig_start), mid_e = MIN(end, orig_end);
+        v->start = mid_s;
+        v->end = mid_e;
+        v->prot = prot;
+        if (orig_start < mid_s) {
+            for (int k = 0; k < MAX_VMAS; k++) {
+                if (p->vmas[k].end <= p->vmas[k].start) {
+                    p->vmas[k] = (struct proc_vma){ orig_start, mid_s, orig_prot, orig_flags };
+                    break;
+                }
+            }
+        }
+        if (mid_e < orig_end) {
+            for (int k = 0; k < MAX_VMAS; k++) {
+                if (p->vmas[k].end <= p->vmas[k].start) {
+                    p->vmas[k] = (struct proc_vma){ mid_e, orig_end, orig_prot, orig_flags };
+                    break;
+                }
+            }
+        }
+    }
+    coalesce_vmas(p);
+    for (uint32_t va = addr; va < end; va += PAGE_SIZE)
+        if (vmm_pte_present(p->pd, va))
+            vmm_protect_page(p->pd, va, prot);
+    return 0;
+}
+
+int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint32_t *out)
+{
+    if (!a->len)
+        return -EINVAL;
+    int shared = (a->flags & MAP_SHARED) != 0;
+    int priv = (a->flags & MAP_PRIVATE) != 0;
+    if (shared == priv)
+        return -EINVAL;
+    if ((a->prot & ~(uint32_t)(PROT_READ | PROT_WRITE | PROT_EXEC)))
+        return -EINVAL;
+    uint32_t len = ALIGN_UP(a->len, PAGE_SIZE);
+    if (len < a->len || len > USER_MMIO_BASE - USER_BASE)
+        return -ENOMEM;
+
+    uint32_t brk_end = ALIGN_UP(p->brk, PAGE_SIZE);
+    uint32_t start = 0;
+    if (a->flags & MAP_FIXED) {
+        if ((a->addr & (PAGE_SIZE - 1)) || a->addr < brk_end ||
+            a->addr >= USER_MMIO_BASE || len > USER_MMIO_BASE - a->addr)
+            return -EINVAL;
+        int r = proc_munmap(p, a->addr, len);
+        if (r < 0)
+            return r;
+        start = a->addr;
+    } else {
+        uint32_t floor = brk_end + 0x100000u <= USER_MMIO_BASE - len ? brk_end + 0x100000u : brk_end;
+        uint32_t hint = ALIGN_DOWN(a->addr, PAGE_SIZE);
+        if (hint >= floor && hint < USER_MMIO_BASE && len <= USER_MMIO_BASE - hint) {
+            int ok = 1;
+            for (int i = 0; i < MAX_VMAS; i++) {
+                const struct proc_vma *v = &p->vmas[i];
+                if (v->end > v->start && v->start < hint + len && hint < v->end) {
+                    ok = 0;
+                    break;
+                }
+            }
+            if (ok)
+                start = hint;
+        }
+        if (!start) {
+            uint32_t cand_end = USER_MMIO_BASE;
+            for (int moved = 1; moved;) {
+                moved = 0;
+                if (cand_end < floor + len)
+                    return -ENOMEM;
+                uint32_t cand_start = cand_end - len;
+                for (int i = 0; i < MAX_VMAS; i++) {
+                    const struct proc_vma *v = &p->vmas[i];
+                    if (v->end > v->start && v->start < cand_end && cand_start < v->end) {
+                        cand_end = v->start;
+                        moved = 1;
+                        break;
+                    }
+                }
+                if (!moved)
+                    start = cand_start;
+            }
+        }
+    }
+
+    int slot = -1;
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (p->vmas[i].end <= p->vmas[i].start) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0)
+        return -ENOMEM;
+
+    /* Shared anonymous mappings and small private mappings are faulted in
+     * immediately so fork shares MAP_SHARED frames before either side writes. */
+    if (shared || !(a->flags & MAP_ANONYMOUS) || (len <= 64 * 1024 && a->prot != PROT_NONE)) {
+        uint32_t init_prot = !(a->flags & MAP_ANONYMOUS) ? (a->prot | PROT_WRITE) : a->prot;
+        for (uint32_t va = start; va < start + len; va += PAGE_SIZE) {
+            if (vmm_alloc_prot(p->pd, va, init_prot, a->flags) < 0) {
+                for (uint32_t u = start; u < va; u += PAGE_SIZE)
+                    vmm_free_page(p->pd, u);
+                return -ENOMEM;
+            }
+        }
+    }
+
+    p->vmas[slot].start = start;
+    p->vmas[slot].end = start + len;
+    p->vmas[slot].prot = a->prot;
+    p->vmas[slot].flags = a->flags & (MAP_SHARED | MAP_PRIVATE | MAP_ANONYMOUS);
+    coalesce_vmas(p);
+    *out = start;
+    return 0;
+}
+
+/* Resolve a user page fault: COW break, demand-paged mmap VMA or stack growth. */
+int proc_page_fault(uint32_t addr, int write)
 {
     struct proc *p = current;
+    if (!p || p->kthread || addr < USER_BASE || addr >= USER_TOP)
+        return 0;
+    if (vmm_pte_present(p->pd, addr)) {
+        if (!vmm_translate(p->pd, addr))
+            return 0;                       /* PROT_NONE page */
+        return write ? vmm_resolve_cow(p->pd, addr) : 1;
+    }
+    struct proc_vma *v = find_vma(p, addr);
+    if (v) {
+        if (v->prot == PROT_NONE || (write && !(v->prot & PROT_WRITE)))
+            return 0;
+        return vmm_alloc_prot(p->pd, addr, v->prot, v->flags) == 0;
+    }
     if (addr < USER_STACK_LIMIT || addr >= USER_STACK_TOP || addr < p->brk)
         return 0;
     if (vmm_alloc(p->pd, addr) < 0)
@@ -756,6 +1160,12 @@ int proc_grow_stack(uint32_t addr)
     if (page < p->stack_low)
         p->stack_low = page;
     return 1;
+}
+
+/* Demand-grow the user stack or fault in a demand-paged VMA. */
+int proc_grow_stack(uint32_t addr)
+{
+    return proc_page_fault(addr, 0);
 }
 
 int proc_info(int slot, struct procinfo *pi)

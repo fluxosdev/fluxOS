@@ -177,14 +177,17 @@ static void handle_exception(struct trapframe *tf, int from_user)
     uint32_t vec = tf->int_no;
 
     uint32_t addr = read_cr2();         /* before anything can fault again */
-    if (from_user) {
-        if (vec == 14) {
-            sti();                      /* growing the stack may take a while */
-            int grown = proc_grow_stack(addr);
+    if (vec == 14 && addr >= USER_BASE && addr < USER_TOP && current && !current->kthread) {
+        int write = (tf->err_code & 2) != 0;
+        if (from_user)
+            sti();
+        int grown = proc_page_fault(addr, write);
+        if (from_user)
             cli();
-            if (grown)
-                return;
-        }
+        if (grown)
+            return;
+    }
+    if (from_user) {
         if (vec == 7) {                 /* first FPU use since a task switch */
             fpu_trap();
             return;
@@ -192,6 +195,7 @@ static void handle_exception(struct trapframe *tf, int from_user)
         klog("pid %d (%s): %s at eip %08x, addr %08x, err %x\n",
              current->pid, current->name, exception_names[vec], tf->eip,
              addr, tf->err_code);
+        current->fault_addr = addr;
         proc_signal_force(current, exception_signal(vec));
         return;
     }

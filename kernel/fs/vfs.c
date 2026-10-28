@@ -549,6 +549,20 @@ int vfs_truncate(struct vnode *vn, uint32_t size)
     return 0;
 }
 
+int vfs_utime(const char *path, struct vnode *cwd, uint32_t mtime)
+{
+    struct vnode *vn;
+    int r = vfs_resolve(path, cwd, &vn);
+    if (r < 0)
+        return r;
+    if (vn->fs && vn->fs->readonly)
+        return -EROFS;
+    vn->mtime = mtime;
+    if (vn->fs && vn->fs->ops->setattr)
+        return vn->fs->ops->setattr(vn);
+    return 0;
+}
+
 void vfs_stat(struct vnode *vn, struct stat *st)
 {
     uint32_t fmt = vn->type == VN_DIR ? S_IFDIR : vn->type == VN_CHR ? S_IFCHR :
@@ -959,8 +973,9 @@ static int same_uuid(const char *a, const char *b)
 /*
  * Make the filesystem on the volume `spec` names (UUID=xxxx-xxxx, or a
  * device name such as hda1) the root, so the system runs from the disk
- * rather than from an initrd in memory. /dev, /tmp and /mnt move over
- * from the ramfs root and hide any directories of those names on the disk.
+ * rather than from an initrd in memory. /dev and /mnt move over from the
+ * ramfs root; /tmp uses the writable disk root so large compiler temporaries
+ * do not consume the kernel heap and cross-directory renames stay on one fs.
  */
 int vfs_mount_root(const char *spec)
 {
@@ -991,6 +1006,15 @@ int vfs_mount_root(const char *spec)
     while (old->children) {
         struct vnode *c = old->children;
         detach(c);
+        if (!strcmp(c->name, "tmp") && !fs->readonly && !c->children) {
+            subtree_free(c);
+            struct vnode *dtmp = find_child(root, "tmp");
+            if (!dtmp)
+                vfs_create(root, "tmp", VN_DIR, &dtmp);
+            if (dtmp)
+                dtmp->mode = 01777;
+            continue;
+        }
         struct vnode *hidden = find_child(root, c->name);
         if (hidden) {
             detach(hidden);

@@ -1240,7 +1240,13 @@ int radeon_map_buffer(struct dispbuf *b)
     if (first + npages > GTT_PAGES)
         return -ENOMEM;
     for (uint32_t i = 0; i < npages; i++) {
-        uint32_t phys = vmm_translate(current->pd, first_va + i * 4096);
+        uint32_t va = first_va + i * 4096;
+        if (!vmm_write_ok(current->pd, va) && !vmm_resolve_cow(current->pd, va)) {
+            for (uint32_t j = 0; j < i; j++)
+                gart_set(first + j, 0);
+            return -EFAULT;
+        }
+        uint32_t phys = vmm_translate(current->pd, va);
         if (!phys) {
             for (uint32_t j = 0; j < i; j++)
                 gart_set(first + j, 0);

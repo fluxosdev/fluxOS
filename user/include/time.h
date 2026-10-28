@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+#define CLOCKS_PER_SEC 100
+
 struct tm {
     int tm_sec;
     int tm_min;
@@ -16,6 +18,7 @@ struct tm {
     int tm_isdst;
 };
 
+clock_t clock(void);
 time_t time(time_t *t);
 struct tm *gmtime(const time_t *t);
 struct tm *gmtime_r(const time_t *t, struct tm *out);

@@ -8,19 +8,25 @@
 #include <flux.h>
 #include <flux/syscall.h>
 #include <poll.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/time.h>
+#include <sys/times.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <utime.h>
 
 int errno;
 
@@ -88,13 +94,29 @@ ssize_t write(int fd, const void *buf, size_t n) { return ret(sc3(SYS_write, fd,
 
 int open(const char *path, int flags, ...)
 {
-    return ret(sc2(SYS_open, (int)path, flags));
+    mode_t mode = 0666;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    return ret(sc3(SYS_open, (int)path, flags, (int)mode));
 }
 
 int creat(const char *path, mode_t mode)
 {
-    (void)mode;
-    return open(path, O_WRONLY | O_CREAT | O_TRUNC);
+    return open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+}
+
+int fcntl(int fd, int cmd, ...)
+{
+    int arg = 0;
+    va_list ap;
+    va_start(ap, cmd);
+    arg = va_arg(ap, int);
+    va_end(ap);
+    return ret(sc3(SYS_fcntl, fd, cmd, arg));
 }
 
 int close(int fd) { return ret(sc1(SYS_close, fd)); }
@@ -127,12 +149,31 @@ char *getcwd(char *buf, size_t size)
 
 int mkdir(const char *path, mode_t mode)
 {
-    (void)mode;
-    return ret(sc1(SYS_mkdir, (int)path));
+    return ret(sc2(SYS_mkdir, (int)path, (int)mode));
 }
 
 int rmdir(const char *path) { return ret(sc1(SYS_rmdir, (int)path)); }
 int chmod(const char *path, mode_t mode) { return ret(sc2(SYS_chmod, (int)path, (int)mode)); }
+mode_t umask(mode_t mask) { return (mode_t)sc1(SYS_umask, (int)mask); }
+int utime(const char *path, const struct utimbuf *times)
+{
+    struct flux_utimbuf ft;
+    if (times) {
+        ft.actime = (uint32_t)times->actime;
+        ft.modtime = (uint32_t)times->modtime;
+    }
+    return ret(sc2(SYS_utime, (int)path, times ? (int)&ft : 0));
+}
+
+int utimes(const char *path, const struct timeval times[2])
+{
+    struct flux_utimbuf ft;
+    if (times) {
+        ft.actime = (uint32_t)times[0].tv_sec;
+        ft.modtime = (uint32_t)times[1].tv_sec;
+    }
+    return ret(sc2(SYS_utime, (int)path, times ? (int)&ft : 0));
+}
 int unlink(const char *path) { return ret(sc1(SYS_unlink, (int)path)); }
 int rename(const char *from, const char *to) { return ret(sc2(SYS_rename, (int)from, (int)to)); }
 int stat(const char *path, struct stat *st) { return ret(sc2(SYS_stat, (int)path, (int)st)); }
@@ -146,6 +187,19 @@ int getdents(int fd, struct dirent *buf, unsigned int count)
 
 pid_t getpid(void) { return sc0(SYS_getpid); }
 pid_t getppid(void) { return sc0(SYS_getppid); }
+uid_t getuid(void) { return 0; }
+uid_t geteuid(void) { return 0; }
+gid_t getgid(void) { return 0; }
+gid_t getegid(void) { return 0; }
+int setuid(uid_t uid) { (void)uid; return 0; }
+int setgid(gid_t gid) { (void)gid; return 0; }
+int chown(const char *path, uid_t owner, gid_t group)
+{
+    (void)owner;
+    (void)group;
+    struct stat st;
+    return stat(path, &st);
+}
 int kill(pid_t pid, int sig) { return ret(sc2(SYS_kill, pid, sig)); }
 int raise(int sig) { return kill(getpid(), sig); }
 int setpgid(pid_t pid, pid_t pgid) { return ret(sc2(SYS_setpgid, pid, pgid)); }
@@ -164,13 +218,132 @@ int tcsetpgrp(int fd, pid_t pgid)
     return ret(sc1(SYS_tcsetpgrp, pgid));
 }
 
+extern void __sigrestorer(void);
+
+int sigaction(int sig, const struct sigaction *act, struct sigaction *oldact)
+{
+    struct flux_sigaction kact, koact;
+    if (act) {
+        kact.sa_handler = (uint32_t)act->sa_handler;
+        kact.sa_flags = act->sa_flags;
+        kact.sa_mask = act->sa_mask;
+        kact.sa_restorer = (uint32_t)(act->sa_restorer ? act->sa_restorer : __sigrestorer);
+    }
+    int r = ret(sc3(SYS_sigaction, sig, act ? (int)&kact : 0, oldact ? (int)&koact : 0));
+    if (r == 0 && oldact) {
+        oldact->sa_handler = (sighandler_t)koact.sa_handler;
+        oldact->sa_flags = koact.sa_flags;
+        oldact->sa_mask = koact.sa_mask;
+        oldact->sa_restorer = (void (*)(void))koact.sa_restorer;
+    }
+    return r;
+}
+
 sighandler_t signal(int sig, sighandler_t handler)
 {
-    int disp = handler == SIG_IGN ? SIGDISP_IGN : SIGDISP_DFL;
-    int r = ret(sc2(SYS_signal, sig, disp));
-    if (r < 0)
+    struct sigaction act, oact;
+    act.sa_handler = handler;
+    act.sa_flags = SA_RESTART;
+    act.sa_mask = 0;
+    act.sa_restorer = __sigrestorer;
+    if (sigaction(sig, &act, &oact) < 0)
         return SIG_ERR;
-    return r == SIGDISP_IGN ? SIG_IGN : SIG_DFL;
+    return oact.sa_handler;
+}
+
+int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
+{
+    return ret(sc3(SYS_sigprocmask, how, (int)set, (int)oldset));
+}
+
+int sigemptyset(sigset_t *set)
+{
+    if (!set) {
+        errno = EINVAL;
+        return -1;
+    }
+    *set = 0;
+    return 0;
+}
+
+int sigfillset(sigset_t *set)
+{
+    if (!set) {
+        errno = EINVAL;
+        return -1;
+    }
+    *set = ~1u;
+    return 0;
+}
+
+int sigaddset(sigset_t *set, int sig)
+{
+    if (!set || sig <= 0 || sig >= NSIG) {
+        errno = EINVAL;
+        return -1;
+    }
+    *set |= 1u << sig;
+    return 0;
+}
+
+int sigdelset(sigset_t *set, int sig)
+{
+    if (!set || sig <= 0 || sig >= NSIG) {
+        errno = EINVAL;
+        return -1;
+    }
+    *set &= ~(1u << sig);
+    return 0;
+}
+
+int sigismember(const sigset_t *set, int sig)
+{
+    if (!set || sig <= 0 || sig >= NSIG) {
+        errno = EINVAL;
+        return -1;
+    }
+    return (*set & (1u << sig)) != 0;
+}
+
+void __sigjmp_save_mask(uint32_t *env)
+{
+    sigset_t mask = 0;
+    sigprocmask(SIG_SETMASK, NULL, &mask);
+    env[7] = mask;
+}
+
+void __sigjmp_restore_mask(const uint32_t *env)
+{
+    sigset_t mask = env[7];
+    sigprocmask(SIG_SETMASK, &mask, NULL);
+}
+
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
+{
+    struct flux_mmap_args a = {
+        .addr = (uint32_t)addr,
+        .len = (uint32_t)len,
+        .prot = (uint32_t)prot,
+        .flags = (uint32_t)flags,
+        .fd = (int32_t)fd,
+        .offset = (uint32_t)offset,
+    };
+    int r = sc1(SYS_mmap, (int)&a);
+    if ((unsigned int)r >= (unsigned int)-4095) {
+        errno = -r;
+        return MAP_FAILED;
+    }
+    return (void *)r;
+}
+
+int munmap(void *addr, size_t len)
+{
+    return ret(sc2(SYS_munmap, (int)addr, (int)len));
+}
+
+int mprotect(void *addr, size_t len, int prot)
+{
+    return ret(sc3(SYS_mprotect, (int)addr, (int)len, prot));
 }
 
 void *sbrk(int incr)
@@ -202,6 +375,59 @@ time_t time(time_t *t)
 }
 
 int stime(const time_t *t) { return ret(sc1(SYS_stime, (int)*t)); }
+
+int gettimeofday(struct timeval *tv, struct timezone *tz)
+{
+    if (tv) {
+        tv->tv_sec = sc0(SYS_time);
+        tv->tv_usec = (suseconds_t)((uptime_ms() % 1000) * 1000);
+    }
+    if (tz) {
+        tz->tz_minuteswest = -tz_get();
+        tz->tz_dsttime = 0;
+    }
+    return 0;
+}
+
+clock_t times(struct tms *buf)
+{
+    struct flux_tms ft;
+    int r = ret(sc1(SYS_times, buf ? (int)&ft : 0));
+    if (r >= 0 && buf) {
+        buf->tms_utime = (clock_t)ft.tms_utime;
+        buf->tms_stime = (clock_t)ft.tms_stime;
+        buf->tms_cutime = (clock_t)ft.tms_cutime;
+        buf->tms_cstime = (clock_t)ft.tms_cstime;
+    }
+    return (clock_t)r;
+}
+
+clock_t clock(void)
+{
+    struct tms t;
+    if (times(&t) == (clock_t)-1)
+        return (clock_t)-1;
+    return t.tms_utime + t.tms_stime;
+}
+
+int getrusage(int who, struct rusage *usage)
+{
+    if (!usage || (who != RUSAGE_SELF && who != RUSAGE_CHILDREN)) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct tms t;
+    if (times(&t) == (clock_t)-1)
+        return -1;
+    memset(usage, 0, sizeof(*usage));
+    clock_t ut = (who == RUSAGE_CHILDREN) ? t.tms_cutime : t.tms_utime;
+    clock_t st = (who == RUSAGE_CHILDREN) ? t.tms_cstime : t.tms_stime;
+    usage->ru_utime.tv_sec = ut / CLOCKS_PER_SEC;
+    usage->ru_utime.tv_usec = (ut % CLOCKS_PER_SEC) * (1000000 / CLOCKS_PER_SEC);
+    usage->ru_stime.tv_sec = st / CLOCKS_PER_SEC;
+    usage->ru_stime.tv_usec = (st % CLOCKS_PER_SEC) * (1000000 / CLOCKS_PER_SEC);
+    return 0;
+}
 
 int uname(struct utsname *buf) { return ret(sc1(SYS_uname, (int)buf)); }
 int sched_yield(void) { return sc0(SYS_yield); }

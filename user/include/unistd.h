@@ -41,6 +41,13 @@ int isatty(int fd);
 
 pid_t getpid(void);
 pid_t getppid(void);
+uid_t getuid(void);
+uid_t geteuid(void);
+gid_t getgid(void);
+gid_t getegid(void);
+int setuid(uid_t uid);
+int setgid(gid_t gid);
+int chown(const char *path, uid_t owner, gid_t group);
 int setpgid(pid_t pid, pid_t pgid);
 pid_t getpgid(pid_t pid);
 pid_t getpgrp(void);

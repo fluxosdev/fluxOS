@@ -84,6 +84,7 @@ struct vnode *vfs_mknod_anon(uint32_t rdev, dev_read_t rd, dev_write_t wr);
 int vfs_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n);
 int vfs_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n);
 int vfs_truncate(struct vnode *vn, uint32_t size);
+int vfs_utime(const char *path, struct vnode *cwd, uint32_t mtime);
 void vfs_stat(struct vnode *vn, struct stat *st);
 int vfs_dirent(struct vnode *dir, uint32_t index, struct dirent *de);
 int vfs_getpath(struct vnode *vn, char *buf, uint32_t size);

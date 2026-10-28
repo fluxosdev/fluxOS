@@ -16,6 +16,7 @@
 #define MAX_FRAMES (0x100000000ull / PAGE_SIZE)
 
 static uint32_t bitmap[MAX_FRAMES / 32];
+static uint8_t share_count[MAX_FRAMES];
 static uint32_t total_frames;
 static uint32_t free_frames, low_free_frames;
 static uint32_t (*reclaim_pages)(uint32_t);
@@ -36,6 +37,7 @@ static inline void frame_set(uint32_t f)
 {
     if (!frame_used(f)) {
         bitmap[f / 32] |= 1u << (f % 32);
+        share_count[f] = 0;
         free_frames--;
         if (f < LOW_FRAMES) low_free_frames--;
     }
@@ -45,6 +47,7 @@ static inline void frame_clear(uint32_t f)
 {
     if (frame_used(f)) {
         bitmap[f / 32] &= ~(1u << (f % 32));
+        share_count[f] = 0;
         free_frames++;
         if (f < LOW_FRAMES) low_free_frames++;
     }
@@ -91,6 +94,7 @@ void pmm_release(uint32_t start, uint32_t end)
 void pmm_init(struct multiboot_info *mbi)
 {
     memset(bitmap, 0xFF, sizeof(bitmap));
+    memset(share_count, 0, sizeof(share_count));
     free_frames = low_free_frames = 0;
     total_frames = 0;
 
@@ -196,13 +200,42 @@ uint32_t pmm_alloc_contig(uint32_t frames)
     return page;
 }
 
+int pmm_ref(uint32_t phys)
+{
+    uint32_t f = phys / PAGE_SIZE;
+    if (f >= MAX_FRAMES)
+        return 0;
+    spin_lock(&pmm_lock);
+    if (!frame_used(f) || share_count[f] == 255) {
+        spin_unlock(&pmm_lock);
+        return 0;
+    }
+    share_count[f]++;
+    spin_unlock(&pmm_lock);
+    return 1;
+}
+
+int pmm_claim_sole(uint32_t phys)
+{
+    uint32_t f = phys / PAGE_SIZE;
+    if (f >= MAX_FRAMES)
+        return 0;
+    spin_lock(&pmm_lock);
+    int sole = frame_used(f) != 0 && share_count[f] == 0;
+    spin_unlock(&pmm_lock);
+    return sole;
+}
+
 void pmm_free(uint32_t phys)
 {
     uint32_t f = phys / PAGE_SIZE;
     if (f >= MAX_FRAMES)
         return;
     spin_lock(&pmm_lock);
-    frame_clear(f);
+    if (share_count[f] > 0)
+        share_count[f]--;
+    else
+        frame_clear(f);
     spin_unlock(&pmm_lock);
 }
 

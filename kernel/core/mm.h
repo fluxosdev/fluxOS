@@ -16,6 +16,8 @@ uint32_t pmm_alloc_user(void);              /* anywhere, for user pages (vmm_kma
 uint32_t pmm_alloc_contig(uint32_t frames); /* below 1 GiB */
 uint32_t pmm_alloc_reserved(uint32_t reserve); /* cache pages; never reclaim, retain low frames */
 void pmm_set_reclaimer(uint32_t (*reclaim)(uint32_t pages)); /* boot-time registration */
+int pmm_ref(uint32_t phys);                 /* add a COW/shared reference; 0 if full/invalid */
+int pmm_claim_sole(uint32_t phys);          /* 1 if allocated with no extra references */
 void pmm_free(uint32_t phys);
 uint32_t pmm_total_kb(void);
 uint32_t pmm_free_kb(void);
@@ -29,6 +31,8 @@ uint32_t pmm_free_kb(void);
 #define PTE_LARGE   0x080
 #define PTE_GLOBAL  0x100
 #define PTE_MMIO    0x200       /* (available bit) device memory, not ours to free */
+#define PTE_COW     0x400       /* (available bit) copy-on-write user page */
+#define PTE_SHARED  0x800       /* (available bit) shared across fork without COW */
 
 /* PTE bits for write-combining device memory (the framebuffer), or 0 if
  * the processor has no page attribute table (cpu.c). */
@@ -42,8 +46,13 @@ uint32_t *vmm_create(void);
 void vmm_destroy(uint32_t *pd);
 uint32_t *vmm_clone(uint32_t *pd);
 int vmm_alloc(uint32_t *pd, uint32_t va);   /* map a zeroed user page */
+int vmm_alloc_prot(uint32_t *pd, uint32_t va, uint32_t prot, uint32_t flags);
+int vmm_protect_page(uint32_t *pd, uint32_t va, uint32_t prot);
 void vmm_free_page(uint32_t *pd, uint32_t va);
+int vmm_pte_present(uint32_t *pd, uint32_t va);
 uint32_t vmm_translate(uint32_t *pd, uint32_t va);
+int vmm_write_ok(uint32_t *pd, uint32_t va);
+int vmm_resolve_cow(uint32_t *pd, uint32_t va);
 int vmm_copy_to(uint32_t *pd, uint32_t va, const void *src, uint32_t len);
 uint32_t vmm_user_pages(uint32_t *pd);
 /* flags: extra page bits, such as PTE_PCD for device registers */

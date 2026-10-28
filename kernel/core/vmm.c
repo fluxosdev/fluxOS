@@ -17,7 +17,9 @@
  * mappings is flushed there too (smp_flush_tlb).
  */
 #include "kernel.h"
+#include "drivers.h"
 #include "mm.h"
+#include "proc.h"
 #include "smp.h"
 #include "x86.h"
 
@@ -192,6 +194,11 @@ static void flush_page(uint32_t *pd, uint32_t va)
 
 int vmm_alloc(uint32_t *pd, uint32_t va)
 {
+    return vmm_alloc_prot(pd, va, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+}
+
+int vmm_alloc_prot(uint32_t *pd, uint32_t va, uint32_t prot, uint32_t flags)
+{
     va = ALIGN_DOWN(va, PAGE_SIZE);
     if (va < USER_BASE || va >= USER_TOP)
         return -EFAULT;
@@ -204,7 +211,40 @@ int vmm_alloc(uint32_t *pd, uint32_t va)
     if (!frame)
         return -ENOMEM;
     zero_page(frame);
-    *pte = frame | PTE_PRESENT | PTE_WRITE | PTE_USER;
+    uint32_t bits = PTE_PRESENT;
+    if (prot != PROT_NONE)
+        bits |= PTE_USER;
+    if (prot & PROT_WRITE)
+        bits |= PTE_WRITE;
+    if (flags & MAP_SHARED)
+        bits |= PTE_SHARED;
+    *pte = frame | bits;
+    flush_page(pd, va);
+    return 0;
+}
+
+int vmm_protect_page(uint32_t *pd, uint32_t va, uint32_t prot)
+{
+    va = ALIGN_DOWN(va, PAGE_SIZE);
+    if (va < USER_BASE || va >= USER_TOP)
+        return -EFAULT;
+    uint32_t *pte = get_pte(pd, va, 0);
+    if (!pte || !(*pte & PTE_PRESENT) || (*pte & PTE_MMIO))
+        return -ENOMEM;
+    uint32_t e = *pte;
+    if (prot == PROT_NONE) {
+        e &= ~(PTE_USER | PTE_WRITE);
+    } else if (prot & PROT_WRITE) {
+        e |= PTE_USER;
+        if ((e & PTE_SHARED) || pmm_claim_sole(FRAME(e))) {
+            e = (e & ~PTE_COW) | PTE_WRITE;
+        } else {
+            e = (e & ~PTE_WRITE) | PTE_COW;
+        }
+    } else {
+        e = (e | PTE_USER) & ~(PTE_WRITE | PTE_COW);
+    }
+    *pte = e;
     flush_page(pd, va);
     return 0;
 }
@@ -237,14 +277,66 @@ void vmm_free_page(uint32_t *pd, uint32_t va)
     }
 }
 
+int vmm_pte_present(uint32_t *pd, uint32_t va)
+{
+    if (va < USER_BASE || va >= USER_TOP)
+        return 0;
+    uint32_t *pte = get_pte(pd, va, 0);
+    return pte && (*pte & (PTE_PRESENT | PTE_MMIO)) == PTE_PRESENT;
+}
+
 uint32_t vmm_translate(uint32_t *pd, uint32_t va)
 {
     if (va < USER_BASE || va >= USER_TOP)
         return 0;
     uint32_t *pte = get_pte(pd, va, 0);
-    if (!pte || (*pte & (PTE_PRESENT | PTE_MMIO)) != PTE_PRESENT)
-        return 0;                               /* device memory is not RAM */
+    if (!pte || (*pte & (PTE_PRESENT | PTE_USER | PTE_MMIO)) != (PTE_PRESENT | PTE_USER))
+        return 0;                               /* device memory or PROT_NONE is not RAM */
     return FRAME(*pte) | (va & 0xFFF);
+}
+
+int vmm_write_ok(uint32_t *pd, uint32_t va)
+{
+    if (va < USER_BASE || va >= USER_TOP)
+        return 0;
+    uint32_t *pte = get_pte(pd, va, 0);
+    if (!pte)
+        return 0;
+    uint32_t req = PTE_PRESENT | PTE_USER | PTE_WRITE;
+    return (*pte & (req | PTE_MMIO)) == req;
+}
+
+int vmm_resolve_cow(uint32_t *pd, uint32_t va)
+{
+    va = ALIGN_DOWN(va, PAGE_SIZE);
+    if (va < USER_BASE || va >= USER_TOP)
+        return 0;
+    uint32_t *pte = get_pte(pd, va, 0);
+    if (!pte || (*pte & (PTE_PRESENT | PTE_USER | PTE_MMIO)) != (PTE_PRESENT | PTE_USER))
+        return 0;
+    if (*pte & PTE_WRITE)
+        return 1;
+    if (!(*pte & PTE_COW))
+        return 0;
+    uint32_t old_frame = FRAME(*pte);
+    if (pmm_claim_sole(old_frame)) {
+        *pte = (*pte & ~PTE_COW) | PTE_WRITE;
+        flush_page(pd, va);
+        return 1;
+    }
+    uint32_t new_frame = pmm_alloc_user();
+    if (!new_frame)
+        return 0;
+    uint32_t flags = irq_save();
+    if (kernel_sse)
+        sse_copy_page(kmap(new_frame, 0), kmap(old_frame, 1));
+    else
+        memcpy(kmap(new_frame, 0), kmap(old_frame, 1), PAGE_SIZE);
+    irq_restore(flags);
+    *pte = new_frame | ((*pte & 0xFFFu & ~PTE_COW) | PTE_WRITE);
+    flush_page(pd, va);
+    pmm_free(old_frame);
+    return 1;
 }
 
 /* Copy kernel memory into another address space, a page at a time. */
@@ -252,6 +344,8 @@ int vmm_copy_to(uint32_t *pd, uint32_t va, const void *src, uint32_t len)
 {
     const uint8_t *s = src;
     while (len) {
+        if (!vmm_write_ok(pd, va) && !vmm_resolve_cow(pd, va))
+            return -EFAULT;
         uint32_t phys = vmm_translate(pd, va);
         if (!phys)
             return -EFAULT;
@@ -282,12 +376,22 @@ void vmm_destroy(uint32_t *pd)
     pmm_free((uint32_t)pd);
 }
 
-/* Deep copy of the user half (fork), without the device memory. */
+static void flush_pd(uint32_t *pd)
+{
+    if (read_cr3() == (uint32_t)pd)
+        write_cr3((uint32_t)pd);
+    else
+        smp_flush_tlb(pd);
+}
+
+/* Copy-on-write clone of the user half (fork), without the device memory.
+ * Pages lent to the GPU stay writable in the parent and are copied for the child. */
 uint32_t *vmm_clone(uint32_t *src)
 {
     uint32_t *pd = vmm_create();
     if (!pd)
         return NULL;
+    int pid = current ? current->pid : 0;
     for (uint32_t i = USER_PDE_FIRST; i < USER_PDE_END; i++) {
         if (!(src[i] & PTE_PRESENT))
             continue;
@@ -296,20 +400,37 @@ uint32_t *vmm_clone(uint32_t *src)
         if (!dpt)
             goto fail;
         pd[i] = (uint32_t)dpt | PTE_PRESENT | PTE_WRITE | PTE_USER;
+        int pde_pinned = pid > 0 && fb_pinned(pid, i << 22, (i + 1) << 22);
         for (int j = 0; j < 1024; j++) {
             if ((spt[j] & (PTE_PRESENT | PTE_MMIO)) != PTE_PRESENT)
                 continue;
+            uint32_t va = (i << 22) | ((uint32_t)j << 12);
+            int pinned = pde_pinned && fb_pinned(pid, va, va + PAGE_SIZE);
+            if (!pinned && pmm_ref(FRAME(spt[j]))) {
+                if ((spt[j] & (PTE_WRITE | PTE_COW)) && !(spt[j] & PTE_SHARED))
+                    spt[j] = (spt[j] & ~PTE_WRITE) | PTE_COW;
+                dpt[j] = spt[j];
+                continue;
+            }
             uint32_t frame = pmm_alloc_user();
             if (!frame)
                 goto fail;
             uint32_t flags = irq_save();
-            sse_copy_page(kmap(frame, 0), kmap(FRAME(spt[j]), 1));
+            if (kernel_sse)
+                sse_copy_page(kmap(frame, 0), kmap(FRAME(spt[j]), 1));
+            else
+                memcpy(kmap(frame, 0), kmap(FRAME(spt[j]), 1), PAGE_SIZE);
             irq_restore(flags);
-            dpt[j] = frame | (spt[j] & 0xFFF);
+            uint32_t eflags = spt[j] & 0xFFFu & ~(PTE_COW | PTE_SHARED);
+            if (spt[j] & PTE_COW)
+                eflags |= PTE_WRITE;
+            dpt[j] = frame | eflags;
         }
     }
+    flush_pd(src);
     return pd;
 fail:
+    flush_pd(src);
     vmm_destroy(pd);
     return NULL;
 }

@@ -10,8 +10,15 @@
 
 #define MAX_PROCS   64
 #define MAX_FDS     32
+#define MAX_VMAS    64
 #define KSTACK_SIZE 16384
 #define QUANTUM     5           /* timer ticks per time slice (50 ms) */
+
+struct proc_vma {
+    uint32_t start, end;        /* page-aligned [start, end), or 0 when unused */
+    uint32_t prot;              /* PROT_* */
+    uint32_t flags;             /* MAP_* */
+};
 
 enum {
     P_UNUSED   = PSTATE_UNUSED,
@@ -41,12 +48,21 @@ struct proc {
     int exit_status;
     uint32_t sig_pending;
     uint32_t sig_ignored;
+    uint32_t sig_blocked;
+    struct flux_sigaction sig_actions[NSIG];
+    uint32_t fault_addr;
+    int in_syscall;
+    uint32_t syscall_orig_eax;
     struct file *fds[MAX_FDS];
+    uint32_t fd_cloexec;        /* bitmask of FD_CLOEXEC per descriptor */
+    uint32_t umask;
     struct vnode *cwd;
     struct tty *ctty;           /* controlling terminal */
     uint32_t heap_start, brk;
     uint32_t stack_low;         /* lowest mapped stack page */
+    struct proc_vma vmas[MAX_VMAS];
     uint32_t cpu_ticks;
+    uint32_t child_ticks;       /* reaped children's cpu_ticks + child_ticks */
     uint32_t start_tick;
     uint32_t ready_tick;         /* affinity yields to tasks waiting a full quantum */
     int last_cpu;               /* soft affinity, -1 until first scheduled */
@@ -143,10 +159,16 @@ void proc_signal(struct proc *p, int sig);
 void proc_signal_force(struct proc *p, int sig);
 void proc_signal_group(int pgid, int sig);
 void proc_signal_ctty(struct tty *t, int sig);
+void proc_signal_exec(struct proc *p);
 uint32_t *proc_set_pd(struct proc *p, uint32_t *pd);    /* returns the old one */
 int signal_pending(struct proc *p);
 void proc_check_signals(void);
 int proc_grow_stack(uint32_t addr);
+int proc_page_fault(uint32_t addr, int write);
+uint32_t proc_vma_lowest(const struct proc *p);
+int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint32_t *out);
+int proc_munmap(struct proc *p, uint32_t addr, uint32_t len);
+int proc_mprotect(struct proc *p, uint32_t addr, uint32_t len, uint32_t prot);
 
 /* Lazy FPU switching (fpu.c) */
 void fpu_init(void);
@@ -155,6 +177,8 @@ void fpu_trap(void);
 void fpu_switch(struct proc *prev, struct proc *next);
 void fpu_fork(struct proc *child);
 void fpu_release(struct proc *p);
+void fpu_save_to(struct proc *p, int32_t *used, uint8_t out[512]);
+void fpu_restore_from(struct proc *p, int32_t used, const uint8_t in[512]);
 void fpu_suspend_cpu(void);              /* its registers are about to be lost */
 
 #endif

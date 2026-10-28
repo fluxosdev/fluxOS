@@ -1176,6 +1176,11 @@ static int fat_rename(struct vnode *vn, struct vnode *newdir, const char *newnam
     return 0;
 }
 
+static int fat_setattr(struct vnode *vn)
+{
+    return update_entry(vn->fs->priv, vn);
+}
+
 static void fat_release(struct vnode *vn)
 {
     struct fat_node *n = vn->fs_data;
@@ -1328,6 +1333,7 @@ const struct fs_ops fat32_ops = {
     .create = fat_create,
     .remove = fat_remove,
     .rename = fat_rename,
+    .setattr = fat_setattr,
     .release = fat_release,
     .statfs = fat_statfs,
 };

@@ -152,6 +152,46 @@ void fpu_release(struct proc *p)
     irq_restore(flags);
 }
 
+void fpu_save_to(struct proc *p, int32_t *used, uint8_t out[512])
+{
+    uint32_t flags = irq_save();
+    struct cpu *c = this_cpu();
+    if (fpu_holds(c, p)) {
+        clts();
+        fpu_save(p);
+        c->fpu_owner = NULL;
+        stts();
+    }
+    *used = p->fpu_used;
+    if (p->fpu_used)
+        memcpy(out, p->fpu, 512);
+    else
+        memset(out, 0, 512);
+    p->fpu_used = 0;
+    p->fpu_cpu = -1;
+    irq_restore(flags);
+}
+
+void fpu_restore_from(struct proc *p, int32_t used, const uint8_t in[512])
+{
+    uint32_t flags = irq_save();
+    struct cpu *c = this_cpu();
+    if (c->fpu_owner == p) {
+        c->fpu_owner = NULL;
+        stts();
+    }
+    p->fpu_cpu = -1;
+    p->fpu_used = used ? 1 : 0;
+    if (used) {
+        memcpy(p->fpu, in, 512);
+        uint32_t mxcsr;
+        memcpy(&mxcsr, p->fpu + FX_MXCSR, sizeof(mxcsr));
+        mxcsr &= 0xFFBFu;               /* clear reserved MXCSR bits before FXRSTOR */
+        memcpy(p->fpu + FX_MXCSR, &mxcsr, sizeof(mxcsr));
+    }
+    irq_restore(flags);
+}
+
 /* Suspend to RAM: this processor's FPU is about to lose its registers.
  * The running process's go to its struct proc (the others' are there
  * already), and nothing counts on what the FPU holds. Interrupts off. */

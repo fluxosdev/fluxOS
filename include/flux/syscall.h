@@ -75,9 +75,19 @@
 #define SYS_ioctl     67
 #define SYS_usbinfo   68
 #define SYS_stime     69
-#define SYS_llseek    70    /* fd, offset high, offset low, uint64_t *result, whence */
-#define SYS_power     71    /* POWER_* op, arg */
+#define SYS_llseek      70  /* fd, offset high, offset low, uint64_t *result, whence */
+#define SYS_power       71  /* POWER_* op, arg */
+#define SYS_sigaction   72  /* sig, const struct flux_sigaction *act, struct flux_sigaction *oact */
+#define SYS_sigprocmask 73  /* how, const uint32_t *set, uint32_t *oset */
+#define SYS_sigreturn   74  /* const struct flux_sigcontext *ctx */
+#define SYS_mmap        75  /* const struct flux_mmap_args *args */
+#define SYS_munmap      76  /* addr, len */
+#define SYS_mprotect    77  /* addr, len, prot */
+#define SYS_fcntl       78  /* fd, cmd, arg */
+#define SYS_umask       79  /* mask */
+#define SYS_utime       80  /* path, const struct flux_utimbuf *times */
+#define SYS_times       81  /* struct flux_tms *buf */
 
-#define NSYSCALLS     72
+#define NSYSCALLS       82
 
 #endif
