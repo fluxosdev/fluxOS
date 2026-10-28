@@ -859,9 +859,15 @@ cannot be used.
   while geometry for some positioned boxes is approximate; background `space` and `round`
   still repeat, `local` attachments do not track inner scrolling, and gradients use a limited
   two-color renderer; `z-index` only orders absolute and fixed boxes, `sticky` works
-  against the window only, transforms other than `translate`,
+  against the window only. CSS 2D translate, scale, rotate, skew and matrix transforms
+  support origins, nesting, painting, hit testing and visual geometry; 3D transforms,
   CSS `transition`s and CSS animations are ignored (Web Animations has a limited
-  numeric/color interpolator). Flexbox has grow/shrink sizing, wrapping,
+  numeric/color interpolator). Transform scratch rendering is bounded to four million
+  source pixels per item. `structuredClone` copies buffers, typed views and blobs,
+  preserving shared references; ownership transfer is not implemented. `CSS.escape`
+  handles identifier serialization, including Unicode and selector round trips.
+  Try `file:///usr/share/www/transforms.html` for an interactive example.
+  Flexbox has grow/shrink sizing, wrapping,
   ordering, alignment and rows/columns, but needs wider conformance testing;
   grids lack subgrid, column flow, named spans and complete named-line behavior for auto-repeat.
   Container queries are missing. Shadow DOM still needs wider composed-event and slot

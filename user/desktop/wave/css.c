@@ -3697,9 +3697,27 @@ static void set_len(struct len *dst, const char *value, const struct vctx *v)
 /* Parse complete 2D transform lists before changing the cascaded value. */
 static int transform_number(const char *s, float *out, int angle)
 {
-    char *end;
-    double x = strtod(s, &end);
-    if (end == s || !__builtin_isfinite(x) || fabs(x) > 1000000) return 0;
+    const char *end=s;
+    int negative=0,digits=0;
+    if(*end=='+' || *end=='-')negative=*end++=='-';
+    double x=0;
+    while(isdigit((unsigned char)*end)){x=x*10+(*end++-'0');digits++;}
+    if(*end=='.') {
+        double place=.1;end++;
+        while(isdigit((unsigned char)*end)){x+=(*end++-'0')*place;place*=.1;digits++;}
+    }
+    if(!digits)return 0;
+    if(*end=='e' || *end=='E') {
+        const char *exponent=end+1;int eneg=0,power=0;
+        if(*exponent=='+' || *exponent=='-')eneg=*exponent++=='-';
+        if(isdigit((unsigned char)*exponent)) {
+            while(isdigit((unsigned char)*exponent)){power=power*10+(*exponent++-'0');if(power>308)return 0;}
+            while(power--)x*=eneg?.1:10;
+            end=exponent;
+        }
+    }
+    if(negative)x=-x;
+    if (!__builtin_isfinite(x) || fabs(x) > 1000000) return 0;
     while (isspace((unsigned char)*end)) end++;
     if (angle) {
         if (!strcasecmp(end,"deg")) x *= 0.017453292519943295;
@@ -4778,9 +4796,14 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         }
         break;
     }
-    case P_TRANSFORM_ORIGIN:
-        parse_position(value,v,&st->tox,&st->toy);
+    case P_TRANSFORM_ORIGIN: {
+        const char *parts[4];int lengths[4],count=words(value,parts,lengths,4);
+        if(count==3) {
+            char xy[256];snprintf(xy,sizeof(xy),"%.*s %.*s",lengths[0],parts[0],lengths[1],parts[1]);
+            parse_position(xy,v,&st->tox,&st->toy); /* Z has no effect on a 2D matrix. */
+        } else if(count<=2)parse_position(value,v,&st->tox,&st->toy);
         break;
+    }
     case P_Z_INDEX: {
         int num;
         st->z_set = parse_num(value, &num) != 0;
