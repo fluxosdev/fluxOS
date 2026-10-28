@@ -491,6 +491,41 @@ void fb_suspend(void)
     mutex_lock(&display_mutex);
 }
 
+/*
+ * Going to sleep, with interrupts off and the other processors parked, so
+ * nothing draws again: a dark screen. A card that loses power shows
+ * nothing anyway, but one that keeps it (under an emulator, which goes on
+ * showing what it last had) would leave the picture up. The page shown is
+ * cleared, and a VGA-compatible card's screen is turned off too (not a
+ * Radeon's own mode, which the VGA registers do not drive, and which goes
+ * dark with the card). fb_unblank() turns it back on; whoever has the
+ * screen draws it again (the console in fb_resume(), the desktop on
+ * PEV_RESUMED).
+ */
+void fb_blank(void)
+{
+    if (fb.base)
+        fb_fill(0, 0, fb.width, fb.height, 0);
+    if (radeon_present())
+        return;
+    outb(0x3C4, 0x01);                  /* clocking mode: screen off */
+    outb(0x3C5, inb(0x3C5) | 0x20);
+    (void)inb(0x3DA);                   /* attribute index, without the palette: blank */
+    outb(0x3C0, 0x00);
+}
+
+/* Back from sleep, or it never went: the screen on again. */
+void fb_unblank(void)
+{
+    if (radeon_present())
+        return;
+    outb(0x3C4, 0x01);
+    outb(0x3C5, inb(0x3C5) & (uint8_t)~0x20);
+    (void)inb(0x3DA);
+    outb(0x3C0, 0x20);                  /* the palette drives the screen again */
+    (void)inb(0x3DA);
+}
+
 void fb_resume(void)
 {
     if (radeon_present())

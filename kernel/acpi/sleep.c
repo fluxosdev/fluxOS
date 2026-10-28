@@ -22,8 +22,10 @@
  * display driver (Radeon, Voodoo) that cannot set its card up again, a
  * USB disk in use.
  *
- * The screen: the video BIOS forgets its mode, so wakeup.S sets the VESA
- * mode the boot loader chose again (or text mode). "s3_bios" on the
+ * The screen: blanked just before SLP_EN (fb_blank()), as a card that keeps
+ * power (an emulator's) would go on showing the desktop. On waking the
+ * video BIOS has forgotten its mode, so wakeup.S sets the VESA mode the
+ * boot loader chose again (or text mode). "s3_bios" on the
  * command line also runs the video BIOS from the start first, for
  * machines whose firmware leaves the card cold; "s3_nomode" skips the
  * mode; "s3_beep" beeps as soon as the firmware hands over, to tell a
@@ -138,6 +140,7 @@ static void machine_sleep(void)
         sleep_failed = 1;
         return;
     }
+    fb_blank();
     pic_suspend();
     osl_suspend();
     place_trampoline();
@@ -164,6 +167,7 @@ static void machine_sleep(void)
     pit_resume();
     serial_resume();
     pci_resume();
+    fb_unblank();                       /* once the card answers its VGA ports again */
     uacpi_prepare_for_wake_from_sleep_state(UACPI_SLEEP_STATE_S3);
     /* Some firmware leaves ACPI mode off on waking, against the spec;
      * Linux turns it back on regardless, and so do we. */

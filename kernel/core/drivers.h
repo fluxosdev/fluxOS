@@ -37,6 +37,8 @@ int fb_pinned(int pid, uint32_t start, uint32_t end);  /* radeon_pinned, under t
 int fb_wake_mode(void);                 /* VESA mode to set on waking, 0 text, -1 none possible */
 void fb_suspend(void);                  /* holds the display lock until fb_resume() */
 void fb_resume(void);
+void fb_blank(void);                    /* the screen dark for S3; interrupts off */
+void fb_unblank(void);
 
 /* 3dfx Banshee/Voodoo3 display driver (voodoo.c) */
 void voodoo_init(void);
