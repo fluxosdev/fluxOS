@@ -589,8 +589,73 @@ static void cjk_wrapping(void)
     unload(&p);
 }
 
+static const struct ditem *colored(const struct page *p,uint32_t color)
+{
+    for(int i=0;i<p->lo.nitems;i++)if(p->lo.items[i].kind==DK_FILL && p->lo.items[i].color==color)return &p->lo.items[i];
+    return NULL;
+}
+static struct rect visual_item(const struct page *p,const struct ditem *d)
+{ CHECK(d);return layout_transform_rect(&p->lo,d->xf,mkrect(d->x,d->y,d->w,d->h),0,0); }
+static void expect_rect(struct rect r,int x,int y,int w,int h)
+{ if(r.x!=x || r.y!=y || r.w!=w || r.h!=h)fprintf(stderr,"rect got %d,%d %dx%d expected %d,%d %dx%d\n",r.x,r.y,r.w,r.h,x,y,w,h);CHECK(r.x==x && r.y==y && r.w==w && r.h==h); }
+static void transforms_2d(void)
+{
+    struct page p;uint32_t pixels[128*128];
+    struct surface surface={pixels,128,128,128,{0,0,128,128}};
+    const char *functions[]={"scale(2)","translate(30px,10px) scale(2)","scale(2) translate(30px,10px)",
+        "translate(40px,10px) rotate(90deg)","matrix(0,1,-1,0,40,10)","translate(40px,10px) scale(-1,1)",
+        "skewX(45deg)","translate(50%,100%)"};
+    const int expected[][4]={{0,0,40,20},{30,10,40,20},{60,20,40,20},{30,10,10,20},{30,10,10,20},
+        {20,10,20,10},{0,0,30,10},{10,10,20,10}};
+    for(unsigned k=0;k<sizeof(functions)/sizeof(functions[0]);k++) {
+        char html[1024];snprintf(html,sizeof(html),"<style>body{margin:0}#box{width:20px;height:10px;background:red;transform-origin:0 0;transform:%s}#after{width:1px;height:1px;background:blue}</style><div id=box></div><div id=after></div>",functions[k]);
+        load(&p,html,128,128);
+        const struct ditem *d=colored(&p,0xffff0000);CHECK(d && d->xf && d->w==20 && d->h==10);
+        const struct ditem *after=colored(&p,0xff0000ff);CHECK(after && after->y==10); /* normal flow is unchanged */
+        struct rect r=visual_item(&p,d);expect_rect(r,expected[k][0],expected[k][1],expected[k][2],expected[k][3]);
+        struct rect node_box=layout_node_visual_rect(&p.lo,d->node,mkrect(d->x,d->y,d->w,d->h),0,0);
+        expect_rect(node_box,r.x,r.y,r.w,r.h);
+        paint_document(&p.lo,&surface,0,0,0,0,NULL,0);
+        int cx=r.x+r.w/2,cy=r.y+r.h/2;
+        CHECK(pixels[cy*128+cx]==0xff0000);
+        CHECK(layout_box_contains(&p.lo,d->xf,d->dyn,d->sb,mkrect(d->x,d->y,d->w,d->h),cx,cy,0,0));
+        unload(&p);
+    }
+    load(&p,"<style>body{margin:0}div{position:absolute;left:40px;top:10px;width:20px;height:10px;background:red;transform:rotate(90deg)}</style><div></div>",128,128);
+    expect_rect(visual_item(&p,colored(&p,0xffff0000)),45,5,10,20);unload(&p);
+    load(&p,"<style>body{margin:0}.outer{width:80px;height:50px;transform:translate(30px,20px)}.inner{width:20px;height:10px;background:red;transform-origin:0 0;transform:rotate(.25turn)}</style><div class=outer><div class=inner></div></div>",128,128);
+    const struct ditem *d=colored(&p,0xffff0000);expect_rect(visual_item(&p,d),20,20,10,20);
+    paint_document(&p.lo,&surface,0,0,0,0,NULL,0);CHECK(pixels[25*128+25]==0xff0000 && pixels[5*128+5]==0xffffff);unload(&p);
+    load(&p,"<style>body{margin:0}button{margin:0;padding:0;border:0;width:20px;height:10px;background:red;transform-origin:0 0;transform:translate(40px,10px) rotate(90deg)}</style><button></button>",128,128);
+    CHECK(p.lo.ncontrols>=1 && p.lo.controls[0].xf);
+    const struct hotspot *control=&p.lo.controls[0];
+    struct rect control_box=layout_transform_rect(&p.lo,control->xf,mkrect(control->x,control->y,control->w,control->h),0,0);
+    CHECK(layout_hit(&p.lo,p.lo.controls,p.lo.ncontrols,control_box.x+control_box.w/2,control_box.y+control_box.h/2,0,0));
+    CHECK(!layout_hit(&p.lo,p.lo.controls,p.lo.ncontrols,control->x+control->w/2,control->y+control->h/2,0,0));unload(&p);
+    load(&p,"<style>body{margin:0}div{width:20px;height:10px;background:red;transform:scale(0)}</style><div></div>",128,128);
+    d=colored(&p,0xffff0000);paint_document(&p.lo,&surface,0,0,0,0,NULL,0);
+    CHECK(pixels[5*128+5]==0xffffff && !layout_box_contains(&p.lo,d->xf,0,0,mkrect(0,0,20,10),5,5,0,0));unload(&p);
+    load(&p,"<style>body{margin:0}.outer{width:20px;height:20px;overflow:hidden}.inner{width:20px;height:10px;background:red;transform:translate(15px,5px)}</style><div class=outer><div class=inner></div></div>",128,128);
+    d=colored(&p,0xffff0000);paint_document(&p.lo,&surface,0,0,0,0,NULL,0);
+    CHECK(pixels[8*128+17]==0xff0000 && pixels[8*128+25]==0xffffff);
+    CHECK(layout_box_contains(&p.lo,d->xf,d->dyn,d->sb,mkrect(d->x,d->y,d->w,d->h),17,8,0,0));
+    CHECK(!layout_box_contains(&p.lo,d->xf,d->dyn,d->sb,mkrect(d->x,d->y,d->w,d->h),25,8,0,0));unload(&p);
+    load(&p,"<style>body{margin:0}.outer{width:20px;height:20px;overflow:hidden;transform-origin:0 0;transform:translate(40px,10px) rotate(90deg)}.inner{width:20px;height:10px;background:red;transform:translate(15px,5px)}</style><div class=outer><div class=inner></div></div>",128,128);
+    d=colored(&p,0xffff0000);paint_document(&p.lo,&surface,0,0,0,0,NULL,0);
+    CHECK(pixels[27*128+32]==0xff0000 && pixels[35*128+32]==0xffffff);
+    CHECK(!layout_box_contains(&p.lo,d->xf,d->dyn,d->sb,mkrect(d->x,d->y,d->w,d->h),32,35,0,0));unload(&p);
+    /* Translucent pixels blend against the real destination after transformation. */
+    load(&p,"<style>body{margin:0;background:blue}div{width:10px;height:10px;background:rgba(255,0,0,.5);transform-origin:0 0;transform:scale(2)}</style><div></div>",128,128);
+    paint_document(&p.lo,&surface,0,0,0,0,NULL,0);unsigned alpha=node_find(p.root,T_DIV)->style->bg>>24;CHECK(pixels[5*128+5]==(alpha<<16 | (255-alpha)));unload(&p);
+    /* A transform captures fixed descendants, even through a positioned wrapper. */
+    load(&p,"<style>body{margin:0}.outer{margin-top:20px;width:80px;height:50px;transform:translateX(30px)}.wrap{position:relative}.fixed{position:fixed;left:0;top:0;width:20px;height:10px;background:red}</style><div class=outer><div class=wrap><div class=fixed></div></div></div>",128,128);
+    d=colored(&p,0xffff0000);CHECK(d && !d->dyn);expect_rect(visual_item(&p,d),30,20,20,10);unload(&p);
+    puts("browser transforms: order, origins, nested matrices, raster pixels, alpha, clipping, hit testing and flow passed");
+}
+
 int main(void)
 {
+    transforms_2d();
     font_faces();
     text_flow();
     positioning();

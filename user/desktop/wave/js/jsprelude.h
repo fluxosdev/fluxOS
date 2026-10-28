@@ -319,12 +319,23 @@ static const char js_chunk_misc[] = JS_SOURCE(
     }
     if (seen.has(v)) return seen.get(v);
     var r;
-    if (v instanceof Date) return new Date(v.getTime());
-    if (v instanceof RegExp) return new RegExp(v.source, v.flags);
+    if (v instanceof Date) { r = new Date(v.getTime()); seen.set(v, r); return r; }
+    if (v instanceof RegExp) { r = new RegExp(v.source, v.flags); seen.set(v, r); return r; }
+    var binary = g["%binaryType"](v);
+    if (binary === "ArrayBuffer") { r = g["%binaryClone"](v); seen.set(v, r); return r; }
+    if (binary) {
+      var buffer = copy(v.buffer, seen);
+      r = g["%binaryClone"](v, buffer);
+      seen.set(v, r); return r;
+    }
+    if (v instanceof Blob) { r = new Blob([v], { type: v.type }); seen.set(v, r); return r; }
+    if (typeof Node !== "undefined" && v instanceof Node)
+      throw new DOMException("A DOM node could not be cloned", "DataCloneError");
     if (Array.isArray(v)) {
       r = [];
       seen.set(v, r);
-      for (var i = 0; i < v.length; i++) r[i] = copy(v[i], seen);
+      r.length = v.length;
+      Object.keys(v).forEach(function (k) { r[k] = copy(v[k], seen); });
       return r;
     }
     if (v instanceof Map) {
@@ -344,7 +355,11 @@ static const char js_chunk_misc[] = JS_SOURCE(
     Object.keys(v).forEach(function (k) { r[k] = copy(v[k], seen); });
     return r;
   }
-  lz("structuredClone", function (v) { return copy(v, new Map()); });
+  lz("structuredClone", function (v, options) {
+    if (options && options.transfer && Array.from(options.transfer).length)
+      throw new DOMException("Transferring ownership is not supported", "DataCloneError");
+    return copy(v, new Map());
+  });
 
   var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   lz("btoa", function (s) {
@@ -1200,7 +1215,27 @@ static const char js_chunk_web[] = JS_SOURCE(
     registerProperty: function () {},
     highlights: new Map(),
     px: function (n) { return n + "px"; },
-    escape: function (s) { return String(s).replace(/[^a-zA-Z0-9_-]/g, function (c) { return "\\" + c; }); }
+    escape: function (value) {
+      if (!arguments.length) throw new TypeError("CSS.escape requires an argument");
+      var s = String(value), out = "";
+      for (var i = 0; i < s.length; i++) {
+        var c = s.charCodeAt(i);
+        if (c >= 55296 && c <= 56319 && i + 1 < s.length &&
+            s.charCodeAt(i + 1) >= 56320 && s.charCodeAt(i + 1) <= 57343) {
+          out += s.slice(i, i + 2); i++; continue;
+        }
+        if (c === 0) { out += String.fromCharCode(65533); continue; }
+        if ((c >= 1 && c <= 31) || c === 127 || (i === 0 && c >= 48 && c <= 57) ||
+            (i === 1 && c >= 48 && c <= 57 && s.charCodeAt(0) === 45)) {
+          out += "\\" + c.toString(16) + " "; continue;
+        }
+        if (i === 0 && c === 45 && s.length === 1) { out += "\\-"; continue; }
+        if (c >= 128 || c === 45 || c === 95 || (c >= 48 && c <= 57) ||
+            (c >= 65 && c <= 90) || (c >= 97 && c <= 122)) out += s.charAt(i);
+        else out += "\\" + s.charAt(i);
+      }
+      return out;
+    }
   };
   class Notification {
     constructor() {}

@@ -19,6 +19,7 @@
  * moved into place when their line is placed; table cells are moved
  * down to their vertical alignment the same way.
  */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -102,6 +103,8 @@ struct lctx {
 
 static unsigned layout_gen;
 static int len_px(struct len l, int base);
+static int node_transform(const struct layout *lo,const struct node *n);
+static struct rect overflow_rect(const struct layout *lo,const struct ditem *d,const struct sbox *b);
 static int bg_picture_wanted(const struct style *st);
 static void bg_picture_finish(struct lctx *c, struct node *n, int slot);
 
@@ -162,7 +165,24 @@ static void add_hotspot(struct lctx *c, struct hotspot **arr, int *n, int *cap, 
     if (!na)
         return;
     *arr = na;
-    (*arr)[(*n)++] = (struct hotspot){ x, y, w, h, node, 0, 0 };
+    (*arr)[(*n)++] = (struct hotspot){ .x=x, .y=y, .w=w, .h=h, .node=node };
+}
+
+/* Groups are registered inside-out; indices survive display-list reordering. */
+static void transform_register(struct lctx *c, struct node *n, struct mark from, int x, int y, int w, int h)
+{
+    struct layout *lo=c->lo;
+    if (!n->style->xf || c->measuring || lo->nxf>=4096) return;
+    struct transform_box *groups=grow(c->a,lo->xf,lo->nxf,&lo->xfcap,sizeof(*groups));
+    if(!groups)return;
+    lo->xf=groups;
+    int index=++lo->nxf;
+    groups[index-1]=(struct transform_box){.node=n,.x=x,.y=y,.w=w,.h=h,.first=from.items,.last=lo->nitems};
+    for(int k=0;k<index-1;k++)if(!groups[k].parent && groups[k].first>=from.items && groups[k].last<=lo->nitems)
+        groups[k].parent=(uint16_t)index;
+    for(int k=from.items;k<lo->nitems;k++)if(!lo->items[k].xf)lo->items[k].xf=(uint16_t)index;
+    for(int k=from.links;k<lo->nlinks;k++)if(!lo->links[k].xf)lo->links[k].xf=(uint16_t)index;
+    for(int k=from.controls;k<lo->ncontrols;k++)if(!lo->controls[k].xf)lo->controls[k].xf=(uint16_t)index;
 }
 
 static void add_anchor(struct lctx *c, const char *name, int y)
@@ -216,6 +236,10 @@ static void shift(struct lctx *c, struct mark from, struct mark to, int dx, int 
             lo->controls[i].x += dx, lo->controls[i].y += dy;
     for (int i = from.anchors; i < to.anchors; i++)
         lo->anchors[i].y += dy;
+    for(int k=0;k<lo->nxf;k++) {
+        struct transform_box *g=&lo->xf[k];
+        if(g->first>=from.items && g->last<=to.items)g->x+=dx,g->y+=dy;
+    }
     for (int k = 0; k < lo->ndyn; k++) {        /* sticky boxes and their containers move with their items */
         struct dynbox *d = &lo->dyn[k];
         if (d->fixed || d->i0 < from.items || d->i1 > to.items)
@@ -430,10 +454,11 @@ static void sbox_finalize(struct layout *lo)
         struct sbox *b = &lo->sb[d->sb - 1];
         if (d->dyn != b->dyn)           /* in a sticky box of its own, or the like: not where it was laid out */
             continue;
-        if (d->x + d->w > b->cw)
-            b->cw = d->x + d->w;
-        if (d->y + d->h > b->ch)
-            b->ch = d->y + d->h;
+        struct rect r=overflow_rect(lo,d,b);
+        if(d->x+d->w>b->cw)b->cw=d->x+d->w;
+        if(d->y+d->h>b->ch)b->ch=d->y+d->h;
+        if(r.x+r.w>b->cw)b->cw=r.x+r.w;
+        if(r.y+r.h>b->ch)b->ch=r.y+r.h;
     }
     for (int k = 0; k < lo->nsb; k++) {
         struct sbox *b = &lo->sb[k];
@@ -1381,6 +1406,7 @@ static int canvas_attr(const struct node *n, const char *name, int def)
 static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, int *oh, int *obase)
 {
     const struct style *st = n->style;
+    struct mark transform_start=mark_now(c);
     struct boxm b;
     resolve_box(st, avail, -1, &b);
     b.ml = len_px(st->margin[3], avail);       /* auto margins are the caller's business */
@@ -1609,6 +1635,7 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
     }
     if (ctrl)
         add_hotspot(c, &c->lo->controls, &c->lo->ncontrols, &c->lo->controlcap, n, d->x, d->y, w, h);
+    transform_register(c,n,transform_start,bx,by,bw,bh);
 }
 
 /* An inline-block (or float, or flex item) with its margin box at (0, 0). */
@@ -2044,9 +2071,12 @@ static void place_line(struct lctx *c, struct flow *f, int from, int to)
             if (st->vertical_align == VA_MIDDLE)
                 top = baseline - xh / 2 - it->h / 2;
             shift(c, it->m0, it->m1, it->x, top);
-            if (it->link)
-                add_hotspot(c, &c->lo->links, &c->lo->nlinks, &c->lo->linkcap, it->link, it->x, top,
-                            it->w, it->h);
+            if (it->link) {
+                int before=c->lo->nlinks;
+                add_hotspot(c, &c->lo->links, &c->lo->nlinks, &c->lo->linkcap, it->link, it->x, top,it->w,it->h);
+                if(c->lo->nlinks>before && it->m0.items<it->m1.items)
+                    c->lo->links[c->lo->nlinks-1].xf=c->lo->items[it->m0.items].xf;
+            }
         }
     }
     place_marker(c, baseline);
@@ -2370,7 +2400,7 @@ static int block_content(struct lctx *c, struct node *n, int x, int y, int w, in
 }
 
 /* An absolute or fixed box, placed against the padding box (cbx, cby, cbw x cbh) of its containing block. */
-static void layout_abs(struct lctx *c, const struct pend *p, int cbx, int cby, int cbw, int cbh)
+static void layout_abs(struct lctx *c, const struct pend *p, int cbx, int cby, int cbw, int cbh, int viewport_fixed)
 {
     struct node *n = p->n;
     const struct style *st = n->style;
@@ -2412,7 +2442,7 @@ static void layout_abs(struct lctx *c, const struct pend *p, int cbx, int cby, i
     shift(c, m0, mark_now(c), x, y);
     if (st->z_set && st->z_index != 0 && c->nzr < (int)(sizeof(c->zr) / sizeof(c->zr[0])))
         c->zr[c->nzr++] = (struct zrange){ m0.items, c->lo->nitems, st->z_index };
-    if (st->position == POS_FIXED)      /* it stays where it is in the window as the page scrolls */
+    if (st->position == POS_FIXED && viewport_fixed)      /* it stays where it is in the window as the page scrolls */
         dyn_register(c, m0, 1, x, y, ow, oh, st, NULL);
 }
 
@@ -2438,7 +2468,7 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
     int first_dyn = c->lo->ndyn;
     /* Positioned boxes (and boxes that will be moved as a whole) place absolute descendants;
      * boxes that start a formatting context keep their floats to themselves. */
-    int is_cb = st->position != POS_STATIC || c->force_container || bg_slot || n == c->contain || !n->parent;
+    int is_cb = st->xf || st->position != POS_STATIC || c->force_container || bg_slot || n == c->contain || !n->parent;
     int pfirst = c->npend;
     int bfc = !n->parent || st->clips || st->floated || st->display == D_TABLE_CELL ||
               st->display == D_INLINE_BLOCK || st->position == POS_ABSOLUTE || st->position == POS_FIXED ||
@@ -2551,15 +2581,16 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
         mf = mark_now(c);                       /* what follows is not the box's own */
     }
     if (is_cb && c->npend > pfirst) {
-        int end = c->npend;
+        int end = c->npend, keep=pfirst;
         for (int i = pfirst; i < end; i++) {
             struct pend p = c->pend[i];
-            if (p.n->style->position == POS_FIXED || !n->parent)
-                layout_abs(c, &p, 0, 0, c->vw, c->vh);          /* against the viewport */
+            if(p.n->style->position==POS_FIXED && !st->xf && n->parent){c->pend[keep++]=p;continue;}
+            if ((p.n->style->position == POS_FIXED && !st->xf) || !n->parent)
+                layout_abs(c, &p, 0, 0, c->vw, c->vh, 1);          /* against the viewport */
             else
-                layout_abs(c, &p, bx + b.bl, y + b.bt, bw - b.bl - b.br, bh - b.bt - b.bb);
+                layout_abs(c, &p, bx + b.bl, y + b.bt, bw - b.bl - b.br, bh - b.bt - b.bb, 0);
         }
-        c->npend = pfirst;
+        c->npend = keep;
     }
     if (st->clips && !bg_slot) {                        /* overflow: its contents are clipped, perhaps scrolled */
         struct mark mp = mark_now(c);
@@ -2569,11 +2600,7 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
         };
         sbox_register(c, n, bx, y, bw, bh, rg, 2);
     }
-    if (!bg_slot && (st->tx.v || st->ty.v)) {           /* transform: translate() */
-        int dx = len_px(st->tx, bw), dy = len_px(st->ty, bh);
-        if (dx || dy)
-            shift(c, m_start, mark_now(c), dx, dy);
-    }
+    if (!bg_slot) transform_register(c,n,m_start,bx,y,bw,bh);
     if (st->position == POS_RELATIVE && !bg_slot) {
         int dx = st->left.unit != U_AUTO ? len_px(st->left, cw) : st->right.unit != U_AUTO ? -len_px(st->right, cw) : 0;
         int dy = st->top.unit != U_AUTO ? len_px(st->top, 0) : st->bottom.unit != U_AUTO ? -len_px(st->bottom, 0) : 0;
@@ -3973,6 +4000,7 @@ static void distribute(int *colw, const int *mn, const int *mx, const int *pct, 
  */
 static int layout_table(struct lctx *c, struct node *n, int x, int y, int cw, int force_bw, int *mb)
 {
+    struct mark transform_start=mark_now(c);
     const struct style *st = n->style;
     struct boxm b;
     resolve_box(st, cw, -1, &b);
@@ -4185,6 +4213,7 @@ static int layout_table(struct lctx *c, struct node *n, int x, int y, int cw, in
     outline_box(c, st, bx, y, bw, bh);
     free(row_slot);
     free(colmin), free(cells), free(rows), free(caps);
+    transform_register(c,n,transform_start,bx,y,bw,bh);
     return bh;
 }
 
@@ -4266,6 +4295,13 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
     int h = layout_block_box(&c, root, 0, 0, vw, -1, &mb, NULL);
     lo->height = h + (mb > 0 ? mb : 0);
     lo->width = vw;
+    /* Save scroll/fixed tags while original range indices still name their first item. */
+    for(int k=0;k<lo->nxf;k++)if(lo->xf[k].first<lo->nitems) {
+        lo->xf[k].dyn=lo->items[lo->xf[k].first].dyn;
+        lo->xf[k].sb=lo->items[lo->xf[k].first].sb;
+    }
+    for(int k=0;k<lo->ncontrols;k++)if(!lo->controls[k].xf)
+        lo->controls[k].xf=(uint16_t)node_transform(lo,lo->controls[k].node);
     apply_z_order(&c);
     sbox_finalize(lo);
     for (int i = 0; i < lo->nitems; i++) {
@@ -4282,25 +4318,154 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
     shadow_restore(composed);
 }
 
-const struct hotspot *layout_hit(const struct layout *lo, const struct hotspot *h, int n, int x, int y,
-                                 int sx, int sy)
+/* Affine maps act on page coordinates; layout coordinates themselves never move. */
+struct affine { double a,b,c,d,e,f; };
+static struct affine identity(void) { return (struct affine){1,0,0,1,0,0}; }
+static struct affine multiply(struct affine a,struct affine b)
 {
-    for (int i = n - 1; i >= 0; i--) {
-        int dx = 0, dy = 0;
-        if (h[i].dyn)
-            layout_dyn_offset(lo, h[i].dyn, sx, sy, &dx, &dy);
-        if (h[i].node && h[i].node->style && h[i].node->style->pointer_none)
-            continue;                   /* pointer-events: none */
-        if (h[i].sb) {                  /* inside scrolling boxes: moved by them, and only where they show it */
-            int bx, by;
-            struct rect clip;
-            layout_sb_view(lo, h[i].sb, sx, sy, &bx, &by, &clip);
-            if (!rect_has(clip, x, y))
-                continue;
-            dx += bx, dy += by;
-        }
-        if (x >= h[i].x + dx && x < h[i].x + dx + h[i].w && y >= h[i].y + dy && y < h[i].y + dy + h[i].h)
-            return &h[i];
+    return (struct affine){a.a*b.a+a.c*b.b,a.b*b.a+a.d*b.b,
+        a.a*b.c+a.c*b.d,a.b*b.c+a.d*b.d,
+        a.a*b.e+a.c*b.f+a.e,a.b*b.e+a.d*b.f+a.f};
+}
+static void map_point(struct affine m,double *x,double *y)
+{ double px=*x,py=*y;*x=m.a*px+m.c*py+m.e;*y=m.b*px+m.d*py+m.f; }
+static int inverse_matrix(struct affine m,struct affine *out)
+{
+    double det=m.a*m.d-m.b*m.c;
+    if(!__builtin_isfinite(det) || fabs(det)<1e-12)return 0;
+    *out=(struct affine){m.d/det,-m.b/det,-m.c/det,m.a/det,
+        (m.c*m.f-m.d*m.e)/det,(m.b*m.e-m.a*m.f)/det};
+    return 1;
+}
+static int node_transform(const struct layout *lo,const struct node *n)
+{
+    for(const struct node *p=n;p;p=p->parent)
+        for(int k=0;k<lo->nxf;k++)if(lo->xf[k].node==p)return k+1;
+    return 0;
+}
+static struct affine transform_matrix(const struct layout *lo,int index,int sx,int sy)
+{
+    struct affine result=identity();
+    for(int depth=0;index>0 && index<=lo->nxf && depth<64;depth++) {
+        const struct transform_box *g=&lo->xf[index-1];
+        const struct style *st=g->node->style;
+        int dx=0,dy=0,bx=0,by=0;
+        if(g->dyn)layout_dyn_offset(lo,g->dyn,sx,sy,&dx,&dy);
+        if(g->sb)layout_sb_view(lo,g->sb,sx,sy,&bx,&by,NULL);
+        double ox=g->x+dx+bx+css_transform_length(st->tox,g->w),oy=g->y+dy+by+css_transform_length(st->toy,g->h);
+        struct affine m={1,0,0,1,ox,oy};
+        double value[6];css_transform_matrix(st,g->w,g->h,value);
+        m=multiply(m,(struct affine){value[0],value[1],value[2],value[3],value[4],value[5]});
+        m=multiply(m,(struct affine){1,0,0,1,-ox,-oy});
+        result=multiply(m,result);index=g->parent;
+    }
+    return result;
+}
+static int coordinate(double x)
+{ if(!__builtin_isfinite(x))return 0;return x>BIG?BIG:x<-BIG?-BIG:(int)x; }
+static struct rect mapped_rect(struct affine m,struct rect r)
+{
+    double x0=BIG,y0=BIG,x1=-BIG,y1=-BIG;
+    for(int k=0;k<4;k++) {
+        double x=r.x+(k&1?r.w:0),y=r.y+(k&2?r.h:0);map_point(m,&x,&y);
+        if(x<x0)x0=x;
+        if(x>x1)x1=x;
+        if(y<y0)y0=y;
+        if(y>y1)y1=y;
+    }
+    /* Float transform storage can leave quarter turns a few ulps off integer. */
+    int x=coordinate(floor(x0+1e-5)),y=coordinate(floor(y0+1e-5));
+    return mkrect(x,y,coordinate(ceil(x1-1e-5))-x,coordinate(ceil(y1-1e-5))-y);
+}
+static struct rect overflow_rect(const struct layout *lo,const struct ditem *d,const struct sbox *b)
+{
+    struct rect r=mkrect(d->x,d->y,d->w,d->h);
+    if(!d->xf)return r;
+    struct affine own=transform_matrix(lo,node_transform(lo,b->node),0,0),inverse;
+    if(!inverse_matrix(own,&inverse))return r;
+    return mapped_rect(multiply(inverse,transform_matrix(lo,d->xf,0,0)),r);
+}
+struct rect layout_transform_rect(const struct layout *lo,int xf,struct rect r,int sx,int sy)
+{ return xf?mapped_rect(transform_matrix(lo,xf,sx,sy),r):r; }
+struct rect layout_node_visual_rect(const struct layout *lo,const struct node *n,struct rect r,int sx,int sy)
+{
+    int xf=node_transform(lo,n),dyn=0,sb=0;
+    if(xf && lo->xf[xf-1].node==n) {
+        const struct transform_box *g=&lo->xf[xf-1];
+        r=mkrect(g->x,g->y,g->w,g->h);dyn=g->dyn;sb=g->sb;
+    } else for(int k=0;k<lo->nitems;k++)if(lo->items[k].node==n) {
+        dyn=lo->items[k].dyn;sb=lo->items[k].sb;break;
+    }
+    int dx=0,dy=0,bx=0,by=0;
+    if(dyn)layout_dyn_offset(lo,dyn,sx,sy,&dx,&dy);
+    if(sb)layout_sb_view(lo,sb,sx,sy,&bx,&by,NULL);
+    r.x+=dx+bx;r.y+=dy+by;
+    return layout_transform_rect(lo,xf,r,sx,sy);
+}
+int layout_node_local_point(const struct layout *lo,const struct node *n,struct rect r,int *x,int *y,int sx,int sy)
+{
+    int xf=node_transform(lo,n),dyn=0,sb=0;
+    if(xf && lo->xf[xf-1].node==n) {
+        const struct transform_box *g=&lo->xf[xf-1];r=mkrect(g->x,g->y,g->w,g->h);dyn=g->dyn;sb=g->sb;
+    } else for(int k=0;k<lo->nitems;k++)if(lo->items[k].node==n){dyn=lo->items[k].dyn;sb=lo->items[k].sb;break;}
+    int dx=0,dy=0,bx=0,by=0;
+    if(dyn)layout_dyn_offset(lo,dyn,sx,sy,&dx,&dy);
+    if(sb)layout_sb_view(lo,sb,sx,sy,&bx,&by,NULL);
+    if(!layout_transform_point(lo,xf,x,y,sx,sy,1))return 0;
+    *x-=r.x+dx+bx;*y-=r.y+dy+by;return 1;
+}
+int layout_transform_point(const struct layout *lo,int xf,int *x,int *y,int sx,int sy,int inverse)
+{
+    if(!xf)return 1;
+    struct affine m=transform_matrix(lo,xf,sx,sy);
+    if(inverse && !inverse_matrix(m,&m))return 0;
+    double px=*x+0.5,py=*y+0.5;map_point(m,&px,&py);
+    if(!__builtin_isfinite(px) || !__builtin_isfinite(py) || fabs(px)>BIG || fabs(py)>BIG)return 0;
+    *x=(int)floor(px);*y=(int)floor(py);return 1;
+}
+struct xclip { struct affine inverse; struct rect box; };
+static int transform_clips(const struct layout *lo,int sb,int sx,int sy,struct xclip clips[64])
+{
+    int count=0;
+    for(int depth=0;sb>0 && sb<=lo->nsb && depth<64;depth++) {
+        const struct sbox *b=&lo->sb[sb-1];int dx=0,dy=0,px=0,py=0;
+        if(b->dyn)layout_dyn_offset(lo,b->dyn,sx,sy,&dx,&dy);
+        if(b->parent)layout_sb_view(lo,b->parent,sx,sy,&px,&py,NULL);
+        struct affine m=transform_matrix(lo,node_transform(lo,b->node),sx,sy);
+        if(!inverse_matrix(m,&clips[count].inverse))return -1;
+        clips[count++].box=mkrect(b->x+dx+px,b->y+dy+py,b->w,b->h);
+        sb=b->parent;
+    }
+    return count;
+}
+static int clips_contain(const struct xclip *clips,int count,double x,double y)
+{
+    if(count<0)return 0;
+    for(int k=0;k<count;k++) {
+        double px=x,py=y;map_point(clips[k].inverse,&px,&py);
+        struct rect r=clips[k].box;
+        if(px<r.x || py<r.y || px>=r.x+r.w || py>=r.y+r.h)return 0;
+    }
+    return 1;
+}
+int layout_box_contains(const struct layout *lo,int xf,int dyn,int sb,struct rect r,int x,int y,int sx,int sy)
+{
+    int dx=0,dy=0,bx=0,by=0;
+    if(dyn)layout_dyn_offset(lo,dyn,sx,sy,&dx,&dy);
+    if(sb) {
+        struct xclip clips[64];int count=transform_clips(lo,sb,sx,sy,clips);
+        if(!clips_contain(clips,count,x+0.5,y+0.5))return 0;
+        layout_sb_view(lo,sb,sx,sy,&bx,&by,NULL);
+    }
+    if(!layout_transform_point(lo,xf,&x,&y,sx,sy,1))return 0;
+    return x>=r.x+dx+bx && y>=r.y+dy+by && x<r.x+dx+bx+r.w && y<r.y+dy+by+r.h;
+}
+
+const struct hotspot *layout_hit(const struct layout *lo,const struct hotspot *h,int n,int x,int y,int sx,int sy)
+{
+    for(int i=n-1;i>=0;i--) {
+        if(h[i].node && h[i].node->style && h[i].node->style->pointer_none)continue;
+        if(layout_box_contains(lo,h[i].xf,h[i].dyn,h[i].sb,mkrect(h[i].x,h[i].y,h[i].w,h[i].h),x,y,sx,sy))return &h[i];
     }
     return NULL;
 }
@@ -5021,7 +5186,8 @@ static void sel_pos(const struct layout *lo, int px, int py, int *item, int *ch)
         if (d->kind != DK_TEXT || !d->len || !selectable(d))
             continue;
         last = i;
-        int qx = px, qy = py;           /* the point as the item's box has it (it may be scrolled) */
+        int qx = px, qy = py;           /* the point in the item's untransformed coordinates */
+        if(!layout_transform_point(lo,d->xf,&qx,&qy,0,0,1))continue;
         if (d->sb) {
             int sdx, sdy;
             layout_sb_view(lo, d->sb, 0, 0, &sdx, &sdy, NULL);
@@ -5197,6 +5363,89 @@ static const struct style *selection_style(const struct node *n)
     return NULL;
 }
 
+/* Iframe pages are painted separately; composite their RGB surface through the
+ * same affine map and clipping chain as the iframe's display item. */
+void layout_paint_surface(const struct layout *lo,const struct ditem *item,const struct surface *source,
+                          struct surface *dst,int ox,int oy,int sx,int sy)
+{
+    if(!source->px || source->w<=0 || source->h<=0 || item->w<=0 || item->h<=0)return;
+    struct affine m=transform_matrix(lo,item->xf,sx,sy),inv;
+    if(!inverse_matrix(m,&inv))return;
+    int dx=0,dy=0,bx=0,by=0;
+    if(item->dyn)layout_dyn_offset(lo,item->dyn,sx,sy,&dx,&dy);
+    if(item->sb)layout_sb_view(lo,item->sb,sx,sy,&bx,&by,NULL);
+    struct rect raw=mkrect(item->x+dx+bx,item->y+dy+by,item->w,item->h);
+    struct rect view=mkrect(dst->clip.x-ox+sx,dst->clip.y-oy+sy,dst->clip.w,dst->clip.h);
+    struct rect output=rect_intersect(mapped_rect(m,raw),view);
+    struct xclip clips[64];int count=transform_clips(lo,item->sb,sx,sy,clips);
+    for(int y=output.y;y<output.y+output.h;y++)for(int x=output.x;x<output.x+output.w;x++) {
+        if(!clips_contain(clips,count,x+0.5,y+0.5))continue;
+        double px=x+0.5,py=y+0.5;map_point(inv,&px,&py);
+        if(!__builtin_isfinite(px) || !__builtin_isfinite(py) || px<raw.x || py<raw.y || px>=raw.x+raw.w || py>=raw.y+raw.h)continue;
+        int ix=(int)((px-raw.x)*source->w/raw.w),iy=(int)((py-raw.y)*source->h/raw.h);
+        if(ix>=0 && iy>=0 && ix<source->w && iy<source->h)
+            dst->px[(y-sy+oy)*dst->stride+x-sx+ox]=source->px[iy*source->stride+ix]&0xffffff;
+    }
+}
+
+/* Two matte renders recover premultiplied color/coverage from the existing RGB
+ * painters, including antialiased text and translucent images. This keeps the
+ * desktop's RGB surface ABI unchanged and leaves holes in rotated items clear. */
+static void paint_transformed(const struct layout *lo,const struct ditem *item,struct surface *dst,
+                              int ox,int oy,int sx,int sy,const struct node *focus,int caret_on,int item_index)
+{
+    struct affine m=transform_matrix(lo,item->xf,sx,sy),inv;
+    if(!inverse_matrix(m,&inv))return; /* scale(0), including singular matrices, paints nothing */
+    struct ditem d=*item;int dx=0,dy=0,bx=0,by=0;
+    if(d.dyn)layout_dyn_offset(lo,d.dyn,sx,sy,&dx,&dy);
+    if(d.sb)layout_sb_view(lo,d.sb,sx,sy,&bx,&by,NULL);
+    d.x+=dx+bx;d.y+=dy+by;d.xf=d.sb=d.dyn=0;
+    int pad=8+abs(d.sh_x)+abs(d.sh_y)+d.sh_blur;
+    if(pad>512)pad=512;
+    struct rect source=mkrect(d.x-pad,d.y-pad,d.w+2*pad,d.h+2*pad);
+    struct rect visible=mkrect(dst->clip.x-ox+sx,dst->clip.y-oy+sy,dst->clip.w,dst->clip.h);
+    struct rect output=rect_intersect(mapped_rect(m,source),visible);
+    if(rect_empty(output))return;
+    source=rect_intersect(source,mapped_rect(inv,output));
+    if(rect_empty(source))return;
+    /* Bound scratch memory even for extreme matrices and enormous source boxes. */
+    size_t pixels=(size_t)source.w*(size_t)source.h;
+    if(source.w>8192 || source.h>8192 || pixels>(4u<<20))return;
+    uint32_t *memory=malloc(pixels*8);
+    if(!memory)return;
+    struct surface black={.px=memory,.w=source.w,.h=source.h,.stride=source.w,.clip={0,0,source.w,source.h}};
+    struct surface white=black;white.px=memory+pixels;
+    struct layout single=*lo;single.items=&d;single.nitems=1;single.nhl=0;
+    single.sel_on=lo->sel_on && item_index>=lo->sel_from && item_index<=lo->sel_to;
+    single.sel_from=single.sel_to=0;
+    single.sel_c0=item_index==lo->sel_from?lo->sel_c0:0;
+    single.sel_c1=item_index==lo->sel_to?lo->sel_c1:d.len;
+    single.canvas=OPAQUE(0);paint_document(&single,&black,-source.x,-source.y,0,0,focus,caret_on);
+    single.canvas=OPAQUE(0xffffff);paint_document(&single,&white,-source.x,-source.y,0,0,focus,caret_on);
+    struct xclip clips[64];int count=transform_clips(lo,item->sb,sx,sy,clips);
+    for(int y=output.y;y<output.y+output.h;y++)for(int x=output.x;x<output.x+output.w;x++) {
+        if(!clips_contain(clips,count,x+0.5,y+0.5))continue;
+        double px=x+0.5,py=y+0.5;map_point(inv,&px,&py);
+        if(!__builtin_isfinite(px) || !__builtin_isfinite(py) || px<source.x || py<source.y || px>=source.x+source.w || py>=source.y+source.h)continue;
+        int ix=(int)floor(px)-source.x,iy=(int)floor(py)-source.y;
+        if(ix<0 || iy<0 || ix>=source.w || iy>=source.h)continue;
+        size_t at=(size_t)iy*source.w+ix;
+        uint32_t b=black.px[at],w=white.px[at];
+        int clear=(int)(w>>16&255)-(int)(b>>16&255);
+        if(clear<0)clear=0;
+        if(clear>255)clear=255;
+        if(clear==255)continue;
+        uint32_t *out=&dst->px[(y-sy+oy)*dst->stride+x-sx+ox],under=*out,result=0;
+        for(int shift=0;shift<=16;shift+=8) {
+            unsigned channel=(b>>shift&255)+((under>>shift&255)*(unsigned)clear+127)/255;
+            if(channel>255)channel=255;
+            result|=channel<<shift;
+        }
+        *out=result;
+    }
+    free(memory);
+}
+
 void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, int sx, int sy,
                     const struct node *focus, int caret_on)
 {
@@ -5207,6 +5456,15 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
     struct rect sbclip = view;
     for (int i = 0; i < lo->nitems; i++) {
         const struct ditem *d = &lo->items[i];
+        struct ditem translated;
+        if(d->xf) {
+            struct affine m=transform_matrix(lo,d->xf,sx,sy);
+            /* Common integer translations retain the existing direct paint path. */
+            if(!d->sb && fabs(m.a-1)<1e-9 && fabs(m.d-1)<1e-9 && fabs(m.b)<1e-9 && fabs(m.c)<1e-9 &&
+               fabs(m.e-round(m.e))<1e-9 && fabs(m.f-round(m.f))<1e-9 && fabs(m.e)<BIG && fabs(m.f)<BIG) {
+                translated=*d;translated.x+=(int)round(m.e);translated.y+=(int)round(m.f);translated.xf=0;d=&translated;
+            } else {paint_transformed(lo,d,s,ox,oy,sx,sy,focus,caret_on,i);continue;}
+        }
         int ddx = 0, ddy = 0;
         if (d->dyn)
             layout_dyn_offset(lo, d->dyn, sx, sy, &ddx, &ddy);
@@ -5334,11 +5592,11 @@ static int sbox_depth(const struct layout *lo, int k)
 }
 
 /* Is the page point inside the box, where what clips it shows it? r gets the box's padding box on the page. */
-static int sbox_contains(const struct layout *lo, int k, int px, int py, int psx, int psy, struct rect *r)
+static int sbox_contains(const struct layout *lo,int k,int px,int py,int psx,int psy,struct rect *r)
 {
-    struct rect clip;
-    *r = sbox_rect(lo, k, psx, psy, &clip);
-    return rect_has(clip, px, py) && rect_has(*r, px, py);
+    *r=sbox_rect(lo,k,psx,psy,NULL);
+    struct xclip clips[64];int count=transform_clips(lo,k+1,psx,psy,clips);
+    return clips_contain(clips,count,px+0.5,py+0.5);
 }
 
 /* Scroll a box to (sx, sy), clamped; the node keeps it for the next layout. 1 if it moved. */
@@ -5360,23 +5618,26 @@ int layout_sbar_hit(const struct layout *lo, int px, int py, int psx, int psy, s
         struct rect r;
         if (!b->active || (!b->bar_x && !b->bar_y) || !sbox_contains(lo, k, px, py, psx, psy, &r))
             continue;
+        int qx=px,qy=py;
+        if(!layout_transform_point(lo,node_transform(lo,b->node),&qx,&qy,psx,psy,1))continue;
         for (int axis = 0; axis < 2; axis++) {
             if (!(axis ? b->bar_y : b->bar_x))
                 continue;
             int page, total, pos;
             struct rect bar = sbar_geometry(b, axis, r.x, r.y, &page, &total, &pos);
-            if (!rect_has(bar, px, py))
+            if (!rect_has(bar, qx, qy))
                 continue;
-            int len = axis ? bar.h : bar.w, along = axis ? py - bar.y : px - bar.x;
+            int len = axis ? bar.h : bar.w, along = axis ? qy - bar.y : qx - bar.x;
             int ts, tl;
             sbar_thumb_span(len, page, total, pos, axis ? b->max_y : b->max_x, &ts, &tl);
             out->box = k, out->axis = axis;
+            out->coordinate=axis?qy:qx;
             out->thumb = (axis ? bar.y : bar.x) + ts;
             out->part = along < SB_BAR ? SBP_ARROW1 : along >= len - SB_BAR ? SBP_ARROW2 : !tl ? SBP_NONE
                       : along < ts ? SBP_PAGE1 : along >= ts + tl ? SBP_PAGE2 : SBP_THUMB;
             return 1;
         }
-        if (b->bar_x && b->bar_y && px >= r.x + r.w - SB_BAR && py >= r.y + r.h - SB_BAR) {
+        if (b->bar_x && b->bar_y && qx >= r.x + r.w - SB_BAR && qy >= r.y + r.h - SB_BAR) {
             out->box = k, out->axis = 0, out->part = SBP_NONE, out->thumb = 0;      /* the corner */
             return 1;
         }
@@ -5395,9 +5656,11 @@ int layout_sbar_press(struct layout *lo, const struct sbhit *h)
     return h->axis ? sbox_set(lo, h->box, b->sx, b->sy + d) : sbox_set(lo, h->box, b->sx + d, b->sy);
 }
 
-void layout_sbar_drag(struct layout *lo, const struct sbhit *h, int mouse, int grab, int psx, int psy)
+void layout_sbar_drag(struct layout *lo, const struct sbhit *h, int px, int py, int grab, int psx, int psy)
 {
     const struct sbox *b = &lo->sb[h->box];
+    if(!layout_transform_point(lo,node_transform(lo,b->node),&px,&py,psx,psy,1))return;
+    int mouse=h->axis?py:px;
     struct rect clip;
     struct rect r = sbox_rect(lo, h->box, psx, psy, &clip);
     int page, total, pos;

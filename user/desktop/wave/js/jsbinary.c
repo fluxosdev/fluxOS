@@ -468,8 +468,45 @@ static jsval crypto_compare(struct js *J, jsval self, jsval *args, int argc)
     return js_bool(difference == 0);
 }
 
+/* Identify intrinsic binary classes without trusting a writable constructor. */
+static jsval binary_type(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    jsval v = ARG(0);
+    if (buffer_of(v)) return js_str(J, "ArrayBuffer");
+    struct view *a = typed_of(v);
+    if (a) return js_str(J, names[a->kind]);
+    if (v.t == JS_OBJ && js_host_data(v.u.o, &view_class)) return js_str(J, "DataView");
+    return js_null;
+}
+
+static jsval binary_clone(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    struct buffer *b = buffer_of(ARG(0));
+    if (b) {
+        jsval r = new_buffer(J, b->len);
+        memcpy(buffer_of(r)->data, b->data, (size_t)b->len);
+        return r;
+    }
+    struct view *a = typed_of(ARG(0));
+    int typed = a != NULL;
+    if (!a && ARG(0).t == JS_OBJ) a = js_host_data(ARG(0).u.o, &view_class);
+    b = buffer_of(ARG(1));
+    if (!a || !b || a->offset > b->len || a->len > (b->len-a->offset)/a->bytes)
+        return js_throw_error(J, "DataCloneError: invalid binary clone");
+    if (typed) return new_typed(J, ARG(1), a->offset, a->len, a->kind);
+    struct view *v = js_alloc(J, sizeof(*v));
+    *v = *a; v->buffer = ARG(1).u.o;
+    struct jsobj *o = js_new_host(J, &view_class, v);
+    o->proto = J->dataview_proto;
+    return js_obj(o);
+}
+
 void js_init_binary(struct js *J)
 {
+    js_define_native(J, J->global, "%binaryType", binary_type, 1);
+    js_define_native(J, J->global, "%binaryClone", binary_clone, 2);
     js_define_native(J, J->global, "%digest", digest_bytes, 2);
     js_define_native(J, J->global, "%hmac", hmac_bytes, 3);
     js_define_native(J, J->global, "%cryptoCompare", crypto_compare, 2);

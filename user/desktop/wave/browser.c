@@ -311,6 +311,7 @@ struct browser {
     /* frames: an <iframe> is a browser too, with no window (win is NULL) */
     struct browser *parent;
     struct node *frame_el;              /* its <iframe>, in the parent's document */
+    struct surface transformed_frame;
     int frame_w, frame_h;               /* the iframe's box */
     int frame_depth;
     int frame_vbar;                     /* its page is taller than it: a scroll bar (until the next page) */
@@ -1742,17 +1743,24 @@ static const struct ditem *frame_item(struct browser *b, const struct browser *f
 }
 
 /* The frame's box in its parent's coordinates; 0 if it has none. */
-static int frame_box(struct browser *b, const struct browser *f, struct rect *r)
+static int frame_box(struct browser *b,const struct browser *f,struct rect *r)
 {
-    const struct ditem *d = frame_item(b, f);
-    if (!d)
-        return 0;
-    struct rect v = view_rect(b);
-    int sbx = 0, sby = 0;
-    if (d->sb)                          /* in a box that scrolls: where it has moved it */
-        layout_sb_view(&b->lo, d->sb, b->scroll_x, b->scroll_y, &sbx, &sby, NULL);
-    *r = mkrect(v.x + d->x + sbx - b->scroll_x, v.y + d->y + sby - b->scroll_y, d->w, d->h);
-    return 1;
+    const struct ditem *d=frame_item(b,f);if(!d)return 0;
+    struct rect v=view_rect(b);int dx=0,dy=0,bx=0,by=0;
+    if(d->dyn)layout_dyn_offset(&b->lo,d->dyn,b->scroll_x,b->scroll_y,&dx,&dy);
+    if(d->sb)layout_sb_view(&b->lo,d->sb,b->scroll_x,b->scroll_y,&bx,&by,NULL);
+    *r=layout_transform_rect(&b->lo,d->xf,mkrect(d->x+dx+bx,d->y+dy+by,d->w,d->h),b->scroll_x,b->scroll_y);
+    r->x+=v.x-b->scroll_x;r->y+=v.y-b->scroll_y;return 1;
+}
+static int frame_local_point(struct browser *b,const struct browser *f,int x,int y,int *lx,int *ly)
+{
+    const struct ditem *d=frame_item(b,f);if(!d)return 0;
+    struct rect v=view_rect(b);x+=b->scroll_x-v.x;y+=b->scroll_y-v.y;
+    if(!layout_transform_point(&b->lo,d->xf,&x,&y,b->scroll_x,b->scroll_y,1))return 0;
+    int dx=0,dy=0,bx=0,by=0;
+    if(d->dyn)layout_dyn_offset(&b->lo,d->dyn,b->scroll_x,b->scroll_y,&dx,&dy);
+    if(d->sb)layout_sb_view(&b->lo,d->sb,b->scroll_x,b->scroll_y,&bx,&by,NULL);
+    *lx=x-d->x-dx-bx;*ly=y-d->y-dy-by;return 1;
 }
 
 /* The part of b's view that shows the frame's box: all of it, but for boxes that scroll round it. */
@@ -1769,13 +1777,16 @@ static struct rect frame_clip(struct browser *b, const struct browser *f)
 }
 
 /* The frame whose box is at (x, y), in b's page. */
-static struct browser *frame_at(struct browser *b, int x, int y, struct rect *r)
+static struct browser *frame_at(struct browser *b,int x,int y,int *lx,int *ly)
 {
-    if (!rect_contains(view_rect(b), x, y))
-        return NULL;
-    for (struct browser *f = b->frames; f; f = f->next_frame)
-        if (frame_box(b, f, r) && rect_contains(*r, x, y) && rect_contains(frame_clip(b, f), x, y))
-            return f;
+    if(!rect_contains(view_rect(b),x,y))return NULL;
+    struct rect v=view_rect(b);
+    for(struct browser *f=b->frames;f;f=f->next_frame) {
+        const struct ditem *d=frame_item(b,f);
+        if(d && layout_box_contains(&b->lo,d->xf,d->dyn,d->sb,mkrect(d->x,d->y,d->w,d->h),
+                                    x-v.x+b->scroll_x,y-v.y+b->scroll_y,b->scroll_x,b->scroll_y) &&
+           frame_local_point(b,f,x,y,lx,ly))return f;
+    }
     return NULL;
 }
 
@@ -2472,6 +2483,21 @@ static int js_node_box(void *ctx, struct node *n, int *x, int *y, int *w, int *h
     return 1;
 }
 
+static int js_node_visual_box(void *ctx,struct node *n,int *x,int *y,int *w,int *h)
+{
+    struct browser *b=ctx;
+    if(!js_node_box(ctx,n,x,y,w,h))return 0;
+    struct rect r=layout_node_visual_rect(&b->lo,n,mkrect(*x,*y,*w,*h),b->scroll_x,b->scroll_y);
+    *x=r.x;*y=r.y;*w=r.w;*h=r.h;return 1;
+}
+
+static int js_node_local_point(void *ctx,struct node *n,int *x,int *y)
+{
+    struct browser *b=ctx;int bx=0,by=0,w=0,h=0;
+    if(!js_node_box(ctx,n,&bx,&by,&w,&h))return 0;
+    return layout_node_local_point(&b->lo,n,mkrect(bx,by,w,h),x,y,b->scroll_x,b->scroll_y);
+}
+
 static int js_cookie_get(void *ctx, char *out, int size)
 {
     struct browser *b = ctx;
@@ -2668,7 +2694,7 @@ static void start_scripts(struct browser *b, const char *url)
         .navigate = js_navigate, .history = js_history, .reload = js_reload, .alert = js_alert,
         .status = js_status, .changed = js_changed, .repaint = js_repaint, .scroll = js_scroll, .scroll_pos = js_scroll_pos,
         .viewport = js_viewport, .set_title = js_set_title, .load_script = js_load_script,
-        .load_image = js_load_image, .node_box = js_node_box, .node_scroll = js_node_scroll,
+        .load_image = js_load_image, .node_box = js_node_box, .node_visual_box = js_node_visual_box, .node_local_point = js_node_local_point, .node_scroll = js_node_scroll,
         .reveal = js_reveal, .flush = js_flush, .focus = js_focus, .http = js_http, .http_cancel=js_http_cancel,
         .has_focus=js_has_focus, .clipboard_read=js_clipboard_read, .clipboard_write=js_clipboard_write,
         .cookie_get = js_cookie_get, .cookie_set = js_cookie_set, .ws_cookies=js_ws_cookies, .font_register=js_font_register, .font_status=js_font_status, .fetch_module = js_fetch_module,
@@ -4621,20 +4647,10 @@ static struct node *element_at(struct browser *b, int x, int y)
         const struct ditem *d = &b->lo.items[i];
         if (!d->node || d->node->type != N_ELEMENT)
             continue;
-        int dx = 0, dy = 0;
-        if (d->dyn)                     /* fixed and sticky boxes are where scrolling has put them */
-            layout_dyn_offset(&b->lo, d->dyn, b->scroll_x, b->scroll_y, &dx, &dy);
-        if (d->sb) {                    /* in a box that scrolls: moved by it, and seen only where it shows */
-            int sbx, sby;
-            struct rect clip;
-            layout_sb_view(&b->lo, d->sb, b->scroll_x, b->scroll_y, &sbx, &sby, &clip);
-            if (x < clip.x || y < clip.y || x >= clip.x + clip.w || y >= clip.y + clip.h)
-                continue;
-            dx += sbx, dy += sby;
-        }
         if (web_inert(d->node) || (d->node->style && d->node->style->pointer_none))
             continue;                   /* pointer-events: none */
-        if (x >= d->x + dx && x < d->x + dx + d->w && y >= d->y + dy && y < d->y + dy + d->h)
+        if (layout_box_contains(&b->lo,d->xf,d->dyn,d->sb,mkrect(d->x,d->y,d->w,d->h),
+                                x,y,b->scroll_x,b->scroll_y))
             return d->node;
     }
     return NULL;
@@ -4887,6 +4903,20 @@ static void paint_page(struct browser *b, struct surface *s, int ox, int oy)
     for (struct browser *f = b->frames; f; f = f->next_frame) {
         if (!frame_box(b, f, &box))
             continue;
+        const struct ditem *frame=frame_item(b,f);
+        if(frame && frame->xf) {
+            if(f->frame_w>0 && f->frame_h>0 && (uint64_t)(unsigned)f->frame_w*(unsigned)f->frame_h<=(16u<<20)) {
+                if(f->transformed_frame.w!=f->frame_w || f->transformed_frame.h!=f->frame_h) {
+                    surface_free(&f->transformed_frame);surface_init(&f->transformed_frame,f->frame_w,f->frame_h);
+                }
+                if(f->transformed_frame.px) {
+                    gfx_noclip(&f->transformed_frame);paint_page(f,&f->transformed_frame,0,0);
+                    s->clip=page;layout_paint_surface(&b->lo,frame,&f->transformed_frame,s,v.x,v.y,b->scroll_x,b->scroll_y);
+                }
+            }
+            continue;
+        }
+        surface_free(&f->transformed_frame);
         struct rect fc = frame_clip(b, f);
         s->clip = rect_intersect(page, mkrect(box.x + ox, box.y + oy, box.w, box.h));
         s->clip = rect_intersect(s->clip, mkrect(fc.x + ox, fc.y + oy, fc.w, fc.h));
@@ -5351,7 +5381,8 @@ static int control_rect(struct browser *b, const struct node *n, struct rect *r)
             layout_dyn_offset(&b->lo, h->dyn, b->scroll_x, b->scroll_y, &dx, &dy);
         if (h->sb)
             layout_sb_view(&b->lo, h->sb, b->scroll_x, b->scroll_y, &sx, &sy, NULL);
-        *r = mkrect(v.x + h->x + dx + sx - b->scroll_x, v.y + h->y + dy + sy - b->scroll_y, h->w, h->h);
+        *r=layout_transform_rect(&b->lo,h->xf,mkrect(h->x+dx+sx,h->y+dy+sy,h->w,h->h),b->scroll_x,b->scroll_y);
+        r->x+=v.x-b->scroll_x;r->y+=v.y-b->scroll_y;
         return 1;
     }
     return 0;
@@ -6459,14 +6490,14 @@ static int ctx_mouse(struct browser *b, int x, int y, int buttons, int changed)
 }
 
 /* A range slider being dragged: its value for the pointer at x (b's coordinates). */
-static void range_drag_to(struct browser *b, struct node *n, int x)
+static void range_drag_to(struct browser *b, struct node *n, int x, int y)
 {
-    struct rect cr;
-    if (!control_rect(b, n, &cr))
-        return;
-    int track = cr.w - 12 - 10;         /* the thumb is 10 wide, 6 in from each end */
+    int bx=0,by=0,w=0,h=0;struct rect view=view_rect(b);
+    x+=b->scroll_x-view.x;y+=b->scroll_y-view.y;
+    if(!js_node_box(b,n,&bx,&by,&w,&h) || !js_node_local_point(b,n,&x,&y))return;
+    int track = w - 12 - 10;         /* the thumb is 10 wide, 6 in from each end */
     char v[32];
-    range_value_at(n, track > 0 ? (x - (cr.x + 6 + 5)) * 1000 / track : 0, v, sizeof(v));
+    range_value_at(n, track > 0 ? (x - (6 + 5)) * 1000 / track : 0, v, sizeof(v));
     if (!n->value || strcmp(n->value, v)) {
         char *nv = strdup(v);
         if (!nv)
@@ -6489,7 +6520,8 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
 {
     int left = buttons & MOUSE_LEFT;
     int pressed = (changed & MOUSE_LEFT) && left, released = (changed & MOUSE_LEFT) && !left;
-    struct rect v = view_rect(b), box;
+    struct rect v = view_rect(b);
+    int fx=0,fy=0;
     int px = x - v.x + b->scroll_x, py = y - v.y + b->scroll_y;
 
     /* A press that went into a frame: it has the mouse until the button comes up. */
@@ -6497,8 +6529,7 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
         struct browser *f = b->mouse_frame;
         if (released)
             b->mouse_frame = NULL;
-        if (frame_box(b, f, &box))
-            mouse(f, x - box.x, y - box.y, buttons, changed);
+        if (frame_local_point(b,f,x,y,&fx,&fy))mouse(f,fx,fy,buttons,changed);
         return;
     }
     if (b->pop_node && pop_mouse(b, x, y, pressed, released))      /* an open list has the pointer */
@@ -6506,7 +6537,7 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
     if (pressed)
         tip_hide(top_of(b));
     if (b->hold == H_NONE) {
-        struct browser *f = frame_at(b, x, y, &box);
+        struct browser *f = frame_at(b, x, y, &fx, &fy);
         if (f) {
             if (pressed)
                 b->mouse_frame = f;
@@ -6514,7 +6545,7 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
                 b->hover = NULL;
                 paint(b);
             }
-            mouse(f, x - box.x, y - box.y, buttons, changed);
+            mouse(f, fx, fy, buttons, changed);
             return;
         }
         for (f = b->frames; f; f = f->next_frame)
@@ -6603,7 +6634,7 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             b->hold = H_SBOX;
             b->sb_hit = sh;
             if (sh.part == SBP_THUMB)
-                b->sb_grab = (sh.axis ? py : px) - sh.thumb;
+                b->sb_grab = sh.coordinate - sh.thumb;
             else
                 layout_sbar_press(&b->lo, &sh);
             paint(b);
@@ -6622,7 +6653,7 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
                 !node_attr(b->press_ctrl, "disabled")) {
                 b->drag_range = b->press_ctrl;      /* a press sets the value, and a drag goes on setting it */
                 b->focus = b->press_ctrl;
-                range_drag_to(b, b->drag_range, x);
+                range_drag_to(b, b->drag_range, x, y);
             }
             h = layout_hit(&b->lo, b->lo.links, b->lo.nlinks, px, py, b->scroll_x, b->scroll_y);
             b->press_link = h && !b->press_ctrl && !web_inert(h->node) ? h->node : NULL;
@@ -6720,11 +6751,11 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
         paint(b);
     } else if (b->hold == H_SBOX) {
         if (b->sb_hit.part == SBP_THUMB && b->sb_hit.box < b->lo.nsb) {
-            layout_sbar_drag(&b->lo, &b->sb_hit, b->sb_hit.axis ? py : px, b->sb_grab, b->scroll_x, b->scroll_y);
+            layout_sbar_drag(&b->lo, &b->sb_hit, px, py, b->sb_grab, b->scroll_x, b->scroll_y);
             paint(b);
         }
     } else if (b->hold == H_PAGE && b->drag_range) {
-        range_drag_to(b, b->drag_range, x);
+        range_drag_to(b, b->drag_range, x, y);
     } else if (b->hold == H_PAGE && b->sel_start && left) {
         int dx = px - b->sel_ax, dy = py - b->sel_ay;
         if (!b->sel_active && (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy) > 4)
@@ -6760,9 +6791,9 @@ static void br_mouse(struct window *w, int x, int y, int buttons, int changed)
  * its end), and then the page around it; 1 if something scrolled. */
 static int wheel(struct browser *b, int x, int y, int delta)
 {
-    struct rect box;
-    struct browser *f = frame_at(b, x, y, &box);
-    if (f && wheel(f, x - box.x, y - box.y, delta))
+    int fx=0,fy=0;
+    struct browser *f = frame_at(b, x, y, &fx, &fy);
+    if (f && wheel(f, fx, fy, delta))
         return 1;
     struct rect v = view_rect(b);
     if (b->pop_node) {                  /* an open list that scrolls */
@@ -6830,6 +6861,7 @@ static void destroy_browser(struct browser *b)
     for(int i=0;i<FETCH_LANES;i++){select_loader(b,&b->lanes[i]);helper_close(b);}
     free_page(b);                       /* (its frames are dropped, to be freed by sweep_frames) */
     cache_clear(b);
+    surface_free(&b->transformed_frame);
     find_clear(b);
     free(b->mp_body);
     for (int i = 0; i < b->nhist; i++)

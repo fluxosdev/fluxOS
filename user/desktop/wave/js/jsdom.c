@@ -674,6 +674,37 @@ static int ident_char(int c)
     return isalnum(c) || c == '-' || c == '_' || c >= 0x80 || c == '\\';
 }
 
+/* CSS.escape output includes hex escapes followed by optional whitespace. */
+static const char *selector_escape(const char *p,const char *end,int *codepoint)
+{
+    p++;int cp=0,k=0;
+    while(p<end && k<6 && isxdigit((unsigned char)*p)) {
+        cp=cp*16+(isdigit((unsigned char)*p)?*p-'0':tolower((unsigned char)*p)-'a'+10);p++;k++;
+    }
+    if(k) {
+        if(p<end && class_space((unsigned char)*p)) { if(*p=='\r' && p+1<end && p[1]=='\n')p++;p++; }
+        if(!cp || cp>0x10ffff || (cp>=0xd800 && cp<=0xdfff))cp=0xfffd;
+    } else if(p<end) cp=(unsigned char)*p++;
+    else cp=0xfffd;
+    if(codepoint)*codepoint=cp;
+    return p;
+}
+static int selector_ident(const char **position,const char *end,char *out,size_t size)
+{
+    const char *p=*position;size_t used=0;
+    while(p<end && ident_char((unsigned char)*p)) {
+        if(*p=='\\') {
+            int cp;p=selector_escape(p,end,&cp);
+            if(used+4>=size)return 0;
+            used+=(size_t)utf8_put(out+used,cp);
+        } else {
+            if(used+1>=size)return 0;
+            out[used++]=*p++;
+        }
+    }
+    out[used]=0;*position=p;return used>0;
+}
+
 static int match_compound(const struct node *n, const char *s, int len);
 static int matches_span(const struct node *n, const char *s, int len);
 
@@ -763,16 +794,12 @@ static int match_compound(const struct node *n, const char *s, int len)
     while (s < e) {
         char c = *s++;
         if (c == '#' || c == '.') {
-            const char *t = s;
-            while (s < e && ident_char((unsigned char)*s))
-                s++;
+            char decoded[1024];
+            if(!selector_ident(&s,e,decoded,sizeof(decoded)))return 0;
             if (c == '#') {
                 const char *id = node_attr(n, "id");
-                if (!id || (int)strlen(id) != s - t || strncmp(id, t, (size_t)(s - t)))
-                    return 0;
-            } else if (!has_class(n, t, (int)(s - t))) {
-                return 0;
-            }
+                if (!id || strcmp(id,decoded))return 0;
+            } else if (!has_class(n,decoded,(int)strlen(decoded)))return 0;
         } else if (c == '[') {
             const char *t = s;
             while (s < e && *s != ']' && *s != '=' && *s != '~' && *s != '^' && *s != '$' &&
@@ -863,32 +890,20 @@ static int match_complex(const struct node *n, const char *s, int len)
     /* find the last combinator outside brackets and parentheses */
     int depth = 0, at = -1;
     char comb = 0;
-    for (int i = len - 1; i >= 0; i--) {
-        char c = s[i];
-        if (c == ']' || c == ')')
-            depth++;
-        else if (c == '[' || c == '(')
-            depth--;
-        else if (!depth && (c == '>' || c == '+' || c == '~')) {
-            at = i;
-            comb = c;
-            break;
-        } else if (!depth && c == ' ') {
-            /* a descendant combinator unless next to another combinator */
-            int j = i;
-            while (j > 0 && s[j - 1] == ' ')
-                j--;
-            int k = i;
-            while (k < len - 1 && s[k + 1] == ' ')
-                k++;
-            if (j == 0 || k == len - 1)
-                continue;
-            char before = s[j - 1], after = s[k + 1];
-            if (before == '>' || before == '+' || before == '~' || after == '>' || after == '+' || after == '~')
-                continue;
-            at = i;
-            comb = ' ';
-            break;
+    char quote=0;
+    for (int i=0;i<len;i++) {
+        char c=s[i];
+        if(c=='\\'){i=(int)(selector_escape(s+i,s+len,NULL)-s)-1;continue;}
+        if(quote){if(c==quote)quote=0;continue;}
+        if(c=='\'' || c=='"'){quote=c;continue;}
+        if(c=='[' || c=='('){depth++;continue;}
+        if(c==']' || c==')'){depth--;continue;}
+        if(depth)continue;
+        if(c=='>' || c=='+' || c=='~'){at=i;comb=c;}
+        else if(class_space((unsigned char)c)) {
+            int j=i;while(j+1<len && class_space((unsigned char)s[j+1]))j++;
+            if(i>0 && j+1<len && !strchr(">+~",s[i-1]) && !strchr(">+~",s[j+1])){at=j;comb=' ';}
+            i=j;
         }
     }
     if (at < 0)
@@ -927,7 +942,7 @@ static int matches_span(const struct node *n, const char *s, int len)
         char quote = 0;
         const char *e = s;
         for (; e < end; e++) {
-            if (*e == '\\' && e + 1 < end) { e++; continue; }
+            if (*e == '\\') { e=selector_escape(e,end,NULL)-1; continue; }
             if (quote) {
                 if (*e == quote) quote = 0;
             } else if (*e == '\'' || *e == '"') {
@@ -942,7 +957,12 @@ static int matches_span(const struct node *n, const char *s, int len)
         }
         const char *a = s, *b = e;
         while (a < b && isspace((unsigned char)*a)) a++;
-        while (b > a && isspace((unsigned char)b[-1])) b--;
+        const char *trim=a;
+        for(const char *p=a;p<b;) {
+            if(*p=='\\'){p=selector_escape(p,b,NULL);trim=p;}
+            else {if(!class_space((unsigned char)*p))trim=p+1;p++;}
+        }
+        b=trim;
         if (b > a && match_complex(n, a, (int)(b - a)))
             return 1;
         s = e < end ? e + 1 : e;
@@ -1204,12 +1224,14 @@ static jsval rect_object(struct jsdom *d, struct node *n)
 {
     struct js *J = d->J;
     int x = 0, y = 0, w = 0, h = 0, sx = 0, sy = 0;
-    if (d->h.node_box)
+    if (d->h.node_visual_box)
+        d->h.node_visual_box(d->h.ctx, n, &x, &y, &w, &h);
+    else if (d->h.node_box)
         d->h.node_box(d->h.ctx, n, &x, &y, &w, &h);
     if (d->h.scroll_pos)
         d->h.scroll_pos(d->h.ctx, &sx, &sy);
     /* Scrolling boxes move descendants, but do not move their own border boxes. */
-    if (d->h.node_scroll)
+    if (!d->h.node_visual_box && d->h.node_scroll)
         for (struct node *p = n ? n->parent : NULL; p; p = p->parent) {
             int bx = 0, by = 0, cw, ch, vw, vh;
             if (d->h.node_scroll(d->h.ctx, p, 0, &bx, &by, &cw, &ch, &vw, &vh))
@@ -1846,7 +1868,18 @@ static int computed_get(struct js *J, struct jsobj *o, const char *key, jsval *o
     struct node *n = o->hdata;
     struct jsdom *d = dom(J);
     const struct style *st = n->style;
-    char b[64];
+    char b[256];
+    if (!strcmp(key,"transform") || !strcmp(key,"transformOrigin") || !strcmp(key,"transform-origin")) {
+        if(!st){*out=js_str(J,!strcmp(key,"transform")?"none":"0px 0px");return 1;}
+        int x=0,y=0,w=0,h=0;
+        if(d->h.node_box)d->h.node_box(d->h.ctx,n,&x,&y,&w,&h);
+        if(!strcmp(key,"transform")) {
+            if(!st->xf){*out=js_str(J,"none");return 1;}
+            double m[6];css_transform_matrix(st,w,h,m);
+            snprintf(b,sizeof(b),"matrix(%.9g, %.9g, %.9g, %.9g, %.9g, %.9g)",m[0],m[1],m[2],m[3],m[4],m[5]);
+        } else snprintf(b,sizeof(b),"%gpx %gpx",css_transform_length(st->tox,w),css_transform_length(st->toy,h));
+        *out=js_str(J,b);return 1;
+    }
     if (!strcmp(key, "display")) {
         static const char *const names[] = { "inline", "block", "list-item", "inline-block", "table",
                                              "inline-table", "table-row", "table-row-group", "table-cell",
@@ -3463,7 +3496,11 @@ int jsdom_mouse_event(struct jsdom *d, struct node *target, const char *type, in
     js_set(J, ev, "screenX", js_num(x - sx));
     js_set(J, ev, "screenY", js_num(y - sy));
     int bx = 0, by = 0, bw, bh;
-    if (d->h.node_box && d->h.node_box(d->h.ctx, target, &bx, &by, &bw, &bh)) {
+    int local_x=x,local_y=y;
+    if(d->h.node_local_point && d->h.node_local_point(d->h.ctx,target,&local_x,&local_y)) {
+        js_set(J,ev,"offsetX",js_num(local_x));
+        js_set(J,ev,"offsetY",js_num(local_y));
+    } else if (d->h.node_box && d->h.node_box(d->h.ctx, target, &bx, &by, &bw, &bh)) {
         js_set(J, ev, "offsetX", js_num(x - bx));
         js_set(J, ev, "offsetY", js_num(y - by));
     }

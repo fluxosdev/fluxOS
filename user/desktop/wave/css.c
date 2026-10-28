@@ -16,6 +16,7 @@
  * can), then the rest.
  */
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,7 +47,7 @@ enum prop {
     P_OVERFLOW, P_GRID_TEMPLATE_COLUMNS, P_GRID_TEMPLATE, P_GRID_COLUMN, P_GRID_COLUMN_START,
     P_GRID_COLUMN_END, P_GRID_ROW, P_GRID_ROW_START, P_GRID_AREA, P_GRID_TEMPLATE_ROWS,
     P_GRID_TEMPLATE_AREAS, P_GRID_AUTO_ROWS, P_GRID_ROW_END, P_GRID_AUTO_FLOW, P_MAX_HEIGHT,
-    P_ASPECT_RATIO, P_RIGHT, P_BOTTOM, P_CLEAR, P_INSET, P_TRANSFORM, P_Z_INDEX, P_BOX_SHADOW,
+    P_ASPECT_RATIO, P_RIGHT, P_BOTTOM, P_CLEAR, P_INSET, P_TRANSFORM, P_TRANSFORM_ORIGIN, P_Z_INDEX, P_BOX_SHADOW,
     P_MARGIN_INLINE, P_MARGIN_BLOCK, P_PADDING_INLINE, P_PADDING_BLOCK, P_INSET_INLINE, P_INSET_BLOCK,
     P_CURSOR, P_POINTER_EVENTS, P_USER_SELECT, P_IGNORED, P_LETTER_SPACING, P_WORD_SPACING,
     P_WORD_BREAK, P_OVERFLOW_WRAP, P_TEXT_OVERFLOW, P_OUTLINE, P_OUTLINE_STYLE, P_OUTLINE_COLOR,
@@ -73,7 +74,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "-webkit-font-smoothing", P_IGNORED }, { "-webkit-hyphens", P_IGNORED },
     { "-webkit-justify-content", P_JUSTIFY_CONTENT }, { "-webkit-line-clamp", P_LINE_CLAMP },
     { "-webkit-mask", P_MASK }, { "-webkit-mask-image", P_MASK }, { "-webkit-order", P_ORDER },
-    { "-webkit-tap-highlight-color", P_IGNORED }, { "-webkit-transform", P_TRANSFORM },
+    { "-webkit-tap-highlight-color", P_IGNORED }, { "-webkit-transform", P_TRANSFORM }, { "-webkit-transform-origin", P_TRANSFORM_ORIGIN },
     { "-webkit-user-select", P_USER_SELECT }, { "accent-color", P_IGNORED },
     { "align-items", P_ALIGN_ITEMS }, { "align-self", P_ALIGN_SELF }, { "appearance", P_IGNORED },
     { "aspect-ratio", P_ASPECT_RATIO }, { "background", P_BACKGROUND },
@@ -169,7 +170,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "text-decoration-thickness", P_DECO_THICKNESS }, { "text-indent", P_TEXT_INDENT },
     { "text-overflow", P_TEXT_OVERFLOW }, { "text-rendering", P_IGNORED },
     { "text-shadow", P_TEXT_SHADOW }, { "text-transform", P_TEXT_TRANSFORM },
-    { "text-underline-offset", P_UNDERLINE_OFFSET }, { "top", P_TOP }, { "transform", P_TRANSFORM },
+    { "text-underline-offset", P_UNDERLINE_OFFSET }, { "top", P_TOP }, { "transform", P_TRANSFORM }, { "transform-origin", P_TRANSFORM_ORIGIN },
     { "user-select", P_USER_SELECT }, { "vertical-align", P_VERTICAL_ALIGN },
     { "visibility", P_VISIBILITY }, { "white-space", P_WHITE_SPACE }, { "width", P_WIDTH },
     { "will-change", P_IGNORED }, { "word-break", P_WORD_BREAK },
@@ -1274,6 +1275,7 @@ static int word_at(const char *p, const char *e, const char *w)
 }
 
 /* (property: value): a property we know, with a value it can take. */
+static int transform_supported(const char *value);
 static int supports_decl(const char *ns, const char *ne, const char *vs, const char *ve)
 {
     while (ns < ne && isspace((unsigned char)*ns))
@@ -1314,6 +1316,7 @@ static int supports_decl(const char *ns, const char *ne, const char *vs, const c
                 return 1;
         return 0;
     }
+    case P_TRANSFORM: return transform_supported(value);
     case P_POSITION:
         return !strcasecmp(value, "static") || !strcasecmp(value, "relative") || !strcasecmp(value, "absolute") ||
                !strcasecmp(value, "fixed") || !strcasecmp(value, "sticky") || !strcasecmp(value, "-webkit-sticky");
@@ -2829,6 +2832,7 @@ static void init_initial(void)
     s->tab_size = 8;
     s->bg_w.unit = s->bg_h.unit = U_AUTO;
     s->obj_px = s->obj_py = (struct len){ 5000, 0, U_PCT };
+    s->tox = s->toy = (struct len){ 5000, 0, U_PCT };
 }
 
 static void inherit(struct style *st, const struct style *p)
@@ -3688,6 +3692,122 @@ static void set_len(struct len *dst, const char *value, const struct vctx *v)
         dst->unit = U_AUTO, dst->v = 0;
     else if (length_value(value, v, &l))
         *dst = l;
+}
+
+/* Parse complete 2D transform lists before changing the cascaded value. */
+static int transform_number(const char *s, float *out, int angle)
+{
+    char *end;
+    double x = strtod(s, &end);
+    if (end == s || !__builtin_isfinite(x) || fabs(x) > 1000000) return 0;
+    while (isspace((unsigned char)*end)) end++;
+    if (angle) {
+        if (!strcasecmp(end,"deg")) x *= 0.017453292519943295;
+        else if (!strcasecmp(end,"grad")) x *= 0.015707963267948967;
+        else if (!strcasecmp(end,"turn")) x *= 6.283185307179586;
+        else if (strcasecmp(end,"rad") && (*end || x != 0)) return 0;
+    } else if (*end) return 0;
+    *out = (float)x;
+    return 1;
+}
+static int parse_transform(const char *value, const struct vctx *v, struct css_xform *out)
+{
+    memset(out,0,sizeof(*out));
+    if (!strcasecmp(value,"none")) return 1;
+    const char *p=value;
+    while (*p) {
+        while (isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+        if (out->n==MAX_TFOPS) return 0;
+        const char *name=p;
+        while (isalpha((unsigned char)*p) || isdigit((unsigned char)*p)) p++;
+        int nl=(int)(p-name);
+        if (*p!='(') return 0;
+        const char *end=skip_group(p,p+strlen(p));
+        if (end<=p+1 || end[-1]!=')') return 0;
+        char args[6][128];int n=0;
+        const char *q=p+1,*limit=end-1;
+        while (q<limit) {
+            while(q<limit && isspace((unsigned char)*q))q++;
+            if(q==limit)break;
+            const char *start=q;
+            while(q<limit && *q!=',' && !isspace((unsigned char)*q)) {
+                if(*q=='(')q=skip_group(q,limit);else q++;
+            }
+            if(n==6 || q-start<=0 || q-start>=(int)sizeof(args[0]))return 0;
+            snprintf(args[n++],sizeof(args[0]),"%.*s",(int)(q-start),start);
+            while(q<limit && isspace((unsigned char)*q))q++;
+            if(q<limit && *q==','){q++;while(q<limit && isspace((unsigned char)*q))q++;if(q==limit)return 0;}
+        }
+        struct tfop op={0};
+        char fn[32];if(nl<=0 || nl>=(int)sizeof(fn))return 0;
+        snprintf(fn,sizeof(fn),"%.*s",nl,name);
+        if(!strcasecmp(fn,"translate") || !strcasecmp(fn,"translateX") || !strcasecmp(fn,"translateY")) {
+            int axis=strcasecmp(fn,"translate")!=0;
+            if(n<1 || n>(axis?1:2))return 0;
+            op.kind=TF_TRANSLATE;
+            if(!length_value(args[0],v,&op.x) || op.x.unit==U_AUTO)return 0;
+            if(n==2 && (!length_value(args[1],v,&op.y) || op.y.unit==U_AUTO))return 0;
+            if(!strcasecmp(fn,"translateY")){op.y=op.x;op.x=(struct len){0};}
+        } else if(!strcasecmp(fn,"scale") || !strcasecmp(fn,"scaleX") || !strcasecmp(fn,"scaleY")) {
+            int axis=strcasecmp(fn,"scale")!=0;
+            if(n<1 || n>(axis?1:2) || !transform_number(args[0],&op.a,0))return 0;
+            op.kind=TF_SCALE;op.b=op.a;
+            if(n==2 && !transform_number(args[1],&op.b,0))return 0;
+            if(!strcasecmp(fn,"scaleX"))op.b=1;
+            if(!strcasecmp(fn,"scaleY")){op.b=op.a;op.a=1;}
+        } else if(!strcasecmp(fn,"rotate")) {
+            op.kind=TF_ROTATE;
+            if(n!=1 || !transform_number(args[0],&op.a,1))return 0;
+        } else if(!strcasecmp(fn,"skew") || !strcasecmp(fn,"skewX") || !strcasecmp(fn,"skewY")) {
+            int axis=strcasecmp(fn,"skew")!=0;
+            op.kind=TF_SKEW;
+            if(n<1 || n>(axis?1:2) || !transform_number(args[0],&op.a,1))return 0;
+            if(n==2 && !transform_number(args[1],&op.b,1))return 0;
+            if(!strcasecmp(fn,"skewY")){op.b=op.a;op.a=0;}
+        } else if(!strcasecmp(fn,"matrix")) {
+            op.kind=TF_MATRIX;
+            float values[6];if(n!=6)return 0;
+            for(int i=0;i<6;i++)if(!transform_number(args[i],&values[i],0))return 0;
+            op.a=values[0];op.b=values[1];op.c=values[2];op.d=values[3];op.e=values[4];op.f=values[5];
+        } else return 0;
+        out->op[out->n++]=op;p=end;
+    }
+    return out->n>0;
+}
+
+/* Fractional percentages matter for transform origins and matrix translations. */
+double css_transform_length(struct len l,int base)
+{
+    double p=(double)base*(l.unit==U_PCT?l.v:l.pct)/10000;
+    if(l.unit==U_PCT)return p;
+    if(l.unit==U_CALC)return l.v+p;
+    if(l.unit==U_MIN)return p<l.v?p:l.v;
+    if(l.unit==U_MAX)return p>l.v?p:l.v;
+    return l.unit==U_AUTO?0:l.v;
+}
+void css_transform_matrix(const struct style *st,int w,int h,double out[6])
+{
+    const double initial[6]={1,0,0,1,0,0};memcpy(out,initial,sizeof(initial));
+    for(int k=0;st && st->xf && k<st->xf->n;k++) {
+        const struct tfop *op=&st->xf->op[k];double t[6]={1,0,0,1,0,0};
+        switch(op->kind) {
+        case TF_TRANSLATE:t[4]=css_transform_length(op->x,w);t[5]=css_transform_length(op->y,h);break;
+        case TF_SCALE:t[0]=op->a;t[3]=op->b;break;
+        case TF_ROTATE:t[0]=t[3]=cos(op->a);t[1]=sin(op->a);t[2]=-t[1];break;
+        case TF_SKEW:t[2]=tan(op->a);t[1]=tan(op->b);break;
+        case TF_MATRIX:t[0]=op->a;t[1]=op->b;t[2]=op->c;t[3]=op->d;t[4]=op->e;t[5]=op->f;break;
+        }
+        double m[6]={out[0]*t[0]+out[2]*t[1],out[1]*t[0]+out[3]*t[1],
+            out[0]*t[2]+out[2]*t[3],out[1]*t[2]+out[3]*t[3],
+            out[0]*t[4]+out[2]*t[5]+out[4],out[1]*t[4]+out[3]*t[5]+out[5]};
+        memcpy(out,m,sizeof(m));
+    }
+}
+static int transform_supported(const char *value)
+{
+    const struct vctx v={16,16,1024,768,NULL};struct css_xform parsed;
+    return parse_transform(value,&v,&parsed);
 }
 
 static void apply(struct style *st, const struct style *parent, int prop, const char *value,
@@ -4650,44 +4770,17 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         }
         break;
     }
-    case P_TRANSFORM: {                         /* only to spot boxes slid out of view */
-        st->tx = st->ty = (struct len){ .unit = U_PX };
-        for (const char *t = value; (t = strcasestr(t, "translate")) != NULL; t++) {
-            const char *name = t;
-            t = strchr(t, '(');
-            if (!t)
-                break;
-            char arg[96];
-            const char *close = strchr(t, ')');
-            if (!close)
-                break;
-            snprintf(arg, sizeof(arg), "%.*s", (int)(close - t - 1), t + 1);
-            char *comma2 = strchr(arg, ',');
-            char a1[48] = "", a2[48] = "";
-            snprintf(a1, sizeof(a1), "%.*s", comma2 ? (int)(comma2 - arg) : (int)strlen(arg), arg);
-            if (comma2)
-                snprintf(a2, sizeof(a2), "%s", comma2 + 1);
-            struct len l1 = { .unit = U_PX }, l2 = { .unit = U_PX };
-            if (!length_value(a1, v, &l1))
-                l1 = (struct len){ .unit = U_PX };
-            if (a2[0] && !length_value(a2, v, &l2))
-                l2 = (struct len){ .unit = U_PX };
-            if (name[9] == 'X' || name[9] == 'x')
-                st->tx = l1;
-            else if (name[9] == 'Y' || name[9] == 'y')
-                st->ty = l1;
-            else
-                st->tx = l1, st->ty = l2;
-            t = close;
+    case P_TRANSFORM: {
+        struct css_xform parsed;
+        if (parse_transform(value,v,&parsed)) {
+            st->xf=NULL;st->tx=st->ty=(struct len){0};
+            if(parsed.n && v->a){struct css_xform *xf=arena_alloc(v->a,sizeof(*xf));if(xf){*xf=parsed;st->xf=xf;}}
         }
-        const char *t = strcasestr(value, "translate");
-        t = t ? strchr(t, '(') : NULL;
-        int num;
-        int used = t ? parse_num(t + 1, &num) : 0;
-        if (used && ((num <= -9900 && t[1 + used] == '%') || num <= -50000))
-            st->invisible |= 2;
         break;
     }
+    case P_TRANSFORM_ORIGIN:
+        parse_position(value,v,&st->tox,&st->toy);
+        break;
     case P_Z_INDEX: {
         int num;
         st->z_set = parse_num(value, &num) != 0;
@@ -5342,7 +5435,8 @@ static void restore_property(struct style *st, const struct style *src, int prop
     case P_BORDER_COLLAPSE: COPY(border_spacing); break;
     case P_POSITION: COPY(positioned); COPY(position); break;
     case P_BOX_SHADOW: COPY(sh_color); COPY(sh_x); COPY(sh_y); COPY(sh_blur); COPY(sh_spread); break;
-    case P_TRANSFORM: COPY(tx); COPY(ty); break;
+    case P_TRANSFORM: COPY(tx); COPY(ty); COPY(xf); break;
+    case P_TRANSFORM_ORIGIN: COPY(tox); COPY(toy); break;
     case P_Z_INDEX: COPY(z_set); COPY(z_index); break;
     case P_CLEAR: COPY(clear); break;
     case P_TOP: COPY(top); break;

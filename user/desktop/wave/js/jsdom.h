@@ -31,6 +31,9 @@ struct jshost {
     void (*load_image)(void *ctx, struct node *img);
     /* The element's border box in page coordinates; 0 if it has none. */
     int (*node_box)(void *ctx, struct node *n, int *x, int *y, int *w, int *h);
+    /* Visual page coordinates, including transforms and nested scrolling. */
+    int (*node_visual_box)(void *ctx, struct node *n, int *x, int *y, int *w, int *h);
+    int (*node_local_point)(void *ctx, struct node *n, int *x, int *y); /* page to local coordinates */
     void (*focus)(void *ctx, struct node *n);
     int (*has_focus)(void *ctx);
     const char *(*clipboard_read)(void *ctx);

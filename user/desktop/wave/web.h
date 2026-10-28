@@ -266,7 +266,7 @@ struct custom_prop {            /* a CSS custom property (--name: value) */
 
 /* ---- transforms, transitions and animations ---- */
 
-/* transform: a list of functions, applied from the left. The origin of each is the element's transform-origin. */
+/* Functions compose in written order; the rightmost acts on a point first. */
 enum { TF_TRANSLATE, TF_SCALE, TF_ROTATE, TF_SKEW, TF_MATRIX };
 struct tfop {
     uint8_t kind;
@@ -278,6 +278,8 @@ struct css_xform {
     int n;
     struct tfop op[MAX_TFOPS];
 };
+double css_transform_length(struct len l, int base);
+void css_transform_matrix(const struct style *st, int w, int h, double out[6]);
 
 /* A timing function: cubic-bezier(x1, y1, x2, y2) (linear, ease and the rest are special cases) or steps. */
 enum { JUMP_START, JUMP_END, JUMP_NONE, JUMP_BOTH };
@@ -517,6 +519,7 @@ struct ditem {
     int fit_x, fit_y, fit_w, fit_h;     /* fit_w == 0: the picture fills the item */
     uint16_t sb;                /* 1 + the scrolling box it is inside (and clipped by), or 0 */
     uint16_t sbi;               /* DK_SBOX: its box */
+    uint16_t xf;                /* transform group, 1-based */
 };
 
 struct hotspot {                /* a link or a form control */
@@ -524,6 +527,7 @@ struct hotspot {                /* a link or a form control */
     struct node *node;          /* the <a href> or the control */
     uint8_t dyn;                /* like ditem.dyn */
     uint16_t sb;                /* like ditem.sb */
+    uint16_t xf;
 };
 
 /* A box with overflow other than visible whose contents are clipped to its padding box; with
@@ -562,6 +566,13 @@ struct anchor {
     int y;
 };
 
+struct transform_box {
+    struct node *node;
+    int x, y, w, h, first, last;
+    uint16_t parent, sb;
+    uint8_t dyn;
+};
+
 struct layout {
     struct ditem *items;
     int nitems, cap;
@@ -577,6 +588,8 @@ struct layout {
     int ndyn;
     struct sbox *sb;
     int nsb;
+    struct transform_box *xf;
+    int nxf, xfcap;
     uint32_t canvas;            /* the background behind everything */
     /* the selected text: items sel_from..sel_to, from character sel_c0 of the first to sel_c1 of the last */
     int sel_on, sel_from, sel_to, sel_c0, sel_c1;
@@ -597,23 +610,32 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
 /* Paint the part of the document at (sx, sy) into s at (ox, oy), within s's clip. */
 void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, int sx, int sy,
                     const struct node *focus, int caret_on);
+void layout_paint_surface(const struct layout *lo, const struct ditem *item, const struct surface *source,
+                          struct surface *dst, int ox, int oy, int sx, int sy);
 /* The hotspot at a page point, with the page scrolled to (sx, sy): fixed and sticky ones move with it. */
 const struct hotspot *layout_hit(const struct layout *lo, const struct hotspot *h, int n, int x, int y,
                                  int sx, int sy);
 /* How far scrolling to (sx, sy) moves the item or hotspot with this dyn from where it was laid out. */
 void layout_dyn_offset(const struct layout *lo, int dyn, int sx, int sy, int *dx, int *dy);
+struct rect layout_transform_rect(const struct layout *lo, int xf, struct rect r, int sx, int sy);
+struct rect layout_node_visual_rect(const struct layout *lo, const struct node *n, struct rect r, int sx, int sy);
+int layout_node_local_point(const struct layout *lo, const struct node *n, struct rect r, int *x, int *y, int sx, int sy);
+int layout_transform_point(const struct layout *lo, int xf, int *x, int *y, int sx, int sy, int inverse);
+int layout_box_contains(const struct layout *lo, int xf, int dyn, int sb, struct rect r,
+                        int x, int y, int sx, int sy);
 /* ---- boxes that scroll (overflow: auto, scroll) ---- */
 enum { SBP_NONE, SBP_ARROW1, SBP_ARROW2, SBP_PAGE1, SBP_PAGE2, SBP_THUMB };
 struct sbhit {                  /* a point on a scroll bar */
     int box, axis, part;        /* index into lo->sb, 0 horizontal 1 vertical, SBP_* */
     int thumb;                  /* where its thumb starts along the axis, in page coordinates */
+    int coordinate;             /* pointer coordinate before transforms */
 };
 /* The scroll bar at a page point (the page scrolled to psx, psy); 1 if there is one. */
 int layout_sbar_hit(const struct layout *lo, int px, int py, int psx, int psy, struct sbhit *out);
 /* A press on an arrow or the track: scroll a step or a page; 1 if the box moved. */
 int layout_sbar_press(struct layout *lo, const struct sbhit *h);
 /* The thumb grabbed `grab` pixels from its start and dragged to mouse (page coordinates along the axis). */
-void layout_sbar_drag(struct layout *lo, const struct sbhit *h, int mouse, int grab, int psx, int psy);
+void layout_sbar_drag(struct layout *lo, const struct sbhit *h, int px, int py, int grab, int psx, int psy);
 /* The wheel turned over a page point: the innermost box that can scroll that way takes it; 1 if one did. */
 int layout_wheel(struct layout *lo, int px, int py, int psx, int psy, int dx, int dy);
 /* A box's scroll position: get (0 if n is not a box that scrolls) and set (clamped, kept when the page is laid out again). */
