@@ -173,7 +173,9 @@ says why.
     `opl=off`.
   - **Intel HD Audio** (and codecs such as the Realtek ALC888) as `/dev/dsp`
     when there is no Sound Blaster; output only, every jack plays the same
-    stereo. `hda=off`.
+    stereo, except that plugging in headphones turns the speakers and line
+    outs off (a line out turns the speakers off), where the jacks can sense
+    it. `hda=off`.
 - Networking: NE2000 (PCI and ISA), **nVidia nForce** ("forcedeth", `eth0`,
   with MII PHY support) and **Intel I217-LM/V** gigabit (the Haswell 8-series
   chipsets' MAC; "e1000e", shares the PHY with the Management Engine,
@@ -927,8 +929,8 @@ cannot be used.
   read-only DOS attribute is kept.
 - **Audio:** the Sound Blaster 16 (DSP 4) and HD Audio are output only, with
   no MIDI and no mixing, so one program at a time has `/dev/dsp`; latency is
-  about 80 ms. HD Audio has no jack sensing, S/PDIF or HDMI, and surround jacks
-  repeat the front pair.
+  about 80 ms. HD Audio has no S/PDIF or HDMI, no microphone or line-in jack
+  sensing, and surround jacks repeat the front pair.
 - **Network:** IPv4 only, one card, no IP fragments, no TCP congestion control
   or out-of-order buffering. forcedeth runs at 10/100 Mbit/s without offload,
   VLANs, wake-on-LAN or MSI. HTTPS is TLS 1.3 with TLS_AES_128_GCM_SHA256 and

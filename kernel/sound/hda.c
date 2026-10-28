@@ -14,6 +14,13 @@
  * enabled. Every DAC used gets the same stream, so all the jacks play the
  * same sound. The ALC888 also gets the coefficient Linux sets on it.
  *
+ * Jacks that can tell when something is plugged in (presence detect)
+ * are watched, as Linux's auto-mute does: headphones in turn the
+ * speakers' and line outs' pins off, a line out in turns the speakers'
+ * off. The watching is done by a kernel thread, khdajack, woken at once
+ * by the codec's unsolicited response where it sends one, and looking
+ * again twice a second regardless.
+ *
  * The codec always runs at 48 kHz (or 44.1 kHz), 16-bit stereo; what
  * write() is given (8 or 16 bits, mono or stereo, 5000 to 48000 Hz) is
  * converted on the way into a ring, with linear interpolation. The
@@ -56,10 +63,15 @@
 
 #define GCTL_CRST     0x1
 #define INTCTL_GIE    (1u << 31)
+#define INTCTL_CIE    (1u << 30)        /* controller interrupts: the RIRB's */
+#define INTSTS_CIS    (1u << 30)
 #define CORBRP_RST    0x8000
 #define CORBCTL_RUN   0x02
 #define RIRBWP_RST    0x8000
+#define RIRBCTL_RINTCTL 0x01            /* an interrupt for responses */
 #define RIRBCTL_DMAEN 0x02
+#define RIRBSTS_ACK   0x05              /* response interrupt, overrun */
+#define RIRB_UNSOL    0x10              /* in a response's extended word */
 #define ICIS_BUSY     0x1
 #define ICIS_VALID    0x2
 
@@ -86,6 +98,9 @@
 #define V_SET_POWER     0x70500
 #define V_SET_STREAM    0x70600
 #define V_SET_PIN_CTL   0x70700
+#define V_SET_UNSOL     0x70800
+#define V_GET_PIN_SENSE 0xF0900
+#define V_SET_PIN_SENSE 0x70900         /* starts a measurement, where one is needed */
 #define V_GET_EAPD      0xF0C00
 #define V_SET_EAPD      0x70C00
 #define V_GET_CONFIG    0xF1C00
@@ -114,16 +129,29 @@
 #define WC_IN_AMP   (1u << 1)
 #define WC_OUT_AMP  (1u << 2)
 #define WC_AMP_OVR  (1u << 3)
+#define WC_UNSOL    (1u << 7)
 #define WC_CONN     (1u << 8)
 #define WC_DIGITAL  (1u << 9)
 #define WC_POWER    (1u << 10)
 
+#define PC_TRIG_REQ    (1u << 1)
+#define PC_PRES_DETECT (1u << 2)
 #define PC_OUT  (1u << 4)
 #define PC_HP   (1u << 3)
 #define PC_EAPD (1u << 16)
 
 #define PIN_OUT 0x40
 #define PIN_HP  0x80
+#define PIN_SENSE_PRESENT 0x80000000u
+
+/* The BIOS's configuration of a pin: its device, and "no presence detect" */
+#define CFG_DEVICE(c)   (((c) >> 20) & 0xF)
+#define DEV_LINE_OUT 0
+#define DEV_SPEAKER  1
+#define DEV_HP_OUT   2
+#define CFG_NO_PRESENCE (1u << 8)
+
+#define JACK_TAG 1                      /* in our unsolicited responses */
 
 #define AMP_OUT   0x8000
 #define AMP_IN    0x4000
@@ -168,6 +196,14 @@ static struct {
     int dacs[MAX_DACS], ndacs;
     int pins[MAX_PINS], npins;
     int nouts;                          /* jacks with a path to a DAC */
+    struct {
+        uint8_t nid, dev;               /* the pin, its device (DEV_*) */
+        uint8_t pinctl;                 /* its pin control when on */
+        uint8_t detect;                 /* plugging it in is sensed */
+        uint8_t present, off;
+    } outs[MAX_PINS];
+    int njacks;                         /* outputs sensed, if any of them mutes another */
+    volatile int jack_kick;             /* an unsolicited response came */
     uint32_t fmt;
     int out_rate;
 
@@ -224,13 +260,15 @@ static int corb_cmd(uint32_t verb, uint32_t *resp)
         while (hda.rirb_rp != rwp) {
             hda.rirb_rp = (hda.rirb_rp + 1) & 0xFF;
             uint32_t r = hda.rirb[hda.rirb_rp * 2], ex = hda.rirb[hda.rirb_rp * 2 + 1];
-            if (ex & 0x10)
-                continue;               /* unsolicited */
+            if (ex & RIRB_UNSOL) {
+                hda.jack_kick = 1;      /* a jack changed: khdajack looks */
+                continue;
+            }
             *resp = r;
             got = 1;
         }
         if (got) {
-            wr8(RIRBSTS, 0x05);
+            wr8(RIRBSTS, RIRBSTS_ACK);
             return 0;
         }
         udelay(20);
@@ -338,7 +376,7 @@ static void rings_init(uint8_t *page)
     wr16(RINTCNT, 1);
     hda.rirb_rp = 0;
     wr8(CORBCTL, CORBCTL_RUN);
-    wr8(RIRBCTL, RIRBCTL_DMAEN);
+    wr8(RIRBCTL, RIRBCTL_DMAEN | RIRBCTL_RINTCTL);     /* INTCTL_CIE lets it through */
 }
 
 /* The ICH6 to ICH10 controllers, which snoop without being told to. */
@@ -496,7 +534,7 @@ static void apply_master(void)
     }
 }
 
-static void setup_path(const int *path, const int *idx, int len, int hp)
+static void setup_path(const int *path, const int *idx, int len, uint8_t pinctl)
 {
     for (int k = 0; k < len; k++) {
         int nid = path[k];
@@ -521,7 +559,7 @@ static void setup_path(const int *path, const int *idx, int len, int hp)
     }
     int pin = path[0];
     struct widget *p = &hda.w[pin];
-    cmd(pin, V_SET_PIN_CTL | PIN_OUT | (hp && (p->pincap & PC_HP) ? PIN_HP : 0));
+    cmd(pin, V_SET_PIN_CTL | pinctl);
     if (p->pincap & PC_EAPD)
         cmd(pin, V_SET_EAPD | ((cmd(pin, V_GET_EAPD) & 0xFF) | 0x02));
 }
@@ -586,6 +624,117 @@ static void codec_name(void)
         snprintf(hda.name, sizeof(hda.name), "HDA codec %04x:%04x", v, d);
 }
 
+/* ---- jack sensing ---- */
+
+static const char *dev_name(int dev)
+{
+    return dev == DEV_HP_OUT ? "headphones" : dev == DEV_SPEAKER ? "speaker" : "line out";
+}
+
+static int pin_present(int nid)
+{
+    if (hda.w[nid].pincap & PC_TRIG_REQ)
+        cmd(nid, V_SET_PIN_SENSE);
+    uint32_t r = cmd(nid, V_GET_PIN_SENSE);
+    return r != 0xFFFFFFFFu && (r & PIN_SENSE_PRESENT);
+}
+
+/* An output's pin on or off. The external amplifier (EAPD) stays on:
+ * on some codecs one serves the headphones too (Linux's keep_eapd_on). */
+static void out_power(int i, int on)
+{
+    cmd(hda.outs[i].nid, V_SET_PIN_CTL | (on ? hda.outs[i].pinctl : 0));
+    hda.outs[i].off = (uint8_t)!on;
+}
+
+/* Look at the sensed jacks; if any changed (or force), turn each output
+ * on or off: headphones in mute the speakers and line outs, a line out
+ * in mutes the speakers. */
+static void jack_update(int force)
+{
+    int changed = force, hp = 0, lo = 0;
+    for (int i = 0; i < hda.nouts; i++) {
+        if (!hda.outs[i].detect)
+            continue;
+        int p = pin_present(hda.outs[i].nid);
+        if (p != hda.outs[i].present) {
+            hda.outs[i].present = (uint8_t)p;
+            changed = 1;
+            klog("hda: %s (pin %02xh) %s\n", dev_name(hda.outs[i].dev), hda.outs[i].nid,
+                 p ? "plugged in" : "unplugged");
+        }
+        hp |= p && hda.outs[i].dev == DEV_HP_OUT;
+        lo |= p && hda.outs[i].dev == DEV_LINE_OUT;
+    }
+    if (!changed)
+        return;
+    for (int i = 0; i < hda.nouts; i++) {
+        int dev = hda.outs[i].dev;
+        int off = (dev == DEV_SPEAKER && (hp || lo)) || (dev == DEV_LINE_OUT && hp);
+        if (force || off != hda.outs[i].off)
+            out_power(i, !off);
+    }
+}
+
+/* Which outputs to sense (Linux's is_jack_detectable): headphones and
+ * line outs that can tell, and only if plugging one in would turn
+ * another output off. Unsolicited responses on where the pin sends them. */
+static void jack_setup(void)
+{
+    int hp_jack = 0, lo_jack = 0, mutes = 0;
+    for (int i = 0; i < hda.nouts; i++) {
+        struct widget *w = &hda.w[hda.outs[i].nid];
+        int dev = hda.outs[i].dev;
+        hda.outs[i].detect = (uint8_t)((dev == DEV_HP_OUT || dev == DEV_LINE_OUT) &&
+                                       (w->pincap & PC_PRES_DETECT) && !(w->config & CFG_NO_PRESENCE));
+        hp_jack |= hda.outs[i].detect && dev == DEV_HP_OUT;
+        lo_jack |= hda.outs[i].detect && dev == DEV_LINE_OUT;
+    }
+    for (int i = 0; i < hda.nouts; i++)
+        mutes |= (hda.outs[i].dev == DEV_SPEAKER && (hp_jack || lo_jack)) ||
+                 (hda.outs[i].dev == DEV_LINE_OUT && hp_jack);
+    hda.njacks = 0;
+    for (int i = 0; i < hda.nouts; i++) {
+        if (!mutes)
+            hda.outs[i].detect = 0;
+        if (!hda.outs[i].detect)
+            continue;
+        hda.njacks++;
+        if (hda.w[hda.outs[i].nid].caps & WC_UNSOL)
+            cmd(hda.outs[i].nid, V_SET_UNSOL | 0x80 | JACK_TAG);
+    }
+    if (hda.njacks)
+        jack_update(1);
+}
+
+/* Are unsolicited responses waiting in the RIRB? Only looked at: whoever
+ * sends the next command takes them off. */
+static int unsol_waiting(void)
+{
+    uint32_t wp = rd16(RIRBWP) & 0xFF;
+    for (uint32_t p = hda.rirb_rp; p != wp;) {
+        p = (p + 1) & 0xFF;
+        if (hda.rirb[p * 2 + 1] & RIRB_UNSOL)
+            return 1;
+    }
+    return 0;
+}
+
+static int jack_chan;                   /* khdajack sleeps on it */
+
+static void khdajack(void)
+{
+    for (;;) {
+        wait_event_timeout(&jack_chan, hda.jack_kick, ticks + HZ / 2);
+        current->sig_pending = 0;
+        spin_lock(&snd_lock);
+        hda.jack_kick = 0;
+        if (!hda.asleep)                /* resume sets the codec up, jacks too */
+            jack_update(0);
+        spin_unlock(&snd_lock);
+    }
+}
+
 /* Set up codec cad for output. Returns 0 if it has a usable output. */
 static int codec_init(int cad)
 {
@@ -624,12 +773,20 @@ static int codec_init(int cad)
         if (!main_dac)
             main_dac = dac;
         add_dac(dac);
-        int hp = ((hda.w[hda.pins[i]].config >> 20) & 0xF) == 2;
-        setup_path(path, idx, len, hp);
+        struct widget *p = &hda.w[hda.pins[i]];
+        int dev = (int)CFG_DEVICE(p->config);
+        uint8_t pinctl = PIN_OUT | (dev == DEV_HP_OUT && (p->pincap & PC_HP) ? PIN_HP : 0);
+        setup_path(path, idx, len, pinctl);
+        hda.outs[hda.nouts].nid = (uint8_t)hda.pins[i];
+        hda.outs[hda.nouts].dev = (uint8_t)dev;
+        hda.outs[hda.nouts].pinctl = pinctl;
+        hda.outs[hda.nouts].present = 0;
+        hda.outs[hda.nouts].off = 0;
         hda.nouts++;
     }
     if (!hda.ndacs)
         return -1;
+    jack_setup();
 
     /* 48 kHz if the DAC can, else 44.1; always 16-bit stereo. */
     uint32_t pcm = param(main_dac, P_PCM);
@@ -796,6 +953,14 @@ static void hda_irq_locked(struct trapframe *tf)
 {
     (void)tf;
     uint32_t st = rd32(INTSTS);
+    if (st & INTSTS_CIS) {
+        /* A response came: if it is a jack's, khdajack looks now. */
+        wr8(RIRBSTS, RIRBSTS_ACK);
+        if (!hda.immediate && unsol_waiting()) {
+            hda.jack_kick = 1;
+            wakeup(&jack_chan);
+        }
+    }
     if (!(st & (1u << hda.sindex)))
         return;
     sd_wr8(SD_STS, SD_STS_ACK);
@@ -1121,6 +1286,12 @@ int hda_get_info(struct sound_info *si)
     return 1;
 }
 
+/* The output stream's interrupt, and the responses' when jacks are sensed. */
+static uint32_t intctl(void)
+{
+    return INTCTL_GIE | (hda.njacks ? INTCTL_CIE : 0) | 1u << hda.sindex;
+}
+
 static int controller_init(const struct pci_dev *pci, uint8_t *page)
 {
     hda.regs = pci_map_bar(pci, PCI_BAR0);
@@ -1207,11 +1378,13 @@ void hda_init(struct vnode *devdir)
         mixer->dev_ioctl = mixer_ioctl;
     if (hda.irq >= 0) {
         irq_register(hda.irq, hda_irq);
-        wr32(INTCTL, INTCTL_GIE | 1u << hda.sindex);
+        wr32(INTCTL, intctl());
     }
-    boot_ok("HD Audio: %s (rev %06x) on codec %d, %d output%s, %d Hz, IRQ %d%s", hda.name,
+    if (hda.njacks)
+        proc_spawn_kthread("khdajack", khdajack);
+    boot_ok("HD Audio: %s (rev %06x) on codec %d, %d output%s, %d Hz, IRQ %d%s%s", hda.name,
             hda.revision >> 8, hda.cad, hda.nouts, hda.nouts == 1 ? "" : "s", hda.out_rate,
-            hda.irq, second ? " (/dev/dsp1)" : "");
+            hda.irq, hda.njacks ? ", headphone sensing" : "", second ? " (/dev/dsp1)" : "");
 }
 
 /* ---- suspend to RAM ---- */
@@ -1250,7 +1423,7 @@ void hda_resume(void)
     hda.asleep = 0;
     apply_master();
     if (hda.irq >= 0)
-        wr32(INTCTL, INTCTL_GIE | 1u << hda.sindex);
+        wr32(INTCTL, intctl());
     start();
     spin_unlock(&snd_lock);
 }
