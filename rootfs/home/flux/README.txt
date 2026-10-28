@@ -2,7 +2,7 @@ Welcome to fluxOS 0.2.3
 =======================
 
 fluxOS is an experimental hobby operating system, built with AI assistance
-from Claude and ChatGPT Codex. Run it in a virtual machine, and do not keep
+from Claude, Google Gemini, and ChatGPT Codex. Run it in a virtual machine, and do not keep
 anything you care about on it. fluxOS runs from the hard disk Setup installed
 it on, so what you save stays across reboots; only /tmp is kept in memory.
 
