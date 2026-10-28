@@ -13,7 +13,7 @@
  * scan, then transforms them all. The inverse DCT is the integer
  * "jidctint" algorithm. Chroma planes are upsampled with a triangle
  * filter (what libjpeg calls fancy upsampling), so 4:2:0 photographs have
- * no blocky colour edges, and turned into RGB four pixels at a time in MMX
+ * no blocky colour edges, and turned into RGB eight pixels at a time in SSE2
  * registers.
  *
  * A file that ends early still gives a picture: whatever scans arrived are
@@ -669,42 +669,42 @@ static int parse_sos(struct jpeg *j, const uint8_t *s, int n, struct scan *sc)
 /* ---- the picture ---- */
 
 /*
- * Four pixels from YCbCr to 0xFFRRGGBB, rounded exactly as the scalar code
+ * Eight pixels from YCbCr to 0xFFRRGGBB, rounded exactly as the scalar code
  * in make_image() does. Constants above 32767 do not fit PMADDWD, so they
  * are split around a multiple of 65536:
  *   (91881 cr + 32768) >> 16             = cr + ((26345 cr + 2 * 16384) >> 16)
  *   (22553 cb + 46802 cr + 32768) >> 16  = cr + ((22553 cb - 18734 cr + 32768) >> 16)
  *   (116130 cb + 32768) >> 16            = 2 cb + ((-14942 cb + 2 * 16384) >> 16)
  * Each bracket is one PMADDWD of a pair of samples (or a sample and 2)
- * with a pair of constants. MMX: the caller runs simd_done().
+ * with a pair of constants.
  */
-static inline void ycc_to_rgb4(uint32_t *dst, const uint8_t *y, const uint8_t *cb, const uint8_t *cr)
+static inline void ycc_to_rgb8(uint32_t *dst, const uint8_t *y, const uint8_t *cb, const uint8_t *cr)
 {
-    const __m64 zero = _mm_setzero_si64(), c128 = _mm_set1_pi16(128), two = _mm_set1_pi16(2);
-    __m64 Y = _mm_unpacklo_pi8(_mm_cvtsi32_si64((int)*(const u32_any *)y), zero);
-    __m64 B = _mm_sub_pi16(_mm_unpacklo_pi8(_mm_cvtsi32_si64((int)*(const u32_any *)cb), zero), c128);
-    __m64 R = _mm_sub_pi16(_mm_unpacklo_pi8(_mm_cvtsi32_si64((int)*(const u32_any *)cr), zero), c128);
+    const __m128i zero = _mm_setzero_si128(), c128 = _mm_set1_epi16(128), two = _mm_set1_epi16(2);
+    __m128i Y = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)y), zero);
+    __m128i B = _mm_sub_epi16(_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)cb), zero), c128);
+    __m128i R = _mm_sub_epi16(_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)cr), zero), c128);
 
-    const __m64 kr = _mm_set_pi16(16384, 26345, 16384, 26345);
-    const __m64 kg = _mm_set_pi16(-18734, 22553, -18734, 22553);
-    const __m64 kb = _mm_set_pi16(16384, -14942, 16384, -14942);
-    const __m64 half = _mm_set1_pi32(32768);
-    __m64 r = _mm_packs_pi32(_mm_srai_pi32(_mm_madd_pi16(_mm_unpacklo_pi16(R, two), kr), 16),
-                             _mm_srai_pi32(_mm_madd_pi16(_mm_unpackhi_pi16(R, two), kr), 16));
-    __m64 g = _mm_packs_pi32(
-        _mm_srai_pi32(_mm_add_pi32(_mm_madd_pi16(_mm_unpacklo_pi16(B, R), kg), half), 16),
-        _mm_srai_pi32(_mm_add_pi32(_mm_madd_pi16(_mm_unpackhi_pi16(B, R), kg), half), 16));
-    __m64 b = _mm_packs_pi32(_mm_srai_pi32(_mm_madd_pi16(_mm_unpacklo_pi16(B, two), kb), 16),
-                             _mm_srai_pi32(_mm_madd_pi16(_mm_unpackhi_pi16(B, two), kb), 16));
-    r = _mm_add_pi16(_mm_add_pi16(Y, R), r);
-    g = _mm_sub_pi16(_mm_sub_pi16(Y, R), g);
-    b = _mm_add_pi16(_mm_add_pi16(Y, _mm_add_pi16(B, B)), b);
+    const __m128i kr = _mm_set_epi16(16384, 26345, 16384, 26345, 16384, 26345, 16384, 26345);
+    const __m128i kg = _mm_set_epi16(-18734, 22553, -18734, 22553, -18734, 22553, -18734, 22553);
+    const __m128i kb = _mm_set_epi16(16384, -14942, 16384, -14942, 16384, -14942, 16384, -14942);
+    const __m128i half = _mm_set1_epi32(32768);
+    __m128i r = _mm_packs_epi32(_mm_srai_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(R, two), kr), 16),
+                                _mm_srai_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(R, two), kr), 16));
+    __m128i g = _mm_packs_epi32(
+        _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(B, R), kg), half), 16),
+        _mm_srai_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(B, R), kg), half), 16));
+    __m128i b = _mm_packs_epi32(_mm_srai_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(B, two), kb), 16),
+                                _mm_srai_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(B, two), kb), 16));
+    r = _mm_add_epi16(_mm_add_epi16(Y, R), r);
+    g = _mm_sub_epi16(_mm_sub_epi16(Y, R), g);
+    b = _mm_add_epi16(_mm_add_epi16(Y, _mm_add_epi16(B, B)), b);
 
-    /* Clamp to bytes and interleave: b g r ff, four times. */
-    __m64 bg = _mm_unpacklo_pi8(_mm_packs_pu16(b, b), _mm_packs_pu16(g, g));
-    __m64 ra = _mm_unpacklo_pi8(_mm_packs_pu16(r, r), _mm_set1_pi8(-1));
-    *(__m64_u *)dst = _mm_unpacklo_pi16(bg, ra);
-    *(__m64_u *)(dst + 2) = _mm_unpackhi_pi16(bg, ra);
+    /* Clamp to bytes and interleave: b g r ff, eight times. */
+    __m128i bg = _mm_unpacklo_epi8(_mm_packus_epi16(b, b), _mm_packus_epi16(g, g));
+    __m128i ra = _mm_unpacklo_epi8(_mm_packus_epi16(r, r), _mm_set1_epi8(-1));
+    _mm_storeu_si128((__m128i *)dst, _mm_unpacklo_epi16(bg, ra));
+    _mm_storeu_si128((__m128i *)(dst + 4), _mm_unpackhi_epi16(bg, ra));
 }
 
 /* How output pixel x (or y) of a component is built from its samples: two
@@ -790,9 +790,8 @@ static struct image *make_image(struct jpeg *j)
                 dst[x] = 0xFF000000u | (uint32_t)src[0][x] << 16 | (uint32_t)src[1][x] << 8 | src[2][x];
         } else {
             int x = 0;
-            for (; x + 3 < W; x += 4)
-                ycc_to_rgb4(dst + x, src[0] + x, src[1] + x, src[2] + x);
-            simd_done();
+            for (; x + 7 < W; x += 8)
+                ycc_to_rgb8(dst + x, src[0] + x, src[1] + x, src[2] + x);
             for (; x < W; x++) {
                 int yy = src[0][x], cb = src[1][x] - 128, cr = src[2][x] - 128;
                 int r = yy + ((91881 * cr + 32768) >> 16);

@@ -30,13 +30,14 @@ terminal. The ISO image is an install CD: GRUB (Multiboot) starts fluxOS
 Setup, which installs fluxOS onto a hard disk, and the installed system boots
 straight into the desktop.
 
-fluxOS needs a **Pentium III** or another processor with SSE (an Athlon XP, a
-Pentium 4 or anything newer). The whole system is built for it: the kernel
+fluxOS needs a **Pentium 4** or another processor with SSE2 (an Athlon 64, a
+Pentium M or anything newer). The whole system is built for it: the kernel
 moves pages and framebuffer lines through the SSE registers, the C library
-copies with them, GL transforms and lights vertices four lanes at a time, and
-the desktop, browser and image decoders blend and convert pixels in MMX
-registers with the integer instructions SSE added. On an older processor it
-stops at boot and says why.
+copies with them, GL transforms and lights vertices four lanes at a time, the
+desktop, browser and image decoders blend and convert pixels eight 16-bit
+lanes at a time in the SSE2 integer instructions, and all floating point,
+doubles included, runs on SSE2. On an older processor it stops at boot and
+says why.
 
 ## Features
 
@@ -65,7 +66,7 @@ stops at boot and says why.
 - Processes: `fork`, `execve` (static ELF32 and `#!` scripts), `exit`/
   `waitpid`, process groups, signals (`kill`, `SIGINT`, `SIGPIPE`, fault
   signals; no user handlers), lazy FPU and SSE switching (FXSAVE/FXRSTOR).
-- Processor check at boot (a Pentium III with SSE is the minimum), and a
+- Processor check at boot (a Pentium 4 with SSE2 is the minimum), and a
   write-combining framebuffer through the page attribute table (`pat=off`
   keeps it uncached).
 - Memory: bitmap frame allocator over the first 4 GiB of RAM, paging (first
@@ -486,8 +487,8 @@ fetcher process, so the desktop keeps running), or from `file://`.
 - `fglCreateContext`, `fglMakeCurrent`, `fglResize` and `fglSwapBuffers` play
   GLX's part. Matrices, vertex transformation, lighting and clipping use SSE;
   the software rasterizer sets up its depth and colour planes in one SSE
-  register and fills spans two pixels at a time with MMX. A `<math.h>` is
-  included: floats in SSE, doubles on the x87 (SSE1 has no doubles).
+  register and fills spans four pixels at a time with SSE2. A `<math.h>` is
+  included: floats and doubles both in SSE2.
 
 **Userland** (`/bin`): 7z basename beep cat chmod clear cp date desktop df dirname
 dmesg dos echo env fetch fluxinstall free fsh grep halt head hexdump host
@@ -523,7 +524,7 @@ sudo apt install build-essential grub-pc-bin grub-common xorriso mtools qemu-sys
 ```
 
 No cross compiler is needed: everything is built with the host GCC using `-m32
--march=pentium3 -ffreestanding`, and nothing links against libgcc or the host
+-march=pentium4 -ffreestanding`, and nothing links against libgcc or the host
 libc. The first
 `make` downloads Debian 12's GRUB 2.06 into `grub-2.06/` (checked against
 fixed SHA-256 hashes; nothing is installed), because GRUB 2.12 reboots some
@@ -543,7 +544,7 @@ make test-kernel # runs allocator, filesystem, pipe and socket regressions on th
 make test-desktop-jobs # decoder helper responsiveness, transfers, cancellation and recovery
 make test-desktop-jobs-qemu # same protocol tests with fluxOS's blocking pipes
 make test-kernel-qemu # boots kernel regressions with a disposable initrd and scratch disk
-make test-kernel-qemu KERNEL_TEST_CPUS=4 # same tests on four Pentium III CPUs
+make test-kernel-qemu KERNEL_TEST_CPUS=4 # same tests on four Core 2 Duo CPUs
 make test-kernel-qemu KERNEL_TEST_CPUS=2 KERNEL_TEST_MEMORY=2048 # larger RAM and read cache
 make test-kernel-qemu KERNEL_TEST_CMDLINE=readcache=0 # direct-read fallback
 make test-kernel-qemu KERNEL_TEST_CPUS=4 KERNEL_TEST_CMDLINE=nosmp # single-core fallback
@@ -562,8 +563,8 @@ The TLS host tests additionally need OpenSSL and the Python `cryptography`
 package. They generate temporary CA/server certificates and use loopback-only
 servers, including tampered signature/transcript rejection checks.
 
-The QEMU targets emulate a Pentium III (`QEMU_CPU=-cpu pentium3`), so
-anything newer that slipped into the build would show up there. `make run
+The QEMU targets emulate a two-core Core 2 Duo (`QEMU_CPU=-cpu core2duo,-lm`,
+`QEMU_SMP=2`; `make run QEMU_SMP=1` for one core). `make run
 QEMU_NET="-nic user,model=ne2k_pci -device intel-hda -device hda-duplex"` adds
 HD Audio. To boot real hardware or another VM, write
 `fluxOS.iso` to a USB stick as a raw image (**DD Image mode** in Rufus), or

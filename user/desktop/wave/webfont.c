@@ -289,7 +289,7 @@ static int downloaded_draw(struct surface *s, const struct wfont *f, int x, int 
         FT_Bitmap *bitmap = &g->bitmap;
         int gx = x + ((pen + 32) >> 6) + g->bitmap_left, gy = y + f->ascent - g->bitmap_top;
         if (bitmap->pixel_mode == FT_PIXEL_MODE_GRAY || bitmap->pixel_mode == FT_PIXEL_MODE_MONO) {
-            __m64 cv = px_unpack(color);
+            __m128i cv = px_unpack(color);
             for (unsigned row = 0; row < bitmap->rows; row++) {
                 int py = gy + (int)row;
                 if (py < clip.y || py >= clip.y + clip.h)
@@ -312,7 +312,6 @@ static int downloaded_draw(struct surface *s, const struct wfont *f, int x, int 
                         *target = px_blend15(*target, cv, (int)coverage) & 0xffffff;
                 }
             }
-            simd_done();
         }
         pen += (int)g->advance.x;
         previous = glyph;
@@ -769,7 +768,7 @@ static void ng_paint(struct surface *s, const struct nglyph *g, int gx, int gy, 
     struct rect clip = s->clip;
     if (!g->cov || gx >= clip.x + clip.w || gx + g->w <= clip.x || gy >= clip.y + clip.h || gy + g->h <= clip.y)
         return;
-    __m64 cv = px_unpack(c);
+    __m128i cv = px_unpack(c);
     for (int j = 0; j < g->h; j++) {
         int py = gy + j;
         if (py < clip.y || py >= clip.y + clip.h)
@@ -786,7 +785,6 @@ static void ng_paint(struct surface *s, const struct nglyph *g, int gx, int gy, 
                 dst[px] = px_blend15(dst[px], cv, cov) & 0xFFFFFF;
         }
     }
-    simd_done();
 }
 
 
@@ -916,7 +914,7 @@ int wfont_draw(struct surface *s, const struct wfont *f, int x, int y, const cha
     int pen = 0;
     struct rect clip = s->clip;
     c &= 0xFFFFFF;
-    __m64 cv = px_unpack(c); /* blended in MMX registers (simd.h) */
+    __m128i cv = px_unpack(c); /* blended in an XMM register (simd.h) */
     while (str < end) {
         int cp = utf8_next(&str, end), gi = glyph_find(cp);
         if (gi < 0) {
@@ -961,7 +959,6 @@ int wfont_draw(struct surface *s, const struct wfont *f, int x, int y, const cha
             }
         }
     }
-    simd_done();
     return (pen + 8) >> 4;
 }
 

@@ -1,11 +1,11 @@
 /*
- * The processor. fluxOS needs a Pentium III, or any other processor with
- * SSE (and the FXSAVE, CMOV and MMX that come with it): the whole system
- * is built for it. cpu_init() checks first thing at boot, and this file,
+ * The processor. fluxOS needs a Pentium 4, or any other processor with
+ * SSE2 (and the FXSAVE, CMOV, MMX and SSE that come with it): the whole
+ * system is built for it. cpu_init() checks first thing at boot, and this file,
  * like everything else that runs before it, is built for any 386 (see the
  * Makefile), so an older machine says why it stops instead of hanging.
  *
- * It also reprograms the page attribute table, which every Pentium III
+ * It also reprograms the page attribute table, which every Pentium 4
  * has, so that pages can be write-combining (pte_wc): the screen's owner
  * gets the framebuffer that way, and its writes, SSE's streaming stores
  * above all, reach the card in whole bursts instead of one at a time.
@@ -26,6 +26,7 @@
 #define F_MMX  (1u << 23)
 #define F_FXSR (1u << 24)
 #define F_SSE  (1u << 25)
+#define F_SSE2 (1u << 26)
 
 #define MSR_PAT 0x277
 /*
@@ -83,7 +84,7 @@ static void read_name(uint32_t sig)
 static void cannot_run(const char *what, const char *missing)
 {
     splash_end(1);
-    kprintf("\n\033[1;31mfluxOS needs a Pentium III or a newer processor.\033[0m\n"
+    kprintf("\n\033[1;31mfluxOS needs a Pentium 4 or a newer processor.\033[0m\n"
             "This one (%s) has no %s.\n\nSystem halted.\n", what, missing);
     cli();
     for (;;)
@@ -111,6 +112,7 @@ void cpu_init(void)
         { F_MMX, "MMX" },
         { F_FXSR, "FXSAVE instruction" },
         { F_SSE, "SSE" },
+        { F_SSE2, "SSE2 (it is older than a Pentium 4)" },
     };
     for (uint32_t i = 0; i < ARRAY_SIZE(need); i++)
         if (!(edx & need[i].bit))

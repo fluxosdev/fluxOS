@@ -1,5 +1,5 @@
 /* Clipped drawing primitives, text and Windows 95 bevels. Fills go 16
- * bytes at a time (memset32), and blending uses MMX (simd.h). */
+ * bytes at a time (memset32), and blending uses SSE2 (simd.h). */
 #include <stdlib.h>
 #include <string.h>
 #include <flux/font.h>
@@ -140,7 +140,7 @@ void gfx_blit(struct surface *dst, int x, int y, const struct surface *src,
                src->px + (sy + j) * src->stride + sx, (size_t)r.w * 4);
 }
 
-/* (src * a + dst * (255 - a)) / 255, rounded, in each channel. MMX: callers simd_done(). */
+/* (src * a + dst * (255 - a)) / 255, rounded, in each channel. */
 static inline uint32_t blend(uint32_t dst, uint32_t src, uint32_t a)
 {
     return px_blend255(dst, src, a, 127) & 0xFFFFFF;
@@ -162,7 +162,6 @@ static void draw_image(struct surface *s, int x, int y, const struct image *img,
             dst[i] = a == 255 ? p & 0xFFFFFF : blend(dst[i], p, a);
         }
     }
-    simd_done();
 }
 
 void gfx_image(struct surface *s, int x, int y, const struct image *img)
@@ -184,8 +183,8 @@ static const struct pglyph *glyph(const struct pfont *f, char ch)
 }
 
 /* Blend c over the pixel under it, cov/15 of the way; cv is c unpacked
- * (px_unpack). MMX: callers simd_done(). */
-static inline void put_cov(uint32_t *px, color_t c, __m64 cv, int cov)
+ * (px_unpack). */
+static inline void put_cov(uint32_t *px, color_t c, __m128i cv, int cov)
 {
     if (cov >= 15)
         *px = c;
@@ -200,14 +199,13 @@ static void draw_glyph(struct surface *s, const struct pfont *f, const struct pg
     struct rect r = rect_intersect(mkrect(gx, y, g->width, f->height), s->clip);
     if (rect_empty(r))
         return;
-    __m64 cv = px_unpack(c);
+    __m128i cv = px_unpack(c);
     for (int j = r.y; j < r.y + r.h; j++) {
         const uint8_t *cov = g->cov + (j - y) * g->width;
         uint32_t *row = s->px + j * s->stride;
         for (int i = r.x; i < r.x + r.w; i++)
             put_cov(&row[i], c, cv, cov[i - gx]);
     }
-    simd_done();
 }
 
 int gfx_text_n(struct surface *s, const struct pfont *f, int x, int y, const char *str,
@@ -237,7 +235,7 @@ int gfx_text_width(const struct pfont *f, const char *str)
 void gfx_text_up(struct surface *s, const struct pfont *f, int x, int y, const char *str, color_t c)
 {
     /* Glyph row j becomes screen column x + j; glyph column i goes up from y. */
-    __m64 cv = px_unpack(c);
+    __m128i cv = px_unpack(c);
     for (; *str; str++) {
         const struct pglyph *g = glyph(f, *str);
         for (int j = 0; j < f->height; j++) {
@@ -249,7 +247,6 @@ void gfx_text_up(struct surface *s, const struct pfont *f, int x, int y, const c
         }
         y -= g->advance;
     }
-    simd_done();
 }
 
 int gfx_text_wrap(struct surface *s, const struct pfont *f, int x, int y, int w,
@@ -392,7 +389,7 @@ static int round_cov(int i, int j, int w, int h, int rt, int rb)
     return c <= 0.0f ? 0 : c >= 1.0f ? 256 : (int)(c * 256.0f);
 }
 
-/* argb over the pixel, with cov (out of 256) of its alpha. MMX: callers simd_done(). */
+/* argb over the pixel, with cov (out of 256) of its alpha. */
 static inline void put_argb(uint32_t *px, color_t argb, int cov)
 {
     uint32_t a = (argb >> 24) * (uint32_t)cov / 256;
@@ -433,7 +430,6 @@ void gfx_gradient(struct surface *s, struct rect r, int rt, int rb, int n, const
         for (int i = c.x; i < c.x + c.w; i++)
             put_argb(&row[i], col, corner_row ? round_cov(i - r.x, bj, r.w, r.h, rt, rb) : 256);
     }
-    simd_done();
 }
 
 void gfx_round_fill(struct surface *s, struct rect r, int rt, int rb, color_t argb)
@@ -465,7 +461,6 @@ void gfx_round_frame(struct surface *s, struct rect r, int rt, int rb, color_t a
                 put_argb(&row[i], argb, cov);
         }
     }
-    simd_done();
 }
 
 /* How far (x, y) is outside a box (centre cx, cy, half size hw, hh, corners of radius rad); 0 inside. */
@@ -507,7 +502,6 @@ static void shadow_direct(struct surface *s, struct rect r, int rad, int dy, int
             put_argb(&row[i], argb, (int)(k * k * 256.0f));
         }
     }
-    simd_done();
 }
 
 /* How much of the color's alpha the shadow of a w x h box puts on pixel (bi, bj) of the box
@@ -613,7 +607,6 @@ void gfx_shadow(struct surface *s, struct rect r, int rad, int dy, int blur, col
                 put_argb(&row[i], argb, cov[xi]);
         }
     }
-    simd_done();
 }
 
 void gfx_line(struct surface *s, int x0, int y0, int x1, int y1, int w, color_t argb)
@@ -638,7 +631,6 @@ void gfx_line(struct surface *s, int x0, int y0, int x1, int y1, int w, color_t 
                 put_argb(&row[i], argb, cov >= 1.0f ? 256 : (int)(cov * 256.0f));
         }
     }
-    simd_done();
 }
 
 /* ---- bevels ---- */

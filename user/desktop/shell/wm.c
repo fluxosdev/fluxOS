@@ -740,7 +740,7 @@ static void classify_fb(void)
 
 /*
  * Rows of pixels to the screen. The framebuffer is write-combining (when
- * the processor has a PAT), and streaming stores (MOVNTPS, MOVNTQ) fill
+ * the processor has a PAT), and streaming stores (MOVNTPS, MOVNTDQ) fill
  * whole write-combining buffers without reading anything back.
  */
 static void put_row32(uint8_t *dst, const uint32_t *src, int n)
@@ -789,31 +789,31 @@ static inline uint16_t pack16(uint32_t p)
                       (p >> fb16_shift[2] & fb16_mask[2]));
 }
 
-/* Two pixels' 15/16-bit values, in the low halves of their lanes. */
-static inline __m64 pack16x2(__m64 p, const __m64 *sh, const __m64 *mask)
+/* Four pixels' 15/16-bit values, in the low halves of their lanes. */
+static inline __m128i pack16x4(__m128i p, const __m128i *sh, const __m128i *mask)
 {
-    __m64 v = _mm_or_si64(_mm_or_si64(_mm_and_si64(_mm_srl_pi32(p, sh[0]), mask[0]),
-                                      _mm_and_si64(_mm_srl_pi32(p, sh[1]), mask[1])),
-                          _mm_and_si64(_mm_srl_pi32(p, sh[2]), mask[2]));
-    return _mm_srai_pi32(_mm_slli_pi32(v, 16), 16);     /* sign extended: PACKSSDW keeps it */
+    __m128i v = _mm_or_si128(_mm_or_si128(_mm_and_si128(_mm_srl_epi32(p, sh[0]), mask[0]),
+                                          _mm_and_si128(_mm_srl_epi32(p, sh[1]), mask[1])),
+                             _mm_and_si128(_mm_srl_epi32(p, sh[2]), mask[2]));
+    return _mm_srai_epi32(_mm_slli_epi32(v, 16), 16);   /* sign extended: PACKSSDW keeps it */
 }
 
-/* Four pixels at a time in MMX registers; the caller runs simd_done(). */
+/* Eight pixels at a time in XMM registers, streamed to the screen. */
 static void put_row16(uint8_t *dst, const uint32_t *src, int n)
 {
     uint16_t *d = (uint16_t *)dst;
-    __m64 sh[3], mask[3];
+    __m128i sh[3], mask[3];
     for (int c = 0; c < 3; c++) {
-        sh[c] = _mm_cvtsi32_si64(fb16_shift[c]);
-        mask[c] = _mm_set1_pi32((int)fb16_mask[c]);
+        sh[c] = _mm_cvtsi32_si128(fb16_shift[c]);
+        mask[c] = _mm_set1_epi32((int)fb16_mask[c]);
     }
     int i = 0;
-    for (; i < n && ((uintptr_t)(d + i) & 7); i++)
+    for (; i < n && ((uintptr_t)(d + i) & 15); i++)
         d[i] = pack16(src[i]);
-    for (; i + 4 <= n; i += 4) {
-        __m64 a = pack16x2(*(const __m64_u *)(src + i), sh, mask);
-        __m64 b = pack16x2(*(const __m64_u *)(src + i + 2), sh, mask);
-        _mm_stream_pi((__m64 *)(d + i), _mm_packs_pi32(a, b));
+    for (; i + 8 <= n; i += 8) {
+        __m128i a = pack16x4(_mm_loadu_si128((const __m128i *)(src + i)), sh, mask);
+        __m128i b = pack16x4(_mm_loadu_si128((const __m128i *)(src + i + 4)), sh, mask);
+        _mm_stream_si128((__m128i *)(d + i), _mm_packs_epi32(a, b));
     }
     for (; i < n; i++)
         d[i] = pack16(src[i]);
@@ -854,7 +854,6 @@ static void present(uint8_t *page, struct rect r)
         }
     }
     _mm_sfence();                       /* the streamed pixels are on their way */
-    simd_done();
 }
 
 /* The back buffer, laid out for the GPU too: page aligned, lines a

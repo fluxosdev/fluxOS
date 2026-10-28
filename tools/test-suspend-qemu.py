@@ -17,7 +17,7 @@ import time
 parser = argparse.ArgumentParser(description=__doc__)
 for name in ('qemu', 'kernel', 'initrd', 'guest', 'mkrescue', 'grubdir'):
     parser.add_argument(name)
-parser.add_argument('--cpus', type=int, default=1, choices=range(1, 17))
+parser.add_argument('--cpus', type=int, default=2, choices=range(1, 17))
 args = parser.parse_args()
 with tempfile.TemporaryDirectory(prefix='flux-suspend-') as directory:
     temp = pathlib.Path(directory)
@@ -40,7 +40,7 @@ with tempfile.TemporaryDirectory(prefix='flux-suspend-') as directory:
     subprocess.run([args.mkrescue, '-d', args.grubdir, '-o', str(temp / 'boot.iso'), str(tree)],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     log = temp / 'serial.log'
-    command = [args.qemu, '-cpu', 'pentium3', '-smp', str(args.cpus),
+    command = [args.qemu, '-cpu', 'core2duo,-lm', '-smp', str(args.cpus),
                '-cdrom', str(temp / 'boot.iso'), '-m', '256', '-display', 'none',
                '-serial', 'stdio', '-qmp', f'unix:{temp}/qmp,server=on,wait=off',
                '-no-reboot', '-nic', 'none']

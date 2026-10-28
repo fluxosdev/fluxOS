@@ -1,7 +1,7 @@
 /*
- * Mathematical functions. Floats are worked on with SSE and doubles with
- * the x87 FPU (SSE1 has no double precision); the square roots and
- * absolute values below compile to single instructions in place.
+ * Mathematical functions. Floats and doubles are both worked on with
+ * SSE2; the square roots and absolute values below compile to single
+ * instructions in place.
  */
 #ifndef _MATH_H
 #define _MATH_H

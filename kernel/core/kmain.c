@@ -88,7 +88,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
 
     for (uint32_t i = 0; i < ARRAY_SIZE(banner); i++)
         kprintf("\033[1;36m%s\033[0m\n", banner[i]);
-    kprintf("\033[1m%s %s\033[0m - a preemptive multitasking Unix-like OS for Pentium III-class PCs\n\n",
+    kprintf("\033[1m%s %s\033[0m - a preemptive multitasking Unix-like OS for Pentium 4-class PCs\n\n",
             FLUXOS_NAME, FLUXOS_RELEASE);
 
     if (magic != MULTIBOOT_BOOT_MAGIC)
@@ -96,7 +96,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     if ((mbi->flags & MB_INFO_LOADER) && mbi->boot_loader_name)
         boot_ok("Booted by %s", (const char *)mbi->boot_loader_name);
 
-    cpu_init();                         /* everything after this needs a Pentium III */
+    cpu_init();                         /* everything after this needs a Pentium 4 */
     lock_init();
 
     /* Remember the initrd before any allocation can reuse that memory. */

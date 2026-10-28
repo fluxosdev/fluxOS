@@ -9,7 +9,7 @@ import tempfile
 parser = argparse.ArgumentParser(description=__doc__)
 for name in ("qemu", "kernel", "initrd", "guest"):
     parser.add_argument(name)
-parser.add_argument("--cpus", type=int, default=1, choices=range(1, 17))
+parser.add_argument("--cpus", type=int, default=2, choices=range(1, 17))
 parser.add_argument("--append", default="")
 parser.add_argument("--memory", type=int, default=256, choices=range(64, 4097), help="guest RAM in MiB")
 parser.add_argument("--success-marker", default="KERNEL REGRESSIONS PASSED")
@@ -37,7 +37,7 @@ with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
     scratch = temp / "disk.img"
     with scratch.open("wb") as disk:
         disk.truncate(32 * 1024 * 1024)
-    command = [qemu, "-cpu", "pentium3", "-smp", str(args.cpus),
+    command = [qemu, "-cpu", "core2duo,-lm", "-smp", str(args.cpus),
                "-kernel", kernel, "-initrd", str(overlay), "-append", "automount=off " + args.append,
                "-m", f"{args.memory}M", "-display", "none", "-monitor", "none", "-serial", "stdio",
                "-no-reboot", "-nic", "none", "-drive", f"file={scratch},format=raw,if=ide,index=0"]

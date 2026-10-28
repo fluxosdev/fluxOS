@@ -953,17 +953,17 @@ static void rasterize(struct canvas *cv, const struct polys *ps, int evenodd)
             }
         }
         /* Coverage to bytes, four at a time: clamped, then rounded by
-         * truncating with half added (CVTTPS2PI, into MMX registers). */
+         * truncating with half added (CVTTPS2DQ). */
         uint8_t *row = cv->mask + (size_t)y * (size_t)cv->w;
         const __m128 k = _mm_set1_ps(255.0f / SS), top = _mm_set1_ps(255), half = _mm_set1_ps(0.5f);
         int x = 0;
         for (; x + 3 < cv->w; x += 4) {
             __m128 c = _mm_min_ps(_mm_max_ps(_mm_mul_ps(_mm_loadu_ps(cv->acc + x), k), _mm_setzero_ps()), top);
             c = _mm_add_ps(c, half);
-            __m64 w = _mm_packs_pi32(_mm_cvttps_pi32(c), _mm_cvttps_pi32(_mm_movehl_ps(c, c)));
-            *(u32_any *)(row + x) = (uint32_t)_mm_cvtsi64_si32(_mm_packs_pu16(w, w));
+            __m128i w = _mm_cvttps_epi32(c);
+            w = _mm_packs_epi32(w, w);
+            *(u32_any *)(row + x) = (uint32_t)_mm_cvtsi128_si32(_mm_packus_epi16(w, w));
         }
-        simd_done();
         for (; x < cv->w; x++) {
             float c = cv->acc[x] * (255.0f / SS);
             row[x] = c >= 255 ? 255 : c <= 0 ? 0 : (uint8_t)(c + 0.5f);

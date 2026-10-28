@@ -46,7 +46,7 @@ static const uint8_t ac_vals[162] = {
 };
 
 /* DCT basis: 8192 * C(u)/2 * cos((2x+1)u*pi/16), so a 2D transform is two passes. */
-static const int16_t basis[8][8] __attribute__((aligned(8))) = {
+static const int16_t basis[8][8] __attribute__((aligned(16))) = {
     { 2896, 2896, 2896, 2896, 2896, 2896, 2896, 2896 },
     { 4017, 3406, 2276, 799, -799, -2276, -3406, -4017 },
     { 3784, 1567, -1567, -3784, -3784, -1567, 1567, 3784 },
@@ -142,16 +142,14 @@ static void put_value(struct enc *e, int v, int n)
     put_bits(e, (uint32_t)(v < 0 ? v - 1 : v), n);     /* negatives in ones' complement */
 }
 
-/* The two 32-bit lanes of a PMADDWD result added up. */
-static inline int hsum(__m64 v)
+/* An eight-term dot product of 16-bit values: one PMADDWD, its four
+ * 32-bit lanes added up. */
+static inline int dot8(__m128i a, const __m128i *b)
 {
-    return _mm_cvtsi64_si32(v) + _mm_cvtsi64_si32(_mm_srli_si64(v, 32));
-}
-
-/* An eight-term dot product of 16-bit values: two PMADDWDs. */
-static inline int dot8(__m64 a0, __m64 a1, const __m64 *b)
-{
-    return hsum(_mm_add_pi32(_mm_madd_pi16(a0, b[0]), _mm_madd_pi16(a1, b[1])));
+    __m128i s = _mm_madd_epi16(a, *b);
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));   /* lanes 2 and 3 onto 0 and 1 */
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));   /* lane 1 onto 0 */
+    return _mm_cvtsi128_si32(s);
 }
 
 /*
@@ -162,32 +160,31 @@ static inline int dot8(__m64 a0, __m64 a1, const __m64 *b)
 static int encode_block(struct enc *e, const int *samples, const uint8_t *quant, const uint32_t *recip,
                         int prev_dc)
 {
-    const __m64 *b = (const __m64 *)basis;              /* row u: b[2u], b[2u + 1] */
+    const __m128i *b = (const __m128i *)basis;          /* row u: b[u] */
     /* Rows. The results take 17 bits, too many for PMADDWD, so they are
      * kept as t >> 8 and t & 255, transposed for the column pass. */
-    int16_t hi[64] __attribute__((aligned(8))), lo[64] __attribute__((aligned(8)));
+    int16_t hi[64] __attribute__((aligned(16))), lo[64] __attribute__((aligned(16)));
     for (int y = 0; y < 8; y++) {
         const int *s = samples + y * 8;
-        __m64 s0 = _mm_packs_pi32(_mm_set_pi32(s[1], s[0]), _mm_set_pi32(s[3], s[2]));
-        __m64 s1 = _mm_packs_pi32(_mm_set_pi32(s[5], s[4]), _mm_set_pi32(s[7], s[6]));
+        __m128i sv = _mm_packs_epi32(_mm_loadu_si128((const __m128i *)s),
+                                     _mm_loadu_si128((const __m128i *)(s + 4)));
         for (int u = 0; u < 8; u++) {
-            int t = (dot8(s0, s1, b + 2 * u) + 32) >> 6;
+            int t = (dot8(sv, b + u) + 32) >> 6;
             hi[u * 8 + y] = (int16_t)(t >> 8);
             lo[u * 8 + y] = (int16_t)(t & 255);
         }
     }
     int coef[64];
     for (int u = 0; u < 8; u++) {                       /* columns */
-        const __m64 *h = (const __m64 *)(hi + u * 8), *l = (const __m64 *)(lo + u * 8);
+        const __m128i *h = (const __m128i *)(hi + u * 8), *l = (const __m128i *)(lo + u * 8);
         for (int v = 0; v < 8; v++) {
-            int sum = 256 * dot8(h[0], h[1], b + 2 * v) + dot8(l[0], l[1], b + 2 * v);
+            int sum = 256 * dot8(*h, b + v) + dot8(*l, b + v);
             sum = (sum + (1 << 19)) >> 20;
             uint32_t mag = (uint32_t)(sum >= 0 ? sum : -sum) + quant[v * 8 + u] / 2;
             int c = (int)(((uint64_t)mag * recip[v * 8 + u]) >> 24);
             coef[v * 8 + u] = sum >= 0 ? c : -c;
         }
     }
-    simd_done();
     int diff = coef[0] - prev_dc, n = nbits(diff);
     put_bits(e, e->dc[n].code, e->dc[n].len);
     if (n)

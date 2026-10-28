@@ -257,12 +257,13 @@ static int paeth(int a, int b, int c)
 
 enum { F_NONE, F_SUB, F_UP, F_AVERAGE, F_PAETH };
 
-/* Up: every byte from the one above, 8 at a time. */
+/* Up: every byte from the one above, 16 at a time. */
 static void unfilter_up(uint8_t *cur, const uint8_t *prev, uint32_t n)
 {
     uint32_t i = 0;
-    for (; i + 8 <= n; i += 8)
-        *(__m64_u *)(cur + i) = _mm_add_pi8(*(const __m64_u *)(cur + i), *(const __m64_u *)(prev + i));
+    for (; i + 16 <= n; i += 16)
+        _mm_storeu_si128((__m128i *)(cur + i), _mm_add_epi8(_mm_loadu_si128((const __m128i *)(cur + i)),
+                                                            _mm_loadu_si128((const __m128i *)(prev + i))));
     for (; i < n; i++)
         cur[i] = (uint8_t)(cur[i] + prev[i]);
 }
@@ -285,17 +286,17 @@ static void unfilter_bytes(uint8_t *cur, const uint8_t *prev, uint32_t n, int bp
 
 /* A 3- or 4-byte pixel as bytes in the low half of a register; a 3-byte
  * one is read whole only where a fourth byte follows inside the row. */
-static inline __m64 load_px(const uint8_t *p, int bpp, int last)
+static inline __m128i load_px(const uint8_t *p, int bpp, int last)
 {
     uint32_t v = bpp == 4 ? *(const u32_any *)p
                : last ? (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16
                : *(const u32_any *)p & 0xFFFFFF;
-    return _mm_cvtsi32_si64((int)v);
+    return _mm_cvtsi32_si128((int)v);
 }
 
-static inline void store_px(uint8_t *p, __m64 px, int bpp)
+static inline void store_px(uint8_t *p, __m128i px, int bpp)
 {
-    uint32_t v = (uint32_t)_mm_cvtsi64_si32(px);
+    uint32_t v = (uint32_t)_mm_cvtsi128_si32(px);
     if (bpp == 4) {
         *(u32_any *)p = v;
     } else {
@@ -307,37 +308,37 @@ static inline void store_px(uint8_t *p, __m64 px, int bpp)
 
 /*
  * Sub, Average and Paeth for 3- and 4-byte pixels: a pixel at a time, its
- * channels in the 16-bit lanes of MMX registers, the left neighbour being
+ * channels in the 16-bit lanes of an XMM register, the left neighbour being
  * the pixel just done. Paeth picks a, b or c per channel by comparing
- * pa = |b - c|, pb = |a - c| and pc = |a + b - 2c|. The caller runs simd_done().
+ * pa = |b - c|, pb = |a - c| and pc = |a + b - 2c|.
  */
 static void unfilter_pixels(uint8_t *cur, const uint8_t *prev, uint32_t n, int bpp, int type)
 {
-    const __m64 zero = _mm_setzero_si64();
-    __m64 a = zero, c = zero;           /* left and upper left, unpacked */
+    const __m128i zero = _mm_setzero_si128();
+    __m128i a = zero, c = zero;         /* left and upper left, unpacked */
     for (uint32_t i = 0; i + bpp <= n; i += bpp) {
         int last = i + bpp == n;
-        __m64 b = _mm_unpacklo_pi8(load_px(prev + i, bpp, last), zero);
-        __m64 pred;
+        __m128i b = _mm_unpacklo_epi8(load_px(prev + i, bpp, last), zero);
+        __m128i pred;
         if (type == F_SUB) {
             pred = a;
         } else if (type == F_AVERAGE) {
-            pred = _mm_srli_pi16(_mm_add_pi16(a, b), 1);
+            pred = _mm_srli_epi16(_mm_add_epi16(a, b), 1);
         } else {
-            __m64 bc = _mm_sub_pi16(b, c), ac = _mm_sub_pi16(a, c);
-            __m64 abc = _mm_add_pi16(bc, ac);
-            __m64 pa = _mm_max_pi16(bc, _mm_sub_pi16(zero, bc));
-            __m64 pb = _mm_max_pi16(ac, _mm_sub_pi16(zero, ac));
-            __m64 pc = _mm_max_pi16(abc, _mm_sub_pi16(zero, abc));
-            __m64 not_a = _mm_or_si64(_mm_cmpgt_pi16(pa, pb), _mm_cmpgt_pi16(pa, pc));
-            __m64 use_c = _mm_and_si64(not_a, _mm_cmpgt_pi16(pb, pc));
-            __m64 use_b = _mm_andnot_si64(use_c, not_a);
-            pred = _mm_or_si64(_mm_andnot_si64(not_a, a),
-                               _mm_or_si64(_mm_and_si64(use_b, b), _mm_and_si64(use_c, c)));
+            __m128i bc = _mm_sub_epi16(b, c), ac = _mm_sub_epi16(a, c);
+            __m128i abc = _mm_add_epi16(bc, ac);
+            __m128i pa = _mm_max_epi16(bc, _mm_sub_epi16(zero, bc));
+            __m128i pb = _mm_max_epi16(ac, _mm_sub_epi16(zero, ac));
+            __m128i pc = _mm_max_epi16(abc, _mm_sub_epi16(zero, abc));
+            __m128i not_a = _mm_or_si128(_mm_cmpgt_epi16(pa, pb), _mm_cmpgt_epi16(pa, pc));
+            __m128i use_c = _mm_and_si128(not_a, _mm_cmpgt_epi16(pb, pc));
+            __m128i use_b = _mm_andnot_si128(use_c, not_a);
+            pred = _mm_or_si128(_mm_andnot_si128(not_a, a),
+                                _mm_or_si128(_mm_and_si128(use_b, b), _mm_and_si128(use_c, c)));
         }
-        __m64 out = _mm_add_pi8(load_px(cur + i, bpp, last), _mm_packs_pu16(pred, zero));
+        __m128i out = _mm_add_epi8(load_px(cur + i, bpp, last), _mm_packus_epi16(pred, zero));
         store_px(cur + i, out, bpp);
-        a = _mm_unpacklo_pi8(out, zero);
+        a = _mm_unpacklo_epi8(out, zero);
         c = b;
     }
 }
@@ -364,7 +365,6 @@ static int unfilter(uint8_t *data, int h, uint32_t stride, int bpp)
             unfilter_bytes(cur, prev, stride, bpp, type);
         prev = cur;
     }
-    simd_done();
     free(zeros);
     return ok ? 0 : -1;
 }

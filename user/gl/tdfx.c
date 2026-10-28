@@ -30,7 +30,7 @@
 #include <flux.h>
 #include <stdlib.h>
 #include <string.h>
-#include <mmintrin.h>
+#include <emmintrin.h>
 #include "glint.h"
 
 /* 3D registers, as offsets into the 3D register block */
@@ -390,18 +390,18 @@ static void tdfx_finish(struct fgl_context *c)
     wait_idle();
 }
 
-/* Four RGB565 pixels to 0xRRGGBB, each channel widened by repeating its top bits. */
-static inline void rgb565x4(uint32_t *out, __m64 p)
+/* Eight RGB565 pixels to 0xRRGGBB, each channel widened by repeating its top bits. */
+static inline void rgb565x8(uint32_t *out, __m128i p)
 {
-    __m64 r = _mm_or_si64(_mm_srli_pi16(_mm_and_si64(p, _mm_set1_pi16((short)0xF800)), 8),
-                          _mm_srli_pi16(p, 13));
-    __m64 g = _mm_or_si64(_mm_srli_pi16(_mm_and_si64(p, _mm_set1_pi16(0x07E0)), 3),
-                          _mm_and_si64(_mm_srli_pi16(p, 9), _mm_set1_pi16(3)));
-    __m64 b = _mm_or_si64(_mm_slli_pi16(_mm_and_si64(p, _mm_set1_pi16(0x001F)), 3),
-                          _mm_and_si64(_mm_srli_pi16(p, 2), _mm_set1_pi16(7)));
-    __m64 bg = _mm_or_si64(b, _mm_slli_pi16(g, 8));
-    *(__m64_u *)out = _mm_unpacklo_pi16(bg, r);
-    *(__m64_u *)(out + 2) = _mm_unpackhi_pi16(bg, r);
+    __m128i r = _mm_or_si128(_mm_srli_epi16(_mm_and_si128(p, _mm_set1_epi16((short)0xF800)), 8),
+                             _mm_srli_epi16(p, 13));
+    __m128i g = _mm_or_si128(_mm_srli_epi16(_mm_and_si128(p, _mm_set1_epi16(0x07E0)), 3),
+                             _mm_and_si128(_mm_srli_epi16(p, 9), _mm_set1_epi16(3)));
+    __m128i b = _mm_or_si128(_mm_slli_epi16(_mm_and_si128(p, _mm_set1_epi16(0x001F)), 3),
+                             _mm_and_si128(_mm_srli_epi16(p, 2), _mm_set1_epi16(7)));
+    __m128i bg = _mm_or_si128(b, _mm_slli_epi16(g, 8));
+    _mm_storeu_si128((__m128i *)out, _mm_unpacklo_epi16(bg, r));
+    _mm_storeu_si128((__m128i *)(out + 4), _mm_unpackhi_epi16(bg, r));
 }
 
 static void tdfx_read(struct fgl_context *c, uint32_t *dst, int stride)
@@ -411,10 +411,9 @@ static void tdfx_read(struct fgl_context *c, uint32_t *dst, int stride)
         const volatile uint32_t *src = (const volatile uint32_t *)(hw.vram + t->color + (uint32_t)y * t->stride);
         uint32_t *out = dst + (size_t)y * stride;
         int x = 0;
-        /* Reads cross the bus one at a time: four pixels per 64-bit MMX read. */
-        for (; x + 3 < c->width; x += 4)
-            rgb565x4(out + x, *(const volatile __m64_u *)(src + (x >> 1)));
-        _mm_empty();
+        /* Reads cross the bus one at a time: eight pixels per 128-bit read. */
+        for (; x + 7 < c->width; x += 8)
+            rgb565x8(out + x, _mm_loadu_si128((const __m128i *)(src + (x >> 1))));
         for (; x + 1 < c->width; x += 2) {
             uint32_t pp = src[x >> 1];
             for (int k = 0; k < 2; k++, pp >>= 16) {

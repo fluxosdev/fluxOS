@@ -3,7 +3,7 @@
  *
  * memcpy, memmove and memset move words with the x86 string instructions.
  * Built for user space, with SSE, larger blocks go 64 bytes at a time
- * through the XMM registers, and blocks bigger than a Pentium III's level 2
+ * through the XMM registers, and blocks bigger than a Pentium 4's level 2
  * cache are streamed past it (MOVNTPS) so they do not flush everything
  * else out. The kernel's build has no SSE: it keeps off those registers.
  */
@@ -15,7 +15,7 @@
 #include <xmmintrin.h>
 #define USE_SSE
 #define SSE_MIN    256                  /* smaller blocks: the string instructions */
-#define STREAM_MIN (256 * 1024)         /* the L2 cache of a Coppermine */
+#define STREAM_MIN (256 * 1024)         /* the L2 cache of a Willamette */
 #endif
 
 /* A word that may sit at any address. */

@@ -4,7 +4,6 @@
 #                   fluxOS Setup and installs fluxOS onto a hard disk
 #   make run        boot the ISO in QEMU (serial console on stdio), with
 #                   fluxdisk.img to install onto
-#   make run-smp    the same with two processors (QEMU_SMP=4 for more)
 #   make run-kernel boot the kernel directly with QEMU's multiboot loader,
 #                   running the whole system from memory (for development;
 #                   text console only: that loader cannot set a video mode)
@@ -23,8 +22,9 @@ CC      ?= gcc
 LD      ?= ld
 AR      ?= ar
 QEMU    ?= qemu-system-i386
-# The oldest processor fluxOS runs on, so that testing catches anything newer.
-QEMU_CPU ?= -cpu pentium3
+# A Core 2 Duo (SSE2 through SSSE3), two cores; QEMU_SMP=1 or 4 for other counts.
+QEMU_CPU ?= -cpu core2duo,-lm
+QEMU_SMP ?= 2
 # GRUB 2.06 from Debian 12, fetched once by tools/fetch-grub.sh (2.12 reboots
 # some older PCs right after "Welcome to GRUB!"). For the host's own GRUB:
 #   make GRUB=/ GRUB_DEP=
@@ -52,9 +52,9 @@ MKFS_FAT ?= $(shell command -v mkfs.fat 2>/dev/null || ls /usr/sbin/mkfs.fat /sb
 
 GCC_INC := $(shell $(CC) -print-file-name=include)
 
-# fluxOS needs a Pentium III: everything is built for its instruction set,
-# SSE included (kernel/core/cpu.c stops the boot on anything older).
-CFLAGS_COMMON := -m32 -march=pentium3 -std=gnu11 -O2 -g \
+# fluxOS needs a Pentium 4: everything is built for its instruction set,
+# SSE2 included (kernel/core/cpu.c stops the boot on anything older).
+CFLAGS_COMMON := -m32 -march=pentium4 -std=gnu11 -O2 -g \
 	-ffreestanding -fno-pie -fno-pic -fno-stack-protector -fno-builtin \
 	-nostdinc -isystem $(GCC_INC) \
 	-fno-asynchronous-unwind-tables -fno-strict-aliasing \
@@ -66,8 +66,8 @@ CFLAGS_COMMON := -m32 -march=pentium3 -std=gnu11 -O2 -g \
 # registers for bulk copies, saving what it touches.
 KERNEL_CFLAGS := $(CFLAGS_COMMON) -mgeneral-regs-only -fno-omit-frame-pointer \
 	-Iinclude -Ikernel/include -Ikernel/core -Ikernel/fs -Ikernel/net -Ikernel/usb -Ikernel/input -Ikernel/storage -Ikernel/sound -Ikernel/video -Ikernel/acpi
-# User code does float arithmetic on SSE (doubles stay on the x87, which
-# SSE1 cannot do) and may use the SSE and MMX intrinsics.
+# User code does all its float and double arithmetic on SSE2 (the x87 is
+# left to long double) and may use the SSE2 intrinsics.
 USER_CFLAGS   := $(CFLAGS_COMMON) -mfpmath=sse -fno-math-errno -Iinclude -Iuser/include
 
 # What runs before kernel/core/cpu.c has checked the processor (the console, the
@@ -76,7 +76,7 @@ USER_CFLAGS   := $(CFLAGS_COMMON) -mfpmath=sse -fno-math-errno -Iinclude -Iuser/
 KERNEL_EARLY_OBJS := $(addprefix $(BUILD)/k/,kernel/core/kmain.o kernel/core/cpu.o kernel/core/kprintf.o \
 	kernel/core/lock.o kernel/video/vga.o kernel/video/fb.o kernel/core/serial.o kernel/video/splash.o \
 	lib/string.o lib/vsnprintf.o lib/font8x16.o)
-$(KERNEL_EARLY_OBJS): KERNEL_CFLAGS += -march=i386 -mtune=pentium3
+$(KERNEL_EARLY_OBJS): KERNEL_CFLAGS += -march=i386 -mtune=pentium4
 
 LDFLAGS_COMMON := -m elf_i386 -nostdlib -z noexecstack --no-warn-rwx-segments
 
@@ -145,7 +145,7 @@ SETUPFS_FILES := $(shell find setupfs -type f 2>/dev/null)
 SETUP_BINS := init desktop fluxinstall mkfs.fat fsh cat ls lsblk mount umount df dmesg \
               ps free uname clear more mkdir rm cp mv sync reboot poweroff halt
 
-.PHONY: all iso kernel system setup disk floppy run run-smp run-kernel run-disk run-q35 run-usb check clean
+.PHONY: all iso kernel system setup disk floppy run run-kernel run-disk run-q35 run-usb check clean
 .SECONDARY:
 
 all: $(ISO)
@@ -288,24 +288,20 @@ QEMU_AUDIO ?= -audiodev pa,id=snd0,out.latency=150000
 QEMU_SND  ?= $(QEMU_AUDIO) -device sb16,audiodev=snd0
 
 run: $(ISO) $(DISK)
-	$(QEMU) $(QEMU_CPU) -m 2G -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
-
-QEMU_SMP ?= 2
-run-smp: $(ISO) $(DISK)
 	$(QEMU) $(QEMU_CPU) -smp $(QEMU_SMP) -m 2G -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
 
 run-kernel: $(TEXT_KERNEL) $(SYSTEM) $(DISK)
-	$(QEMU) $(QEMU_CPU) -kernel $(TEXT_KERNEL) -initrd $(SYSTEM) -m 1G -serial stdio $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
+	$(QEMU) $(QEMU_CPU) -smp $(QEMU_SMP) -kernel $(TEXT_KERNEL) -initrd $(SYSTEM) -m 1G -serial stdio $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
 
 # Boot fluxdisk.img on its own, after "fluxinstall /dev/hda".
 run-disk: $(DISK)
-	$(QEMU) $(QEMU_CPU) -m 2G -serial stdio -boot c $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
+	$(QEMU) $(QEMU_CPU) -smp $(QEMU_SMP) -m 2G -serial stdio -boot c $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
 
 # On q35 "if=ide" drives and the CD sit on the chipset's AHCI controller.
 QEMU_XHCI ?= -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0
 
 run-q35: $(ISO) $(DISK)
-	$(QEMU) $(QEMU_CPU) -M q35 -m 1G -serial stdio -boot d -cdrom $(ISO) \
+	$(QEMU) $(QEMU_CPU) -smp $(QEMU_SMP) -M q35 -m 1G -serial stdio -boot d -cdrom $(ISO) \
 		-drive file=$(DISK),format=raw,if=ide,index=0 $(QEMU_NET) $(QEMU_SND) $(QEMU_XHCI)
 
 QEMU_USB ?= -usb -device usb-kbd,bus=usb-bus.0 -device usb-mouse,bus=usb-bus.0 \
@@ -313,7 +309,7 @@ QEMU_USB ?= -usb -device usb-kbd,bus=usb-bus.0 -device usb-mouse,bus=usb-bus.0 \
 	-device usb-storage,bus=ehci.0,drive=stick
 
 run-usb: $(ISO) $(DISK)
-	$(QEMU) $(QEMU_CPU) -m 1G -serial stdio -boot d -cdrom $(ISO) $(QEMU_NET) $(QEMU_SND) $(QEMU_USB)
+	$(QEMU) $(QEMU_CPU) -smp $(QEMU_SMP) -m 1G -serial stdio -boot d -cdrom $(ISO) $(QEMU_NET) $(QEMU_SND) $(QEMU_USB)
 
 clean:
 	rm -rf $(BUILD) $(ISO)
@@ -365,8 +361,8 @@ $(BUILD)/tests/kernel-%: tests/kernel-%.c tests/kernel-test.h tests/kernel-readc
 		-Iinclude -Ikernel/core -Ikernel/fs -Ikernel/net -Ikernel/usb -Ikernel/input -Ikernel/storage -Ikernel/sound -Ikernel/video $< tests/kernel-readcache-stub.c -Wl,--gc-sections -o $@
 
 .PHONY: test-kernel-qemu
-# Override to exercise SMP, nosmp and maxcpus without touching a real disk.
-KERNEL_TEST_CPUS ?= 1
+# Override to exercise other core counts, nosmp and maxcpus without touching a real disk.
+KERNEL_TEST_CPUS ?= $(QEMU_SMP)
 KERNEL_TEST_MEMORY ?= 256
 KERNEL_TEST_CMDLINE ?=
 test-kernel-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest

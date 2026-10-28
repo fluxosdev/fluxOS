@@ -7,8 +7,8 @@
  * (16.16 for color, whole units for depth).
  *
  * The four planes (depth, red, green, blue) are set up together in the
- * lanes of an SSE register. Spans are filled two pixels at a time in MMX
- * registers, the depth test giving a mask of the pixels to keep.
+ * lanes of an SSE register. Spans are filled four pixels at a time in the
+ * SSE2 integer lanes, the depth test giving a mask of the pixels to keep.
  *
  * A triangle that is textured, blended, alpha tested or color masked has
  * four more planes, 1/w, s/w, t/w and alpha, which are linear in the
@@ -21,7 +21,7 @@
  */
 #include <stdlib.h>
 #include <string.h>
-#include <mmintrin.h>
+#include <emmintrin.h>
 #include "glint.h"
 
 #define DEPTH_ONE 0x3FFFFFFF            /* depth 1.0 */
@@ -114,65 +114,69 @@ static inline int depth_pass(GLenum func, uint32_t z, uint32_t old)
     }
 }
 
-/* ---- spans, two pixels at a time ---- */
+/* ---- spans, four pixels at a time ---- */
 
-/* Two pixels' 16.16 red, green and blue, clamped and packed as 0xRRGGBB. */
-static inline __m64 pack2(__m64 r, __m64 g, __m64 b)
+/* Four pixels' 16.16 red, green and blue, clamped and packed as 0xRRGGBB:
+ * the whole parts saturated to 16 bits (PACKSSDW), interleaved, then to
+ * bytes (PACKUSWB). */
+static inline __m128i pack4(__m128i r, __m128i g, __m128i b)
 {
-    __m64 bg = _mm_packs_pi32(_mm_srai_pi32(b, 16), _mm_srai_pi32(g, 16));     /* b0 b1 g0 g1 */
-    __m64 rr = _mm_packs_pi32(_mm_srai_pi32(r, 16), _mm_setzero_si64());       /* r0 r1 0 0 */
-    __m64 bgi = _mm_unpacklo_pi16(bg, _mm_srli_si64(bg, 32));                  /* b0 g0 b1 g1 */
-    __m64 r0 = _mm_unpacklo_pi16(rr, _mm_setzero_si64());                      /* r0 0 r1 0 */
-    return _mm_packs_pu16(_mm_unpacklo_pi32(bgi, r0), _mm_unpackhi_pi32(bgi, r0));
+    __m128i zero = _mm_setzero_si128();
+    __m128i rr = _mm_packs_epi32(_mm_srai_epi32(r, 16), zero);      /* r0 r1 r2 r3 0 0 0 0 */
+    __m128i gg = _mm_packs_epi32(_mm_srai_epi32(g, 16), zero);
+    __m128i bb = _mm_packs_epi32(_mm_srai_epi32(b, 16), zero);
+    __m128i bg = _mm_unpacklo_epi16(bb, gg);                        /* b0 g0 b1 g1 b2 g2 b3 g3 */
+    __m128i r0 = _mm_unpacklo_epi16(rr, zero);                      /* r0 0 r1 0 r2 0 r3 0 */
+    return _mm_packus_epi16(_mm_unpacklo_epi32(bg, r0), _mm_unpackhi_epi32(bg, r0));
 }
 
-/* The lanes for pixels i and i + 1, and the step to the next pair. */
-#define LANES(v, d) _mm_set_pi32((v) + (d), (v))
-#define STEP2(d)    _mm_set1_pi32(2 * (d))
+/* The lanes for pixels i to i + 3, and the step to the next four. */
+#define LANES(v, d) _mm_setr_epi32((v), (v) + (d), (v) + 2 * (d), (v) + 3 * (d))
+#define STEP4(d)    _mm_set1_epi32(4 * (d))
 
 static void span_color(uint32_t *cp, int n, int32_t r, int32_t g, int32_t b,
                        int32_t dr, int32_t dg, int32_t db)
 {
-    __m64 R = LANES(r, dr), G = LANES(g, dg), B = LANES(b, db);
-    __m64 dR = STEP2(dr), dG = STEP2(dg), dB = STEP2(db);
+    __m128i R = LANES(r, dr), G = LANES(g, dg), B = LANES(b, db);
+    __m128i dR = STEP4(dr), dG = STEP4(dg), dB = STEP4(db);
     int i = 0;
-    for (; i + 1 < n; i += 2) {
-        *(__m64_u *)(cp + i) = pack2(R, G, B);
-        R = _mm_add_pi32(R, dR);
-        G = _mm_add_pi32(G, dG);
-        B = _mm_add_pi32(B, dB);
+    for (; i + 3 < n; i += 4) {
+        _mm_storeu_si128((__m128i *)(cp + i), pack4(R, G, B));
+        R = _mm_add_epi32(R, dR);
+        G = _mm_add_epi32(G, dG);
+        B = _mm_add_epi32(B, dB);
     }
-    if (i < n)
+    for (; i < n; i++)
         cp[i] = pack(r + i * dr, g + i * dg, b + i * db);
-    _mm_empty();
 }
 
 /* GL_LESS. Depths are below 2^31, so signed compares do. */
 static void span_less(uint32_t *cp, uint32_t *zp, int n, int write_z, int32_t z, int32_t r,
                       int32_t g, int32_t b, int32_t dz, int32_t dr, int32_t dg, int32_t db)
 {
-    __m64 Z = LANES(z, dz), R = LANES(r, dr), G = LANES(g, dg), B = LANES(b, db);
-    __m64 dZ = STEP2(dz), dR = STEP2(dr), dG = STEP2(dg), dB = STEP2(db);
+    __m128i Z = LANES(z, dz), R = LANES(r, dr), G = LANES(g, dg), B = LANES(b, db);
+    __m128i dZ = STEP4(dz), dR = STEP4(dr), dG = STEP4(dg), dB = STEP4(db);
     int i = 0;
-    for (; i + 1 < n; i += 2) {
-        __m64 zz = _mm_andnot_si64(_mm_srai_pi32(Z, 31), Z);                   /* below 0: 0 */
-        __m64 old = *(__m64_u *)(zp + i);
-        __m64 keep = _mm_cmpgt_pi32(old, zz);
-        if (_mm_movemask_pi8(keep)) {
+    for (; i + 3 < n; i += 4) {
+        __m128i zz = _mm_andnot_si128(_mm_srai_epi32(Z, 31), Z);               /* below 0: 0 */
+        __m128i old = _mm_loadu_si128((const __m128i *)(zp + i));
+        __m128i keep = _mm_cmpgt_epi32(old, zz);
+        if (_mm_movemask_epi8(keep)) {
             if (write_z)
-                *(__m64_u *)(zp + i) = _mm_or_si64(_mm_and_si64(keep, zz), _mm_andnot_si64(keep, old));
-            __m64_u *px = (__m64_u *)(cp + i);
-            *px = _mm_or_si64(_mm_and_si64(keep, pack2(R, G, B)), _mm_andnot_si64(keep, *px));
+                _mm_storeu_si128((__m128i *)(zp + i),
+                                 _mm_or_si128(_mm_and_si128(keep, zz), _mm_andnot_si128(keep, old)));
+            __m128i px = _mm_loadu_si128((const __m128i *)(cp + i));
+            _mm_storeu_si128((__m128i *)(cp + i),
+                             _mm_or_si128(_mm_and_si128(keep, pack4(R, G, B)), _mm_andnot_si128(keep, px)));
         }
-        Z = _mm_add_pi32(Z, dZ);
-        R = _mm_add_pi32(R, dR);
-        G = _mm_add_pi32(G, dG);
-        B = _mm_add_pi32(B, dB);
+        Z = _mm_add_epi32(Z, dZ);
+        R = _mm_add_epi32(R, dR);
+        G = _mm_add_epi32(G, dG);
+        B = _mm_add_epi32(B, dB);
     }
-    _mm_empty();
-    if (i < n) {
-        z += i * dz;
-        uint32_t zz = z < 0 ? 0 : (uint32_t)z;
+    for (; i < n; i++) {
+        int32_t zi = z + i * dz;
+        uint32_t zz = zi < 0 ? 0 : (uint32_t)zi;
         if (zz < zp[i]) {
             if (write_z)
                 zp[i] = zz;
