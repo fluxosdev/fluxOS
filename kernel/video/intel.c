@@ -20,7 +20,16 @@
  *    memory after the first, and lends the screen's owner both
  *    (DISPF_FLIP). DISP_FLIP points the display planes at either one;
  *    they take the new address at the next vertical blank;
- *  - gives it a 64x64 ARGB hardware pointer (DISP_CURSOR, DISP_CURSORPOS).
+ *  - gives it a 64x64 ARGB hardware pointer (DISP_CURSOR, DISP_CURSORPOS);
+ *  - starts the blitter, the GPU's 2D copy engine, once it passes a
+ *    self-test, and has it copy between the two pages (DISP_COPYRECTS)
+ *    and from memory a process lends it (DISP_MAPBUF, DISP_BLIT), which
+ *    the GTT maps beyond the aperture.
+ *
+ * The blitter runs commands from a ring in stolen memory, as the GPU's
+ * other engines do: we write them at the tail, it reads from the head.
+ * Each batch ends by flushing and writing a sequence number into a status
+ * page, which we wait for; the calls return with the copies done.
  *
  * There are three pipes, A to C, each with a primary plane and a cursor
  * plane, 0x1000 apart. Register names follow Linux's i915 (i915_reg.h).
@@ -30,62 +39,9 @@
 #include "mm.h"
 #include "pci.h"
 #include "proc.h"
+#include "intel.h"
 
-#define VENDOR_INTEL   0x8086
-
-/* PCI configuration space */
-#define GMCH_CTRL      0x50         /* 16 bits */
-#define GMCH_GMS(v)    (((v) >> 3) & 0x1F)          /* stolen memory, 32 MiB units */
-#define GMCH_GGMS(v)   (((v) >> 8) & 0x3)           /* GTT size, MiB */
-#define BDSM           0x5C         /* stolen memory's base */
-
-/* BAR0: registers in the first 2 MiB, the GTT in the second */
-#define GTT_OFFSET     0x200000
-#define GFX_FLSH_CNTL  0x101008     /* write: the GTT's changes reach the GPU */
-#define STOLEN_RESERVED 0x1082C0    /* the firmware's part at the top of stolen memory */
-#define STOLEN_RESERVED_EN   (1u << 0)
-#define STOLEN_RESERVED_256K (1u << 5)
-#define STOLEN_RESERVED_ADDR 0xFFFC0000u
-
-#define PTE_VALID      (1u << 0)
-#define PTE_CACHE      0x80Eu       /* Haswell's cacheability bits */
-#define PTE_ADDR_HI    0x7F0u       /* address bits 38:32 in bits 10:4 */
-
-/* Per pipe, PIPE_STRIDE apart */
-#define PIPE_STRIDE    0x1000
-#define NPIPES         3
-#define CURCNTR        0x70080
-#define CURBASE        0x70084      /* written last: the cursor takes everything at vblank */
-#define CURPOS         0x70088
-#define DSPCNTR        0x70180
-#define DSPLINOFF      0x70184
-#define DSPSTRIDE      0x70188
-#define DSPSURF        0x7019C      /* written: the plane takes it at the next vblank */
-#define DSPSURFLIVE    0x701AC      /* what it scans out now */
-
-#define DISPPLANE_ENABLE    (1u << 31)
-#define DISPPLANE_GAMMA     (1u << 30)
-#define DISPPLANE_PIPE_CSC  (1u << 24)
-#define DISPPLANE_TILED     (1u << 10)
-
-#define MCURSOR_64_ARGB     0x27u
-#define MCURSOR_GAMMA       (1u << 26)
-#define MCURSOR_PIPE_CSC    (1u << 24)
-#define CURSOR_POS_SIGN     0x8000u
-#define CURSOR_POS_MASK     0x7FFFu
-
-/* Watermarks: when each plane asks for more data from memory */
-static const uint32_t wm0_pipe[NPIPES] = { 0x45100, 0x45104, 0x45200 };
-#define WM_LP1         0x45108      /* LP2 and LP3 follow */
-#define WM0_CURSOR     0xFFu
-#define WM_LP_EN       (1u << 31)
-#define WM_LP_CURSOR   0xFFu
-#define WM0_CURSOR_SAFE 16          /* Linux's formula gives about 6 at 1080p */
-#define WM_LP_CURSOR_SAFE 32
-
-#define CUR_N          DISP_CURSOR_SIZE
-#define CUR_BYTES      (CUR_N * CUR_N * 4)
-#define FLIP_ALIGN     0x40000      /* page 1 on a 256 KiB boundary, as Linux aligns scanout */
+struct intel ig;
 
 /* Named cards first, then each family's whole range of device IDs. */
 static const struct chip {
@@ -107,43 +63,6 @@ static const struct chip {
     { 0x0C02, 0x0C2E, "Intel HD Graphics (Haswell)" },
     { 0x0D02, 0x0D2E, "Intel HD Graphics (Haswell)" },
 };
-
-static struct {
-    int present;
-    struct pci_dev pci;
-    const char *name;
-    uint16_t device;
-    volatile uint8_t *regs;
-    volatile uint32_t *gtt;
-    uint32_t gtt_entries;
-    uint32_t aper_phys, aper_size;
-    uint32_t stolen_base, stolen_size, stolen_end;  /* end: below the firmware's part */
-    struct dispmode boot_mode;
-
-    int pipes;                      /* bit n: pipe n's plane shows the screen */
-    uint32_t surf[NPIPES];          /* each one's DSPSURF for page 0 */
-    uint32_t page0;                 /* the screen's address in the GTT (and the aperture) */
-    uint32_t page_offset;           /* page 1 is this far after page 0 */
-    uint32_t cur_off;               /* the pointer's two pictures, in the GTT */
-    uint32_t map_phys, map_first, map_end;  /* GTT pages [first, end) mapped to stolen memory at phys */
-    uint32_t pte_cache;             /* the cache bits the BIOS used */
-    int flip, page;
-    int cursor, cursor_on, cursor_slot;
-    int cur_x, cur_y, hot_x, hot_y;
-    uint8_t *cursor_img;            /* the aperture, at cur_off */
-} ig;
-
-#define FOR_EACH_PIPE(p) for (int p = 0; p < NPIPES; p++) if (ig.pipes & (1 << p))
-
-static inline uint32_t rd(uint32_t reg)
-{
-    return *(volatile uint32_t *)(ig.regs + reg);
-}
-
-static inline void wr(uint32_t reg, uint32_t v)
-{
-    *(volatile uint32_t *)(ig.regs + reg) = v;
-}
 
 static const struct chip *find_chip(struct pci_dev *out)
 {
@@ -204,18 +123,28 @@ static uint32_t stolen_at(uint32_t gfx)
     return (uint32_t)a;
 }
 
-/* Map GTT pages [first, end) to stolen memory at phys onwards. */
+static void gtt_flush(void)
+{
+    (void)ig.gtt[0];                /* the writes are done */
+    wr(GFX_FLSH_CNTL, 1);
+    (void)rd(GFX_FLSH_CNTL);
+}
+
+/*
+ * Map GTT pages [first, end) to stolen memory at phys onwards, uncached:
+ * the display engine reads memory without looking in the cache the
+ * blitter would otherwise leave its writes in. The screen itself is
+ * remapped to where it already is, with that setting.
+ */
 static void gtt_map(void)
 {
     uint32_t phys = ig.map_phys;
     for (uint32_t g = ig.map_first; g < ig.map_end; g += PAGE_SIZE, phys += PAGE_SIZE) {
-        uint32_t pte = pte_make(phys) | ig.pte_cache | PTE_VALID;
+        uint32_t pte = pte_make(phys) | PTE_VALID;
         if (ig.gtt[g >> 12] != pte)
             ig.gtt[g >> 12] = pte;
     }
-    (void)ig.gtt[(ig.map_end >> 12) - 1];   /* the writes are done */
-    wr(GFX_FLSH_CNTL, 1);
-    (void)rd(GFX_FLSH_CNTL);
+    gtt_flush();
 }
 
 /* ---- finding the screen ---- */
@@ -242,35 +171,51 @@ static void find_planes(void)
 }
 
 /*
- * Where the second page and the pointer go: after the screen in the GTT,
- * backed by the stolen memory after the screen's (which the BIOS mapped
- * in a line, as it does), within the aperture and below the firmware's
- * part of stolen memory.
+ * Where the second page, the pointer and the blitter's area go: after the
+ * screen in the GTT, backed by the stolen memory after the screen's (which
+ * the BIOS mapped in a line, as it does), within the aperture and below
+ * the firmware's part of stolen memory. Each page gets a slot as large as
+ * that room allows (up to MAX_PAGE), so a native mode up to that size
+ * changes nothing here.
  */
 static void plan_pages(void)
 {
     if (!ig.pipes)
         return;
-    uint32_t first = stolen_at(ig.page0), last = stolen_at(ig.page0 + fb.size - PAGE_SIZE);
-    if (!first || last != first + fb.size - PAGE_SIZE) {
-        kprintf("intel: the screen is not in stolen memory in one piece; no page flipping\n");
-        return;
+    uint32_t first = stolen_at(ig.page0);
+    for (uint32_t off = 0; first && off < fb.size; off += PAGE_SIZE) {
+        if (stolen_at(ig.page0 + off) != first + off) {
+            kprintf("intel: the screen is not in stolen memory in one piece; no page flipping\n");
+            return;
+        }
     }
-    ig.pte_cache = ig.gtt[ig.page0 >> 12] & PTE_CACHE;
-    ig.page_offset = ALIGN_UP(fb.size, FLIP_ALIGN);
-    ig.cur_off = ALIGN_UP(ig.page0 + ig.page_offset + fb.size, PAGE_SIZE);
-    uint32_t end = ig.cur_off + 2 * CUR_BYTES;
-    if (end > ig.aper_size || end - ig.page0 > ig.stolen_end - first || (end >> 12) > ig.gtt_entries) {
+    if (!first)
+        return;
+    klog("intel: the BIOS maps the screen with cache bits %03x\n", ig.gtt[ig.page0 >> 12] & PTE_CACHE);
+    uint32_t room = MIN(ig.stolen_end - first, ig.aper_size - ig.page0);
+    room = MIN(room, (ig.gtt_entries << 12) - ig.page0);
+    uint32_t extra = ALIGN_UP(2 * CUR_BYTES + ENGINE_BYTES, FLIP_ALIGN);
+    uint32_t slot = room > extra ? MIN(ALIGN_DOWN((room - extra) / 2, FLIP_ALIGN), MAX_PAGE) : 0;
+    if (slot < ALIGN_UP(fb.size, FLIP_ALIGN)) {
         kprintf("intel: %u KiB of stolen memory is too little for a second page\n",
                 ig.stolen_size / 1024);
         return;
     }
-    ig.map_first = ig.page0 + fb.size;
+    ig.page_offset = slot;
+    ig.cur_off = ig.page0 + 2 * slot;
+    ig.eng_off = ig.cur_off + 2 * CUR_BYTES;
+    uint32_t end = ig.eng_off + ENGINE_BYTES;
+    ig.map_first = ig.page0;
     ig.map_end = end;
-    ig.map_phys = first + fb.size;
-    ig.cursor_img = vmm_map_mmio(ig.aper_phys + ig.cur_off, 2 * CUR_BYTES, 0);
-    if (!ig.cursor_img)
+    ig.map_phys = first;
+    uint8_t *cpu = vmm_map_mmio(ig.aper_phys + ig.cur_off, end - ig.cur_off, PTE_PCD | PTE_PWT);
+    ig.screen = vmm_map_mmio(ig.aper_phys + ig.page0, 2 * slot, 0);
+    if (!cpu || !ig.screen)
         return;
+    ig.cursor_img = cpu;
+    ig.ring = (volatile uint32_t *)(cpu + (ig.eng_off - ig.cur_off));
+    ig.hws = (volatile uint32_t *)(cpu + (ig.eng_off - ig.cur_off) + HWS_OFF);
+    ig.test = cpu + (ig.eng_off - ig.cur_off) + TEST_OFF;
     gtt_map();
     ig.flip = ig.cursor = 1;
 }
@@ -283,9 +228,9 @@ static void plan_pages(void)
 static void cursor_watermarks(void)
 {
     FOR_EACH_PIPE(p) {
-        uint32_t wm = rd(wm0_pipe[p]);
+        uint32_t wm = rd(WM0_PIPE(p));
         if (!(wm & WM0_CURSOR))
-            wr(wm0_pipe[p], wm | WM0_CURSOR_SAFE);
+            wr(WM0_PIPE(p), wm | WM0_CURSOR_SAFE);
     }
     for (int i = 0; i < 3; i++) {
         uint32_t wm = rd(WM_LP1 + 4 * (uint32_t)i);
@@ -413,6 +358,421 @@ int intel_cursor_pos(const struct disppos *p)
     return 0;
 }
 
+/* ---- the blitter ---- */
+
+/* The engines' registers need the GT awake. We hold it so for good: it
+ * costs some power at idle, and saves taking it around every call. */
+static void forcewake(void)
+{
+    for (int i = 0; i < 50 && (rd(FORCEWAKE_ACK_HSW) & FORCEWAKE_KERNEL); i++)
+        udelay(1000);
+    wr(FORCEWAKE_MT, MASKED_ON(FORCEWAKE_KERNEL));
+    int i = 0;
+    for (; i < 50 && !(rd(FORCEWAKE_ACK_HSW) & FORCEWAKE_KERNEL); i++)
+        udelay(1000);
+    if (i == 50)
+        klog("intel: the GT did not acknowledge forcewake\n");
+    for (i = 0; i < 5000 && (rd(GT_THREAD_STATUS) & 7); i++)
+        udelay(1);
+}
+
+static void ring_stop(void)
+{
+    wr(RING_MI_MODE, MASKED_ON(MODE_STOP_RING));
+    for (int i = 0; i < 1000 && !(rd(RING_MI_MODE) & MODE_IDLE); i++)
+        udelay(10);
+    wr(RING_CTL, 0);
+    wr(RING_HEAD, 0);
+    wr(RING_TAIL, 0);
+}
+
+/* The ring and the status page, in the order Linux's init_ring_common sets them. */
+static int ring_start(void)
+{
+    ring_stop();
+    ig.hws[HWS_SEQNO] = ig.seq;
+    wr(RING_HWSTAM, 0xFFFFFFFFu);       /* no interrupts from status writes */
+    wr(BCS_HWS_PGA, ig.eng_off + HWS_OFF);
+    (void)rd(BCS_HWS_PGA);
+    wr(RING_INSTPM, MASKED_ON(INSTPM_TLB_INVALIDATE | INSTPM_SYNC_FLUSH));
+    for (int i = 0; i < 1000 && (rd(RING_INSTPM) & INSTPM_SYNC_FLUSH); i++)
+        udelay(10);
+    (void)rd(RING_HEAD);
+
+    wr(RING_START, ig.eng_off);
+    wr(RING_HEAD, 0);
+    wr(RING_TAIL, 0);
+    (void)rd(RING_TAIL);
+    wr(RING_CTL, ((RING_SIZE - PAGE_SIZE) & RING_NR_PAGES) | RING_VALID);
+    int ok = 0;
+    for (int i = 0; i < 5000 && !ok; i++) {
+        ok = (rd(RING_CTL) & RING_VALID) && rd(RING_START) == ig.eng_off && !(rd(RING_HEAD) & HEAD_ADDR);
+        if (!ok)
+            udelay(10);
+    }
+    if (!ok) {
+        klog("intel: the blitter's ring did not start: ctl %08x start %08x head %08x\n",
+             rd(RING_CTL), rd(RING_START), rd(RING_HEAD));
+        return -1;
+    }
+    wr(RING_MI_MODE, MASKED_OFF(MODE_STOP_RING));
+    ig.tail = 0;
+    return 0;
+}
+
+/* A surface the blitter reads or writes: GTT address, bytes per line. */
+struct surf {
+    uint32_t addr, pitch, w, h, cpp;
+};
+
+static uint32_t batch[8 + 8 * DISP_MAX_RECTS];
+static uint32_t nbatch;
+
+/* A batch starts by flushing the GTT's TLB, for buffers mapped since. */
+static void begin(void)
+{
+    nbatch = 0;
+    batch[nbatch++] = MI_FLUSH_DW | FLUSH_INVALIDATE_TLB | FLUSH_STORE_INDEX | FLUSH_OP_STOREDW;
+    batch[nbatch++] = HWS_SCRATCH * 4 | FLUSH_USE_GTT;
+    batch[nbatch++] = 0;
+    batch[nbatch++] = MI_NOOP;
+}
+
+static void copy(const struct surf *src, const struct surf *dst, uint32_t sx, uint32_t sy,
+                 uint32_t dx, uint32_t dy, uint32_t w, uint32_t h)
+{
+    uint32_t *c = &batch[nbatch];
+    nbatch += 8;
+    int argb = dst->cpp == 4;
+    c[0] = XY_SRC_COPY_BLT | (argb ? BLT_WRITE_ALPHA | BLT_WRITE_RGB : 0);
+    c[1] = (argb ? BR13_8888 : BR13_565) | ROP_COPY | dst->pitch;
+    c[2] = dy << 16 | dx;
+    c[3] = (dy + h) << 16 | (dx + w);
+    c[4] = dst->addr;
+    c[5] = sy << 16 | sx;
+    c[6] = src->pitch;
+    c[7] = src->addr;
+}
+
+/* Wait for the blitter to write seq; a stuck one is given up on. */
+static int wait_seq(uint32_t seq)
+{
+    for (int i = 0; i < 40000; i++) {   /* 200 ms */
+        if ((int32_t)(ig.hws[HWS_SEQNO] - seq) >= 0)
+            return 0;
+        udelay(5);
+    }
+    klog("intel: the blitter stopped: head %08x tail %08x acthd %08x ctl %08x mode %08x, "
+         "batch %u, done %u; no more acceleration\n", rd(RING_HEAD), rd(RING_TAIL), rd(RING_ACTHD),
+         rd(RING_CTL), rd(RING_MI_MODE), seq, ig.hws[HWS_SEQNO]);
+    ig.accel = ig.gart = 0;
+    return -1;
+}
+
+/* End the batch with a flush that writes its number, run it, wait. */
+static int submit(void)
+{
+    if (!ig.accel)
+        return -1;
+    ig.seq++;
+    batch[nbatch++] = MI_FLUSH_DW | FLUSH_STORE_INDEX | FLUSH_OP_STOREDW;
+    batch[nbatch++] = HWS_SEQNO * 4 | FLUSH_USE_GTT;
+    batch[nbatch++] = ig.seq;
+    batch[nbatch++] = MI_NOOP;
+    uint32_t bytes = nbatch * 4;
+    if (ig.tail + bytes > RING_SIZE) {  /* no room before the end: skip to the start */
+        while (ig.tail < RING_SIZE) {
+            ig.ring[ig.tail / 4] = MI_NOOP;
+            ig.tail += 4;
+        }
+        ig.tail = 0;
+    }
+    for (uint32_t i = 0; i < nbatch; i++)
+        ig.ring[ig.tail / 4 + i] = batch[i];
+    ig.tail = (ig.tail + bytes) % RING_SIZE;
+    __asm__ volatile("sfence" ::: "memory");
+    wr(RING_TAIL, ig.tail);
+    return wait_seq(ig.seq);
+}
+
+static uint32_t pattern(uint32_t i)
+{
+    return 0xFF000000u | (i * 0x9E3779B9u) >> 8;
+}
+
+/* Copy part of a picture in stolen memory to another, and look. */
+static int self_test(void)
+{
+    uint32_t *a = (uint32_t *)ig.test, *b = (uint32_t *)(ig.test + 0x1000);
+    for (uint32_t i = 0; i < TW * TW; i++) {
+        a[i] = pattern(i);
+        b[i] = 0;
+    }
+    struct surf sa = { ig.eng_off + TEST_OFF, TW * 4, TW, TW, 4 }, sb = sa;
+    sb.addr += 0x1000;
+    begin();
+    copy(&sa, &sb, 0, 0, 3, 2, 20, 10);
+    if (submit() < 0)
+        return -1;
+    for (uint32_t y = 0; y < TW; y++) {
+        for (uint32_t x = 0; x < TW; x++) {
+            int in = x >= 3 && x < 23 && y >= 2 && y < 12;
+            uint32_t want = in ? a[(y - 2) * TW + x - 3] : 0;
+            if (b[y * TW + x] != want) {
+                klog("intel: blitter test: pixel (%u,%u) is %08x, not %08x\n", x, y, b[y * TW + x], want);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* The blitter reads a page of ordinary memory through the GTT, then
+ * writes it: the processor's cache and the GPU agree. */
+static int gart_test(void)
+{
+    uint32_t page = pmm_alloc();
+    if (!page)
+        return -1;
+    uint32_t *p = (uint32_t *)page, *a = (uint32_t *)ig.test, *b = (uint32_t *)(ig.test + 0x1000);
+    for (uint32_t i = 0; i < TW * TW; i++) {
+        p[i] = pattern(i * 7);
+        a[i] = pattern(i * 3);
+        b[i] = 0;
+    }
+    uint32_t g = ig.buf_first + BUF_PAGES - 1;
+    ig.gtt[g] = page | PTE_LLC | PTE_VALID;
+    gtt_flush();
+    struct surf sp = { g << 12, TW * 4, TW, TW, 4 }, sa = { ig.eng_off + TEST_OFF, TW * 4, TW, TW, 4 };
+    struct surf sb = sa;
+    sb.addr += 0x1000;
+    int r = -1;
+    begin();
+    copy(&sp, &sb, 0, 0, 0, 0, TW, TW);
+    if (submit() < 0)
+        goto out;
+    for (uint32_t i = 0; i < TW * TW; i++) {
+        if (b[i] != p[i]) {
+            klog("intel: GTT read test: word %u is %08x, not %08x\n", i, b[i], p[i]);
+            goto out;
+        }
+    }
+    begin();
+    copy(&sa, &sp, 0, 0, 0, 0, TW, TW);
+    if (submit() < 0)
+        goto out;
+    for (uint32_t i = 0; i < TW * TW; i++) {
+        if (p[i] != a[i]) {
+            klog("intel: GTT write test: word %u is %08x, not %08x\n", i, p[i], a[i]);
+            goto out;
+        }
+    }
+    r = 0;
+out:
+    ig.gtt[g] = ig.scratch | PTE_LLC | PTE_VALID;
+    gtt_flush();
+    pmm_free(page);
+    return r;
+}
+
+/* Can the blitter draw on the screen's pages? */
+static int screen_ok(void)
+{
+    return (fb.bpp == 16 || fb.bpp == 32) && fb.pitch < 32768 && !(fb.pitch & 3);
+}
+
+/* ---- buffers lent to the GPU ---- */
+
+static struct slot *find_slot(uint32_t handle)
+{
+    if (handle < 1 || handle > MAX_SLOTS)
+        return NULL;
+    struct slot *sl = &ig.slots[handle - 1];
+    return sl->pid && sl->pid == current->pid ? sl : NULL;
+}
+
+static uint32_t slot_gpu(const struct slot *sl)
+{
+    return (ig.buf_first + sl->first) << 12 | sl->offset;
+}
+
+/* Point a slot's GTT pages at its process's memory; -EFAULT if some is not there. */
+static int map_slot(struct slot *sl, uint32_t *pd)
+{
+    for (uint32_t i = 0; i < sl->npages; i++) {
+        uint32_t phys = vmm_translate(pd, sl->va + i * PAGE_SIZE);
+        if (!phys)
+            return -EFAULT;
+        ig.gtt[ig.buf_first + sl->first + i] = (phys & ~0xFFFu) | PTE_LLC | PTE_VALID;
+    }
+    gtt_flush();
+    return 0;
+}
+
+static void unmap_slot(struct slot *sl)
+{
+    for (uint32_t i = 0; i < sl->npages; i++)
+        ig.gtt[ig.buf_first + sl->first + i] = ig.scratch | PTE_LLC | PTE_VALID;
+    gtt_flush();
+    sl->pid = 0;
+}
+
+int intel_mapbuf(struct dispbuf *b)
+{
+    if (!ig.gart)
+        return -ENODEV;
+    if (!b->size || b->size > MAX_BUF || b->addr + b->size < b->addr)
+        return -EINVAL;
+    uint32_t va = b->addr & ~0xFFFu;
+    uint32_t npages = (b->addr + b->size - va + PAGE_SIZE - 1) >> 12;
+    int idx = -1;
+    for (int i = 0; i < MAX_SLOTS && idx < 0; i++)
+        if (!ig.slots[i].pid)
+            idx = i;
+    if (idx < 0)
+        return -ENOMEM;
+    /* the lowest run of GTT pages no slot uses */
+    uint32_t first = 0;
+    for (int moved = 1; moved;) {
+        moved = 0;
+        for (int i = 0; i < MAX_SLOTS; i++) {
+            struct slot *o = &ig.slots[i];
+            if (o->pid && o->first < first + npages && first < o->first + o->npages) {
+                first = o->first + o->npages;
+                moved = 1;
+            }
+        }
+    }
+    if (first + npages > BUF_PAGES)
+        return -ENOMEM;
+    /* Every page present and the process's own (no copy-on-write left),
+     * so the pages stay put while lent (fb_pinned). */
+    for (uint32_t i = 0; i < npages; i++) {
+        uint32_t a = va + i * PAGE_SIZE;
+        if (!vmm_write_ok(current->pd, a) && !vmm_resolve_cow(current->pd, a))
+            return -EFAULT;
+    }
+    struct slot *sl = &ig.slots[idx];
+    *sl = (struct slot){ current->pid, first, npages, va, b->addr & 0xFFF, b->size };
+    if (map_slot(sl, current->pd) < 0) {
+        unmap_slot(sl);
+        return -EFAULT;
+    }
+    b->handle = (uint32_t)idx + 1;
+    b->gpu_lo = slot_gpu(sl);
+    b->gpu_hi = 0;
+    return 0;
+}
+
+int intel_unmapbuf(const struct dispbuf *b)
+{
+    struct slot *sl = find_slot(b->handle);
+    if (!sl)
+        return -EINVAL;
+    unmap_slot(sl);
+    return 0;
+}
+
+int intel_pinned(int pid, uint32_t start, uint32_t end)
+{
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        const struct slot *sl = &ig.slots[i];
+        if (sl->pid && sl->pid == pid && sl->va < end && start < sl->va + sl->npages * PAGE_SIZE)
+            return 1;
+    }
+    return 0;
+}
+
+void intel_proc_exit(int pid)
+{
+    for (int i = 0; i < MAX_SLOTS; i++)
+        if (ig.slots[i].pid && ig.slots[i].pid == pid)
+            unmap_slot(&ig.slots[i]);
+}
+
+/* ---- DISP_COPYRECTS and DISP_BLIT ---- */
+
+static struct surf page_surf_of(uint32_t page)
+{
+    struct surf s = { ig.page0 + page * ig.page_offset, fb.pitch, fb.width, fb.height, fb.bytespp };
+    return s;
+}
+
+/* Clip a rectangle to both surfaces and copy it; nothing if none is left. */
+static void copy_clipped(const struct surf *src, const struct surf *dst, int sx, int sy, int dx, int dy,
+                         int w, int h)
+{
+    if (sx < 0) { w += sx; dx -= sx; sx = 0; }
+    if (sy < 0) { h += sy; dy -= sy; sy = 0; }
+    if (dx < 0) { w += dx; sx -= dx; dx = 0; }
+    if (dy < 0) { h += dy; sy -= dy; dy = 0; }
+    w = MIN(w, MIN((int)src->w - sx, (int)dst->w - dx));
+    h = MIN(h, MIN((int)src->h - sy, (int)dst->h - dy));
+    if (w > 0 && h > 0)
+        copy(src, dst, (uint32_t)sx, (uint32_t)sy, (uint32_t)dx, (uint32_t)dy, (uint32_t)w, (uint32_t)h);
+}
+
+int intel_copy_rects(const struct dispcopy *c)
+{
+    if (!ig.accel || !ig.flip || !screen_ok())
+        return -ENODEV;
+    if (c->from_page > 1 || c->count > DISP_MAX_RECTS)
+        return -EINVAL;
+    struct surf src = page_surf_of(c->from_page), dst = page_surf_of(c->from_page ^ 1);
+    begin();
+    for (uint32_t i = 0; i < c->count; i++) {
+        const struct disprect *q = &c->rects[i];
+        copy_clipped(&src, &dst, q->x, q->y, q->x, q->y, q->w, q->h);
+    }
+    return submit() < 0 ? -EIO : 0;
+}
+
+static int resolve(const struct dispsurf *d, int screen_owner, struct surf *s)
+{
+    if (d->kind == DISP_SURF_PAGE) {
+        if (!screen_owner)
+            return -EPERM;
+        if (d->handle > 1 || (d->handle && !ig.flip) || !screen_ok())
+            return -EINVAL;
+        *s = page_surf_of(d->handle);
+        return 0;
+    }
+    if (d->kind != DISP_SURF_BUFFER)
+        return -ENODEV;             /* no 3D engine's memory here */
+    struct slot *sl = find_slot(d->handle);
+    if (!sl)
+        return -EINVAL;
+    if (!d->width || !d->height || d->width > 8192 || d->height > 8192 || d->pitch >= 32768 ||
+        (d->pitch & 3) || (d->offset & 3) || d->width * 4 > d->pitch ||
+        (uint64_t)d->offset + (uint64_t)d->pitch * d->height > sl->size)
+        return -EINVAL;
+    *s = (struct surf){ slot_gpu(sl) + d->offset, d->pitch, d->width, d->height, 4 };
+    return 0;
+}
+
+/* The blitter copies without converting: both surfaces the same depth. */
+int intel_blit(const struct dispblit *b, int screen_owner)
+{
+    if (!ig.accel)
+        return -ENODEV;
+    if (b->count > DISP_MAX_RECTS)
+        return -EINVAL;
+    struct surf src, dst;
+    int r = resolve(&b->src, screen_owner, &src);
+    if (r == 0)
+        r = resolve(&b->dst, screen_owner, &dst);
+    if (r < 0)
+        return r;
+    if (src.cpp != dst.cpp)
+        return -EINVAL;
+    begin();
+    for (uint32_t i = 0; i < b->count; i++) {
+        const struct dispblitrect *q = &b->rects[i];
+        copy_clipped(&src, &dst, q->sx, q->sy, q->dx, q->dy, q->w, q->h);
+    }
+    return submit() < 0 ? -EIO : 0;
+}
+
 /* ---- the interface to fb.c ---- */
 
 int intel_present(void)
@@ -424,13 +784,40 @@ void intel_info(struct dispinfo *di)
 {
     strlcpy(di->adapter, ig.name, sizeof(di->adapter));
     strlcpy(di->driver, "intel", sizeof(di->driver));
-    di->flags = DISPF_BOOT | (ig.flip ? DISPF_FLIP : 0) | (ig.cursor ? DISPF_CURSOR : 0);
+    di->flags = (ig.native ? 0 : DISPF_BOOT) | (ig.native_ok ? DISPF_NATIVE : 0) |
+                (ig.edid_ok ? DISPF_EDID : 0) | (ig.flip ? DISPF_FLIP : 0) | (ig.cursor ? DISPF_CURSOR : 0) |
+                (ig.accel && ig.flip && screen_ok() ? DISPF_ACCEL : 0) |
+                (ig.gart && fb.bpp == 32 ? DISPF_GART : 0);
     di->pci_id = VENDOR_INTEL | (uint32_t)ig.device << 16;
     di->vram_kb = ig.stolen_size / 1024;
+    di->max_pixclock = ig.max_clock;
     di->boot = ig.boot_mode;
-    di->mode = ig.boot_mode;
+    di->mode = ig.native ? ig.mode : ig.boot_mode;
+    if (ig.edid_ok)
+        memcpy(di->edid, ig.edid, sizeof(di->edid));
     di->screen_bytes = fb.base ? ig.page0 + (ig.flip ? ig.page_offset : 0) + fb.pitch * fb.height : 0;
     di->page_offset = ig.flip ? ig.page_offset : 0;
+}
+
+int intel_modes(struct dispmode *out, int max)
+{
+    return ig.native_ok ? intel_native_modes(out, max) : 0;
+}
+
+int intel_set_mode(const struct dispmode *m)
+{
+    return ig.native_ok ? intel_native_set(m) : -ENODEV;
+}
+
+/* fb changed size: page 0 on show, and the pointer kept on the screen. */
+void intel_screen_changed(void)
+{
+    ig.page = 0;
+    if (ig.cursor) {
+        ig.cur_x = MIN(ig.cur_x, (int)fb.width - 1);
+        ig.cur_y = MIN(ig.cur_y, (int)fb.height - 1);
+        program_cursor();
+    }
 }
 
 /* What fbmap maps: both pages when they are there. */
@@ -496,8 +883,8 @@ void intel_init(void)
         ig.stolen_end -= 1u << 20;      /* keep off the top MiB all the same */
     klog("intel: stolen memory %08x, %u MiB (reserved %08x), GTT %u entries, aperture %08x, %u MiB\n",
          ig.stolen_base, ig.stolen_size >> 20, res, ig.gtt_entries, ig.aper_phys, ig.aper_size >> 20);
-    klog("intel: watermarks %08x %08x %08x, LP %08x %08x %08x\n", rd(wm0_pipe[0]), rd(wm0_pipe[1]),
-         rd(wm0_pipe[2]), rd(WM_LP1), rd(WM_LP1 + 4), rd(WM_LP1 + 8));
+    klog("intel: watermarks %08x %08x %08x, LP %08x %08x %08x\n", rd(WM0_PIPE(0)), rd(WM0_PIPE(1)),
+         rd(WM0_PIPE(2)), rd(WM_LP1), rd(WM_LP1 + 4), rd(WM_LP1 + 8));
     if (fb_boot.base) {
         ig.boot_mode.width = (uint16_t)fb_boot.width;
         ig.boot_mode.height = (uint16_t)fb_boot.height;
@@ -515,7 +902,61 @@ void intel_init(void)
         kprintf("intel: cannot tell which display plane shows the screen\n");
 }
 
+/* The blitter, if it passes its tests. intelgfx.accel=0 skips it. */
+static void accel_init(void)
+{
+    if (!ig.present || !ig.eng_off || cmdline_has("intelgfx.accel=0") || !screen_ok())
+        return;
+    ig.scratch = pmm_alloc();
+    if (!ig.scratch)
+        return;
+    memset((void *)ig.scratch, 0, PAGE_SIZE);
+    ig.buf_first = ALIGN_UP(ig.aper_size, 1u << 20) >> 12;
+    int room = ig.buf_first + BUF_PAGES <= ig.gtt_entries;
+    if (room) {
+        for (uint32_t i = 0; i < BUF_PAGES; i++)
+            ig.gtt[ig.buf_first + i] = ig.scratch | PTE_LLC | PTE_VALID;
+        gtt_flush();
+    }
+    forcewake();
+    if (ring_start() < 0) {
+        kprintf("intel: the blitter did not start, no acceleration\n");
+        return;
+    }
+    ig.accel = 1;
+    if (self_test() < 0) {
+        ig.accel = 0;
+        ring_stop();
+        kprintf("intel: the blitter failed its self-test, no acceleration\n");
+        return;
+    }
+    ig.gart = room && gart_test() == 0;
+    if (!ig.gart && ig.accel)
+        kprintf("intel: the blitter cannot read ordinary memory, it copies between pages only\n");
+    if (!ig.accel) {
+        kprintf("intel: the blitter stopped during its tests, no acceleration\n");
+        return;
+    }
+    boot_ok("%s: blitter running (copy tested%s)", ig.name, ig.gart ? ", reads memory through the GTT" : "");
+}
+
+/* Once the timer runs: native modes, then the blitter. */
+void intel_late_init(void)
+{
+    if (!ig.present)
+        return;
+    intel_modeset_init();
+    accel_init();
+}
+
 /* ---- suspend to RAM ---- */
+
+/* The video BIOS sets the boot loader's mode on waking; a native one is
+ * not set up again (yet), so suspend waits for the BIOS mode. */
+int intel_can_resume(void)
+{
+    return !ig.native;
+}
 
 /* The video BIOS sets the boot loader's mode again on waking (wakeup.S),
  * from page 0 without a pointer: our pages and the pointer go back. */
@@ -531,5 +972,22 @@ void intel_resume(void)
         if (ig.cursor_on)
             cursor_watermarks();
         program_cursor();
+    }
+    if (ig.accel) {
+        /* The GT lost its state; the GTT may have been rewritten. */
+        for (uint32_t i = 0; ig.gart && i < BUF_PAGES; i++)
+            ig.gtt[ig.buf_first + i] = ig.scratch | PTE_LLC | PTE_VALID;
+        for (int i = 0; i < MAX_SLOTS; i++) {
+            struct slot *sl = &ig.slots[i];
+            struct proc *p = sl->pid ? proc_find(sl->pid) : NULL;
+            if (sl->pid && (!p || p->state == P_ZOMBIE || map_slot(sl, p->pd) < 0))
+                unmap_slot(sl);
+        }
+        gtt_flush();
+        forcewake();
+        if (ring_start() < 0) {
+            ig.accel = ig.gart = 0;
+            klog("intel: the blitter did not start again after suspend\n");
+        }
     }
 }

@@ -4,6 +4,7 @@
 
 #include <stdint.h>
 #include "atom.h"
+#include "modes.h"
 #include "pci.h"
 
 #define VENDOR_ATI 0x1002
@@ -53,17 +54,6 @@ enum radeon_family {
 #define ACCEL_VRAM_SIZE  (3u << 20)
 #define VRAM_MAP_END     (ACCEL_VRAM_OFF + ACCEL_VRAM_SIZE)
 
-/* A display timing, as in the VESA DMT and EDID detailed timings. */
-#define NHSYNC 0x1
-#define NVSYNC 0x2
-
-struct timing {
-    uint16_t w, h, refresh;
-    uint32_t clock;                 /* kHz */
-    uint16_t hfp, hsync, hbp;
-    uint16_t vfp, vsync, vbp;
-    uint8_t flags;
-};
 
 struct radeon {
     int present;

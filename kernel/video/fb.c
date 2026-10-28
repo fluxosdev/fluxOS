@@ -303,6 +303,7 @@ void fb_proc_exit(int pid)
     mutex_lock(&display_mutex);
     voodoo_proc_exit(pid);
     radeon_proc_exit(pid);
+    intel_proc_exit(pid);
     if (fb_owner && pid == fb_owner) {
         fb_owner = 0;
         release_screen();
@@ -316,7 +317,7 @@ void fb_proc_exit(int pid)
 int fb_pinned(int pid, uint32_t start, uint32_t end)
 {
     mutex_lock(&display_mutex);
-    int r = radeon_pinned(pid, start, end);
+    int r = radeon_pinned(pid, start, end) || intel_pinned(pid, start, end);
     mutex_unlock(&display_mutex);
     return r;
 }
@@ -391,7 +392,7 @@ static int set_mode(struct dispmode *m)
     console_lock_take();
     switching = 1;
     console_lock_give();
-    int r = voodoo_present() ? voodoo_set_mode(m) : radeon_set_mode(m);
+    int r = voodoo_present() ? voodoo_set_mode(m) : intel_present() ? intel_set_mode(m) : radeon_set_mode(m);
     console_lock_take();
     switching = 0;
     if (fb_console_active())
@@ -427,9 +428,11 @@ static int display_op(int op, void *arg)
     case DISP_MODES:
         if (voodoo_present())
             return voodoo_modes(arg, DISP_MAX_MODES);
+        if (intel_present())
+            return intel_modes(arg, DISP_MAX_MODES);
         return radeon_present() ? radeon_modes(arg, DISP_MAX_MODES) : 0;
     case DISP_SETMODE: {
-        if (!voodoo_present() && !radeon_present())
+        if (!voodoo_present() && !radeon_present() && !intel_present())
             return -ENODEV;
         /* Only the process that has the screen, or anyone while the console does. */
         if (fb_owner && fb_owner != current->pid) {
@@ -467,16 +470,22 @@ static int display_op(int op, void *arg)
         return intel_present() ? intel_cursor_pos(&pos) : radeon_cursor_pos(&pos);
     }
     case DISP_COPYRECTS:
-        if (!radeon_present())
+        if (!radeon_present() && !intel_present())
             return -ENODEV;
         if (!screen_owner())
             return -EPERM;
-        return radeon_copy_rects(arg);
+        return intel_present() ? intel_copy_rects(arg) : radeon_copy_rects(arg);
     case DISP_MAPBUF:
+        if (intel_present())
+            return intel_mapbuf(arg);
         return radeon_present() ? radeon_mapbuf(arg) : -ENODEV;
     case DISP_UNMAPBUF:
+        if (intel_present())
+            return intel_unmapbuf(arg);
         return radeon_present() ? radeon_unmapbuf(arg) : -ENODEV;
     case DISP_BLIT:
+        if (intel_present())
+            return intel_blit(arg, screen_owner());
         return radeon_present() ? radeon_blit(arg, screen_owner()) : -ENODEV;
     case DISP_SUBMIT:
         return radeon_present() ? radeon_submit_user(arg) : -ENODEV;
@@ -494,7 +503,8 @@ static int display_op(int op, void *arg)
  */
 int fb_wake_mode(void)
 {
-    if (voodoo_present() || (radeon_present() && !radeon_can_resume()))
+    if (voodoo_present() || (radeon_present() && !radeon_can_resume()) ||
+        (intel_present() && !intel_can_resume()))
         return -1;
     if (!fb.base)
         return 0;

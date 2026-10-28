@@ -20,6 +20,7 @@
 #include "kernel.h"
 #include "drivers.h"
 #include "mm.h"
+#include "modes.h"
 #include "radeon.h"
 #include "x86.h"
 
@@ -148,51 +149,6 @@ struct dig_tx_args { uint16_t clock; uint8_t config, action, reserved[4]; } PACK
 struct crtc_src_args { uint8_t crtc, v1_device_v2_encoder, v2_encode_mode, pad; } PACKED;
 struct yuv_args { uint8_t enable, crtc, pad[2]; } PACKED;
 
-/* VESA DMT timings, and common wide ones (CEA, CVT). */
-static const struct timing dmt[] = {
-    { 640, 480, 60, 25175, 16, 96, 48, 10, 2, 33, NHSYNC | NVSYNC },
-    { 640, 480, 72, 31500, 24, 40, 128, 9, 3, 28, NHSYNC | NVSYNC },
-    { 640, 480, 75, 31500, 16, 64, 120, 1, 3, 16, NHSYNC | NVSYNC },
-    { 640, 480, 85, 36000, 56, 56, 80, 1, 3, 25, NHSYNC | NVSYNC },
-    { 800, 600, 56, 36000, 24, 72, 128, 1, 2, 22, 0 },
-    { 800, 600, 60, 40000, 40, 128, 88, 1, 4, 23, 0 },
-    { 800, 600, 72, 50000, 56, 120, 64, 37, 6, 23, 0 },
-    { 800, 600, 75, 49500, 16, 80, 160, 1, 3, 21, 0 },
-    { 800, 600, 85, 56250, 32, 64, 152, 1, 3, 27, 0 },
-    { 1024, 768, 60, 65000, 24, 136, 160, 3, 6, 29, NHSYNC | NVSYNC },
-    { 1024, 768, 70, 75000, 24, 136, 144, 3, 6, 29, NHSYNC | NVSYNC },
-    { 1024, 768, 75, 78750, 16, 96, 176, 1, 3, 28, 0 },
-    { 1024, 768, 85, 94500, 48, 96, 208, 1, 3, 36, 0 },
-    { 1152, 864, 75, 108000, 64, 128, 256, 1, 3, 32, 0 },
-    { 1280, 720, 60, 74250, 110, 40, 220, 5, 5, 20, 0 },
-    { 1280, 800, 60, 83500, 72, 128, 200, 3, 6, 22, NHSYNC },
-    { 1280, 960, 60, 108000, 96, 112, 312, 1, 3, 36, 0 },
-    { 1280, 960, 85, 148500, 64, 160, 224, 1, 3, 47, 0 },
-    { 1280, 1024, 60, 108000, 48, 112, 248, 1, 3, 38, 0 },
-    { 1280, 1024, 75, 135000, 16, 144, 248, 1, 3, 38, 0 },
-    { 1280, 1024, 85, 157500, 64, 160, 224, 1, 3, 44, 0 },
-    { 1360, 768, 60, 85500, 64, 112, 256, 3, 6, 18, 0 },
-    { 1366, 768, 60, 85500, 70, 143, 213, 3, 3, 24, 0 },
-    { 1440, 900, 60, 106500, 80, 152, 232, 3, 6, 25, NHSYNC },
-    { 1600, 900, 60, 108000, 24, 80, 96, 1, 3, 96, 0 },
-    { 1600, 1200, 60, 162000, 64, 192, 304, 1, 3, 46, 0 },
-    { 1600, 1200, 75, 202500, 64, 192, 304, 1, 3, 46, 0 },
-    { 1600, 1200, 85, 229500, 64, 192, 304, 1, 3, 46, 0 },
-    { 1680, 1050, 60, 146250, 104, 176, 280, 3, 6, 30, NHSYNC },
-    { 1920, 1080, 60, 148500, 88, 44, 148, 4, 5, 36, 0 },
-    { 1920, 1200, 60, 154000, 48, 32, 80, 3, 6, 26, NVSYNC },
-    { 2560, 1600, 60, 268500, 48, 32, 80, 3, 6, 37, NVSYNC },
-};
-#define NDMT ((int)ARRAY_SIZE(dmt))
-
-/* EDID established timings, bytes 35-37 from the top bit down. */
-static const struct { uint16_t w, h, refresh; } established[17] = {
-    { 720, 400, 70 }, { 720, 400, 88 }, { 640, 480, 60 }, { 640, 480, 67 },
-    { 640, 480, 72 }, { 640, 480, 75 }, { 800, 600, 56 }, { 800, 600, 60 },
-    { 800, 600, 72 }, { 800, 600, 75 }, { 832, 624, 75 }, { 1024, 768, 87 },
-    { 1024, 768, 60 }, { 1024, 768, 70 }, { 1024, 768, 75 }, { 1280, 1024, 75 },
-    { 1152, 870, 75 },
-};
 
 /* A pixel PLL's limits; frequencies in 10 kHz. */
 struct pll {
@@ -229,9 +185,7 @@ static uint32_t max_pixclock;       /* kHz, from the BIOS */
 static int crtc_id;                 /* the controller we drive; its PLL has the same number */
 static int tx_initialised;
 
-static struct timing modes[DISP_MAX_MODES];
-static int nmodes;
-static int preferred = -1;          /* the EDID's first detailed timing, in modes[] */
+static struct modelist ml;
 static struct timing boot_timing;
 static int boot_timing_ok;
 
@@ -617,9 +571,6 @@ static int read_edid(void)
 
 /* ---- the mode list ---- */
 
-static uint32_t htotal(const struct timing *t) { return (uint32_t)t->w + t->hfp + t->hsync + t->hbp; }
-static uint32_t vtotal(const struct timing *t) { return (uint32_t)t->h + t->vfp + t->vsync + t->vbp; }
-
 static uint32_t pitch_pixels(uint32_t w, int bpp)
 {
     return ALIGN_UP(w, bpp == 16 ? 128u : 64u);
@@ -632,163 +583,15 @@ static int fits(const struct timing *t)
     return rv.page0 + 2 * page <= CURSOR_VRAM_OFF;
 }
 
-static struct {
-    int ok;
-    uint32_t vmin, vmax, hmin, hmax, clock;     /* Hz, kHz, kHz */
-} range;
-
-static int allowed(const struct timing *t)
+/* What the card can show: under the clock limit, both pages below the pointer. */
+static int mode_fits(const struct timing *t)
 {
-    if (t->clock > rv.max_clock || !fits(t))
-        return 0;
-    if (range.ok) {
-        uint32_t hz = t->clock * 1000 / htotal(t) / 1000;       /* line rate, kHz */
-        if (t->refresh < range.vmin || t->refresh > range.vmax || hz + 1 < range.hmin ||
-            hz > range.hmax + 1 || (range.clock && t->clock > range.clock))
-            return 0;
-    }
-    return 1;
-}
-
-static void add_mode(const struct timing *t)
-{
-    if (!allowed(t))
-        return;
-    for (int i = 0; i < nmodes; i++)
-        if (modes[i].w == t->w && modes[i].h == t->h && modes[i].refresh == t->refresh)
-            return;
-    if (nmodes < DISP_MAX_MODES)
-        modes[nmodes++] = *t;
-}
-
-static void add_dmt(int w, int h, int refresh)
-{
-    for (int i = 0; i < NDMT; i++)
-        if (dmt[i].w == w && dmt[i].h == h && dmt[i].refresh == refresh)
-            add_mode(&dmt[i]);
-}
-
-/* An EDID detailed timing descriptor; returns 0 if it is none we can use. */
-static int parse_dtd(const uint8_t *b, struct timing *t)
-{
-    uint32_t clock = (uint32_t)(b[0] | b[1] << 8) * 10;
-    if (!clock || (b[17] & 0x80))
-        return 0;                   /* a descriptor, or interlaced */
-    uint32_t hact = b[2] | (b[4] >> 4) << 8, hblank = b[3] | (b[4] & 15) << 8;
-    uint32_t vact = b[5] | (b[7] >> 4) << 8, vblank = b[6] | (b[7] & 15) << 8;
-    uint32_t hso = b[8] | ((b[11] >> 6) & 3) << 8, hsw = b[9] | ((b[11] >> 4) & 3) << 8;
-    uint32_t vso = (b[10] >> 4) | ((b[11] >> 2) & 3) << 4, vsw = (b[10] & 15) | (b[11] & 3) << 4;
-    if (!hact || !vact || hso + hsw >= hblank || vso + vsw >= vblank)
-        return 0;
-    memset(t, 0, sizeof(*t));
-    t->w = (uint16_t)hact;
-    t->h = (uint16_t)vact;
-    t->clock = clock;
-    t->hfp = (uint16_t)hso;
-    t->hsync = (uint16_t)hsw;
-    t->hbp = (uint16_t)(hblank - hso - hsw);
-    t->vfp = (uint16_t)vso;
-    t->vsync = (uint16_t)vsw;
-    t->vbp = (uint16_t)(vblank - vso - vsw);
-    if ((b[17] & 0x18) == 0x18) {   /* digital separate sync: the polarities */
-        if (!(b[17] & 0x04))
-            t->flags |= NVSYNC;
-        if (!(b[17] & 0x02))
-            t->flags |= NHSYNC;
-    }
-    t->refresh = (uint16_t)((clock * 1000 + htotal(t) * vtotal(t) / 2) / (htotal(t) * vtotal(t)));
-    return 1;
-}
-
-static void sort_modes(void)
-{
-    for (int i = 1; i < nmodes; i++) {
-        for (int j = i; j > 0; j--) {
-            struct timing *a = &modes[j - 1], *b = &modes[j];
-            uint32_t pa = (uint32_t)a->w * a->h, pb = (uint32_t)b->w * b->h;
-            if (pa < pb || (pa == pb && (a->w < b->w || (a->w == b->w && a->refresh <= b->refresh))))
-                break;
-            struct timing tmp = *a;
-            *a = *b;
-            *b = tmp;
-            if (preferred == j)
-                preferred = j - 1;
-            else if (preferred == j - 1)
-                preferred = j;
-        }
-    }
-}
-
-static void build_modes(void)
-{
-    const uint8_t *e = rv.edid;
-    nmodes = 0;
-    preferred = -1;
-    memset(&range, 0, sizeof(range));
-    if (rv.edid_ok) {
-        for (int k = 0; k < 4; k++) {
-            const uint8_t *b = e + 54 + 18 * k;
-            if (!b[0] && !b[1] && b[3] == 0xFD) {
-                range.ok = 1;
-                range.vmin = b[5];
-                range.vmax = b[6];
-                range.hmin = b[7];
-                range.hmax = b[8];
-                range.clock = (uint32_t)b[9] * 10000;
-            }
-        }
-        for (int k = 0; k < 4; k++) {
-            struct timing t;
-            if (parse_dtd(e + 54 + 18 * k, &t)) {
-                int before = nmodes;
-                add_mode(&t);
-                if (k == 0 && nmodes > before)
-                    preferred = before;
-            }
-        }
-        uint32_t est = (uint32_t)e[35] << 9 | (uint32_t)e[36] << 1 | e[37] >> 7;
-        for (int i = 0; i < 17; i++)
-            if (est & (1u << (16 - i)))
-                add_dmt(established[i].w, established[i].h, established[i].refresh);
-        for (int i = 0; i < 8; i++) {
-            uint8_t b0 = e[38 + 2 * i], b1 = e[39 + 2 * i];
-            if ((b0 == 1 && b1 == 1) || !b0)
-                continue;
-            int w = (b0 + 31) * 8, h;
-            switch (b1 >> 6) {
-            case 0: h = e[18] == 1 && e[19] < 3 ? w : w * 10 / 16; break;
-            case 1: h = w * 3 / 4; break;
-            case 2: h = w * 4 / 5; break;
-            default: h = w * 9 / 16; break;
-            }
-            add_dmt(w, h, (b1 & 63) + 60);
-        }
-    } else {
-        /* No EDID: the common rates of the DMT list, up to 1600 x 1200. */
-        for (int i = 0; i < NDMT; i++)
-            if (dmt[i].refresh <= 75 && dmt[i].w <= 1600 && dmt[i].h <= 1200)
-                add_mode(&dmt[i]);
-    }
-    sort_modes();
-}
-
-static void fill_dispmode(struct dispmode *m, const struct timing *t, int bpp)
-{
-    memset(m, 0, sizeof(*m));
-    m->width = t->w;
-    m->height = t->h;
-    m->bpp = (uint16_t)bpp;
-    m->refresh = t->refresh;
-    m->pixclock = t->clock;
-    m->hfreq = t->clock * 1000 / htotal(t);
+    return t->clock <= rv.max_clock && fits(t);
 }
 
 int radeon_native_modes(struct dispmode *outm, int max)
 {
-    int n = 0;
-    for (int i = 0; i < nmodes && n < max; i++)
-        fill_dispmode(&outm[n++], &modes[i], 0);
-    return n;
+    return modes_list(&ml, outm, max);
 }
 
 /* The BIOS mode's timing: its totals from the controller, its refresh rate
@@ -806,11 +609,11 @@ static void find_boot_timing(void)
     const struct timing *best = NULL;
     uint32_t best_err = ~0u;
     for (int pass = 0; pass < 2 && !best; pass++) {
-        for (int i = 0; i < NDMT + nmodes; i++) {
-            const struct timing *t = i < NDMT ? &dmt[i] : &modes[i - NDMT];
+        for (int i = 0; i < ndmt_modes + ml.n; i++) {
+            const struct timing *t = i < ndmt_modes ? &dmt_modes[i] : &ml.modes[i - ndmt_modes];
             if (t->w != fb_boot.width || t->h != fb_boot.height)
                 continue;
-            if (pass == 0 && (htotal(t) != ht || vtotal(t) != vt))
+            if (pass == 0 && (timing_htotal(t) != ht || timing_vtotal(t) != vt))
                 continue;
             uint32_t err = t->refresh > refresh ? t->refresh - refresh : refresh - t->refresh;
             if (err < best_err) {
@@ -825,7 +628,7 @@ static void find_boot_timing(void)
         boot_timing_ok = 1;
         rv.boot_mode.refresh = best->refresh;
         rv.boot_mode.pixclock = best->clock;
-        rv.boot_mode.hfreq = best->clock * 1000 / htotal(best);
+        rv.boot_mode.hfreq = best->clock * 1000 / timing_htotal(best);
     }
 }
 
@@ -1080,9 +883,9 @@ static void set_timing(const struct timing *t)
     struct dtd_args a;
     memset(&a, 0, sizeof(a));
     a.h_size = t->w;
-    a.h_blank = (uint16_t)(htotal(t) - t->w);
+    a.h_blank = (uint16_t)(timing_htotal(t) - t->w);
     a.v_size = t->h;
-    a.v_blank = (uint16_t)(vtotal(t) - t->h);
+    a.v_blank = (uint16_t)(timing_vtotal(t) - t->h);
     a.h_sync_off = t->hfp;
     a.h_sync_w = t->hsync;
     a.v_sync_off = t->vfp;
@@ -1326,28 +1129,6 @@ static void use_native_fb(const struct timing *t, int bpp, uint32_t pitch_px)
     }
 }
 
-static const struct timing *find_mode(int w, int h, int refresh)
-{
-    const struct timing *best = NULL;
-    for (int i = 0; i < nmodes; i++) {
-        const struct timing *t = &modes[i];
-        if (t->w != w || t->h != h)
-            continue;
-        if (refresh && t->refresh == refresh)
-            return t;
-        if (!refresh) {
-            /* No rate asked for: the EDID's preferred timing, or nearest 60 Hz. */
-            if (i == preferred)
-                return t;
-            int d = t->refresh > 60 ? t->refresh - 60 : 60 - t->refresh;
-            int bd = best ? (best->refresh > 60 ? best->refresh - 60 : 60 - best->refresh) : 1 << 30;
-            if (d < bd)
-                best = t;
-        }
-    }
-    return best;
-}
-
 static int busy;
 
 int radeon_native_set(const struct dispmode *m)
@@ -1367,7 +1148,7 @@ int radeon_native_set(const struct dispmode *m)
     } else {
         if (m->bpp != 16 && m->bpp != 32)
             return -EINVAL;
-        const struct timing *t = find_mode(m->width, m->height, m->refresh);
+        const struct timing *t = modes_find(&ml, m->width, m->height, m->refresh);
         if (!t)
             return -EINVAL;
         uint32_t pitch_px = pitch_pixels(t->w, m->bpp);
@@ -1376,7 +1157,7 @@ int radeon_native_set(const struct dispmode *m)
         if (program_mode(t, m->bpp, pitch_px) < 0)
             klog("radeon: the BIOS could not set the pixel clock\n");
         use_native_fb(t, m->bpp, pitch_px);
-        fill_dispmode(&rv.mode, t, m->bpp);
+        timing_dispmode(&rv.mode, t, m->bpp);
         rv.native = 1;
     }
     rv.page_size = fb.size;
@@ -1428,16 +1209,17 @@ void radeon_modeset_init(void)
     rv.max_clock = is_dac() ? max_pixclock : dual_link_connector() ? 330000 : 165000;
     rv.max_clock = MIN(rv.max_clock, max_pixclock);
     rv.edid_ok = read_edid();
-    build_modes();
+    ml.fits = mode_fits;
+    modes_build(&ml, rv.edid_ok ? rv.edid : NULL);
     find_boot_timing();
     if (boot_timing_ok) {
-        add_mode(&boot_timing);
-        sort_modes();
+        modes_add(&ml, &boot_timing);
+        modes_sort(&ml);
     }
-    if (!nmodes)
+    if (!ml.n)
         return;
     rv.native_ok = 1;
-    boot_ok("%s: AtomBIOS %s, %s output, %d modes%s", rv.name, atom.name, output_name(), nmodes,
+    boot_ok("%s: AtomBIOS %s, %s output, %d modes%s", rv.name, atom.name, output_name(), ml.n,
             rv.edid_ok ? " from the monitor's EDID" : "");
 
     struct dispmode m;
@@ -1535,7 +1317,7 @@ void radeon_modeset_probe(void)
              out.encoder, out.i2c_id, rv.edid_ok ? "EDID read" : "no EDID on its DDC line");
         if (rv.edid_ok) {
             struct timing t;
-            if (parse_dtd(rv.edid + 54, &t))
+            if (edid_parse_dtd(rv.edid + 54, &t))
                 klog("radeon: EDID preferred %ux%u at %u Hz, %u kHz\n", t.w, t.h, t.refresh, t.clock);
         }
     } else {

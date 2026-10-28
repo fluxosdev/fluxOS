@@ -138,6 +138,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     acpi_init();                        /* times its waits with the PIT */
     smp_init();
     radeon_late_init();
+    intel_late_init();
     tty_init();
     keyboard_init();
     serial_enable_irq();

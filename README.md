@@ -150,8 +150,13 @@ stops at boot and says why.
   - **Intel HD Graphics of Haswell processors** (HD 4600, 4400, 4200, 5000,
     Iris 5100, Iris Pro 5200): page flipping at vblank and the hardware
     pointer in the boot loader's mode. The second page lives in the stolen
-    memory the BIOS gives the GPU, mapped through its GTT. No native modes or
-    3D yet (see *Work in progress*). `intelgfx=off`.
+    memory the BIOS gives the GPU, mapped through its GTT. The blitter (the
+    GPU's 2D copy engine, self-tested at boot) copies between the pages and
+    from the desktop's back buffer in RAM, which the GTT maps for it. On the
+    VGA output (pipe A, FDI to the 8-series chipset's DAC), modes of its own
+    from the monitor's EDID (read over GMBUS), up to about 171 MHz. No 3D
+    yet, and native modes only on VGA (see *Work in progress*).
+    `video=...`, `intelgfx.modeset=0`, `intelgfx.accel=0`, `intelgfx=off`.
 - Sound:
   - PC speaker (`/dev/speaker`) with background tone queue.
   - **Sound Blaster 16**: `/dev/dsp` (OSS-style, 8/16-bit, mono/stereo, 5-44.1
@@ -648,7 +653,8 @@ kernel/usb/                usb core, hid/hub/msc, uhci/ohci/ehci/xhci
 kernel/input/              input, keyboard, mouse, touchpad
 kernel/net/                net/tcp/socket, ne2000, forcedeth/mii, e1000e
 kernel/sound/              pcspkr, sb16/opl/isadma, hda
-kernel/video/              fb/vga, the startup screen (splash.c), voodoo, radeon*, atom, intel
+kernel/video/              fb/vga, the startup screen (splash.c), voodoo, radeon*, atom, intel*,
+                           modes (EDID mode lists)
 user/libc, user/include    the C library (math.c is the x87 math library; http.c and
                            inflate.c are the HTTP/1.1 client and Deflate) and headers
 user/gl/                   the OpenGL library and its backends
@@ -808,8 +814,10 @@ user range and page tables first.
   channel. `radeon_modeset_probe()` logs what the video BIOS says the outputs
   are (`dmesg | grep radeon`). After that, 3D: Sumo's own microcode
   (SUMO_pfp, SUMO_me, SUMO_rlc) and Evergreen's shader instruction set.
-- **The Intel HD Graphics driver (Haswell) is partial:** page flipping and the
-  hardware pointer in the boot loader's mode. `dmesg | grep intel` shows the
+- **The Intel HD Graphics driver (Haswell) is partial:** page flipping, the
+  hardware pointer and blitter copies; native modes only on the VGA output
+  (DisplayPort and HDMI keep the boot loader's mode), and suspend to RAM
+  only in the BIOS mode. `dmesg | grep intel` shows the
   planes, stolen memory and watermarks it found. Native modes need the DDI
   ports, their PLLs and DisplayPort link training.
 
