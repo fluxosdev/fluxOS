@@ -566,9 +566,14 @@ The QEMU targets emulate a Pentium III (`QEMU_CPU=-cpu pentium3`), so
 anything newer that slipped into the build would show up there. `make run
 QEMU_NET="-nic user,model=ne2k_pci -device intel-hda -device hda-duplex"` adds
 HD Audio. To boot real hardware or another VM, write
-`fluxOS.iso` to a USB stick or attach it as a CD-ROM and boot in **legacy
-BIOS** mode (UEFI is untested), then install (below). On the installed disk
-the default entry starts the desktop at 1024x768; **fluxOS (text console)**
+`fluxOS.iso` to a USB stick as a raw image (**DD Image mode** in Rufus), or
+attach it as a CD-ROM, and boot in **legacy BIOS** mode, then install
+(below). The ISO does not include a UEFI bootloader. Writing the raw image
+erases the USB stick and preserves the bundled GRUB core and matching modules.
+Rufus's ISO Image mode can substitute an incompatible GRUB core. The kernel
+uses one contiguous ELF load segment to avoid GRUB relocator free-list
+corruption between adjacent segments on some BIOS memory layouts.
+On the installed disk the default entry starts the desktop at 1024x768; **fluxOS (text console)**
 boots to the shell. In QEMU the mouse needs no grabbing; elsewhere click into
 the VM window.
 
