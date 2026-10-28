@@ -49,6 +49,8 @@
 
 enum page { PAGE_BACKGROUND, PAGE_APPEARANCE, PAGE_SAVER, PAGE_SETTINGS, PAGE_MONITOR, PAGE_COUNT };
 enum driver { DRV_STANDARD, DRV_NATIVE, DRV_RADEON };    /* DRV_RADEON: or Intel's */
+/* The rows of the display driver list; the last two are both DRV_RADEON. */
+enum { DROW_VGA, DROW_VOODOO, DROW_RADEON, DROW_INTEL, DRIVER_ROWS };
 
 /* Controls, in Tab order. */
 enum ctl {
@@ -425,7 +427,7 @@ static struct rect ctl_rect(enum ctl k)
     case K_BROWSE: return mkrect(298, 190, 90, 23);
     case K_WALLMODE: return mkrect(78, 302, 150, 21);
     case K_COLOR: return mkrect(290, 302, 72, 21);
-    case K_DRIVER: return mkrect(24, 206, 360, 54);
+    case K_DRIVER: return mkrect(116, 210, 180, 21);
     case K_COLORS: return mkrect(24, 300, 162, 21);
     case K_AREA: return mkrect(250, 288, 96, 26);
     case K_REFRESH: return mkrect(116, 353, 130, 21);
@@ -462,7 +464,6 @@ static int on_page(struct dprops *d, enum ctl k)
 static int ctl_enabled(struct dprops *d, enum ctl k)
 {
     switch (k) {
-    case K_DRIVER: return d->native_ok || d->radeon_ok;
     case K_COLORS: case K_AREA: return mode_controls_enabled(d);
     case K_REFRESH: return own_modes(d) && d->nrates > 1;
     case K_COLOR: return d->wall_sel == 0;      /* only with no picture */
@@ -472,15 +473,33 @@ static int ctl_enabled(struct dprops *d, enum ctl k)
     }
 }
 
-static struct rect radio_rect(int i)
+static int is_intel(struct dprops *d)
 {
-    return mkrect(26, 209 + 18 * i, 340, 14);
+    return !strcmp(d->di.driver, "intel");
 }
 
-/* Is driver choice i (an enum driver) there to pick? */
-static int driver_ok(struct dprops *d, int i)
+/* Can row i of a drop-down list be chosen? All can but the drivers for
+ * adapters that are not there. */
+static int item_ok(struct dprops *d, enum ctl k, int i)
 {
-    return i == DRV_STANDARD || (i == DRV_NATIVE && d->native_ok) || (i == DRV_RADEON && d->radeon_ok);
+    if (k != K_DRIVER)
+        return 1;
+    switch (i) {
+    case DROW_VGA: return 1;
+    case DROW_VOODOO: return d->native_ok;
+    case DROW_RADEON: return d->radeon_ok && !is_intel(d);
+    case DROW_INTEL: return d->radeon_ok && is_intel(d);
+    default: return 0;
+    }
+}
+
+/* The next row from i in direction dir that can be chosen, or -1. */
+static int next_item(struct dprops *d, enum ctl k, int i, int dir, int n)
+{
+    for (i += dir; i >= 0 && i < n; i += dir)
+        if (item_ok(d, k, i))
+            return i;
+    return -1;
 }
 
 /* The rows of a drop-down list, in rows[] (up to 8); returns how many, and the chosen one. */
@@ -488,6 +507,14 @@ static int combo_items(struct dprops *d, enum ctl k, char rows[][48], int *chose
 {
     *chosen = 0;
     switch (k) {
+    case K_DRIVER:
+        snprintf(rows[DROW_VGA], 48, "Standard VGA");
+        snprintf(rows[DROW_VOODOO], 48, "3dfx Voodoo%s", item_ok(d, k, DROW_VOODOO) ? "" : " (not found)");
+        snprintf(rows[DROW_RADEON], 48, "ATI Radeon%s", item_ok(d, k, DROW_RADEON) ? "" : " (not found)");
+        snprintf(rows[DROW_INTEL], 48, "Intel HD Graphics%s", item_ok(d, k, DROW_INTEL) ? "" : " (not found)");
+        *chosen = d->driver == DRV_STANDARD ? DROW_VGA : d->driver == DRV_NATIVE ? DROW_VOODOO
+                  : is_intel(d) ? DROW_INTEL : DROW_RADEON;
+        return DRIVER_ROWS;
     case K_COLORS:
         snprintf(rows[0], 48, "High Color (16 bit)");
         snprintf(rows[1], 48, "True Color (32 bit)");
@@ -562,6 +589,11 @@ static struct rect list_rect(struct dprops *d, enum ctl k)
 static void choose_item(struct dprops *d, enum ctl k, int i)
 {
     switch (k) {
+    case K_DRIVER:
+        if (!item_ok(d, k, i))
+            return;
+        d->driver = i == DROW_VGA ? DRV_STANDARD : i == DROW_VOODOO ? DRV_NATIVE : DRV_RADEON;
+        break;
     case K_COLORS:
         d->bpp = i ? 32 : 16;
         break;
@@ -815,10 +847,11 @@ static void draw_list(struct dprops *d, struct surface *s, enum ctl k)
     int hot = d->hover >= 0 ? d->hover : chosen;
     for (int i = 0; i < n; i++) {
         struct rect row = mkrect(l.x + 1, l.y + 1 + i * ITEM_H, l.w - 2, ITEM_H);
-        if (i == hot)
+        int ok = item_ok(d, k, i);
+        if (i == hot && ok)
             gfx_fill(s, row.x, row.y, row.w, row.h, C_NAVY);
         gfx_text(s, &font_sans, row.x + 3, row.y + (ITEM_H - font_sans.height) / 2, rows[i],
-                 i == hot ? C_WHITE : C_BLACK);
+                 !ok ? C_SHADOW : i == hot ? C_WHITE : C_BLACK);
     }
 }
 
@@ -950,31 +983,19 @@ static void settings_page(struct dprops *d, struct surface *s)
     gfx_text(s, &font_sans_bold, 116, 172, buf, C_BLACK);
 
     draw_group(s, mkrect(14, 194, 376, 72), "Display driver");
-    int focus_drv = d->focus == K_DRIVER;
-    draw_radio(s, radio_rect(0).x, radio_rect(0).y, "Standard VGA: keep the mode the BIOS sets at startup",
-               d->driver == DRV_STANDARD, focus_drv && d->driver == DRV_STANDARD);
-    if (d->native_ok) {
-        snprintf(buf, sizeof(buf), "%s driver: set modes, 3D acceleration", d->di.adapter);
-        draw_radio(s, radio_rect(1).x, radio_rect(1).y, buf, d->driver == DRV_NATIVE,
-                   focus_drv && d->driver == DRV_NATIVE);
-    } else {
-        gfx_text(s, &font_sans, 44, radio_rect(1).y - 1, "No 3dfx Voodoo card was found.", C_SHADOW);
-    }
-    if (d->radeon_ok) {
-        const char *name = !strcmp(d->di.driver, "intel") ? "Intel graphics" : "ATI Radeon";
-        snprintf(buf, sizeof(buf), d->radeon_modes ? "%s driver: set modes, no tearing"
-                                                   : "%s driver: no tearing, hardware pointer", name);
-        draw_radio(s, radio_rect(2).x, radio_rect(2).y, buf,
-                   d->driver == DRV_RADEON, focus_drv && d->driver == DRV_RADEON);
-    } else {
-        gfx_text(s, &font_sans, 44, radio_rect(2).y - 1, "No ATI Radeon or Intel graphics was found.",
-                 C_SHADOW);
-    }
+    char rows[8][48];
+    int chosen;
+    gfx_text(s, &font_sans, 26, 214, "Driver:", C_BLACK);
+    combo_items(d, K_DRIVER, rows, &chosen);
+    draw_combo(s, ctl_rect(K_DRIVER), rows[chosen], 1, d->focus == K_DRIVER, d->open == K_DRIVER);
+    const char *what = d->driver == DRV_STANDARD ? "Keeps the mode the BIOS sets at startup."
+                       : d->driver == DRV_NATIVE ? "Sets modes of its own, with 3D acceleration."
+                       : d->radeon_modes ? "Sets modes of its own, and draws without tearing."
+                       : "Draws without tearing, with a hardware pointer, in the BIOS mode.";
+    gfx_text_wrap(s, &font_sans, 26, 240, 356, what, C_BLACK);
 
     int on = mode_controls_enabled(d);
     draw_group(s, mkrect(14, 280, 182, 62), "Color palette");
-    char rows[8][48];
-    int chosen;
     combo_items(d, K_COLORS, rows, &chosen);
     draw_combo(s, ctl_rect(K_COLORS), rows[chosen], on, d->focus == K_COLORS, d->open == K_COLORS);
 
@@ -1691,16 +1712,6 @@ static void step(struct dprops *d, int dir)
     case K_WALL:
         wall_select(d, d->wall_sel + dir);
         break;
-    case K_DRIVER: {
-        int i = (int)d->driver + dir;
-        while (i >= DRV_STANDARD && i <= DRV_RADEON && !driver_ok(d, i))
-            i += dir;
-        if (i >= DRV_STANDARD && i <= DRV_RADEON) {
-            d->driver = (enum driver)i;
-            update_lists(d);
-        }
-        break;
-    }
     case K_AREA:
         if (d->res_idx + dir >= 0 && d->res_idx + dir < d->nres) {
             d->w = d->res[d->res_idx + dir].w;
@@ -1712,6 +1723,7 @@ static void step(struct dprops *d, int dir)
         if (d->accent + dir >= 0 && d->accent + dir < ACCENTS)
             d->accent += dir;
         break;
+    case K_DRIVER:
     case K_COLORS:
     case K_REFRESH:
     case K_MONITOR:
@@ -1719,11 +1731,13 @@ static void step(struct dprops *d, int dir)
     case K_THEME:
     case K_SAVER:
     case K_SAVER_TIME:
-    case K_SAVER_SIZE:
+    case K_SAVER_SIZE: {
         n = combo_items(d, d->focus, rows, &chosen);
-        if (chosen + dir >= 0 && chosen + dir < n)
-            choose_item(d, d->focus, chosen + dir);
+        int i = next_item(d, d->focus, chosen, dir, n);
+        if (i >= 0)
+            choose_item(d, d->focus, i);
         break;
+    }
     }
 }
 
@@ -1777,10 +1791,12 @@ static void dp_key(struct window *w, const struct input_event *ev)
         char rows[8][48];
         int chosen, n = combo_items(d, d->open, rows, &chosen);
         int hot = d->hover >= 0 ? d->hover : chosen;
-        if (code == KEY_UP && hot > 0)
-            d->hover = hot - 1;
-        else if (code == KEY_DOWN && hot + 1 < n)
-            d->hover = hot + 1;
+        int next = code == KEY_UP ? next_item(d, d->open, hot, -1, n)
+                   : code == KEY_DOWN ? next_item(d, d->open, hot, 1, n) : -1;
+        if (next >= 0)
+            d->hover = next;
+        else if (code == KEY_UP || code == KEY_DOWN)
+            ;                           /* at the end of the list */
         else if (code == KEY_ENTER || code == KEY_SPACE) {
             choose_item(d, d->open, hot);
             d->open = -1;
@@ -1813,8 +1829,8 @@ static void dp_key(struct window *w, const struct input_event *ev)
                  : d->wall_sel + (code == KEY_PGUP ? -WALL_ROWS : WALL_ROWS);
         wall_select(d, to < 0 ? 0 : to >= d->nwalls ? d->nwalls - 1 : to);
     } else if (code == KEY_DOWN && (ev->mods & KMOD_ALT) &&
-               (d->focus == K_COLORS || d->focus == K_REFRESH || d->focus == K_MONITOR ||
-                d->focus == K_WALLMODE || d->focus == K_THEME || d->focus == K_SAVER ||
+               (d->focus == K_DRIVER || d->focus == K_COLORS || d->focus == K_REFRESH ||
+                d->focus == K_MONITOR || d->focus == K_WALLMODE || d->focus == K_THEME || d->focus == K_SAVER ||
                 d->focus == K_SAVER_TIME || d->focus == K_SAVER_SIZE) && ctl_enabled(d, d->focus)) {
         d->open = d->focus;
         d->hover = -1;
@@ -1893,6 +1909,8 @@ static void dp_mouse(struct window *w, int x, int y, int buttons, int changed)
     if (d->open >= 0) {
         struct rect l = list_rect(d, d->open);
         int row = rect_contains(l, x, y) ? (y - l.y - 1) / ITEM_H : -1;
+        if (row >= 0 && !item_ok(d, d->open, row))
+            return;                     /* a driver for an adapter that is not there */
         if (press || release) {
             if (row >= 0) {
                 choose_item(d, d->open, row);
@@ -1955,11 +1973,6 @@ static void dp_mouse(struct window *w, int x, int y, int buttons, int changed)
                 d->pressed_in = 1;
             } else if (k == K_COLOR) {
                 d->hexcur = d->hexlen;
-            } else if (k == K_DRIVER) {
-                for (int i = DRV_STANDARD; i <= DRV_RADEON; i++)
-                    if (rect_contains(radio_rect(i), x, y) && driver_ok(d, i))
-                        d->driver = (enum driver)i;
-                update_lists(d);
             } else if (k == K_ACCENT) {
                 int i = (x - r.x) / SWATCH_W;
                 if (i >= 0 && i < ACCENTS)

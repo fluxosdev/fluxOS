@@ -186,6 +186,7 @@ static struct {
     int running, playing;
     uint32_t real[2];
     uint32_t progress;
+    uint32_t underruns;                 /* halves refilled short while the device was open */
     uint32_t rhead, rtail;
     uint8_t ring[RING_SIZE];
 
@@ -340,13 +341,31 @@ static void rings_init(uint8_t *page)
     wr8(RIRBCTL, RIRBCTL_DMAEN);
 }
 
-/* Chipset settings Linux makes: no traffic class, and snooped DMA. */
+/* The ICH6 to ICH10 controllers, which snoop without being told to. */
+static const uint16_t intel_ich[] = { 0x2668, 0x27D8, 0x269A, 0x284B, 0x293E, 0x293F, 0x3A3E, 0x3A6E };
+
+/*
+ * Chipset settings Linux makes: no traffic class, and snooped DMA. The
+ * DMA buffer is in cached memory, so a controller that does not snoop
+ * plays what memory held before the processor's cache wrote the new
+ * sound back: old pieces of it, a stutter.
+ */
 static void pci_quirks(const struct pci_dev *pci)
 {
     uint32_t id = pci_read32(pci, 0);
     uint16_t vendor = (uint16_t)id, device = (uint16_t)(id >> 16);
     pci_write8(pci, 0x44, pci_read8(pci, 0x44) & ~7);  /* TCSEL */
-    if (vendor == 0x10DE) {
+    if (vendor == 0x8086) {
+        /* The 5 Series chipsets on (and the SCH): DEVC's no-snoop bit,
+         * which the BIOS may leave set. */
+        int ich = 0;
+        for (uint32_t i = 0; i < ARRAY_SIZE(intel_ich); i++)
+            ich |= device == intel_ich[i];
+        if (!ich && (pci_read16(pci, 0x78) & 0x0800)) {
+            pci_write16(pci, 0x78, pci_read16(pci, 0x78) & ~0x0800);
+            klog("hda: DMA snooping turned on (it was off)\n");
+        }
+    } else if (vendor == 0x10DE) {
         pci_write8(pci, 0x4E, (uint8_t)((pci_read8(pci, 0x4E) & ~0x0F) | 0x0F));
         pci_write8(pci, 0x4D, pci_read8(pci, 0x4D) | 0x01);
         pci_write8(pci, 0x4C, pci_read8(pci, 0x4C) | 0x01);
@@ -759,6 +778,12 @@ static void service(void)
     if (h == hda.playing)
         return;
     fill_half(hda.playing);
+    if (hda.real[hda.playing] < HALF && hda.open_pid) {
+        /* The writer fell behind: the gap plays as silence. */
+        if (++hda.underruns <= 5 || hda.underruns % 100 == 0)
+            klog("hda: underrun %u (%u of %u bytes ready)\n", hda.underruns,
+                 hda.real[hda.playing], HALF);
+    }
     hda.playing = h;
     hda.progress++;
     if (!hda.real[0] && !hda.real[1] && !ring_used())
