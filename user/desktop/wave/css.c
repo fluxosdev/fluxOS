@@ -215,6 +215,7 @@ struct compound {
     const char *id;
     const char **classes;
     int nclasses;
+    uint32_t id_h, *class_h;    /* hash_str() of the id and of each class */
     struct attr_sel *attrs;
     int nattrs;
     uint32_t pseudo;
@@ -239,7 +240,11 @@ struct selector {
     int nparts;
     uint32_t spec;
     uint8_t pe;                 /* the rule styles the element's ::before (1) or ::after (2) */
+    uint8_t nanc;               /* index_sheet(): keys some ancestor must have (bloom_key()) */
+    uint32_t anc[4];
 };
+
+static uint32_t hash_str(const char *s);
 
 struct decl {
     uint8_t prop;
@@ -791,10 +796,15 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
         return NULL;
     if (c->nclasses) {
         c->classes = arena_alloc(a, sizeof(char *) * (size_t)c->nclasses);
-        if (!c->classes)
+        c->class_h = arena_alloc(a, sizeof(uint32_t) * (size_t)c->nclasses);
+        if (!c->classes || !c->class_h)
             return NULL;
         memcpy(c->classes, classes, sizeof(char *) * (size_t)c->nclasses);
+        for (int i = 0; i < c->nclasses; i++)
+            c->class_h[i] = hash_str(classes[i]);
     }
+    if (c->id)
+        c->id_h = hash_str(c->id);
     if (c->nattrs) {
         c->attrs = arena_alloc(a, sizeof(struct attr_sel) * (size_t)c->nattrs);
         if (!c->attrs)
@@ -1620,19 +1630,171 @@ static void parse_block(struct sheet *sh, const char *s, const char *end, int vw
     }
 }
 
-static uint32_t hash_str(const char *s)
+static uint32_t hash_n(const char *s, size_t n)
 {
     uint32_t h = 2166136261u;
-    for (; *s; s++)
-        h = (h ^ (uint8_t)*s) * 16777619u;
+    for (size_t i = 0; i < n; i++)
+        h = (h ^ (uint8_t)s[i]) * 16777619u;
     return h;
+}
+
+static uint32_t hash_str(const char *s)
+{
+    return hash_n(s, strlen(s));
+}
+
+/*
+ * ---- the ancestor filter ----
+ *
+ * While the cascade walks the tree it keeps a counting Bloom filter of
+ * the ids, classes and tags of the element's ancestors. A selector such
+ * as ".nav ul li a" is filed under "a" and so tried on every link; but
+ * it cannot match a link with no ".nav" above it, and the filter says so
+ * without walking up. Each selector carries the keys of the compounds
+ * that must be ancestors of its subject: those followed by a descendant
+ * or child combinator (a sibling's ancestors are the subject's too).
+ */
+enum { KEY_TAG = 1, KEY_ID, KEY_CLASS };
+#define BLOOM_BITS 12
+#define BLOOM_SIZE (1u << BLOOM_BITS)
+
+struct bloom {
+    uint16_t count[BLOOM_SIZE];
+    int broken;                 /* an element's keys could not be read: it would miss them */
+};
+
+static uint32_t bloom_key(int kind, uint32_t h)
+{
+    uint32_t k = (h ^ (uint32_t)kind * 0x9E3779B1u) * 0x85EBCA6Bu;
+    return k ^ (k >> 15);
+}
+
+static int bloom_has(const struct bloom *b, uint32_t k)
+{
+    return b->count[k & (BLOOM_SIZE - 1)] && b->count[(k >> BLOOM_BITS) & (BLOOM_SIZE - 1)];
+}
+
+static void bloom_adjust(struct bloom *b, uint32_t k, int d)
+{
+    uint16_t *c1 = &b->count[k & (BLOOM_SIZE - 1)], *c2 = &b->count[(k >> BLOOM_BITS) & (BLOOM_SIZE - 1)];
+    *c1 = (uint16_t)(*c1 + d);
+    *c2 = (uint16_t)(*c2 + d);
+}
+
+/* The keys of a selector's ancestor compounds, most selective first (ids, classes, then tags). */
+static void selector_ancestor_keys(struct selector *sel)
+{
+    sel->nanc = 0;
+    for (int i = 0; i < sel->nparts; i++)
+        if (sel->parts[i].host || sel->parts[i].nslot)
+            return;                     /* shadow scopes: ancestors cross the host */
+    for (int pass = 0; pass < 3; pass++)
+        for (int i = sel->nparts - 2; i >= 0 && sel->nanc < 4; i--) {
+            const struct compound *c = &sel->parts[i];
+            char comb = sel->parts[i + 1].comb;
+            if (comb != ' ' && comb != '>' && comb != 0)
+                continue;               /* a sibling, not an ancestor */
+            if (pass == 0 && c->id)
+                sel->anc[sel->nanc++] = bloom_key(KEY_ID, c->id_h);
+            for (int k = 0; pass == 1 && k < c->nclasses && sel->nanc < 4; k++)
+                sel->anc[sel->nanc++] = bloom_key(KEY_CLASS, c->class_h[k]);
+            if (pass == 2 && c->tag > 0 && c->tag != T_UNKNOWN)
+                sel->anc[sel->nanc++] = bloom_key(KEY_TAG, (uint32_t)c->tag);
+        }
+}
+
+/*
+ * ---- an element's id and classes, read once per cascade ----
+ *
+ * Matching asks for them thousands of times per element; parsing the
+ * class attribute again each time was most of the cascade's work.
+ */
+struct nclass {
+    uint32_t h;
+    const char *p;
+    uint32_t len;
+};
+
+struct nkeys {
+    const char *id;
+    uint32_t id_h;
+    int ncls;
+    struct nclass cls[];
+};
+
+static unsigned key_gen = 1;            /* bumped by every cascade: older keys are stale */
+static struct arena *key_arena;
+
+static const struct nkeys *node_keys(const struct node *cn)
+{
+    struct node *n = (struct node *)cn;
+    if (n->kgen == key_gen && n->keys)
+        return n->keys;
+    const char *id = NULL, *cls = NULL;
+    for (const struct attr *a = n->attrs; a; a = a->next) {
+        if (!id && !strcmp(a->name, "id"))
+            id = a->value;
+        else if (!cls && !strcmp(a->name, "class"))
+            cls = a->value;
+    }
+    int count = 0;
+    for (const char *p = cls; p && *p;) {
+        while (*p && isspace((unsigned char)*p))
+            p++;
+        if (*p)
+            count++;
+        while (*p && !isspace((unsigned char)*p))
+            p++;
+    }
+    struct nkeys *k = key_arena ? arena_alloc(key_arena, sizeof(*k) + sizeof(struct nclass) * (size_t)count) : NULL;
+    if (!k)
+        return NULL;
+    k->id = id;
+    k->id_h = id ? hash_str(id) : 0;
+    for (const char *p = cls; p && *p;) {
+        while (*p && isspace((unsigned char)*p))
+            p++;
+        const char *e = p;
+        while (*e && !isspace((unsigned char)*e))
+            e++;
+        if (e > p) {
+            k->cls[k->ncls].p = p;
+            k->cls[k->ncls].len = (uint32_t)(e - p);
+            k->cls[k->ncls].h = hash_n(p, (size_t)(e - p));
+            k->ncls++;
+        }
+        p = e;
+    }
+    n->keys = k;
+    n->kgen = key_gen;
+    return k;
+}
+
+/* Put an element's keys into the filter (d 1) or take them out (d -1). */
+static void bloom_node(struct bloom *b, const struct node *n, int d)
+{
+    if (!b || n->type != N_ELEMENT)
+        return;
+    if (n->tag > 0 && n->tag != T_UNKNOWN)
+        bloom_adjust(b, bloom_key(KEY_TAG, n->tag), d);
+    const struct nkeys *k = node_keys(n);
+    if (!k) {
+        if (d > 0)
+            b->broken = 1;
+        return;
+    }
+    if (k->id)
+        bloom_adjust(b, bloom_key(KEY_ID, k->id_h), d);
+    for (int i = 0; i < k->ncls; i++)
+        bloom_adjust(b, bloom_key(KEY_CLASS, k->cls[i].h), d);
 }
 
 static void index_sheet(struct sheet *sh)
 {
     for (int r = sh->nrules - 1; r >= 0; r--) {
         for (int i = sh->rules[r].nsels - 1; i >= 0; i--) {
-            const struct selector *sel = &sh->rules[r].sels[i];
+            struct selector *sel = &sh->rules[r].sels[i];
+            selector_ancestor_keys(sel);
             const struct compound *c = &sel->parts[sel->nparts - 1];
             struct ref *ref = arena_alloc(sh->a, sizeof(*ref));
             if (!ref)
@@ -1690,6 +1852,25 @@ static const struct node *next_element(const struct node *n)
         ;
     return n;
 }
+
+/*
+ * What the cascade is matching for: the element whose style is being
+ * computed, the filter of its ancestors (NULL where it does not apply),
+ * and what its style turns out to depend on (node->style_flags):
+ *   SF_NOSHARE   a test of the element itself beyond its tag and
+ *                attributes (position, state, children...): a sibling
+ *                with the same attributes may not take its style;
+ *   SF_DYN_SELF  its own :hover, :active, :focus... state;
+ *   SF_DYN_OTHER such a state of some other element (".a:hover .b").
+ */
+#define SF_NOSHARE   1
+#define SF_DYN_SELF  2
+#define SF_DYN_OTHER 4
+#define PS_DYNAMIC   (PS_HOVER | PS_ACTIVE | PS_FOCUS | PS_FOCUS_WITHIN | PS_USER_INVALID)
+
+static const struct node *cur_subject;
+static struct bloom *cur_bloom;
+static uint8_t cur_flags;
 
 static int has_class(const struct node *n, const char *cls)
 {
@@ -1990,18 +2171,33 @@ static int match_compound(const struct compound *c, const struct node *n, const 
     } else if (m->host && n == m->host) return 0;
     if (c->tag >= 0 && (c->tag != n->tag || (c->tag == T_UNKNOWN && strcmp(c->tagname, n->name))))
         return 0;
+    const struct nkeys *k = (c->id || c->nclasses) ? node_keys(n) : NULL;
     if (c->id) {
-        const char *id = node_attr(n, "id");
-        if (!id || strcmp(id, c->id))
+        const char *id = k ? k->id : node_attr(n, "id");
+        if (!id || (k && k->id_h != c->id_h) || strcmp(id, c->id))
             return 0;
     }
-    for (int i = 0; i < c->nclasses; i++)
-        if (!has_class(n, c->classes[i]))
+    for (int i = 0; i < c->nclasses; i++) {
+        if (!k) {
+            if (!has_class(n, c->classes[i]))
+                return 0;
+            continue;
+        }
+        int found = 0;
+        for (int j = 0; j < k->ncls && !found; j++)
+            found = k->cls[j].h == c->class_h[i] && !strncmp(k->cls[j].p, c->classes[i], k->cls[j].len) &&
+                    !c->classes[i][k->cls[j].len];
+        if (!found)
             return 0;
+    }
     for (int i = 0; i < c->nattrs; i++)
         if (!match_attr(n, &c->attrs[i]))
             return 0;
     uint32_t ps = c->pseudo;
+    if (n == cur_subject && (ps || c->focus_visible || c->has_nth || c->nhas || c->lang))
+        cur_flags |= SF_NOSHARE;
+    if ((ps & PS_DYNAMIC) || c->focus_visible)
+        cur_flags |= n == cur_subject ? SF_DYN_SELF : SF_DYN_OTHER;
     if (ps) {
         if (ps & PS_NEVER)
             return 0;
@@ -2208,9 +2404,13 @@ static int match_from(const struct selector *s, int i, const struct node *n, con
         if (p && p->shadow_host == m->host && m->host) p = m->host;
         return p && match_from(s, i - 1, p, m);
     case '+':
+        if (n == cur_subject)
+            cur_flags |= SF_NOSHARE;    /* depends on where it stands among its siblings */
         p = prev_element(n);
         return p && match_from(s, i - 1, p, m);
     case '~':
+        if (n == cur_subject)
+            cur_flags |= SF_NOSHARE;
         for (p = prev_element(n); p; p = prev_element(p))
             if (match_from(s, i - 1, p, m))
                 return 1;
@@ -5287,6 +5487,13 @@ static void match_list(struct collect *c, const struct sheet *sh, const struct r
     for (; ref; ref = ref->next) {
         const struct rule *r = &sh->rules[ref->rule];
         const struct selector *sel = &r->sels[ref->sel];
+        if (cur_bloom && !cur_bloom->broken && sel->nanc) {   /* an ancestor it needs is not there */
+            int i = 0;
+            while (i < sel->nanc && bloom_has(cur_bloom, sel->anc[i]))
+                i++;
+            if (i < sel->nanc)
+                continue;
+        }
         if (match_from(sel, sel->nparts - 1, n, c->mc))
             add_decls(c, r->decls, r->ndecls, rank, sel->spec,
                       sheet_order + (uint32_t)ref->rule * 256, sel->pe,
@@ -5308,6 +5515,24 @@ static void match_sheet(struct collect *c, const struct sheet *sh, const struct 
                               r->layer ? r->layer->canonical->order : 0x7fffffff);
             }
         }
+        return;
+    }
+    const struct nkeys *k = node_keys(n);
+    if (k) {
+        if (k->id)
+            match_list(c, sh, sh->by_id[k->id_h % INDEX_BUCKETS], n, rank, sheet_order);
+        /* Each class's bucket once, even if two classes share it (however many classes). */
+        uint32_t seen[INDEX_BUCKETS / 32] = { 0 };
+        for (int i = 0; i < k->ncls; i++) {
+            uint32_t b = k->cls[i].h % INDEX_BUCKETS;
+            if (seen[b / 32] & (1u << (b % 32)))
+                continue;
+            seen[b / 32] |= 1u << (b % 32);
+            match_list(c, sh, sh->by_class[b], n, rank, sheet_order);
+        }
+        if (n->tag > 0)
+            match_list(c, sh, sh->by_tag[n->tag], n, rank, sheet_order);
+        match_list(c, sh, sh->other, n, rank, sheet_order);
         return;
     }
     const char *id = node_attr(n, "id");
@@ -5599,6 +5824,7 @@ static void apply_match(struct style *st, const struct style *parent, const stru
 static void pseudo(struct arena *a, struct node *n, const struct style *st, const struct collect *c,
                    int pe, const struct vctx *base);
 static void counter_apply(const char *spec, int reset);
+static int counter_calls;               /* counter_apply() since the cascade began */
 static void prepare_layers(struct arena *a, struct sheet **sheets, int nsheets);
 
 static int shadow_sheets(struct arena *a, struct node *shadow, struct sheet **sheets, int vw)
@@ -5613,18 +5839,39 @@ static int shadow_sheets(struct arena *a, struct node *shadow, struct sheet **sh
     return ns;
 }
 
-static void compute(struct arena *a, struct node *n, const struct style *parent,
-                    struct sheet **sheets, int nsheets, const struct vctx *base,
-                    const struct mctx *mc, struct match *buf)
+/* The rules that matched, as a number: the same declarations in the same order give the same
+ * style (given the same parent's). Hints and inline styles are parsed afresh each time, so they
+ * count by their text. */
+static uint32_t match_signature(const struct collect *c, const char *hint, const char *inline_style)
 {
-    struct style *st = arena_alloc(a, sizeof(*st));
-    if (!st)
-        return;
-    inherit(st, parent);
-    n->style = st;
-    memset(n->pseudo_st, 0, sizeof(n->pseudo_st));     /* the last cascade's styles are gone */
-    memset(n->pseudo_text, 0, sizeof(n->pseudo_text));
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < c->n; i++) {
+        const struct match *m = &c->m[i];
+        if (m->rank == R_HINT || m->rank == R_INLINE || m->rank == R_INLINE_IMPORTANT)
+            continue;
+        uint32_t parts[4] = { (uint32_t)(uintptr_t)m->d, m->rank, m->pe, (uint32_t)m->layer };
+        for (int k = 0; k < 4; k++)
+            h = (h ^ parts[k]) * 16777619u;
+    }
+    if (hint[0])
+        h = (h ^ hash_str(hint)) * 16777619u;
+    if (inline_style)
+        h = (h ^ hash_str(inline_style) ^ 0x5bd1e995u) * 16777619u;
+    return h | 1;                       /* never 0: an element never matched */
+}
 
+/*
+ * Compute n's style. With check, only if the rules that match it are not
+ * the ones that matched last time (css_restyle_dynamic): returns 1 if it
+ * was computed, 0 if its style stays as it was.
+ */
+static int compute(struct arena *a, struct node *n, const struct style *parent,
+                   struct sheet **sheets, int nsheets, const struct vctx *base,
+                   const struct mctx *mc, struct match *buf, int check)
+{
+    cur_subject = n;
+    cur_flags = 0;
+    int calls = counter_calls;
     struct collect c = { .m = buf, .mc = mc };
     match_sheet(&c, ua_sheet, n, R_UA, 0);
     if (mc->quirks)
@@ -5641,6 +5888,9 @@ static void compute(struct arena *a, struct node *n, const struct style *parent,
             match_sheet(&c, sheets[i], n, R_AUTHOR, (uint32_t)(i + 1) << 24);
     struct node *host = n->shadow_root ? n : n->parent && n->parent->shadow_root ? n->parent : NULL;
     if (host) {
+        struct bloom *outer_bloom = cur_bloom;
+        cur_bloom = NULL;               /* inside a shadow scope ancestors cross the host */
+        cur_flags |= SF_NOSHARE;
         struct sheet *inner[64];
         int count = shadow_sheets(a, host->shadow_root, inner, base->vw);
         prepare_layers(a, inner, count);
@@ -5655,6 +5905,7 @@ static void compute(struct arena *a, struct node *n, const struct style *parent,
         c.scope = 0;
         /* A shared sheet can also be adopted into another scope. Restore its layer numbering. */
         prepare_layers(a, sheets, nsheets);
+        cur_bloom = outer_bloom;
     }
     const char *inline_style = node_attr(n, "style");
     if (inline_style) {
@@ -5663,6 +5914,20 @@ static void compute(struct arena *a, struct node *n, const struct style *parent,
         add_decls(&c, d, nd, R_INLINE, 0, 0, 0, 0x7fffffff);
     }
     qsort(c.m, (size_t)c.n, sizeof(struct match), cmp_match);
+    cur_subject = NULL;
+    n->style_flags = cur_flags;
+    uint32_t sig = match_signature(&c, hint, inline_style);
+    if (check && sig == n->match_sig && n->style)
+        return 0;
+    n->match_sig = sig;
+
+    struct style *st = arena_alloc(a, sizeof(*st));
+    if (!st)
+        return 0;
+    inherit(st, parent);
+    n->style = st;
+    memset(n->pseudo_st, 0, sizeof(n->pseudo_st));     /* the last cascade's styles are gone */
+    memset(n->pseudo_text, 0, sizeof(n->pseudo_text));
 
     /* Pass 1: custom properties. */
     for (int i = 0; i < c.n; i++) {
@@ -5771,6 +6036,9 @@ static void compute(struct arena *a, struct node *n, const struct style *parent,
     if (st->display != D_NONE)
         for (int pe = PE_BEFORE; pe <= PE_MARKER; pe++)
             pseudo(a, n, st, &c, pe, &v);
+    if (counter_calls != calls)
+        n->style_flags |= SF_NOSHARE;   /* a sibling copying it would not count */
+    return 1;
 }
 
 /* ---- counters: counter-reset and counter-increment, read by counter() in content ---- */
@@ -5796,6 +6064,7 @@ static int counter_find(const char *name, int len, int make)
 /* "name", "name 5", "a 1 b -2": each counter set (reset) or advanced (increment). */
 static void counter_apply(const char *spec, int reset)
 {
+    counter_calls++;
     const char *p = spec;
     while (p && *p) {
         while (isspace((unsigned char)*p))
@@ -6071,44 +6340,111 @@ static void prepare_layers(struct arena *a, struct sheet **sheets, int nsheets)
     layer_number(all, NULL, &order);
 }
 
-static void cascade_tree(struct arena *a, struct node *root, const struct style *parent,
-                         struct sheet **sheets, int nsheets, struct vctx *v,
-                         const struct mctx *mc, struct match *buf)
+int css_shared;                         /* elements styled by sharing, in all cascades so far */
+
+/* Style sharing: an element can take its previous element sibling's style when it has the same
+ * name and attributes and nothing that matched the sibling looked at what tells them apart
+ * (its place among its siblings, its contents, its state: SF_NOSHARE). */
+static struct node *share_source(const struct node *n)
 {
-    prepare_layers(a, sheets, nsheets);
-    /* Iterative pre-order walk; a display:none subtree is skipped (and shares its root's style). */
+    if (n->tag == T_UNKNOWN || n->value || n->shadow_root || n->shadow_host || n->adopted_text)
+        return NULL;
+    switch (n->tag) {
+    case T_INPUT: case T_SELECT: case T_TEXTAREA: case T_BUTTON: case T_OPTION: case T_OPTGROUP:
+        return NULL;
+    }
+    struct node *p = n->prev;
+    while (p && p->type != N_ELEMENT)
+        p = p->prev;
+    if (!p || p->tag != n->tag || !p->style || (p->style_flags & SF_NOSHARE) || p->value || p->shadow_root ||
+        p->pseudo_text[0] || p->pseudo_text[1])
+        return NULL;
+    const struct attr *x = n->attrs, *y = p->attrs;
+    for (; x && y; x = x->next, y = y->next)
+        if (strcmp(x->name, y->name) || strcmp(x->value ? x->value : "", y->value ? y->value : ""))
+            return NULL;
+    return x || y ? NULL : p;
+}
+
+/*
+ * Style the elements under root in a pre-order walk; a display:none subtree is skipped (and
+ * shares its root's style). bloom (the main tree only) holds the ancestors of the element being
+ * styled. With dyn (css_restyle_dynamic), only the elements whose state or parent's style changed
+ * are looked at again; returns how many elements' styles changed.
+ */
+static int cascade_tree(struct arena *a, struct node *root, const struct style *parent,
+                        struct sheet **sheets, int nsheets, struct vctx *v,
+                        const struct mctx *mc, struct match *buf, struct bloom *bloom, unsigned dyn)
+{
+    if (!dyn)
+        prepare_layers(a, sheets, nsheets);
+    cur_bloom = bloom;
+    int changed = 0;
     struct node *n = root;
     while (n) {
         struct node *next = NULL;
         if (n->type == N_ELEMENT) {
             const struct style *ps = n->parent && n->parent->style ? n->parent->style : parent;
-            compute(a, n, ps, sheets, nsheets, v, mc, buf);
+            int redone = 1;
+            if (dyn) {
+                int parent_changed = n->parent && n->parent->rgen == dyn;
+                if (parent_changed || !n->style || (n->style_flags & SF_DYN_OTHER) ||
+                    ((n->style_flags & SF_DYN_SELF) && n->dgen == dyn))
+                    redone = compute(a, n, ps, sheets, nsheets, v, mc, buf, !parent_changed && n->style);
+                else
+                    redone = 0;
+                if (redone) {
+                    n->rgen = dyn;
+                    changed++;
+                }
+            } else {
+                struct node *src = mc->host ? NULL : share_source(n);
+                if (src) {
+                    n->style = src->style;
+                    memcpy(n->pseudo_st, src->pseudo_st, sizeof(n->pseudo_st));
+                    memset(n->pseudo_text, 0, sizeof(n->pseudo_text));
+                    n->style_flags = src->style_flags;
+                    n->match_sig = src->match_sig;
+                    css_shared++;
+                } else {
+                    compute(a, n, ps, sheets, nsheets, v, mc, buf, 0);
+                }
+            }
             if (!n->parent && !n->shadow_host && n->style)
                 v->root_font_size = n->style->font_size;
             if (n->style && n->style->display == D_NONE) {
-                for (struct node *k = n->first; k; k = node_next(k, n))
-                    if (k->type == N_ELEMENT)
-                        k->style = n->style;
-            } else {
+                if (redone)
+                    for (struct node *k = n->first; k; k = node_next(k, n))
+                        if (k->type == N_ELEMENT)
+                            k->style = n->style;
+            } else if (n->first) {
                 next = n->first;
+                if (bloom)
+                    bloom_node(bloom, n, 1);
             }
         }
         if (!next) {
             struct node *p = n;
-            while (p && p != root && !p->next)
+            while (p && p != root && !p->next) {
                 p = p->parent;
+                if (bloom && p)
+                    bloom_node(bloom, p, -1);   /* its children are done */
+            }
             next = p && p != root ? p->next : NULL;
         }
         n = next;
     }
+    cur_bloom = NULL;
+    return changed;
 }
 
 /* Shadow styles cascade in their own scope, inheriting only from their host. */
-static void cascade_shadows(struct arena *a, struct node *root, struct vctx *v, const struct mctx *mc,
-                            struct match *buf, int depth)
+static int cascade_shadows(struct arena *a, struct node *root, struct vctx *v, const struct mctx *mc,
+                           struct match *buf, int depth)
 {
+    int found = 0;
     if (depth > 64)
-        return;
+        return 1;
     for (struct node *n = root; n; n = node_next(n, root))
         if (n->shadow_root) {
             struct node *shadow = n->shadow_root;
@@ -6117,9 +6453,43 @@ static void cascade_shadows(struct arena *a, struct node *root, struct vctx *v, 
             struct mctx scope = *mc;
             scope.host = n;
             scope.slotted = NULL;
-            cascade_tree(a, shadow, n->style, sheets, ns, v, &scope, buf);
+            cascade_tree(a, shadow, n->style, sheets, ns, v, &scope, buf, NULL, 0);
             cascade_shadows(a, shadow, v, mc, buf, depth + 1);
+            found = 1;
         }
+    return found;
+}
+
+/* What the last full cascade of each document (a page and its frames) styled, for css_restyle_dynamic(). */
+struct cascade_record {
+    struct node *root;
+    struct sheet **sheets;
+    int nsheets, vw, vh, ok;
+    const struct node *state[4];        /* the :hover, :focus, :active and :focus-visible elements */
+};
+static struct cascade_record records[8];
+static int next_record;
+
+static struct cascade_record *cascade_record(const struct node *root, int make)
+{
+    for (int i = 0; i < 8; i++)
+        if (records[i].root == root)
+            return &records[i];
+    if (!make)
+        return NULL;
+    struct cascade_record *r = &records[next_record];
+    next_record = (next_record + 1) % 8;
+    memset(r, 0, sizeof(*r));
+    r->root = (struct node *)root;
+    return r;
+}
+
+static void cascade_state(const struct node **s)
+{
+    s[0] = css_hover_node;
+    s[1] = css_focus_node;
+    s[2] = css_active_node;
+    s[3] = css_focus_visible_node;
 }
 
 void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int nsheets,
@@ -6128,6 +6498,10 @@ void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int 
 {
     init_initial();
     ncounters = 0;
+    counter_calls = 0;
+    struct cascade_record *rec = cascade_record(root, root != NULL);
+    if (rec)
+        rec->ok = 0;
     if (!ua_sheet) {
         ua_sheet = css_parse(&ua_arena, ua_css, (int)strlen(ua_css), viewport_w);
         ua_quirks = css_parse(&ua_arena, ua_quirks_css, (int)strlen(ua_quirks_css), viewport_w);
@@ -6141,16 +6515,75 @@ void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int 
     struct vctx v = { ZOOM(16), ZOOM(16), viewport_w, viewport_h, a };
     struct mctx mc = { .visited = visited, .ctx = ctx, .quirks = root->quirks };
     struct match *buf = malloc(sizeof(struct match) * MAX_MATCHES);
-    if (!buf)
+    struct bloom *bloom = calloc(1, sizeof(*bloom));
+    if (!buf || !bloom) {
+        free(buf);
+        free(bloom);
         return;
+    }
+    if (!++key_gen)                     /* ids and classes may have changed: hash them again */
+        key_gen = 1;
+    key_arena = a;
     struct sheet **combined = sheets;
     if (root->adopted_text) {
         combined = arena_alloc(a, sizeof(*combined) * (size_t)(nsheets + 1));
-        if (!combined) { free(buf); return; }
+        if (!combined) { free(buf); free(bloom); key_arena = NULL; return; }
         if (nsheets) memcpy(combined, sheets, sizeof(*combined) * (size_t)nsheets);
         combined[nsheets++] = css_parse(a, root->adopted_text, (int)strlen(root->adopted_text), v.vw);
     }
-    cascade_tree(a, root, &initial_style, combined, nsheets, &v, &mc, buf);
-    cascade_shadows(a, root, &v, &mc, buf, 0);
+    cascade_tree(a, root, &initial_style, combined, nsheets, &v, &mc, buf, bloom, 0);
+    int shadows = cascade_shadows(a, root, &v, &mc, buf, 0);
     free(buf);
+    free(bloom);
+    key_arena = NULL;
+    /* Counters run in document order, and shadow trees and adopted sheets cascade
+     * apart: a page with any of them is restyled whole. */
+    rec->ok = !shadows && !counter_calls && !root->adopted_text;
+    rec->sheets = sheets;
+    rec->nsheets = nsheets;
+    rec->vw = viewport_w;
+    rec->vh = viewport_h;
+    cascade_state(rec->state);
+}
+
+int css_restyle_dynamic(struct arena *a, struct node *root, struct sheet **sheets, int nsheets,
+                        int viewport_w, int viewport_h, int (*visited)(const char *href, void *ctx),
+                        void *ctx)
+{
+    static unsigned gen;
+    struct cascade_record *rec = cascade_record(root, 0);
+    if (!rec || !rec->ok || sheets != rec->sheets || nsheets != rec->nsheets || viewport_w != rec->vw ||
+        viewport_h != rec->vh || !root->style || !ua_sheet || !ua_quirks)
+        return -1;
+    const struct node *now[4];
+    cascade_state(now);
+    if (!memcmp(now, rec->state, sizeof(now)))
+        return 0;
+    if (!++gen)
+        gen = 1;
+    /* Whose state changed: :hover, :active and :focus-within reach the ancestors too. */
+    for (int i = 0; i < 4; i++) {
+        if (now[i] == rec->state[i])
+            continue;
+        for (struct node *n = (struct node *)now[i]; n; n = n->parent)
+            n->dgen = gen;
+        for (struct node *n = (struct node *)rec->state[i]; n; n = n->parent)
+            n->dgen = gen;
+    }
+    struct vctx v = { ZOOM(16), root->style->font_size, viewport_w, viewport_h, a };
+    struct mctx mc = { .visited = visited, .ctx = ctx, .quirks = root->quirks };
+    struct match *buf = malloc(sizeof(struct match) * MAX_MATCHES);
+    struct bloom *bloom = calloc(1, sizeof(*bloom));
+    if (!buf || !bloom) {
+        free(buf);
+        free(bloom);
+        return -1;
+    }
+    key_arena = a;
+    int changed = cascade_tree(a, root, &initial_style, sheets, nsheets, &v, &mc, buf, bloom, gen);
+    key_arena = NULL;
+    free(buf);
+    free(bloom);
+    memcpy(rec->state, now, sizeof(now));
+    return changed > 0;
 }

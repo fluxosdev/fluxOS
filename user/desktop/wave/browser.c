@@ -187,6 +187,7 @@ struct browser {
     char base[URL_MAX];         /* what its links are relative to */
     struct arena arena;         /* document tree and style sheets */
     struct arena sarena;        /* computed styles */
+    size_t sarena_full;         /* how much of it the last full cascade used (restyles add to it) */
     struct arena larena;        /* layout */
     struct node *root;
     struct layout lo;
@@ -208,6 +209,12 @@ struct browser {
     int nbgs;
     int laid_out_w;
     unsigned layouts, boxes_for;        /* layouts done; the one the nodes' boxes are of */
+    /* what the window shows of the page since paint(), for paint_scrolled() */
+    int shown_sx, shown_sy;
+    unsigned shown_layouts;
+    struct rect shown_view;
+    unsigned fixed_bg_for;              /* 1 + the layout fixed_bg is of */
+    int fixed_bg;                       /* some background stays put while the page scrolls */
     int scroll_x, scroll_y;
     int restore_scroll;         /* back/forward: where the page was */
     const char *pending_fragment;
@@ -332,6 +339,7 @@ struct browser {
 
 static struct browser *browsers;
 static int caret_on = 1;
+static struct browser *shown_tab;      /* the tab paint() last drew into its window */
 
 /* Pages visited in this session, for a:visited. */
 static char *visited[512];
@@ -1955,6 +1963,7 @@ static void relayout(struct browser *b)
         css_font_lookup=font_lookup;css_font_context=b;
         css_cascade(&b->sarena, b->root, b->sheets, b->nsheets, v.w, v.h, is_visited, b);
         css_font_lookup=NULL;css_font_context=NULL;
+        b->sarena_full = b->sarena.used;
         b->need_style = 0;
     }
     bg_attach(b);
@@ -4885,6 +4894,19 @@ static int has_keys(struct browser *b)
 
 /* A page, its frames in their boxes, and its scroll bars, with b's
  * coordinates at (ox, oy) in s. */
+static void draw_scrollbars(struct browser *b, struct surface *s, int ox, int oy)
+{
+    struct sbar vb = vbar(b), hb = hbar(b);
+    vb.r.x += ox, vb.r.y += oy, hb.r.x += ox, hb.r.y += oy;
+    if (has_vbar(b))
+        sbar_draw(s, &vb, b->hold == H_VBAR ? b->sbar_pressed : SBAR_NONE);
+    if (has_hbar(b)) {
+        sbar_draw(s, &hb, b->hold == H_HBAR ? b->sbar_pressed : SBAR_NONE);
+        if (has_vbar(b))
+            gfx_fill(s, vb.r.x, hb.r.y, SBAR_W, SBAR_W, C_FACE);
+    }
+}
+
 static void paint_page(struct browser *b, struct surface *s, int ox, int oy)
 {
     load_lazy_images(b);
@@ -4928,16 +4950,7 @@ static void paint_page(struct browser *b, struct surface *s, int ox, int oy)
         draw_pop(b, s, ox, oy);
     }
     s->clip = saved;
-
-    struct sbar vb = vbar(b), hb = hbar(b);
-    vb.r.x += ox, vb.r.y += oy, hb.r.x += ox, hb.r.y += oy;
-    if (has_vbar(b))
-        sbar_draw(s, &vb, b->hold == H_VBAR ? b->sbar_pressed : SBAR_NONE);
-    if (has_hbar(b)) {
-        sbar_draw(s, &hb, b->hold == H_HBAR ? b->sbar_pressed : SBAR_NONE);
-        if (has_vbar(b))
-            gfx_fill(s, vb.r.x, hb.r.y, SBAR_W, SBAR_W, C_FACE);
-    }
+    draw_scrollbars(b, s, ox, oy);
 }
 
 /* ---- the right-click menu ---- */
@@ -5733,6 +5746,75 @@ static void paint(struct browser *b)
     if (b->ctx_open)
         draw_ctx(b, s);
     wm_damage_client(b->win, mkrect(0, 0, s->w, s->h));
+    shown_tab = b;
+    b->shown_sx = b->scroll_x;
+    b->shown_sy = b->scroll_y;
+    b->shown_layouts = b->layouts;
+    b->shown_view = view_rect(b);
+}
+
+/* Whether some background picture is fixed to the window (it does not move with the page). */
+static int has_fixed_bg(struct browser *b)
+{
+    if (b->fixed_bg_for != b->layouts + 1) {
+        b->fixed_bg = 0;
+        for (int i = 0; i < b->lo.nitems && !b->fixed_bg; i++)
+            if (b->lo.items[i].kind == DK_BGIMG)
+                for (const struct bgpaint *p = b->lo.items[i].bgp; p && !b->fixed_bg; p = p->next)
+                    b->fixed_bg = p->fixed;
+        b->fixed_bg_for = b->layouts + 1;
+    }
+    return b->fixed_bg;
+}
+
+/*
+ * After only the page's scroll position changed: move what the window already shows and
+ * paint just the strip that came into view, and the scroll bars. Anything else on the
+ * screen that could have changed, or that does not move with the page, paints it all.
+ */
+static void paint_scrolled(struct browser *b)
+{
+    struct rect v = view_rect(b);
+    int dx = b->scroll_x - b->shown_sx, dy = b->scroll_y - b->shown_sy;
+    int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+    struct browser *top = top_of(b);
+    if (b != shown_tab || is_frame(b) || !b->root || b->frames || b->pop_node || b->find_open || b->tip_shown ||
+        b->ctx_open || top->tip_shown || top->ctx_open || top->find_open || b->need_layout || b->need_style || b->laid_out_w != v.w || b->layouts != b->shown_layouts ||
+        memcmp(&v, &b->shown_view, sizeof(v)) || b->lo.ndyn || has_fixed_bg(b) || adx >= v.w || ady >= v.h) {
+        paint(b);
+        return;
+    }
+    struct surface *s = &b->win->content;
+    if (dx || dy) {
+        if (v.x < 0 || v.y < 0 || v.x + v.w > s->w || v.y + v.h > s->h) {
+            paint(b);
+            return;
+        }
+        int w = v.w - adx, h = v.h - ady;
+        int from_x = v.x + (dx > 0 ? dx : 0), to_x = v.x + (dx < 0 ? adx : 0);
+        size_t bytes = (size_t)w * sizeof(*s->px);
+        if (dy >= 0)
+            for (int r = 0; r < h; r++)
+                memmove(&s->px[(v.y + r) * s->stride + to_x], &s->px[(v.y + r + dy) * s->stride + from_x], bytes);
+        else
+            for (int r = h - 1; r >= 0; r--)
+                memmove(&s->px[(v.y + ady + r) * s->stride + to_x], &s->px[(v.y + r) * s->stride + from_x], bytes);
+        struct rect strips[2] = {
+            dy > 0 ? mkrect(v.x, v.y + v.h - dy, v.w, dy) : mkrect(v.x, v.y, v.w, ady),
+            dx > 0 ? mkrect(v.x + v.w - dx, v.y, dx, v.h) : mkrect(v.x, v.y, adx, v.h),
+        };
+        for (int i = 0; i < 2; i++) {
+            if (rect_empty(strips[i]))
+                continue;
+            s->clip = strips[i];
+            paint_document(&b->lo, s, v.x, v.y, b->scroll_x, b->scroll_y, b->focus, caret_on && has_keys(b));
+        }
+    }
+    gfx_noclip(s);
+    draw_scrollbars(b, s, 0, 0);
+    wm_damage_client(b->win, frame_rect(b));
+    b->shown_sx = b->scroll_x;
+    b->shown_sy = b->scroll_y;
 }
 
 /* ---- input ---- */
@@ -6156,7 +6238,7 @@ static void br_key(struct window *w, const struct input_event *ev)
     case KEY_BACKSPACE: go_history(t, shift ? 1 : -1); return;
     default: return;
     }
-    paint(b);
+    paint_scrolled(b);
 }
 
 static void scroll_step(struct browser *b, const struct sbar *sb, enum sbar_part part)
@@ -6167,6 +6249,32 @@ static void scroll_step(struct browser *b, const struct sbar *sb, enum sbar_part
         scroll_by(b, 0, step);
     else
         scroll_by(b, step, 0);
+}
+
+/* After :hover or :focus moved, restyle only the elements that depend on them. Returns -1
+ * when the page needs a whole cascade instead, else whether any style changed. */
+static int restyle_dynamic(struct browser *b)
+{
+    /* Restyles leave their old styles in the arena: start again once they add up. */
+    if (b->need_style || b->sarena.used > 2 * b->sarena_full + (1u << 20))
+        return -1;
+    zoom_sync(b);
+    if (b->focus && !web_focusable(b->focus)) {
+        if (b->js)
+            jsdom_focus(b->js, NULL);
+        b->focus = NULL;
+    }
+    css_focus_node = b->focus;
+    css_focus_visible_node = b->focus && (b->keyboard_focus || is_text_field(b->focus)) ? b->focus : NULL;
+    struct rect v = view_rect(b);
+    css_viewport_h = v.h;
+    css_target_id = url_fragment(b->url);
+    css_font_lookup = font_lookup;
+    css_font_context = b;
+    int r = css_restyle_dynamic(&b->sarena, b->root, b->sheets, b->nsheets, v.w, v.h, is_visited, b);
+    css_font_lookup = NULL;
+    css_font_context = NULL;
+    return r;
 }
 
 /* Restyle when the element under the pointer or the focused one changed and some rule cares. */
@@ -6188,9 +6296,13 @@ static void sync_dynamic(struct browser *b, const struct node *hov, int hover_to
     static unsigned last;
     if (changed && now_ms() - last >= 50) {
         last = now_ms();
-        b->need_style = 1;
-        relayout(b);
-        paint(b);
+        int r = restyle_dynamic(b);
+        if (r < 0)
+            b->need_style = 1;
+        if (r) {
+            relayout(b);
+            paint(b);
+        }
     } else if (changed) {
         css_hover_node = NULL;          /* too soon: look again on the next movement */
         css_focus_node = NULL;
@@ -6748,7 +6860,7 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             b->scroll_y = sbar_drag(&sb, y, b->grab);
         else
             b->scroll_x = sbar_drag(&sb, x, b->grab);
-        paint(b);
+        paint_scrolled(b);
     } else if (b->hold == H_SBOX) {
         if (b->sb_hit.part == SBP_THUMB && b->sb_hit.box < b->lo.nsb) {
             layout_sbar_drag(&b->lo, &b->sb_hit, px, py, b->sb_grab, b->scroll_x, b->scroll_y);
@@ -6819,7 +6931,7 @@ static int wheel(struct browser *b, int x, int y, int delta)
     scroll_by(b, 0, -delta * 3 * LINE_STEP / 2);
     if (is_frame(b) && b->scroll_y == before)
         return 0;
-    paint(b);
+    paint_scrolled(b);
     return 1;
 }
 

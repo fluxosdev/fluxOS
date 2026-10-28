@@ -156,6 +156,13 @@ struct node {
 
     void *js;                           /* the script engine's wrapper (jsdom.c) */
     unsigned gcpass;                    /* jsdom.c: its tree's wrappers marked in this collection */
+
+    /* css.c: what the last cascade learnt of the element */
+    const struct nkeys *keys;           /* its id and classes, hashed (valid while kgen is current) */
+    unsigned kgen;
+    uint8_t style_flags;                /* SF_*: what its style turned out to depend on */
+    uint32_t match_sig;                 /* the rules that matched it, hashed */
+    unsigned dgen, rgen;                /* css_restyle_dynamic(): its state changed, its style changed */
 };
 
 struct node *html_parse(struct arena *a, const char *text, int len);
@@ -437,6 +444,13 @@ struct sheet *css_parse(struct arena *a, const char *text, int len, int viewport
 void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int nsheets,
                  int viewport_w, int viewport_h, int (*visited)(const char *href, void *ctx),
                  void *ctx);
+/* After only :hover, :focus, :active or :focus-visible moved: restyle the elements whose
+ * state changed and the ones that depend on them. Returns 1 if any style changed, 0 if
+ * none did, -1 if the page needs css_cascade() instead. */
+int css_restyle_dynamic(struct arena *a, struct node *root, struct sheet **sheets, int nsheets,
+                        int viewport_w, int viewport_h, int (*visited)(const char *href, void *ctx),
+                        void *ctx);
+extern int css_shared;
 int css_parse_color(const char *s, int n, uint32_t *out);
 /* oklch(), lab(), hwb(), color(), color-mix() and the rest (csscolor.c, in floating point). */
 int css_color_function(const char *s, uint32_t *out);
