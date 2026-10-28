@@ -153,9 +153,10 @@ says why.
     6550D, 6620G and the rest of 0x9640-0x964F): Evergreen's display
     controllers, with page flipping and the hardware pointer over the memory
     the BIOS shares with them. A laptop panel behind a DisplayPort-to-LVDS
-    bridge (TRAVIS) gets native modes: its own timing from the BIOS, smaller
-    sizes stretched to it by the scaler, the DisplayPort link trained over
-    the AUX channel. No 3D for these yet (see *Work in progress*).
+    bridge (TRAVIS) gets native modes: it keeps the timing the BIOS lit it
+    with, and a mode change only sets what is scanned out, with smaller
+    sizes stretched to the panel by the scaler. No 3D for these yet (see
+    *Work in progress*).
   - **Intel HD Graphics of Haswell processors** (HD 4600, 4400, 4200, 5000,
     Iris 5100, Iris Pro 5200): page flipping at vblank and the hardware
     pointer in the boot loader's mode. The second page lives in the stolen
@@ -866,11 +867,13 @@ user range and page tables first.
 - **The Radeon driver on Llano APUs (HD 6520G and kin) is partial:** page
   flipping, the hardware pointer, and native modes only for a laptop panel
   behind a DisplayPort bridge (TRAVIS, as on the HP ProBook); eDP panels and
-  the VGA, HDMI and DisplayPort connectors keep the boot loader's mode. The
-  native modes are untested on hardware: `dmesg | grep radeon` shows the
-  bridge's DPCD, the clock and the link training's result, and
-  `radeon.modeset=0` turns them off. A native mode is set again after
-  waking from sleep. Next, 3D: Sumo's own microcode (SUMO_pfp, SUMO_me,
+  the VGA, HDMI and DisplayPort connectors keep the boot loader's mode.
+  Modes change only the surface, viewport and scaler; the full DisplayPort
+  mode set (PLL, encoder, bridge, link training over AUX), ported from
+  Linux, blanks the panel on the HP ProBook and is only run with
+  `radeon.dp_modeset=1`. `dmesg | grep radeon` shows each step, and
+  `radeon.modeset=0` turns native modes off. A native mode is set again
+  after waking from sleep. Next, 3D: Sumo's own microcode (SUMO_pfp, SUMO_me,
   SUMO_rlc) and Evergreen's shader instruction set.
 - **The Intel HD Graphics driver (Haswell) is partial:** page flipping, the
   hardware pointer and blitter copies; native modes only on the VGA output

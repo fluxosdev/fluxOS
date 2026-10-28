@@ -112,6 +112,21 @@ static const uint32_t grph_secondary_high[2] = { 0x691C, 0x611C };
 #define EG_VIEWPORT_START  0x6D70
 #define EG_VIEWPORT_SIZE   0x6D74
 #define EG_MASTER_UPDATE_MODE 0x6EF8
+#define EG_DC_LB_MEMORY_SPLIT 0x6B0C
+#define EG_PRIORITY_A_CNT  0x6B18
+#define EG_PRIORITY_B_CNT  0x6B1C
+#define EG_PRIORITY_OFF    (1u << 16)
+#define EG_PRIORITY_ALWAYS_ON (1u << 20)
+#define EG_PIPE0_ARBITRATION_CONTROL3 0x0BF0    /* per pipe, 16 apart */
+#define EG_LATENCY_WATERMARK_MASK(x) ((uint32_t)(x) << 16)
+#define EG_PIPE0_LATENCY_CONTROL 0x0BF4
+#define EG_PIPE0_DMIF_BUFFER_CONTROL 0x0CA0     /* per pipe, 0x20 apart */
+#define EG_DMIF_BUFFERS_ALLOCATED_COMPLETED (1u << 4)
+#define EG_CRTC_CONTROL    0x6E70
+#define EG_CRTC_H_TOTAL    0x6E00
+#define EG_CRTC_V_TOTAL    0x6E20
+#define EG_CRTC_BLANK_CONTROL 0x6E74
+#define EG_CRTC_STATUS_POSITION 0x6E90
 #define EG_P1PLL_SS_CNTL 0x414
 #define EG_P2PLL_SS_CNTL 0x454
 #define EG_PxPLL_SS_EN   (1u << 12)
@@ -280,6 +295,7 @@ static uint32_t dp_extclk;          /* 10 kHz: DisplayPort's reference from outs
 static uint16_t fw_caps;            /* FirmwareInfo's capability flags */
 static int crtc_id;                 /* the controller we drive; its PLL has the same number */
 static int pll_id;                  /* Evergreen: the PLL it runs from */
+static int dp_modeset;              /* Evergreen: the whole DisplayPort mode set, not just the view */
 static int tx_initialised;
 
 static struct modelist ml;
@@ -1280,7 +1296,8 @@ static void dig_encoder_dce4(int action, int panel_mode)
         a.config |= dpsink.link_clock == 540000 ? 0x02 : dpsink.link_clock == 270000 ? 0x01 : 0;
         a.v4_hpd = out.hpd == 0xFF ? 0 : (uint8_t)(out.hpd + 1);
     }
-    run(ATOM_CMD_DIGX_ENCODER, &a, sizeof(a));
+    if (run(ATOM_CMD_DIGX_ENCODER, &a, sizeof(a)) < 0)
+        klog("radeon: DIGxEncoderControl %u.%u, command %02x: the table failed\n", frev, crev, action);
 }
 
 /* UNIPHYTransmitterControl 1.3 for DisplayPort (atombios_dig_transmitter_setup2) */
@@ -1305,7 +1322,8 @@ static void dig_transmitter_dce4(int action, uint8_t lane_set)
     a.v3_lanes = (uint8_t)dpsink.lanes;
     /* coherent (DisplayPort wants it), link B, the DIG, the reference, the PHY */
     a.config = (uint8_t)(0x02 | (linkb() ? 0x04 : 0) | (dig & 1) << 3 | (refclk & 3) << 4 | sel << 6);
-    run(ATOM_CMD_UNIPHY_TRANSMITTER, &a, sizeof(a));
+    if (run(ATOM_CMD_UNIPHY_TRANSMITTER, &a, sizeof(a)) < 0)
+        klog("radeon: UNIPHYTransmitterControl, action %u: the table failed\n", action);
 }
 
 /* ExternalEncoderControl 2.3: the bridge (atombios_external_encoder_setup).
@@ -1327,7 +1345,8 @@ static void ext_encoder(int action)
                          which << 4);
     a.lanes = (uint8_t)dpsink.lanes;
     a.bpc = bpc_code();
-    run(ATOM_CMD_EXTERNAL_ENCODER, &a, sizeof(a));
+    if (run(ATOM_CMD_EXTERNAL_ENCODER, &a, sizeof(a)) < 0)
+        klog("radeon: ExternalEncoderControl, action %02x: the table failed\n", action);
 }
 
 void radeon_dp_encoder(int action)
@@ -1408,6 +1427,91 @@ static void set_base_dce4(const struct timing *t, int bpp, uint32_t pitch_px)
     wr(EG_MASTER_UPDATE_MODE + off, 0);     /* flips anywhere in the vertical blank */
 }
 
+/*
+ * The display's share of memory bandwidth (evergreen_bandwidth_update):
+ * the line buffer split, the DMIF buffers the pipe fetches into, and the
+ * latency watermarks and priority counts. Linux computes the watermarks
+ * from the memory and engine clocks; here the controller always runs the
+ * panel's own timing, the one the BIOS set them for, so the BIOS's values
+ * are kept at boot and put back after each mode change.
+ */
+static struct {
+    uint32_t lb_split, dmif, prio_a, prio_b, wm_a, wm_b;
+} bios_bw;
+
+/* Watermark set 1 (A, high clocks) or 2 (B, low clocks), selected in
+ * the arbitration register and put back as it was. */
+static uint32_t wm_access(int which, int write, uint32_t v)
+{
+    uint32_t pipe = (uint32_t)crtc_id * 16;
+    uint32_t arb = rd(EG_PIPE0_ARBITRATION_CONTROL3 + pipe);
+    wr(EG_PIPE0_ARBITRATION_CONTROL3 + pipe, (arb & ~EG_LATENCY_WATERMARK_MASK(3)) |
+                                             EG_LATENCY_WATERMARK_MASK(which));
+    if (write)
+        wr(EG_PIPE0_LATENCY_CONTROL + pipe, v);
+    else
+        v = rd(EG_PIPE0_LATENCY_CONTROL + pipe);
+    wr(EG_PIPE0_ARBITRATION_CONTROL3 + pipe, arb);
+    return v;
+}
+
+static void read_bandwidth(uint32_t *lb, uint32_t *dmif, uint32_t *pa, uint32_t *pb, uint32_t *wa,
+                           uint32_t *wb)
+{
+    uint32_t off = crtc_off(crtc_id);
+    *lb = rd(EG_DC_LB_MEMORY_SPLIT + off);
+    *dmif = rd(EG_PIPE0_DMIF_BUFFER_CONTROL + (uint32_t)crtc_id * 0x20);
+    *pa = rd(EG_PRIORITY_A_CNT + off);
+    *pb = rd(EG_PRIORITY_B_CNT + off);
+    *wa = wm_access(1, 0, 0);
+    *wb = wm_access(2, 0, 0);
+}
+
+static void save_bandwidth(void)
+{
+    read_bandwidth(&bios_bw.lb_split, &bios_bw.dmif, &bios_bw.prio_a, &bios_bw.prio_b, &bios_bw.wm_a,
+                   &bios_bw.wm_b);
+    klog("radeon: the BIOS's bandwidth: line buffer %x, DMIF %x, priority %05x/%05x, latency %08x/%08x\n",
+         bios_bw.lb_split, bios_bw.dmif, bios_bw.prio_a, bios_bw.prio_b, bios_bw.wm_a, bios_bw.wm_b);
+}
+
+/* After the mode change: the whole line buffer (the other controller is
+ * off), two DMIF buffers, the BIOS's watermarks (or the line time, if it
+ * left none), and the display's requests at high priority. */
+static void set_bandwidth_dce4(int log)
+{
+    if (log) {
+        uint32_t lb, dmif, pa, pb, wa, wb;
+        read_bandwidth(&lb, &dmif, &pa, &pb, &wa, &wb);
+        klog("radeon: bandwidth after the mode change: line buffer %x, DMIF %x, priority %05x/%05x, "
+             "latency %08x/%08x\n", lb, dmif, pa, pb, wa, wb);
+    }
+    uint32_t off = crtc_off(crtc_id);
+    wr(EG_DC_LB_MEMORY_SPLIT + off, (crtc_id & 1) ? 6u : 2u);
+    uint32_t dmif = EG_PIPE0_DMIF_BUFFER_CONTROL + (uint32_t)crtc_id * 0x20;
+    wr(dmif, 2);
+    for (int i = 0; i < 1000 && !(rd(dmif) & EG_DMIF_BUFFERS_ALLOCATED_COMPLETED); i++)
+        udelay(1);
+    uint32_t line_ns = timing_htotal(&panel) * 1000000u / panel.clock;
+    wm_access(1, 1, bios_bw.wm_a ? bios_bw.wm_a : MIN(line_ns, 65535u) << 16);
+    wm_access(2, 1, bios_bw.wm_b ? bios_bw.wm_b : MIN(line_ns, 65535u) << 16);
+    wr(EG_PRIORITY_A_CNT + off, (bios_bw.prio_a & ~EG_PRIORITY_OFF) | EG_PRIORITY_ALWAYS_ON);
+    wr(EG_PRIORITY_B_CNT + off, (bios_bw.prio_b & ~EG_PRIORITY_OFF) | EG_PRIORITY_ALWAYS_ON);
+}
+
+/* For the log: is the controller on, unblanked and scanning? */
+static void log_crtc_dce4(void)
+{
+    uint32_t off = crtc_off(crtc_id);
+    uint32_t p0 = rd(EG_CRTC_STATUS_POSITION + off);
+    udelay(2000);
+    uint32_t p1 = rd(EG_CRTC_STATUS_POSITION + off);
+    klog("radeon: controller %d: control %08x, blank %08x, surface %08x pitch %u, %s\n", crtc_id,
+         rd(EG_CRTC_CONTROL + off), rd(EG_CRTC_BLANK_CONTROL + off),
+         rd(EG_GRPH_PRIMARY_SURFACE_ADDRESS + off), rd(EG_GRPH_PITCH + off),
+         p0 != p1 ? "scanning" : "NOT scanning");
+}
+
 /* An identity gamma ramp (dce4_crtc_load_lut). */
 static void load_lut_dce4(void)
 {
@@ -1437,6 +1541,9 @@ static int encoder_dpms_dce4(int on)
     int travis = lcd && (out.ext_encoder & 0xFF) == ENCODER_TRAVIS;
     if (on) {
         int panel_mode = radeon_dp_panel_mode(out.ext_encoder != 0);
+        klog("radeon: encoder on: DIG %d, panel mode %02x, %d lane%s at %u kHz, %s reference\n", crtc_id,
+             panel_mode, dpsink.lanes, dpsink.lanes == 1 ? "" : "s", dpsink.link_clock,
+             dp_extclk ? "external" : pll_id == ATOM_PPLL1 ? "PPLL1" : "PLL");
         dig_encoder_dce4(ATOM_ENCODER_CMD_SETUP, 0);
         dig_encoder_dce4(ATOM_ENCODER_CMD_SETUP_PANEL_MODE, panel_mode);
         ext_encoder(EXTERNAL_ENCODER_ACTION_V3_ENCODER_SETUP);
@@ -1519,6 +1626,7 @@ static int program_mode_dce4(const struct timing *view, int bpp, uint32_t pitch_
     int r = set_pll_dce4(panel.clock);
     set_timing(&panel);
     set_base_dce4(view, bpp, pitch_px);
+    set_bandwidth_dce4(0);
     struct overscan_args ov;
     memset(&ov, 0, sizeof(ov));
     ov.crtc = (uint8_t)crtc_id;
@@ -1532,6 +1640,8 @@ static int program_mode_dce4(const struct timing *view, int bpp, uint32_t pitch_
     crtc_dpms(1);
     load_lut_dce4();
     crtc_call(ATOM_CMD_UPDATE_CRTC_DBUF, ATOM_DISABLE);
+    set_bandwidth_dce4(1);              /* again, in case enabling it reset them */
+    log_crtc_dce4();
     /* encoder commit; off and on again while the link will not come up,
      * as Linux's hot plug handling retrains */
     int link = encoder_dpms_dce4(1);
@@ -1545,11 +1655,43 @@ static int program_mode_dce4(const struct timing *view, int bpp, uint32_t pitch_
     return r < 0 ? r : link;
 }
 
+/*
+ * The mode change for Evergreen, as it is done unless radeon.dp_modeset=1
+ * asks for the whole one above. A panel runs one timing only, and the
+ * BIOS has it running: the PLL set, the DisplayPort link trained, the
+ * bridge on. A mode is then only what the controller scans out: the
+ * surface, the viewport, and the scaler stretching a smaller view to the
+ * panel (what Linux's "fastset" skips the full mode set for). Locked, the
+ * controller takes it all at one vertical blank; nothing is turned off.
+ */
+static int program_view_dce4(const struct timing *view, int bpp, uint32_t pitch_px)
+{
+    int scaled = view->w != panel.w || view->h != panel.h;
+    int saved = crtc_id;
+    /* Every controller the BIOS lit with the screen: nothing is turned off. */
+    FOR_EACH_CRTC(c) {
+        crtc_id = c;
+        uint32_t off = crtc_off(c);
+        crtc_call(ATOM_CMD_UPDATE_CRTC_DBUF, ATOM_ENABLE);
+        set_base_dce4(view, bpp, pitch_px);
+        struct scaler_args sc = { (uint8_t)c, scaled ? ATOM_SCALER_EXPANSION : ATOM_SCALER_DISABLE, 0, 0 };
+        run(ATOM_CMD_ENABLE_SCALER, &sc, sizeof(sc));
+        load_lut_dce4();
+        crtc_call(ATOM_CMD_UPDATE_CRTC_DBUF, ATOM_DISABLE);
+        klog("radeon: %ux%u on controller %d at the panel's timing (totals %ux%u)%s\n", view->w, view->h, c,
+             (rd(EG_CRTC_H_TOTAL + off) & 0x3FFF) + 1, (rd(EG_CRTC_V_TOTAL + off) & 0x3FFF) + 1,
+             scaled ? ", stretched by the scaler" : "");
+        log_crtc_dce4();
+    }
+    crtc_id = saved;
+    return 0;
+}
+
 /* The whole mode change, in the DRM helper's order. */
 static int program_mode(const struct timing *t, int bpp, uint32_t pitch_px)
 {
     if (RADEON_EVERGREEN())
-        return program_mode_dce4(t, bpp, pitch_px);
+        return dp_modeset ? program_mode_dce4(t, bpp, pitch_px) : program_view_dce4(t, bpp, pitch_px);
     uint32_t clock = t->clock;
     disable_other_crtc();
     if (is_dig() && !tx_initialised) {
@@ -1642,7 +1784,7 @@ int radeon_native_set(const struct dispmode *m)
         bpp = m->bpp;
         pitch_px = pitch_pixels(t->w, bpp);
     }
-    if (RADEON_EVERGREEN() && link_ready() < 0)
+    if (RADEON_EVERGREEN() && dp_modeset && link_ready() < 0)
         return -EIO;                /* nothing changed */
     busy = 1;
     if (m->width == 0) {
@@ -1679,10 +1821,12 @@ void radeon_native_resume(void)
 {
     if (!rv.native || !cur_timing || !RADEON_EVERGREEN())
         return;
-    encoders_init();
-    if (link_ready() < 0) {
-        klog("radeon: cannot set %ux%u again after waking\n", cur_timing->w, cur_timing->h);
-        return;
+    if (dp_modeset) {
+        encoders_init();
+        if (link_ready() < 0) {
+            klog("radeon: cannot set %ux%u again after waking\n", cur_timing->w, cur_timing->h);
+            return;
+        }
     }
     if (program_mode(cur_timing, cur_bpp, cur_pitch) < 0)
         klog("radeon: the mode change after waking did not complete (see above)\n");
@@ -1882,20 +2026,27 @@ static void modeset_init_dce4(void)
     dpsink.channel = out.i2c_id;
     dpsink.hpd = out.hpd;
     ext_encoder(EXTERNAL_ENCODER_ACTION_V3_DDC_SETUP);
+    dp_modeset = cmdline_has("radeon.dp_modeset=1");
     if (radeon_dp_read_dpcd() < 0) {
-        kprintf("radeon: the panel's DisplayPort bridge does not answer over AUX, keeping the BIOS mode\n");
-        return;
+        klog("radeon: the panel's DisplayPort bridge does not answer over AUX\n");
+        if (dp_modeset) {
+            kprintf("radeon: no DisplayPort mode set without the bridge, keeping the BIOS mode\n");
+            return;
+        }
+    } else {
+        const uint8_t *c = dpsink.dpcd;
+        klog("radeon: DPCD %02x %02x %02x %02x ... %02x: DisplayPort %u.%u, %u lane%s at up to %u.%02u GHz\n",
+             c[0], c[1], c[2], c[3], c[13], c[0] >> 4, c[0] & 0xF, c[2] & 0x1F,
+             (c[2] & 0x1F) == 1 ? "" : "s", c[1] * 27 / 100, c[1] * 27 % 100);
     }
-    const uint8_t *c = dpsink.dpcd;
-    klog("radeon: DPCD %02x %02x %02x %02x ... %02x: DisplayPort %u.%u, %u lane%s at up to %u.%02u GHz\n",
-         c[0], c[1], c[2], c[3], c[13], c[0] >> 4, c[0] & 0xF, c[2] & 0x1F, (c[2] & 0x1F) == 1 ? "" : "s",
-         c[1] * 27 / 100, c[1] * 27 % 100);
-    if (radeon_dp_link_config(panel.clock, panel_bpc * 3, (out.ext_encoder & 0xFF) == ENCODER_NUTMEG) < 0) {
+    if (dp_modeset &&
+        radeon_dp_link_config(panel.clock, panel_bpc * 3, (out.ext_encoder & 0xFF) == ENCODER_NUTMEG) < 0) {
         kprintf("radeon: no DisplayPort link the bridge offers carries the panel's %u kHz, keeping the "
                 "BIOS mode\n", panel.clock);
         return;
     }
-    rv.edid_ok = radeon_dp_read_edid(rv.edid);
+    if (dpsink.dpcd_ok)
+        rv.edid_ok = radeon_dp_read_edid(rv.edid);
     if (rv.edid_ok) {
         struct timing t;
         if (edid_parse_dtd(rv.edid + 54, &t))
@@ -1904,6 +2055,8 @@ static void modeset_init_dce4(void)
         klog("radeon: no EDID through the bridge; the panel's timing is LCD_Info's\n");
     }
 
+    if (dp_modeset)
+        save_bandwidth();
     rv.max_clock = panel.clock;
     panel_modes();
     if (!ml.n)
