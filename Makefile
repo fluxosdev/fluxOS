@@ -505,3 +505,15 @@ $(BUILD)/tests/browser-geometry: tests/browser-geometry.c $(BROWSER_TEST_SRCS) $
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DJS_VM_VERIFY -pthread $(DESKTOP_INC) -Iinclude -idirafter user/include \
 		tests/browser-geometry.c $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS)) -lm -o $@
+
+# S3 must boot through firmware/GRUB: QEMU -kernel reloads RAM on wake.
+.PHONY: test-suspend-qemu
+test-suspend-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-suspend $(GRUB_DEP)
+	python3 tools/test-suspend-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-suspend $(MKRESCUE) $(GRUB_PC_DIR) --cpus $(KERNEL_TEST_CPUS)
+
+$(BUILD)/tests/kernel-suspend.o: tests/kernel-suspend.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(BUILD)/tests/kernel-suspend: $(BUILD)/tests/kernel-suspend.o $(CRT0) $(LIBC) user/user.ld
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)

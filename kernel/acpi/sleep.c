@@ -22,14 +22,12 @@
  * display driver (Radeon, Voodoo) that cannot set its card up again, a
  * USB disk in use.
  *
- * The screen: blanked just before SLP_EN (fb_blank()), as a card that keeps
- * power (an emulator's) would go on showing the desktop. On waking the
- * video BIOS has forgotten its mode, so wakeup.S sets the VESA mode the
- * boot loader chose again (or text mode). "s3_bios" on the
- * command line also runs the video BIOS from the start first, for
- * machines whose firmware leaves the card cold; "s3_nomode" skips the
- * mode; "s3_beep" beeps as soon as the firmware hands over, to tell a
- * machine that never comes back from one that comes back to a dark screen.
+ * The screen is blanked just before SLP_EN. Firmware video calls on
+ * resume are opt-in: some BIOSes leave INT 10h unusable after S3 and
+ * hang before we can restore the kernel. "s3_mode" restores the boot
+ * video mode; "s3_bios" additionally runs the video ROM first.
+ * "s3_nomode" overrides mode restoration, and "s3_beep" beeps on entry
+ * to the waking vector to distinguish a failed wake from a dark screen.
  */
 #include <uacpi/acpi.h>
 #include <uacpi/event.h>
@@ -103,7 +101,7 @@ static void place_trampoline(void)
     uint8_t flags = 0;
     if (cmdline_has("s3_bios"))
         flags |= WF_POST;
-    if (!cmdline_has("s3_nomode"))
+    if ((cmdline_has("s3_mode") || cmdline_has("s3_bios")) && !cmdline_has("s3_nomode"))
         flags |= mode > 0 ? WF_VBE : WF_TEXT;
     if (cmdline_has("s3_beep"))
         flags |= WF_BEEP;
@@ -166,6 +164,7 @@ static void machine_sleep(void)
     pic_resume();
     pit_resume();
     serial_resume();
+    klog("power: %s; restoring devices\n", slept ? "CPU resumed from S3" : "S3 entry returned");
     pci_resume();
     fb_unblank();                       /* once the card answers its VGA ports again */
     uacpi_prepare_for_wake_from_sleep_state(UACPI_SLEEP_STATE_S3);

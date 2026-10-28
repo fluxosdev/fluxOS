@@ -124,10 +124,11 @@ stops at boot and says why.
   flushed and parked, the other processors parked, and on waking the
   processor, PICs, PCI configuration, IDE (with its DMA mode), AHCI, all four
   USB controllers (devices are found again), HD Audio, the network card and
-  the PS/2 devices are set up again, and the display's VESA mode is restored
-  from real mode. Options: `acpi=off`, `acpi=basic` (tables only, as before:
-  power-off without AML), `ec=off`, `lid=ignore` (closing the lid does nothing), `s3_bios` (run the video
-  BIOS on waking), `s3_nomode`, `s3_beep` (beep as soon as the firmware hands
+  the PS/2 devices are set up again. Video BIOS calls on wake are opt-in
+  because some firmware hangs in them before the kernel can resume. Options: `acpi=off`, `acpi=basic` (tables only, as before:
+  power-off without AML), `ec=off`, `lid=ignore` (closing the lid does nothing), `s3_mode` (restore the boot video mode),
+  `s3_bios` (run the video ROM first, then restore the mode), `s3_nomode`
+  (override mode restoration), `s3_beep` (beep as soon as the firmware hands
   back, to debug a machine that does not wake).
 - Display drivers:
   - Standard: keeps the VESA BIOS mode.
@@ -778,13 +779,20 @@ user range and page tables first.
 
 ## Work in progress
 
-- **Suspend to RAM does not come back yet.** On the first machine tried (an
-  HP ProBook with a Llano APU) closing the lid or `power sleep` suspends, but
-  on waking the screen stays black and the system does not answer. The
-  likeliest culprit is the video BIOS call (`int 10h`) wakeup.S makes to set
-  the mode again, which can hang if the firmware left the graphics cold;
-  `s3_nomode`, `s3_bios` and `s3_beep` are there to find out. Until it works,
-  boot with `lid=ignore` so closing the lid does nothing.
+- **Suspend to RAM on physical hardware still needs validation.** The wake
+  path previously called the video BIOS unconditionally, which hangs in
+  a GRUB-booted QEMU guest. Video BIOS calls are now opt-in; the default
+  path passes repeated S3 cycles in QEMU. On the HP ProBook with a Llano
+  APU, retest both system responsiveness and the screen: firmware may
+  leave the display dark without restoring its mode. `s3_mode` requests
+  that restoration, `s3_bios` also runs the video ROM first, and `s3_beep`
+  confirms entry to the wake code. These BIOS options can hang on affected
+  firmware. `lid=ignore` prevents automatic sleep while investigating.
+  For QEMU S3 tests, boot through GRUB (ISO or installed disk), not
+  `make run-kernel`: QEMU's direct kernel loader reloads kernel memory on
+  wake, destroying the saved resume context. `make test-suspend-qemu`
+  uses a disposable GRUB ISO and checks three sleep/wake cycles;
+  `KERNEL_TEST_CPUS=2` also exercises restarting the other processor.
 - **The Radeon driver on Llano APUs (HD 6520G and kin) is partial:** page
   flipping and the hardware pointer only, in the boot loader's mode. Native
   modes come next: the panel on these machines is DisplayPort (eDP, or LVDS
@@ -809,8 +817,8 @@ cannot be used.
   own modes or 3D engine (they cannot set the card up again: `radeon.modeset=0
   radeon.accel=0`; the Llano driver keeps to the BIOS mode, so it can), nor with a USB disk mounted
   (USB devices are let go of and found again). The screen comes back only
-  where the VESA BIOS can set its mode again on waking (`s3_bios` helps some
-  machines). No hibernation (S4), no processor frequency scaling, and
+  where firmware restores it, or where the opt-in `s3_mode` / `s3_bios`
+  video restoration works. No hibernation (S4), no processor frequency scaling, and
   touchpads other than Synaptics have no scrolling.
 - **SATA:** AHCI only, no NCQ, port multipliers or hot plugging; a controller
   above 4 GiB can't be reached.

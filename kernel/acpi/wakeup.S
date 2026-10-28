@@ -35,7 +35,10 @@ wakeup_start:
     movw %ax, %ds
     movw %ax, %es
     movw %ax, %ss
-    movw $WAKE_STACK, %sp
+    movl $WAKE_STACK, %esp
+
+    /* Firmware need not leave IDTR or the high half of ESP usable. */
+    lidtl W(wakeup_idt_desc)
 
     testb $WF_BEEP, W(wakeup_flags)
     jz 2f
@@ -62,7 +65,7 @@ wakeup_start:
     movw %ax, %ds
     movw %ax, %es
     movw %ax, %ss
-    movw $WAKE_STACK, %sp
+    movl $WAKE_STACK, %esp
     cli
     cld
 
@@ -74,8 +77,9 @@ wakeup_start:
     movw %cs, %ax
     movw %ax, %ds
     movw %ax, %ss
-    movw $WAKE_STACK, %sp
+    movl $WAKE_STACK, %esp
     cli
+    cld
 
 4:  testb $WF_TEXT, W(wakeup_flags)
     jz 5f
@@ -84,8 +88,9 @@ wakeup_start:
     movw %cs, %ax
     movw %ax, %ds
     movw %ax, %ss
-    movw $WAKE_STACK, %sp
+    movl $WAKE_STACK, %esp
     cli
+    cld
 
 5:  inb $0x92, %al                      /* A20 on (and not bit 0: that resets) */
     orb $0x02, %al
@@ -120,6 +125,9 @@ wakeup_gdt:
     .quad 0
     .quad 0x00CF9A000000FFFF            /* code: flat, ring 0 */
     .quad 0x00CF92000000FFFF            /* data: flat, ring 0 */
+wakeup_idt_desc:
+    .word 0x3FF
+    .long 0
 wakeup_gdt_desc:
     .word 3 * 8 - 1
     .long WAKE_BASE + W(wakeup_gdt)
