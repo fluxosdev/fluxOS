@@ -21,6 +21,11 @@
  *    and again after it changes, as 8-bit RGBA texels with lines of a
  *    multiple of 64. GL_DECAL draws as GL_REPLACE and GL_BLEND as
  *    GL_MODULATE here; GL_CLAMP clamps to the edge texel.
+ *  - Blending (CB_BLEND_CONTROL), the alpha test (SX_ALPHA_TEST_CONTROL,
+ *    with the depth test moved after the pixel shader) and the color mask
+ *    (CB_TARGET_MASK) are the engine's. The buffer's alpha is not GL's:
+ *    the destination alpha factors are given as 1 and 0. GL_REPLACE with
+ *    an RGB texture gives the texel's alpha, 1, not the fragment's.
  *  - glClear draws a rectangle at the clear depth with the depth test off
  *    and the color or depth writes masked as asked.
  *  - fglSwapBuffers submits the frame, then has the engine copy the color
@@ -78,7 +83,13 @@
 #define CB_SHADER_MASK     0x2823C
 #define PA_SC_GENERIC_SCISSOR_TL 0x28240
 #define VGT_MAX_VTX_INDX   0x28400
+#define SX_ALPHA_TEST_CONTROL 0x28410
+#define SX_ALPHA_REF       0x28438
+#define CB_BLEND0_CONTROL  0x28780
 #define DB_DEPTH_CONTROL   0x28800
+#define CB_BLEND_CONTROL   0x28804
+#define CB_COLOR_CONTROL   0x28808
+#define DB_SHADER_CONTROL  0x2880C
 #define PA_CL_VTE_CNTL     0x28818
 #define VTX_XY_FMT         (1u << 8)    /* x and y are already divided by w */
 #define VTX_Z_FMT          (1u << 9)    /* and z */
@@ -100,6 +111,21 @@
 #define CB_FORMAT(x)       ((x) << 2)
 #define CB_ARRAY_LINEAR_ALIGNED (1u << 8)
 #define CB_SOURCE_FORMAT_EXPORT_NORM (1u << 27)
+#define CB_BLEND_CLAMP     (1u << 20)
+#define CB_ROP3_COPY       (0xCCu << 16) /* CB_COLOR_CONTROL: the kernel's default */
+#define CB_TARGET0_BLEND   (1u << 8)
+#define DB_SHADER_DEFAULT  0x210        /* the kernel's default: early Z, then late */
+#define DB_Z_ORDER_MASK    (3u << 4)    /* 0 in it: late Z only */
+#define ALPHA_TEST_ENABLE  (1u << 3)
+/* CB_BLEND_CONTROL's factors */
+#define BLEND_ZERO          0
+#define BLEND_ONE           1
+#define BLEND_SRC_COLOR     2
+#define BLEND_ONE_MINUS_SRC_COLOR 3
+#define BLEND_SRC_ALPHA     4
+#define BLEND_ONE_MINUS_SRC_ALPHA 5
+#define BLEND_DST_COLOR     8
+#define BLEND_ONE_MINUS_DST_COLOR 9
 #define DEPTH_8_24         3
 #define DB_ARRAY_1D_TILED  (2u << 15)
 #define Z_ENABLE           (1u << 1)
@@ -414,10 +440,53 @@ static void emit_texture(const struct gltex *tex)
     emit(0);
 }
 
-/* Everything a run needs: shaders, buffers, scissor, depth test, and the
- * texture (NULL: none). */
+/* glColorMask as CB_TARGET_MASK's bits, which follow the components as
+ * exported: blue, green, red, alpha. */
+static uint32_t color_mask(struct fgl_context *c)
+{
+    return (c->color_mask[2] ? 1u : 0) | (c->color_mask[1] ? 2u : 0) | (c->color_mask[0] ? 4u : 0) |
+           (c->color_mask[3] ? 8u : 0);
+}
+
+static uint32_t blend_factor(GLenum f)
+{
+    switch (f) {
+    case GL_ONE: case GL_DST_ALPHA: return BLEND_ONE;      /* the destination's alpha is 1 */
+    case GL_SRC_COLOR: return BLEND_SRC_COLOR;
+    case GL_ONE_MINUS_SRC_COLOR: return BLEND_ONE_MINUS_SRC_COLOR;
+    case GL_SRC_ALPHA: return BLEND_SRC_ALPHA;
+    case GL_ONE_MINUS_SRC_ALPHA: return BLEND_ONE_MINUS_SRC_ALPHA;
+    case GL_DST_COLOR: return BLEND_DST_COLOR;
+    case GL_ONE_MINUS_DST_COLOR: return BLEND_ONE_MINUS_DST_COLOR;
+    default: return BLEND_ZERO;         /* GL_ZERO, GL_ONE_MINUS_DST_ALPHA, GL_SRC_ALPHA_SATURATE */
+    }
+}
+
+/* Blending and the alpha test, as the context has them (fragment_ops) or off. */
+static void emit_fragment_ops(struct fgl_context *c, int fragment_ops)
+{
+    int blend = fragment_ops && c->blend, atest = fragment_ops && c->alpha_test;
+    /* Source and destination factors; alpha blends with the color's (and is never seen). */
+    uint32_t bc = blend ? blend_factor(c->blend_src) | blend_factor(c->blend_dst) << 8 : BLEND_ONE;
+    bc |= bc << 16;
+    union {
+        float f;
+        uint32_t u;
+    } ref = { .f = c->alpha_ref };
+    set_context_reg(CB_COLOR_CONTROL, CB_ROP3_COPY | (blend ? CB_TARGET0_BLEND : 0));
+    set_context_reg(CB_BLEND_CONTROL, bc);
+    set_context_reg(CB_BLEND0_CONTROL, bc);
+    set_context_reg(SX_ALPHA_TEST_CONTROL, atest ? (c->alpha_func - GL_NEVER) | ALPHA_TEST_ENABLE : 0);
+    set_context_reg(SX_ALPHA_REF, ref.u);
+    /* A pixel the alpha test throws away must not have passed an early depth test. */
+    set_context_reg(DB_SHADER_CONTROL, atest ? DB_SHADER_DEFAULT & ~DB_Z_ORDER_MASK : DB_SHADER_DEFAULT);
+}
+
+/* Everything a run needs: shaders, buffers, scissor, depth test, blending
+ * and the alpha test (fragment_ops: as the context has them; otherwise
+ * off), and the texture (NULL: none). */
 static void emit_state(struct fgl_context *c, uint32_t target_mask, uint32_t depth_control,
-                       const struct gltex *tex)
+                       const struct gltex *tex, int fragment_ops)
 {
     struct radeon *t = c->bpriv;
     int x0, y0, x1, y1;
@@ -451,7 +520,7 @@ static void emit_state(struct fgl_context *c, uint32_t target_mask, uint32_t dep
     set_context_reg(CB_COLOR0_SIZE, size);
     set_context_reg(CB_COLOR0_VIEW, 0);
     set_context_reg(CB_COLOR0_INFO, CB_FORMAT(COLOR_8_8_8_8) | CB_ARRAY_LINEAR_ALIGNED |
-                                    CB_SOURCE_FORMAT_EXPORT_NORM);
+                                    CB_BLEND_CLAMP | CB_SOURCE_FORMAT_EXPORT_NORM);
     set_context_reg(CB_COLOR0_TILE, 0);
     set_context_reg(CB_COLOR0_FRAG, 0);
     set_context_reg(CB_COLOR0_MASK, 0);
@@ -463,6 +532,7 @@ static void emit_state(struct fgl_context *c, uint32_t target_mask, uint32_t dep
     set_context_reg(DB_DEPTH_VIEW, 0);
     set_context_reg(DB_DEPTH_INFO, DEPTH_8_24 | DB_ARRAY_1D_TILED);
     set_context_reg(DB_DEPTH_CONTROL, depth_control);
+    emit_fragment_ops(c, fragment_ops);
 
     emit(PACKET3(IT_SET_CONTEXT_REG, 2));
     emit((PA_SC_SCREEN_SCISSOR_TL - 0x28000u) >> 2);
@@ -489,7 +559,7 @@ static uint32_t depth_control(struct fgl_context *c)
 /* Room for verts more vertices and their state; submit first if need be. */
 static void make_room(uint32_t verts)
 {
-    if (hw.nvb + verts > VB_VERTS || hw.ncmd + 250 > CMD_DWORDS)
+    if (hw.nvb + verts > VB_VERTS || hw.ncmd + 300 > CMD_DWORDS)
         submit();
 }
 
@@ -543,7 +613,7 @@ static void load_state(struct fgl_context *c)
     if (hw.loaded == c && !c->hw_dirty)
         return;
     draw_run();
-    emit_state(c, 0xF, depth_control(c), tex);
+    emit_state(c, color_mask(c), depth_control(c), tex, 1);
     hw.loaded = c;
     c->hw_dirty = 0;
 }
@@ -633,7 +703,7 @@ static void radeon_clear(struct fgl_context *c, GLbitfield mask, int x0, int y0,
     make_room(6);
     draw_run();
     uint32_t dc = (mask & GL_DEPTH_BUFFER_BIT) ? Z_ENABLE | Z_WRITE_ENABLE | ZFUNC(ZFUNC_ALWAYS) : 0;
-    emit_state(c, (mask & GL_COLOR_BUFFER_BIT) ? 0xF : 0, dc, NULL);
+    emit_state(c, (mask & GL_COLOR_BUFFER_BIT) ? color_mask(c) : 0, dc, NULL, 0);
     float z = c->clear_depth;
     const float *rgba = c->clear_color;
     add_vertex((float)x0, (float)y0, z, 1, rgba, 0, 0);

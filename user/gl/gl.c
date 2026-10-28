@@ -1,6 +1,7 @@
 /*
  * GL contexts and state: switches, matrices and their stacks, lights and
- * materials, the viewport, clearing and the glGet queries.
+ * materials, the viewport, blending and the other fragment operations,
+ * polygon modes, clearing and the glGet queries.
  */
 #include <math.h>
 #include <stdlib.h>
@@ -288,6 +289,11 @@ static int *cap_flag(struct fgl_context *c, GLenum cap)
     case GL_SCISSOR_TEST: return &c->scissor_test;
     case GL_DITHER: return &c->dither;
     case GL_TEXTURE_2D: return &c->texture_2d;
+    case GL_BLEND: return &c->blend;
+    case GL_ALPHA_TEST: return &c->alpha_test;
+    case GL_POLYGON_OFFSET_FILL: return &c->offset_fill;
+    case GL_POLYGON_OFFSET_LINE: return &c->offset_line;
+    case GL_POLYGON_OFFSET_POINT: return &c->offset_point;
     case GL_POINT_SMOOTH: case GL_LINE_SMOOTH: case GL_POLYGON_SMOOTH:
         ignored = 0;
         return &ignored;                /* accepted; nothing is anti-aliased */
@@ -305,7 +311,7 @@ static void set_cap(GLenum cap, int on)
     int *flag = cap_flag(c, cap);
     if (!flag) {
         /* Features this GL lacks: switching them off is fine. */
-        if (!on && (cap == GL_BLEND || cap == GL_TEXTURE_1D || cap == GL_FOG || cap == GL_ALPHA_TEST))
+        if (!on && (cap == GL_TEXTURE_1D || cap == GL_FOG))
             return;
         gl_error(c, GL_INVALID_ENUM);
         return;
@@ -322,9 +328,12 @@ GLboolean glIsEnabled(GLenum cap)
     struct fgl_context *c = gl_ctx;
     if (!c)
         return GL_FALSE;
+    struct varray *a = gl_client_array(c, cap);
+    if (a)
+        return a->enabled ? GL_TRUE : GL_FALSE;
     int *flag = cap_flag(c, cap);
     if (!flag) {
-        if (cap != GL_BLEND && cap != GL_TEXTURE_1D && cap != GL_FOG && cap != GL_ALPHA_TEST)
+        if (cap != GL_TEXTURE_1D && cap != GL_FOG)
             gl_error(c, GL_INVALID_ENUM);
         return GL_FALSE;
     }
@@ -432,6 +441,80 @@ void glLineWidth(GLfloat width)
     c->line_width = width;
 }
 
+void glPolygonMode(GLenum face, GLenum mode)
+{
+    GET_CTX(c);
+    RECORD(c, OP_POLYGON_MODE, 2, face, mode);
+    OUTSIDE_BEGIN(c);
+    if ((face != GL_FRONT && face != GL_BACK && face != GL_FRONT_AND_BACK) ||
+        (mode != GL_POINT && mode != GL_LINE && mode != GL_FILL)) {
+        gl_error(c, GL_INVALID_ENUM);
+        return;
+    }
+    if (face != GL_BACK)
+        c->polygon_mode[0] = mode;
+    if (face != GL_FRONT)
+        c->polygon_mode[1] = mode;
+}
+
+void glPolygonOffset(GLfloat factor, GLfloat units)
+{
+    GET_CTX(c);
+    RECORD(c, OP_POLYGON_OFFSET, 2, factor, units);
+    OUTSIDE_BEGIN(c);
+    c->offset_factor = factor;
+    c->offset_units = units;
+}
+
+/* ---- fragment operations ---- */
+
+static int blend_factor_ok(GLenum f)
+{
+    return f == GL_ZERO || f == GL_ONE || (f >= GL_SRC_COLOR && f <= GL_SRC_ALPHA_SATURATE);
+}
+
+/* Any factor either way round, as GL 1.4 allows, except that only the
+ * source may saturate. */
+void glBlendFunc(GLenum sfactor, GLenum dfactor)
+{
+    GET_CTX(c);
+    RECORD(c, OP_BLEND_FUNC, 2, sfactor, dfactor);
+    OUTSIDE_BEGIN(c);
+    if (!blend_factor_ok(sfactor) || !blend_factor_ok(dfactor) || dfactor == GL_SRC_ALPHA_SATURATE) {
+        gl_error(c, GL_INVALID_ENUM);
+        return;
+    }
+    c->blend_src = sfactor;
+    c->blend_dst = dfactor;
+    c->hw_dirty = 1;
+}
+
+void glAlphaFunc(GLenum func, GLclampf ref)
+{
+    GET_CTX(c);
+    RECORD(c, OP_ALPHA_FUNC, 2, func, ref);
+    OUTSIDE_BEGIN(c);
+    if (func < GL_NEVER || func > GL_ALWAYS) {
+        gl_error(c, GL_INVALID_ENUM);
+        return;
+    }
+    c->alpha_func = func;
+    c->alpha_ref = gl_clampf(ref);
+    c->hw_dirty = 1;
+}
+
+void glColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha)
+{
+    GET_CTX(c);
+    RECORD(c, OP_COLOR_MASK, 4, red, green, blue, alpha);
+    OUTSIDE_BEGIN(c);
+    c->color_mask[0] = red != 0;
+    c->color_mask[1] = green != 0;
+    c->color_mask[2] = blue != 0;
+    c->color_mask[3] = alpha != 0;
+    c->hw_dirty = 1;
+}
+
 void glViewport(GLint x, GLint y, GLsizei w, GLsizei h)
 {
     GET_CTX(c);
@@ -512,7 +595,11 @@ void glClear(GLbitfield mask)
     }
     if (!c->depth_mask)
         mask &= ~(GLbitfield)GL_DEPTH_BUFFER_BIT;
+    if (!gl_rgb_write_mask(c))
+        mask &= ~(GLbitfield)GL_COLOR_BUFFER_BIT;
     mask &= GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT;     /* there is no stencil or accum */
+    if (mask & GL_COLOR_BUFFER_BIT)
+        gl_check_backend(c);
     int x0, y0, x1, y1;
     gl_clip_rect(c, &x0, &y0, &x1, &y1);
     if (mask && x1 > x0 && y1 > y0)
@@ -777,7 +864,7 @@ static int get_values(struct fgl_context *c, GLenum pname, double *v)
     case GL_UNPACK_ROW_LENGTH: v[0] = c->unpack_row_length; return 1;
     case GL_UNPACK_SKIP_ROWS: v[0] = c->unpack_skip_rows; return 1;
     case GL_UNPACK_SKIP_PIXELS: v[0] = c->unpack_skip_pixels; return 1;
-    case GL_PACK_ALIGNMENT: v[0] = 4; return 1;
+    case GL_PACK_ALIGNMENT: v[0] = c->pack_align; return 1;
     case GL_DEPTH_RANGE:
         v[0] = c->depth_near; v[1] = c->depth_far;
         return 2;
@@ -800,9 +887,36 @@ static int get_values(struct fgl_context *c, GLenum pname, double *v)
     case GL_GREEN_BITS:
         v[0] = c->be == &gl_tdfx_backend ? 6 : 8;
         return 1;
-    case GL_DEPTH_BITS:
-        v[0] = c->be == &gl_tdfx_backend ? 16 : c->be == &gl_radeon_backend ? 24 : 30;
-        return 1;
+    case GL_ALPHA_BITS: v[0] = 0; return 1;
+    case GL_DEPTH_BITS: v[0] = gl_depth_bits(c); return 1;
+    case GL_BLEND_SRC: v[0] = c->blend_src; return 1;
+    case GL_BLEND_DST: v[0] = c->blend_dst; return 1;
+    case GL_ALPHA_TEST_FUNC: v[0] = c->alpha_func; return 1;
+    case GL_ALPHA_TEST_REF: v[0] = c->alpha_ref; return 1;
+    case GL_COLOR_WRITEMASK:
+        for (int i = 0; i < 4; i++)
+            v[i] = c->color_mask[i];
+        return 4;
+    case GL_POLYGON_MODE:
+        v[0] = c->polygon_mode[0]; v[1] = c->polygon_mode[1];
+        return 2;
+    case GL_POLYGON_OFFSET_FACTOR: v[0] = c->offset_factor; return 1;
+    case GL_POLYGON_OFFSET_UNITS: v[0] = c->offset_units; return 1;
+    case GL_DRAW_BUFFER: v[0] = c->draw_buffer; return 1;
+    case GL_READ_BUFFER: v[0] = c->read_buffer; return 1;
+    case GL_DOUBLEBUFFER: v[0] = 1; return 1;
+    case GL_PACK_ROW_LENGTH: v[0] = c->pack_row_length; return 1;
+    case GL_PACK_SKIP_ROWS: v[0] = c->pack_skip_rows; return 1;
+    case GL_PACK_SKIP_PIXELS: v[0] = c->pack_skip_pixels; return 1;
+    case GL_LIST_BASE: v[0] = c->list_base; return 1;
+    case GL_LIST_INDEX: v[0] = c->compiling ? c->compiling_id : 0; return 1;
+    case GL_LIST_MODE: v[0] = c->compiling ? c->list_mode : 0; return 1;
+    case GL_MAX_LIST_NESTING: v[0] = 64; return 1;
+    }
+    {
+        int n = gl_array_get(c, pname, v);
+        if (n)
+            return n;
     }
     {
         int *flag = cap_flag(c, pname);
@@ -838,7 +952,8 @@ void glGetIntegerv(GLenum pname, GLint *params)
     GET_CTX(c);
     double v[16];
     int n = get_values(c, pname, v);
-    int colors = pname == GL_CURRENT_COLOR || pname == GL_COLOR_CLEAR_VALUE || pname == GL_TEXTURE_ENV_COLOR;
+    int colors = pname == GL_CURRENT_COLOR || pname == GL_COLOR_CLEAR_VALUE || pname == GL_TEXTURE_ENV_COLOR ||
+                 pname == GL_ALPHA_TEST_REF;
     for (int i = 0; i < n; i++)
         params[i] = colors ? (GLint)(v[i] * 2147483647.0) : (GLint)(v[i] < 0 ? v[i] - 0.5 : v[i] + 0.5);
 }
@@ -876,6 +991,19 @@ static void init_state(struct fgl_context *c)
     c->clear_depth = 1;
     c->point_size = 1;
     c->line_width = 1;
+    c->polygon_mode[0] = c->polygon_mode[1] = GL_FILL;
+    c->blend_src = GL_ONE;
+    c->blend_dst = GL_ZERO;
+    c->alpha_func = GL_ALWAYS;
+    for (int i = 0; i < 4; i++)
+        c->color_mask[i] = 1;
+    c->draw_buffer = c->read_buffer = GL_BACK;
+    c->pack_align = 4;
+    c->arrays[ARRAY_VERTEX].size = 4;
+    c->arrays[ARRAY_COLOR].size = 4;
+    c->arrays[ARRAY_TEXCOORD].size = 4;
+    for (int i = 0; i < NARRAYS; i++)
+        c->arrays[i].type = GL_FLOAT;
     for (int i = 0; i < MAX_LIGHTS; i++) {
         struct light *l = &c->lights[i];
         l->ambient[3] = l->diffuse[3] = l->specular[3] = 1;
@@ -967,6 +1095,17 @@ void fglMakeCurrent(FGLcontext *c)
 FGLcontext *fglGetCurrentContext(void)
 {
     return gl_ctx;
+}
+
+int gl_depth_bits(struct fgl_context *c)
+{
+    return c->be == &gl_tdfx_backend ? 16 : c->be == &gl_radeon_backend ? 24 : 30;
+}
+
+void gl_check_backend(struct fgl_context *c)
+{
+    if (c->be == &gl_tdfx_backend && !gl_tdfx_can_draw(c))
+        gl_use_software(c, 1);
 }
 
 /* Fall back to drawing in memory if the hardware cannot keep the context

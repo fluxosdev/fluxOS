@@ -12,9 +12,17 @@
  *    float, then sBeginTriCMD (first vertex) or sDrawTriCMD (the rest).
  *    The chip works out the gradients and fills the triangle, with
  *    Gouraud shading, the depth test and 4x4 dithering.
+ *  - alphaMode does the alpha test and blending, with the iterated alpha.
+ *    The color buffer has no alpha: the destination alpha factors are
+ *    given as 1 and 0.
  *  - glClear is a fastfillCMD over the clip rectangle.
  *  - fglSwapBuffers waits for the engine to go idle and reads the picture
- *    back through the linear frame buffer.
+ *    back through the linear frame buffer, and glReadPixels the depth
+ *    buffer too.
+ *
+ * The engine cannot texture, write some color channels and not others, or
+ * blend with GL_SRC_COLOR as the source factor or GL_DST_COLOR as the
+ * destination's; a context that asks for those goes on in software.
  *
  * The 3D engine renders 16-bit color only, which is what a Voodoo3 game
  * gets too; the desktop shows it in a window of any depth.
@@ -73,6 +81,22 @@
 #define FBZ_DITHER      (1u << 8)
 #define FBZ_RGB_WRITE   (1u << 9)
 #define FBZ_AUX_WRITE   (1u << 10)
+
+/* alphaMode */
+#define AM_TEST         (1u << 0)
+#define AM_FUNC_SHIFT   1
+#define AM_BLEND        (1u << 4)
+#define AM_RGB_SRC_SHIFT 8
+#define AM_RGB_DST_SHIFT 12
+#define AM_REF_SHIFT    24
+/* its blend factors; A_COLOR is the destination's color as a source
+ * factor and the source's as a destination factor */
+#define A_ZERO          0
+#define A_SRC_ALPHA     1
+#define A_COLOR         2
+#define A_ONE           4
+#define A_OM_SRC_ALPHA  5
+#define A_OM_COLOR      6
 
 /* sSetupMode */
 #define SETUP_RGB   (1u << 0)
@@ -193,7 +217,9 @@ static void wait_idle(void)
 
 static uint32_t fbz_mode(struct fgl_context *c)
 {
-    uint32_t m = FBZ_CLIP | FBZ_RGB_WRITE;
+    uint32_t m = FBZ_CLIP;
+    if (gl_rgb_write_mask(c))
+        m |= FBZ_RGB_WRITE;
     if (c->dither)
         m |= FBZ_DITHER;
     if (c->depth_test) {
@@ -202,6 +228,43 @@ static uint32_t fbz_mode(struct fgl_context *c)
             m |= FBZ_AUX_WRITE;
     }
     return m;
+}
+
+/* A GL blend factor as alphaMode's; -1 if the engine has no such factor
+ * that way round. */
+static int blend_factor(GLenum f, int src)
+{
+    switch (f) {
+    case GL_ZERO: case GL_ONE_MINUS_DST_ALPHA: case GL_SRC_ALPHA_SATURATE: return A_ZERO;
+    case GL_ONE: case GL_DST_ALPHA: return A_ONE;      /* the destination's alpha is 1 */
+    case GL_SRC_ALPHA: return A_SRC_ALPHA;
+    case GL_ONE_MINUS_SRC_ALPHA: return A_OM_SRC_ALPHA;
+    case GL_DST_COLOR: return src ? A_COLOR : -1;
+    case GL_ONE_MINUS_DST_COLOR: return src ? A_OM_COLOR : -1;
+    case GL_SRC_COLOR: return src ? -1 : A_COLOR;
+    case GL_ONE_MINUS_SRC_COLOR: return src ? -1 : A_OM_COLOR;
+    }
+    return -1;
+}
+
+static uint32_t alpha_mode(struct fgl_context *c)
+{
+    uint32_t m = 0;
+    if (c->alpha_test)
+        m |= AM_TEST | (c->alpha_func - GL_NEVER) << AM_FUNC_SHIFT |
+             (uint32_t)gl_iround(c->alpha_ref * 255) << AM_REF_SHIFT;
+    int src = blend_factor(c->blend_src, 1), dst = blend_factor(c->blend_dst, 0);
+    if (c->blend && src >= 0 && dst >= 0)  /* otherwise the next glBegin goes to software */
+        m |= AM_BLEND | (uint32_t)src << AM_RGB_SRC_SHIFT | (uint32_t)dst << AM_RGB_DST_SHIFT;
+    return m;
+}
+
+int gl_tdfx_can_draw(struct fgl_context *c)
+{
+    uint32_t wmask = gl_rgb_write_mask(c);
+    if (gl_active_texture(c) || (wmask != 0 && wmask != 0xFFFFFF))
+        return 0;
+    return !c->blend || (blend_factor(c->blend_src, 1) >= 0 && blend_factor(c->blend_dst, 0) >= 0);
 }
 
 /* fbzMode's buffer select can move the draw address, so colBufferAddr follows it. */
@@ -222,7 +285,7 @@ static void load_state(struct fgl_context *c)
     gl_clip_rect(c, &x0, &y0, &x1, &y1);
     wr(SST_fbzColorPath, CC_ZERO_OTHER | CC_ADD_CLOCAL | CCA_ZERO_OTHER | CCA_ADD_CLOCAL |
                          CP_PARAM_ADJUST | CP_CLAMP);
-    wr(SST_alphaMode, 0);
+    wr(SST_alphaMode, alpha_mode(c));
     wr(SST_fogMode, 0);
     wr(SST_lfbMode, 0);
     wr(SST_textureMode, 0);
@@ -299,9 +362,11 @@ static void tdfx_clear(struct fgl_context *c, GLbitfield mask, int x0, int y0, i
         mode |= FBZ_RGB_WRITE;
     if (mask & GL_DEPTH_BUFFER_BIT)
         mode |= FBZ_AUX_WRITE;
+    wr(SST_alphaMode, 0);               /* the fill is not blended */
     set_fbz(c, mode);
     wr(SST_fastfillCMD, 0);
     set_fbz(c, fbz_mode(c));
+    wr(SST_alphaMode, alpha_mode(c));
 }
 
 static void tdfx_polygon(struct fgl_context *c, const struct wvert *v, int n)
@@ -366,6 +431,18 @@ static void tdfx_read(struct fgl_context *c, uint32_t *dst, int stride)
     }
 }
 
+/* The 16-bit depth buffer, through the linear frame buffer like the color. */
+static void tdfx_read_depth(struct fgl_context *c, int x, int y, int w, int h, float *dst)
+{
+    struct tdfx *t = c->bpriv;
+    for (int j = 0; j < h; j++) {
+        const volatile uint16_t *src =
+            (const volatile uint16_t *)(hw.vram + t->aux + (uint32_t)(y + j) * t->stride) + x;
+        for (int i = 0; i < w; i++)
+            *dst++ = (float)src[i] * (1.0f / 65535.0f);
+    }
+}
+
 const struct backend gl_tdfx_backend = {
     .name = "3dfx Voodoo",
     .resize = tdfx_resize,
@@ -374,6 +451,7 @@ const struct backend gl_tdfx_backend = {
     .polygon = tdfx_polygon,
     .finish = tdfx_finish,
     .read = tdfx_read,
+    .read_depth = tdfx_read_depth,
 };
 
 int gl_tdfx_attach(struct fgl_context *c)

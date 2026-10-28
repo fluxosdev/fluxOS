@@ -480,7 +480,8 @@ static float box_distance(float x, float y, float cx, float cy, float hw, float 
     return d > 0.0f ? d : 0.0f;
 }
 
-void gfx_shadow(struct surface *s, struct rect r, int rad, int dy, int blur, color_t argb)
+/* The shadow worked out pixel by pixel, for boxes too small for a table. */
+static void shadow_direct(struct surface *s, struct rect r, int rad, int dy, int blur, color_t argb)
 {
     struct rect area = mkrect(r.x - blur, r.y - blur + dy, r.w + 2 * blur, r.h + 2 * blur);
     struct rect c = rect_intersect(area, s->clip);
@@ -504,6 +505,112 @@ void gfx_shadow(struct surface *s, struct rect r, int rad, int dy, int blur, col
                 continue;
             float k = 1.0f - d / fb;
             put_argb(&row[i], argb, (int)(k * k * 256.0f));
+        }
+    }
+    simd_done();
+}
+
+/* How much of the color's alpha the shadow of a w x h box puts on pixel (bi, bj) of the box
+ * (out of 256): the same arithmetic as shadow_direct(), with the box at the origin. */
+static int shadow_cov(int bi, int bj, int w, int h, int rad, int dy, int blur)
+{
+    float cx = (float)w / 2.0f, cy = (float)dy + (float)h / 2.0f;
+    float hw = (float)w / 2.0f, hh = (float)h / 2.0f, fb = (float)blur;
+    if (bj >= rad && bj < h - rad && bi >= 0 && bi < w)
+        return 0;                       /* the box covers its whole width here */
+    if (round_cov(bi, bj, w, h, rad, rad) == 256)
+        return 0;
+    float d = box_distance((float)bi + 0.5f, (float)bj + 0.5f, cx, cy, hw, hh, (float)rad);
+    if (d >= fb)
+        return 0;
+    float k = 1.0f - d / fb;
+    return (int)(k * k * 256.0f);
+}
+
+/*
+ * A box shadow's coverage depends only on where a pixel is relative to the box, and along the
+ * straight stretch of each side not on how far along it is. So a whole shadow fits in a small
+ * table: the corners' rows and columns, with each straight stretch as one row or column between
+ * them. The last few sizes drawn are kept, so a window being dragged costs no arithmetic.
+ */
+struct shadow_map {
+    int w, h, rad, dy, blur;
+    int x0, x1, y0, y1;                 /* the straight stretch: box columns x0..x1, rows y0..y1 */
+    int cols, rows;
+    uint16_t *cov;                      /* cols x rows */
+};
+static struct shadow_map shadow_maps[8];
+static int shadow_next;
+
+static const struct shadow_map *shadow_map(int w, int h, int rad, int dy, int blur)
+{
+    for (int i = 0; i < 8; i++) {
+        struct shadow_map *m = &shadow_maps[i];
+        if (m->cov && m->w == w && m->h == h && m->rad == rad && m->dy == dy && m->blur == blur)
+            return m;
+    }
+    /* Columns rad..w-rad-1 are alike (within the box's width, clear of its corners), and so
+     * are the rows clear of the corners of both the box and of its shadow, dy lower. */
+    int x0 = rad, x1 = w - rad - 1;
+    int y0 = rad + (dy > 0 ? dy : 0), y1 = h - rad - 1 + (dy < 0 ? dy : 0);
+    if (x1 < x0 || y1 < y0)
+        return NULL;
+    int top = y0 - (dy - blur), left = x0 + blur;
+    int cols = left + 1 + (w + blur - 1 - x1);
+    int rows = top + 1 + (h + blur + dy - 1 - y1);
+    uint16_t *cov = malloc(sizeof(*cov) * (size_t)cols * (size_t)rows);
+    if (!cov)
+        return NULL;
+    struct shadow_map *m = &shadow_maps[shadow_next];
+    shadow_next = (shadow_next + 1) % 8;
+    free(m->cov);
+    *m = (struct shadow_map){ w, h, rad, dy, blur, x0, x1, y0, y1, cols, rows, cov };
+    for (int yi = 0; yi < rows; yi++) {
+        int bj = yi < top ? dy - blur + yi : y1 + (yi - top);
+        if (yi == top)
+            bj = y0;
+        for (int xi = 0; xi < cols; xi++) {
+            int bi = xi < left ? xi - blur : x1 + (xi - left);
+            if (xi == left)
+                bi = x0;
+            cov[yi * cols + xi] = (uint16_t)shadow_cov(bi, bj, w, h, rad, dy, blur);
+        }
+    }
+    return m;
+}
+
+void gfx_shadow(struct surface *s, struct rect r, int rad, int dy, int blur, color_t argb)
+{
+    struct rect area = mkrect(r.x - blur, r.y - blur + dy, r.w + 2 * blur, r.h + 2 * blur);
+    struct rect c = rect_intersect(area, s->clip);
+    if (rect_empty(c) || blur <= 0)
+        return;
+    const struct shadow_map *m = shadow_map(r.w, r.h, rad, dy, blur);
+    if (!m) {
+        shadow_direct(s, r, rad, dy, blur, argb);
+        return;
+    }
+    int top = m->y0 - (dy - blur), left = m->x0 + blur;
+    for (int j = c.y; j < c.y + c.h; j++) {
+        int bj = j - r.y;
+        int yi = bj < m->y0 ? bj - (dy - blur) : bj <= m->y1 ? top : top + (bj - m->y1);
+        const uint16_t *cov = m->cov + yi * m->cols;
+        uint32_t *row = s->px + j * s->stride;
+        for (int i = c.x; i < c.x + c.w; i++) {
+            int bi = i - r.x, xi;
+            if (bi < m->x0) {
+                xi = bi + blur;
+            } else if (bi <= m->x1) {
+                xi = left;
+                if (!cov[xi]) {                 /* nothing anywhere along the straight stretch */
+                    i = r.x + m->x1;
+                    continue;
+                }
+            } else {
+                xi = left + (bi - m->x1);
+            }
+            if (cov[xi])
+                put_argb(&row[i], argb, cov[xi]);
         }
     }
     simd_done();

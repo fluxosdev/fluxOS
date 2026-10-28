@@ -1,9 +1,13 @@
 /*
  * The GL library's insides. gl.c keeps the state, prim.c turns vertices
- * into lit, clipped polygons in window coordinates, list.c records and
- * replays display lists, tex.c keeps textures, and a backend draws the
+ * into lit, clipped polygons in window coordinates, array.c feeds it from
+ * vertex arrays, list.c records and replays display lists, tex.c keeps
+ * textures, pixels.c reads the picture back, and a backend draws the
  * polygons: radeon.c on a
  * Radeon HD 4000's 3D engine, tdfx.c on a Voodoo card's, soft.c in memory.
+ *
+ * There is no destination alpha anywhere: GL_DST_ALPHA blends as 1 and
+ * GL_ALPHA_BITS is 0.
  */
 #ifndef GLINT_H
 #define GLINT_H
@@ -75,6 +79,16 @@ struct dlist {
     int n, cap;
 };
 
+/* A client vertex array (glVertexPointer and the like). */
+enum { ARRAY_VERTEX, ARRAY_NORMAL, ARRAY_COLOR, ARRAY_TEXCOORD, NARRAYS };
+struct varray {
+    int enabled;
+    int size;                   /* components a vertex */
+    GLenum type;
+    int stride;                 /* as given: 0 means tightly packed */
+    const void *ptr;
+};
+
 struct fgl_context;
 
 struct backend {
@@ -88,6 +102,9 @@ struct backend {
     void (*polygon)(struct fgl_context *c, const struct wvert *v, int n);
     void (*finish)(struct fgl_context *c);
     void (*read)(struct fgl_context *c, uint32_t *dst, int stride);
+    /* Depths from 0 to 1 of the rectangle [x, x + w) x [y, y + h), top-left
+     * origin, a row at a time (optional: without it depth cannot be read). */
+    void (*read_depth)(struct fgl_context *c, int x, int y, int w, int h, float *dst);
     /* A texture is going away, or its texels changed: drop the backend's
      * copy (optional). */
     void (*tex_free)(struct fgl_context *c, struct gltex *t);
@@ -119,6 +136,17 @@ struct fgl_context {
     int depth_mask;
     float clear_color[4], clear_depth;
     float point_size, line_width;
+    GLenum polygon_mode[2];             /* front faces, back faces */
+    int offset_fill, offset_line, offset_point;
+    float offset_factor, offset_units;
+
+    /* fragments */
+    int blend, alpha_test;
+    GLenum blend_src, blend_dst, alpha_func;
+    float alpha_ref;
+    int color_mask[4];
+    GLenum draw_buffer, read_buffer;
+    int pack_align, pack_row_length, pack_skip_rows, pack_skip_pixels;
 
     /* lighting */
     struct light lights[MAX_LIGHTS];
@@ -155,6 +183,10 @@ struct fgl_context {
     GLuint compiling_id;
     GLenum list_mode;
     int executing;              /* nesting of glCallList */
+    GLuint list_base;
+
+    /* vertex arrays */
+    struct varray arrays[NARRAYS];
 };
 
 extern struct fgl_context *gl_ctx;
@@ -166,18 +198,32 @@ float *gl_top_matrix(struct fgl_context *c);
 void gl_matrix_changed(struct fgl_context *c);
 /* The drawing rectangle: the buffer, cut down by the scissor box. */
 void gl_clip_rect(struct fgl_context *c, int *x0, int *y0, int *x1, int *y1);
+int gl_depth_bits(struct fgl_context *c);
+/* Before drawing: a backend that cannot draw with today's state gives way
+ * to software, keeping the picture. */
+void gl_check_backend(struct fgl_context *c);
+
+/* The color channels glColorMask lets through, as a 0xRRGGBB mask. */
+static inline uint32_t gl_rgb_write_mask(const struct fgl_context *c)
+{
+    return (c->color_mask[0] ? 0xFF0000u : 0) | (c->color_mask[1] ? 0xFF00u : 0) |
+           (c->color_mask[2] ? 0xFFu : 0);
+}
 
 /* tex.c */
 void gl_tex_init(struct fgl_context *c);
 void gl_tex_free_all(struct fgl_context *c);
 /* The texture to draw with: GL_TEXTURE_2D is on and the bound texture has texels. */
 struct gltex *gl_active_texture(struct fgl_context *c);
-/* Before drawing: a backend that cannot texture gives way to software. */
-void gl_tex_check_backend(struct fgl_context *c);
 
 /* prim.c */
 void gl_prim_init(struct fgl_context *c);
 void gl_update_normal_matrix(struct fgl_context *c);
+
+/* array.c: the client array a glEnableClientState capability names, or NULL. */
+struct varray *gl_client_array(struct fgl_context *c, GLenum cap);
+/* glGet of vertex array state; returns the number of values, 0 if pname is not one. */
+int gl_array_get(struct fgl_context *c, GLenum pname, double *v);
 
 /* list.c: when a list is being compiled, record the call. Returns 1 if the
  * call must not run now (GL_COMPILE). */
@@ -188,7 +234,8 @@ enum {
     OP_POP_MATRIX, OP_TRANSLATE, OP_ROTATE, OP_SCALE, OP_FRUSTUM, OP_ORTHO, OP_CALL_LIST,
     OP_CULL_FACE, OP_FRONT_FACE, OP_DEPTH_FUNC, OP_DEPTH_MASK, OP_DEPTH_RANGE, OP_CLEAR,
     OP_CLEAR_COLOR, OP_CLEAR_DEPTH, OP_VIEWPORT, OP_SCISSOR, OP_POINT_SIZE, OP_LINE_WIDTH,
-    OP_TEXCOORD, OP_BIND_TEXTURE, OP_TEX_ENV, OP_TEX_PARAMETER,
+    OP_TEXCOORD, OP_BIND_TEXTURE, OP_TEX_ENV, OP_TEX_PARAMETER, OP_BLEND_FUNC, OP_ALPHA_FUNC,
+    OP_COLOR_MASK, OP_POLYGON_MODE, OP_POLYGON_OFFSET, OP_LIST_BASE, OP_CALL_LISTS,
 };
 int gl_record(struct fgl_context *c, int op, int nargs, const float *args);
 void gl_free_lists(struct fgl_context *c);
@@ -213,6 +260,7 @@ int gl_tdfx_attach(struct fgl_context *c);     /* 0: the hardware took the conte
 int gl_tdfx_check(struct fgl_context *c);      /* 0: its video memory is still free */
 int gl_radeon_attach(struct fgl_context *c);
 int gl_radeon_check(struct fgl_context *c);    /* 0: the engine still runs */
+int gl_tdfx_can_draw(struct fgl_context *c);   /* 1: the Voodoo can draw with today's state */
 /* Draw in memory from now on, starting from the picture as it is. */
 int gl_use_software(struct fgl_context *c, int keep_picture);
 void gl_soft_load(struct fgl_context *c, const uint32_t *picture);

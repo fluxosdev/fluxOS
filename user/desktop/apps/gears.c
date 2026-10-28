@@ -7,8 +7,9 @@
  *
  * Drag with the mouse or use the arrow keys to turn the view; Space
  * pauses, Home puts the view back, S moves on to the next renderer there
- * is (Radeon, Voodoo, software), to compare them, and T puts a checked
- * texture on the gears or takes it off.
+ * is (Radeon, Voodoo, software), to compare them, T puts a checked
+ * texture on the gears or takes it off, W draws them as wireframes
+ * (glPolygonMode) and B makes them see-through (blending).
  *
  * This file is built with the FPU allowed (USER_FP_CFLAGS).
  */
@@ -30,13 +31,13 @@ struct gears {
     int ctx_w, ctx_h;                   /* the context's picture size */
     GLuint gear1, gear2, gear3;
     GLuint texture;
-    int textured;
+    int textured, wireframe, see_through;
     float angle, rot_x, rot_y;
     int paused;
     unsigned int last_ms;               /* when the angle last advanced */
     unsigned int fps_since;
     int frames;
-    char status[64];
+    char status[128];
     int dragging, drag_x, drag_y;
     struct gears *next;
 };
@@ -159,12 +160,27 @@ static GLuint make_gear(const GLfloat *color, float inner, float outer, float wi
     return list;
 }
 
+/* The W and B switches: wireframes, and see-through gears (their alpha,
+ * which only blending shows, is 0.6) drawn without the depth test. */
+static void apply_modes(struct gears *g)
+{
+    glPolygonMode(GL_FRONT_AND_BACK, g->wireframe ? GL_LINE : GL_FILL);
+    if (g->see_through) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_DEPTH_TEST);
+    } else {
+        glDisable(GL_BLEND);
+        glEnable(GL_DEPTH_TEST);
+    }
+}
+
 static void scene_init(struct gears *g)
 {
     static const GLfloat pos[4] = { 5, 5, 10, 0 };
-    static const GLfloat red[4] = { 0.8f, 0.1f, 0, 1 };
-    static const GLfloat green[4] = { 0, 0.8f, 0.2f, 1 };
-    static const GLfloat blue[4] = { 0.2f, 0.2f, 1, 1 };
+    static const GLfloat red[4] = { 0.8f, 0.1f, 0, 0.6f };
+    static const GLfloat green[4] = { 0, 0.8f, 0.2f, 0.6f };
+    static const GLfloat blue[4] = { 0.2f, 0.2f, 1, 0.6f };
 
     glLightfv(GL_LIGHT0, GL_POSITION, pos);
     glEnable(GL_CULL_FACE);
@@ -196,6 +212,7 @@ static void scene_init(struct gears *g)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 64, 64, 0, GL_RGB, GL_UNSIGNED_BYTE, texels);
     if (g->textured)
         glEnable(GL_TEXTURE_2D);
+    apply_modes(g);
 }
 
 static void reshape(int w, int h)
@@ -275,12 +292,14 @@ static void update_status(struct gears *g, unsigned int now)
 {
     unsigned int span = now - g->fps_since;
     const char *who = fglIsAccelerated(g->ctx) ? (const char *)glGetString(GL_RENDERER) : "Software";
-    const char *tex = g->textured ? ", textured" : "";
+    char modes[48];
+    snprintf(modes, sizeof(modes), "%s%s%s", g->textured ? ", textured" : "",
+             g->wireframe ? ", wireframe" : "", g->see_through ? ", see-through" : "");
     if (g->paused) {
-        snprintf(g->status, sizeof(g->status), "%s%s - paused (Space resumes)", who, tex);
+        snprintf(g->status, sizeof(g->status), "%s%s - paused (Space resumes)", who, modes);
     } else if (span > 0) {
         unsigned int tenths = (unsigned int)g->frames * 10000u / span;
-        snprintf(g->status, sizeof(g->status), "%s%s - %u.%u frames per second", who, tex, tenths / 10,
+        snprintf(g->status, sizeof(g->status), "%s%s - %u.%u frames per second", who, modes, tenths / 10,
                  tenths % 10);
     }
     draw_status(g);
@@ -389,6 +408,16 @@ static void gears_key(struct window *w, const struct input_event *ev)
             glEnable(GL_TEXTURE_2D);
         else
             glDisable(GL_TEXTURE_2D);
+        break;
+    case 0x11:                          /* W */
+        g->wireframe = !g->wireframe;
+        fglMakeCurrent(g->ctx);
+        apply_modes(g);
+        break;
+    case 0x30:                          /* B */
+        g->see_through = !g->see_through;
+        fglMakeCurrent(g->ctx);
+        apply_modes(g);
         break;
     case KEY_SPACE:
         g->paused = !g->paused;

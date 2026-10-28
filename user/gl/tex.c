@@ -1,7 +1,8 @@
 /*
  * Textures: texture objects, uploading texels from the formats GL 1.1
  * has (unsigned bytes, with the glPixelStorei unpack rules), texture
- * parameters and the texture environment.
+ * parameters and the texture environment. glPixelStorei is here, its pack
+ * rules for pixels.c's glReadPixels.
  *
  * Every texture is kept as 0xAABBGGRR texels whatever it came as, so the
  * backends only ever see one format. Only level 0 is kept: the mipmap
@@ -93,14 +94,6 @@ struct gltex *gl_active_texture(struct fgl_context *c)
         return NULL;
     struct gltex *t = bound_texture(c);
     return t && t->texels && t->w > 0 && t->h > 0 ? t : NULL;
-}
-
-/* The Voodoo backend draws without textures: a context that needs them
- * goes on in software, keeping what it has drawn. */
-void gl_tex_check_backend(struct fgl_context *c)
-{
-    if (c->be == &gl_tdfx_backend && gl_active_texture(c))
-        gl_use_software(c, 1);
 }
 
 /* ---- names and binding ---- */
@@ -312,20 +305,27 @@ void glPixelStorei(GLenum pname, GLint param)
         }
         if (pname == GL_UNPACK_ALIGNMENT)
             c->unpack_align = param;
-        return;                         /* nothing is read back with glReadPixels */
+        else
+            c->pack_align = param;
+        return;
     case GL_UNPACK_ROW_LENGTH:
     case GL_UNPACK_SKIP_ROWS:
     case GL_UNPACK_SKIP_PIXELS:
+    case GL_PACK_ROW_LENGTH:
+    case GL_PACK_SKIP_ROWS:
+    case GL_PACK_SKIP_PIXELS:
         if (param < 0) {
             gl_error(c, GL_INVALID_VALUE);
             return;
         }
-        if (pname == GL_UNPACK_ROW_LENGTH)
-            c->unpack_row_length = param;
-        else if (pname == GL_UNPACK_SKIP_ROWS)
-            c->unpack_skip_rows = param;
-        else
-            c->unpack_skip_pixels = param;
+        switch (pname) {
+        case GL_UNPACK_ROW_LENGTH: c->unpack_row_length = param; break;
+        case GL_UNPACK_SKIP_ROWS: c->unpack_skip_rows = param; break;
+        case GL_UNPACK_SKIP_PIXELS: c->unpack_skip_pixels = param; break;
+        case GL_PACK_ROW_LENGTH: c->pack_row_length = param; break;
+        case GL_PACK_SKIP_ROWS: c->pack_skip_rows = param; break;
+        default: c->pack_skip_pixels = param; break;
+        }
         return;
     }
     gl_error(c, GL_INVALID_ENUM);

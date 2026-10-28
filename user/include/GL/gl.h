@@ -1,16 +1,20 @@
 /*
  * fluxOS OpenGL: a subset of OpenGL 1.1's fixed-function pipeline.
  *
- * Supported: immediate mode (glBegin/glEnd with every primitive type),
- * the modelview, projection and texture matrix stacks, per-vertex
- * lighting with eight lights and materials (GL_COLOR_MATERIAL too), flat
- * and smooth shading, back-face culling, the depth buffer, scissoring,
- * display lists, and 2D textures: texture objects, perspective-correct,
+ * Supported: immediate mode (glBegin/glEnd with every primitive type) and
+ * vertex arrays (glDrawArrays, glDrawElements, glArrayElement,
+ * glInterleavedArrays), the modelview, projection and texture matrix
+ * stacks, per-vertex lighting with eight lights and materials
+ * (GL_COLOR_MATERIAL too), flat and smooth shading, back-face culling,
+ * polygon modes and polygon offset, the depth buffer, scissoring, the
+ * alpha test, blending, color masks, display lists (glCallLists too),
+ * glReadPixels, and 2D textures: texture objects, perspective-correct,
  * nearest or bilinear, repeating or clamped, in the modulate, replace,
  * decal and blend modes. Textures need not be a power of two in size, and
  * only level 0 is kept: the mipmap filters use it as their nearest or
- * linear counterparts. Not supported: blending, fog, stencil, vertex
- * arrays, pixel operations other than texture uploads, and selection.
+ * linear counterparts. The color buffer has no alpha: GL_DST_ALPHA blends
+ * as 1. Not supported: fog, stencil, other pixel operations (glDrawPixels,
+ * glBitmap), edge flags, and selection.
  *
  * Create a context and see the picture with <GL/fluxgl.h>. Programs that
  * use GL must be built with the FPU allowed (the Makefile's
@@ -100,6 +104,9 @@ typedef double GLclampd;
 #define GL_SCISSOR_TEST    0x0C11
 #define GL_TEXTURE_2D      0x0DE1
 #define GL_TEXTURE_1D      0x0DE0
+#define GL_POLYGON_OFFSET_POINT 0x2A01
+#define GL_POLYGON_OFFSET_LINE  0x2A02
+#define GL_POLYGON_OFFSET_FILL  0x8037
 #define GL_RESCALE_NORMAL  0x803A
 #define GL_LIGHT0          0x4000
 #define GL_LIGHT1          0x4001
@@ -109,6 +116,33 @@ typedef double GLclampd;
 #define GL_LIGHT5          0x4005
 #define GL_LIGHT6          0x4006
 #define GL_LIGHT7          0x4007
+
+/* blending */
+#define GL_ZERO                0
+#define GL_ONE                 1
+#define GL_SRC_COLOR           0x0300
+#define GL_ONE_MINUS_SRC_COLOR 0x0301
+#define GL_SRC_ALPHA           0x0302
+#define GL_ONE_MINUS_SRC_ALPHA 0x0303
+#define GL_DST_ALPHA           0x0304
+#define GL_ONE_MINUS_DST_ALPHA 0x0305
+#define GL_DST_COLOR           0x0306
+#define GL_ONE_MINUS_DST_COLOR 0x0307
+#define GL_SRC_ALPHA_SATURATE  0x0308
+
+/* polygon modes */
+#define GL_POINT 0x1B00
+#define GL_LINE  0x1B01
+#define GL_FILL  0x1B02
+
+/* buffers */
+#define GL_NONE        0
+#define GL_FRONT_LEFT  0x0400
+#define GL_FRONT_RIGHT 0x0401
+#define GL_BACK_LEFT   0x0402
+#define GL_BACK_RIGHT  0x0403
+#define GL_LEFT        0x0406
+#define GL_RIGHT       0x0407
 
 /* lights and materials */
 #define GL_AMBIENT               0x1200
@@ -167,7 +201,21 @@ typedef double GLclampd;
 #define GL_CURRENT_TEXTURE_COORDS 0x0B03
 
 /* pixel formats and types */
+#define GL_BYTE                 0x1400
 #define GL_UNSIGNED_BYTE        0x1401
+#define GL_SHORT                0x1402
+#define GL_UNSIGNED_SHORT       0x1403
+#define GL_INT                  0x1404
+#define GL_UNSIGNED_INT         0x1405
+#define GL_FLOAT                0x1406
+#define GL_2_BYTES              0x1407
+#define GL_3_BYTES              0x1408
+#define GL_4_BYTES              0x1409
+#define GL_DOUBLE               0x140A
+#define GL_DEPTH_COMPONENT      0x1902
+#define GL_RED                  0x1903
+#define GL_GREEN                0x1904
+#define GL_BLUE                 0x1905
 #define GL_ALPHA                0x1906
 #define GL_RGB                  0x1907
 #define GL_RGBA                 0x1908
@@ -182,25 +230,80 @@ typedef double GLclampd;
 #define GL_UNPACK_SKIP_ROWS     0x0CF3
 #define GL_UNPACK_SKIP_PIXELS   0x0CF4
 #define GL_UNPACK_ALIGNMENT     0x0CF5
+#define GL_PACK_ROW_LENGTH      0x0D02
+#define GL_PACK_SKIP_ROWS       0x0D03
+#define GL_PACK_SKIP_PIXELS     0x0D04
 #define GL_PACK_ALIGNMENT       0x0D05
+
+/* vertex arrays */
+#define GL_VERTEX_ARRAY                0x8074
+#define GL_NORMAL_ARRAY                0x8075
+#define GL_COLOR_ARRAY                 0x8076
+#define GL_INDEX_ARRAY                 0x8077
+#define GL_TEXTURE_COORD_ARRAY         0x8078
+#define GL_EDGE_FLAG_ARRAY             0x8079
+#define GL_VERTEX_ARRAY_SIZE           0x807A
+#define GL_VERTEX_ARRAY_TYPE           0x807B
+#define GL_VERTEX_ARRAY_STRIDE         0x807C
+#define GL_NORMAL_ARRAY_TYPE           0x807E
+#define GL_NORMAL_ARRAY_STRIDE         0x807F
+#define GL_COLOR_ARRAY_SIZE            0x8081
+#define GL_COLOR_ARRAY_TYPE            0x8082
+#define GL_COLOR_ARRAY_STRIDE          0x8083
+#define GL_TEXTURE_COORD_ARRAY_SIZE    0x8088
+#define GL_TEXTURE_COORD_ARRAY_TYPE    0x8089
+#define GL_TEXTURE_COORD_ARRAY_STRIDE  0x808A
+#define GL_VERTEX_ARRAY_POINTER        0x808E
+#define GL_NORMAL_ARRAY_POINTER        0x808F
+#define GL_COLOR_ARRAY_POINTER         0x8090
+#define GL_TEXTURE_COORD_ARRAY_POINTER 0x8092
+#define GL_V2F             0x2A20
+#define GL_V3F             0x2A21
+#define GL_C4UB_V2F        0x2A22
+#define GL_C4UB_V3F        0x2A23
+#define GL_C3F_V3F         0x2A24
+#define GL_N3F_V3F         0x2A25
+#define GL_C4F_N3F_V3F     0x2A26
+#define GL_T2F_V3F         0x2A27
+#define GL_T4F_V4F         0x2A28
+#define GL_T2F_C4UB_V3F    0x2A29
+#define GL_T2F_C3F_V3F     0x2A2A
+#define GL_T2F_N3F_V3F     0x2A2B
+#define GL_T2F_C4F_N3F_V3F 0x2A2C
+#define GL_T4F_C4F_N3F_V4F 0x2A2D
 
 /* display lists */
 #define GL_COMPILE             0x1300
 #define GL_COMPILE_AND_EXECUTE 0x1301
+#define GL_LIST_MODE           0x0B30
+#define GL_MAX_LIST_NESTING    0x0B31
+#define GL_LIST_BASE           0x0B32
+#define GL_LIST_INDEX          0x0B33
 
 /* glGet */
 #define GL_CURRENT_COLOR    0x0B00
 #define GL_CURRENT_NORMAL   0x0B02
 #define GL_POINT_SIZE       0x0B11
 #define GL_LINE_WIDTH       0x0B21
+#define GL_POLYGON_MODE     0x0B40
 #define GL_SHADE_MODEL      0x0B54
 #define GL_DEPTH_RANGE      0x0B70
 #define GL_DEPTH_WRITEMASK  0x0B72
 #define GL_DEPTH_CLEAR_VALUE 0x0B73
 #define GL_DEPTH_FUNC       0x0B74
 #define GL_VIEWPORT         0x0BA2
+#define GL_ALPHA_TEST_FUNC  0x0BC1
+#define GL_ALPHA_TEST_REF   0x0BC2
+#define GL_BLEND_DST        0x0BE0
+#define GL_BLEND_SRC        0x0BE1
+#define GL_DRAW_BUFFER      0x0C01
+#define GL_READ_BUFFER      0x0C02
 #define GL_SCISSOR_BOX      0x0C10
 #define GL_COLOR_CLEAR_VALUE 0x0C22
+#define GL_COLOR_WRITEMASK  0x0C23
+#define GL_DOUBLEBUFFER     0x0C32
+#define GL_POLYGON_OFFSET_UNITS  0x2A00
+#define GL_POLYGON_OFFSET_FACTOR 0x8038
 #define GL_MAX_LIGHTS       0x0D31
 #define GL_MAX_MODELVIEW_STACK_DEPTH  0x0D36
 #define GL_MAX_PROJECTION_STACK_DEPTH 0x0D38
@@ -208,6 +311,7 @@ typedef double GLclampd;
 #define GL_RED_BITS         0x0D52
 #define GL_GREEN_BITS       0x0D53
 #define GL_BLUE_BITS        0x0D54
+#define GL_ALPHA_BITS       0x0D55
 #define GL_DEPTH_BITS       0x0D56
 
 /* glGetString */
@@ -249,6 +353,15 @@ void glScissor(GLint x, GLint y, GLsizei width, GLsizei height);
 void glDepthFunc(GLenum func);
 void glDepthMask(GLboolean flag);
 void glDepthRange(GLclampd near_val, GLclampd far_val);
+void glColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha);
+void glDrawBuffer(GLenum mode);
+void glReadBuffer(GLenum mode);
+void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type,
+                  GLvoid *pixels);
+
+/* fragments */
+void glBlendFunc(GLenum sfactor, GLenum dfactor);
+void glAlphaFunc(GLenum func, GLclampf ref);
 
 /* rasterisation */
 void glShadeModel(GLenum mode);
@@ -256,6 +369,8 @@ void glCullFace(GLenum mode);
 void glFrontFace(GLenum mode);
 void glPointSize(GLfloat size);
 void glLineWidth(GLfloat width);
+void glPolygonMode(GLenum face, GLenum mode);
+void glPolygonOffset(GLfloat factor, GLfloat units);
 
 /* matrices */
 void glMatrixMode(GLenum mode);
@@ -305,6 +420,19 @@ void glColor4ub(GLubyte red, GLubyte green, GLubyte blue, GLubyte alpha);
 void glRectf(GLfloat x1, GLfloat y1, GLfloat x2, GLfloat y2);
 void glRecti(GLint x1, GLint y1, GLint x2, GLint y2);
 
+/* vertex arrays */
+void glEnableClientState(GLenum cap);
+void glDisableClientState(GLenum cap);
+void glVertexPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *ptr);
+void glNormalPointer(GLenum type, GLsizei stride, const GLvoid *ptr);
+void glColorPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *ptr);
+void glTexCoordPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *ptr);
+void glInterleavedArrays(GLenum format, GLsizei stride, const GLvoid *pointer);
+void glGetPointerv(GLenum pname, GLvoid **params);
+void glArrayElement(GLint i);
+void glDrawArrays(GLenum mode, GLint first, GLsizei count);
+void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices);
+
 /* lighting */
 void glLightf(GLenum light, GLenum pname, GLfloat param);
 void glLighti(GLenum light, GLenum pname, GLint param);
@@ -349,6 +477,8 @@ GLuint glGenLists(GLsizei range);
 void glNewList(GLuint list, GLenum mode);
 void glEndList(void);
 void glCallList(GLuint list);
+void glCallLists(GLsizei n, GLenum type, const GLvoid *lists);
+void glListBase(GLuint base);
 void glDeleteLists(GLuint list, GLsizei range);
 GLboolean glIsList(GLuint list);
 

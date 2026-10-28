@@ -10,11 +10,14 @@
  * lanes of an SSE register. Spans are filled two pixels at a time in MMX
  * registers, the depth test giving a mask of the pixels to keep.
  *
- * A textured triangle has three more planes, 1/w, s/w and t/w, which are
- * linear in the window; dividing by 1/w at each pixel gives texture
- * coordinates with perspective. Its spans go a pixel at a time: the
- * texel (nearest, or bilinear between four), then the texture
- * environment's mix of it with the fragment's color.
+ * A triangle that is textured, blended, alpha tested or color masked has
+ * four more planes, 1/w, s/w, t/w and alpha, which are linear in the
+ * window; dividing by 1/w at each pixel gives texture coordinates with
+ * perspective. Its spans go a pixel at a time, through the fragment
+ * operations in GL's order: the texel (nearest, or bilinear between
+ * four) and the texture environment's mix of it with the fragment's
+ * color, the alpha test, the depth test, blending (the buffer's alpha
+ * being 1), and the color mask.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -71,10 +74,16 @@ static void soft_clear(struct fgl_context *c, GLbitfield mask, int x0, int y0, i
                    (uint32_t)gl_iround(c->clear_color[1] * 255) << 8 |
                    (uint32_t)gl_iround(c->clear_color[2] * 255);
     uint32_t z = (uint32_t)gl_iround(c->clear_depth * DEPTH_ONE);
+    uint32_t wmask = gl_rgb_write_mask(c);
     for (int y = y0; y < y1; y++) {
         size_t row = (size_t)y * c->width + x0;
-        if (mask & GL_COLOR_BUFFER_BIT)
+        if ((mask & GL_COLOR_BUFFER_BIT) && wmask == 0xFFFFFF) {
             memset32(s->color + row, rgb, x1 - x0);
+        } else if (mask & GL_COLOR_BUFFER_BIT) {
+            uint32_t *p = s->color + row;
+            for (int i = 0; i < x1 - x0; i++)
+                p[i] = (rgb & wmask) | (p[i] & ~wmask);
+        }
         if (mask & GL_DEPTH_BUFFER_BIT)
             memset32(s->depth + row, z, x1 - x0);
     }
@@ -222,15 +231,27 @@ static inline uint32_t clamp8(int32_t v16)
     return (uint32_t)(v < 0 ? 0 : v > 255 ? 255 : v);
 }
 
-/* The texture environment: texel tx (0xAABBGGRR) with the fragment's
- * color (0 to 255 a channel) as 0xRRGGBB. */
-static inline uint32_t tex_env(GLenum mode, uint32_t tx, uint32_t r, uint32_t g, uint32_t b,
-                               const uint32_t *env)
+/* The texture environment: texel tx (0xAABBGGRR) of a texture of base
+ * format base with the fragment's color (0 to 255 a channel) as
+ * 0xRRGGBB, and its alpha *a. An alpha texture leaves the color alone; an
+ * RGB or luminance texture leaves the alpha alone. */
+static inline uint32_t tex_env(GLenum mode, GLenum base, uint32_t tx, uint32_t r, uint32_t g, uint32_t b,
+                               uint32_t *a, const uint32_t *env)
 {
     uint32_t tr = tx & 0xFF, tg = (tx >> 8) & 0xFF, tb = (tx >> 16) & 0xFF, ta = tx >> 24;
+    int keep_alpha = base == GL_RGB || base == GL_LUMINANCE;
+    if (base == GL_ALPHA) {
+        if (mode == GL_REPLACE)
+            *a = ta;
+        else if (mode != GL_DECAL)
+            *a = *a * (ta + 1) >> 8;
+        return r << 16 | g << 8 | b;
+    }
     switch (mode) {
     case GL_REPLACE:
         r = tr; g = tg; b = tb;
+        if (!keep_alpha)
+            *a = ta;
         break;
     case GL_DECAL:
         r = (r * (255 - ta) + tr * ta + 127) / 255;
@@ -241,14 +262,65 @@ static inline uint32_t tex_env(GLenum mode, uint32_t tx, uint32_t r, uint32_t g,
         r = (r * (255 - tr) + env[0] * tr + 127) / 255;
         g = (g * (255 - tg) + env[1] * tg + 127) / 255;
         b = (b * (255 - tb) + env[2] * tb + 127) / 255;
+        if (base == GL_INTENSITY)
+            *a = (*a * (255 - ta) + env[3] * ta + 127) / 255;
+        else
+            *a = *a * (ta + 1) >> 8;
         break;
     default:                            /* GL_MODULATE */
         r = r * (tr + 1) >> 8;
         g = g * (tg + 1) >> 8;
         b = b * (tb + 1) >> 8;
+        *a = *a * (ta + 1) >> 8;
         break;
     }
     return r << 16 | g << 8 | b;
+}
+
+/* ---- fragment operations ---- */
+
+static inline int alpha_pass(GLenum func, uint32_t a, uint32_t ref)
+{
+    switch (func) {
+    case GL_NEVER: return 0;
+    case GL_LESS: return a < ref;
+    case GL_EQUAL: return a == ref;
+    case GL_LEQUAL: return a <= ref;
+    case GL_GREATER: return a > ref;
+    case GL_NOTEQUAL: return a != ref;
+    case GL_GEQUAL: return a >= ref;
+    default: return 1;
+    }
+}
+
+/* A blend factor for one channel, 0 to 255: s and d are the source's and
+ * destination's value of the channel, sa the source alpha. The buffer
+ * has no alpha, so the destination's is 1. */
+static inline uint32_t blend_factor(GLenum f, uint32_t s, uint32_t d, uint32_t sa)
+{
+    switch (f) {
+    case GL_ONE: return 255;
+    case GL_SRC_COLOR: return s;
+    case GL_ONE_MINUS_SRC_COLOR: return 255 - s;
+    case GL_DST_COLOR: return d;
+    case GL_ONE_MINUS_DST_COLOR: return 255 - d;
+    case GL_SRC_ALPHA: return sa;
+    case GL_ONE_MINUS_SRC_ALPHA: return 255 - sa;
+    case GL_DST_ALPHA: return 255;
+    default: return 0;                  /* GL_ZERO, GL_ONE_MINUS_DST_ALPHA, GL_SRC_ALPHA_SATURATE */
+    }
+}
+
+/* The source 0xRRGGBB with alpha sa blended over the destination dst. */
+static inline uint32_t blend(GLenum sf, GLenum df, uint32_t src, uint32_t sa, uint32_t dst)
+{
+    uint32_t out = 0;
+    for (int sh = 16; sh >= 0; sh -= 8) {
+        uint32_t s = (src >> sh) & 0xFF, d = (dst >> sh) & 0xFF;
+        uint32_t v = (s * blend_factor(sf, s, d, sa) + d * blend_factor(df, s, d, sa) + 127) / 255;
+        out |= (v > 255 ? 255 : v) << sh;
+    }
+    return out;
 }
 
 /* ---- triangles ---- */
@@ -290,36 +362,45 @@ static void triangle(struct fgl_context *c, const struct wvert *v0, const struct
     int test = c->depth_test, write_z = c->depth_test && c->depth_mask;
     GLenum func = c->depth_func;
 
-    /* Texturing: the planes 1/w, s/w and t/w, and whether the texture is
-     * magnified or minified here (by its area against the triangle's). */
+    /* The fragment operations past the depth test, and texturing: the
+     * planes 1/w, s/w, t/w and alpha (0 to 255), and whether the texture
+     * is magnified or minified here (by its area against the triangle's). */
     const struct gltex *tex = gl_active_texture(c);
+    int blending = c->blend, atest = c->alpha_test;
+    GLenum sf = c->blend_src, df = c->blend_dst, afunc = c->alpha_func;
+    uint32_t aref = (uint32_t)gl_iround(c->alpha_ref * 255);
+    uint32_t wmask = gl_rgb_write_mask(c);
+    int plain = !tex && !blending && !atest && wmask == 0xFFFFFF;
     __m128 ta0 = _mm_setzero_ps(), tdx = ta0, tdy = ta0;
     int linear = 0;
-    uint32_t env[3];
-    if (tex) {
-        __m128 q0 = _mm_setr_ps(1 / v0->w, v0->s / v0->w, v0->t / v0->w, 0);
-        __m128 q1 = _mm_sub_ps(_mm_setr_ps(1 / v1->w, v1->s / v1->w, v1->t / v1->w, 0), q0);
-        __m128 q2 = _mm_sub_ps(_mm_setr_ps(1 / v2->w, v2->s / v2->w, v2->t / v2->w, 0), q0);
+    uint32_t env[4];
+    if (!plain) {
+        __m128 q0 = _mm_setr_ps(1 / v0->w, v0->s / v0->w, v0->t / v0->w, v0->a * 255);
+        __m128 q1 = _mm_sub_ps(_mm_setr_ps(1 / v1->w, v1->s / v1->w, v1->t / v1->w, v1->a * 255), q0);
+        __m128 q2 = _mm_sub_ps(_mm_setr_ps(1 / v2->w, v2->s / v2->w, v2->t / v2->w, v2->a * 255), q0);
         ta0 = q0;
         tdx = _mm_mul_ps(_mm_sub_ps(_mm_mul_ps(q1, _mm_set1_ps(v2->y - v0->y)),
                                     _mm_mul_ps(q2, _mm_set1_ps(v1->y - v0->y))), _mm_set1_ps(inv));
         tdy = _mm_mul_ps(_mm_sub_ps(_mm_mul_ps(q2, _mm_set1_ps(v1->x - v0->x)),
                                     _mm_mul_ps(q1, _mm_set1_ps(v2->x - v0->x))), _mm_set1_ps(inv));
+    }
+    if (tex) {
         float tex_area = ((v1->s - v0->s) * (v2->t - v0->t) - (v2->s - v0->s) * (v1->t - v0->t)) *
                          (float)tex->w * (float)tex->h;
         int minified = tex_area * tex_area > area * area;
         GLenum f = minified ? tex->min_filter : tex->mag_filter;
         linear = f == GL_LINEAR || f == GL_LINEAR_MIPMAP_NEAREST || f == GL_LINEAR_MIPMAP_LINEAR;
-        for (int k = 0; k < 3; k++)
+        for (int k = 0; k < 4; k++)
             env[k] = (uint32_t)gl_iround(c->tex_env_color[k] * 255);
     }
-    float diw = 0, dsw = 0, dtw = 0;
-    if (tex) {
+    float diw = 0, dsw = 0, dtw = 0, daw = 0;
+    if (!plain) {
         float lanes[4] __attribute__((aligned(16)));
         _mm_store_ps(lanes, tdx);
         diw = lanes[0];
         dsw = lanes[1];
         dtw = lanes[2];
+        daw = lanes[3];
     }
 
     for (int y = y0; y < y1; y++) {
@@ -346,21 +427,37 @@ static void triangle(struct fgl_context *c, const struct wvert *v0, const struct
         uint32_t *cp = s->color + (size_t)y * c->width + x0;
         uint32_t *zp = s->depth + (size_t)y * c->width + x0;
         int n = x1 - x0;
-        if (tex) {
+        if (!plain) {
             float lanes[4] __attribute__((aligned(16)));
             _mm_store_ps(lanes, _mm_add_ps(_mm_add_ps(ta0, _mm_mul_ps(_mm_set1_ps(fx), tdx)),
                                            _mm_mul_ps(_mm_set1_ps(fy), tdy)));
-            float iw = lanes[0], sw = lanes[1], tw = lanes[2];
+            float iw = lanes[0], sw = lanes[1], tw = lanes[2], aw = lanes[3];
             GLenum mode = c->tex_env_mode;
-            for (int i = 0; i < n; i++, z += dz, r += dr, g += dg, bl += db, iw += diw, sw += dsw, tw += dtw) {
+            for (int i = 0; i < n; i++, z += dz, r += dr, g += dg, bl += db, iw += diw, sw += dsw, tw += dtw,
+                     aw += daw) {
                 uint32_t zz = z < 0 ? 0 : (uint32_t)z;
-                if (test && !depth_pass(func, zz, zp[i]))
+                /* Without the alpha test, the depth test can come first and save the texel. */
+                if (test && !atest && !depth_pass(func, zz, zp[i]))
+                    continue;
+                int ia = gl_iround(aw);
+                uint32_t fa = ia < 0 ? 0 : ia > 255 ? 255 : (uint32_t)ia;
+                uint32_t px;
+                if (tex) {
+                    float w = 1 / iw;
+                    uint32_t tx = linear ? texel_linear(tex, sw * w, tw * w) : texel_nearest(tex, sw * w, tw * w);
+                    px = tex_env(mode, tex->format, tx, clamp8(r), clamp8(g), clamp8(bl), &fa, env);
+                } else {
+                    px = clamp8(r) << 16 | clamp8(g) << 8 | clamp8(bl);
+                }
+                if (atest && !alpha_pass(afunc, fa, aref))
+                    continue;
+                if (test && atest && !depth_pass(func, zz, zp[i]))
                     continue;
                 if (write_z)
                     zp[i] = zz;
-                float w = 1 / iw;
-                uint32_t tx = linear ? texel_linear(tex, sw * w, tw * w) : texel_nearest(tex, sw * w, tw * w);
-                cp[i] = tex_env(mode, tx, clamp8(r), clamp8(g), clamp8(bl), env);
+                if (blending)
+                    px = blend(sf, df, px, fa, cp[i]);
+                cp[i] = (px & wmask) | (cp[i] & ~wmask);
             }
         } else if (!test) {
             span_color(cp, n, r, g, bl, dr, dg, db);
@@ -406,6 +503,16 @@ static void soft_read(struct fgl_context *c, uint32_t *dst, int stride)
         memcpy(dst + (size_t)y * stride, s->color + (size_t)y * c->width, (size_t)c->width * 4);
 }
 
+static void soft_read_depth(struct fgl_context *c, int x, int y, int w, int h, float *dst)
+{
+    struct soft *s = c->bpriv;
+    for (int j = 0; j < h; j++) {
+        const uint32_t *zp = s->depth + (size_t)(y + j) * c->width + x;
+        for (int i = 0; i < w; i++)
+            *dst++ = (float)zp[i] * (1.0f / DEPTH_ONE);
+    }
+}
+
 const struct backend gl_soft_backend = {
     .name = "fluxOS software rasterizer",
     .resize = soft_resize,
@@ -414,4 +521,5 @@ const struct backend gl_soft_backend = {
     .polygon = soft_polygon,
     .finish = soft_finish,
     .read = soft_read,
+    .read_depth = soft_read_depth,
 };

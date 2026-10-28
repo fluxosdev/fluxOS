@@ -4,9 +4,11 @@
  * texture coordinates through the texture matrix; glEnd assembles the
  * vertices into polygons, lines and points. Polygons are clipped against
  * the view volume (Sutherland-Hodgman, in homogeneous coordinates),
- * divided by w, mapped through the viewport, culled by their winding and
- * handed to the backend. Lines and points become small polygons too, so
- * a backend only ever draws convex polygons.
+ * divided by w, mapped through the viewport, culled by their winding,
+ * pushed back or forward by the polygon offset and handed to the backend,
+ * filled or, in the GL_LINE and GL_POINT polygon modes, as their edges or
+ * corners. Lines and points become small polygons too, so a backend only
+ * ever draws convex polygons.
  */
 #include <math.h>
 #include <stdlib.h>
@@ -338,6 +340,68 @@ static void to_window(struct fgl_context *c, const struct cvert *v, struct wvert
     w->w = v->clip[3];
 }
 
+/* A line between window vertices, as a thin quad: x-major lines widen
+ * vertically, y-major ones horizontally. */
+static void line_window(struct fgl_context *c, const struct wvert *wa, const struct wvert *wb)
+{
+    struct wvert q[4];
+    float half = c->line_width * 0.5f, dx = wb->x - wa->x, dy = wb->y - wa->y;
+    float ox = 0, oy = 0;
+    if (fabsf(dx) >= fabsf(dy))
+        oy = half;
+    else
+        ox = half;
+    q[0] = *wa; q[0].x -= ox; q[0].y -= oy;
+    q[1] = *wb; q[1].x -= ox; q[1].y -= oy;
+    q[2] = *wb; q[2].x += ox; q[2].y += oy;
+    q[3] = *wa; q[3].x += ox; q[3].y += oy;
+    c->be->polygon(c, q, 4);
+}
+
+/* A point at a window vertex, as a square. */
+static void point_window(struct fgl_context *c, const struct wvert *w)
+{
+    struct wvert q[4];
+    float half = c->point_size * 0.5f;
+    for (int k = 0; k < 4; k++) {
+        q[k] = *w;
+        q[k].x += (k == 1 || k == 2) ? half : -half;
+        q[k].y += (k >= 2) ? half : -half;
+    }
+    c->be->polygon(c, q, 4);
+}
+
+/* The smallest depth step that surely tells two depths apart. Software
+ * depths are stepped from floats, so its 30 bits are not all to be
+ * trusted; nor are the Radeon's 24 with vertex depths as floats. */
+static float depth_resolution(struct fgl_context *c)
+{
+    int bits = gl_depth_bits(c);
+    return 1.0f / (float)(1u << (bits < 22 ? bits : 22));
+}
+
+/* glPolygonOffset: factor times the polygon's steepest depth slope plus
+ * units of depth resolution. The slopes come from the plane's normal
+ * (Newell's method, which any number of vertices will do). */
+static void polygon_offset(struct fgl_context *c, struct wvert *w, int n)
+{
+    float nx = 0, ny = 0, nz = 0;
+    for (int i = 0; i < n; i++) {
+        const struct wvert *a = &w[i], *b = &w[(i + 1) % n];
+        nx += (a->y - b->y) * (a->z + b->z);
+        ny += (a->z - b->z) * (a->x + b->x);
+        nz += (a->x - b->x) * (a->y + b->y);
+    }
+    float m = 0;
+    if (nz != 0) {
+        float sx = fabsf(nx / nz), sy = fabsf(ny / nz);
+        m = sx > sy ? sx : sy;
+    }
+    float d = c->offset_factor * m + c->offset_units * depth_resolution(c);
+    for (int i = 0; i < n; i++)
+        w[i].z = gl_clampf(w[i].z + d);
+}
+
 static void draw_polygon(struct fgl_context *c, const int *idx, int n, int provoking)
 {
     if (n < 3 || n > MAX_POLY / 2)
@@ -371,12 +435,23 @@ static void draw_polygon(struct fgl_context *c, const int *idx, int n, int provo
     }
     if (area == 0)
         return;
-    if (c->cull) {
-        int front = (area > 0) == (c->front_face == GL_CCW);
-        if (c->cull_face == GL_FRONT_AND_BACK || (front ? c->cull_face == GL_FRONT : c->cull_face == GL_BACK))
-            return;
+    int front = (area > 0) == (c->front_face == GL_CCW);
+    if (c->cull &&
+        (c->cull_face == GL_FRONT_AND_BACK || (front ? c->cull_face == GL_FRONT : c->cull_face == GL_BACK)))
+        return;
+    GLenum mode = c->polygon_mode[front ? 0 : 1];
+    int offset = mode == GL_FILL ? c->offset_fill : mode == GL_LINE ? c->offset_line : c->offset_point;
+    if (offset && (c->offset_factor != 0 || c->offset_units != 0))
+        polygon_offset(c, w, n);
+    if (mode == GL_LINE) {
+        for (int i = 0; i < n; i++)
+            line_window(c, &w[i], &w[(i + 1) % n]);
+    } else if (mode == GL_POINT) {
+        for (int i = 0; i < n; i++)
+            point_window(c, &w[i]);
+    } else {
+        c->be->polygon(c, w, n);
     }
-    c->be->polygon(c, w, n);
 }
 
 static void draw_line(struct fgl_context *c, int i0, int i1)
@@ -405,21 +480,10 @@ static void draw_line(struct fgl_context *c, int i0, int i1)
     struct cvert ca, cb;
     lerp(&ca, &a, &b, t0);
     lerp(&cb, &a, &b, t1);
-    struct wvert wa, wb, q[4];
+    struct wvert wa, wb;
     to_window(c, &ca, &wa);
     to_window(c, &cb, &wb);
-    /* A line is a thin quad: x-major lines widen vertically, y-major ones horizontally. */
-    float half = c->line_width * 0.5f, dx = wb.x - wa.x, dy = wb.y - wa.y;
-    float ox = 0, oy = 0;
-    if (fabsf(dx) >= fabsf(dy))
-        oy = half;
-    else
-        ox = half;
-    q[0] = wa; q[0].x -= ox; q[0].y -= oy;
-    q[1] = wb; q[1].x -= ox; q[1].y -= oy;
-    q[2] = wb; q[2].x += ox; q[2].y += oy;
-    q[3] = wa; q[3].x += ox; q[3].y += oy;
-    c->be->polygon(c, q, 4);
+    line_window(c, &wa, &wb);
 }
 
 static void draw_point(struct fgl_context *c, int i)
@@ -427,15 +491,9 @@ static void draw_point(struct fgl_context *c, int i)
     const struct cvert *v = &c->verts[i];
     if (outcode(v->clip))
         return;
-    struct wvert w, q[4];
+    struct wvert w;
     to_window(c, v, &w);
-    float half = c->point_size * 0.5f;
-    for (int k = 0; k < 4; k++) {
-        q[k] = w;
-        q[k].x += (k == 1 || k == 2) ? half : -half;
-        q[k].y += (k >= 2) ? half : -half;
-    }
-    c->be->polygon(c, q, 4);
+    point_window(c, &w);
 }
 
 void glBegin(GLenum mode)
@@ -450,7 +508,7 @@ void glBegin(GLenum mode)
         gl_error(c, GL_INVALID_ENUM);
         return;
     }
-    gl_tex_check_backend(c);
+    gl_check_backend(c);
     c->prim = mode;
     c->in_begin = 1;
     c->nverts = 0;

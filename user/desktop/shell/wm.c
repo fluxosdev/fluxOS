@@ -677,6 +677,12 @@ static int title_buttons(struct window *w, struct rect *rects, int *kinds)
 
 /* ---- damage and presentation ---- */
 
+/* Whether a lies wholly within b (an empty a does). */
+static int inside(struct rect a, struct rect b)
+{
+    return rect_empty(a) || (a.x >= b.x && a.y >= b.y && a.x + a.w <= b.x + b.w && a.y + a.h <= b.y + b.h);
+}
+
 static int area(struct rect r)
 {
     return r.w * r.h;
@@ -1167,8 +1173,25 @@ static void draw_window_kinetik(struct window *w)
     chrome_colors(active, c);
     if (!w->maximized)
         gfx_shadow(&screen, r, rt, SHADOW_DY, SHADOW_BLUR, SHADOW_COLOR);
-    /* The frame round the client area is the caption's last color; the caption runs down to it. */
-    gfx_round_fill(&screen, r, rt, rb, ARGB(255, c[2]));
+    /* The frame round the client area is the caption's last color; the caption runs down to it.
+     * Only the frame: the client area is about to be copied over whatever is there. */
+    if (inside(cl, r)) {
+        struct rect saved = screen.clip;
+        struct rect ring[4] = {
+            mkrect(r.x, r.y, r.w, cl.y - r.y),
+            mkrect(r.x, cl.y + cl.h, r.w, r.y + r.h - cl.y - cl.h),
+            mkrect(r.x, cl.y, cl.x - r.x, cl.h),
+            mkrect(cl.x + cl.w, cl.y, r.x + r.w - cl.x - cl.w, cl.h),
+        };
+        for (int i = 0; i < 4; i++) {
+            screen.clip = rect_intersect(saved, ring[i]);
+            if (!rect_empty(screen.clip))
+                gfx_round_fill(&screen, r, rt, rb, ARGB(255, c[2]));
+        }
+        screen.clip = saved;
+    } else {
+        gfx_round_fill(&screen, r, rt, rb, ARGB(255, c[2]));
+    }
     chrome_fill(mkrect(r.x, r.y, r.w, theme.cap_inset + TITLE_H), rt, 0, c);
     gfx_round_fill(&screen, mkrect(r.x + rt, r.y + 1, r.w - 2 * rt, 1), 0, 0, ARGB(64, 0xFFFFFF));
     gfx_round_frame(&screen, r, rt, rb, ARGB(255, active ? theme.stroke : gfx_mix(theme.stroke, 0x9AA9B9, 176)));
@@ -1338,6 +1361,11 @@ static void draw_window(struct window *w)
     struct rect r = w->r;
     if (!rect_overlaps(KINETIK ? shadowed(r) : r, screen.clip))
         return;
+    struct rect client = wm_client_rect(w);
+    if (inside(screen.clip, client)) {   /* only the contents show here: the frame is all outside */
+        gfx_blit(&screen, client.x, client.y, &w->content, 0, 0, client.w, client.h);
+        return;
+    }
     if (KINETIK) {
         draw_window_kinetik(w);
         return;
@@ -1539,6 +1567,16 @@ static struct window *modal_window(void)
     return NULL;
 }
 
+/* The topmost window whose contents cover all of r: nothing under it shows there. */
+static struct window *covering(struct rect r, const struct window *modal)
+{
+    struct window *found = NULL;
+    for (struct window *w = bottom; w; w = w->above)
+        if (!w->minimized && w != modal && inside(r, wm_client_rect(w)))
+            found = w;
+    return found;
+}
+
 static void compose(struct rect r)
 {
     gfx_clip(&screen, r);
@@ -1547,9 +1585,13 @@ static void compose(struct rect r)
         gfx_noclip(&screen);
         return;
     }
-    draw_desktop();
     struct window *modal = modal_window();
-    for (struct window *w = bottom; w; w = w->above)
+    /* Draw from the window that hides everything under it here, if one does; the desktop
+     * and the windows below it would only be painted over. */
+    struct window *from = covering(screen.clip, modal);
+    if (!from)
+        draw_desktop();
+    for (struct window *w = from ? from : bottom; w; w = w->above)
         if (!w->minimized && w != modal)
             draw_window(w);
     if (!setup_mode) {

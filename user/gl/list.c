@@ -3,9 +3,13 @@
  * in one records an opcode, its argument count and its arguments (all as
  * floats; enums and list and texture names fit exactly, up to 2^24).
  * glTexImage2D and glTexSubImage2D are not recorded: they take effect
- * when called, even under GL_COMPILE. glCallList replays them
+ * when called, even under GL_COMPILE. Nor are the vertex array calls,
+ * but glDrawArrays and the like record the vertices they draw, as GL has
+ * it. glCallList replays them
  * through the same entry points, with recording held off so that a list
  * called during GL_COMPILE_AND_EXECUTE is not copied into the new one.
+ * glCallLists records its list names as given; glListBase is added to
+ * them when the list runs.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -162,7 +166,9 @@ GLboolean glIsList(GLuint list)
     return c && list < c->nlists && c->lists[list] ? GL_TRUE : GL_FALSE;
 }
 
-static void replay(const struct dlist *l)
+static void call_list(struct fgl_context *c, GLuint list);
+
+static void replay(struct fgl_context *c, const struct dlist *l)
 {
     const float *p = l->ops, *end = l->ops + l->n;
     while (p < end) {
@@ -210,17 +216,90 @@ static void replay(const struct dlist *l)
         case OP_BIND_TEXTURE: glBindTexture((GLenum)a[0], (GLuint)a[1]); break;
         case OP_TEX_ENV: glTexEnvfv((GLenum)a[0], (GLenum)a[1], a + 2); break;
         case OP_TEX_PARAMETER: glTexParameterfv((GLenum)a[0], (GLenum)a[1], a + 2); break;
+        case OP_BLEND_FUNC: glBlendFunc((GLenum)a[0], (GLenum)a[1]); break;
+        case OP_ALPHA_FUNC: glAlphaFunc((GLenum)a[0], a[1]); break;
+        case OP_COLOR_MASK:
+            glColorMask((GLboolean)a[0], (GLboolean)a[1], (GLboolean)a[2], (GLboolean)a[3]);
+            break;
+        case OP_POLYGON_MODE: glPolygonMode((GLenum)a[0], (GLenum)a[1]); break;
+        case OP_POLYGON_OFFSET: glPolygonOffset(a[0], a[1]); break;
+        case OP_LIST_BASE: glListBase((GLuint)a[0]); break;
+        case OP_CALL_LISTS:
+            for (int i = 0; i < n; i++)
+                call_list(c, c->list_base + (GLuint)(GLint)a[i]);
+            break;
         }
     }
+}
+
+static void call_list(struct fgl_context *c, GLuint list)
+{
+    if (list >= c->nlists || !c->lists[list] || c->executing >= MAX_CALL_DEPTH)
+        return;
+    c->executing++;
+    replay(c, c->lists[list]);
+    c->executing--;
 }
 
 void glCallList(GLuint list)
 {
     GET_CTX(c);
     RECORD(c, OP_CALL_LIST, 1, list);
-    if (list >= c->nlists || !c->lists[list] || c->executing >= MAX_CALL_DEPTH)
+    call_list(c, list);
+}
+
+void glListBase(GLuint base)
+{
+    GET_CTX(c);
+    RECORD(c, OP_LIST_BASE, 1, base);
+    c->list_base = base;
+}
+
+/* The i-th list name of an array of type type (one glCallLists takes). */
+static GLint list_name(GLenum type, const void *lists, GLsizei i)
+{
+    const uint8_t *b = lists;
+    switch (type) {
+    case GL_BYTE: return ((const int8_t *)lists)[i];
+    case GL_UNSIGNED_BYTE: return b[i];
+    case GL_SHORT: return ((const int16_t *)lists)[i];
+    case GL_UNSIGNED_SHORT: return ((const uint16_t *)lists)[i];
+    case GL_INT: return ((const int32_t *)lists)[i];
+    case GL_UNSIGNED_INT: return (GLint)((const uint32_t *)lists)[i];
+    case GL_FLOAT: return (GLint)((const float *)lists)[i];
+    /* names in bytes, the most significant first */
+    case GL_2_BYTES: return b[2 * i] << 8 | b[2 * i + 1];
+    case GL_3_BYTES: return b[3 * i] << 16 | b[3 * i + 1] << 8 | b[3 * i + 2];
+    case GL_4_BYTES: return (GLint)((uint32_t)b[4 * i] << 24 | b[4 * i + 1] << 16 | b[4 * i + 2] << 8 | b[4 * i + 3]);
+    }
+    return 0;
+}
+
+void glCallLists(GLsizei n, GLenum type, const GLvoid *lists)
+{
+    GET_CTX(c);
+    if (type < GL_BYTE || type > GL_4_BYTES) {
+        gl_error(c, GL_INVALID_ENUM);
         return;
-    c->executing++;
-    replay(c->lists[list]);
-    c->executing--;
+    }
+    if (n < 0) {
+        gl_error(c, GL_INVALID_VALUE);
+        return;
+    }
+    if (c->compiling && !c->executing) {
+        /* The names go in as floats, which hold them exactly up to 2^24. */
+        float *names = malloc(((size_t)n + 1) * sizeof(float));
+        if (!names) {
+            gl_error(c, GL_OUT_OF_MEMORY);
+            return;
+        }
+        for (GLsizei i = 0; i < n; i++)
+            names[i] = (float)list_name(type, lists, i);
+        int skip = gl_record(c, OP_CALL_LISTS, n, names);
+        free(names);
+        if (skip)
+            return;
+    }
+    for (GLsizei i = 0; i < n; i++)
+        call_list(c, c->list_base + (GLuint)list_name(type, lists, i));
 }
