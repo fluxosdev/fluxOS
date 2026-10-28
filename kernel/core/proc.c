@@ -545,7 +545,7 @@ int do_fork(void)
     child->pgid = parent->pgid;
     for (int i = 0; i < MAX_FDS; i++)
         child->fds[i] = file_dup(parent->fds[i]);
-    child->fd_cloexec = parent->fd_cloexec;
+    memcpy(child->fd_cloexec, parent->fd_cloexec, sizeof(child->fd_cloexec));
     child->umask = parent->umask;
     child->cwd = parent->cwd;
     vfs_ref(child->cwd);

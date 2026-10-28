@@ -115,7 +115,7 @@ $(BUILD)/u/user/libc/brdecode.o: USER_CFLAGS += -I$(BROTLI_DIR)/c/include
 $(LIBFONT): $(FONT_OBJS)
 	$(AR) rcs $@ $^
 
-LIBC_SRCS := $(wildcard user/libc/*.c) $(BROTLI_SRCS) $(MBEDTLS_SRCS) lib/string.c lib/vsnprintf.c lib/font8x16.c lib/sha256.c lib/digest.c lib/logo.c
+LIBC_SRCS := $(wildcard user/libc/*.c) $(BROTLI_SRCS) $(MBEDTLS_SRCS) lib/string.c lib/font8x16.c lib/sha256.c lib/digest.c lib/logo.c
 LIBC_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(LIBC_SRCS)))
 CRT0      := $(BUILD)/u/user/libc/crt0.o
 LIBC      := $(BUILD)/libc.a
@@ -331,7 +331,7 @@ run-usb: $(ISO) $(DISK)
 clean:
 	rm -rf $(BUILD) $(ISO)
 
--include $(shell find $(BUILD) -name '*.d' 2>/dev/null)
+-include $(shell find $(BUILD) -path '$(BUILD)/toolchain' -prune -o -name '*.d' -print 2>/dev/null)
 
 # Run the browser's actual HTML/DOM/JS code on the host, without booting QEMU.
 HOSTCC ?= cc
@@ -362,6 +362,38 @@ $(BUILD)/tests/browser-dom: $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS) user/include/fl
 	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DJS_VM_VERIFY -pthread -Wall -Wextra -Wno-unused-parameter \
 		$(DESKTOP_INC) -Iinclude -idirafter user/include $(BROWSER_TEST_SRCS) \
 		-lm -o $@
+
+# The C library's formatting, number parsing, regex, fnmatch, getopt and
+# calendar code against the host's glibc (compiled against the fluxOS headers).
+LIBC_TEST_FORMAT := user/libc/printf.c user/libc/strtonum.c user/libc/scanf.c
+LIBC_TEST_POSIX := user/libc/regex.c user/libc/fnmatch.c user/libc/glob.c user/libc/getopt.c user/libc/time.c
+.PHONY: test-libc
+test-libc: $(BUILD)/tests/libc-format $(BUILD)/tests/libc-posix
+	$(BUILD)/tests/libc-format
+	$(BUILD)/tests/libc-posix
+
+$(BUILD)/tests/libc-format: tests/libc-format.c tests/libc-host-build.sh $(LIBC_TEST_FORMAT) $(wildcard user/include/*.h user/include/sys/*.h) include/flux/abi.h
+	@mkdir -p $(dir $@)
+	HOSTCC=$(HOSTCC) tests/libc-host-build.sh $@.lib.o $(LIBC_TEST_FORMAT)
+	$(HOSTCC) -std=gnu11 -O1 -g -Wno-format tests/libc-format.c $@.lib.o -lm -o $@
+
+$(BUILD)/tests/libc-posix: tests/libc-posix.c tests/libc-host-build.sh $(LIBC_TEST_POSIX) $(wildcard user/include/*.h user/include/sys/*.h) include/flux/abi.h
+	@mkdir -p $(dir $@)
+	HOSTCC=$(HOSTCC) tests/libc-host-build.sh $@.lib.o $(LIBC_TEST_POSIX)
+	$(HOSTCC) -std=gnu11 -O1 -g -Wno-format tests/libc-posix.c $@.lib.o -o $@
+
+# The same library on the real kernel: boots a disposable QEMU with the
+# guest program as init (not run by default builds).
+.PHONY: test-libc-qemu
+test-libc-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/libc-guest
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/libc-guest --cpus $(KERNEL_TEST_CPUS) --success-marker "LIBC REGRESSIONS PASSED"
+
+$(BUILD)/tests/libc-guest.o: tests/libc-guest.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(BUILD)/tests/libc-guest: $(BUILD)/tests/libc-guest.o $(CRT0) $(LIBC) user/user.ld
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 
 # Host regression tests use production kernel code with mocked hardware/I/O.
 KERNEL_TEST_NAMES := heap pmm pipe socket storage syscall block sched signal

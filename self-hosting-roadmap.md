@@ -1,7 +1,8 @@
 # fluxOS self-hosting roadmap
 
-*Written 2026-10-28, against commit 8cdd993 plus the toolchain work
-described in phase 1. Phases 0 and 1 are done; the rest is a plan.*
+*Written 2026-10-28, against commit 8cdd993 plus the toolchain and libc
+work described in phases 1 and 2. Phases 0 and 1 are done, phase 2
+mostly; the rest is a plan.*
 
 "Self-hosting" means that fluxOS, running on its own kernel, can turn a
 checkout of this repository into a bootable `fluxOS.iso` and an installed
@@ -79,9 +80,9 @@ and nine `.S` files.
 |---|---|
 | A compiler that runs on fluxOS | the cross compiler exists; the native one (phase 4) does not |
 | `make`, `tar`, `gzip` (compress), `find`, `install`, `cmp`/`diff`, `sed` | none (`cp mkdir rm mv cat` exist) |
-| libc | no `strtod`/`atof`/`strtoll`, no `%f`/`%e`/`%g` in `printf`, no `scanf`, no `getopt`, `bsearch`, `realpath`, `popen`/`system`, `mkstemp`/`tmpfile`, `freopen`, `nanosleep`/`clock_gettime`, `select`, `sysconf`, `getrlimit`/`getrusage`, `symlink`/`readlink`/`link`, `err`/`warn`, `strsep`/`stpcpy`/`memrchr`, wide characters, `locale`, `regex`, `glob`, `fnmatch`, threads |
+| libc | since phase 2, enough for GNU make and binutils to build; still no threads, interval timers or real links |
 | Filesystem | FAT32 only on disk: 2 s modification times (a target built within 2 s of editing its source looks up to date to `make`), no symbolic or hard links, cosmetic permissions, case-insensitive names |
-| Kernel limits | 32 descriptors per process, 64 processes, 64 memory regions, 8 MiB stack, `PATH_MAX` 512, 4 KiB pipes |
+| Kernel limits | 64 processes, `PATH_MAX` 512 (descriptors, memory regions, stack and pipes raised in phase 2) |
 | Boot media | ISO 9660 writing, El Torito, GRUB's images |
 
 ## Decisions
@@ -166,7 +167,7 @@ Done 2026-10-28:
 What phase 1 does not do: run anything on fluxOS. It is the foundation
 for phases 2 and 4.
 
-## Phase 2: the libc GNU programs can stand on
+## Phase 2: the libc GNU programs can stand on (mostly done)
 
 *Goal: binutils, GCC, GNU make and the tools of phase 3 compile against
 fluxOS's libc, with `./configure --host=i686-fluxos` and no source
@@ -174,57 +175,94 @@ patches beyond what their own `configure` can be told. Measured by
 `configure` completing for binutils and make, then by the Canadian cross
 of phase 4 linking.*
 
-Each of these is what the GNU build system or libiberty looks for and
-cannot work around:
+**Measured on 2026-10-28:** GNU make 4.4.1 and all of binutils 2.42 (`as`,
+`ld`, `ar`, `nm`, `objdump`, `objcopy`, `readelf`, `strip`, `size`) configure
+with `--host=i686-fluxos` and build into static fluxOS programs, with no
+source changes. Their `configure` scripts now miss only what a cross build
+cannot test by running (`mmap`, `strcoll`). None of it has run on fluxOS
+yet: that is `make test-libc-qemu` and phase 4.
 
-- [ ] `strtod`, `strtof`, `strtold`, `atof`; `strtoll`, `strtoull`,
-      `atoll`. (`user/desktop/wave/js/js.c` has a correct string-to-double
-      to lift; `lib/vsnprintf.c` is shared with the kernel, so the float
-      formatting goes into a user-side `vsnprintf` the kernel does not
-      link.)
-- [ ] `%f`, `%e`, `%g`, `%a`, `%Lf`, `%lld`, `%zu`, `%jd`, `%hhd`, `%*.*`
-      in the printf family; `%n`; `sscanf`/`fscanf`/`scanf`.
-- [ ] `getopt`, `getopt_long`; `bsearch`; `strsep`, `stpcpy`, `stpncpy`,
-      `memrchr`, `strcoll` (as `strcmp`), `strxfrm`; `strerror_r`;
-      `err`/`warn`/`errx`/`warnx`; `strsignal`; `ffs`.
-- [ ] `popen`/`pclose`, `system`; `tmpfile`, `tmpnam`, `mkstemp`,
-      `mkdtemp`; `freopen`; `fseeko`/`ftello`; `setbuf`; `fileno`-level
-      `fflush(NULL)` semantics (exists).
-- [ ] `realpath`, `basename`/`dirname` (`<libgen.h>`), `fnmatch`, `glob`.
-- [ ] `nanosleep`, `clock_gettime` (`CLOCK_REALTIME`, `CLOCK_MONOTONIC`),
-      `clock`, `mktime`, `timegm`, `localtime_r`, `difftime`, `asctime`,
-      `ctime`, `strftime` (exists), `gettimeofday` (exists).
-- [ ] `getrlimit`/`setrlimit`, `getrusage`, `sysconf` (`_SC_PAGESIZE`,
-      `_SC_NPROCESSORS_ONLN`, `_SC_OPEN_MAX`, `_SC_ARG_MAX`), `pathconf`,
-      `gethostname`, `getpagesize`.
-- [ ] `select` (over `poll`), `wait3`/`wait4` (no rusage yet), `setsid`,
-      `getsid`, `execl`/`execlp`/`execle`, `execvpe`, `vfork` (as `fork`),
-      `kill(0, ...)` semantics (exists).
-- [ ] `<wchar.h>`/`<wctype.h>` minimum (`wcslen`, `wcscpy`, `wcscmp`,
-      `mbtowc`, `wctomb`, `mbstowcs`, `wcstombs`, `mbrtowc`, `wcrtomb`,
-      `iswalpha`...; `MB_CUR_MAX` 1), and a `setlocale`/`localeconv` that
-      know only "C". GCC's driver and `cc1` call these at startup.
-- [ ] `<regex.h>` (POSIX basic and extended; libiberty brings its own
-      `xregex` for the GNU programs, so this is for everything else).
-- [ ] `getpwnam`/`getpwuid`/`getlogin` from `/etc/passwd` (one user);
-      `getuid` and friends exist.
-- [ ] Kernel: `symlink`, `readlink`, `link`, `lstat` syscalls (returning
-      `ENOSYS` until phase 5 gives a filesystem that has links);
-      `fchdir`, `fchmod`, `truncate`, `dup3`, `pipe2`, `openat`/`fstatat`
-      with `AT_FDCWD` only.
-- [ ] Kernel limits: `MAX_FDS` 32 to 256 (bitmap per process), `MAX_VMAS`
-      64 to 256, `USER_STACK_MAX` 8 to 64 MiB (`cc1` recurses deeply on
-      big expressions), `PIPE_SIZE` 4 KiB to 64 KiB, `PATH_MAX` 512 to
-      4096, `ARG_MAX` large enough for the Makefile's long `ar` lines.
-- [ ] A conformance test: `tests/libc-posix.c` run on the host harness and
-      in QEMU (`make test-libc-qemu`), covering every function above.
-- [ ] The probe that orders the list: `configure --host=i686-fluxos` of
-      binutils and GNU make with the cross compiler, on Linux, reading
-      `config.log` for what it could not find, and `make` of each for what
-      fails to compile.
+Done:
 
-Size: about 5k lines of libc, 600 of kernel. Risk: low; it is all
-well-trodden, and the probe says exactly what is needed first.
+- [x] `printf` family rewritten (`user/libc/printf.c`): every conversion
+      and size (`%lld`, `%zu`, `%jd`, `%hhd`, `%n`, `%m`, `*` widths), and
+      floating point (`%f %e %g %a`, `L` for long double) exact, by a
+      big-integer decimal expansion rounded half to even, as glibc. Also
+      `asprintf`, `vasprintf`, `vdprintf`.
+- [x] `strtod`, `strtof` correctly rounded (a long double guess checked
+      against the exact value with big integers), `strtold`, hexadecimal
+      floats, `inf`/`nan`; `strtol` and friends with overflow (`ERANGE`),
+      `strtoll`, `strtoull`, `strtoimax`, `strtoumax`, `atoll`, `atof`.
+- [x] `scanf`, `sscanf`, `fscanf` and the `v` forms, with `%[...]`, `%n`,
+      `*`, widths, sizes and `%ms`.
+- [x] stdio rewritten: `fseek`/`ftell`/`fseeko`/`ftello`/`rewind`/`fgetpos`/
+      `fsetpos` (there were none), reading and writing one stream in turn,
+      bulk `fread`/`fwrite`, `getdelim`, `freopen`, `tmpfile`, `tmpnam`,
+      `tempnam`, `popen`/`pclose`, `fmemopen`, `open_memstream`, `setbuf`,
+      `setlinebuf`, the `_unlocked` forms, eight bytes of `ungetc`.
+- [x] `getopt`, `getopt_long`, `getopt_long_only` (glibc's permutation);
+      `bsearch`; `stpcpy`, `stpncpy`, `memrchr`, `mempcpy`, `memccpy`,
+      `memmem`, `strchrnul`, `strsep`, `strcoll`, `strxfrm`, `strerror_r`,
+      `<strings.h>`; `err`/`warn` and their `v` forms; `psignal`,
+      `sys_siglist`, messages for every errno.
+- [x] `popen`, `system`; `mkstemp`, `mkostemp`, `mkstemps`, `mkdtemp`,
+      `mktemp`; `realpath`, `basename`, `dirname`, `fnmatch`, `glob`.
+- [x] `nanosleep`, `clock_gettime`/`clock_getres`/`clock_nanosleep`
+      (realtime, monotonic, CPU), `mktime`, `timegm`, `localtime_r`,
+      `difftime`, `asctime`/`ctime` (and `_r`), `tzset` (fixed offsets),
+      `tzname`/`timezone`, dates before 1970, `strftime` with the ISO week
+      (`%G %V %u`), `%U %W %C %s %z %c %x %X %r %k %l %P` and modifiers.
+- [x] `getrlimit`/`setrlimit` (reporting what the kernel enforces),
+      `sysconf`, `pathconf`, `getpagesize`, `gethostname`, `getloadavg`.
+- [x] `select`/`pselect` over `poll`, `wait3`/`wait4`, `setsid`/`getsid`
+      (a process group), `execl`/`execlp`/`execle`/`execvpe`, `vfork`,
+      `killpg`, `sigsuspend`, `siginterrupt`, `pread`/`pwrite`,
+      `readv`/`writev`, `flock` and `fcntl` record locks (granted).
+- [x] "C" locale: `setlocale`, `localeconv`, `nl_langinfo`, the
+      `<wchar.h>`/`<wctype.h>` functions (one byte is one character),
+      `mbtowc` and friends.
+- [x] `<regex.h>`: BRE and ERE with the GNU additions (`\+ \? \|`,
+      back-references, `\w \s \b \< \>`), leftmost-longest within a step
+      budget.
+- [x] `getpwnam`/`getpwuid` (and `_r`, `getpwent`), `getgrnam`/`getgrgid`
+      from `/etc/passwd` and `/etc/group`, or the one user without them.
+- [x] `<termios.h>` over the kernel's line discipline; `memalign`,
+      `posix_memalign`, `aligned_alloc`, `valloc`, `reallocarray`;
+      `dlopen` stubs that fail with a message.
+- [x] Headers: `pwd.h grp.h locale.h langinfo.h wchar.h wctype.h regex.h
+      fnmatch.h glob.h getopt.h libgen.h err.h alloca.h memory.h strings.h
+      ar.h paths.h sysexits.h sched.h dlfcn.h termios.h endian.h byteswap.h
+      sys/select.h sys/param.h sys/file.h sys/uio.h`, `_POSIX_VERSION`,
+      the `S_I*` and `_SC_*` constants, POSIX's types (`dev_t`, `ino_t`...).
+- [x] Kernel: `struct stat` has `st_dev`, `st_uid`, `st_gid`, `st_blksize`,
+      `st_blocks`, `st_atime`, `st_ctime`; `fchdir` and `fchmod` system
+      calls; 256 descriptors per process (was 32), 256 memory regions (was
+      64), a 32 MiB stack (was 8; 64 would collide with the Radeon GL
+      window), 64 KiB pipes (was 4 KiB); more errno values (`ELOOP`,
+      `EILSEQ`...).
+- [x] The libc carries the 64-bit division helpers GCC calls on i386
+      (`__udivdi3` and the rest, weak so that the real libgcc wins).
+- [x] Tests: `make test-libc` checks printf, strtod/strtof, strtol, sscanf,
+      regex, fnmatch, getopt and the calendar functions against glibc on
+      the host, compiled against the fluxOS headers (1.3 million cases, all
+      equal; glibc's `%#g` misprint of values rounding up to a power of ten
+      is the one known difference). `make test-libc-qemu` runs the
+      in-system part (stdio on files, popen, system, 256 descriptors, pipes,
+      select, nanosleep, realpath, glob) as init in QEMU.
+
+Left:
+
+- [ ] Run `make test-libc-qemu`, and then the cross-built `make`, `as` and
+      `ld` on fluxOS.
+- [ ] `PATH_MAX` stays 512: the kernel copies paths onto its 16 KiB stacks
+      (`rename` holds three), so a larger one needs those buffers on the
+      heap first.
+- [ ] `link`, `symlink` and `readlink` answer as Linux does on vfat (no
+      links): real ones come with ext2 in phase 5.
+- [ ] No interval timers (`alarm`, `setitimer`) and no `sigpending`
+      answer from the kernel; `sigaltstack` is refused. GNU make and
+      binutils need none of them.
+- [ ] Sessions are process groups (`setsid` does not detach the terminal).
 
 ## Phase 3: make and the tools the Makefile runs
 
@@ -404,8 +442,9 @@ Phase 2 comes first among the rest because 3 and 4 are ports that need
 it, and its first item should be the configure probe, which turns the
 libc list into an ordered one.
 
-Suggested order: 2 (probe, then the list), 4 (the Canadian cross, as soon
-as binutils links), 3, 6, 5, 7.
+Suggested order: 4 (the Canadian cross: binutils already links for
+fluxOS), 3 (GNU make already builds), 6, 5, 7; and running the phase 2
+tests on fluxOS before relying on any of it.
 
 ## Later, deliberately
 

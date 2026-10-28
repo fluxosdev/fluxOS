@@ -132,10 +132,53 @@ char *strerror(int err)
     case ETIMEDOUT: return "Connection timed out";
     case ECONNREFUSED: return "Connection refused";
     case EHOSTUNREACH: return "No route to host";
+    case ENXIO: return "No such device or address";
+    case ETXTBSY: return "Text file busy";
+    case EMLINK: return "Too many links";
+    case EDOM: return "Numerical argument out of domain";
+    case EDEADLK: return "Resource deadlock avoided";
+    case ENOLCK: return "No locks available";
+    case ELOOP: return "Too many levels of symbolic links";
+    case ENOMSG: return "No message of desired type";
+    case EIDRM: return "Identifier removed";
+    case ENOSTR: return "Device not a stream";
+    case ENODATA: return "No data available";
+    case ETIME: return "Timer expired";
+    case ENOSR: return "Out of streams resources";
+    case ENOLINK: return "Link has been severed";
+    case EPROTO: return "Protocol error";
+    case EMULTIHOP: return "Multihop attempted";
+    case EBADMSG: return "Bad message";
+    case EILSEQ: return "Invalid or incomplete multibyte or wide character";
+    case ENOPROTOOPT: return "Protocol not available";
+    case ENETRESET: return "Network dropped connection on reset";
+    case ENOBUFS: return "No buffer space available";
+    case EALREADY: return "Operation already in progress";
+    case EINPROGRESS: return "Operation now in progress";
+    case ESTALE: return "Stale file handle";
+    case EDQUOT: return "Disk quota exceeded";
+    case ECANCELED: return "Operation canceled";
+    case EOWNERDEAD: return "Owner died";
+    case ENOTRECOVERABLE: return "State not recoverable";
     }
     static char buf[32];
     snprintf(buf, sizeof(buf), "Unknown error %d", err);
     return buf;
+}
+
+int strerror_r(int err, char *buf, size_t size)
+{
+    const char *m = strerror(err);
+    size_t n = strlen(m);
+    if (!size)
+        return ERANGE;
+    if (n >= size) {
+        memcpy(buf, m, size - 1);
+        buf[size - 1] = 0;
+        return ERANGE;
+    }
+    memcpy(buf, m, n + 1);
+    return 0;
 }
 
 const char *strsignal(int sig)
@@ -156,6 +199,125 @@ const char *strsignal(int sig)
     case SIGPIPE: return "broken pipe";
     case SIGALRM: return "alarm";
     case SIGTERM: return "terminated";
+    case SIGCHLD: return "child exited";
+    case SIGCONT: return "continued";
+    case SIGSTOP: return "stopped (signal)";
+    case SIGTSTP: return "stopped";
+    case SIGTTIN: return "stopped (tty input)";
+    case SIGTTOU: return "stopped (tty output)";
+    case SIGURG: return "urgent I/O condition";
+    case SIGXCPU: return "CPU time limit exceeded";
+    case SIGXFSZ: return "file size limit exceeded";
+    case SIGVTALRM: return "virtual timer expired";
+    case SIGPROF: return "profiling timer expired";
+    case SIGWINCH: return "window changed";
+    case SIGIO: return "I/O possible";
+    case SIGSYS: return "bad system call";
     }
     return "unknown signal";
 }
+
+/* ---- more of <string.h> and <strings.h> ---- */
+
+void *memrchr(const void *s, int c, size_t n)
+{
+    const unsigned char *p = s;
+    while (n--)
+        if (p[n] == (unsigned char)c)
+            return (void *)(p + n);
+    return NULL;
+}
+
+void *mempcpy(void *dst, const void *src, size_t n)
+{
+    return (char *)memcpy(dst, src, n) + n;
+}
+
+void *memccpy(void *dst, const void *src, int c, size_t n)
+{
+    unsigned char *d = dst;
+    const unsigned char *s = src;
+    for (size_t i = 0; i < n; i++) {
+        d[i] = s[i];
+        if (s[i] == (unsigned char)c)
+            return d + i + 1;
+    }
+    return NULL;
+}
+
+void *memmem(const void *hay, size_t hlen, const void *needle, size_t nlen)
+{
+    const unsigned char *h = hay, *n = needle;
+    if (!nlen)
+        return (void *)hay;
+    if (nlen > hlen)
+        return NULL;
+    for (size_t i = 0; i + nlen <= hlen; i++) {
+        const unsigned char *p = memchr(h + i, n[0], hlen - nlen + 1 - i);
+        if (!p)
+            return NULL;
+        i = (size_t)(p - h);
+        if (!memcmp(p, n, nlen))
+            return (void *)p;
+    }
+    return NULL;
+}
+
+int strcoll(const char *a, const char *b)
+{
+    return strcmp(a, b);
+}
+
+size_t strxfrm(char *dst, const char *src, size_t n)
+{
+    size_t len = strlen(src);
+    if (n)
+        strlcpy(dst, src, n);
+    return len;
+}
+
+char *stpcpy(char *dst, const char *src)
+{
+    size_t n = strlen(src);
+    memcpy(dst, src, n + 1);
+    return dst + n;
+}
+
+char *stpncpy(char *dst, const char *src, size_t n)
+{
+    size_t len = strnlen(src, n);
+    memcpy(dst, src, len);
+    memset(dst + len, 0, n - len);
+    return dst + len;
+}
+
+char *strchrnul(const char *s, int c)
+{
+    while (*s && *s != (char)c)
+        s++;
+    return (char *)s;
+}
+
+char *strsep(char **s, const char *delim)
+{
+    char *start = *s;
+    if (!start)
+        return NULL;
+    char *end = start + strcspn(start, delim);
+    if (*end) {
+        *end = 0;
+        *s = end + 1;
+    } else {
+        *s = NULL;
+    }
+    return start;
+}
+
+void bzero(void *s, size_t n) { memset(s, 0, n); }
+void bcopy(const void *src, void *dst, size_t n) { memmove(dst, src, n); }
+int bcmp(const void *a, const void *b, size_t n) { return memcmp(a, b, n) != 0; }
+char *index(const char *s, int c) { return strchr(s, c); }
+char *rindex(const char *s, int c) { return strrchr(s, c); }
+int ffs(int v) { return v ? __builtin_ffs(v) : 0; }
+int ffsl(long v) { return v ? __builtin_ffsl(v) : 0; }
+int ffsll(long long v) { return v ? __builtin_ffsll(v) : 0; }

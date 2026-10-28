@@ -20,9 +20,20 @@ int main(int argc, char **argv, char **envp);
 static void (*atexit_fns[MAX_ATEXIT])(void);
 static int atexit_count;
 
+/* The program's name, for err() and warn(): argv[0] without its directory. */
+const char *__progname = "";
+char *program_invocation_name = "";
+char *program_invocation_short_name = "";
+
 void __libc_start(int argc, char **argv, char **envp)
 {
     environ = envp;
+    if (argc > 0 && argv[0]) {
+        const char *slash = strrchr(argv[0], '/');
+        __progname = slash ? slash + 1 : argv[0];
+        program_invocation_name = argv[0];
+        program_invocation_short_name = (char *)__progname;
+    }
     __stdio_init();
     exit(main(argc, argv, envp));
 }
@@ -252,6 +263,74 @@ void free(void *p)
     release(b);
 }
 
+/* A block whose payload is align-aligned: a bigger one, with the part
+ * before the aligned payload split off and freed. */
+void *memalign(size_t align, size_t n)
+{
+    if (align <= ALIGN)
+        return malloc(n);
+    if (align & (align - 1)) {
+        errno = EINVAL;
+        return NULL;
+    }
+    size_t size = block_size(n ? n : 1);
+    if (!size || n > MAX_REQ - align - MIN_BLOCK) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    char *p = malloc(n + align + MIN_BLOCK);
+    if (!p)
+        return NULL;
+    struct block *b = (struct block *)(p - HDR);
+    if (!((uintptr_t)p & (align - 1))) {
+        trim(b, size);
+        return p;
+    }
+    /* at least MIN_BLOCK in, so the part before is a block of its own */
+    char *q = (char *)(((uintptr_t)p + MIN_BLOCK + align - 1) & ~(uintptr_t)(align - 1));
+    struct block *nb = (struct block *)(q - HDR);
+    size_t lead = (size_t)((char *)nb - (char *)b);
+    nb->head = (bsize(b) - lead) | INUSE;
+    b->head = lead | INUSE | (b->head & PINUSE);
+    release(b);                         /* marks nb's PINUSE clear, merges b downwards */
+    trim(nb, size);
+    return q;
+}
+
+int posix_memalign(void **out, size_t align, size_t n)
+{
+    if (align < sizeof(void *) || (align & (align - 1)))
+        return EINVAL;
+    int saved = errno;
+    void *p = memalign(align, n);
+    if (!p) {
+        int e = errno;
+        errno = saved;
+        return e;
+    }
+    *out = p;
+    return 0;
+}
+
+void *aligned_alloc(size_t align, size_t n)
+{
+    return memalign(align, n);
+}
+
+void *valloc(size_t n)
+{
+    return memalign(4096, n);
+}
+
+void *reallocarray(void *p, size_t count, size_t size)
+{
+    if (size && count > (size_t)-1 / size) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    return realloc(p, count * size);
+}
+
 void *calloc(size_t count, size_t size)
 {
     if (size && count > (size_t)-1 / size)
@@ -420,57 +499,6 @@ int putenv(char *str)
 
 /* ---- numbers ---- */
 
-unsigned long strtoul(const char *s, char **end, int base)
-{
-    const char *p = s;
-    while (isspace(*p))
-        p++;
-    if (*p == '+')
-        p++;
-    if ((base == 0 || base == 16) && p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
-        p += 2;
-        base = 16;
-    } else if (base == 0 && p[0] == '0') {
-        base = 8;
-    } else if (base == 0) {
-        base = 10;
-    }
-    unsigned long v = 0;
-    const char *start = p;
-    for (;; p++) {
-        int d;
-        if (isdigit(*p)) d = *p - '0';
-        else if (*p >= 'a' && *p <= 'z') d = *p - 'a' + 10;
-        else if (*p >= 'A' && *p <= 'Z') d = *p - 'A' + 10;
-        else break;
-        if (d >= base)
-            break;
-        v = v * (unsigned long)base + (unsigned long)d;
-    }
-    if (end)
-        *end = (char *)(p == start ? s : p);
-    return v;
-}
-
-long strtol(const char *s, char **end, int base)
-{
-    const char *p = s;
-    while (isspace(*p))
-        p++;
-    int neg = 0;
-    if (*p == '-') {
-        neg = 1;
-        p++;
-    }
-    char *e;
-    unsigned long v = strtoul(p, &e, base);
-    if (end)
-        *end = e == p ? (char *)s : e;
-    return neg ? -(long)v : (long)v;
-}
-
-int atoi(const char *s) { return (int)strtol(s, NULL, 10); }
-long atol(const char *s) { return strtol(s, NULL, 10); }
 int abs(int x) { return x < 0 ? -x : x; }
 long labs(long x) { return x < 0 ? -x : x; }
 

@@ -90,7 +90,7 @@ int vfs_dirent(struct vnode *dir, uint32_t index, struct dirent *de);
 int vfs_getpath(struct vnode *vn, char *buf, uint32_t size);
 
 /* ---- open file descriptions ---- */
-#define PIPE_SIZE 4096
+#define PIPE_SIZE 65536
 
 enum { FT_VNODE = 1, FT_PIPE, FT_SOCKET };
 

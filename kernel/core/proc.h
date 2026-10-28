@@ -9,8 +9,8 @@
 #include "x86.h"
 
 #define MAX_PROCS   64
-#define MAX_FDS     32
-#define MAX_VMAS    64
+#define MAX_FDS     256
+#define MAX_VMAS    256
 #define KSTACK_SIZE 16384
 #define QUANTUM     5           /* timer ticks per time slice (50 ms) */
 
@@ -58,7 +58,7 @@ struct proc {
     int in_syscall;
     uint32_t syscall_orig_eax;
     struct file *fds[MAX_FDS];
-    uint32_t fd_cloexec;        /* bitmask of FD_CLOEXEC per descriptor */
+    uint32_t fd_cloexec[MAX_FDS / 32];  /* FD_CLOEXEC, a bit per descriptor */
     uint32_t umask;
     struct vnode *cwd;
     struct tty *ctty;           /* controlling terminal */
@@ -76,6 +76,19 @@ struct proc {
     int fpu_cpu;                /* the processor whose FPU last loaded them, or -1 */
     uint8_t fpu[512] __attribute__((aligned(16)));     /* FXSAVE image: x87, MMX, SSE */
 };
+
+static inline int fd_cloexec_get(const struct proc *p, int fd)
+{
+    return (p->fd_cloexec[fd >> 5] >> (fd & 31)) & 1;
+}
+
+static inline void fd_cloexec_set(struct proc *p, int fd, int on)
+{
+    if (on)
+        p->fd_cloexec[fd >> 5] |= 1u << (fd & 31);
+    else
+        p->fd_cloexec[fd >> 5] &= ~(1u << (fd & 31));
+}
 
 extern struct proc procs[MAX_PROCS];
 extern spinlock_t sched_lock;

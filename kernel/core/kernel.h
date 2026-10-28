@@ -26,7 +26,7 @@
 #define USER_BASE        0x40000000u
 #define USER_TOP         0xC0000000u
 #define USER_STACK_TOP   USER_TOP
-#define USER_STACK_MAX   (8u * 1024 * 1024)
+#define USER_STACK_MAX   (32u * 1024 * 1024)
 #define USER_STACK_LIMIT (USER_STACK_TOP - USER_STACK_MAX)
 #define USER_MMIO_BASE   0xB0000000u    /* device memory (framebuffer); heap ends here */
 #define KERNEL_MMIO_BASE 0xC0000000u    /* kernel mappings of device memory */

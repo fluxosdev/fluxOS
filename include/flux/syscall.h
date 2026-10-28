@@ -87,7 +87,9 @@
 #define SYS_umask       79  /* mask */
 #define SYS_utime       80  /* path, const struct flux_utimbuf *times */
 #define SYS_times       81  /* struct flux_tms *buf */
+#define SYS_fchdir      82  /* fd */
+#define SYS_fchmod      83  /* fd, mode */
 
-#define NSYSCALLS       82
+#define NSYSCALLS       84
 
 #endif

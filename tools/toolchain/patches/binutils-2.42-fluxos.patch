@@ -29,7 +29,7 @@
    i386-*-beos*)				fmt=elf ;;
    i386-*-elfiamcu)			fmt=elf arch=iamcu ;;
    i386-*-elf*)				fmt=elf ;;
-+  i386-*-fluxos*)			fmt=elf ;;
++  i386-*-fluxos*)			fmt=elf em=linux ;;
    i386-*-fuchsia*)			fmt=elf ;;
    i386-*-haiku*)			fmt=elf em=haiku ;;
    i386-*-genode*)			fmt=elf ;;

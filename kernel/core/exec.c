@@ -356,10 +356,10 @@ int proc_exec(struct proc *p, const char *path, char *const argv[], char *const 
     memset(p->vmas, 0, sizeof(p->vmas));
     proc_signal_exec(p);
     for (int i = 0; i < MAX_FDS; i++) {
-        if (p->fds[i] && (p->fd_cloexec & (1u << i))) {
+        if (p->fds[i] && fd_cloexec_get(p, i)) {
             struct file *f = p->fds[i];
             p->fds[i] = NULL;
-            p->fd_cloexec &= ~(1u << i);
+            fd_cloexec_set(p, i, 0);
             file_close(f);
         }
     }

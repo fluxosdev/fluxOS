@@ -40,8 +40,34 @@ int sigfillset(sigset_t *set);
 int sigaddset(sigset_t *set, int sig);
 int sigdelset(sigset_t *set, int sig);
 int sigismember(const sigset_t *set, int sig);
+#define SIGRTMIN 32
+#define SIGRTMAX 31                     /* none */
+#define NSIG_MAX NSIG
+#define SA_ONESHOT SA_RESETHAND
+#define SA_NOMASK  SA_NODEFER
+#define SA_INTERRUPT 0
+
+typedef struct {
+    void *ss_sp;
+    int ss_flags;
+    size_t ss_size;
+} stack_t;
+#define SS_ONSTACK 1
+#define SS_DISABLE 2
+#define MINSIGSTKSZ 2048
+#define SIGSTKSZ 8192
+
+extern const char *const sys_siglist[NSIG];
+
 int kill(pid_t pid, int sig);
+int killpg(pid_t pgrp, int sig);
 int raise(int sig);
 const char *strsignal(int sig);
+void psignal(int sig, const char *msg);
+int sigsuspend(const sigset_t *mask);
+int sigpending(sigset_t *set);
+int sigaltstack(const stack_t *ss, stack_t *old);
+int siginterrupt(int sig, int flag);
+sighandler_t bsd_signal(int sig, sighandler_t handler);
 
 #endif

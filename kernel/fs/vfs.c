@@ -567,11 +567,15 @@ void vfs_stat(struct vnode *vn, struct stat *st)
 {
     uint32_t fmt = vn->type == VN_DIR ? S_IFDIR : vn->type == VN_CHR ? S_IFCHR :
                    vn->type == VN_BLK ? S_IFBLK : S_IFREG;
+    memset(st, 0, sizeof(*st));
+    st->st_dev = vn->fs ? (uint32_t)(uintptr_t)vn->fs : 1;     /* ramfs and devices: 1 */
     st->st_ino = vn->ino;
     st->st_mode = fmt | (vn->mode & 07777);
     st->st_size = vn->size;
     st->st_nlink = vn->type == VN_DIR ? 2 : 1;
-    st->st_mtime = vn->mtime;
+    st->st_blksize = 4096;
+    st->st_blocks = (vn->size + 511) / 512;
+    st->st_atime = st->st_mtime = st->st_ctime = vn->mtime;
     st->st_rdev = vn->rdev;
 }
 

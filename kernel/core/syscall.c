@@ -97,10 +97,7 @@ static int alloc_fd_from(struct file *f, int min_fd, int cloexec)
     for (int i = min_fd; i < MAX_FDS; i++) {
         if (!current->fds[i]) {
             current->fds[i] = f;
-            if (cloexec)
-                current->fd_cloexec |= 1u << i;
-            else
-                current->fd_cloexec &= ~(1u << i);
+            fd_cloexec_set(current, i, cloexec);
             return i;
         }
     }
@@ -599,7 +596,7 @@ static int sys_close(uint32_t fd, uint32_t b, uint32_t c, uint32_t d, uint32_t e
     if (!f)
         return -EBADF;
     current->fds[fd] = NULL;
-    current->fd_cloexec &= ~(1u << fd);
+    fd_cloexec_set(current, (int)fd, 0);
     file_close(f);
     return 0;
 }
@@ -626,7 +623,7 @@ static int sys_dup2(uint32_t oldfd, uint32_t newfd, uint32_t c, uint32_t d, uint
         return (int)newfd;
     struct file *prev = current->fds[newfd];
     current->fds[newfd] = file_dup(f);
-    current->fd_cloexec &= ~(1u << newfd);
+    fd_cloexec_set(current, (int)newfd, 0);
     if (prev)
         file_close(prev);
     return (int)newfd;
@@ -647,12 +644,9 @@ static int sys_fcntl(uint32_t fd, uint32_t cmd, uint32_t arg, uint32_t d, uint32
         return nfd;
     }
     case F_GETFD:
-        return (current->fd_cloexec & (1u << fd)) ? FD_CLOEXEC : 0;
+        return fd_cloexec_get(current, (int)fd) ? FD_CLOEXEC : 0;
     case F_SETFD:
-        if (arg & FD_CLOEXEC)
-            current->fd_cloexec |= 1u << fd;
-        else
-            current->fd_cloexec &= ~(1u << fd);
+        fd_cloexec_set(current, (int)fd, (arg & FD_CLOEXEC) != 0);
         return 0;
     case F_GETFL:
         return f->flags & ~O_CLOEXEC;
@@ -854,6 +848,21 @@ static int sys_chdir(uint32_t upath, uint32_t b, uint32_t c, uint32_t d, uint32_
     return 0;
 }
 
+static int sys_fchdir(uint32_t fd, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)b; (void)c; (void)d; (void)e;
+    struct file *f = get_file(fd);
+    if (!f)
+        return -EBADF;
+    struct vnode *vn = f->vn;
+    if (!vn || vn->type != VN_DIR)
+        return -ENOTDIR;
+    vfs_ref(vn);
+    vfs_unref(current->cwd);
+    current->cwd = vn;
+    return 0;
+}
+
 static int sys_getcwd(uint32_t ubuf, uint32_t size, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)c; (void)d; (void)e;
@@ -935,6 +944,21 @@ static int sys_chmod(uint32_t upath, uint32_t mode, uint32_t c, uint32_t d, uint
     int r = vfs_resolve(path, current->cwd, &vn);
     if (r < 0)
         return r;
+    if (vn->fs && vn->fs->readonly)
+        return -EROFS;
+    vn->mode = mode & 07777;
+    return 0;
+}
+
+static int sys_fchmod(uint32_t fd, uint32_t mode, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    struct file *f = get_file(fd);
+    if (!f)
+        return -EBADF;
+    struct vnode *vn = f->vn;
+    if (!vn)
+        return -EINVAL;                 /* pipes and sockets have no mode */
     if (vn->fs && vn->fs->readonly)
         return -EROFS;
     vn->mode = mode & 07777;
@@ -1529,6 +1553,8 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_umask] = sys_umask,
     [SYS_utime] = sys_utime,
     [SYS_times] = sys_times,
+    [SYS_fchdir] = sys_fchdir,
+    [SYS_fchmod] = sys_fchmod,
 };
 
 /* VFS operations and shared file offsets; read and write lock per chunk. */
@@ -1538,7 +1564,7 @@ static const uint8_t takes_vfs_lock[NSYSCALLS] = {
     [SYS_rename] = 1, [SYS_chmod] = 1, [SYS_stat] = 1, [SYS_mount] = 1,
     [SYS_umount] = 1, [SYS_statfs] = 1, [SYS_getmounts] = 1, [SYS_blkinfo] = 1,
     [SYS_sync] = 1, [SYS_fsync] = 1, [SYS_blkrescan] = 1, [SYS_ftruncate] = 1,
-    [SYS_lseek] = 1, [SYS_llseek] = 1, [SYS_utime] = 1,
+    [SYS_lseek] = 1, [SYS_llseek] = 1, [SYS_utime] = 1, [SYS_fchdir] = 1, [SYS_fchmod] = 1,
 };
 
 void syscall_dispatch(struct trapframe *tf)

@@ -14,6 +14,7 @@
 #define ESRCH         3
 #define EINTR         4
 #define EIO           5
+#define ENXIO         6
 #define E2BIG         7
 #define ENOEXEC       8
 #define EBADF         9
@@ -33,16 +34,36 @@
 #define ENFILE       23
 #define EMFILE       24
 #define ENOTTY       25
+#define ETXTBSY      26
 #define EFBIG        27
 #define ENOSPC       28
 #define ESPIPE       29
 #define EROFS        30
+#define EMLINK       31
 #define EPIPE        32
+#define EDOM         33
 #define ERANGE       34
+#define EDEADLK      35
 #define ENAMETOOLONG 36
+#define ENOLCK       37
 #define ENOSYS       38
 #define ENOTEMPTY    39
+#define ELOOP        40
+#ifndef EWOULDBLOCK
+#define EWOULDBLOCK  EAGAIN
+#endif
+#define ENOMSG       42
+#define EIDRM        43
+#define ENOSTR       60
+#define ENODATA      61
+#define ETIME        62
+#define ENOSR        63
+#define ENOLINK      67
+#define EPROTO       71
+#define EMULTIHOP    72
+#define EBADMSG      74
 #define EOVERFLOW    75
+#define EILSEQ       84
 #define ENOTSOCK     88
 #define EDESTADDRREQ 89
 #define EMSGSIZE     90
@@ -52,18 +73,28 @@
 #ifndef ENOTSUP
 #define ENOTSUP      EOPNOTSUPP
 #endif
+#define ENOPROTOOPT  92
 #define EAFNOSUPPORT 97
 #define EADDRINUSE   98
 #define EADDRNOTAVAIL 99
 #define ENETDOWN    100
 #define ENETUNREACH 101
+#define ENETRESET   102
 #define ECONNABORTED 103
 #define ECONNRESET  104
+#define ENOBUFS     105
 #define EISCONN     106
 #define ENOTCONN    107
 #define ETIMEDOUT   110
 #define ECONNREFUSED 111
 #define EHOSTUNREACH 113
+#define EALREADY    114
+#define EINPROGRESS 115
+#define ESTALE      116
+#define EDQUOT      122
+#define ECANCELED   125
+#define EOWNERDEAD  130
+#define ENOTRECOVERABLE 131
 
 /* ---- open(2) and fcntl(2) ---- */
 #define O_RDONLY     0x0000
@@ -115,13 +146,23 @@
 #define S_ISBLK(m)  (((m) & S_IFMT) == S_IFBLK)
 #define S_ISSOCK(m) (((m) & S_IFMT) == S_IFSOCK)
 
+/* POSIX's fields, as plain 32-bit numbers. Ownership is cosmetic (one
+ * user, uid 0), and the three times are the filesystem's one time until
+ * it keeps more. st_dev tells mounted filesystems apart, not disks. */
 struct stat {
+    uint32_t st_dev;            /* the filesystem the file is on */
     uint32_t st_ino;
     uint32_t st_mode;
-    uint32_t st_size;
     uint32_t st_nlink;
-    uint32_t st_mtime;
+    uint32_t st_uid;
+    uint32_t st_gid;
     uint32_t st_rdev;           /* device number for device nodes */
+    uint32_t st_size;
+    uint32_t st_blksize;        /* the preferred I/O size */
+    uint32_t st_blocks;         /* 512-byte blocks */
+    uint32_t st_atime;
+    uint32_t st_mtime;
+    uint32_t st_ctime;
 };
 
 #define MAJOR(dev) (((dev) >> 8) & 0xFF)
@@ -148,6 +189,8 @@ struct stat {
 #define DT_DIR     4
 #define DT_BLK     6
 #define DT_REG     8
+#define DT_LNK     10
+#define DT_SOCK    12
 
 struct dirent {
     uint32_t d_ino;
@@ -694,10 +737,13 @@ struct input_event {
 
 /* ---- poll(2) ---- */
 #define POLLIN   0x01
+#define POLLPRI  0x02          /* never reported: no out-of-band data */
 #define POLLOUT  0x04
 #define POLLERR  0x08
 #define POLLHUP  0x10
 #define POLLNVAL 0x20
+#define POLLRDNORM POLLIN
+#define POLLWRNORM POLLOUT
 
 struct pollfd {
     int32_t fd;

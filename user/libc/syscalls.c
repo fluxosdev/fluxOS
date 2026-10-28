@@ -116,6 +116,19 @@ int fcntl(int fd, int cmd, ...)
     va_start(ap, cmd);
     arg = va_arg(ap, int);
     va_end(ap);
+    switch (cmd) {
+    case F_GETLK:                       /* one user: no lock is ever in the way */
+        if (ret(sc3(SYS_fcntl, fd, F_GETFD, 0)) < 0)
+            return -1;
+        ((struct flock *)arg)->l_type = F_UNLCK;
+        return 0;
+    case F_SETLK:
+    case F_SETLKW:
+    case F_SETOWN:
+        return ret(sc3(SYS_fcntl, fd, F_GETFD, 0)) < 0 ? -1 : 0;
+    case F_GETOWN:
+        return ret(sc3(SYS_fcntl, fd, F_GETFD, 0)) < 0 ? -1 : getpid();
+    }
     return ret(sc3(SYS_fcntl, fd, cmd, arg));
 }
 

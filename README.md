@@ -545,6 +545,15 @@ poweroff ps reboot rm rmdir seq sh sleep sort spin stat sync tail tee top
 touch tr umount uname uniq unzip uptime wc wget yes zip (and httpc, the browser's
 fetcher), on a small libc (stdio, malloc, dirent, time, sockets, a DNS resolver,
 archives, an HTTP/1.1 client and inflate).
+- The libc is enough of POSIX for GNU programs to build against it unchanged
+  (GNU make and binutils do, cross-compiled; see `self-hosting-roadmap.md`):
+  `printf` and `strtod` that agree with glibc digit for digit (exact
+  floating-point conversion, correct rounding), `scanf`, seekable stdio with
+  `popen`, `tmpfile` and memory streams, `getopt_long`, POSIX regular
+  expressions, `fnmatch` and `glob`, `select`, `mktime`/`timegm`/`strftime`,
+  `realpath`, `mkstemp`, `sysconf`, `<termios.h>`, a "C" locale with the
+  wide-character functions, and users from `/etc/passwd`. Processes may hold
+  256 descriptors, pipes 64 KiB.
 - `unzip [-l|-v|-t|-p] [-o|-n] [-j] [-d DIR] ARCHIVE [NAME...]` lists, tests and
   extracts ZIP and 7z archives; `7z l|t|x|e [-oDIR] [-y] ARCHIVE` does the same
   with 7-Zip's syntax; `zip [-r] [-0..-9] [-j] ARCHIVE.zip FILE...` makes ZIP
@@ -589,6 +598,8 @@ make test-browser-fonts # real glyph rendering and malformed-font rejection
 make test-tls     # local OpenSSL servers: authenticated handshakes and rejected certificates
 make test-websocket # local ws/wss transport and browser API integration tests
 make test-kernel # runs allocator, filesystem, pipe and socket regressions on the host
+make test-libc   # libc printf/strtod/scanf/regex/fnmatch/getopt/time against glibc, on the host
+make test-libc-qemu # the libc on the real kernel (files, popen, pipes, select, time) in QEMU
 make test-desktop-jobs # decoder helper responsiveness, transfers, cancellation and recovery
 make test-desktop-jobs-qemu # same protocol tests with fluxOS's blocking pipes
 make test-kernel-qemu # boots kernel regressions with a disposable initrd and scratch disk
@@ -757,7 +768,7 @@ grub/                      the CD's boot menu (install.cfg) and the installed di
 | `0x00000000 - 0x3FFFFFFF`   | kernel; identity map of the first GiB of RAM     |
 | `0x40000000 - ...`          | user program image, then the `sbrk` heap         |
 | `0xB0000000 - ...`          | the framebuffer, in the process that mapped it   |
-| `0xBF800000 - 0xBFFFFFFF`   | user stack (up to 8 MiB, grown on page faults)   |
+| `0xBE000000 - 0xBFFFFFFF`   | user stack (up to 32 MiB, grown on page faults)  |
 | `0xC0000000 - ...`          | kernel mappings of device memory (framebuffer)   |
 | `0xFEC00000 - 0xFEFFFFFF`   | temporary mappings of high user pages (kmap)     |
 | `0xFF000000 - 0xFFFFFFFF`   | late mappings (ACPI's firmware memory)           |
