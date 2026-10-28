@@ -185,6 +185,7 @@ int radeon_dp_read_dpcd(void);
 int radeon_dp_read_edid(uint8_t *edid);     /* 128 bytes over I2C-over-AUX; 1 if valid */
 int radeon_dp_link_config(uint32_t pixclock, int bpp, int nutmeg);
 int radeon_dp_panel_mode(int bridge);
+int radeon_dp_wait_sink(void);              /* ms until it answers again, or -1 */
 void radeon_dp_set_power(int on);
 int radeon_dp_link_train(int panel_mode);   /* transmitter on; 0 when the link is up */
 

@@ -1487,14 +1487,28 @@ static int link_ready(void)
 
 /* The mode change for Evergreen. The controller always runs the panel's
  * timing; a smaller view is stretched to it. */
+/* The transmitter and the bridge from the start (radeon_atom_encoder_init).
+ * The bridge restarts and does not answer on AUX for a while; Linux does
+ * this at load, long before its first mode change, so here the bridge is
+ * waited for before it is used. */
+static void encoders_init(void)
+{
+    dig_transmitter_dce4(ATOM_TRANSMITTER_ACTION_INIT, 0);
+    ext_encoder(EXTERNAL_ENCODER_ACTION_V3_ENCODER_INIT);
+    tx_initialised = 1;
+    int ms = radeon_dp_wait_sink();
+    if (ms < 0)
+        klog("radeon: the DisplayPort bridge is silent a second after its initialisation\n");
+    else
+        klog("radeon: the DisplayPort bridge answered %d ms after its initialisation\n", ms);
+    ext_encoder(EXTERNAL_ENCODER_ACTION_V3_DDC_SETUP);
+}
+
 static int program_mode_dce4(const struct timing *view, int bpp, uint32_t pitch_px)
 {
     disable_other_crtc();
-    if (!tx_initialised) {
-        dig_transmitter_dce4(ATOM_TRANSMITTER_ACTION_INIT, 0);
-        ext_encoder(EXTERNAL_ENCODER_ACTION_V3_ENCODER_INIT);
-        tx_initialised = 1;
-    }
+    if (!tx_initialised)
+        encoders_init();
     /* encoder prepare */
     output_lock(1);
     select_crtc_source();
@@ -1518,8 +1532,15 @@ static int program_mode_dce4(const struct timing *view, int bpp, uint32_t pitch_
     crtc_dpms(1);
     load_lut_dce4();
     crtc_call(ATOM_CMD_UPDATE_CRTC_DBUF, ATOM_DISABLE);
-    /* encoder commit */
+    /* encoder commit; off and on again while the link will not come up,
+     * as Linux's hot plug handling retrains */
     int link = encoder_dpms_dce4(1);
+    for (int tries = 1; link < 0 && tries < 3; tries++) {
+        klog("radeon: DisplayPort link down, training it again (try %d of 3)\n", tries + 1);
+        encoder_dpms_dce4(0);
+        mdelay(50);
+        link = encoder_dpms_dce4(1);
+    }
     output_lock(0);
     return r < 0 ? r : link;
 }
@@ -1658,12 +1679,7 @@ void radeon_native_resume(void)
 {
     if (!rv.native || !cur_timing || !RADEON_EVERGREEN())
         return;
-    tx_initialised = 0;
-    dig_transmitter_dce4(ATOM_TRANSMITTER_ACTION_INIT, 0);
-    ext_encoder(EXTERNAL_ENCODER_ACTION_V3_ENCODER_INIT);
-    tx_initialised = 1;
-    ext_encoder(EXTERNAL_ENCODER_ACTION_V3_DDC_SETUP);
-    radeon_dp_read_dpcd();
+    encoders_init();
     if (link_ready() < 0) {
         klog("radeon: cannot set %ux%u again after waking\n", cur_timing->w, cur_timing->h);
         return;

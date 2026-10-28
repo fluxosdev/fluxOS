@@ -286,15 +286,33 @@ int radeon_dp_link_config(uint32_t pixclock, int bpp, int nutmeg)
 }
 
 /* How the DIG encoder should address the sink (radeon_dp_get_panel_mode):
- * a bridge chip in the internal mode its DPCD offers. */
+ * a bridge chip in the internal mode its DPCD offers. From the DPCD read
+ * at boot, not a fresh read, which fails while the bridge restarts and
+ * would leave it addressed as an external sink: a black panel. */
 int radeon_dp_panel_mode(int bridge)
 {
-    uint8_t cap;
-    if (!bridge || radeon_dp_read(DP_EDP_CONFIGURATION_CAP, &cap, 1) < 0)
+    if (!bridge)
         return DP_PANEL_MODE_EXTERNAL_DP_MODE;
-    if (cap & 1)
+    if (dpsink.dpcd[DP_EDP_CONFIGURATION_CAP] & 1)
         return DP_PANEL_MODE_INTERNAL_DP2_MODE;
     return DP_PANEL_MODE_INTERNAL_DP1_MODE;     /* both NUTMEG and TRAVIS */
+}
+
+/* Wait, up to a second, until the sink answers on AUX with the DPCD it
+ * had at boot (a bridge restarts when it is initialised). Returns the
+ * milliseconds it took, or -1. */
+int radeon_dp_wait_sink(void)
+{
+    uint8_t buf[sizeof(dpsink.dpcd)];
+    uint32_t start = ticks;
+    for (;;) {
+        if (radeon_dp_read(DP_DPCD_REV, buf, sizeof(buf)) > 0 &&
+            (!dpsink.dpcd_ok || !memcmp(buf, dpsink.dpcd, sizeof(buf))))
+            return (int)((ticks - start) * 1000 / HZ);
+        if ((int32_t)(ticks - start) >= HZ)
+            return -1;
+        mdelay(10);
+    }
 }
 
 void radeon_dp_set_power(int on)
