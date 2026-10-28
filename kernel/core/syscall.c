@@ -251,12 +251,12 @@ static int sys_signal(uint32_t sig, uint32_t disp, uint32_t c, uint32_t d, uint3
     struct proc *p = current;
     /* Serialize the disposition and pending-bit update with signal_locked(). */
     spin_lock(&sched_lock);
-    int old = (int)p->sig_actions[sig].sa_handler;
+    int old = (int)p->sig_actions[sig].fsa_handler;
     if (p->sig_ignored & bit)
         old = SIGDISP_IGN;
-    p->sig_actions[sig].sa_handler = disp;
-    p->sig_actions[sig].sa_flags = 0;
-    p->sig_actions[sig].sa_mask = 0;
+    p->sig_actions[sig].fsa_handler = disp;
+    p->sig_actions[sig].fsa_flags = 0;
+    p->sig_actions[sig].fsa_mask = 0;
     if (disp == SIGDISP_IGN) {
         __atomic_or_fetch(&p->sig_ignored, bit, __ATOMIC_RELAXED);
         __atomic_and_fetch(&p->sig_pending, ~bit, __ATOMIC_RELAXED);
@@ -282,8 +282,8 @@ static int sys_sigaction(uint32_t sig, uint32_t uact, uint32_t uoact, uint32_t d
         if (user_check((const void *)uact, sizeof(act)) < 0)
             return -EFAULT;
         memcpy(&act, (const void *)uact, sizeof(act));
-        if (act.sa_handler != SIGDISP_DFL && act.sa_handler != SIGDISP_IGN &&
-            (act.sa_handler < USER_BASE || act.sa_handler >= USER_TOP))
+        if (act.fsa_handler != SIGDISP_DFL && act.fsa_handler != SIGDISP_IGN &&
+            (act.fsa_handler < USER_BASE || act.fsa_handler >= USER_TOP))
             return -EINVAL;
     }
     if (uoact && user_check_w((void *)uoact, sizeof(struct flux_sigaction)) < 0)
@@ -294,16 +294,16 @@ static int sys_sigaction(uint32_t sig, uint32_t uact, uint32_t uoact, uint32_t d
     spin_lock(&sched_lock);
     struct flux_sigaction old = p->sig_actions[sig];
     if (p->sig_ignored & bit)
-        old.sa_handler = SIGDISP_IGN;
+        old.fsa_handler = SIGDISP_IGN;
     if (uact) {
-        act.sa_mask &= ~((1u << SIGKILL) | (1u << SIGSTOP));
+        act.fsa_mask &= ~((1u << SIGKILL) | (1u << SIGSTOP));
         p->sig_actions[sig] = act;
-        if (act.sa_handler == SIGDISP_IGN) {
+        if (act.fsa_handler == SIGDISP_IGN) {
             __atomic_or_fetch(&p->sig_ignored, bit, __ATOMIC_RELAXED);
             __atomic_and_fetch(&p->sig_pending, ~bit, __ATOMIC_RELAXED);
         } else {
             __atomic_and_fetch(&p->sig_ignored, ~bit, __ATOMIC_RELAXED);
-            if (act.sa_handler == SIGDISP_DFL &&
+            if (act.fsa_handler == SIGDISP_DFL &&
                 (sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT))
                 __atomic_and_fetch(&p->sig_pending, ~bit, __ATOMIC_RELAXED);
         }

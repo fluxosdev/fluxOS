@@ -24,7 +24,7 @@ _start:
 .global __sigrestorer
 .type __sigrestorer, @function
 __sigrestorer:
-    movl 8(%esp), %ebx
+    movl 12(%esp), %ebx
     movl $74, %eax                  /* SYS_sigreturn */
     int $0x80
     ud2

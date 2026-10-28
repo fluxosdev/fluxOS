@@ -183,8 +183,12 @@ struct dirent {
 #define SIGVTALRM 26
 #define SIGPROF  27
 #define SIGWINCH 28
+#ifndef SIGIO
 #define SIGIO    29
+#endif
+#ifndef SIGSYS
 #define SIGSYS   31
+#endif
 #define NSIG     32
 
 /* dispositions understood by SYS_signal and SYS_sigaction */
@@ -208,13 +212,13 @@ struct dirent {
 #endif
 
 struct flux_siginfo {
-    int32_t  si_signo;
-    int32_t  si_errno;
-    int32_t  si_code;
-    int32_t  si_pid;
-    uint32_t si_uid;
-    int32_t  si_status;
-    uint32_t si_addr;
+    int32_t  fsi_signo;
+    int32_t  fsi_errno;
+    int32_t  fsi_code;
+    int32_t  fsi_pid;
+    uint32_t fsi_uid;
+    int32_t  fsi_status;
+    uint32_t fsi_addr;
 };
 
 struct flux_sigcontext {
@@ -228,10 +232,10 @@ struct flux_sigcontext {
 };
 
 struct flux_sigaction {
-    uint32_t sa_handler;        /* user handler address, SIGDISP_DFL or SIGDISP_IGN */
-    uint32_t sa_mask;
-    uint32_t sa_flags;
-    uint32_t sa_restorer;       /* user signal return trampoline */
+    uint32_t fsa_handler;       /* user handler address, SIGDISP_DFL or SIGDISP_IGN */
+    uint32_t fsa_mask;
+    uint32_t fsa_flags;
+    uint32_t fsa_restorer;      /* user signal return trampoline */
 };
 
 /* ---- mmap(2), munmap(2), mprotect(2) ---- */

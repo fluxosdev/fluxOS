@@ -224,17 +224,17 @@ int sigaction(int sig, const struct sigaction *act, struct sigaction *oldact)
 {
     struct flux_sigaction kact, koact;
     if (act) {
-        kact.sa_handler = (uint32_t)act->sa_handler;
-        kact.sa_flags = act->sa_flags;
-        kact.sa_mask = act->sa_mask;
-        kact.sa_restorer = (uint32_t)(act->sa_restorer ? act->sa_restorer : __sigrestorer);
+        kact.fsa_handler = (uint32_t)act->sa_handler;
+        kact.fsa_flags = act->sa_flags;
+        kact.fsa_mask = act->sa_mask;
+        kact.fsa_restorer = (uint32_t)(act->sa_restorer ? act->sa_restorer : __sigrestorer);
     }
     int r = ret(sc3(SYS_sigaction, sig, act ? (int)&kact : 0, oldact ? (int)&koact : 0));
     if (r == 0 && oldact) {
-        oldact->sa_handler = (sighandler_t)koact.sa_handler;
-        oldact->sa_flags = koact.sa_flags;
-        oldact->sa_mask = koact.sa_mask;
-        oldact->sa_restorer = (void (*)(void))koact.sa_restorer;
+        oldact->sa_handler = (sighandler_t)koact.fsa_handler;
+        oldact->sa_flags = koact.fsa_flags;
+        oldact->sa_mask = koact.fsa_mask;
+        oldact->sa_restorer = (void (*)(void))koact.fsa_restorer;
     }
     return r;
 }

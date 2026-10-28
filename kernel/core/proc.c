@@ -671,7 +671,7 @@ static void signal_locked(struct proc *p, int sig)
         return;
     if (p->state == P_UNUSED || p->state == P_ZOMBIE || p->state == P_EMBRYO)
         return;
-    uint32_t h = p->sig_actions[sig].sa_handler;
+    uint32_t h = p->sig_actions[sig].fsa_handler;
     if (p->pid == 1 && h < USER_BASE)
         return;
     if (sig != SIGKILL && sig != SIGSTOP) {
@@ -697,11 +697,11 @@ void proc_signal_force(struct proc *p, int sig)
         panic("fault in idle task");
     spin_lock(&sched_lock);
     uint32_t bit = 1u << sig;
-    if ((p->sig_ignored & bit) || p->sig_actions[sig].sa_handler == SIGDISP_IGN ||
+    if ((p->sig_ignored & bit) || p->sig_actions[sig].fsa_handler == SIGDISP_IGN ||
         (p->sig_blocked & bit)) {
         p->sig_ignored &= ~bit;
         p->sig_blocked &= ~bit;
-        p->sig_actions[sig].sa_handler = SIGDISP_DFL;
+        p->sig_actions[sig].fsa_handler = SIGDISP_DFL;
     }
     deliver(p, sig);
     spin_unlock(&sched_lock);
@@ -730,13 +730,13 @@ void proc_signal_exec(struct proc *p)
 {
     spin_lock(&sched_lock);
     for (int i = 1; i < NSIG; i++) {
-        if (p->sig_actions[i].sa_handler != SIGDISP_IGN && !(p->sig_ignored & (1u << i))) {
+        if (p->sig_actions[i].fsa_handler != SIGDISP_IGN && !(p->sig_ignored & (1u << i))) {
             memset(&p->sig_actions[i], 0, sizeof(p->sig_actions[i]));
         } else {
-            p->sig_actions[i].sa_handler = SIGDISP_IGN;
-            p->sig_actions[i].sa_mask = 0;
-            p->sig_actions[i].sa_flags = 0;
-            p->sig_actions[i].sa_restorer = 0;
+            p->sig_actions[i].fsa_handler = SIGDISP_IGN;
+            p->sig_actions[i].fsa_mask = 0;
+            p->sig_actions[i].fsa_flags = 0;
+            p->sig_actions[i].fsa_restorer = 0;
         }
     }
     spin_unlock(&sched_lock);
@@ -753,7 +753,7 @@ int do_kill(int pid, int sig)
         struct proc *p = proc_find_locked(pid);
         if (!p || p->state == P_ZOMBIE || p->state == P_EMBRYO)
             r = -ESRCH;
-        else if (p->kthread || (p->pid == 1 && sig && (sig == SIGKILL || p->sig_actions[sig].sa_handler < USER_BASE)))
+        else if (p->kthread || (p->pid == 1 && sig && (sig == SIGKILL || p->sig_actions[sig].fsa_handler < USER_BASE)))
             r = -EPERM;
         else if (sig)
             signal_locked(p, sig);
@@ -810,21 +810,23 @@ void proc_check_signals(void)
 
         if (sig == SIGKILL || sig == SIGSTOP)
             do_exit(sig);
+        spin_lock(&sched_lock);
         struct flux_sigaction sa = p->sig_actions[sig];
-        if ((p->sig_ignored & bit) || sa.sa_handler == SIGDISP_IGN)
+        uint32_t ignored = p->sig_ignored & bit;
+        if (!ignored && sa.fsa_handler >= USER_BASE && (sa.fsa_flags & SA_RESETHAND))
+            p->sig_actions[sig].fsa_handler = SIGDISP_DFL;
+        spin_unlock(&sched_lock);
+        if (ignored || sa.fsa_handler == SIGDISP_IGN)
             continue;
-        if (sa.sa_handler == SIGDISP_DFL) {
+        if (sa.fsa_handler == SIGDISP_DFL) {
             if (sig_default_ignore(sig))
                 continue;
             do_exit(sig);
         }
 
-        if (sa.sa_flags & SA_RESETHAND)
-            p->sig_actions[sig].sa_handler = SIGDISP_DFL;
-
         struct trapframe *tf = p->tf;
         if (p->in_syscall > 0 && tf->eax == (uint32_t)-EINTR) {
-            if ((sa.sa_flags & SA_RESTART) &&
+            if ((sa.fsa_flags & SA_RESTART) &&
                 p->in_syscall != SYS_sleep && p->in_syscall != SYS_poll) {
                 tf->eax = p->syscall_orig_eax;
                 tf->eip -= 2;
@@ -846,11 +848,11 @@ void proc_check_signals(void)
 
         struct flux_siginfo info;
         memset(&info, 0, sizeof(info));
-        info.si_signo = sig;
-        info.si_addr = p->fault_addr;
+        info.fsi_signo = sig;
+        info.fsi_addr = p->fault_addr;
 
         uint8_t tramp[16] = {
-            0x8b, 0x5c, 0x24, 0x08,             /* movl 8(%esp), %ebx */
+            0x8b, 0x5c, 0x24, 0x0c,             /* movl 12(%esp), %ebx */
             0xb8, (uint8_t)SYS_sigreturn, 0x00, 0x00, 0x00,
             0xcd, 0x80, 0x90, 0x90, 0x90, 0x90, 0x90
         };
@@ -861,10 +863,11 @@ void proc_check_signals(void)
         uint32_t info_va = ALIGN_DOWN(ctx_va - sizeof(info), 16u);
         uint32_t args_va = ALIGN_DOWN(info_va - 16u, 16u);
         uint32_t frame_sp = args_va - 4u;
-        uint32_t call_frame[4] = {
-            sa.sa_restorer ? sa.sa_restorer : tramp_va,
+        uint32_t call_frame[5] = {
+            sa.fsa_restorer ? sa.fsa_restorer : tramp_va,
             (uint32_t)sig,
             info_va,
+            ctx_va,
             ctx_va,
         };
 
@@ -874,12 +877,14 @@ void proc_check_signals(void)
             user_write_range(p, frame_sp, call_frame, sizeof(call_frame)) < 0)
             do_exit(SIGSEGV);
 
-        p->sig_blocked |= sa.sa_mask;
-        if (!(sa.sa_flags & SA_NODEFER))
+        spin_lock(&sched_lock);
+        p->sig_blocked |= sa.fsa_mask;
+        if (!(sa.fsa_flags & SA_NODEFER))
             p->sig_blocked |= bit;
         p->sig_blocked &= ~((1u << SIGKILL) | (1u << SIGSTOP));
+        spin_unlock(&sched_lock);
 
-        tf->eip = sa.sa_handler;
+        tf->eip = sa.fsa_handler;
         tf->useresp = frame_sp;
         tf->eflags &= ~0x400u;                  /* clear DF for handler entry */
         break;
