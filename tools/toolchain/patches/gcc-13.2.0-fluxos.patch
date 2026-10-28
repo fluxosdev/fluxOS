@@ -1,0 +1,87 @@
+--- a/config.sub
++++ b/config.sub
+@@ -1749,7 +1749,7 @@
+ 	     | onefs* | tirtos* | phoenix* | fuchsia* | redox* | bme* \
+ 	     | midnightbsd* | amdhsa* | unleashed* | emscripten* | wasi* \
+ 	     | nsk* | powerunix* | genode* | zvmoe* | qnx* | emx* | zephyr* \
+-	     | fiwix* )
++	     | fiwix* | fluxos* )
+ 		;;
+ 	# This one is extra strict with allowed versions
+ 	sco3.2v2 | sco3.2v[4-9]* | sco5v6*)
+--- a/gcc/config.gcc
++++ b/gcc/config.gcc
+@@ -927,6 +927,11 @@
+       ;;
+   esac
+   ;;
++*-*-fluxos*)
++  gas=yes
++  gnu_ld=yes
++  use_gcc_stdint=provide
++  ;;
+ *-*-netbsd*)
+   tm_p_file="${tm_p_file} netbsd-protos.h"
+   tmake_file="t-netbsd t-slibgcc"
+@@ -1864,6 +1869,9 @@
+ i[34567]86-*-elf*)
+ 	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h newlib-stdint.h i386/i386elf.h"
+ 	;;
++i[34567]86-*-fluxos*)
++	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h glibc-stdint.h i386/i386elf.h fluxos.h"
++	;;
+ x86_64-*-elf*)
+ 	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h newlib-stdint.h i386/i386elf.h i386/x86-64.h"
+ 	;;
+--- a/libgcc/config.host
++++ b/libgcc/config.host
+@@ -704,6 +704,10 @@
+ i[34567]86-*-elf*)
+ 	tmake_file="$tmake_file i386/t-crtstuff t-crtstuff-pic t-libgcc-pic"
+ 	;;
++i[34567]86-*-fluxos*)
++	extra_parts="crtbegin.o crtend.o"
++	tmake_file="$tmake_file i386/t-crtstuff t-crtstuff-pic t-libgcc-pic"
++	;;
+ x86_64-*-elf* | x86_64-*-rtems*)
+ 	tmake_file="$tmake_file i386/t-crtstuff t-crtstuff-pic t-libgcc-pic"
+ 	case ${host} in
+--- /dev/null
++++ b/gcc/config/fluxos.h
+@@ -0,0 +1,36 @@
++/* Definitions for fluxOS: static ELF programs on a small Unix-like
++   kernel for 32-bit x86. Programs are loaded at 1 GiB (user/user.ld in
++   the fluxOS tree); the C library is libc.a and crt0.o in the sysroot.
++
++   This file is part of the fluxOS toolchain patches and is placed under
++   the same license as GCC (GPLv3 or later).  */
++
++#undef TARGET_OS_CPP_BUILTINS
++#define TARGET_OS_CPP_BUILTINS()		\
++  do						\
++    {						\
++      builtin_define ("__fluxos__");		\
++      builtin_define ("__unix__");		\
++      builtin_assert ("system=fluxos");		\
++      builtin_assert ("system=unix");		\
++      builtin_assert ("system=posix");		\
++    }						\
++  while (0)
++
++/* Everything is linked statically; the kernel loads ELF segments from
++   0x40000000 up and refuses anything below.  */
++#undef LINK_SPEC
++#define LINK_SPEC \
++  "-m elf_i386 -z noexecstack %{!r:%{!shared:-static -Ttext-segment=0x40000000}}"
++
++#undef LIB_SPEC
++#define LIB_SPEC "%{!shared:-lc}"
++
++#undef STARTFILE_SPEC
++#define STARTFILE_SPEC "%{!shared:crt0.o%s} crtbegin.o%s"
++
++#undef ENDFILE_SPEC
++#define ENDFILE_SPEC "crtend.o%s"
++
++/* No shared libraries, so no PIC by default and no dynamic linker.  */
++#undef DYNAMIC_LINKER

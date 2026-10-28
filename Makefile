@@ -253,6 +253,23 @@ $(ISO): $(KERNEL) $(SETUP) $(SYSTEM) grub/grub.cfg grub/install.cfg $(GRUB_DEP)
 	cp grub/grub.cfg $(BUILD)/iso/boot/install/grub.cfg
 	PATH="$(abspath $(GRUB))/usr/bin:$$PATH" $(MKRESCUE) -d $(GRUB_PC_DIR) -o $@ $(BUILD)/iso
 
+# The fluxOS sysroot: the headers and libraries a compiler targeting
+# fluxOS (i686-fluxos-gcc, tools/toolchain) builds programs against.
+SYSROOT := $(BUILD)/sysroot
+.PHONY: sysroot
+sysroot: $(LIBC) $(LIBGL) $(LIBFONT) $(CRT0) user/user.ld
+	@mkdir -p $(SYSROOT)/usr/include/flux $(SYSROOT)/usr/lib
+	cp -r user/include/. $(SYSROOT)/usr/include/
+	cp include/flux/*.h $(SYSROOT)/usr/include/flux/
+	cp $(LIBC) $(LIBGL) $(LIBFONT) $(CRT0) $(SYSROOT)/usr/lib/
+	cp user/user.ld $(SYSROOT)/usr/lib/fluxos.ld
+	@echo "$(SYSROOT): headers, libc.a, libGL.a, libfont.a, crt0.o, fluxos.ld"
+
+# The cross toolchain (binutils and GCC for i686-fluxos) in build/toolchain/cross.
+.PHONY: toolchain
+toolchain: sysroot
+	tools/toolchain/build.sh --sysroot $(SYSROOT) --prefix $(BUILD)/toolchain/cross
+
 check: $(KERNEL)
 	grub-file --is-x86-multiboot $(KERNEL) && echo "$(KERNEL): valid multiboot kernel"
 

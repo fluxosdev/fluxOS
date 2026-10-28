@@ -605,7 +605,20 @@ make run-disk   # boots fluxdisk.img alone, after installing fluxOS onto it
 make run-q35    # q35 machine: disk and CD on SATA, USB keyboard and tablet on xHCI
 make run-usb    # disk as a USB stick on EHCI, keyboard and mouse on UHCI
 make clean      # removes build/ and the ISO; the disk images are kept
+make sysroot    # build/sysroot: fluxOS's headers, libc.a, libGL.a, crt0.o for a cross compiler
+make toolchain  # binutils and GCC for the i686-fluxos target, in build/toolchain/cross
 ```
+
+`make toolchain` builds a GCC that targets fluxOS (`i686-fluxos-gcc`, with
+`as`, `ld`, `ar` and `libgcc`): it fetches binutils 2.42 and GCC 13.2.0 from
+gnu.org (checked against fixed SHA-256 sums), applies the small target patches
+in `tools/toolchain/patches/`, and installs into `build/toolchain/cross`. It
+needs `curl`, `patch`, a host C and C++ compiler and about fifteen minutes.
+With it, `i686-fluxos-gcc hello.c` makes a program for fluxOS without the
+Makefile's flags, and `make BUILD=build-cross CC=.../i686-fluxos-gcc
+LD=.../i686-fluxos-ld AR=.../i686-fluxos-ar` builds the tree with it. This is
+the first step of `self-hosting-roadmap.md`, which describes how the same
+compiler is to run on fluxOS itself.
 
 The TLS host tests additionally need OpenSSL and the Python `cryptography`
 package. They generate temporary CA/server certificates and use loopback-only
