@@ -19,17 +19,24 @@
  * The PHY is reached through MDIC. Its standard registers are at MDIO
  * address 2; Intel's own pages from 768 up are at address 1, where 768
  * counts as page 0. Registers 0-15 are the same on every page; for 16-31
- * the page is written to register 31 at address 1 first, page 0 too
- * (Linux's "HV" PHY access). The
- * MAC learns the negotiated speed and duplex from the PHY by itself, and
- * the STATUS register reports the link, so after setup only the MAC's
- * registers are read. The PHY is never reset by hardware here (that
- * would need its configuration reloaded from the NVM by hand, as Linux
- * does); the BIOS left it configured, and a soft reset restarts it.
+ * the page is selected first, page 0 too: through register 31 at address
+ * 1 (the page times 32), through register 22 at address 2 (as is), as
+ * Linux's "HV" PHY access does. The MAC learns the negotiated speed and
+ * duplex from the PHY by itself, and the STATUS register reports the
+ * link, so after setup only the MAC's registers are read, apart from
+ * the per-speed PHY settings Linux applies when a link comes up. The
+ * PHY is never reset by hardware here (that would need its configuration
+ * reloaded from the NVM by hand, as Linux does); the BIOS left it
+ * configured, and a soft reset restarts it. Energy Efficient Ethernet
+ * is turned off in the PHY: the MAC-side handling it needs is not here.
  *
  * The interrupt handler passes received frames up; the timer tick looks
  * at the rings and the link as well, so a lost interrupt costs only
- * latency.
+ * latency. For the first minute the tick also logs what the controller
+ * and the PHY see, for working out why no frames get through.
+ *
+ * Kernel options: e1000e=off; e1000e=phycycle power-cycles the PHY at
+ * start even when it answers (what the BIOS left in it is then gone).
  */
 #include "kernel.h"
 #include "arch.h"
@@ -42,6 +49,8 @@
 #define R_STATUS      0x00008
 #define R_CTRL_EXT    0x00018
 #define R_MDIC        0x00020
+#define R_FEXTNVM6    0x00010
+#define R_FEXTNVM4    0x00024
 #define R_FEXTNVM3    0x0003C
 #define R_ICR         0x000C0
 #define R_ITR         0x000C4
@@ -74,9 +83,13 @@
 #define R_TXDCTL1     0x03928
 #define R_TARC1       0x03940
 #define R_CRCERRS     0x04000           /* the statistics are cleared when read */
+#define R_RXERRC      0x0400C           /* receive errors */
 #define R_MPC         0x04010           /* missed packets */
 #define R_GPRC        0x04074           /* good packets received */
 #define R_GPTC        0x04080           /* good packets sent */
+#define R_RNBC        0x040A0           /* frames with no buffer to go in */
+#define R_TPR         0x040D0           /* every packet received, wanted or not */
+#define R_TPT         0x040D4           /* every packet sent */
 #define R_RFCTL       0x05008
 #define R_MTA         0x05200           /* 32 words on these chips */
 #define R_RAL0        0x05400
@@ -117,6 +130,9 @@
 
 #define FEXTNVM3_PHY_CFG_COUNTER_MASK  (3u << 26)
 #define FEXTNVM3_PHY_CFG_COUNTER_50MS  (2u << 26)
+#define FEXTNVM4_BEACON_DURATION_MASK  0x7u
+#define FEXTNVM4_BEACON_DURATION_8US   0x7u
+#define FEXTNVM6_REQ_PLL_CLK           (1u << 8)
 
 #define EXTCNF_SWFLAG     (1u << 5)
 
@@ -168,7 +184,8 @@
 /* The PHY: standard registers at address 2, Intel's pages 768 on at 1. */
 #define PHY_ADDR          2
 #define PHY_ADDR_HV       1
-#define PHY_PAGE_SELECT   0x1F
+#define PHY_PAGE_SELECT_HV 0x1F         /* at address 1: the page times 32 */
+#define PHY_PAGE_SELECT_BM 0x16         /* at address 2: the page */
 #define PHY_PAGE_SHIFT    5
 #define HV_PAGE_START     768
 #define MAX_UNPAGED_REG   15
@@ -177,17 +194,35 @@
 #define MII_BMCR          0x00
 #define BMCR_ANENABLE     0x1000
 #define BMCR_ANRESTART    0x0200
+#define MII_BMSR          0x01
 #define MII_PHYSID1       0x02
 #define MII_PHYSID2       0x03
+#define MII_ADVERTISE     0x04
+#define MII_LPA           0x05
+#define MII_CTRL1000      0x09
+#define MII_STAT1000      0x0A
 #define I82577_CFG_REG    PHY_REG(0, 22)
 #define CFG_CRS_ON_TX     (1u << 15)    /* carrier sense on transmit: needed for half duplex */
 #define CFG_DOWNSHIFT     (3u << 10)    /* 1000 -> 100 Mbit/s on a two-pair cable */
+#define I82577_PHY_CTRL_2 PHY_REG(0, 18)
+#define CTRL2_MDIX_MASK   0x0600
+#define CTRL2_AUTO_MDIX   0x0400        /* crossover detected: a straight or a crossed cable */
+#define I82579_EMI_ADDR   PHY_REG(0, 16)    /* the extended MDI registers, by address and data */
+#define I82579_EMI_DATA   PHY_REG(0, 17)
+#define I217_EEE_ADVERTISEMENT 0x8001
+#define I217_RX_CONFIG    0xB20C
 #define HV_OEM_BITS       PHY_REG(768, 25)
 #define OEM_LPLU          0x0004
 #define OEM_GBE_DIS       0x0040
 #define OEM_RESTART_AN    0x0400
 #define CV_SMB_CTRL       PHY_REG(769, 23)
 #define SMB_FORCE_SMBUS   0x0001
+#define HV_PM_CTRL        PHY_REG(770, 17)
+#define PM_CTRL_K1_CLK_REQ 0x0200
+#define I82579_LPI_CTRL   PHY_REG(772, 20)
+#define LPI_CTRL_ENABLE_MASK 0x6000     /* Energy Efficient Ethernet at 100 and 1000 Mbit/s */
+#define I217_PLL_CLOCK_GATE PHY_REG(772, 28)
+#define PLL_CLOCK_GATE_MASK 0x07FF
 
 /* Legacy descriptors */
 struct rx_desc {
@@ -237,9 +272,10 @@ static struct {
     uint32_t tx_next, tx_done;          /* free-running */
     int link_up, speed, full, polls;
     uint32_t max_ltr;                   /* the most latency the BIOS lets us report, encoded */
-    uint32_t hw_rx, hw_tx, hw_crc;      /* the controller's own counts, for the log */
-    int diag, diag_polls;               /* reports left to log after the link came up */
+    uint32_t hw_rx, hw_tx, hw_crc, hw_all_rx, hw_all_tx, hw_nobuf, hw_rxerr;   /* the controller's own counts */
+    int diag, diag_polls;               /* reports left to log (the first minute, and after a link change) */
     int irq;
+    int phy_cycle;                      /* e1000e=phycycle */
     struct mii_phy phy;
     struct netdev dev;
 } e;
@@ -334,17 +370,33 @@ static int mdic(int addr, int reg, int value, int write)
     return (int)(v & 0xFFFF);
 }
 
-/* A register by page and number (PHY_REG), the semaphore held: page 0,
- * or 768 and up (the pages between are reached another way, unused here). */
+/* A register by page and number (PHY_REG), the semaphore held: page 0 at
+ * address 2, or 768 and up at address 1 (the pages between are reached
+ * another way, unused here). Registers 16-31 need their page selected
+ * first, through the page register of the address the page lives at. */
 static int hv_rw(int preg, int value, int write)
 {
     int page = preg >> 5, reg = preg & 0x1F;
-    int addr = page >= HV_PAGE_START ? PHY_ADDR_HV : PHY_ADDR;
-    if (page == HV_PAGE_START)
-        page = 0;
-    if (reg > MAX_UNPAGED_REG && mdic(PHY_ADDR_HV, PHY_PAGE_SELECT, page << PHY_PAGE_SHIFT, 1) < 0)
+    int hv = page >= HV_PAGE_START;
+    int addr = hv ? PHY_ADDR_HV : PHY_ADDR;
+    if (hv)
+        page -= HV_PAGE_START;
+    if (reg > MAX_UNPAGED_REG &&
+        mdic(addr, hv ? PHY_PAGE_SELECT_HV : PHY_PAGE_SELECT_BM, hv ? page << PHY_PAGE_SHIFT : page, 1) < 0)
         return -1;
     return mdic(addr, reg, value, write);
+}
+
+/* The extended MDI registers (EEE, receive configuration), by address through two page-0 registers. */
+static int emi_write(int address, uint16_t value)
+{
+    if (swflag_take() < 0)
+        return -1;
+    int r = hv_rw(I82579_EMI_ADDR, address, 1);
+    if (r == 0)
+        r = hv_rw(I82579_EMI_DATA, value, 1);
+    swflag_give();
+    return r;
 }
 
 static int hv_read(int preg)
@@ -454,11 +506,22 @@ static int phy_wake(void)
     return -1;
 }
 
+/* A read-modify-write of a PHY register; 1 if it changed. */
+static int phy_update(int preg, uint16_t clear, uint16_t set)
+{
+    int v = hv_read(preg);
+    if (v < 0 || (uint16_t)((v & ~clear) | set) == (uint16_t)v)
+        return 0;
+    return hv_write(preg, (uint16_t)((v & ~clear) | set)) == 0;
+}
+
 /*
  * Out of the low-power link modes the BIOS or a sleeping OS may have
  * set (low-power link-up and gigabit off), advertise everything, and
- * have the PHY negotiate the link. Linux leaves the PHY alone while the
- * ME forbids resetting it, and so do we.
+ * have the PHY negotiate the link, as Linux's e1000_copper_link_setup_82577
+ * does: crossover detection on, carrier sense on transmit (half duplex
+ * needs it), downshift, and no Energy Efficient Ethernet. Linux leaves
+ * the PHY alone while the ME forbids resetting it, and so do we.
  */
 static void phy_setup(void)
 {
@@ -474,13 +537,29 @@ static void phy_setup(void)
     mii_power_up(&e.phy);
     if (mii_init(&e.phy) < 0)
         klog("%s: PHY %s did not reset\n", e.dev.name, e.phy.name);
-    int cfg = hv_read(I82577_CFG_REG);
-    if (cfg >= 0 && (cfg & (CFG_CRS_ON_TX | CFG_DOWNSHIFT)) != (CFG_CRS_ON_TX | CFG_DOWNSHIFT)) {
-        hv_write(I82577_CFG_REG, (uint16_t)(cfg | CFG_CRS_ON_TX | CFG_DOWNSHIFT));
+    int changed = 0;
+    changed |= phy_update(I82579_LPI_CTRL, LPI_CTRL_ENABLE_MASK, 0);
+    if (emi_write(I217_EEE_ADVERTISEMENT, 0) < 0)
+        klog("%s: cannot reach the PHY's EEE advertisement\n", e.dev.name);
+    changed |= phy_update(I82577_PHY_CTRL_2, CTRL2_MDIX_MASK, CTRL2_AUTO_MDIX);
+    changed |= phy_update(I82577_CFG_REG, 0, CFG_CRS_ON_TX | CFG_DOWNSHIFT);   /* last: see hv_rw */
+    if (changed) {
         int bmcr = mii_read(PHY_ADDR, MII_BMCR);
         if (bmcr >= 0)
             mii_write(PHY_ADDR, MII_BMCR, (uint16_t)(bmcr | BMCR_ANENABLE | BMCR_ANRESTART));
     }
+}
+
+/* What the PHY says of the link, for the log. */
+static void log_phy(void)
+{
+    int bmcr = mii_read(PHY_ADDR, MII_BMCR), bmsr = mii_read(PHY_ADDR, MII_BMSR);
+    bmsr = mii_read(PHY_ADDR, MII_BMSR);    /* the link bit latches low: the second read is now */
+    int adv = mii_read(PHY_ADDR, MII_ADVERTISE), lpa = mii_read(PHY_ADDR, MII_LPA);
+    int c1000 = mii_read(PHY_ADDR, MII_CTRL1000), s1000 = mii_read(PHY_ADDR, MII_STAT1000);
+    klog("%s: PHY BMCR %04x BMSR %04x ADV %04x LPA %04x CTRL1000 %04x STAT1000 %04x; "
+         "MAC CTRL %08x STATUS %08x\n", e.dev.name, bmcr & 0xFFFF, bmsr & 0xFFFF, adv & 0xFFFF,
+         lpa & 0xFFFF, c1000 & 0xFFFF, s1000 & 0xFFFF, rd(R_CTRL), rd(R_STATUS));
 }
 
 /* ---- the MAC ---- */
@@ -583,10 +662,28 @@ static void set_ltr(int speed)
             ns = (ns + 31) / 32;
         }
         lat = scale << LTRV_SCALE_SHIFT | MIN(ns, 0x3FFu);
-        if (lat > e.max_ltr)
-            lat = e.max_ltr;
+        /* No more than the platform allows: compare the two as times, not as encodings. */
+        uint64_t ours = (uint64_t)(lat & 0x3FF) << (5 * (lat >> LTRV_SCALE_SHIFT & 7));
+        uint64_t most = (uint64_t)(e.max_ltr & 0x3FF) << (5 * (e.max_ltr >> LTRV_SCALE_SHIFT & 7));
+        if (ours > most)
+            lat = e.max_ltr & 0x1FFF;
     }
     wr(R_LTRV, reg | lat | lat << LTRV_NOSNOOP_SHIFT);
+}
+
+/*
+ * What Linux's e1000_check_for_copper_link_ich8lan sets in the PHY once
+ * a link is up, by its speed: the receive latency of the analog part
+ * (low at 10 Mbit/s half duplex), the PLL clock gating, and at gigabit
+ * the clock request that keeps K1 power saving from stalling the link.
+ */
+static void phy_link_settings(int speed, int full)
+{
+    if (emi_write(I217_RX_CONFIG, speed == 10 && !full ? 0 : 1) < 0)
+        return;                         /* the PHY is the ME's, or away: nothing else would reach it */
+    phy_update(I217_PLL_CLOCK_GATE, PLL_CLOCK_GATE_MASK, speed == 1000 ? 0xFA : 0x3E8);
+    if (speed == 1000)
+        phy_update(HV_PM_CTRL, 0, PM_CTRL_K1_CLK_REQ);
 }
 
 /*
@@ -617,7 +714,13 @@ static void update_link(int force)
     wr(R_TIPG, tipg | (speed == 10 && !full ? 0xFF : 0x08));
     uint32_t ctrl = rd(R_CTRL) & ~(CTRL_RFCE | CTRL_TFCE);
     wr(R_CTRL, full ? ctrl | CTRL_RFCE : ctrl);
+    /* The I217 loses packets unless its beacon lasts 8 us; no PLL clock request outside K1 work. */
+    wr(R_FEXTNVM4, (rd(R_FEXTNVM4) & ~FEXTNVM4_BEACON_DURATION_MASK) | FEXTNVM4_BEACON_DURATION_8US);
+    wr(R_FEXTNVM6, rd(R_FEXTNVM6) & ~FEXTNVM6_REQ_PLL_CLK);
     set_ltr(speed);
+    if (up)
+        phy_link_settings(speed, full);
+    net_link_changed(up);
 }
 
 /* ---- sending and receiving ---- */
@@ -711,13 +814,21 @@ static void e_poll(void)
         e.hw_rx += rd(R_GPRC);
         e.hw_tx += rd(R_GPTC);
         e.hw_crc += rd(R_CRCERRS);
-        /* For the first minute of a link, every 10 s: whether frames get
-         * through the controller at all. */
+        e.hw_all_rx += rd(R_TPR);
+        e.hw_all_tx += rd(R_TPT);
+        e.hw_nobuf += rd(R_RNBC);
+        e.hw_rxerr += rd(R_RXERRC);
+        /* For the first minute, and the first after a link change, every
+         * 10 s: whether frames get through the controller at all, and
+         * what the PHY makes of the cable. */
         if (e.diag && ++e.diag_polls % 5 == 0) {
             e.diag--;
-            klog("%s: controller sent %u frames, received %u (CRC errors %u, missed %u); "
-                 "stack sent %u, received %u\n", e.dev.name, e.hw_tx, e.hw_rx, e.hw_crc,
-                 netif.rx_dropped, netif.tx_packets, netif.rx_packets);
+            klog("%s: link %s; controller sent %u frames (%u good), received %u (%u good, CRC errors %u, "
+                 "other errors %u, missed %u, no buffer %u); stack sent %u, received %u; rings TDH %u TDT %u "
+                 "RDH %u RDT %u\n", e.dev.name, e.link_up ? "up" : "down", e.hw_all_tx, e.hw_tx,
+                 e.hw_all_rx, e.hw_rx, e.hw_crc, e.hw_rxerr, netif.rx_dropped, e.hw_nobuf, netif.tx_packets,
+                 netif.rx_packets, rd(R_TDH), rd(R_TDT), rd(R_RDH), rd(R_RDT));
+            log_phy();
         }
     }
 }
@@ -778,6 +889,10 @@ static void start_rings(void)
 static int start(void)
 {
     wr(R_CTRL_EXT, rd(R_CTRL_EXT) | CTRL_EXT_DRV_LOAD);    /* ours now, the ME is told */
+    if (e.phy_cycle && !reset_blocked()) {
+        klog("%s: power-cycling the PHY as asked (e1000e=phycycle)\n", e.dev.name);
+        toggle_lanphypc();
+    }
     if (phy_wake() < 0)
         return -1;
     mac_reset();
@@ -793,6 +908,9 @@ static int start(void)
     start_rings();
     e.link_up = e.speed = e.full = 0;
     update_link(1);
+    e.diag = 6;                         /* the first minute's reports, link or no link */
+    e.diag_polls = 0;
+    log_phy();
     return 0;
 }
 
@@ -818,8 +936,12 @@ static void e_resume(void)
 
 int e1000e_init(void)
 {
-    if (cmdline_has("e1000e=off"))
-        return -1;
+    char opt[16];
+    if (cmdline_value("e1000e", opt, sizeof(opt))) {
+        if (!strcmp(opt, "off"))
+            return -1;
+        e.phy_cycle = !strcmp(opt, "phycycle");
+    }
     int found = 0;
     for (uint32_t i = 0; i < ARRAY_SIZE(chips) && !found; i++) {
         if (pci_find_device(0x8086, chips[i].id, &e.pci) == 0) {

@@ -379,6 +379,7 @@ static void update_link(int force)
         else if (!force)
             klog("%s: link down\n", fd.dev.name);
     }
+    net_link_changed(up);
     fd.link_up = up;
     fd.linkspeed = ls;
     fd.duplex = full;

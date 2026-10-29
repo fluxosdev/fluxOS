@@ -416,6 +416,13 @@ static void ip_input(const uint8_t *data, uint32_t len)
     }
 }
 
+void net_link_changed(int up)
+{
+    if (up && !netif.link)
+        netif.link_ups++;
+    netif.link = up;
+}
+
 void net_receive(const uint8_t *frame, uint32_t len)
 {
     if (len < ETH_HLEN)
@@ -614,9 +621,22 @@ void dhcp_input(const uint8_t *data, uint32_t len)
     }
 }
 
+/* A link just came up: ask again now rather than sit out the backoff
+ * (the discovers sent into a dead link were not heard). */
+static unsigned dhcp_link_ups;
+
 static void dhcp_tick(void)
 {
-    if (dhcp.state == DHCP_OFF || (int32_t)(ticks - dhcp.timeout) < 0)
+    if (dhcp.state == DHCP_OFF)
+        return;
+    if (netif.link_ups != dhcp_link_ups) {
+        dhcp_link_ups = netif.link_ups;
+        if (dhcp.state == DHCP_SELECTING || dhcp.state == DHCP_REQUESTING) {
+            dhcp_start();
+            return;
+        }
+    }
+    if ((int32_t)(ticks - dhcp.timeout) < 0)
         return;
     switch (dhcp.state) {
     case DHCP_INIT:

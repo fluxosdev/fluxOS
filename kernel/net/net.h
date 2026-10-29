@@ -123,6 +123,8 @@ struct netif {
     int present;                /* a card was found */
     struct netdev dev;
     uint32_t ip, mask, gw, dns; /* ip 0: not configured */
+    int link;                   /* the card reports a link (net_link_changed) */
+    unsigned link_ups;          /* how many times it has come up */
     int use_dhcp;
     uint32_t lease_end;         /* tick when the DHCP lease runs out */
     uint32_t rx_packets, tx_packets, rx_bytes, tx_bytes;
@@ -139,6 +141,7 @@ void net_resume(void);                  /* and set up again */
 void net_tick(void);                    /* timer interrupt, every tick */
 void net_register(const struct netdev *dev);
 void net_receive(const uint8_t *frame, uint32_t len);   /* driver, in its IRQ */
+void net_link_changed(int up);          /* driver: the link came up or went down */
 void net_get_info(struct netinfo *ni);
 int net_configure(const struct netinfo *ni);
 
