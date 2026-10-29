@@ -1,4 +1,9 @@
-/* The Radeon driver's state, shared by radeon.c, radeon_modeset.c and radeon_accel.c. */
+/*
+ * The Radeon driver's state, shared by radeon.c, the mode setting
+ * (radeon_modeset.c, with radeon_r700_modeset.c and radeon_llano_modeset.c
+ * for the two generations) and the 3D engine (radeon_accel.c, with
+ * radeon_r700_accel.c and radeon_llano_accel.c).
+ */
 #ifndef RADEON_H
 #define RADEON_H
 
@@ -16,7 +21,8 @@ enum radeon_family {
 
 /* Evergreen's display controllers (DCE 4) moved their registers. Native
  * modes there drive a laptop panel behind a DisplayPort bridge
- * (radeon_dp.c); the 3D engine (radeon_accel.c) is R700 only. */
+ * (radeon_dp.c). The 3D engine (radeon_accel.c) blits there too, but
+ * the GL library's 3D (DISP_MAP3D) is R700 only. */
 #define RADEON_EVERGREEN() (rv.family >= CHIP_SUMO)
 
 #define MM_INDEX       0x0000       /* registers past BAR2's 64 KiB, by index and data */
@@ -130,6 +136,7 @@ void radeon_cursor_reload(void);    /* the pointer's registers after a mode chan
 
 /* radeon_accel.c */
 void radeon_accel_init(void);       /* after radeon_modeset_init */
+void radeon_accel_resume(void);     /* Evergreen: the engine again after sleeping */
 int radeon_accel_ok(void);          /* the engine works and the screen suits it */
 int radeon_gart_ok(void);
 int radeon_3d_ok(void);
@@ -147,7 +154,7 @@ int radeon_native_modes(struct dispmode *out, int max);
 int radeon_native_set(const struct dispmode *m);
 void radeon_native_resume(void);    /* the native mode again, after waking */
 
-/* radeon_modeset.c, for radeon_dp.c */
+/* radeon_modeset.c and radeon_llano_modeset.c, for radeon_dp.c */
 int radeon_atom_run(int index, void *args, uint32_t size);
 uint8_t *radeon_atom_scratch(void); /* the interpreter's scratch area */
 void radeon_dp_encoder(int action); /* a DIG encoder command (ATOM_ENCODER_CMD_*) */

@@ -4,8 +4,10 @@
  * 6000 graphics of AMD's Llano APUs (Sumo, such as the HD 6520G), an
  * Evergreen-generation design whose display controllers (DCE 4.1) are
  * the same in kind with their registers elsewhere; on those, page
- * flipping, the hardware pointer and native modes for a laptop panel
- * behind a DisplayPort bridge, without the 3D engine (the R700's code).
+ * flipping, the hardware pointer, native modes for a laptop panel behind
+ * a DisplayPort bridge, and the 3D engine's blits (not OpenGL). What
+ * differs between the two generations is in files of their own:
+ * radeon_r700_*.c and radeon_llano_*.c.
  *
  * The card comes up in the mode its VESA BIOS set for the boot loader.
  * The driver:
@@ -13,7 +15,8 @@
  *  - sets modes of its own (DISP_SETMODE, or video=WxH[xD][@R] on the
  *    command line) by running the video BIOS's AtomBIOS tables, for the
  *    monitor's EDID modes, or a Llano laptop's panel over DisplayPort
- *    (radeon_modeset.c, radeon_dp.c);
+ *    (radeon_modeset.c with radeon_r700_modeset.c or
+ *    radeon_llano_modeset.c, radeon_dp.c);
  *  - lends the screen's owner a second page right after the first in
  *    video memory (DISPF_FLIP). DISP_FLIP points the display controller
  *    at either page; it takes the new address at the next vertical blank,
@@ -22,7 +25,8 @@
  *    so moving the mouse redraws nothing;
  *  - starts the 3D engine with AMD's microcode, and has it copy between
  *    the two pages (DISP_COPYRECTS) once it passes a self-test
- *    (radeon_accel.c).
+ *    (radeon_accel.c with radeon_r700_accel.c or radeon_llano_accel.c);
+ *    on the Llano APUs it is started again after suspend to RAM.
  *
  * BAR0 is the video memory aperture (its first 256 MiB, usually; on an
  * APU, the system memory the BIOS set aside for graphics), BAR2 holds the
@@ -508,8 +512,6 @@ void radeon_late_init(void)
     if (!rv.present)
         return;
     radeon_modeset_init();
-    if (RADEON_EVERGREEN())
-        return;                     /* no 3D engine for it yet */
     radeon_accel_init();
 }
 
@@ -518,10 +520,11 @@ void radeon_late_init(void)
 /* The video BIOS sets the boot loader's mode again on waking (wakeup.S),
  * which is all there is to set up while that mode is in use and the 3D
  * engine is not: then the page and the pointer go back. On Evergreen a
- * native mode is set again on top of it. */
+ * native mode is set again on top of it, and the 3D engine started
+ * again. */
 int radeon_can_resume(void)
 {
-    return (!rv.native || RADEON_EVERGREEN()) && !rv.accel;
+    return RADEON_EVERGREEN() || (!rv.native && !rv.accel);
 }
 
 void radeon_resume(void)
@@ -529,6 +532,7 @@ void radeon_resume(void)
     if (!rv.present || !radeon_can_resume())
         return;
     radeon_native_resume();
+    radeon_accel_resume();
     if (rv.flip)
         radeon_show_page(rv.page);
     radeon_cursor_reload();

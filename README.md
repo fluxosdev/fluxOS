@@ -169,8 +169,11 @@ says why.
     the BIOS shares with them. A laptop panel behind a DisplayPort-to-LVDS
     bridge (TRAVIS) gets native modes: it keeps the timing the BIOS lit it
     with, and a mode change only sets what is scanned out, with smaller
-    sizes stretched to the panel by the scaler. No 3D for these yet (see
-    *Work in progress*).
+    sizes stretched to the panel by the scaler. The 3D engine runs Sumo's own
+    AMD microcode (`SUMO_pfp`, `SUMO_me`) and, once it passes its boot
+    self-test, copies between the pages and from the desktop's back buffer
+    through the GART, as on the HD 4000s (`radeon.accel=0` turns it off).
+    No OpenGL on it yet (see *Work in progress*).
   - **Intel HD Graphics of Haswell processors** (HD 4600, 4400, 4200, 5000,
     Iris 5100, Iris Pro 5200): page flipping at vblank and the hardware
     pointer in the boot loader's mode. The second page lives in the stolen
@@ -999,8 +1002,11 @@ user range and page tables first.
   Linux, blanks the panel on the HP Pavilion g6 and is only run with
   `radeon.dp_modeset=1`. `dmesg | grep radeon` shows each step, and
   `radeon.modeset=0` turns native modes off. A native mode is set again
-  after waking from sleep. Next, 3D: Sumo's own microcode (SUMO_pfp, SUMO_me,
-  SUMO_rlc) and Evergreen's shader instruction set.
+  after waking from sleep. The 3D engine's bring-up (Evergreen set-up,
+  Sumo microcode, blits, GART, restarted after waking) is new and not yet
+  tried on hardware; the boot self-test decides whether the desktop uses
+  it. OpenGL needs the GL library's shaders and the kernel's command
+  buffer check redone for Evergreen's instruction set and registers.
 - **The Intel HD Graphics driver (Haswell) is partial:** page flipping, the
   hardware pointer, blitter copies and 3D (working on an HD 4600: 3D Gears
   draws on it; the boot self-test still decides, and a hang turns it off);

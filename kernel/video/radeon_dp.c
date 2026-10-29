@@ -16,7 +16,7 @@
  * clock recovery with training pattern 1, raising the voltage swing and
  * pre-emphasis the sink asks for, then channel equalisation with pattern
  * 2. The DIG encoder sends the patterns (radeon_dp_encoder in
- * radeon_modeset.c), the transmitter sets the drive levels.
+ * radeon_llano_modeset.c), the transmitter sets the drive levels.
  */
 #include "kernel.h"
 #include "drivers.h"

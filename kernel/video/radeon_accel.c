@@ -1,7 +1,10 @@
 /*
  * The Radeon HD 4000's 3D engine, driven through its command processor
  * (CP), as Linux's radeon driver brings it up on the R700 (rv770.c,
- * r600.c) and blits with it (r600_blit_kms.c, before Linux 3.12).
+ * r600.c) and blits with it (r600_blit_kms.c, before Linux 3.12); and
+ * the Llano APUs' (Sumo, the Evergreen generation: evergreen.c,
+ * evergreen_blit_kms.c). This is what the two share; what differs is in
+ * radeon_r700_accel.c and radeon_llano_accel.c (struct accel_gen).
  *
  * At startup the driver sets the memory controller's client TLBs for
  * plain video memory (no GART: everything the engine reads or writes is
@@ -12,8 +15,9 @@
  * so the CP sees the writes, and the write pointer is moved on.
  *
  * Fills and copies draw one rectangle each, with the static state and
- * shaders in radeon_blit_state.h: a texture (the source surface, or 64
- * texels of the fill color) sampled onto a linear render target. A fence,
+ * shaders in radeon_blit_state.h (radeon_llano_state.h on Llano): a
+ * texture (the source surface, or 64 texels of the fill color) sampled
+ * onto a linear render target. A fence,
  * a scratch register the CP writes after the engine is idle, tells when
  * a batch is done. A self-test fills and copies small surfaces and reads
  * them back; only if it passes does the desktop get DISP_COPYRECTS.
@@ -35,354 +39,11 @@
 #include "mm.h"
 #include "proc.h"
 #include "radeon.h"
-#include "radeon_blit_state.h"
+#include "radeon_accel.h"
 
-/* Registers */
-#define SRBM_STATUS     0x0E50
-#define VM_L2_CNTL      0x1400
-#define ENABLE_L2_CACHE (1u << 0)
-#define ENABLE_L2_FRAGMENT_PROCESSING (1u << 1)
-#define ENABLE_L2_PTE_CACHE_LRU_UPDATE_BY_WRITE (1u << 9)
-#define EFFECTIVE_L2_QUEUE_SIZE(x) (((x) & 7u) << 14)
-#define VM_L2_CNTL2     0x1404
-#define VM_L2_CNTL3     0x1408
-#define BANK_SELECT(x)  ((x) << 0)
-#define CACHE_UPDATE_MODE(x) ((x) << 6)
-#define VM_CONTEXT0_CNTL 0x1410
-#define ENABLE_CONTEXT  (1u << 0)
-#define PAGE_TABLE_DEPTH(x) (((x) & 3u) << 1)
-#define RANGE_PROTECTION_FAULT_ENABLE_DEFAULT (1u << 4)
-#define VM_CONTEXT0_REQUEST_RESPONSE 0x1470
-#define REQUEST_TYPE(x) (((x) & 0xFu) << 0)
-#define RESPONSE_TYPE_MASK 0x000000F0
-#define RESPONSE_TYPE_SHIFT 4
-#define VM_CONTEXT0_INVALIDATION_LOW_ADDR 0x1490
-#define VM_CONTEXT0_INVALIDATION_HIGH_ADDR 0x14B0
-#define VM_CONTEXT0_PROTECTION_FAULT_DEFAULT_ADDR 0x1518
-#define VM_CONTEXT0_PAGE_TABLE_BASE_ADDR 0x153C
-#define VM_CONTEXT0_PAGE_TABLE_START_ADDR 0x155C
-#define VM_CONTEXT0_PAGE_TABLE_END_ADDR 0x157C
-#define MC_VM_FB_LOCATION 0x2024
-#define MC_VM_AGP_TOP   0x2028
-#define MC_VM_AGP_BOT   0x202C
-#define MC_VM_AGP_BASE  0x2030
-#define MC_VM_SYSTEM_APERTURE_LOW_ADDR 0x2034
-#define MC_VM_SYSTEM_APERTURE_HIGH_ADDR 0x2038
-#define MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR 0x203C
-#define MC_VM_MB_L1_TLB0_CNTL 0x2234
-#define MC_VM_MB_L1_TLB1_CNTL 0x2238
-#define MC_VM_MB_L1_TLB2_CNTL 0x223C
-#define MC_VM_MB_L1_TLB3_CNTL 0x2240
-#define MC_VM_MD_L1_TLB0_CNTL 0x2654
-#define MC_VM_MD_L1_TLB1_CNTL 0x2658
-#define MC_VM_MD_L1_TLB2_CNTL 0x265C
-#define MC_VM_MD_L1_TLB3_CNTL 0x2698
-#define ENABLE_L1_TLB   (1u << 0)
-#define ENABLE_L1_FRAGMENT_PROCESSING (1u << 1)
-#define SYSTEM_ACCESS_MODE_NOT_IN_SYS (3u << 3)
-#define EFFECTIVE_L1_TLB_SIZE(x) ((x) << 15)
-#define EFFECTIVE_L1_QUEUE_SIZE(x) ((x) << 18)
-#define MC_ARB_RAMCFG   0x2760
-#define NOOFBANK_MASK   0x00000003
-#define NOOFROWS_MASK   0x00000038
-#define NOOFROWS_SHIFT  3
-#define BURSTLENGTH_MASK 0x00000200
-#define BURSTLENGTH_SHIFT 9
-#define HDP_HOST_PATH_CNTL 0x2C00
-#define HDP_DEBUG1      0x2F34
-#define HDP_TILING_CONFIG 0x2F3C
-#define CGTS_SYS_TCC_DISABLE 0x3F90
-#define CGTS_USER_SYS_TCC_DISABLE 0x3F94
-#define DMA_TILING_CONFIG 0x3EC8
-#define DCP_TILING_CONFIG 0x6CA0
-#define GRBM_CNTL       0x8000
-#define GRBM_READ_TIMEOUT(x) ((x) << 0)
-#define GRBM_STATUS     0x8010
-#define GUI_ACTIVE      (1u << 31)
-#define GRBM_SOFT_RESET 0x8020
-#define SOFT_RESET_CP   (1u << 0)
-#define WAIT_UNTIL      0x8040
-#define WAIT_3D_IDLE_bit      (1u << 15)
-#define WAIT_3D_IDLECLEAN_bit (1u << 17)
-#define SCRATCH_REG0    0x8500
-#define SCRATCH_REG1    0x8504
-#define SCRATCH_UMSK    0x8540
-#define SCRATCH_ADDR    0x8544
-#define CP_SEM_WAIT_TIMER 0x85BC
-#define CP_ME_CNTL      0x86D8
-#define CP_ME_HALT      (1u << 28)
-#define CP_PFP_HALT     (1u << 26)
-#define CP_RB_RPTR      0x8700
-#define CP_RB_WPTR_DELAY 0x8704
-#define CP_QUEUE_THRESHOLDS 0x8760
-#define ROQ_IB1_START(x) ((x) << 0)
-#define ROQ_IB2_START(x) ((x) << 8)
-#define CP_MEQ_THRESHOLDS 0x8764
-#define STQ_SPLIT(x)    ((x) << 0)
-#define CP_PERFMON_CNTL 0x87FC
-#define VGT_CACHE_INVALIDATION 0x88C4
-#define CACHE_INVALIDATION(x) ((x) << 0)
-#define VC_AND_TC       2
-#define TC_ONLY         1
-#define AUTO_INVLD_EN(x) ((x) << 6)
-#define ES_AND_GS_AUTO  3
-#define VGT_GS_PER_ES   0x88C8
-#define VGT_ES_PER_GS   0x88CC
-#define VGT_GS_VERTEX_REUSE 0x88D4
-#define VGT_GS_PER_VS   0x88E8
-#define CC_GC_SHADER_PIPE_CONFIG 0x8950
-#define INACTIVE_QD_PIPES_MASK 0x0000FF00
-#define INACTIVE_QD_PIPES_SHIFT 8
-#define VGT_NUM_INSTANCES 0x8974
-#define PA_CL_ENHANCE   0x8A14
-#define CLIP_VTX_REORDER_ENA (1u << 0)
-#define NUM_CLIP_SEQ(x) ((x) << 1)
-#define PA_SC_LINE_STIPPLE_STATE 0x8B10
-#define PA_SC_MULTI_CHIP_CNTL 0x8B20
-#define PA_SC_FORCE_EOV_MAX_CNTS 0x8B24
-#define FORCE_EOV_MAX_CLK_CNT(x) ((x) << 0)
-#define FORCE_EOV_MAX_REZ_CNT(x) ((x) << 16)
-#define PA_SC_FIFO_SIZE 0x8BCC
-#define SC_PRIM_FIFO_SIZE(x) ((x) << 0)
-#define SC_HIZ_TILE_FIFO_SIZE(x) ((x) << 12)
-#define SC_EARLYZ_TILE_FIFO_SIZE(x) ((x) << 20)
-#define SQ_CONFIG       0x8C00
-#define VC_ENABLE       (1u << 0)
-#define EXPORT_SRC_C    (1u << 1)
-#define DX9_CONSTS      (1u << 2)
-#define ALU_INST_PREFER_VECTOR (1u << 3)
-#define PS_PRIO(x)      ((uint32_t)(x) << 24)
-#define VS_PRIO(x)      ((uint32_t)(x) << 26)
-#define GS_PRIO(x)      ((uint32_t)(x) << 28)
-#define ES_PRIO(x)      ((uint32_t)(x) << 30)
-#define SQ_GPR_RESOURCE_MGMT_1 0x8C04
-#define NUM_PS_GPRS(x)  ((uint32_t)(x) << 0)
-#define NUM_VS_GPRS(x)  ((uint32_t)(x) << 16)
-#define NUM_CLAUSE_TEMP_GPRS(x) ((uint32_t)(x) << 28)
-#define SQ_GPR_RESOURCE_MGMT_2 0x8C08
-#define NUM_GS_GPRS(x)  ((uint32_t)(x) << 0)
-#define NUM_ES_GPRS(x)  ((uint32_t)(x) << 16)
-#define SQ_THREAD_RESOURCE_MGMT 0x8C0C
-#define NUM_PS_THREADS(x) ((uint32_t)(x) << 0)
-#define NUM_VS_THREADS(x) ((uint32_t)(x) << 8)
-#define NUM_GS_THREADS(x) ((uint32_t)(x) << 16)
-#define NUM_ES_THREADS(x) ((uint32_t)(x) << 24)
-#define SQ_STACK_RESOURCE_MGMT_1 0x8C10
-#define NUM_PS_STACK_ENTRIES(x) ((uint32_t)(x) << 0)
-#define NUM_VS_STACK_ENTRIES(x) ((uint32_t)(x) << 16)
-#define SQ_STACK_RESOURCE_MGMT_2 0x8C14
-#define NUM_GS_STACK_ENTRIES(x) ((uint32_t)(x) << 0)
-#define NUM_ES_STACK_ENTRIES(x) ((uint32_t)(x) << 16)
-#define SQ_MS_FIFO_SIZES 0x8CF0
-#define CACHE_FIFO_SIZE(x) ((x) << 0)
-#define FETCH_FIFO_HIWATER(x) ((x) << 8)
-#define DONE_FIFO_HIWATER(x) ((x) << 16)
-#define ALU_UPDATE_FIFO_HIWATER(x) ((uint32_t)(x) << 24)
-#define SQ_DYN_GPR_SIZE_SIMD_AB_0 0x8DB0
-#define SX_EXPORT_BUFFER_SIZES 0x900C
-#define COLOR_BUFFER_SIZE(x) ((x) << 0)
-#define POSITION_BUFFER_SIZE(x) ((x) << 8)
-#define SMX_BUFFER_SIZE(x) ((x) << 16)
-#define SX_DEBUG_1      0x9058
-#define ENABLE_NEW_SMX_ADDRESS (1u << 16)
-#define SPI_CONFIG_CNTL 0x9100
-#define DISABLE_INTERP_1 (1u << 5)
-#define SPI_CONFIG_CNTL_1 0x913C
-#define VTX_DONE_DELAY(x) ((x) << 0)
-#define CGTS_TCC_DISABLE 0x9148
-#define CGTS_USER_TCC_DISABLE 0x914C
-#define TA_CNTL_AUX     0x9508
-#define DISABLE_CUBE_ANISO (1u << 1)
-#define TCP_CNTL        0x9610
-#define VC_ENHANCE      0x9714
-#define DB_DEBUG3       0x98B0
-#define DB_CLK_OFF_DELAY(x) ((x) << 11)
-#define GB_TILING_CONFIG 0x98F0
-#define PIPE_TILING(x)  ((x) << 1)
-#define BANK_TILING(x)  ((x) << 4)
-#define GROUP_SIZE(x)   ((x) << 6)
-#define ROW_TILING(x)   ((x) << 8)
-#define BANK_SWAPS(x)   ((x) << 11)
-#define SAMPLE_SPLIT(x) ((x) << 14)
-#define CC_RB_BACKEND_DISABLE 0x98F4
-#define DB_DEBUG4       0x9B8C
-#define DISABLE_TILE_COVERED_FOR_PS_ITER (1u << 6)
-#define SMX_SAR_CTL0    0xA008
-#define SMX_DC_CTL0     0xA020
-#define CACHE_DEPTH(x)  ((x) << 1)
-#define SMX_EVENT_CTL   0xA02C
-#define ES_FLUSH_CTL(x) ((x) << 0)
-#define GS_FLUSH_CTL(x) ((x) << 3)
-#define ACK_FLUSH_CTL(x) ((x) << 6)
-#define SYNC_FLUSH_CTL  (1u << 8)
-#define CP_RB_BASE      0xC100
-#define CP_RB_CNTL      0xC104
-#define RB_BUFSZ(x)     ((x) << 0)
-#define RB_BLKSZ(x)     ((x) << 8)
-#define RB_NO_UPDATE    (1u << 27)
-#define RB_RPTR_WR_ENA  (1u << 31)
-#define CP_RB_RPTR_WR   0xC108
-#define CP_RB_RPTR_ADDR 0xC10C
-#define CP_RB_RPTR_ADDR_HI 0xC110
-#define CP_RB_WPTR      0xC114
-#define CP_PFP_UCODE_ADDR 0xC150
-#define CP_PFP_UCODE_DATA 0xC154
-#define CP_ME_RAM_RADDR 0xC158
-#define CP_ME_RAM_WADDR 0xC15C
-#define CP_ME_RAM_DATA  0xC160
-#define CP_DEBUG        0xC1FC
-#define DMA_TILING_CONFIG2 0xD0B8
+static const struct accel_gen *gen;     /* the chip's generation */
 
-/* Context registers, past BAR2's window */
-#define CB_COLOR0_BASE  0x28040
-#define CB_COLOR0_SIZE  0x28060
-#define CB_COLOR0_VIEW  0x28080
-#define CB_COLOR0_INFO  0x280A0
-#define CB_FORMAT(x)    ((x) << 2)
-#define CB_ARRAY_MODE(x) ((x) << 8)
-#define CB_SOURCE_FORMAT(x) ((x) << 27)
-#define CB_SF_EXPORT_NORM 1
-#define ARRAY_LINEAR_ALIGNED 1
-#define CB_COLOR0_TILE  0x280C0
-#define CB_COLOR0_FRAG  0x280E0
-#define CB_COLOR7_FRAG  0x280FC
-#define CB_COLOR0_MASK  0x28100
-#define PA_SC_SCREEN_SCISSOR_TL 0x28030
-#define PA_SC_WINDOW_SCISSOR_TL 0x28204
-#define PA_SC_CLIPRECT_RULE 0x2820C
-#define PA_SC_EDGERULE  0x28230
-#define PA_SC_GENERIC_SCISSOR_TL 0x28240
-#define SX_MISC         0x28350
-#define SPI_PS_IN_CONTROL_0 0x286CC
-#define NUM_INTERP(x)   ((x) << 0)
-#define SPI_INPUT_Z     0x286D8
-#define SQ_PGM_START_PS 0x28840
-#define SQ_PGM_RESOURCES_PS 0x28850
-#define SQ_PGM_EXPORTS_PS 0x28854
-#define SQ_PGM_START_VS 0x28858
-#define SQ_PGM_RESOURCES_VS 0x28868
-#define SQ_PGM_CF_OFFSET_PS 0x288CC
-#define SQ_PGM_CF_OFFSET_VS 0x288D0
-#define PA_SC_LINE_STIPPLE 0x28A0C
-#define PA_SC_MODE_CNTL 0x28A4C
-#define VGT_STRMOUT_EN  0x28AB0
-#define PA_SC_AA_CONFIG 0x28C04
-#define VGT_VERTEX_REUSE_BLOCK_CNTL 0x28C58
-#define VGT_OUT_DEALLOC_CNTL 0x28C5C
-#define VGT_PRIMITIVE_TYPE 0x8958
-
-/* PM4 packets */
-#define PACKET0(reg, n) ((((reg) >> 2) & 0xFFFFu) | ((uint32_t)(n) & 0x3FFF) << 16)
-#define PACKET2         0x80000000u
-#define PACKET3(op, n)  (3u << 30 | ((op) & 0xFFu) << 8 | ((uint32_t)(n) & 0x3FFF) << 16)
-#define PACKET3_CONTEXT_CONTROL 0x28
-#define PACKET3_INDEX_TYPE 0x2A
-#define PACKET3_DRAW_INDEX_AUTO 0x2D
-#define PACKET3_NUM_INSTANCES 0x2F
-#define PACKET3_INDIRECT_BUFFER 0x32
-#define PACKET3_SURFACE_SYNC 0x43
-#define PACKET3_ME_INITIALIZE 0x44
-#define PACKET3_EVENT_WRITE 0x46
-#define PACKET3_SET_CONFIG_REG 0x68
-#define PACKET3_SET_CONTEXT_REG 0x69
-#define PACKET3_SET_RESOURCE 0x6D
-#define CONFIG_REG(r)   (((r) - 0x8000u) >> 2)
-#define CONTEXT_REG(r)  (((r) - 0x28000u) >> 2)
-#define PACKET3_CB0_DEST_BASE_ENA (1u << 6)
-#define PACKET3_TC_ACTION_ENA (1u << 23)
-#define PACKET3_VC_ACTION_ENA (1u << 24)
-#define PACKET3_CB_ACTION_ENA (1u << 25)
-#define PACKET3_SH_ACTION_ENA (1u << 27)
-#define CACHE_FLUSH_AND_INV_EVENT 0x16
-#define CP_INT_STATUS   0xC128
-#define DI_PT_RECTLIST  0x11
-#define DI_INDEX_SIZE_16_BIT 0
-#define DI_SRC_SEL_AUTO_INDEX 2
-#define SQ_TEX_VTX_VALID_TEXTURE 2u
-#define SQ_TEX_VTX_VALID_BUFFER 3u
-
-/* Surface formats; the color buffer and texture codes agree. */
-#define FMT_5_6_5       0x08
-#define FMT_8_8_8_8     0x1A
-
-#define PFP_UCODE_DWORDS 848
-#define ME_UCODE_DWORDS  1360
-
-extern const uint8_t radeon_fw_rv770_pfp[], radeon_fw_rv770_me[], radeon_fw_rv730_me[];
-extern const uint8_t radeon_fw_rv710_pfp[], radeon_fw_rv710_me[];
-
-/* The engine's video memory, from ACCEL_VRAM_OFF */
-#define RING_OFF    0x00000
-#define RING_BYTES  0x10000
-#define STATE_OFF   0x10000         /* the default state, then the shaders */
-#define VB_OFF      0x12000         /* vertex data, 48 bytes a rectangle */
-#define VB_BYTES    0x4000
-#define FILL_OFF    0x16000         /* 64 texels of the fill color */
-#define SCRATCH_OFF 0x17000         /* read back to flush the HDP */
-#define TEST_OFF    0x20000         /* the self-test's surfaces */
-#define PT_OFF      0x40000         /* the GART's page table: 8 bytes a page */
-#define UIB_OFF     0x80000         /* a 3D client's command buffer, checked */
-#define UIB_DWORDS  (64 * 1024)     /* the most one may have */
-
-/* The GART: 64 MiB of GPU addresses right after video memory. */
-#define GTT_PAGES   16384
-#define PTE_VALID     (1u << 0)
-#define PTE_SYSTEM    (1u << 1)
-#define PTE_SNOOPED   (1u << 2)
-#define PTE_READABLE  (1u << 5)
-#define PTE_WRITEABLE (1u << 6)
-#define MAX_SLOTS   16
-
-/* The 3D client's video memory, after the engine's area. */
-#define GL_VRAM_OFF  (64u << 20)
-#define GL_VRAM_MAX  (128u << 20)
-#define USER_GL_BASE (USER_MMIO_BASE + 0x04000000u)
-
-/* Per-chip limits (rv770_gpu_init) and the blit's shader resources
- * (r600_blit_kms.c set_default_state). */
-struct chip_config {
-    uint32_t max_pipes, max_tile_pipes, max_simds, max_backends, max_gprs, max_threads;
-    uint32_t max_stack_entries, max_hw_contexts, max_gs_threads;
-    uint32_t sx_max_export_size, sx_max_export_pos_size, sx_max_export_smx_size;
-    uint32_t sq_num_cf_insts, sx_num_of_sets, sc_prim_fifo_size, sc_hiz_tile_fifo_size;
-    uint32_t sc_earlyz_tile_fifo_size;
-    uint32_t blit_ps_gprs, blit_vs_gprs, blit_ps_threads, blit_vs_threads, blit_stack;
-};
-
-static const struct chip_config configs[] = {
-    [CHIP_RV770] = { 4, 8, 10, 4, 256, 248, 512, 8, 32, 128, 16, 112, 2, 7, 0xF9, 0x30, 0x130,
-                     192, 56, 188, 60, 256 },
-    [CHIP_RV730] = { 2, 4, 8, 2, 128, 248, 256, 8, 32, 256, 16, 240, 2, 7, 0xF9, 0x30, 0x130,
-                     84, 36, 188, 60, 128 },
-    [CHIP_RV740] = { 4, 4, 8, 4, 256, 248, 512, 8, 32, 256, 16, 240, 2, 7, 0x100, 0x30, 0x130,
-                     84, 36, 188, 60, 128 },
-    [CHIP_RV710] = { 2, 2, 2, 1, 256, 192, 256, 4, 16, 128, 16, 112, 1, 7, 0x40, 0x30, 0x130,
-                     192, 56, 144, 48, 128 },
-};
-
-static const struct chip_config *cfg;
-
-/* A surface in video memory: a linear bitmap the engine reads or draws. */
-struct surf {
-    uint64_t addr;                  /* as the engine sees it */
-    uint32_t pitch;                 /* pixels */
-    uint32_t w, h;
-    uint32_t format;                /* FMT_* */
-    uint32_t cpp;                   /* bytes per pixel */
-};
-
-static struct {
-    uint8_t *cpu;                   /* the engine's area, as the CPU sees it */
-    uint64_t gpu;
-    uint32_t *ring;
-    uint32_t wptr;                  /* dwords */
-    uint32_t vs_off, ps_off, state_dwords;
-    uint32_t vb_used;
-    uint32_t seq;
-    int busy;
-} cp;
-
-#define RING_MASK (RING_BYTES / 4 - 1)
+struct radeon_cp rcp;
 
 static struct {
     int on;
@@ -402,14 +63,6 @@ static struct {
     uint32_t size;
 } gl3d;
 
-static uint32_t popcount(uint32_t v)
-{
-    uint32_t n = 0;
-    for (; v; v &= v - 1)
-        n++;
-    return n;
-}
-
 /* Sleep a little in a process; at boot, spin. */
 static void pause_ms(void)
 {
@@ -419,7 +72,15 @@ static void pause_ms(void)
         udelay(1000);
 }
 
-/* ---- memory controller and engine set-up (rv770.c) ---- */
+uint32_t radeon_popcount(uint32_t v)
+{
+    uint32_t n = 0;
+    for (; v; v &= v - 1)
+        n++;
+    return n;
+}
+
+/* ---- the memory controller (rv770.c, evergreen.c) ---- */
 
 /* The clients' TLBs pass addresses straight through to video memory
  * (rv770_agp_enable: no GART). The system aperture must cover video
@@ -434,8 +95,7 @@ static int vm_init(void)
          "default %08x, AGP %08x-%08x base %08x, L2 %08x, TLB %08x/%08x\n", loc,
          rreg(MC_VM_SYSTEM_APERTURE_LOW_ADDR), rreg(MC_VM_SYSTEM_APERTURE_HIGH_ADDR),
          rreg(MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR), rreg(MC_VM_AGP_BOT), rreg(MC_VM_AGP_TOP),
-         rreg(MC_VM_AGP_BASE), rreg(VM_L2_CNTL), rreg(MC_VM_MD_L1_TLB0_CNTL),
-         rreg(MC_VM_MB_L1_TLB0_CNTL));
+         rreg(MC_VM_AGP_BASE), rreg(VM_L2_CNTL), rreg(gen->md_tlb0), rreg(MC_VM_MB_L1_TLB0_CNTL));
     if (vram_end <= vram_start || rv.mc_base < vram_start ||
         rv.mc_base + VRAM_MAP_END > vram_end + 1) {
         klog("radeon: the screen (%08x%08x) is not where FB_LOCATION puts video memory\n",
@@ -444,7 +104,7 @@ static int vm_init(void)
     }
     wreg(MC_VM_SYSTEM_APERTURE_LOW_ADDR, (uint32_t)(vram_start >> 12));
     wreg(MC_VM_SYSTEM_APERTURE_HIGH_ADDR, (uint32_t)(vram_end >> 12));
-    wreg(MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR, (uint32_t)((cp.gpu + SCRATCH_OFF) >> 12));
+    wreg(MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR, (uint32_t)((rcp.gpu + SCRATCH_OFF) >> 12));
     /* no AGP aperture: the GART's addresses go through VM context 0 */
     wreg(MC_VM_AGP_BASE, 0);
     wreg(MC_VM_AGP_TOP, 0x0FFFFFFF);
@@ -456,22 +116,18 @@ static int vm_init(void)
     wreg(VM_L2_CNTL3, BANK_SELECT(0) | CACHE_UPDATE_MODE(2));
     uint32_t tlb = ENABLE_L1_TLB | ENABLE_L1_FRAGMENT_PROCESSING | SYSTEM_ACCESS_MODE_NOT_IN_SYS |
                    EFFECTIVE_L1_TLB_SIZE(5) | EFFECTIVE_L1_QUEUE_SIZE(5);
-    wreg(MC_VM_MD_L1_TLB0_CNTL, tlb);
-    wreg(MC_VM_MD_L1_TLB1_CNTL, tlb);
-    wreg(MC_VM_MD_L1_TLB2_CNTL, tlb);
-    if (rv.family == CHIP_RV740)
-        wreg(MC_VM_MD_L1_TLB3_CNTL, tlb);
+    gen->md_tlbs(tlb);
     wreg(MC_VM_MB_L1_TLB0_CNTL, tlb);
     wreg(MC_VM_MB_L1_TLB1_CNTL, tlb);
     wreg(MC_VM_MB_L1_TLB2_CNTL, tlb);
     wreg(MC_VM_MB_L1_TLB3_CNTL, tlb);
-    for (int i = 0; i < 7; i++)
-        wreg(VM_CONTEXT0_CNTL + 4u * (uint32_t)i, 0);
+    for (uint32_t i = 0; i < gen->vm_contexts; i++)
+        wreg(VM_CONTEXT0_CNTL + 4 * i, 0);
     gart.start = ALIGN_UP(vram_end + 1, (uint64_t)4 << 20);
     return 0;
 }
 
-/* ---- the GART (rv770_pcie_gart_enable) ---- */
+/* ---- the GART (rv770_pcie_gart_enable, evergreen_pcie_gart_enable) ---- */
 
 static void gart_set(uint32_t page, uint32_t phys)
 {
@@ -481,15 +137,20 @@ static void gart_set(uint32_t page, uint32_t phys)
     gart.pt[2 * page + 1] = 0;
 }
 
-static void hdp_flush(void);
+static void hdp_flush(void)
+{
+    gen->hdp_flush();
+}
 
 /* Make the GPU forget the page table entries it has cached. */
 static void gart_flush(void)
 {
     hdp_flush();
     (void)gart.pt[0];
-    wreg(VM_CONTEXT0_INVALIDATION_LOW_ADDR, (uint32_t)(gart.start >> 12));
-    wreg(VM_CONTEXT0_INVALIDATION_HIGH_ADDR, (uint32_t)((gart.start + GTT_PAGES * 4096ull - 1) >> 12));
+    if (gen->gart_range_flush) {    /* else the whole context */
+        wreg(VM_CONTEXT0_INVALIDATION_LOW_ADDR, (uint32_t)(gart.start >> 12));
+        wreg(VM_CONTEXT0_INVALIDATION_HIGH_ADDR, (uint32_t)((gart.start + GTT_PAGES * 4096ull - 1) >> 12));
+    }
     wreg(VM_CONTEXT0_REQUEST_RESPONSE, REQUEST_TYPE(1));
     for (int i = 0; i < 100000; i++) {
         uint32_t r = (rreg(VM_CONTEXT0_REQUEST_RESPONSE) & RESPONSE_TYPE_MASK) >> RESPONSE_TYPE_SHIFT;
@@ -503,28 +164,34 @@ static void gart_flush(void)
     }
 }
 
+/* Point VM context 0 at the page table, which is in place. */
+static void gart_enable(void)
+{
+    wreg(VM_CONTEXT0_PAGE_TABLE_START_ADDR, (uint32_t)(gart.start >> 12));
+    wreg(VM_CONTEXT0_PAGE_TABLE_END_ADDR, (uint32_t)((gart.start + GTT_PAGES * 4096ull - 1) >> 12));
+    wreg(VM_CONTEXT0_PAGE_TABLE_BASE_ADDR, (uint32_t)((rcp.gpu + PT_OFF) >> 12));
+    wreg(VM_CONTEXT0_CNTL, ENABLE_CONTEXT | PAGE_TABLE_DEPTH(0) | RANGE_PROTECTION_FAULT_ENABLE_DEFAULT);
+    wreg(VM_CONTEXT0_PROTECTION_FAULT_DEFAULT_ADDR, gart.dummy >> 12);
+    gart_flush();
+}
+
 static int gart_init(void)
 {
     gart.dummy = pmm_alloc();
     if (!gart.dummy)
         return -1;
     memset((void *)gart.dummy, 0, PAGE_SIZE);
-    gart.pt = (volatile uint32_t *)(cp.cpu + PT_OFF);
+    gart.pt = (volatile uint32_t *)(rcp.cpu + PT_OFF);
     for (uint32_t i = 0; i < GTT_PAGES; i++)
         gart_set(i, 0);
-    wreg(VM_CONTEXT0_PAGE_TABLE_START_ADDR, (uint32_t)(gart.start >> 12));
-    wreg(VM_CONTEXT0_PAGE_TABLE_END_ADDR, (uint32_t)((gart.start + GTT_PAGES * 4096ull - 1) >> 12));
-    wreg(VM_CONTEXT0_PAGE_TABLE_BASE_ADDR, (uint32_t)((cp.gpu + PT_OFF) >> 12));
-    wreg(VM_CONTEXT0_CNTL, ENABLE_CONTEXT | PAGE_TABLE_DEPTH(0) | RANGE_PROTECTION_FAULT_ENABLE_DEFAULT);
-    wreg(VM_CONTEXT0_PROTECTION_FAULT_DEFAULT_ADDR, gart.dummy >> 12);
-    gart_flush();
+    gart_enable();
     klog("radeon: GART of %u MiB at %08x%08x\n", GTT_PAGES / 256, (uint32_t)(gart.start >> 32),
          (uint32_t)gart.start);
     return 0;
 }
 
 /* Which render backend serves each tiling pipe (r6xx_remap_render_backend). */
-static uint32_t remap_render_backend(uint32_t tiling_pipe_num, uint32_t max_rb_num,
+uint32_t radeon_remap_render_backend(uint32_t tiling_pipe_num, uint32_t max_rb_num,
                                      uint32_t total_max_rb_num, uint32_t disabled_rb_mask)
 {
     uint32_t data = 0, mask = 1u << (max_rb_num - 1);
@@ -532,7 +199,7 @@ static uint32_t remap_render_backend(uint32_t tiling_pipe_num, uint32_t max_rb_n
     if ((tmp & 0xFF) != 0xFF)
         disabled_rb_mask = tmp;
     uint32_t rendering_pipe_num = 1u << tiling_pipe_num;
-    uint32_t req_rb_num = total_max_rb_num - popcount(disabled_rb_mask);
+    uint32_t req_rb_num = total_max_rb_num - radeon_popcount(disabled_rb_mask);
     if (!req_rb_num)
         req_rb_num = 1;
     uint32_t pipe_rb_ratio = rendering_pipe_num / req_rb_num;
@@ -551,145 +218,6 @@ static uint32_t remap_render_backend(uint32_t tiling_pipe_num, uint32_t max_rb_n
     return data;
 }
 
-static void gpu_init(void)
-{
-    /* the HDP's surface registers */
-    for (uint32_t i = 0, j = 0; i < 32; i++, j += 0x18)
-        for (uint32_t k = 0; k < 5; k++)
-            wreg(0x2C14 + j + 4 * k, 0);
-
-    wreg(GRBM_CNTL, GRBM_READ_TIMEOUT(0xFF));
-
-    uint32_t mc_arb_ramcfg = rreg(MC_ARB_RAMCFG);
-    uint32_t shader_pipe_config = rreg(CC_GC_SHADER_PIPE_CONFIG);
-    uint32_t inactive_pipes = (shader_pipe_config & INACTIVE_QD_PIPES_MASK) >> INACTIVE_QD_PIPES_SHIFT;
-    uint32_t active_pipes = 8 - popcount(inactive_pipes & 0xFF);
-    wreg(SPI_CONFIG_CNTL, active_pipes == 1 ? DISABLE_INTERP_1 : 0);
-
-    uint32_t gb_tiling_config;
-    switch (cfg->max_tile_pipes) {
-    case 2: gb_tiling_config = PIPE_TILING(1); break;
-    case 4: gb_tiling_config = PIPE_TILING(2); break;
-    case 8: gb_tiling_config = PIPE_TILING(3); break;
-    default: gb_tiling_config = PIPE_TILING(0); break;
-    }
-    uint32_t disabled_rb_mask = (rreg(CC_RB_BACKEND_DISABLE) >> 16) & 0xFF;
-    uint32_t all = (1u << cfg->max_backends) - 1;
-    if ((disabled_rb_mask & all) == all)
-        disabled_rb_mask &= ~all;
-    gb_tiling_config |= remap_render_backend((gb_tiling_config >> 1) & 7, cfg->max_backends, 8,
-                                             disabled_rb_mask) << 16;
-    if (rv.family == CHIP_RV770 || (mc_arb_ramcfg & NOOFBANK_MASK))
-        gb_tiling_config |= BANK_TILING(1);
-    gb_tiling_config |= GROUP_SIZE((mc_arb_ramcfg & BURSTLENGTH_MASK) >> BURSTLENGTH_SHIFT);
-    uint32_t rows = (mc_arb_ramcfg & NOOFROWS_MASK) >> NOOFROWS_SHIFT;
-    if (rows > 3)
-        rows = 3;
-    gb_tiling_config |= ROW_TILING(rows) | SAMPLE_SPLIT(rows) | BANK_SWAPS(1);
-    wreg(GB_TILING_CONFIG, gb_tiling_config);
-    wreg(DCP_TILING_CONFIG, gb_tiling_config & 0xFFFF);
-    wreg(HDP_TILING_CONFIG, gb_tiling_config & 0xFFFF);
-    wreg(DMA_TILING_CONFIG, gb_tiling_config & 0xFFFF);
-    wreg(DMA_TILING_CONFIG2, gb_tiling_config & 0xFFFF);
-
-    wreg(CGTS_SYS_TCC_DISABLE, 0);
-    wreg(CGTS_TCC_DISABLE, 0);
-    wreg(CGTS_USER_SYS_TCC_DISABLE, 0);
-    wreg(CGTS_USER_TCC_DISABLE, 0);
-
-    uint32_t num_qd_pipes = 8 - popcount((shader_pipe_config & INACTIVE_QD_PIPES_MASK) >> 8);
-    wreg(VGT_OUT_DEALLOC_CNTL, (num_qd_pipes * 4) & 0x7F);
-    wreg(VGT_VERTEX_REUSE_BLOCK_CNTL, ((num_qd_pipes * 4) - 2) & 0xFF);
-
-    wreg(CP_QUEUE_THRESHOLDS, ROQ_IB1_START(0x16) | ROQ_IB2_START(0x2B));
-    wreg(CP_MEQ_THRESHOLDS, STQ_SPLIT(0x30));
-    wreg(TA_CNTL_AUX, rreg(TA_CNTL_AUX) | DISABLE_CUBE_ANISO);
-    wreg(SX_DEBUG_1, rreg(SX_DEBUG_1) | ENABLE_NEW_SMX_ADDRESS);
-    uint32_t smx_dc_ctl0 = rreg(SMX_DC_CTL0) & ~CACHE_DEPTH(0x1FFu);
-    wreg(SMX_DC_CTL0, smx_dc_ctl0 | CACHE_DEPTH(cfg->sx_num_of_sets * 64 - 1));
-    if (rv.family != CHIP_RV740)
-        wreg(SMX_EVENT_CTL, ES_FLUSH_CTL(4) | GS_FLUSH_CTL(4) | ACK_FLUSH_CTL(3) | SYNC_FLUSH_CTL);
-    if (rv.family != CHIP_RV770)
-        wreg(SMX_SAR_CTL0, 0x00003F3F);
-
-    uint32_t db_debug3 = rreg(DB_DEBUG3) & ~DB_CLK_OFF_DELAY(0x1Fu);
-    if (rv.family == CHIP_RV770 || rv.family == CHIP_RV740)
-        db_debug3 |= DB_CLK_OFF_DELAY(0x1F);
-    else
-        db_debug3 |= DB_CLK_OFF_DELAY(2);
-    wreg(DB_DEBUG3, db_debug3);
-    if (rv.family != CHIP_RV770)
-        wreg(DB_DEBUG4, rreg(DB_DEBUG4) | DISABLE_TILE_COVERED_FOR_PS_ITER);
-
-    wreg(SX_EXPORT_BUFFER_SIZES, COLOR_BUFFER_SIZE(cfg->sx_max_export_size / 4 - 1) |
-                                 POSITION_BUFFER_SIZE(cfg->sx_max_export_pos_size / 4 - 1) |
-                                 SMX_BUFFER_SIZE(cfg->sx_max_export_smx_size / 4 - 1));
-    wreg(PA_SC_FIFO_SIZE, SC_PRIM_FIFO_SIZE(cfg->sc_prim_fifo_size) |
-                          SC_HIZ_TILE_FIFO_SIZE(cfg->sc_hiz_tile_fifo_size) |
-                          SC_EARLYZ_TILE_FIFO_SIZE(cfg->sc_earlyz_tile_fifo_size));
-    wreg(PA_SC_MULTI_CHIP_CNTL, 0);
-    wreg(VGT_NUM_INSTANCES, 1);
-    wreg(SPI_CONFIG_CNTL_1, VTX_DONE_DELAY(4));
-    wreg(CP_PERFMON_CNTL, 0);
-
-    wreg(SQ_MS_FIFO_SIZES, CACHE_FIFO_SIZE(16 * cfg->sq_num_cf_insts) | DONE_FIFO_HIWATER(0xE0) |
-                           ALU_UPDATE_FIFO_HIWATER(0x8) |
-                           FETCH_FIFO_HIWATER(rv.family == CHIP_RV740 ? 0x4 : 0x1));
-
-    uint32_t sq_config = rreg(SQ_CONFIG) & ~(PS_PRIO(3) | VS_PRIO(3) | GS_PRIO(3) | ES_PRIO(3));
-    sq_config |= DX9_CONSTS | VC_ENABLE | EXPORT_SRC_C | PS_PRIO(0) | VS_PRIO(1) | GS_PRIO(2) | ES_PRIO(3);
-    if (rv.family == CHIP_RV710)
-        sq_config &= ~VC_ENABLE;    /* no vertex cache */
-    wreg(SQ_CONFIG, sq_config);
-    wreg(SQ_GPR_RESOURCE_MGMT_1, NUM_PS_GPRS(cfg->max_gprs * 24 / 64) |
-                                 NUM_VS_GPRS(cfg->max_gprs * 24 / 64) |
-                                 NUM_CLAUSE_TEMP_GPRS(cfg->max_gprs * 24 / 64 / 2));
-    wreg(SQ_GPR_RESOURCE_MGMT_2, NUM_GS_GPRS(cfg->max_gprs * 7 / 64) | NUM_ES_GPRS(cfg->max_gprs * 7 / 64));
-    uint32_t threads = NUM_PS_THREADS(cfg->max_threads * 4 / 8) | NUM_VS_THREADS(cfg->max_threads * 2 / 8) |
-                       NUM_ES_THREADS(cfg->max_threads * 1 / 8);
-    if (cfg->max_threads / 8 > cfg->max_gs_threads)
-        threads |= NUM_GS_THREADS(cfg->max_gs_threads);
-    else
-        threads |= NUM_GS_THREADS(cfg->max_gs_threads / 8);
-    wreg(SQ_THREAD_RESOURCE_MGMT, threads);
-    wreg(SQ_STACK_RESOURCE_MGMT_1, NUM_PS_STACK_ENTRIES(cfg->max_stack_entries / 4) |
-                                   NUM_VS_STACK_ENTRIES(cfg->max_stack_entries / 4));
-    wreg(SQ_STACK_RESOURCE_MGMT_2, NUM_GS_STACK_ENTRIES(cfg->max_stack_entries / 4) |
-                                   NUM_ES_STACK_ENTRIES(cfg->max_stack_entries / 4));
-    uint32_t ring = cfg->max_gprs * 38 / 64;
-    uint32_t dyn = ring | ring << 8 | ring << 16 | ring << 24;
-    for (uint32_t i = 0; i < 8; i++)
-        wreg(SQ_DYN_GPR_SIZE_SIMD_AB_0 + 4 * i, dyn);
-
-    wreg(PA_SC_FORCE_EOV_MAX_CNTS, FORCE_EOV_MAX_CLK_CNT(4095) | FORCE_EOV_MAX_REZ_CNT(255));
-    wreg(VGT_CACHE_INVALIDATION, CACHE_INVALIDATION(rv.family == CHIP_RV710 ? TC_ONLY : VC_AND_TC) |
-                                 AUTO_INVLD_EN(ES_AND_GS_AUTO));
-    uint32_t gs_prim_buffer_depth = rv.family == CHIP_RV710 ? 128 : 384;
-    uint32_t vgt_gs_per_es = MIN(gs_prim_buffer_depth + cfg->max_pipes * 16, 256u);
-    wreg(VGT_ES_PER_GS, 128);
-    wreg(VGT_GS_PER_ES, vgt_gs_per_es);
-    wreg(VGT_GS_PER_VS, 2);
-    wreg(VGT_GS_VERTEX_REUSE, 16);
-    wreg(PA_SC_LINE_STIPPLE_STATE, 0);
-    wreg(VGT_STRMOUT_EN, 0);
-    wreg(SX_MISC, 0);
-    wreg(PA_SC_MODE_CNTL, 0);
-    wreg(PA_SC_EDGERULE, 0xAAAAAAAA);
-    wreg(PA_SC_AA_CONFIG, 0);
-    wreg(PA_SC_CLIPRECT_RULE, 0xFFFF);
-    wreg(PA_SC_LINE_STIPPLE, 0);
-    wreg(SPI_INPUT_Z, 0);
-    wreg(SPI_PS_IN_CONTROL_0, NUM_INTERP(2));
-    wreg(CB_COLOR7_FRAG, 0);
-    for (uint32_t i = 0; i < 8; i++)
-        wreg(CB_COLOR0_BASE + 4 * i, 0);
-    wreg(TCP_CNTL, 0);
-    wreg(HDP_HOST_PATH_CNTL, rreg(HDP_HOST_PATH_CNTL));
-    wreg(PA_SC_MULTI_CHIP_CNTL, 0);
-    wreg(PA_CL_ENHANCE, CLIP_VTX_REORDER_ENA | NUM_CLIP_SEQ(3));
-    wreg(VC_ENHANCE, 0);
-}
-
 /* ---- the command processor ---- */
 
 static void cp_halt(void)
@@ -698,9 +226,10 @@ static void cp_halt(void)
     wreg(SCRATCH_UMSK, 0);
 }
 
+/* On Evergreen the blocks the CP feeds are reset with it (evergreen_cp_resume). */
 static void cp_soft_reset(void)
 {
-    wreg(GRBM_SOFT_RESET, SOFT_RESET_CP);
+    wreg(GRBM_SOFT_RESET, SOFT_RESET_CP | gen->soft_reset);
     (void)rreg(GRBM_SOFT_RESET);
     mdelay(15);
     wreg(GRBM_SOFT_RESET, 0);
@@ -713,53 +242,41 @@ static uint32_t be32(const uint8_t *p)
 
 static void load_microcode(void)
 {
-    const uint8_t *pfp = radeon_fw_rv770_pfp, *me = radeon_fw_rv770_me;
-    if (rv.family == CHIP_RV730 || rv.family == CHIP_RV740) {
-        pfp = radeon_fw_rv710_pfp;  /* the RV730's PFP is the RV710's */
-        me = radeon_fw_rv730_me;
-    } else if (rv.family == CHIP_RV710) {
-        pfp = radeon_fw_rv710_pfp;
-        me = radeon_fw_rv710_me;
-    }
+    const uint8_t *pfp, *me;
+    int pfp_dwords, me_dwords;
+    gen->microcode(&pfp, &pfp_dwords, &me, &me_dwords);
     cp_halt();
     wreg(CP_RB_CNTL, RB_NO_UPDATE | RB_BLKSZ(15) | RB_BUFSZ(3));
-    cp_soft_reset();
+    if (gen->reset_with_microcode)  /* Evergreen resets as the CP starts */
+        cp_soft_reset();
     wreg(CP_PFP_UCODE_ADDR, 0);
-    for (int i = 0; i < PFP_UCODE_DWORDS; i++)
+    for (int i = 0; i < pfp_dwords; i++)
         wreg(CP_PFP_UCODE_DATA, be32(pfp + 4 * i));
     wreg(CP_PFP_UCODE_ADDR, 0);
     wreg(CP_ME_RAM_WADDR, 0);
-    for (int i = 0; i < ME_UCODE_DWORDS; i++)
+    for (int i = 0; i < me_dwords; i++)
         wreg(CP_ME_RAM_DATA, be32(me + 4 * i));
     wreg(CP_PFP_UCODE_ADDR, 0);
     wreg(CP_ME_RAM_WADDR, 0);
     wreg(CP_ME_RAM_RADDR, 0);
 }
 
-/* The engine reads what the CPU wrote to video memory only after the HDP
- * is flushed; on the R700, by writing HDP_DEBUG1 and reading memory back. */
-static void hdp_flush(void)
-{
-    wreg(HDP_DEBUG1, 0);
-    (void)*(volatile uint32_t *)(cp.cpu + SCRATCH_OFF);
-}
-
 static void hang(const char *what)
 {
     klog("radeon: the 3D engine hung (%s); GRBM_STATUS %08x, ring read %u, written %u\n", what,
-         rreg(GRBM_STATUS), rreg(CP_RB_RPTR), cp.wptr);
+         rreg(GRBM_STATUS), rreg(CP_RB_RPTR), rcp.wptr);
     cp_halt();
     rv.accel = 0;
 }
 
 /* Wait for room for n dwords, and the padding a commit adds. */
-static int ring_space(uint32_t n)
+int radeon_ring_space(uint32_t n)
 {
     if (!rv.accel)
         return -1;                  /* hung earlier */
     n += 16;
     for (int waited = 0; waited < 1000; waited++) {
-        uint32_t free = (rreg(CP_RB_RPTR) - cp.wptr - 1) & RING_MASK;
+        uint32_t free = (rreg(CP_RB_RPTR) - rcp.wptr - 1) & RING_MASK;
         if (free >= n)
             return 0;
         if (waited < 100)
@@ -771,40 +288,20 @@ static int ring_space(uint32_t n)
     return -1;
 }
 
-static void emit(uint32_t v)
-{
-    cp.ring[cp.wptr] = v;
-    cp.wptr = (cp.wptr + 1) & RING_MASK;
-}
-
 static void commit(void)
 {
-    while (cp.wptr & 15)
+    while (rcp.wptr & 15)
         emit(PACKET2);
     hdp_flush();
-    wreg(CP_RB_WPTR, cp.wptr);
+    wreg(CP_RB_WPTR, rcp.wptr);
     (void)rreg(CP_RB_WPTR);
-}
-
-static void set_config_reg(uint32_t reg, uint32_t v)
-{
-    emit(PACKET3(PACKET3_SET_CONFIG_REG, 1));
-    emit(CONFIG_REG(reg));
-    emit(v);
-}
-
-static void set_context_reg(uint32_t reg, uint32_t v)
-{
-    emit(PACKET3(PACKET3_SET_CONTEXT_REG, 1));
-    emit(CONTEXT_REG(reg));
-    emit(v);
 }
 
 /* Have the CP write a sequence number once everything before it is done
  * and flushed, and wait for it. */
 static int finish(void)
 {
-    if (ring_space(20) < 0)
+    if (radeon_ring_space(20) < 0)
         return -1;
     emit(PACKET3(PACKET3_SURFACE_SYNC, 3));
     emit(PACKET3_TC_ACTION_ENA | PACKET3_VC_ACTION_ENA | PACKET3_SH_ACTION_ENA);
@@ -814,7 +311,7 @@ static int finish(void)
     emit(PACKET3(PACKET3_EVENT_WRITE, 0));
     emit(CACHE_FLUSH_AND_INV_EVENT);
     set_config_reg(WAIT_UNTIL, WAIT_3D_IDLE_bit | WAIT_3D_IDLECLEAN_bit);
-    uint32_t seq = ++cp.seq;
+    uint32_t seq = ++rcp.seq;
     set_config_reg(SCRATCH_REG1, seq);
     commit();
     for (int waited = 0; waited < 1000; waited++) {
@@ -835,36 +332,44 @@ static int cp_start(void)
     uint32_t bufsz = 13, cntl = 9u << 8 | bufsz;    /* log2 of 64 KiB / 8, of 4 KiB / 8 */
     wreg(CP_RB_CNTL, cntl);
     wreg(CP_SEM_WAIT_TIMER, 0);
+    if (gen->cp_regs)
+        gen->cp_regs();
     wreg(CP_RB_WPTR_DELAY, 0);
     wreg(CP_RB_CNTL, cntl | RB_RPTR_WR_ENA);
     wreg(CP_RB_RPTR_WR, 0);
-    cp.wptr = 0;
+    rcp.wptr = 0;
     wreg(CP_RB_WPTR, 0);
-    uint64_t scratch = cp.gpu + SCRATCH_OFF;
+    uint64_t scratch = rcp.gpu + SCRATCH_OFF;
     wreg(CP_RB_RPTR_ADDR, (uint32_t)scratch & ~3u);
     wreg(CP_RB_RPTR_ADDR_HI, (uint32_t)(scratch >> 32) & 0xFF);
     wreg(SCRATCH_ADDR, (uint32_t)(scratch >> 8));
     wreg(SCRATCH_UMSK, 0);          /* no write-back: the CPU reads the registers */
     wreg(SCRATCH_REG1, 0);          /* the fence, before its first number */
-    cp.seq = 0;
+    rcp.seq = 0;
     mdelay(1);
     wreg(CP_RB_CNTL, cntl | RB_NO_UPDATE);
-    wreg(CP_RB_BASE, (uint32_t)((cp.gpu + RING_OFF) >> 8));
+    wreg(CP_RB_BASE, (uint32_t)((rcp.gpu + RING_OFF) >> 8));
     wreg(CP_DEBUG, (1u << 27) | (1u << 28));
 
     emit(PACKET3(PACKET3_ME_INITIALIZE, 5));
     emit(0x1);
     emit(0x0);
-    emit(cfg->max_hw_contexts - 1);
+    emit(gen->hw_contexts() - 1);
     emit(1u << 16);                 /* PACKET3_ME_INITIALIZE_DEVICE_ID(1) */
     emit(0);
     emit(0);
     commit();
     wreg(CP_ME_CNTL, 0xFF);
 
+    if (gen->cp_preamble) {
+        if (gen->cp_preamble() < 0)
+            return -1;
+        commit();
+    }
+
     /* The ring test: the CP writes a scratch register. */
     wreg(SCRATCH_REG0, 0xCAFEDEAD);
-    if (ring_space(3) < 0)
+    if (radeon_ring_space(3) < 0)
         return -1;
     set_config_reg(SCRATCH_REG0, 0xDEADBEEF);
     commit();
@@ -877,7 +382,7 @@ static int cp_start(void)
     return -1;
 }
 
-/* ---- blits (r600_blit_kms.c) ---- */
+/* ---- blits (r600_blit_kms.c, evergreen_blit_kms.c) ---- */
 
 /* An integer as an IEEE single, exact up to 2^24 (int2float). */
 static uint32_t int2float(uint32_t x)
@@ -890,87 +395,23 @@ static uint32_t int2float(uint32_t x)
     return fraction + ((uint32_t)(127 + msb) << 23);
 }
 
-static void surface_sync(uint32_t action, uint32_t size, uint64_t addr)
-{
-    emit(PACKET3(PACKET3_SURFACE_SYNC, 3));
-    emit(action);
-    emit((size + 255) >> 8);
-    emit((uint32_t)(addr >> 8));
-    emit(10);                       /* poll interval */
-}
-
-/* The default state as an indirect buffer and the shader resources: what
- * every batch starts with, blits and a 3D client's command buffers. */
+/* The default state and the shader resources: what every batch starts
+ * with, blits and a 3D client's command buffers. */
 static int begin_state(void)
 {
-    if (ring_space(16) < 0)
-        return -1;
-    uint64_t state = cp.gpu + STATE_OFF;
-    emit(PACKET3(PACKET3_INDIRECT_BUFFER, 2));
-    emit((uint32_t)state & ~3u);
-    emit((uint32_t)(state >> 32) & 0xFF);
-    emit(cp.state_dwords);
-
-    uint32_t sq_config = (rv.family == CHIP_RV710 ? 0 : VC_ENABLE) | DX9_CONSTS |
-                         ALU_INST_PREFER_VECTOR | PS_PRIO(0) | VS_PRIO(1) | GS_PRIO(2) | ES_PRIO(3);
-    emit(PACKET3(PACKET3_SET_CONFIG_REG, 6));
-    emit(CONFIG_REG(SQ_CONFIG));
-    emit(sq_config);
-    emit(NUM_PS_GPRS(cfg->blit_ps_gprs) | NUM_VS_GPRS(cfg->blit_vs_gprs) | NUM_CLAUSE_TEMP_GPRS(4));
-    emit(0);
-    emit(NUM_PS_THREADS(cfg->blit_ps_threads) | NUM_VS_THREADS(cfg->blit_vs_threads));
-    emit(NUM_PS_STACK_ENTRIES(cfg->blit_stack) | NUM_VS_STACK_ENTRIES(cfg->blit_stack));
-    emit(0);
-    return 0;
+    return gen->begin_state();
 }
 
 /* The default state and the two blit shaders. */
 static int begin_blits(void)
 {
-    if (begin_state() < 0 || ring_space(32) < 0)
+    if (begin_state() < 0 || radeon_ring_space(32) < 0)
         return -1;
-    uint64_t vs = cp.gpu + cp.vs_off, ps = cp.gpu + cp.ps_off;
-    set_context_reg(SQ_PGM_START_VS, (uint32_t)(vs >> 8));
-    set_context_reg(SQ_PGM_RESOURCES_VS, 1);
-    set_context_reg(SQ_PGM_CF_OFFSET_VS, 0);
-    set_context_reg(SQ_PGM_START_PS, (uint32_t)(ps >> 8));
-    set_context_reg(SQ_PGM_RESOURCES_PS, 1 | (1u << 28));
-    set_context_reg(SQ_PGM_EXPORTS_PS, 2);
-    set_context_reg(SQ_PGM_CF_OFFSET_PS, 0);
+    uint64_t vs = rcp.gpu + rcp.vs_off, ps = rcp.gpu + rcp.ps_off;
+    gen->set_shaders(vs, ps);
     surface_sync(PACKET3_SH_ACTION_ENA, 512, vs);
-    cp.vb_used = 0;
+    rcp.vb_used = 0;
     return 0;
-}
-
-static void set_render_target(const struct surf *s)
-{
-    uint32_t h = MAX(ALIGN_UP(s->h, 8u), 8u);
-    set_context_reg(CB_COLOR0_BASE, (uint32_t)(s->addr >> 8));
-    set_context_reg(CB_COLOR0_SIZE, (s->pitch / 8 - 1) | (s->pitch * h / 64 - 1) << 10);
-    set_context_reg(CB_COLOR0_VIEW, 0);
-    set_context_reg(CB_COLOR0_INFO, CB_FORMAT(s->format) | CB_SOURCE_FORMAT(CB_SF_EXPORT_NORM) |
-                                    CB_ARRAY_MODE(ARRAY_LINEAR_ALIGNED));
-    set_context_reg(CB_COLOR0_TILE, 0);
-    set_context_reg(CB_COLOR0_FRAG, 0);
-    set_context_reg(CB_COLOR0_MASK, 0);
-}
-
-static void set_texture(const struct surf *s)
-{
-    uint32_t word0 = 1u /* 2D */ | (uint32_t)ARRAY_LINEAR_ALIGNED << 3 |
-                     ((s->pitch / 8 - 1) & 0x7FF) << 8 | ((s->w - 1) & 0x1FFF) << 19;
-    uint32_t word1 = (s->format & 0x3F) << 26 | ((MAX(s->h, 1u) - 1) & 0x1FFF);
-    uint32_t word4 = 1u << 14 /* request size */ | 0u << 16 | 1u << 19 | 2u << 22 | 3u << 25;
-    surface_sync(PACKET3_TC_ACTION_ENA, s->pitch * s->h * s->cpp, s->addr);
-    emit(PACKET3(PACKET3_SET_RESOURCE, 7));
-    emit(0);
-    emit(word0);
-    emit(word1);
-    emit((uint32_t)(s->addr >> 8));
-    emit((uint32_t)(s->addr >> 8));
-    emit(word4);
-    emit(0);
-    emit(SQ_TEX_VTX_VALID_TEXTURE << 30);
 }
 
 static void set_scissors(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2)
@@ -987,20 +428,6 @@ static void set_scissors(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2)
     emit(CONTEXT_REG(PA_SC_WINDOW_SCISSOR_TL));
     emit(x1 | y1 << 16 | 1u << 31);
     emit(x2 | y2 << 16);
-}
-
-static void set_vertices(uint64_t addr)
-{
-    emit(PACKET3(PACKET3_SET_RESOURCE, 7));
-    emit(0x460);
-    emit((uint32_t)addr);
-    emit(48 - 1);
-    emit(((uint32_t)(addr >> 32) & 0xFF) | 16u << 8);      /* stride 16 */
-    emit(1);
-    emit(0);
-    emit(0);
-    emit(SQ_TEX_VTX_VALID_BUFFER << 30);
-    surface_sync(rv.family == CHIP_RV710 ? PACKET3_TC_ACTION_ENA : PACKET3_VC_ACTION_ENA, 48, addr);
 }
 
 static void draw_auto(void)
@@ -1020,21 +447,21 @@ static void draw_auto(void)
 static int blit(const struct surf *src, const struct surf *dst, uint32_t sx, uint32_t sy,
                 uint32_t dx, uint32_t dy, uint32_t w, uint32_t h)
 {
-    if (cp.vb_used + 48 > VB_BYTES)
+    if (rcp.vb_used + 48 > VB_BYTES)
         return 1;
-    uint32_t *v = (uint32_t *)(cp.cpu + VB_OFF + cp.vb_used);
-    uint64_t vb = cp.gpu + VB_OFF + cp.vb_used;
-    cp.vb_used += 48;
+    uint32_t *v = (uint32_t *)(rcp.cpu + VB_OFF + rcp.vb_used);
+    uint64_t vb = rcp.gpu + VB_OFF + rcp.vb_used;
+    rcp.vb_used += 48;
     /* a RECTLIST: three corners, each position then texture coordinate */
     v[0] = int2float(dx);     v[1] = int2float(dy);     v[2] = int2float(sx);     v[3] = int2float(sy);
     v[4] = int2float(dx);     v[5] = int2float(dy + h); v[6] = int2float(sx);     v[7] = int2float(sy + h);
     v[8] = int2float(dx + w); v[9] = int2float(dy + h); v[10] = int2float(sx + w); v[11] = int2float(sy + h);
-    if (ring_space(90) < 0)
+    if (radeon_ring_space(100) < 0)
         return -1;
-    set_texture(src);
-    set_render_target(dst);
+    gen->set_texture(src);
+    gen->set_render_target(dst);
     set_scissors(dx, dy, dx + w, dy + h);
-    set_vertices(vb);
+    gen->set_vertices(vb);
     draw_auto();
     surface_sync(PACKET3_CB_ACTION_ENA | PACKET3_CB0_DEST_BASE_ENA, dst->pitch * dst->h * dst->cpp,
                  dst->addr);
@@ -1057,13 +484,13 @@ static int blit_or_flush(const struct surf *src, const struct surf *dst, uint32_
 /* The 64 texels the fill shader samples, all of one color. */
 static struct surf fill_surface(uint32_t color, uint32_t format, uint32_t cpp)
 {
-    struct surf s = { cp.gpu + FILL_OFF, 64, 64, 1, format, cpp };
+    struct surf s = { rcp.gpu + FILL_OFF, 64, 64, 1, format, cpp };
     if (cpp == 2) {
-        uint16_t *t = (uint16_t *)(cp.cpu + FILL_OFF);
+        uint16_t *t = (uint16_t *)(rcp.cpu + FILL_OFF);
         for (int i = 0; i < 64; i++)
             t[i] = (uint16_t)color;
     } else {
-        uint32_t *t = (uint32_t *)(cp.cpu + FILL_OFF);
+        uint32_t *t = (uint32_t *)(rcp.cpu + FILL_OFF);
         for (int i = 0; i < 64; i++)
             t[i] = color;
     }
@@ -1099,9 +526,9 @@ static int check(const char *what, const uint32_t *px, uint32_t x0, uint32_t y0,
 
 static int self_test(void)
 {
-    uint32_t *a = (uint32_t *)(cp.cpu + TEST_OFF), *b = (uint32_t *)(cp.cpu + TEST_OFF + TW * TH * 4);
-    struct surf sa = { cp.gpu + TEST_OFF, TW, TW, TH, FMT_8_8_8_8, 4 };
-    struct surf sb = { cp.gpu + TEST_OFF + TW * TH * 4, TW, TW, TH, FMT_8_8_8_8, 4 };
+    uint32_t *a = (uint32_t *)(rcp.cpu + TEST_OFF), *b = (uint32_t *)(rcp.cpu + TEST_OFF + TW * TH * 4);
+    struct surf sa = { rcp.gpu + TEST_OFF, TW, TW, TH, FMT_8_8_8_8, 4 };
+    struct surf sb = { rcp.gpu + TEST_OFF + TW * TH * 4, TW, TW, TH, FMT_8_8_8_8, 4 };
 
     memset(a, 0, TW * TH * 4);
     struct surf fill = fill_surface(0xFF336699, FMT_8_8_8_8, 4);
@@ -1127,14 +554,14 @@ static int gart_test(void)
     uint32_t page = pmm_alloc();
     if (!page)
         return -1;
-    uint32_t *p = (uint32_t *)page, *a = (uint32_t *)(cp.cpu + TEST_OFF);
+    uint32_t *p = (uint32_t *)page, *a = (uint32_t *)(rcp.cpu + TEST_OFF);
     for (uint32_t i = 0; i < 1024; i++)
         p[i] = pattern(i);
     memset(a, 0, TW * TH * 4);
     gart_set(GTT_PAGES - 1, page);
     gart_flush();
     struct surf g = { gart.start + (GTT_PAGES - 1) * 4096ull, 64, 64, 16, FMT_8_8_8_8, 4 };
-    struct surf sa = { cp.gpu + TEST_OFF, TW, TW, TH, FMT_8_8_8_8, 4 };
+    struct surf sa = { rcp.gpu + TEST_OFF, TW, TW, TH, FMT_8_8_8_8, 4 };
     int r = -1;
     if (begin_blits() < 0 || blit(&g, &sa, 0, 0, 10, 3, 64, 16) != 0 || finish() < 0)
         goto out;
@@ -1165,6 +592,7 @@ out:
     return r;
 }
 
+
 /* ---- the interface ---- */
 
 /* Can the engine draw on the screen's pages? */
@@ -1183,9 +611,10 @@ int radeon_gart_ok(void)
     return rv.accel && gart.on;
 }
 
+/* Only where the kernel can check a 3D client's command buffers. */
 int radeon_3d_ok(void)
 {
-    return rv.accel && rv.aper_size > GL_VRAM_OFF && rv.vram_size > GL_VRAM_OFF;
+    return rv.accel && gen->check && rv.aper_size > GL_VRAM_OFF && rv.vram_size > GL_VRAM_OFF;
 }
 
 /* ---- buffers lent to the GPU ---- */
@@ -1318,7 +747,7 @@ int radeon_map3d(struct disp3d *d)
 }
 
 /* Does [addr, addr + bytes) lie in the caller's video memory or buffers? */
-static int caller_owns(uint64_t addr, uint64_t bytes)
+int radeon_caller_owns(uint64_t addr, uint64_t bytes)
 {
     uint64_t gl = rv.mc_base + GL_VRAM_OFF;
     if (gl3d.owner == current->leader->pid && addr >= gl && addr + bytes <= gl + gl3d.size)
@@ -1331,301 +760,6 @@ static int caller_owns(uint64_t addr, uint64_t bytes)
     return 0;
 }
 
-/* ---- checking a 3D client's command buffer ----
- *
- * A command buffer runs only as the kernel's copy, in the engine's own
- * video memory, which nothing a process draws can reach; the process's
- * buffer is read once, so changing it afterwards changes nothing. The
- * copy is checked packet by packet, as Linux's r600_cs.c does: only the
- * packets and registers the GL library writes are let through, every
- * address in them must be the caller's (caller_owns), and each draw is
- * checked against the state before it. The color and depth buffers and
- * the shaders must have been set by this buffer, which cannot know what
- * the kernel or another process left in them; only color buffer 0 may
- * be drawn to. What is drawn then stays in the caller's memory.
- */
-
-/* Registers and fields the check looks at */
-#define DB_DEPTH_SIZE   0x28000
-#define DB_DEPTH_VIEW   0x28004
-#define DB_DEPTH_BASE   0x2800C
-#define DB_DEPTH_INFO   0x28010
-#define DB_FORMAT(v)    ((v) & 7)
-#define DB_ARRAY_MODE(v) ((v) >> 15 & 0xF)
-#define DB_TILE_SURFACE_ENABLE (1u << 25)   /* HTILE, at an address of its own */
-#define CB_COLOR0_FORMAT(v) ((v) >> 2 & 0x3F)
-#define CB_COLOR0_ARRAY_MODE(v) ((v) >> 8 & 0xF)
-#define CB_COLOR0_TILE_MODE(v) ((v) >> 18 & 3)  /* CMASK and FMASK */
-#define ARRAY_1D_TILED_THIN1 2
-#define CB_TARGET_MASK  0x28238
-#define CB_SHADER_MASK  0x2823C
-#define VGT_MAX_VTX_INDX 0x28400
-#define SPI_VS_OUT_ID_0 0x28614
-#define SPI_VS_OUT_ID_9 0x28638
-#define SPI_PS_INPUT_CNTL_0 0x28644
-#define SPI_PS_INPUT_CNTL_31 0x286C0
-#define SPI_VS_OUT_CONFIG 0x286C4
-#define DB_DEPTH_CONTROL 0x28800
-#define PA_CL_VTE_CNTL  0x28818
-#define PACKET3_SET_SAMPLER 0x6E
-#define SET_CONTEXT_REG_END 0x29000
-#define SET_RESOURCE_START 0x38000
-#define SET_RESOURCE_END 0x3C000
-#define SET_SAMPLER_START 0x3C000
-#define SET_SAMPLER_END 0x3CFF0
-
-/* What a context register may hold */
-enum { REG_ANY, REG_ZERO, REG_KEPT, REG_SHADER };
-
-static const struct {
-    uint32_t first, last;
-    uint8_t kind;
-} context_regs[] = {
-    { DB_DEPTH_SIZE, DB_DEPTH_VIEW, REG_KEPT },
-    { DB_DEPTH_BASE, DB_DEPTH_INFO, REG_KEPT },
-    { PA_SC_SCREEN_SCISSOR_TL, PA_SC_SCREEN_SCISSOR_TL + 4, REG_ANY },
-    { CB_COLOR0_BASE, CB_COLOR0_BASE, REG_KEPT },
-    { CB_COLOR0_SIZE, CB_COLOR0_SIZE, REG_KEPT },
-    { CB_COLOR0_VIEW, CB_COLOR0_VIEW, REG_KEPT },
-    { CB_COLOR0_INFO, CB_COLOR0_INFO, REG_KEPT },
-    { CB_COLOR0_TILE, CB_COLOR0_TILE, REG_ZERO },
-    { CB_COLOR0_FRAG, CB_COLOR0_FRAG, REG_ZERO },
-    { CB_COLOR0_MASK, CB_COLOR0_MASK, REG_ZERO },
-    { PA_SC_WINDOW_SCISSOR_TL, PA_SC_WINDOW_SCISSOR_TL + 4, REG_ANY },
-    { CB_TARGET_MASK, CB_TARGET_MASK, REG_KEPT },
-    { CB_SHADER_MASK, CB_SHADER_MASK, REG_ANY },
-    { PA_SC_GENERIC_SCISSOR_TL, PA_SC_GENERIC_SCISSOR_TL + 4, REG_ANY },
-    { VGT_MAX_VTX_INDX, VGT_MAX_VTX_INDX, REG_ANY },
-    { SPI_VS_OUT_ID_0, SPI_VS_OUT_ID_9, REG_ANY },
-    { SPI_PS_INPUT_CNTL_0, SPI_PS_INPUT_CNTL_31, REG_ANY },
-    { SPI_VS_OUT_CONFIG, SPI_VS_OUT_CONFIG, REG_ANY },
-    { SPI_PS_IN_CONTROL_0, SPI_PS_IN_CONTROL_0, REG_ANY },
-    { DB_DEPTH_CONTROL, DB_DEPTH_CONTROL, REG_ANY },
-    { PA_CL_VTE_CNTL, PA_CL_VTE_CNTL, REG_ANY },
-    { SQ_PGM_START_PS, SQ_PGM_START_PS, REG_SHADER },
-    { SQ_PGM_RESOURCES_PS, SQ_PGM_EXPORTS_PS, REG_ANY },
-    { SQ_PGM_START_VS, SQ_PGM_START_VS, REG_SHADER },
-    { SQ_PGM_RESOURCES_VS, SQ_PGM_RESOURCES_VS, REG_ANY },
-    { SQ_PGM_CF_OFFSET_PS, SQ_PGM_CF_OFFSET_VS, REG_ANY },
-};
-
-/* The registers a draw depends on, as this buffer set them */
-enum {
-    K_CB_BASE, K_CB_SIZE, K_CB_VIEW, K_CB_INFO, K_TARGET_MASK,
-    K_DB_BASE, K_DB_SIZE, K_DB_VIEW, K_DB_INFO, K_VS, K_PS, NKEPT,
-};
-
-struct cs {
-    uint32_t set;                   /* bit K_*: set by this buffer */
-    uint32_t v[NKEPT];
-    const char *why;                /* the reason a buffer was refused */
-};
-
-static int kept_index(uint32_t reg)
-{
-    switch (reg) {
-    case CB_COLOR0_BASE: return K_CB_BASE;
-    case CB_COLOR0_SIZE: return K_CB_SIZE;
-    case CB_COLOR0_VIEW: return K_CB_VIEW;
-    case CB_COLOR0_INFO: return K_CB_INFO;
-    case CB_TARGET_MASK: return K_TARGET_MASK;
-    case DB_DEPTH_BASE: return K_DB_BASE;
-    case DB_DEPTH_SIZE: return K_DB_SIZE;
-    case DB_DEPTH_VIEW: return K_DB_VIEW;
-    case DB_DEPTH_INFO: return K_DB_INFO;
-    case SQ_PGM_START_VS: return K_VS;
-    case SQ_PGM_START_PS: return K_PS;
-    }
-    return -1;
-}
-
-static int refuse(struct cs *cs, const char *why)
-{
-    cs->why = why;
-    return -1;
-}
-
-static int check_context_reg(struct cs *cs, uint32_t reg, uint32_t v)
-{
-    for (uint32_t i = 0; i < ARRAY_SIZE(context_regs); i++) {
-        if (reg < context_regs[i].first || reg > context_regs[i].last)
-            continue;
-        switch (context_regs[i].kind) {
-        case REG_ZERO:
-            return v ? refuse(cs, "CMASK or FMASK address") : 0;
-        case REG_SHADER:
-            if (!caller_owns((uint64_t)v << 8, 4))
-                return refuse(cs, "shader not in the caller's memory");
-            /* fall through */
-        case REG_KEPT: {
-            int k = kept_index(reg);
-            cs->v[k] = v;
-            cs->set |= 1u << k;
-            return 0;
-        }
-        default:
-            return 0;
-        }
-    }
-    return refuse(cs, "context register not allowed");
-}
-
-/* The bytes a color or depth buffer covers: its SIZE register gives the
- * line in units of 8 pixels and the whole in units of 64. Lines must be
- * a multiple of 64 pixels and the height of 8, as the GL library has
- * them, so that the engine covers no more than that. */
-static int surface_bytes(uint32_t size, uint32_t bpp, uint64_t *out)
-{
-    uint32_t pitch = ((size & 0x3FF) + 1) * 8;
-    uint32_t pixels = ((size >> 10 & 0xFFFFF) + 1) * 64;
-    if (pitch % 64 || pixels % (pitch * 8))
-        return -1;
-    *out = (uint64_t)pixels * bpp;
-    return 0;
-}
-
-static int buffer_ok(struct cs *cs, int base, int size, int view, uint32_t bpp)
-{
-    uint32_t need = 1u << base | 1u << size | 1u << view;
-    uint64_t bytes;
-    if ((cs->set & need) != need)
-        return refuse(cs, "draw before its buffer is set");
-    if (cs->v[view])
-        return refuse(cs, "more than one slice");
-    if (surface_bytes(cs->v[size], bpp, &bytes) < 0)
-        return refuse(cs, "buffer lines not aligned");
-    if (!caller_owns((uint64_t)cs->v[base] << 8, bytes))
-        return refuse(cs, "buffer not in the caller's memory");
-    return 0;
-}
-
-/* What a draw writes: color buffer 0 and the depth buffer. */
-static int check_draw(struct cs *cs)
-{
-    uint32_t need = 1u << K_TARGET_MASK | 1u << K_CB_INFO | 1u << K_DB_INFO | 1u << K_VS | 1u << K_PS;
-    if ((cs->set & need) != need)
-        return refuse(cs, "draw before its state is set");
-    if (cs->v[K_TARGET_MASK] & ~0xFu)
-        return refuse(cs, "color buffers other than 0");
-    uint32_t cb = cs->v[K_CB_INFO];
-    if ((cs->v[K_TARGET_MASK] & 0xF) && CB_COLOR0_FORMAT(cb)) {
-        if (CB_COLOR0_FORMAT(cb) != FMT_8_8_8_8 || CB_COLOR0_ARRAY_MODE(cb) != ARRAY_LINEAR_ALIGNED ||
-            CB_COLOR0_TILE_MODE(cb))
-            return refuse(cs, "color buffer format");
-        if (buffer_ok(cs, K_CB_BASE, K_CB_SIZE, K_CB_VIEW, 4) < 0)
-            return -1;
-    }
-    uint32_t db = cs->v[K_DB_INFO];
-    if (DB_FORMAT(db)) {
-        uint32_t mode = DB_ARRAY_MODE(db);
-        uint32_t bpp = DB_FORMAT(db) == 1 ? 2 : DB_FORMAT(db) == 7 ? 8 : 4;
-        if ((mode != ARRAY_LINEAR_ALIGNED && mode != ARRAY_1D_TILED_THIN1) || (db & DB_TILE_SURFACE_ENABLE))
-            return refuse(cs, "depth buffer format");
-        if (buffer_ok(cs, K_DB_BASE, K_DB_SIZE, K_DB_VIEW, bpp) < 0)
-            return -1;
-    }
-    return 0;
-}
-
-/* One SET_RESOURCE entry: a vertex buffer or a 2D texture, read from. */
-static int check_resource(struct cs *cs, const uint32_t *w)
-{
-    switch (w[6] >> 30) {
-    case 0:                                     /* not valid: unused */
-        return 0;
-    case SQ_TEX_VTX_VALID_BUFFER: {
-        uint64_t addr = (uint64_t)(w[2] & 0xFF) << 32 | w[0];
-        if (!caller_owns(addr, (uint64_t)w[1] + 1))
-            return refuse(cs, "vertex buffer not in the caller's memory");
-        return 0;
-    }
-    case SQ_TEX_VTX_VALID_TEXTURE: {
-        uint32_t dim = w[0] & 7, mode = w[0] >> 3 & 0xF;
-        uint32_t pitch = ((w[0] >> 8 & 0x7FF) + 1) * 8, width = (w[0] >> 19) + 1;
-        uint32_t height = (w[1] & 0x1FFF) + 1, depth = w[1] >> 13 & 0x1FFF;
-        if (dim > 1 || mode > ARRAY_LINEAR_ALIGNED || depth || w[1] >> 26 != FMT_8_8_8_8 ||
-            width > pitch || (mode == ARRAY_LINEAR_ALIGNED && pitch % 64) ||
-            w[4] >> 28 || (w[5] & 0x3FFFFFFF))  /* one level, no arrays */
-            return refuse(cs, "texture format");
-        if (!caller_owns((uint64_t)w[2] << 8, (uint64_t)pitch * height * 4))
-            return refuse(cs, "texture not in the caller's memory");
-        return 0;
-    }
-    }
-    return refuse(cs, "resource type");
-}
-
-/* count registers from the packet's index into a block of [first, end). */
-static int in_range(uint32_t index, uint32_t count, uint32_t first, uint32_t end)
-{
-    uint32_t regs = (end - first) / 4;
-    return index < regs && count <= regs - index;
-}
-
-/* Check the buffer of n dwords, packet by packet. */
-static int check_buffer(struct cs *cs, const uint32_t *ib, uint32_t n, uint32_t *at)
-{
-    uint32_t i = 0;
-    while (i < n) {
-        *at = i;
-        uint32_t hdr = ib[i];
-        if (hdr >> 30 == 2) {                   /* PACKET2: filler */
-            i++;
-            continue;
-        }
-        if (hdr >> 30 != 3)
-            return refuse(cs, "packet type 0 or 1");
-        uint32_t op = hdr >> 8 & 0xFF, count = (hdr >> 16 & 0x3FFF) + 1;
-        if (count > n - i - 1)
-            return refuse(cs, "packet past the end");
-        const uint32_t *d = ib + i + 1;
-        switch (op) {
-        case PACKET3_SET_CONTEXT_REG:
-            if (count < 2 || !in_range(d[0], count - 1, 0x28000u, SET_CONTEXT_REG_END))
-                return refuse(cs, "context registers out of range");
-            for (uint32_t k = 1; k < count; k++)
-                if (check_context_reg(cs, 0x28000u + (d[0] + k - 1) * 4, d[k]) < 0)
-                    return -1;
-            break;
-        case PACKET3_SET_CONFIG_REG:
-            if (count != 2 || d[0] != CONFIG_REG(VGT_PRIMITIVE_TYPE))
-                return refuse(cs, "config register not allowed");
-            break;
-        case PACKET3_SET_RESOURCE:
-            if (count < 8 || (count - 1) % 7 || d[0] % 7 ||
-                !in_range(d[0], count - 1, SET_RESOURCE_START, SET_RESOURCE_END))
-                return refuse(cs, "resources out of range");
-            for (uint32_t k = 1; k < count; k += 7)
-                if (check_resource(cs, d + k) < 0)
-                    return -1;
-            break;
-        case PACKET3_SET_SAMPLER:
-            if (count < 4 || (count - 1) % 3 || d[0] % 3 ||
-                !in_range(d[0], count - 1, SET_SAMPLER_START, SET_SAMPLER_END))
-                return refuse(cs, "samplers out of range");
-            break;
-        case PACKET3_SURFACE_SYNC:              /* caches only */
-            if (count != 4)
-                return refuse(cs, "SURFACE_SYNC length");
-            break;
-        case PACKET3_INDEX_TYPE:
-        case PACKET3_NUM_INSTANCES:
-            if (count != 1)
-                return refuse(cs, "packet length");
-            break;
-        case PACKET3_DRAW_INDEX_AUTO:
-            if (count != 2 || (d[1] & 3) != DI_SRC_SEL_AUTO_INDEX)
-                return refuse(cs, "DRAW_INDEX_AUTO");
-            if (check_draw(cs) < 0)
-                return -1;
-            break;
-        default:
-            return refuse(cs, "packet not allowed");
-        }
-        i += 1 + count;
-    }
-    return 0;
-}
 
 /* Read n dwords at the caller's GPU address addr, which caller_owns. */
 static int fetch(uint64_t addr, uint32_t *dst, uint32_t n)
@@ -1662,37 +796,37 @@ static int fetch(uint64_t addr, uint32_t *dst, uint32_t n)
 int radeon_submit(const struct dispsubmit *sub)
 {
     static uint32_t ib[UIB_DWORDS + 16];
-    if (!rv.accel)
+    if (!rv.accel || !gen->check)
         return -ENODEV;
     if (gl3d.owner != current->leader->pid)
         return -EPERM;
     uint64_t addr = (uint64_t)sub->gpu_hi << 32 | sub->gpu_lo;
     uint32_t n = sub->dwords;
-    if (!n || n > UIB_DWORDS || (addr & 3) || !caller_owns(addr, n * 4ull) || fetch(addr, ib, n) < 0)
+    if (!n || n > UIB_DWORDS || (addr & 3) || !radeon_caller_owns(addr, n * 4ull) || fetch(addr, ib, n) < 0)
         return -EINVAL;
-    struct cs cs = { 0 };
     uint32_t at = 0;
-    if (check_buffer(&cs, ib, n, &at) < 0) {
+    const char *why = NULL;
+    if (gen->check(ib, n, &at, &why) < 0) {
         klog("radeon: pid %d (%s): command buffer refused at dword %u of %u: %s\n",
-             current->leader->pid, current->name, at, n, cs.why);
+             current->leader->pid, current->name, at, n, why);
         return -EINVAL;
     }
     while (n & 15)
         ib[n++] = PACKET2;
-    if (cp.busy)
+    if (rcp.busy)
         return -EBUSY;
-    cp.busy = 1;
-    memcpy(cp.cpu + UIB_OFF, ib, n * 4);
-    uint64_t copy = cp.gpu + UIB_OFF;
+    rcp.busy = 1;
+    memcpy(rcp.cpu + UIB_OFF, ib, n * 4);
+    uint64_t copy = rcp.gpu + UIB_OFF;
     int r = begin_state();
-    if (r == 0 && (r = ring_space(4)) == 0) {
+    if (r == 0 && (r = radeon_ring_space(4)) == 0) {
         emit(PACKET3(PACKET3_INDIRECT_BUFFER, 2));
         emit((uint32_t)copy);
         emit((uint32_t)(copy >> 32) & 0xFF);
         emit(n);
         r = finish();
     }
-    cp.busy = 0;
+    rcp.busy = 0;
     return r < 0 ? -EIO : 0;
 }
 
@@ -1767,9 +901,9 @@ int radeon_accel_blit(const struct dispblit *b, int screen_owner)
         r = resolve(&b->dst, screen_owner, &dst);
     if (r < 0)
         return r;
-    if (cp.busy)
+    if (rcp.busy)
         return -EBUSY;
-    cp.busy = 1;
+    rcp.busy = 1;
     r = begin_blits();
     for (uint32_t i = 0; i < b->count && r == 0; i++) {
         const struct dispblitrect *q = &b->rects[i];
@@ -1787,7 +921,7 @@ int radeon_accel_blit(const struct dispblit *b, int screen_owner)
     }
     if (r == 0)
         r = finish();
-    cp.busy = 0;
+    rcp.busy = 0;
     return r < 0 ? -EIO : 0;
 }
 
@@ -1797,9 +931,9 @@ int radeon_accel_copy(const struct dispcopy *c)
         return -ENODEV;
     if (c->from_page > 1 || c->count > DISP_MAX_RECTS)
         return -EINVAL;
-    if (cp.busy)
+    if (rcp.busy)
         return -EBUSY;
-    cp.busy = 1;
+    rcp.busy = 1;
     uint32_t pitch = fb.pitch / fb.bytespp, fmt = fb.bpp == 16 ? FMT_5_6_5 : FMT_8_8_8_8;
     uint64_t base = rv.mc_base + rv.page0;
     struct surf src = { base + c->from_page * rv.page_size, pitch, fb.width, fb.height, fmt, fb.bytespp };
@@ -1819,9 +953,10 @@ int radeon_accel_copy(const struct dispcopy *c)
     }
     if (r == 0)
         r = finish();
-    cp.busy = 0;
+    rcp.busy = 0;
     return r < 0 ? -EIO : 0;
 }
+
 
 /* radeon.accel=vm, =gpu or =cp stops the bring-up after that step, to
  * find a step that upsets the card; radeon.accel=0 skips it all. */
@@ -1834,27 +969,33 @@ static int stop_after(const char *step)
     return 1;
 }
 
+/* The default state, padded to 16 dwords, then the shaders, into the
+ * engine's video memory. */
+static void load_programs(void)
+{
+    uint32_t *state = (uint32_t *)(rcp.cpu + STATE_OFF);
+    uint32_t n = gen->state_dwords;
+    memcpy(state, gen->state, n * 4);
+    while (n & 15)
+        state[n++] = PACKET2;
+    rcp.state_dwords = n;
+    rcp.vs_off = STATE_OFF + ALIGN_UP(n * 4, 256u);
+    rcp.ps_off = rcp.vs_off + ALIGN_UP(gen->vs_bytes, 256u);
+    memcpy(rcp.cpu + rcp.vs_off, gen->vs, gen->vs_bytes);
+    memcpy(rcp.cpu + rcp.ps_off, gen->ps, gen->ps_bytes);
+}
+
 void radeon_accel_init(void)
 {
     if (cmdline_has("radeon.accel=0") || !rv.vram || !rv.crtcs)
         return;
-    cfg = &configs[rv.family];
-    cp.cpu = rv.vram + (ACCEL_VRAM_OFF - rv.page0);
-    cp.gpu = rv.mc_base + ACCEL_VRAM_OFF;
-    cp.ring = (uint32_t *)(cp.cpu + RING_OFF);
-    memset(cp.cpu, 0, TEST_OFF);
-
-    /* the default state, padded to 16 dwords, then the shaders */
-    uint32_t *state = (uint32_t *)(cp.cpu + STATE_OFF);
-    uint32_t n = ARRAY_SIZE(r7xx_default_state);
-    memcpy(state, r7xx_default_state, sizeof(r7xx_default_state));
-    while (n & 15)
-        state[n++] = PACKET2;
-    cp.state_dwords = n;
-    cp.vs_off = STATE_OFF + ALIGN_UP(n * 4, 256u);
-    cp.ps_off = cp.vs_off + ALIGN_UP((uint32_t)sizeof(blit_vs), 256u);
-    memcpy(cp.cpu + cp.vs_off, blit_vs, sizeof(blit_vs));
-    memcpy(cp.cpu + cp.ps_off, blit_ps, sizeof(blit_ps));
+    gen = RADEON_EVERGREEN() ? &radeon_llano_accel : &radeon_r700_accel;
+    gen->setup();
+    rcp.cpu = rv.vram + (ACCEL_VRAM_OFF - rv.page0);
+    rcp.gpu = rv.mc_base + ACCEL_VRAM_OFF;
+    rcp.ring = (uint32_t *)(rcp.cpu + RING_OFF);
+    memset(rcp.cpu, 0, TEST_OFF);
+    load_programs();
 
     klog("radeon: MC_VM_FB_LOCATION %08x, aperture at %08x%08x as the engine sees it\n",
          rreg(MC_VM_FB_LOCATION), (uint32_t)(rv.mc_base >> 32), (uint32_t)rv.mc_base);
@@ -1868,10 +1009,7 @@ void radeon_accel_init(void)
         want_gart = 0;
     if (stop_after("vm"))
         return;
-    gpu_init();
-    klog("radeon: engine configured: GB_TILING_CONFIG %08x, CC_RB_BACKEND_DISABLE %08x, "
-         "CC_GC_SHADER_PIPE_CONFIG %08x\n", rreg(GB_TILING_CONFIG), rreg(CC_RB_BACKEND_DISABLE),
-         rreg(CC_GC_SHADER_PIPE_CONFIG));
+    gen->gpu_init();
     if (stop_after("gpu"))
         return;
     load_microcode();
@@ -1902,4 +1040,40 @@ void radeon_accel_init(void)
     }
     boot_ok("%s: 3D engine running (command processor, fill and copy tested%s)", rv.name,
             gart.on ? ", GART" : "");
+}
+
+/*
+ * Back from suspend to RAM, on Evergreen only (gen->resumable): the engine lost its set-up
+ * and its microcode, but not the memory it uses (on the APUs, ordinary
+ * memory the BIOS set aside), so the page table and the buffers lent to
+ * it stay as they were. Everything is set up again as at boot; if the
+ * CP does not start, the desktop draws with the CPU from then on.
+ */
+void radeon_accel_resume(void)
+{
+    if (!rv.accel || !gen->resumable)
+        return;
+    rv.accel = 0;
+    load_programs();
+    if (vm_init() < 0) {
+        kprintf("radeon: video memory moved while asleep, no acceleration\n");
+        gart.on = 0;
+        return;
+    }
+    if (gart.on)
+        gart_enable();
+    gen->gpu_init();
+    load_microcode();
+    rv.accel = 1;
+    if (cp_start() < 0) {
+        cp_halt();
+        rv.accel = 0;
+        if (gart.on) {
+            wreg(VM_CONTEXT0_CNTL, 0);
+            gart.on = 0;
+        }
+        kprintf("radeon: the command processor did not start after waking, no acceleration\n");
+        return;
+    }
+    klog("radeon: 3D engine running again after waking\n");
 }
