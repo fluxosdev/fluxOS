@@ -992,7 +992,11 @@ void proc_check_signals(void)
             0xcd, 0x80, 0x90, 0x90, 0x90, 0x90, 0x90
         };
 
-        uint32_t sp = tf->useresp;
+        /* A Win32 program's stack segment is based (SEG_WDATA): its stack
+         * pointer is an offset from WIN_SEG_BASE. The handler runs in the
+         * flat segments, on the same stack; sigreturn brings the others back. */
+        int based = tf->ss == SEG_WDATA;
+        uint32_t sp = based ? tf->useresp + WIN_SEG_BASE : tf->useresp;
         uint32_t tramp_va = ALIGN_DOWN(sp - sizeof(tramp), 16u);
         uint32_t ctx_va = ALIGN_DOWN(tramp_va - sizeof(ctx), 16u);
         uint32_t info_va = ALIGN_DOWN(ctx_va - sizeof(info), 16u);
@@ -1022,6 +1026,10 @@ void proc_check_signals(void)
         tf->eip = sa.fsa_handler;
         tf->useresp = frame_sp;
         tf->eflags &= ~0x400u;                  /* clear DF for handler entry */
+        if (based || tf->cs != SEG_UCODE) {
+            tf->cs = SEG_UCODE;
+            tf->ss = tf->ds = tf->es = tf->fs = tf->gs = SEG_UDATA;
+        }
         break;
     }
     p->in_syscall = 0;

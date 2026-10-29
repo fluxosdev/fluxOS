@@ -131,8 +131,10 @@ DESKTOP_HDRS := $(foreach d,$(DESKTOP_DIRS),$(wildcard $(d)/*.h))
 DESKTOP_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(DESKTOP_SRCS)))
 $(DESKTOP_OBJS): USER_CFLAGS += $(DESKTOP_INC)
 DOS_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/dos/*.c)))
+# winrun, the Windows program loader (os_linux.c is its Linux back end, for host tests)
+WIN32_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(filter-out user/win32/os_linux.c,$(wildcard user/win32/*.c user/win32/*.S))))
 BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/fsh $(ROOTFS)/bin/desktop \
-             $(ROOTFS)/bin/dos
+             $(ROOTFS)/bin/dos $(ROOTFS)/bin/winrun
 
 ROOTFS_FILES := $(shell find rootfs -type f 2>/dev/null)
 SETUPFS_FILES := $(shell find setupfs -type f 2>/dev/null)
@@ -205,6 +207,10 @@ $(ROOTFS)/bin/desktop: $(CRT0) $(DESKTOP_OBJS) $(LIBGL) $(LIBFONT) $(LIBC) user/
 $(ROOTFS)/bin/dos: $(CRT0) $(DOS_OBJS) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(DOS_OBJS) $(LIBC)
+
+$(ROOTFS)/bin/winrun: $(CRT0) $(WIN32_OBJS) $(LIBC) user/user.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(WIN32_OBJS) $(LIBC)
 
 $(ROOTFS)/bin/%: $(BUILD)/u/user/bin/%.o $(CRT0) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)

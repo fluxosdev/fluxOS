@@ -3,12 +3,16 @@
 #define ARCH_H
 
 #include <stdint.h>
+#include <flux/abi.h>
 
 #define SEG_KCODE 0x08
 #define SEG_KDATA 0x10
 #define SEG_UCODE (0x18 | 3)
 #define SEG_UDATA (0x20 | 3)
-#define SEG_TSS   0x28
+#define SEG_WCODE SEG_WIN_CODE          /* Win32 programs: see <flux/abi.h> */
+#define SEG_WDATA SEG_WIN_DATA
+#define SEG_WFS   SEG_WIN_FS
+#define SEG_TSS   0x40
 
 #define IRQ_BASE    32
 #define IRQ_TIMER   0

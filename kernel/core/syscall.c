@@ -357,18 +357,41 @@ static int sys_sigprocmask(uint32_t how, uint32_t uset, uint32_t uoset, uint32_t
     return 0;
 }
 
+/* A selector a process may hold in DS, ES, FS or GS (or none). */
+static int data_seg_ok(uint32_t sel)
+{
+    return sel == SEG_UDATA || sel == SEG_WDATA || sel == SEG_WFS || sel == 0;
+}
+
 static int sys_sigreturn(uint32_t uctx, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)b; (void)c; (void)d; (void)e;
     struct flux_sigcontext sc;
     if (copy_from_user(&sc, (const void *)uctx, sizeof(sc)) < 0)
         return -EFAULT;
-    if (sc.eip < USER_BASE || sc.eip >= USER_TOP ||
-        sc.useresp < USER_BASE || sc.useresp > USER_TOP)
+    /* The segments come back too: the flat ones, or a Win32 program's
+     * based ones (gdt.c), whose offsets stay within the 2 GiB. Anything
+     * else would fault in the kernel on the way out. */
+    int cs_based = sc.cs == SEG_WCODE, ss_based = sc.ss == SEG_WDATA;
+    if (!cs_based && sc.cs != SEG_UCODE)
+        return -EFAULT;
+    if (!ss_based && sc.ss != SEG_UDATA)
+        return -EFAULT;
+    if (!data_seg_ok(sc.ds) || !data_seg_ok(sc.es) || !data_seg_ok(sc.fs) || !data_seg_ok(sc.gs))
+        return -EFAULT;
+    if (cs_based ? sc.eip >= WIN_SEG_LIMIT : (sc.eip < USER_BASE || sc.eip >= USER_TOP))
+        return -EFAULT;
+    if (ss_based ? sc.useresp > WIN_SEG_LIMIT : (sc.useresp < USER_BASE || sc.useresp > USER_TOP))
         return -EFAULT;
 
     struct proc *p = current;
     struct trapframe *tf = p->tf;
+    tf->cs = sc.cs;
+    tf->ss = sc.ss;
+    tf->ds = sc.ds;
+    tf->es = sc.es;
+    tf->fs = sc.fs;
+    tf->gs = sc.gs;
     tf->edi = sc.edi;
     tf->esi = sc.esi;
     tf->ebp = sc.ebp;
