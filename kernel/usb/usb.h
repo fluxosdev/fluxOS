@@ -108,8 +108,16 @@ struct usb_xfer;
 /*
  * A transfer. The buffer must be kernel memory below KERNEL_SPACE_END
  * (identity-mapped, so the controller can reach it by DMA). Only one
- * transfer per endpoint may be in flight.
+ * transfer per endpoint may be in flight, except on an isochronous
+ * endpoint, where several may be queued: the controller sends them in
+ * order, one packet per service interval, each starting right after the
+ * one before (the first as soon as it can). An isochronous transfer's
+ * buffer holds npackets packets, maxpacket bytes apart; iso_len[i] is
+ * what packet i sends, or (IN) how much it received. Packets that fail
+ * are skipped, not retried: actual is the sum of those that went.
  */
+#define USB_ISO_MAX_PACKETS 16
+
 struct usb_xfer {
     struct usb_dev *dev;
     struct usb_ep *ep;
@@ -117,6 +125,8 @@ struct usb_xfer {
     void *buf;
     uint32_t len;
     uint32_t actual;                    /* bytes moved */
+    uint16_t npackets;                  /* isochronous: packets in buf */
+    uint16_t *iso_len;                  /* ...and their lengths */
     volatile int status;                /* USB_PENDING, then 0, -EPIPE (stall), -EIO, -ETIMEDOUT, -ENODEV */
     /* Called when the transfer ends, from interrupt context; may resubmit.
      * Without it the waiter in usb_wait() is woken instead. */
@@ -220,6 +230,10 @@ struct usb_hc_ops {
     void (*dev_free)(struct usb_hc *hc, struct usb_dev *dev);
     /* After a halt was cleared: the endpoint starts again with DATA0. */
     void (*ep_reset)(struct usb_hc *hc, struct usb_dev *dev, struct usb_ep *ep);
+    /* xHCI: an endpoint of another alternate setting is about to be used
+     * (ep filled in by the driver), or is finished with. Process context. */
+    int (*ep_enable)(struct usb_hc *hc, struct usb_dev *dev, struct usb_ep *ep);
+    void (*ep_disable)(struct usb_hc *hc, struct usb_dev *dev, struct usb_ep *ep);
     /* Suspend to RAM, with no devices left: stop; then, the power having
      * gone, take the controller from the BIOS and set it up again. */
     void (*suspend)(struct usb_hc *hc);
@@ -261,6 +275,10 @@ int usb_clear_halt(struct usb_dev *dev, struct usb_ep *ep);
 /* The first endpoint of this type and direction in an interface's descriptors. */
 struct usb_ep *usb_find_ep(struct usb_dev *dev, const uint8_t *desc, uint32_t len,
                            int type, int in);
+/* An endpoint of another alternate setting, from its descriptor: filled in
+ * and made known to the controller. Select the setting first. */
+struct usb_ep *usb_ep_enable(struct usb_dev *dev, const struct usb_ep_desc *e);
+void usb_ep_disable(struct usb_dev *dev, struct usb_ep *ep);
 /* Wake the hub thread: a hub reported a change, or a driver needs it. */
 void usb_kick(void);
 
@@ -272,8 +290,10 @@ void usbhub_resubmit(struct usb_hub *h);
 /* the drivers */
 extern const struct usb_driver usbhid_driver;
 extern const struct usb_driver usbmsc_driver;
+extern const struct usb_driver usbaudio_driver;
 void usbhid_tick(void);
 void usbhid_service(void);
+void usbaudio_tick(void);               /* from usb_tick, usb_lock held */
 
 /* the controllers */
 void uhci_probe(void);

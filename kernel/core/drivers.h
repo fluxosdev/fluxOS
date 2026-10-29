@@ -118,6 +118,8 @@ void opl_init(struct vnode *devdir);
 void hda_init(struct vnode *devdir);
 void hda_tick(void);
 int hda_get_info(struct sound_info *si);
+/* USB audio (usb/usbaudio.c): /dev/dsp while a device is plugged in */
+int usbaudio_get_info(struct sound_info *si);
 void hda_suspend(void);                 /* suspend to RAM: playback stopped */
 void hda_resume(void);                  /* the controller and codec set up again */
 int opl_present(void);                  /* 0, 2 (OPL2) or 3 (OPL3) */

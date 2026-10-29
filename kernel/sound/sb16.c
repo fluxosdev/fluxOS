@@ -573,7 +573,7 @@ void sound_get_info(struct sound_info *si)
         si->dma8 = sb.dma8;
         si->dma16 = sb.dma16;
         si->flags |= SOUNDF_DSP;
-    } else if (!hda_get_info(si)) {
+    } else if (!usbaudio_get_info(si) && !hda_get_info(si)) {
         strlcpy(si->card, "PC speaker", sizeof(si->card));
     }
     int opl = opl_present();

@@ -38,7 +38,7 @@ static int suspended;                   /* suspend to RAM: the controllers are n
 spinlock_t usb_lock = SPINLOCK_INIT("usb");
 
 static const struct usb_driver *const drivers[] = {
-    &usbhub_driver, &usbhid_driver, &usbmsc_driver,
+    &usbhub_driver, &usbhid_driver, &usbmsc_driver, &usbaudio_driver,
 };
 
 static const char *const speed_names[] = { "low", "full", "high", "super" };
@@ -263,6 +263,30 @@ struct usb_ep *usb_find_ep(struct usb_dev *dev, const uint8_t *desc, uint32_t le
             return &dev->eps[usb_ep_index(e->bEndpointAddress)];
     }
     return NULL;
+}
+
+struct usb_ep *usb_ep_enable(struct usb_dev *dev, const struct usb_ep_desc *e)
+{
+    if (e->bLength < 7 || !(e->bEndpointAddress & 0x0F))
+        return NULL;
+    struct usb_ep *ep = &dev->eps[usb_ep_index(e->bEndpointAddress)];
+    if (ep->hcpriv && dev->hc->ops->ep_disable)
+        dev->hc->ops->ep_disable(dev->hc, dev, ep);
+    memset(ep, 0, sizeof(*ep));
+    ep->addr = e->bEndpointAddress;
+    ep->type = e->bmAttributes & 3;
+    ep->maxpacket = e->wMaxPacketSize & 0x7FF;
+    ep->mult = (e->wMaxPacketSize >> 11) & 3;
+    ep->interval = e->bInterval;
+    if (dev->hc->ops->ep_enable && dev->hc->ops->ep_enable(dev->hc, dev, ep) < 0)
+        return NULL;
+    return ep;
+}
+
+void usb_ep_disable(struct usb_dev *dev, struct usb_ep *ep)
+{
+    if (dev->hc->ops->ep_disable && !dev->gone)
+        dev->hc->ops->ep_disable(dev->hc, dev, ep);
 }
 
 void usb_kick(void)
@@ -677,6 +701,7 @@ void usb_tick(void)
     for (struct usb_hc *hc = hcs; hc; hc = hc->next)
         hc->ops->poll(hc);
     usbhid_tick();
+    usbaudio_tick();
     spin_unlock(&usb_lock);
 }
 

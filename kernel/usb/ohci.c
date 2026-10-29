@@ -9,6 +9,11 @@
  * transfer descriptors ending in an empty one; the controller keeps the
  * data toggles. A transfer is finished when the ED's queue is empty or
  * halted. Descriptors are freed two frames after they are done with.
+ *
+ * Isochronous endpoints go on the interrupt list too, with isochronous
+ * descriptors of up to eight packets each, given the frames they are
+ * for; an endpoint's transfers queue up, each one's packets in the
+ * frames after the one before's.
  */
 #include "kernel.h"
 #include "arch.h"
@@ -66,8 +71,11 @@
 #define PS_CLEAR_ENABLE (1u << 0)
 #define PS_SET_POWER    (1u << 8)
 
+#define ED_DIR_OUT (1u << 11)
+#define ED_DIR_IN  (2u << 11)
 #define ED_LS   (1u << 13)
 #define ED_SKIP (1u << 14)
+#define ED_ISO  (1u << 15)
 #define ED_HALTED 0x1u
 #define ED_CARRY  0x2u
 
@@ -84,6 +92,8 @@
 #define CC_UNDERRUN  9
 #define CC_NOTACCESSED 0xE
 
+#define ISO_QUEUE 8                     /* isochronous transfers in flight on an endpoint */
+
 struct ohci_td {
     volatile uint32_t info, cbp, next, be;
     struct ohci_td *snext;              /* this transfer's next descriptor */
@@ -93,6 +103,17 @@ struct ohci_td {
     uint16_t frame;
 };
 
+/* An isochronous descriptor: up to eight packets, one a frame, in the two
+ * pages of bp0 and be; psw[i] holds packet i's offset, then its result. */
+struct ohci_itd {
+    volatile uint32_t info, bp0, next, be;
+    volatile uint16_t psw[8];
+    struct ohci_itd *snext;             /* this transfer's next descriptor */
+    struct ohci_itd *rnext;             /* next retired chain */
+    uint16_t frame;
+    uint16_t npackets;
+};
+
 struct ohci_ed {
     volatile uint32_t info, tailp, headp, next;
     struct ohci_ed *sprev, *snext;      /* in its list */
@@ -100,7 +121,12 @@ struct ohci_ed {
     struct usb_xfer *xfer;
     struct ohci_td *tds;
     int type;
-    uint32_t pad[2];
+    /* isochronous: the empty descriptor at the tail, the transfers queued
+     * (oldest first, each one's descriptors chained from its hcpriv) */
+    struct ohci_itd *idummy;
+    struct usb_xfer *iso[ISO_QUEUE];
+    int iso_head, iso_n;
+    uint16_t next_frame;
 };
 
 struct ohci {
@@ -109,6 +135,7 @@ struct ohci {
     uint32_t *hcca;
     struct ohci_ed *head[3];            /* interrupt, control, bulk: dummy heads */
     struct ohci_td *reclaim;
+    struct ohci_itd *ireclaim;
     int dead;
 };
 
@@ -157,6 +184,24 @@ static void retire(struct ohci *o, struct ohci_td *tds)
     o->reclaim = tds;
 }
 
+static void free_ichain(struct ohci_itd *td)
+{
+    while (td) {
+        struct ohci_itd *n = td->snext;
+        usb_dma_free(td, sizeof(*td));
+        td = n;
+    }
+}
+
+static void iretire(struct ohci *o, struct ohci_itd *tds)
+{
+    if (!tds)
+        return;
+    tds->frame = frame_now(o);
+    tds->rnext = o->ireclaim;
+    o->ireclaim = tds;
+}
+
 static void reclaim(struct ohci *o)
 {
     uint16_t now = frame_now(o);
@@ -170,13 +215,23 @@ static void reclaim(struct ohci *o)
             pp = &td->rnext;
         }
     }
+    struct ohci_itd **ip = &o->ireclaim;
+    while (*ip) {
+        struct ohci_itd *td = *ip;
+        if ((uint16_t)(now - td->frame) >= 2 || o->dead) {
+            *ip = td->rnext;
+            free_ichain(td);
+        } else {
+            ip = &td->rnext;
+        }
+    }
 }
 
 /* ---- endpoint descriptors ---- */
 
 static int list_of(int type)
 {
-    return type == USB_EP_INTR ? 0 : type == USB_EP_CONTROL ? 1 : 2;
+    return type == USB_EP_INTR || type == USB_EP_ISO ? 0 : type == USB_EP_CONTROL ? 1 : 2;
 }
 
 static struct ohci_ed *ed_new(int type)
@@ -214,22 +269,183 @@ static struct ohci_ed *ep_ed(struct ohci *o, struct usb_dev *dev, struct usb_ep 
 {
     if (ep->hcpriv)
         return ep->hcpriv;
+    int iso = ep->type == USB_EP_ISO;
     struct ohci_ed *ed = ed_new(ep->type);
-    struct ohci_td *dummy = usb_dma_alloc(sizeof(struct ohci_td));
-    if (!ed || !dummy) {
+    struct ohci_td *dummy = iso ? NULL : usb_dma_alloc(sizeof(struct ohci_td));
+    struct ohci_itd *idummy = iso ? usb_dma_alloc(sizeof(struct ohci_itd)) : NULL;
+    if (!ed || (!dummy && !idummy)) {
         usb_dma_free(ed, sizeof(*ed));
         usb_dma_free(dummy, sizeof(*dummy));
+        usb_dma_free(idummy, sizeof(*idummy));
         return NULL;
     }
     ed->info = (uint32_t)dev->addr | (uint32_t)(ep->addr & 0xF) << 7 |
                (dev->speed == USB_SPEED_LOW ? ED_LS : 0) |
                (uint32_t)(ep->maxpacket ? ep->maxpacket : 8) << 16;
+    if (iso)                            /* isochronous descriptors carry no direction */
+        ed->info |= ED_ISO | ((ep->addr & USB_DIR_IN) ? ED_DIR_IN : ED_DIR_OUT);
     ed->dummy = dummy;
-    ed->tailp = (uint32_t)dummy;
-    ed->headp = (uint32_t)dummy;
+    ed->idummy = idummy;
+    ed->tailp = iso ? (uint32_t)idummy : (uint32_t)dummy;
+    ed->headp = ed->tailp;
     ed_link(o, ed);
     ep->hcpriv = ed;
     return ed;
+}
+
+/* ---- isochronous transfers ---- */
+
+/* OUT packets lie one after another in the buffer; IN packets maxpacket
+ * apart. A descriptor takes up to eight packets, as many as lie within
+ * two pages. */
+static int iso_submit(struct ohci *o, struct ohci_ed *ed, struct usb_xfer *x)
+{
+    struct usb_ep *ep = x->ep;
+    uint32_t mps = ep->maxpacket ? ep->maxpacket : 8;
+    int in = (ep->addr & USB_DIR_IN) != 0;
+    if (!x->npackets || x->npackets > USB_ISO_MAX_PACKETS || !x->iso_len || ep->interval > 1)
+        return -EINVAL;
+    if (ed->iso_n >= ISO_QUEUE)
+        return -EBUSY;
+    uint32_t addr[USB_ISO_MAX_PACKETS], a = (uint32_t)x->buf;
+    for (uint32_t i = 0; i < x->npackets; i++) {
+        if (in)
+            a = (uint32_t)x->buf + i * mps;
+        if (x->iso_len[i] > mps || a + x->iso_len[i] > (uint32_t)x->buf + x->len)
+            return -EINVAL;
+        addr[i] = a;
+        if (!in)
+            a += x->iso_len[i];
+    }
+    uint16_t now = frame_now(o), start = ed->next_frame;
+    int16_t ahead = (int16_t)(start - now);
+    if (!ed->iso_n || ahead < 2 || ahead > 1000)
+        start = (uint16_t)(now + 2);    /* idle, late, or absurd: soon */
+
+    /* The descriptor starting at packet p takes packets up to a page past p's. */
+    struct ohci_itd *tds[USB_ISO_MAX_PACKETS + 1];
+    int n = 0;
+    uint32_t first[USB_ISO_MAX_PACKETS], count[USB_ISO_MAX_PACKETS];
+    for (uint32_t p = 0; p < x->npackets; n++) {
+        uint32_t page = addr[p] & ~0xFFFu, k = 0;
+        while (p + k < x->npackets && k < 8) {
+            uint32_t slot = in ? mps : (x->iso_len[p + k] ? x->iso_len[p + k] : 1);
+            if (((addr[p + k] + slot - 1) & ~0xFFFu) > page + 0x1000)
+                break;
+            k++;
+        }
+        if (!k)
+            return -EINVAL;             /* a packet over two page ends */
+        first[n] = p;
+        count[n] = k;
+        p += k;
+    }
+    tds[0] = ed->idummy;                /* the transfer starts in the empty tail descriptor */
+    for (int i = 1; i <= n; i++) {
+        if (!(tds[i] = usb_dma_alloc(sizeof(struct ohci_itd)))) {
+            for (int k = 1; k < i; k++)
+                usb_dma_free(tds[k], sizeof(struct ohci_itd));
+            return -ENOMEM;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        struct ohci_itd *td = tds[i];
+        uint32_t p = first[i], k = count[i], last = p + k - 1;
+        uint32_t page = addr[p] & ~0xFFFu;
+        uint32_t end = in ? addr[last] + mps - 1 : addr[last] + (x->iso_len[last] ? x->iso_len[last] - 1 : 0);
+        td->info = (uint32_t)((start + p) & 0xFFFF) | (k - 1) << 24 | TD_NOINT |
+                   (uint32_t)CC_NOTACCESSED << 28;
+        td->bp0 = page;
+        td->be = end;
+        for (uint32_t j = 0; j < 8; j++)
+            td->psw[j] = j < k ? (uint16_t)(0xE000 | ((addr[p + j] - page) & 0x1FFF)) : 0;
+        td->npackets = (uint16_t)k;
+        td->snext = i + 1 < n ? tds[i + 1] : NULL;
+        td->next = (uint32_t)tds[i + 1];
+    }
+    tds[n - 1]->info &= ~TD_NOINT;
+    ed->idummy = tds[n];
+    int q = (ed->iso_head + ed->iso_n) % ISO_QUEUE;
+    ed->iso[q] = x;
+    ed->iso_n++;
+    ed->next_frame = (uint16_t)(start + x->npackets);
+    x->hcpriv = tds[0];
+    barrier();
+    ed->tailp = (uint32_t)tds[n];
+    return 0;
+}
+
+/* Is the oldest queued transfer done? Each descriptor's condition code is
+ * written when it retires; a packet's own is in its status word. */
+static int iso_check(struct usb_xfer *x)
+{
+    int in = (x->ep->addr & USB_DIR_IN) != 0;
+    for (struct ohci_itd *td = x->hcpriv; td; td = td->snext)
+        if (TD_CC(td->info) >= CC_NOTACCESSED)
+            return USB_PENDING;
+    uint32_t got = 0, i = 0;
+    for (struct ohci_itd *td = x->hcpriv; td; td = td->snext) {
+        for (uint32_t j = 0; j < td->npackets; j++, i++) {
+            uint16_t psw = td->psw[j];
+            int cc = psw >> 12;
+            uint32_t len = x->iso_len[i];
+            if (TD_CC(td->info) != CC_NOERROR || (cc != CC_NOERROR && cc != CC_UNDERRUN)) {
+                if (in)
+                    x->iso_len[i] = 0;
+                continue;
+            }
+            uint32_t n = in ? MIN((uint32_t)(psw & 0x7FF), len) : len;
+            if (in)
+                x->iso_len[i] = (uint16_t)n;
+            got += n;
+        }
+    }
+    x->actual = got;
+    return 0;
+}
+
+static void iso_poll(struct ohci *o, struct ohci_ed *ed, struct usb_xfer **done)
+{
+    while (ed->iso_n) {
+        struct usb_xfer *x = ed->iso[ed->iso_head];
+        if (iso_check(x) == USB_PENDING)
+            break;
+        iretire(o, x->hcpriv);
+        x->hcpriv = NULL;
+        ed->iso[ed->iso_head] = NULL;
+        ed->iso_head = (ed->iso_head + 1) % ISO_QUEUE;
+        ed->iso_n--;
+        x->status = 0;
+        x->hcnext = *done;
+        *done = x;
+    }
+}
+
+/* Every transfer queued on the endpoint (its descriptors chained together
+ * for the caller to free once the controller is past them). */
+static struct ohci_itd *iso_drop(struct ohci_ed *ed, int status)
+{
+    struct ohci_itd *chains = NULL;
+    while (ed->iso_n) {
+        struct usb_xfer *x = ed->iso[ed->iso_head];
+        ed->iso[ed->iso_head] = NULL;
+        ed->iso_head = (ed->iso_head + 1) % ISO_QUEUE;
+        ed->iso_n--;
+        struct ohci_itd *first = x->hcpriv, *last = first;
+        while (last && last->snext)
+            last = last->snext;
+        if (first) {
+            last->snext = chains;
+            chains = first;
+        }
+        x->hcpriv = NULL;
+        if (x->status == USB_PENDING) {
+            x->status = status;
+            if (status == -ENODEV)
+                wakeup(x);
+        }
+    }
+    return chains;
 }
 
 /* ---- transfers ---- */
@@ -253,11 +469,11 @@ static int ohci_submit(struct usb_hc *hc, struct usb_xfer *x)
 {
     struct ohci *o = hc->priv;
     struct usb_ep *ep = x->ep;
-    if (ep->type == USB_EP_ISO)
-        return -EINVAL;
     struct ohci_ed *ed = ep_ed(o, x->dev, ep);
     if (!ed)
         return -ENOMEM;
+    if (ep->type == USB_EP_ISO)
+        return iso_submit(o, ed, x);
     if (ed->xfer)
         return -EBUSY;
 
@@ -377,6 +593,10 @@ static void ohci_poll(struct usb_hc *hc)
     struct usb_xfer *done = NULL;
     for (int l = 0; l < 3; l++) {
         for (struct ohci_ed *ed = o->head[l]->snext; ed; ed = ed->snext) {
+            if (ed->type == USB_EP_ISO) {
+                iso_poll(o, ed, &done);
+                continue;
+            }
             if (!ed->xfer)
                 continue;
             uint32_t actual = 0;
@@ -404,7 +624,21 @@ static void ohci_cancel(struct usb_hc *hc, struct usb_xfer *x)
 {
     struct ohci *o = hc->priv;
     struct ohci_ed *ed = x->ep->hcpriv;
-    if (!ed || ed->xfer != x)
+    if (!ed)
+        return;
+    if (ed->type == USB_EP_ISO) {       /* cancelling one cancels the queue */
+        if (!ed->iso_n)
+            return;
+        ed->info |= ED_SKIP;
+        wait_frames(o);
+        struct ohci_itd *chains = iso_drop(ed, -ETIMEDOUT);
+        ed->headp = ed->tailp;
+        free_ichain(chains);
+        barrier();
+        ed->info &= ~ED_SKIP;
+        return;
+    }
+    if (ed->xfer != x)
         return;
     ed->info |= ED_SKIP;
     wait_frames(o);
@@ -446,8 +680,10 @@ static void ohci_dev_free(struct usb_hc *hc, struct usb_dev *dev)
             ed->xfer->status = -ENODEV;
             wakeup(ed->xfer);
         }
+        free_ichain(iso_drop(ed, -ENODEV));
         free_chain(ed->tds);
         usb_dma_free(ed->dummy, sizeof(struct ohci_td));
+        usb_dma_free(ed->idummy, sizeof(struct ohci_itd));
         usb_dma_free(ed, sizeof(*ed));
         eps[i]->hcpriv = NULL;
     }

@@ -96,7 +96,8 @@ says why.
     `readcache=0` disables it. Sequential small reads fetch ahead within a
     4 KiB block; bulk reads retain multi-sector disk commands.
 - USB: **UHCI, OHCI, EHCI and xHCI** controllers, hubs (up to five deep),
-  boot-protocol keyboards, HID mice and tablets, and Bulk-Only mass storage.
+  boot-protocol keyboards, HID mice and tablets, Bulk-Only mass storage and
+  **USB audio** playback (isochronous transfers on UHCI, OHCI and xHCI).
   Hot plugging via the `kusbd` thread; `lsusb` lists devices. Options:
   `usb=off`, `usb.poll`.
 - Filesystems: **FAT12/16/32** read/write (long names, all FATs kept in sync)
@@ -177,6 +178,16 @@ says why.
     stereo, except that plugging in headphones turns the speakers and line
     outs off (a line out turns the speakers off), where the jacks can sense
     it. `hda=off`.
+  - **USB audio** (USB Audio Class 1.0: headsets, DACs, speakers, QEMU's
+    `usb-audio`): output only. The device's best playback format is chosen
+    (16-bit stereo at 48 kHz when it has it; 44.1 kHz and other rates and
+    sample sizes work too, and a device with its own clock is followed
+    through its feedback endpoint), with the feature unit's volume and mute
+    on `/dev/mixer`. While it is plugged in it is `/dev/dsp` and
+    `/dev/mixer`: the built-in card's nodes are pointed at it (unless they
+    are open) and given back when it goes, and it is also `/dev/dsp1`.
+    `usbaudio=secondary` leaves `/dev/dsp` to the built-in card;
+    `usbaudio=off`. `make run-usb-audio` tries it in QEMU.
 - Networking: NE2000 (PCI and ISA), **nVidia nForce** ("forcedeth", `eth0`,
   with MII PHY support) and **Intel I217-LM/V** gigabit (the Haswell 8-series
   chipsets' MAC; "e1000e", shares the PHY with the Management Engine,
@@ -939,7 +950,10 @@ cannot be used.
   touchpads other than Synaptics have no scrolling.
 - **SATA:** AHCI only, no NCQ, port multipliers or hot plugging; a controller
   above 4 GiB can't be reached.
-- **USB:** no isochronous transfers or UAS, only LUN 0 of mass storage, no
+- **USB:** isochronous transfers only on UHCI, OHCI and xHCI (a USB audio
+  device on an EHCI port works where the chipset hands full-speed devices
+  to a companion controller, not behind an EHCI rate-matching hub); no UAS,
+  only LUN 0 of mass storage, no
   keyboard LEDs or power management, boot-protocol/plain HID devices only,
   interrupt endpoints polled every 1 ms, controllers above 4 GiB skipped,
   at most 32 devices on an xHCI controller. Unmount or `sync` before pulling
@@ -965,10 +979,12 @@ cannot be used.
   software won't run); text mode reports key presses without releases; every
   instruction is interpreted, so delay-loop timing runs fast; only the
   read-only DOS attribute is kept.
-- **Audio:** the Sound Blaster 16 (DSP 4) and HD Audio are output only, with
-  no MIDI and no mixing, so one program at a time has `/dev/dsp`; latency is
-  about 80 ms. HD Audio has no S/PDIF or HDMI, no microphone or line-in jack
-  sensing, and surround jacks repeat the front pair.
+- **Audio:** the Sound Blaster 16 (DSP 4), HD Audio and USB audio are output
+  only, with no MIDI and no mixing, so one program at a time has `/dev/dsp`;
+  latency is about 80 ms. HD Audio has no S/PDIF or HDMI, no microphone or
+  line-in jack sensing, and surround jacks repeat the front pair. USB audio
+  is Class 1.0 only (no USB Audio 2.0 devices), one device at a time, no
+  recording, and the first feature unit's controls are the volume.
 - **Network:** IPv4 only, one card, no IP fragments, no TCP congestion control
   or out-of-order buffering. forcedeth runs at 10/100 Mbit/s without offload,
   VLANs, wake-on-LAN or MSI. HTTPS is TLS 1.3 (TLS_AES_128_GCM_SHA256; X25519, or

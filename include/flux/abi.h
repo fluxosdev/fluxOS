@@ -639,6 +639,7 @@ struct mixer_level {
 #define SOUNDF_OPL3    0x4      /* ... that is an OPL3 */
 #define SOUNDF_SPEAKER 0x8      /* the PC speaker (always) */
 #define SOUNDF_HDA     0x10     /* /dev/dsp is an HD Audio codec, not a Sound Blaster */
+#define SOUNDF_USB     0x20     /* /dev/dsp is a USB audio device */
 
 struct sound_info {
     char     card[32];          /* "Sound Blaster 16" */

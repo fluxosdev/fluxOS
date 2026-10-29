@@ -10,6 +10,10 @@
  * (Address Device), so the core's dev_init/dev_configure hooks do that
  * work here.
  *
+ * Isochronous endpoints take a queue of transfers, each packet an Isoch
+ * TRB that interrupts; every TRB asks to start as soon as possible, which
+ * on a running endpoint means the service interval after the one before.
+ *
  * The register window must lie below 4 GiB (this kernel has no PAE).
  */
 #include "kernel.h"
@@ -74,6 +78,7 @@
 #define TRB_SETUP       2
 #define TRB_DATA        3
 #define TRB_STATUS      4
+#define TRB_ISOCH       5
 #define TRB_LINK        6
 #define TRB_ENABLE_SLOT 9
 #define TRB_DISABLE_SLOT 10
@@ -94,6 +99,7 @@
 #define TRB_IOC   (1u << 5)
 #define TRB_IDT   (1u << 6)
 #define TRB_DIR_IN (1u << 16)
+#define TRB_SIA   (1u << 31)            /* isoch: start as soon as possible */
 #define TRB_TYPE(t) ((uint32_t)(t) << 10)
 
 #define CC_SUCCESS 1
@@ -105,6 +111,7 @@
 
 #define RING_TRBS 256                   /* one page; the last is the link back */
 #define MAX_XTRBS 8                     /* TRBs of one transfer */
+#define ISO_QUEUE 8                     /* isochronous transfers in flight on an endpoint */
 #define CMD_TIMEOUT 1000                /* ms */
 
 struct trb {
@@ -127,6 +134,11 @@ struct xep {
     uint32_t actual;                    /* control: data moved, from a short packet event */
     int short_seen;
     int halted;
+    /* isochronous: the transfers queued, oldest first; each one's first
+     * TRB is in its hcpriv and the rest follow it on the ring */
+    struct usb_xfer *iso[ISO_QUEUE];
+    int iso_head, iso_n;
+    uint16_t iso_seen[ISO_QUEUE];       /* packets with an event, per queued transfer */
 };
 
 struct xslot {
@@ -298,13 +310,68 @@ static struct xep *ep_of(struct xhci *x, int slot, int dci)
     return &x->slots[slot]->eps[dci];
 }
 
+/* The ring index of a TRB address, counting past the link. */
+static uint32_t ring_index(struct ring *r, uint32_t trb)
+{
+    return (trb - (uint32_t)r->trbs) / sizeof(struct trb);
+}
+
+/* An event for an isochronous endpoint: which queued transfer and packet
+ * it is for; the transfer is done when every packet has had its event. */
+static void iso_event(struct xep *ep, struct trb *ev, int cc, uint32_t residual,
+                      struct usb_xfer **done)
+{
+    for (int k = 0; k < ep->iso_n; k++) {
+        int q = (ep->iso_head + k) % ISO_QUEUE;
+        struct usb_xfer *xf = ep->iso[q];
+        uint32_t first = ring_index(&ep->ring, (uint32_t)xf->hcpriv);
+        uint32_t idx = ring_index(&ep->ring, ev->p0);
+        if (idx >= RING_TRBS - 1)
+            continue;
+        uint32_t i = (idx + (RING_TRBS - 1) - first) % (RING_TRBS - 1);
+        if (i >= xf->npackets)
+            continue;
+        uint32_t len = xf->iso_len[i];
+        if (cc == CC_SUCCESS || cc == CC_SHORT) {
+            uint32_t got = len - MIN(residual, len);
+            if (xf->ep->addr & USB_DIR_IN)
+                xf->iso_len[i] = (uint16_t)got;
+            xf->actual += got;
+        } else if (xf->ep->addr & USB_DIR_IN) {
+            xf->iso_len[i] = 0;
+        }
+        if (++ep->iso_seen[q] < xf->npackets)
+            return;
+        /* Finished, and so is everything queued before it (an event for
+         * which may have gone missing). */
+        for (int j = 0; j <= k; j++) {
+            struct usb_xfer *d = ep->iso[ep->iso_head];
+            ep->iso[ep->iso_head] = NULL;
+            ep->iso_seen[ep->iso_head] = 0;
+            ep->iso_head = (ep->iso_head + 1) % ISO_QUEUE;
+            ep->iso_n--;
+            d->status = 0;
+            d->hcnext = *done;
+            *done = d;
+        }
+        return;
+    }
+}
+
 static void transfer_event(struct xhci *x, struct trb *ev, struct usb_xfer **done)
 {
     int slot = ev->control >> 24, dci = (ev->control >> 16) & 0x1F;
     int cc = ev->status >> 24;
     uint32_t residual = ev->status & 0xFFFFFF;
     struct xep *ep = ep_of(x, slot, dci);
-    if (!ep || !ep->xfer)
+    if (!ep)
+        return;
+    if (ep->iso_n) {
+        if (ev->p0)                     /* ring underruns and overruns point at nothing */
+            iso_event(ep, ev, cc, residual, done);
+        return;
+    }
+    if (!ep->xfer)
         return;
     int i;
     for (i = 0; i < ep->ntrbs && ep->trb[i] != ev->p0; i++)
@@ -498,6 +565,46 @@ static int put_data(struct xep *ep, uint8_t *buf, uint32_t len, uint32_t mps, ui
     return 0;
 }
 
+/*
+ * Queue an isochronous transfer: an Isoch TRB per packet, each one
+ * interrupting, the first held back until all are on the ring. OUT
+ * packets lie one after another in the buffer; IN packets maxpacket apart.
+ */
+static int iso_submit(struct xhci *x, struct xslot *s, struct xep *ep, struct usb_xfer *xf)
+{
+    uint32_t mps = xf->ep->maxpacket ? xf->ep->maxpacket : 8;
+    int in = (xf->ep->addr & USB_DIR_IN) != 0;
+    if (!xf->npackets || xf->npackets > USB_ISO_MAX_PACKETS || !xf->iso_len)
+        return -EINVAL;
+    if (ep->iso_n >= ISO_QUEUE)
+        return -EBUSY;
+    uint32_t first = 0, a = (uint32_t)xf->buf;
+    for (uint32_t i = 0; i < xf->npackets; i++) {
+        uint32_t len = xf->iso_len[i];
+        if (in)
+            a = (uint32_t)xf->buf + i * mps;
+        if (len > mps || (a & 0xFFFF) + len > 0x10000 || a + len > (uint32_t)xf->buf + xf->len)
+            return -EINVAL;             /* a packet is one TRB: no 64 KiB crossing */
+        uint32_t pkts = len ? (len + mps - 1) / mps : 1;
+        uint32_t ctl = TRB_TYPE(TRB_ISOCH) | TRB_IOC | TRB_SIA | (in ? TRB_ISP : 0) | (pkts - 1) << 16;
+        uint32_t t = ring_put(&ep->ring, len ? a : 0, 0, len, ctl, i == 0);
+        if (i == 0)
+            first = t;
+        if (!in)
+            a += len;
+    }
+    int q = (ep->iso_head + ep->iso_n) % ISO_QUEUE;
+    ep->iso[q] = xf;
+    ep->iso_seen[q] = 0;
+    ep->iso_n++;
+    xf->hcpriv = (void *)first;
+    barrier();
+    ((struct trb *)first)->control ^= TRB_CYCLE;
+    barrier();
+    x->db[s->id] = (uint32_t)dci_of(xf->ep->addr);
+    return 0;
+}
+
 static int xhci_submit(struct usb_hc *hc, struct usb_xfer *xf)
 {
     struct xhci *x = hc->priv;
@@ -506,8 +613,10 @@ static int xhci_submit(struct usb_hc *hc, struct usb_xfer *xf)
         return -ENODEV;
     int dci = dci_of(xf->ep->addr);
     struct xep *ep = &s->eps[dci];
-    if (!ep->ring.trbs || xf->ep->type == USB_EP_ISO)
+    if (!ep->ring.trbs)
         return -EINVAL;
+    if (xf->ep->type == USB_EP_ISO)
+        return iso_submit(x, s, ep, xf);
     if (ep->xfer)
         return -EBUSY;
     if (ep->halted) {
@@ -551,6 +660,23 @@ static int xhci_submit(struct usb_hc *hc, struct usb_xfer *xf)
     return 0;
 }
 
+/* Drop an isochronous endpoint's queue: every transfer on it is cancelled. */
+static void iso_drop(struct xep *ep, int status)
+{
+    while (ep->iso_n) {
+        struct usb_xfer *d = ep->iso[ep->iso_head];
+        ep->iso[ep->iso_head] = NULL;
+        ep->iso_seen[ep->iso_head] = 0;
+        ep->iso_head = (ep->iso_head + 1) % ISO_QUEUE;
+        ep->iso_n--;
+        if (d->status == USB_PENDING) {
+            d->status = status;
+            if (status == -ENODEV)
+                wakeup(d);
+        }
+    }
+}
+
 static void xhci_cancel(struct usb_hc *hc, struct usb_xfer *xf)
 {
     struct xhci *x = hc->priv;
@@ -559,6 +685,14 @@ static void xhci_cancel(struct usb_hc *hc, struct usb_xfer *xf)
         return;
     int dci = dci_of(xf->ep->addr);
     struct xep *ep = &s->eps[dci];
+    if (xf->ep->type == USB_EP_ISO) {
+        if (!ep->iso_n)
+            return;
+        iso_drop(ep, -ETIMEDOUT);       /* cancelling one cancels the queue */
+        if (usb_can_wait())
+            ep_restart(x, s, dci);
+        return;
+    }
     if (ep->xfer != xf)
         return;
     ep->xfer = NULL;                    /* its events are ignored from now on */
@@ -574,6 +708,7 @@ static void slot_free(struct xhci *x, struct xslot *s)
             s->eps[i].xfer->status = -ENODEV;
             wakeup(s->eps[i].xfer);
         }
+        iso_drop(&s->eps[i], -ENODEV);
         if (s->eps[i].ring.trbs)
             ring_free(&s->eps[i].ring);
     }
@@ -593,12 +728,15 @@ static void setup_ep_ctx(struct xhci *x, struct xslot *s, struct usb_dev *dev, s
                     ep->type == USB_EP_BULK ? (in ? 6 : 2) :
                     ep->type == USB_EP_INTR ? (in ? 7 : 3) : (in ? 5 : 1);
     uint32_t mps = ep->maxpacket ? ep->maxpacket : 8;
+    int periodic = ep->type == USB_EP_INTR || ep->type == USB_EP_ISO;
     uint32_t burst = dev->speed == USB_SPEED_SUPER ? ep->burst :
-                     dev->speed == USB_SPEED_HIGH && ep->type == USB_EP_INTR ? ep->mult : 0;
+                     dev->speed == USB_SPEED_HIGH && periodic ? ep->mult : 0;
     uint32_t interval = 0;
-    if (ep->type == USB_EP_INTR) {
+    if (periodic) {
         if (dev->speed >= USB_SPEED_HIGH) {
             interval = ep->interval ? ep->interval - 1u : 0;
+        } else if (ep->type == USB_EP_ISO) {
+            interval = 2u + (ep->interval ? ep->interval : 1);   /* 2^(bInterval-1) ms */
         } else {
             /* Milliseconds to 2^n microframes. */
             uint32_t uf = (ep->interval ? ep->interval : 1) * 8u;
@@ -608,13 +746,58 @@ static void setup_ep_ctx(struct xhci *x, struct xslot *s, struct usb_dev *dev, s
         }
         interval = MIN(interval, 15u);
     }
+    uint32_t cerr = ep->type == USB_EP_ISO ? 0 : 3;     /* isochronous packets are not retried */
     c[0] = interval << 16;
-    c[1] = 3u << 1 | type << 3 | burst << 8 | mps << 16;
+    c[1] = cerr << 1 | type << 3 | burst << 8 | mps << 16;
     c[2] = ring_deq_ptr(&s->eps[dci].ring);
     c[3] = 0;
-    uint32_t esit = ep->type == USB_EP_INTR ? mps * (burst + 1) : 0;
-    c[4] = (ep->type == USB_EP_CONTROL ? 8u : ep->type == USB_EP_INTR ? MIN(mps, 1024u) : 3072u) |
+    uint32_t esit = periodic ? mps * (burst + 1) : 0;
+    c[4] = (ep->type == USB_EP_CONTROL ? 8u : periodic ? MIN(mps, 1024u) : 3072u) |
            (esit & 0xFFFF) << 16;
+}
+
+/* An endpoint of another alternate setting: its ring and context, added
+ * to the device's configuration. */
+static int xhci_ep_enable(struct usb_hc *hc, struct usb_dev *dev, struct usb_ep *ep)
+{
+    struct xhci *x = hc->priv;
+    struct xslot *s = dev->hcpriv;
+    if (!s || x->dead)
+        return -ENODEV;
+    int dci = dci_of(ep->addr);
+    struct xep *xe = &s->eps[dci];
+    if (xe->xfer || xe->iso_n)
+        return -EBUSY;
+    if (!xe->ring.trbs && ring_init(&xe->ring) < 0)
+        return -ENOMEM;
+    ring_reset(&xe->ring);
+    setup_ep_ctx(x, s, dev, ep);
+    uint32_t *sc = slot_ctx(x, in_dev(x, s));
+    int maxdci = MAX((int)(slot_ctx(x, s->out)[0] >> 27), dci);
+    sc[0] = (sc[0] & ~(0x1Fu << 27)) | (uint32_t)maxdci << 27;
+    in_ctrl(x, s)[0] = 0;
+    in_ctrl(x, s)[1] = 1u | 1u << dci;
+    return command(x, (uint32_t)s->in, 0, TRB_TYPE(TRB_CONFIG_EP) | (uint32_t)s->id << 24,
+                   NULL) == CC_SUCCESS ? 0 : -EIO;
+}
+
+static void xhci_ep_disable(struct usb_hc *hc, struct usb_dev *dev, struct usb_ep *ep)
+{
+    struct xhci *x = hc->priv;
+    struct xslot *s = dev->hcpriv;
+    if (!s || x->dead)
+        return;
+    int dci = dci_of(ep->addr);
+    struct xep *xe = &s->eps[dci];
+    if (!xe->ring.trbs)
+        return;
+    iso_drop(xe, -ETIMEDOUT);
+    xe->xfer = NULL;
+    in_ctrl(x, s)[0] = 1u << dci;       /* drop */
+    in_ctrl(x, s)[1] = 1u;
+    command(x, (uint32_t)s->in, 0, TRB_TYPE(TRB_CONFIG_EP) | (uint32_t)s->id << 24, NULL);
+    ring_reset(&xe->ring);
+    xe->halted = 0;
 }
 
 static int xhci_dev_init(struct usb_hc *hc, struct usb_dev *dev)
@@ -817,6 +1000,8 @@ static const struct usb_hc_ops xhci_ops = {
     .dev_hub = xhci_dev_hub,
     .dev_free = xhci_dev_free,
     .ep_reset = xhci_ep_reset,
+    .ep_enable = xhci_ep_enable,
+    .ep_disable = xhci_ep_disable,
     .suspend = xhci_suspend,
     .resume = xhci_resume,
 };

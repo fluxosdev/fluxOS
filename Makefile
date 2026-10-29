@@ -328,6 +328,16 @@ QEMU_USB ?= -usb -device usb-kbd,bus=usb-bus.0 -device usb-mouse,bus=usb-bus.0 \
 run-usb: $(ISO) $(DISK)
 	$(QEMU) $(QEMU_CPU) -smp $(QEMU_SMP) -m 1G -serial stdio -boot d -cdrom $(ISO) $(QEMU_NET) $(QEMU_SND) $(QEMU_USB)
 
+# A USB audio device (USB Audio Class 1.0, 48 kHz stereo) on a UHCI controller, and no Sound
+# Blaster, so it is /dev/dsp. QEMU_USB_AUDIO_BUS="-device qemu-xhci,id=xhci" USB_AUDIO_BUS=xhci.0
+# puts it on an xHCI controller instead.
+QEMU_USB_AUDIO_BUS ?= -usb
+USB_AUDIO_BUS ?= usb-bus.0
+QEMU_USB_AUDIO ?= $(QEMU_AUDIO) $(QEMU_USB_AUDIO_BUS) -device usb-audio,audiodev=snd0,bus=$(USB_AUDIO_BUS)
+
+run-usb-audio: $(ISO) $(DISK)
+	$(QEMU) $(QEMU_CPU) -smp $(QEMU_SMP) -m 1G -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK) $(QEMU_NET) $(QEMU_USB_AUDIO)
+
 clean:
 	rm -rf $(BUILD) $(ISO)
 

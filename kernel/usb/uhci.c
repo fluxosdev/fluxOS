@@ -9,6 +9,10 @@
  * transfer descriptors (one per packet) off it. Data toggles are kept
  * here, in the endpoint. Descriptors the controller may still be
  * reading are freed two frames after they are done with.
+ *
+ * Isochronous transfers put a descriptor per packet straight into the
+ * frames they are for, ahead of the queue heads; an endpoint's transfers
+ * queue up, each one's packets in the frames after the one before's.
  */
 #include "kernel.h"
 #include "arch.h"
@@ -55,6 +59,7 @@
 #define TD_ERR     (0x76u << 16)        /* stalled, buffer, babble, CRC/timeout, bitstuff */
 #define TD_BADPKT  (0x36u << 16)        /* the same, less stalled: a broken packet */
 #define TD_IOC     (1u << 24)
+#define TD_IOS     (1u << 25)           /* isochronous: no retries, executed once */
 #define TD_LS      (1u << 26)
 #define TD_CERR3   (3u << 27)
 #define TD_SPD     (1u << 29)
@@ -69,8 +74,11 @@ struct uhci_td {
     struct uhci_td *rnext;              /* next retired chain */
     uint16_t len;
     uint16_t frame;                     /* the frame its chain was retired in */
-    uint8_t is_data, is_in, pad[2];
+    uint8_t is_data, is_in;
+    uint16_t sched;                     /* isochronous: the frame it is in */
 };
+
+#define ISO_QUEUE 8                     /* isochronous transfers in flight on an endpoint */
 
 struct uhci_qh {
     volatile uint32_t link, elem;
@@ -78,6 +86,12 @@ struct uhci_qh {
     struct usb_xfer *xfer;
     struct uhci_td *tds;
     int type;
+    /* isochronous endpoints (not in the chain): the transfers queued,
+     * oldest first, each one's descriptors chained from its hcpriv */
+    struct usb_xfer *iso[ISO_QUEUE];
+    int iso_head, iso_n;
+    uint16_t next_frame;                /* where the next transfer's packets go */
+    struct uhci_qh *isonext;            /* the controller's isochronous endpoints */
 };
 
 struct uhci {
@@ -86,6 +100,7 @@ struct uhci {
     uint16_t io;
     uint32_t *frames;
     struct uhci_qh *skel[3];            /* interrupt, control, bulk */
+    struct uhci_qh *isos;
     struct uhci_td *reclaim;            /* chains waiting to be freed */
     int halted;
 };
@@ -188,10 +203,177 @@ static struct uhci_qh *ep_qh(struct uhci *u, struct usb_ep *ep)
         struct uhci_qh *qh = qh_new(ep->type);
         if (!qh)
             return NULL;
-        qh_link(u, qh);
+        if (ep->type == USB_EP_ISO) {
+            qh->isonext = u->isos;      /* only bookkeeping: its packets go in the frames */
+            u->isos = qh;
+        } else {
+            qh_link(u, qh);
+        }
         ep->hcpriv = qh;
     }
     return ep->hcpriv;
+}
+
+/* ---- isochronous transfers ---- */
+
+static struct uhci_td *td_new(struct usb_dev *dev, struct usb_ep *ep, int pid, int toggle,
+                              void *buf, uint32_t len);
+
+/* Take a packet's descriptor out of its frame's list (which ends at the skeleton). */
+static void iso_unlink(struct uhci *u, struct uhci_td *td)
+{
+    volatile uint32_t *pp = &u->frames[td->sched & 1023];
+    while (!(*pp & (LP_T | LP_QH))) {
+        struct uhci_td *t = (struct uhci_td *)(*pp & ~0xFu);
+        if (t == td) {
+            *pp = td->link;
+            return;
+        }
+        pp = &t->link;
+    }
+}
+
+/* OUT packets lie one after another in the buffer; IN packets maxpacket apart. */
+static int iso_submit(struct uhci *u, struct uhci_qh *qh, struct usb_xfer *x)
+{
+    struct usb_ep *ep = x->ep;
+    struct usb_dev *dev = x->dev;
+    uint32_t mps = ep->maxpacket ? ep->maxpacket : 8;
+    int in = (ep->addr & USB_DIR_IN) != 0;
+    if (!x->npackets || x->npackets > USB_ISO_MAX_PACKETS || !x->iso_len || ep->interval > 1)
+        return -EINVAL;
+    if (qh->iso_n >= ISO_QUEUE)
+        return -EBUSY;
+    uint16_t now = frame_now(u), start = qh->next_frame;
+    uint16_t ahead = (uint16_t)((start - now) & 0x7FF);
+    if (!qh->iso_n || ahead < 2 || ahead > 1000)
+        start = (uint16_t)((now + 2) & 0x7FF);         /* idle, late, or absurd: soon */
+
+    struct uhci_td *first = NULL, *last = NULL;
+    uint32_t a = (uint32_t)x->buf;
+    for (uint32_t i = 0; i < x->npackets; i++) {
+        uint32_t len = x->iso_len[i];
+        if (in)
+            a = (uint32_t)x->buf + i * mps;
+        if (len > mps || a + len > (uint32_t)x->buf + x->len) {
+            free_chain(first);
+            return -EINVAL;
+        }
+        struct uhci_td *td = td_new(dev, ep, in ? PID_IN : PID_OUT, 0, (void *)a, len);
+        if (!td) {
+            free_chain(first);
+            return -ENOMEM;
+        }
+        td->ctrl = TD_ACTIVE | TD_IOS;
+        td->is_data = 1;
+        td->sched = (uint16_t)((start + i) & 0x7FF);
+        if (last)
+            last->next = td;
+        else
+            first = td;
+        last = td;
+        if (!in)
+            a += len;
+    }
+    last->ctrl |= TD_IOC;
+    int q = (qh->iso_head + qh->iso_n) % ISO_QUEUE;
+    qh->iso[q] = x;
+    qh->iso_n++;
+    qh->next_frame = (uint16_t)((start + x->npackets) & 0x7FF);
+    x->hcpriv = first;
+    barrier();
+    for (struct uhci_td *td = first; td; td = td->next) {   /* ahead of the frame's queue heads */
+        td->link = u->frames[td->sched & 1023];
+        barrier();
+        u->frames[td->sched & 1023] = phys(td);
+    }
+    return 0;
+}
+
+/* Is the oldest queued transfer done? A packet whose frame went by while
+ * it was still active was never reached: it counts as lost. */
+static int iso_check(struct uhci *u, struct usb_xfer *x)
+{
+    uint16_t now = frame_now(u);
+    int in = (x->ep->addr & USB_DIR_IN) != 0;
+    for (struct uhci_td *td = x->hcpriv; td; td = td->next) {
+        uint16_t gone = (uint16_t)((now - td->sched) & 0x7FF);
+        if ((td->ctrl & TD_ACTIVE) && (gone < 2 || gone > 1000))
+            return USB_PENDING;
+    }
+    uint32_t got = 0, i = 0;
+    for (struct uhci_td *td = x->hcpriv; td; td = td->next, i++) {
+        uint32_t c = td->ctrl;
+        iso_unlink(u, td);
+        if (c & (TD_ACTIVE | TD_ERR)) {
+            if (in)
+                x->iso_len[i] = 0;
+            continue;
+        }
+        uint32_t n = (c + 1) & 0x7FF;
+        if (in)
+            x->iso_len[i] = (uint16_t)n;
+        got += n;
+    }
+    x->actual = got;
+    return 0;
+}
+
+static void iso_poll(struct uhci *u, struct usb_xfer **done)
+{
+    for (struct uhci_qh *qh = u->isos; qh; qh = qh->isonext) {
+        while (qh->iso_n) {
+            struct usb_xfer *x = qh->iso[qh->iso_head];
+            if (iso_check(u, x) == USB_PENDING)
+                break;
+            retire(u, x->hcpriv);
+            x->hcpriv = NULL;
+            qh->iso[qh->iso_head] = NULL;
+            qh->iso_head = (qh->iso_head + 1) % ISO_QUEUE;
+            qh->iso_n--;
+            x->status = 0;
+            x->hcnext = *done;
+            *done = x;
+        }
+    }
+}
+
+/* Every transfer queued on the endpoint, out of the frames; freed by the
+ * caller once the controller is past them. */
+static struct uhci_td *iso_drop(struct uhci *u, struct uhci_qh *qh, int status)
+{
+    struct uhci_td *chains = NULL;
+    while (qh->iso_n) {
+        struct usb_xfer *x = qh->iso[qh->iso_head];
+        qh->iso[qh->iso_head] = NULL;
+        qh->iso_head = (qh->iso_head + 1) % ISO_QUEUE;
+        qh->iso_n--;
+        struct uhci_td *first = x->hcpriv, *last = first;
+        for (struct uhci_td *td = first; td; td = td->next) {
+            iso_unlink(u, td);
+            last = td;
+        }
+        if (first) {
+            last->next = chains;
+            chains = first;
+        }
+        x->hcpriv = NULL;
+        if (x->status == USB_PENDING) {
+            x->status = status;
+            if (status == -ENODEV)
+                wakeup(x);
+        }
+    }
+    return chains;
+}
+
+static void iso_qh_remove(struct uhci *u, struct uhci_qh *qh)
+{
+    struct uhci_qh **pp = &u->isos;
+    while (*pp && *pp != qh)
+        pp = &(*pp)->isonext;
+    if (*pp)
+        *pp = qh->isonext;
 }
 
 /* ---- transfers ---- */
@@ -217,11 +399,11 @@ static int uhci_submit(struct usb_hc *hc, struct usb_xfer *x)
     struct uhci *u = hc->priv;
     struct usb_ep *ep = x->ep;
     struct usb_dev *dev = x->dev;
-    if (ep->type == USB_EP_ISO)
-        return -EINVAL;
     struct uhci_qh *qh = ep_qh(u, ep);
     if (!qh)
         return -ENOMEM;
+    if (ep->type == USB_EP_ISO)
+        return iso_submit(u, qh, x);
     if (qh->xfer)
         return -EBUSY;
 
@@ -355,6 +537,7 @@ static void uhci_poll(struct usb_hc *hc)
             done = x;
         }
     }
+    iso_poll(u, &done);
     while (done) {
         struct usb_xfer *x = done;
         done = x->hcnext;
@@ -366,7 +549,15 @@ static void uhci_cancel(struct usb_hc *hc, struct usb_xfer *x)
 {
     struct uhci *u = hc->priv;
     struct uhci_qh *qh = x->ep->hcpriv;
-    if (!qh || qh->xfer != x)
+    if (!qh)
+        return;
+    if (x->ep->type == USB_EP_ISO) {    /* cancelling one cancels the queue */
+        struct uhci_td *chains = iso_drop(u, qh, -ETIMEDOUT);
+        wait_frames(u);
+        free_chain(chains);
+        return;
+    }
+    if (qh->xfer != x)
         return;
     qh->elem = LP_T;
     wait_frames(u);
@@ -387,15 +578,29 @@ static void uhci_dev_free(struct usb_hc *hc, struct usb_dev *dev)
     eps[0] = &dev->ep0;
     for (int i = 0; i < 32; i++)
         eps[i + 1] = &dev->eps[i];
+    struct uhci_td *iso_chains = NULL;
     for (int i = 0; i < 33; i++) {
-        if (eps[i]->hcpriv) {
-            qh_unlink(eps[i]->hcpriv);
-            unlinked = 1;
+        struct uhci_qh *qh = eps[i]->hcpriv;
+        if (!qh)
+            continue;
+        if (qh->type == USB_EP_ISO) {
+            struct uhci_td *c = iso_drop(u, qh, -ENODEV), *last = c;
+            while (last && last->next)
+                last = last->next;
+            if (last) {
+                last->next = iso_chains;
+                iso_chains = c;
+            }
+            iso_qh_remove(u, qh);
+        } else {
+            qh_unlink(qh);
         }
+        unlinked = 1;
     }
     if (!unlinked)
         return;
     wait_frames(u);
+    free_chain(iso_chains);
     for (int i = 0; i < 33; i++) {
         struct uhci_qh *qh = eps[i]->hcpriv;
         if (!qh)
