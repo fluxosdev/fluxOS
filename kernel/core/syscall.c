@@ -77,10 +77,38 @@ static int copy_str(char *dst, const char *src, uint32_t max)
     return -ENAMETOOLONG;
 }
 
+/* A user path, copied into one of the thread's path buffers (allocated the first time and kept:
+ * PATH_MAX is too much for the kernel stack, and a system call wants up to three). */
+static int path_buf(char **out)
+{
+    struct proc *p = current;
+    if (p->npaths >= 3)
+        return -ENOMEM;
+    char *b = p->paths[p->npaths];
+    if (!b && !(b = p->paths[p->npaths] = kmalloc(PATH_MAX)))
+        return -ENOMEM;
+    p->npaths++;
+    *out = b;
+    return 0;
+}
+
+static int user_path(char **out, uint32_t uptr)
+{
+    char *b;
+    int r = path_buf(&b);
+    if (r < 0)
+        return r;
+    r = copy_str(b, (const char *)uptr, PATH_MAX);
+    if (r < 0)
+        return r;
+    *out = b;
+    return 0;
+}
+
 #define COPY_PATH(var, uptr)                            \
-    char var[PATH_MAX];                                 \
+    char *var;                                          \
     do {                                                \
-        int _r = copy_str(var, (const char *)(uptr), PATH_MAX); \
+        int _r = user_path(&var, (uint32_t)(uptr));     \
         if (_r < 0)                                     \
             return _r;                                  \
     } while (0)
@@ -255,6 +283,110 @@ static int sys_tkill(uint32_t tid, uint32_t sig, uint32_t c, uint32_t d, uint32_
 {
     (void)c; (void)d; (void)e;
     return do_tkill((int)tid, (int)sig);
+}
+
+/* ---- interval timers, signal stacks, sessions ---- */
+
+static uint32_t ms_to_ticks(uint32_t ms)
+{
+    uint32_t t = ((uint64_t)ms * HZ + 999) / 1000;
+    return ms && !t ? 1 : t;
+}
+
+static int sys_setitimer(uint32_t which, uint32_t uvalue, uint32_t uold, uint32_t d, uint32_t e)
+{
+    (void)d; (void)e;
+    struct flux_itimer v = { 0, 0 };
+    if (uvalue && copy_from_user(&v, (const void *)uvalue, sizeof(v)) < 0)
+        return -EFAULT;
+    if (uold && user_check_w((void *)uold, sizeof(v)) < 0)
+        return -EFAULT;
+    uint32_t ov, oi;
+    int r = proc_setitimer((int)which, ms_to_ticks(v.value_ms), ms_to_ticks(v.interval_ms), &ov, &oi);
+    if (r < 0)
+        return r;
+    if (uold) {
+        struct flux_itimer o = { ov * (1000 / HZ), oi * (1000 / HZ) };
+        if (copy_to_user((void *)uold, &o, sizeof(o)) < 0)
+            return -EFAULT;
+    }
+    return 0;
+}
+
+static int sys_getitimer(uint32_t which, uint32_t uout, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    if (user_check_w((void *)uout, sizeof(struct flux_itimer)) < 0)
+        return -EFAULT;
+    struct proc *g = current->leader;
+    struct flux_itimer o;
+    spin_lock(&sched_lock);
+    switch (which) {
+    case ITIMER_REAL:
+        o.value_ms = g->it_real_at ? ((int32_t)(g->it_real_at - ticks) > 0 ? g->it_real_at - ticks : 1) : 0;
+        o.interval_ms = g->it_real_interval;
+        break;
+    case ITIMER_VIRTUAL: o.value_ms = g->it_virt_left, o.interval_ms = g->it_virt_interval; break;
+    case ITIMER_PROF: o.value_ms = g->it_prof_left, o.interval_ms = g->it_prof_interval; break;
+    default:
+        spin_unlock(&sched_lock);
+        return -EINVAL;
+    }
+    spin_unlock(&sched_lock);
+    o.value_ms *= 1000 / HZ;
+    o.interval_ms *= 1000 / HZ;
+    return copy_to_user((void *)uout, &o, sizeof(o)) < 0 ? -EFAULT : 0;
+}
+
+static int sys_sigpending(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)a; (void)b; (void)c; (void)d; (void)e;
+    return (int)(__atomic_load_n(&current->sig_pending, __ATOMIC_RELAXED) & 0x7FFFFFFF);
+}
+
+static int sys_sigaltstack(uint32_t uss, uint32_t uold, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    struct proc *p = current;
+    struct flux_stack ss, old;
+    uint32_t sp = p->tf->useresp;
+    int on = p->alt_size && sp > p->alt_sp && sp <= p->alt_sp + p->alt_size;
+    old.sp = p->alt_sp;
+    old.size = p->alt_size;
+    old.flags = !p->alt_size ? SS_DISABLE : on ? SS_ONSTACK : 0;
+    if (uss) {
+        if (copy_from_user(&ss, (const void *)uss, sizeof(ss)) < 0)
+            return -EFAULT;
+        if (on)
+            return -EPERM;              /* not while running on it */
+        if (ss.flags & SS_DISABLE) {
+            p->alt_size = 0;
+        } else {
+            if (ss.flags & ~(uint32_t)SS_ONSTACK)
+                return -EINVAL;
+            if (ss.size < 2048)
+                return -ENOMEM;
+            if (ss.sp < USER_BASE || ss.sp >= USER_TOP || ss.size > USER_TOP - ss.sp)
+                return -EINVAL;
+            p->alt_sp = ss.sp;
+            p->alt_size = ss.size;
+        }
+    }
+    if (uold && copy_to_user((void *)uold, &old, sizeof(old)) < 0)
+        return -EFAULT;
+    return 0;
+}
+
+static int sys_setsid(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)a; (void)b; (void)c; (void)d; (void)e;
+    return do_setsid();
+}
+
+static int sys_getsid(uint32_t pid, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)b; (void)c; (void)d; (void)e;
+    return do_getsid((int)pid);
 }
 
 static int sys_kill(uint32_t pid, uint32_t sig, uint32_t c, uint32_t d, uint32_t e)
@@ -959,8 +1091,11 @@ static int sys_fchdir(uint32_t fd, uint32_t b, uint32_t c, uint32_t d, uint32_t 
 static int sys_getcwd(uint32_t ubuf, uint32_t size, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)c; (void)d; (void)e;
-    char path[PATH_MAX];
-    int r = vfs_getpath(current->leader->cwd, path, sizeof(path));
+    char *path;
+    int r = path_buf(&path);                    /* (a buffer of the thread's, for the answer) */
+    if (r < 0)
+        return r;
+    r = vfs_getpath(current->leader->cwd, path, PATH_MAX);
     if (r < 0)
         return r;
     uint32_t len = strlen(path) + 1;
@@ -1582,6 +1717,12 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_set_tls] = sys_set_tls,
     [SYS_gettid] = sys_gettid,
     [SYS_tkill] = sys_tkill,
+    [SYS_setitimer] = sys_setitimer,
+    [SYS_getitimer] = sys_getitimer,
+    [SYS_sigpending] = sys_sigpending,
+    [SYS_sigaltstack] = sys_sigaltstack,
+    [SYS_setsid] = sys_setsid,
+    [SYS_getsid] = sys_getsid,
     [SYS_getppid] = sys_getppid,
     [SYS_kill] = sys_kill,
     [SYS_mkdir] = sys_mkdir,
@@ -1675,6 +1816,7 @@ void syscall_dispatch(struct trapframe *tf)
     }
     current->in_syscall = (int)n;
     current->syscall_orig_eax = n;
+    current->npaths = 0;                /* its path buffers are free again */
     if (takes_vfs_lock[n])
         vfs_lock();
     tf->eax = (uint32_t)syscalls[n](tf->ebx, tf->ecx, tf->edx, tf->esi, tf->edi);

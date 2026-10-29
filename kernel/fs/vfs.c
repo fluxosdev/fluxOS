@@ -232,11 +232,14 @@ int vfs_resolve(const char *path, struct vnode *cwd, struct vnode **out)
 int vfs_resolve_parent(const char *path, struct vnode *cwd,
                        struct vnode **parent, char *name)
 {
-    char buf[PATH_MAX];
     if (!path || !*path)
         return -ENOENT;
-    if (strlcpy(buf, path, sizeof(buf)) >= sizeof(buf))
-        return -ENAMETOOLONG;
+    char *buf = kmalloc(PATH_MAX);      /* (the path copied, to cut at its last slash) */
+    if (!buf)
+        return -ENOMEM;
+    int r = -ENAMETOOLONG;
+    if (strlcpy(buf, path, PATH_MAX) >= PATH_MAX)
+        goto out;
 
     uint32_t len = strlen(buf);
     while (len > 1 && buf[len - 1] == '/')
@@ -244,7 +247,6 @@ int vfs_resolve_parent(const char *path, struct vnode *cwd,
 
     char *slash = strrchr(buf, '/');
     const char *base;
-    int r;
     if (!slash) {
         base = buf;
         r = vfs_resolve(".", cwd, parent);
@@ -259,15 +261,21 @@ int vfs_resolve_parent(const char *path, struct vnode *cwd,
         }
     }
     if (r < 0)
-        return r;
+        goto out;
+    r = -EINVAL;
     if (!*base || !strcmp(base, ".") || !strcmp(base, ".."))
-        return -EINVAL;
+        goto out;
+    r = -ENAMETOOLONG;
     if (strlen(base) > NAME_MAX)
-        return -ENAMETOOLONG;
+        goto out;
+    r = -ENOTDIR;
     if ((*parent)->type != VN_DIR)
-        return -ENOTDIR;
+        goto out;
     strcpy(name, base);
-    return 0;
+    r = 0;
+out:
+    kfree(buf);
+    return r;
 }
 
 int vfs_create(struct vnode *dir, const char *name, int type, struct vnode **out)
@@ -616,26 +624,32 @@ int vfs_dirent(struct vnode *dir, uint32_t index, struct dirent *de)
 
 int vfs_getpath(struct vnode *vn, char *buf, uint32_t size)
 {
-    char tmp[PATH_MAX];
-    uint32_t pos = sizeof(tmp) - 1;
-    tmp[pos] = 0;
-
     if (vn != vfs_root && !vn->linked)
         return -ENOENT;
+    char *tmp = kmalloc(PATH_MAX);      /* built from the end, backwards */
+    if (!tmp)
+        return -ENOMEM;
+    uint32_t pos = PATH_MAX - 1;
+    tmp[pos] = 0;
+    int r = 0;
     for (struct vnode *v = vn; v != vfs_root; v = v->parent) {
         uint32_t len = strlen(v->name);
-        if (len + 1 > pos)
-            return -ENAMETOOLONG;
+        if (len + 1 > pos) {
+            r = -ENAMETOOLONG;
+            break;
+        }
         pos -= len;
         memcpy(tmp + pos, v->name, len);
         tmp[--pos] = '/';
     }
-    if (pos == sizeof(tmp) - 1)
+    if (r == 0 && pos == PATH_MAX - 1)
         tmp[--pos] = '/';
-    if (sizeof(tmp) - pos > size)
-        return -ERANGE;
-    strcpy(buf, tmp + pos);
-    return 0;
+    if (r == 0 && PATH_MAX - pos > size)
+        r = -ERANGE;
+    if (r == 0)
+        strcpy(buf, tmp + pos);
+    kfree(tmp);
+    return r;
 }
 
 /* ---- mounting ---- */
@@ -914,9 +928,11 @@ int vfs_statfs(struct vnode *vn, struct statfs *st)
 int vfs_mounts_text(char *buf, uint32_t size)
 {
     uint32_t len = 0;
-    char line[PATH_MAX + 64], path[PATH_MAX];
+    char *line = kmalloc(2 * PATH_MAX + 64), *path = line ? line + PATH_MAX + 64 : NULL;
+    if (!line)
+        return -ENOMEM;
     if (!vfs_root->fs) {
-        snprintf(line, sizeof(line), "ramfs on / type ramfs (rw)\n");
+        snprintf(line, PATH_MAX + 64, "ramfs on / type ramfs (rw)\n");
         len = strlcpy(buf, line, size);
     } else if (size) {
         buf[0] = 0;
@@ -928,13 +944,14 @@ int vfs_mounts_text(char *buf, uint32_t size)
         order[n++] = fs;
     while (n-- > 0) {
         struct fs *fs = order[n];
-        if (vfs_getpath(fs->root, path, sizeof(path)) < 0)
+        if (vfs_getpath(fs->root, path, PATH_MAX) < 0)
             strcpy(path, "?");
-        snprintf(line, sizeof(line), "/dev/%s on %s type %s (%s)\n", fs->bd->name, path,
+        snprintf(line, PATH_MAX + 64, "/dev/%s on %s type %s (%s)\n", fs->bd->name, path,
                  fs->name, fs->readonly ? "ro" : "rw");
         if (len < size)
             len += strlcpy(buf + len, line, size - len);
     }
+    kfree(line);
     return (int)MIN(len, size);
 }
 

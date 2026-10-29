@@ -80,9 +80,9 @@ and nine `.S` files.
 |---|---|
 | A compiler that runs on fluxOS | the cross compiler exists; the native one (phase 4) does not |
 | `make`, `tar`, `gzip` (compress), `find`, `install`, `cmp`/`diff`, `sed` | none (`cp mkdir rm mv cat` exist) |
-| libc | since phase 2, enough for GNU make and binutils to build; still no threads, interval timers or real links |
+| libc | since phase 2, enough for GNU make and binutils to build; POSIX threads, interval timers, signal stacks and sessions since 2026-10-29; still no real links |
 | Filesystem | FAT32 only on disk: 2 s modification times (a target built within 2 s of editing its source looks up to date to `make`), no symbolic or hard links, cosmetic permissions, case-insensitive names |
-| Kernel limits | 64 processes, `PATH_MAX` 512 (descriptors, memory regions, stack and pipes raised in phase 2) |
+| Kernel limits | 128 processes and threads together; `PATH_MAX` 4096 since 2026-10-29 (descriptors, memory regions, stack and pipes raised in phase 2) |
 | Boot media | ISO 9660 writing, El Torito, GRUB's images |
 
 ## Decisions
@@ -117,9 +117,12 @@ second partition or disk; FAT32 stays the system's root. ext2 gives 1 s
 timestamps, permissions, hard and symbolic links and case-sensitive names,
 and it is the simplest format that has all four.
 
-**No threads, no dynamic linking.** GCC, binutils and make are built
-single-threaded and static (`--disable-threads --disable-shared`). Both
-stay out of this roadmap.
+**No dynamic linking.** GCC, binutils and make are built static
+(`--disable-shared`), and that stays out of this roadmap. Threads arrived
+on 2026-10-29 for the desktop's sake (kernel threads with futexes, POSIX
+threads in libc); the toolchain is still built `--disable-threads`, which
+keeps the Canadian cross simpler, but `libstdc++`'s `gthr` has something
+to stand on now.
 
 ## Phase 0: the POSIX floor (done)
 
@@ -250,20 +253,28 @@ Done:
       in-system part (stdio on files, popen, system, 256 descriptors, pipes,
       select, nanosleep, realpath, glob) as init in QEMU.
 
-Left:
+Left (the rest done 2026-10-29, built and host-tested, not yet run on the
+real kernel: `make test-libc-qemu` has the checks):
 
 - [x] `make test-libc-qemu` passes on the real kernel (2026-10-28), and a
       system built with this libc installs, boots and runs the desktop.
-- [ ] Run the cross-built `make`, `as` and `ld` on fluxOS.
-- [ ] `PATH_MAX` stays 512: the kernel copies paths onto its 16 KiB stacks
-      (`rename` holds three), so a larger one needs those buffers on the
-      heap first.
-- [ ] `link`, `symlink` and `readlink` answer as Linux does on vfat (no
-      links): real ones come with ext2 in phase 5.
-- [ ] No interval timers (`alarm`, `setitimer`) and no `sigpending`
-      answer from the kernel; `sigaltstack` is refused. GNU make and
-      binutils need none of them.
-- [ ] Sessions are process groups (`setsid` does not detach the terminal).
+- [x] The cross-built `make`, `as`, `ld`, `ar`, `nm`, `objcopy`, `objdump`,
+      `readelf`, `strip`, `size`, `strings` and `ranlib` are on the system
+      image in `/usr/bin` (`make ports`, `tools/ports/build.sh`, 11 MB
+      stripped). Running them there is the next check.
+- [x] `PATH_MAX` is 4096: a system call's paths are copied into up to
+      three heap buffers of the calling thread's (`user_path` in
+      `syscall.c`), and the VFS's own path buffers are on the heap too.
+- [x] `link`, `symlink` and `readlink` answer as Linux does on vfat
+      (`EPERM`, `EINVAL`): real ones come with ext2 in phase 5.
+- [x] Interval timers: `setitimer`/`getitimer` for `ITIMER_REAL`
+      (`SIGALRM`, from the timer tick), `ITIMER_VIRTUAL` (user time,
+      `SIGVTALRM`) and `ITIMER_PROF` (`SIGPROF`), in 10 ms steps; `alarm`
+      over them. `sigpending` from the kernel; `sigaltstack` with
+      `SA_ONSTACK` handlers run on it.
+- [x] Sessions: `setsid` starts one, drops the controlling terminal and
+      keeps `exec` from taking another; `getsid`; `setpgid` refuses a
+      session leader and a group of another session.
 
 ## Phase 3: make and the tools the Makefile runs
 
@@ -272,8 +283,9 @@ the way the Makefile uses it. Measured by running the Makefile's
 `rootfs`, `system.tar` and `tests/` targets natively with the cross-built
 compiler objects, before phase 4 lands.*
 
-- [ ] GNU make 4.4, cross-built with `./configure --host=i686-fluxos` (it
-      needs only the phase 2 libc, no `getloadavg`). The Makefile uses
+- [x] GNU make 4.4, cross-built with `./configure --host=i686-fluxos` (it
+      needs only the phase 2 libc, no `getloadavg`); on the image since
+      2026-10-29 (`make ports`), still to be run there. The Makefile uses
       `$(wildcard)`, `$(patsubst)`, `$(foreach)`, `$(shell)`,
       target-specific variables and `-MMD` includes throughout, so a
       smaller make is not an option.
@@ -459,8 +471,9 @@ tests on fluxOS before relying on any of it.
   phases 2 to 7 makes it closer; nothing in them depends on it.
 - **Dynamic linking** (`ld.so`, PIC, `dlopen`): nothing on the roadmap
   needs it; GCC plugins would.
-- **Threads:** the kernel schedules processes only; make `-j` and the
-  compilers do not need threads. The desktop's workers are processes.
+- **Threads in the toolchain:** fluxOS has threads since 2026-10-29, but
+  make `-j` and the compilers do not need them; the ports stay
+  `--disable-threads` until `libstdc++` wants `gthr` (stage 3).
 - **Networking in the loop:** a native `git` is a large port (or a small
   `git clone`/`pull` over HTTPS with the smart protocol, ~3k lines); the
   GitHub zip through `wget` and `unzip` serves until then.

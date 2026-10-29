@@ -7,10 +7,11 @@
  * main thread's is static and set up before main(); a new thread's sits at
  * the top of its stack, a mapping of its own with a guard page below.
  *
- * The kernel zeroes a thread's tid in its block when it ends and wakes
- * whoever waits on it there: that is what pthread_join() waits for, and
- * after it the stack (block and all) can go. A detached thread has the
- * kernel unmap its stack once it is off it.
+ * The kernel writes a thread's id into its block before it runs, zeroes
+ * it when the thread ends and wakes whoever waits on it there: that is
+ * what pthread_join() waits for, and after it the stack (block and all)
+ * can go. A detached thread has the kernel unmap its stack once it is off
+ * it, so nothing may touch its block once it has started.
  *
  * Locks are futexes: a word that is 0 when free, 1 when taken and 2 when
  * taken with someone waiting, so letting go costs a system call only when
@@ -50,7 +51,7 @@ void __init_tls(void)
 {
     struct __pthread *m = &__main_thread;
     m->self = m;
-    m->ktid = m->tid = sys4(SYS_gettid, 0, 0, 0, 0);
+    m->tid = sys4(SYS_gettid, 0, 0, 0, 0);
     m->state = T_JOINABLE;
     int sel = sys4(SYS_set_tls, (int)m, 0, 0, 0);
     if (sel > 0) {
@@ -178,7 +179,6 @@ void pthread_exit(void *result)
 /* A new thread starts here, on its own stack, with its block as the argument. */
 static void thread_entry(struct __pthread *self)
 {
-    self->ktid = sys4(SYS_gettid, 0, 0, 0, 0);
     pthread_exit(self->start(self->arg));
 }
 
@@ -208,7 +208,7 @@ int pthread_create(pthread_t *out, const pthread_attr_t *attr, void *(*start)(vo
     struct __pthread *t = (struct __pthread *)(((uintptr_t)top - sizeof(*t)) & ~(uintptr_t)15);
     memset(t, 0, sizeof(*t));
     t->self = t;
-    t->tid = -1;                        /* nonzero until the kernel says it has ended */
+    t->tid = -1;                        /* the kernel puts its id here before it runs */
     t->start = start;
     t->arg = arg;
     t->map = map;
@@ -222,6 +222,7 @@ int pthread_create(pthread_t *out, const pthread_attr_t *attr, void *(*start)(vo
     ((uint32_t *)(uintptr_t)base)[0] = (uint32_t)(uintptr_t)t;
     ((uint32_t *)(uintptr_t)base)[-1] = 0;
     __atomic_add_fetch(&live_threads, 1, __ATOMIC_ACQ_REL);
+    *out = t;                           /* before the thread exists: once it runs, t may be gone (detached) */
     int tid = sys4(SYS_thread_create, (int)thread_entry, (int)(base - 4), (int)t, (int)&t->tid);
     if (tid < 0) {
         __atomic_sub_fetch(&live_threads, 1, __ATOMIC_ACQ_REL);
@@ -229,8 +230,6 @@ int pthread_create(pthread_t *out, const pthread_attr_t *attr, void *(*start)(vo
             munmap(map, map_size);
         return -tid == ENOMEM ? EAGAIN : -tid;
     }
-    t->ktid = tid;
-    *out = t;
     return 0;
 }
 
@@ -275,7 +274,7 @@ int pthread_equal(pthread_t a, pthread_t b) { return a == b; }
 
 int pthread_kill(pthread_t t, int sig)
 {
-    int r = sys4(SYS_tkill, t->ktid, sig, 0, 0);
+    int r = sys4(SYS_tkill, t->tid, sig, 0, 0);
     return r < 0 ? -r : 0;
 }
 
@@ -418,7 +417,7 @@ void __fork_parent(void)
 void __fork_child(void)
 {
     struct __pthread *self = __self();
-    self->ktid = sys4(SYS_gettid, 0, 0, 0, 0);
+    self->tid = sys4(SYS_gettid, 0, 0, 0, 0);       /* the child's one thread has a new id */
     live_threads = 1;
     __rlock_give(&__stdio_lock);
     __rlock_give(&__malloc_lock);

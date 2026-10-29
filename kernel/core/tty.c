@@ -434,7 +434,7 @@ void tty_exec_attach(struct proc *p)
     if (major != TTY_MAJOR && !(major == PTY_MAJOR && !(MINOR(f->vn->rdev) & 1)))
         return;
     struct tty *t = vnode_tty(f->vn);
-    if (t == p->leader->ctty)
+    if (t == p->leader->ctty || p->leader->no_ctty)
         return;
     tty_drop(p->leader->ctty);
     p->leader->ctty = tty_hold(t);

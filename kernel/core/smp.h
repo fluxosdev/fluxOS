@@ -43,6 +43,7 @@ struct cpu {
     volatile int kicked;                /* sent VEC_RESCHED, not yet scheduled */
     volatile int tlb_flush;             /* asked to flush its TLB */
     uint32_t idle_ticks;                /* timer ticks it found itself idle */
+    int from_user;                      /* the latest interrupt or trap here came from user mode */
 } __attribute__((aligned(CPU_CACHE_LINE)));
 
 extern struct cpu cpus[MAX_CPUS];

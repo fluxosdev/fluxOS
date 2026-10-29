@@ -95,7 +95,13 @@
 #define SYS_set_tls     87  /* base: this thread's TLS segment; returns its selector */
 #define SYS_gettid      88
 #define SYS_tkill       89  /* thread id, signal */
+#define SYS_setitimer   90  /* ITIMER_*, const struct flux_itimer *value, struct flux_itimer *old */
+#define SYS_getitimer   91  /* ITIMER_*, struct flux_itimer *out */
+#define SYS_sigpending  92  /* the calling thread's pending signals, as a mask */
+#define SYS_sigaltstack 93  /* const struct flux_stack *ss, struct flux_stack *old */
+#define SYS_setsid      94
+#define SYS_getsid      95  /* pid */
 
-#define NSYSCALLS       90
+#define NSYSCALLS       96
 
 #endif

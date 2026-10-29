@@ -5,11 +5,16 @@
 struct cpu cpus[MAX_CPUS];
 int ncpus;
 volatile uint32_t ticks;
+int smp_wake_idle(int preferred) { (void)preferred; return 0; }
+int smp_wake_cpu(int cpu) { (void)cpu; return 0; }
+void smp_kick_proc(struct proc *p) { (void)p; }
 
 static void reset(int cores)
 {
     memset(procs, 0, sizeof(procs));
     memset(cpus, 0, sizeof(cpus));
+    for (int i = 0; i < MAX_PROCS; i++)
+        procs[i].leader = &procs[i];    /* each a process of one thread */
     ncpus = cores;
     ticks = 100;
     cpus[0].idle = &procs[0];

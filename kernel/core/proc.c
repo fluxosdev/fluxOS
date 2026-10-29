@@ -43,6 +43,7 @@
 
 struct proc procs[MAX_PROCS];
 static struct proc *init_proc;
+static void signal_locked(struct proc *p, int sig);
 static int next_pid = 1;
 spinlock_t sched_lock = SPINLOCK_INIT("sched");
 
@@ -300,8 +301,17 @@ void proc_tick_on_cpu(struct cpu *c)
         c->idle_ticks++;
         return;
     }
-    else
-        c->proc->cpu_ticks++;
+    c->proc->cpu_ticks++;
+    /* The process's time: the profiling timer counts every tick, the virtual one those in user mode. */
+    struct proc *g = c->proc->leader;
+    if (g->it_prof_left && --g->it_prof_left == 0) {
+        g->it_prof_left = g->it_prof_interval;
+        signal_locked(g, SIGPROF);
+    }
+    if (c->from_user && g->it_virt_left && --g->it_virt_left == 0) {
+        g->it_virt_left = g->it_virt_interval;
+        signal_locked(g, SIGVTALRM);
+    }
     if (--c->slice <= 0) {
         c->slice = QUANTUM;
         c->resched = 1;
@@ -325,6 +335,10 @@ void proc_tick(void)
         if ((p->state == P_SLEEPING || (p->state == P_BLOCKED && p->timed)) &&
             (int32_t)(ticks - p->wake_tick) >= 0)
             make_ready(p);
+        if (p->it_real_at && p->leader == p && p->state != P_UNUSED && (int32_t)(ticks - p->it_real_at) >= 0) {
+            p->it_real_at = p->it_real_interval ? ticks + p->it_real_interval : 0;
+            signal_locked(p, SIGALRM);
+        }
     }
     proc_tick_on_cpu(this_cpu());
     smp_tick();
@@ -475,6 +489,30 @@ int sleep_ticks_intr(uint32_t n)
     return sleep_ticks_common(n, 1);
 }
 
+int proc_setitimer(int which, uint32_t value, uint32_t interval, uint32_t *old_value, uint32_t *old_interval)
+{
+    struct proc *g = current->leader;
+    uint32_t *left, *every;
+    switch (which) {
+    case ITIMER_REAL: left = &g->it_real_at, every = &g->it_real_interval; break;
+    case ITIMER_VIRTUAL: left = &g->it_virt_left, every = &g->it_virt_interval; break;
+    case ITIMER_PROF: left = &g->it_prof_left, every = &g->it_prof_interval; break;
+    default: return -EINVAL;
+    }
+    spin_lock(&sched_lock);
+    if (which == ITIMER_REAL) {
+        *old_value = *left && (int32_t)(*left - ticks) > 0 ? *left - ticks : *left ? 1 : 0;
+        *left = value ? ticks + value : 0;
+    } else {
+        *old_value = *left;
+        *left = value;
+    }
+    *old_interval = *every;
+    *every = value ? interval : 0;
+    spin_unlock(&sched_lock);
+    return 0;
+}
+
 /* Give p (current, or one not running) the address space pd; returns the
  * one it had, now loaded nowhere and free to destroy. */
 uint32_t *proc_set_pd(struct proc *p, uint32_t *pd)
@@ -494,7 +532,7 @@ void proc_spawn_init(const char *path)
     if (!p)
         panic("cannot allocate init process");
     setup_kstack(p, NULL);
-    p->pgid = p->pid;
+    p->pgid = p->sid = p->pid;
     p->leader->umask = 022;
     p->leader->cwd = vfs_root;
     vfs_ref(vfs_root);
@@ -537,7 +575,7 @@ void proc_spawn_kthread(const char *name, void (*fn)(void))
     tf->eflags = 0x202;                         /* IF set */
     tf->eip = (uint32_t)fn;
     p->kthread = 1;
-    p->pgid = p->pid;
+    p->pgid = p->sid = p->pid;
     strlcpy(p->name, name, sizeof(p->name));
     spin_lock(&sched_lock);
     make_ready(p);
@@ -582,6 +620,10 @@ int do_fork(void)
 
     child->ppid = g->pid;                       /* only the calling thread goes on in the child */
     child->pgid = parent->pgid;
+    child->sid = g->sid;
+    child->no_ctty = g->no_ctty;
+    child->alt_sp = parent->alt_sp;
+    child->alt_size = parent->alt_size;
     for (int i = 0; i < MAX_FDS; i++)
         child->leader->fds[i] = file_dup(parent->leader->fds[i]);
     memcpy(child->leader->fd_cloexec, parent->leader->fd_cloexec, sizeof(child->leader->fd_cloexec));
@@ -619,9 +661,20 @@ static void wake_futex(uint32_t addr);
 
 /* The calling thread ends, and others of its process go on (sched_lock is let go by the switch away). */
 static void exit_this_thread(struct proc *p) __attribute__((noreturn));
+/* The path buffers of a thread that is ending (syscall.c's). */
+static void free_paths(struct proc *p)
+{
+    for (int i = 0; i < 3; i++) {
+        kfree(p->paths[i]);
+        p->paths[i] = NULL;
+    }
+    p->npaths = 0;
+}
+
 static void exit_this_thread(struct proc *p)
 {
     struct proc *g = p->leader;
+    free_paths(p);
     if (p->clear_tid) {                 /* pthread_join() waits for this to become 0 */
         uint32_t zero = 0;
         if (copy_to_user((void *)p->clear_tid, &zero, 4) == 0)
@@ -713,6 +766,8 @@ void do_exit(int status)
     g->ctty = NULL;
     fb_proc_exit(g->pid);
     fpu_release(p);
+    free_paths(p);
+    g->it_real_at = g->it_virt_left = g->it_prof_left = 0;
 
     uint32_t *old = proc_set_pd(p, kernel_pd);
     if (p != g)
@@ -802,6 +857,12 @@ int thread_create(uint32_t entry, uint32_t stack, uint32_t tls, uint32_t clear_t
     t->pgid = g->pgid;
     t->sig_blocked = me->sig_blocked;
     memcpy(t->name, g->name, sizeof(t->name));
+    /* Its id goes into its block before it runs: the creator may not touch the block once it does
+     * (a detached thread frees its stack, block and all, when it ends). */
+    if (clear_tid && copy_to_user((void *)clear_tid, &t->pid, 4) < 0) {
+        proc_release(t);
+        return -EFAULT;
+    }
     spin_lock(&sched_lock);
     if (g->group_exiting || (g->state == P_ZOMBIE && g->nthreads == 0)) {
         spin_unlock(&sched_lock);
@@ -835,6 +896,10 @@ void proc_exec_alone(struct proc *p)
     p->heap_start = g->heap_start;
     p->brk = g->brk;
     p->stack_low = g->stack_low;
+    p->sid = g->sid;
+    p->no_ctty = g->no_ctty;
+    p->it_real_at = g->it_real_at, p->it_real_interval = g->it_real_interval;
+    g->it_real_at = 0;
     memset(g->fds, 0, sizeof(g->fds));
     g->cwd = NULL;
     g->ctty = NULL;
@@ -924,14 +989,54 @@ int do_setpgid(int pid, int pgid)
     int r = 0;
     if (p)
         p = p->leader;
-    if (!p || (p->state == P_ZOMBIE && p->nthreads == 0) || (p != me->leader && p->ppid != me->leader->pid))
+    if (!p || (p->state == P_ZOMBIE && p->nthreads == 0) || (p != me->leader && p->ppid != me->leader->pid)) {
         r = -ESRCH;
-    else {
-        int ng = pgid == 0 ? p->pid : pgid;
-        for (int i = 1; i < MAX_PROCS; i++)     /* every thread of it */
+    } else if (p->sid == p->pid) {
+        r = -EPERM;                     /* a session leader keeps its group */
+    } else {
+        int ng = pgid == 0 ? p->pid : pgid, found = ng == p->pid;
+        for (int i = 1; i < MAX_PROCS && !found; i++)      /* an existing group must be in the same session */
+            found = procs[i].state != P_UNUSED && procs[i].pgid == ng && procs[i].leader->sid == p->sid;
+        if (!found)
+            r = -EPERM;
+        for (int i = 1; i < MAX_PROCS && found; i++)        /* every thread of it */
             if (procs[i].state != P_UNUSED && procs[i].leader == p)
                 procs[i].pgid = ng;
     }
+    spin_unlock(&sched_lock);
+    return r;
+}
+
+/* A session and process group of the caller's own, with no controlling terminal. */
+int do_setsid(void)
+{
+    struct proc *g = current->leader;
+    spin_lock(&sched_lock);
+    int leader = 0;
+    for (int i = 1; i < MAX_PROCS && !leader; i++)
+        leader = procs[i].state != P_UNUSED && procs[i].pgid == g->pid && procs[i].leader != g;
+    if (g->pgid == g->pid || leader) {
+        spin_unlock(&sched_lock);
+        return -EPERM;                  /* already a group leader, or others are in a group of its id */
+    }
+    g->sid = g->pid;
+    g->no_ctty = 1;
+    for (int i = 1; i < MAX_PROCS; i++)
+        if (procs[i].state != P_UNUSED && procs[i].leader == g)
+            procs[i].pgid = g->pid;
+    struct tty *t = g->ctty;
+    g->ctty = NULL;
+    spin_unlock(&sched_lock);
+    tty_drop(t);
+    return g->pid;
+}
+
+int do_getsid(int pid)
+{
+    struct proc *me = current;
+    spin_lock(&sched_lock);
+    struct proc *p = pid == 0 ? me : proc_find_locked(pid);
+    int r = p ? p->leader->sid : -ESRCH;
     spin_unlock(&sched_lock);
     return r;
 }
@@ -1306,6 +1411,10 @@ void proc_check_signals(void)
          * flat segments, on the same stack; sigreturn brings the others back. */
         int based = tf->ss == SEG_WDATA;
         uint32_t sp = based ? tf->useresp + WIN_SEG_BASE : tf->useresp;
+        /* SA_ONSTACK: on the thread's signal stack, unless it is on it already */
+        if (!based && (sa.fsa_flags & SA_ONSTACK) && p->alt_size &&
+            !(sp > p->alt_sp && sp <= p->alt_sp + p->alt_size))
+            sp = p->alt_sp + p->alt_size;
         uint32_t tramp_va = ALIGN_DOWN(sp - sizeof(tramp), 16u);
         uint32_t ctx_va = ALIGN_DOWN(tramp_va - sizeof(ctx), 16u);
         uint32_t info_va = ALIGN_DOWN(ctx_va - sizeof(info), 16u);

@@ -52,10 +52,18 @@ struct proc {
     int nthreads;               /* leader: threads not yet exited, itself included */
     int group_exiting;          /* leader: a thread is ending the process, the others are being killed */
     int reap_self;              /* a thread that exited: freed when its slot is wanted (no waitpid) */
-    uint32_t clear_tid;         /* user address zeroed and futex-woken when this thread exits */
+    uint32_t clear_tid;         /* user word holding this thread's id, zeroed and futex-woken when it exits */
     uint32_t tls;               /* base of the TLS segment (SEG_USER_TLS) */
     struct mutex mm_lock;       /* leader: page faults and changes to the mappings */
     spinlock_t fd_lock;         /* leader: taking and freeing descriptor slots */
+    int sid;                    /* leader: the session (the id of the process that started it) */
+    int no_ctty;                /* leader: setsid() gave the terminal up: exec does not take one */
+    /* leader: the interval timers, in ticks (real: when it goes off, 0 for none; the others:
+     * ticks left, 0 for none) and what they are set again to */
+    uint32_t it_real_at, it_real_interval, it_virt_left, it_virt_interval, it_prof_left, it_prof_interval;
+    uint32_t alt_sp, alt_size;  /* this thread's stack for SA_ONSTACK handlers (size 0: none) */
+    char *paths[3];             /* user paths copied for the system call in progress (syscall.c) */
+    int npaths;
     uint32_t esp;               /* saved kernel stack pointer */
     uint8_t *kstack;
     uint32_t *pd;               /* page directory (physical == virtual) */
@@ -196,6 +204,11 @@ int do_waitpid(int pid, int *status, int options);
 int do_kill(int pid, int sig);
 int do_setpgid(int pid, int pgid);
 int do_getpgid(int pid);
+int do_setsid(void);
+int do_getsid(int pid);
+/* An interval timer (ITIMER_*) set to value ticks (0: off) and interval; the old setting is left in
+ * *old_value and *old_interval. Ticks of ITIMER_REAL are counted from now. */
+int proc_setitimer(int which, uint32_t value, uint32_t interval, uint32_t *old_value, uint32_t *old_interval);
 int proc_exec(struct proc *p, const char *path, char *const argv[], char *const envp[]);
 int proc_info(int slot, struct procinfo *pi);
 struct proc *proc_find(int pid);

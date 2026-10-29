@@ -2,6 +2,7 @@
 #include <sys/mman.h>
 #include "../kernel/core/syscall.c"
 struct proc *current;
+void *kmalloc(size_t n) { return malloc(n); }
 static int calls, truncate_error, opens;
 static struct vnode open_vnode = { .type = VN_FILE };
 static struct file open_file;

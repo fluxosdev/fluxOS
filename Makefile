@@ -221,10 +221,20 @@ $(BUILD)/.rootfs-stamp: $(ROOTFS_FILES)
 	cp -r rootfs/. $(ROOTFS)/
 	@touch $@
 
-$(SYSTEM): $(BUILD)/.rootfs-stamp $(BINS)
+# The ports (GNU make and binutils for fluxOS, tools/ports/build.sh) go into the
+# system too, once "make ports" has built them.
+PORTS_ROOT := $(BUILD)/ports/root
+PORTS_FILES := $(wildcard $(PORTS_ROOT)/usr/bin/*)
+
+$(SYSTEM): $(BUILD)/.rootfs-stamp $(BINS) $(PORTS_FILES)
 	cp $(ROOTFS)/bin/fsh $(ROOTFS)/bin/sh
 	chmod 755 $(ROOTFS)/home/flux/demo.sh
-	tar --format=ustar --owner=0 --group=0 --numeric-owner -cf $@ -C $(ROOTFS) .
+	tar --format=ustar --owner=0 --group=0 --numeric-owner -cf $@ -C $(ROOTFS) . \
+		$(if $(PORTS_FILES),-C $(abspath $(PORTS_ROOT)) .,)
+
+.PHONY: ports
+ports: sysroot
+	tools/ports/build.sh --toolchain $(BUILD)/toolchain/cross --sysroot $(SYSROOT)
 
 $(SETUP): $(BUILD)/.rootfs-stamp $(BINS) $(SETUPFS_FILES)
 	rm -rf $(SETUPFS)
@@ -349,7 +359,7 @@ run-usb-audio: $(ISO) $(DISK)
 clean:
 	rm -rf $(BUILD) $(ISO)
 
--include $(shell find $(BUILD) -path '$(BUILD)/toolchain' -prune -o -name '*.d' -print 2>/dev/null)
+-include $(shell find $(BUILD) -path '$(BUILD)/toolchain' -prune -o -path '$(BUILD)/ports' -prune -o -name '*.d' -print 2>/dev/null)
 
 # Run the browser's actual HTML/DOM/JS code on the host, without booting QEMU.
 HOSTCC ?= cc

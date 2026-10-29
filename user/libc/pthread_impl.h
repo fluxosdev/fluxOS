@@ -11,8 +11,8 @@
 /* A thread's block: %gs:0 points at it (self). A new thread's sits at the top of its stack. */
 struct __pthread {
     struct __pthread *self;
-    volatile int tid;                   /* nonzero while it runs: the kernel zeroes it and wakes a joiner */
-    int ktid;                           /* its id for tkill */
+    volatile int tid;                   /* its id, written by the kernel before it runs; zeroed (and a joiner
+                                           woken) when it ends */
     int errno_val;
     volatile int state;                 /* T_* */
     void *(*start)(void *);

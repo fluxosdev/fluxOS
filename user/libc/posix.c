@@ -29,6 +29,13 @@
 #include <time.h>
 #include <unistd.h>
 
+static inline int sc0(int n)
+{
+    int r;
+    __asm__ volatile("int $0x80" : "=a"(r) : "a"(n) : "memory");
+    return r;
+}
+
 static inline int sc1(int n, int a)
 {
     int r;
@@ -40,6 +47,13 @@ static inline int sc2(int n, int a, int b)
 {
     int r;
     __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a), "c"(b) : "memory");
+    return r;
+}
+
+static inline int sc3(int n, int a, int b, int c)
+{
+    int r;
+    __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a), "c"(b), "d"(c) : "memory");
     return r;
 }
 
@@ -124,19 +138,12 @@ pid_t vfork(void)
 
 pid_t setsid(void)
 {
-    /* No separate sessions: a new process group led by the caller. */
-    if (getpgid(0) == getpid()) {
-        errno = EPERM;
-        return -1;
-    }
-    if (setpgid(0, 0) < 0)
-        return -1;
-    return getpid();
+    return ret(sc0(SYS_setsid));
 }
 
 pid_t getsid(pid_t pid)
 {
-    return getpgid(pid);
+    return ret(sc1(SYS_getsid, pid));
 }
 
 int seteuid(uid_t uid) { (void)uid; return 0; }
@@ -611,30 +618,59 @@ int settimeofday(const struct timeval *tv, const struct timezone *tz)
     return stime(&t);
 }
 
-/* No interval timers: alarm() and setitimer() report what they cannot do. */
-unsigned int alarm(unsigned int seconds)
+/* ---- interval timers (the kernel's, in milliseconds) ---- */
+
+static uint32_t tv_ms(const struct timeval *tv)
 {
-    (void)seconds;
-    return 0;
+    if (tv->tv_sec < 0 || tv->tv_sec > 0x7FFFFFFF / 1000)
+        return 0x7FFFFFFF;
+    uint32_t ms = (uint32_t)tv->tv_sec * 1000 + ((uint32_t)tv->tv_usec + 999) / 1000;
+    return ms || (!tv->tv_sec && !tv->tv_usec) ? ms : 1;
+}
+
+static void ms_tv(uint32_t ms, struct timeval *tv)
+{
+    tv->tv_sec = ms / 1000;
+    tv->tv_usec = (ms % 1000) * 1000;
 }
 
 int getitimer(int which, struct itimerval *value)
 {
-    (void)which;
-    memset(value, 0, sizeof(*value));
+    struct flux_itimer t;
+    if (ret(sc2(SYS_getitimer, which, (int)&t)) < 0)
+        return -1;
+    ms_tv(t.value_ms, &value->it_value);
+    ms_tv(t.interval_ms, &value->it_interval);
     return 0;
 }
 
 int setitimer(int which, const struct itimerval *value, struct itimerval *old)
 {
-    (void)which;
-    if (old)
-        memset(old, 0, sizeof(*old));
-    if (value && (timerisset(&value->it_value))) {
-        errno = ENOSYS;
+    struct flux_itimer t = { 0, 0 }, o;
+    if (value) {
+        if (value->it_value.tv_usec < 0 || value->it_value.tv_usec >= 1000000 ||
+            value->it_interval.tv_usec < 0 || value->it_interval.tv_usec >= 1000000) {
+            errno = EINVAL;
+            return -1;
+        }
+        t.value_ms = tv_ms(&value->it_value);
+        t.interval_ms = tv_ms(&value->it_interval);
+    }
+    if (ret(sc3(SYS_setitimer, which, value ? (int)&t : 0, (int)&o)) < 0)
         return -1;
+    if (old) {
+        ms_tv(o.value_ms, &old->it_value);
+        ms_tv(o.interval_ms, &old->it_interval);
     }
     return 0;
+}
+
+unsigned int alarm(unsigned int seconds)
+{
+    struct flux_itimer t = { seconds > 0x7FFFFFFF / 1000 ? 0x7FFFFFFF : seconds * 1000, 0 }, o;
+    if (sc3(SYS_setitimer, ITIMER_REAL, (int)&t, (int)&o) < 0)
+        return 0;
+    return (o.value_ms + 999) / 1000;
 }
 
 int pause(void)
@@ -800,7 +836,7 @@ int killpg(pid_t pgrp, int sig)
 
 int sigpending(sigset_t *set)
 {
-    *set = 0;                           /* the kernel does not say; none is the safe answer */
+    *set = (sigset_t)sc0(SYS_sigpending);
     return 0;
 }
 
@@ -818,14 +854,18 @@ int sigsuspend(const sigset_t *mask)
 
 int sigaltstack(const stack_t *ss, stack_t *old)
 {
-    if (old) {
-        old->ss_sp = NULL;
-        old->ss_size = 0;
-        old->ss_flags = SS_DISABLE;
+    struct flux_stack ks, ko;
+    if (ss) {
+        ks.sp = (uint32_t)ss->ss_sp;
+        ks.flags = (uint32_t)ss->ss_flags;
+        ks.size = ss->ss_size;
     }
-    if (ss && !(ss->ss_flags & SS_DISABLE)) {
-        errno = ENOSYS;                 /* handlers run on the stack in use */
+    if (ret(sc2(SYS_sigaltstack, ss ? (int)&ks : 0, old ? (int)&ko : 0)) < 0)
         return -1;
+    if (old) {
+        old->ss_sp = (void *)ko.sp;
+        old->ss_flags = (int)ko.flags;
+        old->ss_size = ko.size;
     }
     return 0;
 }

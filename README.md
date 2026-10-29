@@ -65,8 +65,9 @@ says why.
   systems retain the same round-robin scheduling and need no APIC timer.
 - Processes: `fork`, `execve` (static ELF32 and `#!` scripts), `exit`/
   `waitpid`, process groups, signals (`kill`, `sigaction` handlers, `SIGINT`, `SIGPIPE`,
-  fault signals; ^C, ^\ and ^Z from the terminal, stopped and continued jobs), lazy FPU and SSE
-  switching (FXSAVE/FXRSTOR).
+  fault signals; ^C, ^\ and ^Z from the terminal, stopped and continued jobs; `sigaltstack`,
+  `sigpending`), sessions (`setsid`, `getsid`), interval timers (`setitimer` real, virtual and
+  profiling, `alarm`), paths up to 4096 bytes, lazy FPU and SSE switching (FXSAVE/FXRSTOR).
 - Threads: a process's threads share its address space, descriptors and signal handlers and run
   on every processor at once; futexes to wait on, a TLS segment per thread (%gs), `exit()` and
   fatal signals ending all of them, `exec` from any of them. libc has POSIX threads on top
@@ -595,7 +596,10 @@ ifconfig init ls lsblk mkdir mkfs.fat mixer more mount mv nc ping play
 poweroff ps reboot rm rmdir seq sh sleep sort spin stat sync tail tee threadtest top
 touch tr umount uname uniq unzip uptime wc wget yes zip (and httpc, the browser's
 fetcher), on a small libc (stdio, malloc, dirent, time, sockets, a DNS resolver,
-archives, an HTTP/1.1 and HTTP/2 client, inflate and POSIX threads).
+archives, an HTTP/1.1 and HTTP/2 client, inflate and POSIX threads). In `/usr/bin`, cross-built
+from their sources with the fluxOS toolchain (`make ports`): **GNU make 4.4.1** and **binutils 2.42**
+(`as`, `ld`, `ar`, `ranlib`, `nm`, `objcopy`, `objdump`, `readelf`, `strip`, `size`, `strings`), the
+first steps toward building fluxOS on fluxOS (`self-hosting-roadmap.md`).
 - The libc is enough of POSIX for GNU programs to build against it unchanged
   (GNU make and binutils do, cross-compiled; see `self-hosting-roadmap.md`):
   `printf` and `strtod` that agree with glibc digit for digit (exact
@@ -743,6 +747,7 @@ In a terminal:
 fetch                          # system summary
 spin A 5 & spin B 5 & top      # CPU-bound jobs sharing the CPU; ^C quits top
 threadtest                     # POSIX threads: every line should say ok
+make --version; as --version   # GNU make and binutils, built for fluxOS
 cat ~/README.txt; ./demo.sh    # tour and a scripting demo
 echo {1..3} $((6*7)) ~         # brace, arithmetic and tilde expansion
 lsblk; df -h; mount            # disks, CD-ROM and mounted filesystems

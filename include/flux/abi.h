@@ -181,7 +181,7 @@ struct stat {
 
 /* ---- directory entries (getdents) ---- */
 #define NAME_MAX 255
-#define PATH_MAX 512
+#define PATH_MAX 4096
 
 #define DT_UNKNOWN 0
 #define DT_FIFO    1
@@ -280,6 +280,25 @@ struct flux_sigaction {
     uint32_t fsa_flags;
     uint32_t fsa_restorer;      /* user signal return trampoline */
 };
+
+/* SYS_sigaltstack: where SA_ONSTACK handlers run (a thread's own). */
+struct flux_stack {
+    uint32_t sp, flags, size;   /* flags: SS_ONSTACK (reported), SS_DISABLE */
+};
+#ifndef SS_ONSTACK
+#define SS_ONSTACK 1
+#define SS_DISABLE 2
+#endif
+
+/* SYS_setitimer and SYS_getitimer: the process's interval timers, in milliseconds (0: none). */
+struct flux_itimer {
+    uint32_t value_ms, interval_ms;
+};
+#ifndef ITIMER_REAL
+#define ITIMER_REAL    0        /* wall-clock time: SIGALRM */
+#define ITIMER_VIRTUAL 1        /* the process's time in user mode: SIGVTALRM */
+#define ITIMER_PROF    2        /* its time in user mode and the kernel: SIGPROF */
+#endif
 
 /* ---- mmap(2), munmap(2), mprotect(2) ---- */
 #ifndef PROT_NONE

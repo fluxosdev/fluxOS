@@ -23,6 +23,32 @@
 #define ROUNDS 20000
 
 static int failures, verbose;
+static const char *volatile stage = "starting";
+
+/* A step that takes this long is stuck: say which, and stop (ps in another terminal shows its threads). */
+static void on_alarm(int sig)
+{
+    (void)sig;
+    char msg[160];
+    int n = snprintf(msg, sizeof(msg), "STUCK in: %s (pid %d)\n", stage, getpid());
+    write(2, msg, (size_t)n);
+    _exit(3);
+}
+
+static void step(const char *what)
+{
+    stage = what;
+    alarm(20);
+}
+
+static void create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *), void *arg)
+{
+    int r = pthread_create(t, a, fn, arg);
+    if (r) {
+        fprintf(stderr, "pthread_create failed in %s: %s\n", stage, strerror(r));
+        exit(2);
+    }
+}
 
 static void check(int ok, const char *what)
 {
@@ -193,14 +219,13 @@ int main(int argc, char **argv)
         pthread_exit(NULL);                     /* the worker ends the process later */
     }
     verbose = argc > 1 && !strcmp(argv[1], "-v");
+    signal(SIGALRM, on_alarm);
+    step("a mutex under contention");
 
     pthread_t t[THREADS];
     void *r;
     for (int i = 0; i < THREADS; i++)
-        if (pthread_create(&t[i], NULL, adder, NULL)) {
-            check(0, "pthread_create");
-            return 1;
-        }
+        create(&t[i], NULL, adder, NULL);
     int ids_ok = 1;
     for (int i = 0; i < THREADS; i++) {
         pthread_join(t[i], &r);
@@ -211,9 +236,11 @@ int main(int argc, char **argv)
     if (verbose)
         printf("  counter %ld\n", counter);
 
+    step("condition variables: starting the consumers");
     pthread_t c[4];
     for (int i = 0; i < 4; i++)
-        pthread_create(&c[i], NULL, consumer, NULL);
+        create(&c[i], NULL, consumer, NULL);
+    step("condition variables: producing");
     long sent = 0;
     for (int i = 1; i <= 5000; i++) {
         pthread_mutex_lock(&q_lock);
@@ -227,18 +254,21 @@ int main(int argc, char **argv)
         pthread_cond_signal(&q_more);
         pthread_mutex_unlock(&q_lock);
     }
+    step("condition variables: telling the consumers to stop");
     pthread_mutex_lock(&q_lock);
     q_done = 1;
     pthread_cond_broadcast(&q_more);
     pthread_mutex_unlock(&q_lock);
+    step("condition variables: joining the consumers");
     for (int i = 0; i < 4; i++)
         pthread_join(c[i], NULL);
     check(consumed == sent, "condition variables (a work queue)");
 
+    step("errno and keys");
     pthread_key_create(&key, destructor);
     errno = 0;
     for (int i = 0; i < 4; i++)
-        pthread_create(&t[i], NULL, own_errno, (void *)(long)(i + 100));
+        create(&t[i], NULL, own_errno, (void *)(long)(i + 100));
     int own = 1;
     for (int i = 0; i < 4; i++) {
         pthread_join(t[i], &r);
@@ -247,10 +277,11 @@ int main(int argc, char **argv)
     check(own && errno == 0, "errno and keys per thread");
     check(destructed == 4, "key destructors run at thread exit");
 
+    step("once, semaphores, barriers, read-write locks");
     sem_init(&sem, 0, 0);
     pthread_barrier_init(&barrier, NULL, 4);
     for (int i = 0; i < 4; i++)
-        pthread_create(&t[i], NULL, misc, NULL);
+        create(&t[i], NULL, misc, NULL);
     for (int i = 0; i < 4; i++)
         sem_post(&sem);
     int serials = 0, last = 0;
@@ -264,25 +295,29 @@ int main(int argc, char **argv)
     check(shared_value == 4 && last == 4, "read-write locks");
 
     pthread_attr_t attr;
+    step("detached threads");
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     for (int i = 0; i < 20; i++)
-        pthread_create(&t[0], &attr, adder, NULL);      /* they free their own stacks */
+        create(&t[0], &attr, adder, NULL);              /* they free their own stacks */
     struct timespec ts = { 0, 300 * 1000 * 1000 };
     nanosleep(&ts, NULL);
     check(1, "detached threads");
 
+    step("pthread_kill");
     signal(SIGUSR1, on_usr1);
     pthread_t w;
-    pthread_create(&w, NULL, waiter, NULL);
+    create(&w, NULL, waiter, NULL);
     pthread_kill(w, SIGUSR1);
     pthread_join(w, NULL);
     check(pthread_equal(got_signal_in, w), "pthread_kill reaches that thread");
 
-    pthread_create(&t[0], NULL, forker, NULL);
+    step("fork from a thread");
+    create(&t[0], NULL, forker, NULL);
     pthread_join(t[0], &r);
     check((long)r == 1, "fork from a thread");
 
+    step("exec from a thread");
     pid_t pid = fork();
     if (pid == 0) {
         pthread_t s;
@@ -296,6 +331,7 @@ int main(int argc, char **argv)
     if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0))
         check(0, "exec from a thread");
 
+    step("the process outliving its main thread");
     pid = fork();
     if (pid == 0) {
         execl("/bin/threadtest", "threadtest", "--main-exit", (char *)NULL);
@@ -305,6 +341,7 @@ int main(int argc, char **argv)
     if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0))
         check(0, "the process outlives its main thread");
 
+    step("exit() ending every thread");
     pid = fork();
     if (pid == 0) {
         pthread_t s;
@@ -315,6 +352,7 @@ int main(int argc, char **argv)
     waitpid(pid, &st, 0);
     check(WIFEXITED(st) && WEXITSTATUS(st) == 5, "exit() ends every thread");
 
+    alarm(0);
     printf("%s\n", failures ? "Some checks failed." : "All checks passed.");
     return failures != 0;
 }

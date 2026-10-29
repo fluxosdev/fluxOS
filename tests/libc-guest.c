@@ -164,6 +164,113 @@ static void test_processes(void)
     CHECK(getpwuid(0) && getpwuid(0)->pw_dir[0] == '/');
 }
 
+static volatile sig_atomic_t alarms;
+static void on_alarm(int sig) { (void)sig; alarms++; }
+static char alt_stack[16384];
+static volatile int on_alt;
+static void on_usr1(int sig)
+{
+    (void)sig;
+    char here;
+    on_alt = &here >= alt_stack && &here < alt_stack + sizeof(alt_stack);
+}
+
+/* Interval timers, sigpending, sigaltstack, sessions and long paths (phase 2 of the roadmap). */
+static void test_signals_sessions_paths(void)
+{
+    signal(SIGALRM, on_alarm);
+    struct itimerval it = { { 0, 20000 }, { 0, 20000 } }, got;
+    CHECK(setitimer(ITIMER_REAL, &it, NULL) == 0);
+    CHECK(getitimer(ITIMER_REAL, &got) == 0 && got.it_interval.tv_usec == 20000 && timerisset(&got.it_value));
+    for (int i = 0; i < 200 && alarms < 3; i++)
+        msleep(10);
+    CHECK(alarms >= 3);                 /* it went off, and again */
+    it.it_value.tv_sec = it.it_value.tv_usec = 0;
+    CHECK(setitimer(ITIMER_REAL, &it, &got) == 0 && got.it_interval.tv_usec == 20000);
+    int before = alarms;
+    msleep(60);
+    CHECK(alarms == before);            /* off */
+    CHECK(alarm(5) == 0 && alarm(0) >= 4);
+    alarms = 0;
+    alarm(1);
+    for (int i = 0; i < 300 && !alarms; i++)
+        msleep(10);
+    CHECK(alarms == 1);
+
+    sigset_t block, pend;
+    sigemptyset(&block);
+    sigaddset(&block, SIGUSR2);
+    CHECK(sigprocmask(SIG_BLOCK, &block, NULL) == 0);
+    signal(SIGUSR2, on_alarm);
+    CHECK(kill(getpid(), SIGUSR2) == 0);
+    CHECK(sigpending(&pend) == 0 && sigismember(&pend, SIGUSR2));
+    int was = alarms;
+    CHECK(sigprocmask(SIG_UNBLOCK, &block, NULL) == 0 && alarms == was + 1);
+    CHECK(sigpending(&pend) == 0 && !sigismember(&pend, SIGUSR2));
+
+    stack_t ss = { alt_stack, 0, sizeof(alt_stack) }, old;
+    CHECK(sigaltstack(&ss, &old) == 0 && old.ss_flags == SS_DISABLE);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_usr1;
+    sa.sa_flags = SA_ONSTACK;
+    CHECK(sigaction(SIGUSR1, &sa, NULL) == 0);
+    on_alt = 0;
+    raise(SIGUSR1);
+    CHECK(on_alt);                      /* the handler ran on the signal stack */
+    ss.ss_flags = SS_DISABLE;
+    CHECK(sigaltstack(&ss, NULL) == 0);
+    on_alt = 1;
+    raise(SIGUSR1);
+    CHECK(!on_alt);                     /* and not once it is disabled */
+
+    /* A child in a session of its own, with no terminal; its parent, a session leader, cannot setsid. */
+    CHECK(setsid() < 0 && errno == EPERM);
+    pid_t child = fork();
+    if (child == 0) {
+        pid_t sid = setsid();
+        int ok = sid == getpid() && getsid(0) == getpid() && getpgrp() == getpid();
+        ok = ok && setsid() < 0 && errno == EPERM;
+        _exit(ok ? 0 : 1);
+    }
+    int st = 0;
+    CHECK(waitpid(child, &st, 0) == child && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK(getsid(0) == getsid(getpid()) && getsid(child) < 0 && errno == ESRCH);
+
+    /* Paths up to PATH_MAX: twenty-five nested directories of 100-character names. */
+    char *deep = malloc(PATH_MAX);
+    CHECK(deep && PATH_MAX >= 4096);
+    strcpy(deep, "/tmp");
+    mkdir(deep, 0755);
+    for (int i = 0; i < 25; i++) {
+        size_t n = strlen(deep);
+        deep[n] = '/';
+        memset(deep + n + 1, 'a' + i, 100);
+        deep[n + 101] = 0;
+        CHECK(mkdir(deep, 0755) == 0);
+    }
+    CHECK(strlen(deep) > 2500);
+    strcat(deep, "/file");
+    int fd = open(deep, O_WRONLY | O_CREAT, 0644);
+    CHECK(fd >= 0 && write(fd, "x", 1) == 1 && close(fd) == 0);
+    struct stat sb;
+    CHECK(stat(deep, &sb) == 0 && sb.st_size == 1);
+    CHECK(chdir(deep) < 0 && errno == ENOTDIR);
+    deep[strlen(deep) - 5] = 0;
+    CHECK(chdir(deep) == 0);
+    char *cwd = malloc(PATH_MAX);
+    CHECK(cwd && getcwd(cwd, PATH_MAX) && !strcmp(cwd, deep));
+    CHECK(chdir("/") == 0 && unlink(strcat(deep, "/file")) == 0);
+    memset(deep, 'z', PATH_MAX - 1);
+    deep[0] = '/';
+    deep[PATH_MAX - 1] = 0;
+    CHECK(stat(deep, &sb) < 0 && errno == ENAMETOOLONG);       /* PATH_MAX counts the NUL */
+    free(deep);
+    free(cwd);
+    CHECK(symlink("a", "/tmp/b") < 0 && errno == EPERM);
+    CHECK(readlink("/tmp", NULL, 0) < 0 && errno == EINVAL);
+}
+
 static void test_time(void)
 {
     struct timespec a, b;
@@ -204,6 +311,7 @@ int main(void)
     test_processes();
     test_time();
     test_misc();
+    test_signals_sessions_paths();
     printf("LIBC REGRESSIONS PASSED\n");
     fflush(stdout);
     stop();

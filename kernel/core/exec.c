@@ -283,7 +283,7 @@ static int exec_interp(struct proc *p, const char *interp, const char *path,
 static int exec_script(struct proc *p, struct image *vn, const char *path,
                        char *const argv[], char *const envp[])
 {
-    char interp[PATH_MAX];
+    char interp[256];                   /* (an interpreter's path on a #! line is short) */
     uint32_t i = 2, n = 0;
     while (i < vn->have && vn->data[i] == ' ')
         i++;
@@ -378,6 +378,8 @@ int proc_exec(struct proc *p, const char *path, char *const argv[], char *const 
     vmm_destroy(proc_set_pd(p, pd));
     p->tls = 0;
     p->clear_tid = 0;
+    p->alt_size = 0;                        /* the signal stack was in the old image */
+    p->it_virt_left = p->it_prof_left = 0;  /* (the real-time timer goes on, as POSIX has it) */
 
     fpu_release(p);
     memset(p->leader->vmas, 0, sizeof(p->leader->vmas));

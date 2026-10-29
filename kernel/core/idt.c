@@ -259,6 +259,7 @@ void trap(struct trapframe *tf)
 
     int from_user = (tf->cs & 3) == 3;
     struct cpu *c = this_cpu();
+    c->from_user = from_user;           /* (for the timer: whose time a tick is) */
     if (from_user)
         c->proc->tf = tf;
 

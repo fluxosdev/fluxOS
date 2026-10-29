@@ -2,6 +2,7 @@
  * Unpacks the ustar archive GRUB loaded as a module into the ramfs.
  */
 #include "kernel.h"
+#include "mm.h"
 #include "vfs.h"
 
 struct tar_header {
@@ -34,6 +35,9 @@ static uint32_t octal(const char *s, int n)
 void initrd_load(const uint8_t *data, uint32_t size)
 {
     uint32_t off = 0, files = 0, dirs = 0;
+    char *path = kmalloc(2 * PATH_MAX), *parent = path ? path + PATH_MAX : NULL;
+    if (!path)
+        panic("initrd: out of memory");
 
     while (off + 512 <= size) {
         const struct tar_header *h = (const struct tar_header *)(data + off);
@@ -48,12 +52,12 @@ void initrd_load(const uint8_t *data, uint32_t size)
         uint32_t mode = octal(h->mode, sizeof(h->mode));
         uint32_t mtime = octal(h->mtime, sizeof(h->mtime));
 
-        char path[PATH_MAX] = "";
+        path[0] = 0;
         if (h->prefix[0]) {
             strncat(path, h->prefix, MIN(sizeof(h->prefix), sizeof(path) - 2));
             strcat(path, "/");
         }
-        strncat(path, h->name, MIN(sizeof(h->name), sizeof(path) - strlen(path) - 1));
+        strncat(path, h->name, MIN(sizeof(h->name), PATH_MAX - strlen(path) - 1));
 
         char *p = path;
         while (*p == '.' && p[1] == '/')
@@ -81,8 +85,7 @@ void initrd_load(const uint8_t *data, uint32_t size)
             char name[NAME_MAX + 1];
             if (vfs_resolve_parent(p, NULL, &dir, name) < 0) {
                 /* Parent missing from the archive: create it. */
-                char parent[PATH_MAX];
-                strlcpy(parent, p, sizeof(parent));
+                strlcpy(parent, p, PATH_MAX);
                 char *slash = strrchr(parent, '/');
                 if (slash)
                     *slash = 0;
@@ -98,5 +101,6 @@ void initrd_load(const uint8_t *data, uint32_t size)
             files++;
         }
     }
+    kfree(path);
     boot_ok("Unpacked initrd: %u files, %u directories", files, dirs);
 }
