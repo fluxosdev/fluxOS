@@ -190,7 +190,7 @@ int main(int argc, char **argv)
         }
     }
 
-    set_default("PATH", "/bin");
+    set_default("PATH", "/bin:/usr/bin");
     set_default("SHELL", "/bin/fsh");
     set_default("HOME", "/");
     set_default("USER", "flux");

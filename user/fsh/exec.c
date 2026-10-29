@@ -79,7 +79,7 @@ int find_command(const char *name, char *out, size_t size)
     }
     const char *path = getenv("PATH");
     if (!path)
-        path = "/bin";
+        path = "/bin:/usr/bin";
     while (*path) {
         size_t len = strcspn(path, ":");
         if (len)

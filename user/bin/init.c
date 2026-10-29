@@ -93,7 +93,7 @@ int main(void)
     signal(SIGQUIT, SIG_IGN);
     signal(SIGTERM, SIG_IGN);
 
-    setenv("PATH", "/bin", 1);
+    setenv("PATH", "/bin:/usr/bin", 1);
     setenv("HOME", "/home/flux", 1);
     setenv("USER", "flux", 1);
     setenv("LOGNAME", "flux", 1);

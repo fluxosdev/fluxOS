@@ -473,7 +473,7 @@ static void complete_commands(struct strvec *c, const char *prefix)
         add_candidate(c, prefix, builtin_names[i], 0);
     const char *path = getenv("PATH");
     if (!path)
-        path = "/bin";
+        path = "/bin:/usr/bin";
     char dir[PATH_MAX];
     while (*path) {
         size_t len = strcspn(path, ":");
