@@ -36,6 +36,7 @@
 #include "webpolicy.h"
 #include "webblob.h"
 #include "jsnet.h"
+#include "jsworker.h"
 #include "jscanvas.h"
 #include "jsdomlib.h"
 
@@ -74,6 +75,7 @@ struct dispatch_path {
 
 struct jsdom {
     struct jsnet *network;
+    struct jsworkers *workers;
     struct dispatch_path *dispatch_path;
     struct jshost h;
     struct js *J;
@@ -5063,6 +5065,59 @@ static jsval win_atob(struct js *J, jsval self, jsval *args, int argc)
     return js_strn(J, out, n);
 }
 
+/* %b64(view) and %unb64(text): binary data in the structured clone format (jsdomlib.h's serialize), bytes to
+ * base64 and back to a Uint8Array without going through a string of characters. */
+static jsval bytes_base64(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    int len = 0;
+    const unsigned char *p = js_binary_bytes(ARG(0), &len);
+    if (!p)
+        len = 0;
+    char *out = js_alloc(J, (size_t)(len + 2) / 3 * 4 + 1);
+    int n = 0;
+    for (int i = 0; i < len; i += 3) {
+        uint32_t v = (uint32_t)p[i] << 16 | (i + 1 < len ? (uint32_t)p[i + 1] << 8 : 0) | (i + 2 < len ? p[i + 2] : 0);
+        out[n++] = b64[v >> 18];
+        out[n++] = b64[(v >> 12) & 63];
+        out[n++] = i + 1 < len ? b64[(v >> 6) & 63] : '=';
+        out[n++] = i + 2 < len ? b64[v & 63] : '=';
+    }
+    return js_strn(J, out, n);
+}
+
+static jsval base64_bytes(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    static signed char value[256];
+    if (!value['B'])
+        for (int i = 0; i < 256; i++) {
+            const char *c = i ? strchr(b64, i) : NULL;
+            value[i] = (signed char)(c ? c - b64 : -1);
+        }
+    struct jsstr *s = js_tostr(J, ARG(0));
+    int digits = 0;
+    for (int i = 0; i < s->len; i++)
+        digits += value[(unsigned char)s->s[i]] >= 0;
+    jsval length = js_num((double)(digits * 6 / 8));
+    jsval view = js_construct(J, js_get(J, js_obj(J->global), "Uint8Array"), &length, 1);
+    int size = 0, n = 0, bits = 0;
+    unsigned char *out = js_binary_bytes(view, &size);
+    uint32_t acc = 0;
+    for (int i = 0; out && i < s->len; i++) {
+        int v = value[(unsigned char)s->s[i]];
+        if (v < 0)
+            continue;
+        acc = acc << 6 | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8 && n < size) {
+            bits -= 8;
+            out[n++] = (unsigned char)(acc >> bits);
+        }
+    }
+    return view;
+}
+
 static jsval perf_now(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)J;
@@ -5432,13 +5487,20 @@ static jsval xhr_all_headers(struct js *J, jsval self, jsval *args, int argc)
     return h.t == JS_STR ? h : js_str(J, "");
 }
 
+int jsdom_http_streaming(struct jsdom *d,int id)
+{
+    if(d&&id>=JSWORKER_ID_BASE)return jsworkers_http_streaming(d->workers,id);
+    return d&&id>=0&&id<MAX_XHR&&d->xhr[id]&&d->requests[id].streaming;
+}
 int jsdom_http_headers(struct jsdom *d,int id,int status,const char *headers,int hlen)
 {
+    if(d&&id>=JSWORKER_ID_BASE)return jsworkers_http_headers(d->workers,id,status,headers,hlen);
     if(!d||id<0||id>=MAX_XHR||!d->xhr[id])return -1;
     struct js *J=d->J;jsval x=js_obj(d->xhr[id]);struct xhr_request *request=&d->requests[id];
     if(request->received)return request->streaming?2:1;
     if(request->preflight || (status>=300&&status<=308&&status!=304))return 0;
-    if(status<200||!headers||hlen<=0)return 0;
+    if(status<200)return 0;
+    if(!headers||hlen<0){headers="";hlen=0;}     /* a file:// response has no headers */
     struct jsstr *bounded=js_mkstr(J,headers,hlen);headers=bounded->s;
     char origin[300]="null";web_origin(d->h.url,origin,sizeof(origin));int credentials=request->credentials;
     if(request->cross&&request->mode!=2&&!web_cors_allow(origin,headers,credentials)){xhr_failure(d,id,x);return -1;}
@@ -5472,6 +5534,7 @@ int jsdom_http_headers(struct jsdom *d,int id,int status,const char *headers,int
 }
 void jsdom_http_chunk(struct jsdom *d,int id,const void *data,int len)
 {
+    if(d&&id>=JSWORKER_ID_BASE){jsworkers_http_chunk(d->workers,id,data,len);return;}
     if(!d||id<0||id>=MAX_XHR||!d->xhr[id]||len<=0)return;
     struct xhr_request *r=&d->requests[id];if(!r->received || (r->cross&&r->mode==2))return;
     struct js *J=d->J;jsval x=js_obj(d->xhr[id]);
@@ -5490,6 +5553,10 @@ void jsdom_http_chunk(struct jsdom *d,int id,const void *data,int len)
 void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, int hlen,
                      const char *body, int blen)
 {
+    if (d && id >= JSWORKER_ID_BASE) {
+        jsworkers_http_done(d->workers, id, status, headers, hlen, body, blen);
+        return;
+    }
     if (!d || id < 0 || id >= MAX_XHR || !d->xhr[id])
         return;
     struct js *J = d->J;
@@ -6261,11 +6328,14 @@ struct jsdom *jsdom_new(const struct jshost *host)
     fn(J,w,"%chosenFile",chosen_file,1);
     fn(J,w,"%pointerCapture",pointer_capture_api,2);
     fn(J,w,"%winop",window_op,4);
+    fn(J,w,"%b64",bytes_base64,1);
+    fn(J,w,"%unb64",base64_bytes,1);
     fn(J,w,"%idb",idb_store,3);
     if (js_eval(J, js_dom_eager, (int)sizeof(js_dom_eager) - 1, "DOM library") < 0)
         fprintf(stderr, "DOM library: %s\n", js_error(J));
     char origin[300]="null";web_origin(d->h.url,origin,sizeof(origin));
     d->network=jsnet_new(J,d->h.base?d->h.base:d->h.url,origin,d,network_event,network_cookies);
+    d->workers=jsworkers_new(J,&d->h,d);
     return d;
 }
 
@@ -6277,6 +6347,7 @@ void jsdom_free(struct jsdom *d)
     for (int i = 0; i < d->nposted; i++)
         free(d->posted[i].data), free(d->posted[i].origin);
     free(d->posted);
+    jsworkers_free(d->workers);
     jsnet_free(d->network);
     jscanvas_free(d->J);
     js_free(d->J);
@@ -6368,6 +6439,10 @@ void jsdom_module_fetched(struct jsdom *d, int id, const char *text, int len)
 {
     if (!d)
         return;
+    if (id >= JSWORKER_ID_BASE) {
+        jsworkers_module_fetched(d->workers, id, text, len);
+        return;
+    }
     d->depth++;
     js_module_source(d->J, id, text, len);
     d->depth--;
@@ -6511,6 +6586,7 @@ void jsdom_run_timers(struct jsdom *d)
     if (!d)
         return;
     jsnet_poll(d->network);
+    jsworkers_poll(d->workers);
     process_view(d);
     run_queued(d);
     deliver_posted(d);
@@ -6551,7 +6627,8 @@ int jsdom_next_timer(struct jsdom *d)
     if (d->nqueued || d->nposted || view_changes(d, &sx, &sy, &vw, &vh))
         return 0;
     unsigned int now = uptime_ms();
-    int best=jsnet_wait(d->network);
+    int best=jsnet_wait(d->network),w=jsworkers_wait(d->workers);
+    if(w>=0&&(best<0||w<best))best=w;
     for (int i = 0; i < MAX_TIMERS; i++) {
         struct timer *t = &d->timers[i];
         if (!t->active)

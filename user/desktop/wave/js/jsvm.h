@@ -2820,6 +2820,11 @@ L_GETELEM: {
         sp[-1] = i < (uint32_t)o.u.o->len ? o.u.o->items[i] : js_undefined;
         NEXT;
     }
+    if (o.t == JS_OBJ && o.u.o->cls == C_HOST && key.t == JS_NUM && js_index(key, &i) &&
+        js_typed_get_index(J, o.u.o, i, &sp[-1])) {
+        CHECK();
+        NEXT;
+    }
     if (key.t == JS_STR && own_data(o, key.u.s, &sp[-1]))
         NEXT;
     sp[-1] = js_getv(J, o, key);
@@ -2845,6 +2850,12 @@ L_SETELEM: {
     if (o.t == JS_OBJ && o.u.o->cls == C_ARRAY && key.t == JS_NUM && js_index(key, &i) &&
         i < (uint32_t)o.u.o->len) {
         o.u.o->items[i] = v;
+        sp[-1] = v;
+        NEXT;
+    }
+    if (o.t == JS_OBJ && o.u.o->cls == C_HOST && key.t == JS_NUM && js_index(key, &i) &&
+        js_typed_set_index(J, o.u.o, i, v)) {
+        CHECK();
         sp[-1] = v;
         NEXT;
     }

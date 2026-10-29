@@ -15,6 +15,10 @@
 static const char js_dom_lib[] = JS_DOM_SOURCE(
 (function (g) {
   var def = g["%def"];
+  /* A worker's scope has no DOM names; it keeps these for MessageChannel and the rest (jsworker.c). */
+  var kept = g["%domCtors"] || {};
+  var Node = g.Node || kept.Node, HTMLElement = g.HTMLElement || kept.HTMLElement, Document = g.Document || kept.Document;
+  var DocumentFragment = g.DocumentFragment || kept.DocumentFragment, Text = g.Text || kept.Text;
   var NP = Node.prototype, EP = HTMLElement.prototype, DP = Document.prototype;
   function getter(o, k, f) { Object.defineProperty(o, k, { get: f, configurable: true, enumerable: false }); }
 
@@ -1131,16 +1135,7 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
   var winop = g["%winop"], proxies = new Map(), selfId = winop(0, "self");
   function cloneError() { return new DOMException("The object could not be cloned.", "DataCloneError"); }
   function crossOrigin() { return new DOMException("Blocked a frame from accessing a cross-origin frame.", "SecurityError"); }
-  function bytes(u8) {
-    var s = "";
-    for (var i = 0; i < u8.length; i += 8192) s += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));
-    return btoa(s);
-  }
-  function unbytes(b64) {
-    var s = atob(b64), u8 = new Uint8Array(s.length);
-    for (var i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i);
-    return u8;
-  }
+  var bytes = g["%b64"], unbytes = g["%unb64"];
   /* The structured clone algorithm's types, as JSON (every object wrapped, so its keys are its own). */
   function serialize(v) {
     var seen = new Map(), next = 0;
@@ -1165,8 +1160,12 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
       if (x instanceof Map) return { $: "m", i: id, v: Array.from(x, function (e) { return [enc(e[0]), enc(e[1])]; }) };
       if (x instanceof Set) return { $: "s", i: id, v: Array.from(x, enc) };
       if (x instanceof Error) return { $: "e", i: id, n: x.name, m: x.message, s: x.stack };
+      if (x._bytes instanceof Uint8Array && x instanceof Blob)
+        return x instanceof File ? { $: "f", i: id, t: x.type, n: x.name, l: x.lastModified, v: bytes(x._bytes) }
+                                 : { $: "bl", i: id, t: x.type, v: bytes(x._bytes) };
       if (Array.isArray(x)) { var a = []; for (var k = 0; k < x.length; k++) a.push(enc(x[k])); return { $: "a", i: id, v: a }; }
-      if (x instanceof Node || x === g || typeof x.postMessage === "function" && proxiesHas(x)) throw cloneError();
+      if (typeof Node === "function" && x instanceof Node || x === g || typeof x.postMessage === "function" && proxiesHas(x))
+        throw cloneError();
       var o = {};
       Object.keys(x).forEach(function (key) { o[key] = enc(x[key]); });
       return { $: "o", i: id, v: o };
@@ -1192,6 +1191,8 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
       }
       case "m": { var m = refs[x.i] = new Map(); x.v.forEach(function (e) { m.set(dec(e[0]), dec(e[1])); }); return m; }
       case "s": { var st = refs[x.i] = new Set(); x.v.forEach(function (e) { st.add(dec(e)); }); return st; }
+      case "bl": return refs[x.i] = new Blob([unbytes(x.v)], { type: x.t });
+      case "f": return refs[x.i] = new File([unbytes(x.v)], x.n, { type: x.t, lastModified: x.l });
       case "e": { var E = g[x.n] && g[x.n].prototype instanceof Error ? g[x.n] : Error, err = refs[x.i] = new E(x.m); if (x.s) err.stack = x.s; return err; }
       case "a": { var arr = refs[x.i] = []; for (var k = 0; k < x.v.length; k++) arr[k] = dec(x.v[k]); return arr; }
       case "o": { var o = refs[x.i] = {}; for (var key in x.v) o[key] = dec(x.v[key]); return o; }
@@ -1248,6 +1249,58 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
   g["%deliverMessage"] = function (data, origin, source) {
     var e = new MessageEvent("message", { data: deserialize(data), origin: origin, source: proxy(source), lastEventId: "", ports: [] });
     g.dispatchEvent(e);
+  };
+
+  /* ---- Worker: a dedicated worker, a process of its own (jsworker.c); made the first time it is named ---- */
+  var workers = new Map(), workerClass = null;
+  function makeWorker() {
+    var op = g["%worker"];
+    class Worker extends EventTarget {
+      constructor(url, options) {
+        super();
+        options = options === undefined || options === null ? {} : options;
+        var type = options.type === undefined ? "classic" : String(options.type);
+        if (type !== "classic" && type !== "module") throw new TypeError("A worker type is classic or module");
+        var id = op("start", String(url), type, options.name === undefined ? "" : String(options.name));
+        if (id === -1) throw new DOMException("A worker script must have the page origin", "SecurityError");
+        def(this, "_id", id > 0 ? id : 0);
+        this.onmessage = null;
+        this.onmessageerror = null;
+        this.onerror = null;
+        var self = this;
+        if (id > 0) workers.set(id, this);
+        else setTimeout(function () { self.dispatchEvent(new Event("error")); }, 0);
+      }
+      postMessage(data, transfer) {
+        var text = serialize(data);
+        if (this._id) op("post", this._id, text);
+      }
+      terminate() {
+        if (!this._id) return;
+        op("terminate", this._id);
+        workers.delete(this._id);
+        this._id = 0;
+      }
+    }
+    return Worker;
+  }
+  Object.defineProperty(g, "Worker", { configurable: true, enumerable: false,
+    get: function () { return workerClass || (workerClass = makeWorker()); },
+    set: function (v) { Object.defineProperty(g, "Worker", { value: v, writable: true, configurable: true }); } });
+  g["%workerEvent"] = function (id, kind, data) {
+    var w = workers.get(id);
+    if (!w) return;
+    if (kind === "message") {
+      var v;
+      try { v = deserialize(data); }
+      catch (e) { w.dispatchEvent(new MessageEvent("messageerror", { data: null })); return; }
+      w.dispatchEvent(new MessageEvent("message", { data: v, origin: "", lastEventId: "", source: null, ports: [] }));
+    } else if (kind === "error") {
+      w.dispatchEvent(new ErrorEvent("error", { message: data, filename: "", lineno: 0, colno: 0, error: null, cancelable: true }));
+    } else {
+      workers.delete(id);
+      if (kind === "fail") w.dispatchEvent(new Event("error"));
+    }
   };
   Object.defineProperty(Element.prototype, "contentWindow", { configurable: true, get: function () {
     if (this.tagName !== "IFRAME" && this.tagName !== "FRAME") return undefined;

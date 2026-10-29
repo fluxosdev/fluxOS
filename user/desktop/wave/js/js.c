@@ -977,6 +977,10 @@ jsval js_getv(struct js *J, jsval obj, jsval key)
         struct jsobj *a = obj.u.o;
         return i < (uint32_t)a->len ? a->items[i] : js_undefined;
     }
+    jsval out;
+    if (obj.t == JS_OBJ && obj.u.o->cls == C_HOST && key.t == JS_NUM && js_index(key, &i) &&
+        js_typed_get_index(J, obj.u.o, i, &out))
+        return out;
     if (obj.t == JS_STR && key.t == JS_NUM && js_index(key, &i))
         return i < (uint32_t)js_u16len(obj.u.s)
                    ? (jsval){JS_STR, {.s = js_u16slice(J, obj.u.s, (int)i, (int)i + 1)}}
@@ -1062,6 +1066,8 @@ void js_setv(struct js *J, jsval obj, jsval key, jsval v)
         o->items[i] = v;
         return;
     }
+    if (o->cls == C_HOST && key.t == JS_NUM && js_index(key, &i) && js_typed_set_index(J, o, i, v))
+        return;
     struct jsstr *k = js_tostr(J, key);
     if (J->throwing)
         return;

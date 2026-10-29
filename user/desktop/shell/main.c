@@ -7,6 +7,9 @@
  * "desktop --setup" is what the install CD starts instead: fluxOS Setup
  * on a screen of its own, with no taskbar or desktop icons.
  *
+ * "desktop --js-worker" is a web page's worker (the browser starts it; see
+ * wave/js/jsworker.c): a script engine and two pipes, no screen at all.
+ *
  * One loop polls the input device and every terminal's pty, handles
  * what is ready, runs the timers and repaints what changed.
  */
@@ -19,6 +22,7 @@
 #include <unistd.h>
 #include "desktop.h"
 #include "imagejobs.h"
+#include "jsworker.h"
 
 #define MAX_TERMS   32
 #define MAX_WATCHES 24
@@ -63,6 +67,8 @@ static int watching(const struct watch *w)
 
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "--js-worker"))
+        return jsworker_main(argc, argv);
     signal(SIGINT, SIG_IGN);
     signal(SIGQUIT, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);

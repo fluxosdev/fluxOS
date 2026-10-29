@@ -123,6 +123,7 @@ struct js {
     int gc_inhibit;                     /* no collections while this is above 0 (parsing) */
     void *host;
     void *network;                      /* jsnet: WebSocket worker state */
+    void *workers;                      /* jsworker: the page's dedicated workers */
     /* A promise was rejected and nothing had asked for the result by the time the microtasks ran. */
     void (*on_unhandled)(struct js *J, jsval promise, jsval reason);
     struct jsobj *global;
@@ -237,6 +238,8 @@ void js_run_jobs(struct js *J);
 void js_init_binary(struct js *J);
 int js_typed_length(jsval v);
 int js_typed_has(jsval v, const char *key);
+int js_typed_get_index(struct js *J, struct jsobj *o, uint32_t i, jsval *out);
+int js_typed_set_index(struct js *J, struct jsobj *o, uint32_t i, jsval v);
 unsigned char *js_binary_bytes(jsval v, int *len);
 jsval js_new_bytes(struct js *J, const unsigned char *p, int n);    /* a Uint8Array with a copy */
 void js_init_lib(struct js *J);

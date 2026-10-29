@@ -222,6 +222,8 @@ static void write_number(unsigned char *p, int kind, int little, double d)
             d = frac > 0.5 ? lo + 1 : frac < 0.5 ? lo : ((int)lo & 1) ? lo + 1 : lo;
         }
         bits = (uint32_t)d;
+    } else if (d > -2147483649.0 && d < 4294967296.0 && d == (double)(int64_t)d) {
+        bits = (uint32_t)(int64_t)d;    /* a whole number: the low bytes are the modulus */
     } else {
         if (isnan(d) || isinf(d))
             d = 0;
@@ -307,6 +309,35 @@ static int typed_set_prop(struct js *J, struct jsobj *o, const char *k, jsval va
     return 1;
 }
 static const struct jsclass typed_class = {"TypedArray", typed_get, typed_set_prop, NULL};
+/* a[i] and a[i] = v for the VM, without making i a string; 0 when o is not a typed array. */
+int js_typed_get_index(struct js *J, struct jsobj *o, uint32_t i, jsval *out)
+{
+    struct view *a = js_host_data(o, &typed_class);
+    if (!a)
+        return 0;
+    *out = js_undefined;
+    if (i < (uint32_t)a->len) {
+        unsigned char *at = buffer_of(js_obj(a->buffer))->data + a->offset + (size_t)i * (size_t)a->bytes;
+        *out = BIG_KIND(a->kind) ? read_big(J, at, a->kind, 1) : js_num(read_number(at, a->kind, 1));
+    }
+    return 1;
+}
+int js_typed_set_index(struct js *J, struct jsobj *o, uint32_t i, jsval v)
+{
+    struct view *a = js_host_data(o, &typed_class);
+    if (!a)
+        return 0;
+    if (BIG_KIND(a->kind)) {
+        struct jsbig *g = store_big(J, v);
+        if (g && i < (uint32_t)a->len)
+            write_big(buffer_of(js_obj(a->buffer))->data + a->offset + (size_t)i * 8, 1, jb_to_u64(g));
+        return 1;
+    }
+    double d = v.t == JS_NUM ? v.u.n : js_to_number(J, v);
+    if (i < (uint32_t)a->len && !J->throwing)
+        write_number(buffer_of(js_obj(a->buffer))->data + a->offset + (size_t)i * (size_t)a->bytes, a->kind, 1, d);
+    return 1;
+}
 static jsval new_typed(struct js *J, jsval buf, int offset, int len, int kind)
 {
     struct view *a = js_alloc(J, sizeof(*a));

@@ -134,6 +134,8 @@ int jsdom_next_timer(struct jsdom *d);
  * normal XHR body, 0 for redirect/preflight, -1 for a rejected request. */
 int jsdom_http_headers(struct jsdom *d,int id,int status,const char *headers,int hlen);
 void jsdom_http_chunk(struct jsdom *d,int id,const void *bytes,int len);
+/* Whether request id wants its body as it comes (fetch) rather than all at once. */
+int jsdom_http_streaming(struct jsdom *d,int id);
 /* An XMLHttpRequest finished: status 0 if it failed. headers is the header block. */
 void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, int hlen,
                      const char *body, int blen);

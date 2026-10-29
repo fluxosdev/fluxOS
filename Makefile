@@ -364,11 +364,11 @@ clean:
 # Run the browser's actual HTML/DOM/JS code on the host, without booting QEMU.
 HOSTCC ?= cc
 BROWSER_TEST_SRCS := lib/digest.c lib/sha256.c tests/browser-dom.c tests/canvas-font-stub.c tests/js-host-stack.c \
-	$(addprefix user/desktop/wave/js/,js.c jsbig.c jsuni.c jslib.c jslib2.c jsbinary.c jsnet.c jsre.c jsgc.c jsdom.c jscanvas.c) \
+	$(addprefix user/desktop/wave/js/,js.c jsbig.c jsuni.c jslib.c jslib2.c jsbinary.c jsnet.c jsre.c jsgc.c jsdom.c jscanvas.c jsworker.c) \
 	$(addprefix user/desktop/wave/,canvas.c html.c shadow.c webblob.c webintegrity.c webinput.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c anim.c) \
 	user/libc/inflate.c
 .PHONY: test-browser
-test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout $(BUILD)/tests/browser-policy $(BUILD)/tests/browser-http $(BUILD)/tests/browser-images $(BUILD)/tests/browser-navigation $(BUILD)/tests/browser-geometry $(BUILD)/tests/browser-drag
+test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-worker $(BUILD)/tests/jsworker $(BUILD)/tests/js-engine $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout $(BUILD)/tests/browser-policy $(BUILD)/tests/browser-http $(BUILD)/tests/browser-images $(BUILD)/tests/browser-navigation $(BUILD)/tests/browser-geometry $(BUILD)/tests/browser-drag
 	$< rootfs/usr/share/www/classlist-tests.js 20
 	$< rootfs/usr/share/www/dom-feature-tests.js 31
 	$(BUILD)/tests/browser-style
@@ -381,6 +381,7 @@ test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine $(BUILD)/tests
 	$(BUILD)/tests/browser-navigation
 	$(BUILD)/tests/browser-geometry
 	$(BUILD)/tests/browser-drag
+	$(BUILD)/tests/browser-worker
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/clone-escape-tests.js 23
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/canvas-tests.js 52
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 134
@@ -594,6 +595,18 @@ $(BUILD)/tests/browser-drag: tests/browser-drag.c $(BROWSER_TEST_SRCS) $(DESKTOP
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DIDB_DIR='"$(CURDIR)/$(BUILD)/tests/idb/"' -DJS_VM_VERIFY -pthread $(DESKTOP_INC) -Iinclude -idirafter user/include \
 		tests/browser-drag.c $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS)) -lm -o $@
+
+# Workers are processes: the page side runs in browser-worker, each worker in jsworker (its "desktop --js-worker").
+WORKER_TEST_SRCS := $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS))
+$(BUILD)/tests/jsworker: tests/jsworker-host.c $(WORKER_TEST_SRCS) $(DESKTOP_HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DIDB_DIR='"$(CURDIR)/$(BUILD)/tests/idb/"' -DJS_VM_VERIFY -pthread $(DESKTOP_INC) -Iinclude -idirafter user/include \
+		-DWORKER_HELPER='"$(CURDIR)/$@"' tests/jsworker-host.c $(WORKER_TEST_SRCS) -lm -o $@
+
+$(BUILD)/tests/browser-worker: tests/browser-worker.c $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS) $(BUILD)/tests/jsworker
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DIDB_DIR='"$(CURDIR)/$(BUILD)/tests/idb/"' -DJS_VM_VERIFY -pthread $(DESKTOP_INC) -Iinclude -idirafter user/include \
+		-DWORKER_HELPER='"$(CURDIR)/$(BUILD)/tests/jsworker"' tests/browser-worker.c $(WORKER_TEST_SRCS) -lm -o $@
 
 $(BUILD)/tests/browser-geometry: tests/browser-geometry.c $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
