@@ -1,6 +1,10 @@
 #ifndef _WCTYPE_H
 #define _WCTYPE_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <wchar.h>
 
 typedef unsigned int wctype_t;
@@ -24,5 +28,9 @@ wctype_t wctype(const char *name);
 int iswctype(wint_t c, wctype_t type);
 wctrans_t wctrans(const char *name);
 wint_t towctrans(wint_t c, wctrans_t t);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

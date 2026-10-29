@@ -1,6 +1,10 @@
 #ifndef _REGEX_H
 #define _REGEX_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 #include <sys/types.h>
 
@@ -44,5 +48,9 @@ int regcomp(regex_t *re, const char *pattern, int cflags);
 int regexec(const regex_t *re, const char *s, size_t nmatch, regmatch_t *match, int eflags);
 size_t regerror(int err, const regex_t *re, char *buf, size_t size);
 void regfree(regex_t *re);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

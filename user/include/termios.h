@@ -1,6 +1,10 @@
 #ifndef _TERMIOS_H
 #define _TERMIOS_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 /*
@@ -111,5 +115,9 @@ int tcflush(int fd, int queue);
 int tcdrain(int fd);
 int tcsendbreak(int fd, int duration);
 int tcflow(int fd, int action);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

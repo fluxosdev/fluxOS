@@ -1,6 +1,10 @@
 #ifndef _SYS_PARAM_H
 #define _SYS_PARAM_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <limits.h>
 #include <sys/types.h>
 
@@ -26,5 +30,9 @@
 #define LITTLE_ENDIAN 1234
 #define BIG_ENDIAN    4321
 #define BYTE_ORDER    LITTLE_ENDIAN
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

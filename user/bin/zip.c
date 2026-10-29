@@ -1,11 +1,12 @@
 /*
  * zip - make a ZIP archive
  *
- * Files are compressed with Deflate (LZ77 over hash chains, fixed Huffman
- * codes) or stored when that would not make them smaller. The archive is
- * made anew each time.
+ * Files are compressed with the C library's Deflate (deflate.h: LZ77 over
+ * hash chains, fixed Huffman codes) or stored when that would not make
+ * them smaller. The archive is made anew each time.
  */
 #include <archive.h>
+#include <deflate.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -17,11 +18,8 @@
 #include <unistd.h>
 
 #define MAX_IN_MEMORY (64u << 20)       /* bigger files are stored, read a piece at a time */
-#define WIN 32768
-#define HASH_SIZE 32768
-#define MAX_MATCH 258
 
-static int recursive, store_only, junk_paths, quiet, chain_limit = 64;
+static int recursive, store_only, junk_paths, quiet, level = 6;
 
 struct central {                        /* what the central directory needs about each entry */
     char *name;
@@ -44,137 +42,34 @@ static void usage(void)
     exit(2);
 }
 
-/* ---- Deflate ---- */
+/* ---- Deflate (the C library's, deflate.h) into memory ---- */
 
-struct bits {
-    uint8_t *out;
+struct membuf {
+    uint8_t *p;
     uint32_t n, cap;
-    uint32_t buf;
-    int cnt;
 };
 
-static void put_bits(struct bits *w, uint32_t v, int n)
+static int mem_write(void *ctx, const void *p, size_t n)
 {
-    w->buf |= v << w->cnt;
-    w->cnt += n;
-    while (w->cnt >= 8) {
-        if (w->n < w->cap)
-            w->out[w->n] = (uint8_t)w->buf;
-        w->n++;
-        w->buf >>= 8;
-        w->cnt -= 8;
-    }
+    struct membuf *m = ctx;
+    if (n > m->cap - m->n)
+        return 1;                               /* not getting smaller: stop */
+    memcpy(m->p + m->n, p, n);
+    m->n += (uint32_t)n;
+    return 0;
 }
 
-/* A Huffman code, most significant bit first, as Deflate's bit order wants it. */
-static void put_code(struct bits *w, uint32_t code, int len)
-{
-    uint32_t r = 0;
-    for (int i = 0; i < len; i++)
-        r |= ((code >> i) & 1) << (len - 1 - i);
-    put_bits(w, r, len);
-}
-
-static void put_symbol(struct bits *w, int sym)
-{
-    if (sym < 144)
-        put_code(w, 0x30 + (uint32_t)sym, 8);
-    else if (sym < 256)
-        put_code(w, 0x190 + (uint32_t)(sym - 144), 9);
-    else if (sym < 280)
-        put_code(w, (uint32_t)(sym - 256), 7);
-    else
-        put_code(w, 0xC0 + (uint32_t)(sym - 280), 8);
-}
-
-static const uint16_t len_base[29] = {
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
-    35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
-static const uint8_t len_extra[29] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
-static const uint16_t dist_base[30] = {
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
-    257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
-static const uint8_t dist_extra[30] = {
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
-
-static void put_match(struct bits *w, int len, int dist)
-{
-    int i = 28;
-    while (len_base[i] > len)
-        i--;
-    put_symbol(w, 257 + i);
-    put_bits(w, (uint32_t)(len - len_base[i]), len_extra[i]);
-    int d = 29;
-    while (dist_base[d] > dist)
-        d--;
-    put_code(w, (uint32_t)d, 5);
-    put_bits(w, (uint32_t)(dist - dist_base[d]), dist_extra[d]);
-}
-
-/* Compress in[0..n) into one fixed-Huffman block; returns its size, or 0 if it
- * would not be smaller than n. */
+/* Compress in[0..n) into out; returns its size, or 0 if it would not be smaller than n. */
 static uint32_t deflate(const uint8_t *in, uint32_t n, uint8_t *out, uint32_t cap)
 {
-    int32_t *head = malloc(HASH_SIZE * sizeof(int32_t)), *prev = malloc(WIN * sizeof(int32_t));
-    if (!head || !prev) {
-        free(head);
-        free(prev);
+    struct membuf m = { out, 0, cap };
+    struct deflate *d = deflate_open(level, mem_write, &m);
+    if (!d)
         return 0;
-    }
-    for (int i = 0; i < HASH_SIZE; i++)
-        head[i] = -1;
-    struct bits w = { out, 0, cap, 0, 0 };
-    put_bits(&w, 1, 1);                         /* the last block */
-    put_bits(&w, 1, 2);                         /* fixed codes */
-    uint32_t pos = 0;
-#define HASH(p) ((((uint32_t)(p)[0] << 10) ^ ((uint32_t)(p)[1] << 5) ^ (p)[2]) & (HASH_SIZE - 1))
-    while (pos < n && w.n < cap) {
-        int best = 0, best_dist = 0;
-        if (pos + 3 <= n) {
-            uint32_t h = HASH(in + pos);
-            int32_t cand = head[h];
-            int chain = chain_limit;
-            uint32_t limit = n - pos < MAX_MATCH ? n - pos : MAX_MATCH;
-            while (cand >= 0 && pos - (uint32_t)cand <= WIN && chain-- > 0) {
-                const uint8_t *a = in + cand, *b = in + pos;
-                if (a[best] == b[best] && a[0] == b[0]) {
-                    uint32_t l = 0;
-                    while (l < limit && a[l] == b[l])
-                        l++;
-                    if ((int)l > best) {
-                        best = (int)l;
-                        best_dist = (int)(pos - (uint32_t)cand);
-                        if (l == limit)
-                            break;
-                    }
-                }
-                int32_t next = prev[cand & (WIN - 1)];
-                if (next >= cand)
-                    break;
-                cand = next;
-            }
-            prev[pos & (WIN - 1)] = head[h];
-            head[h] = (int32_t)pos;
-        }
-        if (best >= 3) {
-            put_match(&w, best, best_dist);
-            for (uint32_t k = pos + 1; k < pos + (uint32_t)best && k + 3 <= n; k++) {
-                uint32_t h = HASH(in + k);
-                prev[k & (WIN - 1)] = head[h];
-                head[h] = (int32_t)k;
-            }
-            pos += (uint32_t)best;
-        } else {
-            put_symbol(&w, in[pos++]);
-        }
-    }
-    put_symbol(&w, 256);
-    if (w.cnt)
-        put_bits(&w, 0, 8 - w.cnt);
-    free(head);
-    free(prev);
-    return w.n < cap && w.n < n ? w.n : 0;
+    int r = deflate_write(d, in, n);
+    if (deflate_close(d) || r)
+        return 0;
+    return m.n < n ? m.n : 0;
 }
 
 /* ---- writing the archive ---- */
@@ -447,7 +342,7 @@ int main(int argc, char **argv)
             else if (*o == '0')
                 store_only = 1;
             else if (*o >= '1' && *o <= '9')
-                chain_limit = 4 << (*o - '1');  /* -1: 4 ... -9: 1024 */
+                level = *o - '0';
             else
                 usage();
         }

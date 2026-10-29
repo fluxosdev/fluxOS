@@ -348,10 +348,10 @@ int wfont_init(void)
     uint8_t *buf = malloc(st.st_size);
     uint32_t got = 0;
     int r = 1;
-    while (buf && got < st.st_size && (r = (int)read(fd, buf + got, st.st_size - got)) > 0)
+    while (buf && got < (uint32_t)st.st_size && (r = (int)read(fd, buf + got, (uint32_t)st.st_size - got)) > 0)
         got += (uint32_t)r;
     close(fd);
-    if (!buf || got != st.st_size || memcmp(buf, "FXWA", 4) != 0) {
+    if (!buf || got != (uint32_t)st.st_size || memcmp(buf, "FXWA", 4) != 0) {
         free(buf);
         return -1;
     }

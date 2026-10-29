@@ -1,6 +1,10 @@
 #ifndef _SYS_TYPES_H
 #define _SYS_TYPES_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -36,5 +40,9 @@ typedef uint8_t u_int8_t;
 typedef uint16_t u_int16_t;
 typedef uint32_t u_int32_t;
 typedef uint64_t u_int64_t;
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

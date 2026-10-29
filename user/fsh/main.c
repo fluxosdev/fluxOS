@@ -142,6 +142,10 @@ static void interactive_loop(void)
             continue;
         }
 
+        if (sh.noexec) {
+            node_free(tree);
+            continue;
+        }
         exec_node(tree);
         node_free(tree);
         fflush(stdout);
@@ -164,34 +168,98 @@ static int run_stdin(void)
     return st;
 }
 
+/* The shell's exit: the EXIT trap first. */
+static int finish(int status)
+{
+    fflush(stdout);
+    sh.exit_code = sh.exiting ? sh.exit_code : status;
+    sh.exiting = 1;
+    trap_run_exit();
+    fflush(stdout);
+    fflush(stderr);
+    return sh.exit_code;
+}
+
 int main(int argc, char **argv)
 {
     sh.argv0 = argv[0];
     int login = argv[0][0] == '-';
     int i = 1;
     const char *command = NULL;
+    int read_stdin = 0;
 
-    for (; i < argc && argv[i][0] == '-'; i++) {
-        if (!strcmp(argv[i], "-c") && i + 1 < argc) {
-            command = argv[++i];
+    /* "sh" (or "-sh" at login): the POSIX shell */
+    const char *base = strrchr(argv[0], '/');
+    base = base ? base + 1 : argv[0];
+    if (*base == '-')
+        base++;
+    if (!strcmp(base, "sh"))
+        sh.posix = 1;
+
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--")) {
             i++;
             break;
-        } else if (!strcmp(argv[i], "-l")) {
-            login = 1;
-        } else if (!strcmp(argv[i], "--")) {
-            i++;
-            break;
-        } else if (!strcmp(argv[i], "--version")) {
-            printf("fsh 0.3.0 (fluxOS)\n");
-            return 0;
-        } else {
-            fsh_error("bad option: %s", argv[i]);
-            return 1;
         }
+        if (!strcmp(a, "--version")) {
+            printf("fsh 0.3.0 (fluxOS)%s\n", sh.posix ? ", as sh" : "");
+            return 0;
+        }
+        if (!strcmp(a, "--posix")) {
+            sh.posix = 1;
+            continue;
+        }
+        if (!strcmp(a, "--login")) {
+            login = 1;
+            continue;
+        }
+        if (a[1] == '-') {
+            fsh_error("bad option: %s", a);
+            return 2;
+        }
+        /* bundles like -ec: c takes the command string, o an option name */
+        int stop = 0;
+        for (const char *o = a + 1; *o && !stop; o++) {
+            switch (*o) {
+            case 'c':
+                if (i + 1 >= argc) {
+                    fsh_error("-c: requires an argument");
+                    return 2;
+                }
+                command = argv[++i];
+                stop = 1;
+                break;
+            case 'l': login = 1; break;
+            case 's': read_stdin = 1; break;
+            case 'i': break;
+            case 'o':
+                if (i + 1 < argc) {
+                    char *setargv[] = { "set", "-o", argv[++i], NULL };
+                    find_builtin("set")(3, setargv);
+                }
+                break;
+            default:
+                if (set_option(*o, 1) < 0) {
+                    fsh_error("bad option: -%c", *o);
+                    return 2;
+                }
+            }
+        }
+        if (stop) {
+            i++;
+            break;
+        }
+    }
+    /* "+e" and the like turn options off */
+    while (i < argc && argv[i][0] == '+' && argv[i][1]) {
+        for (const char *o = argv[i] + 1; *o; o++)
+            set_option(*o, 0);
+        i++;
     }
 
     set_default("PATH", "/bin:/usr/bin");
-    set_default("SHELL", "/bin/fsh");
+    set_default("SHELL", sh.posix ? "/bin/sh" : "/bin/fsh");
     set_default("HOME", "/");
     set_default("USER", "flux");
     set_default("HOST", "fluxOS");
@@ -207,24 +275,25 @@ int main(int argc, char **argv)
         sh.posv = argv + i;
         sh.posc = argc - i;
         int st = run_string(command);
-        fflush(stdout);
-        return sh.exiting ? sh.exit_code : st;
+        return finish(st);
     }
 
-    if (i < argc) {
+    if (i < argc && !read_stdin) {
         /* fsh script [args...] */
         sh.argv0 = argv[i];
         sh.posv = argv + i + 1;
         sh.posc = argc - i - 1;
         int st = source_file(argv[i], 0);
-        fflush(stdout);
-        return sh.exiting ? sh.exit_code : st;
+        return finish(st);
+    }
+    if (read_stdin && i < argc) {
+        sh.posv = argv + i;
+        sh.posc = argc - i;
     }
 
-    if (!isatty(0)) {
+    if (!isatty(0) || read_stdin) {
         int st = run_stdin();
-        fflush(stdout);
-        return sh.exiting ? sh.exit_code : st;
+        return finish(st);
     }
 
     sh.interactive = 1;
@@ -239,13 +308,16 @@ int main(int argc, char **argv)
     tcsetpgrp(0, sh.shell_pgid);
 
     (void)login;
-    source_file("/etc/fshrc", 1);
-    char rc[PATH_MAX];
-    snprintf(rc, sizeof(rc), "%s/.fshrc", getenv("HOME"));
-    source_file(rc, 1);
+    if (!sh.posix) {
+        source_file("/etc/fshrc", 1);
+        char rc[PATH_MAX];
+        snprintf(rc, sizeof(rc), "%s/.fshrc", getenv("HOME"));
+        source_file(rc, 1);
+    } else if (getenv("ENV")) {
+        source_file(getenv("ENV"), 1);
+    }
     sh.exiting = 0;
 
     interactive_loop();
-    fflush(stdout);
-    return sh.exit_code;
+    return finish(sh.exit_code);
 }

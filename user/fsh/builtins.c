@@ -1,6 +1,7 @@
 /* Shell builtins and the alias table. */
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +9,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "fsh.h"
+
+#define NSIGS 32
 
 /* ---- aliases ---- */
 
@@ -309,9 +312,21 @@ static int bi_printf(int argc, char **argv)
                 if (arg && *arg)
                     putchar(*arg);
             } else if (strchr("diuxXo", conv)) {
+                spec[k++] = 'l';
+                spec[k++] = 'l';
                 spec[k++] = conv;
                 spec[k] = 0;
-                snprintf(out, sizeof(out), spec, arg ? (int)strtol(arg, NULL, 0) : 0);
+                long long v = 0;
+                if (arg && (arg[0] == '\'' || arg[0] == '"'))
+                    v = (unsigned char)arg[1];
+                else if (arg)
+                    v = strtoll(arg, NULL, 0);
+                snprintf(out, sizeof(out), spec, v);
+                fputs(out, stdout);
+            } else if (strchr("eEfFgGaA", conv)) {
+                spec[k++] = conv;
+                spec[k] = 0;
+                snprintf(out, sizeof(out), spec, arg ? strtod(arg, NULL) : 0.0);
                 fputs(out, stdout);
             } else {
                 putchar('%');
@@ -363,7 +378,7 @@ static int bi_export(int argc, char **argv)
             continue;
         }
         if (eq)
-            putenv(argv[i]);
+            assign_env(argv[i]);
         else if (!getenv(argv[i]))
             setenv(argv[i], "", 1);
     }
@@ -372,12 +387,55 @@ static int bi_export(int argc, char **argv)
 
 static int bi_unset(int argc, char **argv)
 {
+    int funcs = 0;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-f") || !strcmp(argv[i], "-v"))
+        if (!strcmp(argv[i], "-f")) {
+            funcs = 1;
             continue;
-        unsetenv(argv[i]);
+        }
+        if (!strcmp(argv[i], "-v")) {
+            funcs = 0;
+            continue;
+        }
+        if (funcs)
+            func_unset(argv[i]);
+        else {
+            unsetenv(argv[i]);
+            func_unset(argv[i]);        /* POSIX: without -f, the variable, else the function */
+        }
     }
     return 0;
+}
+
+/* set -e and friends (also sh's command line flags); -1 for an unknown letter. */
+int set_option(char opt, int on)
+{
+    switch (opt) {
+    case 'e': sh.errexit = on; return 0;
+    case 'u': sh.nounset = on; return 0;
+    case 'x': sh.xtrace = on; return 0;
+    case 'f': sh.noglob = on; return 0;
+    case 'n': sh.noexec = on; return 0;
+    case 'a': case 'b': case 'C': case 'h': case 'm': case 'v': case 'i': case 's': case 'p':
+        return 0;                       /* accepted: nothing to do here */
+    }
+    return -1;
+}
+
+static const struct { const char *name; char opt; } option_names[] = {
+    { "errexit", 'e' }, { "nounset", 'u' }, { "xtrace", 'x' }, { "noglob", 'f' }, { "noexec", 'n' },
+    { "allexport", 'a' }, { "notify", 'b' }, { "noclobber", 'C' }, { "monitor", 'm' }, { "verbose", 'v' },
+    { "ignoreeof", 'i' }, { "vi", 'v' }, { "emacs", 'v' }, { "pipefail", 'p' }, { "posix", 'p' },
+};
+
+static void set_positional(int argc, char **argv, int from)
+{
+    static struct strvec params;
+    sv_free(&params);
+    for (int i = from; i < argc; i++)
+        sv_push(&params, xstrdup(argv[i]));
+    sh.posv = sv_terminate(&params);
+    sh.posc = params.n;
 }
 
 static int bi_set(int argc, char **argv)
@@ -386,17 +444,207 @@ static int bi_set(int argc, char **argv)
         print_env_sorted("");
         return 0;
     }
-    if (!strcmp(argv[1], "--")) {
-        static struct strvec params;
-        sv_free(&params);
-        for (int i = 2; i < argc; i++)
-            sv_push(&params, xstrdup(argv[i]));
-        sh.posv = sv_terminate(&params);
-        sh.posc = params.n;
+    int i = 1;
+    for (; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--")) {
+            set_positional(argc, argv, i + 1);
+            return 0;
+        }
+        if (!strcmp(a, "-") || !strcmp(a, "+")) {
+            i++;
+            break;
+        }
+        if (a[0] != '-' && a[0] != '+')
+            break;
+        int on = a[0] == '-';
+        if (a[1] == 'o' && !a[2]) {
+            if (i + 1 >= argc) {        /* set -o: the options */
+                printf("errexit         %s\nnounset         %s\nxtrace          %s\nnoglob          %s\n",
+                       sh.errexit ? "on" : "off", sh.nounset ? "on" : "off", sh.xtrace ? "on" : "off",
+                       sh.noglob ? "on" : "off");
+                continue;
+            }
+            const char *name = argv[++i];
+            int found = 0;
+            for (size_t k = 0; k < sizeof(option_names) / sizeof(option_names[0]); k++)
+                if (!strcmp(option_names[k].name, name)) {
+                    set_option(option_names[k].opt, on);
+                    found = 1;
+                }
+            if (!found) {
+                fsh_error("set: no such option: %s", name);
+                return 2;
+            }
+            continue;
+        }
+        for (const char *o = a + 1; *o; o++)
+            if (set_option(*o, on) < 0) {
+                fsh_error("set: unsupported option: -%c", *o);
+                return 2;
+            }
+    }
+    if (i < argc || (i == argc && argc > 1 && (!strcmp(argv[argc - 1], "-") || !strcmp(argv[argc - 1], "+"))))
+        set_positional(argc, argv, i);
+    return 0;
+}
+
+static int bi_local(int argc, char **argv)
+{
+    if (!sh.func_depth) {
+        fsh_error("local: can only be used in a function");
+        return 1;
+    }
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] == '-')
+            continue;
+        char *eq = strchr(argv[i], '=');
+        size_t nlen = eq ? (size_t)(eq - argv[i]) : strlen(argv[i]);
+        char *name = xstrndup(argv[i], nlen);
+        if (!is_valid_name(name, nlen)) {
+            fsh_error("local: not an identifier: %s", name);
+            free(name);
+            return 1;
+        }
+        local_declare(name);
+        if (eq)
+            setenv(name, eq + 1, 1);
+        free(name);
+    }
+    return 0;
+}
+
+static int bi_readonly(int argc, char **argv)
+{
+    for (int i = 1; i < argc; i++)
+        if (strchr(argv[i], '=') && argv[i][0] != '-')
+            assign_env(argv[i]);
+    return 0;
+}
+
+static int bi_umask(int argc, char **argv)
+{
+    int i = 1;
+    if (i < argc && (!strcmp(argv[i], "-S") || !strcmp(argv[i], "-p")))
+        i++;
+    if (i >= argc) {
+        mode_t m = umask(0);
+        umask(m);
+        printf("%04o\n", (unsigned)m);
         return 0;
     }
-    fsh_error("set: unsupported option: %s", argv[1]);
-    return 1;
+    char *end;
+    long m = strtol(argv[i], &end, 8);
+    if (*end || m < 0 || m > 0777) {
+        fsh_error("umask: invalid mode: %s", argv[i]);
+        return 1;
+    }
+    umask((mode_t)m);
+    return 0;
+}
+
+static int bi_hash(int argc, char **argv) { return 0; }
+static int bi_ulimit(int argc, char **argv)
+{
+    if (argc < 2 || argv[argc - 1][0] == '-')
+        puts("unlimited");
+    return 0;
+}
+
+/* getopts optstring name [args...] */
+static int bi_getopts(int argc, char **argv)
+{
+    if (argc < 3) {
+        fsh_error("getopts: usage: getopts optstring name [arg...]");
+        return 2;
+    }
+    const char *optstring = argv[1], *name = argv[2];
+    char **args = argc > 3 ? argv + 3 : sh.posv;
+    int nargs = argc > 3 ? argc - 3 : sh.posc;
+    int silent = optstring[0] == ':';
+    if (silent)
+        optstring++;
+    const char *oi = getenv("OPTIND");
+    int optind = oi ? atoi(oi) : 1;
+    static int optpos;                  /* within a bundle like -abc */
+    static int last_optind;
+    if (optind != last_optind)
+        optpos = 0;
+    if (optind < 1)
+        optind = 1;
+    char num[16];
+    if (optind > nargs) {
+        setenv(name, "?", 1);
+        return 1;
+    }
+    const char *arg = args[optind - 1];
+    if (!optpos) {
+        if (arg[0] != '-' || !arg[1]) {
+            setenv(name, "?", 1);
+            return 1;
+        }
+        if (!strcmp(arg, "--")) {
+            snprintf(num, sizeof(num), "%d", optind + 1);
+            setenv("OPTIND", num, 1);
+            setenv(name, "?", 1);
+            return 1;
+        }
+        optpos = 1;
+    }
+    char c = arg[optpos];
+    const char *spec = c == ':' ? NULL : strchr(optstring, c);
+    char cs[2] = { c, 0 };
+    if (!spec) {
+        setenv(name, "?", 1);
+        if (silent)
+            setenv("OPTARG", cs, 1);
+        else {
+            fsh_error("getopts: illegal option -- %c", c);
+            unsetenv("OPTARG");
+        }
+        optpos++;
+    } else if (spec[1] == ':') {
+        if (arg[optpos + 1]) {
+            setenv("OPTARG", arg + optpos + 1, 1);
+            optind++;
+        } else if (optind < nargs) {
+            setenv("OPTARG", args[optind], 1);
+            optind += 2;
+        } else {
+            if (silent) {
+                setenv(name, ":", 1);
+                setenv("OPTARG", cs, 1);
+            } else {
+                fsh_error("getopts: option requires an argument -- %c", c);
+                setenv(name, "?", 1);
+                unsetenv("OPTARG");
+            }
+            optind++;
+            optpos = 0;
+            snprintf(num, sizeof(num), "%d", optind);
+            setenv("OPTIND", num, 1);
+            last_optind = optind;
+            return 0;
+        }
+        setenv(name, cs, 1);
+        optpos = 0;
+        snprintf(num, sizeof(num), "%d", optind);
+        setenv("OPTIND", num, 1);
+        last_optind = optind;
+        return 0;
+    } else {
+        setenv(name, cs, 1);
+        unsetenv("OPTARG");
+        optpos++;
+    }
+    if (!arg[optpos]) {
+        optind++;
+        optpos = 0;
+    }
+    snprintf(num, sizeof(num), "%d", optind);
+    setenv("OPTIND", num, 1);
+    last_optind = optind;
+    return 0;
 }
 
 static int bi_shift(int argc, char **argv)
@@ -465,6 +713,9 @@ static int bi_read(int argc, char **argv)
             raw = 1;
         } else if (!strcmp(argv[i], "-p") && i + 1 < argc) {
             fputs(argv[++i], stderr);
+        } else if (!strcmp(argv[i], "--")) {
+            i++;
+            break;
         } else {
             break;
         }
@@ -492,23 +743,39 @@ static int bi_read(int argc, char **argv)
     if (i >= argc) {
         setenv("REPLY", s, 1);
     } else {
+        /* fields separated by IFS: blanks in it are trimmed and collapsed, other
+         * characters in it each end a field; the last variable gets the rest */
+        const char *ifs = getenv("IFS");
+        if (!ifs)
+            ifs = " \t\n";
         char *p = s;
         for (; i < argc; i++) {
-            while (*p == ' ' || *p == '\t')
+            while (*p && strchr(ifs, *p) && (*p == ' ' || *p == '\t' || *p == '\n'))
                 p++;
             if (i == argc - 1) {
                 size_t len = strlen(p);
-                while (len && (p[len - 1] == ' ' || p[len - 1] == '\t'))
+                while (len && strchr(ifs, p[len - 1]) && (p[len - 1] == ' ' || p[len - 1] == '\t' || p[len - 1] == '\n'))
                     p[--len] = 0;
                 setenv(argv[i], p, 1);
                 break;
             }
-            char *end = p + strcspn(p, " \t");
+            char *end = p;
+            while (*end && !strchr(ifs, *end))
+                end++;
             char save = *end;
             *end = 0;
             setenv(argv[i], p, 1);
-            *end = save;
-            p = end;
+            if (save) {
+                *end = save;
+                p = end;
+                /* one separator: blanks around a non-blank one are absorbed */
+                while (*p && (*p == ' ' || *p == '\t' || *p == '\n') && strchr(ifs, *p))
+                    p++;
+                if (*p && strchr(ifs, *p) && !(*p == ' ' || *p == '\t' || *p == '\n'))
+                    p++;
+            } else {
+                p = end;
+            }
         }
     }
     free(s);
@@ -589,6 +856,12 @@ static int bi_eval(int argc, char **argv)
 
 /* ---- test / [ ---- */
 
+static int bi_test(int argc, char **argv)
+{
+    return test_eval(argc, argv);
+}
+
+#if 0
 static int file_test(char op, const char *path)
 {
     struct stat st;
@@ -652,17 +925,7 @@ static int test_expr(char **a, int n)
     return test_primary(a, n);
 }
 
-static int bi_test(int argc, char **argv)
-{
-    if (!strcmp(argv[0], "[")) {
-        if (strcmp(argv[argc - 1], "]") != 0) {
-            fsh_error("[: ']' expected");
-            return 2;
-        }
-        argc--;
-    }
-    return test_expr(argv + 1, argc - 1) ? 0 : 1;
-}
+#endif
 
 /* ---- jobs and signals ---- */
 
@@ -728,6 +991,64 @@ static int bi_kill(int argc, char **argv)
         }
     }
     return status;
+}
+
+/* trap [action] [signal...]; trap -l; trap -p */
+static int bi_trap(int argc, char **argv)
+{
+    if (argc < 2 || !strcmp(argv[1], "-p")) {
+        for (int sig = 0; sig < NSIGS; sig++) {
+            const char *a = trap_get(sig);
+            if (!a)
+                continue;
+            printf("trap -- ");
+            print_quoted(a);
+            if (sig == TRAP_EXIT)
+                printf(" EXIT\n");
+            else {
+                const char *nm = NULL;
+                for (size_t k = 0; k < sizeof(signames) / sizeof(signames[0]); k++)
+                    if (signames[k].sig == sig)
+                        nm = signames[k].name;
+                printf(" %s\n", nm ? nm : "");
+            }
+        }
+        return 0;
+    }
+    if (!strcmp(argv[1], "-l")) {
+        char *a[] = { "kill", "-l", NULL };
+        return bi_kill(2, a);
+    }
+    int i = 1;
+    const char *action = argv[i++];
+    if (!strcmp(action, "-"))
+        action = NULL;
+    else if (!strcmp(action, "--") && i < argc)
+        action = argv[i++];
+    /* "trap SIG": only signals given: reset them */
+    int first_is_signal = action && (isdigit((unsigned char)action[0]) || parse_signal(action) >= 0 ||
+                                     !strcasecmp(action, "EXIT")) && i >= argc;
+    if (first_is_signal) {
+        i--;
+        action = NULL;
+    }
+    if (i >= argc) {
+        fsh_error("trap: usage: trap [action] signal...");
+        return 1;
+    }
+    for (; i < argc; i++) {
+        int sig;
+        if (!strcasecmp(argv[i], "EXIT") || !strcmp(argv[i], "0"))
+            sig = TRAP_EXIT;
+        else
+            sig = parse_signal(argv[i]);
+        if (sig < 0 || sig >= NSIGS) {
+            fsh_error("trap: %s: invalid signal specification", argv[i]);
+            return 1;
+        }
+        trap_set(sig, action);
+    }
+    return 0;
 }
 
 static int bi_jobs(int argc, char **argv)
@@ -796,7 +1117,7 @@ static int bi_history(int argc, char **argv)
 /* ---- introspection ---- */
 
 static const char *const reserved[] = { "if", "then", "elif", "else", "fi", "for", "in",
-                                        "while", "until", "do", "done", "function",
+                                        "while", "until", "do", "done", "function", "case", "esac",
                                         "time", "{", "}", "!", NULL };
 
 static int describe(const char *name, int style)
@@ -817,7 +1138,7 @@ static int describe(const char *name, int style)
         printf(style ? "%s is a shell function\n" : "%s () { ... }\n", name);
         return 0;
     }
-    if (find_builtin(name) || !strcmp(name, "exec")) {
+    if (find_builtin(name) || !strcmp(name, "exec") || !strcmp(name, "command")) {
         printf(style ? "%s is a shell builtin\n" : "%s: shell built-in command\n", name);
         return 0;
     }
@@ -879,23 +1200,23 @@ static const struct {
     { ".", bi_source }, { ":", bi_true }, { "[", bi_test }, { "alias", bi_alias },
     { "break", bi_break }, { "cd", bi_cd }, { "continue", bi_continue },
     { "bg", bi_bg }, { "dirs", bi_dirs }, { "echo", bi_echo }, { "eval", bi_eval }, { "exit", bi_exit },
-    { "export", bi_export }, { "false", bi_false }, { "fg", bi_fg },
-    { "help", bi_help }, { "history", bi_history }, { "jobs", bi_jobs },
-    { "kill", bi_kill }, { "logout", bi_exit }, { "popd", bi_popd },
+    { "export", bi_export }, { "false", bi_false }, { "fg", bi_fg }, { "getopts", bi_getopts },
+    { "hash", bi_hash }, { "help", bi_help }, { "history", bi_history }, { "jobs", bi_jobs },
+    { "kill", bi_kill }, { "local", bi_local }, { "logout", bi_exit }, { "popd", bi_popd },
     { "print", bi_echo }, { "printf", bi_printf }, { "pushd", bi_pushd },
-    { "pwd", bi_pwd }, { "read", bi_read }, { "return", bi_return }, { "set", bi_set },
-    { "shift", bi_shift }, { "source", bi_source }, { "test", bi_test },
-    { "true", bi_true }, { "type", bi_type }, { "unalias", bi_unalias },
-    { "unset", bi_unset }, { "wait", bi_wait }, { "whence", bi_which },
-    { "which", bi_which },
+    { "pwd", bi_pwd }, { "read", bi_read }, { "readonly", bi_readonly }, { "return", bi_return },
+    { "set", bi_set }, { "shift", bi_shift }, { "source", bi_source }, { "test", bi_test },
+    { "trap", bi_trap }, { "true", bi_true }, { "type", bi_type }, { "ulimit", bi_ulimit },
+    { "umask", bi_umask }, { "unalias", bi_unalias }, { "unset", bi_unset }, { "wait", bi_wait },
+    { "whence", bi_which }, { "which", bi_which },
 };
 
 const char *const builtin_names[] = {
-    ".", ":", "[", "alias", "bg", "break", "cd", "continue", "dirs", "echo", "eval", "exec",
-    "exit", "export", "false", "fg", "help", "history", "jobs", "kill", "logout",
-    "popd", "print", "printf", "pushd", "pwd", "read", "return", "set", "shift",
-    "source", "test", "true", "type", "unalias", "unset", "wait", "whence", "which",
-    NULL,
+    ".", ":", "[", "alias", "bg", "break", "cd", "command", "continue", "dirs", "echo", "eval", "exec",
+    "exit", "export", "false", "fg", "getopts", "hash", "help", "history", "jobs", "kill", "local",
+    "logout", "popd", "print", "printf", "pushd", "pwd", "read", "readonly", "return", "set", "shift",
+    "source", "test", "trap", "true", "type", "ulimit", "umask", "unalias", "unset", "wait", "whence",
+    "which", NULL,
 };
 
 builtin_fn find_builtin(const char *name)

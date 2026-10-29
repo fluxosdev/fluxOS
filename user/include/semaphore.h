@@ -5,6 +5,10 @@
 #ifndef _SEMAPHORE_H
 #define _SEMAPHORE_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <time.h>
 
 typedef struct {
@@ -24,5 +28,9 @@ int sem_getvalue(sem_t *s, int *value);
 sem_t *sem_open(const char *name, int flags, ...);
 int sem_close(sem_t *s);
 int sem_unlink(const char *name);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

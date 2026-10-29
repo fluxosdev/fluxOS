@@ -10,6 +10,10 @@
 #ifndef _PTHREAD_H
 #define _PTHREAD_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sched.h>
 #include <signal.h>
 #include <stddef.h>
@@ -212,5 +216,9 @@ void __pthread_cleanup_pop(struct __pthread_cleanup *c, int run);
     do { struct __pthread_cleanup __cleanup; __pthread_cleanup_push(&__cleanup, (fn), (arg));
 #define pthread_cleanup_pop(run) \
     __pthread_cleanup_pop(&__cleanup, (run)); } while (0)
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

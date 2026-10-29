@@ -6,6 +6,10 @@
 #ifndef FLUX_ABI_H
 #define FLUX_ABI_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 
 /* ---- errno values ---- */
@@ -157,12 +161,12 @@ struct stat {
     uint32_t st_uid;
     uint32_t st_gid;
     uint32_t st_rdev;           /* device number for device nodes */
-    uint32_t st_size;
+    int32_t  st_size;           /* off_t: files are under 2 GiB */
     uint32_t st_blksize;        /* the preferred I/O size */
     uint32_t st_blocks;         /* 512-byte blocks */
-    uint32_t st_atime;
-    uint32_t st_mtime;
-    uint32_t st_ctime;
+    int32_t  st_atime;          /* time_t */
+    int32_t  st_mtime;
+    int32_t  st_ctime;
 };
 
 #define MAJOR(dev) (((dev) >> 8) & 0xFF)
@@ -855,8 +859,15 @@ struct pollfd {
 };
 
 /* ---- sockets (IPv4 only) ---- */
+#define AF_UNSPEC 0
+#define AF_UNIX 1                   /* not provided: socket() fails with EAFNOSUPPORT */
+#define AF_LOCAL AF_UNIX
 #define AF_INET 2
+#define AF_INET6 10                 /* not provided either */
+#define PF_UNSPEC AF_UNSPEC
+#define PF_UNIX AF_UNIX
 #define PF_INET AF_INET
+#define PF_INET6 AF_INET6
 
 #define SOCK_STREAM 1
 #define SOCK_DGRAM  2
@@ -965,5 +976,9 @@ struct powerinfo {
 
 /* timer frequency; SYS_uptime reports milliseconds */
 #define HZ 100
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

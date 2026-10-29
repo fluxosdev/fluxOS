@@ -63,6 +63,135 @@ void func_set(const char *name, struct node *body)
     nfuncs++;
 }
 
+void func_unset(const char *name)
+{
+    for (int i = 0; i < nfuncs; i++)
+        if (!strcmp(funcs[i].name, name)) {
+            free(funcs[i].name);
+            node_free(funcs[i].body);
+            funcs[i] = funcs[--nfuncs];
+            return;
+        }
+}
+
+/* ---- traps (sh mode) ---- */
+
+#define NTRAPS 32
+static char *traps[NTRAPS];
+static volatile int trap_pending[NTRAPS];
+static int any_trap_pending;
+
+static void trap_handler(int sig)
+{
+    if (sig > 0 && sig < NTRAPS) {
+        trap_pending[sig] = 1;
+        any_trap_pending = 1;
+    }
+}
+
+void trap_set(int sig, const char *action)
+{
+    if (sig < 0 || sig >= NTRAPS)
+        return;
+    free(traps[sig]);
+    traps[sig] = action ? xstrdup(action) : NULL;
+    if (sig == TRAP_EXIT)
+        return;
+    if (!action)
+        signal(sig, SIG_DFL);
+    else if (!*action)
+        signal(sig, SIG_IGN);
+    else
+        signal(sig, trap_handler);
+}
+
+const char *trap_get(int sig)
+{
+    return sig >= 0 && sig < NTRAPS ? traps[sig] : NULL;
+}
+
+void trap_run_pending(void)
+{
+    if (!any_trap_pending)
+        return;
+    any_trap_pending = 0;
+    int saved = sh.last_status;
+    for (int sig = 1; sig < NTRAPS; sig++) {
+        if (!trap_pending[sig])
+            continue;
+        trap_pending[sig] = 0;
+        if (traps[sig] && *traps[sig])
+            run_string(traps[sig]);
+    }
+    sh.last_status = saved;
+}
+
+void trap_run_exit(void)
+{
+    char *action = traps[TRAP_EXIT];
+    if (!action || !*action)
+        return;
+    traps[TRAP_EXIT] = NULL;            /* once: the action may call exit itself */
+    int saved = sh.exit_code;
+    sh.exiting = 0;
+    run_string(action);
+    sh.exiting = 1;
+    sh.exit_code = saved;
+    free(action);
+}
+
+/* A subshell or a command about to be run: traps go back to the defaults,
+ * except for signals being ignored, which stay ignored. */
+void traps_reset_for_child(void)
+{
+    for (int sig = 0; sig < NTRAPS; sig++) {
+        if (!traps[sig])
+            continue;
+        if (*traps[sig] && sig != TRAP_EXIT)
+            signal(sig, SIG_DFL);
+        free(traps[sig]);
+        traps[sig] = NULL;
+    }
+}
+
+/* ---- local variables: saved until the function returns ---- */
+
+struct local_var {
+    char *name, *old;                   /* old NULL: was unset */
+};
+static struct local_var *locals;
+static int nlocals, cap_locals;
+
+void local_declare(const char *name)
+{
+    if (nlocals == cap_locals) {
+        cap_locals = cap_locals ? cap_locals * 2 : 16;
+        locals = xrealloc(locals, sizeof(*locals) * (size_t)cap_locals);
+    }
+    const char *v = getenv(name);
+    locals[nlocals].name = xstrdup(name);
+    locals[nlocals].old = v ? xstrdup(v) : NULL;
+    nlocals++;
+}
+
+int locals_mark(void)
+{
+    return nlocals;
+}
+
+void locals_restore(int mark)
+{
+    while (nlocals > mark) {
+        struct local_var *l = &locals[--nlocals];
+        if (l->old)
+            setenv(l->name, l->old, 1);
+        else
+            unsetenv(l->name);
+        free(l->name);
+        free(l->old);
+    }
+}
+
 /* ---- command lookup ---- */
 
 static int is_executable(const char *path)
@@ -305,11 +434,60 @@ static void restore_fds(struct saved_fds *s)
     s->n = 0;
 }
 
+/* A here document on fd: its body (expanded unless the delimiter was quoted)
+ * comes through a pipe; a body too big for one is written by a child. */
+static int apply_heredoc(const struct redir *r, struct saved_fds *save)
+{
+    char *body = r->flags & HD_QUOTED ? xstrdup(r->target) : expand_heredoc(r->target);
+    int p[2];
+    if (pipe(p) < 0) {
+        fsh_error("pipe: %s", errmsg(errno));
+        free(body);
+        return -1;
+    }
+    size_t len = strlen(body);
+    if (len <= 32768) {
+        const char *q = body;
+        while (len) {
+            int w = (int)write(p[1], q, len);
+            if (w <= 0)
+                break;
+            q += w;
+            len -= (size_t)w;
+        }
+    } else {
+        int pid = fork();
+        if (pid == 0) {
+            close(p[0]);
+            const char *q = body;
+            while (len) {
+                int w = (int)write(p[1], q, len);
+                if (w <= 0)
+                    break;
+                q += w;
+                len -= (size_t)w;
+            }
+            _exit(0);
+        }
+    }
+    close(p[1]);
+    free(body);
+    save_fd(save, r->fd);
+    dup2(p[0], r->fd);
+    close(p[0]);
+    return 0;
+}
+
 static int apply_redirs(struct redir *r, int n, struct saved_fds *save)
 {
     fflush(stdout);
     fflush(stderr);
     for (int i = 0; i < n; i++) {
+        if (r[i].op == RD_HEREDOC) {
+            if (apply_heredoc(&r[i], save) < 0)
+                return -1;
+            continue;
+        }
         char *target = expand_single(r[i].target);
         if (!target)
             return -1;
@@ -341,11 +519,12 @@ static int apply_redirs(struct redir *r, int n, struct saved_fds *save)
         int flags;
         switch (r[i].op) {
         case RD_IN: flags = O_RDONLY; break;
+        case RD_RDWR: flags = O_RDWR | O_CREAT; break;
         case RD_APPEND:
         case RD_BOTH_APPEND: flags = O_WRONLY | O_CREAT | O_APPEND; break;
         default: flags = O_WRONLY | O_CREAT | O_TRUNC; break;
         }
-        int nfd = open(target, flags);
+        int nfd = open(target, flags, 0666);
         if (nfd < 0) {
             fsh_error("%s: %s", errmsg(errno), target);
             free(target);
@@ -387,24 +566,25 @@ static void child_jobctl(int pgid, int foreground)
     }
     sh.interactive = 0;
     sh.in_child = 1;
+    traps_reset_for_child();
     reset_signals();
 }
 
 static void exec_external(const char *path, char **argv, char **assigns, int nassigns)
 {
     for (int i = 0; i < nassigns; i++)
-        putenv(assigns[i]);
+        assign_env(assigns[i]);
     execve(path, argv, environ);
     int err = errno;
     if (err == ENOEXEC) {
-        /* No #! line: run it as an fsh script. */
+        /* No #! line: run it as a script of this shell. */
         char *nargv[64];
         int k = 0;
-        nargv[k++] = "fsh";
+        nargv[k++] = sh.posix ? "sh" : "fsh";
         for (int i = 0; argv[i] && k < 63; i++)
             nargv[k++] = i == 0 ? (char *)path : argv[i];
         nargv[k] = NULL;
-        execve("/bin/fsh", nargv, environ);
+        execve(sh.posix ? "/bin/sh" : "/bin/fsh", nargv, environ);
     }
     fsh_error("%s: %s", errmsg(err), argv[0]);
     _exit(err == ENOENT ? 127 : 126);
@@ -416,16 +596,54 @@ static int run_function(struct node *body, struct strvec *args)
 {
     char **old_v = sh.posv;
     int old_c = sh.posc;
+    int mark = locals_mark();
     sh.posv = args->v + 1;
     sh.posc = args->n - 1;
+    sh.func_depth++;
     int status = exec_node(body);
     if (sh.returning) {
         sh.returning = 0;
         status = sh.last_status;
     }
+    sh.func_depth--;
+    locals_restore(mark);
     sh.posv = old_v;
     sh.posc = old_c;
     return status;
+}
+
+/* command -v name (or -V): where the command is; 0 if it exists. */
+static int command_v(const char *name, int verbose)
+{
+    char path[PATH_MAX];
+    if (func_get(name)) {
+        printf(verbose ? "%s is a shell function\n" : "%s\n", name);
+        return 0;
+    }
+    if (find_builtin(name) || !strcmp(name, "exec") || !strcmp(name, "command")) {
+        printf(verbose ? "%s is a shell builtin\n" : "%s\n", name);
+        return 0;
+    }
+    const char *v = alias_get(name);
+    if (v) {
+        printf(verbose ? "%s is an alias for %s\n" : "alias %s='%s'\n", name, v);
+        return 0;
+    }
+    if (find_command(name, path, sizeof(path))) {
+        printf(verbose ? "%s is %s\n" : "%s\n", name, path);
+        return 0;
+    }
+    if (verbose)
+        fprintf(stderr, "%s: not found\n", name);
+    return 1;
+}
+
+static void xtrace(struct strvec *args)
+{
+    fputs("+", stderr);
+    for (int i = 0; i < args->n; i++)
+        fprintf(stderr, " %s", args->v[i]);
+    fputc('\n', stderr);
 }
 
 static int run_simple(struct node *n, int nofork)
@@ -458,7 +676,7 @@ static int run_simple(struct node *n, int nofork)
     /* Assignments / redirections only. */
     if (args.n == 0) {
         for (int i = 0; i < assigns.n; i++)
-            putenv(assigns.v[i]);
+            assign_env(assigns.v[i]);
         if (n->nredirs) {
             struct saved_fds save = { .n = 0 };
             status = apply_redirs(n->redirs, n->nredirs, &save) < 0 ? 1 : 0;
@@ -466,6 +684,34 @@ static int run_simple(struct node *n, int nofork)
         }
         goto out;
     }
+
+    /* "command": the builtin or program of that name, never a function */
+    int no_funcs = 0;
+    while (args.n > 0 && !strcmp(args.v[0], "command")) {
+        int k = 1;
+        while (k < args.n && args.v[k][0] == '-' && args.v[k][1]) {
+            if (!strcmp(args.v[k], "-v") || !strcmp(args.v[k], "-V")) {
+                struct saved_fds save = { .n = 0 };
+                if (apply_redirs(n->redirs, n->nredirs, &save) < 0)
+                    status = 1;
+                else
+                    status = k + 1 < args.n ? command_v(args.v[k + 1], args.v[k][1] == 'V') : 1;
+                fflush(stdout);
+                restore_fds(&save);
+                goto out;
+            }
+            k++;                        /* -p, -- */
+        }
+        for (int i = 0; i < k; i++)
+            free(args.v[i]);
+        memmove(args.v, args.v + k, sizeof(char *) * (size_t)(args.n - k + 1));
+        args.n -= k;
+        no_funcs = 1;
+        if (args.n == 0)
+            goto out;
+    }
+    if (sh.xtrace)
+        xtrace(&args);
 
     const char *name = args.v[0];
 
@@ -488,7 +734,7 @@ static int run_simple(struct node *n, int nofork)
         goto out;
     }
 
-    struct node *fn = func_get(name);
+    struct node *fn = no_funcs ? NULL : func_get(name);
     builtin_fn bf = fn ? NULL : find_builtin(name);
     if (fn || bf) {
         struct saved_fds save = { .n = 0 };
@@ -497,6 +743,23 @@ static int run_simple(struct node *n, int nofork)
             status = 1;
             goto out;
         }
+        /* assignments before it hold while it runs (and stay for the special builtins) */
+        int special = bf && (!strcmp(name, "export") || !strcmp(name, "readonly") || !strcmp(name, "set") ||
+                             !strcmp(name, "unset") || !strcmp(name, "eval") || !strcmp(name, ".") ||
+                             !strcmp(name, "source") || !strcmp(name, ":") || !strcmp(name, "exit") ||
+                             !strcmp(name, "return") || !strcmp(name, "shift") || !strcmp(name, "trap") ||
+                             !strcmp(name, "local"));
+        int temporary = assigns.n > 0 && !special;
+        int mark = temporary ? locals_mark() : 0;
+        for (int i = 0; i < assigns.n; i++) {
+            if (temporary) {
+                char *eq = strchr(assigns.v[i], '=');
+                char *vname = xstrndup(assigns.v[i], (size_t)(eq - assigns.v[i]));
+                local_declare(vname);
+                free(vname);
+            }
+            assign_env(assigns.v[i]);
+        }
         if (fn) {
             status = run_function(fn, &args);
         } else {
@@ -504,6 +767,8 @@ static int run_simple(struct node *n, int nofork)
             fflush(stdout);
             fflush(stderr);
         }
+        if (temporary)
+            locals_restore(mark);
         restore_fds(&save);
         goto out;
     }
@@ -511,7 +776,7 @@ static int run_simple(struct node *n, int nofork)
     char path[PATH_MAX];
     if (!find_command(name, path, sizeof(path))) {
         struct stat st;
-        if (args.n == 1 && stat(name, &st) == 0 && S_ISDIR(st.st_mode) && !nofork) {
+        if (args.n == 1 && !sh.posix && stat(name, &st) == 0 && S_ISDIR(st.st_mode) && !nofork) {
             /* AUTO_CD: a bare directory name changes into it */
             char *cdargv[] = { "cd", (char *)name, NULL };
             status = find_builtin("cd")(2, cdargv);
@@ -556,6 +821,7 @@ static int run_simple(struct node *n, int nofork)
     status = wait_pids(&pid, 1, pid, n->text);
     if (sh.interactive)
         tcsetpgrp(0, sh.shell_pgid);
+    trap_run_pending();
 
 out:
     if (nofork) {
@@ -696,12 +962,21 @@ static int loop_control(void)
     return sh.returning || sh.exiting;
 }
 
+/* A condition (if, while, !, the left of && and ||): set -e does not apply inside it. */
+static int exec_condition(struct node *n)
+{
+    sh.in_condition++;
+    int c = exec_node(n);
+    sh.in_condition--;
+    return c;
+}
+
 static int exec_compound(struct node *n)
 {
     int status = 0;
     switch (n->type) {
     case N_IF:
-        if (exec_node(n->left) == 0 && !interrupted())
+        if (exec_condition(n->left) == 0 && !interrupted())
             status = exec_node(n->body);
         else if (n->alt && !interrupted())
             status = exec_node(n->alt);
@@ -709,7 +984,7 @@ static int exec_compound(struct node *n)
     case N_WHILE:
     case N_UNTIL:
         for (;;) {
-            int c = exec_node(n->left);
+            int c = exec_condition(n->left);
             if (interrupted() || ((c == 0) != (n->type == N_WHILE)))
                 break;
             status = exec_node(n->body);
@@ -717,6 +992,23 @@ static int exec_compound(struct node *n)
                 break;
         }
         break;
+    case N_CASE: {
+        char *subject = expand_single(n->var);
+        if (!subject)
+            return 1;
+        for (int i = 0; i < n->nitems; i++) {
+            struct node *item = n->items[i];
+            int matched = 0;
+            for (int k = 0; k < item->nlist && !matched; k++)
+                matched = pattern_match(item->list[k], subject);
+            if (matched) {
+                status = exec_node(item->body);
+                break;
+            }
+        }
+        free(subject);
+        break;
+    }
     case N_FOR: {
         struct strvec items;
         sv_init(&items);
@@ -756,6 +1048,7 @@ int exec_node(struct node *n)
     case N_LIST:
         status = sh.last_status;
         for (int i = 0; i < n->nitems && !interrupted(); i++) {
+            trap_run_pending();
             status = exec_node(n->items[i]);
             sh.last_status = status;
         }
@@ -764,17 +1057,17 @@ int exec_node(struct node *n)
         status = run_background(n->left);
         break;
     case N_AND:
-        status = exec_node(n->left);
+        status = exec_condition(n->left);
         if (status == 0 && !interrupted())
             status = exec_node(n->right);
         break;
     case N_OR:
-        status = exec_node(n->left);
+        status = exec_condition(n->left);
         if (status != 0 && !interrupted())
             status = exec_node(n->right);
         break;
     case N_NOT:
-        status = !exec_node(n->left);
+        status = !exec_condition(n->left);
         break;
     case N_PIPE:
         status = run_pipeline(n);
@@ -810,6 +1103,12 @@ int exec_node(struct node *n)
     }
     }
     sh.last_status = status;
+    /* set -e: a failing command ends the shell (not in a condition, not && or || parts) */
+    if (sh.errexit && status && !sh.in_condition && !sh.exiting &&
+        (n->type == N_CMD || n->type == N_PIPE || n->type == N_SUBSHELL)) {
+        sh.exiting = 1;
+        sh.exit_code = status;
+    }
     return status;
 }
 
@@ -826,6 +1125,10 @@ int run_string(const char *src)
     }
     if (r == PARSE_ERROR)
         return sh.last_status = 1;
+    if (sh.noexec) {
+        node_free(tree);
+        return 0;
+    }
     int st = exec_node(tree);
     node_free(tree);
     return st;

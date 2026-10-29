@@ -11,6 +11,10 @@
 #ifndef _ARCHIVE_H
 #define _ARCHIVE_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -81,5 +85,9 @@ int arc_make_parents(const char *path);
 int arc_name_match(const char *pattern, const char *name);
 
 uint32_t arc_crc32(uint32_t crc, const void *data, size_t n);  /* start with 0 */
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

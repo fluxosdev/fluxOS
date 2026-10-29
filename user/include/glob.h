@@ -1,6 +1,10 @@
 #ifndef _GLOB_H
 #define _GLOB_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 typedef struct {
@@ -24,5 +28,9 @@ typedef struct {
 
 int glob(const char *pattern, int flags, int (*errfunc)(const char *path, int err), glob_t *g);
 void globfree(glob_t *g);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

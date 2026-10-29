@@ -7,6 +7,10 @@
 #ifndef FLUX_FONT_H
 #define FLUX_FONT_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 
 #define FONT_FIRST  32
@@ -23,5 +27,9 @@ static inline const uint8_t *font8x16_glyph(unsigned char c)
         c = '?';
     return font8x16[c - FONT_FIRST];
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

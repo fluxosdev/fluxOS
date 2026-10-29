@@ -2,9 +2,15 @@
  * Word expansion, zsh style: parameters are not word-split, command
  * substitutions are; unmatched globs are an error ("no matches found");
  * unquoted expansions that come out empty disappear.
+ *
+ * In sh mode (sh.posix) it is POSIX's: unquoted parameters and command
+ * substitutions are split on $IFS, a pattern that matches nothing stays
+ * as it is, and there is no brace expansion.
  */
 #include <ctype.h>
+#include <limits.h>
 #include <dirent.h>
+#include <fnmatch.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,15 +67,25 @@ static void flush_word(struct expander *e)
         word_reset(w);
         return;
     }
-    if (w->glob) {
+    if (w->glob && (e->flags & EXP_KEEPGLOB)) {
+        sv_push(e->out, sb_take(&w->b));        /* the marked pattern itself */
+    } else if (w->glob && sh.noglob) {
+        char *pat = sb_take(&w->b);
+        sv_push(e->out, unmark(pat));
+        free(pat);
+    } else if (w->glob) {
         char *pat = sb_take(&w->b);
         int before = e->out->n;
         glob_expand(pat, e->out);
         if (e->out->n == before) {
             char *lit = unmark(pat);
-            fsh_error("no matches found: %s", lit);
-            free(lit);
-            e->error = 1;
+            if (sh.posix) {
+                sv_push(e->out, lit);           /* POSIX: the pattern stays as it is */
+            } else {
+                fsh_error("no matches found: %s", lit);
+                free(lit);
+                e->error = 1;
+            }
         }
         free(pat);
     } else if (w->b.len || w->quoted) {
@@ -80,21 +96,72 @@ static void flush_word(struct expander *e)
     word_reset(w);
 }
 
-/* Append expansion output; unquoted command substitution is split. */
+/* Append expansion output; unquoted command substitution (and, in sh mode,
+ * parameters) is split on IFS: blanks in IFS separate and collapse, other
+ * characters in it each end a field. */
 static void emit_value(struct expander *e, const char *v, int split)
 {
     if (!split) {
         sb_puts(&e->w.b, v);
         return;
     }
+    const char *ifs = getenv("IFS");
+    if (!ifs)
+        ifs = " \t\n";
+    /* a non-blank separator with no text since the last one (or at the start)
+     * makes an empty field; blanks around separators are absorbed */
+    int after_sep = 0, at_start = 1;
     for (; *v; v++) {
-        if (*v == ' ' || *v == '\t' || *v == '\n') {
-            if (e->w.b.len || e->w.quoted)
-                flush_word(e);
-        } else {
+        if (!strchr(ifs, *v)) {
             sb_putc(&e->w.b, *v);
+            after_sep = 0;
+            at_start = 0;
+            continue;
+        }
+        int blank = *v == ' ' || *v == '\t' || *v == '\n';
+        if (blank) {
+            if (e->w.b.len || e->w.quoted) {
+                flush_word(e);
+                after_sep = 0;
+            }
+            continue;
+        }
+        if (e->w.b.len || e->w.quoted)
+            flush_word(e);
+        else if (after_sep || at_start)
+            sv_push(e->out, xstrdup(""));
+        after_sep = 1;
+        at_start = 0;
+    }
+}
+
+/* Glob markers in the pattern, so that a quoted * stays literal. */
+static int matches_pattern(const char *marked, const char *s)
+{
+    return glob_match(marked, s);
+}
+
+/* The prefix (op '#') or suffix ('%') of v matching the marked pattern, shortest or
+ * (doubled) longest: what is left of v is appended to the word. */
+static void trim_pattern(struct expander *e, const char *v, const char *marked, char op, int longest)
+{
+    size_t n = strlen(v);
+    for (size_t k = 0; k <= n; k++) {
+        size_t len = longest ? n - k : k;   /* the longest candidates first, or the shortest */
+        if (op == '#') {
+            char *prefix = xstrndup(v, len);
+            int m = matches_pattern(marked, prefix);
+            free(prefix);
+            if (m) {
+                sb_puts(&e->w.b, v + len);
+                return;
+            }
+        } else if (matches_pattern(marked, v + n - len)) {
+            sb_putn(&e->w.b, v, (int)(n - len));
+            return;
         }
     }
+    sb_puts(&e->w.b, v);
 }
 
 static const char *param_value(const char *name, char *buf, size_t size)
@@ -136,21 +203,56 @@ static char *join_params(void)
     return sb_take(&b);
 }
 
-/* ${...} forms: name, #name, name:-word, name-word, name:+word, name:=word */
-static void expand_brace(struct expander *e, const char *inner, int in_dq)
+/* ${...} forms: name, #name, name:-word, name-word, name:+word, name:=word,
+ * name:?word, name#pattern, name##pattern, name%pattern, name%%pattern */
+static void expand_brace(struct expander *e, const char *inner, int in_dq, int split)
 {
     char buf[32];
     if (inner[0] == '#' && inner[1]) {
         const char *v = param_value(inner + 1, buf, sizeof(buf));
         char n[16];
-        snprintf(n, sizeof(n), "%d", v ? (int)strlen(v) : 0);
+        snprintf(n, sizeof(n), "%d", !strcmp(inner + 1, "@") || !strcmp(inner + 1, "*") ? sh.posc : v ? (int)strlen(v) : 0);
         sb_puts(&e->w.b, n);
         return;
     }
-    size_t nlen = strcspn(inner, ":-+=");
+    size_t nlen = strcspn(inner, ":-+=?#%");
+    if (nlen == 0 && inner[0] && strchr("?$!#@*-", inner[0]))
+        nlen = 1;                       /* ${?}, ${#}: the special parameters */
     char *name = xstrndup(inner, nlen);
     const char *op = inner + nlen;
+    if ((!strcmp(name, "@") || !strcmp(name, "*")) && !*op) {
+        /* ${@} and ${*}: as $@ and $* */
+        for (int k = 0; k < sh.posc; k++) {
+            if (k) {
+                if (name[0] == '@' || !in_dq)
+                    flush_word(e);
+                else
+                    sb_putc(&e->w.b, ' ');
+            }
+            sb_puts(&e->w.b, sh.posv[k]);
+            if (in_dq)
+                e->w.quoted = 1;
+        }
+        free(name);
+        return;
+    }
     const char *v = param_value(name, buf, sizeof(buf));
+    if (*op == '#' || *op == '%') {
+        char kind = *op;
+        int longest = op[1] == kind;
+        const char *pat = op + (longest ? 2 : 1);
+        struct strvec pv;
+        sv_init(&pv);
+        if (expand_word(pat, &pv, EXP_KEEPGLOB | EXP_NOSPLIT) == 0 && pv.n == 1 && v)
+            trim_pattern(e, v, pv.v[0], kind, longest);
+        else if (v)
+            sb_puts(&e->w.b, v);
+        else if (in_dq)
+            e->w.quoted = 1;
+        sv_free(&pv);
+        free(name);
+        return;
+    }
     int colon = *op == ':';
     if (colon)
         op++;
@@ -169,9 +271,24 @@ static void expand_brace(struct expander *e, const char *inner, int in_dq)
     } else if (*op == '+') {
         alloc = unset ? NULL : expand_single(word);
         v = alloc;
+    } else if (*op == '?' && unset) {
+        alloc = word && *word ? expand_single(word) : NULL;
+        fsh_error("%s: %s", name, alloc ? alloc : v ? "parameter null" : "parameter not set");
+        e->error = 1;
+        if (!sh.interactive) {
+            sh.exiting = 1;
+            sh.exit_code = 1;
+        }
+    } else if (!v && sh.nounset && !*op) {
+        fsh_error("%s: parameter not set", name);
+        e->error = 1;
+        if (!sh.interactive) {
+            sh.exiting = 1;
+            sh.exit_code = 2;
+        }
     }
     if (v)
-        sb_puts(&e->w.b, v);
+        emit_value(e, v, split);
     else if (in_dq)
         e->w.quoted = 1;
     free(alloc);
@@ -217,12 +334,14 @@ static int expand_dollar(struct expander *e, const char *raw, int i, int in_dq)
         free(cmd);
         return end;
     }
+    /* sh mode: unquoted parameters are split on IFS (zsh keeps them whole) */
+    int psplit = sh.posix && split;
     if (raw[i] == '{') {
         const char *close = strchr(raw + i, '}');
         if (!close)
             return (int)strlen(raw);
         char *inner = xstrndup(raw + i + 1, (size_t)(close - raw - i - 1));
-        expand_brace(e, inner, in_dq);
+        expand_brace(e, inner, in_dq, psplit);
         free(inner);
         return (int)(close - raw) + 1;
     }
@@ -232,7 +351,10 @@ static int expand_dollar(struct expander *e, const char *raw, int i, int in_dq)
             for (int k = 0; k < sh.posc; k++) {
                 if (k)
                     flush_word(e);
-                sb_puts(&e->w.b, sh.posv[k]);
+                if (psplit)
+                    emit_value(e, sh.posv[k], 1);
+                else
+                    sb_puts(&e->w.b, sh.posv[k]);
                 if (in_dq)
                     e->w.quoted = 1;
             }
@@ -252,7 +374,11 @@ static int expand_dollar(struct expander *e, const char *raw, int i, int in_dq)
         char name[2] = { raw[i], 0 };
         const char *v = param_value(name, buf, sizeof(buf));
         if (v)
-            sb_puts(&e->w.b, v);
+            emit_value(e, v, psplit);
+        else if (sh.nounset) {
+            fsh_error("%s: parameter not set", name);
+            e->error = 1;
+        }
         return i + 1;
     }
     if (isalpha((unsigned char)raw[i]) || raw[i] == '_') {
@@ -262,7 +388,15 @@ static int expand_dollar(struct expander *e, const char *raw, int i, int in_dq)
         char *name = xstrndup(raw + i, (size_t)(j - i));
         const char *v = getenv(name);
         if (v)
-            sb_puts(&e->w.b, v);
+            emit_value(e, v, psplit);
+        else if (sh.nounset) {
+            fsh_error("%s: parameter not set", name);
+            e->error = 1;
+            if (!sh.interactive) {
+                sh.exiting = 1;
+                sh.exit_code = 2;
+            }
+        }
         free(name);
         return j;
     }
@@ -421,7 +555,7 @@ static int expand_one(const char *raw, struct strvec *out, int flags);
 
 int expand_word(const char *raw, struct strvec *out, int flags)
 {
-    if (flags & EXP_NOSPLIT)
+    if ((flags & EXP_NOSPLIT) || sh.posix)
         return expand_one(raw, out, flags);
     struct strvec words;
     sv_init(&words);
@@ -437,7 +571,16 @@ static int expand_one(const char *raw, struct strvec *out, int flags)
 {
     struct expander e = { out, flags, 0, { { NULL, 0, 0 }, 0, 0 } };
     int i = 0, in_dq = 0;
+    int heredoc = flags & EXP_HEREDOC;  /* quotes are literal; only $ ` \ and newline escape */
     word_reset(&e.w);
+    if (heredoc) {
+        in_dq = 1;
+        e.w.quoted = 1;
+    }
+
+    /* "$@" with no positional parameters is no word at all */
+    if (!sh.posc && (!strcmp(raw, "\"$@\"") || !strcmp(raw, "\"${@}\"")) && !(flags & EXP_NOSPLIT))
+        return 0;
 
     if (raw[0] == '~' && (raw[1] == 0 || raw[1] == '/')) {
         const char *home = getenv("HOME");
@@ -448,7 +591,10 @@ static int expand_one(const char *raw, struct strvec *out, int flags)
 
     while (raw[i] && !e.error) {
         char c = raw[i];
-        if (c == '\'' && !in_dq) {
+        if (heredoc && (c == '\'' || c == '"')) {
+            sb_putc(&e.w.b, c);
+            i++;
+        } else if (c == '\'' && !in_dq) {
             e.w.quoted = 1;
             for (i++; raw[i] && raw[i] != '\''; i++)
                 sb_putc(&e.w.b, raw[i]);
@@ -490,6 +636,21 @@ static int expand_one(const char *raw, struct strvec *out, int flags)
     return e.error ? -1 : 0;
 }
 
+/* A here document's body: parameters, command substitutions and the escapes
+ * \$ \` \\ and backslash-newline, nothing else. */
+char *expand_heredoc(const char *body)
+{
+    struct strvec sv;
+    sv_init(&sv);
+    if (expand_word(body, &sv, EXP_NOGLOB | EXP_NOSPLIT | EXP_HEREDOC) < 0 || sv.n == 0) {
+        sv_free(&sv);
+        return xstrdup("");
+    }
+    char *s = xstrdup(sv.v[0]);
+    sv_free(&sv);
+    return s;
+}
+
 char *expand_single(const char *raw)
 {
     struct strvec sv;
@@ -516,6 +677,20 @@ char *expand_single(const char *raw)
 int has_glob_chars(const char *s)
 {
     return strpbrk(s, "\x01\x02\x03") != NULL;
+}
+
+/* A case pattern (a raw word: quotes make characters literal) against s. */
+int pattern_match(const char *raw_pattern, const char *s)
+{
+    struct strvec pv;
+    sv_init(&pv);
+    int r = 0;
+    if (expand_word(raw_pattern, &pv, EXP_KEEPGLOB | EXP_NOSPLIT) == 0 && pv.n == 1)
+        r = glob_match(pv.v[0], s);
+    else if (pv.n == 0)
+        r = s[0] == 0;
+    sv_free(&pv);
+    return r;
 }
 
 static int match_class(const char **pp, char c)

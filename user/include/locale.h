@@ -1,6 +1,10 @@
 #ifndef _LOCALE_H
 #define _LOCALE_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 /* Only the "C" (and "POSIX") locale. */
@@ -41,5 +45,9 @@ struct lconv {
 
 char *setlocale(int category, const char *locale);
 struct lconv *localeconv(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

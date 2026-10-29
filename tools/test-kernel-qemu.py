@@ -13,6 +13,8 @@ parser.add_argument("--cpus", type=int, default=2, choices=range(1, 17))
 parser.add_argument("--append", default="")
 parser.add_argument("--memory", type=int, default=256, choices=range(64, 4097), help="guest RAM in MiB")
 parser.add_argument("--success-marker", default="KERNEL REGRESSIONS PASSED")
+parser.add_argument("--add", action="append", default=[], metavar="HOST:GUEST", help="a host file to add to the initrd at that guest path")
+parser.add_argument("--timeout", type=int, default=45)
 args = parser.parse_args()
 qemu, kernel, initrd, guest = args.qemu, args.kernel, args.initrd, args.guest
 expected_cpus = args.cpus
@@ -32,6 +34,9 @@ with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
                 replaced = True
             else:
                 target.addfile(member, source.extractfile(member) if member.isfile() else None)
+        for extra in args.add:
+            host, guest = extra.split(":", 1)
+            target.add(host, arcname="./" + guest.lstrip("/"))
     if not replaced:
         raise SystemExit("initrd has no /bin/init to replace")
     scratch = temp / "disk.img"
@@ -42,7 +47,7 @@ with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
                "-m", f"{args.memory}M", "-display", "none", "-monitor", "none", "-serial", "stdio",
                "-no-reboot", "-nic", "none", "-drive", f"file={scratch},format=raw,if=ide,index=0"]
     try:
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=45)
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=args.timeout)
         output = result.stdout.decode(errors="replace")
     except subprocess.TimeoutExpired as error:
         print((error.stdout or b"").decode(errors="replace"))

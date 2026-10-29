@@ -139,7 +139,7 @@ void fsh_error(const char *fmt, ...)
 {
     va_list ap;
     fflush(stdout);
-    fputs("fsh: ", stderr);
+    fputs(sh.posix ? "sh: " : "fsh: ", stderr);
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -162,6 +162,17 @@ int term_width(void)
     const char *c = getenv("COLUMNS");
     int w = c ? atoi(c) : 0;
     return w >= 20 ? w : 80;
+}
+
+/* NAME=value into the environment (copied: putenv would keep the string). */
+void assign_env(const char *entry)
+{
+    const char *eq = strchr(entry, '=');
+    if (!eq)
+        return;
+    char *name = xstrndup(entry, (size_t)(eq - entry));
+    setenv(name, eq + 1, 1);
+    free(name);
 }
 
 int is_valid_name(const char *s, size_t len)

@@ -1,6 +1,10 @@
 #ifndef _SYS_MMAN_H
 #define _SYS_MMAN_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 #include <flux/abi.h>
 
@@ -32,5 +36,9 @@ int madvise(void *addr, size_t len, int advice);
 int posix_madvise(void *addr, size_t len, int advice);
 int mlock(const void *addr, size_t len);
 int munlock(const void *addr, size_t len);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

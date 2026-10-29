@@ -18,6 +18,10 @@
 #ifndef _GL_FLUXGL_H
 #define _GL_FLUXGL_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 #include <GL/gl.h>
 
@@ -48,5 +52,9 @@ void fglSwapBuffers(FGLcontext *ctx, uint32_t *dst, int stride);
 int fglIsAccelerated(FGLcontext *ctx);
 /* Which renderer draws the context: FGL_DRIVER_*. */
 int fglGetDriver(FGLcontext *ctx);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -21,6 +21,7 @@ struct arc_reader {
     uint8_t *buf;
     int bpos, blen;
     int eof;                    /* something read past the end */
+    int stream;                 /* read on from where fd is, without seeking (a pipe) */
 };
 
 int arc_rd_open(struct arc_reader *r, int fd, uint32_t start, uint32_t len);

@@ -1,6 +1,10 @@
 #ifndef _STDIO_H
 #define _STDIO_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdarg.h>
 #include <stddef.h>
 #include <sys/types.h>
@@ -122,5 +126,9 @@ void perror(const char *msg);
 int rename(const char *from, const char *to);
 int remove(const char *path);
 char *ctermid(char *buf);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

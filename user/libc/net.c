@@ -288,3 +288,197 @@ const char *hstrerror(int err)
     default: return "Unknown resolver error";
     }
 }
+
+const struct in6_addr in6addr_any = IN6ADDR_ANY_INIT, in6addr_loopback = IN6ADDR_LOOPBACK_INIT;
+
+/* ---- getaddrinfo and friends ---- */
+
+static const struct {
+    const char *name;
+    int port;
+    const char *proto;
+} services[] = {
+    { "echo", 7, "tcp" }, { "discard", 9, "tcp" }, { "daytime", 13, "tcp" }, { "ftp-data", 20, "tcp" },
+    { "ftp", 21, "tcp" }, { "ssh", 22, "tcp" }, { "telnet", 23, "tcp" }, { "smtp", 25, "tcp" },
+    { "time", 37, "tcp" }, { "domain", 53, "udp" }, { "domain", 53, "tcp" }, { "bootps", 67, "udp" },
+    { "bootpc", 68, "udp" }, { "tftp", 69, "udp" }, { "gopher", 70, "tcp" }, { "finger", 79, "tcp" },
+    { "http", 80, "tcp" }, { "www", 80, "tcp" }, { "pop3", 110, "tcp" }, { "sunrpc", 111, "tcp" },
+    { "nntp", 119, "tcp" }, { "ntp", 123, "udp" }, { "imap", 143, "tcp" }, { "snmp", 161, "udp" },
+    { "ldap", 389, "tcp" }, { "https", 443, "tcp" }, { "submission", 587, "tcp" }, { "imaps", 993, "tcp" },
+    { "pop3s", 995, "tcp" }, { "mysql", 3306, "tcp" }, { "postgresql", 5432, "tcp" }, { "http-alt", 8080, "tcp" },
+};
+
+struct servent *getservbyname(const char *name, const char *proto)
+{
+    static struct servent se;
+    static char *no_aliases[1];
+    for (size_t i = 0; i < sizeof(services) / sizeof(services[0]); i++) {
+        if (strcmp(services[i].name, name) || (proto && strcmp(services[i].proto, proto)))
+            continue;
+        se.s_name = (char *)services[i].name;
+        se.s_aliases = no_aliases;
+        se.s_port = htons((uint16_t)services[i].port);
+        se.s_proto = (char *)services[i].proto;
+        return &se;
+    }
+    return NULL;
+}
+
+struct servent *getservbyport(int port, const char *proto)
+{
+    static struct servent se;
+    static char *no_aliases[1];
+    for (size_t i = 0; i < sizeof(services) / sizeof(services[0]); i++) {
+        if (htons((uint16_t)services[i].port) != port || (proto && strcmp(services[i].proto, proto)))
+            continue;
+        se.s_name = (char *)services[i].name;
+        se.s_aliases = no_aliases;
+        se.s_port = port;
+        se.s_proto = (char *)services[i].proto;
+        return &se;
+    }
+    return NULL;
+}
+
+static struct addrinfo *ai_new(const struct in_addr *addr, uint16_t port, int socktype, int protocol,
+                               const char *canon)
+{
+    struct addrinfo *ai = calloc(1, sizeof(*ai) + sizeof(struct sockaddr_in));
+    if (!ai)
+        return NULL;
+    struct sockaddr_in *sin = (struct sockaddr_in *)(ai + 1);
+    sin->sin_family = AF_INET;
+    sin->sin_port = htons(port);
+    sin->sin_addr = *addr;
+    ai->ai_family = AF_INET;
+    ai->ai_socktype = socktype;
+    ai->ai_protocol = protocol;
+    ai->ai_addrlen = sizeof(*sin);
+    ai->ai_addr = (struct sockaddr *)sin;
+    ai->ai_canonname = canon ? strdup(canon) : NULL;
+    return ai;
+}
+
+int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res)
+{
+    int flags = hints ? hints->ai_flags : 0;
+    int family = hints ? hints->ai_family : AF_UNSPEC;
+    int socktype = hints ? hints->ai_socktype : 0;
+    int protocol = hints ? hints->ai_protocol : 0;
+    *res = NULL;
+    if (!node && !service)
+        return EAI_NONAME;
+    if (family != AF_UNSPEC && family != AF_INET)
+        return EAI_FAMILY;
+    if (socktype && socktype != SOCK_STREAM && socktype != SOCK_DGRAM)
+        return EAI_SOCKTYPE;
+
+    uint16_t port = 0;
+    if (service) {
+        char *end;
+        long p = strtol(service, &end, 10);
+        if (*service && !*end) {
+            if (p < 0 || p > 65535)
+                return EAI_SERVICE;
+            port = (uint16_t)p;
+        } else if (flags & AI_NUMERICSERV) {
+            return EAI_NONAME;
+        } else {
+            struct servent *se = getservbyname(service, socktype == SOCK_DGRAM ? "udp" : socktype == SOCK_STREAM ? "tcp" : NULL);
+            if (!se)
+                return EAI_SERVICE;
+            port = ntohs((uint16_t)se->s_port);
+        }
+    }
+
+    struct in_addr addrs[8];
+    int n = 0;
+    const char *canon = NULL;
+    if (!node) {
+        addrs[0].s_addr = flags & AI_PASSIVE ? INADDR_ANY : htonl(INADDR_LOOPBACK);
+        n = 1;
+    } else if (inet_aton(node, &addrs[0])) {
+        n = 1;
+    } else if (flags & AI_NUMERICHOST) {
+        return EAI_NONAME;
+    } else {
+        struct hostent *he = gethostbyname(node);
+        if (!he)
+            return h_errno == TRY_AGAIN ? EAI_AGAIN : h_errno == NO_RECOVERY ? EAI_FAIL : EAI_NONAME;
+        for (; he->h_addr_list[n] && n < 8; n++)
+            addrs[n] = *(struct in_addr *)he->h_addr_list[n];
+        canon = flags & AI_CANONNAME ? he->h_name : NULL;
+    }
+
+    struct addrinfo *head = NULL, **tail = &head;
+    for (int i = 0; i < n; i++) {
+        int types[2] = { SOCK_STREAM, SOCK_DGRAM };
+        for (int t = 0; t < 2; t++) {
+            if (socktype && socktype != types[t])
+                continue;
+            int proto = types[t] == SOCK_STREAM ? IPPROTO_TCP : IPPROTO_UDP;
+            if (protocol && protocol != proto)
+                continue;
+            struct addrinfo *ai = ai_new(&addrs[i], port, types[t], proto, head ? NULL : canon);
+            if (!ai) {
+                freeaddrinfo(head);
+                return EAI_MEMORY;
+            }
+            *tail = ai;
+            tail = &ai->ai_next;
+        }
+    }
+    if (!head)
+        return EAI_SOCKTYPE;
+    *res = head;
+    return 0;
+}
+
+void freeaddrinfo(struct addrinfo *res)
+{
+    while (res) {
+        struct addrinfo *next = res->ai_next;
+        free(res->ai_canonname);
+        free(res);
+        res = next;
+    }
+}
+
+const char *gai_strerror(int err)
+{
+    switch (err) {
+    case 0: return "Success";
+    case EAI_BADFLAGS: return "Bad value for ai_flags";
+    case EAI_NONAME: return "Name or service not known";
+    case EAI_AGAIN: return "Temporary failure in name resolution";
+    case EAI_FAIL: return "Non-recoverable failure in name resolution";
+    case EAI_FAMILY: return "ai_family not supported";
+    case EAI_SOCKTYPE: return "ai_socktype not supported";
+    case EAI_SERVICE: return "Servname not supported for ai_socktype";
+    case EAI_MEMORY: return "Memory allocation failure";
+    case EAI_SYSTEM: return "System error";
+    case EAI_OVERFLOW: return "Argument buffer overflow";
+    }
+    return "Unknown error";
+}
+
+int getnameinfo(const struct sockaddr *addr, socklen_t addrlen, char *host, socklen_t hostlen,
+                char *serv, socklen_t servlen, int flags)
+{
+    if (!addr || addrlen < sizeof(struct sockaddr_in) || addr->sa_family != AF_INET)
+        return EAI_FAMILY;
+    const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
+    if (host && hostlen) {
+        if (flags & NI_NAMEREQD)
+            return EAI_NONAME;          /* no reverse lookups */
+        if (!inet_ntop(AF_INET, &sin->sin_addr, host, hostlen))
+            return EAI_OVERFLOW;
+    }
+    if (serv && servlen) {
+        struct servent *se = flags & NI_NUMERICSERV ? NULL : getservbyport(sin->sin_port, flags & NI_DGRAM ? "udp" : "tcp");
+        int n = se ? snprintf(serv, servlen, "%s", se->s_name) : snprintf(serv, servlen, "%u", ntohs(sin->sin_port));
+        if (n < 0 || (socklen_t)n >= servlen)
+            return EAI_OVERFLOW;
+    }
+    return 0;
+}

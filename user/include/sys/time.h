@@ -1,6 +1,10 @@
 #ifndef _SYS_TIME_H
 #define _SYS_TIME_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 #include <sys/select.h>
 
@@ -42,5 +46,9 @@ int settimeofday(const struct timeval *tv, const struct timezone *tz);
 int utimes(const char *path, const struct timeval times[2]);
 int getitimer(int which, struct itimerval *value);
 int setitimer(int which, const struct itimerval *value, struct itimerval *old);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

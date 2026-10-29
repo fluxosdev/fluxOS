@@ -1,6 +1,10 @@
 #ifndef _SYS_SELECT_H
 #define _SYS_SELECT_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 #include <signal.h>
 
@@ -34,5 +38,9 @@ typedef struct {
 int select(int nfds, fd_set *rd, fd_set *wr, fd_set *ex, struct timeval *timeout);
 int pselect(int nfds, fd_set *rd, fd_set *wr, fd_set *ex, const struct timespec *timeout,
             const sigset_t *mask);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

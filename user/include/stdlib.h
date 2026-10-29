@@ -1,6 +1,10 @@
 #ifndef _STDLIB_H
 #define _STDLIB_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 #define EXIT_SUCCESS 0
@@ -26,6 +30,8 @@ void exit(int status) __attribute__((noreturn));
 void _Exit(int status) __attribute__((noreturn));
 void abort(void) __attribute__((noreturn));
 int atexit(void (*fn)(void));
+int __cxa_atexit(void (*fn)(void *), void *arg, void *dso);
+void __cxa_finalize(void *dso);
 int system(const char *command);
 
 char *getenv(const char *name);
@@ -80,5 +86,9 @@ int mbtowc(wchar_t *wc, const char *s, size_t n);
 int wctomb(char *s, wchar_t wc);
 size_t mbstowcs(wchar_t *dst, const char *src, size_t n);
 size_t wcstombs(char *dst, const wchar_t *src, size_t n);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

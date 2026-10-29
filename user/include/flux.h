@@ -2,6 +2,10 @@
 #ifndef _FLUX_H
 #define _FLUX_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <flux/abi.h>
 
 int ttymode(int mode);                  /* returns old mode; -1 queries */
@@ -38,5 +42,9 @@ void *fbmap(void);
  * modes), DISP_SETMODE, DISP_MAP3D, DISP_FLIP, DISP_CURSOR or
  * DISP_CURSORPOS; see <flux/abi.h>. */
 int display(int op, void *arg);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

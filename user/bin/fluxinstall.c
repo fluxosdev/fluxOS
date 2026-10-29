@@ -121,10 +121,10 @@ static unsigned char *slurp(const char *path, unsigned *size)
         die("%s: %s", path, strerror(errno));
     unsigned got = 0;
     int n;
-    while (got < st.st_size && (n = read(fd, buf + got, st.st_size - got)) > 0)
+    while (got < (uint32_t)st.st_size && (n = read(fd, buf + got, (uint32_t)st.st_size - got)) > 0)
         got += (unsigned)n;
     close(fd);
-    if (got != st.st_size)
+    if (got != (uint32_t)st.st_size)
         die("%s: short read", path);
     *size = got;
     return buf;

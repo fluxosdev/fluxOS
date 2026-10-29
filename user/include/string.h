@@ -1,6 +1,10 @@
 #ifndef _STRING_H
 #define _STRING_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 void *memcpy(void *dst, const void *src, size_t n);
@@ -45,5 +49,9 @@ char *strsep(char **s, const char *delim);
 char *strerror(int err);
 int strerror_r(int err, char *buf, size_t size);
 const char *strsignal(int sig);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

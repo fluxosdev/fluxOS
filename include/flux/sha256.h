@@ -5,6 +5,10 @@
 #ifndef FLUX_SHA256_H
 #define FLUX_SHA256_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -22,5 +26,9 @@ void sha256_init(struct sha256 *s);
 void sha256_update(struct sha256 *s, const void *data, size_t n);
 void sha256_final(struct sha256 *s, uint8_t out[SHA256_SIZE]);
 void sha256(const void *data, size_t n, uint8_t out[SHA256_SIZE]);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

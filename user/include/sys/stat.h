@@ -1,6 +1,10 @@
 #ifndef _SYS_STAT_H
 #define _SYS_STAT_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 #include <flux/abi.h>
 
@@ -35,5 +39,9 @@ int fchmod(int fd, mode_t mode);
 int mkfifo(const char *path, mode_t mode);
 int mknod(const char *path, mode_t mode, dev_t dev);
 mode_t umask(mode_t mask);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

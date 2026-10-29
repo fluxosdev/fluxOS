@@ -1,6 +1,10 @@
 #ifndef _SYSEXITS_H
 #define _SYSEXITS_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define EX_OK          0
 #define EX__BASE       64
 #define EX_USAGE       64
@@ -19,5 +23,9 @@
 #define EX_NOPERM      77
 #define EX_CONFIG      78
 #define EX__MAX        78
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

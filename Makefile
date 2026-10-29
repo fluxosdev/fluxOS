@@ -45,6 +45,8 @@ SYSTEM  := $(BUILD)/system.tar
 SETUP   := $(BUILD)/setup.tar
 ROOTFS  := $(BUILD)/rootfs
 SETUPFS := $(BUILD)/setupfs
+SYSROOT := $(BUILD)/sysroot
+SYSROOT_STAMP := $(SYSROOT)/.stamp
 DISK    := fluxdisk.img
 DISK_MB ?= 256
 FLOPPY  := fluxfloppy.img
@@ -134,7 +136,7 @@ DOS_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/dos/*.c)))
 # winrun, the Windows program loader (os_linux.c is its Linux back end, for host tests)
 WIN32_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(filter-out user/win32/os_linux.c,$(wildcard user/win32/*.c user/win32/*.S))))
 BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/fsh $(ROOTFS)/bin/desktop \
-             $(ROOTFS)/bin/dos $(ROOTFS)/bin/winrun
+             $(ROOTFS)/bin/dos $(ROOTFS)/bin/winrun $(ROOTFS)/bin/[ $(ROOTFS)/bin/gunzip $(ROOTFS)/bin/zcat
 
 ROOTFS_FILES := $(shell find rootfs -type f 2>/dev/null)
 SETUPFS_FILES := $(shell find setupfs -type f 2>/dev/null)
@@ -216,25 +218,41 @@ $(ROOTFS)/bin/%: $(BUILD)/u/user/bin/%.o $(CRT0) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 
+# test is also [, and gzip is also gunzip and zcat (they look at their name)
+$(ROOTFS)/bin/[: $(ROOTFS)/bin/test
+	cp $< $@
+$(ROOTFS)/bin/gunzip $(ROOTFS)/bin/zcat: $(ROOTFS)/bin/gzip
+	cp $< $@
+
 $(BUILD)/.rootfs-stamp: $(ROOTFS_FILES)
 	@mkdir -p $(ROOTFS)
 	cp -r rootfs/. $(ROOTFS)/
 	@touch $@
 
 # The ports (GNU make and binutils for fluxOS, tools/ports/build.sh) go into the
-# system too, once "make ports" has built them.
+# system too, once "make ports" has built them, and so does the native GCC
+# ("make toolchain-native"), with the sysroot's headers and libraries as
+# /usr/include and /usr/lib so that it has something to compile against.
 PORTS_ROOT := $(BUILD)/ports/root
 PORTS_FILES := $(wildcard $(PORTS_ROOT)/usr/bin/*)
+NATIVE_ROOT := $(BUILD)/toolchain/native/root
+NATIVE_FILES := $(wildcard $(NATIVE_ROOT)/usr/bin/gcc)
 
-$(SYSTEM): $(BUILD)/.rootfs-stamp $(BINS) $(PORTS_FILES)
+$(SYSTEM): $(BUILD)/.rootfs-stamp $(BINS) $(PORTS_FILES) $(NATIVE_FILES) $(if $(NATIVE_FILES),$(SYSROOT_STAMP),)
 	cp $(ROOTFS)/bin/fsh $(ROOTFS)/bin/sh
 	chmod 755 $(ROOTFS)/home/flux/demo.sh
 	tar --format=ustar --owner=0 --group=0 --numeric-owner -cf $@ -C $(ROOTFS) . \
-		$(if $(PORTS_FILES),-C $(abspath $(PORTS_ROOT)) .,)
+		$(if $(PORTS_FILES),-C $(abspath $(PORTS_ROOT)) .,) \
+		$(if $(NATIVE_FILES),-C $(abspath $(NATIVE_ROOT)) . -C $(abspath $(SYSROOT)) usr,)
 
-.PHONY: ports
+.PHONY: ports toolchain-native
 ports: sysroot
 	tools/ports/build.sh --toolchain $(BUILD)/toolchain/cross --sysroot $(SYSROOT)
+
+# The GCC that runs on fluxOS (the Canadian cross of tools/toolchain/build.sh --native),
+# in $(NATIVE_ROOT); the next "make" puts it on the system image.
+toolchain-native: sysroot
+	tools/toolchain/build.sh --native --sysroot $(SYSROOT) --prefix $(BUILD)/toolchain/cross --dest $(NATIVE_ROOT)
 
 $(SETUP): $(BUILD)/.rootfs-stamp $(BINS) $(SETUPFS_FILES)
 	rm -rf $(SETUPFS)
@@ -271,17 +289,20 @@ $(ISO): $(KERNEL) $(SETUP) $(SYSTEM) grub/grub.cfg grub/install.cfg $(GRUB_DEP)
 
 # The fluxOS sysroot: the headers and libraries a compiler targeting
 # fluxOS (i686-fluxos-gcc, tools/toolchain) builds programs against.
-SYSROOT := $(BUILD)/sysroot
 .PHONY: sysroot
-sysroot: $(LIBC) $(LIBGL) $(LIBFONT) $(CRT0) user/user.ld
+sysroot: $(SYSROOT_STAMP)
+
+$(SYSROOT_STAMP): $(LIBC) $(LIBGL) $(LIBFONT) $(CRT0) user/user.ld $(wildcard user/include/*.h user/include/*/*.h include/flux/*.h)
 	@mkdir -p $(SYSROOT)/usr/include/flux $(SYSROOT)/usr/lib
 	cp -r user/include/. $(SYSROOT)/usr/include/
 	cp include/flux/*.h $(SYSROOT)/usr/include/flux/
 	cp $(LIBC) $(LIBGL) $(LIBFONT) $(CRT0) $(SYSROOT)/usr/lib/
 	cp user/user.ld $(SYSROOT)/usr/lib/fluxos.ld
-	@# threads and real-time calls are in libc.a: -lpthread and -lrt find empty archives
-	for l in pthread rt; do rm -f $(SYSROOT)/usr/lib/lib$$l.a; ar rc $(SYSROOT)/usr/lib/lib$$l.a; done
-	@echo "$(SYSROOT): headers, libc.a (with pthreads), libGL.a, libfont.a, crt0.o, fluxos.ld"
+	@# threads, real-time calls and the math library are in libc.a: -lpthread, -lrt and -lm
+	@# (which g++ always adds) find empty archives
+	for l in pthread rt m; do rm -f $(SYSROOT)/usr/lib/lib$$l.a; ar rc $(SYSROOT)/usr/lib/lib$$l.a; done
+	@touch $@
+	@echo "$(SYSROOT): headers, libc.a (with pthreads and libm), libGL.a, libfont.a, crt0.o, fluxos.ld"
 
 # The cross toolchain (binutils and GCC for i686-fluxos) in build/toolchain/cross.
 .PHONY: toolchain
@@ -363,6 +384,54 @@ clean:
 
 # Run the browser's actual HTML/DOM/JS code on the host, without booting QEMU.
 HOSTCC ?= cc
+
+# The phase 3 tools (tar, gzip, sed, diff, patch, find...) built for the host and
+# checked against the GNU originals (tests/tools-host.sh).
+TOOL_TESTS := find install cmp cut xargs truncate dd ln nproc true false printf test mktemp diff patch sed gzip tar
+TOOL_TEST_BINS := $(addprefix $(BUILD)/tests/tools/,$(TOOL_TESTS))
+.PHONY: test-tools
+test-tools: $(TOOL_TEST_BINS)
+	tests/tools-host.sh $(BUILD)/tests/tools
+
+$(BUILD)/tests/tools/gzip $(BUILD)/tests/tools/tar: $(BUILD)/tests/tools/%: user/bin/%.c user/libc/deflate.c user/libc/arc_codec.c user/include/deflate.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -D_GNU_SOURCE -Iinclude -idirafter user/include \
+		$< user/libc/deflate.c user/libc/arc_codec.c -o $@
+
+$(BUILD)/tests/tools/test: user/fsh/testexpr.c
+$(BUILD)/tests/tools/%: user/bin/%.c
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -idirafter user/include $< -o $@
+
+# fsh as /bin/sh, built for the host (tests/fsh-host/flux.h stands in for the two
+# fluxOS calls it makes) and checked against the host's /bin/sh (tests/sh-host.sh).
+.PHONY: test-sh
+test-sh: $(BUILD)/tests/sh
+	tests/sh-host.sh $<
+
+$(BUILD)/tests/sh: $(wildcard user/fsh/*.c user/fsh/*.h) tests/fsh-host/flux.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-unused-result -D_GNU_SOURCE -Itests/fsh-host \
+		$(filter %.c,$^) -o $@
+
+# The native GCC on the real kernel: compiles and runs a program under QEMU and
+# compares the binary with the cross compiler's (needs "make toolchain-native").
+.PHONY: test-gcc-qemu
+test-gcc-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/gcc-guest $(BUILD)/tests/gcc-hello.cross $(NATIVE_ROOT)/usr/bin/gcc
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/gcc-guest --cpus $(KERNEL_TEST_CPUS) \
+		--memory 768 --add $(BUILD)/tests/gcc-hello.cross:tests/hello.cross --add tests/gcc-hello.c:tests/hello.c \
+		--success-marker "GCC REGRESSIONS PASSED" --timeout 240
+
+$(BUILD)/tests/gcc-hello.cross: tests/gcc-hello.c $(BUILD)/toolchain/cross/bin/i686-fluxos-gcc $(SYSROOT)/usr/lib/libc.a
+	@mkdir -p $(dir $@)
+	$(BUILD)/toolchain/cross/bin/i686-fluxos-gcc -O2 -o $@ $<
+
+$(BUILD)/tests/gcc-guest.o: tests/gcc-guest.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(BUILD)/tests/gcc-guest: $(BUILD)/tests/gcc-guest.o $(CRT0) $(LIBC) user/user.ld
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 BROWSER_TEST_SRCS := lib/digest.c lib/sha256.c tests/browser-dom.c tests/canvas-font-stub.c tests/js-host-stack.c \
 	$(addprefix user/desktop/wave/js/,js.c jsbig.c jsuni.c jslib.c jslib2.c jsbinary.c jsnet.c jsre.c jsgc.c jsdom.c jscanvas.c jsworker.c) \
 	$(addprefix user/desktop/wave/,canvas.c html.c shadow.c webblob.c webintegrity.c webinput.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c anim.c) \

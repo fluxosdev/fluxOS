@@ -1,6 +1,10 @@
 #ifndef _LANGINFO_H
 #define _LANGINFO_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef int nl_item;
 
 #define CODESET   14
@@ -13,5 +17,9 @@ typedef int nl_item;
 #define NOEXPR    0x50001
 
 char *nl_langinfo(nl_item item);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

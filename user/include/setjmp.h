@@ -1,6 +1,10 @@
 #ifndef _SETJMP_H
 #define _SETJMP_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 
 /* ebx, esi, edi, ebp, esp, eip, mask_saved, sigmask */
@@ -14,6 +18,10 @@ int sigsetjmp(sigjmp_buf env, int savemask) __attribute__((returns_twice));
 void longjmp(jmp_buf env, int val) __attribute__((noreturn));
 void _longjmp(jmp_buf env, int val) __attribute__((noreturn));
 void siglongjmp(sigjmp_buf env, int val) __attribute__((noreturn));
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
 

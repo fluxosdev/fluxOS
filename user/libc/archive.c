@@ -1374,7 +1374,7 @@ struct archive *arc_read_index(int fd, char *err, int errsize)
     struct stat st;
     uint8_t *data = NULL;
     struct archive *a = NULL;
-    if (fstat(fd,&st) < 0 || st.st_size < (off_t)sizeof(struct index_header) || st.st_size > INDEX_LIMIT)
+    if (fstat(fd,&st) < 0 || st.st_size < (off_t)sizeof(struct index_header) || st.st_size > (off_t)INDEX_LIMIT)
         goto bad;
     size_t size = (size_t)st.st_size;
     data = malloc(size);

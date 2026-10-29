@@ -1,8 +1,9 @@
 # fluxOS self-hosting roadmap
 
 *Written 2026-10-28, against commit 8cdd993 plus the toolchain and libc
-work described in phases 1 and 2. Phases 0 and 1 are done, phase 2
-mostly; the rest is a plan.*
+work described in phases 1 and 2. Phases 0 to 4 are done (phase 3 and 4
+on 2026-10-29: the Makefile's tools, `fsh` as `/bin/sh`, and GCC running
+on fluxOS); phases 5 to 7 are a plan.*
 
 "Self-hosting" means that fluxOS, running on its own kernel, can turn a
 checkout of this repository into a bootable `fluxOS.iso` and an installed
@@ -78,9 +79,9 @@ and nine `.S` files.
 
 | Area | Gap |
 |---|---|
-| A compiler that runs on fluxOS | the cross compiler exists; the native one (phase 4) does not |
-| `make`, `tar`, `gzip` (compress), `find`, `install`, `cmp`/`diff`, `sed` | none (`cp mkdir rm mv cat` exist) |
-| libc | since phase 2, enough for GNU make and binutils to build; POSIX threads, interval timers, signal stacks and sessions since 2026-10-29; still no real links |
+| A compiler that runs on fluxOS | done (phase 4, 2026-10-29): GCC 13.2.0 with C and C++, 72 MB on the image |
+| `make`, `tar`, `gzip` (compress), `find`, `install`, `cmp`/`diff`, `sed` | done (phase 3, 2026-10-29), with `patch`, `cut`, `xargs`, `truncate`, `dd`, `ln`, `mktemp`, `nproc`, `printf`, `test`, `true`, `false` |
+| libc | since phase 2, enough for GNU make and binutils to build; POSIX threads, interval timers, signal stacks and sessions since 2026-10-29; C++-clean headers, C99 math, `getaddrinfo`, `.init_array` constructors and `__cxa_atexit` for GCC and libstdc++ (2026-10-29); still no real links |
 | Filesystem | FAT32 only on disk: 2 s modification times (a target built within 2 s of editing its source looks up to date to `make`), no symbolic or hard links, cosmetic permissions, case-insensitive names |
 | Kernel limits | 128 processes and threads together; `PATH_MAX` 4096 since 2026-10-29 (descriptors, memory regions, stack and pipes raised in phase 2) |
 | Boot media | ISO 9660 writing, El Torito, GRUB's images |
@@ -123,6 +124,22 @@ on 2026-10-29 for the desktop's sake (kernel threads with futexes, POSIX
 threads in libc); the toolchain is still built `--disable-threads`, which
 keeps the Canadian cross simpler, but `libstdc++`'s `gthr` has something
 to stand on now.
+
+**C++ came early.** GCC has been C++ since 4.8, so `cc1` for fluxOS is C++
+code: the Canadian cross of phase 4 needs a cross `g++` and a `libstdc++`
+built for fluxOS before anything else, not in stage 3 as first planned.
+That turned out to cost a day, not a phase: libc headers that are
+C++-clean (`extern "C"`), the rest of C99's `<math.h>`, `<sys/un.h>` and
+`getaddrinfo` (libcody, GCC's module mapper, wants them), `struct stat`
+with `off_t` and `time_t` fields, constructors run from `.init_array` by
+the C library's startup code (the toolchain is configured
+`--enable-initfini-array`; there is no `crti.o`), `.eh_frame` kept by the
+linker script, `__cxa_atexit`, and `--disable-tls` (the libc has no static
+TLS, so `__thread` is emulated through libgcc). libstdc++ itself needed one
+line in its `crossconfig.m4` (and the generated `configure`): fluxOS is
+configured like a Linux host, since the checks are link tests against
+`libc.a`. Both compilers are built with C and C++, so stage 3 lacks only
+the autotools side.
 
 ## Phase 0: the POSIX floor (done)
 
@@ -279,12 +296,20 @@ real kernel: `make test-libc-qemu` has the checks):
       keeps `exec` from taking another; `getsid`; `setpgid` refuses a
       session leader and a group of another session.
 
-## Phase 3: make and the tools the Makefile runs
+## Phase 3: make and the tools the Makefile runs (done)
 
 *Goal: every command the Makefile invokes exists on fluxOS and behaves
 the way the Makefile uses it. Measured by running the Makefile's
 `rootfs`, `system.tar` and `tests/` targets natively with the cross-built
 compiler objects, before phase 4 lands.*
+
+Done 2026-10-29. The tools are checked on the host against the GNU
+originals (`make test-tools`, `tests/tools-host.sh`: 308 checks: archives
+and compressed files each side can read, diffs each side's `patch`
+applies, the same output for the same scripts), and `fsh`'s `sh` mode
+against dash (`make test-sh`, `tests/sh-host.sh`: 135 scripts). They are
+built for fluxOS and on the image; what has not happened yet is running
+the Makefile's targets natively (phase 7).
 
 - [x] GNU make 4.4, cross-built with `./configure --host=i686-fluxos` (it
       needs only the phase 2 libc, no `getloadavg`); on the image since
@@ -292,73 +317,128 @@ compiler objects, before phase 4 lands.*
       `$(wildcard)`, `$(patsubst)`, `$(foreach)`, `$(shell)`,
       target-specific variables and `-MMD` includes throughout, so a
       smaller make is not an option.
-- [ ] `tar` (ustar create, extract, list; `--format=ustar --owner=0
-      --group=0 --numeric-owner -cf`, `-C`, `-x`), reusing the kernel's
-      `initrd.c` parser on the reading side.
-- [ ] `gzip`/`gunzip`/`zcat`: deflate already exists in `zip`'s code
-      (`user/libc/arc_codec.c`); add the gzip header and trailer.
-- [ ] `find` (`-type f`, `-name`, `-print`, `-newer`), `install` (`-d`,
-      `-m`, copying), `cmp`, `diff` (unified; needed by the tests and by
-      anyone editing), `patch` (unified; `tools/toolchain/build.sh` runs
-      it), `sed` (`s///`, `-i`, `-n`, `p`, `d`, addresses), `cut`,
-      `xargs`, `truncate`, `dd` (`if= of= bs= count= seek=`), `sha256sum`,
-      `ln` (hard and symbolic, after phase 5), `curl` or `wget -O`
-      (exists), `nproc`.
-- [ ] `fsh` in `/bin/sh` mode: when started as `sh`, POSIX behaviour
-      where the two differ (no `AUTO_CD`, no history expansion, word
-      splitting of unquoted `$var`, `set -e`, `trap`, `getopts`, `"$@"`,
-      `exec`, `.` as `source`, `[ ]`/`test` builtins, `printf` builtin
-      with `%d %s %x`, here documents). GNU make runs every recipe line
-      through `/bin/sh -c`, and `configure` scripts need all of it.
+- [x] `tar` (`user/bin/tar.c`): ustar create, extract and list,
+      `--format=ustar --owner=0 --group=0 --numeric-owner -cf`, repeated
+      `-C` in both directions, `-z` through a child `gzip` (and gzip's
+      magic recognised without `-z`, pipes included), `--strip-components`,
+      `-k`, `-O`; reads old, GNU (`L`/`K` long names) and pax archives.
+      Members in name order, so the same tree gives the same archive.
+- [x] `gzip`/`gunzip`/`zcat`: Deflate compression moved out of `zip` into
+      libc as a stream (`<deflate.h>`, `user/libc/deflate.c`: LZ77 over
+      hash chains, fixed Huffman codes, a block every 256 KiB, levels 1 to
+      9 and stored blocks at 0) and the archive codecs' inflate made
+      readable from a pipe; `gzip.c` adds the container, `-c -d -f -k -l
+      -n -t -v`, concatenated members. Fixed codes cost some ratio against
+      GNU gzip (dynamic codes are the obvious next step).
+- [x] `find` (`-name -iname -path -type -newer -mtime -size -empty -prune
+      -print -print0 -delete -exec ... \; and +`, `-maxdepth`, `! -o -a ( )`),
+      `install` (`-d -m -D -p -s -t`), `cmp` (`-l -s`), `diff` (Myers in
+      linear space; normal and unified output, `-r -N -q -s -i -b -w -B
+      -a`), `patch` (unified and normal diffs, fuzz, offsets, `-p -R -N -i
+      -d -b --dry-run`, new and deleted files, rejects to `.rej`), `sed`
+      (every address form, `s///` with `g p N i w m`, `y`, `a i c`, `b t
+      T :`, `n N p P D`, the hold space, `l`, `q Q`, `r w`, `{}`, `-n -e -f
+      -E -i -s`; the libc's BRE and ERE), `cut`, `xargs` (`-0 -n -s -I -r
+      -t`), `truncate`, `dd`, `ln` (hard and symbolic: the calls exist and
+      FAT refuses them until phase 5), `mktemp`, `nproc`, `printf`,
+      `test`/`[` (shared with the shell: `user/fsh/testexpr.c`), `true`,
+      `false`; `sha256sum` and `wget -O` existed.
+- [x] `fsh` in `/bin/sh` mode (`sh.posix`, when started as `sh` or with
+      `--posix`): unquoted `$var` and `$(...)` split on `$IFS`, patterns
+      that match nothing stay as they are, no brace expansion, no
+      `AUTO_CD`, no startup files, `"$@"` with no parameters is no word;
+      and for both shells: `case`/`esac`, here documents (`<<`, `<<-`,
+      quoted delimiters), `${var#pat}` and the other three, `${var:?}`,
+      `set -e -u -x -f -n` (and `-o`), `trap` (with `EXIT`), `getopts`,
+      `local`, `command`, `umask`, `readonly`, `unset -f`, `<>`, bundled
+      flags (`sh -ec`, `sh -c cmd name args`, `sh -n`), and a `test` with
+      every POSIX operator. GNU make runs every recipe line through
+      `/bin/sh -c`, and `configure` scripts need all of it.
 - [ ] `grub-file --is-x86-multiboot` becomes `mbcheck` (phase 6);
       `grub-mkimage`'s output becomes a checked-in `core.img` (phase 6).
 
-Size: GNU make is third-party; the tools 2k to 3k lines; the `sh` mode
-1k in `fsh`. Risk: low.
+Size: GNU make is third-party; the tools came to 6k lines (`diff`,
+`patch` and `sed` are 600 to 900 each), the `sh` mode 1k in `fsh`.
 
-## Phase 4: GCC and binutils that run on fluxOS
+## Phase 4: GCC and binutils that run on fluxOS (done)
 
 *Goal: `/usr/bin/gcc` on fluxOS compiles and links a program, and the
 system image carries the whole toolchain. Measured by `gcc -O2 hello.c`
 in a fluxOS terminal, then by `make` of the fluxOS tree natively (phase
 7's stage 1).*
 
-- [ ] The Canadian cross: with `build/toolchain/cross` on the path,
-      binutils then GCC configured `--build=x86_64-linux-gnu
-      --host=i686-fluxos --target=i686-fluxos --prefix=/usr
-      --with-sysroot=/ --enable-languages=c --disable-shared
-      --disable-threads --disable-nls --disable-plugin --disable-lto
-      --disable-libssp --disable-libquadmath --disable-fixincludes`, GMP,
-      MPFR, MPC and ISL in-tree, everything static. `tools/toolchain/
-      build.sh --native` does it, after the cross build.
-- [ ] The parts that run as processes: the `gcc` driver starts `cc1`,
-      `as`, `collect2`/`ld` through libiberty's `pex-unix` (`fork`,
-      `execvp`, `pipe`, `waitpid`, `dup2`: exist) and temporary files
-      (`mkstemp`, `TMPDIR`: phase 2). `collect2` reads `nm` output
-      through a pipe; `--disable-lto` keeps `lto-wrapper` out.
-- [ ] Memory and limits: `cc1` on the desktop's biggest files needs a few
-      hundred MB of heap (the `sbrk` region is bounded by the lowest
-      `mmap`, which the libc's `malloc` could switch to `mmap` chunks for
-      large requests) and a deep stack (phase 2's 64 MiB).
-- [ ] Packaging: `/usr/bin/{gcc, cc, as, ld, ar, ranlib, nm, objcopy,
-      strip, readelf}`, `/usr/libexec/gcc/i686-fluxos/13.2.0/{cc1,
-      collect2}`, `/usr/lib/gcc/i686-fluxos/13.2.0/{libgcc.a, crtbegin.o,
-      crtend.o, include/}`, `/usr/include` and `/usr/lib` from the
-      sysroot. About 60 MB stripped: on the installed disk (`system.tar`),
-      not in the CD's in-memory setup system. `fluxinstall` already
-      unpacks `system.tar`, so nothing changes there.
-- [ ] The specs: `/usr/lib/fluxos.ld` is the default linker script of the
-      native `gcc` (phase 1's `-Ttext-segment` default serves until then),
-      `-static` implied, `-lgcc` and `-lc` found in `/usr/lib`.
-- [ ] A smoke test in `tests/`: compile and run a program with the native
-      GCC under QEMU (`make test-gcc-qemu`), comparing its output and the
-      binary with the cross-built one.
+Done 2026-10-29: `make toolchain-native` builds GCC 13.2.0 to run on
+fluxOS and the next `make` puts it on the system image. It is built and
+installed, and its programs are the kernel's kind of ELF (static, loaded
+at 1 GiB, constructors in `.init_array`); the test that runs it on the
+kernel is written (`make test-gcc-qemu`) and has not been run yet.
 
-Size: no code of ours beyond scripts and packaging; the work is in phase
-2's libc and in whatever the Canadian cross turns up. Risk: medium; GCC's
-configure has its own ideas about hosts it has not met, and each one is a
-small fix in `config.gcc`/`config.host` or a cache variable passed to
-`configure`.
+- [x] The Canadian cross (`tools/toolchain/build.sh --native`): with the
+      cross toolchain on the path, GCC configured `--build=x86_64-pc-linux-gnu
+      --host=i686-fluxos --target=i686-fluxos --prefix=/usr --with-sysroot=/
+      --with-build-sysroot=build/sysroot --enable-languages=c,c++
+      --disable-shared --disable-threads --disable-tls --enable-initfini-array
+      --disable-nls --disable-plugin --disable-lto --disable-libssp
+      --disable-libquadmath --disable-libstdcxx-pch --disable-fixincludes`,
+      GMP, MPFR, MPC and ISL copied into the tree (with their timestamps,
+      or autotools try to regenerate themselves) and given fluxOS's
+      `config.sub`, everything static. binutils come from `make ports`
+      as before (`as`, `ld` and the rest in `/usr/bin`, found on `PATH`).
+      Twenty minutes on eight cores; `--continue` picks a build up after
+      a libc fix without configuring again.
+- [x] What the Canadian cross turned up, all in the libc or the patches:
+      C++-clean headers, `<math.h>`, `<sys/un.h>`, `getaddrinfo`,
+      `struct stat` types, constructors, `__cxa_atexit`, `--disable-tls`,
+      libstdc++'s host configuration (see *Decisions*). GCC's own
+      `configure` needed no cache variables beyond `gcc_cv_func_mmap_*=no`:
+      the compiler's page allocator takes its pages from `malloc` (the
+      kernel keeps 256 mappings per process; the heap can grow to 2 GiB).
+- [x] The parts that run as processes: the `gcc` driver starts `cc1`,
+      `as`, `collect2`/`ld` through libiberty's `pex-unix` (`fork`,
+      `execvp`, `pipe`, `waitpid`, `dup2`) and temporary files (`mkstemp`,
+      `TMPDIR`); `collect2` reads `nm` output through a pipe.
+      `--disable-lto` keeps `lto-wrapper` out (the install still makes
+      one; the script deletes it).
+- [x] Memory and limits: the heap grows by `sbrk` up to the lowest
+      mapping, and mappings are placed from the top of the 2 GiB address
+      space down, so `cc1` has well over a gigabyte to grow into; the
+      stack is 32 MiB (the kernel's maximum). The `mmap`-for-large-blocks
+      change to `malloc` was not needed.
+- [x] Packaging: `/usr/bin/{gcc, cc, cpp, g++, c++}`,
+      `/usr/libexec/gcc/i686-fluxos/13.2.0/{cc1, cc1plus, collect2}`,
+      `/usr/lib/gcc/i686-fluxos/13.2.0/{libgcc.a, crtbegin.o, crtend.o,
+      include/}` in `build/toolchain/native/root`, and `/usr/include` and
+      `/usr/lib` straight from the sysroot (`system.tar` takes both
+      directories when the native `gcc` exists). 72 MB stripped with C++
+      (`cc1` 31 MB, `cc1plus` 33 MB): on the installed disk, not in the
+      CD's in-memory setup system; `fluxinstall` unpacks `system.tar` as
+      before. `libstdc++` for programs compiled on fluxOS is not on the
+      image yet (the cross toolchain has it; copying
+      `cross/i686-fluxos/lib/libstdc++.a` and `include/c++` is a one-line
+      addition when wanted, 50 MB).
+- [x] The specs (`gcc/config/fluxos.h`): `/usr/lib/fluxos.ld` (the
+      sysroot's copy of `user/user.ld`) is the default linker script of
+      both compilers when it exists, found through the startfile search
+      (`%:if-exists-then-else(fluxos.ld%s -T)`: the spec functions take
+      space-separated arguments), with `-Ttext-segment=0x40000000` as the
+      fallback; `-static` implied, `-lgcc`, `-lc` (and `-lm`, which `g++`
+      adds: an empty archive in the sysroot) found in `/usr/lib`;
+      `__cxa_atexit` for static destructors.
+- [x] A smoke test in `tests/`: `make test-gcc-qemu` boots the kernel
+      with the system image plus `tests/gcc-hello.c` and its cross-built
+      binary, runs `tests/gcc-guest.c` as init, which compiles the program
+      with `/usr/bin/gcc -O2`, runs it, checks its output (constructors,
+      `qsort`, `hypot`, 64-bit arithmetic, `argv`), compares the binary
+      with the cross compiler's byte for byte, checks a compile error is
+      reported, runs `-E`, `-S`, `as` and the driver on an object, and has
+      `make` drive it through a Makefile with `/bin/sh` recipes.
+      `tools/test-kernel-qemu.py` grew `--add HOST:GUEST` and `--timeout`
+      for it.
+
+Size: 200 lines in `build.sh`, the test and its guest; the work was in
+the libc. What was expected to be medium risk (GCC's configure and an
+unknown host) was in the end four build attempts, each stopped by one
+missing libc feature.
 
 ## Phase 5: a filesystem for a build
 
@@ -460,23 +540,27 @@ libc list into an ordered one.
 
 Suggested order: 4 (the Canadian cross: binutils already links for
 fluxOS), 3 (GNU make already builds), 6, 5, 7; and running the phase 2
-tests on fluxOS before relying on any of it.
+tests on fluxOS before relying on any of it. (Phases 3 and 4 were done
+together on 2026-10-29; what remains is 5, 6 and 7, and running
+`make test-gcc-qemu` and the tools on the kernel.)
 
 ## Later, deliberately
 
-- **Stage 3, GCC building GCC on fluxOS.** GCC has been C++ since 4.8,
-  so this needs `g++` and `libstdc++` in the Canadian cross
-  (`--enable-languages=c,c++`), which in turn needs a libc with wide
-  characters, locale stubs, `pthread` stubs for `libstdc++`'s `gthr`,
-  and more memory, plus autotools' `configure` running under `fsh` (or a
-  port of `bash`), `sed`, `awk`, `grep`, `expr`, `m4` and `bison` for
-  binutils. Hours of build time on the target machines. Everything in
-  phases 2 to 7 makes it closer; nothing in them depends on it.
+- **Stage 3, GCC building GCC on fluxOS.** The compilers are C++ already
+  (`g++` and `libstdc++` for fluxOS came with phase 4, because `cc1`
+  itself is C++), so what this still needs is autotools' `configure`
+  running under `fsh`'s `sh` mode (long scripts: `awk`, `expr`, `tr`,
+  `grep -E`, `sort`, `uniq` and `m4`/`bison` for binutils are the tools
+  missing), `libstdc++` and the C++ headers on the image, and hours of
+  build time on the target machines. Everything in phases 5 to 7 makes it
+  closer; nothing in them depends on it.
 - **Dynamic linking** (`ld.so`, PIC, `dlopen`): nothing on the roadmap
   needs it; GCC plugins would.
 - **Threads in the toolchain:** fluxOS has threads since 2026-10-29, but
   make `-j` and the compilers do not need them; the ports stay
-  `--disable-threads` until `libstdc++` wants `gthr` (stage 3).
+  `--disable-threads` (`libstdc++` is built with `gthr-single`), and
+  `--disable-tls` until the libc has static TLS for `__thread` (today it
+  is emulated through libgcc's `emutls`).
 - **Networking in the loop:** a native `git` is a large port (or a small
   `git clone`/`pull` over HTTPS with the smart protocol, ~3k lines); the
   GitHub zip through `wget` and `unzip` serves until then.

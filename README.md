@@ -129,24 +129,27 @@ says why.
   batteries (charge, rate, time left), the lid, the power and sleep buttons, a
   thermal zone (critical temperature shuts down cleanly) and the backlight
   (brightness keys and `power bright`). `SYS_power` and the `power` command
-  report it all. **Suspend to RAM (S3)**, not yet working on real hardware
-  (see *Work in progress*), from the desktop's Shut Down dialog,
-  the Power dialog, the sleep key, closing the lid, or `power sleep`: disks are
+  report it all. **Suspend to RAM (S3)** works, on real hardware (the HP
+  Pavilion g6) and in QEMU, from the desktop's Shut Down dialog, the Power
+  dialog, the sleep key, closing the lid, or `power sleep`: disks are
   flushed and parked, the other processors parked, and on waking the
   processor, PICs, PCI configuration, IDE (with its DMA mode), AHCI, all four
   USB controllers (devices are found again), HD Audio, the network card and
   the PS/2 devices are set up again, with the processors' MTRRs and PCI
   functions brought back to D0 first. On real hardware the wake code runs the
   video ROM's initialisation and sets the boot loader's VESA mode again
-  (what pre-KMS Linux needed as `acpi_sleep=s3_bios,s3_mode`); under a
-  hypervisor it does neither, since the virtual BIOS restores the display
-  itself. Options: `acpi=off`, `acpi=basic` (tables only, as before:
-  power-off without AML), `ec=off`, `lid=ignore` (closing the lid does nothing),
-  `s3_nobios` / `s3_nomode` (skip the video ROM / the mode set), `s3_bios` /
-  `s3_mode` (do them under a hypervisor too), `s3_beep` (beeps on the speaker
-  for a machine without a picture: one when the firmware hands back to the
-  wake code, two when the kernel is running again, three when the devices
-  are back).
+  (what pre-KMS Linux needed as `acpi_sleep=s3_bios,s3_mode`), keeping its
+  real-mode code out of the first 64 KiB, which some firmware overwrites
+  while resuming; under a hypervisor it does neither, since the virtual BIOS
+  restores the display itself. Options: `acpi=off`, `acpi=basic` (tables
+  only, as before: power-off without AML), `ec=off`, `lid=ignore` (closing
+  the lid does nothing), `s3_nobios` / `s3_nomode` (skip the video ROM / the
+  mode set), `s3_bios` / `s3_mode` (do them under a hypervisor too),
+  `s3_beep` (beeps on the speaker for a machine without a picture: one when
+  the firmware hands back to the wake code, two when the kernel is running
+  again, three when the devices are back: the way to tell where a machine
+  that does not come back got to). `make test-suspend-qemu` checks three
+  sleep/wake cycles in QEMU.
 - Display drivers:
   - Standard: keeps the VESA BIOS mode.
   - **3dfx Voodoo Banshee/3/4/5**: reads EDID, sets modes from 640x480 to
@@ -222,6 +225,17 @@ says why.
   brace expansion, globs (a glob that matches nothing is an error, as in zsh).
 - Job control (`jobs`, `fg`, `bg`, `wait`, `kill %n`; ^Z suspends the foreground job), history expansion
   (`!! !$ !n !str`), aliases, `source`, `~/.fshrc`, `~/.fsh_history`, AUTO_CD.
+- `case ... esac`, here documents (`<<EOF`, `<<-EOF`, quoted delimiters),
+  `${VAR#pat} ${VAR%pat}` (and `##`, `%%`), `trap`, `getopts`, `local`,
+  `command -v`, `set -e -u -x -f -n`, `umask`, a `test`/`[` with every POSIX
+  operator, and `printf` with `%f`.
+- **As `/bin/sh`** (started as `sh`, or `fsh --posix`): the POSIX shell that
+  `make`'s recipes and `configure` scripts expect. Unquoted `$var` and
+  `$(...)` are split on `$IFS`, a pattern that matches nothing stays as it
+  is, no brace expansion, no AUTO_CD, no startup files (`$ENV` if set), and
+  `"$@"` with no parameters is no word at all. `sh -ec`, `sh -c 'cmd' name
+  args`, `sh script` and `sh -n` work as make and configure use them. `make
+  test-sh` runs the same scripts under it and the host's `/bin/sh` (dash).
 
 **The desktop** (`/bin/desktop`), started by init at boot
 - Two themes, chosen on the **Appearance** page of Display Properties. **Kinetik**
@@ -590,25 +604,45 @@ fetcher process, so the desktop keeps running), or from `file://`.
   register and fills spans four pixels at a time with SSE2. A `<math.h>` is
   included: floats and doubles both in SSE2.
 
-**Userland** (`/bin`): 7z basename beep cat chmod clear cp date desktop df dirname
-dmesg dos echo env fetch fluxinstall free fsh grep halt head hexdump host
-ifconfig init ls lsblk mkdir mkfs.fat mixer more mount mv nc ping play
-poweroff ps reboot rm rmdir seq sh sleep sort spin stat sync tail tee threadtest top
-touch tr umount uname uniq unzip uptime wc wget yes zip (and httpc, the browser's
-fetcher), on a small libc (stdio, malloc, dirent, time, sockets, a DNS resolver,
-archives, an HTTP/1.1 and HTTP/2 client, inflate and POSIX threads). In `/usr/bin`, cross-built
-from their sources with the fluxOS toolchain (`make ports`): **GNU make 4.4.1** and **binutils 2.42**
-(`as`, `ld`, `ar`, `ranlib`, `nm`, `objcopy`, `objdump`, `readelf`, `strip`, `size`, `strings`), the
-first steps toward building fluxOS on fluxOS (`self-hosting-roadmap.md`).
+**Userland** (`/bin`): 7z [ basename beep cat chmod clear cmp cp cut date dd desktop
+df diff dirname dmesg dos echo env false fetch find fluxinstall free fsh grep gunzip
+gzip halt head hexdump host ifconfig init install ln ls lsblk mkdir mkfs.fat mktemp
+mixer more mount mv nc nproc patch ping play poweroff printf ps reboot rm rmdir sed
+seq sh sleep sort spin stat sync tail tar tee test threadtest top touch tr true
+truncate umount uname uniq unzip uptime wc wget xargs yes zcat zip (and httpc, the
+browser's fetcher), on a small libc (stdio, malloc, dirent, time, sockets, a DNS
+resolver, archives, Deflate both ways, an HTTP/1.1 and HTTP/2 client and POSIX
+threads). In `/usr/bin`, cross-built from their sources with the fluxOS toolchain
+(`make ports`): **GNU make 4.4.1** and **binutils 2.42** (`as`, `ld`, `ar`, `ranlib`,
+`nm`, `objcopy`, `objdump`, `readelf`, `strip`, `size`, `strings`); and, after `make
+toolchain-native`, **GCC 13.2.0** itself (`gcc`, `cc`, `cpp`, `g++`, `c++` with `cc1`,
+`cc1plus` and `collect2` in `/usr/libexec`, `libgcc`, and the system's headers and
+libraries in `/usr/include` and `/usr/lib`): `gcc -O2 hello.c` on fluxOS makes the
+same program the cross compiler makes on Linux, byte for byte (`make test-gcc-qemu`).
+- The tools the Makefile runs, written for this: `tar` (ustar create, list,
+  extract, `-C`, `-z` through `gzip`; reads GNU and pax archives too),
+  `gzip`/`gunzip`/`zcat` (libc's Deflate: `<deflate.h>` compresses and expands
+  as streams), `find` (`-name -path -type -newer -size -prune -exec ... {} +`),
+  `install`, `cmp`, `diff` (Myers, normal and unified, `-r -N -i -b -w -B`),
+  `patch` (unified and normal, fuzz, offsets, `-p -R -N --dry-run`, rejects),
+  `sed` (addresses, ranges, `s///` with every flag, `y`, `a i c`, `b t T`,
+  hold space, `{}`, `-i -n -E -s`), `cut`, `xargs` (`-0 -n -I -r`), `truncate`,
+  `dd`, `ln`, `mktemp`, `nproc`, `printf`, `test`/`[`, `true`, `false`. `make
+  test-tools` builds them for the host and checks them against the GNU
+  originals (archives each side can read, diffs each side's `patch` applies,
+  the same output for the same scripts).
 - The libc is enough of POSIX for GNU programs to build against it unchanged
-  (GNU make and binutils do, cross-compiled; see `self-hosting-roadmap.md`):
+  (GNU make, binutils and GCC do, cross-compiled; see `self-hosting-roadmap.md`),
+  and its headers are C++-clean, so that `libstdc++` builds on it too:
   `printf` and `strtod` that agree with glibc digit for digit (exact
   floating-point conversion, correct rounding), `scanf`, seekable stdio with
   `popen`, `tmpfile` and memory streams, `getopt_long`, POSIX regular
   expressions, `fnmatch` and `glob`, `select`, `mktime`/`timegm`/`strftime`,
   `realpath`, `mkstemp`, `sysconf`, `<termios.h>`, a "C" locale with the
-  wide-character functions, and users from `/etc/passwd`. Processes may hold
-  256 descriptors, pipes 64 KiB.
+  wide-character functions, users from `/etc/passwd`, C99's `<math.h>`,
+  `getaddrinfo`, `__cxa_atexit`, and constructors and destructors from
+  `.init_array` and `.fini_array` (what GCC's `crtbegin.o` and C++ static
+  objects use). Processes may hold 256 descriptors, pipes 64 KiB.
 - `unzip [-l|-v|-t|-p] [-o|-n] [-j] [-d DIR] ARCHIVE [NAME...]` lists, tests and
   extracts ZIP and 7z archives; `7z l|t|x|e [-oDIR] [-y] ARCHIVE` does the same
   with 7-Zip's syntax; `zip [-r] [-0..-9] [-j] ARCHIVE.zip FILE...` makes ZIP
@@ -656,6 +690,9 @@ make test-websocket # local ws/wss transport and browser API integration tests
 make test-kernel # runs allocator, filesystem, pipe and socket regressions on the host
 make test-libc   # libc printf/strtod/scanf/regex/fnmatch/getopt/time against glibc, on the host
 make test-libc-qemu # the libc on the real kernel (files, popen, pipes, select, time) in QEMU
+make test-tools  # tar, gzip, sed, diff, patch, find... built for the host, against GNU's
+make test-sh     # fsh as /bin/sh, built for the host, against the host's /bin/sh
+make test-gcc-qemu # the native GCC compiles, links and runs a program on the real kernel
 make test-desktop-jobs # decoder helper responsiveness, transfers, cancellation and recovery
 make test-desktop-jobs-qemu # same protocol tests with fluxOS's blocking pipes
 make test-kernel-qemu # boots kernel regressions with a disposable initrd and scratch disk
@@ -673,19 +710,26 @@ make run-q35    # q35 machine: disk and CD on SATA, USB keyboard and tablet on x
 make run-usb    # disk as a USB stick on EHCI, keyboard and mouse on UHCI
 make clean      # removes build/ and the ISO; the disk images are kept
 make sysroot    # build/sysroot: fluxOS's headers, libc.a, libGL.a, crt0.o for a cross compiler
-make toolchain  # binutils and GCC for the i686-fluxos target, in build/toolchain/cross
+make toolchain  # binutils and GCC (C and C++) for the i686-fluxos target, in build/toolchain/cross
+make ports      # GNU make and binutils built for fluxOS, for the system image
+make toolchain-native # GCC built to run on fluxOS (the Canadian cross), for the system image
 ```
 
-`make toolchain` builds a GCC that targets fluxOS (`i686-fluxos-gcc`, with
-`as`, `ld`, `ar` and `libgcc`): it fetches binutils 2.42 and GCC 13.2.0 from
-gnu.org (checked against fixed SHA-256 sums), applies the small target patches
-in `tools/toolchain/patches/`, and installs into `build/toolchain/cross`. It
-needs `curl`, `patch`, a host C and C++ compiler and about fifteen minutes.
-With it, `i686-fluxos-gcc hello.c` makes a program for fluxOS without the
-Makefile's flags, and `make BUILD=build-cross CC=.../i686-fluxos-gcc
-LD=.../i686-fluxos-ld AR=.../i686-fluxos-ar` builds the tree with it. This is
-the first step of `self-hosting-roadmap.md`, which describes how the same
-compiler is to run on fluxOS itself.
+`make toolchain` builds a GCC that targets fluxOS (`i686-fluxos-gcc` and
+`-g++`, with `as`, `ld`, `ar`, `libgcc` and `libstdc++`): it fetches binutils
+2.42 and GCC 13.2.0 from gnu.org (checked against fixed SHA-256 sums), applies
+the small target patches in `tools/toolchain/patches/`, and installs into
+`build/toolchain/cross`. It needs `curl`, `patch`, a host C and C++ compiler
+and about twenty minutes. With it, `i686-fluxos-gcc hello.c` makes a program
+for fluxOS without the Makefile's flags (linked with `/usr/lib/fluxos.ld`,
+the system's linker script), and `make BUILD=build-cross
+CC=.../i686-fluxos-gcc LD=.../i686-fluxos-ld AR=.../i686-fluxos-ar` builds
+the tree with it. `make ports` then builds GNU make and binutils for fluxOS,
+and `make toolchain-native` GCC itself, configured `--host=i686-fluxos` (its
+C++ parts against that `libstdc++`); the next `make` puts them on the system
+image with the sysroot as `/usr/include` and `/usr/lib`. The whole of
+`self-hosting-roadmap.md` describes the way from there to a fluxOS that
+builds itself.
 
 The TLS host tests additionally need OpenSSL and the Python `cryptography`
 package. They generate temporary CA/server certificates and use loopback-only
@@ -748,6 +792,8 @@ fetch                          # system summary
 spin A 5 & spin B 5 & top      # CPU-bound jobs sharing the CPU; ^C quits top
 threadtest                     # POSIX threads: every line should say ok
 make --version; as --version   # GNU make and binutils, built for fluxOS
+echo 'int main(){puts("hi");}' > h.c; gcc -include stdio.h h.c && ./a.out   # GCC on fluxOS
+tar -czf src.tgz /usr/include; tar -tzf src.tgz | head; sed -n '1,3p' h.c   # the build tools
 cat ~/README.txt; ./demo.sh    # tour and a scripting demo
 echo {1..3} $((6*7)) ~         # brace, arithmetic and tilde expansion
 lsblk; df -h; mount            # disks, CD-ROM and mounted filesystems
@@ -929,23 +975,16 @@ user range and page tables first.
 
 ## Work in progress
 
-- **Suspend to RAM on physical hardware still needs validation.** The wake
-  path passes repeated S3 cycles in QEMU, where the video BIOS is left
-  alone (its ROM call hung there). On real hardware it now runs the video
-  ROM and sets the VESA mode again by default, keeps its real-mode code out
-  of the first 64 KiB (which some firmware overwrites while resuming),
-  restores the MTRRs and brings PCI functions back to D0. On the HP Pavilion g6
-  with a Llano APU, test with `s3_beep`: one beep means the firmware came
-  back to the wake code, two that the kernel is running again, three that
-  the devices are back. One beep then nothing points at the video ROM
-  (`s3_nobios`, then `s3_nomode`); no beep at all means the firmware never
-  came back to the waking vector. `lid=ignore` prevents automatic sleep
-  while investigating.
-  For QEMU S3 tests, boot through GRUB (ISO or installed disk), not
-  `make run-kernel`: QEMU's direct kernel loader reloads kernel memory on
-  wake, destroying the saved resume context. `make test-suspend-qemu`
-  uses a disposable GRUB ISO and checks three sleep/wake cycles;
-  `KERNEL_TEST_CPUS=2` also exercises restarting the other processor.
+- **Building fluxOS on fluxOS** (`self-hosting-roadmap.md`): GNU make,
+  binutils and GCC itself run on fluxOS, and the Makefile's tools exist
+  (`tar`, `gzip`, `sed`, `diff`, `patch`, `find`, `install`...) with `fsh`
+  as `/bin/sh`; what is left is a filesystem with 1-second timestamps and
+  links for the build tree (ext2), making the ISO natively, and the
+  bootstrap itself. The native compiler is tested on the kernel by `make
+  test-gcc-qemu`; the tools and the `sh` mode on the host against the GNU
+  originals and dash. For QEMU S3 tests, boot through GRUB (ISO or installed
+  disk), not `make run-kernel`: QEMU's direct kernel loader reloads kernel
+  memory on wake, destroying the saved resume context.
 - **The Radeon driver on Llano APUs (HD 6520G and kin) is partial:** page
   flipping, the hardware pointer, and native modes only for a laptop panel
   behind a DisplayPort bridge (TRAVIS, as on the HP Pavilion g6); eDP panels and
@@ -981,10 +1020,11 @@ The FPU state is saved with FXSAVE, so AVX and later cannot be used.
   own modes or 3D engine on the HD 4000s (they cannot set the card up again:
   `radeon.modeset=0 radeon.accel=0`; the Llano driver sets its panel mode
   again after the video BIOS), nor with a USB disk mounted
-  (USB devices are let go of and found again). The screen comes back only
-  where firmware restores it, or where the opt-in `s3_mode` / `s3_bios`
-  video restoration works. No hibernation (S4), no processor frequency scaling, and
-  touchpads other than Synaptics have no scrolling.
+  (USB devices are let go of and found again). The screen comes back through
+  the video ROM and the VESA mode set on real hardware (`s3_nobios`,
+  `s3_nomode` turn them off) or the virtual BIOS under a hypervisor. No
+  hibernation (S4), no processor frequency scaling, and touchpads other than
+  Synaptics have no scrolling.
 - **SATA:** AHCI only, no NCQ, port multipliers or hot plugging; a controller
   above 4 GiB can't be reached.
 - **USB:** isochronous transfers only on UHCI, OHCI and xHCI (a USB audio

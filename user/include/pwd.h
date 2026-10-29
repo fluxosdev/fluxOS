@@ -1,6 +1,10 @@
 #ifndef _PWD_H
 #define _PWD_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 /* From /etc/passwd when it exists; fluxOS has one user either way. */
@@ -21,5 +25,9 @@ int getpwuid_r(uid_t uid, struct passwd *pw, char *buf, size_t size, struct pass
 struct passwd *getpwent(void);
 void setpwent(void);
 void endpwent(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -1,6 +1,10 @@
 #ifndef _UNISTD_H
 #define _UNISTD_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 #include <flux/abi.h>
 
@@ -152,5 +156,9 @@ int pause(void);
 extern char *optarg;
 extern int optind, opterr, optopt;
 int getopt(int argc, char *const argv[], const char *optstring);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

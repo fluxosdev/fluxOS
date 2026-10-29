@@ -1,6 +1,10 @@
 #ifndef _SYS_RESOURCE_H
 #define _SYS_RESOURCE_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/time.h>
 
 #define RUSAGE_SELF     0
@@ -56,5 +60,9 @@ int getrlimit(int resource, struct rlimit *rl);
 int setrlimit(int resource, const struct rlimit *rl);
 int getpriority(int which, id_t who);
 int setpriority(int which, id_t who, int prio);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

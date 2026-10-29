@@ -1,6 +1,10 @@
 #ifndef _LIMITS_H
 #define _LIMITS_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <flux/abi.h>
 
 #define CHAR_BIT  8
@@ -46,5 +50,9 @@
 #define _POSIX_ARG_MAX  4096
 #define _POSIX_OPEN_MAX 20
 #define _POSIX2_RE_DUP_MAX 255
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

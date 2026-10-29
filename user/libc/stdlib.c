@@ -17,9 +17,32 @@ char **environ;
 void __stdio_init(void);
 int main(int argc, char **argv, char **envp);
 
-#define MAX_ATEXIT 16
-static void (*atexit_fns[MAX_ATEXIT])(void);
-static int atexit_count;
+/* atexit() and __cxa_atexit() (what C++ registers static destructors with): run in reverse. */
+struct exit_fn {
+    void (*fn)(void *);
+    void *arg;
+    void *dso;
+};
+static struct exit_fn *atexit_fns;
+static int atexit_count, atexit_cap;
+
+/* Constructors and destructors from the linker's .init_array and .fini_array (user.ld, or
+ * the linker's own script): what GCC's crtbegin.o and C++ static objects put there. */
+typedef void (*init_fn)(int, char **, char **);
+extern init_fn __preinit_array_start[] __attribute__((weak, visibility("hidden")));
+extern init_fn __preinit_array_end[] __attribute__((weak, visibility("hidden")));
+extern init_fn __init_array_start[] __attribute__((weak, visibility("hidden")));
+extern init_fn __init_array_end[] __attribute__((weak, visibility("hidden")));
+extern void (*__fini_array_start[])(void) __attribute__((weak, visibility("hidden")));
+extern void (*__fini_array_end[])(void) __attribute__((weak, visibility("hidden")));
+
+static void run_init_array(init_fn *start, init_fn *end, int argc, char **argv, char **envp)
+{
+    if (!start || !end)
+        return;
+    for (init_fn *f = start; f < end; f++)
+        (*f)(argc, argv, envp);
+}
 
 /* The program's name, for err() and warn(): argv[0] without its directory. */
 const char *__progname = "";
@@ -37,21 +60,54 @@ void __libc_start(int argc, char **argv, char **envp)
         program_invocation_short_name = (char *)__progname;
     }
     __stdio_init();
+    run_init_array(__preinit_array_start, __preinit_array_end, argc, argv, envp);
+    run_init_array(__init_array_start, __init_array_end, argc, argv, envp);
     exit(main(argc, argv, envp));
+}
+
+int __cxa_atexit(void (*fn)(void *), void *arg, void *dso)
+{
+    if (atexit_count == atexit_cap) {
+        int cap = atexit_cap ? atexit_cap * 2 : 32;
+        struct exit_fn *n = realloc(atexit_fns, sizeof(*n) * (size_t)cap);
+        if (!n)
+            return -1;
+        atexit_fns = n;
+        atexit_cap = cap;
+    }
+    atexit_fns[atexit_count].fn = fn;
+    atexit_fns[atexit_count].arg = arg;
+    atexit_fns[atexit_count].dso = dso;
+    atexit_count++;
+    return 0;
 }
 
 int atexit(void (*fn)(void))
 {
-    if (atexit_count >= MAX_ATEXIT)
-        return -1;
-    atexit_fns[atexit_count++] = fn;
-    return 0;
+    return __cxa_atexit((void (*)(void *))fn, NULL, NULL);
+}
+
+/* Run what was registered for dso (every one when NULL), latest first. */
+void __cxa_finalize(void *dso)
+{
+    for (int i = atexit_count - 1; i >= 0; i--) {
+        if (dso && atexit_fns[i].dso != dso)
+            continue;
+        struct exit_fn e = atexit_fns[i];
+        atexit_fns[i].fn = NULL;
+        if (e.fn)
+            e.fn(e.arg);
+    }
+    if (!dso)
+        atexit_count = 0;
 }
 
 void exit(int status)
 {
-    while (atexit_count > 0)
-        atexit_fns[--atexit_count]();
+    __cxa_finalize(NULL);
+    if (__fini_array_start && __fini_array_end)
+        for (void (**f)(void) = __fini_array_end; f > __fini_array_start; f--)
+            (*(f - 1))();
     fflush(NULL);
     _exit(status);
 }

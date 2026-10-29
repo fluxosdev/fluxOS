@@ -1,6 +1,10 @@
 #ifndef _UTIME_H
 #define _UTIME_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 #include <flux/abi.h>
 
@@ -10,6 +14,10 @@ struct utimbuf {
 };
 
 int utime(const char *path, const struct utimbuf *times);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
 

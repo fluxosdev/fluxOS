@@ -1,6 +1,10 @@
 #ifndef _DLFCN_H
 #define _DLFCN_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* There is no dynamic linking: dlopen() always fails, and says why. */
 #define RTLD_LAZY   1
 #define RTLD_NOW    2
@@ -13,5 +17,9 @@ void *dlopen(const char *path, int flags);
 void *dlsym(void *handle, const char *name);
 int dlclose(void *handle);
 char *dlerror(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

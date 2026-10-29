@@ -23,6 +23,10 @@
 #ifndef _GL_GL_H
 #define _GL_GL_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef unsigned int GLenum;
 typedef unsigned char GLboolean;
 typedef unsigned int GLbitfield;
@@ -481,5 +485,9 @@ void glCallLists(GLsizei n, GLenum type, const GLvoid *lists);
 void glListBase(GLuint base);
 void glDeleteLists(GLuint list, GLsizei range);
 GLboolean glIsList(GLuint list);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -1,6 +1,10 @@
 #ifndef _GETOPT_H
 #define _GETOPT_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <unistd.h>
 
 #define no_argument       0
@@ -18,5 +22,9 @@ int getopt_long(int argc, char *const argv[], const char *optstring,
                 const struct option *longopts, int *longindex);
 int getopt_long_only(int argc, char *const argv[], const char *optstring,
                      const struct option *longopts, int *longindex);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -868,7 +868,7 @@ static void do_ioctl(void)
         } else if (sft[s].dev == DEV_FILE) {
             struct stat st;
             off_t pos = lseek(sft[s].fd, 0, SEEK_CUR);
-            AL = fstat(sft[s].fd, &st) == 0 && pos >= 0 && (uint32_t)pos < st.st_size ? 0xFF : 0x00;
+            AL = fstat(sft[s].fd, &st) == 0 && pos >= 0 && (uint32_t)pos < (uint32_t)st.st_size ? 0xFF : 0x00;
             if (!S_ISREG(st.st_mode))
                 AL = 0xFF;
         } else {

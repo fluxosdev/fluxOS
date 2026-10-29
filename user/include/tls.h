@@ -10,6 +10,10 @@
 #ifndef _TLS_H
 #define _TLS_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 struct tls;
@@ -39,5 +43,9 @@ const char *tls_error(struct tls *t);
 
 /* Send close_notify and free t; the socket stays open. */
 void tls_close(struct tls *t);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -6,6 +6,10 @@
 #ifndef FLUX_SYSCALL_H
 #define FLUX_SYSCALL_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define SYS_exit       1
 #define SYS_fork       2
 #define SYS_read       3
@@ -103,5 +107,9 @@
 #define SYS_getsid      95  /* pid */
 
 #define NSYSCALLS       96
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

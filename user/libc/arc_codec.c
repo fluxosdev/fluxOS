@@ -6,6 +6,7 @@
  * beyond the dictionary.
  */
 #include <archive.h>
+#include <deflate.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -55,7 +56,7 @@ int arc_rd_fill(struct arc_reader *r)
     if (want > ARC_RDBUF)
         want = ARC_RDBUF;
     int n = 0;
-    if (want && lseek(r->fd, (off_t)r->pos, SEEK_SET) >= 0)
+    if (want && (r->stream || lseek(r->fd, (off_t)r->pos, SEEK_SET) >= 0))
         n = (int)read(r->fd, r->buf, want);
     if (n <= 0) {
         r->bpos = r->blen = 0;
@@ -343,6 +344,55 @@ int arc_inflate(struct arc_reader *in, struct arc_sink *out)
     flush_window(&s);
     free(s.win);
     return s.err;
+}
+
+/* The same decoder over a descriptor read as it comes (deflate.h). */
+
+struct inflate_stream {
+    struct arc_reader rd;
+};
+
+struct inflate_stream *inflate_open(int fd)
+{
+    struct inflate_stream *s = calloc(1, sizeof(*s));
+    if (!s)
+        return NULL;
+    if (arc_rd_open(&s->rd, fd, 0, 0xFFFFFFFFu) < 0) {
+        free(s);
+        return NULL;
+    }
+    s->rd.stream = 1;
+    return s;
+}
+
+struct stream_sink {
+    struct arc_sink sink;
+    deflate_write_fn write;
+    void *ctx;
+};
+
+static int stream_sink_write(struct arc_sink *sk, const uint8_t *p, uint32_t n)
+{
+    struct stream_sink *s = (struct stream_sink *)sk;
+    return s->write(s->ctx, p, n);
+}
+
+int inflate_stream(struct inflate_stream *s, deflate_write_fn write, void *ctx)
+{
+    struct stream_sink sk = { { stream_sink_write }, write, ctx };
+    int r = arc_inflate(&s->rd, &sk.sink);
+    return r == ARC_EDATA ? INFLATE_BAD : r == ARC_ENOMEM ? INFLATE_NOMEM : r;
+}
+
+int inflate_getc(struct inflate_stream *s)
+{
+    return arc_rd_byte(&s->rd);
+}
+
+void inflate_close(struct inflate_stream *s)
+{
+    arc_rd_close(&s->rd);
+    free(s);
 }
 
 /* ---- LZMA ---- */

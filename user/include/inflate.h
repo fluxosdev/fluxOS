@@ -5,6 +5,10 @@
 #ifndef _INFLATE_H
 #define _INFLATE_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -17,5 +21,9 @@ enum { INFLATE_RAW, INFLATE_ZLIB, INFLATE_GZIP, INFLATE_AUTO /* zlib or gzip or 
  * give more is cut there and counts as damaged.
  */
 int inflate_buf(const uint8_t *in, size_t n, int format, uint8_t **out, size_t *outlen, size_t max);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

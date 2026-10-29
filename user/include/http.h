@@ -18,6 +18,10 @@
 #ifndef _HTTP_H
 #define _HTTP_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -83,5 +87,9 @@ void http_response_free(struct http_response *rs);
 
 /* Resolve ref against base (both absolute http(s) URLs once resolved). */
 void http_resolve(const char *base, const char *ref, char *out, size_t size);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

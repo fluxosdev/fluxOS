@@ -4,8 +4,9 @@
  *   list     := and_or ((';' | '&' | '\n') and_or)*
  *   and_or   := pipeline (('&&' | '||') pipeline)*
  *   pipeline := ['!'] ['time'] command ('|' command)*
- *   command  := simple | if | while | until | for | '{' list '}'
+ *   command  := simple | if | while | until | for | case | '{' list '}'
  *             | '(' list ')' | function
+ *   case     := 'case' word 'in' (['('] pattern ('|' pattern)* ')' list ';;')* 'esac'
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -95,6 +96,7 @@ static const char *tok_desc(struct token *t)
     case TK_WORD: return t->text;
     case TK_NEWLINE: return "\\n";
     case TK_SEMI: return ";";
+    case TK_DSEMI: return ";;";
     case TK_AMP: return "&";
     case TK_PIPE: return "|";
     case TK_AND: return "&&";
@@ -142,9 +144,9 @@ static char *source_text(struct parser *p, int first_tok, int last_tok)
 
 static int is_terminator(struct parser *p)
 {
-    static const char *const words[] = { "then", "else", "elif", "fi", "do", "done", "}", NULL };
+    static const char *const words[] = { "then", "else", "elif", "fi", "do", "done", "}", "esac", NULL };
     struct token *t = peek(p);
-    if (t->type == TK_EOF || t->type == TK_RPAREN)
+    if (t->type == TK_EOF || t->type == TK_RPAREN || t->type == TK_DSEMI)
         return 1;
     if (t->type == TK_WORD)
         for (int i = 0; words[i]; i++)
@@ -164,14 +166,20 @@ static void parse_redirs(struct parser *p, struct node *n)
     while (peek(p)->type == TK_REDIR) {
         struct token *r = peek(p);
         p->pos++;
-        if (peek(p)->type != TK_WORD) {
-            fail(p, "");
-            return;
-        }
         n->redirs = xrealloc(n->redirs, sizeof(struct redir) * (size_t)(n->nredirs + 1));
         struct redir *rd = &n->redirs[n->nredirs++];
         rd->op = r->op;
         rd->fd = r->fd;
+        rd->flags = r->flags;
+        if (r->op == RD_HEREDOC) {      /* the body came with the token */
+            rd->target = xstrdup(r->text ? r->text : "");
+            continue;
+        }
+        if (peek(p)->type != TK_WORD) {
+            rd->target = xstrdup("");
+            fail(p, "");
+            return;
+        }
         rd->target = xstrdup(peek(p)->text);
         p->pos++;
     }
@@ -292,6 +300,72 @@ static struct node *parse_for(struct parser *p)
     return n;
 }
 
+/* case word in (pat|pat) list ;; ... esac */
+static struct node *parse_case(struct parser *p)
+{
+    p->pos++;
+    struct token *t = peek(p);
+    if (t->type != TK_WORD) {
+        fail(p, "case");
+        return NULL;
+    }
+    struct node *n = node_new(N_CASE);
+    n->var = xstrdup(t->text);
+    p->pos++;
+    skip_newlines(p);
+    if (!expect_word(p, "in", "case"))
+        goto fail;
+    for (;;) {
+        skip_newlines(p);
+        if (is_word(p, "esac")) {
+            p->pos++;
+            break;
+        }
+        if (peek(p)->type == TK_EOF) {
+            fail(p, "case");
+            goto fail;
+        }
+        struct node *item = node_new(N_CASE_ITEM);
+        add_item(n, item);
+        if (peek(p)->type == TK_LPAREN)
+            p->pos++;
+        for (;;) {
+            if (peek(p)->type != TK_WORD) {
+                fail(p, "case");
+                goto fail;
+            }
+            add_str(&item->list, &item->nlist, peek(p)->text);
+            p->pos++;
+            if (peek(p)->type != TK_PIPE)
+                break;
+            p->pos++;
+        }
+        if (peek(p)->type != TK_RPAREN) {
+            fail(p, "case");
+            goto fail;
+        }
+        p->pos++;
+        item->body = parse_list(p);
+        if (!item->body)
+            goto fail;
+        if (peek(p)->type == TK_DSEMI) {
+            p->pos++;
+            continue;
+        }
+        if (is_word(p, "esac")) {
+            p->pos++;
+            break;
+        }
+        fail(p, "case");
+        goto fail;
+    }
+    parse_redirs(p, n);
+    return n;
+fail:
+    node_free(n);
+    return NULL;
+}
+
 static struct node *parse_group(struct parser *p)
 {
     p->pos++;
@@ -358,6 +432,8 @@ static struct node *parse_command(struct parser *p)
             return parse_while(p);
         if (!strcmp(t->text, "for"))
             return parse_for(p);
+        if (!strcmp(t->text, "case"))
+            return parse_case(p);
         if (!strcmp(t->text, "{"))
             return parse_group(p);
         if (!strcmp(t->text, "function"))
@@ -496,7 +572,7 @@ static int in_command_position(struct tokvec *tv, int i)
         return 1;
     struct token *prev = &tv->t[i - 1];
     switch (prev->type) {
-    case TK_NEWLINE: case TK_SEMI: case TK_AMP: case TK_PIPE:
+    case TK_NEWLINE: case TK_SEMI: case TK_DSEMI: case TK_AMP: case TK_PIPE:
     case TK_AND: case TK_OR: case TK_LPAREN:
         return 1;
     case TK_WORD:

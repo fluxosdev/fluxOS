@@ -1,6 +1,10 @@
 #ifndef _TIME_H
 #define _TIME_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 #include <sys/types.h>
 
@@ -61,5 +65,9 @@ int clock_nanosleep(clockid_t clock, int flags, const struct timespec *req, stru
 int stime(const time_t *t);             /* set the clock (and the RTC) */
 void tz_set(int minutes);               /* local time is UTC plus this */
 int tz_get(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -1,6 +1,10 @@
 #ifndef _SIGNAL_H
 #define _SIGNAL_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 #include <flux/abi.h>
 
@@ -69,5 +73,9 @@ int sigpending(sigset_t *set);
 int sigaltstack(const stack_t *ss, stack_t *old);
 int siginterrupt(int sig, int flag);
 sighandler_t bsd_signal(int sig, sighandler_t handler);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

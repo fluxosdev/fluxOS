@@ -1,6 +1,10 @@
 #ifndef _WCHAR_H
 #define _WCHAR_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -69,5 +73,9 @@ wint_t ungetwc(wint_t c, FILE *f);
 int fputws(const wchar_t *s, FILE *f);
 int fwide(FILE *f, int mode);
 size_t wcsftime(wchar_t *buf, size_t size, const wchar_t *fmt, const struct tm *tm);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

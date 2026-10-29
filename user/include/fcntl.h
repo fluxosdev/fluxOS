@@ -1,6 +1,10 @@
 #ifndef _FCNTL_H
 #define _FCNTL_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 #include <flux/abi.h>
 
@@ -43,5 +47,9 @@ int openat(int dirfd, const char *path, int flags, ...);
 int creat(const char *path, mode_t mode);
 int fcntl(int fd, int cmd, ...);
 int posix_fadvise(int fd, off_t off, off_t len, int advice);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

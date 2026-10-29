@@ -1,6 +1,10 @@
 #ifndef _CTYPE_H
 #define _CTYPE_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* The "C" locale, for ASCII; bytes above 127 are in no class. */
 static inline int isdigit(int c) { return c >= '0' && c <= '9'; }
 static inline int isupper(int c) { return c >= 'A' && c <= 'Z'; }
@@ -20,5 +24,9 @@ static inline int toupper(int c) { return islower(c) ? c - 'a' + 'A' : c; }
 static inline int tolower(int c) { return isupper(c) ? c - 'A' + 'a' : c; }
 #define _toupper(c) ((c) - 'a' + 'A')
 #define _tolower(c) ((c) - 'A' + 'a')
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

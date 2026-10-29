@@ -7,7 +7,15 @@
 #ifndef _SYS_SOUNDCARD_H
 #define _SYS_SOUNDCARD_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <flux/abi.h>
 #include <sys/ioctl.h>
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
