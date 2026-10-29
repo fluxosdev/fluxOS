@@ -415,6 +415,15 @@ $(BUILD)/tests/libc-posix: tests/libc-posix.c tests/libc-host-build.sh $(LIBC_TE
 
 # The same library on the real kernel: boots a disposable QEMU with the
 # guest program as init (not run by default builds).
+# The DOS emulator's CPU against the host processor's (x86 hosts only).
+.PHONY: test-dos
+test-dos: $(BUILD)/tests/dos-cpu
+	$(BUILD)/tests/dos-cpu 1000000
+
+$(BUILD)/tests/dos-cpu: tests/dos-cpu.c user/dos/cpu.c user/dos/dos.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -O1 -w -Iuser/dos tests/dos-cpu.c user/dos/cpu.c -o $@
+
 .PHONY: test-libc-qemu
 test-libc-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/libc-guest
 	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/libc-guest --cpus $(KERNEL_TEST_CPUS) --success-marker "LIBC REGRESSIONS PASSED"

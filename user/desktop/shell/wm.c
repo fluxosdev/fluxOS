@@ -194,7 +194,7 @@ static struct desk_icon desk_icons[] = {
     { ICON_COMPUTER, "My Computer", open_computer, 0, 0 },
     { ICON_TERMINAL, "Terminal", open_terminal, 0, 0 },
     { ICON_BROWSER, "Wave", open_browser, 0, 0 },
-    { ICON_CALC, "Calculator", open_calculator, 0, 0 },
+    { ICON_HOME, "Home", open_home, 0, 0 },
     { ICON_README, "Read Me", open_readme, 0, 0 },
 };
 static int ndesk = (int)(sizeof(desk_icons) / sizeof(desk_icons[0]));

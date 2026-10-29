@@ -261,7 +261,10 @@ real kernel: `make test-libc-qemu` has the checks):
 - [x] The cross-built `make`, `as`, `ld`, `ar`, `nm`, `objcopy`, `objdump`,
       `readelf`, `strip`, `size`, `strings` and `ranlib` are on the system
       image in `/usr/bin` (`make ports`, `tools/ports/build.sh`, 11 MB
-      stripped). Running them there is the next check.
+      stripped), on the default `PATH` (`/bin:/usr/bin`). `make --version`
+      and `as --version` run on fluxOS, and on 2026-10-29 make built a
+      program there: its Makefile ran `as` and `ld`, and the result ran
+      (a write-and-exit `hello.s`, no libc).
 - [x] `PATH_MAX` is 4096: a system call's paths are copied into up to
       three heap buffers of the calling thread's (`user_path` in
       `syscall.c`), and the VFS's own path buffers are on the heap too.
@@ -285,7 +288,7 @@ compiler objects, before phase 4 lands.*
 
 - [x] GNU make 4.4, cross-built with `./configure --host=i686-fluxos` (it
       needs only the phase 2 libc, no `getloadavg`); on the image since
-      2026-10-29 (`make ports`), still to be run there. The Makefile uses
+      2026-10-29 (`make ports`) and starts there. The Makefile uses
       `$(wildcard)`, `$(patsubst)`, `$(foreach)`, `$(shell)`,
       target-specific variables and `-MMD` includes throughout, so a
       smaller make is not an option.

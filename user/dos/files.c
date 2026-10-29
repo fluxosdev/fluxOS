@@ -1658,7 +1658,13 @@ int files_int21(void)
             dos_fail(0x0F);
             return 1;
         }
-        mem_write(ADDR(DS, SI), cwd[d], (uint32_t)strlen(cwd[d]) + 1);
+        {
+            /* The caller's buffer is 64 bytes, DOS's longest path; a deeper
+             * host directory is cut short rather than overrun it. */
+            char dir[64];
+            snprintf(dir, sizeof(dir), "%s", cwd[d]);
+            mem_write(ADDR(DS, SI), dir, (uint32_t)strlen(dir) + 1);
+        }
         AX = 0x0100;
         dos_ok();
         return 1;

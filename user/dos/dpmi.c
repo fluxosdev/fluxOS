@@ -100,6 +100,7 @@ struct ctx {
     uint32_t regs[8];                   /* K_SIM, K_PASSUP: the general registers */
     uint32_t regs_lin;                  /* K_SIM: the real-mode call structure */
     uint32_t frame;                     /* K_REFLECT, K_SIM: the INT frame to update */
+    int hardware;                       /* K_REFLECT: an IRQ, which must leave no trace */
     uint16_t rm_sp;
     uint32_t pm_sp;
 };
@@ -500,20 +501,28 @@ void dpmi_install_check(void)
 
 /* ---- interrupts ---- */
 
-void dpmi_interrupt(int n, int hardware)
-{
-    (void)hardware;
-    uint32_t flags = cpu.flags;
-    push_frame(flags, cpu.seg[S_CS], cpu.ip);
-    cpu.flags &= ~(F_IF | F_TF);
-    cpu_load_seg(S_CS, pm_vec[n].sel);
-    cpu.ip = pm_vec[n].off & cpu.ip_mask;
-}
+static void reflect(int n, int hardware);
 
 static int is_stub(int n)
 {
     return pm_vec[n].sel == (client32 ? code32_sel : code16_sel) &&
            pm_vec[n].off == DPMI_STUBS + (uint32_t)n * 8;
+}
+
+void dpmi_interrupt(int n, int hardware)
+{
+    uint32_t flags = cpu.flags;
+    push_frame(flags, cpu.seg[S_CS], cpu.ip);
+    cpu.flags &= ~(F_IF | F_TF);
+    cpu_load_seg(S_CS, pm_vec[n].sel);
+    cpu.ip = pm_vec[n].off & cpu.ip_mask;
+    if (hardware && is_stub(n)) {
+        /* An IRQ the program left to real mode: reflected from here, so it
+         * comes back to the stub's IRET with the interrupted code's flags
+         * and registers as they were (a software INT returns results in them). */
+        cpu.ip = (cpu.ip + 4) & cpu.ip_mask;
+        reflect(n, 1);
+    }
 }
 
 int dpmi_hooked(int vector)
@@ -557,10 +566,13 @@ void dpmi_exception(int n)
 }
 
 /* A vector's stub: reflect the interrupt to real mode. */
-static void reflect(int n)
+static void reflect(int n, int hardware)
 {
     struct ctx *c = push_ctx(K_REFLECT);
     c->frame = stub_frame();
+    c->hardware = hardware;
+    if (hardware)
+        memcpy(c->regs, cpu.r, sizeof(c->regs));
     uint32_t caller_flags = client32 ? rd(frame_flags_addr(c->frame)) : rw(frame_flags_addr(c->frame));
     to_real_mode();
     cpu_push16((uint16_t)caller_flags);
@@ -1029,6 +1041,8 @@ static void return_from_real_mode(void)
         ww(regs + RM_FS, cpu.seg[S_FS]);
         ww(regs + RM_GS, cpu.seg[S_GS]);
         memcpy(cpu.r, c->regs, sizeof(c->regs));
+    } else if (c->hardware) {
+        memcpy(cpu.r, c->regs, sizeof(c->regs));
     }
     restore_state(&c->saved);
     cpu.flags = c->saved.flags;         /* the stub's, until its IRET */
@@ -1037,7 +1051,7 @@ static void return_from_real_mode(void)
     if (c->kind == K_SIM) {
         uint32_t a = frame_flags_addr(c->frame);
         ww(a, (uint16_t)(rw(a) & ~F_CF));
-    } else {
+    } else if (!c->hardware) {
         set_frame_flags(c->frame, flags);
     }
 }
@@ -1164,7 +1178,7 @@ void dpmi_callback(int id)
         } else if (n == 0x2F && AX == 0x1686) {
             AX = 0;                     /* in protected mode */
         } else {
-            reflect(n);
+            reflect(n, 0);
         }
         return;
     }
