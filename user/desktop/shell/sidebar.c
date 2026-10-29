@@ -237,8 +237,8 @@ static void paint_body(struct surface *s, int w, int h)
         /* Smoked glass, darkening away from the desktop's side (over the backing render() put down). */
         for (int x = 0; x < w; x++) {
             int t = w > 1 ? x * 256 / (w - 1) : 0;
-            tint(s, mkrect(x, 0, 1, h), t < 38 ? gfx_mix(ARGB(140, 0x333B43), ARGB(148, 0x1C2228), t * 256 / 38)
-                                               : gfx_mix(ARGB(148, 0x1C2228), ARGB(158, 0x0C1015),
+            tint(s, mkrect(x, 0, 1, h), t < 38 ? gfx_mix(ARGB(200, 0x333B43), ARGB(206, 0x1C2228), t * 256 / 38)
+                                               : gfx_mix(ARGB(206, 0x1C2228), ARGB(214, 0x0C1015),
                                                          (t - 38) * 256 / (256 - 38)));
         }
         tint(s, mkrect(0, 0, 1, h), ARGB(255, 0x7D8791));

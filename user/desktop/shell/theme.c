@@ -151,7 +151,7 @@ void glass_smoke(struct surface *s, struct rect r, int rt, int rb)
     /* Gray glass, darker past a fold just below the middle. */
     static const int pos[5] = { 0, 20, 123, 128, 256 };
     static const color_t c[5] = {
-        ARGB(128, 0x687079), ARGB(117, 0x454C53), ARGB(107, 0x30363C), ARGB(140, 0x11161B), ARGB(128, 0x272E35),
+        ARGB(196, 0x687079), ARGB(188, 0x454C53), ARGB(182, 0x30363C), ARGB(206, 0x11161B), ARGB(198, 0x272E35),
     };
     gfx_gradient(s, r, rt, rb, 5, c, pos);
 }
