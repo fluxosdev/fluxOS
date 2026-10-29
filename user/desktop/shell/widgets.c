@@ -94,13 +94,8 @@ static void draw_art(struct surface *s, int x, int y, const char *const *rows, i
                 gfx_pixel(s, x + i, y + j, c);
 }
 
-/* Kinetik: the glyph alone, in the caption's text color, a glassy patch behind it while held. */
-static void kinetik_title_button(struct surface *s, struct rect r, int glyph, int pressed, int disabled)
+static void title_glyph(struct surface *s, int cx, int cy, int glyph, color_t c)
 {
-    if (pressed)
-        gfx_round_fill(s, r, 4, 4, ARGB(70, 0xFFFFFF));
-    color_t c = ARGB(disabled ? 90 : 215, theme.on_chrome);
-    int cx = r.x + r.w / 2, cy = r.y + r.h / 2;
     switch (glyph) {
     case TB_CLOSE:
         gfx_line(s, cx - 4, cy - 4, cx + 4, cy + 4, 2, c);
@@ -122,6 +117,18 @@ static void kinetik_title_button(struct surface *s, struct rect r, int glyph, in
         gfx_round_fill(s, mkrect(cx - 4, cy - 3, 8, 1), 0, 0, c);
         break;
     }
+}
+
+/* Kinetik: the glyph alone, in the caption's text color, a glassy patch behind it while held.
+ * Kinetik Glass's white glyphs have a faint dark edge below, to stand out on pale glass. */
+static void kinetik_title_button(struct surface *s, struct rect r, int glyph, int pressed, int disabled)
+{
+    if (pressed)
+        gfx_round_fill(s, r, 4, 4, ARGB(70, 0xFFFFFF));
+    int cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+    if (GLASS)
+        title_glyph(s, cx, cy + 1, glyph, ARGB(disabled ? 30 : 90, 0x142533));
+    title_glyph(s, cx, cy, glyph, ARGB(disabled ? 90 : GLASS ? 255 : 215, theme.on_chrome));
 }
 
 void draw_title_button(struct surface *s, struct rect r, int glyph, int pressed, int disabled)

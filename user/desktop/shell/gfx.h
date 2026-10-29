@@ -79,6 +79,10 @@ void gfx_dither(struct surface *s, int x, int y, int w, int h, color_t c);  /* e
 void gfx_invert_dither(struct surface *s, int x, int y, int w, int h);
 void gfx_blit(struct surface *dst, int x, int y, const struct surface *src,
               int sx, int sy, int w, int h);
+/* Something see-through drawn in advance twice, w x h, over black (black) and over white (white),
+ * put over dst at (x, y): each channel lets through as much of dst as it was lighter over white. */
+void gfx_blit_glass(struct surface *dst, int x, int y, const struct surface *black,
+                    const struct surface *white, int w, int h);
 
 /* Images: 0xAARRGGBB pixels with straight (not premultiplied) alpha. */
 struct image {

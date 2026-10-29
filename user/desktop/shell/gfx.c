@@ -140,6 +140,35 @@ void gfx_blit(struct surface *dst, int x, int y, const struct surface *src,
                src->px + (sy + j) * src->stride + sx, (size_t)r.w * 4);
 }
 
+/* Over black, a pixel is the color it adds (b); over white, that plus 255 times what it lets
+ * through, so dst becomes b + dst * (white - black) / 255. Two pixels at a time. */
+void gfx_blit_glass(struct surface *dst, int x, int y, const struct surface *black,
+                    const struct surface *white, int w, int h)
+{
+    struct rect r = rect_intersect(mkrect(x, y, w, h), dst->clip);
+    if (rect_empty(r))
+        return;
+    const __m128i zero = _mm_setzero_si128(), bias = _mm_set1_epi16(127);
+    for (int j = 0; j < r.h; j++) {
+        uint32_t *d = dst->px + (r.y + j) * dst->stride + r.x;
+        const uint32_t *b = black->px + (r.y - y + j) * black->stride + (r.x - x);
+        const uint32_t *l = white->px + (r.y - y + j) * white->stride + (r.x - x);
+        int i = 0;
+        for (; i + 2 <= r.w; i += 2) {
+            __m128i bv = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(b + i)), zero);
+            __m128i lv = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(l + i)), zero);
+            __m128i dv = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(d + i)), zero);
+            __m128i t = _mm_subs_epu16(lv, bv);
+            __m128i o = _mm_add_epi16(bv, px_div255(_mm_add_epi16(_mm_mullo_epi16(dv, t), bias)));
+            _mm_storel_epi64((__m128i *)(d + i), _mm_packus_epi16(o, zero));
+        }
+        for (; i < r.w; i++) {
+            __m128i bv = px_unpack(b[i]), t = _mm_subs_epu16(px_unpack(l[i]), bv);
+            d[i] = px_pack(_mm_add_epi16(bv, px_div255(_mm_add_epi16(_mm_mullo_epi16(px_unpack(d[i]), t), bias))));
+        }
+    }
+}
+
 /* (src * a + dst * (255 - a)) / 255, rounded, in each channel. */
 static inline uint32_t blend(uint32_t dst, uint32_t src, uint32_t a)
 {

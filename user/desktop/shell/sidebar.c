@@ -6,7 +6,8 @@
  * It follows the Kinetik sidebar studies: a satin body in the theme's color
  * under a heading, cards with a title strip of the captions' chrome, and
  * "Add widgets..." at the foot. Under Classic it takes the gray faces and
- * navy title strips of Windows 95 instead.
+ * navy title strips of Windows 95 instead, and under Kinetik Glass it is
+ * smoked glass with the desktop and windows showing through.
  *
  * The widgets are an analog clock (clicking it opens Date and Time), the
  * month's calendar (paged with its arrows; clicking the month comes back
@@ -17,7 +18,9 @@
  *
  * Everything is drawn into a surface of its own, over a copy of the bare
  * body, and copied to the screen when composing: each second only the
- * clock's and the graph's cards are drawn again.
+ * clock's and the graph's cards are drawn again. See-through, it is drawn
+ * twice, over black and over white, which tells the compositor how much of
+ * what is under each pixel shows through it (gfx_blit_glass).
  *
  * The choice is kept in GRUB's environment block when the system runs from
  * a hard disk (fluxos_sidebar: "on" or "off", then the widgets shown).
@@ -44,6 +47,7 @@ static const char *const widget_keys[NWIDGETS] = { "clock", "calendar", "system"
 static int shown;
 static int enabled[NWIDGETS] = { 1, 1, 1 };
 static struct surface bg, cache;        /* the bare body; everything on it */
+static struct surface bg_lit, cache_lit;        /* Glass: the same over white (those are over black) */
 static int cache_ok;
 static struct rect card[NWIDGETS];      /* sidebar coordinates; empty when not shown */
 static struct rect r_menu, r_add, r_prev, r_next, r_month;
@@ -165,7 +169,7 @@ static void place_cards(int w, int h)
  * wallpaper's darkest, not all the way (White's is pale throughout, with dark text). */
 static int light_body(void)
 {
-    return theme.accent == ACCENT_WHITE;
+    return theme.style == THEME_KINETIK && theme.accent == ACCENT_WHITE;
 }
 
 static color_t ink(void)
@@ -177,6 +181,8 @@ static color_t muted(void)
 {
     if (!KINETIK)
         return C_SHADOW;
+    if (GLASS)
+        return RGB(0xA9, 0xB4, 0xBF);
     return light_body() ? RGB(0x53, 0x68, 0x7E) : gfx_mix(theme.pale, 0xFFFFFF, 110);
 }
 
@@ -185,6 +191,8 @@ static color_t hot(void)
 {
     if (!KINETIK)
         return RGB(0xC0, 0x00, 0x00);
+    if (GLASS)
+        return RGB(0x8E, 0xD3, 0xF2);
     if (theme.accent == ACCENT_WHITE)
         return RGB(0x2E, 0x6F, 0xB7);
     if (theme.accent == ACCENT_BLACK)
@@ -194,6 +202,10 @@ static color_t hot(void)
 
 static void chrome_fill(struct surface *s, struct rect r, int rt, int rb)
 {
+    if (GLASS) {
+        glass_smoke(s, r, rt, rb);
+        return;
+    }
     static const int pos[3] = { 0, 115, 256 };
     color_t c[3] = { ARGB(255, theme.chrome0), ARGB(255, theme.chrome1), ARGB(255, theme.chrome2) };
     gfx_gradient(s, r, rt, rb, 3, c, pos);
@@ -221,6 +233,23 @@ static void paint_body(struct surface *s, int w, int h)
         for (int i = 0; i < 4; i++)
             gfx_hline(s, cx - 3 + i, cy + i, 7 - 2 * i, C_BLACK);
         draw_separator(s, 6, h - FOOT_H, w - 12);
+    } else if (GLASS) {
+        /* Smoked glass, darkening away from the desktop's side (over the backing render() put down). */
+        for (int x = 0; x < w; x++) {
+            int t = w > 1 ? x * 256 / (w - 1) : 0;
+            tint(s, mkrect(x, 0, 1, h), t < 38 ? gfx_mix(ARGB(140, 0x333B43), ARGB(148, 0x1C2228), t * 256 / 38)
+                                               : gfx_mix(ARGB(148, 0x1C2228), ARGB(158, 0x0C1015),
+                                                         (t - 38) * 256 / (256 - 38)));
+        }
+        tint(s, mkrect(0, 0, 1, h), ARGB(255, 0x7D8791));
+        chrome_fill(s, mkrect(1, 0, w - 1, HEAD_H - 1), 0, 0);
+        gfx_text(s, &font_archivo_title, 16, (HEAD_H - font_archivo_title.height) / 2, "Sidebar", ink());
+        chrome_fill(s, r_menu, 3, 3);
+        gfx_round_frame(s, r_menu, 3, 3, ARGB(255, 0x69737D));
+        int cx = r_menu.x + r_menu.w / 2, cy = r_menu.y + r_menu.h / 2;
+        gfx_line(s, cx - 5, cy - 2, cx, cy + 3, 2, ARGB(255, ink()));
+        gfx_line(s, cx, cy + 3, cx + 5, cy - 2, 2, ARGB(255, ink()));
+        tint(s, mkrect(MARGIN, h - FOOT_H, w - 2 * MARGIN, 1), ARGB(153, 0x626B73));
     } else {
         static const int pos[2] = { 0, 256 };
         color_t body[2] = {
@@ -261,17 +290,26 @@ static void paint_card(struct surface *s, struct rect r, const char *title, cons
                      r.y + (CAP_H - font_sans.height) / 2, right, C_WHITE);
         return;
     }
-    static const int pos[2] = { 0, 256 };
-    color_t fill[2] = {
-        ARGB(light_body() ? 66 : 18, 0xFFFFFF),
-        ARGB(light_body() ? 38 : 26, light_body() ? 0xFFFFFF : theme.wall0),
-    };
-    gfx_shadow(s, r, 5, 2, 3, ARGB(26, 0x000714));
-    gfx_gradient(s, r, 5, 5, 2, fill, pos);
-    gfx_round_frame(s, r, 5, 5, ARGB(46, theme.pale));
     struct rect strip = mkrect(r.x + 1, r.y + 1, r.w - 2, CAP_H);
-    chrome_fill(s, strip, 4, 0);
-    tint(s, mkrect(strip.x + 6, strip.y + 1, strip.w - 12, 1), ARGB(64, 0xFFFFFF));
+    if (GLASS) {                        /* a darker pane on the glass, no shadow */
+        static const int pos[3] = { 0, 33, 256 };
+        static const color_t fill[3] = { ARGB(82, 0x414951), ARGB(56, 0x252C33), ARGB(61, 0x1C232A) };
+        gfx_gradient(s, r, 5, 5, 3, fill, pos);
+        gfx_round_frame(s, r, 5, 5, ARGB(178, 0x58616A));
+        chrome_fill(s, strip, 4, 0);
+        tint(s, mkrect(strip.x + 5, strip.y, strip.w - 10, 1), ARGB(41, 0xFFFFFF));
+    } else {
+        static const int pos[2] = { 0, 256 };
+        color_t fill[2] = {
+            ARGB(light_body() ? 66 : 18, 0xFFFFFF),
+            ARGB(light_body() ? 38 : 26, light_body() ? 0xFFFFFF : theme.wall0),
+        };
+        gfx_shadow(s, r, 5, 2, 3, ARGB(26, 0x000714));
+        gfx_gradient(s, r, 5, 5, 2, fill, pos);
+        gfx_round_frame(s, r, 5, 5, ARGB(46, theme.pale));
+        chrome_fill(s, strip, 4, 0);
+        tint(s, mkrect(strip.x + 6, strip.y + 1, strip.w - 12, 1), ARGB(64, 0xFFFFFF));
+    }
     gfx_text(s, &font_sans_bold, r.x + 10, r.y + (CAP_H - font_sans_bold.height) / 2 + 1, title, ink());
     if (right[0])
         gfx_text(s, &font_sans, r.x + r.w - 10 - gfx_text_width(&font_sans, right),
@@ -362,7 +400,10 @@ static void paint_calendar(struct surface *s, struct rect r, const struct tm *tm
         int shown_day = d < 1 ? before + d : d > n ? d - n : d;
         int today = here && d == tm->tm_mday && view_month == tm->tm_mon && view_year == tm->tm_year + 1900;
         struct rect cell = mkrect(x0 + (k % 7) * cw + 1, y + (k / 7) * CAL_ROW, cw - 2, CAL_ROW - 2);
-        if (today && KINETIK) {
+        if (today && GLASS) {
+            gfx_round_fill(s, cell, 5, 5, ARGB(46, 0xFFFFFF));
+            gfx_round_frame(s, cell, 5, 5, ARGB(115, theme.pale));
+        } else if (today && KINETIK) {
             chrome_fill(s, cell, 5, 5);
             gfx_round_frame(s, cell, 5, 5, ARGB(115, theme.pale));
         } else if (today) {
@@ -449,21 +490,28 @@ static void paint_system(struct surface *s, struct rect r)
 
 /* ---- drawing into the cache ---- */
 
-static void paint_widget(int i, const struct tm *tm)
+static void paint_widget_on(struct surface *s, const struct surface *body, int i, const struct tm *tm)
 {
     struct rect r = card[i];
-    if (rect_empty(r))
-        return;
     /* The bare body behind it first, shadow and all. */
-    struct rect under = rect_intersect(mkrect(r.x - 5, r.y - 5, r.w + 10, r.h + 10), mkrect(0, 0, cache.w, cache.h));
-    gfx_noclip(&cache);
-    gfx_blit(&cache, under.x, under.y, &bg, under.x, under.y, under.w, under.h);
+    struct rect under = rect_intersect(mkrect(r.x - 5, r.y - 5, r.w + 10, r.h + 10), mkrect(0, 0, s->w, s->h));
+    gfx_noclip(s);
+    gfx_blit(s, under.x, under.y, body, under.x, under.y, under.w, under.h);
     if (i == W_CLOCK)
-        paint_clock(&cache, r, tm);
+        paint_clock(s, r, tm);
     else if (i == W_CALENDAR)
-        paint_calendar(&cache, r, tm);
+        paint_calendar(s, r, tm);
     else
-        paint_system(&cache, r);
+        paint_system(s, r);
+}
+
+static void paint_widget(int i, const struct tm *tm)
+{
+    if (rect_empty(card[i]))
+        return;
+    paint_widget_on(&cache, &bg, i, tm);
+    if (GLASS)
+        paint_widget_on(&cache_lit, &bg_lit, i, tm);
 }
 
 static void now_tm(struct tm *tm)
@@ -479,15 +527,30 @@ static void render(void)
     cache_ok = 0;
     if (rect_empty(sr))
         return;
-    if (cache.w != sr.w || cache.h != sr.h) {
-        surface_free(&cache);
-        surface_free(&bg);
-        memset(&cache, 0, sizeof(cache));
-        memset(&bg, 0, sizeof(bg));
+    if (cache.w != sr.w || cache.h != sr.h || !bg_lit.px != !GLASS) {
+        struct surface *all[4] = { &bg, &cache, &bg_lit, &cache_lit };
+        for (int i = 0; i < 4; i++) {
+            surface_free(all[i]);
+            memset(all[i], 0, sizeof(*all[i]));
+        }
         if (surface_init(&bg, sr.w, sr.h) < 0 || surface_init(&cache, sr.w, sr.h) < 0)
             return;
+        if (GLASS && (surface_init(&bg_lit, sr.w, sr.h) < 0 || surface_init(&cache_lit, sr.w, sr.h) < 0)) {
+            surface_free(&bg_lit);
+            memset(&bg_lit, 0, sizeof(bg_lit));
+            return;
+        }
     }
     place_cards(sr.w, sr.h);
+    if (GLASS) {
+        gfx_noclip(&bg_lit);
+        gfx_fill(&bg_lit, 0, 0, sr.w, sr.h, C_WHITE);
+        paint_body(&bg_lit, sr.w, sr.h);
+        gfx_noclip(&cache_lit);
+        gfx_blit(&cache_lit, 0, 0, &bg_lit, 0, 0, sr.w, sr.h);
+        gfx_noclip(&bg);
+        gfx_fill(&bg, 0, 0, sr.w, sr.h, C_BLACK);
+    }
     paint_body(&bg, sr.w, sr.h);
     gfx_noclip(&cache);
     gfx_blit(&cache, 0, 0, &bg, 0, 0, sr.w, sr.h);
@@ -513,7 +576,9 @@ void sidebar_draw(struct surface *s)
         return;
     if (!cache_ok || cache.w != sr.w || cache.h != sr.h)
         render();
-    if (cache_ok)
+    if (cache_ok && GLASS)
+        gfx_blit_glass(s, sr.x, sr.y, &cache, &cache_lit, sr.w, sr.h);
+    else if (cache_ok)
         gfx_blit(s, sr.x, sr.y, &cache, 0, 0, sr.w, sr.h);
     else
         gfx_fill(s, sr.x, sr.y, sr.w, sr.h, C_FACE);

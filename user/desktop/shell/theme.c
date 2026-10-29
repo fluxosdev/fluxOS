@@ -8,6 +8,9 @@
  * color with the title centered, glassy buttons on them, light blue-gray
  * faces with flat one-pixel outlines, a wallpaper drawn in the same color,
  * and Archivo for the text. It comes in the studies' six colors.
+ * Kinetik Glass is Kinetik in a single pale blue-gray with the chrome made
+ * see-through: frames of faintly tinted glass with a sheen across their
+ * captions, and a taskbar and sidebar of smoked glass.
  *
  * A theme is a set of values: the system colors (gfx.h), the frame
  * geometry and Kinetik's palette (struct theme), and the UI fonts, which
@@ -17,7 +20,7 @@
  * changes.
  *
  * The choice is kept in GRUB's environment block when the system runs from
- * a hard disk (fluxos_theme: "classic", or "kinetik-" and the color).
+ * a hard disk (fluxos_theme: "classic", "glass", or "kinetik-" and the color).
  */
 #include <stdio.h>
 #include <string.h>
@@ -26,8 +29,8 @@
 struct theme theme;
 struct pfont font_sans, font_sans_bold;
 
-const char *const theme_style_names[THEME_STYLES] = { "Classic", "Kinetik" };
-static const char *const style_keys[THEME_STYLES] = { "classic", "kinetik" };
+const char *const theme_style_names[THEME_STYLES] = { "Classic", "Kinetik", "Kinetik Glass" };
+static const char *const style_keys[THEME_STYLES] = { "classic", "kinetik", "glass" };
 const char *const accent_names[ACCENTS] = { "Blue", "Purple", "Orange", "Green", "White", "Black" };
 static const char *const accent_keys[ACCENTS] = { "blue", "purple", "orange", "green", "white", "black" };
 /* The color each one is named for (the studies' swatches). */
@@ -54,12 +57,18 @@ static const struct palette {
                        0x4D5E73, 0x080E18, 0xFFFFFF },
 };
 
+/* Kinetik Glass's, after White's: a slate wallpaper with a pale glow, the smoked glass's colors
+ * for anything still drawn in the chrome, and light text on it. */
+static const struct palette glass_palette = { 0x31444F, 0x86A0AE, 0x9DB7C4, 0xD4EAF1, 0xB8D3DF, 0x687079,
+                                              0x454C53, 0x272E35, 0x617D8C, 0x304858, 0xEDF3F9 };
+
 static void apply(int style, int accent)
 {
     theme.style = style >= 0 && style < THEME_STYLES ? style : THEME_KINETIK;
     theme.accent = accent >= 0 && accent < ACCENTS ? accent : ACCENT_BLUE;
-    /* Kinetik's colors are kept under Classic too, for its wallpaper if that is still chosen. */
-    const struct palette *p = &palettes[theme.accent];
+    /* Kinetik's colors are kept under Classic too, for its wallpaper if that is still chosen.
+     * Glass has one color of its own (the accent is kept for going back to Kinetik). */
+    const struct palette *p = theme.style == THEME_GLASS ? &glass_palette : &palettes[theme.accent];
     theme.wall0 = p->wall0, theme.wall1 = p->wall1, theme.wall2 = p->wall2;
     theme.pale = p->pale, theme.glow = p->glow;
     theme.chrome0 = p->chrome0, theme.chrome1 = p->chrome1, theme.chrome2 = p->chrome2;
@@ -81,18 +90,20 @@ static void apply(int style, int accent)
     theme.title_h = 28, theme.taskbar_h = 36, theme.radius = 7;
     theme.title_font = &font_archivo_title;
     /* The surfaces are the same blue-gray in every color; selections are in the color itself
-     * (but for White, whose own is too pale under white text). */
+     * (but for White and Glass, whose own are too pale under white text). */
+    color_t select = theme.style == THEME_GLASS ? RGB(0x4A, 0x6A, 0x7C)
+                   : theme.accent == ACCENT_WHITE ? p->ink : p->wall2;
     sys = (struct syscolors){
         .face = RGB(0xE6, 0xEE, 0xF6), .light = RGB(0xF6, 0xF9, 0xFC), .shadow = RGB(0x8A, 0x9C, 0xB0),
-        .highlight = theme.accent == ACCENT_WHITE ? p->ink : p->wall2, .desktop = p->wall1,
-        .teal = p->wall2, .flat = 1,
+        .highlight = select, .desktop = theme.style == THEME_GLASS ? RGB(0xC1, 0xCB, 0xD1) : p->wall1,
+        .teal = select, .flat = 1,
         .edge = RGB(0xA4, 0xB6, 0xC9), .edge_dark = RGB(0x7F, 0x93, 0xAA), .field_edge = RGB(0xA3, 0xB4, 0xC6),
     };
     font_sans = font_archivo;
     font_sans_bold = font_archivo_bold;
 }
 
-/* "classic", "kinetik-blue" and the like. */
+/* "classic", "glass", "kinetik-blue" and the like. */
 static void parse(const char *text, int *style, int *accent)
 {
     *style = THEME_KINETIK;
@@ -127,12 +138,22 @@ void theme_set(int style, int accent, int save)
     char dir[128], value[32];
     if (!save || !grubenv_boot_dir(dir, sizeof(dir)))
         return;
-    if (theme.style == THEME_CLASSIC)
+    if (theme.style != THEME_KINETIK)
         snprintf(value, sizeof(value), "%s", style_keys[theme.style]);
     else
         snprintf(value, sizeof(value), "%s-%s", style_keys[theme.style], accent_keys[theme.accent]);
     const char *keys[1] = { "fluxos_theme" }, *vals[1] = { value };
     grubenv_update(dir, keys, vals, 1);
+}
+
+void glass_smoke(struct surface *s, struct rect r, int rt, int rb)
+{
+    /* Gray glass, darker past a fold just below the middle. */
+    static const int pos[5] = { 0, 20, 123, 128, 256 };
+    static const color_t c[5] = {
+        ARGB(128, 0x687079), ARGB(117, 0x454C53), ARGB(107, 0x30363C), ARGB(140, 0x11161B), ARGB(128, 0x272E35),
+    };
+    gfx_gradient(s, r, rt, rb, 5, c, pos);
 }
 
 /* Kinetik Blue's wallpaper, whatever the theme is (the shutdown screen). */
@@ -153,7 +174,7 @@ void theme_sample(struct surface *s, struct rect r, int style, int accent)
     struct pfont saved_sans = font_sans, saved_bold = font_sans_bold;
     apply(style, accent);
     struct surface bg;
-    if (theme.style == THEME_KINETIK && surface_init(&bg, r.w, r.h) == 0) {
+    if (KINETIK && surface_init(&bg, r.w, r.h) == 0) {
         wallpaper_kinetik(&bg, r.w, r.h);
         gfx_blit(s, r.x, r.y, &bg, 0, 0, r.w, r.h);
         surface_free(&bg);

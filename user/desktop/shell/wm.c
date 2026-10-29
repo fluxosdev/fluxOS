@@ -34,6 +34,7 @@
 #define SHADOW_BLUR  12         /* Kinetik: the shadow under frames and menus */
 #define SHADOW_DY    5
 #define SHADOW_COLOR ARGB(0x48, 0x020B19)
+#define GLASS_SHADOW ARGB(0x30, 0x020B19)      /* lighter under see-through frames */
 
 struct surface screen;
 int screen_w, screen_h;
@@ -1132,10 +1133,19 @@ static void chrome_fill(struct rect r, int rt, int rb, const color_t *c)
     gfx_gradient(&screen, r, rt, rb, 3, argb, pos);
 }
 
-/* A glassy button on the chrome, or (pressed) a hollow one. */
+/* A glassy button on the chrome, or (pressed) a hollow one. Kinetik Glass: smoked, and lit when pressed. */
 static void glass(struct rect r, int rad, int pressed)
 {
     static const int pos[3] = { 0, 154, 256 };
+    if (GLASS) {
+        static const int p2[2] = { 0, 256 };
+        static const color_t lit[2] = { ARGB(72, 0xFFFFFF), ARGB(20, 0xFFFFFF) };
+        glass_smoke(&screen, r, rad, rad);
+        if (pressed)
+            gfx_gradient(&screen, r, rad, rad, 2, lit, p2);
+        gfx_round_frame(&screen, r, rad, rad, ARGB(255, pressed ? 0xA9B7C2 : 0x6F7C88));
+        return;
+    }
     if (pressed) {
         static const int p2[2] = { 0, 256 };
         color_t c[2] = { ARGB(255, theme.stroke), ARGB(255, theme.chrome1) };
@@ -1153,6 +1163,13 @@ static void menu_surface(struct rect m)
     static const int pos[2] = { 0, 256 };
     static const color_t c[2] = { ARGB(255, 0xFFFFFF), ARGB(255, 0xE4EDF6) };
     gfx_shadow(&screen, m, 7, SHADOW_DY, SHADOW_BLUR, SHADOW_COLOR);
+    if (GLASS) {                        /* frosted: only a hint of what is behind, for the text's sake */
+        static const color_t frost[2] = { ARGB(236, 0xFFFFFF), ARGB(222, 0xE2ECF1) };
+        gfx_gradient(&screen, m, 7, 7, 2, frost, pos);
+        gfx_round_frame(&screen, m, 7, 7, ARGB(200, theme.stroke));
+        gfx_round_frame(&screen, mkrect(m.x + 1, m.y + 1, m.w - 2, m.h - 2), 6, 6, ARGB(150, 0xFFFFFF));
+        return;
+    }
     gfx_gradient(&screen, m, 7, 7, 2, c, pos);
     gfx_round_frame(&screen, m, 7, 7, ARGB(255, theme.ink));
 }
@@ -1164,6 +1181,101 @@ static void menu_hot(struct rect r)
     gfx_round_frame(&screen, r, 3, 3, ARGB(255, theme.wall2));
 }
 
+/* Only the frame round the client area, filled as if all of r were: the client area is about
+ * to be copied over whatever is there (and see-through fills must not be laid twice). */
+static void frame_gradient(struct rect r, struct rect cl, int rt, int rb, int n, const color_t *c, const int *pos)
+{
+    if (!inside(cl, r)) {
+        gfx_gradient(&screen, r, rt, rb, n, c, pos);
+        return;
+    }
+    struct rect saved = screen.clip;
+    struct rect ring[4] = {
+        mkrect(r.x, r.y, r.w, cl.y - r.y),
+        mkrect(r.x, cl.y + cl.h, r.w, r.y + r.h - cl.y - cl.h),
+        mkrect(r.x, cl.y, cl.x - r.x, cl.h),
+        mkrect(cl.x + cl.w, cl.y, r.x + r.w - cl.x - cl.w, cl.h),
+    };
+    for (int i = 0; i < 4; i++) {
+        screen.clip = rect_intersect(saved, ring[i]);
+        if (!rect_empty(screen.clip))
+            gfx_gradient(&screen, r, rt, rb, n, c, pos);
+    }
+    screen.clip = saved;
+}
+
+/* A band of light across a caption: w wide, from (x, y) leaning back by slant pixels over h rows. */
+static void streak(int x, int y, int w, int h, int slant, int alpha)
+{
+    for (int j = 0; j < h; j++) {
+        int x0 = (x << 8) - (slant << 8) * (2 * j + 1) / (2 * h), xi = x0 >> 8, f = x0 & 255;
+        gfx_round_fill(&screen, mkrect(xi, y + j, 1, 1), 0, 0, ARGB(alpha * (256 - f) >> 8, 0xFFFFFF));
+        gfx_round_fill(&screen, mkrect(xi + 1, y + j, w - 1, 1), 0, 0, ARGB(alpha, 0xFFFFFF));
+        gfx_round_fill(&screen, mkrect(xi + w, y + j, 1, 1), 0, 0, ARGB(alpha * f >> 8, 0xFFFFFF));
+    }
+}
+
+/* Kinetik Glass: a pane of faintly tinted glass, a sheen with a fold across the caption and
+ * a few bands of light on it, white edges; the title on a soft glow so it reads on anything. */
+static void draw_window_glass(struct window *w)
+{
+    struct rect r = w->r, cl = wm_client_rect(w), cap = caption_rect(w);
+    int active = w == focused, rt = w->maximized ? 0 : theme.radius, rb = w->maximized ? 0 : 3;
+    int top = theme.cap_inset + TITLE_H, k = active ? 256 : 176;   /* how much glass there is */
+    if (!w->maximized)
+        gfx_shadow(&screen, r, rt, SHADOW_DY, SHADOW_BLUR, GLASS_SHADOW);
+    int below = r.h > 1 ? top * 256 / (r.h - 1) : 0;
+    int pos[4] = { 0, below, below > 128 ? below : 128, 256 };
+    color_t pane[4] = {
+        ARGB(82 * k >> 8, 0xD4EAF1), ARGB(61 * k >> 8, 0x7895A5), ARGB(31 * k >> 8, 0xB8D3DF),
+        ARGB(77 * k >> 8, 0xD4EAF1),
+    };
+    frame_gradient(r, cl, rt, rb, 4, pane, pos);
+    static const int spos[4] = { 0, 120, 128, 256 };
+    color_t sheen[4] = {
+        ARGB(97 * k >> 8, 0xFFFFFF), ARGB(43 * k >> 8, 0xFFFFFF), ARGB(31 * k >> 8, 0x142533),
+        ARGB(31 * k >> 8, 0xFFFFFF),
+    };
+    gfx_gradient(&screen, mkrect(r.x + 1, r.y + 1, r.w - 2, top - 1), rt > 0 ? rt - 1 : 0, 0, 4, sheen, spos);
+    if (r.w >= 300)
+        streak(r.x + 85, r.y + 2, 78, top - 2, (top - 2) * 32 / 34, 33 * k >> 8);
+    if (r.w >= 480)
+        streak(r.x + r.w - 260, r.y + 2, 24, top - 2, (top - 2) * 32 / 34, 33 * k >> 8);
+    gfx_round_frame(&screen, r, rt, rb, ARGB(active ? 115 : 80, 0x617D8C));
+    gfx_round_frame(&screen, mkrect(r.x + 1, r.y + 1, r.w - 2, r.h - 2), rt > 0 ? rt - 1 : 0, rb > 0 ? rb - 1 : 0,
+                    ARGB(active ? 153 : 110, 0xFFFFFF));
+    gfx_round_frame(&screen, mkrect(cl.x - 1, cl.y - 1, cl.w + 2, cl.h + 2), 0, 0, ARGB(128, 0x7D929F));
+
+    if (w->icon_img)
+        gfx_image(&screen, cap.x + 7, cap.y + (TITLE_H - 16) / 2, w->icon_img);
+    else
+        draw_icon(&screen, cap.x + 7, cap.y + (TITLE_H - 16) / 2, w->icon, 16);
+    struct rect br[3];
+    int kinds[3];
+    int nb = title_buttons(w, br, kinds);
+    const struct pfont *f = theme.title_font;
+    int left = cap.x + 28, right = br[nb - 1].x - 6;
+    char title[64];
+    gfx_ellipsize(f, w->title, right - left, title, sizeof(title));
+    int tw = gfx_text_width(f, title), tx = cap.x + (cap.w - tw) / 2, ty = cap.y + (TITLE_H - f->height) / 2;
+    if (tx + tw > right)
+        tx = right - tw;
+    if (tx < left)
+        tx = left;
+    if (tw > 0) {
+        struct rect g = mkrect(tx - 4, ty + 1, tw + 8, f->height - 2);
+        color_t glow = ARGB(active ? 0x80 : 0x58, 0xFFFFFF);
+        gfx_shadow(&screen, g, g.h / 2, 0, 7, glow);
+        gfx_round_fill(&screen, g, g.h / 2, g.h / 2, glow);
+    }
+    gfx_text(&screen, f, tx, ty, title, active ? RGB(0x30, 0x48, 0x58) : RGB(0x66, 0x7A, 0x88));
+    for (int i = 0; i < nb; i++) {
+        int pushed = drag == DRAG_TITLE_BUTTON && drag_win == w && drag_button == kinds[i] && drag_pressed;
+        draw_title_button(&screen, br[i], kinds[i], pushed, button_disabled(w, kinds[i]));
+    }
+    gfx_blit(&screen, cl.x, cl.y, &w->content, 0, 0, cl.w, cl.h);
+}
+
 static void draw_window_kinetik(struct window *w)
 {
     struct rect r = w->r, cl = wm_client_rect(w), cap = caption_rect(w);
@@ -1172,25 +1284,10 @@ static void draw_window_kinetik(struct window *w)
     chrome_colors(active, c);
     if (!w->maximized)
         gfx_shadow(&screen, r, rt, SHADOW_DY, SHADOW_BLUR, SHADOW_COLOR);
-    /* The frame round the client area is the caption's last color; the caption runs down to it.
-     * Only the frame: the client area is about to be copied over whatever is there. */
-    if (inside(cl, r)) {
-        struct rect saved = screen.clip;
-        struct rect ring[4] = {
-            mkrect(r.x, r.y, r.w, cl.y - r.y),
-            mkrect(r.x, cl.y + cl.h, r.w, r.y + r.h - cl.y - cl.h),
-            mkrect(r.x, cl.y, cl.x - r.x, cl.h),
-            mkrect(cl.x + cl.w, cl.y, r.x + r.w - cl.x - cl.w, cl.h),
-        };
-        for (int i = 0; i < 4; i++) {
-            screen.clip = rect_intersect(saved, ring[i]);
-            if (!rect_empty(screen.clip))
-                gfx_round_fill(&screen, r, rt, rb, ARGB(255, c[2]));
-        }
-        screen.clip = saved;
-    } else {
-        gfx_round_fill(&screen, r, rt, rb, ARGB(255, c[2]));
-    }
+    /* The frame round the client area is the caption's last color; the caption runs down to it. */
+    static const int pos0[1] = { 0 };
+    color_t edge = ARGB(255, c[2]);
+    frame_gradient(r, cl, rt, rb, 1, &edge, pos0);
     chrome_fill(mkrect(r.x, r.y, r.w, theme.cap_inset + TITLE_H), rt, 0, c);
     gfx_round_fill(&screen, mkrect(r.x + rt, r.y + 1, r.w - 2 * rt, 1), 0, 0, ARGB(64, 0xFFFFFF));
     gfx_round_frame(&screen, r, rt, rb, ARGB(255, active ? theme.stroke : gfx_mix(theme.stroke, 0x9AA9B9, 176)));
@@ -1242,11 +1339,17 @@ static void draw_sidebar_button(void)
 static void draw_taskbar_kinetik(void)
 {
     struct rect tb = taskbar_rect();
-    color_t c[3];
-    chrome_colors(1, c);
-    chrome_fill(tb, 0, 0, c);
-    gfx_hline(&screen, tb.x, tb.y, tb.w, theme.stroke);
-    gfx_hline(&screen, tb.x, tb.y + 1, tb.w, gfx_mix(theme.chrome0, 0xFFFFFF, 72));
+    if (GLASS) {
+        glass_smoke(&screen, tb, 0, 0);
+        gfx_round_fill(&screen, mkrect(tb.x, tb.y, tb.w, 1), 0, 0, ARGB(140, 0x0C1015));
+        gfx_hline(&screen, tb.x, tb.y + 1, tb.w, RGB(0x87, 0x92, 0x9C));
+    } else {
+        color_t c[3];
+        chrome_colors(1, c);
+        chrome_fill(tb, 0, 0, c);
+        gfx_hline(&screen, tb.x, tb.y, tb.w, theme.stroke);
+        gfx_hline(&screen, tb.x, tb.y + 1, tb.w, gfx_mix(theme.chrome0, 0xFFFFFF, 72));
+    }
 
     struct rect sb = start_button_rect();
     glass(sb, 6, menu_open);
@@ -1293,7 +1396,7 @@ static void draw_start_menu_kinetik(void)
         menu_surface(m);
         color_t c[3];
         chrome_colors(1, c);
-        chrome_fill(mkrect(m.x + 1, m.y + 1, m.w - 2, KHEAD), 6, 0, c);
+        chrome_fill(mkrect(m.x + 1, m.y + 1, m.w - 2, KHEAD), 6, 0, c);     /* Glass: its smoke, solid */
         gfx_text(&screen, &font_archivo_large, m.x + 16, m.y + 1 + (KHEAD - font_archivo_large.height) / 2, "fluxOS",
                  theme.on_chrome);
         const struct pfont *f = menu_font();
@@ -1363,6 +1466,10 @@ static void draw_window(struct window *w)
     struct rect client = wm_client_rect(w);
     if (inside(screen.clip, client)) {   /* only the contents show here: the frame is all outside */
         gfx_blit(&screen, client.x, client.y, &w->content, 0, 0, client.w, client.h);
+        return;
+    }
+    if (GLASS) {
+        draw_window_glass(w);
         return;
     }
     if (KINETIK) {

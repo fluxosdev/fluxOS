@@ -1202,6 +1202,9 @@ static void appearance_page(struct dprops *d, struct surface *s)
                       ? "Kinetik: rounded frames with soft shadows, captions and taskbar in the color "
                         "chosen, light faces and the Archivo typeface. Its own wallpaper, drawn in the "
                         "same color, replaces the standard picture."
+                  : d->style == THEME_GLASS
+                      ? "Kinetik Glass: Kinetik's frames in clear, pale blue-gray glass, and a taskbar "
+                        "and sidebar of smoked glass, with the desktop and windows showing through."
                       : "Classic: gray faces and raised 3D edges, navy captions and Liberation Sans, "
                         "as in Windows 95.",
                   C_BLACK);

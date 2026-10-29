@@ -14,8 +14,9 @@
 
 /* ---- themes (theme.c) ---- */
 /* How the desktop looks: Classic is Windows 95's grays and bevels; Kinetik has rounded,
- * shaded frames with gradient captions in one of six colors, and Archivo for its text. */
-enum theme_style { THEME_CLASSIC, THEME_KINETIK, THEME_STYLES };
+ * shaded frames with gradient captions in one of six colors, and Archivo for its text;
+ * Kinetik Glass is Kinetik with see-through frames, taskbar and sidebar, in one pale blue-gray. */
+enum theme_style { THEME_CLASSIC, THEME_KINETIK, THEME_GLASS, THEME_STYLES };
 enum { ACCENT_BLUE, ACCENT_PURPLE, ACCENT_ORANGE, ACCENT_GREEN, ACCENT_WHITE, ACCENT_BLACK, ACCENTS };
 
 struct theme {
@@ -44,13 +45,16 @@ void theme_set(int style, int accent, int save);
 /* How a style and color would look, drawn into r of s (with the Kinetik wallpaper behind, or the plain desktop). */
 void theme_sample(struct surface *s, struct rect r, int style, int accent);
 void theme_kinetik_blue(struct surface *s, int w, int h);      /* Kinetik Blue's wallpaper */
+/* Kinetik Glass: the smoked glass of the taskbar, its buttons and the sidebar's strips, over r. */
+void glass_smoke(struct surface *s, struct rect r, int rt, int rb);
 
 /* Frame geometry */
 #define BORDER     (theme.border)           /* window frame, beside and below the client area */
 #define TITLE_H    (theme.title_h)          /* caption bar */
 #define TASKBAR_H  (theme.taskbar_h)
 #define FRAME_TOP  (theme.cap_inset + TITLE_H + theme.cap_gap)     /* the frame above the client area */
-#define KINETIK    (theme.style == THEME_KINETIK)
+#define KINETIK    (theme.style != THEME_CLASSIC)   /* Kinetik or Kinetik Glass: drawn the Kinetik way */
+#define GLASS      (theme.style == THEME_GLASS)
 
 /* Window flags */
 #define WF_MINIMIZE 0x1         /* has a minimize button */
