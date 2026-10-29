@@ -33,7 +33,7 @@ int main(void)
         "check(CSS.supports('transform','skew(1rad, .2turn)'));"
         "check(!CSS.supports('transform','rotate(10px)'));"
         "check(!CSS.supports('transform','scale(1, )'));"
-        "check(!CSS.supports('transform','rotate3d(1,0,0,20deg)'));"
+        "check(CSS.supports('transform','rotate3d(1,0,0,20deg)')&&!CSS.supports('transform','rotate3d(1,0,20deg)'));"
         "var offsets=null;e.addEventListener('click',function(ev){offsets=[ev.offsetX,ev.offsetY,ev.clientX,ev.clientY];});";
     jsdom_run_script(d,NULL,script,(int)strlen(script),"transform geometry");
     struct node *element=node_find(root,T_DIV);

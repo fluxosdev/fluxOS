@@ -80,6 +80,35 @@ int main(void)
     CHECK(!strstr(out, "hidden="));
     cookie_header("https://api.example.com/", 0, out, sizeof(out));
     CHECK(strstr(out, "hidden=1"));
-    puts("browser policy: origins, public suffixes, CORS, preflights and SameSite cookies passed");
+    /* Referrer Policy: strict-origin-when-cross-origin unless the page says otherwise */
+    char ref[512];
+    const char *page = "https://user:pw@shop.example.com/cart?id=7#total";
+    CHECK(web_referrer(page, "https://shop.example.com/pay", RP_DEFAULT, ref, sizeof(ref)) &&
+          !strcmp(ref, "https://shop.example.com/cart?id=7"));
+    CHECK(web_referrer(page, "https://cdn.other.net/a.js", RP_DEFAULT, ref, sizeof(ref)) &&
+          !strcmp(ref, "https://shop.example.com/"));
+    CHECK(!web_referrer(page, "http://shop.example.com/", RP_DEFAULT, ref, sizeof(ref)) && !ref[0]);
+    CHECK(web_referrer("https://a.example?q=1", "https://a.example/x", RP_DEFAULT, ref, sizeof(ref)) &&
+          !strcmp(ref, "https://a.example/?q=1"));
+    CHECK(!web_referrer(page, "https://shop.example.com/", RP_NO_REFERRER, ref, sizeof(ref)));
+    CHECK(!web_referrer(page, "https://x.org/", RP_SAME_ORIGIN, ref, sizeof(ref)));
+    CHECK(web_referrer(page, "http://x.org/", RP_ORIGIN, ref, sizeof(ref)) && !strcmp(ref, "https://shop.example.com/"));
+    CHECK(!web_referrer(page, "http://x.org/", RP_STRICT_ORIGIN, ref, sizeof(ref)));
+    CHECK(web_referrer(page, "http://x.org/", RP_UNSAFE_URL, ref, sizeof(ref)) &&
+          !strcmp(ref, "https://shop.example.com/cart?id=7"));
+    CHECK(web_referrer(page, "https://x.org/", RP_NO_REFERRER_WHEN_DOWNGRADE, ref, sizeof(ref)) &&
+          !strcmp(ref, "https://shop.example.com/cart?id=7"));
+    CHECK(!web_referrer("file:///home/flux/a.html", "https://x.org/", RP_UNSAFE_URL, ref, sizeof(ref)));
+    CHECK(!web_referrer("", "https://x.org/", RP_DEFAULT, ref, sizeof(ref)));
+    CHECK(web_referrer_policy("no-referrer") == RP_NO_REFERRER && web_referrer_policy("bogus") == RP_DEFAULT);
+    CHECK(web_referrer_policy("no-referrer, strict-origin-when-cross-origin") == RP_STRICT_ORIGIN_WHEN_CROSS_ORIGIN);
+    CHECK(web_referrer_policy(" Origin , bogus") == RP_ORIGIN && web_referrer_policy("never") == RP_NO_REFERRER);
+    /* Sec-Fetch-Site */
+    CHECK(!strcmp(web_fetch_site("", "https://a.example.com/"), "none"));
+    CHECK(!strcmp(web_fetch_site("https://a.example.com/x", "https://a.example.com/y"), "same-origin"));
+    CHECK(!strcmp(web_fetch_site("https://a.example.com/x", "https://img.example.com/y"), "same-site"));
+    CHECK(!strcmp(web_fetch_site("https://a.example.com/x", "https://example.org/y"), "cross-site"));
+    CHECK(!strcmp(web_fetch_site("https://a.github.io/", "https://b.github.io/"), "cross-site"));
+    puts("browser policy: origins, public suffixes, CORS, preflights, SameSite cookies, referrers and fetch metadata passed");
     return 0;
 }

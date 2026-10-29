@@ -3784,7 +3784,7 @@ static int document_get(struct js *J, struct jsobj *o, const char *key, jsval *o
         *out = js_str(J, d->cookies);
         return 1;
     }
-    if (IS("referrer")) { *out = js_str(J, ""); return 1; }
+    if (IS("referrer")) { *out = js_str(J, d->h.referrer ? d->h.referrer : ""); return 1; }
     if (IS("characterSet") || IS("charset")) { *out = js_str(J, "UTF-8"); return 1; }
     if (IS("compatMode")) { *out = js_str(J, root && root->quirks ? "BackCompat" : "CSS1Compat"); return 1; }
     if (IS("visibilityState")) { *out = js_str(J, d->hidden ? "hidden" : "visible"); return 1; }

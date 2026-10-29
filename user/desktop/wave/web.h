@@ -168,6 +168,10 @@ struct node {
     uint32_t match_sig;                 /* the rules that matched it, hashed */
     unsigned dgen, rgen;                /* css_restyle_dynamic(): its state changed, its style changed */
     struct anim_state *anim;            /* anim.c: its transitions and animations, if it has any */
+    /* container queries: a container's content box in the last layout (layout.c), and the size
+     * the cascade took it to be (css.c); they differ until the page is styled again */
+    int cq_w, cq_h, cq_aw, cq_ah;
+    uint8_t cq_known, cq_asked;
 };
 
 struct node *html_parse(struct arena *a, const char *text, int len);
@@ -311,14 +315,43 @@ struct css_gradient {
 enum { TF_TRANSLATE, TF_SCALE, TF_ROTATE, TF_SKEW, TF_MATRIX };
 struct tfop {
     uint8_t kind;
+    uint8_t flip;               /* a 3D rotation that shows the back of the box */
     struct len x, y;            /* TF_TRANSLATE */
     float a, b, c, d, e, f;     /* TF_SCALE: a, b; TF_ROTATE: a (radians); TF_SKEW: a, b (radians); TF_MATRIX: a-f */
 };
 #define MAX_TFOPS 11            /* transform's eight, after translate, rotate and scale */
 struct css_xform {
     int n;
+    uint8_t flipped;            /* rotateX/rotateY turn its back to the viewer (backface-visibility) */
     struct tfop op[MAX_TFOPS];
 };
+/* filter and backdrop-filter: functions in order */
+enum { FX_BLUR = 1, FX_BRIGHTNESS, FX_CONTRAST, FX_GRAYSCALE, FX_HUE, FX_INVERT, FX_OPACITY, FX_SATURATE,
+       FX_SEPIA, FX_SHADOW };
+#define MAX_FXOPS 8
+struct css_filter {
+    int n;
+    struct fxop {
+        uint8_t kind;
+        float amount;           /* FX_BLUR: the radius in pixels; FX_HUE: radians; the rest: a factor */
+        int dx, dy, blur;       /* FX_SHADOW */
+        uint32_t color;         /* FX_SHADOW */
+    } op[MAX_FXOPS];
+};
+/* clip-path: a basic shape over the border box */
+enum { CLIP_INSET = 1, CLIP_CIRCLE, CLIP_ELLIPSE, CLIP_POLYGON };
+#define MAX_CLIP_POINTS 32
+struct css_clip {
+    uint8_t kind;
+    uint8_t rx_side, ry_side;   /* circle and ellipse radii: 0 a length, 1 closest-side, 2 farthest-side */
+    struct len a[4];            /* inset: top, right, bottom, left; circle: r, -, cx, cy; ellipse: rx, ry, cx, cy */
+    struct len round;           /* inset(... round r) */
+    int npts;
+    struct len px[MAX_CLIP_POINTS], py[MAX_CLIP_POINTS];
+};
+/* mix-blend-mode */
+enum { BL_NORMAL, BL_MULTIPLY, BL_SCREEN, BL_OVERLAY, BL_DARKEN, BL_LIGHTEN, BL_DODGE, BL_BURN, BL_HARD,
+       BL_SOFT, BL_DIFFERENCE, BL_EXCLUSION };
 double css_transform_length(struct len l, int base);
 void css_transform_matrix(const struct style *st, int w, int h, double out[6]);
 
@@ -533,7 +566,17 @@ struct style {
     uint8_t grid_col_flow;              /* grid-auto-flow: column */
     int gc_start, gc_end, gc_span;      /* grid-column: lines from 1 (negative: from the end), 0 auto */
     int gr_start, gr_span;              /* grid-row */
+    /* container-type (CQ_*) and container-name (names, spaces apart; NULL: none) */
+    uint8_t cq_type;
+    const char *cq_name;
+    uint8_t backface_hidden;            /* backface-visibility: hidden */
+    const struct css_filter *filter, *backdrop;     /* filter, backdrop-filter (NULL: none) */
+    const struct css_clip *clip_path;
+    uint8_t blend;                      /* mix-blend-mode, BL_* */
 };
+enum { CQ_NONE, CQ_INLINE, CQ_SIZE };
+/* layout.c: a container came out a size the cascade did not assume; the page needs styling again */
+extern int layout_cq_changed;
 
 struct css_fontface { char family[128], sources[8][URL_MAX]; int nsources, bold, italic; };
 void css_font_faces(const char *text,int len,int vw,int vh,void (*found)(void *,const struct css_fontface *),void *ctx);
@@ -641,6 +684,8 @@ struct ditem {
     uint16_t sbi;               /* DK_SBOX: its box */
     uint16_t xf;                /* transform group, 1-based */
     uint8_t fade;               /* opacity: 255 minus how much shows (0: opaque) */
+    uint16_t fx;                /* effect group (filter, clip-path, blend, backdrop-filter), 1-based */
+    uint8_t backdrop;           /* the first item of a group with backdrop-filter: what is behind it is filtered first */
 };
 
 struct hotspot {                /* a link or a form control */
@@ -695,7 +740,19 @@ struct transform_box {
     uint8_t dyn;
 };
 
+/* A box with filter, clip-path, mix-blend-mode or backdrop-filter: its items paint through it
+ * (and through the groups round it, parent on). */
+struct effect_box {
+    struct node *node;
+    int x, y, w, h, first, last;        /* its border box; its items when it was laid out */
+    int rad[4];                         /* its corners, for backdrop-filter */
+    uint16_t parent;
+    uint8_t offscreen;                  /* filter, clip-path or blend: items are painted apart, then put down */
+};
+
 struct layout {
+    struct effect_box *fx;
+    int nfx, fxcap;
     struct ditem *items;
     int nitems, cap;
     struct hotspot *links;

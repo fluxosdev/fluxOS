@@ -58,6 +58,12 @@ static void load(struct page *p, const char *html, int vw, int vh)
         if (n->type == N_ELEMENT && n->tag == T_STYLE && n->first && ns < 4)
             sheets[ns++] = css_parse(&p->a, n->first->text, n->first->len, vw);
     css_viewport_h = vh;
+    /* as browser.c does: styled again while container queries see new container sizes */
+    for (int round = 0; round < 3; round++) {
+    if (round) {
+        arena_free(&p->sa);
+        arena_free(&p->la);
+    }
     css_cascade(&p->sa, root, sheets, ns, vw, vh, NULL, NULL);
     for (struct node *n = root; n; n = node_next(n, root)) {
         if (n->type != N_ELEMENT)
@@ -73,6 +79,9 @@ static void load(struct page *p, const char *html, int vw, int vh)
             n->img = &test_img;
     }
     layout_document(&p->la, &p->lo, root, vw, vh);
+    if (!layout_cq_changed)
+        break;
+    }
 }
 
 static void unload(struct page *p)
@@ -776,8 +785,211 @@ static void multicolumn(void)
     unload(&p);
 }
 
+static struct node *with_class(struct node *root, const char *cls)
+{
+    for (struct node *n = root; n; n = node_next(n, root))
+        if (n->type == N_ELEMENT && node_attr(n, "class") && !strcmp(node_attr(n, "class"), cls))
+            return n;
+    CHECK(0);
+    return NULL;
+}
+
+static int box_width(const struct page *p, uint32_t color)
+{
+    const struct ditem *d = colored(p, color);
+    CHECK(d);
+    return d->w;
+}
+
+/* 3D transforms seen flat, env(), image-set(), @container, cq units, @scope and @property. */
+static void modern_css(void)
+{
+    struct page p;
+    const char *functions[] = { "translate3d(30px,10px,0)", "translate3d(-100%,0,5px)", "translateZ(9px) scale3d(2,2,1)",
+        "perspective(500px) rotateZ(90deg)", "rotateX(60deg)", "rotateY(60deg)", "matrix3d(1,0,0,0,0,1,0,0,0,0,1,0,30,10,0,1)",
+        "rotate3d(0,0,1,90deg)" };
+    const int expected[][4] = { {30,10,20,10}, {-20,0,20,10}, {0,0,40,20}, {5,-5,10,20}, {0,2,20,6}, {5,0,10,10},
+        {30,10,20,10}, {5,-5,10,20} };
+    for (unsigned k = 0; k < sizeof(functions) / sizeof(functions[0]); k++) {
+        char html[512];
+        snprintf(html, sizeof(html), "<style>body{margin:0}#box{width:20px;height:10px;background:red;"
+                 "transform-origin:%s;transform:%s}</style><div id=box></div>", k < 3 || k == 6 ? "0 0" : "50% 50%",
+                 functions[k]);
+        load(&p, html, 128, 128);
+        const struct ditem *d = colored(&p, 0xffff0000);
+        CHECK(d && d->xf);
+        expect_rect(visual_item(&p, d), expected[k][0], expected[k][1], expected[k][2], expected[k][3]);
+        unload(&p);
+    }
+    /* A card turned over hides its front when the back face is not to be seen. */
+    load(&p, "<style>.f{width:20px;height:10px;background:red;transform:rotateY(180deg);backface-visibility:hidden}"
+             ".b{width:20px;height:10px;background:blue;transform:rotateY(180deg)}"
+             ".r{width:20px;height:10px;background:lime;rotate:y 180deg;-webkit-backface-visibility:hidden}</style>"
+             "<div class=f></div><div class=b></div><div class=r></div>", 128, 128);
+    CHECK(!colored(&p, 0xffff0000) && colored(&p, 0xff0000ff) && !colored(&p, 0xff00ff00));
+    unload(&p);
+
+    /* env(): no safe areas here; unknown names take their fallback. image-set(): the 1x picture. */
+    load(&p, "<style>body{margin:0}.a{width:max(30px, env(safe-area-inset-left));height:1px;background:red}"
+             ".b{width:env(no-such-thing, 44px);height:1px;background:blue}"
+             ".c{width:calc(10px + env(safe-area-inset-right, 99px));height:1px;background:lime}"
+             ".d{background-image:image-set(\"hi.png\" 2x, \"lo.png\" 1x);width:5px;height:5px}"
+             ".e{background-image:-webkit-image-set(url(one.png) 1x);width:5px;height:5px}"
+             ".f{background-image:image-set(\"a.avif\" type(\"image/avif\"), \"a.jpg\" type(\"image/jpeg\"));width:5px;height:5px}"
+             "</style><div class=a></div><div class=b></div><div class=c></div><div class=d></div><div class=e></div>"
+             "<div class=f></div>", 800, 600);
+    CHECK(box_width(&p, 0xffff0000) == 30 && box_width(&p, 0xff0000ff) == 44 && box_width(&p, 0xff00ff00) == 10);
+    CHECK(!strcmp(with_class(p.root, "d")->style->bg_url, "lo.png"));
+    CHECK(!strcmp(with_class(p.root, "e")->style->bg_url, "one.png"));
+    CHECK(!strcmp(with_class(p.root, "f")->style->bg_url, "a.jpg"));
+    unload(&p);
+
+    /* @container: the 300 pixel box, not the 800 pixel viewport; named ones; and cq units. */
+    load(&p, "<style>body{margin:0}.box{container-type:inline-size;width:300px}"
+             ".side{container:side / inline-size;width:500px}"
+             ".t{height:1px;background:red;width:10px}.n{height:1px;background:blue;width:10px}"
+             ".u{height:1px;background:lime;width:50cqw}.o{height:1px;background:#123456;width:10px}"
+             "@container (min-width: 400px) { .t { width: 100px } }"
+             "@container (width < 400px) { .t { width: 50px } }"
+             "@container side (inline-size > 450px) { .n { width: 70px } }"
+             "@container nope (min-width: 1px) { .o { width: 80px } }"
+             "@container (min-width: 1px) { .o { width: 90px } }"
+             "</style><div class=side><div class=box><div class=t></div><div class=n></div><div class=u></div></div></div>"
+             "<div class=o></div>", 800, 600);
+    CHECK(box_width(&p, 0xffff0000) == 50);         /* the box is 300 wide */
+    CHECK(box_width(&p, 0xff0000ff) == 70);         /* .side is the container named side, 500 wide */
+    CHECK(box_width(&p, 0xff00ff00) == 150);        /* half the box */
+    CHECK(box_width(&p, 0xff123456) == 10);         /* no container round it at all */
+    CHECK(!layout_cq_changed);
+    unload(&p);
+    /* container-type: size answers height queries; inline-size does not. */
+    load(&p, "<style>body{margin:0}.s{container-type:size;width:200px;height:100px}.i{container-type:inline-size;width:200px}"
+             ".a,.b{height:1px;width:10px}.a{background:red}.b{background:blue}"
+             "@container (height > 50px) and (width > 100px) { .a, .b { width: 60px } }"
+             "@container not (orientation: portrait) { .a { height: 2px } }</style>"
+             "<div class=s><div class=a></div></div><div class=i><div class=b></div></div>", 800, 600);
+    CHECK(box_width(&p, 0xffff0000) == 60 && box_width(&p, 0xff0000ff) == 10);
+    CHECK(colored(&p, 0xffff0000)->h == 2);
+    unload(&p);
+
+    /* @scope: rules for what is inside .card, :scope for the card itself. @property: initial values. */
+    load(&p, "<style>body{margin:0}@scope (.card) { p { width: 33px } :scope { width: 200px } }"
+             "p{margin:0;height:1px;background:red;width:10px}.card{background:blue;height:5px}"
+             "@property --w { syntax: '<length>'; inherits: false; initial-value: 42px }"
+             ".v{width:var(--w);height:1px;background:lime}</style>"
+             "<p></p><div class=card><p></p></div><div class=v></div>", 800, 600);
+    CHECK(box_width(&p, 0xffff0000) == 10 && box_width(&p, 0xff0000ff) == 200 && box_width(&p, 0xff00ff00) == 42);
+    int scoped = 0;
+    for (int i = 0; i < p.lo.nitems; i++)
+        scoped += p.lo.items[i].kind == DK_FILL && p.lo.items[i].color == 0xffff0000 && p.lo.items[i].w == 33;
+    CHECK(scoped == 1);
+    unload(&p);
+    puts("browser modern CSS: 3D transforms, backface-visibility, env(), image-set(), @container, cq units, @scope and @property passed");
+}
+
+/* A page painted onto a 64x64 white surface: the pixel at (x, y). */
+static uint32_t pixels64[64 * 64];
+static void paint64(const char *html)
+{
+    struct page p;
+    load(&p, html, 64, 64);
+    struct surface surface = { pixels64, 64, 64, 64, { 0, 0, 64, 64 } };
+    paint_document(&p.lo, &surface, 0, 0, 0, 0, NULL, 0);
+    unload(&p);
+}
+static uint32_t px64(int x, int y) { return pixels64[y * 64 + x] & 0xffffff; }
+static int near(uint32_t got, uint32_t want, int slack)
+{
+    for (int c = 0; c < 24; c += 8)
+        if (abs((int)(got >> c & 255) - (int)(want >> c & 255)) > slack)
+            return 0;
+    return 1;
+}
+#define BOX "<style>body{margin:0}#b{width:40px;height:40px;background:red;"
+
+/* filter, clip-path, mix-blend-mode and backdrop-filter, by the pixels they leave. */
+static void effects(void)
+{
+    static const struct { const char *filter; uint32_t want; } colors[] = {
+        { "grayscale(1)", 0x363636 }, { "invert(1)", 0x00ffff }, { "brightness(.5)", 0x800000 },
+        { "opacity(50%)", 0xff8080 }, { "sepia(1)", 0x645945 }, { "hue-rotate(120deg)", 0x007100 },
+        { "saturate(0)", 0x363636 }, { "contrast(0)", 0x808080 }, { "invert(1) invert(1)", 0xff0000 },
+    };
+    for (unsigned k = 0; k < sizeof(colors) / sizeof(colors[0]); k++) {
+        char html[256];
+        snprintf(html, sizeof(html), BOX "filter:%s}</style><div id=b></div>", colors[k].filter);
+        paint64(html);
+        if (!near(px64(20, 20), colors[k].want, 3))
+            fprintf(stderr, "filter %s: %06x, not %06x\n", colors[k].filter, px64(20, 20), colors[k].want);
+        CHECK(near(px64(20, 20), colors[k].want, 3) && px64(50, 50) == 0xffffff);
+    }
+    /* blur spreads past the box; drop-shadow puts a copy under it, moved */
+    paint64(BOX "filter:blur(3px)}</style><div id=b></div>");
+    CHECK(near(px64(20, 20), 0xff0000, 2) && px64(42, 20) != 0xffffff && px64(42, 20) >> 16 == 0xff && px64(60, 20) == 0xffffff);
+    paint64(BOX "filter:drop-shadow(6px 6px 0 blue)}</style><div id=b></div>");
+    CHECK(px64(20, 20) == 0xff0000 && px64(43, 43) == 0x0000ff && px64(43, 2) == 0xffffff);
+    paint64(BOX "-webkit-filter:drop-shadow(rgba(0,0,0,.5) 0 6px 0)}</style><div id=b></div>");
+    CHECK(near(px64(20, 43), 0x808080, 2));
+    /* a filter round another: the child's pixels go through both */
+    paint64("<style>body{margin:0}#o{filter:invert(1)}#i{width:10px;height:10px;background:red}</style>"
+            "<div id=o><div id=i></div></div>");
+    CHECK(px64(5, 5) == 0x00ffff);
+
+    /* clip-path shapes */
+    paint64(BOX "clip-path:circle(50%)}</style><div id=b></div>");
+    CHECK(px64(2, 2) == 0xffffff && px64(20, 20) == 0xff0000 && px64(38, 20) == 0xff0000);
+    paint64(BOX "clip-path:inset(10px round 4px)}</style><div id=b></div>");
+    CHECK(px64(5, 5) == 0xffffff && px64(20, 20) == 0xff0000 && px64(10, 10) == 0xffffff && px64(15, 10) == 0xff0000);
+    paint64(BOX "clip-path:polygon(50% 0, 100% 100%, 0 100%)}</style><div id=b></div>");
+    CHECK(px64(3, 3) == 0xffffff && px64(20, 36) == 0xff0000 && px64(20, 3) == 0xff0000);
+    paint64(BOX "-webkit-clip-path:ellipse(10px 20px at 10px 20px)}</style><div id=b></div>");
+    CHECK(px64(10, 20) == 0xff0000 && px64(30, 20) == 0xffffff);
+    paint64(BOX "clip-path:inset(50%)}</style><div id=b>text</div>");     /* the screen-reader-only trick */
+    for (int i = 0; i < 64 * 64; i++)
+        CHECK((pixels64[i] & 0xffffff) == 0xffffff);
+    paint64(BOX "clip-path:url(#nothing)}</style><div id=b></div>");       /* not drawn: the box as it is */
+    CHECK(px64(2, 2) == 0xff0000);
+
+    /* mix-blend-mode against what is behind */
+    paint64("<style>body{margin:0;background:#8080ff}#b{width:40px;height:40px;background:red;mix-blend-mode:multiply}</style>"
+            "<div id=b></div>");
+    CHECK(near(px64(20, 20), 0x800000, 1) && px64(50, 50) == 0x8080ff);
+    paint64(BOX "mix-blend-mode:difference}</style><div id=b></div>");
+    CHECK(px64(20, 20) == 0x00ffff);
+    paint64("<style>body{margin:0;background:#404040}#b{width:40px;height:40px;background:#404040;mix-blend-mode:screen}</style>"
+            "<div id=b></div>");
+    CHECK(near(px64(20, 20), 0x707070, 1));
+
+    /* backdrop-filter: what is under the box, not the box */
+    paint64("<style>body{margin:0}#r{width:40px;height:40px;background:red}"
+            "#g{position:absolute;left:10px;top:10px;width:20px;height:20px;backdrop-filter:invert(1)}</style>"
+            "<div id=r></div><div id=g></div>");
+    CHECK(px64(5, 5) == 0xff0000 && px64(20, 20) == 0x00ffff && px64(35, 35) == 0xff0000);
+    paint64("<style>body{margin:0}#r{width:20px;height:40px;background:red}"
+            "#g{position:absolute;left:0;top:0;width:40px;height:40px;-webkit-backdrop-filter:blur(4px);"
+            "background:rgba(255,255,255,0)}</style><div id=r></div><div id=g></div>");
+    CHECK(px64(20, 20) != 0xffffff && px64(20, 20) != 0xff0000 && px64(2, 20) == 0xff0000 && px64(50, 20) == 0xffffff);
+    /* A flex item's transform, opacity and filter stay its own: its later siblings do not get them. */
+    struct page p;
+    load(&p, "<style>body{margin:0}.row{display:flex}.row div{width:10px;height:10px}"
+             ".a{background:red;transform:translateX(5px);opacity:.5;filter:invert(1)}.b{background:blue}"
+             ".c{background:lime}</style><div class=row><div class=a></div><div class=b></div>"
+             "<a class=c href=x style='display:block;width:10px;height:10px;transform:translateY(3px)'></a></div>", 64, 64);
+    const struct ditem *red = colored(&p, 0xffff0000), *blue = colored(&p, 0xff0000ff), *lime = colored(&p, 0xff00ff00);
+    CHECK(red && red->xf && red->fade && red->fx && blue && !blue->xf && !blue->fade && !blue->fx);
+    CHECK(lime && lime->xf && p.lo.nlinks == 1 && p.lo.links[0].xf == lime->xf);
+    unload(&p);
+    CHECK(css_supports("(backdrop-filter: blur(4px)) and (filter: drop-shadow(0 1px 2px #000))"));
+    CHECK(css_supports("(clip-path: circle(50% at 0 0))") && !css_supports("(clip-path: path('M0 0 L1 1'))"));
+    CHECK(css_supports("(container-type: inline-size)") && css_supports("(transform: translate3d(1px, 0, 0))"));
+    CHECK(!css_supports("(filter: url(#f))") && css_supports("(mix-blend-mode: multiply)"));
+    puts("browser effects: filter functions, blur, drop-shadow, nested filters, clip-path shapes, blend modes and backdrop-filter passed");
+}
+
 int main(void)
 {
+    effects();
+    modern_css();
     multicolumn();
     transforms_2d();
     font_faces();

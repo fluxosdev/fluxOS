@@ -12,4 +12,13 @@ int web_cors_allow(const char *origin, const char *headers, int credentials);
 int web_cors_preflight(const char *origin, const char *response, int credentials, const char *method,
                        const char *headers);
 int web_response_headers(const char *headers, int cross, int credentials, char *out, size_t size);
+/* Referrer Policy: a policy from a <meta name=referrer> content or a Referrer-Policy header (the last
+ * one known in its list; RP_DEFAULT if none is), and the Referer a request from document from to to
+ * carries under it (0: none). */
+enum { RP_DEFAULT, RP_NO_REFERRER, RP_NO_REFERRER_WHEN_DOWNGRADE, RP_SAME_ORIGIN, RP_ORIGIN, RP_STRICT_ORIGIN,
+       RP_ORIGIN_WHEN_CROSS_ORIGIN, RP_STRICT_ORIGIN_WHEN_CROSS_ORIGIN, RP_UNSAFE_URL };
+int web_referrer_policy(const char *value);
+int web_referrer(const char *from, const char *to, int policy, char *out, size_t size);
+/* Sec-Fetch-Site: how the initiator's origin stands to to's ("none": the user asked, there is no initiator). */
+const char *web_fetch_site(const char *initiator, const char *to);
 #endif

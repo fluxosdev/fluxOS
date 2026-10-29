@@ -15,6 +15,7 @@ struct jshost {
     struct node *root;
     const char *url;                    /* the document's address */
     const char *base;                   /* what its links are relative to */
+    const char *referrer;               /* the Referer it was fetched with (document.referrer), or NULL */
     void (*navigate)(void *ctx, const char *url, int replace);
     void (*history)(void *ctx, int delta);
     void (*reload)(void *ctx);

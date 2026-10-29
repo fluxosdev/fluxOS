@@ -226,6 +226,14 @@ struct browser {
     unsigned int js_moved;      /* when they last heard of a mousemove */
     char refresh_url[URL_MAX];  /* <meta http-equiv=refresh> */
     unsigned int refresh_at;
+    /* where requests say they come from (Referer, Sec-Fetch-Site and -User, Origin) */
+    int ref_policy;             /* the document's referrer policy, RP_*: Referrer-Policy, then <meta name=referrer> */
+    int next_ref_policy;        /* ...the Referrer-Policy of the page being loaded */
+    char nav_from[URL_MAX];     /* the next navigation: the document that asked for it ("": the user did) */
+    int nav_from_policy, nav_user;      /* ...its policy; a click or key press started it */
+    char load_from[URL_MAX];    /* the same for the page loading now */
+    int load_from_policy, load_user;
+    char next_referrer[URL_MAX], referrer[URL_MAX];     /* the Referer the page came with: document.referrer */
 
     /* loading */
     struct loader lanes[FETCH_LANES];
@@ -368,7 +376,8 @@ static void pop_open(struct browser *b, struct node *n, int list);
 static void suggest(struct browser *b, struct node *f);
 static void start_next(struct browser *b);
 static void history_add(const char *url, const char *title);
-static struct browser *tab_new(struct browser *from, const char *url, int activate);
+static struct browser *tab_new(struct browser *from, const char *url, int activate, const struct browser *referrer,
+                               int user);
 static void tab_select(struct browser *b);
 static void tab_close(struct browser *b);
 static void tab_cycle(struct browser *b, int direction);
@@ -1150,6 +1159,75 @@ static int read_file(struct fetch *f, const char *url)
     return f->buf ? 0 : -ENOMEM;
 }
 
+/* rel="noreferrer" on a link or form */
+static int no_referrer(const struct node *n)
+{
+    const char *rel = node_attr(n, "rel");
+    for (const char *p = rel ? strcasestr(rel, "noreferrer") : NULL; p; p = strcasestr(p + 1, "noreferrer"))
+        if ((p == rel || p[-1] == ' ') && (!p[10] || p[10] == ' '))
+            return 1;
+    return 0;
+}
+
+/* The next navigation of t: from's document asked for it (NULL: the user did), after a click or key press if user. */
+static void nav_initiated(struct browser *t, const struct browser *from, int user, int noreferrer)
+{
+    snprintf(t->nav_from, sizeof(t->nav_from), "%s", from ? from->url : "");
+    t->nav_from_policy = noreferrer ? RP_NO_REFERRER : from ? from->ref_policy : RP_DEFAULT;
+    t->nav_user = user;
+}
+
+static int resource_cors(struct browser *b,int kind,int slot);
+
+/* What every browser says of a request beside its address: what it takes (Accept, Accept-Language),
+ * where it comes from (Referer, Origin) and what it is for (the Sec-Fetch- headers, Fetch Metadata).
+ * Lines go in out; script requests (has) may have set some already. Returns how many. */
+#define META_LINES 9
+static int request_metadata(struct browser *b, int kind, const char *url, const char *method, const char *has,
+                            char out[META_LINES][URL_MAX + 40])
+{
+    int n = 0, page = kind == F_PAGE;
+    const char *from = page ? b->load_from : b->url;
+    int policy = page ? b->load_from_policy : b->ref_policy;
+#define HAS(h) (has && (strcasestr(has, "\n" h ":") || !strncasecmp(has, h ":", sizeof(h))))
+    static const char *const accepts[] = {
+        [F_PAGE] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        [F_CSS] = "text/css,*/*;q=0.1",
+        [F_IMG] = "image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5",
+        [F_ICON] = "image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5",
+        [F_JS] = "*/*", [F_XHR] = "*/*", [F_MODULE] = "*/*", [F_FONT] = "*/*",
+    };
+    if (!HAS("Accept"))
+        snprintf(out[n++], sizeof(out[0]), "Accept: %s", accepts[kind]);
+    if (!HAS("Accept-Language"))
+        snprintf(out[n++], sizeof(out[0]), "Accept-Language: en-US,en;q=0.5");
+    char ref[URL_MAX + 1];
+    if (web_referrer(from, url, policy, ref, sizeof(ref)))
+        snprintf(out[n++], sizeof(out[0]), "Referer: %s", ref);
+    /* a form's POST names the page it came from; so do a script's requests that change things */
+    int changes = method && strcmp(method, "GET") && strcmp(method, "HEAD");
+    if (changes && (page || kind == F_XHR) && !HAS("Origin")) {
+        char origin[300] = "null";
+        if (from[0] && policy != RP_NO_REFERRER)
+            web_origin(from, origin, sizeof(origin));
+        snprintf(out[n++], sizeof(out[0]), "Origin: %s", origin);
+    }
+    static const char *const dests[] = { [F_PAGE] = "document", [F_CSS] = "style", [F_IMG] = "image",
+        [F_ICON] = "image", [F_JS] = "script", [F_XHR] = "empty", [F_MODULE] = "script", [F_FONT] = "font" };
+    const char *dest = page && is_frame(b) ? "iframe" : dests[kind];
+    const char *mode = page ? "navigate" : kind == F_XHR || kind == F_MODULE || kind == F_FONT ||
+                       resource_cors(b, kind, b->fetch->slot) ? "cors" : "no-cors";
+    snprintf(out[n++], sizeof(out[0]), "Sec-Fetch-Dest: %s", dest);
+    snprintf(out[n++], sizeof(out[0]), "Sec-Fetch-Mode: %s", mode);
+    snprintf(out[n++], sizeof(out[0]), "Sec-Fetch-Site: %s", web_fetch_site(from, url));
+    if (page && b->load_user && !is_frame(b))
+        snprintf(out[n++], sizeof(out[0]), "Sec-Fetch-User: ?1");
+    if (page)
+        snprintf(out[n++], sizeof(out[0]), "Upgrade-Insecure-Requests: 1");
+#undef HAS
+    return n;
+}
+
 static struct node *resource_node(struct browser *b,int kind,int slot)
 {
     if(kind==F_JS&&slot>=0&&slot<b->nscripts)return b->scripts[slot].n;
@@ -1179,10 +1257,11 @@ static int start_via_helper(struct browser *b, int kind, const char *url, const 
         return -1;
     char method[40];
     snprintf(method, sizeof(method), "%s", post ? "POST" : "GET");
-    char *hdrs[20];
+    char *hdrs[32];
     int nh = 0;
     const char *body = post;
     char *packed = kind == F_XHR && post ? malloc((size_t)f->postlen + 1) : NULL;
+    char script_set[4096] = "";                 /* the headers a script's request already has */
     if (packed)
         memcpy(packed, post, (size_t)f->postlen + 1);
     if (packed) {
@@ -1197,8 +1276,11 @@ static int start_via_helper(struct browser *b, int kind, const char *url, const 
                 if (!e)
                     break;
                 *e = 0;
-                if (nh < 14)
+                if (nh < 14) {
                     hdrs[nh++] = p;
+                    size_t used = strlen(script_set);
+                    snprintf(script_set + used, sizeof(script_set) - used, "\n%s", p);
+                }
                 p = e + 1;
             }
             body = *p == '\n' ? p + 1 : p;
@@ -1222,6 +1304,10 @@ static int start_via_helper(struct browser *b, int kind, const char *url, const 
     }
     char ua[] = "User-Agent: " BROWSER_USER_AGENT;
     hdrs[nh++] = ua;
+    static char meta[META_LINES][URL_MAX + 40];
+    int nmeta = request_metadata(b, kind, url, method, script_set, meta);
+    for (int i = 0; i < nmeta; i++)
+        hdrs[nh++] = meta[i];
     static char cookies[4096 + 16];
     char *cookie_line = NULL;
     cookies[8] = 0;
@@ -1337,7 +1423,7 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
     if (packed)
         memcpy(packed, post, (size_t)f->postlen + 1);
     char methodarg[40] = "", postarg[URL_MAX + 16];
-    char *hdr_arg[14];
+    char *hdr_arg[14 + META_LINES];
     int nhdr = 0;
     const char *body = post;
     if (packed) {
@@ -1380,6 +1466,23 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
     }
     if (body)
         snprintf(postarg, sizeof(postarg), "--post-data=%s", body);
+    {
+        static char meta[META_LINES][URL_MAX + 40];
+        char set[4096] = "";
+        for (int i = 0; i < nhdr; i++) {
+            size_t used = strlen(set);
+            snprintf(set + used, sizeof(set) - used, "\n%s", hdr_arg[i] + 9);
+        }
+        const char *m = methodarg[0] ? methodarg + 9 : post ? "POST" : "GET";
+        int nmeta = request_metadata(b, kind, url, m, set, meta);
+        for (int i = 0; i < nmeta && nhdr < 12 + META_LINES; i++) {
+            char *h = malloc(strlen(meta[i]) + 10);
+            if (h) {
+                sprintf(h, "--header=%s", meta[i]);
+                hdr_arg[nhdr++] = h;
+            }
+        }
+    }
     {                                           /* the jar's cookies for this address */
         static char cookies[4096];
         cookies[0] = 0;
@@ -1387,7 +1490,7 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
             cookie_header_context(url, top_of(b)->url, kind == F_PAGE && !b->parent,
                                   !post || !strncmp(post, "GET\n", 4) || !strncmp(post, "HEAD\n", 5), cookies,
                                   sizeof(cookies) - 16);
-        if (cookies[0] && nhdr < 14) {
+        if (cookies[0] && nhdr < 14 + META_LINES - 2) {
             char *h = malloc(strlen(cookies) + 16);
             if (h) {
                 sprintf(h, "--header=Cookie: %s", cookies);
@@ -1395,7 +1498,7 @@ static int start_fetch(struct browser *b, int kind, const char *url, const char 
             }
         }
     }
-    if (resource_cors(b,kind,b->fetch->slot) && !web_same_origin(b->url, url) && nhdr < 14) {
+    if (resource_cors(b,kind,b->fetch->slot) && !web_same_origin(b->url, url) && nhdr < 14 + META_LINES - 1) {
         char origin[300] = "null";
         web_origin(b->url, origin, sizeof(origin));
         char *h = malloc(strlen(origin) + 20);
@@ -1972,20 +2075,28 @@ static void relayout(struct browser *b)
     css_focus_node=b->focus;
     css_focus_visible_node=b->focus&&(b->keyboard_focus||is_text_field(b->focus))?b->focus:NULL;
     struct rect v = view_rect(b);
-    if (b->need_style) {
-        arena_free(&b->sarena);
-        css_viewport_h = v.h;
-        css_target_id = url_fragment(b->url);
-        css_font_lookup=font_lookup;css_font_context=b;
-        anim_now = now_ms();
-        css_cascade(&b->sarena, b->root, b->sheets, b->nsheets, v.w, v.h, is_visited, b);
-        css_font_lookup=NULL;css_font_context=NULL;
-        b->sarena_full = b->sarena.used;
-        b->need_style = 0;
+    /* Container queries: styled against the sizes the last layout found; if a container then
+     * comes out another size, styled and laid out again (twice at most, in case they never settle). */
+    for (int round = 0; round < 3; round++) {
+        if (round)
+            b->need_style = 1;
+        if (b->need_style) {
+            arena_free(&b->sarena);
+            css_viewport_h = v.h;
+            css_target_id = url_fragment(b->url);
+            css_font_lookup=font_lookup;css_font_context=b;
+            anim_now = now_ms();
+            css_cascade(&b->sarena, b->root, b->sheets, b->nsheets, v.w, v.h, is_visited, b);
+            css_font_lookup=NULL;css_font_context=NULL;
+            b->sarena_full = b->sarena.used;
+            b->need_style = 0;
+        }
+        bg_attach(b);
+        arena_free(&b->larena);
+        layout_document(&b->larena, &b->lo, b->root, v.w, v.h);
+        if (!layout_cq_changed)
+            break;
     }
-    bg_attach(b);
-    arena_free(&b->larena);
-    layout_document(&b->larena, &b->lo, b->root, v.w, v.h);
     b->layouts++;
     if (b->sel_active)
         layout_select(&b->lo, b->sel_ax, b->sel_ay, b->sel_fx, b->sel_fy);
@@ -2812,7 +2923,7 @@ static struct node *js_node_at(void *ctx, int x, int y);
 static void start_scripts(struct browser *b, const char *url)
 {
     struct jshost h = {
-        .ctx = b, .arena = &b->arena, .root = b->root, .url = b->url, .base = b->base,
+        .ctx = b, .arena = &b->arena, .root = b->root, .url = b->url, .base = b->base, .referrer = b->referrer,
         .navigate = js_navigate, .history = js_history, .reload = js_reload, .alert = js_alert,
         .status = js_status, .changed = js_changed, .repaint = js_repaint, .scroll = js_scroll, .scroll_pos = js_scroll_pos,
         .viewport = js_viewport, .set_title = js_set_title, .load_script = js_load_script,
@@ -3075,6 +3186,10 @@ static void load_document(struct browser *b, const char *text, int len, const ch
     free_page(b);
     snprintf(b->url, sizeof(b->url), "%s", url);
     snprintf(b->base, sizeof(b->base), "%s", url);
+    b->ref_policy = b->next_ref_policy;          /* Referrer-Policy; <meta name=referrer> may change it */
+    b->next_ref_policy = RP_DEFAULT;
+    snprintf(b->referrer, sizeof(b->referrer), "%s", b->next_referrer);
+    b->next_referrer[0] = 0;
     b->doc_serial++;
     if (b->nhist) {
         b->hist[b->hpos].doc = b->doc_serial;
@@ -3125,6 +3240,9 @@ static void load_document(struct browser *b, const char *text, int len, const ch
         const char *v;
         if (n->tag == T_BASE && (v = node_attr(n, "href")))
             url_resolve(url, v, b->base, sizeof(b->base));
+        else if (n->tag == T_META && (v = node_attr(n, "name")) && !strcasecmp(v, "referrer") &&
+                 (v = node_attr(n, "content")) && web_referrer_policy(v) != RP_DEFAULT)
+            b->ref_policy = web_referrer_policy(v);
         else if (n->tag == T_TITLE && !title[0])
             node_text(n, title, sizeof(title));
         else if (n->tag == T_META && (v = node_attr(n, "http-equiv")) && !strcasecmp(v, "refresh") &&
@@ -4006,6 +4124,11 @@ static void fetch_complete(struct browser *b)
                 free(html);
             }
         } else {
+            char policy[200];
+            b->next_ref_policy = ok && !is_file && r.body > done.buf &&
+                                 web_header_value(done.buf, "Referrer-Policy", policy, sizeof(policy)) == 1
+                                 ? web_referrer_policy(policy) : RP_DEFAULT;
+            web_referrer(b->load_from, done.url, b->load_from_policy, b->next_referrer, sizeof(b->next_referrer));
             load_document(b, r.body, r.len, done.url, r.charset[0] ? r.charset : NULL);
         }
         if (done.special != SP_SAVE) {
@@ -4153,6 +4276,12 @@ static void push_history(struct browser *b, const char *url)
 
 static void navigate(struct browser *b, const char *url, const char *post, int mode)
 {
+    /* who asked for it (nav_initiated), taken now: a later navigation is the user's unless said otherwise */
+    char from[URL_MAX];
+    int from_policy = b->nav_from_policy, user = b->nav_from[0] ? b->nav_user : 1;
+    snprintf(from, sizeof(from), "%s", b->nav_from);
+    b->nav_from[0] = 0;
+    b->nav_from_policy = b->nav_user = 0;
     if (!strncasecmp(url, "javascript:", 11)) {
         run_js_url(b, url);
         return;
@@ -4243,6 +4372,9 @@ static void navigate(struct browser *b, const char *url, const char *post, int m
         paint(b);
         if (source)
             b->next_special = SP_SOURCE;
+        snprintf(b->load_from, sizeof(b->load_from), "%s", from);
+        b->load_from_policy = from_policy;
+        b->load_user = user;
         int started = start_fetch(b, F_PAGE, fu, post, 0, 0, mode, -1, 1);
         free(b->mp_body);               /* whichever way it went, a multipart body is for this request only */
         b->mp_body = NULL;
@@ -4341,7 +4473,7 @@ static struct browser *target_of(struct browser *b, const char *target)
     if (!strcasecmp(target, "_parent"))
         return b->parent ? b->parent : b;
     if (!strcasecmp(target, "_blank")) {
-        struct browser *tab = tab_new(top_of(b), NULL, 1);
+        struct browser *tab = tab_new(top_of(b), NULL, 1, NULL, 1);
         return tab;
     }
     if (!strcasecmp(target, "_top"))
@@ -4369,8 +4501,10 @@ static void follow_link(struct browser *b, struct node *a)
     char abs[URL_MAX];
     url_resolve(b->base, href, abs, sizeof(abs));
     struct browser *target = target_of(b, node_attr(a, "target"));
-    if (target)
+    if (target) {
+        nav_initiated(target, b, 1, no_referrer(a));
         navigate(target, abs, NULL, NAV_NEW);
+    }
 }
 
 /* ---- forms ---- */
@@ -4615,6 +4749,7 @@ static void submit(struct browser *b, struct node *form, struct node *submitter)
         free(tb->mp_body);
         tb->mp_body = NULL;
     }
+    nav_initiated(tb, b, 1, no_referrer(form));
     navigate(tb, target, post ? q : NULL, NAV_NEW);
 }
 
@@ -4728,6 +4863,7 @@ static void activate(struct browser *b, struct node *n)
         }
         char abs[URL_MAX];
         url_resolve(b->base, src, abs, sizeof(abs));
+        nav_initiated(b, b, 1, 0);
         navigate(b, abs, NULL, NAV_NEW);
         return;
     }
@@ -6205,7 +6341,7 @@ static void br_key(struct window *w, const struct input_event *ev)
         int ctrl = ev->mods & KMOD_CTRL;
         int shift = ev->mods & KMOD_SHIFT;
         if (ctrl && ev->code == SC_T) {
-            struct browser *tab = tab_new(t, HOME_URL, 1);
+            struct browser *tab = tab_new(t, HOME_URL, 1, NULL, 1);
             if (tab) {
                 tab->addr_focus = tab->addr_all = 1;
                 tab->addr_cur = tab->addr_len;
@@ -6707,8 +6843,8 @@ static void ctx_action(struct browser *t, int code)
     case CB_STOP: press(t, B_STOP); break;
     case CB_HOME: press(t, B_HOME); break;
     case CB_COPYPAGE: clipboard_set(t->url); break;
-    case CB_OPENLINK: navigate(t, t->ctx_url, NULL, NAV_NEW); break;
-    case CB_NEWTAB: tab_new(t, t->ctx_url, 0); break;
+    case CB_OPENLINK: nav_initiated(t, t, 1, 0); navigate(t, t->ctx_url, NULL, NAV_NEW); break;
+    case CB_NEWTAB: tab_new(t, t->ctx_url, 0, t, 1); break;
     case CB_NEWWIN: browser_open(t->ctx_url); break;
     case CB_COPYLINK: clipboard_set(t->ctx_url); break;
     case CB_SAVELINK: start_save(t, t->ctx_url); break;
@@ -7015,7 +7151,7 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
                 if (href && strncasecmp(href, "javascript:", 11) && strncasecmp(href, "mailto:", 7)) {
                     char url[URL_MAX];
                     url_resolve(b->base, href, url, sizeof(url));
-                    tab_new(top_of(b), url, 0);
+                    tab_new(top_of(b), url, 0, b, 1);
                 }
             }
         }
@@ -7507,7 +7643,9 @@ static void tab_select(struct browser *b)
     paint(b);
 }
 
-static struct browser *tab_new(struct browser *from, const char *url, int activate)
+/* A new tab next to from's, opening url; referrer: the document whose link or script opened it (NULL: the user). */
+static struct browser *tab_new(struct browser *from, const char *url, int activate, const struct browser *referrer,
+                               int user)
 {
     from = top_of(from);
     struct tab_group *group = from->tabs;
@@ -7536,8 +7674,11 @@ static struct browser *tab_new(struct browser *from, const char *url, int activa
     set_status(b, "Ready");
     if (activate)
         tab_select(b);
-    if (url)
+    if (url) {
+        if (referrer)
+            nav_initiated(b, referrer, user, 0);
         navigate(b, url, NULL, NAV_NEW);
+    }
     paint(group->active);
     return b;
 }
@@ -7608,7 +7749,7 @@ static int tab_mouse(struct browser *b, int x, int y, int buttons, int changed)
     int capacity = tab_capacity(b), first = group->first_visible;
     if (buttons & MOUSE_LEFT) {
         if (rect_contains(mkrect(b->win->content.w - 30, 3, 26, TABBAR_H - 6), x, y)) {
-            struct browser *tab = tab_new(b, HOME_URL, 1);
+            struct browser *tab = tab_new(b, HOME_URL, 1, NULL, 1);
             if (tab) {
                 tab->addr_focus = tab->addr_all = 1;
                 tab->addr_cur = tab->addr_len;
@@ -7695,6 +7836,7 @@ void browser_poll(void)
                 done_status(b);
                 paint(b);
             } else {
+                nav_initiated(b, b->parent, 0, 0);     /* the iframe's page, asked for by its parent */
                 navigate(b, u, NULL, NAV_REPLACE);
             }
             return;                     /* the list may have changed */
@@ -7713,7 +7855,7 @@ void browser_poll(void)
             char u[URL_MAX];
             snprintf(u, sizeof(u), "%s", b->js_open);
             b->js_open[0] = 0;
-            struct browser *t = tab_new(top_of(b), u, 1);
+            struct browser *t = tab_new(top_of(b), u, 1, b, 0);
             if (t) {
                 t->wid = b->js_open_wid;
                 t->opener_wid = b->js_open_noopener ? 0 : wid_of(b);
@@ -7732,6 +7874,7 @@ void browser_poll(void)
             b->js_nav[0] = 0;
             char *post = b->js_post;
             b->js_post = NULL;
+            nav_initiated(b, b, 0, 0);          /* a script's location.href, form.submit() and the like */
             navigate(b, u, post, b->js_nav_replace ? NAV_REPLACE : NAV_NEW);
             free(post);
             return;                     /* the list may have changed */
@@ -7796,6 +7939,7 @@ void browser_tick(void)
             char u[URL_MAX];
             snprintf(u, sizeof(u), "%s", b->refresh_url);
             b->refresh_url[0] = 0;
+            nav_initiated(b, b, 0, 0);          /* <meta http-equiv=refresh> */
             navigate(b, u, NULL, NAV_REPLACE);
             return;                     /* the list may have changed */
         }

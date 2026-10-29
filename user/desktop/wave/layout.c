@@ -192,6 +192,35 @@ static void transform_register(struct lctx *c, struct node *n, struct mark from,
     for(int k=from.controls;k<lo->ncontrols;k++)if(!lo->controls[k].xf)lo->controls[k].xf=(uint16_t)index;
 }
 
+/* filter, clip-path, mix-blend-mode or backdrop-filter: the items a box made are its group (inside-out,
+ * like transforms); paint_transformed draws them through it. */
+static void effects_register(struct lctx *c, struct node *n, struct mark from, int x, int y, int w, int h)
+{
+    const struct style *st = n->style;
+    struct layout *lo = c->lo;
+    if ((!st->filter && !st->clip_path && !st->blend && !st->backdrop) || c->measuring || lo->nfx >= 4096 ||
+        from.items >= lo->nitems)
+        return;
+    struct effect_box *groups = grow(c->a, lo->fx, lo->nfx, &lo->fxcap, sizeof(*groups));
+    if (!groups)
+        return;
+    lo->fx = groups;
+    int index = ++lo->nfx;
+    struct effect_box *g = &groups[index - 1];
+    *g = (struct effect_box){ .node = n, .x = x, .y = y, .w = w, .h = h, .first = from.items, .last = lo->nitems,
+                              .offscreen = st->filter || st->clip_path || st->blend };
+    for (int q = 0; q < 4; q++) {
+        int r = len_px(st->radius[q], w < h ? w : h);
+        g->rad[q] = r < 0 ? 0 : r;
+    }
+    for (int k = 0; k < index - 1; k++)
+        if (!groups[k].parent && groups[k].first >= from.items && groups[k].last <= lo->nitems)
+            groups[k].parent = (uint16_t)index;
+    for (int k = from.items; k < lo->nitems; k++)
+        if (!lo->items[k].fx)
+            lo->items[k].fx = (uint16_t)index;
+}
+
 /* opacity below 1: the items a box made show that much less (painted by paint_transformed). */
 static void opacity_register(struct lctx *c, struct node *n, struct mark from)
 {
@@ -214,7 +243,8 @@ static void layer_register(struct lctx *c, struct node *n, int from, int lead)
     const struct style *ps = n->parent ? n->parent->style : NULL;
     int item_of_container = ps && (ps->inner == IN_FLEX || ps->inner == IN_GRID);
     int z = st->z_set && (st->position != POS_STATIC || item_of_container);
-    int ctx = z || st->opacity < 255 || st->xf || st->position == POS_FIXED || st->position == POS_STICKY;
+    int ctx = z || st->opacity < 255 || st->xf || st->position == POS_FIXED || st->position == POS_STICKY ||
+              st->filter || st->clip_path || st->blend || st->backdrop;
     if (!ctx && st->position == POS_STATIC)
         return;
     if (from >= c->lo->nitems)
@@ -281,6 +311,11 @@ static void shift(struct lctx *c, struct mark from, struct mark to, int dx, int 
     for(int k=0;k<lo->nxf;k++) {
         struct transform_box *g=&lo->xf[k];
         if(g->first>=from.items && g->last<=to.items)g->x+=dx,g->y+=dy;
+    }
+    for (int k = 0; k < lo->nfx; k++) {
+        struct effect_box *g = &lo->fx[k];
+        if (g->first >= from.items && g->last <= to.items)
+            g->x += dx, g->y += dy;
     }
     for (int k = 0; k < lo->ndyn; k++) {        /* sticky boxes and their containers move with their items */
         struct dynbox *d = &lo->dyn[k];
@@ -1700,6 +1735,7 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
     if (ctrl)
         add_hotspot(c, &c->lo->controls, &c->lo->ncontrols, &c->lo->controlcap, n, d->x, d->y, w, h);
     transform_register(c,n,transform_start,bx,by,bw,bh);
+    effects_register(c,n,transform_start,bx,by,bw,bh);
     opacity_register(c,n,transform_start);
     layer_register(c,n,transform_start.items,c->lo->nitems);
 }
@@ -2639,7 +2675,7 @@ static int column_of(const int *starts, int n, int y)
  * cut into columns (ncol of them, or more if height or forced breaks make them overflow) and moved side
  * by side with gap between; column rules are drawn in the gaps. Returns the height of the tallest column.
  */
-static int columns_distribute(struct lctx *c, const struct style *st, struct mark m0, int sb0, int xf0, int x,
+static int columns_distribute(struct lctx *c, const struct style *st, struct mark m0, int sb0, int xf0, int fx0, int x,
                               int y, int colw, int gap, int ncol, int h, int defh)
 {
     struct layout *lo = c->lo;
@@ -2729,6 +2765,10 @@ static int columns_distribute(struct lctx *c, const struct style *st, struct mar
         int k = column_of(starts, used, lo->xf[i].y);
         lo->xf[i].x += k * step, lo->xf[i].y += y - starts[k];
     }
+    for (int i = fx0; i < lo->nfx; i++) {
+        int k = column_of(starts, used, lo->fx[i].y);
+        lo->fx[i].x += k * step, lo->fx[i].y += y - starts[k];
+    }
     for (int i = sb0; i < lo->nsb; i++) {
         int k = column_of(starts, used, lo->sb[i].y);
         lo->sb[i].x += k * step, lo->sb[i].y += y - starts[k];
@@ -2765,7 +2805,7 @@ static int block_content(struct lctx *c, struct node *n, int x, int y, int w, in
     }
     int colw = w, gap = 0, ncol = column_plan(st, w, &colw, &gap);
     struct mark m0 = mark_now(c);
-    int sb0 = c->lo->nsb, xf0 = c->lo->nxf;
+    int sb0 = c->lo->nsb, xf0 = c->lo->nxf, fx0 = c->lo->nfx;
     struct flow f = { 0 };
     f.x = x, f.w = colw, f.y0 = f.cy = y;
     f.st = st;
@@ -2786,7 +2826,7 @@ static int block_content(struct lctx *c, struct node *n, int x, int y, int w, in
     if (ncol > 1) {                     /* its floats are in the columns now, out of everyone's way */
         c->nfloats = c->float_base;
         *pm = 0;
-        return columns_distribute(c, st, m0, sb0, xf0, x, y, colw, gap, ncol, f.cy - y, defh);
+        return columns_distribute(c, st, m0, sb0, xf0, fx0, x, y, colw, gap, ncol, f.cy - y, defh);
     }
     *pm = f.pm;
     return f.cy - y;
@@ -2844,6 +2884,11 @@ static void layout_abs(struct lctx *c, const struct pend *p, int cbx, int cby, i
  * With bg_slot, the background is left for the caller to size and the
  * borders are not drawn (table cells grow to their row's height).
  */
+/* Containers (container-type) laid out this time: their sizes are checked against the cascade's at the end. */
+int layout_cq_changed;
+static struct node *cq_laid[256];
+static int ncq_laid;
+
 static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw, int force_bw,
                             int *mb, int *bg_slot)
 {
@@ -2937,6 +2982,14 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
     if (st->min_height.unit == U_PX && ch < st->min_height.v)
         ch = st->min_height.v;
     int bh = b.bt + b.pt + ch + b.pb + b.bb;
+    if (st->cq_type && !c->measuring) {         /* a query container: its content box, for the next cascade */
+        int listed = 0;
+        for (int i = 0; i < ncq_laid && !listed; i++)
+            listed = cq_laid[i] == n;
+        if (!listed && ncq_laid < (int)(sizeof(cq_laid) / sizeof(cq_laid[0])))
+            cq_laid[ncq_laid++] = n;
+        n->cq_w = b.w, n->cq_h = ch, n->cq_known = 1;
+    }
 
     for (int k = 0; k < sh_steps; k++) {        /* the outermost layer first, fading outwards */
         struct ditem *d = &c->lo->items[sh_first + k];
@@ -2993,6 +3046,7 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
     }
     if (!bg_slot) {
         transform_register(c,n,m_start,bx,y,bw,bh);
+        effects_register(c,n,m_start,bx,y,bw,bh);
         opacity_register(c,n,m_start);
     }
     if (st->position == POS_RELATIVE && !bg_slot) {
@@ -3299,14 +3353,28 @@ static void item_place(struct lctx *c, struct fitem *it, int x, int y, int h)
                               it->m1.controls };
         sbox_register(c, it->n, x, y, it->bw, h, &rg, 1);
     }
+    int link0 = c->lo->nlinks, control0 = c->lo->ncontrols;    /* the item's own hotspots go at the end */
     if (it->n->tag == T_BUTTON && !it->st->hidden)
         add_hotspot(c, &c->lo->controls, &c->lo->ncontrols, &c->lo->controlcap, it->n, x, y, it->bw, h);
     struct node *link = enclosing_link(it->n);
     if (link)
         add_hotspot(c, &c->lo->links, &c->lo->nlinks, &c->lo->linkcap, link, x, y, it->bw, h);
-    /* Its own transform, opacity and layer (its box was laid out as a whole, then moved here). */
-    transform_register(c, it->n, it->m0, x, y, it->bw, h);
-    opacity_register(c, it->n, it->m0);
+    /* Its own transform, opacity and layer (its box was laid out as a whole, then moved here). The
+     * items after it are its siblings', so the lists end where it does while these look at them. */
+    if (it->m1.items <= c->lo->nitems && it->m1.links <= c->lo->nlinks && it->m1.controls <= c->lo->ncontrols) {
+        int items = c->lo->nitems, links = c->lo->nlinks, controls = c->lo->ncontrols, nxf = c->lo->nxf;
+        c->lo->nitems = it->m1.items, c->lo->nlinks = it->m1.links, c->lo->ncontrols = it->m1.controls;
+        transform_register(c, it->n, it->m0, x, y, it->bw, h);
+        effects_register(c, it->n, it->m0, x, y, it->bw, h);
+        opacity_register(c, it->n, it->m0);
+        c->lo->nitems = items, c->lo->nlinks = links, c->lo->ncontrols = controls;
+        for (int k = link0; c->lo->nxf > nxf && k < c->lo->nlinks; k++)
+            if (!c->lo->links[k].xf)
+                c->lo->links[k].xf = (uint16_t)c->lo->nxf;
+        for (int k = control0; c->lo->nxf > nxf && k < c->lo->ncontrols; k++)
+            if (!c->lo->controls[k].xf)
+                c->lo->controls[k].xf = (uint16_t)c->lo->nxf;
+    }
     int lead = it->m0.items;
     if (it->slot >= 0 && it->slot == lead) {
         lead++;
@@ -4706,6 +4774,7 @@ static int layout_table(struct lctx *c, struct node *n, int x, int y, int cw, in
     free(row_slot);
     free(colmin), free(cells), free(rows), free(caps);
     transform_register(c,n,transform_start,bx,y,bw,bh);
+    effects_register(c,n,transform_start,bx,y,bw,bh);
     opacity_register(c,n,transform_start);
     layer_register(c,n,transform_start.items,transform_start.items);
     return bh;
@@ -4942,8 +5011,15 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
     if (ALPHA(lo->canvas) < 255)
         lo->canvas = OPAQUE(0xFFFFFF);
     int mb;
+    ncq_laid = 0;
     int h = layout_block_box(&c, root, 0, 0, vw, -1, &mb, NULL);
     lo->height = h + (mb > 0 ? mb : 0);
+    layout_cq_changed = 0;
+    for (int i = 0; i < ncq_laid; i++) {
+        struct node *k = cq_laid[i];
+        if (k->cq_asked && (k->cq_w != k->cq_aw || (k->style->cq_type == CQ_SIZE && k->cq_h != k->cq_ah)))
+            layout_cq_changed = 1;
+    }
     lo->width = vw;
     /* Save scroll/fixed tags while original range indices still name their first item. */
     for(int k=0;k<lo->nxf;k++)if(lo->xf[k].first<lo->nitems) {
@@ -4953,6 +5029,19 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
     for(int k=0;k<lo->ncontrols;k++)if(!lo->controls[k].xf)
         lo->controls[k].xf=(uint16_t)node_transform(lo,lo->controls[k].node);
     apply_z_order(&c);
+    for (int k = 0; k < lo->nfx; k++) {         /* backdrop-filter: before the first of its items to be painted */
+        if (!lo->fx[k].node->style->backdrop)
+            continue;
+        for (int i = 0; i < lo->nitems; i++) {
+            int g = lo->items[i].fx;
+            for (int depth = 0; g && g != k + 1 && depth < 64; depth++)
+                g = lo->fx[g - 1].parent;
+            if (g == k + 1) {
+                lo->items[i].backdrop = 1;
+                break;
+            }
+        }
+    }
     sbox_finalize(lo);
     for (int i = 0; i < lo->nitems; i++) {
         const struct ditem *d = &lo->items[i];
@@ -6306,6 +6395,323 @@ void layout_paint_surface(const struct layout *lo,const struct ditem *item,const
     }
 }
 
+/* ---- filter, clip-path, mix-blend-mode and backdrop-filter ----
+ * Pixels here are premultiplied ARGB: alpha in the top byte, each color at most it. */
+
+/* Does an item's group, or one round it, need its items painted apart (filter, clip-path, blend)? */
+static int fx_offscreen(const struct layout *lo, int g)
+{
+    for (int depth = 0; g > 0 && g <= lo->nfx && depth < 64; depth++, g = lo->fx[g - 1].parent)
+        if (lo->fx[g - 1].offscreen)
+            return 1;
+    return 0;
+}
+
+/* How far a filter can spread a box's pixels (blur and shadows). */
+static int fx_reach(const struct css_filter *f)
+{
+    int r = 0;
+    for (int i = 0; f && i < f->n; i++) {
+        const struct fxop *op = &f->op[i];
+        if (op->kind == FX_BLUR)
+            r += (int)(op->amount * 3) + 1;
+        else if (op->kind == FX_SHADOW)
+            r += abs(op->dx) + abs(op->dy) + op->blur * 3 + 1;
+    }
+    return r;
+}
+
+static inline int clamp255(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
+
+/* The per-pixel functions, on unpremultiplied color (the filter effects matrices). */
+static void fx_color(uint32_t *px, int n, const struct fxop *op)
+{
+    float m[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 }, add = 0, k = op->amount;
+    switch (op->kind) {
+    case FX_GRAYSCALE: {
+        float t = 1 - k;
+        float g[9] = { .2126f + .7874f * t, .7152f - .7152f * t, .0722f - .0722f * t,
+                       .2126f - .2126f * t, .7152f + .2848f * t, .0722f - .0722f * t,
+                       .2126f - .2126f * t, .7152f - .7152f * t, .0722f + .9278f * t };
+        memcpy(m, g, sizeof(m));
+        break;
+    }
+    case FX_SEPIA: {
+        float t = 1 - k;
+        float g[9] = { .393f + .607f * t, .769f - .769f * t, .189f - .189f * t,
+                       .349f - .349f * t, .686f + .314f * t, .168f - .168f * t,
+                       .272f - .272f * t, .534f - .534f * t, .131f + .869f * t };
+        memcpy(m, g, sizeof(m));
+        break;
+    }
+    case FX_SATURATE: {
+        float g[9] = { .213f + .787f * k, .715f - .715f * k, .072f - .072f * k,
+                       .213f - .213f * k, .715f + .285f * k, .072f - .072f * k,
+                       .213f - .213f * k, .715f - .715f * k, .072f + .928f * k };
+        memcpy(m, g, sizeof(m));
+        break;
+    }
+    case FX_HUE: {
+        float c = cosf(k), sn = sinf(k);
+        float g[9] = { .213f + c * .787f - sn * .213f, .715f - c * .715f - sn * .715f, .072f - c * .072f + sn * .928f,
+                       .213f - c * .213f + sn * .143f, .715f + c * .285f + sn * .140f, .072f - c * .072f - sn * .283f,
+                       .213f - c * .213f - sn * .787f, .715f - c * .715f + sn * .715f, .072f + c * .928f + sn * .072f };
+        memcpy(m, g, sizeof(m));
+        break;
+    }
+    case FX_BRIGHTNESS:
+        m[0] = m[4] = m[8] = k;
+        break;
+    case FX_CONTRAST:
+        m[0] = m[4] = m[8] = k;
+        add = (.5f - .5f * k) * 255;
+        break;
+    case FX_INVERT:
+        m[0] = m[4] = m[8] = 1 - 2 * k;
+        add = k * 255;
+        break;
+    case FX_OPACITY:
+        for (int i = 0; i < n; i++) {
+            uint32_t p = px[i];
+            int a = (int)(p >> 24);
+            if (!a)
+                continue;
+            px[i] = (uint32_t)clamp255((int)(a * k + .5f)) << 24 | (uint32_t)clamp255((int)((p >> 16 & 255) * k + .5f)) << 16 |
+                    (uint32_t)clamp255((int)((p >> 8 & 255) * k + .5f)) << 8 | (uint32_t)clamp255((int)((p & 255) * k + .5f));
+        }
+        return;
+    default:
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        uint32_t p = px[i];
+        int a = (int)(p >> 24);
+        if (!a)
+            continue;
+        float r = (float)(p >> 16 & 255) * 255 / a, g = (float)(p >> 8 & 255) * 255 / a, b = (float)(p & 255) * 255 / a;
+        int nr = clamp255((int)(m[0] * r + m[1] * g + m[2] * b + add + .5f));
+        int ng = clamp255((int)(m[3] * r + m[4] * g + m[5] * b + add + .5f));
+        int nb = clamp255((int)(m[6] * r + m[7] * g + m[8] * b + add + .5f));
+        px[i] = (uint32_t)a << 24 | (uint32_t)((nr * a + 127) / 255) << 16 | (uint32_t)((ng * a + 127) / 255) << 8 |
+                (uint32_t)((nb * a + 127) / 255);
+    }
+}
+
+/* One box-blur pass along rows (step 1) or columns (step w) over all four channels; beyond the edges
+ * is transparent, or (edge) the edge pixel again. */
+static void box_pass(const uint32_t *in, uint32_t *out, int len, int lines, int step, int line_step, int r, int edge)
+{
+    int win = 2 * r + 1;
+    for (int l = 0; l < lines; l++) {
+        const uint32_t *src = in + (size_t)l * line_step;
+        uint32_t *dst = out + (size_t)l * line_step;
+        int sum[4] = { 0, 0, 0, 0 };
+        for (int i = -r; i <= r; i++) {
+            int j = i < 0 ? (edge ? 0 : -1) : i >= len ? (edge ? len - 1 : -1) : i;
+            uint32_t p = j < 0 ? 0 : src[(size_t)j * step];
+            for (int c = 0; c < 4; c++)
+                sum[c] += (int)(p >> (8 * c) & 255);
+        }
+        for (int i = 0; i < len; i++) {
+            dst[(size_t)i * step] = (uint32_t)(sum[3] / win) << 24 | (uint32_t)(sum[2] / win) << 16 |
+                                     (uint32_t)(sum[1] / win) << 8 | (uint32_t)(sum[0] / win);
+            int jo = i - r, ji = i + r + 1;
+            jo = jo < 0 ? (edge ? 0 : -1) : jo;
+            ji = ji >= len ? (edge ? len - 1 : -1) : ji;
+            uint32_t po = jo < 0 ? 0 : src[(size_t)jo * step], pi = ji < 0 ? 0 : src[(size_t)ji * step];
+            for (int c = 0; c < 4; c++)
+                sum[c] += (int)(pi >> (8 * c) & 255) - (int)(po >> (8 * c) & 255);
+        }
+    }
+}
+
+/* A Gaussian blur of standard deviation sigma, as three box blurs; tmp is as big as px. */
+static void fx_blur(uint32_t *px, uint32_t *tmp, int w, int h, int stride, float sigma, int edge)
+{
+    int r = (int)(sigma + .5f);
+    if (r < 1 || w <= 0 || h <= 0)
+        return;
+    for (int pass = 0; pass < 3; pass++) {
+        box_pass(px, tmp, w, h, 1, stride, r, edge);
+        box_pass(tmp, px, h, w, stride, 1, r, edge);
+    }
+}
+
+/* drop-shadow(): the pixels' coverage, moved, blurred and colored, under them. */
+static void fx_shadow(uint32_t *px, int w, int h, const struct fxop *op)
+{
+    size_t n = (size_t)w * h;
+    uint32_t *sh = malloc(n * 8);
+    if (!sh)
+        return;
+    uint32_t *tmp = sh + n, col = op->color;
+    unsigned ca = col >> 24;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            int sx = x - op->dx, sy = y - op->dy;
+            unsigned a = sx >= 0 && sy >= 0 && sx < w && sy < h ? px[(size_t)sy * w + sx] >> 24 : 0;
+            a = a * ca / 255;
+            sh[(size_t)y * w + x] = a << 24 | ((col >> 16 & 255) * a / 255) << 16 | ((col >> 8 & 255) * a / 255) << 8 |
+                                    (col & 255) * a / 255;
+        }
+    fx_blur(sh, tmp, w, h, w, (float)op->blur / 2, 0);
+    for (size_t i = 0; i < n; i++) {
+        uint32_t p = px[i], q = sh[i];
+        unsigned keep = 255 - (p >> 24), out = 0;
+        for (int c = 0; c < 32; c += 8)
+            out |= (uint32_t)clamp255((int)((p >> c & 255) + ((q >> c & 255) * keep + 127) / 255)) << c;
+        px[i] = out;
+    }
+    free(sh);
+}
+
+static void fx_filter(uint32_t *px, uint32_t *tmp, int w, int h, const struct css_filter *f)
+{
+    for (int i = 0; f && i < f->n; i++) {
+        const struct fxop *op = &f->op[i];
+        if (op->kind == FX_BLUR)
+            fx_blur(px, tmp, w, h, w, op->amount, 0);
+        else if (op->kind == FX_SHADOW)
+            fx_shadow(px, w, h, op);
+        else
+            fx_color(px, w * h, op);
+    }
+}
+
+/* Is the page point (x, y) inside a group's clip-path? */
+static int clip_has(const struct css_clip *c, double bx, double by, double bw, double bh, double x, double y)
+{
+    x -= bx, y -= by;
+    switch (c->kind) {
+    case CLIP_INSET: {
+        double t = len_px(c->a[0], (int)bh), r = len_px(c->a[1], (int)bw), b = len_px(c->a[2], (int)bh),
+               l = len_px(c->a[3], (int)bw), rad = len_px(c->round, (int)(bw < bh ? bw : bh));
+        double x0 = l, y0 = t, x1 = bw - r, y1 = bh - b;
+        if (x < x0 || y < y0 || x >= x1 || y >= y1)
+            return 0;
+        if (rad <= 0)
+            return 1;
+        double cx = x < x0 + rad ? x0 + rad : x > x1 - rad ? x1 - rad : x;
+        double cy = y < y0 + rad ? y0 + rad : y > y1 - rad ? y1 - rad : y;
+        return (x - cx) * (x - cx) + (y - cy) * (y - cy) <= rad * rad;
+    }
+    case CLIP_CIRCLE:
+    case CLIP_ELLIPSE: {
+        double cx = len_px(c->a[2], (int)bw), cy = len_px(c->a[3], (int)bh), rx, ry;
+        double nx = cx < bw - cx ? cx : bw - cx, fx = cx > bw - cx ? cx : bw - cx;
+        double ny = cy < bh - cy ? cy : bh - cy, fy = cy > bh - cy ? cy : bh - cy;
+        if (c->kind == CLIP_CIRCLE) {
+            int diag = (int)(sqrt(bw * bw + bh * bh) / sqrt(2.0));
+            rx = c->rx_side == 1 ? (nx < ny ? nx : ny) : c->rx_side == 2 ? (fx > fy ? fx : fy) : len_px(c->a[0], diag);
+            ry = rx;
+        } else {
+            rx = c->rx_side == 1 ? nx : c->rx_side == 2 ? fx : len_px(c->a[0], (int)bw);
+            ry = c->ry_side == 1 ? ny : c->ry_side == 2 ? fy : len_px(c->a[1], (int)bh);
+        }
+        if (rx <= 0 || ry <= 0)
+            return 0;
+        double dx = (x - cx) / rx, dy = (y - cy) / ry;
+        return dx * dx + dy * dy <= 1;
+    }
+    case CLIP_POLYGON: {
+        int in = 0;
+        for (int i = 0, j = c->npts - 1; i < c->npts; j = i++) {
+            double xi = len_px(c->px[i], (int)bw), yi = len_px(c->py[i], (int)bh);
+            double xj = len_px(c->px[j], (int)bw), yj = len_px(c->py[j], (int)bh);
+            if ((yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi)
+                in = !in;
+        }
+        return in;
+    }
+    }
+    return 1;
+}
+
+/* Mix one channel of what is behind (b) with the item's (s), both 0-255, unpremultiplied. */
+static int blend_channel(int mode, int b, int s)
+{
+    switch (mode) {
+    case BL_MULTIPLY: return b * s / 255;
+    case BL_SCREEN: return b + s - b * s / 255;
+    case BL_OVERLAY: return b < 128 ? 2 * b * s / 255 : 255 - 2 * (255 - b) * (255 - s) / 255;
+    case BL_DARKEN: return b < s ? b : s;
+    case BL_LIGHTEN: return b > s ? b : s;
+    case BL_DODGE: return b == 0 ? 0 : s >= 255 ? 255 : clamp255(b * 255 / (255 - s));
+    case BL_BURN: return b >= 255 ? 255 : s <= 0 ? 0 : 255 - clamp255((255 - b) * 255 / s);
+    case BL_HARD: return s < 128 ? 2 * b * s / 255 : 255 - 2 * (255 - b) * (255 - s) / 255;
+    case BL_SOFT: {
+        double cb = b / 255.0, cs = s / 255.0, d = cb <= .25 ? ((16 * cb - 12) * cb + 4) * cb : sqrt(cb);
+        double r = cs <= .5 ? cb - (1 - 2 * cs) * cb * (1 - cb) : cb + (2 * cs - 1) * (d - cb);
+        return clamp255((int)(r * 255 + .5));
+    }
+    case BL_DIFFERENCE: return abs(b - s);
+    case BL_EXCLUSION: return b + s - 2 * b * s / 255;
+    default: return s;
+    }
+}
+
+/* backdrop-filter: what is already painted under the group's border box, filtered in place. */
+static void paint_backdrop(const struct layout *lo, const struct ditem *d, struct surface *s, int ox, int oy, int sx,
+                           int sy)
+{
+    int chain[64], n = 0;
+    for (int g = d->fx; g > 0 && g <= lo->nfx && n < 64; g = lo->fx[g - 1].parent)
+        chain[n++] = g;
+    int ddx = 0, ddy = 0, bx = 0, by = 0;
+    if (d->dyn)
+        layout_dyn_offset(lo, d->dyn, sx, sy, &ddx, &ddy);
+    if (d->sb)
+        layout_sb_view(lo, d->sb, sx, sy, &bx, &by, NULL);
+    while (n--) {                               /* the outermost first: it is further back */
+        const struct effect_box *g = &lo->fx[chain[n] - 1];
+        const struct css_filter *f = g->node->style->backdrop;
+        if (!f)
+            continue;
+        struct rect box = mkrect(g->x + ddx + bx - sx + ox, g->y + ddy + by - sy + oy, g->w, g->h);
+        struct rect r = rect_intersect(box, s->clip);
+        if (rect_empty(r))
+            continue;
+        /* read a margin round it for the blur, as far as the clip allows */
+        int reach = fx_reach(f);
+        struct rect src = rect_intersect(mkrect(r.x - reach, r.y - reach, r.w + 2 * reach, r.h + 2 * reach), s->clip);
+        size_t pixels = (size_t)src.w * src.h;
+        if (pixels > (4u << 20))
+            continue;
+        uint32_t *buf = malloc(pixels * 8);
+        if (!buf)
+            continue;
+        for (int y = 0; y < src.h; y++)
+            for (int x = 0; x < src.w; x++)
+                buf[(size_t)y * src.w + x] = 0xff000000u | (s->px[(size_t)(src.y + y) * s->stride + src.x + x] & 0xffffff);
+        for (int i = 0; i < f->n; i++) {
+            const struct fxop *op = &f->op[i];
+            if (op->kind == FX_BLUR)
+                fx_blur(buf, buf + pixels, src.w, src.h, src.w, op->amount, 1);
+            else if (op->kind != FX_SHADOW)
+                fx_color(buf, (int)pixels, op);
+        }
+        for (int y = r.y; y < r.y + r.h; y++)
+            for (int x = r.x; x < r.x + r.w; x++) {
+                /* within its rounded corners */
+                int lx = x - box.x, ly = y - box.y, q = ly < box.h / 2 ? (lx < box.w / 2 ? 0 : 1) : (lx < box.w / 2 ? 3 : 2);
+                int rad = g->rad[q];
+                if (rad) {
+                    int cx = q == 0 || q == 3 ? rad : box.w - rad, cy = q < 2 ? rad : box.h - rad;
+                    int inx = q == 0 || q == 3 ? lx < cx : lx >= cx, iny = q < 2 ? ly < cy : ly >= cy;
+                    if (inx && iny && (lx - cx) * (lx - cx) + (ly - cy) * (ly - cy) > rad * rad)
+                        continue;
+                }
+                uint32_t p = buf[(size_t)(y - src.y) * src.w + x - src.x];
+                unsigned a = p >> 24;               /* opacity() can leave it see-through */
+                uint32_t *out = &s->px[(size_t)y * s->stride + x], under = *out, res = 0;
+                for (int c = 0; c < 24; c += 8)
+                    res |= (uint32_t)clamp255((int)((p >> c & 255) + ((under >> c & 255) * (255 - a) + 127) / 255)) << c;
+                *out = res;
+            }
+        free(buf);
+    }
+}
+
 /* Two matte renders recover premultiplied color/coverage from the existing RGB
  * painters, including antialiased text and translucent images. This keeps the
  * desktop's RGB surface ABI unchanged and leaves holes in rotated items clear.
@@ -6319,8 +6725,12 @@ static void paint_transformed(const struct layout *lo,const struct ditem *item,s
     unsigned shown=255u-item->fade;
     if(d.dyn)layout_dyn_offset(lo,d.dyn,sx,sy,&dx,&dy);
     if(d.sb)layout_sb_view(lo,d.sb,sx,sy,&bx,&by,NULL);
-    d.x+=dx+bx;d.y+=dy+by;d.xf=d.sb=d.dyn=d.fade=0;
+    d.x+=dx+bx;d.y+=dy+by;d.xf=d.sb=d.dyn=d.fade=0;d.fx=0;d.backdrop=0;
+    /* filter, clip-path and blend: the groups round the item, innermost first */
+    int chain[64],nchain=0,effects=item->fx && fx_offscreen(lo,item->fx);
+    for(int g=item->fx;effects && g>0 && g<=lo->nfx && nchain<64;g=lo->fx[g-1].parent)chain[nchain++]=g;
     int pad=8+abs(d.sh_x)+abs(d.sh_y)+d.sh_blur;
+    for(int k=0;k<nchain;k++)pad+=fx_reach(lo->fx[chain[k]-1].node->style->filter);
     if(pad>512)pad=512;
     struct rect source=mkrect(d.x-pad,d.y-pad,d.w+2*pad,d.h+2*pad);
     struct rect visible=mkrect(dst->clip.x-ox+sx,dst->clip.y-oy+sy,dst->clip.w,dst->clip.h);
@@ -6343,6 +6753,58 @@ static void paint_transformed(const struct layout *lo,const struct ditem *item,s
     single.canvas=OPAQUE(0);paint_document(&single,&black,-source.x,-source.y,0,0,focus,caret_on);
     single.canvas=OPAQUE(0xffffff);paint_document(&single,&white,-source.x,-source.y,0,0,focus,caret_on);
     struct xclip clips[64];int count=transform_clips(lo,item->sb,sx,sy,clips);
+    if(effects) {
+        /* premultiplied pixels in black (the white render's memory is the scratch), filtered and clipped
+         * group by group, then put down through the blend mode */
+        uint32_t *px=black.px,*tmp=white.px;int mode=BL_NORMAL;
+        for(size_t at=0;at<pixels;at++) {
+            uint32_t b=px[at],w=tmp[at];
+            int clear=clamp255((int)(w>>16&255)-(int)(b>>16&255)),a=255-clear;
+            uint32_t r=b>>16&255,g=b>>8&255,bl=b&255;
+            r=r>(uint32_t)a?(uint32_t)a:r;g=g>(uint32_t)a?(uint32_t)a:g;bl=bl>(uint32_t)a?(uint32_t)a:bl;
+            px[at]=(uint32_t)a<<24|r<<16|g<<8|bl;
+        }
+        for(int k=0;k<nchain;k++) {
+            const struct effect_box *g=&lo->fx[chain[k]-1];const struct style *gs=g->node->style;
+            if(gs->filter)fx_filter(px,tmp,source.w,source.h,gs->filter);
+            if(gs->clip_path) {
+                double gx=g->x+dx+bx,gy=g->y+dy+by;
+                for(int y=0;y<source.h;y++)for(int x=0;x<source.w;x++) {
+                    uint32_t *p=&px[(size_t)y*source.w+x];
+                    if(!*p)continue;
+                    int inside=0;                   /* four samples a pixel, for smooth edges */
+                    for(int q=0;q<4;q++)inside+=clip_has(gs->clip_path,gx,gy,g->w,g->h,source.x+x+.25+.5*(q&1),source.y+y+.25+.5*(q>>1));
+                    if(inside==4)continue;
+                    uint32_t v=*p,o=0;
+                    for(int c=0;c<32;c+=8)o|=((v>>c&255)*(uint32_t)inside/4)<<c;
+                    *p=o;
+                }
+            }
+            if(!mode && gs->blend)mode=gs->blend;
+        }
+        for(int y=output.y;y<output.y+output.h;y++)for(int x=output.x;x<output.x+output.w;x++) {
+            if(!clips_contain(clips,count,x+0.5,y+0.5))continue;
+            double fpx=x+0.5,fpy=y+0.5;map_point(inv,&fpx,&fpy);
+            if(!__builtin_isfinite(fpx) || !__builtin_isfinite(fpy) || fpx<source.x || fpy<source.y || fpx>=source.x+source.w || fpy>=source.y+source.h)continue;
+            int ix=(int)floor(fpx)-source.x,iy=(int)floor(fpy)-source.y;
+            if(ix<0 || iy<0 || ix>=source.w || iy>=source.h)continue;
+            uint32_t p=px[(size_t)iy*source.w+ix];
+            unsigned a=((p>>24)*shown+127)/255;
+            if(!a)continue;
+            uint32_t *out=&dst->px[(y-sy+oy)*dst->stride+x-sx+ox],under=*out,result=0;
+            for(int shift=0;shift<=16;shift+=8) {
+                unsigned cs=((p>>shift&255)*shown+127)/255,cb=under>>shift&255;
+                if(mode) {                  /* the blended color, as much as the item covers */
+                    int unpre=clamp255((int)(cs*255/a));
+                    cs=((unsigned)blend_channel(mode,(int)cb,unpre)*a+127)/255;
+                }
+                result|=(uint32_t)clamp255((int)(cs+(cb*(255-a)+127)/255))<<shift;
+            }
+            *out=result;
+        }
+        free(memory);
+        return;
+    }
     for(int y=output.y;y<output.y+output.h;y++)for(int x=output.x;x<output.x+output.w;x++) {
         if(!clips_contain(clips,count,x+0.5,y+0.5))continue;
         double px=x+0.5,py=y+0.5;map_point(inv,&px,&py);
@@ -6378,7 +6840,9 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
     for (int i = 0; i < lo->nitems; i++) {
         const struct ditem *d = &lo->items[i];
         struct ditem translated;
-        if(d->fade) {
+        if (d->backdrop)
+            paint_backdrop(lo, d, s, ox, oy, sx, sy);
+        if(d->fade || (d->fx && fx_offscreen(lo,d->fx))) {
             paint_transformed(lo,d,s,ox,oy,sx,sy,focus,caret_on,i);
             continue;
         }

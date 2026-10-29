@@ -368,3 +368,77 @@ int web_response_headers(const char *headers, int cross, int credentials, char *
     }
     return (int)used;
 }
+
+int web_referrer_policy(const char *value)
+{
+    static const char *const names[] = { "", "no-referrer", "no-referrer-when-downgrade", "same-origin", "origin",
+                                         "strict-origin", "origin-when-cross-origin", "strict-origin-when-cross-origin",
+                                         "unsafe-url" };
+    int policy = RP_DEFAULT;
+    for (const char *p = value ? value : ""; *p;) {
+        while (*p == ' ' || *p == '\t' || *p == ',')
+            p++;
+        const char *e = p;
+        while (*e && *e != ',')
+            e++;
+        const char *t = e;
+        while (t > p && (t[-1] == ' ' || t[-1] == '\t'))
+            t--;
+        for (int i = 1; i < (int)(sizeof(names) / sizeof(names[0])); i++)
+            if ((size_t)(t - p) == strlen(names[i]) && !strncasecmp(p, names[i], (size_t)(t - p)))
+                policy = i;
+        if ((size_t)(t - p) == 6 && !strncasecmp(p, "always", 6))      /* the old keywords */
+            policy = RP_UNSAFE_URL;
+        else if ((size_t)(t - p) == 5 && !strncasecmp(p, "never", 5))
+            policy = RP_NO_REFERRER;
+        p = e;
+    }
+    return policy;
+}
+
+int web_referrer(const char *from, const char *to, int policy, char *out, size_t size)
+{
+    if (size)
+        out[0] = 0;
+    if (!from || !to || size < 2 || (strncasecmp(from, "http://", 7) && strncasecmp(from, "https://", 8)))
+        return 0;                       /* only web pages are named: not file:, about: or data: */
+    char origin[300];
+    if (!web_origin(from, origin, sizeof(origin)))
+        return 0;
+    int downgrade = !strncasecmp(from, "https://", 8) && strncasecmp(to, "https://", 8);
+    int same = web_same_origin(from, to), full;
+    switch (policy) {
+    case RP_NO_REFERRER: return 0;
+    case RP_NO_REFERRER_WHEN_DOWNGRADE: if (downgrade) return 0; full = 1; break;
+    case RP_SAME_ORIGIN: if (!same) return 0; full = 1; break;
+    case RP_ORIGIN: full = 0; break;
+    case RP_STRICT_ORIGIN: if (downgrade) return 0; full = 0; break;
+    case RP_ORIGIN_WHEN_CROSS_ORIGIN: full = same; break;
+    case RP_UNSAFE_URL: full = 1; break;
+    default: if (downgrade) return 0; full = same; break;      /* strict-origin-when-cross-origin */
+    }
+    /* the whole address, less its fragment and any user name and password; long ones become the origin */
+    const char *at = strstr(from, "://") + 3, *host_end = at + strcspn(at, "/?#"), *cred = memchr(at, '@', (size_t)(host_end - at));
+    size_t n = 0;
+    if (full) {
+        n = (size_t)snprintf(out, size, "%.*s%.*s%s", (int)(at - from), from, (int)(host_end - (cred ? cred + 1 : at)),
+                             cred ? cred + 1 : at, *host_end == '/' ? "" : "/");
+        size_t rest = strcspn(host_end, "#");
+        if (n < size && n + rest < size && n + rest <= 4096) {
+            memcpy(out + n, host_end, rest);
+            out[n + rest] = 0;
+            return 1;
+        }
+    }
+    n = (size_t)snprintf(out, size, "%s/", origin);
+    return n < size;
+}
+
+const char *web_fetch_site(const char *initiator, const char *to)
+{
+    if (!initiator || !initiator[0])
+        return "none";
+    if (web_same_origin(initiator, to))
+        return "same-origin";
+    return web_same_site(initiator, to) ? "same-site" : "cross-site";
+}

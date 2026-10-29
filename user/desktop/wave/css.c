@@ -64,6 +64,7 @@ enum prop {
     P_ANIMATION_ITERATION, P_ANIMATION_DIRECTION, P_ANIMATION_FILL, P_ANIMATION_STATE,
     P_COLUMNS, P_COLUMN_COUNT, P_COLUMN_WIDTH, P_COLUMN_RULE, P_COLUMN_RULE_WIDTH, P_COLUMN_RULE_STYLE,
     P_COLUMN_RULE_COLOR, P_COLUMN_FILL, P_BREAK_INSIDE, P_BREAK_BEFORE, P_BREAK_AFTER,
+    P_CONTAINER, P_CONTAINER_NAME, P_CONTAINER_TYPE, P_BACKFACE, P_FILTER, P_BACKDROP, P_CLIP_PATH, P_BLEND,
 };
 
 /* Transitions and animations, with or without -webkit- (looked up before prop_names). */
@@ -85,14 +86,14 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "-moz-user-select", P_USER_SELECT }, { "-ms-flex", P_FLEX }, { "-ms-overflow-style", P_IGNORED },
     { "-ms-text-size-adjust", P_IGNORED }, { "-ms-user-select", P_USER_SELECT },
     { "-webkit-align-content", P_ALIGN_CONTENT }, { "-webkit-align-items", P_ALIGN_ITEMS },
-    { "-webkit-align-self", P_ALIGN_SELF }, { "-webkit-appearance", P_IGNORED },
-    { "-webkit-backface-visibility", P_IGNORED }, { "-webkit-border-radius", P_BORDER_RADIUS },
+    { "-webkit-align-self", P_ALIGN_SELF }, { "-webkit-appearance", P_IGNORED }, { "-webkit-backdrop-filter", P_BACKDROP },
+    { "-webkit-backface-visibility", P_BACKFACE }, { "-webkit-border-radius", P_BORDER_RADIUS },
     { "-webkit-box-decoration-break", P_IGNORED }, { "-webkit-box-orient", P_IGNORED },
-    { "-webkit-box-shadow", P_BOX_SHADOW }, { "-webkit-box-sizing", P_BOX_SIZING },
+    { "-webkit-box-shadow", P_BOX_SHADOW }, { "-webkit-box-sizing", P_BOX_SIZING }, { "-webkit-clip-path", P_CLIP_PATH },
     { "-webkit-column-break-after", P_BREAK_AFTER }, { "-webkit-column-break-before", P_BREAK_BEFORE },
     { "-webkit-column-break-inside", P_BREAK_INSIDE }, { "-webkit-column-count", P_COLUMN_COUNT },
     { "-webkit-column-gap", P_COLUMN_GAP }, { "-webkit-column-rule", P_COLUMN_RULE },
-    { "-webkit-column-width", P_COLUMN_WIDTH }, { "-webkit-columns", P_COLUMNS }, { "-webkit-flex", P_FLEX },
+    { "-webkit-column-width", P_COLUMN_WIDTH }, { "-webkit-columns", P_COLUMNS }, { "-webkit-filter", P_FILTER }, { "-webkit-flex", P_FLEX },
     { "-webkit-flex-basis", P_FLEX_BASIS }, { "-webkit-flex-direction", P_FLEX_DIRECTION },
     { "-webkit-flex-flow", P_FLEX_FLOW }, { "-webkit-flex-grow", P_FLEX_GROW },
     { "-webkit-flex-shrink", P_FLEX_SHRINK }, { "-webkit-flex-wrap", P_FLEX_WRAP },
@@ -106,7 +107,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "-webkit-user-drag", P_IGNORED }, { "-webkit-user-select", P_USER_SELECT }, { "accent-color", P_IGNORED },
     { "align-content", P_ALIGN_CONTENT }, { "align-items", P_ALIGN_ITEMS }, { "align-self", P_ALIGN_SELF },
     { "alignment-baseline", P_IGNORED }, { "all", P_ALL }, { "appearance", P_IGNORED },
-    { "aspect-ratio", P_ASPECT_RATIO }, { "backface-visibility", P_IGNORED }, { "background", P_BACKGROUND },
+    { "aspect-ratio", P_ASPECT_RATIO }, { "backdrop-filter", P_BACKDROP }, { "backface-visibility", P_BACKFACE }, { "background", P_BACKGROUND },
     { "background-attachment", P_BACKGROUND_ATTACHMENT }, { "background-clip", P_BACKGROUND_CLIP },
     { "background-color", P_BACKGROUND_COLOR }, { "background-image", P_BACKGROUND_IMAGE },
     { "background-origin", P_BACKGROUND_ORIGIN }, { "background-position", P_BACKGROUND_POSITION },
@@ -136,7 +137,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "border-top-width", P_BORDER_TOP_WIDTH }, { "border-width", P_BORDER_WIDTH }, { "bottom", P_BOTTOM },
     { "box-decoration-break", P_IGNORED }, { "box-shadow", P_BOX_SHADOW }, { "box-sizing", P_BOX_SIZING },
     { "break-after", P_BREAK_AFTER }, { "break-before", P_BREAK_BEFORE }, { "break-inside", P_BREAK_INSIDE },
-    { "caption-side", P_CAPTION_SIDE }, { "caret-color", P_IGNORED }, { "clear", P_CLEAR }, { "clip", P_CLIP },
+    { "caption-side", P_CAPTION_SIDE }, { "caret-color", P_IGNORED }, { "clear", P_CLEAR }, { "clip", P_CLIP }, { "clip-path", P_CLIP_PATH },
     { "color", P_COLOR }, { "color-interpolation", P_IGNORED }, { "color-interpolation-filters", P_IGNORED },
     { "color-rendering", P_IGNORED }, { "color-scheme", P_IGNORED }, { "column-count", P_COLUMN_COUNT },
     { "column-fill", P_COLUMN_FILL }, { "column-gap", P_COLUMN_GAP }, { "column-rule", P_COLUMN_RULE },
@@ -146,11 +147,11 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "contain", P_IGNORED }, { "contain-intrinsic-block-size", P_IGNORED },
     { "contain-intrinsic-height", P_IGNORED }, { "contain-intrinsic-inline-size", P_IGNORED },
     { "contain-intrinsic-size", P_IGNORED }, { "contain-intrinsic-width", P_IGNORED },
-    { "container", P_IGNORED }, { "container-name", P_IGNORED }, { "container-type", P_IGNORED },
+    { "container", P_CONTAINER }, { "container-name", P_CONTAINER_NAME }, { "container-type", P_CONTAINER_TYPE },
     { "content", P_CONTENT }, { "content-visibility", P_IGNORED }, { "counter-increment", P_COUNTER_INCREMENT },
     { "counter-reset", P_COUNTER_RESET }, { "counter-set", P_IGNORED }, { "cursor", P_CURSOR },
     { "display", P_DISPLAY }, { "dominant-baseline", P_IGNORED }, { "dynamic-range-limit", P_IGNORED },
-    { "empty-cells", P_EMPTY_CELLS }, { "field-sizing", P_IGNORED }, { "flex", P_FLEX },
+    { "empty-cells", P_EMPTY_CELLS }, { "field-sizing", P_IGNORED }, { "filter", P_FILTER }, { "flex", P_FLEX },
     { "flex-basis", P_FLEX_BASIS }, { "flex-direction", P_FLEX_DIRECTION }, { "flex-flow", P_FLEX_FLOW },
     { "flex-grow", P_FLEX_GROW }, { "flex-shrink", P_FLEX_SHRINK }, { "flex-wrap", P_FLEX_WRAP },
     { "float", P_FLOAT }, { "font", P_FONT }, { "font-display", P_IGNORED }, { "font-family", P_FONT_FAMILY },
@@ -190,7 +191,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "math-depth", P_IGNORED }, { "math-style", P_IGNORED }, { "max-block-size", P_MAX_HEIGHT },
     { "max-height", P_MAX_HEIGHT }, { "max-inline-size", P_MAX_WIDTH }, { "max-width", P_MAX_WIDTH },
     { "min-block-size", P_MIN_HEIGHT }, { "min-height", P_MIN_HEIGHT }, { "min-inline-size", P_MIN_WIDTH },
-    { "min-width", P_MIN_WIDTH }, { "object-fit", P_OBJECT_FIT }, { "object-position", P_OBJECT_POSITION },
+    { "min-width", P_MIN_WIDTH }, { "mix-blend-mode", P_BLEND }, { "object-fit", P_OBJECT_FIT }, { "object-position", P_OBJECT_POSITION },
     { "opacity", P_OPACITY }, { "order", P_ORDER }, { "orphans", P_IGNORED }, { "outline", P_OUTLINE },
     { "outline-color", P_OUTLINE_COLOR }, { "outline-offset", P_OUTLINE_OFFSET },
     { "outline-style", P_OUTLINE_STYLE }, { "outline-width", P_OUTLINE_WIDTH }, { "overflow", P_OVERFLOW },
@@ -324,7 +325,15 @@ struct layer {
     int order;
 };
 
+/* An @container block's query: the container's name (NULL: any) and the condition; outer is
+ * the @container it sits in, if any (all of them must hold). */
+struct cquery {
+    const char *name, *cond;
+    const struct cquery *outer;
+};
+
 struct rule {
+    const struct cquery *cq;
     struct layer *layer;
     struct selector *sels;
     int nsels;
@@ -339,6 +348,8 @@ struct ref {                    /* a selector, filed in the index */
 
 struct sheet {
     struct layer *layers, *last_layer, *active_layer;
+    const struct cquery *active_cq;     /* the @container being read */
+    struct custom_prop *registered;     /* @property: names and their initial values */
     unsigned anonymous_layer;
     struct rule *rules;
     int nrules, cap;
@@ -1368,11 +1379,11 @@ static int ratio_value(const char *s)
     return b > 0 ? atoi(s) * 100 / b : 0;
 }
 
-static int media_feature(const char *f, int vw)
+static int size_feature(const char *f, int vw, int vh)
 {
     /* "(min-width: 600px)", "(width >= 600px)", "(400px <= width <= 700px)", "(prefers-color-scheme: dark)" */
     char buf[128];
-    int n = 0, vh = css_viewport_h;
+    int n = 0;
     for (; *f && *f != ')' && n < 127; f++)
         if (*f != '(')
             buf[n++] = (char)tolower((unsigned char)*f);
@@ -1463,6 +1474,165 @@ static int media_feature(const char *f, int vw)
     if (!strncmp(buf, "color", 5) || !strcmp(buf, "hover"))
         return 1;
     return 0;
+}
+
+static int media_feature(const char *f, int vw)
+{
+    return size_feature(f, vw, css_viewport_h);
+}
+
+/* ---- @container ---- */
+
+static int cq_guess_w = 1024, cq_guess_h = 768;      /* a container never laid out: the viewport */
+
+/* A container's content box: as the last layout found it, or the guess. The cascade notes what it
+ * took, so the browser can tell when the page must be styled again (layout_cq_changed). */
+static void cq_size(struct node *c, int *w, int *h)
+{
+    *w = c->cq_known ? c->cq_w : cq_guess_w;
+    *h = c->cq_known ? c->cq_h : cq_guess_h;
+    c->cq_asked = 1;
+    c->cq_aw = *w;
+    c->cq_ah = *h;
+}
+
+/* The nearest container from n up (n included) that a query naming name (NULL: any) can use. */
+static struct node *cq_container(struct node *n, const char *name)
+{
+    size_t nl = name ? strlen(name) : 0;
+    for (; n; n = n->parent) {
+        const struct style *st = n->type == N_ELEMENT ? n->style : NULL;
+        if (!st || !st->cq_type)
+            continue;
+        if (!name)
+            return n;
+        for (const char *p = st->cq_name; p && *p;) {
+            while (isspace((unsigned char)*p))
+                p++;
+            const char *e = p;
+            while (*e && !isspace((unsigned char)*e))
+                e++;
+            if ((size_t)(e - p) == nl && !strncmp(p, name, nl))
+                return n;
+            p = e;
+        }
+    }
+    return NULL;
+}
+
+/* One size feature, "min-width: 400px" or "inline-size > 30em"; h < 0: the height is not known. */
+static int cq_feature(const char *s, const char *e, int w, int h)
+{
+    char buf[128];
+    int n = 0;
+    for (const char *p = s; p < e && n < 120; p++) {
+        if (e - p >= 11 && !strncasecmp(p, "inline-size", 11)) {
+            memcpy(buf + n, "width", 5), n += 5, p += 10;
+        } else if (e - p >= 10 && !strncasecmp(p, "block-size", 10)) {
+            memcpy(buf + n, "height", 6), n += 6, p += 9;
+        } else {
+            buf[n++] = (char)tolower((unsigned char)*p);
+        }
+    }
+    buf[n] = 0;
+    if (h < 0 && (strstr(buf, "height") || strstr(buf, "aspect-ratio") || strstr(buf, "orientation")))
+        return 0;
+    if (!strstr(buf, "width") && !strstr(buf, "height") && !strstr(buf, "aspect-ratio") && !strstr(buf, "orientation"))
+        return 0;                               /* not a size feature */
+    return size_feature(buf, w, h < 0 ? 0 : h);
+}
+
+static int word_at(const char *p, const char *e, const char *w);
+static int cq_expr(const char **pp, const char *e, int w, int h);
+
+/* not X, (X), (feature), or a function (style() and the rest, which never hold here) */
+static int cq_term(const char **pp, const char *e, int w, int h)
+{
+    const char *p = *pp;
+    while (p < e && isspace((unsigned char)*p))
+        p++;
+    if (word_at(p, e, "not")) {
+        *pp = p + 3;
+        return !cq_term(pp, e, w, h);
+    }
+    if (p < e && *p == '(') {
+        const char *close = skip_group(p, e), *in = p + 1, *ie = close - 1;
+        *pp = close;
+        while (in < ie && isspace((unsigned char)*in))
+            in++;
+        if (in < ie && (*in == '(' || word_at(in, ie, "not")))
+            return cq_expr(&in, ie, w, h);
+        return cq_feature(in, ie, w, h);
+    }
+    while (p < e && *p != '(' && !isspace((unsigned char)*p))
+        p++;
+    *pp = p < e && *p == '(' ? skip_group(p, e) : p;
+    return 0;
+}
+
+static int cq_expr(const char **pp, const char *e, int w, int h)
+{
+    int r = cq_term(pp, e, w, h);
+    for (;;) {
+        const char *p = *pp;
+        while (p < e && isspace((unsigned char)*p))
+            p++;
+        if (word_at(p, e, "and")) {
+            *pp = p + 3;
+            r = cq_term(pp, e, w, h) && r;
+        } else if (word_at(p, e, "or")) {
+            *pp = p + 2;
+            r = cq_term(pp, e, w, h) || r;
+        } else {
+            return r;
+        }
+    }
+}
+
+/* Does every @container round a rule hold for n (or, for a pseudo-element, n's own box)? */
+static int cq_matches(const struct cquery *q, struct node *n, int pe)
+{
+    for (; q; q = q->outer) {
+        struct node *c = cq_container(pe ? n : n->parent, q->name);
+        if (!c)
+            return 0;
+        int w, h;
+        cq_size(c, &w, &h);
+        const char *p = q->cond;
+        if (!cq_expr(&p, p + strlen(p), w, c->style->cq_type == CQ_SIZE ? h : -1))
+            return 0;
+    }
+    return 1;
+}
+
+/* @container [name] condition: a query for the rules in its block. */
+static const struct cquery *cq_parse(struct sheet *sh, const char *s, const char *e)
+{
+    struct cquery *q = arena_alloc(sh->a, sizeof(*q));
+    if (!q)
+        return sh->active_cq;
+    while (s < e && isspace((unsigned char)*s))
+        s++;
+    while (e > s && isspace((unsigned char)e[-1]))
+        e--;
+    q->name = NULL;
+    const char *k = s;
+    while (k < e && is_ident_char(*k))
+        k++;
+    if (k > s && (k == e || *k != '(') && !word_at(s, e, "not") && !word_at(s, e, "style")) {
+        char *name = arena_alloc(sh->a, (size_t)(k - s) + 1);
+        if (name) {
+            memcpy(name, s, (size_t)(k - s));
+            name[k - s] = 0;
+        }
+        q->name = name;
+        s = k;
+    }
+    q->cond = trimmed(sh->a, s, e);
+    if (!q->cond)
+        q->cond = "";
+    q->outer = sh->active_cq;
+    return q;
 }
 
 static int media_matches(const char *s, const char *end, int vw)
@@ -1589,6 +1759,7 @@ static void add_rule(struct sheet *sh, const char *sel_s, const char *sel_e, con
     struct arena *a = sh->a;
     struct rule r = { 0 };
     r.layer = sh->active_layer;
+    r.cq = sh->active_cq;
     r.ndecls = parse_decls(a, body_s, body_e, &r.decls);
     if (!r.ndecls)
         return;
@@ -1634,6 +1805,8 @@ static int word_at(const char *p, const char *e, const char *w)
 /* (property: value): a property we know, with a value it can take. */
 static int transform_supported(const char *value);
 static int individual_supported(int prop, const char *value);
+static int effect_supported(int prop, const char *value);
+
 static int supports_decl(const char *ns, const char *ne, const char *vs, const char *ve)
 {
     while (ns < ne && isspace((unsigned char)*ns))
@@ -1678,6 +1851,7 @@ static int supports_decl(const char *ns, const char *ne, const char *vs, const c
         return 0;
     }
     case P_TRANSFORM: return transform_supported(value);
+    case P_FILTER: case P_BACKDROP: case P_CLIP_PATH: return effect_supported(prop, value);
     case P_TRANSLATE: case P_ROTATE: case P_SCALE: return individual_supported(prop, value);
     case P_POSITION:
         return !strcasecmp(value, "static") || !strcasecmp(value, "relative") || !strcasecmp(value, "absolute") ||
@@ -1869,6 +2043,36 @@ static char *nest_selector(struct arena *a, const char *ps, const char *pe, cons
     return out;
 }
 
+static void style_rule(struct sheet *sh, const char *sel_s, const char *sel_e, const char *body_s,
+                       const char *body_e, int vw, int depth);
+
+/* @scope (root) [to (limit)] { rules }: the rules nested in the root's selector, :scope standing
+ * for it. The limit is not kept: what is below it matches too. A scope with no root (the
+ * parent of a <style>) cannot be told from here, and its rules are left out. */
+static void scope_rule(struct sheet *sh, const char *pre_s, const char *pre_e, const char *body_s,
+                       const char *body_e, int vw, int depth)
+{
+    while (pre_s < pre_e && isspace((unsigned char)*pre_s))
+        pre_s++;
+    if (pre_s >= pre_e || *pre_s != '(' || depth >= 8)
+        return;
+    const char *close = skip_group(pre_s, pre_e);
+    size_t n = (size_t)(body_e - body_s);
+    char *body = arena_alloc(sh->a, n + 1);
+    if (!body || close - pre_s < 3)
+        return;
+    size_t o = 0;
+    for (const char *p = body_s; p < body_e;) {
+        if (body_e - p >= 6 && !strncasecmp(p, ":scope", 6) && !(body_e - p > 6 && is_ident_char(p[6]))) {
+            body[o++] = '&';
+            p += 6;
+        } else {
+            body[o++] = *p++;
+        }
+    }
+    style_rule(sh, pre_s + 1, close - 1, body, body + o, vw, depth + 1);
+}
+
 /* A style rule. Its body may hold rules of its own (CSS nesting), and
  * @media and @supports blocks whose declarations are the rule's. */
 static void style_rule(struct sheet *sh, const char *sel_s, const char *sel_e, const char *body_s,
@@ -1911,6 +2115,11 @@ static void style_rule(struct sheet *sh, const char *sel_s, const char *sel_e, c
                         sh->active_layer = layer_name(sh, k, brace);
                         style_rule(sh, sel_s, sel_e, brace + 1, close - 1, vw, depth + 1);
                         sh->active_layer = saved;
+                    } else if (kl == 9 && !strncasecmp(kw, "container", 9)) {
+                        const struct cquery *saved = sh->active_cq;
+                        sh->active_cq = cq_parse(sh, k, brace);
+                        style_rule(sh, sel_s, sel_e, brace + 1, close - 1, vw, depth + 1);
+                        sh->active_cq = saved;
                     } else if ((kl == 5 && !strncasecmp(kw, "media", 5) && media_matches(k, brace, vw)) ||
                         (kl == 8 && !strncasecmp(kw, "supports", 8) && supports_matches(sh->a, k, brace)))
                         style_rule(sh, sel_s, sel_e, brace + 1, close - 1, vw, depth + 1);
@@ -1970,6 +2179,38 @@ static void parse_block(struct sheet *sh, const char *s, const char *end, int vw
                 sh->active_layer = layer_name(sh, k, brace);
                 parse_block(sh, brace + 1, close - 1, vw, depth + 1);
                 sh->active_layer = saved;
+                sc.s = close;
+                continue;
+            }
+            if (depth < 8 && kl == 9 && !strncasecmp(kw, "container", 9)) {
+                const struct cquery *saved = sh->active_cq;
+                sh->active_cq = cq_parse(sh, k, brace);
+                parse_block(sh, brace + 1, close - 1, vw, depth + 1);
+                sh->active_cq = saved;
+                sc.s = close;
+                continue;
+            }
+            if (kl == 8 && !strncasecmp(kw, "property", 8)) {      /* @property --x { initial-value: ... } */
+                char *name = trimmed(sh->a, k, brace);
+                for (const char *p = brace + 1; name && name[0] == '-' && name[1] == '-' && p < close - 1;) {
+                    const char *semi = find_top(p, close - 1, ';'), *colon = find_top(p, semi, ':');
+                    while (p < colon && isspace((unsigned char)*p))
+                        p++;
+                    struct custom_prop *cp;
+                    if (colon < semi && colon - p >= 13 && !strncasecmp(p, "initial-value", 13) &&
+                        (cp = arena_alloc(sh->a, sizeof(*cp)))) {
+                        cp->name = name;
+                        cp->value = trimmed(sh->a, colon + 1, semi);
+                        cp->next = sh->registered;
+                        sh->registered = cp->value ? cp : sh->registered;
+                    }
+                    p = semi + 1;
+                }
+                sc.s = close;
+                continue;
+            }
+            if (kl == 5 && !strncasecmp(kw, "scope", 5)) {
+                scope_rule(sh, k, brace, brace + 1, close - 1, vw, depth);
                 sc.s = close;
                 continue;
             }
@@ -2790,6 +3031,7 @@ struct vctx {                   /* what relative units are relative to */
     int font_size, root_font_size, vw, vh;
     struct arena *a;            /* for values kept in the style (grid tracks) */
     int lh, root_lh;            /* the line height (lh units) and the root's (rlh); 0: 1.2em */
+    struct node *cq_from;       /* where cq units look for their container (NULL: the viewport) */
 };
 
 /* A style's line height in pixels, for lh units: normal counts as 1.2. */
@@ -3073,17 +3315,36 @@ static int unit_px100(const char *unit, long num, const struct vctx *v, long *ou
         px = num * 96 * 100 / 254;
     else if (!strcmp(unit, "mm"))
         px = num * 96 * 10 / 254;
-    else if (!strcmp(unit, "vw") || !strcmp(unit, "dvw") || !strcmp(unit, "svw") || !strcmp(unit, "lvw") ||
-             !strcmp(unit, "vi") || !strcmp(unit, "cqw") || !strcmp(unit, "cqi"))      /* no containers: the viewport */
+    else if (unit[0] == 'c' && unit[1] == 'q') {        /* the nearest container's box, else the viewport */
+        int cw = v->vw, ch = v->vh;
+        struct node *c = v->cq_from ? cq_container(v->cq_from, NULL) : NULL;
+        if (c) {
+            int w, h;
+            cq_size(c, &w, &h);
+            cw = w;
+            if (c->style->cq_type == CQ_SIZE)
+                ch = h;
+        }
+        if (!strcmp(unit, "cqw") || !strcmp(unit, "cqi"))
+            px = num * cw / 100;
+        else if (!strcmp(unit, "cqh") || !strcmp(unit, "cqb"))
+            px = num * ch / 100;
+        else if (!strcmp(unit, "cqmin"))
+            px = num * (cw < ch ? cw : ch) / 100;
+        else if (!strcmp(unit, "cqmax"))
+            px = num * (cw > ch ? cw : ch) / 100;
+        else
+            return 0;
+        absolute = 0;
+    } else if (!strcmp(unit, "vw") || !strcmp(unit, "dvw") || !strcmp(unit, "svw") || !strcmp(unit, "lvw") ||
+             !strcmp(unit, "vi"))
         px = num * v->vw / 100, absolute = 0;
     else if (!strcmp(unit, "vh") || !strcmp(unit, "dvh") || !strcmp(unit, "svh") || !strcmp(unit, "lvh") ||
-             !strcmp(unit, "vb") || !strcmp(unit, "cqh") || !strcmp(unit, "cqb"))
+             !strcmp(unit, "vb"))
         px = num * v->vh / 100, absolute = 0;
-    else if (!strcmp(unit, "vmin") || !strcmp(unit, "cqmin") || !strcmp(unit, "dvmin") || !strcmp(unit, "svmin") ||
-             !strcmp(unit, "lvmin"))
+    else if (!strcmp(unit, "vmin") || !strcmp(unit, "dvmin") || !strcmp(unit, "svmin") || !strcmp(unit, "lvmin"))
         px = num * (v->vw < v->vh ? v->vw : v->vh) / 100, absolute = 0;
-    else if (!strcmp(unit, "vmax") || !strcmp(unit, "cqmax") || !strcmp(unit, "dvmax") || !strcmp(unit, "svmax") ||
-             !strcmp(unit, "lvmax"))
+    else if (!strcmp(unit, "vmax") || !strcmp(unit, "dvmax") || !strcmp(unit, "svmax") || !strcmp(unit, "lvmax"))
         px = num * (v->vw > v->vh ? v->vw : v->vh) / 100, absolute = 0;
     else
         return 0;
@@ -3530,14 +3791,14 @@ static int len_on(struct len l, int base)
 /* Something length_value can read (for @supports). */
 static int is_length(const char *s)
 {
-    struct vctx v = { ZOOM(16), ZOOM(16), 1024, 768, NULL, 0, 0 };
+    struct vctx v = { ZOOM(16), ZOOM(16), 1024, 768, NULL, 0, 0, NULL };
     struct len l;
     return length_value(s, &v, &l);
 }
 
 static int length_px(const char *s, int base)
 {
-    struct vctx v = { base, 16, 1024, 768, NULL, 0, 0 };
+    struct vctx v = { base, 16, 1024, 768, NULL, 0, 0, NULL };
     struct len l;
     if (!length_value(s, &v, &l) || l.unit != U_PX)
         return 0;
@@ -4641,6 +4902,24 @@ static int transform_number(const char *s, float *out, int angle)
     *out = (float)x;
     return 1;
 }
+/* rotate3d(x, y, z, angle) seen from the front with no perspective: the top left 2x2 of its
+ * matrix. The back of the box faces the viewer when the z axis comes to point away. */
+static int rotate3d_op(double x, double y, double z, double angle, struct tfop *op)
+{
+    double l = sqrt(x * x + y * y + z * z);
+    if (l <= 0)
+        return 0;
+    x /= l, y /= l, z /= l;
+    double c = cos(angle), s = sin(angle), t = 1 - c;
+    memset(op, 0, sizeof(*op));
+    op->kind = TF_MATRIX;
+    op->a = (float)(t * x * x + c);             /* the image of the x axis */
+    op->b = (float)(t * x * y + s * z);
+    op->c = (float)(t * x * y - s * z);         /* ...and of the y axis */
+    op->d = (float)(t * y * y + c);
+    op->flip = t * z * z + c < -1e-6;
+    return 1;
+}
 static int parse_transform(const char *value, const struct vctx *v, struct css_xform *out)
 {
     memset(out,0,sizeof(*out));
@@ -4656,7 +4935,7 @@ static int parse_transform(const char *value, const struct vctx *v, struct css_x
         if (*p!='(') return 0;
         const char *end=skip_group(p,p+strlen(p));
         if (end<=p+1 || end[-1]!=')') return 0;
-        char args[6][128];int n=0;
+        char args[16][128];int n=0;
         const char *q=p+1,*limit=end-1;
         while (q<limit) {
             while(q<limit && isspace((unsigned char)*q))q++;
@@ -4665,7 +4944,7 @@ static int parse_transform(const char *value, const struct vctx *v, struct css_x
             while(q<limit && *q!=',' && !isspace((unsigned char)*q)) {
                 if(*q=='(')q=skip_group(q,limit);else q++;
             }
-            if(n==6 || q-start<=0 || q-start>=(int)sizeof(args[0]))return 0;
+            if(n==16 || q-start<=0 || q-start>=(int)sizeof(args[0]))return 0;
             snprintf(args[n++],sizeof(args[0]),"%.*s",(int)(q-start),start);
             while(q<limit && isspace((unsigned char)*q))q++;
             if(q<limit && *q==','){q++;while(q<limit && isspace((unsigned char)*q))q++;if(q==limit)return 0;}
@@ -4701,7 +4980,38 @@ static int parse_transform(const char *value, const struct vctx *v, struct css_x
             float values[6];if(n!=6)return 0;
             for(int i=0;i<6;i++)if(!transform_number(args[i],&values[i],0))return 0;
             op.a=values[0];op.b=values[1];op.c=values[2];op.d=values[3];op.e=values[4];op.f=values[5];
+        /* 3D: seen from the front with no perspective, so depth is dropped */
+        } else if(!strcasecmp(fn,"translate3d")) {
+            struct len z;
+            if(n!=3 || !length_value(args[0],v,&op.x) || op.x.unit==U_AUTO || !length_value(args[1],v,&op.y) ||
+               op.y.unit==U_AUTO || !length_value(args[2],v,&z))return 0;
+            op.kind=TF_TRANSLATE;
+        } else if(!strcasecmp(fn,"translateZ") || !strcasecmp(fn,"perspective")) {
+            struct len z;
+            if(n!=1 || (!length_value(args[0],v,&z) && strcasecmp(args[0],"none")))return 0;
+            op.kind=TF_TRANSLATE;
+        } else if(!strcasecmp(fn,"scale3d") || !strcasecmp(fn,"scaleZ")) {
+            float z;
+            if(n!=(fn[5]=='3'?3:1))return 0;
+            op.kind=TF_SCALE;op.a=op.b=1;
+            if(n==3 && (!transform_number(args[0],&op.a,0) || !transform_number(args[1],&op.b,0)))return 0;
+            if(!transform_number(args[n-1],&z,0))return 0;
+        } else if(!strcasecmp(fn,"rotateZ")) {
+            op.kind=TF_ROTATE;
+            if(n!=1 || !transform_number(args[0],&op.a,1))return 0;
+        } else if(!strcasecmp(fn,"rotateX") || !strcasecmp(fn,"rotateY") || !strcasecmp(fn,"rotate3d")) {
+            float axis[3]={fn[6]=='X'||fn[6]=='x',fn[6]=='Y'||fn[6]=='y',0},angle;
+            if(n!=(fn[6]=='3'?4:1))return 0;
+            for(int i=0;i<3 && n==4;i++)if(!transform_number(args[i],&axis[i],0))return 0;
+            if(!transform_number(args[n-1],&angle,1) || !rotate3d_op(axis[0],axis[1],axis[2],angle,&op))return 0;
+        } else if(!strcasecmp(fn,"matrix3d")) {
+            float m[16];if(n!=16)return 0;
+            for(int i=0;i<16;i++)if(!transform_number(args[i],&m[i],0))return 0;
+            float w=m[15]!=0?m[15]:1;
+            op.kind=TF_MATRIX;op.a=m[0]/w;op.b=m[1]/w;op.c=m[4]/w;op.d=m[5]/w;op.e=m[12]/w;op.f=m[13]/w;
+            op.flip=m[10]<0;
         } else return 0;
+        out->flipped^=op.flip;
         out->op[out->n++]=op;p=end;
     }
     return out->n>0;
@@ -4737,7 +5047,7 @@ void css_transform_matrix(const struct style *st,int w,int h,double out[6])
 }
 static int transform_supported(const char *value)
 {
-    const struct vctx v={16,16,1024,768,NULL, 0, 0 };struct css_xform parsed;
+    const struct vctx v={16,16,1024,768,NULL, 0, 0, NULL };struct css_xform parsed;
     return parse_transform(value,&v,&parsed);
 }
 
@@ -4776,8 +5086,19 @@ static int individual_transform(int prop, const char *value, const struct vctx *
             angle = last;
         else if (n == 4 && word_is(w[0], wl[0], "0") && word_is(w[1], wl[1], "0") && word_is(w[2], wl[2], "1"))
             angle = last;
-        else if (n == 2 && (word_is(w[0], wl[0], "x") || word_is(w[0], wl[0], "y")))
-            return transform_number(last, &op->a, 1) ? (*set = 0, 1) : 0;     /* about x or y: flat in 2D */
+        else if ((n == 2 && (word_is(w[0], wl[0], "x") || word_is(w[0], wl[0], "y"))) || n == 4) {
+            float axis[3] = { word_is(w[0], wl[0], "x"), word_is(w[0], wl[0], "y"), 0 }, turn;
+            for (int i = 0; i < 3 && n == 4; i++) {
+                char one[64];
+                snprintf(one, sizeof(one), "%.*s", wl[i], w[i]);
+                if (!transform_number(one, &axis[i], 0))
+                    return 0;
+            }
+            if (!transform_number(last, &turn, 1) || !rotate3d_op(axis[0], axis[1], axis[2], turn, op))
+                return 0;
+            *set = 1;
+            return 1;
+        }
         if (!angle || !transform_number(angle, &op->a, 1))
             return 0;
     } else {
@@ -4806,7 +5127,7 @@ static int individual_transform(int prop, const char *value, const struct vctx *
 
 static int individual_supported(int prop, const char *value)
 {
-    const struct vctx v = { 16, 16, 1024, 768, NULL, 0, 0 };
+    const struct vctx v = { 16, 16, 1024, 768, NULL, 0, 0, NULL };
     struct tfop op;
     int set;
     return individual_transform(prop, value, &v, &op, &set);
@@ -4828,7 +5149,307 @@ static void finish_transform(struct arena *a, struct style *st)
         xf->op[xf->n++] = st->xf_scale;
     for (int k = 0; st->xf && k < st->xf->n && xf->n < MAX_TFOPS; k++)
         xf->op[xf->n++] = st->xf->op[k];
+    for (int k = 0; k < xf->n; k++)
+        xf->flipped ^= xf->op[k].flip;
     st->xf = xf;
+}
+
+/* ---- filter, backdrop-filter, clip-path ---- */
+
+/* The functions of a value, one at a time: "name(args)"; 0 at the end, -1 if it is not that. */
+static int next_function(const char **pp, char *name, int nsize, const char **args, const char **args_end)
+{
+    const char *p = *pp;
+    while (isspace((unsigned char)*p))
+        p++;
+    if (!*p)
+        return 0;
+    const char *n = p;
+    while (isalnum((unsigned char)*p) || *p == '-')
+        p++;
+    if (*p != '(' || p == n || p - n >= nsize)
+        return -1;
+    snprintf(name, (size_t)nsize, "%.*s", (int)(p - n), n);
+    const char *close = skip_group(p, p + strlen(p));
+    if (close[-1] != ')')
+        return -1;
+    *args = p + 1, *args_end = close - 1;
+    *pp = close;
+    return 1;
+}
+
+/* An amount: "0.5", "50%" or nothing (def). */
+static int fx_amount(const char *a, const char *e, float def, float *out)
+{
+    char t[64];
+    while (a < e && isspace((unsigned char)*a))
+        a++;
+    while (e > a && isspace((unsigned char)e[-1]))
+        e--;
+    if (a == e) {
+        *out = def;
+        return 1;
+    }
+    if (e - a >= (int)sizeof(t))
+        return 0;
+    int pct = e[-1] == '%';
+    snprintf(t, sizeof(t), "%.*s", (int)(e - a - pct), a);
+    if (!transform_number(t, out, 0) || *out < 0)
+        return 0;
+    if (pct)
+        *out /= 100;
+    return 1;
+}
+
+/* drop-shadow(color? x y blur? color?) */
+static int fx_shadow(const char *a, const char *e, const struct vctx *v, struct fxop *op)
+{
+    char buf[256];
+    if (e - a >= (int)sizeof(buf))
+        return 0;
+    snprintf(buf, sizeof(buf), "%.*s", (int)(e - a), a);
+    const char *w[6];
+    int wl[6], n = words(buf, w, wl, 6), lens = 0;
+    op->color = 1;                              /* currentColor until the cascade knows it */
+    for (int i = 0; i < n; i++) {
+        char t[128];
+        snprintf(t, sizeof(t), "%.*s", wl[i], w[i]);
+        struct len l;
+        uint32_t c;
+        if (lens < 3 && length_value(t, v, &l) && l.unit == U_PX) {
+            int *slot[3] = { &op->dx, &op->dy, &op->blur };
+            *slot[lens++] = l.v;
+        } else if (css_parse_color(t, (int)strlen(t), &c) == 0) {
+            op->color = c;
+        } else {
+            return 0;
+        }
+    }
+    return lens >= 2 && op->blur >= 0;
+}
+
+/* filter: none, or blur() brightness() contrast() drop-shadow() grayscale() hue-rotate() invert()
+ * opacity() saturate() sepia(). url() filters are not drawn: the value is taken as none. */
+static int parse_filter(const char *value, const struct vctx *v, struct css_filter *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!strcasecmp(value, "none"))
+        return 1;
+    const char *p = value, *a, *e;
+    char fn[32];
+    int r;
+    while ((r = next_function(&p, fn, sizeof(fn), &a, &e)) > 0) {
+        if (out->n == MAX_FXOPS)
+            return 0;
+        struct fxop *op = &out->op[out->n];
+        memset(op, 0, sizeof(*op));
+        static const struct { const char *name; uint8_t kind; float def; } amounts[] = {
+            { "brightness", FX_BRIGHTNESS, 1 }, { "contrast", FX_CONTRAST, 1 }, { "grayscale", FX_GRAYSCALE, 1 },
+            { "invert", FX_INVERT, 1 }, { "opacity", FX_OPACITY, 1 }, { "saturate", FX_SATURATE, 1 },
+            { "sepia", FX_SEPIA, 1 },
+        };
+        int done = 0;
+        for (unsigned i = 0; i < sizeof(amounts) / sizeof(amounts[0]) && !done; i++)
+            if (!strcasecmp(fn, amounts[i].name)) {
+                op->kind = amounts[i].kind;
+                if (!fx_amount(a, e, amounts[i].def, &op->amount))
+                    return 0;
+                if (op->kind == FX_GRAYSCALE || op->kind == FX_INVERT || op->kind == FX_OPACITY || op->kind == FX_SEPIA)
+                    op->amount = op->amount > 1 ? 1 : op->amount;
+                done = 1;
+            }
+        if (done) {
+        } else if (!strcasecmp(fn, "blur")) {
+            char t[128];
+            struct len l = { 0, 0, U_PX };
+            snprintf(t, sizeof(t), "%.*s", (int)(e - a), a);
+            if (t[strspn(t, " ")] && (!length_value(t, v, &l) || l.unit != U_PX || l.v < 0))
+                return 0;
+            op->kind = FX_BLUR;
+            op->amount = (float)(l.v > 100 ? 100 : l.v);
+        } else if (!strcasecmp(fn, "hue-rotate")) {
+            char t[128];
+            snprintf(t, sizeof(t), "%.*s", (int)(e - a), a);
+            op->kind = FX_HUE;
+            if (t[strspn(t, " ")] && !transform_number(t + strspn(t, " "), &op->amount, 1))
+                return 0;
+        } else if (!strcasecmp(fn, "drop-shadow")) {
+            op->kind = FX_SHADOW;
+            if (!fx_shadow(a, e, v, op))
+                return 0;
+            if (op->blur > 100)
+                op->blur = 100;
+        } else {
+            return 0;
+        }
+        out->n++;
+    }
+    return r == 0;
+}
+
+/* One coordinate of a shape: a length, a percentage of the box, or a keyword for one. */
+static int clip_len(const char *s, int sl, const struct vctx *v, struct len *out)
+{
+    char t[128];
+    if (sl <= 0 || sl >= (int)sizeof(t))
+        return 0;
+    snprintf(t, sizeof(t), "%.*s", sl, s);
+    if (!strcasecmp(t, "left") || !strcasecmp(t, "top"))
+        return *out = (struct len){ 0, 0, U_PCT }, 1;
+    if (!strcasecmp(t, "center"))
+        return *out = (struct len){ 5000, 0, U_PCT }, 1;
+    if (!strcasecmp(t, "right") || !strcasecmp(t, "bottom"))
+        return *out = (struct len){ 10000, 0, U_PCT }, 1;
+    return length_value(t, v, out) && out->unit != U_AUTO;
+}
+
+/* "at x y" after a circle or ellipse: the centre (the box's by default). */
+static int clip_center(const char *at, const char *e, const struct vctx *v, struct css_clip *c)
+{
+    c->a[2] = c->a[3] = (struct len){ 5000, 0, U_PCT };
+    if (!at)
+        return 1;
+    const char *w[4];
+    int wl[4];
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%.*s", (int)(e - at - 2), at + 2);
+    int n = words(buf, w, wl, 4);
+    if (n == 1) {
+        if (!clip_len(w[0], wl[0], v, &c->a[2]))
+            return 0;
+        if (word_is(w[0], wl[0], "top") || word_is(w[0], wl[0], "bottom"))
+            c->a[3] = c->a[2], c->a[2] = (struct len){ 5000, 0, U_PCT };
+        return 1;
+    }
+    if (n != 2)
+        return 0;
+    int swap = word_is(w[0], wl[0], "top") || word_is(w[0], wl[0], "bottom") || word_is(w[1], wl[1], "left") ||
+               word_is(w[1], wl[1], "right");
+    return clip_len(w[swap], wl[swap], v, &c->a[2]) && clip_len(w[!swap], wl[!swap], v, &c->a[3]);
+}
+
+/* A radius: a length, closest-side or farthest-side. */
+static int clip_radius(const char *s, int sl, const struct vctx *v, struct len *out, uint8_t *side)
+{
+    *side = 0;
+    if (sl == 12 && !strncasecmp(s, "closest-side", 12))
+        return *side = 1, 1;
+    if (sl == 13 && !strncasecmp(s, "farthest-side", 13))
+        return *side = 2, 1;
+    return clip_len(s, sl, v, out);
+}
+
+/* clip-path: none, inset(), circle(), ellipse() or polygon(), with or without a box keyword. url()
+ * and path() shapes are not drawn: the value is taken as none. */
+static int parse_clip_path(const char *value, const struct vctx *v, struct css_clip *c)
+{
+    memset(c, 0, sizeof(*c));
+    const char *p = value, *a, *e;
+    char fn[32];
+    while (isspace((unsigned char)*p))
+        p++;
+    if (!strncasecmp(p, "none", 4))
+        return 1;
+    /* a box keyword alone, or before or after the shape (always the border box here) */
+    const char *paren = strchr(p, '(');
+    if (!paren)
+        return 1;
+    const char *fs = paren;
+    while (fs > p && (isalpha((unsigned char)fs[-1]) || fs[-1] == '-'))
+        fs--;
+    p = fs;
+    if (next_function(&p, fn, sizeof(fn), &a, &e) <= 0)
+        return 0;
+    char buf[1024];
+    if (e - a >= (int)sizeof(buf))
+        return 0;
+    snprintf(buf, sizeof(buf), "%.*s", (int)(e - a), a);
+    const char *w[8];
+    int wl[8], n;
+    if (!strcasecmp(fn, "inset")) {
+        c->kind = CLIP_INSET;
+        char *round = strstr(buf, "round");
+        if (round) {
+            *round = 0;
+            char r[128];
+            snprintf(r, sizeof(r), "%s", round + 5);
+            n = words(r, w, wl, 8);
+            if (n < 1 || !clip_len(w[0], wl[0], v, &c->round))
+                return 0;
+        }
+        n = words(buf, w, wl, 8);
+        if (n < 1 || n > 4)
+            return 0;
+        for (int i = 0; i < n; i++)
+            if (!clip_len(w[i], wl[i], v, &c->a[i]))
+                return 0;
+        if (n < 2) c->a[1] = c->a[0];
+        if (n < 3) c->a[2] = c->a[0];
+        if (n < 4) c->a[3] = c->a[1];
+        return 1;
+    }
+    if (!strcasecmp(fn, "circle") || !strcasecmp(fn, "ellipse")) {
+        int ellipse = fn[0] == 'e' || fn[0] == 'E';
+        c->kind = ellipse ? CLIP_ELLIPSE : CLIP_CIRCLE;
+        char *at = strstr(buf, "at ");
+        if (at && at != buf && !isspace((unsigned char)at[-1]))
+            at = NULL;
+        const char *end = buf + strlen(buf);
+        char radii[256];
+        snprintf(radii, sizeof(radii), "%.*s", (int)((at ? at : end) - buf), buf);
+        n = words(radii, w, wl, 8);
+        c->rx_side = c->ry_side = 1;            /* closest-side unless given */
+        if (n > (ellipse ? 2 : 1))
+            return 0;
+        if (n >= 1 && !clip_radius(w[0], wl[0], v, &c->a[0], &c->rx_side))
+            return 0;
+        if (ellipse && n == 2 && !clip_radius(w[1], wl[1], v, &c->a[1], &c->ry_side))
+            return 0;
+        if (ellipse && n == 1)
+            return 0;
+        return clip_center(at, end, v, c);
+    }
+    if (!strcasecmp(fn, "polygon")) {
+        c->kind = CLIP_POLYGON;
+        for (const char *q = buf; *q;) {
+            const char *comma = strchr(q, ',');
+            if (!comma)
+                comma = q + strlen(q);
+            char pt[256];
+            snprintf(pt, sizeof(pt), "%.*s", (int)(comma - q), q);
+            n = words(pt, w, wl, 8);
+            if (n == 1 && (word_is(w[0], wl[0], "nonzero") || word_is(w[0], wl[0], "evenodd"))) {
+            } else if (n != 2 || c->npts == MAX_CLIP_POINTS || !clip_len(w[0], wl[0], v, &c->px[c->npts]) ||
+                       !clip_len(w[1], wl[1], v, &c->py[c->npts])) {
+                return 0;
+            } else {
+                c->npts++;
+            }
+            q = *comma ? comma + 1 : comma;
+        }
+        return 1;                               /* under three points: nothing is left to see */
+    }
+    return 0;
+}
+
+static int effect_supported(int prop, const char *value)
+{
+    const struct vctx v = { 16, 16, 1024, 768, NULL, 0, 0, NULL };
+    struct css_filter f;
+    struct css_clip c;
+    if (prop != P_CLIP_PATH)
+        return parse_filter(value, &v, &f);
+    return parse_clip_path(value, &v, &c) && (c.kind || !strcasecmp(value, "none"));
+}
+
+static int blend_mode(const char *value)
+{
+    static const char *names[] = { "normal", "multiply", "screen", "overlay", "darken", "lighten", "color-dodge",
+                                   "color-burn", "hard-light", "soft-light", "difference", "exclusion" };
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        if (!strcasecmp(value, names[i]))
+            return (int)i;
+    return BL_NORMAL;                           /* hue, saturation, color, luminosity: drawn normally */
 }
 
 /* The transition and animation properties, kept as written until finish_motion. */
@@ -5432,6 +6053,74 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         } else if (individual_transform(prop, value, v, &op, &set)) {
             st->xf_ind = (uint8_t)(set ? st->xf_ind | bit : st->xf_ind & ~bit);
             *(prop == P_TRANSLATE ? &st->xf_translate : prop == P_ROTATE ? &st->xf_rotate : &st->xf_scale) = op;
+        }
+        break;
+    }
+    case P_BACKFACE:
+        st->backface_hidden = inherit_kw ? parent->backface_hidden : !strcasecmp(value, "hidden");
+        break;
+    case P_FILTER:
+    case P_BACKDROP: {
+        const struct css_filter **slot = prop == P_FILTER ? &st->filter : &st->backdrop;
+        struct css_filter f;
+        if (inherit_kw)
+            *slot = prop == P_FILTER ? parent->filter : parent->backdrop;
+        else if (initial_kw)
+            *slot = NULL;
+        else if (parse_filter(value, v, &f)) {
+            struct css_filter *kept = f.n && v->a ? arena_alloc(v->a, sizeof(*kept)) : NULL;
+            if (kept)
+                *kept = f;
+            *slot = kept;
+        }
+        break;
+    }
+    case P_CLIP_PATH: {
+        struct css_clip cp;
+        if (inherit_kw)
+            st->clip_path = parent->clip_path;
+        else if (initial_kw)
+            st->clip_path = NULL;
+        else if (parse_clip_path(value, v, &cp)) {
+            struct css_clip *kept = cp.kind && v->a ? arena_alloc(v->a, sizeof(*kept)) : NULL;
+            if (kept)
+                *kept = cp;
+            st->clip_path = kept;
+        }
+        break;
+    }
+    case P_BLEND:
+        st->blend = (uint8_t)(inherit_kw ? parent->blend : initial_kw ? BL_NORMAL : blend_mode(value));
+        break;
+    case P_CONTAINER:                           /* container: name / type */
+    case P_CONTAINER_NAME:
+    case P_CONTAINER_TYPE: {
+        if (inherit_kw) {
+            st->cq_type = parent->cq_type;
+            st->cq_name = parent->cq_name;
+            break;
+        }
+        const char *slash = prop == P_CONTAINER ? strchr(value, '/') : NULL;
+        const char *type = prop == P_CONTAINER_TYPE ? value : slash ? slash + 1 : prop == P_CONTAINER ? "normal" : NULL;
+        if (prop != P_CONTAINER_TYPE) {
+            int nl = (int)(slash ? slash - value : (int)strlen(value));
+            while (nl > 0 && isspace((unsigned char)value[nl - 1]))
+                nl--;
+            st->cq_name = NULL;
+            if (nl > 0 && !initial_kw && strncasecmp(value, "none", (size_t)nl) && v->a) {
+                char *name = arena_alloc(v->a, (size_t)nl + 1);
+                if (name) {
+                    memcpy(name, value, (size_t)nl);
+                    name[nl] = 0;
+                    st->cq_name = name;
+                }
+            }
+        }
+        if (type) {
+            while (isspace((unsigned char)*type))
+                type++;
+            st->cq_type = initial_kw ? CQ_NONE : !strncasecmp(type, "inline-size", 11) ? CQ_INLINE
+                        : !strncasecmp(type, "size", 4) ? CQ_SIZE : CQ_NONE;
         }
         break;
     }
@@ -6279,12 +6968,105 @@ static const char *lookup_var(const struct style *st, const char *name, int len)
     return NULL;
 }
 
-/* Expand var(--x, fallback) in value; returns 0 if a variable is missing. */
+/* Does value hold something substitute() puts in: var(), env() or image-set()? */
+static int substituted(const char *value)
+{
+    return strstr(value, "var(") || strstr(value, "env(") || strstr(value, "image-set(");
+}
+
+/* env(name, fallback): this screen has no notch, keyboard or title bar areas. */
+static int env_value(const char *args, const char *end, char *out, int size)
+{
+    while (args < end && isspace((unsigned char)*args))
+        args++;
+    const char *comma = find_top(args, end, ','), *ne = comma;
+    while (ne > args && isspace((unsigned char)ne[-1]))
+        ne--;
+    int nl = (int)(ne - args);
+    int known = (nl > 15 && !strncmp(args, "safe-area-inset", 15)) ||
+                (nl > 19 && !strncmp(args, "safe-area-max-inset", 19)) ||
+                (nl > 14 && !strncmp(args, "keyboard-inset", 14)) || (nl > 14 && !strncmp(args, "titlebar-area-", 14));
+    if (!known && comma < end) {
+        int fl = (int)(end - comma - 1);
+        if (fl >= size)
+            return 0;
+        memcpy(out, comma + 1, (size_t)fl);
+        out[fl] = 0;
+        return 1;
+    }
+    snprintf(out, (size_t)size, "0px");
+    return 1;
+}
+
+/* image-set("a.png" 1x, url(b.png) 2x, ...): the one for this screen, as url(); types we cannot
+ * decode are passed over. */
+static int image_set_value(const char *args, const char *end, char *out, int size)
+{
+    const char *best = NULL, *best_end = NULL;
+    int best_one_x = 0;
+    for (const char *p = args; p < end;) {
+        const char *comma = find_top(p, end, ','), *c = p;
+        while (c < comma && isspace((unsigned char)*c))
+            c++;
+        const char *ce = c;
+        if (ce < comma && (*ce == '"' || *ce == '\'')) {
+            char q = *ce++;
+            while (ce < comma && *ce != q)
+                ce += *ce == '\\' ? 2 : 1;
+            if (ce < comma)
+                ce++;
+        } else {
+            while (ce < comma && !isspace((unsigned char)*ce))
+                ce = *ce == '(' ? skip_group(ce, comma) : ce + 1;
+        }
+        /* what follows the image: its resolution and perhaps type("image/avif") */
+        char rest[128];
+        int rl = (int)(comma - ce) < 127 ? (int)(comma - ce) : 127;
+        for (int i = 0; i < rl; i++)
+            rest[i] = (char)tolower((unsigned char)ce[i]);
+        rest[rl] = 0;
+        const char *type = strstr(rest, "type(");
+        int decodable = !type || strstr(type, "png") || strstr(type, "jpeg") || strstr(type, "gif") ||
+                        strstr(type, "webp") || strstr(type, "svg");
+        const char *digit = strpbrk(rest, "0123456789.");
+        int one_x = !digit || strtod(digit, NULL) <= 1.0;
+        if (ce > c && decodable && (!best || (one_x && !best_one_x))) {
+            best = c, best_end = ce, best_one_x = one_x;
+            if (one_x)
+                break;
+        }
+        p = comma < end ? comma + 1 : end;
+    }
+    if (!best)
+        return 0;
+    int n = (int)(best_end - best);
+    if (*best == '"' || *best == '\'')
+        return snprintf(out, (size_t)size, "url(%.*s)", n, best) < size;
+    return snprintf(out, (size_t)size, "%.*s", n, best) < size;
+}
+
+/* Expand var(--x, fallback), env() and image-set() in value; returns 0 if a variable is missing. */
 static int substitute(const struct style *st, const char *value, char *out, int size, int depth)
 {
     int o = 0;
     const char *end = value + strlen(value);
     for (const char *p = value; p < end;) {
+        int env = !strncmp(p, "env(", 4), set = !strncmp(p, "image-set(", 10) || !strncmp(p, "-webkit-image-set(", 18);
+        if ((env || set) && (p == value || !is_ident_char(p[-1]) || p[-1] == '-')) {
+            const char *open = strchr(p, '('), *close = skip_group(open, end);
+            char inner[1024], done[1024];
+            if (!(env ? env_value(open + 1, close - 1, inner, sizeof(inner))
+                      : image_set_value(open + 1, close - 1, inner, sizeof(inner))) ||
+                depth > 8 || !substitute(st, inner, done, sizeof(done), depth + 1))
+                return 0;
+            int il = (int)strlen(done);
+            if (o + il >= size)
+                return 0;
+            memcpy(out + o, done, (size_t)il);
+            o += il;
+            p = close;
+            continue;
+        }
         if (!strncmp(p, "var(", 4)) {
             const char *close = skip_group(p + 3, end);
             const char *args = p + 4, *args_end = close - 1;
@@ -6642,7 +7424,7 @@ static void match_list(struct collect *c, const struct sheet *sh, const struct r
             if (i < sel->nanc)
                 continue;
         }
-        if (match_from(sel, sel->nparts - 1, n, c->mc))
+        if (match_from(sel, sel->nparts - 1, n, c->mc) && (!r->cq || cq_matches(r->cq, (struct node *)n, sel->pe)))
             add_decls(c, r->decls, r->ndecls, rank, sel->spec,
                       sheet_order + (uint32_t)ref->rule * 256, sel->pe,
                       r->layer ? r->layer->canonical->order : 0x7fffffff);
@@ -6658,7 +7440,7 @@ static void match_sheet(struct collect *c, const struct sheet *sh, const struct 
             for (int j = 0; j < r->nsels; j++) {
                 const struct selector *sel = &r->sels[j];
                 if (n == c->mc->slotted && !sel->parts[sel->nparts-1].nslot) continue;
-                if (match_from(sel, sel->nparts-1, n, c->mc))
+                if (match_from(sel, sel->nparts-1, n, c->mc) && (!r->cq || cq_matches(r->cq, (struct node *)n, sel->pe)))
                     add_decls(c,r->decls,r->ndecls,rank,sel->spec,sheet_order+(uint32_t)i*256,sel->pe,
                               r->layer ? r->layer->canonical->order : 0x7fffffff);
             }
@@ -6823,6 +7605,12 @@ static void restore_property(struct style *st, const struct style *src, int prop
     case P_CURSOR: COPY(cursor); break;
     case P_POINTER_EVENTS: COPY(pointer_none); break;
     case P_USER_SELECT: COPY(select_none); break;
+    case P_BACKFACE: COPY(backface_hidden); break;
+    case P_FILTER: COPY(filter); break;
+    case P_BACKDROP: COPY(backdrop); break;
+    case P_CLIP_PATH: COPY(clip_path); break;
+    case P_BLEND: COPY(blend); break;
+    case P_CONTAINER: case P_CONTAINER_NAME: case P_CONTAINER_TYPE: COPY(cq_type); COPY(cq_name); break;
     case P_OUTLINE: COPY(outline_style); COPY(outline_w); COPY(outline_color); break;
     case P_OUTLINE_STYLE: COPY(outline_style); break;
     case P_OUTLINE_WIDTH: COPY(outline_w); break;
@@ -6962,7 +7750,7 @@ static void apply_match(struct style *st, const struct style *parent, const stru
         if (match_origin(m) == r->origin && m->scope == r->scope && (r->layer < 0 || m->layer == r->layer)) return;
     const char *value = d->value;
     char expanded[1024];
-    if (strstr(value, "var(")) {
+    if (substituted(value)) {
         if (!substitute(st, value, expanded, sizeof(expanded), 0)) return;
         value = expanded;
     }
@@ -7061,7 +7849,7 @@ static void kf_apply(void *ctx, const struct kframe *f, struct style *st)
             continue;
         const char *value = d[i].value;
         char expanded[1024];
-        if (strstr(value, "var(")) {
+        if (substituted(value)) {
             if (!substitute(st, value, expanded, sizeof(expanded), 0))
                 continue;
             value = expanded;
@@ -7146,7 +7934,7 @@ static int compute(struct arena *a, struct node *n, const struct style *parent,
         cp->value = custom_cascade_value(&c, i, parent, NULL);
         if (!cp->value) cp->value = "";
         /* var() inside a custom property refers to the inherited values. */
-        if (strstr(cp->value, "var(")) {
+        if (substituted(cp->value)) {
             char buf2[1024];
             if (substitute(st, cp->value, buf2, sizeof(buf2), 0))
                 cp->value = arena_strdup(a, buf2);
@@ -7155,8 +7943,20 @@ static int compute(struct arena *a, struct node *n, const struct style *parent,
         st->vars = cp;
     }
 
+    if (!n->parent)                     /* @property initial values: there unless something sets them */
+        for (int i = 0; i < nsheets; i++)
+            for (const struct custom_prop *r = sheets[i] ? sheets[i]->registered : NULL; r; r = r->next) {
+                struct custom_prop *cp;
+                if (!lookup_var(st, r->name, (int)strlen(r->name)) && (cp = arena_alloc(a, sizeof(*cp)))) {
+                    *cp = *r;
+                    cp->next = st->vars;
+                    st->vars = cp;
+                }
+            }
+
     struct vctx v = *base;
     v.a = a;
+    v.cq_from = n->parent;
     /* Pass 2: font-size, which em units in everything else depend on. Pass 3: the rest. */
     int author_color = 0;
     int rollback_budget = 8192;
@@ -7249,6 +8049,20 @@ static int compute(struct arena *a, struct node *n, const struct style *parent,
         st->font_size = 200;
     finish_background(st, parent, &v);
     finish_transform(a, st);
+    if (st->filter) {                           /* drop-shadow() with no color: the text color */
+        struct css_filter *f = NULL;
+        for (int i = 0; i < st->filter->n; i++)
+            if (st->filter->op[i].kind == FX_SHADOW && st->filter->op[i].color == 1) {
+                if (!f && (f = arena_alloc(a, sizeof(*f))))
+                    *f = *st->filter;
+                if (f)
+                    f->op[i].color = st->color;
+            }
+        if (f)
+            st->filter = f;
+    }
+    if (st->backface_hidden && st->xf && st->xf->flipped)      /* turned away from the viewer */
+        st->hidden = 1;
     st->font = wfont_get(st->family, st->bold, st->italic, st->font_size);
     if (st->line_clamp && st->max_height.unit == U_AUTO) {         /* -webkit-line-clamp: that many lines, the rest cut off */
         int lh = st->lh_kind == LH_PX ? st->lh : st->lh_kind == LH_FACTOR ? st->font_size * st->lh / 100
@@ -7748,7 +8562,8 @@ void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int 
     for (int i = 0; i < 4; i++)
         initial_style.border_w[i] = ZOOM(3);
     initial_style.outline_w = ZOOM(3);
-    struct vctx v = { ZOOM(16), ZOOM(16), viewport_w, viewport_h, a, 0, 0 };
+    cq_guess_w = viewport_w, cq_guess_h = viewport_h;
+    struct vctx v = { ZOOM(16), ZOOM(16), viewport_w, viewport_h, a, 0, 0, NULL };
     struct mctx mc = { .visited = visited, .ctx = ctx, .quirks = root->quirks };
     struct match *buf = malloc(sizeof(struct match) * MAX_MATCHES);
     struct bloom *bloom = calloc(1, sizeof(*bloom));
@@ -7807,7 +8622,8 @@ int css_restyle_dynamic(struct arena *a, struct node *root, struct sheet **sheet
         for (struct node *n = (struct node *)rec->state[i]; n; n = n->parent)
             n->dgen = gen;
     }
-    struct vctx v = { ZOOM(16), root->style->font_size, viewport_w, viewport_h, a, 0, 0 };
+    cq_guess_w = viewport_w, cq_guess_h = viewport_h;
+    struct vctx v = { ZOOM(16), root->style->font_size, viewport_w, viewport_h, a, 0, 0, NULL };
     struct mctx mc = { .visited = visited, .ctx = ctx, .quirks = root->quirks };
     struct match *buf = malloc(sizeof(struct match) * MAX_MATCHES);
     struct bloom *bloom = calloc(1, sizeof(*bloom));
@@ -7838,7 +8654,8 @@ int css_restyle_animated(struct arena *a, struct node *root, struct sheet **shee
         gen = 0x80000000u;
     if (!anim_mark(root, gen))
         return 0;
-    struct vctx v = { ZOOM(16), root->style->font_size, viewport_w, viewport_h, a, 0, 0 };
+    cq_guess_w = viewport_w, cq_guess_h = viewport_h;
+    struct vctx v = { ZOOM(16), root->style->font_size, viewport_w, viewport_h, a, 0, 0, NULL };
     struct mctx mc = { .visited = visited, .ctx = ctx, .quirks = root->quirks };
     struct match *buf = malloc(sizeof(struct match) * MAX_MATCHES);
     struct bloom *bloom = calloc(1, sizeof(*bloom));

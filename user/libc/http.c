@@ -1836,7 +1836,7 @@ static int one_request(struct http_client *cl, const struct http_request *rq, co
     }
 
     /* The request: its header lines, then those as HTTP/1.1 or HTTP/2 sends them. */
-    char lines[8192];
+    char lines[16384];                  /* cookies, a referrer and the fetch metadata fit */
     char hosthdr[300];
     if (u.port == (u.https ? 443 : 80))
         snprintf(hosthdr, sizeof(hosthdr), "%s", u.host);
@@ -1844,33 +1844,38 @@ static int one_request(struct http_client *cl, const struct http_request *rq, co
         snprintf(hosthdr, sizeof(hosthdr), "%s:%d", u.host, u.port);
     char *req = lines;
     int n = 0;
+    /* each line whole or not at all, so n never runs past the buffer */
+#define ADD_LINE(...) do { \
+        int k_ = snprintf(req + n, sizeof(lines) - (size_t)n, __VA_ARGS__); \
+        if (k_ > 0 && k_ < (int)sizeof(lines) - n) n += k_; else req[n] = 0; \
+    } while (0)
     if (!has_request_header(rq, "User-Agent"))
-        n += snprintf(req + n, sizeof(lines) - (size_t)n, "User-Agent: %s\r\n", USER_AGENT);
+        ADD_LINE("User-Agent: %s\r\n", USER_AGENT);
     if (!has_request_header(rq, "Accept"))
-        n += snprintf(req + n, sizeof(lines) - (size_t)n, "Accept: %s\r\n", ACCEPT_DEFAULT);
+        ADD_LINE("Accept: %s\r\n", ACCEPT_DEFAULT);
     if (!has_request_header(rq, "Accept-Encoding"))
-        n += snprintf(req + n, sizeof(lines) - (size_t)n, "Accept-Encoding: %s\r\n",
-                      (rq->flags & HTTP_IDENTITY) ? "identity" : "gzip, deflate, br");
+        ADD_LINE("Accept-Encoding: %s\r\n", (rq->flags & HTTP_IDENTITY) ? "identity" : "gzip, deflate, br");
     for (int i = 0; i < rq->nheaders && n < (int)sizeof(lines) - 1200; i++)
-        n += snprintf(req + n, sizeof(lines) - (size_t)n, "%s\r\n", rq->headers[i]);
-    if (have && ent.etag[0] && n < (int)sizeof(lines) - 500)
-        n += snprintf(req + n, sizeof(lines) - (size_t)n, "If-None-Match: %s\r\n", ent.etag);
-    if (have && ent.last_modified[0] && n < (int)sizeof(lines) - 300)
-        n += snprintf(req + n, sizeof(lines) - (size_t)n, "If-Modified-Since: %s\r\n", ent.last_modified);
+        ADD_LINE("%s\r\n", rq->headers[i]);
+    if (have && ent.etag[0])
+        ADD_LINE("If-None-Match: %s\r\n", ent.etag);
+    if (have && ent.last_modified[0])
+        ADD_LINE("If-Modified-Since: %s\r\n", ent.last_modified);
     if (body || !strcmp(method, "POST") || !strcmp(method, "PUT")) {
         if (!has_request_header(rq, "Content-Type") && body)
-            n += snprintf(req + n, sizeof(lines) - (size_t)n, "Content-Type: application/x-www-form-urlencoded\r\n");
-        n += snprintf(req + n, sizeof(lines) - (size_t)n, "Content-Length: %u\r\n", (unsigned)blen);
+            ADD_LINE("Content-Type: application/x-www-form-urlencoded\r\n");
+        ADD_LINE("Content-Length: %u\r\n", (unsigned)blen);
     }
+#undef ADD_LINE
     if (n > (int)sizeof(lines) - 4)
         n = (int)sizeof(lines) - 4;
     lines[n] = 0;
-    char h1[8192 + 2400];
+    char h1[16384 + 2400];
     n = snprintf(h1, sizeof(h1), "%s %s HTTP/1.1\r\nHost: %s\r\n%sConnection: keep-alive\r\n\r\n", method,
                  u.path, hosthdr, lines);
     if (n >= (int)sizeof(h1))
         n = (int)sizeof(h1) - 1;
-    uint8_t h2block[12288];
+    uint8_t h2block[20480];
     size_t h2len = h2_head(h2block, sizeof(h2block), method, &u, hosthdr, lines);
 
     /* Send it and read the head, on a connection that was idle if there is one. */
