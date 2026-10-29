@@ -87,20 +87,25 @@ static int copy_str(char *dst, const char *src, uint32_t max)
 
 static struct file *get_file(uint32_t fd)
 {
-    return fd < MAX_FDS ? current->fds[fd] : NULL;
+    return fd < MAX_FDS ? current->leader->fds[fd] : NULL;
 }
 
+/* (The descriptor table is the process's: its threads take and free slots under fd_lock.) */
 static int alloc_fd_from(struct file *f, int min_fd, int cloexec)
 {
     if (min_fd < 0 || min_fd >= MAX_FDS)
         return -EINVAL;
+    struct proc *g = current->leader;
+    spin_lock(&g->fd_lock);
     for (int i = min_fd; i < MAX_FDS; i++) {
-        if (!current->fds[i]) {
-            current->fds[i] = f;
-            fd_cloexec_set(current, i, cloexec);
+        if (!g->fds[i]) {
+            g->fds[i] = f;
+            fd_cloexec_set(g, i, cloexec);
+            spin_unlock(&g->fd_lock);
             return i;
         }
     }
+    spin_unlock(&g->fd_lock);
     return -EMFILE;
 }
 
@@ -197,13 +202,59 @@ static int sys_waitpid(uint32_t pid, uint32_t ustatus, uint32_t options, uint32_
 static int sys_getpid(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)a; (void)b; (void)c; (void)d; (void)e;
-    return current->pid;
+    return current->leader->pid;        /* the process's; a thread's own is gettid()'s */
 }
 
 static int sys_getppid(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)a; (void)b; (void)c; (void)d; (void)e;
-    return current->ppid;
+    return current->leader->ppid;
+}
+
+/* ---- threads ---- */
+
+static int sys_thread_create(uint32_t entry, uint32_t stack, uint32_t tls, uint32_t clear_tid, uint32_t e)
+{
+    (void)e;
+    return thread_create(entry, stack, tls, clear_tid);
+}
+
+static int sys_thread_exit(uint32_t addr, uint32_t len, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    thread_exit(addr, len);
+}
+
+static int sys_futex(uint32_t addr, uint32_t op, uint32_t val, uint32_t timeout_ms, uint32_t e)
+{
+    (void)e;
+    if (op == FUTEX_WAIT)
+        return futex_wait(addr, val, (int)timeout_ms);
+    if (op == FUTEX_WAKE)
+        return futex_wake(addr, (int)val);
+    return -EINVAL;
+}
+
+static int sys_set_tls(uint32_t base, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)b; (void)c; (void)d; (void)e;
+    uint32_t flags = irq_save();        /* the processor whose segment this is stays this one */
+    current->tls = base;
+    gdt_set_tls(base);
+    irq_restore(flags);
+    return SEG_USER_TLS;
+}
+
+static int sys_gettid(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)a; (void)b; (void)c; (void)d; (void)e;
+    return current->pid;
+}
+
+static int sys_tkill(uint32_t tid, uint32_t sig, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    return do_tkill((int)tid, (int)sig);
 }
 
 static int sys_kill(uint32_t pid, uint32_t sig, uint32_t c, uint32_t d, uint32_t e)
@@ -212,12 +263,21 @@ static int sys_kill(uint32_t pid, uint32_t sig, uint32_t c, uint32_t d, uint32_t
     return do_kill((int)pid, (int)sig);
 }
 
+static int sbrk_locked(struct proc *p, int32_t delta);
+
 static int sys_sbrk(uint32_t incr, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)b; (void)c; (void)d; (void)e;
     struct proc *p = current;
-    uint32_t old = p->brk;
-    int32_t delta = (int32_t)incr;
+    mutex_lock(&p->leader->mm_lock);
+    int r = sbrk_locked(p, (int32_t)incr);
+    mutex_unlock(&p->leader->mm_lock);
+    return r;
+}
+
+static int sbrk_locked(struct proc *p, int32_t delta)
+{
+    uint32_t old = p->leader->brk;
     uint32_t nbrk = old + (uint32_t)delta;
 
     if (delta > 0) {
@@ -231,15 +291,15 @@ static int sys_sbrk(uint32_t incr, uint32_t b, uint32_t c, uint32_t d, uint32_t 
             }
         }
     } else if (delta < 0) {
-        if (nbrk < p->heap_start || nbrk > old)
+        if (nbrk < p->leader->heap_start || nbrk > old)
             return -EINVAL;
         /* Pages lent to the GPU stay until they are taken back (DISP_UNMAPBUF). */
-        if (fb_pinned(p->pid, ALIGN_UP(nbrk, PAGE_SIZE), ALIGN_UP(old, PAGE_SIZE)))
+        if (fb_pinned(p->leader->pid, ALIGN_UP(nbrk, PAGE_SIZE), ALIGN_UP(old, PAGE_SIZE)))
             return -EBUSY;
         for (uint32_t va = ALIGN_UP(nbrk, PAGE_SIZE); va < ALIGN_UP(old, PAGE_SIZE); va += PAGE_SIZE)
             vmm_free_page(p->pd, va);
     }
-    p->brk = nbrk;
+    p->leader->brk = nbrk;
     return (int)old;
 }
 
@@ -266,17 +326,17 @@ static int sys_signal(uint32_t sig, uint32_t disp, uint32_t c, uint32_t d, uint3
     struct proc *p = current;
     /* Serialize the disposition and pending-bit update with signal_locked(). */
     spin_lock(&sched_lock);
-    int old = (int)p->sig_actions[sig].fsa_handler;
-    if (p->sig_ignored & bit)
+    int old = (int)p->leader->sig_actions[sig].fsa_handler;
+    if (p->leader->sig_ignored & bit)
         old = SIGDISP_IGN;
-    p->sig_actions[sig].fsa_handler = disp;
-    p->sig_actions[sig].fsa_flags = 0;
-    p->sig_actions[sig].fsa_mask = 0;
+    p->leader->sig_actions[sig].fsa_handler = disp;
+    p->leader->sig_actions[sig].fsa_flags = 0;
+    p->leader->sig_actions[sig].fsa_mask = 0;
     if (disp == SIGDISP_IGN) {
-        __atomic_or_fetch(&p->sig_ignored, bit, __ATOMIC_RELAXED);
+        __atomic_or_fetch(&p->leader->sig_ignored, bit, __ATOMIC_RELAXED);
         __atomic_and_fetch(&p->sig_pending, ~bit, __ATOMIC_RELAXED);
     } else {
-        __atomic_and_fetch(&p->sig_ignored, ~bit, __ATOMIC_RELAXED);
+        __atomic_and_fetch(&p->leader->sig_ignored, ~bit, __ATOMIC_RELAXED);
         if (disp == SIGDISP_DFL &&
             (sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT))
             __atomic_and_fetch(&p->sig_pending, ~bit, __ATOMIC_RELAXED);
@@ -306,17 +366,17 @@ static int sys_sigaction(uint32_t sig, uint32_t uact, uint32_t uoact, uint32_t d
     struct proc *p = current;
     uint32_t bit = 1u << sig;
     spin_lock(&sched_lock);
-    struct flux_sigaction old = p->sig_actions[sig];
-    if (p->sig_ignored & bit)
+    struct flux_sigaction old = p->leader->sig_actions[sig];
+    if (p->leader->sig_ignored & bit)
         old.fsa_handler = SIGDISP_IGN;
     if (uact) {
         act.fsa_mask &= ~((1u << SIGKILL) | (1u << SIGSTOP));
-        p->sig_actions[sig] = act;
+        p->leader->sig_actions[sig] = act;
         if (act.fsa_handler == SIGDISP_IGN) {
-            __atomic_or_fetch(&p->sig_ignored, bit, __ATOMIC_RELAXED);
+            __atomic_or_fetch(&p->leader->sig_ignored, bit, __ATOMIC_RELAXED);
             __atomic_and_fetch(&p->sig_pending, ~bit, __ATOMIC_RELAXED);
         } else {
-            __atomic_and_fetch(&p->sig_ignored, ~bit, __ATOMIC_RELAXED);
+            __atomic_and_fetch(&p->leader->sig_ignored, ~bit, __ATOMIC_RELAXED);
             if (act.fsa_handler == SIGDISP_DFL &&
                 (sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT))
                 __atomic_and_fetch(&p->sig_pending, ~bit, __ATOMIC_RELAXED);
@@ -360,7 +420,7 @@ static int sys_sigprocmask(uint32_t how, uint32_t uset, uint32_t uoset, uint32_t
 /* A selector a process may hold in DS, ES, FS or GS (or none). */
 static int data_seg_ok(uint32_t sel)
 {
-    return sel == SEG_UDATA || sel == SEG_WDATA || sel == SEG_WFS || sel == 0;
+    return sel == SEG_UDATA || sel == SEG_WDATA || sel == SEG_WFS || sel == SEG_USER_TLS || sel == 0;
 }
 
 static int sys_sigreturn(uint32_t uctx, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
@@ -568,17 +628,17 @@ static int sys_open(uint32_t upath, uint32_t flags, uint32_t mode, uint32_t d, u
     (void)d; (void)e;
     COPY_PATH(path, upath);
     struct vnode *vn;
-    int r = vfs_resolve(path, current->cwd, &vn);
+    int r = vfs_resolve(path, current->leader->cwd, &vn);
 
     if (r == -ENOENT && (flags & O_CREAT)) {
         struct vnode *dir;
         char name[NAME_MAX + 1];
-        r = vfs_resolve_parent(path, current->cwd, &dir, name);
+        r = vfs_resolve_parent(path, current->leader->cwd, &dir, name);
         if (r == 0) {
             r = vfs_create(dir, name, VN_FILE, &vn);
             if (r == 0 && vn) {
                 uint32_t m = mode ? (mode & 07777) : 0666;
-                vn->mode = (m & ~(current->umask & 0777)) | (m & 07000);
+                vn->mode = (m & ~(current->leader->umask & 0777)) | (m & 07000);
             }
         }
     } else if (r == 0 && (flags & O_CREAT) && (flags & O_EXCL)) {
@@ -615,11 +675,17 @@ static int sys_open(uint32_t upath, uint32_t flags, uint32_t mode, uint32_t d, u
 static int sys_close(uint32_t fd, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)b; (void)c; (void)d; (void)e;
-    struct file *f = get_file(fd);
+    struct proc *g = current->leader;
+    if (fd >= MAX_FDS)
+        return -EBADF;
+    spin_lock(&g->fd_lock);
+    struct file *f = g->fds[fd];
+    g->fds[fd] = NULL;
+    if (f)
+        fd_cloexec_set(g, (int)fd, 0);
+    spin_unlock(&g->fd_lock);
     if (!f)
         return -EBADF;
-    current->fds[fd] = NULL;
-    fd_cloexec_set(current, (int)fd, 0);
     file_close(f);
     return 0;
 }
@@ -644,9 +710,13 @@ static int sys_dup2(uint32_t oldfd, uint32_t newfd, uint32_t c, uint32_t d, uint
         return -EBADF;
     if (oldfd == newfd)
         return (int)newfd;
-    struct file *prev = current->fds[newfd];
-    current->fds[newfd] = file_dup(f);
-    fd_cloexec_set(current, (int)newfd, 0);
+    struct proc *g = current->leader;
+    struct file *nf = file_dup(f);
+    spin_lock(&g->fd_lock);
+    struct file *prev = g->fds[newfd];
+    g->fds[newfd] = nf;
+    fd_cloexec_set(g, (int)newfd, 0);
+    spin_unlock(&g->fd_lock);
     if (prev)
         file_close(prev);
     return (int)newfd;
@@ -696,9 +766,9 @@ static int sys_pipe(uint32_t ufds, uint32_t b, uint32_t c, uint32_t d, uint32_t 
     int r2 = fd1 < 0 ? -EMFILE : copy_to_user((void *)ufds, fds, sizeof(fds));
     if (r2 < 0) {
         if (fd0 >= 0)
-            current->fds[fd0] = NULL;
+            current->leader->fds[fd0] = NULL;
         if (fd1 >= 0)
-            current->fds[fd1] = NULL;
+            current->leader->fds[fd1] = NULL;
         file_close(rd);
         file_close(wr);
         return r2;
@@ -721,9 +791,9 @@ static int sys_openpty(uint32_t ufds, uint32_t b, uint32_t c, uint32_t d, uint32
     int r2 = fd1 < 0 ? -EMFILE : copy_to_user((void *)ufds, fds, sizeof(fds));
     if (r2 < 0) {
         if (fd0 >= 0)
-            current->fds[fd0] = NULL;
+            current->leader->fds[fd0] = NULL;
         if (fd1 >= 0)
-            current->fds[fd1] = NULL;
+            current->leader->fds[fd1] = NULL;
         file_close(master);
         file_close(slave);
         return r2;
@@ -823,7 +893,7 @@ static int sys_stat(uint32_t upath, uint32_t ust, uint32_t c, uint32_t d, uint32
     if (user_check_w((void *)ust, sizeof(struct stat)) < 0)
         return -EFAULT;
     struct vnode *vn;
-    int r = vfs_resolve(path, current->cwd, &vn);
+    int r = vfs_resolve(path, current->leader->cwd, &vn);
     if (r < 0)
         return r;
     struct stat st;
@@ -860,14 +930,14 @@ static int sys_chdir(uint32_t upath, uint32_t b, uint32_t c, uint32_t d, uint32_
     (void)b; (void)c; (void)d; (void)e;
     COPY_PATH(path, upath);
     struct vnode *vn;
-    int r = vfs_resolve(path, current->cwd, &vn);
+    int r = vfs_resolve(path, current->leader->cwd, &vn);
     if (r < 0)
         return r;
     if (vn->type != VN_DIR)
         return -ENOTDIR;
     vfs_ref(vn);
-    vfs_unref(current->cwd);
-    current->cwd = vn;
+    vfs_unref(current->leader->cwd);
+    current->leader->cwd = vn;
     return 0;
 }
 
@@ -881,8 +951,8 @@ static int sys_fchdir(uint32_t fd, uint32_t b, uint32_t c, uint32_t d, uint32_t 
     if (!vn || vn->type != VN_DIR)
         return -ENOTDIR;
     vfs_ref(vn);
-    vfs_unref(current->cwd);
-    current->cwd = vn;
+    vfs_unref(current->leader->cwd);
+    current->leader->cwd = vn;
     return 0;
 }
 
@@ -890,7 +960,7 @@ static int sys_getcwd(uint32_t ubuf, uint32_t size, uint32_t c, uint32_t d, uint
 {
     (void)c; (void)d; (void)e;
     char path[PATH_MAX];
-    int r = vfs_getpath(current->cwd, path, sizeof(path));
+    int r = vfs_getpath(current->leader->cwd, path, sizeof(path));
     if (r < 0)
         return r;
     uint32_t len = strlen(path) + 1;
@@ -926,12 +996,12 @@ static int sys_mkdir(uint32_t upath, uint32_t mode, uint32_t c, uint32_t d, uint
 {
     (void)c; (void)d; (void)e;
     COPY_PATH(path, upath);
-    int r = vfs_mkdir(path, current->cwd);
+    int r = vfs_mkdir(path, current->leader->cwd);
     if (r == 0) {
         struct vnode *vn;
-        if (vfs_resolve(path, current->cwd, &vn) == 0 && vn) {
+        if (vfs_resolve(path, current->leader->cwd, &vn) == 0 && vn) {
             uint32_t m = mode ? (mode & 07777) : 0777;
-            vn->mode = (m & ~(current->umask & 0777)) | (m & 07000);
+            vn->mode = (m & ~(current->leader->umask & 0777)) | (m & 07000);
         }
     }
     return r;
@@ -941,14 +1011,14 @@ static int sys_rmdir(uint32_t upath, uint32_t b, uint32_t c, uint32_t d, uint32_
 {
     (void)b; (void)c; (void)d; (void)e;
     COPY_PATH(path, upath);
-    return vfs_rmdir(path, current->cwd);
+    return vfs_rmdir(path, current->leader->cwd);
 }
 
 static int sys_unlink(uint32_t upath, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)b; (void)c; (void)d; (void)e;
     COPY_PATH(path, upath);
-    return vfs_unlink(path, current->cwd);
+    return vfs_unlink(path, current->leader->cwd);
 }
 
 static int sys_rename(uint32_t ufrom, uint32_t uto, uint32_t c, uint32_t d, uint32_t e)
@@ -956,7 +1026,7 @@ static int sys_rename(uint32_t ufrom, uint32_t uto, uint32_t c, uint32_t d, uint
     (void)c; (void)d; (void)e;
     COPY_PATH(from, ufrom);
     COPY_PATH(to, uto);
-    return vfs_rename(from, to, current->cwd);
+    return vfs_rename(from, to, current->leader->cwd);
 }
 
 static int sys_chmod(uint32_t upath, uint32_t mode, uint32_t c, uint32_t d, uint32_t e)
@@ -964,7 +1034,7 @@ static int sys_chmod(uint32_t upath, uint32_t mode, uint32_t c, uint32_t d, uint
     (void)c; (void)d; (void)e;
     COPY_PATH(path, upath);
     struct vnode *vn;
-    int r = vfs_resolve(path, current->cwd, &vn);
+    int r = vfs_resolve(path, current->leader->cwd, &vn);
     if (r < 0)
         return r;
     if (vn->fs && vn->fs->readonly)
@@ -991,8 +1061,8 @@ static int sys_fchmod(uint32_t fd, uint32_t mode, uint32_t c, uint32_t d, uint32
 static int sys_umask(uint32_t mask, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)b; (void)c; (void)d; (void)e;
-    uint32_t old = current->umask;
-    current->umask = mask & 0777;
+    uint32_t old = current->leader->umask;
+    current->leader->umask = mask & 0777;
     return (int)old;
 }
 
@@ -1007,7 +1077,7 @@ static int sys_utime(uint32_t upath, uint32_t utimes, uint32_t c, uint32_t d, ui
             return -EFAULT;
         mtime = tb.modtime;
     }
-    return vfs_utime(path, current->cwd, mtime);
+    return vfs_utime(path, current->leader->cwd, mtime);
 }
 
 static int sys_times(uint32_t ubuf, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
@@ -1200,14 +1270,14 @@ static int sys_mount(uint32_t usrc, uint32_t utarget, uint32_t utype, uint32_t d
     char type[16] = "auto";
     if (utype && copy_str(type, (const char *)utype, sizeof(type)) < 0)
         return -EINVAL;
-    return vfs_mount(src, target, type, current->cwd);
+    return vfs_mount(src, target, type, current->leader->cwd);
 }
 
 static int sys_umount(uint32_t utarget, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)b; (void)c; (void)d; (void)e;
     COPY_PATH(target, utarget);
-    return vfs_umount(target, current->cwd);
+    return vfs_umount(target, current->leader->cwd);
 }
 
 static int sys_statfs(uint32_t upath, uint32_t ubuf, uint32_t c, uint32_t d, uint32_t e)
@@ -1217,7 +1287,7 @@ static int sys_statfs(uint32_t upath, uint32_t ubuf, uint32_t c, uint32_t d, uin
     if (user_check_w((void *)ubuf, sizeof(struct statfs)) < 0)
         return -EFAULT;
     struct vnode *vn;
-    int r = vfs_resolve(path, current->cwd, &vn);
+    int r = vfs_resolve(path, current->leader->cwd, &vn);
     if (r < 0)
         return r;
     struct statfs st;
@@ -1355,7 +1425,7 @@ static int sys_blkrescan(uint32_t upath, uint32_t b, uint32_t c, uint32_t d, uin
     (void)b; (void)c; (void)d; (void)e;
     COPY_PATH(path, upath);
     struct vnode *vn;
-    int r = vfs_resolve(path, current->cwd, &vn);
+    int r = vfs_resolve(path, current->leader->cwd, &vn);
     if (r < 0)
         return r;
     struct blockdev *bd = blk_by_vnode(vn);
@@ -1506,6 +1576,12 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_chdir] = sys_chdir,
     [SYS_time] = sys_time,
     [SYS_getpid] = sys_getpid,
+    [SYS_thread_create] = sys_thread_create,
+    [SYS_thread_exit] = sys_thread_exit,
+    [SYS_futex] = sys_futex,
+    [SYS_set_tls] = sys_set_tls,
+    [SYS_gettid] = sys_gettid,
+    [SYS_tkill] = sys_tkill,
     [SYS_getppid] = sys_getppid,
     [SYS_kill] = sys_kill,
     [SYS_mkdir] = sys_mkdir,

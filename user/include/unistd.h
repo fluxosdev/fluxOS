@@ -107,6 +107,7 @@ char *ttyname(int fd);
 int ttyname_r(int fd, char *buf, size_t size);
 
 pid_t getpid(void);
+pid_t gettid(void);                     /* the calling thread's id */
 pid_t getppid(void);
 uid_t getuid(void);
 uid_t geteuid(void);

@@ -807,7 +807,7 @@ static int run_ops(const uint32_t *ops, uint32_t n)
         }
     }
     if (why) {
-        klog("intel: pid %d (%s): 3D operations refused at dword %u of %u: %s\n", current->pid,
+        klog("intel: pid %d (%s): 3D operations refused at dword %u of %u: %s\n", current->leader->pid,
              current->name, i, n, why);
         return -EINVAL;
     }
@@ -1008,7 +1008,7 @@ int intel_map3d(struct disp3d *d)
 {
     if (!r3.ok)
         return -ENODEV;
-    if (r3.owner && r3.owner != current->pid) {
+    if (r3.owner && r3.owner != current->leader->pid) {
         struct proc *p = proc_find(r3.owner);
         if (p && p->state != P_ZOMBIE)
             return -EBUSY;
@@ -1025,14 +1025,14 @@ int intel_map3d(struct disp3d *d)
             memset((void *)pg, 0, PAGE_SIZE);
             r3.pages[r3.npages++] = pg;
         }
-        r3.owner = current->pid;
+        r3.owner = current->leader->pid;
         if (r3.npages < ARENA_MIN) {
             free_arena();
             return -ENOMEM;
         }
         map_arena();
         gtt_flush3d();
-        klog("intel: pid %d (%s) has the 3D engine, %u MiB\n", current->pid, current->name, r3.npages >> 8);
+        klog("intel: pid %d (%s) has the 3D engine, %u MiB\n", current->leader->pid, current->name, r3.npages >> 8);
     }
     for (uint32_t i = 0; i < r3.npages; i++) {
         int r = vmm_map_phys(current->pd, USER_GL_BASE + i * PAGE_SIZE, r3.pages[i], PAGE_SIZE, 0);
@@ -1051,7 +1051,7 @@ int intel_submit3d(const struct dispsubmit *sub)
 {
     if (!r3.ok)
         return -ENODEV;
-    if (r3.owner != current->pid)
+    if (r3.owner != current->leader->pid)
         return -EPERM;
     uint32_t off = sub->gpu_lo, n = sub->dwords;
     uint32_t size = r3.npages * PAGE_SIZE;

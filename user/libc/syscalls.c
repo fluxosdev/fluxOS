@@ -27,8 +27,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <utime.h>
+#include "pthread_impl.h"
 
-int errno;
 
 static inline int sc0(int n)
 {
@@ -82,7 +82,17 @@ void _exit(int status)
         ;
 }
 
-pid_t fork(void) { return ret(sc0(SYS_fork)); }
+/* The calling thread alone goes on in the child, so libc's locks must be free there (pthread.c). */
+pid_t fork(void)
+{
+    __fork_prepare();
+    int r = sc0(SYS_fork);
+    if (r == 0)
+        __fork_child();
+    else
+        __fork_parent();
+    return ret(r);
+}
 
 int execve(const char *path, char *const argv[], char *const envp[])
 {

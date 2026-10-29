@@ -44,6 +44,7 @@
 
 int screen_mode;
 int vga_graphics;
+static int cp437_mode;                  /* the desktop terminal takes our text as CP437 (ESC % @) */
 
 #define GFX_W 320
 #define GFX_H 200
@@ -551,6 +552,8 @@ void video_leave(void)
     } else if (ansi_used) {
         outs("\033[0m");
     }
+    if (cp437_mode)
+        outs("\033%G");                 /* UTF-8 again, for what runs next */
     video_flush();
 }
 
@@ -560,11 +563,15 @@ void video_suspend(void)
     gfx_end();
     if (screen_mode)
         outs("\033[0m\033[?25h\033[H\033[2J");
+    if (cp437_mode)
+        outs("\033%G");
     video_flush();
 }
 
 void video_resume(void)
 {
+    if (cp437_mode)
+        outs("\033%@");
     if (vga_graphics) {
         video_refresh(1);
         return;
@@ -1068,6 +1075,10 @@ void int10(void)
 void video_init(void)
 {
     term_fd = isatty(1) ? 1 : isatty(2) ? 2 : -1;
+    if (term_fd >= 0 && getenv("FLUX_TERMINAL")) {      /* the desktop's terminal reads UTF-8 unless told */
+        cp437_mode = 1;
+        outs("\033%@");
+    }
     /* Text mode 3 with the cursor on the bottom line, as if the screen
      * held what the terminal shows. */
     mem[0x449] = 3;

@@ -61,6 +61,7 @@ void context_restore(struct cpu_context *c) __attribute__((noreturn));
 void pic_suspend(void);
 void pic_resume(void);
 void gdt_load_tr(int cpu);
+void gdt_set_tls(uint32_t base);          /* this processor's SEG_USER_TLS */
 
 void trapret(void);
 void forkret(void);                     /* a new process's first way out of the kernel */

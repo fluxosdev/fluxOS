@@ -3,6 +3,8 @@
 
 #include <flux/abi.h>
 
-extern int errno;
+/* Each thread's own (libc keeps it in the thread's block). */
+int *__errno_location(void);
+#define errno (*__errno_location())
 
 #endif

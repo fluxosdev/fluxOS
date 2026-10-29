@@ -588,7 +588,7 @@ static struct slot *find_slot(uint32_t handle)
     if (handle < 1 || handle > MAX_SLOTS)
         return NULL;
     struct slot *sl = &ig.slots[handle - 1];
-    return sl->pid && sl->pid == current->pid ? sl : NULL;
+    return sl->pid && sl->pid == current->leader->pid ? sl : NULL;
 }
 
 static uint32_t slot_gpu(const struct slot *sl)
@@ -653,7 +653,7 @@ int intel_mapbuf(struct dispbuf *b)
             return -EFAULT;
     }
     struct slot *sl = &ig.slots[idx];
-    *sl = (struct slot){ current->pid, first, npages, va, b->addr & 0xFFF, b->size };
+    *sl = (struct slot){ current->leader->pid, first, npages, va, b->addr & 0xFFF, b->size };
     if (map_slot(sl, current->pd) < 0) {
         unmap_slot(sl);
         return -EFAULT;

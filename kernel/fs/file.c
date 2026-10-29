@@ -259,7 +259,7 @@ int do_poll(struct pollfd *fds, uint32_t nfds, int timeout_ms)
         int n = 0;
         for (uint32_t i = 0; i < nfds; i++) {
             struct pollfd *pfd = &fds[i];
-            struct file *f = pfd->fd >= 0 && pfd->fd < MAX_FDS ? current->fds[pfd->fd] : NULL;
+            struct file *f = pfd->fd >= 0 && pfd->fd < MAX_FDS ? current->leader->fds[pfd->fd] : NULL;
             if (pfd->fd < 0)
                 pfd->revents = 0;
             else if (!f)

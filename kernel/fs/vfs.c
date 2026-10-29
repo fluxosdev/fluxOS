@@ -1118,6 +1118,7 @@ void vfs_init(void)
     struct vnode *tty = vfs_mknod(dev, "tty", MKDEV(TTY_MAJOR, 0), tty_dev_read, tty_dev_write);
     struct vnode *con = vfs_mknod(dev, "console", MKDEV(TTY_MAJOR, 1), tty_dev_read, tty_dev_write);
     tty->dev_poll = con->dev_poll = tty_dev_poll;
+    tty->dev_ioctl = con->dev_ioctl = tty_dev_ioctl;
     con->dev_priv = &console_tty;       /* /dev/tty is the controlling terminal */
     input_register(dev);
     vfs_mknod(dev, "null", MKDEV(1, 3), dev_null_read, dev_null_write);

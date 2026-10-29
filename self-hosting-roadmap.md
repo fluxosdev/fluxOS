@@ -379,7 +379,7 @@ and that test grows an ext2 image.
 ## Phase 6: boot media made natively
 
 *Goal: `mkiso` on fluxOS produces an ISO that boots in QEMU and on the
-HP ProBook, and `fluxinstall` installs from a native build.*
+HP Pavilion g6, and `fluxinstall` installs from a native build.*
 
 - [ ] `firmware/grub/`: `boot.img`, `core.img` (built on Linux by
       `grub-mkimage -O i386-pc -p '(,msdos1)/boot/grub' biosdisk
@@ -421,7 +421,7 @@ and the loader side exists.
       GCC built the same way should agree; `-g` paths are mapped with
       `-fdebug-prefix-map`, and `__DATE__` is not used anywhere).
 - [ ] Build time and memory on the reference machines (a Core 2 Duo in
-      QEMU, the HP ProBook, the Pentium 4 floor): FreeType, mbedtls and
+      QEMU, the HP Pavilion g6, the Pentium 4 floor): FreeType, mbedtls and
       the browser are the long poles; `make -j` needs nothing new since
       processes already run on all cores.
 - [ ] Documentation: a "Building fluxOS on fluxOS" section in the README

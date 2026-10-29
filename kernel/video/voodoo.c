@@ -678,7 +678,7 @@ int voodoo_screen_bytes(void)
 
 int voodoo_map3d(struct disp3d *d)
 {
-    if (vd.owner3d && vd.owner3d != current->pid) {
+    if (vd.owner3d && vd.owner3d != current->leader->pid) {
         struct proc *p = proc_find(vd.owner3d);
         if (p && p->state != P_ZOMBIE)
             return -EBUSY;
@@ -689,9 +689,9 @@ int voodoo_map3d(struct disp3d *d)
                          PTE_PCD | PTE_PWT);
     if (r < 0)
         return r;
-    if (vd.owner3d != current->pid)
-        klog("voodoo: pid %d (%s) has the 3D engine\n", current->pid, current->name);
-    vd.owner3d = current->pid;
+    if (vd.owner3d != current->leader->pid)
+        klog("voodoo: pid %d (%s) has the 3D engine\n", current->leader->pid, current->name);
+    vd.owner3d = current->leader->pid;
     d->regs = USER_REGS_BASE;
     d->vram = USER_VRAM_BASE;
     d->vram_size = vd.vram_size;

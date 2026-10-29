@@ -5,11 +5,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
-#define ROWS 24
-
 static int tty_fd = -1;
+static int rows = 25, cols = 80;        /* the terminal's size */
 
 /* Returns 0 to quit, 1 for a page, 2 for a line. */
 static int prompt(void)
@@ -30,17 +30,17 @@ static int prompt(void)
 
 static int page(FILE *f)
 {
-    int c, col = 0, row = 0, budget = ROWS - 1;
+    int c, col = 0, row = 0, budget = rows - 1;
     while ((c = fgetc(f)) != EOF) {
         putchar(c);
-        if (c == '\n' || ++col >= 80) {
+        if (c == '\n' || ++col >= cols) {
             col = 0;
             if (++row >= budget) {
                 int r = prompt();
                 if (!r)
                     return 0;
                 row = 0;
-                budget = r == 2 ? 1 : ROWS - 1;
+                budget = r == 2 ? 1 : rows - 1;
             }
         }
     }
@@ -51,6 +51,9 @@ int main(int argc, char **argv)
 {
     if (isatty(1))
         tty_fd = open("/dev/tty", O_RDONLY);
+    struct winsize ws;
+    if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 2 && ws.ws_col > 0)
+        rows = ws.ws_row, cols = ws.ws_col;
     if (argc < 2)
         return !page(stdin);
     for (int i = 1; i < argc; i++) {

@@ -136,6 +136,7 @@ void jobs_list(void);
 struct job *job_find(const char *spec);     /* NULL spec: current job */
 int job_wait(struct job *j, int announce);  /* foreground it and wait */
 int job_pid(struct job *j);
+int job_continue(struct job *j);                  /* bg: a suspended job goes on */
 
 /* ---- builtins ---- */
 typedef int (*builtin_fn)(int argc, char **argv);

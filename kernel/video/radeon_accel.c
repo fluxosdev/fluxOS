@@ -413,7 +413,7 @@ static uint32_t popcount(uint32_t v)
 /* Sleep a little in a process; at boot, spin. */
 static void pause_ms(void)
 {
-    if (current && current->pid > 0)
+    if (current && current->leader->pid > 0)
         sleep_ticks(1);
     else
         udelay(1000);
@@ -1195,7 +1195,7 @@ static struct slot *find_slot(uint32_t handle)
     if (handle < 1 || handle > MAX_SLOTS)
         return NULL;
     struct slot *sl = &gart.slots[handle - 1];
-    return sl->pid && sl->pid == current->pid ? sl : NULL;
+    return sl->pid && sl->pid == current->leader->pid ? sl : NULL;
 }
 
 static uint64_t slot_gpu(const struct slot *sl)
@@ -1256,7 +1256,7 @@ int radeon_map_buffer(struct dispbuf *b)
     }
     gart_flush();
     struct slot *sl = &gart.slots[free_idx];
-    sl->pid = current->pid;
+    sl->pid = current->leader->pid;
     sl->first = first;
     sl->npages = npages;
     sl->va = first_va;
@@ -1294,7 +1294,7 @@ int radeon_map3d(struct disp3d *d)
 {
     if (!radeon_3d_ok())
         return -ENODEV;
-    if (gl3d.owner && gl3d.owner != current->pid) {
+    if (gl3d.owner && gl3d.owner != current->leader->pid) {
         struct proc *p = proc_find(gl3d.owner);
         if (p && p->state != P_ZOMBIE)
             return -EBUSY;
@@ -1303,9 +1303,9 @@ int radeon_map3d(struct disp3d *d)
     int r = vmm_map_phys(current->pd, USER_GL_BASE, rv.aper_phys + GL_VRAM_OFF, size, 0);
     if (r < 0)
         return r;
-    if (gl3d.owner != current->pid)
-        klog("radeon: pid %d (%s) has the 3D engine\n", current->pid, current->name);
-    gl3d.owner = current->pid;
+    if (gl3d.owner != current->leader->pid)
+        klog("radeon: pid %d (%s) has the 3D engine\n", current->leader->pid, current->name);
+    gl3d.owner = current->leader->pid;
     gl3d.size = size;
     uint64_t gpu = rv.mc_base + GL_VRAM_OFF;
     memset(d, 0, sizeof(*d));
@@ -1321,11 +1321,11 @@ int radeon_map3d(struct disp3d *d)
 static int caller_owns(uint64_t addr, uint64_t bytes)
 {
     uint64_t gl = rv.mc_base + GL_VRAM_OFF;
-    if (gl3d.owner == current->pid && addr >= gl && addr + bytes <= gl + gl3d.size)
+    if (gl3d.owner == current->leader->pid && addr >= gl && addr + bytes <= gl + gl3d.size)
         return 1;
     for (int i = 0; i < MAX_SLOTS; i++) {
         struct slot *sl = &gart.slots[i];
-        if (sl->pid == current->pid && addr >= slot_gpu(sl) && addr + bytes <= slot_gpu(sl) + sl->size)
+        if (sl->pid == current->leader->pid && addr >= slot_gpu(sl) && addr + bytes <= slot_gpu(sl) + sl->size)
             return 1;
     }
     return 0;
@@ -1631,14 +1631,14 @@ static int check_buffer(struct cs *cs, const uint32_t *ib, uint32_t n, uint32_t 
 static int fetch(uint64_t addr, uint32_t *dst, uint32_t n)
 {
     uint64_t gl = rv.mc_base + GL_VRAM_OFF, bytes = (uint64_t)n * 4;
-    if (gl3d.owner == current->pid && addr >= gl && addr + bytes <= gl + gl3d.size) {
+    if (gl3d.owner == current->leader->pid && addr >= gl && addr + bytes <= gl + gl3d.size) {
         /* through the caller's own mapping (DISP_MAP3D): the kernel maps less */
         memcpy(dst, (const void *)(USER_GL_BASE + (uint32_t)(addr - gl)), (uint32_t)bytes);
         return 0;
     }
     for (int i = 0; i < MAX_SLOTS; i++) {
         const struct slot *sl = &gart.slots[i];
-        if (sl->pid != current->pid || addr < slot_gpu(sl) || addr + bytes > slot_gpu(sl) + sl->size)
+        if (sl->pid != current->leader->pid || addr < slot_gpu(sl) || addr + bytes > slot_gpu(sl) + sl->size)
             continue;
         uint8_t *out = (uint8_t *)dst;
         uint32_t off = (uint32_t)(addr - gart.start);   /* within the GART */
@@ -1664,7 +1664,7 @@ int radeon_submit(const struct dispsubmit *sub)
     static uint32_t ib[UIB_DWORDS + 16];
     if (!rv.accel)
         return -ENODEV;
-    if (gl3d.owner != current->pid)
+    if (gl3d.owner != current->leader->pid)
         return -EPERM;
     uint64_t addr = (uint64_t)sub->gpu_hi << 32 | sub->gpu_lo;
     uint32_t n = sub->dwords;
@@ -1674,7 +1674,7 @@ int radeon_submit(const struct dispsubmit *sub)
     uint32_t at = 0;
     if (check_buffer(&cs, ib, n, &at) < 0) {
         klog("radeon: pid %d (%s): command buffer refused at dword %u of %u: %s\n",
-             current->pid, current->name, at, n, cs.why);
+             current->leader->pid, current->name, at, n, cs.why);
         return -EINVAL;
     }
     while (n & 15)
@@ -1726,7 +1726,7 @@ static int resolve(const struct dispsurf *d, int screen_owner, struct surf *s)
         s->cpp = fb.bytespp;
         return 0;
     case DISP_SURF_ARENA:
-        if (gl3d.owner != current->pid)
+        if (gl3d.owner != current->leader->pid)
             return -EPERM;
         base = rv.mc_base + GL_VRAM_OFF;
         limit = gl3d.size;

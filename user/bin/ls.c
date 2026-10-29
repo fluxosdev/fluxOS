@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -132,7 +133,8 @@ static void print_entries(struct entry *v, int n)
     }
     int colw = maxw + 2;
     const char *c = getenv("COLUMNS");
-    int width = c ? atoi(c) : 80;
+    struct winsize ws;
+    int width = c ? atoi(c) : ioctl(1, TIOCGWINSZ, &ws) == 0 ? ws.ws_col : 80;
     if (width < 20)
         width = 80;
     int cols = width / colw;

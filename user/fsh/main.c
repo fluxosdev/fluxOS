@@ -231,6 +231,9 @@ int main(int argc, char **argv)
     signal(SIGINT, SIG_IGN);
     signal(SIGQUIT, SIG_IGN);
     signal(SIGTERM, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);           /* ^Z stops the job in the foreground, not the shell */
+    signal(SIGTTIN, SIG_IGN);
+    signal(SIGTTOU, SIG_IGN);
     setpgid(0, 0);
     sh.shell_pgid = getpgrp();
     tcsetpgrp(0, sh.shell_pgid);

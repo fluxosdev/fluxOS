@@ -32,6 +32,7 @@ struct tty *tty_current(void);
 int tty_dev_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n);
 int tty_dev_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n);
 int tty_dev_poll(struct vnode *vn);
+int tty_dev_ioctl(struct vnode *vn, uint32_t req, uint32_t arg);   /* TIOCGWINSZ, TIOCSWINSZ */
 
 int pty_create(struct file **master, struct file **slave);
 

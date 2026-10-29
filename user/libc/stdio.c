@@ -19,6 +19,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "libc.h"
+#include "pthread_impl.h"
 
 #define F_READ   0x01
 #define F_WRITE  0x02
@@ -124,7 +125,7 @@ static void drop_input(FILE *f)
     f->nungot = 0;
 }
 
-int fflush(FILE *f)
+static int fflush__l(FILE *f)
 {
     if (!f) {
         int r = 0;
@@ -163,19 +164,23 @@ static FILE *file_new(int fd, int flags)
     f->flags = flags | F_OWNBUF;
     f->size = BUFSIZ;
     f->mode = isatty(fd) ? _IOLBF : _IOFBF;
+    __rlock_take(&__stdio_lock);
     f->next = open_files;
     open_files = f;
+    __rlock_give(&__stdio_lock);
     return f;
 }
 
 static void file_unlink(FILE *f)
 {
+    __rlock_take(&__stdio_lock);
     for (FILE **pp = &open_files; *pp; pp = &(*pp)->next) {
         if (*pp == f) {
             *pp = f->next;
             break;
         }
     }
+    __rlock_give(&__stdio_lock);
 }
 
 /* open(2) flags and stream flags for a mode string; -1 if it is bad. */
@@ -245,7 +250,7 @@ static void release(FILE *f)
     free(f);
 }
 
-int fclose(FILE *f)
+static int fclose__l(FILE *f)
 {
     int r = fflush(f);
     file_unlink(f);
@@ -300,7 +305,7 @@ int feof(FILE *f) { return (f->flags & F_EOF) != 0; }
 int ferror(FILE *f) { return (f->flags & F_ERR) != 0; }
 void clearerr(FILE *f) { f->flags &= ~(F_EOF | F_ERR); }
 
-int setvbuf(FILE *f, char *buf, int mode, size_t size)
+static int setvbuf__l(FILE *f, char *buf, int mode, size_t size)
 {
     if (mode != _IOFBF && mode != _IOLBF && mode != _IONBF)
         return -1;
@@ -328,7 +333,7 @@ void setlinebuf(FILE *f) { setvbuf(f, NULL, _IOLBF, 0); }
 
 /* ---- positions ---- */
 
-int fseeko(FILE *f, off_t off, int whence)
+static int fseeko__l(FILE *f, off_t off, int whence)
 {
     if (flush_out(f) == EOF)
         return -1;
@@ -355,7 +360,7 @@ static off64_t tell64(FILE *f)
     return pos - (off64_t)(f->rlen - f->rpos) - f->nungot + (off64_t)f->wlen;
 }
 
-off_t ftello(FILE *f)
+static off_t ftello__l(FILE *f)
 {
     off64_t pos = tell64(f);
     if (pos > INT_MAX) {
@@ -367,13 +372,13 @@ off_t ftello(FILE *f)
 
 long ftell(FILE *f) { return (long)ftello(f); }
 
-void rewind(FILE *f)
+static void rewind__l(FILE *f)
 {
     fseek(f, 0, SEEK_SET);
     f->flags &= ~F_ERR;
 }
 
-int fgetpos(FILE *f, fpos_t *pos)
+static int fgetpos__l(FILE *f, fpos_t *pos)
 {
     off64_t p = tell64(f);
     if (p < 0)
@@ -382,7 +387,7 @@ int fgetpos(FILE *f, fpos_t *pos)
     return 0;
 }
 
-int fsetpos(FILE *f, const fpos_t *pos)
+static int fsetpos__l(FILE *f, const fpos_t *pos)
 {
     if (flush_out(f) == EOF)
         return -1;
@@ -433,7 +438,7 @@ static int refill(FILE *f)
     return 0;
 }
 
-int fgetc(FILE *f)
+static int fgetc__l(FILE *f)
 {
     if (f->nungot)
         return f->ungot[--f->nungot];
@@ -447,7 +452,7 @@ int fgetc(FILE *f)
 int getc(FILE *f) { return fgetc(f); }
 int getchar(void) { return fgetc(stdin); }
 
-int ungetc(int c, FILE *f)
+static int ungetc__l(int c, FILE *f)
 {
     if (c == EOF || f->nungot == UNGET_MAX)
         return EOF;
@@ -459,7 +464,7 @@ int ungetc(int c, FILE *f)
     return (unsigned char)c;
 }
 
-char *fgets(char *buf, int size, FILE *f)
+static char *fgets__l(char *buf, int size, FILE *f)
 {
     int i = 0;
     if (size <= 0)
@@ -503,7 +508,7 @@ char *gets(char *buf)
     return buf;
 }
 
-ssize_t getdelim(char **line, size_t *cap, int delim, FILE *f)
+static ssize_t getdelim__l(char **line, size_t *cap, int delim, FILE *f)
 {
     size_t len = 0;
     if (!line || !cap) {
@@ -544,7 +549,7 @@ ssize_t getline(char **line, size_t *cap, FILE *f)
     return getdelim(line, cap, '\n', f);
 }
 
-size_t fread(void *buf, size_t size, size_t n, FILE *f)
+static size_t fread__l(void *buf, size_t size, size_t n, FILE *f)
 {
     if (!size || !n)
         return 0;
@@ -639,7 +644,7 @@ int __fwritable(FILE *f)
     return (f->flags & F_WRITE) != 0;
 }
 
-int fputc(int c, FILE *f)
+static int fputc__l(int c, FILE *f)
 {
     char ch = (char)c;
     if (f->mode == _IOFBF && f->wlen < f->size && f->buf && !(f->rlen > f->rpos) && !f->nungot &&
@@ -653,19 +658,19 @@ int fputc(int c, FILE *f)
 int putc(int c, FILE *f) { return fputc(c, f); }
 int putchar(int c) { return fputc(c, stdout); }
 
-int fputs(const char *s, FILE *f)
+static int fputs__l(const char *s, FILE *f)
 {
     return put_bytes(f, s, strlen(s)) == EOF ? EOF : 0;
 }
 
-int puts(const char *s)
+static int puts__l(const char *s)
 {
     if (fputs(s, stdout) == EOF)
         return EOF;
     return fputc('\n', stdout) == EOF ? EOF : 0;
 }
 
-size_t fwrite(const void *buf, size_t size, size_t n, FILE *f)
+static size_t fwrite__l(const void *buf, size_t size, size_t n, FILE *f)
 {
     if (!size || !n)
         return 0;
@@ -690,9 +695,26 @@ int feof_unlocked(FILE *f) { return feof(f); }
 int ferror_unlocked(FILE *f) { return ferror(f); }
 void clearerr_unlocked(FILE *f) { clearerr(f); }
 int fileno_unlocked(FILE *f) { return fileno(f); }
-void flockfile(FILE *f) { (void)f; }
-void funlockfile(FILE *f) { (void)f; }
-int ftrylockfile(FILE *f) { (void)f; return 0; }
+/* One lock for every stream: what one thread prints comes out whole. */
+struct __rlock __stdio_lock;
+
+void flockfile(FILE *f) { (void)f; __rlock_take(&__stdio_lock); }
+void funlockfile(FILE *f) { (void)f; __rlock_give(&__stdio_lock); }
+
+int ftrylockfile(FILE *f)
+{
+    (void)f;
+    struct __pthread *me = __self();
+    if (__stdio_lock.owner == me) {
+        __stdio_lock.count++;
+        return 0;
+    }
+    if (__sync_val_compare_and_swap(&__stdio_lock.lock, 0, 1) != 0)
+        return -1;
+    __stdio_lock.owner = me;
+    __stdio_lock.count = 1;
+    return 0;
+}
 
 /* ---- formatted output and input ---- */
 
@@ -701,7 +723,7 @@ static void put_stream(void *ctx, const char *s, size_t n)
     put_bytes(ctx, s, n);
 }
 
-int vfprintf(FILE *f, const char *fmt, va_list ap)
+static int vfprintf__l(FILE *f, const char *fmt, va_list ap)
 {
     int saved = f->mode;
     /* stderr: gather the whole message, then write it once */
@@ -811,7 +833,7 @@ static void scan_unget(void *ctx, int c)
     ungetc(c, ctx);
 }
 
-int vfscanf(FILE *f, const char *fmt, va_list ap)
+static int vfscanf__l(FILE *f, const char *fmt, va_list ap)
 {
     struct scan_in in = { scan_get, scan_unget, f };
     return __vscan(&in, fmt, ap);
@@ -837,7 +859,7 @@ int scanf(const char *fmt, ...)
     return n;
 }
 
-void perror(const char *msg)
+static void perror__l(const char *msg)
 {
     const char *err = strerror(errno);
     if (msg && *msg)
@@ -1139,4 +1161,164 @@ FILE *open_memstream(char **buf, size_t *size)
         free(m);
     }
     return f;
+}
+
+/* ---- the locked entry points ---- */
+
+int fflush(FILE *f)
+{
+    __rlock_take(&__stdio_lock);
+    int r = fflush__l(f);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+int fclose(FILE *f)
+{
+    __rlock_take(&__stdio_lock);
+    int r = fclose__l(f);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+int setvbuf(FILE *f, char *buf, int mode, size_t size)
+{
+    __rlock_take(&__stdio_lock);
+    int r = setvbuf__l(f, buf, mode, size);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+int fseeko(FILE *f, off_t off, int whence)
+{
+    __rlock_take(&__stdio_lock);
+    int r = fseeko__l(f, off, whence);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+off_t ftello(FILE *f)
+{
+    __rlock_take(&__stdio_lock);
+    off_t r = ftello__l(f);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+void rewind(FILE *f)
+{
+    __rlock_take(&__stdio_lock);
+    rewind__l(f);
+    __rlock_give(&__stdio_lock);
+}
+
+int fgetpos(FILE *f, fpos_t *pos)
+{
+    __rlock_take(&__stdio_lock);
+    int r = fgetpos__l(f, pos);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+int fsetpos(FILE *f, const fpos_t *pos)
+{
+    __rlock_take(&__stdio_lock);
+    int r = fsetpos__l(f, pos);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+int fgetc(FILE *f)
+{
+    __rlock_take(&__stdio_lock);
+    int r = fgetc__l(f);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+int ungetc(int c, FILE *f)
+{
+    __rlock_take(&__stdio_lock);
+    int r = ungetc__l(c, f);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+char *fgets(char *buf, int size, FILE *f)
+{
+    __rlock_take(&__stdio_lock);
+    char *r = fgets__l(buf, size, f);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+ssize_t getdelim(char **line, size_t *cap, int delim, FILE *f)
+{
+    __rlock_take(&__stdio_lock);
+    ssize_t r = getdelim__l(line, cap, delim, f);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+size_t fread(void *buf, size_t size, size_t n, FILE *f)
+{
+    __rlock_take(&__stdio_lock);
+    size_t r = fread__l(buf, size, n, f);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+int fputc(int c, FILE *f)
+{
+    __rlock_take(&__stdio_lock);
+    int r = fputc__l(c, f);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+int fputs(const char *s, FILE *f)
+{
+    __rlock_take(&__stdio_lock);
+    int r = fputs__l(s, f);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+int puts(const char *s)
+{
+    __rlock_take(&__stdio_lock);
+    int r = puts__l(s);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+size_t fwrite(const void *buf, size_t size, size_t n, FILE *f)
+{
+    __rlock_take(&__stdio_lock);
+    size_t r = fwrite__l(buf, size, n, f);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+int vfprintf(FILE *f, const char *fmt, va_list ap)
+{
+    __rlock_take(&__stdio_lock);
+    int r = vfprintf__l(f, fmt, ap);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+int vfscanf(FILE *f, const char *fmt, va_list ap)
+{
+    __rlock_take(&__stdio_lock);
+    int r = vfscanf__l(f, fmt, ap);
+    __rlock_give(&__stdio_lock);
+    return r;
+}
+
+void perror(const char *msg)
+{
+    __rlock_take(&__stdio_lock);
+    perror__l(msg);
+    __rlock_give(&__stdio_lock);
 }

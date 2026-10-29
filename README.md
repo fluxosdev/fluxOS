@@ -21,8 +21,8 @@
 fluxOS is a small 32-bit x86 Unix-like operating system with preemptive
 multitasking, ring-3 processes, paging, a root filesystem on the hard disk it
 is installed on, IDE/SATA/floppy/USB storage, FAT and ISO9660, an
-NE2000, nForce and Intel I217 network drivers with a TCP/IP stack, a zsh-flavoured shell
-(**fsh**), a desktop with a web browser and two themes (Kinetik and Windows 95 style Classic), 3dfx Voodoo3 and
+NE2000, nForce, Intel PRO/1000 and Intel I217 network drivers with a TCP/IP stack, a zsh-flavoured shell
+(**fsh**), a desktop with a web browser and three themes (Kinetik, Kinetik Glass and Windows 95 style Classic), 3dfx Voodoo3 and
 Radeon HD 4000 display drivers with a small OpenGL library, an Intel HD Graphics
 4600 display driver with 3D, PC speaker, Sound
 Blaster 16 and HD Audio sound, and a layer that runs DOS programs in the
@@ -64,8 +64,15 @@ says why.
   state and ticket-lock counters occupy separate cache lines. Single-core
   systems retain the same round-robin scheduling and need no APIC timer.
 - Processes: `fork`, `execve` (static ELF32 and `#!` scripts), `exit`/
-  `waitpid`, process groups, signals (`kill`, `SIGINT`, `SIGPIPE`, fault
-  signals; no user handlers), lazy FPU and SSE switching (FXSAVE/FXRSTOR).
+  `waitpid`, process groups, signals (`kill`, `sigaction` handlers, `SIGINT`, `SIGPIPE`,
+  fault signals; ^C, ^\ and ^Z from the terminal, stopped and continued jobs), lazy FPU and SSE
+  switching (FXSAVE/FXRSTOR).
+- Threads: a process's threads share its address space, descriptors and signal handlers and run
+  on every processor at once; futexes to wait on, a TLS segment per thread (%gs), `exit()` and
+  fatal signals ending all of them, `exec` from any of them. libc has POSIX threads on top
+  (`<pthread.h>`: mutexes, condition variables, read-write locks, once, keys, barriers, spinlocks;
+  `<semaphore.h>`), with `errno`, `malloc` and stdio safe to use from several threads. `threadtest`
+  checks them.
 - Processor check at boot (a Pentium 4 with SSE2 is the minimum), and a
   write-combining framebuffer through the page attribute table (`pat=off`
   keeps it uncached).
@@ -195,7 +202,9 @@ says why.
 - Networking: NE2000 (PCI and ISA), **nVidia nForce** ("forcedeth", `eth0`,
   with MII PHY support) and **Intel I217-LM/V** gigabit (the Haswell 8-series
   chipsets' MAC; "e1000e", shares the PHY with the Management Engine,
-  `e1000e=off`) drivers; Ethernet, ARP, IPv4 (no fragments), ICMP, UDP,
+  `e1000e=off`) and **Intel PRO/1000** ("e1000": the 8254x family and the 82574L, the
+  card QEMU's `e1000` and `e1000e`, VirtualBox and many 86Box machines offer, `e1000=off`)
+  drivers; Ethernet, ARP, IPv4 (no fragments), ICMP, UDP,
   loopback; TCP with the full state machine, RTT estimation, retransmission
   and fast retransmit; a DHCP client (or `net.ip=... net.gw=... net.dns=...`
   on the kernel command line); BSD sockets for TCP, UDP and ping; DNS from
@@ -210,7 +219,7 @@ says why.
 - Pipelines, `; && || & !`, redirections, `if/while/until/for`, `{ }`, `( )`,
   functions, `time`; `$VAR ${VAR:-x} ${#VAR}`, `$(cmd)`, `$((math))`, `~`,
   brace expansion, globs (a glob that matches nothing is an error, as in zsh).
-- Job control (`jobs`, `fg`, `wait`, `kill %n`), history expansion
+- Job control (`jobs`, `fg`, `bg`, `wait`, `kill %n`; ^Z suspends the foreground job), history expansion
   (`!! !$ !n !str`), aliases, `source`, `~/.fshrc`, `~/.fsh_history`, AUTO_CD.
 
 **The desktop** (`/bin/desktop`), started by init at boot
@@ -238,7 +247,10 @@ says why.
 - Start menu with cascading submenus (Programs, Accessories, System Tools,
   Settings), Read Me, Run... and Shut Down.... Keys: Windows
   key or Ctrl+Esc for Start, Alt+Tab, Alt+F4.
-- **Terminal**: 80x25 VGA-style, running fsh on a pty, as many as you like.
+- **Terminal**: VGA-style text, running fsh on a pty, as many as you like. It opens at 80x25 and
+  takes whatever size its window is given (programs hear `SIGWINCH` and read the size with
+  `TIOCGWINSZ`); 2000 lines scroll back (wheel, Shift+PgUp/PgDn); output is UTF-8, shown with
+  the VGA font's code page 437 glyphs.
 - **File manager**: Explorer-style icon view with an address field, Up, New
   Folder, Delete, Rename, cut/copy/paste (also between disks), a right-click
   menu, and drive icons for mounted volumes. Double-click opens folders; runs
@@ -580,10 +592,10 @@ fetcher process, so the desktop keeps running), or from `file://`.
 **Userland** (`/bin`): 7z basename beep cat chmod clear cp date desktop df dirname
 dmesg dos echo env fetch fluxinstall free fsh grep halt head hexdump host
 ifconfig init ls lsblk mkdir mkfs.fat mixer more mount mv nc ping play
-poweroff ps reboot rm rmdir seq sh sleep sort spin stat sync tail tee top
+poweroff ps reboot rm rmdir seq sh sleep sort spin stat sync tail tee threadtest top
 touch tr umount uname uniq unzip uptime wc wget yes zip (and httpc, the browser's
 fetcher), on a small libc (stdio, malloc, dirent, time, sockets, a DNS resolver,
-archives, an HTTP/1.1 and HTTP/2 client and inflate).
+archives, an HTTP/1.1 and HTTP/2 client, inflate and POSIX threads).
 - The libc is enough of POSIX for GNU programs to build against it unchanged
   (GNU make and binutils do, cross-compiled; see `self-hosting-roadmap.md`):
   `printf` and `strtod` that agree with glibc digit for digit (exact
@@ -730,6 +742,7 @@ In a terminal:
 ```sh
 fetch                          # system summary
 spin A 5 & spin B 5 & top      # CPU-bound jobs sharing the CPU; ^C quits top
+threadtest                     # POSIX threads: every line should say ok
 cat ~/README.txt; ./demo.sh    # tour and a scripting demo
 echo {1..3} $((6*7)) ~         # brace, arithmetic and tilde expansion
 lsblk; df -h; mount            # disks, CD-ROM and mounted filesystems
@@ -769,7 +782,7 @@ kernel/fs/                 vfs/file/initrd, blkdev, automount, fat32/iso9660
 kernel/storage/            ata, ahci, floppy
 kernel/usb/                usb core, hid/hub/msc, uhci/ohci/ehci/xhci
 kernel/input/              input, keyboard, mouse, touchpad
-kernel/net/                net/tcp/socket, ne2000, forcedeth/mii, e1000e
+kernel/net/                net/tcp/socket, ne2000, forcedeth/mii, e1000, e1000e
 kernel/sound/              pcspkr, sb16/opl/isadma, hda
 kernel/video/              fb/vga, the startup screen (splash.c), voodoo, radeon*, atom, intel*,
                            modes (EDID mode lists)
@@ -916,7 +929,7 @@ user range and page tables first.
   alone (its ROM call hung there). On real hardware it now runs the video
   ROM and sets the VESA mode again by default, keeps its real-mode code out
   of the first 64 KiB (which some firmware overwrites while resuming),
-  restores the MTRRs and brings PCI functions back to D0. On the HP ProBook
+  restores the MTRRs and brings PCI functions back to D0. On the HP Pavilion g6
   with a Llano APU, test with `s3_beep`: one beep means the firmware came
   back to the wake code, two that the kernel is running again, three that
   the devices are back. One beep then nothing points at the video ROM
@@ -930,11 +943,11 @@ user range and page tables first.
   `KERNEL_TEST_CPUS=2` also exercises restarting the other processor.
 - **The Radeon driver on Llano APUs (HD 6520G and kin) is partial:** page
   flipping, the hardware pointer, and native modes only for a laptop panel
-  behind a DisplayPort bridge (TRAVIS, as on the HP ProBook); eDP panels and
+  behind a DisplayPort bridge (TRAVIS, as on the HP Pavilion g6); eDP panels and
   the VGA, HDMI and DisplayPort connectors keep the boot loader's mode.
   Modes change only the surface, viewport and scaler; the full DisplayPort
   mode set (PLL, encoder, bridge, link training over AUX), ported from
-  Linux, blanks the panel on the HP ProBook and is only run with
+  Linux, blanks the panel on the HP Pavilion g6 and is only run with
   `radeon.dp_modeset=1`. `dmesg | grep radeon` shows each step, and
   `radeon.modeset=0` turns native modes off. A native mode is set again
   after waking from sleep. Next, 3D: Sumo's own microcode (SUMO_pfp, SUMO_me,
@@ -949,13 +962,13 @@ user range and page tables first.
 
 ## Limitations
 
-Only one processor at a time runs kernel code, so system calls do not
-get faster with more of them, and the I/O APIC is not used. The root
-filesystem lives in RAM; only what you
-write to a mounted FAT volume persists. Permission bits are cosmetic apart from
-the exec bit, there is one user, and signals cannot have user handlers or jobs
-be stopped (no ^Z). The FPU state is saved with FXSAVE, so AVX and later
-cannot be used.
+The kernel runs on every processor at once, but the I/O APIC is not used: every
+interrupt reaches the first processor through the PICs. From the CD, the root
+filesystem lives in RAM and only what you write to a mounted FAT volume persists;
+an installed system runs from its FAT32 partition, so there are no symbolic or hard
+links and permission bits are cosmetic apart from the exec bit. There is one user,
+and there are no shared libraries (programs are linked statically).
+The FPU state is saved with FXSAVE, so AVX and later cannot be used.
 
 - **IDE:** DMA needs a legacy-mode PCI controller with bus mastering and a
   drive the firmware put in a DMA mode; anything else uses PIO.
@@ -989,9 +1002,9 @@ cannot be used.
 - **Floppies:** primary controller only, two drives, double- and high-density
   disks. Unmount before removal or recent changes are lost; looking for a disk
   in an empty drive steps the head every 2 s.
-- **Desktop:** terminals are a fixed 80x25 with no scrollback; windows resize by
-  an outline; dialogs, terminals and the calculator can't be resized; the
-  editor shows bytes as CP437 (no UTF-8).
+- **Desktop:** windows resize by an outline; dialogs and the calculator can't be
+  resized; terminals show only characters code page 437 has (others as `?`) and do not
+  rewrap lines when resized; the editor shows bytes as CP437 (no UTF-8).
 - **DOS programs:** text modes plus VGA 13h/mode X only (other graphics modes
   stop the program); no Sound Blaster recording, ADPCM, direct DAC or MPU-401;
   no mouse, EMS/XMS, batch files or INT 13h (self-booting and copy-protected
@@ -1052,8 +1065,8 @@ cannot be used.
 - **Graphics:** only the 3dfx and Radeon drivers set modes (others keep the BIOS
   mode, changeable only on an installed system at the next start); no 8-bit
   palette, interlaced or doublescan modes; the 3dfx engine renders 16-bit color
-  and is read back over the bus each frame. The GL library has no blending,
-  fog, stencil, vertex arrays or selection, and textures have no mipmaps
+  and is read back over the bus each frame. The GL library has no fog, stencil
+  or selection, and textures have no mipmaps
   (level 0 serves every filter); the Voodoo does not texture, and the Radeon
   draws decal as replace and blend as modulate; lighting is per vertex;
   polygons must be convex; only one process at a time can use the 3D hardware.

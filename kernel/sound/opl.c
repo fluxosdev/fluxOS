@@ -88,12 +88,12 @@ int opl_present(void)
 static int opl_open(struct vnode *vn, int flags)
 {
     (void)vn; (void)flags;
-    if (opl_owner && opl_owner != current->pid) {
+    if (opl_owner && opl_owner != current->leader->pid) {
         struct proc *p = proc_find(opl_owner);
         if (p && p->state != P_ZOMBIE)
             return -EBUSY;
     }
-    opl_owner = current->pid;
+    opl_owner = current->leader->pid;
     return 0;
 }
 

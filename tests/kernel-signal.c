@@ -81,6 +81,8 @@ int main(void)
 {
     current = &procs[2];
     current->pid = 2;
+    current->leader = current;          /* a process of one thread */
+    current->nthreads = 1;
     current->state = P_RUNNING;
     cpus[0].proc = current;
     current->sig_pending = 1u << SIGINT;

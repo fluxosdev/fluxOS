@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "pthread_impl.h"
 
 char **environ;
 
@@ -27,6 +28,7 @@ char *program_invocation_short_name = "";
 
 void __libc_start(int argc, char **argv, char **envp)
 {
+    __init_tls();                       /* errno is the thread's: before anything can set it */
     environ = envp;
     if (argc > 0 && argv[0]) {
         const char *slash = strrchr(argv[0], '/');
@@ -231,7 +233,11 @@ static struct block *find(size_t size)
     return i < 0 ? NULL : bins[i];
 }
 
-void *malloc(size_t n)
+/* Threads take turns at the heap (the lock is one its holder may take again: memalign and realloc
+ * call malloc and free). */
+struct __rlock __malloc_lock;
+
+static void *malloc_locked(size_t n)
 {
     size_t size = block_size(n ? n : 1);
     if (!size) {
@@ -253,7 +259,7 @@ void *malloc(size_t n)
     return (char *)b + HDR;
 }
 
-void free(void *p)
+static void free_locked(void *p)
 {
     if (!p)
         return;
@@ -265,7 +271,7 @@ void free(void *p)
 
 /* A block whose payload is align-aligned: a bigger one, with the part
  * before the aligned payload split off and freed. */
-void *memalign(size_t align, size_t n)
+static void *memalign_locked(size_t align, size_t n)
 {
     if (align <= ALIGN)
         return malloc(n);
@@ -295,6 +301,29 @@ void *memalign(size_t align, size_t n)
     release(b);                         /* marks nb's PINUSE clear, merges b downwards */
     trim(nb, size);
     return q;
+}
+
+void *malloc(size_t n)
+{
+    __rlock_take(&__malloc_lock);
+    void *p = malloc_locked(n);
+    __rlock_give(&__malloc_lock);
+    return p;
+}
+
+void free(void *p)
+{
+    __rlock_take(&__malloc_lock);
+    free_locked(p);
+    __rlock_give(&__malloc_lock);
+}
+
+void *memalign(size_t align, size_t n)
+{
+    __rlock_take(&__malloc_lock);
+    void *p = memalign_locked(align, n);
+    __rlock_give(&__malloc_lock);
+    return p;
 }
 
 int posix_memalign(void **out, size_t align, size_t n)
@@ -341,7 +370,7 @@ void *calloc(size_t count, size_t size)
     return p;
 }
 
-void *realloc(void *p, size_t n)
+static void *realloc_locked(void *p, size_t n)
 {
     if (!p)
         return malloc(n);
@@ -372,6 +401,14 @@ void *realloc(void *p, size_t n)
         return NULL;
     memcpy(q, p, bsize(b) - HDR);
     free(p);
+    return q;
+}
+
+void *realloc(void *p, size_t n)
+{
+    __rlock_take(&__malloc_lock);
+    void *q = realloc_locked(p, n);
+    __rlock_give(&__malloc_lock);
     return q;
 }
 

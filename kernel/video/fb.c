@@ -281,7 +281,7 @@ static int map_user(void)
 {
     if (!fb.base)
         return -ENODEV;
-    if (fb_owner && fb_owner != current->pid) {
+    if (fb_owner && fb_owner != current->leader->pid) {
         struct proc *p = proc_find(fb_owner);
         if (p && p->state != P_ZOMBIE)
             return -EBUSY;
@@ -290,9 +290,9 @@ static int map_user(void)
     if (r < 0)
         return r;
     if (!fb_owner)
-        klog("fb: pid %d (%s) took the screen\n", current->pid, current->name);
+        klog("fb: pid %d (%s) took the screen\n", current->leader->pid, current->name);
     splash_end(0);
-    fb_owner = current->pid;
+    fb_owner = current->leader->pid;
     return (int)USER_MMIO_BASE;
 }
 
@@ -372,7 +372,7 @@ static void boot_mode(struct dispmode *m)
 /* Only the process that has the screen may flip it or move the pointer. */
 static int screen_owner(void)
 {
-    return fb_owner && fb_owner == current->pid;
+    return fb_owner && fb_owner == current->leader->pid;
 }
 
 static int display_op(int op, void *arg);
@@ -435,7 +435,7 @@ static int display_op(int op, void *arg)
         if (!voodoo_present() && !radeon_present() && !intel_present())
             return -ENODEV;
         /* Only the process that has the screen, or anyone while the console does. */
-        if (fb_owner && fb_owner != current->pid) {
+        if (fb_owner && fb_owner != current->leader->pid) {
             struct proc *p = proc_find(fb_owner);
             if (p && p->state != P_ZOMBIE)
                 return -EBUSY;

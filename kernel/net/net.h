@@ -148,6 +148,7 @@ int net_configure(const struct netinfo *ni);
 int ne2000_init(void);
 int forcedeth_init(void);
 int e1000e_init(void);
+int e1000_init(void);                   /* Intel 8254x PRO/1000 and 82574L */
 
 /* Ones' complement sums: accumulate with csum_add, finish with csum_fold. */
 uint32_t csum_add(uint32_t sum, const void *data, uint32_t len);

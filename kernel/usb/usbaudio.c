@@ -429,12 +429,12 @@ static int dsp_open_locked(struct vnode *vn, int flags)
         return -ENODEV;
     if ((flags & O_ACCMODE) == O_RDONLY)
         return -EINVAL;                 /* no recording */
-    if (ua.open_pid && ua.open_pid != current->pid) {
+    if (ua.open_pid && ua.open_pid != current->leader->pid) {
         struct proc *p = proc_find(ua.open_pid);
         if (p && p->state != P_ZOMBIE)
             return -EBUSY;
     }
-    ua.open_pid = current->pid;
+    ua.open_pid = current->leader->pid;
     if (!ua.streaming && !ring_used())
         set_defaults();
     return 0;

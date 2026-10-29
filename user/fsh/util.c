@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 #include "fsh.h"
 
@@ -155,6 +156,9 @@ const char *errmsg(int err)
 
 int term_width(void)
 {
+    struct winsize ws;
+    if (ioctl(0, TIOCGWINSZ, &ws) == 0 && ws.ws_col >= 20)
+        return ws.ws_col;
     const char *c = getenv("COLUMNS");
     int w = c ? atoi(c) : 0;
     return w >= 20 ? w : 80;

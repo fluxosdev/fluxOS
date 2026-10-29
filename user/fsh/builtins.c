@@ -747,6 +747,16 @@ static int bi_fg(int argc, char **argv)
     return job_wait(j, 1);
 }
 
+static int bi_bg(int argc, char **argv)
+{
+    struct job *j = job_find(argc > 1 ? argv[1] : NULL);
+    if (!j) {
+        fsh_error("bg: no current job");
+        return 1;
+    }
+    return job_continue(j);
+}
+
 static int bi_wait(int argc, char **argv)
 {
     int status = 0;
@@ -868,7 +878,7 @@ static const struct {
 } builtins[] = {
     { ".", bi_source }, { ":", bi_true }, { "[", bi_test }, { "alias", bi_alias },
     { "break", bi_break }, { "cd", bi_cd }, { "continue", bi_continue },
-    { "dirs", bi_dirs }, { "echo", bi_echo }, { "eval", bi_eval }, { "exit", bi_exit },
+    { "bg", bi_bg }, { "dirs", bi_dirs }, { "echo", bi_echo }, { "eval", bi_eval }, { "exit", bi_exit },
     { "export", bi_export }, { "false", bi_false }, { "fg", bi_fg },
     { "help", bi_help }, { "history", bi_history }, { "jobs", bi_jobs },
     { "kill", bi_kill }, { "logout", bi_exit }, { "popd", bi_popd },
@@ -881,7 +891,7 @@ static const struct {
 };
 
 const char *const builtin_names[] = {
-    ".", ":", "[", "alias", "break", "cd", "continue", "dirs", "echo", "eval", "exec",
+    ".", ":", "[", "alias", "bg", "break", "cd", "continue", "dirs", "echo", "eval", "exec",
     "exit", "export", "false", "fg", "help", "history", "jobs", "kill", "logout",
     "popd", "print", "printf", "pushd", "pwd", "read", "return", "set", "shift",
     "source", "test", "true", "type", "unalias", "unset", "wait", "whence", "which",

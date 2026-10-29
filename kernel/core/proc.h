@@ -1,4 +1,14 @@
-/* Processes and the scheduler. */
+/*
+ * Processes and the scheduler.
+ *
+ * A process may have several threads. Each thread is a struct proc of its
+ * own (its registers, kernel stack, signal mask and pending signals, TLS),
+ * and the first one, the leader, holds what they share: the address space's
+ * mappings, the file descriptors, the working directory, the signal
+ * handlers. Every proc reaches those through ->leader, which is itself for
+ * a process with one thread. A thread's pid is its thread id; the leader's
+ * is the process's.
+ */
 #ifndef PROC_H
 #define PROC_H
 
@@ -8,7 +18,7 @@
 #include "smp.h"
 #include "x86.h"
 
-#define MAX_PROCS   64
+#define MAX_PROCS   128          /* threads count too */
 #define MAX_FDS     256
 #define MAX_VMAS    256
 #define KSTACK_SIZE 16384
@@ -38,6 +48,14 @@ struct tty;
 struct proc {
     int pid, ppid, pgid;
     int state;
+    struct proc *leader;        /* the thread whose fields below are the process's (itself, alone) */
+    int nthreads;               /* leader: threads not yet exited, itself included */
+    int group_exiting;          /* leader: a thread is ending the process, the others are being killed */
+    int reap_self;              /* a thread that exited: freed when its slot is wanted (no waitpid) */
+    uint32_t clear_tid;         /* user address zeroed and futex-woken when this thread exits */
+    uint32_t tls;               /* base of the TLS segment (SEG_USER_TLS) */
+    struct mutex mm_lock;       /* leader: page faults and changes to the mappings */
+    spinlock_t fd_lock;         /* leader: taking and freeing descriptor slots */
     uint32_t esp;               /* saved kernel stack pointer */
     uint8_t *kstack;
     uint32_t *pd;               /* page directory (physical == virtual) */
@@ -79,15 +97,15 @@ struct proc {
 
 static inline int fd_cloexec_get(const struct proc *p, int fd)
 {
-    return (p->fd_cloexec[fd >> 5] >> (fd & 31)) & 1;
+    return (p->leader->fd_cloexec[fd >> 5] >> (fd & 31)) & 1;
 }
 
 static inline void fd_cloexec_set(struct proc *p, int fd, int on)
 {
     if (on)
-        p->fd_cloexec[fd >> 5] |= 1u << (fd & 31);
+        p->leader->fd_cloexec[fd >> 5] |= 1u << (fd & 31);
     else
-        p->fd_cloexec[fd >> 5] &= ~(1u << (fd & 31));
+        p->leader->fd_cloexec[fd >> 5] &= ~(1u << (fd & 31));
 }
 
 extern struct proc procs[MAX_PROCS];
@@ -167,7 +185,13 @@ int sleep_ticks_intr(uint32_t n);       /* a pending signal ends it, or skips it
     } while (0)
 
 int do_fork(void);
-void do_exit(int status) __attribute__((noreturn));
+void do_exit(int status) __attribute__((noreturn));     /* the whole process (exit, a fatal signal) */
+void thread_exit(uint32_t unmap_addr, uint32_t unmap_len) __attribute__((noreturn));
+int thread_create(uint32_t entry, uint32_t stack, uint32_t tls, uint32_t clear_tid);
+void proc_exec_alone(struct proc *p);   /* exec: the other threads go, and p is the process */
+int futex_wait(uint32_t addr, uint32_t val, int timeout_ms);
+int futex_wake(uint32_t addr, int n);
+int do_tkill(int tid, int sig);
 int do_waitpid(int pid, int *status, int options);
 int do_kill(int pid, int sig);
 int do_setpgid(int pid, int pgid);

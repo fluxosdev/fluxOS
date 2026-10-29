@@ -89,7 +89,13 @@
 #define SYS_times       81  /* struct flux_tms *buf */
 #define SYS_fchdir      82  /* fd */
 #define SYS_fchmod      83  /* fd, mode */
+#define SYS_thread_create 84 /* entry, stack, tls base, clear_tid address: the new thread's id */
+#define SYS_thread_exit 85  /* stack address and length to unmap (0, 0: none) */
+#define SYS_futex       86  /* addr, FUTEX_WAIT or FUTEX_WAKE, value (or count), timeout in ms (-1: none) */
+#define SYS_set_tls     87  /* base: this thread's TLS segment; returns its selector */
+#define SYS_gettid      88
+#define SYS_tkill       89  /* thread id, signal */
 
-#define NSYSCALLS       84
+#define NSYSCALLS       90
 
 #endif

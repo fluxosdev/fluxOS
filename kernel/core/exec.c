@@ -269,7 +269,7 @@ static int exec_interp(struct proc *p, const char *interp, const char *path,
 
     struct vnode *ivn;
     char magic[2] = { 0, 0 };
-    int r = vfs_resolve(interp, p->cwd, &ivn);
+    int r = vfs_resolve(interp, p->leader->cwd, &ivn);
     if (r == 0 && ivn->type == VN_FILE && vfs_read(ivn, magic, 0, 2) == 2 &&
         magic[0] == '#' && magic[1] == '!')
         r = -ENOEXEC;                       /* no nested interpreters */
@@ -332,7 +332,7 @@ static int is_dos_program(const struct image *img, const char *path)
 int proc_exec(struct proc *p, const char *path, char *const argv[], char *const envp[])
 {
     struct vnode *vn;
-    int r = vfs_resolve(path, p->cwd, &vn);
+    int r = vfs_resolve(path, p->leader->cwd, &vn);
     if (r < 0)
         return r;
     if (vn->type == VN_DIR)
@@ -373,22 +373,25 @@ int proc_exec(struct proc *p, const char *path, char *const argv[], char *const 
     /* Point of no return: replace the old image. The screen, the 3D
      * engine and buffers lent to the GPU were the old image's: give them
      * up before its memory is freed, as at exit. */
+    proc_exec_alone(p);                     /* only this thread goes on, as the process */
     fb_proc_exit(p->pid);
     vmm_destroy(proc_set_pd(p, pd));
+    p->tls = 0;
+    p->clear_tid = 0;
 
     fpu_release(p);
-    memset(p->vmas, 0, sizeof(p->vmas));
+    memset(p->leader->vmas, 0, sizeof(p->leader->vmas));
     proc_signal_exec(p);
     for (int i = 0; i < MAX_FDS; i++) {
-        if (p->fds[i] && fd_cloexec_get(p, i)) {
-            struct file *f = p->fds[i];
-            p->fds[i] = NULL;
+        if (p->leader->fds[i] && fd_cloexec_get(p, i)) {
+            struct file *f = p->leader->fds[i];
+            p->leader->fds[i] = NULL;
             fd_cloexec_set(p, i, 0);
             file_close(f);
         }
     }
-    p->heap_start = p->brk = ALIGN_UP(top, PAGE_SIZE);
-    p->stack_low = ALIGN_DOWN(sp, PAGE_SIZE) - STACK_SLACK;
+    p->leader->heap_start = p->leader->brk = ALIGN_UP(top, PAGE_SIZE);
+    p->leader->stack_low = ALIGN_DOWN(sp, PAGE_SIZE) - STACK_SLACK;
 
     const char *base = strrchr(path, '/');
     strlcpy(p->name, base ? base + 1 : path, sizeof(p->name));

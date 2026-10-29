@@ -23,11 +23,20 @@
  * With several processors, each runs its own processes, picked from the
  * one table, and has its own idle process (smp.c), whose time counts as
  * slot 0's. A process blocked or preempted on one may go on on another.
+ *
+ * Threads (proc.h) are scheduled like processes. The process ends when its
+ * last thread does, or when one of them calls exit() or takes a fatal
+ * signal: the others are killed first, and the last one standing frees
+ * what they shared and leaves the leader a zombie for the parent's
+ * waitpid(). A thread that ends before that frees nothing but its own
+ * slot, which the next allocation reaps; a leader that ends early stays as
+ * a zombie holding the shared state until the process is over.
  */
 #include "kernel.h"
 #include "drivers.h"
 #include "mm.h"
 #include "proc.h"
+#include "syscall.h"
 #include "tty.h"
 #include "vfs.h"
 #include <flux/syscall.h>
@@ -44,6 +53,8 @@ void proc_init(void)
     idle->pid = 0;
     idle->state = P_RUNNING;
     idle->pd = kernel_pd;
+    idle->leader = idle;
+    idle->nthreads = 1;
     idle->fpu_cpu = -1;
     strcpy(idle->name, "idle");
     struct cpu *c = this_cpu();
@@ -95,8 +106,28 @@ struct proc *proc_find(int pid)
     return p;
 }
 
+/* Threads that have exited and whose slots nobody waits for: free them. */
+static void reap_threads(void)
+{
+    uint8_t *stacks[MAX_PROCS];
+    int n = 0;
+    spin_lock(&sched_lock);
+    for (int i = 1; i < MAX_PROCS; i++) {
+        struct proc *q = &procs[i];
+        if (q->state == P_ZOMBIE && q->reap_self && !on_cpu(q)) {
+            stacks[n++] = q->kstack;
+            q->kstack = NULL;
+            q->state = P_UNUSED;
+        }
+    }
+    spin_unlock(&sched_lock);
+    while (n > 0)
+        kfree(stacks[--n]);
+}
+
 static struct proc *proc_alloc(void)
 {
+    reap_threads();
     uint8_t *kstack = kmalloc(KSTACK_SIZE);
     if (!kstack)
         return NULL;
@@ -109,6 +140,10 @@ static struct proc *proc_alloc(void)
         p->kstack = kstack;
         p->pid = next_pid++;
         p->state = P_EMBRYO;
+        p->leader = p;
+        p->nthreads = 1;
+        p->mm_lock = (struct mutex)MUTEX_INIT("mm");
+        p->fd_lock = (spinlock_t)SPINLOCK_INIT("fd");
         p->pd = kernel_pd;
         p->fpu_cpu = -1;
         p->last_cpu = -1;
@@ -218,6 +253,7 @@ static void sched_switch(void)
         return;
 
     fpu_switch(prev, next);
+    gdt_set_tls(next->tls);             /* %gs is loaded from it on the way back to user mode */
     if (next->kstack)
         tss_set_kernel_stack((uint32_t)next->kstack + KSTACK_SIZE);
     vmm_switch(next->pd);
@@ -459,16 +495,16 @@ void proc_spawn_init(const char *path)
         panic("cannot allocate init process");
     setup_kstack(p, NULL);
     p->pgid = p->pid;
-    p->umask = 022;
-    p->cwd = vfs_root;
+    p->leader->umask = 022;
+    p->leader->cwd = vfs_root;
     vfs_ref(vfs_root);
-    p->ctty = &console_tty;
+    p->leader->ctty = &console_tty;
 
     struct vnode *tty;
     if (vfs_resolve("/dev/tty", NULL, &tty) == 0) {
-        p->fds[0] = file_open(tty, O_RDONLY);
-        p->fds[1] = file_open(tty, O_WRONLY);
-        p->fds[2] = file_open(tty, O_WRONLY);
+        p->leader->fds[0] = file_open(tty, O_RDONLY);
+        p->leader->fds[1] = file_open(tty, O_WRONLY);
+        p->leader->fds[2] = file_open(tty, O_WRONLY);
     }
 
     char *argv[] = { (char *)path, NULL };
@@ -532,8 +568,11 @@ int do_fork(void)
     if (!child)
         return -EAGAIN;
 
+    struct proc *g = parent->leader;
+    mutex_lock(&g->mm_lock);                    /* the other threads' mappings hold still */
     uint32_t *pd = vmm_clone(parent->pd);
     if (!pd) {
+        mutex_unlock(&g->mm_lock);
         proc_release(child);
         return -ENOMEM;
     }
@@ -541,22 +580,24 @@ int do_fork(void)
     setup_kstack(child, parent->tf);
     child->tf->eax = 0;                         /* fork() returns 0 in the child */
 
-    child->ppid = parent->pid;
+    child->ppid = g->pid;                       /* only the calling thread goes on in the child */
     child->pgid = parent->pgid;
     for (int i = 0; i < MAX_FDS; i++)
-        child->fds[i] = file_dup(parent->fds[i]);
-    memcpy(child->fd_cloexec, parent->fd_cloexec, sizeof(child->fd_cloexec));
-    child->umask = parent->umask;
-    child->cwd = parent->cwd;
-    vfs_ref(child->cwd);
-    child->ctty = tty_hold(parent->ctty);
-    child->heap_start = parent->heap_start;
-    child->brk = parent->brk;
-    child->stack_low = parent->stack_low;
-    memcpy(child->vmas, parent->vmas, sizeof(child->vmas));
-    child->sig_ignored = parent->sig_ignored;
+        child->leader->fds[i] = file_dup(parent->leader->fds[i]);
+    memcpy(child->leader->fd_cloexec, parent->leader->fd_cloexec, sizeof(child->leader->fd_cloexec));
+    child->leader->umask = parent->leader->umask;
+    child->leader->cwd = parent->leader->cwd;
+    vfs_ref(child->leader->cwd);
+    child->leader->ctty = tty_hold(parent->leader->ctty);
+    child->leader->heap_start = parent->leader->heap_start;
+    child->leader->brk = parent->leader->brk;
+    child->leader->stack_low = parent->leader->stack_low;
+    memcpy(child->leader->vmas, parent->leader->vmas, sizeof(child->leader->vmas));
+    mutex_unlock(&g->mm_lock);
+    child->tls = parent->tls;                   /* the same thread block, in the copy */
+    child->leader->sig_ignored = parent->leader->sig_ignored;
     child->sig_blocked = parent->sig_blocked;
-    memcpy(child->sig_actions, parent->sig_actions, sizeof(child->sig_actions));
+    memcpy(child->leader->sig_actions, parent->leader->sig_actions, sizeof(child->leader->sig_actions));
     memcpy(child->name, parent->name, sizeof(child->name));
     fpu_fork(child);
 
@@ -568,28 +609,114 @@ int do_fork(void)
 
 static void signal_locked(struct proc *p, int sig);
 
+/* With sched_lock: a thread of g that is still going (not exited, not exiting). */
+static int thread_alive(const struct proc *q, const struct proc *g)
+{
+    return q->leader == g && q->state != P_UNUSED && q->state != P_ZOMBIE && q->state != P_EMBRYO;
+}
+
+static void wake_futex(uint32_t addr);
+
+/* The calling thread ends, and others of its process go on (sched_lock is let go by the switch away). */
+static void exit_this_thread(struct proc *p) __attribute__((noreturn));
+static void exit_this_thread(struct proc *p)
+{
+    struct proc *g = p->leader;
+    if (p->clear_tid) {                 /* pthread_join() waits for this to become 0 */
+        uint32_t zero = 0;
+        if (copy_to_user((void *)p->clear_tid, &zero, 4) == 0)
+            wake_futex(p->clear_tid);
+    }
+    fpu_release(p);
+    cli();
+    spin_lock(&sched_lock);
+    g->nthreads--;
+    wakeup_locked(&g->nthreads);
+    p->pd = kernel_pd;                  /* (the others' address space goes on without it; cr3 is left as it is) */
+    p->state = P_ZOMBIE;
+    p->reap_self = p != g;              /* the leader stays, holding what the threads share */
+    if (p == g)
+        p->exit_status = 0;
+    sched_switch();
+    panic("exited thread %d was scheduled", p->pid);
+}
+
+/* With nothing held: kill the process's other threads and wait for them to go. 1 if this
+ * thread may go on (it is the last), 0 if another thread is already ending the process. */
+static int kill_other_threads(struct proc *p)
+{
+    struct proc *g = p->leader;
+    spin_lock(&sched_lock);
+    if (g->nthreads <= 1) {
+        spin_unlock(&sched_lock);
+        return 1;
+    }
+    if (g->group_exiting) {
+        spin_unlock(&sched_lock);
+        return 0;
+    }
+    g->group_exiting = 1;
+    for (int i = 1; i < MAX_PROCS; i++) {
+        struct proc *q = &procs[i];
+        if (q != p && thread_alive(q, g)) {
+            __atomic_or_fetch(&q->sig_pending, 1u << SIGKILL, __ATOMIC_RELAXED);
+            if (q->state == P_BLOCKED || q->state == P_SLEEPING || q->state == P_STOPPED) {
+                q->chan = NULL;
+                make_ready(q);
+            } else if (q->state == P_RUNNING && q != this_cpu()->proc) {
+                smp_kick_proc(q);
+            }
+        }
+    }
+    spin_unlock(&sched_lock);
+    for (;;) {
+        prepare_wait(&g->nthreads);
+        spin_lock(&sched_lock);
+        int left = g->nthreads;
+        spin_unlock(&sched_lock);
+        if (left <= 1)
+            break;
+        do_wait();
+    }
+    cancel_wait();
+    spin_lock(&sched_lock);
+    g->group_exiting = 0;
+    spin_unlock(&sched_lock);
+    return 1;
+}
+
 void do_exit(int status)
 {
     struct proc *p = current;
     if (p == init_proc)
         panic("init exited with status %d", status);
     sti();                              /* from a trap's way out, they may be off */
+    if (!kill_other_threads(p))
+        exit_this_thread(p);            /* another thread is ending the process */
 
+    /* The last thread: what the process had goes, and its leader is left for the parent. */
+    struct proc *g = p->leader;
+    if (p->clear_tid) {
+        uint32_t zero = 0;
+        copy_to_user((void *)p->clear_tid, &zero, 4);
+    }
     for (int i = 0; i < MAX_FDS; i++) {
-        if (p->fds[i]) {
-            struct file *f = p->fds[i];
-            p->fds[i] = NULL;
+        if (g->fds[i]) {
+            struct file *f = g->fds[i];
+            g->fds[i] = NULL;
             file_close(f);
         }
     }
-    vfs_unref(p->cwd);
-    p->cwd = NULL;
-    tty_drop(p->ctty);
-    p->ctty = NULL;
-    fb_proc_exit(p->pid);
+    vfs_unref(g->cwd);
+    g->cwd = NULL;
+    tty_drop(g->ctty);
+    g->ctty = NULL;
+    fb_proc_exit(g->pid);
     fpu_release(p);
 
     uint32_t *old = proc_set_pd(p, kernel_pd);
+    if (p != g)
+        proc_set_pd(g, kernel_pd);
     if (old != kernel_pd)
         vmm_destroy(old);
 
@@ -599,7 +726,7 @@ void do_exit(int status)
     /* Orphans are adopted by init, which reaps them. */
     for (int i = 1; i < MAX_PROCS; i++) {
         struct proc *q = &procs[i];
-        if (q->state != P_UNUSED && q->ppid == p->pid) {
+        if (q->state != P_UNUSED && q->ppid == g->pid && q->leader == q) {
             q->ppid = init_proc->pid;
             if (q->state == P_ZOMBIE) {
                 signal_locked(init_proc, SIGCHLD);
@@ -612,9 +739,14 @@ void do_exit(int status)
         }
     }
 
-    p->exit_status = status;
-    p->state = P_ZOMBIE;
-    struct proc *parent = proc_find_locked(p->ppid);
+    g->nthreads = 0;
+    g->exit_status = status;
+    g->state = P_ZOMBIE;
+    if (p != g) {
+        p->state = P_ZOMBIE;
+        p->reap_self = 1;
+    }
+    struct proc *parent = proc_find_locked(g->ppid);
     if (parent) {
         signal_locked(parent, SIGCHLD);
         wakeup_locked(parent);
@@ -624,17 +756,118 @@ void do_exit(int status)
     panic("zombie %d was scheduled", p->pid);
 }
 
+/* pthread_exit(): this thread ends; the process with it if it is the last. A stack to unmap
+ * (a detached thread's own) goes first, once nothing runs on it. */
+void thread_exit(uint32_t unmap_addr, uint32_t unmap_len)
+{
+    struct proc *p = current, *g = p->leader;
+    sti();
+    if (unmap_len) {
+        p->clear_tid = 0;               /* it was on that stack: nothing may be written there now */
+        proc_munmap(p, unmap_addr, unmap_len);
+    }
+    spin_lock(&sched_lock);
+    int last = g->nthreads <= 1;
+    spin_unlock(&sched_lock);
+    if (last)
+        do_exit(0);
+    exit_this_thread(p);
+}
+
+/* A new thread of the calling process, starting at entry with stack pointer stack (and eax 0),
+ * with TLS base tls; clear_tid is zeroed and futex-woken when it exits. Returns its id. */
+int thread_create(uint32_t entry, uint32_t stack, uint32_t tls, uint32_t clear_tid)
+{
+    struct proc *me = current, *g = me->leader;
+    if (entry < USER_BASE || entry >= USER_TOP || stack < USER_BASE || stack > USER_TOP ||
+        (clear_tid && (clear_tid < USER_BASE || clear_tid > USER_TOP - 4)))
+        return -EINVAL;
+    struct proc *t = proc_alloc();
+    if (!t)
+        return -EAGAIN;
+    setup_kstack(t, me->tf);
+    t->tf->eax = 0;
+    t->tf->eip = entry;
+    t->tf->useresp = stack;
+    t->tf->cs = SEG_UCODE;
+    t->tf->ss = t->tf->ds = t->tf->es = t->tf->fs = SEG_UDATA;
+    t->tf->gs = tls ? SEG_USER_TLS : SEG_UDATA;
+    t->tf->eflags = 0x202;
+    t->leader = g;
+    t->nthreads = 0;
+    t->pd = me->pd;
+    t->tls = tls;
+    t->clear_tid = clear_tid;
+    t->ppid = g->ppid;
+    t->pgid = g->pgid;
+    t->sig_blocked = me->sig_blocked;
+    memcpy(t->name, g->name, sizeof(t->name));
+    spin_lock(&sched_lock);
+    if (g->group_exiting || (g->state == P_ZOMBIE && g->nthreads == 0)) {
+        spin_unlock(&sched_lock);
+        proc_release(t);
+        return -EAGAIN;
+    }
+    g->nthreads++;
+    make_ready(t);
+    spin_unlock(&sched_lock);
+    return t->pid;
+}
+
+/* exec(): the process keeps only the calling thread, which becomes its leader if it was not. */
+void proc_exec_alone(struct proc *p)
+{
+    while (!kill_other_threads(p))
+        exit_this_thread(p);            /* (an exit or another exec got there first) */
+    struct proc *g = p->leader;
+    if (g == p)
+        return;
+    /* Take over the leader: its id, its parent, and what the threads shared. */
+    spin_lock(&sched_lock);
+    memcpy(p->fds, g->fds, sizeof(p->fds));
+    memcpy(p->fd_cloexec, g->fd_cloexec, sizeof(p->fd_cloexec));
+    memcpy(p->vmas, g->vmas, sizeof(p->vmas));
+    memcpy(p->sig_actions, g->sig_actions, sizeof(p->sig_actions));
+    p->sig_ignored = g->sig_ignored;
+    p->umask = g->umask;
+    p->cwd = g->cwd;
+    p->ctty = g->ctty;
+    p->heap_start = g->heap_start;
+    p->brk = g->brk;
+    p->stack_low = g->stack_low;
+    memset(g->fds, 0, sizeof(g->fds));
+    g->cwd = NULL;
+    g->ctty = NULL;
+    int tid = p->pid;
+    p->pid = g->pid;
+    p->ppid = g->ppid;
+    p->pgid = g->pgid;
+    p->cpu_ticks += g->cpu_ticks;
+    p->child_ticks += g->child_ticks;
+    p->start_tick = g->start_tick;
+    g->pid = tid;                       /* the old leader goes as the thread it now is */
+    g->reap_self = 1;
+    g->leader = g;
+    g->nthreads = 0;
+    g->pd = kernel_pd;
+    p->leader = p;
+    p->nthreads = 1;
+    p->mm_lock = (struct mutex)MUTEX_INIT("mm");
+    p->fd_lock = (spinlock_t)SPINLOCK_INIT("fd");
+    spin_unlock(&sched_lock);
+}
+
 int do_waitpid(int pid, int *status, int options)
 {
-    struct proc *me = current;
+    struct proc *me = current, *g = me->leader;
     for (;;) {
         int have_children = 0;
-        prepare_wait(me);               /* an exiting child wakes its parent */
+        prepare_wait(g);                /* an exiting child wakes its parent (the process's leader) */
         spin_lock(&sched_lock);
         for (int i = 1; i < MAX_PROCS; i++) {
             struct proc *q = &procs[i];
-            if (q->state == P_UNUSED || q->ppid != me->pid)
-                continue;
+            if (q->state == P_UNUSED || q->ppid != g->pid || q->leader != q || q->reap_self)
+                continue;               /* (a child's threads are not children) */
             if (pid > 0 && q->pid != pid)
                 continue;
             if (pid == 0 && q->pgid != me->pgid)
@@ -642,10 +875,10 @@ int do_waitpid(int pid, int *status, int options)
             if (pid < -1 && q->pgid != -pid)
                 continue;
             have_children = 1;
-            if (q->state == P_ZOMBIE) {
+            if (q->state == P_ZOMBIE && q->nthreads == 0) {
                 int r = q->pid, code = q->exit_status;
                 uint8_t *kstack = q->kstack;
-                me->child_ticks += q->cpu_ticks + q->child_ticks;
+                g->child_ticks += q->cpu_ticks + q->child_ticks;
                 q->kstack = NULL;
                 q->state = P_UNUSED;
                 spin_unlock(&sched_lock);
@@ -689,10 +922,16 @@ int do_setpgid(int pid, int pgid)
     spin_lock(&sched_lock);
     struct proc *p = pid == 0 ? me : proc_find_locked(pid);
     int r = 0;
-    if (!p || p->state == P_ZOMBIE || (p != me && p->ppid != me->pid))
+    if (p)
+        p = p->leader;
+    if (!p || (p->state == P_ZOMBIE && p->nthreads == 0) || (p != me->leader && p->ppid != me->leader->pid))
         r = -ESRCH;
-    else
-        p->pgid = pgid == 0 ? p->pid : pgid;
+    else {
+        int ng = pgid == 0 ? p->pid : pgid;
+        for (int i = 1; i < MAX_PROCS; i++)     /* every thread of it */
+            if (procs[i].state != P_UNUSED && procs[i].leader == p)
+                procs[i].pgid = ng;
+    }
     spin_unlock(&sched_lock);
     return r;
 }
@@ -702,7 +941,7 @@ int do_getpgid(int pid)
     struct proc *me = current;
     spin_lock(&sched_lock);
     struct proc *p = pid == 0 ? me : proc_find_locked(pid);
-    int r = p ? p->pgid : -ESRCH;
+    int r = p ? p->leader->pgid : -ESRCH;
     spin_unlock(&sched_lock);
     return r;
 }
@@ -736,10 +975,12 @@ static void deliver(struct proc *p, int sig)
  * unless it asked for none with SA_NOCLDSTOP), and wake its waitpid(). */
 static void notify_parent_locked(struct proc *p)
 {
+    if (p->leader != p)
+        return;                         /* the process's leader speaks for it */
     struct proc *parent = proc_find_locked(p->ppid);
     if (!parent)
         return;
-    if (!(parent->sig_actions[SIGCHLD].fsa_flags & SA_NOCLDSTOP))
+    if (!(parent->leader->sig_actions[SIGCHLD].fsa_flags & SA_NOCLDSTOP))
         signal_locked(parent, SIGCHLD);
     wakeup_locked(parent);
 }
@@ -757,26 +998,91 @@ static void continue_locked(struct proc *p)
     notify_parent_locked(p);
 }
 
+/* With sched_lock: the thread of p's process to give a signal sent to the process: p if it can
+ * take it, else one that does not block it, else any that is still going (NULL if none is). */
+static struct proc *signal_thread(struct proc *p, int sig)
+{
+    struct proc *g = p->leader, *any = NULL;
+    int live = p->state != P_ZOMBIE && p->state != P_UNUSED && p->state != P_EMBRYO;
+    if (live && (g->nthreads <= 1 || !(p->sig_blocked & (1u << sig))))
+        return p;
+    for (int i = 1; i < MAX_PROCS; i++) {
+        struct proc *q = &procs[i];
+        if (!thread_alive(q, g))
+            continue;
+        if (!(q->sig_blocked & (1u << sig)))
+            return q;
+        if (!any)
+            any = q;
+    }
+    return live ? p : any;
+}
+
 static void signal_locked(struct proc *p, int sig)
 {
     if (sig <= 0 || sig >= NSIG || !p || p->pid <= 0 || p->kthread)
         return;
-    if (p->state == P_UNUSED || p->state == P_ZOMBIE || p->state == P_EMBRYO)
+    if (p->state == P_UNUSED || p->state == P_EMBRYO)
         return;
-    uint32_t h = p->sig_actions[sig].fsa_handler;
-    if (p->pid == 1 && h < USER_BASE)
+    if (p->state == P_ZOMBIE && (p->leader != p || p->nthreads == 0))
+        return;                         /* (a leader that ended early still stands for its threads) */
+    struct proc *g = p->leader;
+    uint32_t h = g->sig_actions[sig].fsa_handler;
+    if (g->pid == 1 && h < USER_BASE)
         return;
-    if (sig == SIGCONT)
-        continue_locked(p);
-    else if (STOP_SIGS & (1u << sig))
-        __atomic_and_fetch(&p->sig_pending, ~(1u << SIGCONT), __ATOMIC_RELAXED);
+    int every = g->nthreads > 1 && (sig == SIGKILL || sig == SIGCONT ||
+                                    ((STOP_SIGS & (1u << sig)) && (sig == SIGSTOP || h == SIGDISP_DFL)));
+    if (sig == SIGCONT) {
+        for (int i = 1; i < MAX_PROCS && every; i++)
+            if (thread_alive(&procs[i], g) && &procs[i] != g)
+                continue_locked(&procs[i]);
+        if (g->state != P_ZOMBIE)
+            continue_locked(g);
+    } else if (STOP_SIGS & (1u << sig)) {
+        for (int i = 1; i < MAX_PROCS; i++)
+            if (thread_alive(&procs[i], g))
+                __atomic_and_fetch(&procs[i].sig_pending, ~(1u << SIGCONT), __ATOMIC_RELAXED);
+    }
     if (sig != SIGKILL && sig != SIGSTOP) {
-        if ((p->sig_ignored & (1u << sig)) || h == SIGDISP_IGN)
+        if ((g->sig_ignored & (1u << sig)) || h == SIGDISP_IGN)
             return;
         if (h == SIGDISP_DFL && sig_default_ignore(sig))
             return;
     }
-    deliver(p, sig);
+    if (every) {                        /* it is for every thread: they all stop, or all go */
+        for (int i = 1; i < MAX_PROCS; i++)
+            if (thread_alive(&procs[i], g))
+                deliver(&procs[i], sig);
+        return;
+    }
+    struct proc *t = signal_thread(p, sig);
+    if (t)
+        deliver(t, sig);
+}
+
+/* pthread_kill(): a signal for one thread of the caller's process. */
+int do_tkill(int tid, int sig)
+{
+    if (sig < 0 || sig >= NSIG)
+        return -EINVAL;
+    struct proc *me = current;
+    spin_lock(&sched_lock);
+    struct proc *t = proc_find_locked(tid);
+    int r = 0;
+    if (!t || t->leader != me->leader || !thread_alive(t, me->leader))
+        r = -ESRCH;
+    else if (sig) {
+        uint32_t h = t->leader->sig_actions[sig].fsa_handler;
+        int ignored = sig != SIGKILL && sig != SIGSTOP &&
+                      ((t->leader->sig_ignored & (1u << sig)) || h == SIGDISP_IGN ||
+                       (h == SIGDISP_DFL && sig_default_ignore(sig)));
+        if (sig == SIGCONT || (STOP_SIGS & (1u << sig)) || sig == SIGKILL)
+            signal_locked(t, sig);      /* these are the whole process's */
+        else if (!ignored)
+            deliver(t, sig);
+    }
+    spin_unlock(&sched_lock);
+    return r;
 }
 
 void proc_signal(struct proc *p, int sig)
@@ -793,11 +1099,11 @@ void proc_signal_force(struct proc *p, int sig)
         panic("fault in idle task");
     spin_lock(&sched_lock);
     uint32_t bit = 1u << sig;
-    if ((p->sig_ignored & bit) || p->sig_actions[sig].fsa_handler == SIGDISP_IGN ||
+    if ((p->leader->sig_ignored & bit) || p->leader->sig_actions[sig].fsa_handler == SIGDISP_IGN ||
         (p->sig_blocked & bit)) {
-        p->sig_ignored &= ~bit;
+        p->leader->sig_ignored &= ~bit;
         p->sig_blocked &= ~bit;
-        p->sig_actions[sig].fsa_handler = SIGDISP_DFL;
+        p->leader->sig_actions[sig].fsa_handler = SIGDISP_DFL;
     }
     deliver(p, sig);
     spin_unlock(&sched_lock);
@@ -807,7 +1113,7 @@ void proc_signal_group(int pgid, int sig)
 {
     spin_lock(&sched_lock);
     for (int i = 1; i < MAX_PROCS; i++)
-        if (procs[i].state != P_UNUSED && procs[i].pgid == pgid)
+        if (procs[i].state != P_UNUSED && procs[i].pgid == pgid && procs[i].leader == &procs[i])
             signal_locked(&procs[i], sig);
     spin_unlock(&sched_lock);
 }
@@ -817,7 +1123,7 @@ void proc_signal_ctty(struct tty *t, int sig)
 {
     spin_lock(&sched_lock);
     for (int i = 1; i < MAX_PROCS; i++)
-        if (procs[i].state != P_UNUSED && procs[i].ctty == t)
+        if (procs[i].state != P_UNUSED && procs[i].leader == &procs[i] && procs[i].ctty == t)
             signal_locked(&procs[i], sig);
     spin_unlock(&sched_lock);
 }
@@ -826,13 +1132,13 @@ void proc_signal_exec(struct proc *p)
 {
     spin_lock(&sched_lock);
     for (int i = 1; i < NSIG; i++) {
-        if (p->sig_actions[i].fsa_handler != SIGDISP_IGN && !(p->sig_ignored & (1u << i))) {
-            memset(&p->sig_actions[i], 0, sizeof(p->sig_actions[i]));
+        if (p->leader->sig_actions[i].fsa_handler != SIGDISP_IGN && !(p->leader->sig_ignored & (1u << i))) {
+            memset(&p->leader->sig_actions[i], 0, sizeof(p->leader->sig_actions[i]));
         } else {
-            p->sig_actions[i].fsa_handler = SIGDISP_IGN;
-            p->sig_actions[i].fsa_mask = 0;
-            p->sig_actions[i].fsa_flags = 0;
-            p->sig_actions[i].fsa_restorer = 0;
+            p->leader->sig_actions[i].fsa_handler = SIGDISP_IGN;
+            p->leader->sig_actions[i].fsa_mask = 0;
+            p->leader->sig_actions[i].fsa_flags = 0;
+            p->leader->sig_actions[i].fsa_restorer = 0;
         }
     }
     spin_unlock(&sched_lock);
@@ -847,9 +1153,11 @@ int do_kill(int pid, int sig)
     int r = 0;
     if (pid > 0) {
         struct proc *p = proc_find_locked(pid);
-        if (!p || p->state == P_ZOMBIE || p->state == P_EMBRYO)
+        if (p)
+            p = p->leader;              /* a thread's id names its process */
+        if (!p || (p->state == P_ZOMBIE && p->nthreads == 0) || p->state == P_EMBRYO)
             r = -ESRCH;
-        else if (p->kthread || (p->pid == 1 && sig && (sig == SIGKILL || p->sig_actions[sig].fsa_handler < USER_BASE)))
+        else if (p->kthread || (p->pid == 1 && sig && (sig == SIGKILL || p->leader->sig_actions[sig].fsa_handler < USER_BASE)))
             r = -EPERM;
         else if (sig)
             signal_locked(p, sig);
@@ -861,9 +1169,10 @@ int do_kill(int pid, int sig)
     int found = 0;
     for (int i = 1; i < MAX_PROCS; i++) {
         struct proc *p = &procs[i];
-        if (p->state == P_UNUSED || p->state == P_ZOMBIE || p->state == P_EMBRYO || p->pid == 1)
+        if (p->state == P_UNUSED || (p->state == P_ZOMBIE && p->nthreads == 0) || p->state == P_EMBRYO ||
+            p->pid == 1 || p->leader != p)
             continue;
-        if (pid == -1 ? p == me : p->pgid != pgid)
+        if (pid == -1 ? p == me->leader : p->pgid != pgid)
             continue;
         found = 1;
         if (sig)
@@ -900,7 +1209,7 @@ static int try_stop(struct proc *p, int sig, uint32_t mask)
 {
     uint32_t bit = 1u << sig;
     spin_lock(&sched_lock);
-    if (sig != SIGSTOP && ((p->sig_ignored & bit) || p->sig_actions[sig].fsa_handler != SIGDISP_DFL)) {
+    if (sig != SIGSTOP && ((p->leader->sig_ignored & bit) || p->leader->sig_actions[sig].fsa_handler != SIGDISP_DFL)) {
         spin_unlock(&sched_lock);
         return 0;
     }
@@ -946,10 +1255,10 @@ void proc_check_signals(void)
         if (sig == SIGKILL)
             do_exit(sig);
         spin_lock(&sched_lock);
-        struct flux_sigaction sa = p->sig_actions[sig];
-        uint32_t ignored = p->sig_ignored & bit;
+        struct flux_sigaction sa = p->leader->sig_actions[sig];
+        uint32_t ignored = p->leader->sig_ignored & bit;
         if (!ignored && sa.fsa_handler >= USER_BASE && (sa.fsa_flags & SA_RESETHAND))
-            p->sig_actions[sig].fsa_handler = SIGDISP_DFL;
+            p->leader->sig_actions[sig].fsa_handler = SIGDISP_DFL;
         spin_unlock(&sched_lock);
         if (ignored || sa.fsa_handler == SIGDISP_IGN)
             continue;
@@ -1028,7 +1337,9 @@ void proc_check_signals(void)
         tf->eflags &= ~0x400u;                  /* clear DF for handler entry */
         if (based || tf->cs != SEG_UCODE) {
             tf->cs = SEG_UCODE;
-            tf->ss = tf->ds = tf->es = tf->fs = tf->gs = SEG_UDATA;
+            tf->ss = tf->ds = tf->es = tf->fs = SEG_UDATA;
+            if (tf->gs != SEG_USER_TLS)         /* (the handler may want its thread block) */
+                tf->gs = SEG_UDATA;
         }
         break;
     }
@@ -1038,7 +1349,7 @@ void proc_check_signals(void)
 static struct proc_vma *find_vma(struct proc *p, uint32_t addr)
 {
     for (int i = 0; i < MAX_VMAS; i++) {
-        struct proc_vma *v = &p->vmas[i];
+        struct proc_vma *v = &p->leader->vmas[i];
         if (v->end > v->start && addr >= v->start && addr < v->end)
             return v;
     }
@@ -1050,11 +1361,11 @@ static void coalesce_vmas(struct proc *p)
     for (int changed = 1; changed;) {
         changed = 0;
         for (int i = 0; i < MAX_VMAS; i++) {
-            struct proc_vma *a = &p->vmas[i];
+            struct proc_vma *a = &p->leader->vmas[i];
             if (a->end <= a->start)
                 continue;
             for (int j = 0; j < MAX_VMAS; j++) {
-                struct proc_vma *b = &p->vmas[j];
+                struct proc_vma *b = &p->leader->vmas[j];
                 if (i == j || b->end <= b->start)
                     continue;
                 if (a->end == b->start && a->prot == b->prot && a->flags == b->flags) {
@@ -1072,8 +1383,8 @@ uint32_t proc_vma_lowest(const struct proc *p)
 {
     uint32_t low = USER_MMIO_BASE;
     for (int i = 0; i < MAX_VMAS; i++)
-        if (p->vmas[i].end > p->vmas[i].start && p->vmas[i].start < low)
-            low = p->vmas[i].start;
+        if (p->leader->vmas[i].end > p->leader->vmas[i].start && p->leader->vmas[i].start < low)
+            low = p->leader->vmas[i].start;
     return low;
 }
 
@@ -1083,7 +1394,7 @@ static int vma_slots_after_unmap(const struct proc *p, uint32_t addr, uint32_t e
 {
     int slots = 0;
     for (int i = 0; i < MAX_VMAS; i++) {
-        const struct proc_vma *v = &p->vmas[i];
+        const struct proc_vma *v = &p->leader->vmas[i];
         if (v->end <= v->start || (addr <= v->start && end >= v->end))
             slots++;                            /* free, or about to be */
         else if (v->start < addr && end < v->end)
@@ -1092,20 +1403,20 @@ static int vma_slots_after_unmap(const struct proc *p, uint32_t addr, uint32_t e
     return slots;
 }
 
-int proc_munmap(struct proc *p, uint32_t addr, uint32_t len)
+static int munmap_locked(struct proc *p, uint32_t addr, uint32_t len)
 {
     if (!len || (addr & (PAGE_SIZE - 1)))
         return -EINVAL;
     uint32_t end = ALIGN_UP(addr + len, PAGE_SIZE);
     if (addr < USER_BASE || end > USER_MMIO_BASE || end <= addr)
         return -EINVAL;
-    if (fb_pinned(p->pid, addr, end))
+    if (fb_pinned(p->leader->pid, addr, end))
         return -EBUSY;
     if (vma_slots_after_unmap(p, addr, end) < 0)
         return -ENOMEM;
 
     for (int i = 0; i < MAX_VMAS; i++) {
-        struct proc_vma *v = &p->vmas[i];
+        struct proc_vma *v = &p->leader->vmas[i];
         if (v->end <= v->start || end <= v->start || addr >= v->end)
             continue;
         if (addr <= v->start && end >= v->end) {
@@ -1118,11 +1429,11 @@ int proc_munmap(struct proc *p, uint32_t addr, uint32_t len)
             uint32_t old_end = v->end;
             v->end = addr;
             for (int k = 0; k < MAX_VMAS; k++) {
-                if (p->vmas[k].end <= p->vmas[k].start) {
-                    p->vmas[k].start = end;
-                    p->vmas[k].end = old_end;
-                    p->vmas[k].prot = v->prot;
-                    p->vmas[k].flags = v->flags;
+                if (p->leader->vmas[k].end <= p->leader->vmas[k].start) {
+                    p->leader->vmas[k].start = end;
+                    p->leader->vmas[k].end = old_end;
+                    p->leader->vmas[k].prot = v->prot;
+                    p->leader->vmas[k].flags = v->flags;
                     break;
                 }
             }
@@ -1133,7 +1444,7 @@ int proc_munmap(struct proc *p, uint32_t addr, uint32_t len)
     return 0;
 }
 
-int proc_mprotect(struct proc *p, uint32_t addr, uint32_t len, uint32_t prot)
+static int mprotect_locked(struct proc *p, uint32_t addr, uint32_t len, uint32_t prot)
 {
     if ((addr & (PAGE_SIZE - 1)) || (prot & ~(uint32_t)(PROT_READ | PROT_WRITE | PROT_EXEC)))
         return -EINVAL;
@@ -1145,7 +1456,7 @@ int proc_mprotect(struct proc *p, uint32_t addr, uint32_t len, uint32_t prot)
 
     int free_slots = 0, need_slots = 0;
     for (int i = 0; i < MAX_VMAS; i++) {
-        const struct proc_vma *v = &p->vmas[i];
+        const struct proc_vma *v = &p->leader->vmas[i];
         if (v->end <= v->start) {
             free_slots++;
         } else if (v->prot != prot && end > v->start && addr < v->end) {
@@ -1164,7 +1475,7 @@ int proc_mprotect(struct proc *p, uint32_t addr, uint32_t len, uint32_t prot)
     }
 
     for (int i = 0; i < MAX_VMAS; i++) {
-        struct proc_vma *v = &p->vmas[i];
+        struct proc_vma *v = &p->leader->vmas[i];
         if (v->end <= v->start || v->prot == prot || end <= v->start || addr >= v->end)
             continue;
         uint32_t orig_start = v->start, orig_end = v->end;
@@ -1175,16 +1486,16 @@ int proc_mprotect(struct proc *p, uint32_t addr, uint32_t len, uint32_t prot)
         v->prot = prot;
         if (orig_start < mid_s) {
             for (int k = 0; k < MAX_VMAS; k++) {
-                if (p->vmas[k].end <= p->vmas[k].start) {
-                    p->vmas[k] = (struct proc_vma){ orig_start, mid_s, orig_prot, orig_flags };
+                if (p->leader->vmas[k].end <= p->leader->vmas[k].start) {
+                    p->leader->vmas[k] = (struct proc_vma){ orig_start, mid_s, orig_prot, orig_flags };
                     break;
                 }
             }
         }
         if (mid_e < orig_end) {
             for (int k = 0; k < MAX_VMAS; k++) {
-                if (p->vmas[k].end <= p->vmas[k].start) {
-                    p->vmas[k] = (struct proc_vma){ mid_e, orig_end, orig_prot, orig_flags };
+                if (p->leader->vmas[k].end <= p->leader->vmas[k].start) {
+                    p->leader->vmas[k] = (struct proc_vma){ mid_e, orig_end, orig_prot, orig_flags };
                     break;
                 }
             }
@@ -1197,7 +1508,7 @@ int proc_mprotect(struct proc *p, uint32_t addr, uint32_t len, uint32_t prot)
     return 0;
 }
 
-int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint32_t *out)
+static int mmap_locked(struct proc *p, const struct flux_mmap_args *a, uint32_t *out)
 {
     if (!a->len)
         return -EINVAL;
@@ -1211,7 +1522,7 @@ int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint32_t *out)
     if (len < a->len || len > USER_MMIO_BASE - USER_BASE)
         return -ENOMEM;
 
-    uint32_t brk_end = ALIGN_UP(p->brk, PAGE_SIZE);
+    uint32_t brk_end = ALIGN_UP(p->leader->brk, PAGE_SIZE);
     uint32_t start = 0;
     if (a->flags & MAP_FIXED) {
         if ((a->addr & (PAGE_SIZE - 1)) || a->addr < brk_end ||
@@ -1220,7 +1531,7 @@ int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint32_t *out)
         /* The new mapping's slot must be there before the old one goes. */
         if (vma_slots_after_unmap(p, a->addr, a->addr + len) < 1)
             return -ENOMEM;
-        int r = proc_munmap(p, a->addr, len);
+        int r = munmap_locked(p, a->addr, len);
         if (r < 0)
             return r;
         start = a->addr;
@@ -1230,7 +1541,7 @@ int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint32_t *out)
         if (hint >= floor && hint < USER_MMIO_BASE && len <= USER_MMIO_BASE - hint) {
             int ok = 1;
             for (int i = 0; i < MAX_VMAS; i++) {
-                const struct proc_vma *v = &p->vmas[i];
+                const struct proc_vma *v = &p->leader->vmas[i];
                 if (v->end > v->start && v->start < hint + len && hint < v->end) {
                     ok = 0;
                     break;
@@ -1247,7 +1558,7 @@ int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint32_t *out)
                     return -ENOMEM;
                 uint32_t cand_start = cand_end - len;
                 for (int i = 0; i < MAX_VMAS; i++) {
-                    const struct proc_vma *v = &p->vmas[i];
+                    const struct proc_vma *v = &p->leader->vmas[i];
                     if (v->end > v->start && v->start < cand_end && cand_start < v->end) {
                         cand_end = v->start;
                         moved = 1;
@@ -1262,7 +1573,7 @@ int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint32_t *out)
 
     int slot = -1;
     for (int i = 0; i < MAX_VMAS; i++) {
-        if (p->vmas[i].end <= p->vmas[i].start) {
+        if (p->leader->vmas[i].end <= p->leader->vmas[i].start) {
             slot = i;
             break;
         }
@@ -1283,14 +1594,59 @@ int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint32_t *out)
         }
     }
 
-    p->vmas[slot].start = start;
-    p->vmas[slot].end = start + len;
-    p->vmas[slot].prot = a->prot;
-    p->vmas[slot].flags = a->flags & (MAP_SHARED | MAP_PRIVATE | MAP_ANONYMOUS);
+    p->leader->vmas[slot].start = start;
+    p->leader->vmas[slot].end = start + len;
+    p->leader->vmas[slot].prot = a->prot;
+    p->leader->vmas[slot].flags = a->flags & (MAP_SHARED | MAP_PRIVATE | MAP_ANONYMOUS);
     coalesce_vmas(p);
     *out = start;
     return 0;
 }
+
+/* The mappings change, or a page is faulted in, with the process's mm_lock: its threads share them.
+ * (A fault in kernel code holding a spinlock, which cannot sleep, goes without.) */
+static int mm_enter(struct proc *p)
+{
+    uint32_t flags = irq_save();
+    int held = this_cpu()->nlocks > 0;
+    irq_restore(flags);
+    if (held)
+        return 0;
+    mutex_lock(&p->leader->mm_lock);
+    return 1;
+}
+
+static void mm_leave(struct proc *p, int locked)
+{
+    if (locked)
+        mutex_unlock(&p->leader->mm_lock);
+}
+
+int proc_munmap(struct proc *p, uint32_t addr, uint32_t len)
+{
+    int locked = mm_enter(p);
+    int r = munmap_locked(p, addr, len);
+    mm_leave(p, locked);
+    return r;
+}
+
+int proc_mprotect(struct proc *p, uint32_t addr, uint32_t len, uint32_t prot)
+{
+    int locked = mm_enter(p);
+    int r = mprotect_locked(p, addr, len, prot);
+    mm_leave(p, locked);
+    return r;
+}
+
+int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint32_t *out)
+{
+    int locked = mm_enter(p);
+    int r = mmap_locked(p, a, out);
+    mm_leave(p, locked);
+    return r;
+}
+
+static int page_fault_locked(struct proc *p, uint32_t addr, int write);
 
 /* Resolve a user page fault: COW break, demand-paged mmap VMA or stack growth. */
 int proc_page_fault(uint32_t addr, int write)
@@ -1298,6 +1654,14 @@ int proc_page_fault(uint32_t addr, int write)
     struct proc *p = current;
     if (!p || p->kthread || addr < USER_BASE || addr >= USER_TOP)
         return 0;
+    int locked = mm_enter(p);
+    int r = page_fault_locked(p, addr, write);
+    mm_leave(p, locked);
+    return r;
+}
+
+static int page_fault_locked(struct proc *p, uint32_t addr, int write)
+{
     if (vmm_pte_present(p->pd, addr)) {
         if (!vmm_translate(p->pd, addr))
             return 0;                       /* PROT_NONE page */
@@ -1309,13 +1673,13 @@ int proc_page_fault(uint32_t addr, int write)
             return 0;
         return vmm_alloc_prot(p->pd, addr, v->prot, v->flags) == 0;
     }
-    if (addr < USER_STACK_LIMIT || addr >= USER_STACK_TOP || addr < p->brk)
+    if (addr < USER_STACK_LIMIT || addr >= USER_STACK_TOP || addr < p->leader->brk)
         return 0;
     if (vmm_alloc(p->pd, addr) < 0)
         return 0;
     uint32_t page = ALIGN_DOWN(addr, PAGE_SIZE);
-    if (page < p->stack_low)
-        p->stack_low = page;
+    if (page < p->leader->stack_low)
+        p->leader->stack_low = page;
     return 1;
 }
 
@@ -1323,6 +1687,74 @@ int proc_page_fault(uint32_t addr, int write)
 int proc_grow_stack(uint32_t addr)
 {
     return proc_page_fault(addr, 0);
+}
+
+/* ---- futexes ----
+ *
+ * A thread waits on a word of its process's memory while the word holds what it expects; another
+ * wakes the waiters on that word. The waiters sleep on a channel picked by a hash of the process and
+ * the address, so unrelated futexes may share one: a wakeup is then spurious, which callers allow for.
+ * The word is read after the thread is marked as waiting, so a wakeup between the read and the sleep
+ * is not lost.
+ */
+static uint8_t futex_chans[64];
+
+static void *futex_chan(const struct proc *g, uint32_t addr)
+{
+    uint32_t h = ((uint32_t)(uintptr_t)g >> 4) * 2654435761u ^ (addr >> 2) * 40503u;
+    return &futex_chans[(h ^ h >> 13) % sizeof(futex_chans)];
+}
+
+static void wake_futex(uint32_t addr)
+{
+    wakeup(futex_chan(current->leader, addr));
+}
+
+/* Sleep while the word at addr is val: 0 when woken (perhaps spuriously), -EAGAIN if it was not val,
+ * -ETIMEDOUT after timeout_ms (< 0: no limit), -EINTR for a signal. */
+int futex_wait(uint32_t addr, uint32_t val, int timeout_ms)
+{
+    struct proc *p = current;
+    if ((addr & 3) || addr < USER_BASE || addr > USER_TOP - 4)
+        return -EINVAL;
+    if (timeout_ms == 0)
+        return -ETIMEDOUT;
+    void *chan = futex_chan(p->leader, addr);
+    uint32_t deadline = 0;
+    if (timeout_ms > 0) {
+        deadline = ticks + ((uint32_t)timeout_ms * HZ + 999) / 1000;
+        prepare_wait_timeout(chan, deadline);
+    } else {
+        prepare_wait(chan);
+    }
+    uint32_t cur;
+    if (copy_from_user(&cur, (const void *)addr, 4) < 0) {
+        cancel_wait();
+        return -EFAULT;
+    }
+    if (cur != val) {
+        cancel_wait();
+        return -EAGAIN;
+    }
+    if (signal_pending(p)) {
+        cancel_wait();
+        return -EINTR;
+    }
+    do_wait();
+    if (signal_pending(p))
+        return -EINTR;
+    if (timeout_ms > 0 && (int32_t)(ticks - deadline) >= 0)
+        return -ETIMEDOUT;
+    return 0;
+}
+
+int futex_wake(uint32_t addr, int n)
+{
+    if ((addr & 3) || addr < USER_BASE || addr > USER_TOP - 4)
+        return -EINVAL;
+    if (n > 0)
+        wake_futex(addr);
+    return 0;
 }
 
 int proc_info(int slot, struct procinfo *pi)

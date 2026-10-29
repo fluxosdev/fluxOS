@@ -1,7 +1,8 @@
 /*
  * Execution of syntax trees: simple commands, pipelines, compound
  * commands, redirections and background jobs (each job gets its own
- * process group so ^C only reaches the foreground).
+ * process group so ^C only reaches the foreground). ^Z stops the
+ * foreground job: it becomes a suspended job, which fg and bg go on with.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -20,7 +21,10 @@
 
 struct job {
     int id;
-    int pid;
+    int pid;                    /* its process group (the first process) */
+    int pids[MAX_PIPE];         /* the processes still to be waited for */
+    int npids;
+    int stopped;                /* suspended by ^Z (or a stop signal) */
     char *text;
 };
 
@@ -102,7 +106,8 @@ int jobs_count(void)
     return n;
 }
 
-static struct job *job_add(int pid, const char *text)
+/* A job of process group pgid, waiting for n processes. */
+static struct job *job_add(int pgid, const int *pids, int n, const char *text)
 {
     int id = 1;
     for (int i = 0; i < MAX_JOBS; i++)
@@ -111,7 +116,10 @@ static struct job *job_add(int pid, const char *text)
     for (int i = 0; i < MAX_JOBS; i++) {
         if (!jobs[i].pid) {
             jobs[i].id = id;
-            jobs[i].pid = pid;
+            jobs[i].pid = pgid;
+            jobs[i].npids = n < MAX_PIPE ? n : MAX_PIPE;
+            memcpy(jobs[i].pids, pids, sizeof(int) * (size_t)jobs[i].npids);
+            jobs[i].stopped = 0;
             jobs[i].text = xstrdup(text ? text : "");
             return &jobs[i];
         }
@@ -136,10 +144,22 @@ static const char *status_word(int st)
 void jobs_reap(int notify)
 {
     int st, pid;
-    while ((pid = waitpid(-1, &st, WNOHANG)) > 0) {
+    while ((pid = waitpid(-1, &st, WNOHANG | WUNTRACED)) > 0) {
         for (int i = 0; i < MAX_JOBS; i++) {
-            if (jobs[i].pid != pid)
+            int k = 0;
+            while (k < jobs[i].npids && jobs[i].pids[k] != pid)
+                k++;
+            if (!jobs[i].pid || k == jobs[i].npids)
                 continue;
+            if (WIFSTOPPED(st)) {       /* stopped in the background (kill -STOP, or it read the terminal) */
+                if (!jobs[i].stopped && notify)
+                    fprintf(stderr, "[%d]  + suspended  %s\n", jobs[i].id, jobs[i].text);
+                jobs[i].stopped = 1;
+                continue;
+            }
+            jobs[i].pids[k] = jobs[i].pids[--jobs[i].npids];
+            if (jobs[i].npids)
+                continue;               /* the rest of its pipeline is still going */
             if (notify) {
                 if (WIFEXITED(st) && WEXITSTATUS(st))
                     fprintf(stderr, "[%d]  + exit %d     %s\n", jobs[i].id, WEXITSTATUS(st), jobs[i].text);
@@ -179,7 +199,8 @@ void jobs_list(void)
     struct job *cur = job_find(NULL);
     for (int i = 0; i < MAX_JOBS; i++)
         if (jobs[i].pid)
-            printf("[%d]  %c running    %s\n", jobs[i].id, &jobs[i] == cur ? '+' : ' ', jobs[i].text);
+            printf("[%d]  %c %-10s %s\n", jobs[i].id, &jobs[i] == cur ? '+' : ' ',
+                   jobs[i].stopped ? "suspended" : "running", jobs[i].text);
 }
 
 /* ---- waiting and status reporting ---- */
@@ -194,13 +215,23 @@ static int decode_status(int st, const char *text)
     return 128 + sig;
 }
 
-static int wait_pids(int *pids, int n, const char *text)
+/* Wait for a foreground job's processes (process group pgid). If one of them stops (^Z), the job
+ * becomes a suspended one with the processes not yet done, and its status is 128 + the signal. */
+static int wait_pids(int *pids, int n, int pgid, const char *text)
 {
     int status = 0;
     for (int i = 0; i < n; i++) {
         int st = 0;
-        while (waitpid(pids[i], &st, 0) < 0 && errno == EINTR)
+        while (waitpid(pids[i], &st, sh.interactive ? WUNTRACED : 0) < 0 && errno == EINTR)
             ;
+        if (WIFSTOPPED(st)) {
+            struct job *j = job_add(pgid, pids + i, n - i, text);
+            if (j) {
+                j->stopped = 1;
+                fprintf(stderr, "\n[%d]  + suspended  %s\n", j->id, text ? text : "");
+            }
+            return 128 + WSTOPSIG(st);
+        }
         if (i == n - 1)
             status = decode_status(st, text);
     }
@@ -209,18 +240,31 @@ static int wait_pids(int *pids, int n, const char *text)
 
 int job_wait(struct job *j, int announce)
 {
-    int pid = j->pid;
+    int pgid = j->pid, pids[MAX_PIPE], n = j->npids, stopped = j->stopped;
+    memcpy(pids, j->pids, sizeof(int) * (size_t)n);
     char *text = xstrdup(j->text);
     if (announce)
-        fprintf(stderr, "[%d]  + running    %s\n", j->id, text);
+        fprintf(stderr, "[%d]  + %s  %s\n", j->id, stopped ? "continued" : "running  ", text);
     job_remove(j);
     if (sh.interactive)
-        tcsetpgrp(0, pid);
-    int st = wait_pids(&pid, 1, text);
+        tcsetpgrp(0, pgid);
+    if (stopped)
+        kill(-pgid, SIGCONT);
+    int st = wait_pids(pids, n, pgid, text);
     if (sh.interactive)
         tcsetpgrp(0, sh.shell_pgid);
     free(text);
     return st;
+}
+
+/* bg: a suspended job goes on, in the background. */
+int job_continue(struct job *j)
+{
+    if (!j->stopped)
+        return 0;
+    j->stopped = 0;
+    fprintf(stderr, "[%d]  + continued  %s\n", j->id, j->text);
+    return kill(-j->pid, SIGCONT) < 0;
 }
 
 /* ---- redirections ---- */
@@ -328,6 +372,9 @@ static void reset_signals(void)
     signal(SIGQUIT, SIG_DFL);
     signal(SIGTERM, SIG_DFL);
     signal(SIGPIPE, SIG_DFL);
+    signal(SIGTSTP, SIG_DFL);
+    signal(SIGTTIN, SIG_DFL);
+    signal(SIGTTOU, SIG_DFL);
 }
 
 /* In a fresh child: join the job's process group. */
@@ -506,7 +553,7 @@ static int run_simple(struct node *n, int nofork)
         setpgid(pid, pid);
         tcsetpgrp(0, pid);
     }
-    status = wait_pids(&pid, 1, n->text);
+    status = wait_pids(&pid, 1, pid, n->text);
     if (sh.interactive)
         tcsetpgrp(0, sh.shell_pgid);
 
@@ -575,7 +622,7 @@ static int run_pipeline(struct node *n)
         close(prev);
     if (sh.interactive && pgid > 0)
         tcsetpgrp(0, pgid);
-    int status = wait_pids(pids, count, n->text);
+    int status = wait_pids(pids, count, pgid, n->text);
     if (sh.interactive)
         tcsetpgrp(0, sh.shell_pgid);
     return status;
@@ -597,7 +644,7 @@ static int run_background(struct node *n)
     if (sh.interactive)
         setpgid(pid, pid);
     sh.last_bg_pid = pid;
-    struct job *j = job_add(pid, n->text);
+    struct job *j = job_add(pid, &pid, 1, n->text);
     if (sh.interactive && j)
         fprintf(stderr, "[%d] %d\n", j->id, pid);
     return 0;
@@ -622,7 +669,7 @@ static int run_subshell(struct node *n)
         setpgid(pid, pid);
         tcsetpgrp(0, pid);
     }
-    int st = wait_pids(&pid, 1, "");
+    int st = wait_pids(&pid, 1, pid, "");
     if (sh.interactive)
         tcsetpgrp(0, sh.shell_pgid);
     return st;

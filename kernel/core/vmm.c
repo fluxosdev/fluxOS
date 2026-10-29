@@ -407,7 +407,7 @@ uint32_t *vmm_clone(uint32_t *src)
     uint32_t *pd = vmm_create();
     if (!pd)
         return NULL;
-    int pid = current ? current->pid : 0;
+    int pid = current ? current->leader->pid : 0;
     for (uint32_t i = USER_PDE_FIRST; i < USER_PDE_END; i++) {
         if (!(src[i] & PTE_PRESENT))
             continue;

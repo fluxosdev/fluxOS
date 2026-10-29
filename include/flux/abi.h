@@ -322,6 +322,12 @@ struct flux_mmap_args {
 #define SEG_WIN_CODE   (0x28 | 3)
 #define SEG_WIN_DATA   (0x30 | 3)
 #define SEG_WIN_FS     (0x38 | 3)
+/* SYS_futex operations */
+#define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
+
+/* A thread's TLS segment: %gs:0 is the start of its thread block (SYS_set_tls, SYS_thread_create). */
+#define SEG_USER_TLS   (0xC0 | 3)
 
 /* ---- utime(2) and times(2) ---- */
 struct flux_utimbuf {
@@ -353,6 +359,14 @@ struct flux_tms {
 #define TTY_ICANON 0x2
 #define TTY_ISIG   0x4
 #define TTY_COOKED (TTY_ECHO | TTY_ICANON | TTY_ISIG)
+
+/* A terminal's size, in characters (ioctl on a terminal or a pty's master; setting it sends
+ * SIGWINCH to the terminal's foreground process group). */
+struct winsize {
+    unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel;
+};
+#define TIOCGWINSZ 0x5413
+#define TIOCSWINSZ 0x5414
 
 /* ---- uname(2) ---- */
 struct utsname {

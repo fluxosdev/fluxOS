@@ -4,6 +4,11 @@
  * sees its own addresses: winrun), plus a TSS for each processor, used
  * to find the kernel stack when an interrupt arrives from ring 3 (and by
  * this_cpu() to tell the processors apart).
+ *
+ * Each processor has its own copy, differing in one entry: the TLS
+ * segment (SEG_USER_TLS), whose base is the thread block of the thread
+ * running there. The scheduler sets it at each switch; the thread's %gs
+ * is loaded from it again on the way back to user mode.
  */
 #include "kernel.h"
 #include "arch.h"
@@ -37,8 +42,12 @@ struct tss {
 } __attribute__((packed));
 
 #define GDT_FIXED 8                     /* entries before the TSSs */
-static struct gdt_entry gdt[GDT_FIXED + MAX_CPUS];
-static struct gdt_ptr gdt_desc;
+#define GDT_TLS (GDT_FIXED + MAX_CPUS)  /* after them */
+#define GDT_ENTRIES (GDT_TLS + 1)
+_Static_assert(SEG_USER_TLS == (GDT_TLS << 3 | 3), "SEG_USER_TLS is the TLS entry");
+static struct gdt_entry gdts[MAX_CPUS][GDT_ENTRIES];
+static struct gdt_entry *const gdt = gdts[0];         /* the boot processor's, which the others copy */
+static struct gdt_ptr gdt_desc[MAX_CPUS];
 static struct tss tss[MAX_CPUS];
 
 void gdt_flush(struct gdt_ptr *p);
@@ -72,11 +81,25 @@ void gdt_init(void)
         tss[i].iomap_base = sizeof(tss[i]);     /* no I/O permission bitmap */
         gdt_set(GDT_FIXED + i, (uint32_t)&tss[i], sizeof(tss[i]) - 1, 0x89, 0x00);
     }
+    gdt_set(GDT_TLS, 0, 0xFFFFF, 0xF2, 0xCF);           /* user data until a thread sets its base */
 
-    gdt_desc.limit = sizeof(gdt) - 1;
-    gdt_desc.base = (uint32_t)&gdt;
-    gdt_flush(&gdt_desc);
+    for (int i = 0; i < MAX_CPUS; i++) {
+        if (i)
+            memcpy(gdts[i], gdts[0], sizeof(gdts[0]));
+        gdt_desc[i].limit = sizeof(gdts[i]) - 1;
+        gdt_desc[i].base = (uint32_t)gdts[i];
+    }
+    gdt_flush(&gdt_desc[0]);
     tss_flush(SEG_TSS);
+}
+
+/* The TLS segment of this processor: based at the thread block of the thread about to run here. */
+void gdt_set_tls(uint32_t base)
+{
+    struct gdt_entry *e = &gdts[this_cpu()->index][GDT_TLS];
+    e->base_low = base & 0xFFFF;
+    e->base_mid = (base >> 16) & 0xFF;
+    e->base_high = (base >> 24) & 0xFF;
 }
 
 /* Load a processor's TSS. LTR marks the descriptor busy and refuses one
@@ -84,13 +107,13 @@ void gdt_init(void)
  * (suspend to RAM): it is made available again first. */
 void gdt_load_tr(int cpu)
 {
-    gdt[GDT_FIXED + cpu].access = 0x89;
+    gdts[cpu][GDT_FIXED + cpu].access = 0x89;
     tss_flush(SEG_TSS + 8 * (uint32_t)cpu);
 }
 
 void gdt_init_ap(int cpu)
 {
-    gdt_flush(&gdt_desc);
+    gdt_flush(&gdt_desc[cpu]);
     gdt_load_tr(cpu);
 }
 

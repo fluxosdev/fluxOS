@@ -269,7 +269,9 @@ sysroot: $(LIBC) $(LIBGL) $(LIBFONT) $(CRT0) user/user.ld
 	cp include/flux/*.h $(SYSROOT)/usr/include/flux/
 	cp $(LIBC) $(LIBGL) $(LIBFONT) $(CRT0) $(SYSROOT)/usr/lib/
 	cp user/user.ld $(SYSROOT)/usr/lib/fluxos.ld
-	@echo "$(SYSROOT): headers, libc.a, libGL.a, libfont.a, crt0.o, fluxos.ld"
+	@# threads and real-time calls are in libc.a: -lpthread and -lrt find empty archives
+	for l in pthread rt; do rm -f $(SYSROOT)/usr/lib/lib$$l.a; ar rc $(SYSROOT)/usr/lib/lib$$l.a; done
+	@echo "$(SYSROOT): headers, libc.a (with pthreads), libGL.a, libfont.a, crt0.o, fluxos.ld"
 
 # The cross toolchain (binutils and GCC for i686-fluxos) in build/toolchain/cross.
 .PHONY: toolchain
