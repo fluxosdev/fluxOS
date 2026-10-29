@@ -711,8 +711,74 @@ static void transforms_2d(void)
     puts("browser transforms: order, origins, nested matrices, raster pixels, alpha, clipping, hit testing and flow passed");
 }
 
+static void multicolumn(void)
+{
+    struct page p;
+    /* Nine one-line paragraphs (20 pixels each) in three balanced columns, 1em (16 pixel) gaps. */
+    load(&p, "<style>body{margin:0} p{margin:0} .mc{column-count:3;width:600px} .after{margin:0}</style>"
+             "<div class=mc><p>w1</p><p>w2</p><p>w3</p><p>w4</p><p>w5</p><p>w6</p><p>w7</p><p>w8</p>"
+             "<p><a href=x>w9</a></p></div><p class=after>after</p>", 800, 600);
+    const struct ditem *w1 = word(&p, "w1"), *w3 = word(&p, "w3"), *w4 = word(&p, "w4"), *w7 = word(&p, "w7"),
+                       *w9 = word(&p, "w9");
+    CHECK(w1 && w3 && w4 && w7 && w9);
+    CHECK(w1->x == 0 && w1->y == 0 && w3->x == 0 && w3->y == 40);
+    CHECK(w4->x == 189 + 16 && w4->y == 0 && w7->x == 2 * (189 + 16) && w7->y == 0 && w9->y == 40);
+    CHECK(word(&p, "after")->y == 60);                              /* the box is as tall as a column */
+    CHECK(p.lo.nlinks == 1 && p.lo.links[0].x == w9->x && p.lo.links[0].y == w9->y);
+    unload(&p);
+
+    /* column-width: as many 150 pixel columns as fit in 500 with 10 pixel gaps, sharing what is left. */
+    load(&p, "<style>body{margin:0} p{margin:0} .mc{column-width:150px;column-gap:10px;width:500px}</style>"
+             "<div class=mc><p>a</p><p>b</p><p>c</p></div>", 800, 600);
+    CHECK(word(&p, "a")->x == 0 && word(&p, "b")->x == 170 && word(&p, "c")->x == 340 && word(&p, "c")->y == 0);
+    unload(&p);
+    /* ...but no more than column-count; the columns shorthand sets both. */
+    load(&p, "<style>body{margin:0} p{margin:0} .mc{columns:2 100px;column-gap:0;width:500px}</style>"
+             "<div class=mc><p>a</p><p>b</p><p>c</p><p>d</p></div>", 800, 600);
+    CHECK(word(&p, "c")->x == 250 && word(&p, "c")->y == 0 && word(&p, "d")->y == 20);
+    unload(&p);
+
+    /* break-inside: avoid keeps a three-line box whole; break-before: column starts a column. */
+    load(&p, "<style>body{margin:0} p,div{margin:0} .mc{column-count:2;column-gap:0;width:400px}"
+             " .keep{break-inside:avoid} .brk{break-before:column}</style>"
+             "<div class=mc><p>a</p><p>b</p><div class=keep>k1<br>k2<br>k3</div><p>c</p></div>"
+             "<div class=mc><p>x</p><p class=brk>y</p><p>z</p></div>", 800, 600);
+    const struct ditem *k1 = word(&p, "k1"), *k3 = word(&p, "k3");
+    CHECK(k1 && k3 && k1->x == k3->x && k3->y == k1->y + 40);
+    CHECK(word(&p, "x")->x == 0 && word(&p, "y")->x == 200 && word(&p, "y")->y == word(&p, "x")->y &&
+          word(&p, "z")->x == 200);
+    unload(&p);
+
+    /* A rule in each gap, as tall as the columns; a set height with column-fill: auto fills one column,
+     * then the next, and what is left over runs on past the box's width. */
+    load(&p, "<style>body{margin:0} p{margin:0} .mc{column-count:2;column-gap:20px;width:420px;"
+             "column-rule:4px solid #123456} .fa{column-count:2;column-gap:0;width:200px;height:40px;"
+             "column-fill:auto}</style><div class=mc><p>a</p><p>b</p><p>c</p><p>d</p></div>"
+             "<div class=fa><p>e</p><p>f</p><p>g</p><p>h</p><p>i</p></div>", 800, 600);
+    const struct ditem *rule = NULL;
+    for (int i = 0; i < p.lo.nitems; i++)
+        if (p.lo.items[i].kind == DK_FILL && p.lo.items[i].color == OPAQUE(0x123456))
+            rule = &p.lo.items[i];
+    CHECK(rule && rule->x == 200 + 10 - 2 && rule->w == 4 && rule->y == 0 && rule->h == 40);
+    const struct ditem *e = word(&p, "e"), *g = word(&p, "g"), *i5 = word(&p, "i");
+    CHECK(e && g && i5 && g->x == 100 && g->y == e->y && i5->x == 200 && i5->y == e->y);
+    unload(&p);
+
+    /* A box with a background that runs over several columns stops at the end of the first. */
+    load(&p, "<style>body{margin:0} p{margin:0} .mc{column-count:2;column-gap:0;width:400px}"
+             " ul{margin:0;padding:0;background:#654321;list-style:none}</style>"
+             "<div class=mc><ul><li>a</li><li>b</li><li>c</li><li>d</li></ul></div>", 800, 600);
+    const struct ditem *bg = NULL;
+    for (int i = 0; i < p.lo.nitems; i++)
+        if (p.lo.items[i].kind == DK_FILL && p.lo.items[i].color == OPAQUE(0x654321))
+            bg = &p.lo.items[i];
+    CHECK(bg && bg->y == 0 && bg->h == 40 && word(&p, "c")->x == 200 && word(&p, "c")->y == 0);
+    unload(&p);
+}
+
 int main(void)
 {
+    multicolumn();
     transforms_2d();
     font_faces();
     text_flow();
@@ -727,5 +793,5 @@ int main(void)
     shadow_layout();
     canvas_layout();
     cjk_wrapping();
-    puts("browser layout: spacing, wrapping, fixed and sticky boxes, outlines, tables, ruby, background pictures, object-fit, scrolling boxes, canvases and CJK wrapping passed");
+    puts("browser layout: spacing, wrapping, fixed and sticky boxes, outlines, tables, ruby, background pictures, object-fit, scrolling boxes, canvases, CJK wrapping and multi-column boxes passed");
 }

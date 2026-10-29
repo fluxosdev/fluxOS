@@ -515,6 +515,16 @@ struct style {
     struct len flex_basis;
     int order;
     struct len row_gap, col_gap;
+    /* multi-column containers (column-count or column-width set), and breaks inside them */
+    uint8_t col_count;          /* column-count; 0: auto */
+    uint8_t col_gap_normal;     /* column-gap: normal, which is 1em between columns (0 in flex and grid) */
+    uint8_t col_fill_auto;      /* column-fill: auto: each column filled in turn, not balanced */
+    uint8_t col_rule_style;     /* column-rule, BS_* */
+    int col_rule_w;
+    uint32_t col_rule_color;    /* 1: currentColor */
+    struct len col_width;       /* column-width: U_AUTO, or the narrowest a column may be */
+    uint8_t break_avoid;        /* break-inside: avoid: kept whole in one column */
+    uint8_t break_before, break_after;  /* break-before/-after: column (or always): starts or ends a column */
     const struct gridspec *grid_cols, *grid_rows, *grid_auto_rows, *grid_auto_cols;
     const struct gridareas *grid_areas;     /* on the container */
     const char *grid_area;              /* on an item: grid-area: name */

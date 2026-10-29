@@ -698,6 +698,9 @@ struct tls {
     uint8_t *hs;                        /* handshake bytes waiting to be parsed */
     int hs_len, hs_cap;
     int eof;
+    uint8_t alpn_offer[32];             /* ALPN's protocol list as it goes in the hello (empty: none) */
+    int alpn_offer_len;
+    char alpn[16];                      /* the protocol the server chose from it, or "" */
 };
 
 static int set_error(struct tls *t, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -1108,6 +1111,14 @@ static int client_hello(struct tls *t, const char *host, int group, const uint8_
         memcpy(m + n + 6, cookie, (size_t)cookie_len);
         n += 6 + cookie_len;
     }
+    /* application_layer_protocol_negotiation */
+    if (t->alpn_offer_len) {
+        put16(m + n, 16);
+        put16(m + n + 2, t->alpn_offer_len + 2);
+        put16(m + n + 4, t->alpn_offer_len);
+        memcpy(m + n + 6, t->alpn_offer, (size_t)t->alpn_offer_len);
+        n += 6 + t->alpn_offer_len;
+    }
     /* key_share: one, of group */
     put16(m + n, 51);
     put16(m + n + 2, publen + 6);
@@ -1122,6 +1133,20 @@ static int client_hello(struct tls *t, const char *host, int group, const uint8_
     put16(m + 2, n - 4);
     hs_add(t, m, (size_t)n);
     return write_record(t, CT_HANDSHAKE, m, n);
+}
+
+/* The server's ALPN answer: one protocol, which must be one offered (RFC 7301 3.1). */
+static int alpn_chosen(struct tls *t, const uint8_t *e, int len)
+{
+    if (len < 3 || (e[0] << 8 | e[1]) != len - 2 || e[2] != len - 3 || e[2] >= (int)sizeof(t->alpn))
+        return set_error(t, "the server's ALPN answer is malformed");
+    for (int i = 0; i < t->alpn_offer_len; i += 1 + t->alpn_offer[i])
+        if (t->alpn_offer[i] == e[2] && !memcmp(t->alpn_offer + i + 1, e + 3, e[2])) {
+            memcpy(t->alpn, e + 3, e[2]);
+            t->alpn[e[2]] = 0;
+            return 0;
+        }
+    return set_error(t, "the server chose an application protocol that was not offered");
 }
 
 /* What the server's hello said. */
@@ -1177,6 +1202,9 @@ static int server_hello(struct tls *t, const uint8_t *p, int n, struct hello *h)
                 memcpy(h->cookie, e + 2, (size_t)h->cookie_len);
             } else if (type == 23 && len == 0) {
                 h->ems = 1;
+            } else if (type == 16) {            /* TLS 1.2 answers ALPN here (1.3 in EncryptedExtensions) */
+                if (alpn_chosen(t, e, len) < 0)
+                    return -1;
             } else if (type == 0xFF01) {
                 if (len != 1 || e[0])
                     return set_error(t, "the server's renegotiation_info is wrong");
@@ -1239,6 +1267,14 @@ static int handshake13(struct tls *t, const char *host, const uint8_t *shared, s
         if (!extensions_seen) {
             if (type != HS_ENCRYPTED_EXTENSIONS || len < 2 || (body[0] << 8 | body[1]) != len - 2)
                 return set_error(t, "invalid or missing EncryptedExtensions");
+            for (int i = 2; i + 4 <= len;) {
+                int et = body[i] << 8 | body[i + 1], el = body[i + 2] << 8 | body[i + 3];
+                if (i + 4 + el > len)
+                    return set_error(t, "invalid EncryptedExtensions");
+                if (et == 16 && alpn_chosen(t, body + i + 4, el) < 0)
+                    return -1;
+                i += 4 + el;
+            }
             extensions_seen = 1;
             consume_handshake(t, whole, 1);
             continue;
@@ -1548,10 +1584,25 @@ static int handshake(struct tls *t, const char *host)
 
 struct tls *tls_connect(int fd, const char *host, int timeout_ms, char *err, size_t errsize)
 {
+    return tls_connect_alpn(fd, host, NULL, timeout_ms, err, errsize);
+}
+
+struct tls *tls_connect_alpn(int fd, const char *host, const char *protocols, int timeout_ms, char *err,
+                             size_t errsize)
+{
     struct tls *t = calloc(1, sizeof(*t));
     if (!t) {
         snprintf(err, errsize, "out of memory");
         return NULL;
+    }
+    for (const char *p = protocols; p && *p;) {        /* "h2,http/1.1" -> 2 'h' '2' 8 'h' 't' ... */
+        size_t pl = strcspn(p, ",");
+        if (pl && pl < sizeof(t->alpn) && t->alpn_offer_len + 1 + (int)pl <= (int)sizeof(t->alpn_offer)) {
+            t->alpn_offer[t->alpn_offer_len++] = (uint8_t)pl;
+            memcpy(t->alpn_offer + t->alpn_offer_len, p, pl);
+            t->alpn_offer_len += (int)pl;
+        }
+        p += pl + (p[pl] == ',');
     }
     t->verifier = tls_verifier_new();
     if (!t->verifier) {
@@ -1575,6 +1626,11 @@ struct tls *tls_connect(int fd, const char *host, int timeout_ms, char *err, siz
     t->log = NULL;
     t->log_len = t->log_cap = 0;
     return t;
+}
+
+const char *tls_alpn(struct tls *t)
+{
+    return t->alpn;
 }
 
 /* Handshake messages after the handshake: tickets are dropped, KeyUpdate followed. */

@@ -19,6 +19,12 @@ struct tls;
  * the reason in err. */
 struct tls *tls_connect(int fd, const char *host, int timeout_ms, char *err, size_t errsize);
 
+/* The same, offering the application protocols in the comma-separated list (ALPN, as in
+ * "h2,http/1.1"); tls_alpn then says which one the server chose ("" if it chose none). */
+struct tls *tls_connect_alpn(int fd, const char *host, const char *protocols, int timeout_ms, char *err,
+                             size_t errsize);
+const char *tls_alpn(struct tls *t);
+
 /* Bytes read (at most n), 0 at the end of the stream, -1 on an error
  * (tls_error says which; a timeout is one). */
 int tls_read(struct tls *t, void *buf, int n);

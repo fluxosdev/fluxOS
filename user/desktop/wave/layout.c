@@ -17,7 +17,9 @@
  *
  * Atomic boxes are laid out at (0, 0) first, to learn their size, and
  * moved into place when their line is placed; table cells are moved
- * down to their vertical alignment the same way.
+ * down to their vertical alignment the same way. Multi-column boxes are
+ * laid out as one column of the columns' width, then cut into columns of
+ * even height between lines and moved side by side.
  */
 #include <math.h>
 #include <stdio.h>
@@ -2551,6 +2553,200 @@ static struct node *enclosing_link(struct node *n)
 /* Lay out the content of a block container; returns its height (the last
  * child's bottom margin is left in *pm). defh is the content height when
  * the box has one set (else -1), minh its least. */
+/* ---- multi-column boxes ---- */
+
+/* How many columns a box w wide is cut into (1: it is not a multi-column box), how wide each is,
+ * and the gap between them. */
+static int column_plan(const struct style *st, int w, int *colw, int *gap)
+{
+    if ((!st->col_count && st->col_width.unit == U_AUTO) || st->inner == IN_FLEX || st->inner == IN_GRID)
+        return 1;
+    int g = st->col_gap_normal ? st->font_size : len_px(st->col_gap, w);
+    if (g < 0)
+        g = 0;
+    int n = st->col_count;
+    if (st->col_width.unit != U_AUTO) {         /* as many as fit at that width, but no more than column-count */
+        int cw = st->col_width.v > 0 ? st->col_width.v : 1;
+        int fit = (w + g) / (cw + g);
+        n = fit < 1 ? 1 : st->col_count && fit > st->col_count ? st->col_count : fit;
+    }
+    if (n < 2 || (w - (n - 1) * g) / n < 1)
+        return 1;
+    *colw = (w - (n - 1) * g) / n;
+    *gap = g;
+    return n;
+}
+
+struct span {
+    int t, b;
+};
+
+static int span_cmp(const void *a, const void *b)
+{
+    const struct span *x = a, *y = b;
+    return x->t != y->t ? (x->t < y->t ? -1 : 1) : (x->b < y->b ? -1 : x->b > y->b);
+}
+
+static int int_cmp(const void *a, const void *b)
+{
+    int x = *(const int *)a, y = *(const int *)b;
+    return x < y ? -1 : x > y;
+}
+
+/*
+ * Cut content from y0 into columns at most hc tall. bl are the stretches that may not be cut (lines,
+ * pictures, boxes with break-inside: avoid), merged and in order; a column ends between two of them,
+ * and the next starts at the top of the next one (the margin between is dropped). Each forced break
+ * (sorted) ends a column. A stretch taller than hc gets a column of its own. Returns how many columns
+ * that takes, with their tops and bottoms in starts and ends (if given, room for max).
+ */
+static int fill_columns(const struct span *bl, int nb, const int *forced, int nf, int y0, int hc, int *starts,
+                        int *ends, int max)
+{
+    int ncol = 0, top = y0, fi = 0;
+    for (int i = 0; i < nb;) {
+        while (fi < nf && forced[fi] <= bl[i].t)
+            fi++;
+        int limit = fi < nf ? forced[fi] : 0x7FFFFFFF, j = i;
+        while (j + 1 < nb && bl[j + 1].b - top <= hc && bl[j + 1].t < limit)
+            j++;
+        if (starts && ncol < max)
+            starts[ncol] = top, ends[ncol] = bl[j].b;
+        ncol++;
+        i = j + 1;
+        if (i < nb)
+            top = bl[i].t;
+    }
+    return ncol;
+}
+
+/* The column (of n, tops in starts) that a thing whose top is at y goes in. */
+static int column_of(const int *starts, int n, int y)
+{
+    int lo = 0, hi = n - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        if (starts[mid] <= y)
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+    return lo;
+}
+
+/*
+ * The contents of a multi-column box, laid out since m0 as one column colw wide and h tall from (x, y),
+ * cut into columns (ncol of them, or more if height or forced breaks make them overflow) and moved side
+ * by side with gap between; column rules are drawn in the gaps. Returns the height of the tallest column.
+ */
+static int columns_distribute(struct lctx *c, const struct style *st, struct mark m0, int sb0, int xf0, int x,
+                              int y, int colw, int gap, int ncol, int h, int defh)
+{
+    struct layout *lo = c->lo;
+    struct mark m1 = mark_now(c);
+    int n = m1.items - m0.items;
+    struct span *bl = malloc(sizeof(*bl) * (size_t)(n + 1));
+    int *forced = malloc(sizeof(int) * (size_t)(2 * n + 1));
+    int *starts = malloc(sizeof(int) * (size_t)(n + 1)), *ends = malloc(sizeof(int) * (size_t)(n + 1));
+    if (!bl || !forced || !starts || !ends) {
+        free(bl), free(forced), free(starts), free(ends);
+        return h;
+    }
+    int nb = 0, nf = 0;
+    for (int i = m0.items; i < m1.items; i++) {
+        const struct ditem *d = &lo->items[i];
+        if (d->dyn && under_fixed(lo, d->dyn))
+            continue;
+        const struct style *bs = d->kind == DK_FILL && d->node ? d->node->style : NULL;    /* a box */
+        if (bs && bs->break_before && d->y > y)
+            forced[nf++] = d->y;
+        if (bs && bs->break_after)
+            forced[nf++] = d->y + d->h;
+        if ((d->kind != DK_FILL && d->kind != DK_BGIMG && d->kind != DK_SBOX) || (bs && bs->break_avoid))
+            bl[nb++] = (struct span){ d->y, d->y + (d->h > 0 ? d->h : 1) };
+    }
+    qsort(bl, (size_t)nb, sizeof(*bl), span_cmp);
+    int merged = 0;
+    for (int i = 0; i < nb; i++) {
+        if (merged && bl[i].t < bl[merged - 1].b) {
+            if (bl[i].b > bl[merged - 1].b)
+                bl[merged - 1].b = bl[i].b;
+        } else {
+            bl[merged++] = bl[i];
+        }
+    }
+    nb = merged;
+    qsort(forced, (size_t)nf, sizeof(int), int_cmp);
+
+    /* Balanced: the least height that needs no more columns than there are (or than forced breaks make). */
+    int hc = h > 0 ? h : 1;
+    if (defh >= 0 && st->col_fill_auto) {
+        hc = defh > 0 ? defh : 1;
+    } else if (nb) {
+        int most = fill_columns(bl, nb, forced, nf, y, hc, NULL, NULL, 0), lo_h = 1, hi_h = hc;
+        if (most < ncol)
+            most = ncol;
+        while (lo_h < hi_h) {
+            int mid = lo_h + (hi_h - lo_h) / 2;
+            if (fill_columns(bl, nb, forced, nf, y, mid, NULL, NULL, 0) <= most)
+                hi_h = mid;
+            else
+                lo_h = mid + 1;
+        }
+        hc = lo_h;
+        if (defh >= 0 && hc > defh)     /* a set height: what does not fit overflows into more columns */
+            hc = defh > 0 ? defh : 1;
+    }
+    int used = nb ? fill_columns(bl, nb, forced, nf, y, hc, starts, ends, n + 1) : 0;
+    if (!used)
+        starts[0] = y, ends[0] = y + h, used = 1;
+    if (ends[used - 1] < y + h)
+        ends[used - 1] = y + h;         /* the last runs to the end of the contents */
+
+    /* Move everything into its column; a box cut by the end of its column stops there. */
+    int step = colw + gap;
+    for (int i = m0.items; i < m1.items; i++) {
+        struct ditem *d = &lo->items[i];
+        if (d->dyn && under_fixed(lo, d->dyn))
+            continue;
+        int k = column_of(starts, used, d->y);
+        if (k < used - 1 && (d->kind == DK_FILL || d->kind == DK_BGIMG) && d->y < ends[k] && d->y + d->h > ends[k])
+            d->h = ends[k] - d->y;
+        d->x += k * step, d->y += y - starts[k];
+    }
+    struct hotspot *hs[2] = { lo->links, lo->controls };
+    int from[2] = { m0.links, m0.controls }, to[2] = { m1.links, m1.controls };
+    for (int s = 0; s < 2; s++)
+        for (int i = from[s]; i < to[s]; i++) {
+            if (hs[s][i].dyn && under_fixed(lo, hs[s][i].dyn))
+                continue;
+            int k = column_of(starts, used, hs[s][i].y);
+            hs[s][i].x += k * step, hs[s][i].y += y - starts[k];
+        }
+    for (int i = m0.anchors; i < m1.anchors; i++)
+        lo->anchors[i].y += y - starts[column_of(starts, used, lo->anchors[i].y)];
+    for (int i = xf0; i < lo->nxf; i++) {
+        int k = column_of(starts, used, lo->xf[i].y);
+        lo->xf[i].x += k * step, lo->xf[i].y += y - starts[k];
+    }
+    for (int i = sb0; i < lo->nsb; i++) {
+        int k = column_of(starts, used, lo->sb[i].y);
+        lo->sb[i].x += k * step, lo->sb[i].y += y - starts[k];
+    }
+
+    int tall = 0;
+    for (int k = 0; k < used; k++)
+        if (ends[k] - starts[k] > tall)
+            tall = ends[k] - starts[k];
+    if (st->col_rule_w > 0 && !st->hidden) {
+        int rw = st->col_rule_w, dash = st->col_rule_style == BS_DOTTED ? 1 : st->col_rule_style == BS_DASHED ? 2 : 0;
+        for (int k = 1; k < used; k++)
+            fill(c, x + k * step - gap / 2 - rw / 2, y, rw, defh >= 0 ? defh : tall, st->col_rule_color, dash);
+    }
+    free(bl), free(forced), free(starts), free(ends);
+    return tall;
+}
+
 static int block_content(struct lctx *c, struct node *n, int x, int y, int w, int defh, int minh,
                          int *pm)
 {
@@ -2567,8 +2763,11 @@ static int block_content(struct lctx *c, struct node *n, int x, int y, int w, in
                     c->pend[c->npend++] = (struct pend){ k, x, y };
         return h;
     }
+    int colw = w, gap = 0, ncol = column_plan(st, w, &colw, &gap);
+    struct mark m0 = mark_now(c);
+    int sb0 = c->lo->nsb, xf0 = c->lo->nxf;
     struct flow f = { 0 };
-    f.x = x, f.w = w, f.y0 = f.cy = y;
+    f.x = x, f.w = colw, f.y0 = f.cy = y;
     f.st = st;
     f.space_before = 1;
     f.link = enclosing_link(n);
@@ -2584,6 +2783,11 @@ static int block_content(struct lctx *c, struct node *n, int x, int y, int w, in
     add_pseudo(c, &f, n, 1);
     flush_run(c, &f);
     free(f.items);
+    if (ncol > 1) {                     /* its floats are in the columns now, out of everyone's way */
+        c->nfloats = c->float_base;
+        *pm = 0;
+        return columns_distribute(c, st, m0, sb0, xf0, x, y, colw, gap, ncol, f.cy - y, defh);
+    }
     *pm = f.pm;
     return f.cy - y;
 }
@@ -2659,7 +2863,7 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
     int pfirst = c->npend;
     int bfc = !n->parent || st->clips || st->floated || st->display == D_TABLE_CELL ||
               st->display == D_INLINE_BLOCK || st->position == POS_ABSOLUTE || st->position == POS_FIXED ||
-              n == c->contain;
+              n == c->contain || st->col_count || st->col_width.unit != U_AUTO;
     int saved_base = c->float_base;
     c->force_container = 0;
     if (bfc)

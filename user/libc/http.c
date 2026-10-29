@@ -1,11 +1,17 @@
 /*
- * An HTTP/1.1 client: see <http.h>.
+ * An HTTP/1.1 and HTTP/2 client: see <http.h>.
  *
  * One request is: look in the cache; take an idle connection to the server (or open one); send the
  * request; read the head, then the body (sized, chunked or to the end); decode it; hand it back and
  * remember it. The pool keeps up to POOL idle connections, none for more than a little while. A
  * connection that was idle may have been closed by the server in the meantime: if it fails before
  * a byte of the answer comes, the request is made again on a new one.
+ *
+ * HTTPS connections offer HTTP/2 as well (ALPN), and most servers take it. A request on one is a
+ * stream: its head goes as an HPACK-coded HEADERS frame (hpack.c), the answer comes as HEADERS and
+ * DATA frames, which are turned into the same head and body an HTTP/1.1 answer gives, so caching
+ * and decoding are the same for both. One request runs at a time (this client blocks), but the
+ * connection serves the next one, and a request given up on is only its stream reset.
  *
  * Cache entries are files named for a hash of the URL, each:
  *
@@ -35,6 +41,7 @@
 #include <time.h>
 #include <tls.h>
 #include <unistd.h>
+#include "hpack.h"
 
 #define POOL            6
 #define MAX_HEAD        (64 * 1024)
@@ -53,6 +60,7 @@ struct conn {
     int https, port;
     char host[256];
     unsigned last;                      /* uptime_ms() when it was last used */
+    struct h2 *h2;                      /* the server chose HTTP/2 */
     uint8_t rbuf[16384];
     int rpos, rlen;
 };
@@ -363,8 +371,11 @@ static long http_date(const char *s)
 
 /* ---- the connection pool and the network ---- */
 
+static void h2_free(struct h2 *h);
+
 static void conn_close(struct conn *c)
 {
+    h2_free(c->h2);
     if (c->tls)
         tls_close(c->tls);
     if (c->sock >= 0)
@@ -542,6 +553,9 @@ static int resolve_host(struct http_client *cl, const struct http_request *rq, c
     return 0;
 }
 
+static int h2_start(struct conn *c, char *err, size_t esize);
+static int h2_idle(struct conn *c);
+
 /* A new connection into a free slot of the pool (or the idlest one); NULL with err set. */
 static struct conn *conn_open(struct http_client *cl, const struct http_request *rq, const struct url *u,
                               int timeout_ms, char *err, size_t esize)
@@ -583,7 +597,8 @@ static struct conn *conn_open(struct http_client *cl, const struct http_request 
     if (u->https) {
         char terr[256];
         event(rq, "Negotiating TLS with %s... ", u->host);
-        c->tls = tls_connect(c->sock, u->host, timeout_ms, terr, sizeof(terr));
+        c->tls = tls_connect_alpn(c->sock, u->host, rq->flags & HTTP_HTTP1 ? NULL : "h2,http/1.1", timeout_ms,
+                                  terr, sizeof(terr));
         if (!c->tls) {
             event(rq, "failed.\n");
             snprintf(err, esize, "%s", terr);
@@ -591,7 +606,12 @@ static struct conn *conn_open(struct http_client *cl, const struct http_request 
             c->sock = -1;
             return NULL;
         }
-        event(rq, "done (TLS 1.3, certificate verified).\n");
+        int h2 = !strcmp(tls_alpn(c->tls), "h2");
+        event(rq, "done (certificate verified%s).\n", h2 ? ", HTTP/2" : "");
+        if (h2 && h2_start(c, err, esize) < 0) {
+            conn_close(c);
+            return NULL;
+        }
     }
     c->state = 2;
     c->last = uptime_ms();
@@ -599,12 +619,21 @@ static struct conn *conn_open(struct http_client *cl, const struct http_request 
 }
 
 /* An idle connection to this server that is still open, marked in use; NULL if none. */
-static struct conn *conn_reuse(struct http_client *cl, const struct url *u)
+static struct conn *conn_reuse(struct http_client *cl, const struct http_request *rq, const struct url *u)
 {
     for (int i = 0; i < POOL; i++) {
         struct conn *c = &cl->pool[i];
-        if (c->state != 1 || c->https != u->https || c->port != u->port || strcmp(c->host, u->host))
+        if (c->state != 1 || c->https != u->https || c->port != u->port || strcmp(c->host, u->host) ||
+            (c->h2 && (rq->flags & HTTP_HTTP1)))
             continue;
+        if (c->h2) {                        /* HTTP/2 servers talk between requests: see what it said */
+            if (h2_idle(c) < 0) {
+                conn_close(c);
+                continue;
+            }
+            c->state = 2;
+            return c;
+        }
         struct pollfd p = { c->sock, POLLIN, 0 };
         if (poll(&p, 1, 0) > 0 || (c->tls && tls_pending(c->tls))) {
             conn_close(c);                  /* readable while idle: closed by the server (or noise) */
@@ -765,7 +794,7 @@ static void cache_store(struct http_client *cl, const struct entry *e)
     char path[240], tmp[250];
     cache_path(cl, e->url, path, sizeof(path));
     snprintf(tmp, sizeof(tmp), "%s.t", path);
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0)
         return;
     char head[2600 + 400];
@@ -1155,6 +1184,536 @@ static int read_body(struct conn *c, const struct http_request *rq, int timeout_
     return 0;
 }
 
+/* ---- HTTP/2 (RFC 9113) ---- */
+
+enum { F_DATA, F_HEADERS, F_PRIORITY, F_RST_STREAM, F_SETTINGS, F_PUSH_PROMISE, F_PING, F_GOAWAY,
+       F_WINDOW_UPDATE, F_CONTINUATION };
+#define FL_END_STREAM   0x1             /* (and ACK, on SETTINGS and PING) */
+#define FL_END_HEADERS  0x4
+#define FL_PADDED       0x8
+#define FL_PRIORITY     0x20
+#define H2_FRAME        16384           /* the largest frame either side sends (SETTINGS_MAX_FRAME_SIZE's default) */
+#define H2_STREAM_WINDOW (1 << 20)      /* what a stream may send before it is told it may send more */
+#define H2_CONN_WINDOW  (16 << 20)      /* the same for the whole connection */
+#define H2_CANCEL       8               /* RST_STREAM's error code for a request given up on */
+#define H2_REFUSED      7               /* ... and the server's for one it did not start on */
+
+struct h2 {
+    struct hpack dec;
+    uint32_t next_id;                   /* the next stream (odd: ours) */
+    long send_window;                   /* the connection's, for request bodies */
+    long peer_window;                   /* SETTINGS_INITIAL_WINDOW_SIZE: each new stream's */
+    uint32_t peer_frame;                /* SETTINGS_MAX_FRAME_SIZE */
+    uint32_t taken;                     /* DATA taken since the connection's window was last opened again */
+    int goaway;                         /* the server is closing it: no new streams */
+    uint8_t *block;                     /* a header block being put together from HEADERS and CONTINUATION */
+    size_t blen, bcap;
+    uint32_t block_stream;
+    int block_end;                      /* its HEADERS frame ended the stream */
+    uint8_t frame[9 + H2_FRAME];        /* the frame being read */
+    uint8_t out[9 + H2_FRAME];          /* and the one being sent */
+};
+
+/* The request running on the connection. */
+struct h2stream {
+    uint32_t id;
+    long send_window;
+    uint32_t taken;
+    int state;                          /* 0 waiting for the head, 1 the body, 2 ended, 3 reset by the server */
+    int refused;                        /* it was not started on: safe to make again elsewhere */
+    struct head *h;
+    struct bodybuf *b;
+    const struct http_request *rq;      /* whose on_data gets the body */
+    size_t total, max;
+    int truncated;
+};
+
+static void h2_free(struct h2 *h)
+{
+    if (!h)
+        return;
+    hpack_free(&h->dec);
+    free(h->block);
+    free(h);
+}
+
+static int h2_send(struct conn *c, int type, int flags, uint32_t id, const void *payload, size_t n, char *err,
+                   size_t esize)
+{
+    uint8_t *f = c->h2->out;
+    f[0] = (uint8_t)(n >> 16), f[1] = (uint8_t)(n >> 8), f[2] = (uint8_t)n;
+    f[3] = (uint8_t)type, f[4] = (uint8_t)flags;
+    f[5] = (uint8_t)(id >> 24 & 0x7F), f[6] = (uint8_t)(id >> 16), f[7] = (uint8_t)(id >> 8), f[8] = (uint8_t)id;
+    if (n)
+        memcpy(f + 9, payload, n);
+    return conn_send(c, f, 9 + n, err, esize);
+}
+
+static void be32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v >> 24), p[1] = (uint8_t)(v >> 16), p[2] = (uint8_t)(v >> 8), p[3] = (uint8_t)v;
+}
+
+static uint32_t get32(const uint8_t *p)
+{
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+static int h2_window_update(struct conn *c, uint32_t id, uint32_t inc, char *err, size_t esize)
+{
+    uint8_t p[4];
+    be32(p, inc);
+    return h2_send(c, F_WINDOW_UPDATE, 0, id, p, 4, err, esize);
+}
+
+/* Give up on a stream: the connection goes on. */
+static void h2_cancel(struct conn *c, struct h2stream *s)
+{
+    if (s->state >= 2)
+        return;
+    uint8_t code[4];
+    char err[128];
+    be32(code, H2_CANCEL);
+    h2_send(c, F_RST_STREAM, 0, s->id, code, 4, err, sizeof(err));
+    s->state = 2;
+}
+
+/* After the TLS handshake chose h2: the preface, our settings (no server push, a larger window for each
+ * stream) and a larger window for the connection. */
+static int h2_start(struct conn *c, char *err, size_t esize)
+{
+    struct h2 *h = calloc(1, sizeof(*h));
+    if (!h) {
+        snprintf(err, esize, "out of memory");
+        return -1;
+    }
+    hpack_init(&h->dec, 4096);
+    h->next_id = 1;
+    h->send_window = h->peer_window = 65535;
+    h->peer_frame = 16384;
+    c->h2 = h;
+    uint8_t m[24 + 9 + 12 + 9 + 4] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    uint8_t *f = m + 24;
+    static const uint8_t settings[9 + 12] = { 0, 0, 12, F_SETTINGS, 0, 0, 0, 0, 0,
+                                              0, 2, 0, 0, 0, 0,                   /* ENABLE_PUSH 0 */
+                                              0, 4, 0, H2_STREAM_WINDOW >> 16 & 0xFF, 0, 0 };  /* INITIAL_WINDOW_SIZE */
+    memcpy(f, settings, sizeof(settings));
+    f += sizeof(settings);
+    static const uint8_t wu[9] = { 0, 0, 4, F_WINDOW_UPDATE, 0, 0, 0, 0, 0 };
+    memcpy(f, wu, 9);
+    be32(f + 9, H2_CONN_WINDOW - 65535);
+    return conn_send(c, m, sizeof(m), err, esize);
+}
+
+/* Exactly n bytes: 0, 1 if the stream ended before the first, -1 error (err set), -2 stopped. */
+static int conn_read(struct conn *c, const struct http_request *rq, int timeout_ms, uint8_t *dst, size_t n,
+                     char *err, size_t esize)
+{
+    size_t got = 0;
+    while (got < n) {
+        if (c->rpos == c->rlen) {
+            int r = conn_fill(c, rq, timeout_ms, err, esize);
+            if (r == -2)
+                return -2;
+            if (r < 0)
+                return -1;
+            if (r == 0) {
+                if (!got)
+                    return 1;
+                snprintf(err, esize, "the server closed the connection in the middle of a frame");
+                return -1;
+            }
+        }
+        size_t k = (size_t)(c->rlen - c->rpos);
+        if (k > n - got)
+            k = n - got;
+        memcpy(dst + got, c->rbuf + c->rpos, k);
+        c->rpos += (int)k;
+        got += k;
+    }
+    return 0;
+}
+
+/* A frame's payload without its padding (and a HEADERS frame's priority); -1 if the padding does not fit. */
+static int unpad(const uint8_t **p, uint32_t *n, int flags, int priority)
+{
+    uint32_t pad = 0;
+    if (flags & FL_PADDED) {
+        if (*n < 1)
+            return -1;
+        pad = **p;
+        (*p)++, (*n)--;
+    }
+    if (priority) {
+        if (*n < 5)
+            return -1;
+        *p += 5, *n -= 5;
+    }
+    if (pad > *n)
+        return -1;
+    *n -= pad;
+    return 0;
+}
+
+struct h2fields {
+    struct head *h;                     /* where the fields go; NULL to only keep HPACK's table right */
+    int status, bad;
+};
+
+static int h2_field(void *ctx, const char *name, size_t nl, const char *value, size_t vl)
+{
+    struct h2fields *f = ctx;
+    if (!f->h)
+        return 0;
+    if (nl == 7 && !memcmp(name, ":status", 7)) {
+        f->status = vl == 3 ? atoi(value) : -1;
+        return 0;
+    }
+    if (nl && name[0] == ':')
+        return f->bad = 1, 0;
+    if (nl + vl > 8000)
+        return 0;
+    char line[8200];
+    int n = snprintf(line, sizeof(line), "%.*s: %.*s", (int)nl, name, (int)vl, value);
+    head_add(f->h, line, (size_t)n);
+    return 0;
+}
+
+/* A whole header block has come: the answer's head, or its trailers, or another stream's (decoded only
+ * for HPACK's sake). */
+static int h2_block_done(struct h2 *h, struct h2stream *s, char *err, size_t esize)
+{
+    int mine = s && h->block_stream == s->id && s->state < 2;
+    struct h2fields f = { mine && s->state == 0 ? s->h : NULL, 0, 0 };
+    if (f.h)
+        head_free(f.h);
+    if (hpack_decode(&h->dec, h->block, h->blen, h2_field, &f) < 0) {
+        snprintf(err, esize, "the server's header block cannot be decoded");
+        return -1;
+    }
+    h->blen = 0;
+    if (!mine)
+        return 0;
+    if (s->state == 0) {
+        if (f.status < 100 || f.status > 999 || f.bad) {
+            snprintf(err, esize, "the server's HTTP/2 answer is malformed");
+            return -1;
+        }
+        if (f.status < 200 && !h->block_end)
+            return 0;                   /* 1xx: the real answer comes after */
+        s->h->status = f.status;
+        s->h->minor = 1;
+        snprintf(s->h->status_line, sizeof(s->h->status_line), "HTTP/2 %d", f.status);
+        s->state = 1;
+    }
+    if (h->block_end)
+        s->state = 2;
+    return 0;
+}
+
+static int h2_block_add(struct h2 *h, const uint8_t *p, size_t n)
+{
+    if (h->blen + n > MAX_HEAD)
+        return -1;
+    if (h->blen + n > h->bcap) {
+        size_t cap = h->bcap ? h->bcap * 2 : 4096;
+        while (cap < h->blen + n)
+            cap *= 2;
+        uint8_t *nb = realloc(h->block, cap);
+        if (!nb)
+            return -1;
+        h->block = nb;
+        h->bcap = cap;
+    }
+    memcpy(h->block + h->blen, p, n);
+    h->blen += n;
+    return 0;
+}
+
+/*
+ * Read one frame and act on it, for stream s (NULL between requests). Returns 0, 1 if the connection
+ * ended, -1 on a connection error (err set) or -2 if asked to stop. What happened to s is in s->state.
+ */
+static int h2_frame(struct conn *c, struct h2stream *s, const struct http_request *rq, int timeout_ms, char *err,
+                    size_t esize)
+{
+    struct h2 *h = c->h2;
+    int r = conn_read(c, rq, timeout_ms, h->frame, 9, err, esize);
+    if (r)
+        return r;
+    uint32_t len = (uint32_t)h->frame[0] << 16 | (uint32_t)h->frame[1] << 8 | h->frame[2];
+    int type = h->frame[3], flags = h->frame[4];
+    uint32_t id = get32(h->frame + 5) & 0x7FFFFFFF;
+    if (len > H2_FRAME) {
+        snprintf(err, esize, "the server sent too big an HTTP/2 frame");
+        return -1;
+    }
+    if ((r = conn_read(c, rq, timeout_ms, h->frame + 9, len, err, esize)) != 0)
+        return r == 1 ? (snprintf(err, esize, "the server closed the connection in the middle of a frame"), -1) : r;
+    const uint8_t *p = h->frame + 9;
+    int ours = s && id == s->id;
+    if (h->blen && type != F_CONTINUATION) {
+        snprintf(err, esize, "the server broke off a header block");
+        return -1;
+    }
+    switch (type) {
+    case F_DATA: {
+        uint32_t n = len;
+        if (!id || unpad(&p, &n, flags, 0) < 0 || (ours && s->state == 0)) {
+            snprintf(err, esize, "the server sent a malformed DATA frame");
+            return -1;
+        }
+        h->taken += len;
+        if (h->taken >= H2_CONN_WINDOW / 2) {
+            if (h2_window_update(c, 0, h->taken, err, esize) < 0)
+                return -1;
+            h->taken = 0;
+        }
+        if (!ours || s->state != 1)
+            return 0;                   /* a stream given up on, still coming */
+        if (s->total + n > s->max) {
+            n = (uint32_t)(s->max - s->total);
+            s->truncated = 1;
+        }
+        int ar = body_add(s->b, s->rq, p, n);
+        if (ar < 0)
+            return ar == -2 ? (snprintf(err, esize, "out of memory"), -1) : -2;
+        s->total += n;
+        if (flags & FL_END_STREAM) {
+            s->state = 2;
+        } else if ((s->taken += len) >= H2_STREAM_WINDOW / 2 && !s->truncated) {
+            if (h2_window_update(c, s->id, s->taken, err, esize) < 0)
+                return -1;
+            s->taken = 0;
+        }
+        return 0;
+    }
+    case F_HEADERS: {
+        uint32_t n = len;
+        if (!id || unpad(&p, &n, flags, flags & FL_PRIORITY) < 0 || h2_block_add(h, p, n) < 0) {
+            snprintf(err, esize, "the server sent a malformed HEADERS frame");
+            return -1;
+        }
+        h->block_stream = id;
+        h->block_end = flags & FL_END_STREAM;
+        return flags & FL_END_HEADERS ? h2_block_done(h, s, err, esize) : 0;
+    }
+    case F_CONTINUATION:
+        if (!h->blen || id != h->block_stream || h2_block_add(h, p, len) < 0) {
+            snprintf(err, esize, "the server sent a stray CONTINUATION frame");
+            return -1;
+        }
+        return flags & FL_END_HEADERS ? h2_block_done(h, s, err, esize) : 0;
+    case F_RST_STREAM:
+        if (len != 4) {
+            snprintf(err, esize, "the server sent a malformed RST_STREAM frame");
+            return -1;
+        }
+        if (ours && s->state < 2) {
+            uint32_t code = get32(p);
+            s->state = 3;
+            s->refused = code == H2_REFUSED;
+            snprintf(err, esize, "the server reset the request (HTTP/2 error %u)", (unsigned)code);
+        }
+        return 0;
+    case F_SETTINGS:
+        if (flags & FL_END_STREAM)
+            return 0;                   /* the server's ACK of ours */
+        if (id || len % 6) {
+            snprintf(err, esize, "the server sent a malformed SETTINGS frame");
+            return -1;
+        }
+        for (uint32_t i = 0; i < len; i += 6) {
+            int which = p[i] << 8 | p[i + 1];
+            uint32_t v = get32(p + i + 2);
+            if (which == 4) {           /* INITIAL_WINDOW_SIZE: the open streams' windows change by as much */
+                if (v > 0x7FFFFFFF) {
+                    snprintf(err, esize, "the server's window size is too big");
+                    return -1;
+                }
+                if (s)
+                    s->send_window += (long)v - h->peer_window;
+                h->peer_window = (long)v;
+            } else if (which == 5) {    /* MAX_FRAME_SIZE */
+                if (v < 16384 || v > 16777215) {
+                    snprintf(err, esize, "the server's frame size setting is invalid");
+                    return -1;
+                }
+                h->peer_frame = v;
+            }
+        }
+        return h2_send(c, F_SETTINGS, FL_END_STREAM, 0, NULL, 0, err, esize) < 0 ? -1 : 0;
+    case F_PING:
+        if (len != 8 || id) {
+            snprintf(err, esize, "the server sent a malformed PING frame");
+            return -1;
+        }
+        return flags & FL_END_STREAM ? 0 : h2_send(c, F_PING, FL_END_STREAM, 0, p, 8, err, esize) < 0 ? -1 : 0;
+    case F_GOAWAY:
+        if (len < 8) {
+            snprintf(err, esize, "the server sent a malformed GOAWAY frame");
+            return -1;
+        }
+        h->goaway = 1;
+        if (s && s->state < 2 && s->id > (get32(p) & 0x7FFFFFFF)) {
+            s->state = 3;
+            s->refused = 1;
+            snprintf(err, esize, "the server is closing the connection");
+        }
+        return 0;
+    case F_WINDOW_UPDATE: {
+        if (len != 4) {
+            snprintf(err, esize, "the server sent a malformed WINDOW_UPDATE frame");
+            return -1;
+        }
+        long inc = (long)(get32(p) & 0x7FFFFFFF);
+        if (!id)
+            h->send_window += inc;
+        else if (ours)
+            s->send_window += inc;
+        return 0;
+    }
+    case F_PUSH_PROMISE:
+        snprintf(err, esize, "the server pushed a response although asked not to");
+        return -1;
+    default:
+        return 0;                       /* PRIORITY, and kinds this client does not know */
+    }
+}
+
+/* Between requests, anything the server sent (settings, pings, GOAWAY): 0 if the connection is still good. */
+static int h2_idle(struct conn *c)
+{
+    static const struct http_request none;
+    char err[256];
+    for (;;) {
+        struct pollfd p = { c->sock, POLLIN, 0 };
+        if (c->rpos == c->rlen && !(c->tls && tls_pending(c->tls)) && poll(&p, 1, 0) <= 0)
+            return c->h2->goaway ? -1 : 0;
+        if (h2_frame(c, NULL, &none, 2000, err, sizeof(err)) != 0)
+            return -1;
+    }
+}
+
+/*
+ * Send a request (its HPACK-coded head, then its body) as a new stream s and read the answer's head into h.
+ * Returns 0, 1 if it was not started on and may be made again on another connection, or -1 (err set; ""
+ * for a stop).
+ */
+static int h2_exchange(struct conn *c, struct h2stream *s, const struct http_request *rq, int timeout_ms,
+                       const uint8_t *block, size_t blen, const void *body, size_t bodylen, struct head *h,
+                       char *err, size_t esize)
+{
+    struct h2 *h2 = c->h2;
+    memset(s, 0, sizeof(*s));
+    if (h2->goaway || h2->next_id > 0x7FFFFFF0) {
+        h2->goaway = 1;
+        return 1;
+    }
+    s->id = h2->next_id;
+    h2->next_id += 2;
+    s->send_window = h2->peer_window;
+    s->h = h;
+    uint32_t most = h2->peer_frame < H2_FRAME ? h2->peer_frame : H2_FRAME;
+    for (size_t off = 0; off < blen || !off;) {
+        size_t k = blen - off < most ? blen - off : most;
+        int last = off + k == blen;
+        int flags = (last ? FL_END_HEADERS : 0) | (!off && !bodylen ? FL_END_STREAM : 0);
+        if (h2_send(c, off ? F_CONTINUATION : F_HEADERS, flags, s->id, block + off, k, err, esize) < 0)
+            return 1;                   /* nothing went: the connection was closed while idle */
+        off += k;
+        if (!k)
+            break;
+    }
+    int r;
+    for (size_t off = 0; off < bodylen && s->state < 2;) {
+        long room = h2->send_window < s->send_window ? h2->send_window : s->send_window;
+        if (room <= 0) {                /* wait for the server to open a window */
+            if ((r = h2_frame(c, s, rq, timeout_ms, err, esize)) != 0)
+                return r == -2 ? (err[0] = 0, -1) : r == 1 && !s->state ? 1 : -1;
+            continue;
+        }
+        size_t k = bodylen - off;
+        if (k > (size_t)room)
+            k = (size_t)room;
+        if (k > most)
+            k = most;
+        int last = off + k == bodylen;
+        if (h2_send(c, F_DATA, last ? FL_END_STREAM : 0, s->id, (const uint8_t *)body + off, k, err, esize) < 0)
+            return -1;
+        h2->send_window -= (long)k;
+        s->send_window -= (long)k;
+        off += k;
+    }
+    while (s->state == 0)
+        if ((r = h2_frame(c, s, rq, timeout_ms, err, esize)) != 0)
+            return r == -2 ? (err[0] = 0, -1) : r == 1 ? 1 : -1;
+    if (s->state == 3)
+        return s->refused ? 1 : -1;
+    return 0;
+}
+
+/* The rest of the answer, as read_body does for HTTP/1.1. */
+static int h2_read_body(struct conn *c, struct h2stream *s, const struct http_request *rq, int timeout_ms,
+                        struct bodybuf *b, size_t max, int *truncated, char *err, size_t esize)
+{
+    s->b = b;
+    s->rq = rq;
+    s->max = max;
+    while (s->state == 1 && !s->truncated) {
+        int r = h2_frame(c, s, rq, timeout_ms, err, esize);
+        if (r == 1)
+            snprintf(err, esize, "the server closed the connection in the middle of a response");
+        if (r)
+            return r == -2 ? -2 : -1;
+    }
+    if (s->state == 3)
+        return -1;
+    if (s->truncated) {
+        h2_cancel(c, s);
+        *truncated = 1;
+        return 1;
+    }
+    return 0;
+}
+
+/* The request's head as HPACK: the pseudo-headers, then lines ("Name: value\r\n" each) as lower-case
+ * fields, leaving out what HTTP/2 forbids. Its length, or 0 if it does not fit. */
+static size_t h2_head(uint8_t *out, size_t cap, const char *method, const struct url *u, const char *authority,
+                      const char *lines)
+{
+    static const char *const banned[] = { "connection", "keep-alive", "proxy-connection", "transfer-encoding",
+                                          "upgrade", "host" };
+    size_t len = 0;
+    if (hpack_encode(out, cap, &len, ":method", method) < 0 ||
+        hpack_encode(out, cap, &len, ":scheme", u->https ? "https" : "http") < 0 ||
+        hpack_encode(out, cap, &len, ":authority", authority) < 0 || hpack_encode(out, cap, &len, ":path", u->path) < 0)
+        return 0;
+    for (const char *p = lines; *p;) {
+        const char *eol = strstr(p, "\r\n");
+        size_t ll = eol ? (size_t)(eol - p) : strlen(p);
+        const char *colon = memchr(p, ':', ll);
+        char name[128], value[8192];
+        if (colon && colon > p && (size_t)(colon - p) < sizeof(name)) {
+            size_t nl = (size_t)(colon - p);
+            for (size_t i = 0; i < nl; i++)
+                name[i] = (char)tolower((unsigned char)p[i]);
+            name[nl] = 0;
+            const char *v = colon + 1;
+            while (v < p + ll && (*v == ' ' || *v == '\t'))
+                v++;
+            snprintf(value, sizeof(value), "%.*s", (int)(p + ll - v), v);
+            int skip = !strcmp(name, "te") && strcmp(value, "trailers");
+            for (size_t i = 0; i < sizeof(banned) / sizeof(banned[0]); i++)
+                skip |= !strcmp(name, banned[i]);
+            if (!skip && hpack_encode(out, cap, &len, name, value) < 0)
+                return 0;
+        }
+        p += ll + (eol ? 2 : 0);
+    }
+    return len;
+}
+
 /* ---- a request ---- */
 
 static int has_request_header(const struct http_request *rq, const char *name)
@@ -1235,6 +1794,18 @@ static char *merge_headers(const char *old, size_t olen, const char *update, siz
     return out;
 }
 
+/* Done with a request before its end: on HTTP/2 only its stream is, and the connection goes back to the pool. */
+static void conn_abandon(struct conn *c, struct h2stream *s)
+{
+    if (!c->h2 || c->h2->goaway) {
+        conn_close(c);
+        return;
+    }
+    h2_cancel(c, s);
+    c->state = 1;
+    c->last = uptime_ms();
+}
+
 static int one_request(struct http_client *cl, const struct http_request *rq, const char *url,
                        const char *method, const void *body, size_t blen, int may_follow,
                        struct http_response *rs)
@@ -1264,47 +1835,56 @@ static int one_request(struct http_client *cl, const struct http_request *rq, co
         }
     }
 
-    /* The request. */
-    char req[8192];
+    /* The request: its header lines, then those as HTTP/1.1 or HTTP/2 sends them. */
+    char lines[8192];
     char hosthdr[300];
     if (u.port == (u.https ? 443 : 80))
         snprintf(hosthdr, sizeof(hosthdr), "%s", u.host);
     else
         snprintf(hosthdr, sizeof(hosthdr), "%s:%d", u.host, u.port);
-    int n = snprintf(req, sizeof(req), "%s %s HTTP/1.1\r\nHost: %s\r\n", method, u.path, hosthdr);
+    char *req = lines;
+    int n = 0;
     if (!has_request_header(rq, "User-Agent"))
-        n += snprintf(req + n, sizeof(req) - (size_t)n, "User-Agent: %s\r\n", USER_AGENT);
+        n += snprintf(req + n, sizeof(lines) - (size_t)n, "User-Agent: %s\r\n", USER_AGENT);
     if (!has_request_header(rq, "Accept"))
-        n += snprintf(req + n, sizeof(req) - (size_t)n, "Accept: %s\r\n", ACCEPT_DEFAULT);
+        n += snprintf(req + n, sizeof(lines) - (size_t)n, "Accept: %s\r\n", ACCEPT_DEFAULT);
     if (!has_request_header(rq, "Accept-Encoding"))
-        n += snprintf(req + n, sizeof(req) - (size_t)n, "Accept-Encoding: %s\r\n",
+        n += snprintf(req + n, sizeof(lines) - (size_t)n, "Accept-Encoding: %s\r\n",
                       (rq->flags & HTTP_IDENTITY) ? "identity" : "gzip, deflate, br");
-    n += snprintf(req + n, sizeof(req) - (size_t)n, "Connection: keep-alive\r\n");
-    for (int i = 0; i < rq->nheaders && n < (int)sizeof(req) - 1200; i++)
-        n += snprintf(req + n, sizeof(req) - (size_t)n, "%s\r\n", rq->headers[i]);
-    if (have && ent.etag[0] && n < (int)sizeof(req) - 500)
-        n += snprintf(req + n, sizeof(req) - (size_t)n, "If-None-Match: %s\r\n", ent.etag);
-    if (have && ent.last_modified[0] && n < (int)sizeof(req) - 300)
-        n += snprintf(req + n, sizeof(req) - (size_t)n, "If-Modified-Since: %s\r\n", ent.last_modified);
+    for (int i = 0; i < rq->nheaders && n < (int)sizeof(lines) - 1200; i++)
+        n += snprintf(req + n, sizeof(lines) - (size_t)n, "%s\r\n", rq->headers[i]);
+    if (have && ent.etag[0] && n < (int)sizeof(lines) - 500)
+        n += snprintf(req + n, sizeof(lines) - (size_t)n, "If-None-Match: %s\r\n", ent.etag);
+    if (have && ent.last_modified[0] && n < (int)sizeof(lines) - 300)
+        n += snprintf(req + n, sizeof(lines) - (size_t)n, "If-Modified-Since: %s\r\n", ent.last_modified);
     if (body || !strcmp(method, "POST") || !strcmp(method, "PUT")) {
         if (!has_request_header(rq, "Content-Type") && body)
-            n += snprintf(req + n, sizeof(req) - (size_t)n, "Content-Type: application/x-www-form-urlencoded\r\n");
-        n += snprintf(req + n, sizeof(req) - (size_t)n, "Content-Length: %u\r\n", (unsigned)blen);
+            n += snprintf(req + n, sizeof(lines) - (size_t)n, "Content-Type: application/x-www-form-urlencoded\r\n");
+        n += snprintf(req + n, sizeof(lines) - (size_t)n, "Content-Length: %u\r\n", (unsigned)blen);
     }
-    if (n > (int)sizeof(req) - 4)
-        n = (int)sizeof(req) - 4;
-    n += snprintf(req + n, sizeof(req) - (size_t)n, "\r\n");
+    if (n > (int)sizeof(lines) - 4)
+        n = (int)sizeof(lines) - 4;
+    lines[n] = 0;
+    char h1[8192 + 2400];
+    n = snprintf(h1, sizeof(h1), "%s %s HTTP/1.1\r\nHost: %s\r\n%sConnection: keep-alive\r\n\r\n", method,
+                 u.path, hosthdr, lines);
+    if (n >= (int)sizeof(h1))
+        n = (int)sizeof(h1) - 1;
+    uint8_t h2block[12288];
+    size_t h2len = h2_head(h2block, sizeof(h2block), method, &u, hosthdr, lines);
 
     /* Send it and read the head, on a connection that was idle if there is one. */
     struct conn *c = NULL;
+    struct h2stream st;
     struct head h;
     memset(&h, 0, sizeof(h));
+    memset(&st, 0, sizeof(st));
     int rc = -1;
     char err[256] = "";
     for (int attempt = 0; attempt < 2; attempt++) {
         int reused = 0;
         err[0] = 0;
-        c = attempt == 0 ? conn_reuse(cl, &u) : NULL;
+        c = attempt == 0 ? conn_reuse(cl, rq, &u) : NULL;
         if (c)
             reused = 1;
         else
@@ -1313,9 +1893,20 @@ static int one_request(struct http_client *cl, const struct http_request *rq, co
             rc = -1;
             break;
         }
-        int sent = conn_send(c, req, (size_t)n, err, sizeof(err)) == 0 &&
-                   (!body || !blen || conn_send(c, body, blen, err, sizeof(err)) == 0);
-        if (sent) {
+        if (c->h2) {
+            rc = h2len ? h2_exchange(c, &st, rq, timeout, h2block, h2len, body, blen, &h, err, sizeof(err))
+                       : (snprintf(err, sizeof(err), "the request's headers are too long"), -1);
+            if (rc == 0)
+                break;
+            if (rc == 1 && !reused) {   /* refused on a new connection: the server is unwell, not the connection */
+                rc = -1;
+                if (!err[0])
+                    snprintf(err, sizeof(err), "the server refused the request");
+            }
+            if (rc == 1)
+                reused = 1;             /* a new connection may do better */
+        } else if (conn_send(c, h1, (size_t)n, err, sizeof(err)) == 0 &&
+                   (!body || !blen || conn_send(c, body, blen, err, sizeof(err)) == 0)) {
             if (!reused)
                 event(rq, "HTTP request sent, awaiting response... ");
             rc = read_head(c, rq, timeout, &h, err, sizeof(err));
@@ -1327,6 +1918,11 @@ static int one_request(struct http_client *cl, const struct http_request *rq, co
         /* An idle connection the server had closed: try once more on a new one. A stop or a timeout is final. */
         int stopped = rc == -1 && !err[0];
         int again = reused && !stopped && (rc == 1 || !strstr(err, "timed out"));
+        if (stopped && c->h2) {
+            conn_abandon(c, &st);
+            c = NULL;
+            break;
+        }
         conn_close(c);
         c = NULL;
         if (!again)
@@ -1386,7 +1982,7 @@ static int one_request(struct http_client *cl, const struct http_request *rq, co
         int stop = rq->on_headers(rq->ctx, h.status, hb, hl);
         free(hb);
         if (stop) {
-            conn_close(c);
+            conn_abandon(c, &st);
             set_err(rs, "stopped");
             entry_free(&ent);
             head_free(&h);
@@ -1400,13 +1996,22 @@ static int one_request(struct http_client *cl, const struct http_request *rq, co
     struct bodybuf bb = { NULL, 0, 0, !(stream_only && stream) };
     int truncated = 0, reusable = 0;
     int br = 0;
-    if (!no_body) {
+    if (c->h2) {
+        br = no_body ? 0 : h2_read_body(c, &st, &sub, timeout, &bb, max, &truncated, err, sizeof(err));
+        reusable = !c->h2->goaway && (br >= 0 || st.state == 3);
+        close_after = 0;
+        if (br >= 0)
+            h2_cancel(c, &st);          /* (a body that was not wanted, or not read to its end) */
+    } else if (!no_body) {
         br = read_body(c, &sub, timeout, &bb, length, chunked, max, &truncated, &reusable, err, sizeof(err));
     } else {
         reusable = 1;
     }
     if (br < 0) {
-        conn_close(c);
+        if (br == -2 || (c->h2 && reusable))
+            conn_abandon(c, &st);       /* given up on, or only this request reset by the server */
+        else
+            conn_close(c);
         free(bb.p);
         set_err(rs, "%s", br == -2 ? "stopped" : err);
         entry_free(&ent);
@@ -1415,7 +2020,7 @@ static int one_request(struct http_client *cl, const struct http_request *rq, co
     }
     rs->truncated = truncated;
     if (c) {
-        if (reusable && !close_after && !truncated) {
+        if (reusable && !close_after && (!truncated || c->h2)) {
             c->state = 1;
             c->last = uptime_ms();
         } else {

@@ -15,10 +15,11 @@
  *   --post-data=STRING  POST STRING (form-encoded) instead of a GET; a
  *                       redirect after it is followed with a GET
  *   --no-keep-alive     not used; connections are closed when wget ends anyway
+ *   --http1.1           never HTTP/2, even where an HTTPS server offers it
  *
- * Requests are HTTP/1.1 (libc's <http.h>), asking for no compression, and the
- * body is written as it arrives, so a large file never sits in memory; a chunked
- * body is decoded. HTTPS uses libc's TLS 1.3 client (<tls.h>): the connection is
+ * Requests are HTTP/1.1, or HTTP/2 where an HTTPS server offers it (libc's
+ * <http.h>), asking for no compression, and the body is written as it arrives,
+ * so a large file never sits in memory; a chunked body is decoded. HTTPS uses libc's TLS 1.3 client (<tls.h>): the connection is
  * encrypted, but the server's certificate is not verified. Exit status, as in
  * GNU wget: 0 success, 1 generic error, 2 usage, 3 file error, 4 network
  * failure, 8 server error.
@@ -36,7 +37,7 @@
 
 enum { EXIT_GENERIC = 1, EXIT_USAGE = 2, EXIT_FILE = 3, EXIT_NETWORK = 4, EXIT_SERVER = 8 };
 
-static int quiet, save_headers, content_on_error, max_redirect = 20, timeout_ms = 60000;
+static int quiet, save_headers, content_on_error, max_redirect = 20, timeout_ms = 60000, http1;
 static const char *post_data;
 static const char *method_arg;          /* --method: PUT, DELETE... (a body goes with --post-data) */
 #define MAX_HEADERS 16
@@ -211,6 +212,8 @@ int main(int argc, char **argv)
             user_agent = a + 13;
         else if (!strcmp(a, "--no-keep-alive"))
             ;
+        else if (!strcmp(a, "--http1.1"))
+            http1 = 1;
         else if (a[0] == '-' && a[1])
             fail(EXIT_USAGE, "unknown option '%s'\nusage: wget [-q] [-O FILE] [-T SECONDS] "
                  "[--save-headers] [--content-on-error] [--max-redirect=N] [-U AGENT] URL", a);
@@ -249,7 +252,7 @@ int main(int argc, char **argv)
         .timeout_ms = timeout_ms,
         .max_body = 2000000000u,
         .max_redirects = max_redirect,
-        .flags = HTTP_STREAM_ONLY | HTTP_IDENTITY | HTTP_NO_CACHE,
+        .flags = HTTP_STREAM_ONLY | HTTP_IDENTITY | HTTP_NO_CACHE | (http1 ? HTTP_HTTP1 : 0),
         .on_event = on_event,
         .on_headers = on_headers,
         .on_data = on_data,

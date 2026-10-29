@@ -116,6 +116,17 @@ int jsdom_key_event(struct jsdom *d, struct node *target, const char *type, int 
 /* A mouse or pointer event at page point (x, y); related is the element the pointer left or entered. */
 int jsdom_mouse_event(struct jsdom *d, struct node *target, const char *type, int x, int y, int button,
                       struct node *related);
+/* Drag and drop. A drag starts: its DataTransfer gets the text and URL dragged (link: a link is,
+ * so the drop is a link at first). Then each event of it at page point (x, y): dragstart (prevented:
+ * no drag), drag, dragenter, dragover, dragleave, drop and dragend, with current the operation chosen
+ * so far (drop and dragend tell it); a prevented dragenter or dragover puts the operation the page
+ * chose in effect ("none", "copy", "link" or "move"). Returns 1 if prevented. jsdom_drag_text is the
+ * text for dropping into a field; jsdom_drag_end forgets the drag. */
+void jsdom_drag_begin(struct jsdom *d, const char *text, const char *url, int link);
+int jsdom_drag_event(struct jsdom *d, struct node *target, const char *type, int x, int y, struct node *related,
+                     const char *current, char *effect, int esize);
+void jsdom_drag_text(struct jsdom *d, char *out, int size);
+void jsdom_drag_end(struct jsdom *d);
 /* Timers: run the ones that are due; ms until the next one, or -1. */
 void jsdom_run_timers(struct jsdom *d);
 int jsdom_next_timer(struct jsdom *d);

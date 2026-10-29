@@ -62,6 +62,8 @@ enum prop {
     P_TRANSITION, P_TRANSITION_PROPERTY, P_TRANSITION_DURATION, P_TRANSITION_TIMING, P_TRANSITION_DELAY,
     P_ANIMATION, P_ANIMATION_NAME, P_ANIMATION_DURATION, P_ANIMATION_TIMING, P_ANIMATION_DELAY,
     P_ANIMATION_ITERATION, P_ANIMATION_DIRECTION, P_ANIMATION_FILL, P_ANIMATION_STATE,
+    P_COLUMNS, P_COLUMN_COUNT, P_COLUMN_WIDTH, P_COLUMN_RULE, P_COLUMN_RULE_WIDTH, P_COLUMN_RULE_STYLE,
+    P_COLUMN_RULE_COLOR, P_COLUMN_FILL, P_BREAK_INSIDE, P_BREAK_BEFORE, P_BREAK_AFTER,
 };
 
 /* Transitions and animations, with or without -webkit- (looked up before prop_names). */
@@ -86,7 +88,11 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "-webkit-align-self", P_ALIGN_SELF }, { "-webkit-appearance", P_IGNORED },
     { "-webkit-backface-visibility", P_IGNORED }, { "-webkit-border-radius", P_BORDER_RADIUS },
     { "-webkit-box-decoration-break", P_IGNORED }, { "-webkit-box-orient", P_IGNORED },
-    { "-webkit-box-shadow", P_BOX_SHADOW }, { "-webkit-box-sizing", P_BOX_SIZING }, { "-webkit-flex", P_FLEX },
+    { "-webkit-box-shadow", P_BOX_SHADOW }, { "-webkit-box-sizing", P_BOX_SIZING },
+    { "-webkit-column-break-after", P_BREAK_AFTER }, { "-webkit-column-break-before", P_BREAK_BEFORE },
+    { "-webkit-column-break-inside", P_BREAK_INSIDE }, { "-webkit-column-count", P_COLUMN_COUNT },
+    { "-webkit-column-gap", P_COLUMN_GAP }, { "-webkit-column-rule", P_COLUMN_RULE },
+    { "-webkit-column-width", P_COLUMN_WIDTH }, { "-webkit-columns", P_COLUMNS }, { "-webkit-flex", P_FLEX },
     { "-webkit-flex-basis", P_FLEX_BASIS }, { "-webkit-flex-direction", P_FLEX_DIRECTION },
     { "-webkit-flex-flow", P_FLEX_FLOW }, { "-webkit-flex-grow", P_FLEX_GROW },
     { "-webkit-flex-shrink", P_FLEX_SHRINK }, { "-webkit-flex-wrap", P_FLEX_WRAP },
@@ -129,10 +135,14 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "border-top-right-radius", P_BORDER_TR_RADIUS }, { "border-top-style", P_BORDER_TOP_STYLE },
     { "border-top-width", P_BORDER_TOP_WIDTH }, { "border-width", P_BORDER_WIDTH }, { "bottom", P_BOTTOM },
     { "box-decoration-break", P_IGNORED }, { "box-shadow", P_BOX_SHADOW }, { "box-sizing", P_BOX_SIZING },
-    { "break-after", P_IGNORED }, { "break-before", P_IGNORED }, { "break-inside", P_IGNORED },
+    { "break-after", P_BREAK_AFTER }, { "break-before", P_BREAK_BEFORE }, { "break-inside", P_BREAK_INSIDE },
     { "caption-side", P_CAPTION_SIDE }, { "caret-color", P_IGNORED }, { "clear", P_CLEAR }, { "clip", P_CLIP },
     { "color", P_COLOR }, { "color-interpolation", P_IGNORED }, { "color-interpolation-filters", P_IGNORED },
-    { "color-rendering", P_IGNORED }, { "color-scheme", P_IGNORED }, { "column-gap", P_COLUMN_GAP },
+    { "color-rendering", P_IGNORED }, { "color-scheme", P_IGNORED }, { "column-count", P_COLUMN_COUNT },
+    { "column-fill", P_COLUMN_FILL }, { "column-gap", P_COLUMN_GAP }, { "column-rule", P_COLUMN_RULE },
+    { "column-rule-color", P_COLUMN_RULE_COLOR }, { "column-rule-style", P_COLUMN_RULE_STYLE },
+    { "column-rule-width", P_COLUMN_RULE_WIDTH }, { "column-span", P_IGNORED }, { "column-width", P_COLUMN_WIDTH },
+    { "columns", P_COLUMNS },
     { "contain", P_IGNORED }, { "contain-intrinsic-block-size", P_IGNORED },
     { "contain-intrinsic-height", P_IGNORED }, { "contain-intrinsic-inline-size", P_IGNORED },
     { "contain-intrinsic-size", P_IGNORED }, { "contain-intrinsic-width", P_IGNORED },
@@ -193,7 +203,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "padding-bottom", P_PADDING_BOTTOM }, { "padding-inline", P_PADDING_INLINE },
     { "padding-inline-end", P_PADDING_RIGHT }, { "padding-inline-start", P_PADDING_LEFT },
     { "padding-left", P_PADDING_LEFT }, { "padding-right", P_PADDING_RIGHT }, { "padding-top", P_PADDING_TOP },
-    { "page-break-after", P_IGNORED }, { "page-break-before", P_IGNORED }, { "page-break-inside", P_IGNORED },
+    { "page-break-after", P_IGNORED }, { "page-break-before", P_IGNORED }, { "page-break-inside", P_BREAK_INSIDE },
     { "paint-order", P_IGNORED }, { "perspective", P_IGNORED }, { "perspective-origin", P_IGNORED },
     { "place-content", P_PLACE_CONTENT }, { "place-items", P_PLACE_ITEMS }, { "place-self", P_PLACE_SELF },
     { "pointer-events", P_POINTER_EVENTS }, { "position", P_POSITION }, { "print-color-adjust", P_IGNORED },
@@ -3605,6 +3615,10 @@ static void init_initial(void)
     s->obj_px = s->obj_py = (struct len){ 5000, 0, U_PCT };
     s->tox = s->toy = (struct len){ 5000, 0, U_PCT };
     s->opacity = 255;
+    s->col_gap_normal = 1;
+    s->col_width.unit = U_AUTO;
+    s->col_rule_w = 3;
+    s->col_rule_color = 1;
 }
 
 static void inherit(struct style *st, const struct style *p)
@@ -5201,19 +5215,95 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
     case P_ROW_GAP:
     case P_COLUMN_GAP: {
         struct len l[2] = { { .unit = U_PX }, { .unit = U_PX } };
+        int normal[2] = { 1, 1 };
         n = words(value, w, wl, 8);
         for (int i = 0; i < n && i < 2; i++) {
             char tmp[64];
             snprintf(tmp, sizeof(tmp), "%.*s", wl[i], w[i]);
             if (!length_value(tmp, v, &l[i]) || l[i].unit == U_AUTO)
                 l[i] = (struct len){ .unit = U_PX };    /* normal */
+            else
+                normal[i] = 0;
         }
         if (n == 1)
-            l[1] = l[0];
+            l[1] = l[0], normal[1] = normal[0];
         if (prop != P_COLUMN_GAP)
             st->row_gap = l[0];
-        if (prop != P_ROW_GAP)
+        if (prop != P_ROW_GAP) {
             st->col_gap = prop == P_GAP ? l[1] : l[0];
+            st->col_gap_normal = (uint8_t)(prop == P_GAP ? normal[1] : normal[0]);
+        }
+        break;
+    }
+    case P_COLUMNS:
+    case P_COLUMN_COUNT:
+    case P_COLUMN_WIDTH: {                      /* "3", "12em", "3 12em", "auto" */
+        if (prop != P_COLUMN_WIDTH)
+            st->col_count = 0;
+        if (prop != P_COLUMN_COUNT)
+            st->col_width = (struct len){ .unit = U_AUTO };
+        if (inherit_kw) {
+            if (prop != P_COLUMN_WIDTH)
+                st->col_count = parent->col_count;
+            if (prop != P_COLUMN_COUNT)
+                st->col_width = parent->col_width;
+            break;
+        }
+        n = words(value, w, wl, 2);
+        for (int i = 0; i < n; i++) {
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "%.*s", wl[i], w[i]);
+            struct len l;
+            const char *e = tmp;
+            while (isdigit((unsigned char)*e))
+                e++;
+            if (*e == 0 && e > tmp && prop != P_COLUMN_WIDTH) {
+                int k = atoi(tmp);
+                st->col_count = (uint8_t)(k > 255 ? 255 : k);
+            } else if (prop != P_COLUMN_COUNT && length_value(tmp, v, &l) && l.unit == U_PX && l.v > 0) {
+                st->col_width = l;
+            }
+        }
+        break;
+    }
+    case P_COLUMN_RULE:
+    case P_COLUMN_RULE_WIDTH:
+    case P_COLUMN_RULE_STYLE:
+    case P_COLUMN_RULE_COLOR: {
+        if (prop == P_COLUMN_RULE || initial_kw) {
+            st->col_rule_style = BS_NONE;
+            st->col_rule_w = ZOOM(3);
+            st->col_rule_color = 1;
+            if (initial_kw)
+                break;
+        }
+        n = words(value, w, wl, 8);
+        for (int i = 0; i < n; i++) {
+            int bs = parse_border_style(w[i], wl[i]), px;
+            if (bs >= 0 && (prop == P_COLUMN_RULE || prop == P_COLUMN_RULE_STYLE))
+                st->col_rule_style = (uint8_t)bs;
+            else if ((prop == P_COLUMN_RULE || prop == P_COLUMN_RULE_WIDTH) && border_width_kw(w[i], wl[i], v, &px))
+                st->col_rule_w = px;
+            else if ((prop == P_COLUMN_RULE || prop == P_COLUMN_RULE_COLOR) && css_parse_color(w[i], wl[i], &c) == 0)
+                st->col_rule_color = c;
+            else if ((prop == P_COLUMN_RULE || prop == P_COLUMN_RULE_COLOR) && word_is(w[i], wl[i], "currentcolor"))
+                st->col_rule_color = 1;
+        }
+        break;
+    }
+    case P_COLUMN_FILL:
+        st->col_fill_auto = !strcasecmp(value, "auto");
+        break;
+    case P_BREAK_INSIDE:                        /* avoid, avoid-column, avoid-page */
+        st->break_avoid = !strncasecmp(value, "avoid", 5);
+        break;
+    case P_BREAK_BEFORE:
+    case P_BREAK_AFTER: {                       /* only column breaks: the page is not paginated */
+        int forced = !strcasecmp(value, "column") || !strcasecmp(value, "always");
+        if (prop == P_BREAK_BEFORE)
+            st->break_before = (uint8_t)forced;
+        else
+            st->break_after = (uint8_t)forced;
         break;
     }
     case P_OVERFLOW: {
@@ -6658,9 +6748,20 @@ static void restore_property(struct style *st, const struct style *src, int prop
     case P_PLACE_ITEMS: COPY(align_items); COPY(justify_items); break;
     case P_PLACE_SELF: COPY(align_self); COPY(justify_self); break;
     case P_ORDER: COPY(order); break;
-    case P_GAP: COPY(row_gap); COPY(col_gap); break;
+    case P_GAP: COPY(row_gap); COPY(col_gap); COPY(col_gap_normal); break;
     case P_ROW_GAP: COPY(row_gap); break;
-    case P_COLUMN_GAP: COPY(col_gap); break;
+    case P_COLUMN_GAP: COPY(col_gap); COPY(col_gap_normal); break;
+    case P_COLUMNS: COPY(col_count); COPY(col_width); break;
+    case P_COLUMN_COUNT: COPY(col_count); break;
+    case P_COLUMN_WIDTH: COPY(col_width); break;
+    case P_COLUMN_RULE: COPY(col_rule_style); COPY(col_rule_w); COPY(col_rule_color); break;
+    case P_COLUMN_RULE_WIDTH: COPY(col_rule_w); break;
+    case P_COLUMN_RULE_STYLE: COPY(col_rule_style); break;
+    case P_COLUMN_RULE_COLOR: COPY(col_rule_color); break;
+    case P_COLUMN_FILL: COPY(col_fill_auto); break;
+    case P_BREAK_INSIDE: COPY(break_avoid); break;
+    case P_BREAK_BEFORE: COPY(break_before); break;
+    case P_BREAK_AFTER: COPY(break_after); break;
     case P_OVERFLOW: COPY(ov_x); COPY(ov_y); break;
     case P_OVERFLOW_X: COPY(ov_x); break;
     case P_OVERFLOW_Y: COPY(ov_y); break;
@@ -7138,6 +7239,10 @@ static int compute(struct arena *a, struct node *n, const struct style *parent,
         st->outline_w = 0;
     if (st->outline_color == 1)
         st->outline_color = st->color;
+    if (st->col_rule_style == BS_NONE)
+        st->col_rule_w = 0;
+    if (st->col_rule_color == 1)
+        st->col_rule_color = st->color;
     if (st->ts_color == 1)
         st->ts_color = st->color;
     if (st->font_size > 200)

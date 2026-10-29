@@ -1,9 +1,11 @@
 /*
- * An HTTP/1.1 client (libc: http.c) for wget and the browser's fetcher (httpc).
+ * An HTTP/1.1 and HTTP/2 client (libc: http.c) for wget and the browser's fetcher (httpc).
  *
  *  - Connections stay open between requests (keep-alive) in a small pool, and a request on one the
  *    server has closed meanwhile is repeated on a fresh one.
  *  - http:// and https:// (libc's TLS 1.3 client; certificates are verified, see <tls.h>).
+ *  - HTTP/2 where an HTTPS server offers it (ALPN): one request at a time on a connection, which
+ *    stays open for the next; giving up on one resets only its stream.
  *  - Bodies may be chunked or sized or end with the connection, and gzip- or deflate-coded:
  *    they are given back decoded, with headers that say so.
  *  - Optionally a cache in a folder: fresh copies are given back without asking the server,
@@ -26,6 +28,7 @@ enum {
     HTTP_NO_CACHE = 2,          /* neither read nor write the cache */
     HTTP_STREAM_ONLY = 4,       /* body only through on_data: nothing is kept (and nothing cached) */
     HTTP_IDENTITY = 8,          /* ask for no compression */
+    HTTP_HTTP1 = 16,            /* HTTP/1.1 only, even where the server could do HTTP/2 */
 };
 
 struct http_request {

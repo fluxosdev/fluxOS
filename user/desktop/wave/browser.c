@@ -286,6 +286,13 @@ struct browser {
     int button_pressed, button_down;
     struct node *press_link, *press_ctrl;
     int sel_start, sel_active;          /* a press that may drag out a selection; one is shown */
+    struct node *drag_src;              /* pressed on something draggable (dragging it starts a drag), or dragged */
+    int drag_on;                        /* a drag (HTML drag and drop) is going on */
+    struct node *drag_over;             /* the element it is over */
+    char drag_effect[8];                /* what dropping it there would do: "none" for nothing */
+    char drag_text[URL_MAX];            /* the text it carries when no script says otherwise */
+    int drag_sx, drag_sy, drag_px, drag_py;     /* where the press was; where the pointer is */
+    unsigned drag_moved;                /* when drag and dragover were last sent */
     int sel_ax, sel_ay, sel_fx, sel_fy; /* its ends, in page coordinates */
     enum sbar_part sbar_pressed;
     int grab;
@@ -1886,6 +1893,8 @@ static void free_page(struct browser *b)
     css_hover_node = css_focus_node = css_focus_visible_node = NULL;
     b->js_hover = NULL;
     b->sel_active = b->sel_start = 0;
+    b->drag_on = 0;
+    b->drag_src = b->drag_over = NULL;
     if (b->favicon) {
         if (b->win && b->win->icon_img == b->favicon) {
             b->win->icon_img = NULL;
@@ -6174,6 +6183,8 @@ static int dom_key(const struct input_event *ev, char *key, int size)
 
 /* Keys go to the window (t) for its own shortcuts and the address bar, and
  * to the page with the keys (b: a frame clicked in, or the window's) for the rest. */
+static void drag_finish(struct browser *b, int cancel);
+
 static void br_key(struct window *w, const struct input_event *ev)
 {
     struct browser *t = w->priv;
@@ -6183,6 +6194,13 @@ static void br_key(struct window *w, const struct input_event *ev)
         paint(t);
     }
     if (ev->flags & IEV_PRESSED) {
+        struct browser *dragging = t;
+        while (dragging && !dragging->drag_on)
+            dragging = dragging->mouse_frame;
+        if (dragging && ev->code == KEY_ESC) {
+            drag_finish(dragging, 1);
+            return;
+        }
         b->keyboard_focus=1;
         int ctrl = ev->mods & KMOD_CTRL;
         int shift = ev->mods & KMOD_SHIFT;
@@ -6801,6 +6819,154 @@ static void range_drag_to(struct browser *b, struct node *n, int x, int y)
 }
 
 /* The mouse at (x, y) in b's coordinates: the window's, or a frame's own. */
+/* ---- drag and drop ---- */
+
+/* What a press on under would drag: the nearest element with draggable="true", or a picture or a link
+ * (unless draggable="false" says not); NULL if nothing, or if a control takes the press itself. */
+static struct node *drag_source(struct node *under)
+{
+    for (struct node *n = under; n && n->type == N_ELEMENT; n = n->parent ? n->parent : n->shadow_host) {
+        const char *d = node_attr(n, "draggable");
+        if (d && !strcasecmp(d, "true"))
+            return n;
+        if ((d && !strcasecmp(d, "false")) || is_text_field(n) || n->tag == T_BUTTON || n->tag == T_SELECT)
+            return NULL;
+        if (n->tag == T_IMG || (n->tag == T_A && node_attr(n, "href")))
+            return n;
+    }
+    return NULL;
+}
+
+/* A text field a drop can go into as typing would. */
+static int drop_field(const struct node *n)
+{
+    return n && is_text_field(n) && !web_disabled(n) && !node_attr(n, "readonly");
+}
+
+/* Scripts may have navigated away (or the page may be gone) while an event ran: the drag is over. */
+static int drag_gone(struct browser *b)
+{
+    if (b->root && !b->js_nav[0])
+        return 0;
+    b->drag_on = 0;
+    b->drag_src = b->drag_over = NULL;
+    return 1;
+}
+
+/* The pointer has gone far enough from the press: the drag starts, unless dragstart says no. */
+static void drag_start(struct browser *b, int px, int py)
+{
+    struct node *src = b->drag_src;
+    char url[URL_MAX] = "";
+    const char *ref = src->tag == T_A ? node_attr(src, "href") : src->tag == T_IMG ? node_attr(src, "src") : NULL;
+    if (ref && strncasecmp(ref, "javascript:", 11))
+        url_resolve(b->base, ref, url, sizeof(url));
+    snprintf(b->drag_text, sizeof(b->drag_text), "%s", url);
+    b->sel_start = 0;
+    if (b->js) {
+        jsdom_mouse_event(b->js, src, "pointercancel", px, py, -1, NULL);   /* the pointer is the drag's now */
+        jsdom_drag_begin(b->js, url, url, src->tag == T_A);
+        int prevented = jsdom_drag_event(b->js, src, "dragstart", px, py, NULL, NULL, NULL, 0);
+        if (drag_gone(b))
+            return;
+        if (prevented) {
+            jsdom_drag_end(b->js);
+            b->drag_src = NULL;
+            return;
+        }
+    }
+    b->drag_on = 1;
+    b->drag_over = NULL;
+    b->drag_moved = 0;
+    snprintf(b->drag_effect, sizeof(b->drag_effect), "none");
+}
+
+/* The drag moved to (x, y), page point (px, py): drag at its source; dragenter and dragleave as it goes
+ * from element to element; dragover where it is, which decides what a drop there would do. */
+static void drag_move(struct browser *b, int x, int y, int px, int py)
+{
+    struct rect v = view_rect(b);
+    struct node *over = b->root && rect_contains(v, x, y) ? element_at(b, px, py) : NULL;
+    b->drag_px = px, b->drag_py = py;
+    if (over == b->drag_over && now_ms() - b->drag_moved < 40)
+        return;
+    b->drag_moved = now_ms();
+    if (b->js) {
+        jsdom_drag_event(b->js, b->drag_src, "drag", px, py, NULL, NULL, NULL, 0);
+        if (drag_gone(b))
+            return;
+    }
+    if (over != b->drag_over) {
+        struct node *old = b->drag_over;
+        b->drag_over = over;
+        if (b->js && over)
+            jsdom_drag_event(b->js, over, "dragenter", px, py, old, NULL, NULL, 0);
+        if (b->js && old && !drag_gone(b))
+            jsdom_drag_event(b->js, old, "dragleave", px, py, over, NULL, NULL, 0);
+        if (drag_gone(b))
+            return;
+    }
+    snprintf(b->drag_effect, sizeof(b->drag_effect), "none");
+    if (over && (!b->js || !jsdom_drag_event(b->js, over, "dragover", px, py, NULL, NULL, b->drag_effect,
+                                             (int)sizeof(b->drag_effect))) && drop_field(over))
+        snprintf(b->drag_effect, sizeof(b->drag_effect), "copy");     /* a field takes the text if the page does not */
+    if (drag_gone(b))
+        return;
+    struct browser *t = top_of(b);
+    if (t->win)
+        wm_set_cursor(t->win, strcmp(b->drag_effect, "none") ? CUR_ARROW : CUR_NO);
+    if (y < v.y)
+        scroll_by(b, 0, -LINE_STEP);    /* dragging past an edge scrolls */
+    else if (y >= v.y + v.h)
+        scroll_by(b, 0, LINE_STEP);
+}
+
+/* The button came up (or Escape was pressed: cancel): drop where it is if that does anything, then dragend. */
+static void drag_finish(struct browser *b, int cancel)
+{
+    struct node *over = b->drag_over, *src = b->drag_src;
+    int px = b->drag_px, py = b->drag_py;
+    char op[8];
+    snprintf(op, sizeof(op), "%s", cancel ? "none" : b->drag_effect);
+    b->drag_on = 0;
+    b->drag_src = b->drag_over = NULL;
+    if (over && !strcmp(op, "none")) {
+        if (b->js)
+            jsdom_drag_event(b->js, over, "dragleave", px, py, NULL, NULL, NULL, 0);
+    } else if (over) {
+        int prevented = b->js && jsdom_drag_event(b->js, over, "drop", px, py, NULL, op, NULL, 0);
+        if (b->root && !b->js_nav[0] && !prevented && drop_field(over)) {
+            char text[2048];
+            if (b->js)
+                jsdom_drag_text(b->js, text, (int)sizeof(text));
+            else
+                snprintf(text, sizeof(text), "%s", b->drag_text);
+            char *before = over->value ? strdup(over->value) : NULL;
+            for (const char *p = text; *p; p++) {          /* as if typed where the caret is */
+                struct input_event ev = { .type = IEV_KEY, .flags = IEV_PRESSED, .len = 1 };
+                ev.text[0] = *p == '\r' ? '\n' : *p;
+                if (ev.text[0] == '\n' && over->tag != T_TEXTAREA)
+                    ev.text[0] = ' ';
+                edit_field(b, over, &ev);
+            }
+            b->focus = over;
+            if (b->js && (!before || !over->value || strcmp(before, over->value)))
+                jsdom_dispatch(b->js, over, "input");
+            free(before);
+        } else if (!prevented) {
+            snprintf(op, sizeof(op), "none");
+        }
+    }
+    if (b->js && src && b->root && !b->js_nav[0])
+        jsdom_drag_event(b->js, src, "dragend", px, py, NULL, op, NULL, 0);
+    if (b->js)
+        jsdom_drag_end(b->js);
+    struct browser *t = top_of(b);
+    if (t->win)
+        wm_set_cursor(t->win, CUR_ARROW);
+    paint(b);
+}
+
 static void mouse(struct browser *b, int x, int y, int buttons, int changed)
 {
     int left = buttons & MOUSE_LEFT;
@@ -6942,7 +7108,10 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             }
             h = layout_hit(&b->lo, b->lo.links, b->lo.nlinks, px, py, b->scroll_x, b->scroll_y);
             b->press_link = h && !b->press_ctrl && !web_inert(h->node) ? h->node : NULL;
-            b->sel_start = !b->press_ctrl && !b->press_link;
+            b->drag_src = b->press_ctrl ? NULL : drag_source(element_at(b, px, py));
+            b->drag_on = 0;
+            b->drag_sx = px, b->drag_sy = py;
+            b->sel_start = !b->press_ctrl && !b->press_link && !b->drag_src;
             b->sel_ax = b->sel_fx = px;
             b->sel_ay = b->sel_fy = py;
             if (b->sel_active) {            /* a new press ends the old selection */
@@ -6958,10 +7127,12 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
                 paint(b);
             }
             struct node *under = b->js ? element_at(b, px, py) : NULL;
-            if (under)
-                jsdom_mouse_event(b->js, under, "pointerdown", px, py, 0, NULL);
-            if (under && b->js && b->root && !b->js_nav[0]) {
+            int pointer_prevented = under && jsdom_mouse_event(b->js, under, "pointerdown", px, py, 0, NULL);
+            if (pointer_prevented)      /* no mousedown then, nor what it would start */
+                b->drag_src = NULL, b->sel_start = 0;
+            if (under && b->js && b->root && !b->js_nav[0] && !pointer_prevented) {
                 int prevented=jsdom_mouse_event(b->js,under,"mousedown",px,py,0,NULL);
+                if(prevented)b->drag_src=NULL,b->sel_start=0;      /* the page handles the press itself */
                 if(!prevented){
                     struct node *focus=under;
                     while(focus&&!web_focusable(focus))focus=focus->parent?focus->parent:focus->shadow_host;
@@ -6991,8 +7162,11 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             if (b->js && b->root)
                 jsdom_dispatch(b->js, r, "change");
             paint(b);
+        } else if (hold == H_PAGE && b->drag_on) {
+            drag_finish(b, 0);
         } else if (hold == H_PAGE) {
             b->sel_start = 0;
+            b->drag_src = NULL;
             struct node *under = b->js && b->root ? element_at(b, px, py) : NULL;
             if (b->js && (under || jsdom_pointer_capture(b->js)))
                 jsdom_mouse_event(b->js, under, "pointerup", px, py, 0, NULL);
@@ -7041,8 +7215,22 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
         }
     } else if (b->hold == H_PAGE && b->drag_range) {
         range_drag_to(b, b->drag_range, x, y);
+    } else if (b->hold == H_PAGE && b->drag_on) {
+        drag_move(b, x, y, px, py);
+    } else if (b->hold == H_PAGE && b->drag_src && left &&
+               abs(px - b->drag_sx) + abs(py - b->drag_sy) > 4) {
+        drag_start(b, px, py);
+        if (b->drag_on)
+            drag_move(b, x, y, px, py);
+    } else if (b->hold == H_PAGE && !b->sel_start && left) {
+        if (b->js && b->root && !b->js_nav[0])      /* the page's own dragging hears where the pointer goes */
+            js_pointer_moved(b, element_at(b, px, py), px, py);
     } else if (b->hold == H_PAGE && b->sel_start && left) {
         int dx = px - b->sel_ax, dy = py - b->sel_ay;
+        if (b->js && b->root && !b->js_nav[0])
+            js_pointer_moved(b, element_at(b, px, py), px, py);
+        if (b->hold != H_PAGE || !b->sel_start)
+            return;                     /* a script ended it */
         if (!b->sel_active && (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy) > 4)
             b->sel_active = 1;
         if (b->sel_active) {

@@ -101,6 +101,7 @@ struct jsdom {
     struct jsobj *tag_protos[T_COUNT];  /* HTMLInputElement and the rest, by tag (NULL: HTMLElement) */
     unsigned int activation;
     int activated, pointer_down, pointer_buttons;
+    int drag_link;                      /* the drag going on is of a link (its effect is link at first) */
     struct node *capture, *pending_capture;
     struct node *active;                /* document.activeElement, when a script focused one */
     int custom_on;                      /* customElements.define was called: tell it of custom elements */
@@ -3250,6 +3251,8 @@ static int event_kind(const char *type)
         { "focusout", EV_FOCUS }, { "input", EV_INPUT }, { "beforeinput", EV_INPUT },
         { "submit", EV_SUBMIT }, { "popstate", EV_POPSTATE }, { "hashchange", EV_HASHCHANGE },
         { "message", EV_MESSAGE }, { "toggle", EV_TOGGLE }, { "beforetoggle", EV_TOGGLE },
+        { "dragstart", EV_DRAG }, { "drag", EV_DRAG }, { "dragenter", EV_DRAG }, { "dragover", EV_DRAG },
+        { "dragleave", EV_DRAG }, { "drop", EV_DRAG }, { "dragend", EV_DRAG },
     };
     for (unsigned i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++)
         if (!strcmp(kinds[i].type, type))
@@ -3504,6 +3507,7 @@ void jsdom_motion_event(struct jsdom *d, struct node *target, const char *type, 
 }
 
 static void update_pointer_capture(struct jsdom *d);
+static void mouse_position(struct jsdom *d, jsval ev, struct node *target, int x, int y);
 
 int jsdom_mouse_event(struct jsdom *d, struct node *target, const char *type, int x, int y, int button,
                       struct node *related)
@@ -3517,14 +3521,38 @@ int jsdom_mouse_event(struct jsdom *d, struct node *target, const char *type, in
     if (!target || web_inert(target)) return 0;
     if(!strcmp(type,"pointerdown") || !strcmp(type,"mousedown")) {d->activated=1;d->activation=uptime_ms();}
     struct js *J = d->J;
-    int sx = 0, sy = 0;
-    if (d->h.scroll_pos)
-        d->h.scroll_pos(d->h.ctx, &sx, &sy);
     jsval ev = new_event(d, type, wrap(d, target));
     js_set(d->J, ev, "composed", js_bool(1));
     int bubbles = bubbles_by_default(type);
     js_set(J, ev, "bubbles", js_bool(bubbles));
     js_set(J, ev, "cancelable", js_bool(bubbles));
+    mouse_position(d, ev, target, x, y);
+    if (button < 0 && strncmp(type, "pointer", 7))
+        button = 0;                     /* mouse events say 0 when no button changed; pointer events -1 */
+    js_set(J, ev, "button", js_num(button));
+    js_set(J, ev, "which", js_num(button + 1));
+    /* buttons: those held down after the event (pointerdown and pointerup keep count) */
+    int up = !strcmp(type, "mouseup") || !strcmp(type, "click") || !strcmp(type, "dblclick") ||
+             !strcmp(type, "auxclick");
+    js_set(J, ev, "buttons", js_num(!strcmp(type, "mousedown") && button >= 0 ? 1 << button
+                                    : up ? 0 : d->pointer_buttons));
+    js_set(J, ev, "detail", js_num(!strcmp(type, "click") ? 1 : 0));
+    if (related)
+        js_set(J, ev, "relatedTarget", wrap(d, related));
+    int prevented=dispatch_event(d, target, type, ev, bubbles);
+    if(!strcmp(type,"pointerup")||!strcmp(type,"pointercancel")){
+        d->pointer_down=0;d->pointer_buttons=0;d->pending_capture=NULL;update_pointer_capture(d);
+    }
+    return prevented;
+}
+
+/* Where a mouse, pointer or drag event at page point (x, y) happened, in each of the ways it can be asked. */
+static void mouse_position(struct jsdom *d, jsval ev, struct node *target, int x, int y)
+{
+    struct js *J = d->J;
+    int sx = 0, sy = 0;
+    if (d->h.scroll_pos)
+        d->h.scroll_pos(d->h.ctx, &sx, &sy);
     js_set(J, ev, "clientX", js_num(x - sx));
     js_set(J, ev, "clientY", js_num(y - sy));
     js_set(J, ev, "x", js_num(x - sx));
@@ -3542,21 +3570,78 @@ int jsdom_mouse_event(struct jsdom *d, struct node *target, const char *type, in
         js_set(J, ev, "offsetX", js_num(x - bx));
         js_set(J, ev, "offsetY", js_num(y - by));
     }
-    if (button < 0 && strncmp(type, "pointer", 7))
-        button = 0;                     /* mouse events say 0 when no button changed; pointer events -1 */
-    js_set(J, ev, "button", js_num(button));
-    js_set(J, ev, "which", js_num(button + 1));
-    int down = !strcmp(type, "mousedown") || !strcmp(type, "pointerdown") || !strcmp(type, "mousemove") ||
-               !strcmp(type, "pointermove");
-    js_set(J, ev, "buttons", js_num(pointer ? d->pointer_buttons : down && button >= 0 ? 1 << button : 0));
-    js_set(J, ev, "detail", js_num(!strcmp(type, "click") ? 1 : 0));
+}
+
+/* ---- drag and drop ---- */
+
+void jsdom_drag_begin(struct jsdom *d, const char *text, const char *url, int link)
+{
+    if (!d)
+        return;
+    struct js *J = d->J;
+    jsval f = js_get(J, js_obj(d->window), "%drag"), r;
+    jsval a[3] = { js_str(J, "new"), url && *url ? js_str(J, url) : js_null, text && *text ? js_str(J, text) : js_null };
+    d->drag_link = link;
+    if (js_is_callable(f) && js_call(J, f, js_undefined, a, 3, &r) == 0)
+        js_set(J, js_obj(d->window), "%dragDT", r);
+}
+
+/* Ask the page's %drag helper something about the drag's DataTransfer; the answer as text into out. */
+static int drag_op(struct jsdom *d, const char *op, const char *type, const char *current, char *out, int size)
+{
+    struct js *J = d->J;
+    jsval dt = js_get(J, js_obj(d->window), "%dragDT"), f = js_get(J, js_obj(d->window), "%drag"), r;
+    if (dt.t != JS_OBJ || !js_is_callable(f))
+        return -1;
+    jsval a[5] = { js_str(J, op), dt, js_str(J, type ? type : ""), js_bool(d->drag_link),
+                   js_str(J, current ? current : "none") };
+    if (js_call(J, f, js_undefined, a, 5, &r) < 0)
+        return -1;
+    if (out && size > 0)
+        snprintf(out, (size_t)size, "%s", r.t == JS_STR ? js_tostr(J, r)->s : "");
+    return 0;
+}
+
+int jsdom_drag_event(struct jsdom *d, struct node *target, const char *type, int x, int y, struct node *related,
+                     const char *current, char *effect, int esize)
+{
+    if (effect && esize > 0)
+        snprintf(effect, (size_t)esize, "none");
+    if (!d || !target || web_inert(target))
+        return 0;
+    struct js *J = d->J;
+    if (drag_op(d, "prepare", type, current, NULL, 0) < 0)
+        return 0;
+    jsval ev = new_event_kind(d, type, wrap(d, target), EV_DRAG);
+    int quiet = !strcmp(type, "dragleave") || !strcmp(type, "dragend");
+    js_set(J, ev, "composed", js_bool(1));
+    js_set(J, ev, "bubbles", js_bool(1));
+    js_set(J, ev, "cancelable", js_bool(!quiet));
+    mouse_position(d, ev, target, x, y);
+    js_set(J, ev, "button", js_num(0));
+    js_set(J, ev, "buttons", js_num(!strcmp(type, "drop") || !strcmp(type, "dragend") ? 0 : 1));
+    js_set(J, ev, "detail", js_num(0));
+    js_set(J, ev, "dataTransfer", js_get(J, js_obj(d->window), "%dragDT"));
     if (related)
         js_set(J, ev, "relatedTarget", wrap(d, related));
-    int prevented=dispatch_event(d, target, type, ev, bubbles);
-    if(!strcmp(type,"pointerup")||!strcmp(type,"pointercancel")){
-        d->pointer_down=0;d->pointer_buttons=0;d->pending_capture=NULL;update_pointer_capture(d);
-    }
+    int prevented = dispatch_event(d, target, type, ev, 1);
+    if (prevented && effect && (!strcmp(type, "dragenter") || !strcmp(type, "dragover")))
+        drag_op(d, "effect", type, current, effect, esize);
     return prevented;
+}
+
+void jsdom_drag_text(struct jsdom *d, char *out, int size)
+{
+    if (size > 0)
+        out[0] = 0;
+    if (d)
+        drag_op(d, "text", NULL, NULL, out, size);
+}
+
+void jsdom_drag_end(struct jsdom *d)
+{
+    if (d)
+        js_set(d->J, js_obj(d->window), "%dragDT", js_null);
 }
 
 int jsdom_key_event(struct jsdom *d, struct node *target, const char *type, int keycode, const char *key)

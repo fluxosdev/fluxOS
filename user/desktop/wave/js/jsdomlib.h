@@ -708,7 +708,12 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
     if (this.hasAttribute("data-popover-open")) this.hidePopover(); else this.showPopover();
   });
   Object.defineProperty(EP, "inert", { configurable:true, get:function(){return this.hasAttribute("inert");}, set:function(v){if(v)this.setAttribute("inert", "");else this.removeAttribute("inert");} });
-  getter(EP, "draggable", function () { return this.getAttribute("draggable") === "true"; });
+  Object.defineProperty(EP, "draggable", { configurable: true, get: function () {   /* pictures and links are by default */
+    var a = this.getAttribute("draggable");
+    if (a === "true" || a === "false") return a === "true";
+    var t = this.localName;
+    return t === "img" || (t === "a" && this.hasAttribute("href"));
+  }, set: function (v) { this.setAttribute("draggable", v ? "true" : "false"); } });
   getter(EP, "slot", function () { return this.getAttribute("slot") || ""; });
   getter(EP, "part", function () { return this.classList; });
   def(Text.prototype, "splitText", function (at) {
@@ -1358,5 +1363,133 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
     def(g.Document, "parseHTMLUnsafe", function (html, options) { return g.Sanitizer && g["%parseHTML"](html, options, false); });
     def(g.Document, "parseHTML", function (html, options) { return g.Sanitizer && g["%parseHTML"](html, options, true); });
   }
+  /* ---- drag and drop: a DataTransfer is what a drag carries (the browser makes one for each drag) ---- */
+  var dropKinds = ["none", "copy", "link", "move"];
+  var allowedKinds = ["none", "copy", "copyLink", "copyMove", "link", "linkMove", "move", "all", "uninitialized"];
+  function dragType(t) { t = String(t).toLowerCase(); return t === "text" ? "text/plain" : t === "url" ? "text/uri-list" : t; }
+  class DataTransferItem {
+    constructor(dt, kind, type, data) { def(this, "_dt", dt); def(this, "_data", data); this.kind = kind; this.type = type; }
+    getAsString(callback) {
+      if (this.kind !== "string" || typeof callback !== "function" || this._dt._mode === "protected") return;
+      var v = this._data;
+      setTimeout(function () { callback(v); }, 0);
+    }
+    getAsFile() { return this.kind === "file" && this._dt._mode !== "protected" ? this._data : null; }
+  }
+  class DataTransferItemList {
+    constructor(dt) { def(this, "_dt", dt); def(this, "_n", 0); }
+    get length() { return this._dt._items.length; }
+    add(data, type) {
+      var dt = this._dt, it;
+      if (dt._mode !== "readwrite") return null;
+      if (g.File && data instanceof g.File) {
+        it = new DataTransferItem(dt, "file", data.type, data);
+      } else {
+        type = dragType(type);
+        if (dt._items.some(function (i) { return i.kind === "string" && i.type === type; }))
+          throw new DOMException("The drag already has data of type " + type, "NotSupportedError");
+        it = new DataTransferItem(dt, "string", type, String(data));
+      }
+      dt._items.push(it);
+      this._sync();
+      return it;
+    }
+    remove(i) { if (this._dt._mode === "readwrite") { this._dt._items.splice(i, 1); this._sync(); } }
+    clear() { if (this._dt._mode === "readwrite") { this._dt._items.length = 0; this._sync(); } }
+    _sync() {
+      var items = this._dt._items;
+      for (var i = 0; i < this._n; i++) delete this[i];
+      for (var k = 0; k < items.length; k++)
+        Object.defineProperty(this, k, { value: items[k], configurable: true, enumerable: true });
+      this._n = items.length;
+    }
+    [Symbol.iterator]() { return this._dt._items.slice()[Symbol.iterator](); }
+  }
+  class DataTransfer {
+    constructor() {
+      def(this, "_items", []);
+      def(this, "_mode", "readwrite");
+      def(this, "_drop", "none");
+      def(this, "_allowed", "uninitialized");
+      def(this, "_list", new DataTransferItemList(this));
+    }
+    get dropEffect() { return this._drop; }
+    set dropEffect(v) { if (dropKinds.indexOf(v) >= 0) this._drop = v; }
+    get effectAllowed() { return this._allowed; }
+    set effectAllowed(v) { if (this._mode === "readwrite" && allowedKinds.indexOf(v) >= 0) this._allowed = v; }
+    get items() { return this._list; }
+    get types() {
+      var t = [], files = false;
+      this._items.forEach(function (i) { if (i.kind === "file") files = true; else t.push(i.type); });
+      if (files) t.push("Files");
+      return Object.freeze(t);
+    }
+    get files() {
+      var f = this._mode === "protected" ? [] : this._items.filter(function (i) { return i.kind === "file"; })
+        .map(function (i) { return i._data; });
+      return g["%fileList"] ? g["%fileList"](f) : f;
+    }
+    getData(format) {
+      if (this._mode === "protected") return "";
+      var asked = String(format).toLowerCase(), type = dragType(asked);
+      var it = this._items.find(function (i) { return i.kind === "string" && i.type === type; });
+      if (!it) return "";
+      if (asked !== "url") return it._data;
+      var lines = it._data.split("\n").map(function (l) { return l.trim(); });
+      return lines.find(function (l) { return l && l.charAt(0) !== "#"; }) || "";
+    }
+    setData(format, data) {
+      if (this._mode !== "readwrite") return;
+      var type = dragType(format), items = this._items;
+      for (var i = items.length - 1; i >= 0; i--)
+        if (items[i].kind === "string" && items[i].type === type) items.splice(i, 1);
+      items.push(new DataTransferItem(this, "string", type, String(data)));
+      this._list._sync();
+    }
+    clearData(format) {
+      if (this._mode !== "readwrite") return;
+      var type = format === undefined ? null : dragType(format), items = this._items;
+      for (var i = items.length - 1; i >= 0; i--)
+        if (items[i].kind === "string" && (type === null || items[i].type === type)) items.splice(i, 1);
+      this._list._sync();
+    }
+    setDragImage(image, x, y) {}
+  }
+  def(g, "DataTransfer", DataTransfer);
+  def(g, "DataTransferItem", DataTransferItem);
+  def(g, "DataTransferItemList", DataTransferItemList);
+  /* The browser side of a drag (jsdom.c): "new" makes its DataTransfer with the text and URL dragged;
+   * "prepare" sets what an event of a type may see and the dropEffect it starts with (from effectAllowed,
+   * or the operation chosen so far for drop and dragend); "effect" is the operation the last dragenter
+   * or dragover chose (none if effectAllowed does not allow it); "text" is the text to drop into a field. */
+  def(g, "%drag", function (op, dt, a, b, c) {
+    if (op === "new") {
+      var d = new DataTransfer();
+      if (dt) d.setData("text/uri-list", dt);
+      if (a) d.setData("text/plain", a);
+      return d;
+    }
+    var allowed = dt._allowed;
+    if (op === "prepare") {
+      dt._mode = a === "dragstart" ? "readwrite" : a === "drop" ? "readonly" : "protected";
+      if (a === "dragenter" || a === "dragover")
+        dt._drop = allowed === "none" ? "none" : allowed === "move" ? "move" : allowed.indexOf("link") === 0 ||
+          (allowed === "uninitialized" && b) ? "link" : "copy";
+      else
+        dt._drop = a === "drop" || a === "dragend" ? String(c || "none") : "none";
+      return null;
+    }
+    if (op === "effect") {
+      var e = dt._drop;
+      return e !== "none" && (allowed === "all" || allowed === "uninitialized" || allowed.toLowerCase().indexOf(e) >= 0)
+        ? e : "none";
+    }
+    if (op === "text") {
+      var t = dt._items.find(function (i) { return i.kind === "string" && i.type === "text/plain"; }) ||
+        dt._items.find(function (i) { return i.kind === "string" && i.type === "text/uri-list"; });
+      return t ? t._data : "";
+    }
+    return null;
+  });
 })(globalThis);
 );

@@ -301,8 +301,10 @@ fetcher process, so the desktop keeps running), or from `file://`.
 - **Network**: each window has its own `/bin/httpc` (built on libc's `<http.h>`),
   started when a page is first fetched and stopped after 30 idle seconds. It keeps
   connections to servers open between requests (HTTP/1.1 keep-alive; one that the
-  server closed meanwhile is retried on a new one), remembers host names for five
-  minutes, decodes chunked, gzip and deflate bodies, and keeps a cache in
+  server closed meanwhile is retried on a new one), speaks HTTP/2 to HTTPS servers
+  that offer it (ALPN; HPACK headers, flow control, a request given up on resets only its
+  stream, one request at a time per connection), remembers host names for five
+  minutes, decodes chunked, gzip, deflate and Brotli bodies, and keeps a cache in
   `/home/flux/.cache/http` (16 MB): fresh copies (`Cache-Control: max-age`,
   `Expires`, or a tenth of the time since `Last-Modified`) are used without asking,
   stale ones are checked with `If-None-Match`/`If-Modified-Since` and reused on a
@@ -386,8 +388,10 @@ fetcher process, so the desktop keeps running), or from `file://`.
   tables, flex rows, grids (columns, rows, areas, auto rows and columns, implicit columns past the
   template, `grid-auto-flow: column`, spans, `dense`, named lines and positive/negative named-line
   occurrences in explicit and integer-repeat tracks; `justify-content` and `align-content` place the
-  tracks), `align-content` for the lines of a wrapping flex container,
-  borders, backgrounds, images and form controls. Floats (`float`, `clear`,
+  tracks), `align-content` for the lines of a wrapping flex container, multi-column boxes
+  (`columns`, `column-count`, `column-width`, `column-gap`, `column-rule`, `column-fill`;
+  balanced columns cut between lines, `break-inside: avoid`, `break-before`/`-after: column`;
+  `column-span` is not supported), borders, backgrounds, images and form controls. Floats (`float`, `clear`,
   clearfixes, text wrapping, new formatting contexts beside floats) and
   positioning (`relative`, `absolute`, `fixed` and `sticky` with `top`/`right`/`bottom`/
   `left`, `inset`) work, painted in stacking-context order (`z-index` on positioned boxes and
@@ -417,7 +421,13 @@ fetcher process, so the desktop keeps running), or from `file://`.
   `autofocus` focuses a field at load.
 - **Interaction**: `:hover`, `:active`, `:focus` and `:focus-within` restyle the page as the
   pointer and focus move. Drag to select text, Ctrl+A to select all, Ctrl+C to
-  copy to the shared clipboard. The window and taskbar show the page's favicon
+  copy to the shared clipboard. Scripts hear the pointer move while a button is held
+  (`pointermove` and `mousemove`, with `buttons`), so pages can drag things themselves.
+  HTML drag and drop: `draggable="true"` elements, links and pictures can be dragged
+  (`dragstart`, `drag`, `dragenter`, `dragover`, `dragleave`, `drop`, `dragend` with a
+  `DataTransfer`: `setData`/`getData`, `types`, `items`, `effectAllowed`/`dropEffect`); a drop
+  into a text field the page does not take types the text there; Escape cancels. Selected text
+  cannot be dragged, and nothing can be dragged between windows. The window and taskbar show the page's favicon
   (`<link rel=icon>` or `/favicon.ico`; PNG, ICO, GIF or SVG).
 - **Cookies**: a jar shared by every window fills from
   `Set-Cookie` headers and `document.cookie` (domain, path, `Secure`,
@@ -573,7 +583,7 @@ ifconfig init ls lsblk mkdir mkfs.fat mixer more mount mv nc ping play
 poweroff ps reboot rm rmdir seq sh sleep sort spin stat sync tail tee top
 touch tr umount uname uniq unzip uptime wc wget yes zip (and httpc, the browser's
 fetcher), on a small libc (stdio, malloc, dirent, time, sockets, a DNS resolver,
-archives, an HTTP/1.1 client and inflate).
+archives, an HTTP/1.1 and HTTP/2 client and inflate).
 - The libc is enough of POSIX for GNU programs to build against it unchanged
   (GNU make and binutils do, cross-compiled; see `self-hosting-roadmap.md`):
   `printf` and `strtod` that agree with glibc digit for digit (exact
@@ -594,8 +604,9 @@ archives, an HTTP/1.1 client and inflate).
 - `ifconfig` shows the interface and sets a static address or asks DHCP;
   `ping [-c N] HOST`, `host NAME`, `nc` (netcat, TCP and UDP).
 - `wget [-q] [-O FILE] [-T SECONDS] [--save-headers] [--content-on-error]
-  [--max-redirect=N] [--post-data=STRING] [--method=VERB] [--header=LINE]... URL` follows redirects and decodes
-  chunked bodies (HTTP/1.1, through libc's `<http.h>`, writing the body as it arrives). `https://` uses libc's own TLS client (`<tls.h>`: TLS 1.3, or
+  [--max-redirect=N] [--post-data=STRING] [--method=VERB] [--header=LINE] [--http1.1]... URL` follows redirects and decodes
+  chunked bodies (HTTP/1.1, or HTTP/2 where an HTTPS server offers it, through libc's `<http.h>`, writing the body
+  as it arrives). `https://` uses libc's own TLS client (`<tls.h>`: TLS 1.3, or
   TLS 1.2 with ECDHE and AES-GCM or ChaCha20-Poly1305). It encrypts but does not verify the server's certificate.
 - `beep [-f HZ] [-l MS] [-r N] [-d MS] [-n ...]` and `beep -m MUSIC` (BASIC's
   PLAY language); `play [-q] [-s SECONDS] FILE...` plays WAV (8 to 32-bit PCM)
@@ -762,8 +773,8 @@ kernel/net/                net/tcp/socket, ne2000, forcedeth/mii, e1000e
 kernel/sound/              pcspkr, sb16/opl/isadma, hda
 kernel/video/              fb/vga, the startup screen (splash.c), voodoo, radeon*, atom, intel*,
                            modes (EDID mode lists)
-user/libc, user/include    the C library (math.c is the x87 math library; http.c and
-                           inflate.c are the HTTP/1.1 client and Deflate) and headers
+user/libc, user/include    the C library (math.c is the x87 math library; http.c, hpack.c and
+                           inflate.c are the HTTP/1.1 and HTTP/2 client and Deflate) and headers
 user/gl/                   the OpenGL library and its backends
 user/fsh/                  the shell
 user/desktop/shell/        compositor and window manager (wm.c), widgets, drawing (gfx.c),
