@@ -202,7 +202,16 @@ native_make() {
         [ -f "$f" ] && "$prefix/bin/$TARGET-strip" "$f" 2>/dev/null || true
     done
     cp "$dest/usr/bin/gcc" "$dest/usr/bin/cc"      # a copy: the installed FAT system has no links
-    echo "native gcc: $dest/usr/bin/gcc, cc, cpp, c++, g++ ($(du -sh "$dest" | cut -f1))"
+    # The C++ runtime for programs compiled on fluxOS: the cross toolchain's
+    # libstdc++ (built for fluxOS against the same sysroot), where the native g++
+    # looks: headers in /usr/include/c++/13.2.0, the libraries in /usr/lib. Without
+    # debug information they are 5 MB instead of 23.
+    mkdir -p "$dest/usr/include/c++" "$dest/usr/lib"
+    cp -r "$prefix/$TARGET/include/c++/13.2.0" "$dest/usr/include/c++/"
+    for lib in libstdc++.a libsupc++.a; do
+        "$prefix/bin/$TARGET-strip" --strip-debug -o "$dest/usr/lib/$lib" "$prefix/$TARGET/lib/$lib"
+    done
+    echo "native gcc: $dest/usr/bin/gcc, cc, cpp, c++, g++, with libstdc++ ($(du -sh "$dest" | cut -f1))"
 }
 
 if [ -n "$native" ]; then

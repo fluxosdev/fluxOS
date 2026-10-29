@@ -418,10 +418,12 @@ files live) was capped at 64 MiB and is now a quarter of RAM up to
       directories when the native `gcc` exists). 72 MB stripped with C++
       (`cc1` 31 MB, `cc1plus` 33 MB): on the installed disk, not in the
       CD's in-memory setup system; `fluxinstall` unpacks `system.tar` as
-      before. `libstdc++` for programs compiled on fluxOS is not on the
-      image yet (the cross toolchain has it; copying
-      `cross/i686-fluxos/lib/libstdc++.a` and `include/c++` is a one-line
-      addition when wanted, 50 MB).
+      before. `libstdc++` for programs compiled on fluxOS is on the image
+      too since 2026-10-29: the cross toolchain's, without debug information
+      (3.4 MB), in `/usr/lib`, with its headers in
+      `/usr/include/c++/13.2.0` (14 MB), where the native `g++` looks; the
+      package is 89 MB with them. `make test-gcc-qemu` compiles and runs a
+      C++ program with iostream, containers, exceptions and static objects.
 - [x] The specs (`gcc/config/fluxos.h`): `/usr/lib/fluxos.ld` (the
       sysroot's copy of `user/user.ld`) is the default linker script of
       both compilers when it exists, found through the startfile search

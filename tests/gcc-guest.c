@@ -4,8 +4,10 @@
  * /usr/bin/gcc, runs the result, checks what it printed, and compares the
  * binary with the one the cross compiler made on the host
  * (/tests/hello.cross), stripped on both sides (the symbol table records
- * the source's name and the two were built from different paths), then
- * prints GCC REGRESSIONS PASSED.
+ * the source's name and the two were built from different paths). Then the
+ * same for C++ (tests/gcc-hello.cc with /usr/bin/g++ and libstdc++:
+ * iostream, containers, exceptions, static objects), and prints GCC
+ * REGRESSIONS PASSED.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -113,6 +115,28 @@ int main(void)
         run("size /tmp/hello.stripped /tmp/cross.stripped; cmp /tmp/hello.stripped /tmp/cross.stripped; "
             "cmp -l /tmp/hello.stripped /tmp/cross.stripped | wc -l", out, sizeof(out));
         printf("the native and cross builds differ:\n%s", out);
+        CHECK(0);
+    }
+
+    /* C++: the runtime library, exceptions and static objects */
+    t0 = uptime_ms();
+    st = run("g++ -O2 -o /tmp/hellocc /tests/hello.cc 2>&1", out, sizeof(out));
+    printf("g++ -O2: %u ms\n%s", uptime_ms() - t0, out);
+    CHECK(st == 0);
+    st = run("/tmp/hellocc", out, sizeof(out));
+    printf("%s", out);
+    CHECK(st == 0);
+    CHECK(!strcmp(out, "static object constructed\n"
+                       "hello from fluxOS g++: apple fig kiwi pear | kiwi=4 | area=21 | caught: division by zero\n"
+                       "static object destroyed\n"));
+    st = run("strip -o /tmp/hellocc.stripped /tmp/hellocc && strip -o /tmp/crosscc.stripped /tests/hellocc.cross", out, sizeof(out));
+    CHECK(st == 0);
+    if (same_file("/tmp/hellocc.stripped", "/tmp/crosscc.stripped"))
+        printf("the native and cross builds of hello.cc are identical once stripped\n");
+    else {
+        run("size /tmp/hellocc.stripped /tmp/crosscc.stripped; cmp -l /tmp/hellocc.stripped /tmp/crosscc.stripped | wc -l",
+            out, sizeof(out));
+        printf("the native and cross builds of hello.cc differ:\n%s", out);
         CHECK(0);
     }
 

@@ -417,10 +417,11 @@ $(BUILD)/tests/sh: $(wildcard user/fsh/*.c user/fsh/*.h) tests/fsh-host/flux.h
 # The native GCC on the real kernel: compiles and runs a program under QEMU and
 # compares the binary with the cross compiler's (needs "make toolchain-native").
 .PHONY: test-gcc-qemu
-test-gcc-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/gcc-guest $(BUILD)/tests/gcc-hello.cross $(NATIVE_ROOT)/usr/bin/gcc
+test-gcc-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/gcc-guest $(BUILD)/tests/gcc-hello.cross $(BUILD)/tests/gcc-hellocc.cross $(NATIVE_ROOT)/usr/bin/gcc
 	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/gcc-guest --cpus $(KERNEL_TEST_CPUS) \
 		--memory 1024 --add $(BUILD)/tests/gcc-hello.cross:tests/hello.cross --add tests/gcc-hello.c:tests/hello.c \
-		--success-marker "GCC REGRESSIONS PASSED" --timeout 240
+		--add $(BUILD)/tests/gcc-hellocc.cross:tests/hellocc.cross --add tests/gcc-hello.cc:tests/hello.cc \
+		--success-marker "GCC REGRESSIONS PASSED" --timeout 480
 
 # Built from a copy named hello.c, as the guest compiles it: the symbol table keeps
 # the source's name, so the unstripped programs can agree too.
@@ -428,6 +429,11 @@ $(BUILD)/tests/gcc-hello.cross: tests/gcc-hello.c $(BUILD)/toolchain/cross/bin/i
 	@mkdir -p $(BUILD)/tests/gcc-hello
 	cp $< $(BUILD)/tests/gcc-hello/hello.c
 	cd $(BUILD)/tests/gcc-hello && $(CURDIR)/$(BUILD)/toolchain/cross/bin/i686-fluxos-gcc -O2 -o $(CURDIR)/$@ hello.c
+
+$(BUILD)/tests/gcc-hellocc.cross: tests/gcc-hello.cc $(BUILD)/toolchain/cross/bin/i686-fluxos-g++ $(SYSROOT)/usr/lib/libc.a
+	@mkdir -p $(BUILD)/tests/gcc-hello
+	cp $< $(BUILD)/tests/gcc-hello/hello.cc
+	cd $(BUILD)/tests/gcc-hello && $(CURDIR)/$(BUILD)/toolchain/cross/bin/i686-fluxos-g++ -O2 -o $(CURDIR)/$@ hello.cc
 
 $(BUILD)/tests/gcc-guest.o: tests/gcc-guest.c
 	@mkdir -p $(dir $@)

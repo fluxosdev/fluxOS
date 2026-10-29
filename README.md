@@ -618,9 +618,11 @@ threads). In `/usr/bin`, cross-built from their sources with the fluxOS toolchai
 (`make ports`): **GNU make 4.4.1** and **binutils 2.42** (`as`, `ld`, `ar`, `ranlib`,
 `nm`, `objcopy`, `objdump`, `readelf`, `strip`, `size`, `strings`); and, after `make
 toolchain-native`, **GCC 13.2.0** itself (`gcc`, `cc`, `cpp`, `g++`, `c++` with `cc1`,
-`cc1plus` and `collect2` in `/usr/libexec`, `libgcc`, and the system's headers and
-libraries in `/usr/include` and `/usr/lib`): `gcc -O2 hello.c` on fluxOS makes the
-same program the cross compiler makes on Linux, byte for byte (`make test-gcc-qemu`).
+`cc1plus` and `collect2` in `/usr/libexec`, `libgcc`, the C++ runtime `libstdc++` with
+its headers, and the system's headers and libraries in `/usr/include` and `/usr/lib`):
+`gcc -O2 hello.c` on fluxOS makes the same program the cross compiler makes on Linux,
+byte for byte once stripped, and `g++` builds C++ programs with iostream, the
+containers and exceptions (`make test-gcc-qemu`).
 - The tools the Makefile runs, written for this: `tar` (ustar create, list,
   extract, `-C`, `-z` through `gzip`; reads GNU and pax archives too),
   `gzip`/`gunzip`/`zcat` (libc's Deflate: `<deflate.h>` compresses and expands
