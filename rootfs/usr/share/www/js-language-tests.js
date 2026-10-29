@@ -26,7 +26,7 @@ test("typeof", function () {
     return [typeof 1, typeof "s", typeof true, typeof undefined, typeof null, typeof {}, typeof [],
             typeof function () {}, typeof class {}, typeof notDeclaredAnywhere, typeof Symbol.iterator];
 }, ["number", "string", "boolean", "undefined", "object", "object", "object", "function", "function",
-    "undefined", "string"]);
+    "undefined", "symbol"]);
 test("logical", function () {
     var log = [];
     function t(v) { log.push(v); return v; }
@@ -757,3 +757,87 @@ test("for initializer closures keep a separate iteration environment", function 
     }
     return [init(), body()];
 }, [0, 7]);
+
+/* ---- symbols and BigInt as their own types ---- */
+test("symbols are unique values", function () {
+    var a = Symbol("x"), b = Symbol("x"), r = Symbol.for("app"), o = { [a]: 1, [b]: 2, s: 3 };
+    o[Symbol.iterator] = function* () { yield 9; };
+    return [typeof a, a === b, a == b, Symbol.for("app") === r, Symbol.keyFor(r), Symbol.keyFor(a),
+            a.description, Symbol().description, String(a), a.toString(), o[a] + o[b], [...o],
+            Object.keys(o), Object.getOwnPropertyNames(o), Object.getOwnPropertySymbols(o).length,
+            Reflect.ownKeys(o).length, JSON.stringify(o), JSON.stringify({ k: a }),
+            Object.prototype.toString.call(a), "@@iterator" in o];
+}, ["symbol", false, false, true, "app", undefined, "x", undefined, "Symbol(x)", "Symbol(x)", 3, [9],
+    ["s"], ["s"], 3, 4, '{"s":3}', "{}", "[object Symbol]", false]);
+test("symbol conversions and copies", function () {
+    var s = Symbol("t"), errors = 0;
+    try { "" + s; } catch (e) { errors += e instanceof TypeError; }
+    try { `${s}`; } catch (e) { errors += e instanceof TypeError; }
+    try { s * 2; } catch (e) { errors += e instanceof TypeError; }
+    var src = { [s]: "v", n: 1 }, spread = { ...src }, assigned = Object.assign({}, src);
+    var tagged = { [Symbol.toStringTag]: "Thing" };
+    var prim = { [Symbol.toPrimitive](hint) { return hint === "string" ? "str" : 5; } };
+    return [errors, spread[s], assigned[s], Object.prototype.toString.call(tagged), `${prim}`, prim + 1,
+            !!s, Object(1) instanceof Number, Object.getPrototypeOf(s) === Symbol.prototype];
+}, [3, "v", "v", "[object Thing]", "str", 6, true, true, true]);
+test("bigint arithmetic", function () {
+    var big = 2n ** 100n;
+    return [typeof 1n, String(big), String(big / 3n), String(big % 7n), String(-big / 3n), String(-7n % 3n),
+            String(123456789012345678901234567890n * 987654321098765432109876543210n),
+            String(0xffn + 0o17n + 0b11n), String(1_000_000n), String(-(5n)), String(10n - 15n),
+            (big * big / big) === big, 5n == 5, 5n === 5, 5n == "5", 2n < 3, 2n > 1.5, 10n > 9n, -3n < -2n,
+            [3n, 1n, 2n].sort().map(String), String(big - 1n).length];
+}, ["bigint", "1267650600228229401496703205376", "422550200076076467165567735125",
+    "2", "-422550200076076467165567735125", "-1",
+    "121932631137021795226185032733622923332237463801111263526900",
+    "273", "1000000", "-5", "-5", true, true, false, true, true, true, true, true, ["1", "2", "3"], 31]);
+test("bigint bitwise and conversions", function () {
+    var errors = 0;
+    try { 1n + 1; } catch (e) { errors += e instanceof TypeError; }
+    try { +1n; } catch (e) { errors += e instanceof TypeError; }
+    try { 1n / 0n; } catch (e) { errors += e instanceof RangeError; }
+    try { JSON.stringify({ a: 1n }); } catch (e) { errors += e instanceof TypeError; }
+    try { BigInt(1.5); } catch (e) { errors += e instanceof RangeError; }
+    try { BigInt("12x"); } catch (e) { errors += e instanceof SyntaxError; }
+    var i = 5n;
+    i++;
+    i += 2n;
+    return [errors, String(i), String(-5n & 0xffn), String(-5n | 2n), String(5n ^ -1n), String(~5n), String(1n << 70n),
+            String(-17n >> 2n), String(-1n >> 200n), String(BigInt.asUintN(64, -1n)), String(BigInt.asIntN(8, 255n)),
+            String(BigInt.asIntN(64, 2n ** 63n)), BigInt("  -42  ") === -42n, BigInt(true) === 1n, Number(2n ** 64n),
+            (255n).toString(16), (-255n).toString(2), BigInt(Number.MAX_SAFE_INTEGER) + 2n === 9007199254740993n,
+            0n ? 1 : 2, 1n && "t", (1234567n).toLocaleString(), `${10n}`, "" + 7n, Object.prototype.toString.call(1n),
+            BigInt(1e21).toString(), Number(123456789012345678901234567890n)];
+}, [6, "8", "251", "-5", "-6", "-6", "1180591620717411303424", "-5", "-1", "18446744073709551615", "-1",
+    "-9223372036854775808", true, true, 18446744073709551616, "ff", "-11111111", true, 2, "t", "1,234,567", "10",
+    "7", "[object BigInt]", "1000000000000000000000", 1.2345678901234568e+29]);
+test("bigint typed arrays and DataView", function () {
+    var a = new BigInt64Array(2), u = new BigUint64Array(a.buffer), dv = new DataView(new ArrayBuffer(8)), err = 0;
+    a[0] = -1n;
+    a[1] = 2n ** 63n;
+    try { a[0] = 1; } catch (e) { err += e instanceof TypeError; }
+    dv.setBigUint64(0, 0x0102030405060708n);
+    return [String(u[0]), String(a[1]), err, dv.getUint8(0), String(dv.getBigInt64(0, true)),
+            [...BigInt64Array.of(3n, 1n, 2n).sort()].map(String), BigInt64Array.BYTES_PER_ELEMENT];
+}, ["18446744073709551615", "-9223372036854775808", 1, 1, "578437695752307201", ["1", "2", "3"], 8]);
+
+/* ---- Unicode text and regular expressions ---- */
+test("unicode case mapping, trim and normalize", function () {
+    return ["Straße".toUpperCase(), "ÉCOLE ΣΟΦΟΣ".toLowerCase(), "ǆ".toUpperCase(), "İ".toLowerCase().length,
+            " 　 hi ﻿".trim(), "é".normalize() === "é", "é".normalize("NFD").length,
+            "Crème Brûlée".normalize("NFD").replace(/[̀-ͯ]/g, ""), "ﬁ①".normalize("NFKC"),
+            "한".normalize("NFD").length, "한".normalize() === "한",
+            "ạ̇".normalize("NFC") === "ạ̇".normalize("NFD").normalize("NFC"),
+            "ḍ̇".normalize() === "ḍ̇"];
+}, ["STRASSE", "école σοφος", "Ǆ", 2, "hi", true, 2, "Creme Brulee", "fi1", 3, true, true, true]);
+test("unicode regular expressions", function () {
+    return ["héllo wörld 日本".match(/\p{L}+/gu), /^\p{Lu}/u.test("Érable"), "a1٣".replace(/\p{Nd}/gu, "#"),
+            /\p{Script=Greek}/u.test("λ"), /\p{sc=Cyrl}+/u.exec("Привет!")[0], /^\P{L}$/u.test("5"),
+            "😀 hi 🎉".match(/\p{Extended_Pictographic}/gu).length, /[Ѐ-ӿ]/.test("ж"),
+            /[^\u0000-\u007f]/.test("abc"), /[^\u0000-\u007f]/.test("abcé"), /ÉCOLE/i.test("école"),
+            /[à-ÿ]+/i.exec("ÀÉÎ")[0], /(é)\1/i.test("éÉ"), /\s+/.test("　"), "a b".match(/./g).length,
+            /[[a-z]--[aeiou]]+/v.exec("hello")[0], /[\p{L}&&\p{ASCII}]+/v.exec("éabcé")[0], /[^]/.test("\n"),
+            /[]/.test("a"), /\u{1F600}/u.test("😀"), "x😀y".match(/./gu).length, /😀/.test("😀"),
+            /\p{Letter}/u.test("ß"), /\p{White_Space}/u.test(" "), /[\p{N}]/u.test("Ⅻ")];
+}, [["héllo", "wörld", "日本"], true, "a##", true, "Привет", true, 2, true, false, true, true, "ÀÉÎ", true,
+    true, 2, "h", "abc", true, false, true, 3, true, true, true, true]);

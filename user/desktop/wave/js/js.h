@@ -19,8 +19,10 @@ struct arena;
 struct js;
 struct jsobj;
 struct jsstr;
+struct jsbig;
 
-enum { JS_UNDEF, JS_NULL, JS_BOOL, JS_NUM, JS_STR, JS_OBJ };
+/* JS_SYM: a symbol, whose u.s is its key (see jsint.h); JS_BIG: a BigInt. */
+enum { JS_UNDEF, JS_NULL, JS_BOOL, JS_NUM, JS_STR, JS_OBJ, JS_SYM, JS_BIG };
 
 typedef struct jsval {
     uint8_t t;
@@ -29,6 +31,7 @@ typedef struct jsval {
         int b;
         struct jsstr *s;
         struct jsobj *o;
+        struct jsbig *g;
     } u;
 } jsval;
 

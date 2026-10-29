@@ -19,9 +19,13 @@ struct view {
     int offset, len, bytes, kind;
 };
 static const struct jsclass buffer_class, typed_class, view_class;
-static const int sizes[] = {1, 1, 1, 2, 2, 4, 4, 4, 8};
+/* Kinds 9 and 10 hold BigInts (BIG_KIND). */
+#define NKINDS 11
+#define BIG_KIND(k) ((k) >= 9)
+static const int sizes[] = {1, 1, 1, 2, 2, 4, 4, 4, 8, 8, 8};
 static const char *names[] = {"Int8Array",  "Uint8Array",  "Uint8ClampedArray", "Int16Array",  "Uint16Array",
-                              "Int32Array", "Uint32Array", "Float32Array",      "Float64Array"};
+                              "Int32Array", "Uint32Array", "Float32Array",      "Float64Array",
+                              "BigInt64Array", "BigUint64Array"};
 static jsval prop(struct js *J, struct jsobj *o, const char *s, jsval v)
 {
     js_put(J, o, js_mkstr(J, s, (int)strlen(s)), v, 1);
@@ -169,6 +173,34 @@ static double read_number(const unsigned char *p, int kind, int little)
     }
     }
 }
+/* BigInt64Array, BigUint64Array and the DataView's BigInt accessors. */
+static jsval read_big(struct js *J, const unsigned char *p, int kind, int little)
+{
+    uint64_t bits = 0;
+    for (int i = 0; i < 8; i++)
+        bits |= (uint64_t)p[i] << (8 * (little ? i : 7 - i));
+    return js_bigv(kind == 9 ? jb_from_i64(J, (int64_t)bits) : jb_from_u64(J, bits, 0));
+}
+static void write_big(unsigned char *p, int little, uint64_t bits)
+{
+    for (int i = 0; i < 8; i++)
+        p[i] = (unsigned char)(bits >> (8 * (little ? i : 7 - i)));
+}
+/* ToBigInt for a store: BigInts, booleans and numeric strings; NULL (thrown) otherwise. */
+static struct jsbig *store_big(struct js *J, jsval v)
+{
+    v = js_to_primitive(J, v, 0);
+    if (J->throwing)
+        return NULL;
+    if (v.t == JS_BIG)
+        return v.u.g;
+    if (v.t == JS_BOOL)
+        return jb_from_u64(J, (uint64_t)v.u.b, 0);
+    struct jsbig *g = v.t == JS_STR ? jb_parse(J, v.u.s->s, v.u.s->len, 0, 1) : NULL;
+    if (!g && !J->throwing)
+        js_throw_error(J, "TypeError: Cannot convert %s to a BigInt", js_text(J, v));
+    return g;
+}
 static void write_number(unsigned char *p, int kind, int little, double d)
 {
     int bytes = sizes[kind];
@@ -248,7 +280,8 @@ static int typed_get(struct js *J, struct jsobj *o, const char *k, jsval *out)
     *out = js_undefined;
     if (n >= 0 && n < a->len && n == floor(n)) {
         struct buffer *b = buffer_of(js_obj(a->buffer));
-        *out = js_num(read_number(b->data + a->offset + (int)n * a->bytes, a->kind, 1));
+        unsigned char *at = b->data + a->offset + (int)n * a->bytes;
+        *out = BIG_KIND(a->kind) ? read_big(J, at, a->kind, 1) : js_num(read_number(at, a->kind, 1));
     }
     return 1;
 }
@@ -260,6 +293,12 @@ static int typed_set_prop(struct js *J, struct jsobj *o, const char *k, jsval va
     double n;
     if (!numeric_key(J, k, &n))
         return 0;
+    if (BIG_KIND(a->kind)) {
+        struct jsbig *g = store_big(J, val);
+        if (g && n >= 0 && n < a->len && n == floor(n))
+            write_big(buffer_of(js_obj(a->buffer))->data + a->offset + (int)n * 8, 1, jb_to_u64(g));
+        return 1;
+    }
     double d = js_to_number(J, val);
     if (n >= 0 && n < a->len && n == floor(n) && !J->throwing) {
         struct buffer *b = buffer_of(js_obj(a->buffer));
@@ -330,8 +369,8 @@ static jsval typed_make(struct js *J, jsval *args, int argc, int kind)
     }
 CTOR(0)
 CTOR(1)
-CTOR(2) CTOR(3) CTOR(4) CTOR(5) CTOR(6) CTOR(7) CTOR(8) static const js_native ctors[] = {
-    ctor_0, ctor_1, ctor_2, ctor_3, ctor_4, ctor_5, ctor_6, ctor_7, ctor_8};
+CTOR(2) CTOR(3) CTOR(4) CTOR(5) CTOR(6) CTOR(7) CTOR(8) CTOR(9) CTOR(10) static const js_native ctors[] = {
+    ctor_0, ctor_1, ctor_2, ctor_3, ctor_4, ctor_5, ctor_6, ctor_7, ctor_8, ctor_9, ctor_10};
 static jsval typed_set(struct js *J, jsval self, jsval *args, int argc)
 {
     struct view *a = typed_of(self);
@@ -405,11 +444,20 @@ static jsval view_access(struct js *J, jsval self, jsval *args, int argc, int ki
     int off = index_arg(J, ARG(0), 0, v->len);
     if (off < 0)
         return js_undefined;
-    double value = set ? js_to_number(J, ARG(1)) : 0;
+    struct jsbig *big = set && BIG_KIND(kind) ? store_big(J, ARG(1)) : NULL;
+    double value = set && !BIG_KIND(kind) ? js_to_number(J, ARG(1)) : 0;
+    if (J->throwing)
+        return js_undefined;
     if (sizes[kind] > v->len - off)
         return js_throw_error(J, "RangeError: DataView access outside buffer");
     unsigned char *p = buffer_of(js_obj(v->buffer))->data + v->offset + off;
     int little = js_truthy(ARG(set ? 2 : 1));
+    if (BIG_KIND(kind)) {
+        if (!set)
+            return read_big(J, p, kind, little);
+        write_big(p, little, jb_to_u64(big));
+        return js_undefined;
+    }
     if (set) {
         write_number(p, kind, little, value);
         return js_undefined;
@@ -428,7 +476,7 @@ static jsval view_access(struct js *J, jsval self, jsval *args, int argc, int ki
 ACCESS(Int8, 0)
 ACCESS(Uint8, 1)
 ACCESS(Int16, 3) ACCESS(Uint16, 4) ACCESS(Int32, 5) ACCESS(Uint32, 6) ACCESS(Float32, 7)
-    ACCESS(Float64, 8) static jsval random_fill(struct js *, jsval, jsval *, int);
+    ACCESS(Float64, 8) ACCESS(BigInt64, 9) ACCESS(BigUint64, 10) static jsval random_fill(struct js *, jsval, jsval *, int);
 static jsval encode_utf8(struct js *, jsval, jsval *, int);
 static jsval decode_utf8(struct js *, jsval, jsval *, int);
 static jsval digest_bytes(struct js *J, jsval self, jsval *args, int argc)
@@ -731,7 +779,7 @@ void js_init_binary(struct js *J)
     struct jsobj *c = ctor(J, "ArrayBuffer", buffer_ctor, J->buffer_proto);
     js_define_native(J, c, "isView", is_view, 1);
     js_define_native(J, J->buffer_proto, "slice", buffer_slice, 2);
-    for (int i = 0; i < 9; i++) {
+    for (int i = 0; i < NKINDS; i++) {
         struct jsobj *p = js_new_object(J);
         J->typed_protos[i] = p;
         c = ctor(J, names[i], ctors[i], p);
@@ -746,6 +794,7 @@ void js_init_binary(struct js *J)
     js_define_native(J, J->dataview_proto, "get" #name, get_##name, 1);                                      \
     js_define_native(J, J->dataview_proto, "set" #name, set_##name, 2);
     BIND(Int8) BIND(Uint8) BIND(Int16) BIND(Uint16) BIND(Int32) BIND(Uint32) BIND(Float32) BIND(Float64)
+    BIND(BigInt64) BIND(BigUint64)
 #undef BIND
 }
 

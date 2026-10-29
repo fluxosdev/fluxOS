@@ -23,6 +23,37 @@ struct jsstr {
     char s[];                           /* NUL-terminated as well */
 };
 
+/*
+ * Symbols are property keys like strings, kept apart by their first byte,
+ * 0xFF, which UTF-8 never has: "\xff" tag ["\xff" description]. The tag is
+ * "w" for the well-known symbols, "r" for Symbol.for's and "u<n>" for the
+ * rest. A JS_SYM value's u.s is that key; js_tostr gives the key back.
+ */
+#define SYMK(name) "\xff" "w" "\xff" "Symbol." name
+#define SYM_ITERATOR       SYMK("iterator")
+#define SYM_ASYNC_ITERATOR SYMK("asyncIterator")
+#define SYM_TO_PRIMITIVE   SYMK("toPrimitive")
+#define SYM_TO_STRING_TAG  SYMK("toStringTag")
+#define SYM_HAS_INSTANCE   SYMK("hasInstance")
+
+static inline int js_is_symkey(const struct jsstr *k)
+{
+    return k->len > 0 && (unsigned char)k->s[0] == 0xFF;
+}
+
+/* A property key as a value: a symbol or a string. */
+static inline jsval js_keyval(struct jsstr *k)
+{
+    jsval v = { js_is_symkey(k) ? JS_SYM : JS_STR, { .s = k } };
+    return v;
+}
+
+struct jsbig {
+    int neg;
+    int n;                              /* limbs in use; 0 for zero */
+    uint32_t d[];                       /* 32 bits each, least significant first */
+};
+
 struct prop {
     struct jsstr *key;
     jsval v;
@@ -114,9 +145,9 @@ struct js {
     struct jsstr *s_prototype;          /* "prototype", made once: every new and instanceof asks */
     struct job *jobs, *jobs_tail;       /* the microtask queue (promises) */
     int in_jobs;
-    struct jsobj *promise_proto, *generator_proto, *agen_proto;
+    struct jsobj *promise_proto, *generator_proto, *agen_proto, *symbol_proto, *bigint_proto;
     struct jsobj *map_proto, *set_proto, *seqiter_proto, *buffer_proto;
-    struct jsobj *typed_protos[9], *dataview_proto;
+    struct jsobj *typed_protos[11], *dataview_proto;
     struct jsstr *s_value, *s_done;     /* iterator results' keys */
     struct coro *cur_co, *co_live;      /* the running coroutine, all those with a stack */
     int nco;
@@ -172,6 +203,8 @@ int js_loose_equal(struct js *J, jsval a, jsval b);
 jsval js_to_primitive(struct js *J, jsval v, int hint_string);
 struct jsstr *js_tostr(struct js *J, jsval v);
 int js_index(jsval key, uint32_t *out);           /* key is an array index */
+struct jsstr *js_sym_desc(struct js *J, const struct jsstr *k);    /* a symbol key's description, or NULL */
+struct jsstr *js_sym_text(struct js *J, const struct jsstr *k);    /* "Symbol(description)" */
 void js_numtostr(double d, char *out);
 double js_strtonum(const char *s, int n);           /* NaN if it is not a number */
 double js_parse_float_prefix(const char *s, int n); /* parseFloat */
@@ -180,6 +213,7 @@ void js_define_native(struct js *J, struct jsobj *o, const char *name, js_native
 int js_is_array(jsval v);
 /* The keys for for-in and Object.keys, own and enumerable (inherited too if asked). */
 int js_keys(struct js *J, jsval obj, int inherited, struct jsstr ***out);
+int js_own_symbols(struct js *J, jsval obj, struct jsstr ***out);
 
 /* Iteration (js.c): arrays, strings, array-likes and objects with a [Symbol.iterator]. */
 enum { IT_ARRAY, IT_STR, IT_LIKE, IT_OBJ };
@@ -220,6 +254,48 @@ int js_promise_state(jsval po, jsval *value);                   /* -1 if not a p
 void js_promise_watch(struct js *J, jsval po, js_native on_ok, js_native on_err, jsval self);
 struct jsstr *js_json_stringify(struct js *J, jsval v, const char *indent);
 jsval js_array_join(struct js *J, struct jsobj *a, const char *sep);
+
+/* jsbig.c: BigInt arithmetic. Results are new values; NULL means an error was thrown. */
+jsval js_bigv(struct jsbig *b);
+struct jsbig *jb_from_u64(struct js *J, uint64_t v, int neg);
+struct jsbig *jb_from_i64(struct js *J, int64_t v);
+struct jsbig *jb_from_double(struct js *J, double d);      /* d an integer */
+uint64_t jb_to_u64(const struct jsbig *b);                  /* modulo 2^64 */
+double jb_to_double(const struct jsbig *b);
+struct jsbig *jb_neg(struct js *J, const struct jsbig *a);
+struct jsbig *jb_add(struct js *J, const struct jsbig *a, const struct jsbig *b);
+struct jsbig *jb_sub(struct js *J, const struct jsbig *a, const struct jsbig *b);
+struct jsbig *jb_mul(struct js *J, const struct jsbig *a, const struct jsbig *b);
+struct jsbig *jb_div(struct js *J, const struct jsbig *a, const struct jsbig *b);
+struct jsbig *jb_mod(struct js *J, const struct jsbig *a, const struct jsbig *b);
+struct jsbig *jb_pow(struct js *J, const struct jsbig *a, const struct jsbig *e);
+struct jsbig *jb_bitop(struct js *J, int op, const struct jsbig *a, const struct jsbig *b);   /* & | ^ */
+struct jsbig *jb_not(struct js *J, const struct jsbig *a);
+struct jsbig *jb_shl(struct js *J, const struct jsbig *a, int64_t k);   /* k < 0 shifts right */
+struct jsbig *jb_as_n(struct js *J, uint32_t bits, const struct jsbig *a, int is_signed);
+int jb_cmp(const struct jsbig *a, const struct jsbig *b);
+int jb_cmp_double(struct js *J, const struct jsbig *a, double d);      /* 2: d is NaN */
+struct jsbig *jb_parse(struct js *J, const char *s, int n, int radix, int sign);
+struct jsstr *jb_tostr(struct js *J, const struct jsbig *a, int radix);
+
+/* jsuni.c: Unicode. A uset is a list of code point ranges; uset_norm sorts and merges them. */
+struct uset {
+    uint32_t (*r)[2];
+    int n, cap;
+};
+void uset_add(struct js *J, struct uset *u, uint32_t lo, uint32_t hi);
+void uset_norm(struct uset *u);
+void uset_invert(struct js *J, struct uset *u);
+void uset_combine(struct js *J, struct uset *u, struct uset *v, int minus);  /* and, or minus */
+int uset_has(const struct uset *u, uint32_t c);
+int uc_add_property(struct js *J, struct uset *u, const char *spec, int len);  /* -1: unknown */
+uint32_t uc_upper(uint32_t c);
+uint32_t uc_lower(uint32_t c);
+uint32_t uc_fold(uint32_t c);
+uint32_t uc_orbit(uint32_t c);
+int uc_is_space(uint32_t c);
+struct jsstr *uc_change_case(struct js *J, struct jsstr *s, int upper);
+struct jsstr *uc_normalize(struct js *J, struct jsstr *s, int compat, int compose);
 
 /* jsre.c: backtracking regular expressions over UTF-8 bytes */
 #define RE_MAX_GROUPS 32

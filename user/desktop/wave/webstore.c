@@ -3,7 +3,9 @@
  * place, so a power cut leaves the old file rather than half of a new one. (Kept out of jsdom.c,
  * which the host tests build with the host's headers.)
  */
+#include <dirent.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,4 +73,100 @@ long store_file_mtime(const char *path)
 {
     struct stat sb;
     return stat(path, &sb) == 0 ? (long)sb.st_mtime : 0;
+}
+
+/* ---- IndexedDB ---- */
+
+#ifndef IDB_DIR
+#define IDB_DIR "/home/flux/.browser_idb/"
+#endif
+
+/* A database's file: IDB_DIR, a hash of its origin and name, ".idb". It starts "origin\nname\n". */
+static void idb_path(const char *origin, const char *name, char *out, size_t size)
+{
+    uint64_t h = 1469598103934665603ull;
+    for (const char *p = origin; *p; p++)
+        h = (h ^ (uint8_t)*p) * 1099511628211ull;
+    h = (h ^ '\n') * 1099511628211ull;
+    for (const char *p = name; *p; p++)
+        h = (h ^ (uint8_t)*p) * 1099511628211ull;
+    snprintf(out, size, IDB_DIR "%08x%08x.idb", (unsigned)(h >> 32), (unsigned)h);
+}
+
+/* Does the file's header name this origin (and this name, if one is given)? Then where its text starts. */
+static const char *idb_header(const char *file, const char *origin, const char *name)
+{
+    size_t ol = strlen(origin);
+    if (strncmp(file, origin, ol) || file[ol] != '\n')
+        return NULL;
+    const char *n = file + ol + 1, *nl = strchr(n, '\n');
+    if (!nl || (name && ((size_t)(nl - n) != strlen(name) || strncmp(n, name, (size_t)(nl - n)))))
+        return NULL;
+    return nl + 1;
+}
+
+char *store_idb(const char *op, const char *origin, const char *name, const char *text, size_t len)
+{
+    char path[300];
+    if (!strcmp(op, "list")) {
+        DIR *dir = opendir(IDB_DIR);
+        size_t cap = 256, used = 0;
+        char *out = malloc(cap);
+        struct dirent *e;
+        while (out && dir && (e = readdir(dir))) {
+            size_t el = strlen(e->d_name);
+            if (el < 5 || strcmp(e->d_name + el - 4, ".idb"))
+                continue;
+            snprintf(path, sizeof(path), IDB_DIR "%s", e->d_name);
+            long flen;
+            char *file = store_read_file(path, 64l << 20, &flen);
+            const char *body = file ? idb_header(file, origin, NULL) : NULL;
+            if (body) {
+                const char *n = file + strlen(origin) + 1;
+                size_t nl = (size_t)(body - 1 - n);
+                if (used + nl + 2 > cap) {
+                    char *grown = realloc(out, cap = (used + nl + 2) * 2);
+                    if (!grown) {
+                        free(file);
+                        break;
+                    }
+                    out = grown;
+                }
+                memcpy(out + used, n, nl);
+                used += nl;
+                out[used++] = '\n';
+            }
+            free(file);
+        }
+        if (dir)
+            closedir(dir);
+        if (out)
+            out[used] = 0;
+        return out;
+    }
+    idb_path(origin, name, path, sizeof(path));
+    if (!strcmp(op, "load")) {
+        long flen;
+        char *file = store_read_file(path, 64l << 20, &flen);
+        const char *body = file ? idb_header(file, origin, name) : NULL;
+        char *out = body ? strdup(body) : NULL;
+        free(file);
+        return out;
+    }
+    if (!strcmp(op, "delete")) {
+        unlink(path);
+        return NULL;
+    }
+    if (!strcmp(op, "save")) {
+        mkdir(IDB_DIR, 0700);
+        size_t hl = strlen(origin) + strlen(name) + 2;
+        char *file = malloc(hl + len + 1);
+        if (file) {
+            snprintf(file, hl + 1, "%s\n%s\n", origin, name);
+            memcpy(file + hl, text, len);
+            store_write_file(path, file, hl + len);
+            free(file);
+        }
+    }
+    return NULL;
 }

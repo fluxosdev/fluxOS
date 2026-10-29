@@ -62,6 +62,8 @@ int main(int argc, char **argv)
     if (expected <= 0)
         return 2;
     char end[128];
+    for (int i = 0; i < 400 && jsdom_next_timer(dom) == 0; i++)
+        jsdom_run_timers(dom);          /* what the tests queued: posted messages, timers due now */
     snprintf(end, sizeof(end), "if (count !== %d) throw new Error('Incomplete test run: ' + count);", expected);
     jsdom_run_script(dom, NULL, end, (int)strlen(end), "test count");
     jsdom_free(dom);

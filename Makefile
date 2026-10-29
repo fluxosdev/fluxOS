@@ -336,8 +336,8 @@ clean:
 # Run the browser's actual HTML/DOM/JS code on the host, without booting QEMU.
 HOSTCC ?= cc
 BROWSER_TEST_SRCS := lib/digest.c lib/sha256.c tests/browser-dom.c tests/canvas-font-stub.c tests/js-host-stack.c \
-	$(addprefix user/desktop/wave/js/,js.c jslib.c jslib2.c jsbinary.c jsnet.c jsre.c jsgc.c jsdom.c jscanvas.c) \
-	$(addprefix user/desktop/wave/,canvas.c html.c shadow.c webblob.c webintegrity.c webinput.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c) \
+	$(addprefix user/desktop/wave/js/,js.c jsbig.c jsuni.c jslib.c jslib2.c jsbinary.c jsnet.c jsre.c jsgc.c jsdom.c jscanvas.c) \
+	$(addprefix user/desktop/wave/,canvas.c html.c shadow.c webblob.c webintegrity.c webinput.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c anim.c) \
 	user/libc/inflate.c
 .PHONY: test-browser
 test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout $(BUILD)/tests/browser-policy $(BUILD)/tests/browser-http $(BUILD)/tests/browser-images $(BUILD)/tests/browser-navigation $(BUILD)/tests/browser-geometry
@@ -347,19 +347,21 @@ test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine $(BUILD)/tests
 	$(BUILD)/tests/browser-layout
 	$(BUILD)/tests/browser-policy
 	$(BUILD)/tests/browser-http
-	$(BUILD)/tests/browser-dom rootfs/usr/share/www/modern-core-tests.js 44
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/modern-core-tests.js 47
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/compatibility-tests.js 30
 	$(BUILD)/tests/browser-images
 	$(BUILD)/tests/browser-navigation
 	$(BUILD)/tests/browser-geometry
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/clone-escape-tests.js 23
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/canvas-tests.js 52
-	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 127
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 134
+	rm -rf $(BUILD)/tests/idb
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/indexeddb-tests.js 3
 	$(BUILD)/tests/js-engine
 
 $(BUILD)/tests/browser-dom: $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS) user/include/flux.h include/flux/abi.h
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DJS_VM_VERIFY -pthread -Wall -Wextra -Wno-unused-parameter \
+	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DIDB_DIR='"$(CURDIR)/$(BUILD)/tests/idb/"' -DJS_VM_VERIFY -pthread -Wall -Wextra -Wno-unused-parameter \
 		$(DESKTOP_INC) -Iinclude -idirafter user/include $(BROWSER_TEST_SRCS) \
 		-lm -o $@
 
@@ -425,17 +427,17 @@ $(BUILD)/tests/kernel-guest.o: tests/kernel-guest.c
 $(BUILD)/tests/kernel-guest: $(BUILD)/tests/kernel-guest.o $(CRT0) $(LIBC) user/user.ld
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 
-$(BUILD)/tests/browser-style: tests/browser-style.c user/desktop/wave/html.c user/desktop/wave/html_entities.h user/desktop/wave/css.c user/desktop/wave/csscolor.c user/desktop/wave/shadow.c user/desktop/wave/webutil.c user/desktop/wave/web.h
+$(BUILD)/tests/browser-style: tests/browser-style.c user/desktop/wave/html.c user/desktop/wave/html_entities.h user/desktop/wave/css.c user/desktop/wave/csscolor.c user/desktop/wave/anim.c user/desktop/wave/shadow.c user/desktop/wave/webutil.c user/desktop/wave/web.h
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter \
 		$(DESKTOP_INC) tests/browser-style.c user/desktop/wave/html.c user/desktop/wave/css.c user/desktop/wave/csscolor.c \
-		user/desktop/wave/shadow.c user/desktop/wave/webutil.c -lm -o $@
+		user/desktop/wave/anim.c user/desktop/wave/shadow.c user/desktop/wave/webutil.c -lm -o $@
 
-$(BUILD)/tests/browser-layout: tests/browser-layout.c user/desktop/wave/layout.c user/desktop/wave/html.c user/desktop/wave/css.c user/desktop/wave/csscolor.c user/desktop/wave/cssfont.c user/desktop/wave/webutil.c $(DESKTOP_HDRS)
+$(BUILD)/tests/browser-layout: tests/browser-layout.c user/desktop/wave/layout.c user/desktop/wave/html.c user/desktop/wave/css.c user/desktop/wave/csscolor.c user/desktop/wave/cssfont.c user/desktop/wave/anim.c user/desktop/wave/webutil.c $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g -msse -Wall -Wextra -Wno-unused-parameter $(DESKTOP_INC) -Iinclude \
 		tests/browser-layout.c user/desktop/wave/layout.c user/desktop/wave/shadow.c user/desktop/wave/html.c user/desktop/wave/css.c \
-		user/desktop/wave/csscolor.c user/desktop/wave/cssfont.c user/desktop/wave/webutil.c -lm -o $@
+		user/desktop/wave/csscolor.c user/desktop/wave/cssfont.c user/desktop/wave/anim.c user/desktop/wave/webutil.c -lm -o $@
 
 # TLS tests use temporary certificates and local OpenSSL servers; never the Internet.
 $(BUILD)/tests/tls-client: tests/tls-client.c user/libc/tls.c user/libc/tlsverify.c lib/sha256.c $(MBEDTLS_SRCS) $(MBEDTLS_DIR)/flux_config.h
@@ -454,14 +456,15 @@ $(BUILD)/tests/browser-policy: tests/browser-policy.c user/desktop/wave/webpolic
 
 $(BUILD)/tests/browser-http: tests/browser-http.c $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DJS_VM_VERIFY -pthread $(DESKTOP_INC) -Iinclude -idirafter user/include \
+	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DIDB_DIR='"$(CURDIR)/$(BUILD)/tests/idb/"' -DJS_VM_VERIFY -pthread $(DESKTOP_INC) -Iinclude -idirafter user/include \
 		tests/browser-http.c $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS)) \
 		-lm -o $@
 
-$(BUILD)/tests/browser-font: tests/browser-font.c user/desktop/wave/webfont.c user/desktop/wave/webutil.c $(FONT_SRCS) $(FREETYPE_DIR)/flux_ftoption.h
+$(BUILD)/tests/browser-font: tests/browser-font.c user/desktop/wave/webfont.c user/desktop/wave/webutil.c user/libc/inflate.c $(FONT_SRCS) $(FREETYPE_DIR)/flux_ftoption.h
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=gnu11 -O1 -g -msse $(DESKTOP_INC) $(FONT_FLAGS) \
-		-DFONT_FILE='"$(CURDIR)/$(BUILD)/tests/font-test.fnt"' $(filter %.c,$^) -o $@
+	$(HOSTCC) -std=gnu11 -O1 -g -msse $(DESKTOP_INC) -idirafter user/include $(FONT_FLAGS) \
+		-DFONT_FILE='"$(CURDIR)/$(BUILD)/tests/font-test.fnt"' -DNOTO_DIR='"$(CURDIR)/rootfs/usr/share/fonts/noto/"' \
+		$(filter %.c,$^) -o $@
 .PHONY: test-browser-fonts
 test-browser-fonts: $(BUILD)/tests/browser-font
 	python3 tools/test-browser-fonts.py
@@ -483,14 +486,14 @@ test-websocket: $(BUILD)/tests/wsc $(BUILD)/tests/browser-ws
 
 $(BUILD)/tests/browser-ws: tests/browser-ws.c $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DJS_VM_VERIFY -pthread $(DESKTOP_INC) -Iinclude -idirafter user/include \
+	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DIDB_DIR='"$(CURDIR)/$(BUILD)/tests/idb/"' -DJS_VM_VERIFY -pthread $(DESKTOP_INC) -Iinclude -idirafter user/include \
 		-DWS_HELPER='"$(CURDIR)/$(BUILD)/tests/wsc"' \
 		tests/browser-ws.c $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS)) \
 		-lm -o $@
 
 # Engine-level tests include real collections on the host's main and coroutine stacks.
 JS_ENGINE_SRCS := lib/digest.c lib/sha256.c tests/js-engine.c tests/js-host-stack.c \
-	$(addprefix user/desktop/wave/js/,js.c jslib.c jslib2.c jsbinary.c jsre.c jsgc.c) \
+	$(addprefix user/desktop/wave/js/,js.c jsbig.c jsuni.c jslib.c jslib2.c jsbinary.c jsre.c jsgc.c) \
 	user/desktop/wave/webutil.c user/libc/inflate.c
 $(BUILD)/tests/js-engine: $(JS_ENGINE_SRCS) $(DESKTOP_HDRS) include/flux/abi.h
 	@mkdir -p $(dir $@)
@@ -500,7 +503,9 @@ $(BUILD)/tests/js-engine: $(JS_ENGINE_SRCS) $(DESKTOP_HDRS) include/flux/abi.h
 
 .PHONY: test-js bench-js
 test-js: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine
-	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 127
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 134
+	rm -rf $(BUILD)/tests/idb
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/indexeddb-tests.js 3
 	$(BUILD)/tests/js-engine
 
 # Each case is a separate entry so the page's step budget applies per case.
@@ -512,7 +517,7 @@ bench-js: $(BUILD)/tests/browser-bench
 # Measure the optimized VM without the test runner's per-instruction assertions.
 $(BUILD)/tests/browser-bench: $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS) user/include/flux.h include/flux/abi.h
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=gnu11 -O2 -g -fno-pie -no-pie -DJS_HOST_TEST -pthread \
+	$(HOSTCC) -std=gnu11 -O2 -g -fno-pie -no-pie -DJS_HOST_TEST -DIDB_DIR='"$(CURDIR)/$(BUILD)/tests/idb/"' -pthread \
 		$(DESKTOP_INC) -Iinclude -idirafter user/include $(BROWSER_TEST_SRCS) \
 		-lm -o $@
 
@@ -549,7 +554,7 @@ $(BUILD)/tests/browser-navigation: tests/browser-navigation.c user/desktop/wave/
 
 $(BUILD)/tests/browser-geometry: tests/browser-geometry.c $(BROWSER_TEST_SRCS) $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DJS_VM_VERIFY -pthread $(DESKTOP_INC) -Iinclude -idirafter user/include \
+	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DIDB_DIR='"$(CURDIR)/$(BUILD)/tests/idb/"' -DJS_VM_VERIFY -pthread $(DESKTOP_INC) -Iinclude -idirafter user/include \
 		tests/browser-geometry.c $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS)) -lm -o $@
 
 # S3 must boot through firmware/GRUB: QEMU -kernel reloads RAM on wake.

@@ -188,6 +188,7 @@ struct browser {
     struct arena arena;         /* document tree and style sheets */
     struct arena sarena;        /* computed styles */
     size_t sarena_full;         /* how much of it the last full cascade used (restyles add to it) */
+    unsigned anim_at;           /* when the last frame of the page's CSS transitions and animations was */
     struct arena larena;        /* layout */
     struct node *root;
     struct layout lo;
@@ -312,6 +313,10 @@ struct browser {
     /* what scripts asked for, done once they have returned */
     char js_nav[URL_MAX];
     char js_open[URL_MAX];              /* window.open: processed after the script returns */
+    int js_open_wid, js_open_noopener;  /* ...the id the new window will have; no window.opener */
+    int wid;                            /* its id for other windows' scripts (wid_of), 0 until asked */
+    int opener_wid;                     /* the window whose script opened it, or 0 */
+    int script_opened, js_close;        /* a script opened it; a script asked to close it */
     char *js_post;                      /* a form a script submitted: the POST body for js_nav */
     int js_nav_replace, js_history, js_reload;
 
@@ -1889,6 +1894,8 @@ static void free_page(struct browser *b)
         image_free(b->favicon);
         b->favicon = NULL;
     }
+    if (b->root)
+        anim_forget(b->root);
     arena_free(&b->larena);
     arena_free(&b->sarena);
     arena_free(&b->arena);
@@ -1961,6 +1968,7 @@ static void relayout(struct browser *b)
         css_viewport_h = v.h;
         css_target_id = url_fragment(b->url);
         css_font_lookup=font_lookup;css_font_context=b;
+        anim_now = now_ms();
         css_cascade(&b->sarena, b->root, b->sheets, b->nsheets, v.w, v.h, is_visited, b);
         css_font_lookup=NULL;css_font_context=NULL;
         b->sarena_full = b->sarena.used;
@@ -2205,10 +2213,104 @@ static void js_viewport(void *ctx, int *w, int *h)
     *h = v.h * 100 / zoom_of(ctx);
 }
 
-static void js_open_tab(void *ctx, const char *url)
+/* ---- windows' ids, for window proxies (window.open, opener, parent, iframes' contentWindow) ---- */
+
+static int next_wid;
+
+static int wid_of(struct browser *b)
+{
+    if (!b->wid)
+        b->wid = ++next_wid;
+    return b->wid;
+}
+
+static struct browser *by_wid(int wid)
+{
+    for (struct browser *b = browsers; wid && b; b = b->next)
+        if (b->wid == wid && !b->frame_dead)
+            return b;
+    return NULL;
+}
+
+static int js_open_tab(void *ctx, const char *url, int noopener)
 {
     struct browser *b = ctx;
     snprintf(b->js_open, sizeof(b->js_open), "%s", url);
+    b->js_open_wid = ++next_wid;
+    b->js_open_noopener = noopener;
+    return b->js_open_wid;
+}
+
+static int js_window_query(void *ctx, int wid, const char *what, struct node *node, char *out, int size)
+{
+    struct browser *b = ctx, *t = wid ? by_wid(wid) : b;
+    if (!strcmp(what, "self"))
+        return wid_of(b);
+    if (!strcmp(what, "frame")) {
+        for (struct browser *f = b->frames; f; f = f->next_frame)
+            if (f->frame_el == node && !f->frame_dead)
+                return wid_of(f);
+        return 0;
+    }
+    if (!t)
+        return !strcmp(what, "alive") ? 0 : !strcmp(what, "href") ? -1 : 0;
+    if (!strcmp(what, "alive"))
+        return 1;
+    if (!strcmp(what, "opener"))
+        return by_wid(t->opener_wid) ? t->opener_wid : 0;
+    if (!strcmp(what, "parent"))
+        return t->parent ? wid_of(t->parent) : 0;
+    if (!strcmp(what, "top")) {
+        struct browser *top = t;
+        while (top->parent)
+            top = top->parent;
+        return top == t ? 0 : wid_of(top);
+    }
+    if (!strcmp(what, "frames")) {
+        int n = 0;
+        for (struct browser *f = t->frames; f; f = f->next_frame)
+            n += !f->frame_dead;
+        return n;
+    }
+    if (!strcmp(what, "href")) {
+        if (t != b && !web_same_origin(b->url, t->url))
+            return -1;
+        snprintf(out, (size_t)size, "%s", t->url);
+        return 1;
+    }
+    return 0;
+}
+
+static void js_window_post(void *ctx, int wid, const char *data, int len, const char *target_origin)
+{
+    struct browser *b = ctx, *t = wid ? by_wid(wid) : b;
+    if (!t || !t->js)
+        return;
+    char from[300] = "null", to[300] = "null", want[300] = "";
+    web_origin(b->url, from, sizeof(from));
+    web_origin(t->url, to, sizeof(to));
+    if (!strcmp(target_origin, "/"))
+        snprintf(want, sizeof(want), "%s", from);
+    else if (strcmp(target_origin, "*") && web_origin(target_origin, want, sizeof(want)) < 0)
+        return;
+    if (want[0] && strcmp(want, to))
+        return;                         /* not for the page that is there now */
+    jsdom_message(t->js, data, len, from, wid_of(b));
+}
+
+/* A script may close a window a script opened (its own too); the main loop does it. */
+static void js_window_close(void *ctx, int wid)
+{
+    struct browser *b = ctx, *t = wid ? by_wid(wid) : b;
+    if (t && !is_frame(t) && t->script_opened)
+        t->js_close = 1;
+}
+
+static void js_window_navigate(void *ctx, int wid, const char *url)
+{
+    struct browser *t = wid ? by_wid(wid) : ctx;
+    if (t && (!strncasecmp(url, "http:", 5) || !strncasecmp(url, "https:", 6) || !strncasecmp(url, "about:", 6)))
+        snprintf(t->js_nav, sizeof(t->js_nav), "%s", url);
 }
 
 static void js_set_title(void *ctx, const char *title)
@@ -2709,7 +2811,8 @@ static void start_scripts(struct browser *b, const char *url)
         .reveal = js_reveal, .flush = js_flush, .focus = js_focus, .http = js_http, .http_cancel=js_http_cancel,
         .has_focus=js_has_focus, .clipboard_read=js_clipboard_read, .clipboard_write=js_clipboard_write,
         .cookie_get = js_cookie_get, .cookie_set = js_cookie_set, .ws_cookies=js_ws_cookies, .font_register=js_font_register, .font_status=js_font_status, .fetch_module = js_fetch_module,
-        .open_tab = js_open_tab, .module_done = js_module_done, .set_url = js_set_url, .submit = js_submit, .node_at = js_node_at,
+        .open_tab = js_open_tab, .window_query = js_window_query, .window_post = js_window_post,
+        .window_close = js_window_close, .window_navigate = js_window_navigate, .module_done = js_module_done, .set_url = js_set_url, .submit = js_submit, .node_at = js_node_at,
     };
     b->js = jsdom_new(&h);
     if (!b->js)
@@ -6306,10 +6409,45 @@ static int restyle_dynamic(struct browser *b)
     css_target_id = url_fragment(b->url);
     css_font_lookup = font_lookup;
     css_font_context = b;
+    anim_now = now_ms();
     int r = css_restyle_dynamic(&b->sarena, b->root, b->sheets, b->nsheets, v.w, v.h, is_visited, b);
     css_font_lookup = NULL;
     css_font_context = NULL;
     return r;
+}
+
+/* A frame of the page's CSS transitions and animations, when one is due; then their events. */
+static void animate(struct browser *b)
+{
+    int t = anim_timeout(b->root);
+    if (t >= 0 && (int)(now_ms() - b->anim_at) >= t) {
+        b->anim_at = now_ms();
+        if (!b->need_style && b->sarena.used > 2 * b->sarena_full + (1u << 20))
+            b->need_style = 1;          /* the frames' styles add up: start the arena again */
+        if (!b->need_style) {
+            zoom_sync(b);
+            struct rect v = view_rect(b);
+            css_viewport_h = v.h;
+            css_target_id = url_fragment(b->url);
+            css_font_lookup = font_lookup;
+            css_font_context = b;
+            anim_now = now_ms();
+            int r = css_restyle_animated(&b->sarena, b->root, b->sheets, b->nsheets, v.w, v.h, is_visited, b);
+            css_font_lookup = NULL;
+            css_font_context = NULL;
+            if (r < 0)
+                b->need_style = 1;
+            else if (r > 0)
+                b->need_layout = 1;
+        }
+        if (b->need_style || b->need_layout) {
+            relayout(b);
+            paint(b);
+        }
+    }
+    struct anim_event ev;
+    while (b->root && anim_take_event(b->root, &ev))
+        jsdom_motion_event(b->js, ev.node, ev.type, ev.name, ev.elapsed);
 }
 
 /* Restyle when the element under the pointer or the focused one changed and some rule cares. */
@@ -7381,13 +7519,24 @@ void browser_poll(void)
             jsdom_run_timers(b->js);
         if (b->root && b->discover_changes) flush_changes(b);
         else if (b->root && (b->need_style || b->need_layout)) { relayout(b); paint(b); }
+        if (b->root) animate(b);
         if(b->qhead<b->nqueue&&free_loader(b))start_next(b);
         if (b->js_open[0]) {
             char u[URL_MAX];
             snprintf(u, sizeof(u), "%s", b->js_open);
             b->js_open[0] = 0;
-            tab_new(top_of(b), u, 1);
+            struct browser *t = tab_new(top_of(b), u, 1);
+            if (t) {
+                t->wid = b->js_open_wid;
+                t->opener_wid = b->js_open_noopener ? 0 : wid_of(b);
+                t->script_opened = 1;
+            }
             return;                     /* the list may have changed */
+        }
+        if (b->js_close && b->tabs) {
+            b->js_close = 0;
+            tab_close(b);
+            return;                     /* the list has changed */
         }
         if (b->js_nav[0]) {
             char u[URL_MAX];
@@ -7420,11 +7569,19 @@ int browser_timeout(void)
     for (struct browser *b = browsers; b; b = b->next) {
         if((b->root && (b->discover_changes || b->need_style || b->need_layout)) ||
            (b->qhead<b->nqueue&&free_loader(b)))return 0;
-        if (b->frame_dead || b->frame_nav[0] || b->js_open[0] || b->js_nav[0] || b->js_history || b->js_reload)
+        if (b->frame_dead || b->frame_nav[0] || b->js_open[0] || b->js_nav[0] || b->js_history || b->js_reload ||
+            b->js_close)
             return 0;
         int t = jsdom_next_timer(b->js);
         if (t >= 0 && (best < 0 || t < best))
             best = t;
+        if (b->root && (t = anim_timeout(b->root)) >= 0) {     /* the next frame of a transition or animation */
+            t -= (int)(now_ms() - b->anim_at);
+            if (t < 0)
+                t = 0;
+            if (best < 0 || t < best)
+                best = t;
+        }
         if (b->tip_node && !b->tip_shown) {         /* the tooltip is due */
             unsigned waited = now_ms() - b->tip_since;
             t = waited >= TIP_DELAY_MS ? 0 : (int)(TIP_DELAY_MS - waited);

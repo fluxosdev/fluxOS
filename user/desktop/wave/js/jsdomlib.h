@@ -1122,6 +1122,137 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
   nav.connection = { effectiveType: "3g", downlink: 1, rtt: 300, saveData: false, addEventListener: function () {} };
   nav.locks = { request: function (n, o, f) { return Promise.resolve((typeof o === "function" ? o : f)({ name: n })); } };
 
+  /* ---- other windows: proxies by id (browser.c carries what they do), and messages ---- */
+  var winop = g["%winop"], proxies = new Map(), selfId = winop(0, "self");
+  function cloneError() { return new DOMException("The object could not be cloned.", "DataCloneError"); }
+  function crossOrigin() { return new DOMException("Blocked a frame from accessing a cross-origin frame.", "SecurityError"); }
+  function bytes(u8) {
+    var s = "";
+    for (var i = 0; i < u8.length; i += 8192) s += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));
+    return btoa(s);
+  }
+  function unbytes(b64) {
+    var s = atob(b64), u8 = new Uint8Array(s.length);
+    for (var i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i);
+    return u8;
+  }
+  /* The structured clone algorithm's types, as JSON (every object wrapped, so its keys are its own). */
+  function serialize(v) {
+    var seen = new Map(), next = 0;
+    function enc(x) {
+      switch (typeof x) {
+      case "undefined": return { $: "u" };
+      case "number": return x !== x || x === Infinity || x === -Infinity || (x === 0 && 1 / x < 0) ? { $: "n", v: x === 0 ? "-0" : String(x) } : x;
+      case "bigint": return { $: "b", v: String(x) };
+      case "string": case "boolean": return x;
+      case "symbol": case "function": throw cloneError();
+      }
+      if (x === null) return null;
+      if (seen.has(x)) return { $: "r", i: seen.get(x) };
+      var id = next++;
+      seen.set(x, id);
+      if (x instanceof Date) return { $: "d", i: id, v: x.getTime() };
+      if (x instanceof RegExp) return { $: "re", i: id, s: x.source, f: x.flags };
+      if (x instanceof ArrayBuffer) return { $: "ab", i: id, v: bytes(new Uint8Array(x)) };
+      if (ArrayBuffer.isView(x))
+        return { $: "ta", i: id, t: x instanceof DataView ? "DataView" : x.constructor.name,
+                 v: bytes(new Uint8Array(x.buffer, x.byteOffset, x.byteLength)) };
+      if (x instanceof Map) return { $: "m", i: id, v: Array.from(x, function (e) { return [enc(e[0]), enc(e[1])]; }) };
+      if (x instanceof Set) return { $: "s", i: id, v: Array.from(x, enc) };
+      if (x instanceof Error) return { $: "e", i: id, n: x.name, m: x.message, s: x.stack };
+      if (Array.isArray(x)) { var a = []; for (var k = 0; k < x.length; k++) a.push(enc(x[k])); return { $: "a", i: id, v: a }; }
+      if (x instanceof Node || x === g || typeof x.postMessage === "function" && proxiesHas(x)) throw cloneError();
+      var o = {};
+      Object.keys(x).forEach(function (key) { o[key] = enc(x[key]); });
+      return { $: "o", i: id, v: o };
+    }
+    return JSON.stringify(enc(v));
+  }
+  function proxiesHas(x) { var found = false; proxies.forEach(function (p) { if (p === x) found = true; }); return found; }
+  function deserialize(text) {
+    var refs = [];
+    function dec(x) {
+      if (x === null || typeof x !== "object") return x;
+      switch (x.$) {
+      case "u": return undefined;
+      case "n": return x.v === "-0" ? -0 : Number(x.v);
+      case "b": return BigInt(x.v);
+      case "r": return refs[x.i];
+      case "d": return refs[x.i] = new Date(x.v);
+      case "re": return refs[x.i] = new RegExp(x.s, x.f);
+      case "ab": return refs[x.i] = unbytes(x.v).buffer;
+      case "ta": {
+        var b = unbytes(x.v), C = x.t === "DataView" ? DataView : g[x.t] || Uint8Array;
+        return refs[x.i] = C === DataView ? new DataView(b.buffer) : new C(b.buffer, 0, b.length / C.BYTES_PER_ELEMENT);
+      }
+      case "m": { var m = refs[x.i] = new Map(); x.v.forEach(function (e) { m.set(dec(e[0]), dec(e[1])); }); return m; }
+      case "s": { var st = refs[x.i] = new Set(); x.v.forEach(function (e) { st.add(dec(e)); }); return st; }
+      case "e": { var E = g[x.n] && g[x.n].prototype instanceof Error ? g[x.n] : Error, err = refs[x.i] = new E(x.m); if (x.s) err.stack = x.s; return err; }
+      case "a": { var arr = refs[x.i] = []; for (var k = 0; k < x.v.length; k++) arr[k] = dec(x.v[k]); return arr; }
+      case "o": { var o = refs[x.i] = {}; for (var key in x.v) o[key] = dec(x.v[key]); return o; }
+      }
+      return x;
+    }
+    return dec(JSON.parse(text));
+  }
+  g["%serialize"] = serialize;
+  g["%deserialize"] = deserialize;
+  function post(id, data, origin) {
+    if (origin && typeof origin === "object") origin = origin.targetOrigin;
+    winop(id, "post", serialize(data), origin === undefined ? "/" : String(origin));
+  }
+  function proxy(id) {
+    if (!id || id === selfId) return g;
+    var p = proxies.get(id);
+    if (p) return p;
+    p = {
+      postMessage: function (data, origin) { post(id, data, origin); },
+      close: function () { winop(id, "close"); },
+      focus: function () {}, blur: function () {},
+      get closed() { return !winop(id, "alive"); },
+      get opener() { var w = winop(id, "opener"); return w ? proxy(w) : null; },
+      get parent() { var w = winop(id, "parent"); return w ? proxy(w) : p; },
+      get top() { var w = winop(id, "top"); return w ? proxy(w) : p; },
+      get window() { return p; }, get self() { return p; }, get frames() { return p; },
+      get length() { return winop(id, "frames"); },
+      get document() { if (winop(id, "href") === null) throw crossOrigin(); return null; },
+      get location() {
+        var href = winop(id, "href");
+        if (href === null) throw crossOrigin();
+        var u = new URL(href);
+        return { href: href, origin: u.origin, protocol: u.protocol, host: u.host, hostname: u.hostname, port: u.port,
+                 pathname: u.pathname, search: u.search, hash: u.hash, toString: function () { return href; },
+                 assign: function (to) { winop(id, "navigate", String(to)); },
+                 replace: function (to) { winop(id, "navigate", String(to)); },
+                 reload: function () { winop(id, "navigate", href); } };
+      },
+      set location(to) { winop(id, "navigate", String(to)); }
+    };
+    proxies.set(id, p);
+    return p;
+  }
+  g["%windowProxy"] = proxy;
+  Object.defineProperty(g, "opener", { configurable: true, enumerable: true,
+    get: function () { var w = winop(0, "opener"); return w ? proxy(w) : null; }, set: function () {} });
+  Object.defineProperty(g, "parent", { configurable: true, enumerable: true,
+    get: function () { var w = winop(0, "parent"); return w ? proxy(w) : g; } });
+  Object.defineProperty(g, "top", { configurable: true, enumerable: true,
+    get: function () { var w = winop(0, "top"); return w ? proxy(w) : g; } });
+  Object.defineProperty(g, "length", { configurable: true, get: function () { return winop(0, "frames"); } });
+  def(g, "postMessage", function (data, origin) { post(selfId, data, origin); });
+  g["%deliverMessage"] = function (data, origin, source) {
+    var e = new MessageEvent("message", { data: deserialize(data), origin: origin, source: proxy(source), lastEventId: "", ports: [] });
+    g.dispatchEvent(e);
+  };
+  Object.defineProperty(Element.prototype, "contentWindow", { configurable: true, get: function () {
+    if (this.tagName !== "IFRAME" && this.tagName !== "FRAME") return undefined;
+    var w = winop(0, "frame", this);
+    return w ? proxy(w) : null;
+  } });
+  Object.defineProperty(Element.prototype, "contentDocument", { configurable: true, get: function () {
+    return this.tagName === "IFRAME" || this.tagName === "FRAME" ? null : undefined;
+  } });
+
   g.isSecureContext = location.protocol === "https:" || location.hostname === "localhost";
   g.crossOriginIsolated = false;
   g.origin = location.origin;

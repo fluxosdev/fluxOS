@@ -59,6 +59,22 @@ enum prop {
     P_LIST_STYLE_IMAGE, P_COUNTER_RESET, P_COUNTER_INCREMENT,
     P_DECO_THICKNESS, P_UNDERLINE_OFFSET, P_BACKGROUND_CLIP, P_BACKGROUND_ATTACHMENT,
     P_ALL, P_ALIGN_CONTENT, P_GRID_AUTO_COLUMNS, P_TRANSLATE, P_ROTATE, P_SCALE, P_TEXT_WRAP,
+    P_TRANSITION, P_TRANSITION_PROPERTY, P_TRANSITION_DURATION, P_TRANSITION_TIMING, P_TRANSITION_DELAY,
+    P_ANIMATION, P_ANIMATION_NAME, P_ANIMATION_DURATION, P_ANIMATION_TIMING, P_ANIMATION_DELAY,
+    P_ANIMATION_ITERATION, P_ANIMATION_DIRECTION, P_ANIMATION_FILL, P_ANIMATION_STATE,
+};
+
+/* Transitions and animations, with or without -webkit- (looked up before prop_names). */
+static const struct { const char *name; uint8_t prop; } motion_names[] = {
+    { "animation", P_ANIMATION }, { "animation-composition", P_IGNORED },
+    { "animation-delay", P_ANIMATION_DELAY }, { "animation-direction", P_ANIMATION_DIRECTION },
+    { "animation-duration", P_ANIMATION_DURATION }, { "animation-fill-mode", P_ANIMATION_FILL },
+    { "animation-iteration-count", P_ANIMATION_ITERATION }, { "animation-name", P_ANIMATION_NAME },
+    { "animation-play-state", P_ANIMATION_STATE }, { "animation-range", P_IGNORED },
+    { "animation-timeline", P_IGNORED }, { "animation-timing-function", P_ANIMATION_TIMING },
+    { "transition", P_TRANSITION }, { "transition-behavior", P_IGNORED },
+    { "transition-delay", P_TRANSITION_DELAY }, { "transition-duration", P_TRANSITION_DURATION },
+    { "transition-property", P_TRANSITION_PROPERTY }, { "transition-timing-function", P_TRANSITION_TIMING },
 };
 
 static const struct { const char *name; uint8_t prop; } prop_names[] = {
@@ -319,6 +335,7 @@ struct sheet {
     struct arena *a;
     /* the index: selectors by what their subject must have */
     struct ref *by_id[INDEX_BUCKETS], *by_class[INDEX_BUCKETS], *by_tag[T_COUNT], *other;
+    struct keyframes *keyframes;        /* @keyframes, the last one first */
 };
 
 /* ---- the user agent style sheet ---- */
@@ -949,6 +966,13 @@ static int parse_selector(struct arena *a, const char *s, const char *end, struc
 
 static int prop_lookup(const char *name)
 {
+    const char *motion = !strncmp(name, "-webkit-", 8) || !strncmp(name, "-moz-", 5) ? strchr(name + 1, '-') + 1 : name;
+    if (!strncmp(motion, "transition", 10) || !strncmp(motion, "animation", 9)) {
+        for (unsigned i = 0; i < sizeof(motion_names) / sizeof(motion_names[0]); i++)
+            if (!strcmp(motion_names[i].name, motion))
+                return motion_names[i].prop;
+        return P_UNKNOWN;
+    }
     int lo = 0, hi = (int)(sizeof(prop_names) / sizeof(prop_names[0])) - 1;
     while (lo <= hi) {
         int mid = (lo + hi) / 2;
@@ -1023,6 +1047,275 @@ static int parse_decls(struct arena *a, const char *s, const char *end, struct d
     }
     *out = d;
     return n;
+}
+
+/* ---- transitions and animations: timing, times and @keyframes ---- */
+
+/* The next token of a value list, spaces apart (a function's parentheses keep theirs). */
+static int motion_token(const char **p, const char *end, const char **ts)
+{
+    while (*p < end && isspace((unsigned char)**p))
+        (*p)++;
+    *ts = *p;
+    int depth = 0;
+    while (*p < end && (depth || !isspace((unsigned char)**p))) {
+        if (**p == '(')
+            depth++;
+        else if (**p == ')' && depth)
+            depth--;
+        (*p)++;
+    }
+    return (int)(*p - *ts);
+}
+
+/* "0.3s", "300ms", "-1s": milliseconds into *ms. */
+static int parse_time(const char *s, int n, int *ms)
+{
+    char buf[32];
+    if (n <= 0 || n >= (int)sizeof(buf))
+        return 0;
+    memcpy(buf, s, (size_t)n);
+    buf[n] = 0;
+    char *e;
+    double v = strtod(buf, &e);
+    if (e == buf)
+        return 0;
+    if (!strcasecmp(e, "ms"))
+        *ms = (int)v;
+    else if (!strcasecmp(e, "s"))
+        *ms = (int)(v * 1000 + (v < 0 ? -0.5 : 0.5));
+    else
+        return 0;
+    return 1;
+}
+
+static int timing_keyword(const char *s, int n, struct css_timing *t)
+{
+    static const struct { const char *kw; float x1, y1, x2, y2; } bez[] = {
+        { "ease", .25f, .1f, .25f, 1 }, { "linear", 0, 0, 1, 1 }, { "ease-in", .42f, 0, 1, 1 },
+        { "ease-out", 0, 0, .58f, 1 }, { "ease-in-out", .42f, 0, .58f, 1 },
+    };
+    memset(t, 0, sizeof(*t));
+    for (unsigned i = 0; i < sizeof(bez) / sizeof(bez[0]); i++)
+        if ((int)strlen(bez[i].kw) == n && !strncasecmp(s, bez[i].kw, (size_t)n)) {
+            t->x1 = bez[i].x1, t->y1 = bez[i].y1, t->x2 = bez[i].x2, t->y2 = bez[i].y2;
+            return 1;
+        }
+    if ((n == 10 && !strncasecmp(s, "step-start", 10)) || (n == 8 && !strncasecmp(s, "step-end", 8))) {
+        t->steps_kind = 1;
+        t->steps = 1;
+        t->jump = n == 10 ? JUMP_START : JUMP_END;
+        return 1;
+    }
+    if (n > 13 && !strncasecmp(s, "cubic-bezier(", 13)) {
+        float v[4];
+        const char *p = s + 13;
+        for (int i = 0; i < 4; i++) {
+            char *e;
+            v[i] = strtof(p, &e);
+            if (e == p)
+                return 0;
+            p = e;
+            while (*p == ',' || isspace((unsigned char)*p))
+                p++;
+        }
+        t->x1 = v[0] < 0 ? 0 : v[0] > 1 ? 1 : v[0], t->y1 = v[1];
+        t->x2 = v[2] < 0 ? 0 : v[2] > 1 ? 1 : v[2], t->y2 = v[3];
+        return 1;
+    }
+    if (n > 6 && !strncasecmp(s, "steps(", 6)) {
+        t->steps_kind = 1;
+        t->steps = atoi(s + 6);
+        if (t->steps < 1)
+            t->steps = 1;
+        t->jump = JUMP_END;
+        const char *comma = memchr(s, ',', (size_t)n);
+        if (comma) {
+            while (++comma < s + n && isspace((unsigned char)*comma))
+                ;
+            if (!strncasecmp(comma, "jump-start", 10) || !strncasecmp(comma, "start", 5))
+                t->jump = JUMP_START;
+            else if (!strncasecmp(comma, "jump-none", 9))
+                t->jump = JUMP_NONE;
+            else if (!strncasecmp(comma, "jump-both", 9))
+                t->jump = JUMP_BOTH;
+        }
+        return 1;
+    }
+    if (n > 7 && !strncasecmp(s, "linear(", 7)) {     /* linear() with stops: taken as linear */
+        t->x2 = t->y2 = 1;
+        return 1;
+    }
+    return 0;
+}
+
+/* The animatable properties a declaration of prop sets (keyframes: what they animate). */
+static uint64_t prop_ap_bits(int prop)
+{
+    const uint64_t margins = AP_BIT(AP_MARGIN_TOP) | AP_BIT(AP_MARGIN_RIGHT) | AP_BIT(AP_MARGIN_BOTTOM) |
+                             AP_BIT(AP_MARGIN_LEFT);
+    const uint64_t paddings = AP_BIT(AP_PADDING_TOP) | AP_BIT(AP_PADDING_RIGHT) | AP_BIT(AP_PADDING_BOTTOM) |
+                              AP_BIT(AP_PADDING_LEFT);
+    const uint64_t bwidths = AP_BIT(AP_BORDER_TOP_WIDTH) | AP_BIT(AP_BORDER_RIGHT_WIDTH) |
+                             AP_BIT(AP_BORDER_BOTTOM_WIDTH) | AP_BIT(AP_BORDER_LEFT_WIDTH);
+    const uint64_t bcolors = AP_BIT(AP_BORDER_TOP_COLOR) | AP_BIT(AP_BORDER_RIGHT_COLOR) |
+                             AP_BIT(AP_BORDER_BOTTOM_COLOR) | AP_BIT(AP_BORDER_LEFT_COLOR);
+    const uint64_t radii = AP_BIT(AP_BORDER_TL_RADIUS) | AP_BIT(AP_BORDER_TR_RADIUS) |
+                           AP_BIT(AP_BORDER_BR_RADIUS) | AP_BIT(AP_BORDER_BL_RADIUS);
+    switch (prop) {
+    case P_COLOR: return AP_BIT(AP_COLOR);
+    case P_BACKGROUND: case P_BACKGROUND_COLOR: return AP_BIT(AP_BACKGROUND_COLOR);
+    case P_OPACITY: return AP_BIT(AP_OPACITY);
+    case P_WIDTH: return AP_BIT(AP_WIDTH);
+    case P_HEIGHT: return AP_BIT(AP_HEIGHT);
+    case P_MIN_WIDTH: return AP_BIT(AP_MIN_WIDTH);
+    case P_MAX_WIDTH: return AP_BIT(AP_MAX_WIDTH);
+    case P_MIN_HEIGHT: return AP_BIT(AP_MIN_HEIGHT);
+    case P_MAX_HEIGHT: return AP_BIT(AP_MAX_HEIGHT);
+    case P_MARGIN: case P_MARGIN_INLINE: case P_MARGIN_BLOCK: return margins;
+    case P_MARGIN_TOP: return AP_BIT(AP_MARGIN_TOP);
+    case P_MARGIN_RIGHT: return AP_BIT(AP_MARGIN_RIGHT);
+    case P_MARGIN_BOTTOM: return AP_BIT(AP_MARGIN_BOTTOM);
+    case P_MARGIN_LEFT: return AP_BIT(AP_MARGIN_LEFT);
+    case P_PADDING: case P_PADDING_INLINE: case P_PADDING_BLOCK: return paddings;
+    case P_PADDING_TOP: return AP_BIT(AP_PADDING_TOP);
+    case P_PADDING_RIGHT: return AP_BIT(AP_PADDING_RIGHT);
+    case P_PADDING_BOTTOM: return AP_BIT(AP_PADDING_BOTTOM);
+    case P_PADDING_LEFT: return AP_BIT(AP_PADDING_LEFT);
+    case P_INSET: case P_INSET_INLINE: case P_INSET_BLOCK:
+        return AP_BIT(AP_TOP) | AP_BIT(AP_RIGHT) | AP_BIT(AP_BOTTOM) | AP_BIT(AP_LEFT);
+    case P_TOP: return AP_BIT(AP_TOP);
+    case P_RIGHT: return AP_BIT(AP_RIGHT);
+    case P_BOTTOM: return AP_BIT(AP_BOTTOM);
+    case P_LEFT: return AP_BIT(AP_LEFT);
+    case P_BORDER: return bwidths | bcolors;
+    case P_BORDER_WIDTH: return bwidths;
+    case P_BORDER_COLOR: return bcolors;
+    case P_BORDER_TOP: return AP_BIT(AP_BORDER_TOP_WIDTH) | AP_BIT(AP_BORDER_TOP_COLOR);
+    case P_BORDER_RIGHT: return AP_BIT(AP_BORDER_RIGHT_WIDTH) | AP_BIT(AP_BORDER_RIGHT_COLOR);
+    case P_BORDER_BOTTOM: return AP_BIT(AP_BORDER_BOTTOM_WIDTH) | AP_BIT(AP_BORDER_BOTTOM_COLOR);
+    case P_BORDER_LEFT: return AP_BIT(AP_BORDER_LEFT_WIDTH) | AP_BIT(AP_BORDER_LEFT_COLOR);
+    case P_BORDER_TOP_WIDTH: return AP_BIT(AP_BORDER_TOP_WIDTH);
+    case P_BORDER_RIGHT_WIDTH: return AP_BIT(AP_BORDER_RIGHT_WIDTH);
+    case P_BORDER_BOTTOM_WIDTH: return AP_BIT(AP_BORDER_BOTTOM_WIDTH);
+    case P_BORDER_LEFT_WIDTH: return AP_BIT(AP_BORDER_LEFT_WIDTH);
+    case P_BORDER_TOP_COLOR: return AP_BIT(AP_BORDER_TOP_COLOR);
+    case P_BORDER_RIGHT_COLOR: return AP_BIT(AP_BORDER_RIGHT_COLOR);
+    case P_BORDER_BOTTOM_COLOR: return AP_BIT(AP_BORDER_BOTTOM_COLOR);
+    case P_BORDER_LEFT_COLOR: return AP_BIT(AP_BORDER_LEFT_COLOR);
+    case P_OUTLINE: return AP_BIT(AP_OUTLINE_COLOR) | AP_BIT(AP_OUTLINE_WIDTH);
+    case P_OUTLINE_COLOR: return AP_BIT(AP_OUTLINE_COLOR);
+    case P_OUTLINE_WIDTH: return AP_BIT(AP_OUTLINE_WIDTH);
+    case P_OUTLINE_OFFSET: return AP_BIT(AP_OUTLINE_OFFSET);
+    case P_FONT: return AP_BIT(AP_FONT_SIZE) | AP_BIT(AP_LINE_HEIGHT);
+    case P_FONT_SIZE: return AP_BIT(AP_FONT_SIZE);
+    case P_LETTER_SPACING: return AP_BIT(AP_LETTER_SPACING);
+    case P_WORD_SPACING: return AP_BIT(AP_WORD_SPACING);
+    case P_LINE_HEIGHT: return AP_BIT(AP_LINE_HEIGHT);
+    case P_BORDER_RADIUS: return radii;
+    case P_BORDER_TL_RADIUS: return AP_BIT(AP_BORDER_TL_RADIUS);
+    case P_BORDER_TR_RADIUS: return AP_BIT(AP_BORDER_TR_RADIUS);
+    case P_BORDER_BR_RADIUS: return AP_BIT(AP_BORDER_BR_RADIUS);
+    case P_BORDER_BL_RADIUS: return AP_BIT(AP_BORDER_BL_RADIUS);
+    case P_TRANSFORM: return AP_BIT(AP_TRANSFORM);
+    case P_TRANSFORM_ORIGIN: return AP_BIT(AP_TRANSFORM_ORIGIN);
+    case P_BOX_SHADOW: return AP_BIT(AP_BOX_SHADOW);
+    case P_TEXT_SHADOW: return AP_BIT(AP_TEXT_SHADOW);
+    case P_FLEX: return AP_BIT(AP_FLEX_GROW) | AP_BIT(AP_FLEX_SHRINK) | AP_BIT(AP_FLEX_BASIS);
+    case P_FLEX_GROW: return AP_BIT(AP_FLEX_GROW);
+    case P_FLEX_SHRINK: return AP_BIT(AP_FLEX_SHRINK);
+    case P_FLEX_BASIS: return AP_BIT(AP_FLEX_BASIS);
+    case P_GAP: return AP_BIT(AP_ROW_GAP) | AP_BIT(AP_COLUMN_GAP);
+    case P_ROW_GAP: return AP_BIT(AP_ROW_GAP);
+    case P_COLUMN_GAP: return AP_BIT(AP_COLUMN_GAP);
+    case P_TEXT_INDENT: return AP_BIT(AP_TEXT_INDENT);
+    case P_Z_INDEX: return AP_BIT(AP_Z_INDEX);
+    case P_VISIBILITY: return AP_BIT(AP_VISIBILITY);
+    default: return 0;
+    }
+}
+
+static int frame_cmp(const void *a, const void *b)
+{
+    const struct kframe *x = a, *y = b;
+    return x->offset < y->offset ? -1 : x->offset > y->offset;
+}
+
+/* @keyframes name { from {...} 50% {...} to {...} } (s and end: what is between the braces). */
+static void parse_keyframes(struct sheet *sh, const char *ns, const char *ne, const char *s, const char *end)
+{
+    struct arena *a = sh->a;
+    while (ns < ne && isspace((unsigned char)*ns))
+        ns++;
+    while (ne > ns && isspace((unsigned char)ne[-1]))
+        ne--;
+    if (ne - ns >= 2 && (*ns == '"' || *ns == '\'') && ne[-1] == *ns)
+        ns++, ne--;
+    if (ns >= ne)
+        return;
+    struct keyframes *k = arena_alloc(a, sizeof(*k));
+    if (!k)
+        return;
+    memset(k, 0, sizeof(*k));
+    k->name = trimmed(a, ns, ne);
+    int cap = 0;
+    struct scan sc = { s, end };
+    while (sc.s < sc.end) {
+        skip_ws(&sc);
+        const char *brace = find_top(sc.s, sc.end, '{');
+        if (brace >= sc.end)
+            break;
+        const char *close = skip_group(brace, sc.end);
+        struct decl *d;
+        int nd = parse_decls(a, brace + 1, close - 1, &d);
+        const struct css_timing *ease = NULL;
+        uint64_t props = 0;
+        for (int i = 0; i < nd; i++) {
+            if (d[i].prop == P_ANIMATION_TIMING) {
+                struct css_timing *t = arena_alloc(a, sizeof(*t));
+                if (t && timing_keyword(d[i].value, (int)strlen(d[i].value), t))
+                    ease = t;
+            } else if (!d[i].important) {
+                props |= prop_ap_bits(d[i].prop);
+            }
+        }
+        for (const char *p = sc.s; p < brace;) {        /* from, to, 25%, ... */
+            const char *comma = find_top(p, brace, ',');
+            while (p < comma && isspace((unsigned char)*p))
+                p++;
+            float off = -1;
+            if (!strncasecmp(p, "from", 4))
+                off = 0;
+            else if (!strncasecmp(p, "to", 2))
+                off = 1;
+            else if (isdigit((unsigned char)*p) || *p == '.')
+                off = strtof(p, NULL) / 100;
+            if (off >= 0 && off <= 1) {
+                if (k->n == cap) {
+                    int nc = cap ? cap * 2 : 4;
+                    struct kframe *f = arena_alloc(a, sizeof(*f) * (size_t)nc);
+                    if (!f)
+                        return;
+                    if (k->n)
+                        memcpy(f, k->f, sizeof(*f) * (size_t)k->n);
+                    k->f = f;
+                    cap = nc;
+                }
+                k->f[k->n++] = (struct kframe){ off, ease, props, d, nd };
+            }
+            p = comma < brace ? comma + 1 : brace;
+        }
+        sc.s = close;
+    }
+    /* By offset, keeping the written order of frames at the same one (insertion sort: stable). */
+    for (int i = 1; i < k->n; i++)
+        for (int j = i; j > 0 && frame_cmp(&k->f[j - 1], &k->f[j]) > 0; j--) {
+            struct kframe t = k->f[j];
+            k->f[j] = k->f[j - 1];
+            k->f[j - 1] = t;
+        }
+    k->next = sh->keyframes;
+    sh->keyframes = k;
 }
 
 /* ---- media queries ---- */
@@ -1655,6 +1948,13 @@ static void parse_block(struct sheet *sh, const char *s, const char *end, int vw
             if (brace >= sc.end)
                 break;
             const char *close = skip_group(brace, sc.end);
+            if ((kl == 9 && !strncasecmp(kw, "keyframes", 9)) ||
+                (kl == 17 && !strncasecmp(kw, "-webkit-keyframes", 17)) ||
+                (kl == 14 && !strncasecmp(kw, "-moz-keyframes", 14))) {
+                parse_keyframes(sh, k, brace, brace + 1, close - 1);
+                sc.s = close;
+                continue;
+            }
             if (depth < 8 && kl == 5 && !strncasecmp(kw, "layer", 5)) {
                 struct layer *saved = sh->active_layer;
                 sh->active_layer = layer_name(sh, k, brace);
@@ -3304,6 +3604,7 @@ static void init_initial(void)
     s->bg_w.unit = s->bg_h.unit = U_AUTO;
     s->obj_px = s->obj_py = (struct len){ 5000, 0, U_PCT };
     s->tox = s->toy = (struct len){ 5000, 0, U_PCT };
+    s->opacity = 255;
 }
 
 static void inherit(struct style *st, const struct style *p)
@@ -4516,6 +4817,213 @@ static void finish_transform(struct arena *a, struct style *st)
     st->xf = xf;
 }
 
+/* The transition and animation properties, kept as written until finish_motion. */
+static void apply_motion(struct style *st, const struct style *parent, int prop, const char *value,
+                         int inherit_kw, int initial_kw, const struct vctx *v)
+{
+    if (!v->a)
+        return;
+    struct css_motion_raw *raw = arena_alloc(v->a, sizeof(*raw));
+    if (!raw)
+        return;
+    if (st->raw_motion)
+        *raw = *st->raw_motion;
+    else
+        memset(raw, 0, sizeof(*raw));
+    st->raw_motion = raw;
+    if (inherit_kw || initial_kw) {
+        const struct css_motion_raw *from = inherit_kw ? parent->raw_motion : NULL;
+        static const struct css_motion_raw none;
+        if (!from)
+            from = &none;
+        if (prop == P_TRANSITION || prop == P_ANIMATION) {
+            if (prop == P_TRANSITION) {
+                raw->tprop = from->tprop, raw->tdur = from->tdur, raw->tdelay = from->tdelay;
+                raw->tease = from->tease;
+            } else {
+                const char *keep[4] = { raw->tprop, raw->tdur, raw->tdelay, raw->tease };
+                *raw = *from;
+                raw->tprop = keep[0], raw->tdur = keep[1], raw->tdelay = keep[2], raw->tease = keep[3];
+            }
+            return;
+        }
+    }
+    const char *val = arena_strdup(v->a, value);
+    switch (prop) {
+    case P_TRANSITION_PROPERTY: raw->tprop = val; return;
+    case P_TRANSITION_DURATION: raw->tdur = val; return;
+    case P_TRANSITION_TIMING: raw->tease = val; return;
+    case P_TRANSITION_DELAY: raw->tdelay = val; return;
+    case P_ANIMATION_NAME: raw->aname = val; return;
+    case P_ANIMATION_DURATION: raw->adur = val; return;
+    case P_ANIMATION_TIMING: raw->aease = val; return;
+    case P_ANIMATION_DELAY: raw->adelay = val; return;
+    case P_ANIMATION_ITERATION: raw->aiter = val; return;
+    case P_ANIMATION_DIRECTION: raw->adir = val; return;
+    case P_ANIMATION_FILL: raw->afill = val; return;
+    case P_ANIMATION_STATE: raw->astate = val; return;
+    }
+    /* A shorthand: split each comma-separated item into the longhands' lists. */
+    enum { L_PROP, L_DUR, L_EASE, L_DELAY, L_NAME, L_ITER, L_DIR, L_FILL, L_STATE, NLISTS };
+    char lists[NLISTS][512];
+    int used[NLISTS] = { 0 };
+    const char *end = value + strlen(value);
+    for (const char *item = value; item <= end;) {
+        const char *comma = find_top(item, end, ',');
+        const char *part[NLISTS] = { 0 };
+        int plen[NLISTS] = { 0 };
+        const char *p = item, *t;
+        int tl, times = 0;
+        while ((tl = motion_token(&p, comma, &t)) > 0) {
+            struct css_timing tmp;
+            int ms, slot;
+            if (parse_time(t, tl, &ms))
+                slot = times++ ? L_DELAY : L_DUR;
+            else if (timing_keyword(t, tl, &tmp))
+                slot = L_EASE;
+            else if (prop == P_TRANSITION)
+                slot = (tl == 6 && !strncasecmp(t, "normal", 6)) || (tl == 14 && !strncasecmp(t, "allow-discrete", 14))
+                           ? -1 : L_PROP;
+            else if ((tl == 8 && !strncasecmp(t, "infinite", 8)) || isdigit((unsigned char)*t) || *t == '.')
+                slot = L_ITER;
+            else if ((tl == 7 && !strncasecmp(t, "reverse", 7)) || (tl == 9 && !strncasecmp(t, "alternate", 9)) ||
+                     (tl == 17 && !strncasecmp(t, "alternate-reverse", 17)) ||
+                     (tl == 6 && !strncasecmp(t, "normal", 6) && !part[L_DIR]))
+                slot = L_DIR;
+            else if ((tl == 8 && !strncasecmp(t, "forwards", 8)) || (tl == 9 && !strncasecmp(t, "backwards", 9)) ||
+                     (tl == 4 && !strncasecmp(t, "both", 4)) ||
+                     (tl == 4 && !strncasecmp(t, "none", 4) && part[L_NAME]))
+                slot = L_FILL;
+            else if ((tl == 7 && !strncasecmp(t, "running", 7)) || (tl == 6 && !strncasecmp(t, "paused", 6)))
+                slot = L_STATE;
+            else
+                slot = L_NAME;
+            if (slot >= 0 && !part[slot])
+                part[slot] = t, plen[slot] = tl;
+        }
+        static const char *const defaults[NLISTS] = { "all", "0s", "ease", "0s", "none", "1", "normal", "none",
+                                                      "running" };
+        for (int i = 0; i < NLISTS; i++) {
+            const char *x = part[i] ? part[i] : defaults[i];
+            int xl = part[i] ? plen[i] : (int)strlen(defaults[i]);
+            if (used[i] + xl + 3 < (int)sizeof(lists[i]))
+                used[i] += snprintf(lists[i] + used[i], sizeof(lists[i]) - (size_t)used[i], "%s%.*s",
+                                    used[i] ? ", " : "", xl, x);
+        }
+        if (comma >= end)
+            break;
+        item = comma + 1;
+    }
+    const char *out[NLISTS];
+    for (int i = 0; i < NLISTS; i++)
+        out[i] = arena_strdup(v->a, used[i] ? lists[i] : "");
+    if (prop == P_TRANSITION) {
+        raw->tprop = out[L_PROP], raw->tdur = out[L_DUR], raw->tease = out[L_EASE], raw->tdelay = out[L_DELAY];
+    } else {
+        raw->aname = out[L_NAME], raw->adur = out[L_DUR], raw->aease = out[L_EASE], raw->adelay = out[L_DELAY];
+        raw->aiter = out[L_ITER], raw->adir = out[L_DIR], raw->afill = out[L_FILL], raw->astate = out[L_STATE];
+    }
+}
+
+/* The n-th item (cycling) of a comma-separated list, or NULL for an empty or missing list. */
+static const char *list_item(const char *list, int n, int *len)
+{
+    if (!list || !*list)
+        return NULL;
+    const char *end = list + strlen(list);
+    int count = 1;
+    for (const char *p = list; (p = find_top(p, end, ',')) < end; p++)
+        count++;
+    n %= count;
+    const char *p = list;
+    while (n--)
+        p = find_top(p, end, ',') + 1;
+    const char *e = find_top(p, end, ',');
+    while (p < e && isspace((unsigned char)*p))
+        p++;
+    while (e > p && isspace((unsigned char)e[-1]))
+        e--;
+    *len = (int)(e - p);
+    return p;
+}
+
+static int list_count(const char *list)
+{
+    if (!list || !*list)
+        return 0;
+    const char *end = list + strlen(list);
+    int count = 1;
+    for (const char *p = list; (p = find_top(p, end, ',')) < end; p++)
+        count++;
+    return count;
+}
+
+/* The written transition and animation lists into st->trans and st->anims. */
+static void finish_motion(struct arena *a, struct style *st)
+{
+    const struct css_motion_raw *raw = st->raw_motion;
+    st->trans = NULL, st->anims = NULL, st->ntrans = st->nanims = 0;
+    if (!raw)
+        return;
+    int n = list_count(raw->tprop ? raw->tprop : (raw->tdur ? "all" : NULL));
+    if (n > 32)
+        n = 32;
+    struct css_transition *tr = n ? arena_alloc(a, sizeof(*tr) * (size_t)n) : NULL;
+    for (int i = 0; tr && i < n; i++) {
+        int len, k = st->ntrans;
+        const char *name = list_item(raw->tprop ? raw->tprop : "all", i, &len);
+        memset(&tr[k], 0, sizeof(tr[k]));
+        tr[k].props = anim_prop_bits(name, len);
+        tr[k].name = arena_strndup(a, name, (size_t)len);
+        const char *x;
+        if ((x = list_item(raw->tdur, i, &len)) && !parse_time(x, len, &tr[k].duration))
+            tr[k].duration = 0;
+        if ((x = list_item(raw->tdelay, i, &len)) && !parse_time(x, len, &tr[k].delay))
+            tr[k].delay = 0;
+        if (!(x = list_item(raw->tease, i, &len)) || !timing_keyword(x, len, &tr[k].ease))
+            timing_keyword("ease", 4, &tr[k].ease);
+        if (tr[k].props && tr[k].duration > 0 && tr[k].duration + tr[k].delay > 0)
+            st->ntrans++;
+    }
+    st->trans = st->ntrans ? tr : NULL;
+    n = list_count(raw->aname);
+    if (n > 16)
+        n = 16;
+    struct css_animation *an = n ? arena_alloc(a, sizeof(*an) * (size_t)n) : NULL;
+    for (int i = 0; an && i < n; i++) {
+        int len, k = st->nanims;
+        const char *name = list_item(raw->aname, i, &len), *x;
+        if (len >= 2 && (*name == '"' || *name == '\''))
+            name++, len -= 2;
+        if (!len || (len == 4 && !strncasecmp(name, "none", 4)))
+            continue;
+        memset(&an[k], 0, sizeof(an[k]));
+        an[k].name = arena_strndup(a, name, (size_t)len);
+        an[k].iterations = 1;
+        if ((x = list_item(raw->adur, i, &len)) && !parse_time(x, len, &an[k].duration))
+            an[k].duration = 0;
+        if ((x = list_item(raw->adelay, i, &len)) && !parse_time(x, len, &an[k].delay))
+            an[k].delay = 0;
+        if (!(x = list_item(raw->aease, i, &len)) || !timing_keyword(x, len, &an[k].ease))
+            timing_keyword("ease", 4, &an[k].ease);
+        if ((x = list_item(raw->aiter, i, &len)))
+            an[k].iterations = !strncasecmp(x, "infinite", 8) ? -1 : strtof(x, NULL);
+        if (an[k].iterations < -1)
+            an[k].iterations = 1;
+        if ((x = list_item(raw->adir, i, &len)))
+            an[k].direction = !strncasecmp(x, "alternate-reverse", 17) ? AD_ALTERNATE_REVERSE
+                            : !strncasecmp(x, "alternate", 9) ? AD_ALTERNATE
+                            : !strncasecmp(x, "reverse", 7) ? AD_REVERSE : AD_NORMAL;
+        if ((x = list_item(raw->afill, i, &len)))
+            an[k].fill = !strncasecmp(x, "forwards", 8) ? AF_FORWARDS : !strncasecmp(x, "backwards", 9) ? AF_BACKWARDS
+                       : !strncasecmp(x, "both", 4) ? AF_BOTH : AF_NONE;
+        if ((x = list_item(raw->astate, i, &len)))
+            an[k].paused = !strncasecmp(x, "paused", 6);
+        st->nanims++;
+    }
+    st->anims = st->nanims ? an : NULL;
+}
+
 static void apply(struct style *st, const struct style *parent, int prop, const char *value,
                   const struct vctx *v)
 {
@@ -5562,11 +6070,24 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         break;
     }
     case P_OPACITY: {
-        int num;
-        if (parse_num(value, &num))
+        int num, used = parse_num(value, &num);
+        if (used) {
+            if (value[used] == '%')
+                num /= 100;
+            num = num < 0 ? 0 : num > 100 ? 100 : num;
+            st->opacity = (uint8_t)((num * 255 + 50) / 100);
             st->invisible = (uint8_t)((st->invisible & ~1) | (num <= 0));
+        } else if (initial_kw || inherit_kw) {
+            st->opacity = inherit_kw ? parent->opacity : 255;
+        }
         break;
     }
+    case P_TRANSITION: case P_TRANSITION_PROPERTY: case P_TRANSITION_DURATION: case P_TRANSITION_TIMING:
+    case P_TRANSITION_DELAY: case P_ANIMATION: case P_ANIMATION_NAME: case P_ANIMATION_DURATION:
+    case P_ANIMATION_TIMING: case P_ANIMATION_DELAY: case P_ANIMATION_ITERATION: case P_ANIMATION_DIRECTION:
+    case P_ANIMATION_FILL: case P_ANIMATION_STATE:
+        apply_motion(st, parent, prop, value, inherit_kw, initial_kw, v);
+        break;
     case P_LEFT:
     case P_TOP: {
         /* Only to recognise content pushed off the screen to hide it. */
@@ -6236,6 +6757,10 @@ static void restore_property(struct style *st, const struct style *src, int prop
     case P_LEFT: COPY(left); break;
     case P_INSET: COPY(top); COPY(right); COPY(bottom); COPY(left); break;
     case P_OPACITY: COPY(invisible); COPY(opacity); break;
+    case P_TRANSITION: case P_TRANSITION_PROPERTY: case P_TRANSITION_DURATION: case P_TRANSITION_TIMING:
+    case P_TRANSITION_DELAY: case P_ANIMATION: case P_ANIMATION_NAME: case P_ANIMATION_DURATION:
+    case P_ANIMATION_TIMING: case P_ANIMATION_DELAY: case P_ANIMATION_ITERATION: case P_ANIMATION_DIRECTION:
+    case P_ANIMATION_FILL: case P_ANIMATION_STATE: COPY(raw_motion); break;
     case P_MASK: COPY(invisible); break;
     case P_CLIP: COPY(invisible); break;
     case P_MARGIN: COPY(margin); break;
@@ -6408,6 +6933,42 @@ static uint32_t match_signature(const struct collect *c, const char *hint, const
  * the ones that matched last time (css_restyle_dynamic): returns 1 if it
  * was computed, 0 if its style stays as it was.
  */
+/* @keyframes for anim_style: the element's sheets, and how to apply a keyframe's declarations. */
+struct kf_ctx {
+    struct sheet **sheets;
+    int nsheets;
+    const struct style *parent;
+    const struct vctx *v;
+};
+
+static const struct keyframes *kf_find(void *ctx, const char *name)
+{
+    struct kf_ctx *k = ctx;
+    for (int i = k->nsheets - 1; i >= 0; i--)          /* the last definition wins */
+        for (const struct keyframes *f = k->sheets[i] ? k->sheets[i]->keyframes : NULL; f; f = f->next)
+            if (!strcmp(f->name, name))
+                return f;
+    return NULL;
+}
+
+static void kf_apply(void *ctx, const struct kframe *f, struct style *st)
+{
+    struct kf_ctx *k = ctx;
+    const struct decl *d = f->decls;
+    for (int i = 0; i < f->ndecls; i++) {
+        if (d[i].prop == P_CUSTOM || d[i].important || prop_ap_bits(d[i].prop) == 0)
+            continue;
+        const char *value = d[i].value;
+        char expanded[1024];
+        if (strstr(value, "var(")) {
+            if (!substitute(st, value, expanded, sizeof(expanded), 0))
+                continue;
+            value = expanded;
+        }
+        apply(st, k->parent, d[i].prop, value, k->v);
+    }
+}
+
 static int compute(struct arena *a, struct node *n, const struct style *parent,
                    struct sheet **sheets, int nsheets, const struct vctx *base,
                    const struct mctx *mc, struct match *buf, int check)
@@ -6460,7 +7021,7 @@ static int compute(struct arena *a, struct node *n, const struct style *parent,
     cur_subject = NULL;
     n->style_flags = cur_flags;
     uint32_t sig = match_signature(&c, hint, inline_style);
-    if (check && sig == n->match_sig && n->style)
+    if (check && sig == n->match_sig && n->style && !anim_running(n))
         return 0;
     n->match_sig = sig;
 
@@ -6515,6 +7076,17 @@ static int compute(struct arena *a, struct node *n, const struct style *parent,
             if (d->prop == P_COLOR && c.m[i].rank != R_UA)
                 author_color = 1;
         }
+    }
+
+    /* Transitions and animations put in their values now, before what depends on them. */
+    finish_motion(a, st);
+    if (st->ntrans || st->nanims || n->anim) {
+        struct kf_ctx kc = { sheets, nsheets, parent, &v };
+        struct anim_env env = { a, &kc, kf_find, kf_apply };
+        anim_style(n, st, &env);
+        n->style_flags |= SF_NOSHARE;
+        if (anim_running(n))
+            n->style_flags |= SF_DYN_SELF;      /* restyled each frame (css_restyle_animated) */
     }
 
     if (st->counter_reset)
@@ -7066,6 +7638,7 @@ void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int 
     }
     if (!ua_sheet || !ua_quirks || !root)
         return;
+    anim_cascade_begin(root);
     initial_style.font_size = ZOOM(16);
     for (int i = 0; i < 4; i++)
         initial_style.border_w[i] = ZOOM(3);
@@ -7091,6 +7664,7 @@ void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int 
     }
     cascade_tree(a, root, &initial_style, combined, nsheets, &v, &mc, buf, bloom, 0);
     int shadows = cascade_shadows(a, root, &v, &mc, buf, 0);
+    anim_cascade_end(root);
     free(buf);
     free(bloom);
     key_arena = NULL;
@@ -7143,5 +7717,35 @@ int css_restyle_dynamic(struct arena *a, struct node *root, struct sheet **sheet
     free(buf);
     free(bloom);
     memcpy(rec->state, now, sizeof(now));
+    return changed > 0;
+}
+
+int css_restyle_animated(struct arena *a, struct node *root, struct sheet **sheets, int nsheets,
+                         int viewport_w, int viewport_h, int (*visited)(const char *href, void *ctx),
+                         void *ctx)
+{
+    static unsigned gen = 0x80000000u;  /* apart from css_restyle_dynamic's generations */
+    struct cascade_record *rec = cascade_record(root, 0);
+    if (!rec || !rec->ok || sheets != rec->sheets || nsheets != rec->nsheets || viewport_w != rec->vw ||
+        viewport_h != rec->vh || !root->style || !ua_sheet || !ua_quirks)
+        return -1;
+    if (!++gen)
+        gen = 0x80000000u;
+    if (!anim_mark(root, gen))
+        return 0;
+    struct vctx v = { ZOOM(16), root->style->font_size, viewport_w, viewport_h, a, 0, 0 };
+    struct mctx mc = { .visited = visited, .ctx = ctx, .quirks = root->quirks };
+    struct match *buf = malloc(sizeof(struct match) * MAX_MATCHES);
+    struct bloom *bloom = calloc(1, sizeof(*bloom));
+    if (!buf || !bloom) {
+        free(buf);
+        free(bloom);
+        return -1;
+    }
+    key_arena = a;
+    int changed = cascade_tree(a, root, &initial_style, sheets, nsheets, &v, &mc, buf, bloom, gen);
+    key_arena = NULL;
+    free(buf);
+    free(bloom);
     return changed > 0;
 }

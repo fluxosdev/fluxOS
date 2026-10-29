@@ -2,7 +2,8 @@
 static const char js_binary_lib[] = JS_SOURCE(
 (function () {
   var types = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array,
-               Int32Array, Uint32Array, Float32Array, Float64Array];
+               Int32Array, Uint32Array, Float32Array, Float64Array,
+               BigInt64Array, BigUint64Array];
   function def(o, k, f) { Object.defineProperty(o, k, { value: f, writable: true, configurable: true }); }
   function snapshot(a) { var r = []; for (var i = 0; i < a.length; i++) r.push(a[i]); return r; }
   types.forEach(function (C) {

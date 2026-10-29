@@ -295,8 +295,8 @@ fetcher process, so the desktop keeps running), or from `file://`.
   Refresh (F5) asks the server about the page itself. If a fetcher cannot be started
   (eight run at most) the page is fetched by `wget` as before.
 - **HTTPS authentication**: Mbed TLS 3.6.7 verifies the server's certificate
-  chain, hostname, validity dates, key usage and TLS 1.3 CertificateVerify
-  signature against `/etc/ssl/ca-certificates.crt`. Invalid authentication
+  chain, hostname, validity dates, key usage and the server's handshake
+  signature (TLS 1.3 CertificateVerify, TLS 1.2 ServerKeyExchange) against `/etc/ssl/ca-certificates.crt`. Invalid authentication
   fails the connection. The trust bundle contains the Mozilla roots from the
   build host's Debian ca-certificates package, excluding local additions.
 - **WebSocket**: real `ws://` and authenticated `wss://` connections through
@@ -375,7 +375,8 @@ fetcher process, so the desktop keeps running), or from `file://`.
   borders, backgrounds, images and form controls. Floats (`float`, `clear`,
   clearfixes, text wrapping, new formatting contexts beside floats) and
   positioning (`relative`, `absolute`, `fixed` and `sticky` with `top`/`right`/`bottom`/
-  `left`, `inset`) work, with `z-index` for absolute and fixed boxes, `box-shadow`
+  `left`, `inset`) work, painted in stacking-context order (`z-index` on positioned boxes and
+  flex/grid items, contexts from opacity, transforms, fixed and sticky boxes), `box-shadow`
   (the first outer shadow, drawn as fading layers) and `transform: translate()`.
   `overflow` other than `visible` clips a box's contents to its padding box, and
   `overflow: auto`/`scroll` boxes scroll: scroll bars (laid over the box's right and bottom
@@ -437,8 +438,12 @@ fetcher process, so the desktop keeps running), or from `file://`.
   live bindings, `import()`, `import.meta`, top-level `await`, import maps;
   `nomodule` scripts are skipped), generators, async generators and
   `async`/`await` (run as coroutines on their own stacks),
-  Promises with a microtask queue, regular expressions with lookbehind,
-  named groups, sticky (`y`) matching and match indices (`d`), and the usual built-ins (Map, Set,
+  Promises with a microtask queue, symbols and BigInt (with `BigInt64Array` and
+  `DataView`'s BigInt accessors) as their own types, regular expressions with lookbehind,
+  named groups, sticky (`y`) matching, match indices (`d`), Unicode classes and property escapes
+  (`\p{L}`, `\p{Script=Greek}`, `\p{Extended_Pictographic}`), case folding beyond ASCII and the `v`
+  flag's nested classes with `--` and `&&`; Unicode `toUpperCase`/`toLowerCase` (ß is SS),
+  `trim` and `normalize()` (NFC, NFD, NFKC, NFKD; tables from `tools/mkunicode.py`), and the usual built-ins (Map, Set,
   Weak*, typed arrays, JSON, Date, Reflect, `Proxy` (get, set, has, deleteProperty and ownKeys
   traps), the ES2025 Set methods, iterator helpers (`Iterator.from`, `map`, `filter`, `take`,
   `drop`, `flatMap`, `reduce`, `toArray`... on arrays', collections' and generators' iterators),
@@ -476,7 +481,13 @@ fetcher process, so the desktop keeps running), or from `file://`.
   (per origin, kept in `/home/flux/.browser_storage`) and `sessionStorage`
   (per origin and window), `XMLHttpRequest`, `fetch`,
   `URL`, and more: `FormData`, `Blob`, `TextEncoder`/`TextDecoder`, `crypto.getRandomValues`/`randomUUID`,
-  `DOMParser`, `postMessage`, a style element's `sheet.insertRule()`, and a stand-in for `Notification`.
+  `DOMParser`, a style element's `sheet.insertRule()`, and a stand-in for `Notification`.
+  Windows talk across tabs, popups and frames: `window.open()` returns the new window,
+  `opener`, `parent`, `top` and an iframe's `contentWindow` are windows too, and `postMessage`
+  carries structured clones (with `origin`, `source` and target-origin checks); a window a
+  script opened can be closed again. `indexedDB` has object stores, indexes (unique,
+  multi-entry), cursors, key ranges, version upgrades and transactions that roll back on abort,
+  kept per origin in `/home/flux/.browser_idb`.
   Constructed `CSSStyleSheet` objects remain outside the DOM; documents and shadow roots
   adopt shared, mutable sheet lists, and replacements, rule edits and disabling update adopters.
   Shadow styles support `:host`, `:host(...)` and `::slotted(...)`, with outer/inner cascade precedence.
@@ -566,8 +577,8 @@ archives, an HTTP/1.1 client and inflate).
   `ping [-c N] HOST`, `host NAME`, `nc` (netcat, TCP and UDP).
 - `wget [-q] [-O FILE] [-T SECONDS] [--save-headers] [--content-on-error]
   [--max-redirect=N] [--post-data=STRING] [--method=VERB] [--header=LINE]... URL` follows redirects and decodes
-  chunked bodies (HTTP/1.1, through libc's `<http.h>`, writing the body as it arrives). `https://` uses libc's own TLS 1.3 client (`<tls.h>`: X25519,
-  AES-128-GCM). It encrypts but does not verify the server's certificate.
+  chunked bodies (HTTP/1.1, through libc's `<http.h>`, writing the body as it arrives). `https://` uses libc's own TLS client (`<tls.h>`: TLS 1.3, or
+  TLS 1.2 with ECDHE and AES-GCM or ChaCha20-Poly1305). It encrypts but does not verify the server's certificate.
 - `beep [-f HZ] [-l MS] [-r N] [-d MS] [-n ...]` and `beep -m MUSIC` (BASIC's
   PLAY language); `play [-q] [-s SECONDS] FILE...` plays WAV (8 to 32-bit PCM)
   and VOC files, `play -t HZ [-l MS]` a test tone; `mixer [CHANNEL LEVEL]`.
@@ -960,22 +971,25 @@ cannot be used.
   sensing, and surround jacks repeat the front pair.
 - **Network:** IPv4 only, one card, no IP fragments, no TCP congestion control
   or out-of-order buffering. forcedeth runs at 10/100 Mbit/s without offload,
-  VLANs, wake-on-LAN or MSI. HTTPS is TLS 1.3 with TLS_AES_128_GCM_SHA256 and
-  X25519 only; certificate chains and handshake signatures are verified using
+  VLANs, wake-on-LAN or MSI. HTTPS is TLS 1.3 (TLS_AES_128_GCM_SHA256; X25519, or
+  P-256/P-384 after a HelloRetryRequest) or TLS 1.2 (ECDHE over X25519, P-256 or P-384 with
+  AES-128/256-GCM or ChaCha20-Poly1305; no CBC suites, no RSA key exchange, no resumption);
+  certificate chains and handshake signatures are verified using
   Mbed TLS and a bundled CA trust store. The trust bundle needs periodic updates.
-- **Browser:** JavaScript has no real BigInt, and `Proxy` cannot wrap a function;
-  `Symbol`s are strings,
-  regular expressions still operate on UTF-8 bytes, and `eval` runs
-  in the global scope, so many modern web apps won't run. Layout is an
+- **Browser:** JavaScript's `Proxy` cannot wrap a function, `eval` runs
+  in the global scope, and regular expressions have no `\q{}` string sets or Unicode
+  case folding beyond simple folding, so some modern web apps won't run. Layout is an
   approximation: the scroll bars of boxes lie over their contents instead of making room
   (text can end up under them), and boxes with `overflow` that are table cells, or `<body>` and
   `<html>`, do not clip or scroll; text selection and `getBoundingClientRect()` account for nested box scrolling,
   while geometry for some positioned boxes is approximate; background `space` and `round`
-  still repeat, and `local` attachments do not track inner scrolling; `z-index` only orders absolute and fixed boxes, `sticky` works
-  against the window only. CSS 2D translate, scale, rotate, skew and matrix transforms
-  support origins, nesting, painting, hit testing and visual geometry; 3D transforms,
-  CSS `transition`s and CSS animations are ignored (Web Animations has a limited
-  numeric/color interpolator). Transform scratch rendering is bounded to four million
+  still repeat, and `local` attachments do not track inner scrolling; a positioned inline (a `<span>`)
+  does not get a layer of its own, and `opacity` fades each item on its own rather than the group;
+  `sticky` works against the window only. CSS 2D translate, scale, rotate, skew and matrix transforms
+  support origins, nesting, painting, hit testing and visual geometry; 3D transforms are
+  ignored. CSS transitions and `@keyframes` animations run on colors, lengths, opacity,
+  transforms with matching functions, shadows and the box properties (not on pseudo-elements,
+  and not on discrete properties such as `display`); each frame restyles only what moves. Transform scratch rendering is bounded to four million
   source pixels per item. `structuredClone` copies buffers, typed views and blobs,
   preserving shared references; ownership transfer is not implemented. `CSS.escape`
   handles identifier serialization, including Unicode and selector round trips.
@@ -989,11 +1003,15 @@ cannot be used.
   parses event streams and reconnects. Each page uses up to four request workers.
   Fetch does not yet pause network delivery when a stream queue fills. BYOB/byte-stream
   controllers are missing. WebP animations show their first frame; SVG ignores clip paths,
-  masks, filters and patterns. Workers, IndexedDB and cross-window messaging remain missing;
+  masks, filters and patterns. Workers remain missing; IndexedDB keeps each database in memory
+  and writes it whole when a transaction that changed it completes (fine for megabytes, not
+  hundreds of them). Windows reach each other only through `postMessage`, `closed`, `close()` and
+  `location`: a same-origin popup's `document` cannot be touched.
   Web Crypto encryption, asymmetric keys and key derivation are missing. There are
   downloadable TrueType/OpenType, WOFF and WOFF2 fonts, but no complex-script
   shaping or complete bidirectional text support; the built-in fonts cover Latin
-  Extended, Greek, Cyrillic and common punctuation. Other characters show as `?`. Connections are kept per
+  Extended, Greek, Cyrillic and common punctuation, Noto fonts most other scripts and CJK, and
+  color emoji are single characters (skin tones, ZWJ families and flags show their parts). Connections are kept per
   window, not shared between them, and the cache is for the browser only (wget
   does not use it).
 - **Graphics:** only the 3dfx and Radeon drivers set modes (others keep the BIOS

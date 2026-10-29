@@ -26,7 +26,17 @@ struct jshost {
     void (*scroll_pos)(void *ctx, int *x, int *y);
     void (*viewport)(void *ctx, int *w, int *h);
     void (*set_title)(void *ctx, const char *title);
-    void (*open_tab)(void *ctx, const char *url);
+    /* window.open: a new tab, opened after the script returns; the id it will have (0: none). */
+    int (*open_tab)(void *ctx, const char *url, int noopener);
+    /* Other windows (tabs, popups and frames), by id (0: this one), for window proxies.
+     * what: "self" (this window's id), "alive", "opener", "parent", "top" (ids, 0 for none),
+     * "frames" (how many), "frame" (the id of the window in iframe node), "href" (into out:
+     * 1, or -1 if it is not of this origin). */
+    int (*window_query)(void *ctx, int wid, const char *what, struct node *node, char *out, int size);
+    /* postMessage to a window: data serialized; it gets it if its origin is target_origin ("*" any, "/" ours). */
+    void (*window_post)(void *ctx, int wid, const char *data, int len, const char *target_origin);
+    void (*window_close)(void *ctx, int wid);
+    void (*window_navigate)(void *ctx, int wid, const char *url);
     void (*load_script)(void *ctx, struct node *script, const char *url);
     void (*load_image)(void *ctx, struct node *img);
     /* The element's border box in page coordinates; 0 if it has none. */
@@ -89,6 +99,8 @@ void jsdom_traverse(struct jsdom *d, int id, const char *old_url, const char *ne
 /* An event for an element, dispatched soon (after the running script): an image,
  * script or style sheet's load or error. */
 void jsdom_queue_event(struct jsdom *d, struct node *n, const char *type);
+/* A message another window (or this one) posted: a MessageEvent soon, from window source_wid. */
+void jsdom_message(struct jsdom *d, const char *data, int len, const char *origin, int source_wid);
 /* A page-level event: "beforeunload" and "pagehide" (the page is being left), "visibilitychange"
  * (hidden: the window was minimized, or has come back). */
 void jsdom_page_event(struct jsdom *d, const char *type, int hidden);
@@ -98,6 +110,8 @@ void jsdom_layout_changed(struct jsdom *d);
 void jsdom_loaded(struct jsdom *d);
 /* Dispatch an event at target, bubbling; returns 1 if a handler called preventDefault. */
 int jsdom_dispatch(struct jsdom *d, struct node *target, const char *type);
+/* transitionrun/start/end/cancel (propertyName) and animationstart/iteration/end/cancel (animationName). */
+void jsdom_motion_event(struct jsdom *d, struct node *target, const char *type, const char *name, float elapsed);
 int jsdom_key_event(struct jsdom *d, struct node *target, const char *type, int keycode, const char *key);
 /* A mouse or pointer event at page point (x, y); related is the element the pointer left or entered. */
 int jsdom_mouse_event(struct jsdom *d, struct node *target, const char *type, int x, int y, int button,

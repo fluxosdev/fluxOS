@@ -99,8 +99,10 @@ struct lctx {
     int npend;
     int force_container;        /* the next block box places its absolute descendants itself */
     int abs_bw1;                /* an absolute box's stretched border-box width, plus 1; 0: none */
-    struct zrange { int from, to, z; } zr[64];   /* items of positioned boxes with a z-index */
-    int nzr;
+    /* Boxes that paint in a layer of their own (positioned, with a z-index, or a stacking
+     * context): their items, the first lead of them their own background. */
+    struct zlayer { int from, lead, to, z; uint8_t ctx; } *zl;
+    int nzl, zlcap;
 };
 
 static unsigned layout_gen;
@@ -168,7 +170,7 @@ static void add_hotspot(struct lctx *c, struct hotspot **arr, int *n, int *cap, 
     if (!na)
         return;
     *arr = na;
-    (*arr)[(*n)++] = (struct hotspot){ .x=x, .y=y, .w=w, .h=h, .node=node };
+    (*arr)[(*n)++] = (struct hotspot){ .x=x, .y=y, .w=w, .h=h, .at=c->lo->nitems, .node=node };
 }
 
 /* Groups are registered inside-out; indices survive display-list reordering. */
@@ -186,6 +188,41 @@ static void transform_register(struct lctx *c, struct node *n, struct mark from,
     for(int k=from.items;k<lo->nitems;k++)if(!lo->items[k].xf)lo->items[k].xf=(uint16_t)index;
     for(int k=from.links;k<lo->nlinks;k++)if(!lo->links[k].xf)lo->links[k].xf=(uint16_t)index;
     for(int k=from.controls;k<lo->ncontrols;k++)if(!lo->controls[k].xf)lo->controls[k].xf=(uint16_t)index;
+}
+
+/* opacity below 1: the items a box made show that much less (painted by paint_transformed). */
+static void opacity_register(struct lctx *c, struct node *n, struct mark from)
+{
+    int op = n->style->opacity;
+    if (op >= 255 || c->measuring)
+        return;
+    for (int k = from.items; k < c->lo->nitems; k++) {
+        int shown = (255 - c->lo->items[k].fade) * op / 255;
+        c->lo->items[k].fade = (uint8_t)(255 - shown);
+    }
+}
+
+/* After a box's items are out (from on; its own background up to lead): a layer of its own if it is
+ * positioned, has a z-index that applies, or starts a stacking context (apply_z_order sorts them). */
+static void layer_register(struct lctx *c, struct node *n, int from, int lead)
+{
+    const struct style *st = n->style;
+    if (c->measuring || st->display == D_NONE)
+        return;
+    const struct style *ps = n->parent ? n->parent->style : NULL;
+    int item_of_container = ps && (ps->inner == IN_FLEX || ps->inner == IN_GRID);
+    int z = st->z_set && (st->position != POS_STATIC || item_of_container);
+    int ctx = z || st->opacity < 255 || st->xf || st->position == POS_FIXED || st->position == POS_STICKY;
+    if (!ctx && st->position == POS_STATIC)
+        return;
+    if (from >= c->lo->nitems)
+        return;                         /* nothing to paint */
+    struct zlayer *zl = grow(c->a, c->zl, c->nzl, &c->zlcap, sizeof(*zl));
+    if (!zl)
+        return;
+    c->zl = zl;
+    zl[c->nzl++] = (struct zlayer){ from, lead < from ? from : lead, c->lo->nitems, z ? st->z_index : 0,
+                                    (uint8_t)ctx };
 }
 
 static void add_anchor(struct lctx *c, const char *name, int y)
@@ -1661,6 +1698,8 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
     if (ctrl)
         add_hotspot(c, &c->lo->controls, &c->lo->ncontrols, &c->lo->controlcap, n, d->x, d->y, w, h);
     transform_register(c,n,transform_start,bx,by,bw,bh);
+    opacity_register(c,n,transform_start);
+    layer_register(c,n,transform_start.items,c->lo->nitems);
 }
 
 /* An inline-block (or float, or flex item) with its margin box at (0, 0). */
@@ -2590,8 +2629,6 @@ static void layout_abs(struct lctx *c, const struct pend *p, int cbx, int cby, i
     if (!ta && !ba && st->height.unit != U_AUTO && st->margin[0].unit == U_AUTO && st->margin[2].unit == U_AUTO)
         y = cby + t + (cbh - t - bo - oh) / 2;
     shift(c, m0, mark_now(c), x, y);
-    if (st->z_set && st->z_index != 0 && c->nzr < (int)(sizeof(c->zr) / sizeof(c->zr[0])))
-        c->zr[c->nzr++] = (struct zrange){ m0.items, c->lo->nitems, st->z_index };
     if (st->position == POS_FIXED && viewport_fixed)      /* it stays where it is in the window as the page scrolls */
         dyn_register(c, m0, 1, x, y, ow, oh, st, NULL);
 }
@@ -2750,7 +2787,10 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
         };
         sbox_register(c, n, bx, y, bw, bh, rg, 2);
     }
-    if (!bg_slot) transform_register(c,n,m_start,bx,y,bw,bh);
+    if (!bg_slot) {
+        transform_register(c,n,m_start,bx,y,bw,bh);
+        opacity_register(c,n,m_start);
+    }
     if (st->position == POS_RELATIVE && !bg_slot) {
         int dx = st->left.unit != U_AUTO ? len_px(st->left, cw) : st->right.unit != U_AUTO ? -len_px(st->right, cw) : 0;
         int dy = st->top.unit != U_AUTO ? len_px(st->top, 0) : st->bottom.unit != U_AUTO ? -len_px(st->bottom, 0) : 0;
@@ -2765,6 +2805,8 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
         (st->top.unit != U_AUTO || st->bottom.unit != U_AUTO || st->left.unit != U_AUTO ||
          st->right.unit != U_AUTO))
         dyn_register(c, m_start, 0, bx, y, bw, bh, st, n->parent);
+    if (!bg_slot)
+        layer_register(c, n, m_start.items, mc0.items);
     return bh;
 }
 
@@ -3058,6 +3100,21 @@ static void item_place(struct lctx *c, struct fitem *it, int x, int y, int h)
     struct node *link = enclosing_link(it->n);
     if (link)
         add_hotspot(c, &c->lo->links, &c->lo->nlinks, &c->lo->linkcap, link, x, y, it->bw, h);
+    /* Its own transform, opacity and layer (its box was laid out as a whole, then moved here). */
+    transform_register(c, it->n, it->m0, x, y, it->bw, h);
+    opacity_register(c, it->n, it->m0);
+    int lead = it->m0.items;
+    if (it->slot >= 0 && it->slot == lead) {
+        lead++;
+        if (lead < it->m1.items && c->lo->items[lead].kind == DK_BGIMG)
+            lead++;
+    }
+    if (it->m1.items <= c->lo->nitems) {
+        int saved = c->lo->nitems;      /* the layer ends where the item does */
+        c->lo->nitems = it->m1.items;
+        layer_register(c, it->n, it->m0.items, lead);
+        c->lo->nitems = saved;
+    }
 }
 
 /* A row item's flex base size and limits (content box widths). */
@@ -4445,55 +4502,213 @@ static int layout_table(struct lctx *c, struct node *n, int x, int y, int cw, in
     free(row_slot);
     free(colmin), free(cells), free(rows), free(caps);
     transform_register(c,n,transform_start,bx,y,bw,bh);
+    opacity_register(c,n,transform_start);
+    layer_register(c,n,transform_start.items,transform_start.items);
     return bh;
 }
 
 /* ---- the document ---- */
 
-/* Paint order: boxes with a negative z-index first, then the rest in document order, then positive ones. */
+/*
+ * Paint order (CSS 2.1 appendix E, simplified). The layers form a tree by
+ * their item ranges; a layer that is not a stacking context (a positioned
+ * box with z-index: auto) hands its own sub-layers up to the context it is
+ * in. Each context paints its own background, then its sub-layers with a
+ * negative z-index, then its other items in document order, then the
+ * sub-layers with z-index auto or 0 in document order, then the positive
+ * ones, lowest first; every sub-layer that is a context paints the same way.
+ */
+struct zsort {
+    const struct zlayer *zl;
+    int *parent, *ctxp;         /* each layer's enclosing layer, and enclosing context (-1: the page) */
+    int *owner;                 /* scratch: the sub-layer an item is in, for the context being sorted */
+    int *out, nout;
+    int n;
+};
+
+static void z_paint(struct zsort *z, int ctx, int from, int lead, int to);
+
+/* The stacking-context sub-layers of ctx with z-indexes in [lo, hi], lowest first, document
+ * order among equals (flat layers are always z-index 0). */
+static void z_kids(struct zsort *z, int *kids, int nk, int lo, int hi)
+{
+    for (int pass = 0; pass < nk; pass++) {
+        int best = -1;
+        for (int k = 0; k < nk; k++) {
+            int i = kids[k];
+            if (i < 0 || z->zl[i].z < lo || z->zl[i].z > hi || !z->zl[i].ctx)
+                continue;
+            if (best < 0 || z->zl[i].z < z->zl[kids[best]].z)
+                best = k;
+        }
+        if (best < 0)
+            return;
+        int i = kids[best];
+        kids[best] = -1;
+        z_paint(z, i, z->zl[i].from, z->zl[i].lead, z->zl[i].to);
+    }
+}
+
+static void z_paint(struct zsort *z, int ctx, int from, int lead, int to)
+{
+    int nk = 0;
+    for (int i = 0; i < z->n; i++)
+        nk += z->ctxp[i] == ctx;
+    int *kids = malloc(sizeof(int) * (size_t)(nk ? nk : 1));
+    int *flow = malloc(sizeof(int) * (size_t)(to - lead > 0 ? to - lead : 1));
+    if (!kids || !flow) {
+        free(kids);
+        free(flow);
+        for (int t = from; t < to; t++)
+            z->out[z->nout++] = t;
+        return;
+    }
+    nk = 0;
+    for (int i = 0; i < z->n; i++)      /* in document order: the layers are sorted by from */
+        if (z->ctxp[i] == ctx)
+            kids[nk++] = i;
+    /* Which sub-layer each item is in (the innermost); outer ones are earlier in the list. */
+    for (int t = from; t < to; t++)
+        z->owner[t] = -1;
+    for (int k = 0; k < nk; k++)
+        for (int t = z->zl[kids[k]].from; t < z->zl[kids[k]].to; t++)
+            z->owner[t] = kids[k];
+    int nflow = 0;
+    for (int t = lead; t < to; t++)
+        if (z->owner[t] < 0)
+            flow[nflow++] = t;
+    int *flat = malloc(sizeof(int) * (size_t)(nk ? nk : 1)), nflat = 0;
+    for (int t = from; t < lead; t++)   /* its own background */
+        z->out[z->nout++] = t;
+    if (flat) {
+        /* Remember the flat layers' items now: the contexts painted below reuse owner. */
+        for (int k = 0; k < nk; k++)
+            if (!z->zl[kids[k]].ctx)
+                flat[nflat++] = kids[k];
+    }
+    int *flat_items = NULL, *flat_at = NULL;
+    if (nflat) {
+        flat_at = malloc(sizeof(int) * (size_t)(nflat + 1));
+        int total = 0;
+        for (int f = 0; f < nflat; f++)
+            for (int t = z->zl[flat[f]].from; t < z->zl[flat[f]].to; t++)
+                total += z->owner[t] == flat[f];
+        flat_items = malloc(sizeof(int) * (size_t)(total ? total : 1));
+        if (flat_at && flat_items) {
+            int at = 0;
+            for (int f = 0; f < nflat; f++) {
+                flat_at[f] = at;
+                for (int t = z->zl[flat[f]].from; t < z->zl[flat[f]].to; t++)
+                    if (z->owner[t] == flat[f])
+                        flat_items[at++] = t;
+            }
+            flat_at[nflat] = at;
+        }
+    }
+    z_kids(z, kids, nk, -0x7fffffff, -1);
+    for (int f = 0; f < nflow; f++)
+        z->out[z->nout++] = flow[f];
+    /* z-index auto and 0, in document order: contexts and flat layers alike. */
+    for (int k = 0; k < nk; k++) {
+        int i = kids[k];
+        if (i < 0 || z->zl[i].z != 0)
+            continue;
+        kids[k] = -1;
+        if (z->zl[i].ctx) {
+            z_paint(z, i, z->zl[i].from, z->zl[i].lead, z->zl[i].to);
+            continue;
+        }
+        for (int f = 0; f < nflat && flat_at && flat_items; f++)
+            if (flat[f] == i)
+                for (int t = flat_at[f]; t < flat_at[f + 1]; t++)
+                    z->out[z->nout++] = flat_items[t];
+    }
+    z_kids(z, kids, nk, 1, 0x7fffffff);
+    free(flat_items);
+    free(flat_at);
+    free(flat);
+    free(flow);
+    free(kids);
+}
+
+static int zl_cmp(const void *a, const void *b)
+{
+    const struct zlayer *x = a, *y = b;
+    if (x->from != y->from)
+        return x->from < y->from ? -1 : 1;
+    return x->to > y->to ? -1 : x->to < y->to;  /* the outer one first */
+}
+
 static void apply_z_order(struct lctx *c)
 {
     struct layout *lo = c->lo;
-    if (!c->nzr)
+    int n = c->nzl;
+    if (!n || !lo->nitems)
         return;
-    struct ditem *out = arena_alloc(c->a, sizeof(struct ditem) * (size_t)(lo->nitems ? lo->nitems : 1));
-    char *taken = arena_alloc(c->a, (size_t)lo->nitems + 1);
-    int *order = arena_alloc(c->a, sizeof(int) * (size_t)c->nzr);
-    if (!out || !taken || !order)
-        return;
-    int n = 0, no = 0;
-    for (int i = 0; i < c->nzr; i++) {          /* outermost ranges only */
-        int nested = 0;
-        for (int j = 0; j < c->nzr && !nested; j++)
-            nested = j != i && c->zr[j].from <= c->zr[i].from && c->zr[i].to <= c->zr[j].to &&
-                     (c->zr[j].from < c->zr[i].from || c->zr[i].to < c->zr[j].to || j < i);
-        if (!nested && c->zr[i].to > c->zr[i].from)
-            order[no++] = i;
+    struct zlayer *zl = c->zl;
+    /* Registered inside out: for equal ranges the later is the outer box. Then by position. */
+    for (int i = 0; i < n / 2; i++) {
+        struct zlayer t = zl[i];
+        zl[i] = zl[n - 1 - i];
+        zl[n - 1 - i] = t;
     }
-    for (int i = 1; i < no; i++) {              /* by z, keeping document order among equals */
-        int t = order[i], j = i;
-        while (j > 0 && c->zr[order[j - 1]].z > c->zr[t].z) {
-            order[j] = order[j - 1];
-            j--;
+    for (int i = 1; i < n; i++)         /* stable insertion sort */
+        for (int j = i; j > 0 && zl_cmp(&zl[j - 1], &zl[j]) > 0; j--) {
+            struct zlayer t = zl[j];
+            zl[j] = zl[j - 1];
+            zl[j - 1] = t;
         }
-        order[j] = t;
+    struct zsort z = { zl, malloc(sizeof(int) * (size_t)n), malloc(sizeof(int) * (size_t)n),
+                       malloc(sizeof(int) * (size_t)lo->nitems), malloc(sizeof(int) * (size_t)lo->nitems), 0, 0 };
+    int *stack = malloc(sizeof(int) * (size_t)n), depth = 0;
+    struct ditem *copy = malloc(sizeof(struct ditem) * (size_t)lo->nitems);
+    if (!z.parent || !z.ctxp || !z.owner || !z.out || !stack || !copy)
+        goto done;
+    /* The tree: each layer's parent is the innermost earlier one containing it. Overlaps that do
+     * not nest (which layout should not make) are dropped. */
+    int kept = 0;
+    for (int i = 0; i < n; i++) {
+        if (zl[i].to > lo->nitems || zl[i].from >= zl[i].to)
+            continue;
+        while (depth && zl[stack[depth - 1]].to <= zl[i].from)
+            depth--;
+        if (depth && zl[stack[depth - 1]].to < zl[i].to)
+            continue;
+        zl[kept] = zl[i];
+        z.parent[kept] = depth ? stack[depth - 1] : -1;
+        stack[depth++] = kept++;
     }
-    for (int k = 0; k < no; k++)
-        for (int i = c->zr[order[k]].from; i < c->zr[order[k]].to; i++)
-            taken[i] = 1;
-    for (int k = 0; k < no; k++)
-        if (c->zr[order[k]].z < 0)
-            for (int i = c->zr[order[k]].from; i < c->zr[order[k]].to && n < lo->nitems; i++)
-                out[n++] = lo->items[i];
-    for (int i = 0; i < lo->nitems; i++)
-        if (!taken[i] && n < lo->nitems)
-            out[n++] = lo->items[i];
-    for (int k = 0; k < no; k++)
-        if (c->zr[order[k]].z > 0)
-            for (int i = c->zr[order[k]].from; i < c->zr[order[k]].to && n < lo->nitems; i++)
-                out[n++] = lo->items[i];
-    if (n == lo->nitems)
-        memcpy(lo->items, out, sizeof(struct ditem) * (size_t)n);
+    z.n = n = kept;
+    for (int i = 0; i < n; i++) {
+        int p = z.parent[i];
+        while (p >= 0 && !zl[p].ctx)
+            p = z.parent[p];
+        z.ctxp[i] = p;
+    }
+    z_paint(&z, -1, 0, 0, lo->nitems);
+    if (z.nout == lo->nitems) {
+        memcpy(copy, lo->items, sizeof(struct ditem) * (size_t)lo->nitems);
+        for (int i = 0; i < z.nout; i++) {
+            lo->items[i] = copy[z.out[i]];
+            z.owner[z.out[i]] = i;      /* now: where each item went */
+        }
+        /* Links and controls go up and down with the items painted before them. */
+        struct hotspot *lists[2] = { lo->links, lo->controls };
+        int counts[2] = { lo->nlinks, lo->ncontrols };
+        for (int l = 0; l < 2; l++)
+            for (int k = 0; k < counts[l]; k++) {
+                int at = lists[l][k].at;
+                if (at > 0 && at <= lo->nitems)
+                    lists[l][k].at = z.owner[at - 1] + 1;
+            }
+    }
+done:
+    free(copy);
+    free(stack);
+    free(z.parent);
+    free(z.ctxp);
+    free(z.owner);
+    free(z.out);
 }
 
 void layout_document(struct arena *a, struct layout *lo, struct node *root, int vw, int vh)
@@ -4694,11 +4909,13 @@ int layout_box_contains(const struct layout *lo,int xf,int dyn,int sb,struct rec
 
 const struct hotspot *layout_hit(const struct layout *lo,const struct hotspot *h,int n,int x,int y,int sx,int sy)
 {
+    int best=-1;                        /* the one painted on top, the later of equals */
     for(int i=n-1;i>=0;i--) {
         if(h[i].node && h[i].node->style && h[i].node->style->pointer_none)continue;
-        if(layout_box_contains(lo,h[i].xf,h[i].dyn,h[i].sb,mkrect(h[i].x,h[i].y,h[i].w,h[i].h),x,y,sx,sy))return &h[i];
+        if(best>=0 && h[i].at<=h[best].at)continue;
+        if(layout_box_contains(lo,h[i].xf,h[i].dyn,h[i].sb,mkrect(h[i].x,h[i].y,h[i].w,h[i].h),x,y,sx,sy))best=i;
     }
-    return NULL;
+    return best>=0?&h[best]:NULL;
 }
 
 /* ---- painting ---- */
@@ -5887,16 +6104,18 @@ void layout_paint_surface(const struct layout *lo,const struct ditem *item,const
 
 /* Two matte renders recover premultiplied color/coverage from the existing RGB
  * painters, including antialiased text and translucent images. This keeps the
- * desktop's RGB surface ABI unchanged and leaves holes in rotated items clear. */
+ * desktop's RGB surface ABI unchanged and leaves holes in rotated items clear.
+ * Items of boxes with opacity come this way too, and are put down that much fainter. */
 static void paint_transformed(const struct layout *lo,const struct ditem *item,struct surface *dst,
                               int ox,int oy,int sx,int sy,const struct node *focus,int caret_on,int item_index)
 {
     struct affine m=transform_matrix(lo,item->xf,sx,sy),inv;
     if(!inverse_matrix(m,&inv))return; /* scale(0), including singular matrices, paints nothing */
     struct ditem d=*item;int dx=0,dy=0,bx=0,by=0;
+    unsigned shown=255u-item->fade;
     if(d.dyn)layout_dyn_offset(lo,d.dyn,sx,sy,&dx,&dy);
     if(d.sb)layout_sb_view(lo,d.sb,sx,sy,&bx,&by,NULL);
-    d.x+=dx+bx;d.y+=dy+by;d.xf=d.sb=d.dyn=0;
+    d.x+=dx+bx;d.y+=dy+by;d.xf=d.sb=d.dyn=d.fade=0;
     int pad=8+abs(d.sh_x)+abs(d.sh_y)+d.sh_blur;
     if(pad>512)pad=512;
     struct rect source=mkrect(d.x-pad,d.y-pad,d.w+2*pad,d.h+2*pad);
@@ -5931,10 +6150,11 @@ static void paint_transformed(const struct layout *lo,const struct ditem *item,s
         int clear=(int)(w>>16&255)-(int)(b>>16&255);
         if(clear<0)clear=0;
         if(clear>255)clear=255;
+        if(shown<255)clear=255-(int)(((unsigned)(255-clear)*shown+127)/255);
         if(clear==255)continue;
         uint32_t *out=&dst->px[(y-sy+oy)*dst->stride+x-sx+ox],under=*out,result=0;
         for(int shift=0;shift<=16;shift+=8) {
-            unsigned channel=(b>>shift&255)+((under>>shift&255)*(unsigned)clear+127)/255;
+            unsigned channel=((b>>shift&255)*shown+127)/255+((under>>shift&255)*(unsigned)clear+127)/255;
             if(channel>255)channel=255;
             result|=channel<<shift;
         }
@@ -5954,6 +6174,10 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
     for (int i = 0; i < lo->nitems; i++) {
         const struct ditem *d = &lo->items[i];
         struct ditem translated;
+        if(d->fade) {
+            paint_transformed(lo,d,s,ox,oy,sx,sy,focus,caret_on,i);
+            continue;
+        }
         if(d->xf) {
             struct affine m=transform_matrix(lo,d->xf,sx,sy);
             /* Common integer translations retain the existing direct paint path. */

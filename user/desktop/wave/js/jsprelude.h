@@ -236,7 +236,6 @@ static const char js_core[] = JS_SOURCE(
     }
     return o;
   });
-  def(String.prototype, "normalize", function () { return String(this); });
   /* strings are UTF-8 here: there are no lone surrogates */
   def(String.prototype, "isWellFormed", function () { return true; });
   def(String.prototype, "toWellFormed", function () { return String(this); });
@@ -375,7 +374,7 @@ static const char js_chunk_weak[] = JS_SOURCE(
   var def = g["%def"], listIter = g["%iter"], lz = g["%lazy"], ITER = Symbol.iterator;
   /* ---- Reflect, weak collections, errors ---- */
   lz("Reflect", {
-    ownKeys: function (o) { return Object.getOwnPropertyNames(o); },
+    ownKeys: function (o) { return Object.getOwnPropertyNames(o).concat(Object.getOwnPropertySymbols(o)); },
     has: function (o, k) { return k in o; },
     get: function (o, k) { return o[k]; },
     set: function (o, k, v) { o[k] = v; return true; },
@@ -1891,19 +1890,727 @@ static const char js_chunk_web[] = JS_SOURCE(
     get bottom() { return Math.max(this.y, this.y + this.height); }
     static fromRect(r) { r = r || {}; return new DOMRect(r.x, r.y, r.width, r.height); }
   }
-  function postMessage(data) {
-    setTimeout(function () {
-      var e = new Event("message");
-      e.data = data;
-      e.origin = location.origin;
-      window.dispatchEvent(e);
-    }, 0);
-  }
   lz("TextEncoder", TextEncoder); lz("TextDecoder", TextDecoder); lz("crypto", crypto);
   lz("Blob", Blob); lz("FormData", FormData); lz("DOMParser", DOMParser);
   lz("File", File); lz("FileList", FileList); lz("FileReader", FileReader);
   lz("customElements", customElements); lz("CSS", CSS);
-  lz("Notification", Notification); lz("DOMRect", DOMRect); lz("postMessage", postMessage);
+  lz("Notification", Notification); lz("DOMRect", DOMRect);
+})(globalThis);
+);
+
+static const char js_chunk_idb[] = JS_SOURCE(
+(function (g) {
+  var def = g["%def"], lz = g["%lazy"];
+  /* ---- IndexedDB. A database lives in memory here, loaded from the store of the browser the first
+     time it is opened and written back whole when a transaction that changed it completes
+     (%idb). Records are kept sorted by key; values are structured clones (%serialize). ---- */
+  var ser = g["%serialize"], deser = g["%deserialize"], disk = g["%idb"];
+  function err(name, msg) { return new DOMException(msg || name, name); }
+
+  /* ---- keys: numbers, dates, strings, binary and arrays, in that order ---- */
+  function keyType(k) {
+    if (typeof k === "number") return k === k ? 1 : 0;
+    if (k instanceof Date) return k.getTime() === k.getTime() ? 2 : 0;
+    if (typeof k === "string") return 3;
+    if (k instanceof ArrayBuffer || ArrayBuffer.isView(k)) return 4;
+    if (Array.isArray(k)) return 5;
+    return 0;
+  }
+  function validKey(k, seen) {
+    var t = keyType(k);
+    if (t !== 5) return t > 0;
+    seen = seen || [];
+    if (seen.indexOf(k) >= 0) return false;
+    seen.push(k);
+    for (var i = 0; i < k.length; i++) if (!(i in k) || !validKey(k[i], seen)) return false;
+    return true;
+  }
+  function bin(k) { return k instanceof ArrayBuffer ? new Uint8Array(k) : new Uint8Array(k.buffer, k.byteOffset, k.byteLength); }
+  function copyKey(k) {
+    var t = keyType(k);
+    if (t === 2) return new Date(k.getTime());
+    if (t === 4) return bin(k).slice().buffer;
+    if (t === 5) return k.map(copyKey);
+    return k;
+  }
+  function cmp(a, b) {
+    var ta = keyType(a), tb = keyType(b);
+    if (!ta || !tb) throw err("DataError", "The parameter is not a valid key.");
+    if (ta !== tb) return ta < tb ? -1 : 1;
+    switch (ta) {
+    case 2: a = a.getTime(); b = b.getTime(); break;
+    case 4: {
+      var p = bin(a), q = bin(b), n = Math.min(p.length, q.length);
+      for (var i = 0; i < n; i++) if (p[i] !== q[i]) return p[i] < q[i] ? -1 : 1;
+      a = p.length; b = q.length;
+      break;
+    }
+    case 5:
+      for (var j = 0; j < a.length && j < b.length; j++) { var c = cmp(a[j], b[j]); if (c) return c; }
+      a = a.length; b = b.length;
+      break;
+    }
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
+  function checkKey(k) { if (!validKey(k)) throw err("DataError", "The parameter is not a valid key."); return copyKey(k); }
+
+  /* ---- key paths: "a.b.c", or a list of them for an array key ---- */
+  function evalPath(v, path) {
+    if (Array.isArray(path)) {
+      var out = [];
+      for (var i = 0; i < path.length; i++) { var k = evalPath(v, path[i]); if (k === undefined) return undefined; out.push(k); }
+      return out;
+    }
+    if (path === "") return v;
+    var parts = path.split(".");
+    for (var j = 0; j < parts.length; j++) {
+      if (v === null || v === undefined) return undefined;
+      if (typeof v === "string" && parts[j] === "length") v = v.length;
+      else if (typeof v !== "object" || !(parts[j] in v)) return undefined;
+      else v = v[parts[j]];
+    }
+    return v;
+  }
+  function injectKey(v, path, key) {
+    var parts = path.split("."), o = v;
+    for (var i = 0; i < parts.length - 1; i++) {
+      if (o[parts[i]] === undefined) o[parts[i]] = {};
+      o = o[parts[i]];
+      if (typeof o !== "object" || o === null) throw err("DataError", "The key path cannot be set.");
+    }
+    o[parts[parts.length - 1]] = key;
+  }
+
+  class IDBKeyRange {
+    constructor(lower, upper, lowerOpen, upperOpen) {
+      this.lower = lower; this.upper = upper; this.lowerOpen = !!lowerOpen; this.upperOpen = !!upperOpen;
+    }
+    static only(k) { k = checkKey(k); return new IDBKeyRange(k, k, false, false); }
+    static lowerBound(k, open) { return new IDBKeyRange(checkKey(k), undefined, open, true); }
+    static upperBound(k, open) { return new IDBKeyRange(undefined, checkKey(k), true, open); }
+    static bound(lo, hi, lowerOpen, upperOpen) {
+      lo = checkKey(lo); hi = checkKey(hi);
+      var c = cmp(lo, hi);
+      if (c > 0 || (c === 0 && (lowerOpen || upperOpen))) throw err("DataError", "The lower bound is above the upper.");
+      return new IDBKeyRange(lo, hi, lowerOpen, upperOpen);
+    }
+    includes(k) { return inRange(this, checkKey(k)); }
+  }
+  function toRange(q) {
+    if (q === undefined || q === null) return null;
+    return q instanceof IDBKeyRange ? q : IDBKeyRange.only(q);
+  }
+  function inRange(r, k) {
+    if (!r) return true;
+    if (r.lower !== undefined) { var c = cmp(k, r.lower); if (c < 0 || (c === 0 && r.lowerOpen)) return false; }
+    if (r.upper !== undefined) { var d = cmp(k, r.upper); if (d > 0 || (d === 0 && r.upperOpen)) return false; }
+    return true;
+  }
+
+  /* Sorted lists: records { k, v } by key; index entries { k, p } by key, then primary key. */
+  function entryCmp(a, ak, ap) { var c = cmp(a.k, ak); return c || ap === undefined ? c : cmp(a.p, ap); }
+  function lowerBoundOf(list, k, p) {          /* the first entry at or after (k, p) */
+    var lo = 0, hi = list.length;
+    while (lo < hi) { var mid = (lo + hi) >> 1; if (entryCmp(list[mid], k, p) < 0) lo = mid + 1; else hi = mid; }
+    return lo;
+  }
+  function insertSorted(list, e) { list.splice(lowerBoundOf(list, e.k, e.p), 0, e); }
+
+  /* ---- events, with bubbling from a request to its transaction and database ---- */
+  class Target {
+    addEventListener(t, f) {
+      if (!f) return;
+      var all = this._l || (this._l = {}), l = all[t] || (all[t] = []);
+      if (l.indexOf(f) < 0) l.push(f);
+    }
+    removeEventListener(t, f) { var l = this._l && this._l[t]; if (l && l.indexOf(f) >= 0) l.splice(l.indexOf(f), 1); }
+    dispatchEvent(e) { return fire([this], e); }
+  }
+  function makeEvent(type, bubbles, cancelable, extra) {
+    var e = typeof Event === "function" ? new Event(type, { bubbles: bubbles, cancelable: cancelable }) :
+      { type: type, bubbles: bubbles, cancelable: cancelable, defaultPrevented: false,
+        preventDefault: function () { this.defaultPrevented = true; }, stopPropagation: function () { this.cancelBubble = true; } };
+    if (extra) for (var k in extra) e[k] = extra[k];
+    return e;
+  }
+  var handlerError;
+  function fire(path, e) {
+    var target = path[0];
+    try { e.target = target; e.srcElement = target; } catch (x) {}
+    for (var i = 0; i < path.length; i++) {
+      var t = path[i];
+      if (!t) continue;
+      try { e.currentTarget = t; } catch (x) {}
+      var fns = [], h = t["on" + e.type];
+      if (typeof h === "function") fns.push(h);
+      if (t._l && t._l[e.type]) fns = fns.concat(t._l[e.type]);
+      for (var j = 0; j < fns.length; j++) {
+        try { typeof fns[j] === "function" ? fns[j].call(t, e) : fns[j].handleEvent(e); }
+        catch (x) { handlerError = x; if (typeof reportError === "function") reportError(x); }
+      }
+      if (!e.bubbles || e.cancelBubble || e.__stopped) break;
+    }
+    return !e.defaultPrevented;
+  }
+
+  /* ---- the databases of this origin ---- */
+  var dbs = new Map();                          /* name: { name, version, stores: Map, conns: [] } */
+  function blankStore(name, keyPath, auto) {
+    return { name: name, keyPath: keyPath, autoIncrement: auto, current: 1, records: [], indexes: new Map() };
+  }
+  function blankIndex(name, keyPath, unique, multi) {
+    return { name: name, keyPath: keyPath, unique: unique, multiEntry: multi, entries: [] };
+  }
+  function indexKeys(ix, value) {
+    var k = evalPath(value, ix.keyPath);
+    if (k === undefined) return [];
+    if (ix.multiEntry && Array.isArray(k)) {
+      var out = [];
+      k.forEach(function (x) { if (validKey(x) && !out.some(function (y) { return cmp(x, y) === 0; })) out.push(copyKey(x)); });
+      return out;
+    }
+    return validKey(k) ? [copyKey(k)] : [];
+  }
+  function load(name) {
+    if (dbs.has(name)) return dbs.get(name);
+    var text = disk ? disk("load", name) : null, db = null;
+    if (text) {
+      try {
+        var saved = JSON.parse(text);
+        db = { name: name, version: saved.version, stores: new Map(), conns: [] };
+        saved.stores.forEach(function (s) {
+          var st = blankStore(s.name, s.keyPath, s.autoIncrement);
+          st.current = s.current;
+          st.records = s.records.map(function (r) { return { k: deser(r[0]), v: r[1] }; });
+          s.indexes.forEach(function (i) {
+            var ix = blankIndex(i.name, i.keyPath, i.unique, i.multiEntry);
+            st.records.forEach(function (r) {
+              indexKeys(ix, deser(r.v)).forEach(function (k) { insertSorted(ix.entries, { k: k, p: r.k }); });
+            });
+            st.indexes.set(i.name, ix);
+          });
+          db.stores.set(s.name, st);
+        });
+      } catch (x) { db = null; }
+    }
+    if (db) dbs.set(name, db);
+    return db;
+  }
+  function save(db) {
+    if (!disk) return;
+    var stores = [];
+    db.stores.forEach(function (st) {
+      var indexes = [];
+      st.indexes.forEach(function (ix) { indexes.push({ name: ix.name, keyPath: ix.keyPath, unique: ix.unique, multiEntry: ix.multiEntry }); });
+      stores.push({ name: st.name, keyPath: st.keyPath, autoIncrement: st.autoIncrement, current: st.current, indexes: indexes,
+                    records: st.records.map(function (r) { return [ser(r.k), r.v]; }) });
+    });
+    disk("save", db.name, JSON.stringify({ version: db.version, stores: stores }));
+  }
+  function names(map) {
+    var list = Array.from(map.keys()).sort();
+    list.contains = function (n) { return list.indexOf(n) >= 0; };
+    list.item = function (i) { return list[i] === undefined ? null : list[i]; };
+    return list;
+  }
+
+  /* ---- transactions: their requests run in order, a little after they are made; one that has
+     nothing more to do after that completes ---- */
+  var live = [], pumping = false;
+  function schedule() { if (!pumping) { pumping = true; setTimeout(pump, 0); } }
+  function pump() {
+    pumping = false;
+    live.slice().forEach(function (tx) {
+      if (tx._finished) return;
+      if (tx._queue.length) {
+        tx._quiet = false;
+        while (tx._queue.length && !tx._finished) run(tx, tx._queue.shift());
+      } else if (tx._quiet) {
+        finish(tx);
+      } else {
+        tx._quiet = true;
+      }
+    });
+    live = live.filter(function (tx) { return !tx._finished; });
+    if (live.length) schedule();
+  }
+  function run(tx, r) {
+    var req = r.req;
+    handlerError = undefined;
+    try {
+      req._result = r.op();
+      req._error = null;
+      req.readyState = "done";
+      fire([req], makeEvent("success", false, false));
+      if (handlerError !== undefined) abort(tx, err("AbortError", "An event handler threw."));
+    } catch (x) {
+      if (tx._finished) return;
+      req._result = undefined;
+      req._error = x instanceof DOMException ? x : err("UnknownError", String(x));
+      req.readyState = "done";
+      if (fire([req, tx, tx.db], makeEvent("error", true, true))) abort(tx, req._error);
+    }
+  }
+  function touch(tx, st) {                      /* keep what a store was, for an abort */
+    if (tx.mode === "readonly") throw err("ReadOnlyError", "The transaction is read-only.");
+    if (!tx._snap.has(st)) {
+      var idx = new Map();
+      st.indexes.forEach(function (ix, n) { idx.set(n, { ix: ix, entries: ix.entries.slice() }); });
+      tx._snap.set(st, { records: st.records.slice(), current: st.current, indexes: idx });
+    }
+    tx._dirty = true;
+  }
+  function finish(tx) {
+    tx._finished = true;
+    if (tx._dirty) save(tx.db._data);
+    fire([tx], makeEvent("complete", false, false));
+    if (tx._done) tx._done(true);
+  }
+  function abort(tx, why) {
+    if (tx._finished) return;
+    tx._finished = true;
+    tx.error = why || null;
+    tx._snap.forEach(function (s, st) {
+      st.records = s.records; st.current = s.current;
+      st.indexes = new Map();
+      s.indexes.forEach(function (x, n) { x.ix.entries = x.entries; st.indexes.set(n, x.ix); });
+    });
+    if (tx._schema) {                           /* a version change undone: the stores and version too */
+      tx.db._data.stores = tx._schema.stores;
+      tx.db._data.version = tx._schema.version;
+      if (tx._schema.created) dbs.delete(tx.db._data.name);
+    }
+    tx._queue.forEach(function (r) {
+      r.req._error = err("AbortError", "The transaction was aborted.");
+      r.req.readyState = "done";
+      fire([r.req, tx, tx.db], makeEvent("error", true, true));
+    });
+    tx._queue = [];
+    fire([tx, tx.db], makeEvent("abort", true, false));
+    if (tx._done) tx._done(false);
+  }
+
+  class IDBRequest extends Target {
+    constructor(source, tx) {
+      super();
+      this.source = source; this.transaction = tx; this.readyState = "pending";
+      this._result = undefined; this._error = null;
+      this.onsuccess = null; this.onerror = null;
+    }
+    get result() { return this._result; }
+    get error() { return this._error; }
+  }
+  class IDBOpenDBRequest extends IDBRequest {
+    constructor() { super(null, null); this.onupgradeneeded = null; this.onblocked = null; }
+  }
+  function request(tx, source, op) {
+    if (tx._finished) throw err("TransactionInactiveError", "The transaction has finished.");
+    var req = new IDBRequest(source, tx);
+    tx._queue.push({ req: req, op: op });
+    tx._quiet = false;
+    schedule();
+    return req;
+  }
+
+  class IDBTransaction extends Target {
+    constructor(db, scope, mode) {
+      super();
+      this.db = db; this.mode = mode; this.error = null; this.durability = "default";
+      this._scope = scope; this._queue = []; this._snap = new Map(); this._dirty = false;
+      this._finished = false; this._quiet = false;
+      this.oncomplete = null; this.onerror = null; this.onabort = null;
+      live.push(this);
+      schedule();
+    }
+    get objectStoreNames() {
+      var m = new Map();
+      (this.mode === "versionchange" ? Array.from(this.db._data.stores.keys()) : this._scope).forEach(function (n) { m.set(n, 1); });
+      return names(m);
+    }
+    objectStore(name) {
+      if (this._finished) throw err("InvalidStateError", "The transaction has finished.");
+      var st = this.db._data.stores.get(name);
+      if (!st || (this.mode !== "versionchange" && this._scope.indexOf(name) < 0))
+        throw err("NotFoundError", "No object store named " + name + ".");
+      return new IDBObjectStore(this, st);
+    }
+    abort() {
+      if (this._finished) throw err("InvalidStateError", "The transaction has finished.");
+      abort(this, null);
+    }
+    commit() { if (!this._finished && !this._queue.length) finish(this); }
+  }
+
+  /* What a store or an index has, between two keys, in a direction. */
+  function storeRange(st, range, dir, count) {
+    var out = [], list = st.records, i;
+    if (dir === "prev" || dir === "prevunique") {
+      for (i = list.length - 1; i >= 0 && (!count || out.length < count); i--) if (inRange(range, list[i].k)) out.push(list[i]);
+    } else {
+      i = range && range.lower !== undefined ? lowerBoundOf(list, range.lower) : 0;
+      for (; i < list.length && (!count || out.length < count); i++) {
+        if (range && range.upper !== undefined && cmp(list[i].k, range.upper) > (range.upperOpen ? -1 : 0)) break;
+        if (inRange(range, list[i].k)) out.push(list[i]);
+      }
+    }
+    return out;
+  }
+  function record(st, key) {
+    var i = lowerBoundOf(st.records, key);
+    return i < st.records.length && cmp(st.records[i].k, key) === 0 ? st.records[i] : null;
+  }
+  function removeRecord(st, key) {
+    var i = lowerBoundOf(st.records, key);
+    if (i >= st.records.length || cmp(st.records[i].k, key)) return false;
+    st.records.splice(i, 1);
+    st.indexes.forEach(function (ix) { ix.entries = ix.entries.filter(function (e) { return cmp(e.p, key) !== 0; }); });
+    return true;
+  }
+
+  class IDBObjectStore {
+    constructor(tx, st) { this.transaction = tx; this._st = st; }
+    get name() { return this._st.name; }
+    get keyPath() { return this._st.keyPath; }
+    get autoIncrement() { return this._st.autoIncrement; }
+    get indexNames() { return names(this._st.indexes); }
+    _write(value, key, add) {
+      var tx = this.transaction, st = this._st;
+      if (tx.mode === "readonly") throw err("ReadOnlyError", "The transaction is read-only.");
+      if (st.keyPath !== null && key !== undefined) throw err("DataError", "The store uses in-line keys.");
+      if (st.keyPath === null && !st.autoIncrement && key === undefined) throw err("DataError", "No key was given.");
+      if (key !== undefined) key = checkKey(key);
+      var text = ser(value), copy = deser(text);
+      if (st.keyPath !== null) {
+        var inline = evalPath(copy, st.keyPath);
+        if (inline !== undefined) key = checkKey(inline);
+        else if (!st.autoIncrement || Array.isArray(st.keyPath)) throw err("DataError", "The value has no key.");
+      }
+      var self = this;
+      return request(tx, this, function () {
+        touch(tx, st);
+        if (key === undefined) {
+          key = st.current++;
+          if (st.keyPath !== null) { injectKey(copy, st.keyPath, key); text = ser(copy); }
+        } else if (st.autoIncrement && typeof key === "number" && key >= st.current) {
+          st.current = Math.floor(key) + 1;
+        }
+        if (add && record(st, key)) throw err("ConstraintError", "A record with this key already exists.");
+        st.indexes.forEach(function (ix) {
+          if (!ix.unique) return;
+          indexKeys(ix, copy).forEach(function (k) {
+            var at = lowerBoundOf(ix.entries, k);
+            if (at < ix.entries.length && cmp(ix.entries[at].k, k) === 0 && cmp(ix.entries[at].p, key) !== 0)
+              throw err("ConstraintError", "The index " + ix.name + " is unique.");
+          });
+        });
+        removeRecord(st, key);
+        insertSorted(st.records, { k: key, v: text });
+        st.indexes.forEach(function (ix) { indexKeys(ix, copy).forEach(function (k) { insertSorted(ix.entries, { k: k, p: key }); }); });
+        return copyKey(key);
+      });
+    }
+    put(value, key) { return this._write(value, key, false); }
+    add(value, key) { return this._write(value, key, true); }
+    get(query) {
+      var st = this._st, range = toRange(query);
+      if (!range) throw err("DataError", "No key or key range was given.");
+      return request(this.transaction, this, function () { var r = storeRange(st, range, "next", 1)[0]; return r ? deser(r.v) : undefined; });
+    }
+    getKey(query) {
+      var st = this._st, range = toRange(query);
+      return request(this.transaction, this, function () { var r = storeRange(st, range, "next", 1)[0]; return r ? copyKey(r.k) : undefined; });
+    }
+    getAll(query, count) {
+      var st = this._st, range = toRange(query);
+      return request(this.transaction, this, function () { return storeRange(st, range, "next", count).map(function (r) { return deser(r.v); }); });
+    }
+    getAllKeys(query, count) {
+      var st = this._st, range = toRange(query);
+      return request(this.transaction, this, function () { return storeRange(st, range, "next", count).map(function (r) { return copyKey(r.k); }); });
+    }
+    count(query) {
+      var st = this._st, range = toRange(query);
+      return request(this.transaction, this, function () { return storeRange(st, range, "next").length; });
+    }
+    delete(query) {
+      var st = this._st, tx = this.transaction, range = toRange(query);
+      if (tx.mode === "readonly") throw err("ReadOnlyError", "The transaction is read-only.");
+      return request(tx, this, function () {
+        touch(tx, st);
+        storeRange(st, range, "next").forEach(function (r) { removeRecord(st, r.k); });
+        return undefined;
+      });
+    }
+    clear() {
+      var st = this._st, tx = this.transaction;
+      if (tx.mode === "readonly") throw err("ReadOnlyError", "The transaction is read-only.");
+      return request(tx, this, function () {
+        touch(tx, st);
+        st.records = [];
+        st.indexes.forEach(function (ix) { ix.entries = []; });
+        return undefined;
+      });
+    }
+    openCursor(query, dir) { return openCursor(this, toRange(query), dir || "next", true); }
+    openKeyCursor(query, dir) { return openCursor(this, toRange(query), dir || "next", false); }
+    index(name) {
+      var ix = this._st.indexes.get(name);
+      if (!ix) throw err("NotFoundError", "No index named " + name + ".");
+      return new IDBIndex(this, ix);
+    }
+    createIndex(name, keyPath, opts) {
+      var tx = this.transaction, st = this._st;
+      if (tx.mode !== "versionchange") throw err("InvalidStateError", "Indexes are made in a version change.");
+      if (st.indexes.has(name)) throw err("ConstraintError", "An index named " + name + " exists.");
+      opts = opts || {};
+      var ix = blankIndex(name, keyPath, !!opts.unique, !!opts.multiEntry);
+      touch(tx, st);
+      st.records.forEach(function (r) { indexKeys(ix, deser(r.v)).forEach(function (k) { insertSorted(ix.entries, { k: k, p: r.k }); }); });
+      if (ix.unique)
+        for (var i = 1; i < ix.entries.length; i++)
+          if (cmp(ix.entries[i - 1].k, ix.entries[i].k) === 0) { abort(tx, err("ConstraintError", "The index " + name + " is unique.")); break; }
+      st.indexes.set(name, ix);
+      return new IDBIndex(this, ix);
+    }
+    deleteIndex(name) {
+      if (this.transaction.mode !== "versionchange") throw err("InvalidStateError", "Indexes are removed in a version change.");
+      if (!this._st.indexes.delete(name)) throw err("NotFoundError", "No index named " + name + ".");
+    }
+  }
+
+  class IDBIndex {
+    constructor(store, ix) { this.objectStore = store; this._ix = ix; }
+    get name() { return this._ix.name; }
+    get keyPath() { return this._ix.keyPath; }
+    get unique() { return this._ix.unique; }
+    get multiEntry() { return this._ix.multiEntry; }
+    _range(query, count) {
+      var ix = this._ix, range = toRange(query), out = [];
+      for (var i = range && range.lower !== undefined ? lowerBoundOf(ix.entries, range.lower) : 0; i < ix.entries.length; i++) {
+        if (count && out.length >= count) break;
+        if (range && range.upper !== undefined && cmp(ix.entries[i].k, range.upper) > (range.upperOpen ? -1 : 0)) break;
+        if (inRange(range, ix.entries[i].k)) out.push(ix.entries[i]);
+      }
+      return out;
+    }
+    get(query) {
+      var self = this, st = this.objectStore._st;
+      return request(this.objectStore.transaction, this, function () { var e = self._range(query, 1)[0], r = e && record(st, e.p); return r ? deser(r.v) : undefined; });
+    }
+    getKey(query) {
+      var self = this;
+      return request(this.objectStore.transaction, this, function () { var e = self._range(query, 1)[0]; return e ? copyKey(e.p) : undefined; });
+    }
+    getAll(query, count) {
+      var self = this, st = this.objectStore._st;
+      return request(this.objectStore.transaction, this, function () { return self._range(query, count).map(function (e) { return deser(record(st, e.p).v); }); });
+    }
+    getAllKeys(query, count) {
+      var self = this;
+      return request(this.objectStore.transaction, this, function () { return self._range(query, count).map(function (e) { return copyKey(e.p); }); });
+    }
+    count(query) {
+      var self = this;
+      return request(this.objectStore.transaction, this, function () { return self._range(query).length; });
+    }
+    openCursor(query, dir) { return openCursor(this, toRange(query), dir || "next", true); }
+    openKeyCursor(query, dir) { return openCursor(this, toRange(query), dir || "next", false); }
+  }
+
+  /* ---- cursors: each step finds the next entry after where the cursor is, in the data as it is now ---- */
+  class IDBCursor {
+    constructor(source, range, dir, req) {
+      this.source = source; this.direction = dir; this.request = req;
+      this._range = range; this._key = undefined; this._pk = undefined; this._got = false;
+    }
+    get key() { return copyKey(this._key); }
+    get primaryKey() { return copyKey(this._pk); }
+    _store() { return this.source instanceof IDBIndex ? this.source.objectStore : this.source; }
+    _step(target, targetPk, skip) {
+      var index = this.source instanceof IDBIndex, list = index ? this.source._ix.entries : this.source._st.records;
+      var back = this.direction.slice(0, 4) === "prev", unique = this.direction.slice(-6) === "unique";
+      var i, e, found = null;
+      for (i = back ? list.length - 1 : 0; back ? i >= 0 : i < list.length; i += back ? -1 : 1) {
+        e = list[i];
+        var pk = index ? e.p : e.k;
+        if (!inRange(this._range, e.k)) continue;
+        if (this._got) {
+          var c = cmp(e.k, this._key);
+          if (back ? c > 0 : c < 0) continue;
+          if (c === 0 && (unique || !index || (back ? cmp(pk, this._pk) >= 0 : cmp(pk, this._pk) <= 0))) continue;
+        }
+        if (target !== undefined) {
+          var t = cmp(e.k, target);
+          if (back ? t > 0 : t < 0) continue;
+          if (t === 0 && targetPk !== undefined && (back ? cmp(pk, targetPk) > 0 : cmp(pk, targetPk) < 0)) continue;
+        }
+        if (unique && back && found) {         /* prevunique: the first of a run of equal keys */
+          if (cmp(found.k, e.k) === 0) { found = e; continue; }
+          break;
+        }
+        found = e;
+        if (skip > 1) { skip--; this._key = e.k; this._pk = pk; this._got = true; found = null; continue; }
+        if (!(unique && back)) break;
+      }
+      if (!found) return null;
+      this._key = found.k;
+      this._pk = index ? found.p : found.k;
+      this._got = true;
+      if (this._withValue) { var r = record(this._store()._st, this._pk); this.value = r ? deser(r.v) : undefined; }
+      return this;
+    }
+    _again(target, targetPk, skip) {
+      var self = this, tx = this._store().transaction, req = this.request;
+      req.readyState = "pending";
+      tx._queue.push({ req: req, op: function () { return self._step(target, targetPk, skip); } });
+      tx._quiet = false;
+      schedule();
+    }
+    continue(key) { this._again(key === undefined ? undefined : checkKey(key), undefined, 1); }
+    continuePrimaryKey(key, pk) { this._again(checkKey(key), checkKey(pk), 1); }
+    advance(n) { if (!(n > 0)) throw new TypeError("advance needs a count above 0"); this._again(undefined, undefined, n); }
+    update(value) {
+      var st = this._store();
+      return st.keyPath === null ? st.put(value, this._pk) : st.put(value);
+    }
+    delete() { return this._store().delete(this._pk); }
+  }
+  class IDBCursorWithValue extends IDBCursor {}
+  function openCursor(source, range, dir, withValue) {
+    var tx = source instanceof IDBIndex ? source.objectStore.transaction : source.transaction;
+    var c = withValue ? new IDBCursorWithValue(source, range, dir, null) : new IDBCursor(source, range, dir, null);
+    c._withValue = withValue;
+    var req = request(tx, source, function () { return c._step(undefined, undefined, 1); });
+    c.request = req;
+    return req;
+  }
+
+  class IDBDatabase extends Target {
+    constructor(data) {
+      super();
+      this._data = data; this._closed = false;
+      this.onversionchange = null; this.onclose = null; this.onabort = null; this.onerror = null;
+      data.conns.push(this);
+    }
+    get name() { return this._data.name; }
+    get version() { return this._data.version; }
+    get objectStoreNames() { return names(this._data.stores); }
+    _versionTx() {
+      var tx = this._upgrade;
+      if (!tx || tx._finished) throw err("InvalidStateError", "Stores change only in a version change.");
+      return tx;
+    }
+    createObjectStore(name, opts) {
+      var tx = this._versionTx();
+      opts = opts || {};
+      var keyPath = opts.keyPath === undefined ? null : opts.keyPath;
+      if (this._data.stores.has(name)) throw err("ConstraintError", "An object store named " + name + " exists.");
+      if (opts.autoIncrement && (keyPath === "" || Array.isArray(keyPath))) throw err("InvalidAccessError", "That key path cannot be generated.");
+      var st = blankStore(name, keyPath, !!opts.autoIncrement);
+      this._data.stores.set(name, st);
+      tx._dirty = true;
+      return new IDBObjectStore(tx, st);
+    }
+    deleteObjectStore(name) {
+      var tx = this._versionTx();
+      if (!this._data.stores.delete(name)) throw err("NotFoundError", "No object store named " + name + ".");
+      tx._dirty = true;
+    }
+    transaction(scope, mode) {
+      if (this._closed) throw err("InvalidStateError", "The database connection is closed.");
+      if (this._upgrade && !this._upgrade._finished) throw err("InvalidStateError", "A version change is running.");
+      scope = typeof scope === "string" ? [scope] : Array.from(scope);
+      if (!scope.length) throw err("InvalidAccessError", "No object stores were named.");
+      var data = this._data;
+      scope.forEach(function (n) { if (!data.stores.has(n)) throw err("NotFoundError", "No object store named " + n + "."); });
+      mode = mode || "readonly";
+      if (mode !== "readonly" && mode !== "readwrite") throw new TypeError("Unknown transaction mode " + mode);
+      return new IDBTransaction(this, scope, mode);
+    }
+    close() {
+      this._closed = true;
+      var i = this._data.conns.indexOf(this);
+      if (i >= 0) this._data.conns.splice(i, 1);
+    }
+  }
+
+  class IDBVersionChangeEvent {}
+  function versionEvent(type, oldVersion, newVersion) {
+    var e = makeEvent(type, false, false, { oldVersion: oldVersion, newVersion: newVersion });
+    try { Object.setPrototypeOf(e, IDBVersionChangeEvent.prototype); } catch (x) {}
+    return e;
+  }
+  /* Others with the database open hear of the change; closed or not, it goes on. */
+  function tellOthers(data, oldVersion, newVersion, except) {
+    data.conns.slice().forEach(function (c) { if (c !== except && !c._closed) fire([c], versionEvent("versionchange", oldVersion, newVersion)); });
+  }
+
+  class IDBFactory {
+    open(name, version) {
+      name = String(name);
+      if (version !== undefined && (!(version >= 1) || version !== Math.floor(version))) throw new TypeError("The version must be a whole number above 0.");
+      var req = new IDBOpenDBRequest();
+      setTimeout(function () {
+        var data = load(name), created = !data;
+        if (!data) { data = { name: name, version: 0, stores: new Map(), conns: [] }; dbs.set(name, data); }
+        var old = data.version, want = version === undefined ? (old || 1) : version;
+        if (want < old) {
+          req._error = err("VersionError", "The database is at version " + old + ".");
+          req.readyState = "done";
+          fire([req], makeEvent("error", true, true));
+          return;
+        }
+        var conn = new IDBDatabase(data);
+        if (want === old) {
+          req._result = conn; req.readyState = "done";
+          fire([req], makeEvent("success", false, false));
+          return;
+        }
+        tellOthers(data, old, want, conn);
+        var tx = new IDBTransaction(conn, [], "versionchange");
+        tx._schema = { stores: new Map(data.stores), version: old, created: created };
+        tx._dirty = true;
+        conn._upgrade = tx;
+        data.version = want;
+        tx._done = function (ok) {
+          req.transaction = null;
+          req.readyState = "done";
+          if (ok) { req._result = conn; fire([req], makeEvent("success", false, false)); }
+          else { conn.close(); req._result = undefined; req._error = tx.error || err("AbortError", "The version change was aborted."); fire([req], makeEvent("error", true, true)); }
+        };
+        req._result = conn; req.transaction = tx; req.readyState = "done";
+        handlerError = undefined;
+        fire([req], versionEvent("upgradeneeded", old, want));
+        if (handlerError !== undefined) abort(tx, err("AbortError", "The upgrade handler threw."));
+      }, 0);
+      return req;
+    }
+    deleteDatabase(name) {
+      name = String(name);
+      var req = new IDBOpenDBRequest();
+      setTimeout(function () {
+        var data = load(name), old = data ? data.version : 0;
+        if (data) { tellOthers(data, old, null, null); dbs.delete(name); }
+        if (disk) disk("delete", name);
+        req.readyState = "done";
+        fire([req], versionEvent("success", old, null));
+      }, 0);
+      return req;
+    }
+    databases() {
+      var seen = new Map();
+      ((disk && disk("list", "")) || "").split("\n").forEach(function (n) { if (n) { var d = load(n); if (d) seen.set(n, d.version); } });
+      dbs.forEach(function (d, n) { if (d.version) seen.set(n, d.version); });
+      return Promise.resolve(Array.from(seen, function (e) { return { name: e[0], version: e[1] }; }));
+    }
+    cmp(a, b) { return cmp(a, b); }
+  }
+
+  var factory = new IDBFactory();
+  lz("indexedDB", factory); lz("IDBFactory", IDBFactory); lz("IDBKeyRange", IDBKeyRange);
+  lz("IDBDatabase", IDBDatabase); lz("IDBTransaction", IDBTransaction); lz("IDBObjectStore", IDBObjectStore);
+  lz("IDBIndex", IDBIndex); lz("IDBCursor", IDBCursor); lz("IDBCursorWithValue", IDBCursorWithValue);
+  lz("IDBRequest", IDBRequest); lz("IDBOpenDBRequest", IDBOpenDBRequest); lz("IDBVersionChangeEvent", IDBVersionChangeEvent);
 })(globalThis);
 );
 

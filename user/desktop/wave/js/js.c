@@ -14,11 +14,13 @@
  * optional chaining, spread; generators, async functions and async
  * generators, which run as coroutines on stacks of their own (see the
  * coroutine section); promises and their microtask queue; ES modules (see
- * the modules section: the host fetches, the engine links and runs). Not
- * there: BigInt (read as a number).
+ * the modules section: the host fetches, the engine links and runs);
+ * symbols (JS_SYM, whose keys jsint.h describes) and BigInts (JS_BIG,
+ * jsbig.c).
  *
  * Strings are stored as UTF-8/WTF-8; indexed access and core string
- * operations expose UTF-16 code units. The regex engine still uses bytes.
+ * operations expose UTF-16 code units. The regex engine (jsre.c) walks the
+ * UTF-8 a code point at a time.
  *
  * Memory is garbage collected. Uncaptured locals live in VM frame slots;
  * closures keep captured locals in heap environments. Running out of
@@ -294,7 +296,8 @@ int js_truthy(jsval v)
     case JS_BOOL: return v.u.b;
     case JS_NUM: return v.u.n != 0 && !isnan(v.u.n);
     case JS_STR: return v.u.s->len > 0;
-    case JS_OBJ: return 1;
+    case JS_OBJ: case JS_SYM: return 1;
+    case JS_BIG: return v.u.g->n > 0;
     default: return 0;
     }
 }
@@ -573,6 +576,8 @@ struct jsstr *js_tostr(struct js *J, jsval v)
         js_numtostr(v.u.n, buf);
         return js_mkstr(J, buf, (int)strlen(buf));
     case JS_STR: return v.u.s;
+    case JS_SYM: return v.u.s;          /* the key: see js_sym_text for showing it */
+    case JS_BIG: return jb_tostr(J, v.u.g, 10);
     default: {
         jsval p = js_to_primitive(J, v, 1);
         if (J->throwing)
@@ -595,6 +600,10 @@ double js_to_number(struct js *J, jsval v)
     case JS_BOOL: return v.u.b;
     case JS_NUM: return v.u.n;
     case JS_STR: return js_strtonum(v.u.s->s, v.u.s->len);
+    case JS_BIG: return jb_to_double(v.u.g);
+    case JS_SYM:
+        js_throw_error(J, "TypeError: Cannot convert a Symbol value to a number");
+        return NAN;
     default: {
         jsval p = js_to_primitive(J, v, 0);
         if (J->throwing || p.t == JS_OBJ)
@@ -621,11 +630,26 @@ static uint32_t to_uint32(struct js *J, jsval v)
     return (uint32_t)to_int32(J, v);
 }
 
+/* A symbol key's description, or NULL for Symbol(). */
+struct jsstr *js_sym_desc(struct js *J, const struct jsstr *k)
+{
+    const char *sep = memchr(k->s + 1, 0xFF, (size_t)k->len - 1);
+    return sep ? js_mkstr(J, sep + 1, (int)(k->s + k->len - sep - 1)) : NULL;
+}
+
+/* "Symbol(description)", as String(symbol) has it. */
+struct jsstr *js_sym_text(struct js *J, const struct jsstr *k)
+{
+    struct jsstr *d = js_sym_desc(J, k);
+    struct jsstr *r = js_concat(J, js_mkstr(J, "Symbol(", 7), d ? d : js_mkstr(J, "", 0));
+    return js_concat(J, r, js_mkstr(J, ")", 1));
+}
+
 const char *js_text(struct js *J, jsval v)
 {
     int saved = J->throwing;
     jsval exc = J->exc;
-    struct jsstr *s = js_tostr(J, v);
+    struct jsstr *s = v.t == JS_SYM ? js_sym_text(J, v.u.s) : js_tostr(J, v);
     J->throwing = saved;
     J->exc = exc;
     snprintf(J->textbuf, sizeof(J->textbuf), "%s", s->s);
@@ -838,7 +862,7 @@ static int proxy_get(struct js *J, struct jsobj *p, struct jsstr *key, jsval sel
 {
     jsval fn;
     if (proxy_trap(J, p, "get", &fn)) {
-        jsval a[3] = { js_obj(p->ptarget), strv(key), self };
+        jsval a[3] = { js_obj(p->ptarget), js_keyval(key), self };
         *out = js_call_value(J, fn, js_obj(p->phandler), a, 3);
         return 1;
     }
@@ -913,6 +937,8 @@ static struct jsobj *proto_of_primitive(struct js *J, jsval v)
     case JS_STR: return J->string_proto;
     case JS_NUM: return J->number_proto;
     case JS_BOOL: return J->boolean_proto;
+    case JS_SYM: return J->symbol_proto;
+    case JS_BIG: return J->bigint_proto;
     default: return NULL;
     }
 }
@@ -971,7 +997,7 @@ static void obj_set(struct js *J, struct jsobj *o, struct jsstr *key, jsval v, j
     if (o->phandler) {
         jsval fn;
         if (proxy_trap(J, o, "set", &fn)) {
-            jsval a[4] = { js_obj(o->ptarget), strv(key), v, self };
+            jsval a[4] = { js_obj(o->ptarget), js_keyval(key), v, self };
             js_call_value(J, fn, js_obj(o->phandler), a, 4);
         } else if (!J->throwing) {
             obj_set(J, o->ptarget, key, v, js_obj(o->ptarget));
@@ -1059,7 +1085,7 @@ int js_has(struct js *J, jsval obj, struct jsstr *key)
         if (x->phandler) {
             jsval fn;
             if (proxy_trap(J, x, "has", &fn)) {
-                jsval a[2] = { js_obj(x->ptarget), strv(key) };
+                jsval a[2] = { js_obj(x->ptarget), js_keyval(key) };
                 return js_truthy(js_call_value(J, fn, js_obj(x->phandler), a, 2));
             }
             return js_has(J, js_obj(x->ptarget), key);
@@ -1089,7 +1115,7 @@ int js_delete(struct js *J, jsval obj, struct jsstr *key)
     if (o->phandler) {
         jsval fn;
         if (proxy_trap(J, o, "deleteProperty", &fn)) {
-            jsval a[2] = { js_obj(o->ptarget), strv(key) };
+            jsval a[2] = { js_obj(o->ptarget), js_keyval(key) };
             return js_truthy(js_call_value(J, fn, js_obj(o->phandler), a, 2));
         }
         return js_delete(J, js_obj(o->ptarget), key);
@@ -1105,6 +1131,24 @@ int js_delete(struct js *J, jsval obj, struct jsstr *key)
             return 1;
         }
     return 1;
+}
+
+/* An object's own enumerable symbol-keyed properties' keys (Object.assign and spread copy them). */
+int js_own_symbols(struct js *J, jsval obj, struct jsstr ***out)
+{
+    int n = 0;
+    if (obj.t == JS_OBJ && !obj.u.o->phandler)
+        for (struct prop *p = obj.u.o->props; p; p = p->next)
+            n += js_is_symkey(p->key) && !p->hidden;
+    struct jsstr **keys = js_alloc(J, sizeof(*keys) * (size_t)(n ? n : 1));
+    *out = keys;
+    if (!n)
+        return 0;
+    n = 0;
+    for (struct prop *p = obj.u.o->props; p; p = p->next)
+        if (js_is_symkey(p->key) && !p->hidden)
+            keys[n++] = p->key;
+    return n;
 }
 
 int js_keys(struct js *J, jsval obj, int inherited, struct jsstr ***out)
@@ -1141,10 +1185,12 @@ int js_keys(struct js *J, jsval obj, int inherited, struct jsstr ***out)
             }
             int len = r.u.o->len;
             keys = js_alloc(J, sizeof(*keys) * (size_t)(len ? len : 1));
+            int nk = 0;
             for (int i = 0; i < len; i++)
-                keys[i] = js_tostr(J, r.u.o->items[i]);
+                if (r.u.o->items[i].t != JS_SYM)    /* string keys only */
+                    keys[nk++] = js_tostr(J, r.u.o->items[i]);
             *out = keys;
-            return len;
+            return nk;
         }
         return js_keys(J, tgt, inherited, out);
     }
@@ -1167,9 +1213,8 @@ int js_keys(struct js *J, jsval obj, int inherited, struct jsstr ***out)
                 keys[n++] = js_mkstr(J, b, (int)strlen(b));
             }
         for (struct prop *p = x->props; p; p = p->next) {
-            if (p->hidden || (p->key->len > 2 && p->key->s[0] == '@' && p->key->s[1] == '@') ||
-                (p->key->len > 1 && p->key->s[0] == '#'))
-                continue;                       /* not enumerable; "@@..." keys are symbols, "#..." private */
+            if (p->hidden || js_is_symkey(p->key) || (p->key->len > 1 && p->key->s[0] == '#'))
+                continue;                       /* not enumerable, a symbol, or "#..." private */
             int dup = 0;
             for (int i = 0; i < n && !dup; i++)
                 dup = str_eq(keys[i], p->key);
@@ -1282,7 +1327,8 @@ int js_strict_equal(jsval a, jsval b)
     case JS_NULL: return 1;
     case JS_BOOL: return a.u.b == b.u.b;
     case JS_NUM: return a.u.n == b.u.n;
-    case JS_STR: return str_eq(a.u.s, b.u.s);
+    case JS_STR: case JS_SYM: return str_eq(a.u.s, b.u.s);
+    case JS_BIG: return jb_cmp(a.u.g, b.u.g) == 0;
     default: return a.u.o == b.u.o;
     }
 }
@@ -1292,6 +1338,15 @@ jsval js_to_primitive(struct js *J, jsval v, int hint_string)
     if (v.t != JS_OBJ)
         return v;
     struct jsobj *o = v.u.o;
+    jsval exotic = o->cls == C_OBJECT || o->cls == C_HOST || o->cls == C_FUNCTION
+                       ? js_get(J, v, SYM_TO_PRIMITIVE) : js_undefined;
+    if (js_is_callable(exotic)) {
+        jsval hint = js_str(J, hint_string ? "string" : "default");
+        jsval r = js_call_value(J, exotic, v, &hint, 1);
+        if (!J->throwing && r.t == JS_OBJ)
+            js_throw_error(J, "TypeError: Symbol.toPrimitive must return a primitive value");
+        return J->throwing ? js_undefined : r;
+    }
     if (o->cls == C_DATE && !hint_string)
         hint_string = 1;
     const char *order[2] = { hint_string ? "toString" : "valueOf", hint_string ? "valueOf" : "toString" };
@@ -1323,8 +1378,19 @@ int js_loose_equal(struct js *J, jsval a, jsval b)
         b = js_to_primitive(J, b, 0);
     if (J->throwing)
         return 0;
-    if (a.t == JS_STR && b.t == JS_STR)
-        return str_eq(a.u.s, b.u.s);
+    if (a.t == b.t)
+        return js_strict_equal(a, b);
+    if (a.t == JS_SYM || b.t == JS_SYM)
+        return 0;
+    if (a.t == JS_BIG || b.t == JS_BIG) {
+        jsval big = a.t == JS_BIG ? a : b, other = a.t == JS_BIG ? b : a;
+        if (other.t == JS_STR) {
+            struct jsbig *g = jb_parse(J, other.u.s->s, other.u.s->len, 0, 1);
+            J->throwing = 0;
+            return g && jb_cmp(big.u.g, g) == 0;
+        }
+        return jb_cmp_double(J, big.u.g, js_to_number(J, other)) == 0;
+    }
     return js_to_number(J, a) == js_to_number(J, b);
 }
 
@@ -1335,6 +1401,7 @@ enum { K_EOF, K_NUM, K_STR, K_TEMPLATE, K_IDENT, K_PUNCT, K_REGEX };
 struct tok {
     uint8_t kind;
     uint8_t nl;                         /* a line break came before it */
+    uint8_t big;                        /* a BigInt literal: its digits are str */
     int line;
     const char *p;                      /* source text */
     int len;
@@ -1585,6 +1652,13 @@ static int lex(struct lexer *L)
             const char *run = s;
             while (run < L->end && (ident_char((unsigned char)*run) || *run == '.'))
                 run++;
+            if (run[-1] == 'n' && !memchr(s, '.', (size_t)(run - s))) {
+                t->big = 1;             /* a BigInt: the digits as written (0x, 0o, 0b, _) */
+                t->str = js_mkstr(L->J, s, (int)(run - 1 - s));
+                t->len = (int)(run - s);
+                L->s = run;
+                continue;
+            }
             char clean[80];
             int nclean = 0, has_sep = 0;
             for (const char *q = s; q < run && nclean < (int)sizeof(clean) - 1; q++) {
@@ -1621,8 +1695,6 @@ static int lex(struct lexer *L)
                     used = k;
                 }
             }
-            if (s + used < L->end && s[used] == 'n')
-                used++;                 /* BigInt: read as a number */
             t->len = used;
             L->s = s + used;
             continue;
@@ -2040,6 +2112,9 @@ static int prop_key(struct parser *P, struct ast *prop)
         prop->str = tok_name(P, t);
     } else if (t->kind == K_STR) {
         prop->str = t->str;
+    } else if (t->kind == K_NUM && t->big) {
+        struct jsbig *g = jb_parse(P->J, t->str->s, t->str->len, 0, 0);
+        prop->str = g ? jb_tostr(P->J, g, 10) : t->str;
     } else if (t->kind == K_NUM) {
         char b[64];
         js_numtostr(t->num, b);
@@ -2415,6 +2490,10 @@ static struct ast *primary(struct parser *P)
     case K_NUM:
         n = mk(P, N_NUM);
         n->num = t->num;
+        if (t->big) {
+            n->flags = 1;
+            n->str = t->str;
+        }
         P->pos++;
         return n;
     case K_STR:
@@ -3894,8 +3973,54 @@ static const char *type_of(jsval v)
     case JS_BOOL: return "boolean";
     case JS_NUM: return "number";
     case JS_STR: return "string";
+    case JS_SYM: return "symbol";
+    case JS_BIG: return "bigint";
     default: return v.u.o->cls == C_FUNCTION ? "function" : "object";
     }
+}
+
+/* ToNumeric: a number, or a BigInt as it is. */
+static jsval to_numeric(struct js *J, jsval v)
+{
+    if (v.t == JS_OBJ)
+        v = js_to_primitive(J, v, 0);
+    if (v.t == JS_BIG || J->throwing)
+        return v;
+    return js_num(js_to_number(J, v));
+}
+
+/* An arithmetic or bitwise operator with a BigInt on either side (after ToPrimitive). */
+static jsval big_op(struct js *J, int op, jsval a, jsval b)
+{
+    if (a.t != JS_BIG || b.t != JS_BIG) {
+        if (a.t == JS_SYM || b.t == JS_SYM)
+            js_to_number(J, a.t == JS_SYM ? a : b);         /* throws */
+        else
+            js_throw_error(J, "TypeError: Cannot mix BigInt and other types, use explicit conversions");
+        return js_undefined;
+    }
+    struct jsbig *x = a.u.g, *y = b.u.g, *r = NULL;
+    switch (op) {
+    case OP_ADD: r = jb_add(J, x, y); break;
+    case OP_SUB: r = jb_sub(J, x, y); break;
+    case OP_MUL: r = jb_mul(J, x, y); break;
+    case OP_DIV: r = jb_div(J, x, y); break;
+    case OP_MOD: r = jb_mod(J, x, y); break;
+    case OP_EXP: r = jb_pow(J, x, y); break;
+    case OP_BAND: r = jb_bitop(J, '&', x, y); break;
+    case OP_BOR: r = jb_bitop(J, '|', x, y); break;
+    case OP_BXOR: r = jb_bitop(J, '^', x, y); break;
+    case OP_SHL: case OP_SHR: {
+        /* Shift counts beyond any size are all the same: 0, -1 or too big. */
+        int64_t k = y->n > 2 || (y->n == 2 && y->d[1] > 0x3FFFFFFF) ? (y->neg ? -((int64_t)1 << 62) : (int64_t)1 << 62)
+                                                                    : (int64_t)jb_to_u64(y);
+        r = jb_shl(J, x, op == OP_SHL ? k : -k);
+        break;
+    }
+    case OP_USHR:
+        return js_throw_error(J, "TypeError: BigInts have no unsigned right shift, use >> instead");
+    }
+    return r ? js_bigv(r) : js_undefined;
 }
 
 static jsval add(struct js *J, jsval a, jsval b)
@@ -3908,10 +4033,14 @@ static jsval add(struct js *J, jsval a, jsval b)
     TRY();
     b = js_to_primitive(J, b, 0);
     TRY();
+    if (a.t == JS_SYM || b.t == JS_SYM)
+        return js_throw_error(J, "TypeError: Cannot convert a Symbol value to a string");
     if (a.t == JS_STR || b.t == JS_STR) {
         struct jsstr *x = js_tostr(J, a), *y = js_tostr(J, b);
         return strv(js_concat(J, x, y));
     }
+    if (a.t == JS_BIG || b.t == JS_BIG)
+        return big_op(J, OP_ADD, a, b);
     return js_num(js_to_number(J, a) + js_to_number(J, b));
 }
 
@@ -3930,6 +4059,28 @@ static int compare(struct js *J, jsval a, jsval b, int *undef)
             if (x < 0)
                 return 0;
         }
+    }
+    if (a.t == JS_BIG || b.t == JS_BIG) {
+        if (a.t == JS_BIG && b.t == JS_BIG)
+            return jb_cmp(a.u.g, b.u.g);
+        int swap = a.t != JS_BIG, c;
+        jsval big = swap ? b : a, other = swap ? a : b;
+        if (other.t == JS_STR) {
+            struct jsbig *g = jb_parse(J, other.u.s->s, other.u.s->len, 0, 1);
+            J->throwing = 0;
+            if (!g) {
+                *undef = 1;
+                return 0;
+            }
+            c = jb_cmp(big.u.g, g);
+        } else {
+            c = jb_cmp_double(J, big.u.g, js_to_number(J, other));
+            if (c == 2) {
+                *undef = 1;
+                return 0;
+            }
+        }
+        return swap ? -c : c;
     }
     double x = js_to_number(J, a), y = js_to_number(J, b);
     if (isnan(x) || isnan(y)) {
@@ -3962,6 +4113,14 @@ static int instance_of(struct js *J, jsval v, jsval ctor)
 static jsval binary_op(struct js *J, int op, jsval a, jsval b)
 {
     int undef;
+    if (op != OP_ADD && op <= OP_BXOR && (a.t == JS_BIG || b.t == JS_BIG || a.t == JS_OBJ || b.t == JS_OBJ)) {
+        a = js_to_primitive(J, a, 0);
+        TRY();
+        b = js_to_primitive(J, b, 0);
+        TRY();
+        if (a.t == JS_BIG || b.t == JS_BIG)
+            return big_op(J, op, a, b);
+    }
     switch (op) {
     case OP_ADD: return add(J, a, b);
     case OP_SUB: return js_num(js_to_number(J, a) - js_to_number(J, b));
@@ -4000,7 +4159,7 @@ static jsval binary_op(struct js *J, int op, jsval a, jsval b)
 /*
  * One way to walk anything iterable, for for-of, spread, destructuring and
  * the built-ins: arrays, strings, array-likes (a NodeList), and objects with
- * a [Symbol.iterator] method (Symbol.iterator is the key "@@iterator"),
+ * a [Symbol.iterator] method (Symbol.iterator is the key SYM_ITERATOR),
  * whose iterator is an object with next(). A method that returns an array
  * stands for that array's elements (the Map and Set built-ins do).
  */
@@ -4023,7 +4182,7 @@ int js_iter_open(struct js *J, jsval v, struct iter *it)
         it->arr = v.u.o;
         return 0;
     }
-    jsval f = js_get(J, v, "@@iterator");
+    jsval f = js_get(J, v, SYM_ITERATOR);
     if (J->throwing)
         return -1;
     if (js_is_callable(f)) {
@@ -4616,13 +4775,13 @@ static void init_generators(struct js *J)
     js_define_native(J, gp, "next", gen_next, 1);
     js_define_native(J, gp, "return", gen_return, 1);
     js_define_native(J, gp, "throw", gen_throw, 1);
-    js_define_native(J, gp, "@@iterator", gen_self, 0);
+    js_define_native(J, gp, SYM_ITERATOR, gen_self, 0);
     J->return_marker = js_new_object(J);
     struct jsobj *ap = J->agen_proto = js_mkobj(J, C_OBJECT, J->object_proto);
     js_define_native(J, ap, "next", agen_next, 1);
     js_define_native(J, ap, "return", agen_return, 1);
     js_define_native(J, ap, "throw", agen_throw, 1);
-    js_define_native(J, ap, "@@asyncIterator", gen_self, 0);
+    js_define_native(J, ap, SYM_ASYNC_ITERATOR, gen_self, 0);
 }
 
 /* ---- async generators ----

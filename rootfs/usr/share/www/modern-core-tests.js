@@ -47,3 +47,21 @@ test('randomUUID has UUIDv4 format',function(){return /^[0-9a-f]{8}-[0-9a-f]{4}-
 test('TextDecoder streaming UTF8 boundaries',function(){var d=new TextDecoder(),a=d.decode(new Uint8Array([239,187]),{stream:true}),b=d.decode(new Uint8Array([191,240,159]),{stream:true}),c=d.decode(new Uint8Array([152,128]),{stream:true}),e=d.decode();return [a,b,c,e];},['','','😀','']);
 test('TextDecoder flush replaces partial sequence',function(){var d=new TextDecoder();return [d.decode(new Uint8Array([226]),{stream:true}),d.decode()];},['','�']);
 test('font checks do not report unknown fonts as loaded',function(){return [document.fonts.check('16px serif'),document.fonts.check('16px Definitely Missing')];},[true,false]);
+
+group("Windows and messages");
+test('window proxies of a top-level window',function(){return [window.top===window,window.parent===window,window.opener,window.length,document.createElement('iframe').contentWindow,document.createElement('div').contentWindow];},[true,true,null,0,null,undefined]);
+test('postMessage clones structured data',function(){
+  var cyc={name:'c'};cyc.self=cyc;
+  var sent={n:-0,big:123n,when:new Date(5),m:new Map([[1,{a:[1,,3]}]]),s:new Set(['x']),bytes:new Uint16Array([1,65535]),cyc:cyc,u:undefined,nan:NaN,re:/a+/gi,err:new RangeError('far')};
+  window.addEventListener('message',function on(e){
+    window.removeEventListener('message',on);
+    var d=e.data;
+    if(e.source!==window||d===sent)throw new Error('message: wrong source');if(e.origin!==(location.protocol==='file:'?'null':location.origin))throw new Error('message origin '+e.origin);
+    var ok=Object.is(d.n,-0)&&d.big===123n&&d.when.getTime()===5&&d.m.get(1).a[2]===3&&d.s.has('x')&&d.bytes instanceof Uint16Array&&d.bytes[1]===65535&&d.cyc.self===d.cyc&&'u' in d&&d.u===undefined&&isNaN(d.nan)&&d.re.flags==='gi'&&d.err instanceof RangeError&&d.err.message==='far';
+    if(!ok)throw new Error('message: data '+JSON.stringify(Object.keys(d)));
+    count++;
+  });
+  window.postMessage(sent,'*');
+  var refused=0;try{window.postMessage({f:function(){}},'*');}catch(e){refused=e.name==='DataCloneError';}
+  return refused;
+},true);

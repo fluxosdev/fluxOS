@@ -113,6 +113,8 @@ struct attr {
 
 struct style;
 
+struct anim_state;
+
 struct node {
     uint8_t type;               /* N_ELEMENT or N_TEXT */
     uint8_t tag;                /* enum tag */
@@ -165,6 +167,7 @@ struct node {
     uint8_t style_flags;                /* SF_*: what its style turned out to depend on */
     uint32_t match_sig;                 /* the rules that matched it, hashed */
     unsigned dgen, rgen;                /* css_restyle_dynamic(): its state changed, its style changed */
+    struct anim_state *anim;            /* anim.c: its transitions and animations, if it has any */
 };
 
 struct node *html_parse(struct arena *a, const char *text, int len);
@@ -342,8 +345,12 @@ enum anim_prop {
     AP_OUTLINE_OFFSET, AP_Z_INDEX, AP_VISIBILITY, AP_COUNT
 };
 
+#define AP_BIT(p) ((uint64_t)1 << (p))
+#define AP_EVERY (AP_BIT(AP_COUNT) - 1)
+
 struct css_transition {
-    int prop;                   /* enum anim_prop (AP_ALL for all) */
+    uint64_t props;             /* AP_BIT()s of what transition-property names (AP_EVERY for all) */
+    const char *name;           /* as written, for the events' propertyName */
     int duration, delay;        /* milliseconds */
     struct css_timing ease;
 };
@@ -357,6 +364,57 @@ struct css_animation {
     float iterations;           /* negative: forever */
     uint8_t direction, fill, paused;
 };
+
+/* @keyframes name { ... }, as css.c parses it. */
+struct kframe {
+    float offset;               /* 0 to 1 */
+    const struct css_timing *ease;      /* animation-timing-function in the keyframe, or NULL */
+    uint64_t props;             /* AP_BIT()s of what its declarations set */
+    const void *decls;          /* css.c's */
+    int ndecls;
+};
+struct keyframes {
+    const char *name;
+    struct kframe *f;           /* by offset */
+    int n;
+    struct keyframes *next;
+};
+
+/* ---- CSS transitions and animations (anim.c) ---- */
+/* What anim_style needs of the cascade, for the element being styled. */
+struct anim_env {
+    struct arena *a;            /* the cascade's, for values the style points to */
+    void *ctx;
+    const struct keyframes *(*find)(void *ctx, const char *name);
+    void (*apply)(void *ctx, const struct kframe *f, struct style *st);  /* its declarations onto st */
+};
+/* The clock styles are computed for (ms): the browser sets it before it restyles. */
+extern unsigned anim_now;
+/* After the declarations of n's style st apply (css.c's compute): start the transitions its
+ * changes call for and put in the values running transitions and animations have now. */
+void anim_style(struct node *n, struct style *st, const struct anim_env *env);
+/* A whole cascade of the tree under root is beginning, or has ended: the elements it did not
+ * style (gone, or display: none) lose their animations. */
+void anim_cascade_begin(struct node *root);
+void anim_cascade_end(struct node *root);
+/* Is anything of n's still moving (so it must be styled again each frame)? */
+int anim_running(const struct node *n);
+/* Mark (dgen = gen) the elements under root whose animations move; how many. */
+int anim_mark(struct node *root, unsigned gen);
+/* ms until the tree under root needs another frame, or -1 if nothing moves. */
+int anim_timeout(const struct node *root);
+/* The document under root is going away: forget its animations. */
+void anim_forget(const struct node *root);
+/* Events for scripts (transitionrun, transitionend, animationstart, ...), oldest first. */
+struct anim_event {
+    struct node *node;
+    char type[20];
+    char name[64];              /* propertyName or animationName */
+    float elapsed;              /* seconds */
+};
+int anim_take_event(const struct node *root, struct anim_event *out);
+/* What transition-property's name stands for, as AP_BIT()s (all: AP_EVERY; unknown: 0). */
+uint64_t anim_prop_bits(const char *name, int len);
 
 /* The transition and animation properties as written (lists, matched up by finish_motion). */
 struct css_motion_raw {
@@ -484,6 +542,11 @@ void css_cascade(struct arena *a, struct node *root, struct sheet **sheets, int 
 int css_restyle_dynamic(struct arena *a, struct node *root, struct sheet **sheets, int nsheets,
                         int viewport_w, int viewport_h, int (*visited)(const char *href, void *ctx),
                         void *ctx);
+/* A frame of the page's transitions and animations: restyle the elements that move (and what
+ * inherits from them), at anim_now. Returns as css_restyle_dynamic does. */
+int css_restyle_animated(struct arena *a, struct node *root, struct sheet **sheets, int nsheets,
+                         int viewport_w, int viewport_h, int (*visited)(const char *href, void *ctx),
+                         void *ctx);
 extern int css_shared;
 int css_parse_color(const char *s, int n, uint32_t *out);
 /* oklch(), lab(), hwb(), color(), color-mix() and the rest (csscolor.c, in floating point). */
@@ -567,10 +630,12 @@ struct ditem {
     uint16_t sb;                /* 1 + the scrolling box it is inside (and clipped by), or 0 */
     uint16_t sbi;               /* DK_SBOX: its box */
     uint16_t xf;                /* transform group, 1-based */
+    uint8_t fade;               /* opacity: 255 minus how much shows (0: opaque) */
 };
 
 struct hotspot {                /* a link or a form control */
     int x, y, w, h;
+    int at;                     /* where it is in the paint order: after this many items */
     struct node *node;          /* the <a href> or the control */
     uint8_t dyn;                /* like ditem.dyn */
     uint16_t sb;                /* like ditem.sb */
@@ -709,6 +774,9 @@ void draw_image_scaled(struct surface *s, const struct image *img, int x, int y,
 /* ---- files the browser keeps (webstore.c) ---- */
 char *store_read_file(const char *path, long max, long *len);   /* malloc'd; NULL if missing or too big */
 int store_write_file(const char *path, const char *data, size_t len);
+/* IndexedDB's databases: one file each, named by origin and name, under IDB_DIR. op is "load" (the
+ * text, malloc'd, or NULL), "save" (text), "delete"; "list" gives the names, one a line (malloc'd). */
+char *store_idb(const char *op, const char *origin, const char *name, const char *text, size_t len);
 long store_file_mtime(const char *path);                         /* seconds since 1970; 0 if unknown */
 
 /* ---- URLs (webutil.c, like the arena and UTF-8 helpers) ---- */

@@ -7,10 +7,11 @@
  * groups (capturing, (?:...), named (?<name>...) with \k<name>),
  * lookahead (?= and ?!), lookbehind (?<= and ?<!), backreferences \1-\9,
  * alternation, and the quantifiers * + ? {n} {n,} {n,m}, greedy or lazy.
- * Flags g, i, m, s, y (u, d and v are accepted). Case folding is ASCII
- * only. . and the classes match one character, which may be several bytes
- * of UTF-8; a class can only name characters below U+0100 one by one, and
- * any other character is in it when the class is negated.
+ * Flags g, i, m, s, y, d, u and v. With u or v, \p{...} and \P{...} name
+ * Unicode properties (jsuni.c); with v, classes nest and take -- and &&.
+ * . and the classes match one character (code point), which may be several
+ * bytes of UTF-8; a class is a set of code point ranges. /i folds case
+ * with Unicode's simple case folding.
  *
  * A lookbehind tries every start position back from the current one and
  * keeps the first from which its pattern ends exactly here.
@@ -29,6 +30,7 @@
 enum {
     R_CHAR, R_ANY, R_CLASS, R_SPLIT, R_JMP, R_SAVE, R_MATCH, R_BOL, R_EOL, R_WORDB, R_NWORDB,
     R_BACKREF, R_LOOK, R_NLOOK, R_LBEH, R_NLBEH, R_LBEND,
+    R_FOLD,                             /* /i: a character whose case folding is x */
 };
 
 struct rinst {
@@ -39,13 +41,21 @@ struct rinst {
 struct regex {
     struct rinst *code;
     int n;
-    uint32_t (*classes)[9];             /* 256 bits for U+0000-U+00FF, then a word for the rest */
+    struct rclass *classes;
     int nclasses;
     int ngroups;
-    int global, icase, multiline, dotall, sticky;
+    int global, icase, multiline, dotall, sticky, unicode, vmode;
     char *source, *flags;
     const char *names[RE_MAX_GROUPS];   /* named groups, by number */
     int nnames;
+};
+
+/* A character class: its set of code points (as written, before any ^), with
+ * a bitmap of the set's U+0000-U+00FF for speed. */
+struct rclass {
+    uint32_t latin[8];
+    struct uset set;
+    int negate;
 };
 
 struct frag {
@@ -86,49 +96,84 @@ static int new_class(struct rparser *P)
     struct regex *re = P->re;
     if (re->nclasses == P->class_cap) {
         int nc = P->class_cap ? P->class_cap * 2 : 8;
-        uint32_t (*n)[9] = js_alloc(P->J, sizeof(*n) * (size_t)nc);
+        struct rclass *n = js_alloc(P->J, sizeof(*n) * (size_t)nc);
         if (re->nclasses)
             memcpy(n, re->classes, sizeof(*n) * (size_t)re->nclasses);
         re->classes = n;
         P->class_cap = nc;
     }
-    memset(re->classes[re->nclasses], 0, sizeof(re->classes[0]));
+    memset(&re->classes[re->nclasses], 0, sizeof(re->classes[0]));
     return re->nclasses++;
 }
 
-static void class_set(uint32_t *bits, int c)
+static void finish_class(struct rclass *k)
 {
-    bits[(c & 0xFF) >> 5] |= 1u << (c & 31);
+    uset_norm(&k->set);
+    for (int i = 0; i < k->set.n && k->set.r[i][0] < 256; i++)
+        for (uint32_t c = k->set.r[i][0]; c <= k->set.r[i][1] && c < 256; c++)
+            k->latin[c >> 5] |= 1u << (c & 31);
 }
 
-static int class_has(const uint32_t *bits, int c)
+static int class_has(const struct rclass *k, uint32_t c)
 {
-    return (bits[(c & 0xFF) >> 5] >> (c & 31)) & 1;
+    return c < 256 ? (int)((k->latin[c >> 5] >> (c & 31)) & 1) : uset_has(&k->set, c);
 }
 
-static void class_range(uint32_t *bits, int lo, int hi)
+/* Is c in class k, folding case if the expression ignores it. */
+static int class_match(const struct regex *re, const struct rclass *k, uint32_t c)
 {
-    for (int c = lo; c <= hi && c < 256; c++)
-        class_set(bits, c);
+    int hit = class_has(k, c);
+    if (!hit && re->icase)
+        for (uint32_t o = uc_orbit(c); o != c && !hit; o = uc_orbit(o))
+            hit = class_has(k, o);
+    return hit != k->negate;
 }
 
-/* \d \w \s and their capitals into bits. */
-static void class_escape(uint32_t *bits, char e)
+/* \d \w \s and their capitals into a set. */
+static void class_escape(struct js *J, struct uset *u, char e)
 {
-    uint32_t tmp[9] = { 0 };
+    struct uset t = { 0 };
     switch (e | 32) {
-    case 'd': class_range(tmp, '0', '9'); break;
-    case 'w': class_range(tmp, '0', '9'); class_range(tmp, 'a', 'z'); class_range(tmp, 'A', 'Z'); class_set(tmp, '_'); break;
-    case 's':
-        class_set(tmp, ' '); class_set(tmp, '\t'); class_set(tmp, '\n'); class_set(tmp, '\r');
-        class_set(tmp, '\v'); class_set(tmp, '\f'); class_set(tmp, 0xA0);
+    case 'd': uset_add(J, &t, '0', '9'); break;
+    case 'w':
+        uset_add(J, &t, '0', '9'); uset_add(J, &t, 'a', 'z'); uset_add(J, &t, 'A', 'Z');
+        uset_add(J, &t, '_', '_');
+        break;
+    case 's': {
+        static const uint32_t sp[][2] = { { 9, 13 }, { 32, 32 }, { 0xA0, 0xA0 }, { 0x1680, 0x1680 },
+                                          { 0x2000, 0x200A }, { 0x2028, 0x2029 }, { 0x202F, 0x202F },
+                                          { 0x205F, 0x205F }, { 0x3000, 0x3000 }, { 0xFEFF, 0xFEFF } };
+        for (unsigned i = 0; i < sizeof(sp) / sizeof(sp[0]); i++)
+            uset_add(J, &t, sp[i][0], sp[i][1]);
         break;
     }
-    int negate = e >= 'A' && e <= 'Z';
-    for (int i = 0; i < 8; i++)
-        bits[i] |= negate ? ~tmp[i] : tmp[i];
+    }
+    if (e >= 'A' && e <= 'Z')
+        uset_invert(J, &t);
+    for (int i = 0; i < t.n; i++)
+        uset_add(J, u, t.r[i][0], t.r[i][1]);
+}
+
+/* \p{...} or \P{...} (P->s at the p): the property's code points into u. */
+static int class_property(struct rparser *P, struct uset *u)
+{
+    int negate = *P->s == 'P';
+    const char *open = P->s + 1, *close = open;
+    if (open >= P->end || *open != '{')
+        return P->error = "invalid property name", -1;
+    while (close < P->end && *close != '}')
+        close++;
+    if (close >= P->end)
+        return P->error = "invalid property name", -1;
+    struct uset t = { 0 };
+    if (uc_add_property(P->J, &t, open + 1, (int)(close - open - 1)) < 0)
+        return P->error = "invalid property name", -1;
+    P->s = close + 1;
     if (negate)
-        bits[8] = 1;                    /* \W, \D, \S: any other character */
+        uset_invert(P->J, &t);
+    for (int i = 0; i < t.n; i++)
+        uset_add(P->J, u, t.r[i][0], t.r[i][1]);
+    return 0;
 }
 
 static int hexd(int c)
@@ -163,14 +208,23 @@ static int escape_char(struct rparser *P)
             hexd(P->s[3]) >= 0) {
             int v = hexd(P->s[0]) << 12 | hexd(P->s[1]) << 8 | hexd(P->s[2]) << 4 | hexd(P->s[3]);
             P->s += 4;
+            /* 😀: a surrogate pair is one character */
+            if (v >= 0xD800 && v < 0xDC00 && P->end - P->s >= 6 && P->s[0] == '\\' && P->s[1] == 'u' &&
+                hexd(P->s[2]) >= 0 && hexd(P->s[3]) >= 0 && hexd(P->s[4]) >= 0 && hexd(P->s[5]) >= 0) {
+                int lo = hexd(P->s[2]) << 12 | hexd(P->s[3]) << 8 | hexd(P->s[4]) << 4 | hexd(P->s[5]);
+                if (lo >= 0xDC00 && lo < 0xE000) {
+                    P->s += 6;
+                    v = 0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00);
+                }
+            }
             return v;
         }
         if (P->s < P->end && *P->s == '{') {
             const char *q = P->s + 1;
             int v = 0;
-            while (q < P->end && hexd(*q) >= 0)
+            while (q < P->end && hexd(*q) >= 0 && v <= 0x10FFFF)
                 v = v * 16 + hexd(*q++);
-            if (q < P->end && *q == '}') {
+            if (q < P->end && *q == '}' && v <= 0x10FFFF) {
                 P->s = q + 1;
                 return v;
             }
@@ -181,82 +235,157 @@ static int escape_char(struct rparser *P)
     }
 }
 
-/* A character (code point) as instructions: one R_CHAR per UTF-8 byte. */
+/* A character (code point) as instructions: one R_CHAR per UTF-8 byte, or
+ * an R_FOLD when /i makes it match characters beyond ASCII. */
 static void emit_char(struct rparser *P, struct frag *f, int cp)
 {
+    int wide = cp >= 0x80;
+    for (uint32_t o = uc_orbit((uint32_t)cp); P->re->icase && !wide && o != (uint32_t)cp; o = uc_orbit(o))
+        wide = o >= 0x80;
+    if (P->re->icase && wide) {
+        femit(P, f, R_FOLD, (int)uc_fold((uint32_t)cp), 0);
+        return;
+    }
     char buf[4];
     int n = cp < 0x80 ? (buf[0] = (char)cp, 1) : utf8_put(buf, cp);
     for (int i = 0; i < n; i++)
         femit(P, f, R_CHAR, (unsigned char)buf[i], 0);
 }
 
-static int parse_class(struct rparser *P, struct frag *f)
+static int class_char(struct rparser *P)
 {
-    int k = new_class(P);
-    uint32_t *bits = P->re->classes[k];
-    int negate = 0;
+    return (unsigned char)*P->s < 0x80 ? *P->s++ : utf8_next(&P->s, P->end);
+}
+
+static int class_body(struct rparser *P, struct uset *u, int *negate);
+
+/*
+ * One member of a class into u: a character or range, an escape for a set,
+ * and with v a nested class. 1 if it was a single character (lo), so a
+ * range may follow.
+ */
+static int class_atom(struct rparser *P, struct uset *u, int *lo)
+{
+    if (*P->s == '[' && P->re->vmode) {
+        P->s++;
+        int neg;
+        struct uset t = { 0 };
+        if (class_body(P, &t, &neg) < 0)
+            return -1;
+        if (neg)
+            uset_invert(P->J, &t);
+        for (int i = 0; i < t.n; i++)
+            uset_add(P->J, u, t.r[i][0], t.r[i][1]);
+        return 0;
+    }
+    if (*P->s == '\\') {
+        P->s++;
+        if (P->s >= P->end)
+            return P->error = "\\ at end of pattern", -1;
+        char e = *P->s;
+        if (strchr("dDwWsS", e)) {
+            P->s++;
+            class_escape(P->J, u, e);
+            return 0;
+        }
+        if ((e == 'p' || e == 'P') && P->re->unicode)
+            return class_property(P, u);
+        if (e == 'b') {
+            P->s++;
+            *lo = '\b';
+        } else if (e == '-') {
+            P->s++;
+            *lo = '-';
+        } else {
+            *lo = escape_char(P);
+        }
+        return 1;
+    }
+    *lo = class_char(P);
+    return 1;
+}
+
+/* After the [: the class up to and past its ], into u (as written: *negate says if it had ^). */
+static int class_body(struct rparser *P, struct uset *u, int *negate)
+{
+    *negate = 0;
     if (P->s < P->end && *P->s == '^') {
-        negate = 1;
+        *negate = 1;
         P->s++;
     }
-    int first = 1;
-    while (P->s < P->end && (*P->s != ']' || first)) {
-        first = 0;
-        int lo;
-        if (*P->s == '\\') {
-            P->s++;
-            if (P->s >= P->end)
-                break;
-            char e = *P->s;
-            if (strchr("dDwWsS", e)) {
-                P->s++;
-                class_escape(bits, e);
-                continue;
-            }
-            if (e == 'b') {
-                P->s++;
-                lo = '\b';
-            } else {
-                lo = escape_char(P);
-            }
-        } else {
-            const char *p = P->s;
-            lo = (unsigned char)*p < 0x80 ? *P->s++ : utf8_next(&P->s, P->end);
-            (void)p;
+    while (P->s < P->end && *P->s != ']') {     /* [] matches nothing, [^] anything */
+        /* v: A--B and A&&B, with the set so far as A */
+        if (P->re->vmode && P->end - P->s > 2 && (P->s[0] == '-' || P->s[0] == '&') && P->s[1] == P->s[0]) {
+            int minus = P->s[0] == '-';
+            P->s += 2;
+            struct uset t = { 0 };
+            int lo;
+            int r = class_atom(P, &t, &lo);
+            if (r < 0)
+                return -1;
+            if (r == 1)
+                uset_add(P->J, &t, (uint32_t)lo, (uint32_t)lo);
+            uset_combine(P->J, u, &t, minus);
+            continue;
         }
+        int lo;
+        int r = class_atom(P, u, &lo);
+        if (r < 0)
+            return -1;
+        if (r == 0)
+            continue;
         int hi = lo;
-        if (P->s + 1 < P->end && *P->s == '-' && P->s[1] != ']') {
+        if (P->s + 1 < P->end && *P->s == '-' && P->s[1] != ']' && P->s[1] != '-') {
             P->s++;
             if (*P->s == '\\') {
                 P->s++;
                 hi = escape_char(P);
             } else {
-                hi = (unsigned char)*P->s < 0x80 ? *P->s++ : utf8_next(&P->s, P->end);
+                hi = class_char(P);
             }
         }
         if (lo > hi)
             return P->error = "range out of order in character class", -1;
-        if (lo >= 0x80) {
-            /* A non-ASCII range: Latin-1 as a whole, and a flag for anything above. */
-            class_range(bits, 0x80, 0xFF);
-            if (hi >= 0x100)
-                bits[8] = 1;
-            continue;
-        }
-        class_range(bits, lo, hi < 0x80 ? hi : 0x7F);
-        if (hi >= 0x80)
-            class_range(bits, 0x80, 0xFF);
-        if (hi >= 0x100)
-            bits[8] = 1;
+        uset_add(P->J, u, (uint32_t)lo, (uint32_t)hi);
     }
     if (P->s >= P->end)
         return P->error = "unterminated character class", -1;
     P->s++;
-    if (negate) {
-        for (int i = 0; i < 8; i++)
-            bits[i] = ~bits[i];
-        bits[8] = !bits[8];
+    return 0;
+}
+
+static int parse_class(struct rparser *P, struct frag *f)
+{
+    int k = new_class(P);
+    struct rclass *c = &P->re->classes[k];
+    struct uset u = { 0 };
+    int negate;
+    if (class_body(P, &u, &negate) < 0)
+        return -1;
+    c = &P->re->classes[k];
+    c->set = u;
+    c->negate = negate;
+    finish_class(c);
+    femit(P, f, R_CLASS, k, 0);
+    return 0;
+}
+
+/* A set escape outside a class (\d, \p{L}...) as a class of its own. */
+static int escape_class(struct rparser *P, struct frag *f)
+{
+    int k = new_class(P);
+    struct uset u = { 0 };
+    char e = *P->s;
+    if (e == 'p' || e == 'P') {
+        if (class_property(P, &u) < 0)
+            return -1;
+    } else {
+        P->s++;
+        class_escape(P->J, &u, e);
     }
+    struct rclass *c = &P->re->classes[k];
+    c->set = u;
+    finish_class(c);
     femit(P, f, R_CLASS, k, 0);
     return 0;
 }
@@ -344,13 +473,8 @@ static int parse_atom(struct rparser *P, struct frag *f)
         if (P->s >= P->end)
             return P->error = "\\ at end of pattern", -1;
         char e = *P->s;
-        if (strchr("dDwWsS", e)) {
-            P->s++;
-            int k = new_class(P);
-            class_escape(P->re->classes[k], e);
-            femit(P, f, R_CLASS, k, 0);
-            return 0;
-        }
+        if (strchr("dDwWsS", e) || ((e == 'p' || e == 'P') && P->re->unicode))
+            return escape_class(P, f);
         if (e == 'b' || e == 'B') {
             P->s++;
             femit(P, f, e == 'b' ? R_WORDB : R_NWORDB, 0, 0);
@@ -515,7 +639,9 @@ struct regex *re_compile(struct js *J, const char *pattern, int len, const char 
         case 'm': re->multiline = 1; break;
         case 's': re->dotall = 1; break;
         case 'y': re->sticky = 1; break;
-        case 'u': case 'd': case 'v': break;
+        case 'u': re->unicode = 1; break;
+        case 'v': re->unicode = re->vmode = 1; break;
+        case 'd': break;
         default:
             *error = "invalid flags";
             return NULL;
@@ -581,6 +707,13 @@ static int lower(int c)
     return c >= 'A' && c <= 'Z' ? c + 32 : c;
 }
 
+/* Do the characters at a and b match, folding case for /i? Their sizes in *na and *nb. */
+static int same_char(const struct matcher *m, int a, int b, int *na, int *nb)
+{
+    int x = char_at(m->s, m->len, a, na), y = char_at(m->s, m->len, b, nb);
+    return x == y || (m->re->icase && uc_fold((uint32_t)x) == uc_fold((uint32_t)y));
+}
+
 static int is_word(int c)
 {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
@@ -628,30 +761,34 @@ static int run(struct matcher *m, int pc, int sp, int *caps)
             if (sp >= m->len || (!re->dotall && (m->s[sp] == '\n' || m->s[sp] == '\r'))) {
                 ok = 0;
             } else {
-                int size;
-                char_at(m->s, m->len, sp, &size);
-                pc++, sp += size;
+                int size, c = char_at(m->s, m->len, sp, &size);
+                if (!re->dotall && (c == 0x2028 || c == 0x2029))
+                    ok = 0;
+                else
+                    pc++, sp += size;
             }
             break;
         case R_CLASS: {
-            const uint32_t *bits = re->classes[in->x];
+            const struct rclass *k = &re->classes[in->x];
             if (sp >= m->len) {
                 ok = 0;
                 break;
             }
-            int size = 1, c = m->s[sp], hit;
-            if (c < 0x80) {
-                hit = class_has(bits, c);
-                if (!hit && re->icase)
-                    hit = class_has(bits, lower(c)) || class_has(bits, c >= 'a' && c <= 'z' ? c - 32 : c);
-            } else {
-                int cp = char_at(m->s, m->len, sp, &size);
-                hit = cp < 0x100 ? class_has(bits, cp) : (int)(bits[8] & 1);
-            }
-            if (hit)
+            int size = 1, c = m->s[sp];
+            if (c >= 0x80)
+                c = char_at(m->s, m->len, sp, &size);
+            if (class_match(re, k, (uint32_t)c))
                 pc++, sp += size;
             else
                 ok = 0;
+            break;
+        }
+        case R_FOLD: {
+            int size;
+            if (sp >= m->len || (int)uc_fold((uint32_t)char_at(m->s, m->len, sp, &size)) != in->x)
+                ok = 0;
+            else
+                pc++, sp += size;
             break;
         }
         case R_SPLIT:
@@ -699,16 +836,22 @@ static int run(struct matcher *m, int pc, int sp, int *caps)
                 break;
             }
             int n = caps[2 * g + 1] - caps[2 * g];
-            if (sp + n > m->len) {
-                ok = 0;
+            if (!re->icase) {
+                ok = sp + n <= m->len && !memcmp(m->s + caps[2 * g], m->s + sp, (size_t)n);
+                if (ok)
+                    pc++, sp += n;
                 break;
             }
-            for (int i = 0; i < n && ok; i++) {
-                int x = m->s[caps[2 * g] + i], y = m->s[sp + i];
-                ok = re->icase ? lower(x) == lower(y) : x == y;
+            int a = caps[2 * g], b = sp;  /* character by character, folded */
+            while (ok && a < caps[2 * g + 1]) {
+                int na, nb;
+                if (b >= m->len || !same_char(m, a, b, &na, &nb))
+                    ok = 0;
+                else
+                    a += na, b += nb;
             }
             if (ok)
-                pc++, sp += n;
+                pc++, sp = b;
             break;
         }
         case R_LBEND:                   /* the end of a lookbehind's pattern: only here */
@@ -787,6 +930,8 @@ int re_exec(struct regex *re, const char *s, int len, int start, int caps[2 * RE
     int found = -1;
     int anchored = re->code[1].op == R_BOL && !re->multiline;
     for (int at = start; at <= len; at++) {
+        if (at > start && at < len && ((unsigned char)s[at] & 0xC0) == 0x80)
+            continue;                   /* inside a character */
         for (int i = 0; i < 2 * RE_MAX_GROUPS; i++)
             caps[i] = -1;
         if (run(&m, 0, at, caps)) {

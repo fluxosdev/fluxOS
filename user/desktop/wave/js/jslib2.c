@@ -1,6 +1,6 @@
 /*
- * More of the JavaScript engine's built-in objects: Symbol (as strings that
- * start "@@", hidden from enumeration), Promise and its job queue, Reflect,
+ * More of the JavaScript engine's built-in objects: Symbol, BigInt, Promise
+ * and its job queue, Reflect,
  * WeakMap and WeakSet, generators and async functions' support, and the
  * newer methods of the older objects.
  */
@@ -17,6 +17,12 @@
 static struct jsstr *S(struct js *J, const char *s)
 {
     return js_mkstr(J, s, (int)strlen(s));
+}
+
+static jsval strv(struct jsstr *s)
+{
+    jsval v = { JS_STR, { .s = s } };
+    return v;
 }
 
 static struct jsobj *fn_obj(struct js *J, struct jsobj *on, const char *name, js_native f, int n)
@@ -44,39 +50,231 @@ static void put_value(struct js *J, struct jsobj *o, const char *name, jsval v)
 
 /* ---- Symbol ---- */
 
-static int symbol_count;
+static unsigned symbol_count;
+
+static jsval sym_value(struct js *J, const char *tag, struct jsstr *desc)
+{
+    int tl = (int)strlen(tag), n = 1 + tl + (desc ? 1 + desc->len : 0);
+    char *b = js_alloc_atomic(J, (size_t)n + 1);
+    b[0] = (char)0xFF;
+    memcpy(b + 1, tag, (size_t)tl);
+    if (desc) {
+        b[1 + tl] = (char)0xFF;
+        memcpy(b + 2 + tl, desc->s, (size_t)desc->len);
+    }
+    jsval v = { JS_SYM, { .s = js_mkstr(J, b, n) } };
+    return v;
+}
 
 static jsval symbol_ctor(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
     if (J->constructing)
         return js_throw_error(J, "TypeError: Symbol is not a constructor");
-    char buf[160];
-    const char *desc = argc && args[0].t != JS_UNDEF ? js_text(J, args[0]) : "";
-    snprintf(buf, sizeof(buf), "@@sym%d:%s", ++symbol_count, desc);
-    return js_str(J, buf);
+    struct jsstr *desc = argc && args[0].t != JS_UNDEF ? js_tostr(J, args[0]) : NULL;
+    if (J->throwing)
+        return js_undefined;
+    char tag[16];
+    snprintf(tag, sizeof(tag), "u%u", ++symbol_count);
+    return sym_value(J, tag, desc);
 }
 
 static jsval symbol_for(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
-    char buf[160];
-    snprintf(buf, sizeof(buf), "@@for:%s", js_text(J, ARG(0)));
-    return js_str(J, buf);
+    struct jsstr *key = ARG(0).t == JS_SYM ? js_sym_text(J, args[0].u.s) : js_tostr(J, ARG(0));
+    return sym_value(J, "r", key);
+}
+
+static jsval symbol_key_for(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    if (ARG(0).t != JS_SYM)
+        return js_throw_error(J, "TypeError: Symbol.keyFor needs a symbol");
+    struct jsstr *k = args[0].u.s;
+    if (k->len < 2 || k->s[1] != 'r')
+        return js_undefined;
+    struct jsstr *d = js_sym_desc(J, k);
+    return d ? strv(d) : js_undefined;
+}
+
+static struct jsstr *this_symbol(struct js *J, jsval self)
+{
+    if (self.t == JS_SYM)
+        return self.u.s;
+    js_throw_error(J, "TypeError: not a Symbol");
+    return NULL;
+}
+
+static jsval symbol_to_string(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct jsstr *k = this_symbol(J, self);
+    return k ? strv(js_sym_text(J, k)) : js_undefined;
+}
+
+static jsval symbol_value_of(struct js *J, jsval self, jsval *args, int argc)
+{
+    return this_symbol(J, self) ? self : js_undefined;
+}
+
+static jsval symbol_description(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct jsstr *k = this_symbol(J, self), *d = k ? js_sym_desc(J, k) : NULL;
+    return d ? strv(d) : js_undefined;
+}
+
+static void getter(struct js *J, struct jsobj *on, const char *name, js_native f)
+{
+    struct jsstr *key = S(J, name);
+    js_put(J, on, key, js_undefined, 1);
+    js_own(on, key)->getter = js_new_function(J, f, name, 0).u.o;
 }
 
 static void init_symbol(struct js *J)
 {
-    struct jsobj *sym = ctor_obj(J, "Symbol", symbol_ctor, 0, NULL);
+    J->symbol_proto = js_new_object(J);
+    struct jsobj *sym = ctor_obj(J, "Symbol", symbol_ctor, 0, J->symbol_proto);
     fn_obj(J, sym, "for", symbol_for, 1);
+    fn_obj(J, sym, "keyFor", symbol_key_for, 1);
     static const char *const well_known[] = {
         "iterator", "asyncIterator", "hasInstance", "toPrimitive", "toStringTag", "species",
+        "isConcatSpreadable", "match", "matchAll", "replace", "search", "split", "unscopables",
+        "dispose", "asyncDispose",
     };
     for (unsigned i = 0; i < sizeof(well_known) / sizeof(well_known[0]); i++) {
-        char buf[48];
-        snprintf(buf, sizeof(buf), "@@%s", well_known[i]);
-        put_value(J, sym, well_known[i], js_str(J, buf));
+        char d[48];
+        snprintf(d, sizeof(d), "Symbol.%s", well_known[i]);
+        put_value(J, sym, well_known[i], sym_value(J, "w", S(J, d)));
     }
+    fn_obj(J, J->symbol_proto, "toString", symbol_to_string, 0);
+    fn_obj(J, J->symbol_proto, "valueOf", symbol_value_of, 0);
+    fn_obj(J, J->symbol_proto, SYM_TO_PRIMITIVE, symbol_value_of, 1);
+    getter(J, J->symbol_proto, "description", symbol_description);
+    put_value(J, J->symbol_proto, SYM_TO_STRING_TAG, js_str(J, "Symbol"));
+}
+
+/* ---- BigInt ---- */
+
+/* ToBigInt: booleans, strings and BigInts; anything else is a TypeError (a SyntaxError for bad text). */
+static struct jsbig *to_bigint(struct js *J, jsval v)
+{
+    v = js_to_primitive(J, v, 0);
+    if (J->throwing)
+        return NULL;
+    switch (v.t) {
+    case JS_BIG: return v.u.g;
+    case JS_BOOL: return jb_from_u64(J, (uint64_t)v.u.b, 0);
+    case JS_STR: {
+        struct jsbig *g = jb_parse(J, v.u.s->s, v.u.s->len, 0, 1);
+        if (!g && !J->throwing)
+            js_throw_error(J, "SyntaxError: Cannot convert %s to a BigInt", v.u.s->s);
+        return g;
+    }
+    default:
+        js_throw_error(J, "TypeError: Cannot convert %s to a BigInt", js_text(J, v));
+        return NULL;
+    }
+}
+
+static jsval bigint_ctor(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    if (J->constructing)
+        return js_throw_error(J, "TypeError: BigInt is not a constructor");
+    jsval v = js_to_primitive(J, ARG(0), 0);
+    if (J->throwing)
+        return js_undefined;
+    if (v.t == JS_NUM) {
+        if (isnan(v.u.n) || isinf(v.u.n) || v.u.n != trunc(v.u.n))
+            return js_throw_error(J, "RangeError: The number %s cannot be converted to a BigInt because it is not an integer",
+                                  js_text(J, v));
+        return js_bigv(jb_from_double(J, v.u.n));
+    }
+    struct jsbig *g = to_bigint(J, v);
+    return g ? js_bigv(g) : js_undefined;
+}
+
+static jsval bigint_as_n(struct js *J, jsval *args, int argc, int is_signed)
+{
+    double bits = js_to_number(J, ARG(0));
+    if (isnan(bits))
+        bits = 0;
+    bits = trunc(bits);
+    if (bits < 0 || bits > 9007199254740991.0)
+        return js_throw_error(J, "RangeError: Invalid value: not (convertible to) a safe integer");
+    struct jsbig *g = to_bigint(J, ARG(1));
+    if (!g)
+        return js_undefined;
+    struct jsbig *r = jb_as_n(J, bits > 4294967295.0 ? 0xFFFFFFFFu : (uint32_t)bits, g, is_signed);
+    return r ? js_bigv(r) : js_undefined;
+}
+
+static jsval bigint_as_int_n(struct js *J, jsval self, jsval *args, int argc)
+{
+    return bigint_as_n(J, args, argc, 1);
+}
+
+static jsval bigint_as_uint_n(struct js *J, jsval self, jsval *args, int argc)
+{
+    return bigint_as_n(J, args, argc, 0);
+}
+
+static struct jsbig *this_bigint(struct js *J, jsval self)
+{
+    if (self.t == JS_BIG)
+        return self.u.g;
+    js_throw_error(J, "TypeError: not a BigInt");
+    return NULL;
+}
+
+static jsval bigint_to_string(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct jsbig *g = this_bigint(J, self);
+    if (!g)
+        return js_undefined;
+    int radix = 10;
+    if (ARG(0).t != JS_UNDEF) {
+        double r = js_to_number(J, args[0]);
+        if (!(r >= 2 && r <= 36))
+            return js_throw_error(J, "RangeError: toString() radix must be between 2 and 36");
+        radix = (int)r;
+    }
+    return strv(jb_tostr(J, g, radix));
+}
+
+static jsval bigint_to_locale_string(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct jsbig *g = this_bigint(J, self);
+    if (!g)
+        return js_undefined;
+    struct jsstr *d = jb_tostr(J, g, 10);       /* grouped by threes, as en-US has it */
+    int digits = d->len - g->neg, n = d->len + (digits - 1) / 3;
+    char *b = js_alloc_atomic(J, (size_t)n + 1);
+    int o = 0;
+    for (int i = 0; i < d->len; i++) {
+        b[o++] = d->s[i];
+        int left = d->len - 1 - i;
+        if (left && left % 3 == 0 && d->s[i] != '-')
+            b[o++] = ',';
+    }
+    return strv(js_mkstr(J, b, o));
+}
+
+static jsval bigint_value_of(struct js *J, jsval self, jsval *args, int argc)
+{
+    return this_bigint(J, self) ? self : js_undefined;
+}
+
+static void init_bigint(struct js *J)
+{
+    J->bigint_proto = js_new_object(J);
+    struct jsobj *big = ctor_obj(J, "BigInt", bigint_ctor, 1, J->bigint_proto);
+    fn_obj(J, big, "asIntN", bigint_as_int_n, 2);
+    fn_obj(J, big, "asUintN", bigint_as_uint_n, 2);
+    fn_obj(J, J->bigint_proto, "toString", bigint_to_string, 0);
+    fn_obj(J, J->bigint_proto, "toLocaleString", bigint_to_locale_string, 0);
+    fn_obj(J, J->bigint_proto, "valueOf", bigint_value_of, 0);
+    put_value(J, J->bigint_proto, SYM_TO_STRING_TAG, js_str(J, "BigInt"));
 }
 
 /* ---- Promise ---- */
@@ -644,6 +842,10 @@ static const struct lazy_chunk {
      {"Reflect", "WeakMap", "WeakSet", "WeakRef", "FinalizationRegistry", "AggregateError", "DOMException",
       NULL}},
     {js_chunk_misc, sizeof(js_chunk_misc) - 1, {"structuredClone", "btoa", "atob", "Intl", NULL}},
+    {js_chunk_idb,
+     sizeof(js_chunk_idb) - 1,
+     {"indexedDB", "IDBFactory", "IDBKeyRange", "IDBDatabase", "IDBTransaction", "IDBObjectStore", "IDBIndex",
+      "IDBCursor", "IDBCursorWithValue", "IDBRequest", "IDBOpenDBRequest", "IDBVersionChangeEvent", NULL}},
     {js_chunk_events, sizeof(js_chunk_events) - 1, {"EventTarget", "AbortSignal", "AbortController", NULL}},
     {js_chunk_url, sizeof(js_chunk_url) - 1, {"URLSearchParams", "URL", "URLPattern", NULL}},
     {js_chunk_observers,
@@ -652,7 +854,7 @@ static const struct lazy_chunk {
     {js_chunk_web,
      sizeof(js_chunk_web) - 1,
      {"TextEncoder", "TextDecoder", "crypto", "CryptoKey", "Blob", "FormData", "DOMParser", "customElements", "CSS",
-      "Notification", "DOMRect", "postMessage", "File", "FileList", "FileReader", NULL}},
+      "Notification", "DOMRect", "File", "FileList", "FileReader", NULL}},
     {js_chunk_fetch,
      sizeof(js_chunk_fetch) - 1,
      {"Headers", "Response", "Request", "ReadableStream", "WritableStream", "TransformStream",
@@ -730,6 +932,7 @@ static void init_prelude(struct js *J)
 void js_init_lib2(struct js *J)
 {
     init_symbol(J);
+    init_bigint(J);
     init_promise(J);
     init_prelude(J);
     if (js_eval(J, js_binary_lib, sizeof(js_binary_lib) - 1, "binary library") < 0)

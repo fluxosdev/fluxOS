@@ -42,6 +42,28 @@ int main(int argc, char **argv)
     memset(pixels, 0, sizeof(pixels));
     wfont_draw(&surface, f, 0, 0, "???", 3, 0xffffff);
     CHECK(memcmp(before, pixels, sizeof(pixels)) != 0);
-    puts("browser fonts: Latin, Greek and Cyrillic glyph rendering passed");
+    /* Color emoji: their own colors, not the text's; U+FE0F asks for one. */
+    static unsigned int emo[80 * 40];
+    struct surface es = {0};
+    es.px = emo;
+    es.stride = 80;
+    es.clip = (struct rect){0, 0, 80, 40};
+    int ew = wfont_width(f, "\xF0\x9F\x98\x80", 4);         /* U+1F600 */
+    CHECK(ew >= 16 && ew <= 22);
+    CHECK(wfont_draw(&es, f, 0, 0, "\xF0\x9F\x98\x80", 4, 0xffffff) == ew);
+    int yellow = 0;
+    for (int i = 0; i < 80 * 40; i++)
+        yellow += (emo[i] >> 16 & 255) > 180 && (emo[i] >> 8 & 255) > 120 && (emo[i] & 255) < 90;
+    CHECK(yellow > 20);
+    int reds[2];
+    for (int k = 0; k < 2; k++) {                            /* U+2764 alone, then with U+FE0F */
+        memset(emo, 0, sizeof(emo));
+        wfont_draw(&es, f, 0, 0, "\xE2\x9D\xA4\xEF\xB8\x8F", k ? 6 : 3, 0xffffff);
+        reds[k] = 0;
+        for (int i = 0; i < 80 * 40; i++)
+            reds[k] += (emo[i] >> 16 & 255) > 150 && (emo[i] >> 8 & 255) < 80;
+    }
+    CHECK(reds[0] == 0 && reds[1] > 20);
+    puts("browser fonts: Latin, Greek and Cyrillic glyph rendering and color emoji passed");
     return 0;
 }

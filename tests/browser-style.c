@@ -297,8 +297,93 @@ static void shadow_selectors_and_adoption(void)
     arena_free(&a);
 }
 
+static void set_class(struct node *n, const char *value)
+{
+    for (struct attr *at = n->attrs; at; at = at->next)
+        if (!strcmp(at->name, "class")) {
+            at->value = (char *)value;
+            return;
+        }
+}
+static int near(int a, int b, int slack) { return a >= b - slack && a <= b + slack; }
+static int took(struct node *root, const char *type, const char *name)
+{
+    struct anim_event ev;
+    while (anim_take_event(root, &ev))
+        if (!strcmp(ev.type, type) && !strcmp(ev.name, name))
+            return 1;
+    return 0;
+}
+static void transitions_and_animations(void)
+{
+    struct arena a = {0};
+    const char *html = "<!doctype html><div id='t' class='a'></div><div id='k'></div><div id='s'></div>"
+                       "<div id='f' style='opacity: .5'><p id='inherits'>x</p></div>";
+    struct node *root = html_parse(&a, html, (int)strlen(html));
+    const char *css =
+        "#t { transition: opacity 1s linear, background-color 1s linear .5s; background-color: rgb(0,0,0) }"
+        "#t.b { opacity: 0; background-color: rgb(200, 100, 0) }"
+        "@keyframes slide { from { margin-left: 0 } 50% { margin-left: 100px } to { margin-left: 50px } }"
+        "#k { animation: slide 2s linear 2 alternate both }"
+        "@-webkit-keyframes spin { to { -webkit-transform: rotate(360deg) } }"
+        "#s { -webkit-animation: spin 1s linear infinite }"
+        "@keyframes tint { from { color: rgb(0, 0, 0) } to { color: rgb(0, 0, 200) } }"
+        "#f { animation-name: tint; animation-duration: 1s; animation-timing-function: linear }";
+    struct sheet *sheet = css_parse(&a, css, (int)strlen(css), 800);
+    struct node *t = id(root, "t"), *k = id(root, "k"), *s = id(root, "s"), *f = id(root, "f");
+    CHECK(sheet && t && k && s && f);
+    anim_now = 1000;
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(t->style->opacity == 255 && t->style->ntrans == 2 && !anim_running(t));
+    CHECK(f->style->opacity == 128);
+    CHECK(k->style->nanims == 1 && k->style->margin[3].v == 0 && anim_running(k));
+    CHECK(took(root, "animationstart", "slide"));
+    /* The class changes: both properties start (one after its delay). */
+    set_class(t, "a b");
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(anim_running(t) && t->style->opacity == 255 && t->style->bg == OPAQUE(0));
+    anim_now = 1500;
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(near(t->style->opacity, 128, 1) && t->style->bg == OPAQUE(0));
+    CHECK(k->style->margin[3].v == 50);                     /* 25%: halfway to 100px */
+    CHECK(s->style->xf && s->style->xf->n == 1 && s->style->xf->op[0].kind == TF_ROTATE &&
+          s->style->xf->op[0].a > 3.1f && s->style->xf->op[0].a < 3.2f);  /* halfway round */
+    CHECK(id(root, "inherits")->style->color == f->style->color && near(f->style->color & 255, 100, 1));
+    anim_now = 2000;
+    struct node *again = root;                              /* a frame only restyles what moves */
+    CHECK(css_restyle_animated(&a, again, &sheet, 1, 800, 600, NULL, NULL) == 1);
+    CHECK(t->style->opacity == 0 && near(t->style->bg >> 16 & 255, 100, 1) && near(t->style->bg >> 8 & 255, 50, 1));
+    CHECK(k->style->margin[3].v == 100);
+    anim_now = 2500;
+    CHECK(css_restyle_animated(&a, root, &sheet, 1, 800, 600, NULL, NULL) == 1);
+    CHECK(k->style->margin[3].v == 75 && t->style->bg == OPAQUE(0xC86400));
+    CHECK(took(root, "transitionend", "opacity"));
+    anim_now = 3500;                                        /* the second, reversed iteration */
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(k->style->margin[3].v == 75 && !anim_running(t));
+    anim_now = 9000;                                        /* both done: filled forwards at 0 */
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(k->style->margin[3].v == 0 && !anim_running(k) && anim_running(s));
+    CHECK(took(root, "animationend", "slide"));
+    /* Going back halfway through takes only as long as it has come. */
+    set_class(t, "a");
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    anim_now = 9500;
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(near(t->style->opacity, 128, 1));
+    set_class(t, "a b");
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    anim_now = 9750;
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(near(t->style->opacity, 64, 2));                  /* half of the half second left */
+    anim_forget(root);
+    CHECK(!anim_take_event(root, &(struct anim_event){0}));
+    arena_free(&a);
+}
+
 int main(void)
 {
+    transitions_and_animations();
     entities(); cascade(); cascade_layers(); shadow_selectors_and_adoption(); selector_specificity(); nth_boundaries();
     text_and_interaction_properties(); state_pseudo_classes(); backgrounds_and_overflow(); counters_and_selectors();
     puts("browser HTML/CSS: named references, filtered siblings, cascade specificity and new properties passed");

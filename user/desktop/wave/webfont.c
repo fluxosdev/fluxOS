@@ -12,6 +12,7 @@
  * size asked for and kept in a cache.
  */
 #include <fcntl.h>
+#include <inflate.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -222,6 +223,8 @@ static const struct wfont *downloaded_font(int family, int bold, int italic, int
     group->fonts = f;
     return f;
 }
+static int emoji_wanted(int cp, const char *p, const char *end);
+
 static int downloaded_width(const struct wfont *f, const char *text, int length)
 {
     FT_Face face = f->face;
@@ -234,8 +237,10 @@ static int downloaded_width(const struct wfont *f, const char *text, int length)
         const char *start = p;
         int cp = utf8_next(&p, end);
         FT_UInt glyph = FT_Get_Char_Index(face, (FT_ULong)cp);
-        if (!glyph) {
+        if (!glyph || emoji_wanted(cp, p, end)) {
             const struct wfont *fallback = wfont_get(FAM_SANS, f->style & 1, f->style & 2, f->px);
+            if (end - p >= 3 && !memcmp(p, "\xEF\xB8\x8F", 3))
+                p += 3;                 /* U+FE0F goes with it: it asks for the emoji */
             if (fallback)
                 pen += wfont_width(fallback, start, (int)(p - start)) * 64;
             previous = 0;
@@ -267,8 +272,10 @@ static int downloaded_draw(struct surface *s, const struct wfont *f, int x, int 
         const char *start = p;
         int cp = utf8_next(&p, end);
         FT_UInt glyph = FT_Get_Char_Index(face, (FT_ULong)cp);
-        if (!glyph) {
+        if (!glyph || emoji_wanted(cp, p, end)) {
             const struct wfont *fallback = wfont_get(FAM_SANS, f->style & 1, f->style & 2, f->px);
+            if (end - p >= 3 && !memcmp(p, "\xEF\xB8\x8F", 3))
+                p += 3;                 /* U+FE0F goes with it: it asks for the emoji */
             if (fallback)
                 pen += wfont_draw(s, fallback, x + ((pen + 32) >> 6), y + f->ascent - fallback->ascent, start,
                                   (int)(p - start), color) *
@@ -570,13 +577,15 @@ static int cjk_find(uint32_t cp)
 }
 
 struct nglyph {
-    uint32_t cp;
+    uint32_t cp;                        /* | NG_EMOJI for a color emoji */
     uint8_t px, state;                  /* state: 0 empty, 1 drawable, 2 nobody has it */
     uint8_t w, h;
     int16_t left, top;                  /* the ink's left edge from the pen, its top above the baseline */
     uint16_t adv;                       /* in 1/16 pixels */
     uint8_t *cov;                       /* h rows of w coverage values 0-15 */
+    uint32_t *rgba;                     /* a color emoji instead: h rows of w premultiplied 0xAARRGGBB */
 };
+#define NG_EMOJI 0x40000000u
 #define NG_CACHE 1024
 #define NG_BYTES (3u << 20)
 static struct nglyph ng_cache[NG_CACHE];
@@ -716,12 +725,150 @@ static int ng_render_face(struct nglyph *g, FT_Face face, FT_UInt gi, int px)
     return 1;
 }
 
+/* ---- color emoji: tools/mkemoji.py's pack, its index read when one is first wanted ---- */
+
+static struct {
+    int tried, fd;
+    uint32_t count, size;
+    uint32_t *cps, *offs;
+} emoji = { 0, -1, 0, 0, NULL, NULL };
+
+static int emoji_load(void)
+{
+    if (emoji.cps)
+        return 1;
+    if (emoji.tried)
+        return 0;
+    emoji.tried = 1;
+    int fd = open(NOTO_DIR "emoji.fxe", O_RDONLY);
+    unsigned char h[12];
+    if (fd < 0)
+        return 0;
+    if (read(fd, h, 12) != 12 || memcmp(h, "FXEM", 4)) {
+        close(fd);
+        return 0;
+    }
+    uint32_t n = (uint32_t)h[4] | (uint32_t)h[5] << 8 | (uint32_t)h[6] << 16 | (uint32_t)h[7] << 24;
+    uint32_t size = (uint32_t)h[8] | (uint32_t)h[9] << 8;
+    uint32_t *table = n && n < 100000 && size && size < 256 ? malloc(4 * (2 * (size_t)n + 1)) : NULL;
+    size_t want = 4 * (2 * (size_t)n + 1), got = 0;
+    long r = 1;
+    while (table && got < want && (r = read(fd, (char *)table + got, want - got)) > 0)
+        got += (size_t)r;
+    if (!table || got != want) {
+        free(table);
+        close(fd);
+        return 0;
+    }
+    emoji.fd = fd;
+    emoji.count = n;
+    emoji.size = size;
+    emoji.cps = table;
+    emoji.offs = table + n;
+    return 1;
+}
+
+/* The pack's entry for a character, or -1; *dflt: it is an emoji even without U+FE0F after it. */
+static int emoji_find(uint32_t cp, int *dflt)
+{
+    int lo = 0, hi = (int)emoji.count - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        uint32_t c = emoji.cps[mid] & 0x7FFFFFFF;
+        if (c == cp) {
+            *dflt = (int)(emoji.cps[mid] >> 31);
+            return mid;
+        }
+        if (c < cp)
+            lo = mid + 1;
+        else
+            hi = mid - 1;
+    }
+    return -1;
+}
+
+/* Should cp, with the text after it at p, be drawn as a color emoji? */
+static int emoji_wanted(int cp, const char *p, const char *end)
+{
+    if (cp < 0xA9 || (cp >= 0x2E80 && cp < 0x1F000 && cp != 0x3030 && cp != 0x303D && cp != 0x3297 && cp != 0x3299))
+        return 0;
+    if (cp < 0x2000 && cp != 0xA9 && cp != 0xAE)
+        return 0;
+    int vs16 = end - p >= 3 && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xB8 && (unsigned char)p[2] == 0x8F;
+    if (cp < 0x1F000 && !vs16 && !(cp >= 0x231A && cp <= 0x2B55))
+        return 0;                       /* text by default, and asked for no emoji */
+    if (!emoji_load())
+        return 0;
+    int dflt;
+    return emoji_find((uint32_t)cp, &dflt) >= 0 && (dflt || vs16);
+}
+
+/* The pack's square scaled to t x t (an area average: each source pixel weighs what it covers). */
+static void emoji_scale(const uint8_t *src, int s, uint32_t *dst, int t)
+{
+    for (int y = 0; y < t; y++)
+        for (int x = 0; x < t; x++) {
+            float y0 = (float)y * s / t, y1 = (float)(y + 1) * s / t, x0 = (float)x * s / t, x1 = (float)(x + 1) * s / t;
+            float acc[4] = { 0 }, area = 0;
+            for (int sy = (int)y0; sy < s && sy < y1; sy++) {
+                float wy = (sy + 1 < y1 ? sy + 1 : y1) - (sy > y0 ? sy : y0);
+                for (int sx = (int)x0; sx < s && sx < x1; sx++) {
+                    float w = wy * ((sx + 1 < x1 ? sx + 1 : x1) - (sx > x0 ? sx : x0));
+                    const uint8_t *p = src + 4 * ((size_t)sy * (size_t)s + (size_t)sx);
+                    for (int k = 0; k < 4; k++)
+                        acc[k] += w * p[k];
+                    area += w;
+                }
+            }
+            uint32_t c[4];
+            for (int k = 0; k < 4; k++) {
+                float v = area > 0 ? acc[k] / area : 0;
+                c[k] = (uint32_t)(v > 255 ? 255 : v + .5f);
+            }
+            dst[y * t + x] = c[3] << 24 | c[0] << 16 | c[1] << 8 | c[2];
+        }
+}
+
+static int ng_render_emoji(struct nglyph *g, uint32_t cp, int px)
+{
+    int dflt, i = emoji_find(cp, &dflt);
+    if (i < 0)
+        return 0;
+    uint32_t at = emoji.offs[i], len = emoji.offs[i + 1] - at;
+    uint8_t *packed = len && len < (1u << 20) ? malloc(len) : NULL;
+    if (!packed || lseek(emoji.fd, (off_t)at, SEEK_SET) < 0 || read(emoji.fd, packed, len) != (long)len) {
+        free(packed);
+        return 0;
+    }
+    uint8_t *pixels = NULL;
+    size_t n = 0, s = emoji.size;
+    int bad = inflate_buf(packed, len, INFLATE_ZLIB, &pixels, &n, 4 * s * s);
+    free(packed);
+    int t = (px * 9 + 4) / 8;           /* a little taller than the letters, as browsers draw them */
+    if (bad || n != 4 * s * s || t < 1 || t > 255 || !(g->rgba = malloc(sizeof(uint32_t) * (size_t)t * (size_t)t))) {
+        free(pixels);
+        return 0;
+    }
+    emoji_scale(pixels, (int)s, g->rgba, t);
+    free(pixels);
+    g->w = g->h = (uint8_t)t;
+    g->left = 0;
+    g->top = (int16_t)((t * 7 + 4) / 8);
+    g->adv = (uint16_t)((t + 1) * 16);
+    return 1;
+}
+
 static void ng_make(struct nglyph *g, uint32_t cp, int px)
 {
     memset(g, 0, sizeof(*g));
     g->cp = cp;
     g->px = (uint8_t)px;
     g->state = 2;
+    if (cp & NG_EMOJI) {
+        if (ng_render_emoji(g, cp & ~NG_EMOJI, px))
+            g->state = 1;
+        return;
+    }
     if (cp >= 0x2E80 && cjk_load()) {
         int idx = cjk_find(cp);
         if (idx >= 0 && ng_render_cjk(g, idx, px)) {
@@ -741,12 +888,13 @@ static const struct nglyph *ng_get(uint32_t cp, int px, struct nglyph *tmp)
     struct nglyph *g = &ng_cache[((cp * 2654435761u) ^ ((uint32_t)px * 40503u)) >> 22 & (NG_CACHE - 1)];
     if (g->state && g->cp == cp && g->px == px)
         return g->state == 1 ? g : NULL;
-    if (g->cov) {
-        ng_bytes -= (size_t)g->w * g->h;
+    if (g->cov || g->rgba) {
+        ng_bytes -= (size_t)g->w * g->h * (g->rgba ? 4 : 1);
         free(g->cov);
+        free(g->rgba);
     }
     ng_make(g, cp, px);
-    size_t size = (size_t)g->w * g->h;
+    size_t size = (size_t)g->w * g->h * (g->rgba ? 4 : 1);
     if (g->state == 1 && ng_bytes + size > NG_BYTES) {   /* too much cached: draw this one and drop it */
         *tmp = *g;
         memset(g, 0, sizeof(*g));
@@ -766,8 +914,31 @@ static int zero_width(int cp)
 static void ng_paint(struct surface *s, const struct nglyph *g, int gx, int gy, color_t c)
 {
     struct rect clip = s->clip;
-    if (!g->cov || gx >= clip.x + clip.w || gx + g->w <= clip.x || gy >= clip.y + clip.h || gy + g->h <= clip.y)
+    if ((!g->cov && !g->rgba) || gx >= clip.x + clip.w || gx + g->w <= clip.x || gy >= clip.y + clip.h ||
+        gy + g->h <= clip.y)
         return;
+    if (g->rgba) {                      /* a color emoji: its own colors, over what is there */
+        for (int j = 0; j < g->h; j++) {
+            int py = gy + j;
+            if (py < clip.y || py >= clip.y + clip.h)
+                continue;
+            const uint32_t *row = g->rgba + j * g->w;
+            uint32_t *dst = s->px + py * s->stride;
+            for (int i = 0; i < g->w; i++) {
+                int px = gx + i;
+                uint32_t p = row[i], a = p >> 24;
+                if (!a || px < clip.x || px >= clip.x + clip.w)
+                    continue;
+                uint32_t under = dst[px], out = 0;
+                for (int sh = 0; sh <= 16; sh += 8) {
+                    uint32_t v = (p >> sh & 255) + ((under >> sh & 255) * (255 - a) + 127) / 255;
+                    out |= (v > 255 ? 255 : v) << sh;
+                }
+                dst[px] = out;
+            }
+        }
+        return;
+    }
     __m128i cv = px_unpack(c);
     for (int j = 0; j < g->h; j++) {
         int py = gy + j;
@@ -883,7 +1054,7 @@ static int width16(const struct wfont *f, const char *s, int n)
     const char *end = s + n;
     int w = 0;
     while (s < end) {
-        int cp = utf8_next(&s, end), g = glyph_find(cp);
+        int cp = utf8_next(&s, end), g = cp >= 0xA9 && emoji_wanted(cp, s, end) ? -1 : glyph_find(cp);
         if (g >= 0) {
             w += f->glyphs[g].advance;
             continue;
@@ -891,10 +1062,11 @@ static int width16(const struct wfont *f, const char *s, int n)
         if (zero_width(cp))
             continue;
         struct nglyph tmp;
-        const struct nglyph *ng = ng_get((uint32_t)cp, f->px, &tmp);
+        uint32_t key = (uint32_t)cp | (cp >= 0xA9 && emoji_wanted(cp, s, end) ? NG_EMOJI : 0);
+        const struct nglyph *ng = ng_get(key, f->px, &tmp);
         w += ng ? ng->adv : f->glyphs[question].advance;
         if (ng == &tmp)
-            free(tmp.cov);
+            free(tmp.cov), free(tmp.rgba);
     }
     return w;
 }
@@ -916,20 +1088,21 @@ int wfont_draw(struct surface *s, const struct wfont *f, int x, int y, const cha
     c &= 0xFFFFFF;
     __m128i cv = px_unpack(c); /* blended in an XMM register (simd.h) */
     while (str < end) {
-        int cp = utf8_next(&str, end), gi = glyph_find(cp);
+        int cp = utf8_next(&str, end), color = cp >= 0xA9 && emoji_wanted(cp, str, end);
+        int gi = color ? -1 : glyph_find(cp);
         if (gi < 0) {
             if (zero_width(cp))
                 continue;
             struct nglyph tmp;
-            const struct nglyph *ng = ng_get((uint32_t)cp, f->px, &tmp);
+            const struct nglyph *ng = ng_get((uint32_t)cp | (color ? NG_EMOJI : 0), f->px, &tmp);
             if (ng) {
                 int nx = x + ((pen + 8) >> 4) + ng->left, ny = y + f->ascent - ng->top;
                 ng_paint(s, ng, nx, ny, c);
-                if (f->style & 1)       /* no bold of these: smear it */
+                if ((f->style & 1) && !ng->rgba)        /* no bold of these: smear it */
                     ng_paint(s, ng, nx + 1, ny, c);
                 pen += ng->adv;
                 if (ng == &tmp)
-                    free(tmp.cov);
+                    free(tmp.cov), free(tmp.rgba);
                 continue;
             }
             gi = question;

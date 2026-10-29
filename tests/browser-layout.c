@@ -249,6 +249,64 @@ static void background_pixels(void)
     unload(&p);
 }
 
+/* opacity: a box's items put down that much fainter, nested boxes multiplying. */
+static void opacity_pixels(void)
+{
+    struct page p;
+    load(&p,"<style>body{margin:0}div{width:4px;height:4px;background:red;opacity:.5}"
+            "#outer{background:transparent;opacity:.5;width:8px}#outer div{opacity:1;background:blue}</style>"
+            "<div></div><div id='outer'><div></div></div>",8,8);
+    uint32_t pixels[64]={0};
+    struct surface surface={pixels,8,8,8,{0,0,8,8}};
+    paint_document(&p.lo,&surface,0,0,0,0,NULL,0);
+    CHECK(pixels[0]==0xff8080 || pixels[0]==0xff7f7f);
+    CHECK(pixels[5*8+1]==0x7f7fff || pixels[5*8+1]==0x8080ff);
+    CHECK(pixels[4]==0xffffff);
+    unload(&p);
+}
+
+/* Stacking: positioned boxes over the flow, z-index among siblings and inside contexts. */
+static uint32_t stack_pixel(const char *html, int x, int y)
+{
+    struct page p;
+    load(&p, html, 16, 16);
+    uint32_t pixels[256] = {0};
+    struct surface surface = {pixels, 16, 16, 16, {0, 0, 16, 16}};
+    paint_document(&p.lo, &surface, 0, 0, 0, 0, NULL, 0);
+    unload(&p);
+    return pixels[y * 16 + x];
+}
+
+static void stacking(void)
+{
+    /* An absolute menu paints over the content that follows it. */
+    CHECK(stack_pixel("<style>body{margin:0}</style><div style='position:relative'>"
+                      "<div style='position:absolute;top:0;left:0;width:4px;height:4px;background:red'></div></div>"
+                      "<div style='width:8px;height:8px;background:blue'></div>", 1, 1) == 0xff0000);
+    /* z-index on relative boxes, against document order. */
+    CHECK(stack_pixel("<style>body{margin:0}div{position:relative;width:4px;height:4px}</style>"
+                      "<div style='z-index:2;background:red'></div><div style='top:-4px;z-index:1;background:blue'></div>",
+                      1, 1) == 0xff0000);
+    /* A child's z-index counts only inside its parent's stacking context. */
+    CHECK(stack_pixel("<style>body{margin:0}div{position:relative;width:4px;height:4px}</style>"
+                      "<div style='z-index:1'><div style='z-index:100;background:red'></div></div>"
+                      "<div style='top:-4px;z-index:2;background:blue'></div>", 1, 1) == 0x0000ff);
+    /* A negative z-index goes under the flow, but over its context's own background. */
+    CHECK(stack_pixel("<style>body{margin:0}</style><div style='position:relative;z-index:0;background:yellow;"
+                      "width:8px;height:8px'><div style='position:absolute;z-index:-1;width:4px;height:4px;"
+                      "background:red'></div></div>", 1, 1) == 0xff0000);
+    CHECK(stack_pixel("<style>body{margin:0}</style><div style='position:absolute;z-index:-1;width:4px;height:4px;"
+                      "background:red'></div><div style='width:8px;height:8px;background:blue'></div>", 1, 1) == 0x0000ff);
+    /* Flex items take a z-index without being positioned, and their transforms apply. */
+    CHECK(stack_pixel("<style>body{margin:0}.f{display:flex}.f div{width:4px;height:4px}</style><div class=f>"
+                      "<div style='z-index:2;background:red'></div><div style='margin-left:-4px;background:blue'></div>"
+                      "</div>", 1, 1) == 0xff0000);
+    CHECK(stack_pixel("<style>body{margin:0}.f{display:flex}.f div{width:4px;height:4px;background:red}</style>"
+                      "<div class=f><div style='transform:translateX(6px)'></div></div>", 7, 1) == 0xff0000);
+    CHECK(stack_pixel("<style>body{margin:0}.f{display:flex}.f div{width:4px;height:4px;background:red}</style>"
+                      "<div class=f><div style='transform:translateX(6px)'></div></div>", 1, 1) == 0xffffff);
+}
+
 static void named_grid_lines(void)
 {
     struct page p;
@@ -660,7 +718,7 @@ int main(void)
     text_flow();
     positioning();
     boxes();
-    background_pictures(); background_pixels(); named_grid_lines(); inside_marker_lifetime();
+    background_pictures(); background_pixels(); opacity_pixels(); stacking(); named_grid_lines(); inside_marker_lifetime();
     text_extras();
     zoom();
     ranges();

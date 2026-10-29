@@ -181,6 +181,12 @@ static jsval object_assign(struct js *J, jsval self, jsval *args, int argc)
             if (J->throwing)
                 return js_undefined;
         }
+        n = js_own_symbols(J, args[i], &keys);
+        for (int k = 0; k < n; k++) {
+            js_setv(J, target, js_keyval(keys[k]), js_get_str(J, args[i], keys[k]));
+            if (J->throwing)
+                return js_undefined;
+        }
     }
     return target;
 }
@@ -229,6 +235,12 @@ static jsval object_get_proto(struct js *J, jsval self, jsval *args, int argc)
         return js_obj(J->string_proto);
     if (v.t == JS_NUM)
         return js_obj(J->number_proto);
+    if (v.t == JS_BOOL)
+        return js_obj(J->boolean_proto);
+    if (v.t == JS_SYM)
+        return js_obj(J->symbol_proto);
+    if (v.t == JS_BIG)
+        return js_obj(J->bigint_proto);
     return js_null;
 }
 
@@ -319,7 +331,8 @@ static jsval object_own_names(struct js *J, jsval self, jsval *args, int argc)
             js_array_push(J, a, js_str(J, b));
         }
     for (struct prop *p = o.u.o->props; p; p = p->next)
-        js_array_push(J, a, strv(p->key));
+        if (!js_is_symkey(p->key) && !(p->key->len > 1 && p->key->s[0] == '#'))
+            js_array_push(J, a, strv(p->key));
     return js_obj(a);
 }
 
@@ -383,12 +396,15 @@ static jsval object_get_own_descriptors(struct js *J, jsval self, jsval *args, i
     return js_obj(r);
 }
 
-static jsval object_no_symbols(struct js *J, jsval self, jsval *args, int argc)
+static jsval object_own_symbols(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
-    (void)args;
-    (void)argc;
-    return js_obj(js_new_array(J));
+    struct jsobj *a = js_new_array(J);
+    if (ARG(0).t == JS_OBJ)
+        for (struct prop *p = args[0].u.o->props; p; p = p->next)
+            if (js_is_symkey(p->key))
+                js_array_push(J, a, js_keyval(p->key));
+    return js_obj(a);
 }
 
 static jsval object_is(struct js *J, jsval self, jsval *args, int argc)
@@ -468,6 +484,8 @@ static const char *class_name(jsval v)
     case JS_BOOL: return "Boolean";
     case JS_NUM: return "Number";
     case JS_STR: return "String";
+    case JS_SYM: return "Symbol";
+    case JS_BIG: return "BigInt";
     default:
         switch (v.u.o->cls) {
         case C_ARRAY: return "Array";
@@ -486,8 +504,11 @@ static jsval proto_to_string(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)args;
     (void)argc;
-    char b[64];
-    snprintf(b, sizeof(b), "[object %s]", class_name(self));
+    char b[96];
+    jsval tag = self.t == JS_OBJ ? js_get(J, self, SYM_TO_STRING_TAG) : js_undefined;
+    if (J->throwing)
+        return js_undefined;
+    snprintf(b, sizeof(b), "[object %s]", tag.t == JS_STR ? tag.u.s->s : class_name(self));
     return js_str(J, b);
 }
 
@@ -606,7 +627,7 @@ static jsval array_from(struct js *J, jsval self, jsval *args, int argc)
     if (src.t == JS_STR || src.t == JS_OBJ) {       /* anything iterable, or with a length */
         struct iter it;
         jsval len = src.t == JS_OBJ ? js_get(J, src, "length") : js_undefined;
-        jsval iterf = src.t == JS_OBJ ? js_get(J, src, "@@iterator") : js_undefined;
+        jsval iterf = src.t == JS_OBJ ? js_get(J, src, SYM_ITERATOR) : js_undefined;
         if (src.t == JS_OBJ && len.t != JS_NUM && iterf.t == JS_UNDEF)
             return js_obj(a);                       /* a plain object: no elements */
         if (js_iter_open(J, src, &it) < 0)
@@ -1038,6 +1059,8 @@ static unsigned to_uint16(double d)
 static jsval string_ctor(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
+    if (argc && args[0].t == JS_SYM && !J->constructing)
+        return strv(js_sym_text(J, args[0].u.s));       /* String(symbol): its description */
     struct jsstr *s = argc ? js_tostr(J, args[0]) : js_mkstr(J, "", 0);
     if (J->constructing) {
         struct jsobj *o = js_mkobj(J, C_STRING, J->string_proto);
@@ -1190,15 +1213,19 @@ static jsval string_substr(struct js *J, jsval self, jsval *args, int argc)
 static jsval change_case(struct js *J, jsval self, int upper)
 {
     struct jsstr *s = this_string(J, self);
-    struct jsstr *r = js_mkstr(J, s->s, s->len);
-    for (int i = 0; i < r->len; i++) {
-        char c = r->s[i];
-        if (upper && c >= 'a' && c <= 'z')
-            r->s[i] = (char)(c - 32);
-        else if (!upper && c >= 'A' && c <= 'Z')
-            r->s[i] = (char)(c + 32);
-    }
-    return strv(r);
+    return J->throwing ? js_undefined : strv(uc_change_case(J, s, upper));
+}
+
+static jsval string_normalize(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct jsstr *s = this_string(J, self);
+    if (J->throwing)
+        return js_undefined;
+    const char *form = ARG(0).t == JS_UNDEF ? "NFC" : js_tostr(J, ARG(0))->s;
+    int compat = !strcmp(form, "NFKC") || !strcmp(form, "NFKD");
+    if (!compat && strcmp(form, "NFC") && strcmp(form, "NFD"))
+        return js_throw_error(J, "RangeError: The normalization form should be one of NFC, NFD, NFKC, NFKD");
+    return strv(uc_normalize(J, s, compat, form[strlen(form) - 1] == 'C'));
 }
 
 static jsval string_upper(struct js *J, jsval self, jsval *args, int argc)
@@ -1224,10 +1251,21 @@ static jsval trim(struct js *J, jsval self, int start, int end)
 {
     struct jsstr *s = this_string(J, self);
     int a = 0, b = s->len;
-    while (start && a < b && js_space((unsigned char)s->s[a]))
-        a++;
-    while (end && b > a && js_space((unsigned char)s->s[b - 1]))
-        b--;
+    for (;;) {                          /* Unicode white space too: U+00A0, U+3000, U+FEFF... */
+        const char *p = s->s + a;
+        if (!start || a >= b || !uc_is_space((uint32_t)utf8_next(&p, s->s + b)))
+            break;
+        a = (int)(p - s->s);
+    }
+    while (end && b > a) {
+        int k = b - 1;
+        while (k > a && ((unsigned char)s->s[k] & 0xC0) == 0x80)
+            k--;
+        const char *p = s->s + k;
+        if (!uc_is_space((uint32_t)utf8_next(&p, s->s + b)))
+            break;
+        b = k;
+    }
     return js_strn(J, s->s + a, b - a);
 }
 
@@ -2192,7 +2230,7 @@ static int json_value(struct sbuf *b, jsval v, const char *indent, int depth)
         js_throw_error(J, "TypeError: converting circular structure to JSON");
         return -1;
     }
-    if (v.t == JS_OBJ) {
+    if (v.t == JS_OBJ || v.t == JS_BIG) {
         jsval tojson = js_get(J, v, "toJSON");
         if (js_is_callable(tojson))
             v = js_call_value(J, tojson, v, NULL, 0);
@@ -2200,6 +2238,9 @@ static int json_value(struct sbuf *b, jsval v, const char *indent, int depth)
             return -1;
     }
     switch (v.t) {
+    case JS_BIG:
+        js_throw_error(J, "TypeError: Do not know how to serialize a BigInt");
+        return -1;
     case JS_NULL:
         sb_str(b, "null");
         return 0;
@@ -2252,7 +2293,7 @@ static int json_value(struct sbuf *b, jsval v, const char *indent, int depth)
         jsval pv = js_get_str(J, v, keys[i]);
         if (J->throwing)
             return -1;
-        if (pv.t == JS_UNDEF || js_is_callable(pv))
+        if (pv.t == JS_UNDEF || pv.t == JS_SYM || js_is_callable(pv))
             continue;
         if (!first)
             sb_add(b, ",", 1);
@@ -3286,7 +3327,7 @@ void js_init_lib(struct js *J)
     fn_obj(J, object, "isExtensible", object_true, 1);
     fn_obj(J, object, "getOwnPropertyDescriptor", object_get_own_descriptor, 2);
     fn_obj(J, object, "getOwnPropertyDescriptors", object_get_own_descriptors, 1);
-    fn_obj(J, object, "getOwnPropertySymbols", object_no_symbols, 1);
+    fn_obj(J, object, "getOwnPropertySymbols", object_own_symbols, 1);
     fn_obj(J, object, "isSealed", object_false, 1);
     fn_obj(J, object, "getPrototypeOf", object_get_proto, 1);
     fn_obj(J, object, "setPrototypeOf", object_set_proto, 2);
@@ -3327,7 +3368,7 @@ void js_init_lib(struct js *J)
         { "find", array_find, 1 }, { "findIndex", array_find_index, 1 }, { "reduce", array_reduce, 1 },
         { "reduceRight", array_reduce_right, 1 }, { "fill", array_fill, 1 }, { "sort", array_sort, 1 },
         { "flat", array_flat, 0 }, { "keys", array_keys, 0 }, { "entries", array_entries, 0 },
-        { "values", array_values, 0 }, { "@@iterator", array_values, 0 },
+        { "values", array_values, 0 }, { SYM_ITERATOR, array_values, 0 },
         { "toString", array_to_string, 0 },
         { "toLocaleString", array_to_string, 0 },
     };
@@ -3357,6 +3398,7 @@ void js_init_lib(struct js *J)
         {"substring", string_substring, 2},
         {"substr", string_substr, 2},
         {"toUpperCase", string_upper, 0},
+        {"normalize", string_normalize, 0},
         {"toLowerCase", string_lower, 0},
         {"toLocaleUpperCase", string_upper, 0},
         {"toLocaleLowerCase", string_lower, 0},
@@ -3532,7 +3574,7 @@ void js_init_lib(struct js *J)
     fn_obj(J, J->map_proto, "keys", collection_keys, 0);
     fn_obj(J, J->map_proto, "values", collection_values, 0);
     fn_obj(J, J->map_proto, "entries", collection_entries, 0);
-    fn_obj(J, J->map_proto, "@@iterator", collection_entries, 0);
+    fn_obj(J, J->map_proto, SYM_ITERATOR, collection_entries, 0);
     define_getter(J, J->map_proto, "size", collection_size_getter);
     J->set_proto = js_mkobj(J, C_OBJECT, op);
     ctor_obj(J, "Set", set_ctor, 0, J->set_proto);
@@ -3544,15 +3586,15 @@ void js_init_lib(struct js *J)
     fn_obj(J, J->set_proto, "keys", collection_keys, 0);
     fn_obj(J, J->set_proto, "values", collection_values, 0);
     fn_obj(J, J->set_proto, "entries", collection_entries, 0);
-    fn_obj(J, J->set_proto, "@@iterator", collection_values, 0);
+    fn_obj(J, J->set_proto, SYM_ITERATOR, collection_values, 0);
     define_getter(J, J->set_proto, "size", collection_size_getter);
 
     J->seqiter_proto = js_mkobj(J, C_OBJECT, op);
     fn_obj(J, J->seqiter_proto, "next", seqiter_next, 0);
-    fn_obj(J, J->seqiter_proto, "@@iterator", seqiter_self, 0);
+    fn_obj(J, J->seqiter_proto, SYM_ITERATOR, seqiter_self, 0);
     J->s_value = S(J, "value");
     J->s_done = S(J, "done");
-    fn_obj(J, sp, "@@iterator", string_iterator, 0);
+    fn_obj(J, sp, SYM_ITERATOR, string_iterator, 0);
 
     js_init_binary(J);
 

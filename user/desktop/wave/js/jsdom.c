@@ -106,6 +106,8 @@ struct jsdom {
     int custom_on;                      /* customElements.define was called: tell it of custom elements */
     int dom_lib;                        /* jsdomlib.h's js_dom_lib has been run */
     struct { struct node *n; char type[8]; } queued[128];      /* jsdom_queue_event */
+    struct posted { char *data, *origin; int source; } *posted; /* jsdom_message: to deliver */
+    int nposted;
     int nqueued;
     int watch_mutations;                /* a MutationObserver observes: report changes to %mutation */
     int in_mutation;
@@ -3488,6 +3490,19 @@ int jsdom_dispatch(struct jsdom *d, struct node *target, const char *type)
     return dispatch_event(d, target, type, ev, bubbles);
 }
 
+/* A transition or animation event (anim.c): transitionend with its propertyName, animationstart... */
+void jsdom_motion_event(struct jsdom *d, struct node *target, const char *type, const char *name, float elapsed)
+{
+    if (!d || !target)
+        return;
+    jsval ev = new_event(d, type, wrap(d, target));
+    js_set(d->J, ev, "bubbles", js_bool(1));
+    js_set(d->J, ev, !strncmp(type, "transition", 10) ? "propertyName" : "animationName", js_str(d->J, name));
+    js_set(d->J, ev, "elapsedTime", js_num(elapsed));
+    js_set(d->J, ev, "pseudoElement", js_str(d->J, ""));
+    dispatch_event(d, target, type, ev, 1);
+}
+
 static void update_pointer_capture(struct jsdom *d);
 
 int jsdom_mouse_event(struct jsdom *d, struct node *target, const char *type, int x, int y, int button,
@@ -4205,24 +4220,123 @@ static jsval win_match_media(struct js *J, jsval self, jsval *args, int argc)
     return mv;
 }
 
+/* A window proxy for window id (js_dom_eager's %windowProxy), or null. */
+static jsval window_proxy(struct jsdom *d, int wid)
+{
+    jsval f = js_get(d->J, js_obj(d->window), "%windowProxy"), id = js_num(wid), r;
+    if (!wid || !js_is_callable(f) || js_call(d->J, f, js_obj(d->window), &id, 1, &r) < 0)
+        return js_null;
+    return r;
+}
+
 static jsval win_open(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
     struct jsdom *d = dom(J);
-    if (d->h.open_tab && (!argc || ARG(0).t == JS_UNDEF || (ARG(0).t == JS_STR && !ARG(0).u.s->len))) {
-        d->h.open_tab(d->h.ctx, "about:blank");
-        return js_null;
-    }
-    if (argc && ARG(0).t == JS_STR && ARG(0).u.s->len) {
-        char abs[URL_MAX];
-        url_resolve(d->h.base, args[0].u.s->s, abs, sizeof(abs));
-        const char *target = argc > 1 ? js_cstr(ARG(1)) : "_blank";
-        if (d->h.open_tab && strcmp(target, "_self") && strcmp(target, "_parent") && strcmp(target, "_top"))
-            d->h.open_tab(d->h.ctx, abs);
-        else
+    const char *features = argc > 2 && ARG(2).t != JS_UNDEF ? js_tostr(J, ARG(2))->s : "";
+    int noopener = strstr(features, "noopener") || strstr(features, "noreferrer");
+    struct jsstr *url = argc && ARG(0).t != JS_UNDEF ? js_tostr(J, ARG(0)) : NULL;
+    char abs[URL_MAX] = "about:blank";
+    if (url && url->len)
+        url_resolve(d->h.base, url->s, abs, sizeof(abs));
+    const char *target = argc > 1 && ARG(1).t != JS_UNDEF ? js_tostr(J, ARG(1))->s : "_blank";
+    if (!strcmp(target, "_self") || !strcmp(target, "_parent") || !strcmp(target, "_top") || !d->h.open_tab) {
+        if (url && url->len)
             d->h.navigate(d->h.ctx, abs, 0);
+        return js_obj(d->window);
     }
-    return js_null;
+    int wid = d->h.open_tab(d->h.ctx, abs, noopener);
+    return noopener || !wid ? js_null : window_proxy(d, wid);
+}
+
+/* window.close(): a window a script opened may close (the browser decides). */
+static jsval win_close(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self, (void)args, (void)argc;
+    struct jsdom *d = dom(J);
+    if (d->h.window_close)
+        d->h.window_close(d->h.ctx, 0);
+    return js_undefined;
+}
+
+/* %winop(id, what, a, b): what window proxies ask of the browser (jsdom.h: window_query and the rest). */
+static jsval window_op(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    struct jsdom *d = dom(J);
+    int wid = (int)js_to_number(J, ARG(0));
+    const char *what = js_tostr(J, ARG(1))->s;
+    if (!strcmp(what, "post")) {
+        struct jsstr *data = js_tostr(J, ARG(2)), *origin = js_tostr(J, ARG(3));
+        if (d->h.window_post) {
+            d->h.window_post(d->h.ctx, wid, data->s, data->len, origin->s);
+        } else if (!wid) {              /* no other windows: only this one */
+            char self_origin[300] = "null";
+            web_origin(d->h.url, self_origin, sizeof(self_origin));
+            jsdom_message(d, data->s, data->len, self_origin, 0);
+        }
+        return js_undefined;
+    }
+    if (!d->h.window_query)
+        return !strcmp(what, "alive") ? js_bool(1) : js_num(0);
+    if (!strcmp(what, "close")) {
+        d->h.window_close(d->h.ctx, wid);
+        return js_undefined;
+    }
+    if (!strcmp(what, "navigate")) {
+        char abs[URL_MAX];
+        url_resolve(d->h.base, js_tostr(J, ARG(2))->s, abs, sizeof(abs));
+        d->h.window_navigate(d->h.ctx, wid, abs);
+        return js_undefined;
+    }
+    char out[URL_MAX] = "";
+    struct node *node = !strcmp(what, "frame") ? this_node(J, ARG(2)) : NULL;
+    int r = d->h.window_query(d->h.ctx, wid, what, node, out, sizeof(out));
+    if (!strcmp(what, "href"))
+        return r > 0 ? js_str(J, out) : js_null;
+    if (!strcmp(what, "alive"))
+        return js_bool(r > 0);
+    return js_num(r);
+}
+
+void jsdom_message(struct jsdom *d, const char *data, int len, const char *origin, int source_wid)
+{
+    if (!d || d->nposted >= 256)
+        return;
+    struct posted *p = realloc(d->posted, sizeof(*p) * (size_t)(d->nposted + 1));
+    if (!p)
+        return;
+    d->posted = p;
+    char *copy = malloc((size_t)len + 1), *from = strdup(origin ? origin : "null");
+    if (!copy || !from) {
+        free(copy);
+        free(from);
+        return;
+    }
+    memcpy(copy, data, (size_t)len);
+    copy[len] = 0;
+    p[d->nposted++] = (struct posted){ copy, from, source_wid };
+}
+
+/* The messages posted to this window, as MessageEvents (js_dom_eager's %deliverMessage). */
+static void deliver_posted(struct jsdom *d)
+{
+    while (d->nposted) {
+        struct posted m = d->posted[0];
+        memmove(d->posted, d->posted + 1, sizeof(m) * (size_t)--d->nposted);
+        jsval f = js_get(d->J, js_obj(d->window), "%deliverMessage"), r;
+        jsval a[3] = { js_str(d->J, m.data), js_str(d->J, m.origin), js_num(m.source) };
+        free(m.data);
+        free(m.origin);
+        if (js_is_callable(f)) {
+            d->depth++;
+            if (js_call(d->J, f, js_obj(d->window), a, 3, &r) < 0)
+                report(d, "message");
+            d->depth--;
+            js_run_jobs(d->J);
+            settle(d);
+        }
+    }
 }
 
 static jsval history_back(struct js *J, jsval self, jsval *args, int argc)
@@ -5537,6 +5651,23 @@ static jsval chosen_file(struct js *J, jsval self, jsval *args, int argc)
     return js_obj(o);
 }
 
+/* %idb(op, name, text): IndexedDB's store for this page's origin (webstore.c: store_idb). */
+static jsval idb_store(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    struct jsdom *d = dom(J);
+    char origin[300] = "null";
+    web_origin(d->h.url, origin, sizeof(origin));
+    if (!strcmp(origin, "null"))
+        snprintf(origin, sizeof(origin), "%s", !strncmp(d->h.url, "file:", 5) ? "file://" : "null");
+    const char *op = js_tostr(J, ARG(0))->s;
+    struct jsstr *name = js_tostr(J, ARG(1)), *text = argc > 2 ? js_tostr(J, args[2]) : NULL;
+    char *r = store_idb(op, origin, name->s, text ? text->s : "", text ? (size_t)text->len : 0);
+    jsval v = r ? js_str(J, r) : js_null;
+    free(r);
+    return v;
+}
+
 static jsval clipboard_text(struct js *J, jsval self, jsval *args, int argc)
 {
     struct jsdom *d=dom(J);
@@ -5941,7 +6072,7 @@ struct jsdom *jsdom_new(const struct jshost *host)
         { "requestAnimationFrame", win_request_frame, 1 }, { "cancelAnimationFrame", win_clear_timer, 1 },
         { "scrollTo", win_scroll_to, 2 }, { "scroll", win_scroll_to, 2 }, { "scrollBy", win_scroll_by, 2 },
         { "getComputedStyle", win_get_computed_style, 1 }, { "matchMedia", win_match_media, 1 },
-        { "open", win_open, 2 }, { "close", nothing, 0 }, { "focus", nothing, 0 }, { "blur", nothing, 0 },
+        { "open", win_open, 2 }, { "close", win_close, 0 }, { "focus", nothing, 0 }, { "blur", nothing, 0 },
         { "print", nothing, 0 }, { "stop", nothing, 0 }, { "btoa", win_btoa, 1 }, { "atob", win_atob, 1 },
         { "addEventListener", add_event_listener, 2 }, { "removeEventListener", remove_event_listener, 2 },
         { "dispatchEvent", el_dispatch_event, 1 },
@@ -6044,6 +6175,8 @@ struct jsdom *jsdom_new(const struct jshost *host)
     fn(J,w,"%clipboard",clipboard_text,1);
     fn(J,w,"%chosenFile",chosen_file,1);
     fn(J,w,"%pointerCapture",pointer_capture_api,2);
+    fn(J,w,"%winop",window_op,4);
+    fn(J,w,"%idb",idb_store,3);
     if (js_eval(J, js_dom_eager, (int)sizeof(js_dom_eager) - 1, "DOM library") < 0)
         fprintf(stderr, "DOM library: %s\n", js_error(J));
     char origin[300]="null";web_origin(d->h.url,origin,sizeof(origin));
@@ -6056,6 +6189,9 @@ void jsdom_free(struct jsdom *d)
     if (!d)
         return;
     web_blob_free(d);
+    for (int i = 0; i < d->nposted; i++)
+        free(d->posted[i].data), free(d->posted[i].origin);
+    free(d->posted);
     jsnet_free(d->network);
     jscanvas_free(d->J);
     js_free(d->J);
@@ -6292,6 +6428,7 @@ void jsdom_run_timers(struct jsdom *d)
     jsnet_poll(d->network);
     process_view(d);
     run_queued(d);
+    deliver_posted(d);
     unsigned int now = uptime_ms();
     int ran = 0;
     for (int i = 0; i < MAX_TIMERS && ran < 32; i++) {
@@ -6326,7 +6463,7 @@ int jsdom_next_timer(struct jsdom *d)
     if (!d)
         return -1;
     int sx, sy, vw, vh;
-    if (d->nqueued || view_changes(d, &sx, &sy, &vw, &vh))
+    if (d->nqueued || d->nposted || view_changes(d, &sx, &sy, &vw, &vh))
         return 0;
     unsigned int now = uptime_ms();
     int best=jsnet_wait(d->network);

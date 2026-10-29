@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Local TLS integration: trust, hostname, dates, key usage and handshake signatures."""
+"""Local TLS integration: trust, hostname, dates, key usage and handshake signatures, over TLS 1.3
+(with a HelloRetryRequest too) and TLS 1.2 with each of its cipher suites, against OpenSSL."""
 from pathlib import Path
 import datetime as dt
 import socket
@@ -22,8 +23,10 @@ root = (x509.CertificateBuilder().subject_name(name('fluxOS test CA')).issuer_na
         .sign(root_key,hashes.SHA256()))
 (OUT/'ca.pem').write_bytes(root.public_bytes(serialization.Encoding.PEM))
 
+TLS13 = ['-tls1_3','-ciphersuites','TLS_AES_128_GCM_SHA256','-groups','X25519']
+
 def check(label, host='localhost', accepted=True, curve=False, expired=False, untrusted=False, wrong_usage=False,
-          sha384=False, curve384=False):
+          sha384=False, curve384=False, server=TLS13):
     digest = hashes.SHA384() if sha384 else hashes.SHA256()
     key = ec.generate_private_key(ec.SECP384R1() if curve384 else ec.SECP256R1()) if curve else rsa.generate_private_key(65537,2048)
     issuer_key = rsa.generate_private_key(65537,2048) if untrusted else root_key
@@ -37,7 +40,7 @@ def check(label, host='localhost', accepted=True, curve=False, expired=False, un
             .sign(issuer_key,digest))
     (OUT/'leaf.pem').write_bytes(cert.public_bytes(serialization.Encoding.PEM))
     (OUT/'key.pem').write_bytes(key.private_bytes(serialization.Encoding.PEM,serialization.PrivateFormat.PKCS8,serialization.NoEncryption()))
-    if accepted:
+    if accepted and server is TLS13:
         message=b' '*64+b'TLS 1.3, server CertificateVerify\0'+b'\x5a'*32
         signature=key.sign(message,ec.ECDSA(digest)) if curve else key.sign(message,padding.PSS(mgf=padding.MGF1(digest),salt_length=digest.digest_size),digest)
         (OUT/'leaf.der').write_bytes(cert.public_bytes(serialization.Encoding.DER))
@@ -47,8 +50,8 @@ def check(label, host='localhost', accepted=True, curve=False, expired=False, un
         print('TLS:',label,'tampered signature/transcript rejection passed')
 
     with socket.socket() as s: s.bind(('127.0.0.1',0));port=s.getsockname()[1]
-    server=subprocess.Popen(['openssl','s_server','-quiet','-www','-tls1_3','-ciphersuites','TLS_AES_128_GCM_SHA256','-groups','X25519',
-                             '-accept',str(port),'-cert',str(OUT/'leaf.pem'),'-key',str(OUT/'key.pem')],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    process=subprocess.Popen(['openssl','s_server','-quiet','-www']+server+
+                             ['-accept',str(port),'-cert',str(OUT/'leaf.pem'),'-key',str(OUT/'key.pem')],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     try:
         for _ in range(100):
             try:
@@ -57,7 +60,7 @@ def check(label, host='localhost', accepted=True, curve=False, expired=False, un
         subprocess.run([str(ROOT/'build/tests/tls-client'),str(port),host,str(int(accepted))],check=True,timeout=10)
         print('TLS:',label,'passed')
     finally:
-        server.terminate();server.wait(timeout=5)
+        process.terminate();process.wait(timeout=5)
 
 check('RSA-PSS authenticated handshake')
 check('ECDSA authenticated handshake',curve=True)
@@ -67,3 +70,19 @@ check('hostname mismatch',host='other.example',accepted=False)
 check('expired leaf',expired=True,accepted=False)
 check('unknown issuer',untrusted=True,accepted=False)
 check('client-only certificate',wrong_usage=True,accepted=False)
+
+# TLS 1.3 servers that want another curve ask for it with a HelloRetryRequest.
+check('TLS 1.3 HelloRetryRequest for P-256',server=['-tls1_3','-groups','P-256'])
+check('TLS 1.3 HelloRetryRequest for P-384',curve=True,server=['-tls1_3','-groups','P-384'])
+# TLS 1.2: every suite offered, with each curve and signature kind.
+tls12 = lambda cipher, groups='X25519', *more: ['-tls1_2','-cipher',cipher,'-groups',groups]+list(more)
+check('TLS 1.2 ECDHE-RSA AES-128-GCM over X25519',server=tls12('ECDHE-RSA-AES128-GCM-SHA256'))
+check('TLS 1.2 ECDHE-RSA AES-256-GCM SHA-384 over P-256',server=tls12('ECDHE-RSA-AES256-GCM-SHA384','P-256'))
+check('TLS 1.2 ECDHE-RSA ChaCha20-Poly1305 over P-384',server=tls12('ECDHE-RSA-CHACHA20-POLY1305','P-384'))
+check('TLS 1.2 ECDHE-ECDSA AES-128-GCM over P-256',curve=True,server=tls12('ECDHE-ECDSA-AES128-GCM-SHA256','P-256'))
+check('TLS 1.2 ECDHE-ECDSA AES-256-GCM over X25519',curve=True,curve384=True,sha384=True,server=tls12('ECDHE-ECDSA-AES256-GCM-SHA384'))
+check('TLS 1.2 ECDHE-ECDSA ChaCha20-Poly1305',curve=True,server=tls12('ECDHE-ECDSA-CHACHA20-POLY1305'))
+check('TLS 1.2 RSA PKCS#1 key exchange signature',server=tls12('ECDHE-RSA-AES128-GCM-SHA256','X25519','-sigalgs','RSA+SHA256'))
+check('TLS 1.2 with a client certificate request',server=tls12('ECDHE-RSA-AES128-GCM-SHA256','X25519','-verify','1'))
+check('TLS 1.2 hostname mismatch',host='other.example',accepted=False,server=tls12('ECDHE-RSA-AES128-GCM-SHA256'))
+check('TLS 1.2 unknown issuer',untrusted=True,accepted=False,server=tls12('ECDHE-RSA-AES128-GCM-SHA256'))

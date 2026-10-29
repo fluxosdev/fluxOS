@@ -1508,7 +1508,14 @@ static void ex(struct cg *C, struct ast *n)
 static void ex_inner(struct cg *C, struct ast *n)
 {
     switch (n->kind) {
-    case N_NUM: op1(C, I_CONST, 1, cg_const(C, js_num(n->num))); return;
+    case N_NUM:
+        if (n->flags & 1) {             /* a BigInt literal */
+            struct jsbig *g = jb_parse(C->J, n->str->s, n->str->len, 0, 0);
+            op1(C, I_CONST, 1, cg_const(C, g ? js_bigv(g) : js_num(NAN)));
+            return;
+        }
+        op1(C, I_CONST, 1, cg_const(C, js_num(n->num)));
+        return;
     case N_STR: op1(C, I_CONST, 1, cg_str(C, n->str)); return;
     case N_TRUE: op(C, I_TRUE, 1); return;
     case N_FALSE: op(C, I_FALSE, 1); return;
@@ -2523,7 +2530,7 @@ static void viter_done(struct viter *vi)
 static int aiter_open(struct js *J, struct viter *vi, jsval obj)
 {
     memset(vi, 0, sizeof(*vi));
-    jsval m = obj.t == JS_OBJ ? js_get(J, obj, "@@asyncIterator") : js_undefined;
+    jsval m = obj.t == JS_OBJ ? js_get(J, obj, SYM_ASYNC_ITERATOR) : js_undefined;
     if (J->throwing)
         return -1;
     if (js_is_callable(m)) {
@@ -2790,6 +2797,9 @@ L_OSPREAD: {
     int nk = js_keys(J, sp[0], 0, &keys);
     for (int i = 0; i < nk && !J->throwing; i++)
         js_put(J, sp[-1].u.o, keys[i], js_get_str(J, sp[0], keys[i]), 0);
+    nk = js_own_symbols(J, sp[0], &keys);
+    for (int i = 0; i < nk && !J->throwing; i++)
+        js_put(J, sp[-1].u.o, keys[i], js_get_str(J, sp[0], keys[i]), 0);
     CHECK();
     NEXT;
 }
@@ -3031,21 +3041,46 @@ L_##name:                                               \
     RELATION(GE, x >= y, OP_GE)
 #undef RELATION
 L_NOT: sp[-1] = js_bool(!js_truthy(sp[-1])); NEXT;
-L_NEG: sp[-1] = js_num(-js_to_number(J, sp[-1])); CHECK(); NEXT;
-L_PLUS: sp[-1] = js_num(js_to_number(J, sp[-1])); CHECK(); NEXT;
-L_BNOT: sp[-1] = js_num((double)~to_int32(J, sp[-1])); CHECK(); NEXT;
+L_NEG:
+    sp[-1] = to_numeric(J, sp[-1]);
+    CHECK();
+    sp[-1] = sp[-1].t == JS_BIG ? js_bigv(jb_neg(J, sp[-1].u.g)) : js_num(-sp[-1].u.n);
+    NEXT;
+L_PLUS:
+    if (sp[-1].t == JS_BIG) {
+        js_throw_error(J, "TypeError: Cannot convert a BigInt value to a number");
+        goto unwind;
+    }
+    sp[-1] = js_num(js_to_number(J, sp[-1]));
+    CHECK();
+    NEXT;
+L_BNOT:
+    sp[-1] = to_numeric(J, sp[-1]);
+    CHECK();
+    sp[-1] = sp[-1].t == JS_BIG ? js_bigv(jb_not(J, sp[-1].u.g)) : js_num((double)~to_int32(J, sp[-1]));
+    NEXT;
 L_TYPEOF: sp[-1] = js_str(J, type_of(sp[-1])); NEXT;
 L_VOID: sp[-1] = js_undefined; NEXT;
-L_TONUM:
+L_TONUM:                                /* ToNumeric: BigInts stay */
     if (sp[-1].t != JS_NUM) {
-        sp[-1] = js_num(js_to_number(J, sp[-1]));
+        sp[-1] = to_numeric(J, sp[-1]);
         CHECK();
     }
     NEXT;
-L_INC: sp[-1].u.n += 1; NEXT;
-L_DEC: sp[-1].u.n -= 1; NEXT;
-L_TOKEY:
-    if (sp[-1].t != JS_STR) {
+L_INC:
+    if (sp[-1].t == JS_BIG)
+        sp[-1] = js_bigv(jb_add(J, sp[-1].u.g, jb_from_u64(J, 1, 0)));
+    else
+        sp[-1].u.n += 1;
+    NEXT;
+L_DEC:
+    if (sp[-1].t == JS_BIG)
+        sp[-1] = js_bigv(jb_sub(J, sp[-1].u.g, jb_from_u64(J, 1, 0)));
+    else
+        sp[-1].u.n -= 1;
+    NEXT;
+L_TOKEY:                                /* a symbol stays one: its u.s is its key */
+    if (sp[-1].t != JS_STR && sp[-1].t != JS_SYM) {
         struct jsstr *s = js_tostr(J, sp[-1]);
         CHECK();
         sp[-1] = strv(s);
@@ -3271,7 +3306,7 @@ L_OBJREST: {
     for (int i = 0; i < nk && !J->throwing; i++) {
         int skip = 0;
         for (int u = 0; u < used->len && !skip; u++)
-            skip = used->items[u].t == JS_STR && str_eq(used->items[u].u.s, keys[i]);
+            skip = (used->items[u].t == JS_STR || used->items[u].t == JS_SYM) && str_eq(used->items[u].u.s, keys[i]);
         if (!skip)
             js_put(J, rest, keys[i], js_get_str(J, src, keys[i]), 0);
     }
