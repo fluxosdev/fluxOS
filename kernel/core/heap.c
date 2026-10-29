@@ -22,14 +22,21 @@ static uint32_t heap_size;
 static uint32_t heap_used;
 static spinlock_t heap_lock = SPINLOCK_INIT("heap");    /* interrupt handlers allocate too */
 
+/* A quarter of RAM, between 4 MiB and 256 MiB, and never more than half of the
+ * low memory the kernel's page tables, stacks and DMA buffers share with it.
+ * Files that live in memory (an initrd that is the whole system, as "make
+ * run-kernel" and the QEMU tests boot) have to fit in it. */
 void heap_init(void)
 {
     uint32_t total = pmm_total_kb() * 1024;
     uint32_t size = total / 4;
+    uint32_t low_half = pmm_low_free_kb() / 2 * 1024;
+    if (size > low_half)
+        size = low_half;
     if (size < 4u << 20)
         size = 4u << 20;
-    if (size > 64u << 20)
-        size = 64u << 20;
+    if (size > 256u << 20)
+        size = 256u << 20;
 
     uint32_t base = pmm_alloc_contig(size / PAGE_SIZE);
     if (!base)

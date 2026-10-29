@@ -253,3 +253,8 @@ uint32_t pmm_free_kb(void)
 {
     return __atomic_load_n(&free_frames, __ATOMIC_RELAXED) * (PAGE_SIZE / 1024);
 }
+
+uint32_t pmm_low_free_kb(void)
+{
+    return __atomic_load_n(&low_free_frames, __ATOMIC_RELAXED) * (PAGE_SIZE / 1024);
+}

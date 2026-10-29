@@ -368,10 +368,16 @@ in a fluxOS terminal, then by `make` of the fluxOS tree natively (phase
 7's stage 1).*
 
 Done 2026-10-29: `make toolchain-native` builds GCC 13.2.0 to run on
-fluxOS and the next `make` puts it on the system image. It is built and
-installed, and its programs are the kernel's kind of ELF (static, loaded
-at 1 GiB, constructors in `.init_array`); the test that runs it on the
-kernel is written (`make test-gcc-qemu`) and has not been run yet.
+fluxOS and the next `make` puts it on the system image. `make
+test-gcc-qemu` passes on the kernel (2026-10-29): `gcc -O2` compiles,
+assembles and links `hello.c` in 1.6 s under QEMU, the program runs
+with its constructor, the stripped program is byte for byte the cross
+compiler's (the symbol tables differ only by the source's name), a
+compile error comes back as one, `-E`, `-S`, `as` and a driver link of
+an object work, and `make` drives it through a recipe under `/bin/sh`.
+Two things the first run taught: the kernel heap (where an initrd's
+files live) was capped at 64 MiB and is now a quarter of RAM up to
+256 MiB, and the stage 2 comparison is of stripped programs.
 
 - [x] The Canadian cross (`tools/toolchain/build.sh --native`): with the
       cross toolchain on the path, GCC configured `--build=x86_64-pc-linux-gnu
@@ -542,7 +548,7 @@ Suggested order: 4 (the Canadian cross: binutils already links for
 fluxOS), 3 (GNU make already builds), 6, 5, 7; and running the phase 2
 tests on fluxOS before relying on any of it. (Phases 3 and 4 were done
 together on 2026-10-29; what remains is 5, 6 and 7, and running
-`make test-gcc-qemu` and the tools on the kernel.)
+the tools on the kernel; `make test-gcc-qemu` passed on 2026-10-29.)
 
 ## Later, deliberately
 

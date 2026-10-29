@@ -3,7 +3,9 @@
  * environment (make test-gcc-qemu). Compiles tests/gcc-hello.c with
  * /usr/bin/gcc, runs the result, checks what it printed, and compares the
  * binary with the one the cross compiler made on the host
- * (/tests/hello.cross), then prints GCC REGRESSIONS PASSED.
+ * (/tests/hello.cross), stripped on both sides (the symbol table records
+ * the source's name and the two were built from different paths), then
+ * prints GCC REGRESSIONS PASSED.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -99,11 +101,17 @@ int main(void)
     CHECK(strstr(out, "constructor ran\n"));
     CHECK(strstr(out, "hello from fluxOS gcc: apple fig kiwi pear 5.0 8641975230861 2\n"));
 
-    /* the same program, built the same way by the cross compiler on the host */
-    if (same_file("/tmp/hello", "/tests/hello.cross"))
-        printf("the native and cross builds of hello.c are identical\n");
-    else {
-        run("size /tmp/hello /tests/hello.cross", out, sizeof(out));
+    /* the same program, built the same way by the cross compiler on the host: the
+     * stripped programs must agree byte for byte (stage 2's test in miniature) */
+    st = run("strip -o /tmp/hello.stripped /tmp/hello && strip -o /tmp/cross.stripped /tests/hello.cross", out, sizeof(out));
+    printf("%s", out);
+    CHECK(st == 0);
+    if (same_file("/tmp/hello.stripped", "/tmp/cross.stripped")) {
+        printf("the native and cross builds of hello.c are identical%s\n",
+               same_file("/tmp/hello", "/tests/hello.cross") ? " (symbol tables too)" : " once stripped");
+    } else {
+        run("size /tmp/hello.stripped /tmp/cross.stripped; cmp /tmp/hello.stripped /tmp/cross.stripped; "
+            "cmp -l /tmp/hello.stripped /tmp/cross.stripped | wc -l", out, sizeof(out));
         printf("the native and cross builds differ:\n%s", out);
         CHECK(0);
     }

@@ -419,12 +419,15 @@ $(BUILD)/tests/sh: $(wildcard user/fsh/*.c user/fsh/*.h) tests/fsh-host/flux.h
 .PHONY: test-gcc-qemu
 test-gcc-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/gcc-guest $(BUILD)/tests/gcc-hello.cross $(NATIVE_ROOT)/usr/bin/gcc
 	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/gcc-guest --cpus $(KERNEL_TEST_CPUS) \
-		--memory 768 --add $(BUILD)/tests/gcc-hello.cross:tests/hello.cross --add tests/gcc-hello.c:tests/hello.c \
+		--memory 1024 --add $(BUILD)/tests/gcc-hello.cross:tests/hello.cross --add tests/gcc-hello.c:tests/hello.c \
 		--success-marker "GCC REGRESSIONS PASSED" --timeout 240
 
+# Built from a copy named hello.c, as the guest compiles it: the symbol table keeps
+# the source's name, so the unstripped programs can agree too.
 $(BUILD)/tests/gcc-hello.cross: tests/gcc-hello.c $(BUILD)/toolchain/cross/bin/i686-fluxos-gcc $(SYSROOT)/usr/lib/libc.a
-	@mkdir -p $(dir $@)
-	$(BUILD)/toolchain/cross/bin/i686-fluxos-gcc -O2 -o $@ $<
+	@mkdir -p $(BUILD)/tests/gcc-hello
+	cp $< $(BUILD)/tests/gcc-hello/hello.c
+	cd $(BUILD)/tests/gcc-hello && $(CURDIR)/$(BUILD)/toolchain/cross/bin/i686-fluxos-gcc -O2 -o $(CURDIR)/$@ hello.c
 
 $(BUILD)/tests/gcc-guest.o: tests/gcc-guest.c
 	@mkdir -p $(dir $@)
@@ -496,7 +499,7 @@ $(BUILD)/tests/dos-cpu: tests/dos-cpu.c user/dos/cpu.c user/dos/dos.h
 
 .PHONY: test-libc-qemu
 test-libc-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/libc-guest
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/libc-guest --cpus $(KERNEL_TEST_CPUS) --success-marker "LIBC REGRESSIONS PASSED"
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/libc-guest --cpus $(KERNEL_TEST_CPUS) $(TEST_DROP_TOOLCHAIN) --success-marker "LIBC REGRESSIONS PASSED"
 
 $(BUILD)/tests/libc-guest.o: tests/libc-guest.c
 	@mkdir -p $(dir $@)
@@ -526,7 +529,7 @@ KERNEL_TEST_CPUS ?= $(QEMU_SMP)
 KERNEL_TEST_MEMORY ?= 256
 KERNEL_TEST_CMDLINE ?=
 test-kernel-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest --cpus $(KERNEL_TEST_CPUS) --memory $(KERNEL_TEST_MEMORY) --append "$(KERNEL_TEST_CMDLINE)"
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest --cpus $(KERNEL_TEST_CPUS) --memory $(KERNEL_TEST_MEMORY) $(TEST_DROP_TOOLCHAIN) --append "$(KERNEL_TEST_CMDLINE)"
 
 $(BUILD)/tests/kernel-guest.o: tests/kernel-guest.c
 	@mkdir -p $(dir $@)
@@ -654,7 +657,7 @@ $(BUILD)/tests/desktop-imagejobs-guest: $(BUILD)/tests/desktop-imagejobs-guest.o
 
 .PHONY: test-desktop-jobs-qemu
 test-desktop-jobs-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/desktop-imagejobs-guest
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/desktop-imagejobs-guest --cpus $(KERNEL_TEST_CPUS) --success-marker "DESKTOP JOB REGRESSIONS PASSED"
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/desktop-imagejobs-guest --cpus $(KERNEL_TEST_CPUS) $(TEST_DROP_TOOLCHAIN) --success-marker "DESKTOP JOB REGRESSIONS PASSED"
 
 $(BUILD)/tests/browser-navigation: tests/browser-navigation.c user/desktop/wave/webutil.c $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
@@ -682,10 +685,15 @@ $(BUILD)/tests/browser-geometry: tests/browser-geometry.c $(BROWSER_TEST_SRCS) $
 	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DIDB_DIR='"$(CURDIR)/$(BUILD)/tests/idb/"' -DJS_VM_VERIFY -pthread $(DESKTOP_INC) -Iinclude -idirafter user/include \
 		tests/browser-geometry.c $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS)) -lm -o $@
 
+# The system image carries the toolchain (about 90 MB) once it is built; the tests
+# that do not run it leave it out of their in-memory initrd (the kernel heap, a
+# quarter of RAM, holds the files).
+TEST_DROP_TOOLCHAIN := --drop usr/bin --drop usr/libexec --drop usr/lib --drop usr/include
+
 # S3 must boot through firmware/GRUB: QEMU -kernel reloads RAM on wake.
 .PHONY: test-suspend-qemu
 test-suspend-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-suspend $(GRUB_DEP)
-	python3 tools/test-suspend-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-suspend $(MKRESCUE) $(GRUB_PC_DIR) --cpus $(KERNEL_TEST_CPUS)
+	python3 tools/test-suspend-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-suspend $(MKRESCUE) $(GRUB_PC_DIR) --cpus $(KERNEL_TEST_CPUS) $(TEST_DROP_TOOLCHAIN)
 
 $(BUILD)/tests/kernel-suspend.o: tests/kernel-suspend.c
 	@mkdir -p $(dir $@)

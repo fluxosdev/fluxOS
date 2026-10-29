@@ -87,7 +87,9 @@ says why.
   Started from an installed disk (`root=UUID=...`), its FAT32 partition is the
   root instead and only `/dev`, `/tmp` and `/mnt` stay in memory. The CD's
   initrd is a small setup system, not the whole one: files in memory live in
-  the kernel heap, a quarter of RAM.
+  the kernel heap, a quarter of RAM (up to 256 MiB, and at most half of the
+  first GiB), so the whole system with its compiler in memory (`make
+  run-kernel`, `make test-gcc-qemu`) wants a machine with 1 GiB.
 - Storage:
   - IDE (ATA LBA28/48 and ATAPI) with bus-master DMA, interrupt driven, falling
     back to PIO on failure; native-mode PCI IDE controllers. Options:

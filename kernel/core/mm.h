@@ -21,6 +21,7 @@ int pmm_claim_sole(uint32_t phys);          /* 1 if allocated with no extra refe
 void pmm_free(uint32_t phys);
 uint32_t pmm_total_kb(void);
 uint32_t pmm_free_kb(void);
+uint32_t pmm_low_free_kb(void);             /* of the first GiB, the kernel's own */
 
 /* ---- paging ---- */
 #define PTE_PRESENT 0x001

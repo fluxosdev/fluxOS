@@ -14,6 +14,7 @@ parser.add_argument("--append", default="")
 parser.add_argument("--memory", type=int, default=256, choices=range(64, 4097), help="guest RAM in MiB")
 parser.add_argument("--success-marker", default="KERNEL REGRESSIONS PASSED")
 parser.add_argument("--add", action="append", default=[], metavar="HOST:GUEST", help="a host file to add to the initrd at that guest path")
+parser.add_argument("--drop", action="append", default=[], metavar="PREFIX", help="leave initrd members under this path out (the toolchain, for tests that do not need it in memory)")
 parser.add_argument("--timeout", type=int, default=45)
 args = parser.parse_args()
 qemu, kernel, initrd, guest = args.qemu, args.kernel, args.initrd, args.guest
@@ -29,9 +30,12 @@ with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
     replaced = False
     with tarfile.open(initrd, "r") as source, tarfile.open(overlay, "w", format=tarfile.USTAR_FORMAT) as target:
         for member in source:
-            if member.name.lstrip("./") == "bin/init":
+            name = member.name.lstrip("./")
+            if name == "bin/init":
                 target.add(guest, arcname=member.name)
                 replaced = True
+            elif any(name == prefix or name.startswith(prefix.rstrip("/") + "/") for prefix in args.drop):
+                continue
             else:
                 target.addfile(member, source.extractfile(member) if member.isfile() else None)
         for extra in args.add:

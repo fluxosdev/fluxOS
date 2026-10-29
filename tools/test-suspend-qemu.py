@@ -18,6 +18,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 for name in ('qemu', 'kernel', 'initrd', 'guest', 'mkrescue', 'grubdir'):
     parser.add_argument(name)
 parser.add_argument('--cpus', type=int, default=2, choices=range(1, 17))
+parser.add_argument('--drop', action='append', default=[], metavar='PREFIX', help='leave initrd members under this path out')
 args = parser.parse_args()
 with tempfile.TemporaryDirectory(prefix='flux-suspend-') as directory:
     temp = pathlib.Path(directory)
@@ -27,9 +28,12 @@ with tempfile.TemporaryDirectory(prefix='flux-suspend-') as directory:
     with tarfile.open(args.initrd) as src, tarfile.open(tree / 'initrd', 'w', format=tarfile.USTAR_FORMAT) as dst:
         replaced = False
         for member in src:
-            if member.name.lstrip('./') == 'bin/init':
+            name = member.name.lstrip('./')
+            if name == 'bin/init':
                 dst.add(args.guest, arcname=member.name)
                 replaced = True
+            elif any(name == prefix or name.startswith(prefix.rstrip('/') + '/') for prefix in args.drop):
+                continue
             else:
                 dst.addfile(member, src.extractfile(member) if member.isfile() else None)
         if not replaced:
