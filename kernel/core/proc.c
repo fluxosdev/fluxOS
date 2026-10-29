@@ -1831,7 +1831,10 @@ int futex_wait(uint32_t addr, uint32_t val, int timeout_ms)
     void *chan = futex_chan(p->leader, addr);
     uint32_t deadline = 0;
     if (timeout_ms > 0) {
-        deadline = ticks + ((uint32_t)timeout_ms * HZ + 999) / 1000;
+        /* in 64 bits: a day's worth of milliseconds overflows 32 when multiplied by HZ; and no further
+         * than the wrap-around comparison on ticks can tell apart */
+        uint64_t t = ((uint64_t)timeout_ms * HZ + 999) / 1000;
+        deadline = ticks + (uint32_t)MIN(t, 0x7FFFFFFFu);
         prepare_wait_timeout(chan, deadline);
     } else {
         prepare_wait(chan);

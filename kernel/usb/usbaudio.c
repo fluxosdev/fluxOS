@@ -121,6 +121,7 @@ static struct {
     int fb_running;
     uint32_t progress, progress_tick, underruns, errors;
     int need_reset;                     /* the stream stalled: its transfers must be cancelled first */
+    int draining;                       /* drain(): once the ring is empty, let the stream end */
 
     /* write()'s side, under snd_lock */
     int open_pid;
@@ -284,7 +285,9 @@ static void xfer_done(struct usb_xfer *x)
         klog("usb: audio transfer failed (%d)\n", x->status);
     ua.progress++;
     ua.progress_tick = ticks;
-    if (ua.streaming && (ring_used() || ua.open_pid)) {
+    /* An open device keeps the stream going with silence between writes,
+     * except while the writer waits for it to finish (drain). */
+    if (ua.streaming && (ring_used() || (ua.open_pid && !ua.draining))) {
         fill_xfer(x);
         if (usb_submit(x) == 0)
             ua.inflight++;
@@ -411,15 +414,17 @@ static int wait_progress(void)
 
 static int drain(void)
 {
+    int r = 0;
+    ua.draining = 1;
     while (!ua.gone && (ua.streaming || ring_used())) {
         start();
         if (!ua.streaming)
             break;
-        int r = wait_progress();
-        if (r < 0)
-            return r;
+        if ((r = wait_progress()) < 0)
+            break;
     }
-    return ua.gone ? -ENODEV : 0;
+    ua.draining = 0;
+    return ua.gone ? -ENODEV : r;
 }
 
 static int dsp_open_locked(struct vnode *vn, int flags)

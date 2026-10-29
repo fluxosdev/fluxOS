@@ -256,6 +256,10 @@ int main(int argc, char **argv)
     int nfiles = 0;
     char **dirs = malloc(sizeof(char *) * (size_t)nops);
     int ndirs = 0;
+    if (!files || !dirs) {
+        fprintf(stderr, "ls: out of memory\n");
+        return 2;
+    }
     for (int k = i; k < argc; k++) {
         struct stat st;
         if (stat(argv[k], &st) < 0) {

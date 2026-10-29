@@ -43,6 +43,8 @@ int main(int argc, char **argv)
         if (r != 1)
             break;
     }
+    if (fd)
+        close(fd);
     printf("%08x\n", off);
     return 0;
 }

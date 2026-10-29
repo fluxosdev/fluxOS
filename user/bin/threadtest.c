@@ -29,9 +29,22 @@ static const char *volatile stage = "starting";
 static void on_alarm(int sig)
 {
     (void)sig;
-    char msg[160];
-    int n = snprintf(msg, sizeof(msg), "STUCK in: %s (pid %d)\n", stage, getpid());
-    write(2, msg, (size_t)n);
+    /* only async-signal-safe calls here: the message is put together by hand */
+    char msg[160], num[12];
+    size_t n = 0;
+    const char *parts[] = { "STUCK in: ", stage, " (pid " };
+    for (int i = 0; i < 3; i++)
+        for (const char *s = parts[i]; *s && n < sizeof(msg) - 16; s++)
+            msg[n++] = *s;
+    int pid = getpid(), k = 0;
+    do
+        num[k++] = (char)('0' + pid % 10);
+    while ((pid /= 10) && k < 10);
+    while (k > 0)
+        msg[n++] = num[--k];
+    msg[n++] = ')';
+    msg[n++] = '\n';
+    write(2, msg, n);
     _exit(3);
 }
 

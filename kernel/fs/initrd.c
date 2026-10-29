@@ -54,7 +54,7 @@ void initrd_load(const uint8_t *data, uint32_t size)
 
         path[0] = 0;
         if (h->prefix[0]) {
-            strncat(path, h->prefix, MIN(sizeof(h->prefix), sizeof(path) - 2));
+            strncat(path, h->prefix, MIN(sizeof(h->prefix), PATH_MAX - 2));
             strcat(path, "/");
         }
         strncat(path, h->name, MIN(sizeof(h->name), PATH_MAX - strlen(path) - 1));

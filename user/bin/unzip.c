@@ -147,7 +147,8 @@ static char **read_list(const char *path, int *n)
             if (!v)
                 exit(1);
         }
-        v[k++] = strdup(line);
+        if (!(v[k++] = strdup(line)))
+            exit(1);
     }
     free(line);
     fclose(f);

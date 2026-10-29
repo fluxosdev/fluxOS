@@ -836,7 +836,10 @@ int killpg(pid_t pgrp, int sig)
 
 int sigpending(sigset_t *set)
 {
-    *set = (sigset_t)sc0(SYS_sigpending);
+    uint32_t s;
+    if (ret(sc1(SYS_sigpending, (int)&s)) < 0)
+        return -1;
+    *set = s;
     return 0;
 }
 

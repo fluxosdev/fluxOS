@@ -581,9 +581,16 @@ void dhcp_input(const uint8_t *data, uint32_t len)
     len -= sizeof(struct udp_hdr);
     const struct dhcp_msg *m = (const struct dhcp_msg *)data;
     uint32_t fixed = (uint32_t)((const uint8_t *)m->options - (const uint8_t *)m);
-    if (len < fixed || m->op != 2 || ntohl(m->xid) != dhcp.xid || ntohl(m->magic) != DHCP_MAGIC ||
-        memcmp(m->chaddr, netif.dev.mac, ETH_ALEN) != 0)
+    if (len < fixed || m->op != 2 || ntohl(m->magic) != DHCP_MAGIC)
         return;
+    if (ntohl(m->xid) != dhcp.xid || memcmp(m->chaddr, netif.dev.mac, ETH_ALEN) != 0) {
+        static int told;
+        if (!told++)                    /* (another machine's, or ours misaddressed: say so once) */
+            klog("net: a DHCP reply not for us (xid %08x, for %02x:%02x:%02x:%02x:%02x:%02x)\n",
+                 ntohl(m->xid), m->chaddr[0], m->chaddr[1], m->chaddr[2], m->chaddr[3], m->chaddr[4],
+                 m->chaddr[5]);
+        return;
+    }
     const uint8_t *v;
     if (opt_get(m, len, OPT_MSG_TYPE, &v) < 1)
         return;
@@ -592,6 +599,9 @@ void dhcp_input(const uint8_t *data, uint32_t len)
     if (type == DHCPOFFER && dhcp.state == DHCP_SELECTING) {
         dhcp.offer = ntohl(m->yiaddr);
         dhcp.server = opt_ip(m, len, OPT_SERVER_ID);
+        static int offers;
+        if (!offers++ || dhcp.logged_failure)   /* the first, and any after a silence */
+            klog("net: DHCP offer of " IP_FMT " from " IP_FMT "\n", IP_ARGS(dhcp.offer), IP_ARGS(dhcp.server));
         dhcp.state = DHCP_REQUESTING;
         dhcp.tries = 0;
         dhcp.timeout = ticks + 2 * HZ;

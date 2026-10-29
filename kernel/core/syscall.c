@@ -266,6 +266,8 @@ static int sys_futex(uint32_t addr, uint32_t op, uint32_t val, uint32_t timeout_
 static int sys_set_tls(uint32_t base, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)b; (void)c; (void)d; (void)e;
+    if (base && (base < USER_BASE || base >= USER_TOP))
+        return -EINVAL;
     uint32_t flags = irq_save();        /* the processor whose segment this is stays this one */
     current->tls = base;
     gdt_set_tls(base);
@@ -338,10 +340,11 @@ static int sys_getitimer(uint32_t which, uint32_t uout, uint32_t c, uint32_t d, 
     return copy_to_user((void *)uout, &o, sizeof(o)) < 0 ? -EFAULT : 0;
 }
 
-static int sys_sigpending(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
+static int sys_sigpending(uint32_t uset, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
-    (void)a; (void)b; (void)c; (void)d; (void)e;
-    return (int)(__atomic_load_n(&current->sig_pending, __ATOMIC_RELAXED) & 0x7FFFFFFF);
+    (void)b; (void)c; (void)d; (void)e;
+    uint32_t set = __atomic_load_n(&current->sig_pending, __ATOMIC_RELAXED);
+    return copy_to_user((void *)uset, &set, sizeof(set)) < 0 ? -EFAULT : 0;
 }
 
 static int sys_sigaltstack(uint32_t uss, uint32_t uold, uint32_t c, uint32_t d, uint32_t e)

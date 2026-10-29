@@ -7,6 +7,10 @@
 static void tail(FILE *f, int lines)
 {
     char **ring = calloc((size_t)lines + 1, sizeof(char *));
+    if (!ring) {
+        fprintf(stderr, "tail: out of memory\n");
+        exit(1);
+    }
     int count = 0;
     char *line = NULL;
     size_t cap = 0;

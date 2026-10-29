@@ -1128,9 +1128,9 @@ void vfs_init(void)
     vfs_root->linked = 1;
 
     struct vnode *dev, *tmp;
-    vfs_create(vfs_root, "dev", VN_DIR, &dev);
-    vfs_create(vfs_root, "tmp", VN_DIR, &tmp);
-    vfs_create(vfs_root, "mnt", VN_DIR, NULL);
+    if (vfs_create(vfs_root, "dev", VN_DIR, &dev) < 0 || vfs_create(vfs_root, "tmp", VN_DIR, &tmp) < 0 ||
+        vfs_create(vfs_root, "mnt", VN_DIR, NULL) < 0)
+        panic("vfs: out of memory");
     tmp->mode = 01777;
     struct vnode *tty = vfs_mknod(dev, "tty", MKDEV(TTY_MAJOR, 0), tty_dev_read, tty_dev_write);
     struct vnode *con = vfs_mknod(dev, "console", MKDEV(TTY_MAJOR, 1), tty_dev_read, tty_dev_write);

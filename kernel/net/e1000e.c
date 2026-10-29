@@ -65,6 +65,9 @@
 #define R_PBA         0x01000
 #define R_PBECCSTS    0x0100C
 #define R_WUC         0x05800
+#define R_MANC        0x05820           /* manageability control (the ME's filters) */
+#define R_MANC2H      0x05860           /* which of the ME's decision filters the host gets too */
+#define R_MDEF0       0x05890           /* the eight decision filters */
 #define R_RDBAL       0x02800
 #define R_RDBAH       0x02804
 #define R_RDLEN       0x02808
@@ -282,6 +285,7 @@ static struct {
     int diag, diag_polls;               /* reports left to log (the first minute, and after a link change) */
     int irq;
     int phy_cycle;                      /* e1000e=phycycle */
+    int logged_manc;                    /* the ME's filters went to the log */
     struct mii_phy phy;
     struct netdev dev;
 } e;
@@ -908,6 +912,18 @@ static void start_rings(void)
     wr(R_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC);
 }
 
+/* What the ME's manageability filters take for themselves, once, for the log
+ * (all MDEF zero: none, so every frame for us reaches the host). */
+static void log_manageability(void)
+{
+    if (e.logged_manc)
+        return;
+    e.logged_manc = 1;
+    klog("%s: manageability MANC %08x MANC2H %08x MDEF %08x %08x %08x %08x %08x %08x %08x %08x\n",
+         e.dev.name, rd(R_MANC), rd(R_MANC2H), rd(R_MDEF0), rd(R_MDEF0 + 4), rd(R_MDEF0 + 8),
+         rd(R_MDEF0 + 12), rd(R_MDEF0 + 16), rd(R_MDEF0 + 20), rd(R_MDEF0 + 24), rd(R_MDEF0 + 28));
+}
+
 /* Bring the controller up, at boot and after suspend. */
 static int start(void)
 {
@@ -920,6 +936,7 @@ static int start(void)
         return -1;
     mac_reset();
     init_hw_bits();
+    log_manageability();
     wr(R_WUC, 0);                       /* no wake-up events */
     write_mac(e.dev.mac);
     for (int i = 0; i < 32; i++)

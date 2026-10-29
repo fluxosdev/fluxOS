@@ -145,7 +145,7 @@ int usb_submit(struct usb_xfer *x)
 {
     if (x->dev->gone)
         return x->status = -ENODEV;
-    if (x->len > USB_MAX_XFER)
+    if (x->len > USB_MAX_XFER || (x->ep && x->ep->type == USB_EP_ISO && !x->npackets))
         return x->status = -EINVAL;
     x->status = USB_PENDING;
     x->actual = 0;
@@ -335,6 +335,8 @@ static void get_string(struct usb_dev *dev, int index, uint16_t lang, char *out,
     uint32_t k = 0;
     for (int i = 2; i + 1 < n && k + 1 < size; i += 2) {
         uint16_t c = (uint16_t)(buf[i] | buf[i + 1] << 8);
+        if (!c)
+            break;                      /* (some pad the declared length with NULs) */
         out[k++] = c >= 0x20 && c < 0x7F ? (char)c : '?';
     }
     out[k] = 0;
