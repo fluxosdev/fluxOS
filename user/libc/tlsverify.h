@@ -6,7 +6,8 @@ struct tls_verifier *tls_verifier_new(void);
 void tls_verifier_free(struct tls_verifier *v);
 int tls_verify_chain(struct tls_verifier *v, const char *host, const unsigned char *p, size_t n, char *err,
                      size_t size);
-int tls_verify_signature(struct tls_verifier *v, const unsigned char hash[32], const unsigned char *p,
+/* TLS 1.3's CertificateVerify over the transcript hash (hlen bytes: 32 or 48). */
+int tls_verify_signature(struct tls_verifier *v, const unsigned char *hash, size_t hash_len, const unsigned char *p,
                          size_t n, char *err, size_t size);
 /* TLS 1.2: a Certificate message's list (no per-certificate extensions), and a ServerKeyExchange
  * signature (SignatureScheme alg) over data with the verified chain's key. */

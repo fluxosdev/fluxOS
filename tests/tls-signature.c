@@ -58,12 +58,12 @@ int main(int argc, char **argv)
     unsigned char hash[32];
     memset(hash, 0x5a, sizeof(hash));
     CHECK(v && tls_verify_chain(v, "localhost", chain, cn + 9, error, sizeof(error)) == 0);
-    CHECK(tls_verify_signature(v, hash, signed_message, sn + 4, error, sizeof(error)) == 0);
+    CHECK(tls_verify_signature(v, hash, 32, signed_message, sn + 4, error, sizeof(error)) == 0);
     hash[0] ^= 1;
-    CHECK(tls_verify_signature(v, hash, signed_message, sn + 4, error, sizeof(error)) < 0);
+    CHECK(tls_verify_signature(v, hash, 32, signed_message, sn + 4, error, sizeof(error)) < 0);
     hash[0] ^= 1;
     signed_message[sn + 3] ^= 1;
-    CHECK(tls_verify_signature(v, hash, signed_message, sn + 4, error, sizeof(error)) < 0);
+    CHECK(tls_verify_signature(v, hash, 32, signed_message, sn + 4, error, sizeof(error)) < 0);
     tls_verifier_free(v);
     free(cert);
     free(sig);

@@ -169,6 +169,127 @@ void gfx_blit_glass(struct surface *dst, int x, int y, const struct surface *bla
     }
 }
 
+/* The blur works on pixels spread out one channel to 16 bits of a 64-bit word (R, G, B from bit 32
+ * down): a sum of window pixels never carries from one channel into the next. */
+static inline uint64_t spread(uint32_t p)
+{
+    return (uint64_t)(p >> 16 & 255) << 32 | (p >> 8 & 255) << 16 | (p & 255);
+}
+
+/* A spread sum divided by the window (times inv, 65536 / the window). */
+static inline uint64_t mean(uint64_t sum, uint32_t inv)
+{
+    return (uint64_t)((uint32_t)(sum >> 32 & 0xFFFF) * inv >> 16) << 32 |
+           (uint64_t)((uint32_t)(sum >> 16 & 0xFFFF) * inv >> 16) << 16 | ((uint32_t)(sum & 0xFFFF) * inv >> 16);
+}
+
+/* One box blur of radius rad across each of h rows of w pixels, in to out; the rows' ends repeat past them. */
+static void box_rows(const uint64_t *in, uint64_t *out, int w, int h, int rad)
+{
+    uint32_t inv = 65536u / (2u * (unsigned)rad + 1);
+    for (int j = 0; j < h; j++) {
+        const uint64_t *r = in + (size_t)j * w;
+        uint64_t *o = out + (size_t)j * w, sum = 0;
+        for (int i = -rad; i <= rad; i++)
+            sum += r[i < 0 ? 0 : i >= w ? w - 1 : i];
+        for (int i = 0; i < w; i++) {
+            o[i] = mean(sum, inv);
+            int k = i + rad + 1, d = i - rad;
+            sum = sum + r[k >= w ? w - 1 : k] - r[d < 0 ? 0 : d];     /* added first: no lane goes below 0 */
+        }
+    }
+}
+
+/* The same down the columns, a row at a time (a running sum for each column in sums). */
+static void box_cols(const uint64_t *in, uint64_t *out, uint64_t *sums, int w, int h, int rad)
+{
+    uint32_t inv = 65536u / (2u * (unsigned)rad + 1);
+    memset(sums, 0, (size_t)w * sizeof(*sums));
+    for (int j = -rad; j <= rad; j++) {
+        const uint64_t *r = in + (size_t)(j < 0 ? 0 : j >= h ? h - 1 : j) * w;
+        for (int i = 0; i < w; i++)
+            sums[i] += r[i];
+    }
+    for (int j = 0; j < h; j++) {
+        uint64_t *o = out + (size_t)j * w;
+        int k = j + rad + 1, d = j - rad;
+        const uint64_t *add = in + (size_t)(k >= h ? h - 1 : k) * w, *sub = in + (size_t)(d < 0 ? 0 : d) * w;
+        for (int i = 0; i < w; i++) {
+            o[i] = mean(sums[i], inv);
+            sums[i] = sums[i] + add[i] - sub[i];
+        }
+    }
+}
+
+/* Is the middle of pixel (x, y) inside r with its corners rounded rt (top) and rb (bottom)? In half pixels. */
+static int in_rounded(struct rect r, int rt, int rb, int x, int y)
+{
+    int rad = y < r.y + r.h / 2 ? rt : rb;
+    if (rad <= 0)
+        return 1;
+    int px = 2 * x + 1, py = 2 * y + 1, x0 = 2 * (r.x + rad), x1 = 2 * (r.x + r.w - rad);
+    int y0 = 2 * (r.y + rad), y1 = 2 * (r.y + r.h - rad);
+    int dx = px < x0 ? x0 - px : px > x1 ? px - x1 : 0, dy = py < y0 ? y0 - py : py > y1 ? py - y1 : 0;
+    return dx * dx + dy * dy <= 4 * rad * rad;
+}
+
+void gfx_blur(struct surface *s, struct rect region, struct rect shape, int rt, int rb, int rad)
+{
+    struct rect out = rect_intersect(rect_intersect(region, shape), s->clip);
+    if (rect_empty(out) || rad <= 0)
+        return;
+    /* what it reads: as far round as the blur reaches, from an even pixel to an even one, on the surface */
+    int reach = GFX_BLUR_REACH(rad), half = GFX_BLUR_HALF(rad);
+    int x0 = (out.x - reach) & ~1, y0 = (out.y - reach) & ~1;
+    int x1 = (out.x + out.w + reach + 1) & ~1, y1 = (out.y + out.h + reach + 1) & ~1;
+    x0 = x0 < 0 ? 0 : x0, y0 = y0 < 0 ? 0 : y0;
+    x1 = x1 > s->w ? s->w : x1, y1 = y1 > s->h ? s->h : y1;
+    int hw = (x1 - x0 + 1) / 2, hh = (y1 - y0 + 1) / 2;
+    static uint64_t *buf;
+    static size_t cap;
+    size_t n = (size_t)hw * (size_t)hh, need = 2 * n + (size_t)hw;
+    if (need > cap) {
+        uint64_t *grown = realloc(buf, need * sizeof(*buf));
+        if (!grown)
+            return;
+        buf = grown;
+        cap = need;
+    }
+    uint64_t *a = buf, *t = buf + n, *sums = buf + 2 * n;
+    /* each half-size pixel the mean of its 2x2 (an odd last row or column counted twice) */
+    for (int j = 0; j < hh; j++) {
+        const uint32_t *r0 = s->px + (size_t)(y0 + 2 * j) * s->stride + x0;
+        const uint32_t *r1 = y0 + 2 * j + 1 < y1 ? r0 + s->stride : r0;
+        for (int i = 0; i < hw; i++) {
+            int c = x0 + 2 * i + 1 < x1 ? 1 : 0;
+            uint64_t sum = spread(r0[2 * i]) + spread(r0[2 * i + c]) + spread(r1[2 * i]) + spread(r1[2 * i + c]);
+            a[(size_t)j * hw + i] = ((sum >> 32 & 0xFFFF) + 2) >> 2 << 32 | ((sum >> 16 & 0xFFFF) + 2) >> 2 << 16 |
+                                    ((sum & 0xFFFF) + 2) >> 2;
+        }
+    }
+    for (int pass = 0; pass < 3; pass++) {
+        box_rows(a, t, hw, hh, half);
+        box_cols(t, a, sums, hw, hh, half);
+    }
+    /* back to full size: each pixel 3/4 its own block's and 1/4 the next one's toward it, each way */
+    for (int y = out.y; y < out.y + out.h; y++) {
+        int hy = (y - y0) / 2, ny = (y - y0) & 1 ? hy + 1 : hy - 1;
+        ny = ny < 0 ? 0 : ny >= hh ? hh - 1 : ny;
+        const uint64_t *ra = a + (size_t)hy * hw, *rb2 = a + (size_t)ny * hw;
+        uint32_t *to = s->px + (size_t)y * s->stride;
+        int corner = y < shape.y + rt || y >= shape.y + shape.h - rb;
+        for (int x = out.x; x < out.x + out.w; x++) {
+            if (corner && !in_rounded(shape, rt, rb, x, y))
+                continue;
+            int hx = (x - x0) / 2, nx = (x - x0) & 1 ? hx + 1 : hx - 1;
+            nx = nx < 0 ? 0 : nx >= hw ? hw - 1 : nx;
+            uint64_t v = 9 * ra[hx] + 3 * ra[nx] + 3 * rb2[hx] + rb2[nx];        /* sixteenths */
+            to[x] = (uint32_t)((v >> 32 & 0xFFFF) + 8) >> 4 << 16 | (uint32_t)((v >> 16 & 0xFFFF) + 8) >> 4 << 8 |
+                    (uint32_t)((v & 0xFFFF) + 8) >> 4;
+        }
+    }
+}
+
 /* (src * a + dst * (255 - a)) / 255, rounded, in each channel. */
 static inline uint32_t blend(uint32_t dst, uint32_t src, uint32_t a)
 {

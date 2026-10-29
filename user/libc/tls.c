@@ -3,9 +3,10 @@
  * record layer and the cryptography it needs. One ClientHello offers both;
  * the server's hello decides.
  *
- *  - TLS 1.3: TLS_AES_128_GCM_SHA256, which every TLS 1.3 server has to
- *    support; key exchange X25519 (RFC 7748), or P-256/P-384 when the server
- *    asks for one with a HelloRetryRequest; HKDF over HMAC-SHA-256.
+ *  - TLS 1.3: TLS_AES_128_GCM_SHA256 (which every TLS 1.3 server has to
+ *    support), TLS_CHACHA20_POLY1305_SHA256 and TLS_AES_256_GCM_SHA384; key
+ *    exchange X25519 (RFC 7748), or P-256/P-384 when the server asks for one
+ *    with a HelloRetryRequest; HKDF over HMAC-SHA-256 or HMAC-SHA-384.
  *  - TLS 1.2: ECDHE (X25519, P-256, P-384) signed with the server's RSA or
  *    ECDSA certificate, records sealed with AES-128-GCM, AES-256-GCM or
  *    ChaCha20-Poly1305 (RFC 8439, 7905); the extended master secret (RFC
@@ -307,11 +308,20 @@ static void hmac(const uint8_t *key, size_t klen, const uint8_t *msg, size_t n, 
     hmac_final(&h, out);
 }
 
-/* HKDF-Expand-Label for outputs of at most one hash block. */
-static void expand_label(const uint8_t secret[32], const char *label, const uint8_t *ctx,
+/* HMAC with TLS 1.3's suite hash: hl 32 for SHA-256, 48 for SHA-384. */
+static void hmac_hl(int hl, const uint8_t *key, size_t klen, const uint8_t *msg, size_t n, uint8_t *out)
+{
+    if (hl == 48)
+        tls_hmac384(key, klen, msg, n, NULL, 0, out);
+    else
+        hmac(key, klen, msg, n, out);
+}
+
+/* HKDF-Expand-Label for outputs of at most one hash block (hl as for hmac_hl). */
+static void expand_label(int hl, const uint8_t *secret, const char *label, const uint8_t *ctx,
                          size_t clen, uint8_t *out, size_t olen)
 {
-    uint8_t info[2 + 1 + 6 + 32 + 1 + 32 + 1], t[32];
+    uint8_t info[2 + 1 + 6 + 32 + 1 + 48 + 1], t[48];
     size_t llen = strlen(label), n = 0;
     info[n++] = (uint8_t)(olen >> 8);
     info[n++] = (uint8_t)olen;
@@ -324,14 +334,13 @@ static void expand_label(const uint8_t secret[32], const char *label, const uint
     memcpy(info + n, ctx, clen);
     n += clen;
     info[n++] = 1;
-    hmac(secret, 32, info, n, t);
+    hmac_hl(hl, secret, (size_t)hl, info, n, t);
     memcpy(out, t, olen);
 }
 
-static void derive_secret(const uint8_t secret[32], const char *label, const uint8_t hash[32],
-                          uint8_t out[32])
+static void derive_secret(int hl, const uint8_t *secret, const char *label, const uint8_t *hash, uint8_t *out)
 {
-    expand_label(secret, label, hash, 32, out, 32);
+    expand_label(hl, secret, label, hash, (size_t)hl, out, (size_t)hl);
 }
 
 /* ---- ChaCha20-Poly1305 (RFC 8439) ---- */
@@ -676,7 +685,7 @@ struct keys {
     uint8_t chacha[32];
     uint8_t iv[12];                     /* TLS 1.3 and ChaCha20: the nonce mask; TLS 1.2 GCM: the salt (4 bytes) */
     uint64_t seq;
-    uint8_t secret[32];                 /* TLS 1.3: the traffic secret, for KeyUpdate */
+    uint8_t secret[48];                 /* TLS 1.3: the traffic secret, for KeyUpdate */
     int on;
 };
 
@@ -685,8 +694,9 @@ struct tls {
     int fd, timeout_ms;
     char err[160];
     int tls12;                          /* the server chose TLS 1.2 */
+    int suite13, hl;                    /* TLS 1.3: the server's cipher suite, and its hash's length (32 or 48) */
     struct sha256 transcript;
-    uint8_t *log;                       /* the handshake so far (TLS 1.2 hashes it with its suite's hash) */
+    uint8_t *log;                       /* the handshake so far (TLS 1.2 and SHA-384 hash it from here) */
     size_t log_len, log_cap;
     uint8_t client_random[32], session_id[32];
     struct keys rd, wr;
@@ -714,15 +724,20 @@ static int set_error(struct tls *t, const char *fmt, ...)
     return -1;
 }
 
-/* TLS 1.3's keys and IV from a traffic secret (TLS_AES_128_GCM_SHA256). */
-static void set_keys(struct keys *k, const uint8_t secret[32])
+/* TLS 1.3's keys and IV from a traffic secret, for the connection's suite. */
+static void set_keys(const struct tls *t, struct keys *k, const uint8_t *secret)
 {
-    uint8_t key[16];
-    memcpy(k->secret, secret, 32);
-    expand_label(secret, "key", NULL, 0, key, 16);
-    expand_label(secret, "iv", NULL, 0, k->iv, 12);
-    gcm_setkey(&k->gcm, key, 16);
-    k->cipher = CIPHER_AES128_GCM;
+    uint8_t key[32];
+    int cipher = t->suite13 == 0x1303 ? CIPHER_CHACHA : t->suite13 == 0x1302 ? CIPHER_AES256_GCM : CIPHER_AES128_GCM;
+    int klen = cipher == CIPHER_AES128_GCM ? 16 : 32;
+    memcpy(k->secret, secret, (size_t)t->hl);
+    expand_label(t->hl, secret, "key", NULL, 0, key, (size_t)klen);
+    expand_label(t->hl, secret, "iv", NULL, 0, k->iv, 12);
+    if (cipher == CIPHER_CHACHA)
+        memcpy(k->chacha, key, 32);
+    else
+        gcm_setkey(&k->gcm, key, klen);
+    k->cipher = cipher;
     k->seq = 0;
     k->on = 1;
     memset(key, 0, sizeof(key));
@@ -1020,8 +1035,13 @@ static void consume_handshake(struct tls *t, int whole, int hash)
     t->hs_len -= whole;
 }
 
-static void transcript_hash(const struct tls *t, uint8_t out[32])
+/* The handshake so far, hashed with TLS 1.3's suite hash (t->hl bytes). */
+static void transcript_hash(const struct tls *t, uint8_t *out)
 {
+    if (t->hl == 48) {
+        tls_sha384(t->log, t->log_len, out);
+        return;
+    }
     struct sha256 copy = t->transcript;
     sha256_final(&copy, out);
 }
@@ -1069,8 +1089,8 @@ static int client_hello(struct tls *t, const char *host, int group, const uint8_
     memcpy(m + n, t->session_id, 32);
     n += 32;
     /* cipher suites: TLS 1.3's, then TLS 1.2's ECDHE AEAD suites */
-    static const uint8_t suites[] = { 0, 14, 0x13, 0x01, 0xC0, 0x2B, 0xC0, 0x2F, 0xCC, 0xA9, 0xCC, 0xA8,
-                                      0xC0, 0x2C, 0xC0, 0x30 };
+    static const uint8_t suites[] = { 0, 18, 0x13, 0x01, 0x13, 0x03, 0x13, 0x02, 0xC0, 0x2B, 0xC0, 0x2F,
+                                      0xCC, 0xA9, 0xCC, 0xA8, 0xC0, 0x2C, 0xC0, 0x30 };
     memcpy(m + n, suites, sizeof(suites));
     n += sizeof(suites);
     m[n++] = 1;                                     /* compression: null */
@@ -1216,7 +1236,7 @@ static int server_hello(struct tls *t, const uint8_t *p, int n, struct hello *h)
     if (!h->version)
         h->version = legacy;
     if (h->version == 0x0304) {
-        if (h->suite != 0x1301)
+        if (h->suite != 0x1301 && h->suite != 0x1302 && h->suite != 0x1303)
             return set_error(t, "the server chose an unsupported cipher suite (%04x)", h->suite);
         if (!h->retry && (!h->key_len || (h->group != 29 && h->group != 23 && h->group != 24)))
             return set_error(t, "the server sent no usable key share");
@@ -1239,25 +1259,28 @@ static int server_hello(struct tls *t, const uint8_t *p, int n, struct hello *h)
 /* TLS 1.3 from the server's hello on (RFC 8446), with the ECDHE shared secret. */
 static int handshake13(struct tls *t, const char *host, const uint8_t *shared, size_t shared_len)
 {
-    static const uint8_t zeros[32];
-    uint8_t early[32], derived[32], hs_secret[32], master[32], h[32], empty_hash[32];
-    uint8_t c_hs[32], s_hs[32], c_ap[32], s_ap[32];
-    int type, len, whole;
+    static const uint8_t zeros[48];
+    uint8_t early[48], derived[48], hs_secret[48], master[48], h[48], empty_hash[48];
+    uint8_t c_hs[48], s_hs[48], c_ap[48], s_ap[48];
+    int type, len, whole, hl = t->hl;
     uint8_t *body;
     if (t->hs_len)
         return set_error(t, "the server sent handshake data before its keys changed");
 
     /* The key schedule (RFC 8446 7.1), with no pre-shared key. */
-    sha256("", 0, empty_hash);
-    hmac(zeros, 32, zeros, 32, early);
-    derive_secret(early, "derived", empty_hash, derived);
-    hmac(derived, 32, shared, shared_len, hs_secret);
+    if (hl == 48)
+        tls_sha384((const uint8_t *)"", 0, empty_hash);
+    else
+        sha256("", 0, empty_hash);
+    hmac_hl(hl, zeros, (size_t)hl, zeros, (size_t)hl, early);
+    derive_secret(hl, early, "derived", empty_hash, derived);
+    hmac_hl(hl, derived, (size_t)hl, shared, shared_len, hs_secret);
     transcript_hash(t, h);
-    derive_secret(hs_secret, "c hs traffic", h, c_hs);
-    derive_secret(hs_secret, "s hs traffic", h, s_hs);
-    derive_secret(hs_secret, "derived", empty_hash, derived);
-    hmac(derived, 32, zeros, 32, master);
-    set_keys(&t->rd, s_hs);
+    derive_secret(hl, hs_secret, "c hs traffic", h, c_hs);
+    derive_secret(hl, hs_secret, "s hs traffic", h, s_hs);
+    derive_secret(hl, hs_secret, "derived", empty_hash, derived);
+    hmac_hl(hl, derived, (size_t)hl, zeros, (size_t)hl, master);
+    set_keys(t, &t->rd, s_hs);
     int cert_requested = 0, cert_seen = 0, sig_seen = 0, extensions_seen = 0;
     uint8_t cert_ctx[256];
     int cert_ctx_len = 0;
@@ -1296,7 +1319,7 @@ static int handshake13(struct tls *t, const char *host, const uint8_t *shared, s
             transcript_hash(t, h);
             if (!cert_seen || sig_seen)
                 return set_error(t, "unexpected server CertificateVerify");
-            if (tls_verify_signature(t->verifier, h, body, (size_t)len, t->err, sizeof(t->err)) < 0)
+            if (tls_verify_signature(t->verifier, h, (size_t)hl, body, (size_t)len, t->err, sizeof(t->err)) < 0)
                 return -1;
             sig_seen = 1;
         }
@@ -1314,26 +1337,26 @@ static int handshake13(struct tls *t, const char *host, const uint8_t *shared, s
     }
 
     /* The server's Finished: an HMAC over everything so far. */
-    uint8_t fkey[32], want[32];
+    uint8_t fkey[48], want[48];
     transcript_hash(t, h);
-    expand_label(s_hs, "finished", NULL, 0, fkey, 32);
-    hmac(fkey, 32, h, 32, want);
-    uint8_t diff = len != 32;
-    for (int i = 0; i < 32 && len == 32; i++)
+    expand_label(hl, s_hs, "finished", NULL, 0, fkey, (size_t)hl);
+    hmac_hl(hl, fkey, (size_t)hl, h, (size_t)hl, want);
+    uint8_t diff = len != hl;
+    for (int i = 0; i < hl && len == hl; i++)
         diff |= want[i] ^ body[i];
     if (diff)
         return set_error(t, "the server's Finished message does not match");
     consume_handshake(t, whole, 1);
     transcript_hash(t, h);
-    derive_secret(master, "c ap traffic", h, c_ap);
-    derive_secret(master, "s ap traffic", h, s_ap);
+    derive_secret(hl, master, "c ap traffic", h, c_ap);
+    derive_secret(hl, master, "s ap traffic", h, s_ap);
 
     /* Ours: a change_cipher_spec for middleboxes, an empty certificate if one
      * was asked for, then Finished. */
     static const uint8_t ccs[] = { CT_CHANGE_CIPHER_SPEC, 3, 3, 0, 1, 1 };
     if (send_full(t, ccs, sizeof(ccs)) < 0)
         return -1;
-    set_keys(&t->wr, c_hs);
+    set_keys(t, &t->wr, c_hs);
     if (cert_requested) {
         uint8_t m[4 + 1 + 255 + 3];
         int n = 4;
@@ -1350,15 +1373,15 @@ static int handshake13(struct tls *t, const char *host, const uint8_t *shared, s
         if (write_record(t, CT_HANDSHAKE, m, n) < 0)
             return -1;
     }
-    uint8_t fin[4 + 32] = { HS_FINISHED, 0, 0, 32 };
+    uint8_t fin[4 + 48] = { HS_FINISHED, 0, 0, (uint8_t)hl };
     transcript_hash(t, h);
-    expand_label(c_hs, "finished", NULL, 0, fkey, 32);
-    hmac(fkey, 32, h, 32, fin + 4);
-    if (write_record(t, CT_HANDSHAKE, fin, sizeof(fin)) < 0)
+    expand_label(hl, c_hs, "finished", NULL, 0, fkey, (size_t)hl);
+    hmac_hl(hl, fkey, (size_t)hl, h, (size_t)hl, fin + 4);
+    if (write_record(t, CT_HANDSHAKE, fin, 4 + hl) < 0)
         return -1;
 
-    set_keys(&t->rd, s_ap);
-    set_keys(&t->wr, c_ap);
+    set_keys(t, &t->rd, s_ap);
+    set_keys(t, &t->wr, c_ap);
     memset(master, 0, sizeof(master));
     return 0;
 }
@@ -1528,6 +1551,11 @@ static int handshake(struct tls *t, const char *host)
         return set_error(t, "the server did not answer with a hello");
     if (server_hello(t, body, len, &sh) < 0)
         return -1;
+    t->hl = 32;
+    if (sh.version == 0x0304) {                 /* the transcript is hashed with the suite's hash from here */
+        t->suite13 = sh.suite;
+        t->hl = sh.suite == 0x1302 ? 48 : 32;
+    }
 
     struct tls_ec *ec = NULL;
     if (sh.retry) {
@@ -1535,13 +1563,14 @@ static int handshake(struct tls *t, const char *host)
          * and a second one goes with a key share of the group the server wants. */
         if (sh.group != 23 && sh.group != 24)
             return set_error(t, "the server wants a key exchange this client does not have (%d)", sh.group);
-        uint8_t h1[32], mh[4 + 32] = { HS_MESSAGE_HASH, 0, 0, 32 }, ecpub[133];
+        int retry_suite = sh.suite;
+        uint8_t h1[48], mh[4 + 48] = { HS_MESSAGE_HASH, 0, 0, (uint8_t)t->hl }, ecpub[133];
         size_t ecpub_len = sizeof(ecpub);
         transcript_hash(t, h1);
-        memcpy(mh + 4, h1, 32);
+        memcpy(mh + 4, h1, (size_t)t->hl);
         sha256_init(&t->transcript);
         t->log_len = 0;
-        hs_add(t, mh, sizeof(mh));
+        hs_add(t, mh, (size_t)(4 + t->hl));
         consume_handshake(t, whole, 1);
         if (!(ec = tls_ec_new(sh.group, ecpub, &ecpub_len)))
             return set_error(t, "cannot make a key for the server's curve");
@@ -1551,7 +1580,8 @@ static int handshake(struct tls *t, const char *host)
             tls_ec_free(ec);
             return type == HS_SERVER_HELLO || t->err[0] ? -1 : set_error(t, "the server did not answer with a hello");
         }
-        if (type != HS_SERVER_HELLO || sh.retry || sh.version != 0x0304 || sh.group != want_group) {
+        if (type != HS_SERVER_HELLO || sh.retry || sh.version != 0x0304 || sh.group != want_group ||
+            sh.suite != retry_suite) {
             tls_ec_free(ec);
             return set_error(t, "the server's second hello does not match its request");
         }
@@ -1653,15 +1683,15 @@ static int post_handshake(struct tls *t)
         if (t->hs_len < 4 + n)
             break;
         if (!t->tls12 && t->hs[0] == HS_KEY_UPDATE && n == 1) {
-            uint8_t next[32];
-            expand_label(t->rd.secret, "traffic upd", NULL, 0, next, 32);
-            set_keys(&t->rd, next);
+            uint8_t next[48];
+            expand_label(t->hl, t->rd.secret, "traffic upd", NULL, 0, next, (size_t)t->hl);
+            set_keys(t, &t->rd, next);
             if (t->hs[4] == 1) {                /* update_requested: answer, then move on */
                 static const uint8_t ku[] = { HS_KEY_UPDATE, 0, 0, 1, 0 };
                 if (write_record(t, CT_HANDSHAKE, ku, sizeof(ku)) < 0)
                     return -1;
-                expand_label(t->wr.secret, "traffic upd", NULL, 0, next, 32);
-                set_keys(&t->wr, next);
+                expand_label(t->hl, t->wr.secret, "traffic upd", NULL, 0, next, (size_t)t->hl);
+                set_keys(t, &t->wr, next);
             }
         }
         consume_handshake(t, 4 + n, 0);

@@ -281,10 +281,10 @@ void tls_hmac384(const unsigned char *key, size_t klen, const unsigned char *a, 
     }
     memcpy(out, pad, 48);
 }
-int tls_verify_signature(struct tls_verifier *v, const unsigned char hash[32], const unsigned char *p,
+int tls_verify_signature(struct tls_verifier *v, const unsigned char *hash, size_t hash_len, const unsigned char *p,
                          size_t n, char *err, size_t size)
 {
-    if (!v || !v->verified || n < 4 || ((size_t)p[2] << 8 | p[3]) != n - 4)
+    if (!v || !v->verified || n < 4 || ((size_t)p[2] << 8 | p[3]) != n - 4 || hash_len > 48)
         goto invalid;
     int alg = p[0] << 8 | p[1];
     mbedtls_md_type_t md;
@@ -316,12 +316,12 @@ int tls_verify_signature(struct tls_verifier *v, const unsigned char hash[32], c
         if (ec->MBEDTLS_PRIVATE(grp).id != want)
             goto invalid;
     }
-    unsigned char input[130], digest[64];
+    unsigned char input[64 + 34 + 48], digest[64];
     memset(input, 0x20, 64);
     static const char context[] = "TLS 1.3, server CertificateVerify";
     memcpy(input + 64, context, sizeof(context));
-    memcpy(input + 64 + sizeof(context), hash, 32);
-    size_t ilen = 64 + sizeof(context) + 32;
+    memcpy(input + 64 + sizeof(context), hash, hash_len);
+    size_t ilen = 64 + sizeof(context) + hash_len;
     int rc = md == MBEDTLS_MD_SHA256 ? mbedtls_sha256(input, ilen, digest, 0)
                                      : mbedtls_sha512(input, ilen, digest, md == MBEDTLS_MD_SHA384);
     int hlen = md == MBEDTLS_MD_SHA256 ? 32 : md == MBEDTLS_MD_SHA384 ? 48 : 64;

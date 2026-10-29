@@ -1204,19 +1204,8 @@ static void frame_gradient(struct rect r, struct rect cl, int rt, int rb, int n,
     screen.clip = saved;
 }
 
-/* A band of light across a caption: w wide, from (x, y) leaning back by slant pixels over h rows. */
-static void streak(int x, int y, int w, int h, int slant, int alpha)
-{
-    for (int j = 0; j < h; j++) {
-        int x0 = (x << 8) - (slant << 8) * (2 * j + 1) / (2 * h), xi = x0 >> 8, f = x0 & 255;
-        gfx_round_fill(&screen, mkrect(xi, y + j, 1, 1), 0, 0, ARGB(alpha * (256 - f) >> 8, 0xFFFFFF));
-        gfx_round_fill(&screen, mkrect(xi + 1, y + j, w - 1, 1), 0, 0, ARGB(alpha, 0xFFFFFF));
-        gfx_round_fill(&screen, mkrect(xi + w, y + j, 1, 1), 0, 0, ARGB(alpha * f >> 8, 0xFFFFFF));
-    }
-}
-
-/* Kinetik Glass: a pane of faintly tinted glass, a sheen with a fold across the caption and
- * a few bands of light on it, white edges; the title on a soft glow so it reads on anything. */
+/* Kinetik Glass: a pane of faintly tinted glass, a sheen with a fold across the caption,
+ * white edges; the title on a soft glow so it reads on anything. */
 static void draw_window_glass(struct window *w)
 {
     struct rect r = w->r, cl = wm_client_rect(w), cap = caption_rect(w);
@@ -1224,6 +1213,13 @@ static void draw_window_glass(struct window *w)
     int top = theme.cap_inset + TITLE_H, k = active ? 256 : 176;   /* how much glass there is */
     if (!w->maximized)
         gfx_shadow(&screen, r, rt, SHADOW_DY, SHADOW_BLUR, GLASS_SHADOW);
+    /* what is behind the frame, frosted (the client area hides the rest) */
+    struct rect bands[4] = {
+        mkrect(r.x, r.y, r.w, cl.y - r.y), mkrect(r.x, cl.y, cl.x - r.x, cl.h),
+        mkrect(cl.x + cl.w, cl.y, r.x + r.w - cl.x - cl.w, cl.h), mkrect(r.x, cl.y + cl.h, r.w, r.y + r.h - cl.y - cl.h),
+    };
+    for (int i = 0; i < 4; i++)
+        gfx_blur(&screen, bands[i], r, rt, rb, GLASS_BLUR);
     int below = r.h > 1 ? top * 256 / (r.h - 1) : 0;
     int pos[4] = { 0, below, below > 128 ? below : 128, 256 };
     color_t pane[4] = {
@@ -1232,15 +1228,11 @@ static void draw_window_glass(struct window *w)
     };
     frame_gradient(r, cl, rt, rb, 4, pane, pos);
     static const int spos[4] = { 0, 120, 128, 256 };
-    color_t sheen[4] = {
-        ARGB(97 * k >> 8, 0xFFFFFF), ARGB(43 * k >> 8, 0xFFFFFF), ARGB(31 * k >> 8, 0x142533),
-        ARGB(31 * k >> 8, 0xFFFFFF),
+    color_t sheen[4] = {                /* a gentle one: the glass and the blur carry the caption */
+        ARGB(58 * k >> 8, 0xFFFFFF), ARGB(26 * k >> 8, 0xFFFFFF), ARGB(16 * k >> 8, 0x142533),
+        ARGB(18 * k >> 8, 0xFFFFFF),
     };
     gfx_gradient(&screen, mkrect(r.x + 1, r.y + 1, r.w - 2, top - 1), rt > 0 ? rt - 1 : 0, 0, 4, sheen, spos);
-    if (r.w >= 300)
-        streak(r.x + 85, r.y + 2, 78, top - 2, (top - 2) * 32 / 34, 33 * k >> 8);
-    if (r.w >= 480)
-        streak(r.x + r.w - 260, r.y + 2, 24, top - 2, (top - 2) * 32 / 34, 33 * k >> 8);
     gfx_round_frame(&screen, r, rt, rb, ARGB(active ? 115 : 80, 0x617D8C));
     gfx_round_frame(&screen, mkrect(r.x + 1, r.y + 1, r.w - 2, r.h - 2), rt > 0 ? rt - 1 : 0, rb > 0 ? rb - 1 : 0,
                     ARGB(active ? 153 : 110, 0xFFFFFF));
@@ -1340,6 +1332,7 @@ static void draw_taskbar_kinetik(void)
 {
     struct rect tb = taskbar_rect();
     if (GLASS) {
+        gfx_blur(&screen, tb, tb, 0, 0, GLASS_BLUR);
         glass_smoke(&screen, tb, 0, 0);
         gfx_round_fill(&screen, mkrect(tb.x, tb.y, tb.w, 1), 0, 0, ARGB(140, 0x0C1015));
         gfx_hline(&screen, tb.x, tb.y + 1, tb.w, RGB(0x87, 0x92, 0x9C));
@@ -1683,7 +1676,7 @@ static struct window *covering(struct rect r, const struct window *modal)
     return found;
 }
 
-static void compose(struct rect r)
+static void compose_rect(struct rect r)
 {
     gfx_clip(&screen, r);
     if (saver_active()) {
@@ -1717,6 +1710,75 @@ static void compose(struct rect r)
     if (!hw_cursor)
         draw_cursor(&screen, mx, my, cursor_kind);
     gfx_noclip(&screen);
+}
+
+/* Kinetik Glass: r, grown by the blur's reach round the glass in it (frames, taskbar, sidebar), so the
+ * blur there takes in only what is drawn afresh. From the top down: what the glass on top takes in may
+ * be glass lower down, which then needs its own surroundings drawn too. */
+static struct rect glass_reach(struct rect r)
+{
+    int reach = GFX_BLUR_REACH(GLASS_BLUR);
+    struct rect e = r;
+#define TOUCH(g)                                                                                         \
+    do {                                                                                                 \
+        struct rect i_ = rect_intersect(e, (g));                                                         \
+        if (!rect_empty(i_))                                                                             \
+            e = rect_union(e, mkrect(i_.x - reach, i_.y - reach, i_.w + 2 * reach, i_.h + 2 * reach)); \
+    } while (0)
+    if (!setup_mode) {
+        TOUCH(taskbar_rect());
+        TOUCH(sidebar_rect());
+    }
+    struct window *stack[64];
+    int n = 0;
+    for (struct window *w = bottom; w; w = w->above)
+        if (!w->minimized && n < 64)
+            stack[n++] = w;
+    while (n--) {
+        struct rect wr = stack[n]->r, cl = wm_client_rect(stack[n]);
+        TOUCH(mkrect(wr.x, wr.y, wr.w, cl.y - wr.y));
+        TOUCH(mkrect(wr.x, cl.y, cl.x - wr.x, cl.h));
+        TOUCH(mkrect(cl.x + cl.w, cl.y, wr.x + wr.w - cl.x - cl.w, cl.h));
+        TOUCH(mkrect(wr.x, cl.y + cl.h, wr.w, wr.y + wr.h - cl.y - cl.h));
+    }
+#undef TOUCH
+    return rect_intersect(e, mkrect(0, 0, screen_w, screen_h));
+}
+
+/* Paint r afresh. Under Kinetik Glass a little more is painted, for the blur to take in, and then put
+ * back as it was: only r changes, so what is in screen stays what is shown. */
+static void compose(struct rect r)
+{
+    struct rect e = GLASS && !saver_active() ? glass_reach(r) : r;
+    static uint32_t *keep;
+    static size_t cap;
+    size_t n = (size_t)e.w * (size_t)e.h;
+    if ((e.x == r.x && e.y == r.y && e.w == r.w && e.h == r.h) || rect_empty(e)) {
+        compose_rect(r);
+        return;
+    }
+    if (n > cap) {
+        uint32_t *grown = realloc(keep, n * sizeof(*keep));
+        if (!grown) {
+            compose_rect(r);
+            return;
+        }
+        keep = grown;
+        cap = n;
+    }
+    for (int j = 0; j < e.h; j++)
+        memcpy(keep + (size_t)j * e.w, screen.px + (size_t)(e.y + j) * screen.stride + e.x, (size_t)e.w * 4);
+    compose_rect(e);
+    for (int j = 0; j < e.h; j++) {
+        int y = e.y + j;
+        uint32_t *row = screen.px + (size_t)y * screen.stride, *old = keep + (size_t)j * e.w;
+        if (y < r.y || y >= r.y + r.h) {
+            memcpy(row + e.x, old, (size_t)e.w * 4);
+            continue;
+        }
+        memcpy(row + e.x, old, (size_t)(r.x - e.x) * 4);
+        memcpy(row + r.x + r.w, old + (r.x + r.w - e.x), (size_t)(e.x + e.w - r.x - r.w) * 4);
+    }
 }
 
 void wm_flush(void)

@@ -150,6 +150,14 @@ void gfx_round_frame(struct surface *s, struct rect r, int rt, int rb, color_t a
 /* A soft shadow round a rounded box (radius rad), dy lower, fading out over blur pixels;
  * its darkest is argb. Only what is outside the box is painted. */
 void gfx_shadow(struct surface *s, struct rect r, int rad, int dy, int blur, color_t argb);
+/* Frosted glass: the pixels of region blurred where they lie inside shape (corners rounded rt at
+ * the top, rb at the bottom), and within s's clip. About a Gaussian of rad pixels, worked out at half
+ * the resolution (on 2x2 blocks at even coordinates, so a pixel comes out the same whatever else is
+ * blurred with it). A pixel takes in what is up to GFX_BLUR_REACH(rad) away: the caller sees that
+ * those are drawn. */
+#define GFX_BLUR_HALF(rad) ((rad) / 2 > 0 ? (rad) / 2 : 1)
+#define GFX_BLUR_REACH(rad) (6 * GFX_BLUR_HALF(rad) + 4)
+void gfx_blur(struct surface *s, struct rect region, struct rect shape, int rt, int rb, int rad);
 /* A line of any slope, anti-aliased, w pixels wide. */
 void gfx_line(struct surface *s, int x0, int y0, int x1, int y1, int w, color_t argb);
 /* Mix two colors: t out of 256 of the way from a to b. */

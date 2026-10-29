@@ -6099,11 +6099,16 @@ struct jsdom *jsdom_new(const struct jshost *host)
     jsval nv = js_obj(nav);
     js_set(J, nv, "userAgent", js_str(J, BROWSER_USER_AGENT));
     js_set(J, nv, "appName", js_str(J, "Netscape"));
-    js_set(J, nv, "appVersion", js_str(J, "5.0 (fluxOS)"));
-    js_set(J, nv, "platform", js_str(J, "fluxOS i686"));
+    /* as the User-Agent says: a Gecko browser on 32-bit Linux, in US English (Accept-Language too) */
+    js_set(J, nv, "appVersion", js_str(J, "5.0 (X11)"));
+    js_set(J, nv, "platform", js_str(J, "Linux i686"));
+    js_set(J, nv, "oscpu", js_str(J, "Linux i686"));
+    js_set(J, nv, "productSub", js_str(J, "20100101"));
+    js_set(J, nv, "buildID", js_str(J, "20181001000000"));
     js_set(J, nv, "language", js_str(J, "en-US"));
     struct jsobj *langs = js_new_array(J);
     js_array_push(J, langs, js_str(J, "en-US"));
+    js_array_push(J, langs, js_str(J, "en"));
     js_set(J, nv, "languages", js_obj(langs));
     js_set(J, nv, "cookieEnabled", js_bool(1));
     js_set(J, nv, "onLine", js_bool(1));

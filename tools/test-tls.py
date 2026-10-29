@@ -74,6 +74,18 @@ check('client-only certificate',wrong_usage=True,accepted=False)
 # TLS 1.3 servers that want another curve ask for it with a HelloRetryRequest.
 check('TLS 1.3 HelloRetryRequest for P-256',server=['-tls1_3','-groups','P-256'])
 check('TLS 1.3 HelloRetryRequest for P-384',curve=True,server=['-tls1_3','-groups','P-384'])
+# TLS 1.3's other suites: SHA-384 throughout the key schedule (and in the HelloRetryRequest's message hash),
+# ChaCha20-Poly1305 records, and a server that prefers either.
+tls13 = lambda suites, groups='X25519', *more: ['-tls1_3','-ciphersuites',suites,'-groups',groups]+list(more)
+check('TLS 1.3 AES-256-GCM SHA-384 over X25519',server=tls13('TLS_AES_256_GCM_SHA384'))
+check('TLS 1.3 AES-256-GCM SHA-384 after a HelloRetryRequest for P-384',curve=True,curve384=True,sha384=True,
+      server=tls13('TLS_AES_256_GCM_SHA384','P-384'))
+check('TLS 1.3 AES-256-GCM SHA-384 with a client certificate request',server=tls13('TLS_AES_256_GCM_SHA384','X25519','-verify','1'))
+check('TLS 1.3 ChaCha20-Poly1305 over X25519',curve=True,server=tls13('TLS_CHACHA20_POLY1305_SHA256'))
+check('TLS 1.3 ChaCha20-Poly1305 after a HelloRetryRequest for P-256',server=tls13('TLS_CHACHA20_POLY1305_SHA256','P-256'))
+check('TLS 1.3 server preference among all three',
+      server=tls13('TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256','X25519','-serverpref'))
+check('TLS 1.3 SHA-384 hostname mismatch',host='other.example',accepted=False,server=tls13('TLS_AES_256_GCM_SHA384'))
 # TLS 1.2: every suite offered, with each curve and signature kind.
 tls12 = lambda cipher, groups='X25519', *more: ['-tls1_2','-cipher',cipher,'-groups',groups]+list(more)
 check('TLS 1.2 ECDHE-RSA AES-128-GCM over X25519',server=tls12('ECDHE-RSA-AES128-GCM-SHA256'))

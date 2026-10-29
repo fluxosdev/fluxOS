@@ -576,8 +576,10 @@ void sidebar_draw(struct surface *s)
         return;
     if (!cache_ok || cache.w != sr.w || cache.h != sr.h)
         render();
-    if (cache_ok && GLASS)
+    if (cache_ok && GLASS) {
+        gfx_blur(s, sr, sr, 0, 0, GLASS_BLUR);         /* the desktop and windows behind, frosted */
         gfx_blit_glass(s, sr.x, sr.y, &cache, &cache_lit, sr.w, sr.h);
+    }
     else if (cache_ok)
         gfx_blit(s, sr.x, sr.y, &cache, 0, 0, sr.w, sr.h);
     else

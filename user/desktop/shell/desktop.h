@@ -55,6 +55,8 @@ void glass_smoke(struct surface *s, struct rect r, int rt, int rb);
 #define FRAME_TOP  (theme.cap_inset + TITLE_H + theme.cap_gap)     /* the frame above the client area */
 #define KINETIK    (theme.style != THEME_CLASSIC)   /* Kinetik or Kinetik Glass: drawn the Kinetik way */
 #define GLASS      (theme.style == THEME_GLASS)
+/* Kinetik Glass blurs what is behind its frames, taskbar and sidebar this much (gfx_blur's rad). */
+#define GLASS_BLUR 5
 
 /* Window flags */
 #define WF_MINIMIZE 0x1         /* has a minimize button */

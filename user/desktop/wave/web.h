@@ -17,8 +17,12 @@
 #include "gfx.h"
 
 #define URL_MAX 2048
-/* How the browser names itself: in its requests, and to scripts (navigator.userAgent). */
-#define BROWSER_USER_AGENT "Mozilla/5.0 (fluxOS; i686) Wave/1.0"
+/* How the browser names itself: in its requests, and to scripts (navigator.userAgent). In the form
+ * Gecko browsers use, so sites give it their standard pages rather than ones for unknown clients; Wave
+ * is named at the end. The Gecko version is an extended-support release: keep it a supported one. */
+#define BROWSER_GECKO_VERSION "140.0"
+#define BROWSER_USER_AGENT \
+    "Mozilla/5.0 (X11; Linux i686; rv:" BROWSER_GECKO_VERSION ") Gecko/20100101 Firefox/" BROWSER_GECKO_VERSION " Wave/1.0"
 /* Where what is typed in the address bar that is not an address goes. */
 #define SEARCH_URL "https://html.duckduckgo.com/html/?q="
 

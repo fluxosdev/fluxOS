@@ -1105,13 +1105,11 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
   var nav = g.navigator;
   nav.hardwareConcurrency = 1;
   nav.maxTouchPoints = 0;
-  nav.deviceMemory = 1;
   nav.pdfViewerEnabled = false;
   nav.webdriver = false;
   nav.doNotTrack = null;
   nav.product = "Gecko";
-  nav.userAgentData = { brands: [], mobile: false, platform: "fluxOS",
-    getHighEntropyValues: function () { return Promise.resolve({ brands: [], mobile: false, platform: "fluxOS" }); } };
+  /* no userAgentData or deviceMemory: Chromium's, and the User-Agent names a Gecko browser */
   URL.createObjectURL = function (blob) { if(!(blob instanceof Blob))throw new TypeError("createObjectURL requires a Blob");return g["%blobURL"](blob._bytes,blob.type); };
   URL.revokeObjectURL = function (url) { g["%blobURL"](String(url)); };
   nav.clipboard = {
