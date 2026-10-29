@@ -181,6 +181,12 @@ static inline void wr(uint32_t reg, uint32_t v)
 /* intel.c */
 void intel_screen_changed(void);        /* fb changed size: page 0, the pointer again */
 
+/* intel_3d.c: the 3D engine, for the GL library */
+void intel_3d_init(void);               /* after the blitter */
+int intel_3d_ok(void);
+void intel_3d_proc_exit(int pid);
+void intel_3d_resume(void);
+
 /* intel_modeset.c: native modes, for the VGA output (the PCH's DAC behind FDI) */
 void intel_modeset_init(void);
 int intel_native_modes(struct dispmode *out, int max);

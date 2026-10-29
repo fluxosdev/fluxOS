@@ -4,7 +4,8 @@
  * vertex arrays, list.c records and replays display lists, tex.c keeps
  * textures, pixels.c reads the picture back, and a backend draws the
  * polygons: radeon.c on a
- * Radeon HD 4000's 3D engine, tdfx.c on a Voodoo card's, soft.c in memory.
+ * Radeon HD 4000's 3D engine, intel.c on Haswell HD Graphics', tdfx.c on a
+ * Voodoo card's, soft.c in memory.
  *
  * There is no destination alpha anywhere: GL_DST_ALPHA blends as 1 and
  * GL_ALPHA_BITS is 0.
@@ -256,10 +257,13 @@ void gl_free_lists(struct fgl_context *c);
 extern const struct backend gl_soft_backend;
 extern const struct backend gl_tdfx_backend;
 extern const struct backend gl_radeon_backend;
+extern const struct backend gl_intel_backend;
 int gl_tdfx_attach(struct fgl_context *c);     /* 0: the hardware took the context */
 int gl_tdfx_check(struct fgl_context *c);      /* 0: its video memory is still free */
 int gl_radeon_attach(struct fgl_context *c);
 int gl_radeon_check(struct fgl_context *c);    /* 0: the engine still runs */
+int gl_intel_attach(struct fgl_context *c);
+int gl_intel_check(struct fgl_context *c);     /* 0: the engine still runs */
 int gl_tdfx_can_draw(struct fgl_context *c);   /* 1: the Voodoo can draw with today's state */
 /* Draw in memory from now on, starting from the picture as it is. */
 int gl_use_software(struct fgl_context *c, int keep_picture);

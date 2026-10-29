@@ -80,6 +80,8 @@
 #define R_TDT         0x03818
 #define R_TXDCTL0     0x03828
 #define R_TARC0       0x03840
+#define R_TDFH        0x03410           /* the transmit FIFO's head and tail */
+#define R_TDFT        0x03418
 #define R_TXDCTL1     0x03928
 #define R_TARC1       0x03940
 #define R_CRCERRS     0x04000           /* the statistics are cleared when read */
@@ -112,6 +114,7 @@
 #define STATUS_LU         (1u << 1)
 #define STATUS_SPEED      (3u << 6)
 #define STATUS_SPEED_100  (1u << 6)
+#define STATUS_PHYRA      (1u << 10)    /* a PHY reset was asserted: cleared by software */
 #define STATUS_GIO_MASTER_ENABLE (1u << 19)
 
 #define CTRL_EXT_LPCD     (1u << 2)     /* LANPHYPC cycle done */
@@ -156,9 +159,12 @@
 
 #define TCTL_EN           (1u << 1)
 #define TCTL_PSP          (1u << 3)     /* pad short frames */
+#define TCTL_CT_MASK      (0xFFu << 4)
 #define TCTL_CT           (15u << 4)    /* collision threshold */
+#define TCTL_COLD_MASK    (0x3FFu << 12)
 #define TCTL_COLD         (63u << 12)   /* collision distance */
 #define TCTL_RTLC         (1u << 24)
+#define TARC_ENABLE       (1u << 10)    /* the transmit queue (its reset default) */
 
 #define TIPG_IPGT_MASK    0x3FF
 
@@ -605,12 +611,14 @@ static void init_hw_bits(void)
         v = (v & ~TXDCTL_PTHRESH) | TXDCTL_PREFETCH;
         wr(reg, v);
     }
-    wr(R_TARC0, rd(R_TARC0) | 1u << 23 | 1u << 24 | 1u << 26 | 1u << 27);
-    wr(R_TARC1, (rd(R_TARC1) | 1u << 24 | 1u << 26 | 1u << 28 | 1u << 30));  /* TCTL.MULR is off */
+    wr(R_TARC0, rd(R_TARC0) | TARC_ENABLE | 1u << 23 | 1u << 24 | 1u << 26 | 1u << 27);
+    wr(R_TARC1, (rd(R_TARC1) | TARC_ENABLE | 1u << 24 | 1u << 26 | 1u << 28 | 1u << 30));  /* TCTL.MULR is off */
     wr(R_RFCTL, rd(R_RFCTL) | RFCTL_NFSW_DIS | RFCTL_NFSR_DIS);
     wr(R_PBECCSTS, rd(R_PBECCSTS) | PBECCSTS_ECC);
     wr(R_CTRL, rd(R_CTRL) | CTRL_MEHE);
-    wr(R_GCR, rd(R_GCR) & ~GCR_NO_SNOOP_ALL);   /* DMA snoops the processor's caches */
+    /* DMA snoops the processor's caches; the other bits of the PCIe control
+     * register set, as Linux and FreeBSD write it on every ICH9 and later part. */
+    wr(R_GCR, (rd(R_GCR) & ~GCR_NO_SNOOP_ALL) | ~GCR_NO_SNOOP_ALL);
 }
 
 static void write_mac(const uint8_t *m)
@@ -714,6 +722,11 @@ static void update_link(int force)
     wr(R_TIPG, tipg | (speed == 10 && !full ? 0xFF : 0x08));
     uint32_t ctrl = rd(R_CTRL) & ~(CTRL_RFCE | CTRL_TFCE);
     wr(R_CTRL, full ? ctrl | CTRL_RFCE : ctrl);
+    /* Transmitting is turned on once there is a link, as Linux does from
+     * its watchdog (enabled with the link down, the transmit unit never
+     * fetched a descriptor on an I217); what was queued meanwhile goes then. */
+    if (up)
+        wr(R_TCTL, rd(R_TCTL) | TCTL_EN);
     /* The I217 loses packets unless its beacon lasts 8 us; no PLL clock request outside K1 work. */
     wr(R_FEXTNVM4, (rd(R_FEXTNVM4) & ~FEXTNVM4_BEACON_DURATION_MASK) | FEXTNVM4_BEACON_DURATION_8US);
     wr(R_FEXTNVM6, rd(R_FEXTNVM6) & ~FEXTNVM6_REQ_PLL_CLK);
@@ -823,12 +836,20 @@ static void e_poll(void)
          * what the PHY makes of the cable. */
         if (e.diag && ++e.diag_polls % 5 == 0) {
             e.diag--;
+            uint32_t tdh = rd(R_TDH), tdt = rd(R_TDT);
             klog("%s: link %s; controller sent %u frames (%u good), received %u (%u good, CRC errors %u, "
                  "other errors %u, missed %u, no buffer %u); stack sent %u, received %u; rings TDH %u TDT %u "
                  "RDH %u RDT %u\n", e.dev.name, e.link_up ? "up" : "down", e.hw_all_tx, e.hw_tx,
                  e.hw_all_rx, e.hw_rx, e.hw_crc, e.hw_rxerr, netif.rx_dropped, e.hw_nobuf, netif.tx_packets,
-                 netif.rx_packets, rd(R_TDH), rd(R_TDT), rd(R_RDH), rd(R_RDT));
+                 netif.rx_packets, tdh, tdt, rd(R_RDH), rd(R_RDT));
             log_phy();
+            if (tdh != tdt) {           /* frames waiting that the transmit unit has not taken */
+                const volatile uint32_t *d = (const volatile uint32_t *)&e.tx_ring[tdh % TX_RING];
+                klog("%s: transmit stuck: TCTL %08x TXDCTL0 %08x TARC0 %08x TARC1 %08x TIPG %08x PBA %08x "
+                     "TDBAL %08x TDLEN %u TDFH %u TDFT %u; descriptor %u: %08x %08x %08x %08x\n", e.dev.name,
+                     rd(R_TCTL), rd(R_TXDCTL0), rd(R_TARC0), rd(R_TARC1), rd(R_TIPG), rd(R_PBA), rd(R_TDBAL),
+                     rd(R_TDLEN), rd(R_TDFH), rd(R_TDFT), tdh, d[0], d[1], d[2], d[3]);
+            }
         }
     }
 }
@@ -872,7 +893,9 @@ static void start_rings(void)
     wr(R_TDH, 0);
     wr(R_TDT, 0);
     wr(R_TXDCTL1, rd(R_TXDCTL0));       /* an erratum: both queues set the same */
-    wr(R_TCTL, TCTL_EN | TCTL_PSP | TCTL_CT | TCTL_COLD | TCTL_RTLC);
+    /* Its other bits (the read request threshold among them) as they are; EN with the link. */
+    wr(R_TCTL, (rd(R_TCTL) & ~(TCTL_EN | TCTL_CT_MASK | TCTL_COLD_MASK)) | TCTL_PSP | TCTL_CT |
+               TCTL_COLD | TCTL_RTLC);
 
     wr(R_RDTR, 0);                      /* an interrupt for each frame, */
     wr(R_RADV, 8);
@@ -907,6 +930,7 @@ static int start(void)
     phy_setup();
     start_rings();
     e.link_up = e.speed = e.full = 0;
+    wr(R_STATUS, rd(R_STATUS) & ~STATUS_PHYRA);     /* a PHY reset noted: seen, as Linux clears it */
     update_link(1);
     e.diag = 6;                         /* the first minute's reports, link or no link */
     e.diag_polls = 0;

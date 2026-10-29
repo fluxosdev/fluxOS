@@ -94,7 +94,9 @@ int intel_blit(const struct dispblit *b, int screen_owner);
 int intel_mapbuf(struct dispbuf *b);
 int intel_unmapbuf(const struct dispbuf *b);
 int intel_pinned(int pid, uint32_t start, uint32_t end);
-void intel_proc_exit(int pid);          /* its lent buffers */
+void intel_proc_exit(int pid);          /* its lent buffers and the 3D engine */
+int intel_map3d(struct disp3d *d);      /* the 3D engine's memory (intel_3d.c) */
+int intel_submit3d(const struct dispsubmit *s);    /* a list of drawing operations */
 
 /* ISA DMA (isadma.c). Modes: single transfers 0x40, auto-init 0x10, and
  * 0x08 to read memory (play) or 0x04 to write it (record). */

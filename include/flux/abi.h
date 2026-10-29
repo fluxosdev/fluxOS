@@ -571,6 +571,61 @@ struct dispsubmit {
     uint32_t dwords;
 };
 
+/*
+ * DISP_SUBMIT on Intel HD Graphics: no engine commands but a list of
+ * drawing operations, `dwords` dwords at offset gpu_lo of the DISP_MAP3D
+ * memory, which the kernel turns into the 3D engine's commands. Every
+ * offset is into that memory. Each operation is its code and its words:
+ *
+ *  GL3_TARGET: color offset, pitch, width, height, depth offset, depth
+ *    pitch. Color is 32-bit 0xAARRGGBB, linear (offset 4 KiB aligned,
+ *    pitch a multiple of 64); depth is 32-bit float, Y-tiled (offset 4 KiB
+ *    aligned, pitch a multiple of 128, room for the height rounded up to 32).
+ *  GL3_STATE: flags (GL3F_*), blend (GL3_BLEND), alpha reference (float
+ *    bits), and the rectangle [x0, x1) x [y0, y1) drawn in.
+ *  GL3_TEXTURE: offset, pitch, width, height, flags (GL3T_*): 8-bit RGBA
+ *    texels (bytes R, G, B, A), linear (offset and pitch multiples of 64).
+ *    Offset GL3_NONE: no texture.
+ *  GL3_DRAW: vertex offset (a multiple of 4), vertex count (a multiple of
+ *    3): a list of triangles of struct gl3_vertex.
+ *
+ * A draw needs a target and a state before it. The call returns when the
+ * engine is idle again.
+ */
+#define GL3_TARGET  1
+#define GL3_STATE   2
+#define GL3_TEXTURE 3
+#define GL3_DRAW    4
+#define GL3_NONE    0xFFFFFFFFu
+
+#define GL3F_SHADER(f)    ((f) & 3)     /* GL3_SHADE_*: what the pixel shader writes */
+#define GL3F_DEPTH_TEST   (1u << 2)
+#define GL3F_DEPTH_WRITE  (1u << 3)
+#define GL3F_DEPTH_FUNC(f) (((f) & 7u) << 4)    /* GL_NEVER + f */
+#define GL3F_ALPHA_TEST   (1u << 7)
+#define GL3F_ALPHA_FUNC(f) (((f) & 7u) << 8)    /* GL_NEVER + f */
+#define GL3F_NO_RED       (1u << 11)    /* color mask */
+#define GL3F_NO_GREEN     (1u << 12)
+#define GL3F_NO_BLUE      (1u << 13)
+#define GL3F_NO_ALPHA     (1u << 14)
+#define GL3_SHADE_COLOR    0            /* the interpolated color */
+#define GL3_SHADE_MODULATE 1            /* the texel times it */
+#define GL3_SHADE_REPLACE  2            /* the texel */
+/* The engine's own blend factors (BLENDFACTOR_*), source and destination */
+#define GL3_BLEND(on, src, dst) (((on) ? 1u << 31 : 0) | ((src) & 0x1Fu) << 8 | ((dst) & 0x1Fu))
+#define GL3T_MAG_LINEAR   (1u << 0)
+#define GL3T_MIN_LINEAR   (1u << 1)
+#define GL3T_REPEAT_S     (1u << 2)
+#define GL3T_REPEAT_T     (1u << 3)
+
+/* A vertex: window position (pixels, depth 0 to 1), color, and the texture
+ * coordinates divided by the clip w with 1/w, for perspective. */
+struct gl3_vertex {
+    float x, y, z, pad0;
+    float r, g, b, a;
+    float s_w, t_w, one_w, pad1;
+};
+
 /* DISP_MAP3D: the 3D engine's registers and all of video memory, mapped
  * into the caller (one process at a time). The screen occupies video
  * memory from offset 0 to screen_end. */

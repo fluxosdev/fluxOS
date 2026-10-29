@@ -688,6 +688,7 @@ void intel_proc_exit(int pid)
     for (int i = 0; i < MAX_SLOTS; i++)
         if (ig.slots[i].pid && ig.slots[i].pid == pid)
             unmap_slot(&ig.slots[i]);
+    intel_3d_proc_exit(pid);
 }
 
 /* ---- DISP_COPYRECTS and DISP_BLIT ---- */
@@ -787,7 +788,7 @@ void intel_info(struct dispinfo *di)
     di->flags = (ig.native ? 0 : DISPF_BOOT) | (ig.native_ok ? DISPF_NATIVE : 0) |
                 (ig.edid_ok ? DISPF_EDID : 0) | (ig.flip ? DISPF_FLIP : 0) | (ig.cursor ? DISPF_CURSOR : 0) |
                 (ig.accel && ig.flip && screen_ok() ? DISPF_ACCEL : 0) |
-                (ig.gart && fb.bpp == 32 ? DISPF_GART : 0);
+                (ig.gart && fb.bpp == 32 ? DISPF_GART : 0) | (intel_3d_ok() ? DISPF_3D : 0);
     di->pci_id = VENDOR_INTEL | (uint32_t)ig.device << 16;
     di->vram_kb = ig.stolen_size / 1024;
     di->max_pixclock = ig.max_clock;
@@ -938,6 +939,7 @@ static void accel_init(void)
         return;
     }
     boot_ok("%s: blitter running (copy tested%s)", ig.name, ig.gart ? ", reads memory through the GTT" : "");
+    intel_3d_init();
 }
 
 /* Once the timer runs: native modes, then the blitter. */
@@ -990,4 +992,5 @@ void intel_resume(void)
             klog("intel: the blitter did not start again after suspend\n");
         }
     }
+    intel_3d_resume();
 }

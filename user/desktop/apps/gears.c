@@ -1,13 +1,14 @@
 /*
  * 3D Gears: three meshing gears turning under a light, after Brian Paul's
  * gears demo, the classic first OpenGL program. It draws with the GL
- * library: on an ATI Radeon HD 4000 or a 3dfx Voodoo card through its 3D
- * engine, anywhere else with the software renderer. The status bar says
+ * library: on an ATI Radeon HD 4000, Haswell's Intel HD Graphics or a 3dfx
+ * Voodoo card through its 3D engine, anywhere else with the software
+ * renderer. The status bar says
  * which, and how many frames a second it manages.
  *
  * Drag with the mouse or use the arrow keys to turn the view; Space
  * pauses, Home puts the view back, S moves on to the next renderer there
- * is (Radeon, Voodoo, software), to compare them, T puts a checked
+ * is (Radeon, Intel, Voodoo, software), to compare them, T puts a checked
  * texture on the gears or takes it off, W draws them as wireframes
  * (glPolygonMode) and B makes them see-through (blending).
  *
@@ -353,23 +354,24 @@ static void redraw(struct gears *g)
 }
 
 /* Start again with a new context on the next renderer that works, in the
- * order Radeon, Voodoo, software. */
+ * order Radeon, Intel, Voodoo, software. */
 static void switch_renderer(struct gears *g)
 {
     static const struct {
         int driver;
         unsigned int flags;
-    } order[3] = {
-        { FGL_DRIVER_RADEON, FGL_NO_TDFX },
-        { FGL_DRIVER_TDFX, FGL_NO_RADEON },
+    } order[4] = {
+        { FGL_DRIVER_RADEON, FGL_NO_INTEL | FGL_NO_TDFX },
+        { FGL_DRIVER_INTEL, FGL_NO_RADEON | FGL_NO_TDFX },
+        { FGL_DRIVER_TDFX, FGL_NO_RADEON | FGL_NO_INTEL },
         { FGL_DRIVER_SOFTWARE, FGL_SOFTWARE },
     };
     int cur = 0;
-    while (cur < 2 && order[cur].driver != fglGetDriver(g->ctx))
+    while (cur < 3 && order[cur].driver != fglGetDriver(g->ctx))
         cur++;
     FGLcontext *ctx = NULL;
-    for (int step = 1; step < 3 && !ctx; step++) {
-        int k = (cur + step) % 3;
+    for (int step = 1; step < 4 && !ctx; step++) {
+        int k = (cur + step) % 4;
         ctx = fglCreateContext(g->ctx_w, g->ctx_h, order[k].flags);
         if (ctx && fglGetDriver(ctx) != order[k].driver) {
             fglDestroyContext(ctx);     /* that card is not there */

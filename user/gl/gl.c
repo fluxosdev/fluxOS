@@ -1046,6 +1046,8 @@ static int attach_hardware(struct fgl_context *c, unsigned int flags)
         return -1;
     if (!(flags & FGL_NO_RADEON) && (!only || !strcmp(only, "radeon")) && gl_radeon_attach(c) == 0)
         return 0;
+    if (!(flags & FGL_NO_INTEL) && (!only || !strcmp(only, "intel")) && gl_intel_attach(c) == 0)
+        return 0;
     if (!(flags & FGL_NO_TDFX) && (!only || !strcmp(only, "tdfx")) && gl_tdfx_attach(c) == 0)
         return 0;
     return -1;
@@ -1099,7 +1101,7 @@ FGLcontext *fglGetCurrentContext(void)
 
 int gl_depth_bits(struct fgl_context *c)
 {
-    return c->be == &gl_tdfx_backend ? 16 : c->be == &gl_radeon_backend ? 24 : 30;
+    return c->be == &gl_tdfx_backend ? 16 : c->be == &gl_radeon_backend || c->be == &gl_intel_backend ? 24 : 30;
 }
 
 void gl_check_backend(struct fgl_context *c)
@@ -1154,7 +1156,8 @@ void fglSwapBuffers(FGLcontext *c, uint32_t *dst, int stride)
     /* A video mode change may have grown the screen over our video memory,
      * or the engine may have hung. */
     if ((c->be == &gl_tdfx_backend && gl_tdfx_check(c) < 0) ||
-        (c->be == &gl_radeon_backend && gl_radeon_check(c) < 0))
+        (c->be == &gl_radeon_backend && gl_radeon_check(c) < 0) ||
+        (c->be == &gl_intel_backend && gl_intel_check(c) < 0))
         gl_use_software(c, 0);
 }
 
@@ -1167,6 +1170,8 @@ int fglGetDriver(FGLcontext *c)
 {
     if (c && c->be == &gl_radeon_backend)
         return FGL_DRIVER_RADEON;
+    if (c && c->be == &gl_intel_backend)
+        return FGL_DRIVER_INTEL;
     if (c && c->be == &gl_tdfx_backend)
         return FGL_DRIVER_TDFX;
     return FGL_DRIVER_SOFTWARE;

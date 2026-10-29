@@ -24,7 +24,7 @@ is installed on, IDE/SATA/floppy/USB storage, FAT and ISO9660, an
 NE2000, nForce and Intel I217 network drivers with a TCP/IP stack, a zsh-flavoured shell
 (**fsh**), a desktop with a web browser and two themes (Kinetik and Windows 95 style Classic), 3dfx Voodoo3 and
 Radeon HD 4000 display drivers with a small OpenGL library, an Intel HD Graphics
-4600 display driver, PC speaker, Sound
+4600 display driver with 3D, PC speaker, Sound
 Blaster 16 and HD Audio sound, and a layer that runs DOS programs in the
 terminal. The ISO image is an install CD: GRUB (Multiboot) starts fluxOS
 Setup, which installs fluxOS onto a hard disk, and the installed system boots
@@ -165,9 +165,13 @@ says why.
     GPU's 2D copy engine, self-tested at boot) copies between the pages and
     from the desktop's back buffer in RAM, which the GTT maps for it. On the
     VGA output (pipe A, FDI to the 8-series chipset's DAC), modes of its own
-    from the monitor's EDID (read over GMBUS), up to about 171 MHz. No 3D
-    yet, and native modes only on VGA (see *Work in progress*).
-    `video=...`, `intelgfx.modeset=0`, `intelgfx.accel=0`, `intelgfx=off`.
+    from the monitor's EDID (read over GMBUS), up to about 171 MHz. The 3D
+    engine draws for the OpenGL library (self-tested at boot): a process
+    gets 64 MiB of RAM the GPU sees, and the kernel writes the engine's
+    commands from checked lists of drawing operations, with three
+    hand-assembled Gen7 pixel shaders. Native modes only on VGA (see
+    *Work in progress*). `video=...`, `intelgfx.modeset=0`,
+    `intelgfx.accel=0`, `intelgfx.3d=0`, `intelgfx=off`.
 - Sound:
   - PC speaker (`/dev/speaker`) with background tone queue.
   - **Sound Blaster 16**: `/dev/dsp` (OSS-style, 8/16-bit, mono/stereo, 5-44.1
@@ -253,7 +257,7 @@ says why.
   color depth and refresh rate (with a 15 s "keep this mode?" prompt on the
   3dfx and Radeon drivers), monitor type and EDID details. Settings are saved
   in GRUB's environment block on an installed system.
-- **3D Gears**: the OpenGL demo, drawn by the Radeon or Voodoo 3D engine when
+- **3D Gears**: the OpenGL demo, drawn by the Radeon, Intel or Voodoo 3D engine when
   there is one, else by the software renderer (S switches renderer, T puts a
   texture on the gears).
 - **Paint**: a bitmap editor with a canvas of any size up to 2048 x 2048
@@ -548,12 +552,15 @@ fetcher process, so the desktop keeps running), or from `file://`.
 - 2D textures: texture objects, `glTexImage2D`/`glTexSubImage2D` from
   RGB(A), BGR(A), luminance and alpha bytes, nearest or bilinear filtering,
   repeat or clamp, the modulate, replace, decal and blend environments, and
-  the texture matrix, all perspective-correct. The Radeon samples them in its
-  pixel shader; a Voodoo context goes on in software once it draws with one.
-- Three backends, tried in order: the Radeon 3D engine (PM4 command buffers),
-  the 3dfx engine (driven from user space, as Glide does), and a software
-  scanline rasterizer. `FGL_NO_RADEON`, `FGL_NO_TDFX`, `FGL_SOFTWARE`,
-  `FLUXGL_DRIVER=radeon|tdfx|soft` and `LIBGL_ALWAYS_SOFTWARE` choose.
+  the texture matrix, all perspective-correct. The Radeon and Intel engines
+  sample them in their pixel shaders; a Voodoo context goes on in software
+  once it draws with one.
+- Four backends, tried in order: the Radeon 3D engine (PM4 command buffers),
+  Haswell's Intel 3D engine (drawing operations the kernel turns into
+  commands), the 3dfx engine (driven from user space, as Glide does), and a
+  software scanline rasterizer. `FGL_NO_RADEON`, `FGL_NO_INTEL`,
+  `FGL_NO_TDFX`, `FGL_SOFTWARE`, `FLUXGL_DRIVER=radeon|intel|tdfx|soft` and
+  `LIBGL_ALWAYS_SOFTWARE` choose.
 - `fglCreateContext`, `fglMakeCurrent`, `fglResize` and `fglSwapBuffers` play
   GLX's part. Matrices, vertex transformation, lighting and clipping use SSE;
   the software rasterizer sets up its depth and colour planes in one SSE
@@ -922,7 +929,8 @@ user range and page tables first.
   after waking from sleep. Next, 3D: Sumo's own microcode (SUMO_pfp, SUMO_me,
   SUMO_rlc) and Evergreen's shader instruction set.
 - **The Intel HD Graphics driver (Haswell) is partial:** page flipping, the
-  hardware pointer and blitter copies; native modes only on the VGA output
+  hardware pointer, blitter copies and 3D (untested on hardware: the boot
+  self-test decides, and a hang turns it off); native modes only on the VGA output
   (DisplayPort and HDMI keep the boot loader's mode), and suspend to RAM
   only in the BIOS mode. `dmesg | grep intel` shows the
   planes, stolen memory and watermarks it found. Native modes need the DDI

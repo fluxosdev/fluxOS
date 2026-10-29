@@ -55,6 +55,9 @@
 #define DISPPLANE_FORMAT   (15u << 26)
 #define DISPPLANE_BGRX565  (5u << 26)
 #define DISPPLANE_BGRX888  (6u << 26)
+#define PF_WIN_POS_A   0x68070      /* pipe A's panel fitter */
+#define PF_WIN_SZ_A    0x68074
+#define PF_CTL_A       0x68080
 #define PIPE_WM_LINETIME_A 0x45270
 #define MCH_SSKPD      0x145D10     /* 64 bits: the memory latencies the watermarks need */
 
@@ -415,6 +418,10 @@ static void path_off(void)
     if (wait_reg(PIPECONF_A, PIPECONF_ACTIVE, 0, 100) < 0)
         klog("intel: pipe A did not stop\n");
     wr(TRANS_DDI_FUNC_CTL_A, rd(TRANS_DDI_FUNC_CTL_A) & ~(DDI_FUNC_ENABLE | DDI_PORT_MASK));
+    /* ironlake_pfit_disable: a scaler the BIOS left on would stretch the new mode */
+    wr(PF_CTL_A, 0);
+    wr(PF_WIN_POS_A, 0);
+    wr(PF_WIN_SZ_A, 0);
     wr(TRANS_CLK_SEL_A, 0);
 
     wr(LPT_TRANSCONF, rd(LPT_TRANSCONF) & ~TRANS_ENABLE);
@@ -538,7 +545,23 @@ static void watermarks(const struct timing *t, int bpp)
     wr(PIPE_WM_LINETIME_A, ips << 16 | line);
 }
 
-static void path_on(const struct timing *t, int bpp, uint32_t pitch)
+/* Did the pipe and plane take the mode? The plane scanning another stride
+ * than the one fb says shows the screen sheared into stripes. */
+static int path_check(const struct timing *t, uint32_t pitch)
+{
+    uint32_t src = rd(PIPESRC_A), ht = rd(HTOTAL_A), vt = rd(HTOTAL_A + 12);
+    uint32_t stride = rd(DSPSTRIDE), live = rd(DSPSURFLIVE) & ~0xFFFu;
+    uint32_t want_src = (t->w - 1u) << 16 | (t->h - 1u);
+    int ok = src == want_src && (ht & 0x1FFF) + 1 == t->w && (vt & 0x1FFF) + 1 == t->h &&
+             (stride & ~63u) == pitch && live == ig.page0 && !(rd(DSPCNTR) & DISPPLANE_TILED) &&
+             !(rd(PF_CTL_A) & 1u << 31);
+    klog("intel: %s: PIPESRC %08x HTOTAL %08x VTOTAL %08x DSPCNTR %08x DSPSTRIDE %u (want %u) "
+         "live %08x PF_CTL %08x\n", ok ? "mode took" : "mode did not take", src, ht, vt, rd(DSPCNTR),
+         stride, pitch, live, rd(PF_CTL_A));
+    return ok ? 0 : -1;
+}
+
+static int path_on(const struct timing *t, int bpp, uint32_t pitch)
 {
     int lanes = lanes_for(t->clock);
     pll_on();
@@ -588,6 +611,7 @@ static void path_on(const struct timing *t, int bpp, uint32_t pitch)
     udelay(200);                        /* a few lines' time at any mode */
     if ((rd(PIPEDSL_A) & 0x1FFF) == line)
         klog("intel: pipe A's scanline does not move\n");
+    return path_check(t, pitch);
 }
 
 static void use_fb(const struct timing *t, int bpp, uint32_t pitch)
@@ -636,7 +660,19 @@ int intel_native_set(const struct dispmode *m)
     busy = 1;
     path_off();
     memset(ig.screen, 0, pitch * t->h);
-    path_on(t, bpp, pitch);
+    if (path_on(t, bpp, pitch) < 0 && m->width != 0) {
+        /* Better the BIOS mode than a screen nobody can read. */
+        kprintf("intel: the %ux%u mode did not take; back to the BIOS mode\n", t->w, t->h);
+        path_off();
+        memset(ig.screen, 0, boot_pitch * boot_timing.h);
+        path_on(&boot_timing, (int)boot_bpp, boot_pitch);
+        fb = fb_boot;
+        ig.native = 0;
+        busy = 0;
+        fb_mode_changed();
+        intel_screen_changed();
+        return -EIO;
+    }
     if (m->width == 0) {
         fb = fb_boot;
         ig.native = 0;

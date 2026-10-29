@@ -446,6 +446,8 @@ static int display_op(int op, void *arg)
     case DISP_MAP3D:
         if (voodoo_present())
             return voodoo_map3d(arg);
+        if (intel_present())
+            return intel_map3d(arg);
         return radeon_present() ? radeon_map3d_user(arg) : -ENODEV;
     case DISP_FLIP:
         if (!radeon_present() && !intel_present())
@@ -488,6 +490,8 @@ static int display_op(int op, void *arg)
             return intel_blit(arg, screen_owner());
         return radeon_present() ? radeon_blit(arg, screen_owner()) : -ENODEV;
     case DISP_SUBMIT:
+        if (intel_present())
+            return intel_submit3d(arg);
         return radeon_present() ? radeon_submit_user(arg) : -ENODEV;
     }
     return -EINVAL;
