@@ -179,7 +179,8 @@ says why.
     from the desktop's back buffer in RAM, which the GTT maps for it. On the
     VGA output (pipe A, FDI to the 8-series chipset's DAC), modes of its own
     from the monitor's EDID (read over GMBUS), up to about 171 MHz. The 3D
-    engine draws for the OpenGL library (self-tested at boot): a process
+    engine draws for the OpenGL library (self-tested at boot, and running
+    3D Gears on an HD 4600): a process
     gets 64 MiB of RAM the GPU sees, and the kernel writes the engine's
     commands from checked lists of drawing operations, with three
     hand-assembled Gen7 pixel shaders. Native modes only on VGA (see
@@ -1001,8 +1002,9 @@ user range and page tables first.
   after waking from sleep. Next, 3D: Sumo's own microcode (SUMO_pfp, SUMO_me,
   SUMO_rlc) and Evergreen's shader instruction set.
 - **The Intel HD Graphics driver (Haswell) is partial:** page flipping, the
-  hardware pointer, blitter copies and 3D (untested on hardware: the boot
-  self-test decides, and a hang turns it off); native modes only on the VGA output
+  hardware pointer, blitter copies and 3D (working on an HD 4600: 3D Gears
+  draws on it; the boot self-test still decides, and a hang turns it off);
+  native modes only on the VGA output
   (DisplayPort and HDMI keep the boot loader's mode), and suspend to RAM
   only in the BIOS mode. `dmesg | grep intel` shows the
   planes, stolen memory and watermarks it found. Native modes need the DDI
