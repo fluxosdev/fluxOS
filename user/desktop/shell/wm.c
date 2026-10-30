@@ -1,8 +1,10 @@
 /*
  * Window manager and compositor: windows, the taskbar with its Start
- * menu and clock, desktop icons, the mouse pointer, and input routing.
- * The sidebar (sidebar.c) is composed over the windows as the taskbar is,
- * and windows are placed and maximized beside it.
+ * menu and clock, the mouse pointer, and input routing. The desktop is a
+ * window too (WF_DESKTOP: a folder browsed on the wallpaper, files.c),
+ * frameless, filling the space beside the sidebar and above the taskbar,
+ * and kept under the others. The sidebar (sidebar.c) is composed over the
+ * windows as the taskbar is, and windows are placed and maximized beside it.
  *
  * Changes only record damaged rectangles; wm_flush() repaints each one
  * from the bottom of the scene to the top into the back buffer and
@@ -24,8 +26,6 @@
 
 #define MAX_DAMAGE   32
 #define OUTLINE      3          /* resize outline thickness */
-#define ICON_CELL_W  75
-#define ICON_CELL_H  70
 #define MENU_ITEM_H  36
 #define MENU_SEP_H   8
 #define SUB_ITEM_H   24         /* items of a cascading menu: 16 pixel icons */
@@ -84,7 +84,6 @@ enum drag {
     DRAG_CLIENT,                        /* the client area has the mouse */
     DRAG_TASK,                          /* holding a taskbar button */
     DRAG_MENU,                          /* the Start menu is tracking */
-    DRAG_ICON,                          /* moving a desktop icon */
     DRAG_CTX,                           /* the context menu is tracking */
 };
 static enum drag drag;
@@ -130,7 +129,7 @@ static int sub_hover = -1;              /* the highlighted item in that submenu 
 static int task_pressed_idx = -1;
 static char clock_text[16];
 
-/* ---- desktop icons and the Start menu ---- */
+/* ---- the Start menu, and the apps shortcuts start ---- */
 
 static void open_terminal(void)
 {
@@ -203,29 +202,51 @@ static void open_readme(void)
     editor_open("/home/flux/README.txt");
 }
 
-struct desk_icon {
+/* The apps a shortcut (a .app file, files.c) can name in its exec line. */
+static const struct {
+    const char *name;
     enum icon_id icon;
-    const char *label;
-    void (*open)(void);
-    int x, y;                           /* the cell's top left corner */
+    void (*run)(void);
+} apps[] = {
+    { "wave", ICON_BROWSER, open_browser },
+    { "terminal", ICON_TERMINAL, open_terminal },
+    { "files", ICON_FOLDER, open_home },
+    { "computer", ICON_COMPUTER, open_computer },
+    { "editor", ICON_EDITOR, open_editor },
+    { "calculator", ICON_CALC, open_calculator },
+    { "player", ICON_SOUND, open_player },
+    { "archiver", ICON_ARCHIVE, open_archiver },
+    { "paint", ICON_PAINT, open_paint },
+    { "gears", ICON_GEARS, open_gears },
+    { "minesweeper", ICON_MINES, open_minesweeper },
+    { "taskmgr", ICON_TASKMGR, open_taskmgr },
+    { "diskmgr", ICON_DRIVE, open_diskmgr },
+    { "display", ICON_DISPLAY, display_open },
+    { "mouse", ICON_MOUSE, mouse_open },
+    { "datetime", ICON_DATETIME, datetime_open },
+    { "wireless", ICON_WIFI, wireless_open },
+    { "system", ICON_COMPUTER, about_open },
+    { "readme", ICON_README, open_readme },
+    { "run", ICON_RUN, run_open },
 };
 
-static struct desk_icon desk_icons[] = {
-    { ICON_COMPUTER, "My Computer", open_computer, 0, 0 },
-    { ICON_TERMINAL, "Terminal", open_terminal, 0, 0 },
-    { ICON_BROWSER, "Wave", open_browser, 0, 0 },
-    { ICON_HOME, "Home", open_home, 0, 0 },
-    { ICON_README, "Read Me", open_readme, 0, 0 },
-};
-static int ndesk = (int)(sizeof(desk_icons) / sizeof(desk_icons[0]));
-#define NDESK ndesk
-static int desk_selected = -1;
-static int last_click_icon = -1;
-static int drag_icon;                   /* the icon DRAG_ICON is moving */
-static int icon_moved;                  /* it left its cell */
-static int icon_ox, icon_oy;            /* where it started */
-static int icon_px, icon_py;            /* where the pointer went down */
-static unsigned int last_click_ms;
+int wm_launch(const char *app)
+{
+    for (int i = 0; i < (int)(sizeof(apps) / sizeof(apps[0])); i++)
+        if (!strcmp(apps[i].name, app)) {
+            apps[i].run();
+            return 0;
+        }
+    return -1;
+}
+
+enum icon_id wm_app_icon(const char *app)
+{
+    for (int i = 0; i < (int)(sizeof(apps) / sizeof(apps[0])); i++)
+        if (!strcmp(apps[i].name, app))
+            return apps[i].icon;
+    return ICON_NONE;
+}
 
 struct menu_item {
     enum icon_id icon;
@@ -283,7 +304,7 @@ static int nmenu = (int)(sizeof(menu_items) / sizeof(menu_items[0]));
 /*
  * Setup mode: the desktop as the install CD starts it, for fluxOS Setup
  * alone. Setup paints the whole background; there is no taskbar, Start
- * menu or desktop icons, and Shift+F10 opens a command prompt for when
+ * menu or desktop folder, and Shift+F10 opens a command prompt for when
  * something needs looking into, as in Windows Setup.
  */
 static int setup_mode;
@@ -305,14 +326,11 @@ int wm_work_right(void)
     return work_right();
 }
 
-/* ---- the desktop context menu ---- */
+/* ---- the taskbar's context menu, and wm_popup's ---- */
 
 #define CTX_ITEM_H 22
 #define CTX_SEP_H 8
-#define ICON_MARGIN 4
 
-static void arrange_icons(void);
-static void open_ctx_icon(void);
 static void minimize_all(void);
 static void tile_horizontally(void);
 static void tile_vertically(void);
@@ -333,26 +351,11 @@ static const struct ctx_item taskbar_ctx[] = {
     { "Tile Windows Vertically", ICON_NONE, tile_vertically, NULL },
 };
 
-static const struct ctx_item desktop_ctx[] = {
-    { "Arrange Icons", ICON_NONE, arrange_icons, NULL },
-    { NULL, ICON_NONE, NULL, NULL },
-    { "Terminal", ICON_TERMINAL, open_terminal, NULL },
-    { "File Manager", ICON_FOLDER, open_home, NULL },
-    { "Task Manager", ICON_TASKMGR, open_taskmgr, NULL },
-    { NULL, ICON_NONE, NULL, NULL },
-    { "Display Properties", ICON_DISPLAY, display_open, NULL },
-};
-
-static const struct ctx_item icon_ctx[] = {
-    { "Open", ICON_NONE, open_ctx_icon, NULL },
-};
-
 static const struct ctx_item *ctx_items;
 static int ctx_n;
 static int ctx_open;
 static int ctx_hover = -1;
 static int ctx_x, ctx_y;
-static int ctx_icon = -1;               /* the icon the menu was opened on */
 
 /* What a frame or menu covers, its shadow included. */
 static struct rect shadowed(struct rect r)
@@ -412,7 +415,7 @@ static int ctx_hit(int x, int y)
     return -1;
 }
 
-static void set_ctx(const struct ctx_item *items, int n, int x, int y, int icon)
+static void set_ctx(const struct ctx_item *items, int n, int x, int y)
 {
     if (ctx_open)
         wm_damage(shadowed(ctx_rect()));
@@ -423,14 +426,13 @@ static void set_ctx(const struct ctx_item *items, int n, int x, int y, int icon)
         ctx_n = n;
         ctx_x = x;
         ctx_y = y;
-        ctx_icon = icon;
         wm_damage(shadowed(ctx_rect()));
     }
 }
 
 void wm_popup(const struct ctx_item *items, int n, int x, int y)
 {
-    set_ctx(items, n, x, y, -1);
+    set_ctx(items, n, x, y);
 }
 
 static void set_ctx_hover(int i)
@@ -629,67 +631,35 @@ static struct rect sub_item_rect(int p, int j)
     return mkrect(m.x + pad, m.y + pad + j * SUB_ITEM_H, m.w - 2 * pad, SUB_ITEM_H);
 }
 
-static struct rect desk_icon_rect(int i)
+/* The desktop window's place: all the space windows are placed in. */
+static struct rect desk_rect(void)
 {
-    return mkrect(desk_icons[i].x, desk_icons[i].y, ICON_CELL_W, ICON_CELL_H - 4);
+    return mkrect(0, 0, work_right(), work_bottom());
 }
 
-/* Lay the icons out in columns down the left edge, as they start. */
-static void arrange_icons(void)
+/* What the frame adds round the client area, across and down: nothing round the desktop. */
+static int frame_w(const struct window *w)
 {
-    int per = (screen_h - TASKBAR_H - 6) / ICON_CELL_H;
-    if (per < 1)
-        per = 1;
-    for (int i = 0; i < NDESK; i++) {
-        wm_damage(desk_icon_rect(i));
-        desk_icons[i].x = ICON_MARGIN + (i / per) * ICON_CELL_W;
-        desk_icons[i].y = 6 + (i % per) * ICON_CELL_H;
-        wm_damage(desk_icon_rect(i));
-    }
+    return w->flags & WF_DESKTOP ? 0 : 2 * BORDER;
 }
 
-static void open_ctx_icon(void)
+static int frame_h(const struct window *w)
 {
-    if (ctx_icon >= 0 && ctx_icon < NDESK)
-        desk_icons[ctx_icon].open();
-}
-
-/* Drop the dragged icon onto the nearest grid cell, or back if that one is taken. */
-static void place_icon(int i)
-{
-    int cx = (desk_icons[i].x - ICON_MARGIN + ICON_CELL_W / 2) / ICON_CELL_W;
-    int cy = (desk_icons[i].y - 6 + ICON_CELL_H / 2) / ICON_CELL_H;
-    int maxx = (work_right() - ICON_CELL_W - ICON_MARGIN) / ICON_CELL_W;
-    int maxy = (screen_h - TASKBAR_H - 6 - ICON_CELL_H) / ICON_CELL_H;
-    if (cx < 0)
-        cx = 0;
-    if (cy < 0)
-        cy = 0;
-    if (cx > maxx)
-        cx = maxx;
-    if (cy > maxy)
-        cy = maxy;
-    int nx = ICON_MARGIN + cx * ICON_CELL_W, ny = 6 + cy * ICON_CELL_H;
-    for (int j = 0; j < NDESK; j++)
-        if (j != i && desk_icons[j].x == nx && desk_icons[j].y == ny) {
-            nx = icon_ox;
-            ny = icon_oy;
-            break;
-        }
-    wm_damage(desk_icon_rect(i));
-    desk_icons[i].x = nx;
-    desk_icons[i].y = ny;
-    wm_damage(desk_icon_rect(i));
+    return w->flags & WF_DESKTOP ? 0 : FRAME_TOP + BORDER;
 }
 
 static struct rect caption_rect(struct window *w)
 {
     int in = theme.cap_inset;
+    if (w->flags & WF_DESKTOP)
+        return mkrect(w->r.x, w->r.y, 0, 0);
     return mkrect(w->r.x + in, w->r.y + in, w->r.w - 2 * in, TITLE_H);
 }
 
 struct rect wm_client_rect(struct window *w)
 {
+    if (w->flags & WF_DESKTOP)
+        return mkrect(w->r.x, w->r.y, w->content.w, w->content.h);
     return mkrect(w->r.x + BORDER, w->r.y + FRAME_TOP, w->content.w, w->content.h);
 }
 
@@ -707,6 +677,8 @@ static int button_disabled(const struct window *w, int kind)
 /* Caption buttons from right to left: close, then maximize and minimize. */
 static int title_buttons(struct window *w, struct rect *rects, int *kinds)
 {
+    if (w->flags & WF_DESKTOP)
+        return 0;
     struct rect c = caption_rect(w);
     int bw = KINETIK ? 22 : 16, bh = KINETIK ? 20 : 14, gap = KINETIK ? 1 : 2;
     int x = c.x + c.w - (KINETIK ? 6 : 2) - bw, y = c.y + (TITLE_H - bh) / 2, n = 0;
@@ -1136,30 +1108,7 @@ static void draw_desktop(void)
         setup_draw_backdrop(&screen, c);
         return;
     }
-    wallpaper_draw(&screen, c);
-
-    for (int i = 0; i < NDESK; i++) {
-        struct rect cell = desk_icon_rect(i);
-        if (!rect_overlaps(cell, c))
-            continue;
-        int sel = i == desk_selected;
-        int ix = cell.x + (cell.w - 32) / 2, iy = cell.y + 2;
-        if (sel)
-            draw_icon_selected(&screen, ix, iy, desk_icons[i].icon, 32);
-        else
-            draw_icon(&screen, ix, iy, desk_icons[i].icon, 32);
-
-        int tw = gfx_text_width(&font_sans, desk_icons[i].label);
-        struct rect lr = mkrect(cell.x + (cell.w - tw) / 2 - 2, iy + 32 + 3, tw + 4, font_sans.height + 1);
-        if (sel)
-            gfx_fill(&screen, lr.x, lr.y, lr.w, lr.h, C_NAVY);
-        /* Over a photograph, white text needs a shadow to stay readable. */
-        if (!sel && wallpaper_active())
-            gfx_text(&screen, &font_sans, lr.x + 3, lr.y + 1, desk_icons[i].label, C_BLACK);
-        gfx_text(&screen, &font_sans, lr.x + 2, lr.y, desk_icons[i].label, C_WHITE);
-        if (sel && focused == NULL)
-            gfx_focus_rect(&screen, lr);
-    }
+    wallpaper_draw(&screen, c);     /* under the taskbar and sidebar; the desktop window has the rest */
 }
 
 /* ---- the Kinetik theme's chrome ---- */
@@ -1508,7 +1457,7 @@ static void draw_window(struct window *w)
     if (!rect_overlaps(KINETIK ? shadowed(r) : r, screen.clip))
         return;
     struct rect client = wm_client_rect(w);
-    if (inside(screen.clip, client)) {   /* only the contents show here: the frame is all outside */
+    if (inside(screen.clip, client) || (w->flags & WF_DESKTOP)) {    /* only the contents show here */
         gfx_blit(&screen, client.x, client.y, &w->content, 0, 0, client.w, client.h);
         return;
     }
@@ -1867,6 +1816,11 @@ struct window *wm_create(const char *title, enum icon_id icon, int client_w, int
     struct window *w = calloc(1, sizeof(*w));
     if (!w)
         return NULL;
+    if (flags & WF_DESKTOP) {           /* no taskbar button either, and the size is the wm's to say */
+        flags |= WF_NOTASK;
+        client_w = desk_rect().w;
+        client_h = desk_rect().h;
+    }
     if (surface_init(&w->content, client_w, client_h) < 0) {
         free(w);
         return NULL;
@@ -1879,16 +1833,23 @@ struct window *wm_create(const char *title, enum icon_id icon, int client_w, int
     w->priv = priv;
     w->min_w = 200;
     w->min_h = 120;
-    w->r = mkrect(0, 0, client_w + 2 * BORDER, client_h + FRAME_TOP + BORDER);
+    w->r = mkrect(0, 0, client_w + frame_w(w), client_h + frame_h(w));
 
     struct window **pp = &bottom;
-    while (*pp)
+    while (*pp && !(flags & WF_DESKTOP))  /* on top, or the desktop under everything */
         pp = &(*pp)->above;
+    w->above = *pp;
     *pp = w;
     if (!(flags & WF_NOTASK) && ntasks < (int)(sizeof(task_order) / sizeof(task_order[0])))
         task_order[ntasks++] = w;
-    wm_cascade(w);
-    wm_focus(w);
+    if (flags & WF_DESKTOP) {
+        wm_damage(w->r);
+        if (!focused)
+            wm_focus(w);
+    } else {
+        wm_cascade(w);
+        wm_focus(w);
+    }
     damage_taskbar();
     if (flags & WF_MODAL)
         wm_damage(mkrect(0, 0, screen_w, screen_h));    /* dim everything */
@@ -1958,7 +1919,7 @@ void wm_focus(struct window *w)
     struct window *old = focused;
     if (w) {
         w->minimized = 0;
-        if (w->above) {                 /* raise */
+        if (w->above && !(w->flags & WF_DESKTOP)) {     /* raise; the desktop stays at the bottom */
             unlink_window(w);
             struct window **pp = &bottom;
             while (*pp)
@@ -1981,8 +1942,6 @@ void wm_focus(struct window *w)
             w->ops->focus(w, 1);
     }
     damage_taskbar();
-    if (desk_selected >= 0)
-        wm_damage(desk_icon_rect(desk_selected));
 }
 
 struct window *wm_focused(void)
@@ -2063,7 +2022,7 @@ void wm_set_min_size(struct window *w, int client_w, int client_h)
  */
 static int set_frame(struct window *w, struct rect r)
 {
-    int cw = r.w - 2 * BORDER, ch = r.h - (FRAME_TOP + BORDER);
+    int cw = r.w - frame_w(w), ch = r.h - frame_h(w);
     if (cw < 1 || ch < 1)
         return -1;
     struct rect old = w->r;
@@ -2241,7 +2200,9 @@ void wm_restyle(void)
     sidebar_layout();
     for (struct window *w = bottom; w; w = w->above) {
         int cw = w->content.w, ch = w->content.h;
-        if (w->maximized) {             /* still filling the screen above the taskbar */
+        if (w->flags & WF_DESKTOP) {    /* the taskbar's height may have changed */
+            set_frame(w, desk_rect());
+        } else if (w->maximized) {      /* still filling the screen above the taskbar */
             w->restore.w += dw - frame_dw;
             w->restore.h += dh - frame_dh;
             set_frame(w, mkrect(0, 0, work_right(), work_bottom()));
@@ -2260,12 +2221,14 @@ void wm_restyle(void)
     }
     frame_dw = dw;
     frame_dh = dh;
-    /* A taller taskbar may cover icons in the bottom row: lay them out again. */
-    for (int i = 0; i < NDESK; i++)
-        if (desk_icons[i].y + ICON_CELL_H > screen_h - TASKBAR_H) {
-            arrange_icons();
-            break;
-        }
+    wm_damage(mkrect(0, 0, screen_w, screen_h));
+}
+
+void wm_wallpaper_changed(void)
+{
+    for (struct window *w = bottom; w; w = w->above)
+        if ((w->flags & WF_DESKTOP) && w->ops && w->ops->restyle)
+            w->ops->restyle(w);
     wm_damage(mkrect(0, 0, screen_w, screen_h));
 }
 
@@ -2296,6 +2259,8 @@ int wm_window_count(void)
 
 static void close_window(struct window *w)
 {
+    if (w->flags & WF_DESKTOP)
+        return;                         /* it stays as long as the desktop does */
     if (w->ops && w->ops->close)
         w->ops->close(w);
     else
@@ -2471,15 +2436,6 @@ static struct window *window_at(int x, int y)
         if (!w->minimized && rect_contains(w->r, x, y))
             hit = w;
     return hit;
-}
-
-static void select_icon(int i)
-{
-    if (desk_selected >= 0)
-        wm_damage(desk_icon_rect(desk_selected));
-    desk_selected = i;
-    if (i >= 0)
-        wm_damage(desk_icon_rect(i));
 }
 
 static void client_mouse(struct window *w, int buttons, int changed)
@@ -2792,7 +2748,7 @@ static void press_left(void)
             set_ctx_hover(ctx_hit(mx, my));
             return;
         }
-        set_ctx(NULL, 0, 0, 0, -1);
+        set_ctx(NULL, 0, 0, 0);
     }
     if (menu_open) {
         if (menu_contains(mx, my)) {
@@ -2849,38 +2805,9 @@ static void press_left(void)
     }
 
     struct window *w = window_at(mx, my);
-    if (!w) {
-        if (modal)
-            return;
-        int hit = -1;
-        for (int i = 0; i < NDESK; i++) {
-            struct rect cell = desk_icon_rect(i);
-            struct rect icon = mkrect(cell.x + (cell.w - 32) / 2, cell.y + 2, 32, 32);
-            int tw = gfx_text_width(&font_sans, desk_icons[i].label);
-            struct rect label = mkrect(cell.x + (cell.w - tw) / 2 - 2, cell.y + 37, tw + 4, 15);
-            if (rect_contains(icon, mx, my) || rect_contains(label, mx, my))
-                hit = i;
-        }
-        if (focused)
+    if (!w) {                           /* bare wallpaper: only without a desktop window */
+        if (!modal && focused)
             wm_focus(NULL);
-        select_icon(hit);
-        if (hit >= 0 && !(hit == last_click_icon && now_ms() - last_click_ms < DBLCLICK_MS)) {
-            drag = DRAG_ICON;
-            drag_icon = hit;
-            icon_moved = 0;
-            icon_ox = desk_icons[hit].x;
-            icon_oy = desk_icons[hit].y;
-            icon_px = mx;
-            icon_py = my;
-        }
-        unsigned int t = now_ms();
-        if (hit >= 0 && hit == last_click_icon && t - last_click_ms < DBLCLICK_MS) {
-            last_click_icon = -1;
-            desk_icons[hit].open();
-            return;
-        }
-        last_click_icon = hit;
-        last_click_ms = t;
         return;
     }
 
@@ -2997,27 +2924,6 @@ static void drag_motion(void)
     case DRAG_CTX:
         set_ctx_hover(ctx_hit(mx, my));
         break;
-    case DRAG_ICON: {
-        if (!icon_moved && abs(mx - icon_px) < 4 && abs(my - icon_py) < 4)
-            break;
-        icon_moved = 1;
-        int x = icon_ox + mx - icon_px, y = icon_oy + my - icon_py;
-        if (x < 0)
-            x = 0;
-        if (y < 0)
-            y = 0;
-        if (x > screen_w - ICON_CELL_W)
-            x = screen_w - ICON_CELL_W;
-        if (y > screen_h - TASKBAR_H - ICON_CELL_H)
-            y = screen_h - TASKBAR_H - ICON_CELL_H;
-        if (x != desk_icons[drag_icon].x || y != desk_icons[drag_icon].y) {
-            wm_damage(desk_icon_rect(drag_icon));
-            desk_icons[drag_icon].x = x;
-            desk_icons[drag_icon].y = y;
-            wm_damage(desk_icon_rect(drag_icon));
-        }
-        break;
-    }
     case DRAG_NONE:
         break;
     }
@@ -3086,18 +2992,12 @@ static void release_left(void)
         int i = ctx_hit(mx, my);
         void (*run)(void) = i >= 0 ? ctx_items[i].run : NULL;
         if (i >= 0 || !rect_contains(ctx_rect(), mx, my)) {
-            int icon = ctx_icon;
-            set_ctx(NULL, 0, 0, 0, -1);
-            ctx_icon = icon;            /* for open_ctx_icon */
+            set_ctx(NULL, 0, 0, 0);
             if (run)
                 run();
         }
         break;
     }
-    case DRAG_ICON:
-        if (icon_moved)
-            place_icon(drag_icon);
-        break;
     case DRAG_NONE:
         break;
     }
@@ -3109,37 +3009,20 @@ static void press_right(void)
         set_menu(0);
     struct window *rw = window_at(mx, my);
     if (rw && (rw->flags & WF_RIGHTCLICK) && drag == DRAG_NONE && rect_contains(wm_client_rect(rw), mx, my)) {
-        set_ctx(NULL, 0, 0, 0, -1);
+        set_ctx(NULL, 0, 0, 0);
         wm_focus(rw);
         client_mouse(rw, mbuttons, MOUSE_RIGHT);
         return;
     }
     if (!modal_window() && drag == DRAG_NONE && rect_contains(taskbar_rect(), mx, my)) {
-        set_ctx(taskbar_ctx, COUNT(taskbar_ctx), mx, my, -1);
+        set_ctx(taskbar_ctx, COUNT(taskbar_ctx), mx, my);
         return;
     }
     if (!setup_mode && !modal_window() && drag == DRAG_NONE && rect_contains(sidebar_rect(), mx, my)) {
         sidebar_menu(mx, my);
         return;
     }
-    if (setup_mode || modal_window() || drag != DRAG_NONE || rect_contains(taskbar_rect(), mx, my) ||
-        window_at(mx, my)) {
-        set_ctx(NULL, 0, 0, 0, -1);
-        return;
-    }
-    int hit = -1;
-    for (int i = 0; i < NDESK; i++) {
-        struct rect cell = desk_icon_rect(i);
-        if (rect_contains(mkrect(cell.x, cell.y, cell.w, 52), mx, my))
-            hit = i;
-    }
-    if (focused)
-        wm_focus(NULL);
-    select_icon(hit);
-    if (hit >= 0)
-        set_ctx(icon_ctx, COUNT(icon_ctx), mx, my, hit);
-    else
-        set_ctx(desktop_ctx, COUNT(desktop_ctx), mx, my, -1);
+    set_ctx(NULL, 0, 0, 0);             /* the desktop's menu is the desktop window's own */
 }
 
 static void mouse_event(const struct input_event *ev)
@@ -3262,7 +3145,7 @@ static void key_event(const struct input_event *ev)
         return;
     }
     if (ctx_open && code == KEY_ESC) {
-        set_ctx(NULL, 0, 0, 0, -1);
+        set_ctx(NULL, 0, 0, 0);
         return;
     }
     if (menu_open) {
@@ -3306,7 +3189,7 @@ static void key_event(const struct input_event *ev)
         return;
     }
     if (alt && code == KEY_F4) {
-        if (focused)
+        if (focused && !(focused->flags & WF_DESKTOP))
             close_window(focused);
         else if (!setup_mode)
             shutdown_open();
@@ -3319,8 +3202,6 @@ static void key_event(const struct input_event *ev)
     }
     if (focused && focused->ops && focused->ops->key)
         focused->ops->key(focused, ev);
-    else if (!focused && desk_selected >= 0 && code == KEY_ENTER)
-        desk_icons[desk_selected].open();
 }
 
 void wm_saver(int on)
@@ -3393,17 +3274,12 @@ void wm_tick(void)
         sidebar_tick();
 }
 
-/* Maximized windows fill the space the sidebar now leaves, and icons it would cover move. */
+/* Maximized windows and the desktop fill the space the sidebar now leaves. */
 void wm_work_changed(void)
 {
     for (struct window *w = bottom; w; w = w->above)
-        if (w->maximized)
+        if (w->maximized || (w->flags & WF_DESKTOP))
             set_frame(w, mkrect(0, 0, work_right(), work_bottom()));
-    for (int i = 0; i < NDESK; i++)
-        if (desk_icons[i].x + ICON_CELL_W > work_right()) {
-            arrange_icons();
-            break;
-        }
     wm_damage(mkrect(0, 0, screen_w, screen_h));
 }
 
@@ -3450,7 +3326,7 @@ int wm_reconfigure(void)
         my = screen_h - 1;
     sidebar_layout();
     for (struct window *w = bottom; w; w = w->above) {
-        if (w->maximized) {
+        if (w->maximized || (w->flags & WF_DESKTOP)) {
             set_frame(w, mkrect(0, 0, work_right(), work_bottom()));
             continue;
         }
@@ -3461,12 +3337,6 @@ int wm_reconfigure(void)
             y = work_bottom() - w->r.h;
         w->r.x = x < 0 ? 0 : x;
         w->r.y = y < 0 ? 0 : y;
-    }
-    for (int i = 0; i < NDESK; i++) {
-        if (desk_icons[i].x > work_right() - ICON_CELL_W || desk_icons[i].y > screen_h - TASKBAR_H - ICON_CELL_H) {
-            arrange_icons();
-            break;
-        }
     }
     ndamage = 0;
     wm_damage(mkrect(0, 0, screen_w, screen_h));
@@ -3495,11 +3365,8 @@ void wm_init(int setup)
         fprintf(stderr, "desktop: out of memory\n");
         exit(1);
     }
-    if (setup_mode)
-        ndesk = 0;
-    else
+    if (!setup_mode)
         sidebar_init();
-    arrange_icons();
     mx = screen_w / 2;
     my = screen_h / 2;
     char dir[128], drv[16];

@@ -910,7 +910,7 @@ static void draw_preview(struct dprops *d, struct surface *s, int background)
     } else {
         gfx_fill(s, scr.x, scr.y, scr.w, scr.h, C_DESKTOP);
     }
-    /* the taskbar and a few icons, sized as they would be */
+    /* the taskbar, the desktop's divider and a few icons under it, sized as they would be */
     int tbh = TASKBAR_H * scr.h / ph;
     if (tbh < 2)
         tbh = 2;
@@ -923,8 +923,9 @@ static void draw_preview(struct dprops *d, struct surface *s, int background)
         gfx_frame(s, wx, wy, ww, wh, C_BLACK);
         gfx_fill(s, wx + 1, wy + 1, ww - 2, TITLE_H * scr.h / ph + 1, C_NAVY);
     }
+    gfx_hline(s, scr.x + 16 * scr.w / pw, scr.y + 62 * scr.h / ph, (pw - 32) * scr.w / pw, C_WHITE);
     for (int i = 0; i < 3; i++) {
-        int ix = scr.x + 8 * scr.w / pw + 2, iy = scr.y + (6 + i * 70) * scr.h / ph + 2;
+        int ix = scr.x + 20 * scr.w / pw + 1, iy = scr.y + (85 + i * 48) * scr.h / ph + 1;
         int sz = 32 * scr.w / pw + 1;
         gfx_fill(s, ix, iy, sz, sz, RGB(0xC0, 0xC0, 0xFF));
     }

@@ -276,9 +276,20 @@ says why.
   own wallpaper (a gradient, a glow and sweeping curves, drawn at the screen's size),
   in Blue, Purple, Orange, Green, White or Black; UI text is anti-aliased Archivo.
   **Classic**: the Windows 95 look, a purple desktop, gray beveled windows with navy
-  captions, and Liberation Sans. Either way the desktop has icons and a taskbar
-  (Start button, a button per window, clock, volume tray icon), and terminals keep
-  the sharp 8x16 bitmap font. Switching redraws every open window at once.
+  captions, and Liberation Sans. Either way the desktop is a folder browsed on the
+  wallpaper (below) with a taskbar (Start button, a button per window, clock, volume
+  tray icon), and terminals keep the sharp 8x16 bitmap font. Switching redraws every
+  open window at once.
+- **The desktop is a file manager**: it opens on `~/Desktop` and shows folders right on
+  the wallpaper, each icon with its name beside it, down columns, under a header of
+  **Back** (the folders before, or Backspace), **Home** (back to `~/Desktop`) and
+  **Favourites** (a menu of the folders in `~/.favourites`, one path a line; folders are
+  added from it or from a folder's right-click menu), then a button for each mounted
+  disk (**System** for `/`, the mount point's name for the rest). Everything the File Manager does
+  works there: opening, dragging, cut/copy/paste, rename, delete, its right-click menu
+  (with Display Properties). A shortcut is a small text file, `NAME.app`, with
+  `exec=wave` (an app's name, such as `terminal`, `files`, `paint`) or a path, and an
+  optional `icon=`; `~/Desktop/Wave.app` starts Wave.
 - **Sidebar** down the right edge, as in Longhorn: always in view like the taskbar,
   with maximized windows stopping beside it. Its widgets are an analog clock
   (click for Date and Time), a month calendar (arrows page it, the month's name
@@ -842,7 +853,7 @@ gives a shell).
 
 ## Things to try
 
-On the desktop: open **My Computer**, drag windows, open terminals, try
+On the desktop: browse folders on it, drag windows, open terminals, try
 **Run...** with `ls -l /bin`, open **Wave** (68k.news, wiby.me and
 textfiles.com suit simple browsers; or type `example.com`), and **Shut Down...**.
 In a terminal:

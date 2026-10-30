@@ -310,6 +310,8 @@ static const char *const icon_names[ICON_COUNT] = {
     [ICON_DATETIME] = "preferences-system-time",
     [ICON_WIFI] = "network-wireless",
     [ICON_MOUSE] = "input-mouse",
+    [ICON_STAR] = "emblem-favorite",
+    [ICON_VIDEO] = "video-x-generic",
     [ICON_BATTERY_CAUTION] = "battery-caution",
     [ICON_BATTERY_LOW] = "battery-low",
     [ICON_BATTERY_40] = "battery-040",
@@ -389,6 +391,14 @@ void draw_icon(struct surface *s, int x, int y, enum icon_id id, int size)
         gfx_image(s, x, y, img);
     else
         draw_builtin(s, x, y, id, size);
+}
+
+enum icon_id icon_by_name(const char *name)
+{
+    for (int i = ICON_NONE + 1; i < ICON_COUNT; i++)
+        if (icon_names[i] && !strcmp(icon_names[i], name))
+            return (enum icon_id)i;
+    return ICON_NONE;
 }
 
 void draw_icon_selected(struct surface *s, int x, int y, enum icon_id id, int size)

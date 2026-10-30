@@ -411,7 +411,7 @@ void wallpaper_set_color(uint32_t rgb, int save)
     rebuild();
     if (save)
         save_setting();
-    wm_damage(mkrect(0, 0, screen_w, screen_h));
+    wm_wallpaper_changed();
 }
 
 struct wall_request {
@@ -445,7 +445,7 @@ static void wallpaper_ready(void *context, struct image *image, int full_w, int 
     applied_mode=cur_mode=request->mode;
     kinetik=!strcmp(cur_path,WALLPAPER_KINETIK);
     if (request->save) save_setting();
-    wm_damage(mkrect(0,0,screen_w,screen_h));
+    wm_wallpaper_changed();
 }
 int wallpaper_set(const char *path, int mode, int save)
 {
@@ -459,7 +459,7 @@ int wallpaper_set(const char *path, int mode, int save)
         surface_free(&wall);cur_path[0]=applied_path[0]=0;kinetik=0;
         applied_mode=cur_mode=request->mode;
         if (save) save_setting();
-        free(request);wm_damage(mkrect(0,0,screen_w,screen_h));return 0;
+        free(request);wm_wallpaper_changed();return 0;
     }
     if (image_job_wallpaper(&wallpaper_owner,request->path,request->mode,desk_color,screen_w,screen_h,
                             wallpaper_ready,request,free)<0) {free(request);return -1;}

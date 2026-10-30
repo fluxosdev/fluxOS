@@ -4,10 +4,19 @@
  * field, a scroll bar and a status bar. Double-clicking a folder opens
  * it in the same window; a program runs in a terminal window, a PNG or
  * JPEG picture opens in the image viewer, a text file in the text editor, a WAV sound opens
- * in the sound player, a VOC one plays with play(1), and anything else is shown with more(1).
+ * in the sound player, a VOC one plays with play(1), a shortcut (NAME.app) starts what it
+ * names, and anything else is shown with more(1).
  *
- * Keys: arrows move the selection, Enter opens, Backspace goes up,
- * Delete deletes, F2 renames and F5 reloads the folder. Ctrl+X, Ctrl+C
+ * The desktop is a folder window too (files_open_desktop): no frame, the
+ * wallpaper behind, a header of Back, Home, Favourites and the mounted
+ * disks over a divider,
+ * and the folder in tiles (the icon with the name beside it) down columns.
+ * It opens on ~/Desktop; Home goes back there, Back to the folders before,
+ * and Favourites to the folders kept in ~/.favourites, one per line.
+ *
+ * Keys: arrows move the selection, Enter opens, Backspace goes up (back,
+ * on the desktop), Alt+Up up and Alt+Left back, Delete deletes, F2
+ * renames and F5 reloads the folder. Ctrl+X, Ctrl+C
  * and Ctrl+V cut, copy and paste (also between disks and the CD), and
  * Ctrl+A selects everything; dragging a box with the mouse selects several
  * items. Clicking the
@@ -38,6 +47,18 @@
 #define SB_W       16
 #define LINE_STEP  CELL_H
 
+/* The desktop: a header of buttons, a divider under it, then tiles. */
+#define DESK_PAD   16                   /* from the edges */
+#define HEAD_Y     10
+#define HEAD_H     44
+#define DIVIDER_Y  (HEAD_Y + HEAD_H + 8)
+#define DIVIDER_H  3
+#define TILES_Y    (DIVIDER_Y + DIVIDER_H + 12)
+#define TILE_W     196
+#define TILE_H     48
+#define HIST_MAX   32                   /* folders Back remembers */
+#define MAX_FAVS   16
+
 struct entry {
     char name[NAME_MAX + 1];
     int is_dir;
@@ -60,6 +81,28 @@ static const struct {
     { "Rename", ICON_NONE },
 };
 
+enum { HB_BACK, HB_HOME, HB_FAVS, NHEAD };
+
+static const struct {
+    const char *label;
+    enum icon_id icon;
+} heads[NHEAD] = {
+    { "Back", ICON_BACK },
+    { "Home", ICON_HOME },
+    { "Favourites", ICON_STAR },
+};
+
+/* After them, a button for each mounted disk (files_tick keeps the list): "System" for /,
+ * the mount point's name for the rest. */
+#define MAX_DRIVES 16
+#define DRIVES_GAP 24                   /* between Favourites and the first disk */
+static struct {
+    char path[128];
+    char label[32];
+    enum icon_id icon;
+} drives[MAX_DRIVES];
+static int ndrives;
+
 /* The clipboard is shared by all folder windows. */
 static char (*clip)[PATH_MAX];
 static int clip_n;
@@ -72,7 +115,10 @@ enum hold { HOLD_NONE, HOLD_TOOL, HOLD_THUMB, HOLD_ARROW_UP, HOLD_ARROW_DOWN, HO
 
 struct fm {
     struct window *win;
+    int desk;                           /* the desktop's (files_open_desktop) */
     char path[PATH_MAX];
+    char *hist[HIST_MAX];               /* the folders before, the last one last */
+    int nhist;
     struct entry *ents;
     int n, cap;
     int sel;                            /* the primary selected entry, or -1 */
@@ -94,7 +140,8 @@ struct fm {
     int ctx_open;                       /* the right-click menu */
     int ctx_x, ctx_y, ctx_hover;
     int ctx_n;
-    int ctx_codes[10];
+    int ctx_codes[32];
+    int ctx_favs;                       /* it is the Favourites button's */
     struct fm *next;
 };
 
@@ -160,6 +207,46 @@ static int is_text_name(const char *name)
     return 0;
 }
 
+/*
+ * A shortcut, NAME.app: lines of key=value. exec is an app's name, as
+ * wm_launch knows them ("wave", "terminal"), or a path to open as the File
+ * Manager would; icon (if any) an icon's name ("folder", see icons.c) or an
+ * app's. -1 if it cannot be read.
+ */
+static int read_shortcut(const char *path, char *exec, size_t size, enum icon_id *icon)
+{
+    char buf[1024];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    int n = (int)read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n < 0)
+        return -1;
+    buf[n] = 0;
+    exec[0] = 0;
+    *icon = ICON_NONE;
+    for (char *line = buf, *next; line; line = next) {
+        next = strchr(line, '\n');
+        if (next)
+            *next++ = 0;
+        size_t len = strlen(line);
+        while (len && (line[len - 1] == '\r' || line[len - 1] == ' '))
+            line[--len] = 0;
+        char *eq = strchr(line, '=');
+        if (line[0] == '#' || !eq)
+            continue;
+        *eq = 0;
+        if (!strcmp(line, "exec"))
+            snprintf(exec, size, "%s", eq + 1);
+        else if (!strcmp(line, "icon") && (*icon = icon_by_name(eq + 1)) == ICON_NONE)
+            *icon = wm_app_icon(eq + 1);
+    }
+    if (*icon == ICON_NONE)
+        *icon = exec[0] && wm_app_icon(exec) != ICON_NONE ? wm_app_icon(exec) : ICON_RUN;
+    return 0;
+}
+
 static enum icon_id classify(struct fm *f, const struct entry *e, const char *parent_fs)
 {
     char path[PATH_MAX];
@@ -174,6 +261,11 @@ static enum icon_id classify(struct fm *f, const struct entry *e, const char *pa
             return !strcmp(st.f_fstype, "iso9660") ? ICON_CDROM : ICON_DRIVE;
         return ICON_FOLDER;
     }
+    if (has_suffix(e->name, ".app")) {
+        char exec[PATH_MAX];
+        enum icon_id icon;
+        return read_shortcut(path, exec, sizeof(exec), &icon) == 0 ? icon : ICON_README;
+    }
     if (has_suffix(e->name, ".png") || has_suffix(e->name, ".jpg") ||
         has_suffix(e->name, ".jpeg") || has_suffix(e->name, ".jpe") || has_suffix(e->name, ".jfif") ||
         has_suffix(e->name, ".gif") || has_suffix(e->name, ".svg") || has_suffix(e->name, ".ico"))
@@ -184,6 +276,9 @@ static enum icon_id classify(struct fm *f, const struct entry *e, const char *pa
         return ICON_SOUND;
     if (has_suffix(e->name, ".zip") || has_suffix(e->name, ".7z"))
         return ICON_ARCHIVE;
+    if (has_suffix(e->name, ".mp4") || has_suffix(e->name, ".mkv") || has_suffix(e->name, ".avi") ||
+        has_suffix(e->name, ".webm") || has_suffix(e->name, ".mov") || has_suffix(e->name, ".mpg"))
+        return ICON_VIDEO;
     struct stat st;
     if (is_dos_program(path) || (stat(path, &st) == 0 && (st.st_mode & 0111) && is_program(path)))
         return ICON_RUN;
@@ -236,17 +331,60 @@ static void load(struct fm *f)
 
 /* ---- layout ---- */
 
+/* The desktop's text: the Menu button's font for the header, the captions' for the tiles
+ * (Classic: the Start banner's, and the UI's). */
+static const struct pfont *head_font(void)
+{
+    return KINETIK ? &font_archivo_start : &font_banner;
+}
+
+static const struct pfont *tile_font(void)
+{
+    return KINETIK ? &font_archivo_title : &font_sans;
+}
+
 static struct rect view_rect(struct fm *f)
 {
     int w = f->win->content.w, h = f->win->content.h;
     return mkrect(4, VIEW_Y, w - 8, h - VIEW_Y - STATUS_H - 4);
 }
 
-/* The icon area inside the view's border, left of the scroll bar. */
+/* The icon area inside the view's border, left of the scroll bar; the desktop's under its divider. */
 static struct rect icon_area(struct fm *f)
 {
+    if (f->desk)
+        return mkrect(DESK_PAD, TILES_Y, f->win->content.w - 2 * DESK_PAD,
+                      f->win->content.h - TILES_Y - 8);
     struct rect v = view_rect(f);
     return mkrect(v.x + 2, v.y + 2, v.w - 4 - SB_W, v.h - 4);
+}
+
+static const char *head_label(int i)
+{
+    return i < NHEAD ? heads[i].label : i - NHEAD < ndrives ? drives[i - NHEAD].label : "";
+}
+
+static enum icon_id head_icon(int i)
+{
+    return i < NHEAD ? heads[i].icon : i - NHEAD < ndrives ? drives[i - NHEAD].icon : ICON_NONE;
+}
+
+/* A header button of the desktop: the icon and the label beside it. */
+static struct rect head_rect(int i)
+{
+    int x = DESK_PAD - 8;
+    for (int k = 0; k < i; k++)
+        x += 8 + 32 + 10 + gfx_text_width(head_font(), head_label(k)) + 14 + 12 + (k == NHEAD - 1 ? DRIVES_GAP : 0);
+    return mkrect(x, HEAD_Y, 8 + 32 + 10 + gfx_text_width(head_font(), head_label(i)) + 14, HEAD_H);
+}
+
+/* The header's buttons: Back, Home, Favourites and the disks that fit beside them. */
+static int nheads(struct fm *f)
+{
+    int n = NHEAD;
+    while (n < NHEAD + ndrives && head_rect(n).x + head_rect(n).w <= f->win->content.w - DESK_PAD + 8)
+        n++;
+    return n;
 }
 
 static struct rect sb_rect(struct fm *f)
@@ -257,12 +395,22 @@ static struct rect sb_rect(struct fm *f)
 
 static int columns(struct fm *f)
 {
-    int c = icon_area(f).w / CELL_W;
+    int c = icon_area(f).w / (f->desk ? TILE_W : CELL_W);
     return c > 0 ? c : 1;
+}
+
+/* The desktop's tiles go down a column, then the next, as many as fit;
+ * with more than fit, the columns grow longer and scroll. */
+static int tile_rows(struct fm *f)
+{
+    int fit = icon_area(f).h / TILE_H, need = (f->n + columns(f) - 1) / columns(f);
+    return fit > need ? fit : need > 0 ? need : 1;
 }
 
 static int content_height(struct fm *f)
 {
+    if (f->desk)
+        return tile_rows(f) * TILE_H;
     int rows = (f->n + columns(f) - 1) / columns(f);
     return rows * CELL_H + 8;
 }
@@ -276,10 +424,62 @@ static int max_scroll(struct fm *f)
 static struct rect cell_rect(struct fm *f, int i)
 {
     struct rect a = icon_area(f);
+    if (f->desk) {
+        int rows = tile_rows(f);
+        return mkrect(a.x + i / rows * TILE_W, a.y + i % rows * TILE_H - f->scroll, TILE_W, TILE_H);
+    }
     int cols = columns(f);
     int pad = (a.w - cols * CELL_W) / 2;
     return mkrect(a.x + pad + (i % cols) * CELL_W, a.y + 4 + (i / cols) * CELL_H - f->scroll,
                   CELL_W, CELL_H);
+}
+
+/* What an entry is called on the screen: a shortcut without its .app. */
+static void shown_name(const struct entry *e, char *out, size_t size)
+{
+    snprintf(out, size, "%s", e->name);
+    if (!e->is_dir && has_suffix(out, ".app"))
+        out[strlen(out) - 4] = 0;
+}
+
+/* An entry's icon, and its label (as wide as the name), which clicks find it by. */
+static struct rect icon_rect(struct fm *f, int i)
+{
+    struct rect c = cell_rect(f, i);
+    if (f->desk)
+        return mkrect(c.x + 4, c.y + (TILE_H - 32) / 2, 32, 32);
+    return mkrect(c.x + (CELL_W - 32) / 2, c.y + 2, 32, 32);
+}
+
+static struct rect label_rect(struct fm *f, int i, char *label, int size)
+{
+    struct rect c = cell_rect(f, i);
+    char name[NAME_MAX + 1];
+    shown_name(&f->ents[i], name, sizeof(name));
+    if (f->desk) {
+        const struct pfont *fn = tile_font();
+        gfx_ellipsize(fn, name, TILE_W - 4 - 32 - 8 - 12, label, size);
+        return mkrect(c.x + 4 + 32 + 6, c.y + (TILE_H - fn->height) / 2 - 1, gfx_text_width(fn, label) + 5,
+                      fn->height + 2);
+    }
+    gfx_ellipsize(&font_sans, name, CELL_W - 6, label, size);
+    int tw = gfx_text_width(&font_sans, label);
+    return mkrect(c.x + (CELL_W - tw) / 2 - 2, c.y + 37, tw + 4, font_sans.height + 1);
+}
+
+/* Where clicks find entry i's name: its label, or in a window the cell's width under the icon. */
+static struct rect name_area(struct fm *f, int i)
+{
+    char label[64];
+    if (f->desk)
+        return label_rect(f, i, label, sizeof(label));
+    struct rect c = cell_rect(f, i);
+    return mkrect(c.x + 2, c.y + 37, CELL_W - 4, font_sans.height + 1);
+}
+
+static int on_entry(struct fm *f, int i, int x, int y)
+{
+    return rect_contains(icon_rect(f, i), x, y) || rect_contains(name_area(f, i), x, y);
 }
 
 static struct rect addr_rect(struct fm *f)
@@ -386,19 +586,24 @@ static void band_select(struct fm *f)
     struct rect b = band_rect(f);
     f->sel = -1;
     for (int i = 0; i < f->n; i++) {
-        struct rect c = cell_rect(f, i);
-        struct rect icon = mkrect(c.x + (CELL_W - 32) / 2, c.y + 2, 32, 32);
-        struct rect label = mkrect(c.x + 2, c.y + 37, CELL_W - 4, font_sans.height + 1);
-        f->ents[i].selected = rect_overlaps(b, icon) || rect_overlaps(b, label);
+        f->ents[i].selected = rect_overlaps(b, icon_rect(f, i)) || rect_overlaps(b, name_area(f, i));
         if (f->ents[i].selected && f->sel < 0)
             f->sel = i;
     }
 }
 
+/* White with a black shadow, to read over any wallpaper (as the desktop's labels always were). */
+static void shadow_text(struct surface *s, const struct pfont *fn, int x, int y, const char *text, color_t c)
+{
+    gfx_text(s, fn, x + 1, y + 1, text, C_BLACK);
+    gfx_text(s, fn, x, y, text, c);
+}
+
 static void draw_entries(struct fm *f, struct surface *s)
 {
     struct rect a = icon_area(f);
-    gfx_fill(s, a.x, a.y, a.w, a.h, C_WHITE);
+    if (!f->desk)
+        gfx_fill(s, a.x, a.y, a.w, a.h, C_WHITE);
     struct rect saved = s->clip;
     s->clip = rect_intersect(saved, a);
     for (int i = 0; i < f->n; i++) {
@@ -406,18 +611,20 @@ static void draw_entries(struct fm *f, struct surface *s)
         if (!rect_overlaps(c, a))
             continue;
         int sel = f->ents[i].selected || (f == drop_f && i == drop_i);
-        int ix = c.x + (CELL_W - 32) / 2, iy = c.y + 2;
+        struct rect ir = icon_rect(f, i);
         if (sel)
-            draw_icon_selected(s, ix, iy, f->ents[i].icon, 32);
+            draw_icon_selected(s, ir.x, ir.y, f->ents[i].icon, 32);
         else
-            draw_icon(s, ix, iy, f->ents[i].icon, 32);
+            draw_icon(s, ir.x, ir.y, f->ents[i].icon, 32);
         char label[64];
-        gfx_ellipsize(&font_sans, f->ents[i].name, CELL_W - 6, label, sizeof(label));
-        int tw = gfx_text_width(&font_sans, label);
-        struct rect lr = mkrect(c.x + (CELL_W - tw) / 2 - 2, iy + 35, tw + 4, font_sans.height + 1);
+        struct rect lr = label_rect(f, i, label, sizeof(label));
+        const struct pfont *fn = f->desk ? tile_font() : &font_sans;
         if (sel)
             gfx_fill(s, lr.x, lr.y, lr.w, lr.h, C_NAVY);
-        gfx_text(s, &font_sans, lr.x + 2, lr.y, label, sel ? C_WHITE : C_BLACK);
+        if (f->desk && !sel)
+            shadow_text(s, fn, lr.x + 2, lr.y + 1, label, C_WHITE);
+        else
+            gfx_text(s, fn, lr.x + 2, lr.y + f->desk, label, sel ? C_WHITE : C_BLACK);
         if (i == f->sel && wm_focused() == f->win)
             gfx_focus_rect(s, lr);
     }
@@ -497,14 +704,116 @@ static void draw_disk_space(struct fm *f, struct surface *s, int w, int h)
 
 /* ---- the right-click menu ---- */
 
+/* CX_FAV + k: the k-th favourite folder, in the Favourites button's menu. */
 enum { CX_SEP, CX_OPEN, CX_CUT, CX_COPY, CX_PASTE, CX_DELETE, CX_RENAME, CX_NEWDIR, CX_REFRESH, CX_TERMINAL,
-       CX_EXTRACT, CX_PAINT };
+       CX_EXTRACT, CX_PAINT, CX_UP, CX_WINDOW, CX_DISPLAY, CX_FAVADD, CX_FAVDEL, CX_FAVTHIS, CX_UNFAVTHIS,
+       CX_FAV };
 
 static const char *const ctx_labels[] = {
     [CX_OPEN] = "Open", [CX_CUT] = "Cut", [CX_COPY] = "Copy", [CX_PASTE] = "Paste", [CX_DELETE] = "Delete",
     [CX_RENAME] = "Rename", [CX_NEWDIR] = "New Folder", [CX_REFRESH] = "Refresh",
     [CX_TERMINAL] = "Open Terminal Here", [CX_EXTRACT] = "Extract All...", [CX_PAINT] = "Edit in Paint",
+    [CX_UP] = "Up", [CX_WINDOW] = "Open in a Window", [CX_DISPLAY] = "Display Properties",
+    [CX_FAVADD] = "Add to Favourites", [CX_FAVDEL] = "Remove from Favourites",
+    [CX_FAVTHIS] = "Add this folder", [CX_UNFAVTHIS] = "Remove this folder",
 };
+
+/* ---- favourites ---- */
+
+/* The folders the desktop's Favourites button offers: ~/.favourites, one path a line
+ * (~ for the home folder), read again each time; Home and Downloads until there is one. */
+static struct {
+    char path[PATH_MAX];
+    char label[64];
+} favs[MAX_FAVS];
+static int nfavs;
+
+static const char *home_dir(void)
+{
+    const char *home = getenv("HOME");
+    return home && *home ? home : "/home/flux";
+}
+
+static void add_fav(const char *path)
+{
+    if (nfavs == MAX_FAVS || !*path)
+        return;
+    if (path[0] == '~' && (!path[1] || path[1] == '/'))
+        snprintf(favs[nfavs].path, sizeof(favs[nfavs].path), "%s%s", home_dir(), path + 1);
+    else
+        snprintf(favs[nfavs].path, sizeof(favs[nfavs].path), "%s", path);
+    const char *base = strrchr(favs[nfavs].path, '/');
+    snprintf(favs[nfavs].label, sizeof(favs[nfavs].label), "%s",
+             !strcmp(favs[nfavs].path, home_dir()) ? "Home" : base && base[1] ? base + 1 : favs[nfavs].path);
+    nfavs++;
+}
+
+static void load_favs(void)
+{
+    char file[PATH_MAX], line[PATH_MAX];
+    snprintf(file, sizeof(file), "%s/.favourites", home_dir());
+    nfavs = 0;
+    FILE *fp = fopen(file, "r");
+    if (!fp) {
+        add_fav("~");
+        add_fav("~/Downloads");
+        return;
+    }
+    while (fgets(line, sizeof(line), fp)) {
+        line[strcspn(line, "\r\n")] = 0;
+        add_fav(line);
+    }
+    fclose(fp);
+}
+
+static void save_favs(void)
+{
+    char file[PATH_MAX];
+    snprintf(file, sizeof(file), "%s/.favourites", home_dir());
+    FILE *fp = fopen(file, "w");
+    if (!fp) {
+        char msg[PATH_MAX + 64];
+        snprintf(msg, sizeof(msg), "Cannot save the favourites in %s: %s.", file, strerror(errno));
+        message_box("Favourites", ICON_WARNING, msg);
+        return;
+    }
+    for (int k = 0; k < nfavs; k++)
+        fprintf(fp, "%s\n", favs[k].path);
+    fclose(fp);
+}
+
+/* Its place among the favourites, or -1. */
+static int fav_index(const char *path)
+{
+    for (int k = 0; k < nfavs; k++)
+        if (!strcmp(favs[k].path, path))
+            return k;
+    return -1;
+}
+
+static void set_fav(const char *path, int on)
+{
+    load_favs();
+    int k = fav_index(path);
+    if (on && k < 0) {
+        if (nfavs == MAX_FAVS) {
+            message_box("Favourites", ICON_WARNING, "There are as many favourites as there can be.");
+            return;
+        }
+        add_fav(path);
+    } else if (!on && k >= 0) {
+        memmove(&favs[k], &favs[k + 1], (size_t)(nfavs - k - 1) * sizeof(favs[0]));
+        nfavs--;
+    } else {
+        return;
+    }
+    save_favs();
+}
+
+static const char *ctx_label(int code)
+{
+    return code >= CX_FAV ? favs[code - CX_FAV].label : ctx_labels[code];
+}
 
 #define CTX_W 150
 #define CTX_ITEM_H 20
@@ -517,15 +826,19 @@ static int ctx_height(const struct fm *f, int i)
 
 static struct rect ctx_rect(const struct fm *f)
 {
-    int h = 4;
-    for (int i = 0; i < f->ctx_n; i++)
+    int h = 4, mw = CTX_W;
+    for (int i = 0; i < f->ctx_n; i++) {
         h += ctx_height(f, i);
+        int tw = f->ctx_codes[i] == CX_SEP ? 0 : gfx_text_width(&font_sans, ctx_label(f->ctx_codes[i])) + 30;
+        if (tw > mw)
+            mw = tw;
+    }
     int x = f->ctx_x, y = f->ctx_y, w = f->win->content.w, ch = f->win->content.h;
-    if (x + CTX_W > w)
-        x = w - CTX_W;
+    if (x + mw > w)
+        x = w - mw;
     if (y + h > ch)
         y = ch - h;
-    return mkrect(x < 0 ? 0 : x, y < 0 ? 0 : y, CTX_W, h);
+    return mkrect(x < 0 ? 0 : x, y < 0 ? 0 : y, mw, h);
 }
 
 static struct rect ctx_item_rect(const struct fm *f, int idx)
@@ -571,13 +884,80 @@ static void draw_ctx(struct fm *f, struct surface *s)
             gfx_fill(s, r.x, r.y, r.w, r.h, C_NAVY);
         int ty = r.y + (r.h - font_sans.height) / 2;
         if (!en)
-            gfx_text(s, &font_sans, r.x + 13, ty + 1, ctx_labels[code], C_WHITE);
-        gfx_text(s, &font_sans, r.x + 12, ty, ctx_labels[code], hot ? C_WHITE : en ? C_BLACK : C_SHADOW);
+            gfx_text(s, &font_sans, r.x + 13, ty + 1, ctx_label(code), C_WHITE);
+        gfx_text(s, &font_sans, r.x + 12, ty, ctx_label(code), hot ? C_WHITE : en ? C_BLACK : C_SHADOW);
     }
+}
+
+/* A 32 pixel icon faded halfway into what is behind it: a button with nothing to do. */
+static void draw_icon_faded(struct surface *s, int x, int y, enum icon_id icon)
+{
+    uint32_t under[32 * 32];
+    if (x < 0 || y < 0 || x + 32 > s->w || y + 32 > s->h) {
+        draw_icon(s, x, y, icon, 32);
+        return;
+    }
+    for (int j = 0; j < 32; j++)
+        memcpy(under + j * 32, s->px + (y + j) * s->stride + x, 32 * 4);
+    draw_icon(s, x, y, icon, 32);
+    for (int j = 0; j < 32; j++)
+        for (int i = 0; i < 32; i++) {
+            uint32_t *p = s->px + (y + j) * s->stride + x + i;
+            *p = gfx_mix(*p, under[j * 32 + i], 150);
+        }
+}
+
+/* The desktop: the wallpaper (the window is where the screen's (0, 0) is, so it lines up
+ * with what is round it), the header and its divider, the tiles. */
+static void paint_desk(struct fm *f)
+{
+    struct surface *s = &f->win->content;
+    int w = s->w, h = s->h;
+    gfx_noclip(s);
+    wallpaper_draw(s, mkrect(0, 0, w, h));
+
+    const struct pfont *hf = head_font();
+    for (int i = 0, n = nheads(f); i < n; i++) {
+        struct rect r = head_rect(i);
+        int down = (f->hold == HOLD_TOOL && f->hold_tool == i && f->hold_in) ||
+                   (i == HB_FAVS && f->ctx_open && f->ctx_favs);
+        int off = i == HB_BACK && !f->nhist;
+        if (down) {
+            gfx_round_fill(s, r, KINETIK ? 6 : 0, KINETIK ? 6 : 0, ARGB(0x60, 0x000000));
+            gfx_round_frame(s, r, KINETIK ? 6 : 0, KINETIK ? 6 : 0, ARGB(0xA0, 0xFFFFFF));
+        }
+        int ix = r.x + 8, iy = r.y + (r.h - 32) / 2;
+        if (off)
+            draw_icon_faded(s, ix, iy, head_icon(i));
+        else
+            draw_icon(s, ix, iy, head_icon(i), 32);
+        shadow_text(s, hf, ix + 32 + 10, r.y + (r.h - hf->height) / 2, head_label(i),
+                    off ? RGB(0xA8, 0xA8, 0xA8) : C_WHITE);
+    }
+    gfx_round_fill(s, mkrect(DESK_PAD - 1, DIVIDER_Y, w - 2 * DESK_PAD, DIVIDER_H), 1, 1, ARGB(0x99, 0xFFFFFF));
+
+    draw_entries(f, s);
+    int ms = max_scroll(f);
+    if (ms > 0) {                       /* where the view is: a slim bar in the margin */
+        struct rect a = icon_area(f);
+        int len = a.h * a.h / content_height(f);
+        if (len < 16)
+            len = 16;
+        struct rect bar = mkrect(a.x + a.w + 5, a.y, 6, a.h);
+        gfx_round_fill(s, bar, 3, 3, ARGB(0x50, 0x000000));
+        gfx_round_fill(s, mkrect(bar.x, a.y + (a.h - len) * f->scroll / ms, 6, len), 3, 3, ARGB(0xD0, 0xFFFFFF));
+    }
+    if (f->ctx_open)
+        draw_ctx(f, s);
+    wm_damage_client(f->win, mkrect(0, 0, w, h));
 }
 
 static void paint(struct fm *f)
 {
+    if (f->desk) {
+        paint_desk(f);
+        return;
+    }
     struct surface *s = &f->win->content;
     int w = s->w, h = s->h;
     gfx_noclip(s);
@@ -655,7 +1035,8 @@ static void select_name(struct fm *f, const char *name)
     show_selection(f);
 }
 
-static void navigate(struct fm *f, const char *path)
+/* Show the folder path. */
+static void enter(struct fm *f, const char *path)
 {
     f->editing = 0;
     snprintf(f->path, sizeof(f->path), "%s", path);
@@ -664,6 +1045,47 @@ static void navigate(struct fm *f, const char *path)
     load(f);
     set_title(f);
     paint(f);
+}
+
+/* Go to path, remembering this folder for Back (HIST_MAX of them, the oldest forgotten first). */
+static void navigate(struct fm *f, const char *path)
+{
+    char *was = strcmp(f->path, path) ? strdup(f->path) : NULL;
+    if (was) {
+        if (f->nhist == HIST_MAX) {
+            free(f->hist[0]);
+            memmove(f->hist, f->hist + 1, (HIST_MAX - 1) * sizeof(f->hist[0]));
+            f->nhist--;
+        }
+        f->hist[f->nhist++] = was;
+    }
+    enter(f, path);
+}
+
+/* Back to the folder before, landing on the one we were in if it is inside it. */
+static void go_back(struct fm *f)
+{
+    if (!f->nhist)
+        return;
+    char *to = f->hist[--f->nhist], was[PATH_MAX];
+    snprintf(was, sizeof(was), "%s", f->path);
+    enter(f, to);
+    size_t n = strlen(to);
+    const char *rest = was + n + (n > 1);
+    if (!strncmp(was, to, n) && (n == 1 || was[n] == '/') && *rest && !strchr(rest, '/')) {
+        select_name(f, rest);
+        paint(f);
+    }
+    free(to);
+}
+
+/* The desktop's folder, ~/Desktop: made if it is not there yet (a disk installed before there was one). */
+static const char *desktop_dir(void)
+{
+    static char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s/Desktop", home_dir());
+    mkdir(dir, 0755);
+    return dir;
 }
 
 static void go_up(struct fm *f)
@@ -712,8 +1134,33 @@ static void reload(struct fm *f, const char *select)
  * Once a second: discs and floppies are mounted and unmounted by the kernel
  * as they are put in and taken out (the automounter), so when the list of
  * mounts changes, every folder window reads its folder again and the drive
- * icons follow.
+ * icons follow, and so do the desktop header's disks.
  */
+
+/* The disks, from getmounts' lines: "/dev/hda1 on /mnt/sda1 type fat32 (rw)". */
+static void read_drives(const char *text)
+{
+    ndrives = 0;
+    for (const char *line = text; *line && ndrives < MAX_DRIVES;) {
+        const char *end = strchr(line, '\n');
+        if (!end)
+            end = line + strlen(line);
+        const char *on = strstr(line, " on "), *type = on ? strstr(on + 4, " type ") : NULL;
+        if (on && type && type < end && type - (on + 4) < (int)sizeof(drives[0].path)) {
+            char *path = drives[ndrives].path;
+            memcpy(path, on + 4, (size_t)(type - (on + 4)));
+            path[type - (on + 4)] = 0;
+            const char *base = strrchr(path, '/');
+            snprintf(drives[ndrives].label, sizeof(drives[0].label), "%s",
+                     !strcmp(path, "/") ? "System" : base ? base + 1 : path);
+            drives[ndrives].icon = !strcmp(path, "/") ? ICON_COMPUTER
+                                 : !strncmp(type + 6, "iso9660", 7) ? ICON_CDROM : ICON_DRIVE;
+            ndrives++;
+        }
+        line = *end ? end + 1 : end;
+    }
+}
+
 void files_tick(void)
 {
     static char last[2048];
@@ -728,16 +1175,44 @@ void files_tick(void)
     int changed = known;
     memcpy(last, now, (size_t)n + 1);
     known = 1;
-    if (!changed)
-        return;                         /* the first look only takes note */
-    for (struct fm *f = fms; f; f = f->next)
-        reload(f, NULL);
+    read_drives(now);
+    for (struct fm *f = fms; f; f = f->next) {
+        if (f->hold == HOLD_TOOL && f->desk && f->hold_tool >= NHEAD)
+            f->hold = HOLD_NONE;        /* the disk it held may be gone */
+        if (changed)
+            reload(f, NULL);
+        else if (f->desk)
+            paint(f);                   /* the first look only takes note, and shows the disks */
+    }
+}
+
+/* Start what a shortcut names: an app, or a file or folder opened as double-clicking it would. */
+static void open_shortcut(const char *path, const char *name)
+{
+    char exec[PATH_MAX], msg[PATH_MAX + NAME_MAX + 64];
+    enum icon_id icon;
+    struct stat st;
+    if (read_shortcut(path, exec, sizeof(exec), &icon) < 0 || !exec[0]) {
+        snprintf(msg, sizeof(msg), "The shortcut %s does not say what to open.", name);
+    } else if (wm_launch(exec) == 0) {
+        return;
+    } else if (exec[0] == '/' && !has_suffix(exec, ".app") && stat(exec, &st) == 0) {
+        files_open_path(exec);
+        return;
+    } else {
+        snprintf(msg, sizeof(msg), "Cannot find '%s', which the shortcut %s opens.", exec, name);
+    }
+    message_box("Shortcut", ICON_WARNING, msg);
 }
 
 /* Open a file (not a folder) by its kind; dir is its folder, for programs. */
 static void open_file(const char *dir, const char *name, const char *path, enum icon_id icon)
 {
-    if (icon == ICON_IMAGE) {
+    if (has_suffix(name, ".app")) {
+        open_shortcut(path, name);
+    } else if (icon == ICON_VIDEO) {
+        message_box("Video", ICON_INFO, "fluxOS cannot play videos yet.");
+    } else if (icon == ICON_IMAGE) {
         if (!image_view_open(path)) {
             char msg[NAME_MAX + 64];
             snprintf(msg, sizeof(msg), "%s is not a picture fluxOS can show (PNG, JPEG, GIF, SVG or ICO).", name);
@@ -1176,6 +1651,7 @@ static void tool_action(struct fm *f, int i)
 static void open_ctx(struct fm *f, int x, int y, int hit)
 {
     int n = 0;
+    f->ctx_favs = 0;
     if (hit >= 0) {
         if (!f->ents[hit].selected)
             select_only(f, hit);
@@ -1189,6 +1665,19 @@ static void open_ctx(struct fm *f, int x, int y, int hit)
             if (c[i] == CX_OPEN && f->ents[hit].icon == ICON_IMAGE)
                 f->ctx_codes[n++] = CX_PAINT;
         }
+        char path[PATH_MAX];
+        if (f->ents[hit].is_dir && join(path, sizeof(path), f->path, f->ents[hit].name) == 0) {
+            load_favs();
+            f->ctx_codes[n++] = CX_SEP;
+            f->ctx_codes[n++] = fav_index(path) < 0 ? CX_FAVADD : CX_FAVDEL;
+        }
+    } else if (f->desk) {
+        clear_selection(f);
+        int c[] = { CX_NEWDIR, CX_SEP, CX_PASTE, CX_SEP, CX_REFRESH, CX_TERMINAL, CX_WINDOW, CX_UP, CX_SEP,
+                    CX_DISPLAY };
+        for (int i = 0; i < (int)(sizeof(c) / sizeof(c[0])); i++)
+            if (c[i] != CX_UP || strcmp(f->path, "/"))
+                f->ctx_codes[n++] = c[i];
     } else {
         clear_selection(f);
         int c[] = { CX_NEWDIR, CX_SEP, CX_PASTE, CX_SEP, CX_REFRESH, CX_TERMINAL };
@@ -1202,8 +1691,59 @@ static void open_ctx(struct fm *f, int x, int y, int hit)
     f->ctx_open = 1;
 }
 
+/* The Favourites button's menu, under it: the folders, then adding or removing this one. */
+static void open_favs(struct fm *f)
+{
+    int n = 0;
+    load_favs();
+    for (int k = 0; k < nfavs; k++)
+        f->ctx_codes[n++] = CX_FAV + k;
+    if (n)
+        f->ctx_codes[n++] = CX_SEP;
+    f->ctx_codes[n++] = fav_index(f->path) < 0 ? CX_FAVTHIS : CX_UNFAVTHIS;
+    struct rect r = head_rect(HB_FAVS);
+    f->ctx_n = n;
+    f->ctx_x = r.x;
+    f->ctx_y = r.y + r.h + 2;
+    f->ctx_hover = -1;
+    f->ctx_open = 1;
+    f->ctx_favs = 1;
+}
+
+static void head_action(struct fm *f, int i)
+{
+    switch (i) {
+    case HB_BACK: go_back(f); break;
+    case HB_HOME: navigate(f, desktop_dir()); break;
+    case HB_FAVS: open_favs(f); paint(f); break;
+    default:
+        if (i < nheads(f))
+            navigate(f, drives[i - NHEAD].path);
+        break;
+    }
+}
+
+/* Go to a favourite folder, if it is still there. */
+static void go_fav(struct fm *f, const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) < 0 || !S_ISDIR(st.st_mode)) {
+        char msg[PATH_MAX + 64];
+        snprintf(msg, sizeof(msg), "Cannot find the folder '%s'.", path);
+        message_box("Favourites", ICON_WARNING, msg);
+        return;
+    }
+    navigate(f, path);
+}
+
 static void ctx_action(struct fm *f, int code)
 {
+    char path[PATH_MAX];
+    if (code >= CX_FAV) {
+        snprintf(path, sizeof(path), "%s", favs[code - CX_FAV].path);
+        go_fav(f, path);
+        return;
+    }
     switch (code) {
     case CX_OPEN:
         if (f->sel >= 0)
@@ -1217,6 +1757,16 @@ static void ctx_action(struct fm *f, int code)
     case CX_NEWDIR: ask_text("New Folder", "Name of the new folder:", "New Folder", do_mkdir, f); break;
     case CX_REFRESH: reload(f, NULL); break;
     case CX_TERMINAL: terminal_open_in(f->path, "Terminal", NULL, 0); break;
+    case CX_UP: go_up(f); break;
+    case CX_WINDOW: files_open(f->path); break;
+    case CX_DISPLAY: display_open(); break;
+    case CX_FAVTHIS: set_fav(f->path, 1); break;
+    case CX_UNFAVTHIS: set_fav(f->path, 0); break;
+    case CX_FAVADD:
+    case CX_FAVDEL:
+        if (f->sel >= 0 && join(path, sizeof(path), f->path, f->ents[f->sel].name) == 0)
+            set_fav(path, code == CX_FAVADD);
+        break;
     case CX_PAINT:
         if (f->sel >= 0) {
             char path[PATH_MAX];
@@ -1257,7 +1807,14 @@ static void fm_key(struct window *w, const struct input_event *ev)
         address_key(f, ev);
         return;
     }
-    if (ev->len == 1 && ev->text[0] == 0x0C) {         /* Ctrl+L */
+    if ((ev->mods & KMOD_ALT) && (ev->code == KEY_UP || ev->code == KEY_LEFT)) {
+        if (ev->code == KEY_UP)
+            go_up(f);
+        else
+            go_back(f);
+        return;
+    }
+    if (ev->len == 1 && ev->text[0] == 0x0C && !f->desk) {     /* Ctrl+L */
         start_editing(f);
         paint(f);
         return;
@@ -1276,12 +1833,13 @@ static void fm_key(struct window *w, const struct input_event *ev)
         paint(f);
         return;
     }
-    int cols = columns(f), sel = f->sel;
+    /* across a row and down a column; the desktop's tiles run down the columns */
+    int across = f->desk ? tile_rows(f) : 1, down = f->desk ? 1 : columns(f), sel = f->sel;
     switch (ev->code) {
-    case KEY_LEFT: sel = sel < 0 ? 0 : sel - 1; break;
-    case KEY_RIGHT: sel = sel < 0 ? 0 : sel + 1; break;
-    case KEY_UP: sel = sel < 0 ? 0 : sel - cols; break;
-    case KEY_DOWN: sel = sel < 0 ? 0 : sel + cols; break;
+    case KEY_LEFT: sel = sel < 0 ? 0 : sel - across; break;
+    case KEY_RIGHT: sel = sel < 0 ? 0 : sel + across; break;
+    case KEY_UP: sel = sel < 0 ? 0 : sel - down; break;
+    case KEY_DOWN: sel = sel < 0 ? 0 : sel + down; break;
     case KEY_HOME: sel = 0; break;
     case KEY_END: sel = f->n - 1; break;
     case KEY_ENTER:
@@ -1292,7 +1850,9 @@ static void fm_key(struct window *w, const struct input_event *ev)
     case KEY_F2: ask_rename(f); return;
     case KEY_F5: reload(f, NULL); return;
     default:
-        if (ev->len == 1 && ev->text[0] == 0x7F)
+        if (ev->len == 1 && ev->text[0] == 0x7F && f->desk)
+            go_back(f);
+        else if (ev->len == 1 && ev->text[0] == 0x7F)
             go_up(f);
         return;
     }
@@ -1434,23 +1994,31 @@ static int fm_drop(struct window *w, int x, int y, const struct drag_data *d, in
     return effect;
 }
 
+/* The toolbar button i, or on the desktop the header's. */
+static struct rect hold_rect(struct fm *f, int i)
+{
+    return f->desk ? head_rect(i) : tool_rect(i);
+}
+
 static void press(struct fm *f, int x, int y)
 {
-    if (rect_contains(addr_rect(f), x, y)) {
+    if (!f->desk && rect_contains(addr_rect(f), x, y)) {
         if (!f->editing)
             start_editing(f);
         return;
     }
     f->editing = 0;
-    for (int i = 0; i < NTOOLS; i++) {
-        if (rect_contains(tool_rect(i), x, y)) {
+    for (int i = 0; i < (f->desk ? nheads(f) : NTOOLS); i++) {
+        if (rect_contains(hold_rect(f, i), x, y)) {
+            if (f->desk && i == HB_BACK && !f->nhist)
+                return;                 /* nowhere to go back to */
             f->hold = HOLD_TOOL;
             f->hold_tool = i;
             f->hold_in = 1;
             return;
         }
     }
-    struct rect sb = sb_rect(f), up, down, thumb;
+    struct rect sb = f->desk ? mkrect(0, 0, 0, 0) : sb_rect(f), up, down, thumb;
     sb_parts(f, &up, &down, &thumb);
     if (rect_contains(sb, x, y)) {
         int page = icon_area(f).h - 16;
@@ -1471,13 +2039,9 @@ static void press(struct fm *f, int x, int y)
     if (!rect_contains(icon_area(f), x, y))
         return;
     int hit = -1;
-    for (int i = 0; i < f->n; i++) {
-        struct rect c = cell_rect(f, i);
-        struct rect icon = mkrect(c.x + (CELL_W - 32) / 2, c.y + 2, 32, 32);
-        struct rect label = mkrect(c.x + 2, c.y + 37, CELL_W - 4, font_sans.height + 1);
-        if (rect_contains(icon, x, y) || rect_contains(label, x, y))
+    for (int i = 0; i < f->n; i++)
+        if (on_entry(f, i, x, y))
             hit = i;
-    }
     if (hit < 0) {
         clear_selection(f);
         f->last_click = -1;
@@ -1514,13 +2078,10 @@ static void fm_mouse(struct window *w, int x, int y, int buttons, int changed)
             return;
         int hit = -1;
         if (rect_contains(icon_area(f), x, y))
-            for (int i = 0; i < f->n; i++) {
-                struct rect c = cell_rect(f, i);
-                if (rect_contains(mkrect(c.x + (CELL_W - 32) / 2, c.y + 2, 32, 32), x, y) ||
-                    rect_contains(mkrect(c.x + 2, c.y + 37, CELL_W - 4, font_sans.height + 1), x, y))
+            for (int i = 0; i < f->n; i++)
+                if (on_entry(f, i, x, y))
                     hit = i;
-            }
-        if (!rect_contains(icon_area(f), x, y))
+        if (!rect_contains(icon_area(f), x, y) && !f->desk)
             f->ctx_open = 0;
         else
             open_ctx(f, x, y, hit);
@@ -1544,8 +2105,8 @@ static void fm_mouse(struct window *w, int x, int y, int buttons, int changed)
         paint(f);
         if (code != CX_SEP)
             ctx_action(f, code);
-        if (inside)
-            return;                     /* a click on the menu is not a click on the folder */
+        if (inside || (f->desk && rect_contains(head_rect(HB_FAVS), x, y)))
+            return;                     /* a click on the menu (or on the button that closes it) is not a click on the folder */
     }
     if ((changed & MOUSE_LEFT) && (buttons & MOUSE_LEFT)) {
         press(f, x, y);
@@ -1565,8 +2126,12 @@ static void fm_mouse(struct window *w, int x, int y, int buttons, int changed)
                 select_only(f, f->item_hit);    /* a plain click on one of several */
             }
         }
-        if (h == HOLD_TOOL && f->hold_in && rect_contains(tool_rect(f->hold_tool), x, y))
-            tool_action(f, f->hold_tool);
+        if (h == HOLD_TOOL && f->hold_in && rect_contains(hold_rect(f, f->hold_tool), x, y)) {
+            if (f->desk)
+                head_action(f, f->hold_tool);
+            else
+                tool_action(f, f->hold_tool);
+        }
     } else if (f->hold == HOLD_BAND) {
         f->band_x1 = x;
         f->band_y1 = y;
@@ -1590,7 +2155,7 @@ static void fm_mouse(struct window *w, int x, int y, int buttons, int changed)
     } else if (f->hold == HOLD_THUMB) {
         scroll_to_mouse(f, y);
     } else if (f->hold == HOLD_TOOL) {
-        int in = rect_contains(tool_rect(f->hold_tool), x, y);
+        int in = rect_contains(hold_rect(f, f->hold_tool), x, y);
         if (in == f->hold_in)
             return;
         f->hold_in = in;
@@ -1638,6 +2203,8 @@ static void fm_destroy(struct window *w)
     }
     if (drop_f == f)
         drop_f = NULL;
+    for (int i = 0; i < f->nhist; i++)
+        free(f->hist[i]);
     free(f->ents);
     free(f);
 }
@@ -1648,6 +2215,7 @@ static const struct window_ops fm_ops = {
     .wheel = fm_wheel,
     .focus = fm_focus,
     .resize = fm_resize,
+    .restyle = fm_resize,               /* the desktop's for a new wallpaper too (wm_wallpaper_changed) */
     .destroy = fm_destroy,
     .drop = fm_drop,
 };
@@ -1670,6 +2238,27 @@ struct window *files_open(const char *path)
     f->next = fms;
     fms = f;
     navigate(f, path);
+    return w;
+}
+
+struct window *files_open_desktop(void)
+{
+    struct fm *f = calloc(1, sizeof(*f));
+    if (!f)
+        return NULL;
+    f->desk = 1;
+    f->sel = -1;
+    f->last_click = -1;
+    snprintf(f->path, sizeof(f->path), "%s", desktop_dir());
+    struct window *w = wm_create("Desktop", ICON_HOME, 0, 0, WF_DESKTOP | WF_RIGHTCLICK, &fm_ops, f);
+    if (!w) {
+        free(f);
+        return NULL;
+    }
+    f->win = w;
+    f->next = fms;
+    fms = f;
+    enter(f, f->path);
     return w;
 }
 

@@ -65,6 +65,8 @@ void glass_smoke(struct surface *s, struct rect r, int rt, int rb);
 #define WF_MODAL    0x4         /* dims everything else while open */
 #define WF_NOTASK   0x8         /* no taskbar button */
 #define WF_RIGHTCLICK 0x10      /* the right button is passed to ops->mouse (MOUSE_RIGHT in changed) */
+#define WF_DESKTOP  0x20        /* the desktop itself: no frame, filling the space windows are placed
+                                   in, always at the bottom; never moved, minimized or closed */
 
 enum icon_id {
     ICON_NONE,
@@ -108,6 +110,8 @@ enum icon_id {
     ICON_PAINT,
     ICON_WIFI,
     ICON_MOUSE,
+    ICON_STAR,
+    ICON_VIDEO,
     /* the battery in the tray: its charge, on battery and charging */
     ICON_BATTERY_CAUTION,
     ICON_BATTERY_LOW,
@@ -190,7 +194,7 @@ struct window {
 extern struct surface screen;
 extern int screen_w, screen_h;
 
-/* setup: the install CD's desktop, for fluxOS Setup alone (no taskbar or icons). */
+/* setup: the install CD's desktop, for fluxOS Setup alone (no taskbar or desktop folder). */
 void wm_init(int setup);
 void wm_damage(struct rect r);
 void wm_flush(void);
@@ -231,6 +235,11 @@ void wm_close(struct window *w);        /* as the close button does */
 int wm_work_right(void);
 /* The sidebar came or went: maximized windows refit, everything is drawn again. */
 void wm_work_changed(void);
+/* The wallpaper changed: the desktop window paints it again, everything is drawn again. */
+void wm_wallpaper_changed(void);
+/* Start an app by the name shortcuts give it ("wave", "terminal", ...): -1 if there is none. */
+int wm_launch(const char *app);
+enum icon_id wm_app_icon(const char *app);  /* its icon, or ICON_NONE */
 
 /* A pop-up menu at (x, y), kept on the screen: what the desktop and taskbar's right
  * buttons open. An item with checked is drawn ticked while it returns nonzero. */
@@ -278,6 +287,7 @@ void sidebar_tick(void);                /* once a second */
 /* ---- icons (icons.c) ---- */
 void draw_icon(struct surface *s, int x, int y, enum icon_id id, int size);   /* 16, 32, 48 */
 void draw_icon_selected(struct surface *s, int x, int y, enum icon_id id, int size);
+enum icon_id icon_by_name(const char *name);    /* "folder", "wave": its file's name, or ICON_NONE */
 /* Draw the pointer with its hot spot at (x, y); cursor_bounds is what it covers. */
 void draw_cursor(struct surface *s, int x, int y, enum cursor_kind kind);
 struct rect cursor_bounds(int x, int y, enum cursor_kind kind);
@@ -321,6 +331,8 @@ void terminal_child_exited(int pid);
 void terminal_blink(void);
 
 struct window *files_open(const char *path);
+/* The desktop: a folder browsed right on it (the home folder's Desktop), at the bottom of the screen. */
+struct window *files_open_desktop(void);
 /* Open a file as double-clicking it in the File Manager would. */
 void files_open_path(const char *path);
 void files_tick(void);                  /* once a second: follow mounts coming and going */

@@ -5,7 +5,7 @@
  * the screen back to the text console.
  *
  * "desktop --setup" is what the install CD starts instead: fluxOS Setup
- * on a screen of its own, with no taskbar or desktop icons.
+ * on a screen of its own, with no taskbar or desktop folder.
  *
  * "desktop --js-worker" is a web page's worker (the browser starts it; see
  * wave/js/jsworker.c): a script engine and two pipes, no screen at all.
@@ -91,6 +91,7 @@ int main(int argc, char **argv)
         wm_flush();
     } else {
         saver_init();
+        files_open_desktop();           /* the desktop's folder, under every window */
         terminal_open("Terminal", NULL, 0, 1);
         wm_flush();
         sound_startup();                /* the desktop has replaced the boot screen */
