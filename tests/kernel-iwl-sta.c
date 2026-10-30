@@ -7,6 +7,16 @@ int iwl_have_chan_flags;
 static int received, reclaimed, sent;
 static uint8_t last_frame[2048], last_cmd[28];
 static uint32_t last_len;
+static struct iwl_scan_req_umac_v17 scan_command;
+int iwl_trans_rfkill(void) { return 0; }
+int iwl_chan_from_index(int idx, int *band)
+{ *band = idx < 14 ? BAND_2GHZ : BAND_5GHZ; return idx < 14 ? idx + 1 : 36; }
+int iwl_send_cmd(uint8_t g, uint8_t c, const void *p, uint32_t n,
+                 void *resp, uint32_t size, uint32_t *got)
+{
+    CHECK(g == GRP_LONG && c == SCAN_REQ && n == sizeof(scan_command));
+    memcpy(&scan_command, p, n); return 0;
+}
 void klog(const char *fmt, ...) { (void)fmt; }
 void sleep_on(void *p) { (void)p; abort(); }
 void wifi_rx(const uint8_t *f, uint32_t n, int rssi, int ch, int band, int dec)
@@ -49,6 +59,16 @@ static void tx_test(void)
 }
 int main(void)
 {
+    st.ready=1; iwl.band_2ghz=iwl.band_5ghz=1;
+    iwl_chan_flags[0]=iwl_chan_flags[14]=NVM_VALID;
+    CHECK(scan()==0);
+    CHECK(scan_command.scan_params.channel_params.count==2);
+    CHECK(scan_command.scan_params.channel_params.channel_config[0].channel_num==1);
+    CHECK(scan_command.scan_params.channel_params.channel_config[0].flags==(1u<<30));
+    CHECK(scan_command.scan_params.channel_params.channel_config[1].channel_num==36);
+    CHECK(scan_command.scan_params.channel_params.channel_config[1].flags==0);
+    CHECK(scan()==-EBUSY);
+    st.scanning=0;
     rx_test(); tx_test();
     uint8_t packet[64]={0}; struct iwl_rx_packet *p=(void*)packet;
     p->cmd=0x1c; p->len_n_flags=4+47; p->data[0]=1;

@@ -160,7 +160,9 @@ static int scan(void)
         unsigned j = c.scan_params.channel_params.count++;
         struct iwl_scan_channel_cfg_umac *cc = &c.scan_params.channel_params.channel_config[j];
         cc->channel_num = ch;
-        cc->flags = (uint32_t)band << 30;
+        /* Scan v17 uses PHY_BAND_24=1 / PHY_BAND_5=0, unlike
+         * the station layer's BAND_2GHZ=0 / BAND_5GHZ=1. */
+        cc->flags = (uint32_t)(band == BAND_2GHZ ? 1 : 0) << 30;
         cc->v5.iter_count = 1;
     }
     if (!c.scan_params.channel_params.count) return -ENODEV;

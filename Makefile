@@ -262,7 +262,7 @@ ports: sysroot
 toolchain-native: sysroot
 	tools/toolchain/build.sh --native --sysroot $(SYSROOT) --prefix $(BUILD)/toolchain/cross --dest $(NATIVE_ROOT)
 
-$(SETUP): $(BUILD)/.rootfs-stamp $(BINS) $(SETUPFS_FILES)
+$(SETUP): Makefile $(BUILD)/.rootfs-stamp $(BINS) $(SETUPFS_FILES) $(IWL_FIRMWARE_DEST)
 	rm -rf $(SETUPFS)
 	mkdir -p $(SETUPFS)/bin $(SETUPFS)/etc $(SETUPFS)/usr/share
 	cp $(addprefix $(ROOTFS)/bin/,$(SETUP_BINS)) $(SETUPFS)/bin/
@@ -270,6 +270,10 @@ $(SETUP): $(BUILD)/.rootfs-stamp $(BINS) $(SETUPFS_FILES)
 	cp $(ROOTFS)/etc/fshrc $(SETUPFS)/etc/
 	cp -r $(ROOTFS)/usr/share/icons $(SETUPFS)/usr/share/
 	cp -r setupfs/. $(SETUPFS)/
+	@# Setup boots the same kernel, so its wireless worker needs firmware too.
+	mkdir -p $(SETUPFS)/lib/firmware $(SETUPFS)/usr/share/doc/firmware
+	cp $(IWL_FIRMWARE_DEST) $(SETUPFS)/lib/firmware/
+	cp firmware/iwlwifi/LICENCE.iwlwifi_firmware $(SETUPFS)/usr/share/doc/firmware/
 	tar --format=ustar --owner=0 --group=0 --numeric-owner -cf $@ -C $(SETUPFS) .
 
 $(GRUB)/usr/bin/grub-mkimage:

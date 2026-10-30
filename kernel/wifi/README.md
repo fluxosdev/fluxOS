@@ -65,6 +65,22 @@ TLV boundaries, chunk limits, command metadata lifetime, crypto vectors,
 WPA2 handshake cases, command completion correlation, queue wraparound,
 RX length validation, CCMP replay checks, and TX formatting. These are software tests, not hardware validation.
 
+The transport regression also models reset losing NIC ownership, checks
+the required L0s-disable setting, exercises command sequences through both
+8-bit and 16-bit rollover, and rejects all fragments of a split RX packet
+even when the final continuation arrives in a later poll.
+
+If `8086:2725` is absent from PCI enumeration, firmware loading has not
+started. The `pci-net` diagnostics then list every network controller and
+every PCI bridge, with each bridge's bus numbers, memory windows, PCIe link
+status and, for a port with a slot, whether a card is present. If the card
+is found but its BAR0 cannot be mapped or reads back as all ones, they list
+the card and only the bridges above it, so BAR0 can be checked against each
+window. The probe wakes the card from D1-D3hot (putting back its BARs) and
+turns on memory decoding and bus mastering on the bridges above it.
+Transport initialization fixes only apply once the endpoint is visible;
+they do not establish recovery of a missing PCIe link.
+
 ## Protocol references
 
 Use the upstream Intel driver as the hardware/firmware reference:

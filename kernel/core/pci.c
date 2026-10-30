@@ -8,6 +8,29 @@
 #define CONFIG_ADDR 0xCF8
 #define CONFIG_DATA 0xCFC
 
+#define PCI_STATUS      0x06
+#define PCI_CAP_LIST    0x10            /* status: there is a capability list */
+#define PCI_CAP_PTR     0x34
+#define PCI_HEADER_TYPE 0x0E
+#define PCI_BUS_NUMBERS 0x18            /* bridge: primary, secondary, subordinate */
+#define PCI_MEM_WINDOW  0x20            /* bridge: memory base and limit */
+#define PCI_PREF_WINDOW 0x24            /* bridge: prefetchable base and limit */
+#define PCI_CAP_ID_PM   0x01
+#define PCI_CAP_ID_EXP  0x10
+#define PCI_PM_CTRL     0x04            /* PMCSR, in the capability */
+#define PCI_PM_STATE_MASK 0x0003
+#define PCI_PM_PME_STATUS 0x8000        /* write 1 to clear */
+
+/* Mechanism #1 reaches the first 256 bytes of a function only; the PCIe
+ * extended space past them needs ECAM. Rather than wrap round onto the
+ * header, reads there return all ones, as from a missing register, and
+ * writes are dropped. Out of line: inlined, the test leads GCC to warn
+ * about array indexes in callers' loops that no offset there can reach. */
+static __attribute__((noinline)) int out_of_reach(int off)
+{
+    return (unsigned)off > 0xFF;
+}
+
 /* Each access is two port writes or reads: they must not interleave. */
 static spinlock_t pci_lock = SPINLOCK_INIT("pci");
 
@@ -19,6 +42,8 @@ static uint32_t config_addr(const struct pci_dev *p, int off)
 
 uint32_t pci_read32(const struct pci_dev *p, int off)
 {
+    if (out_of_reach(off))
+        return (uint32_t)~0u;
     spin_lock(&pci_lock);
     outl(CONFIG_ADDR, config_addr(p, off));
     uint32_t v = inl(CONFIG_DATA);
@@ -28,6 +53,8 @@ uint32_t pci_read32(const struct pci_dev *p, int off)
 
 void pci_write32(const struct pci_dev *p, int off, uint32_t v)
 {
+    if (out_of_reach(off))
+        return;
     spin_lock(&pci_lock);
     outl(CONFIG_ADDR, config_addr(p, off));
     outl(CONFIG_DATA, v);
@@ -36,6 +63,8 @@ void pci_write32(const struct pci_dev *p, int off, uint32_t v)
 
 uint16_t pci_read16(const struct pci_dev *p, int off)
 {
+    if (out_of_reach(off))
+        return (uint16_t)~0u;
     spin_lock(&pci_lock);
     outl(CONFIG_ADDR, config_addr(p, off));
     uint16_t v = inw((uint16_t)(CONFIG_DATA + (off & 2)));
@@ -45,6 +74,8 @@ uint16_t pci_read16(const struct pci_dev *p, int off)
 
 void pci_write16(const struct pci_dev *p, int off, uint16_t v)
 {
+    if (out_of_reach(off))
+        return;
     spin_lock(&pci_lock);
     outl(CONFIG_ADDR, config_addr(p, off));
     outw((uint16_t)(CONFIG_DATA + (off & 2)), v);
@@ -53,6 +84,8 @@ void pci_write16(const struct pci_dev *p, int off, uint16_t v)
 
 uint8_t pci_read8(const struct pci_dev *p, int off)
 {
+    if (out_of_reach(off))
+        return (uint8_t)~0u;
     spin_lock(&pci_lock);
     outl(CONFIG_ADDR, config_addr(p, off));
     uint8_t v = inb((uint16_t)(CONFIG_DATA + (off & 3)));
@@ -62,6 +95,8 @@ uint8_t pci_read8(const struct pci_dev *p, int off)
 
 void pci_write8(const struct pci_dev *p, int off, uint8_t v)
 {
+    if (out_of_reach(off))
+        return;
     spin_lock(&pci_lock);
     outl(CONFIG_ADDR, config_addr(p, off));
     outb((uint16_t)(CONFIG_DATA + (off & 3)), v);
@@ -72,9 +107,13 @@ void pci_write8(const struct pci_dev *p, int off, uint8_t v)
 static int pci_scan(int (*match)(const struct pci_dev *p, const void *arg), const void *arg,
                     struct pci_dev *out)
 {
-    /* Is there a PCI host bridge answering mechanism #1 at all? */
+    /* Is there a PCI host bridge answering mechanism #1 at all? Under the
+     * lock: another processor's access in between would use our address. */
+    spin_lock(&pci_lock);
     outl(CONFIG_ADDR, 0x80000000u);
-    if (inl(CONFIG_ADDR) != 0x80000000u)
+    int present = inl(CONFIG_ADDR) == 0x80000000u;
+    spin_unlock(&pci_lock);
+    if (!present)
         return -1;
 
     for (int bus = 0; bus < 256; bus++) {
@@ -135,6 +174,93 @@ void pci_log_devices(void)
 {
     struct pci_dev unused;
     pci_scan(log_device, NULL, &unused);
+}
+
+/* Raw registers only: nothing is changed, and no bridge is reset, since
+ * one may also carry storage. */
+static void log_network_fn(const struct pci_dev *p)
+{
+    uint32_t id = pci_read32(p, 0x00), cls = pci_read32(p, 0x08) >> 16;
+    klog("pci-net: %02x:%02x.%u %04x:%04x class %04x command %04x\n", p->bus, p->dev, p->fn,
+         id & 0xFFFF, id >> 16, cls, pci_read16(p, PCI_COMMAND));
+    if ((pci_read8(p, PCI_HEADER_TYPE) & 0x7F) == 1) {
+        uint32_t buses = pci_read32(p, PCI_BUS_NUMBERS);
+        uint32_t mem = pci_read32(p, PCI_MEM_WINDOW), pref = pci_read32(p, PCI_PREF_WINDOW);
+        int pref64 = (pref & 0xF) == 1;
+        klog("pci-net: bridge primary %u secondary %u subordinate %u\n", buses & 0xFF,
+             (buses >> 8) & 0xFF, (buses >> 16) & 0xFF);
+        /* A window whose base is above its limit is closed. */
+        klog("pci-net: bridge memory %08x-%08x prefetchable %08x%08x-%08x%08x\n",
+             (mem & 0xFFF0) << 16, (mem & 0xFFF00000) | 0xFFFFF,
+             pref64 ? pci_read32(p, 0x28) : 0, (pref & 0xFFF0) << 16,
+             pref64 ? pci_read32(p, 0x2C) : 0, (pref & 0xFFF00000) | 0xFFFFF);
+    } else {
+        klog("pci-net: BAR0 %08x BAR1 %08x\n", pci_read32(p, PCI_BAR0), pci_read32(p, PCI_BAR1));
+    }
+    if (!(pci_read16(p, PCI_STATUS) & PCI_CAP_LIST))
+        return;
+    uint8_t cap = pci_read8(p, PCI_CAP_PTR) & 0xFC;
+    for (int n = 0; cap >= 0x40 && n < 48; n++) {
+        uint8_t kind = pci_read8(p, cap);
+        if (kind == 0xFF)
+            break;
+        if (kind == PCI_CAP_ID_PM)
+            klog("pci-net: PMCSR %04x\n", pci_read16(p, cap + PCI_PM_CTRL));
+        if (kind == PCI_CAP_ID_EXP) {
+            klog("pci-net: PCIe link control/status %08x\n", pci_read32(p, cap + 0x10));
+            /* A root or downstream port with a slot: bit 6 is presence detect. */
+            if (pci_read16(p, cap + 2) & 0x100) {
+                uint16_t slot = pci_read16(p, cap + 0x1A);
+                klog("pci-net: PCIe slot status %04x (card %s)\n", slot,
+                     slot & 0x40 ? "present" : "absent");
+            }
+        }
+        cap = pci_read8(p, cap + 1) & 0xFC;
+    }
+}
+
+static int log_network_path(const struct pci_dev *p, const void *arg)
+{
+    (void)arg;
+    uint32_t cls = pci_read32(p, 0x08) >> 16;
+    if ((cls >> 8) == 2 || cls == 0x0604)
+        log_network_fn(p);
+    return 0;
+}
+
+void pci_log_network_diagnostics(const struct pci_dev *dev)
+{
+    struct pci_dev b;
+    if (!dev) {
+        pci_scan(log_network_path, NULL, &b);
+        return;
+    }
+    log_network_fn(dev);
+    for (b = *dev; pci_parent_bridge(&b, &b) == 0;)
+        log_network_fn(&b);
+}
+
+static int bridge_to(const struct pci_dev *p, const void *arg)
+{
+    if ((pci_read8(p, PCI_HEADER_TYPE) & 0x7F) != 1)
+        return 0;
+    uint8_t secondary = (uint8_t)(pci_read32(p, PCI_BUS_NUMBERS) >> 8);
+    /* A bridge sits on a lower bus than the one behind it; insisting on
+     * that skips unconfigured bridges (all zeros) and ends every walk up. */
+    return p->bus < secondary && secondary == *(const uint8_t *)arg;
+}
+
+int pci_parent_bridge(const struct pci_dev *p, struct pci_dev *out)
+{
+    uint8_t bus = p->bus;
+    return bus ? pci_scan(bridge_to, &bus, out) : -1;
+}
+
+void pci_enable_upstream(const struct pci_dev *p, uint32_t cmd_bits)
+{
+    struct pci_dev b = *p;
+    while (pci_parent_bridge(&b, &b) == 0)
+        pci_enable(&b, cmd_bits);
 }
 
 struct nth {
@@ -213,14 +339,6 @@ void *pci_map_bar(const struct pci_dev *p, int bar)
 #define IDE_DWORDS 8
 #define ISA_DWORDS 16
 
-#define PCI_STATUS      0x06
-#define PCI_CAP_LIST    0x10            /* status: there is a capability list */
-#define PCI_CAP_PTR     0x34
-#define PCI_HEADER_TYPE 0x0E
-#define PCI_CAP_ID_PM   0x01
-#define PCI_PM_CTRL     0x04            /* PMCSR, in the capability */
-#define PCI_PM_STATE_MASK 0x0003
-
 static struct saved_fn {
     struct pci_dev d;
     int extra;                          /* dwords kept from 0x40 on */
@@ -243,6 +361,27 @@ static uint8_t find_pm_cap(const struct pci_dev *p)
         pos = pci_read8(p, pos + 1) & 0xFC;
     }
     return 0;
+}
+
+int pci_set_d0(const struct pci_dev *p)
+{
+    uint8_t pm = find_pm_cap(p);
+    if (!pm)
+        return -1;
+    uint16_t pmcsr = pci_read16(p, pm + PCI_PM_CTRL);
+    int state = pmcsr & PCI_PM_STATE_MASK;
+    if (!state)
+        return 0;
+    uint32_t cfg[16];
+    for (int i = 1; i < 16; i++)
+        cfg[i] = pci_read32(p, i * 4);
+    pci_write16(p, pm + PCI_PM_CTRL, pmcsr & ~(PCI_PM_STATE_MASK | PCI_PM_PME_STATUS));
+    udelay(10000);                      /* D3hot to D0: 10 ms before it is addressed */
+    /* Without No_Soft_Reset it comes back blank: BARs before the command register. */
+    for (int i = 15; i >= 1; i--)
+        if (pci_read32(p, i * 4) != cfg[i])
+            pci_write32(p, i * 4, cfg[i]);
+    return state;
 }
 
 static int save_fn(const struct pci_dev *p, const void *arg)

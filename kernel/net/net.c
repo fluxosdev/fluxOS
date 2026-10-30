@@ -10,6 +10,7 @@
 #include "drivers.h"
 #include "mm.h"
 #include "net.h"
+#include "pci.h"
 
 #define ARP_ENTRIES    16
 #define ARP_TTL        (300 * HZ)   /* forget a resolved address after 5 minutes */
@@ -727,9 +728,20 @@ void net_init(void)
 {
     /* One interface: a wired card if there is one, else wireless (net=wifi: wireless first). */
     int wifi_first = cmdline_has("net=wifi");
-    if ((!wifi_first || iwl_probe() < 0) && e1000e_init() < 0 && e1000_init() < 0 &&
-        forcedeth_init() < 0 && ne2000_init() < 0 && (wifi_first || iwl_probe() < 0) &&
-        wifi_sim_probe() < 0) {
+    int selected = wifi_first && iwl_probe() == 0;
+    if (!selected) {
+        selected = e1000e_init() == 0 || e1000_init() == 0 ||
+                   forcedeth_init() == 0 || ne2000_init() == 0;
+        struct pci_dev ax210;
+        if (selected && !wifi_first && pci_find_device(0x8086, 0x2725, &ax210) == 0)
+            klog("wifi: AX210 present, but wired interface %s selected; "
+                 "boot with net=wifi to use the AX210\n", netif.dev.name);
+    }
+    if (!selected && !wifi_first)
+        selected = iwl_probe() == 0;
+    if (!selected)
+        selected = wifi_sim_probe() == 0;
+    if (!selected) {
         boot_ok("Network: no network card found (loopback only)");
         return;
     }

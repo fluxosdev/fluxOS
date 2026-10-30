@@ -9,15 +9,36 @@ void iwl_mvm_fw_error(int hw) { (void)hw; errors++; iwl.dead=1; }
 void iwl_mvm_rx(const struct iwl_rx_packet *p) { (void)p; dispatched++; }
 int iwl_fw_cmd_ver(const struct iwl_fw *fw, uint8_t g, uint8_t c) { (void)fw; (void)g; (void)c; return 17; }
 static uint8_t regs[8192], descriptors[TX_COUNT*256], buffers[TX_COUNT*PAGE_SIZE], bc[TX_COUNT*2];
+static int reset_seen, master_enabled;
+void pci_enable(const struct pci_dev *p, uint32_t bits)
+{ (void)p; master_enabled |= bits; }
+void udelay(uint32_t us)
+{
+    if (us == 10000 && (iwl_read32(CSR_RESET) & 0x80)) {
+        /* Hardware reset loses ownership; normal RAM would hide this. */
+        iwl_write32(CSR_HW_IF, 0);
+        iwl_write32(0x88, 0);
+        iwl_write32(CSR_RESET, 0);
+        reset_seen++;
+    }
+}
 static void setup(void)
 {
     memset(&t,0,sizeof(t)); memset(&iwl,0,sizeof(iwl));
     memset(regs,0,sizeof(regs)); iwl.regs=regs;
     t.running=1; t.cmd.desc.p=descriptors; t.cmd.buffers.p=buffers; t.cmd.bc.p=bc;
-    errors=dispatched=0;
+    errors=dispatched=reset_seen=master_enabled=0;
 }
 int main(void)
 {
+    setup(); t.found=1; iwl_write32(CSR_GP, 1);
+    CHECK(iwl_trans_power_up()==0 && reset_seen==1);
+    CHECK(iwl_read32(CSR_HW_IF)&NIC_READY);
+    CHECK(iwl_read32(0x88)&(1u<<5));
+    CHECK(iwl_read32(CSR_GIO)&2);
+    CHECK(master_enabled&PCI_CMD_MASTER);
+    setup(); t.found=1; iwl_write32(CSR_HW_IF, ~0u);
+    CHECK(iwl_trans_power_up()==-ENODEV && !master_enabled);
     setup();
     uint8_t payload[3]={1,2,3};
     CHECK(command(1,0xd,payload,3,0)==0);
@@ -34,6 +55,20 @@ int main(void)
     p->cmd=0xd; p->group=1; p->sequence=127; p->len_n_flags=4;
     packet(p); CHECK(t.sync.done && t.cmd.read==128 && !errors);
     packet(p); CHECK(errors==1); /* duplicate completion cannot free another slot */
+    /* Slot 0 at hardware pointer 128 must retain sequence 128. Exercise
+     * both the 8-bit sequence rollover and the 16-bit hardware rollover. */
+    for (unsigned pos=127; pos<65538; pos++) {
+        setup(); t.cmd.read=t.cmd.write=(uint16_t)pos;
+        t.sync.active=1;
+        CHECK(command(1,0xd,payload,3,1)==0);
+        uint8_t *header=buffers+(pos&(TX_COUNT-1))*PAGE_SIZE;
+        CHECK(get16(header+2)==(pos&255));
+        CHECK(iwl_read32(0x460)==(uint16_t)(pos+1));
+        p->cmd=0xd; p->group=1; p->sequence=pos&255; p->len_n_flags=4;
+        packet(p);
+        CHECK(t.sync.done && !t.sync.error && !errors);
+        CHECK(t.cmd.read==t.cmd.write);
+    }
     setup();
     struct iwl_notif_wait wait; uint8_t out[2]={0};
     iwl_notif_arm(&wait,0,1,out,sizeof(out));
@@ -48,5 +83,24 @@ int main(void)
     setup(); t.tx[0].active=1; t.tx[0].id=3; t.tx[0].read=65534; t.tx[0].write=2;
     iwl_trans_reclaim(3,1); CHECK(t.tx[0].read==1 && !iwl.dead);
     iwl_trans_reclaim(3,10); CHECK(iwl.dead && t.tx[0].read==1);
+    /* Multi-buffer RX must discard the final (unflagged) continuation,
+     * including when it arrives in a later poll. */
+    setup();
+    static uint8_t used[RX_COUNT*32], rbd[RX_COUNT*16], rxbuf[PAGE_SIZE];
+    uint16_t closed=1;
+    t.used.p=used; t.rbd.p=rbd; t.status.p=(void*)&closed; t.rx[0].p=rxbuf;
+    used[4]=1; used[6]=1;
+    iwl_trans_service(); CHECK(t.rx_fragment && !errors);
+    /* Simulate write-one-to-clear CSRs between polls. */
+    iwl_write32(CSR_INT,0); iwl_write32(CSR_FH_INT,0);
+    used[32+4]=1; closed=2;
+    struct iwl_rx_packet *rxp=(void*)rxbuf;
+    /* Tail bytes can accidentally resemble a valid notification. */
+    rxp->len_n_flags=4; rxp->cmd=0x55; rxp->sequence=SEQ_RX_FRAME;
+    iwl_trans_service(); CHECK(!t.rx_fragment && !errors && !dispatched);
+    iwl_write32(CSR_INT,0); iwl_write32(CSR_FH_INT,0);
+    used[64+4]=1; closed=3;
+    rxp->len_n_flags=4; rxp->cmd=0x55; rxp->sequence=SEQ_RX_FRAME;
+    iwl_trans_service(); CHECK(dispatched==1 && !errors);
     puts("kernel-iwl-trans: all passed"); return 0;
 }

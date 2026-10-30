@@ -20,6 +20,10 @@
 #define CSR_FH_INT 0x010
 #define CSR_RESET 0x020
 #define CSR_GP 0x024
+#define CSR_GIO 0x03c
+#define CSR_HW_IF 0x000
+#define NIC_READY 0x00400000
+#define NIC_PREPARE 0x08000000
 #define NIC_REQ 8
 #define INT_ERROR ((1u << 29) | (1u << 25))
 #define FW_MAX_DMA (16u << 20)
@@ -66,7 +70,7 @@ _Static_assert(sizeof(struct scratch) == 1660, "gen3 scratch");
 
 static struct {
     struct pci_dev pci;
-    int found, powered, running, servicing;
+    int found, powered, running, servicing, rx_fragment;
     struct dma_mem ctx, scratch, info, iml, rbd, used, status;
     struct dma_mem rx[RX_COUNT], sections[3][IWL_FW_MAX_SECS];
     struct dma_mem pnvm[IWL_PNVM_MAX_CHUNKS], pnvm_map;
@@ -152,17 +156,26 @@ int iwl_trans_rfkill(void) { return !(iwl_read32(CSR_GP) & (1u << 27)); }
 int iwl_trans_probe(void)
 {
     if (t.found) return 0;
-    if (pci_find_device(0x8086, 0x2725, &t.pci) < 0) return -ENODEV;
-    /* Restore D0 and disable MSI/MSI-X before using polling. */
+    klog("iwl: probing PCI for Intel AX210 (8086:2725)\n");
+    if (pci_find_device(0x8086, 0x2725, &t.pci) < 0) {
+        klog("iwl: no 8086:2725 found; check the pci device list in dmesg\n");
+        pci_log_network_diagnostics(NULL);
+        return -ENODEV;
+    }
+    /* Wake it first: a function left in D3hot may come back with its
+     * BARs blank, and pci_set_d0 puts them back. */
+    int was = pci_set_d0(&t.pci);
+    if (was > 0)
+        klog("iwl: AX210 was in D%d, now D0\n", was);
+    klog("iwl: found 8086:2725 at %02x:%02x.%u, BAR0 %08x BAR1 %08x\n",
+         t.pci.bus, t.pci.dev, t.pci.fn,
+         pci_read32(&t.pci, PCI_BAR0), pci_read32(&t.pci, PCI_BAR1));
+    /* Disable MSI/MSI-X before using polling. */
     if (pci_read16(&t.pci, 6) & 0x10) {
         uint8_t cap = pci_read8(&t.pci, 0x34) & 0xfc;
         for (int i = 0; cap >= 0x40 && i < 48; i++) {
             uint8_t id = pci_read8(&t.pci, cap);
-            if (id == 1) {
-                uint16_t pm = pci_read16(&t.pci, cap + 4);
-                pci_write16(&t.pci, cap + 4, pm & ~0x8003);
-                udelay(10000);
-            } else if (id == 5) {
+            if (id == 5) {
                 pci_write16(&t.pci, cap + 2, pci_read16(&t.pci, cap + 2) & ~1);
             } else if (id == 0x11) {
                 pci_write16(&t.pci, cap + 2, pci_read16(&t.pci, cap + 2) & ~0x8000);
@@ -170,30 +183,70 @@ int iwl_trans_probe(void)
             cap = pci_read8(&t.pci, cap + 1) & 0xfc;
         }
     }
+    /* The root port (and any switch) must forward MMIO down and DMA up. */
+    pci_enable_upstream(&t.pci, PCI_CMD_MEM | PCI_CMD_MASTER);
     iwl.regs = pci_map_bar(&t.pci, PCI_BAR0);
-    if (!iwl.regs) return -ENODEV;
+    if (!iwl.regs) {
+        klog("iwl: cannot map AX210 BAR0 (unassigned, above 4 GiB, or MMIO mapping failed)\n");
+        pci_log_network_diagnostics(&t.pci);
+        return -ENODEV;
+    }
     pci_enable(&t.pci, PCI_CMD_MEM | 0x400); /* INTx disabled; poll CSR/RX */
     iwl_write32(CSR_MASK, 0);
     iwl.hw_rev = iwl_read32(CSR_HW_REV);
     iwl.hw_rf_id = iwl_read32(CSR_HW_RF_ID);
-    if (iwl.hw_rev == ~0u) return -ENODEV;
+    if (iwl.hw_rev == ~0u) {
+        klog("iwl: AX210 BAR mapped but register reads return ffffffff\n");
+        pci_log_network_diagnostics(&t.pci);
+        return -ENODEV;
+    }
     iwl.irq = -1;
     t.found = 1;
     klog("iwl: AX210 at %02x:%02x.%u, rev %08x RF %08x (polling)\n",
          t.pci.bus, t.pci.dev, t.pci.fn, iwl.hw_rev, iwl.hw_rf_id);
     return 0;
 }
+static int hw_ready(void)
+{
+    setbits(CSR_HW_IF, NIC_READY);
+    int r = poll(CSR_HW_IF, NIC_READY, NIC_READY, 50);
+    if (!r) setbits(0x88, 1u << 5); /* OS_ALIVE */
+    return r;
+}
+static int prepare_card(void)
+{
+    int r = hw_ready();
+    if (!r || r == -ENODEV) return r;
+    /* Match iwl_pcie_prepare_card_hw: wake the management side when
+     * NIC ownership is not immediately available. */
+    setbits(0x250, 0x80000000);
+    udelay(1000);
+    for (int attempt = 0; attempt < 10; attempt++) {
+        setbits(CSR_HW_IF, NIC_PREPARE);
+        for (int us = 0; us < 150000; us += 200) {
+            r = hw_ready();
+            if (!r || r == -ENODEV) return r;
+            udelay(200);
+        }
+        udelay(25000);
+    }
+    klog("iwl: NIC ownership timed out, HW_IF %08x\n", iwl_read32(CSR_HW_IF));
+    return r;
+}
 int iwl_trans_power_up(void)
 {
     if (!t.found) return -ENODEV;
-    setbits(0, 0x00400000); /* NIC_READY */
-    if (poll(0, 0x00400000, 0x00400000, 50000) < 0) return -EIO;
-    setbits(0x88, 1u << 5); /* OS_ALIVE */
-    iwl_write32(CSR_RESET, 0x80);
+    int r = prepare_card();
+    if (r < 0) return r;
+    setbits(CSR_RESET, 0x80);
     udelay(10000);
+    /* Software reset releases ownership; retake it before APM init. */
+    r = prepare_card();
+    if (r < 0) return r;
     setbits(0x100, 0x00800000);
     setbits(0x240, 0xffff0000);
     setbits(0, 0x00080000);
+    setbits(CSR_GIO, 2); /* L0S_DISABLED: required by iwl_pcie_apm_config */
     setbits(CSR_GP, 4); /* INIT_DONE */
     if (poll(CSR_GP, 1, 1, 25000) < 0) return -EIO;
     iwl_write32(CSR_MASK, 0);
@@ -252,7 +305,7 @@ int iwl_trans_start_fw(void)
     c->mtr = (uint32_t)t.cmd.desc.p; c->mcr = (uint32_t)t.used.p;
     c->mtr_size = 4; /* log2(128) - 3 */ c->mcr_size = 9; /* log2(512) */
     t.cmd.id = CMD_QUEUE; t.cmd.active = 1;
-    t.rx_read = 0; t.rx_write = RX_COUNT - 8;
+    t.rx_read = 0; t.rx_write = RX_COUNT - 8; t.rx_fragment = 0;
     barrier();
     iwl_write32(0x118, (uint32_t)t.ctx.p); iwl_write32(0x11c, 0);
     iwl_write32(0x120, (uint32_t)t.iml.p); iwl_write32(0x124, 0);
@@ -281,6 +334,8 @@ void iwl_trans_stop(void)
     int stopped = poll(CSR_RESET, 0x100, 0x100, 10000) == 0 || !was_running;
     pci_write16(&t.pci, PCI_COMMAND, pci_read16(&t.pci, PCI_COMMAND) & ~PCI_CMD_MASTER);
     iwl_write32(CSR_RESET, 0x80); udelay(10000);
+    /* Complete D0A -> D0U, as in iwl_pcie_gen2_apm_stop. */
+    iwl_write32(CSR_GP, iwl_read32(CSR_GP) & ~4u);
     spin_unlock(&tx_lock);
     t.powered = 0; t.waits = NULL; t.sync.active = 0;
     /* Keep DMA memory quarantined if the device never acknowledged stop. */
@@ -364,7 +419,9 @@ static int command(uint8_t group, uint8_t cmd, const void *data, uint32_t len, i
     if (len > PAGE_SIZE - 8 || (!data && len)) return -EMSGSIZE;
     struct queue *q = &t.cmd;
     if ((uint16_t)(q->write - q->read) >= TX_COUNT - 1) return -EAGAIN;
-    uint16_t seq = (CMD_QUEUE << 8) | (q->write & (TX_COUNT - 1));
+    /* The firmware sequence carries the low 8 bits of the hardware
+     * write pointer, not the index in our smaller DMA allocation. */
+    uint16_t seq = (CMD_QUEUE << 8) | (q->write & 0xff);
     uint8_t *p = q->buffers.p + (q->write & (TX_COUNT - 1)) * PAGE_SIZE;
     memset(p, 0, 8); p[0] = cmd; p[1] = group; memcpy(p + 2, &seq, 2);
     uint16_t size = len; memcpy(p + 4, &size, 2);
@@ -414,7 +471,7 @@ static void packet(const struct iwl_rx_packet *p)
         w->done = 1; matched = 1;
     }
     if (!(p->sequence & SEQ_RX_FRAME) && (p->sequence >> 8) == CMD_QUEUE) {
-        uint16_t expected = (uint16_t)(t.cmd.read & (TX_COUNT - 1));
+        uint16_t expected = t.cmd.read & 0xff;
         if ((p->sequence & 0xff) != expected || t.cmd.read == t.cmd.write) {
             iwl_mvm_fw_error(0); return;
         }
@@ -450,7 +507,10 @@ void iwl_trans_service(void)
         uint8_t *buf = t.rx[id - 1].p;
         /* Fragmented MPDUs exceed our negotiated legacy MTU. Recycle
          * the buffer without interpreting a continuation as a header. */
-        for (uint32_t off = 0; !(completion[6] & 1) && off + 8 <= PAGE_SIZE;) {
+        int fragmented = completion[6] & 1;
+        int discard = fragmented || t.rx_fragment;
+        t.rx_fragment = fragmented;
+        for (uint32_t off = 0; !discard && off + 8 <= PAGE_SIZE && !iwl.dead;) {
             uint32_t raw = get32(buf + off), n = raw & RX_LEN_MASK;
             if (raw == 0xffffffff || !raw) break;
             if (n < 4 || n > PAGE_SIZE - off - 4) { iwl_mvm_fw_error(1); break; }

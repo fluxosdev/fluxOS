@@ -477,6 +477,10 @@ static void link_down(void)
 /* Give up this attempt (or connection); try again later if still wanted. */
 static void fail(const char *why)
 {
+    /* A synchronous driver call may already have reported a fatal error.
+     * Do not turn M_OFF back into M_IDLE and retry a crashed device. */
+    if (w.state == M_OFF)
+        return;
     char ssid[WIFI_SSID_MAX + 1];
     fmt_ssid(ssid, (const uint8_t *)w.target.ssid, w.target.ssid_len);
     klog("wifi: %s: %s\n", ssid, why);
@@ -738,7 +742,7 @@ static void kwifid(void)
         w.status = WIFI_ST_FAILED;
         strlcpy(w.error, w.hw->error[0] ? w.hw->error : "the card did not start", sizeof(w.error));
         klog("wifi: %s\n", w.error);
-        return;
+        goto stopped;
     }
     klog("wifi: %s ready, firmware %s, address %02x:%02x:%02x:%02x:%02x:%02x\n", w.hw->name,
          w.hw->firmware, w.hw->mac[0], w.hw->mac[1], w.hw->mac[2], w.hw->mac[3], w.hw->mac[4],
@@ -776,10 +780,20 @@ static void kwifid(void)
                 handle_mgmt(f, len);
         }
         take_requests();
+        if (w.state == M_OFF)
+            break;
         if (w.state == M_IDLE && w.want && (int32_t)(ticks - w.retry_at) >= 0)
             connect_step(0);
+        if (w.state == M_OFF)
+            break;
         mlme_timer();
     }
+stopped:
+    /* proc_spawn_kthread enters via iret, without a C return address.
+     * Keep a failed device's worker asleep rather than returning into
+     * arbitrary stack data. A future recovery request can wake it. */
+    for (;;)
+        sleep_on(&w);
 }
 
 /* ---- registration and SYS_wifi ---- */
