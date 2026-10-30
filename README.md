@@ -296,6 +296,13 @@ says why.
   color depth and refresh rate (with a 15 s "keep this mode?" prompt on the
   3dfx and Radeon drivers), monitor type and EDID details. Settings are saved
   in GRUB's environment block on an installed system.
+- **Wireless Networks** (Settings, or the wireless icon in the tray, which is
+  crossed out while not connected): the networks in range with their signal and
+  security, Connect (asking for a WPA2 password), Disconnect, and how the
+  connection is doing. A network joined here is remembered in `/etc/wifi.conf`
+  and joined again at startup, as with `wifi connect`; Disconnect forgets it.
+  Networks that hide their name, and WPA3 or Enterprise ones, are listed but
+  cannot be joined.
 - **3D Gears**: the OpenGL demo, drawn by the Radeon, Intel or Voodoo 3D engine when
   there is one, else by the software renderer (S switches renderer, T puts a
   texture on the gears).

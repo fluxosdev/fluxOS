@@ -30,6 +30,12 @@ int power(int op, unsigned int arg);
 /* Wireless networking: op is WIFI_STATUS, WIFI_SCAN, WIFI_BSS, WIFI_CONNECT or
  * WIFI_DISCONNECT, with the struct each takes (see <flux/abi.h>). */
 int wifi(int op, void *arg);
+/* The remembered network, /etc/wifi.conf (wificonf.c). Each returns 0, or -1 with errno. */
+int wifi_conf_load(struct wifi_connect *c);
+int wifi_conf_save(const struct wifi_connect *c);
+int wifi_conf_forget(void);
+/* A WPA2 password (8-63 characters, or the key as 64 hex digits) into the key. */
+int wifi_make_psk(const char *ssid, unsigned int ssid_len, const char *pass, uint8_t psk[32]);
 
 /* Pseudo-terminal: fds[0] is the master, fds[1] the slave (a terminal). */
 int openpty(int fds[2]);

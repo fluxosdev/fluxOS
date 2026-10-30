@@ -84,6 +84,7 @@ int main(int argc, char **argv)
     datetime_init();
     sound_init();
     power_init();
+    wireless_init();
     if (setup) {
         setup_open();
         wm_flush();
@@ -178,6 +179,7 @@ int main(int argc, char **argv)
             display_tick();
             sound_tick();
             power_tick();
+            wireless_tick();
             files_tick();
             taskmgr_tick();
             diskmgr_tick();

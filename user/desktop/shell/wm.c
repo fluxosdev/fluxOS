@@ -241,6 +241,7 @@ static const struct menu_item system_items[] = {
 static const struct menu_item settings_items[] = {
     { ICON_DISPLAY, "Display Properties", display_open, NULL, 0 },
     { ICON_DATETIME, "Date and Time", datetime_open, NULL, 0 },
+    { ICON_WIFI, "Wireless Networks", wireless_open, NULL, 0 },
     { ICON_COMPUTER, "System Properties", about_open, NULL, 0 },
 };
 
@@ -466,6 +467,8 @@ static struct rect tray_rect(void)
         w += 20;                        /* the speaker */
     if (power_tray_present())
         w += 20;                        /* the battery */
+    if (wireless_tray_present())
+        w += 20;                        /* the wireless connection */
     return mkrect(screen_w - 2 - w, screen_h - TASKBAR_H + 4, w, TASKBAR_H - 8);
 }
 
@@ -482,6 +485,32 @@ static struct rect battery_icon_rect(void)
     if (sound_tray_icon() != ICON_NONE)
         r.x += 20;
     return power_tray_present() ? r : mkrect(r.x, r.y, 0, 0);
+}
+
+/* The wireless connection: after the battery, if there is one. */
+static struct rect wifi_icon_rect(void)
+{
+    struct rect r = tray_icon_rect();
+    if (sound_tray_icon() != ICON_NONE)
+        r.x += 20;
+    if (power_tray_present())
+        r.x += 20;
+    return wireless_tray_present() ? r : mkrect(r.x, r.y, 0, 0);
+}
+
+/* The wireless icon, crossed out in red while not connected. */
+static void draw_wifi_tray(void)
+{
+    if (!wireless_tray_present())
+        return;
+    struct rect r = wifi_icon_rect();
+    draw_icon(&screen, r.x, r.y, ICON_WIFI, 16);
+    if (!wireless_tray_connected()) {
+        for (int i = 0; i < 6; i++) {
+            gfx_fill(&screen, r.x + 10 + i, r.y + 10 + i, 2, 1, RGB(0xC0, 0x00, 0x00));
+            gfx_fill(&screen, r.x + 15 - i, r.y + 10 + i, 2, 1, RGB(0xC0, 0x00, 0x00));
+        }
+    }
 }
 
 #define SB_BUTTON_W 22
@@ -1377,6 +1406,7 @@ static void draw_taskbar_kinetik(void)
         struct rect br = battery_icon_rect();
         draw_icon(&screen, br.x, br.y, power_tray_icon(), 16);
     }
+    draw_wifi_tray();
     int cw = gfx_text_width(&font_sans, clock_text);
     gfx_text(&screen, &font_sans, tr.x + tr.w - 9 - cw, tr.y + (tr.h - font_sans.height) / 2, clock_text,
              theme.on_chrome);
@@ -1556,6 +1586,7 @@ static void draw_taskbar(void)
         struct rect br = battery_icon_rect();
         draw_icon(&screen, br.x, br.y, power_tray_icon(), 16);
     }
+    draw_wifi_tray();
     int cw = gfx_text_width(&font_sans, clock_text);
     gfx_text(&screen, &font_sans, tr.x + tr.w - 9 - cw, tr.y + 4, clock_text, C_BLACK);
 }
@@ -2577,6 +2608,10 @@ static void press_left(void)
         }
         if (rect_contains(battery_icon_rect(), mx, my)) {
             power_open();
+            return;
+        }
+        if (rect_contains(wifi_icon_rect(), mx, my)) {
+            wireless_open();
             return;
         }
         if (rect_contains(tray_rect(), mx, my)) {

@@ -728,7 +728,8 @@ void net_init(void)
     /* One interface: a wired card if there is one, else wireless (net=wifi: wireless first). */
     int wifi_first = cmdline_has("net=wifi");
     if ((!wifi_first || iwl_probe() < 0) && e1000e_init() < 0 && e1000_init() < 0 &&
-        forcedeth_init() < 0 && ne2000_init() < 0 && (wifi_first || iwl_probe() < 0)) {
+        forcedeth_init() < 0 && ne2000_init() < 0 && (wifi_first || iwl_probe() < 0) &&
+        wifi_sim_probe() < 0) {
         boot_ok("Network: no network card found (loopback only)");
         return;
     }

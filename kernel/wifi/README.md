@@ -35,6 +35,17 @@ Firmware crashes require a reboot. Failed DMA-stop acknowledgement retains
 buffers until reboot. This implementation must not be described as proven
 working connectivity until tested on hardware.
 
+## Trying it without a card
+
+The kernel option `wifi.sim` (used only when no real card is found)
+registers a simulated card (`wifi_sim.c`): a scan hears six networks
+(WPA2, open, WPA3-only, 5 GHz, and one hiding its name), authentication
+and association are answered, and the WPA2 ones run the access point's side
+of the 4-way handshake with the password `correct horse`, so a wrong
+password fails as it would. No DHCP server answers. It exercises `wifi.c`,
+`wpa.c`, the `wifi` command and the desktop's Wireless Networks under QEMU;
+it says nothing about the AX210.
+
 ## Verification
 
 Run from the repository root:

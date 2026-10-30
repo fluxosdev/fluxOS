@@ -106,6 +106,7 @@ enum icon_id {
     ICON_DATETIME,
     ICON_ARCHIVE,
     ICON_PAINT,
+    ICON_WIFI,
     /* the battery in the tray: its charge, on battery and charging */
     ICON_BATTERY_CAUTION,
     ICON_BATTERY_LOW,
@@ -363,6 +364,13 @@ void power_battery_text(char *out, size_t size);
 const struct powerinfo *power_info(void);       /* NULL if the kernel did not answer */
 void system_sleep(void);                /* suspend to RAM, and back */
 void power_open(void);                  /* the Power dialog (apps.c) */
+
+/* Wireless Networks (wireless.c): joining networks, and the wireless icon in the tray. */
+void wireless_init(void);
+void wireless_tick(void);               /* once a second */
+void wireless_open(void);
+int wireless_tray_present(void);        /* there is a wireless card */
+int wireless_tray_connected(void);
 void power_dialog_tick(void);           /* the information changed */
 void display_tick(void);                /* once a second */
 struct window *taskmgr_open(void);      /* Task Manager: applications, processes, performance */
@@ -404,6 +412,9 @@ void ask_text(const char *title, const char *label, const char *initial,
  * neither, if a prompt is already open. */
 int ask_text_cancel(const char *title, const char *label, const char *initial,
                     void (*done)(void *ctx, const char *text), void (*cancel)(void *ctx), void *ctx);
+/* ask_text_cancel for a password: the field shows asterisks, and the text is wiped after done. */
+int ask_password(const char *title, const char *label,
+                 void (*done)(void *ctx, const char *text), void (*cancel)(void *ctx), void *ctx);
 
 void about_open(void);
 void about_tick(void);

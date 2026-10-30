@@ -35,6 +35,7 @@ ICONS = {
     "battery-charging-caution": None, "battery-charging-low": None,
     "battery-charging-040": None, "battery-charging-060": None,
     "battery-charging-080": None, "battery-charging": None, "battery-missing": None,
+    "network-wireless": None,
 }
 SIZES = (16, 32, 48)
 OUT = "rootfs/usr/share/icons/oxygen"

@@ -14,7 +14,6 @@
  */
 #include <errno.h>
 #include <flux.h>
-#include <flux/sha1.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -158,81 +157,13 @@ static void read_password(char *buf, size_t size)
     }
 }
 
-static int hexval(int c)
-{
-    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
-         : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
-}
-
-/* A passphrase of 8-63 characters, or the key itself as 64 hex digits. */
-static int make_psk(const char *ssid, const char *pass, uint8_t psk[32])
-{
-    size_t len = strlen(pass);
-    if (len == 64) {
-        for (int i = 0; i < 32; i++) {
-            int hi = hexval(pass[2 * i]), lo = hexval(pass[2 * i + 1]);
-            if (hi < 0 || lo < 0)
-                goto passphrase;
-            psk[i] = (uint8_t)(hi << 4 | lo);
-        }
-        return 0;
-    }
-passphrase:
-    if (len < 8 || len > 63) {
-        fprintf(stderr, "wifi: a WPA2 password has 8 to 63 characters\n");
-        return -1;
-    }
-    pbkdf2_sha1(pass, len, (const uint8_t *)ssid, strlen(ssid), 4096, psk, 32);
-    return 0;
-}
-
-static int save_conf(const struct wifi_connect *c)
-{
-    FILE *f = fopen(CONF, "w");
-    if (!f)
-        return -1;
-    fprintf(f, "# The wireless network to join at startup (wifi connect / wifi forget).\n");
-    fprintf(f, "ssid=%.*s\n", c->ssid_len, c->ssid);
-    if (c->has_psk) {
-        fprintf(f, "psk=");
-        for (int i = 0; i < 32; i++)
-            fprintf(f, "%02x", c->psk[i]);
-        fprintf(f, "\n");
-    }
-    return fclose(f);
-}
-
-static int load_conf(struct wifi_connect *c)
-{
-    FILE *f = fopen(CONF, "r");
-    if (!f)
-        return -1;
-    memset(c, 0, sizeof(*c));
-    char line[160];
-    while (fgets(line, sizeof(line), f)) {
-        line[strcspn(line, "\r\n")] = 0;
-        if (!strncmp(line, "ssid=", 5)) {
-            size_t n = strlen(line + 5);
-            if (n > sizeof(c->ssid))
-                n = sizeof(c->ssid);
-            memcpy(c->ssid, line + 5, n);
-            c->ssid_len = (uint8_t)n;
-        } else if (!strncmp(line, "psk=", 4) && strlen(line + 4) == 64) {
-            for (int i = 0; i < 32; i++)
-                c->psk[i] = (uint8_t)(hexval(line[4 + 2 * i]) << 4 | hexval(line[5 + 2 * i]));
-            c->has_psk = 1;
-        }
-    }
-    fclose(f);
-    return c->ssid_len ? 0 : -1;
-}
-
-/* Follow a connection attempt until it succeeds or fails. */
+/* Follow a connection attempt until it succeeds, or the kernel gives up on it. */
 static int wait_connected(void)
 {
     struct wifi_status st;
-    int saw_attempt = 0;
-    for (int i = 0; i < 300; i++) {     /* 30 seconds */
+    char shown[sizeof(st.error)] = "";
+    int started = 0;
+    for (int i = 0; i < 600; i++) {     /* 60 seconds */
         msleep(100);
         if (wifi(WIFI_STATUS, &st) < 0)
             return 1;
@@ -241,14 +172,15 @@ static int wait_connected(void)
             return 0;
         }
         if (st.state == WIFI_ST_CONNECTING || st.state == WIFI_ST_STARTING)
-            saw_attempt = 1;
-        if (saw_attempt && st.error[0] && st.state != WIFI_ST_CONNECTED) {
+            started = 1;                /* the kernel has taken the request */
+        if (!started)
+            continue;
+        if (st.error[0] && strcmp(st.error, shown)) {
+            snprintf(shown, sizeof(shown), "%s", st.error);
             fprintf(stderr, "wifi: %s\n", st.error);
-            if (st.state == WIFI_ST_IDLE)
-                return 1;               /* given up */
-            saw_attempt = 0;            /* report each new failure once */
-            printf("Trying again...\n");
         }
+        if (st.state == WIFI_ST_IDLE)
+            return 1;                   /* it gave up */
     }
     fprintf(stderr, "wifi: not connected yet; it keeps trying in the background ('wifi' shows how it goes)\n");
     return 1;
@@ -289,8 +221,10 @@ static int connect_cmd(int argc, char **argv)
         }
     }
     if (pass && pass[0]) {
-        if (make_psk(ssid, pass, c.psk) < 0)
+        if (wifi_make_psk(ssid, strlen(ssid), pass, c.psk) < 0) {
+            fprintf(stderr, "wifi: a WPA2 password has 8 to 63 characters\n");
             return 2;
+        }
         c.has_psk = 1;
     }
     memset(buf, 0, sizeof(buf));
@@ -300,7 +234,7 @@ static int connect_cmd(int argc, char **argv)
     }
     printf("Connecting to %s...\n", ssid);
     int r = wait_connected();
-    if (r == 0 && save && save_conf(&c) < 0)
+    if (r == 0 && save && wifi_conf_save(&c) < 0)
         fprintf(stderr, "wifi: could not save %s: %s\n", CONF, strerror(errno));
     return r;
 }
@@ -319,7 +253,7 @@ int main(int argc, char **argv)
             perror("wifi");
             return 1;
         }
-        if (!strcmp(cmd, "forget") && unlink(CONF) < 0 && errno != ENOENT) {
+        if (!strcmp(cmd, "forget") && wifi_conf_forget() < 0) {
             fprintf(stderr, "wifi: %s: %s\n", CONF, strerror(errno));
             return 1;
         }
@@ -328,7 +262,7 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "auto")) {
         struct wifi_connect c;
         struct wifi_status st;
-        if (load_conf(&c) < 0 || wifi(WIFI_STATUS, &st) < 0 || st.state == WIFI_ST_NONE)
+        if (wifi_conf_load(&c) < 0 || wifi(WIFI_STATUS, &st) < 0 || st.state == WIFI_ST_NONE)
             return 0;                   /* nothing remembered, or no card: nothing to do */
         return wifi(WIFI_CONNECT, &c) < 0;
     }

@@ -35,6 +35,7 @@ struct dialog {
     int default_id, cancel_id;
     char edit[128];
     int edit_len, edit_cur;
+    int masked;                 /* the edit field shows asterisks (a password) */
     void (*command)(struct dialog *d, int id);
     struct dialog **self;       /* cleared when the dialog closes */
     /* message boxes and prompts: what to call when the user agrees */
@@ -99,7 +100,14 @@ static void paint(struct dialog *d)
             draw_radio(s, c->r.x, c->r.y, c->text, c->id == d->radio, focused);
             break;
         case CT_EDIT:
-            draw_text_field(s, c->r, d->edit, d->edit_cur, focused);
+            if (d->masked) {
+                char stars[sizeof(d->edit)];
+                memset(stars, '*', (size_t)d->edit_len);
+                stars[d->edit_len] = 0;
+                draw_text_field(s, c->r, stars, d->edit_cur, focused);
+            } else {
+                draw_text_field(s, c->r, d->edit, d->edit_cur, focused);
+            }
             break;
         }
     }
@@ -312,6 +320,7 @@ static void ask_command(struct dialog *d, int id)
     void *ctx = d->ctx;
     char text[sizeof(d->edit)];
     snprintf(text, sizeof(text), "%s", d->edit);
+    memset(d->edit, 0, sizeof(d->edit));    /* it may be a password */
     close_dialog(d);                    /* frees d */
     if (id == ID_YES && on_yes)
         on_yes(ctx);
@@ -321,6 +330,7 @@ static void ask_command(struct dialog *d, int id)
         on_text(ctx, text);
     else if (on_cancel && (id == ID_CANCEL || id == ID_OK))
         on_cancel(ctx);
+    memset(text, 0, sizeof(text));
 }
 
 #define MSG_TEXT_W    420               /* message text wraps at this width */
@@ -490,6 +500,16 @@ void ask_text(const char *title, const char *label, const char *initial,
               void (*done)(void *ctx, const char *text), void *ctx)
 {
     ask_text_cancel(title, label, initial, done, NULL, ctx);
+}
+
+int ask_password(const char *title, const char *label,
+                 void (*done)(void *ctx, const char *text), void (*cancel)(void *ctx), void *ctx)
+{
+    if (!ask_text_cancel(title, label, "", done, cancel, ctx))
+        return 0;
+    ask_dlg->masked = 1;
+    paint(ask_dlg);
+    return 1;
 }
 
 /* ---- System Properties ---- */

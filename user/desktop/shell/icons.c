@@ -298,6 +298,7 @@ static const char *const icon_names[ICON_COUNT] = {
     [ICON_MINES] = "edit-bomb",
     [ICON_CLOCK] = "clock",
     [ICON_DATETIME] = "preferences-system-time",
+    [ICON_WIFI] = "network-wireless",
     [ICON_BATTERY_CAUTION] = "battery-caution",
     [ICON_BATTERY_LOW] = "battery-low",
     [ICON_BATTERY_40] = "battery-040",
