@@ -29,7 +29,7 @@ void jsworkers_http_done(struct jsworkers *ws, int id, int status, const char *h
                          const char *body, int blen);
 void jsworkers_module_fetched(struct jsworkers *ws, int id, const char *text, int len);
 
-/* "desktop --js-worker url type name": a worker's process (type "classic" or "module"). */
+/* "wave --js-worker url type name": a worker's process (type "classic" or "module"). */
 int jsworker_main(int argc, char **argv);
 
 #endif

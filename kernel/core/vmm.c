@@ -251,6 +251,33 @@ int vmm_protect_page(uint32_t *pd, uint32_t va, uint32_t prot)
     return 0;
 }
 
+void vmm_zero_frame(uint32_t phys)
+{
+    zero_page(phys);
+}
+
+/* Map an ordinary frame at va, shared across fork (a shared memory segment's). The caller has
+ * taken the reference the mapping holds, which unmapping gives back. */
+int vmm_map_frame(uint32_t *pd, uint32_t va, uint32_t frame, uint32_t prot)
+{
+    va = ALIGN_DOWN(va, PAGE_SIZE);
+    if (va < USER_BASE || va >= USER_TOP)
+        return -EFAULT;
+    uint32_t *pte = get_pte(pd, va, 1);
+    if (!pte)
+        return -ENOMEM;
+    if (*pte & PTE_PRESENT)
+        return -EBUSY;
+    uint32_t bits = PTE_PRESENT | PTE_SHARED;
+    if (prot != PROT_NONE)
+        bits |= PTE_USER;
+    if (prot & PROT_WRITE)
+        bits |= PTE_WRITE;
+    *pte = frame | bits;
+    flush_page(pd, va);
+    return 0;
+}
+
 /* Map [phys, phys + size) into a user address space as device memory. */
 int vmm_map_phys(uint32_t *pd, uint32_t va, uint32_t phys, uint32_t size, uint32_t flags)
 {

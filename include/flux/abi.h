@@ -334,6 +334,22 @@ struct flux_mmap_args {
     uint32_t offset;
 };
 
+/* ---- shared memory segments (SYS_shmget, SYS_shmat, SYS_shmctl), System V style ---- */
+#ifndef IPC_PRIVATE
+#define IPC_PRIVATE 0               /* a key no other shmget finds */
+#define IPC_CREAT   01000
+#define IPC_EXCL    02000
+#define IPC_RMID    0               /* the id goes; the memory lasts while it is mapped */
+#define IPC_SET     1
+#define IPC_STAT    2
+#endif
+
+struct flux_shmid_ds {
+    uint32_t shm_segsz;         /* bytes */
+    int32_t  shm_cpid;          /* the creator, whose exit removes the segment */
+    uint32_t shm_nattch;        /* not kept: 0 */
+};
+
 /* ---- Win32 programs (winrun) ----
  * A Windows program keeps its own addresses: it runs through code and
  * data segments whose base is the start of user space, so its address 0
@@ -862,7 +878,7 @@ struct pollfd {
 
 /* ---- sockets (IPv4 only) ---- */
 #define AF_UNSPEC 0
-#define AF_UNIX 1                   /* not provided: socket() fails with EAFNOSUPPORT */
+#define AF_UNIX 1                   /* SOCK_STREAM only, named in a namespace of the kernel's own */
 #define AF_LOCAL AF_UNIX
 #define AF_INET 2
 #define AF_INET6 10                 /* not provided either */

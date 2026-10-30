@@ -776,6 +776,7 @@ void do_exit(int status)
     tty_drop(g->ctty);
     g->ctty = NULL;
     fb_proc_exit(g->pid);
+    shm_proc_exit(g->pid);
     fpu_release(p);
     free_paths(p);
     g->it_real_at = g->it_virt_left = g->it_prof_left = 0;
@@ -1705,8 +1706,10 @@ static int mmap_locked(struct proc *p, const struct flux_mmap_args *a, uint32_t 
         return -ENOMEM;
 
     /* Shared anonymous mappings and small private mappings are faulted in
-     * immediately so fork shares MAP_SHARED frames before either side writes. */
-    if (shared || !(a->flags & MAP_ANONYMOUS) || (len <= 64 * 1024 && a->prot != PROT_NONE)) {
+     * immediately so fork shares MAP_SHARED frames before either side writes.
+     * (proc_map_frames puts in frames of its own.) */
+    if (!(a->flags & MAP_KFRAMES) &&
+        (shared || !(a->flags & MAP_ANONYMOUS) || (len <= 64 * 1024 && a->prot != PROT_NONE))) {
         uint32_t init_prot = !(a->flags & MAP_ANONYMOUS) ? (a->prot | PROT_WRITE) : a->prot;
         for (uint32_t va = start; va < start + len; va += PAGE_SIZE) {
             if (vmm_alloc_prot(p->pd, va, init_prot, a->flags) < 0) {
@@ -1765,6 +1768,32 @@ int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint32_t *out)
 {
     int locked = mm_enter(p);
     int r = mmap_locked(p, a, out);
+    mm_leave(p, locked);
+    return r;
+}
+
+/* Map npages frames, read-write and shared, where there is room. Each frame comes with the reference
+ * its mapping is to hold; on failure none is taken and the references are the caller's still. */
+int proc_map_frames(struct proc *p, const uint32_t *frames, uint32_t npages, uint32_t *out)
+{
+    struct flux_mmap_args a = {
+        .len = npages * PAGE_SIZE, .prot = PROT_READ | PROT_WRITE,
+        .flags = MAP_SHARED | MAP_ANONYMOUS | MAP_KFRAMES, .fd = -1,
+    };
+    if (!npages || npages > (USER_MMIO_BASE - USER_BASE) / PAGE_SIZE)
+        return -EINVAL;
+    int locked = mm_enter(p);
+    int r = mmap_locked(p, &a, out);
+    for (uint32_t i = 0; r == 0 && i < npages; i++) {
+        if (vmm_map_frame(p->pd, *out + i * PAGE_SIZE, frames[i], a.prot) < 0) {
+            /* Give back the references of the pages mapped so far by taking new ones for them:
+             * unmapping drops what the mappings hold, and the caller still has its own. */
+            for (uint32_t j = 0; j < i; j++)
+                pmm_ref(frames[j]);
+            munmap_locked(p, *out, a.len);
+            r = -ENOMEM;
+        }
+    }
     mm_leave(p, locked);
     return r;
 }

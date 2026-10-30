@@ -17,6 +17,7 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
+#include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
@@ -606,7 +607,7 @@ static void give_addr(const struct sockaddr_in *sin, struct sockaddr *addr, sock
 
 int accept(int fd, struct sockaddr *addr, socklen_t *len)
 {
-    struct sockaddr_in sin;
+    struct sockaddr_in sin = { 0 };     /* an AF_UNIX peer has no address for the kernel to fill */
     int r = ret(sc2(SYS_accept, fd, (int)&sin));
     if (r >= 0)
         give_addr(&sin, addr, len);
@@ -650,3 +651,88 @@ int getpeername(int fd, struct sockaddr *addr, socklen_t *len) { return sockname
 
 int netinfo(struct netinfo *ni) { return ret(sc1(SYS_netinfo, (int)ni)); }
 int netconf(const struct netinfo *ni) { return ret(sc1(SYS_netconf, (int)ni)); }
+
+/* ---- shared memory ---- */
+
+int shmget(key_t key, size_t size, int flags)
+{
+    return ret(sc3(SYS_shmget, key, (int)size, flags));
+}
+
+/* Where each segment is mapped and how long it is, for shmdt (fork copies the table with the
+ * mappings). A spin lock: threads attaching at once are rare and quick. */
+#define SHM_ATTACH_MAX 256
+static struct {
+    void *addr;
+    size_t size;
+} shm_attached[SHM_ATTACH_MAX];
+static int shm_table_lock;
+
+static void shm_lock_table(void)
+{
+    while (__atomic_exchange_n(&shm_table_lock, 1, __ATOMIC_ACQUIRE))
+        sc0(SYS_yield);
+}
+
+static void shm_unlock_table(void)
+{
+    __atomic_store_n(&shm_table_lock, 0, __ATOMIC_RELEASE);
+}
+
+void *shmat(int id, const void *addr, int flags)
+{
+    (void)flags;
+    if (addr) {
+        errno = EINVAL;
+        return (void *)-1;
+    }
+    shm_lock_table();
+    int slot = -1;
+    for (int i = 0; i < SHM_ATTACH_MAX && slot < 0; i++)
+        if (!shm_attached[i].addr)
+            slot = i;
+    if (slot < 0) {
+        shm_unlock_table();
+        errno = EMFILE;
+        return (void *)-1;
+    }
+    uint32_t size = 0;
+    int r = sc2(SYS_shmat, id, (int)&size);
+    if ((unsigned int)r >= (unsigned int)-4095) {
+        shm_unlock_table();
+        errno = -r;
+        return (void *)-1;
+    }
+    shm_attached[slot].addr = (void *)r;
+    shm_attached[slot].size = size;
+    shm_unlock_table();
+    return (void *)r;
+}
+
+int shmdt(const void *addr)
+{
+    shm_lock_table();
+    for (int i = 0; i < SHM_ATTACH_MAX; i++) {
+        if (addr && shm_attached[i].addr == addr) {
+            size_t size = shm_attached[i].size;
+            shm_attached[i].addr = NULL;
+            shm_unlock_table();
+            return munmap((void *)addr, size);
+        }
+    }
+    shm_unlock_table();
+    errno = EINVAL;
+    return -1;
+}
+
+int shmctl(int id, int cmd, struct shmid_ds *buf)
+{
+    struct flux_shmid_ds ds;
+    int r = ret(sc3(SYS_shmctl, id, cmd, (int)&ds));
+    if (r == 0 && cmd == IPC_STAT && buf) {
+        buf->shm_segsz = ds.shm_segsz;
+        buf->shm_cpid = ds.shm_cpid;
+        buf->shm_nattch = ds.shm_nattch;
+    }
+    return r;
+}

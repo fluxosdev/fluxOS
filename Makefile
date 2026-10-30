@@ -139,27 +139,60 @@ LIBGL     := $(BUILD)/libGL.a
 
 PROGS     := $(basename $(notdir $(wildcard user/bin/*.c)))
 FSH_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/fsh/*.c)))
-DESKTOP_DIRS := user/desktop/apps user/desktop/image user/desktop/shell user/desktop/wave user/desktop/wave/js
+DESKTOP_DIRS := user/desktop/apps user/desktop/image user/desktop/shell user/desktop/wave user/desktop/wave/js \
+                user/desktop/progs
 DESKTOP_INC  := $(addprefix -I,$(DESKTOP_DIRS))
 DESKTOP_SRCS := $(foreach d,$(DESKTOP_DIRS),$(wildcard $(d)/*.c))
 DESKTOP_HDRS := $(foreach d,$(DESKTOP_DIRS),$(wildcard $(d)/*.h))
 DESKTOP_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(DESKTOP_SRCS)))
 $(DESKTOP_OBJS): USER_CFLAGS += $(DESKTOP_INC)
+desktop_objs = $(patsubst %,$(BUILD)/u/user/desktop/%.o,$(basename $(1)))
+# What the desktop and every program share: drawing, pictures, icons, dialogs, the theme, starting
+# programs, the window protocol's plumbing. A program takes from it only what it uses.
+# (SVG pictures are drawn with Wave's HTML, CSS and font code.)
+LIBDESKTOP_SRCS := $(wildcard user/desktop/image/*.c) $(filter-out %/browser.c,$(wildcard user/desktop/wave/*.c)) \
+                   $(addprefix user/desktop/shell/,gfx.c font_archivo.c font_sans.c icons.c widgets.c theme.c \
+                     wallpaint.c grubenv.c imagejobs.c apps.c launch.c loop.c wmconn.c mousecfg.c)
+LIBDESKTOP := $(BUILD)/libdesktop.a
+# The desktop process: the window manager, the taskbar, its folder, its dialogs, and setup's screen.
+DESKTOP_SHELL_OBJS := $(call desktop_objs,$(addprefix shell/,main.c wm.c server.c sidebar.c wallpaper.c \
+                        screensaver.c power.c sound.c sysdlg.c clock.c setup.c wifitray.c) apps/files.c)
+# The programs, each /bin/NAME: progs/NAME.c, the program's own sources, and client.c for its windows.
+DESKTOP_PROGS := wave terminal files editor calculator player archiver paint gears minesweeper taskmgr \
+                 diskmgr display mouse datetime wireless imageview
+PROG_SRCS_wave        := $(patsubst user/desktop/%,%,$(wildcard user/desktop/wave/*.c user/desktop/wave/js/*.c))
+PROG_SRCS_terminal    := apps/term.c
+PROG_SRCS_files       := apps/files.c
+PROG_SRCS_editor      := apps/edit.c
+PROG_SRCS_calculator  := apps/calc.c
+PROG_SRCS_player      := apps/player.c
+PROG_SRCS_archiver    := apps/archiver.c
+PROG_SRCS_paint       := apps/paint.c
+PROG_SRCS_gears       := apps/gears.c
+PROG_SRCS_minesweeper := apps/mines.c
+PROG_SRCS_taskmgr     := apps/taskmgr.c
+PROG_SRCS_diskmgr     := apps/diskmgr.c
+PROG_SRCS_display     := apps/display.c
+PROG_SRCS_mouse       := apps/mouse.c
+PROG_SRCS_datetime    := apps/datetime.c
+PROG_SRCS_wireless    := apps/wireless.c
+PROG_SRCS_imageview   := apps/imageview.c
 DOS_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/dos/*.c)))
 # winrun, the Windows program loader (os_linux.c is its Linux back end, for host tests)
 WIN32_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(filter-out user/win32/os_linux.c,$(wildcard user/win32/*.c user/win32/*.S))))
 BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/fsh $(ROOTFS)/bin/desktop \
+             $(addprefix $(ROOTFS)/bin/,$(DESKTOP_PROGS)) \
              $(ROOTFS)/bin/dos $(ROOTFS)/bin/winrun $(ROOTFS)/bin/[ $(ROOTFS)/bin/gunzip $(ROOTFS)/bin/zcat
 
 ROOTFS_FILES := $(shell find rootfs -type f 2>/dev/null)
 SETUPFS_FILES := $(shell find setupfs -type f 2>/dev/null)
 
 # The install CD's setup system, the one GRUB loads into memory: fluxOS
-# Setup (the desktop and fluxinstall), its icons, and a few tools for the
-# command prompt Shift+F10 opens. Small, so that it fits the kernel heap of
+# Setup (the desktop and fluxinstall), its icons, the terminal and Disk
+# Manager it opens, and a few tools for the command prompt Shift+F10 opens. Small, so that it fits the kernel heap of
 # a machine with little memory; the system it installs is $(SYSTEM), which
 # fluxinstall reads from the CD.
-SETUP_BINS := init desktop fluxinstall mkfs.fat mkfs.ext2 fsh cat ls lsblk mount umount df dmesg \
+SETUP_BINS := init desktop terminal diskmgr fluxinstall mkfs.fat mkfs.ext2 fsh cat ls lsblk mount umount df dmesg \
               ps free uname clear more mkdir rm cp mv sync reboot poweroff halt
 
 .PHONY: all iso kernel system setup disk floppy run run-kernel run-disk run-q35 run-usb run-nvme check clean
@@ -215,9 +248,22 @@ $(ROOTFS)/bin/fsh: $(CRT0) $(FSH_OBJS) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(FSH_OBJS) $(LIBC)
 
-$(ROOTFS)/bin/desktop: $(CRT0) $(DESKTOP_OBJS) $(LIBGL) $(LIBFONT) $(LIBC) user/user.ld
+$(LIBDESKTOP): $(call desktop_objs,$(patsubst user/desktop/%,%,$(LIBDESKTOP_SRCS))) Makefile
+	@rm -f $@
+	$(AR) rcs $@ $(filter %.o,$^)
+
+$(ROOTFS)/bin/desktop: $(CRT0) $(DESKTOP_SHELL_OBJS) $(LIBDESKTOP) $(LIBFONT) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
-	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(DESKTOP_OBJS) $(LIBGL) $(LIBFONT) $(LIBC)
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(DESKTOP_SHELL_OBJS) $(LIBDESKTOP) $(LIBFONT) $(LIBC)
+
+define DESKTOP_PROG_RULE
+$(ROOTFS)/bin/$(1): $(CRT0) $(call desktop_objs,progs/$(1).c $(PROG_SRCS_$(1)) shell/client.c) $(LIBDESKTOP) $(LIBGL) \
+                    $(LIBFONT) $(LIBC) user/user.ld
+	@mkdir -p $$(dir $$@)
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $$@ $(CRT0) \
+		$(call desktop_objs,progs/$(1).c $(PROG_SRCS_$(1)) shell/client.c) $(LIBDESKTOP) $(LIBGL) $(LIBFONT) $(LIBC)
+endef
+$(foreach p,$(DESKTOP_PROGS),$(eval $(call DESKTOP_PROG_RULE,$(p))))
 
 $(ROOTFS)/bin/dos: $(CRT0) $(DOS_OBJS) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
@@ -712,7 +758,7 @@ $(BUILD)/tests/browser-images: tests/browser-images.c user/desktop/image/gif.c u
 test-desktop-mouse: $(BUILD)/tests/desktop-mouse
 	$<
 
-$(BUILD)/tests/desktop-mouse: tests/desktop-mouse.c user/desktop/apps/mouse.c $(DESKTOP_HDRS)
+$(BUILD)/tests/desktop-mouse: tests/desktop-mouse.c user/desktop/apps/mouse.c user/desktop/shell/mousecfg.c $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O2 -g -Wall -Wextra -ffunction-sections -fdata-sections $(DESKTOP_INC) -Iinclude $< -Wl,--gc-sections -o $@
 
@@ -744,7 +790,7 @@ $(BUILD)/tests/browser-drag: tests/browser-drag.c $(BROWSER_TEST_SRCS) $(DESKTOP
 	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DIDB_DIR='"$(CURDIR)/$(BUILD)/tests/idb/"' -DJS_VM_VERIFY -pthread $(DESKTOP_INC) -Iinclude -idirafter user/include \
 		tests/browser-drag.c $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS)) -lm -o $@
 
-# Workers are processes: the page side runs in browser-worker, each worker in jsworker (its "desktop --js-worker").
+# Workers are processes: the page side runs in browser-worker, each worker in jsworker (its "wave --js-worker").
 WORKER_TEST_SRCS := $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS))
 $(BUILD)/tests/jsworker: tests/jsworker-host.c $(WORKER_TEST_SRCS) $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)

@@ -1,14 +1,23 @@
 /*
- * The fluxOS desktop: a Windows 95 style window manager and compositor.
+ * The fluxOS desktop: a Windows 95 style window manager and compositor,
+ * and the programs that open windows on it.
  *
  * The whole screen is composed in a back buffer and copied to the
  * framebuffer in damaged rectangles. Windows keep their client area in
  * their own surface, which apps (terminals, dialogs) draw into and then
  * report as damaged.
+ *
+ * The desktop (/bin/desktop) is one process: the window manager, the
+ * taskbar, its folder on the wallpaper and its own dialogs. Every program
+ * (Wave, the terminal, the File Manager...) is a process of its own,
+ * /bin/NAME, whose windows the desktop shows (client.c, server.c). Both
+ * sides use the calls below; a program's wm_* calls are carried out by
+ * the desktop.
  */
 #ifndef DESKTOP_H
 #define DESKTOP_H
 
+#include <stddef.h>
 #include <flux/abi.h>
 #include "gfx.h"
 
@@ -40,6 +49,9 @@ extern const color_t accent_swatches[ACCENTS];
 
 /* The look in use, at startup: the saved one (fluxos_theme in grubenv), or Kinetik. */
 void theme_init(void);
+/* Take on a look: the values only (theme_set is what changes it for everyone). */
+void theme_apply(int style, int accent);
+void theme_save(void);                  /* the look in use, for the next start */
 /* Change it: everything is drawn again (and kept for the next start, if save). */
 void theme_set(int style, int accent, int save);
 /* How a style and color would look, drawn into r of s (with the Kinetik wallpaper behind, or the plain desktop). */
@@ -173,6 +185,8 @@ enum cursor_kind {
     CUR_HAND, CUR_IBEAM, CUR_BUSY, CUR_CROSS, CUR_MOVE4, CUR_NO, CUR_HELP, CUR_HIDDEN,
 };
 
+struct wm_link;                 /* a program's window, as the desktop or the program keeps it */
+
 struct window {
     struct rect r;              /* outer frame, screen coordinates */
     char title[64];
@@ -186,8 +200,10 @@ struct window {
     struct window *above;       /* z-order, bottom to top */
     int maximized;
     struct rect restore;        /* where the frame was before it was maximized */
-    int min_w, min_h;           /* smallest client area when resizing */
+    int min_w, min_h;           /* smallest client area when resizing (wm_set_min_size) */
     enum cursor_kind cursor;    /* the pointer over the client area (wm_set_cursor) */
+    uint32_t handle;            /* the desktop's number for it (wm_list_windows) */
+    struct wm_link *link;       /* in the desktop: the program it belongs to (NULL: its own) */
 };
 
 /* ---- screen and compositor (wm.c) ---- */
@@ -211,6 +227,10 @@ void wm_cascade(struct window *w);
 void wm_focus(struct window *w);
 struct window *wm_focused(void);
 void wm_set_title(struct window *w, const char *title);
+void wm_set_icon(struct window *w, enum icon_id icon);
+/* A picture for the caption and taskbar instead of the icon (a page's favicon, at most 32 x 32),
+ * copied; NULL goes back to the icon. */
+void wm_set_icon_image(struct window *w, const struct image *img);
 void wm_set_min_size(struct window *w, int client_w, int client_h);
 /* The pointer to show while it is over the window's client area (a page's cursor property). */
 void wm_set_cursor(struct window *w, enum cursor_kind kind);
@@ -231,15 +251,39 @@ int wm_window_count(void);
 struct window *wm_nth(int i);           /* the i-th window from the bottom of the stack, or NULL */
 void wm_close(struct window *w);        /* as the close button does */
 
+/* Every window on the desktop, whichever program it is: Task Manager's Applications. */
+struct wm_window_info {
+    uint32_t handle;
+    int pid;                            /* the program's process */
+    enum icon_id icon;
+    int flags, minimized, focused;
+    char title[64];
+};
+int wm_list_windows(struct wm_window_info *out, int max);
+void wm_focus_handle(uint32_t handle);
+void wm_close_handle(uint32_t handle);  /* as its close button does */
+int wm_desktop_pid(void);               /* the desktop's process */
+
 /* The space windows are placed in: left of the sidebar, above the taskbar. */
 int wm_work_right(void);
+int wm_work_bottom(void);
 /* The sidebar came or went: maximized windows refit, everything is drawn again. */
 void wm_work_changed(void);
 /* The wallpaper changed: the desktop window paints it again, everything is drawn again. */
 void wm_wallpaper_changed(void);
+
+/* ---- starting programs (launch.c) ----
+ * Each program is /bin/NAME, a process of its own, adopted by init. */
+int launch(const char *prog, const char *const *args);  /* args NULL-terminated, or NULL */
+int launch1(const char *prog, const char *arg);         /* one argument, or none for NULL */
+int launch_in(const char *dir, const char *prog, const char *const *args);  /* started in dir */
+/* A terminal window running argv (NULL: the shell) in dir (NULL: home), held open after it ends if hold. */
+int launch_terminal(const char *dir, const char *title, const char *const *argv, int hold);
 /* Start an app by the name shortcuts give it ("wave", "terminal", ...): -1 if there is none. */
-int wm_launch(const char *app);
-enum icon_id wm_app_icon(const char *app);  /* its icon, or ICON_NONE */
+int app_launch(const char *app);
+enum icon_id app_icon(const char *app);     /* its icon, or ICON_NONE */
+/* One of the desktop's own windows: "run", "system" (System Properties) or "shutdown". */
+void shell_open(const char *what);
 
 /* A pop-up menu at (x, y), kept on the screen: what the desktop and taskbar's right
  * buttons open. An item with checked is drawn ticked while it returns nonzero. */
@@ -254,6 +298,8 @@ void wm_popup(const struct ctx_item *items, int n, int x, int y);
 void wm_input(const struct input_event *ev);
 /* The video mode changed: map the new screen and lay the desktop out for it. */
 int wm_reconfigure(void);
+/* Set a video mode and lay the desktop out for it (the boot mode again if it cannot be used). */
+int wm_set_mode(const struct dispmode *m);
 /* The adapter's page flipping and hardware pointer (radeon), on or off. */
 int wm_accel(void);
 void wm_set_accel(int on);
@@ -265,7 +311,38 @@ void wm_restyle(void);
 void wm_draw_sample(struct surface *s, struct rect r);
 void wm_splash(const char *message);    /* the shutdown screen, saying message */
 void wm_tick(void);             /* clock and timers; call a few times a second */
+void wm_clock_changed(void);    /* the time zone changed: the clock again */
 unsigned int now_ms(void);
+
+/* ---- the desktop's end of the programs' windows (wm.c, server.c) ---- */
+struct window *wm_create_remote(struct wm_link *link, const char *title, enum icon_id icon, int client_w,
+                                int client_h, int flags, const struct window_ops *ops);
+uint32_t wm_drag_serial(void);          /* a number for the drag in progress, new with each */
+/* A window under the drag answered what letting go there would do (asked by its ops->drop). */
+void wm_drag_update(struct window *w, int effect, const char *hint);
+int server_init(void);                  /* listen for programs */
+void server_sync(void);                 /* once a loop, before wm_flush */
+void server_state_changed(void);        /* the theme, screen or settings changed: tell the programs */
+int server_buffer_new(struct wm_link *l, struct surface *s, int w, int h);
+void server_buffer_free(struct wm_link *l, struct surface *s);
+void server_buffer_changed(struct wm_link *l);
+
+/* ---- a program: its windows are the desktop's to show (client.c) ---- */
+struct app {
+    int (*start)(int argc, char **argv);    /* open the first windows: nonzero gives up, with that status */
+    void (*blink)(void);                    /* every half second */
+    void (*tick)(void);                     /* every second */
+    int (*timeout)(void);                   /* ms until frame has work, -1 for none */
+    void (*frame)(void);
+    void (*child_exited)(int pid, int status);
+    int (*poll_fds)(struct pollfd *fds, struct window **owners, int max);
+    void (*ready)(struct window *w, int revents);
+    int (*busy)(void);                      /* go on with no window open */
+};
+/* Connect to the desktop and run the program until its last window closes; the exit status. */
+int app_main(const char *name, const struct app *app, int argc, char **argv);
+/* In start: a window titled so is open already, in another process (now in front): open no other. */
+int app_focus_existing(const char *title);
 
 /* ---- the sidebar (sidebar.c) ----
  * A column of widgets down the right edge, from the top of the screen to the
@@ -342,7 +419,7 @@ void player_child_exited(int pid, int status);
 void player_tick(void);
 struct window *editor_open(const char *path);      /* path NULL: an empty document */
 void editor_blink(void);
-void clipboard_set(const char *text);              /* the clipboard the editors share */
+void clipboard_set(const char *text);              /* the desktop's clipboard, every program's */
 const char *clipboard_get(int *len);               /* NULL when empty */
 struct window *browser_open(const char *url);      /* url NULL: the home page */
 void browser_poll(void);                /* script timers and requests */
@@ -355,6 +432,10 @@ void setup_draw_backdrop(struct surface *s, struct rect clip);  /* behind Setup'
 void setup_tick(void);                  /* once a second */
 void display_open(void);                /* Display Properties */
 void mouse_init(void);                  /* the saved mouse settings */
+/* The settings in use and kept, as speed, double-click step, left-handed, wheel lines, reverse wheel. */
+void mouse_get_config(int active[5], int saved[5]);
+void mouse_set_config(const int active[5], const int saved[5]);
+void mouse_config_changed(void);        /* Mouse Properties changed them: tell the desktop */
 void mouse_open(void);                  /* Mouse Properties */
 int mouse_left_handed(void);
 void mouse_scale_motion(int *dx, int *dy);
@@ -366,6 +447,7 @@ int mouse_wheel_reverse(void);
 void datetime_open(void);               /* Date and Time Properties: zone, NTP sync */
 void datetime_tick(void);               /* once a second */
 void datetime_init(void);               /* the saved time zone */
+void datetime_zone_changed(int minutes);    /* Date and Time changed it: tell the desktop */
 
 /* GRUB's environment block on the boot partition (grubenv.c): for settings
  * that have to outlive the RAM filesystem. dir is the partition's mount point. */
@@ -420,9 +502,12 @@ void system_sleep(void);                /* suspend to RAM, and back */
 void power_open(void);                  /* the Power dialog (apps.c) */
 
 /* Wireless Networks (wireless.c): joining networks, and the wireless icon in the tray. */
-void wireless_init(void);
-void wireless_tick(void);               /* once a second */
 void wireless_open(void);
+void wireless_tick(void);               /* once a second */
+int wireless_busy(void);                /* joining a network still */
+/* The tray's wireless icon (wifitray.c, the desktop's) */
+void wireless_init(void);
+void wireless_tray_tick(void);          /* once a second */
 int wireless_tray_present(void);        /* there is a wireless card */
 int wireless_tray_connected(void);
 void power_dialog_tick(void);           /* the information changed */
@@ -442,9 +527,12 @@ void setup_child_exited(int pid, int status);
 void system_restart(void);
 void system_shutdown(void);             /* splash, sync and power off */
 
-/* The event loop (main.c): call ready(ctx, revents) when fd is readable. */
+/* The event loop (loop.c): call ready(ctx, revents) when fd is readable. */
 int loop_watch(int fd, void (*ready)(void *ctx, int revents), void *ctx);
 void loop_unwatch(int fd);
+void loop_watch_events(int fd, int events);     /* POLLIN, and POLLOUT too while there is writing to do */
+int loop_poll_fds(struct pollfd *fds, int max); /* the loop's: fill fds, then loop_dispatch after poll */
+void loop_dispatch(const struct pollfd *fds);
 struct window *image_view_open(const char *path);
 
 /* Archive Manager (archiver.c): ZIP and 7z archives, browsed and extracted. */

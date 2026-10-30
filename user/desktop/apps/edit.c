@@ -122,10 +122,6 @@ struct ed {
 static struct ed *eds;
 static int blink_on = 1;
 
-/* The clipboard, shared by every editor. */
-static char *clip;
-static int cliplen;
-
 /* ---- text buffer ---- */
 
 static int reserve(struct ed *e, int need)
@@ -374,8 +370,11 @@ static int item_enabled(struct ed *e, const struct item *it)
     case C_COPY:
     case C_DELETE:
         return has_selection(e);
-    case C_PASTE:
-        return cliplen > 0;
+    case C_PASTE: {
+        int n;
+        clipboard_get(&n);              /* the desktop's, shared by every program */
+        return n > 0;
+    }
     default:
         return 1;
     }
@@ -862,32 +861,13 @@ static void copy_selection(struct ed *e)
     sel_range(e, &from, &to);
     if (from == to)
         return;
-    char *c = malloc((size_t)(to - from));
+    char *c = malloc((size_t)(to - from) + 1);
     if (!c)
         return;
     memcpy(c, e->text + from, (size_t)(to - from));
-    free(clip);
-    clip = c;
-    cliplen = to - from;
-}
-
-/* The shared clipboard, for the other programs. */
-void clipboard_set(const char *text)
-{
-    size_t n = strlen(text);
-    char *c = malloc(n ? n : 1);
-    if (!c)
-        return;
-    memcpy(c, text, n);
-    free(clip);
-    clip = c;
-    cliplen = (int)n;
-}
-
-const char *clipboard_get(int *len)
-{
-    *len = cliplen;
-    return clip;
+    c[to - from] = 0;
+    clipboard_set(c);
+    free(c);
 }
 
 static void delete_selection(struct ed *e)
@@ -930,10 +910,13 @@ static void run_command(struct ed *e, enum cmd c)
         delete_selection(e);
         break;
     case C_COPY: copy_selection(e); break;
-    case C_PASTE:
-        if (cliplen)
-            insert_text(e, clip, cliplen);
+    case C_PASTE: {
+        int n;
+        const char *clip = clipboard_get(&n);
+        if (n)
+            insert_text(e, clip, n);
         break;
+    }
     case C_DELETE: delete_selection(e); break;
     case C_SELALL:
         e->sel = 0;

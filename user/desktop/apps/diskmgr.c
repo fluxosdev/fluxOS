@@ -972,7 +972,7 @@ static void explore(const struct dm *m)
 {
     const struct dev *d = find(m->sel);
     if (d && mounted(d))
-        files_open(d->bi.mountpoint);
+        launch1("files", d->bi.mountpoint);
 }
 
 static void do_mount(struct dm *m)
@@ -1038,7 +1038,7 @@ static void run_format(void *ctx, const char *label)
     argv[n] = NULL;
     char title[48];
     snprintf(title, sizeof(title), "Format %s", dm->pending);
-    terminal_open(title, argv, 1, 0);
+    launch_terminal(NULL, title, argv, 1);
     dm->pending[0] = 0;
 }
 

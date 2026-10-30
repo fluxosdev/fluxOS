@@ -1296,16 +1296,7 @@ static void dp_paint(struct dprops *d)
 
 static int set_mode(const struct dispmode *m)
 {
-    struct dispmode mm = *m;
-    if (display(DISP_SETMODE, &mm) < 0)
-        return -1;
-    if (wm_reconfigure() < 0) {
-        mm.width = 0;                   /* the desktop cannot use it: back to the boot mode */
-        display(DISP_SETMODE, &mm);
-        wm_reconfigure();
-        return -1;
-    }
-    return 0;
+    return wm_set_mode(m);              /* the desktop has the screen: it sets the mode */
 }
 
 static void confirm_close(int keep);

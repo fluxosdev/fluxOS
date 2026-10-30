@@ -1,6 +1,6 @@
 /*
- * Wireless Networks under Settings, and the wireless icon in the tray:
- * the networks in range, strongest first, joining one (asking for its
+ * Wireless Networks under Settings (and the wireless icon in the tray,
+ * which the desktop shows: wifitray.c): the networks in range, strongest first, joining one (asking for its
  * password when it has one), leaving it, and how the connection is
  * doing. The kernel does the work (SYS_wifi): this only asks it and
  * shows what it says, once a second. A network joined here is
@@ -55,9 +55,6 @@ static unsigned int last_click_ms;
 static struct wifi_connect pending;
 static int pending_active, pending_started;
 static char pending_error[64];          /* the last failure already reported */
-
-/* What the tray last showed. */
-static int tray_present, tray_connected;
 
 /* ---- the kernel's view ---- */
 
@@ -641,39 +638,17 @@ static const struct window_ops wl_ops = {
     .destroy = wl_destroy,
 };
 
-/* ---- the tray, and the once-a-second look ---- */
+/* ---- the once-a-second look ---- */
 
-static void update_tray(void)
+/* A network being joined is remembered once it is, even after the window closes. */
+int wireless_busy(void)
 {
-    int present = have_card, connected = st.state == WIFI_ST_CONNECTED;
-    if (present != tray_present || connected != tray_connected) {
-        tray_present = present;
-        tray_connected = connected;
-        wm_tray_changed();
-    }
-}
-
-void wireless_init(void)
-{
-    read_status();
-    tray_present = have_card;
-    tray_connected = st.state == WIFI_ST_CONNECTED;
-}
-
-int wireless_tray_present(void)
-{
-    return tray_present;
-}
-
-int wireless_tray_connected(void)
-{
-    return tray_connected;
+    return pending_active;
 }
 
 void wireless_tick(void)
 {
     read_status();
-    update_tray();
     follow_pending();                   /* even with the window closed: remember what was joined */
     if (!wl_win)
         return;

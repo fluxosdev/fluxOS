@@ -1029,8 +1029,7 @@ static struct window *open_term(const char *title, const char *const *argv, int 
         free(t->cells), free(t->drawn), free(t);
         return NULL;
     }
-    w->min_w = MIN_COLS * FONT_W + 2 * PAD + 2 * BORDER;
-    w->min_h = MIN_ROWS * FONT_H + 2 * PAD + FRAME_TOP + BORDER;
+    wm_set_min_size(w, MIN_COLS * FONT_W + 2 * PAD + 2 * BORDER, MIN_ROWS * FONT_H + 2 * PAD + FRAME_TOP + BORDER);
     t->win = w;
     t->next = terms;
     terms = t;

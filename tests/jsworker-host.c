@@ -1,4 +1,4 @@
-/* "desktop --js-worker" for host tests: the worker process, with a real clock (tests/browser-worker.c). */
+/* "wave --js-worker" for host tests: the worker process, with a real clock (tests/browser-worker.c). */
 #include <flux.h>
 #include <malloc.h>
 #include <time.h>

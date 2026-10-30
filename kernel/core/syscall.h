@@ -12,4 +12,10 @@ int user_access_ok(const void *ptr, uint32_t len);
 int copy_from_user(void *dst, const void *usrc, uint32_t n);
 int copy_to_user(void *udst, const void *src, uint32_t n);
 
+/* Shared memory segments (shm.c) */
+int sys_shmget(uint32_t key, uint32_t size, uint32_t flags, uint32_t d, uint32_t e);
+int sys_shmat(uint32_t id, uint32_t usize, uint32_t c, uint32_t d, uint32_t e);
+int sys_shmctl(uint32_t id, uint32_t cmd, uint32_t ubuf, uint32_t d, uint32_t e);
+void shm_proc_exit(int pid);
+
 #endif

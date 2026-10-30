@@ -59,7 +59,7 @@ struct tmgr {
     int tab;
     int sort_col, sort_desc;
     int sel_pid;                /* selected process, or -1 */
-    struct window *sel_win;     /* selected application */
+    uint32_t sel_app;           /* selected application: its window's handle, or 0 */
     int scroll;                 /* in rows, for the current page's list */
     enum hold hold;
     int hold_btn, hold_in;
@@ -93,7 +93,7 @@ static struct meminfo mi;
 static unsigned up_secs;
 static int ntasks, nrunning;
 
-static struct window *apps[MAXAPPS];
+static struct wm_window_info apps[MAXAPPS];  /* every program's windows but ours */
 static int napps;
 
 static unsigned prev_ticks(int pid, int *found)
@@ -159,20 +159,17 @@ static void push(uint8_t *hist, int v)
 
 static void refresh_apps(struct tmgr *t)
 {
+    struct wm_window_info all[MAXAPPS];
+    int n = wm_list_windows(all, MAXAPPS);
     napps = 0;
-    for (int i = 0; napps < MAXAPPS; i++) {
-        struct window *w = wm_nth(i);
-        if (!w)
-            break;
-        if (w == t->win || (w->flags & (WF_NOTASK | WF_MODAL)))
-            continue;
-        apps[napps++] = w;
-    }
+    for (int i = 0; i < n; i++)
+        if (all[i].pid != getpid() && !(all[i].flags & (WF_NOTASK | WF_MODAL | WF_DESKTOP)))
+            apps[napps++] = all[i];
     int found = 0;
     for (int i = 0; i < napps; i++)
-        found |= apps[i] == t->sel_win;
+        found |= apps[i].handle == t->sel_app;
     if (!found)
-        t->sel_win = NULL;
+        t->sel_app = 0;
 }
 
 /* Read the process table and the memory figures; move the graphs on. */
@@ -321,7 +318,7 @@ static int selected_index(const struct tmgr *t)
 {
     if (t->tab == TAB_APPS) {
         for (int i = 0; i < napps; i++)
-            if (apps[i] == t->sel_win)
+            if (apps[i].handle == t->sel_app)
                 return i;
     } else {
         for (int i = 0; i < nrows; i++)
@@ -449,9 +446,9 @@ static void draw_apps(struct tmgr *t, struct surface *s)
     s->clip = rect_intersect(saved, mkrect(l.x + 2, l.y + 2, l.w - 4, l.h - 4));
     int vis = visible_rows(t);
     for (int k = 0; k < vis && t->scroll + k < napps; k++) {
-        struct window *w = apps[t->scroll + k];
+        const struct wm_window_info *w = &apps[t->scroll + k];
         int y = l.y + 2 + k * ROW_H;
-        int sel = w == t->sel_win;
+        int sel = w->handle == t->sel_app;
         if (sel)
             gfx_fill(s, l.x + 2, y, l.w - 4, ROW_H, C_NAVY);
         color_t fg = sel ? C_WHITE : C_BLACK;
@@ -683,27 +680,20 @@ static void paint(struct tmgr *t)
 
 /* ---- actions ---- */
 
-static int window_alive(const struct window *w)
-{
-    for (int i = 0; wm_nth(i); i++)
-        if (wm_nth(i) == w)
-            return 1;
-    return 0;
-}
-
 static void switch_to(struct tmgr *t)
 {
-    if (t->sel_win && window_alive(t->sel_win))
-        wm_focus(t->sel_win);
+    refresh_apps(t);
+    if (t->sel_app)
+        wm_focus_handle(t->sel_app);
 }
 
 static void end_task(struct tmgr *t)
 {
-    struct window *w = t->sel_win;
-    if (!w || !window_alive(w))
+    refresh_apps(t);
+    if (!t->sel_app)
         return;
-    t->sel_win = NULL;
-    wm_close(w);
+    wm_close_handle(t->sel_app);        /* as its close button does: the program may ask first */
+    t->sel_app = 0;
     refresh_apps(t);
 }
 
@@ -725,10 +715,10 @@ static void end_process(struct tmgr *t)
     if (i < 0)
         return;
     const struct procinfo *pi = &rows[i].pi;
-    if (pi->pid <= 1 || pi->pid == getpid()) {
+    if (pi->pid <= 1 || pi->pid == wm_desktop_pid()) {
         message_box("Task Manager", ICON_WARNING,
-                    pi->pid == getpid() ? "That is the desktop itself: end it with Shut Down."
-                                        : "This process is part of the system and cannot be ended.");
+                    pi->pid > 1 ? "That is the desktop itself: end it with Shut Down."
+                                : "This process is part of the system and cannot be ended.");
         return;
     }
     char msg[128];
@@ -746,7 +736,7 @@ static void button_action(struct tmgr *t, int btn)
         else if (btn == BTN_SWITCH)
             switch_to(t);
         else
-            run_open();
+            shell_open("run");
     } else if (t->tab == TAB_PROCS) {
         end_process(t);
     }
@@ -788,7 +778,7 @@ static int header_at(const struct tmgr *t, int x, int y)
 static void select_index(struct tmgr *t, int i)
 {
     if (t->tab == TAB_APPS)
-        t->sel_win = i >= 0 && i < napps ? apps[i] : NULL;
+        t->sel_app = i >= 0 && i < napps ? apps[i].handle : 0;
     else
         t->sel_pid = i >= 0 && i < nrows ? rows[i].pi.pid : -1;
 }

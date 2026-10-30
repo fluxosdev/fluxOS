@@ -61,6 +61,8 @@ uint32_t vmm_user_pages(uint32_t *pd);
 void *vmm_map_mmio(uint32_t phys, uint32_t size, uint32_t flags);  /* boot time only */
 void *vmm_map_late(uint32_t phys, uint32_t size, uint32_t flags);  /* any time; kept for good */
 int vmm_map_phys(uint32_t *pd, uint32_t va, uint32_t phys, uint32_t size, uint32_t flags);
+void vmm_zero_frame(uint32_t phys);         /* any frame, high memory too */
+int vmm_map_frame(uint32_t *pd, uint32_t va, uint32_t frame, uint32_t prot);
 
 /*
  * ---- SSE block moves (sse.S) ----

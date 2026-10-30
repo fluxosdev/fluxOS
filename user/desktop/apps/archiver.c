@@ -732,7 +732,7 @@ static void open_dest(void *ctx)
 {
     struct arcwin *w = alive(ctx);
     if (w)
-        files_open(w->dest);
+        launch1("files", w->dest);
 }
 
 static void finish_job(struct arcwin *w)
@@ -788,7 +788,7 @@ static void finish_job(struct arcwin *w)
             snprintf(msg, sizeof(msg), "Cannot open %s from the archive.\n%s", w->view_name, w->errors);
             message_box("Archive Manager", ICON_WARNING, msg);
         } else {
-            files_open_path(path);
+            launch("files", (const char *const[]){ "--open", path, NULL });
         }
         return;
     }

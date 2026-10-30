@@ -7,6 +7,8 @@
  * in the sound player, a VOC one plays with play(1), a shortcut (NAME.app) starts what it
  * names, and anything else is shown with more(1).
  *
+ * Each of these is a program of its own (launch.c): this one runs as the
+ * File Manager (/bin/files) and inside the desktop, whose folder it is.
  * The desktop is a folder window too (files_open_desktop): no frame, the
  * wallpaper behind, a header of Back, Home, Favourites and the mounted
  * disks over a divider,
@@ -34,6 +36,10 @@
 #include <unistd.h>
 #include "desktop.h"
 #include "imagejobs.h"
+
+/* The desktop's folder draws the wallpaper, which only the desktop has (the File Manager never
+ * shows the desktop's folder). */
+#pragma weak wallpaper_draw
 
 #define FM_W       560
 #define FM_H       380
@@ -146,6 +152,7 @@ struct fm {
 };
 
 static struct fm *fms;
+static int in_desktop;                  /* this is the desktop's process: other folders open in the File Manager */
 
 /* The folder a drag is over: the entry drop_i of window drop_f, or -1 for the window's own. */
 static struct fm *drop_f;
@@ -209,7 +216,7 @@ static int is_text_name(const char *name)
 
 /*
  * A shortcut, NAME.app: lines of key=value. exec is an app's name, as
- * wm_launch knows them ("wave", "terminal"), or a path to open as the File
+ * app_launch knows them ("wave", "terminal"), or a path to open as the File
  * Manager would; icon (if any) an icon's name ("folder", see icons.c) or an
  * app's. -1 if it cannot be read.
  */
@@ -240,10 +247,10 @@ static int read_shortcut(const char *path, char *exec, size_t size, enum icon_id
         if (!strcmp(line, "exec"))
             snprintf(exec, size, "%s", eq + 1);
         else if (!strcmp(line, "icon") && (*icon = icon_by_name(eq + 1)) == ICON_NONE)
-            *icon = wm_app_icon(eq + 1);
+            *icon = app_icon(eq + 1);
     }
     if (*icon == ICON_NONE)
-        *icon = exec[0] && wm_app_icon(exec) != ICON_NONE ? wm_app_icon(exec) : ICON_RUN;
+        *icon = exec[0] && app_icon(exec) != ICON_NONE ? app_icon(exec) : ICON_RUN;
     return 0;
 }
 
@@ -914,7 +921,8 @@ static void paint_desk(struct fm *f)
     struct surface *s = &f->win->content;
     int w = s->w, h = s->h;
     gfx_noclip(s);
-    wallpaper_draw(s, mkrect(0, 0, w, h));
+    if (wallpaper_draw)
+        wallpaper_draw(s, mkrect(0, 0, w, h));
 
     const struct pfont *hf = head_font();
     for (int i = 0, n = nheads(f); i < n; i++) {
@@ -1194,7 +1202,7 @@ static void open_shortcut(const char *path, const char *name)
     struct stat st;
     if (read_shortcut(path, exec, sizeof(exec), &icon) < 0 || !exec[0]) {
         snprintf(msg, sizeof(msg), "The shortcut %s does not say what to open.", name);
-    } else if (wm_launch(exec) == 0) {
+    } else if (app_launch(exec) == 0) {
         return;
     } else if (exec[0] == '/' && !has_suffix(exec, ".app") && stat(exec, &st) == 0) {
         files_open_path(exec);
@@ -1213,33 +1221,29 @@ static void open_file(const char *dir, const char *name, const char *path, enum 
     } else if (icon == ICON_VIDEO) {
         message_box("Video", ICON_INFO, "fluxOS cannot play videos yet.");
     } else if (icon == ICON_IMAGE) {
-        if (!image_view_open(path)) {
-            char msg[NAME_MAX + 64];
-            snprintf(msg, sizeof(msg), "%s is not a picture fluxOS can show (PNG, JPEG, GIF, SVG or ICO).", name);
-            message_box("Image Viewer", ICON_WARNING, msg);
-        }
+        launch1("imageview", path);
     } else if (icon == ICON_HTML) {
         char url[PATH_MAX + 8];
         snprintf(url, sizeof(url), "file://%s", path);
-        browser_open(url);
+        launch1("wave", url);
     } else if (icon == ICON_SOUND && has_suffix(name, ".wav")) {
-        player_open(path);
+        launch1("player", path);
     } else if (icon == ICON_SOUND) {
         const char *argv[] = { "/bin/play", path, NULL };
-        terminal_open(name, argv, 0, 0);
+        launch_terminal(NULL, name, argv, 0);
     } else if (icon == ICON_ARCHIVE) {
-        archiver_open(path);
+        launch1("archiver", path);
     } else if (icon == ICON_RUN) {
         /* DOS programs go through the emulator even without execute permission.
          * Programs start in their own folder, as on Windows: a DOS game's
          * setup program runs the game by a name relative to it. */
         const char *dos_argv[] = { "/bin/dos", path, NULL }, *argv[] = { path, NULL };
-        terminal_open_in(dir, name, is_dos_program(path) ? dos_argv : argv, 1);
+        launch_terminal(dir, name, is_dos_program(path) ? dos_argv : argv, 1);
     } else if (is_text_name(name)) {
-        editor_open(path);
+        launch1("editor", path);
     } else {
         const char *argv[] = { "/bin/more", path, NULL };
-        terminal_open(name, argv, 0, 0);
+        launch_terminal(NULL, name, argv, 0);
     }
 }
 
@@ -1756,10 +1760,10 @@ static void ctx_action(struct fm *f, int code)
     case CX_RENAME: ask_rename(f); break;
     case CX_NEWDIR: ask_text("New Folder", "Name of the new folder:", "New Folder", do_mkdir, f); break;
     case CX_REFRESH: reload(f, NULL); break;
-    case CX_TERMINAL: terminal_open_in(f->path, "Terminal", NULL, 0); break;
+    case CX_TERMINAL: launch_terminal(f->path, "Terminal", NULL, 0); break;
     case CX_UP: go_up(f); break;
     case CX_WINDOW: files_open(f->path); break;
-    case CX_DISPLAY: display_open(); break;
+    case CX_DISPLAY: app_launch("display"); break;
     case CX_FAVTHIS: set_fav(f->path, 1); break;
     case CX_UNFAVTHIS: set_fav(f->path, 0); break;
     case CX_FAVADD:
@@ -1771,14 +1775,14 @@ static void ctx_action(struct fm *f, int code)
         if (f->sel >= 0) {
             char path[PATH_MAX];
             join(path, sizeof(path), f->path, f->ents[f->sel].name);
-            paint_open(path);
+            launch1("paint", path);
         }
         break;
     case CX_EXTRACT:
         if (f->sel >= 0) {
             char path[PATH_MAX];
             join(path, sizeof(path), f->path, f->ents[f->sel].name);
-            archiver_extract(path);
+            launch("archiver", (const char *const[]){ "--extract", path, NULL });
         }
         break;
     }
@@ -2222,6 +2226,10 @@ static const struct window_ops fm_ops = {
 
 struct window *files_open(const char *path)
 {
+    if (in_desktop) {
+        launch1("files", path);         /* a window of the File Manager's, not the desktop's */
+        return NULL;
+    }
     struct fm *f = calloc(1, sizeof(*f));
     if (!f)
         return NULL;
@@ -2246,6 +2254,7 @@ struct window *files_open_desktop(void)
     struct fm *f = calloc(1, sizeof(*f));
     if (!f)
         return NULL;
+    in_desktop = 1;
     f->desk = 1;
     f->sel = -1;
     f->last_click = -1;
@@ -2259,60 +2268,5 @@ struct window *files_open_desktop(void)
     f->next = fms;
     fms = f;
     enter(f, f->path);
-    return w;
-}
-
-/* ---- image viewer ---- */
-
-struct image_view { struct window *win; struct image *image; int failed; };
-static void iv_destroy(struct window *w)
-{
-    struct image_view *view=w->priv;
-    image_jobs_cancel(view);
-    image_free(view->image);free(view);
-}
-
-static void iv_paint(struct window *w)
-{
-    struct image_view *view=w->priv;
-    struct surface *s=&w->content;
-    gfx_fill(s,0,0,s->w,s->h,C_SHADOW);
-    if(view->image)gfx_image(s,(s->w-view->image->w)/2,(s->h-view->image->h)/2,view->image);
-    else gfx_text(s,&font_sans,12,12,view->failed ? "Could not load image" : "Loading image...",C_WHITE);
-    wm_damage_client(w,mkrect(0,0,s->w,s->h));
-}
-static void iv_ready(void *context, struct image *image, int full_w, int full_h)
-{
-    (void)full_w;(void)full_h;
-    struct image_view *view=context;
-    view->image=image;view->failed=!image;
-    if(image) {
-        int cw=image->w+16,ch=image->h+16;
-        int maxw=wm_work_right()-2*BORDER-40,maxh=screen_h-TASKBAR_H-TITLE_H-60;
-        if(cw<160)cw=160;
-        if(ch<100)ch=100;
-        if(cw>maxw)cw=maxw;
-        if(ch>maxh)ch=maxh;
-        wm_resize_client(view->win,cw,ch);
-    }
-    iv_paint(view->win);
-}
-
-static const struct window_ops iv_ops = {
-    .restyle = iv_paint,
-    .resize = iv_paint,
-    .destroy = iv_destroy,
-};
-
-struct window *image_view_open(const char *path)
-{
-    struct image_view *view=calloc(1,sizeof(*view));
-    if(!view)return NULL;
-    const char *name=strrchr(path,'/');
-    view->win=wm_create(name ? name+1 : path,ICON_IMAGE,320,200,WF_MINIMIZE,&iv_ops,view);
-    if(!view->win){free(view);return NULL;}
-    struct window *w=view->win;
-    if(image_job_path(view,path,0,iv_ready,view,NULL)<0)view->failed=1;
-    iv_paint(w);
     return w;
 }

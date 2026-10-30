@@ -1,45 +1,18 @@
 /*
  * Mouse Properties under Settings: button configuration (right-handed or
  * left-handed), double-click speed with a test box, pointer speed for
- * mouse motion, and scroll wheel speed and direction.
- *
- * The settings are kept in GRUB's environment block as fluxos_mouse, for
- * example "4-4-0-3-0" (pointer speed, double-click step, left-handed,
- * wheel lines, reverse wheel). Without a disk to save them on they last
- * until a restart.
+ * mouse motion, and scroll wheel speed and direction. The settings
+ * themselves are mousecfg.c's; the desktop hears of each change, as it
+ * moves the pointer (mouse_config_changed).
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "desktop.h"
+#include "mousecfg.h"
 
 #define MP_W 368
 #define MP_H 398
-
-#define SPEED_STEPS    9
-#define DBLCLICK_STEPS 9
-#define WHEEL_MAX      9
-
-/* Multipliers in sixteenths (4/16 = 0.25x up to 48/16 = 3.0x; index 4 is 1:1). */
-static const int speed_mult[SPEED_STEPS] = { 4, 6, 8, 12, 16, 22, 28, 36, 48 };
-
-/* Double-click window in milliseconds, from Slow (900 ms) to Fast (200 ms). */
-static const unsigned int dblclick_times[DBLCLICK_STEPS] = {
-    900, 800, 700, 600, 500, 400, 320, 250, 200,
-};
-
-struct mouse_config {
-    int speed;              /* 0 .. SPEED_STEPS - 1 */
-    int dblclick;           /* 0 .. DBLCLICK_STEPS - 1 */
-    int left_handed;        /* 0: right-handed, 1: left-handed */
-    int wheel_lines;        /* 1 .. WHEEL_MAX */
-    int wheel_reverse;      /* 0: normal, 1: natural / reverse */
-};
-
-static struct mouse_config saved_cfg = { 4, 4, 0, 3, 0 };
-static struct mouse_config active_cfg = { 4, 4, 0, 3, 0 };
-static int rem_x, rem_y;    /* sub-pixel motion in sixteenths */
-static int abs_x, abs_y, abs_w, abs_h;
 
 enum ctl {
     C_RIGHT,
@@ -69,141 +42,24 @@ struct mprops {
 
 static struct mprops *dlg;
 
-static int clamp_int(int v, int lo, int hi)
-{
-    return v < lo ? lo : v > hi ? hi : v;
-}
-
-void mouse_init(void)
-{
-    char dir[128], val[48];
-    if (!grubenv_boot_dir(dir, sizeof(dir)) || !grubenv_get(dir, "fluxos_mouse", val, sizeof(val)))
-        return;
-    int v[5] = { 4, 4, 0, 3, 0 };
-    const char *p = val;
-    for (int i = 0; i < 5; i++) {
-        char *end;
-        long n = strtol(p, &end, 10);
-        if (end == p)
-            return;
-        v[i] = (int)n;
-        if (i < 4) {
-            if (*end != '-')
-                return;
-            p = end + 1;
-        }
-    }
-    saved_cfg.speed = clamp_int(v[0], 0, SPEED_STEPS - 1);
-    saved_cfg.dblclick = clamp_int(v[1], 0, DBLCLICK_STEPS - 1);
-    saved_cfg.left_handed = v[2] ? 1 : 0;
-    saved_cfg.wheel_lines = clamp_int(v[3], 1, WHEEL_MAX);
-    saved_cfg.wheel_reverse = v[4] ? 1 : 0;
-    active_cfg = saved_cfg;
-}
-
-static void save_grubenv(const struct mouse_config *c)
-{
-    char dir[128], val[48];
-    if (!grubenv_boot_dir(dir, sizeof(dir)))
-        return;
-    snprintf(val, sizeof(val), "%d-%d-%d-%d-%d",
-             c->speed, c->dblclick, c->left_handed, c->wheel_lines, c->wheel_reverse);
-    const char *keys[1] = { "fluxos_mouse" }, *vals[1] = { val };
-    grubenv_update(dir, keys, vals, 1);
-}
-
-int mouse_left_handed(void)
-{
-    return active_cfg.left_handed;
-}
-
-void mouse_scale_motion(int *dx, int *dy)
-{
-    static int last_mult = 16;
-    int m = speed_mult[clamp_int(active_cfg.speed, 0, SPEED_STEPS - 1)];
-    if (m != last_mult) {
-        rem_x = rem_y = 0;
-        last_mult = m;
-    }
-    if (m == 16) {
-        rem_x = rem_y = 0;
-        return;
-    }
-    rem_x += *dx * m;
-    rem_y += *dy * m;
-    *dx = rem_x / 16;
-    *dy = rem_y / 16;
-    rem_x %= 16;
-    rem_y %= 16;
-}
-
-void mouse_move_pointer(const struct input_event *ev, int width, int height, int *x, int *y)
-{
-    int dx = ev->x, dy = ev->y;
-    if (ev->flags & IEV_ABS) {
-        int px = ev->x * width / 32768;
-        int py = ev->y * height / 32768;
-        /* Keep host alignment at 1:1. At other speeds, scale changes in
-         * position rather than the absolute coordinates themselves. A new
-         * absolute stream or display size establishes a fresh baseline. */
-        if (active_cfg.speed == 4 || abs_w != width || abs_h != height) {
-            *x = px;
-            *y = py;
-            rem_x = rem_y = 0;
-        } else {
-            dx = px - abs_x;
-            dy = py - abs_y;
-            mouse_scale_motion(&dx, &dy);
-            *x += dx;
-            *y += dy;
-        }
-        abs_x = px;
-        abs_y = py;
-        abs_w = width;
-        abs_h = height;
-    } else {
-        if (abs_w || abs_h)
-            rem_x = rem_y = 0;
-        abs_w = abs_h = 0;
-        mouse_scale_motion(&dx, &dy);
-        *x += dx;
-        *y += dy;
-    }
-    *x = clamp_int(*x, 0, width - 1);
-    *y = clamp_int(*y, 0, height - 1);
-}
-
-unsigned int mouse_dblclick_ms(void)
-{
-    return dblclick_times[clamp_int(active_cfg.dblclick, 0, DBLCLICK_STEPS - 1)];
-}
-
-int mouse_wheel_lines(void)
-{
-    return clamp_int(active_cfg.wheel_lines, 1, WHEEL_MAX);
-}
-
-int mouse_wheel_reverse(void)
-{
-    return active_cfg.wheel_reverse;
-}
-
 /* Preview slider and wheel settings live while the dialog is open; button swap waits for Apply/OK. */
 static void sync_preview(const struct mouse_config *c)
 {
-    active_cfg.speed = c->speed;
-    active_cfg.dblclick = c->dblclick;
-    active_cfg.wheel_lines = c->wheel_lines;
-    active_cfg.wheel_reverse = c->wheel_reverse;
+    mouse_active_cfg.speed = c->speed;
+    mouse_active_cfg.dblclick = c->dblclick;
+    mouse_active_cfg.wheel_lines = c->wheel_lines;
+    mouse_active_cfg.wheel_reverse = c->wheel_reverse;
+    mouse_config_changed();             /* the desktop moves the pointer: it previews too */
 }
 
 static void commit_config(const struct mouse_config *c)
 {
-    int changed = memcmp(c, &saved_cfg, sizeof(*c)) != 0;
-    saved_cfg = *c;
-    active_cfg = *c;
+    int changed = memcmp(c, &mouse_saved_cfg, sizeof(*c)) != 0;
+    mouse_saved_cfg = *c;
+    mouse_active_cfg = *c;
     if (changed)
-        save_grubenv(c);
+        mouse_save(c);
+    mouse_config_changed();
 }
 
 /* ---- geometry and drawing ---- */
@@ -285,7 +141,7 @@ static int slider_val(const struct mprops *m, enum ctl k)
 static void set_slider_val(struct mprops *m, enum ctl k, int v)
 {
     int n = slider_steps(k);
-    v = clamp_int(v, 0, n - 1);
+    v = mouse_clamp(v, 0, n - 1);
     if (k == C_DBLCLICK)
         m->cfg.dblclick = v;
     else if (k == C_SPEED)
@@ -450,7 +306,8 @@ static void activate(struct mprops *m, enum ctl k)
         wm_destroy(m->win);
         return;
     case C_CANCEL:
-        active_cfg = saved_cfg;
+        mouse_active_cfg = mouse_saved_cfg;
+        mouse_config_changed();
         wm_destroy(m->win);
         return;
     case C_APPLY:
@@ -582,7 +439,8 @@ static void mp_restyle(struct window *w)
 
 static void mp_close(struct window *w)
 {
-    active_cfg = saved_cfg;
+    mouse_active_cfg = mouse_saved_cfg;
+    mouse_config_changed();
     wm_destroy(w);
 }
 
@@ -612,8 +470,8 @@ void mouse_open(void)
     struct mprops *m = calloc(1, sizeof(*m));
     if (!m)
         return;
-    m->cfg = saved_cfg;
-    m->focus = saved_cfg.left_handed ? C_LEFT : C_RIGHT;
+    m->cfg = mouse_saved_cfg;
+    m->focus = mouse_saved_cfg.left_handed ? C_LEFT : C_RIGHT;
     m->pressed = -1;
     m->dragging = -1;
     m->win = wm_create("Mouse Properties", ICON_MOUSE, MP_W, MP_H, 0, &mp_ops, m);

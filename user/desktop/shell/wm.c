@@ -1,6 +1,8 @@
 /*
  * Window manager and compositor: windows, the taskbar with its Start
- * menu and clock, the mouse pointer, and input routing. The desktop is a
+ * menu and clock, the mouse pointer, and input routing. Most windows are
+ * programs' (server.c gives each one window_ops that tell the program,
+ * and a client area in shared memory); the rest are the desktop's own. The desktop is a
  * window too (WF_DESKTOP: a folder browsed on the wallpaper, files.c),
  * frameless, filling the space beside the sidebar and above the taskbar,
  * and kept under the others. The sidebar (sidebar.c) is composed over the
@@ -129,124 +131,26 @@ static int sub_hover = -1;              /* the highlighted item in that submenu 
 static int task_pressed_idx = -1;
 static char clock_text[16];
 
-/* ---- the Start menu, and the apps shortcuts start ---- */
+/* ---- the Start menu ---- */
 
-static void open_terminal(void)
-{
-    terminal_open("Terminal", NULL, 0, 0);
-}
-
-static void open_computer(void)
-{
-    files_open("/");
-}
-
-static void open_editor(void)
-{
-    editor_open(NULL);
-}
-
-static void open_calculator(void)
-{
-    calculator_open();
-}
-
-static void open_player(void)
-{
-    player_open(NULL);
-}
-
-static void open_browser(void)
-{
-    browser_open(NULL);
-}
-
-static void open_gears(void)
-{
-    gears_open();
-}
-
-static void open_taskmgr(void)
-{
-    taskmgr_open();
-}
-
-static void open_diskmgr(void)
-{
-    diskmgr_open();
-}
-
-static void open_home(void)
-{
-    const char *home = getenv("HOME");
-    files_open(home ? home : "/");
-}
-
-static void open_minesweeper(void)
-{
-    minesweeper_open();
-}
-
-static void open_paint(void)
-{
-    paint_open(NULL);
-}
-
-static void open_archiver(void)
-{
-    archiver_open(NULL);
-}
-
-static void open_readme(void)
-{
-    editor_open("/home/flux/README.txt");
-}
-
-/* The apps a shortcut (a .app file, files.c) can name in its exec line. */
-static const struct {
-    const char *name;
-    enum icon_id icon;
-    void (*run)(void);
-} apps[] = {
-    { "wave", ICON_BROWSER, open_browser },
-    { "terminal", ICON_TERMINAL, open_terminal },
-    { "files", ICON_FOLDER, open_home },
-    { "computer", ICON_COMPUTER, open_computer },
-    { "editor", ICON_EDITOR, open_editor },
-    { "calculator", ICON_CALC, open_calculator },
-    { "player", ICON_SOUND, open_player },
-    { "archiver", ICON_ARCHIVE, open_archiver },
-    { "paint", ICON_PAINT, open_paint },
-    { "gears", ICON_GEARS, open_gears },
-    { "minesweeper", ICON_MINES, open_minesweeper },
-    { "taskmgr", ICON_TASKMGR, open_taskmgr },
-    { "diskmgr", ICON_DRIVE, open_diskmgr },
-    { "display", ICON_DISPLAY, display_open },
-    { "mouse", ICON_MOUSE, mouse_open },
-    { "datetime", ICON_DATETIME, datetime_open },
-    { "wireless", ICON_WIFI, wireless_open },
-    { "system", ICON_COMPUTER, about_open },
-    { "readme", ICON_README, open_readme },
-    { "run", ICON_RUN, run_open },
-};
-
-int wm_launch(const char *app)
-{
-    for (int i = 0; i < (int)(sizeof(apps) / sizeof(apps[0])); i++)
-        if (!strcmp(apps[i].name, app)) {
-            apps[i].run();
-            return 0;
-        }
-    return -1;
-}
-
-enum icon_id wm_app_icon(const char *app)
-{
-    for (int i = 0; i < (int)(sizeof(apps) / sizeof(apps[0])); i++)
-        if (!strcmp(apps[i].name, app))
-            return apps[i].icon;
-    return ICON_NONE;
-}
+/* Each starts a program of its own (launch.c), or one of the desktop's dialogs. */
+static void open_terminal(void) { app_launch("terminal"); }
+static void open_home(void) { app_launch("files"); }
+static void open_editor(void) { app_launch("editor"); }
+static void open_calculator(void) { app_launch("calculator"); }
+static void open_player(void) { app_launch("player"); }
+static void open_browser(void) { app_launch("wave"); }
+static void open_gears(void) { app_launch("gears"); }
+static void open_taskmgr(void) { app_launch("taskmgr"); }
+static void open_diskmgr(void) { app_launch("diskmgr"); }
+static void open_minesweeper(void) { app_launch("minesweeper"); }
+static void open_paint(void) { app_launch("paint"); }
+static void open_archiver(void) { app_launch("archiver"); }
+static void open_readme(void) { app_launch("readme"); }
+static void open_display(void) { app_launch("display"); }
+static void open_mouse(void) { app_launch("mouse"); }
+static void open_datetime(void) { app_launch("datetime"); }
+static void open_wireless(void) { app_launch("wireless"); }
 
 struct menu_item {
     enum icon_id icon;
@@ -280,10 +184,10 @@ static const struct menu_item system_items[] = {
 };
 
 static const struct menu_item settings_items[] = {
-    { ICON_DISPLAY, "Display Properties", display_open, NULL, 0 },
-    { ICON_MOUSE, "Mouse", mouse_open, NULL, 0 },
-    { ICON_DATETIME, "Date and Time", datetime_open, NULL, 0 },
-    { ICON_WIFI, "Wireless Networks", wireless_open, NULL, 0 },
+    { ICON_DISPLAY, "Display Properties", open_display, NULL, 0 },
+    { ICON_MOUSE, "Mouse", open_mouse, NULL, 0 },
+    { ICON_DATETIME, "Date and Time", open_datetime, NULL, 0 },
+    { ICON_WIFI, "Wireless Networks", open_wireless, NULL, 0 },
     { ICON_COMPUTER, "System Properties", about_open, NULL, 0 },
 };
 
@@ -324,6 +228,11 @@ static int work_right(void)
 int wm_work_right(void)
 {
     return work_right();
+}
+
+int wm_work_bottom(void)
+{
+    return work_bottom();
 }
 
 /* ---- the taskbar's context menu, and wm_popup's ---- */
@@ -447,11 +356,6 @@ static void set_ctx_hover(int i)
 }
 
 /* ---- time ---- */
-
-unsigned int now_ms(void)
-{
-    return uptime_ms();
-}
 
 static int update_clock(void)
 {
@@ -1810,9 +1714,24 @@ static void damage_taskbar(void)
 
 /* ---- windows ---- */
 
-struct window *wm_create(const char *title, enum icon_id icon, int client_w, int client_h,
-                         int flags, const struct window_ops *ops, void *priv)
+/* A client area surface for w: a shared memory segment for a program's window (server.c). */
+static int content_alloc(struct window *w, struct surface *s, int cw, int ch)
 {
+    return w->link ? server_buffer_new(w->link, s, cw, ch) : surface_init(s, cw, ch);
+}
+
+static void content_free(struct window *w, struct surface *s)
+{
+    if (w->link)
+        server_buffer_free(w->link, s);
+    else
+        surface_free(s);
+}
+
+static struct window *create_window(struct wm_link *link, const char *title, enum icon_id icon, int client_w,
+                                    int client_h, int flags, const struct window_ops *ops, void *priv)
+{
+    static uint32_t handles;
     struct window *w = calloc(1, sizeof(*w));
     if (!w)
         return NULL;
@@ -1821,7 +1740,9 @@ struct window *wm_create(const char *title, enum icon_id icon, int client_w, int
         client_w = desk_rect().w;
         client_h = desk_rect().h;
     }
-    if (surface_init(&w->content, client_w, client_h) < 0) {
+    w->link = link;
+    w->handle = ++handles;
+    if (content_alloc(w, &w->content, client_w, client_h) < 0) {
         free(w);
         return NULL;
     }
@@ -1854,6 +1775,19 @@ struct window *wm_create(const char *title, enum icon_id icon, int client_w, int
     if (flags & WF_MODAL)
         wm_damage(mkrect(0, 0, screen_w, screen_h));    /* dim everything */
     return w;
+}
+
+struct window *wm_create(const char *title, enum icon_id icon, int client_w, int client_h,
+                         int flags, const struct window_ops *ops, void *priv)
+{
+    return create_window(NULL, title, icon, client_w, client_h, flags, ops, priv);
+}
+
+/* A program's window (server.c): ops send it what happens, and link is struct window's. */
+struct window *wm_create_remote(struct wm_link *link, const char *title, enum icon_id icon, int client_w,
+                                int client_h, int flags, const struct window_ops *ops)
+{
+    return create_window(link, title, icon, client_w, client_h, flags, ops, NULL);
 }
 
 static void unlink_window(struct window *w)
@@ -1907,9 +1841,12 @@ void wm_destroy(struct window *w)
             wm_focus(next);
     }
     damage_taskbar();
+    if (w->link)
+        content_free(w, &w->content);   /* before destroy lets go of the link */
     if (w->ops && w->ops->destroy)
         w->ops->destroy(w);
-    surface_free(&w->content);
+    if (w->content.px)
+        surface_free(&w->content);
     image_free(w->icon_img);
     free(w);
 }
@@ -2028,13 +1965,17 @@ static int set_frame(struct window *w, struct rect r)
     struct rect old = w->r;
     if (cw != w->content.w || ch != w->content.h) {
         struct surface ns;
-        if (surface_init(&ns, cw, ch) < 0)
+        if (content_alloc(w, &ns, cw, ch) < 0)
             return -1;
         gfx_fill(&ns, 0, 0, cw, ch, C_FACE);
-        surface_free(&w->content);
+        if (w->link)                    /* the program draws it again in a moment: until then, as it was */
+            gfx_blit(&ns, 0, 0, &w->content, 0, 0, w->content.w, w->content.h);
+        content_free(w, &w->content);
         w->content = ns;
         w->r = r;
-        if (w->ops && w->ops->resize)
+        if (w->link)
+            server_buffer_changed(w->link);
+        else if (w->ops && w->ops->resize)
             w->ops->resize(w);
     } else {
         w->r = r;
@@ -2235,6 +2176,31 @@ void wm_wallpaper_changed(void)
 void wm_set_title(struct window *w, const char *title)
 {
     strncpy(w->title, title, sizeof(w->title) - 1);
+    wm_damage(caption_rect(w));
+    damage_taskbar();
+}
+
+void wm_set_icon(struct window *w, enum icon_id icon)
+{
+    w->icon = icon;
+    wm_damage(caption_rect(w));
+    damage_taskbar();
+}
+
+void wm_set_icon_image(struct window *w, const struct image *img)
+{
+    struct image *copy = NULL;
+    if (img && img->w > 0 && img->h > 0 && (copy = calloc(1, sizeof(*copy))) &&
+        (copy->px = malloc((size_t)img->w * (size_t)img->h * 4))) {
+        copy->w = img->w;
+        copy->h = img->h;
+        memcpy(copy->px, img->px, (size_t)img->w * (size_t)img->h * 4);
+    } else if (copy) {
+        free(copy);
+        copy = NULL;
+    }
+    image_free(w->icon_img);
+    w->icon_img = copy;
     wm_damage(caption_rect(w));
     damage_taskbar();
 }
@@ -2674,10 +2640,29 @@ static void dnd_clear(void)
     update_cursor();
 }
 
+static uint32_t drag_serial;
+
+uint32_t wm_drag_serial(void)
+{
+    return drag_serial;
+}
+
+void wm_drag_update(struct window *w, int effect, const char *hint)
+{
+    if (!dnd_shown() || dnd.target != w || w == dnd.src)
+        return;
+    damage_drag_image();
+    dnd.effect = effect;
+    snprintf(dnd.hint, sizeof(dnd.hint), "%s", hint);
+    damage_drag_image();
+    update_cursor();
+}
+
 void wm_drag_start(struct window *w, const struct drag_data *d)
 {
     if (drag != DRAG_CLIENT || drag_win != w || dnd.active)
         return;
+    drag_serial++;
     dnd.d = *d;
     dnd.d.paths = NULL;
     dnd.d.npaths = 0;
@@ -2781,7 +2766,7 @@ static void press_left(void)
             return;
         }
         if (rect_contains(wifi_icon_rect(), mx, my)) {
-            wireless_open();
+            open_wireless();
             return;
         }
         if (rect_contains(tray_rect(), mx, my)) {
@@ -3136,7 +3121,7 @@ static void key_event(const struct input_event *ev)
         dnd_cancel();                   /* and the window it came from hears Escape too */
 
     if (setup_mode && code == KEY_F10 && (ev->mods & KMOD_SHIFT)) {
-        terminal_open("Command Prompt", NULL, 0, 0);
+        launch_terminal(NULL, "Command Prompt", NULL, 0);
         return;
     }
     if (code == KEY_LWIN || code == KEY_RWIN || (ctrl && code == KEY_ESC)) {
@@ -3266,6 +3251,13 @@ void wm_splash(const char *message)
     show_frame(&all, 1);
 }
 
+void wm_clock_changed(void)
+{
+    update_clock();
+    if (!setup_mode)
+        wm_damage(tray_rect());
+}
+
 void wm_tick(void)
 {
     if (update_clock() && !setup_mode)
@@ -3325,6 +3317,7 @@ int wm_reconfigure(void)
     if (my >= screen_h)
         my = screen_h - 1;
     sidebar_layout();
+    server_state_changed();             /* the programs hear of the new screen before their windows refit */
     for (struct window *w = bottom; w; w = w->above) {
         if (w->maximized || (w->flags & WF_DESKTOP)) {
             set_frame(w, mkrect(0, 0, work_right(), work_bottom()));

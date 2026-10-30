@@ -743,7 +743,7 @@ static void press_button(struct setup *s, int b)
     if (!button_enabled(s, b))
         return;
     if (b == B_DISKS) {
-        diskmgr_open();                 /* setup_focus looks at the disks again after */
+        app_launch("diskmgr");        /* setup_focus looks at the disks again after */
         paint(s);
         return;
     }

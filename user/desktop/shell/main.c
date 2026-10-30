@@ -4,14 +4,17 @@
  * console shell. Exiting it (Shut Down... > exit to the console) gives
  * the screen back to the text console.
  *
+ * It is the window manager, the taskbar, its folder on the wallpaper and
+ * its own dialogs; every program is a process of its own that connects
+ * to it for its windows (server.c), the terminal it opens at the start
+ * too.
+ *
  * "desktop --setup" is what the install CD starts instead: fluxOS Setup
  * on a screen of its own, with no taskbar or desktop folder.
  *
- * "desktop --js-worker" is a web page's worker (the browser starts it; see
- * wave/js/jsworker.c): a script engine and two pipes, no screen at all.
- *
- * One loop polls the input device and every terminal's pty, handles
- * what is ready, runs the timers and repaints what changed.
+ * One loop polls the input device, the programs' sockets and whatever
+ * else is watched, handles what is ready, runs the timers and repaints
+ * what changed.
  */
 #include <fcntl.h>
 #include <poll.h>
@@ -22,53 +25,12 @@
 #include <unistd.h>
 #include "desktop.h"
 #include "imagejobs.h"
-#include "jsworker.h"
 
-#define MAX_TERMS   32
-#define MAX_WATCHES 24
-#define BLINK_MS    500
-
-/* Other descriptors the loop waits on, such as the installer's pipe. */
-static struct watch {
-    int fd;
-    void (*ready)(void *ctx, int revents);
-    void *ctx;
-} watches[MAX_WATCHES];
-static int nwatches;
-
-int loop_watch(int fd, void (*ready)(void *ctx, int revents), void *ctx)
-{
-    if (nwatches == MAX_WATCHES)
-        return -1;
-    watches[nwatches].fd = fd;
-    watches[nwatches].ready = ready;
-    watches[nwatches].ctx = ctx;
-    nwatches++;
-    return 0;
-}
-
-void loop_unwatch(int fd)
-{
-    for (int i = 0; i < nwatches; i++) {
-        if (watches[i].fd == fd) {
-            watches[i] = watches[--nwatches];
-            return;
-        }
-    }
-}
-
-static int watching(const struct watch *w)
-{
-    for (int i = 0; i < nwatches; i++)
-        if (watches[i].fd == w->fd && watches[i].ready == w->ready && watches[i].ctx == w->ctx)
-            return 1;
-    return 0;
-}
+#define MAX_WATCHES 64
+#define TICK_MS     1000
 
 int main(int argc, char **argv)
 {
-    if (argc > 1 && !strcmp(argv[1], "--js-worker"))
-        return jsworker_main(argc, argv);
     signal(SIGINT, SIG_IGN);
     signal(SIGQUIT, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
@@ -86,108 +48,69 @@ int main(int argc, char **argv)
     sound_init();
     power_init();
     wireless_init();
+    if (server_init() < 0)
+        fprintf(stderr, "desktop: programs cannot open windows\n");
     if (setup) {
         setup_open();
         wm_flush();
     } else {
         saver_init();
         files_open_desktop();           /* the desktop's folder, under every window */
-        terminal_open("Terminal", NULL, 0, 1);
+        launch1("terminal", "-m");
         wm_flush();
         sound_startup();                /* the desktop has replaced the boot screen */
         wallpaper_init();               /* after the first frame: decoding takes a moment */
         wm_flush();
     }
 
-    unsigned int last_blink = now_ms(), last_tick = last_blink;
+    unsigned int last_tick = now_ms();
     for (;;) {
-        struct pollfd fds[1 + MAX_TERMS + MAX_WATCHES];
-        struct window *owners[1 + MAX_TERMS];
-        struct watch w[MAX_WATCHES];
+        struct pollfd fds[1 + MAX_WATCHES];
         fds[0].fd = input;
         fds[0].events = POLLIN;
         fds[0].revents = 0;
-        int n = 1 + terminal_poll_fds(fds + 1, owners + 1, MAX_TERMS);
-        int nw = nwatches;
-        for (int i = 0; i < nw; i++) {
-            w[i] = watches[i];
-            fds[n + i].fd = w[i].fd;
-            fds[n + i].events = POLLIN;
-            fds[n + i].revents = 0;
-        }
+        int nw = loop_poll_fds(fds + 1, MAX_WATCHES);
 
-        unsigned int since = now_ms() - last_blink;
-        int timeout = since >= BLINK_MS ? 0 : (int)(BLINK_MS - since);
-        int frame = gears_timeout();            /* animation wants an earlier wakeup */
-        if (frame >= 0 && frame < timeout)
-            timeout = frame;
-        int js = browser_timeout();             /* a page's timers */
-        if (js >= 0 && js < timeout)
-            timeout = js;
+        unsigned int since = now_ms() - last_tick;
+        int timeout = since >= TICK_MS ? 0 : (int)(TICK_MS - since);
         int images = image_jobs_timeout();
-        if (images >= 0 && images < timeout) timeout = images;
+        if (images >= 0 && images < timeout)
+            timeout = images;
         int sv = saver_timeout();               /* the screen saver starting, or moving */
         if (sv >= 0 && sv < timeout)
             timeout = sv;
-        poll(fds, (unsigned int)(n + nw), timeout);
+        poll(fds, (unsigned int)(1 + nw), timeout);
 
-        /* Input first, before background I/O callbacks. A callback may close
-         * windows or remove watches; the snapshots below are checked again. */
+        /* Input first, before background I/O callbacks (the programs' messages among them). */
         if (fds[0].revents & POLLIN) {
             struct input_event ev[64];
             int r = (int)read(input, ev, sizeof(ev));
-            for (int i = 0; i < r / (int)sizeof(ev[0]); i++) wm_input(&ev[i]);
+            for (int i = 0; i < r / (int)sizeof(ev[0]); i++)
+                wm_input(&ev[i]);
         }
-
-        /* Terminals whose windows survived input handling. */
-        for (int i = 1; i < n; i++)
-            if (fds[i].revents)
-                terminal_ready(owners[i], fds[i].revents);
-
-        /* A callback may drop its own watch or another; check each is still wanted. */
-        for (int i = 0; i < nw; i++)
-            if (fds[n + i].revents && watching(&w[i]))
-                w[i].ready(w[i].ctx, fds[n + i].revents);
+        loop_dispatch(fds + 1);
 
         int pid, status;
         while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
             image_worker_child_exited(pid);
-            terminal_child_exited(pid);
             setup_child_exited(pid, status);
-            browser_child_exited(pid, status);
-            player_child_exited(pid, status);
-            archiver_child_exited(pid, status);
         }
 
         saver_frame();
-        gears_frame();
         image_jobs_poll();
-        browser_poll();
         unsigned int now = now_ms();
-        if (now - last_blink >= BLINK_MS) {
-            last_blink = now;
-            terminal_blink();
-            editor_blink();
-            browser_blink();
-            player_tick();
-        }
-        if (now - last_tick >= 1000) {
+        if (now - last_tick >= TICK_MS) {
             last_tick = now;
             wm_tick();
             clock_tick();
-            datetime_tick();
-            minesweeper_tick();
             about_tick();
-            display_tick();
             sound_tick();
             power_tick();
-            wireless_tick();
+            wireless_tray_tick();
             files_tick();
-            taskmgr_tick();
-            diskmgr_tick();
-            browser_tick();
             setup_tick();
         }
+        server_sync();
         wm_flush();
     }
 }

@@ -1,6 +1,6 @@
 /*
  * Dedicated workers. Each one is a process of its own: the desktop binary
- * run as "desktop --js-worker url type name" (jsworker_main), a page engine
+ * run as "wave --js-worker url type name" (jsworker_main), a page engine
  * with no document whose global object is made a worker's scope. It talks
  * to its page over a pair of pipes, so a busy worker never holds up the
  * page, and the engine (one heap per process) needs no locks.
@@ -39,9 +39,9 @@
 
 extern char **environ;
 #ifndef WORKER_HELPER
-#define WORKER_HELPER "/bin/desktop"
+#define WORKER_HELPER "/bin/wave"
 #endif
-/* The desktop's loop wakes when one of these descriptors is ready (shell/main.c); host tests have none. */
+/* Wave's loop wakes when one of these descriptors is ready (shell/loop.c); host tests have none. */
 int loop_watch(int fd, void (*ready)(void *ctx, int revents), void *ctx) __attribute__((weak));
 void loop_unwatch(int fd) __attribute__((weak));
 
@@ -156,7 +156,7 @@ static int launch(struct worker *w, const char *url, const char *type, const cha
         dup2(out[1], 1);
         for (int i = 3; i < 256; i++)
             close(i);
-        char *args[] = {"desktop", "--js-worker", (char *)url, (char *)type, (char *)name, NULL};
+        char *args[] = {"wave", "--js-worker", (char *)url, (char *)type, (char *)name, NULL};
         execve(WORKER_HELPER, args, environ);
         _exit(127);
     }

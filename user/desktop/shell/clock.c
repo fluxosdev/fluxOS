@@ -260,3 +260,11 @@ void clock_open(void)
     wm_move(clock_win, wm_work_right() - clock_win->r.w - 2, screen_h - TASKBAR_H - clock_win->r.h - 2);
     paint();
 }
+
+/* At startup: the saved time zone (fluxos_tz, minutes east of UTC), which Date and Time sets. */
+void datetime_init(void)
+{
+    char dir[128], value[16];
+    if (grubenv_boot_dir(dir, sizeof(dir)) && grubenv_get(dir, "fluxos_tz", value, sizeof(value)) > 0)
+        tz_set(atoi(value));
+}

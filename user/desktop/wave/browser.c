@@ -2000,10 +2000,8 @@ static void free_page(struct browser *b)
     b->drag_on = 0;
     b->drag_src = b->drag_over = NULL;
     if (b->favicon) {
-        if (b->win && b->win->icon_img == b->favicon) {
-            b->win->icon_img = NULL;
-            wm_damage(b->win->r);
-        }
+        if (b->win && tab_active(b))
+            wm_set_icon_image(b->win, NULL);
         image_free(b->favicon);
         b->favicon = NULL;
     }
@@ -3432,7 +3430,7 @@ static void decoded_ready(void *context, struct image *image, int full_w, int fu
     if(request->icon) {
         if(image && b->win) {
             image_free(b->favicon);b->favicon=image;
-            if(tab_active(b)){b->win->icon_img=image;wm_damage(b->win->r);}
+            if(tab_active(b))wm_set_icon_image(b->win,image);
         } else image_free(image);
     } else image_received(b,request->url,image);
     if(!b->pending_images && !fetch_busy(b) && b->qhead>=b->nqueue)done_status(b);
@@ -4298,7 +4296,7 @@ static void navigate(struct browser *b, const char *url, const char *post, int m
     struct stat archive_stat;
     if (!source && !post && !is_frame(b) && url_file_path(fu, archive_path, sizeof(archive_path)) &&
         web_archive_path(archive_path) && stat(archive_path, &archive_stat) == 0 && S_ISREG(archive_stat.st_mode)) {
-        archiver_open(archive_path);
+        launch1("archiver", archive_path);
         set_status(b, "Opened %.120s in Archive Manager", archive_path);
         paint(b);
         return;
@@ -7504,7 +7502,6 @@ static void br_destroy(struct window *w)
 {
     struct browser *b = w->priv;
     struct tab_group *group = b->tabs;
-    w->icon_img = NULL;                 /* each tab owns its favicon */
     w->priv = NULL;
     for (struct browser *tab = group ? group->first : b; tab;) {
         struct browser *next = tab->next_tab;
@@ -7639,7 +7636,7 @@ static void tab_select(struct browser *b)
     group->active = b;
     b->win->priv = b;
     b->focused = old ? old->focused : 0;
-    b->win->icon_img = b->favicon;
+    wm_set_icon_image(b->win, b->favicon);  /* (copied: each tab keeps its own) */
     if (old) {
         old->focused = 0;
         tab_reset_input(old);
@@ -7655,7 +7652,6 @@ static void tab_select(struct browser *b)
     char title[sizeof(b->page_title)];
     snprintf(title, sizeof(title), "%s", b->page_title);
     update_title(b, title);
-    wm_damage(b->win->r);
     paint(b);
 }
 

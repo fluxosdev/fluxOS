@@ -659,7 +659,7 @@ static int sys_mmap(uint32_t uargs, uint32_t b, uint32_t c, uint32_t d, uint32_t
     struct flux_mmap_args a;
     if (copy_from_user(&a, (const void *)uargs, sizeof(a)) < 0)
         return -EFAULT;
-    if (!a.len)
+    if (!a.len || (a.flags & MAP_KFRAMES))
         return -EINVAL;
 
     struct file *f = NULL;
@@ -1453,9 +1453,45 @@ static int install_socket(struct socket *s)
     return fd;
 }
 
+/* An AF_UNIX descriptor's file, or NULL (an AF_INET socket or not a socket at all). */
+static struct file *get_unix(uint32_t fd)
+{
+    struct file *f = get_file(fd);
+    return f && f->type == FT_UNIX ? f : NULL;
+}
+
+/* A struct sockaddr_un's path, NUL-terminated (Linux allows sun_path to fill the field). */
+static int copy_unix_path(uint32_t uaddr, uint32_t len, char *path)
+{
+    if (len <= 2)
+        return -EINVAL;
+    uint32_t n = MIN(len - 2, (uint32_t)UNIX_PATH_MAX - 1);
+    uint16_t family;
+    if (copy_from_user(&family, (const void *)uaddr, 2) < 0 ||
+        copy_from_user(path, (const char *)uaddr + 2, n) < 0)
+        return -EFAULT;
+    if (family != AF_UNIX)
+        return -EAFNOSUPPORT;
+    path[n] = 0;
+    return 0;
+}
+
 static int sys_socket(uint32_t domain, uint32_t type, uint32_t proto, uint32_t d, uint32_t e)
 {
     (void)d; (void)e;
+    if (domain == AF_UNIX) {
+        if (type != SOCK_STREAM)
+            return -EPROTOTYPE;
+        if (proto)
+            return -EPROTONOSUPPORT;
+        struct file *f = unix_create();
+        if (!f)
+            return -ENOMEM;
+        int fd = alloc_fd(f);
+        if (fd < 0)
+            file_close(f);
+        return fd;
+    }
     struct socket *s;
     int r = sock_create((int)domain, (int)type, (int)proto, &s);
     return r < 0 ? r : install_socket(s);
@@ -1464,6 +1500,12 @@ static int sys_socket(uint32_t domain, uint32_t type, uint32_t proto, uint32_t d
 static int sys_bind(uint32_t fd, uint32_t uaddr, uint32_t len, uint32_t d, uint32_t e)
 {
     (void)d; (void)e;
+    struct file *uf = get_unix(fd);
+    if (uf) {
+        char path[UNIX_PATH_MAX];
+        int r = copy_unix_path(uaddr, len, path);
+        return r < 0 ? r : unix_bind(uf, path);
+    }
     struct socket *s;
     struct sockaddr_in sin;
     int r = get_socket(fd, &s);
@@ -1475,6 +1517,12 @@ static int sys_bind(uint32_t fd, uint32_t uaddr, uint32_t len, uint32_t d, uint3
 static int sys_connect(uint32_t fd, uint32_t uaddr, uint32_t len, uint32_t d, uint32_t e)
 {
     (void)d; (void)e;
+    struct file *uf = get_unix(fd);
+    if (uf) {
+        char path[UNIX_PATH_MAX];
+        int r = copy_unix_path(uaddr, len, path);
+        return r < 0 ? r : unix_connect(uf, path);
+    }
     struct socket *s;
     struct sockaddr_in sin;
     int r = get_socket(fd, &s);
@@ -1486,6 +1534,9 @@ static int sys_connect(uint32_t fd, uint32_t uaddr, uint32_t len, uint32_t d, ui
 static int sys_listen(uint32_t fd, uint32_t backlog, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)c; (void)d; (void)e;
+    struct file *uf = get_unix(fd);
+    if (uf)
+        return unix_listen(uf, (int)backlog);
     struct socket *s;
     int r = get_socket(fd, &s);
     return r < 0 ? r : sock_listen(s, (int)backlog);
@@ -1494,6 +1545,18 @@ static int sys_listen(uint32_t fd, uint32_t backlog, uint32_t c, uint32_t d, uin
 static int sys_accept(uint32_t fd, uint32_t uaddr, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)c; (void)d; (void)e;
+    struct file *uf = get_unix(fd);
+    if (uf) {
+        /* The peer has no name to give: the caller's address is left as it is. */
+        struct file *conn;
+        int r = unix_accept(uf, &conn);
+        if (r < 0)
+            return r;
+        r = alloc_fd(conn);
+        if (r < 0)
+            file_close(conn);
+        return r;
+    }
     struct socket *s, *conn;
     struct sockaddr_in peer;
     int r = get_socket(fd, &s);
@@ -1510,8 +1573,13 @@ static int sys_accept(uint32_t fd, uint32_t uaddr, uint32_t c, uint32_t d, uint3
     return r;
 }
 
+static int sys_write(uint32_t fd, uint32_t buf, uint32_t n, uint32_t d, uint32_t e);
+static int sys_read(uint32_t fd, uint32_t buf, uint32_t n, uint32_t d, uint32_t e);
+
 static int sys_sendto(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, uint32_t uaddr)
 {
+    if (get_unix(fd))
+        return sys_write(fd, buf, n, 0, 0);     /* connected: no address, and no flags kept */
     struct socket *s;
     struct file *f;
     struct sockaddr_in sin;
@@ -1548,6 +1616,8 @@ static int sys_sendto(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, uin
 
 static int sys_recvfrom(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, uint32_t uaddr)
 {
+    if (get_unix(fd))
+        return sys_read(fd, buf, n, 0, 0);
     struct socket *s;
     struct file *f;
     struct sockaddr_in sin;
@@ -2049,6 +2119,9 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_times] = sys_times,
     [SYS_fchdir] = sys_fchdir,
     [SYS_fchmod] = sys_fchmod,
+    [SYS_shmget] = sys_shmget,
+    [SYS_shmat] = sys_shmat,
+    [SYS_shmctl] = sys_shmctl,
 };
 
 /* VFS operations and shared file offsets; read and write lock per chunk. */

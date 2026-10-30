@@ -19,9 +19,6 @@
 #define FRAME_MS 33
 #define SPEED 110                       /* pixels a second, on each axis */
 
-const int saver_timeouts[SAVER_TIMEOUTS] = { 30, 60, 120, 300, 600, 900, 1800, 3600 };
-const int saver_sizes[SAVER_SIZES] = { 32, 48, 64, 96, 128, 192, 256 };
-
 static struct saver_config cfg = { 0, 300, 128 };
 static int run_size;                    /* the size of the logo that is running (a preview may differ) */
 static unsigned int last_input;

@@ -9,7 +9,10 @@
 #undef WIFSTOPPED
 #undef WSTOPSIG
 #undef WIFCONTINUED
+#include "../user/desktop/shell/mousecfg.c"
 #include "../user/desktop/apps/mouse.c"
+
+void mouse_config_changed(void) {}     /* the desktop's to hear: there is none here */
 
 static void move(int absolute, int px, int py, int *x, int *y)
 {
@@ -23,7 +26,7 @@ static void move(int absolute, int px, int py, int *x, int *y)
 int main(void)
 {
     int x = 0, y = 0;
-    struct mouse_config cfg = saved_cfg;
+    struct mouse_config cfg = mouse_saved_cfg;
     move(1, 16000, 16000, &x, &y);
     assert(x == 500 && y == 500);
 
@@ -40,7 +43,7 @@ int main(void)
         move(1, 16320 + i * 32, 15680 - i * 32, &x, &y);
     assert(x == 531 && y == 469);  /* retain fractional motion at 0.25x */
 
-    active_cfg = saved_cfg;         /* Cancel restores host alignment */
+    mouse_active_cfg = mouse_saved_cfg; /* Cancel restores host alignment */
     move(1, 16000, 16000, &x, &y);
     assert(x == 500 && y == 500);
     move(0, 10, -10, &x, &y);

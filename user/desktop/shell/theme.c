@@ -17,7 +17,9 @@
  * are copied into font_sans and font_sans_bold so that everything drawing
  * text picks them up. wm.c, widgets.c and gfx.c draw each part the
  * theme's way; windows are asked to draw their client areas again when it
- * changes.
+ * changes. Every program keeps the same values: the desktop tells them the
+ * look in use, and changing it is the desktop's to do (server.c's
+ * theme_set, and theme_sample).
  *
  * The choice is kept in GRUB's environment block when the system runs from
  * a hard disk (fluxos_theme: "classic", "glass", or "kinetik-" and the color).
@@ -38,6 +40,10 @@ const color_t accent_swatches[ACCENTS] = {
     RGB(0x23, 0x99, 0xF3), RGB(0xBF, 0x00, 0xFF), RGB(0xF5, 0x8B, 0x23),
     RGB(0x5B, 0xBE, 0x39), RGB(0xE4, 0xEA, 0xF2), RGB(0x40, 0x49, 0x58),
 };
+
+/* The screen saver's choices, which Display Properties offers with the rest of the look. */
+const int saver_timeouts[SAVER_TIMEOUTS] = { 30, 60, 120, 300, 600, 900, 1800, 3600 };
+const int saver_sizes[SAVER_SIZES] = { 32, 48, 64, 96, 128, 192, 256 };
 
 /* Each color's palette, as the studies have it. */
 static const struct palette {
@@ -62,7 +68,7 @@ static const struct palette {
 static const struct palette glass_palette = { 0x31444F, 0x86A0AE, 0x9DB7C4, 0xD4EAF1, 0xB8D3DF, 0x687079,
                                               0x454C53, 0x272E35, 0x617D8C, 0x304858, 0xEDF3F9 };
 
-static void apply(int style, int accent)
+void theme_apply(int style, int accent)
 {
     theme.style = style >= 0 && style < THEME_STYLES ? style : THEME_KINETIK;
     theme.accent = accent >= 0 && accent < ACCENTS ? accent : ACCENT_BLUE;
@@ -126,17 +132,13 @@ void theme_init(void)
     int style = THEME_KINETIK, accent = ACCENT_BLUE;
     if (grubenv_boot_dir(dir, sizeof(dir)) && grubenv_get(dir, "fluxos_theme", value, sizeof(value)))
         parse(value, &style, &accent);
-    apply(style, accent);
+    theme_apply(style, accent);
 }
 
-void theme_set(int style, int accent, int save)
+void theme_save(void)
 {
-    int old = theme.style;
-    apply(style, accent);
-    wm_restyle();
-    wallpaper_theme_changed(old);
     char dir[128], value[32];
-    if (!save || !grubenv_boot_dir(dir, sizeof(dir)))
+    if (!grubenv_boot_dir(dir, sizeof(dir)))
         return;
     if (theme.style != THEME_KINETIK)
         snprintf(value, sizeof(value), "%s", style_keys[theme.style]);
@@ -165,25 +167,4 @@ void theme_kinetik_blue(struct surface *s, int w, int h)
     theme.pale = p->pale, theme.glow = p->glow;
     wallpaper_kinetik(s, w, h);
     theme = saved;
-}
-
-void theme_sample(struct surface *s, struct rect r, int style, int accent)
-{
-    struct theme saved = theme;
-    struct syscolors saved_sys = sys;
-    struct pfont saved_sans = font_sans, saved_bold = font_sans_bold;
-    apply(style, accent);
-    struct surface bg;
-    if (KINETIK && surface_init(&bg, r.w, r.h) == 0) {
-        wallpaper_kinetik(&bg, r.w, r.h);
-        gfx_blit(s, r.x, r.y, &bg, 0, 0, r.w, r.h);
-        surface_free(&bg);
-    } else {
-        gfx_fill(s, r.x, r.y, r.w, r.h, C_DESKTOP);
-    }
-    wm_draw_sample(s, r);
-    theme = saved;
-    sys = saved_sys;
-    font_sans = saved_sans;
-    font_sans_bold = saved_bold;
 }

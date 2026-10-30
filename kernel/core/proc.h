@@ -230,7 +230,10 @@ void proc_check_signals(void);
 int proc_grow_stack(uint32_t addr);
 int proc_page_fault(uint32_t addr, int write);
 uint32_t proc_vma_lowest(const struct proc *p);
+/* Kernel only, in flux_mmap_args.flags: the pages are put in by the caller (proc_map_frames). */
+#define MAP_KFRAMES 0x40000000u
 int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint32_t *out);
+int proc_map_frames(struct proc *p, const uint32_t *frames, uint32_t npages, uint32_t *out);
 int proc_munmap(struct proc *p, uint32_t addr, uint32_t len);
 int proc_mprotect(struct proc *p, uint32_t addr, uint32_t len, uint32_t prot);
 

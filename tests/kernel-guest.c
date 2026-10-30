@@ -13,6 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/shm.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -763,6 +766,97 @@ static void user_memory_races(void)
     puts("guest: read into memory unmapped meanwhile, and two threads exiting at once passed");
 }
 
+/* Shared memory segments and AF_UNIX stream sockets: what the desktop and its programs share. */
+static void ipc_regressions(void)
+{
+    struct meminfo before, after;
+    CHECK(meminfo(&before) == 0);
+    int id = shmget(IPC_PRIVATE, 3 * 4096 + 100, 0); CHECK(id >= 0);
+    struct shmid_ds ds; CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_segsz == 3 * 4096 + 100);
+    uint32_t *a = shmat(id, NULL, 0); CHECK(a != (void *)-1);
+    CHECK(a[0] == 0 && a[3 * 1024] == 0);
+    a[0] = 0x12345678; a[3 * 1024 + 10] = 0xCAFE;
+    int ready[2]; CHECK(pipe(ready) == 0);
+    int child = fork(); CHECK(child >= 0);
+    if (!child) {
+        /* a second mapping of the same memory, and the inherited one */
+        uint32_t *b = shmat(id, NULL, 0);
+        if (b == (void *)-1 || b == a || b[0] != 0x12345678 || a[3 * 1024 + 10] != 0xCAFE) _exit(1);
+        b[1] = 0xBEEF;
+        if (a[1] != 0xBEEF || shmdt(b) != 0) _exit(2);
+        a[2] = 0xF00D;
+        _exit(0);
+    }
+    int status;
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(a[1] == 0xBEEF && a[2] == 0xF00D);
+    CHECK(shmctl(id, IPC_RMID, NULL) == 0);
+    CHECK(shmat(id, NULL, 0) == (void *)-1 && errno == EINVAL);
+    CHECK(a[0] == 0x12345678);          /* mapped still */
+    CHECK(shmdt(a) == 0 && shmdt(a) == -1);
+    int key = shmget(4242, 4096, IPC_CREAT); CHECK(key >= 0);
+    CHECK(shmget(4242, 4096, 0) == key);
+    CHECK(shmget(4242, 4096, IPC_CREAT | IPC_EXCL) == -1 && errno == EEXIST);
+    child = fork(); CHECK(child >= 0);
+    if (!child) _exit(shmget(IPC_PRIVATE, 4096, 0) >= 0 ? 0 : 1);    /* left for its exit to remove */
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(shmctl(key, IPC_RMID, NULL) == 0);
+    close(ready[0]); close(ready[1]);
+    CHECK(meminfo(&after) == 0);
+    CHECK(before.free_kb - after.free_kb < 64);
+    puts("guest: shared memory segments passed");
+
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    strcpy(addr.sun_path, "/tmp/.regress-socket");
+    int ls = socket(AF_UNIX, SOCK_STREAM, 0); CHECK(ls >= 0);
+    CHECK(socket(AF_UNIX, SOCK_DGRAM, 0) == -1);
+    int early = socket(AF_UNIX, SOCK_STREAM, 0); CHECK(early >= 0);
+    CHECK(connect(early, (struct sockaddr *)&addr, sizeof(addr)) == -1 && errno == ECONNREFUSED);
+    CHECK(bind(ls, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    CHECK(bind(early, (struct sockaddr *)&addr, sizeof(addr)) == -1 && errno == EADDRINUSE);
+    close(early);
+    CHECK(listen(ls, 4) == 0);
+    CHECK(fcntl(ls, F_SETFL, O_NONBLOCK) == 0);
+    CHECK(accept(ls, NULL, NULL) == -1 && errno == EAGAIN);
+    child = fork(); CHECK(child >= 0);
+    if (!child) {
+        int c = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (c < 0 || connect(c, (struct sockaddr *)&addr, sizeof(addr)) != 0) _exit(1);
+        char big[100000];
+        for (unsigned i = 0; i < sizeof(big); i++) big[i] = (char)i;
+        if (write(c, big, sizeof(big)) != (int)sizeof(big)) _exit(2);
+        char reply[8];
+        if (read(c, reply, 5) != 5 || memcmp(reply, "thanks", 5)) _exit(3);
+        if (read(c, reply, 1) != 0) _exit(4);       /* the other end closed */
+        _exit(0);
+    }
+    struct pollfd pfd = { ls, POLLIN, 0 };
+    CHECK(poll(&pfd, 1, 5000) == 1 && (pfd.revents & POLLIN));
+    int conn = accept(ls, NULL, NULL); CHECK(conn >= 0);
+    static char got[100000];
+    int n = 0;
+    while (n < (int)sizeof(got)) {
+        int r = read(conn, got + n, sizeof(got) - n);
+        CHECK(r > 0);
+        n += r;
+    }
+    for (unsigned i = 0; i < sizeof(got); i++) CHECK(got[i] == (char)i);
+    CHECK(send(conn, "thanks", 5, 0) == 5);
+    close(conn);
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    /* a connection nobody accepts ends when the listener goes, and the name is free again */
+    int c = socket(AF_UNIX, SOCK_STREAM, 0); CHECK(c >= 0);
+    CHECK(connect(c, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    close(ls);
+    char ch;
+    CHECK(read(c, &ch, 1) == 0);
+    close(c);
+    ls = socket(AF_UNIX, SOCK_STREAM, 0); CHECK(ls >= 0);
+    CHECK(bind(ls, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    close(ls);
+    puts("guest: AF_UNIX stream sockets passed");
+}
+
 int main(void)
 {
     sound_mixing();
@@ -770,6 +864,7 @@ int main(void)
     phase0_regressions();
     shared_offset_stress();
     user_memory_races();
+    ipc_regressions();
     int fd = open("/tmp/size-test", O_CREAT | O_RDWR, 0600);
     CHECK(fd >= 0);
     CHECK(write(fd, "safe", 4) == 4);

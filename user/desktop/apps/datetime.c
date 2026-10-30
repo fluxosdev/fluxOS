@@ -116,26 +116,22 @@ static void set_zone(int i)
     zone = i;
     tz_set(zones[zone].minutes);
     save_zone();
+    datetime_zone_changed(zones[zone].minutes);     /* the desktop's clock, and every program's */
 }
 
-/* Start the saved time zone (UTC without one). */
-void datetime_init(void)
+/* The zone in use, which the desktop said (UTC if it is not in the list). */
+static void find_zone(void)
 {
-    char dir[128], value[16];
-    int minutes = 0;
-    if (grubenv_boot_dir(dir, sizeof(dir)) && grubenv_get(dir, "fluxos_tz", value, sizeof(value)) > 0)
-        minutes = atoi(value);
+    int minutes = tz_get(), utc = 0;
+    zone = -1;
     for (int i = 0; i < NZONES; i++) {
-        if (zones[i].minutes == minutes) {
+        if (zones[i].minutes == minutes && zone < 0)
             zone = i;
-            break;
-        }
+        if (!zones[i].minutes)
+            utc = i;
     }
-    if (zones[zone].minutes == 0)
-        for (int i = 0; i < NZONES; i++)
-            if (!zones[i].minutes)
-                zone = i;
-    tz_set(zones[zone].minutes);
+    if (zone < 0)
+        zone = utc;
 }
 
 /* ---- SNTP ---- */
@@ -379,6 +375,7 @@ void datetime_open(void)
     pressed = -1;
     focus = B_SYNC;
     status[0] = 0;
+    find_zone();
     dt_win = wm_create("Date and Time Properties", ICON_DATETIME, DT_W, DT_H, 0, &dt_ops, NULL);
     if (!dt_win)
         return;

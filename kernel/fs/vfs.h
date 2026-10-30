@@ -107,7 +107,7 @@ int vfs_getpath(struct vnode *vn, char *buf, uint32_t size);
 /* ---- open file descriptions ---- */
 #define PIPE_SIZE 65536
 
-enum { FT_VNODE = 1, FT_PIPE, FT_SOCKET };
+enum { FT_VNODE = 1, FT_PIPE, FT_SOCKET, FT_UNIX };
 
 struct pipe {
     char buf[PIPE_SIZE];
@@ -116,6 +116,7 @@ struct pipe {
 };
 
 struct socket;
+struct unix_sock;
 
 struct file {
     int type;
@@ -125,6 +126,7 @@ struct file {
     struct vnode *vn;
     struct pipe *pipe;
     struct socket *sock;
+    struct unix_sock *usock;    /* FT_UNIX */
     struct readcache_stream read_stream;
 };
 
@@ -135,6 +137,15 @@ void file_close(struct file *f);
 int file_read(struct file *f, void *buf, uint32_t n);
 int file_write(struct file *f, const void *buf, uint32_t n);
 int pipe_create(struct file **rd, struct file **wr);
+
+/* AF_UNIX stream sockets: a name in the kernel's own namespace (no file is made), and a
+ * connection is two pipes. path is at most UNIX_PATH_MAX - 1 bytes. */
+#define UNIX_PATH_MAX 108
+struct file *unix_create(void);
+int unix_bind(struct file *f, const char *path);
+int unix_listen(struct file *f, int backlog);
+int unix_connect(struct file *f, const char *path);
+int unix_accept(struct file *f, struct file **out);
 
 /* poll(2): which of events are ready on f; waiters are woken by poll_wakeup. */
 int file_poll(struct file *f, int events);

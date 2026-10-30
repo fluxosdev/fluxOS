@@ -112,8 +112,11 @@ extern "C" {
 #define SYS_link        100 /* existing path, new path: a hard link (ext2) */
 #define SYS_chown       101 /* path, uid (-1: kept), gid (-1: kept), follow the last link (0: lchown) */
 #define SYS_fchown      102 /* fd, uid, gid */
+#define SYS_shmget      103 /* key, size, IPC_CREAT | IPC_EXCL */
+#define SYS_shmat       104 /* id, uint32_t *size: the address it is mapped at */
+#define SYS_shmctl      105 /* id, IPC_RMID or IPC_STAT, struct flux_shmid_ds * */
 
-#define NSYSCALLS       103
+#define NSYSCALLS       106
 
 #ifdef __cplusplus
 }

@@ -1,6 +1,6 @@
-/* Unix-domain socket addresses. The kernel has no such sockets (socket()
- * with AF_UNIX fails with EAFNOSUPPORT); the type lets programs that can
- * use them build. */
+/* Unix-domain socket addresses. The kernel has SOCK_STREAM sockets, named
+ * in a namespace of its own: binding makes no file, and a name is free
+ * again once the socket bound to it is closed. */
 #ifndef _SYS_UN_H
 #define _SYS_UN_H
 

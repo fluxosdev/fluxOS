@@ -69,6 +69,11 @@ says why.
   fault signals; ^C, ^\ and ^Z from the terminal, stopped and continued jobs; `sigaltstack`,
   `sigpending`), sessions (`setsid`, `getsid`), interval timers (`setitimer` real, virtual and
   profiling, `alarm`), paths up to 4096 bytes, lazy FPU and SSE switching (FXSAVE/FXRSTOR).
+- IPC between processes: pipes, pseudo-terminals, `AF_UNIX` stream sockets (named in a
+  namespace of the kernel's own: binding makes no file) and System V shared memory
+  (`shmget`/`shmat`/`shmdt`/`shmctl`; a segment's memory lasts while anything maps it,
+  and one its creator never removed goes when the creator exits). The desktop and its
+  programs talk over the first and share windows' pixels through the second.
 - Threads: a process's threads share its address space, descriptors and signal handlers and run
   on every processor at once; futexes to wait on, a TLS segment per thread (%gs), `exit()` and
   fatal signals ending all of them, `exec` from any of them. libc has POSIX threads on top
@@ -269,6 +274,17 @@ says why.
   test-sh` runs the same scripts under it and the host's `/bin/sh` (dash).
 
 **The desktop** (`/bin/desktop`), started by init at boot
+- **Every program is a process of its own**: the desktop process is the window manager,
+  the taskbar and Start menu, the sidebar, its folder on the wallpaper and its own dialogs
+  (System Properties, Run, Shut Down, Power, Volume Control, the clock). Wave, the terminal,
+  the File Manager, the editor and every other program are separate binaries in `/bin`
+  (`wave`, `terminal`, `files`, `editor`, `calculator`, `player`, `archiver`, `paint`,
+  `gears`, `minesweeper`, `taskmgr`, `diskmgr`, `display`, `mouse`, `datetime`,
+  `wireless`, `imageview`) that connect to the desktop over an `AF_UNIX` socket
+  (`/tmp/.desktop`) and draw each window's client area into a shared memory segment
+  the desktop composes from. A program that hangs or crashes takes only its own windows
+  with it; one that exits when its last window closes frees what it used. They can be
+  started from a terminal too (`paint picture.png`, `wave https://...`).
 - Two themes, chosen on the **Appearance** page of Display Properties. **Kinetik**
   (the default): frames with rounded corners and a soft shadow, captions, taskbar
   and Start menu heading in a gradient of the theme's color with centered titles,
@@ -328,7 +344,7 @@ says why.
   shared with the browser, files up to 1 MB. No undo, word wrap or search.
 - **Sound Player**: opens a PCM WAV (typed path or from the file manager) with
   Play, Pause, Stop and a seek bar. It runs `play(1)` (`play -s SECONDS`
-  starts part-way in) so the desktop keeps running.
+  starts part-way in) so the player keeps running.
 - **Display Properties**: wallpaper and fill mode with a preview (with **(None)** chosen, a
   `#rrggbb` field sets the solid desktop color; **Kinetik** is the theme's drawn
   wallpaper), the theme and its color with a live sample, resolution,
@@ -370,7 +386,7 @@ progress gauge and a right-click menu (Back, Forward, Refresh, Stop, Home, Add t
 Copy Page Address, Find in Page, Save Page As, View Page Source and Print on the page; Open,
 Open in New Window, Copy and Save Link As on a link; Save Image As and Copy Image Address on a
 picture; Cut/Copy/Paste on the address bar). Pages come over HTTP or HTTPS (through `httpc`, a
-fetcher process, so the desktop keeps running), or from `file://`.
+fetcher process, so the browser keeps running), or from `file://`.
 - **Archives and downloads**: local ZIP and 7z links open in Archive Manager
   without loading the archive into the browser. Binary response prefixes are
   checked before text layout, so an archive served as `text/plain` is downloaded.
@@ -665,7 +681,7 @@ fetcher process, so the desktop keeps running), or from `file://`.
   included: floats and doubles both in SSE2.
 
 **Userland** (`/bin`): 7z [ basename beep cat chmod clear cmp cp cut date dd desktop
-df diff dirname dmesg dos echo env false fetch find fluxinstall free fsh grep gunzip
+(and its programs, above) df diff dirname dmesg dos echo env false fetch find fluxinstall free fsh grep gunzip
 gzip halt head hexdump host ifconfig init install ln ls lsblk mbcheck mkdir mkfs.ext2
 mkfs.fat mkiso mktemp fsck.ext2 mixer more mount mv nc nproc patch ping play poweroff
 printf ps reboot rm rmdir sed
@@ -912,11 +928,17 @@ user/libc, user/include    the C library (math.c is the x87 math library; http.c
                            inflate.c are the HTTP/1.1 and HTTP/2 client and Deflate) and headers
 user/gl/                   the OpenGL library and its backends
 user/fsh/                  the shell
-user/desktop/shell/        compositor and window manager (wm.c), widgets, drawing (gfx.c),
-                           icons, sound, the wallpaper, dialogs (apps.c) and the themes
-                           (theme.c; fonts in font_sans.c and font_archivo.c)
-user/desktop/apps/         files, edit, calc, player, paint, term, taskmgr, diskmgr,
-                           display, datetime, setup, archiver, clock, gears, mines
+user/desktop/shell/        the desktop: compositor and window manager (wm.c), its side of
+                           the window protocol (server.c, wmproto.h), sidebar, sound, the
+                           wallpaper, its dialogs (sysdlg.c), clock, setup's screen; the
+                           programs' side (client.c); and what both share (libdesktop.a):
+                           drawing (gfx.c), widgets, icons, dialogs (apps.c), starting
+                           programs (launch.c), the loop (loop.c), the themes (theme.c;
+                           fonts in font_sans.c and font_archivo.c)
+user/desktop/apps/         the programs: files, edit, calc, player, paint, term, taskmgr,
+                           diskmgr, display, mouse, datetime, wireless, archiver, gears,
+                           mines, imageview (files.c is the desktop's folder too)
+user/desktop/progs/        each program's main(): /bin/NAME
 user/desktop/image/        PNG/JPEG/GIF/WebP/ICO/SVG decoding (image.c picks the decoder)
 user/desktop/wave/         the Wave browser: window (browser.c), HTML (html.c), CSS
                            (css.c), layout (layout.c), shadow composition (shadow.c),
@@ -1025,15 +1047,15 @@ screen-sized surface so repaints are copies. GIF is decoded with LZW into a
 palette image. SVG shapes are flattened to polygons and filled by a scanline
 rasteriser with four sub-scanlines per pixel.
 
-The desktop starts one decoder helper before opening its windows. Browser
-images (including data URLs and favicons), image-viewer and Paint opens,
-wallpaper previews and full wallpaper rendering run there. The desktop keeps
+The desktop, and each program that shows pictures, starts one decoder helper before
+opening its windows. Browser images (including data URLs and favicons), image-viewer
+and Paint opens, wallpaper previews and full wallpaper rendering run there. The program keeps
 handling input while the helper works, transferring results in bounded chunks
 through credit-controlled pipes. Closing a window or navigating cancels its
 requests; a failed helper is restarted for subsequent work. JavaScript DOM
 discovery is batched once per event-loop turn, while explicit geometry queries
 still flush pending changes immediately. JavaScript execution, layout and
-subsequent GIF animation frames still run in the desktop process.
+subsequent GIF animation frames run in Wave's own process.
 
 **The browser** keeps a page in arenas: document tree and style sheets, computed
 styles (rebuilt when a style sheet arrives), and layout (rebuilt when a picture

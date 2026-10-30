@@ -736,9 +736,9 @@ void sidebar_press(int x, int y)
         else if (rect_contains(r_month, lx, ly))
             show_month(0);
     } else if (rect_contains(card[W_CLOCK], lx, ly)) {
-        datetime_open();
+        app_launch("datetime");
     } else if (rect_contains(card[W_SYSTEM], lx, ly)) {
-        taskmgr_open();
+        app_launch("taskmgr");
     }
 }
 
