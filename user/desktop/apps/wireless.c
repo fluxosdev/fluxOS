@@ -27,7 +27,6 @@
 #define BTN_W 90
 #define BTN_H 23
 #define MAX_NETS 64
-#define DBLCLICK_MS 500
 
 enum { B_REFRESH, B_CONNECT, B_DISCONNECT, B_CLOSE, B_COUNT };
 enum { F_LIST = B_COUNT };              /* focus: a button, or the list */
@@ -603,7 +602,7 @@ static void wl_mouse(struct window *w, int x, int y, int buttons, int changed)
 static void wl_wheel(struct window *w, int steps)
 {
     (void)w;
-    scroll -= steps * 3;
+    scroll -= steps * mouse_wheel_lines();
     clamp_scroll();
     paint();
 }

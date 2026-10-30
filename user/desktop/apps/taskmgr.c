@@ -36,7 +36,6 @@
 #define BTN_W      96
 #define BTN_H      24
 #define PAD        8
-#define DBLCLICK_MS 500
 
 enum { TAB_APPS, TAB_PROCS, TAB_PERF, NTABS };
 static const char *const tab_names[NTABS] = { "Applications", "Processes", "Performance" };
@@ -895,7 +894,7 @@ static void tm_wheel(struct window *w, int steps)
     struct tmgr *t = w->priv;
     if (t->tab == TAB_PERF)
         return;
-    t->scroll -= steps * 3;
+    t->scroll -= steps * mouse_wheel_lines();
     clamp_scroll(t);
     paint(t);
 }

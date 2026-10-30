@@ -158,18 +158,6 @@ int getgroups(int size, gid_t list[])
     return 1;
 }
 
-int fchown(int fd, uid_t owner, gid_t group)
-{
-    struct stat st;
-    (void)owner;
-    (void)group;
-    return fstat(fd, &st);
-}
-
-int lchown(const char *path, uid_t owner, gid_t group)
-{
-    return chown(path, owner, group);
-}
 
 int nice(int inc)
 {
@@ -279,36 +267,6 @@ int getloadavg(double loadavg[], int n)
 
 /* ---- files ---- */
 
-/* FAT and the RAM filesystem have no links of either kind: as Linux
- * answers for vfat. A path that is not a link makes readlink EINVAL. */
-int link(const char *from, const char *to)
-{
-    struct stat st;
-    if (stat(from, &st) < 0)
-        return -1;
-    (void)to;
-    errno = EPERM;
-    return -1;
-}
-
-int symlink(const char *target, const char *path)
-{
-    (void)target;
-    (void)path;
-    errno = EPERM;
-    return -1;
-}
-
-ssize_t readlink(const char *path, char *buf, size_t size)
-{
-    struct stat st;
-    (void)buf;
-    (void)size;
-    if (stat(path, &st) < 0)
-        return -1;
-    errno = EINVAL;
-    return -1;
-}
 
 int mkfifo(const char *path, mode_t mode)
 {

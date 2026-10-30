@@ -178,6 +178,16 @@ static void icon_clock(void)
     P(15, 15, 2, 2, RGB(0xC0, 0x00, 0x00));
 }
 
+/* A two-button mouse with a wheel and a cord. */
+static void icon_mouse(void)
+{
+    P(15, 1, 2, 5, C_SHADOW);
+    box(8, 6, 16, 23, C_FACE);
+    P(9, 15, 14, 1, C_SHADOW);
+    P(15, 7, 2, 8, C_SHADOW);
+    P(15, 9, 2, 4, C_BLACK);
+}
+
 static void small_window(color_t body)
 {
     frame(2, 4, 28, 24, C_BLACK);
@@ -299,6 +309,7 @@ static const char *const icon_names[ICON_COUNT] = {
     [ICON_CLOCK] = "clock",
     [ICON_DATETIME] = "preferences-system-time",
     [ICON_WIFI] = "network-wireless",
+    [ICON_MOUSE] = "input-mouse",
     [ICON_BATTERY_CAUTION] = "battery-caution",
     [ICON_BATTERY_LOW] = "battery-low",
     [ICON_BATTERY_40] = "battery-040",
@@ -366,6 +377,7 @@ static void draw_builtin(struct surface *s, int x, int y, enum icon_id id, int s
     case ICON_CLOCK: icon_clock(); break;
     case ICON_ARCHIVE: icon_archive(); break;
     case ICON_PAINT: icon_paint(); break;
+    case ICON_MOUSE: icon_mouse(); break;
     default: break;                     /* image-only icons */
     }
 }

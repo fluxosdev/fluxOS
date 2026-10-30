@@ -341,9 +341,13 @@ static struct tfop identity_op(const struct tfop *op)
     id.kind = op->kind;
     id.x.unit = id.y.unit = U_PX;
     if (op->kind == TF_SCALE)
-        id.a = id.b = 1;
+        id.a = id.b = id.m[10] = 1;
     if (op->kind == TF_MATRIX)
         id.a = id.d = 1;
+    if (op->kind == TF_MATRIX3D)
+        id.m[0] = id.m[5] = id.m[10] = id.m[15] = 1;
+    if (op->kind == TF_PERSPECTIVE)
+        id.z.unit = U_AUTO;
     return id;
 }
 
@@ -375,6 +379,13 @@ static int blend_xf(const struct apval *a, const struct apval *b, float t, struc
         const struct tfop *p = &x->op[k], *q = &y->op[k];
         struct tfop *r = &out->xf.op[k];
         r->kind = p->kind;
+        r->z = lerp_len(p->z, q->z, t);
+        for(int j=0;j<16;j++)r->m[j]=p->m[j]+(q->m[j]-p->m[j])*t;
+        if(r->kind==TF_PERSPECTIVE) {
+            double a=p->z.unit==U_AUTO?0:1.0/(p->z.v<1?1:p->z.v);
+            double b=q->z.unit==U_AUTO?0:1.0/(q->z.v<1?1:q->z.v), inv=a+(b-a)*t;
+            r->z=(struct len){.unit=inv>0?U_PX:U_AUTO,.v=inv>0?(int)(1/inv):0};
+        }
         r->x = lerp_len(p->x, q->x, t);
         r->y = lerp_len(p->y, q->y, t);
         r->a = p->a + (q->a - p->a) * t, r->b = p->b + (q->b - p->b) * t;

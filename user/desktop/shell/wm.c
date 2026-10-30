@@ -22,7 +22,6 @@
 #include "simd.h"
 
 #define MAX_DAMAGE   32
-#define DBLCLICK_MS  500
 #define OUTLINE      3          /* resize outline thickness */
 #define ICON_CELL_W  75
 #define ICON_CELL_H  70
@@ -240,6 +239,7 @@ static const struct menu_item system_items[] = {
 
 static const struct menu_item settings_items[] = {
     { ICON_DISPLAY, "Display Properties", display_open, NULL, 0 },
+    { ICON_MOUSE, "Mouse", mouse_open, NULL, 0 },
     { ICON_DATETIME, "Date and Time", datetime_open, NULL, 0 },
     { ICON_WIFI, "Wireless Networks", wireless_open, NULL, 0 },
     { ICON_COMPUTER, "System Properties", about_open, NULL, 0 },
@@ -2925,21 +2925,7 @@ static void press_right(void)
 static void mouse_event(const struct input_event *ev)
 {
     int ox = mx, oy = my;
-    if (ev->flags & IEV_ABS) {
-        mx = ev->x * screen_w / 32768;
-        my = ev->y * screen_h / 32768;
-    } else {
-        mx += ev->x;
-        my += ev->y;
-    }
-    if (mx < 0)
-        mx = 0;
-    if (my < 0)
-        my = 0;
-    if (mx >= screen_w)
-        mx = screen_w - 1;
-    if (my >= screen_h)
-        my = screen_h - 1;
+    mouse_move_pointer(ev, screen_w, screen_h, &mx, &my);
     if ((mx != ox || my != oy) && hw_cursor) {
         struct disppos pos = { mx, my };
         if (display(DISP_CURSORPOS, &pos) < 0)
@@ -2950,11 +2936,18 @@ static void mouse_event(const struct input_event *ev)
     }
 
     int old = mbuttons;
-    mbuttons = ev->mods;
+    int mods = ev->mods;
+    if (mouse_left_handed())
+        mods = (mods & ~(MOUSE_LEFT | MOUSE_RIGHT)) |
+               ((mods & MOUSE_LEFT) ? MOUSE_RIGHT : 0) |
+               ((mods & MOUSE_RIGHT) ? MOUSE_LEFT : 0);
+    mbuttons = mods;
     int pressed = mbuttons & ~old, released = old & ~mbuttons;
 
     /* The wheel scrolls the window under the pointer. */
     int16_t wheel = (int16_t)ev->code;
+    if (mouse_wheel_reverse())
+        wheel = -wheel;
     if (wheel && !menu_open && drag == DRAG_NONE && (setup_mode || !rect_contains(sidebar_rect(), mx, my))) {
         struct window *w = window_at(mx, my);
         if (!w)

@@ -54,7 +54,6 @@
 #define SEG_MIN_W  44
 #define STATUS_H   20
 #define LEGEND_H   20
-#define DBLCLICK_MS 500
 
 enum { B_EXPLORE, B_MOUNT, B_UNMOUNT, B_FORMAT, B_NEW, B_DELETE, B_ACTIVE, B_RESCAN, B_REFRESH,
        NBTNS };
@@ -1512,10 +1511,11 @@ static void dm_wheel(struct window *w, int steps)
     struct dm *m = w->priv;
     struct rect l, mp;
     panes(m, &l, &mp);
+    int lines = mouse_wheel_lines();
     if (m->mouse_y < l.y + l.h)
-        m->lscroll -= steps * 3;
+        m->lscroll -= steps * lines;
     else
-        m->mscroll -= steps * 20;
+        m->mscroll -= steps * 20 * lines / 3;
     clamp_scrolls(m);
     paint(m);
 }

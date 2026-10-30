@@ -1011,7 +1011,7 @@ static void pt_mouse(struct window *win, int x, int y, int buttons, int changed_
 static void pt_wheel(struct window *win, int steps)
 {
     struct paint *p = win->priv;
-    p->sy -= steps * 48;
+    p->sy -= steps * 16 * mouse_wheel_lines();
     clamp_scroll(p);
     paint_all(p);
 }

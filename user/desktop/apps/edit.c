@@ -1185,6 +1185,16 @@ static void ed_mouse(struct window *w, int x, int y, int buttons, int changed_bu
 
 /* ---- window callbacks ---- */
 
+static void ed_wheel(struct window *w, int steps)
+{
+    struct ed *e = w->priv;
+    struct sbar v = vbar(e);
+    int max = sbar_max(&v);
+    int pos = e->vscroll - steps * mouse_wheel_lines();
+    e->vscroll = pos < 0 ? 0 : pos > max ? max : pos;
+    paint(e);
+}
+
 static void ed_focus(struct window *w, int focused)
 {
     struct ed *e = w->priv;
@@ -1224,6 +1234,7 @@ static void ed_destroy(struct window *w)
 static const struct window_ops ed_ops = {
     .key = ed_key,
     .mouse = ed_mouse,
+    .wheel = ed_wheel,
     .focus = ed_focus,
     .resize = ed_resize,
     .close = ed_close,

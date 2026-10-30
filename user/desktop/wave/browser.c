@@ -7405,11 +7405,12 @@ static int wheel(struct browser *b, int x, int y, int delta)
     if (f && wheel(f, fx, fy, delta))
         return 1;
     struct rect v = view_rect(b);
+    int lines = mouse_wheel_lines();
     if (b->pop_node) {                  /* an open list that scrolls */
         struct rect pr;
         int pn, pv;
         if (pop_rect(b, &pr, &pn, &pv) && rect_contains(pr, x, y) && pn > pv) {
-            b->pop_top += delta > 0 ? -3 : 3;
+            b->pop_top += delta > 0 ? -lines : lines;
             b->pop_top = b->pop_top < 0 ? 0 : b->pop_top > pn - pv ? pn - pv : b->pop_top;
             paint(b);
             return 1;
@@ -7418,14 +7419,14 @@ static int wheel(struct browser *b, int x, int y, int delta)
     tip_hide(top_of(b));
     if (b->root && rect_contains(v, x, y) &&            /* a box on the page that scrolls takes it first */
         layout_wheel(&b->lo, x - v.x + b->scroll_x, y - v.y + b->scroll_y, b->scroll_x, b->scroll_y, 0,
-                     -delta * 3 * LINE_STEP / 2)) {
+                     -delta * lines * LINE_STEP / 2)) {
         paint(b);
         return 1;
     }
     if (is_frame(b) && (!frame_scrolls(b) || b->lo.height <= view_rect(b).h))
         return 0;
     int before = b->scroll_y;
-    scroll_by(b, 0, -delta * 3 * LINE_STEP / 2);
+    scroll_by(b, 0, -delta * lines * LINE_STEP / 2);
     if (is_frame(b) && b->scroll_y == before)
         return 0;
     paint_scrolled(b);

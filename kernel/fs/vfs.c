@@ -31,7 +31,7 @@ static struct vnode *vnode_new(const char *name, int type)
     strlcpy(vn->name, name, sizeof(vn->name));
     vn->type = type;
     vn->ino = __atomic_fetch_add(&next_ino, 1, __ATOMIC_RELAXED);   /* ptys come without the lock */
-    vn->mode = type == VN_DIR ? 0755 : type == VN_CHR ? 0666 : 0644;
+    vn->mode = type == VN_DIR ? 0755 : type == VN_CHR ? 0666 : type == VN_LNK ? 0777 : 0644;
     vn->mtime = time_now();
     return vn;
 }
@@ -186,7 +186,25 @@ static void detach(struct vnode *vn)
         dir->mtime = time_now();
 }
 
-int vfs_resolve(const char *path, struct vnode *cwd, struct vnode **out)
+/* A symbolic link's target, NUL-terminated in buf (size bytes). */
+static int read_link(struct vnode *vn, char *buf, uint32_t size)
+{
+    int n;
+    if (vn->fs) {
+        if (!vn->fs->ops->readlink)
+            return -EINVAL;
+        n = vn->fs->ops->readlink(vn, buf, size - 1);
+    } else {
+        n = (int)MIN(vn->size, size - 1);
+        memcpy(buf, vn->data, (uint32_t)n);
+    }
+    if (n < 0)
+        return n;
+    buf[n] = 0;
+    return n ? n : -ENOENT;
+}
+
+int vfs_lookup(const char *path, struct vnode *cwd, int follow, struct vnode **out)
 {
     if (!path || !*path)
         return -ENOENT;
@@ -194,6 +212,8 @@ int vfs_resolve(const char *path, struct vnode *cwd, struct vnode **out)
     struct vnode *v = (*path == '/' || !cwd) ? vfs_root : cwd;
     char comp[NAME_MAX + 1];
     const char *p = path;
+    char *work = NULL;                  /* the rest of the path once a link is followed */
+    int links = 0, r = 0;
 
     while (*p) {
         while (*p == '/')
@@ -204,28 +224,73 @@ int vfs_resolve(const char *path, struct vnode *cwd, struct vnode **out)
         while (*p && *p != '/')
             p++;
         uint32_t len = (uint32_t)(p - start);
-        if (len > NAME_MAX)
-            return -ENAMETOOLONG;
+        if (len > NAME_MAX) {
+            r = -ENAMETOOLONG;
+            break;
+        }
         memcpy(comp, start, len);
         comp[len] = 0;
 
-        if (v->type != VN_DIR)
-            return -ENOTDIR;
+        if (v->type != VN_DIR) {
+            r = -ENOTDIR;
+            break;
+        }
         if (!strcmp(comp, "."))
             continue;
         if (!strcmp(comp, "..")) {
             v = v->parent ? v->parent : vfs_root;
             continue;
         }
+        struct vnode *dir = v;
         v = cross(find_child(v, comp));
-        if (!v)
-            return -ENOENT;
+        if (!v) {
+            r = -ENOENT;
+            break;
+        }
+        if (v->type != VN_LNK)
+            continue;
+        const char *rest = p;
+        while (*rest == '/')
+            rest++;
+        if (!*rest && !follow && *p != '/')
+            break;                      /* the link itself is wanted */
+        if (++links > VFS_MAX_SYMLINKS) {
+            r = -ELOOP;
+            break;
+        }
+        /* go on from the link's directory with its target, then the rest */
+        if (!work && !(work = kmalloc(2 * PATH_MAX))) {
+            r = -ENOMEM;
+            break;
+        }
+        char *next = work + (p >= work && p < work + PATH_MAX ? PATH_MAX : 0);
+        int n = read_link(v, next, PATH_MAX);
+        if (n < 0) {
+            r = n;
+            break;
+        }
+        if (*p) {
+            if ((uint32_t)n + 1 + strlen(p) >= PATH_MAX) {
+                r = -ENAMETOOLONG;
+                break;
+            }
+            strcpy(next + n, p);        /* p starts with its '/' */
+        }
+        v = next[0] == '/' ? vfs_root : dir;
+        p = next;
     }
 
-    if (path[strlen(path) - 1] == '/' && v->type != VN_DIR)
-        return -ENOTDIR;
-    *out = v;
-    return 0;
+    if (r == 0 && path[strlen(path) - 1] == '/' && v->type != VN_DIR)
+        r = -ENOTDIR;
+    kfree(work);
+    if (r == 0)
+        *out = v;
+    return r;
+}
+
+int vfs_resolve(const char *path, struct vnode *cwd, struct vnode **out)
+{
+    return vfs_lookup(path, cwd, 1, out);
 }
 
 /* Split "a/b/c" into the vnode for "a/b" and the name "c". */
@@ -351,7 +416,7 @@ int vfs_mkdir_p(const char *path, struct vnode **out)
 int vfs_unlink(const char *path, struct vnode *cwd)
 {
     struct vnode *vn;
-    int r = vfs_resolve(path, cwd, &vn);
+    int r = vfs_lookup(path, cwd, 0, &vn);
     if (r < 0)
         return r;
     if (vn->type == VN_DIR)
@@ -374,7 +439,7 @@ int vfs_unlink(const char *path, struct vnode *cwd)
 int vfs_rmdir(const char *path, struct vnode *cwd)
 {
     struct vnode *vn;
-    int r = vfs_resolve(path, cwd, &vn);
+    int r = vfs_lookup(path, cwd, 0, &vn);
     if (r < 0)
         return r;
     if (vn->type != VN_DIR)
@@ -403,7 +468,7 @@ int vfs_rename(const char *from, const char *to, struct vnode *cwd)
 {
     struct vnode *src, *dir;
     char name[NAME_MAX + 1];
-    int r = vfs_resolve(from, cwd, &src);
+    int r = vfs_lookup(from, cwd, 0, &src);
     if (r < 0)
         return r;
     if (src == vfs_root || is_fs_root(src))
@@ -481,12 +546,104 @@ struct vnode *vfs_mknod_anon(uint32_t rdev, dev_read_t rd, dev_write_t wr)
     return vn;
 }
 
+int vfs_symlink(const char *target, const char *path, struct vnode *cwd)
+{
+    struct vnode *dir;
+    char name[NAME_MAX + 1];
+    uint32_t len = strlen(target);
+    if (!len)
+        return -ENOENT;
+    if (len >= PATH_MAX)
+        return -ENAMETOOLONG;
+    int r = vfs_resolve_parent(path, cwd, &dir, name);
+    if (r < 0)
+        return r;
+    if (!dir->linked)
+        return -ENOENT;
+    if (find_child(dir, name))
+        return -EEXIST;
+    if (dir->fs) {
+        if (dir->fs->readonly)
+            return -EROFS;
+        if (!dir->fs->ops->symlink)
+            return -EPERM;              /* FAT, like Linux's vfat */
+        struct vnode *vn;
+        return dir->fs->ops->symlink(dir, name, target, &vn);
+    }
+    struct vnode *vn = vnode_new(name, VN_LNK);
+    if (!vn || !(vn->data = kmalloc(len))) {
+        kfree(vn);
+        return -ENOMEM;
+    }
+    memcpy(vn->data, target, len);
+    vn->size = vn->cap = len;
+    attach(dir, vn);
+    return 0;
+}
+
+int vfs_link(const char *from, const char *to, struct vnode *cwd)
+{
+    struct vnode *src, *dir;
+    char name[NAME_MAX + 1];
+    int r = vfs_lookup(from, cwd, 0, &src);
+    if (r < 0)
+        return r;
+    if (src->type == VN_DIR)
+        return -EPERM;
+    r = vfs_resolve_parent(to, cwd, &dir, name);
+    if (r < 0)
+        return r;
+    if (!dir->linked)
+        return -ENOENT;
+    if (find_child(dir, name))
+        return -EEXIST;
+    if (src->fs != dir->fs)
+        return -EXDEV;
+    if (!src->fs || !src->fs->ops->link)
+        return -EPERM;                  /* ramfs and FAT have one name per file */
+    if (src->fs->readonly)
+        return -EROFS;
+    struct vnode *vn;
+    return src->fs->ops->link(src, dir, name, &vn);
+}
+
+int vfs_readlink(const char *path, struct vnode *cwd, char *buf, uint32_t size)
+{
+    struct vnode *vn;
+    int r = vfs_lookup(path, cwd, 0, &vn);
+    if (r < 0)
+        return r;
+    if (vn->type != VN_LNK)
+        return -EINVAL;
+    char *tmp = kmalloc(PATH_MAX);
+    if (!tmp)
+        return -ENOMEM;
+    r = read_link(vn, tmp, PATH_MAX);
+    if (r > 0) {
+        r = (int)MIN((uint32_t)r, size);
+        memcpy(buf, tmp, (uint32_t)r);
+    }
+    kfree(tmp);
+    return r;
+}
+
+int vfs_setattr(struct vnode *vn)
+{
+    if (vn->fs && vn->fs->readonly)
+        return -EROFS;
+    if (vn->fs && vn->fs->ops->setattr)
+        return vn->fs->ops->setattr(vn);
+    return 0;
+}
+
 int vfs_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
 {
     if (vn->type == VN_CHR || vn->type == VN_BLK)
         return vn->dev_read ? vn->dev_read(vn, buf, off, n) : 0;
     if (vn->type == VN_DIR)
         return -EISDIR;
+    if (vn->type == VN_LNK)
+        return -EINVAL;
     if (off >= vn->size)
         return 0;
     n = MIN(n, vn->size - (uint32_t)off);
@@ -516,6 +673,8 @@ int vfs_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
         return vn->dev_write ? vn->dev_write(vn, buf, off, n) : (int)n;
     if (vn->type == VN_DIR)
         return -EISDIR;
+    if (vn->type == VN_LNK)
+        return -EINVAL;
     if (!n)
         return 0;
     if (off + n > UINT32_MAX)
@@ -566,21 +725,21 @@ int vfs_utime(const char *path, struct vnode *cwd, uint32_t mtime)
     if (vn->fs && vn->fs->readonly)
         return -EROFS;
     vn->mtime = mtime;
-    if (vn->fs && vn->fs->ops->setattr)
-        return vn->fs->ops->setattr(vn);
-    return 0;
+    return vfs_setattr(vn);
 }
 
 void vfs_stat(struct vnode *vn, struct stat *st)
 {
     uint32_t fmt = vn->type == VN_DIR ? S_IFDIR : vn->type == VN_CHR ? S_IFCHR :
-                   vn->type == VN_BLK ? S_IFBLK : S_IFREG;
+                   vn->type == VN_BLK ? S_IFBLK : vn->type == VN_LNK ? S_IFLNK : S_IFREG;
     memset(st, 0, sizeof(*st));
     st->st_dev = vn->fs ? (uint32_t)(uintptr_t)vn->fs : 1;     /* ramfs and devices: 1 */
     st->st_ino = vn->ino;
     st->st_mode = fmt | (vn->mode & 07777);
     st->st_size = vn->size;
-    st->st_nlink = vn->type == VN_DIR ? 2 : 1;
+    st->st_nlink = vn->nlink ? vn->nlink : vn->type == VN_DIR ? 2 : 1;
+    st->st_uid = vn->uid;
+    st->st_gid = vn->gid;
     st->st_blksize = 4096;
     st->st_blocks = (vn->size + 511) / 512;
     st->st_atime = st->st_mtime = st->st_ctime = vn->mtime;
@@ -590,7 +749,7 @@ void vfs_stat(struct vnode *vn, struct stat *st)
 static uint8_t dtype(struct vnode *vn)
 {
     return vn->type == VN_DIR ? DT_DIR : vn->type == VN_CHR ? DT_CHR :
-           vn->type == VN_BLK ? DT_BLK : DT_REG;
+           vn->type == VN_BLK ? DT_BLK : vn->type == VN_LNK ? DT_LNK : DT_REG;
 }
 
 /* Entry `index` of a directory: 0 is ".", 1 is "..", then children. */
@@ -663,13 +822,15 @@ static const struct fs_ops *fs_by_name(const char *type)
         return &fat32_ops;
     if (!strcmp(type, "iso9660") || !strcmp(type, "iso") || !strcmp(type, "cd9660"))
         return &iso9660_ops;
+    if (!strcmp(type, "ext2") || !strcmp(type, "ext3"))
+        return &ext2_ops;
     return NULL;
 }
 
 /* Find a filesystem of `type` (or any, for "auto") on bd and mount it, unattached. */
 static int fs_probe(struct blockdev *bd, const char *type, struct fs **out)
 {
-    static const struct fs_ops *const probe_order[] = { &iso9660_ops, &fat32_ops };
+    static const struct fs_ops *const probe_order[] = { &iso9660_ops, &fat32_ops, &ext2_ops };
     if (bd->refresh)
         bd->refresh(bd);
     if (!bd->nsectors)
@@ -953,6 +1114,13 @@ int vfs_mounts_text(char *buf, uint32_t size)
     }
     kfree(line);
     return (int)MIN(len, size);
+}
+
+void vfs_sync_filesystems(void)
+{
+    for (struct fs *fs = mounts; fs; fs = fs->next)
+        if (!fs->readonly && fs->ops->sync)
+            fs->ops->sync(fs);
 }
 
 int vfs_mountpoint_of(struct blockdev *bd, char *buf, uint32_t size)

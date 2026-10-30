@@ -15,7 +15,7 @@ import tempfile
 import time
 
 parser = argparse.ArgumentParser(description=__doc__)
-for name in ('qemu', 'kernel', 'initrd', 'guest', 'mkrescue', 'grubdir'):
+for name in ('qemu', 'kernel', 'initrd', 'guest', 'mkiso', 'grubdir'):
     parser.add_argument(name)
 parser.add_argument('--cpus', type=int, default=2, choices=range(1, 17))
 parser.add_argument('--drop', action='append', default=[], metavar='PREFIX', help='leave initrd members under this path out')
@@ -41,8 +41,10 @@ with tempfile.TemporaryDirectory(prefix='flux-suspend-') as directory:
     (tree / 'boot/grub/grub.cfg').write_text(
         'set timeout=0\nmenuentry test {\n multiboot /kernel automount=off\n'
         ' module /initrd\n boot\n}\n')
-    subprocess.run([args.mkrescue, '-d', args.grubdir, '-o', str(temp / 'boot.iso'), str(tree)],
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # GRUB's El Torito image and modules, as the CD has them (firmware/grub)
+    shutil.copytree(pathlib.Path(args.grubdir) / 'i386-pc', tree / 'boot/grub/i386-pc')
+    subprocess.run([args.mkiso, '-o', str(temp / 'boot.iso'), '-b', 'boot/grub/i386-pc/eltorito.img', str(tree)],
+                   check=True, stdout=subprocess.DEVNULL)
     log = temp / 'serial.log'
     command = [args.qemu, '-cpu', 'core2duo,-lm', '-smp', str(args.cpus),
                '-cdrom', str(temp / 'boot.iso'), '-m', '256', '-display', 'none',

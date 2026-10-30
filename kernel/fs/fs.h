@@ -33,6 +33,10 @@ struct fs_ops {
     int (*setattr)(struct vnode *vn);
     void (*release)(struct vnode *vn);
     void (*statfs)(struct fs *fs, struct statfs *st);
+    /* Symbolic and hard links, where the filesystem has them (NULL: EPERM). */
+    int (*symlink)(struct vnode *dir, const char *name, const char *target, struct vnode **out);
+    int (*readlink)(struct vnode *vn, char *buf, uint32_t size);   /* bytes put in buf */
+    int (*link)(struct vnode *vn, struct vnode *dir, const char *name, struct vnode **out);
 };
 
 struct fs {
@@ -50,6 +54,7 @@ struct fs {
 
 extern const struct fs_ops fat32_ops;
 extern const struct fs_ops iso9660_ops;
+extern const struct fs_ops ext2_ops;
 
 /* Helpers for filesystem drivers. */
 struct vnode *fs_vnode_new(struct fs *fs, const char *name, int type);
@@ -60,6 +65,9 @@ int vfs_mount_dev(struct blockdev *bd, const char *target, const char *type);
 int vfs_umount(const char *target, struct vnode *cwd);
 int vfs_statfs(struct vnode *vn, struct statfs *st);
 int vfs_mounts_text(char *buf, uint32_t size);
+/* Shutting down: every filesystem told to leave its volume clean (ext2's
+ * state), before the block devices are synced. */
+void vfs_sync_filesystems(void);
 /* Run from the disk volume spec names (UUID=xxxx-xxxx or a device name). */
 int vfs_mount_root(const char *spec);
 void vfs_automount(void);

@@ -267,7 +267,14 @@ static void test_signals_sessions_paths(void)
     CHECK(stat(deep, &sb) < 0 && errno == ENAMETOOLONG);       /* PATH_MAX counts the NUL */
     free(deep);
     free(cwd);
-    CHECK(symlink("a", "/tmp/b") < 0 && errno == EPERM);
+    /* symbolic links (ramfs keeps them; FAT refuses with EPERM, as on Linux) */
+    char target[8];
+    CHECK(symlink("a", "/tmp/b") == 0);
+    CHECK(readlink("/tmp/b", target, sizeof(target)) == 1 && target[0] == 'a');
+    CHECK(lstat("/tmp/b", &sb) == 0 && S_ISLNK(sb.st_mode) && stat("/tmp/b", &sb) < 0 && errno == ENOENT);
+    CHECK(symlink("x", "/tmp/b") < 0 && errno == EEXIST);
+    CHECK(unlink("/tmp/b") == 0 && lstat("/tmp/b", &sb) < 0);
+    CHECK(readlink("/tmp", target, sizeof(target)) < 0 && errno == EINVAL);
     CHECK(readlink("/tmp", NULL, 0) < 0 && errno == EINVAL);
 }
 
@@ -306,6 +313,7 @@ static void test_misc(void)
 int main(void)
 {
     printf("libc guest: starting\n");
+    printf("guest: %d CPUs online\n", (int)sysconf(_SC_NPROCESSORS_ONLN));   /* the script checks it */
     test_format();
     test_files();
     test_processes();

@@ -142,6 +142,7 @@ extern "C" {
 #define S_IFDIR  0x4000
 #define S_IFBLK  0x6000
 #define S_IFREG  0x8000
+#define S_IFLNK  0xA000
 #define S_IFSOCK 0xC000
 #define S_ISDIR(m)  (((m) & S_IFMT) == S_IFDIR)
 #define S_ISREG(m)  (((m) & S_IFMT) == S_IFREG)
@@ -149,6 +150,7 @@ extern "C" {
 #define S_ISFIFO(m) (((m) & S_IFMT) == S_IFIFO)
 #define S_ISBLK(m)  (((m) & S_IFMT) == S_IFBLK)
 #define S_ISSOCK(m) (((m) & S_IFMT) == S_IFSOCK)
+#define S_ISLNK(m)  (((m) & S_IFMT) == S_IFLNK)
 
 /* POSIX's fields, as plain 32-bit numbers. Ownership is cosmetic (one
  * user, uid 0), and the three times are the filesystem's one time until

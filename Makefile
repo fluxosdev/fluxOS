@@ -26,14 +26,26 @@ QEMU    ?= qemu-system-i386
 # A Core 2 Duo (SSE2 through SSSE3), two cores; QEMU_SMP=1 or 4 for other counts.
 QEMU_CPU ?= -cpu core2duo,-lm
 QEMU_SMP ?= 2
-# GRUB 2.06 from Debian 12, fetched once by tools/fetch-grub.sh (2.12 reboots
-# some older PCs right after "Welcome to GRUB!"). For the host's own GRUB:
-#   make GRUB=/ GRUB_DEP=
+# GRUB 2.06 from Debian 12 (2.12 reboots some older PCs right after "Welcome
+# to GRUB!"): its boot images and the modules the menus load are checked in
+# (firmware/grub, see its README), and mkiso (user/bin/mkiso.c, built for the
+# machine running the build: Linux, or fluxOS itself) makes the CD from them.
+# grub-mkrescue can still make it, from Debian's GRUB fetched into grub-2.06/
+# by tools/fetch-grub.sh, or the host's own:
+#   make MKRESCUE=grub-2.06/usr/bin/grub-mkrescue
+#   make MKRESCUE=grub-mkrescue GRUB=/ GRUB_DEP=
+MKRESCUE ?=
 GRUB    ?= grub-2.06
 GRUB_DEP ?= $(GRUB)/usr/bin/grub-mkimage
-MKRESCUE ?= $(GRUB)/usr/bin/grub-mkrescue
-GRUB_MKIMAGE ?= $(GRUB)/usr/bin/grub-mkimage
 GRUB_PC_DIR ?= $(GRUB)/usr/lib/grub/i386-pc
+GRUB_FIRMWARE := $(shell find firmware/grub -type f 2>/dev/null)
+
+# Programs the build runs on the machine it runs on, from user/bin: the C
+# compiler there (on fluxOS, the native gcc) builds them.
+HOSTCC ?= cc
+HOST_TOOLS = $(BUILD)/host
+MKISO   = $(HOST_TOOLS)/mkiso
+MBCHECK = $(HOST_TOOLS)/mbcheck
 
 # Plain "make" builds the ISO, whatever rule comes first below.
 .DEFAULT_GOAL := all
@@ -147,7 +159,7 @@ SETUPFS_FILES := $(shell find setupfs -type f 2>/dev/null)
 # command prompt Shift+F10 opens. Small, so that it fits the kernel heap of
 # a machine with little memory; the system it installs is $(SYSTEM), which
 # fluxinstall reads from the CD.
-SETUP_BINS := init desktop fluxinstall mkfs.fat fsh cat ls lsblk mount umount df dmesg \
+SETUP_BINS := init desktop fluxinstall mkfs.fat mkfs.ext2 fsh cat ls lsblk mount umount df dmesg \
               ps free uname clear more mkdir rm cp mv sync reboot poweroff halt
 
 .PHONY: all iso kernel system setup disk floppy run run-kernel run-disk run-q35 run-usb run-nvme check clean
@@ -279,25 +291,34 @@ $(SETUP): Makefile $(BUILD)/.rootfs-stamp $(BINS) $(SETUPFS_FILES) $(IWL_FIRMWAR
 $(GRUB)/usr/bin/grub-mkimage:
 	sh tools/fetch-grub.sh $(GRUB)
 
+$(HOST_TOOLS)/%: user/bin/%.c
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -DHOST_TOOL -idirafter user/include $< -o $@
+
 # The CD: GRUB's menu (grub/install.cfg), the kernel, the setup system it
-# loads and the system Setup installs.
-$(ISO): $(KERNEL) $(SETUP) $(SYSTEM) grub/grub.cfg grub/install.cfg $(GRUB_DEP)
-	@rm -f $(BUILD)/iso/boot/initrd.tar
-	@mkdir -p $(BUILD)/iso/boot/grub
+# loads and the system Setup installs, with GRUB's El Torito image and
+# modules (firmware/grub) in boot/grub/i386-pc. GRUB for hard disks is in
+# firmware/grub, as in the tree: /bin/fluxinstall writes boot.img into the
+# MBR and core.img into the gap before the first partition, which reads its
+# modules and menu (grub/grub.cfg, copied from boot/install) from /boot/grub
+# on that FAT32 partition. boot_hybrid.img makes the ISO start from a USB
+# stick too.
+$(ISO): $(KERNEL) $(SETUP) $(SYSTEM) grub/grub.cfg grub/install.cfg $(GRUB_FIRMWARE) \
+		$(if $(MKRESCUE),$(GRUB_DEP),$(MKISO))
+	rm -rf $(BUILD)/iso
+	mkdir -p $(BUILD)/iso/boot/grub $(BUILD)/iso/boot/install $(BUILD)/iso/firmware/grub
 	cp $(KERNEL) $(BUILD)/iso/boot/fluxos.kernel
 	cp $(SETUP) $(BUILD)/iso/boot/setup.tar
 	cp $(SYSTEM) $(BUILD)/iso/boot/system.tar
 	cp grub/install.cfg $(BUILD)/iso/boot/grub/grub.cfg
-	@# GRUB for hard disks, written to disk by /bin/fluxinstall: boot.img
-	@# goes in the MBR, core.img in the gap before the first partition and
-	@# reads its modules and menu (grub/grub.cfg) from /boot/grub on that
-	@# FAT32 partition.
-	@mkdir -p $(BUILD)/iso/boot/install
-	$(GRUB_MKIMAGE) -O i386-pc -d $(GRUB_PC_DIR) -o $(BUILD)/iso/boot/install/core.img \
-		-p '(,msdos1)/boot/grub' biosdisk part_msdos fat
-	cp $(GRUB_PC_DIR)/boot.img $(BUILD)/iso/boot/install/boot.img
 	cp grub/grub.cfg $(BUILD)/iso/boot/install/grub.cfg
+	cp firmware/grub/boot.img firmware/grub/core.img firmware/grub/README $(BUILD)/iso/firmware/grub/
+ifeq ($(MKRESCUE),)
+	cp -r firmware/grub/i386-pc $(BUILD)/iso/boot/grub/
+	$(MKISO) -o $@ -b boot/grub/i386-pc/eltorito.img -G firmware/grub/boot_hybrid.img $(BUILD)/iso
+else
 	PATH="$(abspath $(GRUB))/usr/bin:$$PATH" $(MKRESCUE) -d $(GRUB_PC_DIR) -o $@ $(BUILD)/iso
+endif
 
 # The fluxOS sysroot: the headers and libraries a compiler targeting
 # fluxOS (i686-fluxos-gcc, tools/toolchain) builds programs against.
@@ -321,18 +342,27 @@ $(SYSROOT_STAMP): $(LIBC) $(LIBGL) $(LIBFONT) $(CRT0) user/user.ld $(wildcard us
 toolchain: sysroot
 	tools/toolchain/build.sh --sysroot $(SYSROOT) --prefix $(BUILD)/toolchain/cross
 
-check: $(KERNEL)
-	grub-file --is-x86-multiboot $(KERNEL) && echo "$(KERNEL): valid multiboot kernel"
+# The Multiboot header GRUB looks for, and the one PT_LOAD segment the linker
+# script promises (mbcheck, built for the machine the build runs on).
+check: $(KERNEL) $(MBCHECK)
+	$(MBCHECK) $(KERNEL)
 
 disk: $(DISK)
 
 # A blank FAT32 disk; without a host mkfs.fat it stays unformatted and can
 # be formatted from inside fluxOS with "mkfs.fat /dev/hda".
-$(DISK):
+# DISKFS=ext2 makes it ext2 instead, with fluxOS's own mkfs.ext2 built for
+# the host (a disk for a source tree: links, permissions, one-second times).
+DISKFS ?= fat32
+$(DISK): $(if $(filter ext2,$(DISKFS)),$(HOST_TOOLS)/mkfs.ext2)
 	truncate -s $(DISK_MB)M $@
+ifeq ($(DISKFS),ext2)
+	$(HOST_TOOLS)/mkfs.ext2 -q -L FLUXDISK $@ && echo "$@: $(DISK_MB) MiB ext2"
+else
 	@if [ -n "$(MKFS_FAT)" ]; then $(MKFS_FAT) -F 32 -n FLUXDISK $@ >/dev/null && \
 		echo "$@: $(DISK_MB) MiB FAT32"; \
 	else echo "$@: blank, run 'mkfs.fat /dev/hda' inside fluxOS"; fi
+endif
 
 floppy: $(FLOPPY)
 
@@ -401,11 +431,11 @@ clean:
 -include $(shell find $(BUILD) -path '$(BUILD)/toolchain' -prune -o -path '$(BUILD)/ports' -prune -o -name '*.d' -print 2>/dev/null)
 
 # Run the browser's actual HTML/DOM/JS code on the host, without booting QEMU.
-HOSTCC ?= cc
 
 # The phase 3 tools (tar, gzip, sed, diff, patch, find...) built for the host and
 # checked against the GNU originals (tests/tools-host.sh).
-TOOL_TESTS := find install cmp cut xargs truncate dd ln nproc true false printf test mktemp diff patch sed gzip tar
+TOOL_TESTS := find install cmp cut xargs truncate dd ln nproc true false printf test mktemp diff patch sed gzip tar \
+	mkfs.ext2 fsck.ext2 mkiso mbcheck
 TOOL_TEST_BINS := $(addprefix $(BUILD)/tests/tools/,$(TOOL_TESTS))
 .PHONY: test-tools
 test-tools: $(TOOL_TEST_BINS)
@@ -419,7 +449,7 @@ $(BUILD)/tests/tools/gzip $(BUILD)/tests/tools/tar: $(BUILD)/tests/tools/%: user
 $(BUILD)/tests/tools/test: user/fsh/testexpr.c
 $(BUILD)/tests/tools/%: user/bin/%.c
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -idirafter user/include $< -o $@
+	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -DHOST_TOOL -idirafter user/include $< -o $@
 
 # fsh as /bin/sh, built for the host (tests/fsh-host/flux.h stands in for the two
 # fluxOS calls it makes) and checked against the host's /bin/sh (tests/sh-host.sh).
@@ -533,7 +563,7 @@ $(BUILD)/tests/libc-guest: $(BUILD)/tests/libc-guest.o $(CRT0) $(LIBC) user/user
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 
 # Host regression tests use production kernel code with mocked hardware/I/O.
-KERNEL_TEST_NAMES := heap pmm pipe socket storage syscall block sched signal wifi iwl-trans iwl-sta
+KERNEL_TEST_NAMES := heap pmm pipe socket storage ext2 syscall block sched signal wifi iwl-trans iwl-sta
 KERNEL_TEST_BINS := $(addprefix $(BUILD)/tests/kernel-,$(KERNEL_TEST_NAMES))
 .PHONY: test-kernel
 test-kernel: $(KERNEL_TEST_BINS)
@@ -550,10 +580,22 @@ $(BUILD)/tests/kernel-%: tests/kernel-%.c tests/kernel-test.h tests/kernel-readc
 .PHONY: test-kernel-qemu
 # Override to exercise other core counts, nosmp and maxcpus without touching a real disk.
 KERNEL_TEST_CPUS ?= $(QEMU_SMP)
+# Install from a CD made by mkiso (GRUB from firmware/grub) onto a blank disk
+# with fluxinstall, then start the computer from that disk alone.
+test-install-qemu: $(ISO) $(BUILD)/tests/install-guest
+	python3 tools/test-install-qemu.py $(QEMU) $(MKISO) $(BUILD)/iso firmware/grub $(BUILD)/tests/install-guest
+
+$(BUILD)/tests/install-guest.o: tests/install-guest.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(BUILD)/tests/install-guest: $(BUILD)/tests/install-guest.o $(CRT0) $(LIBC) user/user.ld
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
+
 KERNEL_TEST_MEMORY ?= 256
 KERNEL_TEST_CMDLINE ?=
 test-kernel-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest --cpus $(KERNEL_TEST_CPUS) --memory $(KERNEL_TEST_MEMORY) $(TEST_DROP_TOOLCHAIN) --append "$(KERNEL_TEST_CMDLINE)"
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest --cpus $(KERNEL_TEST_CPUS) --memory $(KERNEL_TEST_MEMORY) $(TEST_DROP_TOOLCHAIN) --append "$(KERNEL_TEST_CMDLINE)" --fsck-ext2
 
 $(BUILD)/tests/kernel-guest.o: tests/kernel-guest.c
 	@mkdir -p $(dir $@)
@@ -664,6 +706,14 @@ $(BUILD)/tests/browser-images: tests/browser-images.c user/desktop/image/gif.c u
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra $(DESKTOP_INC) tests/browser-images.c user/desktop/image/gif.c user/desktop/image/webp.c -o $@
 
+.PHONY: test-desktop-mouse
+test-desktop-mouse: $(BUILD)/tests/desktop-mouse
+	$<
+
+$(BUILD)/tests/desktop-mouse: tests/desktop-mouse.c user/desktop/apps/mouse.c $(DESKTOP_HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -g -Wall -Wextra -ffunction-sections -fdata-sections $(DESKTOP_INC) -Iinclude $< -Wl,--gc-sections -o $@
+
 .PHONY: test-desktop-jobs
 test-desktop-jobs: $(BUILD)/tests/desktop-imagejobs
 	$<
@@ -716,8 +766,8 @@ TEST_DROP_TOOLCHAIN := --drop usr/bin --drop usr/libexec --drop usr/lib --drop u
 
 # S3 must boot through firmware/GRUB: QEMU -kernel reloads RAM on wake.
 .PHONY: test-suspend-qemu
-test-suspend-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-suspend $(GRUB_DEP)
-	python3 tools/test-suspend-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-suspend $(MKRESCUE) $(GRUB_PC_DIR) --cpus $(KERNEL_TEST_CPUS) $(TEST_DROP_TOOLCHAIN)
+test-suspend-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-suspend $(MKISO) $(GRUB_FIRMWARE)
+	python3 tools/test-suspend-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-suspend $(MKISO) firmware/grub --cpus $(KERNEL_TEST_CPUS) $(TEST_DROP_TOOLCHAIN)
 
 $(BUILD)/tests/kernel-suspend.o: tests/kernel-suspend.c
 	@mkdir -p $(dir $@)

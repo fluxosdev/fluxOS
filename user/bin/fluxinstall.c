@@ -1,10 +1,15 @@
 /*
  * fluxinstall - install fluxOS onto a hard disk.
  *
- *   fluxinstall [-y] [-p] [-s SOURCE] [-n HOSTNAME] [/dev/hdX]
+ *   fluxinstall [-y] [-p] [-s SOURCE] [-n HOSTNAME] [-e DIR [-r MIB]] [/dev/hdX]
  *
  * The disk gets a new MBR partition table with one bootable FAT32
- * partition starting at 1 MiB. GRUB's boot sector goes into the MBR and
+ * partition starting at 1 MiB. With -e, a second partition after it, ext2,
+ * holds DIR (such as /src for a source tree, or /home): links, permissions
+ * and one-second times, which a build wants and FAT32 does not have. The
+ * system partition then gets -r MIB of the disk (by default half, up to
+ * 4 GiB, and at least what the system needs) and the ext2 one the rest;
+ * /etc/fstab on the system says where init mounts it. GRUB's boot sector goes into the MBR and
  * its core image into the gap before the partition, which is what
  * grub-install does for a BIOS disk. The partition is formatted, and the
  * kernel, GRUB's modules and its menu for a hard disk are copied there
@@ -50,6 +55,8 @@
 
 static const char *source;              /* -s, or found */
 static const char *hostname;            /* -n: for the installed /etc/hostname */
+static const char *data_dir;            /* -e: the second, ext2, partition's mount point */
+static unsigned system_mib;             /* -r: the system partition's size (0: chosen) */
 static int mounted;
 static int progress_lines;              /* -p */
 
@@ -254,14 +261,15 @@ static void size_str(unsigned sectors, char *out, size_t n)
         snprintf(out, n, "%u.%u GiB", mb / 1024, mb % 1024 * 10 / 1024);
 }
 
-static int run_mkfs(const char *dev)
+static int run_mkfs(const char *dev, int ext2, const char *label)
 {
     int pid = fork();
     if (pid < 0)
         return -1;
     if (pid == 0) {
-        char *argv[] = { "mkfs.fat", "-n", "FLUXOS", (char *)dev, NULL };
-        execve("/bin/mkfs.fat", argv, environ);
+        char *fat[] = { "mkfs.fat", "-n", "FLUXOS", (char *)dev, NULL };
+        char *e2[] = { "mkfs.ext2", "-q", "-L", (char *)label, (char *)dev, NULL };
+        execve(ext2 ? "/bin/mkfs.ext2" : "/bin/mkfs.fat", ext2 ? e2 : fat, environ);
         _exit(127);
     }
     int st;
@@ -270,13 +278,33 @@ static int run_mkfs(const char *dev)
     return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
 }
 
+/* An ext2 volume's UUID, as init matches /etc/fstab's UUID= against it. */
+static int ext2_uuid(const char *dev, char *out, size_t size)
+{
+    int fd = open(dev, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    unsigned char sb[136];
+    int ok = lseek(fd, 1024, SEEK_SET) == 1024 && read(fd, sb, sizeof(sb)) == (ssize_t)sizeof(sb) &&
+             sb[56] == 0x53 && sb[57] == 0xEF;
+    close(fd);
+    if (!ok)
+        return -1;
+    const unsigned char *u = sb + 104;
+    snprintf(out, size, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+    return 0;
+}
+
 static void usage(void)
 {
-    fprintf(stderr, "usage: fluxinstall [-y] [-p] [-s SOURCE] [-n HOSTNAME] [/dev/hdX]\n"
+    fprintf(stderr, "usage: fluxinstall [-y] [-p] [-s SOURCE] [-n HOSTNAME] [-e DIR [-r MIB]] [/dev/hdX]\n"
                     "  -y           do not ask for confirmation\n"
                     "  -p           print \"progress N\" lines (N: 0-100)\n"
                     "  -s SOURCE    install medium (default: the fluxOS CD, wherever mounted)\n"
                     "  -n HOSTNAME  the installed computer's name (letters, digits, hyphens)\n"
+                    "  -e DIR       a second partition, ext2, mounted on DIR (/src, /home...)\n"
+                    "  -r MIB       with -e: the system partition's size; the ext2 one gets the rest\n"
                     "Without a disk, fluxinstall asks which one to use.\n");
     exit(2);
 }
@@ -293,10 +321,11 @@ static int valid_hostname(const char *s)
     return 1;
 }
 
-/* The files an install medium has. */
+/* The files an install medium has. GRUB's boot sector and core image for
+ * a hard disk are in firmware/grub, as in the source tree (mkiso's CD). */
 static const char *const needed[] = {
     "boot/fluxos.kernel", "boot/system.tar", "boot/install/grub.cfg",
-    "boot/install/boot.img", "boot/install/core.img", NULL,
+    "firmware/grub/boot.img", "firmware/grub/core.img", NULL,
 };
 
 static int is_medium(const char *dir)
@@ -425,11 +454,22 @@ int main(int argc, char **argv)
             source = argv[++i];
         else if (!strcmp(argv[i], "-n") && i + 1 < argc)
             hostname = argv[++i];
+        else if (!strcmp(argv[i], "-e") && i + 1 < argc)
+            data_dir = argv[++i];
+        else if (!strcmp(argv[i], "-r") && i + 1 < argc)
+            system_mib = (unsigned)strtoul(argv[++i], NULL, 10);
         else
             usage();
     }
     if (i < argc - 1)
         usage();
+    if (system_mib && !data_dir)
+        usage();
+    if (data_dir && (data_dir[0] != '/' || !data_dir[1] || strchr(data_dir + 1, '/') ||
+                     !strcmp(data_dir, "/boot") || !strcmp(data_dir, "/bin") || !strcmp(data_dir, "/etc") ||
+                     !strcmp(data_dir, "/usr") || !strcmp(data_dir, "/dev") || !strcmp(data_dir, "/mnt") ||
+                     !strcmp(data_dir, "/tmp")))
+        die("%s: -e takes a new top-level directory, such as /src or /home", data_dir);
     if (hostname && !valid_hostname(hostname))
         die("%s: a host name is 1-63 letters, digits and hyphens, not starting or ending with a hyphen",
             hostname);
@@ -450,6 +490,8 @@ int main(int argc, char **argv)
     char devpath[64], partpath[64];
     snprintf(devpath, sizeof(devpath), "/dev/%s", disk);
     snprintf(partpath, sizeof(partpath), "/dev/%s%s1", disk, part_sep(disk) ? "p" : "");
+    char datapath[64];
+    snprintf(datapath, sizeof(datapath), "/dev/%s%s2", disk, part_sep(disk) ? "p" : "");
 
     /* ---- the target ---- */
     struct blkinfo bi, target;
@@ -467,6 +509,33 @@ int main(int argc, char **argv)
         die("%s: unsupported sector size %u", dev, target.sector_size);
     if (target.sectors < PART_START + MIN_PART)
         die("%s is too small: fluxOS needs a disk of at least 34 MiB", dev);
+
+    /* With -e: the system partition's size, and the ext2 one after it. */
+    unsigned sys_sectors = target.sectors - PART_START, data_start = 0, data_sectors = 0;
+    if (data_dir) {
+        struct stat tst;
+        char tarpath[PATH_MAX];
+        path_join(tarpath, sizeof(tarpath), source, "boot/system.tar");
+        unsigned long long need = stat(tarpath, &tst) == 0 ? (unsigned long long)tst.st_size : 0;
+        need += need / 4 + (64ull << 20);               /* FAT's clusters, GRUB, room to spare */
+        unsigned need_mib = (unsigned)(need >> 20), mib = system_mib;
+        if (need_mib < MIN_PART / 2048 + 1)
+            need_mib = MIN_PART / 2048 + 1;
+        if (!mib) {
+            mib = target.sectors / 2048 / 2;
+            if (mib > 4096)
+                mib = 4096;
+            if (mib < need_mib)
+                mib = need_mib;
+        }
+        if (mib < need_mib)
+            die("-r %u: the system partition needs at least %u MiB", mib, need_mib);
+        sys_sectors = mib * 2048;
+        data_start = PART_START + sys_sectors;
+        if (data_start >= target.sectors || target.sectors - data_start < 64 * 2048)
+            die("%s is too small for a %u MiB system partition and an ext2 one of 64 MiB or more", dev, mib);
+        data_sectors = target.sectors - data_start;
+    }
     /* Nothing may be mounted from it (the system itself, say): the kernel
      * would refuse the partition rescan, but only after the boot sector
      * had been written. */
@@ -482,9 +551,9 @@ int main(int argc, char **argv)
         die("the install medium %s is on %s itself", source, dev);
 
     unsigned boot_size, core_size;
-    path_join(path, sizeof(path), source, "boot/install/boot.img");
+    path_join(path, sizeof(path), source, "firmware/grub/boot.img");
     unsigned char *boot = slurp(path, &boot_size);
-    path_join(path, sizeof(path), source, "boot/install/core.img");
+    path_join(path, sizeof(path), source, "firmware/grub/core.img");
     unsigned char *core = slurp(path, &core_size);
     unsigned core_sectors = (core_size + SECTOR - 1) / SECTOR;
     if (boot_size != SECTOR || boot[510] != 0x55 || boot[511] != 0xAA)
@@ -501,7 +570,15 @@ int main(int argc, char **argv)
     if (hostname)
         printf("  Name:    %s\n", hostname);
     printf("\n");
-    printf("This creates one FAT32 partition (%s) and installs GRUB and fluxOS.\n", partpath);
+    if (data_dir) {
+        char a[32], b[32];
+        size_str(sys_sectors, a, sizeof(a));
+        size_str(data_sectors, b, sizeof(b));
+        printf("This creates a FAT32 partition (%s, %s) and installs GRUB and fluxOS on it,\n"
+               "and an ext2 partition (%s, %s) for %s.\n", partpath, a, datapath, b, data_dir);
+    } else {
+        printf("This creates one FAT32 partition (%s) and installs GRUB and fluxOS.\n", partpath);
+    }
     printf("\033[1;31mALL DATA ON %s WILL BE ERASED.\033[0m\n", devpath);
     if (!yes) {
         char answer[16];
@@ -559,13 +636,22 @@ int main(int argc, char **argv)
     }
     wr32(mbr + MBR_SIGNATURE, sig);
     unsigned char *pe = mbr + MBR_PARTITIONS;
-    unsigned psize = target.sectors - PART_START;
+    unsigned psize = sys_sectors;
     pe[0] = 0x80;                                       /* bootable */
     pe[1] = 0xFE; pe[2] = 0xFF; pe[3] = 0xFF;           /* CHS: use LBA */
     pe[4] = 0x0C;                                       /* FAT32, LBA */
     pe[5] = 0xFE; pe[6] = 0xFF; pe[7] = 0xFF;
     wr32(pe + 8, PART_START);
     wr32(pe + 12, psize);
+    if (data_dir) {                                     /* the ext2 one */
+        pe += 16;
+        pe[0] = 0;
+        pe[1] = 0xFE; pe[2] = 0xFF; pe[3] = 0xFF;
+        pe[4] = 0x83;                                   /* Linux */
+        pe[5] = 0xFE; pe[6] = 0xFF; pe[7] = 0xFF;
+        wr32(pe + 8, data_start);
+        wr32(pe + 12, data_sectors);
+    }
     mbr[510] = 0x55;
     mbr[511] = 0xAA;
 
@@ -586,8 +672,13 @@ int main(int argc, char **argv)
     /* ---- [2/4] filesystem ---- */
     progress(2);
     printf("[2/4] Formatting %s as FAT32\n", partpath);
-    if (run_mkfs(partpath) < 0)
+    if (run_mkfs(partpath, 0, NULL) < 0)
         die("formatting %s failed", partpath);
+    if (data_dir) {
+        printf("      Formatting %s as ext2 for %s\n", datapath, data_dir);
+        if (run_mkfs(datapath, 1, data_dir + 1) < 0)
+            die("formatting %s failed", datapath);
+    }
 
     /* ---- [3/4] files ---- */
     progress(COPY_FROM);
@@ -665,6 +756,21 @@ int main(int argc, char **argv)
         if (!f || fprintf(f, "%s\n", hostname) < 0 || fclose(f) != 0)
             die("%s: %s", dst, strerror(errno));
         printf("      host name: %s\n", hostname);
+    }
+
+    if (data_dir) {
+        /* where init mounts the ext2 partition, found by its UUID */
+        char uuid[40];
+        if (ext2_uuid(datapath, uuid, sizeof(uuid)) < 0)
+            die("%s: no ext2 filesystem after formatting it", datapath);
+        path_join(dst, sizeof(dst), MOUNTPOINT, data_dir);
+        make_dir(dst);
+        path_join(dst, sizeof(dst), MOUNTPOINT, "etc/fstab");
+        FILE *f = fopen(dst, "a");
+        if (!f || fprintf(f, "# made by fluxinstall: the ext2 partition %s\nUUID=%s %s ext2\n", datapath, uuid,
+                          data_dir) < 0 || fclose(f) != 0)
+            die("%s: %s", dst, strerror(errno));
+        printf("      %s: ext2 partition %s\n", data_dir, datapath);
     }
 
     /* ---- [4/4] finish ---- */

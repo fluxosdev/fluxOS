@@ -1,9 +1,10 @@
 # fluxOS self-hosting roadmap
 
 *Written 2026-10-28, against commit 8cdd993 plus the toolchain and libc
-work described in phases 1 and 2. Phases 0 to 4 are done (phase 3 and 4
+work described in phases 1 and 2. Phases 0 to 6 are done (phase 3 and 4
 on 2026-10-29: the Makefile's tools, `fsh` as `/bin/sh`, and GCC running
-on fluxOS); phases 5 to 7 are a plan.*
+on fluxOS; phases 5 and 6 on 2026-10-30: ext2 with links, and the ISO made
+natively); phase 7 is a plan.*
 
 "Self-hosting" means that fluxOS, running on its own kernel, can turn a
 checkout of this repository into a bootable `fluxOS.iso` and an installed
@@ -82,9 +83,9 @@ and nine `.S` files.
 | A compiler that runs on fluxOS | done (phase 4, 2026-10-29): GCC 13.2.0 with C and C++, 72 MB on the image |
 | `make`, `tar`, `gzip` (compress), `find`, `install`, `cmp`/`diff`, `sed` | done (phase 3, 2026-10-29), with `patch`, `cut`, `xargs`, `truncate`, `dd`, `ln`, `mktemp`, `nproc`, `printf`, `test`, `true`, `false` |
 | libc | since phase 2, enough for GNU make and binutils to build; POSIX threads, interval timers, signal stacks and sessions since 2026-10-29; C++-clean headers, C99 math, `getaddrinfo`, `.init_array` constructors and `__cxa_atexit` for GCC and libstdc++ (2026-10-29); still no real links |
-| Filesystem | FAT32 only on disk: 2 s modification times (a target built within 2 s of editing its source looks up to date to `make`), no symbolic or hard links, cosmetic permissions, case-insensitive names |
+| Filesystem | done (phase 5, 2026-10-30): ext2 read/write with symbolic and hard links, permissions and 1 s times, on a second partition (`fluxinstall -e /src`) or any disk; FAT32 stays the system's root, now with 1 s modification times |
 | Kernel limits | 128 processes and threads together; `PATH_MAX` 4096 since 2026-10-29 (descriptors, memory regions, stack and pipes raised in phase 2) |
-| Boot media | ISO 9660 writing, El Torito, GRUB's images |
+| Boot media | done (phase 6, 2026-10-30): `mkiso` (ISO 9660, Rock Ridge, El Torito, hybrid MBR) and GRUB's images checked in |
 
 ## Decisions
 
@@ -448,64 +449,119 @@ the libc. What was expected to be medium risk (GCC's configure and an
 unknown host) was in the end four build attempts, each stopped by one
 missing libc feature.
 
-## Phase 5: a filesystem for a build
+## Phase 5: a filesystem for a build (done)
 
 *Goal: `make` is correct on fluxOS (no spurious "up to date"), links work,
 `cp -r` of the tree keeps everything. Measured by the native build of
 phase 7 producing the same file list as the Linux build.*
 
-- [ ] ext2 read/write driver (`kernel/fs/ext2.c`): superblock, block
-      groups, bitmaps, inodes with direct, indirect and double-indirect
-      blocks, directories (linked list, no htree), symbolic links (fast
-      and slow), hard links, `mtime`/`ctime`/`atime`, permission bits,
-      `rename` within and across directories, and the same write-back
-      sector cache FAT uses. Revision 1 only: no journal (ext3) and no
-      extents (ext4), but the feature flags checked so an ext4 volume is
-      refused rather than damaged.
-- [ ] `mkfs.ext2` natively (and `make disk DISKFS=ext2` on the host),
-      `fsck`-lite (counts only), `mount -t ext2`.
-- [ ] VFS: symbolic link resolution in `vfs_resolve` (with a depth limit),
-      `lstat`, `readlink`, `link`, `symlink`, `chmod`/`chown` that persist,
-      `S_IFLNK` in `getdents`.
-- [ ] `fluxinstall` and the automounter recognise ext2 volumes; the
-      installer keeps FAT32 for `/` (GRUB reads it, and the Setup CD's
-      tools expect it) and can make a second ext2 partition for `/src`
-      or `/home`.
-- [ ] Timestamps: the FAT driver uses the 10 ms create-time field as the
-      modification time where it can, so the system partition is at least
-      `make`-safe for small edits.
+Done 2026-10-30. `make test-kernel` runs the ext2 driver through the VFS on
+images mke2fs made (1 and 4 KiB blocks, 128- and 256-byte inodes, one
+filled by `mke2fs -d`), with 3000 random writes, truncations, unlinks,
+renames and hard links checked against a model, and Linux's e2fsck and
+debugfs judging every image afterwards. `make test-kernel-qemu` formats
+the scratch disk with the native `mkfs.ext2`, uses it through the system
+calls (and `cp -a`, `ls -l`, `fsck.ext2`), and the host's e2fsck checks the
+disk after. `make test-install-qemu` installs with an ext2 `/src`
+partition and boots the disk until init has mounted it.
 
-Size: ext2 about 2.5k lines, VFS and tools 1k. Risk: medium; a write
-driver needs the kind of testing `tests/kernel-storage.c` does for FAT,
-and that test grows an ext2 image.
+- [x] ext2 read/write driver (`kernel/fs/ext2.c`, 1.5k lines): superblock,
+      block groups, bitmaps, inodes through direct, indirect, double- and
+      triple-indirect blocks (a 4 GiB file with 1 KiB blocks needs the
+      third), linked-list directories, fast and slow symbolic links, hard
+      links (an in-core inode shared by every vnode naming it, since a VFS
+      vnode is a name), `mtime`/`ctime`, permission bits and owners,
+      `rename` within and across directories (`..` and link counts kept),
+      extended-attribute blocks released with their last user. Metadata goes
+      through the write-back sector cache, file and directory blocks through
+      `blk_read`/`blk_write`, which stay coherent with it. Revision 0 and 1;
+      the feature flags are checked: ext4 (extents, 64-bit) and a journal to
+      recover are refused, checksums mount read-only, an ext3 volume with a
+      clean journal mounts as ext2 (as Linux allows); an htree directory's
+      index flag is cleared when the directory changes. The volume is marked
+      not clean while mounted, and clean at unmount and at shutdown
+      (`vfs_sync_filesystems`, before the disks are synced).
+- [x] `mkfs.ext2` natively (and `make disk DISKFS=ext2` on the host, with
+      the same program built for it): revision 1, 256-byte inodes, file
+      types, sparse superblock copies, large files, lost+found; 1 KiB blocks
+      below 512 MiB, 4 KiB above, one inode per 8 KiB. `fsck.ext2` checks the
+      counts (each group's free blocks, free inodes and directories against
+      its bitmaps and inode table, bitmap padding, the superblock's totals)
+      and `-y` corrects them; exit codes as e2fsck's. `mount -t ext2`.
+- [x] VFS: symbolic links followed in `vfs_resolve` (40 at most, then
+      `ELOOP`; the last component's not for `lstat`, `unlink`, `rmdir`,
+      `rename`'s source, `readlink`, `lchown`; a trailing slash follows
+      it), `lstat`, `readlink`, `link`, `symlink` (ramfs keeps symbolic links
+      too; FAT answers `EPERM`, as Linux's vfat), `chmod`/`fchmod`/`chown`/
+      `fchown`/`lchown` and the modes `open` and `mkdir` give that persist
+      through the filesystem's `setattr`, owners and link counts in `stat`,
+      `S_IFLNK` and `DT_LNK`. Six system calls (97-102). `cp -r` copies
+      links as links, `cp -a` keeps modes, times and hard links too, `ls -l`
+      shows `name -> target`.
+- [x] `fluxinstall` and the automounter recognise ext2 volumes (it is the
+      last in the probe order); the installer keeps FAT32 for `/` and with
+      `-e /src` (or `/home`) makes a second, ext2, partition after it (the
+      system gets half the disk up to 4 GiB, or `-r MIB`), which `/etc/fstab`
+      names by UUID and init moves from the automounter's `/mnt/hdX2` to its
+      place at start-up. fluxOS Setup's wizard does not offer it yet; its
+      command prompt (Shift+F10) and the text mode do.
+- [x] Timestamps: the FAT driver writes the modification time into the
+      creation time's fields too, its odd second in the 10 ms field, and
+      reads it back while it falls within the write time's 2-second step
+      (another system writing the file sets only the write time), so the
+      system partition is `make`-safe to the second.
 
-## Phase 6: boot media made natively
+Size: the driver 1.5k lines, the tools 0.5k, the VFS and system calls 0.4k, the tests 0.8k.
+
+## Phase 6: boot media made natively (done)
 
 *Goal: `mkiso` on fluxOS produces an ISO that boots in QEMU and on the
 HP Pavilion g6, and `fluxinstall` installs from a native build.*
 
-- [ ] `firmware/grub/`: `boot.img`, `core.img` (built on Linux by
-      `grub-mkimage -O i386-pc -p '(,msdos1)/boot/grub' biosdisk
-      part_msdos fat`), the CD's `eltorito.img` (`-p '/boot/grub'
-      biosdisk iso9660`), and the `i386-pc` modules the two menus load,
-      each with its SHA-256 and the Debian package it came from.
-      `tools/fetch-grub.sh` becomes the way to refresh them, not a build
-      step.
-- [ ] `mkiso`: ISO 9660 level 1 with Rock Ridge (`RR`, `PX`, `NM`), a
-      primary volume descriptor, path tables, El Torito boot record
-      pointing at `eltorito.img` (no emulation, 4 sectors), `boot/grub/`
-      with the modules, `grub.cfg`, the kernel, `setup.tar` and
-      `system.tar`. The kernel's `iso9660.c` reads the result as a test.
-- [ ] `make iso` on fluxOS: the Makefile's ISO rule written in terms of
-      `mkiso` and the firmware directory, with the Linux build keeping
-      `grub-mkrescue` as an alternative behind `MKRESCUE=`.
-- [ ] `mbcheck` (Multiboot header validation) and a `kernel-elf-check`
-      (one `PT_LOAD`, entry inside it) as native tools run by `make check`.
-- [ ] Setup CD: `fluxinstall` reads `boot.img`/`core.img` from
-      `firmware/grub` on the CD instead of `boot/install/`.
+Done 2026-10-30, tried in QEMU (the HP Pavilion g6 is still to come): the
+ISO `make` builds now comes from `mkiso` and boots as a CD and written to
+a disk as a USB stick would be; `make test-install-qemu` installs from it
+onto a blank disk and starts the disk alone; `make test-kernel-qemu` runs
+the native `mkiso` on fluxOS and reads its image back through the kernel's
+ISO 9660 driver; `make test-suspend-qemu` boots through an `mkiso` ISO too.
+No build step downloads GRUB any more.
 
-Size: `mkiso` 800 lines, tooling 300. Risk: low; the formats are simple
-and the loader side exists.
+- [x] `firmware/grub/`: `boot.img`, `core.img` (`grub-mkimage -O i386-pc
+      -p '(,msdos1)/boot/grub' biosdisk part_msdos fat`, byte for byte what
+      the old rule made), the CD's `i386-pc/eltorito.img` (`-O
+      i386-pc-eltorito -p /boot/grub biosdisk iso9660`: grub-mkrescue's adds
+      a search for the CD by a UUID made from the ISO's date, which would
+      change with every build; the plain one reads `/boot/grub` from the
+      drive it started from), `boot_hybrid.img`, and the 45 modules the two
+      menus load (their `insmod`s, their commands' modules through
+      `command.lst`, a few for GRUB's command line, and the closure of
+      `moddep.lst`) with GRUB's `.lst` files: 628 KiB. A README gives each
+      file's origin, the Debian packages and their hashes; `SHA256SUMS` each
+      file's. `tools/fetch-grub.sh --firmware DIR` makes the directory again.
+- [x] `mkiso` (`user/bin/mkiso.c`, 0.8k lines): ISO 9660 level 1 names made
+      unique, Rock Ridge (`SP`, `ER`, `PX`, `NM`, `TF`), both path tables,
+      an El Torito boot record and catalog (no emulation, 4 sectors) with the
+      boot information table written into the image, and a hybrid MBR (`-G
+      boot_hybrid.img`: a protective partition over the image, GRUB's two
+      addresses patched in as xorriso's `--grub2-mbr` and
+      `--grub2-boot-info` do), so the ISO written to a USB stick starts too,
+      as grub-mkrescue's did. Sequential writes only. xorriso reads its
+      images as it reads its own.
+- [x] `make iso` on fluxOS: the ISO rule copies the tree and runs `mkiso`
+      (built by the C compiler of the machine running the build, `HOSTCC`,
+      as `mbcheck` and `mkfs.ext2` are); `make MKRESCUE=...` keeps
+      grub-mkrescue as the alternative.
+- [x] `mbcheck` for `make check`: the Multiboot header (in the first 8 KiB,
+      aligned, the checksum, no required feature a loader may lack, the
+      a.out addresses when given) and the ELF layout (one `PT_LOAD`, inside
+      the file, the entry point in it), in one program rather than two.
+- [x] Setup CD: `fluxinstall` (and Setup's check for an install medium)
+      reads `boot.img` and `core.img` from `firmware/grub` on the CD; the
+      hard disk's menu stays in `boot/install/grub.cfg`.
+
+Size: `mkiso` 800 lines, `mbcheck` 150, the tests 200. As expected, low risk:
+the only surprises were the boot information table's checksum (taken after
+GRUB's address is patched in) and the ISO's embedded-UUID config.
 
 ## Phase 7: the bootstrap
 
@@ -549,8 +605,8 @@ libc list into an ordered one.
 Suggested order: 4 (the Canadian cross: binutils already links for
 fluxOS), 3 (GNU make already builds), 6, 5, 7; and running the phase 2
 tests on fluxOS before relying on any of it. (Phases 3 and 4 were done
-together on 2026-10-29; what remains is 5, 6 and 7, and running
-the tools on the kernel; `make test-gcc-qemu` passed on 2026-10-29.)
+together on 2026-10-29, 5 and 6 on 2026-10-30; what remains is 7, and
+running the tools on the kernel; `make test-gcc-qemu` passed on 2026-10-29.)
 
 ## Later, deliberately
 

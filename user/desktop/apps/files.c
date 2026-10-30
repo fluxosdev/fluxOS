@@ -37,7 +37,6 @@
 #define CELL_H     68
 #define SB_W       16
 #define LINE_STEP  CELL_H
-#define DBLCLICK_MS 500
 
 struct entry {
     char name[NAME_MAX + 1];
@@ -1497,6 +1496,13 @@ static void fm_mouse(struct window *w, int x, int y, int buttons, int changed)
     paint(f);
 }
 
+static void fm_wheel(struct window *w, int steps)
+{
+    struct fm *f = w->priv;
+    set_scroll(f, f->scroll - steps * mouse_wheel_lines() * (CELL_H / 3));
+    paint(f);
+}
+
 static void fm_focus(struct window *w, int focused)
 {
     struct fm *f = w->priv;
@@ -1535,6 +1541,7 @@ static void fm_destroy(struct window *w)
 static const struct window_ops fm_ops = {
     .key = fm_key,
     .mouse = fm_mouse,
+    .wheel = fm_wheel,
     .focus = fm_focus,
     .resize = fm_resize,
     .destroy = fm_destroy,

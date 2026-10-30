@@ -85,7 +85,17 @@ says why.
 - VFS over an in-memory filesystem unpacked from a ustar initrd at boot, with
   `/dev/{tty,console,null,zero,random,urandom}`, pipes and pseudo-terminals.
   Started from an installed disk (`root=UUID=...`), its FAT32 partition is the
-  root instead and only `/dev`, `/tmp` and `/mnt` stay in memory. The CD's
+  root instead and only `/dev`, `/tmp` and `/mnt` stay in memory. Symbolic
+  links are followed in paths (`lstat`, `readlink`, `symlink`, `link`), on
+  ext2 and in memory.
+- Filesystems: FAT12/16/32 with long names (read/write; modification times
+  to the second, kept in the creation time's 10 ms field besides the 2 s
+  write time), ISO 9660 with Rock Ridge (read), and ext2 (read/write,
+  revision 0 and 1): permissions, owners, one-second times, symbolic and
+  hard links, files through triple-indirect blocks. ext3 mounts as ext2
+  while its journal is clean; ext4 is refused, and volumes with features
+  writing would not keep up to date (checksums) mount read-only. `/etc/fstab`
+  lines (`UUID=... /src ext2`) are mounted at start-up. The CD's
   initrd is a small setup system, not the whole one: files in memory live in
   the kernel heap, a quarter of RAM (up to 256 MiB, and at most half of the
   first GiB), so the whole system with its compiler in memory (`make
@@ -415,8 +425,9 @@ fetcher process, so the desktop keeps running), or from `file://`.
   `lab()`, `lch()`, `oklab()` and `oklch()` forms) and the system colors (`AccentColor`, `Canvas`,
   `Mark`...). Around 120 properties that change nothing this renderer draws (`color-scheme`,
   `touch-action`, `overscroll-behavior`, `scrollbar-width`, `content-visibility`, `contain`,
-  `font-feature-settings`, `scroll-margin`, `scroll-snap-*`...) are accepted and ignored, so
-  `@supports` and `CSS.supports()` answer as a modern browser does.
+  `font-feature-settings`, `scroll-margin`, `scroll-snap-*`...) are parsed but ignored;
+  `@supports` and `CSS.supports()` return false for these unimplemented properties so
+  pages can choose their fallback styles.
   Pictures: comma-separated `background-image` layers (PNG, JPEG, GIF, WebP, ICO,
   SVG, gradients and `data:` URLs) with `background-size` (lengths, percentages, `cover`, `contain`),
   `background-position` (keywords, offsets from an edge), `background-repeat`, `background-origin`,
@@ -625,8 +636,9 @@ fetcher process, so the desktop keeps running), or from `file://`.
 
 **Userland** (`/bin`): 7z [ basename beep cat chmod clear cmp cp cut date dd desktop
 df diff dirname dmesg dos echo env false fetch find fluxinstall free fsh grep gunzip
-gzip halt head hexdump host ifconfig init install ln ls lsblk mkdir mkfs.fat mktemp
-mixer more mount mv nc nproc patch ping play poweroff printf ps reboot rm rmdir sed
+gzip halt head hexdump host ifconfig init install ln ls lsblk mbcheck mkdir mkfs.ext2
+mkfs.fat mkiso mktemp fsck.ext2 mixer more mount mv nc nproc patch ping play poweroff
+printf ps reboot rm rmdir sed
 seq sh sleep sort spin stat sync tail tar tee test threadtest top touch tr true
 truncate umount uname uniq unzip uptime wc wget xargs yes zcat zip (and httpc, the
 browser's fetcher), on a small libc (stdio, malloc, dirent, time, sockets, a DNS
@@ -688,27 +700,31 @@ containers and exceptions (`make test-gcc-qemu`).
 On a Debian/Ubuntu host:
 
 ```sh
-sudo apt install build-essential grub-pc-bin grub-common xorriso mtools qemu-system-x86
+sudo apt install build-essential qemu-system-x86
+# optional: mtools, and e2fsprogs and xorriso, which the tests check images with
 ```
 
 No cross compiler is needed: everything is built with the host GCC using `-m32
 -march=pentium4 -ffreestanding`, and nothing links against libgcc or the host
-libc. The first
-`make` downloads Debian 12's GRUB 2.06 into `grub-2.06/` (checked against
-fixed SHA-256 hashes; nothing is installed), because GRUB 2.12 reboots some
-older PCs right after "Welcome to GRUB!". `make GRUB=/ GRUB_DEP=` uses the
-host's GRUB. The ISO boots on legacy BIOS only.
+libc. GRUB is not built or downloaded: its boot images and the modules the
+menus load are checked in (`firmware/grub`, Debian 12's GRUB 2.06, with their
+provenance and hashes in its README; 2.12 reboots some older PCs right after
+"Welcome to GRUB!"), and `mkiso`, fluxOS's own, makes the ISO from them: El
+Torito for CDs, and a hybrid MBR so the image written to a USB stick starts
+too. `make MKRESCUE=grub-2.06/usr/bin/grub-mkrescue` makes it with
+grub-mkrescue instead, from GRUB fetched by `tools/fetch-grub.sh`, which also
+remakes `firmware/grub` (`--firmware`). The ISO boots on legacy BIOS only.
 
 ```sh
 make            # builds fluxOS.iso
-make check      # verifies the kernel is a valid Multiboot image
+make check      # verifies the kernel is a valid Multiboot image (mbcheck)
 make test-browser # DOM, CSS/layout, binary/Unicode, shadow/motion and HTTP policy regressions
 make test-js     # language, module, suspended-frame and real garbage-collection regressions
 make bench-js   # ten standalone JavaScript workloads with wall time and peak memory
 make test-browser-fonts # real glyph rendering and malformed-font rejection
 make test-tls     # local OpenSSL servers: authenticated handshakes and rejected certificates
 make test-websocket # local ws/wss transport and browser API integration tests
-make test-kernel # runs allocator, filesystem, pipe and socket regressions on the host
+make test-kernel # runs allocator, filesystem (FAT and ext2, judged by e2fsck), pipe and socket regressions on the host
 make test-libc   # libc printf/strtod/scanf/regex/fnmatch/getopt/time against glibc, on the host
 make test-libc-qemu # the libc on the real kernel (files, popen, pipes, select, time) in QEMU
 make test-tools  # tar, gzip, sed, diff, patch, find... built for the host, against GNU's
@@ -717,12 +733,13 @@ make test-gcc-qemu # the native GCC compiles, links and runs a program on the re
 make test-desktop-jobs # decoder helper responsiveness, transfers, cancellation and recovery
 make test-desktop-jobs-qemu # same protocol tests with fluxOS's blocking pipes
 make test-kernel-qemu # boots kernel regressions with a disposable initrd and scratch disk
+make test-install-qemu # installs from the mkiso CD with an ext2 /src partition, then boots the disk
 make test-kernel-qemu KERNEL_TEST_CPUS=4 # same tests on four Core 2 Duo CPUs
 make test-kernel-qemu KERNEL_TEST_CPUS=2 KERNEL_TEST_MEMORY=2048 # larger RAM and read cache
 make test-kernel-qemu KERNEL_TEST_CMDLINE=readcache=0 # direct-read fallback
 make test-kernel-qemu KERNEL_TEST_CPUS=4 KERNEL_TEST_CMDLINE=nosmp # single-core fallback
 make test-kernel-qemu KERNEL_TEST_CPUS=4 KERNEL_TEST_CMDLINE=maxcpus=2 # CPU limit
-make disk       # fluxdisk.img, a 256 MiB FAT32 data disk (DISK_MB=...)
+make disk       # fluxdisk.img, a 256 MiB FAT32 data disk (DISK_MB=..., DISKFS=ext2)
 make floppy     # fluxfloppy.img, a 1.44 MB FAT12 floppy for drive A:
 make run        # boots the install CD in QEMU with the disk, floppy (if any) and an NE2000
 make run-kernel # boots the kernel directly, the whole system in memory (text console)
@@ -788,7 +805,10 @@ copy files off them before one is erased. **Quit** leaves Setup by restarting
 or shutting down, and **Shift+F10** opens a command prompt. Without a framebuffer, or with the menu's **Install fluxOS (text
 mode)**, the same questions come on the console; from that console (or the
 command prompt) `fluxinstall /dev/hda` installs directly (it asks you to type
-"yes", `-y` skips that).
+"yes", `-y` skips that). `fluxinstall -e /src /dev/hda` adds a second
+partition, ext2, for a source tree (or `-e /home`): the system partition gets
+half the disk up to 4 GiB (`-r MIB` says otherwise) and the ext2 one the rest,
+mounted on `/src` at start-up from `/etc/fstab`.
 
 Setup writes an MBR with one bootable FAT32 partition at 1 MiB, installs GRUB,
 formats the partition, copies the kernel and GRUB's files onto it and unpacks
@@ -882,6 +902,7 @@ rootfs/                    the installed system's files (/etc, /home/flux, icons
 setupfs/                   the CD's setup system's own files (/etc/setup, its motd)
 grub/                      the CD's boot menu (install.cfg) and the installed disk's
                            (grub.cfg)
+firmware/grub/             GRUB's boot images and modules, checked in (see its README)
 ```
 
 ## Design notes
@@ -999,9 +1020,9 @@ user range and page tables first.
 - **Building fluxOS on fluxOS** (`self-hosting-roadmap.md`): GNU make,
   binutils and GCC itself run on fluxOS, and the Makefile's tools exist
   (`tar`, `gzip`, `sed`, `diff`, `patch`, `find`, `install`...) with `fsh`
-  as `/bin/sh`; what is left is a filesystem with 1-second timestamps and
-  links for the build tree (ext2), making the ISO natively, and the
-  bootstrap itself. The native compiler is tested on the kernel by `make
+  as `/bin/sh`, the build tree has a filesystem with links and one-second
+  times (ext2), and the ISO is made by fluxOS's own `mkiso` from GRUB's
+  checked-in images; what is left is the bootstrap itself. The native compiler is tested on the kernel by `make
   test-gcc-qemu`; the tools and the `sh` mode on the host against the GNU
   originals and dash. For QEMU S3 tests, boot through GRUB (ISO or installed
   disk), not `make run-kernel`: QEMU's direct kernel loader reloads kernel
@@ -1034,8 +1055,9 @@ user range and page tables first.
 The kernel runs on every processor at once, but the I/O APIC is not used: every
 interrupt reaches the first processor through the PICs. From the CD, the root
 filesystem lives in RAM and only what you write to a mounted FAT volume persists;
-an installed system runs from its FAT32 partition, so there are no symbolic or hard
-links and permission bits are cosmetic apart from the exec bit. There is one user,
+an installed system runs from its FAT32 partition, which has no symbolic or hard
+links and only the exec bit of the permissions (an ext2 partition, `fluxinstall -e`,
+has both; permissions are not enforced anywhere). There is one user,
 and there are no shared libraries (programs are linked statically).
 The FPU state is saved with FXSAVE, so AVX and later cannot be used.
 
@@ -1104,8 +1126,12 @@ The FPU state is saved with FXSAVE, so AVX and later cannot be used.
   still repeat, and `local` attachments do not track inner scrolling; a positioned inline (a `<span>`)
   does not get a layer of its own, and `opacity` fades each item on its own rather than the group;
   `sticky` works against the window only. CSS 2D translate, scale, rotate, skew and matrix transforms
-  support origins, nesting, painting, hit testing and visual geometry; 3D transforms are
-  ignored. CSS transitions and `@keyframes` animations run on colors, lengths, opacity,
+  support origins, nesting, painting, hit testing and visual geometry. 3D transform lists
+  retain depth through composition: `perspective()`, `translateZ()`, `scaleZ()`, arbitrary-axis
+  rotations and `matrix3d()` project flattened planes, including raster painting, hit testing
+  and clipping at the viewer plane. Parent `perspective` and `perspective-origin` project
+  direct transformed children. Shared `preserve-3d` scenes, depth sorting and intersecting
+  planes remain unimplemented; `CSS.supports()` reports `transform-style` as unsupported. CSS transitions and `@keyframes` animations run on colors, lengths, opacity,
   transforms with matching functions, shadows and the box properties (not on pseudo-elements,
   and not on discrete properties such as `display`); each frame restyles only what moves. Transform scratch rendering is bounded to four million
   source pixels per item. `structuredClone` copies buffers, typed views and blobs,
@@ -1114,8 +1140,11 @@ The FPU state is saved with FXSAVE, so AVX and later cannot be used.
   Try `file:///usr/share/www/transforms.html` for an interactive example.
   Flexbox has grow/shrink sizing, wrapping,
   ordering, alignment and rows/columns, but needs wider conformance testing;
-  grids lack subgrid, named spans and complete named-line behavior for auto-repeat.
-  Container queries are missing. Shadow DOM still needs wider composed-event and slot
+  grids support row and column subgrids with inherited track sizes and gaps, nested
+  subgrids, descendant contributions to auto tracks, and inherited names for explicitly
+  placed spans. Subgrid line-name repeat syntax, complete named-line handling for
+  auto-placed spans, named spans and complete named-line behavior for auto-repeat remain
+  incomplete. Container size queries are implemented. Shadow DOM still needs wider composed-event and slot
   conformance testing; adopted sheets do not register downloadable font faces.
   Fetch resolves at headers and delivers body chunks incrementally; EventSource
   parses event streams and reconnects. Each page uses up to four request workers.

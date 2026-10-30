@@ -324,5 +324,37 @@ if "$tools/mktemp" "$work/noxs" 2>/dev/null; then bad "mktemp: too few X"; else 
 "$tools/true" && ok || bad "true"
 if "$tools/false"; then bad "false"; else ok; fi
 
+# ---- mkfs.ext2, fsck.ext2: Linux's e2fsck agrees with the volumes and the counts ----
+if command -v e2fsck >/dev/null 2>&1 && command -v mke2fs >/dev/null 2>&1; then
+    for spec in "1024 8M" "4096 600M" "2048 3000K"; do
+        set -- $spec
+        rm -f e2.img
+        "$tools/mkfs.ext2" -q -b "$1" e2.img "$2" && e2fsck -fn e2.img >/dev/null 2>&1 && ok || bad "mkfs.ext2 -b $1 $2"
+    done
+    rm -f e2.img && "$tools/mkfs.ext2" -q -L srcdisk e2.img 100M &&
+        [ "$(dumpe2fs -h e2.img 2>/dev/null | sed -n 's/^Filesystem volume name: *//p')" = srcdisk ] && ok || bad "mkfs.ext2 -L"
+    "$tools/fsck.ext2" e2.img >/dev/null && ok || bad "fsck.ext2 on a clean volume"
+    mke2fs -q -F -t ext2 e2l.img 20M >/dev/null 2>&1 && "$tools/fsck.ext2" e2l.img >/dev/null && ok || bad "fsck.ext2 on mke2fs's volume"
+    printf '\071\060\000\000' | dd of=e2.img bs=1 seek=1036 conv=notrunc 2>/dev/null
+    if "$tools/fsck.ext2" e2.img >/dev/null; then bad "fsck.ext2 misses a wrong count"; else ok; fi
+    "$tools/fsck.ext2" -y e2.img >/dev/null; [ $? = 1 ] && e2fsck -fn e2.img >/dev/null 2>&1 && ok || bad "fsck.ext2 -y"
+fi
+
+# ---- mkiso: xorriso reads the image, its names and El Torito's boot entry ----
+if command -v xorriso >/dev/null 2>&1; then
+    mkdir -p isotree/Sub/deeper && echo hi > isotree/Sub/deeper/A-Long-Name.txt && cp tree/src/random.bin isotree/ &&
+        head -c 4096 /dev/zero > isotree/boot.img
+    "$tools/mkiso" -o t.iso -b boot.img isotree && ok || bad "mkiso"
+    xorriso -indev t.iso -find / -type f 2>/dev/null | LC_ALL=C sort > iso.list
+    printf "'/Sub/deeper/A-Long-Name.txt'\n'/boot.img'\n'/random.bin'\n" > iso.exp
+    same iso.exp iso.list "mkiso Rock Ridge names"
+    xorriso -indev t.iso -report_el_torito plain 2>/dev/null | grep -q 'cat path : /boot.catalog' && ok || bad "mkiso boot catalog"
+    xorriso -osirrox on -indev t.iso -extract /random.bin iso.random 2>/dev/null && same tree/src/random.bin iso.random "mkiso contents"
+    xorriso -indev t.iso -report_el_torito plain 2>/dev/null | grep -q 'boot-info-table' && ok || bad "mkiso El Torito"
+fi
+
+# ---- mbcheck: a Multiboot header with a good checksum, one PT_LOAD ----
+printf '\177ELF' > notkernel && if "$tools/mbcheck" -q notkernel 2>/dev/null; then bad "mbcheck accepts junk"; else ok; fi
+
 echo "tools: $pass checks passed, $fail failed"
 [ $fail = 0 ]

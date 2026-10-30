@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Wave: subgrid and perspective</title>
+<style>
+body { font:16px sans-serif; margin:24px; color:#182735; background:#eef3f7 }
+h1 { font-size:28px }
+.grid { display:grid; grid-template-columns:100px 1fr 80px; gap:12px; max-width:620px }
+.row { display:grid; grid-template-columns:subgrid; grid-column:1 / -1; background:white }
+.row > div { padding:12px }
+.header { background:#184c70; color:white; font-weight:bold }
+.scene { margin-top:24px; width:300px; height:180px; perspective:400px; perspective-origin:50% 50%; background:#dae4ec }
+.card { width:200px; height:120px; background:#184c70; color:white; padding:12px;
+        transform:translateZ(30px) rotateY(35deg); transition:transform .4s }
+.scene:hover .card { transform:translateZ(70px) rotateY(-25deg) }
+.fallback { color:#186b32 }
+@supports (contain:layout) { .fallback { color:red } }
+</style>
+<h1>Shared tracks and perspective</h1>
+<p>Every row below shares the same three columns, even though each is its own grid.</p>
+<div class="grid">
+ <div class="row header"><div>Item</div><div>Description</div><div>Count</div></div>
+ <div class="row"><div>Subgrid</div><div>Columns follow the parent grid</div><div>3</div></div>
+ <div class="row"><div>Nested row</div><div>Longer content stays aligned with the header</div><div>12</div></div>
+</div>
+<div class="scene"><div class="card">Perspective card<br>Move the pointer over this panel.</div></div>
+<p class="fallback">This text stays green when unsupported containment selects the fallback.</p>
+<p>These are flattened planes. Shared preserve-3d scenes and intersecting planes are not implemented.</p>

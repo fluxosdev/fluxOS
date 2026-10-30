@@ -816,6 +816,7 @@ static int sys_open(uint32_t upath, uint32_t flags, uint32_t mode, uint32_t d, u
             if (r == 0 && vn) {
                 uint32_t m = mode ? (mode & 07777) : 0666;
                 vn->mode = (m & ~(current->leader->umask & 0777)) | (m & 07000);
+                vfs_setattr(vn);        /* kept where the filesystem keeps modes (ext2) */
             }
         }
     } else if (r == 0 && (flags & O_CREAT) && (flags & O_EXCL)) {
@@ -1067,20 +1068,98 @@ static int sys_llseek(uint32_t fd, uint32_t hi, uint32_t lo, uint32_t uresult, u
     return copy_to_user((void *)uresult, &pos, sizeof(pos));
 }
 
-static int sys_stat(uint32_t upath, uint32_t ust, uint32_t c, uint32_t d, uint32_t e)
+static int stat_path(uint32_t upath, uint32_t ust, int follow)
 {
-    (void)c; (void)d; (void)e;
     COPY_PATH(path, upath);
     if (user_check_w((void *)ust, sizeof(struct stat)) < 0)
         return -EFAULT;
     struct vnode *vn;
-    int r = vfs_resolve(path, current->leader->cwd, &vn);
+    int r = vfs_lookup(path, current->leader->cwd, follow, &vn);
     if (r < 0)
         return r;
     struct stat st;
     memset(&st, 0, sizeof(st));
     vfs_stat(vn, &st);
     return copy_to_user((void *)ust, &st, sizeof(st));
+}
+
+static int sys_stat(uint32_t upath, uint32_t ust, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    return stat_path(upath, ust, 1);
+}
+
+static int sys_lstat(uint32_t upath, uint32_t ust, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    return stat_path(upath, ust, 0);
+}
+
+static int sys_readlink(uint32_t upath, uint32_t ubuf, uint32_t size, uint32_t d, uint32_t e)
+{
+    (void)d; (void)e;
+    COPY_PATH(path, upath);
+    if (!size)
+        return -EINVAL;
+    size = MIN(size, (uint32_t)PATH_MAX);
+    if (user_check_w((void *)ubuf, size) < 0)
+        return -EFAULT;
+    char *tmp = kmalloc(size);
+    if (!tmp)
+        return -ENOMEM;
+    int r = vfs_readlink(path, current->leader->cwd, tmp, size);
+    if (r > 0 && copy_to_user((void *)ubuf, tmp, (uint32_t)r) < 0)
+        r = -EFAULT;
+    kfree(tmp);
+    return r;
+}
+
+static int sys_symlink(uint32_t utarget, uint32_t upath, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    COPY_PATH(target, utarget);
+    COPY_PATH(path, upath);
+    return vfs_symlink(target, path, current->leader->cwd);
+}
+
+static int sys_link(uint32_t ufrom, uint32_t uto, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    COPY_PATH(from, ufrom);
+    COPY_PATH(to, uto);
+    return vfs_link(from, to, current->leader->cwd);
+}
+
+/* An owner of -1 is kept. One user, so anyone may give a file away. */
+static int set_owner(struct vnode *vn, uint32_t uid, uint32_t gid)
+{
+    if (vn->fs && vn->fs->readonly)
+        return -EROFS;
+    if (uid != UINT32_MAX)
+        vn->uid = uid;
+    if (gid != UINT32_MAX)
+        vn->gid = gid;
+    return vfs_setattr(vn);
+}
+
+static int sys_chown(uint32_t upath, uint32_t uid, uint32_t gid, uint32_t follow, uint32_t e)
+{
+    (void)e;
+    COPY_PATH(path, upath);
+    struct vnode *vn;
+    int r = vfs_lookup(path, current->leader->cwd, follow != 0, &vn);
+    return r < 0 ? r : set_owner(vn, uid, gid);
+}
+
+static int sys_fchown(uint32_t fd, uint32_t uid, uint32_t gid, uint32_t d, uint32_t e)
+{
+    (void)d; (void)e;
+    struct file *f = get_file(fd);
+    if (!f)
+        return -EBADF;
+    if (!f->vn)
+        return -EINVAL;
+    return set_owner(f->vn, uid, gid);
 }
 
 static int sys_fstat(uint32_t fd, uint32_t ust, uint32_t c, uint32_t d, uint32_t e)
@@ -1186,6 +1265,7 @@ static int sys_mkdir(uint32_t upath, uint32_t mode, uint32_t c, uint32_t d, uint
         if (vfs_resolve(path, current->leader->cwd, &vn) == 0 && vn) {
             uint32_t m = mode ? (mode & 07777) : 0777;
             vn->mode = (m & ~(current->leader->umask & 0777)) | (m & 07000);
+            vfs_setattr(vn);            /* kept where the filesystem keeps modes (ext2) */
         }
     }
     return r;
@@ -1224,7 +1304,7 @@ static int sys_chmod(uint32_t upath, uint32_t mode, uint32_t c, uint32_t d, uint
     if (vn->fs && vn->fs->readonly)
         return -EROFS;
     vn->mode = mode & 07777;
-    return 0;
+    return vfs_setattr(vn);
 }
 
 static int sys_fchmod(uint32_t fd, uint32_t mode, uint32_t c, uint32_t d, uint32_t e)
@@ -1239,7 +1319,7 @@ static int sys_fchmod(uint32_t fd, uint32_t mode, uint32_t c, uint32_t d, uint32
     if (vn->fs && vn->fs->readonly)
         return -EROFS;
     vn->mode = mode & 07777;
-    return 0;
+    return vfs_setattr(vn);
 }
 
 static int sys_umask(uint32_t mask, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
@@ -1753,6 +1833,7 @@ static int sys_reboot(uint32_t cmd, uint32_t b, uint32_t c, uint32_t d, uint32_t
     (void)b; (void)c; (void)d; (void)e;
     if (cmd == REBOOT_RESTART || cmd == REBOOT_POWEROFF || cmd == REBOOT_HALT) {
         vfs_lock();
+        vfs_sync_filesystems();                 /* volumes left clean (ext2) */
         blk_sync_all();                         /* nothing cached may be lost */
         vfs_unlock();
     }
@@ -1880,6 +1961,12 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_fcntl] = sys_fcntl,
     [SYS_umask] = sys_umask,
     [SYS_utime] = sys_utime,
+    [SYS_lstat] = sys_lstat,
+    [SYS_readlink] = sys_readlink,
+    [SYS_symlink] = sys_symlink,
+    [SYS_link] = sys_link,
+    [SYS_chown] = sys_chown,
+    [SYS_fchown] = sys_fchown,
     [SYS_times] = sys_times,
     [SYS_fchdir] = sys_fchdir,
     [SYS_fchmod] = sys_fchmod,
@@ -1893,6 +1980,8 @@ static const uint8_t takes_vfs_lock[NSYSCALLS] = {
     [SYS_umount] = 1, [SYS_statfs] = 1, [SYS_getmounts] = 1, [SYS_blkinfo] = 1,
     [SYS_sync] = 1, [SYS_fsync] = 1, [SYS_blkrescan] = 1, [SYS_ftruncate] = 1,
     [SYS_lseek] = 1, [SYS_llseek] = 1, [SYS_utime] = 1, [SYS_fchdir] = 1, [SYS_fchmod] = 1,
+    [SYS_lstat] = 1, [SYS_readlink] = 1, [SYS_symlink] = 1, [SYS_link] = 1, [SYS_chown] = 1,
+    [SYS_fchown] = 1,
 };
 
 void syscall_dispatch(struct trapframe *tf)

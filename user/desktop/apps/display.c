@@ -1905,7 +1905,7 @@ static void dp_wheel(struct window *w, int steps)
     struct dprops *d = w->priv;
     if (d->page != PAGE_BACKGROUND || d->nwalls <= WALL_ROWS || d->open >= 0)
         return;
-    int max = d->nwalls - WALL_ROWS, top = d->wall_top - steps * 3;
+    int max = d->nwalls - WALL_ROWS, top = d->wall_top - steps * mouse_wheel_lines();
     d->wall_top = top < 0 ? 0 : top > max ? max : top;
     dp_paint(d);
 }

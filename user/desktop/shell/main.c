@@ -81,6 +81,7 @@ int main(int argc, char **argv)
         return 1;
     }
     wm_init(setup);
+    mouse_init();
     datetime_init();
     sound_init();
     power_init();

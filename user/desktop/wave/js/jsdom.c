@@ -1895,15 +1895,17 @@ static int computed_get(struct js *J, struct jsobj *o, const char *key, jsval *o
     struct node *n = o->hdata;
     struct jsdom *d = dom(J);
     const struct style *st = n->style;
-    char b[256];
+    char b[512];
     if (!strcmp(key,"transform") || !strcmp(key,"transformOrigin") || !strcmp(key,"transform-origin")) {
         if(!st){*out=js_str(J,!strcmp(key,"transform")?"none":"0px 0px");return 1;}
         int x=0,y=0,w=0,h=0;
         if(d->h.node_box)d->h.node_box(d->h.ctx,n,&x,&y,&w,&h);
         if(!strcmp(key,"transform")) {
             if(!st->xf){*out=js_str(J,"none");return 1;}
-            double m[6];css_transform_matrix(st,w,h,m);
-            snprintf(b,sizeof(b),"matrix(%.9g, %.9g, %.9g, %.9g, %.9g, %.9g)",m[0],m[1],m[2],m[3],m[4],m[5]);
+            double m[16];css_transform_matrix3d(st,w,h,m);
+            int is2d=m[2]==0 && m[3]==0 && m[6]==0 && m[7]==0 && m[8]==0 && m[9]==0 && m[10]==1 && m[11]==0 && m[14]==0 && m[15]==1;
+            if(is2d)snprintf(b,sizeof(b),"matrix(%.9g, %.9g, %.9g, %.9g, %.9g, %.9g)",m[0],m[1],m[4],m[5],m[12],m[13]);
+            else snprintf(b,sizeof(b),"matrix3d(%.9g, %.9g, %.9g, %.9g, %.9g, %.9g, %.9g, %.9g, %.9g, %.9g, %.9g, %.9g, %.9g, %.9g, %.9g, %.9g)",m[0],m[1],m[2],m[3],m[4],m[5],m[6],m[7],m[8],m[9],m[10],m[11],m[12],m[13],m[14],m[15]);
         } else snprintf(b,sizeof(b),"%gpx %gpx",css_transform_length(st->tox,w),css_transform_length(st->toy,h));
         *out=js_str(J,b);return 1;
     }

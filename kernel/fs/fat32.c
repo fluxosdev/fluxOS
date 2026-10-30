@@ -170,6 +170,35 @@ static void unix_to_fat(uint32_t t, uint32_t *date, uint32_t *time)
     *time = (secs / 3600) << 11 | (secs / 60 % 60) << 5 | (secs % 60) / 2;
 }
 
+/*
+ * Modification times. A FAT entry's write time moves in 2-second steps, so
+ * a file edited a second after make built from it could look older than
+ * its target. The creation time has a 10 ms field besides, so fluxOS
+ * writes the modification time there too and reads it back to the second.
+ * Another system writing the file sets only the write time; the creation
+ * fields then count only while they fall within the write time's step.
+ */
+static void set_entry_times(uint8_t *e, uint32_t mtime)
+{
+    uint32_t date, time;
+    unix_to_fat(mtime, &date, &time);
+    wr16(e + 22, time);
+    wr16(e + 24, date);
+    wr16(e + 18, date);                         /* accessed */
+    wr16(e + 14, time);
+    wr16(e + 16, date);
+    e[13] = (mtime & 1) ? 100 : 0;              /* hundredths of a second: the odd one */
+}
+
+static uint32_t entry_mtime(const uint8_t *e)
+{
+    uint32_t w = fat_to_unix(rd16(e + 24), rd16(e + 22));
+    uint32_t c = fat_to_unix(rd16(e + 16), rd16(e + 14));
+    if (c && e[13] < 200)
+        c += e[13] / 100;
+    return c >= w && c - w < 2 ? c : w;
+}
+
 /* ---- the allocation table ---- */
 
 static int is_end(struct fat_fs *f, uint32_t c)
@@ -575,7 +604,7 @@ static struct vnode *make_vnode(struct fat_fs *f, struct vnode *dir, const char 
     vn->fs_data = n;
     vn->size = isdir ? 0 : rd32(e + 28);
     vn->mode = (e[11] & ATTR_RO) ? 0555 : 0755;
-    vn->mtime = fat_to_unix(rd16(e + 24), rd16(e + 22));
+    vn->mtime = entry_mtime(e);
     return vn;
 }
 
@@ -754,18 +783,12 @@ static void make_alias(const char *name, const uint8_t *dir, uint32_t len, uint8
 static void fill_short(uint8_t *e, const uint8_t *name11, uint8_t case_flags, uint8_t attr,
                        uint32_t first, uint32_t size, uint32_t mtime)
 {
-    uint32_t date, time;
-    unix_to_fat(mtime, &date, &time);
     memset(e, 0, 32);
     memcpy(e, name11, 11);
     e[11] = attr;
     e[12] = case_flags;
-    wr16(e + 14, time);
-    wr16(e + 16, date);
-    wr16(e + 18, date);
+    set_entry_times(e, mtime);
     wr16(e + 20, first >> 16);
-    wr16(e + 22, time);
-    wr16(e + 24, date);
     wr16(e + 26, first & 0xFFFF);
     wr32(e + 28, size);
 }
@@ -882,15 +905,11 @@ static int update_entry(struct fat_fs *f, struct vnode *vn)
     uint8_t e[32];
     if (slot_read(f, n->dir_first, n->ent_off, e) < 0)
         return -EIO;
-    uint32_t date, time;
-    unix_to_fat(vn->mtime, &date, &time);
     e[11] = n->attr;
     wr16(e + 20, n->first >> 16);
     wr16(e + 26, n->first & 0xFFFF);
     wr32(e + 28, vn->type == VN_DIR ? 0 : vn->size);
-    wr16(e + 22, time);
-    wr16(e + 24, date);
-    wr16(e + 18, date);
+    set_entry_times(e, vn->mtime);
     return slot_write(f, n->dir_first, n->ent_off, e);
 }
 

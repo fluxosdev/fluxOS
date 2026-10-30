@@ -204,7 +204,7 @@ static int has_install_files(const char *dir)
     snprintf(path, sizeof(path), "%s/boot/system.tar", dir);
     if (stat(path, &st) < 0)
         return 0;
-    snprintf(path, sizeof(path), "%s/boot/install/core.img", dir);
+    snprintf(path, sizeof(path), "%s/firmware/grub/core.img", dir);
     return stat(path, &st) == 0;
 }
 

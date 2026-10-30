@@ -107,6 +107,7 @@ enum icon_id {
     ICON_ARCHIVE,
     ICON_PAINT,
     ICON_WIFI,
+    ICON_MOUSE,
     /* the battery in the tray: its charge, on battery and charging */
     ICON_BATTERY_CAUTION,
     ICON_BATTERY_LOW,
@@ -309,6 +310,15 @@ void setup_open(void);                  /* fluxOS Setup, full screen (wm_init's 
 void setup_draw_backdrop(struct surface *s, struct rect clip);  /* behind Setup's window */
 void setup_tick(void);                  /* once a second */
 void display_open(void);                /* Display Properties */
+void mouse_init(void);                  /* the saved mouse settings */
+void mouse_open(void);                  /* Mouse Properties */
+int mouse_left_handed(void);
+void mouse_scale_motion(int *dx, int *dy);
+void mouse_move_pointer(const struct input_event *ev, int width, int height, int *x, int *y);
+unsigned int mouse_dblclick_ms(void);
+int mouse_wheel_lines(void);
+int mouse_wheel_reverse(void);
+#define DBLCLICK_MS (mouse_dblclick_ms())
 void datetime_open(void);               /* Date and Time Properties: zone, NTP sync */
 void datetime_tick(void);               /* once a second */
 void datetime_init(void);               /* the saved time zone */

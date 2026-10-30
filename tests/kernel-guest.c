@@ -1,4 +1,5 @@
 /* Runs as init only in the disposable QEMU regression environment. */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <flux.h>
@@ -12,6 +13,7 @@
 #include <sys/mount.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/time.h>
 #include <sys/times.h>
 #include <sys/wait.h>
@@ -433,6 +435,203 @@ static void phase0_regressions(void)
     puts("guest: COW fork, sigaction/SSE/SA_RESTART, sigsetjmp, mmap/mprotect, fcntl/umask/utime and large execve passed");
 }
 
+/* mkiso, run on fluxOS, makes an image the kernel's ISO 9660 reader reads
+ * back: Rock Ridge names (long, mixed case, two that are the same in 8.3),
+ * modes, times, an empty file, a nested directory and El Torito's boot
+ * catalog and information table. The image goes onto the scratch disk. */
+static void put_file(const char *path, const char *data, size_t n, mode_t mode)
+{
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, mode);
+    CHECK(fd >= 0 && write(fd, data, n) == (ssize_t)n && close(fd) == 0);
+}
+
+static void native_mkiso(void)
+{
+    static char big[100000];
+    for (size_t i = 0; i < sizeof(big); i++)
+        big[i] = (char)(i * 7 + i / 300);
+    CHECK(mkdir("/tmp/isotree", 0755) == 0);
+    CHECK(mkdir("/tmp/isotree/Sub Directory", 0755) == 0);
+    CHECK(mkdir("/tmp/isotree/Sub Directory/deeper", 0755) == 0);
+    put_file("/tmp/isotree/Hello.txt", "hello, iso\n", 11, 0644);
+    put_file("/tmp/isotree/a long name with spaces.tar.gz", big, sizeof(big), 0644);
+    put_file("/tmp/isotree/collision-one.txt", "one", 3, 0644);
+    put_file("/tmp/isotree/collision-two.txt", "two", 3, 0644);
+    put_file("/tmp/isotree/run-me", "#!/bin/sh\n", 10, 0755);
+    put_file("/tmp/isotree/empty", "", 0, 0644);
+    put_file("/tmp/isotree/Sub Directory/deeper/Leaf.File", "leaf", 4, 0644);
+    static char boot[4096];
+    for (size_t i = 0; i < sizeof(boot); i++)
+        boot[i] = (char)i;
+    put_file("/tmp/isotree/boot.img", boot, sizeof(boot), 0644);
+    struct utimbuf ut = { .actime = 1700004321, .modtime = 1700004321 };
+    CHECK(utime("/tmp/isotree/Hello.txt", &ut) == 0);
+
+    int child = fork(); CHECK(child >= 0);
+    if (!child) {
+        char *args[] = { "mkiso", "-o", "/tmp/test.iso", "-V", "regress", "-b", "boot.img", "/tmp/isotree", NULL };
+        execv("/bin/mkiso", args); _exit(127);
+    }
+    int status;
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    int in = open("/tmp/test.iso", O_RDONLY), out = open("/dev/hda", O_WRONLY);
+    CHECK(in >= 0 && out >= 0);
+    static char chunk[65536];
+    int n;
+    while ((n = (int)read(in, chunk, sizeof(chunk))) > 0)
+        CHECK(write(out, chunk, (size_t)n) == n);
+    CHECK(n == 0 && close(in) == 0 && close(out) == 0);
+    unlink("/tmp/test.iso");
+
+    CHECK(mount("/dev/hda", "/mnt/regress", "iso9660") == 0);
+    struct stat st;
+    char buf[64];
+    int fd = open("/mnt/regress/Hello.txt", O_RDONLY); CHECK(fd >= 0);
+    CHECK(read(fd, buf, sizeof(buf)) == 11 && !memcmp(buf, "hello, iso\n", 11) && close(fd) == 0);
+    CHECK(stat("/mnt/regress/Hello.txt", &st) == 0 && st.st_mtime == 1700004321);
+    CHECK(stat("/mnt/regress/a long name with spaces.tar.gz", &st) == 0 && st.st_size == sizeof(big));
+    static char back[sizeof(big)];
+    fd = open("/mnt/regress/a long name with spaces.tar.gz", O_RDONLY); CHECK(fd >= 0);
+    size_t got = 0;
+    while (got < sizeof(back) && (n = (int)read(fd, back + got, sizeof(back) - got)) > 0)
+        got += (size_t)n;
+    CHECK(got == sizeof(big) && !memcmp(back, big, sizeof(big)) && close(fd) == 0);
+    fd = open("/mnt/regress/collision-one.txt", O_RDONLY); CHECK(fd >= 0);
+    CHECK(read(fd, buf, sizeof(buf)) == 3 && !memcmp(buf, "one", 3) && close(fd) == 0);
+    fd = open("/mnt/regress/collision-two.txt", O_RDONLY); CHECK(fd >= 0);
+    CHECK(read(fd, buf, sizeof(buf)) == 3 && !memcmp(buf, "two", 3) && close(fd) == 0);
+    CHECK(stat("/mnt/regress/run-me", &st) == 0 && (st.st_mode & 0777) == 0755);
+    CHECK(stat("/mnt/regress/empty", &st) == 0 && st.st_size == 0 && S_ISREG(st.st_mode));
+    CHECK(stat("/mnt/regress/Sub Directory/deeper", &st) == 0 && S_ISDIR(st.st_mode));
+    fd = open("/mnt/regress/Sub Directory/deeper/Leaf.File", O_RDONLY); CHECK(fd >= 0);
+    CHECK(read(fd, buf, sizeof(buf)) == 4 && !memcmp(buf, "leaf", 4) && close(fd) == 0);
+    CHECK(stat("/mnt/regress/boot.catalog", &st) == 0 && st.st_size == 2048);
+    /* the boot information table: the primary volume descriptor's block (16) */
+    fd = open("/mnt/regress/boot.img", O_RDONLY); CHECK(fd >= 0);
+    /* and the image's length (4096) */
+    CHECK(read(fd, buf, 24) == 24 && buf[8] == 16 && buf[9] == 0 && buf[16] == 0 && buf[17] == 0x10 &&
+          close(fd) == 0);
+    CHECK(umount("/mnt/regress") == 0);
+    puts("guest: mkiso on fluxOS, read back by the ISO 9660 driver (Rock Ridge names, modes, times, El Torito) passed");
+}
+
+static int run_tool(char *const argv[])
+{
+    int child = fork();
+    if (!child) {
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    int status;
+    CHECK(child > 0 && waitpid(child, &status, 0) == child);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* Symbolic links on ramfs, then an ext2 volume made by the native
+ * mkfs.ext2 on the scratch disk: files through indirect blocks, symbolic
+ * and hard links, owners, modes and times that persist across a remount,
+ * fsck.ext2 content with it. The host's e2fsck checks the disk after. */
+static void native_ext2(void)
+{
+    struct stat st;
+    char buf[256];
+    CHECK(symlink("/tmp/isotree", "/tmp/tree-link") == 0);
+    CHECK(lstat("/tmp/tree-link", &st) == 0 && S_ISLNK(st.st_mode) && st.st_size == 12);
+    CHECK(stat("/tmp/tree-link", &st) == 0 && S_ISDIR(st.st_mode));
+    CHECK(readlink("/tmp/tree-link", buf, sizeof(buf)) == 12 && !memcmp(buf, "/tmp/isotree", 12));
+    int fd = open("/tmp/tree-link/Hello.txt", O_RDONLY); CHECK(fd >= 0);
+    CHECK(read(fd, buf, 11) == 11 && !memcmp(buf, "hello, iso\n", 11) && close(fd) == 0);
+    CHECK(symlink("loop-b", "/tmp/loop-a") == 0 && symlink("loop-a", "/tmp/loop-b") == 0);
+    CHECK(open("/tmp/loop-a", O_RDONLY) == -1 && errno == ELOOP);
+    CHECK(readlink("/tmp/isotree", buf, sizeof(buf)) == -1 && errno == EINVAL);
+    CHECK(link("/tmp/isotree/Hello.txt", "/tmp/hard") == -1 && errno == EPERM);
+    CHECK(unlink("/tmp/tree-link") == 0 && stat("/tmp/isotree/Hello.txt", &st) == 0);
+
+    char *mkfs[] = { "/bin/mkfs.ext2", "-q", "-L", "regress", "/dev/hda", NULL };
+    CHECK(run_tool(mkfs) == 0);
+    CHECK(mount("/dev/hda", "/mnt/regress", "ext2") == 0);
+    struct statfs sfs;
+    CHECK(statfs("/mnt/regress", &sfs) == 0 && !strcmp(sfs.f_fstype, "ext2"));
+    CHECK(stat("/mnt/regress/lost+found", &st) == 0 && S_ISDIR(st.st_mode));
+    static char big[3 << 20];
+    for (size_t i = 0; i < sizeof(big); i++)
+        big[i] = (char)(i * 13 + i / 4093);
+    fd = open("/mnt/regress/big.bin", O_CREAT | O_WRONLY, 0644); CHECK(fd >= 0);
+    CHECK(write(fd, big, sizeof(big)) == (ssize_t)sizeof(big) && close(fd) == 0);
+    CHECK(mkdir("/mnt/regress/src", 0755) == 0 && mkdir("/mnt/regress/src/lib", 0755) == 0);
+    put_file("/mnt/regress/src/lib/a.c", "int a;\n", 7, 0644);
+    put_file("/mnt/regress/src/run.sh", "#!/bin/sh\n", 10, 0755);
+    CHECK(symlink("lib/a.c", "/mnt/regress/src/alias.c") == 0);
+    CHECK(link("/mnt/regress/src/lib/a.c", "/mnt/regress/src/hard.c") == 0);
+    CHECK(stat("/mnt/regress/src/hard.c", &st) == 0 && st.st_nlink == 2);
+    CHECK(chown("/mnt/regress/src/run.sh", 1000, 100) == 0);
+    CHECK(chmod("/mnt/regress/src/lib", 0700) == 0);
+    struct utimbuf ut = { .actime = 1700007777, .modtime = 1700007777 };
+    CHECK(utime("/mnt/regress/src/run.sh", &ut) == 0);
+    CHECK(rename("/mnt/regress/src/lib", "/mnt/regress/lib2") == 0);
+    CHECK(symlink("../lib2", "/mnt/regress/src/lib") == 0);       /* the old path, through a link */
+    DIR *d = opendir("/mnt/regress/src");
+    CHECK(d);
+    int saw_link = 0;
+    struct dirent *de;
+    while ((de = readdir(d)))
+        if (!strcmp(de->d_name, "alias.c"))
+            saw_link = de->d_type == DT_LNK;
+    closedir(d);
+    CHECK(saw_link);
+    CHECK(umount("/mnt/regress") == 0);
+    char *fsck[] = { "/bin/fsck.ext2", "/dev/hda", NULL };
+    CHECK(run_tool(fsck) == 0);
+
+    CHECK(mount("/dev/hda", "/mnt/regress", "auto") == 0);
+    static char back[3 << 20];
+    fd = open("/mnt/regress/big.bin", O_RDONLY); CHECK(fd >= 0);
+    size_t got = 0;
+    ssize_t n;
+    while (got < sizeof(back) && (n = read(fd, back + got, sizeof(back) - got)) > 0)
+        got += (size_t)n;
+    CHECK(got == sizeof(big) && !memcmp(back, big, sizeof(big)) && close(fd) == 0);
+    fd = open("/mnt/regress/src/lib/a.c", O_RDONLY); CHECK(fd >= 0);    /* through src/lib -> ../lib2 */
+    CHECK(read(fd, buf, sizeof(buf)) == 7 && !memcmp(buf, "int a;\n", 7) && close(fd) == 0);
+    CHECK(readlink("/mnt/regress/src/alias.c", buf, sizeof(buf)) == 7 && !memcmp(buf, "lib/a.c", 7));
+    CHECK(stat("/mnt/regress/src/hard.c", &st) == 0 && st.st_nlink == 2);
+    CHECK(stat("/mnt/regress/src/run.sh", &st) == 0 && st.st_uid == 1000 && st.st_gid == 100 &&
+          (st.st_mode & 0777) == 0755 && st.st_mtime == 1700007777);
+    CHECK(stat("/mnt/regress/lib2", &st) == 0 && (st.st_mode & 0777) == 0700);
+    CHECK(lstat("/mnt/regress/src/lib", &st) == 0 && S_ISLNK(st.st_mode));
+    /* cp -a keeps links and hard links; ls -l shows what a link points at */
+    CHECK(link("/mnt/regress/src/run.sh", "/mnt/regress/src/run2.sh") == 0);
+    char *cpa[] = { "/bin/cp", "-a", "/mnt/regress/src", "/mnt/regress/copy", NULL };
+    CHECK(run_tool(cpa) == 0);
+    CHECK(readlink("/mnt/regress/copy/alias.c", buf, sizeof(buf)) == 7 && !memcmp(buf, "lib/a.c", 7));
+    CHECK(lstat("/mnt/regress/copy/lib", &st) == 0 && S_ISLNK(st.st_mode));
+    struct stat st2;
+    CHECK(stat("/mnt/regress/copy/run.sh", &st) == 0 && stat("/mnt/regress/copy/run2.sh", &st2) == 0 &&
+          st.st_ino == st2.st_ino && st.st_nlink == 2 && st.st_mtime == 1700007777 && (st.st_mode & 0777) == 0755);
+    int out = open("/tmp/ls.out", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    CHECK(out >= 0);
+    int child = fork();
+    if (!child) {
+        dup2(out, 1);
+        char *ls[] = { "/bin/ls", "-l", "/mnt/regress/copy", NULL };
+        execv(ls[0], ls);
+        _exit(127);
+    }
+    int status;
+    CHECK(child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(out);
+    static char listing[4096];
+    fd = open("/tmp/ls.out", O_RDONLY);
+    n = read(fd, listing, sizeof(listing) - 1);
+    CHECK(fd >= 0 && n > 0 && close(fd) == 0);
+    listing[n] = 0;
+    CHECK(strstr(listing, "alias.c -> lib/a.c") && strstr(listing, "lrwxrwxrwx"));
+    CHECK(unlink("/mnt/regress/src/hard.c") == 0);
+    CHECK(stat("/mnt/regress/lib2/a.c", &st) == 0 && st.st_nlink == 1);
+    CHECK(umount("/mnt/regress") == 0);
+    puts("guest: ext2 by the native mkfs.ext2: files, symbolic and hard links, owners, modes, times, cp -a, ls -l and fsck.ext2 passed");
+}
+
 int main(void)
 {
     scheduler_stress();
@@ -499,6 +698,8 @@ int main(void)
     CHECK(read(dst, buf, sizeof(buf)) == 3 && !memcmp(buf, "sou", 3));
     CHECK(close(dst) == 0 && umount("/mnt/regress") == 0);
     puts("guest: unlink/rename open-file lifetime, truncate and FAT remount persistence passed");
+    native_mkiso();
+    native_ext2();
     puts("KERNEL REGRESSIONS PASSED");
     stop();
 }

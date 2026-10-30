@@ -363,9 +363,33 @@ static void mirrored_truncate_errors(void)
     }
 }
 
+/* Modification times to the second through the creation time's 10 ms field,
+ * and the write time alone when another system changed the file since. */
+static void one_second_times(void)
+{
+    uint8_t e[32] = {0};
+    for (uint32_t t = 1700000000; t < 1700000006; t++) {
+        set_entry_times(e, t);
+        CHECK(entry_mtime(e) == t);
+    }
+    set_entry_times(e, 1700000001);
+    uint32_t date, time;
+    unix_to_fat(1700000100, &date, &time);      /* written later elsewhere: write time only */
+    wr16(e + 22, time); wr16(e + 24, date);
+    CHECK(entry_mtime(e) == 1700000100);
+    setup();
+    struct vnode *vn = create_file("ODD.TXT", "x");
+    vn->mtime = 1700000123;
+    CHECK(fat_setattr(vn) == 0);
+    struct fat_node *n = vn->fs_data;
+    CHECK(slot_read(mounted_fs->priv, n->dir_first, n->ent_off, e) == 0 && entry_mtime(e) == 1700000123);
+    finish();
+}
+
 int main(void)
 {
     unlink_lifetime(); rename_lifetime(); metadata_errors(); unmount_errors(); unlinked_directory();
     truncate_errors(); rename_errors(); directory_rename_errors(); mirrored_truncate_errors();
-    puts("kernel storage: lifetime, mount references, atomic rename/truncate failures and flush retries passed");
+    one_second_times();
+    puts("kernel storage: lifetime, mount references, atomic rename/truncate failures, flush retries and 1 s FAT times passed");
 }

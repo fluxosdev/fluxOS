@@ -14,7 +14,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "-t") && i + 1 < argc)
             type = argv[++i];
         else {
-            fprintf(stderr, "usage: mount [-t fat32|iso9660|auto] device directory\n");
+            fprintf(stderr, "usage: mount [-t fat32|ext2|iso9660|auto] device directory\n");
             return 1;
         }
     }
@@ -26,7 +26,7 @@ int main(int argc, char **argv)
         return 0;
     }
     if (argc - i != 2) {
-        fprintf(stderr, "usage: mount [-t fat32|iso9660|auto] device directory\n");
+        fprintf(stderr, "usage: mount [-t fat32|ext2|iso9660|auto] device directory\n");
         return 1;
     }
     if (mount(argv[i], argv[i + 1], type) < 0) {

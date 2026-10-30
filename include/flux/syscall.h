@@ -106,8 +106,14 @@ extern "C" {
 #define SYS_setsid      94
 #define SYS_getsid      95  /* pid */
 #define SYS_wifi        96  /* WIFI_* op, arg */
+#define SYS_lstat       97  /* path, struct stat *: a symbolic link itself */
+#define SYS_readlink    98  /* path, buf, size: the target's length (not NUL-terminated) */
+#define SYS_symlink     99  /* target, path */
+#define SYS_link        100 /* existing path, new path: a hard link (ext2) */
+#define SYS_chown       101 /* path, uid (-1: kept), gid (-1: kept), follow the last link (0: lchown) */
+#define SYS_fchown      102 /* fd, uid, gid */
 
-#define NSYSCALLS       97
+#define NSYSCALLS       103
 
 #ifdef __cplusplus
 }

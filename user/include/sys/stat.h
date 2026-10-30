@@ -8,8 +8,6 @@ extern "C" {
 #include <sys/types.h>
 #include <flux/abi.h>
 
-#define S_IFLNK  0xA000
-#define S_ISLNK(m) (((m) & S_IFMT) == S_IFLNK)
 
 #define S_ISUID 04000
 #define S_ISGID 02000

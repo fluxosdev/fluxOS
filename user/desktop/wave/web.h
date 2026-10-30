@@ -268,6 +268,7 @@ struct track {
 };
 struct gridspec {
     int n;
+    uint8_t subgrid;            /* tracks borrowed from the parent grid area */
     uint8_t auto_repeat;        /* 1 auto-fill, 2 auto-fit: tracks [rep, rep + nrep) repeat */
     int rep, nrep;
     struct track t[MAX_TRACKS];
@@ -316,11 +317,12 @@ struct css_gradient {
 /* ---- transforms, transitions and animations ---- */
 
 /* Functions compose in written order; the rightmost acts on a point first. */
-enum { TF_TRANSLATE, TF_SCALE, TF_ROTATE, TF_SKEW, TF_MATRIX };
+enum { TF_TRANSLATE, TF_SCALE, TF_ROTATE, TF_SKEW, TF_MATRIX, TF_MATRIX3D, TF_PERSPECTIVE };
 struct tfop {
     uint8_t kind;
     uint8_t flip;               /* a 3D rotation that shows the back of the box */
-    struct len x, y;            /* TF_TRANSLATE */
+    struct len x, y, z;         /* TF_TRANSLATE, including depth */
+    float m[16];               /* column-major TF_MATRIX3D */
     float a, b, c, d, e, f;     /* TF_SCALE: a, b; TF_ROTATE: a (radians); TF_SKEW: a, b (radians); TF_MATRIX: a-f */
 };
 #define MAX_TFOPS 11            /* transform's eight, after translate, rotate and scale */
@@ -358,6 +360,7 @@ enum { BL_NORMAL, BL_MULTIPLY, BL_SCREEN, BL_OVERLAY, BL_DARKEN, BL_LIGHTEN, BL_
        BL_SOFT, BL_DIFFERENCE, BL_EXCLUSION };
 double css_transform_length(struct len l, int base);
 void css_transform_matrix(const struct style *st, int w, int h, double out[6]);
+void css_transform_matrix3d(const struct style *st, int w, int h, double out[16]);
 
 /* A timing function: cubic-bezier(x1, y1, x2, y2) (linear, ease and the rest are special cases) or steps. */
 enum { JUMP_START, JUMP_END, JUMP_NONE, JUMP_BOTH };
@@ -479,7 +482,8 @@ struct style {
     const struct css_xform *xf; /* transform: none (NULL) or functions; translate, rotate and scale first */
     struct tfop xf_translate, xf_rotate, xf_scale;  /* the individual transform properties */
     uint8_t xf_ind;             /* which of them are set: 1 translate, 2 rotate, 4 scale */
-    struct len tox, toy;        /* transform-origin */
+    struct len tox, toy, toz;   /* transform-origin */
+    struct len perspective, pox, poy; /* perspective for children, and its origin */
     const struct css_motion_raw *raw_motion;
     const struct css_transition *trans;
     const struct css_animation *anims;
@@ -554,6 +558,7 @@ struct style {
     struct len row_gap, col_gap;
     /* multi-column containers (column-count or column-width set), and breaks inside them */
     uint8_t col_count;          /* column-count; 0: auto */
+    uint8_t row_gap_normal;
     uint8_t col_gap_normal;     /* column-gap: normal, which is 1em between columns (0 in flex and grid) */
     uint8_t col_fill_auto;      /* column-fill: auto: each column filled in turn, not balanced */
     uint8_t col_rule_style;     /* column-rule, BS_* */

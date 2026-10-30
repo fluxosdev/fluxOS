@@ -58,6 +58,13 @@ static inline int sc3(int n, int a, int b, int c)
     return r;
 }
 
+static inline int sc4(int n, int a, int b, int c, int d)
+{
+    int r;
+    __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a), "c"(b), "d"(c), "S"(d) : "memory");
+    return r;
+}
+
 static inline int sc5(int n, int a, int b, int c, int d, int e)
 {
     int r;
@@ -200,7 +207,7 @@ int utimes(const char *path, const struct timeval times[2])
 int unlink(const char *path) { return ret(sc1(SYS_unlink, (int)path)); }
 int rename(const char *from, const char *to) { return ret(sc2(SYS_rename, (int)from, (int)to)); }
 int stat(const char *path, struct stat *st) { return ret(sc2(SYS_stat, (int)path, (int)st)); }
-int lstat(const char *path, struct stat *st) { return stat(path, st); }
+int lstat(const char *path, struct stat *st) { return ret(sc2(SYS_lstat, (int)path, (int)st)); }
 int fstat(int fd, struct stat *st) { return ret(sc2(SYS_fstat, fd, (int)st)); }
 
 int getdents(int fd, struct dirent *buf, unsigned int count)
@@ -216,12 +223,30 @@ gid_t getgid(void) { return 0; }
 gid_t getegid(void) { return 0; }
 int setuid(uid_t uid) { (void)uid; return 0; }
 int setgid(gid_t gid) { (void)gid; return 0; }
+/* Owners stay where the filesystem keeps them (ext2); -1 keeps one. */
 int chown(const char *path, uid_t owner, gid_t group)
 {
-    (void)owner;
-    (void)group;
-    struct stat st;
-    return stat(path, &st);
+    return ret(sc4(SYS_chown, (int)path, (int)owner, (int)group, 1));
+}
+
+int lchown(const char *path, uid_t owner, gid_t group)
+{
+    return ret(sc4(SYS_chown, (int)path, (int)owner, (int)group, 0));
+}
+
+int fchown(int fd, uid_t owner, gid_t group)
+{
+    return ret(sc3(SYS_fchown, fd, (int)owner, (int)group));
+}
+
+/* Links are ext2's (and a symbolic one ramfs's too); FAT has neither:
+ * EPERM, as Linux answers for vfat. */
+int link(const char *from, const char *to) { return ret(sc2(SYS_link, (int)from, (int)to)); }
+int symlink(const char *target, const char *path) { return ret(sc2(SYS_symlink, (int)target, (int)path)); }
+
+ssize_t readlink(const char *path, char *buf, size_t size)
+{
+    return ret(sc3(SYS_readlink, (int)path, (int)buf, (int)size));
 }
 int kill(pid_t pid, int sig) { return ret(sc2(SYS_kill, pid, sig)); }
 int raise(int sig) { return kill(getpid(), sig); }

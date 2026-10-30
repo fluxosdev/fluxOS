@@ -6,7 +6,7 @@
 #include <flux/abi.h>
 #include "readcache.h"
 
-enum { VN_FILE = 1, VN_DIR, VN_CHR, VN_BLK };
+enum { VN_FILE = 1, VN_DIR, VN_CHR, VN_BLK, VN_LNK };   /* VN_LNK: a symbolic link */
 
 struct vnode;
 struct fs;
@@ -25,11 +25,13 @@ struct vnode {
     int type;
     uint32_t ino;
     uint32_t mode;              /* permission bits, cosmetic */
-    uint32_t size;
+    uint32_t uid, gid;          /* owner, kept where the filesystem keeps them (ext2) */
+    uint32_t nlink;             /* names the file has (ext2's hard links); 0: the usual 1 or 2 */
+    uint32_t size;              /* a symbolic link's: its target's length */
     uint32_t cap;
     uint32_t mtime;
     uint32_t rdev;              /* device nodes only */
-    uint8_t *data;
+    uint8_t *data;              /* ramfs: a file's contents, a symbolic link's target */
     int refs;                   /* open files + working directories */
     int linked;                 /* still reachable from the tree */
     struct vnode *parent;
@@ -67,7 +69,12 @@ int vfs_locked(void);                   /* by the calling process */
 void vfs_ref(struct vnode *vn);
 void vfs_unref(struct vnode *vn);
 
-int vfs_resolve(const char *path, struct vnode *cwd, struct vnode **out);
+/* Symbolic links are followed (at most VFS_MAX_SYMLINKS of them), the last
+ * component's too unless follow is 0 (lstat, unlink, rename and the like):
+ * a trailing slash follows it anyway. */
+#define VFS_MAX_SYMLINKS 40
+int vfs_lookup(const char *path, struct vnode *cwd, int follow, struct vnode **out);
+int vfs_resolve(const char *path, struct vnode *cwd, struct vnode **out);     /* follow = 1 */
 int vfs_resolve_parent(const char *path, struct vnode *cwd,
                        struct vnode **parent, char *name);
 int vfs_create(struct vnode *dir, const char *name, int type, struct vnode **out);
@@ -76,6 +83,11 @@ int vfs_mkdir_p(const char *path, struct vnode **out);
 int vfs_unlink(const char *path, struct vnode *cwd);
 int vfs_rmdir(const char *path, struct vnode *cwd);
 int vfs_rename(const char *from, const char *to, struct vnode *cwd);
+int vfs_symlink(const char *target, const char *path, struct vnode *cwd);
+int vfs_link(const char *from, const char *to, struct vnode *cwd);
+int vfs_readlink(const char *path, struct vnode *cwd, char *buf, uint32_t size);
+/* Mode, owner and time of vn changed: written to its filesystem, if any. */
+int vfs_setattr(struct vnode *vn);
 struct vnode *vfs_mknod(struct vnode *dir, const char *name, uint32_t rdev,
                         dev_read_t rd, dev_write_t wr);
 struct vnode *vfs_mknod_anon(uint32_t rdev, dev_read_t rd, dev_write_t wr);

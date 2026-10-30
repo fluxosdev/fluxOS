@@ -31,7 +31,6 @@
 #define HDR_H       18
 #define ROW_H       18
 #define STATUS_H    22
-#define DBLCLICK_MS 500
 #define UNZIP       "/bin/unzip"
 #define VIEW_DIR    "/tmp/archive-manager"
 #define PATH_LEN    1024
@@ -1247,7 +1246,7 @@ static void aw_mouse(struct window *win, int x, int y, int buttons, int changed)
 static void aw_wheel(struct window *win, int steps)
 {
     struct arcwin *w = win->priv;
-    w->scroll -= steps * 3;
+    w->scroll -= steps * mouse_wheel_lines();
     clamp_scroll(w);
     paint(w);
 }

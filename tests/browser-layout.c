@@ -986,8 +986,97 @@ static void effects(void)
     puts("browser effects: filter functions, blur, drop-shadow, nested filters, clip-path shapes, blend modes and backdrop-filter passed");
 }
 
+
+static void subgrids(void)
+{
+    struct page p;
+    load(&p,"<style>body{margin:0}.g{display:grid;width:170px;grid-template-columns:[left] 50px [mid] 110px [end];gap:10px}"
+            ".s{display:grid;grid-column:1 / -1;grid-template-columns:subgrid}"
+            ".b{grid-column:mid / end}</style><div class=g><div class=s><div>A</div><div class=b>B</div></div></div>",300,300);
+    CHECK(word(&p,"A") && word(&p,"A")->x==0);
+    CHECK(word(&p,"B") && word(&p,"B")->x==60);
+    unload(&p);
+    /* Two-axis subgrid inherits row sizes and gaps, ignoring its auto tracks. */
+    load(&p,"<style>body{margin:0}.g{display:grid;width:170px;grid-template-columns:50px 110px;grid-template-rows:30px 70px;gap:10px}"
+            ".s{display:grid;grid-column:1 / 3;grid-row:1 / 3;grid-template-columns:subgrid;grid-template-rows:subgrid;grid-auto-rows:999px}"
+            ".b{grid-column:2;grid-row:2}</style><div class=g><div class=s><div>A</div><div class=b>B</div></div></div>",300,300);
+    CHECK(word(&p,"B") && word(&p,"B")->x==60 && word(&p,"B")->y==40);
+    CHECK(p.lo.height==110);
+    unload(&p);
+    /* Grandchildren contribute to each auto row, aligning a sibling in that row. */
+    load(&p,"<style>body{margin:0}.g{display:grid;width:100px;grid-template-columns:50px 50px;row-gap:10px}"
+            ".s{display:grid;grid-row:1 / 3;grid-template-rows:subgrid}.tall{height:60px}"
+            ".b{grid-column:2;grid-row:2}</style><div class=g><div class=s><div class=tall>A</div><div>B</div></div><div class=b>C</div></div>",300,300);
+    CHECK(word(&p,"B") && word(&p,"C") && word(&p,"B")->y==70 && word(&p,"C")->y==70);
+    unload(&p);
+    /* Nested subgrids keep the outer track proportions. */
+    load(&p,"<style>body{margin:0}.g{display:grid;width:170px;grid-template-columns:50px 110px;gap:10px}"
+            ".s{display:grid;grid-column:1 / -1;grid-template-columns:subgrid}</style>"
+            "<div class=g><div class=s><div class=s><div>A</div><div>B</div></div></div></div>",300,300);
+    CHECK(word(&p,"B") && word(&p,"B")->x==60);
+    unload(&p);
+    /* Content in a subgrid sizes the parent's auto columns individually. */
+    load(&p,"<style>body{margin:0}.g{display:grid;width:100px;grid-template-columns:auto auto;justify-content:start}"
+            ".s{display:grid;grid-column:1 / 3;grid-template-columns:subgrid}</style>"
+            "<div class=g><div class=s><div>AAAA</div><div>B</div></div></div>",300,300);
+    CHECK(word(&p,"B") && word(&p,"B")->x==32);
+    unload(&p);
+    /* Explicit subgrid gaps meet halfway across the parent's gutter. */
+    load(&p,"<style>body{margin:0}.g{display:grid;width:170px;grid-template-columns:50px 110px;gap:10px}"
+            ".s{display:grid;grid-column:1 / 3;grid-template-columns:subgrid;gap:20px;padding:0 5px}</style>"
+            "<div class=g><div class=s><div>A</div><div>B</div></div></div>",300,300);
+    CHECK(word(&p,"A") && word(&p,"A")->x==5 && word(&p,"B") && word(&p,"B")->x==65);
+    unload(&p);
+    CHECK(!css_supports("(grid-template-columns: subgrid 20px)"));
+    CHECK(!css_supports("(grid-template-columns: subgrid [broken)"));
+    CHECK(css_supports("(grid-template-columns: subgrid)"));
+    CHECK(!css_supports("(scroll-snap-type: x mandatory)"));
+    CHECK(!css_supports("(contain: layout)"));
+    CHECK(!css_supports("(transform-style: preserve-3d)"));
+    puts("browser subgrid: columns, rows, inherited names and gaps, nested grids and auto-row contributions passed");
+}
+static void perspective_projection(void)
+{
+    struct page p;
+    const char *cases[]={"perspective(100px) translateZ(50px)",
+        "matrix3d(1,0,0,0,0,1,0,0,0,0,1,-0.01,0,0,50,0.5)",
+        "perspective(100px) scaleZ(2) translateZ(25px)"};
+    for(unsigned k=0;k<sizeof(cases)/sizeof(cases[0]);k++) {
+        char html[512];snprintf(html,sizeof(html),"<style>body{margin:0}button{margin:0;border:0;padding:0;display:block;width:20px;height:10px;background:red;transform-origin:0 0;transform:%s}</style><button></button>",cases[k]);
+        load(&p,html,100,100);
+        const struct ditem *d=colored(&p,OPAQUE(0xff0000));
+        expect_rect(visual_item(&p,d),0,0,40,20);
+        struct hotspot hot={.x=d->x,.y=d->y,.w=d->w,.h=d->h,.xf=d->xf};
+        CHECK(layout_hit(&p.lo,&hot,1,35,15,0,0));
+        CHECK(!layout_hit(&p.lo,&hot,1,45,15,0,0));
+        unload(&p);
+    }
+    /* Parent perspective projects children, but does not transform its own background. */
+    load(&p,"<style>body{margin:0}.p{width:100px;height:100px;perspective:100px;perspective-origin:0 0;background:blue}"
+            "button{margin:0;border:0;padding:0;display:block;width:20px;height:10px;background:red;transform:translateZ(50px);transform-origin:0 0}</style>"
+            "<div class=p><button></button></div>",100,100);
+    expect_rect(visual_item(&p,colored(&p,OPAQUE(0xff0000))),0,0,40,20);
+    expect_rect(visual_item(&p,colored(&p,OPAQUE(0x0000ff))),0,0,100,100);
+    const struct ditem *child=colored(&p,OPAQUE(0xff0000));
+    CHECK(layout_box_contains(&p.lo,child->xf,0,0,mkrect(child->x,child->y,child->w,child->h),35,15,0,0));unload(&p);
+    /* The eye plane clips a box behind the viewer. */
+    paint64(BOX "transform-origin:0 0;transform:perspective(100px) translateZ(150px)}</style><div id=b></div>");
+    CHECK(px64(5,5)==0xffffff);
+    paint64(BOX "width:20px;height:10px;transform-origin:0 0;transform:perspective(100px) translateZ(50px)}</style><div id=b></div>");
+    CHECK(px64(35,15)==0xff0000 && px64(45,15)==0xffffff);
+    /* Rotation produces a trapezoid: its right edge recedes from the viewer. */
+    paint64(BOX "transform-origin:0 0;transform:perspective(100px) rotateY(60deg)}</style><div id=b></div>");
+    CHECK(px64(2,30)==0xff0000 && px64(14,38)==0xffffff);
+    CHECK(css_supports("(perspective: 100px)") && !css_supports("(perspective: -1px)") && !css_supports("(perspective: 50%)"));
+    CHECK(!css_supports("(transform: translateZ(10%))"));
+    CHECK(!css_supports("(perspective: auto)") && !css_supports("(perspective: calc(10px - 20px))"));
+    CHECK(!css_supports("(grid-auto-rows: subgrid)"));
+    puts("browser perspective: depth, matrix3d, scaleZ, parent perspective, raster pixels, eye-plane clipping and hit testing passed");
+}
 int main(void)
 {
+    subgrids();
+    perspective_projection();
     effects();
     modern_css();
     multicolumn();

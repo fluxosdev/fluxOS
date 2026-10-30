@@ -75,7 +75,14 @@ struct flow {
     const struct style *fl_line;        /* the block's ::first-line, until its first line is placed */
 };
 
+struct subgrid_input {
+    struct node *node;
+    const int *cols, *rows;
+    int nc, nr, cgap, rgap, final;
+    int *contribute;
+};
 struct lctx {
+    const struct subgrid_input *subgrid;
     struct arena *a;
     struct layout *lo;
     int vw, vh;
@@ -179,7 +186,7 @@ static void add_hotspot(struct lctx *c, struct hotspot **arr, int *n, int *cap, 
 static void transform_register(struct lctx *c, struct node *n, struct mark from, int x, int y, int w, int h)
 {
     struct layout *lo=c->lo;
-    if (!n->style->xf || c->measuring || lo->nxf>=4096) return;
+    if ((!n->style->xf && n->style->perspective.unit==U_AUTO) || c->measuring || lo->nxf>=4096) return;
     struct transform_box *groups=grow(c->a,lo->xf,lo->nxf,&lo->xfcap,sizeof(*groups));
     if(!groups)return;
     lo->xf=groups;
@@ -243,7 +250,7 @@ static void layer_register(struct lctx *c, struct node *n, int from, int lead)
     const struct style *ps = n->parent ? n->parent->style : NULL;
     int item_of_container = ps && (ps->inner == IN_FLEX || ps->inner == IN_GRID);
     int z = st->z_set && (st->position != POS_STATIC || item_of_container);
-    int ctx = z || st->opacity < 255 || st->xf || st->position == POS_FIXED || st->position == POS_STICKY ||
+    int ctx = z || st->opacity < 255 || st->xf || st->perspective.unit!=U_AUTO || st->position == POS_FIXED || st->position == POS_STICKY ||
               st->filter || st->clip_path || st->blend || st->backdrop;
     if (!ctx && st->position == POS_STATIC)
         return;
@@ -3762,6 +3769,40 @@ static int grid_tracks(const struct gridspec *g, int w, int gap, int nitems, str
     return n;
 }
 
+static int grid_place(struct fitem *it,int ni,int nt,const struct style *cst,int colflow);
+
+/* Subgrid descendants participate in the parent's intrinsic track sizing. */
+static void column_contributions(struct lctx *c,struct fitem *it,int ni,int nt,int *mn,int *mx,int depth)
+{
+    if(depth>16)return;
+    for(int i=0;i<ni;i++) {
+        struct fitem *t=&it[i];
+        if(t->col<0 || t->col>=nt)continue;
+        int span=t->cspan;if(span<1)span=1;if(span>nt-t->col)span=nt-t->col;
+        if(!anonymous(t) && t->st->inner==IN_GRID && t->st->grid_cols && t->st->grid_cols->subgrid) {
+            struct fitem *kids;int nk=container_items(t->n,&kids);
+            struct style placement=*t->st;
+            struct gridspec cols={.n=span,.subgrid=1};placement.grid_cols=&cols;
+            grid_place(kids,nk,span,&placement,0);
+            for(int k=0;k<nk;k++)item_edges(&kids[k],0);
+            int cmn[MAX_TRACKS]={0},cmx[MAX_TRACKS]={0};
+            column_contributions(c,kids,nk,span,cmn,cmx,depth+1);
+            int left=len_px(t->st->padding[3],0)+t->st->border_w[3];
+            int right=len_px(t->st->padding[1],0)+t->st->border_w[1];
+            cmn[0]+=left;cmx[0]+=left;cmn[span-1]+=right;cmx[span-1]+=right;
+            for(int k=0;k<span;k++) {
+                if(cmn[k]>mn[t->col+k])mn[t->col+k]=cmn[k];
+                if(cmx[k]>mx[t->col+k])mx[t->col+k]=cmx[k];
+            }
+            free(kids);
+        } else if(span==1) {
+            int a,b;item_measure(c,t,&a,&b);
+            if(a>mn[t->col])mn[t->col]=a;
+            if(b>mx[t->col])mx[t->col]=b;
+        }
+    }
+}
+
 /* Column widths: fixed tracks, then content-sized ones up to what their
  * items want, then fr tracks share the rest; with no fr tracks, auto
  * ones stretch to fill. */
@@ -3771,16 +3812,7 @@ static void size_columns(struct lctx *c, const struct track *tr, int nt, struct 
     int cmin[MAX_TRACKS], cmax[MAX_TRACKS], limit[MAX_TRACKS];
     memset(cmin, 0, sizeof(cmin));
     memset(cmax, 0, sizeof(cmax));
-    for (int i = 0; i < ni; i++) {
-        if (it[i].cspan != 1)
-            continue;
-        int mn, mx;
-        item_measure(c, &it[i], &mn, &mx);
-        if (mn > cmin[it[i].col])
-            cmin[it[i].col] = mn;
-        if (mx > cmax[it[i].col])
-            cmax[it[i].col] = mx;
-    }
+    column_contributions(c,it,ni,nt,cmin,cmax,0);
     int spare = avail, sumfr = 0, nauto = 0;
     for (int k = 0; k < nt; k++) {
         const struct track *t = &tr[k];
@@ -3885,6 +3917,11 @@ static int grid_place(struct fitem *it, int ni, int nt, const struct style *cst,
             int r_span = anon ? 0 : colflow ? st->gc_span : st->gr_span;
             int col = -1, cs = c_span > 0 ? c_span : 1;
             int row = r_start > 0 ? r_start - 1 : -1;
+            const struct gridspec *bounded=colflow?cst->grid_cols:cst->grid_rows;
+            if(bounded && bounded->subgrid) {
+                if(r_start<0)row=bounded->n+1+r_start;
+                if(r_end<0)r_end=bounded->n+2+r_end;
+            }
             int rs = r_span > 0 ? r_span : 1;
             if (!anon && st->grid_area && cst->grid_areas) {      /* grid-area: name */
                 const struct gridareas *ga = cst->grid_areas;
@@ -3976,6 +4013,31 @@ static int grid_place(struct fitem *it, int ni, int nt, const struct style *cst,
     return nrows;
 }
 
+static int grid_item_layout(struct lctx *c,struct fitem *t,int bw,int cw,
+                            const int *cols,const int *rows,int cgap,int rgap,int final,int *contribute)
+{
+    const struct subgrid_input *saved=c->subgrid;
+    struct subgrid_input input={t->n,cols+t->col,rows+t->row,t->cspan,t->rspan,cgap,rgap,final,contribute+t->row};
+    c->subgrid=&input;
+    int h=item_layout(c,t,bw,cw);
+    c->subgrid=saved;
+    return h;
+}
+
+/* Subgrid measurements must not leave an extra copy of the child's display list. */
+static int grid_item_probe(struct lctx *c,struct fitem *t,int bw,int cw,
+                           const int *cols,const int *rows,int cgap,int rgap,int *contribute)
+{
+    struct arena a={0};struct layout lo={0};struct lctx probe=*c;
+    probe.a=&a;probe.lo=&lo;probe.zl=NULL;probe.nzl=probe.zlcap=0;
+    probe.npend=0;probe.nfloats=probe.float_base=0;
+    lo.dyn=arena_alloc(&a,sizeof(struct dynbox)*MAX_DYNBOX);
+    lo.sb=arena_alloc(&a,sizeof(struct sbox)*MAX_SBOX);
+    int h=grid_item_layout(&probe,t,bw,cw,cols,rows,cgap,rgap,0,contribute);
+    arena_free(&a);
+    return h;
+}
+
 static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int defh, int minh)
 {
     const struct style *st = n->style;
@@ -3985,19 +4047,31 @@ static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int 
         free(it);
         return 0;
     }
-    int cgap = len_px(st->col_gap, w), rgap = len_px(st->row_gap, w);
+    const struct subgrid_input *sg=c->subgrid && c->subgrid->node==n?c->subgrid:NULL;
+    int subc=sg && st->grid_cols && st->grid_cols->subgrid;
+    int subr=sg && st->grid_rows && st->grid_rows->subgrid;
+    int cgap = subc && st->col_gap_normal?sg->cgap:len_px(st->col_gap,w);
+    int rgap = subr && st->row_gap_normal?sg->rgap:len_px(st->row_gap,w);
+    struct style placement=*st;
+    struct gridspec pc={0},pr={0};
+    if(subc){pc.n=sg->nc;pc.subgrid=1;placement.grid_cols=&pc;}
+    if(subr){pr.n=sg->nr;pr.subgrid=1;placement.grid_rows=&pr;}
     struct track tr[MAX_TRACKS];
-    int explicit_cols = st->grid_cols && st->grid_cols->n;
-    int nt = explicit_cols ? grid_tracks(st->grid_cols, w, cgap, ni, tr) : 0;
+    int explicit_cols = st->grid_cols && !st->grid_cols->subgrid && st->grid_cols->n;
+    int nt = subc?sg->nc:explicit_cols?grid_tracks(st->grid_cols,w,cgap,ni,tr):0;
+    if(subc)for(int k=0;k<nt;k++)tr[k]=(struct track){TK_PX,TK_PX,sg->cols[k],sg->cols[k]};
     for (int i = 0; i < ni; i++)
         item_edges(&it[i], w);
     const struct gridspec *rspec = st->grid_rows, *aspec = st->grid_auto_rows;
-    int erows = rspec ? rspec->n : 0;
+    int erows = subr?sg->nr:rspec && !rspec->subgrid?rspec->n:0;
+    int probe_rows=0;
+    for(int k=0;k<ni;k++)if(!anonymous(&it[k]) && it[k].st->grid_rows &&
+        it[k].st->grid_rows->subgrid && it[k].st->inner==IN_GRID)probe_rows=1;
     int nrows;
     if (st->grid_col_flow) {
         /* grid-auto-flow: column: the rows are the template's (or one), columns are added as items need them */
         nrows = erows > 0 ? erows : 1;
-        int ncols = grid_place(it, ni, nrows, st, 1);
+        int ncols = grid_place(it, ni, nrows, &placement, 1);
         if (ncols > MAX_TRACKS)
             ncols = MAX_TRACKS;
         if (ncols > nt) {
@@ -4024,13 +4098,28 @@ static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int 
             if (end > need)
                 need = end;
         }
+        if(subc)need=nt;
         if (need > MAX_TRACKS)
             need = MAX_TRACKS;
         if (need > nt) {
             implicit_tracks(tr, nt, need, st->grid_auto_cols);
             nt = need;
         }
-        nrows = grid_place(it, ni, nt, st, 0);
+        nrows = grid_place(it, ni, nt, &placement, 0);
+    }
+    if(subc) {
+        if(nt>sg->nc)nt=sg->nc;
+        for(int k=0;k<ni;k++) {
+            if(it[k].cspan>nt)it[k].cspan=nt;
+            if(it[k].col+it[k].cspan>nt)it[k].col=nt-it[k].cspan;
+        }
+    }
+    if(subr) {
+        nrows=sg->nr;
+        for(int k=0;k<ni;k++) {
+            if(it[k].rspan>nrows)it[k].rspan=nrows;
+            if(it[k].row+it[k].rspan>nrows)it[k].row=nrows-it[k].rspan;
+        }
     }
     if (nrows < erows)
         nrows = erows;
@@ -4040,10 +4129,22 @@ static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int 
     }
     int colw[MAX_TRACKS], colx[MAX_TRACKS + 1];
     size_columns(c, tr, nt, it, ni, w, w - cgap * (nt - 1), colw, !distributes(st->justify));
+    if(subc) {
+        for(int k=0;k<nt;k++) {
+            colw[k]=sg->cols[k];
+            /* A different gap meets halfway at each inherited grid line. */
+            if(k)colw[k]-=(cgap-sg->cgap)/2;
+            if(k+1<nt)colw[k]-=(cgap-sg->cgap)-(cgap-sg->cgap)/2;
+        }
+        int leading=len_px(st->padding[3],w)+st->border_w[3]+len_px(st->margin[3],w);
+        int trailing=len_px(st->padding[1],w)+st->border_w[1]+len_px(st->margin[1],w);
+        colw[0]-=leading;colw[nt-1]-=trailing;
+        for(int k=0;k<nt;k++)if(colw[k]<0)colw[k]=0;
+    }
     int used_w = cgap * (nt - 1), coff = 0, cstep = cgap;
     for (int k = 0; k < nt; k++)
         used_w += colw[k];
-    if (distributes(st->justify) && used_w < w)
+    if (!subc && distributes(st->justify) && used_w < w)
         justify_space(st->justify, w - used_w, nt, cgap, &coff, &cstep);       /* justify-content */
     colx[0] = coff;
     for (int k = 0; k < nt; k++)
@@ -4065,13 +4166,14 @@ static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int 
             bw = stretch_width(t, cw);
         else
             bw = fit_width(c, t, cw);
-        int h = item_layout(c, t, bw, cw);
+        int h=probe_rows?grid_item_probe(c,t,bw,cw,colw,rowh,cstep,rgap,rowh)
+                        :grid_item_layout(c,t,bw,cw,colw,rowh,cstep,rgap,0,rowh);
         if (t->rspan == 1 && t->mt + h + t->mb > rowh[t->row])
             rowh[t->row] = t->mt + h + t->mb;
     }
     for (int i = 0; i < ni; i++) {              /* rows spanned by taller items grow */
         struct fitem *t = &it[i];
-        if (t->rspan == 1)
+        if (t->rspan == 1 || (t->st->inner==IN_GRID && t->st->grid_rows && t->st->grid_rows->subgrid))
             continue;
         int have = rgap * (t->rspan - 1);
         for (int r = t->row; r < t->row + t->rspan; r++)
@@ -4084,8 +4186,8 @@ static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int 
     uint8_t rkind[1100];                        /* 0 auto, 1 fixed, 2 fr */
     int rweight[1100];
     for (int r = 0; r < nrows && r < 1100; r++) {
-        const struct track *t = r < erows ? &rspec->t[r]
-                              : aspec && aspec->n ? &aspec->t[(r - erows) % aspec->n] : NULL;
+        const struct track *t = !subr && r < erows ? &rspec->t[r]
+                              : !subr && aspec && aspec->n ? &aspec->t[(r - erows) % aspec->n] : NULL;
         rkind[r] = 0;
         rweight[r] = 0;
         if (t) {
@@ -4100,13 +4202,30 @@ static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int 
             else if (t->max == TK_FR)
                 rkind[r] = 2, rweight[r] = t->vmax, sumfr += t->vmax;
         }
+        if(subr && sg->final) {
+            rowh[r]=sg->rows[r];
+            if(r)rowh[r]-=(rgap-sg->rgap)/2;
+            if(r+1<nrows)rowh[r]-=(rgap-sg->rgap)-(rgap-sg->rgap)/2;
+            if(r==0)rowh[r]-=len_px(st->padding[0],w)+st->border_w[0]+len_px(st->margin[0],w);
+            if(r+1==nrows)rowh[r]-=len_px(st->padding[2],w)+st->border_w[2]+len_px(st->margin[2],w);
+            if(rowh[r]<0)rowh[r]=0;
+            rkind[r]=1;
+        }
         if (!rkind[r])
             nauto++;
     }
     int total = rgap * (nrows - 1);
     for (int r = 0; r < nrows; r++)
         total += rowh[r];
-    int target = defh >= 0 ? defh : minh;
+    if(subr && !sg->final && sg->contribute) {
+        for(int r=0;r<nrows;r++) {
+            int size=rowh[r];
+            if(r==0)size+=len_px(st->padding[0],w)+st->border_w[0]+len_px(st->margin[0],w);
+            if(r+1==nrows)size+=len_px(st->padding[2],w)+st->border_w[2]+len_px(st->margin[2],w);
+            if(size>sg->contribute[r])sg->contribute[r]=size;
+        }
+    }
+    int target = subr && sg->final?0:defh>=0?defh:minh;
     int roff = 0, rstep = rgap;
     if (target > total && nrows && distributes(st->align_content) && !sumfr) {
         justify_space(st->align_content, target - total, nrows, rgap, &roff, &rstep);     /* align-content */
@@ -4145,6 +4264,10 @@ static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int 
         struct fitem *t = &it[i];
         int cx = x + colx[t->col], cw = colx[t->col + t->cspan] - colx[t->col] - cstep;
         int cy = y + rowy[t->row], ch = rowy[t->row + t->rspan] - rowy[t->row] - rstep;
+        if(probe_rows) {
+            int bw=t->bw;
+            grid_item_layout(c,t,bw,cw,colw,rowh,cstep,rstep,1,rowh);
+        }
         int al = item_align(st, t), js = item_justify(st, t), h = t->bh, top, left;
         int outer = t->mt + h + t->mb, oute = t->ml + t->bw + t->mr;
         if (al == AL_STRETCH && t->kind == FI_BLOCK && t->st->height.unit == U_AUTO &&
@@ -5057,24 +5180,45 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
     shadow_restore(composed);
 }
 
-/* Affine maps act on page coordinates; layout coordinates themselves never move. */
-struct affine { double a,b,c,d,e,f; };
-static struct affine identity(void) { return (struct affine){1,0,0,1,0,0}; }
+/* Projective maps act on page coordinates; layout coordinates never move.
+ * The last row retains perspective for painting, geometry and hit testing alike. */
+struct affine { double a,b,c,d,e,f,g,h,i; };
+static struct affine identity(void) { return (struct affine){1,0,0,1,0,0,0,0,1}; }
 static struct affine multiply(struct affine a,struct affine b)
 {
-    return (struct affine){a.a*b.a+a.c*b.b,a.b*b.a+a.d*b.b,
-        a.a*b.c+a.c*b.d,a.b*b.c+a.d*b.d,
-        a.a*b.e+a.c*b.f+a.e,a.b*b.e+a.d*b.f+a.f};
+    return (struct affine){
+        a.a*b.a+a.c*b.b+a.e*b.g, a.b*b.a+a.d*b.b+a.f*b.g,
+        a.a*b.c+a.c*b.d+a.e*b.h, a.b*b.c+a.d*b.d+a.f*b.h,
+        a.a*b.e+a.c*b.f+a.e*b.i, a.b*b.e+a.d*b.f+a.f*b.i,
+        a.g*b.a+a.h*b.b+a.i*b.g, a.g*b.c+a.h*b.d+a.i*b.h,
+        a.g*b.e+a.h*b.f+a.i*b.i};
 }
 static void map_point(struct affine m,double *x,double *y)
-{ double px=*x,py=*y;*x=m.a*px+m.c*py+m.e;*y=m.b*px+m.d*py+m.f; }
+{
+    double px=*x,py=*y,w=m.g*px+m.h*py+m.i;
+    if(w<=1e-8){*x=*y=NAN;return;}
+    *x=(m.a*px+m.c*py+m.e)/w;*y=(m.b*px+m.d*py+m.f)/w;
+}
 static int inverse_matrix(struct affine m,struct affine *out)
 {
-    double det=m.a*m.d-m.b*m.c;
+    double det=m.a*(m.d*m.i-m.f*m.h)-m.c*(m.b*m.i-m.f*m.g)+m.e*(m.b*m.h-m.d*m.g);
     if(!__builtin_isfinite(det) || fabs(det)<1e-12)return 0;
-    *out=(struct affine){m.d/det,-m.b/det,-m.c/det,m.a/det,
-        (m.c*m.f-m.d*m.e)/det,(m.b*m.e-m.a*m.f)/det};
+    *out=(struct affine){(m.d*m.i-m.f*m.h)/det,(m.f*m.g-m.b*m.i)/det,
+        (m.e*m.h-m.c*m.i)/det,(m.a*m.i-m.e*m.g)/det,
+        (m.c*m.f-m.e*m.d)/det,(m.e*m.b-m.a*m.f)/det,
+        (m.b*m.h-m.d*m.g)/det,(m.c*m.g-m.a*m.h)/det,(m.a*m.d-m.c*m.b)/det};
     return 1;
+}
+static void matrix_product(double a[16],const double b[16])
+{
+    double out[16]={0};
+    for(int col=0;col<4;col++)for(int row=0;row<4;row++)
+        for(int k=0;k<4;k++)out[col*4+row]+=a[k*4+row]*b[col*4+k];
+    memcpy(a,out,sizeof(out));
+}
+static void matrix_translate(double m[16],double x,double y,double z)
+{
+    double t[16]={1,0,0,0,0,1,0,0,0,0,1,0,x,y,z,1};matrix_product(m,t);
 }
 static int node_transform(const struct layout *lo,const struct node *n)
 {
@@ -5085,6 +5229,8 @@ static int node_transform(const struct layout *lo,const struct node *n)
 static struct affine transform_matrix(const struct layout *lo,int index,int sx,int sy)
 {
     struct affine result=identity();
+    /* Each box is a flattened plane. Keep depth within its transform list, then
+     * apply its direct parent's perspective before projecting that plane. */
     for(int depth=0;index>0 && index<=lo->nxf && depth<64;depth++) {
         const struct transform_box *g=&lo->xf[index-1];
         const struct style *st=g->node->style;
@@ -5092,11 +5238,31 @@ static struct affine transform_matrix(const struct layout *lo,int index,int sx,i
         if(g->dyn)layout_dyn_offset(lo,g->dyn,sx,sy,&dx,&dy);
         if(g->sb)layout_sb_view(lo,g->sb,sx,sy,&bx,&by,NULL);
         double ox=g->x+dx+bx+css_transform_length(st->tox,g->w),oy=g->y+dy+by+css_transform_length(st->toy,g->h);
-        struct affine m={1,0,0,1,ox,oy};
-        double value[6];css_transform_matrix(st,g->w,g->h,value);
-        m=multiply(m,(struct affine){value[0],value[1],value[2],value[3],value[4],value[5]});
-        m=multiply(m,(struct affine){1,0,0,1,-ox,-oy});
-        result=multiply(m,result);index=g->parent;
+        double oz=css_transform_length(st->toz,0);
+        double m[16]={1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1},value[16];
+        matrix_translate(m,ox,oy,oz);
+        css_transform_matrix3d(st,g->w,g->h,value);matrix_product(m,value);
+        matrix_translate(m,-ox,-oy,-oz);
+        const struct node *parent=g->node->parent;
+        if(parent && parent->style && parent->style->perspective.unit!=U_AUTO) {
+            const struct transform_box *pg=NULL;
+            for(int k=0;k<lo->nxf;k++)if(lo->xf[k].node==parent){pg=&lo->xf[k];break;}
+            if(pg) {
+                int px=0,py=0,qx=0,qy=0;
+                if(pg->dyn)layout_dyn_offset(lo,pg->dyn,sx,sy,&px,&py);
+                if(pg->sb)layout_sb_view(lo,pg->sb,sx,sy,&qx,&qy,NULL);
+                double x=pg->x+px+qx+css_transform_length(parent->style->pox,pg->w);
+                double y=pg->y+py+qy+css_transform_length(parent->style->poy,pg->h);
+                double p[16]={1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};
+                matrix_translate(p,x,y,0);
+                double distance=css_transform_length(parent->style->perspective,0);
+                double perspective[16]={1,0,0,0,0,1,0,0,0,0,1,-1.0/(distance<1?1:distance),0,0,0,1};
+                matrix_product(p,perspective);matrix_translate(p,-x,-y,0);
+                matrix_product(p,m);memcpy(m,p,sizeof(m));
+            }
+        }
+        result=multiply((struct affine){m[0],m[1],m[4],m[5],m[12],m[13],m[3],m[7],m[15]},result);
+        index=g->parent;
     }
     return result;
 }
@@ -5105,6 +5271,13 @@ static int coordinate(double x)
 static struct rect mapped_rect(struct affine m,struct rect r)
 {
     double x0=BIG,y0=BIG,x1=-BIG,y1=-BIG;
+    int front=0,back=0;
+    for(int k=0;k<4;k++) {
+        double w=m.g*(r.x+(k&1?r.w:0))+m.h*(r.y+(k&2?r.h:0))+m.i;
+        if(w>1e-8)front=1;else back=1;
+    }
+    if(!front)return mkrect(0,0,0,0);
+    if(back)return mkrect(-BIG,-BIG,2*BIG,2*BIG);
     for(int k=0;k<4;k++) {
         double x=r.x+(k&1?r.w:0),y=r.y+(k&2?r.h:0);map_point(m,&x,&y);
         if(x<x0)x0=x;
@@ -6849,7 +7022,7 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
         if(d->xf) {
             struct affine m=transform_matrix(lo,d->xf,sx,sy);
             /* Common integer translations retain the existing direct paint path. */
-            if(!d->sb && fabs(m.a-1)<1e-9 && fabs(m.d-1)<1e-9 && fabs(m.b)<1e-9 && fabs(m.c)<1e-9 &&
+            if(!d->sb && fabs(m.g)<1e-12 && fabs(m.h)<1e-12 && fabs(m.i-1)<1e-12 && fabs(m.a-1)<1e-9 && fabs(m.d-1)<1e-9 && fabs(m.b)<1e-9 && fabs(m.c)<1e-9 &&
                fabs(m.e-round(m.e))<1e-9 && fabs(m.f-round(m.f))<1e-9 && fabs(m.e)<BIG && fabs(m.f)<BIG) {
                 translated=*d;translated.x+=(int)round(m.e);translated.y+=(int)round(m.f);translated.xf=0;d=&translated;
             } else {paint_transformed(lo,d,s,ox,oy,sx,sy,focus,caret_on,i);continue;}

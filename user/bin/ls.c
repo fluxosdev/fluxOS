@@ -11,12 +11,27 @@
 
 struct entry {
     char name[NAME_MAX + 1];
-    struct stat st;
+    struct stat st;                     /* a symbolic link's own (lstat) */
+    char *link;                         /* its target, for -l */
 };
 
 static int opt_all, opt_almost, opt_long, opt_one, opt_classify, opt_color;
 static int opt_dir, opt_reverse, opt_size_sort, opt_time_sort, opt_human, opt_recursive;
 static int status;
+
+/* Read the target of a link entry, for -l's "name -> target". */
+static void note_link(struct entry *e, const char *path)
+{
+    e->link = NULL;
+    if (!S_ISLNK(e->st.st_mode) || !opt_long)
+        return;
+    char buf[PATH_MAX];
+    ssize_t n = readlink(path, buf, sizeof(buf) - 1);
+    if (n >= 0) {
+        buf[n] = 0;
+        e->link = strdup(buf);
+    }
+}
 
 static int compare(const void *a, const void *b)
 {
@@ -39,6 +54,8 @@ static const char *color_of(const struct stat *st)
         return NULL;
     if (S_ISDIR(st->st_mode))
         return "\033[1;34m";
+    if (S_ISLNK(st->st_mode))
+        return "\033[1;36m";
     if (S_ISCHR(st->st_mode) || S_ISBLK(st->st_mode))
         return "\033[1;33m";
     if (S_ISFIFO(st->st_mode))
@@ -53,6 +70,7 @@ static char type_suffix(const struct stat *st)
     if (!opt_classify)
         return 0;
     if (S_ISDIR(st->st_mode)) return '/';
+    if (S_ISLNK(st->st_mode)) return '@';
     if (S_ISFIFO(st->st_mode)) return '|';
     if (S_ISREG(st->st_mode) && (st->st_mode & 0111)) return '*';
     return 0;
@@ -73,7 +91,7 @@ static int print_name(const struct entry *e)
 
 static void mode_string(uint32_t m, char *s)
 {
-    s[0] = S_ISDIR(m) ? 'd' : S_ISCHR(m) ? 'c' : S_ISBLK(m) ? 'b' : S_ISFIFO(m) ? 'p' : '-';
+    s[0] = S_ISDIR(m) ? 'd' : S_ISLNK(m) ? 'l' : S_ISCHR(m) ? 'c' : S_ISBLK(m) ? 'b' : S_ISFIFO(m) ? 'p' : '-';
     const char *rwx = "rwxrwxrwx";
     for (int i = 0; i < 9; i++)
         s[i + 1] = (m & (1u << (8 - i))) ? rwx[i] : '-';
@@ -108,6 +126,8 @@ static void print_long(const struct entry *e)
         snprintf(size, sizeof(size), "%u", e->st.st_size);
     printf("%s %2u flux flux %7s %s ", mode, e->st.st_nlink, size, when);
     print_name(e);
+    if (e->link)
+        printf(" -> %s", e->link);
     putchar('\n');
 }
 
@@ -179,8 +199,9 @@ static void list_dir(const char *path)
         strlcpy(v[n].name, de->d_name, sizeof(v[n].name));
         char full[PATH_MAX];
         snprintf(full, sizeof(full), "%s/%s", path, de->d_name);
-        if (stat(full, &v[n].st) < 0)
+        if (lstat(full, &v[n].st) < 0)
             memset(&v[n].st, 0, sizeof(v[n].st));
+        note_link(&v[n], full);
         n++;
     }
     closedir(d);
@@ -262,7 +283,8 @@ int main(int argc, char **argv)
     }
     for (int k = i; k < argc; k++) {
         struct stat st;
-        if (stat(argv[k], &st) < 0) {
+        /* a link named here is followed, unless its own details are asked for */
+        if ((opt_long || opt_dir || opt_classify ? lstat(argv[k], &st) : stat(argv[k], &st)) < 0) {
             fprintf(stderr, "ls: cannot access '%s': %s\n", argv[k], strerror(errno));
             status = 2;
             continue;
@@ -272,6 +294,7 @@ int main(int argc, char **argv)
         } else {
             strlcpy(files[nfiles].name, argv[k], sizeof(files[nfiles].name));
             files[nfiles].st = st;
+            note_link(&files[nfiles], argv[k]);
             nfiles++;
         }
     }

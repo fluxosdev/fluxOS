@@ -15,9 +15,12 @@ int main(void)
 {
     mallopt(M_MMAP_MAX,0);
     struct arena a={0},sa={0};
-    const char *html="<!doctype html><html><body><div id=box style='transform:translate(50%,100%) scale(2);transform-origin:top left'></div></body></html>";
+    const char *html="<!doctype html><html><body><div id=box style='transform:translate(50%,100%) scale(2);transform-origin:top left'></div><div id=projective style='transform:perspective(100px) translateZ(50px)'></div></body></html>";
     struct node *root=html_parse(&a,html,(int)strlen(html));
-    css_cascade(&sa,root,NULL,0,200,100,NULL,NULL);
+    const char *css="#projective{color:red}@supports (contain:layout){#projective{color:blue}}"
+                    "@supports not (contain:layout){#projective{color:lime}}";
+    struct sheet *sheet=css_parse(&a,css,(int)strlen(css),200);
+    css_cascade(&sa,root,&sheet,1,200,100,NULL,NULL);
     struct jshost h={.arena=&a,.root=root,.url="file:///geometry.html",.base="file:///geometry.html",
         .status=status,.changed=changed,.node_box=raw_box,.node_visual_box=visual_box,.node_local_point=local_point,
         .scroll_pos=scroll_pos,.node_scroll=nested_scroll};
@@ -29,6 +32,14 @@ int main(void)
         "check(r.x===27&&r.y===36&&r.width===40&&r.height===20&&r.right===67);"
         "check(s.transform==='matrix(2, 0, 0, 2, 10, 10)');"
         "check(s.transformOrigin==='0px 0px');"
+        "var ps=getComputedStyle(document.getElementById('projective')),value=ps.transform;"
+        "var m=value.slice(value.indexOf('(')+1,-1).split(',').map(Number);"
+        "check(value.indexOf('matrix3d(')===0&&m.length===16&&m[10]===1&&Math.round(m[11]*100)===-1&&m[14]===50&&m[15]===.5);"
+        "check(ps.color==='rgb(0, 255, 0)');"
+        "check(!CSS.supports('contain','layout')&&!CSS.supports('scroll-snap-type','x mandatory'));"
+        "check(!CSS.supports('transform-style','preserve-3d')&&CSS.supports('perspective','200px'));"
+        "check(CSS.supports('grid-template-columns','subgrid')&&CSS.supports('grid-template-rows','subgrid [start] [end]'));"
+        "check(!CSS.supports('grid-template-columns','subgrid 20px')&&!CSS.supports('grid-template-columns','subgrid [unclosed'));"
         "check(CSS.supports('transform','rotate(30deg) scale(2)'));"
         "check(CSS.supports('transform','skew(1rad, .2turn)'));"
         "check(!CSS.supports('transform','rotate(10px)'));"

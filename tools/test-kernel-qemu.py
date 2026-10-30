@@ -2,6 +2,7 @@
 """Boot the kernel regressions with a temporary initrd and blank scratch disk."""
 import argparse
 import pathlib
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -16,6 +17,7 @@ parser.add_argument("--success-marker", default="KERNEL REGRESSIONS PASSED")
 parser.add_argument("--add", action="append", default=[], metavar="HOST:GUEST", help="a host file to add to the initrd at that guest path")
 parser.add_argument("--drop", action="append", default=[], metavar="PREFIX", help="leave initrd members under this path out (the toolchain, for tests that do not need it in memory)")
 parser.add_argument("--timeout", type=int, default=45)
+parser.add_argument("--fsck-ext2", action="store_true", help="the guest leaves an ext2 volume on the scratch disk: have e2fsck check it")
 args = parser.parse_args()
 qemu, kernel, initrd, guest = args.qemu, args.kernel, args.initrd, args.guest
 expected_cpus = args.cpus
@@ -61,3 +63,12 @@ with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
         raise SystemExit("QEMU kernel regressions failed")
     if f"guest: {expected_cpus} CPUs online" not in output:
         raise SystemExit(f"QEMU expected {expected_cpus} active CPUs")
+    if args.fsck_ext2:
+        if shutil.which("e2fsck"):
+            check = subprocess.run(["e2fsck", "-fn", str(scratch)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            if check.returncode:
+                print(check.stdout.decode(errors="replace"))
+                raise SystemExit("e2fsck found the guest's ext2 volume damaged")
+            print("host: e2fsck finds the ext2 volume the guest wrote clean")
+        else:
+            print("host: no e2fsck to check the guest's ext2 volume with")

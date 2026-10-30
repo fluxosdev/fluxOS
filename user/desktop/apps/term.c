@@ -809,7 +809,7 @@ static void term_key(struct window *w, const struct input_event *ev)
 
 static void term_wheel(struct window *w, int steps)
 {
-    scroll_view(w->priv, steps * 3);
+    scroll_view(w->priv, steps * mouse_wheel_lines());
 }
 
 static void term_resize(struct window *w)

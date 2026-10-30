@@ -1,0 +1,46 @@
+GRUB 2.06 for BIOS PCs, as the fluxOS CD and installed disks boot it
+=====================================================================
+
+These files are GRUB's, built by GRUB's own tools and checked in so that
+the CD can be made without GRUB's build or a download (by mkiso, on Linux
+or on fluxOS itself). They come from Debian 12's GRUB 2.06 packages, version
+2.06-13+deb12u2, which tools/fetch-grub.sh fetches and checks against their
+SHA-256 hashes:
+
+  grub-pc-bin_2.06-13+deb12u2_amd64.deb   db6aced5a89f02e10e150140b4df9621196f311c26203baf8558b4c6808e1298
+  grub-common_2.06-13+deb12u2_amd64.deb   fa2a91e48bb85effb1d9e22e16d83774e6de0ae6167268e8150e76ae963ec671
+  grub2-common_2.06-13+deb12u2_amd64.deb  5067186a3bf88a99555069b9b29203ae2facec3372746ac93db1b02e92ef933e
+
+"tools/fetch-grub.sh --firmware DIR" makes this directory again. SHA256SUMS
+lists every file's hash.
+
+  boot.img          usr/lib/grub/i386-pc/boot.img, unchanged: the hard disk's
+                    boot sector. fluxinstall writes it into the MBR (with
+                    core.img's address, the partition table kept).
+  core.img          grub-mkimage -O i386-pc -p '(,msdos1)/boot/grub'
+                    biosdisk part_msdos fat: the hard disk's core image,
+                    which fluxinstall writes into the gap before the first
+                    partition. It reads /boot/grub there.
+  boot_hybrid.img   usr/lib/grub/i386-pc/boot_hybrid.img, unchanged: the
+                    ISO's first sector (mkiso -G), so that the ISO written
+                    to a USB stick starts too. mkiso patches in the El Torito
+                    image's address, as xorriso's --grub2-mbr does.
+  i386-pc/eltorito.img
+                    grub-mkimage -O i386-pc-eltorito -p /boot/grub biosdisk
+                    iso9660: the CD's El Torito boot image (no emulation),
+                    which mkiso gives a boot information table and its own
+                    address (xorriso's -boot-info-table, --grub2-boot-info).
+  i386-pc/*.mod     the modules the two menus (grub/install.cfg on the CD,
+                    grub/grub.cfg on a disk) load, the modules of the commands
+                    they use (command.lst), a few for GRUB's command line (ls,
+                    cat, configfile, help, reboot, halt) and what all those
+                    depend on (moddep.lst). fluxinstall copies them to the
+                    disk's /boot/grub/i386-pc.
+  i386-pc/*.lst     GRUB's module lists, unchanged.
+
+GRUB is free software under the GNU General Public License, version 3 or
+later (https://www.gnu.org/licenses/gpl-3.0.html). Its source is Debian's
+grub2 2.06-13+deb12u2 source package
+(https://deb.debian.org/debian/pool/main/g/grub2/, or
+https://snapshot.debian.org/package/grub2/2.06-13%2Bdeb12u2/), from which
+these binaries were built by Debian.

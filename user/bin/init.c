@@ -7,6 +7,12 @@
  * On the install CD, whose small setup system has /etc/setup, it starts
  * fluxOS Setup instead: the desktop's graphical one, or without a
  * framebuffer fluxinstall's guided text mode.
+ *
+ * First it mounts what /etc/fstab lists (fluxinstall -e writes it for a
+ * second, ext2, partition): lines "SPEC DIRECTORY [TYPE]", where SPEC is
+ * /dev/NAME or UUID=... (an ext2 volume's), and # starts a comment. The
+ * kernel has mounted every disk volume on /mnt/NAME already; a volume
+ * fstab names is moved to its directory.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -15,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -53,6 +60,68 @@ static void read_hostname(char *out, size_t size)
     buf[strcspn(buf, "\r\n \t")] = 0;
     if (buf[0])
         snprintf(out, size, "%s", buf);
+}
+
+/* An ext2 volume's UUID as Linux writes it (8-4-4-4-12 hex digits). */
+static int ext2_uuid(const char *dev, char *out, size_t size)
+{
+    int fd = open(dev, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    unsigned char sb[136];
+    int ok = lseek(fd, 1024, SEEK_SET) == 1024 && read(fd, sb, sizeof(sb)) == (ssize_t)sizeof(sb) &&
+             sb[56] == 0x53 && sb[57] == 0xEF;
+    close(fd);
+    if (!ok)
+        return -1;
+    const unsigned char *u = sb + 104;
+    snprintf(out, size, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+    return 0;
+}
+
+static void mount_fstab(void)
+{
+    FILE *f = fopen("/etc/fstab", "r");
+    if (!f)
+        return;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "#\r\n")] = 0;
+        char spec[128], dir[256], type[32] = "auto";
+        if (sscanf(line, "%127s %255s %31s", spec, dir, type) < 2 || dir[0] != '/')
+            continue;
+        /* the device, and where the kernel mounted it */
+        char dev[64] = "", was[128] = "";
+        struct blkinfo bi;
+        for (int k = 0; blkinfo(k, &bi) == 0; k++) {
+            char path[64], id[40];
+            snprintf(path, sizeof(path), "/dev/%s", bi.name);
+            int match = !strncmp(spec, "UUID=", 5)
+                            ? bi.type != BLK_CDROM && ext2_uuid(path, id, sizeof(id)) == 0 &&
+                                  !strcasecmp(id, spec + 5)
+                            : !strcmp(path, spec);
+            if (match) {
+                snprintf(dev, sizeof(dev), "%s", path);
+                snprintf(was, sizeof(was), "%s", bi.mountpoint);
+                break;
+            }
+        }
+        if (!dev[0]) {
+            fprintf(stderr, "init: /etc/fstab: %s is not here; %s not mounted\n", spec, dir);
+            continue;
+        }
+        if (!strcmp(was, dir))
+            continue;
+        if (was[0] && umount(was) == 0)
+            rmdir(was);
+        mkdir(dir, 0755);
+        if (mount(dev, dir, type) < 0)
+            fprintf(stderr, "init: mount %s on %s: %s\n", dev, dir, strerror(errno));
+        else
+            printf("init: mounted %s on %s\n", dev, dir);
+    }
+    fclose(f);
 }
 
 static int spawn(const char *path, char *const argv[])
@@ -119,6 +188,7 @@ int main(void)
     read_hostname(host, sizeof(host));
     setenv("HOST", host, 1);
 
+    mount_fstab();
     mkdir("/tmp", 01777);
     mkdir("/home", 0755);
     mkdir("/home/flux", 0755);

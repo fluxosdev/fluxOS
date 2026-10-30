@@ -47,7 +47,7 @@ enum prop {
     P_OVERFLOW, P_GRID_TEMPLATE_COLUMNS, P_GRID_TEMPLATE, P_GRID_COLUMN, P_GRID_COLUMN_START,
     P_GRID_COLUMN_END, P_GRID_ROW, P_GRID_ROW_START, P_GRID_AREA, P_GRID_TEMPLATE_ROWS,
     P_GRID_TEMPLATE_AREAS, P_GRID_AUTO_ROWS, P_GRID_ROW_END, P_GRID_AUTO_FLOW, P_MAX_HEIGHT,
-    P_ASPECT_RATIO, P_RIGHT, P_BOTTOM, P_CLEAR, P_INSET, P_TRANSFORM, P_TRANSFORM_ORIGIN, P_Z_INDEX, P_BOX_SHADOW,
+    P_ASPECT_RATIO, P_RIGHT, P_BOTTOM, P_CLEAR, P_INSET, P_TRANSFORM, P_TRANSFORM_ORIGIN, P_PERSPECTIVE, P_PERSPECTIVE_ORIGIN, P_Z_INDEX, P_BOX_SHADOW,
     P_MARGIN_INLINE, P_MARGIN_BLOCK, P_PADDING_INLINE, P_PADDING_BLOCK, P_INSET_INLINE, P_INSET_BLOCK,
     P_CURSOR, P_POINTER_EVENTS, P_USER_SELECT, P_IGNORED, P_LETTER_SPACING, P_WORD_SPACING,
     P_WORD_BREAK, P_OVERFLOW_WRAP, P_TEXT_OVERFLOW, P_OUTLINE, P_OUTLINE_STYLE, P_OUTLINE_COLOR,
@@ -205,7 +205,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "padding-inline-end", P_PADDING_RIGHT }, { "padding-inline-start", P_PADDING_LEFT },
     { "padding-left", P_PADDING_LEFT }, { "padding-right", P_PADDING_RIGHT }, { "padding-top", P_PADDING_TOP },
     { "page-break-after", P_IGNORED }, { "page-break-before", P_IGNORED }, { "page-break-inside", P_BREAK_INSIDE },
-    { "paint-order", P_IGNORED }, { "perspective", P_IGNORED }, { "perspective-origin", P_IGNORED },
+    { "paint-order", P_IGNORED }, { "perspective", P_PERSPECTIVE }, { "perspective-origin", P_PERSPECTIVE_ORIGIN },
     { "place-content", P_PLACE_CONTENT }, { "place-items", P_PLACE_ITEMS }, { "place-self", P_PLACE_SELF },
     { "pointer-events", P_POINTER_EVENTS }, { "position", P_POSITION }, { "print-color-adjust", P_IGNORED },
     { "quotes", P_IGNORED }, { "resize", P_IGNORED }, { "right", P_RIGHT }, { "rotate", P_ROTATE },
@@ -1341,6 +1341,7 @@ static void parse_keyframes(struct sheet *sh, const char *ns, const char *ne, co
 
 /* ---- media queries ---- */
 
+
 static int length_px(const char *s, int base);
 
 int css_viewport_h = 600;
@@ -1806,6 +1807,8 @@ static int word_at(const char *p, const char *e, const char *w)
 static int transform_supported(const char *value);
 static int individual_supported(int prop, const char *value);
 static int effect_supported(int prop, const char *value);
+static int subgrid_supported(const char *value);
+static int perspective_supported(const char *value);
 
 static int supports_decl(const char *ns, const char *ne, const char *vs, const char *ve)
 {
@@ -1827,7 +1830,7 @@ static int supports_decl(const char *ns, const char *ne, const char *vs, const c
     name[ne - ns] = 0;
     snprintf(value, sizeof(value), "%.*s", (int)(ve - vs), vs);
     int prop = prop_lookup(name);
-    if (prop == P_UNKNOWN || !value[0])
+    if (prop == P_UNKNOWN || prop == P_IGNORED || !value[0])
         return 0;
     if (!strncasecmp(value, "var(", 4) || !strcasecmp(value, "inherit") || !strcasecmp(value, "initial") ||
         !strcasecmp(value, "unset") || !strcasecmp(value, "revert"))
@@ -1850,6 +1853,12 @@ static int supports_decl(const char *ns, const char *ne, const char *vs, const c
                 return 1;
         return 0;
     }
+    case P_GRID_TEMPLATE_COLUMNS: case P_GRID_TEMPLATE_ROWS:
+        if(!strncasecmp(value,"subgrid",7))return subgrid_supported(value);
+        return 1;
+    case P_GRID_AUTO_ROWS: case P_GRID_AUTO_COLUMNS:
+        return strncasecmp(value,"subgrid",7)!=0;
+    case P_PERSPECTIVE:return perspective_supported(value);
     case P_TRANSFORM: return transform_supported(value);
     case P_FILTER: case P_BACKDROP: case P_CLIP_PATH: return effect_supported(prop, value);
     case P_TRANSLATE: case P_ROTATE: case P_SCALE: return individual_supported(prop, value);
@@ -3796,6 +3805,12 @@ static int is_length(const char *s)
     return length_value(s, &v, &l);
 }
 
+static int perspective_supported(const char *value)
+{
+    struct vctx v={16,16,1024,768,NULL,0,0,NULL};struct len l;
+    return !strcasecmp(value,"none") || (length_value(value,&v,&l) && l.unit==U_PX && l.v>=0);
+}
+
 static int length_px(const char *s, int base)
 {
     struct vctx v = { base, 16, 1024, 768, NULL, 0, 0, NULL };
@@ -3874,7 +3889,9 @@ static void init_initial(void)
     s->tab_size = 8;
     s->bg_w.unit = s->bg_h.unit = U_AUTO;
     s->obj_px = s->obj_py = (struct len){ 5000, 0, U_PCT };
-    s->tox = s->toy = (struct len){ 5000, 0, U_PCT };
+    s->tox = s->toy = s->pox = s->poy = (struct len){ 5000, 0, U_PCT };
+    s->perspective.unit = U_AUTO;
+    s->row_gap_normal = 1;
     s->opacity = 255;
     s->col_gap_normal = 1;
     s->col_width.unit = U_AUTO;
@@ -4692,12 +4709,16 @@ static const struct gridspec *parse_tracks(const char *value, const struct vctx 
     memset(g, 0, sizeof(*g));
     const char *w[64];
     int wl[64], n = words(value, w, wl, 64), in_names = 0;
-    for (int i = 0; i < n; i++) {
+    int sub = n && word_is(w[0], wl[0], "subgrid");
+    g->subgrid = sub;
+    for (int i = sub; i < n; i++) {
         if (in_names || w[i][0] == '[') {               /* [line names] */
             add_line_names(g,w[i],wl[i],v);
             in_names = w[i][wl[i] - 1] != ']';
+            if(sub && !in_names && g->n<MAX_TRACKS)g->n++;
             continue;
         }
+        if(sub)return NULL; /* subgrid has line names, not independent track sizes */
         if (wl[i] > 7 && !strncasecmp(w[i], "repeat(", 7)) {
             char inner[256];
             int len = wl[i] - 8;
@@ -4737,9 +4758,38 @@ static const struct gridspec *parse_tracks(const char *value, const struct vctx 
         }
         add_track(g, w[i], wl[i], v);
     }
+    if(sub && in_names)return NULL;
     if (g->auto_repeat && !g->nrep)
         g->auto_repeat = 0;
     return g;
+}
+
+static int subgrid_supported(const char *value)
+{
+    struct arena a={0};const struct vctx v={16,16,1024,768,&a,0,0,NULL};
+    const struct gridspec *g=parse_tracks(value,&v);
+    int supported=g && g->subgrid;arena_free(&a);return supported;
+}
+
+/* Explicitly placed subgrids expose their parent's line names in local coordinates. */
+static const struct gridspec *subgrid_names(struct arena *a,const struct gridspec *g,
+                                           const struct gridspec *parent,int start,int end,int span)
+{
+    if(!g || !g->subgrid || !parent || !parent->n)return g;
+    int first=start>0?start-1:start<0?parent->n+1+start:0;
+    int last=end>0?end-1:end<0?parent->n+1+end:first+(span>0?span:1);
+    if(first<0 || first>=parent->n || last<=first)return g;
+    if(last>parent->n)last=parent->n;
+    struct gridspec *out=arena_alloc(a,sizeof(*out));if(!out)return g;
+    *out=*g;out->n=last-first;
+    for(int k=0;k<=out->n;k++) {
+        const char *local=g->line_names[k],*outer=parent->line_names[first+k];
+        if(!outer)continue;
+        size_t size=strlen(outer)+(local?strlen(local):0)+2;
+        char *names=arena_alloc(a,size);
+        if(names){snprintf(names,size,"%s %s",outer,local?local:"");out->line_names[k]=names;}
+    }
+    return out;
 }
 
 /* grid-template-areas: "header header" "nav main": each string is a row of cell names. */
@@ -4868,7 +4918,7 @@ static void set_len(struct len *dst, const char *value, const struct vctx *v)
         *dst = l;
 }
 
-/* Parse complete 2D transform lists before changing the cascaded value. */
+/* Parse complete transform lists before changing the cascaded value. */
 static int transform_number(const char *s, float *out, int angle)
 {
     const char *end=s;
@@ -4902,22 +4952,20 @@ static int transform_number(const char *s, float *out, int angle)
     *out = (float)x;
     return 1;
 }
-/* rotate3d(x, y, z, angle) seen from the front with no perspective: the top left 2x2 of its
- * matrix. The back of the box faces the viewer when the z axis comes to point away. */
+/* Keep all three axes until the complete transform list has been composed. */
 static int rotate3d_op(double x, double y, double z, double angle, struct tfop *op)
 {
-    double l = sqrt(x * x + y * y + z * z);
-    if (l <= 0)
-        return 0;
-    x /= l, y /= l, z /= l;
-    double c = cos(angle), s = sin(angle), t = 1 - c;
+    double l = sqrt(x*x + y*y + z*z);
     memset(op, 0, sizeof(*op));
-    op->kind = TF_MATRIX;
-    op->a = (float)(t * x * x + c);             /* the image of the x axis */
-    op->b = (float)(t * x * y + s * z);
-    op->c = (float)(t * x * y - s * z);         /* ...and of the y axis */
-    op->d = (float)(t * y * y + c);
-    op->flip = t * z * z + c < -1e-6;
+    op->kind = TF_MATRIX3D;
+    op->m[0] = op->m[5] = op->m[10] = op->m[15] = 1;
+    if (l <= 0) return 1;       /* a zero vector is the identity */
+    x /= l; y /= l; z /= l;
+    double c = cos(angle), s = sin(angle), t = 1-c;
+    op->m[0]=t*x*x+c; op->m[1]=t*x*y+s*z; op->m[2]=t*x*z-s*y;
+    op->m[4]=t*x*y-s*z; op->m[5]=t*y*y+c; op->m[6]=t*y*z+s*x;
+    op->m[8]=t*x*z+s*y; op->m[9]=t*y*z-s*x; op->m[10]=t*z*z+c;
+    op->flip = op->m[10] < -1e-6;
     return 1;
 }
 static int parse_transform(const char *value, const struct vctx *v, struct css_xform *out)
@@ -4949,7 +4997,7 @@ static int parse_transform(const char *value, const struct vctx *v, struct css_x
             while(q<limit && isspace((unsigned char)*q))q++;
             if(q<limit && *q==','){q++;while(q<limit && isspace((unsigned char)*q))q++;if(q==limit)return 0;}
         }
-        struct tfop op={0};
+        struct tfop op={0};op.m[10]=1;
         char fn[32];if(nl<=0 || nl>=(int)sizeof(fn))return 0;
         snprintf(fn,sizeof(fn),"%.*s",nl,name);
         if(!strcasecmp(fn,"translate") || !strcasecmp(fn,"translateX") || !strcasecmp(fn,"translateY")) {
@@ -4980,22 +5028,22 @@ static int parse_transform(const char *value, const struct vctx *v, struct css_x
             float values[6];if(n!=6)return 0;
             for(int i=0;i<6;i++)if(!transform_number(args[i],&values[i],0))return 0;
             op.a=values[0];op.b=values[1];op.c=values[2];op.d=values[3];op.e=values[4];op.f=values[5];
-        /* 3D: seen from the front with no perspective, so depth is dropped */
+        /* Three-dimensional operations retain depth for perspective composition. */
         } else if(!strcasecmp(fn,"translate3d")) {
-            struct len z;
             if(n!=3 || !length_value(args[0],v,&op.x) || op.x.unit==U_AUTO || !length_value(args[1],v,&op.y) ||
-               op.y.unit==U_AUTO || !length_value(args[2],v,&z))return 0;
+               op.y.unit==U_AUTO || !length_value(args[2],v,&op.z) || op.z.unit!=U_PX)return 0;
             op.kind=TF_TRANSLATE;
         } else if(!strcasecmp(fn,"translateZ") || !strcasecmp(fn,"perspective")) {
-            struct len z;
-            if(n!=1 || (!length_value(args[0],v,&z) && strcasecmp(args[0],"none")))return 0;
-            op.kind=TF_TRANSLATE;
+            if(n!=1)return 0;
+            op.kind=!strcasecmp(fn,"translateZ")?TF_TRANSLATE:TF_PERSPECTIVE;
+            if(op.kind==TF_PERSPECTIVE && !strcasecmp(args[0],"none"))op.z.unit=U_AUTO;
+            else if(!length_value(args[0],v,&op.z) || op.z.unit!=U_PX ||
+                    (op.kind==TF_PERSPECTIVE && op.z.v<0))return 0;
         } else if(!strcasecmp(fn,"scale3d") || !strcasecmp(fn,"scaleZ")) {
-            float z;
-            if(n!=(fn[5]=='3'?3:1))return 0;
+            if(n!=(!strcasecmp(fn,"scale3d")?3:1))return 0;
             op.kind=TF_SCALE;op.a=op.b=1;
             if(n==3 && (!transform_number(args[0],&op.a,0) || !transform_number(args[1],&op.b,0)))return 0;
-            if(!transform_number(args[n-1],&z,0))return 0;
+            if(!transform_number(args[n-1],&op.m[10],0))return 0;
         } else if(!strcasecmp(fn,"rotateZ")) {
             op.kind=TF_ROTATE;
             if(n!=1 || !transform_number(args[0],&op.a,1))return 0;
@@ -5005,11 +5053,10 @@ static int parse_transform(const char *value, const struct vctx *v, struct css_x
             for(int i=0;i<3 && n==4;i++)if(!transform_number(args[i],&axis[i],0))return 0;
             if(!transform_number(args[n-1],&angle,1) || !rotate3d_op(axis[0],axis[1],axis[2],angle,&op))return 0;
         } else if(!strcasecmp(fn,"matrix3d")) {
-            float m[16];if(n!=16)return 0;
-            for(int i=0;i<16;i++)if(!transform_number(args[i],&m[i],0))return 0;
-            float w=m[15]!=0?m[15]:1;
-            op.kind=TF_MATRIX;op.a=m[0]/w;op.b=m[1]/w;op.c=m[4]/w;op.d=m[5]/w;op.e=m[12]/w;op.f=m[13]/w;
-            op.flip=m[10]<0;
+            if(n!=16)return 0;
+            op.kind=TF_MATRIX3D;
+            for(int i=0;i<16;i++)if(!transform_number(args[i],&op.m[i],0))return 0;
+            op.flip=op.m[10]<0;
         } else return 0;
         out->flipped^=op.flip;
         out->op[out->n++]=op;p=end;
@@ -5027,23 +5074,30 @@ double css_transform_length(struct len l,int base)
     if(l.unit==U_MAX)return p>l.v?p:l.v;
     return l.unit==U_AUTO?0:l.v;
 }
-void css_transform_matrix(const struct style *st,int w,int h,double out[6])
+void css_transform_matrix3d(const struct style *st,int w,int h,double out[16])
 {
-    const double initial[6]={1,0,0,1,0,0};memcpy(out,initial,sizeof(initial));
+    memset(out,0,16*sizeof(double));out[0]=out[5]=out[10]=out[15]=1;
     for(int k=0;st && st->xf && k<st->xf->n;k++) {
-        const struct tfop *op=&st->xf->op[k];double t[6]={1,0,0,1,0,0};
+        const struct tfop *op=&st->xf->op[k];
+        double t[16]={0}, m[16]={0};t[0]=t[5]=t[10]=t[15]=1;
         switch(op->kind) {
-        case TF_TRANSLATE:t[4]=css_transform_length(op->x,w);t[5]=css_transform_length(op->y,h);break;
-        case TF_SCALE:t[0]=op->a;t[3]=op->b;break;
-        case TF_ROTATE:t[0]=t[3]=cos(op->a);t[1]=sin(op->a);t[2]=-t[1];break;
-        case TF_SKEW:t[2]=tan(op->a);t[1]=tan(op->b);break;
-        case TF_MATRIX:t[0]=op->a;t[1]=op->b;t[2]=op->c;t[3]=op->d;t[4]=op->e;t[5]=op->f;break;
+        case TF_TRANSLATE:t[12]=css_transform_length(op->x,w);t[13]=css_transform_length(op->y,h);t[14]=css_transform_length(op->z,0);break;
+        case TF_SCALE:t[0]=op->a;t[5]=op->b;t[10]=op->m[10];break;
+        case TF_ROTATE:t[0]=t[5]=cos(op->a);t[1]=sin(op->a);t[4]=-t[1];break;
+        case TF_SKEW:t[4]=tan(op->a);t[1]=tan(op->b);break;
+        case TF_MATRIX:t[0]=op->a;t[1]=op->b;t[4]=op->c;t[5]=op->d;t[12]=op->e;t[13]=op->f;break;
+        case TF_MATRIX3D:for(int i=0;i<16;i++)t[i]=op->m[i];break;
+        case TF_PERSPECTIVE:if(op->z.unit!=U_AUTO)t[11]=-1.0/(op->z.v<1?1:op->z.v);break;
         }
-        double m[6]={out[0]*t[0]+out[2]*t[1],out[1]*t[0]+out[3]*t[1],
-            out[0]*t[2]+out[2]*t[3],out[1]*t[2]+out[3]*t[3],
-            out[0]*t[4]+out[2]*t[5]+out[4],out[1]*t[4]+out[3]*t[5]+out[5]};
+        for(int col=0;col<4;col++)for(int row=0;row<4;row++)
+            for(int j=0;j<4;j++)m[col*4+row]+=out[j*4+row]*t[col*4+j];
         memcpy(out,m,sizeof(m));
     }
+}
+void css_transform_matrix(const struct style *st,int w,int h,double out[6])
+{
+    double m[16];css_transform_matrix3d(st,w,h,m);
+    out[0]=m[0];out[1]=m[1];out[2]=m[4];out[3]=m[5];out[4]=m[12];out[5]=m[13];
 }
 static int transform_supported(const char *value)
 {
@@ -5053,8 +5107,7 @@ static int transform_supported(const char *value)
 
 /*
  * The individual transform properties: translate: x [y [z]], rotate: angle (or about the z axis:
- * "z 45deg", "0 0 1 45deg"), scale: x [y [z]] (numbers or percentages). The third dimension does
- * nothing in 2D. Returns 1 with *set 0 for none, 1 with *set 1 and op filled in, 0 for nonsense.
+ * "z 45deg", "0 0 1 45deg"), scale: x [y [z]] (numbers or percentages). Returns 1 with *set 0 for none, 1 with *set 1 and op filled in, 0 for nonsense.
  */
 static int individual_transform(int prop, const char *value, const struct vctx *v, struct tfop *op, int *set)
 {
@@ -5077,6 +5130,7 @@ static int individual_transform(int prop, const char *value, const struct vctx *
             return 0;
         if (n >= 2 && (!length_value(a[1], v, &op->y) || op->y.unit == U_AUTO))
             return 0;
+        if (n == 3 && (!length_value(a[2], v, &op->z) || op->z.unit != U_PX)) return 0;
     } else if (prop == P_ROTATE) {
         op->kind = TF_ROTATE;
         const char *angle = n == 1 ? a[0] : NULL;
@@ -5105,6 +5159,7 @@ static int individual_transform(int prop, const char *value, const struct vctx *
         if (n > 3)
             return 0;
         op->kind = TF_SCALE;
+        op->m[10] = 1;
         float s[2];
         for (int i = 0; i < 2; i++) {
             const char *t = a[i < n ? i : 0];
@@ -5118,6 +5173,13 @@ static int individual_transform(int prop, const char *value, const struct vctx *
             } else if (!transform_number(t, &s[i], 0)) {
                 return 0;
             }
+        }
+        if (n == 3) {
+            size_t len = strlen(a[2]);
+            int pct = len && a[2][len-1]=='%';
+            if (pct) a[2][len-1]=0;
+            if (!transform_number(a[2], &op->m[10], 0)) return 0;
+            if (pct) op->m[10]/=100;
         }
         op->a = s[0], op->b = s[1];
     }
@@ -5848,8 +5910,10 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         }
         if (n == 1)
             l[1] = l[0], normal[1] = normal[0];
-        if (prop != P_COLUMN_GAP)
+        if (prop != P_COLUMN_GAP) {
             st->row_gap = l[0];
+            st->row_gap_normal = normal[0];
+        }
         if (prop != P_ROW_GAP) {
             st->col_gap = prop == P_GAP ? l[1] : l[0];
             st->col_gap_normal = (uint8_t)(prop == P_GAP ? normal[1] : normal[0]);
@@ -6025,10 +6089,12 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         st->bg_attachment = !strcasecmp(value, "fixed") ? 1 : !strcasecmp(value, "local") ? 2 : 0;
         break;
     case P_GRID_TEMPLATE_COLUMNS:
-        st->grid_cols = !strcasecmp(value, "none") || initial_kw ? NULL : parse_tracks(value, v);
+        if(strncasecmp(value,"subgrid",7) || subgrid_supported(value))
+            st->grid_cols = !strcasecmp(value, "none") || initial_kw ? NULL : parse_tracks(value, v);
         break;
     case P_GRID_TEMPLATE_ROWS:
-        st->grid_rows = !strcasecmp(value, "none") || initial_kw ? NULL : parse_tracks(value, v);
+        if(strncasecmp(value,"subgrid",7) || subgrid_supported(value))
+            st->grid_rows = !strcasecmp(value, "none") || initial_kw ? NULL : parse_tracks(value, v);
         break;
     case P_GRID_AUTO_ROWS:
         st->grid_auto_rows = !strcasecmp(value, "auto") || initial_kw ? NULL : parse_tracks(value, v);
@@ -6820,11 +6886,21 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         }
         break;
     }
+    case P_PERSPECTIVE: {
+        struct len l;
+        if (!strcasecmp(value,"none") || initial_kw)st->perspective=(struct len){.unit=U_AUTO};
+        else if(length_value(value,v,&l) && l.unit==U_PX && l.v>=0)st->perspective=l;
+        break;
+    }
+    case P_PERSPECTIVE_ORIGIN:parse_position(value,v,&st->pox,&st->poy);break;
     case P_TRANSFORM_ORIGIN: {
         const char *parts[4];int lengths[4],count=words(value,parts,lengths,4);
         if(count==3) {
             char xy[256];snprintf(xy,sizeof(xy),"%.*s %.*s",lengths[0],parts[0],lengths[1],parts[1]);
-            parse_position(xy,v,&st->tox,&st->toy); /* Z has no effect on a 2D matrix. */
+            struct len z;char zs[64];snprintf(zs,sizeof(zs),"%.*s",lengths[2],parts[2]);
+            if(length_value(zs,v,&z) && z.unit==U_PX) {
+                parse_position(xy,v,&st->tox,&st->toy);st->toz=z;
+            }
         } else if(count<=2)parse_position(value,v,&st->tox,&st->toy);
         break;
     }
@@ -7530,8 +7606,8 @@ static void restore_property(struct style *st, const struct style *src, int prop
     case P_PLACE_ITEMS: COPY(align_items); COPY(justify_items); break;
     case P_PLACE_SELF: COPY(align_self); COPY(justify_self); break;
     case P_ORDER: COPY(order); break;
-    case P_GAP: COPY(row_gap); COPY(col_gap); COPY(col_gap_normal); break;
-    case P_ROW_GAP: COPY(row_gap); break;
+    case P_GAP: COPY(row_gap_normal); COPY(row_gap); COPY(col_gap); COPY(col_gap_normal); break;
+    case P_ROW_GAP: COPY(row_gap_normal); COPY(row_gap); break;
     case P_COLUMN_GAP: COPY(col_gap); COPY(col_gap_normal); break;
     case P_COLUMNS: COPY(col_count); COPY(col_width); break;
     case P_COLUMN_COUNT: COPY(col_count); break;
@@ -7637,7 +7713,9 @@ static void restore_property(struct style *st, const struct style *src, int prop
     case P_POSITION: COPY(positioned); COPY(position); break;
     case P_BOX_SHADOW: COPY(sh_color); COPY(sh_x); COPY(sh_y); COPY(sh_blur); COPY(sh_spread); break;
     case P_TRANSFORM: COPY(tx); COPY(ty); COPY(xf); break;
-    case P_TRANSFORM_ORIGIN: COPY(tox); COPY(toy); break;
+    case P_PERSPECTIVE: COPY(perspective); break;
+    case P_PERSPECTIVE_ORIGIN: COPY(pox); COPY(poy); break;
+    case P_TRANSFORM_ORIGIN: COPY(tox); COPY(toy); COPY(toz); break;
     case P_Z_INDEX: COPY(z_set); COPY(z_index); break;
     case P_CLEAR: COPY(clear); break;
     case P_TOP: COPY(top); break;
@@ -8049,6 +8127,10 @@ static int compute(struct arena *a, struct node *n, const struct style *parent,
         st->font_size = 200;
     finish_background(st, parent, &v);
     finish_transform(a, st);
+    if(parent->inner==IN_GRID) {
+        st->grid_cols=subgrid_names(a,st->grid_cols,parent->grid_cols,st->gc_start,st->gc_end,st->gc_span);
+        st->grid_rows=subgrid_names(a,st->grid_rows,parent->grid_rows,st->gr_start,st->gr_end,st->gr_span);
+    }
     if (st->filter) {                           /* drop-shadow() with no color: the text color */
         struct css_filter *f = NULL;
         for (int i = 0; i < st->filter->n; i++)
