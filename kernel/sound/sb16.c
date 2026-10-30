@@ -322,18 +322,23 @@ static int dsp_dev_write_locked(struct vnode *vn, const void *buf, uint64_t off,
     uint32_t uf = user_frame(), df = dev_frame(), used = 0;
 
     /* Complete a frame begun by the last write. */
-    while (sb.ncarry && used < n) {
-        sb.carry[sb.ncarry++] = in[used++];
-        if (sb.ncarry == uf) {
-            while (RING_SIZE - ring_used() < df) {
-                start();
-                int r = wait_for_irq();
-                if (r < 0)
-                    return r;
-            }
-            put_frame(sb.carry);
-            sb.ncarry = 0;
+    /* A full frame stays in carry until there is room for it: a wait that
+     * fails (a signal) keeps it for the next write, which must not add to it. */
+    while (sb.ncarry) {
+        if (sb.ncarry < uf) {
+            if (used == n)
+                break;
+            sb.carry[sb.ncarry++] = in[used++];
+            continue;
         }
+        while (RING_SIZE - ring_used() < df) {
+            start();
+            int r = wait_for_irq();
+            if (r < 0)
+                return used ? (int)used : r;
+        }
+        put_frame(sb.carry);
+        sb.ncarry = 0;
     }
     while (n - used >= uf) {
         uint32_t room = (RING_SIZE - ring_used()) / df;

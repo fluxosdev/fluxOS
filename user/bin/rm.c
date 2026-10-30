@@ -11,7 +11,7 @@ static int recursive, force, verbose;
 static int remove_path(const char *path)
 {
     struct stat st;
-    if (stat(path, &st) < 0) {
+    if (lstat(path, &st) < 0) {         /* a link is removed, not followed */
         if (force)
             return 0;
         fprintf(stderr, "rm: cannot remove '%s': %s\n", path, strerror(errno));

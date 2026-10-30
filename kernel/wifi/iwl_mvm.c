@@ -160,6 +160,7 @@ void iwl_dump_errors(const char *why)
          iwl_read_prph(SB_MODIFY_CFG_FLAG + UMAC_PRPH_OFFSET));
     klog("iwl: UMAC PC 0x%08X, LMAC1 PC 0x%08X\n", iwl_read_prph(0xD05C18),
          iwl_read_prph(0xD05C1C));
+    iwl_trans_dump_queues();
 }
 
 void iwl_mvm_fw_error(int hw_error)

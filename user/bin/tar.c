@@ -541,6 +541,26 @@ static const char *safe_path(const char *name, char *out, size_t size)
     return out;
 }
 
+/* Whether a directory on the way to path is a symbolic link: a member
+ * written through one could land outside the directory unpacked into
+ * (an archive holding "l -> /etc" and then "l/passwd"). */
+static int through_symlink(const char *path)
+{
+    char tmp[PATH_MAX];
+    struct stat st;
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p != '/')
+            continue;
+        *p = 0;
+        int link = lstat(tmp, &st) == 0 && S_ISLNK(st.st_mode);
+        *p = '/';
+        if (link)
+            return 1;
+    }
+    return 0;
+}
+
 static void make_parents(const char *path)
 {
     char tmp[PATH_MAX];
@@ -789,6 +809,13 @@ static int read_archive(const char *extract_dir)
                 break;
             continue;
         }
+        if (!to_stdout && through_symlink(path)) {
+            warn("%s: member is beneath a symbolic link, skipped%s", name, "");
+            status = 2;
+            if (skip_bytes((size + 511) & ~511u) < 0)
+                break;
+            continue;
+        }
         if (type == '0') {
             if (extract_file(path, size, mode, mtime) < 0) {
                 fprintf(stderr, "tar: unexpected end of archive\n");
@@ -814,7 +841,7 @@ static int read_archive(const char *extract_dir)
             }
         } else if (type == '1') {
             char target[PATH_MAX];
-            if (!to_stdout && safe_path(lnk, target, sizeof(target))) {
+            if (!to_stdout && safe_path(lnk, target, sizeof(target)) && !through_symlink(target)) {
                 make_parents(path);
                 unlink(path);
                 if (link(target, path) < 0) {

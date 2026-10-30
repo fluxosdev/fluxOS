@@ -128,8 +128,8 @@ void iwl_trans_service(void);           /* reap RX and TX completions; dispatch 
 int iwl_send_cmd(uint8_t group, uint8_t cmd, const void *data, uint32_t len, void *resp,
                  uint32_t resp_size, uint32_t *resp_len);
 int iwl_send_cmd_async(uint8_t group, uint8_t cmd, const void *data, uint32_t len);
-/* TX queues for a firmware station's TID (SCD_QUEUE_CONFIG): a handle
- * (0 or 1), or -errno. Freed by iwl_trans_free_txq() before the station goes. */
+/* TX queues for a firmware station's TID (SCD_QUEUE_CONFIG): 0-7 for QoS
+ * data, 15 for management and non-QoS frames. A handle (0 or 1), or -errno. Freed by iwl_trans_free_txq() before the station goes. */
 int iwl_trans_alloc_txq(int sta_id, int tid);
 void iwl_trans_free_txq(int txq);
 /* A frame: the 28-byte TX command (its len set), then the 802.11 frame,
@@ -138,6 +138,7 @@ int iwl_trans_tx(int txq, const void *tx_cmd, const uint8_t *frame, uint32_t hdr
 /* The firmware is done with a queue's frames up to (not including) ssn. */
 void iwl_trans_reclaim(int fw_queue, uint16_t ssn);
 int iwl_trans_rfkill(void);             /* the hardware switch has the radio off */
+void iwl_trans_dump_queues(void);       /* command and TX ring pointers, for a crash dump */
 /* Periphery registers and device memory (grabbing NIC access as needed). */
 uint32_t iwl_read_prph(uint32_t addr);
 void iwl_write_prph(uint32_t addr, uint32_t val);

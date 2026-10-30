@@ -624,9 +624,11 @@ int do_fork(void)
     child->no_ctty = g->no_ctty;
     child->alt_sp = parent->alt_sp;
     child->alt_size = parent->alt_size;
+    spin_lock(&g->fd_lock);                     /* other threads may be closing descriptors */
     for (int i = 0; i < MAX_FDS; i++)
-        child->leader->fds[i] = file_dup(parent->leader->fds[i]);
-    memcpy(child->leader->fd_cloexec, parent->leader->fd_cloexec, sizeof(child->leader->fd_cloexec));
+        child->leader->fds[i] = file_dup(g->fds[i]);
+    memcpy(child->leader->fd_cloexec, g->fd_cloexec, sizeof(child->leader->fd_cloexec));
+    spin_unlock(&g->fd_lock);
     child->leader->umask = parent->leader->umask;
     child->leader->cwd = parent->leader->cwd;
     vfs_ref(child->leader->cwd);

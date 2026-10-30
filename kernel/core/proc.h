@@ -64,6 +64,10 @@ struct proc {
     uint32_t alt_sp, alt_size;  /* this thread's stack for SA_ONSTACK handlers (size 0: none) */
     char *paths[3];             /* user paths copied for the system call in progress (syscall.c) */
     int npaths;
+    struct file *held[2];       /* descriptors the system call in progress looked up, each holding
+                                   a reference until it returns, so that a close in another
+                                   thread cannot free them under it (syscall.c) */
+    int nheld;
     uint32_t esp;               /* saved kernel stack pointer */
     uint8_t *kstack;
     uint32_t *pd;               /* page directory (physical == virtual) */

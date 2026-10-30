@@ -8,8 +8,11 @@
  * Reads are of ibs bytes, writes of obs (bs sets both); skip and seek
  * are in blocks; count is in input blocks.
  */
+#define _LARGEFILE64_SOURCE             /* lseek64 on a host's C library too */
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +38,8 @@ static long long parse_size(const char *s)
         }
         if (*end == 'B')
             end++;
+        if (v < 0 || (v && total > LLONG_MAX / v))
+            return -1;                  /* negative, or too big to be a size */
         total *= v;
         if (*end == 'x')
             end++;
@@ -48,7 +53,10 @@ static long long parse_size(const char *s)
 int main(int argc, char **argv)
 {
     const char *in_name = NULL, *out_name = NULL;
+    /* count -1 copies everything: only leaving count out may ask for that,
+     * never a count that fails to parse (count=1O must not wipe a disk) */
     long long ibs = 512, obs = 512, count = -1, skip = 0, seek = 0;
+    int have_count = 0;
     int notrunc = 0, sync_pad = 0, noerror = 0, do_fsync = 0, quiet = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *eq = strchr(a, '=');
@@ -63,7 +71,7 @@ int main(int argc, char **argv)
         else if (!strncmp(a, "bs", kl) && kl == 2) ibs = obs = parse_size(v);
         else if (!strncmp(a, "ibs", kl) && kl == 3) ibs = parse_size(v);
         else if (!strncmp(a, "obs", kl) && kl == 3) obs = parse_size(v);
-        else if (!strncmp(a, "count", kl) && kl == 5) count = parse_size(v);
+        else if (!strncmp(a, "count", kl) && kl == 5) { count = parse_size(v); have_count = 1; }
         else if (!strncmp(a, "skip", kl) && kl == 4) skip = parse_size(v);
         else if (!strncmp(a, "seek", kl) && kl == 4) seek = parse_size(v);
         else if (!strncmp(a, "status", kl) && kl == 6) quiet = !strcmp(v, "none") || !strcmp(v, "noxfer");
@@ -84,7 +92,8 @@ int main(int argc, char **argv)
             fprintf(stderr, "dd: unrecognized operand '%s'\n", a);
             return 1;
         }
-        if (ibs <= 0 || obs <= 0 || skip < 0 || seek < 0) {
+        if (ibs <= 0 || obs <= 0 || ibs > INT_MAX || obs > INT_MAX || skip < 0 || seek < 0 ||
+            (have_count && count < 0) || skip > LLONG_MAX / ibs || seek > LLONG_MAX / obs) {
             fprintf(stderr, "dd: invalid number: '%s'\n", v);
             return 1;
         }
@@ -99,7 +108,7 @@ int main(int argc, char **argv)
         return 1;
     }
     if (skip) {
-        if (lseek(in, (off_t)(skip * ibs), SEEK_SET) < 0) {
+        if (lseek64(in, (off64_t)(skip * ibs), SEEK_SET) < 0) {
             char *junk = malloc((size_t)ibs);
             for (long long k = 0; k < skip; k++)
                 if (read(in, junk, (size_t)ibs) <= 0)
@@ -108,11 +117,15 @@ int main(int argc, char **argv)
         }
     }
     if (seek) {
-        if (lseek(out, (off_t)(seek * obs), SEEK_SET) < 0) {
+        /* 64-bit: off_t is 32 bits here, and seek=4608 bs=1M must not
+         * wrap to 512 MiB on a disk */
+        if (lseek64(out, (off64_t)(seek * obs), SEEK_SET) < 0) {
             fprintf(stderr, "dd: cannot seek '%s': %s\n", out_name ? out_name : "stdout", strerror(errno));
             return 1;
         }
-        if (!notrunc && out_name)
+        /* ftruncate takes an off_t: past its range, leave the file as it is
+         * rather than cut it at a wrapped size */
+        if (!notrunc && out_name && (off64_t)(seek * obs) == (off64_t)(off_t)(seek * obs))
             (void)!ftruncate(out, (off_t)(seek * obs));
     }
     char *ibuf = malloc((size_t)ibs), *obuf = malloc((size_t)obs);

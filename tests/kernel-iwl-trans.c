@@ -1,4 +1,5 @@
 #include "kernel-test.h"
+#include <sys/mman.h>
 #include "../kernel/wifi/iwl_trans.c"
 struct iwl_dev iwl;
 volatile uint32_t ticks;
@@ -21,6 +22,25 @@ void udelay(uint32_t us)
         iwl_write32(CSR_RESET, 0);
         reset_seen++;
     }
+}
+/* Pages for a TX queue, low enough for the 32-bit physical addresses the
+ * transport keeps; the firmware's reply is staged and delivered while the
+ * command waits, where the kernel would sleep. */
+static int pages_freed;
+uint32_t pmm_alloc_contig(uint32_t frames)
+{
+    void *p = mmap(NULL, frames * PAGE_SIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_32BIT, -1, 0);
+    CHECK(p != MAP_FAILED && (uintptr_t)p <= UINT32_MAX);
+    return (uint32_t)(uintptr_t)p;
+}
+void pmm_free(uint32_t phys) { CHECK(munmap((void *)(uintptr_t)phys, PAGE_SIZE) == 0); pages_freed++; }
+static uint8_t reply[16]; static uint32_t reply_len;
+int sleep_ticks(uint32_t n)
+{
+    uint8_t buf[32] = {0}; struct iwl_rx_packet *p = (void *)buf;
+    p->cmd = t.sync.cmd; p->group = t.sync.group; p->sequence = t.sync.seq;
+    p->len_n_flags = 4 + reply_len; memcpy(p->data, reply, reply_len);
+    packet(p); return 0;
 }
 static void setup(void)
 {
@@ -102,5 +122,17 @@ int main(void)
     used[64+4]=1; closed=3;
     rxp->len_n_flags=4; rxp->cmd=0x55; rxp->sequence=SEQ_RX_FRAME;
     iwl_trans_service(); CHECK(dispatched==1 && !errors);
+    /* A TX queue: the firmware's 8-byte reply carries the queue number and,
+     * after the flags, the write pointer. */
+    setup(); t.used.p=used; t.rbd.p=rbd; t.status.p=(void*)&closed; closed=0;
+    pages_freed=0; memset(reply,0,sizeof(reply)); reply[0]=7; reply[4]=5; reply_len=8;
+    CHECK(iwl_trans_alloc_txq(0,15)==0);
+    CHECK(t.tx[0].active && t.tx[0].id==7 && t.tx[0].read==5 && t.tx[0].write==5 && t.tx[0].tid==15);
+    CHECK(!iwl.dead && !pages_freed);
+    CHECK(iwl_trans_alloc_txq(0,16)==-EINVAL);
+    /* A reply we cannot read means the firmware may own the queue: quarantine, never free. */
+    setup(); t.used.p=used; t.rbd.p=rbd; t.status.p=(void*)&closed; closed=0;
+    pages_freed=0; reply_len=12;
+    CHECK(iwl_trans_alloc_txq(0,15)<0 && iwl.dead && !pages_freed);
     puts("kernel-iwl-trans: all passed"); return 0;
 }

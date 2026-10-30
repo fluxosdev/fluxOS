@@ -29,6 +29,7 @@
 #define FAT_MASK  0x0FFFFFFFu
 #define FAT_EOC   0x0FFFFFF8u
 #define FAT_END   0x0FFFFFFFu
+#define FAT_EIO   0xFFFFFFFFu   /* fat_get: the FAT could not be read (is_end, but not the end) */
 #define FIXED_ROOT 1u            /* "first cluster" of a FAT12/16 root directory */
 #define LFN_CHARS 13
 #define MAX_DIR_BYTES (4u << 20)
@@ -221,17 +222,19 @@ static int fat_write16(struct fat_fs *f, uint32_t base, uint32_t off, uint32_t m
     return 0;
 }
 
-/* Entries are returned in FAT32's range: end of chain is >= FAT_EOC. */
+/* Entries are returned in FAT32's range: end of chain is >= FAT_EOC.
+ * A read error is FAT_EIO, which ends a walk like the end of the chain but
+ * must not be taken for it by anything that changes the chain. */
 static uint32_t fat_get(struct fat_fs *f, uint32_t c)
 {
     uint32_t off = fat_offset(f, c);
     if (f->bits == 32) {
         const uint8_t *s = meta_read(f, f->reserved + off / 512);
-        return s ? rd32(s + off % 512) & FAT_MASK : FAT_END;
+        return s ? rd32(s + off % 512) & FAT_MASK : FAT_EIO;
     }
     uint32_t v;
     if (fat_read16(f, f->reserved, off, &v) < 0)
-        return FAT_END;
+        return FAT_EIO;
     if (f->bits == 12) {
         v = (c & 1) ? v >> 4 : v & 0xFFF;
         return v >= 0xFF7 ? v | 0x0FFFF000u : v;
@@ -345,7 +348,7 @@ static int free_chain(struct fat_fs *f, uint32_t c)
 {
     for (uint32_t guard = 0; !is_end(f, c) && guard < f->nclusters; guard++) {
         uint32_t next = fat_get(f, c);
-        if (fat_set(f, c, 0) < 0)
+        if (next == FAT_EIO || fat_set(f, c, 0) < 0)
             return -EIO;
         if (f->free_count != 0xFFFFFFFFu)
             f->free_count++;
@@ -375,6 +378,8 @@ static uint32_t node_cluster(struct fat_fs *f, struct fat_node *n, uint32_t idx,
     }
     while (i < idx) {
         uint32_t next = fat_get(f, c);
+        if (next == FAT_EIO)
+            return 0;                   /* not the end: extending here would cut the chain */
         if (is_end(f, next)) {
             if (!alloc)
                 return 0;
@@ -424,6 +429,10 @@ static int read_dir(struct fat_fs *f, uint32_t first, uint8_t **out, uint32_t *l
         }
         size += f->cluster_bytes;
         c = fat_get(f, c);
+        if (c == FAT_EIO) {
+            kfree(buf);
+            return -EIO;
+        }
     }
     *out = buf;
     *len = size;
@@ -905,7 +914,7 @@ static int fat_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
             uint32_t run = 1, last = c;
             while ((run + 1) * cb <= n - done && run < 32) {
                 uint32_t next = fat_get(f, last);
-                if (next != last + 1)
+                if (is_end(f, next) || next != last + 1)
                     break;
                 last = next;
                 run++;
@@ -1022,7 +1031,9 @@ static int fat_truncate(struct vnode *vn, uint32_t size)
                 r = -EIO;
             } else {
                 tail = fat_get(f, c);
-                if (!is_end(f, tail))
+                if (tail == FAT_EIO)
+                    r = -EIO;
+                else if (!is_end(f, tail))
                     r = fat_set(f, c, FAT_END);
             }
         }

@@ -516,6 +516,9 @@ void smp_flush_tlb(uint32_t *pd)
 {
     if (ncpus < 2)
         return;
+    /* The page-table change must be visible before c->pd is read; pairs
+     * with vmm_switch storing c->pd before it loads CR3. */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     uint32_t flags = irq_save();
     struct cpu *self = this_cpu();
     for (int i = 0; i < ncpus; i++) {

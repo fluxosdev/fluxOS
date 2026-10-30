@@ -504,7 +504,12 @@ static void dhcp_send(uint8_t type)
     m.htype = 1;
     m.hlen = ETH_ALEN;
     m.xid = htonl(dhcp.xid);
-    m.flags = htons(0x8000);            /* we cannot take unicasts yet: broadcast the reply */
+    /* Ask for a unicast reply on wireless: a broadcast reply would be
+     * group-encrypted (GTK), the most fragile RX path, and the server
+     * reaches us by chaddr without ARP. Our IP input accepts a unicast
+     * reply before we have an address. Wired keeps the broadcast flag. */
+    int wireless = !strncmp(netif.dev.name, "wlan", 4);
+    m.flags = wireless ? 0 : htons(0x8000);
     if (dhcp.state == DHCP_RENEWING)
         m.ciaddr = htonl(netif.ip);
     memcpy(m.chaddr, netif.dev.mac, ETH_ALEN);
@@ -625,6 +630,21 @@ void dhcp_input(const uint8_t *data, uint32_t len)
         if (!renewed)
             klog("net: DHCP gave us " IP_FMT "/" IP_FMT ", gateway " IP_FMT ", DNS " IP_FMT "\n",
                  IP_ARGS(netif.ip), IP_ARGS(netif.mask), IP_ARGS(netif.gw), IP_ARGS(netif.dns));
+        if (!netif.dns) {
+            /* No DNS server: show which options the ACK did carry, so a
+             * missing option 6 is told apart from one we failed to read. */
+            char codes[96];
+            uint32_t n = 0;
+            const uint8_t *p = m->options, *end = (const uint8_t *)m + len;
+            while (p < end && *p != OPT_END && n < sizeof(codes) - 5) {
+                if (*p == OPT_PAD) { p++; continue; }
+                if (p + 2 > end || p + 2 + p[1] > end)
+                    break;
+                n += (uint32_t)snprintf(codes + n, sizeof(codes) - n, "%u ", *p);
+                p += 2 + p[1];
+            }
+            klog("net: DHCP ACK carried no DNS server; options present: %s\n", codes);
+        }
     } else if (type == DHCPNAK && dhcp.state != DHCP_SELECTING) {
         klog("net: DHCP server refused our address, starting over\n");
         netif.ip = 0;

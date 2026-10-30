@@ -113,9 +113,51 @@ static int user_path(char **out, uint32_t uptr)
             return _r;                                  \
     } while (0)
 
+/*
+ * The file behind descriptor fd, held until the system call returns: the
+ * descriptor table is shared by the process's threads, and another one may
+ * close fd (dropping the table's reference) while this call still uses it.
+ */
 static struct file *get_file(uint32_t fd)
 {
-    return fd < MAX_FDS ? current->leader->fds[fd] : NULL;
+    if (fd >= MAX_FDS)
+        return NULL;
+    struct proc *g = current->leader;
+    spin_lock(&g->fd_lock);
+    struct file *f = file_dup(g->fds[fd]);
+    spin_unlock(&g->fd_lock);
+    if (!f)
+        return NULL;
+    if (current->nheld >= (int)(sizeof(current->held) / sizeof(current->held[0])))
+        panic("get_file: more than %d descriptors in one system call", current->nheld);
+    current->held[current->nheld++] = f;
+    return f;
+}
+
+/* The end of a system call: the references get_file took. */
+static void put_held_files(void)
+{
+    while (current->nheld > 0) {
+        struct file *f = current->held[--current->nheld];
+        current->held[current->nheld] = NULL;
+        file_close(f);
+    }
+}
+
+/* Clear slot fd if it still holds f (an error path giving back a descriptor
+ * it just made); 0 if another thread closed or replaced it meanwhile. */
+static int fd_take_back(int fd, struct file *f)
+{
+    struct proc *g = current->leader;
+    int took = 0;
+    spin_lock(&g->fd_lock);
+    if (fd >= 0 && fd < MAX_FDS && g->fds[fd] == f) {
+        g->fds[fd] = NULL;
+        fd_cloexec_set(g, fd, 0);
+        took = 1;
+    }
+    spin_unlock(&g->fd_lock);
+    return took;
 }
 
 /* (The descriptor table is the process's: its threads take and free slots under fd_lock.) */
@@ -831,9 +873,10 @@ static int sys_dup(uint32_t fd, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
     struct file *f = get_file(fd);
     if (!f)
         return -EBADF;
+    file_dup(f);                        /* the new slot's, before another thread can close it */
     int nfd = alloc_fd(f);
-    if (nfd >= 0)
-        file_dup(f);
+    if (nfd < 0)
+        file_close(f);
     return nfd;
 }
 
@@ -866,16 +909,21 @@ static int sys_fcntl(uint32_t fd, uint32_t cmd, uint32_t arg, uint32_t d, uint32
     switch (cmd) {
     case F_DUPFD:
     case F_DUPFD_CLOEXEC: {
+        file_dup(f);                    /* the new slot's, before another thread can close it */
         int nfd = alloc_fd_from(f, (int)arg, cmd == F_DUPFD_CLOEXEC);
-        if (nfd >= 0)
-            file_dup(f);
+        if (nfd < 0)
+            file_close(f);
         return nfd;
     }
     case F_GETFD:
         return fd_cloexec_get(current, (int)fd) ? FD_CLOEXEC : 0;
-    case F_SETFD:
-        fd_cloexec_set(current, (int)fd, (arg & FD_CLOEXEC) != 0);
+    case F_SETFD: {
+        struct proc *g = current->leader;
+        spin_lock(&g->fd_lock);         /* the bits share words with other descriptors' */
+        fd_cloexec_set(g, (int)fd, (arg & FD_CLOEXEC) != 0);
+        spin_unlock(&g->fd_lock);
         return 0;
+    }
     case F_GETFL:
         return f->flags & ~O_CLOEXEC;
     case F_SETFL:
@@ -900,12 +948,11 @@ static int sys_pipe(uint32_t ufds, uint32_t b, uint32_t c, uint32_t d, uint32_t 
     int fds[2] = { fd0, fd1 };
     int r2 = fd1 < 0 ? -EMFILE : copy_to_user((void *)ufds, fds, sizeof(fds));
     if (r2 < 0) {
-        if (fd0 >= 0)
-            current->leader->fds[fd0] = NULL;
-        if (fd1 >= 0)
-            current->leader->fds[fd1] = NULL;
-        file_close(rd);
-        file_close(wr);
+        /* A slot another thread already closed gave its file back itself. */
+        if (fd0 < 0 || fd_take_back(fd0, rd))
+            file_close(rd);
+        if (fd1 < 0 || fd_take_back(fd1, wr))
+            file_close(wr);
         return r2;
     }
     return 0;
@@ -925,12 +972,11 @@ static int sys_openpty(uint32_t ufds, uint32_t b, uint32_t c, uint32_t d, uint32
     int fds[2] = { fd0, fd1 };
     int r2 = fd1 < 0 ? -EMFILE : copy_to_user((void *)ufds, fds, sizeof(fds));
     if (r2 < 0) {
-        if (fd0 >= 0)
-            current->leader->fds[fd0] = NULL;
-        if (fd1 >= 0)
-            current->leader->fds[fd1] = NULL;
-        file_close(master);
-        file_close(slave);
+        /* A slot another thread already closed gave its file back itself. */
+        if (fd0 < 0 || fd_take_back(fd0, master))
+            file_close(master);
+        if (fd1 < 0 || fd_take_back(fd1, slave))
+            file_close(slave);
         return r2;
     }
     return 0;
@@ -1236,7 +1282,7 @@ static int sys_times(uint32_t ubuf, uint32_t b, uint32_t c, uint32_t d, uint32_t
 
 /* ---- sockets ---- */
 
-static int get_socket(uint32_t fd, struct socket **out)
+static int get_socket_file(uint32_t fd, struct socket **out, struct file **fout)
 {
     struct file *f = get_file(fd);
     if (!f)
@@ -1244,7 +1290,14 @@ static int get_socket(uint32_t fd, struct socket **out)
     if (f->type != FT_SOCKET)
         return -ENOTSOCK;
     *out = f->sock;
+    if (fout)
+        *fout = f;
     return 0;
+}
+
+static int get_socket(uint32_t fd, struct socket **out)
+{
+    return get_socket_file(fd, out, NULL);
 }
 
 /* Socket addresses are always a struct sockaddr_in; len is only checked. */
@@ -1328,28 +1381,30 @@ static int sys_accept(uint32_t fd, uint32_t uaddr, uint32_t c, uint32_t d, uint3
 static int sys_sendto(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, uint32_t uaddr)
 {
     struct socket *s;
+    struct file *f;
     struct sockaddr_in sin;
-    int r = get_socket(fd, &s);
+    int r = get_socket_file(fd, &s, &f);
     if (r < 0)
         return r;
     if (user_check((void *)buf, n) < 0)
         return -EFAULT;
     if (uaddr && (r = copy_sockaddr(uaddr, sizeof(sin), &sin)) < 0)
         return r;
-    int sflags = (int)flags | ((get_file(fd)->flags & O_NONBLOCK) ? MSG_DONTWAIT : 0);
+    int sflags = (int)flags | ((f->flags & O_NONBLOCK) ? MSG_DONTWAIT : 0);
     return sock_sendto(s, (const void *)buf, n, sflags, uaddr ? &sin : NULL);
 }
 
 static int sys_recvfrom(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, uint32_t uaddr)
 {
     struct socket *s;
+    struct file *f;
     struct sockaddr_in sin;
-    int r = get_socket(fd, &s);
+    int r = get_socket_file(fd, &s, &f);
     if (r < 0)
         return r;
     if (user_check_w((void *)buf, n) < 0 || (uaddr && user_check_w((void *)uaddr, sizeof(sin)) < 0))
         return -EFAULT;
-    int sflags = (int)flags | ((get_file(fd)->flags & O_NONBLOCK) ? MSG_DONTWAIT : 0);
+    int sflags = (int)flags | ((f->flags & O_NONBLOCK) ? MSG_DONTWAIT : 0);
     r = sock_recvfrom(s, (void *)buf, n, sflags, uaddr ? &sin : NULL);
     if (r >= 0 && uaddr)
         copy_to_user((void *)uaddr, &sin, sizeof(sin));    /* checked above; the data is already taken */
@@ -1667,7 +1722,21 @@ static int sys_display(uint32_t op, uint32_t uarg, uint32_t c, uint32_t d, uint3
     }
     if ((writes ? user_check_w((void *)uarg, size) : user_check((const void *)uarg, size)) < 0)
         return -EFAULT;
-    return fb_display((int)op, (void *)uarg);
+    /* The drivers work on a private copy: they check fields and use them
+     * again later, and another thread could change the caller's memory in
+     * between, or unmap it while the driver sleeps. */
+    void *karg = kmalloc(size);
+    if (!karg)
+        return -ENOMEM;
+    if (copy_from_user(karg, (const void *)uarg, size) < 0) {
+        kfree(karg);
+        return -EFAULT;
+    }
+    int r = fb_display((int)op, karg);
+    if (writes && copy_to_user((void *)uarg, karg, size) < 0)
+        r = -EFAULT;
+    kfree(karg);
+    return r;
 }
 
 static int sys_reboot(uint32_t cmd, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
@@ -1832,4 +1901,5 @@ void syscall_dispatch(struct trapframe *tf)
     tf->eax = (uint32_t)syscalls[n](tf->ebx, tf->ecx, tf->edx, tf->esi, tf->edi);
     if (takes_vfs_lock[n])
         vfs_unlock();
+    put_held_files();                   /* after the lock: a last close may take it */
 }

@@ -2152,10 +2152,39 @@ static int one_request(struct http_client *cl, const struct http_request *rq, co
     return 0;
 }
 
-int http_fetch(struct http_client *cl, const struct http_request *rq, struct http_response *rs)
+/* Whether a caller's request line carries credentials, which go only to
+ * the origin the caller named: not to wherever a redirect points. */
+static int credential_header(const char *line)
+{
+    static const char *const names[] = { "Authorization", "Proxy-Authorization", "Cookie" };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        size_t nl = strlen(names[i]);
+        if (!strncasecmp(line, names[i], nl) && line[nl] == ':')
+            return 1;
+    }
+    return 0;
+}
+
+static int same_origin(const char *a, const char *b)
+{
+    struct url ua, ub;
+    char oa[300], ob[300];
+    if (parse_url(a, &ua) < 0 || parse_url(b, &ub) < 0)
+        return 0;
+    origin(&ua, oa, sizeof(oa));
+    origin(&ub, ob, sizeof(ob));
+    return !strcmp(oa, ob);
+}
+
+int http_fetch(struct http_client *cl, const struct http_request *rq_in, struct http_response *rs)
 {
     memset(rs, 0, sizeof(*rs));
     rs->length = -1;
+    /* rq is rq_in until a redirect leaves the caller's origin; from then on
+     * it is a copy without the credential headers (as curl does). */
+    struct http_request stripped;
+    const char **kept = NULL;
+    const struct http_request *rq = rq_in;
     const char *method = rq->method && *rq->method ? rq->method : "GET";
     char url[2048], next[2048];
     snprintf(url, sizeof(url), "%s", rq->url);
@@ -2169,6 +2198,7 @@ int http_fetch(struct http_client *cl, const struct http_request *rq, struct htt
         one.length = -1;
         if (one_request(cl, rq, url, verb, body, blen, hops < rq->max_redirects, &one) < 0) {
             memcpy(rs, &one, sizeof(*rs));
+            free(kept);
             return -1;
         }
         char loc[2048];
@@ -2183,11 +2213,27 @@ int http_fetch(struct http_client *cl, const struct http_request *rq, struct htt
                 body = NULL;
                 blen = 0;
             }
+            if (rq == rq_in && rq->nheaders > 0 && !same_origin(rq_in->url, next)) {
+                kept = malloc(sizeof(*kept) * (size_t)rq->nheaders);
+                if (!kept) {
+                    http_response_free(&one);
+                    set_err(rs, "out of memory");
+                    return -1;
+                }
+                stripped = *rq_in;
+                stripped.nheaders = 0;
+                for (int i = 0; i < rq_in->nheaders; i++)
+                    if (!credential_header(rq_in->headers[i]))
+                        kept[stripped.nheaders++] = rq_in->headers[i];
+                stripped.headers = kept;
+                rq = &stripped;
+            }
             snprintf(url, sizeof(url), "%s", next);
             http_response_free(&one);
             continue;
         }
         memcpy(rs, &one, sizeof(*rs));
+        free(kept);
         return 0;
     }
 }

@@ -22,9 +22,17 @@
 #define SCAN_ABORT 0x0e
 #define SESSION_PROTECT 0x05
 #define SEC_KEY 0x18
+#define RLC_CONFIG 0x08
+#define MGMT_TID 15                     /* the queue for management and non-QoS frames */
 #define RX_MPDU 0xc1
 #define SCAN_COMPLETE 0x0f
 #define SCAN_ITER_COMPLETE 0xb5
+/* LINK_CONFIG modify_mask bits */
+#define LINK_ACTIVE 0x01
+#define LINK_RATES 0x02
+#define LINK_PROTECTION 0x04
+#define LINK_QOS 0x08
+#define LINK_BEACON_TIMING 0x10
 #define NVM_VALID 1
 #define NVM_ACTIVE 8
 #define NVM_RADAR 16
@@ -39,6 +47,7 @@ void iwl_free_file(uint8_t *buf, uint32_t pages);
 static struct wifi_hw hw;
 static struct {
     int ready, mac, link, phy, sta, active, scanning, protection, failed;
+    int link_phy, link_active;          /* the link is bound to the PHY context, and active */
     int txq;
     uint16_t aid, sequence;
     uint32_t scan_uid, scan_deadline;
@@ -66,14 +75,17 @@ static int mac_config(int action, int associated)
     c.client.is_assoc = associated; c.client.assoc_id = st.aid;
     return send(GRP_MAC_CONF, MAC_CONFIG, &c, sizeof(c));
 }
-static int link_config(int action, int active)
+/* The PHY context is bound (phy_id) only while the link is inactive, and
+ * the firmware ignores a change of it once active, so as Linux does: bind
+ * with an empty mask, then activate, and the reverse on the way down. */
+static int link_config(int action, int active, uint32_t mask)
 {
     struct iwl_link_config_cmd c = { 0 };
     c.action = action;
     c.phy_id = st.phy ? 0 : 0xffffffff;
     memcpy(c.local_link_addr, iwl.mac, 6);
     c.active = active;
-    if (action == MODIFY) c.modify_mask = 0x1f; /* active, rates, protection, QoS, beacons */
+    if (action == MODIFY) c.modify_mask = mask;
     c.cck_rates = st.bss.band == BAND_2GHZ ? 0xf : 0;
     c.ofdm_rates = 0x15; /* mandatory OFDM 6, 12, 24 Mbps */
     c.cck_short_preamble = !!(st.bss.capab & CAP_SHORT_PREAMBLE);
@@ -91,12 +103,14 @@ static int phy_config(int action)
     struct iwl_phy_context_cmd c = { 0 };
     c.action = action; c.ci.channel = st.bss.channel;
     c.ci.band = st.bss.band == BAND_2GHZ ? 1 : 0;
-    /* API 4 uses a separate RX chain command; rxchain_info is reserved. */
+    /* API 4 uses a separate RX chain command (RLC_CONFIG v2: phy_id, then
+     * rx_chain_info); rxchain_info here is reserved. As Linux, after every
+     * add or modify: valid antennas, one static and one MIMO chain. */
     int r = send(GRP_LONG, PHY_CONFIG, &c, sizeof(c));
-    if (!r && action == ADD && iwl_fw_cmd_ver(&iwl.fw, GRP_DATA_PATH, 0x0f) == 2) {
+    if (!r && action != REMOVE && iwl_fw_cmd_ver(&iwl.fw, GRP_DATA_PATH, RLC_CONFIG) >= 2) {
         uint32_t rlc[8] = { 0 };
         rlc[1] = (uint32_t)iwl.rx_ant << 1 | 1u << 10 | 1u << 12;
-        r = send(GRP_DATA_PATH, 0x0f, rlc, sizeof(rlc));
+        r = send(GRP_DATA_PATH, RLC_CONFIG, rlc, sizeof(rlc));
     }
     return r;
 }
@@ -118,6 +132,9 @@ static int protect(int action)
     int r = send(GRP_MAC_CONF, SESSION_PROTECT, &c, sizeof(c));
     if (action != ADD) return r;
     if (r < 0) { iwl_notif_cancel(&wait); return r; }
+    /* Accepted: the firmware holds it until told otherwise, whatever the
+     * notification says, so leave() must cancel it even if we give up. */
+    st.protection = 1;
     r = iwl_notif_wait(&wait, 1000);
     if (r < 0 || wait.len != 16 || !rd32(notification + 4) || !rd32(notification + 8)) return -EIO;
     return 0;
@@ -133,9 +150,12 @@ static void leave(void)
     st.txq = -1;
     if (st.sta && !iwl.dead) { uint32_t id = 0; send(GRP_MAC_CONF, STA_REMOVE, &id, 4); }
     st.sta = 0;
-    if (st.link && !iwl.dead) link_config(MODIFY, 0);
+    if (st.link_active && !iwl.dead) link_config(MODIFY, 0, LINK_ACTIVE);
+    st.link_active = 0;
     if (st.phy && !iwl.dead) phy_config(REMOVE);
     st.phy = 0;
+    if (st.link_phy && !iwl.dead) link_config(MODIFY, 0, 0);    /* unbind */
+    st.link_phy = 0;
     if (st.mac && !iwl.dead) mac_config(MODIFY, 0);
     st.aid = 0;
     memset(st.key_valid, 0, sizeof(st.key_valid));
@@ -203,17 +223,21 @@ static int join(const struct wifi_bss *b)
     int r = phy_config(ADD);
     if (r < 0) goto fail;
     st.phy = 1;
-    r = link_config(MODIFY, 1);
+    r = link_config(MODIFY, 0, 0);                              /* bind */
     if (r < 0) goto fail;
+    st.link_phy = 1;
+    r = link_config(MODIFY, 1, LINK_ACTIVE | LINK_RATES);
+    if (r < 0) goto fail;
+    st.link_active = 1;
     r = sta_config();
     if (r < 0) goto fail;
     st.sta = 1;
-    r = iwl_trans_alloc_txq(0, 16); /* non-QoS, also management */
+    r = iwl_trans_alloc_txq(0, MGMT_TID);
     if (r < 0) goto fail;
     st.txq = r;
     r = protect(ADD);
     if (r < 0) goto fail;
-    st.protection = 1; st.active = 1;
+    st.active = 1;
     return 0;
 fail:
     leave(); return r;
@@ -223,7 +247,7 @@ static int associated(const struct wifi_bss *b, uint16_t aid)
     if (!st.active) return -ENETDOWN;
     st.bss = *b; st.aid = aid;
     int r = sta_config();
-    if (!r) r = link_config(MODIFY, 1);
+    if (!r) r = link_config(MODIFY, 1, LINK_RATES | LINK_PROTECTION | LINK_QOS | LINK_BEACON_TIMING);
     if (!r) r = mac_config(MODIFY, 1);
     return r;
 }
@@ -243,23 +267,22 @@ static int tx_frame(const uint8_t *frame, uint32_t len, int encrypt)
     uint8_t f[1816], cmd[28] = { 0 };
     spin_lock(&sta_lock);
     if (!st.active || (encrypt && !st.key_valid[0])) { spin_unlock(&sta_lock); return -ENETDOWN; }
-    uint32_t iv = encrypt ? 8 : 0;
-    memcpy(f, frame, HDR_LEN);
+    memcpy(f, frame, len);
     uint16_t sequence = (st.sequence++ & 0xfff) << 4;
     memcpy(f + 22, &sequence, 2);
-    if (encrypt) {
-        f[1] |= FC_PROTECTED;
-        memset(f + HDR_LEN, 0, 8); f[HDR_LEN + 3] = 0x20;
-    }
-    memcpy(f + HDR_LEN + iv, frame + HDR_LEN, len - HDR_LEN);
-    uint16_t n = len + iv, flags = 1 | (encrypt ? 0 : 2); /* explicit rate, optional encryption */
+    /* New TX API (AX210): the firmware inserts the CCMP header and MIC
+     * itself, from the key's own PN counter, so the frame goes without
+     * IV space and the header size excludes it. Only the Protected bit
+     * tells it to encrypt; ENCRYPT_DIS (flag bit 1) sends in the clear. */
+    if (encrypt) f[1] |= FC_PROTECTED;
+    uint16_t n = len, flags = 1 | (encrypt ? 0 : 2); /* explicit rate, optional encryption */
     memcpy(cmd, &n, 2); memcpy(cmd + 2, &flags, 2);
-    uint32_t offload = ((HDR_LEN + iv) / 2) << 8;
+    uint32_t offload = (HDR_LEN / 2) << 8;
     memcpy(cmd + 4, &offload, 4);
     uint32_t ant = (iwl.tx_ant & 1) ? 1 : 2;
     uint32_t rate = (ant << 14) | (st.bss.band == BAND_5GHZ ? 1u << 8 : 0);
     memcpy(cmd + 16, &rate, 4); /* new rate encoding: 1 Mbps CCK / 6 Mbps OFDM */
-    int r = iwl_trans_tx(st.txq, cmd, f, HDR_LEN + iv, n);
+    int r = iwl_trans_tx(st.txq, cmd, f, HDR_LEN, n);
     spin_unlock(&sta_lock); return r;
 }
 static int tx_mgmt(const uint8_t *f, uint32_t n) { return tx_frame(f, n, 0); }
@@ -382,7 +405,7 @@ static int start(void)
     r = mac_config(ADD, 0);
     if (r < 0) goto fail;
     st.mac = 1;
-    r = link_config(ADD, 0);
+    r = link_config(ADD, 0, 0);
     if (r < 0) goto fail;
     st.link = 1; st.ready = 1;
     return 0;

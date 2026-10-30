@@ -13,11 +13,66 @@ int iwl_chan_index(int channel, int band)
 { return band == BAND_2GHZ ? channel - 1 : channel == 36 ? 14 : channel == 52 ? 18 : -1; }
 int iwl_chan_from_index(int idx, int *band)
 { *band = idx < 14 ? BAND_2GHZ : BAND_5GHZ; return idx < 14 ? idx + 1 : 36; }
+/* Commands other than scans are logged as group:cmd, and LINK_CONFIG
+ * also as its phy_id, active flag and modify mask. */
+static struct { uint8_t g, c; uint32_t phy, active, mask; } cmds[16];
+static int ncmds;
 int iwl_send_cmd(uint8_t g, uint8_t c, const void *p, uint32_t n,
                  void *resp, uint32_t size, uint32_t *got)
 {
-    CHECK(g == GRP_LONG && c == SCAN_REQ && n == sizeof(scan_command));
-    memcpy(&scan_command, p, n); return 0;
+    if (g == GRP_LONG && c == SCAN_REQ) {
+        CHECK(n == sizeof(scan_command));
+        memcpy(&scan_command, p, n); return 0;
+    }
+    CHECK(ncmds < 16);
+    cmds[ncmds].g = g; cmds[ncmds].c = c;
+    if (g == GRP_MAC_CONF && c == LINK_CONFIG) {
+        const struct iwl_link_config_cmd *l = p;
+        cmds[ncmds].phy = l->phy_id; cmds[ncmds].active = l->active;
+        cmds[ncmds].mask = l->modify_mask;
+    }
+    ncmds++; return 0;
+}
+int iwl_fw_cmd_ver(const struct iwl_fw *fw, uint8_t g, uint8_t c) { (void)fw; return 3; }
+static int queue_tid = -1;
+int iwl_trans_alloc_txq(int sta_id, int tid) { queue_tid = tid; return 1; }
+void iwl_trans_free_txq(int txq) {}
+static struct iwl_notif_wait *armed;
+void iwl_notif_arm(struct iwl_notif_wait *w, uint8_t group, uint8_t cmd, void *buf, uint32_t size)
+{ w->buf = buf; w->size = size; armed = w; }
+int iwl_notif_wait(struct iwl_notif_wait *w, uint32_t timeout_ms)
+{   /* session protection started: id and status nonzero */
+    memset(w->buf, 0, 16); w->buf[4] = w->buf[8] = 1; w->len = 16; return 0;
+}
+void iwl_notif_cancel(struct iwl_notif_wait *w) {}
+static int is_link(int i, uint32_t phy, uint32_t active, uint32_t mask)
+{
+    return cmds[i].g == GRP_MAC_CONF && cmds[i].c == LINK_CONFIG && cmds[i].phy == phy &&
+           cmds[i].active == active && cmds[i].mask == mask;
+}
+static void join_test(void)
+{
+    struct wifi_bss b = { 0 };
+    b.channel = 52; b.band = BAND_5GHZ;
+    ncmds = 0;
+    CHECK(join(&b) == 0);
+    /* PHY context and its RX chains, then bind the link, then activate. */
+    CHECK(ncmds >= 5 && cmds[0].g == GRP_LONG && cmds[0].c == PHY_CONFIG);
+    CHECK(cmds[1].g == GRP_DATA_PATH && cmds[1].c == RLC_CONFIG);
+    CHECK(is_link(2, 0, 0, 0));
+    CHECK(is_link(3, 0, 1, LINK_ACTIVE | LINK_RATES));
+    CHECK(queue_tid == MGMT_TID);     /* the firmware asserts on TID 16 */
+    ncmds = 0;
+    leave();
+    /* Deactivate, remove the PHY context, then unbind the link. */
+    int deact = -1, phy_rm = -1, unbind = -1;
+    for (int i = 0; i < ncmds; i++) {
+        if (is_link(i, 0, 0, LINK_ACTIVE)) deact = i;
+        if (cmds[i].g == GRP_LONG && cmds[i].c == PHY_CONFIG) phy_rm = i;
+        if (is_link(i, 0xffffffff, 0, 0)) unbind = i;
+    }
+    CHECK(deact >= 0 && phy_rm > deact && unbind > phy_rm);
+    CHECK(!st.link_phy && !st.link_active && !st.phy);
 }
 void klog(const char *fmt, ...) { (void)fmt; }
 void sleep_on(void *p) { (void)p; abort(); }
@@ -55,9 +110,14 @@ static void tx_test(void)
     CHECK(tx_frame(f,32,0)==0 && sent==1 && last_len==32);
     CHECK(rd16(last_cmd+2)==3);
     st.key_valid[0]=0; CHECK(tx_frame(f,32,1)==-ENETDOWN);
-    st.key_valid[0]=1; CHECK(tx_frame(f,32,1)==0 && sent==2 && last_len==40);
-    CHECK(last_frame[1]&FC_PROTECTED); CHECK(last_frame[27]==0x20);
-    CHECK(rd16(last_cmd)==40 && rd16(last_cmd+2)==1);
+    /* New TX API: the firmware inserts the CCMP header itself. An encrypted
+     * frame must go out at its own length with the body right after the
+     * MAC header, only the Protected bit set, and MH_SIZE of 24 bytes. */
+    f[HDR_LEN]=0x5a;
+    st.key_valid[0]=1; CHECK(tx_frame(f,32,1)==0 && sent==2 && last_len==32);
+    CHECK(last_frame[1]&FC_PROTECTED); CHECK(last_frame[HDR_LEN]==0x5a);
+    CHECK(rd16(last_cmd)==32 && rd16(last_cmd+2)==1);
+    CHECK(rd32(last_cmd+4)==((HDR_LEN/2)<<8));
 }
 int main(void)
 {
@@ -77,6 +137,7 @@ int main(void)
     CHECK(channel_joinable(1,BAND_2GHZ) && channel_joinable(36,BAND_5GHZ));
     CHECK(channel_joinable(52,BAND_5GHZ));
     CHECK(!channel_joinable(2,BAND_2GHZ) && !channel_joinable(165,BAND_5GHZ));
+    st.mac=st.link=1; join_test();
     iwl_have_chan_flags=0; CHECK(!channel_joinable(1,BAND_2GHZ));
     uint8_t packet[64]={0}; struct iwl_rx_packet *p=(void*)packet;
     p->cmd=0x1c; p->len_n_flags=4+47; p->data[0]=1;

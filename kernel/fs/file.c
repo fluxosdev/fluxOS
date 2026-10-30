@@ -259,13 +259,21 @@ int do_poll(struct pollfd *fds, uint32_t nfds, int timeout_ms)
         int n = 0;
         for (uint32_t i = 0; i < nfds; i++) {
             struct pollfd *pfd = &fds[i];
-            struct file *f = pfd->fd >= 0 && pfd->fd < MAX_FDS ? current->leader->fds[pfd->fd] : NULL;
+            struct file *f = NULL;
+            if (pfd->fd >= 0 && pfd->fd < MAX_FDS) {
+                /* held while polled: another thread may close the descriptor */
+                struct proc *g = current->leader;
+                spin_lock(&g->fd_lock);
+                f = file_dup(g->fds[pfd->fd]);
+                spin_unlock(&g->fd_lock);
+            }
             if (pfd->fd < 0)
                 pfd->revents = 0;
             else if (!f)
                 pfd->revents = POLLNVAL;
             else
                 pfd->revents = (int16_t)file_poll(f, pfd->events);
+            file_close(f);
             if (pfd->revents)
                 n++;
         }

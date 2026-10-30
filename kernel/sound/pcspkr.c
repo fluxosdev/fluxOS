@@ -77,9 +77,9 @@ static int queue_tone(uint32_t freq, uint32_t ms)
         return -1;
     if (ms > 60000)
         ms = 60000;
-    queue[qhead].freq = freq;
-    queue[qhead].ms = ms;
-    qhead++;
+    struct spkr_tone *t = &queue[qhead++ % QLEN];
+    t->freq = freq;
+    t->ms = ms;
     if (!playing)
         next_tone();
     return 0;

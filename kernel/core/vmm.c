@@ -12,9 +12,10 @@
  * PTE_MMIO map device memory, lent to one process: never freed, and
  * not copied into a forked child, which has no claim on the device.
  *
- * An address space is loaded on at most one processor, the one running
- * its process, but that need not be this one: a change to another's
- * mappings is flushed there too (smp_flush_tlb).
+ * An address space can be loaded on several processors at once (the
+ * threads of one process share it), so a change to its mappings is
+ * flushed here and on every other processor that has it loaded
+ * (smp_flush_tlb).
  */
 #include "kernel.h"
 #include "drivers.h"
@@ -136,9 +137,11 @@ void *vmm_map_late(uint32_t phys, uint32_t size, uint32_t flags)
 
 void vmm_switch(uint32_t *pd)
 {
+    /* Announce pd before loading it, so that a flush racing with the
+     * switch cannot miss this processor (write_cr3 serializes). */
+    this_cpu()->pd = pd;
     if (read_cr3() != (uint32_t)pd)
         write_cr3((uint32_t)pd);
-    this_cpu()->pd = pd;
 }
 
 uint32_t *vmm_create(void)
@@ -188,8 +191,7 @@ static void flush_page(uint32_t *pd, uint32_t va)
 {
     if (read_cr3() == (uint32_t)pd)
         invlpg(va);
-    else
-        smp_flush_tlb(pd);
+    smp_flush_tlb(pd);              /* other threads of this process */
 }
 
 int vmm_alloc(uint32_t *pd, uint32_t va)
@@ -396,8 +398,7 @@ static void flush_pd(uint32_t *pd)
 {
     if (read_cr3() == (uint32_t)pd)
         write_cr3((uint32_t)pd);
-    else
-        smp_flush_tlb(pd);
+    smp_flush_tlb(pd);              /* other threads of this process */
 }
 
 /* Copy-on-write clone of the user half (fork), without the device memory.

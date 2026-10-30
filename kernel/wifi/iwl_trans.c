@@ -529,25 +529,28 @@ out:
 }
 int iwl_trans_alloc_txq(int sta, int tid)
 {
-    if (sta < 0 || sta >= 32 || tid < 0 || tid > 16) return -EINVAL;
+    if (sta < 0 || sta >= 32 || tid < 0 || tid > 15) return -EINVAL;   /* 15: management */
     int h;
     for (h = 0; h < 2 && t.tx[h].active; h++);
     if (h == 2) return -ENOSPC;
     struct queue *q = &t.tx[h];
     if (queue_alloc(q) < 0) { queue_free(q); return -ENOMEM; }
-    uint8_t cmd[36] = { 0 }, rsp[4]; uint32_t got = 0;
+    /* TX_QUEUE_CFG_RSP: queue number, flags, write pointer, reserved; 16 bits each. */
+    uint8_t cmd[36] = { 0 }, rsp[8]; uint32_t got = 0;
     put32(cmd + 4, 1u << sta); cmd[8] = tid;
     put32(cmd + 16, 4); put32(cmd + 20, (uint32_t)q->bc.p); put32(cmd + 28, (uint32_t)q->desc.p);
     int r = iwl_send_cmd(GRP_DATA_PATH, 0x17, cmd, sizeof(cmd), rsp, sizeof(rsp), &got);
     if (r < 0) {
-        /* On timeout the firmware may still own these addresses. */
+        /* The firmware may own these addresses: after a timeout, and after
+         * a reply it did send but we could not read. */
+        if (r == -EMSGSIZE || r == -EIO) iwl.dead = 1;
         if (!iwl.dead) queue_free(q);
         return r;
     }
     unsigned id = get16(rsp);
-    if (got != 4 || id >= 512 || id == CMD_QUEUE ||
+    if (got != sizeof(rsp) || id >= 512 || id == CMD_QUEUE ||
         (t.tx[1-h].active && t.tx[1-h].id == (int)id)) { iwl.dead = 1; return -EIO; }
-    q->id = id; q->read = q->write = get16(rsp + 2); q->sta = sta; q->tid = tid;
+    q->id = id; q->read = q->write = get16(rsp + 4); q->sta = sta; q->tid = tid;
     q->active = 1;
     return h;
 }
@@ -602,3 +605,20 @@ void iwl_trans_reclaim(int id, uint16_t ssn)
     spin_unlock(&tx_lock);
 }
 void iwl_mvm_tx_done(int queue, int index) { iwl_trans_reclaim(queue, index); }
+
+/* The ring pointers at the moment of a crash. The SCD sequence the firmware
+ * reports wraps at 12 bits, while read/write here are free-running 16-bit
+ * counters, so a large (write - read) in the log means the two numbering
+ * spaces have drifted and reclaim is no longer freeing descriptors. */
+void iwl_trans_dump_queues(void)
+{
+    klog("iwl: cmd queue read %u write %u (in flight %u)\n", t.cmd.read, t.cmd.write,
+         (uint16_t)(t.cmd.write - t.cmd.read));
+    for (int h = 0; h < 2; h++) {
+        struct queue *q = &t.tx[h];
+        if (q->active)
+            klog("iwl: tx queue %d (fw id %d sta %d tid %d) read %u write %u (in flight %u)\n",
+                 h, q->id, q->sta, q->tid, q->read, q->write,
+                 (uint16_t)(q->write - q->read));
+    }
+}
