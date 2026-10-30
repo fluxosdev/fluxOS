@@ -441,6 +441,8 @@ static void begin(void)
 static void copy(const struct surf *src, const struct surf *dst, uint32_t sx, uint32_t sy,
                  uint32_t dx, uint32_t dy, uint32_t w, uint32_t h)
 {
+    if (nbatch + 8 + 4 > sizeof(batch) / sizeof(batch[0]))
+        return;                         /* no room left for it and submit()'s 4 dwords */
     uint32_t *c = &batch[nbatch];
     nbatch += 8;
     int argb = dst->cpp == 4;

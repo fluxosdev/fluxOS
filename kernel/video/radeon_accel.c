@@ -61,6 +61,7 @@ static struct {
 static struct {
     int owner;                      /* pid with the 3D engine, or 0 */
     uint32_t size;
+    int dirty;                      /* its video memory may hold a client's pixels */
 } gl3d;
 
 /* Sleep a little in a process; at boot, spin. */
@@ -670,15 +671,13 @@ int radeon_map_buffer(struct dispbuf *b)
         return -ENOMEM;
     for (uint32_t i = 0; i < npages; i++) {
         uint32_t va = first_va + i * 4096;
-        if (!vmm_write_ok(current->pd, va) && !vmm_resolve_cow(current->pd, va)) {
-            for (uint32_t j = 0; j < i; j++)
-                gart_set(first + j, 0);
-            return -EFAULT;
-        }
-        uint32_t phys = vmm_translate(current->pd, va);
+        uint32_t phys = 0;
+        if ((vmm_write_ok(current->pd, va) || vmm_resolve_cow(current->pd, va)))
+            phys = vmm_translate(current->pd, va);
         if (!phys) {
             for (uint32_t j = 0; j < i; j++)
                 gart_set(first + j, 0);
+            gart_flush();
             return -EFAULT;
         }
         gart_set(first + i, phys);
@@ -719,6 +718,32 @@ int radeon_pinned(int pid, uint32_t start, uint32_t end)
 
 /* ---- the 3D client ---- */
 
+/* Fill the 3D client's video memory with zeros, the engine drawing it as
+ * rows of 8192 pixels (32 KiB) from the fill color. */
+static int clear_arena(uint32_t size)
+{
+    if (rcp.busy)
+        return -EBUSY;
+    rcp.busy = 1;
+    uint64_t base = rv.mc_base + GL_VRAM_OFF;
+    uint32_t rows = size / 32768, rest = size % 32768;
+    struct surf fill = fill_surface(0, FMT_8_8_8_8, 4);
+    int r = begin_blits();
+    for (uint32_t y = 0; y < rows && r == 0; y += 8192) {
+        uint32_t h = MIN(8192u, rows - y);
+        struct surf dst = { base + (uint64_t)y * 32768, 8192, 8192, h, FMT_8_8_8_8, 4 };
+        r = blit_or_flush(&fill, &dst, 0, 0, 0, 0, 8192, h);
+    }
+    if (r == 0 && rest >= 4) {
+        struct surf dst = { base + (uint64_t)rows * 32768, 8192, rest / 4, 1, FMT_8_8_8_8, 4 };
+        r = blit_or_flush(&fill, &dst, 0, 0, 0, 0, rest / 4, 1);
+    }
+    if (r == 0)
+        r = finish();
+    rcp.busy = 0;
+    return r < 0 ? -EIO : 0;
+}
+
 int radeon_map3d(struct disp3d *d)
 {
     if (!radeon_3d_ok())
@@ -729,6 +754,16 @@ int radeon_map3d(struct disp3d *d)
             return -EBUSY;
     }
     uint32_t size = MIN(GL_VRAM_MAX, MIN(rv.aper_size, rv.vram_size) - GL_VRAM_OFF);
+    /* A new client must not find the last one's textures and pictures
+     * (Intel's pages are zeroed the same way, intel_map3d). */
+    if (gl3d.owner != current->leader->pid && gl3d.dirty) {
+        int c = clear_arena(size);
+        if (c < 0) {
+            klog("radeon: could not clear the 3D client's memory; not handed out\n");
+            return c;
+        }
+        gl3d.dirty = 0;
+    }
     int r = vmm_map_phys(current->pd, USER_GL_BASE, rv.aper_phys + GL_VRAM_OFF, size, 0);
     if (r < 0)
         return r;
@@ -736,6 +771,7 @@ int radeon_map3d(struct disp3d *d)
         klog("radeon: pid %d (%s) has the 3D engine\n", current->leader->pid, current->name);
     gl3d.owner = current->leader->pid;
     gl3d.size = size;
+    gl3d.dirty = 1;
     uint64_t gpu = rv.mc_base + GL_VRAM_OFF;
     memset(d, 0, sizeof(*d));
     d->vram = USER_GL_BASE;
@@ -746,15 +782,22 @@ int radeon_map3d(struct disp3d *d)
     return 0;
 }
 
+/* Does [addr, addr + bytes) lie within [base, base + size)? Written so that
+ * nothing wraps: addr + bytes near 2^64 would pass a plain sum. */
+static int within(uint64_t addr, uint64_t bytes, uint64_t base, uint64_t size)
+{
+    return addr >= base && bytes <= size && addr - base <= size - bytes;
+}
+
 /* Does [addr, addr + bytes) lie in the caller's video memory or buffers? */
 int radeon_caller_owns(uint64_t addr, uint64_t bytes)
 {
     uint64_t gl = rv.mc_base + GL_VRAM_OFF;
-    if (gl3d.owner == current->leader->pid && addr >= gl && addr + bytes <= gl + gl3d.size)
+    if (gl3d.owner == current->leader->pid && within(addr, bytes, gl, gl3d.size))
         return 1;
     for (int i = 0; i < MAX_SLOTS; i++) {
         struct slot *sl = &gart.slots[i];
-        if (sl->pid == current->leader->pid && addr >= slot_gpu(sl) && addr + bytes <= slot_gpu(sl) + sl->size)
+        if (sl->pid == current->leader->pid && within(addr, bytes, slot_gpu(sl), sl->size))
             return 1;
     }
     return 0;
@@ -765,14 +808,15 @@ int radeon_caller_owns(uint64_t addr, uint64_t bytes)
 static int fetch(uint64_t addr, uint32_t *dst, uint32_t n)
 {
     uint64_t gl = rv.mc_base + GL_VRAM_OFF, bytes = (uint64_t)n * 4;
-    if (gl3d.owner == current->leader->pid && addr >= gl && addr + bytes <= gl + gl3d.size) {
-        /* through the caller's own mapping (DISP_MAP3D): the kernel maps less */
-        memcpy(dst, (const void *)(USER_GL_BASE + (uint32_t)(addr - gl)), (uint32_t)bytes);
+    if (gl3d.owner == current->leader->pid && within(addr, bytes, gl, gl3d.size)) {
+        /* from video memory itself, not the caller's mapping of it, which
+         * another thread could unmap under the copy */
+        vmm_read_phys(dst, rv.aper_phys + GL_VRAM_OFF + (uint32_t)(addr - gl), (uint32_t)bytes);
         return 0;
     }
     for (int i = 0; i < MAX_SLOTS; i++) {
         const struct slot *sl = &gart.slots[i];
-        if (sl->pid != current->leader->pid || addr < slot_gpu(sl) || addr + bytes > slot_gpu(sl) + sl->size)
+        if (sl->pid != current->leader->pid || !within(addr, bytes, slot_gpu(sl), sl->size))
             continue;
         uint8_t *out = (uint8_t *)dst;
         uint32_t off = (uint32_t)(addr - gart.start);   /* within the GART */
@@ -876,7 +920,9 @@ static int resolve(const struct dispsurf *d, int screen_owner, struct surf *s)
     default:
         return -EINVAL;
     }
+    /* pitch: at most 8192 pixels, all the render target's 10-bit field holds */
     if (!d->width || !d->height || d->width > 8192 || d->height > 8192 || d->pitch % 256 ||
+        d->pitch > 8192 * 4 ||
         d->width * 4 > d->pitch || (uint64_t)d->offset + (uint64_t)d->pitch * d->height > limit ||
         ((base + d->offset) & 255))
         return -EINVAL;

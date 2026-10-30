@@ -168,8 +168,12 @@
 #define VGT_VERTEX_REUSE_BLOCK_CNTL 0x28C58
 #define VGT_OUT_DEALLOC_CNTL 0x28C5C
 #define PACKET3_SET_RESOURCE 0x6D
+#define SQ_TEX_VTX_INVALID_TEXTURE 0u
+#define SQ_TEX_VTX_INVALID_BUFFER 1u
 #define SQ_TEX_VTX_VALID_TEXTURE 2u
 #define SQ_TEX_VTX_VALID_BUFFER 3u
+#define BLIT_TEX_RESOURCE 0             /* set_texture: the pixel shader's resource 0 */
+#define BLIT_VTX_RESOURCE 0x460         /* set_vertices: the vertex shader's fetch resource */
 
 extern const uint8_t radeon_fw_rv770_pfp[], radeon_fw_rv770_me[], radeon_fw_rv730_me[];
 extern const uint8_t radeon_fw_rv710_pfp[], radeon_fw_rv710_me[];
@@ -390,9 +394,19 @@ static void hdp_flush(void)
 
 /* ---- blits (r600_blit_kms.c) ---- */
 
+/* An unused resource: the engine fetches nothing through it. */
+static void clear_resource(uint32_t index, uint32_t type)
+{
+    emit(PACKET3(PACKET3_SET_RESOURCE, 7));
+    emit(index);
+    for (int i = 0; i < 6; i++)
+        emit(0);
+    emit(type << 30);
+}
+
 static int begin_state(void)
 {
-    if (radeon_ring_space(16) < 0)
+    if (radeon_ring_space(16 + 2 * 9) < 0)
         return -1;
     uint64_t state = rcp.gpu + STATE_OFF;
     emit(PACKET3(PACKET3_INDIRECT_BUFFER, 2));
@@ -410,6 +424,11 @@ static int begin_state(void)
     emit(NUM_PS_THREADS(cfg->blit_ps_threads) | NUM_VS_THREADS(cfg->blit_vs_threads));
     emit(NUM_PS_STACK_ENTRIES(cfg->blit_stack) | NUM_VS_STACK_ENTRIES(cfg->blit_stack));
     emit(0);
+    /* The last blit left its source (another process's buffer, or the
+     * screen) in these: a 3D client's shader could sample them without
+     * setting them, which check() cannot see. Every batch starts without. */
+    clear_resource(BLIT_TEX_RESOURCE, SQ_TEX_VTX_INVALID_TEXTURE);
+    clear_resource(BLIT_VTX_RESOURCE, SQ_TEX_VTX_INVALID_BUFFER);
     return 0;
 }
 
@@ -446,7 +465,7 @@ static void set_texture(const struct surf *s)
     uint32_t word4 = 1u << 14 /* request size */ | 0u << 16 | 1u << 19 | 2u << 22 | 3u << 25;
     surface_sync(PACKET3_TC_ACTION_ENA, s->pitch * s->h * s->cpp, s->addr);
     emit(PACKET3(PACKET3_SET_RESOURCE, 7));
-    emit(0);
+    emit(BLIT_TEX_RESOURCE);
     emit(word0);
     emit(word1);
     emit((uint32_t)(s->addr >> 8));
@@ -459,7 +478,7 @@ static void set_texture(const struct surf *s)
 static void set_vertices(uint64_t addr)
 {
     emit(PACKET3(PACKET3_SET_RESOURCE, 7));
-    emit(0x460);
+    emit(BLIT_VTX_RESOURCE);
     emit((uint32_t)addr);
     emit(48 - 1);
     emit(((uint32_t)(addr >> 32) & 0xFF) | 16u << 8);      /* stride 16 */

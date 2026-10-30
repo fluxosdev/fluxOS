@@ -98,9 +98,13 @@
  * what tables called from it address past them. */
 #define PS_DWORDS 1024
 
+#define ATOM_MAX_DEPTH 16               /* tables calling tables */
+
 struct exec {
     struct atom_context *ctx;
     uint32_t *ps, *ws;
+    uint32_t ps_dwords;                 /* how many of ps there are */
+    int depth;
     int ps_shift;
     uint16_t start;
     uint32_t last_jump, last_jump_ticks;
@@ -145,7 +149,8 @@ uint32_t atom_u32(const struct atom_context *ctx, uint32_t off)
 #define U16(p) atom_u16(e->ctx, (uint32_t)(p))
 #define U32(p) atom_u32(e->ctx, (uint32_t)(p))
 
-static int execute_locked(struct atom_context *ctx, int index, uint32_t *params);
+static int execute_locked(struct atom_context *ctx, int index, uint32_t *params, uint32_t ps_dwords,
+                          int depth);
 
 static uint32_t iio_execute(struct atom_context *ctx, int base, uint32_t index, uint32_t data)
 {
@@ -467,7 +472,8 @@ static void op_calltable(struct exec *e, int *ptr, int arg)
     int idx = U8((*ptr)++);
     (void)arg;
     if (U16(e->ctx->cmd_table + 4 + 2 * idx) &&
-        execute_locked(e->ctx, idx, e->ps + e->ps_shift) < 0)
+        execute_locked(e->ctx, idx, e->ps + e->ps_shift, e->ps_dwords - (uint32_t)e->ps_shift,
+                       e->depth + 1) < 0)
         e->abort = 1;
 }
 
@@ -762,7 +768,8 @@ static const struct {
     { op_unimplemented, 0 },                                    /* debug */
 };
 
-static int execute_locked(struct atom_context *ctx, int index, uint32_t *params)
+static int execute_locked(struct atom_context *ctx, int index, uint32_t *params, uint32_t ps_dwords,
+                          int depth)
 {
     int base = atom_u16(ctx, ctx->cmd_table + 4u + 2u * (uint32_t)index);
     if (!base)
@@ -771,12 +778,22 @@ static int execute_locked(struct atom_context *ctx, int index, uint32_t *params)
     int ps = atom_u8(ctx, (uint32_t)base + ATOM_CT_PS_PTR) & ATOM_CT_PS_MASK;
     int ptr = base + ATOM_CT_CODE_PTR;
 
+    /* PS indexes are a byte, and a table it calls starts ps / 4 further on:
+     * both must stay inside the parameter space. A BIOS that nests deeper
+     * or reaches past it is not run. */
+    if (depth > ATOM_MAX_DEPTH || ps_dwords < 256 || (uint32_t)(ps / 4) > ps_dwords - 256) {
+        klog("atom: table %d: parameter space or nesting exceeded\n", index);
+        return -1;
+    }
+
     struct exec e;
     memset(&e, 0, sizeof(e));
     e.ctx = ctx;
     e.ps_shift = ps / 4;
     e.start = (uint16_t)base;
     e.ps = params;
+    e.ps_dwords = ps_dwords;
+    e.depth = depth;
     /* WS indexes are a byte; leave room for all of them. */
     e.ws = ws ? kzalloc(256 * sizeof(uint32_t)) : NULL;
     if (ws && !e.ws)
@@ -813,7 +830,7 @@ int atom_execute(struct atom_context *ctx, int index, void *params, uint32_t siz
     ctx->fb_base = 0;
     ctx->io_mode = ATOM_IO_MM;
     ctx->divmul[0] = ctx->divmul[1] = 0;
-    int r = execute_locked(ctx, index, ps);
+    int r = execute_locked(ctx, index, ps, PS_DWORDS, 0);
     if (params)
         memcpy(params, ps, size);
     return r;

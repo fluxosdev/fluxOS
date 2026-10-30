@@ -1732,7 +1732,16 @@ static int sys_display(uint32_t op, uint32_t uarg, uint32_t c, uint32_t d, uint3
         kfree(karg);
         return -EFAULT;
     }
+    /* DISP_MAPBUF breaks copy-on-write in the caller's pages, which only the
+     * holder of mm_lock may do (another thread's fault, a fork). The lock
+     * comes first, as for munmap and fork, which ask the display whether
+     * pages are lent (fb_pinned). */
+    struct mutex *mm = op == DISP_MAPBUF ? &current->leader->mm_lock : NULL;
+    if (mm)
+        mutex_lock(mm);
     int r = fb_display((int)op, karg);
+    if (mm)
+        mutex_unlock(mm);
     if (writes && copy_to_user((void *)uarg, karg, size) < 0)
         r = -EFAULT;
     kfree(karg);
