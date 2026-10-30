@@ -404,7 +404,12 @@ static void ip_input(const uint8_t *data, uint32_t len)
         if (plen >= sizeof(struct udp_hdr)) {
             const struct udp_hdr *uh = (const struct udp_hdr *)payload;
             if (ntohs(uh->dport) == DHCP_CLIENT_PORT && netif.use_dhcp) {
-                dhcp_input(payload, plen);
+                /* The checks udp_input would make: length, then checksum. */
+                uint32_t ulen = ntohs(uh->len);
+                if (ulen >= sizeof(*uh) && ulen <= plen &&
+                    (!uh->csum || csum_fold(csum_add(csum_pseudo(ntohl(ip->src), dst, IPPROTO_UDP,
+                                                                 ulen), payload, ulen)) == 0))
+                    dhcp_input(payload, ulen);
                 break;
             }
             /* Nobody listening: tell the sender, unless it was a broadcast. */
@@ -612,7 +617,8 @@ void dhcp_input(const uint8_t *data, uint32_t len)
         dhcp.tries = 0;
         dhcp.timeout = ticks + 2 * HZ;
         dhcp_send(DHCPREQUEST);
-    } else if (type == DHCPACK && (dhcp.state == DHCP_REQUESTING || dhcp.state == DHCP_RENEWING)) {
+    } else if (type == DHCPACK && (dhcp.state == DHCP_REQUESTING || dhcp.state == DHCP_RENEWING) &&
+               opt_ip(m, len, OPT_SERVER_ID) == dhcp.server) {     /* the server we asked */
         uint32_t lease = opt_ip(m, len, OPT_LEASE);
         int renewed = dhcp.state == DHCP_RENEWING && netif.ip == ntohl(m->yiaddr);
         netif.ip = ntohl(m->yiaddr);
@@ -645,7 +651,8 @@ void dhcp_input(const uint8_t *data, uint32_t len)
             }
             klog("net: DHCP ACK carried no DNS server; options present: %s\n", codes);
         }
-    } else if (type == DHCPNAK && dhcp.state != DHCP_SELECTING) {
+    } else if (type == DHCPNAK && dhcp.state != DHCP_SELECTING &&
+               opt_ip(m, len, OPT_SERVER_ID) == dhcp.server) {
         klog("net: DHCP server refused our address, starting over\n");
         netif.ip = 0;
         dhcp_start();

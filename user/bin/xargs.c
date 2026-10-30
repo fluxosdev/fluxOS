@@ -154,16 +154,16 @@ int main(int argc, char **argv)
         if (!strcmp(a, "-t") || !strcmp(a, "--verbose")) { trace = 1; continue; }
         if (!strcmp(a, "-p")) { trace = 1; continue; }
         if (!strcmp(a, "-x")) continue;
-        if (a[1] == 'n' || a[1] == 's' || a[1] == 'I' || a[1] == 'i' || a[1] == 'L' || a[1] == 'P') {
+        if (a[1] == 'i') { replace = a[2] ? a + 2 : "{}"; continue; }     /* only an attached string */
+        if (a[1] == 'n' || a[1] == 's' || a[1] == 'I' || a[1] == 'L' || a[1] == 'P') {
             const char *v = a[2] ? a + 2 : i + 1 < argc ? argv[++i] : NULL;
-            if (!v && a[1] != 'i') {
+            if (!v) {
                 fprintf(stderr, "xargs: option requires an argument -- '%c'\n", a[1]);
                 return 1;
             }
             if (a[1] == 'n') max_args = atoi(v);
             else if (a[1] == 's') max_bytes = (size_t)atol(v);
             else if (a[1] == 'I') replace = v;
-            else if (a[1] == 'i') replace = a[2] ? a + 2 : "{}";
             else if (a[1] == 'L') max_args = 0;     /* lines: close enough to one call per line is -I */
             continue;
         }

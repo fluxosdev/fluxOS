@@ -356,9 +356,19 @@ static void an_class(struct an *A, struct ast *n)
     A->sc = saved;
 }
 
+/* Too deep to analyse on this stack: a SyntaxError, and the rest is not run. */
+static int an_too_deep(struct an *A)
+{
+    if (!js_stack_low(A->J))
+        return 0;
+    if (!A->J->throwing)
+        js_throw_error(A->J, "SyntaxError: the script is nested too deeply");
+    return 1;
+}
+
 static void an_expr(struct an *A, struct ast *n)
 {
-    if (!n)
+    if (!n || an_too_deep(A))
         return;
     switch (n->kind) {
     case N_NUM: case N_STR: case N_REGEX: case N_TRUE: case N_FALSE: case N_NULL: case N_HOLE:
@@ -471,7 +481,7 @@ static void an_var(struct an *A, struct ast *n)
 
 static void an_stmt(struct an *A, struct ast *n)
 {
-    if (!n)
+    if (!n || an_too_deep(A))
         return;
     struct vscope *saved = A->sc;
     switch (n->kind) {

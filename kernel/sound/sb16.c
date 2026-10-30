@@ -5,15 +5,14 @@
  * The card is found by resetting its DSP at 220h, 240h, 260h or 280h; its
  * mixer says which IRQ and DMA channels it uses (registers 80h and 81h).
  *
- * Playback runs from a DMA buffer in two halves, with the DSP in auto-init
- * mode and an interrupt each time a half has played; the interrupt refills
- * that half from a ring of samples that write() fills. With a 16-bit DMA
- * channel the card is always fed signed 16-bit samples (8-bit ones are
- * widened as they are written), otherwise unsigned 8-bit ones. A half lasts
- * about 60 ms at any rate, which is the latency. When the ring runs dry
- * the halves are filled with silence, and once nothing but silence is left
- * to play the DSP is stopped. Closing /dev/dsp lets what was written play
- * out; one process at a time may have it open.
+ * /dev/dsp is the software mixer's (pcm.c); this driver is its backend.
+ * The card always plays 44.1 kHz stereo: signed 16-bit with a 16-bit DMA
+ * channel, otherwise unsigned 8-bit. Playback runs from a DMA buffer in two
+ * halves, with the DSP in auto-init mode and an interrupt each time a half
+ * has played; the interrupt has the mixer top up a ring of frames and
+ * refills that half from it. A half lasts 60 ms, which is the latency. When
+ * the ring runs dry the halves are filled with silence, and once nothing
+ * but silence is left to play the DSP is stopped.
  */
 #include "kernel.h"
 #include "arch.h"
@@ -48,8 +47,7 @@
 #define DMA_SIZE  32768                 /* both halves; aligned, so no page is crossed */
 #define RING_SIZE 65536
 #define HALF_MS   60
-#define MIN_RATE  5000
-#define MAX_RATE  44100
+#define RATE      44100
 
 /* ISA DMA modes: single transfers, auto-init, memory to device. */
 #define DMA_PLAY_AUTO 0x58
@@ -65,19 +63,13 @@ static struct {
     uint8_t irq, dma8, dma16;           /* dma16 0xFF: none */
     uint16_t version;
     int dev16;                          /* the card gets 16-bit samples */
-    int open_pid;                       /* who has /dev/dsp, or 0 */
-
-    int rate, channels, fmt;            /* what write() is given */
-    uint8_t carry[4];                   /* part of a frame left from the last write */
-    uint32_t ncarry;
+    struct pcm *dsp;                    /* the mixer feeding it */
 
     int running;
     uint32_t half;                      /* bytes in each half of dma_buf */
     int next_half;                      /* the half the next interrupt finishes */
-    uint32_t real[2];                   /* bytes of written samples in each half */
-    int draining;                       /* play what is left even if it is short */
+    uint32_t real[2];                   /* bytes of mixed frames in each half */
     uint32_t rhead, rtail;              /* the ring, free-running */
-    uint32_t irqs;                      /* interrupts so far */
 } sb;
 
 /* ---- the DSP and the mixer ---- */
@@ -127,24 +119,17 @@ static uint8_t mix_read(uint8_t reg)
     return inb(sb.base + DSP_MIXER_DATA);
 }
 
-/* ---- formats ---- */
-
-static uint32_t user_frame(void)
-{
-    return (uint32_t)sb.channels * (sb.fmt == AFMT_S16_LE ? 2 : 1);
-}
+/* ---- the ring of mixed frames ---- */
 
 static uint32_t dev_frame(void)
 {
-    return (uint32_t)sb.channels * (sb.dev16 ? 2 : 1);
+    return sb.dev16 ? 4 : 2;            /* stereo */
 }
 
-/* About HALF_MS of sound, in whole frames on a 4-byte boundary. */
+/* HALF_MS of sound, in whole frames on a 4-byte boundary. */
 static void choose_half(void)
 {
-    uint32_t bytes = (uint32_t)sb.rate * dev_frame() * HALF_MS / 1000;
-    if (bytes < 256)
-        bytes = 256;
+    uint32_t bytes = (uint32_t)RATE * dev_frame() * HALF_MS / 1000;
     if (bytes > DMA_SIZE / 2)
         bytes = DMA_SIZE / 2;
     sb.half = bytes & ~3u;
@@ -155,17 +140,11 @@ static uint32_t ring_used(void)
     return sb.rhead - sb.rtail;
 }
 
-/* Append one frame of user samples to the ring in the card's format. */
-static void put_frame(const uint8_t *in)
+/* Mixed 16-bit stereo frames into the ring, in the card's format. */
+static void sb_put(const int16_t *lr, uint32_t n)
 {
-    for (int c = 0; c < sb.channels; c++) {
-        int16_t s;
-        if (sb.fmt == AFMT_S16_LE) {
-            s = (int16_t)(in[0] | in[1] << 8);
-            in += 2;
-        } else {
-            s = (int16_t)((*in++ - 128) << 8);
-        }
+    for (uint32_t i = 0; i < 2 * n; i++) {
+        int16_t s = lr[i];
         if (sb.dev16) {
             ring[sb.rhead++ % RING_SIZE] = (uint8_t)s;
             ring[sb.rhead++ % RING_SIZE] = (uint8_t)(s >> 8);
@@ -175,10 +154,27 @@ static void put_frame(const uint8_t *in)
     }
 }
 
-/* Fill half h of the DMA buffer from the ring, then with silence. */
+static uint32_t sb_room(void)
+{
+    return (RING_SIZE - ring_used()) / dev_frame();
+}
+
+static uint32_t sb_queued(void)
+{
+    return (ring_used() + (sb.running ? sb.real[0] + sb.real[1] : 0)) / dev_frame();
+}
+
+static int sb_running(void)
+{
+    return sb.running;
+}
+
+/* Fill half h of the DMA buffer from the ring, topped up by the mixer, then with silence. */
 static void fill_half(int h)
 {
     uint8_t *dst = dma_buf + h * sb.half;
+    if (ring_used() < sb.half)
+        pcm_pull(sb.dsp, (sb.half - ring_used()) / dev_frame());
     uint32_t n = MIN(ring_used(), sb.half);
     n -= n % dev_frame();
     for (uint32_t i = 0; i < n; i++)
@@ -197,8 +193,6 @@ static void stop(void)
     isa_dma_stop(sb.dev16 ? sb.dma16 : sb.dma8);
     sb.running = 0;
     sb.real[0] = sb.real[1] = 0;
-    wakeup(&sb);
-    poll_wakeup();
 }
 
 static void start(void)
@@ -212,15 +206,29 @@ static void start(void)
     if (isa_dma_start(ch, (uint32_t)dma_buf, 2 * sb.half, DMA_PLAY_AUTO) < 0)
         return;
     uint32_t count = (sb.dev16 ? sb.half / 2 : sb.half) - 1;   /* samples per block, less one */
-    uint8_t mode = (uint8_t)((sb.channels == 2 ? MODE_STEREO : 0) | (sb.dev16 ? MODE_SIGNED : 0));
+    uint8_t mode = (uint8_t)(MODE_STEREO | (sb.dev16 ? MODE_SIGNED : 0));
     dsp_out(CMD_RATE);
-    dsp_out((uint8_t)(sb.rate >> 8));
-    dsp_out((uint8_t)sb.rate);
+    dsp_out((uint8_t)(RATE >> 8));
+    dsp_out((uint8_t)RATE);
     dsp_out(sb.dev16 ? CMD_DMA16_AUTO : CMD_DMA8_AUTO);
     dsp_out(mode);
     dsp_out((uint8_t)count);
     dsp_out((uint8_t)(count >> 8));
     sb.running = 1;
+}
+
+/* Stop, and forget what is queued (SNDCTL_DSP_RESET). */
+static void sb_drop(void)
+{
+    stop();
+    sb.rtail = sb.rhead;
+}
+
+/* A second without an interrupt while playing: the IRQ is wrong. */
+static void sb_stalled(void)
+{
+    klog("sb16: no interrupt on IRQ %d, stopping playback\n", sb.irq);
+    sb_drop();
 }
 
 static void sb_irq_locked(struct trapframe *tf)
@@ -233,221 +241,23 @@ static void sb_irq_locked(struct trapframe *tf)
         (void)inb(sb.base + DSP_ACK16);
     if (!(st & 3) || !sb.running)
         return;
-    sb.irqs++;
     int h = sb.next_half;               /* this half has played: refill it */
     fill_half(h);
     sb.next_half = h ^ 1;
     if (!sb.real[0] && !sb.real[1] && !ring_used())
         stop();                         /* only silence left in the buffer */
-    wakeup(&sb);
-    poll_wakeup();
 }
 
-/* Sleep until the interrupt handler moves on; -EIO if the card never interrupts. */
-static int wait_for_irq(void)
-{
-    uint32_t seen = sb.irqs;
-    int was_running = sb.running;
-    if (!was_running)
-        return -EIO;                    /* nothing will wake us: the DMA did not start */
-    sleep_on_lock_timeout(&sb, &snd_lock, ticks + HZ);
-    if (signal_pending(current))
-        return -EINTR;
-    if (was_running && sb.running && sb.irqs == seen) {
-        klog("sb16: no interrupt on IRQ %d, stopping playback\n", sb.irq);
-        stop();
-        sb.rtail = sb.rhead;
-        return -EIO;
-    }
-    return 0;
-}
-
-/* Wait until everything written has played. */
-static int drain(void)
-{
-    sb.draining = 1;
-    while (sb.running || ring_used()) {
-        start();
-        if (!sb.running)
-            break;                      /* the DMA would not start */
-        int r = wait_for_irq();
-        if (r < 0) {
-            sb.draining = 0;
-            return r;
-        }
-    }
-    sb.draining = 0;
-    return 0;
-}
-
-/* ---- /dev/dsp ---- */
-
-static void set_defaults(void)
-{
-    sb.rate = 8000;
-    sb.channels = 1;
-    sb.fmt = AFMT_U8;
-    sb.ncarry = 0;
-    choose_half();
-}
-
-static int dsp_open_locked(struct vnode *vn, int flags)
-{
-    (void)vn;
-    if ((flags & O_ACCMODE) == O_RDONLY)
-        return -EINVAL;                 /* no recording */
-    if (sb.open_pid && sb.open_pid != current->leader->pid) {
-        struct proc *p = proc_find(sb.open_pid);
-        if (p && p->state != P_ZOMBIE)
-            return -EBUSY;
-    }
-    sb.open_pid = current->leader->pid;
-    if (!sb.running && !ring_used())
-        set_defaults();
-    return 0;
-}
-
-static void dsp_close_locked(struct vnode *vn, int flags)
-{
-    (void)vn; (void)flags;
-    sb.open_pid = 0;
-    sb.ncarry = 0;
-    start();                            /* the rest plays out by itself */
-}
-
-static int dsp_dev_write_locked(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
-{
-    (void)vn; (void)off;
-    const uint8_t *in = buf;
-    uint32_t uf = user_frame(), df = dev_frame(), used = 0;
-
-    /* Complete a frame begun by the last write. */
-    /* A full frame stays in carry until there is room for it: a wait that
-     * fails (a signal) keeps it for the next write, which must not add to it. */
-    while (sb.ncarry) {
-        if (sb.ncarry < uf) {
-            if (used == n)
-                break;
-            sb.carry[sb.ncarry++] = in[used++];
-            continue;
-        }
-        while (RING_SIZE - ring_used() < df) {
-            start();
-            int r = wait_for_irq();
-            if (r < 0)
-                return used ? (int)used : r;
-        }
-        put_frame(sb.carry);
-        sb.ncarry = 0;
-    }
-    while (n - used >= uf) {
-        uint32_t room = (RING_SIZE - ring_used()) / df;
-        if (!room) {
-            start();
-            int r = wait_for_irq();
-            if (r < 0)
-                return used ? (int)used : r;
-            continue;
-        }
-        uint32_t frames = MIN(room, (n - used) / uf);
-        for (uint32_t i = 0; i < frames; i++, used += uf)
-            put_frame(in + used);
-        if (!sb.running && ring_used() >= RING_SIZE / 2)
-            start();      /* a deep head start rides out a busy desktop */
-    }
-    while (used < n)                    /* keep a part frame for next time */
-        sb.carry[sb.ncarry++] = in[used++];
-    return (int)n;
-}
-
-static int dsp_poll_locked(struct vnode *vn)
-{
-    (void)vn;
-    return RING_SIZE - ring_used() >= sb.half ? POLLOUT : 0;
-}
-
-/* Change the format after what was written in the old one has played. */
-static int set_format(int *field, int value)
-{
-    if (*field == value)
-        return 0;
-    int r = drain();
-    if (r < 0)
-        return r;
-    *field = value;
-    sb.ncarry = 0;
-    choose_half();
-    return 0;
-}
-
-static int get_int(uint32_t arg, int *v)
-{
-    return copy_from_user(v, (const void *)arg, sizeof(*v));
-}
-
-static int put_int(uint32_t arg, int v)
-{
-    return copy_to_user((void *)arg, &v, sizeof(v));
-}
-
-static int dsp_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg)
-{
-    (void)vn;
-    int v, r;
-    switch (req) {
-    case SNDCTL_DSP_RESET:
-        stop();
-        sb.rtail = sb.rhead;
-        sb.ncarry = 0;
-        return 0;
-    case SNDCTL_DSP_SYNC:
-        return drain();
-    case SNDCTL_DSP_POST:
-        start();
-        return 0;
-    case SNDCTL_DSP_SPEED:
-        if ((r = get_int(arg, &v)) < 0)
-            return r;
-        v = v < MIN_RATE ? MIN_RATE : v > MAX_RATE ? MAX_RATE : v;
-        if ((r = set_format(&sb.rate, v)) < 0)
-            return r;
-        return put_int(arg, sb.rate);
-    case SNDCTL_DSP_CHANNELS:
-        if ((r = get_int(arg, &v)) < 0)
-            return r;
-        v = v >= 2 ? 2 : 1;
-        if ((r = set_format(&sb.channels, v)) < 0)
-            return r;
-        return put_int(arg, sb.channels);
-    case SNDCTL_DSP_SETFMT:
-        if ((r = get_int(arg, &v)) < 0)
-            return r;
-        v = v == AFMT_S16_LE ? AFMT_S16_LE : AFMT_U8;
-        if ((r = set_format(&sb.fmt, v)) < 0)
-            return r;
-        return put_int(arg, sb.fmt);
-    case SNDCTL_DSP_GETOSPACE: {
-        struct audio_buf_info bi;
-        uint32_t frames = (RING_SIZE - ring_used()) / dev_frame();
-        uint32_t frag = sb.half / dev_frame() * user_frame();
-        bi.bytes = (int32_t)(frames * user_frame());
-        bi.fragsize = (int32_t)frag;
-        bi.fragstotal = (int32_t)(RING_SIZE / sb.half);
-        bi.fragments = frag ? bi.bytes / (int32_t)frag : 0;
-        return copy_to_user((void *)arg, &bi, sizeof(bi));
-    }
-    case SNDCTL_DSP_GETODELAY: {
-        uint32_t queued = ring_used() + (sb.running ? sb.real[0] + sb.real[1] : 0);
-        return put_int(arg, (int)(queued / dev_frame() * user_frame()));
-    }
-    case SOUND_INFO: {
-        struct sound_info si;
-        sound_get_info(&si);
-        return copy_to_user((void *)arg, &si, sizeof(si));
-    }
-    }
-    return -EINVAL;
-}
+static struct pcm_backend sb_backend = {
+    .rate = RATE,
+    .room = sb_room,
+    .queued = sb_queued,
+    .put = sb_put,
+    .start = start,
+    .running = sb_running,
+    .stalled = sb_stalled,
+    .drop = sb_drop,
+};
 
 /* ---- /dev/mixer ---- */
 
@@ -509,49 +319,10 @@ static int mixer_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg)
 
 /* ---- the device calls and the interrupt, under snd_lock ---- */
 
-static int dsp_open(struct vnode *vn, int flags)
-{
-    spin_lock(&snd_lock);
-    int r = dsp_open_locked(vn, flags);
-    spin_unlock(&snd_lock);
-    return r;
-}
-
-static void dsp_close(struct vnode *vn, int flags)
-{
-    spin_lock(&snd_lock);
-    dsp_close_locked(vn, flags);
-    spin_unlock(&snd_lock);
-}
-
-static int dsp_poll(struct vnode *vn)
-{
-    spin_lock(&snd_lock);
-    int r = dsp_poll_locked(vn);
-    spin_unlock(&snd_lock);
-    return r;
-}
-
-static int dsp_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
-{
-    spin_lock(&snd_lock);
-    int r = dsp_ioctl_locked(vn, req, arg);
-    spin_unlock(&snd_lock);
-    return r;
-}
-
 static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
 {
     spin_lock(&snd_lock);
     int r = mixer_ioctl_locked(vn, req, arg);
-    spin_unlock(&snd_lock);
-    return r;
-}
-
-static int dsp_dev_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
-{
-    spin_lock(&snd_lock);
-    int r = dsp_dev_write_locked(vn, buf, off, n);
     spin_unlock(&snd_lock);
     return r;
 }
@@ -643,7 +414,8 @@ void sb16_init(struct vnode *devdir)
         }
     }
     sb.dev16 = sb.dma16 != 0xFF;
-    set_defaults();
+    choose_half();
+    sb_backend.lead = 2 * sb.half / dev_frame();
     dsp_out(CMD_SPEAKER_ON);
     /* IRQ handlers are not shared: without its IRQ the card can still mix. */
     int irq_ok = !irq_registered(sb.irq);
@@ -652,14 +424,8 @@ void sb16_init(struct vnode *devdir)
     else
         kprintf("sb16: IRQ %d is taken by another device, so there is no /dev/dsp\n", sb.irq);
 
-    struct vnode *dsp = irq_ok ? vfs_mknod(devdir, "dsp", MKDEV(SOUND_MAJOR, SOUND_MINOR_DSP), NULL,
-                                           dsp_dev_write) : NULL;
-    if (dsp) {
-        dsp->dev_open = dsp_open;
-        dsp->dev_close = dsp_close;
-        dsp->dev_ioctl = dsp_ioctl;
-        dsp->dev_poll = dsp_poll;
-    }
+    if (irq_ok)
+        sb.dsp = pcm_create(devdir, "dsp", MKDEV(SOUND_MAJOR, SOUND_MINOR_DSP), &sb_backend);
     struct vnode *mixer = vfs_mknod(devdir, "mixer", MKDEV(SOUND_MAJOR, SOUND_MINOR_MIXER), NULL, NULL);
     if (mixer)
         mixer->dev_ioctl = mixer_ioctl;

@@ -113,7 +113,9 @@ static void reg_retire(struct reg *r, struct image *img)
 void jscanvas_laid_out(struct js *J)
 {
     struct reg *r = reg_of(J);
-    if (!r)
+    /* A layout a script forced, perhaps from a valueOf in the middle of a
+     * canvas method still drawing into the old bitmap: free them later. */
+    if (!r || js_running())
         return;
     for (int i = 0; i < r->nret; i++)
         img_release(r->retired[i]);
@@ -1402,15 +1404,19 @@ static jsval ctx_put_image_data(struct js *J, jsval self, jsval *args, int argc)
     if (args[0].t != JS_OBJ)
         return js_throw_error(J, "TypeError: Failed to execute 'putImageData' on 'CanvasRenderingContext2D': parameter "
                                  "1 is not of type 'ImageData'.");
-    int w = (int)js_to_number(J, js_get(J, args[0], "width")), h = (int)js_to_number(J, js_get(J, args[0], "height"));
+    double fw = js_to_number(J, js_get(J, args[0], "width")), fh = js_to_number(J, js_get(J, args[0], "height"));
     int len = 0;
     unsigned char *bytes = js_binary_bytes(js_get(J, args[0], "data"), &len);
-    if (!bytes || w <= 0 || h <= 0 || len < w * h * 4)
+    if (!bytes || !(fw >= 1 && fw <= 16384) || !(fh >= 1 && fh <= 16384) ||
+        (long long)len < (long long)(int)fw * (int)fh * 4)
         return js_throw_error(J, "TypeError: Failed to execute 'putImageData' on 'CanvasRenderingContext2D': parameter "
                                  "1 is not of type 'ImageData'.");
+    int w = (int)fw, h = (int)fh;
     double x = NUM(1), y = NUM(2);
     if (isnan(x) || isnan(y) || isinf(x) || isinf(y))
         return js_throw_error(J, "TypeError: The provided double value is non-finite.");
+    if (fabs(x) > 1 << 30 || fabs(y) > 1 << 30)           /* entirely off the canvas */
+        return js_undefined;
     int dx = 0, dy = 0, dw = w, dh = h;
     if (argc >= 7) {
         double rx = NUM(3), ry = NUM(4), rw = NUM(5), rh = NUM(6);

@@ -129,8 +129,14 @@ test("putImageData with a dirty rectangle copies only that part", function () {
 test("createImageData and getImageData sizes", function () {
   var x = mk(10, 10).getContext("2d"), a = x.createImageData(3, 5), b = x.createImageData(a), c = x.getImageData(8, 8, 4, 4);
   var err = ""; try { x.getImageData(0, 0, 0, 5); } catch (e) { err = e.name; }
-  return [a.width, a.height, a.data.length, b.width, c.data.length, px(x, 9, 9), err];
-}, [3, 5, 60, 3, 64, [0, 0, 0, 0], "IndexSizeError"]);
+  /* width * height * 4 must not wrap round to fit a small buffer */
+  var bad = [];
+  [[65536, 65536], [65536, 16385], [16384, 16384], [-1, 4], [1.5e9, 2]].forEach(function (s) {
+    try { x.putImageData({ width: s[0], height: s[1], data: new Uint8ClampedArray(16) }, 0, 0); bad.push("ok"); }
+    catch (e) { bad.push(e.name); }
+  });
+  return [a.width, a.height, a.data.length, b.width, c.data.length, px(x, 9, 9), err, bad];
+}, [3, 5, 60, 3, 64, [0, 0, 0, 0], "IndexSizeError", ["TypeError", "TypeError", "TypeError", "TypeError", "TypeError"]]);
 test("composite operations", function () {
   var x = mk(4, 4).getContext("2d");
   x.fillStyle = "#f00"; x.fillRect(0, 0, 4, 4);

@@ -12,6 +12,7 @@
  */
 #include <fcntl.h>
 #include <flux.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,6 +99,26 @@ static struct rect drag_start;          /* the frame when it did */
 static enum cursor_kind cursor_kind;
 static struct window *last_caption_win;  /* for double-clicking a caption */
 static unsigned int last_caption_ms;
+
+/* Drag and drop between windows (wm_drag_start). */
+#define DND_ICON 32
+#define DND_TEXT_W 180                  /* the label and hint at most */
+
+static struct {
+    int active;                         /* d is being carried */
+    int cancelled;                      /* Escape: carried on to the release, dropped nowhere */
+    struct window *src;                 /* where it came from */
+    struct window *target;              /* the window under the pointer (src included), or NULL */
+    struct drag_data d;                 /* the wm's copy */
+    int effect;                         /* letting go now: DROP_*, DRAG_HERE over src */
+    int result;                         /* for src's release (wm_drag_effect) */
+    char hint[64];
+    struct rect drawn;                  /* where the picture by the pointer was last drawn */
+} dnd;
+static int kmods;                       /* KMOD_* held, from the key events */
+static int dnd_shown(void);
+static void draw_drag_image(void);
+static void dnd_clear(void);
 
 enum { E_L = 1, E_R = 2, E_T = 4, E_B = 8 };
 #define GRIP 16                         /* corner grab length along an edge */
@@ -1738,6 +1759,8 @@ static void compose_rect(struct rect r)
         draw_ctx_menu();
     if (drag == DRAG_RESIZE)
         draw_outline();
+    if (dnd_shown())
+        draw_drag_image();
     if (!hw_cursor)
         draw_cursor(&screen, mx, my, cursor_kind);
     gfx_noclip(&screen);
@@ -1909,6 +1932,12 @@ void wm_destroy(struct window *w)
         drag = DRAG_NONE;
         drag_win = NULL;
     }
+    if (dnd.active && dnd.src == w)
+        dnd_clear();
+    else if (dnd.target == w)
+        dnd.target = NULL;              /* found again at the next move */
+    if (last_caption_win == w)
+        last_caption_win = NULL;        /* a new window may come at the same address */
     task_pressed_idx = -1;
     if (focused == w) {
         focused = NULL;
@@ -2535,12 +2564,17 @@ static enum cursor_kind kind_for_edges(int e)
     return e & (E_T | E_B) ? CUR_NS : CUR_ARROW;
 }
 
+static int dnd_pointer(enum cursor_kind *k);
+
 /* Show the pointer the place under it calls for. */
 static void update_cursor(void)
 {
     enum cursor_kind k = CUR_ARROW;
     if (drag == DRAG_RESIZE) {
         k = kind_for_edges(drag_edges);
+    } else if (drag == DRAG_CLIENT) {
+        if (!dnd_pointer(&k))
+            k = drag_win->cursor;       /* the window holding the mouse still says (a page's drag) */
     } else if (drag == DRAG_NONE && !menu_open) {
         struct window *w = window_at(mx, my);
         if (w) {
@@ -2568,6 +2602,186 @@ void wm_set_cursor(struct window *w, enum cursor_kind kind)
         return;
     w->cursor = kind;
     update_cursor();
+}
+
+/* ---- drag and drop between windows ---- */
+
+
+void wm_drag_hint(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(dnd.hint, sizeof(dnd.hint), fmt, ap);
+    va_end(ap);
+}
+
+int wm_drag_here(void)
+{
+    return !dnd.active || (!dnd.cancelled && dnd.effect == DRAG_HERE);
+}
+
+int wm_drag_effect(void)
+{
+    return dnd.active ? dnd.result : DRAG_HERE;
+}
+
+/* The picture by the pointer: the icon, the label and what letting go would do. */
+static struct rect dnd_rect(void)
+{
+    int tw = gfx_text_width(&font_sans, dnd.d.label);
+    int hw = dnd.hint[0] ? gfx_text_width(&font_sans, dnd.hint) : 0;
+    if (hw > tw)
+        tw = hw;
+    if (tw > DND_TEXT_W)
+        tw = DND_TEXT_W;
+    return mkrect(mx + 14, my + 16, 6 + DND_ICON + 6 + tw + 8, DND_ICON + 8);
+}
+
+static int dnd_shown(void)
+{
+    return dnd.active && !dnd.cancelled;
+}
+
+static void draw_drag_image(void)
+{
+    struct rect r = dnd_rect();
+    dnd.drawn = r;
+    gfx_round_fill(&screen, r, 4, 4, ARGB(0xD8, C_TOOLTIP));
+    gfx_round_frame(&screen, r, 4, 4, ARGB(0xC0, C_SHADOW));
+    int ix = r.x + 6, iy = r.y + 4;
+    draw_icon(&screen, ix, iy, dnd.d.icon, DND_ICON);
+    if (dnd.effect == DROP_COPY) {      /* a plus, as Windows marks a copy */
+        struct rect b = mkrect(ix + DND_ICON - 11, iy + DND_ICON - 11, 11, 11);
+        gfx_fill(&screen, b.x, b.y, b.w, b.h, C_WHITE);
+        gfx_frame(&screen, b.x, b.y, b.w, b.h, C_BLACK);
+        gfx_hline(&screen, b.x + 2, b.y + 5, 7, C_BLACK);
+        gfx_vline(&screen, b.x + 5, b.y + 2, 7, C_BLACK);
+    }
+    char line[96];
+    int tx = ix + DND_ICON + 6, tw = r.x + r.w - 8 - tx, lh = font_sans.height;
+    int ty = dnd.hint[0] ? r.y + r.h / 2 - lh : r.y + (r.h - lh) / 2;
+    gfx_ellipsize(&font_sans, dnd.d.label, tw, line, sizeof(line));
+    gfx_text(&screen, &font_sans, tx, ty, line, C_BLACK);
+    if (dnd.hint[0]) {
+        gfx_ellipsize(&font_sans, dnd.hint, tw, line, sizeof(line));
+        gfx_text(&screen, &font_sans, tx, ty + lh, line, dnd.effect == DROP_NONE ? C_SHADOW : C_NAVY);
+    }
+}
+
+/* Where the picture was, and where it is now (the pointer has moved since it was drawn). */
+static void damage_drag_image(void)
+{
+    if (!rect_empty(dnd.drawn))
+        wm_damage(dnd.drawn);
+    if (dnd_shown())
+        wm_damage(dnd_rect());
+}
+
+static int dnd_copy(void)
+{
+    return (kmods & KMOD_CTRL) != 0;
+}
+
+/* Ask the window under the pointer what letting go there would do. */
+static void dnd_update(void)
+{
+    if (!dnd_shown())
+        return;
+    damage_drag_image();
+    struct window *t = window_at(mx, my);
+    if (t && t != dnd.src && (!rect_contains(wm_client_rect(t), mx, my) || !t->ops || !t->ops->drop))
+        t = NULL;                       /* its frame, or a window that takes nothing */
+    if (dnd.target && dnd.target != t && dnd.target != dnd.src)
+        dnd.target->ops->drop(dnd.target, 0, 0, &dnd.d, DROP_LEAVE, dnd_copy());
+    dnd.target = t;
+    dnd.hint[0] = 0;
+    if (!t) {
+        dnd.effect = DROP_NONE;
+    } else if (t == dnd.src) {
+        dnd.effect = DRAG_HERE;
+    } else {
+        struct rect cl = wm_client_rect(t);
+        dnd.effect = t->ops->drop(t, mx - cl.x, my - cl.y, &dnd.d, DROP_OVER, dnd_copy());
+    }
+    damage_drag_image();
+    update_cursor();
+}
+
+static void dnd_clear(void)
+{
+    damage_drag_image();
+    for (int i = 0; i < dnd.d.npaths; i++)
+        free(dnd.d.paths[i]);
+    free(dnd.d.paths);
+    free(dnd.d.text);
+    memset(&dnd, 0, sizeof(dnd));
+    update_cursor();
+}
+
+void wm_drag_start(struct window *w, const struct drag_data *d)
+{
+    if (drag != DRAG_CLIENT || drag_win != w || dnd.active)
+        return;
+    dnd.d = *d;
+    dnd.d.paths = NULL;
+    dnd.d.npaths = 0;
+    dnd.d.text = d->text ? strdup(d->text) : NULL;
+    if (d->npaths && (dnd.d.paths = calloc((size_t)d->npaths, sizeof(char *))))
+        for (int i = 0; i < d->npaths; i++)
+            if ((dnd.d.paths[dnd.d.npaths] = strdup(d->paths[i])))
+                dnd.d.npaths++;
+    dnd.d.label[sizeof(dnd.d.label) - 1] = 0;
+    dnd.src = w;
+    dnd.active = 1;
+    dnd.result = DROP_NONE;
+    dnd_update();
+}
+
+/* Escape: nothing is dropped, and the pointer stops showing it. */
+static void dnd_cancel(void)
+{
+    if (!dnd_shown())
+        return;
+    if (dnd.target && dnd.target != dnd.src)
+        dnd.target->ops->drop(dnd.target, 0, 0, &dnd.d, DROP_LEAVE, dnd_copy());
+    damage_drag_image();
+    dnd.cancelled = 1;
+    dnd.target = NULL;
+    dnd.effect = DROP_NONE;
+    update_cursor();
+}
+
+/* The button came up: the window under the pointer takes it, before src hears of the release. */
+static void dnd_drop(void)
+{
+    dnd_update();                       /* where the pointer is now, Ctrl as it is now */
+    if (dnd.cancelled || !dnd.target) {
+        dnd.result = DROP_NONE;
+    } else if (dnd.target == dnd.src) {
+        dnd.result = DRAG_HERE;
+    } else if (dnd.effect == DROP_NONE) {
+        dnd.target->ops->drop(dnd.target, 0, 0, &dnd.d, DROP_LEAVE, dnd_copy());
+        dnd.result = DROP_NONE;
+    } else {
+        struct window *t = dnd.target, *before = focused;
+        struct rect cl = wm_client_rect(t);
+        damage_drag_image();
+        dnd.cancelled = 1;              /* no more picture, whatever the drop opens */
+        dnd.result = t->ops->drop(t, mx - cl.x, my - cl.y, &dnd.d, DROP_DO, dnd_copy());
+        int live = 0;
+        for (struct window *w = bottom; w; w = w->above)
+            live |= w == t;
+        if (live && focused == before)
+            wm_focus(t);                /* where it was put, unless that opened something of its own */
+    }
+}
+
+static int dnd_pointer(enum cursor_kind *k)
+{
+    if (!dnd_shown() || dnd.effect == DRAG_HERE)
+        return 0;
+    *k = dnd.effect == DROP_NONE ? CUR_NO : CUR_ARROW;
+    return 1;
 }
 
 static void press_left(void)
@@ -2763,6 +2977,7 @@ static void drag_motion(void)
         break;
     }
     case DRAG_CLIENT:
+        dnd_update();                   /* first, so wm_drag_here() is about this move */
         client_mouse(drag_win, mbuttons, 0);
         break;
     case DRAG_TASK: {
@@ -2835,7 +3050,12 @@ static void release_left(void)
             toggle_maximize(w);
         break;
     case DRAG_CLIENT:
+        if (dnd.active)
+            dnd_drop();
         client_mouse(w, mbuttons, MOUSE_LEFT);
+        if (dnd.active)
+            dnd_clear();
+        update_cursor();
         break;
     case DRAG_TASK: {
         int i = task_pressed_idx;
@@ -3017,6 +3237,10 @@ static void key_event(const struct input_event *ev)
             sound_key(ev->code);
         return;
     }
+    if (ev->mods != kmods) {
+        kmods = ev->mods;
+        dnd_update();                   /* Ctrl copies rather than moves */
+    }
     if (!(ev->flags & IEV_PRESSED)) {
         /* Releases only matter to a window that follows keys held down. */
         if (!menu_open && focused && focused->ops && focused->ops->key)
@@ -3025,6 +3249,8 @@ static void key_event(const struct input_event *ev)
     }
     int code = ev->code;
     int ctrl = ev->mods & KMOD_CTRL, alt = ev->mods & KMOD_ALT;
+    if (code == KEY_ESC && dnd_shown())
+        dnd_cancel();                   /* and the window it came from hears Escape too */
 
     if (setup_mode && code == KEY_F10 && (ev->mods & KMOD_SHIFT)) {
         terminal_open("Command Prompt", NULL, 0, 0);

@@ -220,7 +220,7 @@ static void test_handshake(void)
     CHECK(r.reply[5] == 0x01 && r.reply[6] == 0x0A);            /* MIC, pairwise, version 2 */
     CHECK(!memcmp(r.reply + 99, own, own_len));
     ap_derive(&ap, snonce);
-    CHECK(!memcmp(ap.ptk, sm.ptk, 48));
+    CHECK(!memcmp(ap.ptk, sm.tptk, 48));                        /* aside until message 3 */
     CHECK(mic_valid(ap.ptk, r.reply, r.reply_len));
 
     /* Message 3 with a wrong ANonce is refused; with a bad MIC too. */
@@ -255,10 +255,30 @@ static void test_handshake(void)
     /* The same message 3 again is a replay. */
     CHECK(wpa_rx(&sm, f, len, &r) == WPA_EREPLAY);
 
+    /* Our message 4 was lost, so the AP retransmits message 3 with a new
+     * counter: message 4 again, but no key is installed a second time. */
+    ap.replay = 3;
+    len = ap_frame(&ap, f, 0x13CA, ap.anonce, kd, kdl, 1);
+    CHECK(wpa_rx(&sm, f, len, &r) == 0);
+    CHECK(!r.install_ptk && !r.install_gtk && !r.connected);
+    CHECK(r.reply_len == 99 && r.reply[5] == 0x03 && r.reply[6] == 0x0A && r.reply[16] == 3);
+    CHECK(mic_valid(ap.ptk, r.reply, r.reply_len));
+
+    /* A forged message 1 (it carries no MIC) leaves the keys in use alone. */
+    uint8_t live[48], forged[32];
+    memcpy(live, sm.ptk, 48);
+    memset(forged, 0xEE, 32);
+    ap.replay = 4;
+    nonce_byte = 0x77;
+    len = ap_frame(&ap, f, 0x008A, forged, NULL, 0, 0);
+    CHECK(wpa_rx(&sm, f, len, &r) == 0 && r.reply_len && !r.install_ptk);
+    CHECK(!memcmp(sm.ptk, live, 48) && sm.state == WPA_DONE);
+    nonce_byte = 0x5A;
+
     /* Group rekey: key 2. */
     for (int i = 0; i < 16; i++)
         gtk[i] = (uint8_t)(0x30 + i);
-    ap.replay = 3;
+    ap.replay = 5;
     kdl = ap_keydata(&ap, kd, 0, 2, gtk);
     len = ap_frame(&ap, f, 0x1382, NULL, kd, kdl, 1);
     CHECK(wpa_rx(&sm, f, len, &r) == 0);
@@ -266,6 +286,19 @@ static void test_handshake(void)
     CHECK(!memcmp(r.gtk, gtk, 16));
     CHECK(r.reply_len == 99 && r.reply[5] == 0x03 && r.reply[6] == 0x02);
     CHECK(mic_valid(ap.ptk, r.reply, r.reply_len));
+
+    /* A real pairwise rekey: the new keys go in once message 3 proves them. */
+    ap.anonce[0] ^= 0xFF;
+    ap.replay = 6;
+    len = ap_frame(&ap, f, 0x008A, ap.anonce, NULL, 0, 0);
+    CHECK(wpa_rx(&sm, f, len, &r) == 0 && !r.install_ptk && !memcmp(sm.ptk, live, 48));
+    ap_derive(&ap, snonce);
+    CHECK(mic_valid(ap.ptk, r.reply, r.reply_len));
+    ap.replay = 7;
+    kdl = ap_keydata(&ap, kd, 1, 1, gtk);
+    len = ap_frame(&ap, f, 0x13CA, ap.anonce, kd, kdl, 1);
+    CHECK(wpa_rx(&sm, f, len, &r) == 0 && r.install_ptk && r.install_gtk && !r.connected);
+    CHECK(!memcmp(sm.ptk, ap.ptk, 48) && memcmp(sm.ptk, live, 48));
 
     /* Truncated and foreign frames are dropped. */
     CHECK(wpa_rx(&sm, f, 50, &r) == WPA_EBADFRAME);

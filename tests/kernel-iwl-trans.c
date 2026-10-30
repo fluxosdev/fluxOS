@@ -103,6 +103,11 @@ int main(void)
     setup(); t.tx[0].active=1; t.tx[0].id=3; t.tx[0].read=65534; t.tx[0].write=2;
     iwl_trans_reclaim(3,1); CHECK(t.tx[0].read==1 && !iwl.dead);
     iwl_trans_reclaim(3,10); CHECK(iwl.dead && t.tx[0].read==1);
+    /* The firmware's SSN wraps at 12 bits: frame 4096 completes as SSN 0. */
+    setup(); t.tx[0].active=1; t.tx[0].id=3; t.tx[0].read=4094; t.tx[0].write=4098;
+    iwl_trans_reclaim(3,4095); CHECK(t.tx[0].read==4095 && !iwl.dead);
+    iwl_trans_reclaim(3,1); CHECK(t.tx[0].read==4097 && !iwl.dead);
+    iwl_trans_reclaim(3,4); CHECK(iwl.dead && t.tx[0].read==4097);
     /* Multi-buffer RX must discard the final (unflagged) continuation,
      * including when it arrives in a later poll. */
     setup();

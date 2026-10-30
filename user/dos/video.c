@@ -139,7 +139,12 @@ static int active_page(void)
 
 static uint32_t page_base(int page)
 {
-    return (rb(0x449) == 7 ? 0xB0000u : 0xB8000u) + (uint32_t)page * rw(0x44C);
+    /* The page size is in the program's reach: keep the 8 pages within
+     * the 32K of text memory. */
+    uint32_t size = rw(0x44C);
+    if (size > 0x1000)
+        size = 0x1000;
+    return (rb(0x449) == 7 ? 0xB0000u : 0xB8000u) + (uint32_t)(page & 7) * size;
 }
 
 static uint32_t cell_addr(int page, int row, int col)

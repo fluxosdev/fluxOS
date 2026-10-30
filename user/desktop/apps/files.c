@@ -100,15 +100,21 @@ struct fm {
 
 static struct fm *fms;
 
-/* The folder a drag is hovering over: the entry drop_i of window drop_f, or -1 for the window. */
+/* The folder a drag is over: the entry drop_i of window drop_f, or -1 for the window's own. */
 static struct fm *drop_f;
 static int drop_i = -1;
+static void set_drop(struct fm *tf, int ti);
 
 /* ---- paths and directory loading ---- */
 
-static void join(char *out, size_t size, const char *dir, const char *name)
+/* -1 (ENAMETOOLONG) when it does not fit: a cut-short path names something else. */
+static int join(char *out, size_t size, const char *dir, const char *name)
 {
-    snprintf(out, size, "%s%s%s", dir, strcmp(dir, "/") ? "/" : "", name);
+    if (snprintf(out, size, "%s%s%s", dir, strcmp(dir, "/") ? "/" : "", name) >= (int)size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
 }
 
 static int is_program(const char *path)
@@ -827,9 +833,9 @@ static void do_delete(void *ctx)
         if (!f->ents[i].selected)
             continue;
         char path[PATH_MAX];
-        join(path, sizeof(path), f->path, f->ents[i].name);
         struct stat st;
-        int r = stat(path, &st) == 0 && S_ISDIR(st.st_mode) ? rmdir(path) : unlink(path);
+        int r = join(path, sizeof(path), f->path, f->ents[i].name) < 0 ? -1 :
+                lstat(path, &st) == 0 && S_ISDIR(st.st_mode) ? rmdir(path) : unlink(path);
         if (r < 0) {
             report("Error Deleting File", "delete", f->ents[i].name);
             break;
@@ -862,8 +868,7 @@ static void do_mkdir(void *ctx, const char *name)
     if (!f)
         return;
     char path[PATH_MAX];
-    join(path, sizeof(path), f->path, name);
-    if (mkdir(path, 0755) < 0) {
+    if (join(path, sizeof(path), f->path, name) < 0 || mkdir(path, 0755) < 0) {
         report("Error Creating Folder", "create", name);
         return;
     }
@@ -876,9 +881,8 @@ static void do_rename(void *ctx, const char *name)
     if (!f || !strcmp(name, f->pending))
         return;
     char from[PATH_MAX], to[PATH_MAX];
-    join(from, sizeof(from), f->path, f->pending);
-    join(to, sizeof(to), f->path, name);
-    if (strchr(name, '/') || rename(from, to) < 0) {
+    if (join(from, sizeof(from), f->path, f->pending) < 0 || join(to, sizeof(to), f->path, name) < 0 ||
+        strchr(name, '/') || rename(from, to) < 0) {
         if (strchr(name, '/'))
             errno = EINVAL;
         report("Error Renaming File", "rename", f->pending);
@@ -899,13 +903,14 @@ static void ask_rename(struct fm *f)
 
 /* ---- cut, copy and paste ---- */
 
-static int copy_file(const char *src, const char *dst)
+/* Copies a file's contents and its permissions (a script stays runnable). */
+static int copy_file(const char *src, const char *dst, mode_t mode)
 {
     static char buf[4096];
     int in = open(src, O_RDONLY);
     if (in < 0)
         return -1;
-    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC);
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode & 07777);
     if (out < 0) {
         int e = errno;
         close(in);
@@ -922,59 +927,80 @@ static int copy_file(const char *src, const char *dst)
     if (n < 0)
         r = -1;
     int e = errno;
+    fchmod(out, mode & 07777);          /* as it was, whatever the umask; a disk without modes keeps what it can */
     close(in);
     close(out);
     errno = e;
     return r;
 }
 
-/* Copies a file or a whole folder tree; this works between filesystems. */
+static int copy_link(const char *src, const char *dst)
+{
+    char target[PATH_MAX];
+    ssize_t n = readlink(src, target, sizeof(target) - 1);
+    if (n < 0)
+        return -1;
+    target[n] = 0;
+    return symlink(target, dst);
+}
+
+/* Copies a file or a whole folder tree; this works between filesystems. A
+ * symbolic link is copied as one, never followed (ln -s . loop). The paths
+ * are on the heap: a tree can be PATH_MAX / 2 deep. */
 static int copy_tree(const char *src, const char *dst)
 {
     struct stat st;
-    if (stat(src, &st) < 0)
+    if (lstat(src, &st) < 0)
         return -1;
+    if (S_ISLNK(st.st_mode))
+        return copy_link(src, dst);
     if (!S_ISDIR(st.st_mode))
-        return copy_file(src, dst);
+        return copy_file(src, dst, st.st_mode);
     if (mkdir(dst, 0755) < 0 && errno != EEXIST)
         return -1;
-    DIR *d = opendir(src);
-    if (!d)
+    char *s = malloc(2 * PATH_MAX), *t = s + PATH_MAX;
+    DIR *d = s ? opendir(src) : NULL;
+    if (!d) {
+        free(s);
         return -1;
+    }
     int r = 0;
     struct dirent *de;
     while (r == 0 && (de = readdir(d))) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
             continue;
-        char s[PATH_MAX], t[PATH_MAX];
-        join(s, sizeof(s), src, de->d_name);
-        join(t, sizeof(t), dst, de->d_name);
-        r = copy_tree(s, t);
+        r = join(s, PATH_MAX, src, de->d_name) < 0 || join(t, PATH_MAX, dst, de->d_name) < 0 ? -1 :
+            copy_tree(s, t);
     }
     closedir(d);
+    free(s);
+    chmod(dst, st.st_mode & 07777);     /* once its contents are in */
     return r;
 }
 
+/* Removes a file or folder tree; a symbolic link goes, not what it points to. */
 static int remove_tree(const char *path)
 {
     struct stat st;
-    if (stat(path, &st) < 0)
+    if (lstat(path, &st) < 0)
         return -1;
     if (!S_ISDIR(st.st_mode))
         return unlink(path);
-    DIR *d = opendir(path);
-    if (!d)
+    char *c = malloc(PATH_MAX);
+    DIR *d = c ? opendir(path) : NULL;
+    if (!d) {
+        free(c);
         return -1;
+    }
     int r = 0;
     struct dirent *de;
     while (r == 0 && (de = readdir(d))) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
             continue;
-        char c[PATH_MAX];
-        join(c, sizeof(c), path, de->d_name);
-        r = remove_tree(c);
+        r = join(c, PATH_MAX, path, de->d_name) < 0 ? -1 : remove_tree(c);
     }
     closedir(d);
+    free(c);
     return r ? r : rmdir(path);
 }
 
@@ -990,8 +1016,8 @@ static void clip_set(struct fm *f, int cut)
     clip = list;
     clip_n = 0;
     for (int i = 0; i < f->n; i++)
-        if (f->ents[i].selected)
-            join(clip[clip_n++], PATH_MAX, f->path, f->ents[i].name);
+        if (f->ents[i].selected && join(clip[clip_n], PATH_MAX, f->path, f->ents[i].name) == 0)
+            clip_n++;
     clip_cut = cut;
     paint(f);
 }
@@ -999,7 +1025,7 @@ static void clip_set(struct fm *f, int cut)
 static int exists(const char *path)
 {
     struct stat st;
-    return stat(path, &st) == 0;
+    return lstat(path, &st) == 0;       /* a link to nothing is there all the same */
 }
 
 /* Pastes one clipboard item into the folder; 0 on success. */
@@ -1008,14 +1034,16 @@ static int paste_one(const char *dir, const char *src, char *name, int cut)
     const char *base = strrchr(src, '/');
     base = base ? base + 1 : src;
     char dst[PATH_MAX];
+    int r = -1;
     snprintf(name, NAME_MAX + 1, "%s", base);
-    join(dst, sizeof(dst), dir, name);
+    if (join(dst, sizeof(dst), dir, name) < 0)
+        goto out;
 
     /* A folder cannot go inside itself. */
     size_t n = strlen(src);
     if (!strncmp(dst, src, n) && dst[n] == '/') {
         struct stat st;
-        if (stat(src, &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (lstat(src, &st) == 0 && S_ISDIR(st.st_mode)) {
             message_box("File Manager", ICON_WARNING, "Cannot copy a folder into itself.");
             return 1;
         }
@@ -1027,10 +1055,14 @@ static int paste_one(const char *dir, const char *src, char *name, int cut)
             snprintf(name, NAME_MAX + 1, "Copy of %s", base);
         else
             snprintf(name, NAME_MAX + 1, "Copy (%d) of %s", k, base);
-        join(dst, sizeof(dst), dir, name);
+        if (join(dst, sizeof(dst), dir, name) < 0)
+            goto out;
+    }
+    if (exists(dst)) {                  /* every name up to "Copy (99) of" taken: never over one */
+        errno = EEXIST;
+        goto out;
     }
 
-    int r;
     if (cut && rename(src, dst) == 0) {
         r = 0;
     } else {
@@ -1044,6 +1076,7 @@ static int paste_one(const char *dir, const char *src, char *name, int cut)
             r = remove_tree(src);
         }
     }
+out:
     if (r < 0) {
         report(cut ? "Error Moving File" : "Error Copying File", cut ? "move" : "copy", base);
         return 1;
@@ -1208,6 +1241,12 @@ static void fm_key(struct window *w, const struct input_event *ev)
     struct fm *f = w->priv;
     if (!(ev->flags & IEV_PRESSED))
         return;
+    if (f->hold == HOLD_ITEM && f->dragging && ev->code == KEY_ESC) {
+        f->hold = HOLD_NONE;            /* the window manager has dropped it nowhere */
+        f->dragging = 0;
+        set_drop(NULL, -1);
+        return;
+    }
     if (f->ctx_open) {
         f->ctx_open = 0;
         paint(f);
@@ -1273,31 +1312,15 @@ static void scroll_to_mouse(struct fm *f, int y)
         set_scroll(f, (y - f->thumb_grab - (sb.y + SB_W)) * max_scroll(f) / span);
 }
 
-/* The folder window under a screen point, and which of its entries (or -1). */
-static struct fm *fm_at(int sx, int sy, int *entry)
+/* The folder entry of f at x, y, or -1. */
+static int folder_at(struct fm *f, int x, int y)
 {
-    for (struct fm *o = fms; o; o = o->next) {
-        struct rect cl = wm_client_rect(o->win);
-        int x = sx - cl.x, y = sy - cl.y;
-        if (o->win->minimized || !rect_contains(mkrect(0, 0, cl.w, cl.h), x, y) ||
-            !rect_contains(icon_area(o), x, y))
-            continue;
-        *entry = -1;
-        for (int i = 0; i < o->n; i++)
-            if (o->ents[i].is_dir && rect_contains(cell_rect(o, i), x, y))
-                *entry = i;
-        return o;
-    }
-    return NULL;
-}
-
-/* Finds what a drag from f is over; entries being dragged are not drop targets. */
-static void drop_target(struct fm *f, int x, int y, struct fm **tf, int *ti)
-{
-    struct rect cl = wm_client_rect(f->win);
-    *tf = fm_at(cl.x + x, cl.y + y, ti);
-    if (*tf == f && *ti >= 0 && f->ents[*ti].selected)
-        *ti = -1;
+    if (!rect_contains(icon_area(f), x, y))
+        return -1;
+    for (int i = 0; i < f->n; i++)
+        if (f->ents[i].is_dir && rect_contains(cell_rect(f, i), x, y))
+            return i;
+    return -1;
 }
 
 static void set_drop(struct fm *tf, int ti)
@@ -1313,28 +1336,102 @@ static void set_drop(struct fm *tf, int ti)
         paint(tf);
 }
 
-/* Moves the dragged selection into the folder it was dropped on. */
-static void drop_items(struct fm *f, struct fm *tf, int ti)
+/* The selection, for the window manager to carry to other windows. */
+static void start_drag(struct fm *f)
+{
+    struct drag_data d = { 0 };
+    char **paths = calloc((size_t)f->n, sizeof(char *));
+    if (!paths)
+        return;
+    for (int i = 0; i < f->n; i++) {
+        if (!f->ents[i].selected)
+            continue;
+        char path[PATH_MAX];
+        if (join(path, sizeof(path), f->path, f->ents[i].name) < 0)
+            continue;
+        if (!(paths[d.npaths] = strdup(path)))
+            break;
+        if (!d.npaths++) {
+            d.icon = f->ents[i].icon;
+            snprintf(d.label, sizeof(d.label), "%s", f->ents[i].name);
+        }
+    }
+    if (d.npaths > 1)                   /* the first one's icon, as Windows shows */
+        snprintf(d.label, sizeof(d.label), "%d items", d.npaths);
+    d.paths = paths;
+    if (d.npaths)
+        wm_drag_start(f->win, &d);
+    for (int i = 0; i < d.npaths; i++)
+        free(paths[i]);
+    free(paths);
+}
+
+/* Moves the dragged selection into one of f's own folders. */
+static void drop_items(struct fm *f, int ti)
 {
     char dir[PATH_MAX];
-    if (ti >= 0)
-        join(dir, sizeof(dir), tf->path, tf->ents[ti].name);
-    else
-        snprintf(dir, sizeof(dir), "%s", tf->path);
-    if (!strcmp(dir, f->path))
-        return;                         /* dropped where it came from */
+    if (join(dir, sizeof(dir), f->path, f->ents[ti].name) < 0)
+        return;
     char name[NAME_MAX + 1] = "";
     for (int i = 0; i < f->n; i++) {
         if (!f->ents[i].selected)
             continue;
         char src[PATH_MAX];
-        join(src, sizeof(src), f->path, f->ents[i].name);
-        if (paste_one(dir, src, name, 1))
+        if (join(src, sizeof(src), f->path, f->ents[i].name) < 0 || paste_one(dir, src, name, 1))
             break;
     }
     reload(f, NULL);
-    if (tf != f)
-        reload(tf, NULL);
+}
+
+/* Files dragged here from another window: into the folder under the pointer,
+ * or the one this window shows. Moved within a disk and copied to another, as
+ * in Windows; Ctrl copies anyway. */
+static int fm_drop(struct window *w, int x, int y, const struct drag_data *d, int phase, int copy)
+{
+    struct fm *f = w->priv;
+    if (phase == DROP_LEAVE || !d->npaths || f->editing) {
+        set_drop(NULL, -1);
+        return DROP_NONE;
+    }
+    int ti = folder_at(f, x, y);
+    char dir[PATH_MAX];
+    if (ti < 0)
+        snprintf(dir, sizeof(dir), "%s", f->path);
+    else if (join(dir, sizeof(dir), f->path, f->ents[ti].name) < 0) {
+        set_drop(NULL, -1);             /* too long a path to go into */
+        return DROP_NONE;
+    }
+    struct stat ds, ss;
+    int here = 1, same_disk = stat(dir, &ds) == 0;
+    for (int i = 0; i < d->npaths; i++) {
+        char parent[PATH_MAX];
+        snprintf(parent, sizeof(parent), "%s", d->paths[i]);
+        char *slash = strrchr(parent, '/');
+        if (slash)
+            *(slash == parent ? slash + 1 : slash) = 0;
+        here &= !strcmp(parent, dir);
+        same_disk &= lstat(d->paths[i], &ss) == 0 && ss.st_dev == ds.st_dev;   /* a link is where it is */
+    }
+    if (here) {                         /* where they are already */
+        set_drop(NULL, -1);
+        return DROP_NONE;
+    }
+    int effect = copy || !same_disk ? DROP_COPY : DROP_MOVE;
+    if (phase == DROP_OVER) {
+        set_drop(f, ti);
+        const char *base = strrchr(dir, '/');
+        wm_drag_hint("%s to %s", effect == DROP_COPY ? "Copy" : "Move",
+                     base && base[1] ? base + 1 : dir);
+        return effect;
+    }
+    set_drop(NULL, -1);
+    char name[NAME_MAX + 1] = "";
+    for (int i = 0; i < d->npaths; i++)
+        if (paste_one(dir, d->paths[i], name, effect == DROP_MOVE))
+            break;
+    for (struct fm *o = fms; o; o = o->next)
+        reload(o, NULL);                /* this one, and any showing where they came from */
+    return effect;
 }
 
 static void press(struct fm *f, int x, int y)
@@ -1456,14 +1553,14 @@ static void fm_mouse(struct window *w, int x, int y, int buttons, int changed)
         enum hold h = f->hold;
         f->hold = HOLD_NONE;
         if (h == HOLD_ITEM) {
-            struct fm *tf;
-            int ti;
             if (f->dragging) {
-                drop_target(f, x, y, &tf, &ti);
+                int ti = drop_f == f ? drop_i : -1;
                 set_drop(NULL, -1);
                 f->dragging = 0;
-                if (tf)
-                    drop_items(f, tf, ti);
+                if (wm_drag_effect() == DRAG_HERE && ti >= 0)
+                    drop_items(f, ti);
+                else if (wm_drag_effect() == DROP_MOVE)
+                    reload(f, NULL);    /* another window took them */
             } else if (count_selected(f) > 1) {
                 select_only(f, f->item_hit);    /* a plain click on one of several */
             }
@@ -1477,11 +1574,18 @@ static void fm_mouse(struct window *w, int x, int y, int buttons, int changed)
     } else if (f->hold == HOLD_ITEM) {
         if (!f->dragging && abs(x - f->item_x) < DRAG_SLOP && abs(y - f->item_y) < DRAG_SLOP)
             return;
-        f->dragging = 1;
-        struct fm *tf;
-        int ti;
-        drop_target(f, x, y, &tf, &ti);
-        set_drop(tf, ti);
+        if (!f->dragging) {
+            f->dragging = 1;
+            start_drag(f);
+        }
+        /* Over this window: its own folders, but not those being dragged. */
+        int ti = wm_drag_here() ? folder_at(f, x, y) : -1;
+        if (ti >= 0 && f->ents[ti].selected)
+            ti = -1;
+        if (wm_drag_here())
+            set_drop(f, ti);
+        else if (drop_f == f)
+            set_drop(NULL, -1);
         return;
     } else if (f->hold == HOLD_THUMB) {
         scroll_to_mouse(f, y);
@@ -1545,6 +1649,7 @@ static const struct window_ops fm_ops = {
     .focus = fm_focus,
     .resize = fm_resize,
     .destroy = fm_destroy,
+    .drop = fm_drop,
 };
 
 struct window *files_open(const char *path)

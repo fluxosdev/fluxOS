@@ -231,7 +231,8 @@ struct usb_hc_ops {
     /* After a halt was cleared: the endpoint starts again with DATA0. */
     void (*ep_reset)(struct usb_hc *hc, struct usb_dev *dev, struct usb_ep *ep);
     /* xHCI: an endpoint of another alternate setting is about to be used
-     * (ep filled in by the driver), or is finished with. Process context. */
+     * (ep filled in by the driver), or is finished with. Process context.
+     * EHCI: refuses isochronous endpoints, which it cannot do. */
     int (*ep_enable)(struct usb_hc *hc, struct usb_dev *dev, struct usb_ep *ep);
     void (*ep_disable)(struct usb_hc *hc, struct usb_dev *dev, struct usb_ep *ep);
     /* Suspend to RAM, with no devices left: stop; then, the power having

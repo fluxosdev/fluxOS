@@ -366,7 +366,7 @@ static void parse_config(struct usb_dev *dev)
         switch (d[off + 1]) {
         case USB_DT_INTERFACE: {
             const struct usb_iface_desc *ifd = (const void *)(d + off);
-            alt0 = ifd->bAlternateSetting == 0;
+            alt0 = d[off] >= 9 && ifd->bAlternateSetting == 0;     /* a short one is skipped, with its endpoints */
             last = NULL;
             if (alt0 && dev->nifaces < USB_MAX_IFACES) {
                 struct usb_iface *ifc = &dev->ifaces[dev->nifaces++];

@@ -53,6 +53,8 @@ static int ensure_slot(struct fgl_context *c, GLuint name)
 {
     if (name < c->ntextures)
         return 0;
+    if (name >= 0x10000000u)            /* so n * 2 and n * sizeof cannot wrap */
+        return -1;
     GLuint n = c->ntextures ? c->ntextures : 16;
     while (n <= name)
         n *= 2;
@@ -282,7 +284,7 @@ void glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei width
         return;
     struct gltex *t = bound_texture(c);
     if (!t || level < 0 || x < 0 || y < 0 || width < 0 || height < 0 ||
-        x + width > t->w || y + height > t->h) {
+        x > t->w - width || y > t->h - height) {
         gl_error(c, GL_INVALID_VALUE);
         return;
     }

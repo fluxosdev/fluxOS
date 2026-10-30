@@ -9,19 +9,21 @@
  * format (channels, sample size, rates) on an isochronous endpoint. The
  * first AudioControl interface is taken, the best playback format among
  * the streaming interfaces chosen (16-bit stereo at 48 kHz if it has it),
- * its alternate setting selected, and the endpoint told the rate.
+ * its alternate setting selected, and the endpoint told the rate. The
+ * device is a backend of the software mixer (pcm.c), which converts what
+ * programs write to the device's rate and leaves it in a ring.
  *
  * Playing is a stream of isochronous packets, one a service interval
  * (every millisecond at full speed), each holding the frames that
  * interval is due at the device's rate (a fraction carries over, so
  * 44.1 kHz works). A few transfers of several packets each are kept in
- * flight; each one is refilled from the ring of frames write() leaves,
+ * flight; each one is refilled from the ring of frames the mixer leaves,
  * silence when it is empty, and queued again when it completes, from the
  * controller's interrupt. A device that runs its own clock sends how
  * many frames it wants on a feedback endpoint, which is followed.
  *
- * Locking: write() and the ioctls hold snd_lock, as the other sound
- * drivers do; the packet refills run under usb_lock from interrupts, and
+ * Locking: the mixer fills the ring under snd_lock, from write() and the
+ * timer tick; the packet refills run under usb_lock from interrupts, and
  * never take snd_lock. The ring between them is one writer, one reader.
  * Nothing waits for the controller while holding snd_lock (the controller
  * commands behind cancelling a transfer may sleep), so stopping the
@@ -29,9 +31,10 @@
  * sent from process context without it.
  *
  * While a device is plugged in it is /dev/dsp: the built-in card's node
- * (if there is one, and it is not open) is pointed at this driver and
- * given back when the device goes; the device also has /dev/dsp1 of its
- * own. The option usbaudio=secondary leaves /dev/dsp alone.
+ * (if there is one) opens this device's mixer, and the built-in card's
+ * again when the device goes; programs playing meanwhile play on where
+ * they started. The device also has /dev/dsp1 of its own. The option
+ * usbaudio=secondary leaves /dev/dsp alone.
  */
 #include "kernel.h"
 #include "drivers.h"
@@ -73,9 +76,6 @@
 #define XFER_BYTES    4096              /* each one's buffer: one page, so no 64 KiB crossing */
 #define RING_SIZE     65536u            /* bytes of device frames waiting to go */
 #define RING_PAGES    (RING_SIZE / PAGE_SIZE)
-#define MAX_PER_IN    16                /* device frames one input frame can become (4 kHz in) */
-#define MIN_RATE      4000
-#define MAX_RATE      48000
 #define MAX_DEV_RATE  192000
 #define STALL_TICKS   (2 * HZ)          /* no packet completed for this long: the stream is dead */
 
@@ -110,6 +110,7 @@ static struct {
     struct usb_xfer x[NX];
     uint8_t *buf[NX];
     uint16_t plen[NX][USB_ISO_MAX_PACKETS];
+    uint32_t real[NX];                  /* bytes of mixed frames in each transfer */
     int npk;                            /* packets a transfer */
     volatile int streaming;
     int inflight;
@@ -121,43 +122,29 @@ static struct {
     int fb_running;
     uint32_t progress, progress_tick, underruns, errors;
     int need_reset;                     /* the stream stalled: its transfers must be cancelled first */
-    int draining;                       /* drain(): once the ring is empty, let the stream end */
 
-    /* write()'s side, under snd_lock */
-    int open_pid;
-    int rate, channels, fmt_user;       /* what write() is given */
-    uint8_t carry[4];
-    uint32_t ncarry;
-    int32_t prev_l, prev_r;             /* the resampler */
-    uint32_t pos, step;
+    /* the mixer's side, under snd_lock */
     volatile uint32_t rhead, rtail;     /* the ring: written at rhead, read at rtail */
     uint8_t *ring;
     int master, pcm;                    /* volumes, 0-100 */
 
     /* the device nodes: ours, and the built-in card's while we have them */
-    struct vnode *dsp, *mixer;
+    struct pcm *dsp;                    /* our mixer */
+    struct vnode *mixer;
     int primary;                        /* ours are /dev/dsp and /dev/mixer */
     struct vnode *taken_dsp, *taken_mixer;
-    dev_open_t saved_open;
-    dev_close_t saved_close;
-    dev_write_t saved_write;
-    dev_ioctl_t saved_ioctl, saved_mixer_ioctl;
-    dev_poll_t saved_poll;
+    struct pcm *saved_dsp;
+    dev_ioctl_t saved_mixer_ioctl;
 } ua = { .gone = 1 };
 
-/* ---- the ring and the resampler (write()'s side) ---- */
+/* ---- the ring (the mixer's side) ---- */
 
 static uint32_t ring_used(void)
 {
     return ua.rhead - ua.rtail;
 }
 
-static uint32_t user_frame(void)
-{
-    return (uint32_t)ua.channels * (ua.fmt_user == AFMT_S16_LE ? 2 : 1);
-}
-
-static int32_t volume(void)
+static int ua_gain(void)
 {
     int v = ua.pcm * (ua.fu_volume ? 100 : ua.master) / 100;
     return v * 256 / 100;
@@ -183,47 +170,34 @@ static void push_dev_frame(int32_t l, int32_t r)
     ua.rhead = h;                       /* whole frames only: the reader never sees part of one */
 }
 
-/* One input frame as device frames, interpolating between it and the one before. */
-static void put_frame(const uint8_t *in)
+/* Mixed frames into the ring, in the device's format. */
+static void ua_put(const int16_t *lr, uint32_t n)
 {
-    int32_t s[2] = { 0, 0 };
-    for (int c = 0; c < ua.channels; c++) {
-        if (ua.fmt_user == AFMT_S16_LE) {
-            s[c] = (int16_t)(in[0] | in[1] << 8);
-            in += 2;
-        } else {
-            s[c] = (*in++ - 128) << 8;
-        }
-    }
-    if (ua.channels == 1)
-        s[1] = s[0];
-    int32_t vol = volume();
-    int32_t l = s[0] * vol / 256, r = s[1] * vol / 256;
-    while (ua.pos < 0x10000) {
-        int32_t f = (int32_t)(ua.pos >> 2);
-        push_dev_frame(ua.prev_l + (((l - ua.prev_l) * f) >> 14),
-                       ua.prev_r + (((r - ua.prev_r) * f) >> 14));
-        ua.pos += ua.step;
-    }
-    ua.pos -= 0x10000;
-    ua.prev_l = l;
-    ua.prev_r = r;
+    for (uint32_t i = 0; i < n; i++)
+        push_dev_frame(lr[2 * i], lr[2 * i + 1]);
 }
 
-static void reset_resampler(void)
+static uint32_t ua_room(void)
 {
-    ua.pos = 0;
-    ua.prev_l = ua.prev_r = 0;
-    ua.step = (uint32_t)(((uint32_t)ua.rate << 16) / ua.f.rate);
+    return (RING_SIZE - ring_used()) / ua.df;
 }
 
-static void set_defaults(void)
+static uint32_t ua_queued(void)
 {
-    ua.rate = 8000;
-    ua.channels = 1;
-    ua.fmt_user = AFMT_U8;
-    ua.ncarry = 0;
-    reset_resampler();
+    uint32_t bytes = ring_used();
+    for (int k = 0; k < NX; k++)
+        bytes += ua.real[k];
+    return bytes / ua.df;
+}
+
+static int ua_running(void)
+{
+    return ua.streaming;
+}
+
+static int ua_gone(void)
+{
+    return ua.gone;
 }
 
 /* ---- the stream (under usb_lock) ---- */
@@ -237,17 +211,13 @@ static uint32_t next_frames(void)
     return n;
 }
 
-static uint32_t xfer_bytes(void)
-{
-    return (ua.ff >> 16) * ua.df * (uint32_t)ua.npk;
-}
-
 /* Fill a transfer's packets from the ring, silence where it runs dry. */
 static void fill_xfer(struct usb_xfer *x)
 {
     int k = (int)(x - ua.x);
     uint8_t *p = ua.buf[k];
     uint32_t off = 0, mps = ua.ep->maxpacket;
+    ua.real[k] = 0;
     for (int i = 0; i < ua.npk; i++) {
         uint32_t n = next_frames() * ua.df;
         if (n > mps)
@@ -262,9 +232,10 @@ static void fill_xfer(struct usb_xfer *x)
             p[off + b] = ua.ring[t++ % RING_SIZE];
         __asm__ volatile("" ::: "memory");
         ua.rtail = t;
+        ua.real[k] += take;
         if (take < n) {
             memset(p + off + take, ua.f.unsigned8 ? 0x80 : 0, n - take);
-            if (ua.open_pid && ++ua.underruns <= 5)
+            if (pcm_active(ua.dsp) && ++ua.underruns <= 5)
                 klog("usb: audio underrun %u (%u of %u bytes ready)\n", ua.underruns, take, n);
         }
         ua.plen[k][i] = (uint16_t)n;
@@ -279,23 +250,21 @@ static void xfer_done(struct usb_xfer *x)
 {
     if (ua.inflight > 0)
         ua.inflight--;
+    ua.real[x - ua.x] = 0;              /* heard */
     if (x->status == -ENODEV || ua.gone)
         return;
     if (x->status < 0 && ++ua.errors <= 3)
         klog("usb: audio transfer failed (%d)\n", x->status);
     ua.progress++;
     ua.progress_tick = ticks;
-    /* An open device keeps the stream going with silence between writes,
-     * except while the writer waits for it to finish (drain). */
-    if (ua.streaming && (ring_used() || (ua.open_pid && !ua.draining))) {
+    /* While a program has the device open the stream goes on, with silence between writes. */
+    if (ua.streaming && (ring_used() || pcm_active(ua.dsp))) {
         fill_xfer(x);
         if (usb_submit(x) == 0)
             ua.inflight++;
     }
     if (!ua.inflight)
         ua.streaming = 0;               /* only silence was left, and nobody writes */
-    wakeup(&ua);
-    poll_wakeup();
 }
 
 /* The device's own clock: frames per packet from the feedback endpoint. */
@@ -367,21 +336,22 @@ static void stop(void)
         if (ua.fb_running)
             usb_cancel(&ua.fx);
     }
-    for (int k = 0; k < NX; k++)
+    for (int k = 0; k < NX; k++) {
         if (ua.x[k].status == USB_PENDING)
             ua.x[k].status = -ETIMEDOUT;
+        ua.real[k] = 0;
+    }
     ua.inflight = 0;
     ua.fb_running = 0;
     ua.fb_ff = 0;
     ua.need_reset = 0;
     usb_leave(t);
-    wakeup(&ua);
-    poll_wakeup();
 }
 
 /* From usb_tick: a stream whose packets stopped completing is given up.
  * Its transfers are still the controller's, so nothing starts again until
- * stop() has taken them back (at the next open, or SNDCTL_DSP_RESET). */
+ * stop() has taken them back (ua_recover: at the next open, or
+ * SNDCTL_DSP_RESET). */
 void usbaudio_tick(void)
 {
     if (!ua.streaming || ua.gone || (int32_t)(ticks - ua.progress_tick) < STALL_TICKS)
@@ -390,218 +360,44 @@ void usbaudio_tick(void)
     ua.streaming = 0;
     ua.need_reset = 1;
     ua.rtail = ua.rhead;
-    wakeup(&ua);
-    poll_wakeup();
+    if (ua.dsp)
+        wakeup(ua.dsp);                 /* writers see it stopped */
 }
 
-/* ---- /dev/dsp (under snd_lock) ---- */
-
-/* Sleep until a transfer completes; -EIO if the stream has stopped. */
-static int wait_progress(void)
+/* A stream that stalled (usbaudio_tick) still has its transfers on the
+ * controller: they are taken back before anything plays again. Without
+ * snd_lock, since telling the controller may wait. */
+static void ua_recover(void)
 {
-    uint32_t seen = ua.progress;
-    if (!ua.streaming || ua.gone)
-        return -EIO;
-    sleep_on_lock_timeout(&ua, &snd_lock, ticks + HZ);
-    if (signal_pending(current))
-        return -EINTR;
-    if (ua.gone)
-        return -ENODEV;
-    if (ua.streaming && ua.progress == seen)
-        return -EIO;
-    return 0;
+    if (ua.need_reset && !ua.gone)
+        stop();
 }
 
-static int drain(void)
+/* SNDCTL_DSP_RESET: nothing more is sent and what waits is forgotten. The
+ * transfers in flight are taken back by ua_recover, which the mixer calls
+ * next, without snd_lock. */
+static void ua_drop(void)
 {
-    int r = 0;
-    ua.draining = 1;
-    while (!ua.gone && (ua.streaming || ring_used())) {
-        start();
-        if (!ua.streaming)
-            break;
-        if ((r = wait_progress()) < 0)
-            break;
-    }
-    ua.draining = 0;
-    return ua.gone ? -ENODEV : r;
-}
-
-static int dsp_open_locked(struct vnode *vn, int flags)
-{
-    (void)vn;
-    if (ua.gone)
-        return -ENODEV;
-    if ((flags & O_ACCMODE) == O_RDONLY)
-        return -EINVAL;                 /* no recording */
-    if (ua.open_pid && ua.open_pid != current->leader->pid) {
-        struct proc *p = proc_find(ua.open_pid);
-        if (p && p->state != P_ZOMBIE)
-            return -EBUSY;
-    }
-    ua.open_pid = current->leader->pid;
-    if (!ua.streaming && !ring_used())
-        set_defaults();
-    return 0;
-}
-
-static void dsp_close_locked(struct vnode *vn, int flags)
-{
-    (void)vn; (void)flags;
-    ua.open_pid = 0;
-    ua.ncarry = 0;
-    start();                            /* the rest plays out by itself */
-}
-
-static int make_room(void)
-{
-    while (RING_SIZE - ring_used() < MAX_PER_IN * ua.df) {
-        start();
-        int r = wait_progress();
-        if (r < 0)
-            return r;
-    }
-    return 0;
-}
-
-static int dsp_write_locked(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
-{
-    (void)vn; (void)off;
-    if (ua.gone)
-        return -ENODEV;
-    const uint8_t *in = buf;
-    uint32_t uf = user_frame(), used = 0;
-    /* Complete a frame begun by the last write. A full frame stays in
-     * carry until there is room for it: a wait that fails (a signal) keeps
-     * it for the next write, which must not add to it. */
-    while (ua.ncarry) {
-        if (ua.ncarry < uf) {
-            if (used == n)
-                break;
-            ua.carry[ua.ncarry++] = in[used++];
-            continue;
-        }
-        int r = make_room();
-        if (r < 0)
-            return used ? (int)used : r;
-        put_frame(ua.carry);
-        ua.ncarry = 0;
-    }
-    while (n - used >= uf) {
-        if (RING_SIZE - ring_used() < MAX_PER_IN * ua.df) {
-            int r = make_room();
-            if (r < 0)
-                return used ? (int)used : r;
-        }
-        while (n - used >= uf && RING_SIZE - ring_used() >= MAX_PER_IN * ua.df) {
-            put_frame(in + used);
-            used += uf;
-        }
-        if (!ua.streaming && ring_used() >= NX * xfer_bytes())
-            start();
-    }
-    while (used < n)
-        ua.carry[ua.ncarry++] = in[used++];
-    return (int)n;
-}
-
-static int dsp_poll_locked(struct vnode *vn)
-{
-    (void)vn;
-    if (ua.gone)
-        return POLLOUT | POLLERR;
-    return RING_SIZE - ring_used() >= xfer_bytes() + MAX_PER_IN * ua.df ? POLLOUT : 0;
-}
-
-static int set_format(int *field, int value)
-{
-    if (*field == value)
-        return 0;
-    int r = drain();
-    if (r < 0)
-        return r;
-    *field = value;
-    ua.ncarry = 0;
-    reset_resampler();
-    return 0;
-}
-
-static int get_int(uint32_t arg, int *v)
-{
-    return copy_from_user(v, (const void *)arg, sizeof(*v));
-}
-
-static int put_int(uint32_t arg, int v)
-{
-    return copy_to_user((void *)arg, &v, sizeof(v));
-}
-
-/* Device bytes as the bytes of write()'s format that make them. */
-static uint32_t user_bytes(uint32_t dev_bytes)
-{
-    uint32_t frames = dev_bytes / ua.df;
-    return (uint32_t)((uint64_t)frames * (uint32_t)ua.rate / ua.f.rate) * user_frame();
-}
-
-static int dsp_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg)
-{
-    (void)vn;
-    int v, r;
-    if (ua.gone && req != SOUND_INFO)
-        return -ENODEV;
-    switch (req) {
-    case SNDCTL_DSP_RESET:              /* the stream was stopped before the lock was taken */
+    int t = usb_enter();
+    if (!ua.gone) {
+        ua.streaming = 0;
+        ua.need_reset = 1;
         ua.rtail = ua.rhead;
-        ua.ncarry = 0;
-        reset_resampler();
-        return 0;
-    case SNDCTL_DSP_SYNC:
-        return drain();
-    case SNDCTL_DSP_POST:
-        start();
-        return 0;
-    case SNDCTL_DSP_SPEED:
-        if ((r = get_int(arg, &v)) < 0)
-            return r;
-        v = v < MIN_RATE ? MIN_RATE : v > MAX_RATE ? MAX_RATE : v;
-        if ((r = set_format(&ua.rate, v)) < 0)
-            return r;
-        return put_int(arg, ua.rate);
-    case SNDCTL_DSP_CHANNELS:
-        if ((r = get_int(arg, &v)) < 0)
-            return r;
-        if ((r = set_format(&ua.channels, v >= 2 ? 2 : 1)) < 0)
-            return r;
-        return put_int(arg, ua.channels);
-    case SNDCTL_DSP_SETFMT:
-        if ((r = get_int(arg, &v)) < 0)
-            return r;
-        if ((r = set_format(&ua.fmt_user, v == AFMT_S16_LE ? AFMT_S16_LE : AFMT_U8)) < 0)
-            return r;
-        return put_int(arg, ua.fmt_user);
-    case SNDCTL_DSP_GETOSPACE: {
-        struct audio_buf_info bi;
-        uint32_t room = RING_SIZE - ring_used();
-        room = room > MAX_PER_IN * ua.df ? room - MAX_PER_IN * ua.df : 0;
-        uint32_t frag = user_bytes(xfer_bytes());
-        bi.bytes = (int32_t)user_bytes(room);
-        bi.fragsize = (int32_t)frag;
-        bi.fragstotal = (int32_t)(RING_SIZE / xfer_bytes());
-        bi.fragments = frag ? bi.bytes / (int32_t)frag : 0;
-        return copy_to_user((void *)arg, &bi, sizeof(bi));
     }
-    case SNDCTL_DSP_GETODELAY: {
-        uint32_t queued = ring_used() + (ua.streaming ? (uint32_t)ua.inflight * xfer_bytes() : 0);
-        return put_int(arg, (int)user_bytes(queued));
-    }
-    case SOUND_INFO: {
-        struct sound_info si;
-        sound_get_info(&si);
-        return copy_to_user((void *)arg, &si, sizeof(si));
-    }
-    }
-    return -EINVAL;
+    usb_leave(t);
 }
+
+static struct pcm_backend ua_backend = {
+    .room = ua_room,
+    .queued = ua_queued,
+    .put = ua_put,
+    .start = start,
+    .running = ua_running,
+    .gain = ua_gain,
+    .gone = ua_gone,
+    .recover = ua_recover,
+    .drop = ua_drop,
+};
 
 /* ---- the volume controls, by control transfer (process context, no snd_lock) ---- */
 
@@ -665,41 +461,6 @@ static int mixer_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg, int 
 
 /* ---- the device calls, under snd_lock ---- */
 
-static int dsp_open(struct vnode *vn, int flags)
-{
-    if (ua.need_reset && !ua.gone)
-        stop();
-    spin_lock(&snd_lock);
-    int r = dsp_open_locked(vn, flags);
-    spin_unlock(&snd_lock);
-    return r;
-}
-
-static void dsp_close(struct vnode *vn, int flags)
-{
-    spin_lock(&snd_lock);
-    dsp_close_locked(vn, flags);
-    spin_unlock(&snd_lock);
-}
-
-static int dsp_poll(struct vnode *vn)
-{
-    spin_lock(&snd_lock);
-    int r = dsp_poll_locked(vn);
-    spin_unlock(&snd_lock);
-    return r;
-}
-
-static int dsp_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
-{
-    if (req == SNDCTL_DSP_RESET)
-        stop();
-    spin_lock(&snd_lock);
-    int r = dsp_ioctl_locked(vn, req, arg);
-    spin_unlock(&snd_lock);
-    return r;
-}
-
 static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
 {
     int hw_level;
@@ -708,14 +469,6 @@ static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
     spin_unlock(&snd_lock);
     if (r == 0 && hw_level >= 0)
         apply_master(hw_level);
-    return r;
-}
-
-static int dsp_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
-{
-    spin_lock(&snd_lock);
-    int r = dsp_write_locked(vn, buf, off, n);
-    spin_unlock(&snd_lock);
     return r;
 }
 
@@ -732,38 +485,24 @@ static void nodes_make(void)
         return;
     int second = vfs_resolve("/dev/dsp", NULL, &other) == 0;
     ua.primary = !second;
-    ua.dsp = vfs_mknod(devdir, second ? "dsp1" : "dsp",
-                       MKDEV(SOUND_MAJOR, SOUND_MINOR_DSP + (second ? 0x80 : 0)), NULL, dsp_write);
-    if (ua.dsp) {
-        ua.dsp->dev_open = dsp_open;
-        ua.dsp->dev_close = dsp_close;
-        ua.dsp->dev_ioctl = dsp_ioctl;
-        ua.dsp->dev_poll = dsp_poll;
-    }
+    ua.dsp = pcm_create(devdir, second ? "dsp1" : "dsp",
+                        MKDEV(SOUND_MAJOR, SOUND_MINOR_DSP + (second ? 0x80 : 0)), &ua_backend);
     ua.mixer = vfs_mknod(devdir, second ? "mixer1" : "mixer",
                          MKDEV(SOUND_MAJOR, SOUND_MINOR_MIXER + (second ? 0x80 : 0)), NULL, NULL);
     if (ua.mixer)
         ua.mixer->dev_ioctl = mixer_ioctl;
 }
 
-/* Point the built-in card's /dev/dsp and /dev/mixer here, unless they are open. */
+/* Point the built-in card's /dev/dsp here, and its /dev/mixer unless that is open. */
 static void nodes_take(void)
 {
     struct vnode *dsp, *mixer;
-    if (ua.primary || ua.taken_dsp || cmdline_has("usbaudio=secondary"))
+    if (ua.primary || ua.taken_dsp || !ua.dsp || cmdline_has("usbaudio=secondary"))
         return;
-    if (vfs_resolve("/dev/dsp", NULL, &dsp) < 0 || dsp->refs > 0 || dsp->dev_write == dsp_write)
+    if (vfs_resolve("/dev/dsp", NULL, &dsp) < 0 || !pcm_of(dsp) || pcm_of(dsp) == ua.dsp)
         return;
-    ua.saved_open = dsp->dev_open;
-    ua.saved_close = dsp->dev_close;
-    ua.saved_write = dsp->dev_write;
-    ua.saved_ioctl = dsp->dev_ioctl;
-    ua.saved_poll = dsp->dev_poll;
-    dsp->dev_open = dsp_open;
-    dsp->dev_close = dsp_close;
-    dsp->dev_write = dsp_write;
-    dsp->dev_ioctl = dsp_ioctl;
-    dsp->dev_poll = dsp_poll;
+    ua.saved_dsp = pcm_of(dsp);
+    pcm_point(dsp, ua.dsp);
     ua.taken_dsp = dsp;
     if (vfs_resolve("/dev/mixer", NULL, &mixer) == 0 && mixer->refs == 0 &&
         mixer->dev_ioctl != mixer_ioctl) {
@@ -776,13 +515,8 @@ static void nodes_take(void)
 static void nodes_give_back(void)
 {
     struct vnode *dsp = ua.taken_dsp, *mixer = ua.taken_mixer;
-    if (dsp && dsp->dev_write == dsp_write) {
-        dsp->dev_open = ua.saved_open;
-        dsp->dev_close = ua.saved_close;
-        dsp->dev_write = ua.saved_write;
-        dsp->dev_ioctl = ua.saved_ioctl;
-        dsp->dev_poll = ua.saved_poll;
-    }
+    if (dsp && pcm_of(dsp) == ua.dsp)
+        pcm_point(dsp, ua.saved_dsp);
     if (mixer && mixer->dev_ioctl == mixer_ioctl)
         mixer->dev_ioctl = ua.saved_mixer_ioctl;
     ua.taken_dsp = ua.taken_mixer = NULL;
@@ -1029,8 +763,10 @@ static int audio_probe(struct usb_dev *dev, const struct usb_iface_desc *ifd,
     }
     ua.ep = usb_ep_enable(dev, &f.ep);
     ua.fb_ep = f.has_fb && (f.ep.bmAttributes & SYNC_MASK) == SYNC_ASYNC ? usb_ep_enable(dev, &f.fb) : NULL;
-    if (!ua.ep) {
-        klog("usb: %s: the controller would not set up the audio endpoint\n", dev->product);
+    if (!ua.ep) {                       /* EHCI, which has no isochronous transfers */
+        klog("usb: %s: the %s controller would not set up the audio endpoint\n", dev->product,
+             dev->hc->name);
+        usb_control(dev, USB_RT_INTERFACE, USB_REQ_SET_INTERFACE, 0, f.iface, NULL, 0);
         return -1;
     }
     if (f.ep_attrs & EP_ATTR_FREQ_CTL) {
@@ -1047,6 +783,9 @@ static int audio_probe(struct usb_dev *dev, const struct usb_iface_desc *ifd,
     ua.npk = (int)MIN(MIN((uint32_t)USB_ISO_MAX_PACKETS, XFER_BYTES / mps), ua.pps >= 8000 ? 16u : 8u);
     if (ua.npk < 1)
         ua.npk = 1;
+    /* Fed from the timer tick: all the transfers in flight, and two ticks more. */
+    ua_backend.rate = (int)f.rate;
+    ua_backend.lead = NX * (ua.ff >> 16) * (uint32_t)ua.npk + 2 * f.rate / HZ;
 
     /* The volume range, and a starting level. */
     ua.dev = dev;
@@ -1096,8 +835,7 @@ static int audio_probe(struct usb_dev *dev, const struct usb_iface_desc *ifd,
     ua.fb_ff = 0;
     ua.underruns = ua.errors = 0;
     ua.rhead = ua.rtail = 0;
-    ua.open_pid = 0;
-    set_defaults();
+    memset(ua.real, 0, sizeof(ua.real));
 
     with_vfs(nodes_make);
     with_vfs(nodes_take);
@@ -1128,9 +866,11 @@ static void audio_disconnect(struct usb_dev *dev, void *priv)
     ua.ep = ua.fb_ep = NULL;
     ua.need_reset = 0;
     ua.rtail = ua.rhead;
+    memset(ua.real, 0, sizeof(ua.real));
     int had = ua.taken_dsp != NULL;
     with_vfs(nodes_give_back);
-    wakeup(&ua);
+    if (ua.dsp)
+        wakeup(ua.dsp);                 /* writers find the device gone */
     poll_wakeup();
     klog("usb: audio: %s is gone%s\n", ua.name, had ? "; /dev/dsp is the built-in card's again" : "");
 }

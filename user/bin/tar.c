@@ -190,6 +190,14 @@ static void start_gzip(int file_fd, int reading, const uint8_t *first, size_t nf
 
 static void finish_stream(void)
 {
+    /* the rest of what gzip expands (GNU tar pads to 10 KiB records): closing on it
+     * early would fail gzip with a broken pipe */
+    if (helper > 0 && !mode_c) {
+        char buf[8192];
+        int n;
+        while ((n = (int)read(fd, buf, sizeof(buf))) > 0 || (n < 0 && errno == EINTR))
+            ;
+    }
     if (fd > 2)
         close(fd);
     if (helper > 0) {
@@ -726,6 +734,11 @@ static int read_archive(const char *extract_dir)
 
         /* GNU long names and pax headers announce the next member's name */
         if (type == 'L' || type == 'K' || type == 'x' || type == 'g') {
+            if (size > (1u << 20)) {
+                fprintf(stderr, "tar: extended header too large: damaged archive\n");
+                status = 2;
+                break;
+            }
             char *data = malloc(size + 1);
             if (!data || read_full(data, size) < 0 || skip_bytes((512 - (size & 511)) & 511) < 0) {
                 free(data);
@@ -825,8 +838,11 @@ static int read_archive(const char *extract_dir)
         } else if (type == '5') {
             if (!to_stdout) {
                 make_parents(path);
+                struct stat st;
                 if (mkdir(path, 0755) < 0 && errno != EEXIST)
                     warn("%s: cannot make directory: %s", path, strerror(errno));
+                else if (lstat(path, &st) < 0 || !S_ISDIR(st.st_mode))
+                    warn("%s: cannot make directory: %s", path, "not a directory");   /* a symbolic link there */
                 else {
                     chmod(path, mode & 07777);
                     remember_dir_time(path, mtime);
@@ -841,10 +857,14 @@ static int read_archive(const char *extract_dir)
             }
         } else if (type == '1') {
             char target[PATH_MAX];
+            struct stat st;
             if (!to_stdout && safe_path(lnk, target, sizeof(target)) && !through_symlink(target)) {
                 make_parents(path);
                 unlink(path);
-                if (link(target, path) < 0) {
+                /* a file unpacked here, not a symbolic link: the copy would read what it points at */
+                if (lstat(target, &st) < 0 || !S_ISREG(st.st_mode))
+                    warn("%s: cannot link to %s", path, target);
+                else if (link(target, path) < 0) {
                     /* no hard links on this filesystem: a copy is the next best thing */
                     int a = open(target, O_RDONLY), b = a < 0 ? -1 : open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
                     if (a < 0 || b < 0)
@@ -871,7 +891,9 @@ static int read_archive(const char *extract_dir)
     /* directories last, since unpacking into them changed their times */
     for (int i = ndir_times - 1; i >= 0; i--) {
         struct utimbuf ut = { (time_t)dir_times[i].mtime, (time_t)dir_times[i].mtime };
-        utime(dir_times[i].path, &ut);
+        struct stat st;
+        if (lstat(dir_times[i].path, &st) == 0 && S_ISDIR(st.st_mode))      /* not one replaced by a link */
+            utime(dir_times[i].path, &ut);
     }
     for (int i = 0; i < nmembers; i++)
         if (!member_seen[i]) {

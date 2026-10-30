@@ -19,6 +19,7 @@
 struct framebuffer fb;
 struct framebuffer fb_boot;
 static int fb_owner;                    /* pid with the screen mapped, or 0 */
+static uint32_t owner_mapped;           /* how much of USER_MMIO_BASE it has mapped */
 static int panicked;                    /* the panic screen is up: nobody else draws */
 static int switching;                   /* a driver is changing fb: the console keeps off it */
 
@@ -125,6 +126,30 @@ static uint32_t map_size(void)
     return radeon_present() ? radeon_map_size() : fb.size;
 }
 
+/* Take pages [from, to) of the screen's mapping out of a process; only
+ * device memory, never ordinary memory it may have put there since. */
+static void unmap_screen(uint32_t *pd, uint32_t from, uint32_t to)
+{
+    for (uint32_t off = ALIGN_UP(from, PAGE_SIZE); off < to; off += PAGE_SIZE)
+        if (!vmm_pte_present(pd, USER_MMIO_BASE + off))
+            vmm_free_page(pd, USER_MMIO_BASE + off);
+}
+
+/*
+ * Map the screen into a process at USER_MMIO_BASE, where *mapped bytes of
+ * an earlier one may be: what the new one does not cover goes, so a
+ * smaller mode leaves nothing of the larger one's memory behind. If it
+ * cannot be mapped, none of it stays.
+ */
+static int map_screen(uint32_t *pd, uint32_t *mapped)
+{
+    uint32_t size = map_size();
+    int r = vmm_map_phys(pd, USER_MMIO_BASE, fb.phys, size, pte_wc);
+    unmap_screen(pd, r < 0 ? 0 : size, MAX(*mapped, size));
+    *mapped = r < 0 ? 0 : size;
+    return r;
+}
+
 /* The screen's owner is gone: page 0 on show, the pointer hidden. */
 static void release_screen(void)
 {
@@ -141,7 +166,7 @@ void fb_mode_changed(void)
 {
     struct proc *p = fb_owner ? proc_find(fb_owner) : NULL;
     if (p && p->state != P_ZOMBIE)
-        vmm_map_phys(p->pd, USER_MMIO_BASE, fb.phys, map_size(), pte_wc);
+        map_screen(p->pd, &owner_mapped);
     vga_reset_fb();
 }
 
@@ -286,7 +311,11 @@ static int map_user(void)
         if (p && p->state != P_ZOMBIE)
             return -EBUSY;
     }
-    int r = vmm_map_phys(current->pd, USER_MMIO_BASE, fb.phys, map_size(), pte_wc);
+    int mine = fb_owner == current->leader->pid;
+    uint32_t mapped = mine ? owner_mapped : 0;
+    int r = map_screen(current->pd, &mapped);
+    if (mine || r == 0)
+        owner_mapped = mapped;
     if (r < 0)
         return r;
     if (!fb_owner)
@@ -444,8 +473,11 @@ static int display_op(int op, void *arg)
         return set_mode(&m);
     }
     case DISP_MAP3D:
+        /* The Voodoo's engine takes its registers from the process, so it
+         * can draw anywhere in video memory, the screen too: only the
+         * screen's owner gets it. */
         if (voodoo_present())
-            return voodoo_map3d(arg);
+            return screen_owner() ? voodoo_map3d(arg) : -EPERM;
         if (intel_present())
             return intel_map3d(arg);
         return radeon_present() ? radeon_map3d_user(arg) : -ENODEV;

@@ -21,6 +21,7 @@
 
 #define SS        4             /* sub-scanlines per pixel */
 #define MAX_DASH  16
+#define MAX_DASH_STEPS 20000            /* dash pieces per sub-path; past that, a solid line */
 #define MAX_RULES 128
 #define MAX_DEPTH 24
 #define MAX_PX    2048
@@ -97,16 +98,24 @@ static void path_move(struct path *p, double x, double y)
         return;
     }
     if (p->ns == p->scap) {
-        p->scap = p->scap ? p->scap * 2 : 8;
-        p->subs = realloc(p->subs, sizeof(struct sub) * (size_t)p->scap);
+        int cap = p->scap ? p->scap * 2 : 8;
+        struct sub *t = realloc(p->subs, sizeof(struct sub) * (size_t)cap);
+        if (!t) {
+            path_free(p);               /* out of memory: the path is lost, capacities with it */
+            return;
+        }
+        p->subs = t;
+        p->scap = cap;
     }
     if (p->np == p->pcap) {
-        p->pcap = p->pcap ? p->pcap * 2 : 64;
-        p->pts = realloc(p->pts, sizeof(struct pt) * (size_t)p->pcap);
-    }
-    if (!p->subs || !p->pts) {
-        p->ns = p->np = 0;
-        return;
+        int cap = p->pcap ? p->pcap * 2 : 64;
+        struct pt *t = realloc(p->pts, sizeof(struct pt) * (size_t)cap);
+        if (!t) {
+            path_free(p);
+            return;
+        }
+        p->pts = t;
+        p->pcap = cap;
     }
     p->subs[p->ns].start = p->np;
     p->subs[p->ns].n = 1;
@@ -123,13 +132,16 @@ static void path_line(struct path *p, double x, double y)
         return;
     if (p->subs[p->ns - 1].closed)
         path_move(p, p->pts[p->subs[p->ns - 1].start].x, p->pts[p->subs[p->ns - 1].start].y);
+    if (!p->ns)
+        return;                         /* that ran out of memory */
     if (p->np == p->pcap) {
-        p->pcap *= 2;
-        p->pts = realloc(p->pts, sizeof(struct pt) * (size_t)p->pcap);
-        if (!p->pts) {
-            p->ns = p->np = 0;
+        struct pt *t = realloc(p->pts, sizeof(struct pt) * (size_t)p->pcap * 2);
+        if (!t) {
+            path_free(p);
             return;
         }
+        p->pts = t;
+        p->pcap *= 2;
     }
     p->pts[p->np].x = x;
     p->pts[p->np].y = y;
@@ -269,14 +281,21 @@ static double svg_strtod(const char *s, char **end)
         p++;
         if (*p == '+' || *p == '-')
             eneg = *p++ == '-';
-        while (isdigit((unsigned char)*p))
+        while (isdigit((unsigned char)*p)) {
             e = e * 10 + (*p++ - '0');
+            if (e > 400)
+                e = 400;                /* saturated: 1e999 is huge, not 1 */
+        }
         double m = 1;
-        for (; e > 0 && e < 400; e--)
+        for (; e > 0; e--)
             m *= 10;
-        v = eneg ? v / m : v * m;
+        v = eneg ? v / m : v ? v * m : 0;
     }
     *end = (char *)p;
+    /* Kept finite (inf * 0 is NaN, which no comparison clips) and in a range
+     * a few transforms cannot overflow. */
+    if (!(v <= 1e15))
+        v = 1e15;
     return neg ? -v : v;
 }
 
@@ -634,9 +653,13 @@ static void apply_prop(struct canvas *cv, struct gs *g, const char *name, int nl
                     s++;
             }
             double sum = 0;
-            for (int i = 0; i < g->ndash; i++)
-                sum += g->dash[i];
-            if (sum <= 0)
+            for (int i = 0; i < g->ndash; i++) {
+                if (!(g->dash[i] >= 0) || !isfinite(g->dash[i]))
+                    sum = -1;           /* a negative one makes it all invalid: no dashes */
+                if (sum >= 0)
+                    sum += g->dash[i];
+            }
+            if (!(sum > 0) || !isfinite(sum))
                 g->ndash = 0;
             if (g->ndash & 1) {
                 int n = g->ndash;
@@ -885,8 +908,8 @@ static void rasterize(struct canvas *cv, const struct polys *ps, int evenodd)
         const struct poly *pl = &ps->list[i];
         for (int j = 0; j < pl->n; j++) {
             const struct pt *a = &pl->p[j], *b = &pl->p[(j + 1) % pl->n];
-            if (a->y == b->y)
-                continue;
+            if (a->y == b->y || !isfinite(a->x) || !isfinite(a->y) || !isfinite(b->x) || !isfinite(b->y))
+                continue;                   /* flat, or overflowed to inf or NaN */
             struct edge *e = &edges[k++];
             if (a->y < b->y) {
                 e->x0 = a->x, e->y0 = a->y, e->x1 = b->x, e->y1 = b->y, e->dir = 1;
@@ -899,11 +922,10 @@ static void rasterize(struct canvas *cv, const struct polys *ps, int evenodd)
                 ymax = e->y1;
         }
     }
+    /* Clamped as doubles: out of int range, a cast is undefined. */
+    ymin = ymin < 0 ? 0 : ymin > cv->h ? cv->h : ymin;
+    ymax = ymax < 0 ? 0 : ymax > cv->h ? cv->h : ymax;
     int y0 = (int)floor(ymin), y1 = (int)ceil(ymax);
-    if (y0 < 0)
-        y0 = 0;
-    if (y1 > cv->h)
-        y1 = cv->h;
     cv->ry0 = y0;
     cv->ry1 = y1;
     for (int y = y0; y < y1; y++) {
@@ -916,6 +938,8 @@ static void rasterize(struct canvas *cv, const struct polys *ps, int evenodd)
                 if (sy < e->y0 || sy >= e->y1)
                     continue;
                 double x = e->x0 + (e->x1 - e->x0) * (sy - e->y0) / (e->y1 - e->y0);
+                if (isnan(x))
+                    continue;           /* inf * 0 of a huge edge */
                 int j = nx++;
                 while (j > 0 && xs[j - 1] > x) {
                     xs[j] = xs[j - 1];
@@ -1292,18 +1316,30 @@ static void stroke_path(struct polys *ps, const struct mat *m, const struct path
         }
         /* dashes: walk the polyline cutting it into pieces */
         int n = s->n + (s->closed ? 1 : 0);
-        double total = 0;
+        double total = 0, len = 0;
         for (int j = 0; j < g->ndash; j++)
             total += g->dash[j];
+        for (int j = 0; j + 1 < n; j++) {
+            struct pt a = pts[j % s->n], b = pts[(j + 1) % s->n];
+            len += sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y));
+        }
+        /* Dashes too small for the length would take forever (or never end,
+         * once a step is below the precision of the position): solid. */
+        if (!(total > 0) || !isfinite(len) || !isfinite(g->dash_off) ||
+            len / total * g->ndash > MAX_DASH_STEPS) {
+            stroke_line(ps, m, pts, s->n, s->closed, g);
+            continue;
+        }
         double pos = fmod(g->dash_off, total);
         if (pos < 0)
             pos += total;
         int di = 0;
-        while (pos >= g->dash[di]) {
+        for (int k = 0; k < 2 * g->ndash && pos >= g->dash[di]; k++) {
             pos -= g->dash[di];
             di = (di + 1) % g->ndash;
         }
-        double left = g->dash[di] - pos;
+        int steps = 0;
+        double left = g->dash[di] - pos > 0 ? g->dash[di] - pos : 0;
         int on = !(di & 1);
         struct pt cur[512];
         int nc = 0;
@@ -1314,7 +1350,7 @@ static void stroke_path(struct polys *ps, const struct mat *m, const struct path
                 continue;
             if (on && nc == 0)
                 cur[nc++] = a;
-            while (l - at > left) {
+            while (l - at > left && steps++ < 2 * MAX_DASH_STEPS) {
                 at += left;
                 struct pt c = { a.x + dx * at / l, a.y + dy * at / l };
                 if (on) {
@@ -1694,8 +1730,8 @@ void svg_size(const struct node *svg, int *w, int *h)
     } else if (sh <= 0) {
         sh = has ? sw * vb[3] / vb[2] : sw / 2;
     }
-    *w = (int)(sw + 0.5);
-    *h = (int)(sh + 0.5);
+    *w = sw < 1e6 ? (int)(sw + 0.5) : 1000000;     /* out of int range, a cast is undefined */
+    *h = sh < 1e6 ? (int)(sh + 0.5) : 1000000;
     if (*w < 1) *w = 1;
     if (*h < 1) *h = 1;
 }

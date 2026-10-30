@@ -702,6 +702,10 @@ static uint32_t to_str(uint64_t v, int neg, gp_t out, int radix, int wide)
 {
     char tmp[72];
     int n = 0;
+    if (radix < 2 || radix > 36) {      /* an invalid parameter: an empty string */
+        if (wide) *(uint16_t *)GP(out) = 0; else *(char *)GP(out) = 0;
+        return out;
+    }
     do { int d = (int)(v % (unsigned)radix); tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); v /= (unsigned)radix; } while (v);
     if (neg) tmp[n++] = '-';
     char buf[72];

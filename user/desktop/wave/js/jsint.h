@@ -15,6 +15,8 @@
 #define JS_HEAP_MAX   (512u << 20)
 #define JS_STEP_LIMIT 40000000u         /* steps one entry into the engine may take (a second or so) */
 #define JS_MAX_DEPTH  180               /* nested calls */
+#define JS_STR_MAX    (1 << 28)         /* bytes in one string */
+#define JS_STACK_SPARE (64u << 10)      /* stack left below the last check, for natives and the host */
 
 struct jsstr {
     int len;                            /* bytes of UTF-8 */
@@ -141,6 +143,7 @@ struct js {
     size_t heap_limit;
     struct jsstr *small_ints[256];      /* "0" to "255", made once: common property keys */
     int depth;
+    const char *stack_lo, *stack_hi;    /* the stack it runs on now: main, a coroutine's or the compiler's */
     int dead;                           /* out of memory or time: no more scripts */
     struct jsstr *s_home;               /* the hidden variable that holds a method's home object */
     struct jsstr *s_prototype;          /* "prototype", made once: every new and instanceof asks */
@@ -167,9 +170,18 @@ struct js {
     char textbuf[1024];
 };
 
+/* Is the stack the engine is on nearly used up? Recursion checks this and
+ * gives up (a RangeError or SyntaxError) rather than run off its end. */
+static inline int js_stack_low(struct js *J)
+{
+    const char *sp = __builtin_frame_address(0);
+    return sp >= J->stack_lo && sp < J->stack_hi && (size_t)(sp - J->stack_lo) < JS_STACK_SPARE;
+}
+
 /* jsgc.c: the garbage-collected heap */
 struct gcheap *gc_new(void);
 void *gc_alloc(struct js *J, size_t n, int atomic);    /* zeroed; NULL if out of memory */
+int js_running(void);                   /* inside a script now */
 void gc_collect(struct js *J);
 void gc_destroy(struct js *J);
 size_t gc_heap_bytes(struct js *J);                     /* in use, garbage included */

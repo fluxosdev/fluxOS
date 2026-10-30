@@ -122,6 +122,31 @@ void hda_tick(void);
 int hda_get_info(struct sound_info *si);
 /* USB audio (usb/usbaudio.c): /dev/dsp while a device is plugged in */
 int usbaudio_get_info(struct sound_info *si);
+/* The software mixer (pcm.c): /dev/dsp, where every open is a stream of its
+ * own and they all play at once. A card's driver is its backend: it plays
+ * 16-bit stereo at its own rate from a ring the mixer feeds. The calls are
+ * made under snd_lock. */
+struct pcm;
+struct pcm_backend {
+    int rate;                           /* frames a second the card plays */
+    uint32_t lead;                      /* frames to keep queued ahead of what is heard */
+    uint32_t (*room)(void);             /* frames put() can take now */
+    uint32_t (*queued)(void);           /* frames put() was given that have not been heard */
+    void (*put)(const int16_t *lr, uint32_t n);
+    void (*start)(void);                /* play what is queued, if not playing already */
+    int (*running)(void);
+    int (*gain)(void);                  /* the software volume, 0-256; NULL: 256 */
+    int (*gone)(void);                  /* the card went away; NULL: it cannot */
+    void (*stalled)(void);              /* playing, yet nothing moved for a second; or NULL */
+    void (*drop)(void);                 /* stop, and forget what is queued (SNDCTL_DSP_RESET); or NULL */
+    void (*recover)(void);              /* before a stream opens or is reset, without snd_lock; or NULL */
+};
+struct pcm *pcm_create(struct vnode *dir, const char *name, uint32_t rdev, struct pcm_backend *be);
+void pcm_pull(struct pcm *p, uint32_t frames);  /* the card refills: up to this many mixed now */
+int pcm_active(const struct pcm *p);    /* streams open (any lock, or none) */
+struct pcm *pcm_of(struct vnode *vn);   /* the mixer a /dev/dsp node opens; NULL if not one */
+void pcm_point(struct vnode *vn, struct pcm *p);  /* opens of vn go to p from now on */
+void pcm_tick(void);
 void hda_suspend(void);                 /* suspend to RAM: playback stopped */
 void hda_resume(void);                  /* the controller and codec set up again */
 int opl_present(void);                  /* 0, 2 (OPL2) or 3 (OPL3) */

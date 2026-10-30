@@ -171,6 +171,7 @@ static struct {
     int edid_ok;
     uint8_t edid[128];
     int owner3d;                    /* pid with the 3D engine mapped, or 0 */
+    int dirty3d;                    /* video memory may hold a 3D client's pictures */
 } vd;
 
 static inline uint32_t rd(uint32_t off)
@@ -623,13 +624,14 @@ static void use_native_fb(const struct timing *t, int bpp)
     }
 }
 
-/* Blank the new screen, 64 KiB at a time so interrupts get a look in. */
-static void clear_vram(uint32_t bytes)
+/* Zero video memory [start, end), 64 KiB at a time so interrupts get a look in. */
+static void clear_vram(uint32_t start, uint32_t end)
 {
-    uint32_t words = bytes & ~3u;
-    for (uint32_t off = 0; off < words; off += 0x10000)
+    uint32_t head = MIN(ALIGN_UP(start, 4), end), words = head + ((end - head) & ~3u);
+    memset(vd.vram + start, 0, head - start);
+    for (uint32_t off = head; off < words; off += 0x10000)
         sse_fill(vd.vram + off, 0, MIN(0x10000u, words - off));
-    memset(vd.vram + words, 0, bytes & 3);
+    memset(vd.vram + words, 0, end - words);
 }
 
 int voodoo_set_mode(const struct dispmode *m)
@@ -656,7 +658,7 @@ int voodoo_set_mode(const struct dispmode *m)
 
     struct vregs r;
     build_regs(t, m->bpp, &r);
-    clear_vram((uint32_t)t->w * t->h * (m->bpp / 8));
+    clear_vram(0, (uint32_t)t->w * t->h * (m->bpp / 8));
     write_regs(&r);
     vd.native = 1;
     fill_mode(&vd.mode, t, m->bpp);
@@ -676,12 +678,21 @@ int voodoo_screen_bytes(void)
     return (int)(start + fb.pitch * fb.height);
 }
 
+/* Only the screen's owner gets here (fb.c), the screen being its already. */
 int voodoo_map3d(struct disp3d *d)
 {
     if (vd.owner3d && vd.owner3d != current->leader->pid) {
         struct proc *p = proc_find(vd.owner3d);
         if (p && p->state != P_ZOMBIE)
             return -EBUSY;
+    }
+    /* A new client must not find the last one's pictures above the screen;
+     * the engine finishes what that one gave it first. */
+    if (vd.owner3d != current->leader->pid && vd.dirty3d) {
+        uint32_t screen = MIN((uint32_t)voodoo_screen_bytes(), vd.vram_size);
+        wait_idle();
+        clear_vram(screen, vd.vram_size);
+        vd.dirty3d = 0;
     }
     int r = vmm_map_phys(current->pd, USER_VRAM_BASE, vd.lfb_phys, vd.vram_size, 0);
     if (r == 0)
@@ -692,6 +703,7 @@ int voodoo_map3d(struct disp3d *d)
     if (vd.owner3d != current->leader->pid)
         klog("voodoo: pid %d (%s) has the 3D engine\n", current->leader->pid, current->name);
     vd.owner3d = current->leader->pid;
+    vd.dirty3d = 1;
     d->regs = USER_REGS_BASE;
     d->vram = USER_VRAM_BASE;
     d->vram_size = vd.vram_size;

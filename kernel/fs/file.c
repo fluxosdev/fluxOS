@@ -89,8 +89,8 @@ void file_close(struct file *f)
     kfree(f);
 }
 
-/* buf is the caller's, checked beforehand: copying it holding the lock
- * cannot fault. */
+/* buf is a kernel buffer (sys_read bounces user memory), so copying it
+ * holding the lock cannot fault. */
 static int pipe_read_flags(struct pipe *p, uint8_t *buf, uint32_t n, int nonblock)
 {
     if (!n)

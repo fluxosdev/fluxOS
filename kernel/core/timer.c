@@ -23,6 +23,7 @@ static void timer_irq(struct trapframe *tf)
     spkr_tick();
     hda_tick();
     usb_tick();
+    pcm_tick();                         /* after the cards moved on */
     proc_tick();                        /* and the other processors' slices */
     net_tick();
 }

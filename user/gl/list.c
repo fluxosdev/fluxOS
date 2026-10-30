@@ -68,6 +68,8 @@ static int ensure_slot(struct fgl_context *c, GLuint id)
 {
     if (id < c->nlists)
         return 0;
+    if (id >= 0x10000000u)              /* so n * 2 and n * sizeof cannot wrap */
+        return -1;
     GLuint n = c->nlists ? c->nlists : 16;
     while (n <= id)
         n *= 2;

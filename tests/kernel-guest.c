@@ -4,6 +4,9 @@
 #include <fcntl.h>
 #include <flux.h>
 #include <flux/syscall.h>
+#include <math.h>
+#include <poll.h>
+#include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>
@@ -14,6 +17,8 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/ioctl.h>
+#include <sys/soundcard.h>
 #include <sys/time.h>
 #include <sys/times.h>
 #include <sys/wait.h>
@@ -632,11 +637,139 @@ static void native_ext2(void)
     puts("guest: ext2 by the native mkfs.ext2: files, symbolic and hard links, owners, modes, times, cp -a, ls -l and fsck.ext2 passed");
 }
 
+/* One second of a sine wave on a /dev/dsp of its own, then SNDCTL_DSP_SYNC. */
+static void play_tone(int hz)
+{
+    int fd = open("/dev/dsp", O_WRONLY);
+    CHECK(fd >= 0);
+    int rate = 48000, channels = 1, fmt = AFMT_S16_LE;
+    CHECK(ioctl(fd, SNDCTL_DSP_SPEED, &rate) == 0 && rate == 48000);
+    CHECK(ioctl(fd, SNDCTL_DSP_CHANNELS, &channels) == 0 && channels == 1);
+    CHECK(ioctl(fd, SNDCTL_DSP_SETFMT, &fmt) == 0 && fmt == AFMT_S16_LE);
+    struct audio_buf_info bi;
+    CHECK(ioctl(fd, SNDCTL_DSP_GETOSPACE, &bi) == 0 && bi.bytes > 0);
+    static int16_t chunk[4800];         /* 100 ms */
+    for (int part = 0; part < 10; part++) {
+        for (int i = 0; i < 4800; i++)
+            chunk[i] = (int16_t)(8000 * sin(2 * M_PI * hz * (part * 4800 + i) / 48000.0));
+        CHECK(write(fd, chunk, sizeof(chunk)) == (int)sizeof(chunk));
+    }
+    int delay = -1;
+    CHECK(ioctl(fd, SNDCTL_DSP_GETODELAY, &delay) == 0 && delay > 0);
+    CHECK(ioctl(fd, SNDCTL_DSP_SYNC) == 0);
+    CHECK(ioctl(fd, SNDCTL_DSP_GETODELAY, &delay) == 0 && delay == 0);
+    CHECK(close(fd) == 0);
+}
+
+/* Two programs play at once: the software mixer gives each its own stream
+ * (before it, the second got EBUSY). With --sound, QEMU records the card's
+ * output and the harness checks that both tones sound in it at the same
+ * time, not one after the other. */
+static void sound_mixing(void)
+{
+    struct stat st;
+    if (stat("/dev/dsp", &st) != 0) {
+        puts("guest: no sound card; the mixer was not tried");
+        return;
+    }
+    int both[2];
+    CHECK(pipe(both) == 0);
+    int child = fork();
+    CHECK(child >= 0);
+    if (!child) {
+        char go;
+        close(both[1]);
+        if (read(both[0], &go, 1) != 1)
+            _exit(1);
+        play_tone(660);
+        _exit(0);
+    }
+    close(both[0]);
+    int held = open("/dev/dsp", O_WRONLY);             /* open while the other one starts */
+    CHECK(held >= 0);
+    CHECK(write(both[1], "g", 1) == 1);
+    play_tone(440);
+    CHECK(close(held) == 0 && close(both[1]) == 0);
+    int status;
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    puts("guest: two programs played on /dev/dsp at once (440 Hz and 660 Hz) passed");
+}
+
+/* A buffer unmapped by another thread while read() waits to fill it: the
+ * copy out fails with EFAULT, where the kernel used to fault on it and panic. */
+static int unmapped_pipe[2];
+static void *read_into(void *buf)
+{
+    ssize_t r = read(unmapped_pipe[0], buf, 64);
+    return (void *)(intptr_t)(r < 0 ? -errno : r);
+}
+
+/* Two threads ending at once by the raw call (libc's count would make the
+ * second exit()): the second must end the process, closing its descriptors. */
+static volatile int exit_ready, exit_go;
+static void raw_thread_exit(void)
+{
+    __asm__ volatile("int $0x80" : : "a"(SYS_thread_exit), "b"(0), "c"(0) : "memory");
+    for (;;)
+        ;
+}
+static void *exit_together(void *arg)
+{
+    (void)arg;
+    __atomic_add_fetch(&exit_ready, 1, __ATOMIC_SEQ_CST);
+    while (!exit_go)
+        ;
+    raw_thread_exit();
+    return NULL;
+}
+
+static void user_memory_races(void)
+{
+    char *buf = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(buf != MAP_FAILED);
+    CHECK(pipe(unmapped_pipe) == 0);
+    pthread_t t;
+    CHECK(pthread_create(&t, NULL, read_into, buf) == 0);
+    CHECK(msleep(50) == 0);             /* it waits in read() by now */
+    CHECK(munmap(buf, 4096) == 0);
+    CHECK(write(unmapped_pipe[1], "data", 4) == 4);
+    void *res;
+    CHECK(pthread_join(t, &res) == 0 && (intptr_t)res == -EFAULT);
+    CHECK(close(unmapped_pipe[0]) == 0 && close(unmapped_pipe[1]) == 0);
+
+    for (int round = 0; round < 20; round++) {
+        int held[2];
+        CHECK(pipe(held) == 0);
+        int child = fork();
+        CHECK(child >= 0);
+        if (!child) {
+            close(held[0]);
+            pthread_t other;
+            if (pthread_create(&other, NULL, exit_together, NULL) != 0)
+                _exit(1);
+            while (__atomic_load_n(&exit_ready, __ATOMIC_SEQ_CST) < 1)
+                ;
+            exit_go = 1;
+            raw_thread_exit();
+        }
+        close(held[1]);
+        struct pollfd pfd = { .fd = held[0], .events = POLLIN };
+        char c;
+        CHECK(poll(&pfd, 1, 5000) == 1 && read(held[0], &c, 1) == 0);  /* the child's end closed */
+        int status;
+        CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        CHECK(close(held[0]) == 0);
+    }
+    puts("guest: read into memory unmapped meanwhile, and two threads exiting at once passed");
+}
+
 int main(void)
 {
+    sound_mixing();
     scheduler_stress();
     phase0_regressions();
     shared_offset_stress();
+    user_memory_races();
     int fd = open("/tmp/size-test", O_CREAT | O_RDWR, 0600);
     CHECK(fd >= 0);
     CHECK(write(fd, "safe", 4) == 4);

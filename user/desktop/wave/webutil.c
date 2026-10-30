@@ -17,6 +17,8 @@ struct arena_chunk {
 
 void *arena_alloc(struct arena *a, size_t n)
 {
+    if (n > SIZE_MAX / 2)               /* a negative length cast: it would wrap below */
+        return NULL;
     n = (n + 7) & ~(size_t)7;
     struct arena_chunk *c = a->chunks;
     if (!c || c->size - c->used < n) {
@@ -44,6 +46,8 @@ void *arena_alloc(struct arena *a, size_t n)
 
 char *arena_strndup(struct arena *a, const char *s, size_t n)
 {
+    if (n > SIZE_MAX / 2)
+        return NULL;
     char *p = arena_alloc(a, n + 1);
     if (p)
         memcpy(p, s, n);

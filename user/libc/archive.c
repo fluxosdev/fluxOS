@@ -742,11 +742,12 @@ static void parse_streams(struct hbuf *b, struct streams *s)
             id = hb_byte(b);
         }
         s->nsub = 0;
-        for (int i = 0; i < s->nfolders; i++)
+        for (int i = 0; i < s->nfolders; i++) {
+            if (s->folders[i].nsub > 0x1000000 - s->nsub) {     /* and so no overflow */
+                b->err = 1;
+                return;
+            }
             s->nsub += s->folders[i].nsub;
-        if (s->nsub > 0x1000000) {
-            b->err = 1;
-            return;
         }
         s->sub_size = calloc((size_t)s->nsub + 1, 4);
         s->sub_crc = calloc((size_t)s->nsub + 1, 4);
@@ -1077,13 +1078,17 @@ static int parse_files(struct archive *a, struct hbuf *b, struct streams *s)
             break;
         }
         case K_EMPTY_FILE:
-            free(empty_file);
-            empty_file = hb_bits(&pb, nempty, 0);
+        case K_ANTI: {
+            /* one bit per empty stream; kept nfiles long, as K_EMPTY_STREAM may come later */
+            uint8_t **dst = type == K_ANTI ? &is_anti : &empty_file;
+            uint8_t *v = hb_bits(&pb, nempty, 0);
+            free(*dst);
+            *dst = calloc((size_t)nfiles + 1, 1);
+            if (*dst && v)
+                memcpy(*dst, v, (size_t)nempty);
+            free(v);
             break;
-        case K_ANTI:
-            free(is_anti);
-            is_anti = hb_bits(&pb, nempty, 0);
-            break;
+        }
         case K_NAME:
             if (hb_byte(&pb) != 0) {            /* external */
                 r = -1;

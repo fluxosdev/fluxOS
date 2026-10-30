@@ -34,7 +34,7 @@ static struct job jobs[MAX_JOBS];
 
 struct func {
     char *name;
-    struct node *body;
+    struct node *body;          /* one owner of it (the definition and running calls are the others) */
 };
 
 static struct func *funcs;
@@ -305,6 +305,15 @@ int job_pid(struct job *j)
     return j->pid;
 }
 
+struct job *job_find_pid(int pid)
+{
+    for (int i = 0; i < MAX_JOBS; i++)
+        for (int k = 0; jobs[i].pid && k < jobs[i].npids; k++)
+            if (jobs[i].pids[k] == pid)
+                return &jobs[i];
+    return NULL;
+}
+
 struct job *job_find(const char *spec)
 {
     struct job *best = NULL;
@@ -414,7 +423,7 @@ static int save_fd(struct saved_fds *s, int fd)
     if (s->n >= 16)
         return -1;
     s->fd[s->n] = fd;
-    s->copy[s->n] = dup(fd);
+    s->copy[s->n] = fcntl(fd, F_DUPFD_CLOEXEC, 10);    /* not inherited, clear of 0-9 */
     s->n++;
     return 0;
 }
@@ -594,21 +603,26 @@ static void exec_external(const char *path, char **argv, char **assigns, int nas
 
 static int run_function(struct node *body, struct strvec *args)
 {
-    char **old_v = sh.posv;
+    char **old_v = sh.posv, **old_alloc = sh.posv_alloc;
     int old_c = sh.posc;
     int mark = locals_mark();
     sh.posv = args->v + 1;
     sh.posc = args->n - 1;
+    sh.posv_alloc = NULL;
     sh.func_depth++;
+    body->refs++;                       /* kept while it runs, even if redefined or unset */
     int status = exec_node(body);
+    node_free(body);
     if (sh.returning) {
         sh.returning = 0;
         status = sh.last_status;
     }
     sh.func_depth--;
     locals_restore(mark);
+    positional_free(sh.posv_alloc);
     sh.posv = old_v;
     sh.posc = old_c;
+    sh.posv_alloc = old_alloc;
     return status;
 }
 
@@ -848,7 +862,7 @@ static int run_pipeline(struct node *n)
 {
     int pids[MAX_PIPE];
     int count = n->nitems < MAX_PIPE ? n->nitems : MAX_PIPE;
-    int pgid = 0, prev = -1;
+    int pgid = 0, prev = -1, forked_all = 1;
 
     fflush(stdout);
     fflush(stderr);
@@ -860,6 +874,16 @@ static int run_pipeline(struct node *n)
             break;
         }
         int pid = fork();
+        if (pid < 0) {
+            fsh_error("fork failed: %s", errmsg(errno));
+            if (fds[1] >= 0) {
+                close(fds[0]);
+                close(fds[1]);
+            }
+            count = i;
+            forked_all = 0;
+            break;
+        }
         if (pid == 0) {
             child_jobctl(pgid, 1);
             if (prev >= 0) {
@@ -891,7 +915,7 @@ static int run_pipeline(struct node *n)
     int status = wait_pids(pids, count, pgid, n->text);
     if (sh.interactive)
         tcsetpgrp(0, sh.shell_pgid);
-    return status;
+    return forked_all ? status : 1;
 }
 
 static int run_background(struct node *n)
@@ -1079,8 +1103,9 @@ int exec_node(struct node *n)
         status = run_subshell(n);
         break;
     case N_FUNC:
+        if (n->body)
+            n->body->refs++;            /* the table and the definition both hold it */
         func_set(n->var, n->body);
-        n->body = NULL;                 /* ownership moves to the table */
         status = 0;
         break;
     case N_TIME: {

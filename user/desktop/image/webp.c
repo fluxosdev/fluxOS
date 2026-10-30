@@ -1684,7 +1684,7 @@ struct image *image_decode_webp(const uint8_t *data, uint32_t len)
             if (!f)
                 return NULL;
             int fx = (int)rd24(body) * 2, fy = (int)rd24(body + 3) * 2;
-            if (!cw || !ch || (uint32_t)cw * ch > MAX_PIXELS) {
+            if (!cw || !ch || (uint64_t)cw * ch > MAX_PIXELS) {    /* 2^24 squared needs 48 bits */
                 cw = f->w;
                 ch = f->h;
             }

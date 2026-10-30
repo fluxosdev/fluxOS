@@ -630,14 +630,17 @@ int do_fork(void)
     memcpy(child->leader->fd_cloexec, g->fd_cloexec, sizeof(child->leader->fd_cloexec));
     spin_unlock(&g->fd_lock);
     child->leader->umask = parent->leader->umask;
-    child->leader->cwd = parent->leader->cwd;
-    vfs_ref(child->leader->cwd);
     child->leader->ctty = tty_hold(parent->leader->ctty);
     child->leader->heap_start = parent->leader->heap_start;
     child->leader->brk = parent->leader->brk;
     child->leader->stack_low = parent->leader->stack_low;
     memcpy(child->leader->vmas, parent->leader->vmas, sizeof(child->leader->vmas));
     mutex_unlock(&g->mm_lock);
+    /* After mm_lock, which a page fault takes holding the VFS lock: never the other way round. */
+    vfs_lock();
+    child->leader->cwd = parent->leader->cwd;
+    vfs_ref(child->leader->cwd);
+    vfs_unlock();
     child->tls = parent->tls;                   /* the same thread block, in the copy */
     child->leader->sig_ignored = parent->leader->sig_ignored;
     child->sig_blocked = parent->sig_blocked;
@@ -685,6 +688,12 @@ static void exit_this_thread(struct proc *p)
     fpu_release(p);
     cli();
     spin_lock(&sched_lock);
+    if (g->nthreads <= 1) {
+        /* The others went meanwhile (two thread_exit()s at once): this is the
+         * last thread, and the process ends with it. */
+        spin_unlock(&sched_lock);
+        do_exit(0);
+    }
     g->nthreads--;
     wakeup_locked(&g->nthreads);
     p->pd = kernel_pd;                  /* (the others' address space goes on without it; cr3 is left as it is) */
@@ -877,14 +886,16 @@ int thread_create(uint32_t entry, uint32_t stack, uint32_t tls, uint32_t clear_t
     return t->pid;
 }
 
-/* exec(): the process keeps only the calling thread, which becomes its leader if it was not. */
-void proc_exec_alone(struct proc *p)
+/* exec(): the process keeps only the calling thread, which becomes its leader if it was not.
+ * If an exit or another exec got there first, SIGKILL is pending: the caller backs out
+ * (letting go of what it holds) and dies on its way back to user mode. */
+int proc_exec_alone(struct proc *p)
 {
-    while (!kill_other_threads(p))
-        exit_this_thread(p);            /* (an exit or another exec got there first) */
+    if (!kill_other_threads(p))
+        return -EINTR;
     struct proc *g = p->leader;
     if (g == p)
-        return;
+        return 0;
     /* Take over the leader: its id, its parent, and what the threads shared. */
     spin_lock(&sched_lock);
     memcpy(p->fds, g->fds, sizeof(p->fds));
@@ -922,6 +933,7 @@ void proc_exec_alone(struct proc *p)
     p->mm_lock = (struct mutex)MUTEX_INIT("mm");
     p->fd_lock = (spinlock_t)SPINLOCK_INIT("fd");
     spin_unlock(&sched_lock);
+    return 0;
 }
 
 int do_waitpid(int pid, int *status, int options)
@@ -1302,8 +1314,8 @@ static int user_write_range(struct proc *p, uint32_t va, const void *src, uint32
     for (uint32_t pg = ALIGN_DOWN(va, PAGE_SIZE); pg < va + len; pg += PAGE_SIZE)
         if (!vmm_write_ok(p->pd, pg) && !proc_page_fault(pg, 1))
             return -EFAULT;
-    memcpy((void *)(uintptr_t)va, src, len);
-    return 0;
+    /* Another thread may unmap it meanwhile: the copy then fails instead of the kernel. */
+    return uaccess_copy((void *)(uintptr_t)va, src, len);
 }
 
 /*
@@ -1665,7 +1677,7 @@ static int mmap_locked(struct proc *p, const struct flux_mmap_args *a, uint32_t 
             uint32_t cand_end = USER_MMIO_BASE;
             for (int moved = 1; moved;) {
                 moved = 0;
-                if (cand_end < floor + len)
+                if (cand_end < floor || cand_end - floor < len)    /* (floor + len may wrap) */
                     return -ENOMEM;
                 uint32_t cand_start = cand_end - len;
                 for (int i = 0; i < MAX_VMAS; i++) {
@@ -1715,7 +1727,7 @@ static int mmap_locked(struct proc *p, const struct flux_mmap_args *a, uint32_t 
 }
 
 /* The mappings change, or a page is faulted in, with the process's mm_lock: its threads share them.
- * (A fault in kernel code holding a spinlock, which cannot sleep, goes without.) */
+ * 0 in kernel code holding a spinlock, which cannot sleep for it (and goes without). */
 static int mm_enter(struct proc *p)
 {
     uint32_t flags = irq_save();
@@ -1759,13 +1771,19 @@ int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint32_t *out)
 
 static int page_fault_locked(struct proc *p, uint32_t addr, int write);
 
-/* Resolve a user page fault: COW break, demand-paged mmap VMA or stack growth. */
+/* Resolve a user page fault: COW break, demand-paged mmap VMA or stack growth.
+ * Not in kernel code holding a spinlock, which cannot wait for mm_lock: a fault
+ * there would race with the other threads' (two COW breaks of one frame free it
+ * twice). The kernel copies user memory with nothing held, so that is a bug, or
+ * a race with munmap: the copy fails (uaccess_copy) instead. */
 int proc_page_fault(uint32_t addr, int write)
 {
     struct proc *p = current;
     if (!p || p->kthread || addr < USER_BASE || addr >= USER_TOP)
         return 0;
     int locked = mm_enter(p);
+    if (!locked)
+        return 0;
     int r = page_fault_locked(p, addr, write);
     mm_leave(p, locked);
     return r;

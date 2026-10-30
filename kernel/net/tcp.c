@@ -56,13 +56,15 @@ static uint32_t new_iss(void)
  * than the network card can hold while we are slow to drain it. An
  * NE2000's ring holds about nine full frames, and a burst beyond that is
  * dropped by the card and has to be retransmitted; connections receiving
- * at the same time share that budget.
+ * at the same time share that budget. A window once offered is never
+ * taken back (RFC 793 3.7): the peer may already be sending into it.
  */
 static uint32_t rcv_window(const struct socket *s)
 {
     uint32_t space = TCP_RCVBUF - s->rlen;
     if (ip_is_local(s->raddr))
         return space;
+    uint32_t offered = SEQ_GT(s->rcv_adv, s->rcv_nxt) ? s->rcv_adv - s->rcv_nxt : 0;
     uint32_t busy = 0;
     for (const struct socket *o = sockets; o; o = o->next)
         if (o->proto == IPPROTO_TCP && o->state == TCP_ESTABLISHED && !ip_is_local(o->raddr))
@@ -70,7 +72,7 @@ static uint32_t rcv_window(const struct socket *s)
     uint32_t cap = TCP_WINDOW / (busy ? busy : 1);
     if (cap < 2 * MSS_LOCAL)
         cap = 2 * MSS_LOCAL;
-    return MIN(space, cap);
+    return MIN(space, MAX(cap, offered));
 }
 
 static int send_raw(uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport, uint32_t seq,
@@ -312,7 +314,7 @@ static void listen_input(struct socket *l, const struct seg *g)
     c->parent = l;
     l->pending++;
     c->irs = g->seq;
-    c->rcv_nxt = g->seq + 1;
+    c->rcv_nxt = c->rcv_adv = g->seq + 1;
     c->mss = parse_mss(g->opts, g->optlen);
     c->snd_wnd = g->win;
     c->snd_wl1 = g->seq;
@@ -340,7 +342,7 @@ static void syn_sent_input(struct socket *s, const struct seg *g)
     if (!(g->flags & TCP_SYN))
         return;
     s->irs = g->seq;
-    s->rcv_nxt = g->seq + 1;
+    s->rcv_nxt = s->rcv_adv = g->seq + 1;
     s->mss = parse_mss(g->opts, g->optlen);
     if (!(g->flags & TCP_ACK)) {        /* simultaneous open */
         s->state = TCP_SYN_RECEIVED;
@@ -381,13 +383,16 @@ static void enter_time_wait(struct socket *s)
     s->rtx_on = 0;
 }
 
-/* Process the acknowledgement; returns 0 if the socket is gone. */
+/*
+ * Process the acknowledgement; returns 0 if the rest of the segment is to
+ * be ignored: its ACK was unacceptable (RFC 793), or the socket is gone.
+ */
 static int ack_input(struct socket *s, const struct seg *g)
 {
     if (s->state == TCP_SYN_RECEIVED) {
         if (SEQ_LEQ(g->ack, s->snd_una) || SEQ_GT(g->ack, s->snd_max)) {
             reset_reply(g);
-            return 1;
+            return 0;
         }
         s->snd_una = g->ack;            /* our SYN */
         s->snd_wnd = g->win;
@@ -395,7 +400,7 @@ static int ack_input(struct socket *s, const struct seg *g)
         s->snd_wl2 = g->ack;
         s->retries = 0;
         s->rtx_on = 0;
-        s->state = TCP_ESTABLISHED;
+        s->state = s->fin_queued ? TCP_FIN_WAIT_1 : TCP_ESTABLISHED;   /* closed early */
         if (s->parent) {
             struct socket **pp = &s->parent->acceptq;
             while (*pp)
@@ -410,7 +415,7 @@ static int ack_input(struct socket *s, const struct seg *g)
 
     if (SEQ_GT(g->ack, s->snd_max)) {
         send_ack(s);                    /* acknowledges something we never sent */
-        return 1;
+        return 0;
     }
     if (SEQ_GT(g->ack, s->snd_una)) {
         uint32_t acked = g->ack - s->snd_una;
@@ -535,6 +540,13 @@ static void synchronized_input(struct socket *s, const struct seg *g)
         return;
     }
     if (g->flags & TCP_RST) {
+        /* RFC 5961: only a reset at exactly rcv_nxt is believed. One that
+         * is merely in the window may be a blind guess: a challenge ACK
+         * makes the real peer send the exact one. */
+        if (g->seq != s->rcv_nxt) {
+            send_ack(s);
+            return;
+        }
         int err = 0;
         if (s->state == TCP_SYN_RECEIVED)
             err = s->parent ? 0 : ECONNREFUSED;
@@ -671,7 +683,11 @@ int tcp_read(struct socket *s, uint8_t *buf, uint32_t n, int peek)
 
 void tcp_shutdown(struct socket *s)
 {
-    if (s->state == TCP_ESTABLISHED || s->state == TCP_SYN_RECEIVED)
+    if (s->state == TCP_SYN_RECEIVED) {
+        s->fin_queued = 1;              /* sent once our SYN is acknowledged */
+        return;
+    }
+    if (s->state == TCP_ESTABLISHED)
         s->state = TCP_FIN_WAIT_1;
     else if (s->state == TCP_CLOSE_WAIT)
         s->state = TCP_LAST_ACK;

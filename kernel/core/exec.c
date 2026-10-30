@@ -370,10 +370,22 @@ int proc_exec(struct proc *p, const char *path, char *const argv[], char *const 
         return r;
     }
 
+    /* Only this thread goes on, as the process. The others are waited
+     * for without the VFS lock: one waiting for it could not die. */
+    int vfs_held = vfs_locked();
+    if (vfs_held)
+        vfs_unlock();
+    r = proc_exec_alone(p);
+    if (vfs_held)
+        vfs_lock();
+    if (r < 0) {
+        vmm_destroy(pd);
+        return r;
+    }
+
     /* Point of no return: replace the old image. The screen, the 3D
      * engine and buffers lent to the GPU were the old image's: give them
      * up before its memory is freed, as at exit. */
-    proc_exec_alone(p);                     /* only this thread goes on, as the process */
     fb_proc_exit(p->pid);
     vmm_destroy(proc_set_pd(p, pd));
     p->tls = 0;

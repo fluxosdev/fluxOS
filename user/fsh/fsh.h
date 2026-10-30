@@ -78,6 +78,7 @@ struct tokvec {
 int lex(const char *src, struct tokvec *out, const char **ctx);
 void tokvec_free(struct tokvec *tv);
 int skip_subst(const char *s, int i);           /* i at "$(" -> index past ")" or -1 */
+int skip_brace(const char *s, int i, int in_dq); /* i at "${" -> index past the matching "}" or -1 */
 
 /* ---- syntax tree ---- */
 enum node_type {
@@ -113,6 +114,7 @@ struct node {
     char **list;
     int nlist;
     int has_list;
+    int refs;                       /* owners besides the first (a function body: the table, calls running it) */
 };
 
 #define PARSE_OK         0
@@ -120,7 +122,7 @@ struct node {
 #define PARSE_ERROR      (-1)
 
 int parse(const char *src, struct node **out, const char **ctx);
-void node_free(struct node *n);
+void node_free(struct node *n);                 /* with refs, drops one owner */
 
 /* ---- expansion ---- */
 #define EXP_NOGLOB 0x1
@@ -151,6 +153,7 @@ void jobs_reap(int notify);
 int jobs_count(void);
 void jobs_list(void);
 struct job *job_find(const char *spec);     /* NULL spec: current job */
+struct job *job_find_pid(int pid);          /* the job a process belongs to */
 int job_wait(struct job *j, int announce);  /* foreground it and wait */
 int job_pid(struct job *j);
 int job_continue(struct job *j);                  /* bg: a suspended job goes on */
@@ -161,6 +164,7 @@ builtin_fn find_builtin(const char *name);
 extern const char *const builtin_names[];
 int test_eval(int argc, char **argv);           /* testexpr.c */
 int set_option(char opt, int on);               /* set -e and friends; -1 for an unknown one */
+void positional_free(char **v);                 /* a vector set_positional made (NULL is fine) */
 
 /* ---- traps (sh mode) ---- */
 #define TRAP_EXIT 0
@@ -206,6 +210,7 @@ struct shell {
     char *argv0;
     char **posv;            /* positional parameters $1.. */
     int posc;
+    char **posv_alloc;      /* set's vector for this function call or dot script (freed when it ends), or NULL */
     int break_n, continue_n;
     int returning;
     int exiting;

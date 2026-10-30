@@ -32,7 +32,9 @@
  * which the kernel checks and copies into its own video memory first.
  * Everything is synchronous: each call returns with the engine idle, so
  * no buffer is ever in use behind a process's back. Lent pages stay put
- * while lent: the heap cannot shrink over them (radeon_pinned).
+ * while lent: the heap cannot shrink over them (radeon_pinned). A 3D
+ * client's buffer that hangs the engine has it reset and started again
+ * for the desktop's copies, without 3D from then on.
  */
 #include "kernel.h"
 #include "drivers.h"
@@ -62,6 +64,7 @@ static struct {
     int owner;                      /* pid with the 3D engine, or 0 */
     uint32_t size;
     int dirty;                      /* its video memory may hold a client's pixels */
+    int off;                        /* a client hung the engine: no more 3D */
 } gl3d;
 
 /* Sleep a little in a process; at boot, spin. */
@@ -261,6 +264,11 @@ static void load_microcode(void)
     wreg(CP_ME_RAM_WADDR, 0);
     wreg(CP_ME_RAM_RADDR, 0);
 }
+
+/* What the CP feeds on the R600 and R700, as Linux's r600_gpu_soft_reset
+ * resets them after a hang: CB, CR, DB, PA, SC, SMX, SPI, SH, SX, TC, TA,
+ * VC and VGT (GRBM_SOFT_RESET bits 1-3 and 5-14). */
+#define SOFT_RESET_GFX_R700 0x7FEEu
 
 static void hang(const char *what)
 {
@@ -615,7 +623,7 @@ int radeon_gart_ok(void)
 /* Only where the kernel can check a 3D client's command buffers. */
 int radeon_3d_ok(void)
 {
-    return rv.accel && gen->check && rv.aper_size > GL_VRAM_OFF && rv.vram_size > GL_VRAM_OFF;
+    return rv.accel && gen->check && !gl3d.off && rv.aper_size > GL_VRAM_OFF && rv.vram_size > GL_VRAM_OFF;
 }
 
 /* ---- buffers lent to the GPU ---- */
@@ -837,10 +845,40 @@ static int fetch(uint64_t addr, uint32_t *dst, uint32_t n)
     return -1;
 }
 
+/*
+ * A 3D client's command buffer hung the engine. No check of it could have
+ * bounded the work (its shaders may loop for ever, a draw be as long as
+ * it likes), so the engine is recovered instead, as Linux's
+ * r600_gpu_soft_reset and rv770_startup do it: the CP stopped, the blocks
+ * it feeds and the CP reset, the engine set up and the CP started as at
+ * boot. The desktop's copies go on if the self-test passes again; 3D
+ * stays off, so a client cannot hang the engine over and over (the GL
+ * library draws in software, as after a hang on Intel).
+ */
+static void restart_after_hang(void)
+{
+    gl3d.off = 1;
+    cp_halt();
+    wreg(GRBM_SOFT_RESET, SOFT_RESET_GFX_R700);
+    (void)rreg(GRBM_SOFT_RESET);
+    mdelay(15);
+    wreg(GRBM_SOFT_RESET, 0);
+    gen->gpu_init();
+    load_microcode();
+    rv.accel = 1;
+    if (cp_start() < 0 || self_test() < 0) {
+        cp_halt();
+        rv.accel = 0;
+        kprintf("radeon: the 3D engine did not come back from the hang, no acceleration\n");
+        return;
+    }
+    kprintf("radeon: the 3D engine was reset after a 3D client hung it; no more 3D\n");
+}
+
 int radeon_submit(const struct dispsubmit *sub)
 {
     static uint32_t ib[UIB_DWORDS + 16];
-    if (!rv.accel || !gen->check)
+    if (!rv.accel || !gen->check || gl3d.off)
         return -ENODEV;
     if (gl3d.owner != current->leader->pid)
         return -EPERM;
@@ -871,6 +909,8 @@ int radeon_submit(const struct dispsubmit *sub)
         r = finish();
     }
     rcp.busy = 0;
+    if (r < 0 && !rv.accel)             /* it hung (hang()) */
+        restart_after_hang();
     return r < 0 ? -EIO : 0;
 }
 

@@ -8,8 +8,8 @@
  *
  * The whole network stack runs holding net_lock (net.c): these calls,
  * the network cards' interrupts and the timer tick. A call lets it go
- * while it sleeps. Buffers passed in are the caller's, checked
- * beforehand, so they are copied holding it.
+ * while it sleeps. Buffers passed in are kernel memory (the system
+ * calls copy the user's through one), so they are copied holding it.
  */
 #include "kernel.h"
 #include "drivers.h"

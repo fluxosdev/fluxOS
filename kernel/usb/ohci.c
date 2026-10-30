@@ -459,10 +459,13 @@ static void td_fill(struct ohci_td *td, uint32_t info, void *buf, uint32_t len)
     td->len = (uint16_t)len;
 }
 
-/* A descriptor covers at most 8 KiB and one page crossing. */
-static uint32_t chunk_at(uint32_t addr, uint32_t left)
+/* A descriptor covers at most 8 KiB and one page crossing, and whole
+ * packets unless it is the last: a packet split between two would be a
+ * short one (OUT) or overrun the first (IN). */
+static uint32_t chunk_at(uint32_t addr, uint32_t left, uint32_t mps)
 {
-    return MIN(left, 0x2000u - (addr & 0xFFF));
+    uint32_t c = 0x2000u - (addr & 0xFFF);
+    return left <= c ? left : c - c % mps;
 }
 
 static int ohci_submit(struct usb_hc *hc, struct usb_xfer *x)
@@ -480,9 +483,9 @@ static int ohci_submit(struct usb_hc *hc, struct usb_xfer *x)
     int control = ep->type == USB_EP_CONTROL;
     int in = control ? (x->setup[0] & USB_RT_IN) != 0 : (ep->addr & USB_DIR_IN) != 0;
     int ndata = 0;
-    uint32_t a = (uint32_t)x->buf, left = x->len;
+    uint32_t a = (uint32_t)x->buf, left = x->len, mps = ep->maxpacket ? ep->maxpacket : 8;
     do {
-        uint32_t c = chunk_at(a, left);
+        uint32_t c = chunk_at(a, left, mps);
         ndata++;
         a += c;
         left -= c;
@@ -511,7 +514,7 @@ static int ohci_submit(struct usb_hc *hc, struct usb_xfer *x)
     uint8_t *p = x->buf;
     left = x->len;
     for (int k = 0; k < ndata; k++) {
-        uint32_t c = chunk_at((uint32_t)p, left);
+        uint32_t c = chunk_at((uint32_t)p, left, mps);
         uint32_t info = in ? TD_IN : TD_OUT;
         if (control && k == 0)
             info |= TD_DATA1;

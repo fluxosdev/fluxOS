@@ -21,7 +21,7 @@ mkdir -p tree/src/deep/deeper tree/empty
 printf 'hello\nworld\n' > tree/src/a.txt
 seq 1 5000 > tree/src/numbers.txt
 head -c 200000 /dev/urandom > tree/src/random.bin
-head -c 300000 /dev/zero | tr '\0' 'x' > tree/src/xs.txt
+{ head -c 300000 /dev/zero | tr '\0' 'x'; echo; } > tree/src/xs.txt     # a whole line: find -exec cat's output is sorted
 : > tree/src/deep/deeper/empty.txt
 cp "$tools/sed" tree/src/deep/binary
 chmod 640 tree/src/a.txt
@@ -68,6 +68,17 @@ mkdir x9 && "$tools/tar" -xf ours.tar -C x9 --strip-components=1 ./src/deep && [
 if "$tools/tar" -xf ours.tar -C /nonexistent 2>/dev/null; then bad "tar: bad -C"; else ok; fi
 printf '\0\0' | (mkdir x10 && cd x10 && "$tools/tar" -xf - 2>/dev/null); ok
 (cd tree && "$tools/tar" -cf ../r1.tar .) && (cd tree && "$tools/tar" -cf ../r2.tar .) && same r1.tar r2.tar "tar: reproducible"
+# crafted archives: a long-name header claiming 4 GiB; a directory member over a symbolic link
+python3 -c '
+import sys
+h = bytearray(512)
+h[0:13] = b"././@LongLink"; h[100:108] = b"0000644\0"; h[124:136] = b"37777777777\0"; h[156] = ord("L"); h[257:263] = b"ustar\0"
+h[148:156] = b" " * 8; h[148:156] = b"%06o\0 " % sum(h)
+sys.stdout.buffer.write(bytes(h) + b"x" * 2048)' > huge.tar
+"$tools/tar" -tf huge.tar >/dev/null 2>&1; [ $? = 2 ] && ok || bad "tar: 4 GiB long-name header"
+mkdir -p ln1 ln2/d xl/x xl/outside && ln -s ../outside ln1/d && chmod 777 ln2/d && touch -d '2001-01-01' ln2/d && chmod 700 xl/outside &&
+    (cd ln1 && tar -cf ../lnk.tar d) && (cd ln2 && tar -rf ../lnk.tar d) && (cd xl/x && "$tools/tar" -xf ../../lnk.tar 2>/dev/null)
+[ "$(stat -c %a xl/outside)" = 700 ] && [ "$(stat -c %Y xl/outside)" != "$(stat -c %Y ln2/d)" ] && ok || bad "tar: directory member over a symbolic link"
 mkdir evil && printf '../evil.txt' > /dev/null && (cd tree && "$tools/tar" -cf ../abs.tar "$work/tree/src/a.txt" 2>/dev/null) && "$tools/tar" -tf abs.tar | grep -q "^tmp" && ok || bad "tar: leading / removed"
 
 # ---- sed ----
@@ -252,9 +263,13 @@ t "$(cut -c1,3 cut.txt)" "$tools/cut" -c1,3 cut.txt
 t "$(cut -c-2 cut.txt)" "$tools/cut" -c-2 cut.txt
 t "$(cut -d: -f1 --complement cut.txt)" "$tools/cut" -d: -f1 --complement cut.txt
 t "$(cut -d: -f1,2 --output-delimiter=, cut.txt)" "$tools/cut" -d: -f1,2 --output-delimiter=, cut.txt
+t "$(cut -d '' -f2 cut.txt)" "$tools/cut" -d '' -f2 cut.txt
+t "$(cut -d '' -s -f1 cut.txt)" "$tools/cut" -d '' -s -f1 cut.txt
 t "$(printf 'a b  c\nd\n' | xargs echo)" sh -c "printf 'a b  c\nd\n' | $tools/xargs echo"
 t "$(printf 'a b c d e\n' | xargs -n 2 echo)" sh -c "printf 'a b c d e\n' | $tools/xargs -n 2 echo"
 t "$(printf 'a\nb\n' | xargs -I{} echo "[{}]")" sh -c "printf 'a\nb\n' | $tools/xargs -I{} echo '[{}]'"
+t "$(printf 'a\nb\n' | xargs -i echo "[{}]")" sh -c "printf 'a\nb\n' | $tools/xargs -i echo '[{}]'"
+t "$(printf 'a\nb\n' | xargs -i% echo "[%]")" sh -c "printf 'a\nb\n' | $tools/xargs -i% echo '[%]'"
 t "$(printf 'a\0b c\0' | xargs -0 printf '<%s>')" sh -c "printf 'a\0b c\0' | $tools/xargs -0 printf '<%s>'"
 t "$(printf "'a b' c \"d e\" f\\\\ g\n" | xargs printf '<%s>')" sh -c "printf \"'a b' c \\\"d e\\\" f\\\\\\\\ g\n\" | $tools/xargs printf '<%s>'"
 t "$(printf '' | xargs -r echo x; echo "[$?]")" sh -c "printf '' | $tools/xargs -r echo x; echo \"[\$?]\""

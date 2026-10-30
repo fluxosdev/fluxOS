@@ -154,6 +154,8 @@ static int iso_load_dir(struct vnode *dir)
 
         uint32_t nlen = r[32];
         uint8_t flags = r[25];
+        if (33 + nlen > rlen)
+            continue;                           /* a name longer than its record */
         if (nlen == 1 && (r[33] == 0 || r[33] == 1))
             continue;                           /* "." and ".." */
         if (flags & 0x04)
@@ -174,7 +176,7 @@ static int iso_load_dir(struct vnode *dir)
             strlcpy(name, rr.name, sizeof(name));
         else
             plain_name(r + 33, nlen, name);
-        if (!name[0] || !strcmp(name, ".") || !strcmp(name, ".."))
+        if (!name[0] || !strcmp(name, ".") || !strcmp(name, "..") || strchr(name, '/'))
             continue;
 
         int isdir = (flags & 0x02) != 0;

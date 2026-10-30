@@ -120,7 +120,7 @@ void wpa_prf_sha1(const uint8_t *key, uint32_t key_len, const char *label, const
     }
 }
 
-static void derive_ptk(struct wpa_sm *sm)
+static void derive_ptk(const struct wpa_sm *sm, uint8_t ptk[WPA_PTK_LEN])
 {
     uint8_t data[6 + 6 + WPA_NONCE_LEN + WPA_NONCE_LEN];
     int a_first = memcmp(sm->aa, sm->spa, 6) < 0;
@@ -130,7 +130,7 @@ static void derive_ptk(struct wpa_sm *sm)
     memcpy(data + 12, an_first ? sm->anonce : sm->snonce, WPA_NONCE_LEN);
     memcpy(data + 12 + WPA_NONCE_LEN, an_first ? sm->snonce : sm->anonce, WPA_NONCE_LEN);
     wpa_prf_sha1(sm->pmk, WPA_PMK_LEN, "Pairwise key expansion", data, sizeof(data),
-                 sm->ptk, WPA_PTK_LEN);
+                 ptk, WPA_PTK_LEN);
 }
 
 /* ---- EAPOL-Key frames ---- */
@@ -176,28 +176,28 @@ static void put_be16(uint8_t *p, uint32_t v)
     p[1] = (uint8_t)v;
 }
 
-static void compute_mic(const struct wpa_sm *sm, const uint8_t *frame, uint32_t len, uint8_t mic[16])
+static void compute_mic(const uint8_t *kck, const uint8_t *frame, uint32_t len, uint8_t mic[16])
 {
     uint8_t h[SHA1_SIZE];
     const uint8_t zero[16] = { 0 };
     const uint8_t *d[3] = { frame, zero, frame + O_MIC + 16 };
     size_t l[3] = { O_MIC, 16, len - O_MIC - 16 };
-    hmac_sha1_vec(WPA_KCK(sm), WPA_KCK_LEN, 3, d, l, h);
+    hmac_sha1_vec(kck, WPA_KCK_LEN, 3, d, l, h);
     memcpy(mic, h, 16);
 }
 
-static int mic_ok(const struct wpa_sm *sm, const uint8_t *frame, uint32_t len)
+static int mic_ok(const uint8_t *kck, const uint8_t *frame, uint32_t len)
 {
     uint8_t mic[16];
-    compute_mic(sm, frame, len, mic);
+    compute_mic(kck, frame, len, mic);
     uint8_t diff = 0;
     for (int i = 0; i < 16; i++)
         diff |= mic[i] ^ frame[O_MIC + i];
     return diff == 0;
 }
 
-/* A reply with no key data beyond `data`; its MIC filled in when asked. */
-static void build_reply(const struct wpa_sm *sm, struct wpa_result *res, uint16_t info,
+/* A reply with no key data beyond `data`; its MIC (by `kck`) filled in when asked. */
+static void build_reply(const uint8_t *kck, struct wpa_result *res, uint16_t info,
                         const uint8_t *replay, const uint8_t *nonce, const uint8_t *data,
                         uint32_t data_len)
 {
@@ -216,7 +216,7 @@ static void build_reply(const struct wpa_sm *sm, struct wpa_result *res, uint16_
     if (data_len)
         memcpy(f + O_DATA, data, data_len);
     if (info & KI_MIC)
-        compute_mic(sm, f, len, f + O_MIC);
+        compute_mic(kck, f, len, f + O_MIC);
     res->reply_len = len;
 }
 
@@ -296,30 +296,39 @@ int wpa_rx(struct wpa_sm *sm, const uint8_t *f, uint32_t len, struct wpa_result 
     const uint8_t *data = f + O_DATA;
 
     if ((info & KI_PAIRWISE) && !(info & KI_MIC)) {
-        /* Message 1: a new ANonce. A repeated message 1 starts over. */
+        /* Message 1: a new ANonce. A repeated message 1 starts over. It has
+         * no MIC, so anyone can send one: the new keys stay aside (the TPTK)
+         * until a message 3 proves the AP has them too, and a rekey leaves
+         * the connection and its keys as they are meanwhile. */
         if (sm->state != WPA_WAIT_MSG1 && sm->state != WPA_WAIT_MSG3 && sm->state != WPA_DONE)
             return WPA_ESTATE;
         memcpy(sm->anonce, f + O_NONCE, WPA_NONCE_LEN);
         random_bytes(sm->snonce, WPA_NONCE_LEN);
-        derive_ptk(sm);
-        build_reply(sm, res, KI_HMAC_SHA1_AES | KI_PAIRWISE | KI_MIC, f + O_REPLAY, sm->snonce,
-                    sm->own_ie, sm->own_ie_len);
-        sm->state = WPA_WAIT_MSG3;
+        derive_ptk(sm, sm->tptk);
+        sm->tptk_set = 1;
+        build_reply(sm->tptk, res, KI_HMAC_SHA1_AES | KI_PAIRWISE | KI_MIC, f + O_REPLAY,
+                    sm->snonce, sm->own_ie, sm->own_ie_len);
+        if (sm->state != WPA_DONE)
+            sm->state = WPA_WAIT_MSG3;
         return 0;
     }
 
     if ((info & (KI_PAIRWISE | KI_MIC | KI_INSTALL)) == (KI_PAIRWISE | KI_MIC | KI_INSTALL)) {
-        /* Message 3: the AP has the same PTK (the MIC says so) and sends the GTK. */
+        /* Message 3: the AP has the same PTK (the MIC says so) and sends the GTK.
+         * Without a new message 1 since the last one, it is a retransmission
+         * (our message 4 was lost): answer it, but the keys are in already. */
         if (sm->state != WPA_WAIT_MSG3 && sm->state != WPA_DONE)
             return WPA_ESTATE;
         if (memcmp(f + O_NONCE, sm->anonce, WPA_NONCE_LEN))
             return WPA_ESTATE;          /* not the ANonce of the message 1 we answered */
-        if (!mic_ok(sm, f, len))
+        int fresh = sm->tptk_set && mic_ok(sm->tptk, f, len);
+        const uint8_t *ptk = fresh ? sm->tptk : sm->ptk;
+        if (!fresh && (sm->state != WPA_DONE || !mic_ok(ptk, f, len)))
             return WPA_EMIC;
         if (!(info & KI_ENCRYPTED) || data_len < 24 || data_len % 8 || data_len - 8 > 256)
             return WPA_EKEYDATA;
         uint8_t plain[256];
-        if (aes_unwrap(WPA_KEK(sm), data, data_len - 8, plain) < 0)
+        if (aes_unwrap(ptk + WPA_KCK_LEN, data, data_len - 8, plain) < 0)
             return WPA_EKEYDATA;
         const uint8_t *rsn = NULL;
         uint32_t rsn_len = 0;
@@ -332,10 +341,16 @@ int wpa_rx(struct wpa_sm *sm, const uint8_t *f, uint32_t len, struct wpa_result 
         memcpy(sm->replay, f + O_REPLAY, 8);
         sm->replay_valid = 1;
         memcpy(res->gtk_rsc, f + O_RSC, 8);
-        build_reply(sm, res, KI_HMAC_SHA1_AES | KI_PAIRWISE | KI_MIC | KI_SECURE, f + O_REPLAY,
-                    NULL, NULL, 0);
-        res->install_ptk = 1;
-        res->install_gtk = 1;
+        if (fresh) {
+            memcpy(sm->ptk, sm->tptk, WPA_PTK_LEN);
+            memset(sm->tptk, 0, WPA_PTK_LEN);
+            sm->tptk_set = 0;
+        }
+        build_reply(WPA_KCK(sm), res, KI_HMAC_SHA1_AES | KI_PAIRWISE | KI_MIC | KI_SECURE,
+                    f + O_REPLAY, NULL, NULL, 0);
+        /* Installing the same keys again would reset their counters (KRACK). */
+        res->install_ptk = fresh;
+        res->install_gtk = fresh;
         res->connected = sm->state != WPA_DONE;
         sm->state = WPA_DONE;
         return 0;
@@ -345,7 +360,7 @@ int wpa_rx(struct wpa_sm *sm, const uint8_t *f, uint32_t len, struct wpa_result 
         /* Group key handshake message 1: a new GTK. */
         if (sm->state != WPA_DONE)
             return WPA_ESTATE;
-        if (!mic_ok(sm, f, len))
+        if (!mic_ok(WPA_KCK(sm), f, len))
             return WPA_EMIC;
         if (!(info & KI_ENCRYPTED) || data_len < 24 || data_len % 8 || data_len - 8 > 256)
             return WPA_EKEYDATA;
@@ -356,7 +371,8 @@ int wpa_rx(struct wpa_sm *sm, const uint8_t *f, uint32_t len, struct wpa_result 
         memcpy(sm->replay, f + O_REPLAY, 8);
         sm->replay_valid = 1;
         memcpy(res->gtk_rsc, f + O_RSC, 8);
-        build_reply(sm, res, KI_HMAC_SHA1_AES | KI_MIC | KI_SECURE, f + O_REPLAY, NULL, NULL, 0);
+        build_reply(WPA_KCK(sm), res, KI_HMAC_SHA1_AES | KI_MIC | KI_SECURE, f + O_REPLAY, NULL,
+                    NULL, 0);
         res->install_gtk = 1;
         return 0;
     }

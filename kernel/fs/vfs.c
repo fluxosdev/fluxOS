@@ -76,6 +76,8 @@ static int is_fs_root(struct vnode *vn)
     return vn->fs && vn == vn->fs->root;
 }
 
+static void detach(struct vnode *vn);
+
 /* Read a filesystem directory's entries the first time it is used. */
 static int ensure_loaded(struct vnode *dir)
 {
@@ -83,8 +85,17 @@ static int ensure_loaded(struct vnode *dir)
         return 0;
     dir->loaded = 1;
     int r = dir->fs->ops->load_dir(dir);
-    if (r < 0)
+    if (r < 0) {
         dir->loaded = 0;
+        /* The next try reads them all again: no second copy of what this one attached. */
+        for (struct vnode *c = dir->children, *next; c; c = next) {
+            next = c->next;
+            if (c->refs <= 0 && !c->mounted && !c->children) {
+                detach(c);
+                vnode_free(c);
+            }
+        }
+    }
     return r;
 }
 
@@ -862,8 +873,10 @@ static int fs_probe(struct blockdev *bd, const char *type, struct fs **out)
         if (only)
             break;
     }
-    if (!fs)
+    if (!fs) {
+        blk_invalidate(bd);             /* no unmount will forget what the probes read */
         return r;
+    }
     *out = fs;
     return 0;
 }

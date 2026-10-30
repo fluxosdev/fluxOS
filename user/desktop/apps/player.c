@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include "desktop.h"
@@ -69,19 +71,23 @@ static int wav_info(const char *path, struct player *p, const char **err)
     }
     uint8_t h[12], ck[8], fmt[40];
     int have_fmt = 0, ok = -1;
+    struct stat st;
+    uint64_t at = 12;                   /* where the next chunk starts */
     *err = "Not a WAV file.";
-    if (read_full(fd, h, 12) != 12 || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4))
+    if (fstat(fd, &st) < 0 || read_full(fd, h, 12) != 12 || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4))
         goto out;
     for (;;) {
-        if (read_full(fd, ck, 8) != 8) {
+        /* Seeked to each chunk from the start: always forward, never past the end
+         * (a length of 0xFFFFFFF8 as a long is -8, the same chunk again). */
+        if (at + 8 > (uint64_t)st.st_size || lseek(fd, (off_t)at, SEEK_SET) < 0 || read_full(fd, ck, 8) != 8) {
             *err = "The file has no sound data.";
             goto out;
         }
         uint32_t len = le32(ck + 4);
+        at += 8 + (uint64_t)len + (len & 1);
         if (!memcmp(ck, "fmt ", 4)) {
             uint32_t n = len < sizeof(fmt) ? len : sizeof(fmt);
-            if (n < 16 || read_full(fd, fmt, n) != (int)n ||
-                lseek(fd, (long)((len - n) + (len & 1)), SEEK_CUR) < 0)
+            if (n < 16 || read_full(fd, fmt, n) != (int)n)
                 goto out;
             uint32_t tag = le16(fmt);
             if (tag == 0xFFFE && n >= 26)
@@ -101,8 +107,6 @@ static int wav_info(const char *path, struct player *p, const char **err)
             uint32_t frames = len / (uint32_t)(p->channels * p->bits / 8);
             p->dur_ms = frames / (uint32_t)p->rate * 1000 + frames % (uint32_t)p->rate * 1000 / (uint32_t)p->rate;
             ok = 0;
-            goto out;
-        } else if (lseek(fd, (long)(len + (len & 1)), SEEK_CUR) < 0) {
             goto out;
         }
     }
@@ -388,7 +392,23 @@ static void pl_destroy(struct window *w)
     free(p);
 }
 
+/* A WAV file dragged here plays, as opening it does. */
+static int pl_drop(struct window *w, int x, int y, const struct drag_data *d, int phase, int copy)
+{
+    (void)w; (void)x; (void)y; (void)copy;
+    size_t n = d->npaths == 1 ? strlen(d->paths[0]) : 0;
+    if (phase == DROP_LEAVE || n < 5 || strcasecmp(d->paths[0] + n - 4, ".wav"))
+        return DROP_NONE;
+    if (phase == DROP_OVER) {
+        wm_drag_hint("Play");
+        return DROP_OPEN;
+    }
+    player_open(d->paths[0]);           /* this window: there is only one */
+    return DROP_OPEN;
+}
+
 static const struct window_ops pl_ops = {
+    .drop = pl_drop,
     .key = pl_key,
     .mouse = pl_mouse,
     .focus = pl_focus,

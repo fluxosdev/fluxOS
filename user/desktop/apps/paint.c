@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "desktop.h"
@@ -57,6 +58,7 @@ struct paint {
     int modified;
     unsigned revision;
     char path[512];                     /* where it was opened from or saved to ("" for none) */
+    char dropped[512];                  /* a picture dragged here, to open once changes are dealt with */
     char pending[512];                  /* a path waiting for an overwrite answer */
     char status[96];                    /* the last thing that happened */
     int mx, my;                         /* the pointer, in canvas coordinates */
@@ -1089,7 +1091,43 @@ static void pt_destroy(struct window *win)
     free(p);
 }
 
+static int is_picture(const char *path)
+{
+    static const char *const suffixes[] = { ".png", ".jpg", ".jpeg", ".jpe", ".jfif", ".gif", ".svg", ".ico", ".webp" };
+    size_t n = strlen(path);
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        size_t k = strlen(suffixes[i]);
+        if (n > k && !strcasecmp(path + n - k, suffixes[i]))
+            return 1;
+    }
+    return 0;
+}
+
+static void open_dropped(void *ctx)
+{
+    struct paint *p = alive(ctx);
+    if (p)
+        open_chosen(p, p->dropped);
+}
+
+/* A picture dragged here opens in this window, as File, Open would. */
+static int pt_drop(struct window *w, int x, int y, const struct drag_data *d, int phase, int copy)
+{
+    (void)x; (void)y; (void)copy;
+    struct paint *p = w->priv;
+    if (phase == DROP_LEAVE || d->npaths != 1 || !is_picture(d->paths[0]))
+        return DROP_NONE;
+    if (phase == DROP_OVER) {
+        wm_drag_hint("Open in Paint");
+        return DROP_OPEN;
+    }
+    snprintf(p->dropped, sizeof(p->dropped), "%s", d->paths[0]);
+    after_unsaved(p, open_dropped, "Open another");
+    return DROP_OPEN;
+}
+
 static const struct window_ops pt_ops = {
+    .drop = pt_drop,
     .key = pt_key,
     .mouse = pt_mouse,
     .wheel = pt_wheel,

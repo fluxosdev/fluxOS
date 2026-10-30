@@ -70,7 +70,11 @@ struct rparser {
     const char *error;
     int groups;
     int class_cap;
+    int nest;                           /* groups and classes open now */
 };
+
+/* Matching a lookaround recurses as deep as it nests: keep both well in the stack. */
+#define RE_MAX_NEST 128
 
 static void femit(struct rparser *P, struct frag *f, int op, int x, int y)
 {
@@ -306,7 +310,18 @@ static int class_atom(struct rparser *P, struct uset *u, int *lo)
 }
 
 /* After the [: the class up to and past its ], into u (as written: *negate says if it had ^). */
+static int class_body_in(struct rparser *P, struct uset *u, int *negate);
 static int class_body(struct rparser *P, struct uset *u, int *negate)
+{
+    if (P->nest >= RE_MAX_NEST || js_stack_low(P->J))
+        return P->error = "pattern nested too deeply", -1;
+    P->nest++;
+    int r = class_body_in(P, u, negate);
+    P->nest--;
+    return r;
+}
+
+static int class_body_in(struct rparser *P, struct uset *u, int *negate)
 {
     *negate = 0;
     if (P->s < P->end && *P->s == '^') {
@@ -435,7 +450,12 @@ static int parse_atom(struct rparser *P, struct frag *f)
                 P->re->names[g] = js_mkstr(P->J, name, name_len)->s, P->re->nnames++;
         }
         struct frag body = { 0 };
-        if (parse_alt(P, &body) < 0)
+        if (P->nest >= RE_MAX_NEST || js_stack_low(P->J))
+            return P->error = "pattern nested too deeply", -1;
+        P->nest++;
+        int r = parse_alt(P, &body);
+        P->nest--;
+        if (r < 0)
             return -1;
         if (P->s >= P->end || *P->s != ')')
             return P->error = "missing )", -1;
@@ -647,7 +667,7 @@ struct regex *re_compile(struct js *J, const char *pattern, int len, const char 
             return NULL;
         }
     }
-    struct rparser P = { J, pattern, pattern + len, re, NULL, 0, 0 };
+    struct rparser P = { J, pattern, pattern + len, re, NULL, 0, 0, 0 };
     struct frag f = { 0 };
     femit(&P, &f, R_SAVE, 0, 0);
     if (parse_alt(&P, &f) < 0 || (P.s < P.end && *P.s == ')' && (P.error = "unmatched )"))) {

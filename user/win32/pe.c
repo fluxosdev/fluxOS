@@ -77,14 +77,16 @@ static void relocate(struct module *m, uint32_t delta)
     uint32_t rva = m->dir[DIR_BASERELOC][0], size = m->dir[DIR_BASERELOC][1];
     uint8_t *img = GP(m->base);
     uint32_t off = 0;
-    while (off + 8 <= size) {
+    if (rva > m->size || size > m->size - rva)
+        return;
+    while (size - off >= 8) {
         uint32_t page = rd32(img + rva + off), bsize = rd32(img + rva + off + 4);
-        if (bsize < 8 || off + bsize > size)
+        if (bsize < 8 || bsize > size - off)
             break;
         for (uint32_t i = 8; i + 2 <= bsize; i += 2) {
             uint16_t e = rd16(img + rva + off + i);
             uint32_t at = page + (e & 0xFFF);
-            if (at + 4 > m->size)
+            if (at < page || at > m->size - 4)
                 continue;
             switch (e >> 12) {
             case IMAGE_REL_BASED_HIGHLOW: {
@@ -139,7 +141,7 @@ int pe_map(const char *path, struct module *m, char *err, size_t errsize)
             return -1;
         }
     }
-    if (size_of_image < size_of_headers || size_of_image > 0x40000000u) {
+    if (!size_of_image || size_of_image < size_of_headers || size_of_image > 0x40000000u) {
         snprintf(err, errsize, "bad image size %u", size_of_image);
         close(fd);
         return -1;
@@ -225,13 +227,14 @@ fail:
 gp_t pe_export(struct module *m, const char *name, int ordinal)
 {
     uint32_t rva = m->dir[DIR_EXPORT][0], size = m->dir[DIR_EXPORT][1];
-    if (!rva || !size || rva + 40 > m->size)
+    if (!rva || !size || m->size < 40 || rva > m->size - 40)
         return 0;
     const uint8_t *img = GP(m->base);
     const uint8_t *ed = img + rva;
     uint32_t base_ord = rd32(ed + 16), nfuncs = rd32(ed + 20), nnames = rd32(ed + 24);
     uint32_t funcs = rd32(ed + 28), names = rd32(ed + 32), ords = rd32(ed + 36);
-    if (funcs + nfuncs * 4 > m->size || names + nnames * 4 > m->size || ords + nnames * 2 > m->size)
+    if (funcs > m->size || nfuncs > (m->size - funcs) / 4 || names > m->size || nnames > (m->size - names) / 4 ||
+        ords > m->size || nnames > (m->size - ords) / 2)
         return 0;
     uint32_t index = 0xFFFFFFFFu;
     if (name) {
@@ -271,7 +274,7 @@ gp_t pe_export(struct module *m, const char *name, int ordinal)
     uint32_t frva = rd32(img + funcs + index * 4);
     if (!frva)
         return 0;
-    if (frva >= rva && frva < rva + size) {    /* a forwarder: "DLL.Name" or "DLL.#12" */
+    if (frva >= rva && frva - rva < size && frva < m->size) {   /* a forwarder: "DLL.Name" or "DLL.#12" */
         char fwd[256];
         snprintf(fwd, sizeof(fwd), "%s", (const char *)img + frva);
         char *dot = strrchr(fwd, '.');
@@ -309,6 +312,10 @@ int pe_resolve_imports(struct module *m, char *err, size_t errsize)
         if (name >= m->size || ft >= m->size)
             break;
         const char *dll = (const char *)img + name;
+        /* the import holds one reference, so FreeLibrary cannot pull the
+         * DLL out from under it; loader_resolve below takes none */
+        char lerr[256];
+        module_load(dll, from_dir, lerr, sizeof(lerr));
         uint32_t thunks = oft && oft < m->size ? oft : ft;
         for (uint32_t i = 0; thunks + i * 4 + 4 <= m->size; i++) {
             uint32_t e = rd32(img + thunks + i * 4);
@@ -350,17 +357,18 @@ int pe_setup_tls(struct module *m)
     const uint8_t *img = GP(m->base);
     const uint8_t *t = img + rva;
     uint32_t start = rd32(t), end = rd32(t + 4), index_at = rd32(t + 8), zero_fill = rd32(t + 16);
+    uint32_t size = end > start ? end - start : 0;
+    if (size > m->size || zero_fill > GUEST_TOP - m->size)     /* the block size cannot wrap */
+        return -1;
     if (next_tls_index >= 64)
         return -1;
     int index = next_tls_index++;
     m->tls_index = index;
-    if (index_at >= WIN_BASE && index_at < WIN_BASE + GUEST_TOP)
-        memcpy(GP(index_at - WIN_BASE), &index, 4);     /* absolute addresses in the image */
-    else if (index_at >= m->base && index_at < m->base + m->size)
+    /* absolute addresses in the image, wherever it was loaded */
+    if (index_at >= m->base && index_at - m->base <= m->size - 4)
         memcpy(GP(index_at), &index, 4);
-    uint32_t size = end > start ? end - start : 0;
     gp_t block = vm_alloc_loader(size + zero_fill + 16);
-    if (size && start >= m->base && start + size <= m->base + m->size)
+    if (size && start >= m->base && start - m->base <= m->size - size)
         memcpy(GP(block), GP(start), size);
     uint32_t *array = GP(teb->tls_pointer);
     array[index] = block;

@@ -698,11 +698,18 @@ static int drop_xattr(struct ext2_fs *e, struct ext2_inode *in)
     return r;
 }
 
+/* A symbolic link whose target is in its block pointers: no data block,
+ * though an extended-attribute block may be counted in in->blocks. */
+static int fast_symlink(struct ext2_fs *e, struct ext2_inode *in)
+{
+    return (in->mode & S_IFMT_) == S_IFLNK_ && in->blocks == (in->file_acl ? e->bs / 512 : 0);
+}
+
 /* An inode with no names and no vnodes left: its blocks and itself. */
 static int free_inode(struct ext2_fs *e, struct ext2_inode *in)
 {
     int r = 0;
-    if ((in->mode & S_IFMT_) != S_IFLNK_ || in->blocks)
+    if (!fast_symlink(e, in))
         r = truncate_blocks(e, in, 0);
     int x = drop_xattr(e, in);
     in->size = 0;
@@ -870,7 +877,9 @@ static int dent_at(struct ext2_fs *e, const uint8_t *b, uint32_t off, struct den
     d->name_len = e->filetype ? b[off + 6] : rd16(b + off + 6);
     d->type = e->filetype ? b[off + 7] : 0;
     d->name = (const char *)b + off + 8;
-    if (d->rec_len < 8 || d->rec_len % 4 || off + d->rec_len > e->bs || 8 + d->name_len > d->rec_len)
+    /* without FILETYPE name_len has 16 bits, but no name is longer than NAME_MAX */
+    if (d->rec_len < 8 || d->rec_len % 4 || off + d->rec_len > e->bs || 8 + d->name_len > d->rec_len ||
+        d->name_len > NAME_MAX)
         return -1;
     return 0;
 }
@@ -1245,8 +1254,7 @@ static int ext2_readlink(struct vnode *vn, char *buf, uint32_t size)
     uint32_t len = in->size;
     if (len >= PATH_MAX || len >= e->bs)
         return -EIO;
-    uint32_t data_blocks = in->blocks - (in->file_acl ? e->bs / 512 : 0);
-    if (!data_blocks) {
+    if (fast_symlink(e, in)) {
         if (len >= sizeof(in->block))
             return -EIO;
         memcpy(e->buf, in->block, len);
@@ -1480,8 +1488,10 @@ static int ext2_mount(struct fs *fs)
         return -EINVAL;
     }
     e->ngroups = (e->blocks_count - e->first_data_block + e->bpg - 1) / e->bpg;
-    if ((uint64_t)e->ngroups * e->ipg != e->inodes_count) {
-        klog("ext2: /dev/%s: not mounted: the inode count does not add up\n", bd->name);
+    /* the descriptor table follows the superblock in the first group */
+    if ((uint64_t)e->ngroups * e->ipg != e->inodes_count ||
+        (uint64_t)e->ngroups * GD_SIZE > (uint64_t)e->bpg * e->bs) {
+        klog("ext2: /dev/%s: not mounted: the inode or group count does not add up\n", bd->name);
         kfree(e);
         return -EINVAL;
     }
@@ -1530,7 +1540,13 @@ static int ext2_sync(struct fs *fs)
     struct ext2_fs *e = fs->priv;
     if (fs->readonly)
         return 0;
-    wr16(e->sb + SB_STATE, rd16(e->sb + SB_STATE) | EXT2_VALID_FS);
+    /* There is no orphan list: an unlinked file still open at shutdown
+     * leaves the volume unclean, so e2fsck frees it. */
+    int orphans = 0;
+    for (struct ext2_inode *in = e->inodes; in; in = in->next)
+        orphans |= in->orphan;
+    if (!orphans)
+        wr16(e->sb + SB_STATE, rd16(e->sb + SB_STATE) | EXT2_VALID_FS);
     return write_sb(e);
 }
 

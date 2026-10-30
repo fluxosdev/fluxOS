@@ -63,16 +63,20 @@ int copy_to_user(void *udst, const void *src, uint32_t n)
     return r < 0 ? r : uaccess_copy(udst, src, n);
 }
 
-/* Copy a NUL-terminated user string; returns its length. */
+/* Copy a NUL-terminated user string; returns its length. It is copied in
+ * short pieces that stay within a page (and max), so dst may be written a
+ * little past the NUL. */
 static int copy_str(char *dst, const char *src, uint32_t max)
 {
-    uint32_t a = (uint32_t)src;
-    for (uint32_t i = 0; i < max; i++, a++) {
-        if ((i == 0 || (a & 0xFFF) == 0) && user_check((const void *)a, 1) < 0)
+    uint32_t a = (uint32_t)src, i = 0;
+    while (i < max) {
+        uint32_t n = MIN(MIN(max - i, PAGE_SIZE - (a & 0xFFF)), 256u);
+        if (copy_from_user(dst + i, (const void *)a, n) < 0)
             return -EFAULT;
-        dst[i] = *(const char *)a;
-        if (!dst[i])
-            return (int)i;
+        for (uint32_t end = i + n; i < end; i++)
+            if (!dst[i])
+                return (int)i;
+        a += n;
     }
     return -ENAMETOOLONG;
 }
@@ -208,9 +212,9 @@ static int copy_vector(uint32_t uvec, char **kvec, int max, char **pool, uint32_
     }
     for (;; n++) {
         uint32_t slot = uvec + (uint32_t)n * 4;
-        if (user_check((const void *)slot, 4) < 0)
+        const char *s;
+        if (copy_from_user(&s, (const void *)slot, 4) < 0)
             return -EFAULT;
-        const char *s = *(const char **)slot;
         if (!s)
             break;
         if (n >= max)
@@ -683,14 +687,24 @@ static int sys_mmap(uint32_t uargs, uint32_t b, uint32_t c, uint32_t d, uint32_t
         return (int)base;
 
     uint32_t len = ALIGN_UP(a.len, PAGE_SIZE);
+    /* Read through a kernel page: another thread may unmap the new pages
+     * meanwhile, which only makes the copy fail. */
+    uint8_t *page = kmalloc(PAGE_SIZE);
+    if (!page) {
+        proc_munmap(current, base, len);
+        return -ENOMEM;
+    }
     vfs_lock();
     for (uint32_t off = 0; off < len; off += PAGE_SIZE) {
         uint32_t foff = a.offset + off;
         if (foff < f->vn->size) {
             uint32_t n = MIN((uint32_t)PAGE_SIZE, f->vn->size - foff);
-            int nr = vfs_read(f->vn, (void *)(base + off), foff, n);
+            int nr = vfs_read(f->vn, page, foff, n);
+            if (nr > 0 && copy_to_user((void *)(base + off), page, (uint32_t)nr) < 0)
+                nr = -EFAULT;
             if (nr < 0) {
                 vfs_unlock();
+                kfree(page);
                 proc_munmap(current, base, len);
                 return nr;
             }
@@ -699,6 +713,7 @@ static int sys_mmap(uint32_t uargs, uint32_t b, uint32_t c, uint32_t d, uint32_t
             vmm_protect_page(current->pd, base + off, a.prot);
     }
     vfs_unlock();
+    kfree(page);
     return (int)base;
 }
 
@@ -748,9 +763,14 @@ static int sys_ttymode(uint32_t mode, uint32_t b, uint32_t c, uint32_t d, uint32
 /* ---- files ---- */
 
 /*
- * File I/O that may reach a disk runs under the VFS lock, in chunks so
- * other processes get their turn during a long transfer. Terminals and
- * pipes block for unbounded time and never take the lock.
+ * File I/O goes through a kernel buffer, a chunk at a time: filesystems,
+ * drivers, terminals, pipes and sockets never see the caller's memory,
+ * which another thread may unmap while they sleep, or which they would
+ * otherwise copy holding a spinlock. The caller's side is copied with
+ * nothing held. I/O that may reach a disk runs under the VFS lock, a
+ * chunk at a time so other processes get their turn during a long
+ * transfer. Terminals and pipes block for unbounded time and never take
+ * the lock.
  */
 #define IO_CHUNK (64 * 1024)
 
@@ -759,23 +779,47 @@ static int needs_vfs_lock(struct file *f)
     return f->type == FT_VNODE && f->vn->type != VN_CHR;
 }
 
-static int file_io(struct file *f, uint8_t *buf, uint32_t n, int write)
+/* The kernel buffer for a transfer of n bytes (a chunk of it at a time). */
+static uint8_t *bounce_alloc(uint32_t n)
 {
-    if (!needs_vfs_lock(f))
-        return write ? file_write(f, buf, n) : file_read(f, buf, n);
+    return kmalloc(n ? MIN(n, (uint32_t)IO_CHUNK) : 1);
+}
+
+static int file_io(struct file *f, uint8_t *ubuf, uint32_t n, int write)
+{
+    uint8_t *kbuf = bounce_alloc(n);
+    if (!kbuf)
+        return -ENOMEM;
+    int locked = needs_vfs_lock(f);
     uint32_t done = 0;
-    while (done < n) {
+    int r;
+    do {                                /* once at least: a 0-byte transfer still checks f */
         uint32_t chunk = MIN(n - done, (uint32_t)IO_CHUNK);
-        vfs_lock();
-        int r = write ? file_write(f, buf + done, chunk) : file_read(f, buf + done, chunk);
-        vfs_unlock();
+        if (write && copy_from_user(kbuf, ubuf + done, chunk) < 0) {
+            r = -EFAULT;
+            break;
+        }
+        if (locked)
+            vfs_lock();
+        r = write ? file_write(f, kbuf, chunk) : file_read(f, kbuf, chunk);
+        if (locked)
+            vfs_unlock();
         if (r < 0)
-            return done ? (int)done : r;
+            break;
+        if (!write && r > 0 && copy_to_user(ubuf + done, kbuf, (uint32_t)r) < 0) {
+            r = -EFAULT;                /* (what was read is lost, as it would be on Linux) */
+            break;
+        }
         done += (uint32_t)r;
         if ((uint32_t)r < chunk)
             break;
-    }
-    return (int)done;
+        /* A terminal, pipe, socket or device hands over what it has:
+         * another chunk could wait for more, with this one's in hand. */
+        if (!write && !locked)
+            break;
+    } while (done < n);
+    kfree(kbuf);
+    return done ? (int)done : r;
 }
 
 static int sys_read(uint32_t fd, uint32_t buf, uint32_t n, uint32_t d, uint32_t e)
@@ -836,12 +880,20 @@ static int sys_open(uint32_t upath, uint32_t flags, uint32_t mode, uint32_t d, u
             return r;
     }
 
-    if (vn->type == VN_CHR && vn->dev_open && (r = vn->dev_open(vn, (int)flags)) < 0)
+    int cloned = vn->type == VN_CHR && vn->dev_clone;
+    if (cloned && (r = vn->dev_clone(vn, (int)flags, &vn)) < 0)
         return r;
+    if (vn->type == VN_CHR && vn->dev_open && (r = vn->dev_open(vn, (int)flags)) < 0) {
+        if (cloned)
+            vfs_unref(vn);              /* the clone goes too */
+        return r;
+    }
     struct file *f = file_open(vn, (int)(flags & ~O_CLOEXEC));
     if (!f) {
         if (vn->type == VN_CHR && vn->dev_close)
             vn->dev_close(vn, (int)flags);
+        if (cloned)
+            vfs_unref(vn);              /* nothing else refers to it: it goes */
         return -ENOMEM;
     }
     int fd = alloc_fd_from(f, 0, (flags & O_CLOEXEC) != 0);
@@ -1471,7 +1523,27 @@ static int sys_sendto(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, uin
     if (uaddr && (r = copy_sockaddr(uaddr, sizeof(sin), &sin)) < 0)
         return r;
     int sflags = (int)flags | ((f->flags & O_NONBLOCK) ? MSG_DONTWAIT : 0);
-    return sock_sendto(s, (const void *)buf, n, sflags, uaddr ? &sin : NULL);
+    /* Through a kernel buffer, as file_io(): the stack copies it holding net_lock.
+     * (A datagram is far smaller than a chunk: one that is not fails whole.) */
+    uint8_t *kbuf = bounce_alloc(n);
+    if (!kbuf)
+        return -ENOMEM;
+    uint32_t done = 0;
+    do {
+        uint32_t chunk = MIN(n - done, (uint32_t)IO_CHUNK);
+        if (copy_from_user(kbuf, (const uint8_t *)buf + done, chunk) < 0) {
+            r = -EFAULT;
+            break;
+        }
+        r = sock_sendto(s, kbuf, chunk, sflags, uaddr ? &sin : NULL);
+        if (r < 0)
+            break;
+        done += (uint32_t)r;
+        if ((uint32_t)r < chunk)
+            break;
+    } while (done < n);
+    kfree(kbuf);
+    return done ? (int)done : r;
 }
 
 static int sys_recvfrom(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, uint32_t uaddr)
@@ -1485,7 +1557,14 @@ static int sys_recvfrom(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, u
     if (user_check_w((void *)buf, n) < 0 || (uaddr && user_check_w((void *)uaddr, sizeof(sin)) < 0))
         return -EFAULT;
     int sflags = (int)flags | ((f->flags & O_NONBLOCK) ? MSG_DONTWAIT : 0);
-    r = sock_recvfrom(s, (void *)buf, n, sflags, uaddr ? &sin : NULL);
+    /* Up to a chunk, received into a kernel buffer as by file_io(). */
+    uint8_t *kbuf = bounce_alloc(n);
+    if (!kbuf)
+        return -ENOMEM;
+    r = sock_recvfrom(s, kbuf, MIN(n, (uint32_t)IO_CHUNK), sflags, uaddr ? &sin : NULL);
+    if (r > 0 && copy_to_user((void *)buf, kbuf, (uint32_t)r) < 0)
+        r = -EFAULT;                    /* (the data is taken, and lost) */
+    kfree(kbuf);
     if (r >= 0 && uaddr)
         copy_to_user((void *)uaddr, &sin, sizeof(sin));    /* checked above; the data is already taken */
     return r;

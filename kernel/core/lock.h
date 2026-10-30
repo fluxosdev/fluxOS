@@ -19,7 +19,7 @@
  *
  * Lock order, outermost first (take an inner one while holding an outer
  * one, never the other way round):
- *   mutexes: vfs, display
+ *   mutexes: vfs, mm (each process's), display
  *   subsystem spinlocks: usb, net, sound, tty, input, pipe, ata, ahci, nvme, floppy, acpi
  *   then console, then heap and pmm, then sched (innermost: wakeup()
  *   may be called holding anything), with the small hardware locks

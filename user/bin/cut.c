@@ -72,7 +72,7 @@ static void cut_line(char *line, char mode, char delim, int only_delimited, cons
         putchar('\n');
         return;
     }
-    if (!strchr(line, delim)) {
+    if (!delim || !strchr(line, delim)) {      /* -d '': NUL, which a line cannot hold */
         if (!only_delimited)
             puts(line);
         return;

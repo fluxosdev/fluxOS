@@ -248,7 +248,7 @@ static uint32_t mem_find(uint32_t size, int ignore)
     for (int i = 0; i < MAX_BLOCKS; i++) {
         if (!blocks[i].size || i == ignore)
             continue;
-        if (blocks[i].addr >= at + size)
+        if (blocks[i].addr >= at && blocks[i].addr - at >= size)
             return at;
         if (blocks[i].addr + blocks[i].size > at)
             at = blocks[i].addr + blocks[i].size;
@@ -275,6 +275,8 @@ static int block_by_handle(uint32_t h)
 
 static uint32_t block_alloc(uint32_t size)
 {
+    if (size > ~0xFFFu)
+        return 0;
     size = (size + 0xFFF) & ~0xFFFu;
     if (!size)
         size = 0x1000;
@@ -951,18 +953,22 @@ static void int31(void)
     }
     case 0x0503: {                      /* resize a memory block */
         int i = block_by_handle((uint32_t)SI << 16 | DI);
-        uint32_t size = ((uint32_t)BX << 16 | CX) + 0xFFF;
-        size &= ~0xFFFu;
+        uint32_t size = (uint32_t)BX << 16 | CX;
         if (i < 0) {
             fail(0x8023);
             return;
         }
+        if (size > ~0xFFFu) {
+            fail(0x8013);
+            return;
+        }
+        size = (size + 0xFFF) & ~0xFFFu;
         uint32_t old = blocks[i].addr, old_size = blocks[i].size;
         uint32_t next = ext_end;
         for (int k = 0; k < MAX_BLOCKS; k++)
             if (blocks[k].size && blocks[k].addr > old && blocks[k].addr < next)
                 next = blocks[k].addr;
-        if (old + size <= next) {       /* in place */
+        if (size <= next - old) {       /* in place */
             if (size > old_size)
                 memset(mem + old + old_size, 0, size - old_size);
             blocks[i].size = size;

@@ -29,7 +29,9 @@
  * The blitter runs commands from a ring in stolen memory, as the GPU's
  * other engines do: we write them at the tail, it reads from the head.
  * Each batch ends by flushing and writing a sequence number into a status
- * page, which we wait for; the calls return with the copies done.
+ * page, which we wait for; the calls return with the copies done. One
+ * that does not finish ends acceleration, after a reset of the GT's
+ * engines so that nothing lent to the blitter is freed while it runs.
  *
  * There are three pipes, A to C, each with a primary plane and a cursor
  * plane, 0x1000 apart. Register names follow Linux's i915 (i915_reg.h).
@@ -201,21 +203,23 @@ static void plan_pages(void)
                 ig.stolen_size / 1024);
         return;
     }
+    uint32_t cur_off = ig.page0 + 2 * slot;
+    uint32_t eng_off = cur_off + 2 * CUR_BYTES;
+    uint32_t end = eng_off + ENGINE_BYTES;
+    uint8_t *cpu = vmm_map_mmio(ig.aper_phys + cur_off, end - cur_off, PTE_PCD | PTE_PWT);
+    ig.screen = vmm_map_mmio(ig.aper_phys + ig.page0, 2 * slot, 0);
+    if (!cpu || !ig.screen)
+        return;                     /* eng_off stays 0: no blitter (accel_init) */
     ig.page_offset = slot;
-    ig.cur_off = ig.page0 + 2 * slot;
-    ig.eng_off = ig.cur_off + 2 * CUR_BYTES;
-    uint32_t end = ig.eng_off + ENGINE_BYTES;
+    ig.cur_off = cur_off;
+    ig.eng_off = eng_off;
     ig.map_first = ig.page0;
     ig.map_end = end;
     ig.map_phys = first;
-    uint8_t *cpu = vmm_map_mmio(ig.aper_phys + ig.cur_off, end - ig.cur_off, PTE_PCD | PTE_PWT);
-    ig.screen = vmm_map_mmio(ig.aper_phys + ig.page0, 2 * slot, 0);
-    if (!cpu || !ig.screen)
-        return;
     ig.cursor_img = cpu;
-    ig.ring = (volatile uint32_t *)(cpu + (ig.eng_off - ig.cur_off));
-    ig.hws = (volatile uint32_t *)(cpu + (ig.eng_off - ig.cur_off) + HWS_OFF);
-    ig.test = cpu + (ig.eng_off - ig.cur_off) + TEST_OFF;
+    ig.ring = (volatile uint32_t *)(cpu + (eng_off - cur_off));
+    ig.hws = (volatile uint32_t *)(cpu + (eng_off - cur_off) + HWS_OFF);
+    ig.test = cpu + (eng_off - cur_off) + TEST_OFF;
     gtt_map();
     ig.flip = ig.cursor = 1;
 }
@@ -456,7 +460,8 @@ static void copy(const struct surf *src, const struct surf *dst, uint32_t sx, ui
     c[7] = src->addr;
 }
 
-/* Wait for the blitter to write seq; a stuck one is given up on. */
+/* Wait for the blitter to write seq; a stuck one is given up on, and
+ * stopped before anything it could still be copying to is freed. */
 static int wait_seq(uint32_t seq)
 {
     for (int i = 0; i < 40000; i++) {   /* 200 ms */
@@ -468,7 +473,57 @@ static int wait_seq(uint32_t seq)
          "batch %u, done %u; no more acceleration\n", rd(RING_HEAD), rd(RING_TAIL), rd(RING_ACTHD),
          rd(RING_CTL), rd(RING_MI_MODE), seq, ig.hws[HWS_SEQNO]);
     ig.accel = ig.gart = 0;
+    ring_stop();
+    intel_engine_hung();
     return -1;
+}
+
+/*
+ * The engines did not reset, so they may still read and write what the
+ * GTT lends them: no more acceleration, and the pages lent now are never
+ * freed (a reference each, which nothing drops; the 3D engine's memory
+ * likewise, intel_3d.c's free_arena).
+ */
+static void keep_lent_pages(void)
+{
+    ig.hung = 1;
+    ig.accel = ig.gart = 0;
+    uint32_t kept = 0;
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        const struct slot *sl = &ig.slots[i];
+        for (uint32_t j = 0; sl->pid && j < sl->npages; j++)
+            kept += (uint32_t)pmm_ref((uint32_t)pte_addr(ig.gtt[ig.buf_first + sl->first + j]));
+    }
+    klog("intel: the GT did not reset; %u pages lent to it are kept for good\n", kept);
+}
+
+/*
+ * An engine's batch did not finish, and that engine has been given up on.
+ * Reset the GT's engines, as Linux's gen6_reset_engines does on Gen7 (all
+ * of them at once), so that it lets go of the memory the GTT lends it; the
+ * GT forgets forcewake with them. The other engine starts again.
+ */
+void intel_engine_hung(void)
+{
+    if (ig.hung)
+        return;
+    wr(GEN6_GDRST, GRDOM_FULL);
+    int i = 0;
+    for (; i < 50000 && (rd(GEN6_GDRST) & GRDOM_FULL); i++)   /* 500 ms */
+        udelay(10);
+    if (i == 50000) {
+        keep_lent_pages();
+        intel_3d_after_reset(0);
+        return;
+    }
+    klog("intel: the GT's engines were reset\n");
+    wr(FORCEWAKE_MT, MASKED_OFF(FORCEWAKE_KERNEL));
+    forcewake();
+    if (ig.accel && ring_start() < 0) {
+        ig.accel = ig.gart = 0;
+        klog("intel: the blitter did not start again after the reset\n");
+    }
+    intel_3d_after_reset(1);
 }
 
 /* End the batch with a flush that writes its number, run it, wait. */
@@ -573,7 +628,8 @@ static int gart_test(void)
 out:
     ig.gtt[g] = ig.scratch | PTE_LLC | PTE_VALID;
     gtt_flush();
-    pmm_free(page);
+    if (!ig.hung)                       /* else the blitter may still write it */
+        pmm_free(page);
     return r;
 }
 

@@ -385,6 +385,7 @@ static int wait_render(uint32_t seq)
          r3.hws[HWS_SEQ]);
     r3.ok = 0;
     rcs_stop();
+    intel_engine_hung();                /* before anything it may be drawing into is freed */
     return -1;
 }
 
@@ -991,11 +992,14 @@ int intel_3d_ok(void)
     return r3.ok;
 }
 
+/* The pages go back unless the engines did not reset (ig.hung): then the
+ * 3D engine may still be drawing into them, and they are kept for good. */
 static void free_arena(void)
 {
     for (uint32_t i = 0; i < r3.npages; i++) {
         ig.gtt[r3.arena_first + i] = ig.scratch | PTE_LLC | PTE_VALID;
-        pmm_free(r3.pages[i]);
+        if (!ig.hung)
+            pmm_free(r3.pages[i]);
     }
     gtt_flush3d();
     kfree(r3.pages);
@@ -1073,6 +1077,22 @@ void intel_3d_proc_exit(int pid)
 {
     if (r3.owner && r3.owner == pid)
         free_arena();
+}
+
+/* The blitter hung and the GT's engines were reset (ok), taking the render
+ * ring with them, or would not reset (then no more 3D either). */
+void intel_3d_after_reset(int ok)
+{
+    if (!r3.ok)
+        return;
+    if (!ok) {
+        r3.ok = 0;
+        return;
+    }
+    if (rcs_start() < 0) {
+        r3.ok = 0;
+        klog("intel: the 3D engine did not start again after the reset\n");
+    }
 }
 
 /* After waking: the GTT may have been rewritten and the engine forgot its ring. */

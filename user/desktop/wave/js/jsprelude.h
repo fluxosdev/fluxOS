@@ -379,7 +379,7 @@ static const char js_chunk_weak[] = JS_SOURCE(
     get: function (o, k) { return o[k]; },
     set: function (o, k, v) { o[k] = v; return true; },
     getPrototypeOf: function (o) { return Object.getPrototypeOf(o); },
-    setPrototypeOf: function (o, p) { Object.setPrototypeOf(o, p); return true; },
+    setPrototypeOf: function (o, p) { try { Object.setPrototypeOf(o, p); } catch (e) { return false; } return true; },
     defineProperty: function (o, k, d) { Object.defineProperty(o, k, d); return true; },
     deleteProperty: function (o, k) { return delete o[k]; },
     getOwnPropertyDescriptor: function (o, k) { return Object.getOwnPropertyDescriptor(o, k); },

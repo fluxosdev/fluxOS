@@ -37,6 +37,10 @@ void node_free(struct node *n)
 {
     if (!n)
         return;
+    if (n->refs > 0) {
+        n->refs--;
+        return;
+    }
     free(n->text);
     for (int i = 0; i < n->nwords; i++)
         free(n->words[i]);

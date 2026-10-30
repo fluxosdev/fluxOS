@@ -79,21 +79,25 @@ int wstrcasecmp(const uint16_t *a, const uint16_t *b)
 
 int ansi_to_wide(const char *s, int n, uint16_t *out, int outlen)
 {
-    if (n < 0)
+    int term = n < 0, i;
+    if (term)
         n = (int)strlen(s) + 1;
-    int i;
     for (i = 0; i < n && i < outlen; i++)
         out[i] = (uint8_t)s[i];
+    if (term && i < n && outlen > 0)    /* truncated: keep it a string */
+        out[outlen - 1] = 0;
     return i;
 }
 
 int wide_to_ansi(const uint16_t *s, int n, char *out, int outlen)
 {
-    if (n < 0)
+    int term = n < 0, i;
+    if (term)
         n = wstrlen(s) + 1;
-    int i;
     for (i = 0; i < n && i < outlen; i++)
         out[i] = s[i] < 256 ? (char)s[i] : '?';
+    if (term && i < n && outlen > 0)    /* truncated: keep it a string */
+        out[outlen - 1] = 0;
     return i;
 }
 

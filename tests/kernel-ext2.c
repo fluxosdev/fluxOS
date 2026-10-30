@@ -578,6 +578,84 @@ static void other_kinds(void)
     printf("kernel-ext2: ext4 refused, ext3 mounted and written\n");
 }
 
+/* Where debugfs says a file's logical block lies, as a byte offset into the disk. */
+static uint8_t *block_of(const char *path, uint32_t idx, uint32_t bs)
+{
+    char req[128];
+    snprintf(req, sizeof(req), "bmap %s %u", path, idx);
+    uint32_t blk = (uint32_t)strtoul(debugfs(req), NULL, 10);
+    CHECK(blk && (uint64_t)(blk + 1) * bs <= (uint64_t)disk_sectors * 512);
+    return disk + (size_t)blk * bs;
+}
+
+/* Hostile and odd volumes: nothing overruns, frees what it should not, or is duplicated. */
+static void crafted(void)
+{
+    /* Without FILETYPE a name length has 16 bits: one past NAME_MAX is damage. */
+    sh("mke2fs -q -F -t ext2 -O ^filetype -b 1024 %s %uM >/dev/null 2>&1", img, DISK_MB);
+    sh("printf 'no filetype' > %s/victim && debugfs -w -R 'write %s/victim victim' %s >/dev/null 2>&1",
+       workdir, workdir, img);
+    load_image();
+    CHECK(mount_image() == 0);
+    same("/mnt/victim", "no filetype", 11, 0);
+    unmount_image();
+    uint8_t *b = block_of("/", 0, 1024);
+    int patched = 0;
+    for (uint32_t off = 0; off + 8 <= 1024 && rd16(b + off + 4) >= 8; off += rd16(b + off + 4)) {
+        if (rd16(b + off + 6) == 6 && !memcmp(b + off + 8, "victim", 6)) {
+            CHECK(rd16(b + off + 4) >= 8 + 600);
+            wr16(b + off + 6, 600);
+            patched = 1;
+        }
+    }
+    CHECK(patched);
+    CHECK(mount_image() == 0);
+    CHECK(!look("/mnt/victim", 1));
+    unmount_image();
+
+    /* A directory damaged past its first block: what was read before the
+     * damage is not attached again on every lookup. */
+    sh("mke2fs -q -F -t ext2 -b 1024 %s %uM >/dev/null 2>&1", img, DISK_MB);
+    load_image();
+    CHECK(mount_image() == 0);
+    CHECK(create("/mnt/d", VN_DIR, NULL) == 0);
+    char path[128];
+    for (int i = 0; i < 40; i++) {
+        snprintf(path, sizeof(path), "/mnt/d/a-name-long-enough-to-fill-blocks-%02d", i);
+        put(path, "x", 1, 0);
+    }
+    CHECK(look("/mnt/d", 1)->size >= 2048);
+    unmount_image();
+    save_image();
+    wr16(block_of("/d", 1, 1024) + 4, 0);
+    CHECK(mount_image() == 0);
+    struct vnode *d = look("/mnt/d", 1);
+    CHECK(d);
+    for (int k = 0; k < 3; k++)
+        CHECK(!look("/mnt/d/a-name-long-enough-to-fill-blocks-00", 1));
+    CHECK(!d->children && !d->loaded);
+    unmount_image();
+
+    /* A fast symbolic link with an extended-attribute block: its target is
+     * not taken for block numbers when it goes. (block[0] is made to name a
+     * file's block, which e2fsck would then find free.) */
+    sh("mke2fs -q -F -t ext2 -b 1024 -I 128 %s %uM >/dev/null 2>&1", img, DISK_MB);
+    sh("printf 'kept' > %s/kept && printf 'write %s/kept kept\\nsymlink link short-target\\n"
+       "ea_set link user.test value\\n' > %s/cmds && debugfs -w -f %s/cmds %s >/dev/null 2>&1",
+       workdir, workdir, workdir, workdir, img);
+    sh("debugfs -w -R \"sif /link block[0] $(debugfs -R 'bmap /kept 0' %s 2>/dev/null)\" %s >/dev/null 2>&1",
+       img, img);
+    CHECK(strstr(debugfs("stat /link"), "File ACL: ") && !strstr(debugfs("stat /link"), "File ACL: 0"));
+    load_image();
+    CHECK(mount_image() == 0);
+    CHECK(LOCKED(vfs_unlink("/mnt/link", NULL)) == 0);
+    unmount_image();
+    save_image();
+    fsck_clean("removing a fast symbolic link with an extended attribute");
+    CHECK(!strcmp(debugfs("cat /kept"), "kept"));
+    printf("kernel-ext2: crafted volumes: long names, damaged directories, fast links with xattrs\n");
+}
+
 int main(void)
 {
     if (!have_e2fsprogs()) {
@@ -595,6 +673,7 @@ int main(void)
     linux_made();
     stress();
     other_kinds();
+    crafted();
     sh("rm -rf %s", workdir);
     printf("kernel ext2: files, directories, symbolic and hard links, renames and truncation passed\n");
     return 0;

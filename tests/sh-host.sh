@@ -187,6 +187,21 @@ lower
 EOF
 echo after'
 t "ifs restore" 'IFS=:; set -- a:b; for w in $1; do echo $w; done; unset IFS; set -- "a b"; for w in $1; do echo $w; done'
+t "func redefined while running" 'f() { f() { echo new; }; echo old; }; f; f'
+t "func unset while running" 'f() { unset -f f; echo still; echo more; }; f; f 2>/dev/null || echo gone'
+t "func defined twice" 'for i in 1 2; do h() { echo h$i; }; h; done; h'
+t "set -- in func" 'set -- a b; f() { set -- x; set -- y z; echo "$@"; }; f; echo "$@"; g() { set -- q; }; k() { set -- p; g; echo "$1"; }; set -- top; k; echo $1'
+t "set -- in dot script" 'echo "set -- s1 s2" > setp.sh; set -- a; . ./setp.sh; echo "$@"; f() { . ./setp.sh; echo "$#"; }; f x; echo "$@"'
+te "arith LONG_MIN / -1" '-9223372036854775808 0
+[0]' 'echo $(( (-9223372036854775807-1) / -1 )) $(( (-9223372036854775807-1) % -1 ))'
+t "wait pid" '(sleep 0.2; echo bg) & wait $!; echo after; (exit 5) & wait $!; echo $?; (exit 6) & wait %1; echo $?'
+t "nested brace" 'x=; y=Y; echo ${x:-${y}} "${x:-${y:-"q w"}}" ${x:-a}b} "${x:-a}"} ${x:-"}"} ${x:-$(echo "}")} ${x:-${x:-${y}}}'
+t "printf long" 'printf "%s" "$(printf "%0600d" 0)" | wc -c; printf "%-700s|\n" a | wc -c; printf "%b" "$(printf "%0600d" 0)" | wc -c'
+t "printf octal" 'printf "\101\0101|%b|%b|%5b|\n" "\0101" "\101" "x\ty"'
+te "printf hex" 'AB
+[0]' 'printf "\x41%b\n" "\x42"'
+t "printf b stop" 'printf "a%bc\n" "x\cy"; echo after'
+t "saved fds not inherited" '{ ls /proc/self/fd; } > fds.txt; cat fds.txt'
 te "sh name" 'sh[]
 [0]' 'printf "%s[%s]\n" "$(basename "$0")" ""'
 got=$("$ours" -ec 'echo one; false; echo two' 2>/dev/null; echo "[$?]")

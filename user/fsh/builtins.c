@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include "fsh.h"
 
@@ -191,49 +192,75 @@ static int bi_popd(int argc, char **argv)
 
 /* ---- output ---- */
 
-/* Interpret backslash escapes; returns 1 if \c (stop) was seen. */
-static int put_escaped(const char *s)
+#define ESC_ECHO 0      /* echo: \0nnn */
+#define ESC_B    1      /* printf's %b: \0nnn and \nnn */
+#define ESC_FMT  2      /* printf's format: \nnn, a leading 0 one of the three digits */
+
+/* The escape at s (s[0] is the backslash, s[1] is not NUL) into b; returns its length,
+ * or -1 for \c (no more output). */
+static int escape_at(struct sbuf *b, const char *s, int mode)
 {
-    for (; *s; s++) {
+    int i = 2, v = 0;
+    switch (s[1]) {
+    case 'n': sb_putc(b, '\n'); break;
+    case 't': sb_putc(b, '\t'); break;
+    case 'r': sb_putc(b, '\r'); break;
+    case 'a': sb_putc(b, '\a'); break;
+    case 'b': sb_putc(b, '\b'); break;
+    case 'e':
+    case 'E': sb_putc(b, '\033'); break;
+    case 'v': sb_putc(b, '\v'); break;
+    case 'f': sb_putc(b, '\f'); break;
+    case '\\': sb_putc(b, '\\'); break;
+    case 'c': return -1;
+    case 'x':
+        for (int k = 0; k < 2 && isxdigit((unsigned char)s[i]); k++, i++)
+            v = v * 16 + (isdigit((unsigned char)s[i]) ? s[i] - '0' : tolower((unsigned char)s[i]) - 'a' + 10);
+        sb_putc(b, (char)v);
+        break;
+    default:
+        if (s[1] >= '0' && s[1] <= '7' && (s[1] == '0' || mode != ESC_ECHO)) {
+            int digits = 3;
+            if (s[1] != '0' || mode == ESC_FMT) {
+                v = s[1] - '0';
+                digits = 2;
+            }
+            for (int k = 0; k < digits && s[i] >= '0' && s[i] <= '7'; k++, i++)
+                v = v * 8 + (s[i] - '0');
+            sb_putc(b, (char)v);
+        } else {
+            sb_putc(b, '\\');
+            sb_putc(b, s[1]);
+        }
+        break;
+    }
+    return i;
+}
+
+/* Backslash escapes in s into b; returns 1 if \c (stop) was seen. */
+static int escape_str(struct sbuf *b, const char *s, int mode)
+{
+    while (*s) {
         if (*s != '\\' || !s[1]) {
-            putchar(*s);
+            sb_putc(b, *s++);
             continue;
         }
-        switch (*++s) {
-        case 'n': putchar('\n'); break;
-        case 't': putchar('\t'); break;
-        case 'r': putchar('\r'); break;
-        case 'a': putchar('\a'); break;
-        case 'b': putchar('\b'); break;
-        case 'e':
-        case 'E': putchar('\033'); break;
-        case 'v': putchar('\v'); break;
-        case 'f': putchar('\f'); break;
-        case '\\': putchar('\\'); break;
-        case 'c': return 1;
-        case '0': {
-            int v = 0;
-            for (int k = 0; k < 3 && s[1] >= '0' && s[1] <= '7'; k++)
-                v = v * 8 + (*++s - '0');
-            putchar(v);
-            break;
-        }
-        case 'x': {
-            int v = 0;
-            for (int k = 0; k < 2 && isxdigit((unsigned char)s[1]); k++) {
-                char c = *++s;
-                v = v * 16 + (isdigit((unsigned char)c) ? c - '0' : tolower(c) - 'a' + 10);
-            }
-            putchar(v);
-            break;
-        }
-        default:
-            putchar('\\');
-            putchar(*s);
-            break;
-        }
+        int n = escape_at(b, s, mode);
+        if (n < 0)
+            return 1;
+        s += n;
     }
     return 0;
+}
+
+static int put_escaped(const char *s)
+{
+    struct sbuf b;
+    sb_init(&b);
+    int stop = escape_str(&b, s, ESC_ECHO);
+    fwrite(b.s, 1, (size_t)b.len, stdout);
+    sb_free(&b);
+    return stop;
 }
 
 static int bi_echo(int argc, char **argv)
@@ -274,11 +301,15 @@ static int bi_printf(int argc, char **argv)
     int ai = 2;
     do {
         for (const char *p = fmt; *p; p++) {
-            if (*p == '\\') {
-                char tmp[3] = { '\\', p[1], 0 };
-                if (p[1])
-                    p++;
-                put_escaped(tmp);
+            if (*p == '\\' && p[1]) {
+                struct sbuf b;
+                sb_init(&b);
+                int len = escape_at(&b, p, ESC_FMT);
+                fwrite(b.s, 1, (size_t)b.len, stdout);
+                sb_free(&b);
+                if (len < 0)
+                    return 0;
+                p += len - 1;
                 continue;
             }
             if (*p != '%') {
@@ -299,15 +330,25 @@ static int bi_printf(int argc, char **argv)
                 break;
             char conv = *p;
             const char *arg = ai < argc ? argv[ai++] : NULL;
-            char out[512];
-            if (conv == 's' || conv == 'b') {
+            if (conv == 's') {
                 spec[k++] = 's';
                 spec[k] = 0;
-                snprintf(out, sizeof(out), spec, arg ? arg : "");
-                if (conv == 'b')
-                    put_escaped(out);
-                else
-                    fputs(out, stdout);
+                printf(spec, arg ? arg : "");
+            } else if (conv == 'b') {
+                /* the escapes first, then the width and precision */
+                struct sbuf b;
+                sb_init(&b);
+                int stop = escape_str(&b, arg ? arg : "", ESC_B);
+                if (k == 1) {
+                    fwrite(b.s, 1, (size_t)b.len, stdout);
+                } else {
+                    spec[k++] = 's';
+                    spec[k] = 0;
+                    printf(spec, b.s ? b.s : "");
+                }
+                sb_free(&b);
+                if (stop)
+                    return 0;
             } else if (conv == 'c') {
                 if (arg && *arg)
                     putchar(*arg);
@@ -321,13 +362,11 @@ static int bi_printf(int argc, char **argv)
                     v = (unsigned char)arg[1];
                 else if (arg)
                     v = strtoll(arg, NULL, 0);
-                snprintf(out, sizeof(out), spec, v);
-                fputs(out, stdout);
+                printf(spec, v);
             } else if (strchr("eEfFgGaA", conv)) {
                 spec[k++] = conv;
                 spec[k] = 0;
-                snprintf(out, sizeof(out), spec, arg ? strtod(arg, NULL) : 0.0);
-                fputs(out, stdout);
+                printf(spec, arg ? strtod(arg, NULL) : 0.0);
             } else {
                 putchar('%');
                 putchar(conv);
@@ -428,13 +467,23 @@ static const struct { const char *name; char opt; } option_names[] = {
     { "ignoreeof", 'i' }, { "vi", 'v' }, { "emacs", 'v' }, { "pipefail", 'p' }, { "posix", 'p' },
 };
 
+void positional_free(char **v)
+{
+    for (int i = 0; v && v[i]; i++)
+        free(v[i]);
+    free(v);
+}
+
+/* A new vector each time: the old one is freed only if it is this call's own
+ * (a caller's, saved by run_function or source, stays as it is). */
 static void set_positional(int argc, char **argv, int from)
 {
-    static struct strvec params;
-    sv_free(&params);
+    struct strvec params;
+    sv_init(&params);
     for (int i = from; i < argc; i++)
         sv_push(&params, xstrdup(argv[i]));
-    sh.posv = sv_terminate(&params);
+    positional_free(sh.posv_alloc);
+    sh.posv = sh.posv_alloc = sv_terminate(&params);
     sh.posc = params.n;
 }
 
@@ -825,15 +874,22 @@ static int bi_source(int argc, char **argv)
         fsh_error("%s: not enough arguments", argv[0]);
         return 1;
     }
-    char **old_v = sh.posv;
-    int old_c = sh.posc;
-    if (argc > 2) {
-        sh.posv = argv + 2;
-        sh.posc = argc - 2;
+    if (argc == 2) {            /* the caller's parameters: set in the script changes them */
+        int st = source_file(argv[1], 0);
+        if (sh.returning)
+            sh.returning = 0;
+        return st;
     }
+    char **old_v = sh.posv, **old_alloc = sh.posv_alloc;
+    int old_c = sh.posc;
+    sh.posv = argv + 2;
+    sh.posc = argc - 2;
+    sh.posv_alloc = NULL;
     int st = source_file(argv[1], 0);
+    positional_free(sh.posv_alloc);
     sh.posv = old_v;
     sh.posc = old_c;
+    sh.posv_alloc = old_alloc;
     if (sh.returning)
         sh.returning = 0;
     return st;
@@ -1082,10 +1138,17 @@ static int bi_wait(int argc, char **argv)
 {
     int status = 0;
     if (argc > 1) {
+        /* %N is a job, a number a process ($!) */
         for (int i = 1; i < argc; i++) {
-            struct job *j = job_find(argv[i]);
+            int pid = argv[i][0] == '%' ? 0 : atoi(argv[i]);
+            struct job *j = pid ? job_find_pid(pid) : job_find(argv[i]);
+            int st;
             if (j)
                 status = job_wait(j, 0);
+            else if (pid > 0 && waitpid(pid, &st, 0) == pid)
+                status = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+            else
+                status = 127;
         }
         return status;
     }

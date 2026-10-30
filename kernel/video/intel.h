@@ -36,6 +36,10 @@
 #define MASKED_ON(b)        ((b) << 16 | (b))   /* the top half says which bits to change */
 #define MASKED_OFF(b)       ((b) << 16)
 
+/* Resetting the GT's engines; the display is not part of it */
+#define GEN6_GDRST          0x941C
+#define GRDOM_FULL          (1u << 0)   /* every engine; clears itself when done */
+
 /* The blitter's command streamer, BCS */
 #define BCS            0x22000
 #define RING_TAIL      (BCS + 0x30)
@@ -147,6 +151,7 @@ struct intel {
     uint8_t *screen;                /* the aperture, at page0: both pages */
 
     int accel, gart;                /* the blitter runs; and reads lent memory */
+    int hung;                       /* the engines did not reset: lent pages are never freed */
     volatile uint32_t *ring, *hws;  /* the aperture, at eng_off */
     uint8_t *test;
     uint32_t tail, seq;
@@ -180,12 +185,14 @@ static inline void wr(uint32_t reg, uint32_t v)
 
 /* intel.c */
 void intel_screen_changed(void);        /* fb changed size: page 0, the pointer again */
+void intel_engine_hung(void);           /* an engine given up on: reset them, restart the other */
 
 /* intel_3d.c: the 3D engine, for the GL library */
 void intel_3d_init(void);               /* after the blitter */
 int intel_3d_ok(void);
 void intel_3d_proc_exit(int pid);
 void intel_3d_resume(void);
+void intel_3d_after_reset(int ok);      /* the GT was reset (ok) or would not be */
 
 /* intel_modeset.c: native modes, for the VGA output (the PCH's DAC behind FDI) */
 void intel_modeset_init(void);

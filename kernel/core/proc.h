@@ -200,7 +200,9 @@ int do_fork(void);
 void do_exit(int status) __attribute__((noreturn));     /* the whole process (exit, a fatal signal) */
 void thread_exit(uint32_t unmap_addr, uint32_t unmap_len) __attribute__((noreturn));
 int thread_create(uint32_t entry, uint32_t stack, uint32_t tls, uint32_t clear_tid);
-void proc_exec_alone(struct proc *p);   /* exec: the other threads go, and p is the process */
+/* exec: the other threads go, and p is the process; -EINTR (nothing changed) if
+ * another thread is ending the process first: p is killed on its way out. */
+int proc_exec_alone(struct proc *p);
 int futex_wait(uint32_t addr, uint32_t val, int timeout_ms);
 int futex_wake(uint32_t addr, int n);
 int do_tkill(int tid, int sig);

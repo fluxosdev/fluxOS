@@ -892,8 +892,23 @@ static int match_compound(const struct node *n, const char *s, int len)
     return 1;
 }
 
+/* How deep the matcher has gone into nested :not()/:is() and into combinators:
+ * each costs stack, which may be a script's coroutine's. */
+static int sel_nest, sel_combinators;
+
 /* A complex selector (compounds and combinators), matched right to left. */
+static int match_complex_in(const struct node *n, const char *s, int len);
 static int match_complex(const struct node *n, const char *s, int len)
+{
+    if (sel_combinators >= 128)
+        return 0;
+    sel_combinators++;
+    int r = match_complex_in(n, s, len);
+    sel_combinators--;
+    return r;
+}
+
+static int match_complex_in(const struct node *n, const char *s, int len)
 {
     /* find the last combinator outside brackets and parentheses */
     int depth = 0, at = -1;
@@ -942,7 +957,18 @@ static int match_complex(const struct node *n, const char *s, int len)
 }
 
 /* A selector list, bounded so nested functional selectors need no copies. */
+static int matches_span_in(const struct node *n, const char *s, int len);
 static int matches_span(const struct node *n, const char *s, int len)
+{
+    if (sel_nest >= 8)
+        return 0;
+    sel_nest++;
+    int r = matches_span_in(n, s, len);
+    sel_nest--;
+    return r;
+}
+
+static int matches_span_in(const struct node *n, const char *s, int len)
 {
     const char *end = s + len;
     while (s < end) {
@@ -5343,7 +5369,7 @@ static void xhr_issue(struct jsdom *d, int id, jsval x, int preflight)
         }
         char head[300];int n=snprintf(head,sizeof(head),"Content-Type: %s\r\nContent-Length: %u\r\n",*type?type:"application/octet-stream",(unsigned)len);
         r->cross=0;r->preflight=0;r->received=0;
-        jsdom_http_done(d,id,200,head,n,bytes,!strcmp(method,"HEAD")?0:(int)len);
+        jsdom_http_done(d,id,200,head,n,(const char *)bytes,!strcmp(method,"HEAD")?0:(int)len);
         free(bytes);return;
     }
     char origin[300] = "null", target[300];

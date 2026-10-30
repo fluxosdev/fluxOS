@@ -143,6 +143,8 @@ void crt_dtoa(double v, char type, int prec, int alt, char *out)
     char t = (char)(type | 0x20);
     if (prec < 0)
         prec = 6;
+    if (prec > 340)                     /* the most fmt_fixed and fmt_exp give */
+        prec = 340;
     int neg = v < 0 || (v == 0 && 1 / v < 0);
     if (neg)
         v = -v;
@@ -301,7 +303,7 @@ int crt_vformat(crt_put_fn put, void *ctx, const void *vfmt, int wide_fmt, const
         c = FC(i);
         if (!c)
             break;
-        char body[420], prefix[4] = "";
+        char body[660], prefix[4] = "";   /* "-", 309 digits, ".", 340 decimals */
         int blen = 0;
         switch (c) {
         case '%':

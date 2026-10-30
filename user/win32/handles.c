@@ -55,6 +55,10 @@ static void release(struct hobj *o)
         if (o->fd > 2)
             close(o->fd);
         break;
+    case H_MAPPING:
+        if (o->priv && ((struct mapping *)o->priv)->fd >= 0)
+            close(((struct mapping *)o->priv)->fd);
+        break;
     case H_CONSOLE_IN: case H_CONSOLE_OUT:
         break;
     default:

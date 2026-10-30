@@ -865,7 +865,60 @@ static void term_destroy(struct window *w)
     free(t);
 }
 
+/* Files dropped here are typed as their paths, quoted for the shell; text as it
+ * is, with line breaks and tabs as spaces, so that a drop never runs anything by
+ * itself. Other control characters would act on the line (^U, ^C, ^D) whatever
+ * the quoting: they are left out of text, and a path holding one is not typed. */
+static int is_control(char c)
+{
+    return (unsigned char)c < 0x20 || c == 0x7F;
+}
+
+static int term_drop(struct window *w, int x, int y, const struct drag_data *d, int phase, int copy)
+{
+    (void)x; (void)y; (void)copy;
+    struct term *t = w->priv;
+    if (phase == DROP_LEAVE || t->finished || t->gfx || t->master < 0 || (!d->npaths && !d->text))
+        return DROP_NONE;
+    if (phase == DROP_OVER) {
+        wm_drag_hint(d->npaths ? "Type the path%s" : "Type the text", d->npaths > 1 ? "s" : "");
+        return DROP_COPY;
+    }
+    if (t->view) {
+        t->view = 0;
+        render(t);
+    }
+    if (!d->npaths) {
+        for (const char *c = d->text; *c; c++) {
+            char ch = *c == '\n' || *c == '\r' || *c == '\t' ? ' ' : *c;
+            if (!is_control(ch))
+                write(t->master, &ch, 1);
+        }
+        return DROP_COPY;
+    }
+    int typed = 0;
+    for (int i = 0; i < d->npaths; i++) {
+        const char *bad = d->paths[i];
+        while (*bad && !is_control(*bad))
+            bad++;
+        if (*bad)
+            continue;
+        write(t->master, typed ? " '" : "'", typed ? 2 : 1);
+        typed = 1;
+        for (const char *c = d->paths[i]; *c; c++) {
+            if (*c == '\'')
+                write(t->master, "'\\''", 4);       /* ' ends the quote, \' is one, ' starts again */
+            else
+                write(t->master, c, 1);
+        }
+        write(t->master, "'", 1);
+    }
+    write(t->master, " ", 1);
+    return DROP_COPY;
+}
+
 static const struct window_ops term_ops = {
+    .drop = term_drop,
     .key = term_key,
     .wheel = term_wheel,
     .resize = term_resize,

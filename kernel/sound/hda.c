@@ -21,13 +21,13 @@
  * by the codec's unsolicited response where it sends one, and looking
  * again twice a second regardless.
  *
- * The codec always runs at 48 kHz (or 44.1 kHz), 16-bit stereo; what
- * write() is given (8 or 16 bits, mono or stereo, 5000 to 48000 Hz) is
- * converted on the way into a ring, with linear interpolation. The
+ * The codec always runs at 48 kHz (or 44.1 kHz), 16-bit stereo. /dev/dsp
+ * is the software mixer's (pcm.c), which converts what each program
+ * writes and feeds this driver a ring of the codec's frames. The
  * controller plays from a DMA buffer in two halves; when it moves on to
- * one half the other is refilled from the ring. The halves are checked
- * at each buffer interrupt and on every timer tick, so a lost interrupt
- * does not stop the sound.
+ * one half the other is refilled from the ring, which the mixer tops up
+ * first. The halves are checked at each buffer interrupt and on every
+ * timer tick, so a lost interrupt does not stop the sound.
  */
 #include "kernel.h"
 #include "arch.h"
@@ -168,9 +168,6 @@
 #define HALF      7680                  /* 40 ms at 48 kHz, 16-bit stereo; a multiple of 128 */
 #define RING_SIZE 65536
 #define FRAME     4                     /* the codec's frame: 16-bit stereo */
-#define MIN_RATE  5000
-#define MAX_RATE  48000
-#define MAX_PER_IN 12                   /* codec frames one input frame can become */
 
 struct widget {
     uint32_t caps, pincap, config;
@@ -211,13 +208,7 @@ static struct {
     int sindex, bidir;
     uint32_t *bdl;
     uint8_t *buf;                       /* the DMA buffer: two halves */
-    int open_pid;
-
-    int rate, channels, fmt_user;       /* what write() is given */
-    uint8_t carry[4];
-    uint32_t ncarry;
-    int32_t prev_l, prev_r;             /* the resampler */
-    uint32_t pos, step;
+    struct pcm *dsp;                    /* the mixer feeding it */
 
     int running, playing;
     uint32_t real[2];
@@ -815,54 +806,42 @@ static uint32_t ring_used(void)
     return hda.rhead - hda.rtail;
 }
 
-static void push_sample(int32_t s)
-{
-    hda.ring[hda.rhead++ % RING_SIZE] = (uint8_t)s;
-    hda.ring[hda.rhead++ % RING_SIZE] = (uint8_t)(s >> 8);
-}
-
-static uint32_t user_frame(void)
-{
-    return (uint32_t)hda.channels * (hda.fmt_user == AFMT_S16_LE ? 2 : 1);
-}
-
-static int32_t volume(void)
+/* The software volume: pcm, and master when the DACs have no amplifier for it. */
+static int hda_gain(void)
 {
     int v = hda.pcm * (hda.hw_master ? 100 : hda.master) / 100;
     return v * 256 / 100;
 }
 
-/* One input frame into the ring as codec frames, interpolating between it
- * and the one before at the codec's rate. */
-static void put_frame(const uint8_t *in)
+/* Mixed frames into the ring; they are the codec's format already. */
+static void hda_put(const int16_t *lr, uint32_t n)
 {
-    int32_t s[2] = { 0, 0 };
-    for (int c = 0; c < hda.channels; c++) {
-        if (hda.fmt_user == AFMT_S16_LE) {
-            s[c] = (int16_t)(in[0] | in[1] << 8);
-            in += 2;
-        } else {
-            s[c] = (*in++ - 128) << 8;
-        }
+    for (uint32_t i = 0; i < 2 * n; i++) {
+        hda.ring[hda.rhead++ % RING_SIZE] = (uint8_t)lr[i];
+        hda.ring[hda.rhead++ % RING_SIZE] = (uint8_t)(lr[i] >> 8);
     }
-    if (hda.channels == 1)
-        s[1] = s[0];
-    int32_t vol = volume();
-    int32_t l = s[0] * vol / 256, r = s[1] * vol / 256;
-    while (hda.pos < 0x10000) {
-        int32_t f = (int32_t)(hda.pos >> 2);            /* 14 bits: no overflow below */
-        push_sample(hda.prev_l + (((l - hda.prev_l) * f) >> 14));
-        push_sample(hda.prev_r + (((r - hda.prev_r) * f) >> 14));
-        hda.pos += hda.step;
-    }
-    hda.pos -= 0x10000;
-    hda.prev_l = l;
-    hda.prev_r = r;
+}
+
+static uint32_t hda_room(void)
+{
+    return (RING_SIZE - ring_used()) / FRAME;
+}
+
+static uint32_t hda_queued(void)
+{
+    return (ring_used() + (hda.running ? hda.real[0] + hda.real[1] : 0)) / FRAME;
+}
+
+static int hda_running(void)
+{
+    return hda.running;
 }
 
 static void fill_half(int h)
 {
     uint8_t *dst = hda.buf + h * HALF;
+    if (ring_used() < HALF)
+        pcm_pull(hda.dsp, (HALF - ring_used()) / FRAME);
     uint32_t n = MIN(ring_used(), (uint32_t)HALF);
     n -= n % FRAME;
     for (uint32_t i = 0; i < n; i++)
@@ -896,8 +875,6 @@ static void stop(void)
     sd_wr8(SD_STS, SD_STS_ACK);
     hda.running = 0;
     hda.real[0] = hda.real[1] = 0;
-    wakeup(&hda);
-    poll_wakeup();
 }
 
 static void start(void)
@@ -935,7 +912,7 @@ static void service(void)
     if (h == hda.playing)
         return;
     fill_half(hda.playing);
-    if (hda.real[hda.playing] < HALF && hda.open_pid) {
+    if (hda.real[hda.playing] < HALF && pcm_active(hda.dsp)) {
         /* The writer fell behind: the gap plays as silence. */
         if (++hda.underruns <= 5 || hda.underruns % 100 == 0)
             klog("hda: underrun %u (%u of %u bytes ready)\n", hda.underruns,
@@ -945,8 +922,6 @@ static void service(void)
     hda.progress++;
     if (!hda.real[0] && !hda.real[1] && !ring_used())
         stop();                         /* only silence left to play */
-    wakeup(&hda);
-    poll_wakeup();
 }
 
 static void hda_irq_locked(struct trapframe *tf)
@@ -976,223 +951,31 @@ void hda_tick(void)
     spin_unlock(&snd_lock);
 }
 
-/* Sleep until the buffer moves on; -EIO if it has stopped moving. */
-static int wait_progress(void)
+/* Stop, and forget what is queued (SNDCTL_DSP_RESET). */
+static void hda_drop(void)
 {
-    uint32_t seen = hda.progress;
-    if (!hda.running)
-        return -EIO;
-    sleep_on_lock_timeout(&hda, &snd_lock, ticks + HZ);
-    if (signal_pending(current))
-        return -EINTR;
-    if (hda.running && hda.progress == seen) {
-        klog("hda: the stream does not advance, stopping playback\n");
-        stop();
-        hda.rtail = hda.rhead;
-        return -EIO;
-    }
-    return 0;
+    stop();
+    hda.rtail = hda.rhead;
 }
 
-static int drain(void)
+/* Playing, yet the buffer has not moved for a second. */
+static void hda_stalled(void)
 {
-    while (hda.running || ring_used()) {
-        start();
-        if (!hda.running)
-            break;
-        int r = wait_progress();
-        if (r < 0)
-            return r;
-    }
-    return 0;
+    klog("hda: the stream does not advance, stopping playback\n");
+    hda_drop();
 }
 
-/* ---- /dev/dsp ---- */
-
-static void reset_resampler(void)
-{
-    hda.pos = 0;
-    hda.prev_l = hda.prev_r = 0;
-    hda.step = (uint32_t)(((uint32_t)hda.rate << 16) / (uint32_t)hda.out_rate);
-}
-
-static void set_defaults(void)
-{
-    hda.rate = 8000;
-    hda.channels = 1;
-    hda.fmt_user = AFMT_U8;
-    hda.ncarry = 0;
-    reset_resampler();
-}
-
-static int dsp_open_locked(struct vnode *vn, int flags)
-{
-    (void)vn;
-    if ((flags & O_ACCMODE) == O_RDONLY)
-        return -EINVAL;                 /* no recording */
-    if (hda.open_pid && hda.open_pid != current->leader->pid) {
-        struct proc *p = proc_find(hda.open_pid);
-        if (p && p->state != P_ZOMBIE)
-            return -EBUSY;
-    }
-    hda.open_pid = current->leader->pid;
-    if (!hda.running && !ring_used())
-        set_defaults();
-    return 0;
-}
-
-static void dsp_close_locked(struct vnode *vn, int flags)
-{
-    (void)vn; (void)flags;
-    hda.open_pid = 0;
-    hda.ncarry = 0;
-    start();                            /* the rest plays out by itself */
-}
-
-static int make_room(void)
-{
-    while (RING_SIZE - ring_used() < MAX_PER_IN * FRAME) {
-        start();
-        int r = wait_progress();
-        if (r < 0)
-            return r;
-    }
-    return 0;
-}
-
-static int dsp_write_locked(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
-{
-    (void)vn; (void)off;
-    const uint8_t *in = buf;
-    uint32_t uf = user_frame(), used = 0;
-    /* Complete a frame begun by the last write. A full frame stays in
-     * carry until there is room for it: a wait that fails (a signal) keeps
-     * it for the next write, which must not add to it. */
-    while (hda.ncarry) {
-        if (hda.ncarry < uf) {
-            if (used == n)
-                break;
-            hda.carry[hda.ncarry++] = in[used++];
-            continue;
-        }
-        int r = make_room();
-        if (r < 0)
-            return used ? (int)used : r;
-        put_frame(hda.carry);
-        hda.ncarry = 0;
-    }
-    while (n - used >= uf) {
-        if (RING_SIZE - ring_used() < MAX_PER_IN * FRAME) {
-            int r = make_room();
-            if (r < 0)
-                return used ? (int)used : r;
-        }
-        while (n - used >= uf && RING_SIZE - ring_used() >= MAX_PER_IN * FRAME) {
-            put_frame(in + used);
-            used += uf;
-        }
-        if (!hda.running && ring_used() >= 2 * HALF)
-            start();
-    }
-    while (used < n)
-        hda.carry[hda.ncarry++] = in[used++];
-    return (int)n;
-}
-
-static int dsp_poll_locked(struct vnode *vn)
-{
-    (void)vn;
-    return RING_SIZE - ring_used() >= HALF ? POLLOUT : 0;
-}
-
-static int set_format(int *field, int value)
-{
-    if (*field == value)
-        return 0;
-    int r = drain();
-    if (r < 0)
-        return r;
-    *field = value;
-    hda.ncarry = 0;
-    reset_resampler();
-    return 0;
-}
-
-static int get_int(uint32_t arg, int *v)
-{
-    return copy_from_user(v, (const void *)arg, sizeof(*v));
-}
-
-static int put_int(uint32_t arg, int v)
-{
-    return copy_to_user((void *)arg, &v, sizeof(v));
-}
-
-/* Codec bytes as the bytes of write()'s format that make them. */
-static uint32_t user_bytes(uint32_t codec_bytes)
-{
-    uint32_t frames = codec_bytes / FRAME;
-    return frames * (uint32_t)hda.rate / (uint32_t)hda.out_rate * user_frame();
-}
-
-static int dsp_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg)
-{
-    (void)vn;
-    int v, r;
-    switch (req) {
-    case SNDCTL_DSP_RESET:
-        stop();
-        hda.rtail = hda.rhead;
-        hda.ncarry = 0;
-        reset_resampler();
-        return 0;
-    case SNDCTL_DSP_SYNC:
-        return drain();
-    case SNDCTL_DSP_POST:
-        start();
-        return 0;
-    case SNDCTL_DSP_SPEED:
-        if ((r = get_int(arg, &v)) < 0)
-            return r;
-        v = v < MIN_RATE ? MIN_RATE : v > MAX_RATE ? MAX_RATE : v;
-        if ((r = set_format(&hda.rate, v)) < 0)
-            return r;
-        return put_int(arg, hda.rate);
-    case SNDCTL_DSP_CHANNELS:
-        if ((r = get_int(arg, &v)) < 0)
-            return r;
-        if ((r = set_format(&hda.channels, v >= 2 ? 2 : 1)) < 0)
-            return r;
-        return put_int(arg, hda.channels);
-    case SNDCTL_DSP_SETFMT:
-        if ((r = get_int(arg, &v)) < 0)
-            return r;
-        if ((r = set_format(&hda.fmt_user, v == AFMT_S16_LE ? AFMT_S16_LE : AFMT_U8)) < 0)
-            return r;
-        return put_int(arg, hda.fmt_user);
-    case SNDCTL_DSP_GETOSPACE: {
-        struct audio_buf_info bi;
-        uint32_t room = RING_SIZE - ring_used();
-        room = room > MAX_PER_IN * FRAME ? room - MAX_PER_IN * FRAME : 0;
-        uint32_t frag = user_bytes(HALF);
-        bi.bytes = (int32_t)user_bytes(room);
-        bi.fragsize = (int32_t)frag;
-        bi.fragstotal = RING_SIZE / HALF;
-        bi.fragments = frag ? bi.bytes / (int32_t)frag : 0;
-        return copy_to_user((void *)arg, &bi, sizeof(bi));
-    }
-    case SNDCTL_DSP_GETODELAY: {
-        uint32_t queued = ring_used() + (hda.running ? hda.real[0] + hda.real[1] : 0);
-        return put_int(arg, (int)user_bytes(queued));
-    }
-    case SOUND_INFO: {
-        struct sound_info si;
-        sound_get_info(&si);
-        return copy_to_user((void *)arg, &si, sizeof(si));
-    }
-    }
-    return -EINVAL;
-}
+static struct pcm_backend hda_backend = {
+    .lead = 2 * HALF / FRAME,
+    .room = hda_room,
+    .queued = hda_queued,
+    .put = hda_put,
+    .start = start,
+    .running = hda_running,
+    .gain = hda_gain,
+    .stalled = hda_stalled,
+    .drop = hda_drop,
+};
 
 /* ---- /dev/mixer: master (the DACs' amplifiers) and pcm (in software) ---- */
 
@@ -1226,49 +1009,10 @@ static int mixer_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg)
 
 /* ---- the device calls and the interrupt, under snd_lock ---- */
 
-static int dsp_open(struct vnode *vn, int flags)
-{
-    spin_lock(&snd_lock);
-    int r = dsp_open_locked(vn, flags);
-    spin_unlock(&snd_lock);
-    return r;
-}
-
-static void dsp_close(struct vnode *vn, int flags)
-{
-    spin_lock(&snd_lock);
-    dsp_close_locked(vn, flags);
-    spin_unlock(&snd_lock);
-}
-
-static int dsp_poll(struct vnode *vn)
-{
-    spin_lock(&snd_lock);
-    int r = dsp_poll_locked(vn);
-    spin_unlock(&snd_lock);
-    return r;
-}
-
-static int dsp_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
-{
-    spin_lock(&snd_lock);
-    int r = dsp_ioctl_locked(vn, req, arg);
-    spin_unlock(&snd_lock);
-    return r;
-}
-
 static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
 {
     spin_lock(&snd_lock);
     int r = mixer_ioctl_locked(vn, req, arg);
-    spin_unlock(&snd_lock);
-    return r;
-}
-
-static int dsp_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
-{
-    spin_lock(&snd_lock);
-    int r = dsp_write_locked(vn, buf, off, n);
     spin_unlock(&snd_lock);
     return r;
 }
@@ -1362,21 +1106,14 @@ void hda_init(struct vnode *devdir)
     hda.master = 80;
     hda.pcm = 100;
     apply_master();
-    set_defaults();
+    hda_backend.rate = hda.out_rate;
     hda.present = 1;
 
     /* /dev/dsp, unless a Sound Blaster has it already. */
     struct vnode *old;
     int second = vfs_resolve("/dev/dsp", NULL, &old) == 0;
-    struct vnode *dsp = vfs_mknod(devdir, second ? "dsp1" : "dsp",
-                                  MKDEV(SOUND_MAJOR, SOUND_MINOR_DSP + (second ? 0x40 : 0)),
-                                  NULL, dsp_write);
-    if (dsp) {
-        dsp->dev_open = dsp_open;
-        dsp->dev_close = dsp_close;
-        dsp->dev_ioctl = dsp_ioctl;
-        dsp->dev_poll = dsp_poll;
-    }
+    hda.dsp = pcm_create(devdir, second ? "dsp1" : "dsp",
+                         MKDEV(SOUND_MAJOR, SOUND_MINOR_DSP + (second ? 0x40 : 0)), &hda_backend);
     struct vnode *mixer = vfs_mknod(devdir, second ? "mixer1" : "mixer",
                                     MKDEV(SOUND_MAJOR, SOUND_MINOR_MIXER + (second ? 0x40 : 0)),
                                     NULL, NULL);

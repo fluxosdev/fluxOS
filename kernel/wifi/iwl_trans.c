@@ -599,7 +599,10 @@ void iwl_trans_reclaim(int id, uint16_t ssn)
     for (int h = 0; h < 2; h++) {
         struct queue *q = &t.tx[h];
         if (!q->active || q->id != id) continue;
-        if ((uint16_t)(ssn - q->read) <= (uint16_t)(q->write - q->read)) q->read = ssn;
+        /* The firmware's SSN wraps at 12 bits, not 16: compare ring slots, as
+         * Linux does. At most TX_COUNT - 1 are in flight, so this is exact. */
+        uint16_t done = (uint16_t)((ssn - q->read) & (TX_COUNT - 1));
+        if (done <= (uint16_t)(q->write - q->read)) q->read += done;
         else { iwl.dead = 1; klog("iwl: invalid TX completion\n"); }
     }
     spin_unlock(&tx_lock);
@@ -608,8 +611,8 @@ void iwl_mvm_tx_done(int queue, int index) { iwl_trans_reclaim(queue, index); }
 
 /* The ring pointers at the moment of a crash. The SCD sequence the firmware
  * reports wraps at 12 bits, while read/write here are free-running 16-bit
- * counters, so a large (write - read) in the log means the two numbering
- * spaces have drifted and reclaim is no longer freeing descriptors. */
+ * counters (reclaim compares them modulo the ring), so a large
+ * (write - read) in the log means reclaim is no longer freeing descriptors. */
 void iwl_trans_dump_queues(void)
 {
     klog("iwl: cmd queue read %u write %u (in flight %u)\n", t.cmd.read, t.cmd.write,

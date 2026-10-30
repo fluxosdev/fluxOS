@@ -674,7 +674,7 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
             if (s < end && *s == '(') {
                 const char *close = skip_group(s, end);
                 args = s + 1;
-                args_end = close - 1;
+                args_end = close > args && close[-1] == ')' ? close - 1 : close;    /* unclosed: to the end */
                 s = close;
             }
             if (!strcmp(name, "before") || !strcmp(name, "after")) {
@@ -898,9 +898,23 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
 
 static int parse_selector(struct arena *a, const char *s, const char *end, struct selector *sel);
 
-/* "a, b > c" inside :not() or :is(): a list of full selectors. */
+static int compound_list(struct arena *a, const char *s, const char *end, struct selector **out, int *nout);
+
+/* "a, b > c" inside :not() or :is(): a list of full selectors. Each level
+ * takes a few KB of stack (perhaps a script's coroutine's), so few levels. */
 static int parse_compound_list(struct arena *a, const char *s, const char *end,
                                struct selector **out, int *nout)
+{
+    static int nesting;
+    if (nesting >= 8)
+        return -1;
+    nesting++;
+    int r = compound_list(a, s, end, out, nout);
+    nesting--;
+    return r;
+}
+
+static int compound_list(struct arena *a, const char *s, const char *end, struct selector **out, int *nout)
 {
     struct selector list[16];
     int n = 0;
@@ -7124,6 +7138,9 @@ static int image_set_value(const char *args, const char *end, char *out, int siz
 /* Expand var(--x, fallback), env() and image-set() in value; returns 0 if a variable is missing. */
 static int substitute(const struct style *st, const char *value, char *out, int size, int depth)
 {
+    static int expansions;              /* in this whole value: nested ones can multiply */
+    if (!depth)
+        expansions = 0;
     int o = 0;
     const char *end = value + strlen(value);
     for (const char *p = value; p < end;) {
@@ -7131,6 +7148,8 @@ static int substitute(const struct style *st, const char *value, char *out, int 
         if ((env || set) && (p == value || !is_ident_char(p[-1]) || p[-1] == '-')) {
             const char *open = strchr(p, '('), *close = skip_group(open, end);
             char inner[1024], done[1024];
+            if (++expansions > 1024)
+                return 0;
             if (!(env ? env_value(open + 1, close - 1, inner, sizeof(inner))
                       : image_set_value(open + 1, close - 1, inner, sizeof(inner))) ||
                 depth > 8 || !substitute(st, inner, done, sizeof(done), depth + 1))
@@ -7162,7 +7181,7 @@ static int substitute(const struct style *st, const char *value, char *out, int 
                 fallback[fl] = 0;
                 val = fallback;
             }
-            if (!val || depth > 8)
+            if (!val || depth > 8 || ++expansions > 1024)
                 return 0;
             char inner[1024];
             if (!substitute(st, val, inner, sizeof(inner), depth + 1))

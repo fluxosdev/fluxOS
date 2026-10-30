@@ -604,6 +604,32 @@ fail:
             printf("  memory differs\n");
         failures++;
     }
+
+    /* Real mode: a word at offset FFFFh wraps to offset 0 of its segment. */
+    static const uint8_t wrap_code[][4] = {
+        { 0x8B, 0x06, 0xFF, 0xFF },     /* mov ax, [FFFF] */
+        { 0xA1, 0xFF, 0xFF, 0x90 },     /* mov ax, moffs [FFFF] */
+        { 0x89, 0x1E, 0xFF, 0xFF },     /* mov [FFFF], bx */
+    };
+    for (int t = 0; t < 3; t++) {
+        cpu.pm = cpu.code32 = cpu.stack32 = 0;
+        cpu.ip_mask = 0xFFFF;
+        cpu.seg[S_CS] = 0x8000;
+        cpu.seg[S_DS] = 0x1000;
+        cpu.ip = 0;
+        memcpy(mem + 0x80000, wrap_code[t], 4);
+        mem[0x10000] = 0x12;
+        mem[0x1FFFF] = 0x34;
+        mem[0x20000] = 0x56;
+        cpu.r[R_AX] = 0;
+        cpu.r[R_BX] = 0xBBAA;
+        cpu_run(1);
+        int ok = t < 2 ? AX == 0x1234 : mem[0x1FFFF] == 0xAA && mem[0x10000] == 0xBB && mem[0x20000] == 0x56;
+        if (!ok) {
+            printf("MISMATCH real-mode wrap at FFFFh, test %d\n", t);
+            failures++;
+        }
+    }
     printf("%ld instructions, %ld failures, %ld skipped\n", count, failures, skipped);
     return failures != 0;
 }

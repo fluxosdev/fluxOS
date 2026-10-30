@@ -54,6 +54,8 @@ struct wpa_sm {
     uint32_t own_ie_len, ap_ie_len;     /* ap_ie: from its beacon or probe response */
     uint8_t anonce[WPA_NONCE_LEN], snonce[WPA_NONCE_LEN];
     uint8_t ptk[WPA_PTK_LEN];           /* KCK, KEK, TK */
+    uint8_t tptk[WPA_PTK_LEN];          /* from the latest message 1, until message 3 checks */
+    int tptk_set;
     uint8_t replay[8];
     int replay_valid;
 };

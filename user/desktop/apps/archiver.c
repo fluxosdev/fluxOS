@@ -1342,11 +1342,31 @@ static void aw_destroy(struct window *win)
     free(w->rows);
     free(w->pending);
     close_index(w);
+    if (w->listfile[0])
+        unlink(w->listfile);            /* closed mid-extract: the job's end never comes */
     arc_close(w->a);
     free(w);
 }
 
+/* A ZIP or 7z archive dragged here opens in this window, unless one is being extracted. */
+static int aw_drop(struct window *win, int x, int y, const struct drag_data *d, int phase, int copy)
+{
+    (void)x; (void)y; (void)copy;
+    struct arcwin *w = win->priv;
+    if (phase == DROP_LEAVE || d->npaths != 1 || w->job ||
+        !(has_suffix(d->paths[0], ".zip") || has_suffix(d->paths[0], ".7z")))
+        return DROP_NONE;
+    if (phase == DROP_OVER) {
+        wm_drag_hint("Open in Archive Manager");
+        return DROP_OPEN;
+    }
+    load(w, d->paths[0]);
+    paint(w);
+    return DROP_OPEN;
+}
+
 static const struct window_ops aw_ops = {
+    .drop = aw_drop,
     .key = aw_key,
     .mouse = aw_mouse,
     .wheel = aw_wheel,

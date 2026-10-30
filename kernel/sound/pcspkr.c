@@ -157,11 +157,11 @@ static int spkr_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
         wakeup(queue);
         spin_unlock(&spkr_lock);
         return 0;
-    case SOUND_INFO:
-        if (!user_access_ok((void *)arg, sizeof(struct sound_info)))
-            return -EFAULT;
-        sound_get_info((struct sound_info *)arg);
-        return 0;
+    case SOUND_INFO: {
+        struct sound_info si;
+        sound_get_info(&si);
+        return copy_to_user((void *)arg, &si, sizeof(si));
+    }
     }
     return -EINVAL;
 }

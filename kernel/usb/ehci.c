@@ -564,6 +564,14 @@ static void ehci_port_disable(struct usb_hub *h, int port)
     op_wr(e, port_reg(port), v & ~(PORT_RWC | PORT_PE));
 }
 
+/* There are no isochronous transfers here: a driver that needs them is told
+ * now (usb_ep_enable fails) rather than at every submit. */
+static int ehci_ep_enable(struct usb_hc *hc, struct usb_dev *dev, struct usb_ep *ep)
+{
+    (void)hc; (void)dev;
+    return ep->type == USB_EP_ISO ? -EINVAL : 0;
+}
+
 static void ehci_suspend(struct usb_hc *hc);
 static void ehci_resume(struct usb_hc *hc);
 
@@ -573,6 +581,7 @@ static const struct usb_hc_ops ehci_ops = {
     .poll = ehci_poll,
     .dev_free = ehci_dev_free,
     .ep_reset = ehci_ep_reset,
+    .ep_enable = ehci_ep_enable,
     .suspend = ehci_suspend,
     .resume = ehci_resume,
 };

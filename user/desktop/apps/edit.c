@@ -85,7 +85,9 @@ static const struct menu {
 };
 #define NMENUS 2
 
-enum hold { H_NONE, H_TEXT, H_VBAR, H_HBAR };
+enum hold { H_NONE, H_TEXT, H_VBAR, H_HBAR, H_SELECTION };    /* H_SELECTION: pressed in it */
+
+#define DRAG_SLOP 4
 
 struct ed {
     struct window *win;
@@ -111,6 +113,9 @@ struct ed {
     enum hold hold;
     int grab;                           /* where a scroll thumb was grabbed */
     enum sbar_part sbar_pressed;
+    int press_x, press_y;               /* H_SELECTION: where, and whether it became a drag */
+    int dragging;
+    int drop;                           /* where dragged text would go in, or -1 */
     struct ed *next;
 };
 
@@ -149,6 +154,8 @@ static void changed(struct ed *e)
 /* Replace [from, to) with n bytes of s; the caret goes after the new text. */
 static int replace(struct ed *e, int from, int to, const char *s, int n)
 {
+    from = from < 0 ? 0 : from > e->len ? e->len : from;
+    to = to < from ? from : to > e->len ? e->len : to;
     if (reserve(e, e->len - (to - from) + n) < 0)
         return -1;
     memmove(e->text + from + n, e->text + to, (size_t)(e->len - to));
@@ -493,6 +500,11 @@ static void draw_text(struct ed *e, struct surface *s)
         int line = line_of(e, e->cur), col = column_of(e, line, e->cur);
         if (line >= e->vscroll && line <= e->vscroll + rows(e) && col >= e->hscroll)
             gfx_fill(s, x0 + col, t.y + (line - e->vscroll) * LINE_H, 2, LINE_H, C_BLACK);
+    }
+    if (e->drop >= 0) {                 /* where a drop would put the text */
+        int line = line_of(e, e->drop), col = column_of(e, line, e->drop);
+        if (line >= e->vscroll && line <= e->vscroll + rows(e) && col >= e->hscroll)
+            gfx_dither(s, x0 + col, t.y + (line - e->vscroll) * LINE_H, 2, LINE_H, C_BLACK);
     }
     s->clip = saved;
 }
@@ -1002,6 +1014,13 @@ static void ed_key(struct window *w, const struct input_event *ev)
     if (!(ev->flags & IEV_PRESSED))
         return;
     int ctrl = ev->mods & KMOD_CTRL, alt = ev->mods & KMOD_ALT, shift = ev->mods & KMOD_SHIFT;
+    if (e->hold == H_SELECTION && e->dragging && ev->code == KEY_ESC) {
+        e->hold = H_NONE;               /* the window manager has dropped it nowhere */
+        e->dragging = 0;
+        e->drop = -1;
+        paint(e);
+        return;
+    }
 
     if (e->menu >= 0) {
         menu_key(e, ev);
@@ -1079,6 +1098,84 @@ static int index_at_point(struct ed *e, int x, int y)
         line = e->nlines - 1;
     int px = x - t.x - PAD + e->hscroll;
     return index_at(e, line, px < 0 ? 0 : px);
+}
+
+/* The selection, for the window manager to carry to other windows. */
+static void start_drag(struct ed *e)
+{
+    int from, to;
+    sel_range(e, &from, &to);
+    struct drag_data d = { .icon = ICON_README };      /* a text file's: the editor's has no 32-pixel picture */
+    if (!(d.text = malloc((size_t)(to - from) + 1)))
+        return;
+    memcpy(d.text, e->text + from, (size_t)(to - from));
+    d.text[to - from] = 0;
+    snprintf(d.label, sizeof(d.label), "%s", d.text);
+    for (char *c = d.label; *c; c++)
+        if (*c == '\n' || *c == '\t' || *c == '\r')
+            *c = ' ';
+    wm_drag_start(e->win, &d);
+    free(d.text);
+}
+
+/* The selection dragged to `to` in the same document. */
+static void move_text(struct ed *e, int to)
+{
+    int from, end;
+    sel_range(e, &from, &end);
+    int n = end - from;
+    char *t = malloc((size_t)n);
+    if (!t)
+        return;
+    memcpy(t, e->text + from, (size_t)n);
+    replace(e, from, end, "", 0);
+    if (to >= end)
+        to -= n;
+    replace(e, to, to, t, n);
+    free(t);
+    e->sel = to;                        /* still selected, where it went */
+    e->want_col = column_of(e, line_of(e, e->cur), e->cur);
+    show_caret(e);
+}
+
+/* Text dragged in from another window goes where it is let go; files open here
+ * (in place of an unchanged document) or in editors of their own. */
+static int ed_drop(struct window *w, int x, int y, const struct drag_data *d, int phase, int copy)
+{
+    (void)copy;
+    struct ed *e = w->priv;
+    int over_text = rect_contains(text_rect(e), x, y) && e->menu < 0;
+    int at = phase != DROP_LEAVE && over_text && d->text && !d->npaths ? index_at_point(e, x, y) : -1;
+    if (at != e->drop) {
+        e->drop = at;
+        paint(e);
+    }
+    if (phase == DROP_LEAVE || (!d->npaths && at < 0))
+        return DROP_NONE;
+    if (phase == DROP_OVER) {
+        if (d->npaths)
+            wm_drag_hint("Open in Text Editor");
+        return d->npaths ? DROP_OPEN : DROP_COPY;
+    }
+    e->drop = -1;
+    if (!d->npaths) {
+        move_caret(e, at, 0, 0);
+        insert_text(e, d->text, (int)strlen(d->text));
+        e->sel = at;                    /* the new text selected, as dropped text is */
+        paint(e);
+        return DROP_COPY;
+    }
+    for (int i = 0; i < d->npaths; i++) {
+        if (i == 0 && !e->modified && !e->len) {
+            if (load_file(e, d->paths[0]) == 0) {
+                update_title(e);
+                paint(e);
+            }
+        } else {
+            editor_open(d->paths[i]);
+        }
+    }
+    return DROP_OPEN;
 }
 
 static void scroll_step(struct ed *e, struct sbar *b, enum sbar_part part)
@@ -1160,14 +1257,44 @@ static void ed_mouse(struct window *w, int x, int y, int buttons, int changed_bu
                 scroll_step(e, b, part);
             }
         } else if (rect_contains(text_rect(e), x, y)) {
+            int at = index_at_point(e, x, y), from, to;
+            sel_range(e, &from, &to);
+            if (has_selection(e) && at >= from && at < to) {
+                e->hold = H_SELECTION;  /* a drag of the selection, or a click */
+                e->press_x = x;
+                e->press_y = y;
+                e->dragging = 0;
+                return;
+            }
             e->hold = H_TEXT;
-            move_caret(e, index_at_point(e, x, y), 0, 0);
+            move_caret(e, at, 0, 0);
             e->anchor = e->cur;
         } else {
             return;
         }
+    } else if (released && e->hold == H_SELECTION) {
+        e->hold = H_NONE;
+        if (!e->dragging)
+            move_caret(e, index_at_point(e, x, y), 0, 0);   /* a click in it */
+        else if (wm_drag_effect() == DRAG_HERE && e->drop >= 0)
+            move_text(e, e->drop);
+        e->dragging = 0;
+        e->drop = -1;
     } else if (released) {
         e->hold = H_NONE;
+    } else if (e->hold == H_SELECTION && left) {
+        if (!e->dragging && abs(x - e->press_x) < DRAG_SLOP && abs(y - e->press_y) < DRAG_SLOP)
+            return;
+        if (!e->dragging) {
+            e->dragging = 1;
+            start_drag(e);
+        }
+        int from, to, at = wm_drag_here() ? index_at_point(e, x, y) : -1;
+        sel_range(e, &from, &to);
+        at = at > from && at < to ? -1 : at;   /* into itself: nowhere */
+        if (at == e->drop)
+            return;
+        e->drop = at;
     } else if (e->hold == H_TEXT && left) {
         e->cur = index_at_point(e, x, y);
         e->sel = e->cur == e->anchor ? -1 : e->anchor;
@@ -1239,6 +1366,7 @@ static const struct window_ops ed_ops = {
     .resize = ed_resize,
     .close = ed_close,
     .destroy = ed_destroy,
+    .drop = ed_drop,
 };
 
 void editor_blink(void)
@@ -1255,6 +1383,7 @@ struct window *editor_open(const char *path)
     if (!e)
         return NULL;
     e->sel = -1;
+    e->drop = -1;
     e->menu = -1;
     e->menu_hover = -1;
     e->lines_ok = 0;

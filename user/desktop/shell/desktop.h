@@ -127,6 +127,21 @@ enum icon_id {
 
 struct window;
 
+/* What a drag between windows carries (wm_drag_start): files, text, or both
+ * (a link: the address as text, and a name to show). */
+struct drag_data {
+    int npaths;
+    char **paths;               /* absolute; NULL when npaths is 0 */
+    char *text;                 /* NULL: none */
+    enum icon_id icon;          /* drawn by the pointer */
+    char label[64];             /* beside it: a file's name, "3 items", the start of the text */
+};
+
+/* What letting go would do. DRAG_HERE: the pointer is over the window the drag came from. */
+enum drop_effect { DROP_NONE, DROP_COPY, DROP_MOVE, DROP_OPEN, DRAG_HERE = -1 };
+/* window_ops.drop's phases */
+enum drop_phase { DROP_OVER, DROP_LEAVE, DROP_DO };
+
 struct window_ops {
     void (*key)(struct window *w, const struct input_event *ev);
     /* Client coordinates; buttons is the MOUSE_* mask after the event. */
@@ -141,6 +156,11 @@ struct window_ops {
      * else focus, which most windows redraw themselves for. */
     void (*restyle)(struct window *w);
     void (*destroy)(struct window *w);  /* free app data */
+    /* A drag from another window is over the client area at x, y (DROP_OVER, again as it
+     * moves), has left it (DROP_LEAVE, whose return is ignored), or was let go there
+     * (DROP_DO: do it now). Returns the DROP_* effect, DROP_NONE where it cannot go; copy
+     * is Ctrl held. DROP_OVER may name the effect with wm_drag_hint(). */
+    int (*drop)(struct window *w, int x, int y, const struct drag_data *d, int phase, int copy);
 };
 
 /* The shapes of the mouse pointer (icons.c). */
@@ -191,6 +211,18 @@ void wm_set_min_size(struct window *w, int client_w, int client_h);
 /* The pointer to show while it is over the window's client area (a page's cursor property). */
 void wm_set_cursor(struct window *w, enum cursor_kind kind);
 void wm_damage_client(struct window *w, struct rect r);  /* client coordinates */
+/* Drag and drop between windows. A window whose client area holds the left
+ * button starts carrying d (copied) when the drag gets going; the pointer
+ * then shows it, and the windows it passes over are asked (ops->drop).
+ * While it lasts, wm_drag_here() says the pointer is over w itself, where w
+ * does the dropping as before. In w's release, wm_drag_effect() tells what
+ * became of it: DRAG_HERE, or the DROP_* effect of another window taking it
+ * (DROP_NONE when nothing did, or Escape cancelled it). With no drag carried
+ * (none started, or it could not be), both say "here": w has it all. */
+void wm_drag_start(struct window *w, const struct drag_data *d);
+int wm_drag_here(void);
+int wm_drag_effect(void);
+void wm_drag_hint(const char *fmt, ...) __attribute__((format(printf, 1, 2)));  /* "Move to Documents" */
 int wm_window_count(void);
 struct window *wm_nth(int i);           /* the i-th window from the bottom of the stack, or NULL */
 void wm_close(struct window *w);        /* as the close button does */

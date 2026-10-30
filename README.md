@@ -52,8 +52,9 @@ says why.
 - Preemptive round-robin scheduler (PIT at 100 Hz) with sleep/wait queues.
 - Multiprocessor (SMP): the other processors and cores, found in the ACPI
   MADT or the MultiProcessor Specification table, are started with INIT and
-  startup IPIs and run user processes alongside the first. The kernel itself
-  runs on one at a time (a big kernel lock); device interrupts stay on the
+  startup IPIs and run user processes alongside the first. Kernel code runs
+  on all of them at once, under fine-grained locks (the VFS mutex, each
+  process's mm lock, per-subsystem spinlocks); device interrupts stay on the
   8259 PIC and the boot processor. `nosmp` on the kernel command line keeps
   to the first, `maxcpus=N` to N.
   Processes prefer their previous core to retain warm caches, but idle cores
@@ -206,9 +207,16 @@ says why.
     *Work in progress*). `video=...`, `intelgfx.modeset=0`,
     `intelgfx.accel=0`, `intelgfx.3d=0`, `intelgfx=off`.
 - Sound:
+  - **A software mixer** behind `/dev/dsp`: every program that opens it gets
+    a stream of its own, with its own format (8 or 16-bit, mono or stereo,
+    4-48 kHz) and buffer, and up to 16 play at once on each card: the
+    desktop's sounds over the Sound Player, a DOS game over both. Each stream
+    is resampled to the card's rate and they are added up, clipped, at the
+    `pcm` volume. A program that falls behind leaves a gap in its own sound,
+    not in the others'.
   - PC speaker (`/dev/speaker`) with background tone queue.
-  - **Sound Blaster 16**: `/dev/dsp` (OSS-style, 8/16-bit, mono/stereo, 5-44.1
-    kHz), `/dev/mixer`, and the OPL2/3 synthesizer (`/dev/opl`). `sb16=off`,
+  - **Sound Blaster 16**: `/dev/dsp` (OSS-style; the card plays 44.1 kHz
+    stereo), `/dev/mixer`, and the OPL2/3 synthesizer (`/dev/opl`). `sb16=off`,
     `opl=off`.
   - **Intel HD Audio** (and codecs such as the Realtek ALC888) as `/dev/dsp`
     when there is no Sound Blaster; output only, every jack plays the same
@@ -221,8 +229,9 @@ says why.
     sample sizes work too, and a device with its own clock is followed
     through its feedback endpoint), with the feature unit's volume and mute
     on `/dev/mixer`. While it is plugged in it is `/dev/dsp` and
-    `/dev/mixer`: the built-in card's nodes are pointed at it (unless they
-    are open) and given back when it goes, and it is also `/dev/dsp1`.
+    `/dev/mixer` (the mixer unless it is open): programs that open `/dev/dsp`
+    play on it, programs already playing go on on the built-in card, and
+    the nodes are given back when it goes. It is also `/dev/dsp1`.
     `usbaudio=secondary` leaves `/dev/dsp` to the built-in card;
     `usbaudio=off`. `make run-usb-audio` tries it in QEMU.
 - Networking: NE2000 (PCI and ISA), **nVidia nForce** ("forcedeth", `eth0`,
@@ -281,6 +290,15 @@ says why.
   whatever the name), and a wallpaper (Fill, Stretch, Center or Tile).
 - Windows move, minimize, maximize and cascade; the browser, text editor, file
   manager, Task Manager and Gears resize by dragging an edge.
+- **Drag and drop between windows**: what is dragged follows the pointer with its icon,
+  its name and what letting go would do ("Move to Downloads", "Open in Paint"); the
+  pointer is a no-entry sign where nothing takes it, and Escape cancels. Files from the
+  File Manager move into another folder window (copied to another disk, or with Ctrl
+  held), open in a Text Editor, Paint (pictures), the Sound Player (WAV), the Archive
+  Manager (ZIP, 7z) or Wave, and are typed into a terminal as quoted paths. Text
+  selected in an editor, and links and pictures from Wave (their address), go into an
+  editor where they are let go, into a page's text field, or into a terminal as typed
+  (line breaks as spaces, so nothing runs by itself); an address dropped on Wave opens.
 - Start menu with cascading submenus (Programs, Accessories, System Tools,
   Settings), Read Me, Run... and Shut Down.... Keys: Windows
   key or Ctrl+Esc for Start, Alt+Tab, Alt+F4.
@@ -483,8 +501,9 @@ fetcher process, so the desktop keeps running), or from `file://`.
   HTML drag and drop: `draggable="true"` elements, links and pictures can be dragged
   (`dragstart`, `drag`, `dragenter`, `dragover`, `dragleave`, `drop`, `dragend` with a
   `DataTransfer`: `setData`/`getData`, `types`, `items`, `effectAllowed`/`dropEffect`); a drop
-  into a text field the page does not take types the text there; Escape cancels. Selected text
-  cannot be dragged, and nothing can be dragged between windows. The window and taskbar show the page's favicon
+  into a text field the page does not take types the text there; Escape cancels. Links and
+  pictures can also be dragged out to other windows (their address); selected text cannot be
+  dragged. The window and taskbar show the page's favicon
   (`<link rel=icon>` or `/favicon.ico`; PNG, ICO, GIF or SVG).
 - **Cookies**: a jar shared by every window fills from
   `Set-Cookie` headers and `document.cookie` (domain, path, `Secure`,
@@ -1104,8 +1123,8 @@ The FPU state is saved with FXSAVE, so AVX and later cannot be used.
   instruction is interpreted, so delay-loop timing runs fast; only the
   read-only DOS attribute is kept.
 - **Audio:** the Sound Blaster 16 (DSP 4), HD Audio and USB audio are output
-  only, with no MIDI and no mixing, so one program at a time has `/dev/dsp`;
-  latency is about 80 ms. HD Audio has no S/PDIF or HDMI, no microphone or
+  only, with no MIDI; latency is about 80 ms (120 ms on the Sound Blaster), and a
+  stream that starts while others play joins within that. HD Audio has no S/PDIF or HDMI, no microphone or
   line-in jack sensing, and surround jacks repeat the front pair. USB audio
   is Class 1.0 only (no USB Audio 2.0 devices), one device at a time, no
   recording, and the first feature unit's controls are the volume.

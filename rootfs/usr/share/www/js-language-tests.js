@@ -372,7 +372,21 @@ test("errors in callbacks", function () {
 }, ["RangeError", "two"]);
 test("stack overflow is catchable", function () {
     function forever() { return forever(); }
-    try { forever(); return "no"; } catch (e) { return e instanceof RangeError; }
+    try { forever(); return "no"; } catch (e) { if (!(e instanceof RangeError)) return false; }
+    /* Chains of bound functions and of proxies recurse without a user call in between,
+     * here on a generator's small stack. */
+    var f = function () { return 1; }, C = function () {}, p = {}, h = {}, errs = [];
+    for (var i = 0; i < 20000; i++) f = f.bind(null), C = C.bind(null);
+    for (var i = 0; i < 20000; i++) p = new Proxy(p, h);
+    function* g() {
+        try { f(); } catch (e) { errs.push(e.name); }
+        try { new C(); } catch (e) { errs.push(e.name); }
+        try { p.x; } catch (e) { errs.push(e.name); }
+        try { "x" in p; } catch (e) { errs.push(e.name); }
+        try { Object.keys(p); } catch (e) { errs.push(e.name); }
+    }
+    g().next();
+    return errs.join() === "RangeError,RangeError,RangeError,RangeError,RangeError" || errs;
 }, true);
 
 /* ---- destructuring ---- */
@@ -424,8 +438,13 @@ test("destructuring closes iterators", function () {
 /* ---- spread and arrays ---- */
 test("array spread and holes", function () {
     var a = [1, , 3];
-    return [[0, ...a, 4], a.length, [..."ab", ...new Set([1, 1, 2])]];
-}, [[0, 1, undefined, 3, 4], 3, ["a", "b", 1, 2]]);
+    /* join takes the length it starts with, though a toString grows the array */
+    var g = [], o = { toString: function () { for (var i = 0; i < 1000; i++) g.push(i); return "o"; } };
+    g.push(o, o);
+    var big = new Array(5000).fill("x".repeat(65536)), err = "";
+    try { big.join(""); } catch (e) { err = e.name; }
+    return [[0, ...a, 4], a.length, [..."ab", ...new Set([1, 1, 2])], g.join("-"), g.length, err];
+}, [[0, 1, undefined, 3, 4], 3, ["a", "b", 1, 2], "o-o", 2002, "RangeError"]);
 test("object spread copies own enumerable", function () {
     var proto = { inherited: 1 };
     var o = Object.create(proto);
@@ -625,17 +644,30 @@ test("prototype chain lookups", function () {
     b.y = 2;
     c.z = 3;
     a.x = 10;
-    return [c.x, c.y, c.z, c.hasOwnProperty("x"), "x" in c];
-}, [10, 2, 3, false, true]);
+    var cyclic = [];
+    try { Object.setPrototypeOf(a, a); } catch (e) { cyclic.push(e.name); }
+    try { Object.setPrototypeOf(a, c); } catch (e) { cyclic.push(e.name); }
+    return [c.x, c.y, c.z, c.hasOwnProperty("x"), "x" in c, cyclic, Reflect.setPrototypeOf(a, c), "q" in c];
+}, [10, 2, 3, false, true, ["TypeError", "TypeError"], false, false]);
 test("string methods through primitives", function () {
     var s = "Hello";
     return [s.length, s[1], s.toUpperCase(), s.charCodeAt(0), "a,b".split(","), s.at(-1)];
 }, [5, "e", "HELLO", 72, ["a", "b"], "o"]);
 test("completion of loops in eval", function () { return eval("for (var i = 0; i < 3; i++) i * 2;"); }, 4);
 test("deep expression nesting", function () {
-    var x = 1;
-    return ((((((((((x + 1) * 2) - 3) / 1) + 4) * 5) - 6) / 2) + 7) * 1);
-}, 16.5);
+    var x = 1, errs = [];
+    /* Too deep to parse is an error, not a crash: scripts (on a generator's
+     * small stack, to be sure to reach its end), patterns and selectors. */
+    function* g() {
+        try { eval("[".repeat(100000) + "]".repeat(100000)); } catch (e) { errs.push(e.name); }
+        try { eval("!".repeat(100000) + "1"); } catch (e) { errs.push(e.name); }
+    }
+    g().next();
+    try { new RegExp("(".repeat(5000) + ")".repeat(5000)); } catch (e) { errs.push(e.name); }
+    var css = [CSS.supports("selector(x:lang(((") + "", CSS.supports("selector(x:lang(") + "",
+               CSS.supports("selector(:lang(en))"), CSS.supports("selector(" + ":is(".repeat(100) + "a" + ")".repeat(100) + ")")];
+    return [((((((((((x + 1) * 2) - 3) / 1) + 4) * 5) - 6) / 2) + 7) * 1), errs, css[2], css[3]];
+}, [16.5, ["SyntaxError", "SyntaxError", "SyntaxError"], true, false]);
 test("long loop", function () { var s = 0; for (var i = 0; i < 100000; i++) s += i; return s; }, 4999950000);
 test("closures in hot loop", function () {
     var total = 0;

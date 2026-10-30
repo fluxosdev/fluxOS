@@ -61,6 +61,8 @@ static int drop(struct blockdev *bd)
             return -EBUSY;
         }
         klog("%s: %s removed, unmounted\n", bd->name, kind(bd));
+    } else {
+        blk_discard(bd);                /* raw reads, a probe that found nothing */
     }
     bd->am_stuck = 0;
     bd->am_present = 0;
@@ -88,6 +90,7 @@ static void look(struct blockdev *bd)
             return;
     }
     if (m == MEDIA_CHANGED) {           /* new to us, even if the drive said so before */
+        blk_discard(bd);                /* nothing cached is of this medium */
         bd->am_tried = 0;
         bd->manual_umount = 0;
     }

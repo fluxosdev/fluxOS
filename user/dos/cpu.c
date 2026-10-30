@@ -113,6 +113,33 @@ static inline void mwrite(int size, uint32_t a, uint32_t v)
         wd(a, v);
 }
 
+/* Real-mode 16-bit addressing wraps within the segment: a word at offset
+ * FFFFh takes its high byte from offset 0. */
+static inline int wraps16(int size, uint32_t off)
+{
+    return !cpu.pm && !addrsize32 && off > 0x10000u - (uint32_t)size / 8;
+}
+
+static uint32_t mread_at(int size, uint32_t base, uint32_t off)
+{
+    if (!wraps16(size, off))
+        return mread(size, base + off);
+    uint32_t v = 0;
+    for (int i = 0; i < size / 8; i++)
+        v |= (uint32_t)rb(base + ((off + (uint32_t)i) & 0xFFFF)) << (i * 8);
+    return v;
+}
+
+static void mwrite_at(int size, uint32_t base, uint32_t off, uint32_t v)
+{
+    if (!wraps16(size, off)) {
+        mwrite(size, base + off, v);
+        return;
+    }
+    for (int i = 0; i < size / 8; i++)
+        wb(base + ((off + (uint32_t)i) & 0xFFFF), (uint8_t)(v >> (i * 8)));
+}
+
 static inline void set_flag(uint32_t f, int on)
 {
     if (on)
@@ -198,7 +225,7 @@ static void decode(struct modrm *m)
 
 static inline uint32_t rm_get(const struct modrm *m, int size)
 {
-    return m->is_reg ? get_reg(size, m->rm) : mread(size, m->addr);
+    return m->is_reg ? get_reg(size, m->rm) : mread_at(size, m->addr - m->off, m->off);
 }
 
 static inline void rm_set(const struct modrm *m, int size, uint32_t v)
@@ -206,7 +233,7 @@ static inline void rm_set(const struct modrm *m, int size, uint32_t v)
     if (m->is_reg)
         set_reg(size, m->rm, v);
     else
-        mwrite(size, m->addr, v);
+        mwrite_at(size, m->addr - m->off, m->off, v);
 }
 
 /* ---- stack ---- */
@@ -1344,12 +1371,12 @@ static void step(void)
     case 0xA2:
     case 0xA3: {
         uint32_t off = addrsize32 ? fetch32() : fetch16();
-        uint32_t a = segbase(seg_ovr >= 0 ? seg_ovr : S_DS) + off;
+        uint32_t base = segbase(seg_ovr >= 0 ? seg_ovr : S_DS);
         size = (op & 1) ? vsize() : 8;
         if (op < 0xA2)
-            set_reg(size, R_AX, mread(size, a));
+            set_reg(size, R_AX, mread_at(size, base, off));
         else
-            mwrite(size, a, get_reg(size, R_AX));
+            mwrite_at(size, base, off, get_reg(size, R_AX));
         return;
     }
     case 0xA4: string_op(S_MOVS, 8); return;

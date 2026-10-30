@@ -177,10 +177,13 @@ static void find_crtcs(void)
 }
 
 /* Map video memory from the screen to the 3D engine's area, and see
- * whether a second page fits after the boot screen. */
+ * whether a second page fits after the boot screen. The screen must end
+ * below the pointer: fbmap lends it whole, and what follows (the pointer,
+ * the CP's ring, the GART's page table, the checked command buffers) is
+ * the kernel's. */
 static void plan_vram(void)
 {
-    if (!rv.crtcs || rv.page0 >= CURSOR_VRAM_OFF)
+    if (!rv.crtcs || rv.page0 >= CURSOR_VRAM_OFF || fb.size > CURSOR_VRAM_OFF - rv.page0)
         return;
     uint32_t end = VRAM_MAP_END;
     if (end > rv.aper_size || end > rv.vram_size)
@@ -285,6 +288,7 @@ static void place_cursor(void)
         }
         if (w - xorigin <= 0)
             show = 0;
+        w = MAX(w, 1);              /* hidden, but a width of 0 would wrap in cur_size */
     }
     FOR_EACH_CRTC(c) {
         uint32_t off = (uint32_t)c * dc->stride;

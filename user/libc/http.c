@@ -1107,9 +1107,13 @@ static int read_body(struct conn *c, const struct http_request *rq, int timeout_
             }
             if (n < 0)
                 return err[0] ? -1 : -2;
-            long size = strtol(line, NULL, 16);
-            if (size < 0)
-                size = 0;
+            char *end;
+            long size = strtol(line, &end, 16);
+            if (end == line || !isxdigit((unsigned char)line[0]) || size < 0 ||
+                (*end && *end != ';' && *end != ' ' && *end != '\t')) {
+                snprintf(err, esize, "bad chunk size '%.32s'", line);
+                return -1;
+            }
             if (size == 0)
                 break;
             while (size > 0) {
@@ -1140,11 +1144,21 @@ static int read_body(struct conn *c, const struct http_request *rq, int timeout_
                 if (*truncated)
                     return 1;
             }
-            conn_line(c, rq, timeout_ms, line, sizeof(line), err, esize);       /* the CRLF after the chunk */
+            n = conn_line(c, rq, timeout_ms, line, sizeof(line), err, esize);   /* the CRLF after the chunk */
+            if (n == -2)
+                return err[0] ? -1 : -2;
+            if (n != 0) {
+                snprintf(err, esize, "bad chunk ending");
+                return -1;
+            }
         }
-        while (conn_line(c, rq, timeout_ms, line, sizeof(line), err, esize) > 0)
+        int n;
+        while ((n = conn_line(c, rq, timeout_ms, line, sizeof(line), err, esize)) > 0)
             ;                                                                   /* trailers */
-        *reusable = 1;
+        if (n == -2 && !err[0])
+            return -2;
+        *reusable = n == 0;     /* only a body that ended as it should leaves the connection usable */
+        err[0] = 0;
         return 0;
     }
     long left = length;

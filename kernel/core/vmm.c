@@ -272,10 +272,11 @@ void vmm_free_page(uint32_t *pd, uint32_t va)
 {
     uint32_t *pte = get_pte(pd, ALIGN_DOWN(va, PAGE_SIZE), 0);
     if (pte && (*pte & PTE_PRESENT)) {
-        if (!(*pte & PTE_MMIO))
-            pmm_free(FRAME(*pte));
+        uint32_t e = *pte;
         *pte = 0;
-        flush_page(pd, va);
+        flush_page(pd, va);             /* no processor may still write to it once it is reused */
+        if (!(e & PTE_MMIO))
+            pmm_free(FRAME(e));
     }
 }
 
@@ -402,13 +403,30 @@ static void flush_pd(uint32_t *pd)
 }
 
 /* Copy-on-write clone of the user half (fork), without the device memory.
- * Pages lent to the GPU stay writable in the parent and are copied for the child. */
+ * Pages lent to the GPU stay writable in the parent and are copied for the child.
+ * The parent's pages are all made read-only, and flushed, before any is shared:
+ * a thread still writing through a stale translation meanwhile writes what the
+ * child gets, so the child's copy is of one moment. */
 uint32_t *vmm_clone(uint32_t *src)
 {
     uint32_t *pd = vmm_create();
     if (!pd)
         return NULL;
     int pid = current ? current->leader->pid : 0;
+    for (uint32_t i = USER_PDE_FIRST; i < USER_PDE_END; i++) {
+        if (!(src[i] & PTE_PRESENT))
+            continue;
+        uint32_t *spt = (uint32_t *)FRAME(src[i]);
+        int pde_pinned = pid > 0 && fb_pinned(pid, i << 22, (i + 1) << 22);
+        for (int j = 0; j < 1024; j++) {
+            uint32_t va = (i << 22) | ((uint32_t)j << 12);
+            if ((spt[j] & (PTE_PRESENT | PTE_MMIO)) == PTE_PRESENT &&
+                (spt[j] & (PTE_WRITE | PTE_COW)) && !(spt[j] & PTE_SHARED) &&
+                !(pde_pinned && fb_pinned(pid, va, va + PAGE_SIZE)))
+                spt[j] = (spt[j] & ~PTE_WRITE) | PTE_COW;
+        }
+    }
+    flush_pd(src);
     for (uint32_t i = USER_PDE_FIRST; i < USER_PDE_END; i++) {
         if (!(src[i] & PTE_PRESENT))
             continue;
@@ -424,9 +442,7 @@ uint32_t *vmm_clone(uint32_t *src)
             uint32_t va = (i << 22) | ((uint32_t)j << 12);
             int pinned = pde_pinned && fb_pinned(pid, va, va + PAGE_SIZE);
             if (!pinned && pmm_ref(FRAME(spt[j]))) {
-                if ((spt[j] & (PTE_WRITE | PTE_COW)) && !(spt[j] & PTE_SHARED))
-                    spt[j] = (spt[j] & ~PTE_WRITE) | PTE_COW;
-                dpt[j] = spt[j];
+                dpt[j] = spt[j];        /* (made copy-on-write above) */
                 continue;
             }
             uint32_t frame = pmm_alloc_user();
@@ -444,10 +460,8 @@ uint32_t *vmm_clone(uint32_t *src)
             dpt[j] = frame | eflags;
         }
     }
-    flush_pd(src);
     return pd;
 fail:
-    flush_pd(src);
     vmm_destroy(pd);
     return NULL;
 }

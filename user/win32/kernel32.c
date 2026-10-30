@@ -1711,6 +1711,16 @@ DEF(SetSearchPathMode) { (void)a; return 1; }
 
 /* ---- resources ---- */
 
+static void res_name(uint16_t *d, const uint16_t *s, int cap)
+{
+    int i = 0;
+    while (s[i] && i < cap - 1) {
+        d[i] = s[i];
+        i++;
+    }
+    d[i] = 0;
+}
+
 static gp_t find_res(gp_t module, gp_t type, gp_t name, int wide, uint32_t *size)
 {
     struct module *m = module ? module_by_base(module) : main_module;
@@ -1720,11 +1730,11 @@ static gp_t find_res(gp_t module, gp_t type, gp_t name, int wide, uint32_t *size
     const uint16_t *tn = NULL, *nn = NULL;
     uint32_t tid = type, nid = name;
     if (type >= 0x10000) {
-        if (wide) wstrcpy(tname, GP(type)); else ansi_to_wide(gstr(type), -1, tname, 128);
+        if (wide) res_name(tname, GP(type), 128); else ansi_to_wide(gstr(type), -1, tname, 128);
         if (tname[0] == '#') { tid = (uint32_t)atoi(wtmp_n(tname + 1, -1)); } else { tn = tname; tid = 0; }
     }
     if (name >= 0x10000) {
-        if (wide) wstrcpy(nname, GP(name)); else ansi_to_wide(gstr(name), -1, nname, 128);
+        if (wide) res_name(nname, GP(name), 128); else ansi_to_wide(gstr(name), -1, nname, 128);
         if (nname[0] == '#') { nid = (uint32_t)atoi(wtmp_n(nname + 1, -1)); } else { nn = nname; nid = 0; }
     }
     return pe_find_resource(m, tid, tn, nid, nn, size);
@@ -1794,8 +1804,11 @@ DEF(DuplicateHandle)
 {
     HANDLE src = A(1);
     if (src == PSEUDO_PROCESS || src == PSEUDO_THREAD) {
-        if (A(3)) *(uint32_t *)P(3) = src == PSEUDO_PROCESS ? handle_new(H_PROCESS) : handle_new(H_THREAD);
-        struct hobj *o = handle_get(*(uint32_t *)P(3));
+        if (!A(3))
+            return 1;
+        HANDLE d = src == PSEUDO_PROCESS ? handle_new(H_PROCESS) : handle_new(H_THREAD);
+        *(uint32_t *)P(3) = d;
+        struct hobj *o = handle_get(d);
         if (o) o->pid = (int)teb->process_id;
         return 1;
     }
@@ -2831,8 +2844,6 @@ DEF(FindVolumeClose) { (void)a; return 1; }
 
 /* ---- file mappings ---- */
 
-struct mapping { int fd; uint32_t protect; uint32_t size; gp_t anon; };
-
 DEF(CreateFileMappingA)
 {
     HANDLE file = A(0);
@@ -2867,6 +2878,12 @@ DEF(CreateFileMappingA)
             ftruncate(m->fd, m->size);
     }
     HANDLE h = handle_new(H_MAPPING);
+    if (!h) {
+        if (m->fd >= 0)
+            close(m->fd);
+        free(m);
+        FAIL(ERROR_NOT_ENOUGH_MEMORY);
+    }
     handle_get(h)->priv = m;
     SETERR(0);
     return h;
@@ -3725,7 +3742,7 @@ static uint32_t format_date(const SYSTEMTIME *st, const char *fmt, int time, cha
         } else if (time && c == 't') {
             o += (uint32_t)sprintf(buf + o, n == 1 ? "%.1s" : "%s", st->hour < 12 ? "AM" : "PM");
         } else {
-            for (int i = 0; i < n; i++)
+            for (int i = 0; i < n && o < sizeof(buf) - 1; i++)
                 buf[o++] = c;
         }
     }
@@ -3874,7 +3891,8 @@ static uint32_t format_message(uint32_t flags, const char *src, uint32_t id, cha
     }
     uint32_t o = 0;
     int argn = 0;
-    for (const char *p = fmt; *p && o < sizeof(buf) - 2; ) {
+    /* Room is left for a two-character escape and the trailing CRLF. */
+    for (const char *p = fmt; *p && o < sizeof(buf) - 4; ) {
         if (*p == '%' && !(flags & 0x200)) {    /* not FORMAT_MESSAGE_IGNORE_INSERTS */
             p++;
             if (*p >= '1' && *p <= '9') {
@@ -3904,6 +3922,8 @@ static uint32_t format_message(uint32_t flags, const char *src, uint32_t id, cha
                         snprintf(f, sizeof(f), "%%%s", spec);
                         o += (uint32_t)snprintf(buf + o, sizeof(buf) - o, f, v);
                     }
+                    if (o > sizeof(buf) - 4)    /* snprintf counts what did not fit */
+                        o = sizeof(buf) - 4;
                 }
                 (void)argn;
                 continue;

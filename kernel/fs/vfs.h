@@ -19,6 +19,8 @@ typedef int (*dev_open_t)(struct vnode *vn, int flags);  /* before a file opens 
 typedef void (*dev_close_t)(struct vnode *vn, int flags);    /* its last file closed */
 /* arg is the caller's value: a user pointer must be checked with user_access_ok(). */
 typedef int (*dev_ioctl_t)(struct vnode *vn, uint32_t req, uint32_t arg);
+/* Opening vn opens *out instead: an anonymous device of the opener's own (/dev/dsp). */
+typedef int (*dev_clone_t)(struct vnode *vn, int flags, struct vnode **out);
 
 struct vnode {
     char name[NAME_MAX + 1];
@@ -44,6 +46,7 @@ struct vnode {
     dev_open_t dev_open;        /* NULL: anyone may open it */
     dev_close_t dev_close;      /* each open file description, when it goes */
     dev_ioctl_t dev_ioctl;      /* NULL: ioctl fails with ENOTTY */
+    dev_clone_t dev_clone;      /* NULL: opened as it is */
     void *dev_priv;             /* device driver data */
     struct fs *fs;              /* NULL for ramfs and device nodes */
     void *fs_data;              /* filesystem-specific inode data */

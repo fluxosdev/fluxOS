@@ -337,13 +337,13 @@ static int expand_dollar(struct expander *e, const char *raw, int i, int in_dq)
     /* sh mode: unquoted parameters are split on IFS (zsh keeps them whole) */
     int psplit = sh.posix && split;
     if (raw[i] == '{') {
-        const char *close = strchr(raw + i, '}');
-        if (!close)
+        int end = skip_brace(raw, i - 1, in_dq);
+        if (end < 0)
             return (int)strlen(raw);
-        char *inner = xstrndup(raw + i + 1, (size_t)(close - raw - i - 1));
+        char *inner = xstrndup(raw + i + 1, (size_t)(end - i - 2));
         expand_brace(e, inner, in_dq, psplit);
         free(inner);
-        return (int)(close - raw) + 1;
+        return end;
     }
     if (raw[i] == '@' || raw[i] == '*') {
         if (raw[i] == '@' || !in_dq) {
@@ -945,7 +945,10 @@ static long a_expr(struct arith *a, int min_prec)
                 a->err = 1;
                 return 0;
             }
-            lhs = opstr[0] == '/' ? lhs / rhs : lhs % rhs;
+            if (rhs == -1)      /* LONG_MIN / -1 traps: LONG_MIN and 0, as bash gives */
+                lhs = opstr[0] == '/' ? (long)-(unsigned long)lhs : 0;
+            else
+                lhs = opstr[0] == '/' ? lhs / rhs : lhs % rhs;
             break;
         }
     }

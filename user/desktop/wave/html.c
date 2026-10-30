@@ -161,6 +161,8 @@ struct parser {
     struct node *stack[MAX_DEPTH];
     int depth;
     int in_body;
+    struct node *grow;                  /* the text node add_text last merged into, */
+    int grow_cap;                       /* and the room its text has */
 };
 
 static struct node *new_element(struct parser *p, int tag, const char *name, int len)
@@ -305,13 +307,19 @@ static void add_text(struct parser *p, const char *s, int n)
         return;
     struct node *last = parent->last;
     if (last && last->type == N_TEXT) {             /* merge with the text before */
-        char *joined = arena_alloc(p->a, (size_t)(last->len + len + 1));
-        if (!joined)
-            return;
-        memcpy(joined, last->text, (size_t)last->len);
-        memcpy(joined + last->len, text, (size_t)len);
-        last->text = joined;
+        if (last != p->grow || last->len + len + 1 > p->grow_cap) {
+            int cap = (last->len + len + 1) * 2;    /* room to grow: many pieces stay linear */
+            char *joined = arena_alloc(p->a, (size_t)cap);
+            if (!joined)
+                return;
+            memcpy(joined, last->text, (size_t)last->len);
+            last->text = joined;
+            p->grow = last;
+            p->grow_cap = cap;
+        }
+        memcpy(last->text + last->len, text, (size_t)len);
         last->len += len;
+        last->text[last->len] = 0;
         return;
     }
     struct node *t = arena_alloc(p->a, sizeof(*t));

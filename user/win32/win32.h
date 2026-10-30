@@ -413,6 +413,7 @@ struct hobj {
     void *priv;                         /* finds, mappings... */
     uint64_t pos_hint;
 };
+struct mapping { int fd; uint32_t protect; uint32_t size; gp_t anon; };     /* H_MAPPING's priv */
 HANDLE handle_new(enum htype type);
 struct hobj *handle_get(HANDLE h);                      /* NULL if bad */
 struct hobj *handle_get_type(HANDLE h, enum htype type);

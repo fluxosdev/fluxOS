@@ -246,10 +246,14 @@ static jsval object_get_proto(struct js *J, jsval self, jsval *args, int argc)
 
 static jsval object_set_proto(struct js *J, jsval self, jsval *args, int argc)
 {
-    (void)J;
     (void)self;
-    if (ARG(0).t == JS_OBJ && (ARG(1).t == JS_OBJ || ARG(1).t == JS_NULL))
-        args[0].u.o->proto = ARG(1).t == JS_OBJ ? args[1].u.o : NULL;
+    if (ARG(0).t == JS_OBJ && (ARG(1).t == JS_OBJ || ARG(1).t == JS_NULL)) {
+        struct jsobj *p = ARG(1).t == JS_OBJ ? args[1].u.o : NULL;
+        for (struct jsobj *x = p; x && !x->phandler; x = x->proto)
+            if (x == args[0].u.o)
+                return js_throw_error(J, "TypeError: Cyclic __proto__ value");
+        args[0].u.o->proto = p;
+    }
     return ARG(0);
 }
 
@@ -757,20 +761,26 @@ jsval js_array_join(struct js *J, struct jsobj *a, const char *sep)
     if (depth > 32)
         return js_str(J, "");
     depth++;
-    int seplen = (int)strlen(sep), total = 0;
-    struct jsstr **parts = js_alloc(J, sizeof(*parts) * (size_t)(a->len ? a->len : 1));
-    for (int i = 0; i < a->len; i++) {
-        jsval v = a->items[i];
+    /* An element's toString may change the array: join the length it had. */
+    int n = a->len, seplen = (int)strlen(sep);
+    long long total = 0;
+    struct jsstr **parts = js_alloc(J, sizeof(*parts) * (size_t)(n ? n : 1));
+    for (int i = 0; i < n; i++) {
+        jsval v = i < a->len ? a->items[i] : js_undefined;
         parts[i] = v.t == JS_UNDEF || v.t == JS_NULL ? js_mkstr(J, "", 0) : js_tostr(J, v);
         if (J->throwing) {
             depth--;
             return js_undefined;
         }
         total += parts[i]->len + (i ? seplen : 0);
+        if (total > JS_STR_MAX) {
+            depth--;
+            return js_throw_error(J, "RangeError: invalid string length");
+        }
     }
     struct jsstr *r = js_alloc_atomic(J, sizeof(struct jsstr) + (size_t)total + 1);
     int o = 0;
-    for (int i = 0; i < a->len; i++) {
+    for (int i = 0; i < n; i++) {
         if (i) {
             memcpy(r->s + o, sep, (size_t)seplen);
             o += seplen;

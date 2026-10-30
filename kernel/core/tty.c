@@ -232,7 +232,7 @@ void tty_input(char c)
     spin_unlock(&tty_lock);
 }
 
-/* buf is the caller's, checked beforehand: it is filled holding the lock. */
+/* buf is kernel memory (read() copies it out afterwards): it is filled holding the lock. */
 int tty_read(struct tty *t, char *buf, uint32_t n)
 {
     if (!n)

@@ -563,7 +563,7 @@ $(BUILD)/tests/libc-guest: $(BUILD)/tests/libc-guest.o $(CRT0) $(LIBC) user/user
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 
 # Host regression tests use production kernel code with mocked hardware/I/O.
-KERNEL_TEST_NAMES := heap pmm pipe socket storage ext2 syscall block sched signal wifi iwl-trans iwl-sta
+KERNEL_TEST_NAMES := heap pmm pipe socket storage ext2 syscall block sched signal wifi iwl-trans iwl-sta pcm
 KERNEL_TEST_BINS := $(addprefix $(BUILD)/tests/kernel-,$(KERNEL_TEST_NAMES))
 .PHONY: test-kernel
 test-kernel: $(KERNEL_TEST_BINS)
@@ -594,8 +594,10 @@ $(BUILD)/tests/install-guest: $(BUILD)/tests/install-guest.o $(CRT0) $(LIBC) use
 
 KERNEL_TEST_MEMORY ?= 256
 KERNEL_TEST_CMDLINE ?=
+# The card the mixer test plays on (--sound=sb16, --sound=usb), or empty for none.
+KERNEL_TEST_SOUND ?= --sound
 test-kernel-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest --cpus $(KERNEL_TEST_CPUS) --memory $(KERNEL_TEST_MEMORY) $(TEST_DROP_TOOLCHAIN) --append "$(KERNEL_TEST_CMDLINE)" --fsck-ext2
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest --cpus $(KERNEL_TEST_CPUS) --memory $(KERNEL_TEST_MEMORY) $(TEST_DROP_TOOLCHAIN) --append "$(KERNEL_TEST_CMDLINE)" --fsck-ext2 $(KERNEL_TEST_SOUND)
 
 $(BUILD)/tests/kernel-guest.o: tests/kernel-guest.c
 	@mkdir -p $(dir $@)

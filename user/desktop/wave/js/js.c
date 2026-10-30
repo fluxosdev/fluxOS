@@ -849,6 +849,10 @@ static jsval fn_prototype(struct js *J, struct jsobj *f);
 
 static int proxy_trap(struct js *J, struct jsobj *p, const char *name, jsval *fn)
 {
+    if (js_stack_low(J)) {                      /* a proxy of a proxy of ... */
+        js_throw_error(J, "RangeError: Maximum call stack size exceeded");
+        return 0;
+    }
     jsval t = js_get(J, js_obj(p->phandler), name);
     if (J->throwing || !js_is_callable(t))
         return 0;
@@ -1094,7 +1098,7 @@ int js_has(struct js *J, jsval obj, struct jsstr *key)
                 jsval a[2] = { js_obj(x->ptarget), js_keyval(key) };
                 return js_truthy(js_call_value(J, fn, js_obj(x->phandler), a, 2));
             }
-            return js_has(J, js_obj(x->ptarget), key);
+            return !J->throwing && js_has(J, js_obj(x->ptarget), key);
         }
         if ((x->cls == C_ARRAY || x->cls == C_ARGUMENTS) &&
             ((js_index(strv(key), &i) && i < (uint32_t)x->len) || str_is(key, "length")))
@@ -1124,7 +1128,7 @@ int js_delete(struct js *J, jsval obj, struct jsstr *key)
             jsval a[2] = { js_obj(o->ptarget), js_keyval(key) };
             return js_truthy(js_call_value(J, fn, js_obj(o->phandler), a, 2));
         }
-        return js_delete(J, js_obj(o->ptarget), key);
+        return !J->throwing && js_delete(J, js_obj(o->ptarget), key);
     }
     if ((o->cls == C_ARRAY || o->cls == C_ARGUMENTS) && js_index(strv(key), &i)) {
         if (i < (uint32_t)o->len)
@@ -1197,6 +1201,10 @@ int js_keys(struct js *J, jsval obj, int inherited, struct jsstr ***out)
                     keys[nk++] = js_tostr(J, r.u.o->items[i]);
             *out = keys;
             return nk;
+        }
+        if (J->throwing) {
+            *out = keys;
+            return 0;
         }
         return js_keys(J, tgt, inherited, out);
     }
@@ -2770,6 +2778,8 @@ static struct ast *postfix(struct parser *P)
 
 static struct ast *unary(struct parser *P)
 {
+    if (js_stack_low(P->J))                     /* every nested expression comes through here */
+        return fail_parse(P, "expression nested too deeply"), NULL;
     struct tok *t = peek(P);
     static const struct { const char *s; int op; } ops[] = {
         { "!", OP_NOT }, { "~", OP_BNOT }, { "-", OP_NEG }, { "+", OP_PLUS },
@@ -2882,6 +2892,8 @@ static const struct { const char *s; int op; } assignops[] = {
 
 static struct ast *assignment(struct parser *P)
 {
+    if (js_stack_low(P->J))                     /* and arrow functions' bodies through here */
+        return fail_parse(P, "expression nested too deeply"), NULL;
     struct tok *t = peek(P);
     int async_arrow = 0;
     if (tok_is(t, "async") && !peek2(P)->nl) {
@@ -3130,6 +3142,8 @@ static struct ast *for_statement(struct parser *P)
 
 static struct ast *statement(struct parser *P)
 {
+    if (js_stack_low(P->J))
+        return fail_parse(P, "statements nested too deeply"), NULL;
     struct tok *t = peek(P);
     struct ast *n;
     if (accept(P, "{"))
@@ -3859,9 +3873,9 @@ static jsval start_coroutine(struct js *J, struct jsobj *f, jsval self, jsval *a
 static jsval run_user(struct js *J, struct jsobj *f, jsval self, jsval *args, int argc)
 {
     struct ast *fn = f->fn;
-    if (++J->depth > JS_MAX_DEPTH) {
+    if (++J->depth > JS_MAX_DEPTH || js_stack_low(J)) {
         J->depth--;
-        return js_throw_error(J, "RangeError: maximum call stack size exceeded");
+        return js_throw_error(J, "RangeError: Maximum call stack size exceeded");
     }
     jsval result;
     if (fn->flags & F_MODULE) {         /* its bindings were made when it was linked */
@@ -3888,7 +3902,14 @@ static __attribute__((noinline)) jsval call_bound(struct js *J, struct jsobj *f,
         all[n++] = f->bound_args[i];
     for (int i = 0; i < argc && n < 64; i++)
         all[n++] = args[i];
-    return js_call_value(J, js_obj(f->bound), f->bound_this, all, n);
+    int chain = f->bound->bound != NULL;     /* a bound bound function counts as a call */
+    if (chain && ++J->depth > JS_MAX_DEPTH) {
+        J->depth--;
+        return js_throw_error(J, "RangeError: Maximum call stack size exceeded");
+    }
+    jsval r = js_call_value(J, js_obj(f->bound), f->bound_this, all, n);
+    J->depth -= chain;
+    return r;
 }
 
 /* Calling a user function: async functions and generators run as coroutines. */
@@ -3913,6 +3934,8 @@ static jsval call_value_impl(struct js *J, jsval fv, jsval self, jsval *args, in
     if (!js_is_callable(fv))
         return js_throw_error(J, "TypeError: %s is not a function",
                               fv.t == JS_UNDEF ? "undefined" : fv.t == JS_NULL ? "null" : "value");
+    if (js_stack_low(J))                        /* natives that call back in, too */
+        return js_throw_error(J, "RangeError: Maximum call stack size exceeded");
     struct jsobj *f = fv.u.o;
     if (f->bound)
         return call_bound(J, f, args, argc);
@@ -3944,6 +3967,8 @@ static jsval construct_impl(struct js *J, jsval fv, jsval *args, int argc)
     if (!js_is_callable(fv) || fv.u.o->arrow)
         return js_throw_error(J, "TypeError: not a constructor");
     struct jsobj *f = fv.u.o;
+    if (js_stack_low(J))
+        return js_throw_error(J, "RangeError: Maximum call stack size exceeded");
     if (f->bound) {                             /* new (F.bind(null, a))(b): a, b */
         jsval all[64];
         int n = 0;
@@ -3951,7 +3976,14 @@ static jsval construct_impl(struct js *J, jsval fv, jsval *args, int argc)
             all[n++] = f->bound_args[i];
         for (int i = 0; i < argc && n < 64; i++)
             all[n++] = args[i];
-        return js_construct(J, js_obj(f->bound), all, n);     /* a bound bound function unwraps in turn */
+        int chain = f->bound->bound != NULL;
+        if (chain && ++J->depth > JS_MAX_DEPTH) {
+            J->depth--;
+            return js_throw_error(J, "RangeError: Maximum call stack size exceeded");
+        }
+        jsval r = js_construct(J, js_obj(f->bound), all, n);     /* a bound bound function unwraps in turn */
+        J->depth -= chain;
+        return r;
     }
     if (f->native) {
         if (!f->ctor)
@@ -4325,6 +4357,8 @@ static void run_script(struct js *J, struct ast *prog)
 {
     prepare_body(J, prog, prog->info);
     struct vfunc *vf = an_root(J, prog);
+    if (J->throwing)                    /* an early error: none of it runs */
+        return;
     struct env *g = J->genv;
     for (int i = 0; i < prog->info->nvars; i++)
         declare_global(J, g, prog->info->vars[i], js_undefined, 0);
@@ -4363,7 +4397,7 @@ static jsval global_eval(struct js *J, jsval self, jsval *args, int argc)
  * it. The stack is given back as soon as the function finishes.
  */
 #ifndef CORO_STACK
-#define CORO_STACK  (96 * 1024)
+#define CORO_STACK  (256 * 1024)        /* JS_STACK_SPARE of it is kept for natives */
 #endif
 #define CORO_DEPTH  32                  /* nested calls allowed on one stack */
 #define MAX_CORO    192
@@ -4546,7 +4580,12 @@ static struct vproto *compile_on_stack(struct js *J, struct vfunc *vf, int root)
     c->root = root;
     c->active = 1;
     c->sp = prepare_stack(c->stack, COMPILE_STACK, compiler_main, c);
+    const char *saved_lo = J->stack_lo, *saved_hi = J->stack_hi;
+    J->stack_lo = c->stack;
+    J->stack_hi = (const char *)c->stack + COMPILE_STACK;
     js_coro_switch(&c->caller_sp, c->sp);
+    J->stack_lo = saved_lo;
+    J->stack_hi = saved_hi;
     struct vproto *result = c->result;
     c->active = 0;
     c->vf = NULL;
@@ -4618,10 +4657,15 @@ static void co_resume(struct js *J, struct coro *co, jsval v, int mode)
     J->cur_co = co;
     co->state = CO_RUNNING;
     int saved_depth = J->depth;
+    const char *saved_lo = J->stack_lo, *saved_hi = J->stack_hi;
     J->depth = co->depth;
+    J->stack_lo = co->stack;
+    J->stack_hi = (const char *)co->stack + CORO_STACK;
     js_coro_switch(&co->caller_sp, co->sp);
     co->depth = J->depth;
     J->depth = saved_depth;
+    J->stack_lo = saved_lo;
+    J->stack_hi = saved_hi;
     J->cur_co = co->resumer;
     if (co->state == CO_DONE)
         co_unlink(co);
@@ -4978,6 +5022,18 @@ static int on_stack(const char *p, const char *lo, const char *hi)
     return p >= lo && p < hi;
 }
 
+static void main_stack(const char **lo, const char **hi)
+{
+#ifdef JS_HOST_TEST
+    /* The Linux regression runner has a different main-stack mapping. */
+    extern void js_test_stack_bounds(const char **lo, const char **hi);
+    js_test_stack_bounds(lo, hi);
+#else
+    *lo = (const char *)MAIN_STACK_LOW;
+    *hi = (const char *)MAIN_STACK_TOP;
+#endif
+}
+
 /*
  * The main stack and every coroutine's: each is scanned from the lowest
  * place its frames may reach: where the engine is running now, where a
@@ -4986,14 +5042,8 @@ static int on_stack(const char *p, const char *lo, const char *hi)
 int js_gc_scan_stacks(struct js *J, const char *sp,
                       void (*scan)(struct js *J, const void *lo, const void *hi))
 {
-#ifdef JS_HOST_TEST
-    /* The Linux regression runner has a different main-stack mapping. */
-    extern void js_test_stack_bounds(const char **lo, const char **hi);
     const char *mlo, *mhi;
-    js_test_stack_bounds(&mlo, &mhi);
-#else
-    const char *mlo = (const char *)MAIN_STACK_LOW, *mhi = (const char *)MAIN_STACK_TOP;
-#endif
+    main_stack(&mlo, &mhi);
     int known = on_stack(sp, mlo, mhi);
     const char *main_from = known ? sp : NULL;
     struct vcompile *compiler = J->compiler;
@@ -5073,6 +5123,12 @@ void js_run_jobs(struct js *J)
 
 /* ---- the interface ---- */
 
+/* Is a script running (so whatever the host does now happens inside it)? */
+int js_running(void)
+{
+    return entered;
+}
+
 static int enter(struct js *J)
 {
     if (J->dead)
@@ -5080,6 +5136,7 @@ static int enter(struct js *J)
     if (!entered) {
         J->steps = 0;
         J->depth = 0;
+        main_stack(&J->stack_lo, &J->stack_hi);
     }
     active = J;
     return 0;
@@ -5182,7 +5239,8 @@ jsval js_compile_handler(struct js *J, const char *body, const char *where)
         free(src);
         if (x && x->kind == N_FUNC) {
             an_root(J, x);
-            f = make_function(J, x, J->genv);
+            if (!J->throwing)
+                f = make_function(J, x, J->genv);
         }
         J->throwing = 0;
     }
@@ -5295,6 +5353,13 @@ static void mod_set_source(struct js *J, struct jsmod *m, const char *src, int l
     }
     prepare_body(J, prog, prog->info);
     an_root(J, prog);                   /* before linking makes its functions */
+    if (J->throwing) {                  /* nested too deeply to analyse */
+        jsval e = J->exc;
+        J->throwing = 0;
+        J->exc = js_undefined;
+        mod_fail(J, m, e);
+        return;
+    }
     int n = 0;
     for (int i = 0; i < prog->n; i++)
         if ((prog->list[i]->kind == S_IMPORT || prog->list[i]->kind == S_EXPORT) && prog->list[i]->str)

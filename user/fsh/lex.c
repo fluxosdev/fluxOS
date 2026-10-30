@@ -94,11 +94,35 @@ int skip_subst(const char *s, int i)
     return -1;
 }
 
-static int skip_brace(const char *s, int i)
+/* s[i] is '$', s[i+1] is '{' : return index past the matching '}' (nested ${...},
+ * quotes and substitutions skipped), or -1. Inside double quotes a ' is literal. */
+int skip_brace(const char *s, int i, int in_dq)
 {
-    for (i += 2; s[i]; i++)
-        if (s[i] == '}')
+    for (i += 2; s[i]; ) {
+        char c = s[i];
+        if (c == '\\' && s[i + 1]) {
+            i += 2;
+        } else if (c == '\'' && !in_dq) {
+            if ((i = skip_squote(s, i)) < 0)
+                return -1;
+        } else if (c == '"') {
+            if ((i = skip_dquote(s, i)) < 0)
+                return -1;
+        } else if (c == '`') {
+            if ((i = skip_bquote(s, i)) < 0)
+                return -1;
+        } else if (c == '$' && s[i + 1] == '(') {
+            if ((i = skip_subst(s, i)) < 0)
+                return -1;
+        } else if (c == '$' && s[i + 1] == '{') {
+            if ((i = skip_brace(s, i, in_dq)) < 0)
+                return -1;
+        } else if (c == '}') {
             return i + 1;
+        } else {
+            i++;
+        }
+    }
     return -1;
 }
 
@@ -115,7 +139,7 @@ static int skip_dquote(const char *s, int i)
             if ((i = skip_subst(s, i)) < 0)
                 return -1;
         } else if (c == '$' && s[i + 1] == '{') {
-            if ((i = skip_brace(s, i)) < 0)
+            if ((i = skip_brace(s, i, 1)) < 0)
                 return -1;
         } else if (c == '`') {
             if ((i = skip_bquote(s, i)) < 0)
@@ -161,7 +185,7 @@ static int scan_word(const char *s, int *pi, const char **ctx)
                 return LEX_INCOMPLETE;
             }
         } else if (c == '$' && s[i + 1] == '{') {
-            if ((r = skip_brace(s, i)) < 0) {
+            if ((r = skip_brace(s, i, 0)) < 0) {
                 *ctx = "braceparam";
                 return LEX_INCOMPLETE;
             }

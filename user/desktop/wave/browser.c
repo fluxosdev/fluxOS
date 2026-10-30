@@ -1075,7 +1075,8 @@ void browser_child_exited(int pid,int status)
         struct fetch *f=&lane->fetch;if(!f->active||f->pid!=pid)continue;
         struct loader *previous=b->lane;select_loader(b,lane);
         f->pid=0;f->exited=1;f->status=status;if(f->eof)fetch_complete(b);
-        if(alive(b))select_loader(b,previous);return;
+        if(alive(b))select_loader(b,previous);
+        return;
     }
 }
 
@@ -6979,6 +6980,23 @@ static int drop_field(const struct node *n)
     return n && is_text_field(n) && !web_disabled(n) && !node_attr(n, "readonly");
 }
 
+/* Dropped text into field n, as if typed where its caret is; "input" if it changed. */
+static void drop_into_field(struct browser *b, struct node *n, const char *text)
+{
+    char *before = n->value ? strdup(n->value) : NULL;
+    for (const char *p = text; *p; p++) {
+        struct input_event ev = { .type = IEV_KEY, .flags = IEV_PRESSED, .len = 1 };
+        ev.text[0] = *p == '\r' ? '\n' : *p;
+        if (ev.text[0] == '\n' && n->tag != T_TEXTAREA)
+            ev.text[0] = ' ';
+        edit_field(b, n, &ev);
+    }
+    b->focus = n;
+    if (b->js && (!before || !n->value || strcmp(before, n->value)))
+        jsdom_dispatch(b->js, n, "input");
+    free(before);
+}
+
 /* Scripts may have navigated away (or the page may be gone) while an event ran: the drag is over. */
 static int drag_gone(struct browser *b)
 {
@@ -7015,6 +7033,14 @@ static void drag_start(struct browser *b, int px, int py)
     b->drag_over = NULL;
     b->drag_moved = 0;
     snprintf(b->drag_effect, sizeof(b->drag_effect), "none");
+    /* Other windows can take its address; a local file's only from a local page,
+     * or a remote one could have a drop open file:///anything. */
+    if (url[0] && strncasecmp(url, "data:", 5) &&
+        (strncasecmp(url, "file:", 5) || !strncasecmp(b->url, "file:", 5))) {
+        struct drag_data d = { .text = url, .icon = src->tag == T_IMG ? ICON_IMAGE : ICON_HTML };
+        snprintf(d.label, sizeof(d.label), "%s", url);
+        wm_drag_start(top_of(b)->win, &d);
+    }
 }
 
 /* The drag moved to (x, y), page point (px, py): drag at its source; dragenter and dragleave as it goes
@@ -7022,7 +7048,7 @@ static void drag_start(struct browser *b, int px, int py)
 static void drag_move(struct browser *b, int x, int y, int px, int py)
 {
     struct rect v = view_rect(b);
-    struct node *over = b->root && rect_contains(v, x, y) ? element_at(b, px, py) : NULL;
+    struct node *over = b->root && rect_contains(v, x, y) && wm_drag_here() ? element_at(b, px, py) : NULL;
     b->drag_px = px, b->drag_py = py;
     if (over == b->drag_over && now_ms() - b->drag_moved < 40)
         return;
@@ -7077,18 +7103,7 @@ static void drag_finish(struct browser *b, int cancel)
                 jsdom_drag_text(b->js, text, (int)sizeof(text));
             else
                 snprintf(text, sizeof(text), "%s", b->drag_text);
-            char *before = over->value ? strdup(over->value) : NULL;
-            for (const char *p = text; *p; p++) {          /* as if typed where the caret is */
-                struct input_event ev = { .type = IEV_KEY, .flags = IEV_PRESSED, .len = 1 };
-                ev.text[0] = *p == '\r' ? '\n' : *p;
-                if (ev.text[0] == '\n' && over->tag != T_TEXTAREA)
-                    ev.text[0] = ' ';
-                edit_field(b, over, &ev);
-            }
-            b->focus = over;
-            if (b->js && (!before || !over->value || strcmp(before, over->value)))
-                jsdom_dispatch(b->js, over, "input");
-            free(before);
+            drop_into_field(b, over, text);
         } else if (!prevented) {
             snprintf(op, sizeof(op), "none");
         }
@@ -7299,7 +7314,7 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
                 jsdom_dispatch(b->js, r, "change");
             paint(b);
         } else if (hold == H_PAGE && b->drag_on) {
-            drag_finish(b, 0);
+            drag_finish(b, wm_drag_effect() != DRAG_HERE);  /* another window took it, or nothing did */
         } else if (hold == H_PAGE) {
             b->sel_start = 0;
             b->drag_src = NULL;
@@ -7795,7 +7810,57 @@ static void sweep_frames(void)
     }
 }
 
+static int looks_like_url(const char *t)
+{
+    if (strncasecmp(t, "http://", 7) && strncasecmp(t, "https://", 8) && strncasecmp(t, "file://", 7))
+        return 0;
+    for (; *t; t++)
+        if (*t == ' ' || *t == '\n' || *t == '\t')
+            return 0;
+    return 1;
+}
+
+/* From another window: text goes into the page's text field under the pointer,
+ * as typed; a file, or text that is an address, opens in this window. */
+static int br_drop(struct window *w, int x, int y, const struct drag_data *d, int phase, int copy)
+{
+    (void)copy;
+    struct browser *b = w->priv;
+    if (phase == DROP_LEAVE)
+        return DROP_NONE;
+    if (!d->npaths && d->text) {
+        struct browser *f = b, *in;
+        int fx, fy;
+        while ((in = frame_at(f, x, y, &fx, &fy)))
+            f = in, x = fx, y = fy;
+        struct rect v = view_rect(f);
+        struct node *n = f->root && !f->js_nav[0] && rect_contains(v, x, y) ?
+                         element_at(f, x - v.x + f->scroll_x, y - v.y + f->scroll_y) : NULL;
+        if (drop_field(n)) {
+            if (phase == DROP_DO) {
+                drop_into_field(f, n, d->text);
+                paint(f);
+            }
+            return DROP_COPY;
+        }
+    }
+    char url[URL_MAX];
+    if (d->npaths)
+        snprintf(url, sizeof(url), "file://%s", d->paths[0]);
+    else if (d->text && looks_like_url(d->text))
+        snprintf(url, sizeof(url), "%s", d->text);
+    else
+        return DROP_NONE;
+    if (phase == DROP_OVER) {
+        wm_drag_hint("Open in Wave");
+        return DROP_OPEN;
+    }
+    navigate(b, url, NULL, NAV_NEW);
+    return DROP_OPEN;
+}
+
 static const struct window_ops br_ops = {
+    .drop = br_drop,
     .key = br_key,
     .mouse = br_mouse,
     .wheel = br_wheel,

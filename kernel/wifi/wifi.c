@@ -573,7 +573,7 @@ static void handle_eapol(const uint8_t *frame, uint32_t len)
     if (res.reply_len) {
         if (send_eapol(res.reply, res.reply_len) < 0)
             klog("wifi: could not send an EAPOL reply\n");
-        if (!res.install_ptk && !res.install_gtk) {
+        if (w.wpa.state == WPA_WAIT_MSG3) {
             w.sent_msg2 = 1;            /* message 2 */
             w.deadline = ticks + EAPOL_TIMEOUT;
         }

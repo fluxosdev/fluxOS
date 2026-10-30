@@ -666,7 +666,7 @@ static int fat_load_dir(struct vnode *dir)
             short_to_name(e, name);
         }
         lfn_valid = 0;
-        if (!name[0] || !strcmp(name, ".") || !strcmp(name, ".."))
+        if (!name[0] || !strcmp(name, ".") || !strcmp(name, "..") || strchr(name, '/'))
             continue;
 
         struct vnode *vn = make_vnode(f, dir, name, e, off, slots);
@@ -1040,7 +1040,7 @@ static int fat_truncate(struct vnode *vn, uint32_t size)
         r = edit_begin(f);
         if (r < 0)
             return r;
-        uint32_t keep = (size + f->cluster_bytes - 1) / f->cluster_bytes;
+        uint32_t keep = size / f->cluster_bytes + (size % f->cluster_bytes != 0);
         if (!keep) {
             tail = nd->first;
             nd->first = 0;

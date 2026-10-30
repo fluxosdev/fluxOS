@@ -471,6 +471,7 @@ static int check_disk(struct fd_drive *d)
             blk_discard(&d->bd);
             return -EIO;
         }
+        blk_discard(&d->bd);            /* what is cached is of the old disk */
         probe(d);
     }
     return d->bd.nsectors ? 0 : -EIO;
