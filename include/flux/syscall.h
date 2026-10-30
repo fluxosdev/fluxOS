@@ -1,0 +1,115 @@
+/*
+ * System call numbers. Invoked with `int $0x80`:
+ *   eax = number, ebx/ecx/edx/esi/edi = arguments, eax = result.
+ * Results in [-4095, -1] are negated errno values.
+ */
+#ifndef FLUX_SYSCALL_H
+#define FLUX_SYSCALL_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define SYS_exit       1
+#define SYS_fork       2
+#define SYS_read       3
+#define SYS_write      4
+#define SYS_open       5
+#define SYS_close      6
+#define SYS_waitpid    7
+#define SYS_execve     8
+#define SYS_chdir      9
+#define SYS_time      10
+#define SYS_getpid    11
+#define SYS_getppid   12
+#define SYS_kill      13
+#define SYS_mkdir     14
+#define SYS_rmdir     15
+#define SYS_unlink    16
+#define SYS_dup       17
+#define SYS_dup2      18
+#define SYS_pipe      19
+#define SYS_sbrk      20
+#define SYS_sleep     21
+#define SYS_lseek     22
+#define SYS_stat      23
+#define SYS_fstat     24
+#define SYS_getcwd    25
+#define SYS_getdents  26
+#define SYS_uname     27
+#define SYS_yield     28
+#define SYS_signal    29
+#define SYS_setpgid   30
+#define SYS_getpgid   31
+#define SYS_tcsetpgrp 32
+#define SYS_tcgetpgrp 33
+#define SYS_ttymode   34
+#define SYS_procinfo  35
+#define SYS_meminfo   36
+#define SYS_uptime    37
+#define SYS_reboot    38
+#define SYS_rename    39
+#define SYS_dmesg     40
+#define SYS_chmod     41
+#define SYS_mount     42
+#define SYS_umount    43
+#define SYS_statfs    44
+#define SYS_getmounts 45
+#define SYS_blkinfo   46
+#define SYS_sync      47
+#define SYS_fsync     48
+#define SYS_blkrescan 49
+#define SYS_fbinfo    50
+#define SYS_fbmap     51
+#define SYS_openpty   52
+#define SYS_poll      53
+#define SYS_socket    54
+#define SYS_bind      55
+#define SYS_connect   56
+#define SYS_listen    57
+#define SYS_accept    58
+#define SYS_sendto    59
+#define SYS_recvfrom  60
+#define SYS_shutdown  61
+#define SYS_sockname  62
+#define SYS_netinfo   63
+#define SYS_netconf   64
+#define SYS_ftruncate 65
+#define SYS_display   66
+#define SYS_ioctl     67
+#define SYS_usbinfo   68
+#define SYS_stime     69
+#define SYS_llseek      70  /* fd, offset high, offset low, uint64_t *result, whence */
+#define SYS_power       71  /* POWER_* op, arg */
+#define SYS_sigaction   72  /* sig, const struct flux_sigaction *act, struct flux_sigaction *oact */
+#define SYS_sigprocmask 73  /* how, const uint32_t *set, uint32_t *oset */
+#define SYS_sigreturn   74  /* const struct flux_sigcontext *ctx */
+#define SYS_mmap        75  /* const struct flux_mmap_args *args */
+#define SYS_munmap      76  /* addr, len */
+#define SYS_mprotect    77  /* addr, len, prot */
+#define SYS_fcntl       78  /* fd, cmd, arg */
+#define SYS_umask       79  /* mask */
+#define SYS_utime       80  /* path, const struct flux_utimbuf *times */
+#define SYS_times       81  /* struct flux_tms *buf */
+#define SYS_fchdir      82  /* fd */
+#define SYS_fchmod      83  /* fd, mode */
+#define SYS_thread_create 84 /* entry, stack, tls base, clear_tid address: the new thread's id */
+#define SYS_thread_exit 85  /* stack address and length to unmap (0, 0: none) */
+#define SYS_futex       86  /* addr, FUTEX_WAIT or FUTEX_WAKE, value (or count), timeout in ms (-1: none) */
+#define SYS_set_tls     87  /* base: this thread's TLS segment; returns its selector */
+#define SYS_gettid      88
+#define SYS_tkill       89  /* thread id, signal */
+#define SYS_setitimer   90  /* ITIMER_*, const struct flux_itimer *value, struct flux_itimer *old */
+#define SYS_getitimer   91  /* ITIMER_*, struct flux_itimer *out */
+#define SYS_sigpending  92  /* uint32_t *set: the calling thread's pending signals, as a mask */
+#define SYS_sigaltstack 93  /* const struct flux_stack *ss, struct flux_stack *old */
+#define SYS_setsid      94
+#define SYS_getsid      95  /* pid */
+
+#define NSYSCALLS       96
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

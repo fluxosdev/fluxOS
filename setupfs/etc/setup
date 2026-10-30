@@ -1,0 +1,2 @@
+This is the fluxOS install CD's setup system. init starts fluxOS Setup
+because this file is here; the installed system does not have it.

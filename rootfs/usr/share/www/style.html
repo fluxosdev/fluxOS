@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<title>Text, state and scroll test page</title>
+<style>
+body { font-family: sans-serif; max-width: 760px; margin: 0 auto; padding: 0 16px 80px; line-height: 1.5; color: #26202d; background: #f5f2f8; }
+h1, h2 { color: #4b2569; }
+.card { padding: 10px 18px; margin: 14px 0; background: white; border: 1px solid #d6c6e2; }
+.note { color: #776c80; font-size: 13px; }
+.bar { position: sticky; top: 0; background: #4b2569; color: white; padding: 6px 12px; z-index: 5; }
+.bar a { color: #e9d6ff; }
+.pin { position: fixed; right: 10px; bottom: 28px; width: 150px; padding: 6px; background: #ffe9a8; border: 1px solid #b08c1f; font-size: 13px; }
+.sec { border: 1px solid #c4b4d0; padding: 0 10px 10px; margin: 10px 0; }
+.sec h3 { position: sticky; top: 30px; margin: 0; padding: 4px 8px; background: #d9c7ea; }
+.sp { letter-spacing: 3px; word-spacing: 12px; }
+.ba { word-break: break-all; width: 150px; border: 1px dashed #888; }
+.bw { overflow-wrap: break-word; width: 150px; border: 1px dashed #888; }
+.el { width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border: 1px solid #888; }
+.sc { font-variant: small-caps; }
+.sh { font-size: 26px; font-weight: bold; color: #4b2569; text-shadow: 2px 2px 3px #9a7bb5; }
+.ol { outline: 3px solid #2a7f3f; outline-offset: 4px; width: 200px; margin: 10px 8px; padding: 4px; }
+.deco { text-decoration: underline wavy #c0392b; }
+.deco2 { text-decoration: underline double #2a5fbf; }
+.hand { cursor: pointer; background: #e9e1f2; padding: 4px 8px; display: inline-block; }
+.wait { cursor: wait; background: #e9e1f2; padding: 4px 8px; display: inline-block; }
+.text { cursor: text; background: #e9e1f2; padding: 4px 8px; display: inline-block; }
+.no { cursor: not-allowed; background: #e9e1f2; padding: 4px 8px; display: inline-block; }
+.cross { cursor: crosshair; background: #e9e1f2; padding: 4px 8px; display: inline-block; }
+.inert { pointer-events: none; }
+.nosel { user-select: none; background: #eee; padding: 2px 6px; }
+::selection { background: #2a7f3f; color: white; }
+input:invalid { outline: 2px solid #c0392b; }
+input:valid { outline: 2px solid #2a7f3f; }
+input:read-only { background: #eee; }
+input::placeholder { color: #c0392b; }
+#t:target { background: #fff1b8; }
+ul.in { list-style-position: inside; background: #eef6ee; padding: 4px 4px 4px 14px; }
+ul.mk li::marker { color: #c0392b; }
+table.fx { table-layout: fixed; width: 360px; border: 1px solid #888; }
+table.fx td { border: 1px solid #aaa; overflow: hidden; }
+table.cs td { background: #eee; border: 1px solid #888; }
+table.cs { border-collapse: separate; border-spacing: 4px; empty-cells: hide; }
+table.cap caption { caption-side: bottom; }
+ruby rt { color: #c0392b; }
+</style>
+</head>
+<body>
+<div class="bar"><b>Text, state and scroll test page</b> &middot; <a href="home.html">Home</a> &middot; this bar is <code>position: sticky</code></div>
+<div class="pin" id="pin">I am <code>position: fixed</code>: I stay here when you scroll.</div>
+
+<div class="card">
+<p>Each box says what you should see. Move the mouse over the grey boxes to see the pointers change.</p>
+</div>
+
+<div class="sec"><h3>Sticky headings</h3>
+<p>This heading sticks under the purple bar until its section ends, then the next section's heading takes over.</p>
+<p>Scroll down a little to see it. &darr;</p>
+<p class="note">(There is more text below, so there is something to scroll.)</p>
+<p>&nbsp;</p><p>&nbsp;</p><p>&nbsp;</p><p>&nbsp;</p>
+</div>
+
+<div class="sec"><h3>Text spacing and wrapping</h3>
+<p class="sp">letter-spacing 3px and word-spacing 12px</p>
+<p class="ba">word-break: break-all breaks anywhere: supercalifragilisticexpialidocious</p>
+<p class="bw">overflow-wrap: break-word only breaks when it must: supercalifragilisticexpialidocious_and_more</p>
+<p class="el">text-overflow: ellipsis cuts this long line off with three dots</p>
+<p class="sc">Small Capitals In A Sentence</p>
+<p class="sh">A text shadow</p>
+<p><span class="deco">wavy red underline</span> and <span class="deco2">double blue underline</span></p>
+</div>
+
+<div class="sec"><h3>Outline, pointers, selection</h3>
+<div class="ol">outline: 3px green, 4px out (it takes no room)</div>
+<p><span class="hand">pointer (hand)</span> <span class="text">text (I-beam)</span> <span class="wait">wait (hourglass)</span>
+<span class="no">not-allowed</span> <span class="cross">crosshair</span></p>
+<p><a href="#t">A link</a> with <span class="inert">pointer-events: none inside it</span> &mdash; and
+<a class="inert" href="javascript:alert('you should not see this')">a link with pointer-events: none (does nothing)</a>.</p>
+<p>Select this text: the highlight is green (<code>::selection</code>). <span class="nosel">This part cannot be selected (user-select: none).</span></p>
+</div>
+
+<div class="sec"><h3>Form state</h3>
+<p><input required placeholder="required: red outline until you type"> &nbsp;
+<input type="email" value="nobody" title="email"> &nbsp; <input type="number" min="1" max="5" value="9"> &nbsp;
+<input readonly value="read-only (grey)"></p>
+<p class="note">Green outline: valid. Red: invalid (empty required field, a bad address, a number out of range).</p>
+</div>
+
+<div class="sec"><h3>Lists, tables, gauges, ruby</h3>
+<ul class="in"><li>list-style-position: inside, the bullet is in the text</li><li>second item</li></ul>
+<ul class="mk"><li>a red ::marker</li><li>another</li></ul>
+<table class="fx"><tr><td style="width:60px">60px</td><td>table-layout: fixed &mdash; this cell gets the rest even though it holds a very long word: aaaaaaaaaaaaaaaaaaaaaaaa</td><td>x</td></tr></table>
+<table class="cs"><tr><td>full</td><td></td><td>empty-cells: hide</td></tr></table>
+<table class="cap"><caption>caption-side: bottom (this is under the table)</caption><tr><td>a</td><td>b</td></tr></table>
+<p><progress value="35" max="100"></progress> <progress></progress> <meter value="0.8"></meter>
+<meter min="0" max="100" low="30" high="70" optimum="80" value="20"></meter></p>
+<p>Ruby: <ruby>漢<rp>(</rp><rt>kan</rt><rp>)</rp></ruby> <ruby>fluxOS<rt>a small OS</rt></ruby></p>
+<p><a href="#t">Jump to the :target box</a></p>
+<div id="t" class="card">The :target box: yellow when you arrive here by the link above.</div>
+</div>
+
+<div class="sec"><h3>Kept between sessions</h3>
+<p>localStorage counter: <b id="n">?</b> <button onclick="bump()">Add one</button> &middot; cookie visits: <b id="c">?</b></p>
+<p class="note">Close the browser (or restart fluxOS) and open this page again: the counters should continue where they left off.</p>
+</div>
+
+<script>
+function bump() {
+  var n = +(localStorage.getItem("style_count") || 0) + 1;
+  localStorage.setItem("style_count", n);
+  document.getElementById("n").textContent = n;
+}
+document.getElementById("n").textContent = localStorage.getItem("style_count") || 0;
+var m = /(?:^|; )style_visits=(\d+)/.exec(document.cookie);
+var v = (m ? +m[1] : 0) + 1;
+document.cookie = "style_visits=" + v + "; max-age=31536000; path=/";
+document.getElementById("c").textContent = v;
+</script>
+</body>
+</html>

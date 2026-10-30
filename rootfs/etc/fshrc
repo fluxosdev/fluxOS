@@ -1,0 +1,18 @@
+# /etc/fshrc - system-wide startup file for interactive fsh shells.
+# Per-user settings go in ~/.fshrc.
+
+# zsh-style prompt: user@host, current directory, % (green, or red
+# after a failed command). The right prompt shows a non-zero exit code.
+PROMPT='%F{cyan}%n@%m%f %F{blue}%B%~%b%f %(?.%F{green}.%F{red})%#%f '
+RPROMPT='%(?..%F{red}[%?]%f)'
+
+alias ls='ls -F'
+alias ll='ls -l'
+alias la='ls -la'
+alias l='ls -lA'
+alias ..='cd ..'
+alias ...='cd ../..'
+alias md='mkdir -p'
+alias h='history'
+alias j='jobs'
+alias grep='grep --color=auto'

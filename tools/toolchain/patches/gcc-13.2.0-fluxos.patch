@@ -1,0 +1,122 @@
+diff -ruN a/config.sub b/config.sub
+--- a/config.sub	2023-07-27 04:13:03.000000000 -0400
++++ b/config.sub	2026-10-29 16:48:27.550189729 -0400
+@@ -1749,7 +1749,7 @@
+ 	     | onefs* | tirtos* | phoenix* | fuchsia* | redox* | bme* \
+ 	     | midnightbsd* | amdhsa* | unleashed* | emscripten* | wasi* \
+ 	     | nsk* | powerunix* | genode* | zvmoe* | qnx* | emx* | zephyr* \
+-	     | fiwix* )
++	     | fiwix* | fluxos* )
+ 		;;
+ 	# This one is extra strict with allowed versions
+ 	sco3.2v2 | sco3.2v[4-9]* | sco5v6*)
+diff -ruN a/gcc/config/fluxos.h b/gcc/config/fluxos.h
+--- a/gcc/config/fluxos.h	1969-12-31 19:00:00.000000000 -0500
++++ b/gcc/config/fluxos.h	2026-10-29 17:03:54.701736051 -0400
+@@ -0,0 +1,42 @@
++/* Definitions for fluxOS: static ELF programs on a small Unix-like
++   kernel for 32-bit x86. Programs are loaded at 1 GiB (user/user.ld in
++   the fluxOS tree); the C library is libc.a and crt0.o in the sysroot.
++
++   This file is part of the fluxOS toolchain patches and is placed under
++   the same license as GCC (GPLv3 or later).  */
++
++#undef TARGET_OS_CPP_BUILTINS
++#define TARGET_OS_CPP_BUILTINS()		\
++  do						\
++    {						\
++      builtin_define ("__fluxos__");		\
++      builtin_define ("__unix__");		\
++      builtin_assert ("system=fluxos");		\
++      builtin_assert ("system=unix");		\
++      builtin_assert ("system=posix");		\
++    }						\
++  while (0)
++
++/* Everything is linked statically with the system's linker script
++   (/usr/lib/fluxos.ld in the sysroot: user/user.ld in the fluxOS tree),
++   which puts programs at 0x40000000, where the kernel loads ELF segments
++   from, and keeps the constructor and exception sections the C library's
++   startup code and libgcc look for.  Without the script, the text segment
++   address alone makes a program the kernel accepts.  */
++#undef LINK_SPEC
++#define LINK_SPEC \
++  "-m elf_i386 -z noexecstack %{!r:%{!shared:-static " \
++  "%{!T*:%:if-exists-then-else(fluxos.ld%s -T) " \
++  "%:if-exists-else(fluxos.ld%s -Ttext-segment=0x40000000)}}}"
++
++#undef LIB_SPEC
++#define LIB_SPEC "%{!shared:-lc}"
++
++#undef STARTFILE_SPEC
++#define STARTFILE_SPEC "%{!shared:crt0.o%s} crtbegin.o%s"
++
++#undef ENDFILE_SPEC
++#define ENDFILE_SPEC "crtend.o%s"
++
++/* No shared libraries, so no PIC by default and no dynamic linker.  */
++#undef DYNAMIC_LINKER
+diff -ruN a/gcc/config.gcc b/gcc/config.gcc
+--- a/gcc/config.gcc	2023-07-27 04:13:04.000000000 -0400
++++ b/gcc/config.gcc	2026-10-29 16:48:48.331307020 -0400
+@@ -927,6 +927,12 @@
+       ;;
+   esac
+   ;;
++*-*-fluxos*)
++  gas=yes
++  gnu_ld=yes
++  use_gcc_stdint=provide
++  default_use_cxa_atexit=yes
++  ;;
+ *-*-netbsd*)
+   tm_p_file="${tm_p_file} netbsd-protos.h"
+   tmake_file="t-netbsd t-slibgcc"
+@@ -1864,6 +1870,9 @@
+ i[34567]86-*-elf*)
+ 	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h newlib-stdint.h i386/i386elf.h"
+ 	;;
++i[34567]86-*-fluxos*)
++	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h glibc-stdint.h i386/i386elf.h fluxos.h"
++	;;
+ x86_64-*-elf*)
+ 	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h newlib-stdint.h i386/i386elf.h i386/x86-64.h"
+ 	;;
+diff -ruN a/libgcc/config.host b/libgcc/config.host
+--- a/libgcc/config.host	2023-07-27 04:13:07.000000000 -0400
++++ b/libgcc/config.host	2026-10-29 16:48:27.551621621 -0400
+@@ -704,6 +704,10 @@
+ i[34567]86-*-elf*)
+ 	tmake_file="$tmake_file i386/t-crtstuff t-crtstuff-pic t-libgcc-pic"
+ 	;;
++i[34567]86-*-fluxos*)
++	extra_parts="crtbegin.o crtend.o"
++	tmake_file="$tmake_file i386/t-crtstuff t-crtstuff-pic t-libgcc-pic"
++	;;
+ x86_64-*-elf* | x86_64-*-rtems*)
+ 	tmake_file="$tmake_file i386/t-crtstuff t-crtstuff-pic t-libgcc-pic"
+ 	case ${host} in
+diff -ruN a/libstdc++-v3/configure b/libstdc++-v3/configure
+--- a/libstdc++-v3/configure	2023-07-27 04:13:08.000000000 -0400
++++ b/libstdc++-v3/configure	2026-10-29 16:48:48.336739345 -0400
+@@ -48035,7 +48035,7 @@
+ 
+   fi
+     ;;
+-  *-linux* | *-uclinux* | *-gnu* | *-kfreebsd*-gnu | *-cygwin* | *-solaris*)
++  *-linux* | *-uclinux* | *-gnu* | *-kfreebsd*-gnu | *-cygwin* | *-solaris* | *-fluxos*)
+ 
+   # All these tests are for C++; save the language and the compiler flags.
+   # The CXXFLAGS thing is suspicious, but based on similar bits previously
+diff -ruN a/libstdc++-v3/crossconfig.m4 b/libstdc++-v3/crossconfig.m4
+--- a/libstdc++-v3/crossconfig.m4	2023-07-27 04:13:08.000000000 -0400
++++ b/libstdc++-v3/crossconfig.m4	2026-10-29 16:48:48.331610307 -0400
+@@ -174,7 +174,7 @@
+ 
+     GCC_CHECK_TLS
+     ;;
+-  *-linux* | *-uclinux* | *-gnu* | *-kfreebsd*-gnu | *-cygwin* | *-solaris*)
++  *-linux* | *-uclinux* | *-gnu* | *-kfreebsd*-gnu | *-cygwin* | *-solaris* | *-fluxos*)
+     GLIBCXX_CHECK_COMPILER_FEATURES
+     GLIBCXX_CHECK_LINKER_FEATURES
+     GLIBCXX_CHECK_MATH_SUPPORT
