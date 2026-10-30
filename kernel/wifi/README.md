@@ -30,7 +30,10 @@ WPA2, DHCP, reconnect, and failure recovery. Host tests and ordinary QEMU
 network devices cannot validate AX210 register or firmware behavior.
 
 Current limits: passive scanning while idle, legacy 2.4/5 GHz frames,
-no DFS transmission, no HT aggregation, and no suspend/resume integration.
+no HT aggregation, and no suspend/resume integration. On passive-only and
+DFS channels (in the world domain, all of 5 GHz) it joins an AP the scan
+heard but never initiates transmission itself; the firmware waits to
+receive there before it sends.
 Firmware crashes require a reboot. Failed DMA-stop acknowledgement retains
 buffers until reboot. This implementation must not be described as proven
 working connectivity until tested on hardware.

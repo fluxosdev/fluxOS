@@ -9,6 +9,8 @@ static uint8_t last_frame[2048], last_cmd[28];
 static uint32_t last_len;
 static struct iwl_scan_req_umac_v17 scan_command;
 int iwl_trans_rfkill(void) { return 0; }
+int iwl_chan_index(int channel, int band)
+{ return band == BAND_2GHZ ? channel - 1 : channel == 36 ? 14 : channel == 52 ? 18 : -1; }
 int iwl_chan_from_index(int idx, int *band)
 { *band = idx < 14 ? BAND_2GHZ : BAND_5GHZ; return idx < 14 ? idx + 1 : 36; }
 int iwl_send_cmd(uint8_t g, uint8_t c, const void *p, uint32_t n,
@@ -70,6 +72,12 @@ int main(void)
     CHECK(scan()==-EBUSY);
     st.scanning=0;
     rx_test(); tx_test();
+    /* Passive-only and radar channels can be joined; invalid ones cannot. */
+    iwl_have_chan_flags=1; iwl_chan_flags[18]=NVM_VALID|NVM_RADAR;
+    CHECK(channel_joinable(1,BAND_2GHZ) && channel_joinable(36,BAND_5GHZ));
+    CHECK(channel_joinable(52,BAND_5GHZ));
+    CHECK(!channel_joinable(2,BAND_2GHZ) && !channel_joinable(165,BAND_5GHZ));
+    iwl_have_chan_flags=0; CHECK(!channel_joinable(1,BAND_2GHZ));
     uint8_t packet[64]={0}; struct iwl_rx_packet *p=(void*)packet;
     p->cmd=0x1c; p->len_n_flags=4+47; p->data[0]=1;
     iwl_sta_rx(p); CHECK(reclaimed==0);

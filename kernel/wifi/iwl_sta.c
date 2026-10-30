@@ -182,13 +182,20 @@ static int scan(void)
     if (r < 0) st.scanning = 0;
     return r;
 }
+/* A station may join an AP on a passive-only (no initiated radiation) or
+ * radar channel, as Linux does: the scan heard the AP there, and the
+ * firmware holds transmission on such a channel until it receives on it.
+ * In the world domain that is all of 5 GHz and 2.4 GHz channels 12-13. */
+static int channel_joinable(int channel, int band)
+{
+    int idx = iwl_chan_index(channel, band);
+    return iwl_have_chan_flags && idx >= 0 && (iwl_chan_flags[idx] & NVM_VALID);
+}
 static int join(const struct wifi_bss *b)
 {
     if (!st.ready || iwl.dead || st.scanning || iwl_trans_rfkill()) return -ENETDOWN;
-    int idx = iwl_chan_index(b->channel, b->band);
-    if (!iwl_have_chan_flags || idx < 0 || !(iwl_chan_flags[idx] & NVM_VALID) ||
-        !(iwl_chan_flags[idx] & NVM_ACTIVE) || (iwl_chan_flags[idx] & NVM_RADAR)) {
-        strlcpy(hw.error, "channel not permitted for transmission", sizeof(hw.error));
+    if (!channel_joinable(b->channel, b->band)) {
+        strlcpy(hw.error, "channel not available in this regulatory domain", sizeof(hw.error));
         return -EINVAL;
     }
     if (st.phy || st.sta) leave();
