@@ -27,6 +27,10 @@ int usbinfo(int index, struct usbinfo *ui); /* the index-th USB device plugged i
  * or BRIGHTNESS_DOWN; returns the percentage set). See <flux/abi.h>. */
 int power(int op, unsigned int arg);
 
+/* Wireless networking: op is WIFI_STATUS, WIFI_SCAN, WIFI_BSS, WIFI_CONNECT or
+ * WIFI_DISCONNECT, with the struct each takes (see <flux/abi.h>). */
+int wifi(int op, void *arg);
+
 /* Pseudo-terminal: fds[0] is the master, fds[1] the slave (a terminal). */
 int openpty(int fds[2]);
 

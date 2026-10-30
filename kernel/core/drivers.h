@@ -178,6 +178,11 @@ void usb_suspend(void);
 void usb_resume(void);
 int usbmsc_in_use(void);                /* a USB disk has a file system mounted */
 
+/* Wireless networking (kernel/wifi): the station layer and Intel's AX210 */
+int iwl_probe(void);                    /* from net_init: 0 if a card was found */
+void wifi_start(void);                  /* after the scheduler: the card's thread */
+int wifi_syscall(uint32_t op, uint32_t arg);   /* SYS_wifi; arg checked by it */
+
 /*
  * Input events for the desktop (/dev/input). While that device is open,
  * the keyboard reports there instead of typing on the console.

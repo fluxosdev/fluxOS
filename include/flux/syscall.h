@@ -105,8 +105,9 @@ extern "C" {
 #define SYS_sigaltstack 93  /* const struct flux_stack *ss, struct flux_stack *old */
 #define SYS_setsid      94
 #define SYS_getsid      95  /* pid */
+#define SYS_wifi        96  /* WIFI_* op, arg */
 
-#define NSYSCALLS       96
+#define NSYSCALLS       97
 
 #ifdef __cplusplus
 }

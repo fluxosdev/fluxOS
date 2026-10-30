@@ -974,6 +974,62 @@ struct powerinfo {
     struct battery_info bat[MAX_BATTERIES];
 };
 
+/* ---- wireless networking (SYS_wifi) ---- */
+#define WIFI_STATUS     0       /* arg: struct wifi_status * to fill */
+#define WIFI_SCAN       1       /* start a scan; wifi_status.scans counts finished ones */
+#define WIFI_BSS        2       /* arg: struct wifi_bss_info *, .index set: that network; -ENOENT past the last */
+#define WIFI_CONNECT    3       /* arg: const struct wifi_connect *; wifi_status follows the attempt */
+#define WIFI_DISCONNECT 4       /* and forget the network: no reconnecting */
+
+#define WIFI_ST_NONE       0    /* no wireless card */
+#define WIFI_ST_STARTING   1    /* loading its firmware */
+#define WIFI_ST_FAILED     2    /* the card could not be started: see error */
+#define WIFI_ST_IDLE       3
+#define WIFI_ST_SCANNING   4
+#define WIFI_ST_CONNECTING 5    /* authenticating, associating, the key handshake */
+#define WIFI_ST_CONNECTED  6
+
+#define WIFI_SEC_OPEN      0
+#define WIFI_SEC_WPA2_PSK  1
+#define WIFI_SEC_OTHER     2    /* something we cannot join (WPA3-only, Enterprise, WEP...) */
+
+struct wifi_status {
+    uint32_t state;             /* WIFI_ST_* */
+    uint32_t scans;             /* scans finished since boot */
+    char     driver[32];
+    char     firmware[48];
+    uint8_t  mac[6];
+    uint8_t  bssid[6];          /* the network (being) joined */
+    char     ssid[33];
+    uint8_t  channel;
+    int8_t   rssi;              /* dBm */
+    uint8_t  security;          /* WIFI_SEC_* */
+    uint16_t freq;              /* MHz */
+    uint16_t reserved;
+    char     error[64];         /* why the last connection or start failed */
+};
+
+struct wifi_bss_info {
+    uint32_t index;             /* in: which one */
+    uint8_t  bssid[6];
+    uint8_t  ssid_len;
+    uint8_t  channel;
+    char     ssid[33];
+    int8_t   rssi;              /* dBm */
+    uint8_t  security;          /* WIFI_SEC_* */
+    uint8_t  reserved;
+    uint16_t freq;              /* MHz */
+    uint32_t age_ms;            /* since it was last heard */
+};
+
+struct wifi_connect {
+    char     ssid[32];
+    uint8_t  ssid_len;
+    uint8_t  has_psk;           /* 0: an open network */
+    uint8_t  bssid[6];          /* all zero: whichever access point is best */
+    uint8_t  psk[32];           /* PBKDF2-SHA1(passphrase, ssid, 4096): see pbkdf2_sha1() */
+};
+
 /* timer frequency; SYS_uptime reports milliseconds */
 #define HZ 100
 

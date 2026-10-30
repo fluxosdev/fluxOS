@@ -192,6 +192,7 @@ void kmain(uint32_t magic, struct multiboot_info *mbi)
     blk_start_flusher();
     floppy_start();
     usb_start();
+    wifi_start();
     automount_start();
     acpi_power_start();
     smp_start();

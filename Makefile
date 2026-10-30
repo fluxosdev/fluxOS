@@ -68,7 +68,7 @@ CFLAGS_COMMON := -m32 -march=pentium4 -std=gnu11 -O2 -g \
 # user processes (fpu.c switches them lazily); kernel/core/sse.S borrows the SSE
 # registers for bulk copies, saving what it touches.
 KERNEL_CFLAGS := $(CFLAGS_COMMON) -mgeneral-regs-only -fno-omit-frame-pointer \
-	-Iinclude -Ikernel/include -Ikernel/core -Ikernel/fs -Ikernel/net -Ikernel/usb -Ikernel/input -Ikernel/storage -Ikernel/sound -Ikernel/video -Ikernel/acpi
+	-Iinclude -Ikernel/include -Ikernel/core -Ikernel/fs -Ikernel/net -Ikernel/usb -Ikernel/input -Ikernel/storage -Ikernel/sound -Ikernel/video -Ikernel/acpi -Ikernel/wifi
 # User code does all its float and double arithmetic on SSE2 (the x87 is
 # left to long double) and may use the SSE2 intrinsics.
 USER_CFLAGS   := $(CFLAGS_COMMON) -mfpmath=sse -fno-math-errno -Iinclude -Iuser/include
@@ -91,7 +91,7 @@ UACPI_SRCS := $(wildcard $(UACPI_DIR)/source/*.c)
 UACPI_FLAGS := -I$(UACPI_DIR)/include -include kernel/acpi/uacpi_flux.h
 
 KERNEL_SRCS := $(wildcard kernel/*/*.S kernel/*/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c \
-               lib/sha256.c lib/logo.c user/desktop/shell/font_archivo.c $(UACPI_SRCS)
+               lib/sha256.c lib/sha1.c lib/aes.c lib/logo.c user/desktop/shell/font_archivo.c $(UACPI_SRCS)
 KERNEL_OBJS := $(patsubst %,$(BUILD)/k/%.o,$(basename $(KERNEL_SRCS)))
 UACPI_OBJS := $(patsubst %,$(BUILD)/k/%.o,$(basename $(UACPI_SRCS) $(wildcard kernel/acpi/*.c)))
 $(UACPI_OBJS): KERNEL_CFLAGS += $(UACPI_FLAGS)
@@ -118,7 +118,7 @@ $(BUILD)/u/user/libc/brdecode.o: USER_CFLAGS += -I$(BROTLI_DIR)/c/include
 $(LIBFONT): $(FONT_OBJS)
 	$(AR) rcs $@ $^
 
-LIBC_SRCS := $(wildcard user/libc/*.c) $(BROTLI_SRCS) $(MBEDTLS_SRCS) lib/string.c lib/font8x16.c lib/sha256.c lib/digest.c lib/logo.c
+LIBC_SRCS := $(wildcard user/libc/*.c) $(BROTLI_SRCS) $(MBEDTLS_SRCS) lib/string.c lib/font8x16.c lib/sha256.c lib/sha1.c lib/digest.c lib/logo.c
 LIBC_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(LIBC_SRCS)))
 CRT0      := $(BUILD)/u/user/libc/crt0.o
 LIBC      := $(BUILD)/libc.a
@@ -239,7 +239,14 @@ PORTS_FILES := $(wildcard $(PORTS_ROOT)/usr/bin/*)
 NATIVE_ROOT := $(BUILD)/toolchain/native/root
 NATIVE_FILES := $(wildcard $(NATIVE_ROOT)/usr/bin/gcc)
 
-$(SYSTEM): $(BUILD)/.rootfs-stamp $(BINS) $(PORTS_FILES) $(NATIVE_FILES) $(if $(NATIVE_FILES),$(SYSROOT_STAMP),)
+# The AX210's firmware, which the wireless driver reads from /lib/firmware.
+IWL_FIRMWARE := $(wildcard firmware/iwlwifi/*.ucode firmware/iwlwifi/*.pnvm)
+IWL_FIRMWARE_DEST := $(addprefix $(ROOTFS)/lib/firmware/,$(notdir $(IWL_FIRMWARE)))
+$(ROOTFS)/lib/firmware/%: firmware/iwlwifi/% $(BUILD)/.rootfs-stamp
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+$(SYSTEM): $(BUILD)/.rootfs-stamp $(BINS) $(IWL_FIRMWARE_DEST) $(PORTS_FILES) $(NATIVE_FILES) $(if $(NATIVE_FILES),$(SYSROOT_STAMP),)
 	cp $(ROOTFS)/bin/fsh $(ROOTFS)/bin/sh
 	chmod 755 $(ROOTFS)/home/flux/demo.sh
 	tar --format=ustar --owner=0 --group=0 --numeric-owner -cf $@ -C $(ROOTFS) . \
@@ -522,7 +529,7 @@ $(BUILD)/tests/libc-guest: $(BUILD)/tests/libc-guest.o $(CRT0) $(LIBC) user/user
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 
 # Host regression tests use production kernel code with mocked hardware/I/O.
-KERNEL_TEST_NAMES := heap pmm pipe socket storage syscall block sched signal
+KERNEL_TEST_NAMES := heap pmm pipe socket storage syscall block sched signal wifi iwl-trans iwl-sta
 KERNEL_TEST_BINS := $(addprefix $(BUILD)/tests/kernel-,$(KERNEL_TEST_NAMES))
 .PHONY: test-kernel
 test-kernel: $(KERNEL_TEST_BINS)
@@ -534,7 +541,7 @@ $(BUILD)/tests/kernel-%: tests/kernel-%.c tests/kernel-test.h tests/kernel-readc
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(KERNEL_TEST_FLAGS) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter \
 		-Wno-int-to-pointer-cast -Wno-pointer-to-int-cast -ffunction-sections -fdata-sections \
-		-Iinclude -Ikernel/core -Ikernel/fs -Ikernel/net -Ikernel/usb -Ikernel/input -Ikernel/storage -Ikernel/sound -Ikernel/video $< tests/kernel-readcache-stub.c -Wl,--gc-sections -o $@
+		-Iinclude -Ikernel/core -Ikernel/fs -Ikernel/net -Ikernel/usb -Ikernel/input -Ikernel/storage -Ikernel/sound -Ikernel/video -Ikernel/wifi $< tests/kernel-readcache-stub.c -Wl,--gc-sections -o $@
 
 .PHONY: test-kernel-qemu
 # Override to exercise other core counts, nosmp and maxcpus without touching a real disk.

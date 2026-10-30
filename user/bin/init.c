@@ -74,6 +74,22 @@ static int spawn(const char *path, char *const argv[])
     return pid;
 }
 
+/* Join the remembered wireless network: "wifi auto" only asks the kernel,
+ * which keeps trying in the background, so it is over at once. */
+static void join_wifi(void)
+{
+    if (access("/etc/wifi.conf", F_OK) < 0 || access("/bin/wifi", X_OK) < 0)
+        return;
+    int pid = fork();
+    if (pid == 0) {
+        char *argv[] = { "wifi", "auto", NULL };
+        execve("/bin/wifi", argv, environ);
+        _exit(127);
+    }
+    if (pid > 0)
+        waitpid(pid, NULL, 0);
+}
+
 /* Wait for pid, reaping any orphans that exit meanwhile. */
 static int wait_for(int pid)
 {
@@ -109,6 +125,7 @@ int main(void)
     mkdir("/root", 0700);
 
     int setup = access(SETUP_MARK, F_OK) == 0;
+    join_wifi();
     struct fbinfo fi;
     if (fbinfo(&fi) == 0 && access(DESKTOP, X_OK) == 0) {
         char *argv[] = { "desktop", setup ? "--setup" : NULL, NULL };

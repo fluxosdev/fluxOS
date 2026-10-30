@@ -1485,6 +1485,12 @@ static int sys_usbinfo(uint32_t idx, uint32_t ubuf, uint32_t c, uint32_t d, uint
     return r < 0 ? r : copy_to_user((void *)ubuf, &ui, sizeof(ui));
 }
 
+static int sys_wifi(uint32_t op, uint32_t arg, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    return wifi_syscall(op, arg);
+}
+
 static int sys_power(uint32_t op, uint32_t arg, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)c; (void)d; (void)e;
@@ -1784,6 +1790,7 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_ioctl] = sys_ioctl,
     [SYS_usbinfo] = sys_usbinfo,
     [SYS_power] = sys_power,
+    [SYS_wifi] = sys_wifi,
     [SYS_stime] = sys_stime,
     [SYS_llseek] = sys_llseek,
     [SYS_sigaction] = sys_sigaction,

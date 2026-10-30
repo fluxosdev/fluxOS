@@ -488,6 +488,7 @@ int getmounts(char *buf, unsigned int size) { return ret(sc2(SYS_getmounts, (int
 int blkinfo(int index, struct blkinfo *bi) { return ret(sc2(SYS_blkinfo, index, (int)bi)); }
 int usbinfo(int index, struct usbinfo *ui) { return ret(sc2(SYS_usbinfo, index, (int)ui)); }
 int power(int op, unsigned int arg) { return ret(sc2(SYS_power, op, (int)arg)); }
+int wifi(int op, void *arg) { return ret(sc2(SYS_wifi, op, (int)arg)); }
 
 int poll(struct pollfd *fds, unsigned int nfds, int timeout_ms)
 {
