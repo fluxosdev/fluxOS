@@ -249,15 +249,36 @@ static void toggle_sidebar(void)
     sidebar_show(!sidebar_shown());
 }
 
+/* The window whose taskbar button was right-clicked, while task_ctx is open. */
+static struct window *ctx_task;
+
+static void close_window(struct window *w);
+
+static void close_ctx_task(void)
+{
+    struct window *w = ctx_task;
+    ctx_task = NULL;
+    if (w)
+        close_window(w);
+}
+
 /* What right-clicking the taskbar offers. */
-static const struct ctx_item taskbar_ctx[] = {
-    { "Task Manager", ICON_TASKMGR, open_taskmgr, NULL },
-    { NULL, ICON_NONE, NULL, NULL },
-    { "Show Sidebar", ICON_NONE, toggle_sidebar, sidebar_shown },
-    { NULL, ICON_NONE, NULL, NULL },
-    { "Minimize All Windows", ICON_NONE, minimize_all, NULL },
-    { "Tile Windows Horizontally", ICON_NONE, tile_horizontally, NULL },
+#define TASKBAR_CTX_ITEMS \
+    { "Task Manager", ICON_TASKMGR, open_taskmgr, NULL }, \
+    { NULL, ICON_NONE, NULL, NULL }, \
+    { "Show Sidebar", ICON_NONE, toggle_sidebar, sidebar_shown }, \
+    { NULL, ICON_NONE, NULL, NULL }, \
+    { "Minimize All Windows", ICON_NONE, minimize_all, NULL }, \
+    { "Tile Windows Horizontally", ICON_NONE, tile_horizontally, NULL }, \
     { "Tile Windows Vertically", ICON_NONE, tile_vertically, NULL },
+
+static const struct ctx_item taskbar_ctx[] = { TASKBAR_CTX_ITEMS };
+
+/* ... and on a window's button, closing that window first. */
+static const struct ctx_item task_ctx[] = {
+    { "Close Window", ICON_NONE, close_ctx_task, NULL },
+    { NULL, ICON_NONE, NULL, NULL },
+    TASKBAR_CTX_ITEMS
 };
 
 static const struct ctx_item *ctx_items;
@@ -1834,6 +1855,11 @@ void wm_destroy(struct window *w)
     if (last_caption_win == w)
         last_caption_win = NULL;        /* a new window may come at the same address */
     task_pressed_idx = -1;
+    if (ctx_task == w) {
+        ctx_task = NULL;
+        if (ctx_open && ctx_items == task_ctx)
+            set_ctx(NULL, 0, 0, 0);     /* its Close would have nothing to close */
+    }
     if (focused == w) {
         focused = NULL;
         struct window *next = topmost_visible();
@@ -3000,7 +3026,14 @@ static void press_right(void)
         return;
     }
     if (!modal_window() && drag == DRAG_NONE && rect_contains(taskbar_rect(), mx, my)) {
-        set_ctx(taskbar_ctx, COUNT(taskbar_ctx), mx, my);
+        ctx_task = NULL;
+        for (int i = 0; i < ntasks; i++)
+            if (rect_contains(task_button_rect(i), mx, my))
+                ctx_task = task_order[i];
+        if (ctx_task && !(ctx_task->flags & WF_DESKTOP))
+            set_ctx(task_ctx, COUNT(task_ctx), mx, my);
+        else
+            set_ctx(taskbar_ctx, COUNT(taskbar_ctx), mx, my);
         return;
     }
     if (!setup_mode && !modal_window() && drag == DRAG_NONE && rect_contains(sidebar_rect(), mx, my)) {

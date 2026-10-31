@@ -10,9 +10,10 @@
  * Each of these is a program of its own (launch.c): this one runs as the
  * File Manager (/bin/files) and inside the desktop, whose folder it is.
  * The desktop is a folder window too (files_open_desktop): no frame, the
- * wallpaper behind, a header of Back, Home, Favourites and the mounted
- * disks over a divider,
- * and the folder in tiles (the icon with the name beside it) down columns.
+ * wallpaper behind, a header of Labels, Back, Home, Favourites and the
+ * mounted disks over a divider,
+ * and the folder in tiles down columns: the icon with the name under it,
+ * or beside it once Labels is clicked (kept in ~/.desklabels).
  * It opens on ~/Desktop; Home goes back there, Back to the folders before,
  * and Favourites to the folders kept in ~/.favourites, one per line.
  *
@@ -60,8 +61,10 @@
 #define DIVIDER_Y  (HEAD_Y + HEAD_H + 8)
 #define DIVIDER_H  3
 #define TILES_Y    (DIVIDER_Y + DIVIDER_H + 12)
-#define TILE_W     196
+#define TILE_W     196                  /* a tile with the name beside the icon */
 #define TILE_H     48
+#define GRID_W     96                   /* and with it under the icon */
+#define GRID_H     76
 #define HIST_MAX   32                   /* folders Back remembers */
 #define MAX_FAVS   16
 
@@ -87,12 +90,13 @@ static const struct {
     { "Rename", ICON_NONE },
 };
 
-enum { HB_BACK, HB_HOME, HB_FAVS, NHEAD };
+enum { HB_LABELS, HB_BACK, HB_HOME, HB_FAVS, NHEAD };
 
 static const struct {
     const char *label;
     enum icon_id icon;
 } heads[NHEAD] = {
+    { "Labels", ICON_NONE },            /* drawn by draw_labels_glyph */
     { "Back", ICON_BACK },
     { "Home", ICON_HOME },
     { "Favourites", ICON_STAR },
@@ -152,6 +156,7 @@ struct fm {
 };
 
 static struct fm *fms;
+static int labels_beside;               /* the desktop's names go beside the icons, not under them */
 static int in_desktop;                  /* this is the desktop's process: other folders open in the File Manager */
 
 /* The folder a drag is over: the entry drop_i of window drop_f, or -1 for the window's own. */
@@ -351,6 +356,17 @@ static const struct pfont *tile_font(void)
     return KINETIK ? &font_archivo_title : &font_sans;
 }
 
+/* The desktop's tile, by where its names go. */
+static int tile_w(void)
+{
+    return labels_beside ? TILE_W : GRID_W;
+}
+
+static int tile_h(void)
+{
+    return labels_beside ? TILE_H : GRID_H;
+}
+
 static struct rect view_rect(struct fm *f)
 {
     int w = f->win->content.w, h = f->win->content.h;
@@ -403,7 +419,7 @@ static struct rect sb_rect(struct fm *f)
 
 static int columns(struct fm *f)
 {
-    int c = icon_area(f).w / (f->desk ? TILE_W : CELL_W);
+    int c = icon_area(f).w / (f->desk ? tile_w() : CELL_W);
     return c > 0 ? c : 1;
 }
 
@@ -411,14 +427,14 @@ static int columns(struct fm *f)
  * with more than fit, the columns grow longer and scroll. */
 static int tile_rows(struct fm *f)
 {
-    int fit = icon_area(f).h / TILE_H, need = (f->n + columns(f) - 1) / columns(f);
+    int fit = icon_area(f).h / tile_h(), need = (f->n + columns(f) - 1) / columns(f);
     return fit > need ? fit : need > 0 ? need : 1;
 }
 
 static int content_height(struct fm *f)
 {
     if (f->desk)
-        return tile_rows(f) * TILE_H;
+        return tile_rows(f) * tile_h();
     int rows = (f->n + columns(f) - 1) / columns(f);
     return rows * CELL_H + 8;
 }
@@ -434,7 +450,7 @@ static struct rect cell_rect(struct fm *f, int i)
     struct rect a = icon_area(f);
     if (f->desk) {
         int rows = tile_rows(f);
-        return mkrect(a.x + i / rows * TILE_W, a.y + i % rows * TILE_H - f->scroll, TILE_W, TILE_H);
+        return mkrect(a.x + i / rows * tile_w(), a.y + i % rows * tile_h() - f->scroll, tile_w(), tile_h());
     }
     int cols = columns(f);
     int pad = (a.w - cols * CELL_W) / 2;
@@ -454,8 +470,10 @@ static void shown_name(const struct entry *e, char *out, size_t size)
 static struct rect icon_rect(struct fm *f, int i)
 {
     struct rect c = cell_rect(f, i);
-    if (f->desk)
+    if (f->desk && labels_beside)
         return mkrect(c.x + 4, c.y + (TILE_H - 32) / 2, 32, 32);
+    if (f->desk)
+        return mkrect(c.x + (GRID_W - 32) / 2, c.y + 6, 32, 32);
     return mkrect(c.x + (CELL_W - 32) / 2, c.y + 2, 32, 32);
 }
 
@@ -464,11 +482,17 @@ static struct rect label_rect(struct fm *f, int i, char *label, int size)
     struct rect c = cell_rect(f, i);
     char name[NAME_MAX + 1];
     shown_name(&f->ents[i], name, sizeof(name));
-    if (f->desk) {
+    if (f->desk && labels_beside) {
         const struct pfont *fn = tile_font();
         gfx_ellipsize(fn, name, TILE_W - 4 - 32 - 8 - 12, label, size);
         return mkrect(c.x + 4 + 32 + 6, c.y + (TILE_H - fn->height) / 2 - 1, gfx_text_width(fn, label) + 5,
                       fn->height + 2);
+    }
+    if (f->desk) {
+        const struct pfont *fn = tile_font();
+        gfx_ellipsize(fn, name, GRID_W - 10, label, size);
+        int tw = gfx_text_width(fn, label);
+        return mkrect(c.x + (GRID_W - tw) / 2 - 2, c.y + 6 + 32 + 5, tw + 5, fn->height + 2);
     }
     gfx_ellipsize(&font_sans, name, CELL_W - 6, label, size);
     int tw = gfx_text_width(&font_sans, label);
@@ -790,6 +814,30 @@ static void save_favs(void)
     fclose(fp);
 }
 
+/* Where the desktop's names go: ~/.desklabels says "beside" or "below"; below until it does. */
+static void load_labels(void)
+{
+    char file[PATH_MAX], line[16] = "";
+    snprintf(file, sizeof(file), "%s/.desklabels", home_dir());
+    FILE *fp = fopen(file, "r");
+    if (!fp)
+        return;
+    if (fgets(line, sizeof(line), fp))
+        labels_beside = !strncmp(line, "beside", 6);
+    fclose(fp);
+}
+
+static void save_labels(void)
+{
+    char file[PATH_MAX];
+    snprintf(file, sizeof(file), "%s/.desklabels", home_dir());
+    FILE *fp = fopen(file, "w");
+    if (!fp)
+        return;                         /* the desktop still shows them so until it restarts */
+    fprintf(fp, "%s\n", labels_beside ? "beside" : "below");
+    fclose(fp);
+}
+
 /* Its place among the favourites, or -1. */
 static int fav_index(const char *path)
 {
@@ -915,6 +963,26 @@ static void draw_icon_faded(struct surface *s, int x, int y, enum icon_id icon)
         }
 }
 
+/* The Labels button's icon: a tile laid out as the desktop's are now, white with a shadow
+ * like the header's text. */
+static void draw_labels_glyph(struct surface *s, int x, int y)
+{
+    int rad = KINETIK ? 3 : 0;
+    for (int sh = 1; sh >= 0; sh--) {
+        color_t c = sh ? ARGB(0xC0, 0x000000) : ARGB(0xFF, 0xFFFFFF);
+        int ox = x + sh, oy = y + sh;
+        if (labels_beside) {
+            gfx_round_fill(s, mkrect(ox + 2, oy + 9, 14, 14), rad, rad, c);
+            gfx_round_fill(s, mkrect(ox + 19, oy + 11, 11, 4), 1, 1, c);
+            gfx_round_fill(s, mkrect(ox + 19, oy + 17, 7, 4), 1, 1, c);
+        } else {
+            gfx_round_fill(s, mkrect(ox + 9, oy + 3, 14, 14), rad, rad, c);
+            gfx_round_fill(s, mkrect(ox + 5, oy + 20, 22, 4), 1, 1, c);
+            gfx_round_fill(s, mkrect(ox + 9, oy + 26, 14, 4), 1, 1, c);
+        }
+    }
+}
+
 /* The desktop: the wallpaper (the window is where the screen's (0, 0) is, so it lines up
  * with what is round it), the header and its divider, the tiles. */
 static void paint_desk(struct fm *f)
@@ -936,7 +1004,9 @@ static void paint_desk(struct fm *f)
             gfx_round_frame(s, r, KINETIK ? 6 : 0, KINETIK ? 6 : 0, ARGB(0xA0, 0xFFFFFF));
         }
         int ix = r.x + 8, iy = r.y + (r.h - 32) / 2;
-        if (off)
+        if (i == HB_LABELS)
+            draw_labels_glyph(s, ix, iy);
+        else if (off)
             draw_icon_faded(s, ix, iy, head_icon(i));
         else
             draw_icon(s, ix, iy, head_icon(i), 32);
@@ -1718,6 +1788,13 @@ static void open_favs(struct fm *f)
 static void head_action(struct fm *f, int i)
 {
     switch (i) {
+    case HB_LABELS:
+        labels_beside = !labels_beside;
+        save_labels();
+        set_scroll(f, f->scroll);       /* the tiles' columns are another length now */
+        show_selection(f);
+        paint(f);
+        break;
     case HB_BACK: go_back(f); break;
     case HB_HOME: navigate(f, desktop_dir()); break;
     case HB_FAVS: open_favs(f); paint(f); break;
@@ -2256,6 +2333,7 @@ struct window *files_open_desktop(void)
     if (!f)
         return NULL;
     in_desktop = 1;
+    load_labels();
     f->desk = 1;
     f->sel = -1;
     f->last_click = -1;
