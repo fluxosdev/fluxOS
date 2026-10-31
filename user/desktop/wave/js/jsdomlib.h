@@ -22,6 +22,8 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
   var NP = Node.prototype, EP = HTMLElement.prototype, DP = Document.prototype;
   function getter(o, k, f) { Object.defineProperty(o, k, { get: f, configurable: true, enumerable: false }); }
 
+  /* Message tasks stay responsive while hidden; worker scopes use their ordinary task timer. */
+  var queueMessageTask=g["%queueTask"] || function(fn){setTimeout(fn,0);};
   /* ---- MessageChannel, BroadcastChannel (within the page), XMLSerializer, Path2D, ImageData ---- */
   class MessagePort extends EventTarget {
     constructor() {
@@ -34,7 +36,7 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
       var o = this._other;
       if (!o || this._closed) return;
       var copy = structuredClone(data,{transfer:transfer && transfer.transfer || transfer || []});
-      setTimeout(function () {
+      queueMessageTask(function () {
         if (o._closed) return;
         var e = new MessageEvent("message", { data: copy });
         o.dispatchEvent(e);
@@ -69,7 +71,7 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
       if(g["%broadcast"])g["%broadcast"](this.name,g["%serialize"](data));
       channels.slice().forEach(function (c) {
         if (c === self || c._closed || c.name !== self.name) return;
-        setTimeout(function () {
+        queueMessageTask(function () {
           if (!c._closed) c.dispatchEvent(new MessageEvent("message", { data: copy }));
         }, 0);
       });

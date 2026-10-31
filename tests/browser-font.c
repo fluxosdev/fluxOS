@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "web.h"
 #define CHECK(x)                                                                                             \
     do {                                                                                                     \
@@ -15,6 +16,19 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "reject"))
         return rc < 0 ? 0 : 1;
     CHECK(rc == 0);
+    if(argc>1 && !strcmp(argv[1],"bench")) {
+        const struct wfont *font=wfont_get(FAM_SANS,0,0,16);
+        const char *words[]={"Navigation", "Settings", "Browser performance", "Repeated text measurement", "\xd8\xa8\xd8\xa8", "\xd7\x90\xd7\x91 12"};
+        struct timespec begin,end;clock_gettime(CLOCK_MONOTONIC,&begin);
+        unsigned long sum=0;
+        for(int i=0;i<250000;i++) {
+            const char *word=words[i%6];sum+=(unsigned)wfont_width(font,word,(int)strlen(word));
+        }
+        clock_gettime(CLOCK_MONOTONIC,&end);
+        double ms=(end.tv_sec-begin.tv_sec)*1000.0+(end.tv_nsec-begin.tv_nsec)/1e6;
+        printf("text benchmark: 250000 widths, %.3f ms, checksum %lu, cache hits %llu\n",ms,sum,
+            (unsigned long long)web_perf.events[WP_WIDTH_HIT]);return 0;
+    }
     if(argc>2 && !strcmp(argv[1],"download")){
         FILE *file=fopen(argv[2],"rb");CHECK(file);CHECK(!fseek(file,0,SEEK_END));long len=ftell(file);CHECK(len>0&&len<(8<<20));rewind(file);
         unsigned char *bytes=malloc((size_t)len);CHECK(bytes&&fread(bytes,1,(size_t)len,file)==(size_t)len);fclose(file);
@@ -27,10 +41,20 @@ int main(int argc, char **argv)
         CHECK(wfont_register(bytes,(size_t)len,family,1,0)==family);
         CHECK(wfont_register((const unsigned char *)"broken",6,-1,0,0)<0);
         CHECK(wfont_register(bytes,12,-1,0,0)<0);
-        wfont_release(family);free(bytes);puts("browser fonts: scalable font parsing, metrics, kerning and rendering passed");return 0;
+        wfont_release(family);
+        int replacement=wfont_register(bytes,(size_t)len,-1,0,0);CHECK(replacement>=3);
+        const struct wfont *fresh=wfont_get(replacement,0,0,17);CHECK(fresh);
+        CHECK(wfont_width(fresh,"AVATAR Hello",12)==wfont_draw(&surface,fresh,0,0,"AVATAR Hello",12,0xffffff));
+        CHECK(wfont_width(fresh,"AVATAR Hello",12)<width);
+        wfont_release(replacement);free(bytes);puts("browser fonts: scalable font parsing, metrics, kerning, cache lifetime and rendering passed");return 0;
     }
     const struct wfont *f = wfont_get(FAM_SANS, 0, 0, 16);
     CHECK(f);
+    int cached=wfont_width(f,"cached width",12);
+    uint64_t width_hits=web_perf.events[WP_WIDTH_HIT];
+    CHECK(wfont_width(f,"cached width",12)==cached && web_perf.events[WP_WIDTH_HIT]>width_hits);
+    char mutable[16]="W";int one=wfont_width(f,mutable,1);strcpy(mutable,"WWWW");
+    CHECK(wfont_width(f,mutable,4)>=one*3);
     CHECK(wfont_width(f, "Ж", 2) > wfont_width(f, "?", 1));
     unsigned int pixels[300 * 80] = {0}, before[300 * 80];
     struct surface surface = {0};
@@ -38,6 +62,9 @@ int main(int argc, char **argv)
     surface.stride = 300;
     surface.clip = (struct rect){0, 0, 300, 80};
     wfont_draw(&surface, f, 0, 0, "αЖé", 6, 0xffffff);
+    uint64_t shape_hits=web_perf.events[WP_SHAPE_HIT];
+    wfont_draw(&surface, f, 0, 0, "αЖé", 6, 0xffffff);
+    CHECK(web_perf.events[WP_SHAPE_HIT]>shape_hits);
     memcpy(before, pixels, sizeof(pixels));
     memset(pixels, 0, sizeof(pixels));
     wfont_draw(&surface, f, 0, 0, "???", 3, 0xffffff);

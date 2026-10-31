@@ -46,7 +46,8 @@
 struct timer {
     int id;
     int active;
-    unsigned int due;
+    unsigned int due, scheduled;
+    int frame;                         /* animation callbacks pause while hidden */
     int interval;                       /* ms; 0 for a one-shot timer */
     jsval fn;                           /* a function, or a string to evaluate */
     jsval args[4];
@@ -90,6 +91,7 @@ struct jsdom {
     int dirty;
     int repaint;                        /* pixels changed (a canvas): paint again, no layout */
     int hidden;                         /* the window is minimized: document.hidden */
+    unsigned hidden_at;
     int loaded;
     int depth;                          /* nested entries from the browser */
     char cookies[2048];
@@ -171,6 +173,17 @@ static void settle(struct jsdom *d)
         if (d->h.repaint)
             d->h.repaint(d->h.ctx);
     }
+}
+
+/* Publish mutations before a synchronous read. The host can then skip clean flushes. */
+static void flush_layout(struct jsdom *d)
+{
+    if(!d->h.flush)return;
+    if(d->dirty) {
+        d->dirty=0;d->repaint=0;
+        if(d->h.changed)d->h.changed(d->h.ctx);
+    }
+    d->h.flush(d->h.ctx);
 }
 
 void jsdom_canvas_dirty(struct js *J)
@@ -1279,6 +1292,7 @@ static const char *control_value(struct node *n)
 static jsval rect_object(struct jsdom *d, struct node *n)
 {
     struct js *J = d->J;
+    flush_layout(d);
     int x = 0, y = 0, w = 0, h = 0, sx = 0, sy = 0;
     if (d->h.node_visual_box)
         d->h.node_visual_box(d->h.ctx, n, &x, &y, &w, &h);
@@ -1512,10 +1526,7 @@ static int node_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
     if (IS("offsetWidth") || IS("offsetHeight") || IS("clientWidth") || IS("clientHeight") ||
         IS("offsetTop") || IS("offsetLeft") || IS("scrollWidth") || IS("scrollHeight")) {
         int x = 0, y = 0, w = 0, h = 0;
-        if (d->dirty && d->h.flush && (IS("scrollWidth") || IS("scrollHeight"))) {   /* content was just added: how big now? */
-            d->dirty = 0;
-            d->h.flush(d->h.ctx);
-        }
+        flush_layout(d);
         if (d->h.node_box)
             d->h.node_box(d->h.ctx, n, &x, &y, &w, &h);
         int ssx, ssy, scw, sch, svw, svh;
@@ -1534,10 +1545,7 @@ static int node_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
             if (d->h.scroll_pos)
                 d->h.scroll_pos(d->h.ctx, &sx, &sy);
         } else if (d->h.node_scroll) {
-            if (d->dirty && d->h.flush) {
-                d->dirty = 0;
-                d->h.flush(d->h.ctx);
-            }
+            flush_layout(d);
             d->h.node_scroll(d->h.ctx, n, 0, &sx, &sy, &cw, &ch, &vw, &vh);
         }
         *out = js_num(IS("scrollTop") ? sy : sx);
@@ -1753,10 +1761,7 @@ static int node_set(struct js *J, struct jsobj *o, const char *key, jsval v)
             d->h.scroll(d->h.ctx, IS("scrollLeft") ? (int)p : sx, IS("scrollTop") ? (int)p : sy, 0);
         } else if (d->h.node_scroll) {
             int cw, ch, vw, vh;
-            if (d->dirty && d->h.flush) {
-                d->dirty = 0;
-                d->h.flush(d->h.ctx);
-            }
+            flush_layout(d);
             sx = n->scroll_x, sy = n->scroll_y;
             d->h.node_scroll(d->h.ctx, n, 0, &sx, &sy, &cw, &ch, &vw, &vh);
             if (IS("scrollLeft"))
@@ -1985,6 +1990,7 @@ static int computed_get(struct js *J, struct jsobj *o, const char *key, jsval *o
 {
     struct node *n = o->hdata;
     struct jsdom *d = dom(J);
+    flush_layout(d);
     const struct style *st = n->style;
     char b[512];
     if (!strcmp(key,"transform") || !strcmp(key,"transformOrigin") || !strcmp(key,"transform-origin")) {
@@ -2841,8 +2847,7 @@ static void open_focus(struct jsdom *d, struct node *n, int dialog)
     struct js *J = d->J;
     jsval w = wrap(d, n);
     js_put(J, w.u.o, S(J, "__prevFocus"), d->active ? wrap(d, d->active) : js_null, 0);
-    if (d->h.flush)
-        d->h.flush(d->h.ctx);           /* styled now: what was display: none can be focused */
+    flush_layout(d);                    /* styled now: what was display: none can be focused */
     struct node *f = focus_delegate(n, !dialog);
     if (f)
         jsdom_focus(d, f);
@@ -4843,7 +4848,8 @@ static int add_timer(struct jsdom *d, jsval f, int ms, int repeat, jsval *extra,
             ms = 10;
         t->active = 1;
         t->id = ++d->next_timer_id;
-        t->due = uptime_ms() + (unsigned)ms;
+        t->scheduled=uptime_ms();t->frame=0;
+        t->due = t->scheduled + (unsigned)ms;
         t->interval = repeat ? ms : 0;
         t->fn = f;
         t->nargs = nextra < 4 ? nextra : 4;
@@ -4878,11 +4884,22 @@ static jsval win_set_interval(struct js *J, jsval self, jsval *args, int argc)
     return set_timer(J, args, argc, 1);
 }
 
+static jsval win_queue_task(struct js *J,jsval self,jsval *args,int argc)
+{
+    (void)self;
+    if(!js_is_callable(ARG(0)))return js_throw_error(J,"TypeError: task is not callable");
+    struct jsdom *d=dom(J);int id=add_timer(d,ARG(0),0,0,NULL,0);
+    for(int i=0;i<MAX_TIMERS;i++)if(d->timers[i].active && d->timers[i].id==id)d->timers[i].frame=-1;
+    return js_num(id);
+}
+
 static jsval win_request_frame(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
-    jsval now = js_num(uptime_ms());
-    return js_num(add_timer(dom(J), ARG(0), 33, 0, &now, 1));
+    struct jsdom *d=dom(J);
+    int id=add_timer(d,ARG(0),33,0,NULL,0);
+    for(int i=0;i<MAX_TIMERS;i++)if(d->timers[i].active && d->timers[i].id==id)d->timers[i].frame=1;
+    return js_num(id);
 }
 
 static jsval win_clear_timer(struct js *J, jsval self, jsval *args, int argc)
@@ -5216,6 +5233,7 @@ void jsdom_page_event(struct jsdom *d, const char *type, int hidden)
     if (!strcmp(type, "visibilitychange")) {
         if (d->hidden != hidden) {
             d->hidden = hidden;
+            if(hidden)d->hidden_at=uptime_ms();
             jsval ev = new_event(d, type, js_obj(d->document));
             js_set(J, ev, "bubbles", js_bool(1));
             js_set(J, ev, "cancelable", js_bool(0));
@@ -6959,7 +6977,7 @@ struct jsdom *jsdom_new(const struct jshost *host)
         { "alert", win_alert, 1 }, { "confirm", win_confirm, 1 }, { "prompt", win_prompt, 2 },
         { "setTimeout", win_set_timeout, 2 }, { "setInterval", win_set_interval, 2 },
         { "clearTimeout", win_clear_timer, 1 }, { "clearInterval", win_clear_timer, 1 },
-        { "requestAnimationFrame", win_request_frame, 1 }, { "cancelAnimationFrame", win_clear_timer, 1 },
+        { "%queueTask", win_queue_task, 1 }, { "requestAnimationFrame", win_request_frame, 1 }, { "cancelAnimationFrame", win_clear_timer, 1 },
         { "scrollTo", win_scroll_to, 2 }, { "scroll", win_scroll_to, 2 }, { "scrollBy", win_scroll_by, 2 },
         { "getComputedStyle", win_get_computed_style, 1 }, { "matchMedia", win_match_media, 1 },
         { "open", win_open, 2 }, { "close", win_close, 0 }, { "focus", nothing, 0 }, { "blur", nothing, 0 },
@@ -7303,6 +7321,7 @@ void jsdom_run_script(struct jsdom *d, struct node *script, const char *text, in
     const char *src=script?node_attr(script,"src"):NULL;
     char target[URL_MAX];if(src)url_resolve(d->h.base,src,target,sizeof(target));
     if((d->h.sandbox&WEB_SB_SCRIPTS) || !web_csp_allows(d->h.csp,d->h.url,"script-src-elem",src?target:NULL,script?node_attr(script,"nonce"):NULL))return;
+    uint64_t profile_start=web_perf_start();
     struct node *saved = d->current_script, *saved_after = d->write_after;
     d->current_script = script;
     d->write_after = NULL;
@@ -7313,6 +7332,7 @@ void jsdom_run_script(struct jsdom *d, struct node *script, const char *text, in
     d->current_script = saved;
     d->write_after = saved_after;
     settle(d);
+    web_perf_end(WP_SCRIPT,profile_start);
 }
 
 void jsdom_loaded(struct jsdom *d)
@@ -7331,26 +7351,42 @@ void jsdom_loaded(struct jsdom *d)
     settle(d);
 }
 
+/* One-second floor for hidden page timers; networking/messages remain independent. */
+static int timer_wait(struct jsdom *d,const struct timer *t,unsigned now)
+{
+    if(d->hidden && t->frame>0)return -1;
+    int wait=(int)(t->due-now);
+    if(d->hidden && t->frame==0) {
+        unsigned base=(int)(t->scheduled-d->hidden_at)>0?t->scheduled:d->hidden_at;
+        int floor=(int)(base+1000-now);
+        if(floor>wait)wait=floor;
+    }
+    return wait>0?wait:0;
+}
+
 void jsdom_run_timers(struct jsdom *d)
 {
     if (!d)
         return;
+    uint64_t profile_start=web_perf_start();
     jsnet_poll(d->network);
     jsworkers_poll(d->workers);
     process_view(d);
     run_queued(d);
     deliver_posted(d);
     unsigned int now = uptime_ms();
-    int ran = 0;
+    int ran = 0, cutoff=d->next_timer_id;
     for (int i = 0; i < MAX_TIMERS && ran < 32; i++) {
         struct timer *t = &d->timers[i];
-        if (!t->active || (int)(now - t->due) < 0)
+        if (!t->active || t->id>cutoff || timer_wait(d,t,now)!=0)
             continue;
         ran++;
         jsval f = t->fn;
         jsval args[4];
         int nargs = t->nargs;
         memcpy(args, t->args, sizeof(args));
+        if(t->frame>0){args[0]=js_num(now);nargs=1;}
+        t->scheduled=now;
         if (t->interval)
             t->due = now + (unsigned)t->interval;
         else
@@ -7367,6 +7403,7 @@ void jsdom_run_timers(struct jsdom *d)
         d->depth--;
     }
     settle(d);
+    web_perf_end(WP_SCRIPT,profile_start);
 }
 
 int jsdom_next_timer(struct jsdom *d)
@@ -7383,9 +7420,8 @@ int jsdom_next_timer(struct jsdom *d)
         struct timer *t = &d->timers[i];
         if (!t->active)
             continue;
-        int wait = (int)(t->due - now);
-        if (wait < 0)
-            wait = 0;
+        int wait=timer_wait(d,t,now);
+        if(wait<0)continue;
         if (best < 0 || wait < best)
             best = wait;
     }

@@ -43,6 +43,8 @@ struct page {
     struct node *root;
     struct arena a, sa, la;
     struct layout lo;
+    struct sheet *sheets[4];
+    int nsheets;
 };
 
 /* Pictures the engine would have fetched: every background picture and <img> is this 40x20 one. */
@@ -57,11 +59,12 @@ static void load(struct page *p, const char *html, int vw, int vh)
     struct node *root = p->root = html_parse(&p->a, html, (int)strlen(html));
     if (before_style)
         before_style(root);
-    struct sheet *sheets[4];
+    struct sheet **sheets=p->sheets;
     int ns = 0;
     for (struct node *n = root; n; n = node_next(n, root))
         if (n->type == N_ELEMENT && n->tag == T_STYLE && n->first && ns < 4)
             sheets[ns++] = css_parse(&p->a, n->first->text, n->first->len, vw);
+    p->nsheets=ns;
     css_viewport_h = vh;
     /* as browser.c does: styled again while container queries see new container sizes */
     for (int round = 0; round < 3; round++) {
@@ -284,6 +287,47 @@ static void opacity_pixels(void)
     CHECK((pixels[3]&0xff00)>=0x7f00 && (pixels[3]&0xff00)<=0x8000 && (pixels[3]&255)==255);
     unload(&p);
 
+}
+
+/* Background-only invalidation must render identically to rebuilding the display list. */
+static void paint_only_restyle(void)
+{
+    const char *fixtures[]={
+        "<style>body{margin:0}#box{width:8px;height:8px;background:red}#box:hover{background:blue}</style><div id=box></div>",
+        "<style>body{margin:0}#box{width:8px;height:8px;background:red;border:1px solid black;border-radius:3px}#box:hover{background:transparent}</style><div id=box></div>",
+        "<style>body{margin:0}#box{width:8px;height:8px;background:red;opacity:.5}#box:hover{background:blue}</style><div id=box></div>",
+        "<style>body{margin:0}#box{width:8px;height:8px;background:red;transition:background-color 1s linear}#box:hover{background:blue}</style><div id=box></div>"};
+    for(unsigned k=0;k<sizeof(fixtures)/sizeof(fixtures[0]);k++) {
+        css_hover_node=NULL;anim_now=1000;
+        struct page p;load(&p,fixtures[k],16,16);
+        struct node *box=node_find(p.root,T_DIV);
+        css_hover_node=box;
+        CHECK(css_restyle_dynamic(&p.sa,p.root,p.sheets,p.nsheets,16,16,NULL,NULL)>0);
+        if(k==3) {
+            anim_now=1500;
+            CHECK(css_restyle_animated(&p.sa,p.root,p.sheets,p.nsheets,16,16,NULL,NULL)>0);
+        }
+        struct ditem *items=p.lo.items;size_t arena_used=p.la.used;
+        int refreshed=layout_refresh_backgrounds(&p.lo,p.root);
+        CHECK(items==p.lo.items && arena_used==p.la.used);
+        if(!css_paint_only || !refreshed)fprintf(stderr,"paint-only fixture %u: classified=%d refreshed=%d display=%d bg=%x\n",k,css_paint_only,refreshed,box->style->display,box->style->bg);
+        CHECK(css_paint_only && refreshed);
+        uint32_t fast[256]={0},full[256]={0};
+        struct surface s={fast,16,16,16,{0,0,16,16}};
+        paint_document(&p.lo,&s,0,0,0,0,NULL,0);
+        uint64_t hits=web_perf.events[WP_OPACITY_HIT];
+        paint_document(&p.lo,&s,0,0,0,0,NULL,0);
+        if(k==2)CHECK(web_perf.events[WP_OPACITY_HIT]>hits);
+        arena_free(&p.la);layout_document(&p.la,&p.lo,p.root,16,16);
+        s.px=full;paint_document(&p.lo,&s,0,0,0,0,NULL,0);
+        CHECK(!memcmp(fast,full,sizeof(fast)));unload(&p);
+    }
+    css_hover_node=NULL;
+    struct page p;load(&p,"<style>#box{width:8px}#box:hover{width:12px}</style><div id=box>x</div>",16,16);
+    css_hover_node=node_find(p.root,T_DIV);
+    CHECK(css_restyle_dynamic(&p.sa,p.root,p.sheets,p.nsheets,16,16,NULL,NULL)>0);
+    CHECK(!css_paint_only && !layout_refresh_backgrounds(&p.lo,p.root));
+    unload(&p);css_hover_node=NULL;anim_now=0;
 }
 
 /* Stacking: positioned boxes over the flow, z-index among siblings and inside contexts. */
@@ -1255,7 +1299,7 @@ int main(void)
     text_flow();
     positioning();
     boxes();
-    background_pictures(); background_pixels(); opacity_pixels(); stacking(); named_grid_lines(); inside_marker_lifetime();
+    background_pictures(); background_pixels(); opacity_pixels(); paint_only_restyle(); stacking(); named_grid_lines(); inside_marker_lifetime();
     text_extras();
     zoom();
     ranges();

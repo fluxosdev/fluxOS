@@ -37,10 +37,60 @@ static void platform_hosts(void)
     run_code(pages[3],script,"if(globalThis.blocked)throw Error('CSP allowed an unnonced script');var denied=0;try{eval('1');}catch(e){denied++;}try{new Function('return 1');}catch(e){denied++;}try{setTimeout('1',0);}catch(e){denied++;}if(denied!==3)throw Error('CSP code-generation restriction failed');");
     for(int k=0;k<4;k++){jsdom_free(pages[k]);arena_free(&arenas[k]);}
 }
+struct flush_host { struct node *box; int dirty, layouts, width; };
+static void mark_geometry_dirty(void *ctx) { ((struct flush_host *)ctx)->dirty=1; }
+static void flush_geometry(void *ctx)
+{
+    struct flush_host *h=ctx;
+    if(!h->dirty)return;
+    const char *style=node_attr(h->box,"style"),*width=style?strstr(style,"width:"):NULL;
+    if(width)h->width=atoi(width+6);
+    h->layouts++;h->dirty=0;
+}
+static int flushed_box(void *ctx,struct node *n,int *x,int *y,int *w,int *h)
+{
+    (void)n;*x=*y=0;*w=((struct flush_host *)ctx)->width;*h=10;return 1;
+}
+static void synchronous_geometry(void)
+{
+    struct arena a={0};const char *html="<html><body><div id=box></div></body></html>";
+    struct node *root=html_parse(&a,html,(int)strlen(html));
+    struct flush_host state={.box=node_find(root,T_DIV),.width=10};
+    struct jshost h={.arena=&a,.root=root,.url="https://geometry.test/",.base="https://geometry.test/",
+        .ctx=&state,.changed=mark_geometry_dirty,.flush=flush_geometry,.node_box=flushed_box,.status=status};
+    struct jsdom *d=jsdom_new(&h);
+    run_code(d,NULL,"var e=document.getElementById('box');e.style.width='20px';if(e.offsetWidth!==20||e.offsetWidth!==20)throw Error('offset read did not flush mutations');e.style.width='30px';if(e.getBoundingClientRect().width!==30||e.clientWidth!==30)throw Error('rect read did not flush mutations');");
+    if(state.layouts!=2 || state.dirty){fprintf(stderr,"geometry reads repeated or missed layout\n");errors++;}
+    jsdom_free(d);arena_free(&a);
+}
+static void background_timers(void)
+{
+    struct arena a={0};const char *html="<html><body></body></html>";
+    struct jshost h={.arena=&a,.root=html_parse(&a,html,(int)strlen(html)),
+        .url="https://timer.test/",.base="https://timer.test/",.status=status,.changed=changed};
+    struct jsdom *d=jsdom_new(&h);
+    unsigned saved=host_time;host_time=100;
+    run_code(d,NULL,"var calls=0,frames=0,stamp=0;var tick=setInterval(function(){calls++;},10);requestAnimationFrame(function(t){frames++;stamp=t;});");
+    jsdom_page_event(d,"visibilitychange",1);
+    if(jsdom_next_timer(d)!=1000){fprintf(stderr,"hidden timer floor missing\n");errors++;}
+    host_time=1099;jsdom_run_timers(d);
+    run_code(d,NULL,"if(calls||frames)throw Error('hidden timer ran early');");
+    host_time=1100;jsdom_run_timers(d);
+    run_code(d,NULL,"if(calls!==1||frames)throw Error('hidden timers or frames were not throttled');clearInterval(tick);");
+    if(jsdom_next_timer(d)!=-1){fprintf(stderr,"hidden animation callback woke the event loop\n");errors++;}
+    jsdom_page_event(d,"visibilitychange",0);host_time=1110;jsdom_run_timers(d);
+    run_code(d,NULL,"if(frames!==1||stamp!==1110)throw Error('visible frame did not resume with current timestamp');");
+    run_code(d,NULL,"var message=0;var ch=new MessageChannel();ch.port1.onmessage=function(){message++;};ch.port2.postMessage('ok');setTimeout(function(){calls++;},0);");
+    jsdom_page_event(d,"visibilitychange",1);jsdom_run_timers(d);
+    run_code(d,NULL,"if(message!==1||calls!==1)throw Error('hidden messaging should remain responsive');");
+    jsdom_free(d);arena_free(&a);host_time=saved;
+}
 int main(void)
 {
     mallopt(M_MMAP_MAX,0);
     platform_hosts();
+    background_timers();
+    synchronous_geometry();
     struct arena a={0},sa={0};
     const char *html="<!doctype html><html><body><div id=box style='transform:translate(50%,100%) scale(2);transform-origin:top left'></div><div id=projective style='transform:perspective(100px) translateZ(50px)'></div></body></html>";
     struct node *root=html_parse(&a,html,(int)strlen(html));

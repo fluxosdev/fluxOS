@@ -764,6 +764,7 @@ static void finish_box_inner(struct lctx *c, struct node *n, int slot, int x, in
     /* An unpainted background keeps the box (transparent) so clicks find the element. */
     d->x = x, d->y = y, d->w = w, d->h = h;
     d->color = paint && ALPHA(st->bg) ? st->bg : TRANSPARENT;
+    d->paint_bg=paint;
     d->node = n;
     if (!paint) {
         borders(c, st, x, y, w, h);
@@ -3445,6 +3446,7 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
             int paint = ALPHA(st->bg) && !st->hidden && n != c->skip_bg;
             d->x = bx, d->y = y, d->w = bw, d->h = bh;
             d->color = paint ? st->bg : TRANSPARENT;
+            d->paint_bg=!st->hidden && n!=c->skip_bg;
             d->node = n;
             bg_picture_finish(c, n, slot);
         }
@@ -5670,6 +5672,24 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
     shadow_restore(composed);
 }
 
+/* No geometry or item ordering changes: refresh only tagged background fills. */
+int layout_refresh_backgrounds(struct layout *lo,struct node *root)
+{
+    if(!css_paint_only)return 0;
+    for(struct node *n=root;n;n=node_next_shadow(n,root))if(n->paint_bg_changed) {
+        int found=0;
+        for(int i=0;i<lo->nitems && !found;i++)
+            found=lo->items[i].node==n && lo->items[i].paint_bg;
+        if(!found)return 0; /* inline fragments, skipped backgrounds, hidden trees */
+    }
+    for(int i=0;i<lo->nitems;i++) {
+        struct ditem *d=&lo->items[i];
+        if(d->paint_bg && d->node && d->node->paint_bg_changed)d->color=d->node->style->bg;
+    }
+    web_perf.events[WP_PAINT_ONLY]++;
+    return 1;
+}
+
 /* Projective maps act on page coordinates; layout coordinates never move.
  * The last row retains perspective for painting, geometry and hit testing alike. */
 struct affine { double a,b,c,d,e,f,g,h,i; };
@@ -7554,17 +7574,52 @@ static int opacity_contains(const struct layout *lo,int group,int wanted)
     }
     return 0;
 }
+/* A bounded pool per active nesting level. Busy storage is never reused by a child. */
+#define OPACITY_CACHE_BYTES (16u<<20)
+static struct { unsigned char *data; size_t capacity; int busy; } opacity_scratch[8];
+static size_t opacity_retained;
+static void *opacity_acquire(size_t bytes,int *slot)
+{
+    *slot=-1;
+    for(int i=0;i<8;i++)if(!opacity_scratch[i].busy && opacity_scratch[i].capacity>=bytes) {
+        opacity_scratch[i].busy=1;*slot=i;web_perf.events[WP_OPACITY_HIT]++;
+        return opacity_scratch[i].data;
+    }
+    if(bytes<=OPACITY_CACHE_BYTES)for(int i=0;i<8;i++)if(!opacity_scratch[i].busy) {
+        for(int j=0;j<8 && opacity_retained-opacity_scratch[i].capacity+bytes>OPACITY_CACHE_BYTES;j++)
+            if(j!=i && !opacity_scratch[j].busy) {
+                opacity_retained-=opacity_scratch[j].capacity;
+                free(opacity_scratch[j].data);opacity_scratch[j].data=NULL;opacity_scratch[j].capacity=0;
+            }
+        if(opacity_retained-opacity_scratch[i].capacity+bytes>OPACITY_CACHE_BYTES)break;
+        void *data=realloc(opacity_scratch[i].data,bytes);
+        if(!data)break;
+        opacity_retained+=bytes-opacity_scratch[i].capacity;
+        opacity_scratch[i].data=data;opacity_scratch[i].capacity=bytes;
+        opacity_scratch[i].busy=1;*slot=i;return data;
+    }
+    return malloc(bytes); /* large groups or unusually deep nesting: transient */
+}
+static void opacity_release(void *data,int slot)
+{
+    if(slot<0)free(data);else opacity_scratch[slot].busy=0;
+}
 /* Composite the entire stacking context once. Overlapping children must not each fade. */
 static int paint_opacity(const struct layout *lo,int group,struct surface *dst,int ox,int oy,int sx,int sy,const struct node *focus,int caret_on)
 {
     struct rect clip=dst->clip;size_t count=(size_t)clip.w*clip.h;
     if(clip.w<=0 || clip.h<=0)return 1;
     if(count>(4u<<20))return 0;
-    uint32_t *pixels=malloc(count*8);
-    struct ditem *items=malloc((size_t)lo->nitems*sizeof(*items));
-    int *map=malloc((size_t)lo->nitems*sizeof(*map));
-    struct fhl *highlights=lo->nhl?malloc((size_t)lo->nhl*sizeof(*highlights)):NULL;
-    if(!pixels || !items || !map || (lo->nhl && !highlights)){free(pixels);free(items);free(map);free(highlights);return 0;}
+    size_t item_bytes=((size_t)lo->nitems*sizeof(struct ditem)+7)&~(size_t)7;
+    size_t map_bytes=((size_t)lo->nitems*sizeof(int)+7)&~(size_t)7;
+    size_t bytes=count*8+item_bytes+map_bytes+(size_t)lo->nhl*sizeof(struct fhl);
+    int scratch_slot;
+    unsigned char *storage=opacity_acquire(bytes,&scratch_slot);
+    if(!storage)return 0;
+    uint32_t *pixels=(uint32_t *)storage;
+    struct ditem *items=(struct ditem *)(storage+count*8);
+    int *map=(int *)(storage+count*8+item_bytes);
+    struct fhl *highlights=(struct fhl *)(storage+count*8+item_bytes+map_bytes);
     struct layout subset=*lo;subset.items=items;subset.nitems=0;subset.nhl=0;subset.hl=highlights;subset.sel_on=0;
     for(int k=0;k<lo->nitems;k++) {
         map[k]=-1;
@@ -7590,7 +7645,7 @@ static int paint_opacity(const struct layout *lo,int group,struct surface *dst,i
         for(int shift=0;shift<=16;shift+=8)out|=(uint32_t)clamp255((int)(((b>>shift&255)*opacity+(under>>shift&255)*(255-a)+127)/255))<<shift;
         *dstpx=out;
     }
-    free(pixels);free(items);free(map);free(highlights);return 1;
+    opacity_release(storage,scratch_slot);return 1;
 }
 static void paint_layer(const struct layout *lo, struct surface *s, int ox, int oy, int sx, int sy,
                     const struct node *focus, int caret_on,int skip)

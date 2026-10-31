@@ -26,6 +26,16 @@
 /* Where what is typed in the address bar that is not an address goes. */
 #define SEARCH_URL "https://html.duckduckgo.com/html/?q="
 
+/* Opt-in stage timings (WAVE_PROFILE=1); counters remain available to host regressions. */
+enum web_perf_stage { WP_SCRIPT, WP_STYLE, WP_LAYOUT, WP_TEXT, WP_PAINT, WP_STAGES };
+enum web_perf_event { WP_WIDTH_HIT, WP_SHAPE_HIT, WP_OPACITY_HIT, WP_PAINT_ONLY,
+    WP_FLUSH_SKIP, WP_PAINT_MERGE, WP_HIDDEN_SKIP, WP_EVENTS };
+struct web_perf_stats { uint64_t ns[WP_STAGES], calls[WP_STAGES], events[WP_EVENTS]; };
+extern struct web_perf_stats web_perf;
+uint64_t web_perf_start(void);
+void web_perf_end(enum web_perf_stage stage, uint64_t start);
+void web_perf_report(void);
+
 /* ---- memory: everything a page owns lives in arenas, freed at once ---- */
 struct arena {
     struct arena_chunk *chunks;
@@ -171,6 +181,7 @@ struct node {
     unsigned kgen;
     uint8_t style_flags;                /* SF_*: what its style turned out to depend on */
     uint32_t match_sig;                 /* the rules that matched it, hashed */
+    uint8_t paint_bg_changed;            /* a restyle changed only the background color */
     unsigned dgen, rgen;                /* css_restyle_dynamic(): its state changed, its style changed */
     struct anim_state *anim;            /* anim.c: its transitions and animations, if it has any */
     /* container queries: a container's content box in the last layout (layout.c), and the size
@@ -659,6 +670,7 @@ int css_restyle_dynamic(struct arena *a, struct node *root, struct sheet **sheet
 int css_restyle_animated(struct arena *a, struct node *root, struct sheet **sheets, int nsheets,
                          int viewport_w, int viewport_h, int (*visited)(const char *href, void *ctx),
                          void *ctx);
+extern int css_paint_only;              /* last partial restyle can reuse layout geometry */
 extern int css_shared;
 int css_parse_color(const char *s, int n, uint32_t *out);
 /* oklch(), lab(), hwb(), color(), color-mix() and the rest (csscolor.c, in floating point). */
@@ -742,6 +754,7 @@ struct ditem {
     uint16_t sb;                /* 1 + the scrolling box it is inside (and clipped by), or 0 */
     uint16_t sbi;               /* DK_SBOX: its box */
     uint16_t xf;                /* transform group, 1-based */
+    uint8_t paint_bg;           /* this fill is the node background, refreshable without layout */
     uint16_t opacity_group;    /* innermost isolated opacity group */
     uint8_t fade;               /* opacity: 255 minus how much shows (0: opaque) */
     uint16_t fx;                /* effect group (filter, clip-path, blend, backdrop-filter), 1-based */
@@ -852,6 +865,7 @@ int layout_selection_text(const struct layout *lo, char *out, int size);
 
 /* Lay out the document for a viewport `vw` pixels wide. Output goes in lo,
  * allocated from a (free it to throw the layout away). */
+int layout_refresh_backgrounds(struct layout *lo, struct node *root);
 void layout_document(struct arena *a, struct layout *lo, struct node *root, int vw, int vh);
 /* Paint the part of the document at (sx, sy) into s at (ox, oy), within s's clip. */
 void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, int sx, int sy,

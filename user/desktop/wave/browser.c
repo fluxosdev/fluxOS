@@ -252,6 +252,7 @@ struct browser {
     int nqueue, qhead;
     int loading, total_res, done_res;
     int need_style, need_layout;
+    int paint_pending;
     int pending_images;
     int discover_changes;
     /* <audio> elements that have asked for their sound (media_for), and where a click on the
@@ -376,6 +377,7 @@ static char *visited[512];
 static int nvisited;
 
 static void navigate(struct browser *b, const char *url, const char *post, int mode);
+static unsigned paint_batch_depth;
 static void paint(struct browser *b);
 static int is_text_field(const struct node *n);
 static int has_keys(struct browser *b);
@@ -2391,14 +2393,18 @@ static void relayout(struct browser *b)
             css_target_id = url_fragment(b->url);
             css_font_lookup=font_lookup;css_font_context=b;
             anim_now = now_ms();
+            uint64_t style_start=web_perf_start();
             css_cascade(&b->sarena, b->root, b->sheets, b->nsheets, v.w, v.h, is_visited, b);
+            web_perf_end(WP_STYLE,style_start);
             css_font_lookup=NULL;css_font_context=NULL;
             b->sarena_full = b->sarena.used;
             b->need_style = 0;
         }
         bg_attach(b);
         arena_free(&b->larena);
+        uint64_t layout_start=web_perf_start();
         layout_document(&b->larena, &b->lo, b->root, v.w, v.h);
+        web_perf_end(WP_LAYOUT,layout_start);
         if (!layout_cq_changed)
             break;
     }
@@ -2948,7 +2954,10 @@ static void js_load_image(void *ctx, struct node *n)
 
 static void js_flush(void *ctx)
 {
-    flush_changes(ctx);              /* synchronous geometry reads still observe mutations */
+    struct browser *b=ctx;
+    if(b->discover_changes)flush_changes(b);
+    else if(b->need_style || b->need_layout) { relayout(b);paint(b); }
+    else web_perf.events[WP_FLUSH_SKIP]++;
 }
 
 /* An element with overflow that scrolls (jsdom.c's scrollTop and friends). */
@@ -6361,6 +6370,17 @@ static void paint(struct browser *b)
         return;                         /* a dropped frame */
     if (b->tabs)
         b = b->tabs->active;
+    if(paint_batch_depth || tab_hidden(b)) {
+        if(b->paint_pending)web_perf.events[WP_PAINT_MERGE]++;
+        b->paint_pending=1;return;
+    }
+    /* Geometry reads remain synchronous; drawing their results waits for this frame. */
+    paint_batch_depth++;
+    if(b->discover_changes)flush_changes(b);
+    else if(b->need_style || b->need_layout)relayout(b);
+    paint_batch_depth--;
+    b->paint_pending=0;
+    uint64_t paint_start=web_perf_start();
     struct surface *s = &b->win->content;
     gfx_noclip(s);
     draw_tabs(b, s);
@@ -6388,6 +6408,7 @@ static void paint(struct browser *b)
     b->shown_sy = b->scroll_y;
     b->shown_layouts = b->layouts;
     b->shown_view = view_rect(b);
+    web_perf_end(WP_PAINT,paint_start);
 }
 
 /* Whether some background picture is fixed to the window (it does not move with the page). */
@@ -6411,6 +6432,7 @@ static int has_fixed_bg(struct browser *b)
  */
 static void paint_scrolled(struct browser *b)
 {
+    if(paint_batch_depth || tab_hidden(b)) { paint(b);return; }
     struct rect v = view_rect(b);
     int dx = b->scroll_x - b->shown_sx, dy = b->scroll_y - b->shown_sy;
     int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
@@ -6922,7 +6944,9 @@ static int restyle_dynamic(struct browser *b)
     css_font_lookup = font_lookup;
     css_font_context = b;
     anim_now = now_ms();
+    uint64_t style_start=web_perf_start();
     int r = css_restyle_dynamic(&b->sarena, b->root, b->sheets, b->nsheets, v.w, v.h, is_visited, b);
+    web_perf_end(WP_STYLE,style_start);
     css_font_lookup = NULL;
     css_font_context = NULL;
     return r;
@@ -6944,13 +6968,17 @@ static void animate(struct browser *b)
             css_font_lookup = font_lookup;
             css_font_context = b;
             anim_now = now_ms();
+            uint64_t style_start=web_perf_start();
             int r = css_restyle_animated(&b->sarena, b->root, b->sheets, b->nsheets, v.w, v.h, is_visited, b);
+            web_perf_end(WP_STYLE,style_start);
             css_font_lookup = NULL;
             css_font_context = NULL;
             if (r < 0)
                 b->need_style = 1;
-            else if (r > 0)
-                b->need_layout = 1;
+            else if (r > 0) {
+                if(layout_refresh_backgrounds(&b->lo,b->root))paint(b);
+                else b->need_layout = 1;
+            }
         }
         if (b->need_style || b->need_layout) {
             relayout(b);
@@ -6985,7 +7013,7 @@ static void sync_dynamic(struct browser *b, const struct node *hov, int hover_to
         if (r < 0)
             b->need_style = 1;
         if (r) {
-            relayout(b);
+            if(r<0 || b->need_layout || !layout_refresh_backgrounds(&b->lo,b->root))relayout(b);
             paint(b);
         }
     } else if (changed) {
@@ -8245,7 +8273,7 @@ void browser_blink(void)
 }
 
 /* Every pass of the desktop's loop: timers, and what scripts asked for. */
-void browser_poll(void)
+static void browser_poll_work(void)
 {
     sweep_frames();
     for (struct browser *b = browsers; b; b = b->next) {
@@ -8255,8 +8283,10 @@ void browser_poll(void)
             b->http_resumed=0;
             for(int k=0;k<FETCH_LANES;k++)if(!b->lanes[k].fetch.paused && b->lanes[k].hp.len)helper_ready(&b->lanes[k],0);
         }
+        int hidden=tab_hidden(b);
+        if(hidden)web_perf.events[WP_HIDDEN_SKIP]++;
         int animated = 0;
-        for (struct cached *c = b->cache; c; c = c->next)
+        for (struct cached *c = hidden?NULL:b->cache; c; c = c->next)
             if (c->img) animated |= image_animate(c->img, now_ms());
         if (animated) paint(b);
         if (b->frame_nav[0]) {          /* a frame's iframe asked for a page */
@@ -8282,9 +8312,11 @@ void browser_poll(void)
         if (b->js)
             jsdom_run_timers(b->js);
         media_notify(b);
-        if (b->root && b->discover_changes) flush_changes(b);
-        else if (b->root && (b->need_style || b->need_layout)) { relayout(b); paint(b); }
-        if (b->root) animate(b);
+        if (!hidden) {
+            if (b->root && b->discover_changes) flush_changes(b);
+            else if (b->root && (b->need_style || b->need_layout)) { relayout(b); paint(b); }
+            if (b->root) animate(b);
+        }
         if(b->qhead<b->nqueue&&free_loader(b))start_next(b);
         if (b->js_open[0]) {
             char u[URL_MAX];
@@ -8329,13 +8361,24 @@ void browser_poll(void)
     }
 }
 
+/* Early navigation returns still reach the commit step; no dead browser pointers are retained. */
+void browser_poll(void)
+{
+    paint_batch_depth++;
+    browser_poll_work();
+    paint_batch_depth--;
+    for(struct browser *b=browsers;b;b=b->next)
+        if(!b->parent && tab_active(b) && !tab_hidden(b) && b->paint_pending)paint(b);
+    web_perf_report();
+}
+
 /* ms until a browser needs browser_poll, or -1. */
 int browser_timeout(void)
 {
     int best = -1;
     for (struct browser *b = browsers; b; b = b->next) {
         if(b->http_resumed)return 0;
-        if((b->root && (b->discover_changes || b->need_style || b->need_layout)) ||
+        if((!tab_hidden(b) && b->root && (b->discover_changes || b->need_style || b->need_layout)) ||
            (b->qhead<b->nqueue&&free_loader(b)))return 0;
         if (b->frame_dead || b->frame_nav[0] || b->js_open[0] || b->js_nav[0] || b->js_history || b->js_reload ||
             b->js_close)
@@ -8343,7 +8386,7 @@ int browser_timeout(void)
         int t = jsdom_next_timer(b->js);
         if (t >= 0 && (best < 0 || t < best))
             best = t;
-        if (b->root && (t = anim_timeout(b->root)) >= 0) {     /* the next frame of a transition or animation */
+        if (!tab_hidden(b) && b->root && (t = anim_timeout(b->root)) >= 0) {     /* the next frame of a transition or animation */
             t -= (int)(now_ms() - b->anim_at);
             if (t < 0)
                 t = 0;

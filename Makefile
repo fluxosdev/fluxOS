@@ -777,7 +777,10 @@ $(BUILD)/tests/browser-font: tests/browser-font.c user/desktop/wave/webfont.c us
 	$(HOSTCC) -std=gnu11 -O1 -g -msse $(DESKTOP_INC) -idirafter user/include $(FONT_FLAGS) \
 		-DFONT_FILE='"$(CURDIR)/$(BUILD)/tests/font-test.fnt"' -DNOTO_DIR='"$(CURDIR)/rootfs/usr/share/fonts/noto/"' \
 		$(filter %.c,$^) -o $@
-.PHONY: test-browser-fonts
+.PHONY: test-browser-fonts bench-browser-text
+bench-browser-text: $(BUILD)/tests/browser-font
+	python3 tools/bench-browser-text.py
+
 test-browser-fonts: $(BUILD)/tests/browser-font
 	python3 tools/test-browser-fonts.py
 

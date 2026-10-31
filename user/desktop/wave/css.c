@@ -8968,6 +8968,95 @@ static struct node *share_source(const struct node *n)
  * styled. With dyn (css_restyle_dynamic), only the elements whose state or parent's style changed
  * are looked at again; returns how many elements' styles changed.
  */
+int css_paint_only;
+static int same_string(const char *a,const char *b) { return a==b || (a && b && !strcmp(a,b)); }
+/* Be conservative: geometry reuse is limited to unchanged styles/background-color.
+ * Motion descriptors are freshly allocated on each frame, so compare their values. */
+static void clean_length(struct len *length)
+{
+    /* Parsed lengths can carry indeterminate tail padding; it is not a style value. */
+    memset((unsigned char *)length+offsetof(struct len,unit)+sizeof(length->unit),0,
+        sizeof(*length)-offsetof(struct len,unit)-sizeof(length->unit));
+}
+static void clean_style_lengths(struct style *s)
+{
+    clean_length(&s->tx);
+    clean_length(&s->ty);
+    clean_length(&s->top);
+    clean_length(&s->right);
+    clean_length(&s->bottom);
+    clean_length(&s->left);
+    clean_length(&s->tox);
+    clean_length(&s->toy);
+    clean_length(&s->toz);
+    clean_length(&s->perspective);
+    clean_length(&s->pox);
+    clean_length(&s->poy);
+    clean_length(&s->deco_thickness);
+    clean_length(&s->underline_offset);
+    for(int i=0;i<4;i++)clean_length(&s->margin[i]);
+    for(int i=0;i<4;i++)clean_length(&s->padding[i]);
+    clean_length(&s->width);
+    clean_length(&s->min_width);
+    clean_length(&s->max_width);
+    clean_length(&s->height);
+    clean_length(&s->min_height);
+    clean_length(&s->max_height);
+    for(int i=0;i<4;i++)clean_length(&s->radius[i]);
+    clean_length(&s->bg_w);
+    clean_length(&s->bg_h);
+    clean_length(&s->bg_px);
+    clean_length(&s->bg_py);
+    clean_length(&s->obj_px);
+    clean_length(&s->obj_py);
+    clean_length(&s->flex_basis);
+    clean_length(&s->row_gap);
+    clean_length(&s->col_gap);
+    clean_length(&s->col_width);
+    struct tfop *ops[]={&s->xf_translate,&s->xf_rotate,&s->xf_scale};
+    for(int i=0;i<3;i++) {
+        clean_length(&ops[i]->x);clean_length(&ops[i]->y);clean_length(&ops[i]->z);
+    }
+}
+static int plain_background(const struct style *st)
+{
+    if(st->bg_url || st->bg_img || st->gr)return 0;
+    int count=0;
+    for(const struct style *layer=st->bg_layers;layer;layer=layer->bg_next)
+        if(++count>64 || layer->bg_url || layer->bg_img || layer->gr)return 0;
+    return 1;
+}
+static int background_only(const struct style *old,const struct style *now)
+{
+    if(!old || !now)return 0;
+    struct style a=*old,b=*now;a.bg=b.bg;
+    clean_style_lengths(&a);clean_style_lengths(&b);
+    if(plain_background(&a) && plain_background(&b)) {
+        memset(a.bg_values,0,sizeof(a.bg_values));memset(b.bg_values,0,sizeof(b.bg_values));
+        a.bg_layers=b.bg_layers=NULL;
+    }
+    if(a.ntrans!=b.ntrans || a.nanims!=b.nanims)return 0;
+    for(int i=0;i<a.ntrans;i++) {
+        struct css_transition x=a.trans[i],y=b.trans[i];
+        if(!same_string(x.name,y.name))return 0;
+        x.name=y.name=NULL;if(memcmp(&x,&y,sizeof(x)))return 0;
+    }
+    for(int i=0;i<a.nanims;i++) {
+        struct css_animation x=a.anims[i],y=b.anims[i];
+        if(!same_string(x.name,y.name))return 0;
+        x.name=y.name=NULL;if(memcmp(&x,&y,sizeof(x)))return 0;
+    }
+    if(!!a.raw_motion!=!!b.raw_motion)return 0;
+    if(a.raw_motion) {
+#define SAME_RAW(field) if(!same_string(a.raw_motion->field,b.raw_motion->field))return 0
+        SAME_RAW(tprop);SAME_RAW(tdur);SAME_RAW(tdelay);SAME_RAW(tease);SAME_RAW(tbehav);
+        SAME_RAW(aname);SAME_RAW(adur);SAME_RAW(aease);SAME_RAW(adelay);SAME_RAW(aiter);
+        SAME_RAW(adir);SAME_RAW(afill);SAME_RAW(astate);
+#undef SAME_RAW
+    }
+    a.trans=b.trans=NULL;a.anims=b.anims=NULL;a.raw_motion=b.raw_motion=NULL;
+    return !memcmp(&a,&b,sizeof(a));
+}
 static int cascade_tree(struct arena *a, struct node *root, const struct style *parent,
                         struct sheet **sheets, int nsheets, struct vctx *v,
                         const struct mctx *mc, struct match *buf, struct bloom *bloom, unsigned dyn)
@@ -8983,6 +9072,10 @@ static int cascade_tree(struct arena *a, struct node *root, const struct style *
             const struct style *ps = n->parent && n->parent->style ? n->parent->style : parent;
             int redone = 1;
             if (dyn) {
+                const struct style *before=n->style;
+                int pseudo_before=0;
+                for(int pe=0;pe<8;pe++)pseudo_before|=n->pseudo_st[pe]!=NULL;
+                n->paint_bg_changed=0;
                 int parent_changed = n->parent && n->parent->rgen == dyn;
                 if (parent_changed || !n->style || (n->style_flags & SF_DYN_OTHER) ||
                     ((n->style_flags & SF_DYN_SELF) && n->dgen == dyn))
@@ -8992,6 +9085,16 @@ static int cascade_tree(struct arena *a, struct node *root, const struct style *
                 if (redone) {
                     n->rgen = dyn;
                     changed++;
+                    int has_pseudo=pseudo_before;
+                    for(int pe=0;pe<8;pe++)has_pseudo|=n->pseudo_st[pe]!=NULL;
+                    if(has_pseudo || !background_only(before,n->style))css_paint_only=0;
+                    else if(before->bg!=n->style->bg) {
+                        if(!n->parent || n->tag==T_HTML || n->tag==T_BODY ||
+                           n->style->display!=D_BLOCK ||
+                           n->style->hidden || n->style->empty_hide)
+                            css_paint_only=0;
+                        else n->paint_bg_changed=1;
+                    }
                 }
             } else {
                 struct node *src = mc->host ? NULL : share_source(n);
@@ -9182,6 +9285,8 @@ int css_restyle_dynamic(struct arena *a, struct node *root, struct sheet **sheet
         return -1;
     }
     key_arena = a;
+    css_paint_only=1;
+    for(struct node *n=root;n;n=node_next_shadow(n,root))n->paint_bg_changed=0;
     int changed = cascade_tree(a, root, &initial_style, sheets, nsheets, &v, &mc, buf, bloom, gen);
     key_arena = NULL;
     free(buf);
@@ -9214,6 +9319,8 @@ int css_restyle_animated(struct arena *a, struct node *root, struct sheet **shee
         return -1;
     }
     key_arena = a;
+    css_paint_only=1;
+    for(struct node *n=root;n;n=node_next_shadow(n,root))n->paint_bg_changed=0;
     int changed = cascade_tree(a, root, &initial_style, sheets, nsheets, &v, &mc, buf, bloom, gen);
     key_arena = NULL;
     free(buf);

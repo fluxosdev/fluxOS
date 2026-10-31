@@ -1230,7 +1230,8 @@ The FPU state is saved with FXSAVE, so AVX and later cannot be used.
   AES-128/256-GCM or ChaCha20-Poly1305; no CBC suites, no RSA key exchange, no resumption);
   certificate chains and handshake signatures are verified using
   Mbed TLS and a bundled CA trust store. The trust bundle needs periodic updates.
-- **Browser:** Callable proxies and local-scope direct `eval` are implemented; complete
+- **Browser:** Performance improvements and profiling instructions are described in
+  [browser-performance.md](browser-performance.md). Callable proxies and local-scope direct `eval` are implemented; complete
   proxy invariants and strict-eval declaration edge cases still need work. Regular
   expressions have no `\q{}` string sets or Unicode
   case folding beyond simple folding, so some modern web apps won't run. Layout is an

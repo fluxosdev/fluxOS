@@ -3,7 +3,45 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "web.h"
+
+struct web_perf_stats web_perf;
+static int profile_enabled = -1;
+uint64_t web_perf_start(void)
+{
+    if (profile_enabled < 0) {
+        const char *value = getenv("WAVE_PROFILE");
+        profile_enabled = value && !strcmp(value, "1");
+    }
+    if (!profile_enabled) return 0;
+    struct timespec t;
+    if (clock_gettime(CLOCK_MONOTONIC, &t)) return 0;
+    return (uint64_t)t.tv_sec * 1000000000u + (unsigned)t.tv_nsec;
+}
+void web_perf_end(enum web_perf_stage stage, uint64_t start)
+{
+    if (!start) return;
+    uint64_t end = web_perf_start();
+    if (end >= start) { web_perf.ns[stage] += end - start; web_perf.calls[stage]++; }
+}
+void web_perf_report(void)
+{
+    static uint64_t last;
+    uint64_t now = web_perf_start();
+    if (!now || now-last < 5000000000ull) return;
+    last = now;
+    static const char *names[] = {"script", "style", "layout", "text", "paint"};
+    fprintf(stderr, "Wave profile (cumulative; text is included in layout/paint):");
+    for (int i=0; i<WP_STAGES; i++)
+        fprintf(stderr, " %s=%llu us/%llu", names[i],
+            (unsigned long long)(web_perf.ns[i]/1000), (unsigned long long)web_perf.calls[i]);
+    fprintf(stderr, " hits width=%llu shape=%llu opacity=%llu paint-only=%llu flush-skip=%llu paint-merge=%llu hidden=%llu\n",
+        (unsigned long long)web_perf.events[WP_WIDTH_HIT], (unsigned long long)web_perf.events[WP_SHAPE_HIT],
+        (unsigned long long)web_perf.events[WP_OPACITY_HIT], (unsigned long long)web_perf.events[WP_PAINT_ONLY],
+        (unsigned long long)web_perf.events[WP_FLUSH_SKIP], (unsigned long long)web_perf.events[WP_PAINT_MERGE],
+        (unsigned long long)web_perf.events[WP_HIDDEN_SKIP]);
+}
 
 /* ---- arenas ---- */
 

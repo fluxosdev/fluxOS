@@ -113,6 +113,7 @@ static int ft_ready(void)
     }
     return 1;
 }
+static unsigned text_epoch = 1;
 int wfont_register(const unsigned char *bytes, size_t length, int family, int bold, int italic)
 {
     if (!bytes || !length || length > FONT_DATA_MAX || length > FONT_DATA_TOTAL - font_data_bytes)
@@ -149,6 +150,7 @@ int wfont_register(const unsigned char *bytes, size_t length, int family, int bo
     group->sources[style] = copy;
     group->lengths[style] = length;
     group->generation++;
+    text_epoch++;
     font_data_bytes += length;
     return slot + 3;
 }
@@ -171,6 +173,7 @@ void wfont_release(int family)
         f = next;
     }
     memset(group, 0, sizeof(*group));
+    text_epoch++;
 }
 static const struct wfont *downloaded_font(int family, int bold, int italic, int px)
 {
@@ -1071,11 +1074,65 @@ static int width16(const struct wfont *f, const char *s, int n)
     return w;
 }
 
+/* Bounded, content-keyed caches: DOM strings need not retain their address. */
+#define TEXT_KEY_MAX 256
+struct shaped_text { uint32_t hash; int len, visual_len; char key[TEXT_KEY_MAX], visual[TEXT_KEY_MAX*3]; };
+struct measured_text { const struct wfont *font; unsigned epoch; uint32_t hash; int len, width; char key[TEXT_KEY_MAX]; };
+static struct shaped_text shapes[128];
+static struct measured_text widths[512];
+static uint32_t text_hash(const char *s, int n)
+{
+    uint32_t hash=2166136261u;
+    for (int i=0;i<n;i++) hash=(hash^(unsigned char)s[i])*16777619u;
+    return hash;
+}
+static const char *shape_cached(const char *text,int *n,char **owned)
+{
+    *owned=NULL;
+    if (*n<=0 || *n>TEXT_KEY_MAX) {
+        *owned=web_text_visual(text,*n,n);return *owned?*owned:text;
+    }
+    uint32_t hash=text_hash(text,*n);
+    struct shaped_text *entry=&shapes[hash%128];
+    if(entry->hash==hash && entry->len==*n && !memcmp(entry->key,text,(size_t)*n)) {
+        web_perf.events[WP_SHAPE_HIT]++;
+        if(entry->visual_len<0)return text;
+        *n=entry->visual_len;return entry->visual;
+    }
+    int length=*n,visual_len=length;
+    char *visual=web_text_visual(text,length,&visual_len);
+    entry->hash=hash;entry->len=length;memcpy(entry->key,text,(size_t)length);
+    entry->visual_len=visual?visual_len:-1;
+    if(visual && visual_len>(int)sizeof(entry->visual)) {
+        entry->len=0;*owned=visual;*n=visual_len;return visual;
+    }
+    if(visual)memcpy(entry->visual,visual,(size_t)visual_len);
+    free(visual);
+    if(entry->visual_len<0)return text;
+    *n=visual_len;return entry->visual;
+}
 int wfont_width(const struct wfont *f, const char *s, int n)
 {
-    char *visual=web_text_visual(s,n,&n);if(visual)s=visual;
-    int width=f->face?downloaded_width(f,s,n):(width16(f,s,n)+8)>>4;
-    free(visual);return width;
+    uint64_t start=web_perf_start();
+    struct measured_text *entry=NULL;
+    uint32_t hash=0;
+    int length=n;
+    if(n>0 && n<=TEXT_KEY_MAX) {
+        hash=text_hash(s,n);
+        entry=&widths[(hash^((uintptr_t)f>>4))%512];
+        if(entry->font==f && entry->epoch==text_epoch && entry->hash==hash && entry->len==n &&
+           !memcmp(entry->key,s,(size_t)n)) {
+            web_perf.events[WP_WIDTH_HIT]++;web_perf_end(WP_TEXT,start);return entry->width;
+        }
+        entry->font=f;entry->epoch=text_epoch;entry->hash=hash;entry->len=n;
+        memcpy(entry->key,s,(size_t)n);
+    }
+    char *owned;
+    const char *visual=shape_cached(s,&n,&owned);
+    int width=f->face?downloaded_width(f,visual,n):(width16(f,visual,n)+8)>>4;
+    free(owned);
+    if(entry && entry->len==length)entry->width=width;
+    web_perf_end(WP_TEXT,start);return width;
 }
 
 static int draw_visual(struct surface *s, const struct wfont *f, int x, int y, const char *str, int n, color_t c)
@@ -1137,8 +1194,11 @@ static int draw_visual(struct surface *s, const struct wfont *f, int x, int y, c
 
 int wfont_draw(struct surface *s,const struct wfont *f,int x,int y,const char *text,int n,color_t c)
 {
-    char *visual=web_text_visual(text,n,&n);
-    int advance=draw_visual(s,f,x,y,visual?visual:text,n,c);free(visual);return advance;
+    uint64_t start=web_perf_start();
+    char *owned;
+    const char *visual=shape_cached(text,&n,&owned);
+    int advance=draw_visual(s,f,x,y,visual,n,c);
+    free(owned);web_perf_end(WP_TEXT,start);return advance;
 }
 
 /* ---- text at any size, for <canvas> ---- */
