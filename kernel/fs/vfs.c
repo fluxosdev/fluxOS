@@ -1227,20 +1227,30 @@ int vfs_mount_root(const char *spec)
 {
     int by_uuid = !strncmp(spec, "UUID=", 5);
     struct blockdev *bd = NULL, *b;
+    const char *type = "auto";
     for (int i = 0; !bd && (b = blk_get(i)); i++) {
         char id[40];
         if (b->type == BLK_CDROM || b->type == BLK_FLOPPY || b->fs)
             continue;
-        if (by_uuid ? (ext2_uuid(b, id, sizeof(id)) == 0 || fat_uuid(b, id, sizeof(id)) == 0) &&
-                      same_uuid(id, spec + 5)
-                    : !strcmp(b->name, spec))
+        if (!by_uuid) {
+            if (!strcmp(b->name, spec))
+                bd = b;
+        } else if (ext2_uuid(b, id, sizeof(id)) == 0 && same_uuid(id, spec + 5)) {
             bd = b;
+            type = "ext2";
+        } else if (fat_uuid(b, id, sizeof(id)) == 0 && same_uuid(id, spec + 5)) {
+            bd = b;
+            type = "fat32";
+        }
     }
     if (!bd)
         return -ENODEV;
 
+    /* The filesystem the UUID was found in: an ext2 volume formatted over
+     * a FAT one by an older mkfs.ext2 still has the FAT boot sector, which
+     * "auto" would try first. */
     struct fs *fs;
-    int r = fs_probe(bd, "auto", &fs);
+    int r = fs_probe(bd, type, &fs);
     if (r < 0)
         return r;
     struct vnode *root = fs->root, *bin;

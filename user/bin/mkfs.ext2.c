@@ -6,7 +6,9 @@
  *
  * Revision 1 with 256-byte inodes, the features every ext2 reader knows
  * (file types in directory entries, sparse superblock copies, large
- * files), a root directory and lost+found. The block size is 1 KiB below
+ * files), a root directory and lost+found. The 1 KiB before the
+ * superblock is cleared, as mke2fs does: a FAT boot sector left there
+ * would still make the volume look like FAT. The block size is 1 KiB below
  * 512 MiB and 4 KiB from there unless -b says; one inode per 8 KiB unless
  * -i or -N do (a source tree is many small files); 5% of the blocks are
  * kept for the superuser unless -m says.
@@ -270,6 +272,9 @@ int main(int argc, char **argv)
         if (!quiet && ngroups > 8 && g % (ngroups / 8) == 0)
             fprintf(stderr, "mkfs.ext2: group %u of %u\r", g + 1, ngroups);
     }
+
+    /* the boot block: whatever was there before (a FAT boot sector) goes */
+    put_at(0, zero, 1024);
 
     /* the root directory and lost+found */
     memset(buf, 0, bs);
