@@ -4,7 +4,7 @@
 work described in phases 1 and 2. Phases 0 to 6 are done (phase 3 and 4
 on 2026-10-29: the Makefile's tools, `fsh` as `/bin/sh`, and GCC running
 on fluxOS; phases 5 and 6 on 2026-10-30: ext2 with links, and the ISO made
-natively); phase 7 is a plan.*
+natively); phases 6.5 and 7 are a plan.*
 
 "Self-hosting" means that fluxOS, running on its own kernel, can turn a
 checkout of this repository into a bootable `fluxOS.iso` and an installed
@@ -310,7 +310,7 @@ and compressed files each side can read, diffs each side's `patch`
 applies, the same output for the same scripts), and `fsh`'s `sh` mode
 against dash (`make test-sh`, `tests/sh-host.sh`: 135 scripts). They are
 built for fluxOS and on the image; what has not happened yet is running
-the Makefile's targets natively (phase 7).
+the Makefile's targets natively (phase 6.5).
 
 - [x] GNU make 4.4, cross-built with `./configure --host=i686-fluxos` (it
       needs only the phase 2 libc, no `getloadavg`); on the image since
@@ -366,7 +366,7 @@ Size: GNU make is third-party; the tools came to 6k lines (`diff`,
 *Goal: `/usr/bin/gcc` on fluxOS compiles and links a program, and the
 system image carries the whole toolchain. Measured by `gcc -O2 hello.c`
 in a fluxOS terminal, then by `make` of the fluxOS tree natively (phase
-7's stage 1).*
+6.5).*
 
 Done 2026-10-29: `make toolchain-native` builds GCC 13.2.0 to run on
 fluxOS and the next `make` puts it on the system image. `make
@@ -453,7 +453,7 @@ missing libc feature.
 
 *Goal: `make` is correct on fluxOS (no spurious "up to date"), links work,
 `cp -r` of the tree keeps everything. Measured by the native build of
-phase 7 producing the same file list as the Linux build.*
+phase 6.5 producing the same file list as the Linux build.*
 
 Done 2026-10-30. `make test-kernel` runs the ext2 driver through the VFS on
 images mke2fs made (1 and 4 KiB blocks, 128- and 256-byte inodes, one
@@ -563,22 +563,46 @@ Size: `mkiso` 800 lines, `mbcheck` 150, the tests 200. As expected, low risk:
 the only surprises were the boot information table's checksum (taken after
 GRUB's address is patched in) and the ISO's embedded-UUID config.
 
-## Phase 7: the bootstrap
+## Phase 6.5: the first native build
 
-*Goal: stages 1 and 2. A documented procedure and a test that proves it.*
+*Goal: stage 1, by hand. `make`, `make check` and `make iso` of the
+whole tree run to the end on fluxOS, and the ISO they make boots.
+Measured by the native build's file list matching the Linux build's.*
 
 - [ ] A source disk: `make srcdisk` makes an ext2 image with the checkout
       (or `wget https://github.com/.../archive/refs/heads/main.zip &&
       unzip` on the machine).
-- [ ] `tools/selfhost.sh`, run inside fluxOS: `make` with the native
-      tools, `make check`, `make iso`, then `fluxinstall` to a second
-      disk; the same script on Linux drives QEMU for CI:
-      `make test-selfhost-qemu` boots the Linux-built ISO with the source
-      disk, runs the native build, boots the native ISO, runs
-      `test-kernel-qemu`'s suite there, and compares the stripped kernel
-      and every program of stage 1 and stage 2 byte for byte (the same
-      GCC built the same way should agree; `-g` paths are mapped with
-      `-fdebug-prefix-map`, and `__DATE__` is not used anywhere).
+- [ ] KVM for the long runs: `tools/test-kernel-qemu.py` runs the guest
+      under TCG (`-cpu core2duo,-lm`, no `-enable-kvm`), which makes a full
+      build take hours; a `--kvm` option, with the same CPU model, for the
+      build tests, falling back to TCG where `/dev/kvm` is missing.
+- [ ] `make` of the tree in a fluxOS terminal with the native tools,
+      fixing what it turns up: the Makefile's `$(shell ...)` probes under
+      `fsh`, `cc1`'s memory on FreeType, mbedtls and the browser, the
+      process limit under `make -j`, and ext2 and the sector cache under
+      hours of small writes. This is the first sustained load the kernel
+      has carried.
+- [ ] `make check` and `make iso` natively, then the native ISO booted
+      in QEMU and `fluxinstall` from it to a second disk.
+
+Size: a Makefile rule and a test-script option; the rest is fixes.
+Risk: the highest left on the roadmap, because no earlier phase ran
+anything this long.
+
+## Phase 7: the bootstrap
+
+*Goal: stages 1 and 2. A documented procedure and a test that proves it.*
+
+- [ ] `tools/selfhost.sh`, run inside fluxOS: the steps of phase 6.5 in
+      one script (`make` with the native tools, `make check`, `make iso`,
+      then `fluxinstall` to a second disk); the same script on Linux
+      drives QEMU for CI: `make test-selfhost-qemu` boots the Linux-built
+      ISO with the source disk, runs the native build, boots the native
+      ISO, runs `test-kernel-qemu`'s suite there, and compares the
+      stripped kernel and every program of stage 1 and stage 2 byte for
+      byte (the same GCC built the same way should agree; `-g` paths are
+      mapped with `-fdebug-prefix-map`, and `__DATE__` is not used
+      anywhere).
 - [ ] Build time and memory on the reference machines (a Core 2 Duo in
       QEMU, the HP Pavilion g6, the Pentium 4 floor): FreeType, mbedtls and
       the browser are the long poles; `make -j` needs nothing new since
@@ -586,13 +610,14 @@ GRUB's address is patched in) and the ISO's embedded-UUID config.
 - [ ] Documentation: a "Building fluxOS on fluxOS" section in the README
       and the firmware provenance.
 
-Size: scripts and docs. Risk: whatever the previous phases left behind.
+Size: scripts and docs. Risk: low once phase 6.5 is done; stage 2 runs
+on the same `/src` path with the same prebuilt GCC as stage 1.
 
 ## Order and dependencies
 
 ```
 Phase 1 (cross toolchain, done) ──> Phase 2 (libc) ──┬──> Phase 3 (make, tools, sh)  ──┐
-                                                     └──> Phase 4 (native gcc, binutils) ┼──> Phase 7 (bootstrap)
+                                                     └──> Phase 4 (native gcc, binutils) ┼──> Phase 6.5 (first native build) ──> Phase 7 (bootstrap)
 Phase 5 (ext2, links, timestamps) ───────────────────────────────────────────────────────┤
 Phase 6 (mkiso, GRUB blobs) ─────────────────────────────────────────────────────────────┘
 ```
@@ -603,10 +628,11 @@ it, and its first item should be the configure probe, which turns the
 libc list into an ordered one.
 
 Suggested order: 4 (the Canadian cross: binutils already links for
-fluxOS), 3 (GNU make already builds), 6, 5, 7; and running the phase 2
-tests on fluxOS before relying on any of it. (Phases 3 and 4 were done
-together on 2026-10-29, 5 and 6 on 2026-10-30; what remains is 7, and
-running the tools on the kernel; `make test-gcc-qemu` passed on 2026-10-29.)
+fluxOS), 3 (GNU make already builds), 6, 5, 6.5, 7; and running the
+phase 2 tests on fluxOS before relying on any of it. (Phases 3 and 4 were
+done together on 2026-10-29, 5 and 6 on 2026-10-30; what remains is 6.5,
+the first native build, and 7, which automates it and adds stage 2;
+`make test-gcc-qemu` passed on 2026-10-29.)
 
 ## Later, deliberately
 
@@ -616,7 +642,7 @@ running the tools on the kernel; `make test-gcc-qemu` passed on 2026-10-29.)
   running under `fsh`'s `sh` mode (long scripts: `awk`, `expr`, `tr`,
   `grep -E`, `sort`, `uniq` and `m4`/`bison` for binutils are the tools
   missing), `libstdc++` and the C++ headers on the image, and hours of
-  build time on the target machines. Everything in phases 5 to 7 makes it
+  build time on the target machines. Everything in phases 5 to 7 (6.5 included) makes it
   closer; nothing in them depends on it.
 - **Dynamic linking** (`ld.so`, PIC, `dlopen`): nothing on the roadmap
   needs it; GCC plugins would.
