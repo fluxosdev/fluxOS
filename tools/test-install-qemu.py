@@ -5,7 +5,7 @@ The CD is the build's (build/iso, with GRUB from firmware/grub), except
 that its setup system's init is tests/install-guest.c, which runs
 fluxinstall onto the disk, and its menu starts that at once, in text mode.
 The disk is then started alone: GRUB's boot sector and core image that
-fluxinstall wrote, its modules and menu on the FAT32 partition, the kernel
+fluxinstall wrote, its modules and menu on the ext2 partition, the kernel
 from there and the system unpacked onto it, as / .
 """
 import argparse
@@ -20,9 +20,9 @@ import time
 parser = argparse.ArgumentParser(description=__doc__)
 for name in ('qemu', 'mkiso', 'isotree', 'firmware', 'guest'):
     parser.add_argument(name)
-parser.add_argument('--disk-mb', type=int, default=512)
+parser.add_argument('--disk-mb', type=int, default=768)
 parser.add_argument('--data-dir', default='/src', help="fluxinstall -e: a second, ext2, partition for it ('' for none)")
-parser.add_argument('--system-mib', type=int, default=200, help='fluxinstall -r, with --data-dir')
+parser.add_argument('--system-mib', type=int, default=320, help='fluxinstall -r, with --data-dir')
 parser.add_argument('--timeout', type=int, default=600)
 args = parser.parse_args()
 
@@ -82,26 +82,33 @@ with tempfile.TemporaryDirectory(prefix='flux-install-test-') as directory:
         print(text[-4000:])
         raise SystemExit('install: fluxinstall did not finish (see the log above)')
     print('install: fluxinstall installed fluxOS from the mkiso CD')
+
+    def check_ext2(index, what):
+        """Partition `index` (0-based) is ext2 and, as Linux's e2fsck sees it, clean."""
+        entry = disk.read_bytes()[446 + 16 * index:462 + 16 * index]
+        start, count = (int.from_bytes(entry[8:12], 'little'), int.from_bytes(entry[12:16], 'little'))
+        if entry[4] != 0x83 or not count:
+            raise SystemExit(f'install: no ext2 partition for {what} in the partition table')
+        if not shutil.which('e2fsck'):
+            return
+        part = temp / f'part{index + 1}.img'
+        with disk.open('rb') as src, part.open('wb') as dst:
+            src.seek(start * 512)
+            left = count * 512
+            while left:
+                chunk = src.read(min(left, 1 << 20))
+                dst.write(chunk)
+                left -= len(chunk)
+        check = subprocess.run(['e2fsck', '-fn', str(part)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        part.unlink()
+        if check.returncode:
+            print(check.stdout.decode(errors='replace'))
+            raise SystemExit(f'install: e2fsck finds the ext2 partition for {what} damaged')
+        print(f'install: the ext2 partition for {what} ({count // 2048} MiB) is clean to e2fsck')
+
+    check_ext2(0, 'the system')
     if args.data_dir:
-        # the second partition, as Linux's e2fsck sees it
-        table = disk.read_bytes()[446:478]
-        start, count = (int.from_bytes(table[24:28], 'little'), int.from_bytes(table[28:32], 'little'))
-        if table[20] != 0x83 or not count:
-            raise SystemExit('install: no second (ext2) partition in the partition table')
-        if shutil.which('e2fsck'):
-            part = temp / 'part2.img'
-            with disk.open('rb') as src, part.open('wb') as dst:
-                src.seek(start * 512)
-                left = count * 512
-                while left:
-                    chunk = src.read(min(left, 1 << 20))
-                    dst.write(chunk)
-                    left -= len(chunk)
-            check = subprocess.run(['e2fsck', '-fn', str(part)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            if check.returncode:
-                print(check.stdout.decode(errors='replace'))
-                raise SystemExit('install: e2fsck finds the ext2 partition damaged')
-            print(f'install: the ext2 partition for {args.data_dir} ({count // 2048} MiB) is clean to e2fsck')
+        check_ext2(1, args.data_dir)
 
     log = temp / 'boot.log'
     # with a data partition, until init has mounted it (/etc/fstab)

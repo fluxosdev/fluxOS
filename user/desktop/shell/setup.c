@@ -4,7 +4,7 @@
  * steps and shows which one is under way; a wizard in front of it finds
  * the install files and the disks, lets the user choose a disk, name the
  * computer and confirm that the disk will be erased, then runs
- * fluxinstall(1) to do the work (partition table, GRUB, FAT32, copying)
+ * fluxinstall(1) to do the work (partition table, GRUB, ext2, copying)
  * and follows its progress through a pipe. When it is done the computer
  * restarts into the installed system.
  *
@@ -464,7 +464,7 @@ static void paint(struct setup *s)
                           "Setup installs fluxOS on a hard disk in this computer, so that it "
                           "starts from the disk without the CD.\n\n"
                           "Setup creates a new partition table on the disk you choose, "
-                          "formats it as FAT32 and copies fluxOS and the GRUB boot loader "
+                          "formats it as ext2 and copies fluxOS and the GRUB boot loader "
                           "onto it.", C_BLACK);
         y += 14;
         if (s->source[0])
@@ -539,7 +539,7 @@ static void paint(struct setup *s)
         snprintf(buf, sizeof(buf), "All data on /dev/%s (%s, %s) will be erased.", d->name, d->model, d->size);
         gfx_text_wrap(sf, &font_sans_bold, TEXT_X + 44, y + 1, TEXT_W - 44, buf, C_BLACK);
         snprintf(buf, sizeof(buf),
-                 "Setup will create one FAT32 partition, /dev/%s%s1, install GRUB and make "
+                 "Setup will create one ext2 partition, /dev/%s%s1, install GRUB and make "
                  "the disk bootable, and name the computer %s. Any volumes on this disk are "
                  "unmounted first.\n\n"
                  "Click Install to begin. This takes a few minutes and cannot be interrupted.",

@@ -27,7 +27,8 @@ static int booted_from_disk(void)
     return n >= 4 && !strncmp(buf, "disk", 4);
 }
 
-/* The mounted FAT volume with GRUB on it, when started from a hard disk. */
+/* The mounted volume with GRUB on it (ext2 or FAT, usually the root),
+ * when started from a hard disk. */
 int grubenv_boot_dir(char *out, size_t size)
 {
     out[0] = 0;
@@ -35,7 +36,7 @@ int grubenv_boot_dir(char *out, size_t size)
         return 0;
     struct blkinfo bi;
     for (int i = 0; blkinfo(i, &bi) == 0; i++) {
-        if (!bi.mountpoint[0] || strncmp(bi.fstype, "fat", 3) != 0)
+        if (!bi.mountpoint[0] || (strncmp(bi.fstype, "fat", 3) && strcmp(bi.fstype, "ext2")))
             continue;
         char path[192];
         snprintf(path, sizeof(path), "%s/boot/grub/grub.cfg", bi.mountpoint);

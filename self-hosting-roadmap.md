@@ -84,7 +84,7 @@ and nine `.S` files.
 | A compiler that runs on fluxOS | done (phase 4, 2026-10-29): GCC 13.2.0 with C and C++, 72 MB on the image |
 | `make`, `tar`, `gzip` (compress), `find`, `install`, `cmp`/`diff`, `sed` | done (phase 3, 2026-10-29), with `patch`, `cut`, `xargs`, `truncate`, `dd`, `ln`, `mktemp`, `nproc`, `printf`, `test`, `true`, `false` |
 | libc | since phase 2, enough for GNU make and binutils to build; POSIX threads, interval timers, signal stacks and sessions since 2026-10-29; C++-clean headers, C99 math, `getaddrinfo`, `.init_array` constructors and `__cxa_atexit` for GCC and libstdc++ (2026-10-29); still no real links |
-| Filesystem | done (phase 5, 2026-10-30): ext2 read/write with symbolic and hard links, permissions and 1 s times, on a second partition (`fluxinstall -e /src`) or any disk; FAT32 stays the system's root, now with 1 s modification times |
+| Filesystem | done (phase 5, 2026-10-30): ext2 read/write with symbolic and hard links, permissions and 1 s times, on a second partition (`fluxinstall -e /src`) or any disk, and since 2026-10-31 the system's root (FAT32 with `fluxinstall -t fat32`, now with 1 s modification times) |
 | Kernel limits | 128 processes and threads together; `PATH_MAX` 4096 since 2026-10-29 (descriptors, memory regions, stack and pipes raised in phase 2) |
 | Boot media | done (phase 6, 2026-10-30): `mkiso` (ISO 9660, Rock Ridge, El Torito, hybrid MBR) and GRUB's images checked in |
 
@@ -115,8 +115,9 @@ ourselves is the ISO: a small `mkiso` (ISO 9660 with Rock Ridge names and
 an El Torito no-emulation entry) is a few hundred lines and the kernel's
 `iso9660.c` is the reference for the layout.
 
-**The filesystem for a build tree is ext2**, read and write, mounted on a
-second partition or disk; FAT32 stays the system's root. ext2 gives 1 s
+**The filesystem for a build tree is ext2**, read and write: the system's
+root since 2026-10-31 (FAT32 with `fluxinstall -t fat32`), or a second
+partition or disk. ext2 gives 1 s
 timestamps, permissions, hard and symbolic links and case-sensitive names,
 and it is the simplest format that has all four.
 
@@ -505,7 +506,9 @@ partition and boots the disk until init has mounted it.
       system gets half the disk up to 4 GiB, or `-r MIB`), which `/etc/fstab`
       names by UUID and init moves from the automounter's `/mnt/hdX2` to its
       place at start-up. fluxOS Setup's wizard does not offer it yet; its
-      command prompt (Shift+F10) and the text mode do.
+      command prompt (Shift+F10) and the text mode do. Since 2026-10-31 the
+      system partition itself is ext2 (GRUB's core image reads ext2 and FAT,
+      the kernel matches `root=UUID=` against either), FAT32 with `-t fat32`.
 - [x] Timestamps: the FAT driver writes the modification time into the
       creation time's fields too, its odd second in the 10 ms field, and
       reads it back while it falls within the write time's 2-second step
@@ -687,7 +690,7 @@ build) on 2026-10-31; what remains is 7, which automates it and adds stage
 - **Networking in the loop:** a native `git` is a large port (or a small
   `git clone`/`pull` over HTTPS with the smart protocol, ~3k lines); the
   GitHub zip through `wget` and `unzip` serves until then.
-- **A fluxOS boot loader** instead of GRUB's blobs: an MBR, a FAT32
+- **A fluxOS boot loader** instead of GRUB's blobs: an MBR, an ext2
   stage that loads a Multiboot ELF and sets the VESA mode, and the ISO
   equivalent. Nice for purity, not required as long as the blobs'
   provenance is documented.

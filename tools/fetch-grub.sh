@@ -47,14 +47,14 @@ fi
 # ---- firmware/grub ----
 pc=$dir/usr/lib/grub/i386-pc
 out=$(dirname "$0")/../firmware/grub
-rm -rf "$out"
+find "$out" -mindepth 1 ! -name README -delete
 mkdir -p "$out/i386-pc"
 # The hard disk's: boot.img in the MBR, core.img in the gap before the
-# FAT32 partition, reading its menu and modules from /boot/grub there
-# (fluxinstall writes both).
+# system partition (ext2, or FAT32 with fluxinstall -t fat32), reading its
+# menu and modules from /boot/grub there (fluxinstall writes both).
 cp "$pc/boot.img" "$out/boot.img"
 "$dir/usr/bin/grub-mkimage" -O i386-pc -d "$pc" -o "$out/core.img" \
-    -p '(,msdos1)/boot/grub' biosdisk part_msdos fat
+    -p '(,msdos1)/boot/grub' biosdisk part_msdos ext2 fat
 # The CD's: El Torito's no-emulation image, reading /boot/grub from the
 # drive it started from (a CD, or a USB stick the ISO was written to, which
 # boot_hybrid.img in the ISO's first sector starts).
@@ -64,7 +64,7 @@ cp "$pc/boot_hybrid.img" "$out/boot_hybrid.img"
 # The modules the two menus (grub/install.cfg, grub/grub.cfg) load, their
 # commands' modules (command.lst), a few for GRUB's own command line, and
 # everything those depend on (moddep.lst).
-mods="normal biosdisk part_msdos fat iso9660 all_video vbe vga video_bochs video_cirrus gfxterm
+mods="normal biosdisk part_msdos ext2 fat iso9660 all_video vbe vga video_bochs video_cirrus gfxterm
       terminal probe loadenv multiboot chain test echo sleep configfile ls cat help reboot halt"
 for cmd in $(sed -e 's/#.*//' grub/grub.cfg grub/install.cfg | awk 'NF { print $1 }' | sort -u); do
     m=$(awk -F': ' -v c="$cmd" '{ sub(/^\*/, "", $1) } $1 == c { print $2 }' "$pc/command.lst")
@@ -85,5 +85,5 @@ for m in $all; do
     cp "$pc/$m.mod" "$out/i386-pc/"
 done
 cp "$pc"/*.lst "$out/i386-pc/"
-(cd "$out" && find . -type f ! -name SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort | xargs sha256sum > SHA256SUMS)
+(cd "$out" && find . -type f ! -name SHA256SUMS ! -name README | sed 's|^\./||' | LC_ALL=C sort | xargs sha256sum > SHA256SUMS)
 echo "$out: $(echo $all | wc -w) modules from GRUB $ver"

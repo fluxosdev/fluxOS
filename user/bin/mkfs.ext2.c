@@ -49,8 +49,15 @@ static void wr32(uint8_t *p, uint32_t v) { wr16(p, v); wr16(p + 2, v >> 16); }
 
 static void put_at(uint64_t off, const void *buf, uint32_t n)
 {
-    if (lseek64(fd, (off64_t)off, SEEK_SET) < 0 || write(fd, buf, n) != (ssize_t)n)
+    if (lseek64(fd, (off64_t)off, SEEK_SET) < 0)
         die(strerror(errno));
+    for (const uint8_t *p = buf; n; ) {
+        ssize_t w = write(fd, p, n);
+        if (w <= 0)
+            die(w < 0 ? strerror(errno) : "short write");
+        p += w;
+        n -= (uint32_t)w;
+    }
 }
 
 static void put_block(uint32_t blk, const void *buf)
@@ -210,7 +217,9 @@ int main(int argc, char **argv)
     }
     uint32_t inodes = ipg * ngroups;
 
-    uint8_t *gdt = calloc(gdt_blocks, bs), *buf = calloc(1, bs), *zero = calloc(1, bs);
+    /* zero: a whole inode table, written in one go (on a large disk they
+     * are gigabytes, too slow a block at a time) */
+    uint8_t *gdt = calloc(gdt_blocks, bs), *buf = calloc(1, bs), *zero = calloc(itable_blocks, bs);
     if (!gdt || !buf || !zero)
         die("out of memory");
     uint32_t now = (uint32_t)time(NULL);
@@ -257,8 +266,7 @@ int main(int argc, char **argv)
         wr16(d + 16, g == 0 ? 2 : 0);
         free_blocks += gfree_blocks;
         free_inodes += ipg - iused;
-        for (uint32_t b = 0; b < itable_blocks; b++)
-            put_block(itab + b, zero);
+        put_at((uint64_t)itab * bs, zero, itable_blocks * bs);
         if (!quiet && ngroups > 8 && g % (ngroups / 8) == 0)
             fprintf(stderr, "mkfs.ext2: group %u of %u\r", g + 1, ngroups);
     }

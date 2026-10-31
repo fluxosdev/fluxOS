@@ -1,15 +1,15 @@
 /*
  * fluxinstall - install fluxOS onto a hard disk.
  *
- *   fluxinstall [-y] [-p] [-s SOURCE] [-n HOSTNAME] [-e DIR [-r MIB]] [/dev/hdX]
+ *   fluxinstall [-y] [-p] [-s SOURCE] [-n HOSTNAME] [-t ext2|fat32] [-e DIR [-r MIB]] [/dev/hdX]
  *
- * The disk gets a new MBR partition table with one bootable FAT32
- * partition starting at 1 MiB. With -e, a second partition after it, ext2,
- * holds DIR (such as /src for a source tree, or /home): links, permissions
- * and one-second times, which a build wants and FAT32 does not have. The
- * system partition then gets -r MIB of the disk (by default half, up to
- * 4 GiB, and at least what the system needs) and the ext2 one the rest;
- * /etc/fstab on the system says where init mounts it. GRUB's boot sector goes into the MBR and
+ * The disk gets a new MBR partition table with one bootable partition
+ * starting at 1 MiB, ext2 (links, permissions and one-second times) or,
+ * with -t fat32, FAT32 (which other systems can read too). With -e, a
+ * second partition after it, ext2, holds DIR (such as /src for a source
+ * tree, or /home). The system partition then gets -r MIB of the disk (by
+ * default half, up to 4 GiB, and at least what the system needs) and the
+ * second one the rest; /etc/fstab on the system says where init mounts it. GRUB's boot sector goes into the MBR and
  * its core image into the gap before the partition, which is what
  * grub-install does for a BIOS disk. The partition is formatted, and the
  * kernel, GRUB's modules and its menu for a hard disk are copied there
@@ -42,7 +42,7 @@
 
 #define SECTOR      512
 #define PART_START  2048                /* 1 MiB: room for GRUB's core image */
-#define MIN_PART    67584               /* 33 MiB: enough clusters for FAT32 */
+#define MIN_PART    67584               /* 33 MiB: enough clusters for FAT32 (-t fat32) */
 #define MOUNTPOINT  "/mnt/install"
 #define MAX_DISKS   8
 
@@ -55,6 +55,7 @@
 
 static const char *source;              /* -s, or found */
 static const char *hostname;            /* -n: for the installed /etc/hostname */
+static int fat_root;                    /* -t fat32: the system partition is FAT32, not ext2 */
 static const char *data_dir;            /* -e: the second, ext2, partition's mount point */
 static unsigned system_mib;             /* -r: the system partition's size (0: chosen) */
 static int mounted;
@@ -145,7 +146,7 @@ static void copy_file(const char *src, const char *dst, unsigned long *bytes)
     int in = open(src, O_RDONLY);
     if (in < 0)
         die("%s: %s", src, strerror(errno));
-    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC);
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out < 0)
         die("%s: %s", dst, strerror(errno));
     int n;
@@ -175,7 +176,26 @@ static unsigned octal(const char *s, size_t n)
     return v;
 }
 
-/* Unpack the ustar archive `tar` (directories and regular files) into dir. */
+/* An archive member's name, or a link's target, as a path under dir. */
+static void member_path(char *out, size_t size, const char *dir, char *name)
+{
+    char *p = name;
+    while (*p == '.' && p[1] == '/')
+        p += 2;
+    while (*p == '/')
+        p++;
+    size_t len = strlen(p);
+    while (len && p[len - 1] == '/')
+        p[--len] = 0;
+    if (*p && strcmp(p, "."))
+        path_join(out, size, dir, p);
+    else
+        out[0] = 0;
+}
+
+/* Unpack the ustar archive `tar` into dir: directories, files and their
+ * modes, and links. FAT has neither modes nor links: a hard link becomes
+ * a copy there, and a symbolic link is left out. */
 static void extract_tar(const char *tar, const char *dir, unsigned long *bytes, unsigned *files)
 {
     static char buf[65536];
@@ -190,26 +210,36 @@ static void extract_tar(const char *tar, const char *dir, unsigned long *bytes, 
         if (h[345])
             snprintf(name, sizeof(name), "%.155s/", (char *)h + 345);
         snprintf(name + strlen(name), sizeof(name) - strlen(name), "%.100s", (char *)h);
+        unsigned mode = octal((char *)h + 100, 8) & 07777;
         unsigned size = octal((char *)h + 124, 12);
         unsigned padded = (size + SECTOR - 1) / SECTOR * SECTOR;
+        char dst[PATH_MAX], target[101];
+        member_path(dst, sizeof(dst), dir, name);
+        snprintf(target, sizeof(target), "%.100s", (char *)h + 157);
 
-        char *p = name;
-        while (*p == '.' && p[1] == '/')
-            p += 2;
-        while (*p == '/')
-            p++;
-        size_t len = strlen(p);
-        while (len && p[len - 1] == '/')
-            p[--len] = 0;
-        char dst[PATH_MAX];
-        path_join(dst, sizeof(dst), dir, p);
-
-        if (*p && strcmp(p, ".") && h[156] == '5') {
+        if (dst[0] && h[156] == '5') {
             make_dir(dst);
-        } else if (*p && (h[156] == '0' || h[156] == 0)) {
-            int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC);
+            chmod(dst, mode);
+        } else if (dst[0] && h[156] == '1') {
+            char from[PATH_MAX];
+            member_path(from, sizeof(from), dir, target);
+            unlink(dst);
+            if (!from[0])
+                die("%s: %s links to nothing", tar, dst);
+            if (link(from, dst) < 0) {
+                copy_file(from, dst, bytes);
+                chmod(dst, mode);
+            }
+            (*files)++;
+        } else if (dst[0] && h[156] == '2') {
+            unlink(dst);
+            if (symlink(target, dst) == 0)
+                (*files)++;
+        } else if (dst[0] && (h[156] == '0' || h[156] == 0)) {
+            int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode);
             if (out < 0)
                 die("%s: %s", dst, strerror(errno));
+            fchmod(out, mode);
             for (unsigned left = padded; left; ) {
                 unsigned chunk = left < sizeof(buf) ? left : sizeof(buf);
                 if (read(in, buf, chunk) != (int)chunk)
@@ -261,14 +291,20 @@ static void size_str(unsigned sectors, char *out, size_t n)
         snprintf(out, n, "%u.%u GiB", mb / 1024, mb % 1024 * 10 / 1024);
 }
 
-static int run_mkfs(const char *dev, int ext2, const char *label)
+/* Format dev: ext2 with bytes_per_inode (NULL: mkfs.ext2's own), or FAT32. */
+static int run_mkfs(const char *dev, int ext2, const char *label, const char *bytes_per_inode)
 {
     int pid = fork();
     if (pid < 0)
         return -1;
     if (pid == 0) {
-        char *fat[] = { "mkfs.fat", "-n", "FLUXOS", (char *)dev, NULL };
-        char *e2[] = { "mkfs.ext2", "-q", "-L", (char *)label, (char *)dev, NULL };
+        char *fat[] = { "mkfs.fat", "-n", (char *)label, (char *)dev, NULL };
+        char *e2[] = { "mkfs.ext2", "-q", "-L", (char *)label, (char *)dev, NULL, NULL, NULL };
+        if (bytes_per_inode) {
+            e2[4] = "-i";
+            e2[5] = (char *)bytes_per_inode;
+            e2[6] = (char *)dev;
+        }
         execve(ext2 ? "/bin/mkfs.ext2" : "/bin/mkfs.fat", ext2 ? e2 : fat, environ);
         _exit(127);
     }
@@ -298,11 +334,13 @@ static int ext2_uuid(const char *dev, char *out, size_t size)
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: fluxinstall [-y] [-p] [-s SOURCE] [-n HOSTNAME] [-e DIR [-r MIB]] [/dev/hdX]\n"
+    fprintf(stderr, "usage: fluxinstall [-y] [-p] [-s SOURCE] [-n HOSTNAME] [-t ext2|fat32] [-e DIR [-r MIB]]\n"
+                    "                   [/dev/hdX]\n"
                     "  -y           do not ask for confirmation\n"
                     "  -p           print \"progress N\" lines (N: 0-100)\n"
                     "  -s SOURCE    install medium (default: the fluxOS CD, wherever mounted)\n"
                     "  -n HOSTNAME  the installed computer's name (letters, digits, hyphens)\n"
+                    "  -t TYPE      the system partition's filesystem: ext2 (default) or fat32\n"
                     "  -e DIR       a second partition, ext2, mounted on DIR (/src, /home...)\n"
                     "  -r MIB       with -e: the system partition's size; the ext2 one gets the rest\n"
                     "Without a disk, fluxinstall asks which one to use.\n");
@@ -454,6 +492,9 @@ int main(int argc, char **argv)
             source = argv[++i];
         else if (!strcmp(argv[i], "-n") && i + 1 < argc)
             hostname = argv[++i];
+        else if (!strcmp(argv[i], "-t") && i + 1 < argc && (!strcmp(argv[i + 1], "ext2") ||
+                                                              !strcmp(argv[i + 1], "fat32")))
+            fat_root = !strcmp(argv[++i], "fat32");
         else if (!strcmp(argv[i], "-e") && i + 1 < argc)
             data_dir = argv[++i];
         else if (!strcmp(argv[i], "-r") && i + 1 < argc)
@@ -517,7 +558,7 @@ int main(int argc, char **argv)
         char tarpath[PATH_MAX];
         path_join(tarpath, sizeof(tarpath), source, "boot/system.tar");
         unsigned long long need = stat(tarpath, &tst) == 0 ? (unsigned long long)tst.st_size : 0;
-        need += need / 4 + (64ull << 20);               /* FAT's clusters, GRUB, room to spare */
+        need += need / 4 + (64ull << 20);               /* the filesystem's own, GRUB, room to spare */
         unsigned need_mib = (unsigned)(need >> 20), mib = system_mib;
         if (need_mib < MIN_PART / 2048 + 1)
             need_mib = MIN_PART / 2048 + 1;
@@ -562,6 +603,7 @@ int main(int argc, char **argv)
         die("core.img does not fit before the partition (%u sectors)", core_sectors);
 
     /* ---- confirmation ---- */
+    const char *fstype = fat_root ? "FAT32" : "ext2";
     char size[32];
     size_str(target.sectors, size, sizeof(size));
     printf("fluxOS installer\n\n");
@@ -574,10 +616,10 @@ int main(int argc, char **argv)
         char a[32], b[32];
         size_str(sys_sectors, a, sizeof(a));
         size_str(data_sectors, b, sizeof(b));
-        printf("This creates a FAT32 partition (%s, %s) and installs GRUB and fluxOS on it,\n"
-               "and an ext2 partition (%s, %s) for %s.\n", partpath, a, datapath, b, data_dir);
+        printf("This creates a %s partition (%s, %s) and installs GRUB and fluxOS on it,\n"
+               "and an ext2 partition (%s, %s) for %s.\n", fstype, partpath, a, datapath, b, data_dir);
     } else {
-        printf("This creates one FAT32 partition (%s) and installs GRUB and fluxOS.\n", partpath);
+        printf("This creates one %s partition (%s) and installs GRUB and fluxOS.\n", fstype, partpath);
     }
     printf("\033[1;31mALL DATA ON %s WILL BE ERASED.\033[0m\n", devpath);
     if (!yes) {
@@ -639,7 +681,7 @@ int main(int argc, char **argv)
     unsigned psize = sys_sectors;
     pe[0] = 0x80;                                       /* bootable */
     pe[1] = 0xFE; pe[2] = 0xFF; pe[3] = 0xFF;           /* CHS: use LBA */
-    pe[4] = 0x0C;                                       /* FAT32, LBA */
+    pe[4] = fat_root ? 0x0C : 0x83;                     /* FAT32 (LBA), or Linux */
     pe[5] = 0xFE; pe[6] = 0xFF; pe[7] = 0xFF;
     wr32(pe + 8, PART_START);
     wr32(pe + 12, psize);
@@ -671,12 +713,14 @@ int main(int argc, char **argv)
 
     /* ---- [2/4] filesystem ---- */
     progress(2);
-    printf("[2/4] Formatting %s as FAT32\n", partpath);
-    if (run_mkfs(partpath, 0, NULL) < 0)
+    printf("[2/4] Formatting %s as %s\n", partpath, fstype);
+    /* one inode per 16 KiB, as mke2fs makes them: the system's files are
+     * not small, and a whole large disk's inode tables are less to write */
+    if (run_mkfs(partpath, !fat_root, "FLUXOS", "16384") < 0)
         die("formatting %s failed", partpath);
     if (data_dir) {
         printf("      Formatting %s as ext2 for %s\n", datapath, data_dir);
-        if (run_mkfs(datapath, 1, data_dir + 1) < 0)
+        if (run_mkfs(datapath, 1, data_dir + 1, NULL) < 0)
             die("formatting %s failed", datapath);
     }
 
@@ -684,7 +728,7 @@ int main(int argc, char **argv)
     progress(COPY_FROM);
     printf("[3/4] Copying fluxOS from %s\n", source);
     make_dir(MOUNTPOINT);
-    if (mount(partpath, MOUNTPOINT, "fat32") < 0)
+    if (mount(partpath, MOUNTPOINT, fat_root ? "fat32" : "ext2") < 0)
         die("mount %s: %s", partpath, strerror(errno));
     mounted = 1;
 

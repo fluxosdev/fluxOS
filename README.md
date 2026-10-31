@@ -90,7 +90,7 @@ says why.
   caches.
 - VFS over an in-memory filesystem unpacked from a ustar initrd at boot, with
   `/dev/{tty,console,null,zero,random,urandom}`, pipes and pseudo-terminals.
-  Started from an installed disk (`root=UUID=...`), its FAT32 partition is the
+  Started from an installed disk (`root=UUID=...`), its ext2 (or FAT32) partition is the
   root instead and only `/dev`, `/tmp` and `/mnt` stay in memory. Symbolic
   links are followed in paths (`lstat`, `readlink`, `symlink`, `link`), on
   ext2 and in memory.
@@ -841,7 +841,7 @@ make test-kernel-qemu KERNEL_TEST_CPUS=2 KERNEL_TEST_MEMORY=2048 # larger RAM an
 make test-kernel-qemu KERNEL_TEST_CMDLINE=readcache=0 # direct-read fallback
 make test-kernel-qemu KERNEL_TEST_CPUS=4 KERNEL_TEST_CMDLINE=nosmp # single-core fallback
 make test-kernel-qemu KERNEL_TEST_CPUS=4 KERNEL_TEST_CMDLINE=maxcpus=2 # CPU limit
-make disk       # fluxdisk.img, a 256 MiB FAT32 data disk (DISK_MB=..., DISKFS=ext2)
+make disk       # fluxdisk.img, a 256 MiB ext2 data disk (DISK_MB=..., DISKFS=fat32)
 make floppy     # fluxfloppy.img, a 1.44 MB FAT12 floppy for drive A:
 make run        # boots the install CD in QEMU with the disk, floppy (if any) and an NE2000
 make run-kernel # boots the kernel directly, the whole system in memory (text console)
@@ -907,12 +907,14 @@ copy files off them before one is erased. **Quit** leaves Setup by restarting
 or shutting down, and **Shift+F10** opens a command prompt. Without a framebuffer, or with the menu's **Install fluxOS (text
 mode)**, the same questions come on the console; from that console (or the
 command prompt) `fluxinstall /dev/hda` installs directly (it asks you to type
-"yes", `-y` skips that). `fluxinstall -e /src /dev/hda` adds a second
+"yes", `-y` skips that). `fluxinstall -t fat32` makes the system partition
+FAT32 instead of ext2, for a disk other systems should read too.
+`fluxinstall -e /src /dev/hda` adds a second
 partition, ext2, for a source tree (or `-e /home`): the system partition gets
-half the disk up to 4 GiB (`-r MIB` says otherwise) and the ext2 one the rest,
+half the disk up to 4 GiB (`-r MIB` says otherwise) and the second one the rest,
 mounted on `/src` at start-up from `/etc/fstab`.
 
-Setup writes an MBR with one bootable FAT32 partition at 1 MiB, installs GRUB,
+Setup writes an MBR with one bootable ext2 partition at 1 MiB, installs GRUB,
 formats the partition, copies the kernel and GRUB's files onto it and unpacks
 the system (`boot/system.tar` on the CD). **This erases the whole disk**, which
 must be at least 34 MiB. Once a disk has fluxOS, the CD's menu starts the hard
@@ -1167,9 +1169,9 @@ user range and page tables first.
 The kernel runs on every processor at once, but the I/O APIC is not used: every
 interrupt reaches the first processor through the PICs. From the CD, the root
 filesystem lives in RAM and only what you write to a mounted FAT volume persists;
-an installed system runs from its FAT32 partition, which has no symbolic or hard
-links and only the exec bit of the permissions (an ext2 partition, `fluxinstall -e`,
-has both; permissions are not enforced anywhere). There is one user,
+an installed system runs from its ext2 partition, with symbolic and hard links and
+permissions (only the exec bit is enforced; a FAT32 one, `fluxinstall -t fat32`, has no
+links and only that bit). There is one user,
 and there are no shared libraries (programs are linked statically).
 The FPU state is saved with FXSAVE, so AVX and later cannot be used.
 

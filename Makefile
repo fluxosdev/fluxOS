@@ -14,7 +14,7 @@
 #                   a USB keyboard and mouse on UHCI
 #   make run-nvme   boot the ISO with fluxdisk.img as an NVMe disk
 #   make check      verify the kernel is a valid multiboot image
-#   make disk       create fluxdisk.img, a FAT32 data disk (kept by make clean)
+#   make disk       create fluxdisk.img, an ext2 data disk (kept by make clean)
 #   make floppy     create fluxfloppy.img, a 1.44 MB FAT12 floppy that the
 #                   QEMU targets then put in drive A: (kept by make clean)
 #   make clean      remove build artifacts
@@ -411,11 +411,10 @@ check: $(KERNEL) $(MBCHECK)
 
 disk: $(DISK)
 
-# A blank FAT32 disk; without a host mkfs.fat it stays unformatted and can
-# be formatted from inside fluxOS with "mkfs.fat /dev/hda".
-# DISKFS=ext2 makes it ext2 instead, with fluxOS's own mkfs.ext2 built for
-# the host (a disk for a source tree: links, permissions, one-second times).
-DISKFS ?= fat32
+# A blank ext2 disk, made with fluxOS's own mkfs.ext2 built for the host.
+# DISKFS=fat32 makes it FAT32 instead; without a host mkfs.fat it then stays
+# unformatted and can be formatted from inside fluxOS with "mkfs.fat /dev/hda".
+DISKFS ?= ext2
 $(DISK): $(if $(filter ext2,$(DISKFS)),$(HOST_TOOLS)/mkfs.ext2)
 	truncate -s $(DISK_MB)M $@
 ifeq ($(DISKFS),ext2)

@@ -1189,6 +1189,20 @@ static int fat_uuid(struct blockdev *bd, char *out, uint32_t size)
     return 0;
 }
 
+/* An ext2 volume's UUID, 8-4-4-4-12 hex digits as GRUB and Linux write it. */
+static int ext2_uuid(struct blockdev *bd, char *out, uint32_t size)
+{
+    uint8_t sb[1024];
+    if (bd->sector_size != 512 || bd->nsectors < 4 || blk_read(bd, 2, 2, sb) < 0)
+        return -1;
+    if (sb[56] != 0x53 || sb[57] != 0xEF)
+        return -1;
+    const uint8_t *u = sb + 104;
+    snprintf(out, size, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+    return 0;
+}
+
 static int same_uuid(const char *a, const char *b)
 {
     for (;; a++, b++) {
@@ -1202,8 +1216,9 @@ static int same_uuid(const char *a, const char *b)
 }
 
 /*
- * Make the filesystem on the volume `spec` names (UUID=xxxx-xxxx, or a
- * device name such as hda1) the root, so the system runs from the disk
+ * Make the filesystem on the volume `spec` names (UUID= an ext2 volume's
+ * UUID or a FAT one's xxxx-xxxx serial number, or a device name such as
+ * hda1) the root, so the system runs from the disk
  * rather than from an initrd in memory. /dev and /mnt move over from the
  * ramfs root; /tmp uses the writable disk root so large compiler temporaries
  * do not consume the kernel heap and cross-directory renames stay on one fs.
@@ -1213,10 +1228,11 @@ int vfs_mount_root(const char *spec)
     int by_uuid = !strncmp(spec, "UUID=", 5);
     struct blockdev *bd = NULL, *b;
     for (int i = 0; !bd && (b = blk_get(i)); i++) {
-        char id[16];
+        char id[40];
         if (b->type == BLK_CDROM || b->type == BLK_FLOPPY || b->fs)
             continue;
-        if (by_uuid ? fat_uuid(b, id, sizeof(id)) == 0 && same_uuid(id, spec + 5)
+        if (by_uuid ? (ext2_uuid(b, id, sizeof(id)) == 0 || fat_uuid(b, id, sizeof(id)) == 0) &&
+                      same_uuid(id, spec + 5)
                     : !strcmp(b->name, spec))
             bd = b;
     }

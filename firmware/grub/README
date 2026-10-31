@@ -18,9 +18,10 @@ lists every file's hash.
                     boot sector. fluxinstall writes it into the MBR (with
                     core.img's address, the partition table kept).
   core.img          grub-mkimage -O i386-pc -p '(,msdos1)/boot/grub'
-                    biosdisk part_msdos fat: the hard disk's core image,
-                    which fluxinstall writes into the gap before the first
-                    partition. It reads /boot/grub there.
+                    biosdisk part_msdos ext2 fat: the hard disk's core
+                    image, which fluxinstall writes into the gap before the
+                    first partition. It reads /boot/grub there, from ext2
+                    (the default) or FAT32 (fluxinstall -t fat32).
   boot_hybrid.img   usr/lib/grub/i386-pc/boot_hybrid.img, unchanged: the
                     ISO's first sector (mkiso -G), so that the ISO written
                     to a USB stick starts too. mkiso patches in the El Torito
