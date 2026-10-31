@@ -3,13 +3,14 @@
 #include <string.h>
 #include "desktop.h"
 
-/* Kinetik: a light, softly shaded button with round corners; the default one is outlined in the color. */
+/* Kinetik: a light, softly shaded button with round corners; the default one is outlined in the color.
+ * Seashell's are in its warm grays. */
 static void kinetik_button(struct surface *s, struct rect r, const char *label, int pressed,
                            int is_default, int focused)
 {
     static const int pos[2] = { 0, 256 };
-    color_t up[2] = { ARGB(255, 0xFFFFFF), ARGB(255, 0xE1EAF3) };
-    color_t down[2] = { ARGB(255, 0xD3DFEB), ARGB(255, 0xE6EEF6) };
+    color_t up[2] = { ARGB(255, 0xFFFFFF), ARGB(255, SEASHELL ? 0xE3E9E4 : 0xE1EAF3) };
+    color_t down[2] = { ARGB(255, SEASHELL ? 0xD3DDD8 : 0xD3DFEB), ARGB(255, SEASHELL ? 0xE6ECE8 : 0xE6EEF6) };
     gfx_fill(s, r.x, r.y, r.w, r.h, C_FACE);
     gfx_gradient(s, r, 4, 4, 2, pressed ? down : up, pos);
     gfx_round_frame(s, r, 4, 4, ARGB(255, is_default || pressed ? theme.wall2 : sys.edge));
@@ -123,8 +124,8 @@ static void title_glyph(struct surface *s, int cx, int cy, int glyph, color_t c)
  * Kinetik Glass's white glyphs have a faint dark edge below, to stand out on pale glass. */
 static void kinetik_title_button(struct surface *s, struct rect r, int glyph, int pressed, int disabled)
 {
-    if (pressed)
-        gfx_round_fill(s, r, 4, 4, ARGB(70, 0xFFFFFF));
+    if (pressed)                        /* Seashell's pale chrome takes a shade instead */
+        gfx_round_fill(s, r, 4, 4, SEASHELL ? ARGB(36, 0x263D3E) : ARGB(70, 0xFFFFFF));
     int cx = r.x + r.w / 2, cy = r.y + r.h / 2;
     if (GLASS)
         title_glyph(s, cx, cy + 1, glyph, ARGB(disabled ? 30 : 90, 0x142533));
@@ -227,7 +228,7 @@ void draw_tab_edges(struct surface *s, struct rect r, int selected)
 void draw_separator(struct surface *s, int x, int y, int w)
 {
     if (KINETIK) {
-        gfx_hline(s, x, y, w, RGB(0xBE, 0xCD, 0xDD));
+        gfx_hline(s, x, y, w, SEASHELL ? RGB(0xC3, 0xCE, 0xC7) : RGB(0xBE, 0xCD, 0xDD));
         return;
     }
     gfx_hline(s, x, y, w, C_SHADOW);
@@ -263,9 +264,11 @@ static void sbar_arrow(struct surface *s, struct rect r, int vertical, int secon
 {
     if (KINETIK) {                      /* no button: a small triangle, on a patch while held */
         if (pressed)
-            gfx_round_fill(s, mkrect(r.x + 2, r.y + 2, r.w - 4, r.h - 4), 3, 3, ARGB(255, 0xC9D6E4));
+            gfx_round_fill(s, mkrect(r.x + 2, r.y + 2, r.w - 4, r.h - 4), 3, 3,
+                           ARGB(255, SEASHELL ? 0xCCD7D0 : 0xC9D6E4));
         int mx = r.x + r.w / 2 - 1, my = r.y + r.h / 2 - 1;
-        color_t col = enabled ? RGB(0x4E, 0x63, 0x7A) : RGB(0xB4, 0xC2, 0xD1);
+        color_t col = SEASHELL ? (enabled ? RGB(0x50, 0x64, 0x66) : RGB(0xB7, 0xC4, 0xBD))
+                               : (enabled ? RGB(0x4E, 0x63, 0x7A) : RGB(0xB4, 0xC2, 0xD1));
         for (int i = 0; i < 4; i++) {
             int k = second ? i : 3 - i;
             if (vertical)
@@ -317,7 +320,8 @@ struct rect sbar_thumb(const struct sbar *b)
 void sbar_draw(struct surface *s, const struct sbar *b, enum sbar_part pressed)
 {
     struct rect r = b->r;
-    gfx_fill(s, r.x, r.y, r.w, r.h, KINETIK ? RGB(0xEB, 0xF1, 0xF7) : C_FACE);
+    color_t track = SEASHELL ? RGB(0xE9, 0xEE, 0xEA) : KINETIK ? RGB(0xEB, 0xF1, 0xF7) : C_FACE;
+    gfx_fill(s, r.x, r.y, r.w, r.h, track);
     if (!KINETIK)
         gfx_dither(s, r.x, r.y, r.w, r.h, C_WHITE);
     int enabled = sbar_max(b) > 0;
@@ -334,7 +338,9 @@ void sbar_draw(struct surface *s, const struct sbar *b, enum sbar_part pressed)
     struct rect t = sbar_thumb(b);
     if (!rect_empty(t) && KINETIK) {    /* a rounded bar, narrower than the track */
         struct rect in = b->vertical ? mkrect(t.x + 3, t.y + 1, t.w - 6, t.h - 2) : mkrect(t.x + 1, t.y + 3, t.w - 2, t.h - 6);
-        gfx_round_fill(s, in, 4, 4, ARGB(255, pressed == SBAR_THUMB ? 0x93A9C1 : 0xB2C3D6));
+        color_t thumb = SEASHELL ? (pressed == SBAR_THUMB ? 0x98ABA2 : 0xB9C7BF)
+                                 : (pressed == SBAR_THUMB ? 0x93A9C1 : 0xB2C3D6);
+        gfx_round_fill(s, in, 4, 4, ARGB(255, thumb));
     } else if (!rect_empty(t)) {
         gfx_fill(s, t.x, t.y, t.w, t.h, C_FACE);
         gfx_bevel(s, t, BEVEL_RAISED);

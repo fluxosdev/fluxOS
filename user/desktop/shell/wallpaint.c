@@ -273,6 +273,22 @@ static void stroke_curve(struct surface *s, const struct curve *cv, int w, int h
 
 void wallpaper_kinetik(struct surface *s, int w, int h)
 {
+    if (SEASHELL) {
+        /* Seashell's: corner to corner, light sage, its middle color (wall1) at 55%, a deeper one. */
+        color_t lut[1025];
+        for (int i = 0; i <= 1024; i++)
+            lut[i] = i < 563 ? gfx_mix(RGB(0xB8, 0xCA, 0xC6), theme.wall1, i * 256 / 563)
+                             : gfx_mix(theme.wall1, RGB(0x7E, 0x9B, 0x9E), (i - 563) * 256 / (1024 - 563));
+        for (int j = 0; j < h; j++) {
+            uint32_t *row = s->px + j * s->stride;
+            float v = ((float)j + 0.5f) / (float)h;
+            for (int i = 0; i < w; i++) {
+                float t = (((float)i + 0.5f) / (float)w + v) * 0.5f;
+                row[i] = lut[t <= 0.0f ? 0 : t >= 1.0f ? 1024 : (int)(t * 1024.0f)];
+            }
+        }
+        return;
+    }
     /* The gradient runs from the top left corner towards (0.8 w, h): wall0, wall1 at 52%, wall2. */
     color_t lut[1025];
     for (int i = 0; i <= 1024; i++)

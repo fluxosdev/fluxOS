@@ -22,7 +22,7 @@
 #define READ_BUDGET (64u << 10)
 #define CREDIT 0x494d4743u
 #define RESULT 0x494d4752u
-struct request { uint32_t kind, bytes, w, h, mode, color, colors[5]; };
+struct request { uint32_t kind, bytes, w, h, mode, color, colors[5], style; };
 struct message { uint32_t kind, bytes, w, h, full_w, full_h; };
 struct image_job {
     struct image_job *next;
@@ -150,7 +150,7 @@ static void child_loop(int input, int output)
                surface_init(&rendered,(int)request.w,(int)request.h)==0) {
                 if(request.kind==6) {
                     theme.wall0=request.colors[0];theme.wall1=request.colors[1];theme.wall2=request.colors[2];
-                    theme.pale=request.colors[3];theme.glow=request.colors[4];
+                    theme.pale=request.colors[3];theme.glow=request.colors[4];theme.style=(int)request.style;
                     wallpaper_kinetik(&rendered,rendered.w,rendered.h);
                 } else wallpaper_render(&rendered,mkrect(0,0,rendered.w,rendered.h),image,image->w,image->h,
                                          (int)request.mode,request.color,rendered.w,rendered.h);
@@ -351,7 +351,7 @@ int image_job_wallpaper(void *owner,const char *path,int mode,uint32_t color,int
                         image_job_done done,void *context,void (*cleanup)(void *))
 {
     struct request options={ .w=(unsigned)w,.h=(unsigned)h,.mode=(unsigned)mode,.color=color,
-        .colors={theme.wall0,theme.wall1,theme.wall2,theme.pale,theme.glow} };
+        .colors={theme.wall0,theme.wall1,theme.wall2,theme.pale,theme.glow},.style=(uint32_t)theme.style };
     return path ? submit(owner,path,(unsigned)strlen(path),!strcmp(path,WALLPAPER_KINETIK)?6:5,
                           done,context,cleanup,&options) : -1;
 }

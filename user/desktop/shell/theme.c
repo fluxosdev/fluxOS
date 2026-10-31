@@ -11,6 +11,9 @@
  * Kinetik Glass is Kinetik in a single pale blue-gray with the chrome made
  * see-through: frames of faintly tinted glass with a sheen across their
  * captions, and a taskbar and sidebar of smoked glass.
+ * Seashell is after the Kinetik Flat study: Kinetik's frames in pale warm
+ * grays with dark text on them, a light sidebar of solid cards, a plain
+ * sage gradient for the wallpaper, and a restrained blue for what is chosen.
  *
  * A theme is a set of values: the system colors (gfx.h), the frame
  * geometry and Kinetik's palette (struct theme), and the UI fonts, which
@@ -22,7 +25,7 @@
  * theme_set, and theme_sample).
  *
  * The choice is kept in GRUB's environment block when the system runs from
- * a hard disk (fluxos_theme: "classic", "glass", or "kinetik-" and the color).
+ * a hard disk (fluxos_theme: "classic", "glass", "seashell", or "kinetik-" and the color).
  */
 #include <stdio.h>
 #include <string.h>
@@ -31,8 +34,8 @@
 struct theme theme;
 struct pfont font_sans, font_sans_bold;
 
-const char *const theme_style_names[THEME_STYLES] = { "Classic", "Kinetik", "Kinetik Glass" };
-static const char *const style_keys[THEME_STYLES] = { "classic", "kinetik", "glass" };
+const char *const theme_style_names[THEME_STYLES] = { "Classic", "Kinetik", "Kinetik Glass", "Seashell" };
+static const char *const style_keys[THEME_STYLES] = { "classic", "kinetik", "glass", "seashell" };
 const char *const accent_names[ACCENTS] = { "Blue", "Purple", "Orange", "Green", "White", "Black" };
 static const char *const accent_keys[ACCENTS] = { "blue", "purple", "orange", "green", "white", "black" };
 /* The color each one is named for (the studies' swatches). */
@@ -68,13 +71,21 @@ static const struct palette {
 static const struct palette glass_palette = { 0x31444F, 0x86A0AE, 0x9DB7C4, 0xD4EAF1, 0xB8D3DF, 0x687079,
                                               0x454C53, 0x272E35, 0x617D8C, 0x304858, 0xEDF3F9 };
 
+/* Seashell's, from the Kinetik Flat study: a deep sage for shading (wall0), the wallpaper's middle
+ * (wall1), its blue for what is chosen (wall2, glow), the chrome's warm grays and dark text on them.
+ * Its wallpaper is a gradient of its own (wallpaint.c). */
+static const struct palette seashell_palette = { 0x2E4546, 0x9EB5B5, 0x5687AD, 0xD5E3EC, 0x5687AD, 0xF7F8F5,
+                                                 0xE9EDE8, 0xDCE2DD, 0xA5B6AD, 0x344447, 0x344447 };
+
 void theme_apply(int style, int accent)
 {
     theme.style = style >= 0 && style < THEME_STYLES ? style : THEME_KINETIK;
     theme.accent = accent >= 0 && accent < ACCENTS ? accent : ACCENT_BLUE;
     /* Kinetik's colors are kept under Classic too, for its wallpaper if that is still chosen.
-     * Glass has one color of its own (the accent is kept for going back to Kinetik). */
-    const struct palette *p = theme.style == THEME_GLASS ? &glass_palette : &palettes[theme.accent];
+     * Glass and Seashell have one color of their own (the accent is kept for going back to Kinetik). */
+    const struct palette *p = theme.style == THEME_GLASS      ? &glass_palette
+                            : theme.style == THEME_SEASHELL ? &seashell_palette
+                                                              : &palettes[theme.accent];
     theme.wall0 = p->wall0, theme.wall1 = p->wall1, theme.wall2 = p->wall2;
     theme.pale = p->pale, theme.glow = p->glow;
     theme.chrome0 = p->chrome0, theme.chrome1 = p->chrome1, theme.chrome2 = p->chrome2;
@@ -98,18 +109,26 @@ void theme_apply(int style, int accent)
     /* The surfaces are the same blue-gray in every color; selections are in the color itself
      * (but for White and Glass, whose own are too pale under white text). */
     color_t select = theme.style == THEME_GLASS ? RGB(0x4A, 0x6A, 0x7C)
-                   : theme.accent == ACCENT_WHITE ? p->ink : p->wall2;
+                   : theme.style != THEME_SEASHELL && theme.accent == ACCENT_WHITE ? p->ink : p->wall2;
+    font_sans = font_archivo;
+    font_sans_bold = font_archivo_bold;
+    if (theme.style == THEME_SEASHELL) {        /* the study's warm sage grays */
+        sys = (struct syscolors){
+            .face = RGB(0xED, 0xF0, 0xEC), .light = RGB(0xF8, 0xF9, 0xF6), .shadow = RGB(0x8D, 0x9F, 0x98),
+            .highlight = select, .desktop = p->wall1, .teal = select, .flat = 1,
+            .edge = RGB(0xB8, 0xC5, 0xBE), .edge_dark = RGB(0x8D, 0x9F, 0x98), .field_edge = RGB(0xB5, 0xC4, 0xBA),
+        };
+        return;
+    }
     sys = (struct syscolors){
         .face = RGB(0xE6, 0xEE, 0xF6), .light = RGB(0xF6, 0xF9, 0xFC), .shadow = RGB(0x8A, 0x9C, 0xB0),
         .highlight = select, .desktop = theme.style == THEME_GLASS ? RGB(0xC1, 0xCB, 0xD1) : p->wall1,
         .teal = select, .flat = 1,
         .edge = RGB(0xA4, 0xB6, 0xC9), .edge_dark = RGB(0x7F, 0x93, 0xAA), .field_edge = RGB(0xA3, 0xB4, 0xC6),
     };
-    font_sans = font_archivo;
-    font_sans_bold = font_archivo_bold;
 }
 
-/* "classic", "glass", "kinetik-blue" and the like. */
+/* "classic", "glass", "seashell", "kinetik-blue" and the like. */
 static void parse(const char *text, int *style, int *accent)
 {
     *style = THEME_KINETIK;
@@ -163,6 +182,7 @@ void theme_kinetik_blue(struct surface *s, int w, int h)
 {
     struct theme saved = theme;
     const struct palette *p = &palettes[ACCENT_BLUE];
+    theme.style = THEME_KINETIK;        /* not Seashell's own */
     theme.wall0 = p->wall0, theme.wall1 = p->wall1, theme.wall2 = p->wall2;
     theme.pale = p->pale, theme.glow = p->glow;
     wallpaper_kinetik(s, w, h);

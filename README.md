@@ -22,7 +22,7 @@ fluxOS is a small 32-bit x86 Unix-like operating system with preemptive
 multitasking, ring-3 processes, paging, a root filesystem on the hard disk it
 is installed on, IDE/SATA/floppy/USB storage, FAT and ISO9660, an
 NE2000, nForce, Intel PRO/1000 and Intel I217 network drivers with a TCP/IP stack, a zsh-flavoured shell
-(**fsh**), a desktop with a web browser and three themes (Kinetik, Kinetik Glass and Windows 95 style Classic), 3dfx Voodoo3 and
+(**fsh**), a desktop with a web browser and four themes (Kinetik, Kinetik Glass, Seashell and Windows 95 style Classic), 3dfx Voodoo3 and
 Radeon HD 4000 display drivers with a small OpenGL library, an Intel HD Graphics
 4600 display driver with 3D, PC speaker, Sound
 Blaster 16 and HD Audio sound, and a layer that runs DOS programs in the
@@ -290,12 +290,15 @@ says why.
   the desktop composes from. A program that hangs or crashes takes only its own windows
   with it; one that exits when its last window closes frees what it used. They can be
   started from a terminal too (`paint picture.png`, `wave https://...`).
-- Two themes, chosen on the **Appearance** page of Display Properties. **Kinetik**
+- Four themes, chosen on the **Appearance** page of Display Properties. **Kinetik**
   (the default): frames with rounded corners and a soft shadow, captions, taskbar
   and Start menu heading in a gradient of the theme's color with centered titles,
   glassy Start and taskbar buttons, light blue-gray faces with flat outlines, and its
   own wallpaper (a gradient, a glow and sweeping curves, drawn at the screen's size),
   in Blue, Purple, Orange, Green, White or Black; UI text is anti-aliased Archivo.
+  **Kinetik Glass**: Kinetik with see-through frames, taskbar and sidebar.
+  **Seashell**: Kinetik flat and light, in warm sage grays with dark captions, solid
+  sidebar cards, a restrained blue for selections and a plain sage gradient wallpaper.
   **Classic**: the Windows 95 look, a purple desktop, gray beveled windows with navy
   captions, and Liberation Sans. Either way the desktop is a folder browsed on the
   wallpaper (below) with a taskbar (Start button, a button per window, clock, volume

@@ -1048,7 +1048,7 @@ static void chrome_colors(int active, color_t *c)
     c[0] = theme.chrome0, c[1] = theme.chrome1, c[2] = theme.chrome2;
     if (!active)
         for (int i = 0; i < 3; i++)
-            c[i] = gfx_mix(c[i], RGB(0xD3, 0xDC, 0xE6), 176);
+            c[i] = gfx_mix(c[i], SEASHELL ? RGB(0xE6, 0xEA, 0xE6) : RGB(0xD3, 0xDC, 0xE6), 176);
 }
 
 /* The chrome's gradient down r: top corners rounded by rt. */
@@ -1059,10 +1059,23 @@ static void chrome_fill(struct rect r, int rt, int rb, const color_t *c)
     gfx_gradient(&screen, r, rt, rb, 3, argb, pos);
 }
 
-/* A glassy button on the chrome, or (pressed) a hollow one. Kinetik Glass: smoked, and lit when pressed. */
+/* A glassy button on the chrome, or (pressed) a hollow one. Kinetik Glass: smoked, and lit when pressed.
+ * Seashell: raised in the chrome's own grays with a lit top edge, or (pressed) recessed. */
 static void glass(struct rect r, int rad, int pressed)
 {
     static const int pos[3] = { 0, 154, 256 };
+    if (SEASHELL) {
+        static const int p2[2] = { 0, 256 };
+        static const color_t up[2] = { ARGB(255, 0xF7F8F5), ARGB(255, 0xDCE2DD) };
+        static const color_t down[2] = { ARGB(255, 0xD3DDD8), ARGB(255, 0xE6ECE8) };
+        if (!pressed)
+            gfx_shadow(&screen, r, rad, 1, 2, ARGB(46, 0x263D3E));
+        gfx_gradient(&screen, r, rad, rad, 2, pressed ? down : up, p2);
+        if (!pressed)
+            gfx_round_fill(&screen, mkrect(r.x + rad, r.y + 1, r.w - 2 * rad, 1), 0, 0, ARGB(255, 0xFFFFFF));
+        gfx_round_frame(&screen, r, rad, rad, ARGB(255, pressed ? 0x93A69B : 0xA9BCB0));
+        return;
+    }
     if (GLASS) {
         static const int p2[2] = { 0, 256 };
         static const color_t lit[2] = { ARGB(72, 0xFFFFFF), ARGB(20, 0xFFFFFF) };
@@ -1094,6 +1107,12 @@ static void menu_surface(struct rect m)
         gfx_gradient(&screen, m, 7, 7, 2, frost, pos);
         gfx_round_frame(&screen, m, 7, 7, ARGB(200, theme.stroke));
         gfx_round_frame(&screen, mkrect(m.x + 1, m.y + 1, m.w - 2, m.h - 2), 6, 6, ARGB(150, 0xFFFFFF));
+        return;
+    }
+    if (SEASHELL) {                     /* the sidebar's cards, outlined in the chrome's sage */
+        static const color_t card[2] = { ARGB(255, 0xFAFBF8), ARGB(255, 0xEDF1EC) };
+        gfx_gradient(&screen, m, 7, 7, 2, card, pos);
+        gfx_round_frame(&screen, m, 7, 7, ARGB(255, 0x9AADA3));
         return;
     }
     gfx_gradient(&screen, m, 7, 7, 2, c, pos);
@@ -1207,10 +1226,12 @@ static void draw_window_kinetik(struct window *w)
     color_t edge = ARGB(255, c[2]);
     frame_gradient(r, cl, rt, rb, 1, &edge, pos0);
     chrome_fill(mkrect(r.x, r.y, r.w, theme.cap_inset + TITLE_H), rt, 0, c);
-    gfx_round_fill(&screen, mkrect(r.x + rt, r.y + 1, r.w - 2 * rt, 1), 0, 0, ARGB(64, 0xFFFFFF));
-    gfx_round_frame(&screen, r, rt, rb, ARGB(255, active ? theme.stroke : gfx_mix(theme.stroke, 0x9AA9B9, 176)));
+    gfx_round_fill(&screen, mkrect(r.x + rt, r.y + 1, r.w - 2 * rt, 1), 0, 0,
+                   ARGB(SEASHELL ? 255 : 64, 0xFFFFFF));     /* Seashell's lit edge is bright */
+    gfx_round_frame(&screen, r, rt, rb,
+                    ARGB(255, active ? theme.stroke : gfx_mix(theme.stroke, SEASHELL ? 0xB8C5BE : 0x9AA9B9, 176)));
 
-    color_t text = active ? theme.on_chrome : RGB(0x5A, 0x6C, 0x80);
+    color_t text = active ? theme.on_chrome : SEASHELL ? RGB(0x70, 0x80, 0x83) : RGB(0x5A, 0x6C, 0x80);
     if (w->icon_img)
         gfx_image(&screen, cap.x + 7, cap.y + (TITLE_H - 16) / 2, w->icon_img);
     else
@@ -1323,7 +1344,8 @@ static void draw_start_menu_kinetik(void)
         for (int i = 0; i < NMENU; i++) {
             struct rect r = menu_item_rect(i);
             if (!menu_items[i].label) {
-                gfx_hline(&screen, r.x + 8, r.y + r.h / 2, r.w - 16, RGB(0xBE, 0xCD, 0xDD));
+                gfx_hline(&screen, r.x + 8, r.y + r.h / 2, r.w - 16,
+                          SEASHELL ? RGB(0xC3, 0xCE, 0xC7) : RGB(0xBE, 0xCD, 0xDD));
                 continue;
             }
             if (i == menu_hover || i == menu_sub)
@@ -1364,7 +1386,8 @@ static void draw_ctx_menu_kinetik(void)
     for (int i = 0; i < ctx_n; i++) {
         struct rect r = ctx_item_rect(i);
         if (!ctx_items[i].label) {
-            gfx_hline(&screen, r.x + 6, r.y + r.h / 2, r.w - 12, RGB(0xBE, 0xCD, 0xDD));
+            gfx_hline(&screen, r.x + 6, r.y + r.h / 2, r.w - 12,
+                      SEASHELL ? RGB(0xC3, 0xCE, 0xC7) : RGB(0xBE, 0xCD, 0xDD));
             continue;
         }
         if (i == ctx_hover)

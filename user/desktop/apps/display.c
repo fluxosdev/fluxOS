@@ -6,9 +6,9 @@
  * it fills the screen: a preview monitor shows the choice, drawn from a
  * thumbnail (a JPEG decodes at an eighth of its size, which is quick).
  * The Settings page picks the driver, color depth, desktop area and
- * refresh rate. The Appearance page picks the theme (theme.c), Classic or
- * Kinetik and Kinetik's color, with a sample of how it looks drawn by the
- * window manager's own code. The Screen Saver page turns on the bouncing logo
+ * refresh rate. The Appearance page picks the theme (theme.c), Classic,
+ * Kinetik and Kinetik's color, Kinetik Glass or Seashell, with a sample of
+ * how it looks drawn by the window manager's own code. The Screen Saver page turns on the bouncing logo
  * (screensaver.c) and sets how long the desktop is left alone before it starts
  * and how big the logo is. The Monitor page picks the kind of monitor, which limits
  * the modes offered, and shows what the monitor's EDID says about it and
@@ -1206,6 +1206,10 @@ static void appearance_page(struct dprops *d, struct surface *s)
                   : d->style == THEME_GLASS
                       ? "Kinetik Glass: Kinetik's frames in clear, pale blue-gray glass, and a taskbar "
                         "and sidebar of smoked glass, with the desktop and windows showing through."
+                  : d->style == THEME_SEASHELL
+                      ? "Seashell: Kinetik's frames, flat and light, in warm sage grays with dark "
+                        "captions, solid sidebar cards and a restrained blue. Its own wallpaper is a "
+                        "plain sage gradient."
                       : "Classic: gray faces and raised 3D edges, navy captions and Liberation Sans, "
                         "as in Windows 95.",
                   C_BLACK);

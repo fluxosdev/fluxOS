@@ -16,7 +16,8 @@
  * The Kinetik theme has a wallpaper of its own, drawn rather than decoded
  * (WALLPAPER_KINETIK): its color's gradient running from the top left
  * corner, a glow towards the top right and three sweeping curves, as in
- * the Kinetik studies, at whatever size the screen is.
+ * the Kinetik studies, at whatever size the screen is (Seashell's is a
+ * plain sage gradient, corner to corner).
  *
  * The choice is kept for the next start in GRUB's environment block when
  * the system runs from a hard disk (fluxos_wall, fluxos_wallmode).

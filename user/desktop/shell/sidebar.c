@@ -7,7 +7,9 @@
  * under a heading, cards with a title strip of the captions' chrome, and
  * "Add widgets..." at the foot. Under Classic it takes the gray faces and
  * navy title strips of Windows 95 instead, and under Kinetik Glass it is
- * smoked glass with the desktop and windows showing through.
+ * smoked glass with the desktop and windows showing through. Under
+ * Seashell it is pale and flat, after the Kinetik Flat study: solid cards
+ * with recessed faces and graphs, and its blue for the hands and bars.
  *
  * The widgets are an analog clock (clicking it opens Date and Time), the
  * month's calendar (paged with its arrows; clicking the month comes back
@@ -183,6 +185,8 @@ static color_t muted(void)
         return C_SHADOW;
     if (GLASS)
         return RGB(0xA9, 0xB4, 0xBF);
+    if (SEASHELL)
+        return RGB(0x70, 0x80, 0x83);
     return light_body() ? RGB(0x53, 0x68, 0x7E) : gfx_mix(theme.pale, 0xFFFFFF, 110);
 }
 
@@ -215,6 +219,15 @@ static void chrome_fill(struct surface *s, struct rect r, int rt, int rb)
 static void tint(struct surface *s, struct rect r, color_t argb)
 {
     gfx_round_fill(s, r, 0, 0, argb);
+}
+
+/* Seashell: a face set into its card (the clock's, the graph's), rounded by rad. */
+static void recess(struct surface *s, struct rect r, int rad, color_t edge)
+{
+    static const int pos[2] = { 0, 256 };
+    static const color_t c[2] = { ARGB(255, 0xDCE5E2), ARGB(255, 0xE9EFEB) };
+    gfx_gradient(s, r, rad, rad, 2, c, pos);
+    gfx_round_frame(s, r, rad, rad, ARGB(255, edge));
 }
 
 /* ---- the body ---- */
@@ -250,6 +263,24 @@ static void paint_body(struct surface *s, int w, int h)
         gfx_line(s, cx - 5, cy - 2, cx, cy + 3, 2, ARGB(255, ink()));
         gfx_line(s, cx, cy + 3, cx + 5, cy - 2, 2, ARGB(255, ink()));
         tint(s, mkrect(MARGIN, h - FOOT_H, w - 2 * MARGIN, 1), ARGB(153, 0x626B73));
+    } else if (SEASHELL) {
+        /* Pale and flat: a lit edge where it meets the desktop, the heading in the chrome. */
+        static const int pos[2] = { 0, 256 };
+        static const color_t body[2] = { ARGB(255, 0xEDF0EC), ARGB(255, 0xD5DED9) };
+        gfx_gradient(s, mkrect(0, 0, w, h), 0, 0, 2, body, pos);
+        tint(s, mkrect(0, 0, 1, h), ARGB(255, 0x8D9F98));
+        tint(s, mkrect(1, 0, 1, h), ARGB(191, 0xFFFFFF));
+        chrome_fill(s, mkrect(2, 0, w - 2, HEAD_H), 0, 0);
+        tint(s, mkrect(2, 1, w - 2, 1), ARGB(255, 0xFFFFFF));
+        tint(s, mkrect(2, HEAD_H - 1, w - 2, 1), ARGB(255, 0xC3CEC7));
+        gfx_text(s, &font_archivo_title, 16, (HEAD_H - font_archivo_title.height) / 2, "Sidebar", ink());
+        chrome_fill(s, r_menu, 4, 4);
+        gfx_round_frame(s, r_menu, 4, 4, ARGB(255, 0xA9BCB0));
+        int cx = r_menu.x + r_menu.w / 2, cy = r_menu.y + r_menu.h / 2;
+        gfx_line(s, cx - 5, cy - 2, cx, cy + 3, 2, ARGB(255, ink()));
+        gfx_line(s, cx, cy + 3, cx + 5, cy - 2, 2, ARGB(255, ink()));
+        tint(s, mkrect(MARGIN, h - FOOT_H, w - 2 * MARGIN, 1), ARGB(255, 0xB5C4BA));
+        tint(s, mkrect(MARGIN, h - FOOT_H + 1, w - 2 * MARGIN, 1), ARGB(255, 0xF7FAF5));
     } else {
         static const int pos[2] = { 0, 256 };
         color_t body[2] = {
@@ -298,6 +329,15 @@ static void paint_card(struct surface *s, struct rect r, const char *title, cons
         gfx_round_frame(s, r, 5, 5, ARGB(178, 0x58616A));
         chrome_fill(s, strip, 4, 0);
         tint(s, mkrect(strip.x + 5, strip.y, strip.w - 10, 1), ARGB(41, 0xFFFFFF));
+    } else if (SEASHELL) {              /* solid, softly shadowed, the strip ruled off */
+        static const int pos[2] = { 0, 256 };
+        static const color_t fill[2] = { ARGB(255, 0xFAFBF8), ARGB(255, 0xEDF1EC) };
+        gfx_shadow(s, r, 5, 3, 3, ARGB(41, 0x263D3E));
+        gfx_gradient(s, r, 5, 5, 2, fill, pos);
+        chrome_fill(s, strip, 4, 0);
+        tint(s, mkrect(strip.x + 4, strip.y, strip.w - 8, 1), ARGB(255, 0xFFFFFF));
+        tint(s, mkrect(strip.x, strip.y + strip.h, strip.w, 1), ARGB(255, 0xCBD5CE));
+        gfx_round_frame(s, r, 5, 5, ARGB(255, 0xB8C5BE));
     } else {
         static const int pos[2] = { 0, 256 };
         color_t fill[2] = {
@@ -334,7 +374,13 @@ static void paint_clock(struct surface *s, struct rect r, const struct tm *tm)
     paint_card(s, r, "local time", "");
     int cx = r.x + r.w / 2, cy = r.y + CAP_H + 8 + FACE_R;
     color_t face_ink = KINETIK ? ink() : C_BLACK, sec = hot();
-    if (KINETIK) {
+    if (SEASHELL) {
+        struct rect face = mkrect(cx - FACE_R, cy - FACE_R, 2 * FACE_R + 1, 2 * FACE_R + 1);
+        gfx_shadow(s, face, FACE_R, 1, 1, ARGB(46, 0x263D3E));
+        recess(s, face, FACE_R, 0xB7C6BE);
+        gfx_round_frame(s, mkrect(face.x + 2, face.y + 2, face.w - 4, face.h - 4), FACE_R - 2, FACE_R - 2,
+                        ARGB(178, 0xFFFFFF));
+    } else if (KINETIK) {
         disc(s, cx, cy, FACE_R, ARGB(light_body() ? 90 : 30, 0xFFFFFF));
         gfx_round_frame(s, mkrect(cx - FACE_R, cy - FACE_R, 2 * FACE_R + 1, 2 * FACE_R + 1), FACE_R, FACE_R,
                         ARGB(120, theme.pale));
@@ -344,14 +390,15 @@ static void paint_clock(struct surface *s, struct rect r, const struct tm *tm)
     }
     for (int i = 0; i < 60; i++) {
         int hour = i % 5 == 0, r0 = FACE_R - (hour ? 9 : 4), r1 = FACE_R - 3;
+        color_t tick = SEASHELL ? ARGB(255, hour ? 0x647B78 : 0xA4B4AC) : ARGB(hour ? 230 : 110, face_ink);
         gfx_line(s, cx + r0 * sin60(i) / 1000, cy - r0 * cos60(i) / 1000, cx + r1 * sin60(i) / 1000,
-                 cy - r1 * cos60(i) / 1000, hour ? 2 : 1, ARGB(hour ? 230 : 110, face_ink));
+                 cy - r1 * cos60(i) / 1000, hour ? 2 : 1, tick);
     }
     hand(s, cx, cy, (tm->tm_hour % 12) * 5 + tm->tm_min / 12, FACE_R - 24, 3, ARGB(255, face_ink));
     hand(s, cx, cy, tm->tm_min, FACE_R - 11, 2, ARGB(255, KINETIK ? face_ink : C_NAVY));
     hand(s, cx, cy, tm->tm_sec, FACE_R - 6, 1, ARGB(255, sec));
-    disc(s, cx, cy, 4, ARGB(255, face_ink));
-    disc(s, cx, cy, 2, ARGB(255, sec));
+    disc(s, cx, cy, 4, ARGB(255, SEASHELL ? C_WHITE : face_ink));
+    disc(s, cx, cy, SEASHELL ? 3 : 2, ARGB(255, sec));
 
     char buf[48];
     int h12 = tm->tm_hour % 12, y = cy + FACE_R + 10;
@@ -400,7 +447,10 @@ static void paint_calendar(struct surface *s, struct rect r, const struct tm *tm
         int shown_day = d < 1 ? before + d : d > n ? d - n : d;
         int today = here && d == tm->tm_mday && view_month == tm->tm_mon && view_year == tm->tm_year + 1900;
         struct rect cell = mkrect(x0 + (k % 7) * cw + 1, y + (k / 7) * CAL_ROW, cw - 2, CAL_ROW - 2);
-        if (today && GLASS) {
+        if (today && SEASHELL) {
+            gfx_round_fill(s, cell, 4, 4, ARGB(255, theme.wall2));
+            gfx_round_frame(s, cell, 4, 4, ARGB(255, 0x477B9E));
+        } else if (today && GLASS) {
             gfx_round_fill(s, cell, 5, 5, ARGB(46, 0xFFFFFF));
             gfx_round_frame(s, cell, 5, 5, ARGB(115, theme.pale));
         } else if (today && KINETIK) {
@@ -411,8 +461,8 @@ static void paint_calendar(struct surface *s, struct rect r, const struct tm *tm
         }
         snprintf(buf, sizeof(buf), "%d", shown_day);
         const struct pfont *f = today ? &font_sans_bold : &font_sans;
-        color_t c = today && !KINETIK ? C_WHITE : here ? ink() : KINETIK ? gfx_mix(muted(), theme.wall0, 90)
-                                                                         : C_SHADOW;
+        color_t c = today && (!KINETIK || SEASHELL) ? C_WHITE : here ? ink()
+                  : SEASHELL ? muted() : KINETIK ? gfx_mix(muted(), theme.wall0, 90) : C_SHADOW;
         gfx_text(s, f, cell.x + (cell.w - gfx_text_width(f, buf)) / 2, cell.y + (cell.h - f->height) / 2, buf, c);
     }
 }
@@ -433,7 +483,10 @@ static void bar(struct surface *s, struct rect r, int pct)
         gfx_fill(s, r.x, r.y, fw, r.h, C_NAVY);
         return;
     }
-    gfx_round_fill(s, r, 2, 2, ARGB(140, light_body() ? 0x7B8CA0 : theme.wall0));
+    if (SEASHELL)
+        gfx_round_fill(s, r, 2, 2, ARGB(255, 0xCDD8D0));
+    else
+        gfx_round_fill(s, r, 2, 2, ARGB(140, light_body() ? 0x7B8CA0 : theme.wall0));
     if (fw > 0)
         gfx_round_fill(s, mkrect(r.x, r.y, fw, r.h), 2, 2, ARGB(255, hot()));
 }
@@ -446,7 +499,12 @@ static void paint_system(struct surface *s, struct rect r)
 
     struct rect g = mkrect(r.x + 8, r.y + CAP_H + 8, r.w - 16, GRAPH_H);
     color_t cpu_c = hot(), mem_c = KINETIK ? (light_body() ? theme.ink : theme.pale) : RGB(0xFF, 0xFF, 0x00);
-    if (KINETIK) {
+    if (SEASHELL) {
+        mem_c = RGB(0x7F, 0x96, 0x8E);
+        recess(s, g, 3, 0xC6D2CB);
+        for (int i = 1; i < 4; i++)
+            tint(s, mkrect(g.x + 1, g.y + i * g.h / 4, g.w - 2, 1), ARGB(255, 0xCBD7CF));
+    } else if (KINETIK) {
         gfx_round_fill(s, g, 3, 3, ARGB(light_body() ? 60 : 90, light_body() ? 0x7B8CA0 : theme.wall0));
         for (int i = 1; i < 4; i++)
             tint(s, mkrect(g.x + 1, g.y + i * g.h / 4, g.w - 2, 1), ARGB(26, theme.pale));
@@ -464,7 +522,7 @@ static void paint_system(struct surface *s, struct rect r)
     for (int x = 0; x < g.w - 2; x++) {
         int v = hist_at(cpu_hist, x, g.w - 2) * span / 100;
         if (v > 0)
-            tint(s, mkrect(g.x + 1 + x, bottom - v, 1, v), ARGB(KINETIK ? 70 : 90, cpu_c));
+            tint(s, mkrect(g.x + 1 + x, bottom - v, 1, v), ARGB(SEASHELL ? 31 : KINETIK ? 70 : 90, cpu_c));
     }
     int step = (g.w - 2) / 30 > 1 ? (g.w - 2) / 30 : 1;
     for (int x = 0; x + step < g.w - 2; x += step) {

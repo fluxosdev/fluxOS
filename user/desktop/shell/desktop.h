@@ -24,8 +24,9 @@
 /* ---- themes (theme.c) ---- */
 /* How the desktop looks: Classic is Windows 95's grays and bevels; Kinetik has rounded,
  * shaded frames with gradient captions in one of six colors, and Archivo for its text;
- * Kinetik Glass is Kinetik with see-through frames, taskbar and sidebar, in one pale blue-gray. */
-enum theme_style { THEME_CLASSIC, THEME_KINETIK, THEME_GLASS, THEME_STYLES };
+ * Kinetik Glass is Kinetik with see-through frames, taskbar and sidebar, in one pale blue-gray;
+ * Seashell is Kinetik flat and light, in warm sage grays with blue for what is chosen. */
+enum theme_style { THEME_CLASSIC, THEME_KINETIK, THEME_GLASS, THEME_SEASHELL, THEME_STYLES };
 enum { ACCENT_BLUE, ACCENT_PURPLE, ACCENT_ORANGE, ACCENT_GREEN, ACCENT_WHITE, ACCENT_BLACK, ACCENTS };
 
 struct theme {
@@ -65,8 +66,9 @@ void glass_smoke(struct surface *s, struct rect r, int rt, int rb);
 #define TITLE_H    (theme.title_h)          /* caption bar */
 #define TASKBAR_H  (theme.taskbar_h)
 #define FRAME_TOP  (theme.cap_inset + TITLE_H + theme.cap_gap)     /* the frame above the client area */
-#define KINETIK    (theme.style != THEME_CLASSIC)   /* Kinetik or Kinetik Glass: drawn the Kinetik way */
+#define KINETIK    (theme.style != THEME_CLASSIC)   /* Kinetik, Kinetik Glass or Seashell: drawn the Kinetik way */
 #define GLASS      (theme.style == THEME_GLASS)
+#define SEASHELL   (theme.style == THEME_SEASHELL)
 /* Kinetik Glass blurs what is behind its frames, taskbar and sidebar this much (gfx_blur's rad). */
 #define GLASS_BLUR 5
 
@@ -464,7 +466,7 @@ extern const char *const wall_mode_names[WALL_MODES];
 #define WALLPAPER_DIR     "/usr/share/wallpapers"
 #define WALLPAPER_DEFAULT WALLPAPER_DIR "/bamboo.jpg"
 #define WALLPAPER_KINETIK "kinetik"     /* not a file: the Kinetik theme's own, drawn in its color */
-/* The Kinetik wallpaper at w x h, into s at (0, 0). */
+/* The Kinetik wallpaper (Seashell's under Seashell) at w x h, into s at (0, 0). */
 void wallpaper_kinetik(struct surface *s, int w, int h);
 /* The theme changed from old_style: a theme's own wallpaper goes with it. */
 void wallpaper_theme_changed(int old_style);
