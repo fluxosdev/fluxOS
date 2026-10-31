@@ -492,7 +492,7 @@ static void emit_state(struct fgl_context *c, uint32_t target_mask, uint32_t dep
     int x0, y0, x1, y1;
     gl_clip_rect(c, &x0, &y0, &x1, &y1);
     uint32_t ps_off = !tex ? PS_COLOR_OFF
-                      : c->tex_env_mode == GL_REPLACE || c->tex_env_mode == GL_DECAL ? PS_REPLACE_OFF
+                      : c->unit[0].env_mode == GL_REPLACE || c->unit[0].env_mode == GL_DECAL ? PS_REPLACE_OFF
                                                                                      : PS_MODULATE_OFF;
     uint64_t vs = hw.gpu + VS_OFF, ps = hw.gpu + ps_off;
     uint64_t color = hw.gpu + t->color, depth = hw.gpu + t->depth;

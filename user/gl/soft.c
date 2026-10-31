@@ -1,23 +1,30 @@
 /*
- * The software backend: a 0xRRGGBB color buffer and a 30-bit depth buffer
- * in memory. Polygons are split into triangles and filled a scanline at a
- * time with the top-left rule (a pixel is drawn when its centre is inside).
- * Depth and color are planes over the triangle: their gradients are worked
- * out once, in floating point, and each span steps them in fixed point
- * (16.16 for color, whole units for depth).
+ * The software backend: a 0xRRGGBB color buffer, a 30-bit depth buffer
+ * and an 8-bit stencil buffer in memory. Polygons are split into
+ * triangles and filled a scanline at a time with the top-left rule (a
+ * pixel is drawn when its centre is inside). Depth and color are planes
+ * over the triangle: their gradients are worked out once, in floating
+ * point, and each span steps them in fixed point (16.16 for color, whole
+ * units for depth).
  *
  * The four planes (depth, red, green, blue) are set up together in the
  * lanes of an SSE register. Spans are filled four pixels at a time in the
  * SSE2 integer lanes, the depth test giving a mask of the pixels to keep.
  *
- * A triangle that is textured, blended, alpha tested or color masked has
- * four more planes, 1/w, s/w, t/w and alpha, which are linear in the
+ * A triangle that is textured, blended, alpha tested, color masked,
+ * stencilled or fogged has eight more planes, 1/w, s/w, t/w, alpha, the
+ * second unit's s/w and t/w, and the fog factor, which are linear in the
  * window; dividing by 1/w at each pixel gives texture coordinates with
  * perspective. Its spans go a pixel at a time, through the fragment
- * operations in GL's order: the texel (nearest, or bilinear between
- * four) and the texture environment's mix of it with the fragment's
- * color, the alpha test, the depth test, blending (the buffer's alpha
- * being 1), and the color mask.
+ * operations in GL's order: each unit's texel and texture environment
+ * (the second taking the first's result), fog, the alpha test, the
+ * stencil test, the depth test, blending (the buffer's alpha being 1),
+ * and the color mask.
+ *
+ * A mipmapped texture's level of detail is worked out at each pixel, from
+ * how far its texture coordinates move between neighbouring pixels (the
+ * derivatives of s/w, t/w and 1/w); otherwise the texture is magnified or
+ * minified, as the triangle's area against its texture's tells.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +36,7 @@
 struct soft {
     uint32_t *color;
     uint32_t *depth;
+    uint8_t *stencil;
 };
 
 static int soft_resize(struct fgl_context *c)
@@ -42,17 +50,21 @@ static int soft_resize(struct fgl_context *c)
     }
     size_t n = (size_t)c->width * (size_t)c->height;
     uint32_t *color = malloc(n * 4), *depth = malloc(n * 4);
-    if (!color || !depth) {
+    uint8_t *stencil = calloc(n, 1);
+    if (!color || !depth || !stencil) {
         free(color);
         free(depth);
+        free(stencil);
         return -1;
     }
     memset(color, 0, n * 4);
     memset32(depth, DEPTH_ONE, n);
     free(s->color);
     free(s->depth);
+    free(s->stencil);
     s->color = color;
     s->depth = depth;
+    s->stencil = stencil;
     return 0;
 }
 
@@ -62,6 +74,7 @@ static void soft_destroy(struct fgl_context *c)
     if (s) {
         free(s->color);
         free(s->depth);
+        free(s->stencil);
         free(s);
     }
     c->bpriv = NULL;
@@ -75,6 +88,7 @@ static void soft_clear(struct fgl_context *c, GLbitfield mask, int x0, int y0, i
                    (uint32_t)gl_iround(c->clear_color[2] * 255);
     uint32_t z = (uint32_t)gl_iround(c->clear_depth * DEPTH_ONE);
     uint32_t wmask = gl_rgb_write_mask(c);
+    uint8_t sv = (uint8_t)c->clear_stencil, swm = (uint8_t)c->stencil_writemask;
     for (int y = y0; y < y1; y++) {
         size_t row = (size_t)y * c->width + x0;
         if ((mask & GL_COLOR_BUFFER_BIT) && wmask == 0xFFFFFF) {
@@ -86,6 +100,13 @@ static void soft_clear(struct fgl_context *c, GLbitfield mask, int x0, int y0, i
         }
         if (mask & GL_DEPTH_BUFFER_BIT)
             memset32(s->depth + row, z, x1 - x0);
+        if ((mask & GL_STENCIL_BUFFER_BIT) && swm == 0xFF) {
+            memset(s->stencil + row, sv, (size_t)(x1 - x0));
+        } else if (mask & GL_STENCIL_BUFFER_BIT) {
+            uint8_t *p = s->stencil + row;
+            for (int i = 0; i < x1 - x0; i++)
+                p[i] = (uint8_t)((sv & swm) | (p[i] & ~swm));
+        }
     }
 }
 
@@ -100,6 +121,8 @@ static inline uint32_t pack(int32_t r, int32_t g, int32_t b)
     return (uint32_t)(r << 16 | g << 8 | b);
 }
 
+/* a func b: the depth test (a the fragment's depth), and the alpha and
+ * stencil tests (a the fragment's alpha, the reference). */
 static inline int depth_pass(GLenum func, uint32_t z, uint32_t old)
 {
     switch (func) {
@@ -202,31 +225,130 @@ static inline int wrap(int i, int n, GLenum mode)
     return i < 0 ? 0 : i >= n ? n - 1 : i;
 }
 
-static inline uint32_t texel_nearest(const struct gltex *t, float s, float u)
+/* A texture unit as a triangle samples it: its levels, how it filters and
+ * wraps, and its environment. */
+struct sampler {
+    struct texlevel lv[MAX_LEVELS];
+    int nlevels;
+    GLenum wrap_s, wrap_t;
+    int mag_linear;
+    GLenum min;                         /* GL_NEAREST or GL_LINEAR when not mipmapped */
+    int mipmapped;                      /* the level of detail is worked out at each pixel */
+    float crossover;                    /* the level of detail past which it is minified */
+    int linear;                         /* when not mipmapped: bilinear on this triangle */
+    GLenum mode, base;
+    uint32_t env[4];
+};
+
+static inline uint32_t texel_nearest(const struct sampler *sp, const struct texlevel *l, float s, float u)
 {
-    int x = wrap(ifloor(s * (float)t->w), t->w, t->wrap_s);
-    int y = wrap(ifloor(u * (float)t->h), t->h, t->wrap_t);
-    return t->texels[(size_t)y * (size_t)t->w + (size_t)x];
+    int x = wrap(ifloor(s * (float)l->w), l->w, sp->wrap_s);
+    int y = wrap(ifloor(u * (float)l->h), l->h, sp->wrap_t);
+    return l->texels[(size_t)y * (size_t)l->w + (size_t)x];
+}
+
+/* a and b mixed, channel by channel, w 256ths of the way to b. */
+static inline uint32_t mix_texel(uint32_t a, uint32_t b, uint32_t w)
+{
+    uint32_t rb = (((a & 0xFF00FF) * (256 - w) + (b & 0xFF00FF) * w) >> 8) & 0xFF00FF;
+    uint32_t ga = ((((a >> 8) & 0xFF00FF) * (256 - w) + ((b >> 8) & 0xFF00FF) * w) >> 8) & 0xFF00FF;
+    return rb | ga << 8;
 }
 
 /* The four texels around (s, u), weighted by where it falls between them
- * (in 256ths), channel by channel. */
-static uint32_t texel_linear(const struct gltex *t, float s, float u)
+ * (in 256ths). */
+static uint32_t texel_linear(const struct sampler *sp, const struct texlevel *l, float s, float u)
 {
-    float fx = s * (float)t->w - 0.5f, fy = u * (float)t->h - 0.5f;
+    float fx = s * (float)l->w - 0.5f, fy = u * (float)l->h - 0.5f;
     int x0 = ifloor(fx), y0 = ifloor(fy);
     uint32_t wx = (uint32_t)((fx - (float)x0) * 256), wy = (uint32_t)((fy - (float)y0) * 256);
-    int x1 = wrap(x0 + 1, t->w, t->wrap_s), y1 = wrap(y0 + 1, t->h, t->wrap_t);
-    x0 = wrap(x0, t->w, t->wrap_s);
-    y0 = wrap(y0, t->h, t->wrap_t);
-    const uint32_t *r0 = t->texels + (size_t)y0 * (size_t)t->w, *r1 = t->texels + (size_t)y1 * (size_t)t->w;
-    uint32_t a = r0[x0], b = r0[x1], cc = r1[x0], d = r1[x1], out = 0;
-    for (int sh = 0; sh < 32; sh += 8) {
-        uint32_t top = ((a >> sh) & 0xFF) * (256 - wx) + ((b >> sh) & 0xFF) * wx;
-        uint32_t bot = ((cc >> sh) & 0xFF) * (256 - wx) + ((d >> sh) & 0xFF) * wx;
-        out |= ((top * (256 - wy) + bot * wy) >> 16) << sh;
+    int x1 = wrap(x0 + 1, l->w, sp->wrap_s), y1 = wrap(y0 + 1, l->h, sp->wrap_t);
+    x0 = wrap(x0, l->w, sp->wrap_s);
+    y0 = wrap(y0, l->h, sp->wrap_t);
+    const uint32_t *r0 = l->texels + (size_t)y0 * (size_t)l->w, *r1 = l->texels + (size_t)y1 * (size_t)l->w;
+    return mix_texel(mix_texel(r0[x0], r0[x1], wx), mix_texel(r1[x0], r1[x1], wx), wy);
+}
+
+static inline uint32_t texel(const struct sampler *sp, const struct texlevel *l, int linear, float s, float u)
+{
+    return linear ? texel_linear(sp, l, s, u) : texel_nearest(sp, l, s, u);
+}
+
+/* The texel at (s, u) with level of detail lambda, by GL's filter rules. */
+static uint32_t sample(const struct sampler *sp, float s, float u, float lambda)
+{
+    if (lambda <= sp->crossover)
+        return texel(sp, &sp->lv[0], sp->mag_linear, s, u);
+    int n = sp->nlevels;
+    switch (sp->min) {
+    case GL_NEAREST: return texel_nearest(sp, &sp->lv[0], s, u);
+    case GL_LINEAR: return texel_linear(sp, &sp->lv[0], s, u);
+    case GL_NEAREST_MIPMAP_NEAREST:
+    case GL_LINEAR_MIPMAP_NEAREST: {
+        int d = lambda <= 0.5f ? 0 : gl_iceil(lambda + 0.5f) - 1;
+        if (d > n - 1)
+            d = n - 1;
+        return texel(sp, &sp->lv[d], sp->min == GL_LINEAR_MIPMAP_NEAREST, s, u);
     }
-    return out;
+    default: {                          /* *_MIPMAP_LINEAR: between the two levels around lambda */
+        int linear = sp->min == GL_LINEAR_MIPMAP_LINEAR;
+        int d = lambda < 0 ? 0 : (int)lambda;
+        if (d >= n - 1)
+            return texel(sp, &sp->lv[n - 1], linear, s, u);
+        uint32_t w = (uint32_t)((lambda - (float)d) * 256);
+        return mix_texel(texel(sp, &sp->lv[d], linear, s, u), texel(sp, &sp->lv[d + 1], linear, s, u), w);
+    }
+    }
+}
+
+/* log2 of x, near enough for a level of detail: the exponent, and the
+ * mantissa as a straight line between powers of two. */
+static inline float fast_log2(float x)
+{
+    union {
+        float f;
+        uint32_t u;
+    } v = { .f = x };
+    if (x <= 0)
+        return -128;
+    return (float)((int)(v.u >> 23) - 127) + (float)(v.u & 0x7FFFFF) * (1.0f / 8388608.0f);
+}
+
+/* The level of detail at a pixel: log2 of the most texels a step of one
+ * pixel across or down covers. s and t are the texture coordinates there,
+ * w the clip w, and d holds the x and y steps of 1/w, s/w and t/w. */
+static inline float level_of_detail(const struct texlevel *l0, float s, float t, float w, const float *d)
+{
+    float tw = (float)l0->w * w, th = (float)l0->h * w;
+    float dsdx = (d[1] - s * d[0]) * tw, dtdx = (d[2] - t * d[0]) * th;
+    float dsdy = (d[4] - s * d[3]) * tw, dtdy = (d[5] - t * d[3]) * th;
+    float px = dsdx * dsdx + dtdx * dtdx, py = dsdy * dsdy + dtdy * dtdy;
+    return 0.5f * fast_log2(px > py ? px : py);
+}
+
+/* A unit's sampler for a triangle; tex_area is its texture coordinates'
+ * area times the texture's against area, the triangle's in pixels. */
+static void setup_sampler(struct sampler *sp, const struct gltex *t, const struct texunit *u, float tex_area,
+                          float area)
+{
+    sp->nlevels = t->nlevels;
+    for (int i = 0; i < sp->nlevels; i++)
+        sp->lv[i] = gl_tex_level(t, i);
+    sp->wrap_s = t->wrap_s;
+    sp->wrap_t = t->wrap_t;
+    sp->mag_linear = t->mag_filter == GL_LINEAR;
+    GLenum min = t->min_filter;
+    sp->mipmapped = min != GL_NEAREST && min != GL_LINEAR && sp->nlevels > 1;
+    if (!sp->mipmapped)
+        min = min == GL_NEAREST || min == GL_NEAREST_MIPMAP_NEAREST || min == GL_NEAREST_MIPMAP_LINEAR ? GL_NEAREST
+                                                                                                    : GL_LINEAR;
+    sp->min = min;
+    sp->crossover = sp->mag_linear && (min == GL_NEAREST_MIPMAP_NEAREST || min == GL_NEAREST_MIPMAP_LINEAR) ? 0.5f : 0;
+    sp->linear = tex_area * tex_area > area * area ? min == GL_LINEAR : sp->mag_linear;
+    sp->mode = u->env_mode;
+    sp->base = t->format;
+    for (int k = 0; k < 4; k++)
+        sp->env[k] = (uint32_t)gl_iround(u->env_color[k] * 255);
 }
 
 static inline uint32_t clamp8(int32_t v16)
@@ -236,9 +358,9 @@ static inline uint32_t clamp8(int32_t v16)
 }
 
 /* The texture environment: texel tx (0xAABBGGRR) of a texture of base
- * format base with the fragment's color (0 to 255 a channel) as
- * 0xRRGGBB, and its alpha *a. An alpha texture leaves the color alone; an
- * RGB or luminance texture leaves the alpha alone. */
+ * format base with the fragment's color (0 to 255 a channel) and its
+ * alpha *a; the result as 0xRRGGBB. An alpha texture leaves the color
+ * alone; an RGB or luminance texture leaves the alpha alone. */
 static inline uint32_t tex_env(GLenum mode, GLenum base, uint32_t tx, uint32_t r, uint32_t g, uint32_t b,
                                uint32_t *a, const uint32_t *env)
 {
@@ -283,20 +405,6 @@ static inline uint32_t tex_env(GLenum mode, GLenum base, uint32_t tx, uint32_t r
 
 /* ---- fragment operations ---- */
 
-static inline int alpha_pass(GLenum func, uint32_t a, uint32_t ref)
-{
-    switch (func) {
-    case GL_NEVER: return 0;
-    case GL_LESS: return a < ref;
-    case GL_EQUAL: return a == ref;
-    case GL_LEQUAL: return a <= ref;
-    case GL_GREATER: return a > ref;
-    case GL_NOTEQUAL: return a != ref;
-    case GL_GEQUAL: return a >= ref;
-    default: return 1;
-    }
-}
-
 /* A blend factor for one channel, 0 to 255: s and d are the source's and
  * destination's value of the channel, sa the source alpha. The buffer
  * has no alpha, so the destination's is 1. */
@@ -327,7 +435,149 @@ static inline uint32_t blend(GLenum sf, GLenum df, uint32_t src, uint32_t sa, ui
     return out;
 }
 
+/* The stencil test's state, as a triangle uses it. */
+struct stencil {
+    GLenum func, fail, zfail, zpass;
+    uint8_t ref, mask, writemask;
+};
+
+static inline uint8_t stencil_op(const struct stencil *st, GLenum op, uint8_t s)
+{
+    uint8_t v;
+    switch (op) {
+    case GL_ZERO: v = 0; break;
+    case GL_REPLACE: v = st->ref; break;
+    case GL_INCR: v = s == 255 ? 255 : s + 1; break;
+    case GL_DECR: v = s == 0 ? 0 : s - 1; break;
+    case GL_INVERT: v = (uint8_t)~s; break;
+    case GL_INCR_WRAP_EXT: v = (uint8_t)(s + 1); break;
+    case GL_DECR_WRAP_EXT: v = (uint8_t)(s - 1); break;
+    default: return s;                  /* GL_KEEP */
+    }
+    return (uint8_t)((v & st->writemask) | (s & ~st->writemask));
+}
+
+/* The stencil test (st, if it is on) and the depth test (test), updating
+ * the stencil value at sp as they go; 1 if the fragment survives them. */
+static inline int stencil_depth(const struct stencil *st, uint8_t *sp, int test, GLenum func, uint32_t z,
+                                uint32_t old)
+{
+    if (!st)
+        return !test || depth_pass(func, z, old);
+    uint8_t s = *sp;
+    if (!depth_pass(st->func, st->ref & st->mask, s & st->mask)) {
+        *sp = stencil_op(st, st->fail, s);
+        return 0;
+    }
+    if (test && !depth_pass(func, z, old)) {
+        *sp = stencil_op(st, st->zfail, s);
+        return 0;
+    }
+    *sp = stencil_op(st, st->zpass, s);
+    return 1;
+}
+
+/* px (0xRRGGBB) fogged by f (256ths) into the fog color fc. */
+static inline uint32_t fog_pixel(uint32_t px, uint32_t f, const uint32_t *fc)
+{
+    uint32_t out = 0;
+    for (int k = 0, sh = 16; k < 3; k++, sh -= 8)
+        out |= ((((px >> sh) & 0xFF) * f + fc[k] * (256 - f)) >> 8) << sh;
+    return out;
+}
+
 /* ---- triangles ---- */
+
+/* The planes of a triangle's four attributes in the lanes of a vector:
+ * their value at v0 (a0) and their x and y gradients, from their values
+ * at the three vertices. */
+static void planes(__m128 q0, __m128 q1, __m128 q2, const struct wvert *v0, const struct wvert *v1,
+                   const struct wvert *v2, float inv, __m128 *a0, __m128 *dx, __m128 *dy)
+{
+    __m128 e1 = _mm_sub_ps(q1, q0), e2 = _mm_sub_ps(q2, q0);
+    *a0 = q0;
+    *dx = _mm_mul_ps(_mm_sub_ps(_mm_mul_ps(e1, _mm_set1_ps(v2->y - v0->y)), _mm_mul_ps(e2, _mm_set1_ps(v1->y - v0->y))),
+                     _mm_set1_ps(inv));
+    *dy = _mm_mul_ps(_mm_sub_ps(_mm_mul_ps(e2, _mm_set1_ps(v1->x - v0->x)), _mm_mul_ps(e1, _mm_set1_ps(v2->x - v0->x))),
+                     _mm_set1_ps(inv));
+}
+
+/* What a triangle's fragments share when they go a pixel at a time. */
+struct frags {
+    const struct sampler *smp0, *smp1;  /* NULL: that unit draws no texture */
+    const struct stencil *st;           /* NULL: the stencil test is off */
+    int test, write_z, atest, blending, fogp;
+    GLenum func, afunc, sf, df;
+    uint32_t aref, wmask, fog_color[3];
+    float dt[4] __attribute__((aligned(16)));   /* x steps of 1/w, s/w, t/w, alpha */
+    float du[4] __attribute__((aligned(16)));   /* ... of the second unit's s/w, t/w, and fog */
+    float d0[6], d1[6];                 /* each unit's x and y steps for the level of detail */
+};
+
+/* n fragments of a span, starting from depth z, color (r, g, bl) and the
+ * planes' values lanes and ulanes: texturing, fog, then the fragment
+ * operations. extra, a constant, says whether the second unit or fog may
+ * be on; without them their work drops out of the loop. */
+static inline __attribute__((always_inline)) void
+fragment_span(const struct frags *fr, const int extra, uint32_t *cp, uint32_t *zp, uint8_t *sp, int n, int32_t z,
+              int32_t r, int32_t g, int32_t bl, int32_t dz, int32_t dr, int32_t dg, int32_t db, const float *lanes,
+              const float *ulanes)
+{
+    const struct sampler *sp0 = fr->smp0, *sp1 = extra ? fr->smp1 : NULL;
+    const struct stencil *st = fr->st;
+    int test = fr->test, write_z = fr->write_z, atest = fr->atest, blending = fr->blending;
+    int fogp = extra && fr->fogp;
+    GLenum func = fr->func, afunc = fr->afunc, sf = fr->sf, df = fr->df;
+    uint32_t aref = fr->aref, wmask = fr->wmask;
+    float diw = fr->dt[0], dsw = fr->dt[1], dtw = fr->dt[2], daw = fr->dt[3];
+    float ds1w = extra ? fr->du[0] : 0, dt1w = extra ? fr->du[1] : 0, dfw = extra ? fr->du[2] : 0;
+    float iw = lanes[0], sw = lanes[1], tw = lanes[2], aw = lanes[3];
+    float s1w = ulanes[0], t1w = ulanes[1], fw = ulanes[2];
+    for (int i = 0; i < n; i++, z += dz, r += dr, g += dg, bl += db, iw += diw, sw += dsw, tw += dtw, aw += daw,
+             s1w += ds1w, t1w += dt1w, fw += dfw) {
+        uint32_t zz = z < 0 ? 0 : (uint32_t)z;
+        /* Without the alpha test, the stencil and depth tests can come first and save the texels. */
+        if (!atest && !stencil_depth(st, sp + i, test, func, zz, zp[i]))
+            continue;
+        int ia = gl_iround(aw);
+        uint32_t fa = ia < 0 ? 0 : ia > 255 ? 255 : (uint32_t)ia;
+        uint32_t px;
+        if (sp0 || sp1) {
+            float w = 1 / iw;
+            if (sp0) {
+                float ss = sw * w, tt = tw * w;
+                uint32_t tx = sp0->mipmapped ? sample(sp0, ss, tt, level_of_detail(&sp0->lv[0], ss, tt, w, fr->d0))
+                                             : texel(sp0, &sp0->lv[0], sp0->linear, ss, tt);
+                px = tex_env(sp0->mode, sp0->base, tx, clamp8(r), clamp8(g), clamp8(bl), &fa, sp0->env);
+            } else {
+                px = clamp8(r) << 16 | clamp8(g) << 8 | clamp8(bl);
+            }
+            if (sp1) {
+                float ss = s1w * w, tt = t1w * w;
+                uint32_t tx = sp1->mipmapped ? sample(sp1, ss, tt, level_of_detail(&sp1->lv[0], ss, tt, w, fr->d1))
+                                             : texel(sp1, &sp1->lv[0], sp1->linear, ss, tt);
+                px = tex_env(sp1->mode, sp1->base, tx, px >> 16, (px >> 8) & 0xFF, px & 0xFF, &fa, sp1->env);
+            }
+        } else {
+            px = clamp8(r) << 16 | clamp8(g) << 8 | clamp8(bl);
+        }
+        if (fogp) {
+            int f = gl_iround(fw * 256);
+            px = fog_pixel(px, f < 0 ? 0 : f > 256 ? 256 : (uint32_t)f, fr->fog_color);
+        }
+        if (atest) {
+            if (!depth_pass(afunc, fa, aref))
+                continue;
+            if (!stencil_depth(st, sp + i, test, func, zz, zp[i]))
+                continue;
+        }
+        if (write_z)
+            zp[i] = zz;
+        if (blending)
+            px = blend(sf, df, px, fa, cp[i]);
+        cp[i] = (px & wmask) | (cp[i] & ~wmask);
+    }
+}
 
 static void triangle(struct fgl_context *c, const struct wvert *v0, const struct wvert *v1,
                      const struct wvert *v2, int cx0, int cy0, int cx1, int cy1)
@@ -337,16 +587,12 @@ static void triangle(struct fgl_context *c, const struct wvert *v0, const struct
     if (area > -1e-6f && area < 1e-6f)
         return;
     float inv = 1 / area;
-    /* The attribute planes, in the lanes depth, red, green, blue: their value
-     * at the first vertex and their x and y gradients. */
+    /* The attribute planes, in the lanes depth, red, green, blue. */
     __m128 scale = _mm_setr_ps((float)DEPTH_ONE, 16711680.0f, 16711680.0f, 16711680.0f);
-    __m128 a0 = _mm_mul_ps(_mm_setr_ps(v0->z, v0->r, v0->g, v0->b), scale);
-    __m128 e1 = _mm_sub_ps(_mm_mul_ps(_mm_setr_ps(v1->z, v1->r, v1->g, v1->b), scale), a0);
-    __m128 e2 = _mm_sub_ps(_mm_mul_ps(_mm_setr_ps(v2->z, v2->r, v2->g, v2->b), scale), a0);
-    __m128 pdx = _mm_mul_ps(_mm_sub_ps(_mm_mul_ps(e1, _mm_set1_ps(v2->y - v0->y)),
-                                       _mm_mul_ps(e2, _mm_set1_ps(v1->y - v0->y))), _mm_set1_ps(inv));
-    __m128 pdy = _mm_mul_ps(_mm_sub_ps(_mm_mul_ps(e2, _mm_set1_ps(v1->x - v0->x)),
-                                       _mm_mul_ps(e1, _mm_set1_ps(v2->x - v0->x))), _mm_set1_ps(inv));
+    __m128 a0, pdx, pdy;
+    planes(_mm_mul_ps(_mm_setr_ps(v0->z, v0->r, v0->g, v0->b), scale),
+           _mm_mul_ps(_mm_setr_ps(v1->z, v1->r, v1->g, v1->b), scale),
+           _mm_mul_ps(_mm_setr_ps(v2->z, v2->r, v2->g, v2->b), scale), v0, v1, v2, inv, &a0, &pdx, &pdy);
 
     /* Walk the edges from the top vertex down. */
     const struct wvert *t = v0, *m = v1, *b = v2, *tmp;
@@ -366,45 +612,68 @@ static void triangle(struct fgl_context *c, const struct wvert *v0, const struct
     int test = c->depth_test, write_z = c->depth_test && c->depth_mask;
     GLenum func = c->depth_func;
 
-    /* The fragment operations past the depth test, and texturing: the
-     * planes 1/w, s/w, t/w and alpha (0 to 255), and whether the texture
-     * is magnified or minified here (by its area against the triangle's). */
-    const struct gltex *tex = gl_active_texture(c);
-    int blending = c->blend, atest = c->alpha_test;
-    GLenum sf = c->blend_src, df = c->blend_dst, afunc = c->alpha_func;
-    uint32_t aref = (uint32_t)gl_iround(c->alpha_ref * 255);
-    uint32_t wmask = gl_rgb_write_mask(c);
-    int plain = !tex && !blending && !atest && wmask == 0xFFFFFF;
-    __m128 ta0 = _mm_setzero_ps(), tdx = ta0, tdy = ta0;
-    int linear = 0;
-    uint32_t env[4];
-    if (!plain) {
-        __m128 q0 = _mm_setr_ps(1 / v0->w, v0->s / v0->w, v0->t / v0->w, v0->a * 255);
-        __m128 q1 = _mm_sub_ps(_mm_setr_ps(1 / v1->w, v1->s / v1->w, v1->t / v1->w, v1->a * 255), q0);
-        __m128 q2 = _mm_sub_ps(_mm_setr_ps(1 / v2->w, v2->s / v2->w, v2->t / v2->w, v2->a * 255), q0);
-        ta0 = q0;
-        tdx = _mm_mul_ps(_mm_sub_ps(_mm_mul_ps(q1, _mm_set1_ps(v2->y - v0->y)),
-                                    _mm_mul_ps(q2, _mm_set1_ps(v1->y - v0->y))), _mm_set1_ps(inv));
-        tdy = _mm_mul_ps(_mm_sub_ps(_mm_mul_ps(q2, _mm_set1_ps(v1->x - v0->x)),
-                                    _mm_mul_ps(q1, _mm_set1_ps(v2->x - v0->x))), _mm_set1_ps(inv));
+    /* The fragment operations past the depth test, texturing and fog. */
+    const struct gltex *tex0 = gl_unit_texture(c, 0), *tex1 = gl_unit_texture(c, 1);
+    struct frags fr;
+    struct sampler smp[2];
+    struct stencil stencil;
+    fr.smp0 = tex0 ? &smp[0] : NULL;
+    fr.smp1 = tex1 ? &smp[1] : NULL;
+    fr.st = NULL;
+    fr.test = test;
+    fr.write_z = write_z;
+    fr.func = func;
+    fr.atest = c->alpha_test;
+    fr.blending = c->blend;
+    fr.fogp = c->fog_draw == FOG_PIXEL;
+    fr.afunc = c->alpha_func;
+    fr.sf = c->blend_src;
+    fr.df = c->blend_dst;
+    fr.aref = (uint32_t)gl_iround(c->alpha_ref * 255);
+    fr.wmask = gl_rgb_write_mask(c);
+    if (c->stencil_test) {
+        stencil.func = c->stencil_func;
+        stencil.fail = c->stencil_fail;
+        stencil.zfail = c->stencil_zfail;
+        stencil.zpass = c->stencil_zpass;
+        stencil.ref = (uint8_t)c->stencil_ref;
+        stencil.mask = (uint8_t)c->stencil_value_mask;
+        stencil.writemask = (uint8_t)c->stencil_writemask;
+        fr.st = &stencil;
     }
-    if (tex) {
-        float tex_area = ((v1->s - v0->s) * (v2->t - v0->t) - (v2->s - v0->s) * (v1->t - v0->t)) *
-                         (float)tex->w * (float)tex->h;
-        int minified = tex_area * tex_area > area * area;
-        GLenum f = minified ? tex->min_filter : tex->mag_filter;
-        linear = f == GL_LINEAR || f == GL_LINEAR_MIPMAP_NEAREST || f == GL_LINEAR_MIPMAP_LINEAR;
-        for (int k = 0; k < 4; k++)
-            env[k] = (uint32_t)gl_iround(c->tex_env_color[k] * 255);
-    }
-    float diw = 0, dsw = 0, dtw = 0, daw = 0;
+    int plain = !tex0 && !tex1 && !fr.blending && !fr.atest && fr.wmask == 0xFFFFFF && !fr.st && !fr.fogp;
+    /* Two more sets of planes: 1/w, s/w, t/w and alpha (0 to 255); the
+     * second unit's s/w and t/w, and the fog factor. */
+    __m128 ta0 = _mm_setzero_ps(), tdx = ta0, tdy = ta0, ua0 = ta0, udx = ta0, udy = ta0;
     if (!plain) {
-        float lanes[4] __attribute__((aligned(16)));
-        _mm_store_ps(lanes, tdx);
-        diw = lanes[0];
-        dsw = lanes[1];
-        dtw = lanes[2];
-        daw = lanes[3];
+        planes(_mm_setr_ps(1 / v0->w, v0->s / v0->w, v0->t / v0->w, v0->a * 255),
+               _mm_setr_ps(1 / v1->w, v1->s / v1->w, v1->t / v1->w, v1->a * 255),
+               _mm_setr_ps(1 / v2->w, v2->s / v2->w, v2->t / v2->w, v2->a * 255), v0, v1, v2, inv, &ta0, &tdx, &tdy);
+        planes(_mm_setr_ps(v0->s1 / v0->w, v0->t1 / v0->w, v0->f, 0),
+               _mm_setr_ps(v1->s1 / v1->w, v1->t1 / v1->w, v1->f, 0),
+               _mm_setr_ps(v2->s1 / v2->w, v2->t1 / v2->w, v2->f, 0), v0, v1, v2, inv, &ua0, &udx, &udy);
+        for (int k = 0; k < 3; k++)
+            fr.fog_color[k] = (uint32_t)gl_iround(c->fog_color[k] * 255);
+        /* The x steps of the planes, and for the level of detail each
+         * unit's x and y steps of 1/w, s/w and t/w. */
+        float ty[4] __attribute__((aligned(16))), uy[4] __attribute__((aligned(16)));
+        _mm_store_ps(fr.dt, tdx);
+        _mm_store_ps(fr.du, udx);
+        _mm_store_ps(ty, tdy);
+        _mm_store_ps(uy, udy);
+        float *d0 = fr.d0, *d1 = fr.d1;
+        d0[0] = fr.dt[0]; d0[1] = fr.dt[1]; d0[2] = fr.dt[2]; d0[3] = ty[0]; d0[4] = ty[1]; d0[5] = ty[2];
+        d1[0] = fr.dt[0]; d1[1] = fr.du[0]; d1[2] = fr.du[1]; d1[3] = ty[0]; d1[4] = uy[0]; d1[5] = uy[1];
+    }
+    if (tex0) {
+        float ta = ((v1->s - v0->s) * (v2->t - v0->t) - (v2->s - v0->s) * (v1->t - v0->t)) * (float)tex0->w *
+                   (float)tex0->h;
+        setup_sampler(&smp[0], tex0, &c->unit[0], ta, area);
+    }
+    if (tex1) {
+        float ta = ((v1->s1 - v0->s1) * (v2->t1 - v0->t1) - (v2->s1 - v0->s1) * (v1->t1 - v0->t1)) *
+                   (float)tex1->w * (float)tex1->h;
+        setup_sampler(&smp[1], tex1, &c->unit[1], ta, area);
     }
 
     for (int y = y0; y < y1; y++) {
@@ -428,41 +697,21 @@ static void triangle(struct fgl_context *c, const struct wvert *v0, const struct
         int32_t r = _mm_cvt_ss2si(_mm_shuffle_ps(at, at, 0x55));
         int32_t g = _mm_cvt_ss2si(_mm_shuffle_ps(at, at, 0xAA));
         int32_t bl = _mm_cvt_ss2si(_mm_shuffle_ps(at, at, 0xFF));
-        uint32_t *cp = s->color + (size_t)y * c->width + x0;
-        uint32_t *zp = s->depth + (size_t)y * c->width + x0;
+        size_t row = (size_t)y * c->width + x0;
+        uint32_t *cp = s->color + row;
+        uint32_t *zp = s->depth + row;
+        uint8_t *sp = s->stencil + row;
         int n = x1 - x0;
         if (!plain) {
-            float lanes[4] __attribute__((aligned(16)));
+            float lanes[4] __attribute__((aligned(16))), ulanes[4] __attribute__((aligned(16)));
             _mm_store_ps(lanes, _mm_add_ps(_mm_add_ps(ta0, _mm_mul_ps(_mm_set1_ps(fx), tdx)),
                                            _mm_mul_ps(_mm_set1_ps(fy), tdy)));
-            float iw = lanes[0], sw = lanes[1], tw = lanes[2], aw = lanes[3];
-            GLenum mode = c->tex_env_mode;
-            for (int i = 0; i < n; i++, z += dz, r += dr, g += dg, bl += db, iw += diw, sw += dsw, tw += dtw,
-                     aw += daw) {
-                uint32_t zz = z < 0 ? 0 : (uint32_t)z;
-                /* Without the alpha test, the depth test can come first and save the texel. */
-                if (test && !atest && !depth_pass(func, zz, zp[i]))
-                    continue;
-                int ia = gl_iround(aw);
-                uint32_t fa = ia < 0 ? 0 : ia > 255 ? 255 : (uint32_t)ia;
-                uint32_t px;
-                if (tex) {
-                    float w = 1 / iw;
-                    uint32_t tx = linear ? texel_linear(tex, sw * w, tw * w) : texel_nearest(tex, sw * w, tw * w);
-                    px = tex_env(mode, tex->format, tx, clamp8(r), clamp8(g), clamp8(bl), &fa, env);
-                } else {
-                    px = clamp8(r) << 16 | clamp8(g) << 8 | clamp8(bl);
-                }
-                if (atest && !alpha_pass(afunc, fa, aref))
-                    continue;
-                if (test && atest && !depth_pass(func, zz, zp[i]))
-                    continue;
-                if (write_z)
-                    zp[i] = zz;
-                if (blending)
-                    px = blend(sf, df, px, fa, cp[i]);
-                cp[i] = (px & wmask) | (cp[i] & ~wmask);
-            }
+            _mm_store_ps(ulanes, _mm_add_ps(_mm_add_ps(ua0, _mm_mul_ps(_mm_set1_ps(fx), udx)),
+                                            _mm_mul_ps(_mm_set1_ps(fy), udy)));
+            if (fr.smp1 || fr.fogp)
+                fragment_span(&fr, 1, cp, zp, sp, n, z, r, g, bl, dz, dr, dg, db, lanes, ulanes);
+            else
+                fragment_span(&fr, 0, cp, zp, sp, n, z, r, g, bl, dz, dr, dg, db, lanes, ulanes);
         } else if (!test) {
             span_color(cp, n, r, g, bl, dr, dg, db);
         } else if (func == GL_LESS) {
@@ -488,11 +737,18 @@ static void soft_polygon(struct fgl_context *c, const struct wvert *v, int n)
         triangle(c, &v[0], &v[i], &v[i + 1], x0, y0, x1, y1);
 }
 
-void gl_soft_load(struct fgl_context *c, const uint32_t *picture)
+void gl_soft_load(struct fgl_context *c, const uint32_t *picture, const float *depths)
 {
     struct soft *s = c->bpriv;
-    if (s)
-        memcpy(s->color, picture, (size_t)c->width * (size_t)c->height * 4);
+    if (!s)
+        return;
+    size_t n = (size_t)c->width * (size_t)c->height;
+    if (picture)
+        memcpy(s->color, picture, n * 4);
+    if (depths)
+        for (size_t i = 0; i < n; i++)
+            s->depth[i] = (uint32_t)gl_iround(gl_clampf(depths[i]) * DEPTH_ONE);
+    memset(s->stencil, (uint8_t)c->clear_stencil, n);
 }
 
 static void soft_finish(struct fgl_context *c)

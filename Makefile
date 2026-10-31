@@ -517,6 +517,20 @@ $(BUILD)/tests/sh: $(wildcard user/fsh/*.c user/fsh/*.h) tests/fsh-host/flux.h
 	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-unused-result -D_GNU_SOURCE -Itests/fsh-host \
 		$(filter %.c,$^) -o $@
 
+# The GL library's state, vertex pipeline and software backend, built for the
+# host and drawn with pixel by pixel (tests/gl-soft.c; no hardware backends).
+GL_TEST_SRCS := $(filter-out user/gl/radeon.c user/gl/intel.c user/gl/tdfx.c,$(wildcard user/gl/*.c))
+
+.PHONY: test-gl
+test-gl: $(BUILD)/tests/gl-soft
+	$<
+
+$(BUILD)/tests/gl-soft: tests/gl-soft.c tests/gl-host.h $(GL_TEST_SRCS) user/gl/glint.h $(wildcard user/include/GL/*.h)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -msse2 \
+		-fsanitize=address,undefined -include tests/gl-host.h -idirafter user/include \
+		tests/gl-soft.c $(GL_TEST_SRCS) -lm -o $@
+
 # The native GCC on the real kernel: compiles and runs a program under QEMU and
 # compares the binary with the cross compiler's (needs "make toolchain-native").
 .PHONY: test-gcc-qemu

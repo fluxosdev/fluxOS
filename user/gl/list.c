@@ -2,10 +2,11 @@
  * Display lists. While a list is being compiled, each GL call that can go
  * in one records an opcode, its argument count and its arguments (all as
  * floats; enums and list and texture names fit exactly, up to 2^24).
- * glTexImage2D and glTexSubImage2D are not recorded: they take effect
- * when called, even under GL_COMPILE. Nor are the vertex array calls,
- * but glDrawArrays and the like record the vertices they draw, as GL has
- * it. glCallList replays them
+ * glTexImage2D, glTexSubImage2D, glCopyTexImage2D, glDrawPixels and
+ * glCopyPixels are not recorded: they take effect when called, even under
+ * GL_COMPILE. Nor are the vertex array calls, but glDrawArrays and the
+ * like record the vertices they draw, as GL has it. glBitmap records its
+ * bits as they were unpacked then. glCallList replays them
  * through the same entry points, with recording held off so that a list
  * called during GL_COMPILE_AND_EXECUTE is not copied into the new one.
  * glCallLists records its list names as given; glListBase is added to
@@ -170,6 +171,25 @@ GLboolean glIsList(GLuint list)
 
 static void call_list(struct fgl_context *c, GLuint list);
 
+/* OP_BITMAP: width, height, origin and move, then the bits sixteen to a float. */
+static void replay_bitmap(struct fgl_context *c, const float *a)
+{
+    int w = (int)a[0], h = (int)a[1];
+    size_t bits = (size_t)w * (size_t)h;
+    uint8_t *on = bits ? malloc(bits) : NULL;
+    if (bits && !on) {
+        gl_error(c, GL_OUT_OF_MEMORY);
+        return;
+    }
+    for (size_t i = 0; i < bits; i++)
+        on[i] = ((unsigned)a[6 + i / 16] >> (i % 16)) & 1;
+    if (c->in_begin)
+        gl_error(c, GL_INVALID_OPERATION);
+    else
+        gl_draw_bitmap(c, w, h, a[2], a[3], a[4], a[5], on);
+    free(on);
+}
+
 static void replay(struct fgl_context *c, const struct dlist *l)
 {
     const float *p = l->ops, *end = l->ops + l->n;
@@ -230,6 +250,25 @@ static void replay(struct fgl_context *c, const struct dlist *l)
             for (int i = 0; i < n; i++)
                 call_list(c, c->list_base + (GLuint)(GLint)a[i]);
             break;
+        case OP_FOG: glFogfv((GLenum)a[0], a + 1); break;
+        case OP_STENCIL_FUNC: glStencilFunc((GLenum)a[0], (GLint)a[1], (GLuint)a[2]); break;
+        case OP_STENCIL_OP: glStencilOp((GLenum)a[0], (GLenum)a[1], (GLenum)a[2]); break;
+        case OP_STENCIL_MASK: glStencilMask((GLuint)a[0]); break;
+        case OP_CLEAR_STENCIL: glClearStencil((GLint)a[0]); break;
+        case OP_CLIP_PLANE: {
+            GLdouble eq[4] = { a[1], a[2], a[3], a[4] };
+            glClipPlane((GLenum)a[0], eq);
+            break;
+        }
+        case OP_TEX_GEN: glTexGenfv((GLenum)a[0], (GLenum)a[1], a + 2); break;
+        case OP_RASTER_POS: glRasterPos4f(a[0], a[1], a[2], a[3]); break;
+        case OP_BITMAP: replay_bitmap(c, a); break;
+        case OP_PIXEL_ZOOM: glPixelZoom(a[0], a[1]); break;
+        case OP_ACTIVE_TEXTURE: glActiveTextureARB((GLenum)a[0]); break;
+        case OP_MULTI_TEXCOORD: glMultiTexCoord4fARB((GLenum)a[0], a[1], a[2], a[3], a[4]); break;
+        case OP_PUSH_ATTRIB: glPushAttrib((GLbitfield)a[0]); break;
+        case OP_POP_ATTRIB: glPopAttrib(); break;
+        case OP_HINT: glHint((GLenum)a[0], (GLenum)a[1]); break;
         }
     }
 }

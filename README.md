@@ -682,15 +682,31 @@ fetcher process, so the browser keeps running), or from `file://`.
   DMA 1/5 (DSP, mixer, both DMA controllers) passed on to the real devices.
 
 **OpenGL** (`libGL.a`, `<GL/gl.h>`, `<GL/fluxgl.h>`, `<GL/glu.h>`)
-- A subset of OpenGL 1.1's fixed-function pipeline: `glBegin`/`glEnd`, matrix
-  stacks, per-vertex lighting (eight lights), flat/smooth shading, culling,
-  depth buffer, scissor, display lists, `glGet*`, and basic GLU.
+- Most of OpenGL 1.1's fixed-function pipeline: `glBegin`/`glEnd` and
+  vertex arrays, matrix stacks, per-vertex lighting (eight lights),
+  flat/smooth shading, culling, depth and 8-bit stencil buffers, scissor,
+  fog (linear, exp, exp2), six user clip planes, `glTexGen` (object, eye,
+  sphere map), display lists, `glPushAttrib`/`glPushClientAttrib`, the
+  raster position with `glBitmap`, `glDrawPixels`, `glCopyPixels` and
+  `glPixelZoom`, `glGet*` (lights, materials, textures and the rest), and
+  basic GLU.
 - 2D textures: texture objects, `glTexImage2D`/`glTexSubImage2D` from
-  RGB(A), BGR(A), luminance and alpha bytes, nearest or bilinear filtering,
+  RGB(A), BGR(A), luminance and alpha bytes, `glCopyTexImage2D`,
+  `glGetTexImage`, mipmaps (`gluBuild2DMipmaps` makes them; the software
+  renderer picks the level at each pixel), nearest or bilinear filtering,
   repeat or clamp, the modulate, replace, decal and blend environments, and
-  the texture matrix, all perspective-correct. The Radeon and Intel engines
-  sample them in their pixel shaders; a Voodoo context goes on in software
-  once it draws with one.
+  the texture matrix, all perspective-correct. Two texture units
+  (`GL_ARB_multitexture` and GL 1.3's names for it), and
+  `fglGetProcAddress` for programs that look calls up by name. The Radeon
+  and Intel engines sample level 0 in their pixel shaders; a Voodoo context
+  goes on in software once it draws with a texture.
+- What the 3D engines cannot draw moves a context to software, keeping its
+  picture (and its depths, from a Voodoo): the stencil test, a second
+  texture, and fog after a texture (untextured fog, and fog into black
+  after `GL_MODULATE`, are folded into the vertex colours and stay on the
+  hardware). `GL_ARB_multitexture` is listed only in software, so that
+  programs with a multipass path take it on the hardware. `make test-gl`
+  checks the software renderer on the host.
 - Four backends, tried in order: the Radeon 3D engine (PM4 command buffers),
   Haswell's Intel 3D engine (drawing operations the kernel turns into
   commands), the 3dfx engine (driven from user space, as Glide does), and a
@@ -798,6 +814,7 @@ make test-libc   # libc printf/strtod/scanf/regex/fnmatch/getopt/time against gl
 make test-libc-qemu # the libc on the real kernel (files, popen, pipes, select, time) in QEMU
 make test-tools  # tar, gzip, sed, diff, patch, find... built for the host, against GNU's
 make test-sh     # fsh as /bin/sh, built for the host, against the host's /bin/sh
+make test-gl     # the GL library's software renderer, built for the host, drawn with pixel by pixel
 make test-gcc-qemu # the native GCC compiles, links and runs a program on the real kernel
 make test-desktop-jobs # decoder helper responsiveness, transfers, cancellation and recovery
 make test-desktop-jobs-qemu # same protocol tests with fluxOS's blocking pipes
@@ -1245,11 +1262,16 @@ The FPU state is saved with FXSAVE, so AVX and later cannot be used.
 - **Graphics:** only the 3dfx and Radeon drivers set modes (others keep the BIOS
   mode, changeable only on an installed system at the next start); no 8-bit
   palette, interlaced or doublescan modes; the 3dfx engine renders 16-bit color
-  and is read back over the bus each frame. The GL library has no fog, stencil
-  or selection, and textures have no mipmaps
-  (level 0 serves every filter); the Voodoo does not texture, and the Radeon
-  draws decal as replace and blend as modulate; lighting is per vertex;
-  polygons must be convex; only one process at a time can use the 3D hardware.
+  and is read back over the bus each frame. The GL library has no
+  accumulation buffer, colour index mode, logic ops, stipples, evaluators,
+  1D textures, selection or feedback; `glDrawPixels` and `glCopyPixels`
+  take colours only; the 3D engines draw level 0 of a mipmap and have no
+  stencil buffer or second texture unit (a context needing those goes on in
+  software, without its depths from the Radeon or Intel, so the frame where
+  it moves may draw wrongly); the Voodoo does not texture, and the Radeon
+  draws decal as replace and blend as modulate; lighting and fog are per
+  vertex; polygons must be convex; only one process at a time can use the
+  3D hardware.
 - **Pictures:** JPEG arithmetic coding, 12-bit, lossless and CMYK, and
   interlaced PNGs are not shown; EXIF orientation and color profiles are
   ignored; pictures up to 4096x4096. A 1920x1080 photo takes a few seconds to

@@ -239,7 +239,7 @@ static void emit_state(struct fgl_context *c, uint32_t flags, uint32_t blend, co
 static void emit_context_state(struct fgl_context *c, const struct gltex *tex)
 {
     uint32_t flags = !tex ? GL3_SHADE_COLOR
-                     : c->tex_env_mode == GL_REPLACE || c->tex_env_mode == GL_DECAL ? GL3_SHADE_REPLACE
+                     : c->unit[0].env_mode == GL_REPLACE || c->unit[0].env_mode == GL_DECAL ? GL3_SHADE_REPLACE
                                                                                     : GL3_SHADE_MODULATE;
     if (c->depth_test)
         flags |= GL3F_DEPTH_TEST | (c->depth_mask ? GL3F_DEPTH_WRITE : 0) | GL3F_DEPTH_FUNC(c->depth_func - GL_NEVER);

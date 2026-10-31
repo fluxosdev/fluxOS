@@ -52,6 +52,9 @@ void fglSwapBuffers(FGLcontext *ctx, uint32_t *dst, int stride);
 int fglIsAccelerated(FGLcontext *ctx);
 /* Which renderer draws the context: FGL_DRIVER_*. */
 int fglGetDriver(FGLcontext *ctx);
+/* A GL call by name (wglGetProcAddress's counterpart, for programs that
+ * look up the extensions' calls); NULL if there is none. */
+void *fglGetProcAddress(const char *name);
 
 #ifdef __cplusplus
 }

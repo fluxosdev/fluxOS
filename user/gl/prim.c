@@ -1,14 +1,16 @@
 /*
  * The vertex pipeline. Each glVertex is transformed to eye coordinates,
- * lit there, and projected to clip coordinates, and takes the current
- * texture coordinates through the texture matrix; glEnd assembles the
- * vertices into polygons, lines and points. Polygons are clipped against
- * the view volume (Sutherland-Hodgman, in homogeneous coordinates),
- * divided by w, mapped through the viewport, culled by their winding,
- * pushed back or forward by the polygon offset and handed to the backend,
- * filled or, in the GL_LINE and GL_POINT polygon modes, as their edges or
- * corners. Lines and points become small polygons too, so a backend only
- * ever draws convex polygons.
+ * lit there, and projected to clip coordinates; it takes each enabled
+ * texture unit's coordinates (current or generated) through the unit's
+ * texture matrix, and its distances to the user clip planes and its fog
+ * factor. glEnd assembles the vertices into polygons, lines and points.
+ * Polygons are clipped against the view volume and the user clip planes
+ * (Sutherland-Hodgman, in homogeneous coordinates), divided by w, mapped
+ * through the viewport, culled by their winding, pushed back or forward by
+ * the polygon offset and handed to the backend, filled or, in the GL_LINE
+ * and GL_POINT polygon modes, as their edges or corners. Lines and points
+ * become small polygons too, so a backend only ever draws convex polygons.
+ * The raster position goes through the same steps as a vertex.
  */
 #include <math.h>
 #include <stdlib.h>
@@ -16,7 +18,7 @@
 #include "glint.h"
 
 #define MAX_POLY 64                     /* vertices of a polygon, clipping included */
-#define NPLANES  7
+#define NPLANES  (7 + MAX_CLIP_PLANES)  /* the view volume's six, w > 0, and the user's */
 
 #define GET_CTX(c)                      \
     struct fgl_context *c = gl_ctx;     \
@@ -158,8 +160,19 @@ void glNormal3f(GLfloat x, GLfloat y, GLfloat z)
     c->eye_normal_valid = 0;
 }
 
+/* Signed integers map to -1 to 1: (2v + 1) / (2^b - 1). */
+#define SBYTE(v)  ((2.0f * (v) + 1) / 255.0f)
+#define SSHORT(v) ((2.0f * (v) + 1) / 65535.0f)
+
+void glNormal3b(GLbyte x, GLbyte y, GLbyte z) { glNormal3f(SBYTE(x), SBYTE(y), SBYTE(z)); }
 void glNormal3d(GLdouble x, GLdouble y, GLdouble z) { glNormal3f((float)x, (float)y, (float)z); }
+void glNormal3i(GLint x, GLint y, GLint z) { glNormal3f(gl_int_color(x), gl_int_color(y), gl_int_color(z)); }
+void glNormal3s(GLshort x, GLshort y, GLshort z) { glNormal3f(SSHORT(x), SSHORT(y), SSHORT(z)); }
+void glNormal3bv(const GLbyte *v) { glNormal3b(v[0], v[1], v[2]); }
+void glNormal3dv(const GLdouble *v) { glNormal3f((float)v[0], (float)v[1], (float)v[2]); }
 void glNormal3fv(const GLfloat *v) { glNormal3f(v[0], v[1], v[2]); }
+void glNormal3iv(const GLint *v) { glNormal3i(v[0], v[1], v[2]); }
+void glNormal3sv(const GLshort *v) { glNormal3s(v[0], v[1], v[2]); }
 
 void glColor4f(GLfloat r, GLfloat g, GLfloat b, GLfloat a)
 {
@@ -188,6 +201,9 @@ void glColor4fv(const GLfloat *v) { glColor4f(v[0], v[1], v[2], v[3]); }
 void glColor3f(GLfloat r, GLfloat g, GLfloat b) { glColor4f(r, g, b, 1); }
 void glColor3d(GLdouble r, GLdouble g, GLdouble b) { glColor4f((float)r, (float)g, (float)b, 1); }
 void glColor3fv(const GLfloat *v) { glColor4f(v[0], v[1], v[2], 1); }
+void glColor3dv(const GLdouble *v) { glColor4f((float)v[0], (float)v[1], (float)v[2], 1); }
+void glColor4d(GLdouble r, GLdouble g, GLdouble b, GLdouble a) { glColor4f((float)r, (float)g, (float)b, (float)a); }
+void glColor4dv(const GLdouble *v) { glColor4f((float)v[0], (float)v[1], (float)v[2], (float)v[3]); }
 
 void glColor4ub(GLubyte r, GLubyte g, GLubyte b, GLubyte a)
 {
@@ -196,26 +212,88 @@ void glColor4ub(GLubyte r, GLubyte g, GLubyte b, GLubyte a)
 
 void glColor3ub(GLubyte r, GLubyte g, GLubyte b) { glColor4ub(r, g, b, 255); }
 void glColor3ubv(const GLubyte *v) { glColor4ub(v[0], v[1], v[2], 255); }
+void glColor4ubv(const GLubyte *v) { glColor4ub(v[0], v[1], v[2], v[3]); }
+
+/* The other integer types: signed ones map to -1 to 1 (and clamp to 0),
+ * unsigned ones to 0 to 1. */
+#define UINT_F(v) ((float)((double)(v) / 4294967295.0))
+void glColor4b(GLbyte r, GLbyte g, GLbyte b, GLbyte a) { glColor4f(SBYTE(r), SBYTE(g), SBYTE(b), SBYTE(a)); }
+void glColor4s(GLshort r, GLshort g, GLshort b, GLshort a) { glColor4f(SSHORT(r), SSHORT(g), SSHORT(b), SSHORT(a)); }
+void glColor4i(GLint r, GLint g, GLint b, GLint a)
+{
+    glColor4f(gl_int_color(r), gl_int_color(g), gl_int_color(b), gl_int_color(a));
+}
+void glColor4us(GLushort r, GLushort g, GLushort b, GLushort a)
+{
+    glColor4f(r / 65535.0f, g / 65535.0f, b / 65535.0f, a / 65535.0f);
+}
+void glColor4ui(GLuint r, GLuint g, GLuint b, GLuint a) { glColor4f(UINT_F(r), UINT_F(g), UINT_F(b), UINT_F(a)); }
+void glColor3b(GLbyte r, GLbyte g, GLbyte b) { glColor4f(SBYTE(r), SBYTE(g), SBYTE(b), 1); }
+void glColor3s(GLshort r, GLshort g, GLshort b) { glColor4f(SSHORT(r), SSHORT(g), SSHORT(b), 1); }
+void glColor3i(GLint r, GLint g, GLint b) { glColor4f(gl_int_color(r), gl_int_color(g), gl_int_color(b), 1); }
+void glColor3us(GLushort r, GLushort g, GLushort b) { glColor4f(r / 65535.0f, g / 65535.0f, b / 65535.0f, 1); }
+void glColor3ui(GLuint r, GLuint g, GLuint b) { glColor4f(UINT_F(r), UINT_F(g), UINT_F(b), 1); }
+void glColor3bv(const GLbyte *v) { glColor3b(v[0], v[1], v[2]); }
+void glColor3sv(const GLshort *v) { glColor3s(v[0], v[1], v[2]); }
+void glColor3iv(const GLint *v) { glColor3i(v[0], v[1], v[2]); }
+void glColor3usv(const GLushort *v) { glColor3us(v[0], v[1], v[2]); }
+void glColor3uiv(const GLuint *v) { glColor3ui(v[0], v[1], v[2]); }
+void glColor4bv(const GLbyte *v) { glColor4b(v[0], v[1], v[2], v[3]); }
+void glColor4sv(const GLshort *v) { glColor4s(v[0], v[1], v[2], v[3]); }
+void glColor4iv(const GLint *v) { glColor4i(v[0], v[1], v[2], v[3]); }
+void glColor4usv(const GLushort *v) { glColor4us(v[0], v[1], v[2], v[3]); }
+void glColor4uiv(const GLuint *v) { glColor4ui(v[0], v[1], v[2], v[3]); }
 
 /* ---- vertices ---- */
 
-void glVertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w)
+/* glTexGen for the coordinates whose generation is on: obj is the vertex
+ * as given, eye in eye coordinates. */
+static void texgen(struct fgl_context *c, const struct texunit *u, const float *obj, const float *eye, float *tc)
 {
-    GET_CTX(c);
-    RECORD(c, OP_VERTEX, 4, x, y, z, w);
-    if (!c->in_begin)
-        return;                         /* undefined outside glBegin; ignore it */
-    if (c->nverts == c->vcap) {
-        int cap = c->vcap ? c->vcap * 2 : 256;
-        struct cvert *nv = realloc(c->verts, (size_t)cap * sizeof(*nv));
-        if (!nv) {
-            gl_error(c, GL_OUT_OF_MEMORY);
-            return;
+    float r[3] = { 0, 0, 0 }, m = 0;
+    int sphere_done = 0;
+    for (int k = 0; k < 4; k++) {
+        if (!u->gen_on[k])
+            continue;
+        switch (u->gen_mode[k]) {
+        case GL_OBJECT_LINEAR: {
+            const float *p = u->gen_object[k];
+            tc[k] = p[0] * obj[0] + p[1] * obj[1] + p[2] * obj[2] + p[3] * obj[3];
+            break;
         }
-        c->verts = nv;
-        c->vcap = cap;
+        case GL_EYE_LINEAR: {
+            const float *p = u->gen_eye[k];
+            tc[k] = p[0] * eye[0] + p[1] * eye[1] + p[2] * eye[2] + p[3] * eye[3];
+            break;
+        }
+        default:                        /* GL_SPHERE_MAP, for s and t */
+            if (!sphere_done) {
+                /* The view direction reflected about the normal, onto a sphere's picture. */
+                float n[3], v[3] = { eye[0], eye[1], eye[2] };
+                eye_normal(c, n);
+                float len = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+                if (len > 0) {
+                    v[0] /= len;
+                    v[1] /= len;
+                    v[2] /= len;
+                }
+                float nv = 2 * (n[0] * v[0] + n[1] * v[1] + n[2] * v[2]);
+                for (int i = 0; i < 3; i++)
+                    r[i] = v[i] - n[i] * nv;
+                m = 2 * sqrtf(r[0] * r[0] + r[1] * r[1] + (r[2] + 1) * (r[2] + 1));
+                sphere_done = 1;
+            }
+            tc[k] = m > 0 ? r[k] / m + 0.5f : 0.5f;
+            break;
+        }
     }
-    struct cvert *v = &c->verts[c->nverts++];
+}
+
+/* A vertex through the pipeline into v: clip coordinates, color, each
+ * enabled unit's texture coordinates, the distances to the user clip
+ * planes and the fog factor. *dist gets its distance from the eye. */
+static void transform(struct fgl_context *c, float x, float y, float z, float w, struct cvert *v, float *dist)
+{
     const float *mv = c->modelview[c->mv_depth], *p = c->projection[c->proj_depth];
     /* The modelview's columns weighted by x, y, z and w, then the projection's
      * by the eye coordinates. */
@@ -235,35 +313,90 @@ void glVertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w)
         light_vertex(c, eye, v->color);
     else
         _mm_store_ps(v->color, _mm_load_ps(c->color));
-    if (c->texture_2d) {
-        const float *tm = c->texture[c->tex_depth];
-        __m128 tc = _mm_load_ps(c->texcoord);
-        _mm_store_ps(v->tex, _mm_add_ps(_mm_add_ps(_mm_add_ps(
-                                 _mm_mul_ps(_mm_load_ps(tm), _mm_shuffle_ps(tc, tc, 0x00)),
-                                 _mm_mul_ps(_mm_load_ps(tm + 4), _mm_shuffle_ps(tc, tc, 0x55))),
-                                 _mm_mul_ps(_mm_load_ps(tm + 8), _mm_shuffle_ps(tc, tc, 0xAA))),
-                                 _mm_mul_ps(_mm_load_ps(tm + 12), _mm_shuffle_ps(tc, tc, 0xFF))));
-    } else {
-        _mm_store_ps(v->tex, _mm_setr_ps(0, 0, 0, 1));
+    for (int k = 0; k < MAX_UNITS; k++) {
+        const struct texunit *u = &c->unit[k];
+        if (!u->enabled) {
+            _mm_store_ps(v->tex[k], _mm_setr_ps(0, 0, 0, 1));
+            continue;
+        }
+        float tc[4] VEC4;
+        memcpy(tc, u->coord, sizeof(tc));
+        if (u->gen_on[0] | u->gen_on[1] | u->gen_on[2] | u->gen_on[3]) {
+            const float obj[4] = { x, y, z, w };
+            texgen(c, u, obj, eye, tc);
+        }
+        const float *tm = u->matrix[u->depth];
+        __m128 t = _mm_load_ps(tc);
+        _mm_store_ps(v->tex[k], _mm_add_ps(_mm_add_ps(_mm_add_ps(
+                                    _mm_mul_ps(_mm_load_ps(tm), _mm_shuffle_ps(t, t, 0x00)),
+                                    _mm_mul_ps(_mm_load_ps(tm + 4), _mm_shuffle_ps(t, t, 0x55))),
+                                    _mm_mul_ps(_mm_load_ps(tm + 8), _mm_shuffle_ps(t, t, 0xAA))),
+                                    _mm_mul_ps(_mm_load_ps(tm + 12), _mm_shuffle_ps(t, t, 0xFF))));
     }
+    memset(v->aux, 0, sizeof(v->aux));
+    for (int k = 0; k < MAX_CLIP_PLANES; k++) {
+        if (c->clip_on[k]) {
+            const float *pl = c->clip_plane[k];
+            v->aux[k] = pl[0] * eye[0] + pl[1] * eye[1] + pl[2] * eye[2] + pl[3] * eye[3];
+        }
+    }
+    /* The distance from the eye, as GL lets it be: |z|. */
+    float d = fabsf(eye[3] != 0 ? eye[2] / eye[3] : eye[2]);
+    v->aux[AUX_FOG] = c->fog ? gl_fog_factor(c, d) : 1;
+    if (dist)
+        *dist = d;
 }
 
+void glVertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w)
+{
+    GET_CTX(c);
+    RECORD(c, OP_VERTEX, 4, x, y, z, w);
+    if (!c->in_begin)
+        return;                         /* undefined outside glBegin; ignore it */
+    if (c->nverts == c->vcap) {
+        int cap = c->vcap ? c->vcap * 2 : 256;
+        struct cvert *nv = realloc(c->verts, (size_t)cap * sizeof(*nv));
+        if (!nv) {
+            gl_error(c, GL_OUT_OF_MEMORY);
+            return;
+        }
+        c->verts = nv;
+        c->vcap = cap;
+    }
+    transform(c, x, y, z, w, &c->verts[c->nverts++], NULL);
+}
+
+void glVertex2d(GLdouble x, GLdouble y) { glVertex4f((float)x, (float)y, 0, 1); }
 void glVertex2f(GLfloat x, GLfloat y) { glVertex4f(x, y, 0, 1); }
 void glVertex2i(GLint x, GLint y) { glVertex4f((float)x, (float)y, 0, 1); }
-void glVertex2d(GLdouble x, GLdouble y) { glVertex4f((float)x, (float)y, 0, 1); }
-void glVertex2fv(const GLfloat *v) { glVertex4f(v[0], v[1], 0, 1); }
+void glVertex2s(GLshort x, GLshort y) { glVertex4f(x, y, 0, 1); }
+void glVertex3d(GLdouble x, GLdouble y, GLdouble z) { glVertex4f((float)x, (float)y, (float)z, 1); }
 void glVertex3f(GLfloat x, GLfloat y, GLfloat z) { glVertex4f(x, y, z, 1); }
 void glVertex3i(GLint x, GLint y, GLint z) { glVertex4f((float)x, (float)y, (float)z, 1); }
-void glVertex3d(GLdouble x, GLdouble y, GLdouble z) { glVertex4f((float)x, (float)y, (float)z, 1); }
-void glVertex3fv(const GLfloat *v) { glVertex4f(v[0], v[1], v[2], 1); }
+void glVertex3s(GLshort x, GLshort y, GLshort z) { glVertex4f(x, y, z, 1); }
+void glVertex4d(GLdouble x, GLdouble y, GLdouble z, GLdouble w) { glVertex4f((float)x, (float)y, (float)z, (float)w); }
+void glVertex4i(GLint x, GLint y, GLint z, GLint w) { glVertex4f((float)x, (float)y, (float)z, (float)w); }
+void glVertex4s(GLshort x, GLshort y, GLshort z, GLshort w) { glVertex4f(x, y, z, w); }
+void glVertex2dv(const GLdouble *v) { glVertex4f((float)v[0], (float)v[1], 0, 1); }
+void glVertex2fv(const GLfloat *v) { glVertex4f(v[0], v[1], 0, 1); }
+void glVertex2iv(const GLint *v) { glVertex4f((float)v[0], (float)v[1], 0, 1); }
+void glVertex2sv(const GLshort *v) { glVertex4f(v[0], v[1], 0, 1); }
 void glVertex3dv(const GLdouble *v) { glVertex4f((float)v[0], (float)v[1], (float)v[2], 1); }
+void glVertex3fv(const GLfloat *v) { glVertex4f(v[0], v[1], v[2], 1); }
+void glVertex3iv(const GLint *v) { glVertex4f((float)v[0], (float)v[1], (float)v[2], 1); }
+void glVertex3sv(const GLshort *v) { glVertex4f(v[0], v[1], v[2], 1); }
+void glVertex4dv(const GLdouble *v) { glVertex4f((float)v[0], (float)v[1], (float)v[2], (float)v[3]); }
 void glVertex4fv(const GLfloat *v) { glVertex4f(v[0], v[1], v[2], v[3]); }
+void glVertex4iv(const GLint *v) { glVertex4f((float)v[0], (float)v[1], (float)v[2], (float)v[3]); }
+void glVertex4sv(const GLshort *v) { glVertex4f(v[0], v[1], v[2], v[3]); }
 
 /* ---- clipping and drawing ---- */
 
-/* Signed distance to clip plane k; inside when >= 0. The last plane keeps w positive. */
-static inline float plane_dist(const float *v, int k)
+/* Signed distance to clip plane k; inside when >= 0. Plane 6 keeps w
+ * positive; from 7 on they are the user's. */
+static inline float plane_dist(const struct cvert *cv, int k)
 {
+    const float *v = cv->clip;
     switch (k) {
     case 0: return v[3] + v[0];
     case 1: return v[3] - v[0];
@@ -271,33 +404,38 @@ static inline float plane_dist(const float *v, int k)
     case 3: return v[3] - v[1];
     case 4: return v[3] + v[2];
     case 5: return v[3] - v[2];
-    default: return v[3] - 1e-5f;
+    case 6: return v[3] - 1e-5f;
+    default: return cv->aux[k - 7];
     }
 }
 
 /* Bit k set when the vertex is outside plane k. w + (x, y, z) and
  * w - (x, y, z) are compared with 0 in one go each. */
-static int outcode(const float *v)
+static int outcode(const struct fgl_context *c, const struct cvert *cv)
 {
-    __m128 p = _mm_load_ps(v), w = _mm_shuffle_ps(p, p, 0xFF), zero = _mm_setzero_ps();
+    __m128 p = _mm_load_ps(cv->clip), w = _mm_shuffle_ps(p, p, 0xFF), zero = _mm_setzero_ps();
     int plus = _mm_movemask_ps(_mm_cmplt_ps(_mm_add_ps(w, p), zero));     /* planes 0, 2, 4 */
     int minus = _mm_movemask_ps(_mm_cmplt_ps(_mm_sub_ps(w, p), zero));    /* planes 1, 3, 5 */
     int code = (plus & 1) | (minus & 1) << 1 | (plus & 2) << 1 | (minus & 2) << 2 |
                (plus & 4) << 2 | (minus & 4) << 3;
-    if (plane_dist(v, 6) < 0)
+    if (plane_dist(cv, 6) < 0)
         code |= 1 << 6;
+    for (int k = 0; k < MAX_CLIP_PLANES; k++)
+        if (c->clip_on[k] && cv->aux[k] < 0)
+            code |= 1 << (7 + k);
     return code;
 }
 
 static void lerp(struct cvert *out, const struct cvert *a, const struct cvert *b, float t)
 {
     __m128 tt = _mm_set1_ps(t);
-    __m128 ac = _mm_load_ps(a->clip), bc = _mm_load_ps(b->clip);
-    __m128 acol = _mm_load_ps(a->color), bcol = _mm_load_ps(b->color);
-    __m128 atex = _mm_load_ps(a->tex), btex = _mm_load_ps(b->tex);
-    _mm_store_ps(out->clip, _mm_add_ps(ac, _mm_mul_ps(_mm_sub_ps(bc, ac), tt)));
-    _mm_store_ps(out->color, _mm_add_ps(acol, _mm_mul_ps(_mm_sub_ps(bcol, acol), tt)));
-    _mm_store_ps(out->tex, _mm_add_ps(atex, _mm_mul_ps(_mm_sub_ps(btex, atex), tt)));
+    const float *pa = (const float *)a, *pb = (const float *)b;
+    float *po = (float *)out;
+    /* Every attribute is a run of four-float vectors. */
+    for (size_t i = 0; i < sizeof(struct cvert) / sizeof(float); i += 4) {
+        __m128 va = _mm_load_ps(pa + i), vb = _mm_load_ps(pb + i);
+        _mm_store_ps(po + i, _mm_add_ps(va, _mm_mul_ps(_mm_sub_ps(vb, va), tt)));
+    }
 }
 
 /* Clip the polygon in place against every plane its vertices cross; returns its size. */
@@ -310,7 +448,7 @@ static int clip_polygon(struct cvert *poly, int n, int planes)
         int m = 0;
         for (int i = 0; i < n; i++) {
             const struct cvert *a = &poly[i], *b = &poly[(i + 1) % n];
-            float da = plane_dist(a->clip, k), db = plane_dist(b->clip, k);
+            float da = plane_dist(a, k), db = plane_dist(b, k);
             if (da >= 0 && m < MAX_POLY)
                 tmp[m++] = *a;
             if ((da >= 0) != (db >= 0) && m < MAX_POLY)
@@ -322,7 +460,8 @@ static int clip_polygon(struct cvert *poly, int n, int planes)
     return n;
 }
 
-/* Clip coordinates to the backend's window coordinates (top-left origin). */
+/* Clip coordinates to the backend's window coordinates (top-left origin).
+ * Fog worked out at the vertices is folded into the color here. */
 static void to_window(struct fgl_context *c, const struct cvert *v, struct wvert *w)
 {
     float iw = 1 / v->clip[3];
@@ -334,9 +473,21 @@ static void to_window(struct fgl_context *c, const struct cvert *v, struct wvert
     w->g = v->color[1];
     w->b = v->color[2];
     w->a = v->color[3];
-    float q = v->tex[3] != 0 ? 1 / v->tex[3] : 1;
-    w->s = v->tex[0] * q;
-    w->t = v->tex[1] * q;
+    w->f = 1;
+    float f = v->aux[AUX_FOG];
+    if (c->fog_draw == FOG_FOLD) {
+        w->r = f * w->r + (1 - f) * c->fog_color[0];
+        w->g = f * w->g + (1 - f) * c->fog_color[1];
+        w->b = f * w->b + (1 - f) * c->fog_color[2];
+    } else if (c->fog_draw == FOG_PIXEL) {
+        w->f = f;
+    }
+    float q = v->tex[0][3] != 0 ? 1 / v->tex[0][3] : 1;
+    w->s = v->tex[0][0] * q;
+    w->t = v->tex[0][1] * q;
+    q = v->tex[1][3] != 0 ? 1 / v->tex[1][3] : 1;
+    w->s1 = v->tex[1][0] * q;
+    w->t1 = v->tex[1][1] * q;
     w->w = v->clip[3];
 }
 
@@ -407,10 +558,10 @@ static void draw_polygon(struct fgl_context *c, const int *idx, int n, int provo
     if (n < 3 || n > MAX_POLY / 2)
         return;
     struct cvert poly[MAX_POLY];
-    int all = 0x7F, any = 0;
+    int all = (1 << NPLANES) - 1, any = 0;
     for (int i = 0; i < n; i++) {
         poly[i] = c->verts[idx[i]];
-        int code = outcode(poly[i].clip);
+        int code = outcode(c, &poly[i]);
         all &= code;
         any |= code;
     }
@@ -459,10 +610,10 @@ static void draw_line(struct fgl_context *c, int i0, int i1)
     struct cvert a = c->verts[i0], b = c->verts[i1];
     if (c->shade_model == GL_FLAT)
         memcpy(a.color, b.color, sizeof(a.color));
-    /* Liang-Barsky against each plane. */
+    /* Liang-Barsky against each plane (a user plane that is off reads 0 at both ends). */
     float t0 = 0, t1 = 1;
     for (int k = 0; k < NPLANES; k++) {
-        float da = plane_dist(a.clip, k), db = plane_dist(b.clip, k);
+        float da = plane_dist(&a, k), db = plane_dist(&b, k);
         if (da < 0 && db < 0)
             return;
         if (da < 0) {
@@ -489,7 +640,7 @@ static void draw_line(struct fgl_context *c, int i0, int i1)
 static void draw_point(struct fgl_context *c, int i)
 {
     const struct cvert *v = &c->verts[i];
-    if (outcode(v->clip))
+    if (outcode(c, v))
         return;
     struct wvert w;
     to_window(c, v, &w);
@@ -601,7 +752,68 @@ void glRectf(GLfloat x1, GLfloat y1, GLfloat x2, GLfloat y2)
     glEnd();
 }
 
-void glRecti(GLint x1, GLint y1, GLint x2, GLint y2)
+void glRectd(GLdouble x1, GLdouble y1, GLdouble x2, GLdouble y2) { glRectf((float)x1, (float)y1, (float)x2, (float)y2); }
+void glRecti(GLint x1, GLint y1, GLint x2, GLint y2) { glRectf((float)x1, (float)y1, (float)x2, (float)y2); }
+void glRects(GLshort x1, GLshort y1, GLshort x2, GLshort y2) { glRectf(x1, y1, x2, y2); }
+void glRectdv(const GLdouble *a, const GLdouble *b) { glRectf((float)a[0], (float)a[1], (float)b[0], (float)b[1]); }
+void glRectfv(const GLfloat *a, const GLfloat *b) { glRectf(a[0], a[1], b[0], b[1]); }
+void glRectiv(const GLint *a, const GLint *b) { glRectf((float)a[0], (float)a[1], (float)b[0], (float)b[1]); }
+void glRectsv(const GLshort *a, const GLshort *b) { glRectf(a[0], a[1], b[0], b[1]); }
+
+/* ---- the raster position ---- */
+
+/* A point through the vertex pipeline: valid if it is inside the view
+ * volume and the user clip planes, and then where glBitmap and
+ * glDrawPixels draw, with its color, texture coordinates and fog. */
+void glRasterPos4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w)
 {
-    glRectf((float)x1, (float)y1, (float)x2, (float)y2);
+    GET_CTX(c);
+    RECORD(c, OP_RASTER_POS, 4, x, y, z, w);
+    if (c->in_begin) {
+        gl_error(c, GL_INVALID_OPERATION);
+        return;
+    }
+    struct cvert v;
+    float dist;
+    transform(c, x, y, z, w, &v, &dist);
+    if (outcode(c, &v)) {
+        c->raster_valid = 0;
+        return;
+    }
+    float iw = 1 / v.clip[3];
+    c->raster_pos[0] = c->vp_x + (v.clip[0] * iw + 1) * c->vp_w * 0.5f;
+    c->raster_pos[1] = c->vp_y + (v.clip[1] * iw + 1) * c->vp_h * 0.5f;
+    c->raster_pos[2] = gl_clampf(c->depth_near + (v.clip[2] * iw + 1) * 0.5f * (c->depth_far - c->depth_near));
+    c->raster_pos[3] = v.clip[3];
+    memcpy(c->raster_color, v.color, sizeof(c->raster_color));
+    memcpy(c->raster_tex, v.tex, sizeof(c->raster_tex));
+    c->raster_distance = dist;
+    c->raster_valid = 1;
 }
+
+void glRasterPos2d(GLdouble x, GLdouble y) { glRasterPos4f((float)x, (float)y, 0, 1); }
+void glRasterPos2f(GLfloat x, GLfloat y) { glRasterPos4f(x, y, 0, 1); }
+void glRasterPos2i(GLint x, GLint y) { glRasterPos4f((float)x, (float)y, 0, 1); }
+void glRasterPos2s(GLshort x, GLshort y) { glRasterPos4f(x, y, 0, 1); }
+void glRasterPos3d(GLdouble x, GLdouble y, GLdouble z) { glRasterPos4f((float)x, (float)y, (float)z, 1); }
+void glRasterPos3f(GLfloat x, GLfloat y, GLfloat z) { glRasterPos4f(x, y, z, 1); }
+void glRasterPos3i(GLint x, GLint y, GLint z) { glRasterPos4f((float)x, (float)y, (float)z, 1); }
+void glRasterPos3s(GLshort x, GLshort y, GLshort z) { glRasterPos4f(x, y, z, 1); }
+void glRasterPos4d(GLdouble x, GLdouble y, GLdouble z, GLdouble w)
+{
+    glRasterPos4f((float)x, (float)y, (float)z, (float)w);
+}
+void glRasterPos4i(GLint x, GLint y, GLint z, GLint w) { glRasterPos4f((float)x, (float)y, (float)z, (float)w); }
+void glRasterPos4s(GLshort x, GLshort y, GLshort z, GLshort w) { glRasterPos4f(x, y, z, w); }
+void glRasterPos2dv(const GLdouble *v) { glRasterPos4f((float)v[0], (float)v[1], 0, 1); }
+void glRasterPos2fv(const GLfloat *v) { glRasterPos4f(v[0], v[1], 0, 1); }
+void glRasterPos2iv(const GLint *v) { glRasterPos4f((float)v[0], (float)v[1], 0, 1); }
+void glRasterPos2sv(const GLshort *v) { glRasterPos4f(v[0], v[1], 0, 1); }
+void glRasterPos3dv(const GLdouble *v) { glRasterPos4f((float)v[0], (float)v[1], (float)v[2], 1); }
+void glRasterPos3fv(const GLfloat *v) { glRasterPos4f(v[0], v[1], v[2], 1); }
+void glRasterPos3iv(const GLint *v) { glRasterPos4f((float)v[0], (float)v[1], (float)v[2], 1); }
+void glRasterPos3sv(const GLshort *v) { glRasterPos4f(v[0], v[1], v[2], 1); }
+void glRasterPos4dv(const GLdouble *v) { glRasterPos4f((float)v[0], (float)v[1], (float)v[2], (float)v[3]); }
+void glRasterPos4fv(const GLfloat *v) { glRasterPos4f(v[0], v[1], v[2], v[3]); }
+void glRasterPos4iv(const GLint *v) { glRasterPos4f((float)v[0], (float)v[1], (float)v[2], (float)v[3]); }
+void glRasterPos4sv(const GLshort *v) { glRasterPos4f(v[0], v[1], v[2], v[3]); }

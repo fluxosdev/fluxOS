@@ -7,6 +7,10 @@
  *
  * Normals, and colors of integer types, are mapped to -1 to 1 or 0 to 1
  * as GL has it; vertex and texture coordinates are taken as they are.
+ * Each texture unit has its texture coordinate array, which
+ * glClientActiveTexture picks. glLockArraysEXT and glUnlockArraysEXT
+ * (GL_EXT_compiled_vertex_array) are kept track of and change nothing:
+ * every vertex is transformed when it is drawn.
  */
 #include <stddef.h>
 #include "glint.h"
@@ -33,7 +37,7 @@ struct varray *gl_client_array(struct fgl_context *c, GLenum cap)
     case GL_VERTEX_ARRAY: return &c->arrays[ARRAY_VERTEX];
     case GL_NORMAL_ARRAY: return &c->arrays[ARRAY_NORMAL];
     case GL_COLOR_ARRAY: return &c->arrays[ARRAY_COLOR];
-    case GL_TEXTURE_COORD_ARRAY: return &c->arrays[ARRAY_TEXCOORD];
+    case GL_TEXTURE_COORD_ARRAY: return &c->arrays[ARRAY_TEXCOORD + c->client_unit];
     default: return NULL;
     }
 }
@@ -98,7 +102,9 @@ void glColorPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *ptr)
 void glTexCoordPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *ptr)
 {
     static const GLenum types[] = { GL_SHORT, GL_INT, GL_FLOAT, GL_DOUBLE, 0 };
-    set_pointer(ARRAY_TEXCOORD, size, 1, 4, type, types, stride, ptr);
+    struct fgl_context *c = gl_ctx;
+    if (c)
+        set_pointer(ARRAY_TEXCOORD + c->client_unit, size, 1, 4, type, types, stride, ptr);
 }
 
 /* glInterleavedArrays' formats: which arrays, the texture coordinates' and
@@ -148,7 +154,7 @@ void glInterleavedArrays(GLenum format, GLsizei stride, const GLvoid *pointer)
     if (stride == 0)
         stride = voff + vertex * 4;
     const uint8_t *p = pointer;
-    c->arrays[ARRAY_TEXCOORD].enabled = tex != 0;
+    c->arrays[ARRAY_TEXCOORD + c->client_unit].enabled = tex != 0;
     c->arrays[ARRAY_COLOR].enabled = color != 0;
     c->arrays[ARRAY_NORMAL].enabled = normal;
     c->arrays[ARRAY_VERTEX].enabled = 1;
@@ -169,7 +175,7 @@ void glGetPointerv(GLenum pname, GLvoid **params)
     case GL_VERTEX_ARRAY_POINTER: k = ARRAY_VERTEX; break;
     case GL_NORMAL_ARRAY_POINTER: k = ARRAY_NORMAL; break;
     case GL_COLOR_ARRAY_POINTER: k = ARRAY_COLOR; break;
-    case GL_TEXTURE_COORD_ARRAY_POINTER: k = ARRAY_TEXCOORD; break;
+    case GL_TEXTURE_COORD_ARRAY_POINTER: k = ARRAY_TEXCOORD + c->client_unit; break;
     default:
         gl_error(c, GL_INVALID_ENUM);
         return;
@@ -186,11 +192,13 @@ int gl_array_get(struct fgl_context *c, GLenum pname, double *v)
         return 1;
     case GL_VERTEX_ARRAY_SIZE: v[0] = c->arrays[ARRAY_VERTEX].size; return 1;
     case GL_COLOR_ARRAY_SIZE: v[0] = c->arrays[ARRAY_COLOR].size; return 1;
-    case GL_TEXTURE_COORD_ARRAY_SIZE: v[0] = c->arrays[ARRAY_TEXCOORD].size; return 1;
+    case GL_TEXTURE_COORD_ARRAY_SIZE: v[0] = c->arrays[ARRAY_TEXCOORD + c->client_unit].size; return 1;
     case GL_VERTEX_ARRAY_TYPE: case GL_VERTEX_ARRAY_STRIDE: a = &c->arrays[ARRAY_VERTEX]; break;
     case GL_NORMAL_ARRAY_TYPE: case GL_NORMAL_ARRAY_STRIDE: a = &c->arrays[ARRAY_NORMAL]; break;
     case GL_COLOR_ARRAY_TYPE: case GL_COLOR_ARRAY_STRIDE: a = &c->arrays[ARRAY_COLOR]; break;
-    case GL_TEXTURE_COORD_ARRAY_TYPE: case GL_TEXTURE_COORD_ARRAY_STRIDE: a = &c->arrays[ARRAY_TEXCOORD]; break;
+    case GL_TEXTURE_COORD_ARRAY_TYPE: case GL_TEXTURE_COORD_ARRAY_STRIDE:
+        a = &c->arrays[ARRAY_TEXCOORD + c->client_unit];
+        break;
     default: return 0;
     }
     int is_type = pname == GL_VERTEX_ARRAY_TYPE || pname == GL_NORMAL_ARRAY_TYPE ||
@@ -262,12 +270,17 @@ void glArrayElement(GLint i)
         fetch(a, i, v, 1);
         glColor4f(v[0], v[1], v[2], v[3]);
     }
-    a = &c->arrays[ARRAY_TEXCOORD];
-    if (a->enabled && a->ptr) {
-        v[1] = v[2] = 0;
-        v[3] = 1;
-        fetch(a, i, v, 0);
-        glTexCoord4f(v[0], v[1], v[2], v[3]);
+    for (int u = 0; u < MAX_UNITS; u++) {
+        a = &c->arrays[ARRAY_TEXCOORD + u];
+        if (a->enabled && a->ptr) {
+            v[1] = v[2] = 0;
+            v[3] = 1;
+            fetch(a, i, v, 0);
+            if (u == 0)
+                glTexCoord4f(v[0], v[1], v[2], v[3]);
+            else
+                glMultiTexCoord4fARB(GL_TEXTURE0_ARB + (GLenum)u, v[0], v[1], v[2], v[3]);
+        }
     }
     a = &c->arrays[ARRAY_VERTEX];
     if (a->enabled && a->ptr) {
@@ -328,4 +341,30 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indic
         glArrayElement(k);
     }
     glEnd();
+}
+
+void glLockArraysEXT(GLint first, GLsizei count)
+{
+    GET_CTX(c);
+    if (first < 0 || count <= 0) {
+        gl_error(c, GL_INVALID_VALUE);
+        return;
+    }
+    if (c->lock_count || c->in_begin) {
+        gl_error(c, GL_INVALID_OPERATION);
+        return;
+    }
+    c->lock_first = first;
+    c->lock_count = count;
+}
+
+void glUnlockArraysEXT(void)
+{
+    GET_CTX(c);
+    if (!c->lock_count || c->in_begin) {
+        gl_error(c, GL_INVALID_OPERATION);
+        return;
+    }
+    c->lock_first = 0;
+    c->lock_count = 0;
 }
