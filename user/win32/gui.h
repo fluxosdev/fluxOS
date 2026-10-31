@@ -25,6 +25,9 @@ void gui_move(uint32_t id, int x, int y);
 void gui_title(uint32_t id, const char *title);
 void gui_cursor(uint32_t id, int kind);     /* enum cursor_kind */
 void gui_focus(uint32_t id);
+void gui_clip_set(const char *text);
+char *gui_clip_get(void);
+void gui_icon(uint32_t id, const uint32_t *pixels);
 void gui_damage(uint32_t id, struct rect r);
 void gui_flush(void);
 /* The next message from the desktop that is about a window (malloc'd), or NULL. */
@@ -32,6 +35,8 @@ struct wm_msg *gui_event(void);
 /* A buffer from the desktop, mapped (and kept out of the program's address space); -1 if it cannot be. */
 int gui_attach(struct surface *s, const struct wm_buffer *b);
 void gui_detach(struct surface *s);
+int win_surface_init(struct surface *s, int w, int h);
+void win_surface_free(struct surface *s);
 
 /* ---- user32.c ---- */
 /* The pixels a window's DC draws into: the surface, where the window's client area lies in it,
@@ -39,6 +44,10 @@ void gui_detach(struct surface *s);
 int win_surface(HWND hwnd, struct surface **s, int *ox, int *oy, int *cw, int *ch);
 /* r (surface coordinates) of the window's surface was drawn on. */
 void win_dirty(HWND hwnd, struct rect r);
+struct rect win_clip_bounds(HWND hwnd);
+struct clip_save;
+struct clip_save *win_clip_save(HWND hwnd, struct surface *s, struct rect clip, struct clip_save *saved);
+void win_clip_restore(struct clip_save *saved, struct surface *s);
 /* Send the desktop what was drawn (gui_flush does). */
 void user32_flush_damage(void);
 /* The desktop went or the program is ending: let go of every desktop window. */

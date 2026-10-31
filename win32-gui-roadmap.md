@@ -1,8 +1,10 @@
 # fluxOS Windows GUI roadmap
 
 *Written 2026-10-30, against commit 95a0cc4. Stages 0 and 1 are done (see
-their sections for where they differ from the plan); the later stages are
-plans.*
+their sections for where they differ from the plan). Stage 2 now has
+its basic controls, dialogs, menus, clipboard and resource icons; see its
+section for the tested workflow and remaining compatibility limits. The
+later stages are plans.*
 
 `winrun` already runs 32-bit console Windows programs: a PE loader, the
 gate between the loader's flat segments and the program's segments, SEH,
@@ -12,7 +14,7 @@ creates a window and pumps messages gets a real window on the fluxOS
 desktop, drawn through GDI, with the keyboard, the mouse and timers
 arriving as Windows messages.
 
-## Where we are
+## Starting point (before stage 0)
 
 **Already in place:**
 
@@ -266,6 +268,75 @@ clipboard.*
   `C_CLIP_GET`.
 - The program's icon: `RT_GROUP_ICON` from the exe, as `C_ICON_IMAGE`
   (32 x 32) for the taskbar.
+
+**Implemented (2026-10-31).** The basic stage-2 workflow is exercised by
+`tests/win32/phase2.c`: an editor with a menu bar, edit/list/combo/button
+controls, a resource dialog, a message box, popup menus, accelerators,
+clipboard text and a resource icon. This is a purpose-built compatibility
+program, not a claim that every version of Microsoft's Notepad runs.
+
+- Children have sibling z-order independent of handle allocation.
+  `SetWindowPos` reorders children, input descends to visible, enabled
+  children, and capture retains child-local coordinates. `WM_MOVE` for
+  children reports parent-client coordinates. `GetDlgItem`,
+  `GetDlgCtrlID`, child traversal through `GetWindow`, `IsChild`,
+  `EnumChildWindows`, `ChildWindowFromPoint(Ex)` and window enabling are
+  available. Enumeration tolerates destruction and handle reuse in its
+  callback; reparenting through `GWL_HWNDPARENT` rejects cycles.
+- GDI clips to ancestors, `WS_CLIPCHILDREN` and `WS_CLIPSIBLINGS`, and
+  queued painting follows z-order. Nonrectangular exclusions preserve
+  and restore only the covered pixels touched by an operation. Private
+  surfaces and clipping backups use separate mappings, recorded as
+  foreign allocations, so they cannot grow the loader's heap into the
+  guest EXE's mapping.
+- `controls.c` registers guest-callable builtin procedures for `BUTTON`,
+  `STATIC`, `EDIT`, `LISTBOX`, `COMBOBOX` and `SCROLLBAR`. Their state is
+  separate from the application's window extra bytes and `GWL_USERDATA`.
+  Controls use the desktop's colors and the selected GDI font. Edit
+  controls support selection, keyboard navigation, copy/cut/paste,
+  single/multiline text, scrolling, read-only mode, limits and one-step
+  undo. Lists support insertion, deletion, selection and item data;
+  combo boxes provide editable and drop-down-list modes with a desktop
+  popup. Window scrollbars reserve client space and use `SCROLLINFO`.
+  Notifications go to the parent through `WM_COMMAND`; applications can
+  route `WM_NOTIFY` through the ordinary `SendMessage` path.
+- `dialog.c` reads bounded standard and extended templates, maps dialog
+  units using the dialog font and handles ordinal builtin control
+  classes. Modeless and modal A/W entry points, dialog-item helpers,
+  Tab/group navigation, Enter/Escape and mnemonics are implemented.
+  Modal loops preserve `WM_QUIT`, disable the owner and restore it on
+  exit. `MessageBox` creates a themed dialog with the requested button
+  group and default button.
+- `menu.c` handles standard/extended resources, menu construction and
+  item state/info, menu bars inside the desktop surface, desktop popup
+  windows, keyboard selection and resource/constructed accelerator
+  tables. Menu height is excluded from Win32 client rectangles and
+  included in window sizing and coordinate conversion.
+- `clipboard.c` carries text through `C_CLIP_SET` / `C_CLIP_GET`, converts
+  ANSI/UTF-16/desktop UTF-8 and uses guest `GlobalAlloc` handles for data
+  returned to the program. Synchronous requests queue unrelated desktop
+  events, as window creation and resizing do.
+- `icons.c` decodes `RT_GROUP_ICON` / `RT_ICON` with the desktop's ICO
+  decoder, supports `DrawIcon(Ex)` and sends a 32 x 32 ARGB
+  `C_ICON_IMAGE`. A top-level window without an explicit icon uses the
+  first icon group in its module.
+- `make test-win32-gui-qemu` runs the previous stages, child-window tests
+  and the stage-2 workflow on two CPUs. The stand-in desktop checks
+  control/menu pixels, the taskbar icon, actual typing and accelerator
+  input, combo popups, modal dialog focus/owner state, message-box results,
+  popup/menu-bar commands, clipboard conversion and clean exit. Guest
+  assertions also cover subclassing, radio groups, Unicode text,
+  destruction during edit notification and malformed dialog resources.
+
+**Compatibility limits:** this remains a basic USER32 implementation.
+There is no edit soft wrapping, custom tab stops, IME, rich text, listbox
+owner data, owner drawing or control theming API. Menus open submenus by
+click or keyboard rather than hover and do not implement menu-bar drag
+tracking; scrollbar buttons do not repeat while held. Clipboard support
+is text only, with process-local open/close exclusion (the desktop
+protocol has no cross-process clipboard lock or delayed-rendering
+ownership). Fonts retain stage 0's glyph limitations. Common controls,
+file dialogs and real GUI threads remain stage 3 work.
 
 ## Stage 3: threads and the common libraries
 

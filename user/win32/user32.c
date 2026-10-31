@@ -40,245 +40,10 @@
 #include "wmconn.h"
 #include "os.h"
 
-#define A(i) (a[i])
-#define P(i) gp(a[i])
-#define SETERR(e) set_last_error(e)
-#define FAIL(e) do { set_last_error(e); return 0; } while (0)
-#define IS_INTRES(p) (((p) >> 16) == 0)
-
-#define WM_NULL 0x0000
-#define WM_CREATE 0x0001
-#define WM_DESTROY 0x0002
-#define WM_MOVE 0x0003
-#define WM_SIZE 0x0005
-#define WM_SETTEXT 0x000C
-#define WM_GETTEXT 0x000D
-#define WM_GETTEXTLENGTH 0x000E
-#define WM_PAINT 0x000F
-#define WM_CLOSE 0x0010
-#define WM_QUERYENDSESSION 0x0011
-#define WM_QUIT 0x0012
-#define WM_QUERYOPEN 0x0013
-#define WM_ERASEBKGND 0x0014
-#define WM_SHOWWINDOW 0x0018
-#define WM_MOUSEACTIVATE 0x0021
-#define WM_NOTIFYFORMAT 0x0055
-#define WM_NCCREATE 0x0081
-#define WM_NCDESTROY 0x0082
-#define WM_NCHITTEST 0x0084
-#define WM_NCACTIVATE 0x0086
-#define WM_SYSCOMMAND 0x0112
-#define WM_ACTIVATE 0x0006
-#define WM_SETFOCUS 0x0007
-#define WM_KILLFOCUS 0x0008
-#define WM_ACTIVATEAPP 0x001C
-#define WM_SETCURSOR 0x0020
-#define WM_KEYDOWN 0x0100
-#define WM_KEYUP 0x0101
-#define WM_CHAR 0x0102
-#define WM_SYSKEYDOWN 0x0104
-#define WM_SYSKEYUP 0x0105
-#define WM_SYSCHAR 0x0106
-#define WM_TIMER 0x0113
-#define WM_MOUSEMOVE 0x0200
-#define WM_LBUTTONDOWN 0x0201
-#define WM_RBUTTONDOWN 0x0204
-#define WM_MBUTTONDOWN 0x0207
-#define WM_MOUSEWHEEL 0x020A
-#define WM_CAPTURECHANGED 0x0215
-
-#define WA_INACTIVE 0
-#define WA_ACTIVE 1
-#define MK_LBUTTON 0x01
-#define MK_RBUTTON 0x02
-#define MK_SHIFT 0x04
-#define MK_CONTROL 0x08
-#define MK_MBUTTON 0x10
-#define WHEEL_DELTA 120
-#define USER_TIMER_MINIMUM 10
-
-#define VK_LBUTTON 0x01
-#define VK_RBUTTON 0x02
-#define VK_MBUTTON 0x04
-#define VK_BACK 0x08
-#define VK_TAB 0x09
-#define VK_RETURN 0x0D
-#define VK_SHIFT 0x10
-#define VK_CONTROL 0x11
-#define VK_MENU 0x12
-#define VK_CAPITAL 0x14
-#define VK_ESCAPE 0x1B
-#define VK_SPACE 0x20
-#define VK_F10 0x79
-#define VK_LSHIFT 0xA0
-#define VK_RSHIFT 0xA1
-#define VK_LCONTROL 0xA2
-#define VK_RCONTROL 0xA3
-#define VK_LMENU 0xA4
-#define VK_RMENU 0xA5
-
-#define SC_CLOSE 0xF060
-#define SIZE_RESTORED 0
-#define SIZE_MINIMIZED 1
-#define SIZE_MAXIMIZED 2
-#define HTCLIENT 1
-#define MA_ACTIVATE 1
-#define NFR_ANSI 1
-#define NFR_UNICODE 2
-
-#define WS_POPUP 0x80000000u
-#define WS_CHILD 0x40000000u
-#define WS_MINIMIZE 0x20000000u
-#define WS_VISIBLE 0x10000000u
-#define WS_MAXIMIZE 0x01000000u
-#define WS_CAPTION 0x00C00000u
-#define WS_THICKFRAME 0x00040000u
-#define WS_MINIMIZEBOX 0x00020000u
-#define WS_MAXIMIZEBOX 0x00010000u
-#define WS_EX_TOOLWINDOW 0x00000080u
-
-#define CS_DBLCLKS 0x0008
-#define CS_OWNDC 0x0020
-#define CS_CLASSDC 0x0040
-
-#define SW_HIDE 0
-#define SW_SHOWDEFAULT 10
-
-#define SWP_NOSIZE 0x0001
-#define SWP_NOMOVE 0x0002
-#define SWP_SHOWWINDOW 0x0040
-#define SWP_HIDEWINDOW 0x0080
-
-#define GWL_WNDPROC (-4)
-#define GWL_HINSTANCE (-6)
-#define GWL_HWNDPARENT (-8)
-#define GWL_ID (-12)
-#define GWL_STYLE (-16)
-#define GWL_EXSTYLE (-20)
-#define GWL_USERDATA (-21)
-
-#define GCL_MENUNAME (-8)
-#define GCL_HBRBACKGROUND (-10)
-#define GCL_HCURSOR (-12)
-#define GCL_HICON (-14)
-#define GCL_HMODULE (-16)
-#define GCL_CBWNDEXTRA (-18)
-#define GCL_CBCLSEXTRA (-20)
-#define GCL_WNDPROC (-24)
-#define GCL_STYLE (-26)
-#define GCW_ATOM (-32)
-#define GCL_HICONSM (-34)
-
-#define CW_USEDEFAULT 0x80000000u
-#define HWND_MESSAGE 0xFFFFFFFDu
-#define HWND_BROADCAST 0xFFFFu
-#define PM_REMOVE 0x0001
-
-#define ERROR_INVALID_INDEX 1413
-#define ERROR_CLASS_HAS_WINDOWS 1412
-#define ERROR_TLW_WITH_WSCHILD 1406
-
-/* The handles LoadCursor and LoadIcon give for the system's own (IDC_*, IDI_*). */
-#define CURSOR_HANDLE(id) (0x00010000u | (id))
-#define ICON_HANDLE(id) (0x00020000u | (id))
-#define IDC_ARROW 32512
-#define IDI_APPLICATION 32512
-
-/* ---- structures as the program has them ---- */
-struct wndclassex {             /* WNDCLASSEX; WNDCLASS is this without cbSize and hIconSm */
-    uint32_t size, style;
-    gp_t wndproc;
-    int32_t cls_extra, wnd_extra;
-    HINSTANCE inst;
-    HICON icon;
-    HCURSOR cursor;
-    HBRUSH brush;
-    gp_t menu_name, class_name;
-    HICON icon_sm;
-};
-
-struct createstruct {
-    gp_t params;
-    HINSTANCE inst;
-    HMENU menu;
-    HWND parent;
-    int32_t cy, cx, y, x;
-    uint32_t style;
-    gp_t name, class_name;
-    uint32_t exstyle;
-};
-
-struct msg {
-    HWND hwnd;
-    UINT message;
-    WPARAM wparam;
-    LPARAM lparam;
-    DWORD time;
-    POINT pt;
-};
-
-struct paintstruct {
-    HDC hdc;
-    BOOL erase;
-    RECT paint;
-    BOOL restore, inc_update;
-    BYTE reserved[32];
-};
-
-/* ---- classes ---- */
-struct wclass {
-    ATOM atom;
-    uint16_t name[256];
-    uint32_t style;
-    gp_t wndproc;
-    int cls_extra, wnd_extra;
-    HINSTANCE inst;
-    HICON icon, icon_sm;
-    HCURSOR cursor;
-    HBRUSH brush;
-    gp_t menu_name;
-    int unicode;
-    uint8_t *extra;
-    int nwindows;
-    struct wclass *next;
-};
+#include "ui.h"
 
 static struct wclass *classes;
 static ATOM next_atom = 0xC000;
-
-/* ---- windows ---- */
-#define MAX_WINDOWS 4096
-
-struct win {
-    HWND hwnd;
-    struct wclass *cls;                 /* NULL: the desktop window */
-    uint32_t tid;
-    uint32_t style, exstyle;
-    gp_t wndproc;
-    int unicode;
-    HINSTANCE inst;
-    HWND parent, owner;                 /* parent: WS_CHILD windows only */
-    uint32_t id;                        /* a child's (hMenu) */
-    uint32_t userdata;
-    uint8_t *extra;
-    int nextra;
-    uint16_t *text;                     /* malloc'd, or NULL */
-    RECT wr;                            /* the window: screen coordinates, or a child's in its parent's client area */
-    int cw, ch;                         /* the client area */
-    int user_pos;                       /* the program placed it (not CW_USEDEFAULT) */
-    int message_only;
-    int shown_once;
-    /* a top-level window's pixels: the desktop's (desk_id) or our own */
-    uint32_t desk_id, seq;
-    struct surface surf;
-    int minimized, maximized;
-    RECT update;                        /* client coordinates; empty: nothing to paint */
-    int erase;
-    struct rect dirty;                  /* surface coordinates drawn on since the last flush */
-    HDC own_dc;                         /* CS_OWNDC and CS_CLASSDC */
-    int cursor_sent;                    /* the C_CURSOR kind sent last, plus 1 (0: none yet) */
-    int destroying;
-};
 
 static struct win *table[MAX_WINDOWS];
 static uint16_t gens[MAX_WINDOWS];
@@ -421,6 +186,34 @@ static struct win *win_new(void)
     return NULL;
 }
 
+/* Children are linked from front to back, independently of handle allocation. */
+static void child_unlink(struct win *w)
+{
+    struct win *p = win_get(w->parent), *prev = win_get(w->prev_sibling), *next = win_get(w->next_sibling);
+    if (!p || !(w->style & WS_CHILD))
+        return;
+    if (prev) prev->next_sibling = w->next_sibling;
+    else p->first_child = w->next_sibling;
+    if (next) next->prev_sibling = w->prev_sibling;
+    else p->last_child = w->prev_sibling;
+    w->prev_sibling = w->next_sibling = 0;
+}
+
+static void child_insert(struct win *w, HWND after)
+{
+    struct win *p = win_get(w->parent);
+    if (!p || !(w->style & WS_CHILD))
+        return;
+    struct win *prev = after == 1 ? win_get(p->last_child) : win_get(after); /* HWND_BOTTOM */
+    struct win *next = win_get(prev ? prev->next_sibling : p->first_child);
+    w->prev_sibling = prev ? prev->hwnd : 0;
+    w->next_sibling = next ? next->hwnd : 0;
+    if (prev) prev->next_sibling = w->hwnd;
+    else p->first_child = w->hwnd;
+    if (next) next->prev_sibling = w->hwnd;
+    else p->last_child = w->hwnd;
+}
+
 static int is_top(const struct win *w)
 {
     return w->cls && !(w->style & WS_CHILD) && !w->message_only;
@@ -460,7 +253,7 @@ static POINT client_origin(struct win *w)
             break;
         if (!(w->style & WS_CHILD)) {
             p.x += w->wr.left + (framed(w) ? BORDER : 0);
-            p.y += w->wr.top + (framed(w) ? FRAME_TOP : 0);
+            p.y += w->wr.top + (framed(w) ? FRAME_TOP : 0) + w->menu_height;
             break;
         }
         p.x += w->wr.left;
@@ -474,11 +267,11 @@ static POINT client_origin(struct win *w)
 static void frame_from_client(struct win *w)
 {
     if (framed(w)) {
-        w->wr.right = w->wr.left + w->cw + 2 * BORDER;
-        w->wr.bottom = w->wr.top + w->ch + FRAME_TOP + BORDER;
+        w->wr.right = w->wr.left + w->cw + w->sb_w + 2 * BORDER;
+        w->wr.bottom = w->wr.top + w->ch + w->menu_height + w->sb_h + FRAME_TOP + BORDER;
     } else {
-        w->wr.right = w->wr.left + w->cw;
-        w->wr.bottom = w->wr.top + w->ch;
+        w->wr.right = w->wr.left + w->cw + w->sb_w;
+        w->wr.bottom = w->wr.top + w->ch + w->menu_height + w->sb_h;
     }
 }
 
@@ -512,6 +305,9 @@ static LRESULT call_proc(gp_t proc, int proc_unicode, HWND h, UINT msg, WPARAM w
     if (proc_unicode == from_unicode)
         return call_guest4(proc, h, msg, wp, lp);
     switch (msg) {
+    case 0x00C2: /* EM_REPLACESEL */
+    case 0x0180: case 0x0181: case 0x018C: case 0x018D: case 0x018F: case 0x01A2:
+    case 0x0143: case 0x014A: case 0x014C: case 0x014D: case 0x0158:
     case WM_SETTEXT: {
         if (!lp)
             break;
@@ -521,6 +317,20 @@ static LRESULT call_proc(gp_t proc, int proc_unicode, HWND h, UINT msg, WPARAM w
         LRESULT r = call_guest4(proc, h, msg, wp, g);
         gfree(g);
         return r;
+    }
+    case 0x0189: case 0x0148: { /* LB_GETTEXT / CB_GETLBTEXT */
+        if(!lp) return (uint32_t)-1;
+        UINT length_message=msg==0x0189 ? 0x018A:0x0149;
+        int n=(int)call_guest4(proc,h,length_message,wp,0);
+        if(n<0 || n>1024*1024) return (uint32_t)-1;
+        gp_t g=galloc(((uint32_t)n+1)*2);
+        LRESULT r=call_guest4(proc,h,msg,wp,g);
+        if((int)r>=0 && r<=(uint32_t)n) {
+            if(from_unicode) ansi_to_wide(GP(g),(int)r,GP(lp),(int)r);
+            else wide_to_ansi(GP(g),(int)r,GP(lp),(int)r);
+            if(from_unicode) ((uint16_t *)GP(lp))[r]=0;else ((char *)GP(lp))[r]=0;
+        }
+        gfree(g);return r;
     }
     case WM_GETTEXT: {
         if (!lp || !wp)
@@ -576,12 +386,12 @@ static void surface_resize(struct surface *s, int w, int h)
         w = 1;
     if (h < 1)
         h = 1;
-    if (surface_init(&ns, w, h) < 0)
+    if (win_surface_init(&ns, w, h) < 0)
         wdie("out of memory for a window of %d x %d", w, h);
     gfx_fill(&ns, 0, 0, w, h, C_WHITE);
     if (s->px) {
         gfx_blit(&ns, 0, 0, s, 0, 0, s->w < w ? s->w : w, s->h < h ? s->h : h);
-        surface_free(s);
+        win_surface_free(s);
     }
     *s = ns;
 }
@@ -607,11 +417,12 @@ static int take_buffer(struct win *w, const struct wm_buffer *b)
         gui_detach(&w->surf);
     else if (w->surf.px) {
         gfx_blit(&ns, 0, 0, &w->surf, 0, 0, w->surf.w < ns.w ? w->surf.w : ns.w, w->surf.h < ns.h ? w->surf.h : ns.h);
-        surface_free(&w->surf);
+        win_surface_free(&w->surf);
     }
     w->surf = ns;
     w->seq = b->seq;
     w->dirty = mkrect(0, 0, 0, 0);
+    menu_draw(w->hwnd);
     return 0;
 }
 
@@ -619,9 +430,12 @@ static void client_resized(struct win *w, int cw, int ch)
 {
     HWND h = w->hwnd;
     int changed = cw != w->cw || ch != w->ch;
-    w->cw = cw;
-    w->ch = ch;
+    w->cw = cw < 0 ? 0 : cw;
+    w->ch = ch < 0 ? 0 : ch;
+    menu_draw(h);
     frame_from_client(w);
+    controls_layout(h);
+    if(!(w=win_get(h))) return;
     invalidate_all(w);
     if (changed)
         send0(h, WM_SIZE, w->maximized ? SIZE_MAXIMIZED : SIZE_RESTORED, makelong(cw, ch));
@@ -645,7 +459,7 @@ static void desktop_show(struct win *w)
     int n = wide_to_utf8(w->text ? w->text : (const uint16_t *)u"", -1, title, sizeof(title));
     title[n < (int)sizeof(title) ? n : (int)sizeof(title) - 1] = 0;
     struct wm_buffer b;
-    uint32_t id = gui_create(w->cw > 0 ? w->cw : 1, w->ch > 0 ? w->ch : 1, flags, ops, title, &b);
+    uint32_t id = gui_create(w->cw + w->sb_w > 0 ? w->cw + w->sb_w : 1, (w->ch + w->menu_height + w->sb_h) > 0 ? w->ch + w->menu_height + w->sb_h : 1, flags, ops, title, &b);
     if (!id)
         return;
     uint32_t old = w->desk_id;
@@ -657,10 +471,13 @@ static void desktop_show(struct win *w)
     }
     w->desk_id = id;
     w->cursor_sent = 0;
+    if(!w->icon && !w->cls->icon && !(w->exstyle&WS_EX_TOOLWINDOW)) w->icon=icon_default(w->inst);
+    icon_send(id,w->icon ? w->icon : w->cls->icon);
+    menu_draw(w->hwnd);
     if (w->user_pos)
         gui_move(id, w->wr.left, w->wr.top);
-    if (b.w != w->cw || b.h != w->ch)
-        client_resized(w, b.w, b.h);
+    if (b.w != w->cw + w->sb_w || b.h != w->ch + w->menu_height + w->sb_h)
+        client_resized(w, b.w - w->sb_w, b.h - w->menu_height - w->sb_h);
 }
 
 /* Take w off the desktop, keeping its pixels in a surface of our own. */
@@ -694,10 +511,82 @@ int win_surface(HWND hwnd, struct surface **s, int *ox, int *oy, int *cw, int *c
         return -1;
     *s = &t->surf;
     *ox = x;
-    *oy = y;
+    *oy = y + t->menu_height;
     *cw = w->cw;
     *ch = w->ch;
     return 0;
+}
+
+/* Bounds and exclusions are in the top-level surface's coordinates. GDI keeps the
+ * covered pixels while drawing so all its primitives share the same nonrectangular clip. */
+struct rect win_clip_bounds(HWND h)
+{
+    struct win *w = win_get(h), *t = top_of(w);
+    if (!w || !t)
+        return mkrect(0, 0, 0, 0);
+    POINT origin = client_origin(t);
+    origin.y -= t->menu_height;
+    struct rect clip = mkrect(0, 0, t->surf.w, t->surf.h);
+    int nonclient=0;
+    for (int depth = 0; w && depth < 64; depth++) {
+        POINT o = client_origin(w);
+        clip = rect_intersect(clip, mkrect(o.x - origin.x, o.y - origin.y, w->cw + (nonclient ? w->sb_w:0), w->ch + (nonclient ? w->sb_h:0)));
+        nonclient=w->nonclient;
+        if (!(w->style & WS_CHILD)) break;
+        w = win_get(w->parent);
+    }
+    return clip;
+}
+
+struct clip_save {
+    struct clip_save *next;
+    struct rect r;
+    struct surface copy;
+};
+
+static void save_covered(struct clip_save **list, struct surface *s, struct rect clip,
+                         struct win *cover, POINT origin)
+{
+    if (!(cover->style & WS_VISIBLE))
+        return;
+    POINT o = client_origin(cover);
+    struct rect r = rect_intersect(clip, mkrect(o.x - origin.x, o.y - origin.y, cover->cw, cover->ch));
+    if (rect_empty(r)) return;
+    struct clip_save *b = malloc(sizeof(*b));
+    if (!b || win_surface_init(&b->copy,r.w,r.h)<0) wdie("out of memory for child window clipping");
+    b->next = *list;
+    b->r = r;
+    for (int y = 0; y < r.h; y++)
+        memcpy(b->copy.px + y * r.w, s->px + (r.y + y) * s->stride + r.x, (size_t)r.w * 4);
+    *list = b;
+}
+
+struct clip_save *win_clip_save(HWND h, struct surface *s, struct rect clip, struct clip_save *list)
+{
+    struct win *w = win_get(h), *top = top_of(w);
+    if (!w || !top) return NULL;
+    POINT origin = client_origin(top);
+    origin.y -= top->menu_height;
+    if (w->style & WS_CLIPCHILDREN)
+        for (struct win *c = win_get(w->first_child); c; c = win_get(c->next_sibling))
+            save_covered(&list, s, clip, c, origin);
+    for (int depth = 0; w && (w->style & WS_CHILD) && depth < 64; w = win_get(w->parent), depth++)
+        if (w->style & WS_CLIPSIBLINGS)
+            for (struct win *c = win_get(w->prev_sibling); c; c = win_get(c->prev_sibling))
+                save_covered(&list, s, clip, c, origin);
+    return list;
+}
+
+void win_clip_restore(struct clip_save *list, struct surface *s)
+{
+    while (list) {
+        struct clip_save *b = list;
+        for (int y = 0; y < b->r.h; y++)
+            memcpy(s->px + (b->r.y + y) * s->stride + b->r.x, b->copy.px + y * b->r.w, (size_t)b->r.w * 4);
+        list = b->next;
+        win_surface_free(&b->copy);
+        free(b);
+    }
 }
 
 void win_dirty(HWND hwnd, struct rect r)
@@ -751,6 +640,8 @@ static BOOL show_window(struct win *w, int cmd)
         if (!(w = win_get(h)))
             return was;
         w->style &= ~WS_VISIBLE;
+        struct win *p = win_get(w->parent);
+        if ((w->style & WS_CHILD) && p) invalidate_all(p);
         if (active_hwnd == h)
             deactivate(w);
         if ((w = win_get(h)))
@@ -803,6 +694,8 @@ static BOOL destroy_window(HWND h)
     if (w->desk_id)
         desktop_hide(w, 0);
     w->style &= ~WS_VISIBLE;
+    struct win *p = win_get(w->parent);
+    if ((w->style & WS_CHILD) && p) invalidate_all(p);
     send0(h, WM_DESTROY, 0, 0);
     /* children and owned windows go with it */
     for (int i = 0; i < MAX_WINDOWS; i++) {
@@ -817,7 +710,11 @@ static BOOL destroy_window(HWND h)
     if (w->own_dc)
         gdi_release_dc(w->own_dc);
     if (w->surf.px)
-        surface_free(&w->surf);
+        win_surface_free(&w->surf);
+    child_unlink(w);
+    controls_destroy(w);
+    dialog_destroy(w);
+    menu_destroy_window(h);
     free(w->text);
     free(w->extra);
     w->cls->nwindows--;
@@ -1044,6 +941,7 @@ static void key_event(struct win *top, const struct input_event *ev)
     UINT msg = down ? (sys ? WM_SYSKEYDOWN : WM_KEYDOWN) : (sys ? WM_SYSKEYUP : WM_KEYUP);
     LPARAM lp = 1 | (uint32_t)(sc & 0x7F) << 16 | (sc & 0x80 ? 1u << 24 : 0) | (alt ? 1u << 29 : 0) |
                 (down ? (was ? 1u << 30 : 0) : 3u << 30);
+    if (top->style & WS_DISABLED) return;
     struct win *f = win_get(focus_hwnd);
     HWND target = f && top_of(f) == top ? focus_hwnd : top->hwnd;
     post(top->tid, target, msg, (WPARAM)vk, lp);
@@ -1106,10 +1004,41 @@ static void post_mouse(struct win *t, UINT msg, LPARAM lp)
         q->tail->m.pt = cursor_pos;
 }
 
+static struct win *child_at(struct win *w, int x, int y, uint32_t skip, int recursive)
+{
+    for (int depth = 0; w && depth < 64; depth++) {
+        if (x < 0 || y < 0 || x >= w->cw+w->sb_w || y >= w->ch+w->sb_h) return w;
+        struct win *found = NULL;
+        for (struct win *c = win_get(w->first_child); c; c = win_get(c->next_sibling)) {
+            if(!c->nonclient && (x>=w->cw || y>=w->ch)) continue;
+            if ((skip & 1) && !(c->style & WS_VISIBLE)) continue;
+            if ((skip & 2) && (c->style & WS_DISABLED)) continue;
+            if ((skip & 4) && (c->exstyle & 0x20)) continue; /* WS_EX_TRANSPARENT */
+            if (x >= c->wr.left && x < c->wr.right && y >= c->wr.top && y < c->wr.bottom) {
+                found = c;
+                break;
+            }
+        }
+        if (!found) return w;
+        x -= found->wr.left;
+        y -= found->wr.top;
+        w = found;
+        if (!recursive) return w;
+    }
+    return w;
+}
+
 static void mouse_event(struct win *top, const struct wm_mouse_event *me)
 {
+    if ((top->style & WS_DISABLED) && !capture_hwnd) return;
     POINT o = client_origin(top);
-    cursor_pos = (POINT){ o.x + me->x, o.y + me->y };
+    cursor_pos = (POINT){ o.x + me->x, o.y + me->y - top->menu_height };
+    if (!capture_hwnd && me->y < top->menu_height) {
+        UINT message=(me->changed & MOUSE_LEFT) ? ((me->buttons & MOUSE_LEFT) ? WM_LBUTTONDOWN : 0x0202) : WM_MOUSEMOVE;
+        UINT nc=message==WM_LBUTTONDOWN ? 0x00A1:message==0x0202 ? 0x00A2:0x00A0;
+        post(top->tid,top->hwnd,nc,5,makelong(cursor_pos.x,cursor_pos.y));
+        return;
+    }
     mouse_top = top->hwnd;
     set_buttons(post_state, me->buttons);
     apply_cursor();
@@ -1128,7 +1057,7 @@ static void mouse_event(struct win *top, const struct wm_mouse_event *me)
         }
         struct win *t = win_get(capture_hwnd);
         if (!t || !t->cls)
-            t = win_get(mouse_top);
+            t = child_at(win_get(mouse_top), me->x, me->y - top->menu_height, 3, 1);
         if (!t)
             return;
         HWND h = t->hwnd;
@@ -1159,6 +1088,7 @@ static void mouse_event(struct win *top, const struct wm_mouse_event *me)
 
 static void wheel_event(struct win *top, int steps)
 {
+    if (top->style & WS_DISABLED) return;
     struct win *f = win_get(focus_hwnd);
     struct win *t = f && top_of(f) == top ? f : top;
     post(t->tid, t->hwnd, WM_MOUSEWHEEL, makelong((int)mk_flags(), steps * WHEEL_DELTA),
@@ -1211,6 +1141,8 @@ static HWND set_focus(HWND h)
         struct win *w = win_get(h);
         if (!w || !w->cls)
             FAIL(ERROR_INVALID_WINDOW_HANDLE);
+        for (struct win *p = w; p; p = (p->style & WS_CHILD) ? win_get(p->parent) : NULL)
+            if (p->style & WS_DISABLED) return 0;
         struct win *top = top_of(w);
         if (top && top->hwnd != active_hwnd)
             activate(top, 0);
@@ -1323,7 +1255,7 @@ static void desktop_event(const struct wm_msg *m)
     case S_BUFFER: {
         const struct wm_buffer *b = p;
         if (n >= sizeof(*b) && take_buffer(w, b) == 0 && b->resized)
-            client_resized(w, b->w, b->h);
+            client_resized(w, b->w - w->sb_w, b->h - w->menu_height - w->sb_h);
         break;
     }
     case S_CONFIGURE: {
@@ -1484,10 +1416,19 @@ static LRESULT def_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp, int unicode)
     switch (msg) {
     case WM_NCCREATE: {
         const struct createstruct *cs = gp(lp);
-        if (cs && cs->name && (unicode || !IS_INTRES(cs->name)))
+        if (cs && cs->name && !IS_INTRES(cs->name))
             set_text(w, wdup_guest(cs->name, unicode));
         return TRUE;
     }
+    case 0x00A0: case 0x00A1: case 0x00A2:
+        if(wp==5 && w->menu_height) {
+            POINT origin=client_origin(w);
+            UINT mouse=msg==0x00A1 ? WM_LBUTTONDOWN:msg==0x00A2 ? 0x0202:WM_MOUSEMOVE;
+            return menu_mouse(h,mouse,(int16_t)lp-origin.x,(int16_t)(lp>>16)-origin.y+w->menu_height);
+        }
+        return 0;
+    case 0x0080: { HICON old=w->icon ? w->icon : w->cls->icon; w->icon=lp; if(w->desk_id) icon_send(w->desk_id,lp); return old; }
+    case 0x007F: return w->icon ? w->icon : w->cls->icon;
     case WM_SETTEXT:
         set_text(w, wdup_guest(lp, unicode));
         return TRUE;
@@ -1604,6 +1545,21 @@ static int post(uint32_t tid, HWND h, UINT msg, WPARAM wp, LPARAM lp)
     return 1;
 }
 
+/* Paint the parent, then children from back to front. Handle-table order is unrelated
+ * to z-order after SetWindowPos, or after a destroyed handle's slot is reused. */
+static struct win *paint_window(struct win *w, uint32_t tid, HWND filter, int depth)
+{
+    if (!w || !w->cls || depth >= 64 || !(w->style & WS_VISIBLE) || w->minimized)
+        return NULL;
+    if (w->tid == tid && !rect_is_empty(&w->update) && for_filter(w->hwnd, filter))
+        return w;
+    for (struct win *c = win_get(w->last_child); c; c = win_get(c->prev_sibling)) {
+        struct win *found = paint_window(c, tid, filter, depth + 1);
+        if (found) return found;
+    }
+    return NULL;
+}
+
 /* The next message for this thread: 1 and *out, or 0 if there is none (and not block). */
 static int next_message(struct msg *out, HWND filter, UINT lo, UINT hi, int remove, int block)
 {
@@ -1636,8 +1592,8 @@ static int next_message(struct msg *out, HWND filter, UINT lo, UINT hi, int remo
         if (in_range(WM_PAINT, lo, hi)) {
             for (int i = 0; i < MAX_WINDOWS; i++) {
                 struct win *w = table[i];
-                if (w && w->cls && w->tid == tid && !rect_is_empty(&w->update) && !w->minimized &&
-                    win_visible(w) && for_filter(w->hwnd, filter)) {
+                if (!w || (w->style & WS_CHILD)) continue;
+                if ((w = paint_window(w, tid, filter, 0))) {
                     *out = (struct msg){ w->hwnd, WM_PAINT, 0, 0, os_ticks_ms(), { 0, 0 } };
                     return 1;
                 }
@@ -1715,6 +1671,8 @@ static LRESULT dispatch_message(const struct msg *m, int unicode)
     struct win *w = win_get(m->hwnd);
     if (!w)
         FAIL(ERROR_INVALID_WINDOW_HANDLE);
+    struct win *top=top_of(w);
+    if(top && menu_key(top->hwnd,m->message,m->wparam)) return 0;
     LRESULT r = call_proc(w->wndproc, w->unicode, m->hwnd, m->message, m->wparam, m->lparam, unicode);
     if (m->message == WM_PAINT && (w = win_get(m->hwnd)) && !rect_is_empty(&w->update)) {
         /* As Windows does, so that WM_PAINT does not come again and again. */
@@ -1935,11 +1893,19 @@ static HWND create_window(uint32_t *a, int unicode)
     w->unicode = c->unicode;
     w->inst = A(10);
     w->message_only = message_only;
+    w->sb_w=(style&0x00200000) ? 16:0;
+    w->sb_h=(style&0x00100000) ? 16:0;
     if (style & WS_CHILD) {
         w->parent = parent;
         w->id = A(9);
     } else {
         w->owner = parent;
+    }
+    child_insert(w, 0);
+    if (!(style & WS_CHILD)) {
+        w->menu = A(9);
+        if (!w->menu && c->menu_name) w->menu=ui_call(&user32_dll,c->unicode ? "LoadMenuW":"LoadMenuA",(uint32_t[]){c->inst,c->menu_name});
+        w->menu_height=menu_height(w->menu);
     }
     w->nextra = c->wnd_extra;
     w->extra = calloc(1, (size_t)w->nextra + 1);
@@ -1955,15 +1921,15 @@ static HWND create_window(uint32_t *a, int unicode)
             width = work_w * 3 / 4;
             height = work_h * 3 / 4;
         }
-        w->cw = width - (framed(w) ? 2 * BORDER : 0);
-        w->ch = height - (framed(w) ? FRAME_TOP + BORDER : 0);
+        w->cw = width - (framed(w) ? 2 * BORDER : 0) - w->sb_w;
+        w->ch = height - (framed(w) ? FRAME_TOP + BORDER : 0) - w->menu_height - w->sb_h;
     } else {
         if ((uint32_t)x == CW_USEDEFAULT)
             x = y = 0;
         if ((uint32_t)width == CW_USEDEFAULT)
             width = height = 0;
-        w->cw = width;
-        w->ch = height;
+        w->cw = width-w->sb_w;
+        w->ch = height-w->sb_h;
     }
     if (w->cw < 0)
         w->cw = 0;
@@ -1973,13 +1939,14 @@ static HWND create_window(uint32_t *a, int unicode)
     w->wr.top = y;
     frame_from_client(w);
     if (is_top(w))
-        surface_resize(&w->surf, w->cw, w->ch);
+        surface_resize(&w->surf, w->cw + w->sb_w, w->ch + w->menu_height + w->sb_h);
+    menu_draw(h);
 
     /* CREATESTRUCT, with the strings in the window procedure's character set */
     gp_t csp = galloc(sizeof(struct createstruct));
     struct createstruct *cs = GP(csp);
-    uint16_t *name = A(2) && (unicode || !IS_INTRES(A(2))) ? wdup_guest(A(2), unicode) : NULL;
-    gp_t gname = name ? guest_copy(name, w->unicode) : 0;
+    uint16_t *name = A(2) && !IS_INTRES(A(2)) ? wdup_guest(A(2), unicode) : NULL;
+    gp_t gname = name ? guest_copy(name, w->unicode) : (IS_INTRES(A(2)) ? A(2):0);
     gp_t gclass = IS_INTRES(A(1)) ? A(1) : guest_copy(c->name, w->unicode);
     free(name);
     *cs = (struct createstruct){ A(11), A(10), A(9), parent, height, width, y, x, style, gname, gclass, exstyle };
@@ -1989,7 +1956,9 @@ static HWND create_window(uint32_t *a, int unicode)
         if ((int32_t)send0(h, WM_CREATE, 0, csp) == -1) {
             destroy_window(h);
         } else if ((w = win_get(h))) {
-            POINT o = client_origin(w);
+            controls_layout(h);
+            if(!(w=win_get(h))) goto created_done;
+            POINT o = (w->style & WS_CHILD) ? (POINT){ w->wr.left, w->wr.top } : client_origin(w);
             send0(h, WM_SIZE, SIZE_RESTORED, makelong(w->cw, w->ch));
             send0(h, WM_MOVE, 0, makelong(o.x, o.y));
             if ((style & WS_VISIBLE) && (w = win_get(h)))
@@ -1999,7 +1968,8 @@ static HWND create_window(uint32_t *a, int unicode)
     } else if (win_get(h)) {
         destroy_window(h);
     }
-    if (gname)
+created_done:
+    if (gname>=0x10000)
         gfree(gname);
     if (!IS_INTRES(gclass))
         gfree(gclass);
@@ -2038,7 +2008,7 @@ static BOOL set_window_pos(struct win *w, int x, int y, int cx, int cy, uint32_t
         w->user_pos = 1;
         if (w->desk_id)
             gui_move(w->desk_id, x, y);
-        POINT o = client_origin(w);
+        POINT o = (w->style & WS_CHILD) ? (POINT){ x, y } : client_origin(w);
         send0(h, WM_MOVE, 0, makelong(o.x, o.y));
         if (!(w = win_get(h)))
             return TRUE;
@@ -2049,24 +2019,28 @@ static BOOL set_window_pos(struct win *w, int x, int y, int cx, int cy, uint32_t
             ncw -= 2 * BORDER;
             nch -= FRAME_TOP + BORDER;
         }
+        ncw -= w->sb_w;
+        nch -= w->menu_height+w->sb_h;
         if (ncw < 0)
             ncw = 0;
         if (nch < 0)
             nch = 0;
         if (ncw != w->cw || nch != w->ch) {
             struct wm_buffer b;
-            if (w->desk_id && gui_resize(w->desk_id, ncw > 0 ? ncw : 1, nch > 0 ? nch : 1, &b) == 0 &&
+            if (w->desk_id && gui_resize(w->desk_id, ncw + w->sb_w > 0 ? ncw + w->sb_w : 1, nch + w->menu_height + w->sb_h > 0 ? nch + w->menu_height + w->sb_h : 1, &b) == 0 &&
                 (take_buffer(w, &b) == 0 || b.seq == w->seq)) {
-                ncw = b.w;
-                nch = b.h;
+                ncw = b.w-w->sb_w;
+                nch = b.h-w->menu_height-w->sb_h;
             } else if (is_top(w) && !w->desk_id) {
-                surface_resize(&w->surf, ncw, nch);
+                surface_resize(&w->surf, ncw+w->sb_w, nch+w->menu_height+w->sb_h);
             }
             client_resized(w, ncw, nch);
             if (!(w = win_get(h)))
                 return TRUE;
         }
     }
+    struct win *p = win_get(w->parent);
+    if ((w->style & WS_CHILD) && p) invalidate_all(p);
     if (flags & SWP_SHOWWINDOW)
         show_window(w, 5);
     else if (flags & SWP_HIDEWINDOW)
@@ -2079,6 +2053,17 @@ DEF(SetWindowPos)
     struct win *w = win_get(A(0));
     if (!w || !w->cls)
         FAIL(ERROR_INVALID_WINDOW_HANDLE);
+    if ((w->style & WS_CHILD) && !(A(6) & SWP_NOZORDER)) {
+        HWND after = A(1);
+        if (after == w->hwnd) return set_window_pos(w, (int32_t)A(2), (int32_t)A(3), (int32_t)A(4), (int32_t)A(5), A(6));
+        if (after != 0 && after != 1 && after != 0xFFFFFFFFu && after != 0xFFFFFFFEu) {
+            struct win *sibling = win_get(after);
+            if (!sibling || !(sibling->style & WS_CHILD) || sibling->parent != w->parent)
+                FAIL(ERROR_INVALID_WINDOW_HANDLE);
+        } else if (after != 1) after = 0;
+        child_unlink(w);
+        child_insert(w, after);
+    }
     return set_window_pos(w, (int32_t)A(2), (int32_t)A(3), (int32_t)A(4), (int32_t)A(5), A(6));
 }
 
@@ -2101,6 +2086,100 @@ DEF(GetParent)
     if (!w)
         FAIL(ERROR_INVALID_WINDOW_HANDLE);
     return (w->style & WS_CHILD) ? w->parent : w->owner;
+}
+
+DEF(GetDlgItem)
+{
+    struct win *w = win_get(A(0));
+    if (!w) FAIL(ERROR_INVALID_WINDOW_HANDLE);
+    for (struct win *c = win_get(w->first_child); c; c = win_get(c->next_sibling))
+        if (c->id == A(1)) return c->hwnd;
+    return 0;
+}
+DEF(GetDlgCtrlID) { struct win *w = win_get(A(0)); return w ? w->id : 0; }
+DEF(IsChild)
+{
+    struct win *w = win_get(A(1));
+    for (int depth = 0; w && (w->style & WS_CHILD) && depth < 64; depth++) {
+        if (w->parent == A(0)) return TRUE;
+        w = win_get(w->parent);
+    }
+    return FALSE;
+}
+DEF(GetWindow)
+{
+    struct win *w = win_get(A(0));
+    if (!w) FAIL(ERROR_INVALID_WINDOW_HANDLE);
+    struct win *p = win_get(w->parent);
+    switch (A(1)) {
+    case 0: return p ? p->first_child : 0;
+    case 1: return p ? p->last_child : 0;
+    case 2: return w->next_sibling;
+    case 3: return w->prev_sibling;
+    case 4: return w->owner;
+    case 5: return w->first_child;
+    }
+    return 0;
+}
+
+static void child_snapshot(struct win *p, HWND *out, int *n, int depth)
+{
+    if (!p || depth >= 64) return;
+    for (struct win *c = win_get(p->first_child); c; c = win_get(c->next_sibling)) {
+        out[(*n)++] = c->hwnd;
+        child_snapshot(c, out, n, depth + 1);
+    }
+}
+DEF(EnumChildWindows)
+{
+    struct win *p = win_get(A(0));
+    if (!p) FAIL(ERROR_INVALID_WINDOW_HANDLE);
+    HWND *snapshot = malloc(MAX_WINDOWS * sizeof(HWND));
+    if (!snapshot) FAIL(ERROR_NOT_ENOUGH_MEMORY);
+    int n = 0;
+    child_snapshot(p, snapshot, &n, 0);
+    /* Callbacks may destroy, reorder or create windows; handles include generations. */
+    for (int i = 0; i < n; i++) {
+        uint32_t args[] = { A(0), snapshot[i] };
+        if (api_IsChild(args) && !call_guest2(A(1), snapshot[i], A(2))) break;
+    }
+    free(snapshot);
+    return TRUE;
+}
+DEF(ChildWindowFromPointEx)
+{
+    struct win *w = win_get(A(0));
+    if (!w) FAIL(ERROR_INVALID_WINDOW_HANDLE);
+    int x = (int32_t)A(1), y = (int32_t)A(2);
+    if (x < 0 || y < 0 || x >= w->cw || y >= w->ch) return 0;
+    return child_at(w, x, y, A(3), 0)->hwnd;
+}
+DEF(ChildWindowFromPoint)
+{
+    uint32_t args[] = { A(0), A(1), A(2), 0 };
+    return api_ChildWindowFromPointEx(args);
+}
+DEF(IsWindowEnabled) { struct win *w = win_get(A(0)); return w && !(w->style & WS_DISABLED); }
+DEF(EnableWindow)
+{
+    struct win *w = win_get(A(0));
+    if (!w) FAIL(ERROR_INVALID_WINDOW_HANDLE);
+    int was_disabled = (w->style & WS_DISABLED) != 0;
+    if (was_disabled == !A(1)) return was_disabled;
+    if (A(1)) w->style &= ~WS_DISABLED;
+    else w->style |= WS_DISABLED;
+    if (!A(1)) {
+        uint32_t args[] = { A(0), focus_hwnd };
+        if (focus_hwnd == A(0) || api_IsChild(args)) set_focus(0);
+        args[1] = capture_hwnd;
+        if (capture_hwnd == A(0) || api_IsChild(args)) {
+            HWND old = capture_hwnd;
+            capture_hwnd = 0;
+            send0(old, WM_CAPTURECHANGED, 0, 0);
+        }
+    }
+    send0(A(0), 0x000A, A(1) != 0, 0); /* WM_ENABLE */
+    return was_disabled;
 }
 
 /* ---- messages ---- */
@@ -2197,7 +2276,11 @@ DEF(PostQuitMessage)
 
 DEF(DefWindowProcA) { return def_proc(A(0), A(1), A(2), A(3), 0); }
 DEF(DefWindowProcW) { return def_proc(A(0), A(1), A(2), A(3), 1); }
-DEF(CallWindowProcA) { return call_proc(A(0), 0, A(1), A(2), A(3), A(4), 0); }
+DEF(CallWindowProcA) {
+    int wide=0;
+    for(struct wclass *c=classes;c;c=c->next) if(c->wndproc==A(0)) {wide=c->unicode;break;}
+    return call_proc(A(0),wide,A(1),A(2),A(3),A(4),0);
+}
 DEF(CallWindowProcW) { return call_proc(A(0), 1, A(1), A(2), A(3), A(4), 1); }
 
 /* ---- painting ---- */
@@ -2343,12 +2426,35 @@ DEF(GetWindowTextW)
 DEF(GetWindowTextLengthA) { return send_message(A(0), WM_GETTEXTLENGTH, 0, 0, 0); }
 DEF(GetWindowTextLengthW) { return send_message(A(0), WM_GETTEXTLENGTH, 0, 0, 1); }
 
+static HWND reparent_child(struct win *w, HWND parent)
+{
+    struct win *p = win_get(parent);
+    if (!p || !p->cls) FAIL(ERROR_INVALID_WINDOW_HANDLE);
+    int depth = 0;
+    for (struct win *a = p; a; a = (a->style & WS_CHILD) ? win_get(a->parent) : NULL) {
+        if (a == w || ++depth >= 64) FAIL(ERROR_INVALID_PARAMETER);
+    }
+    HWND old = w->parent;
+    if (old == parent) return old;
+    struct win *before = win_get(old);
+    child_unlink(w);
+    w->parent = parent;
+    child_insert(w, 0);
+    if (before) invalidate_all(before);
+    invalidate_all(p);
+    return old;
+}
+
 static uint32_t window_long(uint32_t *a, int set, int unicode)
 {
     struct win *w = win_get(A(0));
     if (!w || !w->cls)
         FAIL(ERROR_INVALID_WINDOW_HANDLE);
     int32_t index = (int32_t)A(1);
+    uint32_t dialog_value;
+    if(dialog_window_long(w,index,set,set ? A(2):0,&dialog_value)) return dialog_value;
+    if (set && index == GWL_HWNDPARENT && (w->style & WS_CHILD))
+        return reparent_child(w, A(2));
     uint32_t *field, v;
     switch (index) {
     case GWL_WNDPROC: field = &w->wndproc; break;
@@ -2369,9 +2475,14 @@ static uint32_t window_long(uint32_t *a, int set, int unicode)
     }
     v = *field;
     if (set) {
+        int relink = index == GWL_STYLE && ((w->style ^ A(2)) & WS_CHILD);
+        if (relink && (A(2) & WS_CHILD) && !win_get(w->parent))
+            FAIL(ERROR_INVALID_PARAMETER);
+        if (relink && (w->style & WS_CHILD)) child_unlink(w);
         *field = A(2);
+        if (relink && (w->style & WS_CHILD)) child_insert(w, 0);
         if (index == GWL_WNDPROC)
-            w->unicode = unicode;
+            w->unicode = A(2)==w->cls->wndproc ? w->cls->unicode : unicode;
     }
     SETERR(0);
     return v;
@@ -2393,15 +2504,10 @@ DEF(LoadCursorA)
     return CURSOR_HANDLE(IDC_ARROW);
 }
 DEF(LoadCursorW) { return api_LoadCursorA(a); }
-DEF(LoadIconA)
-{
-    if (!A(0) && IS_INTRES(A(1)))
-        return A(1) >= 32512 && A(1) <= 32518 ? ICON_HANDLE(A(1)) : 0;
-    return ICON_HANDLE(IDI_APPLICATION);
-}
-DEF(LoadIconW) { return api_LoadIconA(a); }
+DEF(LoadIconA) { return icon_load(A(0),A(1),0); }
+DEF(LoadIconW) { return icon_load(A(0),A(1),1); }
 DEF(DestroyCursor) { (void)a; return TRUE; }
-DEF(DestroyIcon) { (void)a; return TRUE; }
+DEF(DestroyIcon) { return ui_icon_destroy(A(0)); }
 
 /* The desktop draws the frames: BORDER beside and below the client area, FRAME_TOP above it
  * (the caption and the border over it). */
@@ -2451,8 +2557,8 @@ static BOOL adjust_rect(RECT *r, uint32_t style)
     return TRUE;
 }
 
-DEF(AdjustWindowRect) { return adjust_rect(P(0), A(1)); }
-DEF(AdjustWindowRectEx) { return adjust_rect(P(0), A(1)); }
+DEF(AdjustWindowRect) { if(A(2) && !(A(1)&WS_CHILD)) ((RECT *)P(0))->top-=20; return adjust_rect(P(0), A(1)); }
+DEF(AdjustWindowRectEx) { if(A(2) && !(A(1)&WS_CHILD)) ((RECT *)P(0))->top-=20; return adjust_rect(P(0), A(1)); }
 
 DEF(SystemParametersInfoA)
 {
@@ -2701,13 +2807,70 @@ static uint32_t msg_wait(uint32_t n, gp_t handles, int all, uint32_t ms)
 DEF(MsgWaitForMultipleObjects) { return msg_wait(A(0), A(1), A(2) != 0, A(3)); }
 DEF(MsgWaitForMultipleObjectsEx) { return msg_wait(A(0), A(1), (A(4) & 1) != 0, A(2)); }
 
+void ui_scroll_changed(HWND h,int vertical,int show)
+{
+    struct win *w=win_get(h);if(!w) return;
+    int old=vertical ? w->sb_w:w->sb_h,now=show ? 16:0;
+    if(vertical) {w->sb_w=now;w->style=(w->style&~0x00200000u)|(show ? 0x00200000:0);}
+    else {w->sb_h=now;w->style=(w->style&~0x00100000u)|(show ? 0x00100000:0);}
+    client_resized(w,w->cw+(vertical ? old-now:0),w->ch+(vertical ? 0:old-now));
+}
+
+void ui_menu_changed(HWND h,int height)
+{
+    struct win *w=win_get(h);if(!w || w->menu_height==height) {menu_draw(h);return;}
+    int delta=height-w->menu_height;w->menu_height=height;
+    client_resized(w,w->cw,w->ch-delta);menu_draw(h);
+}
+
+/* Bridges keep window lifetime and message dispatch in this file. */
+struct win *ui_win(HWND h) { return win_get(h); }
+LRESULT ui_send(HWND h, UINT m, WPARAM wp, LPARAM lp, int wide) { return send_message(h,m,wp,lp,wide); }
+LRESULT ui_proc(gp_t p,int pw,HWND h,UINT m,WPARAM wp,LPARAM lp,int wide) { return call_proc(p,pw,h,m,wp,lp,wide); }
+LRESULT ui_default(HWND h, UINT m, WPARAM wp, LPARAM lp, int wide) { return def_proc(h,m,wp,lp,wide); }
+HWND ui_create(uint32_t *args, int wide) { return create_window(args,wide); }
+uint16_t *ui_wdup(const uint16_t *s, int n) { return wdup(s,n); }
+uint16_t *ui_string(gp_t s, int wide) { return wdup_guest(s,wide); }
+gp_t ui_guest(const uint16_t *s, int wide) { return guest_copy(s,wide); }
+void ui_text(HWND h, const uint16_t *s) { struct win *w=win_get(h); if(w) set_text(w,wdup(s,-1)); }
+void ui_invalidate(HWND h) { struct win *w=win_get(h); if(w) invalidate(w,NULL,1); }
+HDC ui_begin(HWND h, struct paintstruct *ps) { struct win *w=win_get(h); return w ? begin_paint(w,ps) : 0; }
+void ui_end(HWND h, struct paintstruct *ps) { end_paint(win_get(h),ps); }
+int ui_next(struct msg *m,int block) { return next_message(m,0,0,0,1,block); }
+LRESULT ui_dispatch(struct msg *m) { return dispatch_message(m,1); }
+void ui_class(const char *name,const struct api_entry *proc,HBRUSH brush)
+{
+    gp_t gn=galloc(strlen(name)+1);
+    memcpy(GP(gn),name,strlen(name)+1);
+    struct wndclassex wc={0};
+    wc.class_name=gn; wc.wndproc=api_thunk(&user32_dll,proc); wc.brush=brush;
+    wc.cursor=CURSOR_HANDLE(IDC_ARROW); wc.style=CS_DBLCLKS;
+    if(!strcmp(name,"#32770")) wc.wnd_extra=30;
+    register_class(&wc,0);
+    struct wclass *c=class_find(gn,0);
+    if(c) c->unicode=1;
+    gfree(gn);
+}
+
 static void user32_init(void)
 {
     if (!gui_connected)
         theme_apply(THEME_KINETIK, ACCENT_BLUE);    /* the frame and fonts the desktop would have */
+    controls_init();
+    dialog_init();
+    menu_init();
 }
 
 static const struct api_entry user32_entries[] = {
+    API(GetDlgItem, 2),
+    API(GetDlgCtrlID, 1),
+    API(IsChild, 2),
+    API(GetWindow, 2),
+    API(EnumChildWindows, 3),
+    API(ChildWindowFromPoint, 3),
+    API(ChildWindowFromPointEx, 4),
+    API(EnableWindow, 2),
+    API(IsWindowEnabled, 1),
     API(AdjustWindowRect, 3),
     API(AdjustWindowRectEx, 4),
     API(BeginPaint, 2),
@@ -2837,4 +3000,9 @@ struct api_dll user32_dll = { "USER32.DLL", user32_entries, sizeof(user32_entrie
 void user32_link(void)
 {
     user32_dll.counts[0] = gdi_user32_count;
+    user32_dll.tables[1]=controls_entries; user32_dll.counts[1]=controls_count;
+    user32_dll.tables[2]=dialog_entries; user32_dll.counts[2]=dialog_count;
+    user32_dll.tables[3]=menu_entries; user32_dll.counts[3]=menu_count;
+    user32_dll.tables[4]=clipboard_entries; user32_dll.counts[4]=clipboard_count;
+    user32_dll.tables[5]=icon_entries; user32_dll.counts[5]=icon_count;
 }

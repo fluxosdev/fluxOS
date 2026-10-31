@@ -28,6 +28,9 @@
 static struct wm_conn conn = { .fd = -1 };
 static int failures;
 static char seen_title[WM_TITLE_MAX];   /* the last C_TITLE and C_CURSOR, whenever they came */
+static char clipboard[4096]="from desktop";
+static int seen_icon;
+static void send_msg(int type, uint32_t win, uint32_t serial, const void *p, size_t n);
 static int seen_cursor = -1;
 
 static void finish(void)
@@ -82,6 +85,19 @@ static struct wm_msg *next_msg(void)
             } else if (copy->type == C_CURSOR && wm_payload_len(copy) >= sizeof(struct wm_int)) {
                 seen_cursor = ((struct wm_int *)wm_payload(copy))->value;
             }
+            if(copy->type==C_CLIP_SET) {
+                size_t n=wm_payload_len(copy);if(n>=sizeof(clipboard)) n=sizeof(clipboard)-1;
+                memcpy(clipboard,wm_payload(copy),n);clipboard[n]=0;free(copy);continue;
+            }
+            if(copy->type==C_CLIP_GET) {
+                send_msg(S_CLIP,0,copy->serial,clipboard,strlen(clipboard));free(copy);continue;
+            }
+            if(copy->type==C_ICON_IMAGE) {
+                const struct wm_image *im=wm_payload(copy);
+                if(wm_payload_len(copy)>=sizeof(*im)+32*32*4 && im->w==32 && im->h==32) {
+                    const uint32_t *pixels=(const uint32_t *)(im+1);seen_icon=pixels[0]==0xFFFF0000 && pixels[1023]==0xFFFF0000;
+                }
+            }
             return copy;
         }
         struct pollfd p = { conn.fd, POLLIN, 0 };
@@ -94,7 +110,7 @@ static struct wm_msg *next_msg(void)
 /* What a window may send at any time. */
 static int incidental(int type)
 {
-    return type == C_DAMAGE || type == C_MOVE || type == C_TITLE || type == C_CURSOR || type == C_FOCUS;
+    return type == C_ICON_IMAGE || type == C_DAMAGE || type == C_MOVE || type == C_TITLE || type == C_CURSOR || type == C_FOCUS;
 }
 
 /* The next message of this type (skipping the incidental ones). */
@@ -315,6 +331,129 @@ static void run_input(int lfd, const struct wm_state *st)
     wm_conn_close(&conn);
 }
 
+/* Child windows stay inside a single desktop surface; input uses their local coordinates. */
+static void child_title(const char *title)
+{
+    while (strcmp(seen_title, title) && strcmp(seen_title, "children-failed")) {
+        struct wm_msg *m = next_msg();
+        REQUIRE(m);
+        CHECK(incidental(m->type));
+        free(m);
+    }
+    REQUIRE(!strcmp(seen_title, title));
+}
+
+static void run_children(int lfd, const struct wm_state *st)
+{
+    int pid = spawn("/test/children.exe", -1);
+    struct pollfd p = { lfd, POLLIN, 0 };
+    REQUIRE(poll(&p, 1, 15000) == 1);
+    int fd = accept(lfd, NULL, NULL);
+    REQUIRE(fd >= 0);
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+    wm_conn_init(&conn, fd);
+    seen_title[0] = 0;
+    struct wm_msg *m = expect(C_HELLO);
+    send_msg(S_STATE, 0, m->serial, st, sizeof(*st));
+    free(m);
+    m = expect(C_CREATE);
+    const struct wm_create *cr = wm_payload(m);
+    CHECK(cr->w == 240 && cr->h == 160);
+    uint32_t win = m->win;
+    struct surface s;
+    struct wm_buffer b = { new_buffer(&s, cr->w, cr->h), cr->w, cr->h, 1, 0 };
+    send_msg(S_BUFFER, win, m->serial, &b, sizeof(b));
+    free(m);
+    child_title("children-ready");
+    /* C_TITLE can precede buffered damage; request a flush through the first mouse event. */
+    mouse(win, 60, 30, MOUSE_LEFT, MOUSE_LEFT);
+    child_title("step-1");
+    pixel(&s, 60, 30, 0x0000FF);
+    pixel(&s, 15, 55, 0x00FF00);
+    pixel(&s, 5, 55, 0x000000);
+    pixel(&s, 15, 95, 0x000000);
+    mouse(win, 60, 30, 0, MOUSE_LEFT);
+    mouse(win, 200, 140, MOUSE_LEFT, MOUSE_LEFT); /* capture on a descendant outside its bounds */
+    child_title("step-2");
+    mouse(win, 200, 140, 0, MOUSE_LEFT);
+    mouse(win, 60, 30, MOUSE_LEFT, MOUSE_LEFT);  /* disabled front child is skipped */
+    child_title("step-3");
+    mouse(win, 60, 30, 0, MOUSE_LEFT);
+    mouse(win, 60, 30, MOUSE_LEFT, MOUSE_LEFT);  /* reordered child remains behind */
+    child_title("children-ok");
+    send_msg(S_CLOSE, win, 0, NULL, 0);
+    m = expect(C_DESTROY);
+    free(m);
+    while ((m = next_msg())) { CHECK(incidental(m->type)); free(m); }
+    int code = wait_exit(pid);
+    printf("guest: children.exe exited with %d\n", code);
+    CHECK(code == 11);
+    shm_surface_detach(&s);
+    shmctl(b.shmid, IPC_RMID, NULL);
+    wm_conn_close(&conn);
+}
+
+static void phase2_title(const char *title)
+{
+    while(strcmp(seen_title,title) && !strstr(seen_title,"phase2-failed")) {
+        struct wm_msg *m=next_msg();REQUIRE(m);CHECK(incidental(m->type));free(m);
+    }
+    if(strcmp(seen_title,title)) printf("phase2: expected %s, got %s\n",title,seen_title);
+    REQUIRE(!strcmp(seen_title,title));
+}
+static void phase2_popup(const struct wm_state *st,const char *title,int tab)
+{
+    struct wm_msg *m=expect(C_CREATE);const struct wm_create *cr=wm_payload(m);
+    printf("guest: phase2 popup %s %d x %d\n",cr->title,cr->w,cr->h);
+    CHECK(!strcmp(cr->title,title));uint32_t win=m->win;struct surface s;
+    struct wm_buffer b={new_buffer(&s,cr->w,cr->h),cr->w,cr->h,1,0};
+    send_msg(S_BUFFER,win,m->serial,&b,sizeof(b));free(m);
+    struct wm_int focus={1};send_msg(S_FOCUS,win,0,&focus,sizeof(focus));
+    (void)st;
+    if(tab) {key(win,0x0F,1,0,NULL);key(win,0x0F,0,0,NULL);}
+    else if(!title[0]) {key(win,KEY_DOWN,1,0,NULL);key(win,KEY_DOWN,0,0,NULL);}
+    key(win,0x1C,1,0,NULL);key(win,0x1C,0,0,NULL);
+    m=expect(C_DESTROY);CHECK(m->win==win);free(m);
+    shm_surface_detach(&s);shmctl(b.shmid,IPC_RMID,NULL);
+}
+static void run_phase2(int lfd,const struct wm_state *st)
+{
+    int pid=spawn("/test/phase2.exe",-1);struct pollfd p={lfd,POLLIN,0};
+    REQUIRE(poll(&p,1,15000)==1);int fd=accept(lfd,NULL,NULL);REQUIRE(fd>=0);
+    fcntl(fd,F_SETFL,O_NONBLOCK);wm_conn_init(&conn,fd);seen_title[0]=0;seen_icon=0;
+    struct wm_msg *m=expect(C_HELLO);send_msg(S_STATE,0,m->serial,st,sizeof(*st));free(m);
+    m=expect(C_CREATE);const struct wm_create *cr=wm_payload(m);
+    CHECK(!strcmp(cr->title,"Phase2") && cr->w==320 && cr->h==240);uint32_t win=m->win;
+    struct surface s;struct wm_buffer b={new_buffer(&s,cr->w,cr->h),cr->w,cr->h,1,0};
+    send_msg(S_BUFFER,win,m->serial,&b,sizeof(b));free(m);
+    struct wm_int focus={1};send_msg(S_FOCUS,win,0,&focus,sizeof(focus));
+    phase2_title("phase2-ready");CHECK(seen_icon);
+    theme_apply(st->style,st->accent);
+    pixel(&s,0,0,C_FACE);pixel(&s,0,19,C_SHADOW); /* menu lives above the Win32 client */
+    pixel(&s,14,34,0xFFFFFF); /* the blank edit */
+    pixel(&s,180,30,C_SHADOW); /* button border */
+    pixel(&s,186,76,0x000000); /* checked checkbox */
+    key(win,0x1D,1,KMOD_CTRL,NULL);key(win,0x31,1,KMOD_CTRL,"n");key(win,0x31,0,KMOD_CTRL,NULL);key(win,0x1D,0,0,NULL);
+    phase2_title("phase2-accel");
+    mouse(win,280,190,MOUSE_LEFT,MOUSE_LEFT);mouse(win,280,190,0,MOUSE_LEFT);
+    phase2_popup(st,"",0);phase2_title("phase2-combo");
+    mouse(win,20,35,MOUSE_LEFT,MOUSE_LEFT);mouse(win,20,35,0,MOUSE_LEFT);
+    phase2_title("phase2-edit");
+    key(win,0x2C,1,0,"Z");key(win,0x2C,0,0,NULL);
+    mouse(win,200,40,MOUSE_LEFT,MOUSE_LEFT);mouse(win,200,40,0,MOUSE_LEFT);
+    phase2_popup(st,"Resource EX",1);
+    phase2_popup(st,"Question",0);
+    phase2_popup(st,"",0);
+    phase2_title("phase2-workflow");
+    mouse(win,15,10,MOUSE_LEFT,MOUSE_LEFT);mouse(win,15,10,0,MOUSE_LEFT);
+    phase2_popup(st,"",0);
+    phase2_title("phase2-ok");
+    send_msg(S_CLOSE,win,0,NULL,0);m=expect(C_DESTROY);free(m);
+    while((m=next_msg())) {CHECK(incidental(m->type));free(m);}
+    int code=wait_exit(pid);printf("guest: phase2.exe exited with %d\n",code);CHECK(code==13);
+    shm_surface_detach(&s);shmctl(b.shmid,IPC_RMID,NULL);wm_conn_close(&conn);
+}
+
 int main(void)
 {
     printf("guest: %d CPUs online\n", (int)sysconf(_SC_NPROCESSORS_ONLN));   /* the script checks it */
@@ -419,5 +558,7 @@ int main(void)
     wm_conn_close(&conn);
 
     run_input(lfd, &st);
+    run_children(lfd, &st);
+    run_phase2(lfd, &st);
     finish();
 }

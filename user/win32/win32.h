@@ -164,7 +164,7 @@ struct api_entry {
     int ordinal;                        /* 0: none assigned */
 };
 
-#define API_TABLES 3
+#define API_TABLES 6
 struct api_dll {
     const char *name;                   /* "KERNEL32.DLL", in upper case */
     const struct api_entry *entries;    /* the first table (more in tables[]) */

@@ -883,11 +883,24 @@ WIN32_TEST_DEPS := tests/win32/winapi.h tests/win32/imports.h tests/win32/import
 WIN32_SUBSYSTEM = windows
 $(BUILD)/tests/win32/console.exe: WIN32_SUBSYSTEM = console
 
-$(BUILD)/tests/win32/%.exe: tests/win32/%.c $(WIN32_TEST_DEPS)
+$(BUILD)/tests/win32/resources.S: tests/win32/resources.py
+	@mkdir -p $(dir $@)
+	python3 $< $@
+
+$(BUILD)/tests/win32/resources.o: $(BUILD)/tests/win32/resources.S
+	$(CC) $(WIN32_TEST_CFLAGS) -c $< -o $@
+
+$(BUILD)/tests/win32/phase2.exe: WIN32_TEST_EXTRA = $(BUILD)/tests/win32/resources.o
+$(BUILD)/tests/win32/phase2.exe: $(BUILD)/tests/win32/resources.o
+
+$(BUILD)/tests/win32/imports.o: tests/win32/imports.S tests/win32/imports.h
+	@mkdir -p $(dir $@)
+	$(CC) $(WIN32_TEST_CFLAGS) -c $< -o $@
+
+$(BUILD)/tests/win32/%.exe: tests/win32/%.c $(WIN32_TEST_DEPS) $(BUILD)/tests/win32/imports.o
 	@mkdir -p $(dir $@)
 	$(CC) $(WIN32_TEST_CFLAGS) -c $< -o $(BUILD)/tests/win32/$*.o
-	$(CC) $(WIN32_TEST_CFLAGS) -c tests/win32/imports.S -o $(BUILD)/tests/win32/imports.o
-	$(LD) -m elf_i386 -T tests/win32/pe.ld -o $(BUILD)/tests/win32/$*.elf $(BUILD)/tests/win32/$*.o $(BUILD)/tests/win32/imports.o
+	$(LD) -m elf_i386 -T tests/win32/pe.ld -o $(BUILD)/tests/win32/$*.elf $(BUILD)/tests/win32/$*.o $(BUILD)/tests/win32/imports.o $(WIN32_TEST_EXTRA)
 	$(OBJCOPY) -O pei-i386 --subsystem $(WIN32_SUBSYSTEM):4.0 --image-base 0x400000 --section-alignment 0x1000 \
 		--file-alignment 0x200 $(BUILD)/tests/win32/$*.elf $@
 
@@ -900,11 +913,13 @@ $(BUILD)/tests/win32-gui-guest: $(BUILD)/tests/win32-gui-guest.o $(CRT0) $(LIBDE
 
 .PHONY: test-win32-gui-qemu
 test-win32-gui-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/win32-gui-guest $(BUILD)/tests/win32/hello.exe \
-                     $(BUILD)/tests/win32/console.exe $(BUILD)/tests/win32/input.exe
+                     $(BUILD)/tests/win32/console.exe $(BUILD)/tests/win32/input.exe $(BUILD)/tests/win32/children.exe $(BUILD)/tests/win32/phase2.exe
 	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/win32-gui-guest --cpus $(KERNEL_TEST_CPUS) \
 		$(TEST_DROP_TOOLCHAIN) --add $(BUILD)/tests/win32/hello.exe:/test/hello.exe \
 		--add $(BUILD)/tests/win32/console.exe:/test/console.exe \
-		--add $(BUILD)/tests/win32/input.exe:/test/input.exe --timeout 90 \
+		--add $(BUILD)/tests/win32/input.exe:/test/input.exe \
+		--add $(BUILD)/tests/win32/children.exe:/test/children.exe \
+		--add $(BUILD)/tests/win32/phase2.exe:/test/phase2.exe --timeout 120 \
 		--success-marker "WIN32 GUI REGRESSIONS PASSED"
 
 $(BUILD)/tests/browser-navigation: tests/browser-navigation.c user/desktop/wave/webutil.c $(DESKTOP_HDRS)

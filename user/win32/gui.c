@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include "gui.h"
@@ -277,6 +278,45 @@ void gui_damage(uint32_t id, struct rect r)
 {
     struct wm_rect wr = { r.x, r.y, r.w, r.h };
     send_msg(C_DAMAGE, id, 0, &wr, sizeof(wr));
+}
+
+void gui_clip_set(const char *text)
+{
+    send_msg(C_CLIP_SET,0,0,text,strlen(text));
+}
+char *gui_clip_get(void)
+{
+    if(!gui_connected) return NULL;
+    struct wm_msg *m=request(C_CLIP_GET,0,NULL,0);
+    size_t n=m->type==S_CLIP ? wm_payload_len(m) : 0;
+    char *text=malloc(n+1);
+    if(!text) wdie("out of memory for clipboard");
+    memcpy(text,wm_payload(m),n); text[n]=0;
+    free(m); return text;
+}
+void gui_icon(uint32_t id,const uint32_t *pixels)
+{
+    struct { struct wm_image header; uint32_t pixels[32*32]; } im;
+    im.header=(struct wm_image){pixels ? 32 : 0,pixels ? 32 : 0};
+    if(pixels) memcpy(im.pixels,pixels,sizeof(im.pixels));
+    send_msg(C_ICON_IMAGE,id,0,&im,pixels ? sizeof(im) : sizeof(im.header));
+}
+
+/* Private drawing buffers must not grow the loader's brk into the guest EXE. */
+int win_surface_init(struct surface *s,int w,int h)
+{
+    if(w<=0 || h<=0 || (uint64_t)w*h>0x1FFFFFFF) return -1;
+    uint32_t bytes=(uint32_t)w*h*4;
+    void *p=mmap(NULL,bytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    if(p==MAP_FAILED) return -1;
+    vm_note_foreign((uint32_t)(uintptr_t)p,bytes);
+    *s=(struct surface){p,w,h,w,{0,0,w,h}};return 0;
+}
+void win_surface_free(struct surface *s)
+{
+    if(!s->px) return;
+    vm_forget_foreign((uint32_t)(uintptr_t)s->px);
+    munmap(s->px,(size_t)s->stride*s->h*4);memset(s,0,sizeof(*s));
 }
 
 int gui_attach(struct surface *s, const struct wm_buffer *b)

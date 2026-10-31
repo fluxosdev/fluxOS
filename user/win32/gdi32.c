@@ -199,9 +199,9 @@ static void bitmap_free(struct bitmap *bm)
     if (bm->dib) {
         vm_free(bm->bits, bm->bits_size);
         if (!bm->direct)
-            surface_free(&bm->surf);
+            win_surface_free(&bm->surf);
     } else {
-        surface_free(&bm->surf);
+        win_surface_free(&bm->surf);
     }
     free(bm);
 }
@@ -267,7 +267,7 @@ static HBITMAP new_bitmap(int w, int h, int mono, struct bitmap **out)
     bm->h = h;
     bm->bpp = mono ? 1 : 32;
     bm->mono = mono;
-    if (surface_init(&bm->surf, w > 0 ? w : 1, h > 0 ? h : 1) < 0) {
+    if (win_surface_init(&bm->surf, w > 0 ? w : 1, h > 0 ? h : 1) < 0) {
         free(bm);
         return 0;
     }
@@ -720,6 +720,7 @@ struct target {
     HWND hwnd;
     struct bitmap *bm;
     struct dc *d;
+    struct clip_save *saved;
 };
 
 static int target(struct dc *d, struct target *t)
@@ -743,6 +744,8 @@ static int target(struct dc *d, struct target *t)
     c.x += t->ox;
     c.y += t->oy;
     t->clip = rect_intersect(c, mkrect(0, 0, t->s->w, t->s->h));
+    if (!d->mem)
+        t->clip = rect_intersect(t->clip, win_clip_bounds(d->hwnd));
     t->hwnd = d->hwnd;
     if (rect_empty(t->clip))
         return -1;
@@ -753,6 +756,10 @@ static int target(struct dc *d, struct target *t)
 /* r (device coordinates) is about to be drawn over: a converted DIB's copy is brought up to date. */
 static void touch(struct target *t, struct rect r)
 {
+    if (!t->bm) {
+        struct rect touched=rect_intersect(mkrect(r.x+t->ox,r.y+t->oy,r.w,r.h),t->clip);
+        t->saved = win_clip_save(t->hwnd,t->s,touched,t->saved);
+    }
     if (t->bm)
         dib_pull(t->bm, rect_intersect(mkrect(r.x + t->ox, r.y + t->oy, r.w, r.h), t->clip));
 }
@@ -763,8 +770,11 @@ static void drawn(struct target *t, struct rect r)
     r = rect_intersect(mkrect(r.x + t->ox, r.y + t->oy, r.w, r.h), t->clip);
     if (t->bm)
         dib_push(t->bm, r);
-    else
+    else {
+        win_clip_restore(t->saved, t->s);
+        t->saved = NULL;
         win_dirty(t->hwnd, r);
+    }
     gfx_noclip(t->s);
 }
 
@@ -1561,7 +1571,7 @@ static HBITMAP dib_section(struct dc *d, const struct dibinfo *di, gp_t *bits_ou
         bm->surf.stride = di->top_down ? di->w : -di->w;
         bm->surf.px = (uint32_t *)GP(bm->bits) + (di->top_down ? 0 : (size_t)(di->h - 1) * di->w);
         gfx_noclip(&bm->surf);
-    } else if (surface_init(&bm->surf, di->w, di->h) < 0) {
+    } else if (win_surface_init(&bm->surf, di->w, di->h) < 0) {
         vm_free(bm->bits, bm->bits_size);
         free(bm);
         return 0;

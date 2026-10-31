@@ -10,5 +10,7 @@ SECTIONS
     .data : { *(.data*) *(.bss*) *(COMMON) }
     . = ALIGN(0x1000);
     .idata : { *(.idata) }
+    . = ALIGN(0x1000);
+    .rsrc : { *(.rsrc) }
     /DISCARD/ : { *(.note*) *(.comment) *(.eh_frame*) }
 }
