@@ -104,6 +104,25 @@ static void icon_gears(void)
     disc(16, 16, 4, C_FACE);
 }
 
+/* A black pawn standing on a checkered tile. */
+static void icon_chess(void)
+{
+    color_t light = RGB(0xEE, 0xD8, 0xB0), dark = RGB(0x8B, 0x5A, 0x2B), ink = RGB(0x20, 0x20, 0x28);
+    P(2, 2, 14, 14, light);
+    P(16, 2, 14, 14, dark);
+    P(2, 16, 14, 14, dark);
+    P(16, 16, 14, 14, light);
+    frame(2, 2, 28, 28, C_BLACK);
+    P(8, 24, 16, 4, ink);               /* the foot */
+    P(10, 22, 12, 2, ink);
+    P(11, 18, 10, 4, ink);              /* the body */
+    P(12, 14, 8, 4, ink);
+    P(10, 12, 12, 2, ink);              /* the collar */
+    disc(16, 8, 5, ink);                /* the head */
+    P(13, 6, 2, 2, RGB(0x90, 0x90, 0xA0));
+    P(13, 16, 1, 6, RGB(0x60, 0x60, 0x70));
+}
+
 /* A window holding a green trace on black, like a system monitor. */
 static void icon_taskmgr(void)
 {
@@ -374,6 +393,7 @@ static void draw_builtin(struct surface *s, int x, int y, enum icon_id id, int s
     case ICON_WARNING: icon_warning(); break;
     case ICON_DISPLAY: icon_display(); break;
     case ICON_GEARS: icon_gears(); break;
+    case ICON_CHESS: icon_chess(); break;
     case ICON_TASKMGR: icon_taskmgr(); break;
     case ICON_MINES: icon_mines(); break;
     case ICON_CLOCK: icon_clock(); break;

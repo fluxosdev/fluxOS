@@ -35,6 +35,7 @@ static const struct {
     { "archiver", ICON_ARCHIVE, "archiver", NULL },
     { "paint", ICON_PAINT, "paint", NULL },
     { "gears", ICON_GEARS, "gears", NULL },
+    { "chess", ICON_CHESS, "chess", NULL },
     { "minesweeper", ICON_MINES, "minesweeper", NULL },
     { "taskmgr", ICON_TASKMGR, "taskmgr", NULL },
     { "diskmgr", ICON_DRIVE, "diskmgr", NULL },

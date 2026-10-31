@@ -124,6 +124,7 @@ enum icon_id {
     ICON_MOUSE,
     ICON_STAR,
     ICON_VIDEO,
+    ICON_CHESS,
     /* the battery in the tray: its charge, on battery and charging */
     ICON_BATTERY_CAUTION,
     ICON_BATTERY_LOW,
@@ -215,6 +216,8 @@ void wm_init(int setup);
 void wm_damage(struct rect r);
 void wm_flush(void);
 struct rect wm_client_rect(struct window *w);
+/* Where the mouse pointer is on the screen (the desktop's process only). */
+void wm_pointer(int *x, int *y);
 
 struct window *wm_create(const char *title, enum icon_id icon, int client_w, int client_h,
                          int flags, const struct window_ops *ops, void *priv);
@@ -523,6 +526,9 @@ void clock_tick(void);                  /* once a second */
 struct window *gears_open(void);        /* 3D Gears, an OpenGL demo */
 void gears_frame(void);                 /* draw the next frame when it is due */
 int gears_timeout(void);                /* ms until the next frame, -1 if none */
+struct window *chess_open(void);        /* Chess, a 3D board after Chess Titans */
+void chess_frame(void);                 /* animate, or let the computer move, when due */
+int chess_timeout(void);                /* ms until chess_frame has work, -1 if none */
 void setup_child_exited(int pid, int status);
 void system_restart(void);
 void system_shutdown(void);             /* splash, sync and power off */

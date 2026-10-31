@@ -141,6 +141,7 @@ static void open_calculator(void) { app_launch("calculator"); }
 static void open_player(void) { app_launch("player"); }
 static void open_browser(void) { app_launch("wave"); }
 static void open_gears(void) { app_launch("gears"); }
+static void open_chess(void) { app_launch("chess"); }
 static void open_taskmgr(void) { app_launch("taskmgr"); }
 static void open_diskmgr(void) { app_launch("diskmgr"); }
 static void open_minesweeper(void) { app_launch("minesweeper"); }
@@ -166,6 +167,7 @@ static const struct menu_item programs_items[] = {
     { ICON_BROWSER, "Wave", open_browser, NULL, 0 },
     { ICON_TERMINAL, "Terminal", open_terminal, NULL, 0 },
     { ICON_GEARS, "3D Gears", open_gears, NULL, 0 },
+    { ICON_CHESS, "Chess", open_chess, NULL, 0 },
     { ICON_MINES, "Minesweeper", open_minesweeper, NULL, 0 },
 };
 
@@ -2561,6 +2563,12 @@ void wm_drag_hint(const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(dnd.hint, sizeof(dnd.hint), fmt, ap);
     va_end(ap);
+}
+
+void wm_pointer(int *x, int *y)
+{
+    *x = mx;
+    *y = my;
 }
 
 int wm_drag_here(void)

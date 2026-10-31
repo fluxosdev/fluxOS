@@ -11,8 +11,8 @@
  * File Manager (/bin/files) and inside the desktop, whose folder it is.
  * The desktop is a folder window too (files_open_desktop): no frame, the
  * wallpaper behind, a header of Labels, Back, Home, Favourites and the
- * mounted disks over a divider,
- * and the folder in tiles down columns: the icon with the name under it,
+ * mounted disks over a divider (scrolling sideways, by the wheel or the bar under it, when
+ * they do not all fit), and the folder in tiles down columns: the icon with the name under it,
  * or beside it once Labels is clicked (kept in ~/.desklabels).
  * It opens on ~/Desktop; Home goes back there, Back to the folders before,
  * and Favourites to the folders kept in ~/.favourites, one per line.
@@ -41,6 +41,7 @@
 /* The desktop's folder draws the wallpaper, which only the desktop has (the File Manager never
  * shows the desktop's folder). */
 #pragma weak wallpaper_draw
+#pragma weak wm_pointer
 
 #define FM_W       560
 #define FM_H       380
@@ -119,7 +120,7 @@ static int clip_n;
 static int clip_cut;
 
 /* What the mouse is holding down. */
-enum hold { HOLD_NONE, HOLD_TOOL, HOLD_THUMB, HOLD_ARROW_UP, HOLD_ARROW_DOWN, HOLD_BAND, HOLD_ITEM };
+enum hold { HOLD_NONE, HOLD_TOOL, HOLD_THUMB, HOLD_ARROW_UP, HOLD_ARROW_DOWN, HOLD_BAND, HOLD_ITEM, HOLD_HEAD_THUMB };
 
 #define DRAG_SLOP 4
 
@@ -135,6 +136,7 @@ struct fm {
     int band_x0, band_y0;               /* rubber band start (y includes the scroll) */
     int band_x1, band_y1;               /* rubber band end, in window coordinates */
     int scroll;                         /* view offset in pixels */
+    int head_scroll;                    /* the desktop header's, when its buttons are wider than it */
     enum hold hold;
     int hold_tool, hold_in;
     int thumb_grab;                     /* where the thumb was grabbed */
@@ -393,22 +395,91 @@ static enum icon_id head_icon(int i)
     return i < NHEAD ? heads[i].icon : i - NHEAD < ndrives ? drives[i - NHEAD].icon : ICON_NONE;
 }
 
+/* The header's buttons: Back, Home, Favourites and a button for each disk. */
+static int nheads(void)
+{
+    return NHEAD + ndrives;
+}
+
 /* A header button of the desktop: the icon and the label beside it. */
-static struct rect head_rect(int i)
+static int head_w(int i)
+{
+    return 8 + 32 + 10 + gfx_text_width(head_font(), head_label(i)) + 14;
+}
+
+/* Where header button i starts, before the header scrolls. */
+static int head_x(int i)
 {
     int x = DESK_PAD - 8;
     for (int k = 0; k < i; k++)
-        x += 8 + 32 + 10 + gfx_text_width(head_font(), head_label(k)) + 14 + 12 + (k == NHEAD - 1 ? DRIVES_GAP : 0);
-    return mkrect(x, HEAD_Y, 8 + 32 + 10 + gfx_text_width(head_font(), head_label(i)) + 14, HEAD_H);
+        x += head_w(k) + 12 + (k == NHEAD - 1 ? DRIVES_GAP : 0);
+    return x;
 }
 
-/* The header's buttons: Back, Home, Favourites and the disks that fit beside them. */
-static int nheads(struct fm *f)
+static struct rect head_rect(struct fm *f, int i)
 {
-    int n = NHEAD;
-    while (n < NHEAD + ndrives && head_rect(n).x + head_rect(n).w <= f->win->content.w - DESK_PAD + 8)
-        n++;
-    return n;
+    return mkrect(head_x(i) - f->head_scroll, HEAD_Y, head_w(i), HEAD_H);
+}
+
+/* What the header's buttons are seen through: with more than fit, they scroll along it. */
+static struct rect head_strip(struct fm *f)
+{
+    return mkrect(DESK_PAD - 8, HEAD_Y, f->win->content.w - 2 * DESK_PAD + 16, HEAD_H);
+}
+
+static int head_max_scroll(struct fm *f)
+{
+    struct rect s = head_strip(f);
+    int last = nheads() - 1, m = head_x(last) + head_w(last) - (s.x + s.w);
+    return m > 0 ? m : 0;
+}
+
+static void set_head_scroll(struct fm *f, int x)
+{
+    int ms = head_max_scroll(f);
+    f->head_scroll = x < 0 ? 0 : x > ms ? ms : x;
+}
+
+/* Header button i scrolled fully into view. */
+static void show_head(struct fm *f, int i)
+{
+    struct rect s = head_strip(f), r = head_rect(f, i);
+    if (r.x < s.x)
+        set_head_scroll(f, f->head_scroll - (s.x - r.x));
+    else if (r.x + r.w > s.x + s.w)
+        set_head_scroll(f, f->head_scroll + (r.x + r.w - s.x - s.w));
+}
+
+/* Where the header has scrolled to: a slim bar between it and the divider, and its thumb;
+ * the room down to the divider takes clicks on it. */
+static struct rect head_bar(struct fm *f)
+{
+    struct rect s = head_strip(f);
+    return mkrect(s.x + 8, HEAD_Y + HEAD_H + 2, s.w - 16, 4);
+}
+
+static struct rect head_bar_hit(struct fm *f)
+{
+    struct rect b = head_bar(f);
+    return mkrect(b.x, HEAD_Y + HEAD_H, b.w, DIVIDER_Y + DIVIDER_H - HEAD_Y - HEAD_H);
+}
+
+static struct rect head_thumb(struct fm *f)
+{
+    struct rect b = head_bar(f);
+    int ms = head_max_scroll(f), sw = head_strip(f).w;
+    int len = ms ? b.w * sw / (sw + ms) : b.w;
+    if (len < 16)
+        len = 16;
+    return mkrect(b.x + (ms ? (b.w - len) * f->head_scroll / ms : 0), b.y, len, b.h);
+}
+
+/* Drag the thumb so that the point grabbed is under x. */
+static void head_thumb_to(struct fm *f, int x)
+{
+    struct rect b = head_bar(f), t = head_thumb(f);
+    if (b.w > t.w)
+        set_head_scroll(f, (x - f->thumb_grab - b.x) * head_max_scroll(f) / (b.w - t.w));
 }
 
 static struct rect sb_rect(struct fm *f)
@@ -994,8 +1065,10 @@ static void paint_desk(struct fm *f)
         wallpaper_draw(s, mkrect(0, 0, w, h));
 
     const struct pfont *hf = head_font();
-    for (int i = 0, n = nheads(f); i < n; i++) {
-        struct rect r = head_rect(i);
+    set_head_scroll(f, f->head_scroll);     /* the disks or the width may have changed */
+    gfx_clip(s, head_strip(f));
+    for (int i = 0, n = nheads(); i < n; i++) {
+        struct rect r = head_rect(f, i);
         int down = (f->hold == HOLD_TOOL && f->hold_tool == i && f->hold_in) ||
                    (i == HB_FAVS && f->ctx_open && f->ctx_favs);
         int off = i == HB_BACK && !f->nhist;
@@ -1012,6 +1085,11 @@ static void paint_desk(struct fm *f)
             draw_icon(s, ix, iy, head_icon(i), 32);
         shadow_text(s, hf, ix + 32 + 10, r.y + (r.h - hf->height) / 2, head_label(i),
                     off ? RGB(0xA8, 0xA8, 0xA8) : C_WHITE);
+    }
+    gfx_noclip(s);
+    if (head_max_scroll(f)) {
+        gfx_round_fill(s, head_bar(f), 2, 2, ARGB(0x50, 0x000000));
+        gfx_round_fill(s, head_thumb(f), 2, 2, ARGB(0xD0, 0xFFFFFF));
     }
     gfx_round_fill(s, mkrect(DESK_PAD - 1, DIVIDER_Y, w - 2 * DESK_PAD, DIVIDER_H), 1, 1, ARGB(0x99, 0xFFFFFF));
 
@@ -1776,7 +1854,8 @@ static void open_favs(struct fm *f)
     if (n)
         f->ctx_codes[n++] = CX_SEP;
     f->ctx_codes[n++] = fav_index(f->path) < 0 ? CX_FAVTHIS : CX_UNFAVTHIS;
-    struct rect r = head_rect(HB_FAVS);
+    show_head(f, HB_FAVS);              /* for the menu to hang under it */
+    struct rect r = head_rect(f, HB_FAVS);
     f->ctx_n = n;
     f->ctx_x = r.x;
     f->ctx_y = r.y + r.h + 2;
@@ -1799,7 +1878,7 @@ static void head_action(struct fm *f, int i)
     case HB_HOME: navigate(f, desktop_dir()); break;
     case HB_FAVS: open_favs(f); paint(f); break;
     default:
-        if (i < nheads(f))
+        if (i < nheads())
             navigate(f, drives[i - NHEAD].path);
         break;
     }
@@ -2076,10 +2155,10 @@ static int fm_drop(struct window *w, int x, int y, const struct drag_data *d, in
     return effect;
 }
 
-/* The toolbar button i, or on the desktop the header's. */
+/* The toolbar button i, or on the desktop the header's (as much of it as is scrolled into view). */
 static struct rect hold_rect(struct fm *f, int i)
 {
-    return f->desk ? head_rect(i) : tool_rect(i);
+    return f->desk ? rect_intersect(head_rect(f, i), head_strip(f)) : tool_rect(i);
 }
 
 static void press(struct fm *f, int x, int y)
@@ -2090,7 +2169,18 @@ static void press(struct fm *f, int x, int y)
         return;
     }
     f->editing = 0;
-    for (int i = 0; i < (f->desk ? nheads(f) : NTOOLS); i++) {
+    if (f->desk && head_max_scroll(f) && rect_contains(head_bar_hit(f), x, y)) {
+        struct rect t = head_thumb(f);
+        if (x >= t.x && x < t.x + t.w) {
+            f->hold = HOLD_HEAD_THUMB;
+            f->thumb_grab = x - t.x;
+        } else {
+            int page = head_strip(f).w - 40;
+            set_head_scroll(f, f->head_scroll + (x < t.x ? -page : page));
+        }
+        return;
+    }
+    for (int i = 0; i < (f->desk ? nheads() : NTOOLS); i++) {
         if (rect_contains(hold_rect(f, i), x, y)) {
             if (f->desk && i == HB_BACK && !f->nhist)
                 return;                 /* nowhere to go back to */
@@ -2187,7 +2277,7 @@ static void fm_mouse(struct window *w, int x, int y, int buttons, int changed)
         paint(f);
         if (code != CX_SEP)
             ctx_action(f, code);
-        if (inside || (f->desk && rect_contains(head_rect(HB_FAVS), x, y)))
+        if (inside || (f->desk && rect_contains(hold_rect(f, HB_FAVS), x, y)))
             return;                     /* a click on the menu (or on the button that closes it) is not a click on the folder */
     }
     if ((changed & MOUSE_LEFT) && (buttons & MOUSE_LEFT)) {
@@ -2236,6 +2326,8 @@ static void fm_mouse(struct window *w, int x, int y, int buttons, int changed)
         return;
     } else if (f->hold == HOLD_THUMB) {
         scroll_to_mouse(f, y);
+    } else if (f->hold == HOLD_HEAD_THUMB) {
+        head_thumb_to(f, x);
     } else if (f->hold == HOLD_TOOL) {
         int in = rect_contains(hold_rect(f, f->hold_tool), x, y);
         if (in == f->hold_in)
@@ -2250,6 +2342,17 @@ static void fm_mouse(struct window *w, int x, int y, int buttons, int changed)
 static void fm_wheel(struct window *w, int steps)
 {
     struct fm *f = w->priv;
+    if (f->desk && wm_pointer && head_max_scroll(f)) {
+        /* over the header (or its bar), the wheel scrolls it along */
+        struct rect c = wm_client_rect(w), s = head_strip(f);
+        int x, y;
+        wm_pointer(&x, &y);
+        if (rect_contains(mkrect(s.x, s.y, s.w, DIVIDER_Y + DIVIDER_H - s.y), x - c.x, y - c.y)) {
+            set_head_scroll(f, f->head_scroll - steps * mouse_wheel_lines() * 40);
+            paint(f);
+            return;
+        }
+    }
     set_scroll(f, f->scroll - steps * mouse_wheel_lines() * (CELL_H / 3));
     paint(f);
 }

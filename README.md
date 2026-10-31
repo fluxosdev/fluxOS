@@ -284,7 +284,7 @@ says why.
   (System Properties, Run, Shut Down, Power, Volume Control, the clock). Wave, the terminal,
   the File Manager, the editor and every other program are separate binaries in `/bin`
   (`wave`, `terminal`, `files`, `editor`, `calculator`, `player`, `archiver`, `paint`,
-  `gears`, `minesweeper`, `taskmgr`, `diskmgr`, `display`, `mouse`, `datetime`,
+  `gears`, `chess`, `minesweeper`, `taskmgr`, `diskmgr`, `display`, `mouse`, `datetime`,
   `wireless`, `imageview`) that connect to the desktop over an `AF_UNIX` socket
   (`/tmp/.desktop`) and draw each window's client area into a shared memory segment
   the desktop composes from. A program that hangs or crashes takes only its own windows
@@ -321,7 +321,7 @@ says why.
 - Oxygen icons (PNG), PNG, JPEG, GIF and SVG decoding (the first bytes decide,
   whatever the name), and a wallpaper (Fill, Stretch, Center or Tile).
 - Windows move, minimize, maximize and cascade; the browser, text editor, file
-  manager, Task Manager and Gears resize by dragging an edge.
+  manager, Task Manager, Gears and Chess resize by dragging an edge.
 - **Drag and drop between windows**: what is dragged follows the pointer with its icon,
   its name and what letting go would do ("Move to Downloads", "Open in Paint"); the
   pointer is a no-entry sign where nothing takes it, and Escape cancels. Files from the
@@ -366,6 +366,15 @@ says why.
 - **3D Gears**: the OpenGL demo, drawn by the Radeon, Intel or Voodoo 3D engine when
   there is one, else by the software renderer (S switches renderer, T puts a
   texture on the gears).
+- **Chess**: a 3D board after Vista's Chess Titans, drawn with the GL library in
+  front of the White Kinetik wallpaper: turned Staunton pieces reflected in glossy
+  wooden squares, the squares a piece can reach lit up, and pieces that arc across
+  the board. Play the computer at ten levels or a second player at the same
+  computer, the board swinging round to whoever is to move. Click a piece and its
+  square or drag it there; drag with the right button (or use the arrow keys) to
+  turn the board in 3D and roll the wheel to zoom. F2 starts a new game, Ctrl+Z
+  takes a move back, M switches opponent, L or 1-0 sets the level, R turns the
+  reflections off and on.
 - **Paint**: a bitmap editor with a canvas of any size up to 2048 x 2048
   (**New...** and **Size...**), a round **Brush** with an adjustable size (the
   `-`/`+` buttons or `[`/`]`), a square **Eraser**, flood **Fill**, straight
@@ -818,6 +827,7 @@ make test-libc-qemu # the libc on the real kernel (files, popen, pipes, select, 
 make test-tools  # tar, gzip, sed, diff, patch, find... built for the host, against GNU's
 make test-sh     # fsh as /bin/sh, built for the host, against the host's /bin/sh
 make test-gl     # the GL library's software renderer, built for the host, drawn with pixel by pixel
+make test-chess  # Chess's move generation (perft), game ends and the computer's play, on the host
 make test-gcc-qemu # the native GCC compiles, links and runs a program on the real kernel
 make test-desktop-jobs # decoder helper responsiveness, transfers, cancellation and recovery
 make test-desktop-jobs-qemu # same protocol tests with fluxOS's blocking pipes
@@ -980,6 +990,7 @@ user/desktop/shell/        the desktop: compositor and window manager (wm.c), it
                            fonts in font_sans.c and font_archivo.c)
 user/desktop/apps/         the programs: files, edit, calc, player, paint, term, taskmgr,
                            diskmgr, display, mouse, datetime, wireless, archiver, gears,
+                           chess (the window; chessview.c draws it, chessrules.c plays),
                            mines, imageview (files.c is the desktop's folder too)
 user/desktop/progs/        each program's main(): /bin/NAME
 user/desktop/image/        PNG/JPEG/GIF/WebP/ICO/SVG decoding (image.c picks the decoder)

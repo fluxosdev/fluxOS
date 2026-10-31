@@ -160,7 +160,7 @@ LIBDESKTOP := $(BUILD)/libdesktop.a
 DESKTOP_SHELL_OBJS := $(call desktop_objs,$(addprefix shell/,main.c wm.c server.c sidebar.c wallpaper.c \
                         screensaver.c power.c sound.c sysdlg.c clock.c setup.c wifitray.c) apps/files.c)
 # The programs, each /bin/NAME: progs/NAME.c, the program's own sources, and client.c for its windows.
-DESKTOP_PROGS := wave terminal files editor calculator player archiver paint gears minesweeper taskmgr \
+DESKTOP_PROGS := wave terminal files editor calculator player archiver paint gears chess minesweeper taskmgr \
                  diskmgr display mouse datetime wireless imageview
 PROG_SRCS_wave        := $(patsubst user/desktop/%,%,$(wildcard user/desktop/wave/*.c user/desktop/wave/js/*.c))
 PROG_SRCS_terminal    := apps/term.c
@@ -171,6 +171,7 @@ PROG_SRCS_player      := apps/player.c
 PROG_SRCS_archiver    := apps/archiver.c
 PROG_SRCS_paint       := apps/paint.c
 PROG_SRCS_gears       := apps/gears.c
+PROG_SRCS_chess       := apps/chess.c apps/chessview.c apps/chessrules.c
 PROG_SRCS_minesweeper := apps/mines.c
 PROG_SRCS_taskmgr     := apps/taskmgr.c
 PROG_SRCS_diskmgr     := apps/diskmgr.c
@@ -530,6 +531,16 @@ $(BUILD)/tests/gl-soft: tests/gl-soft.c tests/gl-host.h $(GL_TEST_SRCS) user/gl/
 	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -msse2 \
 		-fsanitize=address,undefined -include tests/gl-host.h -idirafter user/include \
 		tests/gl-soft.c $(GL_TEST_SRCS) -lm -o $@
+
+# Chess's rules and the computer's play, built for the host (tests/chess-rules.c).
+.PHONY: test-chess
+test-chess: $(BUILD)/tests/chess-rules
+	$<
+
+$(BUILD)/tests/chess-rules: tests/chess-rules.c user/desktop/apps/chessrules.c user/desktop/apps/chess.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -g -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined \
+		tests/chess-rules.c user/desktop/apps/chessrules.c -o $@
 
 # The native GCC on the real kernel: compiles and runs a program under QEMU and
 # compares the binary with the cross compiler's (needs "make toolchain-native").
