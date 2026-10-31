@@ -23,6 +23,8 @@ void gui_destroy(uint32_t id);
 int gui_resize(uint32_t id, int w, int h, struct wm_buffer *b);
 void gui_move(uint32_t id, int x, int y);
 void gui_title(uint32_t id, const char *title);
+void gui_cursor(uint32_t id, int kind);     /* enum cursor_kind */
+void gui_focus(uint32_t id);
 void gui_damage(uint32_t id, struct rect r);
 void gui_flush(void);
 /* The next message from the desktop that is about a window (malloc'd), or NULL. */
@@ -43,6 +45,8 @@ void user32_flush_damage(void);
 void user32_drop_windows(void);
 /* The class background brush of a window (for WM_ERASEBKGND). */
 HBRUSH win_class_brush(HWND hwnd);
+/* A key or the mouse, as it is read from the desktop (before it becomes a message). */
+void user32_input_arrived(const struct wm_msg *m);
 
 /* ---- gdi32.c ---- */
 /* A DC on the window's client area (hwnd 0: the screen, which draws nothing). */

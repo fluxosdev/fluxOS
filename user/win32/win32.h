@@ -45,7 +45,7 @@ static inline uint16_t *gwstr(gp_t a) { return a ? (uint16_t *)GP(a) : NULL; }
 #define GUEST_TOP   0x80000000u
 
 /* ---- Windows types, as the program sees them ---- */
-typedef uint32_t DWORD, HANDLE, HMODULE, HWND, HDC, HGDIOBJ, HINSTANCE, HMENU, HICON, HCURSOR, HBRUSH, HFONT, HBITMAP, HPEN, HRGN, HKEY, LPARAM, WPARAM, UINT, ULONG, BOOL, COLORREF, LRESULT, SIZE_T, HRESULT, HGLOBAL, HLOCAL;
+typedef uint32_t DWORD, HANDLE, HMODULE, HWND, HDC, HGDIOBJ, HINSTANCE, HMENU, HICON, HCURSOR, HBRUSH, HFONT, HBITMAP, HPEN, HRGN, HPALETTE, HKEY, LPARAM, WPARAM, UINT, ULONG, BOOL, COLORREF, LRESULT, SIZE_T, HRESULT, HGLOBAL, HLOCAL;
 typedef int32_t LONG, INT;
 typedef uint16_t WORD, WCHAR, ATOM;
 typedef uint8_t BYTE;
@@ -599,8 +599,6 @@ int gui_available(void);                /* connect, if not yet tried: 1 if the d
 int gui_pump(int block);                /* read the desktop's messages (block: till one comes); 1 if any wait */
 void gui_exit(void);                    /* the program is ending: close its windows */
 int gui_wait_ms(int ms);                /* wait at most ms (-1: no limit) for news from the desktop: 1 if any came */
-void gui_timers_due(void);
-int gui_next_timer_ms(void);
 extern int gui_connected;
 
 #endif

@@ -27,6 +27,8 @@
 
 static struct wm_conn conn = { .fd = -1 };
 static int failures;
+static char seen_title[WM_TITLE_MAX];   /* the last C_TITLE and C_CURSOR, whenever they came */
+static int seen_cursor = -1;
 
 static void finish(void)
 {
@@ -73,6 +75,13 @@ static struct wm_msg *next_msg(void)
             struct wm_msg *copy = malloc(m->len);
             memcpy(copy, m, m->len);
             wm_conn_consume(&conn);
+            if (copy->type == C_TITLE) {
+                size_t n = wm_payload_len(copy) < sizeof(seen_title) - 1 ? wm_payload_len(copy) : sizeof(seen_title) - 1;
+                memcpy(seen_title, wm_payload(copy), n);
+                seen_title[n] = 0;
+            } else if (copy->type == C_CURSOR && wm_payload_len(copy) >= sizeof(struct wm_int)) {
+                seen_cursor = ((struct wm_int *)wm_payload(copy))->value;
+            }
             return copy;
         }
         struct pollfd p = { conn.fd, POLLIN, 0 };
@@ -82,7 +91,13 @@ static struct wm_msg *next_msg(void)
     }
 }
 
-/* The next message of this type (skipping C_DAMAGE and C_MOVE, which may come at any time). */
+/* What a window may send at any time. */
+static int incidental(int type)
+{
+    return type == C_DAMAGE || type == C_MOVE || type == C_TITLE || type == C_CURSOR || type == C_FOCUS;
+}
+
+/* The next message of this type (skipping the incidental ones). */
 static struct wm_msg *expect(int type)
 {
     for (;;) {
@@ -90,7 +105,7 @@ static struct wm_msg *expect(int type)
         REQUIRE(m);
         if (m->type == type)
             return m;
-        if (m->type != C_DAMAGE && m->type != C_MOVE && m->type != C_TITLE) {
+        if (!incidental(m->type)) {
             printf("unexpected message %d while waiting for %d\n", m->type, type);
             failures++;
         }
@@ -121,7 +136,7 @@ static void await_paint(int w, int h, char *title, size_t title_size)
             size_t n = wm_payload_len(m) < title_size - 1 ? wm_payload_len(m) : title_size - 1;
             memcpy(title, wm_payload(m), n);
             title[n] = 0;
-        } else if (m->type != C_MOVE) {
+        } else if (!incidental(m->type)) {
             printf("unexpected message %d while waiting for paint\n", m->type);
             failures++;
         }
@@ -164,6 +179,140 @@ static int new_buffer(struct surface *s, int w, int h)
     REQUIRE(id >= 0);
     gfx_fill(s, 0, 0, w, h, MARK);
     return id;
+}
+
+static void key(uint32_t win, int code, int down, int mods, const char *text)
+{
+    struct input_event ev = { IEV_KEY, (uint8_t)(down ? IEV_PRESSED : 0), (uint8_t)mods, 0, (uint16_t)code, 0, 0, { 0 } };
+    if (text) {
+        ev.len = (uint8_t)strlen(text);
+        memcpy(ev.text, text, ev.len);
+    }
+    send_msg(S_KEY, win, 0, &ev, sizeof(ev));
+}
+
+static void mouse(uint32_t win, int x, int y, int buttons, int changed)
+{
+    struct wm_mouse_event me = { x, y, buttons, changed, 1, DRAG_HERE };
+    send_msg(S_MOUSE, win, 0, &me, sizeof(me));
+}
+
+static void pixel(const struct surface *s, int x, int y, uint32_t want)
+{
+    uint32_t p = s->px[y * s->stride + x] & 0xFFFFFF;
+    if (p != want) {
+        printf("FAIL pixel (%d, %d) is %06x, not %06x\n", x, y, p, want);
+        failures++;
+    }
+}
+
+/* input.exe: a full-screen window, its scene, then keys, the mouse, the wheel and the focus. */
+static void run_input(int lfd, const struct wm_state *st)
+{
+    int pid = spawn("/test/input.exe", -1);
+    struct pollfd p = { lfd, POLLIN, 0 };
+    REQUIRE(poll(&p, 1, 15000) == 1);
+    int fd = accept(lfd, NULL, NULL);
+    REQUIRE(fd >= 0);
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+    wm_conn_init(&conn, fd);
+    seen_title[0] = 0;
+    seen_cursor = -1;
+
+    struct wm_msg *m = expect(C_HELLO);
+    send_msg(S_STATE, 0, m->serial, st, sizeof(*st));
+    free(m);
+    m = expect(C_CREATE);
+    const struct wm_create *cr = wm_payload(m);
+    printf("guest: C_CREATE %d x %d flags %x ops %x\n", cr->w, cr->h, cr->flags, cr->ops);
+    CHECK(cr->w == st->screen_w && cr->h == st->screen_h);
+    CHECK(cr->flags & WF_BORDERLESS);
+    CHECK(cr->flags & WF_ALLBUTTONS);
+    CHECK((cr->ops & (WOP_KEY | WOP_MOUSE | WOP_WHEEL)) == (WOP_KEY | WOP_MOUSE | WOP_WHEEL));
+    uint32_t win = m->win;
+    struct surface s;
+    struct wm_buffer b = { new_buffer(&s, cr->w, cr->h), cr->w, cr->h, 1, 0 };
+    send_msg(S_BUFFER, win, m->serial, &b, sizeof(b));
+    free(m);
+    struct wm_configure cf = { { 0, 0, st->screen_w, st->screen_h }, 0, 0 };
+    send_msg(S_CONFIGURE, win, 0, &cf, sizeof(cf));
+    struct wm_int focus = { 1 };
+    send_msg(S_FOCUS, win, 0, &focus, sizeof(focus));
+
+    await_paint(st->screen_w, st->screen_h, NULL, 0);
+    pixel(&s, 10, 10, 0xFF0000);        /* the 8-bit DIB section, stretched: red above */
+    pixel(&s, 10, 50, 0x0000FF);        /* and blue below */
+    pixel(&s, 110, 10, 0xFFFFFF);       /* StretchDIBits of a bottom-up 2 x 2 */
+    pixel(&s, 130, 10, 0xFFFF00);
+    pixel(&s, 110, 30, 0x00FF00);
+    pixel(&s, 130, 30, 0x0000FF);
+    pixel(&s, 200, 0, 0xFFFFFF);        /* Rectangle: the pen */
+    pixel(&s, 259, 39, 0xFFFFFF);
+    pixel(&s, 230, 20, 0x808080);       /* and the brush */
+    pixel(&s, 260, 40, 0x000000);
+    pixel(&s, 330, 30, 0xFFFFFF);       /* Ellipse */
+    pixel(&s, 301, 1, 0x000000);
+    pixel(&s, 430, 10, 0xFF0000);       /* LineTo, its end left out */
+    pixel(&s, 460, 10, 0x000000);
+    pixel(&s, 502, 4, 0xFFFF00);        /* the sprite through its mask */
+    pixel(&s, 506, 4, 0x0000FF);
+    pixel(&s, 600, 5, 0xFF00FF);        /* SetPixel */
+    pixel(&s, 705, 5, 0xFFFFFF);        /* Polygon */
+    pixel(&s, 755, 55, 0x000000);
+    pixel(&s, 905, 5, 0xFFFFFF);        /* PatBlt WHITENESS */
+    pixel(&s, 935, 5, 0x808080);        /* PatBlt PATCOPY */
+    pixel(&s, 1000, 700, 0x000000);
+    int text = 0;
+    for (int y = 0; y < 20; y++)
+        for (int x = 800; x < 830; x++)
+            text += (s.px[y * s.stride + x] & 0xFFFFFF) == 0xFFFFFF;
+    CHECK(text > 10);
+
+    key(win, 0x1E, 1, 0, "a");
+    key(win, 0x1E, 0, 0, NULL);
+    key(win, 0x2A, 1, KMOD_SHIFT, NULL);
+    key(win, 0x30, 1, KMOD_SHIFT, "B");
+    key(win, 0x30, 0, KMOD_SHIFT, NULL);
+    key(win, 0x2A, 0, 0, NULL);
+    key(win, KEY_LEFT, 1, 0, "\033[D");
+    key(win, KEY_LEFT, 0, 0, NULL);
+    mouse(win, 100, 100, 0, 0);
+    mouse(win, 100, 100, MOUSE_LEFT, MOUSE_LEFT);
+    mouse(win, 100, 100, 0, MOUSE_LEFT);
+    mouse(win, 100, 100, MOUSE_LEFT, MOUSE_LEFT);
+    mouse(win, 100, 100, 0, MOUSE_LEFT);
+    mouse(win, 200, 150, MOUSE_RIGHT, MOUSE_RIGHT);
+    mouse(win, 200, 150, 0, MOUSE_RIGHT);
+    struct wm_int wheel = { 1 };
+    send_msg(S_WHEEL, win, 0, &wheel, sizeof(wheel));
+    usleep(300000);                     /* the timers tick meanwhile */
+    mouse(win, 200, 150, MOUSE_MIDDLE, MOUSE_MIDDLE);
+    mouse(win, 200, 150, 0, MOUSE_MIDDLE);
+    while (!seen_title[0] || strcmp(seen_title, "Game") == 0) {
+        m = next_msg();
+        REQUIRE(m);
+        free(m);
+    }
+    printf("guest: input.exe says \"%s\"\n", seen_title);
+    CHECK(!strcmp(seen_title, "ok"));
+    CHECK(seen_cursor == CUR_CROSS);
+
+    send_msg(S_CLOSE, win, 0, NULL, 0);
+    m = expect(C_DESTROY);
+    free(m);
+    while ((m = next_msg())) {
+        if (!incidental(m->type)) {
+            printf("unexpected message %d after C_DESTROY\n", m->type);
+            failures++;
+        }
+        free(m);
+    }
+    int code = wait_exit(pid);
+    printf("guest: input.exe exited with %d\n", code);
+    CHECK(code == 9);
+    shm_surface_detach(&s);
+    shmctl(b.shmid, IPC_RMID, NULL);
+    wm_conn_close(&conn);
 }
 
 int main(void)
@@ -267,5 +416,8 @@ int main(void)
     CHECK(code == 7);
     shm_surface_detach(&s2);
     shmctl(b2.shmid, IPC_RMID, NULL);
+    wm_conn_close(&conn);
+
+    run_input(lfd, &st);
     finish();
 }

@@ -853,10 +853,11 @@ $(BUILD)/tests/win32-gui-guest: $(BUILD)/tests/win32-gui-guest.o $(CRT0) $(LIBDE
 
 .PHONY: test-win32-gui-qemu
 test-win32-gui-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/win32-gui-guest $(BUILD)/tests/win32/hello.exe \
-                     $(BUILD)/tests/win32/console.exe
+                     $(BUILD)/tests/win32/console.exe $(BUILD)/tests/win32/input.exe
 	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/win32-gui-guest --cpus $(KERNEL_TEST_CPUS) \
 		$(TEST_DROP_TOOLCHAIN) --add $(BUILD)/tests/win32/hello.exe:/test/hello.exe \
-		--add $(BUILD)/tests/win32/console.exe:/test/console.exe --timeout 90 \
+		--add $(BUILD)/tests/win32/console.exe:/test/console.exe \
+		--add $(BUILD)/tests/win32/input.exe:/test/input.exe --timeout 90 \
 		--success-marker "WIN32 GUI REGRESSIONS PASSED"
 
 $(BUILD)/tests/browser-navigation: tests/browser-navigation.c user/desktop/wave/webutil.c $(DESKTOP_HDRS)

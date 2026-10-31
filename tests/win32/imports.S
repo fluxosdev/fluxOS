@@ -10,11 +10,13 @@
     .long 0, 0, 0, dll_k32 - IB, iat_k32 - IB
     .long 0, 0, 0, dll_u32 - IB, iat_u32 - IB
     .long 0, 0, 0, dll_g32 - IB, iat_g32 - IB
+    .long 0, 0, 0, dll_wmm - IB, iat_wmm - IB
     .long 0, 0, 0, 0, 0
 
 #define IMP_K32 IAT
 #define IMP_U32 NONE
 #define IMP_G32 NONE
+#define IMP_WMM NONE
 iat_k32:
 #include "imports.h"
     .long 0
@@ -32,15 +34,25 @@ iat_u32:
 iat_g32:
 #include "imports.h"
     .long 0
+#undef IMP_G32
+#undef IMP_WMM
+#define IMP_G32 NONE
+#define IMP_WMM IAT
+iat_wmm:
+#include "imports.h"
+    .long 0
 #undef IMP_K32
 #undef IMP_U32
 #undef IMP_G32
+#undef IMP_WMM
 #define IMP_K32 HINT
 #define IMP_U32 HINT
 #define IMP_G32 HINT
+#define IMP_WMM HINT
 #include "imports.h"
 dll_k32: .asciz "KERNEL32.dll"
 dll_u32: .asciz "USER32.dll"
 dll_g32: .asciz "GDI32.dll"
+dll_wmm: .asciz "WINMM.dll"
 
     .section .note.GNU-stack, "", @progbits

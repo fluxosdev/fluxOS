@@ -81,6 +81,11 @@ void glass_smoke(struct surface *s, struct rect r, int rt, int rb);
 #define WF_RIGHTCLICK 0x10      /* the right button is passed to ops->mouse (MOUSE_RIGHT in changed) */
 #define WF_DESKTOP  0x20        /* the desktop itself: no frame, filling the space windows are placed
                                    in, always at the bottom; never moved, minimized or closed */
+#define WF_BORDERLESS 0x40      /* no frame: the client area is the whole window. One that has the focus
+                                   and covers the screen is full screen, over the taskbar and sidebar */
+#define WF_ALLBUTTONS 0x80      /* every button's presses and releases go to ops->mouse (the right and
+                                   middle ones too), and so do the moves while one is held, wherever the
+                                   pointer goes */
 
 enum icon_id {
     ICON_NONE,

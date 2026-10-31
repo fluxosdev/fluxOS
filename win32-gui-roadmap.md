@@ -1,7 +1,8 @@
 # fluxOS Windows GUI roadmap
 
-*Written 2026-10-30, against commit 95a0cc4. Stage 0 is done (see its
-section for where it differs from the plan); the later stages are plans.*
+*Written 2026-10-30, against commit 95a0cc4. Stages 0 and 1 are done (see
+their sections for where they differ from the plan); the later stages are
+plans.*
 
 `winrun` already runs 32-bit console Windows programs: a PE loader, the
 gate between the loader's flat segments and the program's segments, SEH,
@@ -201,6 +202,39 @@ a back buffer blitted to the window each frame.*
   `Polygon`, `Polyline`, `SetPixel`, `GetPixel`.
 - Borderless windows: `WS_POPUP` at the screen's size gives a
   full-screen window.
+
+**Done.** Where it differs from the plan above:
+
+- The desktop needed two window flags (`desktop.h`, `wm.c`):
+  `WF_BORDERLESS`, a window with no frame (one that has the focus and
+  covers the screen is drawn over the taskbar and sidebar, which then
+  take no clicks), and `WF_ALLBUTTONS`, which passes the right and middle
+  buttons' presses and releases, and the moves while they are held, to
+  the window (the desktop passed only the left button's release before).
+  winrun gives every window `WF_ALLBUTTONS`, and a captionless popup
+  `WF_BORDERLESS`. The test drives both through its stand-in desktop,
+  not through `wm.c` itself.
+- Mouse messages go to the top-level window (or the capture): hit-testing
+  down to child windows is stage 2. The desktop sends moves only over the
+  focused window's client area, or while a button is held. `SetCursorPos`
+  cannot move the pointer (the protocol has no way to); it only changes
+  what `GetCursorPos` says until the mouse next moves. `ClipCursor` does
+  nothing.
+- `GetKeyState` follows the messages as the program takes them, as on
+  Windows; `GetAsyncKeyState` follows what the desktop has sent, read
+  even when the program is not taking messages. `WM_CHAR` comes from the
+  text the desktop sent with the key, or from a US layout.
+- No `timeSetEvent`: its callbacks run on a thread of their own, which
+  waits for stage 3. `MsgWaitForMultipleObjects` looks at its handles
+  every 10 ms.
+- Also in: `CreateBitmap`, `CreateDIBitmap`, `SetDIBits`,
+  `SetDIBColorTable`, `GetObject`, palettes (`CreatePalette`,
+  `SelectPalette`...), `SetROP2`, the viewport and window origins,
+  `LoadBitmap` and `LoadImage` (bitmaps from resources or `.bmp` files),
+  `ToAscii`/`ToUnicode`, `MapWindowPoints`.
+- Not in: pattern and hatched brushes, regions and clip regions,
+  `HALFTONE` stretching (all stretching is to the nearest pixel), RLE
+  bitmaps, and a `CreateDIBSection` over a file mapping.
 
 ## Stage 2: controls, dialogs and menus
 

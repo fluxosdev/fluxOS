@@ -79,6 +79,8 @@ static int take_messages(void)
             wm_conn_consume(&conn);
             continue;
         }
+        if (m->type == S_KEY || m->type == S_MOUSE)
+            user32_input_arrived(m);    /* GetAsyncKeyState knows at once */
         struct queued *q = malloc(sizeof(*q) - sizeof(q->m) + m->len);
         if (!q)
             wdie("out of memory");
@@ -254,6 +256,17 @@ void gui_move(uint32_t id, int x, int y)
     send_msg(C_MOVE, id, 0, &p, sizeof(p));
 }
 
+void gui_cursor(uint32_t id, int kind)
+{
+    struct wm_int v = { kind };
+    send_msg(C_CURSOR, id, 0, &v, sizeof(v));
+}
+
+void gui_focus(uint32_t id)
+{
+    send_msg(C_FOCUS, id, 0, NULL, 0);
+}
+
 void gui_title(uint32_t id, const char *title)
 {
     size_t n = strlen(title);
@@ -342,7 +355,3 @@ void gui_exit(void)
     wm_conn_close(&conn);
     gui_connected = 0;
 }
-
-/* Timers come with stage 1 of the roadmap. */
-void gui_timers_due(void) { }
-int gui_next_timer_ms(void) { return -1; }

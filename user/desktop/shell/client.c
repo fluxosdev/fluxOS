@@ -262,7 +262,7 @@ static int ops_bits(const struct window_ops *ops)
 
 static void frame_size(struct window *w)
 {
-    if (w->flags & WF_DESKTOP) {
+    if (w->flags & (WF_DESKTOP | WF_BORDERLESS)) {
         w->r.w = w->content.w;
         w->r.h = w->content.h;
     } else {
@@ -378,7 +378,7 @@ void wm_flush(void)
 
 struct rect wm_client_rect(struct window *w)
 {
-    if (w->flags & WF_DESKTOP)
+    if (w->flags & (WF_DESKTOP | WF_BORDERLESS))
         return mkrect(w->r.x, w->r.y, w->content.w, w->content.h);
     return mkrect(w->r.x + BORDER, w->r.y + FRAME_TOP, w->content.w, w->content.h);
 }

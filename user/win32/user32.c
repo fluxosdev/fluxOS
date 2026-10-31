@@ -16,8 +16,16 @@
  * text is in the other character set than the window procedure's is
  * converted on the way (WM_SETTEXT, WM_GETTEXT).
  *
- * WM_PAINT is never queued: GetMessage makes one for a visible window
- * with an update rectangle when nothing else is waiting. The update
+ * Keys and the mouse are posted as the desktop sends them (keys to the
+ * focus window, the mouse to the window under it or the capture);
+ * TranslateMessage makes WM_CHAR from the text the desktop sent with the
+ * key, or from a US layout when there was none. Activation and focus
+ * follow the desktop's S_FOCUS. A popup without a caption is borderless
+ * on the desktop, and full screen when it covers the screen.
+ *
+ * WM_PAINT and WM_TIMER are never queued: GetMessage makes them for a
+ * visible window with an update rectangle, and for a timer that is due,
+ * when nothing else is waiting. The update
  * "region" is a rectangle (the bounding box of what was invalidated).
  * What was drawn reaches the desktop when the program next waits or asks
  * for messages (user32_flush_damage, from gui_flush).
@@ -60,6 +68,54 @@
 #define WM_NCHITTEST 0x0084
 #define WM_NCACTIVATE 0x0086
 #define WM_SYSCOMMAND 0x0112
+#define WM_ACTIVATE 0x0006
+#define WM_SETFOCUS 0x0007
+#define WM_KILLFOCUS 0x0008
+#define WM_ACTIVATEAPP 0x001C
+#define WM_SETCURSOR 0x0020
+#define WM_KEYDOWN 0x0100
+#define WM_KEYUP 0x0101
+#define WM_CHAR 0x0102
+#define WM_SYSKEYDOWN 0x0104
+#define WM_SYSKEYUP 0x0105
+#define WM_SYSCHAR 0x0106
+#define WM_TIMER 0x0113
+#define WM_MOUSEMOVE 0x0200
+#define WM_LBUTTONDOWN 0x0201
+#define WM_RBUTTONDOWN 0x0204
+#define WM_MBUTTONDOWN 0x0207
+#define WM_MOUSEWHEEL 0x020A
+#define WM_CAPTURECHANGED 0x0215
+
+#define WA_INACTIVE 0
+#define WA_ACTIVE 1
+#define MK_LBUTTON 0x01
+#define MK_RBUTTON 0x02
+#define MK_SHIFT 0x04
+#define MK_CONTROL 0x08
+#define MK_MBUTTON 0x10
+#define WHEEL_DELTA 120
+#define USER_TIMER_MINIMUM 10
+
+#define VK_LBUTTON 0x01
+#define VK_RBUTTON 0x02
+#define VK_MBUTTON 0x04
+#define VK_BACK 0x08
+#define VK_TAB 0x09
+#define VK_RETURN 0x0D
+#define VK_SHIFT 0x10
+#define VK_CONTROL 0x11
+#define VK_MENU 0x12
+#define VK_CAPITAL 0x14
+#define VK_ESCAPE 0x1B
+#define VK_SPACE 0x20
+#define VK_F10 0x79
+#define VK_LSHIFT 0xA0
+#define VK_RSHIFT 0xA1
+#define VK_LCONTROL 0xA2
+#define VK_RCONTROL 0xA3
+#define VK_LMENU 0xA4
+#define VK_RMENU 0xA5
 
 #define SC_CLOSE 0xF060
 #define SIZE_RESTORED 0
@@ -75,11 +131,13 @@
 #define WS_MINIMIZE 0x20000000u
 #define WS_VISIBLE 0x10000000u
 #define WS_MAXIMIZE 0x01000000u
+#define WS_CAPTION 0x00C00000u
 #define WS_THICKFRAME 0x00040000u
 #define WS_MINIMIZEBOX 0x00020000u
 #define WS_MAXIMIZEBOX 0x00010000u
 #define WS_EX_TOOLWINDOW 0x00000080u
 
+#define CS_DBLCLKS 0x0008
 #define CS_OWNDC 0x0020
 #define CS_CLASSDC 0x0040
 
@@ -218,6 +276,7 @@ struct win {
     int erase;
     struct rect dirty;                  /* surface coordinates drawn on since the last flush */
     HDC own_dc;                         /* CS_OWNDC and CS_CLASSDC */
+    int cursor_sent;                    /* the C_CURSOR kind sent last, plus 1 (0: none yet) */
     int destroying;
 };
 
@@ -367,6 +426,12 @@ static int is_top(const struct win *w)
     return w->cls && !(w->style & WS_CHILD) && !w->message_only;
 }
 
+/* A top-level window the desktop draws a frame round: all but captionless popups. */
+static int framed(const struct win *w)
+{
+    return is_top(w) && !((w->style & WS_POPUP) && (w->style & WS_CAPTION) != WS_CAPTION);
+}
+
 static int win_visible(struct win *w)
 {
     for (int depth = 0; w && depth < 64; depth++) {
@@ -394,8 +459,8 @@ static POINT client_origin(struct win *w)
         if (!w->cls)
             break;
         if (!(w->style & WS_CHILD)) {
-            p.x += w->wr.left + BORDER;
-            p.y += w->wr.top + FRAME_TOP;
+            p.x += w->wr.left + (framed(w) ? BORDER : 0);
+            p.y += w->wr.top + (framed(w) ? FRAME_TOP : 0);
             break;
         }
         p.x += w->wr.left;
@@ -408,7 +473,7 @@ static POINT client_origin(struct win *w)
 /* The frame of a top-level window for its client size (the desktop's frame). */
 static void frame_from_client(struct win *w)
 {
-    if (is_top(w)) {
+    if (framed(w)) {
         w->wr.right = w->wr.left + w->cw + 2 * BORDER;
         w->wr.bottom = w->wr.top + w->ch + FRAME_TOP + BORDER;
     } else {
@@ -429,6 +494,10 @@ static void desktop_window(void)
     w->text = wdup((const uint16_t *)u"", 0);
     desktop_hwnd = w->hwnd;
 }
+
+static HWND focus_hwnd, active_hwnd, capture_hwnd;
+static void deactivate(struct win *top);
+static void forget_input(HWND h);
 
 /* ---- calling window procedures ---- */
 
@@ -561,7 +630,9 @@ static void client_resized(struct win *w, int cw, int ch)
 /* Show w on the desktop. */
 static void desktop_show(struct win *w)
 {
-    int flags = 0, ops = 0;
+    int flags = WF_RIGHTCLICK | WF_ALLBUTTONS, ops = WOP_KEY | WOP_MOUSE | WOP_WHEEL | WOP_FOCUS;
+    if (!framed(w))
+        flags |= WF_BORDERLESS;
     if (w->style & WS_MINIMIZEBOX)
         flags |= WF_MINIMIZE;
     if (w->style & WS_MAXIMIZEBOX)
@@ -585,6 +656,7 @@ static void desktop_show(struct win *w)
         return;
     }
     w->desk_id = id;
+    w->cursor_sent = 0;
     if (w->user_pos)
         gui_move(id, w->wr.left, w->wr.top);
     if (b.w != w->cw || b.h != w->ch)
@@ -679,7 +751,10 @@ static BOOL show_window(struct win *w, int cmd)
         if (!(w = win_get(h)))
             return was;
         w->style &= ~WS_VISIBLE;
-        desktop_hide(w, 1);
+        if (active_hwnd == h)
+            deactivate(w);
+        if ((w = win_get(h)))
+            desktop_hide(w, 1);
         return was;
     }
     /* Minimizing and maximizing (SW_SHOWMINIMIZED, SW_MAXIMIZE...) are the desktop's to do: the
@@ -737,6 +812,7 @@ static BOOL destroy_window(HWND h)
     }
     send0(h, WM_NCDESTROY, 0, 0);
     drop_posted(h);
+    forget_input(h);
     gdi_window_gone(h);
     if (w->own_dc)
         gdi_release_dc(w->own_dc);
@@ -749,6 +825,480 @@ static BOOL destroy_window(HWND h)
     table[i] = NULL;
     free(w);
     return TRUE;
+}
+
+/* ---- input ---- */
+
+static uint8_t key_state[256];          /* as of the messages taken (GetKeyState): 0x80 down, 0x01 toggled */
+static uint8_t post_state[256];         /* as of the messages posted */
+static uint8_t async_state[256];        /* as the desktop last said, for GetAsyncKeyState */
+static uint8_t async_pressed[256];      /* pressed since GetAsyncKeyState last asked */
+static uint8_t pressed_vk[256], async_vk[256];  /* by scan code: the key a press was, for its release */
+static HWND mouse_top;                  /* the top-level window the pointer was last over */
+static POINT cursor_pos;                /* on the screen, as last seen */
+static int cursor_count;                /* ShowCursor's: hidden below 0 */
+static HCURSOR cursor = CURSOR_HANDLE(IDC_ARROW);
+static struct { HWND hwnd; UINT msg; DWORD time; POINT pt; } last_click;
+/* The text the desktop sent with key presses, for TranslateMessage */
+static struct { LPARAM lp; WPARAM vk; uint16_t ch; } typed[16];
+static int ntyped;
+
+/* PS/2 set 1 scan codes (the desktop's key codes) to virtual keys, without the E0 prefix */
+static const uint8_t scan_vk[0x59] = {
+    0, 0x1B, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 0xBD, 0xBB, 0x08, 0x09,
+    'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', 0xDB, 0xDD, 0x0D, 0x11, 'A', 'S',
+    'D', 'F', 'G', 'H', 'J', 'K', 'L', 0xBA, 0xDE, 0xC0, 0x10, 0xDC, 'Z', 'X', 'C', 'V',
+    'B', 'N', 'M', 0xBC, 0xBE, 0xBF, 0x10, 0x6A, 0x12, 0x20, 0x14, 0x70, 0x71, 0x72, 0x73, 0x74,
+    0x75, 0x76, 0x77, 0x78, 0x79, 0x90, 0x91, 0x24, 0x26, 0x21, 0x6D, 0x25, 0x0C, 0x27, 0x6B, 0x23,
+    0x28, 0x22, 0x2D, 0x2E, 0, 0, 0xE2, 0x7A, 0x7B,
+};
+
+/* E0-prefixed keys (the desktop adds 0x80 to their codes) */
+static const uint8_t ext_scan_vk[][2] = {
+    { 0x9C, 0x0D }, { 0x9D, 0x11 }, { 0xB5, 0x6F }, { 0xB7, 0x2C }, { 0xB8, 0x12 }, { 0xC7, 0x24 },
+    { 0xC8, 0x26 }, { 0xC9, 0x21 }, { 0xCB, 0x25 }, { 0xCD, 0x27 }, { 0xCF, 0x23 }, { 0xD0, 0x28 },
+    { 0xD1, 0x22 }, { 0xD2, 0x2D }, { 0xD3, 0x2E }, { 0xDB, 0x5B }, { 0xDC, 0x5C }, { 0xDD, 0x5D },
+    { 0xA0, 0xAD }, { 0xAE, 0xAE }, { 0xB0, 0xAF }, { 0xA2, 0xB3 }, { 0xA4, 0xB2 }, { 0x90, 0xB1 },
+    { 0x99, 0xB0 },
+};
+
+/* The keypad's keys are digits with Num Lock on, which the text the desktop sends tells. */
+static const uint8_t keypad_vk[][2] = {
+    { 0x47, 0x67 }, { 0x48, 0x68 }, { 0x49, 0x69 }, { 0x4B, 0x64 }, { 0x4C, 0x65 }, { 0x4D, 0x66 },
+    { 0x4F, 0x61 }, { 0x50, 0x62 }, { 0x51, 0x63 }, { 0x52, 0x60 }, { 0x53, 0x6E },
+};
+
+static int scan_to_vk(int sc, const char *text, int len)
+{
+    if (sc & 0x80) {
+        for (size_t i = 0; i < sizeof(ext_scan_vk) / sizeof(ext_scan_vk[0]); i++)
+            if (ext_scan_vk[i][0] == sc)
+                return ext_scan_vk[i][1];
+        return 0;
+    }
+    if (len == 1 && ((text[0] >= '0' && text[0] <= '9') || text[0] == '.'))
+        for (size_t i = 0; i < sizeof(keypad_vk) / sizeof(keypad_vk[0]); i++)
+            if (keypad_vk[i][0] == sc)
+                return keypad_vk[i][1];
+    return sc < (int)sizeof(scan_vk) ? scan_vk[sc] : 0;
+}
+
+/* The left or right key of a pair, for one of Shift, Ctrl and Alt (0 for other keys). */
+static int side_vk(int sc, int vk)
+{
+    switch (vk) {
+    case VK_SHIFT: return sc == 0x36 ? VK_RSHIFT : VK_LSHIFT;
+    case VK_CONTROL: return sc == 0x9D ? VK_RCONTROL : VK_LCONTROL;
+    case VK_MENU: return sc == 0xB8 ? VK_RMENU : VK_LMENU;
+    }
+    return 0;
+}
+
+static void set_key(uint8_t *state, int vk, int down)
+{
+    if (down && !(state[vk] & 0x80))
+        state[vk] ^= 1;                 /* every press toggles (Caps Lock's is the one that shows) */
+    state[vk] = (uint8_t)((state[vk] & 1) | (down ? 0x80 : 0));
+}
+
+static void key_change(uint8_t *state, int sc, int vk, int down)
+{
+    int side = side_vk(sc, vk);
+    if (!side) {
+        set_key(state, vk, down);
+        return;
+    }
+    set_key(state, side, down);
+    int pair = vk == VK_SHIFT ? VK_LSHIFT : vk == VK_CONTROL ? VK_LCONTROL : VK_LMENU;
+    set_key(state, vk, ((state[pair] | state[pair + 1]) & 0x80) != 0);
+}
+
+static void release_all(uint8_t *state)
+{
+    for (int i = 0; i < 256; i++)
+        state[i] &= 1;
+}
+
+static void set_buttons(uint8_t *state, int buttons)
+{
+    set_key(state, VK_LBUTTON, buttons & MOUSE_LEFT);
+    set_key(state, VK_RBUTTON, buttons & MOUSE_RIGHT);
+    set_key(state, VK_MBUTTON, buttons & MOUSE_MIDDLE);
+}
+
+/* The one character a key's text is, if it is printable: else 0. */
+static uint16_t typed_char(const char *text, int len)
+{
+    uint16_t w[4];
+    if (len <= 0 || len > 4)
+        return 0;
+    int n = utf8_to_wide(text, len, w, 4);
+    return n == 1 && w[0] >= 0x20 && w[0] != 0x7F ? w[0] : 0;
+}
+
+/* The character a key makes on a US keyboard with these keys held, or 0. */
+static uint16_t vk_char(int vk, const uint8_t *state)
+{
+    static const struct { uint8_t vk; char plain, shifted; } oem[] = {
+        { 0xBA, ';', ':' }, { 0xBB, '=', '+' }, { 0xBC, ',', '<' }, { 0xBD, '-', '_' }, { 0xBE, '.', '>' },
+        { 0xBF, '/', '?' }, { 0xC0, '`', '~' }, { 0xDB, '[', '{' }, { 0xDC, '\\', '|' }, { 0xDD, ']', '}' },
+        { 0xDE, '\'', '"' }, { 0xE2, '\\', '|' },
+    };
+    int shift = (state[VK_SHIFT] & 0x80) != 0, ctrl = (state[VK_CONTROL] & 0x80) != 0;
+    int alt = (state[VK_MENU] & 0x80) != 0, caps = state[VK_CAPITAL] & 1;
+    if (ctrl && !alt) {
+        if (vk >= 'A' && vk <= 'Z')
+            return (uint16_t)(vk - 'A' + 1);
+        switch (vk) {
+        case 0xDB: return 27;
+        case 0xDC: return 28;
+        case 0xDD: return 29;
+        case VK_BACK: return 127;
+        case VK_RETURN: return 10;
+        case VK_SPACE: return ' ';
+        }
+        return 0;
+    }
+    switch (vk) {
+    case VK_BACK: case VK_TAB: case VK_RETURN: case VK_ESCAPE: case VK_SPACE:
+        return (uint16_t)vk;
+    case 0x6A: return '*';
+    case 0x6B: return '+';
+    case 0x6D: return '-';
+    case 0x6E: return '.';
+    case 0x6F: return '/';
+    }
+    if (vk >= 'A' && vk <= 'Z')
+        return (uint16_t)(shift ^ caps ? vk : vk + 32);
+    if (vk >= '0' && vk <= '9')
+        return (uint16_t)(shift ? ")!@#$%^&*("[vk - '0'] : vk);
+    if (vk >= 0x60 && vk <= 0x69)
+        return (uint16_t)('0' + vk - 0x60);
+    for (size_t i = 0; i < sizeof(oem) / sizeof(oem[0]); i++)
+        if (oem[i].vk == vk)
+            return (uint16_t)(shift ? oem[i].shifted : oem[i].plain);
+    return 0;
+}
+
+static uint32_t mk_flags(void)
+{
+    return (post_state[VK_LBUTTON] & 0x80 ? MK_LBUTTON : 0) | (post_state[VK_RBUTTON] & 0x80 ? MK_RBUTTON : 0) |
+           (post_state[VK_MBUTTON] & 0x80 ? MK_MBUTTON : 0) | (post_state[VK_SHIFT] & 0x80 ? MK_SHIFT : 0) |
+           (post_state[VK_CONTROL] & 0x80 ? MK_CONTROL : 0);
+}
+
+/* A key or mouse message taken from the queue: GetKeyState says so from now on. */
+static void took_input(const struct msg *m)
+{
+    if (m->message >= WM_KEYDOWN && m->message <= WM_SYSKEYUP && m->message != WM_CHAR &&
+        m->message != WM_SYSCHAR && m->message != 0x0103) {
+        int sc = (int)(m->lparam >> 16 & 0x7F) | (m->lparam & 1u << 24 ? 0x80 : 0);
+        key_change(key_state, sc, (int)(m->wparam & 0xFF), m->message == WM_KEYDOWN || m->message == WM_SYSKEYDOWN);
+    } else if (m->message >= WM_MOUSEMOVE && m->message <= 0x0209) {
+        set_key(key_state, VK_LBUTTON, m->wparam & MK_LBUTTON);
+        set_key(key_state, VK_RBUTTON, m->wparam & MK_RBUTTON);
+        set_key(key_state, VK_MBUTTON, m->wparam & MK_MBUTTON);
+    }
+}
+
+static int post(uint32_t tid, HWND h, UINT msg, WPARAM wp, LPARAM lp);
+static struct queue *queue_for(uint32_t tid);
+
+void user32_input_arrived(const struct wm_msg *m)
+{
+    if (m->type == S_KEY && wm_payload_len(m) >= sizeof(struct input_event)) {
+        const struct input_event *ev = wm_payload(m);
+        int sc = ev->code & 0xFF, down = ev->flags & IEV_PRESSED;
+        int vk = down ? scan_to_vk(sc, ev->text, ev->len) : async_vk[sc];
+        if (down)
+            async_vk[sc] = (uint8_t)vk;
+        if (vk) {
+            if (down && !(async_state[vk] & 0x80))
+                async_pressed[vk] = 1;
+            key_change(async_state, sc, vk, down);
+        }
+    } else if (m->type == S_MOUSE && wm_payload_len(m) >= sizeof(struct wm_mouse_event)) {
+        const struct wm_mouse_event *me = wm_payload(m);
+        if (me->changed & me->buttons & MOUSE_LEFT)
+            async_pressed[VK_LBUTTON] = 1;
+        if (me->changed & me->buttons & MOUSE_RIGHT)
+            async_pressed[VK_RBUTTON] = 1;
+        if (me->changed & me->buttons & MOUSE_MIDDLE)
+            async_pressed[VK_MBUTTON] = 1;
+        set_buttons(async_state, me->buttons);
+    }
+}
+
+static void key_event(struct win *top, const struct input_event *ev)
+{
+    int sc = ev->code & 0xFF, down = ev->flags & IEV_PRESSED;
+    int vk = down ? scan_to_vk(sc, ev->text, ev->len) : pressed_vk[sc];
+    if (down)
+        pressed_vk[sc] = (uint8_t)vk;
+    if (!vk)
+        return;
+    int was = post_state[vk] & 0x80;
+    key_change(post_state, sc, vk, down);
+    int alt = (post_state[VK_MENU] & 0x80) != 0, ctrl = (post_state[VK_CONTROL] & 0x80) != 0;
+    int sys = (alt && !ctrl) || vk == VK_F10;
+    UINT msg = down ? (sys ? WM_SYSKEYDOWN : WM_KEYDOWN) : (sys ? WM_SYSKEYUP : WM_KEYUP);
+    LPARAM lp = 1 | (uint32_t)(sc & 0x7F) << 16 | (sc & 0x80 ? 1u << 24 : 0) | (alt ? 1u << 29 : 0) |
+                (down ? (was ? 1u << 30 : 0) : 3u << 30);
+    struct win *f = win_get(focus_hwnd);
+    HWND target = f && top_of(f) == top ? focus_hwnd : top->hwnd;
+    post(top->tid, target, msg, (WPARAM)vk, lp);
+    uint16_t ch = down ? typed_char(ev->text, ev->len) : 0;
+    if (ch) {
+        if (ntyped == (int)(sizeof(typed) / sizeof(typed[0]))) {
+            memmove(typed, typed + 1, sizeof(typed) - sizeof(typed[0]));
+            ntyped--;
+        }
+        typed[ntyped].lp = lp;
+        typed[ntyped].vk = (WPARAM)vk;
+        typed[ntyped++].ch = ch;
+    }
+}
+
+static enum cursor_kind cursor_kind_of(HCURSOR h)
+{
+    switch (h & 0xFFFF) {
+    case 32513: return CUR_IBEAM;
+    case 32514: case 32650: return CUR_BUSY;    /* IDC_WAIT, IDC_APPSTARTING */
+    case 32515: return CUR_CROSS;
+    case 32642: return CUR_NWSE;
+    case 32643: return CUR_NESW;
+    case 32644: return CUR_EW;
+    case 32645: return CUR_NS;
+    case 32646: return CUR_MOVE4;
+    case 32648: return CUR_NO;
+    case 32649: return CUR_HAND;
+    case 32651: return CUR_HELP;
+    }
+    return CUR_ARROW;
+}
+
+/* Show the pointer SetCursor and ShowCursor asked for over the window it is over. */
+static void apply_cursor(void)
+{
+    struct win *t = win_get(mouse_top);
+    if (!t || !t->desk_id)
+        return;
+    int kind = cursor_count < 0 || !cursor ? CUR_HIDDEN : (int)cursor_kind_of(cursor);
+    if (t->cursor_sent == kind + 1)
+        return;
+    t->cursor_sent = kind + 1;
+    gui_cursor(t->desk_id, kind);
+}
+
+/* Mouse messages: posted to the capture, or else the window the pointer is over. */
+static void post_mouse(struct win *t, UINT msg, LPARAM lp)
+{
+    struct queue *q = queue_for(t->tid);
+    if (msg == WM_MOUSEMOVE && q->tail && q->tail->m.message == WM_MOUSEMOVE && q->tail->m.hwnd == t->hwnd) {
+        q->tail->m.wparam = mk_flags();     /* moves not taken yet come together */
+        q->tail->m.lparam = lp;
+        q->tail->m.time = os_ticks_ms();
+        q->tail->m.pt = cursor_pos;
+        return;
+    }
+    post(t->tid, t->hwnd, msg, mk_flags(), lp);
+    if (q->tail)
+        q->tail->m.pt = cursor_pos;
+}
+
+static void mouse_event(struct win *top, const struct wm_mouse_event *me)
+{
+    POINT o = client_origin(top);
+    cursor_pos = (POINT){ o.x + me->x, o.y + me->y };
+    mouse_top = top->hwnd;
+    set_buttons(post_state, me->buttons);
+    apply_cursor();
+    static const int buttons[3] = { MOUSE_LEFT, MOUSE_RIGHT, MOUSE_MIDDLE };
+    static const UINT downs[3] = { WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN };
+    int any = 0;
+    for (int i = 0; i < 3 || (!any && i == 3); i++) {
+        UINT msg;
+        if (i == 3) {
+            msg = WM_MOUSEMOVE;
+        } else if (me->changed & buttons[i]) {
+            msg = (me->buttons & buttons[i]) ? downs[i] : downs[i] + 1;
+            any = 1;
+        } else {
+            continue;
+        }
+        struct win *t = win_get(capture_hwnd);
+        if (!t || !t->cls)
+            t = win_get(mouse_top);
+        if (!t)
+            return;
+        HWND h = t->hwnd;
+        POINT to = client_origin(t);
+        int x = cursor_pos.x - to.x, y = cursor_pos.y - to.y;
+        if (i < 3 && msg == downs[i]) {
+            uint32_t now = os_ticks_ms();
+            if ((t->cls->style & CS_DBLCLKS) && last_click.hwnd == h && last_click.msg == msg &&
+                now - last_click.time <= mouse_dblclick_ms() && abs(cursor_pos.x - last_click.pt.x) <= 2 &&
+                abs(cursor_pos.y - last_click.pt.y) <= 2) {
+                msg += 2;               /* WM_?BUTTONDBLCLK */
+                last_click.hwnd = 0;
+            } else {
+                last_click.hwnd = h;
+                last_click.msg = msg;
+                last_click.time = now;
+                last_click.pt = cursor_pos;
+            }
+        }
+        if (!capture_hwnd && (msg == WM_MOUSEMOVE || msg == downs[0] || msg == downs[1] || msg == downs[2])) {
+            send0(h, WM_SETCURSOR, h, makelong(HTCLIENT, (int)msg));
+            if (!(t = win_get(h)))
+                return;
+        }
+        post_mouse(t, msg, makelong(x, y));
+    }
+}
+
+static void wheel_event(struct win *top, int steps)
+{
+    struct win *f = win_get(focus_hwnd);
+    struct win *t = f && top_of(f) == top ? f : top;
+    post(t->tid, t->hwnd, WM_MOUSEWHEEL, makelong((int)mk_flags(), steps * WHEEL_DELTA),
+         makelong(cursor_pos.x, cursor_pos.y));
+}
+
+static HWND set_focus(HWND h);
+
+/* Make top the active window (and tell the desktop, unless it said so itself). */
+static void activate(struct win *top, int from_desktop)
+{
+    HWND h = top->hwnd, old = active_hwnd;
+    if (!from_desktop && top->desk_id)
+        gui_focus(top->desk_id);
+    if (old == h)
+        return;
+    if (old && win_get(old)) {
+        send0(old, WM_NCACTIVATE, FALSE, 0);
+        send0(old, WM_ACTIVATE, WA_INACTIVE, h);
+    } else {
+        send0(h, WM_ACTIVATEAPP, TRUE, 0);
+    }
+    active_hwnd = h;
+    if (!win_get(h))
+        return;
+    send0(h, WM_NCACTIVATE, TRUE, 0);
+    send0(h, WM_ACTIVATE, WA_ACTIVE, old);
+}
+
+static void deactivate(struct win *top)
+{
+    HWND h = top->hwnd;
+    if (active_hwnd != h)
+        return;
+    active_hwnd = 0;
+    send0(h, WM_NCACTIVATE, FALSE, 0);
+    send0(h, WM_ACTIVATE, WA_INACTIVE, 0);
+    set_focus(0);
+    send0(h, WM_ACTIVATEAPP, FALSE, 0);
+    /* keys let go of elsewhere are never heard of */
+    release_all(key_state);
+    release_all(post_state);
+    release_all(async_state);
+}
+
+static HWND set_focus(HWND h)
+{
+    HWND old = focus_hwnd;
+    if (h) {
+        struct win *w = win_get(h);
+        if (!w || !w->cls)
+            FAIL(ERROR_INVALID_WINDOW_HANDLE);
+        struct win *top = top_of(w);
+        if (top && top->hwnd != active_hwnd)
+            activate(top, 0);
+        old = focus_hwnd;
+    }
+    if (old == h)
+        return old;
+    focus_hwnd = h;
+    if (old && win_get(old))
+        send0(old, WM_KILLFOCUS, h, 0);
+    if (h && focus_hwnd == h && win_get(h))
+        send0(h, WM_SETFOCUS, old, 0);
+    return old;
+}
+
+/* ---- timers ---- */
+
+#define MAX_TIMERS 256
+
+struct timer {
+    HWND hwnd;
+    uint32_t id, interval, due, tid;
+    gp_t proc;
+};
+
+static struct timer timers[MAX_TIMERS];
+static int ntimers;
+static uint32_t next_timer_id = 0x7FF0;
+
+static struct timer *timer_find(HWND h, uint32_t id)
+{
+    for (int i = 0; i < ntimers; i++)
+        if (timers[i].hwnd == h && timers[i].id == id)
+            return &timers[i];
+    return NULL;
+}
+
+static void timer_remove(struct timer *t)
+{
+    *t = timers[--ntimers];
+}
+
+/* Milliseconds until a timer of the thread is due (0: one is), or -1 for none. */
+static int next_timer_ms(uint32_t tid)
+{
+    uint32_t now = os_ticks_ms();
+    int best = -1;
+    for (int i = 0; i < ntimers; i++) {
+        if (timers[i].tid != tid)
+            continue;
+        int left = (int)(timers[i].due - now);
+        if (left < 0)
+            left = 0;
+        if (best < 0 || left < best)
+            best = left;
+    }
+    return best;
+}
+
+/* A timer of the thread that is due, for a message filtered by hwnd. */
+static int for_filter(HWND msg_hwnd, HWND filter);
+static struct timer *timer_due(uint32_t tid, HWND filter)
+{
+    uint32_t now = os_ticks_ms();
+    for (int i = 0; i < ntimers; i++)
+        if (timers[i].tid == tid && (int)(timers[i].due - now) <= 0 && for_filter(timers[i].hwnd, filter))
+            return &timers[i];
+    return NULL;
+}
+
+/* A window going: nothing of the input or the timers may point at it. */
+static void forget_input(HWND h)
+{
+    if (focus_hwnd == h)
+        focus_hwnd = 0;
+    if (active_hwnd == h)
+        active_hwnd = 0;
+    if (capture_hwnd == h)
+        capture_hwnd = 0;
+    if (mouse_top == h)
+        mouse_top = 0;
+    if (last_click.hwnd == h)
+        last_click.hwnd = 0;
+    for (int i = 0; i < ntimers; )
+        if (timers[i].hwnd == h)
+            timer_remove(&timers[i]);
+        else
+            i++;
 }
 
 /* ---- what the desktop says ---- */
@@ -805,6 +1355,26 @@ static void desktop_event(const struct wm_msg *m)
     }
     case S_CLOSE:
         send0(h, WM_SYSCOMMAND, SC_CLOSE, 0);
+        break;
+    case S_KEY:
+        if (n >= sizeof(struct input_event))
+            key_event(w, p);
+        break;
+    case S_MOUSE:
+        if (n >= sizeof(struct wm_mouse_event))
+            mouse_event(w, p);
+        break;
+    case S_WHEEL:
+        if (n >= sizeof(struct wm_int))
+            wheel_event(w, ((const struct wm_int *)p)->value);
+        break;
+    case S_FOCUS:
+        if (n < sizeof(struct wm_int))
+            break;
+        if (((const struct wm_int *)p)->value)
+            activate(w, 1);
+        else
+            deactivate(w);
         break;
     case S_RESTYLE:
         invalidate_all(w);
@@ -968,6 +1538,27 @@ static LRESULT def_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp, int unicode)
         return TRUE;
     case WM_NCHITTEST:
         return HTCLIENT;
+    case WM_SETCURSOR:
+        /* a child's parent may say first; then the class cursor, over the client area */
+        if ((w->style & WS_CHILD) && w->parent && send0(w->parent, WM_SETCURSOR, wp, lp))
+            return TRUE;
+        if ((w = win_get(h)) && (lp & 0xFFFF) == HTCLIENT && w->cls && w->cls->cursor) {
+            cursor = w->cls->cursor;
+            apply_cursor();
+            return TRUE;
+        }
+        return FALSE;
+    case WM_ACTIVATE:
+        if ((wp & 0xFFFF) != WA_INACTIVE && !w->minimized) {
+            struct win *f = win_get(focus_hwnd);
+            if (!f || top_of(f) != w)
+                set_focus(h);
+        }
+        return 0;
+    case WM_MOUSEWHEEL:
+        if ((w->style & WS_CHILD) && w->parent)
+            return send_message(w->parent, msg, wp, lp, unicode);
+        return 0;
     case WM_MOUSEACTIVATE:
         return MA_ACTIVATE;
     case WM_NOTIFYFORMAT:
@@ -1027,6 +1618,7 @@ static int next_message(struct msg *out, HWND filter, UINT lo, UINT hi, int remo
                 continue;
             *out = m->m;
             if (remove) {
+                took_input(&m->m);
                 *pp = m->next;
                 if (q->tail == m)
                     q->tail = prev;
@@ -1051,36 +1643,73 @@ static int next_message(struct msg *out, HWND filter, UINT lo, UINT hi, int remo
                 }
             }
         }
+        if (in_range(WM_TIMER, lo, hi)) {
+            struct timer *t = timer_due(tid, filter);
+            if (t) {
+                *out = (struct msg){ t->hwnd, WM_TIMER, t->id, t->proc, os_ticks_ms(), cursor_pos };
+                if (remove)
+                    t->due = os_ticks_ms() + t->interval;   /* expirations missed meanwhile are one */
+                return 1;
+            }
+        }
         if (!block)
             return 0;
-        if (gui_connected)
-            gui_pump(1);
-        else
-            gui_wait_ms(-1);
+        if (!gui_pump(0))
+            gui_wait_ms(next_timer_ms(tid));
     }
 }
 
-static uint32_t get_message(uint32_t *a)
+/* Is there anything for this thread to take (MsgWaitForMultipleObjects)? */
+static int input_waiting(uint32_t tid)
+{
+    struct queue *q = queue_for(tid);
+    if (q->head || q->quit || timer_due(tid, 0))
+        return 1;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        struct win *w = table[i];
+        if (w && w->cls && w->tid == tid && !rect_is_empty(&w->update) && !w->minimized && win_visible(w))
+            return 1;
+    }
+    return 0;
+}
+
+/* A character for GetMessageA: Latin-1, or '?' */
+static void ansi_message(struct msg *m, int unicode)
+{
+    if (!unicode && (m->message == WM_CHAR || m->message == WM_SYSCHAR) && m->wparam > 0xFF)
+        m->wparam = '?';
+}
+
+static uint32_t get_message(uint32_t *a, int unicode)
 {
     if (A(1) && A(1) != 0xFFFFFFFFu && !win_get(A(1)))
         { SETERR(ERROR_INVALID_WINDOW_HANDLE); return (uint32_t)-1; }
     struct msg m;
     next_message(&m, A(1), A(2), A(3), 1, 1);
+    ansi_message(&m, unicode);
     *(struct msg *)P(0) = m;
     return m.message != WM_QUIT;
 }
 
-static uint32_t peek_message(uint32_t *a)
+static uint32_t peek_message(uint32_t *a, int unicode)
 {
     struct msg m;
     if (!next_message(&m, A(1), A(2), A(3), A(4) & PM_REMOVE, 0))
         return FALSE;
+    ansi_message(&m, unicode);
     *(struct msg *)P(0) = m;
     return TRUE;
 }
 
 static LRESULT dispatch_message(const struct msg *m, int unicode)
 {
+    if (m->message == WM_TIMER && m->lparam) {
+        /* a timer procedure: only one SetTimer was given */
+        struct timer *t = timer_find(m->hwnd, m->wparam);
+        if (t && t->proc == m->lparam)
+            call_guest4(t->proc, m->hwnd, WM_TIMER, m->wparam, os_ticks_ms());
+        return 0;
+    }
     if (!m->hwnd)
         return 0;
     struct win *w = win_get(m->hwnd);
@@ -1326,8 +1955,8 @@ static HWND create_window(uint32_t *a, int unicode)
             width = work_w * 3 / 4;
             height = work_h * 3 / 4;
         }
-        w->cw = width - 2 * BORDER;
-        w->ch = height - FRAME_TOP - BORDER;
+        w->cw = width - (framed(w) ? 2 * BORDER : 0);
+        w->ch = height - (framed(w) ? FRAME_TOP + BORDER : 0);
     } else {
         if ((uint32_t)x == CW_USEDEFAULT)
             x = y = 0;
@@ -1416,7 +2045,7 @@ static BOOL set_window_pos(struct win *w, int x, int y, int cx, int cy, uint32_t
     }
     if (!(flags & SWP_NOSIZE)) {
         int ncw = cx, nch = cy;
-        if (is_top(w)) {
+        if (framed(w)) {
             ncw -= 2 * BORDER;
             nch -= FRAME_TOP + BORDER;
         }
@@ -1476,23 +2105,54 @@ DEF(GetParent)
 
 /* ---- messages ---- */
 
-DEF(GetMessageA) { return get_message(a); }
-DEF(GetMessageW) { return get_message(a); }
-DEF(PeekMessageA) { return peek_message(a); }
-DEF(PeekMessageW) { return peek_message(a); }
+DEF(GetMessageA) { return get_message(a, 0); }
+DEF(GetMessageW) { return get_message(a, 1); }
+DEF(PeekMessageA) { return peek_message(a, 0); }
+DEF(PeekMessageW) { return peek_message(a, 1); }
 DEF(WaitMessage)
 {
     (void)a;
     struct msg m;
-    if (!next_message(&m, 0, 0, 0, 0, 0)) {
-        if (gui_connected)
-            gui_pump(1);
-        else
-            gui_wait_ms(-1);
-    }
+    while (!next_message(&m, 0, 0, 0, 0, 0))
+        if (!gui_pump(0))
+            gui_wait_ms(next_timer_ms(cur_tid()));
     return TRUE;
 }
-DEF(TranslateMessage) { (void)a; return FALSE; }   /* keys come with stage 1 */
+
+/* WM_CHAR (or WM_SYSCHAR) for a key press, next in the queue: the text the desktop sent with the
+ * key, or else the US layout's character. */
+DEF(TranslateMessage)
+{
+    const struct msg *m = P(0);
+    if (m->message == WM_KEYUP || m->message == WM_SYSKEYUP)
+        return TRUE;
+    if (m->message != WM_KEYDOWN && m->message != WM_SYSKEYDOWN)
+        return FALSE;
+    uint16_t ch = 0;
+    for (int i = ntyped - 1; i >= 0; i--) {
+        if (typed[i].lp == m->lparam && typed[i].vk == m->wparam) {
+            ch = typed[i].ch;
+            memmove(&typed[i], &typed[i + 1], (size_t)(ntyped - i - 1) * sizeof(typed[0]));
+            ntyped--;
+            break;
+        }
+    }
+    if (!ch)
+        ch = vk_char((int)m->wparam, key_state);
+    if (!ch)
+        return TRUE;
+    struct queue *q = queue_for(cur_tid());
+    struct qmsg *c = calloc(1, sizeof(*c));
+    if (!c)
+        return TRUE;
+    c->m = (struct msg){ m->hwnd, m->message == WM_KEYDOWN ? WM_CHAR : WM_SYSCHAR, ch, m->lparam, m->time, m->pt };
+    c->next = q->head;
+    q->head = c;
+    if (!q->tail)
+        q->tail = c;
+    q->count++;
+    return TRUE;
+}
 DEF(DispatchMessageA) { return dispatch_message(P(0), 0); }
 DEF(DispatchMessageW) { return dispatch_message(P(0), 1); }
 
@@ -1780,11 +2440,10 @@ DEF(GetSystemMetrics)
     return 0;
 }
 
-#define WS_CHILD_STYLE WS_CHILD
 static BOOL adjust_rect(RECT *r, uint32_t style)
 {
-    if (style & WS_CHILD_STYLE)
-        return TRUE;
+    if ((style & WS_CHILD) || ((style & WS_POPUP) && (style & WS_CAPTION) != WS_CAPTION))
+        return TRUE;                    /* no frame: see framed() */
     r->left -= BORDER;
     r->right += BORDER;
     r->top -= FRAME_TOP;
@@ -1811,6 +2470,237 @@ DEF(SystemParametersInfoA)
 }
 DEF(SystemParametersInfoW) { return api_SystemParametersInfoA(a); }
 
+/* ---- keys ---- */
+
+static uint32_t key_short(uint8_t k, int pressed)
+{
+    return (uint32_t)(int32_t)(int16_t)((k & 0x80 ? 0x8000 : 0) | pressed);
+}
+
+DEF(GetKeyState) { return key_short(key_state[A(0) & 0xFF], key_state[A(0) & 0xFF] & 1); }
+
+DEF(GetAsyncKeyState)
+{
+    gui_pump(0);                        /* what the desktop has sent, even if not yet taken */
+    int vk = (int)(A(0) & 0xFF), pressed = async_pressed[vk];
+    async_pressed[vk] = 0;
+    return key_short(async_state[vk], pressed);
+}
+
+DEF(GetKeyboardState) { memcpy(P(0), key_state, 256); return TRUE; }
+DEF(SetKeyboardState) { memcpy(key_state, P(0), 256); return TRUE; }
+
+static uint32_t map_virtual_key(uint32_t code, uint32_t type)
+{
+    switch (type) {
+    case 0: case 4:                     /* MAPVK_VK_TO_VSC(_EX) */
+        switch (code) {
+        case VK_SHIFT: case VK_LSHIFT: return 0x2A;
+        case VK_RSHIFT: return 0x36;
+        case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL: return 0x1D;
+        case VK_MENU: case VK_LMENU: case VK_RMENU: return 0x38;
+        }
+        for (uint32_t i = 1; i < sizeof(scan_vk); i++)
+            if (scan_vk[i] == code)
+                return i;
+        for (size_t i = 0; i < sizeof(keypad_vk) / sizeof(keypad_vk[0]); i++)
+            if (keypad_vk[i][1] == code)
+                return keypad_vk[i][0];
+        for (size_t i = 0; i < sizeof(ext_scan_vk) / sizeof(ext_scan_vk[0]); i++)
+            if (ext_scan_vk[i][1] == code)
+                return (type == 4 ? 0xE000u : 0) | (ext_scan_vk[i][0] & 0x7Fu);
+        return 0;
+    case 1: case 3: {                   /* MAPVK_VSC_TO_VK(_EX) */
+        uint32_t vk = code < sizeof(scan_vk) ? scan_vk[code] : 0;
+        if (type == 3 && (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU))
+            vk = (uint32_t)side_vk((int)code, (int)vk);
+        return vk;
+    }
+    case 2: {                           /* MAPVK_VK_TO_CHAR: unshifted, letters in capitals */
+        static const uint8_t none[256];
+        if (code >= 'A' && code <= 'Z')
+            return code;
+        return vk_char((int)code, none);
+    }
+    }
+    return 0;
+}
+
+DEF(MapVirtualKeyA) { return map_virtual_key(A(0), A(1)); }
+DEF(MapVirtualKeyW) { return map_virtual_key(A(0), A(1)); }
+DEF(MapVirtualKeyExA) { return map_virtual_key(A(0), A(1)); }
+DEF(MapVirtualKeyExW) { return map_virtual_key(A(0), A(1)); }
+
+/* ToAscii and ToUnicode: what the key makes with the keys held as the program says. */
+static uint32_t to_char(uint32_t *a, int wide)
+{
+    if (A(1) & 0x8000)
+        return 0;                       /* a release */
+    uint16_t ch = vk_char((int)A(0), A(2) ? (const uint8_t *)P(2) : key_state);
+    if (!ch)
+        return 0;
+    if (wide)
+        *(uint16_t *)P(3) = ch;
+    else
+        *(uint16_t *)P(3) = ch < 256 ? ch : '?';
+    return 1;
+}
+
+DEF(ToAscii) { return to_char(a, 0); }
+DEF(ToAsciiEx) { return to_char(a, 0); }
+DEF(ToUnicode) { return to_char(a, 1); }
+DEF(ToUnicodeEx) { return to_char(a, 1); }
+
+/* ---- the mouse ---- */
+
+DEF(SetCapture)
+{
+    HWND old = capture_hwnd;
+    if (!win_get(A(0)))
+        return old;
+    capture_hwnd = A(0);
+    if (old && old != A(0) && win_get(old))
+        send0(old, WM_CAPTURECHANGED, 0, A(0));
+    return old;
+}
+
+DEF(ReleaseCapture)
+{
+    (void)a;
+    HWND old = capture_hwnd;
+    capture_hwnd = 0;
+    if (old && win_get(old))
+        send0(old, WM_CAPTURECHANGED, 0, 0);
+    return TRUE;
+}
+
+DEF(GetCapture) { (void)a; return capture_hwnd; }
+DEF(GetCursorPos) { *(POINT *)P(0) = cursor_pos; return TRUE; }
+/* The desktop moves the pointer only for the mouse: this is what GetCursorPos says till it moves. */
+DEF(SetCursorPos) { cursor_pos = (POINT){ (int32_t)A(0), (int32_t)A(1) }; return TRUE; }
+DEF(ClipCursor) { (void)a; return TRUE; }
+DEF(GetClipCursor) { *(RECT *)P(0) = (RECT){ 0, 0, gui_screen_w(), gui_screen_h() }; return TRUE; }
+DEF(SetCursor) { HCURSOR old = cursor; cursor = A(0); apply_cursor(); return old; }
+DEF(GetCursor) { (void)a; return cursor; }
+DEF(ShowCursor) { cursor_count += A(0) ? 1 : -1; apply_cursor(); return (uint32_t)cursor_count; }
+
+static int point_map(HWND h, POINT *p, int to_screen)
+{
+    struct win *w = win_get(h);
+    if (!w)
+        FAIL(ERROR_INVALID_WINDOW_HANDLE);
+    POINT o = client_origin(w);
+    p->x += to_screen ? o.x : -o.x;
+    p->y += to_screen ? o.y : -o.y;
+    return TRUE;
+}
+
+DEF(ClientToScreen) { return point_map(A(0), P(1), 1); }
+DEF(ScreenToClient) { return point_map(A(0), P(1), 0); }
+
+DEF(MapWindowPoints)
+{
+    POINT from = { 0, 0 }, to = { 0, 0 };
+    struct win *w;
+    if (A(0) && (w = win_get(A(0))))
+        from = client_origin(w);
+    if (A(1) && (w = win_get(A(1))))
+        to = client_origin(w);
+    int dx = from.x - to.x, dy = from.y - to.y;
+    POINT *p = P(2);
+    for (uint32_t i = 0; i < A(3); i++) {
+        p[i].x += dx;
+        p[i].y += dy;
+    }
+    return makelong(dx, dy);
+}
+
+/* ---- focus ---- */
+
+DEF(SetFocus) { return set_focus(A(0)); }
+DEF(GetFocus) { (void)a; return focus_hwnd; }
+DEF(GetActiveWindow) { (void)a; return active_hwnd; }
+DEF(GetForegroundWindow) { (void)a; return active_hwnd; }
+
+static HWND activate_api(HWND h)
+{
+    struct win *w = win_get(h);
+    HWND old = active_hwnd;
+    if (!w || !w->cls)
+        FAIL(ERROR_INVALID_WINDOW_HANDLE);
+    if ((w = top_of(w)))
+        activate(w, 0);
+    return old;
+}
+
+DEF(SetActiveWindow) { return activate_api(A(0)); }
+DEF(SetForegroundWindow) { return activate_api(A(0)) || active_hwnd == A(0); }
+
+/* ---- timers ---- */
+
+DEF(SetTimer)
+{
+    HWND h = A(0);
+    uint32_t id = A(1), ms = A(2);
+    if (h && !win_get(h))
+        FAIL(ERROR_INVALID_WINDOW_HANDLE);
+    if (ms < USER_TIMER_MINIMUM)
+        ms = USER_TIMER_MINIMUM;
+    if (ms > 0x7FFFFFFF)
+        ms = 0x7FFFFFFF;
+    struct timer *t = h || id ? timer_find(h, id) : NULL;
+    if (!t) {
+        if (ntimers == MAX_TIMERS)
+            FAIL(ERROR_NOT_ENOUGH_MEMORY);
+        t = &timers[ntimers++];
+        if (!h)
+            id = next_timer_id++;
+    }
+    *t = (struct timer){ h, id, ms, os_ticks_ms() + ms, h ? win_get(h)->tid : cur_tid(), A(3) };
+    return id ? id : 1;
+}
+
+DEF(KillTimer)
+{
+    struct timer *t = timer_find(A(0), A(1));
+    if (!t)
+        FAIL(ERROR_INVALID_PARAMETER);
+    timer_remove(t);
+    return TRUE;
+}
+
+/* Wait for one of the handles, or for something in the queue, or the time to run out. */
+static uint32_t msg_wait(uint32_t n, gp_t handles, int all, uint32_t ms)
+{
+    uint32_t start = os_ticks_ms(), tid = cur_tid();
+    const struct api_entry *wfmo = n ? api_find(&kernel32_dll, "WaitForMultipleObjects") : NULL;
+    for (;;) {
+        if (wfmo) {
+            uint32_t args[4] = { n, handles, (uint32_t)all, 0 };
+            uint32_t r = wfmo->fn(args);
+            if (r != WAIT_TIMEOUT)
+                return r;
+        }
+        gui_flush();
+        desktop_events();
+        if (input_waiting(tid))
+            return WAIT_OBJECT_0 + n;
+        uint32_t spent = os_ticks_ms() - start;
+        if (ms != INFINITE && spent >= ms)
+            return WAIT_TIMEOUT;
+        int wait = ms == INFINITE ? -1 : (int)(ms - spent), t = next_timer_ms(tid);
+        if (t >= 0 && (wait < 0 || t < wait))
+            wait = t;
+        if (n && (wait < 0 || wait > 10))
+            wait = 10;                  /* the handles are looked at again */
+        if (!gui_pump(0))
+            gui_wait_ms(wait);
+    }
+}
+
+DEF(MsgWaitForMultipleObjects) { return msg_wait(A(0), A(1), A(2) != 0, A(3)); }
+DEF(MsgWaitForMultipleObjectsEx) { return msg_wait(A(0), A(1), (A(4) & 1) != 0, A(2)); }
+
 static void user32_init(void)
 {
     if (!gui_connected)
@@ -1823,6 +2713,8 @@ static const struct api_entry user32_entries[] = {
     API(BeginPaint, 2),
     API(CallWindowProcA, 5),
     API(CallWindowProcW, 5),
+    API(ClientToScreen, 2),
+    API(ClipCursor, 1),
     API(CreateWindowExA, 12),
     API(CreateWindowExW, 12),
     API(DefWindowProcA, 4),
@@ -1833,6 +2725,9 @@ static const struct api_entry user32_entries[] = {
     API(DispatchMessageA, 1),
     API(DispatchMessageW, 1),
     API(EndPaint, 2),
+    API(GetActiveWindow, 0),
+    API(GetAsyncKeyState, 1),
+    API(GetCapture, 0),
     API(GetClassInfoA, 3),
     API(GetClassInfoExA, 3),
     API(GetClassInfoExW, 3),
@@ -1842,8 +2737,15 @@ static const struct api_entry user32_entries[] = {
     ALIAS(GetClassLongPtrW, GetClassLongW),
     API(GetClassLongW, 2),
     API(GetClientRect, 2),
+    API(GetClipCursor, 1),
+    API(GetCursor, 0),
+    API(GetCursorPos, 1),
     API(GetDC, 1),
     API(GetDesktopWindow, 0),
+    API(GetFocus, 0),
+    API(GetForegroundWindow, 0),
+    API(GetKeyState, 1),
+    API(GetKeyboardState, 1),
     API(GetMessageA, 4),
     API(GetMessageW, 4),
     API(GetParent, 1),
@@ -1864,11 +2766,19 @@ static const struct api_entry user32_entries[] = {
     API(IsWindow, 1),
     API(IsWindowVisible, 1),
     API(IsZoomed, 1),
+    API(KillTimer, 2),
     API(LoadCursorA, 2),
     API(LoadCursorW, 2),
     API(LoadIconA, 2),
     API(LoadIconW, 2),
+    API(MapVirtualKeyA, 2),
+    API(MapVirtualKeyExA, 3),
+    API(MapVirtualKeyExW, 3),
+    API(MapVirtualKeyW, 2),
+    API(MapWindowPoints, 4),
     API(MoveWindow, 6),
+    API(MsgWaitForMultipleObjects, 5),
+    API(MsgWaitForMultipleObjectsEx, 5),
     API(PeekMessageA, 5),
     API(PeekMessageW, 5),
     API(PostMessageA, 4),
@@ -1880,13 +2790,23 @@ static const struct api_entry user32_entries[] = {
     API(RegisterClassExA, 1),
     API(RegisterClassExW, 1),
     API(RegisterClassW, 1),
+    API(ReleaseCapture, 0),
     API(ReleaseDC, 2),
+    API(ScreenToClient, 2),
     API(SendMessageA, 4),
     API(SendMessageW, 4),
+    API(SetActiveWindow, 1),
+    API(SetCapture, 1),
     API(SetClassLongA, 3),
     ALIAS(SetClassLongPtrA, SetClassLongA),
     ALIAS(SetClassLongPtrW, SetClassLongW),
     API(SetClassLongW, 3),
+    API(SetCursor, 1),
+    API(SetCursorPos, 2),
+    API(SetFocus, 1),
+    API(SetForegroundWindow, 1),
+    API(SetKeyboardState, 1),
+    API(SetTimer, 4),
     API(SetWindowLongA, 3),
     ALIAS(SetWindowLongPtrA, SetWindowLongA),
     ALIAS(SetWindowLongPtrW, SetWindowLongW),
@@ -1894,9 +2814,14 @@ static const struct api_entry user32_entries[] = {
     API(SetWindowPos, 7),
     API(SetWindowTextA, 2),
     API(SetWindowTextW, 2),
+    API(ShowCursor, 1),
     API(ShowWindow, 2),
     API(SystemParametersInfoA, 4),
     API(SystemParametersInfoW, 4),
+    API(ToAscii, 5),
+    API(ToAsciiEx, 6),
+    API(ToUnicode, 6),
+    API(ToUnicodeEx, 7),
     API(TranslateMessage, 1),
     API(UnregisterClassA, 2),
     API(UnregisterClassW, 2),

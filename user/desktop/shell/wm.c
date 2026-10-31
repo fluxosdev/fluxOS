@@ -98,6 +98,9 @@ static int drag_edges;                  /* E_* while DRAG_RESIZE */
 static int drag_mx, drag_my;            /* where a resize started */
 static struct rect drag_start;          /* the frame when it did */
 static enum cursor_kind cursor_kind;
+/* WF_ALLBUTTONS: the window the right or middle button was pressed over, which has it (its release,
+ * and the moves meanwhile) until it is let go. */
+static struct window *button_win;
 static struct window *last_caption_win;  /* for double-clicking a caption */
 static unsigned int last_caption_ms;
 
@@ -564,28 +567,34 @@ static struct rect desk_rect(void)
     return mkrect(0, 0, work_right(), work_bottom());
 }
 
-/* What the frame adds round the client area, across and down: nothing round the desktop. */
+/* The desktop and borderless windows have no frame: the client area is all of them. */
+static int frameless(const struct window *w)
+{
+    return (w->flags & (WF_DESKTOP | WF_BORDERLESS)) != 0;
+}
+
+/* What the frame adds round the client area, across and down. */
 static int frame_w(const struct window *w)
 {
-    return w->flags & WF_DESKTOP ? 0 : 2 * BORDER;
+    return frameless(w) ? 0 : 2 * BORDER;
 }
 
 static int frame_h(const struct window *w)
 {
-    return w->flags & WF_DESKTOP ? 0 : FRAME_TOP + BORDER;
+    return frameless(w) ? 0 : FRAME_TOP + BORDER;
 }
 
 static struct rect caption_rect(struct window *w)
 {
     int in = theme.cap_inset;
-    if (w->flags & WF_DESKTOP)
+    if (frameless(w))
         return mkrect(w->r.x, w->r.y, 0, 0);
     return mkrect(w->r.x + in, w->r.y + in, w->r.w - 2 * in, TITLE_H);
 }
 
 struct rect wm_client_rect(struct window *w)
 {
-    if (w->flags & WF_DESKTOP)
+    if (frameless(w))
         return mkrect(w->r.x, w->r.y, w->content.w, w->content.h);
     return mkrect(w->r.x + BORDER, w->r.y + FRAME_TOP, w->content.w, w->content.h);
 }
@@ -604,7 +613,7 @@ static int button_disabled(const struct window *w, int kind)
 /* Caption buttons from right to left: close, then maximize and minimize. */
 static int title_buttons(struct window *w, struct rect *rects, int *kinds)
 {
-    if (w->flags & WF_DESKTOP)
+    if (frameless(w))
         return 0;
     struct rect c = caption_rect(w);
     int bw = KINETIK ? 22 : 16, bh = KINETIK ? 20 : 14, gap = KINETIK ? 1 : 2;
@@ -1407,7 +1416,7 @@ static void draw_window(struct window *w)
     if (!rect_overlaps(KINETIK ? shadowed(r) : r, screen.clip))
         return;
     struct rect client = wm_client_rect(w);
-    if (inside(screen.clip, client) || (w->flags & WF_DESKTOP)) {    /* only the contents show here */
+    if (inside(screen.clip, client) || frameless(w)) {      /* only the contents show here */
         gfx_blit(&screen, client.x, client.y, &w->content, 0, 0, client.w, client.h);
         return;
     }
@@ -1627,6 +1636,15 @@ static struct window *covering(struct rect r, const struct window *modal)
     return found;
 }
 
+/* A borderless window with the focus that covers the screen: it is drawn over the taskbar and the
+ * sidebar, which then take no clicks. */
+static struct window *fullscreen(void)
+{
+    struct window *w = focused;
+    return w && (w->flags & WF_BORDERLESS) && !w->minimized && w->r.x <= 0 && w->r.y <= 0 &&
+           w->r.x + w->r.w >= screen_w && w->r.y + w->r.h >= screen_h ? w : NULL;
+}
+
 static void compose_rect(struct rect r)
 {
     gfx_clip(&screen, r);
@@ -1644,7 +1662,7 @@ static void compose_rect(struct rect r)
     for (struct window *w = from ? from : bottom; w; w = w->above)
         if (!w->minimized && w != modal)
             draw_window(w);
-    if (!setup_mode) {
+    if (!setup_mode && !fullscreen()) {
         sidebar_draw(&screen);
         draw_taskbar();
     }
@@ -1879,6 +1897,8 @@ void wm_destroy(struct window *w)
         dnd.target = NULL;              /* found again at the next move */
     if (last_caption_win == w)
         last_caption_win = NULL;        /* a new window may come at the same address */
+    if (button_win == w)
+        button_win = NULL;
     task_pressed_idx = -1;
     if (ctx_task == w) {
         ctx_task = NULL;
@@ -1904,7 +1924,7 @@ void wm_destroy(struct window *w)
 
 void wm_focus(struct window *w)
 {
-    struct window *old = focused;
+    struct window *old = focused, *fs = fullscreen();
     if (w) {
         w->minimized = 0;
         if (w->above && !(w->flags & WF_DESKTOP)) {     /* raise; the desktop stays at the bottom */
@@ -1929,6 +1949,8 @@ void wm_focus(struct window *w)
         if (w->ops && w->ops->focus)
             w->ops->focus(w, 1);
     }
+    if (fullscreen() != fs)
+        wm_damage(mkrect(0, 0, screen_w, screen_h));    /* the taskbar comes or goes */
     damage_taskbar();
 }
 
@@ -1970,8 +1992,8 @@ void wm_move(struct window *w, int x, int y)
 int wm_resize_client(struct window *w, int client_w, int client_h)
 {
     struct rect r = w->r;
-    r.w = client_w + 2 * BORDER;
-    r.h = client_h + FRAME_TOP + BORDER;
+    r.w = client_w + frame_w(w);
+    r.h = client_h + frame_h(w);
     if (r.x + r.w > work_right())
         r.x = work_right() > r.w ? work_right() - r.w : 0;
     if (r.y + r.h > work_bottom())
@@ -2447,7 +2469,7 @@ static struct window *window_at(int x, int y)
     struct window *modal = modal_window();
     if (modal)
         return rect_contains(modal->r, x, y) ? modal : NULL;
-    if (!setup_mode && rect_contains(sidebar_rect(), x, y))
+    if (!setup_mode && !fullscreen() && rect_contains(sidebar_rect(), x, y))
         return NULL;                    /* the sidebar is over them */
     for (struct window *w = bottom; w; w = w->above)
         if (!w->minimized && rect_contains(w->r, x, y))
@@ -2804,7 +2826,7 @@ static void press_left(void)
     }
 
     struct window *modal = modal_window();
-    if (rect_contains(taskbar_rect(), mx, my) && !modal) {
+    if (rect_contains(taskbar_rect(), mx, my) && !modal && !fullscreen()) {
         if (rect_contains(start_button_rect(), mx, my)) {
             set_menu(1);
             drag = DRAG_MENU;
@@ -2840,7 +2862,7 @@ static void press_left(void)
         }
         return;
     }
-    if (!setup_mode && rect_contains(sidebar_rect(), mx, my)) {
+    if (!setup_mode && !fullscreen() && rect_contains(sidebar_rect(), mx, my)) {
         if (!modal)
             sidebar_press(mx, my);
         return;
@@ -3045,6 +3067,19 @@ static void release_left(void)
     }
 }
 
+/* The right or middle button pressed over a WF_ALLBUTTONS window's client area: 1 if it took it. */
+static int press_other(int button)
+{
+    struct window *w = window_at(mx, my);
+    if (!w || !(w->flags & WF_ALLBUTTONS) || menu_open || ctx_open || !rect_contains(wm_client_rect(w), mx, my) ||
+        (drag != DRAG_NONE && !(drag == DRAG_CLIENT && drag_win == w)))
+        return 0;
+    wm_focus(w);
+    button_win = w;
+    client_mouse(w, mbuttons, button);
+    return 1;
+}
+
 static void press_right(void)
 {
     if (menu_open)
@@ -3056,7 +3091,7 @@ static void press_right(void)
         client_mouse(rw, mbuttons, MOUSE_RIGHT);
         return;
     }
-    if (!modal_window() && drag == DRAG_NONE && rect_contains(taskbar_rect(), mx, my)) {
+    if (!modal_window() && !fullscreen() && drag == DRAG_NONE && rect_contains(taskbar_rect(), mx, my)) {
         ctx_task = NULL;
         for (int i = 0; i < ntasks; i++)
             if (rect_contains(task_button_rect(i), mx, my))
@@ -3067,7 +3102,7 @@ static void press_right(void)
             set_ctx(taskbar_ctx, COUNT(taskbar_ctx), mx, my);
         return;
     }
-    if (!setup_mode && !modal_window() && drag == DRAG_NONE && rect_contains(sidebar_rect(), mx, my)) {
+    if (!setup_mode && !modal_window() && !fullscreen() && drag == DRAG_NONE && rect_contains(sidebar_rect(), mx, my)) {
         sidebar_menu(mx, my);
         return;
     }
@@ -3100,7 +3135,8 @@ static void mouse_event(const struct input_event *ev)
     int16_t wheel = (int16_t)ev->code;
     if (mouse_wheel_reverse())
         wheel = -wheel;
-    if (wheel && !menu_open && drag == DRAG_NONE && (setup_mode || !rect_contains(sidebar_rect(), mx, my))) {
+    if (wheel && !menu_open && drag == DRAG_NONE &&
+        (setup_mode || fullscreen() || !rect_contains(sidebar_rect(), mx, my))) {
         struct window *w = window_at(mx, my);
         if (!w)
             w = focused;
@@ -3115,16 +3151,25 @@ static void mouse_event(const struct input_event *ev)
             menu_pointer(mx, my);
         else if (ctx_open)
             set_ctx_hover(ctx_hit(mx, my));
+        else if (button_win && !button_win->minimized)
+            client_mouse(button_win, mbuttons, 0);
         else if (focused && !focused->minimized && focused->ops && focused->ops->mouse &&
                  rect_contains(wm_client_rect(focused), mx, my))
             client_mouse(focused, mbuttons, 0);     /* hovering: menus highlight */
     }
-    if (pressed & MOUSE_RIGHT)
+    if ((pressed & MOUSE_RIGHT) && !press_other(MOUSE_RIGHT))
         press_right();
+    if (pressed & MOUSE_MIDDLE)
+        press_other(MOUSE_MIDDLE);
     if (pressed & MOUSE_LEFT)
         press_left();
     if (released & MOUSE_LEFT)
         release_left();
+    for (int b = MOUSE_RIGHT; b <= MOUSE_MIDDLE; b <<= 1)
+        if ((released & b) && button_win)
+            client_mouse(button_win, mbuttons, b);
+    if (!(mbuttons & (MOUSE_RIGHT | MOUSE_MIDDLE)))
+        button_win = NULL;
     update_cursor();
 }
 
