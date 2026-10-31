@@ -1,5 +1,6 @@
 /*
- * The sound player: opens a PCM WAV file, shows its format and length, and
+ * The sound player: opens a WAV, MP3 or Ogg Vorbis file (the last two, and
+ * float WAV, through Wave's decoders: codecs.c), shows its format and length, and
  * plays it with play(1) as a child process, so the desktop keeps running
  * while it sounds. Pause stops the child and remembers the second; Play
  * starts it again from there (play -s). Clicking or dragging the bar seeks.
@@ -15,12 +16,14 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "codecs.h"
 #include "desktop.h"
 
 #define PL_W      320
 #define PL_H      150
 #define PATH_MAX_CHARS 255
 #define PLAY      "/bin/play"
+#define MAX_COMPRESSED (64 << 20)       /* as play(1) takes */
 
 extern char **environ;
 
@@ -32,6 +35,7 @@ struct player {
     char path[PATH_MAX_CHARS + 1];      /* the field */
     int path_len, path_cur;
     char loaded[PATH_MAX_CHARS + 1];    /* the file that is open */
+    const char *kind;                   /* "WAV", "MP3", "Ogg Vorbis" */
     int rate, channels, bits;
     uint32_t dur_ms;                    /* 0: nothing open */
     int state;
@@ -61,7 +65,8 @@ static int read_full(int fd, void *buf, uint32_t n)
     return (int)got;
 }
 
-/* Read a PCM WAV header; 0 on success, else a message in err. */
+/* Read a PCM WAV header; 0 on success, else a message in err (-2: a WAV file of a kind only the
+ * codecs can play, such as float). */
 static int wav_info(const char *path, struct player *p, const char **err)
 {
     int fd = open(path, O_RDONLY);
@@ -97,7 +102,8 @@ static int wav_info(const char *path, struct player *p, const char **err)
             p->bits = (int)le16(fmt + 14);
             if (tag != 1 || p->channels < 1 || p->channels > 2 || p->rate < 1000 ||
                 (p->bits != 8 && p->bits != 16 && p->bits != 24 && p->bits != 32)) {
-                *err = "Only PCM WAV files, mono or stereo, can be played.";
+                *err = "This kind of WAV file cannot be played.";
+                ok = -2;
                 goto out;
             }
             have_fmt = 1;
@@ -106,12 +112,40 @@ static int wav_info(const char *path, struct player *p, const char **err)
                 goto out;
             uint32_t frames = len / (uint32_t)(p->channels * p->bits / 8);
             p->dur_ms = frames / (uint32_t)p->rate * 1000 + frames % (uint32_t)p->rate * 1000 / (uint32_t)p->rate;
+            p->kind = "WAV";
             ok = 0;
             goto out;
         }
     }
 out:
     close(fd);
+    return ok;
+}
+
+/* An MP3, Ogg Vorbis or float WAV file: opened with the decoders play(1) uses, for its format and
+ * length; 0 on success. */
+static int codec_info(const char *path, struct player *p)
+{
+    struct stat st;
+    int fd = open(path, O_RDONLY), ok = -1;
+    unsigned char *data = NULL;
+    if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0 && st.st_size <= MAX_COMPRESSED &&
+        (data = malloc((size_t)st.st_size)) && read_full(fd, data, (uint32_t)st.st_size) == (int)st.st_size) {
+        struct codec *c = codec_open(data, (size_t)st.st_size);
+        if (c && codec_frames(c)) {
+            const char *type = codec_sniff(data, (size_t)st.st_size);
+            p->kind = !strcmp(type, "audio/mpeg") ? "MP3" : !strcmp(type, "audio/ogg") ? "Ogg Vorbis" : "WAV";
+            p->rate = codec_rate(c);
+            p->channels = codec_channels(c);
+            p->bits = 16;
+            p->dur_ms = (uint32_t)((uint64_t)codec_frames(c) * 1000 / (uint32_t)p->rate);
+            ok = 0;
+        }
+        codec_close(c);
+    }
+    free(data);
+    if (fd >= 0)
+        close(fd);
     return ok;
 }
 
@@ -199,7 +233,14 @@ static void load(struct player *p, const char *path)
     p->loaded[0] = 0;
     p->msg[0] = 0;
     const char *err;
-    if (wav_info(path, p, &err) < 0) {
+    int wav = wav_info(path, p, &err);
+    if (wav == -2 || (wav < 0 && !strcmp(err, "Not a WAV file."))) {     /* MP3, Ogg, float WAV */
+        if (codec_info(path, p) == 0)
+            wav = 0;
+        else if (wav != -2)
+            err = "Not a WAV, MP3 or Ogg Vorbis file.";
+    }
+    if (wav < 0) {
         p->dur_ms = 0;
         snprintf(p->msg, sizeof(p->msg), "%s", err);
         wm_set_title(p->win, "Sound Player");
@@ -254,9 +295,10 @@ static void paint(struct player *p)
     if (p->msg[0])
         snprintf(line, sizeof(line), "%s", p->msg);
     else if (p->dur_ms)
-        snprintf(line, sizeof(line), "%d Hz, %d bit, %s", p->rate, p->bits, p->channels == 2 ? "stereo" : "mono");
+        snprintf(line, sizeof(line), "%s, %d Hz, %d bit, %s", p->kind, p->rate, p->bits,
+                 p->channels == 2 ? "stereo" : "mono");
     else
-        snprintf(line, sizeof(line), "Type the name of a WAV file and press Enter.");
+        snprintf(line, sizeof(line), "Type the name of a WAV, MP3 or Ogg file and press Enter.");
     gfx_ellipsize(&font_sans, line, s->w - 16, fit, sizeof(fit));
     gfx_text(s, &font_sans, 8, 38, fit, p->msg[0] ? C_BLACK : C_SHADOW);
 
@@ -392,12 +434,14 @@ static void pl_destroy(struct window *w)
     free(p);
 }
 
-/* A WAV file dragged here plays, as opening it does. */
+/* A sound file dragged here plays, as opening it does. */
 static int pl_drop(struct window *w, int x, int y, const struct drag_data *d, int phase, int copy)
 {
     (void)w; (void)x; (void)y; (void)copy;
     size_t n = d->npaths == 1 ? strlen(d->paths[0]) : 0;
-    if (phase == DROP_LEAVE || n < 5 || strcasecmp(d->paths[0] + n - 4, ".wav"))
+    const char *dot = n ? strrchr(d->paths[0], '.') : NULL;
+    if (phase == DROP_LEAVE || !dot || (strcasecmp(dot, ".wav") && strcasecmp(dot, ".mp3") &&
+                                        strcasecmp(dot, ".ogg") && strcasecmp(dot, ".oga")))
         return DROP_NONE;
     if (phase == DROP_OVER) {
         wm_drag_hint("Play");

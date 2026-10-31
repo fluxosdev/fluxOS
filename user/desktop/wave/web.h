@@ -149,8 +149,8 @@ struct node {
     uint8_t file_chosen;        /* <input type=file>: value is a file the user picked (only that is sent) */
 
     /* generated content: ::before and ::after with a string "content" */
-    struct style *pseudo_st[7];         /* ::before, ::after, ::placeholder, ::selection, ::marker,
-                                           ::first-letter, ::first-line */
+    struct style *pseudo_st[8];         /* ::before, ::after, ::placeholder, ::selection, ::marker,
+                                           ::first-letter, ::first-line, ::backdrop */
     const char *pseudo_text[2];
 
     int bx0, by0, bx1, by1;             /* browser.c: its box in the last layout, for scripts */
@@ -176,7 +176,19 @@ struct node {
      * the cascade took it to be (css.c); they differ until the page is styled again */
     int cq_w, cq_h, cq_aw, cq_ah;
     uint8_t cq_known, cq_asked;
+
+    /* the top layer (jsdom.c): an open popover (POP_*), a dialog shown with showModal() */
+    uint8_t popover_open, modal;
+    unsigned top_seq;                   /* when it last went into the top layer, for their order */
+    struct node *invoker;               /* an open popover: the button that opened it (its implicit anchor) */
+    struct node *top_modal;             /* a document's root: its topmost modal dialog, which makes the rest inert */
+
+    /* <audio>: what its sound is doing (browser.c), for the controls layout.c draws */
+    uint8_t media_state;                /* MEDIA_* */
+    int media_pos_ms, media_dur_ms;     /* where it is, and how long (-1: not known) */
 };
+enum { MEDIA_IDLE, MEDIA_LOADING, MEDIA_PLAYING, MEDIA_PAUSED, MEDIA_FAILED };
+enum { POP_NONE, POP_AUTO, POP_MANUAL, POP_HINT };
 
 struct node *html_parse(struct arena *a, const char *text, int len);
 /* <template shadowrootmode> in a page's HTML: attach those shadow roots (after html_parse). */
@@ -205,8 +217,9 @@ int web_nth_fits(int a, int b, int position);
 
 /* ---- styles (css.c) ---- */
 /* pseudo-elements: node.pseudo_st[PE_x - 1] is the style of an element's ::before and the rest */
-enum { PE_NONE, PE_BEFORE, PE_AFTER, PE_PLACEHOLDER, PE_SELECTION, PE_MARKER, PE_FIRST_LETTER, PE_FIRST_LINE };
-#define PE_COUNT 7
+enum { PE_NONE, PE_BEFORE, PE_AFTER, PE_PLACEHOLDER, PE_SELECTION, PE_MARKER, PE_FIRST_LETTER, PE_FIRST_LINE,
+       PE_BACKDROP };
+#define PE_COUNT 8
 
 /* The fragment of the page's address, for :target (css.c; the browser sets it before cascading). */
 extern const char *css_target_id;
@@ -229,7 +242,7 @@ enum { IN_FLOW, IN_FLEX, IN_GRID };
 /* justify-content, align-items and the like; AL_NORMAL stretches where it can. */
 enum {
     AL_AUTO, AL_NORMAL, AL_STRETCH, AL_START, AL_END, AL_CENTER, AL_BASELINE, AL_BETWEEN,
-    AL_AROUND, AL_EVENLY,
+    AL_AROUND, AL_EVENLY, AL_ANCHOR_CENTER,
 };
 enum { TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY };
 enum { WS_NORMAL, WS_PRE, WS_NOWRAP, WS_PRE_WRAP, WS_PRE_LINE };
@@ -314,6 +327,31 @@ struct css_gradient {
     } stops[MAX_GSTOPS];
 };
 
+/* ---- anchor positioning ---- */
+
+/* anchor(--name side, fallback) in an inset, anchor-size(--name width, fallback) in a size (css.c
+ * parses them, layout.c measures the anchor and puts the pixels in). */
+enum { AS_TOP = -1, AS_RIGHT = -2, AS_BOTTOM = -3, AS_LEFT = -4, AS_START = -5, AS_END = -6, AS_CENTER = -7,
+       AS_INSIDE = -8, AS_OUTSIDE = -9, AS_WIDTH = -10, AS_HEIGHT = -11, AS_SAME = -12 };
+struct aref {
+    const char *name;           /* the anchor's name, or NULL: the box's default anchor */
+    int side;                   /* AS_*, or 0 to 10000: a percentage (times 100) of the way across it */
+    int add;                    /* pixels added to it (calc(anchor(bottom) + 4px)) */
+    struct len fallback;        /* what it is when there is no such anchor (U_AUTO: auto) */
+    uint8_t set;
+};
+#define MAX_TRIES 6
+enum { TRY_BLOCK = 1, TRY_INLINE = 2, TRY_START = 4 };
+struct anchor_spec {
+    struct aref inset[4];       /* top, right, bottom, left */
+    struct aref size[2];        /* width, height */
+    /* position-area: the rows from line area[0] to area[1] and the columns from area[2] to area[3]
+     * of the grid the anchor's edges cut the containing block into (lines 0-3); area[1] 0: none */
+    uint8_t area[4];
+    int ntry;                   /* position-try-fallbacks: flips (TRY_*), or other areas, tried in order */
+    struct { uint8_t flip, area[4]; } tries[MAX_TRIES];
+};
+
 /* ---- transforms, transitions and animations ---- */
 
 /* Functions compose in written order; the rightmost acts on a point first. */
@@ -382,7 +420,9 @@ enum anim_prop {
     AP_LETTER_SPACING, AP_WORD_SPACING, AP_LINE_HEIGHT, AP_BORDER_TL_RADIUS, AP_BORDER_TR_RADIUS,
     AP_BORDER_BR_RADIUS, AP_BORDER_BL_RADIUS, AP_TRANSFORM, AP_TRANSFORM_ORIGIN, AP_BOX_SHADOW, AP_TEXT_SHADOW,
     AP_FLEX_GROW, AP_FLEX_SHRINK, AP_FLEX_BASIS, AP_ROW_GAP, AP_COLUMN_GAP, AP_TEXT_INDENT, AP_OUTLINE_WIDTH,
-    AP_OUTLINE_OFFSET, AP_Z_INDEX, AP_VISIBILITY, AP_COUNT
+    AP_OUTLINE_OFFSET, AP_Z_INDEX, AP_VISIBILITY,
+    AP_DISPLAY, AP_OVERLAY,     /* discrete: they only transition with transition-behavior: allow-discrete */
+    AP_COUNT
 };
 
 #define AP_BIT(p) ((uint64_t)1 << (p))
@@ -393,6 +433,7 @@ struct css_transition {
     const char *name;           /* as written, for the events' propertyName */
     int duration, delay;        /* milliseconds */
     struct css_timing ease;
+    uint8_t discrete;           /* transition-behavior: allow-discrete */
 };
 
 enum { AD_NORMAL, AD_REVERSE, AD_ALTERNATE, AD_ALTERNATE_REVERSE };
@@ -427,6 +468,7 @@ struct anim_env {
     void *ctx;
     const struct keyframes *(*find)(void *ctx, const char *name);
     void (*apply)(void *ctx, const struct kframe *f, struct style *st);  /* its declarations onto st */
+    const struct style *start;  /* @starting-style's style, for an element with none before it (or NULL) */
 };
 /* The clock styles are computed for (ms): the browser sets it before it restyles. */
 extern unsigned anim_now;
@@ -437,6 +479,8 @@ void anim_style(struct node *n, struct style *st, const struct anim_env *env);
  * style (gone, or display: none) lose their animations. */
 void anim_cascade_begin(struct node *root);
 void anim_cascade_end(struct node *root);
+/* Has n no style to transition from (it is new, or was display: none)? Then @starting-style's counts. */
+int anim_needs_start(const struct node *n);
 /* Is anything of n's still moving (so it must be styled again each frame)? */
 int anim_running(const struct node *n);
 /* Mark (dgen = gen) the elements under root whose animations move; how many. */
@@ -458,7 +502,7 @@ uint64_t anim_prop_bits(const char *name, int len);
 
 /* The transition and animation properties as written (lists, matched up by finish_motion). */
 struct css_motion_raw {
-    const char *tprop, *tdur, *tdelay, *tease;
+    const char *tprop, *tdur, *tdelay, *tease, *tbehav;
     const char *aname, *adur, *aease, *adelay, *aiter, *adir, *afill, *astate;
 };
 
@@ -472,6 +516,11 @@ struct style {
     uint8_t position;           /* POS_* */
     uint8_t clear;              /* clear: 1 left, 2 right, 3 both */
     uint8_t z_set;              /* z-index is not auto */
+    uint8_t overlay;            /* overlay: auto, in the top layer (from the element's state; a transition keeps it) */
+    const char *anchor_name;    /* anchor-name: its names, comma separated (NULL: none) */
+    const char *position_anchor;    /* position-anchor: a name, "none", or NULL for auto (a popover's button) */
+    const struct anchor_spec *anchor;   /* anchor(), anchor-size(), position-area, position-try (NULL: none) */
+    uint8_t fit_w, fit_h;       /* width, height: fit-content (or min-/max-content): shrink to fit, never stretched */
     int sh_x, sh_y, sh_blur, sh_spread;     /* box-shadow (the first, outer one) */
     uint32_t sh_color;          /* 0: none */
     struct len tx, ty;          /* transform: translate() */
@@ -842,6 +891,8 @@ void range_value_at(const struct node *n, int fraction, char *out, int size);
 void range_nudge(const struct node *n, int dir, char *out, int size);
 /* Characters a date or time field takes, and the pattern it is waiting for ("yyyy-mm-dd"); NULL for other fields. */
 const char *input_pattern(const char *type);
+/* <audio controls>: where its seek bar runs, from x0 to x1 pixels in a control w wide (x0 == x1: none). */
+void layout_media_bar(const struct node *n, int w, int *x0, int *x1);
 /* The text a button, submit input or select shows. */
 const char *control_label(const struct node *n);
 /* Draw img scaled to w x h, alpha-blended. */

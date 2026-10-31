@@ -381,10 +381,72 @@ static void transitions_and_animations(void)
     arena_free(&a);
 }
 
+/* @starting-style, and display and overlay held by transition-behavior: allow-discrete: a popover
+ * fades in from its starting style, and out again, staying shown (and in the top layer) meanwhile. */
+static void starting_and_discrete(void)
+{
+    struct arena a = {0};
+    const char *html = "<!doctype html><div id='p' popover></div><div id='n' class='hide'></div>"
+                       "<div id='plain' class='hide'></div><div id='strict' class='hide'></div>";
+    struct node *root = html_parse(&a, html, (int)strlen(html));
+    const char *css =
+        "[popover] { opacity: 0; transition: opacity 1s linear, display 1s allow-discrete, overlay 1s allow-discrete }"
+        "[popover]:popover-open { opacity: 1 }"
+        "@starting-style { [popover]:popover-open { opacity: 0 } }"
+        "#n { transition: opacity 1s linear; opacity: 1; @starting-style { opacity: .2 } } #n.hide { display: none }"
+        "#plain { transition: opacity 1s linear; opacity: 1 } #plain.hide { display: none; opacity: 0 }"
+        "#strict { transition: opacity 1s linear, display 1s; opacity: 1 } #strict.hide { display: none; opacity: 0 }";
+    struct sheet *sheet = css_parse(&a, css, (int)strlen(css), 800);
+    struct node *p = id(root, "p"), *n = id(root, "n"), *plain = id(root, "plain"), *strict = id(root, "strict");
+    CHECK(sheet && p && n && plain && strict);
+    anim_now = 100000;
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(p->style->display == D_NONE && !p->style->overlay && n->style->display == D_NONE);
+    /* opened: from the starting style's opacity, not from nothing */
+    p->popover_open = POP_AUTO;
+    p->top_seq = 1;
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(p->style->display == D_BLOCK && p->style->overlay && p->style->opacity == 0 && anim_running(p));
+    anim_now = 100500;
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(near(p->style->opacity, 128, 2));
+    anim_now = 102000;
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(p->style->opacity == 255 && !anim_running(p));
+    /* closed: still displayed and in the top layer while it fades, then gone */
+    p->popover_open = 0;
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(p->style->display == D_BLOCK && p->style->overlay && p->style->opacity == 255);
+    anim_now = 102500;
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(p->style->display == D_BLOCK && p->style->overlay && near(p->style->opacity, 128, 2));
+    anim_now = 103100;
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(p->style->display == D_NONE && !p->style->overlay);
+    /* out of display: none: the nested @starting-style's opacity is where it starts; without one
+     * nothing moves; display without allow-discrete does not hold the box */
+    set_class(n, "");
+    set_class(plain, "");
+    set_class(strict, "");
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(n->style->opacity == 51 && anim_running(n));
+    CHECK(plain->style->opacity == 255 && !anim_running(plain));
+    CHECK(strict->style->display == D_BLOCK && strict->style->opacity == 255);
+    set_class(strict, "hide");
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(strict->style->display == D_NONE);
+    anim_now = 103600;
+    css_cascade(&a, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(near(n->style->opacity, 153, 2));
+    anim_forget(root);
+    arena_free(&a);
+}
+
 int main(void)
 {
     transitions_and_animations();
+    starting_and_discrete();
     entities(); cascade(); cascade_layers(); shadow_selectors_and_adoption(); selector_specificity(); nth_boundaries();
     text_and_interaction_properties(); state_pseudo_classes(); backgrounds_and_overflow(); counters_and_selectors();
-    puts("browser HTML/CSS: named references, filtered siblings, cascade specificity and new properties passed");
+    puts("browser HTML/CSS: named references, filtered siblings, cascade specificity, @starting-style, discrete transitions and new properties passed");
 }

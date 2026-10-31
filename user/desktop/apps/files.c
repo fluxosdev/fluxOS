@@ -279,7 +279,8 @@ static enum icon_id classify(struct fm *f, const struct entry *e, const char *pa
         return ICON_IMAGE;
     if (has_suffix(e->name, ".html") || has_suffix(e->name, ".htm"))
         return ICON_HTML;
-    if (has_suffix(e->name, ".wav") || has_suffix(e->name, ".voc"))
+    if (has_suffix(e->name, ".wav") || has_suffix(e->name, ".voc") || has_suffix(e->name, ".mp3") ||
+        has_suffix(e->name, ".ogg") || has_suffix(e->name, ".oga"))
         return ICON_SOUND;
     if (has_suffix(e->name, ".zip") || has_suffix(e->name, ".7z"))
         return ICON_ARCHIVE;
@@ -1226,7 +1227,7 @@ static void open_file(const char *dir, const char *name, const char *path, enum 
         char url[PATH_MAX + 8];
         snprintf(url, sizeof(url), "file://%s", path);
         launch1("wave", url);
-    } else if (icon == ICON_SOUND && has_suffix(name, ".wav")) {
+    } else if (icon == ICON_SOUND && !has_suffix(name, ".voc")) {
         launch1("player", path);
     } else if (icon == ICON_SOUND) {
         const char *argv[] = { "/bin/play", path, NULL };

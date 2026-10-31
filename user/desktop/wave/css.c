@@ -65,7 +65,12 @@ enum prop {
     P_COLUMNS, P_COLUMN_COUNT, P_COLUMN_WIDTH, P_COLUMN_RULE, P_COLUMN_RULE_WIDTH, P_COLUMN_RULE_STYLE,
     P_COLUMN_RULE_COLOR, P_COLUMN_FILL, P_BREAK_INSIDE, P_BREAK_BEFORE, P_BREAK_AFTER,
     P_CONTAINER, P_CONTAINER_NAME, P_CONTAINER_TYPE, P_BACKFACE, P_FILTER, P_BACKDROP, P_CLIP_PATH, P_BLEND,
+    P_TRANSITION_BEHAVIOR, P_ANCHOR_NAME, P_POSITION_ANCHOR, P_POSITION_AREA, P_POSITION_TRY_FALLBACKS,
+    P_POSITION_TRY,
+    P_COUNT
 };
+_Static_assert(P_COUNT <= 256, "a declaration keeps its property in a byte");
+_Static_assert(AP_COUNT <= 64, "transition-property's names are bits of a 64-bit mask");
 
 /* Transitions and animations, with or without -webkit- (looked up before prop_names). */
 static const struct { const char *name; uint8_t prop; } motion_names[] = {
@@ -75,7 +80,7 @@ static const struct { const char *name; uint8_t prop; } motion_names[] = {
     { "animation-iteration-count", P_ANIMATION_ITERATION }, { "animation-name", P_ANIMATION_NAME },
     { "animation-play-state", P_ANIMATION_STATE }, { "animation-range", P_IGNORED },
     { "animation-timeline", P_IGNORED }, { "animation-timing-function", P_ANIMATION_TIMING },
-    { "transition", P_TRANSITION }, { "transition-behavior", P_IGNORED },
+    { "transition", P_TRANSITION }, { "transition-behavior", P_TRANSITION_BEHAVIOR },
     { "transition-delay", P_TRANSITION_DELAY }, { "transition-duration", P_TRANSITION_DURATION },
     { "transition-property", P_TRANSITION_PROPERTY }, { "transition-timing-function", P_TRANSITION_TIMING },
 };
@@ -106,7 +111,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "-webkit-transform", P_TRANSFORM }, { "-webkit-transform-origin", P_TRANSFORM_ORIGIN },
     { "-webkit-user-drag", P_IGNORED }, { "-webkit-user-select", P_USER_SELECT }, { "accent-color", P_IGNORED },
     { "align-content", P_ALIGN_CONTENT }, { "align-items", P_ALIGN_ITEMS }, { "align-self", P_ALIGN_SELF },
-    { "alignment-baseline", P_IGNORED }, { "all", P_ALL }, { "appearance", P_IGNORED },
+    { "alignment-baseline", P_IGNORED }, { "all", P_ALL }, { "anchor-name", P_ANCHOR_NAME }, { "anchor-scope", P_IGNORED }, { "appearance", P_IGNORED },
     { "aspect-ratio", P_ASPECT_RATIO }, { "backdrop-filter", P_BACKDROP }, { "backface-visibility", P_BACKFACE }, { "background", P_BACKGROUND },
     { "background-attachment", P_BACKGROUND_ATTACHMENT }, { "background-clip", P_BACKGROUND_CLIP },
     { "background-color", P_BACKGROUND_COLOR }, { "background-image", P_BACKGROUND_IMAGE },
@@ -175,7 +180,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "grid-template-columns", P_GRID_TEMPLATE_COLUMNS }, { "grid-template-rows", P_GRID_TEMPLATE_ROWS },
     { "hanging-punctuation", P_IGNORED }, { "height", P_HEIGHT }, { "hyphens", P_IGNORED },
     { "image-rendering", P_IGNORED }, { "inline-size", P_WIDTH }, { "inset", P_INSET },
-    { "inset-block", P_INSET_BLOCK }, { "inset-block-end", P_BOTTOM }, { "inset-block-start", P_TOP },
+    { "inset-area", P_POSITION_AREA }, { "inset-block", P_INSET_BLOCK }, { "inset-block-end", P_BOTTOM }, { "inset-block-start", P_TOP },
     { "inset-inline", P_INSET_INLINE }, { "inset-inline-end", P_RIGHT }, { "inset-inline-start", P_LEFT },
     { "interpolate-size", P_IGNORED }, { "isolation", P_IGNORED }, { "justify-content", P_JUSTIFY_CONTENT },
     { "justify-items", P_JUSTIFY_ITEMS }, { "justify-self", P_JUSTIFY_SELF }, { "left", P_LEFT },
@@ -207,7 +212,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "page-break-after", P_IGNORED }, { "page-break-before", P_IGNORED }, { "page-break-inside", P_BREAK_INSIDE },
     { "paint-order", P_IGNORED }, { "perspective", P_PERSPECTIVE }, { "perspective-origin", P_PERSPECTIVE_ORIGIN },
     { "place-content", P_PLACE_CONTENT }, { "place-items", P_PLACE_ITEMS }, { "place-self", P_PLACE_SELF },
-    { "pointer-events", P_POINTER_EVENTS }, { "position", P_POSITION }, { "print-color-adjust", P_IGNORED },
+    { "pointer-events", P_POINTER_EVENTS }, { "position", P_POSITION }, { "position-anchor", P_POSITION_ANCHOR }, { "position-area", P_POSITION_AREA }, { "position-try", P_POSITION_TRY }, { "position-try-fallbacks", P_POSITION_TRY_FALLBACKS }, { "position-try-options", P_POSITION_TRY_FALLBACKS }, { "position-try-order", P_IGNORED }, { "position-visibility", P_IGNORED }, { "print-color-adjust", P_IGNORED },
     { "quotes", P_IGNORED }, { "resize", P_IGNORED }, { "right", P_RIGHT }, { "rotate", P_ROTATE },
     { "row-gap", P_ROW_GAP }, { "ruby-align", P_IGNORED }, { "ruby-position", P_IGNORED }, { "scale", P_SCALE },
     { "scroll-behavior", P_IGNORED }, { "scroll-margin", P_IGNORED }, { "scroll-margin-block", P_IGNORED },
@@ -255,6 +260,8 @@ enum {
 };
 #define PS_ACTIVE       (1u << 30)
 #define PS_USER_INVALID (1u << 31)
+/* :modal, :popover-open and :open: states scripts (and invoker buttons) set, outside the attributes */
+enum { ST_MODAL = 1, ST_POPOVER_OPEN = 2, ST_OPEN = 4 };
 
 /* Page zoom in percent (see web.h): the browser sets it before it parses or cascades. */
 int css_zoom = 100;
@@ -284,6 +291,7 @@ struct compound {
     int nattrs;
     uint32_t pseudo;
     uint8_t focus_visible;
+    uint8_t state;              /* ST_*: the top layer's and <details>'s states */
     const char *lang;           /* :lang(xx) */
     int nth_a, nth_b, has_nth, nth_of_type, nth_last;
     struct selector *nth_list;   /* siblings matching the optional nth-child "of" filter */
@@ -335,6 +343,7 @@ struct cquery {
 struct rule {
     const struct cquery *cq;
     struct layer *layer;
+    uint8_t starting;           /* inside @starting-style: only for an element's starting style */
     struct selector *sels;
     int nsels;
     struct decl *decls;
@@ -346,7 +355,12 @@ struct ref {                    /* a selector, filed in the index */
     struct ref *next;
 };
 
+/* @starting-style rules in any sheet so far; while cur_starting the cascade matches them (and counts
+ * how many did in starting_hits), otherwise it passes them by. */
+static int css_starting_rules, cur_starting, starting_hits;
+
 struct sheet {
+    int active_starting;                /* reading inside @starting-style */
     struct layer *layers, *last_layer, *active_layer;
     const struct cquery *active_cq;     /* the @container being read */
     struct custom_prop *registered;     /* @property: names and their initial values */
@@ -369,7 +383,7 @@ static const char ua_css[] =
     "head, script, style, link, meta, title, base, template, param, area, map, source, track,"
     " datalist, embed, audio:not([controls]), col, colgroup, option,"
     " input[type=hidden], [hidden], noembed, noscript, dialog:not([open]), datalist { display: none }"
-    /* <video> and <audio controls> are boxes that offer the file (layout.c); an <object> shows
+    /* <video> is a box that offers the file, <audio controls> a player (layout.c); an <object> shows
      * what it holds for browsers that cannot show it */
     "li { display: list-item }"
     "table { display: table; border-spacing: 2px; text-indent: 0 }"
@@ -423,9 +437,17 @@ static const char ua_css[] =
     "q::before { content: open-quote } q::after { content: close-quote }"
     "img { vertical-align: baseline }"
     "iframe { border: 2px inset #808080 }"
+    /* the top layer: modal dialogs and open popovers sit over the page, a backdrop under each */
     "dialog { position: absolute; left: 0; right: 0; width: fit-content; height: fit-content; margin: auto;"
     " border: 2px solid; padding: 1em; background-color: white; color: black }"
-    "[popover]:not([data-popover-open]) { display: none }"
+    "dialog:modal { position: fixed; top: 0; bottom: 0; overflow: auto;"
+    " max-width: calc(100% - 6px - 2em); max-height: calc(100% - 6px - 2em) }"
+    "::backdrop { position: fixed; top: 0; right: 0; bottom: 0; left: 0 }"
+    "dialog::backdrop { background-color: rgba(0, 0, 0, .1) }"
+    "[popover] { position: fixed; top: 0; right: 0; bottom: 0; left: 0; width: fit-content; height: fit-content;"
+    " margin: auto; border: solid; padding: .25em; overflow: auto; color: black; background-color: white }"
+    "[popover]:not(:popover-open):not(dialog[open]) { display: none }"
+    "dialog:popover-open { display: block }"
     "slot { display: contents }"
     "progress, meter { display: inline-block; vertical-align: middle }"
     "ruby { display: inline-flex; flex-direction: column-reverse; align-items: center;"
@@ -698,6 +720,11 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
                 *spec += 1;
                 continue;
             }
+            if (element && !strcmp(name, "backdrop")) {
+                c->pe = PE_BACKDROP;
+                *spec += 1;
+                continue;
+            }
             if (element && !strcmp(name, "slotted") && args) {
                 if (parse_compound_list(a, args, args_end, &c->slot_args, &c->nslot) < 0 || c->nslot != 1 ||
                     c->slot_args[0].nparts != 1 || c->slot_args[0].pe) return NULL;
@@ -718,7 +745,13 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
                         c->nhost != 1 || c->host_args[0].nparts != 1 || c->host_args[0].pe) return NULL;
                     *spec += list_specificity(c->host_args, c->nhost);
                 }
-            } else if (!strcmp(name, "first-child"))
+            } else if (!strcmp(name, "modal"))
+                c->state |= ST_MODAL;
+            else if (!strcmp(name, "popover-open"))
+                c->state |= ST_POPOVER_OPEN;
+            else if (!strcmp(name, "open"))
+                c->state |= ST_OPEN;
+            else if (!strcmp(name, "first-child"))
                 c->pseudo |= PS_FIRST_CHILD;
             else if (!strcmp(name, "last-child"))
                 c->pseudo |= PS_LAST_CHILD;
@@ -855,9 +888,22 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
                 *spec += list_specificity(c->has_list, c->nhas);
                 continue;
             } else if (!strcmp(name, "not") && args) {
-                if (parse_compound_list(a, args, args_end, &c->not_list, &c->nnot) < 0)
+                struct selector *list;
+                int count;
+                if (parse_compound_list(a, args, args_end, &list, &count) < 0)
                     return NULL;
-                *spec += list_specificity(c->not_list, c->nnot);
+                *spec += list_specificity(list, count);
+                if (c->nnot) {                  /* :not(a):not(b) is :not(a, b) */
+                    struct selector *both = arena_alloc(a, sizeof(*both) * (size_t)(c->nnot + count));
+                    if (!both)
+                        return NULL;
+                    memcpy(both, c->not_list, sizeof(*both) * (size_t)c->nnot);
+                    memcpy(both + c->nnot, list, sizeof(*both) * (size_t)count);
+                    list = both;
+                    count += c->nnot;
+                }
+                c->not_list = list;
+                c->nnot = count;
                 continue;
             } else if ((!strcmp(name, "is") || !strcmp(name, "matches") || !strcmp(name, "where") ||
                         !strcmp(name, "-webkit-any")) && args) {
@@ -1198,6 +1244,7 @@ static uint64_t prop_ap_bits(int prop)
     const uint64_t radii = AP_BIT(AP_BORDER_TL_RADIUS) | AP_BIT(AP_BORDER_TR_RADIUS) |
                            AP_BIT(AP_BORDER_BR_RADIUS) | AP_BIT(AP_BORDER_BL_RADIUS);
     switch (prop) {
+    case P_DISPLAY: return AP_BIT(AP_DISPLAY);
     case P_COLOR: return AP_BIT(AP_COLOR);
     case P_BACKGROUND: case P_BACKGROUND_COLOR: return AP_BIT(AP_BACKGROUND_COLOR);
     case P_OPACITY: return AP_BIT(AP_OPACITY);
@@ -1775,6 +1822,7 @@ static void add_rule(struct sheet *sh, const char *sel_s, const char *sel_e, con
     struct rule r = { 0 };
     r.layer = sh->active_layer;
     r.cq = sh->active_cq;
+    r.starting = sh->active_starting > 0;
     r.ndecls = parse_decls(a, body_s, body_e, &r.decls);
     if (!r.ndecls)
         return;
@@ -1793,6 +1841,7 @@ static void add_rule(struct sheet *sh, const char *sel_s, const char *sel_e, con
     }
     if (!r.nsels)
         return;
+    css_starting_rules += r.starting;
     if (sh->nrules == sh->cap) {
         int cap = sh->cap ? sh->cap * 2 : 64;
         struct rule *nr = arena_alloc(a, sizeof(struct rule) * (size_t)cap);
@@ -1882,7 +1931,8 @@ static int supports_decl(const char *ns, const char *ne, const char *vs, const c
     case P_WIDTH: case P_HEIGHT: case P_MIN_WIDTH: case P_MAX_WIDTH: case P_MIN_HEIGHT: case P_MAX_HEIGHT:
     case P_TOP: case P_RIGHT: case P_BOTTOM: case P_LEFT: case P_GAP: case P_ROW_GAP: case P_COLUMN_GAP:
         return is_length(value) || !strcasecmp(value, "fit-content") || !strcasecmp(value, "min-content") ||
-               !strcasecmp(value, "max-content");
+               !strcasecmp(value, "max-content") || !strncasecmp(value, "anchor(", 7) ||
+               !strncasecmp(value, "anchor-size(", 12);
     default:
         return 1;
     }
@@ -2143,6 +2193,10 @@ static void style_rule(struct sheet *sh, const char *sel_s, const char *sel_e, c
                         sh->active_cq = cq_parse(sh, k, brace);
                         style_rule(sh, sel_s, sel_e, brace + 1, close - 1, vw, depth + 1);
                         sh->active_cq = saved;
+                    } else if (kl == 14 && !strncasecmp(kw, "starting-style", 14)) {
+                        sh->active_starting++;
+                        style_rule(sh, sel_s, sel_e, brace + 1, close - 1, vw, depth + 1);
+                        sh->active_starting--;
                     } else if ((kl == 5 && !strncasecmp(kw, "media", 5) && media_matches(k, brace, vw)) ||
                         (kl == 8 && !strncasecmp(kw, "supports", 8) && supports_matches(sh->a, k, brace)))
                         style_rule(sh, sel_s, sel_e, brace + 1, close - 1, vw, depth + 1);
@@ -2210,6 +2264,13 @@ static void parse_block(struct sheet *sh, const char *s, const char *end, int vw
                 sh->active_cq = cq_parse(sh, k, brace);
                 parse_block(sh, brace + 1, close - 1, vw, depth + 1);
                 sh->active_cq = saved;
+                sc.s = close;
+                continue;
+            }
+            if (depth < 8 && kl == 14 && !strncasecmp(kw, "starting-style", 14)) {
+                sh->active_starting++;
+                parse_block(sh, brace + 1, close - 1, vw, depth + 1);
+                sh->active_starting--;
                 sc.s = close;
                 continue;
             }
@@ -2817,8 +2878,16 @@ static int match_compound(const struct compound *c, const struct node *n, const 
         if (!match_attr(n, &c->attrs[i]))
             return 0;
     uint32_t ps = c->pseudo;
-    if (n == cur_subject && (ps || c->focus_visible || c->has_nth || c->nhas || c->lang))
+    if (n == cur_subject && (ps || c->focus_visible || c->has_nth || c->nhas || c->lang || c->state))
         cur_flags |= SF_NOSHARE;
+    if (c->state) {
+        if ((c->state & ST_MODAL) && !n->modal)
+            return 0;
+        if ((c->state & ST_POPOVER_OPEN) && !n->popover_open)
+            return 0;
+        if ((c->state & ST_OPEN) && !((n->tag == T_DETAILS || n->tag == T_DIALOG) && node_attr(n, "open")))
+            return 0;
+    }
     if ((ps & PS_DYNAMIC) || c->focus_visible)
         cur_flags |= n == cur_subject ? SF_DYN_SELF : SF_DYN_OTHER;
     if (ps) {
@@ -4176,7 +4245,7 @@ static int align_value(const char *value, int *out)
         { "left", AL_START }, { "end", AL_END }, { "flex-end", AL_END }, { "self-end", AL_END },
         { "right", AL_END }, { "center", AL_CENTER }, { "baseline", AL_BASELINE },
         { "space-between", AL_BETWEEN }, { "space-around", AL_AROUND },
-        { "space-evenly", AL_EVENLY },
+        { "space-evenly", AL_EVENLY }, { "anchor-center", AL_ANCHOR_CENTER },
     };
     const char *w[4];
     int wl[4], n = words(value, w, wl, 4);
@@ -4932,6 +5001,28 @@ static void set_len(struct len *dst, const char *value, const struct vctx *v)
         *dst = l;
 }
 
+/* width and height: a length, auto, or fit-content (min-content and max-content alike), which is auto
+ * that shrinks to fit its contents where auto would stretch. */
+static void set_size(struct len *dst, uint8_t *fit, const char *value, const struct vctx *v)
+{
+    if (!strncasecmp(value, "fit-content", 11) || !strncasecmp(value, "-moz-fit-content", 16) ||
+        !strncasecmp(value, "-webkit-fit-content", 19) || !strcasecmp(value, "min-content") ||
+        !strcasecmp(value, "max-content")) {
+        dst->unit = U_AUTO, dst->v = dst->pct = 0;
+        *fit = 1;
+        return;
+    }
+    if (!strcasecmp(value, "initial") || !strcasecmp(value, "unset")) {
+        dst->unit = U_AUTO, dst->v = dst->pct = 0;
+        *fit = 0;
+        return;
+    }
+    struct len before = *dst;
+    set_len(dst, value, v);
+    if (memcmp(&before, dst, sizeof(before)) || !strncasecmp(value, "auto", 4))
+        *fit = 0;
+}
+
 /* Parse complete transform lists before changing the cascaded value. */
 static int transform_number(const char *s, float *out, int angle)
 {
@@ -5550,11 +5641,12 @@ static void apply_motion(struct style *st, const struct style *parent, int prop,
         if (prop == P_TRANSITION || prop == P_ANIMATION) {
             if (prop == P_TRANSITION) {
                 raw->tprop = from->tprop, raw->tdur = from->tdur, raw->tdelay = from->tdelay;
-                raw->tease = from->tease;
+                raw->tease = from->tease, raw->tbehav = from->tbehav;
             } else {
-                const char *keep[4] = { raw->tprop, raw->tdur, raw->tdelay, raw->tease };
+                const char *keep[5] = { raw->tprop, raw->tdur, raw->tdelay, raw->tease, raw->tbehav };
                 *raw = *from;
                 raw->tprop = keep[0], raw->tdur = keep[1], raw->tdelay = keep[2], raw->tease = keep[3];
+                raw->tbehav = keep[4];
             }
             return;
         }
@@ -5565,6 +5657,7 @@ static void apply_motion(struct style *st, const struct style *parent, int prop,
     case P_TRANSITION_DURATION: raw->tdur = val; return;
     case P_TRANSITION_TIMING: raw->tease = val; return;
     case P_TRANSITION_DELAY: raw->tdelay = val; return;
+    case P_TRANSITION_BEHAVIOR: raw->tbehav = val; return;
     case P_ANIMATION_NAME: raw->aname = val; return;
     case P_ANIMATION_DURATION: raw->adur = val; return;
     case P_ANIMATION_TIMING: raw->aease = val; return;
@@ -5575,7 +5668,7 @@ static void apply_motion(struct style *st, const struct style *parent, int prop,
     case P_ANIMATION_STATE: raw->astate = val; return;
     }
     /* A shorthand: split each comma-separated item into the longhands' lists. */
-    enum { L_PROP, L_DUR, L_EASE, L_DELAY, L_NAME, L_ITER, L_DIR, L_FILL, L_STATE, NLISTS };
+    enum { L_PROP, L_DUR, L_EASE, L_DELAY, L_NAME, L_ITER, L_DIR, L_FILL, L_STATE, L_BEHAV, NLISTS };
     char lists[NLISTS][512];
     int used[NLISTS] = { 0 };
     const char *end = value + strlen(value);
@@ -5594,7 +5687,7 @@ static void apply_motion(struct style *st, const struct style *parent, int prop,
                 slot = L_EASE;
             else if (prop == P_TRANSITION)
                 slot = (tl == 6 && !strncasecmp(t, "normal", 6)) || (tl == 14 && !strncasecmp(t, "allow-discrete", 14))
-                           ? -1 : L_PROP;
+                           ? L_BEHAV : L_PROP;
             else if ((tl == 8 && !strncasecmp(t, "infinite", 8)) || isdigit((unsigned char)*t) || *t == '.')
                 slot = L_ITER;
             else if ((tl == 7 && !strncasecmp(t, "reverse", 7)) || (tl == 9 && !strncasecmp(t, "alternate", 9)) ||
@@ -5613,7 +5706,7 @@ static void apply_motion(struct style *st, const struct style *parent, int prop,
                 part[slot] = t, plen[slot] = tl;
         }
         static const char *const defaults[NLISTS] = { "all", "0s", "ease", "0s", "none", "1", "normal", "none",
-                                                      "running" };
+                                                      "running", "normal" };
         for (int i = 0; i < NLISTS; i++) {
             const char *x = part[i] ? part[i] : defaults[i];
             int xl = part[i] ? plen[i] : (int)strlen(defaults[i]);
@@ -5630,6 +5723,7 @@ static void apply_motion(struct style *st, const struct style *parent, int prop,
         out[i] = arena_strdup(v->a, used[i] ? lists[i] : "");
     if (prop == P_TRANSITION) {
         raw->tprop = out[L_PROP], raw->tdur = out[L_DUR], raw->tease = out[L_EASE], raw->tdelay = out[L_DELAY];
+        raw->tbehav = out[L_BEHAV];
     } else {
         raw->aname = out[L_NAME], raw->adur = out[L_DUR], raw->aease = out[L_EASE], raw->adelay = out[L_DELAY];
         raw->aiter = out[L_ITER], raw->adir = out[L_DIR], raw->afill = out[L_FILL], raw->astate = out[L_STATE];
@@ -5693,6 +5787,8 @@ static void finish_motion(struct arena *a, struct style *st)
             tr[k].delay = 0;
         if (!(x = list_item(raw->tease, i, &len)) || !timing_keyword(x, len, &tr[k].ease))
             timing_keyword("ease", 4, &tr[k].ease);
+        if ((x = list_item(raw->tbehav, i, &len)))
+            tr[k].discrete = len == 14 && !strncasecmp(x, "allow-discrete", 14);
         if (tr[k].props && tr[k].duration > 0 && tr[k].duration + tr[k].delay > 0)
             st->ntrans++;
     }
@@ -5735,6 +5831,192 @@ static void finish_motion(struct arena *a, struct style *st)
     st->anims = st->nanims ? an : NULL;
 }
 
+/* ---- anchor positioning: anchor(), anchor-size(), position-area, position-try-fallbacks ---- */
+
+/* The element's anchor_spec, its own to change. */
+static struct anchor_spec *anchor_spec_edit(struct style *st, struct arena *a)
+{
+    struct anchor_spec *sp = a ? arena_alloc(a, sizeof(*sp)) : NULL;
+    if (!sp)
+        return NULL;
+    if (st->anchor)
+        *sp = *st->anchor;
+    st->anchor = sp;
+    return sp;
+}
+
+/* anchor(--name side, fallback) (size 0) or anchor-size(--name width, fallback) (size 1), alone or
+ * in calc() with pixels added or taken away: 1 if value is one, and *out says what it asks for. */
+static int parse_aref(const char *value, int size, const struct vctx *v, struct aref *out)
+{
+    static const struct { const char *kw; int side; } sides[] = {
+        { "top", AS_TOP }, { "bottom", AS_BOTTOM }, { "left", AS_LEFT }, { "right", AS_RIGHT },
+        { "start", AS_START }, { "end", AS_END }, { "self-start", AS_START }, { "self-end", AS_END },
+        { "center", AS_CENTER }, { "inside", AS_INSIDE }, { "outside", AS_OUTSIDE },
+    }, sizes[] = {
+        { "width", AS_WIDTH }, { "height", AS_HEIGHT }, { "inline", AS_WIDTH }, { "block", AS_HEIGHT },
+        { "self-inline", AS_WIDTH }, { "self-block", AS_HEIGHT },
+    };
+    memset(out, 0, sizeof(*out));
+    out->fallback.unit = U_AUTO;
+    out->side = size ? AS_SAME : 5000;
+    const char *end = value + strlen(value), *p = value;
+    while (isspace((unsigned char)*p))
+        p++;
+    int calc = !strncasecmp(p, "calc(", 5);
+    if (calc)
+        for (p += 5; isspace((unsigned char)*p); p++)
+            ;
+    const char *fn = size ? "anchor-size(" : "anchor(";
+    size_t fl = strlen(fn);
+    if (strncasecmp(p, fn, fl))
+        return 0;
+    const char *close = skip_group(p + fl - 1, end), *a0 = p + fl;
+    const char *a1 = close > a0 && close[-1] == ')' ? close - 1 : close, *comma = find_top(a0, a1, ',');
+    int got_side = size;
+    for (const char *q = a0; q < comma;) {
+        while (q < comma && isspace((unsigned char)*q))
+            q++;
+        const char *w = q;
+        while (q < comma && !isspace((unsigned char)*q))
+            q++;
+        int wl = (int)(q - w), known = 0;
+        if (!wl)
+            break;
+        if (wl > 2 && w[0] == '-' && w[1] == '-') {
+            out->name = v->a ? arena_strndup(v->a, w, (size_t)wl) : NULL;
+            continue;
+        }
+        for (unsigned i = 0; !size && i < sizeof(sides) / sizeof(sides[0]); i++)
+            if ((int)strlen(sides[i].kw) == wl && !strncasecmp(w, sides[i].kw, (size_t)wl))
+                out->side = sides[i].side, known = got_side = 1;
+        for (unsigned i = 0; size && i < sizeof(sizes) / sizeof(sizes[0]); i++)
+            if ((int)strlen(sizes[i].kw) == wl && !strncasecmp(w, sizes[i].kw, (size_t)wl))
+                out->side = sizes[i].side, known = 1;
+        int pct;
+        if (!known && !size && w[wl - 1] == '%' && parse_num(w, &pct)) {
+            out->side = pct < 0 ? 0 : pct > 10000 ? 10000 : pct;
+            known = got_side = 1;
+        }
+        if (!known)
+            return 0;
+    }
+    if (!got_side)
+        return 0;
+    if (comma < a1) {
+        char fb[128];
+        snprintf(fb, sizeof(fb), "%.*s", (int)(a1 - comma - 1), comma + 1);
+        if (!length_value(fb, v, &out->fallback))
+            out->fallback.unit = U_AUTO;
+    }
+    if (calc) {                                 /* calc(anchor(bottom) + 4px) */
+        const char *q = close;
+        while (isspace((unsigned char)*q))
+            q++;
+        if (*q == '+' || *q == '-') {
+            int sign = *q == '-' ? -1 : 1;
+            char rest[64];
+            snprintf(rest, sizeof(rest), "%.*s", (int)(end - q - 1), q + 1);
+            char *paren = strrchr(rest, ')');
+            if (paren)
+                *paren = 0;
+            struct len l;
+            if (length_value(rest, v, &l) && l.unit == U_PX)
+                out->add = sign * l.v;
+        }
+    }
+    out->set = 1;
+    return 1;
+}
+
+/* A position-area keyword: the axis it is for (0 either, 1 rows, 2 columns) and its lines. */
+static int area_keyword(const char *w, int wl, int *axis, int *from, int *to)
+{
+    static const struct { const char *kw; uint8_t axis, from, to; } kws[] = {
+        { "top", 1, 0, 1 }, { "bottom", 1, 2, 3 }, { "span-top", 1, 0, 2 }, { "span-bottom", 1, 1, 3 },
+        { "y-start", 1, 0, 1 }, { "y-end", 1, 2, 3 }, { "span-y-start", 1, 0, 2 }, { "span-y-end", 1, 1, 3 },
+        { "block-start", 1, 0, 1 }, { "block-end", 1, 2, 3 }, { "span-block-start", 1, 0, 2 },
+        { "span-block-end", 1, 1, 3 }, { "self-block-start", 1, 0, 1 }, { "self-block-end", 1, 2, 3 },
+        { "left", 2, 0, 1 }, { "right", 2, 2, 3 }, { "span-left", 2, 0, 2 }, { "span-right", 2, 1, 3 },
+        { "x-start", 2, 0, 1 }, { "x-end", 2, 2, 3 }, { "span-x-start", 2, 0, 2 }, { "span-x-end", 2, 1, 3 },
+        { "inline-start", 2, 0, 1 }, { "inline-end", 2, 2, 3 }, { "span-inline-start", 2, 0, 2 },
+        { "span-inline-end", 2, 1, 3 }, { "self-inline-start", 2, 0, 1 }, { "self-inline-end", 2, 2, 3 },
+        { "center", 0, 1, 2 }, { "start", 0, 0, 1 }, { "end", 0, 2, 3 }, { "self-start", 0, 0, 1 },
+        { "self-end", 0, 2, 3 }, { "span-start", 0, 0, 2 }, { "span-end", 0, 1, 3 }, { "span-all", 0, 0, 3 },
+    };
+    for (unsigned i = 0; i < sizeof(kws) / sizeof(kws[0]); i++)
+        if ((int)strlen(kws[i].kw) == wl && !strncasecmp(w, kws[i].kw, (size_t)wl)) {
+            *axis = kws[i].axis, *from = kws[i].from, *to = kws[i].to;
+            return 1;
+        }
+    return 0;
+}
+
+/* position-area: none, or one or two keywords (rows, columns: see anchor_spec). */
+static int parse_area(const char *value, uint8_t out[4])
+{
+    const char *w[3];
+    int wl[3], n = words(value, w, wl, 3), axis[2], from[2], to[2];
+    memset(out, 0, 4);
+    if (n == 1 && word_is(w[0], wl[0], "none"))
+        return 1;
+    if (n < 1 || n > 2)
+        return 0;
+    for (int i = 0; i < n; i++)
+        if (!area_keyword(w[i], wl[i], &axis[i], &from[i], &to[i]))
+            return 0;
+    int r0, r1, c0, c1;
+    if (n == 1) {
+        r0 = axis[0] == 2 ? 0 : from[0], r1 = axis[0] == 2 ? 3 : to[0];
+        c0 = axis[0] == 1 ? 0 : from[0], c1 = axis[0] == 1 ? 3 : to[0];
+    } else {
+        if (axis[0] && axis[0] == axis[1])
+            return 0;
+        int cols_first = axis[0] == 2 || axis[1] == 1;
+        r0 = from[cols_first], r1 = to[cols_first], c0 = from[!cols_first], c1 = to[!cols_first];
+    }
+    out[0] = (uint8_t)r0, out[1] = (uint8_t)r1, out[2] = (uint8_t)c0, out[3] = (uint8_t)c1;
+    return 1;
+}
+
+/* position-try-fallbacks: flip-block, flip-inline, flip-start (or several), and position-area values. */
+static void parse_tries(const char *value, struct anchor_spec *sp)
+{
+    sp->ntry = 0;
+    const char *end = value + strlen(value);
+    for (const char *item = value; item < end && sp->ntry < MAX_TRIES;) {
+        const char *comma = find_top(item, end, ',');
+        char one[96];
+        snprintf(one, sizeof(one), "%.*s", (int)(comma - item), item);
+        const char *w[3];
+        int wl[3], n = words(one, w, wl, 3), flip = 0, flips = 1;
+        for (int i = 0; i < n; i++) {
+            int f = word_is(w[i], wl[i], "flip-block") ? TRY_BLOCK : word_is(w[i], wl[i], "flip-inline") ? TRY_INLINE
+                  : word_is(w[i], wl[i], "flip-start") ? TRY_START : 0;
+            flip |= f;
+            flips &= f != 0;
+        }
+        uint8_t area[4];
+        const char *a = one;
+        while (isspace((unsigned char)*a))
+            a++;
+        if (!strncasecmp(a, "position-area(", 14)) {     /* the older spelling */
+            a += 14;
+            char *paren = strrchr(one, ')');
+            if (paren)
+                *paren = 0;
+        }
+        if (n && flips) {
+            sp->tries[sp->ntry].flip = (uint8_t)flip;
+            memset(sp->tries[sp->ntry++].area, 0, 4);
+        } else if (parse_area(a, area) && area[1]) {
+            sp->tries[sp->ntry].flip = 0;
+            memcpy(sp->tries[sp->ntry++].area, area, 4);
+        }
+        item = comma < end ? comma + 1 : end;
+    }
+}
+
 static void apply(struct style *st, const struct style *parent, int prop, const char *value,
                   const struct vctx *v)
 {
@@ -5755,6 +6037,41 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
             st->bg_values[k] = v->a ? arena_strdup(v->a, value) : value;
             break;
         }
+
+    /* anchor() in an inset, anchor-size() in a size: the length gets what applies when there is no
+     * such anchor, and the reference goes beside it, for layout.c to measure the anchor. */
+    int slot = prop == P_TOP ? 0 : prop == P_RIGHT ? 1 : prop == P_BOTTOM ? 2 : prop == P_LEFT ? 3
+             : prop == P_WIDTH ? 4 : prop == P_HEIGHT ? 5 : -1;
+    if (slot >= 0) {
+        struct aref r;
+        int ref = strcasestr(value, "anchor") && parse_aref(value, slot >= 4, v, &r);
+        const struct aref *old = !st->anchor ? NULL : slot < 4 ? &st->anchor->inset[slot] : &st->anchor->size[slot - 4];
+        if (ref || (old && old->set)) {
+            struct anchor_spec *sp = anchor_spec_edit(st, v->a);
+            struct aref *dst = !sp ? NULL : slot < 4 ? &sp->inset[slot] : &sp->size[slot - 4];
+            if (dst) {
+                memset(dst, 0, sizeof(*dst));
+                if (ref)
+                    *dst = r;
+            }
+        }
+        if (ref) {
+            struct len *len = slot == 0 ? &st->top : slot == 1 ? &st->right : slot == 2 ? &st->bottom
+                            : slot == 3 ? &st->left : slot == 4 ? &st->width : &st->height;
+            *len = r.fallback;
+            if (slot == 4)
+                st->fit_w = 0;
+            if (slot == 5)
+                st->fit_h = 0;
+            return;
+        }
+    }
+    if (prop == P_INSET && st->anchor && (st->anchor->inset[0].set || st->anchor->inset[1].set ||
+                                          st->anchor->inset[2].set || st->anchor->inset[3].set)) {
+        struct anchor_spec *sp = anchor_spec_edit(st, v->a);
+        if (sp)
+            memset(sp->inset, 0, sizeof(sp->inset));
+    }
 
     switch (prop) {
     case P_DISPLAY:
@@ -6806,8 +7123,8 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         if (css_parse_color(value, (int)strlen(value), &c) == 0)
             st->border_color[prop - P_BORDER_TOP_COLOR] = c;
         break;
-    case P_WIDTH: set_len(&st->width, value, v); break;
-    case P_HEIGHT: set_len(&st->height, value, v); break;
+    case P_WIDTH: set_size(&st->width, &st->fit_w, value, v); break;
+    case P_HEIGHT: set_size(&st->height, &st->fit_h, value, v); break;
     case P_MIN_WIDTH:
         set_len(&st->min_width, value, v);      /* auto: a flex item's own minimum */
         break;
@@ -6859,6 +7176,39 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         if (!strcasecmp(value, "collapse"))
             st->border_spacing = 0;
         break;
+    case P_ANCHOR_NAME:
+        st->anchor_name = initial_kw || !strcasecmp(value, "none") || !v->a ? NULL : arena_strdup(v->a, value);
+        break;
+    case P_POSITION_ANCHOR:
+        st->position_anchor = initial_kw || !strcasecmp(value, "auto") || !v->a ? NULL : arena_strdup(v->a, value);
+        break;
+    case P_POSITION_AREA: {
+        uint8_t area[4] = { 0 };
+        if (!initial_kw && !parse_area(value, area))
+            break;
+        struct anchor_spec *sp = area[1] || (st->anchor && st->anchor->area[1]) ? anchor_spec_edit(st, v->a) : NULL;
+        if (sp)
+            memcpy(sp->area, area, 4);
+        break;
+    }
+    case P_POSITION_TRY: case P_POSITION_TRY_FALLBACKS: {
+        struct anchor_spec tries;
+        const char *list = value;
+        if (prop == P_POSITION_TRY) {           /* position-try: [order] fallbacks */
+            static const char *const orders[] = { "normal", "most-width", "most-height", "most-block-size",
+                                                  "most-inline-size", NULL };
+            for (int i = 0; orders[i]; i++)
+                if (!strncasecmp(list, orders[i], strlen(orders[i])) && isspace((unsigned char)list[strlen(orders[i])]))
+                    list += strlen(orders[i]);
+        }
+        parse_tries(initial_kw ? "none" : list, &tries);
+        struct anchor_spec *sp = tries.ntry || (st->anchor && st->anchor->ntry) ? anchor_spec_edit(st, v->a) : NULL;
+        if (sp) {
+            sp->ntry = tries.ntry;
+            memcpy(sp->tries, tries.tries, sizeof(sp->tries));
+        }
+        break;
+    }
     case P_POSITION:
         st->positioned = !strcasecmp(value, "absolute") || !strcasecmp(value, "fixed");
         st->position = !strcasecmp(value, "relative") ? POS_RELATIVE : !strcasecmp(value, "absolute") ? POS_ABSOLUTE
@@ -6952,7 +7302,7 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
         break;
     }
     case P_TRANSITION: case P_TRANSITION_PROPERTY: case P_TRANSITION_DURATION: case P_TRANSITION_TIMING:
-    case P_TRANSITION_DELAY: case P_ANIMATION: case P_ANIMATION_NAME: case P_ANIMATION_DURATION:
+    case P_TRANSITION_DELAY: case P_TRANSITION_BEHAVIOR: case P_ANIMATION: case P_ANIMATION_NAME: case P_ANIMATION_DURATION:
     case P_ANIMATION_TIMING: case P_ANIMATION_DELAY: case P_ANIMATION_ITERATION: case P_ANIMATION_DIRECTION:
     case P_ANIMATION_FILL: case P_ANIMATION_STATE:
         apply_motion(st, parent, prop, value, inherit_kw, initial_kw, v);
@@ -7512,6 +7862,8 @@ static void match_list(struct collect *c, const struct sheet *sh, const struct r
     for (; ref; ref = ref->next) {
         const struct rule *r = &sh->rules[ref->rule];
         const struct selector *sel = &r->sels[ref->sel];
+        if (r->starting && !cur_starting)
+            continue;
         if (cur_bloom && !cur_bloom->broken && sel->nanc) {   /* an ancestor it needs is not there */
             int i = 0;
             while (i < sel->nanc && bloom_has(cur_bloom, sel->anc[i]))
@@ -7519,10 +7871,12 @@ static void match_list(struct collect *c, const struct sheet *sh, const struct r
             if (i < sel->nanc)
                 continue;
         }
-        if (match_from(sel, sel->nparts - 1, n, c->mc) && (!r->cq || cq_matches(r->cq, (struct node *)n, sel->pe)))
+        if (match_from(sel, sel->nparts - 1, n, c->mc) && (!r->cq || cq_matches(r->cq, (struct node *)n, sel->pe))) {
             add_decls(c, r->decls, r->ndecls, rank, sel->spec,
                       sheet_order + (uint32_t)ref->rule * 256, sel->pe,
                       r->layer ? r->layer->canonical->order : 0x7fffffff);
+            starting_hits += r->starting;
+        }
     }
 }
 
@@ -7532,12 +7886,16 @@ static void match_sheet(struct collect *c, const struct sheet *sh, const struct 
     if (c->mc->host && (n == c->mc->host || n == c->mc->slotted)) {
         for (int i = 0; i < sh->nrules; i++) {
             const struct rule *r = &sh->rules[i];
+            if (r->starting && !cur_starting)
+                continue;
             for (int j = 0; j < r->nsels; j++) {
                 const struct selector *sel = &r->sels[j];
                 if (n == c->mc->slotted && !sel->parts[sel->nparts-1].nslot) continue;
-                if (match_from(sel, sel->nparts-1, n, c->mc) && (!r->cq || cq_matches(r->cq, (struct node *)n, sel->pe)))
+                if (match_from(sel, sel->nparts-1, n, c->mc) && (!r->cq || cq_matches(r->cq, (struct node *)n, sel->pe))) {
                     add_decls(c,r->decls,r->ndecls,rank,sel->spec,sheet_order+(uint32_t)i*256,sel->pe,
                               r->layer ? r->layer->canonical->order : 0x7fffffff);
+                    starting_hits += r->starting;
+                }
             }
         }
         return;
@@ -7718,8 +8076,11 @@ static void restore_property(struct style *st, const struct style *src, int prop
     case P_VERTICAL_ALIGN: COPY(vertical_align); break;
     case P_LIST_STYLE: COPY(list_style); COPY(list_inside); COPY(ls_url); COPY(ls_img); break;
     case P_LIST_STYLE_TYPE: COPY(list_style); break;
-    case P_WIDTH: COPY(width); break;
-    case P_HEIGHT: COPY(height); break;
+    case P_ANCHOR_NAME: COPY(anchor_name); break;
+    case P_POSITION_ANCHOR: COPY(position_anchor); break;
+    case P_POSITION_AREA: case P_POSITION_TRY: case P_POSITION_TRY_FALLBACKS: COPY(anchor); break;
+    case P_WIDTH: COPY(width); COPY(fit_w); break;
+    case P_HEIGHT: COPY(height); COPY(fit_h); break;
     case P_MIN_WIDTH: COPY(min_width); break;
     case P_MAX_WIDTH: COPY(max_width); break;
     case P_MIN_HEIGHT: COPY(min_height); break;
@@ -7744,7 +8105,7 @@ static void restore_property(struct style *st, const struct style *src, int prop
     case P_INSET: COPY(top); COPY(right); COPY(bottom); COPY(left); break;
     case P_OPACITY: COPY(invisible); COPY(opacity); break;
     case P_TRANSITION: case P_TRANSITION_PROPERTY: case P_TRANSITION_DURATION: case P_TRANSITION_TIMING:
-    case P_TRANSITION_DELAY: case P_ANIMATION: case P_ANIMATION_NAME: case P_ANIMATION_DURATION:
+    case P_TRANSITION_DELAY: case P_TRANSITION_BEHAVIOR: case P_ANIMATION: case P_ANIMATION_NAME: case P_ANIMATION_DURATION:
     case P_ANIMATION_TIMING: case P_ANIMATION_DELAY: case P_ANIMATION_ITERATION: case P_ANIMATION_DIRECTION:
     case P_ANIMATION_FILL: case P_ANIMATION_STATE: COPY(raw_motion); break;
     case P_MASK: COPY(invisible); break;
@@ -7955,19 +8316,17 @@ static void kf_apply(void *ctx, const struct kframe *f, struct style *st)
     }
 }
 
-static int compute(struct arena *a, struct node *n, const struct style *parent,
-                   struct sheet **sheets, int nsheets, const struct vctx *base,
-                   const struct mctx *mc, struct match *buf, int check)
+/* The declarations that apply to n, in cascade order: the user agent's, hints, the author sheets
+ * (the shadow tree's too), the style attribute. */
+static void collect_matches(struct arena *a, struct node *n, struct sheet **sheets, int nsheets,
+                            const struct vctx *base, const struct mctx *mc, struct collect *cp, char *hint,
+                            int hint_size, const char **inline_out)
 {
-    cur_subject = n;
-    cur_flags = 0;
-    int calls = counter_calls;
-    struct collect c = { .m = buf, .mc = mc };
+    struct collect c = *cp;
     match_sheet(&c, ua_sheet, n, R_UA, 0);
     if (mc->quirks)
         match_sheet(&c, ua_quirks, n, R_UA, 1u << 23);
-    char hint[1024];
-    hints(n, hint, sizeof(hint));
+    hints(n, hint, hint_size);
     if (hint[0]) {
         struct decl *d;
         int nd = parse_decls(a, hint, hint + strlen(hint), &d);
@@ -8004,21 +8363,16 @@ static int compute(struct arena *a, struct node *n, const struct style *parent,
         add_decls(&c, d, nd, R_INLINE, 0, 0, 0, 0x7fffffff);
     }
     qsort(c.m, (size_t)c.n, sizeof(struct match), cmp_match);
-    cur_subject = NULL;
-    n->style_flags = cur_flags;
-    uint32_t sig = match_signature(&c, hint, inline_style);
-    if (check && sig == n->match_sig && n->style && !anim_running(n))
-        return 0;
-    n->match_sig = sig;
+    *cp = c;
+    *inline_out = inline_style;
+}
 
-    struct style *st = arena_alloc(a, sizeof(*st));
-    if (!st)
-        return 0;
-    inherit(st, parent);
-    n->style = st;
-    memset(n->pseudo_st, 0, sizeof(n->pseudo_st));     /* the last cascade's styles are gone */
-    memset(n->pseudo_text, 0, sizeof(n->pseudo_text));
-
+/* The values the collected declarations give st (inheriting from parent): custom properties,
+ * then font-size, then line-height and the rest. Returns 1 if an author set the color. */
+static int apply_values(struct arena *a, struct node *n, struct style *st, const struct style *parent,
+                        const struct collect *cp, struct sheet **sheets, int nsheets, struct vctx *v)
+{
+    const struct collect c = *cp;
     /* Pass 1: custom properties. */
     for (int i = 0; i < c.n; i++) {
         const struct decl *d = c.m[i].d;
@@ -8051,36 +8405,108 @@ static int compute(struct arena *a, struct node *n, const struct style *parent,
                 }
             }
 
-    struct vctx v = *base;
-    v.a = a;
-    v.cq_from = n->parent;
+    v->a = a;
+    v->cq_from = n->parent;
     /* Pass 2: font-size, which em units in everything else depend on. Pass 3: the rest. */
     int author_color = 0;
     int rollback_budget = 8192;
     for (int pass = 2; pass <= 3; pass++) {
         if (pass == 3) {
-            v.font_size = st->font_size;
+            v->font_size = st->font_size;
             for (int i = 0; i < c.n; i++)       /* line-height first, for lh units in the rest */
                 if (c.m[i].d->prop == P_LINE_HEIGHT && !c.m[i].pe)
-                    apply_match(st, parent, &c, i, &v, pass, NULL, &rollback_budget);
-            v.lh = line_px(st);
+                    apply_match(st, parent, &c, i, v, pass, NULL, &rollback_budget);
+            v->lh = line_px(st);
         }
         for (int i = 0; i < c.n; i++) {
             const struct decl *d = c.m[i].d;
             int early = d->prop == P_FONT_SIZE || d->prop == P_FONT;
             if (d->prop == P_CUSTOM || (pass == 2) != early || c.m[i].pe || (pass == 3 && d->prop == P_LINE_HEIGHT))
                 continue;
-            apply_match(st, parent, &c, i, &v, pass, NULL, &rollback_budget);
+            apply_match(st, parent, &c, i, v, pass, NULL, &rollback_budget);
             if (d->prop == P_COLOR && c.m[i].rank != R_UA)
                 author_color = 1;
         }
     }
+    return author_color;
+}
 
+/*
+ * @starting-style: the style n would have if those rules applied too, for an element that had no
+ * style before (just inserted, or out of display: none) to transition from. NULL if none of them
+ * match it.
+ */
+static struct style *starting_style(struct arena *a, struct node *n, const struct style *parent,
+                                    struct sheet **sheets, int nsheets, const struct vctx *base,
+                                    const struct mctx *mc)
+{
+    struct match *buf = malloc(sizeof(struct match) * MAX_MATCHES);
+    if (!buf)
+        return NULL;
+    const struct node *saved_subject = cur_subject;
+    uint8_t saved_flags = n->style_flags;
+    unsigned saved_cur = cur_flags;
+    struct collect c = { .m = buf, .mc = mc };
+    char hint[1024];
+    const char *inline_style;
+    cur_starting = 1;
+    starting_hits = 0;
+    cur_subject = n;
+    collect_matches(a, n, sheets, nsheets, base, mc, &c, hint, sizeof(hint), &inline_style);
+    cur_starting = 0;
+    cur_subject = saved_subject;
+    cur_flags = saved_cur;
+    n->style_flags = saved_flags;
+    struct style *st = NULL;
+    if (starting_hits && (st = arena_alloc(a, sizeof(*st)))) {
+        inherit(st, parent);
+        struct vctx v = *base;
+        apply_values(a, n, st, parent, &c, sheets, nsheets, &v);
+        st->overlay = n->popover_open || n->modal;
+    }
+    free(buf);
+    return st;
+}
+
+static int compute(struct arena *a, struct node *n, const struct style *parent,
+                   struct sheet **sheets, int nsheets, const struct vctx *base,
+                   const struct mctx *mc, struct match *buf, int check)
+{
+    cur_subject = n;
+    cur_flags = 0;
+    int calls = counter_calls;
+    struct collect c = { .m = buf, .mc = mc };
+    char hint[1024];
+    const char *inline_style;
+    collect_matches(a, n, sheets, nsheets, base, mc, &c, hint, sizeof(hint), &inline_style);
+    cur_subject = NULL;
+    n->style_flags = cur_flags;
+    uint32_t sig = match_signature(&c, hint, inline_style);
+    if (check && sig == n->match_sig && n->style && !anim_running(n))
+        return 0;
+    n->match_sig = sig;
+
+    struct style *st = arena_alloc(a, sizeof(*st));
+    if (!st)
+        return 0;
+    inherit(st, parent);
+    n->style = st;
+    memset(n->pseudo_st, 0, sizeof(n->pseudo_st));     /* the last cascade's styles are gone */
+    memset(n->pseudo_text, 0, sizeof(n->pseudo_text));
+
+    struct vctx v = *base;
+    int author_color = apply_values(a, n, st, parent, &c, sheets, nsheets, &v);
+
+    /* An open popover or modal dialog is in the top layer (overlay: auto, which only a transition can
+     * keep a while after it leaves). */
+    st->overlay = n->popover_open || n->modal;
     /* Transitions and animations put in their values now, before what depends on them. */
     finish_motion(a, st);
     if (st->ntrans || st->nanims || n->anim) {
         struct kf_ctx kc = { sheets, nsheets, parent, &v };
-        struct anim_env env = { a, &kc, kf_find, kf_apply };
+        struct anim_env env = { a, &kc, kf_find, kf_apply, NULL };
+        if (css_starting_rules && st->ntrans && st->display != D_NONE && anim_needs_start(n))
+            env.start = starting_style(a, n, parent, sheets, nsheets, base, mc);
         anim_style(n, st, &env);
         n->style_flags |= SF_NOSHARE;
         if (anim_running(n))
@@ -8107,8 +8533,9 @@ static int compute(struct arena *a, struct node *n, const struct style *parent,
     if (!n->parent)
         st->display = st->display == D_NONE ? D_NONE : D_BLOCK;
     /* Positioned boxes stay in the flow here, so the ones that are meant to be
-     * hidden (closed menus, screen-reader text) must not take room there. */
-    if (st->positioned && (st->hidden || st->invisible ||
+     * hidden (closed menus, screen-reader text) must not take room there. (The top layer's are
+     * laid out apart, and fade in and out from nothing.) */
+    if (st->positioned && !st->overlay && (st->hidden || st->invisible ||
                            (st->width.unit == U_PX && st->width.v <= 1 && st->height.unit == U_PX &&
                             st->height.v <= 1)))
         st->display = D_NONE;
@@ -8177,6 +8604,8 @@ static int compute(struct arena *a, struct node *n, const struct style *parent,
     if (st->display != D_NONE)
         for (int pe = PE_BEFORE; pe <= PE_FIRST_LINE; pe++)
             pseudo(a, n, st, &c, pe, &v);
+    if (st->display != D_NONE && st->overlay)  /* only what is in the top layer has a backdrop */
+        pseudo(a, n, st, &c, PE_BACKDROP, &v);
     if (counter_calls != calls)
         n->style_flags |= SF_NOSHARE;   /* a sibling copying it would not count */
     return 1;

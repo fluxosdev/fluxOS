@@ -259,11 +259,16 @@ static void ce_tree(struct jsdom *d, struct node *n, int connected)
         }
 }
 
+static void top_layer_removed(struct jsdom *d, struct node *root);
+static void top_layer_attr(struct jsdom *d, struct node *n, const char *name, const char *old, const char *value);
+
 static void unlink_node(struct jsdom *d, struct node *n)
 {
     struct node *p = n->parent;
     if (!p)
         return;
+    if (d && is_connected(d, p))
+        top_layer_removed(d, n);
     if (d && d->watch_mutations)
         mutation(d, "childList", p, NULL, n, n->prev, n->next, NULL, NULL);
     int was_connected = d && d->custom_on && is_connected(d, p);
@@ -413,6 +418,7 @@ static void set_attr(struct jsdom *d, struct node *n, const char *name, const ch
                 mutation(d, "attributes", n, NULL, NULL, NULL, NULL, lname, old);
             if (d->custom_on && is_custom(n))
                 ce_attr(d, n, lname, old, value);
+            top_layer_attr(d, n, lname, old, value);
             return;
         }
     struct attr *a = arena_alloc(d->h.arena, sizeof(*a));
@@ -429,6 +435,7 @@ static void set_attr(struct jsdom *d, struct node *n, const char *name, const ch
         mutation(d, "attributes", n, NULL, NULL, NULL, NULL, lname, NULL);
     if (d->custom_on && is_custom(n))
         ce_attr(d, n, lname, NULL, value);
+    top_layer_attr(d, n, lname, NULL, value);
 }
 
 static void remove_attr(struct jsdom *d, struct node *n, const char *name)
@@ -445,6 +452,7 @@ static void remove_attr(struct jsdom *d, struct node *n, const char *name)
                 mutation(d, "attributes", n, NULL, NULL, NULL, NULL, gone->name, gone->value);
             if (d->custom_on && is_custom(n))
                 ce_attr(d, n, gone->name, gone->value, NULL);
+            top_layer_attr(d, n, gone->name, gone->value, NULL);
             return;
         }
 }
@@ -779,6 +787,12 @@ static int match_pseudo(const struct node *n, const char *name, int nlen, const 
         return p == NULL || p->type != N_ELEMENT;
     if (IS("link") || IS("any-link"))
         return n->tag == T_A && node_attr(n, "href");
+    if (IS("popover-open"))
+        return n->popover_open != 0;
+    if (IS("modal"))
+        return n->modal;
+    if (IS("open"))
+        return (n->tag == T_DETAILS || n->tag == T_DIALOG) && node_attr(n, "open");
     return 0;                           /* :hover, :focus, ... */
 #undef IS
 }
@@ -1596,6 +1610,33 @@ static int node_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
         return 1;
     }
     if (IS("tabIndex")) { *out = js_num(web_tabindex(n)); return 1; }
+    if (IS("popover")) {                /* the state's keyword, or null when it is not a popover */
+        static const char *const states[] = { NULL, "auto", "manual", "hint" };
+        const char *v = node_attr(n, "popover");
+        int st = !v ? POP_NONE : !*v || !strcasecmp(v, "auto") ? POP_AUTO : !strcasecmp(v, "hint") ? POP_HINT : POP_MANUAL;
+        *out = st ? js_str(J, states[st]) : js_null;
+        return 1;
+    }
+    if (IS("popoverTargetElement") || IS("commandForElement")) {
+        const char *id = node_attr(n, IS("commandForElement") ? "commandfor" : "popovertarget");
+        struct node *t = id && *id ? by_id(d->h.root, id) : NULL;
+        *out = t ? wrap(d, t) : js_null;
+        return 1;
+    }
+    if (IS("popoverTargetAction") || IS("command")) {
+        const char *v = node_attr(n, IS("command") ? "command" : "popovertargetaction");
+        if (IS("popoverTargetAction"))
+            v = v && (!strcasecmp(v, "show") || !strcasecmp(v, "hide")) ? v : "toggle";
+        *out = js_str(J, v ? v : "");
+        return 1;
+    }
+    if (IS("closedBy") && n->tag == T_DIALOG) {
+        const char *v = node_attr(n, "closedby");
+        if (!v || (strcasecmp(v, "any") && strcasecmp(v, "closerequest") && strcasecmp(v, "none")))
+            v = n->modal ? "closerequest" : "none";
+        *out = js_str(J, v);
+        return 1;
+    }
     if (in_list(reflected, key, attr, sizeof(attr))) {
         const char *v = node_attr(n, attr);
         *out = js_str(J, v ? v : "");
@@ -1741,6 +1782,28 @@ static int node_set(struct js *J, struct jsobj *o, const char *key, jsval v)
         int index = number != number ? 0 : number < -32768 ? -32768 : number > 32767 ? 32767 : (int)number;
         snprintf(text, sizeof(text), "%d", index);
         set_attr(d, n, "tabindex", text); return 1;
+    }
+    if (IS("popoverTargetElement") || IS("commandForElement")) {
+        const char *name = IS("commandForElement") ? "commandfor" : "popovertarget";
+        struct node *t = node_of(v);
+        const char *id = t ? node_attr(t, "id") : NULL;
+        if (id && *id)
+            set_attr(d, n, name, id);
+        else
+            remove_attr(d, n, name);
+        return 1;
+    }
+    if (IS("popoverTargetAction") || IS("command") || IS("closedBy")) {
+        set_attr(d, n, IS("command") ? "command" : IS("closedBy") ? "closedby" : "popovertargetaction",
+                 js_tostr(J, v)->s);
+        return 1;
+    }
+    if (IS("popover")) {
+        if (v.t == JS_NULL)
+            remove_attr(d, n, "popover");
+        else
+            set_attr(d, n, "popover", js_tostr(J, v)->s);
+        return 1;
     }
     if (in_list(reflected, key, attr, sizeof(attr))) {
         set_attr(d, n, attr, js_tostr(J, v)->s);
@@ -2670,30 +2733,574 @@ static jsval new_event(struct jsdom *d, const char *type, jsval target);
 static void host_unhandled(struct js *J, jsval promise, jsval reason);
 static int dispatch_event(struct jsdom *d, struct node *target, const char *type, jsval ev, int bubbles);
 
-/* <dialog>: show(), showModal() and close(returnValue). */
+/* ---- the top layer: popovers and modal dialogs ----
+ *
+ * An open popover or modal dialog is in the document's top layer: it is drawn over everything, in the
+ * order things went in (node.top_seq), and css.c matches :popover-open and :modal on it. Auto popovers
+ * nest: opening one closes the others, except those it is inside (or whose button opened it); a press
+ * outside them, or Escape, closes them again (light dismiss). The topmost modal dialog makes the rest
+ * of the document inert (the root's top_modal, which web_inert reads). beforetoggle is sent at once
+ * (opening can be cancelled), toggle afterwards, once for what happened in between.
+ */
+
+static unsigned top_counter;
+
+/* Throw a DOMException named name (InvalidStateError and the like). */
+static jsval throw_dom(struct js *J, const char *name, const char *message)
+{
+    jsval ctor = js_get(J, js_obj(dom(J)->window), "DOMException");
+    if (!js_is_callable(ctor))
+        return js_throw_error(J, "%s: %s", name, message);
+    jsval args[2] = { js_str(J, message), js_str(J, name) };
+    jsval e = js_construct(J, ctor, args, 2);
+    return e.t == JS_OBJ ? js_throw_value(J, e) : js_throw_error(J, "%s: %s", name, message);
+}
+
+/* The popover attribute's state: auto ("" or "auto"), hint, or manual (any other value). */
+static int popover_state(const struct node *n)
+{
+    const char *v = is_element(n) ? node_attr(n, "popover") : NULL;
+    if (!v)
+        return POP_NONE;
+    if (!*v || !strcasecmp(v, "auto"))
+        return POP_AUTO;
+    return !strcasecmp(v, "hint") ? POP_HINT : POP_MANUAL;
+}
+
+static void update_modal(struct jsdom *d)
+{
+    struct node *top = NULL;
+    for (struct node *n = d->h.root; n; n = node_next_shadow(n, d->h.root))
+        if (n->type == N_ELEMENT && n->modal && (!top || n->top_seq > top->top_seq))
+            top = n;
+    d->h.root->top_modal = top;
+}
+
+static void toggle_job(struct js *J, struct job *job)
+{
+    struct jsdom *d = dom(J);
+    struct node *n = node_of(job->a);
+    jsval ev = js_get(J, job->a, "__toggleEvent");
+    js_put(J, job->a.u.o, S(J, "__toggleEvent"), js_undefined, 0);
+    if (n && ev.t == JS_OBJ)
+        dispatch_event(d, n, "toggle", ev, 0);
+}
+
+/* toggle, soon: one event for every change before it is sent, from the first state to the last. */
+static void queue_toggle(struct jsdom *d, struct node *n, int opened)
+{
+    struct js *J = d->J;
+    jsval w = wrap(d, n), pending = js_get(J, w, "__toggleEvent");
+    if (pending.t == JS_OBJ) {
+        js_set(J, pending, "newState", js_str(J, opened ? "open" : "closed"));
+        return;
+    }
+    jsval ev = new_event(d, "toggle", w);
+    js_set(J, ev, "bubbles", js_bool(0));
+    js_set(J, ev, "cancelable", js_bool(0));
+    js_set(J, ev, "oldState", js_str(J, opened ? "closed" : "open"));
+    js_set(J, ev, "newState", js_str(J, opened ? "open" : "closed"));
+    js_put(J, w.u.o, S(J, "__toggleEvent"), ev, 0);
+    js_enqueue(J, toggle_job, w, js_undefined, js_undefined, js_undefined);
+}
+
+/* beforetoggle, now; opening can be cancelled (returns 1 if it was). */
+static int fire_beforetoggle(struct jsdom *d, struct node *n, int opening, struct node *source)
+{
+    struct js *J = d->J;
+    jsval ev = new_event(d, "beforetoggle", wrap(d, n));
+    js_set(J, ev, "bubbles", js_bool(0));
+    js_set(J, ev, "cancelable", js_bool(opening));
+    js_set(J, ev, "oldState", js_str(J, opening ? "closed" : "open"));
+    js_set(J, ev, "newState", js_str(J, opening ? "open" : "closed"));
+    js_set(J, ev, "source", source ? wrap(d, source) : js_null);
+    return dispatch_event(d, n, "beforetoggle", ev, 0) && opening;
+}
+
+/* What gets the focus when a popover or dialog opens: a descendant with autofocus, or (for a
+ * dialog) the first that can be focused. */
+static struct node *focus_delegate(struct node *root, int autofocus_only)
+{
+    if (node_attr(root, "autofocus") && web_focusable(root))
+        return root;
+    for (struct node *k = node_next(root, root); k; k = node_next(k, root))
+        if (is_element(k) && node_attr(k, "autofocus") && web_focusable(k))
+            return k;
+    if (!autofocus_only)
+        for (struct node *k = node_next(root, root); k; k = node_next(k, root))
+            if (is_element(k) && web_focusable(k))
+                return k;
+    return NULL;
+}
+
+/* Focus moves into what opened; where it was is remembered, for when it closes. */
+static void open_focus(struct jsdom *d, struct node *n, int dialog)
+{
+    struct js *J = d->J;
+    jsval w = wrap(d, n);
+    js_put(J, w.u.o, S(J, "__prevFocus"), d->active ? wrap(d, d->active) : js_null, 0);
+    if (d->h.flush)
+        d->h.flush(d->h.ctx);           /* styled now: what was display: none can be focused */
+    struct node *f = focus_delegate(n, !dialog);
+    if (f)
+        jsdom_focus(d, f);
+}
+
+static void close_focus(struct jsdom *d, struct node *n, int restore)
+{
+    struct js *J = d->J;
+    jsval w = wrap(d, n), prev = js_get(J, w, "__prevFocus");
+    js_put(J, w.u.o, S(J, "__prevFocus"), js_null, 0);
+    struct node *p = node_of(prev);
+    if (restore && p && (!d->active || contains(n, d->active)) && is_connected(d, p))
+        jsdom_focus(d, p);
+}
+
+/* The open auto popovers, oldest first (max: room in out); how many. */
+static int auto_popovers(struct jsdom *d, struct node **out, int max)
+{
+    int k = 0;
+    for (struct node *n = d->h.root; n && k < max; n = node_next_shadow(n, d->h.root))
+        if (n->type == N_ELEMENT && (n->popover_open == POP_AUTO || n->popover_open == POP_HINT))
+            out[k++] = n;
+    for (int i = 1; i < k; i++)
+        for (int j = i; j > 0 && out[j - 1]->top_seq > out[j]->top_seq; j--) {
+            struct node *t = out[j];
+            out[j] = out[j - 1];
+            out[j - 1] = t;
+        }
+    return k;
+}
+
+/* The open auto popover n belongs in: the newest one it is inside, or that its button is inside. */
+static struct node *popover_ancestor(struct node *n, struct node *invoker)
+{
+    struct node *best = NULL;
+    struct node *starts[2] = { n ? (n->parent ? n->parent : n->shadow_host) : NULL, invoker };
+    for (int s = 0; s < 2; s++)
+        for (struct node *p = starts[s]; p; p = p->parent ? p->parent : p->shadow_host)
+            if (p->type == N_ELEMENT && (p->popover_open == POP_AUTO || p->popover_open == POP_HINT)) {
+                if (!best || p->top_seq > best->top_seq)
+                    best = p;
+                break;
+            }
+    return best;
+}
+
+static int hide_popover(struct jsdom *d, struct node *n, int restore_focus, int fire);
+
+/* Close the auto popovers opened after keep (all of them if keep is NULL), newest first. */
+static void hide_popovers_until(struct jsdom *d, struct node *keep, int restore_focus, int fire)
+{
+    for (int guard = 0; guard < 64; guard++) {
+        struct node *open[64];
+        int k = auto_popovers(d, open, 64);
+        if (!k || open[k - 1] == keep || (keep && !keep->popover_open))
+            return;
+        hide_popover(d, open[k - 1], restore_focus, fire);
+    }
+}
+
+static int popover_valid(struct jsdom *d, struct node *n, int opening)
+{
+    return popover_state(n) && is_connected(d, n) && (n->popover_open != 0) != opening &&
+           !(opening && n->tag == T_DIALOG && node_attr(n, "open"));
+}
+
+/* Returns 0 if it opened, else why not (1 nothing to do, -1 not allowed). */
+static int show_popover(struct jsdom *d, struct node *n, struct node *source)
+{
+    if (!popover_state(n) || !is_connected(d, n) || (n->tag == T_DIALOG && node_attr(n, "open") && !n->popover_open))
+        return -1;
+    if (n->popover_open)
+        return 1;
+    if (fire_beforetoggle(d, n, 1, source) || !popover_valid(d, n, 1))
+        return 1;
+    int kind = popover_state(n);
+    if (kind == POP_AUTO || kind == POP_HINT) {
+        hide_popovers_until(d, popover_ancestor(n, source), 0, 1);
+        if (!popover_valid(d, n, 1))
+            return 1;                   /* a handler of theirs changed it */
+    }
+    n->popover_open = (uint8_t)kind;
+    n->top_seq = ++top_counter;
+    n->invoker = source;
+    d->dirty = 1;
+    open_focus(d, n, 0);
+    queue_toggle(d, n, 1);
+    return 0;
+}
+
+static int hide_popover(struct jsdom *d, struct node *n, int restore_focus, int fire)
+{
+    if (!n->popover_open)
+        return 1;
+    if (n->popover_open == POP_AUTO || n->popover_open == POP_HINT) {
+        hide_popovers_until(d, n, restore_focus, fire);        /* the ones it opened go first */
+        if (!n->popover_open)
+            return 1;
+    }
+    if (fire) {
+        fire_beforetoggle(d, n, 0, NULL);
+        if (!n->popover_open)
+            return 1;
+    }
+    n->popover_open = 0;
+    n->invoker = NULL;
+    d->dirty = 1;
+    if (fire)
+        queue_toggle(d, n, 0);
+    close_focus(d, n, restore_focus);
+    return 0;
+}
+
+static struct node *source_option(struct js *J, jsval opts)
+{
+    return opts.t == JS_OBJ && !node_of(opts) ? node_of(js_get(J, opts, "source")) : NULL;
+}
+
+static jsval el_show_popover(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct node *n = this_node(J, self);
+    if (n && show_popover(dom(J), n, source_option(J, ARG(0))) < 0)
+        return popover_state(n) ? throw_dom(J, "InvalidStateError", "The popover cannot be shown")
+                                : throw_dom(J, "NotSupportedError", "The element is not a popover");
+    return js_undefined;
+}
+
+static jsval el_hide_popover(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct node *n = this_node(J, self);
+    if (n && !popover_state(n))
+        return throw_dom(J, "NotSupportedError", "The element is not a popover");
+    if (n)
+        hide_popover(dom(J), n, 1, 1);
+    return js_undefined;
+}
+
+/* togglePopover(force) or togglePopover({ force, source }): whether it is open afterwards. */
+static jsval el_toggle_popover(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct node *n = this_node(J, self);
+    if (!n)
+        return js_bool(0);
+    if (!popover_state(n))
+        return throw_dom(J, "NotSupportedError", "The element is not a popover");
+    jsval force = ARG(0);
+    struct node *source = source_option(J, force);
+    if (force.t == JS_OBJ)
+        force = js_get(J, force, "force");
+    int open = force.t == JS_UNDEF ? !n->popover_open : js_truthy(force);
+    if (open && !n->popover_open && show_popover(dom(J), n, source) < 0)
+        return throw_dom(J, "InvalidStateError", "The popover cannot be shown");
+    if (!open && n->popover_open)
+        hide_popover(dom(J), n, 1, 1);
+    return js_bool(n->popover_open != 0);
+}
+
+/* <dialog>: show(), showModal(), close(returnValue) and requestClose(returnValue). */
+static int dialog_open(struct jsdom *d, struct node *n, int modal)
+{
+    if (node_attr(n, "open"))
+        return !modal || n->modal ? 0 : -1;
+    if (n->popover_open || (modal && !is_connected(d, n)))
+        return -1;
+    if (fire_beforetoggle(d, n, 1, NULL) || node_attr(n, "open"))
+        return 0;
+    set_attr(d, n, "open", "");
+    if (modal) {
+        n->modal = 1;
+        n->top_seq = ++top_counter;
+        update_modal(d);
+        hide_popovers_until(d, popover_ancestor(n, NULL), 0, 1);
+    }
+    open_focus(d, n, 1);
+    queue_toggle(d, n, 1);
+    return 0;
+}
+
 static jsval dialog_show(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)args, (void)argc;
     struct node *n = this_node(J, self);
-    if (n && !node_attr(n, "open"))
-        set_attr(dom(J), n, "open", "");
+    if (n && dialog_open(dom(J), n, 0) < 0)
+        return throw_dom(J, "InvalidStateError", "The dialog is open as a modal one, or is a popover");
     return js_undefined;
+}
+
+static jsval dialog_show_modal(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)args, (void)argc;
+    struct node *n = this_node(J, self);
+    if (n && dialog_open(dom(J), n, 1) < 0)
+        return throw_dom(J, "InvalidStateError", "The dialog cannot be shown as a modal one");
+    return js_undefined;
+}
+
+static void dialog_close_with(struct jsdom *d, struct node *n, jsval value)
+{
+    struct js *J = d->J;
+    if (!node_attr(n, "open"))
+        return;
+    fire_beforetoggle(d, n, 0, NULL);
+    if (!node_attr(n, "open"))
+        return;
+    int was_modal = n->modal;
+    n->modal = 0;
+    remove_attr(d, n, "open");
+    if (was_modal)
+        update_modal(d);
+    jsval w = wrap(d, n);
+    if (value.t != JS_UNDEF && value.t != JS_NULL)
+        js_set(J, w, "returnValue", js_to_string(J, value));
+    queue_toggle(d, n, 0);
+    close_focus(d, n, 1);
+    jsval ev = new_event(d, "close", w);
+    js_set(J, ev, "bubbles", js_bool(0));
+    js_set(J, ev, "cancelable", js_bool(0));
+    dispatch_event(d, n, "close", ev, 0);
 }
 
 static jsval dialog_close(struct js *J, jsval self, jsval *args, int argc)
 {
-    struct jsdom *d = dom(J);
     struct node *n = this_node(J, self);
-    if (!n || !node_attr(n, "open"))
-        return js_undefined;
-    if (argc && ARG(0).t != JS_UNDEF)
-        js_set(J, self, "returnValue", js_to_string(J, ARG(0)));
-    remove_attr(d, n, "open");
-    jsval ev = new_event(d, "close", self);
-    js_set(J, ev, "bubbles", js_bool(0));
-    js_set(J, ev, "cancelable", js_bool(0));
-    dispatch_event(d, n, "close", ev, 0);
+    if (n)
+        dialog_close_with(dom(J), n, ARG(0));
     return js_undefined;
+}
+
+/* A request to close (Escape, requestClose()): cancel first, which a handler may prevent. */
+static int dialog_request_close(struct jsdom *d, struct node *n, jsval value)
+{
+    if (!node_attr(n, "open"))
+        return 0;
+    jsval ev = new_event(d, "cancel", wrap(d, n));
+    js_set(d->J, ev, "bubbles", js_bool(0));
+    if (!dispatch_event(d, n, "cancel", ev, 0))
+        dialog_close_with(d, n, value);
+    return 1;
+}
+
+static jsval dialog_request_close_api(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct node *n = this_node(J, self);
+    if (n)
+        dialog_request_close(dom(J), n, ARG(0));
+    return js_undefined;
+}
+
+/* closedby: what closes a dialog besides close(): "any" (light dismiss too), "closerequest" (Escape),
+ * or "none"; a modal dialog's Escape closes it unless it says none. */
+static int closed_by(const struct node *n, const char *want)
+{
+    const char *v = node_attr(n, "closedby");
+    if (!v || (strcasecmp(v, "any") && strcasecmp(v, "closerequest") && strcasecmp(v, "none")))
+        v = n->modal ? "closerequest" : "none";
+    if (!strcasecmp(want, "closerequest"))
+        return strcasecmp(v, "none") != 0;
+    return !strcasecmp(v, want);
+}
+
+/* The element left the document, or stopped being a popover: out of the top layer, without events. */
+static void top_layer_removed(struct jsdom *d, struct node *root)
+{
+    int modal = 0;
+    for (struct node *k = root; k; k = node_next_shadow(k, root)) {
+        if (k->type != N_ELEMENT)
+            continue;
+        if (k->popover_open) {
+            k->popover_open = 0;
+            k->invoker = NULL;
+            d->dirty = 1;
+        }
+        if (k->modal) {
+            k->modal = 0;
+            modal = 1;
+            d->dirty = 1;
+        }
+    }
+    if (modal)
+        update_modal(d);
+}
+
+/* popover's state changed: an open popover closes (without events); open taken off a modal dialog
+ * takes it out of the top layer. */
+static void top_layer_attr(struct jsdom *d, struct node *n, const char *name, const char *old, const char *value)
+{
+    if (!strcmp(name, "popover") && n->popover_open) {
+        struct node probe = { 0 };
+        struct attr a = { "popover", (char *)old, NULL };
+        probe.type = N_ELEMENT;
+        probe.attrs = old ? &a : NULL;
+        if (popover_state(&probe) != popover_state(n))
+            top_layer_removed(d, n);
+    } else if (!strcmp(name, "open") && !value && n->modal) {
+        n->modal = 0;
+        update_modal(d);
+        d->dirty = 1;
+    }
+}
+
+/* An invoker button: popovertarget (popovertargetaction toggle, show or hide), or commandfor with a
+ * command (show-modal, close, request-close, show-popover, hide-popover, toggle-popover, or a --custom
+ * one, which only sends the target a command event). A click's activation, after the click event. */
+static struct node *invoker_target(struct jsdom *d, struct node *n, const char *attr)
+{
+    const char *id = node_attr(n, attr);
+    return id && *id ? by_id(d->h.root, id) : NULL;
+}
+
+static void invoke(struct jsdom *d, struct node *target)
+{
+    struct node *n = target;
+    while (n && !(is_element(n) && (n->tag == T_BUTTON || n->tag == T_INPUT)))
+        n = n->parent;
+    if (!n || web_disabled(n) || web_inert(n))
+        return;
+    const char *type = node_attr(n, "type");
+    if (n->tag == T_INPUT && (!type || (strcasecmp(type, "button") && strcasecmp(type, "submit") &&
+                                        strcasecmp(type, "reset") && strcasecmp(type, "image"))))
+        return;
+    int submit = n->tag == T_BUTTON ? !type || !strcasecmp(type, "submit") : !strcasecmp(type, "submit") ||
+                 !strcasecmp(type, "image");
+    struct node *form = NULL;
+    for (struct node *p = n->parent; p && !form; p = p->parent)
+        if (p->tag == T_FORM)
+            form = p;
+    if (submit && (form || node_attr(n, "form")))
+        return;                         /* a form's submit button submits it instead */
+    struct js *J = d->J;
+    struct node *t = n->tag == T_BUTTON ? invoker_target(d, n, "commandfor") : NULL;
+    const char *command = node_attr(n, "command");
+    if (t && command && *command) {
+        jsval ev = new_event(d, "command", wrap(d, t));
+        js_set(J, ev, "bubbles", js_bool(0));
+        js_set(J, ev, "command", js_str(J, command));
+        js_set(J, ev, "source", wrap(d, n));
+        if (dispatch_event(d, t, "command", ev, 0) || !is_connected(d, t))
+            return;
+        if (!strcasecmp(command, "toggle-popover") && popover_state(t)) {
+            if (t->popover_open)
+                hide_popover(d, t, 1, 1);
+            else
+                show_popover(d, t, n);
+        } else if (!strcasecmp(command, "show-popover") && popover_state(t)) {
+            show_popover(d, t, n);
+        } else if (!strcasecmp(command, "hide-popover") && popover_state(t)) {
+            hide_popover(d, t, 1, 1);
+        } else if (t->tag == T_DIALOG && !strcasecmp(command, "show-modal")) {
+            dialog_open(d, t, 1);
+        } else if (t->tag == T_DIALOG && !strcasecmp(command, "close")) {
+            const char *v = node_attr(n, "value");
+            dialog_close_with(d, t, v ? js_str(J, v) : js_undefined);
+        } else if (t->tag == T_DIALOG && !strcasecmp(command, "request-close")) {
+            const char *v = node_attr(n, "value");
+            dialog_request_close(d, t, v ? js_str(J, v) : js_undefined);
+        }
+        return;
+    }
+    t = invoker_target(d, n, "popovertarget");
+    if (!t || !popover_state(t))
+        return;
+    const char *action = node_attr(n, "popovertargetaction");
+    int show = action && !strcasecmp(action, "show"), hide = action && !strcasecmp(action, "hide");
+    if (t->popover_open && !show)
+        hide_popover(d, t, 1, 1);
+    else if (!t->popover_open && !hide)
+        show_popover(d, t, n);
+}
+
+/* The newest of the top layer's auto popovers and modal dialogs: what Escape closes. */
+static struct node *top_closable(struct jsdom *d)
+{
+    struct node *top = NULL;
+    for (struct node *n = d->h.root; n; n = node_next_shadow(n, d->h.root))
+        if (n->type == N_ELEMENT && (n->popover_open == POP_AUTO || n->popover_open == POP_HINT ||
+                                     (n->tag == T_DIALOG && node_attr(n, "open") && closed_by(n, "closerequest"))) &&
+            (!top || n->top_seq > top->top_seq))
+            top = n;
+    return top;
+}
+
+int jsdom_dialog_submit(struct jsdom *d, struct node *form, struct node *submitter)
+{
+    if (!d || !form)
+        return 0;
+    const char *method = submitter ? node_attr(submitter, "formmethod") : NULL;
+    if (!method)
+        method = node_attr(form, "method");
+    if (!method || strcasecmp(method, "dialog"))
+        return 0;
+    struct node *dlg = form;
+    while (dlg && dlg->tag != T_DIALOG)
+        dlg = dlg->parent;
+    if (dlg && node_attr(dlg, "open")) {
+        const char *v = submitter ? node_attr(submitter, "value") : NULL;
+        d->depth++;
+        dialog_close_with(d, dlg, v ? js_str(d->J, v) : js_undefined);
+        d->depth--;
+        js_run_jobs(d->J);
+        settle(d);
+    }
+    return 1;
+}
+
+int jsdom_close_request(struct jsdom *d)
+{
+    if (!d)
+        return 0;
+    struct node *top = top_closable(d);
+    if (!top)
+        return 0;
+    d->depth++;
+    if (top->popover_open)
+        hide_popover(d, top, 1, 1);
+    else
+        dialog_request_close(d, top, js_undefined);
+    d->depth--;
+    js_run_jobs(d->J);
+    settle(d);
+    return 1;
+}
+
+void jsdom_light_dismiss(struct jsdom *d, struct node *target, int x, int y)
+{
+    if (!d)
+        return;
+    struct node *open[64];
+    int nopen = auto_popovers(d, open, 64);
+    struct node *dlg = d->h.root->top_modal;
+    int bx, by, bw, bh;
+    int on_backdrop = dlg && target == dlg && closed_by(dlg, "any") && d->h.node_box &&
+                      d->h.node_box(d->h.ctx, dlg, &bx, &by, &bw, &bh) &&
+                      (x < bx || y < by || x >= bx + bw || y >= by + bh);
+    if (!nopen && !on_backdrop)
+        return;
+    d->depth++;
+    if (nopen) {
+        /* the popover pressed in (or the one the pressed button opens) stays, with those under it */
+        struct node *keep = NULL;
+        for (struct node *p = target; p; p = p->parent ? p->parent : p->shadow_host)
+            if (p->type == N_ELEMENT && (p->popover_open == POP_AUTO || p->popover_open == POP_HINT)) {
+                keep = p;
+                break;
+            }
+        for (struct node *p = target; p; p = p->parent)
+            if (is_element(p) && (p->tag == T_BUTTON || p->tag == T_INPUT)) {
+                struct node *t = invoker_target(d, p, "popovertarget");
+                if (!t)
+                    t = invoker_target(d, p, "commandfor");
+                if (t && t->popover_open && (!keep || t->top_seq > keep->top_seq))
+                    keep = t;
+                break;
+            }
+        hide_popovers_until(d, keep, 0, 1);
+    } else {
+        dialog_request_close(d, dlg, js_undefined);
+    }
+    d->depth--;
+    js_run_jobs(d->J);
+    settle(d);
 }
 
 /* form.submit(), requestSubmit() and reset() */
@@ -3026,13 +3633,15 @@ static jsval nothing(struct js *J, jsval self, jsval *args, int argc)
     return js_undefined;
 }
 
+static void invoke(struct jsdom *d, struct node *target);
+
 static jsval el_click(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)args;
     (void)argc;
     struct node *n = this_node(J, self);
-    if (n && !web_inert(n) && !web_disabled(n))
-        jsdom_dispatch(dom(J), n, "click");
+    if (n && !web_inert(n) && !web_disabled(n) && !jsdom_dispatch(dom(J), n, "click"))
+        invoke(dom(J), n);
     return js_undefined;
 }
 
@@ -3257,7 +3866,8 @@ static jsval event_composed_path(struct js *J, jsval self, jsval *args, int argc
     X(EV_HASHCHANGE, "HashChangeEvent", EV_EVENT) X(EV_ANIMATION, "AnimationEvent", EV_EVENT) \
     X(EV_TRANSITION, "TransitionEvent", EV_EVENT) X(EV_CLIPBOARD, "ClipboardEvent", EV_EVENT) \
     X(EV_STORAGE, "StorageEvent", EV_EVENT) X(EV_PAGETRANSITION, "PageTransitionEvent", EV_EVENT) \
-    X(EV_BEFOREUNLOAD, "BeforeUnloadEvent", EV_EVENT) X(EV_TOGGLE, "ToggleEvent", EV_EVENT)
+    X(EV_BEFOREUNLOAD, "BeforeUnloadEvent", EV_EVENT) X(EV_TOGGLE, "ToggleEvent", EV_EVENT) \
+    X(EV_COMMAND, "CommandEvent", EV_EVENT)
 
 enum {
 #define X(id, name, parent) id,
@@ -3280,7 +3890,7 @@ static int event_kind(const char *type)
         { "keypress", EV_KEYBOARD }, { "focus", EV_FOCUS }, { "blur", EV_FOCUS }, { "focusin", EV_FOCUS },
         { "focusout", EV_FOCUS }, { "input", EV_INPUT }, { "beforeinput", EV_INPUT },
         { "submit", EV_SUBMIT }, { "popstate", EV_POPSTATE }, { "hashchange", EV_HASHCHANGE },
-        { "message", EV_MESSAGE }, { "toggle", EV_TOGGLE }, { "beforetoggle", EV_TOGGLE },
+        { "message", EV_MESSAGE }, { "toggle", EV_TOGGLE }, { "beforetoggle", EV_TOGGLE }, { "command", EV_COMMAND },
         { "dragstart", EV_DRAG }, { "drag", EV_DRAG }, { "dragenter", EV_DRAG }, { "dragover", EV_DRAG },
         { "dragleave", EV_DRAG }, { "drop", EV_DRAG }, { "dragend", EV_DRAG },
     };
@@ -3570,6 +4180,13 @@ int jsdom_mouse_event(struct jsdom *d, struct node *target, const char *type, in
     if (related)
         js_set(J, ev, "relatedTarget", wrap(d, related));
     int prevented=dispatch_event(d, target, type, ev, bubbles);
+    if (!prevented && !strcmp(type, "click") && is_connected(d, target)) {    /* popovertarget, commandfor */
+        d->depth++;
+        invoke(d, target);
+        d->depth--;
+        js_run_jobs(J);
+        settle(d);
+    }
     if(!strcmp(type,"pointerup")||!strcmp(type,"pointercancel")){
         d->pointer_down=0;d->pointer_buttons=0;d->pending_capture=NULL;update_pointer_capture(d);
     }
@@ -5709,8 +6326,7 @@ void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, i
                                             X(E, scroll) X(E, scrollTo) X(E, scrollBy) X(E, getClientRects)  \
                                                 X(E, checkVisibility) X(E, setPointerCapture)                \
                                                     X(E, releasePointerCapture) X(E, hasPointerCapture)      \
-                                                        X(E, showPopover) X(E, hidePopover)                  \
-                                                            X(E, togglePopover) X(E, inert) X(E, draggable)  \
+                                                            X(E, inert) X(E, draggable)                      \
                                                                 X(E, slot) X(E, part) X(T, splitText)        \
                                                                     X(T, appendData) X(T, substringData)     \
     X(W, ReportingObserver) X(W, TaskController) X(W, scheduler) X(W, SpeechSynthesisUtterance)              \
@@ -5863,6 +6479,48 @@ static jsval clipboard_text(struct js *J, jsval self, jsval *args, int argc)
     const char *text=d->h.clipboard_read(d->h.ctx);
     return js_str(J,text?text:"");
 }
+/* ---- <audio>: the browser plays it (h.media); what the sound does comes back through jsdom_media_event,
+ * to jsdomlib.h's %mediaState, which keeps the element's state and sends the events ---- */
+static jsval media_api(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    struct jsdom *d = dom(J);
+    struct node *n = node_of(ARG(0));
+    const char *op = js_tostr(J, ARG(1))->s;
+    if (!strcmp(op, "allowed"))         /* sound may start once the user has done something on the page */
+        return js_bool(d->activated);
+    if (n && d->h.media)
+        d->h.media(d->h.ctx, n, op, js_to_number(J, ARG(2)));
+    return js_undefined;
+}
+
+static void media_call(struct jsdom *d, const char *hook, struct node *n, const char *what, double a, double b)
+{
+    if (!d || !n)
+        return;
+    struct js *J = d->J;
+    jsval fn = js_get(J, js_obj(d->window), hook), r;
+    if (!js_is_callable(fn))
+        return;
+    jsval args[4] = { wrap(d, n), js_str(J, what), js_num(a), js_num(b) };
+    d->depth++;
+    if (js_call(J, fn, js_undefined, args, 4, &r) < 0)
+        report(d, hook);
+    d->depth--;
+    js_run_jobs(J);
+    settle(d);
+}
+
+void jsdom_media_event(struct jsdom *d, struct node *n, const char *type, double time, double duration)
+{
+    media_call(d, "%mediaState", n, type, time, duration);
+}
+
+void jsdom_media_user(struct jsdom *d, struct node *n, const char *op, double time)
+{
+    media_call(d, "%mediaUser", n, op, time, 0);
+}
+
 static jsval pointer_capture_api(struct js *J, jsval self, jsval *args, int argc)
 {
     struct jsdom *d=dom(J);struct node *n=this_node(J,self);
@@ -5986,6 +6644,8 @@ struct jsdom *jsdom_new(const struct jshost *host)
         { "select", nothing, 0 }, { "scrollIntoView", el_scroll_into_view, 0 },
         { "setSelectionRange", nothing, 2 }, { "submit", form_submit, 0 },
         { "requestSubmit", form_request_submit, 0 }, { "reset", form_reset, 0 },
+        { "showPopover", el_show_popover, 0 }, { "hidePopover", el_hide_popover, 0 },
+        { "togglePopover", el_toggle_popover, 0 },
     };
     for (unsigned i = 0; i < sizeof(element_methods) / sizeof(element_methods[0]); i++)
         fn(J, ep, element_methods[i].name, element_methods[i].fn, element_methods[i].n);
@@ -6338,8 +6998,9 @@ struct jsdom *jsdom_new(const struct jshost *host)
             jscanvas_install(J, proto);
         if (!strcmp(ifaces[i].name, "HTMLDialogElement")) {
             fn(J, proto, "show", dialog_show, 0);
-            fn(J, proto, "showModal", dialog_show, 0);
+            fn(J, proto, "showModal", dialog_show_modal, 0);
             fn(J, proto, "close", dialog_close, 1);
+            fn(J, proto, "requestClose", dialog_request_close_api, 1);
             js_put(J, proto, S(J, "returnValue"), js_str(J, ""), 0);
         }
     }
@@ -6360,6 +7021,7 @@ struct jsdom *jsdom_new(const struct jshost *host)
     fn(J,w,"%clipboard",clipboard_text,1);
     fn(J,w,"%chosenFile",chosen_file,1);
     fn(J,w,"%pointerCapture",pointer_capture_api,2);
+    fn(J,w,"%media",media_api,3);
     fn(J,w,"%winop",window_op,4);
     fn(J,w,"%b64",bytes_base64,1);
     fn(J,w,"%unb64",base64_bytes,1);

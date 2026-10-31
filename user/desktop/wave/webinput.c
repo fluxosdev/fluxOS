@@ -7,11 +7,19 @@ static const struct node *interaction_parent(const struct node *n)
 {
     return n->parent ? n->parent : n->shadow_host;
 }
+/* inert, or outside the document's topmost modal dialog (which its root names). */
 int web_inert(const struct node *n)
 {
+    const struct node *root = n;
+    for (const struct node *p = n; p; p = interaction_parent(p)) {
+        if (node_attr(p, "inert")) return 1;
+        root = p;
+    }
+    const struct node *modal = root ? root->top_modal : NULL;
+    if (!modal) return 0;
     for (; n; n = interaction_parent(n))
-        if (node_attr(n, "inert")) return 1;
-    return 0;
+        if (n == modal) return 0;
+    return 1;
 }
 int web_disabled(const struct node *n)
 {

@@ -326,7 +326,7 @@ says why.
   its name and what letting go would do ("Move to Downloads", "Open in Paint"); the
   pointer is a no-entry sign where nothing takes it, and Escape cancels. Files from the
   File Manager move into another folder window (copied to another disk, or with Ctrl
-  held), open in a Text Editor, Paint (pictures), the Sound Player (WAV), the Archive
+  held), open in a Text Editor, Paint (pictures), the Sound Player (WAV, MP3, Ogg), the Archive
   Manager (ZIP, 7z) or Wave, and are typed into a terminal as quoted paths. Text
   selected in an editor, and links and pictures from Wave (their address), go into an
   editor where they are let go, into a page's text field, or into a terminal as typed
@@ -347,8 +347,8 @@ says why.
   use.
 - **Text editor**: Notepad-style, File/Edit menus, selection, a clipboard
   shared with the browser, files up to 1 MB. No undo, word wrap or search.
-- **Sound Player**: opens a PCM WAV (typed path or from the file manager) with
-  Play, Pause, Stop and a seek bar. It runs `play(1)` (`play -s SECONDS`
+- **Sound Player**: opens a WAV, MP3 or Ogg Vorbis file (typed path, dropped on it, or from
+  the file manager) with Play, Pause, Stop and a seek bar. It runs `play(1)` (`play -s SECONDS`
   starts part-way in) so the player keeps running.
 - **Display Properties**: wallpaper and fill mode with a preview (with **(None)** chosen, a
   `#rrggbb` field sets the solid desktop color; **Kinetik** is the theme's drawn
@@ -460,8 +460,8 @@ fetcher process, so the browser keeps running), or from `file://`.
   `scroll-behavior`, which are accepted and ignored). More selectors: `:target`,
   `:lang()`, `:read-only`/`:read-write`, `:default`, `:indeterminate`, `:valid`/`:invalid`
   (`required`, `type=email`/`url`/`number` with `min`/`max`, `minlength`, `maxlength`),
-  `:in-range`/`:out-of-range`, `:scope`, `:dir(ltr)`, `:user-invalid`, and the pseudo-elements
-  `::placeholder`, `::selection` and `::marker`. Counters: `counter-reset`, `counter-increment`
+  `:in-range`/`:out-of-range`, `:scope`, `:dir(ltr)`, `:user-invalid`, `:modal`, `:popover-open`,
+  `:open`, and the pseudo-elements `::placeholder`, `::selection`, `::marker` and `::backdrop`. Counters: `counter-reset`, `counter-increment`
   and `counter()`/`counters()` in `content` (one flat set of counters, not scoped by nesting).
   Also `tab-size`, `text-align-last`, `-webkit-line-clamp` (the lines are cut off, with no
   ellipsis), `list-style-image`, and `hyphens` and `resize`, which are accepted and ignored.
@@ -513,10 +513,21 @@ fetcher process, so the browser keeps running), or from `file://`.
   `scrollIntoView()` on them. `fixed` boxes stay where they are in the window as the page scrolls; `sticky` boxes
   follow it until the end of the box they are in (against the window, not a scrolling
   box inside the page). `<progress>`, `<meter>` and `<ruby>` (the annotation above its
-  base) are drawn. Nothing plays `<video>` or `<audio>`: a video is a box of its size with its poster
-  and a play button, `<audio controls>` a bar, and a click on either downloads the file (its `src`
-  or first `<source>`); the fallback inside them is not shown, as in a browser that plays them. An
-  `<object>` shows its fallback content. `<template shadowrootmode>` in a page's HTML attaches a
+  base) are drawn. The top layer: modal dialogs and open popovers are laid out over everything (above
+  any `z-index`, out of whatever clips or transforms their parents), in the order they opened,
+  centred in the window by the user agent sheet, each on its `::backdrop`. Anchor positioning:
+  `anchor-name`, `position-anchor` (a popover's default anchor is the button that opened it),
+  `anchor()` in the insets (sides, `center`, percentages, a fallback, and `calc()` with a length
+  added), `anchor-size()`, `position-area`, `justify-self`/`align-self: anchor-center` and
+  `position-try-fallbacks` (`flip-block`, `flip-inline`, `flip-start` and other areas; named
+  `@position-try` rules are not supported); a page with anchors is laid out twice. `width` and
+  `height` take `fit-content` (and `min-content`/`max-content`, alike), and an absolute box with
+  `top` and `bottom` but no height stretches between them. `<audio>` plays MP3, Ogg Vorbis and
+  WAV: one `wave --audio` process decodes (minimp3, stb_vorbis), mixes the streams of every page and
+  holds `/dev/dsp` only while something sounds; `<audio controls>` is a play button, the time and a
+  bar to seek along. Nothing plays `<video>`: it is a box of its size with its poster and a play
+  button, and a click downloads the file (its `src` or first `<source>`); the fallback inside media
+  elements is not shown, as in a browser that plays them. An `<object>` shows its fallback content. `<template shadowrootmode>` in a page's HTML attaches a
   shadow root (declarative shadow DOM).
 - **Forms**: `<select>` opens a list (arrows, Home/End, typing a letter, Enter, wheel and
   scroll bar for long ones); fields with a `<datalist>` suggest matches as you type;
@@ -604,7 +615,14 @@ fetcher process, so the browser keeps running), or from `file://`.
   elements (`customElements.define` with upgrades and lifecycle callbacks;
   `attachShadow` creates a separate open or closed tree, with scoped styles,
   named/default slots, coalesced `slotchange` events, slotted event paths and event retargeting), `<template>`
-  content, `<dialog>`, `HTMLInputElement` and the other interfaces for
+  content, `<dialog>` (`show()`, `showModal()`, which makes the rest of the page inert,
+  `requestClose()`, `closedby`, `<form method=dialog>`), popovers (`popover` auto, manual and
+  hint, `showPopover()`/`hidePopover()`/`togglePopover()`, nesting, light dismiss and Escape,
+  `beforetoggle` and `toggle`), invoker buttons (`popovertarget`, and `commandfor` with
+  `show-modal`, `close`, `request-close`, the popover commands and `--custom` ones, sending
+  `command` events), `HTMLAudioElement` (`play()` promises, which need the user to have pressed a
+  key or the mouse on the page first unless muted, `pause()`, `currentTime`, `duration`, `volume`,
+  `muted`, `loop`, `autoplay`, `canPlayType()` and the media events), `HTMLInputElement` and the other interfaces for
   `instanceof`, `TreeWalker`, `Range`/`Selection`, form validation,
   `form.submit()`/`requestSubmit()`, `load`/`error` events for pictures,
   scripts and style sheets,
@@ -743,8 +761,8 @@ containers and exceptions (`make test-gcc-qemu`).
   as it arrives). `https://` uses libc's own TLS client (`<tls.h>`: TLS 1.3, or
   TLS 1.2 with ECDHE and AES-GCM or ChaCha20-Poly1305). It encrypts but does not verify the server's certificate.
 - `beep [-f HZ] [-l MS] [-r N] [-d MS] [-n ...]` and `beep -m MUSIC` (BASIC's
-  PLAY language); `play [-q] [-s SECONDS] FILE...` plays WAV (8 to 32-bit PCM)
-  and VOC files, `play -t HZ [-l MS]` a test tone; `mixer [CHANNEL LEVEL]`.
+  PLAY language); `play [-q] [-s SECONDS] FILE...` plays WAV (8 to 32-bit PCM,
+  32-bit float), VOC, MP3 and Ogg Vorbis files (the last two with Wave's decoders, up to 64 MB), `play -t HZ [-l MS]` a test tone; `mixer [CHANNEL LEVEL]`.
 
 ## Building
 
@@ -948,10 +966,13 @@ user/desktop/image/        PNG/JPEG/GIF/WebP/ICO/SVG decoding (image.c picks the
 user/desktop/wave/         the Wave browser: window (browser.c), HTML (html.c), CSS
                            (css.c), layout (layout.c), shadow composition (shadow.c),
                            fonts (webfont.c), URLs (webutil.c), request policy
-                           (webpolicy.c), cookies, storage and <canvas> (canvas.c)
+                           (webpolicy.c), cookies, storage, <canvas> (canvas.c), and
+                           <audio> (webaudio.c, the player; codecs.c, the decoders)
 user/desktop/wave/js/      JavaScript (js.c, jslib*.c, jsbinary.c, jsre.c, jsgc.c, jsdom.c)
 third_party/mbedtls/        upstream verification library subset and its fluxOS config
 third_party/uacpi/         uACPI 6.1.1, the AML interpreter (unmodified)
+third_party/minimp3/       minimp3, Wave's MP3 decoder (unmodified, public domain)
+third_party/stb_vorbis/    stb_vorbis 1.22, Wave's Ogg Vorbis decoder (unmodified, public domain)
 user/dos/                  the DOS emulator (CPU, DPMI, BIOS, video, files, sound)
 user/bin/                  one program per file (fluxinstall.c is the installer)
 rootfs/                    the installed system's files (/etc, /home/flux, icons,
@@ -1189,8 +1210,11 @@ The FPU state is saved with FXSAVE, so AVX and later cannot be used.
   and clipping at the viewer plane. Parent `perspective` and `perspective-origin` project
   direct transformed children. Shared `preserve-3d` scenes, depth sorting and intersecting
   planes remain unimplemented; `CSS.supports()` reports `transform-style` as unsupported. CSS transitions and `@keyframes` animations run on colors, lengths, opacity,
-  transforms with matching functions, shadows and the box properties (not on pseudo-elements,
-  and not on discrete properties such as `display`); each frame restyles only what moves. Transform scratch rendering is bounded to four million
+  transforms with matching functions, shadows and the box properties (not on pseudo-elements);
+  `display` and `overlay` transition with `transition-behavior: allow-discrete` (the box stays shown,
+  and in the top layer, until the transition ends), `@starting-style` (at the top level or nested)
+  gives what an element appearing, or coming out of `display: none`, transitions from, and nothing
+  else transitions out of `display: none`; each frame restyles only what moves. Transform scratch rendering is bounded to four million
   source pixels per item. `structuredClone` copies buffers, typed views and blobs,
   preserving shared references; ownership transfer is not implemented. `CSS.escape`
   handles identifier serialization, including Unicode and selector round trips.

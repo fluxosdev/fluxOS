@@ -48,10 +48,15 @@ struct page {
 /* Pictures the engine would have fetched: every background picture and <img> is this 40x20 one. */
 static struct image test_img = { 40, 20, NULL };
 
+/* What scripts would have done before the page is styled (opened popovers and dialogs), or NULL. */
+static void (*before_style)(struct node *root);
+
 static void load(struct page *p, const char *html, int vw, int vh)
 {
     memset(p, 0, sizeof(*p));
     struct node *root = p->root = html_parse(&p->a, html, (int)strlen(html));
+    if (before_style)
+        before_style(root);
     struct sheet *sheets[4];
     int ns = 0;
     for (struct node *n = root; n; n = node_next(n, root))
@@ -1073,8 +1078,164 @@ static void perspective_projection(void)
     CHECK(!css_supports("(grid-auto-rows: subgrid)"));
     puts("browser perspective: depth, matrix3d, scaleZ, parent perspective, raster pixels, eye-plane clipping and hit testing passed");
 }
+static struct node *by_id(struct node *root, const char *id)
+{
+    for (struct node *n = root; n; n = node_next(n, root))
+        if (n->type == N_ELEMENT && node_attr(n, "id") && !strcmp(node_attr(n, "id"), id))
+            return n;
+    return NULL;
+}
+
+static int item_index(const struct page *p, const struct ditem *d) { return (int)(d - p->lo.items); }
+
+/* As showModal() and showPopover() leave them: #d modal (and open), #p1 then #p2 open popovers. */
+static void open_top_layer(struct node *root)
+{
+    struct node *d = by_id(root, "d"), *p1 = by_id(root, "p1"), *p2 = by_id(root, "p2");
+    if (d)
+        d->modal = 1, d->top_seq = 1, root->top_modal = d;
+    if (p2)
+        p2->popover_open = POP_AUTO, p2->top_seq = 2;
+    if (p1)
+        p1->popover_open = POP_MANUAL, p1->top_seq = 3;
+}
+
+static void top_layer(void)
+{
+    struct page p;
+    /* A modal dialog leaves its clipped, transformed, z-indexed box: centred in the viewport, over
+     * everything, on a backdrop that covers the window and stays there as the page scrolls. */
+    before_style = open_top_layer;
+    load(&p, "<style>body{margin:0}#d{width:100px;height:50px;padding:0;border:0;background:#123456}"
+             ".trap{position:relative;z-index:5;transform:translateX(10px);overflow:hidden;width:30px;height:20px}"
+             ".over{position:absolute;z-index:999;top:0;left:0;width:400px;height:300px;background:#00ff00}</style>"
+             "<div class=trap><dialog id=d open>D</dialog></div><div class=over></div>"
+             "<div style='height:2000px'></div>", 400, 300);
+    const struct ditem *dlg = colored(&p, 0xff123456), *over = colored(&p, 0xff00ff00);
+    CHECK(dlg && over && !dlg->xf && !dlg->sb);
+    CHECK(dlg->x == 150 && dlg->y == 125 && dlg->w == 100 && dlg->h == 50);
+    CHECK(item_index(&p, dlg) > item_index(&p, over));                  /* above z-index 999 */
+    CHECK(dlg->dyn && dy_of(&p, dlg, 0, 500) == 625);                  /* fixed in the window */
+    const struct ditem *back = NULL;
+    for (int i = 0; i < p.lo.nitems; i++)
+        if (p.lo.items[i].kind == DK_FILL && p.lo.items[i].w == 400 && p.lo.items[i].h == 300 &&
+            ALPHA(p.lo.items[i].color) > 0 && ALPHA(p.lo.items[i].color) < 64)
+            back = &p.lo.items[i];
+    CHECK(back && back->node == by_id(p.root, "d") && item_index(&p, back) < item_index(&p, dlg) &&
+          item_index(&p, back) > item_index(&p, over));
+    unload(&p);
+    /* Popovers: hidden until opened, then centred, the one opened last on top; a closed one has no box. */
+    load(&p, "<style>body{margin:0}[popover]{padding:0;border:0}#p1{width:40px;height:10px;background:#ff0000}"
+             "#p2{width:60px;height:20px;background:#0000ff}#p3{background:#00ffff}</style>"
+             "<div id=p1 popover=manual></div><div id=p2 popover></div><div id=p3 popover>closed</div>", 200, 100);
+    const struct ditem *r = colored(&p, 0xffff0000), *b = colored(&p, 0xff0000ff);
+    CHECK(r && b && !colored(&p, 0xff00ffff) && !word(&p, "closed"));
+    CHECK(r->x == 80 && r->y == 45 && b->x == 70 && b->y == 40);
+    CHECK(item_index(&p, r) > item_index(&p, b));                       /* p1 went in after p2 */
+    unload(&p);
+    before_style = NULL;
+    /* A dialog shown without showModal stays where it is, centred across, as wide as its content. */
+    load(&p, "<style>body{margin:0}dialog{padding:0;border:0;background:#123456}</style>"
+             "<div style='height:30px'></div><dialog open>wide</dialog>", 200, 100);
+    const struct ditem *shown = colored(&p, 0xff123456);
+    CHECK(shown && shown->y == 30 && shown->w == 32 && shown->x == 84 && !shown->dyn);
+    unload(&p);
+}
+
+static void fit_content(void)
+{
+    struct page p;
+    load(&p, "<style>body{margin:0}#a{width:fit-content;background:#ff0000}#b{width:max-content;margin:0 auto;"
+             "background:#00ff00}#c{position:absolute;top:10px;bottom:20px;left:0;width:50px;background:#0000ff}"
+             "#e{position:absolute;top:0;bottom:0;left:0;right:0;width:20px;height:fit-content;margin:auto;"
+             "background:#ffff00}</style><div id=a>abc</div><div id=b>abcd</div><div id=c></div><div id=e>x</div>",
+         200, 200);
+    const struct ditem *a = colored(&p, 0xffff0000), *b = colored(&p, 0xff00ff00);
+    const struct ditem *c = colored(&p, 0xff0000ff), *e = colored(&p, 0xffffff00);
+    CHECK(a && a->w == 24 && a->x == 0);
+    CHECK(b && b->w == 32 && b->x == 84);                              /* auto margins centre it */
+    CHECK(c && c->y == 10 && c->h == 170);                             /* stretched between top and bottom */
+    CHECK(e && e->h == 20 && e->y == 90 && e->x == 90);                /* fit-content: centred, not stretched */
+    unload(&p);
+}
+
+/* The anchor #a: 40x20 at (50, 30) (or at the bottom of a 100px viewport). */
+#define ANCHOR_CSS "body{margin:0}#a{anchor-name:--a;margin:30px 0 0 50px;width:40px;height:20px;background:#ff0000}"
+
+/* #b is the button that opened the popover #p1. */
+static void opened_by_button(struct node *root)
+{
+    struct node *p = by_id(root, "p1");
+    if (p)
+        p->popover_open = POP_AUTO, p->top_seq = 1, p->invoker = by_id(root, "b");
+}
+
+static void anchors(void)
+{
+    struct page p;
+    const struct ditem *t;
+    /* anchor() in the insets, by name and by the default anchor; calc() and percentages */
+    load(&p, "<style>" ANCHOR_CSS "#t{position:absolute;position-anchor:--a;top:anchor(bottom);left:anchor(right);"
+             "width:10px;height:10px;background:#00ff00}#u{position:absolute;top:calc(anchor(--a top) - 5px);"
+             "left:anchor(--a 25%);width:anchor-size(--a width);height:4px;background:#0000ff}"
+             "#v{position:absolute;right:anchor(--a left);bottom:anchor(--a top);width:6px;height:6px;background:#00ffff}"
+             "</style><div id=a></div><div id=t></div><div id=u></div><div id=v></div>", 200, 200);
+    t = colored(&p, 0xff00ff00);
+    CHECK(t && t->x == 90 && t->y == 50);
+    t = colored(&p, 0xff0000ff);
+    CHECK(t && t->x == 60 && t->y == 25 && t->w == 40);
+    t = colored(&p, 0xff00ffff);
+    CHECK(t && t->x == 44 && t->y == 24);
+    unload(&p);
+    /* position-area: a cell beside the anchor, or centred across it */
+    const char *areas[] = { "bottom", "top left", "right center", "span-all", "left span-bottom" };
+    const int at[][2] = { { 65, 50 }, { 40, 20 }, { 90, 35 }, { 65, 35 }, { 40, 30 } };
+    for (unsigned k = 0; k < sizeof(areas) / sizeof(areas[0]); k++) {
+        char html[512];
+        snprintf(html, sizeof(html), "<style>" ANCHOR_CSS "#t{position:absolute;position-anchor:--a;position-area:%s;"
+                 "width:10px;height:10px;background:#00ff00}</style><div id=a></div><div id=t></div>", areas[k]);
+        load(&p, html, 200, 200);
+        t = colored(&p, 0xff00ff00);
+        CHECK(t && t->x == at[k][0] && t->y == at[k][1]);
+        unload(&p);
+    }
+    /* anchor-center, and an anchor that is not there: the fallback */
+    load(&p, "<style>" ANCHOR_CSS "#t{position:absolute;position-anchor:--a;top:anchor(bottom);justify-self:anchor-center;"
+             "width:10px;height:10px;background:#00ff00}#u{position:absolute;top:anchor(--nothing bottom, 7px);left:3px;"
+             "width:4px;height:4px;background:#0000ff}</style><div id=a></div><div id=t></div><div id=u></div>", 200, 200);
+    t = colored(&p, 0xff00ff00);
+    CHECK(t && t->x == 65 && t->y == 50);
+    t = colored(&p, 0xff0000ff);
+    CHECK(t && t->x == 3 && t->y == 7);
+    unload(&p);
+    /* no room below the anchor at the foot of the window: flip-block puts it above */
+    load(&p, "<style>body{margin:0}#a{anchor-name:--a;position:absolute;top:80px;left:20px;width:40px;height:20px}"
+             "#t{position:fixed;position-anchor:--a;top:anchor(bottom);left:anchor(left);width:10px;height:30px;"
+             "background:#00ff00;position-try-fallbacks:flip-block}"
+             "#u{position:fixed;position-anchor:--a;position-area:bottom;width:10px;height:30px;background:#0000ff;"
+             "position-try-fallbacks:flip-inline,top}</style><div id=a></div><div id=t></div><div id=u></div>", 200, 100);
+    t = colored(&p, 0xff00ff00);
+    CHECK(t && t->x == 20 && t->y == 50);
+    t = colored(&p, 0xff0000ff);
+    CHECK(t && t->x == 35 && t->y == 50);
+    CHECK(!t->dyn);                                     /* it goes with the anchor as the page scrolls */
+    unload(&p);
+    /* a popover is anchored to the button that opened it */
+    before_style = opened_by_button;
+    load(&p, "<style>body{margin:0}#b{margin-left:100px;width:30px;height:16px;padding:0;border:0}"
+             "#p1{inset:auto;margin:0;padding:0;border:0;position-area:bottom span-right;width:50px;height:10px;"
+             "background:#00ff00}</style><button id=b></button><div id=p1 popover></div>", 300, 200);
+    t = colored(&p, 0xff00ff00);
+    CHECK(t && t->x == 100 && t->y == 16);
+    unload(&p);
+    before_style = NULL;
+}
+
 int main(void)
 {
+    anchors();
+    top_layer();
+    fit_content();
     subgrids();
     perspective_projection();
     effects();
@@ -1094,5 +1255,5 @@ int main(void)
     shadow_layout();
     canvas_layout();
     cjk_wrapping();
-    puts("browser layout: spacing, wrapping, fixed and sticky boxes, outlines, tables, ruby, background pictures, object-fit, scrolling boxes, canvases, CJK wrapping and multi-column boxes passed");
+    puts("browser layout: spacing, wrapping, fixed and sticky boxes, the top layer, anchor positioning, fit-content, outlines, tables, ruby, background pictures, object-fit, scrolling boxes, canvases, CJK wrapping and multi-column boxes passed");
 }

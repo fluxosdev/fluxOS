@@ -706,11 +706,6 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
   def(EP, "setPointerCapture", function (id) { return g["%pointerCapture"].call(this, id, 1); });
   def(EP, "releasePointerCapture", function (id) { return g["%pointerCapture"].call(this, id, 0); });
   def(EP, "hasPointerCapture", function (id) { return g["%pointerCapture"].call(this, id, 2); });
-  def(EP, "showPopover", function () { this.setAttribute("data-popover-open", ""); this.style.display = "block"; });
-  def(EP, "hidePopover", function () { this.removeAttribute("data-popover-open"); this.style.display = ""; });
-  def(EP, "togglePopover", function () {
-    if (this.hasAttribute("data-popover-open")) this.hidePopover(); else this.showPopover();
-  });
   Object.defineProperty(EP, "inert", { configurable:true, get:function(){return this.hasAttribute("inert");}, set:function(v){if(v)this.setAttribute("inert", "");else this.removeAttribute("inert");} });
   Object.defineProperty(EP, "draggable", { configurable: true, get: function () {   /* pictures and links are by default */
     var a = this.getAttribute("draggable");
@@ -1348,40 +1343,159 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
       dispatchEvent: function () { return true; }
     };
 
-  /* <video> and <audio>: nothing plays here (a click on one downloads its file), so play() fails
-   * as it does for a format a browser cannot play, and the rest reads as an element with no media. */
+  /* <audio>: the browser plays the sound (%media) and says what it does (%mediaState), which keeps
+   * the element's state and sends its events; the controls it draws come here too (%mediaUser).
+   * Sound may start once the user has done something on the page (or muted). <video> has no player
+   * here (a click on one downloads its file): its play() fails as for a format it cannot play. */
+  var mediaOp = g["%media"];
   var mediaProtos = [g.HTMLMediaElement, g.HTMLAudioElement, g.HTMLVideoElement].filter(function (c) { return c; })
-    .map(function (c) { return c.prototype; });
+    .map(function (c) { return c.prototype; }).filter(function (p, i, all) { return all.indexOf(p) === i; });
+  var mediaNotSupported = function () { return new DOMException("This browser cannot play that media", "NotSupportedError"); };
+  var mediaError = function () { return { code: 4, message: "The sound could not be played", MEDIA_ERR_ABORTED: 1,
+                                          MEDIA_ERR_NETWORK: 2, MEDIA_ERR_DECODE: 3, MEDIA_ERR_SRC_NOT_SUPPORTED: 4 }; };
+  var mstate = function (el) {
+    var s = el["%ms"];
+    if (!s) {
+      s = { paused: true, ended: false, seeking: false, time: 0, duration: NaN, readyState: 0, networkState: 0,
+            error: null, pending: [], volume: 1, muted: el.hasAttribute("muted"), rate: 1, defaultRate: 1, pitch: true };
+      def(el, "%ms", s);
+    }
+    return s;
+  };
+  var mfire = function (el, type) { el.dispatchEvent(new Event(type)); };
+  var msettle = function (s, err) {
+    var p = s.pending;
+    s.pending = [];
+    p.forEach(function (q) { if (err) q.reject(err); else q.resolve(); });
+  };
+  var mlater = function (el, types) { setTimeout(function () { types.forEach(function (t) { mfire(el, t); }); }, 0); };
+  var mplayable = function (type) {
+    var t = String(type).toLowerCase(), base = t.split(";")[0].trim();
+    var codecs = t.indexOf("codecs=") >= 0 ? t.split("codecs=")[1] : null;
+    if (["audio/mpeg", "audio/mp3", "audio/mpeg3", "audio/x-mpeg", "audio/x-mp3"].indexOf(base) >= 0)
+      return !codecs || codecs.indexOf("mp3") >= 0 ? "probably" : "";
+    if (["audio/wav", "audio/wave", "audio/x-wav", "audio/vnd.wave"].indexOf(base) >= 0)
+      return !codecs || codecs.indexOf("1") >= 0 ? "probably" : "";
+    if (["audio/ogg", "application/ogg", "audio/vorbis"].indexOf(base) >= 0)
+      return !codecs ? "maybe" : codecs.indexOf("vorbis") >= 0 && codecs.indexOf("opus") < 0 ? "probably" : "";
+    return "";
+  };
+  var EMPTY_RANGES = { length: 0, start: function () { throw new DOMException("Index out of range", "IndexSizeError"); },
+                       end: function () { throw new DOMException("Index out of range", "IndexSizeError"); } };
+  var ranges = function (from, to) {
+    if (!(to > from)) return EMPTY_RANGES;
+    var check = function (i) { if (i !== 0) throw new DOMException("Index out of range", "IndexSizeError"); };
+    return { length: 1, start: function (i) { check(i); return from; }, end: function (i) { check(i); return to; } };
+  };
   mediaProtos.forEach(function (MP) {
-    var notSupported = function () { return new DOMException("This browser cannot play media", "NotSupportedError"); };
     def(MP, "play", function () {
-      var el = this;
-      setTimeout(function () { el.dispatchEvent(new Event("error")); }, 0);
-      var p = Promise.reject(notSupported());
+      var el = this, s = mstate(el);
+      if (el.localName !== "audio") {
+        mlater(el, ["error"]);
+        var no = Promise.reject(mediaNotSupported());
+        no.catch(function () {});
+        return no;
+      }
+      var p = new Promise(function (resolve, reject) { s.pending.push({ resolve: resolve, reject: reject }); });
+      p.catch(function () {});
+      if (s.error) {
+        msettle(s, mediaNotSupported());
+        return p;
+      }
+      if (!mediaOp(el, "allowed") && !s.muted) {
+        msettle(s, new DOMException("play() can only start sound once the user has interacted with the page", "NotAllowedError"));
+        return p;
+      }
+      if (s.ended && !el.loop) {
+        s.time = 0;
+        s.ended = false;
+      }
+      if (s.paused) {
+        s.paused = false;
+        mlater(el, ["play"]);
+      }
+      mediaOp(el, "volume", s.muted ? 0 : s.volume);
+      mediaOp(el, "play", s.time);
       return p;
     });
-    def(MP, "pause", function () {});
-    def(MP, "load", function () { var el = this; setTimeout(function () { el.dispatchEvent(new Event("emptied")); }, 0); });
-    def(MP, "canPlayType", function () { return ""; });
-    def(MP, "fastSeek", function () {});
+    def(MP, "pause", function () {
+      var el = this, s = mstate(el);
+      if (s.paused) return;
+      s.paused = true;
+      mediaOp(el, "pause", 0);
+      msettle(s, new DOMException("The play() request was interrupted by a call to pause()", "AbortError"));
+      mlater(el, ["timeupdate", "pause"]);
+    });
+    def(MP, "load", function () {
+      var el = this, s = mstate(el), had = s.networkState !== 0;
+      msettle(s, new DOMException("The play() request was interrupted by a new load request", "AbortError"));
+      mediaOp(el, "load", 0);
+      s.paused = true; s.ended = false; s.seeking = false; s.time = 0; s.duration = NaN;
+      s.readyState = 0; s.networkState = 0; s.error = null;
+      if (had) mlater(el, ["emptied"]);
+      if (el.autoplay && el.localName === "audio") el.play();
+    });
+    def(MP, "canPlayType", function (type) { return this.localName === "video" ? "" : mplayable(type); });
+    def(MP, "fastSeek", function (t) { this.currentTime = t; });
     def(MP, "addTextTrack", function () { return { mode: "disabled", cues: [], addCue: function () {}, removeCue: function () {} }; });
-    def(MP, "setSinkId", function () { return Promise.reject(notSupported()); });
-    def(MP, "captureStream", function () { throw notSupported(); });
-    var EMPTY_RANGES = { length: 0, start: function () { throw new DOMException("Index out of range", "IndexSizeError"); },
-                         end: function () { throw new DOMException("Index out of range", "IndexSizeError"); } };
-    var media = { paused: true, ended: false, seeking: false, duration: NaN, readyState: 0, networkState: 3,
-                  videoWidth: 0, videoHeight: 0, buffered: EMPTY_RANGES, played: EMPTY_RANGES, seekable: EMPTY_RANGES,
-                  textTracks: [], audioTracks: [], videoTracks: [], currentSrc: "", srcObject: null,
-                  error: { code: 4, message: "This browser cannot play media", MEDIA_ERR_SRC_NOT_SUPPORTED: 4 } };
-    Object.keys(media).forEach(function (k) {
-      Object.defineProperty(MP, k, { configurable: true, get: function () { return this["%m_" + k] !== undefined ? this["%m_" + k] : media[k]; },
+    def(MP, "setSinkId", function () { return Promise.reject(mediaNotSupported()); });
+    def(MP, "captureStream", function () { throw mediaNotSupported(); });
+    ["paused", "ended", "seeking", "duration", "readyState", "networkState", "error"].forEach(function (k) {
+      Object.defineProperty(MP, k, { configurable: true, get: function () { return mstate(this)[k]; } });
+    });
+    var fixed = { videoWidth: 0, videoHeight: 0, textTracks: [], audioTracks: [], videoTracks: [], srcObject: null };
+    Object.keys(fixed).forEach(function (k) {
+      Object.defineProperty(MP, k, { configurable: true, get: function () { var v = this["%m_" + k]; return v === undefined ? fixed[k] : v; },
                                      set: function (v) { def(this, "%m_" + k, v); } });
     });
-    var settable = { currentTime: 0, volume: 1, muted: false, playbackRate: 1, defaultPlaybackRate: 1, preservesPitch: true };
-    Object.keys(settable).forEach(function (k) {
-      Object.defineProperty(MP, k, { configurable: true,
-        get: function () { var v = this["%m_" + k]; return v === undefined ? settable[k] : v; },
-        set: function (v) { def(this, "%m_" + k, typeof settable[k] === "boolean" ? !!v : Number(v)); } });
+    Object.defineProperty(MP, "buffered", { configurable: true, get: function () { var s = mstate(this); return s.readyState ? ranges(0, s.duration) : EMPTY_RANGES; } });
+    Object.defineProperty(MP, "seekable", { configurable: true, get: function () { var s = mstate(this); return s.readyState ? ranges(0, s.duration) : EMPTY_RANGES; } });
+    Object.defineProperty(MP, "played", { configurable: true, get: function () { var s = mstate(this); return ranges(0, s.time); } });
+    Object.defineProperty(MP, "currentSrc", { configurable: true, get: function () {
+      if (this.getAttribute("src")) return this.src;
+      var sources = this.getElementsByTagName("source");
+      for (var i = 0; i < sources.length; i++)
+        if (sources[i].getAttribute("src") && (!sources[i].type || mplayable(sources[i].type))) return sources[i].src;
+      return "";
+    } });
+    Object.defineProperty(MP, "currentTime", { configurable: true,
+      get: function () { return mstate(this).time; },
+      set: function (v) {
+        var el = this, s = mstate(el), t = Number(v);
+        s.time = t >= 0 ? t : 0;
+        s.ended = false;
+        if (s.readyState >= 1) {
+          s.seeking = true;
+          mediaOp(el, "seek", s.time);
+          mlater(el, ["seeking"]);
+        }
+      } });
+    Object.defineProperty(MP, "volume", { configurable: true,
+      get: function () { return mstate(this).volume; },
+      set: function (v) {
+        var s = mstate(this), x = Number(v);
+        if (!(x >= 0 && x <= 1)) throw new DOMException("The volume is not between 0 and 1", "IndexSizeError");
+        if (x === s.volume) return;
+        s.volume = x;
+        mediaOp(this, "volume", s.muted ? 0 : x);
+        mlater(this, ["volumechange"]);
+      } });
+    Object.defineProperty(MP, "muted", { configurable: true,
+      get: function () { return mstate(this).muted; },
+      set: function (v) {
+        var s = mstate(this);
+        if (!!v === s.muted) return;
+        s.muted = !!v;
+        mediaOp(this, "volume", s.muted ? 0 : s.volume);
+        mlater(this, ["volumechange"]);
+      } });
+    [["playbackRate", "rate"], ["defaultPlaybackRate", "defaultRate"], ["preservesPitch", "pitch"]].forEach(function (k) {
+      Object.defineProperty(MP, k[0], { configurable: true, get: function () { return mstate(this)[k[1]]; },
+                                        set: function (v) { mstate(this)[k[1]] = k[0] === "preservesPitch" ? !!v : Number(v); } });
+    });
+    [["autoplay", "autoplay"], ["loop", "loop"], ["controls", "controls"], ["defaultMuted", "muted"]].forEach(function (k) {
+      Object.defineProperty(MP, k[0], { configurable: true, get: function () { return this.hasAttribute(k[1]); },
+                                        set: function (v) { if (v) this.setAttribute(k[1], ""); else this.removeAttribute(k[1]); } });
     });
     [["NETWORK_EMPTY", 0], ["NETWORK_IDLE", 1], ["NETWORK_LOADING", 2], ["NETWORK_NO_SOURCE", 3], ["HAVE_NOTHING", 0],
      ["HAVE_METADATA", 1], ["HAVE_CURRENT_DATA", 2], ["HAVE_FUTURE_DATA", 3], ["HAVE_ENOUGH_DATA", 4]].forEach(function (c) {
@@ -1389,6 +1503,60 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
       def(MP.constructor, c[0], c[1]);
     });
   });
+  g["%mediaState"] = function (el, type, t, d) {
+    var s = mstate(el);
+    if (t >= 0) s.time = t;
+    if (d >= 0) s.duration = d;
+    if (type === "loadstart") {
+      s.networkState = 2;
+      mfire(el, "loadstart");
+    } else if (type === "loadedmetadata") {
+      s.readyState = 1;
+      s.networkState = 1;
+      mfire(el, "durationchange");
+      mfire(el, "loadedmetadata");
+    } else if (type === "canplay") {
+      s.readyState = 4;
+      mfire(el, "loadeddata");
+      mfire(el, "canplay");
+      mfire(el, "canplaythrough");
+    } else if (type === "playing") {
+      if (!s.paused) {
+        mfire(el, "playing");
+        msettle(s);
+      }
+    } else if (type === "timeupdate") {
+      mfire(el, "timeupdate");
+    } else if (type === "seeked") {
+      s.seeking = false;
+      mfire(el, "timeupdate");
+      mfire(el, "seeked");
+    } else if (type === "ended") {
+      s.ended = true;
+      s.paused = true;
+      mfire(el, "timeupdate");
+      mfire(el, "pause");
+      mfire(el, "ended");
+    } else if (type === "error") {
+      s.error = mediaError();
+      s.networkState = 3;
+      s.readyState = 0;
+      s.paused = true;
+      mfire(el, "error");
+      msettle(s, mediaNotSupported());
+    }
+  };
+  g["%mediaUser"] = function (el, op, t) {
+    if (op === "toggle") {
+      if (el.paused) el.play(); else el.pause();
+    } else if (op === "seek") {
+      el.currentTime = t;
+    }
+  };
+  if (g.document)
+    document.addEventListener("DOMContentLoaded", function () {
+      [].forEach.call(document.querySelectorAll("audio[autoplay]"), function (a) { a.play(); });
+    });
   if (g.HTMLAudioElement) {
     var Audio = function Audio(src) {
       var a = document.createElement("audio");

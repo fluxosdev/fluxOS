@@ -4,13 +4,15 @@
  *   play [-q] [-s SECONDS] FILE...
  *   play [-q] -t HZ [-l MS]
  *
- * Plays WAV files (PCM, 8, 16, 24 or 32 bit, mono or stereo) and Creative
- * Voice files (.VOC: 8-bit and 16-bit PCM, silence blocks, stereo). Rates
+ * Plays WAV files (PCM, 8, 16, 24 or 32 bit, mono or stereo), Creative
+ * Voice files (.VOC: 8-bit and 16-bit PCM, silence blocks, stereo), MP3 and
+ * Ogg Vorbis files (and float WAV), the last through Wave's decoders
+ * (user/desktop/wave/codecs.c, which read the whole file into memory). Rates
  * the card cannot do (it goes from 5000 to 44100 Hz) are resampled. -t
  * plays a test tone (a sine wave, 2 seconds unless -l says otherwise),
  * and -q keeps quiet instead of showing the format and the time. -s starts
- * a WAV file that many seconds in (the desktop's sound player pauses and
- * seeks with it).
+ * a file (not a VOC) that many seconds in (the desktop's sound player pauses
+ * and seeks with it).
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -19,9 +21,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/soundcard.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#include "codecs.h"
 
 #define CHUNK 4096                      /* frames decoded at a time */
+#define MAX_COMPRESSED (64 << 20)       /* the largest MP3 or Ogg file read into memory */
 
 static int quiet;
 static uint32_t start_sec;              /* -s: where in a WAV file to begin */
@@ -38,6 +43,8 @@ struct source {
     uint32_t silence;                   /* VOC: frames of silence still to give */
     int pending_rate, pending_channels; /* VOC: a type 8 block's format for the next */
     uint32_t total_frames;              /* 0 if unknown */
+    struct codec *codec;                /* MP3, Ogg Vorbis, float WAV: decoded from data */
+    unsigned char *data;
     uint8_t buf[CHUNK * 8];
 };
 
@@ -91,10 +98,8 @@ static int open_wav(struct source *s, const char *name)
             s->rate = (int)le32(fmt + 4);
             s->bits = (int)le16(fmt + 14);
             if (tag != 1 || s->channels < 1 || s->channels > 2 || s->rate < 1000 ||
-                (s->bits != 8 && s->bits != 16 && s->bits != 24 && s->bits != 32)) {
-                fprintf(stderr, "play: %s: only PCM WAV files in mono or stereo can be played\n", name);
-                return -2;
-            }
+                (s->bits != 8 && s->bits != 16 && s->bits != 24 && s->bits != 32))
+                return -3;              /* float or many channels: the codecs may do it */
             have_fmt = 1;
         } else if (!memcmp(ck, "data", 4)) {
             if (!have_fmt)
@@ -185,9 +190,31 @@ static int open_voc(struct source *s)
     return voc_next(s) ? 0 : -2;
 }
 
+/* An MP3, Ogg Vorbis or other file the codecs know: all of it in memory, decoded from there. */
+static int open_codec(struct source *s)
+{
+    struct stat st;
+    if (fstat(s->fd, &st) < 0 || st.st_size <= 0 || st.st_size > MAX_COMPRESSED || lseek(s->fd, 0, SEEK_SET) < 0)
+        return -1;
+    s->data = malloc((size_t)st.st_size);
+    if (!s->data || read_full(s->fd, s->data, (uint32_t)st.st_size) != (int)st.st_size ||
+        !(s->codec = codec_open(s->data, (size_t)st.st_size))) {
+        free(s->data);
+        s->data = NULL;
+        return -1;
+    }
+    s->rate = codec_rate(s->codec);
+    s->channels = codec_channels(s->codec);
+    s->bits = 16;
+    s->total_frames = codec_frames(s->codec);
+    return 0;
+}
+
 /* Decode up to max frames as signed 16-bit; 0 at the end of the file. */
 static int decode(struct source *s, int16_t *out, int max)
 {
+    if (s->codec)
+        return codec_read(s->codec, out, max);
     while (s->voc && !s->left && !s->silence)
         if (!voc_next(s))
             return 0;
@@ -367,13 +394,26 @@ static int play_file(const char *name)
         memset(&s.voc, 0, sizeof(s) - sizeof(s.fd));
         r = open_voc(&s);
     }
+    int wav_format = r == -3;
+    if (r == -1 || r == -3) {
+        memset(&s.voc, 0, sizeof(s) - sizeof(s.fd));
+        r = open_codec(&s) == 0 ? 0 : -1;
+    }
     if (r < 0) {
-        if (r == -1)
-            fprintf(stderr, "play: %s: not a WAV or VOC file\n", name);
+        if (wav_format)
+            fprintf(stderr, "play: %s: this kind of WAV file cannot be played\n", name);
+        else if (r == -1)
+            fprintf(stderr, "play: %s: not a WAV, VOC, MP3 or Ogg Vorbis file\n", name);
         close(s.fd);
         return -1;
     }
-    if (start_sec && !s.voc) {
+    if (start_sec && s.codec) {
+        uint32_t skipped = start_sec * (uint32_t)s.rate;
+        if (s.total_frames && skipped > s.total_frames)
+            skipped = s.total_frames;
+        if (codec_seek(s.codec, skipped) == 0 && s.total_frames)
+            s.total_frames -= skipped;
+    } else if (start_sec && !s.voc) {
         uint32_t frame = (uint32_t)(s.channels * s.bits / 8), skipped = start_sec * (uint32_t)s.rate;
         if (skipped > s.total_frames)
             skipped = s.total_frames;
@@ -383,6 +423,8 @@ static int play_file(const char *name)
         }
     }
     r = play_source(&s, name);
+    codec_close(s.codec);
+    free(s.data);
     close(s.fd);
     return r;
 }

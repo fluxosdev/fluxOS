@@ -1,5 +1,6 @@
 /* /bin/wave: Wave, the web browser: the address given, or the home page. "wave --js-worker url type
- * name" is a page's worker (jsworker.c), which has no window. */
+ * name" is a page's worker (jsworker.c), and "wave --audio" the player for its pages' sound
+ * (webaudio.c); neither has a window. */
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +8,7 @@
 #include <unistd.h>
 #include "desktop.h"
 #include "jsworker.h"
+#include "webaudio.h"
 
 static void child_exited(int pid, int status)
 {
@@ -28,5 +30,7 @@ int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "--js-worker"))
         return jsworker_main(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "--audio"))
+        return webaudio_main();
     return app_main("wave", &app, argc, argv);
 }

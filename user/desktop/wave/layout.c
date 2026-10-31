@@ -108,10 +108,17 @@ struct lctx {
     int npend;
     int force_container;        /* the next block box places its absolute descendants itself */
     int abs_bw1;                /* an absolute box's stretched border-box width, plus 1; 0: none */
+    int abs_bh1;                /* ...and its height stretched between top and bottom, plus 1 */
+    int force_bh1;              /* the next block box's border-box height, plus 1 (from abs_bh1) */
     /* Boxes that paint in a layer of their own (positioned, with a z-index, or a stacking
      * context): their items, the first lead of them their own background. */
     struct zlayer { int from, lead, to, z; uint8_t ctx; } *zl;
     int nzl, zlcap;
+    /* anchor positioning: the anchors boxes asked for, measured after a first pass (anchor_pass 0)
+     * for the second to place the boxes against */
+    struct node *root;
+    struct abox { struct node *n; int x, y, w, h; uint8_t known, fixed; } *ab;
+    int nab, abcap, anchor_pass;
 };
 
 static unsigned layout_gen;
@@ -262,6 +269,15 @@ static void layer_register(struct lctx *c, struct node *n, int from, int lead)
     c->zl = zl;
     zl[c->nzl++] = (struct zlayer){ from, lead < from ? from : lead, c->lo->nitems, z ? st->z_index : 0,
                                     (uint8_t)ctx };
+}
+
+/* Is n in the top layer (an open popover or modal dialog, or one a transition keeps there)? Such a box
+ * is left out where it stands and laid out over everything once the page is (top_layer()). */
+static int in_top_layer(const struct node *n)
+{
+    const struct style *st = n->style;
+    return n->type == N_ELEMENT && st && st->overlay && st->display != D_NONE &&
+           !(n->parent && n->parent->style == st);         /* (inside display: none, it has no box) */
 }
 
 static void add_anchor(struct lctx *c, const char *name, int y)
@@ -1777,10 +1793,13 @@ static void layout_inline_block(struct lctx *c, struct node *n, int avail, int *
     c->marker_pending = 0;
     c->last_baseline = -1;
     int mb, h;
+    int stretch_h1 = c->abs_bh1;
+    c->abs_bh1 = 0;
     if (st->display == D_INLINE_TABLE || st->display == D_TABLE) {
         h = layout_table(c, n, ml, mt, avail, bw, &mb);
     } else {
         c->force_container = 1;         /* what is absolute inside is placed against this box */
+        c->force_bh1 = stretch_h1;
         h = layout_block_box(c, n, ml, mt, avail, bw, &mb, NULL);
     }
     c->marker_pending = saved_pending;
@@ -2537,6 +2556,8 @@ static void flow_node(struct lctx *c, struct flow *f, struct node *n)
     }
     if (n->tag == T_INPUT && !strcasecmp(input_type(n), "hidden"))
         return;
+    if (in_top_layer(n))
+        return;
     if (st->position == POS_ABSOLUTE || st->position == POS_FIXED) {
         /* out of the flow: laid out once the box it is placed against is known */
         if (!c->measuring && c->npend < (int)(sizeof(c->pend) / sizeof(c->pend[0])))
@@ -2805,7 +2826,7 @@ static int block_content(struct lctx *c, struct node *n, int x, int y, int w, in
         if (!c->measuring)
             for (struct node *k = n->first; k; k = k->next)     /* absolute children are not items */
                 if (k->type == N_ELEMENT && k->style && k->style->display != D_NONE &&
-                    (k->style->position == POS_ABSOLUTE || k->style->position == POS_FIXED) &&
+                    (k->style->position == POS_ABSOLUTE || k->style->position == POS_FIXED) && !in_top_layer(k) &&
                     c->npend < (int)(sizeof(c->pend) / sizeof(c->pend[0])))
                     c->pend[c->npend++] = (struct pend){ k, x, y };
         return h;
@@ -2839,11 +2860,392 @@ static int block_content(struct lctx *c, struct node *n, int x, int y, int w, in
     return f.cy - y;
 }
 
+/* ---- anchor positioning ----
+ *
+ * A positioned box can be placed against another element, its anchor: anchor() in its insets,
+ * anchor-size() in its sizes, position-area (a cell of the grid the anchor's edges cut the containing
+ * block into), justify-self or align-self: anchor-center, and position-try-fallbacks (other places,
+ * tried in turn if it overflows). Anchors are found by anchor-name (the last in the document), or
+ * for a popover its button. A page that has any is laid out twice: the first time to find where the
+ * anchors are (anchored boxes go where they would without them), the second with them known.
+ */
+
+/* Does st's anchor-name list name? */
+static int names_anchor(const struct style *st, const char *name)
+{
+    size_t nl = strlen(name);
+    for (const char *p = st ? st->anchor_name : NULL; p && *p;) {
+        while (*p == ',' || *p == ' ' || *p == '\t' || *p == '\n')
+            p++;
+        const char *e = p;
+        while (*e && *e != ',' && *e != ' ' && *e != '\t' && *e != '\n')
+            e++;
+        if ((size_t)(e - p) == nl && !strncmp(p, name, nl))
+            return 1;
+        p = e;
+    }
+    return 0;
+}
+
+static int node_contains(const struct node *a, const struct node *b)
+{
+    for (; b; b = b->parent)
+        if (a == b)
+            return 1;
+    return 0;
+}
+
+static int has_box(struct lctx *c, const struct node *n)
+{
+    for (const struct node *k = n; k; k = k->parent) {
+        if (k->type == N_ELEMENT && (!k->style || k->style->display == D_NONE))
+            return 0;
+        if (k == c->root)
+            return 1;
+    }
+    return 0;
+}
+
+/* n's anchor called name, or with name NULL its default one (position-anchor, else the button that
+ * opened it): the last element with the name that has a box, outside n. */
+static struct node *find_anchor(struct lctx *c, struct node *n, const char *name)
+{
+    if (!name) {
+        const char *pa = n->style->position_anchor;
+        if (!pa)
+            return n->invoker && has_box(c, n->invoker) && !node_contains(n, n->invoker) ? n->invoker : NULL;
+        if (!strcmp(pa, "none"))
+            return NULL;
+        name = pa;
+    }
+    struct node *found = NULL;
+    for (struct node *k = c->root; k;) {
+        if (k->type == N_ELEMENT && k->style && k != n && k->style->display != D_NONE) {
+            if (names_anchor(k->style, name))
+                found = k;
+            if (k->first) {
+                k = k->first;
+                continue;
+            }
+        }
+        while (k && k != c->root && !k->next)
+            k = k->parent;
+        k = k && k != c->root ? k->next : NULL;
+    }
+    return found;
+}
+
+/* Where the anchor a is: NULL until it has been measured (and on the first pass, asked for). */
+static const struct abox *anchor_box(struct lctx *c, struct node *a)
+{
+    if (!a)
+        return NULL;
+    for (int i = 0; i < c->nab; i++)
+        if (c->ab[i].n == a)
+            return c->ab[i].known ? &c->ab[i] : NULL;
+    if (c->anchor_pass)
+        return NULL;
+    struct abox *ab = grow(c->a, c->ab, c->nab, &c->abcap, sizeof(*ab));
+    if (ab) {
+        c->ab = ab;
+        memset(&ab[c->nab], 0, sizeof(ab[0]));
+        ab[c->nab++].n = a;
+    }
+    return NULL;
+}
+
+/* After the first pass: each anchor's border box (its background's), or else what it laid out. */
+static void measure_anchors(struct lctx *c)
+{
+    struct layout *lo = c->lo;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < lo->nitems; i++) {
+            const struct ditem *d = &lo->items[i];
+            if (!d->node || d->w <= 0 || d->h <= 0)
+                continue;
+            for (struct node *k = d->node; k; k = pass ? k->parent : NULL)
+                for (int j = 0; j < c->nab; j++) {
+                    struct abox *b = &c->ab[j];
+                    if (b->n != k || (pass && b->known == 2) || (!pass && (d->kind != DK_FILL || b->known)))
+                        continue;
+                    if (!b->known) {
+                        b->x = d->x, b->y = d->y, b->w = d->w, b->h = d->h;
+                        b->fixed = d->dyn && under_fixed(lo, d->dyn);
+                        b->known = (uint8_t)(pass ? 1 : 2);     /* 2: its own box, nothing to add */
+                        continue;
+                    }
+                    int x1 = b->x + b->w > d->x + d->w ? b->x + b->w : d->x + d->w;
+                    int y1 = b->y + b->h > d->y + d->h ? b->y + b->h : d->y + d->h;
+                    b->x = b->x < d->x ? b->x : d->x;
+                    b->y = b->y < d->y ? b->y : d->y;
+                    b->w = x1 - b->x, b->h = y1 - b->y;
+                }
+        }
+}
+
+/* An anchored box while it is laid out: its style's own values (put back afterwards: the style
+ * is changed to the pixels the anchors come to), the default anchor, the containing block. */
+struct anchoring {
+    struct len inset[4], margin[4], w, h;
+    uint8_t fit_w, fit_h;
+    const struct abox *box;
+    int cbx, cby, cbw, cbh;
+    uint8_t area[4];            /* the position-area in use (area[1] 0: none) */
+    int ax, ay, aw, ah;         /* ...its rectangle */
+    uint8_t page;               /* placed against an anchor that scrolls with the page: so does the box */
+};
+
+static struct len *inset_of(struct style *st, int i)
+{
+    return i == 0 ? &st->top : i == 1 ? &st->right : i == 2 ? &st->bottom : &st->left;
+}
+
+/* Where anchor side `side` of b is along inset i's axis (page coordinates); 0 if not along it. */
+static int anchor_edge(const struct abox *b, int i, int side, int *out)
+{
+    int vertical = i == 0 || i == 2, start_inset = i == 0 || i == 3;
+    int lo = vertical ? b->y : b->x, len = vertical ? b->h : b->w;
+    switch (side) {
+    case AS_TOP: case AS_BOTTOM:
+        *out = side == AS_TOP ? lo : lo + len;
+        return vertical;
+    case AS_LEFT: case AS_RIGHT:
+        *out = side == AS_LEFT ? lo : lo + len;
+        return !vertical;
+    case AS_START: *out = lo; return 1;
+    case AS_END: *out = lo + len; return 1;
+    case AS_CENTER: *out = lo + len / 2; return 1;
+    case AS_INSIDE: case AS_OUTSIDE:            /* the side the inset is on, or the other */
+        *out = start_inset == (side == AS_INSIDE) ? lo : lo + len;
+        return 1;
+    default:
+        *out = lo + (int)((long long)len * side / 10000);
+        return side >= 0;
+    }
+}
+
+/* A side seen from the other end of an axis (flip-block, flip-inline), or across (flip-start). */
+static int flip_side(int side, int vertical, int flip)
+{
+    if (flip & TRY_START) {
+        static const int across[][2] = { { AS_TOP, AS_LEFT }, { AS_BOTTOM, AS_RIGHT } };
+        for (int k = 0; k < 2; k++)
+            if (side == across[k][0] || side == across[k][1])
+                side = side == across[k][0] ? across[k][1] : across[k][0];
+        vertical = !vertical;
+    }
+    if (!(flip & (vertical ? TRY_BLOCK : TRY_INLINE)))
+        return side;
+    switch (side) {
+    case AS_TOP: return AS_BOTTOM;
+    case AS_BOTTOM: return AS_TOP;
+    case AS_LEFT: return AS_RIGHT;
+    case AS_RIGHT: return AS_LEFT;
+    case AS_START: return AS_END;
+    case AS_END: return AS_START;
+    default: return side >= 0 ? 10000 - side : side;
+    }
+}
+
+static void flip_area(const uint8_t in[4], int flip, uint8_t out[4])
+{
+    memcpy(out, in, 4);
+    if (flip & TRY_START)
+        out[0] = in[2], out[1] = in[3], out[2] = in[0], out[3] = in[1];
+    uint8_t t[4];
+    memcpy(t, out, 4);
+    if (flip & TRY_BLOCK)
+        out[0] = (uint8_t)(3 - t[1]), out[1] = (uint8_t)(3 - t[0]);
+    if (flip & TRY_INLINE)
+        out[2] = (uint8_t)(3 - t[3]), out[3] = (uint8_t)(3 - t[2]);
+}
+
+/* Put into n's style what its anchors come to, flipped as flip says, with area (or its own
+ * position-area if NULL); the containing block becomes the area if there is one. */
+static void anchor_resolve(struct lctx *c, struct node *n, int flip, const uint8_t *area, struct anchoring *A)
+{
+    struct style *st = (struct style *)n->style;
+    const struct anchor_spec *sp = st->anchor;
+    /* where each of the four sides' values come from: their own, or (flipped) another's */
+    int from[4] = { 0, 1, 2, 3 };
+    for (int i = 0; i < 4; i++) {
+        int k = i;
+        if (flip & TRY_START)
+            k = (int[]){ 3, 2, 1, 0 }[k];
+        if ((flip & TRY_BLOCK) && (k == 0 || k == 2))
+            k = 2 - k;
+        if ((flip & TRY_INLINE) && (k == 1 || k == 3))
+            k = 4 - k;
+        from[i] = k;
+    }
+    for (int i = 0; i < 4; i++) {
+        *inset_of(st, i) = A->inset[from[i]];
+        st->margin[i] = A->margin[from[i]];
+    }
+    st->width = A->w, st->height = A->h, st->fit_w = A->fit_w, st->fit_h = A->fit_h;
+    for (int i = 0; sp && i < 4; i++) {
+        struct aref r = sp->inset[from[i]];
+        if (!r.set)
+            continue;
+        r.side = flip_side(r.side, i == 0 || i == 2, flip);
+        const struct abox *b = r.name ? anchor_box(c, find_anchor(c, n, r.name)) : A->box;
+        int pos;
+        if (!b || !anchor_edge(b, i, r.side, &pos))
+            continue;                   /* its fallback, already there */
+        int v = i == 0 ? pos - A->cby : i == 3 ? pos - A->cbx : i == 2 ? A->cby + A->cbh - pos : A->cbx + A->cbw - pos;
+        *inset_of(st, i) = (struct len){ v + r.add, 0, U_PX };
+        A->page |= !b->fixed;
+    }
+    for (int k = 0; sp && k < 2; k++) {
+        const struct aref *r = &sp->size[k];
+        const struct abox *b = !r->set ? NULL : r->name ? anchor_box(c, find_anchor(c, n, r->name)) : A->box;
+        if (!b)
+            continue;
+        int tall = r->side == AS_SAME ? k : r->side == AS_HEIGHT;
+        struct len px = { (tall ? b->h : b->w) + r->add, 0, U_PX };
+        if (k)
+            st->height = px, st->fit_h = 0;
+        else
+            st->width = px, st->fit_w = 0;
+    }
+    memset(A->area, 0, 4);
+    if (A->box && (area || (sp && sp->area[1]))) {
+        flip_area(area ? area : sp->area, area ? 0 : flip, A->area);
+        const struct abox *b = A->box;
+        int xs[4] = { A->cbx, b->x, b->x + b->w, A->cbx + A->cbw }, ys[4] = { A->cby, b->y, b->y + b->h, A->cby + A->cbh };
+        for (int k = 1; k < 4; k++) {           /* an anchor out of the containing block: empty cells */
+            xs[k] = xs[k] < xs[k - 1] ? xs[k - 1] : xs[k];
+            ys[k] = ys[k] < ys[k - 1] ? ys[k - 1] : ys[k];
+        }
+        A->ax = xs[A->area[2]], A->aw = xs[A->area[3]] - A->ax;
+        A->ay = ys[A->area[0]], A->ah = ys[A->area[1]] - A->ay;
+        for (int i = 0; i < 4; i++)             /* in the area, auto insets are 0 and nothing stretches */
+            if (inset_of(st, i)->unit == U_AUTO)
+                *inset_of(st, i) = (struct len){ 0, 0, U_PX };
+        if (st->width.unit == U_AUTO)
+            st->fit_w = 1;
+        if (st->height.unit == U_AUTO)
+            st->fit_h = 1;
+        A->page |= !b->fixed;
+    }
+    if (A->box && (st->justify_self == AL_ANCHOR_CENTER || st->align_self == AL_ANCHOR_CENTER))
+        A->page |= !A->box->fixed;
+}
+
+/* Is n anchored at all? If so, its style is set up for laying it out (anchor_end puts it back). */
+static int anchor_begin(struct lctx *c, struct node *n, int cbx, int cby, int cbw, int cbh, struct anchoring *A)
+{
+    struct style *st = (struct style *)n->style;
+    if (!st->anchor && st->justify_self != AL_ANCHOR_CENTER && st->align_self != AL_ANCHOR_CENTER)
+        return 0;
+    memset(A, 0, sizeof(*A));
+    for (int i = 0; i < 4; i++)
+        A->inset[i] = *inset_of(st, i), A->margin[i] = st->margin[i];
+    A->w = st->width, A->h = st->height, A->fit_w = st->fit_w, A->fit_h = st->fit_h;
+    A->cbx = cbx, A->cby = cby, A->cbw = cbw, A->cbh = cbh;
+    A->box = anchor_box(c, find_anchor(c, n, NULL));
+    anchor_resolve(c, n, 0, NULL, A);
+    return 1;
+}
+
+static void anchor_end(struct node *n, const struct anchoring *A)
+{
+    struct style *st = (struct style *)n->style;
+    for (int i = 0; i < 4; i++)
+        *inset_of(st, i) = A->inset[i], st->margin[i] = A->margin[i];
+    st->width = A->w, st->height = A->h, st->fit_w = A->fit_w, st->fit_h = A->fit_h;
+}
+
+/* Where an absolute box ow x oh (its margin box) goes in its containing block, by its insets and auto margins. */
+static void abs_place(const struct style *st, const struct pend *p, int cbx, int cby, int cbw, int cbh, int ow,
+                      int oh, int *xo, int *yo)
+{
+    int la = st->left.unit == U_AUTO, ra = st->right.unit == U_AUTO;
+    int ta = st->top.unit == U_AUTO, ba = st->bottom.unit == U_AUTO;
+    int l = len_px(st->left, cbw), r = len_px(st->right, cbw);
+    int t = len_px(st->top, cbh), bo = len_px(st->bottom, cbh);
+    int avail = cbw - (la ? 0 : l) - (ra ? 0 : r);
+    int x = !la ? cbx + l : !ra ? cbx + cbw - r - ow : p->sx;
+    int y = !ta ? cby + t : !ba ? cby + cbh - bo - oh : p->sy;
+    if (!la && !ra && (st->width.unit != U_AUTO || st->fit_w) && st->margin[3].unit == U_AUTO &&
+        st->margin[1].unit == U_AUTO)
+        x = cbx + l + (avail - ow > 0 ? (avail - ow) / 2 : 0);     /* auto margins centre it between the sides */
+    if (!ta && !ba && (st->height.unit != U_AUTO || st->fit_h) && st->margin[0].unit == U_AUTO &&
+        st->margin[2].unit == U_AUTO)
+        y = cby + t + (cbh - t - bo - oh > 0 ? (cbh - t - bo - oh) / 2 : 0);
+    *xo = x, *yo = y;
+}
+
+/* One axis of a box in its position-area (lines from, to): toward the anchor, or across it centred. */
+static int area_align(int from, int to, int a, int alen, int inset_s, int inset_e, int size, int centre,
+                      int cb, int cblen)
+{
+    if (from == 0 && to == 3) {                 /* anchor-center, kept inside the containing block */
+        int v = centre - size / 2;
+        if (v + size > cb + cblen)
+            v = cb + cblen - size;
+        return v < cb ? cb : v;
+    }
+    if (to == 1 || (from == 0 && to == 2))      /* before the anchor: its end against it */
+        return a + alen - inset_e - size;
+    if (from == 2 || (from == 1 && to == 3))    /* after it */
+        return a + inset_s;
+    return a + (alen - size) / 2;               /* over it */
+}
+
+/* Where an anchored box goes, as its style now says (after anchor_resolve). */
+static void anchor_place(const struct node *n, const struct pend *p, const struct anchoring *A, int ow, int oh,
+                         int *x, int *y)
+{
+    const struct style *st = n->style;
+    const struct abox *b = A->box;
+    if (A->area[1]) {
+        *x = area_align(A->area[2], A->area[3], A->ax, A->aw, len_px(st->left, A->aw), len_px(st->right, A->aw), ow,
+                        b->x + b->w / 2, A->cbx, A->cbw);
+        *y = area_align(A->area[0], A->area[1], A->ay, A->ah, len_px(st->top, A->ah), len_px(st->bottom, A->ah), oh,
+                        b->y + b->h / 2, A->cby, A->cbh);
+        return;
+    }
+    abs_place(st, p, A->cbx, A->cby, A->cbw, A->cbh, ow, oh, x, y);
+    if (b && st->justify_self == AL_ANCHOR_CENTER && st->left.unit == U_AUTO && st->right.unit == U_AUTO)
+        *x = area_align(0, 3, 0, 0, 0, 0, ow, b->x + b->w / 2, A->cbx, A->cbw);
+    if (b && st->align_self == AL_ANCHOR_CENTER && st->top.unit == U_AUTO && st->bottom.unit == U_AUTO)
+        *y = area_align(0, 3, 0, 0, 0, 0, oh, b->y + b->h / 2, A->cby, A->cbh);
+}
+
+static int anchor_fits(const struct anchoring *A, int x, int y, int ow, int oh)
+{
+    return x >= A->cbx && y >= A->cby && x + ow <= A->cbx + A->cbw && y + oh <= A->cby + A->cbh;
+}
+
+/* Overflowing its containing block: the first of position-try-fallbacks that does not, if any. */
+static void anchor_try(struct lctx *c, struct node *n, const struct pend *p, struct anchoring *A, int ow, int oh,
+                       int *x, int *y)
+{
+    const struct anchor_spec *sp = n->style->anchor;
+    if (!sp || !sp->ntry || anchor_fits(A, *x, *y, ow, oh))
+        return;
+    for (int k = 0; k < sp->ntry; k++) {
+        int tx, ty;
+        anchor_resolve(c, n, sp->tries[k].flip, sp->tries[k].area[1] ? sp->tries[k].area : NULL, A);
+        anchor_place(n, p, A, ow, oh, &tx, &ty);
+        if (anchor_fits(A, tx, ty, ow, oh)) {
+            *x = tx, *y = ty;
+            return;
+        }
+    }
+    anchor_resolve(c, n, 0, NULL, A);           /* none fits: where it was */
+}
+
 /* An absolute or fixed box, placed against the padding box (cbx, cby, cbw x cbh) of its containing block. */
 static void layout_abs(struct lctx *c, const struct pend *p, int cbx, int cby, int cbw, int cbh, int viewport_fixed)
 {
     struct node *n = p->n;
     const struct style *st = n->style;
+    struct anchoring A;
+    int anchored = anchor_begin(c, n, cbx, cby, cbw, cbh, &A);
+    if (anchored && A.area[1])
+        cbx = A.ax, cby = A.ay, cbw = A.aw, cbh = A.ah;     /* it is sized in its position-area */
     int la = st->left.unit == U_AUTO, ra = st->right.unit == U_AUTO;
     int ta = st->top.unit == U_AUTO, ba = st->bottom.unit == U_AUTO;
     int l = len_px(st->left, cbw), r = len_px(st->right, cbw);
@@ -2857,30 +3259,27 @@ static void layout_abs(struct lctx *c, const struct pend *p, int cbx, int cby, i
     if (is_replaced(n)) {
         layout_replaced(c, n, avail, &ow, &oh, &base);
     } else {
-        if (st->width.unit == U_AUTO && !la && !ra)
+        if (st->width.unit == U_AUTO && !st->fit_w && !la && !ra)
             c->abs_bw1 = (avail - ml - mr > 0 ? avail - ml - mr : 0) + 1;      /* stretched between the sides */
+        if (st->height.unit == U_AUTO && !st->fit_h && !ta && !ba && st->display != D_TABLE &&
+            st->display != D_INLINE_TABLE) {                                    /* ...and between top and bottom */
+            int stretch = cbh - t - bo - len_px(st->margin[0], cbw) - len_px(st->margin[2], cbw);
+            c->abs_bh1 = (stretch > 0 ? stretch : 0) + 1;
+        }
         layout_inline_block(c, n, avail, &ow, &oh, &base);
-        c->abs_bw1 = 0;
+        c->abs_bw1 = c->abs_bh1 = 0;
     }
     int x, y;
-    if (!la)
-        x = cbx + l;
-    else if (!ra)
-        x = cbx + cbw - r - ow;
-    else
-        x = p->sx;
-    if (!ta)
-        y = cby + t;
-    else if (!ba)
-        y = cby + cbh - bo - oh;
-    else
-        y = p->sy;
-    if (!la && !ra && st->width.unit != U_AUTO && st->margin[3].unit == U_AUTO && st->margin[1].unit == U_AUTO)
-        x = cbx + l + (avail - ow) / 2;                 /* auto margins centre it between the sides */
-    if (!ta && !ba && st->height.unit != U_AUTO && st->margin[0].unit == U_AUTO && st->margin[2].unit == U_AUTO)
-        y = cby + t + (cbh - t - bo - oh) / 2;
+    if (anchored) {
+        anchor_place(n, p, &A, ow, oh, &x, &y);
+        anchor_try(c, n, p, &A, ow, oh, &x, &y);
+        anchor_end(n, &A);
+    } else {
+        abs_place(st, p, cbx, cby, cbw, cbh, ow, oh, &x, &y);
+    }
     shift(c, m0, mark_now(c), x, y);
-    if (st->position == POS_FIXED && viewport_fixed)      /* it stays where it is in the window as the page scrolls */
+    /* it stays where it is in the window as the page scrolls (unless it goes with an anchor that does not) */
+    if (st->position == POS_FIXED && viewport_fixed && !(anchored && A.page))
         dyn_register(c, m0, 1, x, y, ow, oh, st, NULL);
 }
 
@@ -2900,8 +3299,24 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
                             int *mb, int *bg_slot)
 {
     const struct style *st = n->style;
+    int force_bh = c->force_bh1 - 1;
+    c->force_bh1 = 0;
     struct boxm b;
-    resolve_box(st, cw, force_bw, &b);
+    if (force_bw < 0 && st->fit_w && st->width.unit == U_AUTO && !c->measuring) {
+        /* width: fit-content: as wide as its contents want, within what there is */
+        resolve_box(st, cw, -1, &b);
+        int mn, mx, room = cw - (st->margin[3].unit == U_AUTO ? 0 : b.ml) - (st->margin[1].unit == U_AUTO ? 0 : b.mr);
+        measure(c, n, &mn, &mx);
+        mn -= b.ml + b.mr, mx -= b.ml + b.mr;
+        int fit = mx < room ? mx : room;
+        if (fit < mn)
+            fit = mn;
+        struct style sized = *st;               /* sized like a box of that width, auto margins centring it */
+        sized.width = (struct len){ fit - (st->box_sizing_border ? 0 : hz(&b)), 0, U_PX };
+        resolve_box(&sized, cw, -1, &b);
+    } else {
+        resolve_box(st, cw, force_bw, &b);
+    }
     int bw = b.bl + b.pl + b.w + b.pr + b.br;
     if (force_bw < 0 && st->width.unit != U_AUTO && n->parent && n->parent->style &&
         n->parent->style->center_blocks)
@@ -2945,6 +3360,8 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
     int pm = 0, vt = st->box_sizing_border ? b.bt + b.bb + b.pt + b.pb : 0, defh = -1, minh = 0;
     if (st->height.unit == U_PX)
         defh = st->height.v - vt > 0 ? st->height.v - vt : 0;
+    else if (force_bh >= 0)                     /* stretched (an absolute box between top and bottom) */
+        defh = force_bh - b.bt - b.bb - b.pt - b.pb > 0 ? force_bh - b.bt - b.bb - b.pt - b.pb : 0;
     if (st->min_height.unit == U_PX)
         minh = st->min_height.v - vt > 0 ? st->min_height.v - vt : 0;
     int ch = block_content(c, n, cx, cy, b.w, defh, minh, &pm);
@@ -2971,6 +3388,8 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
         ch = st->height.v - (st->box_sizing_border ? b.bt + b.bb + b.pt + b.pb : 0);
         if (ch < 0)
             ch = 0;
+    } else if (force_bh >= 0) {
+        ch = defh;
     } else if (!b.pb && !b.bb && st->display != D_TABLE_CELL && n->parent && n != c->contain) {
         *mb = collapse(b.mb, pm);               /* the last child's margin passes through */
     } else {
@@ -3180,7 +3599,7 @@ static int container_items(struct node *n, struct fitem **out)
         const struct style *st = k->style;
         if (!st || st->display == D_NONE || !st->font || k->tag == T_BR || k->tag == T_WBR ||
             (k->tag == T_INPUT && !strcasecmp(input_type(k), "hidden")) ||
-            st->position == POS_ABSOLUTE || st->position == POS_FIXED)
+            st->position == POS_ABSOLUTE || st->position == POS_FIXED || in_top_layer(k))
             continue;
         int kind = is_replaced(k) ? FI_REPLACED
                  : st->display == D_TABLE || st->display == D_INLINE_TABLE ? FI_TABLE : FI_BLOCK;
@@ -5107,18 +5526,68 @@ done:
     free(z.out);
 }
 
-void layout_document(struct arena *a, struct layout *lo, struct node *root, int vw, int vh)
+static int top_cmp(const void *a, const void *b)
 {
+    const struct node *x = *(struct node *const *)a, *y = *(struct node *const *)b;
+    return x->top_seq < y->top_seq ? -1 : x->top_seq > y->top_seq;
+}
+
+/*
+ * The top layer, once the page is laid out: each box in it, in the order they went in, over everything
+ * before it (a layer of its own above any z-index) and placed against the viewport whatever its
+ * ancestors are. Under each is its ::backdrop, covering the viewport; a modal dialog's takes the clicks
+ * that miss it (for the dialog), a popover's lets them through to the page.
+ */
+static void top_layer(struct lctx *c, struct node *root)
+{
+    struct node *list[64];
+    int n = 0;
+    for (struct node *k = root; k && n < 64; k = node_next(k, root))
+        if (in_top_layer(k))
+            list[n++] = k;
+    if (n > 1)
+        qsort(list, (size_t)n, sizeof(list[0]), top_cmp);
+    for (int i = 0; i < n; i++) {
+        struct node *e = list[i];
+        int from = c->lo->nitems;
+        struct mark m0 = mark_now(c);
+        const struct style *bs = e->pseudo_st[PE_BACKDROP - 1];
+        if (bs && !bs->hidden) {
+            uint32_t color = bs->bg;
+            if (bs->opacity < 255)
+                color = (ALPHA(color) * bs->opacity / 255) << 24 | (color & 0xFFFFFF);
+            struct ditem *d = fill(c, 0, 0, c->vw, c->vh, color, 0);
+            if (!d && e->modal && (d = emit(c, DK_FILL))) {
+                d->w = c->vw, d->h = c->vh;
+                d->color = TRANSPARENT;
+            }
+            if (d)
+                d->node = e->modal ? e : NULL;
+            if (c->lo->nitems > from)
+                dyn_register(c, m0, 1, 0, 0, c->vw, c->vh, bs, NULL);
+        }
+        struct pend p = { e, 0, 0 };
+        layout_abs(c, &p, 0, 0, c->vw, c->vh, 1);
+        if (c->lo->nitems <= from)
+            continue;
+        struct zlayer *zl = grow(c->a, c->zl, c->nzl, &c->zlcap, sizeof(*zl));
+        if (!zl)
+            continue;
+        c->zl = zl;
+        zl[c->nzl++] = (struct zlayer){ from, from, c->lo->nitems, 0x7fff0000 + i, 1 };
+    }
+}
+
+/* One pass over the document: the page, then the top layer. */
+static void layout_pass(struct lctx *c, struct node *root, int vw, int vh)
+{
+    struct layout *lo = c->lo;
     memset(lo, 0, sizeof(*lo));
     lo->canvas = OPAQUE(0xFFFFFF);
-    if (!root || !root->style)
-        return;
-    struct shadow_swap *composed = shadow_compose(a, root);
-    struct lctx c = { .a = a, .lo = lo, .vw = vw, .vh = vh, .gen = ++layout_gen };
     lo->vw = vw;
     lo->vh = vh;
-    lo->dyn = arena_alloc(a, sizeof(struct dynbox) * MAX_DYNBOX);
-    lo->sb = arena_alloc(a, sizeof(struct sbox) * MAX_SBOX);
+    lo->dyn = arena_alloc(c->a, sizeof(struct dynbox) * MAX_DYNBOX);
+    lo->sb = arena_alloc(c->a, sizeof(struct sbox) * MAX_SBOX);
     /* The root's background, or else the body's, covers the whole canvas. */
     struct node *body = NULL;
     for (struct node *k = root->first; k; k = k->next)
@@ -5126,17 +5595,36 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
             body = k;
     if (ALPHA(root->style->bg)) {
         lo->canvas = root->style->bg;
-        c.skip_bg = root;
+        c->skip_bg = root;
     } else if (body && body->style && ALPHA(body->style->bg)) {
         lo->canvas = body->style->bg;
-        c.skip_bg = body;
+        c->skip_bg = body;
     }
     if (ALPHA(lo->canvas) < 255)
         lo->canvas = OPAQUE(0xFFFFFF);
     int mb;
     ncq_laid = 0;
-    int h = layout_block_box(&c, root, 0, 0, vw, -1, &mb, NULL);
+    int h = layout_block_box(c, root, 0, 0, vw, -1, &mb, NULL);
     lo->height = h + (mb > 0 ? mb : 0);
+    top_layer(c, root);
+}
+
+void layout_document(struct arena *a, struct layout *lo, struct node *root, int vw, int vh)
+{
+    memset(lo, 0, sizeof(*lo));
+    lo->canvas = OPAQUE(0xFFFFFF);
+    if (!root || !root->style)
+        return;
+    struct shadow_swap *composed = shadow_compose(a, root);
+    struct lctx c = { .a = a, .lo = lo, .vw = vw, .vh = vh, .gen = ++layout_gen, .root = root };
+    layout_pass(&c, root, vw, vh);
+    if (c.nab) {                        /* anchors: where they came out, and all again with that known */
+        measure_anchors(&c);
+        struct lctx again = { .a = a, .lo = lo, .vw = vw, .vh = vh, .gen = ++layout_gen, .root = root,
+                              .ab = c.ab, .nab = c.nab, .abcap = c.abcap, .anchor_pass = 1 };
+        c = again;
+        layout_pass(&c, root, vw, vh);
+    }
     layout_cq_changed = 0;
     for (int i = 0; i < ncq_laid; i++) {
         struct node *k = cq_laid[i];
@@ -6008,8 +6496,26 @@ static void play_triangle(struct surface *s, int x, int cy, int h, color_t c)
     }
 }
 
-/* <video> and <audio controls>: nothing here can play them, so they show what they are (the poster
- * for a video) and a click downloads the file (browser.c). */
+/* <audio controls>: a play button, the time, and a bar from x0 to x1 (pixels from the left of a
+ * control w wide; x0 == x1: no room for one), which browser.c seeks along. */
+void layout_media_bar(const struct node *n, int w, int *x0, int *x1)
+{
+    const struct wfont *f = n->style && n->style->font ? n->style->font : NULL;
+    int tw = f ? wfont_width(f, "00:00 / 00:00", 13) : 80;
+    *x0 = 26 + tw + 10;
+    *x1 = w - 10;
+    if (*x1 - *x0 < 24)
+        *x0 = *x1 = 0;
+}
+
+static int clock_text(int ms, char *out, int size)
+{
+    int s = ms / 1000;
+    return snprintf(out, (size_t)size, "%d:%02d", s / 60, s % 60);
+}
+
+/* <video>: nothing here can play it, so it shows its poster and a click downloads the file;
+ * <audio controls>: a player, whose sound browser.c plays. */
 static void draw_media(struct surface *s, const struct ditem *d, int x, int y, int focused)
 {
     const struct node *n = d->node;
@@ -6042,12 +6548,39 @@ static void draw_media(struct surface *s, const struct ditem *d, int x, int y, i
     } else {
         gfx_fill(s, x, y, d->w, d->h, 0xF1F3F4);
         gfx_frame(s, x, y, d->w, d->h, 0xC0C0C0);
-        play_triangle(s, x + 10, y + d->h / 2, d->h / 2 > 6 ? d->h / 2 : 6, 0x202020);
-        snprintf(label, sizeof(label), "0:00  %s - click to download", *file ? file : "audio");
-        int len = (int)strlen(label);
-        while (len > 0 && wfont_width(f, label, len) > d->w - 30)
+        int cy = y + d->h / 2, bh = d->h / 2 > 6 ? d->h / 2 : 6;
+        if (n->media_state == MEDIA_PLAYING) {          /* pause: two bars */
+            gfx_fill(s, x + 10, cy - bh / 2, bh / 3 > 2 ? bh / 3 : 2, bh, 0x202020);
+            gfx_fill(s, x + 10 + bh / 2 + 1, cy - bh / 2, bh / 3 > 2 ? bh / 3 : 2, bh, 0x202020);
+        } else {
+            play_triangle(s, x + 10, cy, bh, 0x202020);
+        }
+        int x0, x1, len;
+        layout_media_bar(n, d->w, &x0, &x1);
+        if (n->media_state == MEDIA_FAILED) {
+            snprintf(label, sizeof(label), "Cannot play %s", *file ? file : "this sound");
+            x1 = x0;                    /* no bar then: the words take the room */
+        } else if (n->media_state == MEDIA_LOADING) {
+            snprintf(label, sizeof(label), "Loading...");
+        } else {
+            len = clock_text(n->media_pos_ms, label, sizeof(label));
+            if (n->media_dur_ms >= 0) {
+                snprintf(label + len, sizeof(label) - (size_t)len, " / ");
+                clock_text(n->media_dur_ms, label + len + 3, (int)sizeof(label) - len - 3);
+            }
+        }
+        len = (int)strlen(label);
+        int room = (x1 > x0 ? x0 - 6 : d->w - 4) - 26;
+        while (len > 0 && wfont_width(f, label, len) > room)
             len--;
         wfont_draw(s, f, x + 26, y + (d->h - fh) / 2, label, len, 0x202020);
+        if (x1 > x0) {                                  /* the bar, filled as far as it has played */
+            int filled = n->media_dur_ms > 0 ? (int)((long long)(x1 - x0) * n->media_pos_ms / n->media_dur_ms) : 0;
+            filled = filled < 0 ? 0 : filled > x1 - x0 ? x1 - x0 : filled;
+            gfx_fill(s, x + x0, cy - 2, x1 - x0, 4, 0xC0C4C8);
+            gfx_fill(s, x + x0, cy - 2, filled, 4, 0x404040);
+            gfx_fill(s, x + x0 + filled - 3, cy - 5, 6, 10, 0x404040);
+        }
     }
     if (focused)
         gfx_focus_rect(s, mkrect(x + 1, y + 1, d->w - 2, d->h - 2));

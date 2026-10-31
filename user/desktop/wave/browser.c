@@ -42,6 +42,8 @@
 #include "webblob.h"
 #include "web.h"
 #include "webpolicy.h"
+#include "webaudio.h"
+#include "codecs.h"
 
 #define BR_W        800
 #define BR_H        560
@@ -93,7 +95,7 @@
 #define KEY_BACKSPACE 0x0E
 #define KEY_F6 0x40
 
-enum { F_PAGE, F_CSS, F_IMG, F_JS, F_XHR, F_ICON, F_MODULE, F_FONT };
+enum { F_PAGE, F_CSS, F_IMG, F_JS, F_XHR, F_ICON, F_MODULE, F_FONT, F_MEDIA };
 enum { NAV_NEW, NAV_REPLACE, NAV_HISTORY };
 enum { B_BACK, B_FORWARD, B_STOP, B_REFRESH, B_HOME, B_HISTORY, B_DOWNLOADS, B_FAVORITES, B_GO, NBUTTONS };
 /* What a page load is for besides showing the page. */
@@ -249,6 +251,11 @@ struct browser {
     int need_style, need_layout;
     int pending_images;
     int discover_changes;
+    /* <audio> elements that have asked for their sound (media_for), and where a click on the
+     * controls landed (pixels from their left, -1 for a key) */
+    struct media *media;
+    int nmedia, mediacap;
+    int media_click, media_click_w;
     char status[256];
     char page_title[128];       /* the document's title, for favorites */
     int zoom;                   /* page zoom in percent, 0 for 100 (a window's; its frames follow it) */
@@ -1197,6 +1204,7 @@ static int request_metadata(struct browser *b, int kind, const char *url, const 
         [F_IMG] = "image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5",
         [F_ICON] = "image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5",
         [F_JS] = "*/*", [F_XHR] = "*/*", [F_MODULE] = "*/*", [F_FONT] = "*/*",
+        [F_MEDIA] = "audio/webm,audio/ogg,audio/wav,audio/*;q=0.9,application/ogg;q=0.7,*/*;q=0.5",
     };
     if (!HAS("Accept"))
         snprintf(out[n++], sizeof(out[0]), "Accept: %s", accepts[kind]);
@@ -1214,7 +1222,8 @@ static int request_metadata(struct browser *b, int kind, const char *url, const 
         snprintf(out[n++], sizeof(out[0]), "Origin: %s", origin);
     }
     static const char *const dests[] = { [F_PAGE] = "document", [F_CSS] = "style", [F_IMG] = "image",
-        [F_ICON] = "image", [F_JS] = "script", [F_XHR] = "empty", [F_MODULE] = "script", [F_FONT] = "font" };
+        [F_ICON] = "image", [F_JS] = "script", [F_XHR] = "empty", [F_MODULE] = "script", [F_FONT] = "font",
+        [F_MEDIA] = "audio" };
     const char *dest = page && is_frame(b) ? "iframe" : dests[kind];
     const char *mode = page ? "navigate" : kind == F_XHR || kind == F_MODULE || kind == F_FONT ||
                        resource_cors(b, kind, b->fetch->slot) ? "cors" : "no-cors";
@@ -1968,6 +1977,287 @@ static void sync_frames(struct browser *b)
 
 /* ---- documents ---- */
 
+/* ---- <audio>: played by the audio player process (webaudio.c) ----
+ *
+ * An element's sound is fetched the first time it is played (by a script, or its controls), put in
+ * a file for the player, which says how long it is and then plays it on and off as the page asks.
+ * What the player says goes to the page's scripts as the element's events (from browser_poll, not
+ * while a script runs) and to the controls layout.c draws.
+ */
+enum { M_IDLE, M_FETCHING, M_OPENING, M_READY, M_FAILED };
+enum { N_LOADSTART = 1, N_META = 2, N_PLAYING = 4, N_TIME = 8, N_SEEKED = 16, N_ENDED = 32, N_ERROR = 64 };
+struct media {
+    struct node *n;
+    int id, state;                      /* the player's name for it; M_* */
+    char url[URL_MAX];
+    int want_play, playing, seeking;
+    int pos_ms, dur_ms, volume;         /* volume per mille */
+    int notify;                         /* N_*: what the page's scripts have still to hear */
+};
+static int media_ids;
+
+/* The sound an element plays: its src, or the first <source> of a kind the player knows. */
+static int media_url(struct browser *b, struct node *n, char *out, int size)
+{
+    const char *src = node_attr(n, "src");
+    for (struct node *k = n->first; (!src || !*src) && k; k = k->next) {
+        const char *type = k->type == N_ELEMENT && k->tag == T_SOURCE ? node_attr(k, "type") : NULL;
+        if (k->type == N_ELEMENT && k->tag == T_SOURCE && (!type || !*type || codec_type_playable(type)))
+            src = node_attr(k, "src");
+    }
+    if (!src || !*src)
+        return 0;
+    url_resolve(b->base, src, out, size);
+    return 1;
+}
+
+static struct media *media_for(struct browser *b, struct node *n, int make)
+{
+    for (int i = 0; i < b->nmedia; i++)
+        if (b->media[i].n == n)
+            return &b->media[i];
+    if (!make)
+        return NULL;
+    if (b->nmedia == b->mediacap) {
+        int cap = b->mediacap ? b->mediacap * 2 : 8;
+        struct media *more = realloc(b->media, sizeof(*more) * (size_t)cap);
+        if (!more)
+            return NULL;
+        b->media = more;
+        b->mediacap = cap;
+    }
+    struct media *m = &b->media[b->nmedia++];
+    memset(m, 0, sizeof(*m));
+    m->n = n;
+    m->id = ++media_ids;
+    m->dur_ms = -1;
+    m->volume = 1000;
+    return m;
+}
+
+/* What the element's controls show. */
+static void media_show(struct browser *b, struct media *m)
+{
+    struct node *n = m->n;
+    int st = m->state == M_FAILED ? MEDIA_FAILED : m->playing ? MEDIA_PLAYING
+           : (m->state == M_FETCHING || m->state == M_OPENING) && m->want_play ? MEDIA_LOADING
+           : m->state == M_READY && m->pos_ms > 0 ? MEDIA_PAUSED : MEDIA_IDLE;
+    if (n->media_state == st && n->media_pos_ms / 1000 == m->pos_ms / 1000 && n->media_dur_ms == m->dur_ms)
+        return;
+    n->media_state = (uint8_t)st;
+    n->media_pos_ms = m->pos_ms;
+    n->media_dur_ms = m->dur_ms;
+    if (node_attr(n, "controls") && b->root)
+        paint(b);
+}
+
+static void media_drop(struct media *m)
+{
+    if (m->state == M_OPENING || m->state == M_READY)
+        webaudio_close(m->id);
+    m->id = ++media_ids;                /* what the player still says of the old one goes nowhere */
+    m->state = M_IDLE;
+    m->url[0] = 0;
+    m->playing = m->want_play = m->seeking = 0;
+    m->pos_ms = 0;
+    m->dur_ms = -1;
+}
+
+/* The page is going: its sounds stop. */
+static void media_forget(struct browser *b)
+{
+    for (int i = 0; i < b->nmedia; i++)
+        media_drop(&b->media[i]);
+    free(b->media);
+    b->media = NULL;
+    b->nmedia = b->mediacap = 0;
+}
+
+/* What the player said of stream id (id -1: the player itself is gone, and its streams with it). */
+static void media_answer(int id, const char *what, int a)
+{
+    for (struct browser *b = browsers; b; b = b->next)
+        for (int i = 0; i < b->nmedia; i++) {
+            struct media *m = &b->media[i];
+            if (id < 0) {
+                if (m->state == M_OPENING || m->state == M_READY) {
+                    if (m->playing || m->want_play)
+                        m->notify |= N_ERROR;
+                    m->state = M_IDLE;
+                    m->playing = m->want_play = 0;
+                    media_show(b, m);
+                }
+                continue;
+            }
+            if (m->id != id)
+                continue;
+            if (!strcmp(what, "meta")) {
+                m->dur_ms = a;
+                m->state = M_READY;
+                m->notify |= N_META;
+                webaudio_volume(id, m->volume);
+                if (m->want_play) {
+                    webaudio_play(id, m->pos_ms);
+                    m->playing = 1;
+                    m->notify |= N_PLAYING;
+                }
+            } else if (!strcmp(what, "time")) {
+                m->pos_ms = a;
+                m->notify |= m->seeking ? N_SEEKED : N_TIME;
+                m->seeking = 0;
+            } else if (!strcmp(what, "ended")) {
+                m->playing = 0;
+                if (node_attr(m->n, "loop")) {
+                    webaudio_play(id, 0);
+                    m->playing = 1;
+                    m->pos_ms = 0;
+                } else {
+                    m->want_play = 0;
+                    m->notify |= N_ENDED;
+                }
+            } else if (!strcmp(what, "error")) {
+                m->state = M_FAILED;
+                m->playing = m->want_play = 0;
+                m->notify |= N_ERROR;
+            }
+            media_show(b, m);
+            return;
+        }
+}
+
+/* The fetched sound (body NULL: it could not be fetched): to a file, for the player. */
+static void media_fetched(struct browser *b, int id, const char *body, int len)
+{
+    struct media *m = NULL;
+    for (int i = 0; i < b->nmedia && !m; i++)
+        if (b->media[i].id == id)
+            m = &b->media[i];
+    if (!m || m->state != M_FETCHING)
+        return;
+    char path[64] = "/tmp/wave-audio-XXXXXX";
+    int fd = -1, ok = 0;
+    if (body && len > 0) {
+        mkdir("/tmp", 01777);
+        fd = mkstemp(path);
+    }
+    if (fd >= 0) {
+        int done = 0;
+        while (done < len) {
+            int w = (int)write(fd, body + done, (size_t)(len - done));
+            if (w <= 0)
+                break;
+            done += w;
+        }
+        close(fd);
+        ok = done == len && webaudio_open(m->id, path) == 0;
+        if (!ok)
+            unlink(path);
+    }
+    m->state = ok ? M_OPENING : M_FAILED;
+    if (!ok)
+        m->notify |= N_ERROR;
+    media_show(b, m);
+}
+
+/* jsdom.c's h.media: what the page's scripts ask of an <audio> element. */
+static void js_media(void *ctx, struct node *n, const char *op, double value)
+{
+    struct browser *b = ctx;
+    static int answered;
+    if (!answered) {
+        webaudio_set_handler(media_answer);
+        answered = 1;
+    }
+    struct media *m = media_for(b, n, strcmp(op, "load") != 0);
+    if (!m)
+        return;
+    int ms = value > 0 ? (int)(value * 1000 + .5) : 0;
+    if (!strcmp(op, "load")) {
+        media_drop(m);
+        m->notify = 0;
+    } else if (!strcmp(op, "volume")) {
+        m->volume = value <= 0 ? 0 : value >= 1 ? 1000 : (int)(value * 1000 + .5);
+        if (m->state == M_READY)
+            webaudio_volume(m->id, m->volume);
+    } else if (!strcmp(op, "pause")) {
+        if (m->playing)
+            webaudio_pause(m->id);
+        m->playing = m->want_play = 0;
+    } else if (!strcmp(op, "seek")) {
+        m->pos_ms = ms;
+        if (m->state == M_READY) {
+            m->seeking = 1;
+            webaudio_seek(m->id, ms);
+        }
+    } else if (!strcmp(op, "play")) {
+        char url[URL_MAX];
+        if (!media_url(b, n, url, sizeof(url))) {
+            m->state = M_FAILED;
+            m->notify |= N_ERROR;
+        } else {
+            if (strcmp(url, m->url)) {          /* another sound than it had */
+                media_drop(m);
+                snprintf(m->url, sizeof(m->url), "%s", url);
+            }
+            m->pos_ms = ms;
+            m->want_play = 1;
+            if (m->state == M_IDLE || m->state == M_FAILED) {
+                m->state = M_FETCHING;
+                m->notify |= N_LOADSTART;
+                if (!queue_resource(b, F_MEDIA, url, m->id, 0)) {
+                    m->state = M_FAILED;
+                    m->notify |= N_ERROR;
+                } else if (free_loader(b)) {
+                    start_next(b);
+                }
+            } else if (m->state == M_READY) {
+                webaudio_play(m->id, ms);
+                m->playing = 1;
+                m->notify |= N_PLAYING;
+            }
+        }
+    }
+    media_show(b, m);
+}
+
+/* What the player said, to the page's scripts: the events, in the order they happened in. */
+static void media_notify(struct browser *b)
+{
+    static const struct { int bit; const char *type; } order[] = {
+        { N_LOADSTART, "loadstart" }, { N_META, "loadedmetadata" }, { N_META, "canplay" }, { N_PLAYING, "playing" },
+        { N_SEEKED, "seeked" }, { N_TIME, "timeupdate" }, { N_ENDED, "ended" }, { N_ERROR, "error" },
+    };
+    for (int i = 0; i < b->nmedia && b->js; i++) {
+        int bits = b->media[i].notify;
+        if (!bits)
+            continue;
+        b->media[i].notify = 0;
+        struct node *n = b->media[i].n;
+        double t = b->media[i].pos_ms / 1000.0, dur = b->media[i].dur_ms >= 0 ? b->media[i].dur_ms / 1000.0 : -1;
+        for (unsigned k = 0; k < sizeof(order) / sizeof(order[0]); k++)
+            if (bits & order[k].bit) {
+                jsdom_media_event(b->js, n, order[k].type, t, dur);
+                if (!b->js || i >= b->nmedia || b->media[i].n != n)
+                    return;             /* a handler changed the page */
+            }
+    }
+}
+
+/* A press on an <audio>'s controls: the play button plays or pauses, the bar goes to that point. */
+static void media_pressed(struct browser *b, struct node *n)
+{
+    if (!b->js)
+        return;
+    int x0, x1;
+    layout_media_bar(n, b->media_click_w, &x0, &x1);
+    if (b->media_click >= 0 && x1 > x0 && b->media_click >= x0 - 4 && n->media_dur_ms > 0) {
+        int at = b->media_click < x0 ? x0 : b->media_click > x1 ? x1 : b->media_click;
+        jsdom_media_user(b->js, n, "seek", (double)n->media_dur_ms * (at - x0) / (x1 - x0) / 1000.0);
+    } else {
+        jsdom_media_user(b->js, n, "toggle", 0);
+    }
+}
+
 static void free_page(struct browser *b)
 {
     image_jobs_cancel(b);
@@ -2024,6 +2314,7 @@ static void free_page(struct browser *b)
     b->tip_shown = 0;
     b->pop_swallow = 0;
     b->refresh_url[0] = 0;
+    media_forget(b);
     jsdom_free(b->js);
     b->js = NULL;
     for (int i = 0; i < b->nscripts; i++)
@@ -2932,6 +3223,7 @@ static void start_scripts(struct browser *b, const char *url)
         .cookie_get = js_cookie_get, .cookie_set = js_cookie_set, .ws_cookies=js_ws_cookies, .font_register=js_font_register, .font_status=js_font_status, .fetch_module = js_fetch_module,
         .open_tab = js_open_tab, .window_query = js_window_query, .window_post = js_window_post,
         .window_close = js_window_close, .window_navigate = js_window_navigate, .module_done = js_module_done, .set_url = js_set_url, .submit = js_submit, .node_at = js_node_at,
+        .media = js_media,
     };
     b->js = jsdom_new(&h);
     if (!b->js)
@@ -4196,6 +4488,8 @@ static void fetch_complete(struct browser *b)
                 collect_sheets(b);
         } else if (done.kind == F_IMG) {
             image_done(b, done.url, ok && r.status < 300 ? r.body : "", ok && r.status < 300 ? r.len : 0);
+        } else if (done.kind == F_MEDIA) {
+            media_fetched(b, done.slot, ok && r.status < 300 ? r.body : NULL, ok && r.status < 300 ? r.len : 0);
         } else if (done.kind == F_ICON) {
             if (ok && r.status < 300)
                 set_favicon(b, r.body, r.len);
@@ -4229,7 +4523,7 @@ static void start_next(struct browser *b)
         }
         set_status(b, "Loading %s %d of %d: %s",
                    r.kind == F_CSS ? "style sheet" : r.kind == F_JS || r.kind == F_MODULE ? "script" :
-                   r.kind == F_XHR ? "request" : r.kind==F_FONT ? "font" : "picture",
+                   r.kind == F_XHR ? "request" : r.kind==F_FONT ? "font" : r.kind == F_MEDIA ? "sound" : "picture",
                    b->done_res + 1, b->total_res, r.url);
         b->queue[b->qhead - 1].post = NULL;            /* r has it */
         int started =
@@ -4736,6 +5030,8 @@ static void submit(struct browser *b, struct node *form, struct node *submitter)
         return;                         /* a handler said no */
     if (b->js_nav[0])
         return;                         /* or went somewhere else */
+    if (jsdom_dialog_submit(b->js, form, submitter))
+        return;                         /* method=dialog: it closes its dialog instead */
     char q[URL_MAX], target[URL_MAX];
     int post = form_request(b, form, submitter, target, sizeof(target), q, sizeof(q));
     struct browser *tb = target_of(b, node_attr(form, "target"));
@@ -4758,7 +5054,7 @@ static void js_submit(void *ctx, struct node *form, int fire)
     struct browser *b = ctx;
     if (fire && b->js && jsdom_dispatch(b->js, form, "submit"))
         return;
-    if (b->js_nav[0])
+    if (b->js_nav[0] || jsdom_dialog_submit(b->js, form, NULL))
         return;
     char q[URL_MAX];
     int post = form_request(b, form, NULL, b->js_nav, sizeof(b->js_nav), q, sizeof(q));
@@ -4849,8 +5145,12 @@ static void ask_control(struct browser *b, struct node *n)
 static void activate(struct browser *b, struct node *n)
 {
     if (!n || web_inert(n) || web_disabled(n)) return;
+    if (n->tag == T_AUDIO && b->js) {
+        media_pressed(b, n);
+        return;
+    }
     if (n->tag == T_VIDEO || n->tag == T_AUDIO) {
-        /* nothing here plays them: fetch the file (its src, or its first <source>) to the downloads */
+        /* nothing here plays video: fetch the file (its src, or its first <source>) to the downloads */
         const char *src = node_attr(n, "src");
         for (struct node *k = n->first; (!src || !*src) && k; k = k->next)
             if (k->type == N_ELEMENT && k->tag == T_SOURCE)
@@ -6412,6 +6712,9 @@ static void br_key(struct window *w, const struct input_event *ev)
             paint(b);
             return;
         }
+        /* Escape the page let through closes its newest popover or modal dialog */
+        if (pressed && ev->code == KEY_ESC && jsdom_close_request(b->js))
+            return;
     }
     if (!(ev->flags & IEV_PRESSED))
         return;
@@ -6512,6 +6815,7 @@ static void br_key(struct window *w, const struct input_event *ev)
         if(b->js && jsdom_mouse_event(b->js,f,"click",f->bx0,f->by0,0,NULL))return;
         if(f->tag==T_A||f->tag==T_AREA){if(ev->code==KEY_ENTER)follow_link(b,f);return;}
         if(f->tag==T_SUMMARY){toggle_details(b,f->bx0+1,f->by0+1);return;}
+        b->media_click = -1;
         activate(b, f);
         return;
     }
@@ -7276,6 +7580,10 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
                 paint(b);
             }
             struct node *under = b->js ? element_at(b, px, py) : NULL;
+            if (b->js)                  /* a press outside the open popovers closes them */
+                jsdom_light_dismiss(b->js, under ? under : b->root, px, py);
+            if (!b->root || b->js_nav[0])
+                return;
             int pointer_prevented = under && jsdom_mouse_event(b->js, under, "pointerdown", px, py, 0, NULL);
             if (pointer_prevented)      /* no mousedown then, nor what it would start */
                 b->drag_src = NULL, b->sel_start = 0;
@@ -7329,6 +7637,8 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
                 return;
             const struct hotspot *h = layout_hit(&b->lo, b->lo.controls, b->lo.ncontrols, px, py, b->scroll_x, b->scroll_y);
             if (b->press_ctrl && h && h->node == b->press_ctrl) {
+                b->media_click = px - h->x;     /* where on an <audio>'s controls */
+                b->media_click_w = h->w;
                 activate(b, b->press_ctrl);
                 return;
             }
@@ -7909,6 +8219,7 @@ void browser_poll(void)
         }
         if (b->js)
             jsdom_run_timers(b->js);
+        media_notify(b);
         if (b->root && b->discover_changes) flush_changes(b);
         else if (b->root && (b->need_style || b->need_layout)) { relayout(b); paint(b); }
         if (b->root) animate(b);

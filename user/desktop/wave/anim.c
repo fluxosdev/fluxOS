@@ -92,14 +92,14 @@ static const struct { const char *name; int ap; } prop_table[] = {
     { "border-right-width", AP_BORDER_RIGHT_WIDTH }, { "border-top-color", AP_BORDER_TOP_COLOR },
     { "border-top-left-radius", AP_BORDER_TL_RADIUS }, { "border-top-right-radius", AP_BORDER_TR_RADIUS },
     { "border-top-width", AP_BORDER_TOP_WIDTH }, { "bottom", AP_BOTTOM }, { "box-shadow", AP_BOX_SHADOW },
-    { "color", AP_COLOR }, { "column-gap", AP_COLUMN_GAP }, { "flex-basis", AP_FLEX_BASIS },
+    { "color", AP_COLOR }, { "column-gap", AP_COLUMN_GAP }, { "display", AP_DISPLAY }, { "flex-basis", AP_FLEX_BASIS },
     { "flex-grow", AP_FLEX_GROW }, { "flex-shrink", AP_FLEX_SHRINK }, { "font-size", AP_FONT_SIZE },
     { "height", AP_HEIGHT }, { "left", AP_LEFT }, { "letter-spacing", AP_LETTER_SPACING },
     { "line-height", AP_LINE_HEIGHT }, { "margin-bottom", AP_MARGIN_BOTTOM }, { "margin-left", AP_MARGIN_LEFT },
     { "margin-right", AP_MARGIN_RIGHT }, { "margin-top", AP_MARGIN_TOP }, { "max-height", AP_MAX_HEIGHT },
     { "max-width", AP_MAX_WIDTH }, { "min-height", AP_MIN_HEIGHT }, { "min-width", AP_MIN_WIDTH },
     { "opacity", AP_OPACITY }, { "outline-color", AP_OUTLINE_COLOR }, { "outline-offset", AP_OUTLINE_OFFSET },
-    { "outline-width", AP_OUTLINE_WIDTH }, { "padding-bottom", AP_PADDING_BOTTOM },
+    { "outline-width", AP_OUTLINE_WIDTH }, { "overlay", AP_OVERLAY }, { "padding-bottom", AP_PADDING_BOTTOM },
     { "padding-left", AP_PADDING_LEFT }, { "padding-right", AP_PADDING_RIGHT }, { "padding-top", AP_PADDING_TOP },
     { "right", AP_RIGHT }, { "row-gap", AP_ROW_GAP }, { "text-indent", AP_TEXT_INDENT },
     { "text-shadow", AP_TEXT_SHADOW }, { "top", AP_TOP }, { "transform", AP_TRANSFORM },
@@ -221,6 +221,8 @@ static void get(const struct style *cst, int ap, struct apval *v)
     case AP_OPACITY: v->f = st->opacity; break;
     case AP_LINE_HEIGHT: v->k = st->lh_kind, v->i[0] = st->lh; break;
     case AP_VISIBILITY: v->i[0] = st->hidden; break;
+    case AP_DISPLAY: v->i[0] = st->display, v->i[1] = st->inner; break;
+    case AP_OVERLAY: v->i[0] = st->overlay; break;
     case AP_TRANSFORM_ORIGIN: v->l = st->tox, v->l2 = st->toy; break;
     case AP_BOX_SHADOW:
         v->c = st->sh_color, v->i[0] = st->sh_x, v->i[1] = st->sh_y, v->i[2] = st->sh_blur, v->i[3] = st->sh_spread;
@@ -254,6 +256,8 @@ static void put(struct style *st, int ap, const struct apval *v, struct arena *a
         break;
     case AP_LINE_HEIGHT: st->lh_kind = v->k, st->lh = v->i[0]; break;
     case AP_VISIBILITY: st->hidden = (uint8_t)v->i[0]; break;
+    case AP_DISPLAY: st->display = (uint8_t)v->i[0], st->inner = (uint8_t)v->i[1]; break;
+    case AP_OVERLAY: st->overlay = (uint8_t)v->i[0]; break;
     case AP_TRANSFORM_ORIGIN: st->tox = v->l, st->toy = v->l2; break;
     case AP_BOX_SHADOW:
         st->sh_color = v->c, st->sh_x = v->i[0], st->sh_y = v->i[1], st->sh_blur = v->i[2], st->sh_spread = v->i[3];
@@ -405,6 +409,12 @@ static void blend(int ap, const struct apval *a, const struct apval *b, float t,
     case AP_VISIBILITY:                 /* visible while either end is */
         out->i[0] = t <= 0 ? a->i[0] : t >= 1 ? b->i[0] : a->i[0] && b->i[0];
         return;
+    case AP_DISPLAY: case AP_OVERLAY: { /* discrete; between none and a box, the box all the way */
+        int none_a = ap == AP_DISPLAY ? a->i[0] == D_NONE : !a->i[0];
+        int none_b = ap == AP_DISPLAY ? b->i[0] == D_NONE : !b->i[0];
+        *out = t <= 0 ? *a : t >= 1 ? *b : none_a != none_b ? (none_a ? *b : *a) : t < .5f ? *a : *b;
+        return;
+    }
     case AP_LINE_HEIGHT:
         if (a->k != b->k) {
             *out = t < .5f ? *a : *b;
@@ -800,18 +810,25 @@ static void sync_transitions(struct anim_state *s, const struct style *st)
     for (int ap = 0; ap < AP_COUNT; ap++) {
         if (!(all & AP_BIT(ap)))
             continue;
+        const struct css_transition *spec = transition_for(st, ap);
+        if ((ap == AP_DISPLAY || ap == AP_OVERLAY) && !spec->discrete)
+            continue;
         struct apval before, after;
         get(&s->prev, ap, &before);
         get(st, ap, &after);
-        if (same(ap, &before, &after))
-            continue;
-        const struct css_transition *spec = transition_for(st, ap);
         int k;
         for (k = 0; k < s->nt && s->t[k].ap != ap; k++)
             ;
         struct transition *old = k < s->nt ? &s->t[k] : NULL;
         if (old && same(ap, &old->to, &after))
             continue;                   /* already on its way there */
+        if (same(ap, &before, &after)) {
+            if (old) {                  /* back where it started: what was going elsewhere stops */
+                event(s, "transitioncancel", old->name, 0);
+                remove_transition(s, k);
+            }
+            continue;
+        }
         struct transition t = { 0 };
         t.ap = ap;
         t.duration = spec->duration;
@@ -895,6 +912,17 @@ void anim_style(struct node *n, struct style *st, const struct anim_env *env)
     if (!s)
         return;
     s->seen = cascade_gen;
+    /* Nothing transitions out of display: none (or into being), unless @starting-style says from what. */
+    if (!s->has_prev || s->prev.display == D_NONE) {
+        s->has_prev = env->start != NULL;
+        if (env->start) {
+            s->prev = *env->start;
+            if (env->start->xf) {
+                s->prev_xf = *env->start->xf;
+                s->prev.xf = &s->prev_xf;
+            }
+        }
+    }
     sync_transitions(s, st);
     sync_animations(s, st);
     /* Remember the base values for the next change, before anything moves them. */
@@ -920,6 +948,11 @@ static int state_moving(const struct anim_state *s)
         if (!s->a[k].ended && !s->a[k].paused_at)
             return 1;
     return 0;
+}
+
+int anim_needs_start(const struct node *n)
+{
+    return !n->anim || !n->anim->has_prev || n->anim->prev.display == D_NONE;
 }
 
 int anim_running(const struct node *n)

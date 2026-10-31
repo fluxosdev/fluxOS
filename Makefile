@@ -127,6 +127,8 @@ FONT_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(FONT_SRCS)))
 LIBFONT := $(BUILD)/libfont.a
 $(FONT_OBJS) $(BUILD)/u/user/desktop/wave/webfont.o: USER_CFLAGS += $(FONT_FLAGS)
 $(BUILD)/u/user/libc/brdecode.o: USER_CFLAGS += -I$(BROTLI_DIR)/c/include
+$(BUILD)/u/user/desktop/wave/codecs.o $(BUILD)/u/user/desktop/wave/mp3dec.o: USER_CFLAGS += -Ithird_party/minimp3 \
+	-Ithird_party/stb_vorbis
 $(LIBFONT): $(FONT_OBJS)
 	$(AR) rcs $@ $^
 
@@ -272,6 +274,13 @@ $(ROOTFS)/bin/dos: $(CRT0) $(DOS_OBJS) $(LIBC) user/user.ld
 $(ROOTFS)/bin/winrun: $(CRT0) $(WIN32_OBJS) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(WIN32_OBJS) $(LIBC)
+
+# play decodes MP3 and Ogg Vorbis with Wave's decoders
+PLAY_CODECS := $(BUILD)/u/user/desktop/wave/codecs.o $(BUILD)/u/user/desktop/wave/mp3dec.o
+$(BUILD)/u/user/bin/play.o: USER_CFLAGS += -Iuser/desktop/wave
+$(ROOTFS)/bin/play: $(BUILD)/u/user/bin/play.o $(PLAY_CODECS) $(CRT0) $(LIBC) user/user.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(PLAY_CODECS) $(LIBC)
 
 $(ROOTFS)/bin/%: $(BUILD)/u/user/bin/%.o $(CRT0) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
@@ -557,6 +566,8 @@ test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-worker $(BUILD)/
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/clone-escape-tests.js 23
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/canvas-tests.js 52
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 134
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/toplayer-tests.js 18
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/media-tests.js 5
 	rm -rf $(BUILD)/tests/idb
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/indexeddb-tests.js 3
 	$(BUILD)/tests/js-engine

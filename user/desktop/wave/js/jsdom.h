@@ -77,6 +77,9 @@ struct jshost {
     void (*reveal)(void *ctx, struct node *n);
     /* The element drawn at a page point, or NULL. */
     struct node *(*node_at)(void *ctx, int x, int y);
+    /* <audio>: "play" (from value seconds), "pause", "seek" (to value), "volume" (0 to 1) and "load"
+     * (forget the sound: its source changed); the browser answers through jsdom_media_event. */
+    void (*media)(void *ctx, struct node *n, const char *op, double value);
 };
 
 struct jsdom;
@@ -109,6 +112,20 @@ void jsdom_page_event(struct jsdom *d, const char *type, int hidden);
 void jsdom_layout_changed(struct jsdom *d);
 /* The document finished loading: DOMContentLoaded, then load. */
 void jsdom_loaded(struct jsdom *d);
+/* The top layer. A close request (Escape): the newest auto popover or modal dialog closes (a dialog
+ * after its cancel event); 1 if there was one. A press at page point (x, y) on target: the auto
+ * popovers it is outside close, and a modal dialog with closedby=any whose backdrop it is on. */
+int jsdom_close_request(struct jsdom *d);
+/* A form being submitted: with method=dialog it closes the dialog it is in (its returnValue the
+ * submitter's value) and is not sent anywhere; 1 if so. */
+int jsdom_dialog_submit(struct jsdom *d, struct node *form, struct node *submitter);
+void jsdom_light_dismiss(struct jsdom *d, struct node *target, int x, int y);
+/* What an <audio> element's sound did: "loadstart", "loadedmetadata", "canplay", "playing",
+ * "timeupdate", "seeked", "ended" or "error", at time seconds into it (-1: as it was), duration long
+ * (-1: not known). */
+void jsdom_media_event(struct jsdom *d, struct node *n, const char *type, double time, double duration);
+/* The user pressed an <audio>'s controls: "toggle" (play or pause), or "seek" to time seconds. */
+void jsdom_media_user(struct jsdom *d, struct node *n, const char *op, double time);
 /* Dispatch an event at target, bubbling; returns 1 if a handler called preventDefault. */
 int jsdom_dispatch(struct jsdom *d, struct node *target, const char *type);
 /* transitionrun/start/end/cancel (propertyName) and animationstart/iteration/end/cancel (animationName). */
