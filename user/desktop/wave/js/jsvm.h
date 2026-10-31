@@ -723,11 +723,11 @@ static void lay_out(struct vfunc *f)
     X(SETREG)       /* r          v     -- v */                                     \
     X(GETENV)       /* hops slot        -- v */                                     \
     X(SETENV)       /* hops slot  v     -- v */                                     \
-    X(GETNAME)      /* hops name        -- v (ReferenceError if none) */            \
-    X(TYPEOFNAME)   /* hops name        -- v (undefined if none) */                 \
-    X(SETNAME)      /* hops name  v     -- v */                                     \
+    X(GETNAME)      /* hops name ic     -- v (ReferenceError if none) */            \
+    X(TYPEOFNAME)   /* hops name ic     -- v (undefined if none) */                 \
+    X(SETNAME)      /* hops name ic v   -- v */                                     \
     X(DECLNAME)     /* hops name konst v -- v: a top-level let or const */         \
-    X(VARNAME)      /* hops name  v     -- v: a top-level var's value */           \
+    X(VARNAME)      /* hops name ic v   -- v: a top-level var's value */           \
     X(CONSTERR)     /* name             -- (throws) */                              \
     X(THIS)         /*                  -- this */                                  \
     X(NEWTARGET)    /* lexical constructor target */                              \
@@ -745,17 +745,17 @@ static void lay_out(struct vfunc *f)
     X(APUSH)        /*            a v   -- a */                                     \
     X(AHOLE)        /*            a     -- a */                                     \
     X(ASPREAD)      /*            a it  -- a */                                     \
-    X(OBJECT)       /*                  -- {} */                                    \
-    X(OPROP)        /* key        o v   -- o */                                     \
+    X(OBJECT)       /* n                -- {} (room for n properties) */            \
+    X(OPROP)        /* key ic     o v   -- o */                                     \
     X(OPROPC)       /*          o k v   -- o */                                     \
     X(OGET)         /* key        o f   -- o */                                     \
     X(OSET)         /* key        o f   -- o */                                     \
     X(OGETC)        /*          o k f   -- o */                                     \
     X(OSETC)        /*          o k f   -- o */                                     \
     X(OSPREAD)      /*          o src   -- o */                                     \
-    X(GETPROP)      /* key        o     -- v */                                     \
+    X(GETPROP)      /* key ic     o     -- v */                                     \
     X(GETELEM)      /*            o k   -- v */                                     \
-    X(SETPROP)      /* key        o v   -- v */                                     \
+    X(SETPROP)      /* key ic     o v   -- v */                                     \
     X(SETELEM)      /*          o k v   -- v */                                     \
     X(DELPROP)      /* key        o     -- bool */                                  \
     X(DELELEM)      /*            o k   -- bool */                                  \
@@ -829,11 +829,56 @@ enum {
 /* CMETHOD kinds */
 enum { CM_METHOD, CM_GETTER, CM_SETTER, CM_STATIC = 4 };
 
+/*
+ * Inline caches: each GETPROP, SETPROP, OPROP and name lookup has one, which remembers what
+ * the last object it saw looked like and where the key was. An object with the same shape has
+ * the key in the same place. A key found up the prototype chain stays there while the receiver's
+ * prototype is the same and nothing on the way has changed: objects on the way are marked
+ * is_proto, and changing one moves J->shape_epoch. A name's cache holds while nothing new is
+ * declared (J->var_epoch).
+ */
+enum {
+    IC_NONE,
+    IC_OWN,                             /* the receiver's own property, at index */
+    IC_PROTO,                           /* holder's property at index, up the receiver's chain */
+    IC_ABSENT,                          /* nowhere on the chain */
+    IC_ADD,                             /* a new property: the receiver moves to shape next */
+    IC_GLOBAL,                          /* a name: env's object's own property at index */
+    IC_BINDING,                         /* a name: binding b in env's list */
+    IC_LENGTH,                          /* an array's or a string's length */
+};
+
+struct vic {
+    uint8_t kind, fills;
+    uint32_t index, epoch;
+    struct shape *shape;                /* the receiver's */
+    union {
+        struct jsobj *proto;            /* the receiver's prototype (IC_PROTO, IC_ABSENT, IC_ADD) */
+        struct env *env;                /* IC_GLOBAL, IC_BINDING: where the lookup starts */
+    };
+    union {
+        struct jsobj *holder;           /* IC_PROTO */
+        struct shape *next;             /* IC_ADD */
+        struct binding *b;              /* IC_BINDING */
+    };
+};
+
+/* A GETPROP that misses looks in a table shared by every instruction, by shape and key, so
+ * one that sees objects of many shapes still finds most of them without a lookup. */
+#define IC_MEGA 4096
+
+struct vmega {
+    struct jsstr *key;
+    struct vic ic;
+};
+
 struct vproto {
     uint32_t *code;
     jsval *k;                           /* constants: names, numbers, strings, functions */
     int ncode, nk;
     int nregs, maxsp, niters, maxh;
+    struct vic *ic;                     /* nic inline caches */
+    int nic;
     struct vfunc *vf;
 };
 
@@ -870,6 +915,7 @@ struct cg {
     int nk, kcap;
     int sp, maxsp, depth;
     int nregs, niters, h, maxh;
+    int nic;
     struct ctl *ctl;
     struct jsstr **labels;              /* labels waiting for the statement they name */
     int nlabels;
@@ -912,6 +958,18 @@ static void op2(struct cg *C, int code, int delta, int a, int b)
 {
     op1(C, code, delta, a);
     cg_word(C, (uint32_t)b);
+}
+
+/* An instruction with an operand and an inline cache of its own. */
+static void op1ic(struct cg *C, int code, int delta, int a)
+{
+    op2(C, code, delta, a, C->nic++);
+}
+
+static void op2ic(struct cg *C, int code, int delta, int a, int b)
+{
+    op2(C, code, delta, a, b);
+    cg_word(C, (uint32_t)C->nic++);
 }
 
 static int cg_const(struct cg *C, jsval v)
@@ -1045,7 +1103,7 @@ static void load_name(struct cg *C, struct jsstr *name, int for_typeof)
     if (d)
         load_decl(C, d);
     else
-        op2(C, for_typeof ? I_TYPEOFNAME : I_GETNAME, 1, dyn ? hops_to(C, dyn) : 0, cg_str(C, name));
+        op2ic(C, for_typeof ? I_TYPEOFNAME : I_GETNAME, 1, dyn ? hops_to(C, dyn) : 0, cg_str(C, name));
 }
 
 /* How a store binds: an assignment, or the declaration's own value. */
@@ -1067,7 +1125,7 @@ static void store_name(struct cg *C, struct jsstr *name, int mode)
         cg_word(C, (uint32_t)cg_str(C, name));
         cg_word(C, mode == ST_CONST);
     } else {
-        op2(C, mode == ST_VAR ? I_VARNAME : I_SETNAME, 0, hops, cg_str(C, name));
+        op2ic(C, mode == ST_VAR ? I_VARNAME : I_SETNAME, 0, hops, cg_str(C, name));
     }
 }
 
@@ -1210,7 +1268,7 @@ static void ex_call(struct cg *C, struct ast *n)
         op(C, I_DUP, 1);
         if (callee->kind == N_MEMBER) {
             name = cg_str(C, callee->str);
-            op1(C, I_GETPROP, 0, name);
+            op1ic(C, I_GETPROP, 0, name);
         } else {
             ex(C, callee->b);
             op(C, I_GETELEM, -1);
@@ -1269,7 +1327,7 @@ static void ex_member(struct cg *C, struct ast *n)
     if (n->flags & F_OPTIONAL)
         skip = jump(C, I_JNULLISH, 0);
     if (n->kind == N_MEMBER) {
-        op1(C, I_GETPROP, 0, cg_str(C, n->str));
+        op1ic(C, I_GETPROP, 0, cg_str(C, n->str));
     } else {
         ex(C, n->b);
         op(C, I_GETELEM, -1);
@@ -1285,7 +1343,7 @@ static void store_target(struct cg *C, struct ast *t, int mode)
     if (t->kind == N_IDENT)
         store_name(C, t->str, mode);
     else if (t->kind == N_MEMBER)
-        op1(C, I_SETPROP, -1, cg_str(C, t->str));
+        op1ic(C, I_SETPROP, -1, cg_str(C, t->str));
     else
         op(C, I_SETELEM, -2);
 }
@@ -1311,7 +1369,7 @@ static void load_target(struct cg *C, struct ast *t, int nbase)
         load_name(C, t->str, 0);
     } else if (nbase == 1) {
         op(C, I_DUP, 1);
-        op1(C, I_GETPROP, 0, cg_str(C, t->str));
+        op1ic(C, I_GETPROP, 0, cg_str(C, t->str));
     } else {
         op(C, I_DUP2, 2);
         op(C, I_GETELEM, -1);
@@ -1436,7 +1494,7 @@ static void ex_unary(struct cg *C, struct ast *n)
 
 static void ex_object(struct cg *C, struct ast *n)
 {
-    op(C, I_OBJECT, 1);
+    op1(C, I_OBJECT, 1, n->n < 255 ? n->n : 255);
     for (int i = 0; i < n->n; i++) {
         struct ast *p = n->list[i];
         if (p->kind == N_SPREAD) {
@@ -1455,6 +1513,8 @@ static void ex_object(struct cg *C, struct ast *n)
                                        : (computed ? I_OPROPC : I_OPROP);
         if (computed)
             op(C, code, -2);
+        else if (code == I_OPROP)
+            op1ic(C, code, -1, cg_str(C, p->str));
         else
             op1(C, code, -1, cg_str(C, p->str));
     }
@@ -1593,7 +1653,7 @@ static void ex_inner(struct cg *C, struct ast *n)
     case N_IMPORT_META: {
         struct vscope *dyn = NULL;
         cg_resolve(C, C->J->s_meta, &dyn);
-        op2(C, I_TYPEOFNAME, 1, dyn ? hops_to(C, dyn) : 0, cg_str(C, C->J->s_meta));
+        op2ic(C, I_TYPEOFNAME, 1, dyn ? hops_to(C, dyn) : 0, cg_str(C, C->J->s_meta));
         return;
     }
     case N_MEMBER:
@@ -1739,7 +1799,7 @@ static void bind(struct cg *C, struct ast *p, int mode)
                     op1(C, I_KEYPUSH, 0, rest);
                     op(C, I_POP, -1);
                 }
-                op1(C, I_GETPROP, 0, cg_str(C, pr->str));
+                op1ic(C, I_GETPROP, 0, cg_str(C, pr->str));
             }
             bind(C, pr->a, mode);
         }
@@ -2283,6 +2343,8 @@ static struct vproto *cg_finish(struct cg *C)
     p->maxsp = C->maxsp;
     p->niters = C->niters;
     p->maxh = C->maxh;
+    p->nic = C->nic;
+    p->ic = C->nic ? js_alloc(C->J, sizeof(*p->ic) * (size_t)C->nic) : NULL;
     p->vf = C->vf;
     C->vf->proto = p;
     return p;
@@ -2513,10 +2575,12 @@ static void define_accessor(struct js *J, struct jsobj *o, struct jsstr *key, st
         js_put(J, o, key, js_undefined, hidden);
         pr = js_own(o, key);
     }
-    if (setter)
+    if (setter) {
         pr->setter = f;
-    else
+        js_shape_changed(J, o);
+    } else {
         pr->getter = f;
+    }
 }
 
 /* The strings of a tagged template, with .raw. */
@@ -2610,6 +2674,234 @@ static int aiter_next(struct js *J, struct viter *vi, jsval *out)
     return J->throwing ? -1 : 1;
 }
 
+/* ---- inline caches ---- */
+
+/* Mark the prototypes from x up to and including last (all of them if last is NULL). */
+static void mark_protos(struct jsobj *x, struct jsobj *last)
+{
+    for (; x; x = x->proto) {
+        x->is_proto = 1;
+        if (x == last)
+            break;
+    }
+}
+
+/* Remember how reading key from v found it, if it is a way the VM can repeat. */
+static void ic_fill_get(struct js *J, struct vic *ic, jsval v, struct jsstr *key)
+{
+    uint32_t i;
+    if (js_index(strv(key), &i))
+        return;
+    int is_length = str_is(key, "length");
+    struct shape *s;
+    struct jsobj *x;
+    if (is_length && (v.t == JS_STR || (v.t == JS_OBJ && (v.u.o->cls == C_ARRAY || v.u.o->cls == C_ARGUMENTS)))) {
+        ic->kind = IC_LENGTH;
+        ic->shape = NULL;
+        return;
+    }
+    if (v.t == JS_OBJ) {
+        struct jsobj *o = v.u.o;
+        if (o->phandler || (o->cls == C_HOST && o->hcls->get) ||
+            ((o->cls == C_ARRAY || o->cls == C_ARGUMENTS) && is_length))
+            return;
+        int at = own_index(J, o, key);
+        if (at >= 0) {
+            ic->kind = IC_OWN;
+            ic->shape = o->shape;
+            ic->index = (uint32_t)at;
+            return;
+        }
+        /* An owned shape grows in place, so it cannot say the key is still missing. */
+        if (o->shape->owned || (o->cls == C_STRING && is_length) ||
+            (o->cls == C_FUNCTION && (is_length || key == J->s_prototype || str_is(key, "prototype") ||
+                                      str_is(key, "name"))))
+            return;
+        s = o->shape;
+        x = o->proto;
+    } else {
+        if (v.t == JS_UNDEF || v.t == JS_NULL || (v.t == JS_STR && is_length))
+            return;
+        s = J->prim_roots[v.t];
+        x = proto_of_primitive(J, v);
+    }
+    struct jsobj *first = x;
+    int at = -1;
+    for (; x; x = x->proto) {
+        if (x->phandler || (x->cls == C_HOST && x->hcls->get) ||
+            ((x->cls == C_ARRAY || x->cls == C_ARGUMENTS) && is_length))
+            return;
+        if ((at = own_index(J, x, key)) >= 0)
+            break;
+    }
+    mark_protos(first, x);
+    ic->kind = x ? IC_PROTO : IC_ABSENT;
+    ic->shape = s;
+    ic->proto = first;
+    ic->holder = x;
+    ic->index = (uint32_t)at;
+    ic->epoch = J->shape_epoch;
+}
+
+/* Read key from v through ic: 1 if it knew where (*out is set, and a getter may have thrown). */
+static inline int ic_get(struct js *J, struct vic *ic, jsval v, jsval *out)
+{
+    struct prop *p;
+    if (ic->kind == IC_LENGTH) {
+        if (v.t == JS_OBJ && (v.u.o->cls == C_ARRAY || v.u.o->cls == C_ARGUMENTS))
+            *out = js_num(v.u.o->len);
+        else if (v.t == JS_STR)
+            *out = js_num(js_u16len(v.u.s));
+        else
+            return 0;
+        return 1;
+    }
+    if (v.t == JS_OBJ) {
+        struct jsobj *o = v.u.o;
+        if (o->shape != ic->shape)
+            return 0;
+        if (ic->kind == IC_OWN) {
+            p = &o->props[ic->index];
+            goto found;
+        }
+        if (o->proto != ic->proto)
+            return 0;
+    } else if (v.t > JS_BIG || J->prim_roots[v.t] != ic->shape) {
+        return 0;
+    }
+    if (ic->epoch != J->shape_epoch)
+        return 0;
+    if (ic->kind == IC_ABSENT) {
+        *out = js_undefined;
+        return 1;
+    }
+    if (ic->kind != IC_PROTO)
+        return 0;
+    p = &ic->holder->props[ic->index];
+found:
+    if (p->getter)
+        *out = js_call_value(J, js_obj(p->getter), v, NULL, 0);
+    else
+        *out = p->setter ? js_undefined : p->v;
+    return 1;
+}
+
+/* A SETPROP or name cache that keeps missing (it sees many shapes) stops being refilled. */
+#define IC_MAX_FILLS 64
+
+static jsval vm_getprop(struct js *J, struct vic *ic, jsval v, struct jsstr *key)
+{
+    struct shape *s = v.t == JS_OBJ ? v.u.o->shape : v.t <= JS_BIG ? J->prim_roots[v.t] : NULL;
+    struct vmega *m = NULL;
+    jsval out;
+    if (s) {
+        if (!J->ic_mega)
+            J->ic_mega = js_alloc(J, sizeof(struct vmega) * IC_MEGA);
+        uint32_t h = (uint32_t)((uintptr_t)s ^ ((uintptr_t)key << 1)) * 2654435761u;
+        m = &J->ic_mega[h >> 20 & (IC_MEGA - 1)];
+        if (m->ic.shape == s && m->key == key && ic_get(J, &m->ic, v, &out)) {
+            *ic = m->ic;
+            return out;
+        }
+    }
+    ic->kind = IC_NONE;
+    ic->shape = NULL;
+    ic_fill_get(J, ic, v, key);
+    if (ic->kind == IC_NONE)
+        return js_get_str(J, v, key);
+    if (m && ic->shape == s) {
+        m->key = key;
+        m->ic = *ic;
+    }
+    return ic_get(J, ic, v, &out) ? out : js_get_str(J, v, key);
+}
+
+/* o.key = v, filling ic with how it went if it can be repeated. */
+static void vm_setprop(struct js *J, struct vic *ic, struct jsobj *o, struct jsstr *key, jsval v)
+{
+    uint32_t i;
+    int kind = IC_NONE, at = -1;
+    struct shape *before = o->shape;
+    if (ic->fills < IC_MAX_FILLS && !o->phandler && !(o->cls == C_HOST && o->hcls->set) &&
+        !js_index(strv(key), &i) &&
+        !((o->cls == C_ARRAY || o->cls == C_ARGUMENTS) && str_is(key, "length"))) {
+        at = own_index(J, o, key);
+        if (at >= 0) {
+            if (!o->props[at].getter && !o->props[at].setter)
+                kind = IC_OWN;
+        } else if (!before->owned) {
+            /* What decides is the first property of that name up the chain: a setter, or not. */
+            struct jsobj *x = o->proto;
+            for (; x && !x->phandler; x = x->proto) {
+                int a = own_index(J, x, key);
+                if (a >= 0) {
+                    if (!x->props[a].setter)
+                        kind = IC_ADD;
+                    break;
+                }
+            }
+            if (!x)
+                kind = IC_ADD;
+            if (kind == IC_ADD)
+                mark_protos(o->proto, x);
+        }
+    }
+    obj_set(J, o, key, v, js_obj(o));
+    if (J->throwing || kind == IC_NONE)
+        return;
+    ic->fills++;
+    if (kind == IC_OWN && o->shape == before) {
+        ic->kind = IC_OWN;
+        ic->shape = before;
+        ic->index = (uint32_t)at;
+    } else if (kind == IC_ADD && o->shape->parent == before && !o->shape->owned) {
+        ic->kind = IC_ADD;
+        ic->shape = before;
+        ic->next = o->shape;
+        ic->proto = o->proto;
+        ic->epoch = J->shape_epoch;
+    }
+}
+
+/* Remember how a name looked up from scope x was found, if it was found there. */
+static void ic_fill_name(struct js *J, struct vic *ic, struct env *x, struct jsstr *name)
+{
+    for (struct binding *b = x->vars; b; b = b->next)
+        if (str_eq(b->name, name)) {
+            while (b->alias)
+                b = b->alias;
+            ic->kind = IC_BINDING;
+            ic->b = b;
+            ic->env = x;
+            ic->epoch = J->var_epoch;
+            return;
+        }
+    struct jsobj *o = x->obj;
+    int at;
+    if (!o || o->cls != C_OBJECT || o->phandler || (at = own_index(J, o, name)) < 0)
+        return;
+    ic->kind = IC_GLOBAL;
+    ic->shape = o->shape;
+    ic->index = (uint32_t)at;
+    ic->env = x;
+    ic->epoch = J->var_epoch;
+}
+
+/* The name's binding or global property, through ic; NULL if ic does not know. */
+static inline jsval *ic_name(struct js *J, struct vic *ic, struct env *x)
+{
+    if (x != ic->env || ic->epoch != J->var_epoch)
+        return NULL;
+    if (ic->kind == IC_BINDING)
+        return ic->b->slot ? ic->b->slot : &ic->b->v;
+    if (ic->kind != IC_GLOBAL || x->obj->shape != ic->shape)
+        return NULL;
+    struct prop *p = &x->obj->props[ic->index];
+    if (p->getter || p->setter)
+        return NULL;
+    return &p->v;
+}
+
 /* A property of a plain object found without leaving it: the common case. */
 static inline int own_data(jsval o, struct jsstr *key, jsval *out)
 {
@@ -2693,25 +2985,43 @@ L_GETREG: *sp++ = regs[A]; pc++; NEXT;
 L_SETREG: regs[A] = sp[-1]; pc++; NEXT;
 L_GETENV: *sp++ = env_up(e, A)->slots[B]; pc += 2; NEXT;
 L_SETENV: env_up(e, A)->slots[B] = sp[-1]; pc += 2; NEXT;
-L_GETNAME: {
-    jsval v = read_var(J, env_up(e, A), KSTR(B), 0);
-    pc += 2;
-    CHECK();
-    *sp++ = v;
-    NEXT;
-}
+L_GETNAME:
 L_TYPEOFNAME: {
-    jsval v = read_var(J, env_up(e, A), KSTR(B), 1);
-    pc += 2;
+    struct env *x = env_up(e, A);
+    struct vic *ic = &P->ic[code[pc + 2]];
+    jsval *slot = ic_name(J, ic, x), v;
+    if (slot) {
+        v = *slot;
+    } else {
+        if (ic->fills < IC_MAX_FILLS) {
+            ic->fills++;
+            ic_fill_name(J, ic, x, KSTR(B));
+        }
+        v = read_var(J, x, KSTR(B), code[pc - 1] == I_TYPEOFNAME);
+    }
+    pc += 3;
     CHECK();
     *sp++ = v;
     NEXT;
 }
-L_SETNAME:
-    write_var(J, env_up(e, A), KSTR(B), sp[-1]);
-    pc += 2;
+L_SETNAME: {
+    struct env *x = env_up(e, A);
+    struct vic *ic = &P->ic[code[pc + 2]];
+    jsval *slot = ic_name(J, ic, x);
+    /* An assignment to a global property goes to the global object, whatever scope found it. */
+    if (slot && (ic->kind == IC_BINDING ? !ic->b->konst : x->obj == J->global)) {
+        *slot = sp[-1];
+    } else {
+        if (ic->fills < IC_MAX_FILLS) {
+            ic->fills++;
+            ic_fill_name(J, ic, x, KSTR(B));
+        }
+        write_var(J, x, KSTR(B), sp[-1]);
+    }
+    pc += 3;
     CHECK();
     NEXT;
+}
 L_DECLNAME: {
     struct env *x = env_up(e, A);
     if (x->obj)
@@ -2723,7 +3033,7 @@ L_DECLNAME: {
 }
 L_VARNAME:
     var_init(J, env_up(e, A), KSTR(B), sp[-1]);
-    pc += 2;
+    pc += 3;
     CHECK();
     NEXT;
 L_CONSTERR:
@@ -2810,12 +3120,24 @@ L_ASPREAD: {
     CHECK();
     NEXT;
 }
-L_OBJECT: *sp++ = js_obj(js_new_object(J)); NEXT;
+L_OBJECT: *sp++ = js_obj(js_mkobj_room(J, C_OBJECT, J->object_proto, A)); pc++; NEXT;
 L_OPROP: {
     sp--;
+    struct jsobj *o = sp[-1].u.o;
+    struct vic *ic = &P->ic[B];
     name_function(sp[0], KSTR(A));
-    js_put(J, sp[-1].u.o, KSTR(A), sp[0], 0);
-    pc++;
+    if (o->shape == ic->shape && ic->kind == IC_ADD) {
+        js_prop_append(J, o, KSTR(A), ic->next)->v = sp[0];
+    } else {
+        struct shape *before = o->shape;
+        js_put(J, o, KSTR(A), sp[0], 0);
+        if (o->shape->parent == before && !o->shape->owned) {
+            ic->kind = IC_ADD;
+            ic->shape = before;
+            ic->next = o->shape;
+        }
+    }
+    pc += 2;
     NEXT;
 }
 L_OPROPC: {
@@ -2842,11 +3164,11 @@ L_OSPREAD: {
 }
 L_GETPROP: {
     struct jsstr *key = KSTR(A);
-    pc++;
-    if (!own_data(sp[-1], key, &sp[-1])) {
-        sp[-1] = js_get_str(J, sp[-1], key);
-        CHECK();
-    }
+    struct vic *ic = &P->ic[B];
+    pc += 2;
+    if (!ic_get(J, ic, sp[-1], &sp[-1]))
+        sp[-1] = vm_getprop(J, ic, sp[-1], key);
+    CHECK();
     NEXT;
 }
 L_GETELEM: {
@@ -2871,11 +3193,22 @@ L_GETELEM: {
 L_SETPROP: {
     sp--;
     jsval o = sp[-1], v = sp[0];
-    pc++;
-    if (o.t == JS_OBJ)
-        obj_set(J, o.u.o, KSTR(code[pc - 1]), v, o);
-    else
-        js_setv(J, o, strv(KSTR(code[pc - 1])), v);
+    struct jsstr *key = KSTR(A);
+    struct vic *ic = &P->ic[B];
+    pc += 2;
+    if (o.t == JS_OBJ) {
+        struct jsobj *x = o.u.o;
+        struct prop *p = x->shape == ic->shape && ic->kind == IC_OWN ? &x->props[ic->index] : NULL;
+        if (p && !p->getter && !p->setter)
+            p->v = v;
+        else if (x->shape == ic->shape && ic->kind == IC_ADD && ic->epoch == J->shape_epoch &&
+                 x->proto == ic->proto)
+            js_prop_append(J, x, key, ic->next)->v = v;
+        else
+            vm_setprop(J, ic, x, key, v);
+    } else {
+        js_setv(J, o, strv(key), v);
+    }
     CHECK();
     sp[-1] = v;
     NEXT;

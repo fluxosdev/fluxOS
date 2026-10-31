@@ -684,12 +684,22 @@ int js_index(jsval key, uint32_t *out)
 
 /* ---- objects ---- */
 
-struct jsobj *js_mkobj(struct js *J, int cls, struct jsobj *proto)
+struct jsobj *js_mkobj_room(struct js *J, int cls, struct jsobj *proto, uint32_t n)
 {
-    struct jsobj *o = js_alloc(J, sizeof(*o));
+    struct jsobj *o = js_alloc(J, sizeof(*o) + sizeof(struct prop) * n);
     o->cls = (uint8_t)cls;
     o->proto = proto;
+    o->shape = J->roots[cls];
+    if (n) {
+        o->props = (struct prop *)(o + 1);
+        o->pcap = n;
+    }
     return o;
+}
+
+struct jsobj *js_mkobj(struct js *J, int cls, struct jsobj *proto)
+{
+    return js_mkobj_room(J, cls, proto, 0);
 }
 
 struct jsobj *js_new_object(struct js *J)
@@ -702,11 +712,14 @@ struct jsobj *js_new_array(struct js *J)
     return js_mkobj(J, C_ARRAY, J->array_proto);
 }
 
+static struct shape *root_of(struct js *J, struct jsobj *o);
+
 struct jsobj *js_new_host(struct js *J, const struct jsclass *cls, void *data)
 {
     struct jsobj *o = js_mkobj(J, C_HOST, J->object_proto);
     o->hcls = cls;
     o->hdata = data;
+    o->shape = root_of(J, o);
     return o;
 }
 
@@ -716,100 +729,225 @@ void *js_host_data(struct jsobj *o, const struct jsclass *cls)
 }
 
 /*
- * Properties are a list in the order they were added, which enumeration
- * follows. An object with more than PROP_TAB_MIN of them also gets an open
- * addressing hash table over the list, so lookups do not walk it; a deleted
- * property leaves a tombstone until the table is next rebuilt.
+ * Properties are an array in the order they were added, which enumeration follows, and the
+ * object's shape (jsint.h) says what keys they have. Up to SHAPE_SCAN of them are found by
+ * scanning; past that the shape has a hash table from keys to indices, shared by every object
+ * with that shape.
  */
-#define PROP_TAB_MIN 8
+#define SHAPE_SCAN 8
+#define SHAPE_SHARED 64                 /* past this many properties, an object's shape is its own */
+#define SHAPE_FANOUT 64                 /* transitions from one shape before keys look like data */
+#define SHAPE_LIMIT (1u << 17)          /* shared shapes, in all */
 
-static struct prop prop_tomb;
+struct js_host_root {
+    const struct jsclass *hcls;
+    struct shape *root;
+};
 
 static int key_eq(struct jsstr *a, struct jsstr *b)
 {
     return a == b || (js_str_hash(a) == js_str_hash(b) && str_eq(a, b));
 }
 
+static struct shape *shape_root(struct js *J)
+{
+    return js_alloc(J, sizeof(struct shape));
+}
+
+/* The shape of an object like o with no properties. */
+static struct shape *root_of(struct js *J, struct jsobj *o)
+{
+    if (o->phandler)
+        return J->proxy_root;
+    if (o->cls != C_HOST)
+        return J->roots[o->cls];
+    for (int i = 0; i < J->nhost_roots; i++)
+        if (J->host_roots[i].hcls == o->hcls)
+            return J->host_roots[i].root;
+    struct js_host_root *r = js_alloc(J, sizeof(*r) * (size_t)(J->nhost_roots + 1));
+    if (J->nhost_roots)
+        memcpy(r, J->host_roots, sizeof(*r) * (size_t)J->nhost_roots);
+    r[J->nhost_roots].hcls = o->hcls;
+    r[J->nhost_roots].root = shape_root(J);
+    J->host_roots = r;
+    return r[J->nhost_roots++].root;
+}
+
+/* Index s's keys (o's, as o has that shape) in its table, growing it as needed. */
+static void shape_index_keys(struct js *J, struct shape *s, struct jsobj *o)
+{
+    if ((s->n + 1) * 2 > s->tabcap) {
+        uint32_t cap = 16;
+        while ((s->n + 1) * 2 > cap)
+            cap *= 2;
+        s->tab = js_alloc_atomic(J, sizeof(*s->tab) * cap);
+        s->tabcap = cap;
+        s->tabn = 0;
+    }
+    uint32_t mask = s->tabcap - 1;
+    for (; s->tabn < s->n; s->tabn++) {
+        uint32_t i = js_str_hash(o->props[s->tabn].key) & mask;
+        while (s->tab[i])
+            i = (i + 1) & mask;
+        s->tab[i] = s->tabn + 1;
+    }
+}
+
+static void kid_insert(struct shape **kids, uint32_t cap, struct shape *k)
+{
+    uint32_t mask = cap - 1, i = js_str_hash(k->key) & mask;
+    while (kids[i])
+        i = (i + 1) & mask;
+    kids[i] = k;
+}
+
+/* The child of shared shape s that adds key, made if need be; NULL if the object should have
+ * a shape of its own instead. */
+static struct shape *shape_child(struct js *J, struct shape *s, struct jsstr *key)
+{
+    if (s->kids) {
+        uint32_t mask = s->kidcap - 1, i = js_str_hash(key) & mask;
+        for (struct shape *k; (k = s->kids[i]) != NULL; i = (i + 1) & mask)
+            if (key_eq(k->key, key))
+                return k;
+    }
+    if (s->n >= SHAPE_SHARED || s->nkids >= SHAPE_FANOUT || J->nshapes >= SHAPE_LIMIT)
+        return NULL;
+    if ((s->nkids + 1) * 2 > s->kidcap) {
+        uint32_t cap = s->kidcap ? s->kidcap * 2 : 4;
+        struct shape **kids = js_alloc(J, sizeof(*kids) * cap);
+        for (uint32_t i = 0; i < s->kidcap; i++)
+            if (s->kids[i])
+                kid_insert(kids, cap, s->kids[i]);
+        s->kids = kids;
+        s->kidcap = cap;
+    }
+    struct shape *c = js_alloc(J, sizeof(*c));
+    c->parent = s;
+    c->key = key;
+    c->n = s->n + 1;
+    kid_insert(s->kids, s->kidcap, c);
+    s->nkids++;
+    J->nshapes++;
+    return c;
+}
+
+/* Give o a new shape of its own, so caches that knew its old one miss. */
+static void shape_own(struct js *J, struct jsobj *o)
+{
+    struct shape *s = js_alloc(J, sizeof(*s));
+    s->owned = 1;
+    s->n = o->nprops;
+    o->shape = s;
+    if (s->n > SHAPE_SCAN)
+        shape_index_keys(J, s, o);
+}
+
+/* o became another kind of object: give it a shape from that kind's root. */
+static void reshape(struct js *J, struct jsobj *o)
+{
+    struct shape *s = root_of(J, o);
+    for (uint32_t i = 0; i < o->nprops && s; i++)
+        s = shape_child(J, s, o->props[i].key);
+    if (s)
+        o->shape = s;
+    else
+        shape_own(J, o);
+    js_shape_changed(J, o);
+}
+
+/* Where o's own property key is, without allocating: -1 if it has none. */
+static int own_find(struct jsobj *o, struct jsstr *key)
+{
+    struct shape *s = o->shape;
+    if (s->tab && s->tabn == o->nprops) {
+        uint32_t mask = s->tabcap - 1, i = js_str_hash(key) & mask;
+        for (uint32_t x; (x = s->tab[i]) != 0; i = (i + 1) & mask)
+            if (key_eq(o->props[x - 1].key, key))
+                return (int)x - 1;
+        return -1;
+    }
+    for (uint32_t i = 0; i < o->nprops; i++)
+        if (key_eq(o->props[i].key, key))
+            return (int)i;
+    return -1;
+}
+
+/* The same, indexing the shape's keys first if it has many. */
+static int own_index(struct js *J, struct jsobj *o, struct jsstr *key)
+{
+    if (o->nprops > SHAPE_SCAN && o->shape->tabn != o->nprops)
+        shape_index_keys(J, o->shape, o);
+    return own_find(o, key);
+}
+
+int js_own_index(struct jsobj *o, struct jsstr *key)
+{
+    return own_find(o, key);
+}
+
 struct prop *js_own(struct jsobj *o, struct jsstr *key)
 {
-    if (o->tab) {
-        uint32_t mask = o->tabcap - 1, i = js_str_hash(key) & mask;
-        for (struct prop *p; (p = o->tab[i]) != NULL; i = (i + 1) & mask)
-            if (p != &prop_tomb && key_eq(p->key, key))
-                return p;
-        return NULL;
+    int i = own_find(o, key);
+    return i >= 0 ? &o->props[i] : NULL;
+}
+
+struct prop *js_prop_append(struct js *J, struct jsobj *o, struct jsstr *key, struct shape *next)
+{
+    if (o->nprops == o->pcap) {
+        uint32_t cap = o->pcap ? o->pcap * 2 : 4;
+        struct prop *pv = js_alloc(J, sizeof(*pv) * cap);
+        if (o->nprops)
+            memcpy(pv, o->props, sizeof(*pv) * o->nprops);
+        o->props = pv;
+        o->pcap = cap;
     }
-    for (struct prop *p = o->props; p; p = p->next)
-        if (key_eq(p->key, key))
-            return p;
-    return NULL;
-}
-
-static void tab_add(struct prop **tab, uint32_t cap, struct prop *p)
-{
-    uint32_t mask = cap - 1, i = js_str_hash(p->key) & mask;
-    while (tab[i] && tab[i] != &prop_tomb)
-        i = (i + 1) & mask;
-    tab[i] = p;
-}
-
-/* (Re)build o's table from its list, with room to spare and no tombstones. */
-static void tab_build(struct js *J, struct jsobj *o)
-{
-    uint32_t cap = 16;
-    while (cap < o->nprops * 2 + 2)
-        cap *= 2;
-    struct prop **tab = js_alloc(J, sizeof(*tab) * cap);
-    for (struct prop *p = o->props; p; p = p->next)
-        tab_add(tab, cap, p);
-    o->tab = tab;
-    o->tabcap = cap;
-    o->tabused = o->nprops;
+    struct prop *p = &o->props[o->nprops++];
+    memset(p, 0, sizeof(*p));
+    p->key = key;
+    struct shape *s = o->shape;
+    if (next)
+        o->shape = next;
+    else if (!s->owned && (next = shape_child(J, s, key)) != NULL)
+        o->shape = next;
+    else if (!s->owned)
+        shape_own(J, o);
+    else if (++s->n > SHAPE_SCAN)
+        shape_index_keys(J, s, o);
+    js_shape_changed(J, o);
+    return p;
 }
 
 void js_put(struct js *J, struct jsobj *o, struct jsstr *key, jsval v, int hidden)
 {
-    struct prop *p = js_own(o, key);
-    if (!p) {
-        p = js_alloc(J, sizeof(*p));
-        p->key = key;
+    int i = own_index(J, o, key);
+    struct prop *p;
+    if (i >= 0) {
+        p = &o->props[i];
+    } else {
+        p = js_prop_append(J, o, key, NULL);
         p->hidden = (uint8_t)hidden;
-        /* Append, so enumeration follows insertion order. */
-        if (o->last)
-            o->last->next = p;
-        else
-            o->props = p;
-        o->last = p;
-        o->nprops++;
-        if (o->tab && (o->tabused + 1) * 2 <= o->tabcap) {
-            tab_add(o->tab, o->tabcap, p);
-            o->tabused++;
-        } else if (o->tab || o->nprops > PROP_TAB_MIN) {
-            tab_build(J, o);
-        }
     }
     p->v = v;
 }
 
-/* Take p off o's list and out of its table. */
-static void prop_unlink(struct jsobj *o, struct prop **pp)
+/* Take property i off o. */
+static void prop_remove(struct js *J, struct jsobj *o, uint32_t i)
 {
-    struct prop *p = *pp;
-    *pp = p->next;
-    if (o->last == p) {
-        o->last = NULL;
-        for (struct prop *q = o->props; q; q = q->next)
-            o->last = q;
-    }
+    memmove(&o->props[i], &o->props[i + 1], sizeof(*o->props) * (o->nprops - i - 1));
     o->nprops--;
-    if (o->tab) {
-        uint32_t mask = o->tabcap - 1, i = js_str_hash(p->key) & mask;
-        for (; o->tab[i]; i = (i + 1) & mask)
-            if (o->tab[i] == p) {
-                o->tab[i] = &prop_tomb;
-                break;
-            }
-    }
+    memset(&o->props[o->nprops], 0, sizeof(*o->props));
+    if (!o->shape->owned && i == o->nprops)
+        o->shape = o->shape->parent;            /* the last one added: back where it was */
+    else
+        shape_own(J, o);
+    js_shape_changed(J, o);
+}
+
+void js_set_proto(struct js *J, struct jsobj *o, struct jsobj *proto)
+{
+    o->proto = proto;
+    js_shape_changed(J, o);
 }
 
 static void array_reserve(struct js *J, struct jsobj *a, int n)
@@ -891,8 +1029,9 @@ static int obj_get(struct js *J, struct jsobj *o, struct jsstr *key, jsval self,
         }
         if (x->cls == C_HOST && x->hcls->get && x->hcls->get(J, x, key->s, out))
             return 1;
-        struct prop *p = js_own(x, key);
-        if (p) {
+        int i = own_index(J, x, key);
+        if (i >= 0) {
+            struct prop *p = &x->props[i];
             if (p->getter)
                 *out = js_call_value(J, js_obj(p->getter), self, NULL, 0);
             else if (p->setter)
@@ -1035,7 +1174,8 @@ static void obj_set(struct js *J, struct jsobj *o, struct jsstr *key, jsval v, j
         return;
     /* A setter anywhere up the chain takes the write. */
     for (struct jsobj *x = o; x; x = x->proto) {
-        struct prop *p = js_own(x, key);
+        int i = own_index(J, x, key);
+        struct prop *p = i >= 0 ? &x->props[i] : NULL;
         if (p && p->setter) {
             jsval arg = v;
             js_call_value(J, js_obj(p->setter), self, &arg, 1);
@@ -1105,7 +1245,7 @@ int js_has(struct js *J, jsval obj, struct jsstr *key)
         if ((x->cls == C_ARRAY || x->cls == C_ARGUMENTS) &&
             ((js_index(strv(key), &i) && i < (uint32_t)x->len) || str_is(key, "length")))
             return 1;
-        if (js_own(x, key))
+        if (own_index(J, x, key) >= 0)
             return 1;
         jsval tmp;
         if (x->cls == C_HOST && x->hcls->get && x->hcls->get(J, x, key->s, &tmp))
@@ -1116,7 +1256,6 @@ int js_has(struct js *J, jsval obj, struct jsstr *key)
 
 int js_delete(struct js *J, jsval obj, struct jsstr *key)
 {
-    (void)J;
     if (obj.t != JS_OBJ)
         return 1;
     int indexed = js_typed_has(obj, key->s);
@@ -1137,11 +1276,9 @@ int js_delete(struct js *J, jsval obj, struct jsstr *key)
             o->items[i] = js_undefined;
         return 1;
     }
-    for (struct prop **pp = &o->props; *pp; pp = &(*pp)->next)
-        if (str_eq((*pp)->key, key)) {
-            prop_unlink(o, pp);
-            return 1;
-        }
+    int at = own_index(J, o, key);
+    if (at >= 0)
+        prop_remove(J, o, (uint32_t)at);
     return 1;
 }
 
@@ -1150,16 +1287,18 @@ int js_own_symbols(struct js *J, jsval obj, struct jsstr ***out)
 {
     int n = 0;
     if (obj.t == JS_OBJ && !obj.u.o->phandler)
-        for (struct prop *p = obj.u.o->props; p; p = p->next)
-            n += js_is_symkey(p->key) && !p->hidden;
+        for (uint32_t i = 0; i < obj.u.o->nprops; i++)
+            n += js_is_symkey(obj.u.o->props[i].key) && !obj.u.o->props[i].hidden;
     struct jsstr **keys = js_alloc(J, sizeof(*keys) * (size_t)(n ? n : 1));
     *out = keys;
     if (!n)
         return 0;
     n = 0;
-    for (struct prop *p = obj.u.o->props; p; p = p->next)
+    for (uint32_t i = 0; i < obj.u.o->nprops; i++) {
+        struct prop *p = &obj.u.o->props[i];
         if (js_is_symkey(p->key) && !p->hidden)
             keys[n++] = p->key;
+    }
     return n;
 }
 
@@ -1213,8 +1352,7 @@ int js_keys(struct js *J, jsval obj, int inherited, struct jsstr ***out)
     for (struct jsobj *x = obj.u.o; x; x = inherited ? x->proto : NULL) {
         int typedlen = js_typed_length(js_obj(x));
         int count = (x->cls == C_ARRAY || x->cls == C_ARGUMENTS) ? x->len : typedlen > 0 ? typedlen : 0;
-        for (struct prop *p = x->props; p; p = p->next)
-            count++;
+        count += (int)x->nprops;
         if (n + count > cap) {
             while (n + count > cap)
                 cap *= 2;
@@ -1228,7 +1366,8 @@ int js_keys(struct js *J, jsval obj, int inherited, struct jsstr ***out)
                 snprintf(b, sizeof(b), "%d", i);
                 keys[n++] = js_mkstr(J, b, (int)strlen(b));
             }
-        for (struct prop *p = x->props; p; p = p->next) {
+        for (uint32_t pi = 0; pi < x->nprops; pi++) {
+            struct prop *p = &x->props[pi];
             if (p->hidden || js_is_symkey(p->key) || (p->key->len > 1 && p->key->s[0] == '#'))
                 continue;                       /* not enumerable, a symbol, or "#..." private */
             int dup = 0;
@@ -3752,6 +3891,7 @@ static struct binding *declare(struct js *J, struct env *e, struct jsstr *name, 
     b->alias = NULL;b->slot=NULL;
     b->next = e->vars;
     e->vars = b;
+    J->var_epoch++;
     return b;
 }
 
@@ -4025,11 +4165,14 @@ static jsval construct_impl(struct js *J, jsval fv, jsval *args, int argc)
         return r;
     }
     jsval proto = js_get_str(J, js_obj(f), J->s_prototype);
-    struct jsobj *o = js_mkobj(J, C_OBJECT, proto.t == JS_OBJ ? proto.u.o : J->object_proto);
+    struct jsobj *o = js_mkobj_room(J, C_OBJECT, proto.t == JS_OBJ ? proto.u.o : J->object_proto,
+                                    f->size_hint);
     step(J);
     jsval r = call_user(J, f, js_obj(o), args, argc);
     if (J->throwing)
         return js_undefined;
+    if (o->nprops > f->size_hint)
+        f->size_hint = (uint8_t)(o->nprops < 255 ? o->nprops : 255);
     return r.t == JS_OBJ ? r : js_obj(o);
 }
 
@@ -4366,7 +4509,9 @@ static void adopt(struct js *J, struct jsobj *self, struct jsobj *from)
     self->re = from->re;
     self->hcls = from->hcls;
     self->hdata = from->hdata;
-    for (struct prop *p = from->props; p; p = p->next) {
+    reshape(J, self);
+    for (uint32_t i = 0; i < from->nprops; i++) {
+        struct prop *p = &from->props[i];
         js_put(J, self, p->key, p->v, p->hidden);
         struct prop *q = js_own(self, p->key);
         if (q) {
@@ -5027,7 +5172,7 @@ static jsval start_coroutine(struct js *J, struct jsobj *f, jsval self, jsval *a
         jsval proto = js_get_str(J, js_obj(f), J->s_prototype);    /* generator.prototype inherits next() */
         o->proto = proto.t == JS_OBJ && proto.u.o->proto == J->object_proto ? proto.u.o : J->generator_proto;
         if (o->proto != J->generator_proto && o->proto->proto == J->object_proto)
-            o->proto->proto = J->generator_proto;
+            js_set_proto(J, o->proto, J->generator_proto);
         return js_obj(o);
     }
     struct coro *co = co_new(J, f, self, args, argc, 0);
@@ -5651,8 +5796,10 @@ static int mod_bind_imports(struct js *J, struct jsmod *m)
             }
             struct binding *target = r.m->env ? find_binding(r.m->env, r.local) : NULL;
             struct binding *b = declare(J, m->env, local, js_undefined, 1);
-            if (target != b)
+            if (target != b) {
                 b->alias = target;
+                J->var_epoch++;
+            }
         }
     }
     return 0;
@@ -5958,6 +6105,11 @@ struct js *js_new(void *host)
     J->s_prototype = js_mkstr(J, "prototype", 9);
     J->s_default = js_mkstr(J, "*default*", 9);
     J->s_meta = js_mkstr(J, "%meta", 5);
+    for (int c = 0; c <= C_ARGUMENTS; c++)
+        J->roots[c] = shape_root(J);
+    J->proxy_root = shape_root(J);
+    for (int t = 0; t <= JS_BIG; t++)
+        J->prim_roots[t] = shape_root(J);
     J->object_proto = js_mkobj(J, C_OBJECT, NULL);
     J->function_proto = js_mkobj(J, C_FUNCTION, J->object_proto);
     J->global = js_mkobj(J, C_OBJECT, J->object_proto);

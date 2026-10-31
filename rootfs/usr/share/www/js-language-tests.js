@@ -451,6 +451,19 @@ test("object spread copies own enumerable", function () {
     o.own = 2;
     return { ...o, extra: 3 };
 }, { own: 2, extra: 3 });
+test("Object.create takes descriptors", function () {
+    var log = [];
+    var o = Object.create({ base: 1 }, {
+        shown: { value: "s", enumerable: true },
+        hidden: { value: "h" },
+        acc: { get() { return "got"; }, set(v) { log.push(v); }, enumerable: true }
+    });
+    o.acc = 5;
+    var err = "";
+    try { Object.create({}, null); } catch (e) { err = e.name; }
+    return [Object.keys(o), o.hidden, o.acc, log, Object.getOwnPropertyNames(o), o.base, err,
+            Object.keys(Object.create(null, undefined))];
+}, [["shown", "acc"], "h", "got", [5], ["shown", "hidden", "acc"], 1, "TypeError", []]);
 
 /* ---- classes ---- */
 test("class basics", function () {

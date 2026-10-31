@@ -7,7 +7,9 @@ collection, and the Linux host stack mapping; per-instruction assertions are
 reserved for `make test-js` and `make test-browser`.
 
 These cases exercise calls, arithmetic loops, object records, object maps,
-arrays and sorting, strings, closures, classes, JSON, and switches. They measure
+arrays and sorting, strings, closures, classes, JSON, switches, methods and
+getters through class hierarchies over several shapes, and built-ins and
+globals used from functions. They measure
 engine workloads including startup and compilation, not complete page loading.
 The records case keeps its live set within the runner's 48 MiB heap limit.
 
@@ -30,3 +32,24 @@ memory. Both runners checked every result.
 
 These are host measurements. They do not predict Pentium III timings or the
 speed of pages limited by layout, networking, or native built-ins.
+
+## Shapes and inline caches
+
+On 2026-10-31, the median of five native Linux runs per case, with GCC 13.3.0 at
+`-O2`, alternating with runs of commit `4151a96` (properties as per-object lists
+and hash tables, no inline caches). Both runners checked every result.
+
+| Workload | Before | After | Speedup |
+|---|---:|---:|---:|
+| Object records | 0.12 s | 0.08 s | 1.50x |
+| Classes and allocation | 0.21 s | 0.13 s | 1.62x |
+| Methods through class hierarchies | 0.11 s | 0.07 s | 1.57x |
+| Built-ins and globals | 0.23 s | 0.11 s | 2.09x |
+| Wide objects as maps | 0.07 s | 0.07 s | 1.00x |
+| JSON and object churn | 0.02 s | 0.02 s | 1.00x |
+
+Cases that do little with properties (calls, arithmetic loops, switches) also
+ran 1.3x to 1.5x faster in this comparison, which the property changes do not
+explain; treat those as differences in how the compiler laid out the VM. The
+heap after start-up and a collection grew from 2.7 MB to 3.1 MB on the host,
+mostly the shared second-level cache and the shapes' tables.

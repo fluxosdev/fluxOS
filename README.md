@@ -573,7 +573,10 @@ fetcher process, so the browser keeps running), or from `file://`.
   variables to frame slots and captured variables to heap environment slots;
   functions compile on first use. Ordinary functions, generators, async
   functions, classes, destructuring, modules, `eval` and event handlers all run
-  as bytecode. Property hash tables preserve insertion order, and ASCII
+  as bytecode. Objects built alike share a shape (their keys' layout, in
+  insertion order), and property reads, writes, object literals and global
+  names have inline caches keyed by shape, with a shared second-level cache for
+  sites that see many shapes; objects used as maps get shapes of their own. ASCII
   string operations have direct byte paths while retaining UTF-16 semantics.
   It covers most of ES2020 and some later: `let`/`const`, arrow functions,
   template literals, destructuring, spread, optional chaining, classes

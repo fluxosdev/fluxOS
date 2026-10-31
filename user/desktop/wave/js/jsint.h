@@ -60,8 +60,26 @@ struct prop {
     struct jsstr *key;
     jsval v;
     struct jsobj *getter, *setter;      /* an accessor property */
-    struct prop *next;
     uint8_t hidden;                     /* not enumerable */
+};
+
+/*
+ * A shape is the layout of an object's properties: their keys, in order. Objects built alike
+ * (the same keys added in the same order to the same kind of object) share one, so the VM's
+ * inline caches can tell where a key is from the shape alone. Shapes make a tree from a root
+ * per cls (per host class for C_HOST): adding a key moves an object to a child. An object with
+ * many properties, or that had one deleted, gets a shape of its own ("owned"), which grows in
+ * place. While an object keeps its shape, none of its keys move.
+ */
+struct shape {
+    struct shape *parent;
+    struct jsstr *key;                  /* the last property's (NULL in a root) */
+    uint32_t n;                         /* properties */
+    uint8_t owned;
+    struct shape **kids;                /* transitions: an open addressing table by key */
+    uint32_t nkids, kidcap;
+    uint32_t *tab;                      /* key -> index + 1 over the first tabn keys, past SHAPE_SCAN */
+    uint32_t tabcap, tabn;
 };
 
 enum {
@@ -86,12 +104,12 @@ struct jsobj {
     uint8_t cls;
     uint8_t arrow;                      /* an arrow function: this from its scope */
     uint8_t ctor;                       /* a native that may be called with new */
+    uint8_t is_proto;                   /* an inline cache relies on its keys and prototype */
+    uint8_t size_hint;                  /* C_FUNCTION: properties `new` gave its objects */
     struct jsobj *proto;
-    struct prop *props;                 /* in the order they were added */
-    struct prop *last;
-    /* With more than a few properties, a hash table of them too (js_own). */
-    struct prop **tab;
-    uint32_t tabcap, tabused, nprops;
+    struct shape *shape;                /* the layout of props */
+    struct prop *props;                 /* nprops of them, in the order they were added */
+    uint32_t nprops, pcap;
     /* C_ARRAY, C_ARGUMENTS */
     jsval *items;
     int len, cap;
@@ -170,6 +188,14 @@ struct js {
     unsigned mod_mark;
     struct jsstr *s_default, *s_meta;   /* the hidden bindings of export default and import.meta */
     struct jsobj *super_this;           /* while super() runs a native constructor: the new object */
+    /* Shapes (js.c): the roots, and epochs that the VM's inline caches check. */
+    struct shape *roots[C_ARGUMENTS + 1], *proxy_root, *prim_roots[JS_BIG + 1];
+    struct js_host_root *host_roots;
+    int nhost_roots;
+    unsigned nshapes;
+    uint32_t shape_epoch;               /* a prototype an inline cache relies on changed */
+    uint32_t var_epoch;                 /* a name was declared in an environment's list */
+    struct vmega *ic_mega;              /* jsvm.h: the inline caches' shared second level */
     char err[512];
     char textbuf[1024];
 };
@@ -203,11 +229,23 @@ int js_u16unit(const struct jsstr *s, int index);
 struct jsstr *js_u16slice(struct js *J, const struct jsstr *s, int start, int end);
 struct jsstr *js_concat(struct js *J, struct jsstr *a, struct jsstr *b);
 struct jsobj *js_mkobj(struct js *J, int cls, struct jsobj *proto);
+/* The same, with room for n properties in the object's own block. */
+struct jsobj *js_mkobj_room(struct js *J, int cls, struct jsobj *proto, uint32_t n);
 jsval js_getv(struct js *J, jsval obj, jsval key);
 void js_setv(struct js *J, jsval obj, jsval key, jsval v);
 jsval js_get_str(struct js *J, jsval obj, struct jsstr *key);
 void js_put(struct js *J, struct jsobj *o, struct jsstr *key, jsval v, int hidden);
 struct prop *js_own(struct jsobj *o, struct jsstr *key);
+int js_own_index(struct jsobj *o, struct jsstr *key);         /* -1 if o has no such property */
+/* Add a property o does not have (with no value yet); next, if not NULL, is the shape it moves to. */
+struct prop *js_prop_append(struct js *J, struct jsobj *o, struct jsstr *key, struct shape *next);
+void js_set_proto(struct js *J, struct jsobj *o, struct jsobj *proto);
+/* o's prototype or a property's accessors changed in a way inline caches must see. */
+static inline void js_shape_changed(struct js *J, struct jsobj *o)
+{
+    if (o->is_proto)
+        J->shape_epoch++;
+}
 uint32_t js_str_hash(struct jsstr *s);
 int js_has(struct js *J, jsval obj, struct jsstr *key);
 int js_delete(struct js *J, jsval obj, struct jsstr *key);

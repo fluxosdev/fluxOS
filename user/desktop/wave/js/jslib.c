@@ -191,20 +191,22 @@ static jsval object_assign(struct js *J, jsval self, jsval *args, int argc)
     return target;
 }
 
+static void define_property(struct js *J, jsval obj, struct jsstr *key, jsval desc);
+
 static jsval object_create(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
     jsval p = ARG(0);
     if (p.t != JS_OBJ && p.t != JS_NULL)
         return js_throw_error(J, "TypeError: Object prototype may only be an Object or null");
+    if (ARG(1).t == JS_NULL)
+        return js_throw_error(J, "TypeError: Cannot convert undefined or null to object");
     struct jsobj *o = js_mkobj(J, C_OBJECT, p.t == JS_OBJ ? p.u.o : NULL);
-    if (ARG(1).t == JS_OBJ) {
+    if (ARG(1).t == JS_OBJ) {               /* descriptors, as Object.defineProperties takes them */
         struct jsstr **keys;
         int n = js_keys(J, ARG(1), 0, &keys);
-        for (int i = 0; i < n; i++) {
-            jsval d = js_get_str(J, ARG(1), keys[i]);
-            js_put(J, o, keys[i], js_get(J, d, "value"), 0);
-        }
+        for (int i = 0; i < n && !J->throwing; i++)
+            define_property(J, js_obj(o), keys[i], js_get_str(J, args[1], keys[i]));
     }
     return js_obj(o);
 }
@@ -252,7 +254,7 @@ static jsval object_set_proto(struct js *J, jsval self, jsval *args, int argc)
         for (struct jsobj *x = p; x && !x->phandler; x = x->proto)
             if (x == args[0].u.o)
                 return js_throw_error(J, "TypeError: Cyclic __proto__ value");
-        args[0].u.o->proto = p;
+        js_set_proto(J, args[0].u.o, p);
     }
     return ARG(0);
 }
@@ -285,8 +287,10 @@ static void define_property(struct js *J, jsval obj, struct jsstr *key, jsval de
         }
         if (js_is_callable(get))
             p->getter = get.u.o;
-        if (js_is_callable(set))
+        if (js_is_callable(set)) {
             p->setter = set.u.o;
+            js_shape_changed(J, o);
+        }
         return;
     }
     jsval v = js_get(J, desc, "value");
@@ -334,9 +338,11 @@ static jsval object_own_names(struct js *J, jsval self, jsval *args, int argc)
             snprintf(b, sizeof(b), "%d", i);
             js_array_push(J, a, js_str(J, b));
         }
-    for (struct prop *p = o.u.o->props; p; p = p->next)
+    for (uint32_t i = 0; i < o.u.o->nprops; i++) {
+        struct prop *p = &o.u.o->props[i];
         if (!js_is_symkey(p->key) && !(p->key->len > 1 && p->key->s[0] == '#'))
             js_array_push(J, a, strv(p->key));
+    }
     return js_obj(a);
 }
 
@@ -395,8 +401,10 @@ static jsval object_get_own_descriptors(struct js *J, jsval self, jsval *args, i
     jsval o = ARG(0);
     if (o.t != JS_OBJ)
         return js_obj(r);
-    for (struct prop *p = o.u.o->props; p; p = p->next)
-        js_put(J, r, p->key, descriptor_of(J, o, p->key), 0);
+    for (uint32_t i = 0; i < o.u.o->nprops; i++) {
+        struct jsstr *key = o.u.o->props[i].key;
+        js_put(J, r, key, descriptor_of(J, o, key), 0);
+    }
     return js_obj(r);
 }
 
@@ -405,9 +413,9 @@ static jsval object_own_symbols(struct js *J, jsval self, jsval *args, int argc)
     (void)self;
     struct jsobj *a = js_new_array(J);
     if (ARG(0).t == JS_OBJ)
-        for (struct prop *p = args[0].u.o->props; p; p = p->next)
-            if (js_is_symkey(p->key))
-                js_array_push(J, a, js_keyval(p->key));
+        for (uint32_t i = 0; i < args[0].u.o->nprops; i++)
+            if (js_is_symkey(args[0].u.o->props[i].key))
+                js_array_push(J, a, js_keyval(args[0].u.o->props[i].key));
     return js_obj(a);
 }
 

@@ -803,6 +803,7 @@ static jsval proxy_ctor(struct js *J, jsval self, jsval *args, int argc)
     p->ctor = ARG(0).u.o->ctor;
     p->ptarget = ARG(0).u.o;
     p->phandler = ARG(1).u.o;
+    p->shape = J->proxy_root;
     return js_obj(p);
 }
 

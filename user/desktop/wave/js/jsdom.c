@@ -5852,8 +5852,10 @@ static void accessor(struct js *J, struct jsobj *o, const char *name, js_native 
     struct prop *p = js_own(o, S(J, name));
     if (get)
         p->getter = js_new_function(J, get, name, 0).u.o;
-    if (set)
+    if (set) {
         p->setter = js_new_function(J, set, name, 1).u.o;
+        js_shape_changed(J, o);
+    }
 }
 
 /* ---- performance ---- */

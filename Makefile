@@ -582,7 +582,8 @@ test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-worker $(BUILD)/
 	$(BUILD)/tests/browser-worker
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/clone-escape-tests.js 23
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/canvas-tests.js 52
-	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 134
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 135
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/inline-cache-tests.js 19
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/toplayer-tests.js 18
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/media-tests.js 5
 	rm -rf $(BUILD)/tests/idb
@@ -756,7 +757,8 @@ $(BUILD)/tests/js-engine: $(JS_ENGINE_SRCS) $(DESKTOP_HDRS) include/flux/abi.h
 
 .PHONY: test-js bench-js
 test-js: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine
-	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 134
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 135
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/inline-cache-tests.js 19
 	rm -rf $(BUILD)/tests/idb
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/indexeddb-tests.js 3
 	$(BUILD)/tests/js-engine
