@@ -97,6 +97,10 @@ int main(int argc, char **argv, char **envp)
     m->refs = 1;
     m->is_exe = 1;
     modules = main_module = m;
+    if (m->subsystem == 2 && !gui_available()) {
+        fprintf(stderr, "winrun: %s: a Windows program with windows, and the desktop is not running\n", path);
+        return 1;
+    }
     snprintf(exe_dir_host, sizeof(exe_dir_host), "%s", path);
     char *slash = strrchr(exe_dir_host, '/');
     if (slash)

@@ -58,9 +58,10 @@ static struct region *region_find(gp_t addr)
     return NULL;
 }
 
-static int range_free(gp_t base, uint32_t size)
+/* Is [base, base + size) unused and below limit? */
+static int range_free(gp_t base, uint32_t size, gp_t limit)
 {
-    if (base < low_limit || base + size > high_limit || base + size < base)
+    if (base < low_limit || base + size > limit || base + size < base)
         return 0;
     for (struct region *r = regions; r; r = r->next)
         if (r->base < base + size && base < r->base + r->size)
@@ -91,7 +92,8 @@ gp_t vm_alloc(gp_t addr, uint32_t size, uint32_t protect, uint32_t type, int fix
         return 0;
     if (addr) {
         addr &= ~(PAGE - 1);
-        if (!range_free(addr, size)) {
+        /* Only what asks for its place may go above high_limit: the thread block does. */
+        if (!range_free(addr, size, fixed ? GUEST_TOP : high_limit)) {
             if (fixed)
                 return 0;
             addr = 0;
@@ -354,4 +356,32 @@ gp_t vm_alloc_loader(uint32_t size)
     pool += size;
     left -= size;
     return p;
+}
+
+void vm_note_foreign(uint32_t linear, uint32_t size)
+{
+    if (linear < WIN_BASE || linear - WIN_BASE >= GUEST_TOP)
+        return;
+    gp_t base = linear - WIN_BASE;
+    struct region *r = region_new(base, round_up(size, PAGE));
+    r->state = MEM_COMMIT;
+    r->protect = PAGE_READWRITE;
+    r->type = MEM_MAPPED;
+    r->alloc_base = base;
+    r->loader = 1;
+}
+
+void vm_forget_foreign(uint32_t linear)
+{
+    gp_t base = linear - WIN_BASE;
+    if (linear < WIN_BASE)
+        return;
+    for (struct region **pp = &regions; *pp; pp = &(*pp)->next) {
+        struct region *r = *pp;
+        if (r->loader && r->base == base && r->alloc_base == base && r->type == MEM_MAPPED) {
+            *pp = r->next;
+            free(r);
+            return;
+        }
+    }
 }

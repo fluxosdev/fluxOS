@@ -47,8 +47,9 @@ static void api_register(struct api_dll *d)
 
 void api_register_all(void)
 {
-    extern void msvcrt_link(void);
+    extern void msvcrt_link(void), user32_link(void);
     msvcrt_link();
+    user32_link();
     api_register(&kernel32_dll);
     api_register(&ntdll_dll);
     api_register(&msvcrt_dll);

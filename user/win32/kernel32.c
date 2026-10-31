@@ -922,7 +922,15 @@ DEF(Sleep)
     uint32_t ms = A(0);
     crt_flush_all();
     if (gui_connected) {
-        gui_wait_ms((int)(ms > 0x7FFFFFFF ? 0x7FFFFFFF : ms));
+        /* keeping up with the desktop meanwhile, so that it does not give up on the program */
+        if (ms == INFINITE)
+            for (;;)
+                gui_wait_ms(-1);
+        uint32_t end = os_ticks_ms() + ms;
+        int left;
+        gui_wait_ms(0);
+        while ((left = (int)(end - os_ticks_ms())) > 0)
+            gui_wait_ms(left);
         return 0;
     }
     if (ms == INFINITE)

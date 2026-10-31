@@ -272,9 +272,12 @@ $(ROOTFS)/bin/dos: $(CRT0) $(DOS_OBJS) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(DOS_OBJS) $(LIBC)
 
-$(ROOTFS)/bin/winrun: $(CRT0) $(WIN32_OBJS) $(LIBC) user/user.ld
+# winrun draws Windows programs' windows with the desktop's drawing, fonts and theme, and speaks
+# the window protocol with its plumbing (wmconn.c)
+$(WIN32_OBJS): USER_CFLAGS += -Iuser/desktop/shell
+$(ROOTFS)/bin/winrun: $(CRT0) $(WIN32_OBJS) $(LIBDESKTOP) $(LIBFONT) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
-	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(WIN32_OBJS) $(LIBC)
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(WIN32_OBJS) $(LIBDESKTOP) $(LIBFONT) $(LIBC)
 
 # play decodes MP3 and Ogg Vorbis with Wave's decoders
 PLAY_CODECS := $(BUILD)/u/user/desktop/wave/codecs.o $(BUILD)/u/user/desktop/wave/mp3dec.o
@@ -821,6 +824,40 @@ $(BUILD)/tests/desktop-imagejobs-guest: $(BUILD)/tests/desktop-imagejobs-guest.o
 .PHONY: test-desktop-jobs-qemu
 test-desktop-jobs-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/desktop-imagejobs-guest
 	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/desktop-imagejobs-guest --cpus $(KERNEL_TEST_CPUS) $(TEST_DROP_TOOLCHAIN) --success-marker "DESKTOP JOB REGRESSIONS PASSED"
+
+# winrun's windows: a Windows program built here (gcc's ELF, laid out at 0x400000 and turned into
+# a PE by objcopy, with the import directory of tests/win32/imports.S), run in QEMU with
+# win32-gui-guest as init playing the desktop to it.
+OBJCOPY ?= objcopy
+WIN32_TEST_CFLAGS := -m32 -march=i686 -O2 -ffreestanding -fno-pic -fno-pie -fno-stack-protector \
+	-fno-asynchronous-unwind-tables -mpreferred-stack-boundary=2 -nostdinc -isystem $(GCC_INC) -Wall -Wextra
+WIN32_TEST_DEPS := tests/win32/winapi.h tests/win32/imports.h tests/win32/imports.S tests/win32/pe.ld
+
+WIN32_SUBSYSTEM = windows
+$(BUILD)/tests/win32/console.exe: WIN32_SUBSYSTEM = console
+
+$(BUILD)/tests/win32/%.exe: tests/win32/%.c $(WIN32_TEST_DEPS)
+	@mkdir -p $(dir $@)
+	$(CC) $(WIN32_TEST_CFLAGS) -c $< -o $(BUILD)/tests/win32/$*.o
+	$(CC) $(WIN32_TEST_CFLAGS) -c tests/win32/imports.S -o $(BUILD)/tests/win32/imports.o
+	$(LD) -m elf_i386 -T tests/win32/pe.ld -o $(BUILD)/tests/win32/$*.elf $(BUILD)/tests/win32/$*.o $(BUILD)/tests/win32/imports.o
+	$(OBJCOPY) -O pei-i386 --subsystem $(WIN32_SUBSYSTEM):4.0 --image-base 0x400000 --section-alignment 0x1000 \
+		--file-alignment 0x200 $(BUILD)/tests/win32/$*.elf $@
+
+$(BUILD)/tests/win32-gui-guest.o: tests/win32-gui-guest.c $(DESKTOP_HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) $(DESKTOP_INC) -c $< -o $@
+
+$(BUILD)/tests/win32-gui-guest: $(BUILD)/tests/win32-gui-guest.o $(CRT0) $(LIBDESKTOP) $(LIBFONT) $(LIBC) user/user.ld
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBDESKTOP) $(LIBFONT) $(LIBC)
+
+.PHONY: test-win32-gui-qemu
+test-win32-gui-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/win32-gui-guest $(BUILD)/tests/win32/hello.exe \
+                     $(BUILD)/tests/win32/console.exe
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/win32-gui-guest --cpus $(KERNEL_TEST_CPUS) \
+		$(TEST_DROP_TOOLCHAIN) --add $(BUILD)/tests/win32/hello.exe:/test/hello.exe \
+		--add $(BUILD)/tests/win32/console.exe:/test/console.exe --timeout 90 \
+		--success-marker "WIN32 GUI REGRESSIONS PASSED"
 
 $(BUILD)/tests/browser-navigation: tests/browser-navigation.c user/desktop/wave/webutil.c $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)

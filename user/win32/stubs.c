@@ -1,15 +1,11 @@
 /*
  * DLLs winrun names but does not fill in yet: their tables are empty, so
  * every import from them reaches api_missing_thunk (logged, returns 0).
- * Also the GUI hooks, until user32/gdi32 and a window server exist:
- * winrun runs console programs only for now.
  */
 #include "win32.h"
 
 #define EMPTY_DLL(var, nm) struct api_dll var = { nm, NULL, 0, NULL, { NULL }, { 0 }, NULL, NULL, 0 }
 
-EMPTY_DLL(user32_dll, "USER32.DLL");
-EMPTY_DLL(gdi32_dll, "GDI32.DLL");
 EMPTY_DLL(advapi32_dll, "ADVAPI32.DLL");
 EMPTY_DLL(shell32_dll, "SHELL32.DLL");
 EMPTY_DLL(ole32_dll, "OLE32.DLL");
@@ -31,11 +27,3 @@ EMPTY_DLL(secur32_dll, "SECUR32.DLL");
 EMPTY_DLL(wininet_dll, "WININET.DLL");
 EMPTY_DLL(mpr_dll, "MPR.DLL");
 EMPTY_DLL(setupapi_dll, "SETUPAPI.DLL");
-
-int gui_connected;
-int gui_available(void) { return 0; }
-int gui_pump(int block) { (void)block; return 0; }
-void gui_exit(void) { }
-int gui_wait_ms(int ms) { (void)ms; return 0; }
-void gui_timers_due(void) { }
-int gui_next_timer_ms(void) { return -1; }

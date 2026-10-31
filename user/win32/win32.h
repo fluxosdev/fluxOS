@@ -267,6 +267,10 @@ int vm_readable(gp_t addr, uint32_t size);
 int vm_writable(gp_t addr, uint32_t size);
 /* Guest memory for the loader's own use (strings handed to the program...). */
 gp_t vm_alloc_loader(uint32_t size);
+/* Memory the system mapped for the loader (a shared memory segment) at a linear address that
+ * may lie inside the program's window: kept out of the program's way until forgotten. */
+void vm_note_foreign(uint32_t linear, uint32_t size);
+void vm_forget_foreign(uint32_t linear);
 
 /* ---- heap.c: Windows heaps in guest memory ---- */
 gp_t heap_create(uint32_t initial, uint32_t max, uint32_t flags);
@@ -590,11 +594,11 @@ void wtrace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 /* The error code for errno (os.c) */
 uint32_t errno_to_win(int e);
 
-/* ---- user32.c / gdi32.c (GUI) ---- */
-int gui_available(void);                /* the desktop's window server answered */
-int gui_pump(int block);                /* handle server messages; 1 if any came */
+/* ---- gui.c: the desktop connection (gui.h has the rest) ---- */
+int gui_available(void);                /* connect, if not yet tried: 1 if the desktop answered */
+int gui_pump(int block);                /* read the desktop's messages (block: till one comes); 1 if any wait */
 void gui_exit(void);                    /* the program is ending: close its windows */
-int gui_wait_ms(int ms);                /* wait for input or a timer, at most ms */
+int gui_wait_ms(int ms);                /* wait at most ms (-1: no limit) for news from the desktop: 1 if any came */
 void gui_timers_due(void);
 int gui_next_timer_ms(void);
 extern int gui_connected;

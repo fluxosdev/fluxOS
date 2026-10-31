@@ -1,7 +1,7 @@
 # fluxOS Windows GUI roadmap
 
-*Written 2026-10-30, against commit 95a0cc4. Nothing here is done yet;
-every stage is a plan.*
+*Written 2026-10-30, against commit 95a0cc4. Stage 0 is done (see its
+section for where it differs from the plan); the later stages are plans.*
 
 `winrun` already runs 32-bit console Windows programs: a PE loader, the
 gate between the loader's flat segments and the program's segments, SEH,
@@ -140,6 +140,40 @@ the host test.*
 - Tests: small PEs built on the host with `i686-w64-mingw32-gcc`, run
   through `os_linux.c` against a headless `gui.c` backend that renders
   into plain buffers for comparison with reference images.
+
+**Done.** Where it differs from the plan above:
+
+- Tests run in QEMU, not on the host (`make test-win32-gui-qemu`): the
+  build machine has neither mingw nor 32-bit glibc, so `os_linux.c`
+  cannot be built there. The test PEs (`tests/win32/`) are built with
+  the host's `gcc -m32`, linked as ELF at 0x400000 and turned into PEs
+  by `objcopy -O pei-i386`, with a hand-made import directory
+  (`imports.S`). `tests/win32-gui-guest.c` runs as init and plays the
+  desktop: it answers `C_HELLO` and `C_CREATE`, checks the painted
+  pixels (the brush everywhere, the text centred), resizes the window,
+  presses the close button and checks the exit code. No headless
+  backend was needed: without a desktop, windows draw into surfaces of
+  winrun's own.
+- A window is created on the desktop when it is first shown, not at
+  `CreateWindowEx`, and `SW_HIDE` destroys the desktop window (keeping
+  its pixels): the protocol has no hidden windows. Minimize and maximize
+  commands to `ShowWindow` just show the window, since the protocol has
+  no way to ask for either.
+- Fonts are drawn at whole multiples of the desktop's sans (and the 8x16
+  VGA font for fixed faces); text outside printable ASCII is `?`.
+- Child windows exist (created, destroyed with their parent, drawn into
+  their top-level window's surface) but are not clipped or hit-tested:
+  that is stage 2.
+- Also in: `MoveWindow`, `SetWindowPos` (top-level), `GetClassInfo(Ex)`,
+  `Get/SetClassLong`, `GetDeviceCaps`, `ExtTextOut`, `CreateFont(Indirect)`,
+  `GetSysColor(Brush)`, `FrameRect`, `SystemParametersInfo`
+  (`SPI_GETWORKAREA`).
+- Two fixes outside the new files: `vm_alloc` refused any fixed address
+  above `GUEST_HIGH`, the thread block's included, so winrun could not
+  start any program on fluxOS; and `shmat` puts a window's pixels
+  wherever the kernel finds room, which may be inside the program's
+  address window, so `vm_note_foreign` keeps the program's allocations
+  off them.
 
 ## Stage 1: input, timers and pixels
 
