@@ -551,6 +551,7 @@ static jsval worker_op(struct js *J, jsval self, jsval *args, int argc)
         const char *type = js_tostr(J, ARG(2))->s, *name = js_tostr(J, ARG(3))->s;
         char url[URL_MAX];
         url_resolve(ws->h->base ? ws->h->base : ws->h->url, js_tostr(J, ARG(1))->s, url, sizeof(url));
+        if (J->resource_allowed && !J->resource_allowed(J,"worker-src",url))return js_num(-1);
         if (!allowed(ws, url))
             return js_num(-1);
         int slot = -1;
@@ -647,7 +648,7 @@ static const char js_worker_scope[] = JS_WORKER_SOURCE(
     if (/^(HTML|SVG)[A-Za-z]*Element$/.test(n)) try { delete g[n]; } catch (e) {}
   });
   function method(name, f) { Object.defineProperty(g, name, { value: f, writable: true, configurable: true, enumerable: true }); }
-  method("postMessage", function (data, transfer) { op("post", ser(data)); });
+  method("postMessage", function (data, transfer) { op("post", ser(transfer===undefined?data:structuredClone(data,{transfer:transfer && transfer.transfer || transfer || []}))); });
   method("close", function () { op("close"); });
   method("importScripts", function () {
     var urls = Array.prototype.map.call(arguments, function (u) { return new URL(String(u), location.href).href; });

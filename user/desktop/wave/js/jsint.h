@@ -123,6 +123,8 @@ struct gcheap;
 struct js {
     struct gcheap *heap;                /* jsgc.c */
     int gc_inhibit;                     /* no collections while this is above 0 (parsing) */
+    int (*codegen_allowed)(struct js *J);
+    int (*resource_allowed)(struct js *J,const char *directive,const char *url);
     void *host;
     void *network;                      /* jsnet: WebSocket worker state */
     void *workers;                      /* jsworker: the page's dedicated workers */
@@ -151,7 +153,9 @@ struct js {
     int in_jobs;
     struct jsobj *promise_proto, *generator_proto, *agen_proto, *symbol_proto, *bigint_proto;
     struct jsobj *map_proto, *set_proto, *seqiter_proto, *buffer_proto;
-    struct jsobj *typed_protos[11], *dataview_proto;
+    struct jsobj *typed_protos[11], *dataview_proto, *shared_proto;
+    struct js_shared_mapping *shared_mappings;
+    struct env *eval_env;
     struct jsstr *s_value, *s_done;     /* iterator results' keys */
     struct coro *cur_co, *co_live;      /* the running coroutine, all those with a stack */
     int nco;
@@ -325,5 +329,7 @@ int re_global(struct regex *re);
 int re_icase(struct regex *re);
 const char *re_source(struct regex *re);
 const char *re_flags(struct regex *re);
+
+void js_binary_free(struct js *J);
 
 #endif

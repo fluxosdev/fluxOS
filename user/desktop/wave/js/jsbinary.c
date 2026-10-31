@@ -3,6 +3,11 @@
 #include <flux/digest.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/shm.h>
+#include <signal.h>
+#include <errno.h>
+#include <time.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,13 +17,16 @@
 #define BUFFER_MAX (64u << 20)
 struct buffer {
     unsigned char *data;
-    int len;
+    int len, detached, shared;
+    struct shared_header *shared_header;
 };
 struct view {
     struct jsobj *buffer;
     int offset, len, bytes, kind;
 };
-static const struct jsclass buffer_class, typed_class, view_class;
+static const struct jsclass buffer_class, shared_class, typed_class, view_class;
+static jsval new_shared(struct js *J,int len);
+
 /* Kinds 9 and 10 hold BigInts (BIG_KIND). */
 #define NKINDS 11
 #define BIG_KIND(k) ((k) >= 9)
@@ -42,7 +50,9 @@ static struct jsobj *ctor(struct js *J, const char *s, js_native f, struct jsobj
 }
 static struct buffer *buffer_of(jsval v)
 {
-    return v.t == JS_OBJ ? js_host_data(v.u.o, &buffer_class) : NULL;
+    if(v.t!=JS_OBJ)return NULL;
+    struct buffer *b=js_host_data(v.u.o,&buffer_class);
+    return b?b:js_host_data(v.u.o,&shared_class);
 }
 static struct view *typed_of(jsval v)
 {
@@ -51,12 +61,13 @@ static struct view *typed_of(jsval v)
 int js_typed_length(jsval v)
 {
     struct view *a = typed_of(v);
-    return a ? a->len : -1;
+    return a ? (buffer_of(js_obj(a->buffer))->detached ? 0 : a->len) : -1;
 }
 unsigned char *js_binary_bytes(jsval v, int *len)
 {
     struct buffer *b = buffer_of(v);
     if (b) {
+        if(b->detached){*len=0;return NULL;}
         *len = b->len;
         return b->data;
     }
@@ -66,6 +77,7 @@ unsigned char *js_binary_bytes(jsval v, int *len)
     if (!a)
         return NULL;
     b = buffer_of(js_obj(a->buffer));
+    if(b->detached){*len=0;return NULL;}
     *len = a->len * a->bytes;
     return b->data + a->offset;
 }
@@ -102,6 +114,7 @@ static jsval buffer_ctor(struct js *J, jsval self, jsval *args, int argc)
 static int buffer_get(struct js *J, struct jsobj *o, const char *k, jsval *out)
 {
     struct buffer *b = o->hdata;
+    if(!strcmp(k,"detached")){*out=js_bool(b->detached);return 1;}
     if (strcmp(k, "byteLength"))
         return 0;
     *out = js_num(b->len);
@@ -112,6 +125,7 @@ static int buffer_set(struct js *J, struct jsobj *o, const char *k, jsval v)
     return !strcmp(k, "byteLength");
 }
 static const struct jsclass buffer_class = {"ArrayBuffer", buffer_get, buffer_set, NULL};
+static const struct jsclass shared_class = {"SharedArrayBuffer", buffer_get, buffer_set, NULL};
 static int relative(struct js *J, jsval v, int def, int len)
 {
     if (v.t == JS_UNDEF)
@@ -127,12 +141,13 @@ static int relative(struct js *J, jsval v, int def, int len)
 static jsval buffer_slice(struct js *J, jsval self, jsval *args, int argc)
 {
     struct buffer *b = buffer_of(self);
-    if (!b)
-        return js_throw_error(J, "TypeError: not an ArrayBuffer");
+    if (!b || b->detached)
+        return js_throw_error(J, "TypeError: not an attached ArrayBuffer");
     int a = relative(J, ARG(0), 0, b->len), z = relative(J, ARG(1), b->len, b->len);
     if (z < a)
         z = a;
-    jsval r = new_buffer(J, z - a);
+    jsval r = b->shared?new_shared(J,z-a):new_buffer(J,z-a);
+    if(J->throwing)return js_undefined;
     memcpy(buffer_of(r)->data, b->data + a, (size_t)(z - a));
     return r;
 }
@@ -254,12 +269,17 @@ int js_typed_has(jsval value, const char *key)
     double n;
     if (!a || !numeric_key(NULL, key, &n))
         return -1;
-    return n >= 0 && n < a->len && n == floor(n);
+    return !buffer_of(js_obj(a->buffer))->detached && n >= 0 && n < a->len && n == floor(n);
 }
 
 static int typed_get(struct js *J, struct jsobj *o, const char *k, jsval *out)
 {
     struct view *a = o->hdata;
+    if(buffer_of(js_obj(a->buffer))->detached && strcmp(k,"buffer")) {
+        double index;
+        if(!strcmp(k,"length") || !strcmp(k,"byteLength") || !strcmp(k,"byteOffset")){*out=js_num(0);return 1;}
+        if(numeric_key(J,k,&index)){*out=js_undefined;return 1;}
+    }
     if (!strcmp(k, "length")) {
         *out = js_num(a->len);
         return 1;
@@ -293,8 +313,8 @@ static int typed_set_prop(struct js *J, struct jsobj *o, const char *k, jsval va
     if (!strcmp(k, "length") || !strcmp(k, "byteLength") || !strcmp(k, "byteOffset") || !strcmp(k, "buffer"))
         return 1;
     double n;
-    if (!numeric_key(J, k, &n))
-        return 0;
+    if (!numeric_key(J, k, &n)) return 0;
+    if(buffer_of(js_obj(a->buffer))->detached)return 1;
     if (BIG_KIND(a->kind)) {
         struct jsbig *g = store_big(J, val);
         if (g && n >= 0 && n < a->len && n == floor(n))
@@ -316,7 +336,7 @@ int js_typed_get_index(struct js *J, struct jsobj *o, uint32_t i, jsval *out)
     if (!a)
         return 0;
     *out = js_undefined;
-    if (i < (uint32_t)a->len) {
+    if (!buffer_of(js_obj(a->buffer))->detached && i < (uint32_t)a->len) {
         unsigned char *at = buffer_of(js_obj(a->buffer))->data + a->offset + (size_t)i * (size_t)a->bytes;
         *out = BIG_KIND(a->kind) ? read_big(J, at, a->kind, 1) : js_num(read_number(at, a->kind, 1));
     }
@@ -327,6 +347,7 @@ int js_typed_set_index(struct js *J, struct jsobj *o, uint32_t i, jsval v)
     struct view *a = js_host_data(o, &typed_class);
     if (!a)
         return 0;
+    if(buffer_of(js_obj(a->buffer))->detached)return 1;
     if (BIG_KIND(a->kind)) {
         struct jsbig *g = store_big(J, v);
         if (g && i < (uint32_t)a->len)
@@ -354,6 +375,7 @@ static jsval typed_make(struct js *J, jsval *args, int argc, int kind)
     struct buffer *b = buffer_of(src);
     int bytes = sizes[kind], n;
     if (b) {
+        if(b->detached)return js_throw_error(J,"TypeError: detached ArrayBuffer");
         int off = index_arg(J, ARG(1), 0, b->len);
         if (off < 0)
             return js_undefined;
@@ -405,7 +427,7 @@ CTOR(2) CTOR(3) CTOR(4) CTOR(5) CTOR(6) CTOR(7) CTOR(8) CTOR(9) CTOR(10) static 
 static jsval typed_set(struct js *J, jsval self, jsval *args, int argc)
 {
     struct view *a = typed_of(self);
-    if (!a)
+    if (!a || buffer_of(js_obj(a->buffer))->detached)
         return js_throw_error(J, "TypeError: not a typed array");
     int off = index_arg(J, ARG(1), 0, a->len);
     if (off < 0)
@@ -425,7 +447,7 @@ static jsval typed_set(struct js *J, jsval self, jsval *args, int argc)
 static jsval typed_subarray(struct js *J, jsval self, jsval *args, int argc)
 {
     struct view *a = typed_of(self);
-    if (!a)
+    if (!a || buffer_of(js_obj(a->buffer))->detached)
         return js_throw_error(J, "TypeError: not a typed array");
     int lo = relative(J, ARG(0), 0, a->len), hi = relative(J, ARG(1), a->len, a->len);
     if (hi < lo)
@@ -435,6 +457,9 @@ static jsval typed_subarray(struct js *J, jsval self, jsval *args, int argc)
 static int view_get(struct js *J, struct jsobj *o, const char *k, jsval *out)
 {
     struct view *v = o->hdata;
+    if(buffer_of(js_obj(v->buffer))->detached && (!strcmp(k,"byteLength") || !strcmp(k,"byteOffset"))) {
+        *out=js_throw_error(J,"TypeError: detached ArrayBuffer");return 1;
+    }
     if (!strcmp(k, "buffer"))
         *out = js_obj(v->buffer);
     else if (!strcmp(k, "byteOffset"))
@@ -453,7 +478,7 @@ static const struct jsclass view_class = {"DataView", view_get, view_set, NULL};
 static jsval view_ctor(struct js *J, jsval self, jsval *args, int argc)
 {
     struct buffer *b = buffer_of(ARG(0));
-    if (!J->constructing || !b)
+    if (!J->constructing || !b || b->detached)
         return js_throw_error(J, "TypeError: DataView requires an ArrayBuffer");
     int off = index_arg(J, ARG(1), 0, b->len);
     if (off < 0)
@@ -470,8 +495,8 @@ static jsval view_ctor(struct js *J, jsval self, jsval *args, int argc)
 static jsval view_access(struct js *J, jsval self, jsval *args, int argc, int kind, int set)
 {
     struct view *v = self.t == JS_OBJ ? js_host_data(self.u.o, &view_class) : NULL;
-    if (!v)
-        return js_throw_error(J, "TypeError: not a DataView");
+    if (!v || buffer_of(js_obj(v->buffer))->detached)
+        return js_throw_error(J, "TypeError: not an attached DataView");
     int off = index_arg(J, ARG(0), 0, v->len);
     if (off < 0)
         return js_undefined;
@@ -553,7 +578,7 @@ static jsval binary_type(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
     jsval v = ARG(0);
-    if (buffer_of(v)) return js_str(J, "ArrayBuffer");
+    if (buffer_of(v)) return js_str(J,buffer_of(v)->shared?"SharedArrayBuffer":"ArrayBuffer");
     struct view *a = typed_of(v);
     if (a) return js_str(J, names[a->kind]);
     if (v.t == JS_OBJ && js_host_data(v.u.o, &view_class)) return js_str(J, "DataView");
@@ -565,6 +590,7 @@ static jsval binary_clone(struct js *J, jsval self, jsval *args, int argc)
     (void)self;
     struct buffer *b = buffer_of(ARG(0));
     if (b) {
+        if(b->detached)return js_throw_error(J,"DataCloneError: detached ArrayBuffer");
         jsval r = new_buffer(J, b->len);
         memcpy(buffer_of(r)->data, b->data, (size_t)b->len);
         return r;
@@ -573,7 +599,7 @@ static jsval binary_clone(struct js *J, jsval self, jsval *args, int argc)
     int typed = a != NULL;
     if (!a && ARG(0).t == JS_OBJ) a = js_host_data(ARG(0).u.o, &view_class);
     b = buffer_of(ARG(1));
-    if (!a || !b || a->offset > b->len || a->len > (b->len-a->offset)/a->bytes)
+    if (!a || !b || b->detached || a->offset > b->len || a->len > (b->len-a->offset)/a->bytes)
         return js_throw_error(J, "DataCloneError: invalid binary clone");
     if (typed) return new_typed(J, ARG(1), a->offset, a->len, a->kind);
     struct view *v = js_alloc(J, sizeof(*v));
@@ -583,6 +609,14 @@ static jsval binary_clone(struct js *J, jsval self, jsval *args, int argc)
     return js_obj(o);
 }
 
+/* Detach only after structured serialization has succeeded. Existing views consult this flag. */
+static jsval binary_detach(struct js *J,jsval self,jsval *args,int argc)
+{
+    struct buffer *b=buffer_of(ARG(0));
+    if(!b || b->shared || b->detached)return js_throw_error(J,"DataCloneError: buffer is not transferable");
+    b->detached=1;b->len=0;
+    return js_undefined;
+}
 /* A new Uint8Array holding a copy of n bytes. */
 jsval js_new_bytes(struct js *J, const unsigned char *p, int n)
 {
@@ -591,6 +625,173 @@ jsval js_new_bytes(struct js *J, const unsigned char *p, int n)
         memcpy(buffer_of(buf)->data, p, (size_t)n);
     return new_typed(J, buf, 0, n, 1);
 }
+
+/* Shared segments carry an unguessable capability; importing a guessed segment id is insufficient.
+ * Mappings live until the engine closes, with a bounded process-wide pool reclaimed at exit. */
+#define SHARED_HEADER 4096
+#define SHARED_SLOTS 32
+struct shared_wait { int offset,kind,count,budget,seq; };
+struct shared_header { uint32_t magic,secret[4];int lock;struct shared_wait wait[SHARED_SLOTS]; };
+struct js_shared_mapping { int id,len;void *address;struct js_shared_mapping *next; };
+static int shared_owned[128],nshared_owned;static size_t shared_owned_bytes;
+static void shared_cleanup(void)
+{for(int k=0;k<nshared_owned;k++)shmctl(shared_owned[k],IPC_RMID,NULL);}
+void js_binary_free(struct js *J)
+{
+    while(J->shared_mappings){struct js_shared_mapping *m=J->shared_mappings;J->shared_mappings=m->next;shmdt(m->address);free(m);}
+}
+static jsval shared_wrap(struct js *J,int id,void *mapping,int len)
+{
+    struct js_shared_mapping *entry=malloc(sizeof(*entry));
+    if(!entry){shmdt(mapping);return js_throw_error(J,"RangeError: shared mapping allocation failed");}
+    *entry=(struct js_shared_mapping){id,len,mapping,J->shared_mappings};J->shared_mappings=entry;
+    struct buffer *b=js_alloc(J,sizeof(*b));b->data=(unsigned char *)mapping+SHARED_HEADER;b->len=len;b->shared=1;b->shared_header=mapping;
+    struct jsobj *o=js_new_host(J,&shared_class,b);o->proto=J->shared_proto;return js_obj(o);
+}
+static jsval new_shared(struct js *J,int len)
+{
+    if(nshared_owned>=128 || (size_t)len>BUFFER_MAX-shared_owned_bytes)return js_throw_error(J,"RangeError: shared memory quota exceeded");
+    int id=shmget(IPC_PRIVATE,(size_t)len+SHARED_HEADER,IPC_CREAT|0600);
+    if(id<0)return js_throw_error(J,"RangeError: shared memory allocation failed");
+    void *mapping=shmat(id,NULL,0);
+    if(mapping==(void *)-1){shmctl(id,IPC_RMID,NULL);return js_throw_error(J,"RangeError: shared memory mapping failed");}
+    struct shared_header *h=mapping;memset(h,0,SHARED_HEADER);h->magic=0x57414253;
+    int fd=open("/dev/urandom",O_RDONLY);int got=fd>=0?(int)read(fd,h->secret,sizeof(h->secret)):-1;if(fd>=0)close(fd);
+    if(got!=(int)sizeof(h->secret)){shmdt(mapping);shmctl(id,IPC_RMID,NULL);return js_throw_error(J,"OperationError: secure randomness unavailable");}
+    if(!nshared_owned)atexit(shared_cleanup);
+    shared_owned[nshared_owned++]=id;shared_owned_bytes+=(size_t)len;
+    return shared_wrap(J,id,mapping,len);
+}
+static jsval shared_ctor(struct js *J,jsval self,jsval *args,int argc)
+{
+    if(!J->constructing)return js_throw_error(J,"TypeError: SharedArrayBuffer requires new");
+    int n=index_arg(J,ARG(0),0,BUFFER_MAX);return n<0?js_undefined:new_shared(J,n);
+}
+static jsval shared_export(struct js *J,jsval self,jsval *args,int argc)
+{
+    struct buffer *b=buffer_of(ARG(0));if(!b || !b->shared)return js_throw_error(J,"DataCloneError: not a shared buffer");
+    struct js_shared_mapping *entry=J->shared_mappings;
+    while(entry && entry->address!=b->shared_header)entry=entry->next;
+    if(!entry)return js_throw_error(J,"DataCloneError: unavailable shared mapping");
+    char token[128];snprintf(token,sizeof(token),"%d:%d:%08x%08x%08x%08x",entry->id,b->len,b->shared_header->secret[0],b->shared_header->secret[1],b->shared_header->secret[2],b->shared_header->secret[3]);
+    return js_str(J,token);
+}
+static jsval shared_import(struct js *J,jsval self,jsval *args,int argc)
+{
+    int id=-1,len=-1,used=0;unsigned secret[4];const char *token=js_tostr(J,ARG(0))->s;
+    if(sscanf(token,"%d:%d:%8x%8x%8x%8x%n",&id,&len,&secret[0],&secret[1],&secret[2],&secret[3],&used)!=6 || token[used] || len<0 || len>(int)BUFFER_MAX)
+        return js_throw_error(J,"DataCloneError: invalid shared buffer capability");
+    for(struct js_shared_mapping *m=J->shared_mappings;m;m=m->next)if(m->id==id) {
+        struct shared_header *h=m->address;unsigned mismatch=m->len!=len;
+        for(int k=0;k<4;k++)mismatch|=secret[k]^h->secret[k];
+        if(mismatch)return js_throw_error(J,"DataCloneError: invalid shared capability");
+        struct buffer *b=js_alloc(J,sizeof(*b));b->data=(unsigned char *)h+SHARED_HEADER;b->len=len;b->shared=1;b->shared_header=h;
+        struct jsobj *o=js_new_host(J,&shared_class,b);o->proto=J->shared_proto;return js_obj(o);
+    }
+    struct shmid_ds stat;
+    if(shmctl(id,IPC_STAT,&stat)<0 || stat.shm_segsz!=(size_t)len+SHARED_HEADER)return js_throw_error(J,"DataCloneError: missing shared buffer");
+    void *mapping=shmat(id,NULL,0);if(mapping==(void *)-1)return js_throw_error(J,"DataCloneError: shared mapping failed");
+    struct shared_header *h=mapping;unsigned mismatch=h->magic^0x57414253;
+    for(int k=0;k<4;k++)mismatch|=secret[k]^h->secret[k];
+    if(mismatch){shmdt(mapping);return js_throw_error(J,"DataCloneError: invalid shared capability");}
+    return shared_wrap(J,id,mapping,len);
+}
+/* A CAS loop makes read/modify/write operations atomic even for 64-bit lanes on x86. */
+#define ATOMIC_LANE(T) do { T *at=(T *)pointer,old=__atomic_load_n(at,__ATOMIC_SEQ_CST),next; \
+    for(;;){next=old;switch(operation){case 1:next=(T)value;break;case 2:next=old+(T)value;break;case 3:next=old-(T)value;break; \
+      case 4:next=old&(T)value;break;case 5:next=old|(T)value;break;case 6:next=old^(T)value;break;case 7:next=(T)value;break; \
+      case 8:next=old==(T)expected?(T)value:old;break;} \
+      if(!operation || __atomic_compare_exchange_n(at,&old,next,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST))break;}old_bits=old; } while(0)
+static jsval atomic_op(struct js *J,jsval self,jsval *args,int argc)
+{
+    const char *op=js_tostr(J,ARG(0))->s;
+    if(!strcmp(op,"isLockFree")){double n=js_to_number(J,ARG(1));return js_bool(n==1 || n==2 || n==4 || n==8);}
+    struct view *a=typed_of(ARG(1));
+    if(!a || a->kind==2 || a->kind==7 || a->kind==8 || buffer_of(js_obj(a->buffer))->detached)return js_throw_error(J,"TypeError: Atomics requires an integer typed array");
+    int index=index_arg(J,ARG(2),0,a->len-1);if(index<0 || index>=a->len)return js_throw_error(J,"RangeError: atomic index out of bounds");
+    struct buffer *b=buffer_of(js_obj(a->buffer));unsigned char *pointer=b->data+a->offset+index*a->bytes;
+    const char *names[]={"load","store","add","sub","and","or","xor","exchange","compareExchange"};int operation=-1;
+    for(int k=0;k<9;k++)if(!strcmp(op,names[k]))operation=k;
+    if(operation<0)return js_throw_error(J,"TypeError: unsupported atomic operation");
+    uint64_t value=0,expected=0,old_bits=0;jsval stored=js_undefined;
+    if(operation) {
+        if(BIG_KIND(a->kind)){struct jsbig *g=store_big(J,ARG(3));if(!g)return js_undefined;value=jb_to_u64(g);stored=js_bigv(g);}
+        else {unsigned char raw[8]={0};double number=js_to_number(J,ARG(3));stored=js_num(isnan(number)?0:trunc(number));write_number(raw,a->kind,1,number);for(int k=0;k<a->bytes;k++)value|=(uint64_t)raw[k]<<(k*8);}
+    }
+    if(operation==8) {
+        expected=value;
+        if(BIG_KIND(a->kind)){struct jsbig *g=store_big(J,ARG(4));if(!g)return js_undefined;value=jb_to_u64(g);}
+        else {unsigned char raw[8]={0};write_number(raw,a->kind,1,js_to_number(J,ARG(4)));value=0;for(int k=0;k<a->bytes;k++)value|=(uint64_t)raw[k]<<(k*8);}
+    }
+    if(J->throwing)return js_undefined;
+    switch(a->bytes){case 1:ATOMIC_LANE(uint8_t);break;case 2:ATOMIC_LANE(uint16_t);break;case 4:ATOMIC_LANE(uint32_t);break;case 8:ATOMIC_LANE(uint64_t);break;}
+    if(operation==1)return stored;
+    unsigned char raw[8];uint64_t bits=old_bits;for(int k=0;k<8;k++)raw[k]=(unsigned char)(bits>>(k*8));
+    return BIG_KIND(a->kind)?read_big(J,raw,a->kind,1):js_num(read_number(raw,a->kind,1));
+}
+#undef ATOMIC_LANE
+static void shared_lock(struct shared_header *h)
+{
+    int pid=(int)getpid();
+    for(;;) {
+        int empty=0;
+        if(__atomic_compare_exchange_n(&h->lock,&empty,pid,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED))return;
+        if(empty>0 && kill(empty,0)<0 && errno==ESRCH)__atomic_compare_exchange_n(&h->lock,&empty,0,0,__ATOMIC_ACQ_REL,__ATOMIC_RELAXED);
+        usleep(1000);
+    }
+}
+static void shared_unlock(struct shared_header *h)
+{__atomic_store_n(&h->lock,0,__ATOMIC_RELEASE);}
+static uint64_t shared_now(void)
+{struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000+(uint64_t)t.tv_nsec/1000000;}
+static jsval atomic_wait_op(struct js *J,jsval self,jsval *args,int argc)
+{
+    int notify=js_truthy(ARG(0));struct view *a=typed_of(ARG(1));
+    if(!a || (a->kind!=5 && a->kind!=9) || buffer_of(js_obj(a->buffer))->detached)
+        return js_throw_error(J,"TypeError: wait/notify requires Int32Array or BigInt64Array");
+    int index=index_arg(J,ARG(2),0,a->len-1);if(index<0 || index>=a->len)return js_throw_error(J,"RangeError: invalid atomic index");
+    struct buffer *b=buffer_of(js_obj(a->buffer));
+    if(!b->shared)return notify?js_num(0):js_throw_error(J,"TypeError: wait requires shared memory");
+    if(!notify && js_get(J,js_obj(J->global),"document").t==JS_OBJ)return js_throw_error(J,"TypeError: Atomics.wait cannot block a window");
+    int offset=a->offset+index*a->bytes;struct shared_header *h=b->shared_header;
+    uint64_t expected=0;
+    if(!notify) {
+        if(a->kind==9){struct jsbig *g=store_big(J,ARG(3));if(!g)return js_undefined;expected=jb_to_u64(g);}
+        else {unsigned char raw[8]={0};write_number(raw,5,1,js_to_number(J,ARG(3)));for(int k=0;k<4;k++)expected|=(uint64_t)raw[k]<<(8*k);}
+    }
+    double timeout=notify?0:js_to_number(J,ARG(4)),count=notify && ARG(3).t!=JS_UNDEF?js_to_number(J,ARG(3)):INFINITY;
+    if(J->throwing)return js_undefined;
+    shared_lock(h);struct shared_wait *slot=NULL,*empty=NULL;
+    for(int k=0;k<SHARED_SLOTS;k++) {
+        if(h->wait[k].count && h->wait[k].offset==offset && h->wait[k].kind==a->kind){slot=&h->wait[k];break;}
+        if(!h->wait[k].count && !empty)empty=&h->wait[k];
+    }
+    if(notify) {
+        int n=slot?slot->count-slot->budget:0;
+        if(count!=count || count<0)count=0;
+        if(count<n)n=(int)floor(count);
+        if(slot && n){slot->budget+=n;slot->seq++;}
+        shared_unlock(h);return js_num(n);
+    }
+    uint64_t value=a->bytes==8?__atomic_load_n((uint64_t *)(b->data+offset),__ATOMIC_SEQ_CST):__atomic_load_n((uint32_t *)(b->data+offset),__ATOMIC_SEQ_CST);
+    if(value!=expected){shared_unlock(h);return js_str(J,"not-equal");}
+    if(timeout<=0){shared_unlock(h);return js_str(J,"timed-out");}
+    if(!slot)slot=empty;
+    if(!slot){shared_unlock(h);return js_throw_error(J,"RangeError: shared wait queue is full");}
+    if(!slot->count){slot->offset=offset;slot->kind=a->kind;slot->budget=0;}
+    int seq=slot->seq;slot->count++;shared_unlock(h);
+    uint64_t start=shared_now();
+    for(;;) {
+        shared_lock(h);
+        if(slot->seq!=seq && slot->budget>0){slot->budget--;slot->count--;shared_unlock(h);return js_str(J,"ok");}
+        if(isfinite(timeout) && (double)(shared_now()-start)>=timeout) {
+            slot->count--;if(slot->budget>slot->count)slot->budget=slot->count;
+            shared_unlock(h);return js_str(J,"timed-out");
+        }
+        shared_unlock(h);usleep(1000);
+    }
+}
+
 
 /* ---- CompressionStream's deflate and gzip: a small LZ77 encoder with the fixed Huffman codes ---- */
 
@@ -800,12 +1001,20 @@ void js_init_binary(struct js *J)
     js_define_native(J, J->global, "%decompress", decompress_bytes, 2);
     js_define_native(J, J->global, "%binaryType", binary_type, 1);
     js_define_native(J, J->global, "%binaryClone", binary_clone, 2);
+    js_define_native(J, J->global, "%binaryDetach", binary_detach, 1);
+    js_define_native(J,J->global,"%sharedExport",shared_export,1);
+    js_define_native(J,J->global,"%sharedImport",shared_import,1);
+    js_define_native(J,J->global,"%atomic",atomic_op,5);
+    js_define_native(J,J->global,"%atomicWait",atomic_wait_op,5);
     js_define_native(J, J->global, "%digest", digest_bytes, 2);
     js_define_native(J, J->global, "%hmac", hmac_bytes, 3);
     js_define_native(J, J->global, "%cryptoCompare", crypto_compare, 2);
     js_define_native(J, J->global, "%randomFill", random_fill, 1);
     js_define_native(J, J->global, "%encodeUTF8", encode_utf8, 1);
     js_define_native(J, J->global, "%decodeUTF8", decode_utf8, 1);
+    J->shared_proto=js_new_object(J);
+    ctor(J,"SharedArrayBuffer",shared_ctor,J->shared_proto);
+    js_define_native(J,J->shared_proto,"slice",buffer_slice,2);
     J->buffer_proto = js_new_object(J);
     struct jsobj *c = ctor(J, "ArrayBuffer", buffer_ctor, J->buffer_proto);
     js_define_native(J, c, "isView", is_view, 1);

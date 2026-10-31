@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "webpolicy.h"
+#include "web.h"
 #include "publicsuffix.h"
 static int rule(const char *s)
 {
@@ -441,4 +442,124 @@ const char *web_fetch_site(const char *initiator, const char *to)
     if (web_same_origin(initiator, to))
         return "same-origin";
     return web_same_site(initiator, to) ? "same-site" : "cross-site";
+}
+
+/* A directive's first occurrence wins. A missing directive falls back at its caller. */
+static int csp_directive(const char *policy,const char *end,const char *name,const char **value,const char **stop)
+{
+    size_t n=strlen(name);
+    for(const char *p=policy;p<end;) {
+        while(p<end && (*p==';' || isspace((unsigned char)*p)))p++;
+        if(p>=end)break;
+        const char *e=memchr(p,';',(size_t)(end-p));if(!e)e=end;
+        const char *word=p;while(p<e && !isspace((unsigned char)*p))p++;
+        if((size_t)(p-word)==n && !strncasecmp(word,name,n)){*value=p;*stop=e;return 1;}
+        p=e;
+    }
+    return 0;
+}
+static int csp_source(const char *source,size_t n,const char *document,const char *target)
+{
+    if(n==6 && !strncmp(source,"'self'",6))return web_same_origin(document,target);
+    if(n==1 && *source=='*')return !strncasecmp(target,"http:",5) || !strncasecmp(target,"https:",6) ||
+        !strncasecmp(target,"ws:",3) || !strncasecmp(target,"wss:",4);
+    if(n && source[n-1]==':' && !memchr(source,'/',n))return !strncasecmp(source,target,n);
+    if(!n || *source=='\'')return 0;
+    char token[URL_MAX],resolved[URL_MAX],origin[300],want[300];
+    if(n>=sizeof(token))return 0;
+    memcpy(token,source,n);token[n]=0;
+    const char *scheme=strstr(token,"://");
+    if(!scheme) {
+        const char *colon=strchr(document,':');if(!colon)return 0;
+        size_t prefix=(size_t)(colon-document);
+        if(prefix+3+n>=sizeof(resolved))return 0;
+        memcpy(resolved,document,prefix);memcpy(resolved+prefix,"://",3);
+        memcpy(resolved+prefix+3,token,n+1);
+    } else snprintf(resolved,sizeof(resolved),"%s",token);
+    char *host=strstr(resolved,"://");if(!host)return 0;host+=3;
+    char *path=strchr(host,'/');char path_copy[URL_MAX]="";
+    if(path){snprintf(path_copy,sizeof(path_copy),"%s",path);*path=0;}
+    int wildcard=!strncmp(host,"*.",2);
+    if(wildcard)memmove(host,host+2,strlen(host+2)+1);
+    if(web_origin(resolved,want,sizeof(want))<0 || web_origin(target,origin,sizeof(origin))<0)return 0;
+    if(wildcard) {
+        const char *oh=strstr(origin,"://"),*wh=strstr(want,"://");if(!oh || !wh)return 0;
+        if(oh-origin!=wh-want || strncasecmp(origin,want,(size_t)(oh-origin)))return 0;
+        oh+=3;wh+=3;size_t ol=strlen(oh),wl=strlen(wh);
+        if(ol<=wl || oh[ol-wl-1]!='.' || strcasecmp(oh+ol-wl,wh))return 0;
+    } else if(strcmp(origin,want))return 0;
+    if(path_copy[0]) {
+        const char *tp=strstr(target,"://");tp=tp?strchr(tp+3,'/'):NULL;if(!tp)tp="/";
+        size_t pl=strlen(path_copy),tl=strcspn(tp,"?#");
+        if(path_copy[pl-1]=='/')return tl>=pl && !strncmp(path_copy,tp,pl);
+        return tl==pl && !strncmp(path_copy,tp,pl);
+    }
+    return 1;
+}
+int web_csp_allows(const char *policies,const char *document,const char *directive,const char *target,const char *nonce)
+{
+    for(const char *p=policies?policies:"";*p;) {
+        const char *end=strchr(p,'\n');if(!end)end=p+strlen(p);
+        const char *v=NULL,*stop=NULL;int eval=!strcmp(directive,"eval");
+        const char *name=eval?"script-src":directive;
+        int found=csp_directive(p,end,name,&v,&stop);
+        if(!found && (!strcmp(name,"frame-src") || !strcmp(name,"worker-src")))found=csp_directive(p,end,"child-src",&v,&stop);
+        if(!found && !strcmp(name,"worker-src"))found=csp_directive(p,end,"script-src",&v,&stop);
+        if(!found && (!strcmp(name,"script-src-elem") || !strcmp(name,"script-src-attr")))
+            found=csp_directive(p,end,"script-src",&v,&stop);
+        if(!found && strcmp(name,"form-action") && strcmp(name,"base-uri") && strcmp(name,"frame-ancestors"))
+            found=csp_directive(p,end,"default-src",&v,&stop);
+        if(found) {
+            int allowed=0,unsafe=0,has_nonce=0;
+            while(v<stop) {
+                while(v<stop && isspace((unsigned char)*v))v++;
+                const char *s=v;while(v<stop && !isspace((unsigned char)*v))v++;size_t n=(size_t)(v-s);
+                if(!n)break;
+                if(n==13 && !strncmp(s,"'unsafe-eval'",13) && eval)allowed=1;
+                if(n==15 && !strncmp(s,"'unsafe-inline'",15))unsafe=1;
+                if(n>8 && !strncmp(s,"'nonce-",7) && s[n-1]=='\'') {
+                    has_nonce=1;if(nonce && strlen(nonce)==n-8 && !memcmp(s+7,nonce,n-8))allowed=1;
+                }
+                if(n>8 && (!strncmp(s,"'sha256-",8) || !strncmp(s,"'sha384-",8) || !strncmp(s,"'sha512-",8)))has_nonce=1;
+                if(target && !eval && csp_source(s,n,document,target))allowed=1;
+            }
+            if(!target && !eval && unsafe && !has_nonce)allowed=1;
+            if(!allowed)return 0;
+        }
+        p=*end?end+1:end;
+    }
+    return 1;
+}
+void web_csp_headers(const char *headers,char *out,size_t size)
+{
+    size_t used=0;if(!size)return;out[0]=0;
+    for(const char *p=headers?headers:"";*p;) {
+        const char *end=strchr(p,'\n');if(!end)end=p+strlen(p);
+        if(end==p || (end==p+1 && *p=='\r'))break;
+        const char *name="Content-Security-Policy:";size_t nl=strlen(name);
+        if((size_t)(end-p)>=nl && !strncasecmp(p,name,nl)) {
+            const char *v=p+nl;while(v<end && isspace((unsigned char)*v))v++;
+            const char *e=end;while(e>v && isspace((unsigned char)e[-1]))e--;
+            size_t n=(size_t)(e-v);
+            if(used+n+2>size){snprintf(out,size,"default-src 'none'");return;}
+            if(used)out[used++]='\n';
+            memcpy(out+used,v,n);used+=n;out[used]=0;
+        }
+        p=*end?end+1:end;
+    }
+}
+unsigned web_sandbox_flags(const char *attribute)
+{
+    if(!attribute)return 0;
+    unsigned flags=WEB_SB_SCRIPTS|WEB_SB_FORMS|WEB_SB_ORIGIN|WEB_SB_POPUPS|WEB_SB_TOP|WEB_SB_ESCAPE;
+    static const struct {const char *token;unsigned bit;} allow[]={
+        {"allow-scripts",WEB_SB_SCRIPTS},{"allow-forms",WEB_SB_FORMS},{"allow-same-origin",WEB_SB_ORIGIN},
+        {"allow-popups",WEB_SB_POPUPS},{"allow-top-navigation",WEB_SB_TOP},{"allow-popups-to-escape-sandbox",WEB_SB_ESCAPE}};
+    while(*attribute) {
+        while(isspace((unsigned char)*attribute))attribute++;
+        const char *end=attribute;while(*end && !isspace((unsigned char)*end))end++;
+        for(unsigned k=0;k<sizeof(allow)/sizeof(allow[0]);k++)if(strlen(allow[k].token)==(size_t)(end-attribute) && !memcmp(attribute,allow[k].token,(size_t)(end-attribute)))flags&=~allow[k].bit;
+        attribute=end;
+    }
+    return flags;
 }

@@ -216,10 +216,13 @@ static void finish(struct image *image)
     if (job) {
         if (image && !job->canceled && job->kind == 0 && image_is_gif(job->data,job->length))
             image_gif_adopt(image,job->data,job->length);
+        if(image && !job->canceled && job->kind==0 && image_is_webp(job->data,job->length))
+            image_webp_adopt(image,job->data,job->length);
         if (image && !job->canceled && job->kind == 4) {
             unsigned length=0;
             uint8_t *bytes=url_bytes((const char *)job->data,&length);
             if(bytes && image_is_gif(bytes,length))image_gif_adopt(image,bytes,length);
+            if(bytes && image_is_webp(bytes,length))image_webp_adopt(image,bytes,length);
             free(bytes);
         }
         if (!job->canceled && job->done)

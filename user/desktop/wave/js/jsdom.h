@@ -15,6 +15,8 @@ struct jshost {
     struct node *root;
     const char *url;                    /* the document's address */
     const char *base;                   /* what its links are relative to */
+    unsigned sandbox;
+    const char *csp;                     /* newline-separated enforced source-list policies */
     const char *referrer;               /* the Referer it was fetched with (document.referrer), or NULL */
     void (*navigate)(void *ctx, const char *url, int replace);
     void (*history)(void *ctx, int delta);
@@ -57,6 +59,7 @@ struct jshost {
     int (*ws_cookies)(void *ctx,const char *url,char *out,int size);
     /* Start an XMLHttpRequest; the browser calls jsdom_http_done with its id. */
     void (*http_cancel)(void *ctx,int id);
+    void (*http_pause)(void *ctx,int id,int paused);
     void (*http)(void *ctx, int id, const char *method, const char *url, const void *body, int body_len,
                  const char *headers, int credentials);       /* headers: "Name: value\n" lines, or NULL */
     /* Fetch a module a script imports; the browser calls jsdom_module_fetched with its id. */

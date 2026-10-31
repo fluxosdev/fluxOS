@@ -8,7 +8,8 @@
  * and follows its progress through a pipe. When it is done the computer
  * restarts into the installed system.
  *
- * Pages: Welcome, Choose a Disk, Name This Computer, Ready to Install,
+ * Pages: Welcome, Warning (fluxOS is experimental; "I understand" must
+ * be ticked), Choose a Disk, Name This Computer, Ready to Install,
  * Installing, and Complete (or Failed); Quit Setup, from any of them
  * before the copying starts, restarts or shuts the computer down. The
  * name goes to fluxinstall -n, which writes it to the installed system's
@@ -51,11 +52,11 @@
 #define BD_STEP_H   34
 #define BD_COLUMN_W 260
 
-enum page { P_WELCOME, P_DISK, P_NAME, P_CONFIRM, P_INSTALL, P_DONE, P_QUIT };
+enum page { P_WELCOME, P_WARNING, P_DISK, P_NAME, P_CONFIRM, P_INSTALL, P_DONE, P_QUIT };
 enum { B_BACK, B_NEXT, B_CANCEL, B_DISKS, NBUTTONS };
 
 static const char *const steps[] = {
-    "Welcome", "Choose a disk", "Name this computer", "Ready to install", "Installing fluxOS",
+    "Welcome", "Warning", "Choose a disk", "Name this computer", "Ready to install", "Installing fluxOS",
     "Finishing",
 };
 #define NSTEPS ((int)(sizeof(steps) / sizeof(steps[0])))
@@ -75,6 +76,7 @@ struct setup {
     struct disk disks[MAX_DISKS];
     int ndisks;
     int choice;                         /* selected disk, or -1 */
+    int understood;                     /* the warning's "I understand" box */
     int agreed;                         /* the "erase this disk" box */
     char host[HOST_MAX + 1];            /* the computer's name, as typed */
     int host_len, host_cur;
@@ -314,6 +316,11 @@ static struct rect agree_rect(void)
     return mkrect(TEXT_X, 214, TEXT_W, 18);
 }
 
+static struct rect understood_rect(void)
+{
+    return mkrect(TEXT_X, BUTTONS_Y - 38, TEXT_W, 18);
+}
+
 static struct rect host_field(void)
 {
     return mkrect(TEXT_X, 118, 200, 21);
@@ -359,6 +366,8 @@ static int button_enabled(struct setup *s, int b)
     switch (s->page) {
     case P_WELCOME:
         return b == B_CANCEL || (b == B_NEXT && s->source[0]);
+    case P_WARNING:
+        return b != B_NEXT || s->understood;
     case P_DISK:
         return b != B_NEXT || (s->choice >= 0 && !s->disks[s->choice].why_not);
     case P_NAME:
@@ -465,6 +474,19 @@ static void paint(struct setup *s)
         else
             gfx_text_wrap(sf, &font_sans, TEXT_X, y, TEXT_W,
                           "Setup is looking for the fluxOS installation files on the CD...", C_BLACK);
+        break;
+
+    case P_WARNING:
+        gfx_text(sf, &font_banner, TEXT_X, 16, "Warning", RGB(0xC0, 0x00, 0x00));
+        gfx_text_wrap(sf, &font_sans, TEXT_X, 16 + font_banner.height + 12, TEXT_W,
+                      "fluxOS is an experimental project, created entirely by generative AI "
+                      "models, with a very limited amount of human testers. It is highly "
+                      "discouraged to use fluxOS in any form of production environment.\n\n"
+                      "Technical problems and data loss may occur, and by installing fluxOS, "
+                      "you are entirely responsible for whatever happens to your machine.\n\n"
+                      "If you find a bug, file an issue on the GitHub page: "
+                      "https://github.com/fluxosdev/fluxOS", C_BLACK);
+        draw_checkbox(sf, understood_rect().x, understood_rect().y, "I understand", s->understood);
         break;
 
     case P_DISK:
@@ -772,6 +794,9 @@ static void press_button(struct setup *s, int b)
     } else {
         switch (s->page) {
         case P_WELCOME:
+            s->page = P_WARNING;
+            break;
+        case P_WARNING:
             find_disks(s);
             s->page = P_DISK;
             break;
@@ -839,6 +864,9 @@ static void setup_key(struct window *w, const struct input_event *ev)
             press_button(s, B_BACK);
         else if (button_shown(s, B_CANCEL))
             press_button(s, B_CANCEL);
+    } else if (s->page == P_WARNING && ev->code == KEY_SPACE) {
+        s->understood = !s->understood;
+        paint(s);
     } else if (s->page == P_CONFIRM && ev->code == KEY_SPACE) {
         s->agreed = !s->agreed;
         paint(s);
@@ -882,6 +910,8 @@ static void setup_mouse(struct window *w, int x, int y, int buttons, int changed
                 cx += w;
                 s->host_cur++;
             }
+        } else if (s->page == P_WARNING && rect_contains(understood_rect(), x, y)) {
+            s->understood = !s->understood;
         } else if (s->page == P_CONFIRM && rect_contains(agree_rect(), x, y)) {
             s->agreed = !s->agreed;
         }

@@ -175,6 +175,7 @@ static jsval constructor(struct js *J, jsval self, jsval *args, int argc)
         snprintf(normalized, sizeof(normalized), "ws://%s", href + 7);
     else
         snprintf(normalized, sizeof(normalized), "%s", href);
+    if(J->resource_allowed && !J->resource_allowed(J,"connect-src",normalized))return js_throw_error(J,"SecurityError: WebSocket blocked by document policy");
     int secure = !strncmp(normalized, "wss://", 6);
     if ((!secure && strncmp(normalized, "ws://", 5)) || strchr(normalized, '#') ||
         strlen(href) >= URL_MAX - 4)

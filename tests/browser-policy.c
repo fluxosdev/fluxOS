@@ -16,7 +16,23 @@ unsigned int uptime_ms(void)
 }
 int main(void)
 {
+    CHECK(web_csp_allows("default-src 'self'","https://a.test/page","img-src","https://a.test/a.png",NULL));
+    CHECK(!web_csp_allows("default-src 'self'","https://a.test/page","img-src","https://evil.test/a.png",NULL));
+    CHECK(!web_csp_allows("default-src *; script-src 'none'","https://a.test","script-src-elem",NULL,NULL));
+    CHECK(web_csp_allows("script-src 'nonce-abc'","https://a.test","script-src-elem",NULL,"abc"));
+    CHECK(!web_csp_allows("script-src 'unsafe-inline' 'nonce-abc'","https://a.test","script-src-elem",NULL,NULL));
+    CHECK(web_csp_allows("script-src 'unsafe-eval'","https://a.test","eval",NULL,NULL));
+    CHECK(!web_csp_allows("script-src 'self'","https://a.test","eval",NULL,NULL));
+    CHECK(web_csp_allows("img-src https://*.example.com/assets/","https://a.test","img-src","https://sub.example.com/assets/a.png",NULL));
+    CHECK(!web_csp_allows("img-src https://*.example.com/assets/","https://a.test","img-src","https://example.com/assets/a.png",NULL));
+    CHECK(!web_csp_allows("img-src *\nimg-src 'none'","https://a.test","img-src","https://a.test/x",NULL));
+    CHECK(web_sandbox_flags(NULL)==0);
+    CHECK(web_sandbox_flags("")&WEB_SB_SCRIPTS);
+    CHECK(!(web_sandbox_flags("allow-scripts allow-same-origin")&(WEB_SB_SCRIPTS|WEB_SB_ORIGIN)));
+    CHECK(web_sandbox_flags("allow-scripts-not")&WEB_SB_SCRIPTS);
     char out[4096];
+    web_csp_headers("Content-Security-Policy: img-src *\r\nContent-Security-Policy: img-src 'none'\r\n\r\n",out,sizeof(out));
+    CHECK(!strcmp(out,"img-src *\nimg-src 'none'"));
     CHECK(web_same_origin("HTTPS://EXAMPLE.COM:443/a", "https://example.com/b"));
     CHECK(!web_same_origin("https://example.com", "http://example.com"));
     CHECK(!web_same_origin("https://example.com:444", "https://example.com"));

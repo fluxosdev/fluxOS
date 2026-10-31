@@ -1,6 +1,7 @@
 #define main browser_dom_main
 #include "browser-dom.c"
 #undef main
+#include "webpolicy.h"
 static int raw_box(void *ctx,struct node *n,int *x,int *y,int *w,int *h)
 { (void)ctx;(void)n;*x=10;*y=20;*w=20;*h=10;return 1; }
 static int visual_box(void *ctx,struct node *n,int *x,int *y,int *w,int *h)
@@ -11,9 +12,35 @@ static void scroll_pos(void *ctx,int *x,int *y)
 { (void)ctx;*x=3;*y=4; }
 static int nested_scroll(void *ctx,struct node *n,int set,int *x,int *y,int *cw,int *ch,int *vw,int *vh)
 { (void)ctx;(void)n;(void)set;*x=100;*y=100;*cw=*ch=200;*vw=*vh=100;return 1; }
+static void run_code(struct jsdom *d,struct node *script,const char *text)
+{jsdom_run_script(d,script,text,(int)strlen(text),"platform host regression");}
+static void platform_hosts(void)
+{
+    struct arena arenas[4]={{0}};struct jsdom *pages[4];struct node *roots[4];
+    const char *html="<!doctype html><html><body><script nonce=ok></script></body></html>";
+    for(int k=0;k<4;k++) {
+        const char *url=k==2?"https://other.test/":"https://same.test/";
+        roots[k]=html_parse(&arenas[k],html,(int)strlen(html));
+        struct jshost h={.arena=&arenas[k],.root=roots[k],.url=url,.base=url,.status=status,.changed=changed,
+            .csp=k==3?"script-src 'nonce-ok'":NULL};
+        pages[k]=jsdom_new(&h);
+    }
+    run_code(pages[1],NULL,"var got=[];var channel=new BroadcastChannel('host');channel.onmessage=function(e){got.push(e.data.value);};");
+    run_code(pages[2],NULL,"var got=[];var channel=new BroadcastChannel('host');channel.onmessage=function(e){got.push(e.data.value);};");
+    run_code(pages[0],NULL,"var sender=new BroadcastChannel('host');sender.postMessage({value:17});");
+    for(int k=0;k<3;k++)jsdom_run_timers(pages[k]);
+    run_code(pages[1],NULL,"if(JSON.stringify(got)!=='[17]')throw Error('same-origin broadcast was not delivered');");
+    run_code(pages[2],NULL,"if(got.length)throw Error('cross-origin broadcast leaked');");
+    run_code(pages[3],NULL,"globalThis.blocked=true;");
+    /* The nonce permits the harness, while unnonced scripts and eval remain blocked. */
+    struct node *script=node_find(roots[3],T_SCRIPT);
+    run_code(pages[3],script,"if(globalThis.blocked)throw Error('CSP allowed an unnonced script');var denied=0;try{eval('1');}catch(e){denied++;}try{new Function('return 1');}catch(e){denied++;}try{setTimeout('1',0);}catch(e){denied++;}if(denied!==3)throw Error('CSP code-generation restriction failed');");
+    for(int k=0;k<4;k++){jsdom_free(pages[k]);arena_free(&arenas[k]);}
+}
 int main(void)
 {
     mallopt(M_MMAP_MAX,0);
+    platform_hosts();
     struct arena a={0},sa={0};
     const char *html="<!doctype html><html><body><div id=box style='transform:translate(50%,100%) scale(2);transform-origin:top left'></div><div id=projective style='transform:perspective(100px) translateZ(50px)'></div></body></html>";
     struct node *root=html_parse(&a,html,(int)strlen(html));

@@ -277,6 +277,13 @@ static void opacity_pixels(void)
     CHECK(pixels[5*8+1]==0x7f7fff || pixels[5*8+1]==0x8080ff);
     CHECK(pixels[4]==0xffffff);
     unload(&p);
+    load(&p,"<style>body{margin:0}.g{opacity:.5;position:relative;width:8px;height:8px}.r{position:absolute;left:0;top:0;width:8px;height:8px;background:red}"
+            ".b{position:absolute;left:2px;top:0;width:4px;height:8px;background:blue}</style><div class=g><div class=r></div><div class=b></div></div>",8,8);
+    paint_document(&p.lo,&surface,0,0,0,0,NULL,0);
+    CHECK((pixels[3]&0xff0000)>=0x7f0000 && (pixels[3]&0xff0000)<=0x800000);
+    CHECK((pixels[3]&0xff00)>=0x7f00 && (pixels[3]&0xff00)<=0x8000 && (pixels[3]&255)==255);
+    unload(&p);
+
 }
 
 /* Stacking: positioned boxes over the flow, z-index among siblings and inside contexts. */
@@ -981,7 +988,7 @@ static void effects(void)
              ".c{background:lime}</style><div class=row><div class=a></div><div class=b></div>"
              "<a class=c href=x style='display:block;width:10px;height:10px;transform:translateY(3px)'></a></div>", 64, 64);
     const struct ditem *red = colored(&p, 0xffff0000), *blue = colored(&p, 0xff0000ff), *lime = colored(&p, 0xff00ff00);
-    CHECK(red && red->xf && red->fade && red->fx && blue && !blue->xf && !blue->fade && !blue->fx);
+    CHECK(red && red->xf && red->opacity_group && red->fx && blue && !blue->xf && !blue->opacity_group && !blue->fx);
     CHECK(lime && lime->xf && p.lo.nlinks == 1 && p.lo.links[0].xf == lime->xf);
     unload(&p);
     CHECK(css_supports("(backdrop-filter: blur(4px)) and (filter: drop-shadow(0 1px 2px #000))"));
@@ -1034,6 +1041,8 @@ static void subgrids(void)
     unload(&p);
     CHECK(!css_supports("(grid-template-columns: subgrid 20px)"));
     CHECK(!css_supports("(grid-template-columns: subgrid [broken)"));
+    CHECK(css_supports("(grid-template-columns: subgrid repeat(2, [edge]))"));
+    CHECK(!css_supports("(grid-template-columns: subgrid repeat(0, [edge]))"));
     CHECK(css_supports("(grid-template-columns: subgrid)"));
     CHECK(!css_supports("(scroll-snap-type: x mandatory)"));
     CHECK(!css_supports("(contain: layout)"));

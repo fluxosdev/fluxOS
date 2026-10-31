@@ -610,8 +610,8 @@ asyncTest("promise all and chains", async function () {
 test("eval and Function", function () {
     var g = eval("var evalVar = 3; evalVar * 2");
     var f = new Function("a", "b", "return a + b");
-    return [g, globalThis.evalVar, f(2, 3), eval("1 + 1"), eval(5)];
-}, [6, 3, 5, 2, 5]);
+    return [g, globalThis.evalVar, evalVar, f(2, 3), eval("1 + 1"), eval(5)];
+}, [6, undefined, 3, 5, 2, 5]);
 test("json round trip", function () {
     var o = { a: [1, "two", { three: true }], b: null };
     return JSON.parse(JSON.stringify(o));

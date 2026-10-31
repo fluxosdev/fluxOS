@@ -19,6 +19,8 @@ static void http(void *ctx, int id, const char *method, const char *url, const v
     if (body && len <= (int)sizeof(pending.body))
         memcpy(pending.body, body, (size_t)len);
 }
+static int paused,resumed;
+static void flow(void *ctx,int id,int pause){if(pause)paused++;else resumed++;}
 static void run(struct jsdom *d, const char *s)
 {
     jsdom_run_script(d, NULL, s, (int)strlen(s), "HTTP regression");
@@ -45,7 +47,7 @@ int main(void)
                        .base = "https://app.example/",
                        .status = status,
                        .changed = changed,
-                       .http = http};
+                       .http = http,.http_pause=flow};
     struct jsdom *d = jsdom_new(&h);
     CHECK(d);
     run(d, "var rejected=false;var x=new "
@@ -91,6 +93,14 @@ int main(void)
     run(d,"if(JSON.stringify(first)!=='[0,255,10]'||streamDone)throw new Error('chunk not delivered before completion');");
     done(d,200,stream_headers,NULL,0);
     run(d,"if(!streamDone)throw new Error('stream not closed');");
+    run(d,"var held;fetch('/backpressure').then(function(r){held=r;});");
+    CHECK(jsdom_http_headers(d,pending.id,200,stream_headers,(int)strlen(stream_headers))==2);
+    unsigned char *bulk=calloc(65536,1);CHECK(bulk);jsdom_http_chunk(d,pending.id,bulk,65536);free(bulk);
+    CHECK(paused>0);int was_resumed=resumed;
+    run(d,"var byobBytes=0;held.body.getReader({mode:'byob'}).read(new Uint8Array(65536)).then(function(r){byobBytes=r.value.length;});");
+    CHECK(resumed>was_resumed);
+    run(d,"if(byobBytes!==65536)throw new Error('fetch BYOB bytes');");
+    done(d,200,stream_headers,NULL,0);
     run(d,"var cloned,original;fetch('/tee').then(function(r){var c=r.clone();r.text().then(function(t){original=t;});c.text().then(function(t){cloned=t;});});");
     CHECK(jsdom_http_headers(d,pending.id,200,stream_headers,(int)strlen(stream_headers))==2);
     jsdom_http_chunk(d,pending.id,"one",3);jsdom_http_chunk(d,pending.id,"two",3);done(d,200,stream_headers,NULL,0);

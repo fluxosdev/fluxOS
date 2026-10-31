@@ -563,9 +563,12 @@ BROWSER_TEST_SRCS := lib/digest.c lib/sha256.c tests/browser-dom.c tests/canvas-
 	$(addprefix user/desktop/wave/,canvas.c html.c shadow.c webblob.c webintegrity.c webinput.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c anim.c) \
 	user/libc/inflate.c
 .PHONY: test-browser
-test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-worker $(BUILD)/tests/jsworker $(BUILD)/tests/js-engine $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout $(BUILD)/tests/browser-policy $(BUILD)/tests/browser-http $(BUILD)/tests/browser-images $(BUILD)/tests/browser-navigation $(BUILD)/tests/browser-geometry $(BUILD)/tests/browser-drag
+test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-worker $(BUILD)/tests/jsworker $(BUILD)/tests/js-engine $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout $(BUILD)/tests/browser-policy $(BUILD)/tests/browser-http $(BUILD)/tests/browser-images $(BUILD)/tests/browser-navigation $(BUILD)/tests/browser-geometry $(BUILD)/tests/browser-drag $(BUILD)/tests/browser-storage $(BUILD)/tests/browser-vector-text
 	$< rootfs/usr/share/www/classlist-tests.js 20
 	$< rootfs/usr/share/www/dom-feature-tests.js 31
+	$(BUILD)/tests/browser-storage
+	$(BUILD)/tests/browser-vector-text
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/platform-gap-tests.js 19
 	$(BUILD)/tests/browser-style
 	$(BUILD)/tests/browser-layout
 	$(BUILD)/tests/browser-policy
@@ -848,3 +851,11 @@ $(BUILD)/tests/kernel-suspend.o: tests/kernel-suspend.c
 
 $(BUILD)/tests/kernel-suspend: $(BUILD)/tests/kernel-suspend.o $(CRT0) $(LIBC) user/user.ld
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
+
+$(BUILD)/tests/browser-storage: tests/browser-storage.c user/desktop/wave/webstore.c $(DESKTOP_HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g $(DESKTOP_INC) -Iinclude -DIDB_DIR='"$(CURDIR)/$(BUILD)/tests/idb-journal/"' tests/browser-storage.c user/desktop/wave/webstore.c -o $@
+
+$(BUILD)/tests/browser-vector-text: tests/browser-vector-text.c user/desktop/image/svg.c $(addprefix user/desktop/wave/,html.c shadow.c css.c csscolor.c cssfont.c anim.c webutil.c webtext.h) $(DESKTOP_HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g $(DESKTOP_INC) -Iinclude tests/browser-vector-text.c user/desktop/image/svg.c user/desktop/wave/html.c user/desktop/wave/shadow.c user/desktop/wave/css.c user/desktop/wave/csscolor.c user/desktop/wave/cssfont.c user/desktop/wave/anim.c user/desktop/wave/webutil.c -lm -o $@

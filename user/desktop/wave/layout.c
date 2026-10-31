@@ -235,16 +235,18 @@ static void effects_register(struct lctx *c, struct node *n, struct mark from, i
             lo->items[k].fx = (uint16_t)index;
 }
 
-/* opacity below 1: the items a box made show that much less (painted by paint_transformed). */
-static void opacity_register(struct lctx *c, struct node *n, struct mark from)
+/* Opacity isolates the complete group, so overlapping children fade together. */
+static void opacity_register(struct lctx *c,struct node *n,struct mark from)
 {
-    int op = n->style->opacity;
-    if (op >= 255 || c->measuring)
-        return;
-    for (int k = from.items; k < c->lo->nitems; k++) {
-        int shown = (255 - c->lo->items[k].fade) * op / 255;
-        c->lo->items[k].fade = (uint8_t)(255 - shown);
-    }
+    struct layout *lo=c->lo;
+    if(n->style->opacity>=255 || c->measuring || from.items>=lo->nitems || lo->nopacity>=4096)return;
+    struct opacity_group *groups=grow(c->a,lo->opacity,lo->nopacity,&lo->opacitycap,sizeof(*groups));
+    if(!groups)return;
+    lo->opacity=groups;int index=++lo->nopacity;
+    groups[index-1]=(struct opacity_group){n,from.items,lo->nitems,0};
+    for(int k=0;k<index-1;k++)if(!groups[k].parent && groups[k].first>=from.items && groups[k].last<=lo->nitems)
+        groups[k].parent=(uint16_t)index;
+    for(int k=from.items;k<lo->nitems;k++)if(!lo->items[k].opacity_group)lo->items[k].opacity_group=(uint16_t)index;
 }
 
 /* After a box's items are out (from on; its own background up to lead): a layer of its own if it is
@@ -7431,7 +7433,7 @@ static void paint_transformed(const struct layout *lo,const struct ditem *item,s
     unsigned shown=255u-item->fade;
     if(d.dyn)layout_dyn_offset(lo,d.dyn,sx,sy,&dx,&dy);
     if(d.sb)layout_sb_view(lo,d.sb,sx,sy,&bx,&by,NULL);
-    d.x+=dx+bx;d.y+=dy+by;d.xf=d.sb=d.dyn=d.fade=0;d.fx=0;d.backdrop=0;
+    d.x+=dx+bx;d.y+=dy+by;d.xf=d.sb=d.dyn=d.fade=0;d.opacity_group=0;d.fx=0;d.backdrop=0;
     /* filter, clip-path and blend: the groups round the item, innermost first */
     int chain[64],nchain=0,effects=item->fx && fx_offscreen(lo,item->fx);
     for(int g=item->fx;effects && g>0 && g<=lo->nfx && nchain<64;g=lo->fx[g-1].parent)chain[nchain++]=g;
@@ -7535,9 +7537,65 @@ static void paint_transformed(const struct layout *lo,const struct ditem *item,s
     free(memory);
 }
 
-void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, int sx, int sy,
-                    const struct node *focus, int caret_on)
+static void paint_layer(const struct layout *lo,struct surface *s,int ox,int oy,int sx,int sy,const struct node *focus,int caret_on,int skip);
+static int outer_opacity(const struct layout *lo,int group,int skip)
 {
+    if(group==skip)return 0;
+    for(int depth=0;group>0 && group<=lo->nopacity && depth<64;depth++) {
+        int parent=lo->opacity[group-1].parent;if(!parent || parent==skip)return group;group=parent;
+    }
+    return 0;
+}
+static int opacity_contains(const struct layout *lo,int group,int wanted)
+{
+    for(int depth=0;group>0 && group<=lo->nopacity && depth<64;depth++) {
+        if(group==wanted)return 1;
+        group=lo->opacity[group-1].parent;
+    }
+    return 0;
+}
+/* Composite the entire stacking context once. Overlapping children must not each fade. */
+static int paint_opacity(const struct layout *lo,int group,struct surface *dst,int ox,int oy,int sx,int sy,const struct node *focus,int caret_on)
+{
+    struct rect clip=dst->clip;size_t count=(size_t)clip.w*clip.h;
+    if(clip.w<=0 || clip.h<=0)return 1;
+    if(count>(4u<<20))return 0;
+    uint32_t *pixels=malloc(count*8);
+    struct ditem *items=malloc((size_t)lo->nitems*sizeof(*items));
+    int *map=malloc((size_t)lo->nitems*sizeof(*map));
+    struct fhl *highlights=lo->nhl?malloc((size_t)lo->nhl*sizeof(*highlights)):NULL;
+    if(!pixels || !items || !map || (lo->nhl && !highlights)){free(pixels);free(items);free(map);free(highlights);return 0;}
+    struct layout subset=*lo;subset.items=items;subset.nitems=0;subset.nhl=0;subset.hl=highlights;subset.sel_on=0;
+    for(int k=0;k<lo->nitems;k++) {
+        map[k]=-1;
+        if(!opacity_contains(lo,lo->items[k].opacity_group,group))continue;
+        int index=subset.nitems;map[k]=index;items[subset.nitems++]=lo->items[k];
+        if(lo->sel_on && k>=lo->sel_from && k<=lo->sel_to) {
+            if(!subset.sel_on){subset.sel_from=index;subset.sel_c0=k==lo->sel_from?lo->sel_c0:0;subset.sel_on=1;}
+            subset.sel_to=index;subset.sel_c1=k==lo->sel_to?lo->sel_c1:lo->items[k].len;
+        }
+    }
+    for(int k=0;k<lo->nhl;k++)if(lo->hl[k].item>=0 && lo->hl[k].item<lo->nitems && map[lo->hl[k].item]>=0) {
+        highlights[subset.nhl]=lo->hl[k];highlights[subset.nhl++].item=map[lo->hl[k].item];
+    }
+    struct surface black={.px=pixels,.w=clip.w,.h=clip.h,.stride=clip.w,.clip={0,0,clip.w,clip.h}},white=black;
+    white.px=pixels+count;
+    subset.canvas=OPAQUE(0);paint_layer(&subset,&black,ox-clip.x,oy-clip.y,sx,sy,focus,caret_on,group);
+    subset.canvas=OPAQUE(0xffffff);paint_layer(&subset,&white,ox-clip.x,oy-clip.y,sx,sy,focus,caret_on,group);
+    unsigned opacity=lo->opacity[group-1].node->style->opacity;
+    for(int y=0;y<clip.h;y++)for(int x=0;x<clip.w;x++) {
+        size_t at=(size_t)y*clip.w+x;uint32_t b=pixels[at],w=pixels[count+at];
+        int clear=clamp255((int)(w>>16&255)-(int)(b>>16&255));unsigned a=(255u-clear)*opacity/255;
+        uint32_t *dstpx=&dst->px[(size_t)(clip.y+y)*dst->stride+clip.x+x],under=*dstpx,out=0;
+        for(int shift=0;shift<=16;shift+=8)out|=(uint32_t)clamp255((int)(((b>>shift&255)*opacity+(under>>shift&255)*(255-a)+127)/255))<<shift;
+        *dstpx=out;
+    }
+    free(pixels);free(items);free(map);free(highlights);return 1;
+}
+static void paint_layer(const struct layout *lo, struct surface *s, int ox, int oy, int sx, int sy,
+                    const struct node *focus, int caret_on,int skip)
+{
+    uint8_t painted[4097]={0};
     struct rect view = s->clip;
     int vx = view.x - ox + sx, vy = view.y - oy + sy;   /* the clip in page coordinates */
     gfx_fill(s, view.x, view.y, view.w, view.h, lo->canvas & 0xFFFFFF);
@@ -7546,6 +7604,19 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
     for (int i = 0; i < lo->nitems; i++) {
         const struct ditem *d = &lo->items[i];
         struct ditem translated;
+        int group=outer_opacity(lo,d->opacity_group,skip);
+        if(group) {
+            if(painted[group]==1)continue;
+            if(!painted[group])painted[group]=paint_opacity(lo,group,s,ox,oy,sx,sy,focus,caret_on)?1:2;
+            if(painted[group]==1)continue;
+            translated=*d;unsigned shown=255;int nested=d->opacity_group;
+            for(int depth=0;nested && nested!=skip && depth<64;depth++) {
+                shown=shown*lo->opacity[nested-1].node->style->opacity/255;nested=lo->opacity[nested-1].parent;
+            }
+            translated.fade=(uint8_t)(255-shown);translated.opacity_group=0;
+            paint_transformed(lo,&translated,s,ox,oy,sx,sy,focus,caret_on,i);continue;
+        }
+
         if (d->backdrop)
             paint_backdrop(lo, d, s, ox, oy, sx, sy);
         if(d->fade || (d->fx && fx_offscreen(lo,d->fx))) {
@@ -7675,6 +7746,9 @@ void paint_document(const struct layout *lo, struct surface *s, int ox, int oy, 
             s->clip = view;
     }
 }
+
+void paint_document(const struct layout *lo,struct surface *s,int ox,int oy,int sx,int sy,const struct node *focus,int caret_on)
+{paint_layer(lo,s,ox,oy,sx,sy,focus,caret_on,0);}
 
 /* ---- scrolling boxes: what the browser asks of them ---- */
 

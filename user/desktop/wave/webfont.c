@@ -1073,12 +1073,12 @@ static int width16(const struct wfont *f, const char *s, int n)
 
 int wfont_width(const struct wfont *f, const char *s, int n)
 {
-    if (f->face)
-        return downloaded_width(f, s, n);
-    return (width16(f, s, n) + 8) >> 4;
+    char *visual=web_text_visual(s,n,&n);if(visual)s=visual;
+    int width=f->face?downloaded_width(f,s,n):(width16(f,s,n)+8)>>4;
+    free(visual);return width;
 }
 
-int wfont_draw(struct surface *s, const struct wfont *f, int x, int y, const char *str, int n, color_t c)
+static int draw_visual(struct surface *s, const struct wfont *f, int x, int y, const char *str, int n, color_t c)
 {
     if (f->face)
         return downloaded_draw(s, f, x, y, str, n, c);
@@ -1133,6 +1133,12 @@ int wfont_draw(struct surface *s, const struct wfont *f, int x, int y, const cha
         }
     }
     return (pen + 8) >> 4;
+}
+
+int wfont_draw(struct surface *s,const struct wfont *f,int x,int y,const char *text,int n,color_t c)
+{
+    char *visual=web_text_visual(text,n,&n);
+    int advance=draw_visual(s,f,x,y,visual?visual:text,n,c);free(visual);return advance;
 }
 
 /* ---- text at any size, for <canvas> ---- */

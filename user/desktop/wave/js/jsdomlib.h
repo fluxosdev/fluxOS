@@ -30,10 +30,10 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
       def(this, "_closed", false);
       this.onmessage = null;
     }
-    postMessage(data) {
+    postMessage(data, transfer) {
       var o = this._other;
       if (!o || this._closed) return;
-      var copy = structuredClone(data);
+      var copy = structuredClone(data,{transfer:transfer && transfer.transfer || transfer || []});
       setTimeout(function () {
         if (o._closed) return;
         var e = new MessageEvent("message", { data: copy });
@@ -66,6 +66,7 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
     postMessage(data) {
       if (this._closed) throw new DOMException("Channel is closed", "InvalidStateError");
       var copy = structuredClone(data), self = this;
+      if(g["%broadcast"])g["%broadcast"](this.name,g["%serialize"](data));
       channels.slice().forEach(function (c) {
         if (c === self || c._closed || c.name !== self.name) return;
         setTimeout(function () {
@@ -79,6 +80,12 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
       if (i >= 0) channels.splice(i, 1);
     }
   }
+  def(g,"%deliverBroadcast",function(data,origin,name){
+    channels.slice().forEach(function(channel){
+      if(!channel._closed && channel.name===name)
+        channel.dispatchEvent(new MessageEvent("message",{data:g["%deserialize"](data),origin:origin}));
+    });
+  });
   def(g, "BroadcastChannel", BroadcastChannel);
 
   class XMLSerializer {
@@ -1114,7 +1121,7 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
   nav.permissions = { query: function (d) { return Promise.resolve({ name: d && d.name, state: "denied", onchange: null }); } };
   nav.mediaDevices = { enumerateDevices: function () { return Promise.resolve([]); },
     getUserMedia: function () { return Promise.reject(new DOMException("No devices", "NotFoundError")); } };
-  nav.storage = { estimate: function () { return Promise.resolve({ quota: 0, usage: 0 }); },
+  nav.storage = { estimate: function () { return Promise.resolve(JSON.parse(g["%idb"]("estimate", ""))); },
     persist: function () { return Promise.resolve(false); }, persisted: function () { return Promise.resolve(false); } };
   nav.share = function () { return Promise.reject(new DOMException("Sharing is not supported", "NotAllowedError")); };
   nav.canShare = function () { return false; };
@@ -1146,10 +1153,11 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
       seen.set(x, id);
       if (x instanceof Date) return { $: "d", i: id, v: x.getTime() };
       if (x instanceof RegExp) return { $: "re", i: id, s: x.source, f: x.flags };
+      if(g["%binaryType"](x)==="SharedArrayBuffer")return {$:"sab",i:id,v:g["%sharedExport"](x)};
       if (x instanceof ArrayBuffer) return { $: "ab", i: id, v: bytes(new Uint8Array(x)) };
       if (ArrayBuffer.isView(x))
         return { $: "ta", i: id, t: x instanceof DataView ? "DataView" : x.constructor.name,
-                 v: bytes(new Uint8Array(x.buffer, x.byteOffset, x.byteLength)) };
+                 b:enc(x.buffer),o:x.byteOffset,n:x.byteLength };
       if (x instanceof Map) return { $: "m", i: id, v: Array.from(x, function (e) { return [enc(e[0]), enc(e[1])]; }) };
       if (x instanceof Set) return { $: "s", i: id, v: Array.from(x, enc) };
       if (x instanceof Error) return { $: "e", i: id, n: x.name, m: x.message, s: x.stack };
@@ -1178,9 +1186,11 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
       case "d": return refs[x.i] = new Date(x.v);
       case "re": return refs[x.i] = new RegExp(x.s, x.f);
       case "ab": return refs[x.i] = unbytes(x.v).buffer;
+      case "sab":return refs[x.i]=g["%sharedImport"](x.v);
       case "ta": {
-        var b = unbytes(x.v), C = x.t === "DataView" ? DataView : g[x.t] || Uint8Array;
-        return refs[x.i] = C === DataView ? new DataView(b.buffer) : new C(b.buffer, 0, b.length / C.BYTES_PER_ELEMENT);
+        var C=x.t==="DataView"?DataView:g[x.t] || Uint8Array,b=x.b?dec(x.b):unbytes(x.v).buffer;
+        var offset=x.b?x.o:0,n=x.b?x.n:b.byteLength;
+        return refs[x.i]=C===DataView?new DataView(b,offset,n):new C(b,offset,n/C.BYTES_PER_ELEMENT);
       }
       case "m": { var m = refs[x.i] = new Map(); x.v.forEach(function (e) { m.set(dec(e[0]), dec(e[1])); }); return m; }
       case "s": { var st = refs[x.i] = new Set(); x.v.forEach(function (e) { st.add(dec(e)); }); return st; }
@@ -1196,16 +1206,17 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
   }
   g["%serialize"] = serialize;
   g["%deserialize"] = deserialize;
-  function post(id, data, origin) {
-    if (origin && typeof origin === "object") origin = origin.targetOrigin;
-    winop(id, "post", serialize(data), origin === undefined ? "/" : String(origin));
+  function post(id, data, origin, transfer) {
+    if(origin && typeof origin==="object"){transfer=origin.transfer;origin=origin.targetOrigin;}
+    var copy=transfer===undefined?data:structuredClone(data,{transfer:transfer || []});
+    winop(id, "post", serialize(copy), origin === undefined ? "/" : String(origin));
   }
   function proxy(id) {
     if (!id || id === selfId) return g;
     var p = proxies.get(id);
     if (p) return p;
     p = {
-      postMessage: function (data, origin) { post(id, data, origin); },
+      postMessage: function (data, origin, transfer) { post(id, data, origin, transfer); },
       close: function () { winop(id, "close"); },
       focus: function () {}, blur: function () {},
       get closed() { return !winop(id, "alive"); },
@@ -1238,7 +1249,7 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
   Object.defineProperty(g, "top", { configurable: true, enumerable: true,
     get: function () { var w = winop(0, "top"); return w ? proxy(w) : g; } });
   Object.defineProperty(g, "length", { configurable: true, get: function () { return winop(0, "frames"); } });
-  def(g, "postMessage", function (data, origin) { post(selfId, data, origin); });
+  def(g, "postMessage", function (data, origin, transfer) { post(selfId, data, origin, transfer); });
   g["%deliverMessage"] = function (data, origin, source) {
     var e = new MessageEvent("message", { data: deserialize(data), origin: origin, source: proxy(source), lastEventId: "", ports: [] });
     g.dispatchEvent(e);
@@ -1265,7 +1276,7 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
         else setTimeout(function () { self.dispatchEvent(new Event("error")); }, 0);
       }
       postMessage(data, transfer) {
-        var text = serialize(data);
+        var text = serialize(transfer===undefined?data:structuredClone(data,{transfer:transfer && transfer.transfer || transfer || []}));
         if (this._id) op("post", this._id, text);
       }
       terminate() {

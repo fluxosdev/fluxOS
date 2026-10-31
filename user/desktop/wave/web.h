@@ -39,6 +39,7 @@ void arena_free(struct arena *a);
 /* ---- text ---- */
 /* Decode one UTF-8 character, advancing *p (invalid bytes decode as Latin-1). */
 int utf8_next(const char **p, const char *end);
+char *web_text_visual(const char *text,int len,int *out_len); /* malloc, or NULL for unchanged */
 int utf8_put(char *out, int cp);                   /* returns bytes written (1-4) */
 
 /* ---- fonts (webfont.c) ---- */
@@ -741,6 +742,7 @@ struct ditem {
     uint16_t sb;                /* 1 + the scrolling box it is inside (and clipped by), or 0 */
     uint16_t sbi;               /* DK_SBOX: its box */
     uint16_t xf;                /* transform group, 1-based */
+    uint16_t opacity_group;    /* innermost isolated opacity group */
     uint8_t fade;               /* opacity: 255 minus how much shows (0: opaque) */
     uint16_t fx;                /* effect group (filter, clip-path, blend, backdrop-filter), 1-based */
     uint8_t backdrop;           /* the first item of a group with backdrop-filter: what is behind it is filtered first */
@@ -808,7 +810,14 @@ struct effect_box {
     uint8_t offscreen;                  /* filter, clip-path or blend: items are painted apart, then put down */
 };
 
+struct opacity_group {
+    struct node *node;
+    int first,last;
+    uint16_t parent;
+};
 struct layout {
+    struct opacity_group *opacity;
+    int nopacity,opacitycap;
     struct effect_box *fx;
     int nfx, fxcap;
     struct ditem *items;

@@ -72,6 +72,7 @@ struct vfunc {
     int nscopes, scap;
     uint8_t is_root, arrow, arguments_param;
     uint8_t needs_env;                  /* the function's scope makes an env (this, super) */
+    uint8_t dynamic_eval;
     uint8_t laid_out;
     int nregs;
     struct vproto *proto;               /* once compiled */
@@ -423,6 +424,11 @@ static void an_expr(struct an *A, struct ast *n)
         return;
     case N_CALL:
     case N_NEW:
+        if(n->kind==N_CALL && n->a->kind==N_IDENT && str_is(n->a->str,"eval")) {
+            A->fn->dynamic_eval=1;A->fn->needs_env=1;
+            for(struct vscope *scope=A->sc;scope && scope->kind!=SC_DYN;scope=scope->parent)
+                for(int k=0;k<scope->nd;k++)scope->d[k]->captured=1;
+        }
         an_expr(A, n->a);
         for (int i = 0; i < n->n; i++)
             an_expr(A, n->list[i]);
@@ -788,6 +794,7 @@ static void lay_out(struct vfunc *f)
     X(ENDTRY)                                                                       \
     X(FINCALL)      /* reg label: save return PC, run the shared finally body */     \
     X(FINRET)       /* reg: return from a shared finally body */                    \
+    X(BINDENV)      /* slot/const name: expose a lexical slot to direct eval */      \
     X(CLEARREGS)    /* first count: release a scope's uncaptured local values */     \
     X(CATCH)        /*                  -- exception (not a generator's return) */  \
     X(CATCHANY)     /*                  -- exception */                             \
@@ -1004,7 +1011,7 @@ static struct vdecl *cg_resolve(struct cg *C, struct jsstr *name, struct vscope 
 {
     for (struct vscope *s = C->sc; s; s = s->parent) {
         if (s->kind == SC_DYN) {
-            *dyn = s;
+            *dyn = C->vf->dynamic_eval?NULL:s;
             return NULL;
         }
         struct vdecl *d = sc_find(s, name);
@@ -1091,6 +1098,12 @@ static void clear_inactive_scopes(struct cg *C)
     }
 }
 
+static void bind_scope_names(struct cg *C,struct vscope *scope)
+{
+    if(!scope || !scope->has_env)return;
+    for(int k=0;k<scope->nd;k++)if(scope->d[k]->captured)
+        op2(C,I_BINDENV,0,scope->d[k]->slot*2+scope->d[k]->konst,cg_str(C,scope->d[k]->name));
+}
 /* Enter a scope that may make an environment; returns the one left. */
 static struct vscope *scope_enter(struct cg *C, struct vscope *s, struct ctl *c)
 {
@@ -1101,6 +1114,7 @@ static struct vscope *scope_enter(struct cg *C, struct vscope *s, struct ctl *c)
     clear_scope(C, s);
     if (s->has_env)
         op1(C, I_PUSHENV, 0, s->nslots);
+    bind_scope_names(C,s);
     if (c) {
         ctl_push(C, c, CT_SCOPE);
         c->sc = s;
@@ -1221,6 +1235,7 @@ static void ex_call(struct cg *C, struct ast *n)
     } else {
         argc = args(C, n, 0);
     }
+    if(callee->kind==N_IDENT && str_is(callee->str,"eval") && !(n->flags&F_OPTIONAL) && n->op!=1)name=-2;
     call_with(C, argc, name);
     /* A skipped call leaves undefined where its result would be. */
     if (optional >= 0)
@@ -1453,6 +1468,7 @@ static void ex_class(struct cg *C, struct ast *n)
     C->sc = cs;
     if (cs->has_env)
         op1(C, I_PUSHENV, 0, cs->nslots);
+    bind_scope_names(C,cs);
     op2(C, I_CLASS, n->a ? 1 : 2, cg_node(C, n), n->a != NULL);
     if (n->str) {                       /* the class's own name, for its methods */
         op1(C, I_PICK, 1, 1);
@@ -2281,6 +2297,7 @@ static struct vproto *compile_function(struct js *J, struct vfunc *vf)
     struct cg C = { .J = J, .vf = vf, .sc = vf->params, .nregs = vf->nregs };
     if (vf->params->has_env)
         op1(&C, I_FUNCENV, 0, vf->params->nslots);
+    bind_scope_names(&C,vf->params);
     if (vf->args) {
         op(&C, I_ARGUMENTS, 1);
         store_decl(&C, vf->args);
@@ -2315,6 +2332,7 @@ static struct vproto *compile_function(struct js *J, struct vfunc *vf)
     if (vf->scope != vf->params) {
         if (vf->scope->has_env)
             op1(&C, I_PUSHENV, 0, vf->scope->nslots);
+        bind_scope_names(&C,vf->scope);
         /* A body var that redeclares a parameter starts with its value,
          * while closures in defaults keep the parameter environment. */
         for (int i = 0; fi && i < fi->nvars; i++) {
@@ -2392,9 +2410,10 @@ static void var_init(struct js *J, struct env *e, struct jsstr *name, jsval v)
         if (b || s->obj || s->has_self)
             break;
     }
-    if (b)
-        b->v = v;
-    else if (s && s->obj)
+    if (b) {
+        if(b->konst){js_throw_error(J,"TypeError: assignment to constant variable");return;}
+        if(b->slot)*b->slot=v;else b->v=v;
+    } else if (s && s->obj)
         js_put(J, s->obj, name, v, 0);
     else if (s)
         declare(J, s, name, v, 0);
@@ -2724,8 +2743,16 @@ L_POPENV: e = e->parent; NEXT;
 L_COPYENV: {
     struct env *x = env_new(J, e->parent, e->nslots);
     memcpy(x->slots, e->slots, sizeof(jsval) * (size_t)e->nslots);
+    for(struct binding *b=e->vars;b;b=b->next) {
+        struct binding *copy=declare(J,x,b->name,b->v,b->konst);
+        if(b->slot)copy->slot=&x->slots[b->slot-e->slots];
+    }
     e = x;
     NEXT;
+}
+L_BINDENV: {
+    struct binding *binding=declare(J,e,KSTR(B),js_undefined,(int)A&1);
+    binding->slot=&e->slots[(int)A/2];pc+=2;NEXT;
 }
 L_FUNCENV:
     e = env_new(J, e, (int)A);
@@ -2911,7 +2938,10 @@ L_CALL: {
                            fn.t == JS_UNDEF ? "undefined" : fn.t == JS_NULL ? "null" : "value");
         goto unwind;
     }
+    struct env *saved_eval=J->eval_env;
+    J->eval_env=name==-2 && fn.u.o->native==global_eval?e:NULL;
     jsval r = js_call_value(J, fn, sp[-n - 1], sp - n, n);
+    J->eval_env=saved_eval;
     sp -= n + 2;
     CHECK();
     *sp++ = r;
@@ -2926,7 +2956,10 @@ L_CALLS: {
         js_throw_error(J, "TypeError: %s is not a function", name >= 0 ? KSTR(name)->s : "value");
         goto unwind;
     }
+    struct env *saved_eval=J->eval_env;
+    J->eval_env=name==-2 && fn.u.o->native==global_eval?e:NULL;
     jsval r = js_call_value(J, fn, sp[-2], arr->items, arr->len);
+    J->eval_env=saved_eval;
     sp -= 3;
     CHECK();
     *sp++ = r;

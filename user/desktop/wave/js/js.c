@@ -854,8 +854,10 @@ static int proxy_trap(struct js *J, struct jsobj *p, const char *name, jsval *fn
         return 0;
     }
     jsval t = js_get(J, js_obj(p->phandler), name);
-    if (J->throwing || !js_is_callable(t))
-        return 0;
+    if (J->throwing || t.t == JS_UNDEF || t.t == JS_NULL) return 0;
+    if (!js_is_callable(t)) {
+        js_throw_error(J,"TypeError: Proxy trap is not callable");return 0;
+    }
     *fn = t;
     return 1;
 }
@@ -3715,6 +3717,7 @@ struct binding {
     jsval v;
     struct binding *next;
     uint8_t konst;
+    jsval *slot;                       /* a compiled lexical binding exposed to direct eval */
     struct binding *alias;              /* an import: the exporting module's binding */
 };
 
@@ -3746,7 +3749,7 @@ static struct binding *declare(struct js *J, struct env *e, struct jsstr *name, 
     b->name = name;
     b->v = v;
     b->konst = (uint8_t)konst;
-    b->alias = NULL;
+    b->alias = NULL;b->slot=NULL;
     b->next = e->vars;
     e->vars = b;
     return b;
@@ -3808,6 +3811,7 @@ struct vcompile {
 };
 static struct vproto *compile_on_stack(struct js *J, struct vfunc *vf, int root);
 static struct vfunc *an_root(struct js *J, struct ast *prog);
+static jsval global_eval(struct js *J,jsval self,jsval *args,int argc);
 static struct vproto *compile_function(struct js *J, struct vfunc *vf);
 static struct vproto *compile_root(struct js *J, struct vfunc *vf);
 static jsval vm_run(struct js *J, struct vproto *P, struct jsobj *f, struct env *e, jsval self,
@@ -3826,7 +3830,7 @@ static jsval read_var(struct js *J, struct env *e, struct jsstr *name, int for_t
     struct jsobj *obj;
     struct binding *b = lookup(e, name, &obj);
     if (b)
-        return b->v;
+        return b->slot?*b->slot:b->v;
     if (obj)
         return js_get_str(J, js_obj(obj), name);
     if (for_typeof)
@@ -3843,7 +3847,7 @@ static void write_var(struct js *J, struct env *e, struct jsstr *name, jsval v)
             js_throw_error(J, "TypeError: assignment to constant variable '%s'", name->s);
             return;
         }
-        b->v = v;
+        if(b->slot)*b->slot=v;else b->v=v;
         return;
     }
     obj_set(J, J->global, name, v, js_obj(J->global));
@@ -3937,6 +3941,16 @@ static jsval call_value_impl(struct js *J, jsval fv, jsval self, jsval *args, in
     if (js_stack_low(J))                        /* natives that call back in, too */
         return js_throw_error(J, "RangeError: Maximum call stack size exceeded");
     struct jsobj *f = fv.u.o;
+    if(f->ptarget) {
+        jsval trap;
+        if(proxy_trap(J,f,"apply",&trap)) {
+            struct jsobj *list=js_new_array(J);
+            for(int k=0;k<argc;k++)js_array_push(J,list,args[k]);
+            jsval a[3]={js_obj(f->ptarget),self,js_obj(list)};
+            return js_call_value(J,trap,js_obj(f->phandler),a,3);
+        }
+        return J->throwing?js_undefined:js_call_value(J,js_obj(f->ptarget),self,args,argc);
+    }
     if (f->bound)
         return call_bound(J, f, args, argc);
     step(J);
@@ -3969,6 +3983,22 @@ static jsval construct_impl(struct js *J, jsval fv, jsval *args, int argc)
     struct jsobj *f = fv.u.o;
     if (js_stack_low(J))
         return js_throw_error(J, "RangeError: Maximum call stack size exceeded");
+    if(f->ptarget) {
+        struct jsobj *target=f->ptarget;int depth=0;
+        while((target->ptarget || target->bound) && depth++<64)target=target->ptarget?target->ptarget:target->bound;
+        if(depth>=64 || target->arrow || (target->native && !target->ctor))return js_throw_error(J,"TypeError: proxy target is not a constructor");
+
+        jsval trap;
+        if(proxy_trap(J,f,"construct",&trap)) {
+            struct jsobj *list=js_new_array(J);
+            for(int k=0;k<argc;k++)js_array_push(J,list,args[k]);
+            jsval a[3]={js_obj(f->ptarget),js_obj(list),js_obj(J->new_target)};
+            jsval r=js_call_value(J,trap,js_obj(f->phandler),a,3);
+            if(!J->throwing && r.t!=JS_OBJ)return js_throw_error(J,"TypeError: construct trap must return an object");
+            return r;
+        }
+        return J->throwing?js_undefined:construct_impl(J,js_obj(f->ptarget),args,argc);
+    }
     if (f->bound) {                             /* new (F.bind(null, a))(b): a, b */
         jsval all[64];
         int n = 0;
@@ -4371,6 +4401,7 @@ static void run_script(struct js *J, struct ast *prog)
  * back the value of its last expression statement. */
 static jsval global_eval(struct js *J, jsval self, jsval *args, int argc)
 {
+    if(J->codegen_allowed && !J->codegen_allowed(J))return js_throw_error(J,"EvalError: blocked by Content Security Policy");
     (void)self;
     if (argc < 1 || args[0].t != JS_STR)
         return argc ? args[0] : js_undefined;
@@ -4378,10 +4409,19 @@ static jsval global_eval(struct js *J, jsval self, jsval *args, int argc)
     if (!prog)
         return js_throw_error(J, "%s", J->err);
     jsval saved = J->completion;
+    struct env *caller=J->eval_env,*global=J->genv;J->eval_env=NULL;
     J->completion = js_undefined;
-    run_script(J, prog);
+    if(caller) {
+        prepare_body(J,prog,prog->info);
+        struct env *vars=caller;while(vars->parent && !vars->has_self)vars=vars->parent;
+        for(int k=0;k<prog->info->nvars;k++)declare_global(J,vars,prog->info->vars[k],js_undefined,0);
+        struct env *lexical=env_new(J,caller,0);
+        for(int k=0;k<prog->info->nfuncs;k++)declare_global(J,vars,prog->info->funcs[k]->str,make_function(J,prog->info->funcs[k],lexical),1);
+        struct vfunc *vf=an_root(J,prog);
+        if(!J->throwing)vm_run(J,compile_on_stack(J,vf,1),NULL,lexical,this_value(caller),NULL,0);
+    } else run_script(J, prog);
     jsval r = J->completion;
-    J->completion = saved;
+    J->completion = saved;J->genv=global;J->eval_env=caller;
     return J->throwing ? js_undefined : r;
 }
 
@@ -5946,6 +5986,7 @@ void js_free(struct js *J)
     if (active == J)
         active = NULL;
     co_free_all(J);
+    js_binary_free(J);
     if (J->compiler) {
         free(J->compiler->stack);
         free(J->compiler);

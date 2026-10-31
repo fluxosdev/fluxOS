@@ -19,7 +19,7 @@ test('empty buffer and view',function(){var b=new ArrayBuffer(0),c=structuredClo
 test('binary graph cycles',function(){var x={a:new Uint8Array([7])};x.self=x;x.map=new Map([[x.a,x]]);var y=structuredClone(x);return [y!==x,y.self===y,y.map.get(y.a)===y,y.a[0]];},[true,true,true,7]);
 test('Date and RegExp aliases',function(){var d=new Date(42),r=/abc/g,c=structuredClone([d,d,r,r]);return [c[0]===c[1],c[2]===c[3],c[0].getTime(),c[2].source];},[true,true,42,'abc']);
 test('array shape and properties preserved',function(){var a=[];a.length=4;a[2]=new Uint8Array([9]);a.extra='yes';var b=structuredClone(a);return [b.length,(0 in b)===(0 in a),2 in b,b[2][0],b.extra];},[4,true,true,9,'yes']);
-test('nonempty transfer list fails explicitly',function(){var b=new ArrayBuffer(1);try{structuredClone(b,{transfer:[b]});return false;}catch(e){return [e.name,b.byteLength];}},['DataCloneError',1]);
+test('transfer detaches the source buffer',function(){var b=new ArrayBuffer(1),v=new Uint8Array(b);v[0]=7;var r=structuredClone(b,{transfer:[b]});return [b.byteLength,v.length,new Uint8Array(r)[0]];},[0,0,7]);
 test('empty transfer list allows copying',function(){return structuredClone(new Uint8Array([1]),{transfer:[]})[0];},1);
 test('DOM nodes rejected',function(){try{structuredClone(document.body);return false;}catch(e){return e.name;}},'DataCloneError');
 var blob=new Blob([new Uint8Array([0,255,7])],{type:'application/octet-stream'}),cloned=structuredClone([blob,blob]);

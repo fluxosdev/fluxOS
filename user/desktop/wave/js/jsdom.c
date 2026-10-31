@@ -73,7 +73,9 @@ struct dispatch_path {
     struct dispatch_path *prev;
 };
 
+static struct jsdom *active_doms;
 struct jsdom {
+    struct jsdom *active_next;
     struct jsnet *network;
     struct jsworkers *workers;
     struct dispatch_path *dispatch_path;
@@ -109,7 +111,7 @@ struct jsdom {
     int custom_on;                      /* customElements.define was called: tell it of custom elements */
     int dom_lib;                        /* jsdomlib.h's js_dom_lib has been run */
     struct { struct node *n; char type[8]; } queued[128];      /* jsdom_queue_event */
-    struct posted { char *data, *origin; int source; } *posted; /* jsdom_message: to deliver */
+    struct posted { char *data, *origin; int source; char *channel; } *posted; /* jsdom_message: to deliver */
     int nposted;
     int nqueued;
     int watch_mutations;                /* a MutationObserver observes: report changes to %mutation */
@@ -3966,7 +3968,7 @@ static void fire_phase(struct jsdom *d, jsval obj, struct node *n, const char *t
     jsval handler = js_get(J, obj, on);
     if (!js_is_callable(handler) && n && n->type == N_ELEMENT) {
         const char *code = node_attr(n, on);
-        if (code) {
+        if (code && web_csp_allows(d->h.csp,d->h.url,"script-src-attr",NULL,NULL)) {
             char cache[48];
             snprintf(cache, sizeof(cache), "__%s", on);
             handler = js_get(J, obj, cache);
@@ -4421,6 +4423,7 @@ static int document_get(struct js *J, struct jsobj *o, const char *key, jsval *o
     if (IS("location")) { *out = js_obj(d->location); return 1; }
     if (IS("readyState")) { *out = js_str(J, d->loaded ? "complete" : "interactive"); return 1; }
     if (IS("cookie")) {
+        if(d->h.sandbox&WEB_SB_ORIGIN){*out=js_throw_error(J,"SecurityError: sandboxed origin");return 1;}
         char jar[4096];
         if (d->h.cookie_get && d->h.cookie_get(d->h.ctx, jar, sizeof(jar))) {
             *out = js_str(J, jar);
@@ -4480,6 +4483,7 @@ static int document_set(struct js *J, struct jsobj *o, const char *key, jsval v)
         return 1;
     }
     if (!strcmp(key, "cookie")) {
+        if(d->h.sandbox&WEB_SB_ORIGIN){js_throw_error(J,"SecurityError: sandboxed origin");return 1;}
         /* name=value (attributes after ; are ignored), replacing the same name */
         struct jsstr *s = js_tostr(J, v);
         if (d->h.cookie_set && d->h.cookie_set(d->h.ctx, s->s))
@@ -4855,6 +4859,7 @@ static jsval set_timer(struct js *J, jsval *args, int argc, int repeat)
     jsval f = ARG(0);
     if (!js_is_callable(f) && f.t != JS_STR)
         f = js_to_string(J, f);
+    if(f.t==JS_STR && J->codegen_allowed && !J->codegen_allowed(J))return js_throw_error(J,"EvalError: string timer blocked by Content Security Policy");
     double ms = js_to_number(J, ARG(1));
     int id = add_timer(dom(J), f, ms != ms ? 0 : ms > 1e8 ? 100000000 : (int)ms, repeat,
                        argc > 2 ? args + 2 : NULL, argc > 2 ? argc - 2 : 0);
@@ -5047,7 +5052,22 @@ void jsdom_message(struct jsdom *d, const char *data, int len, const char *origi
     }
     memcpy(copy, data, (size_t)len);
     copy[len] = 0;
-    p[d->nposted++] = (struct posted){ copy, from, source_wid };
+    p[d->nposted++] = (struct posted){ copy, from, source_wid, NULL };
+}
+
+/* Queue serialized values, never objects from another page's heap. */
+static jsval broadcast_post(struct js *J,jsval self,jsval *args,int argc)
+{
+    struct jsdom *from=dom(J);struct jsstr *name=js_tostr(J,ARG(0)),*data=js_tostr(J,ARG(1));
+    char origin[300];web_origin(from->h.url,origin,sizeof(origin));
+    for(struct jsdom *to=active_doms;to;to=to->active_next) {
+        if(to==from || !to->dom_lib || (from->h.sandbox&WEB_SB_ORIGIN) || (to->h.sandbox&WEB_SB_ORIGIN) || !web_same_origin(from->h.url,to->h.url) || to->nposted>=256)continue;
+        int old=to->nposted;
+        char *channel=strdup(name->s);if(!channel)continue;
+        jsdom_message(to,data->s,data->len,origin,0);
+        if(to->nposted>old)to->posted[old].channel=channel;else free(channel);
+    }
+    return js_undefined;
 }
 
 /* The messages posted to this window, as MessageEvents (js_dom_eager's %deliverMessage). */
@@ -5056,8 +5076,9 @@ static void deliver_posted(struct jsdom *d)
     while (d->nposted) {
         struct posted m = d->posted[0];
         memmove(d->posted, d->posted + 1, sizeof(m) * (size_t)--d->nposted);
-        jsval f = js_get(d->J, js_obj(d->window), "%deliverMessage"), r;
-        jsval a[3] = { js_str(d->J, m.data), js_str(d->J, m.origin), js_num(m.source) };
+        jsval f = js_get(d->J, js_obj(d->window), m.channel?"%deliverBroadcast":"%deliverMessage"), r;
+        jsval a[3] = { js_str(d->J, m.data), js_str(d->J, m.origin), m.channel?js_str(d->J,m.channel):js_num(m.source) };
+        free(m.channel);
         free(m.data);
         free(m.origin);
         if (js_is_callable(f)) {
@@ -5587,12 +5608,14 @@ static int storage_nth(struct jsdom *d, int session, int i, const char **key)
 
 static jsval storage_get(struct js *J, jsval self, jsval *args, int argc)
 {
+    if(dom(J)->h.sandbox&WEB_SB_ORIGIN)return js_throw_error(J,"SecurityError: sandboxed origin");
     const char *v = storage_read(dom(J), storage_session(self), js_tostr(J, ARG(0))->s);
     return v ? js_str(J, v) : js_null;
 }
 
 static jsval storage_set(struct js *J, jsval self, jsval *args, int argc)
 {
+    if(dom(J)->h.sandbox&WEB_SB_ORIGIN)return js_throw_error(J,"SecurityError: sandboxed origin");
     struct jsstr *k = js_tostr(J, ARG(0)), *v = js_tostr(J, ARG(1));
     storage_write(J, storage_session(self), k->s, v->s);
     return js_undefined;
@@ -5600,12 +5623,14 @@ static jsval storage_set(struct js *J, jsval self, jsval *args, int argc)
 
 static jsval storage_remove(struct js *J, jsval self, jsval *args, int argc)
 {
+    if(dom(J)->h.sandbox&WEB_SB_ORIGIN)return js_throw_error(J,"SecurityError: sandboxed origin");
     storage_remove_key(dom(J), storage_session(self), js_tostr(J, ARG(0))->s);
     return js_undefined;
 }
 
 static jsval storage_clear(struct js *J, jsval self, jsval *args, int argc)
 {
+    if(dom(J)->h.sandbox&WEB_SB_ORIGIN)return js_throw_error(J,"SecurityError: sandboxed origin");
     (void)args;
     (void)argc;
     struct jsdom *d = dom(J);
@@ -5618,6 +5643,7 @@ static jsval storage_clear(struct js *J, jsval self, jsval *args, int argc)
 
 static jsval storage_key(struct js *J, jsval self, jsval *args, int argc)
 {
+    if(dom(J)->h.sandbox&WEB_SB_ORIGIN)return js_throw_error(J,"SecurityError: sandboxed origin");
     const char *key;
     double i = js_to_number(J, ARG(0));
     if (i != i || i < 0 || storage_nth(dom(J), storage_session(self), (int)i, &key) < 0)
@@ -5628,6 +5654,7 @@ static jsval storage_key(struct js *J, jsval self, jsval *args, int argc)
 /* localStorage.name reads and writes an item too, unless the name is a method's. */
 static int storage_prop_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
 {
+    if(dom(J)->h.sandbox&WEB_SB_ORIGIN){*out=js_throw_error(J,"SecurityError: sandboxed origin");return 1;}
     int session = o->hdata == &session_marker;
     if (!strcmp(key, "length")) {
         const char *k;
@@ -5645,6 +5672,7 @@ static int storage_prop_get(struct js *J, struct jsobj *o, const char *key, jsva
 
 static int storage_prop_set(struct js *J, struct jsobj *o, const char *key, jsval v)
 {
+    if(dom(J)->h.sandbox&WEB_SB_ORIGIN){js_throw_error(J,"SecurityError: sandboxed origin");return 1;}
     if (o->proto && js_has(J, js_obj(o->proto), S(J, key)))
         return 0;
     storage_write(J, o->hdata == &session_marker, key, js_tostr(J, v)->s);
@@ -5891,6 +5919,7 @@ static jsval xhr_ctor(struct js *J, jsval self, jsval *args, int argc)
 static jsval xhr_open(struct js *J, jsval self, jsval *args, int argc)
 {
     struct jsdom *d = dom(J);
+    if(d->h.sandbox&WEB_SB_ORIGIN)return js_throw_error(J,"SecurityError: sandboxed fetch origin is not supported");
     if (self.t != JS_OBJ)
         return js_undefined;
     char abs[URL_MAX];
@@ -6080,6 +6109,14 @@ static jsval xhr_send(struct js *J, jsval self, jsval *args, int argc)
     else if (body.t != JS_NULL && body.t != JS_UNDEF)
         r->body = js_tostr(J, body);
     xhr_issue(d, id, self, 1);
+    return js_undefined;
+}
+
+static jsval http_pause(struct js *J,jsval self,jsval *args,int argc)
+{
+    struct jsdom *d=dom(J);
+    if(d->h.http_pause && ARG(0).t==JS_OBJ)
+        for(int k=0;k<MAX_XHR;k++)if(d->xhr[k]==ARG(0).u.o)d->h.http_pause(d->h.ctx,k,js_truthy(ARG(1)));
     return js_undefined;
 }
 
@@ -6450,6 +6487,7 @@ static jsval chosen_file(struct js *J, jsval self, jsval *args, int argc)
 /* %idb(op, name, text): IndexedDB's store for this page's origin (webstore.c: store_idb). */
 static jsval idb_store(struct js *J, jsval self, jsval *args, int argc)
 {
+    if(dom(J)->h.sandbox&WEB_SB_ORIGIN)return js_throw_error(J,"SecurityError: sandboxed origin");
     (void)self;
     struct jsdom *d = dom(J);
     char origin[300] = "null";
@@ -6547,6 +6585,11 @@ static void update_pointer_capture(struct jsdom *d)
     if(old)jsdom_dispatch(d,old,"lostpointercapture");
     if(next)jsdom_dispatch(d,next,"gotpointercapture");
 }
+
+static int csp_codegen(struct js *J)
+{struct jsdom *d=dom(J);return !(d->h.sandbox&WEB_SB_SCRIPTS) && web_csp_allows(d->h.csp,d->h.url,"eval",NULL,NULL);}
+static int csp_resource(struct js *J,const char *directive,const char *url)
+{struct jsdom *d=dom(J);return !(d->h.sandbox&WEB_SB_ORIGIN) && web_csp_allows(d->h.csp,d->h.url,directive,url,NULL);}
 
 struct jsdom *jsdom_new(const struct jshost *host)
 {
@@ -7018,6 +7061,7 @@ struct jsdom *jsdom_new(const struct jshost *host)
         accessor(J, lazy_on[lazy[i].where], lazy[i].name, lazy[i].get, lazy[i].set);
     fn(J,w,"%blobURL",blob_url_api,2);
     fn(J,w,"%adoptSheets",adopt_sheets,2);
+    fn(J,w,"%broadcast",broadcast_post,2);
     fn(J,w,"%clipboard",clipboard_text,1);
     fn(J,w,"%chosenFile",chosen_file,1);
     fn(J,w,"%pointerCapture",pointer_capture_api,2);
@@ -7026,11 +7070,14 @@ struct jsdom *jsdom_new(const struct jshost *host)
     fn(J,w,"%b64",bytes_base64,1);
     fn(J,w,"%unb64",base64_bytes,1);
     fn(J,w,"%idb",idb_store,3);
+    fn(J,w,"%httpPause",http_pause,2);
     if (js_eval(J, js_dom_eager, (int)sizeof(js_dom_eager) - 1, "DOM library") < 0)
         fprintf(stderr, "DOM library: %s\n", js_error(J));
     char origin[300]="null";web_origin(d->h.url,origin,sizeof(origin));
     d->network=jsnet_new(J,d->h.base?d->h.base:d->h.url,origin,d,network_event,network_cookies);
     d->workers=jsworkers_new(J,&d->h,d);
+    d->J->codegen_allowed=csp_codegen;d->J->resource_allowed=csp_resource;
+    d->active_next=active_doms;active_doms=d;
     return d;
 }
 
@@ -7038,9 +7085,11 @@ void jsdom_free(struct jsdom *d)
 {
     if (!d)
         return;
+    for(struct jsdom **at=&active_doms;*at;at=&(*at)->active_next)
+        if(*at==d){*at=d->active_next;break;}
     web_blob_free(d);
     for (int i = 0; i < d->nposted; i++)
-        free(d->posted[i].data), free(d->posted[i].origin);
+        free(d->posted[i].data), free(d->posted[i].origin), free(d->posted[i].channel);
     free(d->posted);
     jsworkers_free(d->workers);
     jsnet_free(d->network);
@@ -7125,6 +7174,7 @@ void jsdom_run_module(struct jsdom *d, const char *url, int inline_src, const ch
     if (!d)
         return;
     d->depth++;
+    if((d->h.sandbox&WEB_SB_SCRIPTS) || !web_csp_allows(d->h.csp,d->h.url,"script-src-elem",inline_src?NULL:url,NULL))return;
     js_run_module(d->J, url, inline_src, text, len, (void *)(intptr_t)tag);
     d->depth--;
     settle(d);
@@ -7248,6 +7298,9 @@ void jsdom_run_script(struct jsdom *d, struct node *script, const char *text, in
 {
     if (!d)
         return;
+    const char *src=script?node_attr(script,"src"):NULL;
+    char target[URL_MAX];if(src)url_resolve(d->h.base,src,target,sizeof(target));
+    if((d->h.sandbox&WEB_SB_SCRIPTS) || !web_csp_allows(d->h.csp,d->h.url,"script-src-elem",src?target:NULL,script?node_attr(script,"nonce"):NULL))return;
     struct node *saved = d->current_script, *saved_after = d->write_after;
     d->current_script = script;
     d->write_after = NULL;

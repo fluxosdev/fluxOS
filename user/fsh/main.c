@@ -203,7 +203,7 @@ int main(int argc, char **argv)
             break;
         }
         if (!strcmp(a, "--version")) {
-            printf("fsh 0.3.0 (fluxOS)%s\n", sh.posix ? ", as sh" : "");
+            printf("fsh 0.3.1 (fluxOS)%s\n", sh.posix ? ", as sh" : "");
             return 0;
         }
         if (!strcmp(a, "--posix")) {

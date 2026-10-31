@@ -430,24 +430,42 @@ static const char js_chunk_weak[] = JS_SOURCE(
 static const char js_chunk_misc[] = JS_SOURCE(
 (function (g) {
   var def = g["%def"], listIter = g["%iter"], lz = g["%lazy"], ITER = Symbol.iterator;
+  var Atomics={};
+  ["load","store","add","sub","and","or","xor","exchange","compareExchange","isLockFree"].forEach(function(name){
+    def(Atomics,name,function(a,index,value,replacement){return g["%atomic"](name,a,index,value,replacement);});
+  });
+  def(Atomics,"wait",function(a,index,value,timeout){return g["%atomicWait"](false,a,index,value,timeout);});
+  def(Atomics,"notify",function(a,index,count){return g["%atomicWait"](true,a,index,count);});
+  lz("Atomics",Atomics);
   /* ---- structuredClone, base64 ---- */
   function copy(v, seen) {
     if (v === null || typeof v !== "object") {
-      if (typeof v === "function") throw new DOMException("A function could not be cloned", "DataCloneError");
+      if (typeof v === "function" || typeof v === "symbol") throw new DOMException("The value could not be cloned", "DataCloneError");
       return v;
     }
     if (seen.has(v)) return seen.get(v);
     var r;
+    if(v instanceof Error) {
+      var C=v instanceof TypeError?TypeError:v instanceof RangeError?RangeError:v instanceof SyntaxError?SyntaxError:
+        v instanceof ReferenceError?ReferenceError:v instanceof EvalError?EvalError:v instanceof URIError?URIError:Error;
+      r=new C(v.message);seen.set(v,r);r.name=v.name;r.stack=v.stack;
+      if(Object.prototype.hasOwnProperty.call(v,"cause"))r.cause=copy(v.cause,seen);
+      return r;
+    }
     if (v instanceof Date) { r = new Date(v.getTime()); seen.set(v, r); return r; }
     if (v instanceof RegExp) { r = new RegExp(v.source, v.flags); seen.set(v, r); return r; }
     var binary = g["%binaryType"](v);
+    if(binary === "SharedArrayBuffer"){r=g["%sharedImport"](g["%sharedExport"](v));seen.set(v,r);return r;}
     if (binary === "ArrayBuffer") { r = g["%binaryClone"](v); seen.set(v, r); return r; }
     if (binary) {
       var buffer = copy(v.buffer, seen);
       r = g["%binaryClone"](v, buffer);
       seen.set(v, r); return r;
     }
-    if (v instanceof Blob) { r = new Blob([v], { type: v.type }); seen.set(v, r); return r; }
+    if (v instanceof Blob) {
+      r=v instanceof File?new File([v],v.name,{type:v.type,lastModified:v.lastModified}):new Blob([v],{type:v.type});
+      seen.set(v,r);return r;
+    }
     if (typeof Node !== "undefined" && v instanceof Node)
       throw new DOMException("A DOM node could not be cloned", "DataCloneError");
     if (Array.isArray(v)) {
@@ -475,9 +493,16 @@ static const char js_chunk_misc[] = JS_SOURCE(
     return r;
   }
   lz("structuredClone", function (v, options) {
-    if (options && options.transfer && Array.from(options.transfer).length)
-      throw new DOMException("Transferring ownership is not supported", "DataCloneError");
-    return copy(v, new Map());
+    var transfer=options && options.transfer!==undefined?Array.from(options.transfer):[],seen=new Set();
+    transfer.forEach(function(b){
+      if(g["%binaryType"](b)!=="ArrayBuffer" || b.detached || seen.has(b))
+        throw new DOMException("Invalid transfer list", "DataCloneError");
+      seen.add(b);
+    });
+    var result=copy(v,new Map());
+    transfer.forEach(function(b){if(b.detached)throw new DOMException("Buffer detached during serialization","DataCloneError");});
+    transfer.forEach(function(b){g["%binaryDetach"](b);});
+    return result;
   });
 
   var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -2105,7 +2130,8 @@ static const char js_chunk_idb[] = JS_SOURCE(
       stores.push({ name: st.name, keyPath: st.keyPath, autoIncrement: st.autoIncrement, current: st.current, indexes: indexes,
                     records: st.records.map(function (r) { return [ser(r.k), r.v]; }) });
     });
-    disk("save", db.name, JSON.stringify({ version: db.version, stores: stores }));
+    var failure=disk("save", db.name, JSON.stringify({ version: db.version, stores: stores }));
+    if(failure)throw err(failure,"Unable to commit database");
   }
   function names(map) {
     var list = Array.from(map.keys()).sort();
@@ -2161,8 +2187,9 @@ static const char js_chunk_idb[] = JS_SOURCE(
     tx._dirty = true;
   }
   function finish(tx) {
+    try { if (tx._dirty) save(tx.db._data); }
+    catch(e){abort(tx,e);return;}
     tx._finished = true;
-    if (tx._dirty) save(tx.db._data);
     fire([tx], makeEvent("complete", false, false));
     if (tx._done) tx._done(true);
   }
@@ -2657,8 +2684,10 @@ static const char js_chunk_fetch[] = JS_SOURCE(
   class ReadableStream {
     constructor(source, strategy) {
       source = source || {};
-      if (source.type !== undefined) throw new TypeError("Byte streams are not supported");
-      this._source = source; this._strategy = streamStrategy(strategy, 1);
+      if (source.type !== undefined && source.type !== "bytes") throw new TypeError("Invalid stream type");
+      this._bytes=source.type === "bytes";
+      if(this._bytes && strategy && strategy.size!==undefined)throw new RangeError("Byte streams cannot have a size strategy");
+      this._source = source; this._strategy = streamStrategy(strategy, this._bytes?0:1);
       this._q = []; this._wait = []; this._total = 0; this._state = "readable";
       this._closeRequested = false; this._disturbed = false; this._locked = false;
       this._pulling = false; this._again = false; this._started = false;
@@ -2667,7 +2696,13 @@ static const char js_chunk_fetch[] = JS_SOURCE(
       this._controller = {
         enqueue: function (chunk) {
           if (s._state !== "readable" || s._closeRequested) throw new TypeError("Stream is not readable");
-          if (s._wait.length) s._wait.shift().resolve({ value: chunk, done: false });
+          if(s._bytes) {
+            if(!ArrayBuffer.isView(chunk) || !chunk.byteLength || chunk.buffer.detached)throw new TypeError("Expected a nonempty byte view");
+            var offset=chunk.byteOffset,length=chunk.byteLength;
+            var buffer=structuredClone(chunk.buffer,{transfer:[chunk.buffer]});
+            var bytes=new Uint8Array(buffer,offset,length);
+            s._q.push({value:bytes,size:length});s._total+=length;s._drainBytes();
+          } else if (s._wait.length) s._wait.shift().resolve({ value: chunk, done: false });
           else {
             var size;
             try { size = Number(s._strategy.size(chunk)); if (!isFinite(size) || size < 0) throw new RangeError("Invalid chunk size"); }
@@ -2678,9 +2713,30 @@ static const char js_chunk_fetch[] = JS_SOURCE(
         },
         close: function () {
           if (s._state !== "readable" || s._closeRequested) throw new TypeError("Stream is not readable");
-          s._closeRequested = true; s._finish();
+          s._closeRequested = true;if(s._bytes)s._drainBytes();s._finish();
         },
         error: function (e) { s._error(e); },
+        get byobRequest() {
+          if(!s._bytes || !s._wait.length || !s._wait[0].view)return null;
+          var request=s._wait[0];
+          if(request.request)return request.request;
+          var valid=true;
+          return request.request={
+            get view(){return valid?new Uint8Array(request.view.buffer,request.view.byteOffset+request.filled,request.view.byteLength-request.filled):null;},
+            respond:function(n){
+              n=Number(n);
+              if(!valid || s._wait[0]!==request)throw new TypeError("Invalid BYOB request");
+              if(!Number.isInteger(n) || n<0 || n>request.view.byteLength-request.filled)throw new RangeError("Invalid response size");
+              if(n===0 && !s._closeRequested)throw new TypeError("Zero response on an open stream");
+              valid=false;request.request=null;request.filled+=n;s._drainBytes();s._finish();s._pull();
+            },
+            respondWithNewView:function(view){
+              if(!ArrayBuffer.isView(view) || view.buffer!==request.view.buffer || view.byteOffset!==request.view.byteOffset+request.filled)
+                throw new RangeError("View does not match BYOB request");
+              this.respond(view.byteLength);
+            }
+          };
+        },
         get desiredSize() { return s._state === "errored" ? null : s._state === "closed" ? 0 : s._strategy.mark - s._total; }
       };
       try {
@@ -2688,9 +2744,35 @@ static const char js_chunk_fetch[] = JS_SOURCE(
         Promise.resolve(started).then(function () { s._started = true; s._pull(); }, function (e) { s._error(e); });
       } catch (e) { this._error(e); }
     }
+    _drainBytes() {
+      while(this._wait.length) {
+        var request=this._wait[0];
+        if(!request.view) {
+          if(!this._q.length)break;
+          var whole=this._q.shift();this._total-=whole.size;this._wait.shift().resolve({value:whole.value,done:false});continue;
+        }
+        while(this._q.length && request.filled<request.view.byteLength) {
+          var entry=this._q[0],available=request.view.byteLength-request.filled,n=Math.min(available,entry.size);
+          new Uint8Array(request.view.buffer,request.view.byteOffset+request.filled,n).set(entry.value.subarray(0,n));
+          request.filled+=n;entry.value=entry.value.subarray(n);entry.size-=n;this._total-=n;
+          if(!entry.size)this._q.shift();
+        }
+        var unit=request.unit;
+        if(request.filled>=request.min && request.filled%unit===0 || this._closeRequested && !this._q.length) {
+          if(request.filled%unit){this._error(new TypeError("Incomplete typed element"));return;}
+          this._wait.shift();request.request=null;
+          var original=request.view,buf=structuredClone(original.buffer,{transfer:[original.buffer]});
+          var value=original instanceof DataView?new DataView(buf,request.offset,request.filled)
+            :new request.ctor(buf,request.offset,request.filled/unit);
+          request.resolve({value:value,done:request.filled===0});
+        } else break;
+      }
+    }
     get locked() { return this._locked; }
     _finish() {
       if (this._state !== "readable" || !this._closeRequested || this._q.length) return;
+      if(this._bytes)this._drainBytes();
+      if(this._state!=="readable")return;
       this._state = "closed";
       while (this._wait.length) this._wait.shift().resolve({ value: undefined, done: true });
       if (this._readerClosed) this._readerClosed.resolve();
@@ -2713,7 +2795,8 @@ static const char js_chunk_fetch[] = JS_SOURCE(
     }
     getReader(options) {
       if (this._locked) throw new TypeError("Stream is locked");
-      if (options && options.mode !== undefined) throw new TypeError("BYOB readers are not supported");
+      var byob=options && options.mode!==undefined;
+      if(byob && (options.mode!=="byob" || !this._bytes))throw new TypeError("BYOB requires a byte stream");
       this._locked = true;
       var s = this, released = false, pending = 0, closed = streamDeferred();
       this._readerClosed = closed;
@@ -2721,9 +2804,24 @@ static const char js_chunk_fetch[] = JS_SOURCE(
       if (s._state === "errored") closed.reject(s._storedError);
       return {
         get closed() { return closed.promise; },
-        read: function () {
+        read: function (view, options) {
           if (released) return Promise.reject(new TypeError("Reader was released"));
           s._disturbed = true;
+          if(byob) {
+            if(!ArrayBuffer.isView(view) || view.buffer.detached || !view.byteLength)return Promise.reject(new TypeError("Expected a nonempty view"));
+            var min=options && options.min!==undefined?Number(options.min):1,unit=view.BYTES_PER_ELEMENT || 1;
+            if(!Number.isInteger(min) || min<1 || min>view.byteLength/unit)return Promise.reject(new RangeError("Invalid minimum"));
+            if(s._state==="errored")return Promise.reject(s._storedError);
+            var offset=view.byteOffset,size=view.byteLength,C=view.constructor;
+            var buffer=structuredClone(view.buffer,{transfer:[view.buffer]}),request=streamDeferred();
+            request.view=new Uint8Array(buffer,offset,size);
+            request.unit=unit;request.offset=offset;request.ctor=C;request.min=min*unit;request.filled=0;
+            if(C===DataView)request.view=new DataView(buffer,offset,size);
+            s._wait.push(request);pending++;
+            if(s._state==="closed")s._closeRequested=true;
+            s._drainBytes();s._pull();
+            return request.promise.then(function(v){pending--;return v;},function(e){pending--;throw e;});
+          }
           if (s._q.length) {
             var entry = s._q.shift(); s._total -= entry.size; s._finish(); s._pull();
             return Promise.resolve({ value: entry.value, done: false });
@@ -3078,13 +3176,13 @@ static const char js_chunk_fetch[] = JS_SOURCE(
         if(done||resolved||x.readyState<2)return;
         var opaque = req.mode === "no-cors" && x.status === 0;
         var empty=opaque||req.method==="HEAD"||x.status===204||x.status===205||x.status===304;
-        var stream=empty?null:new ReadableStream({start:function(c){controller=c;},cancel:function(){done=true;cleanup();x.abort();}});
+        var stream=empty?null:new ReadableStream({type:"bytes",start:function(c){controller=c;},pull:function(){if(g["%httpPause"])g["%httpPause"](x,false);},cancel:function(){done=true;cleanup();x.abort();}},{highWaterMark:65536});
         response=new Response(stream,{status:x.status,statusText:x.statusText,headers:parseHeaders(x.getAllResponseHeaders())});
         response.url=opaque?"":x.responseURL||req.url;response.type=opaque?"opaque":"basic";response.redirected=response.url!==new URL(req.url,location.href).href;
         resolved=true;resolve(response);
       }
       x.onreadystatechange=function(){if(x.readyState===2)headers();};
-      x.onprogress=function(ev){if(!done&&controller&&ev.data)controller.enqueue(ev.data);};
+      x.onprogress=function(ev){if(!done&&controller&&ev.data){controller.enqueue(ev.data);if(g["%httpPause"])g["%httpPause"](x,controller.desiredSize<=0);}};
       x.onload=function(){if(done)return;headers();done=true;cleanup();if(controller)controller.close();};
       x.onerror=function(){failed(new TypeError("Failed to fetch"));};
       x.onabort=function(){failed(new DOMException("The operation was aborted","AbortError"));};

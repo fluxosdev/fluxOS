@@ -1554,7 +1554,74 @@ static void draw_children(struct canvas *cv, const struct node *n, const struct 
             draw_node(cv, k, *ctm, *g, depth + 1);
 }
 
-static void draw_node(struct canvas *cv, const struct node *n, struct mat ctm, struct gs g, int depth)
+static void draw_node_impl(struct canvas *cv,const struct node *n,struct mat ctm,struct gs g,int depth);
+/* Resolve local clip paths and masks as nested groups, retaining antialiased coverage. */
+static const char *effect_reference(const struct node *n,const char *name,char out[256])
+{
+    const char *value=attr(n,name);if(value)return value;
+    const char *style=attr(n,"style");size_t len=strlen(name);
+    for(const char *p=style?style:"";*p;) {
+        while(isspace((unsigned char)*p) || *p==';')p++;
+        const char *end=strchr(p,';');if(!end)end=p+strlen(p);
+        const char *colon=memchr(p,':',(size_t)(end-p));
+        const char *ne=colon;while(ne && ne>p && isspace((unsigned char)ne[-1]))ne--;
+        if(colon && (size_t)(ne-p)==len && !strncasecmp(p,name,len)) {
+            const char *v=colon+1;while(v<end && isspace((unsigned char)*v))v++;
+            snprintf(out,256,"%.*s",(int)(end-v),v);return out;
+        }
+        p=*end?end+1:end;
+    }
+    return NULL;
+}
+static uint32_t svg_over(uint32_t dst,uint32_t src)
+{
+    unsigned sa=src>>24,da=dst>>24,a=sa*255+da*(255-sa);if(!a)return 0;
+    uint32_t out=((a+127)/255)<<24;
+    for(int shift=0;shift<24;shift+=8)out|=(((src>>shift&255)*sa*255+(dst>>shift&255)*da*(255-sa)+a/2)/a)<<shift;
+    return out;
+}
+static void draw_node(struct canvas *cv,const struct node *n,struct mat ctm,struct gs g,int depth)
+{
+    if(depth>MAX_DEPTH || cv->failed || !n->name)return;
+    char value[256];const char *spec=effect_reference(n,"clip-path",value);int len=0,is_mask=0;
+    const char *id=spec?ref_id(spec,&len):NULL;
+    const struct node *clip=id?find_id(cv->root,id,len):NULL;
+    if(!clip) {
+        spec=effect_reference(n,"mask",value);id=spec?ref_id(spec,&len):NULL;
+        clip=id?find_id(cv->root,id,len):NULL;is_mask=clip!=NULL;
+    }
+    if(!clip || clip==n){draw_node_impl(cv,n,ctm,g,depth);return;}
+    size_t pixels=(size_t)cv->w*cv->h;
+    uint32_t *source=calloc(pixels,sizeof(uint32_t)),*coverage=calloc(pixels,sizeof(uint32_t));
+    if(!source || !coverage){free(source);free(coverage);cv->failed=1;return;}
+    struct canvas layer=*cv;layer.px=source;draw_node_impl(&layer,n,ctm,g,depth);
+    struct mat clipmat=ctm,t;
+    const char *transform=attr(n,"transform");if(transform && svg_parse_transform(transform,&t)==0)clipmat=mat_mul(clipmat,t);
+    const char *units=attr(clip,is_mask?"maskcontentunits":"clippathunits");
+    if(units && !strcasecmp(units,"objectBoundingBox")) {
+        int x0=cv->w,y0=cv->h,x1=0,y1=0;
+        for(int y=0;y<cv->h;y++)for(int x=0;x<cv->w;x++)if(source[(size_t)y*cv->w+x]>>24) {
+            if(x<x0)x0=x;
+            if(x+1>x1)x1=x+1;
+            if(y<y0)y0=y;
+            if(y+1>y1)y1=y+1;
+        }
+        clipmat=(struct mat){x1-x0,0,0,y1-y0,x0,y0};
+    }
+    transform=attr(clip,"transform");if(transform && svg_parse_transform(transform,&t)==0)clipmat=mat_mul(clipmat,t);
+    struct gs cg=g;cg.fill.type=PT_COLOR;cg.fill.rgb=0xffffffffu;cg.stroke.type=PT_NONE;cg.fill_op=cg.opacity=1;
+    layer.px=coverage;draw_children(&layer,clip,&clipmat,&cg,depth+1);
+    int alpha=is_mask && attr(clip,"mask-type") && !strcasecmp(attr(clip,"mask-type"),"alpha");
+    for(size_t i=0;i<pixels;i++) {
+        uint32_t p=source[i],m=coverage[i];unsigned mask=m>>24;
+        if(is_mask && !alpha)mask=mask*(54*(m>>16&255)+183*(m>>8&255)+19*(m&255))/(256*255);
+        p=(p&0xffffffu)|(((p>>24)*mask+127)/255)<<24;
+        cv->px[i]=svg_over(cv->px[i],p);
+    }
+    cv->failed|=layer.failed;free(source);free(coverage);
+}
+
+static void draw_node_impl(struct canvas *cv, const struct node *n, struct mat ctm, struct gs g, int depth)
 {
     if (depth > MAX_DEPTH || cv->failed || !n->name)
         return;

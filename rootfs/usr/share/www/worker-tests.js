@@ -186,5 +186,26 @@ function runWorkerTests(report) {
     });
   });
 
+
+  step("transfer ArrayBuffer ownership", function(done) {
+    var url=URL.createObjectURL(new Blob(["onmessage=function(e){var b=e.data;new Uint8Array(b)[0]++;postMessage(b,[b]);postMessage(b.byteLength);};"]));
+    var w=new Worker(url),buffer=new ArrayBuffer(3),received;
+    new Uint8Array(buffer)[0]=11;
+    w.onmessage=function(e){
+      if(typeof e.data==="number"){w.terminate();done(buffer.byteLength===0 && received && new Uint8Array(received)[0]===12 && e.data===0);}
+      else received=e.data;
+    };
+    w.postMessage(buffer,[buffer]);
+  });
+  step("shared memory atomic wait and notify", function(done) {
+    var buffer=new SharedArrayBuffer(8),a=new Int32Array(buffer);a[0]=3;
+    var url=URL.createObjectURL(new Blob(["onmessage=function(e){var a=new Int32Array(e.data);Atomics.add(a,0,4);postMessage('ready');var result=Atomics.wait(a,1,0,2000);postMessage(result);};"]));
+    var w=new Worker(url),woken=-1;
+    w.onmessage=function(e){
+      if(e.data==="ready")setTimeout(function(){Atomics.store(a,1,1);woken=Atomics.notify(a,1,1);},50);
+      else {w.terminate();done(e.data==="ok" && woken===1 && a[0]===7,String(e.data)+"/"+woken+"/"+a[0]);}
+    };
+    w.postMessage(buffer);
+  });
   setTimeout(queue.shift(), 0);
 }

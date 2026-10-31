@@ -798,9 +798,9 @@ static jsval proxy_ctor(struct js *J, jsval self, jsval *args, int argc)
         return js_throw_error(J, "TypeError: Constructor Proxy requires 'new'");
     if (ARG(0).t != JS_OBJ || ARG(1).t != JS_OBJ)
         return js_throw_error(J, "TypeError: Cannot create proxy with a non-object as target or handler");
-    if (js_is_callable(ARG(0)))
-        return js_throw_error(J, "TypeError: Proxy of a function is not supported");
-    struct jsobj *p = js_mkobj(J, C_OBJECT, ARG(0).u.o->proto);
+    struct jsobj *p = js_mkobj(J, js_is_callable(ARG(0)) ? C_FUNCTION : C_OBJECT, ARG(0).u.o->proto);
+    p->arrow = ARG(0).u.o->arrow;
+    p->ctor = ARG(0).u.o->ctor;
     p->ptarget = ARG(0).u.o;
     p->phandler = ARG(1).u.o;
     return js_obj(p);
@@ -841,7 +841,7 @@ static const struct lazy_chunk {
      sizeof(js_chunk_weak) - 1,
      {"Reflect", "WeakMap", "WeakSet", "WeakRef", "FinalizationRegistry", "AggregateError", "DOMException",
       NULL}},
-    {js_chunk_misc, sizeof(js_chunk_misc) - 1, {"structuredClone", "btoa", "atob", "Intl", NULL}},
+    {js_chunk_misc, sizeof(js_chunk_misc) - 1, {"structuredClone", "Atomics", "btoa", "atob", "Intl", NULL}},
     {js_chunk_idb,
      sizeof(js_chunk_idb) - 1,
      {"indexedDB", "IDBFactory", "IDBKeyRange", "IDBDatabase", "IDBTransaction", "IDBObjectStore", "IDBIndex",

@@ -1661,6 +1661,96 @@ static struct image *decode_frame_chunks(const uint8_t *p, const uint8_t *end)
     return NULL;
 }
 
+/* Retain compressed frames and decode on demand, as GIF does. */
+struct webp_animation {
+    struct image *img;uint8_t *data;size_t pos,start,end;
+    uint32_t background,due;int delay,started,loops,limit,dispose,x,y,w,h;
+    struct webp_animation *next;
+};
+static struct webp_animation *webp_animations;
+static uint32_t webp_over(uint32_t dst,uint32_t src)
+{
+    unsigned sa=src>>24,da=dst>>24,alpha=sa*255+da*(255-sa);
+    if(!alpha)return 0;
+    uint32_t out=((alpha+127)/255)<<24;
+    for(int shift=0;shift<24;shift+=8) {
+        unsigned value=(src>>shift&255)*sa*255+(dst>>shift&255)*da*(255-sa);
+        out|=((value+alpha/2)/alpha)<<shift;
+    }
+    return out;
+}
+static int webp_next(struct webp_animation *a,int adopted)
+{
+    while(a->end-a->pos>=8) {
+        const uint8_t *chunk=a->data+a->pos;uint32_t size=rd32(chunk+4);
+        if(size>a->end-a->pos-8 || size+(size&1)>a->end-a->pos-8)return -1;
+        a->pos+=8+size+(size&1);
+        if(memcmp(chunk,"ANMF",4))continue;
+        if(size<16)return -1;
+        const uint8_t *body=chunk+8;
+        int x=(int)rd24(body)*2,y=(int)rd24(body+3)*2,w=(int)rd24(body+6)+1,h=(int)rd24(body+9)+1;
+        if(body[15]&~3 || x>a->img->w || y>a->img->h || w>a->img->w-x || h>a->img->h-y)return -1;
+        if(!adopted) {
+            struct image *f=decode_frame_chunks(body+16,body+size);
+            if(!f)return -1;
+            if(f->w!=w || f->h!=h){image_free(f);return -1;}
+            if(a->dispose)for(int j=0;j<a->h;j++)for(int i=0;i<a->w;i++)
+                a->img->px[(size_t)(a->y+j)*a->img->w+a->x+i]=a->background;
+            for(int j=0;j<h;j++)for(int i=0;i<w;i++) {
+                uint32_t *out=&a->img->px[(size_t)(y+j)*a->img->w+x+i],value=f->px[(size_t)j*w+i];
+                *out=body[15]&2?value:webp_over(*out,value);
+            }
+            image_free(f);
+        }
+        a->x=x;a->y=y;a->w=w;a->h=h;a->dispose=body[15]&1;
+        a->delay=(int)rd24(body+12);if(a->delay<10)a->delay=10;
+        return 1;
+    }
+    return 0;
+}
+void image_webp_animation_free(struct image *img)
+{
+    for(struct webp_animation **at=&webp_animations;*at;at=&(*at)->next)
+        if((*at)->img==img){struct webp_animation *a=*at;*at=a->next;free(a->data);free(a);return;}
+}
+int image_webp_animate(struct image *img,uint32_t now)
+{
+    struct webp_animation *a=webp_animations;while(a && a->img!=img)a=a->next;
+    if(!a)return 0;
+    if(!a->started){a->started=1;a->due=now+(uint32_t)a->delay;return 0;}
+    if((int32_t)(now-a->due)<0)return 0;
+    int result=webp_next(a,0);
+    if(!result && (!a->limit || ++a->loops<a->limit)) {
+        a->pos=a->start;a->dispose=0;
+        for(size_t i=0;i<(size_t)img->w*img->h;i++)img->px[i]=a->background;
+        result=webp_next(a,0);
+    }
+    if(result<=0){image_webp_animation_free(img);return 0;}
+    a->due=now+(uint32_t)a->delay;return 1;
+}
+static int attach_webp(struct image *img,const uint8_t *data,uint32_t len,int adopted)
+{
+    if(!image_is_webp(data,len) || rd32(data+4)>len-8)return -1;
+    size_t pos=12,end=rd32(data+4)+8;int w=0,h=0,limit=0;uint32_t bg=0;
+    while(end-pos>=8) {
+        const uint8_t *chunk=data+pos;uint32_t size=rd32(chunk+4);
+        if(size>end-pos-8 || size+(size&1)>end-pos-8)return -1;
+        if(!memcmp(chunk,"VP8X",4) && size>=10){w=(int)rd24(chunk+12)+1;h=(int)rd24(chunk+15)+1;}
+        if(!memcmp(chunk,"ANIM",4) && size==6){bg=rd32(chunk+8);limit=chunk[12]|chunk[13]<<8;}
+        if(!memcmp(chunk,"ANMF",4))break;
+        pos+=8+size+(size&1);
+    }
+    if(w!=img->w || h!=img->h || pos>=end)return -1;
+    struct webp_animation *a=calloc(1,sizeof(*a));if(!a)return -1;
+    a->data=malloc(end);if(!a->data){free(a);return -1;}
+    memcpy(a->data,data,end);a->img=img;a->start=a->pos=pos;a->end=end;a->background=bg;a->limit=limit;
+    if(!adopted)for(size_t i=0;i<(size_t)w*h;i++)img->px[i]=bg;
+    if(webp_next(a,adopted)!=1){free(a->data);free(a);return -1;}
+    a->next=webp_animations;webp_animations=a;return 0;
+}
+int image_webp_adopt(struct image *img,const uint8_t *data,uint32_t len)
+{image_webp_animation_free(img);return attach_webp(img,data,len,1);}
+
 struct image *image_decode_webp(const uint8_t *data, uint32_t len)
 {
     if (!image_is_webp(data, len))
@@ -1680,28 +1770,10 @@ struct image *image_decode_webp(const uint8_t *data, uint32_t len)
             cw = (int)rd24(body + 4) + 1;
             ch = (int)rd24(body + 7) + 1;
         } else if (!memcmp(p, "ANMF", 4) && sz >= 16) {
-            struct image *f = decode_frame_chunks(body + 16, body + sz);
-            if (!f)
-                return NULL;
-            int fx = (int)rd24(body) * 2, fy = (int)rd24(body + 3) * 2;
-            if (!cw || !ch || (uint64_t)cw * ch > MAX_PIXELS) {    /* 2^24 squared needs 48 bits */
-                cw = f->w;
-                ch = f->h;
-            }
-            struct image *img = malloc(sizeof(*img));
-            if (img)
-                img->px = calloc((size_t)cw * ch, sizeof(uint32_t));
-            if (!img || !img->px) {
-                free(img);
-                image_free(f);
-                return NULL;
-            }
-            img->w = cw;
-            img->h = ch;
-            for (int y = 0; y < f->h && fy + y < ch; y++)
-                for (int x = 0; x < f->w && fx + x < cw; x++)
-                    img->px[(size_t)(fy + y) * cw + fx + x] = f->px[(size_t)y * f->w + x];
-            image_free(f);
+            if(cw<=0 || ch<=0 || (uint64_t)cw*ch>MAX_PIXELS)return NULL;
+            struct image *img=calloc(1,sizeof(*img));if(!img)return NULL;
+            img->w=cw;img->h=ch;img->px=calloc((size_t)cw*ch,sizeof(uint32_t));
+            if(!img->px || attach_webp(img,data,len,0)<0){image_free(img);return NULL;}
             return img;
         } else if (!memcmp(p, "ALPH", 4) || !memcmp(p, "VP8 ", 4) || !memcmp(p, "VP8L", 4)) {
             return decode_frame_chunks(p, end);

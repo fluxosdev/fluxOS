@@ -465,3 +465,67 @@ int web_nth_fits(int a, int b, int position)
     return ((uint32_t)b - (uint32_t)position) % (0u - (uint32_t)a) == 0;
 }
 
+
+/* A small shaping fallback for Arabic and simple Hebrew/Arabic directional runs.
+ * Logical strings remain untouched; editing/selection can keep their DOM offsets.
+ * This is not the Unicode bidi algorithm or an OpenType shaping engine. */
+#include "webtext.h"
+static const struct arabic_form *arabic_form(int cp)
+{
+    for(size_t k=0;k<sizeof(arabic_forms)/sizeof(arabic_forms[0]);k++)if(arabic_forms[k].base==cp)return &arabic_forms[k];
+    return NULL;
+}
+static int text_mark(int cp)
+{return (cp>=0x590 && cp<=0x5bd) || cp==0x5bf || (cp>=0x5c1 && cp<=0x5c2) || (cp>=0x610 && cp<=0x61a) ||
+    (cp>=0x64b && cp<=0x65f) || cp==0x670 || (cp>=0x6d6 && cp<=0x6ed);}
+static int text_rtl(int cp)
+{return (cp>=0x5d0 && cp<=0x5f4) || (cp>=0x620 && cp<=0x6ff) || (cp>=0x750 && cp<=0x8ff) || (cp>=0xfb1d && cp<=0xfdff) || (cp>=0xfe70 && cp<=0xfefc);}
+static int joins(int cp,int following)
+{
+    if(cp==0x640 || cp==0x200d)return 1;
+    const struct arabic_form *f=arabic_form(cp);return f && f->form[following?2:1];
+}
+char *web_text_visual(const char *text,int len,int *out_len)
+{
+    *out_len=len;int needed=0;
+    const char *p=text,*end=text+len;
+    while(p<end){int cp=utf8_next(&p,end);if(text_rtl(cp))needed=1;}
+    if(!needed || len<=0 || len>(1<<20))return NULL;
+    int *cp=malloc((size_t)(len+1)*sizeof(int)),*shaped=malloc((size_t)(len+1)*sizeof(int));
+    char *out=malloc((size_t)len*3+1);
+    if(!cp || !shaped || !out){free(cp);free(shaped);free(out);return NULL;}
+    int n=0;p=text;while(p<end)cp[n++]=utf8_next(&p,end);
+    for(int k=0;k<n;k++) {
+        const struct arabic_form *f=arabic_form(cp[k]);shaped[k]=cp[k];
+        if(!f)continue;
+        int prev=k-1,next=k+1;
+        while(prev>=0 && text_mark(cp[prev]))prev--;
+        while(next<n && text_mark(cp[next]))next++;
+        int before=prev>=0 && joins(cp[prev],1) && joins(cp[k],0);
+        int after=next<n && joins(cp[k],1) && joins(cp[next],0);
+        int form=before?(after?3:1):(after?2:0);
+        if(f->form[form])shaped[k]=f->form[form];
+    }
+    /* Lam-alef ligatures; intervening combining marks retain their own clusters. */
+    for(int k=0;k+1<n;k++)if(cp[k]==0x644) {
+        int lig=cp[k+1]==0x622?0xfef5:cp[k+1]==0x623?0xfef7:cp[k+1]==0x625?0xfef9:cp[k+1]==0x627?0xfefb:0;
+        if(lig){int prev=k-1;while(prev>=0 && text_mark(cp[prev]))prev--;shaped[k]=lig+(prev>=0 && joins(cp[prev],1));shaped[k+1]=0;}
+    }
+    int used=0;
+    for(int k=0;k<n;) {
+        if(!text_rtl(cp[k])){if(shaped[k])used+=utf8_put(out+used,shaped[k]);k++;continue;}
+        int stop=k+1;
+        while(stop<n && (text_rtl(cp[stop]) || text_mark(cp[stop]) || cp[stop]==0x200c || cp[stop]==0x200d ||
+            cp[stop]==' ' || (cp[stop]>='0' && cp[stop]<='9')))stop++;
+        while(stop>k+1 && cp[stop-1]==' ')stop--;
+        int r=stop;
+        while(r>k) {
+            int start=r-1;while(start>k && text_mark(cp[start]))start--;
+            if(cp[start]>='0' && cp[start]<='9')while(start>k && cp[start-1]>='0' && cp[start-1]<='9')start--;
+            for(int j=start;j<r;j++)if(shaped[j])used+=utf8_put(out+used,shaped[j]);
+            r=start;
+        }
+        k=stop;
+    }
+    out[used]=0;*out_len=used;free(cp);free(shaped);return out;
+}

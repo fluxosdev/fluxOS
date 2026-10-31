@@ -115,6 +115,9 @@ int jpeg_encode_file(const char *path, const uint32_t *rgb, int stride, int w, i
 void image_free(struct image *img);
 void image_animation_free(struct image *img);
 int image_animate(struct image *img, uint32_t now);
+int image_webp_animate(struct image *img,uint32_t now);
+void image_webp_animation_free(struct image *img);
+int image_webp_adopt(struct image *img,const uint8_t *data,uint32_t len);
 int image_gif_adopt(struct image *img, const uint8_t *data, uint32_t len);
 void gfx_image(struct surface *s, int x, int y, const struct image *img);
 /* Blend `tint` over the image's opaque half, like a selected Win95 icon. */

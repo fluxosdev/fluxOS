@@ -588,7 +588,7 @@ fetcher process, so the browser keeps running), or from `file://`.
   (`\p{L}`, `\p{Script=Greek}`, `\p{Extended_Pictographic}`), case folding beyond ASCII and the `v`
   flag's nested classes with `--` and `&&`; Unicode `toUpperCase`/`toLowerCase` (ß is SS),
   `trim` and `normalize()` (NFC, NFD, NFKC, NFKD; tables from `tools/mkunicode.py`), and the usual built-ins (Map, Set,
-  Weak*, typed arrays, JSON, Date, Reflect, `Proxy` (get, set, has, deleteProperty and ownKeys
+  Weak*, typed arrays, JSON, Date, Reflect, `Proxy` (get, set, has, deleteProperty, ownKeys, apply and construct
   traps), the ES2025 Set methods, iterator helpers (`Iterator.from`, `map`, `filter`, `take`,
   `drop`, `flatMap`, `reduce`, `toArray`... on arrays', collections' and generators' iterators),
   `Array.fromAsync`, `Error` causes, a small Intl (`NumberFormat` with currencies, percentages,
@@ -1211,15 +1211,17 @@ The FPU state is saved with FXSAVE, so AVX and later cannot be used.
   AES-128/256-GCM or ChaCha20-Poly1305; no CBC suites, no RSA key exchange, no resumption);
   certificate chains and handshake signatures are verified using
   Mbed TLS and a bundled CA trust store. The trust bundle needs periodic updates.
-- **Browser:** JavaScript's `Proxy` cannot wrap a function, `eval` runs
-  in the global scope, and regular expressions have no `\q{}` string sets or Unicode
+- **Browser:** Callable proxies and local-scope direct `eval` are implemented; complete
+  proxy invariants and strict-eval declaration edge cases still need work. Regular
+  expressions have no `\q{}` string sets or Unicode
   case folding beyond simple folding, so some modern web apps won't run. Layout is an
   approximation: the scroll bars of boxes lie over their contents instead of making room
   (text can end up under them), and boxes with `overflow` that are table cells, or `<body>` and
   `<html>`, do not clip or scroll; text selection and `getBoundingClientRect()` account for nested box scrolling,
   while geometry for some positioned boxes is approximate; background `space` and `round`
   still repeat, and `local` attachments do not track inner scrolling; a positioned inline (a `<span>`)
-  does not get a layer of its own, and `opacity` fades each item on its own rather than the group;
+  does not get a layer of its own; opacity groups composite overlapping children together,
+  with bounded offscreen buffers and incomplete filter/backdrop/iframe interactions;
   `sticky` works against the window only. CSS 2D translate, scale, rotate, skew and matrix transforms
   support origins, nesting, painting, hit testing and visual geometry. 3D transform lists
   retain depth through composition: `perspective()`, `translateZ()`, `scaleZ()`, arbitrary-axis
@@ -1233,28 +1235,34 @@ The FPU state is saved with FXSAVE, so AVX and later cannot be used.
   gives what an element appearing, or coming out of `display: none`, transitions from, and nothing
   else transitions out of `display: none`; each frame restyles only what moves. Transform scratch rendering is bounded to four million
   source pixels per item. `structuredClone` copies buffers, typed views and blobs,
-  preserving shared references; ownership transfer is not implemented. `CSS.escape`
+  preserving shared references; transferring ArrayBuffers detaches their source views.
+  SharedArrayBuffer uses native shared segments and supports atomic integer operations and
+  worker wait/notify, with a bounded process-lifetime pool (see `browser-compatibility.md`). `CSS.escape`
   handles identifier serialization, including Unicode and selector round trips.
   Try `file:///usr/share/www/transforms.html` for an interactive example.
   Flexbox has grow/shrink sizing, wrapping,
   ordering, alignment and rows/columns, but needs wider conformance testing;
   grids support row and column subgrids with inherited track sizes and gaps, nested
   subgrids, descendant contributions to auto tracks, and inherited names for explicitly
-  placed spans. Subgrid line-name repeat syntax, complete named-line handling for
+  placed spans. Integer line-name repeats are supported; auto-fill line-name repeats, complete named-line handling for
   auto-placed spans, named spans and complete named-line behavior for auto-repeat remain
   incomplete. Container size queries are implemented. Shadow DOM still needs wider composed-event and slot
   conformance testing; adopted sheets do not register downloadable font faces.
   Fetch resolves at headers and delivers body chunks incrementally; EventSource
   parses event streams and reconnects. Each page uses up to four request workers.
-  Fetch does not yet pause network delivery when a stream queue fills. BYOB/byte-stream
-  controllers are missing. WebP animations show their first frame; SVG ignores clip paths,
-  masks, filters and patterns. Workers remain missing; IndexedDB keeps each database in memory
-  and writes it whole when a transaction that changed it completes (fine for megabytes, not
-  hundreds of them). Windows reach each other only through `postMessage`, `closed`, `close()` and
-  `location`: a same-origin popup's `document` cannot be touched.
+  Fetch byte streams support BYOB readers, and window fetches pause helper-pipe delivery
+  when their queues fill; worker transport and the wget fallback still need backpressure.
+  Animated WebP supports frames, blending, disposal and loops. SVG supports local clip paths
+  and basic luminance/alpha masks; filters and patterns remain missing. Dedicated workers
+  are implemented. IndexedDB keeps each database in memory and serializes it at commit,
+  but small changes append checksummed replacement ranges instead of rewriting the entire
+  database file; very large databases and concurrent page transactions need more work. Windows reach each other only through `postMessage`, `closed`, `close()` and
+  `location`: a same-origin popup's `document` cannot be touched. BroadcastChannel
+  delivers between same-origin page engines in a Wave process.
   Web Crypto encryption, asymmetric keys and key derivation are missing. There are
-  downloadable TrueType/OpenType, WOFF and WOFF2 fonts, but no complex-script
-  shaping or complete bidirectional text support; the built-in fonts cover Latin
+  downloadable TrueType/OpenType, WOFF and WOFF2 fonts, but no
+  complete OpenType shaping or bidirectional text support (basic Arabic joining,
+  lam-alef ligatures and Hebrew/Arabic visual runs are implemented); the built-in fonts cover Latin
   Extended, Greek, Cyrillic and common punctuation, Noto fonts most other scripts and CJK, and
   color emoji are single characters (skin tones, ZWJ families and flags show their parts). Connections are kept per
   window, not shared between them, and the cache is for the browser only (wget
@@ -1306,3 +1314,6 @@ under the MIT license. Source subsets, licenses, and port notes are in `third_pa
 
 The firmware's ACPI tables and AML run on [uACPI 6.1.1](https://github.com/uACPI/uACPI) by
 Daniil Tatianin and contributors, under the MIT license (`third_party/uacpi/LICENSE`).
+
+The current browser compatibility implementation and remaining limits are tracked in
+[browser-compatibility.md](browser-compatibility.md).

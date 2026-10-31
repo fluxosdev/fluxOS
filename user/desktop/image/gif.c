@@ -241,6 +241,7 @@ static int next_frame(struct gif_animation *a, int adopted)
 
 void image_animation_free(struct image *img)
 {
+    image_webp_animation_free(img);
     for (struct gif_animation **p=&animations;*p;p=&(*p)->next)
         if ((*p)->img==img) {
             struct gif_animation *a=*p;
@@ -255,7 +256,8 @@ int image_animate(struct image *img, uint32_t now)
 {
     struct gif_animation *a;
     for (a=animations;a && a->img!=img;a=a->next) {}
-    if (!a || a->stopped) return 0;
+    if(!a)return image_webp_animate(img,now);
+    if(a->stopped)return 0;
     if (!a->started) {a->started=1;a->due=now+(uint32_t)a->delay;return 0;}
     if ((int32_t)(now-a->due)<0) return 0;
     int result=next_frame(a,0);

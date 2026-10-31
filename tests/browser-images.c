@@ -28,7 +28,26 @@ static void frame(int x,int width,int first,int second,int disposal,int transpar
     bits|=5u<<nbits;nbits+=3;
     byte(2);byte((nbits+7)/8);while(nbits>0){byte(bits&255);bits>>=8;nbits-=8;}byte(0);
 }
+static void u24(unsigned value){byte(value);byte(value>>8);byte(value>>16);}
+static void webp_frame(int flags) {
+    byte('A');byte('N');byte('M');byte('F');byte(44);byte(0);byte(0);byte(0);
+    u24(0);u24(0);u24(1);u24(0);u24(50);byte(flags);
+    memcpy(data+len,webp_lossless+12,28);len+=28;
+}
+static void animated_webp(void) {
+    const uint8_t header[]={'R','I','F','F',0,0,0,0,'W','E','B','P','V','P','8','X',10,0,0,0,2,0,0,0,1,0,0,0,0,0,
+        'A','N','I','M',6,0,0,0,0,0,0,0,1,0};
+    memcpy(data,header,sizeof(header));len=sizeof(header);
+    webp_frame(0);webp_frame(1);webp_frame(2);
+    unsigned riff=len-8;for(int k=0;k<4;k++)data[4+k]=(uint8_t)(riff>>(8*k));
+    struct image *image=image_decode_webp(data,len);CHECK(image && image->px[1]==0x800000ffu);
+    CHECK(!image_animate(image,0));CHECK(image_animate(image,50) && image->px[1]==0xc00000ffu);
+    CHECK(image_animate(image,100) && image->px[1]==0x800000ffu);CHECK(!image_animate(image,150));
+    CHECK(image_webp_adopt(image,data,len)==0);CHECK(!image_animate(image,200));CHECK(image_animate(image,250));image_free(image);
+    for(unsigned n=0;n<len;n++){image=image_decode_webp(data,n);if(image)image_free(image);}
+}
 int main(void){
+    animated_webp();
     begin(-1);frame(0,2,0,0,1,0);frame(1,1,1,0,3,0);frame(0,1,2,0,2,0);frame(1,1,1,0,1,1);byte(0x3b);
     struct image *img=image_decode_gif(data,len);CHECK(img && img->w==2 && img->h==1);
     CHECK(img->px[0]==0xffff0000u && img->px[1]==0xffff0000u);

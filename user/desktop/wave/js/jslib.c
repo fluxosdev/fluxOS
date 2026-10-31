@@ -528,6 +528,7 @@ static jsval proto_value_of(struct js *J, jsval self, jsval *args, int argc)
 
 static jsval function_ctor(struct js *J, jsval self, jsval *args, int argc)
 {
+    if(J->codegen_allowed && !J->codegen_allowed(J))return js_throw_error(J,"EvalError: blocked by Content Security Policy");
     (void)self;
     /* new Function("a", "b", "return a + b"): compiled as an expression in the global scope */
     struct jsstr *src = S(J, "__fluxfn=(function anonymous(");

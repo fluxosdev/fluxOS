@@ -4801,7 +4801,26 @@ static const struct gridspec *parse_tracks(const char *value, const struct vctx 
             if(sub && !in_names && g->n<MAX_TRACKS)g->n++;
             continue;
         }
-        if(sub)return NULL; /* subgrid has line names, not independent track sizes */
+        if(sub) {
+            if(wl[i]<10 || strncasecmp(w[i],"repeat(",7))return NULL;
+            const char *comma=memchr(w[i]+7,',',(size_t)wl[i]-8);if(!comma)return NULL;
+            char count_text[32];int cl=(int)(comma-w[i]-7);if(cl<=0 || cl>=32)return NULL;
+            memcpy(count_text,w[i]+7,(size_t)cl);count_text[cl]=0;
+            char *tail;long count=strtol(count_text,&tail,10);while(isspace((unsigned char)*tail))tail++;
+            if(*tail || count<1 || count>MAX_TRACKS)return NULL;
+            const char *part=comma+1,*end=w[i]+wl[i]-1;
+            for(int repeat=0;repeat<count;repeat++) {
+                const char *p=part;
+                while(p<end) {
+                    while(p<end && isspace((unsigned char)*p))p++;
+                    if(p==end)break;
+                    if(*p!='[')return NULL;
+                    const char *close=memchr(p,']',(size_t)(end-p));if(!close || g->n>=MAX_TRACKS)return NULL;
+                    add_line_names(g,p,(int)(close+1-p),v);g->n++;p=close+1;
+                }
+            }
+            continue;
+        }
         if (wl[i] > 7 && !strncasecmp(w[i], "repeat(", 7)) {
             char inner[256];
             int len = wl[i] - 8;

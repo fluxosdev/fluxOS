@@ -119,7 +119,7 @@ struct fetch {
     int slot;                   /* F_CSS: the style sheet slot */
     int redirects;
     int mode;                   /* F_PAGE: NAV_* */
-    int postlen, credentials, streaming;
+    int postlen, credentials, streaming, paused;
     char *post;                 /* F_PAGE: a form's POST body */
     int special;                /* F_PAGE: SP_* */
 };
@@ -229,6 +229,9 @@ struct browser {
     char refresh_url[URL_MAX];  /* <meta http-equiv=refresh> */
     unsigned int refresh_at;
     /* where requests say they come from (Referer, Sec-Fetch-Site and -User, Origin) */
+    char csp[4096],next_csp[4096];
+    unsigned sandbox;
+    int http_resumed;
     int ref_policy;             /* the document's referrer policy, RP_*: Referrer-Policy, then <meta name=referrer> */
     int next_ref_policy;        /* ...the Referrer-Policy of the page being loaded */
     char nav_from[URL_MAX];     /* the next navigation: the document that asked for it ("": the user did) */
@@ -689,10 +692,12 @@ static void cache_clear(struct browser *b)
 /* ---- fetching ---- */
 
 static void helper_cancel(struct browser *b);
+static void helper_ready(void *ctx,int revents);
 
 static void fetch_stop(struct browser *b)
 {
     struct fetch *f = b->fetch;
+    if(f->paused && b->hp->from>=0){loop_watch(b->hp->from,helper_ready,b->lane);b->http_resumed=1;}
     if (!f->active)
         return;
     if (f->via)
@@ -912,6 +917,7 @@ static void helper_ready_selected(struct browser *b,int revents)
     struct helper *h = b->hp;
     struct fetch *f = b->fetch;
     (void)revents;
+    if(f->paused)return;
     int n = helper_pull(h);
     if (n < 0) {                        /* it has died: what was being asked will not come */
         int active = f->active && f->via;
@@ -1010,6 +1016,7 @@ static void helper_ready_selected(struct browser *b,int revents)
         }
         memmove(h->buf, h->buf + head + len, (size_t)h->len - head - len);
         h->len -= (int)(head + len);
+        if(f->paused)break;
     }
     if (f->active && f->via && f->kind == F_PAGE)
         paint(b);
@@ -1357,6 +1364,13 @@ static int start_via_helper(struct browser *b, int kind, const char *url, const 
 static int start_fetch(struct browser *b, int kind, const char *url, const char *post, int slot,
                        int redirects, int mode, int postlen, int credentials)
 {
+    if(kind==F_PAGE && b->parent && !web_csp_allows(b->parent->csp,b->parent->url,"frame-src",url,NULL))return -1;
+    if(kind!=F_PAGE) {
+        const char *directive=kind==F_CSS?"style-src-elem":kind==F_JS || kind==F_MODULE?"script-src-elem":
+            kind==F_FONT?"font-src":kind==F_MEDIA?"media-src":kind==F_XHR?"connect-src":"img-src";
+        const char *nonce=kind==F_JS && slot>=0 && slot<b->nscripts?node_attr(b->scripts[slot].n,"nonce"):NULL;
+        if(!web_csp_allows(b->csp,b->url,directive,url,nonce))return -1;
+    }
     fetch_stop(b);
     struct fetch *f = b->fetch;
     f->active = 1;
@@ -1857,6 +1871,7 @@ static struct browser *new_frame(struct browser *parent, struct node *el)
     init_loaders(f);
     f->parent = parent;
     f->frame_el = el;
+    f->sandbox=parent->sandbox|web_sandbox_flags(node_attr(el,"sandbox"));
     f->frame_depth = parent->frame_depth + 1;
     f->next_frame = parent->frames;
     parent->frames = f;
@@ -2645,6 +2660,7 @@ static struct browser *by_wid(int wid)
 static int js_open_tab(void *ctx, const char *url, int noopener)
 {
     struct browser *b = ctx;
+    if(b->sandbox&WEB_SB_POPUPS)return 0;
     snprintf(b->js_open, sizeof(b->js_open), "%s", url);
     b->js_open_wid = ++next_wid;
     b->js_open_noopener = noopener;
@@ -2683,7 +2699,7 @@ static int js_window_query(void *ctx, int wid, const char *what, struct node *no
         return n;
     }
     if (!strcmp(what, "href")) {
-        if (t != b && !web_same_origin(b->url, t->url))
+        if (t != b && ((b->sandbox|t->sandbox)&WEB_SB_ORIGIN || !web_same_origin(b->url, t->url)))
             return -1;
         snprintf(out, (size_t)size, "%s", t->url);
         return 1;
@@ -2718,7 +2734,8 @@ static void js_window_close(void *ctx, int wid)
 
 static void js_window_navigate(void *ctx, int wid, const char *url)
 {
-    struct browser *t = wid ? by_wid(wid) : ctx;
+    struct browser *from=ctx,*t = wid ? by_wid(wid) : ctx;
+    if(t!=from && (from->sandbox&WEB_SB_TOP))return;
     if (t && (!strncasecmp(url, "http:", 5) || !strncasecmp(url, "https:", 6) || !strncasecmp(url, "about:", 6)))
         snprintf(t->js_nav, sizeof(t->js_nav), "%s", url);
 }
@@ -3062,6 +3079,19 @@ static int js_cookie_set(void *ctx, const char *value)
 }
 
 /* A script's XMLHttpRequest: fetched like the page's other resources. */
+static void js_http_pause(void *ctx,int id,int pause)
+{
+    struct browser *b=ctx;
+    for(int k=0;k<FETCH_LANES;k++) {
+        struct loader *lane=&b->lanes[k];struct fetch *f=&lane->fetch;
+        if(f->active && f->via && f->kind==F_XHR && f->slot==id && f->paused!=pause) {
+            f->paused=pause;
+            if(pause)loop_unwatch(lane->hp.from);
+            else {loop_watch(lane->hp.from,helper_ready,lane);b->http_resumed=1;}
+        }
+    }
+}
+
 static void js_http_cancel(void *ctx,int id)
 {
     struct browser *b=ctx;struct loader *previous=b->lane;
@@ -3212,15 +3242,17 @@ static struct node *js_node_at(void *ctx, int x, int y);
 /* Start the page's scripts: make the engine and queue the external ones. */
 static void start_scripts(struct browser *b, const char *url)
 {
+    if(b->sandbox&WEB_SB_SCRIPTS)return;
     struct jshost h = {
         .ctx = b, .arena = &b->arena, .root = b->root, .url = b->url, .base = b->base, .referrer = b->referrer,
         .navigate = js_navigate, .history = js_history, .reload = js_reload, .alert = js_alert,
         .status = js_status, .changed = js_changed, .repaint = js_repaint, .scroll = js_scroll, .scroll_pos = js_scroll_pos,
         .viewport = js_viewport, .set_title = js_set_title, .load_script = js_load_script,
         .load_image = js_load_image, .node_box = js_node_box, .node_visual_box = js_node_visual_box, .node_local_point = js_node_local_point, .node_scroll = js_node_scroll,
-        .reveal = js_reveal, .flush = js_flush, .focus = js_focus, .http = js_http, .http_cancel=js_http_cancel,
+        .reveal = js_reveal, .flush = js_flush, .focus = js_focus, .http = js_http, .http_cancel=js_http_cancel,.http_pause=js_http_pause,
         .has_focus=js_has_focus, .clipboard_read=js_clipboard_read, .clipboard_write=js_clipboard_write,
         .cookie_get = js_cookie_get, .cookie_set = js_cookie_set, .ws_cookies=js_ws_cookies, .font_register=js_font_register, .font_status=js_font_status, .fetch_module = js_fetch_module,
+        .csp=b->csp,.sandbox=b->sandbox,
         .open_tab = js_open_tab, .window_query = js_window_query, .window_post = js_window_post,
         .window_close = js_window_close, .window_navigate = js_window_navigate, .module_done = js_module_done, .set_url = js_set_url, .submit = js_submit, .node_at = js_node_at,
         .media = js_media,
@@ -3474,9 +3506,11 @@ static void collect_sheets(struct browser *b)
 static void load_document(struct browser *b, const char *text, int len, const char *url,
                           const char *charset)
 {
+    if(b->parent && b->frame_el)b->sandbox=b->parent->sandbox|web_sandbox_flags(node_attr(b->frame_el,"sandbox"));
     free_page(b);
     snprintf(b->url, sizeof(b->url), "%s", url);
     snprintf(b->base, sizeof(b->base), "%s", url);
+    snprintf(b->csp,sizeof(b->csp),"%s",b->next_csp);b->next_csp[0]=0;
     b->ref_policy = b->next_ref_policy;          /* Referrer-Policy; <meta name=referrer> may change it */
     b->next_ref_policy = RP_DEFAULT;
     snprintf(b->referrer, sizeof(b->referrer), "%s", b->next_referrer);
@@ -3509,6 +3543,14 @@ static void load_document(struct browser *b, const char *text, int len, const ch
     free(converted);
     if (!b->root)
         return;
+    for(struct node *m=b->root;m;m=node_next(m,b->root)) {
+        const char *equiv=node_attr(m,"http-equiv"),*content=node_attr(m,"content");
+        if(m->tag==T_META && equiv && content && !strcasecmp(equiv,"content-security-policy")) {
+            size_t have=strlen(b->csp),n=strlen(content);
+            if(have+n+2<sizeof(b->csp)){if(have)b->csp[have++]='\n';memcpy(b->csp+have,content,n+1);}
+            else snprintf(b->csp,sizeof(b->csp),"default-src 'none'");
+        }
+    }
     html_declarative_shadows(&b->arena, b->root);
     init_controls(b->root);
     for (struct node *n = b->root; n; n = node_next(n, b->root))        /* autofocus: the first field that asks */
@@ -3529,8 +3571,10 @@ static void load_document(struct browser *b, const char *text, int len, const ch
         if (n->type != N_ELEMENT || in_noscript(n))
             continue;
         const char *v;
-        if (n->tag == T_BASE && (v = node_attr(n, "href")))
-            url_resolve(url, v, b->base, sizeof(b->base));
+        if (n->tag == T_BASE && (v = node_attr(n, "href"))) {
+            char base[URL_MAX];url_resolve(url,v,base,sizeof(base));
+            if(web_csp_allows(b->csp,url,"base-uri",base,NULL))snprintf(b->base,sizeof(b->base),"%s",base);
+        }
         else if (n->tag == T_META && (v = node_attr(n, "name")) && !strcasecmp(v, "referrer") &&
                  (v = node_attr(n, "content")) && web_referrer_policy(v) != RP_DEFAULT)
             b->ref_policy = web_referrer_policy(v);
@@ -4415,6 +4459,7 @@ static void fetch_complete(struct browser *b)
                 free(html);
             }
         } else {
+            web_csp_headers(ok && !is_file?done.buf:NULL,b->next_csp,sizeof(b->next_csp));
             char policy[200];
             b->next_ref_policy = ok && !is_file && r.body > done.buf &&
                                  web_header_value(done.buf, "Referrer-Policy", policy, sizeof(policy)) == 1
@@ -4764,13 +4809,16 @@ static struct browser *target_of(struct browser *b, const char *target)
     if (!target || !*target || !strcasecmp(target, "_self"))
         return b;
     if (!strcasecmp(target, "_parent"))
-        return b->parent ? b->parent : b;
+        return b->sandbox&WEB_SB_TOP?NULL:b->parent?b->parent:b;
     if (!strcasecmp(target, "_blank")) {
+        if(b->sandbox&WEB_SB_POPUPS)return NULL;
         struct browser *tab = tab_new(top_of(b), NULL, 1, NULL, 1);
+        if(tab && (b->sandbox&WEB_SB_ESCAPE))tab->sandbox=b->sandbox;
         return tab;
     }
     if (!strcasecmp(target, "_top"))
-        return top_of(b);
+        return b->sandbox&WEB_SB_TOP?NULL:top_of(b);
+    if(b->sandbox&WEB_SB_TOP)return NULL;
     struct browser *f = named_frame(top_of(b), target);
     return f ? f : top_of(b);
 }
@@ -5026,6 +5074,7 @@ static int build_multipart(struct browser *tb, struct node *form, struct node *s
 
 static void submit(struct browser *b, struct node *form, struct node *submitter)
 {
+    if(b->sandbox&WEB_SB_FORMS)return;
     if (b->js && jsdom_dispatch(b->js, form, "submit"))
         return;                         /* a handler said no */
     if (b->js_nav[0])
@@ -5034,6 +5083,7 @@ static void submit(struct browser *b, struct node *form, struct node *submitter)
         return;                         /* method=dialog: it closes its dialog instead */
     char q[URL_MAX], target[URL_MAX];
     int post = form_request(b, form, submitter, target, sizeof(target), q, sizeof(q));
+    if(!web_csp_allows(b->csp,b->url,"form-action",target,NULL))return;
     struct browser *tb = target_of(b, node_attr(form, "target"));
     if (!tb)
         return;
@@ -5052,12 +5102,14 @@ static void submit(struct browser *b, struct node *form, struct node *submitter)
 static void js_submit(void *ctx, struct node *form, int fire)
 {
     struct browser *b = ctx;
+    if(b->sandbox&WEB_SB_FORMS)return;
     if (fire && b->js && jsdom_dispatch(b->js, form, "submit"))
         return;
     if (b->js_nav[0] || jsdom_dialog_submit(b->js, form, NULL))
         return;
     char q[URL_MAX];
     int post = form_request(b, form, NULL, b->js_nav, sizeof(b->js_nav), q, sizeof(q));
+    if(!web_csp_allows(b->csp,b->url,"form-action",b->js_nav,NULL)){b->js_nav[0]=0;return;}
     free(b->js_post);
     b->js_post = post ? strdup(q) : NULL;
     b->js_nav_replace = 0;
@@ -7983,6 +8035,7 @@ static struct browser *tab_new(struct browser *from, const char *url, int activa
         return NULL;
     }
     init_loaders(b);
+    if(!user && referrer && (referrer->sandbox&WEB_SB_ESCAPE))b->sandbox=referrer->sandbox;
     b->win = from->win;
     b->tabs = group;
     b->zoom = zoom_of(from);
@@ -8193,6 +8246,10 @@ void browser_poll(void)
     for (struct browser *b = browsers; b; b = b->next) {
         if (b->frame_dead)
             continue;
+        if(b->http_resumed) {
+            b->http_resumed=0;
+            for(int k=0;k<FETCH_LANES;k++)if(!b->lanes[k].fetch.paused && b->lanes[k].hp.len)helper_ready(&b->lanes[k],0);
+        }
         int animated = 0;
         for (struct cached *c = b->cache; c; c = c->next)
             if (c->img) animated |= image_animate(c->img, now_ms());
@@ -8233,6 +8290,7 @@ void browser_poll(void)
                 t->wid = b->js_open_wid;
                 t->opener_wid = b->js_open_noopener ? 0 : wid_of(b);
                 t->script_opened = 1;
+                if(b->sandbox&WEB_SB_ESCAPE)t->sandbox=b->sandbox;
             }
             return;                     /* the list may have changed */
         }
@@ -8271,6 +8329,7 @@ int browser_timeout(void)
 {
     int best = -1;
     for (struct browser *b = browsers; b; b = b->next) {
+        if(b->http_resumed)return 0;
         if((b->root && (b->discover_changes || b->need_style || b->need_layout)) ||
            (b->qhead<b->nqueue&&free_loader(b)))return 0;
         if (b->frame_dead || b->frame_nav[0] || b->js_open[0] || b->js_nav[0] || b->js_history || b->js_reload ||
