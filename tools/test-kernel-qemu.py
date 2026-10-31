@@ -3,11 +3,13 @@
 import argparse
 import array
 import math
+import os
 import pathlib
 import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 import wave
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -20,6 +22,8 @@ parser.add_argument("--success-marker", default="KERNEL REGRESSIONS PASSED")
 parser.add_argument("--add", action="append", default=[], metavar="HOST:GUEST", help="a host file to add to the initrd at that guest path")
 parser.add_argument("--drop", action="append", default=[], metavar="PREFIX", help="leave initrd members under this path out (the toolchain, for tests that do not need it in memory)")
 parser.add_argument("--timeout", type=int, default=45)
+parser.add_argument("--kvm", action="store_true", help="run the guest under KVM (same CPU model) when /dev/kvm can be opened, else under TCG as usual")
+parser.add_argument("--disk", metavar="IMAGE", help="a second IDE disk (/dev/hdb), used in place, not copied")
 parser.add_argument("--fsck-ext2", action="store_true", help="the guest leaves an ext2 volume on the scratch disk: have e2fsck check it")
 parser.add_argument("--sound", nargs="?", const="hda", choices=("hda", "sb16", "usb"), help="give the guest a sound card (HD Audio by default), record what it plays, and check that the mixer test's two tones play at once (skipped if QEMU cannot record to a WAV file)")
 args = parser.parse_args()
@@ -90,10 +94,19 @@ with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
     scratch = temp / "disk.img"
     with scratch.open("wb") as disk:
         disk.truncate(32 * 1024 * 1024)
-    command = [qemu, "-cpu", "core2duo,-lm", "-smp", str(args.cpus),
+    accel = []
+    if args.kvm:
+        if os.access("/dev/kvm", os.R_OK | os.W_OK):
+            accel = ["-enable-kvm"]
+            print("host: running the guest under KVM")
+        else:
+            print("host: /dev/kvm cannot be opened, so the guest runs under TCG")
+    command = [qemu, *accel, "-cpu", "core2duo,-lm", "-smp", str(args.cpus),
                "-kernel", kernel, "-initrd", str(overlay), "-append", "automount=off " + args.append,
                "-m", f"{args.memory}M", "-display", "none", "-monitor", "none", "-serial", "stdio",
                "-no-reboot", "-nic", "none", "-drive", f"file={scratch},format=raw,if=ide,index=0"]
+    if args.disk:
+        command += ["-drive", f"file={args.disk},format=raw,if=ide,index=1"]
     recording = temp / "sound.wav"
     if args.sound and not can_record(qemu):
         print("host: QEMU has no wav audiodev, so the sound check is skipped")
@@ -104,14 +117,23 @@ with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
             "sb16": ["-device", "sb16,audiodev=snd"],
             "usb": ["-device", "qemu-xhci", "-device", "usb-audio,audiodev=snd"],
         }[args.sound]
-    try:
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=args.timeout)
-        output = result.stdout.decode(errors="replace")
-    except subprocess.TimeoutExpired as error:
-        print((error.stdout or b"").decode(errors="replace"))
+    # The guest's console is shown as it comes, since a long run (a native
+    # build) can take hours.
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    timer = threading.Timer(args.timeout, process.kill)
+    timer.start()
+    lines = []
+    for line in process.stdout:
+        text = line.decode(errors="replace")
+        lines.append(text)
+        print(text, end="", flush=True)
+    returncode = process.wait()
+    timed_out = not timer.is_alive()
+    timer.cancel()
+    output = "".join(lines)
+    if timed_out:
         raise SystemExit("QEMU kernel regressions timed out")
-    print(output)
-    if result.returncode or args.success_marker not in output:
+    if returncode or args.success_marker not in output:
         raise SystemExit("QEMU kernel regressions failed")
     if f"guest: {expected_cpus} CPUs online" not in output:
         raise SystemExit(f"QEMU expected {expected_cpus} active CPUs")

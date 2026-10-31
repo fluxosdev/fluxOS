@@ -58,6 +58,8 @@ while [ $# -gt 0 ]; do
 done
 
 prefix=$(mkdir -p "$prefix" && cd "$prefix" && pwd)
+# Absolute, as the native build installs from its build directory (rm -rf'd there first).
+case "$dest" in /*) ;; *) dest="$PWD/$dest" ;; esac
 sysroot=$(mkdir -p "$sysroot" && cd "$sysroot" && pwd)
 mkdir -p "$cache" "$work"
 cache=$(cd "$cache" && pwd)
@@ -186,7 +188,6 @@ native_make() {
     PATH="$prefix/bin:$PATH" make -j"$jobs" MAKEINFO=true all-target-libgcc >build-libgcc.log 2>&1 || { tail -40 build-libgcc.log; exit 1; }
     rm -rf "$dest"
     mkdir -p "$dest"
-    dest=$(cd "$dest" && pwd)
     PATH="$prefix/bin:$PATH" make DESTDIR="$dest" MAKEINFO=true install-gcc install-target-libgcc >install.log 2>&1 || \
         { tail -20 install.log; exit 1; }
     # Only what runs on fluxOS: no manuals, no .la files, no build-machine

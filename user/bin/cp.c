@@ -211,8 +211,12 @@ int main(int argc, char **argv)
     int status = 0;
     for (; i < argc - 1; i++) {
         char target[PATH_MAX];
-        if (dest_is_dir)
-            snprintf(target, sizeof(target), "%s/%s", dest, base_name(argv[i]));
+        const char *name = base_name(argv[i]);
+        /* "cp -r dir/. dest" copies what is in dir into dest itself */
+        if (dest_is_dir && (!strcmp(name, ".") || !strcmp(name, "..")))
+            snprintf(target, sizeof(target), "%s", dest);
+        else if (dest_is_dir)
+            snprintf(target, sizeof(target), "%s/%s", dest, name);
         else
             snprintf(target, sizeof(target), "%s", dest);
         status |= copy_path(argv[i], target, 1);

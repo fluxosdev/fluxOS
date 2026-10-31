@@ -1,10 +1,11 @@
 # fluxOS self-hosting roadmap
 
 *Written 2026-10-28, against commit 8cdd993 plus the toolchain and libc
-work described in phases 1 and 2. Phases 0 to 6 are done (phase 3 and 4
+work described in phases 1 and 2. Phases 0 to 6.5 are done (phase 3 and 4
 on 2026-10-29: the Makefile's tools, `fsh` as `/bin/sh`, and GCC running
 on fluxOS; phases 5 and 6 on 2026-10-30: ext2 with links, and the ISO made
-natively); phases 6.5 and 7 are a plan.*
+natively; phase 6.5 on 2026-10-31: the first native build); phase 7 is a
+plan.*
 
 "Self-hosting" means that fluxOS, running on its own kernel, can turn a
 checkout of this repository into a bootable `fluxOS.iso` and an installed
@@ -563,31 +564,63 @@ Size: `mkiso` 800 lines, `mbcheck` 150, the tests 200. As expected, low risk:
 the only surprises were the boot information table's checksum (taken after
 GRUB's address is patched in) and the ISO's embedded-UUID config.
 
-## Phase 6.5: the first native build
+## Phase 6.5: the first native build (done)
 
 *Goal: stage 1, by hand. `make`, `make check` and `make iso` of the
 whole tree run to the end on fluxOS, and the ISO they make boots.
 Measured by the native build's file list matching the Linux build's.*
 
-- [ ] A source disk: `make srcdisk` makes an ext2 image with the checkout
-      (or `wget https://github.com/.../archive/refs/heads/main.zip &&
-      unzip` on the machine).
-- [ ] KVM for the long runs: `tools/test-kernel-qemu.py` runs the guest
-      under TCG (`-cpu core2duo,-lm`, no `-enable-kvm`), which makes a full
-      build take hours; a `--kvm` option, with the same CPU model, for the
-      build tests, falling back to TCG where `/dev/kvm` is missing.
-- [ ] `make` of the tree in a fluxOS terminal with the native tools,
-      fixing what it turns up: the Makefile's `$(shell ...)` probes under
-      `fsh`, `cc1`'s memory on FreeType, mbedtls and the browser, the
-      process limit under `make -j`, and ext2 and the sector cache under
-      hours of small writes. This is the first sustained load the kernel
-      has carried.
-- [ ] `make check` and `make iso` natively, then the native ISO booted
+Done 2026-10-31: `make test-native-build-qemu` boots the Linux-built
+kernel and system (with the native GCC) under KVM with the source disk as
+`/dev/hdb`, and `tests/build-guest.c`, as init, runs `make -j2`, `make
+check`, `make -q iso` (which must find nothing to do) and `make iso` in
+`/src`. Then, on the host: e2fsck finds the disk clean, the native build's
+ISO tree (69 names), `system.tar` (1516) and `setup.tar` (220) hold the
+same names as the Linux build's, the native `fluxOS.iso` boots as a CD,
+and `tools/test-install-qemu.py` installs from it onto a blank disk and
+starts that disk. The whole build takes 4 minutes under KVM on two
+virtual CPUs (an i5-4590T host); TCG has not been timed. The guest runs
+from the initrd (the system in memory, `TMPDIR` on the source disk), not
+from an installed disk: that is phase 7's.
+
+- [x] A source disk: `make srcdisk` makes `build/srcdisk.img`, a 4 GiB
+      ext2 image of the checkout (what git tracks, as the working tree has
+      it, and new files it does not ignore) with the prebuilt ports and
+      native GCC in `build/`, so that the system the native build makes
+      carries them as the Linux build's does. The host's `mke2fs -d`
+      makes it; mounted with `mount -t ext2 /dev/hdb /src`. (`wget` of
+      GitHub's zip and `unzip` on the machine remains the other way.)
+- [x] KVM for the long runs: `tools/test-kernel-qemu.py --kvm` (same CPU
+      model, TCG where `/dev/kvm` cannot be opened), `--disk IMAGE` for a
+      second disk, and the guest's console shown as it comes rather than
+      at the end.
+- [x] `make` of the tree on fluxOS. What it turned up was all in the tree
+      and the tools, not the kernel: `cp -r rootfs/. build/rootfs/` (a
+      source ending in `/.` copies its contents, as GNU `cp` does);
+      `stb_vorbis.c` includes `<alloca.h>` only where `__linux__` is
+      defined, which the Linux build had and the native gcc has not (the
+      Linux compiler's `__linux__`, `__linux`, `linux` and `__gnu_linux__`
+      are now undefined in `CFLAGS_COMMON`, so both compile the tree for
+      fluxOS alike, and `codecs.c` includes `<alloca.h>` itself); GRUB's
+      `.img` files in `firmware/grub` were caught by `.gitignore`'s
+      `*.img` and never committed, so a fresh checkout could not make the
+      ISO (now excepted, like `firmware/**/*.bin`); and `build.sh --native
+      --dest` with a relative path installed under GCC's build directory.
+      What was feared did not happen: the `$(shell ...)` probes run under
+      `fsh`, `cc1` has room on FreeType, mbedtls and the browser in a
+      2 GiB guest, `make -j2` stays within the process limit, and e2fsck
+      finds the volume clean after the build. GNU make's jobserver wants
+      `mkfifo`, which fluxOS lacks; it falls back to a pipe.
+- [x] `make check` and `make iso` natively, then the native ISO booted
       in QEMU and `fluxinstall` from it to a second disk.
 
-Size: a Makefile rule and a test-script option; the rest is fixes.
-Risk: the highest left on the roadmap, because no earlier phase ran
-anything this long.
+Size: a Makefile rule, two test-script options, the guest and its host
+script (300 lines); the fixes were four lines. The highest risk left on
+the roadmap turned out to be the least work: phases 2 to 6 had already
+run each piece on fluxOS. Stage 2's byte-for-byte comparison should
+compare two native builds: the native `system.tar` holds the same members
+as the Linux build's but is not the same size, since fluxOS's `tar` orders
+and pads differently from GNU tar.
 
 ## Phase 7: the bootstrap
 
@@ -630,9 +663,9 @@ libc list into an ordered one.
 Suggested order: 4 (the Canadian cross: binutils already links for
 fluxOS), 3 (GNU make already builds), 6, 5, 6.5, 7; and running the
 phase 2 tests on fluxOS before relying on any of it. (Phases 3 and 4 were
-done together on 2026-10-29, 5 and 6 on 2026-10-30; what remains is 6.5,
-the first native build, and 7, which automates it and adds stage 2;
-`make test-gcc-qemu` passed on 2026-10-29.)
+done together on 2026-10-29, 5 and 6 on 2026-10-30, 6.5 (the first native
+build) on 2026-10-31; what remains is 7, which automates it and adds stage
+2; `make test-gcc-qemu` passed on 2026-10-29.)
 
 ## Later, deliberately
 

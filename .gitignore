@@ -10,9 +10,10 @@
 !/firmware/**/*.bin
 *.kernel
 
-# Disk images
+# Disk images (GRUB's boot images in firmware/grub are sources)
 *.iso
 *.img
+!/firmware/**/*.img
 
 # Emulator logs and dumps
 *.log

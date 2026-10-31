@@ -68,8 +68,11 @@ MKFS_FAT ?= $(shell command -v mkfs.fat 2>/dev/null || ls /usr/sbin/mkfs.fat /sb
 GCC_INC := $(shell $(CC) -print-file-name=include)
 
 # fluxOS needs a Pentium 4: everything is built for its instruction set,
-# SSE2 included (kernel/core/cpu.c stops the boot on anything older).
+# SSE2 included (kernel/core/cpu.c stops the boot on anything older). A Linux
+# compiler's own macros are taken away, so that the code is compiled for fluxOS
+# as the native gcc compiles it (which defines none of them).
 CFLAGS_COMMON := -m32 -march=pentium4 -std=gnu11 -O2 -g \
+	-U__linux__ -U__linux -Ulinux -U__gnu_linux__ \
 	-ffreestanding -fno-pie -fno-pic -fno-stack-protector -fno-builtin \
 	-nostdinc -isystem $(GCC_INC) \
 	-fno-asynchronous-unwind-tables -fno-strict-aliasing \
@@ -423,6 +426,26 @@ else
 	else echo "$@: blank, run 'mkfs.fat /dev/hda' inside fluxOS"; fi
 endif
 
+# The source disk for a native build (phase 6.5 of self-hosting-roadmap.md): an ext2
+# image of the checkout (what git tracks, as the working tree has it, and new files
+# it does not ignore) with the prebuilt ports and native GCC in build/, so that the
+# system the native build makes carries them as this one does. Attached as a second
+# disk, it is mounted with "mount -t ext2 /dev/hdb /src", and "cd /src && make"
+# builds fluxOS there. Made with the host's mke2fs -d (e2fsprogs).
+SRCDISK := $(BUILD)/srcdisk.img
+SRCDISK_MB ?= 4096
+.PHONY: srcdisk
+srcdisk:
+	rm -rf $(BUILD)/srcdisk $(SRCDISK)
+	mkdir -p $(BUILD)/srcdisk/build
+	git ls-files -z -c -o --exclude-standard | tar --null --ignore-failed-read -T - -cf - | tar -C $(BUILD)/srcdisk -xf -
+	$(if $(wildcard $(PORTS_ROOT)),mkdir -p $(BUILD)/srcdisk/$(dir $(PORTS_ROOT)) && cp -a $(PORTS_ROOT) $(BUILD)/srcdisk/$(PORTS_ROOT))
+	$(if $(NATIVE_FILES),mkdir -p $(BUILD)/srcdisk/$(dir $(NATIVE_ROOT)) && cp -a $(NATIVE_ROOT) $(BUILD)/srcdisk/$(NATIVE_ROOT))
+	truncate -s $(SRCDISK_MB)M $(SRCDISK)
+	mke2fs -q -F -t ext2 -L FLUXSRC -E root_owner=0:0 -d $(BUILD)/srcdisk $(SRCDISK)
+	rm -rf $(BUILD)/srcdisk
+	@echo "$(SRCDISK): $(SRCDISK_MB) MiB ext2 with the source tree$(if $(NATIVE_FILES), and the native GCC)"
+
 floppy: $(FLOPPY)
 
 # A blank floppy; without a host mkfs.fat, format it inside fluxOS with
@@ -679,6 +702,28 @@ $(BUILD)/tests/install-guest.o: tests/install-guest.c
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
 $(BUILD)/tests/install-guest: $(BUILD)/tests/install-guest.o $(CRT0) $(LIBC) user/user.ld
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
+
+# The first native build: make, make check and make iso on fluxOS, from the source
+# disk (a fresh "make srcdisk"), under KVM when /dev/kvm can be opened. Then the
+# native build's files are compared by name with this build's, and its ISO is booted
+# and installed from. Needs "make toolchain-native" and "make ports" first; hours
+# under TCG.
+NATIVE_BUILD_CPUS ?= $(KERNEL_TEST_CPUS)
+NATIVE_BUILD_MEMORY ?= 2048
+NATIVE_BUILD_TIMEOUT ?= 21600
+.PHONY: test-native-build-qemu
+test-native-build-qemu: $(TEXT_KERNEL) $(SYSTEM) $(ISO) $(BUILD)/tests/build-guest $(BUILD)/tests/install-guest $(MKISO) \
+		$(NATIVE_ROOT)/usr/bin/gcc $(PORTS_ROOT)/usr/bin/make srcdisk
+	python3 tools/test-native-build-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/build-guest $(SRCDISK) \
+		$(BUILD)/iso $(MKISO) firmware/grub $(BUILD)/tests/install-guest --kvm --cpus $(NATIVE_BUILD_CPUS) \
+		--memory $(NATIVE_BUILD_MEMORY) --timeout $(NATIVE_BUILD_TIMEOUT)
+
+$(BUILD)/tests/build-guest.o: tests/build-guest.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(BUILD)/tests/build-guest: $(BUILD)/tests/build-guest.o $(CRT0) $(LIBC) user/user.ld
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 
 KERNEL_TEST_MEMORY ?= 256

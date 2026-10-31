@@ -23,6 +23,7 @@
 #include "minimp3.h"                    /* (its implementation is in mp3dec.c: the two share names) */
 #define STB_VORBIS_NO_STDIO
 #define STB_VORBIS_NO_PUSHDATA_API
+#include <alloca.h>                     /* stb_vorbis includes it only on the systems it knows */
 #include "stb_vorbis.c"
 #pragma GCC diagnostic pop
 
