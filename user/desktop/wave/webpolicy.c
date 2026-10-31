@@ -530,9 +530,9 @@ int web_csp_allows(const char *policies,const char *document,const char *directi
     }
     return 1;
 }
-void web_csp_headers(const char *headers,char *out,size_t size)
+char *web_csp_headers(const char *headers)
 {
-    size_t used=0;if(!size)return;out[0]=0;
+    char *out=NULL;size_t used=0;
     for(const char *p=headers?headers:"";*p;) {
         const char *end=strchr(p,'\n');if(!end)end=p+strlen(p);
         if(end==p || (end==p+1 && *p=='\r'))break;
@@ -541,12 +541,15 @@ void web_csp_headers(const char *headers,char *out,size_t size)
             const char *v=p+nl;while(v<end && isspace((unsigned char)*v))v++;
             const char *e=end;while(e>v && isspace((unsigned char)e[-1]))e--;
             size_t n=(size_t)(e-v);
-            if(used+n+2>size){snprintf(out,size,"default-src 'none'");return;}
+            char *grown=realloc(out,used+n+2);
+            if(!grown){free(out);return strdup("default-src 'none'");}
+            out=grown;
             if(used)out[used++]='\n';
             memcpy(out+used,v,n);used+=n;out[used]=0;
         }
         p=*end?end+1:end;
     }
+    return out;
 }
 unsigned web_sandbox_flags(const char *attribute)
 {

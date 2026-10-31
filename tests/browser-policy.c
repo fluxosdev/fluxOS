@@ -31,8 +31,20 @@ int main(void)
     CHECK(!(web_sandbox_flags("allow-scripts allow-same-origin")&(WEB_SB_SCRIPTS|WEB_SB_ORIGIN)));
     CHECK(web_sandbox_flags("allow-scripts-not")&WEB_SB_SCRIPTS);
     char out[4096];
-    web_csp_headers("Content-Security-Policy: img-src *\r\nContent-Security-Policy: img-src 'none'\r\n\r\n",out,sizeof(out));
-    CHECK(!strcmp(out,"img-src *\nimg-src 'none'"));
+    char *csp=web_csp_headers("Content-Security-Policy: img-src *\r\nContent-Security-Policy: img-src 'none'\r\n\r\n");
+    CHECK(csp && !strcmp(csp,"img-src *\nimg-src 'none'"));
+    free(csp);
+    CHECK(!web_csp_headers("Content-Type: text/html\r\n\r\n"));
+    {   /* a long policy (Wikipedia's is ~4.5KB) is kept whole, not replaced with default-src 'none' */
+        static char headers[12000];
+        int n=snprintf(headers,sizeof(headers),"Content-Security-Policy: default-src 'self'");
+        while(n<9000)n+=snprintf(headers+n,sizeof(headers)-(size_t)n," *.host%d.example",n);
+        snprintf(headers+n,sizeof(headers)-(size_t)n," upload.example.org\r\n\r\n");
+        csp=web_csp_headers(headers);
+        CHECK(csp && web_csp_allows(csp,"https://a.test/page","img-src","https://upload.example.org/x.png",NULL));
+        CHECK(csp && !web_csp_allows(csp,"https://a.test/page","img-src","https://evil.test/x.png",NULL));
+        free(csp);
+    }
     CHECK(web_same_origin("HTTPS://EXAMPLE.COM:443/a", "https://example.com/b"));
     CHECK(!web_same_origin("https://example.com", "http://example.com"));
     CHECK(!web_same_origin("https://example.com:444", "https://example.com"));

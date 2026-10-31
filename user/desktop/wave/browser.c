@@ -229,7 +229,7 @@ struct browser {
     char refresh_url[URL_MAX];  /* <meta http-equiv=refresh> */
     unsigned int refresh_at;
     /* where requests say they come from (Referer, Sec-Fetch-Site and -User, Origin) */
-    char csp[4096],next_csp[4096];
+    char *csp,*next_csp;        /* enforced Content-Security-Policy, newline-separated (NULL: none) */
     unsigned sandbox;
     int http_resumed;
     int ref_policy;             /* the document's referrer policy, RP_*: Referrer-Policy, then <meta name=referrer> */
@@ -3510,7 +3510,7 @@ static void load_document(struct browser *b, const char *text, int len, const ch
     free_page(b);
     snprintf(b->url, sizeof(b->url), "%s", url);
     snprintf(b->base, sizeof(b->base), "%s", url);
-    snprintf(b->csp,sizeof(b->csp),"%s",b->next_csp);b->next_csp[0]=0;
+    free(b->csp);b->csp=b->next_csp;b->next_csp=NULL;
     b->ref_policy = b->next_ref_policy;          /* Referrer-Policy; <meta name=referrer> may change it */
     b->next_ref_policy = RP_DEFAULT;
     snprintf(b->referrer, sizeof(b->referrer), "%s", b->next_referrer);
@@ -3546,9 +3546,12 @@ static void load_document(struct browser *b, const char *text, int len, const ch
     for(struct node *m=b->root;m;m=node_next(m,b->root)) {
         const char *equiv=node_attr(m,"http-equiv"),*content=node_attr(m,"content");
         if(m->tag==T_META && equiv && content && !strcasecmp(equiv,"content-security-policy")) {
-            size_t have=strlen(b->csp),n=strlen(content);
-            if(have+n+2<sizeof(b->csp)){if(have)b->csp[have++]='\n';memcpy(b->csp+have,content,n+1);}
-            else snprintf(b->csp,sizeof(b->csp),"default-src 'none'");
+            size_t have=b->csp?strlen(b->csp):0,n=strlen(content);
+            char *grown=realloc(b->csp,have+n+2);
+            if(!grown){free(b->csp);b->csp=strdup("default-src 'none'");continue;}
+            b->csp=grown;
+            if(have)b->csp[have++]='\n';
+            memcpy(b->csp+have,content,n+1);
         }
     }
     html_declarative_shadows(&b->arena, b->root);
@@ -4459,7 +4462,7 @@ static void fetch_complete(struct browser *b)
                 free(html);
             }
         } else {
-            web_csp_headers(ok && !is_file?done.buf:NULL,b->next_csp,sizeof(b->next_csp));
+            free(b->next_csp);b->next_csp=web_csp_headers(ok && !is_file?done.buf:NULL);
             char policy[200];
             b->next_ref_policy = ok && !is_file && r.body > done.buf &&
                                  web_header_value(done.buf, "Referrer-Policy", policy, sizeof(policy)) == 1
@@ -7849,6 +7852,8 @@ static void destroy_browser(struct browser *b)
     surface_free(&b->transformed_frame);
     find_clear(b);
     free(b->mp_body);
+    free(b->csp);
+    free(b->next_csp);
     for (int i = 0; i < b->nhist; i++)
         free(b->hist[i].url);
     free(b);

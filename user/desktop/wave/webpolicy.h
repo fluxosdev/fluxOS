@@ -24,7 +24,8 @@ const char *web_fetch_site(const char *initiator, const char *to);
 /* Enforced source-list subset: policies are intersected across newline-separated headers/metas.
  * target NULL denotes inline code; the special directive "eval" checks unsafe-eval. */
 int web_csp_allows(const char *policies,const char *document,const char *directive,const char *target,const char *nonce);
-void web_csp_headers(const char *headers,char *out,size_t size);
+/* The Content-Security-Policy headers, newline-separated, in a malloc'd string (NULL: none). */
+char *web_csp_headers(const char *headers);
 enum { WEB_SB_SCRIPTS=1,WEB_SB_FORMS=2,WEB_SB_ORIGIN=4,WEB_SB_POPUPS=8,WEB_SB_TOP=16,WEB_SB_ESCAPE=32 };
 unsigned web_sandbox_flags(const char *attribute);
 
