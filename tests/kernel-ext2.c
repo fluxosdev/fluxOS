@@ -70,6 +70,20 @@ int bcache_write(struct blockdev *dev, uint32_t lba, const void *in)
 int blk_sync(struct blockdev *dev) { (void)dev; return 0; }
 void blk_invalidate(struct blockdev *dev) { (void)dev; }
 void blk_discard(struct blockdev *dev) { (void)dev; }
+/* A drive that loses what trimmed sectors held: they are filled with junk. */
+static int can_trim;
+static uint32_t trim_calls;
+int blk_can_trim(struct blockdev *dev) { (void)dev; return can_trim; }
+void blk_trim_add(struct blk_trimmer *t, uint32_t lba, uint32_t count)
+{
+    CHECK(mutex_owner == current);
+    if (!count) return;
+    CHECK(lba < disk_sectors && count <= disk_sectors - lba);
+    memset(disk + (size_t)lba * 512, 0xA5, (size_t)count * 512);
+    t->sectors += count;
+    trim_calls++;
+}
+int blk_trim_end(struct blk_trimmer *t) { return t->err; }
 /* The other filesystems mount_at probes first: neither is on these images. */
 static int not_this(struct fs *fs) { (void)fs; return -EINVAL; }
 const struct fs_ops fat32_ops = { .name = "fat32", .mount = not_this };
@@ -656,6 +670,60 @@ static void crafted(void)
     printf("kernel-ext2: crafted volumes: long names, damaged directories, fast links with xattrs\n");
 }
 
+/* fstrim: every free block and nothing else. */
+static void trimming(uint32_t bs)
+{
+    sh("mke2fs -q -F -t ext2 -b %u %s %uM >/dev/null 2>&1", bs, img, DISK_MB);
+    load_image();
+    CHECK(mount_image() == 0);
+    uint8_t *kept = pattern(300000, 7), *gone = pattern(500000, 8);
+    put("/mnt/kept.bin", kept, 300000, 0);
+    put("/mnt/gone.bin", gone, 500000, 0);
+    CHECK(create("/mnt/d", VN_DIR, NULL) == 0);
+    char path[64];
+    for (int i = 0; i < 64; i++) {
+        snprintf(path, sizeof(path), "/mnt/d/f%02d", i);
+        put(path, gone, 3000 + 1000 * (uint32_t)i, 0);
+    }
+    CHECK(LOCKED(vfs_unlink("/mnt/gone.bin", NULL)) == 0);
+    for (int i = 0; i < 64; i += 2) {
+        snprintf(path, sizeof(path), "/mnt/d/f%02d", i);
+        CHECK(LOCKED(vfs_unlink(path, NULL)) == 0);
+    }
+
+    struct vnode *vn = look("/mnt/d", 1);
+    uint64_t bytes = 1;
+    can_trim = 0;
+    CHECK(LOCKED(vfs_trim(vn, &bytes)) == -EOPNOTSUPP && bytes == 0);
+    can_trim = 1;
+    trim_calls = 0;
+    CHECK(LOCKED(vfs_trim(vn, &bytes)) == 0);
+    struct ext2_fs *e = mounted_fs->priv;
+    CHECK(bytes == (uint64_t)e->free_blocks * bs && trim_calls > 1);
+    mounted_fs->readonly = 1;
+    CHECK(LOCKED(vfs_trim(vn, &bytes)) == -EROFS);
+    mounted_fs->readonly = 0;
+
+    same("/mnt/kept.bin", kept, 300000, 0);
+    for (int i = 1; i < 64; i += 2) {
+        snprintf(path, sizeof(path), "/mnt/d/f%02d", i);
+        same(path, gone, 3000 + 1000 * (uint32_t)i, 0);
+    }
+    unmount_image();
+    save_image();
+    fsck_clean("trimming");
+    load_image();
+    CHECK(mount_image() == 0);
+    same("/mnt/kept.bin", kept, 300000, 0);
+    same("/mnt/d/f63", gone, 3000 + 1000 * 63, 0);
+    unmount_image();
+    can_trim = 0;
+    free(kept);
+    free(gone);
+    printf("kernel-ext2: fstrim on %u-byte blocks: %u runs, every free block and nothing else\n",
+           bs, trim_calls);
+}
+
 int main(void)
 {
     if (!have_e2fsprogs()) {
@@ -674,6 +742,8 @@ int main(void)
     stress();
     other_kinds();
     crafted();
+    trimming(1024);
+    trimming(4096);
     sh("rm -rf %s", workdir);
     printf("kernel ext2: files, directories, symbolic and hard links, renames and truncation passed\n");
     return 0;

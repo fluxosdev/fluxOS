@@ -76,6 +76,19 @@ int blk_sync(struct blockdev *dev)
 }
 void blk_invalidate(struct blockdev *dev) { (void)dev; CHECK(synced); }
 void blk_discard(struct blockdev *dev) { (void)dev; }
+static int can_trim;
+static uint8_t trimmed[64];
+int blk_can_trim(struct blockdev *dev) { (void)dev; return can_trim; }
+void blk_trim_add(struct blk_trimmer *t, uint32_t lba, uint32_t count)
+{
+    CHECK(synced);                      /* the FAT on disk says they are free */
+    for (uint32_t i = 0; i < count; i++) {
+        CHECK(lba + i < 64 && !trimmed[lba + i]);
+        trimmed[lba + i] = 1;
+    }
+    t->sectors += count;
+}
+int blk_trim_end(struct blk_trimmer *t) { return t->err; }
 
 static void setup(void)
 {
@@ -386,10 +399,50 @@ static void one_second_times(void)
     finish();
 }
 
+/* fstrim: the free clusters, not those of an unlinked file still open. */
+static void trimming(void)
+{
+    setup();
+    struct fat_fs *f = mounted_fs->priv;
+    struct vnode *open = create_file("OPEN.TXT", "still open");
+    create_file("KEEP.TXT", "kept");
+    char big[1500];
+    memset(big, 'x', sizeof(big));
+    big[sizeof(big) - 1] = 0;
+    create_file("GONE.TXT", big);
+    vfs_ref(open);
+    CHECK(vfs_unlink("/mnt/OPEN.TXT", NULL) == 0);
+    CHECK(vfs_unlink("/mnt/GONE.TXT", NULL) == 0);
+    uint64_t bytes = 1;
+    CHECK(vfs_trim(mounted_fs->root, &bytes) == -EOPNOTSUPP && bytes == 0);
+    can_trim = 1;
+    fail_sync = 1;
+    CHECK(vfs_trim(mounted_fs->root, &bytes) == -EIO && bytes == 0);
+    fail_sync = 0;
+    memset(trimmed, 0, sizeof(trimmed));
+    CHECK(vfs_trim(mounted_fs->root, &bytes) == 0);
+    synced = 0;
+    uint32_t nfree = 0;
+    for (uint32_t c = 2; c < f->nclusters + 2; c++) {
+        int is_free = fat_get(f, c) == 0;
+        nfree += (uint32_t)is_free;
+        CHECK(trimmed[cluster_lba(f, c)] == is_free);
+    }
+    for (uint32_t lba = 0; lba < f->data_start; lba++)
+        CHECK(!trimmed[lba]);
+    CHECK(bytes == nfree * 512 && nfree == count_free(f) && nfree == f->nclusters - 3);
+    char buf[16] = {0};
+    CHECK(vfs_read(open, buf, 0, 10) == 10 && !memcmp(buf, "still open", 10));
+    can_trim = 0;
+    vfs_unref(open);
+    finish();
+}
+
 int main(void)
 {
+    trimming();
     unlink_lifetime(); rename_lifetime(); metadata_errors(); unmount_errors(); unlinked_directory();
     truncate_errors(); rename_errors(); directory_rename_errors(); mirrored_truncate_errors();
     one_second_times();
-    puts("kernel storage: lifetime, mount references, atomic rename/truncate failures, flush retries and 1 s FAT times passed");
+    puts("kernel storage: lifetime, mount references, atomic rename/truncate failures, flush retries and 1 s FAT times and fstrim passed");
 }

@@ -1099,6 +1099,35 @@ int vfs_statfs(struct vnode *vn, struct statfs *st)
     return 0;
 }
 
+/*
+ * Everything the filesystem changed is written out first, so a block it
+ * has freed is free on the disk too before the drive is told to forget
+ * it: a crash in between must not leave a file pointing at trimmed blocks.
+ */
+int vfs_trim(struct vnode *vn, uint64_t *bytes)
+{
+    struct fs *fs = vn->fs;
+    *bytes = 0;
+    if (!fs)
+        return -EOPNOTSUPP;
+    if (fs->readonly)
+        return -EROFS;
+    if (!fs->ops->trim || !blk_can_trim(fs->bd))
+        return -EOPNOTSUPP;
+    int r = blk_sync(fs->bd);
+    if (r < 0)
+        return r;
+    struct blk_trimmer *t = kzalloc(sizeof(*t));
+    if (!t)
+        return -ENOMEM;
+    t->bd = fs->bd;
+    r = fs->ops->trim(fs, t);
+    int e = blk_trim_end(t);
+    *bytes = t->sectors * fs->bd->sector_size;
+    kfree(t);
+    return r < 0 ? r : e;
+}
+
 int vfs_mounts_text(char *buf, uint32_t size)
 {
     uint32_t len = 0;

@@ -384,6 +384,74 @@ void blk_start_flusher(void)
     proc_spawn_kthread("kflushd", kflushd);
 }
 
+/* ---- trim ---- */
+
+int blk_can_trim(struct blockdev *bd)
+{
+    return !bd->readonly && disk_of(bd)->trim != NULL;
+}
+
+/*
+ * Send the collected extents to the drive. Afterwards the sectors read
+ * as whatever the drive likes (zeros, mostly), so clean cached copies go;
+ * a dirty one is newer than the trim and is still written back.
+ */
+static void trim_send(struct blk_trimmer *t)
+{
+    struct blockdev *disk = disk_of(t->bd);
+    uint32_t n = t->n;
+    uint64_t sectors = 0;
+    t->n = 0;
+    if (!n || t->err)
+        return;
+    if (!disk->trim) {
+        t->err = -EOPNOTSUPP;
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (check_range(t->bd, t->ext[i].lba, t->ext[i].count) < 0) {
+            t->err = -EIO;
+            return;
+        }
+        translate(t->bd, &t->ext[i].lba);
+        sectors += t->ext[i].count;
+    }
+    int r = disk->trim(disk, t->ext, n);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t lba = t->ext[i].lba, count = t->ext[i].count;
+        readcache_forget(disk, lba, count);
+        for (int k = 0; k < BCACHE_SIZE && bcache; k++) {
+            struct bcache_entry *e = &bcache[k];
+            if (e->valid && !e->dirty && e->dev == disk && e->lba >= lba && e->lba - lba < count)
+                e->valid = 0;
+        }
+    }
+    if (r < 0)
+        t->err = r;
+    else
+        t->sectors += sectors;
+}
+
+void blk_trim_add(struct blk_trimmer *t, uint32_t lba, uint32_t count)
+{
+    if (!count || t->err)
+        return;
+    struct blk_extent *last = t->n ? &t->ext[t->n - 1] : NULL;
+    if (last && last->lba + last->count == lba && last->count <= 0xFFFFFFFFu - count) {
+        last->count += count;
+        return;
+    }
+    if (t->n == BLK_TRIM_MAX)
+        trim_send(t);
+    t->ext[t->n++] = (struct blk_extent){ lba, count };
+}
+
+int blk_trim_end(struct blk_trimmer *t)
+{
+    trim_send(t);
+    return t->err;
+}
+
 /* ---- byte-granular access ---- */
 
 int blk_read_at(struct blockdev *bd, uint32_t base, uint64_t off, uint32_t n, void *buf)

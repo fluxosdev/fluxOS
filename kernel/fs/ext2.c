@@ -1432,6 +1432,31 @@ static void ext2_statfs(struct fs *fs, struct statfs *st)
     st->f_bfree = e->free_blocks;
 }
 
+/* fstrim: the runs of clear bits in each group's block bitmap. */
+static int ext2_trim(struct fs *fs, struct blk_trimmer *t)
+{
+    struct ext2_fs *e = fs->priv;
+    for (uint32_t g = 0; g < e->ngroups && !t->err; g++) {
+        uint8_t *d = gd(e, g);
+        if (!rd16(d + GD_FREE_BLOCKS))
+            continue;
+        uint32_t first = e->first_data_block + g * e->bpg;
+        uint32_t in_group = MIN(e->bpg, e->blocks_count - first), run = 0;
+        int r = read_block(e, rd32(d + GD_BLOCK_BITMAP), e->buf);
+        if (r < 0)
+            return r;
+        for (uint32_t bit = 0; bit <= in_group; bit++) {
+            if (bit < in_group && !(e->buf[bit / 8] & (1u << (bit % 8)))) {
+                run++;
+                continue;
+            }
+            blk_trim_add(t, (first + bit - run) * e->spb, run * e->spb);
+            run = 0;
+        }
+    }
+    return 0;
+}
+
 /* ---- mounting ---- */
 
 static int ext2_mount(struct fs *fs)
@@ -1578,4 +1603,5 @@ const struct fs_ops ext2_ops = {
     .symlink = ext2_symlink,
     .readlink = ext2_readlink,
     .link = ext2_link,
+    .trim = ext2_trim,
 };

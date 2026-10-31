@@ -60,6 +60,9 @@
 #define NVM_FLUSH 0x00
 #define NVM_WRITE 0x01
 #define NVM_READ  0x02
+#define NVM_DSM   0x09                  /* dataset management */
+#define DSM_AD    (1u << 2)             /* its attribute: deallocate (trim) */
+#define ONCS_DSM  (1u << 2)             /* IDENTIFY: the controller has it */
 
 #define ADMIN_DEPTH 16
 #define IO_DEPTH    64                  /* 64 x 64 bytes: one page of submissions */
@@ -112,6 +115,7 @@ struct nvme_ctrl {
     uint32_t timeout;                   /* ms to become ready (CAP.TO) */
     uint32_t max_xfer;                  /* bytes in one command */
     int vwc;                            /* there is a volatile write cache to flush */
+    int dsm;                            /* and Dataset Management, to trim with */
     struct nvme_queue admin, io;
     uint64_t *prp_list;                 /* one page */
     uint8_t *bounce;
@@ -458,6 +462,33 @@ static int nvme_flush(struct blockdev *bd)
     return submit(ns->c, &ns->c->io, &cmd, 30000) == 0 ? 0 : -EIO;
 }
 
+/*
+ * Trim: Dataset Management with the deallocate attribute, every extent a
+ * 16-byte range (context attributes, length, starting LBA) in one command.
+ * The ranges go in the bounce buffer, which is free while the VFS lock is held.
+ */
+static int nvme_trim(struct blockdev *bd, const struct blk_extent *ext, uint32_t n)
+{
+    _Static_assert(BLK_TRIM_MAX <= 256 && BLK_TRIM_MAX * 16 <= PAGE_SIZE,
+                   "one DSM command, its ranges in one page");
+    struct nvme_ns *ns = bd->priv;
+    struct nvme_ctrl *c = ns->c;
+    uint32_t *range = (uint32_t *)c->bounce;
+    for (uint32_t i = 0; i < n; i++) {
+        range[4 * i] = 0;
+        range[4 * i + 1] = ext[i].count;
+        range[4 * i + 2] = ext[i].lba;
+        range[4 * i + 3] = 0;
+    }
+    struct nvme_sqe cmd = { .cdw0 = NVM_DSM, .nsid = ns->nsid, .prp1 = (uint32_t)range,
+                            .cdw10 = n - 1, .cdw11 = DSM_AD };
+    int r = submit(c, &c->io, &cmd, 30000);
+    if (r > 0)
+        klog("%s: trim of %u ranges from sector %u failed, status %03x\n", bd->name, n,
+             ext[0].lba, r);
+    return r == 0 ? 0 : -EIO;
+}
+
 /* ---- probing ---- */
 
 static int identify(struct nvme_ctrl *c, uint32_t cns, uint32_t nsid, void *page)
@@ -508,13 +539,15 @@ static void ns_probe(struct nvme_ctrl *c, uint32_t nsid, uint8_t *id, const char
     bd->read = nvme_read;
     bd->write = nvme_write;
     bd->flush = nvme_flush;
+    if (c->dsm)
+        bd->trim = nvme_trim;
     if (blk_register(bd) < 0) {
         kfree(ns);
         return;
     }
     c->ns[c->nns++] = ns;
-    boot_ok("%s: NVMe %s, %u MiB", bd->name, bd->model,
-            (uint32_t)(((uint64_t)bd->nsectors << shift) >> 20));
+    boot_ok("%s: NVMe %s, %u MiB%s", bd->name, bd->model,
+            (uint32_t)(((uint64_t)bd->nsectors << shift) >> 20), bd->trim ? ", trim" : "");
     blk_scan_partitions(bd);
 }
 
@@ -578,6 +611,7 @@ static void ctrl_init(const struct pci_dev *pci)
     if (mdts && mdts < 4)
         c->max_xfer = PAGE_SIZE << mdts;
     c->vwc = id[525] & 1;
+    c->dsm = (*(uint16_t *)(id + 520) & ONCS_DSM) != 0;
     uint32_t nn = *(uint32_t *)(id + 516);
     uint32_t vs = rd32(c, REG_VS);
     boot_ok("NVMe %u.%u controller: %s, %u namespace%s, IRQ %d%s", vs >> 16, (vs >> 8) & 0xFF,

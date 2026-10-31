@@ -114,6 +114,11 @@ says why.
   - **NVMe** solid-state disks (`/dev/nvme0n1`, partitions `nvme0n1p1`...),
     one I/O queue per controller, interrupt driven (`nvme.poll`). `make
     run-nvme` tries it in QEMU.
+  - **TRIM** for SSDs: SATA drives that advertise DATA SET MANAGEMENT/TRIM
+    and NVMe namespaces with Dataset Management (deallocate). `fstrim -av`
+    (or `fstrim /mnt/sda`) syncs each FAT or ext2 volume, then tells its
+    drive every free run in its FAT or block bitmaps; nothing trims
+    automatically.
   - A SATA or NVMe controller whose completion interrupts fail to arrive
     (found out when a wait runs out and the command is done after all) is
     polled from then on, instead of every command taking the whole timeout.
@@ -681,7 +686,7 @@ fetcher process, so the browser keeps running), or from `file://`.
   included: floats and doubles both in SSE2.
 
 **Userland** (`/bin`): 7z [ basename beep cat chmod clear cmp cp cut date dd desktop
-(and its programs, above) df diff dirname dmesg dos echo env false fetch find fluxinstall free fsh grep gunzip
+(and its programs, above) df diff dirname dmesg dos echo env false fetch find fluxinstall free fsh fstrim grep gunzip
 gzip halt head hexdump host ifconfig init install ln ls lsblk mbcheck mkdir mkfs.ext2
 mkfs.fat mkiso mktemp fsck.ext2 mixer more mount mv nc nproc patch ping play poweroff
 printf ps reboot rm rmdir sed

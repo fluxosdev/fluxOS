@@ -1860,6 +1860,24 @@ static int sys_blkrescan(uint32_t upath, uint32_t b, uint32_t c, uint32_t d, uin
     return bd ? blk_rescan(bd) : -ENOTBLK;
 }
 
+/* Trim the free space of the filesystem holding path (like Linux's FITRIM). */
+static int sys_fstrim(uint32_t upath, uint32_t utrimmed, uint32_t c, uint32_t d, uint32_t e)
+{
+    (void)c; (void)d; (void)e;
+    COPY_PATH(path, upath);
+    if (utrimmed && user_check_w((void *)utrimmed, sizeof(uint64_t)) < 0)
+        return -EFAULT;
+    struct vnode *vn;
+    int r = vfs_resolve(path, current->leader->cwd, &vn);
+    if (r < 0)
+        return r;
+    uint64_t trimmed;
+    r = vfs_trim(vn, &trimmed);
+    if (utrimmed && copy_to_user((void *)utrimmed, &trimmed, sizeof(trimmed)) < 0)
+        return -EFAULT;
+    return r;
+}
+
 static int sys_sync(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)a; (void)b; (void)c; (void)d; (void)e;
@@ -2078,6 +2096,7 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_sync] = sys_sync,
     [SYS_fsync] = sys_fsync,
     [SYS_blkrescan] = sys_blkrescan,
+    [SYS_fstrim] = sys_fstrim,
     [SYS_fbinfo] = sys_fbinfo,
     [SYS_fbmap] = sys_fbmap,
     [SYS_openpty] = sys_openpty,
@@ -2133,7 +2152,7 @@ static const uint8_t takes_vfs_lock[NSYSCALLS] = {
     [SYS_sync] = 1, [SYS_fsync] = 1, [SYS_blkrescan] = 1, [SYS_ftruncate] = 1,
     [SYS_lseek] = 1, [SYS_llseek] = 1, [SYS_utime] = 1, [SYS_fchdir] = 1, [SYS_fchmod] = 1,
     [SYS_lstat] = 1, [SYS_readlink] = 1, [SYS_symlink] = 1, [SYS_link] = 1, [SYS_chown] = 1,
-    [SYS_fchown] = 1,
+    [SYS_fchown] = 1, [SYS_fstrim] = 1,
 };
 
 void syscall_dispatch(struct trapframe *tf)

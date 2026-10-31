@@ -59,6 +59,21 @@ static int read_generated(struct blockdev *bd,uint32_t lba,uint32_t n,void *out)
     for(uint32_t i=0;i<n;i++)memset((uint8_t *)out+i*512,(int)((lba+i)%251),512);
     return 0;
 }
+static struct blk_extent trims[1024];
+static unsigned trim_cmds, ntrims;
+static int fail_trim;
+static int trim_disk(struct blockdev *bd, const struct blk_extent *ext, uint32_t n)
+{
+    CHECK(n >= 1 && n <= BLK_TRIM_MAX && !bd->parent);
+    trim_cmds++;
+    for (uint32_t i = 0; i < n; i++) {
+        CHECK(ext[i].lba < bd->nsectors && ext[i].count <= bd->nsectors - ext[i].lba);
+        memset(media[ext[i].lba], 0, ext[i].count * 512);   /* deterministic zeros */
+        trims[ntrims++] = ext[i];
+    }
+    return fail_trim ? -EIO : 0;
+}
+static void trims_reset(void) { trim_cmds = ntrims = 0; }
 static void unpinned(void)
 {
     for (int i = 0; i < BCACHE_SIZE; i++) CHECK(!bcache[i].pinned);
@@ -227,6 +242,61 @@ int main(void)
     }
     readcache_discard(&large);CHECK(!resident);
     printf("read cache: 8 MiB working set, %u cold commands, 0 warm commands; pressure/refill passed\n",cold_reads);
+
+    /* Trim: neighbours merged, BLK_TRIM_MAX extents a command, partitions offset. */
+    cache_option=NULL;test_total_kb=2u<<20;initialized=0;hand=0;readcache_init();
+    struct blockdev tdisk = { .sector_size = 512, .nsectors = BCACHE_SIZE + 32,
+                              .read = read_disk, .write = write_disk };
+    struct blockdev tpart = { .sector_size = 512, .nsectors = 100, .parent = &tdisk, .start = 50 };
+    struct blk_trimmer t = { .bd = &tdisk };
+    CHECK(!blk_can_trim(&tdisk) && !blk_can_trim(&tpart));
+    blk_trim_add(&t, 0, 1);
+    CHECK(blk_trim_end(&t) == -EOPNOTSUPP);
+    tdisk.trim = trim_disk;
+    CHECK(blk_can_trim(&tpart));
+    tpart.readonly = 1; CHECK(!blk_can_trim(&tpart)); tpart.readonly = 0;
+    trims_reset();
+    t = (struct blk_trimmer){ .bd = &tdisk };
+    blk_trim_add(&t, 10, 2); blk_trim_add(&t, 12, 3); blk_trim_add(&t, 15, 0); blk_trim_add(&t, 20, 1);
+    CHECK(blk_trim_end(&t) == 0 && t.sectors == 6 && trim_cmds == 1 && ntrims == 2);
+    CHECK(trims[0].lba == 10 && trims[0].count == 5 && trims[1].lba == 20 && trims[1].count == 1);
+    trims_reset();
+    t = (struct blk_trimmer){ .bd = &tdisk };
+    for (uint32_t i = 0; i < BLK_TRIM_MAX * 2 + 1; i++)
+        blk_trim_add(&t, i * 2, 1);
+    CHECK(blk_trim_end(&t) == 0 && trim_cmds == 3 && ntrims == BLK_TRIM_MAX * 2 + 1);
+    CHECK(t.sectors == BLK_TRIM_MAX * 2 + 1);
+    trims_reset();
+    t = (struct blk_trimmer){ .bd = &tpart };
+    blk_trim_add(&t, 0, 4); blk_trim_add(&t, 96, 4);
+    CHECK(blk_trim_end(&t) == 0 && ntrims == 2 && trims[0].lba == 50 && trims[1].lba == 146);
+    t = (struct blk_trimmer){ .bd = &tpart };
+    blk_trim_add(&t, 98, 4);                    /* past the partition's end */
+    CHECK(blk_trim_end(&t) == -EIO && t.sectors == 0);
+
+    /* Cached copies: clean ones go, a dirty one is newer and is written back. */
+    memset(media[200], 0x33, 512); memset(media[201], 0x44, 512);
+    CHECK(blk_read(&tdisk, 200, 2, bulk) == 0 && bulk[0] == 0x33);
+    CHECK(bcache_read(&tdisk, 200)[0] == 0x33);
+    uint8_t newer[512]; memset(newer, 0x55, sizeof(newer));
+    CHECK(bcache_write(&tdisk, 201, newer) == 0);
+    t = (struct blk_trimmer){ .bd = &tdisk };
+    blk_trim_add(&t, 200, 2);
+    CHECK(blk_trim_end(&t) == 0);
+    CHECK(bcache_read(&tdisk, 200)[0] == 0 && bcache_read(&tdisk, 201)[0] == 0x55);
+    CHECK(blk_read(&tdisk, 200, 2, bulk) == 0 && bulk[0] == 0 && bulk[512] == 0x55);
+    CHECK(blk_sync(&tdisk) == 0 && media[201][0] == 0x55);
+
+    /* A failing drive: the error is kept, nothing more is sent. */
+    trims_reset(); fail_trim = 1;
+    t = (struct blk_trimmer){ .bd = &tdisk };
+    for (uint32_t i = 0; i < BLK_TRIM_MAX + 1; i++)
+        blk_trim_add(&t, i * 2, 1);
+    blk_trim_add(&t, 250, 1);
+    CHECK(blk_trim_end(&t) == -EIO && trim_cmds == 1 && t.sectors == 0);
+    fail_trim = 0;
+    readcache_discard(&tdisk);
+
     free(bcache);
-    puts("kernel block cache: atomic metadata, data-cache hits/coherence, bounded read-ahead and failures passed");
+    puts("kernel block cache: atomic metadata, data-cache hits/coherence, bounded read-ahead, trim and failures passed");
 }

@@ -302,30 +302,58 @@ static int fat_set(struct fat_fs *f, uint32_t c, uint32_t v)
     return 0;
 }
 
+typedef void (*free_run_fn)(struct fat_fs *f, uint32_t first, uint32_t n, void *arg);
+
+/* Call fn for each run of free clusters, in order. FAT32's table is read
+ * in large pieces past the sector cache; the small FATs go through it. */
+static int free_runs(struct fat_fs *f, free_run_fn fn, void *arg)
+{
+    const uint32_t chunk = 64;                  /* sectors, of 128 entries each */
+    uint32_t end = f->nclusters + 2, run = 0;
+    uint8_t *buf = NULL;
+    if (f->bits == 32 && !(buf = kmalloc(chunk * 512)))
+        return -ENOMEM;
+    int r = 0;
+    for (uint32_t c = 2; c < end; c++) {
+        uint32_t v;
+        if (buf) {
+            uint32_t i = c % (chunk * 128);
+            if (c == 2 || i == 0) {
+                uint32_t sec = c / (chunk * 128) * chunk;
+                if (blk_read(f->bd, f->reserved + sec, MIN(chunk, f->fat_size - sec), buf) < 0) {
+                    r = -EIO;
+                    break;
+                }
+            }
+            v = rd32(buf + i * 4) & FAT_MASK;
+        } else if ((v = fat_get(f, c)) == FAT_EIO) {
+            r = -EIO;
+            break;
+        }
+        if (v == 0) {
+            run++;
+            continue;
+        }
+        if (run)
+            fn(f, c - run, run, arg);
+        run = 0;
+    }
+    if (run && !r)
+        fn(f, end - run, run, arg);
+    kfree(buf);
+    return r;
+}
+
+static void count_run(struct fat_fs *f, uint32_t first, uint32_t n, void *arg)
+{
+    (void)f;
+    *(uint32_t *)arg += n;
+}
+
 static uint32_t count_free(struct fat_fs *f)
 {
-    uint32_t chunk = 64, free = 0;
-    if (f->bits != 32) {                        /* small FATs: through the cache */
-        for (uint32_t c = 2; c < f->nclusters + 2; c++)
-            if (fat_get(f, c) == 0)
-                free++;
-        return free;
-    }
-    uint8_t *buf = kmalloc(chunk * 512);
-    if (!buf)
-        return 0;
-    uint32_t entries = f->nclusters + 2;
-    for (uint32_t sec = 0; sec * 128 < entries; sec += chunk) {
-        uint32_t n = MIN(chunk, f->fat_size - sec);
-        if (blk_read(f->bd, f->reserved + sec, n, buf) < 0)
-            break;
-        for (uint32_t i = 0; i < n * 128; i++) {
-            uint32_t c = sec * 128 + i;
-            if (c >= 2 && c < entries && (rd32(buf + i * 4) & FAT_MASK) == 0)
-                free++;
-        }
-    }
-    kfree(buf);
+    uint32_t free = 0;
+    free_runs(f, count_run, &free);
     return free;
 }
 
@@ -1339,6 +1367,16 @@ static int fat_mount(struct fs *fs)
     return 0;
 }
 
+static void trim_run(struct fat_fs *f, uint32_t first, uint32_t n, void *arg)
+{
+    blk_trim_add(arg, cluster_lba(f, first), n * f->spc);
+}
+
+static int fat_trim(struct fs *fs, struct blk_trimmer *t)
+{
+    return free_runs(fs->priv, trim_run, t);
+}
+
 static int fat_sync(struct fs *fs)
 {
     return flush_fsinfo(fs->priv);
@@ -1366,4 +1404,5 @@ const struct fs_ops fat32_ops = {
     .setattr = fat_setattr,
     .release = fat_release,
     .statfs = fat_statfs,
+    .trim = fat_trim,
 };

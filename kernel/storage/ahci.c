@@ -85,6 +85,9 @@
 #define ATA_ID_PACKET     0xA1
 #define ATA_IDENTIFY      0xEC
 #define ATA_STANDBY_NOW   0xE0
+#define ATA_DSM           0x06          /* DATA SET MANAGEMENT */
+#define DSM_TRIM          0x01
+#define TRIM_ENTRIES      64            /* in the one 512-byte block each command sends */
 
 #define ATAPI_SECTOR 2048
 #define BOUNCE_SIZE  65536u
@@ -453,6 +456,47 @@ static int ahci_flush(struct blockdev *bd)
     return r < 0 ? -EIO : 0;
 }
 
+/*
+ * Trim: DATA SET MANAGEMENT with the TRIM bit, sending one 512-byte block
+ * of entries, each a 48-bit LBA and a 16-bit count (0: unused). Longer
+ * extents take several entries. A drive that aborts it is not asked again.
+ */
+static int dsm_trim(struct ahci_port *p, uint64_t *entries, uint32_t k)
+{
+    memset(entries + k, 0, (TRIM_ENTRIES - k) * sizeof(*entries));
+    struct ata_cmd c = { .command = ATA_DSM, .features = DSM_TRIM, .device = 0x40, .count = 1 };
+    int r = port_exec(p, &c, entries, 512, 1, 30000);
+    if (r == -ENOSYS) {
+        klog("%s: drive refuses TRIM; not trimming it\n", p->bd.name);
+        p->bd.trim = NULL;
+        return -EOPNOTSUPP;
+    }
+    return r == 512 ? 0 : -EIO;
+}
+
+static int ahci_trim(struct blockdev *bd, const struct blk_extent *ext, uint32_t n)
+{
+    struct ahci_port *p = bd->priv;
+    static uint64_t entries[TRIM_ENTRIES];
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t lba = ext[i].lba, left = ext[i].count;
+        while (left) {
+            uint32_t len = MIN(left, 0xFFFFu);
+            entries[k++] = (uint64_t)len << 48 | lba;
+            lba += len;
+            left -= len;
+            if (k == TRIM_ENTRIES) {
+                int r = dsm_trim(p, entries, k);
+                if (r < 0)
+                    return r;
+                k = 0;
+            }
+        }
+    }
+    return k ? dsm_trim(p, entries, k) : 0;
+}
+
 /* ---- ATAPI drives ---- */
 
 /*
@@ -666,6 +710,8 @@ static void port_probe(struct hba *h, int n, uint16_t *id)
         uint32_t lba48 = id[100] | ((uint32_t)id[101] << 16);
         bd->nsectors = p->lba48 && (id[102] || id[103]) ? 0xFFFFFFFFu
                      : p->lba48 && lba48 ? lba48 : lba28;
+        if (p->lba48 && (id[169] & 1))
+            bd->trim = ahci_trim;
     }
     if (blk_register(bd) < 0)
         goto fail;
@@ -673,7 +719,8 @@ static void port_probe(struct hba *h, int n, uint16_t *id)
         boot_ok("%s: SATA ATAPI %s, %s", bd->name, bd->model,
                 bd->nsectors ? "media present" : "no media");
     else
-        boot_ok("%s: SATA %s, %u MiB", bd->name, bd->model, bd->nsectors / 2048);
+        boot_ok("%s: SATA %s, %u MiB%s", bd->name, bd->model, bd->nsectors / 2048,
+                bd->trim ? ", trim" : "");
     if (!p->atapi)
         blk_scan_partitions(bd);
     return;

@@ -19,6 +19,9 @@ int msleep(unsigned int ms);
 int getmounts(char *buf, unsigned int size);
 int blkinfo(int index, struct blkinfo *bi);
 int blkrescan(const char *disk);         /* re-read the partition table */
+/* Tell the SSD under path's filesystem which sectors are free; *trimmed (may
+ * be NULL) gets the bytes trimmed. EOPNOTSUPP: the drive or filesystem cannot. */
+int fstrim(const char *path, unsigned long long *trimmed);
 int usbinfo(int index, struct usbinfo *ui); /* the index-th USB device plugged in */
 
 /* Batteries, the AC adapter, the lid, suspend and the backlight: op is

@@ -115,8 +115,9 @@ extern "C" {
 #define SYS_shmget      103 /* key, size, IPC_CREAT | IPC_EXCL */
 #define SYS_shmat       104 /* id, uint32_t *size: the address it is mapped at */
 #define SYS_shmctl      105 /* id, IPC_RMID or IPC_STAT, struct flux_shmid_ds * */
+#define SYS_fstrim      106 /* path, uint64_t *trimmed: tell the SSD under path's filesystem what is free */
 
-#define NSYSCALLS       106
+#define NSYSCALLS       107
 
 #ifdef __cplusplus
 }

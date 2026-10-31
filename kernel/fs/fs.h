@@ -11,6 +11,7 @@
 
 struct vnode;
 struct blockdev;
+struct blk_trimmer;
 struct fs;
 
 struct fs_ops {
@@ -37,6 +38,9 @@ struct fs_ops {
     int (*symlink)(struct vnode *dir, const char *name, const char *target, struct vnode **out);
     int (*readlink)(struct vnode *vn, char *buf, uint32_t size);   /* bytes put in buf */
     int (*link)(struct vnode *vn, struct vnode *dir, const char *name, struct vnode **out);
+    /* Hand every run of free blocks to blk_trim_add (fstrim). The device has
+     * just been synced, and the VFS lock is held throughout. NULL: cannot. */
+    int (*trim)(struct fs *fs, struct blk_trimmer *t);
 };
 
 struct fs {
@@ -64,6 +68,9 @@ int vfs_mount(const char *source, const char *target, const char *type, struct v
 int vfs_mount_dev(struct blockdev *bd, const char *target, const char *type);
 int vfs_umount(const char *target, struct vnode *cwd);
 int vfs_statfs(struct vnode *vn, struct statfs *st);
+/* Tell the SSD under vn's filesystem which of its sectors are free; *bytes
+ * is how much was trimmed. -EOPNOTSUPP if the drive or filesystem cannot. */
+int vfs_trim(struct vnode *vn, uint64_t *bytes);
 int vfs_mounts_text(char *buf, uint32_t size);
 /* Shutting down: every filesystem told to leave its volume clean (ext2's
  * state), before the block devices are synced. */

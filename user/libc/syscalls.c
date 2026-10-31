@@ -507,6 +507,10 @@ int mount(const char *source, const char *target, const char *type)
 int umount(const char *target) { return ret(sc1(SYS_umount, (int)target)); }
 void sync(void) { sc0(SYS_sync); }
 int blkrescan(const char *disk) { return ret(sc1(SYS_blkrescan, (int)disk)); }
+int fstrim(const char *path, unsigned long long *trimmed)
+{
+    return ret(sc2(SYS_fstrim, (int)path, (int)trimmed));
+}
 int fsync(int fd) { return ret(sc1(SYS_fsync, fd)); }
 int ftruncate(int fd, off_t size) { return ret(sc2(SYS_ftruncate, fd, (int)size)); }
 int statfs(const char *path, struct statfs *st) { return ret(sc2(SYS_statfs, (int)path, (int)st)); }

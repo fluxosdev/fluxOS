@@ -17,6 +17,12 @@ struct vnode;
 #define MEDIA_CHANGED 2         /* there is one, and it is not the one seen last */
 #define MEDIA_BUSY    3         /* cannot tell now (spinning up...): ask again later */
 
+/* A run of sectors, as a drive's trim() hook takes them. */
+struct blk_extent {
+    uint32_t lba, count;
+};
+#define BLK_TRIM_MAX 64         /* extents in one trim() call */
+
 struct blockdev {
     char name[16];
     char model[44];
@@ -34,6 +40,9 @@ struct blockdev {
     int (*flush)(struct blockdev *bd);      /* flush the drive's write cache */
     /* Removable drives: is there a medium, and is it a new one? Cheap; VFS lock held. */
     int (*media)(struct blockdev *bd);
+    /* SSDs: forget what the sectors hold (ATA TRIM, NVMe deallocate), 1 to
+     * BLK_TRIM_MAX extents. NULL, or set to NULL later: the drive cannot. */
+    int (*trim)(struct blockdev *bd, const struct blk_extent *ext, uint32_t n);
     int unflushed;              /* written since the last flush */
     /* the automounter's notes (automount.c) */
     int am_present;             /* a medium was in at the last look */
@@ -82,6 +91,23 @@ void blk_invalidate(struct blockdev *bd);
  * medium was taken out. */
 void blk_discard(struct blockdev *bd);
 void blk_start_flusher(void);
+
+/*
+ * Trimming free space (fstrim), VFS lock held: a filesystem hands the runs
+ * it knows to be free to blk_trim_add, in sectors of bd (a partition or a
+ * whole disk); neighbours are merged and sent to the drive BLK_TRIM_MAX at
+ * a time. The first error stops it, and blk_trim_end returns it.
+ */
+struct blk_trimmer {
+    struct blockdev *bd;
+    uint32_t n;
+    int err;
+    uint64_t sectors;           /* trimmed so far */
+    struct blk_extent ext[BLK_TRIM_MAX];
+};
+int blk_can_trim(struct blockdev *bd);
+void blk_trim_add(struct blk_trimmer *t, uint32_t lba, uint32_t count);
+int blk_trim_end(struct blk_trimmer *t);
 
 void blk_scan_partitions(struct blockdev *disk);
 int blk_rescan(struct blockdev *disk);
