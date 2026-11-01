@@ -923,7 +923,8 @@ static void int31(void)
         return;
     case 0x0400:                        /* version */
         AX = 0x005A;
-        BX = 0x0005;                    /* 32-bit, interrupts reflected to real mode */
+        BX = 0x0003;                    /* bit 0: 32-bit; bit 1: real mode (not V86) for
+                                         * reflected interrupts; bit 2 clear: no virtual memory */
         CL = 4;
         DH = 0x08;
         DL = 0x70;
@@ -963,6 +964,8 @@ static void int31(void)
             return;
         }
         size = (size + 0xFFF) & ~0xFFFu;
+        if (!size)
+            size = 0x1000;              /* as in block_alloc: 0 would mark the slot free */
         uint32_t old = blocks[i].addr, old_size = blocks[i].size;
         uint32_t next = ext_end;
         for (int k = 0; k < MAX_BLOCKS; k++)

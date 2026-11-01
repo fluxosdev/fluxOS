@@ -569,7 +569,8 @@ void kbd_idle_hint(void)
 
 void int16(void)
 {
-    switch (AH) {
+    uint8_t fn = AH;                    /* AX is overwritten below */
+    switch (fn) {
     case 0x00:                          /* wait for a key */
     case 0x10:
         if (!kbd_available()) {
@@ -577,13 +578,15 @@ void int16(void)
             return;
         }
         AX = kbd_read();
-        if (AH == 0x00 && AL == 0xE0)
+        if (fn == 0x00 && AL == 0xE0)   /* the old function knows no E0 keys */
             AL = 0;
         return;
     case 0x01:                          /* is a key ready? */
     case 0x11:
         if (kbd_available()) {
             AX = kbd_peek();
+            if (fn == 0x01 && AL == 0xE0)
+                AL = 0;
             set_zf(0);
         } else {
             set_zf(1);

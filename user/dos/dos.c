@@ -96,11 +96,12 @@ static void mcb_name(uint16_t m, const char *path)
     for (const char *p = path; *p; p++)
         if (*p == '\\' || *p == '/' || *p == ':')
             base = p + 1;
+    int ended = 0;
     for (int i = 0; i < 8; i++) {
-        char c = base[i] && base[i] != '.' ? base[i] : 0;
+        char c = !ended && base[i] && base[i] != '.' ? base[i] : 0;
         wb(ADDR(m, 8 + i), cp437_upper((uint8_t)c));
         if (!c)
-            base = "";
+            ended = 1;                  /* pad with zeros, do not read on */
     }
 }
 

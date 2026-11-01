@@ -868,9 +868,12 @@ static void do_ioctl(void)
         } else if (sft[s].dev == DEV_FILE) {
             struct stat st;
             off_t pos = lseek(sft[s].fd, 0, SEEK_CUR);
-            AL = fstat(sft[s].fd, &st) == 0 && pos >= 0 && (uint32_t)pos < (uint32_t)st.st_size ? 0xFF : 0x00;
-            if (!S_ISREG(st.st_mode))
-                AL = 0xFF;
+            if (fstat(sft[s].fd, &st) < 0)
+                AL = 0x00;
+            else if (!S_ISREG(st.st_mode))
+                AL = 0xFF;              /* a pipe or device: no end to reach */
+            else
+                AL = pos >= 0 && (uint32_t)pos < (uint32_t)st.st_size ? 0xFF : 0x00;
         } else {
             AL = 0x00;
         }
@@ -1586,7 +1589,8 @@ int files_int21(void)
             dos_ok();
             return 1;
         }
-        off_t pos = lseek(sft[s].fd, (off_t)((uint32_t)CX << 16 | DX), AL);
+        /* CX:DX is signed: seeking back from the end or the current position. */
+        off_t pos = lseek(sft[s].fd, (off_t)(int32_t)((uint32_t)CX << 16 | DX), AL);
         if (pos < 0) {
             dos_fail(0x19);
             return 1;
