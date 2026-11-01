@@ -886,3 +886,39 @@ test("unicode regular expressions", function () {
             /\p{Letter}/u.test("ß"), /\p{White_Space}/u.test(" "), /[\p{N}]/u.test("Ⅻ")];
 }, [["héllo", "wörld", "日本"], true, "a##", true, "Привет", true, 2, true, false, true, true, "ÀÉÎ", true,
     true, 2, "h", "abc", true, false, true, 3, true, true, true, true]);
+
+test("an optional chain that meets null or undefined skips all the rest of it", function () {
+  var r = [], o = null, p = { a: { b: { c: 5, f: function () { return this.c; } } } }, calls = 0;
+  function bump() { calls++; return 1; }
+  r.push(o?.a.b, o?.a.b.c(), o?.a["b"].c, o?.f().g, p?.a.b.c, p?.a.b.f(), o?.[bump()].x, p.a?.zz?.q.w,
+         p.a.b.nofn?.().x, p.a.b?.c + 1, (o?.a.b) ?? "dflt", calls);
+  var x = { parent: null, children: new Set() };
+  x.parent?.children.add(x);
+  return r.map(String);
+}, ["undefined", "undefined", "undefined", "undefined", "5", "5", "undefined", "undefined", "undefined", "6", "dflt", "0"]);
+
+(function () {
+var s = ["1969-12-31T20:01:23.000-04:00", "1970-01-01T09:00:05.000+09:00", "1970-01-01T11:45:05.000+11:45", "1969-12-31T16:14:55.000-07:45",
+         "2024-03-05T10:20:30Z", "2024-03-05", "2024-03-05T10:20:30.5+01:00", "2024-03-05T10:20", "+002024-03-05T00:00:00Z",
+         "Tue, 05 Mar 2024 10:20:30 GMT", "Mar 5 2024 10:20:30", "5 March 2024 1:20 PM +0200", "Tue Mar 05 2024 10:20:30 GMT+0100",
+         "2024-13-05", "garbage", "2024-03-05T10:20:30+0130", "10/24/2026"];
+var out = s.map(function (x) { var t = new Date(x).getTime(); return isNaN(t) ? "NaN" : t; });
+test("Date.parse: ISO 8601 offsets and fractions, and the forms people and HTTP write", function () { return out; }, [83000, 5000, 5000, -5000, 1709634030000, 1709596800000, 1709630430500, 1709634000000,
+  1709596800000, 1709634030000, 1709634030000, 1709637600000, 1709630430000, "NaN", "NaN", 1709628630000, 1792800000000]);
+})();
+
+(function () {
+var r = [/^a{2,4}$/.test("aaa"), /^a{2,4}$/.test("aaaaa"), "aaaaa".match(/a{2,4}/)[0], "aaaaa".match(/a{2,4}?/)[0],
+  "abcabc".match(/(abc){1,3}/)[0], "xaaay".replace(/a{1,2}/g, "-"), /^(?:\d{1,3}\.){3}\d{1,3}$/.test("192.168.10.255"),
+  /^(?:\d{1,3}\.){3}\d{1,3}$/.test("192.168.10"), /^([a-z]{1,63}\.)*googlevideo\.com$/.test("rr1---x.ab.googlevideo.com"),
+  /^([a-z0-9-]{1,63}\.)*googlevideo\.com$/.test("rr1---sn-x.googlevideo.com"), "aaab".match(/(a{1,3})(a{0,2})b/).slice(1),
+  "aaab".match(/(a{1,3}?)(a{0,2})b/).slice(1)];
+test("bounded repeats: greedy and lazy, nested, and without exponential backtracking", function () { return r; },
+  [true, false, "aaaa", "aa", "abcabc", "x--y", true, false, false, true, ["aaa", ""], ["a", "aa"]]);
+})();
+
+test("ToPrimitive hints: a Date is a number in arithmetic and comparisons, a string for + and ==", function () {
+  var d = new Date(5000), o = {};
+  o[Symbol.toPrimitive] = function (h) { return h === "number" ? 42 : h === "string" ? "str" : "dflt"; };
+  return [d / 1000, +d, d - new Date(1000), d > 4000, typeof (d + 1), d == d.toString(), +o, o * 1, String(o), o + "", o < 50];
+}, [5, 5000, 4000, true, "string", true, 42, 42, "str", "dflt", true]);

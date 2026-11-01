@@ -1175,6 +1175,403 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
   def(g, "TrustedTypePolicyFactory", TrustedTypePolicyFactory);
   def(g, "trustedTypes", new TrustedTypePolicyFactory(TT_KEY));
 
+  /* ---- Media Source Extensions: what a page appends, the media engine plays ----
+   * A MediaSource is attached to a media element through a blob: URL (createObjectURL) or
+   * srcObject; its SourceBuffers send what is appended to the engine (%mediaCmd), which parses it
+   * at once and answers with the buffered spans when it has used it all up (%mediaMsg brings the
+   * answers here). The element's readyState follows what is buffered where it is. */
+  if (g.document && g["%mediaCmd"]) {
+    var mseCmd = g["%mediaCmd"], mseState = g["%mstate"], mseFire = g["%mfire"];
+    var mseSecret = {}, mseURLs = {}, mseCount = 0;
+    var mseTask = function (target, type) { setTimeout(function () { target.dispatchEvent(new Event(type)); }, 0); };
+    var mseInvalid = function (what) { return new DOMException(what, "InvalidStateError"); };
+    /* What the engine decodes, at sizes and rates a Pentium 4 keeps up with: H.264 (and VP8) up to
+     * 1280x720 at 30 frames, AAC, MP3, Opus and Vorbis. VP9 is decoded too, but sites that are
+     * told no pick H.264, which is lighter. */
+    var mseSupported = function (type) {
+      var t = String(type).toLowerCase(), parts = t.split(";"), base = parts[0].trim();
+      var codecs = null, width = 0, height = 0, rate = 0;
+      for (var i = 1; i < parts.length; i++) {
+        var kv = parts[i].split("="), k = kv[0].trim(), v = kv.slice(1).join("=").split(String.fromCharCode(34)).join("").trim();
+        if (k === "codecs") codecs = v.split(",").map(function (c) { return c.trim(); }).filter(function (c) { return c; });
+        else if (k === "width") width = Number(v);
+        else if (k === "height") height = Number(v);
+        else if (k === "framerate") rate = Number(v);
+      }
+      if (width > 1280 || height > 720 || rate > 31) return false;
+      var video = base.indexOf("video/") === 0, list;
+      if (base === "video/mp4" || base === "audio/mp4") list = ["avc1", "avc3", "mp4a.40", "mp4a.69", "mp4a.6b", "mp3", "opus", "flac"];
+      else if (base === "video/webm" || base === "audio/webm") list = ["vp8", "opus", "vorbis"];
+      else return false;
+      if (!codecs) return true;
+      if (!codecs.length) return false;
+      return codecs.every(function (c) {
+        if (!video && (c.indexOf("avc") === 0 || c.indexOf("vp") === 0)) return false;
+        return list.some(function (p) { return c.indexOf(p) === 0; });
+      });
+    };
+    var mseIntersect = function (a, b) {
+      var out = [], i = 0, j = 0;
+      while (i < a.length && j < b.length) {
+        var s = Math.max(a[i][0], b[j][0]), e = Math.min(a[i][1], b[j][1]);
+        if (s < e) out.push([s, e]);
+        if (a[i][1] < b[j][1]) i++; else j++;
+      }
+      return out;
+    };
+
+    class SourceBufferList extends EventTarget {
+      constructor(token) {
+        if (token !== mseSecret) throw new TypeError("Illegal constructor");
+        super();
+        def(this, "_list", []);
+        this.onaddsourcebuffer = null;
+        this.onremovesourcebuffer = null;
+      }
+      get length() { return this._list.length; }
+      _sync() {
+        for (var i = 0; i < 8; i++) {
+          if (i < this._list.length) Object.defineProperty(this, i, { configurable: true, enumerable: true, value: this._list[i] });
+          else delete this[i];
+        }
+      }
+      _add(sb, quiet) {
+        this._list.push(sb);
+        this._sync();
+        if (!quiet) mseTask(this, "addsourcebuffer");
+      }
+      _remove(sb, quiet) {
+        var i = this._list.indexOf(sb);
+        if (i < 0) return;
+        this._list.splice(i, 1);
+        this._sync();
+        if (!quiet) mseTask(this, "removesourcebuffer");
+      }
+      [Symbol.iterator]() { return this._list.slice()[Symbol.iterator](); }
+    }
+
+    class SourceBuffer extends EventTarget {
+      constructor(token) {
+        if (token !== mseSecret) throw new TypeError("Illegal constructor");
+        super();
+        def(this, "_ms", null);
+        def(this, "_id", 0);
+        def(this, "_type", "");
+        def(this, "_updating", false);
+        def(this, "_removed", false);
+        def(this, "_ranges", []);
+        def(this, "_seq", 0);
+        def(this, "_init", false);
+        def(this, "_offset", 0);
+        def(this, "_mode", "segments");
+        def(this, "_winStart", 0);
+        def(this, "_winEnd", Infinity);
+        this.onupdatestart = null;
+        this.onupdate = null;
+        this.onupdateend = null;
+        this.onerror = null;
+        this.onabort = null;
+      }
+      _check() {
+        if (this._removed) throw mseInvalid("This SourceBuffer has been removed from its MediaSource");
+        if (this._updating) throw mseInvalid("This SourceBuffer is still processing an append or remove");
+      }
+      get updating() { return this._updating; }
+      get buffered() {
+        if (this._removed) throw mseInvalid("This SourceBuffer has been removed from its MediaSource");
+        return g["%timeRanges"](this._ranges.map(function (r) { return r.slice(); }));
+      }
+      get mode() { return this._mode; }
+      set mode(v) {
+        v = String(v);
+        if (v !== "segments" && v !== "sequence") return;
+        this._check();
+        this._mode = v;
+      }
+      get timestampOffset() { return this._offset; }
+      set timestampOffset(v) {
+        var x = Number(v);
+        if (!isFinite(x)) throw new TypeError("The provided double value is non-finite.");
+        this._check();
+        if (this._ms._state === "ended") this._ms._reopen();
+        this._offset = x;
+        mseCmd(this._ms._el, "sboffset", String(Math.round(x * 1e6)), this._id, 0);
+      }
+      get appendWindowStart() { return this._winStart; }
+      set appendWindowStart(v) { this._check(); var x = Number(v); if (!(x >= 0) || x >= this._winEnd) throw new TypeError("appendWindowStart is out of range"); this._winStart = x; }
+      get appendWindowEnd() { return this._winEnd; }
+      set appendWindowEnd(v) { this._check(); var x = Number(v); if (isNaN(x) || x <= this._winStart) throw new TypeError("appendWindowEnd is out of range"); this._winEnd = x; }
+      get audioTracks() { return []; }
+      get videoTracks() { return []; }
+      get textTracks() { return []; }
+      appendBuffer(data) {
+        this._check();
+        var view = data instanceof ArrayBuffer ? new Uint8Array(data) : ArrayBuffer.isView(data) ? data : null;
+        if (!view) throw new TypeError("appendBuffer requires an ArrayBuffer or ArrayBufferView");
+        var el = this._ms._el, st = mseState(el);
+        if (st.error) throw mseInvalid("The media element has an error");
+        if (this._ms._state === "ended") this._ms._reopen();
+        var seq = ++this._seq;
+        this._updating = true;
+        mseTask(this, "updatestart");
+        if (!view.byteLength) {         /* nothing to parse: done at once */
+          var self = this;
+          setTimeout(function () { self._done(seq, self._ranges); }, 0);
+          return;
+        }
+        mseCmd(el, "sbappend", view, this._id, seq);
+      }
+      remove(start, end) {
+        this._check();
+        var ms = this._ms, s = Number(start), e = Number(end);
+        if (isNaN(ms._duration) || !(s >= 0) || s > ms._duration || !(e > s)) throw new TypeError("The remove range is not valid");
+        if (ms._state === "ended") ms._reopen();
+        var seq = ++this._seq;
+        this._updating = true;
+        mseTask(this, "updatestart");
+        mseCmd(ms._el, "sbremove", Math.round(s * 1e6) + " " + (e === Infinity ? "9223372036854775807" : String(Math.round(e * 1e6))), this._id, seq);
+      }
+      abort() {
+        if (this._removed) throw mseInvalid("This SourceBuffer has been removed from its MediaSource");
+        if (this._ms._state !== "open") throw mseInvalid("The MediaSource is not open");
+        this._seq++;                    /* what the engine still says of the last append is stale */
+        if (this._updating) {
+          this._updating = false;
+          mseTask(this, "abort");
+          mseTask(this, "updateend");
+        }
+        mseCmd(this._ms._el, "sbabort", "", this._id, 0);
+        this._winStart = 0;
+        this._winEnd = Infinity;
+      }
+      changeType(type) {
+        if (!type) throw new TypeError("The type is empty");
+        this._check();
+        if (!mseSupported(type)) throw new DOMException("The type is not supported", "NotSupportedError");
+        this._type = String(type);
+        mseCmd(this._ms._el, "sbabort", "", this._id, 0);
+      }
+      /* the engine's answers */
+      _done(seq, ranges) {
+        if (seq !== this._seq || this._removed) return;
+        this._ranges = ranges;
+        this._updating = false;
+        this._ms._update();              /* readyState moves with the coded frames, before updateend */
+        this.dispatchEvent(new Event("update"));
+        this.dispatchEvent(new Event("updateend"));
+      }
+      _error(seq) {
+        if (seq !== this._seq || this._removed) return;
+        this._updating = false;
+        this.dispatchEvent(new Event("error"));
+        this.dispatchEvent(new Event("updateend"));
+        if (this._ms._state === "open") this._ms.endOfStream("decode");
+      }
+      _initSegment(v, a, w, h) {
+        var ms = this._ms, el = ms._el, st = mseState(el);
+        if (!v && !a) {
+          this._error(this._seq);
+          return;
+        }
+        this._init = true;
+        if (ms._active._list.indexOf(this) < 0) ms._active._add(this);
+        if (v && w > 0 && (st.vw !== w || st.vh !== h)) {
+          var known = st.vw > 0;
+          st.vw = w;
+          st.vh = h;
+          if (known) mseFire(el, "resize");
+        }
+        if (isNaN(ms._duration)) ms._setDuration(Infinity);
+        ms._update();
+      }
+    }
+
+    class MediaSource extends EventTarget {
+      constructor() {
+        super();
+        def(this, "%mse", true);
+        def(this, "_sbs", new SourceBufferList(mseSecret));
+        def(this, "_active", new SourceBufferList(mseSecret));
+        def(this, "_state", "closed");
+        def(this, "_duration", NaN);
+        def(this, "_el", null);
+        def(this, "_live", null);
+        this.onsourceopen = null;
+        this.onsourceended = null;
+        this.onsourceclose = null;
+      }
+      static isTypeSupported(type) { return mseSupported(type); }
+      static get canConstructInDedicatedWorker() { return false; }
+      get sourceBuffers() { return this._sbs; }
+      get activeSourceBuffers() { return this._active; }
+      get readyState() { return this._state; }
+      get handle() { return null; }
+      get duration() { return this._state === "closed" ? NaN : this._duration; }
+      set duration(v) {
+        var x = Number(v);
+        if (isNaN(x) || x < 0) throw new TypeError("The duration is not valid");
+        if (this._state !== "open") throw mseInvalid("The MediaSource is not open");
+        if (this._sbs._list.some(function (sb) { return sb._updating; })) throw mseInvalid("A SourceBuffer is updating");
+        var top = 0;
+        this._sbs._list.forEach(function (sb) { sb._ranges.forEach(function (r) { top = Math.max(top, r[1]); }); });
+        if (x < top - 0.001) throw mseInvalid("The duration is shorter than what is buffered");
+        this._setDuration(x);
+      }
+      _setDuration(x) {
+        if (x === this._duration) return;
+        this._duration = x;
+        var el = this._el;
+        if (el) {
+          var st = mseState(el);
+          st.duration = x;
+          mseFire(el, "durationchange");
+        }
+      }
+      addSourceBuffer(type) {
+        if (!type) throw new TypeError("The type is empty");
+        if (!mseSupported(type)) throw new DOMException("The type " + type + " is not supported", "NotSupportedError");
+        if (this._state !== "open") throw mseInvalid("The MediaSource is not open");
+        if (this._sbs.length >= 4) throw new DOMException("Too many SourceBuffers", "QuotaExceededError");
+        var id = mseCmd(this._el, "sbadd", String(type), 0, 0);
+        if (!(id > 0)) throw new DOMException("The media engine is not running", "NotSupportedError");
+        var sb = new SourceBuffer(mseSecret);
+        sb._ms = this;
+        sb._id = id;
+        sb._type = String(type);
+        this._sbs._add(sb);
+        return sb;
+      }
+      removeSourceBuffer(sb) {
+        if (!(sb instanceof SourceBuffer) || this._sbs._list.indexOf(sb) < 0)
+          throw new DOMException("That SourceBuffer does not belong to this MediaSource", "NotFoundError");
+        if (sb._updating) {
+          sb._seq++;
+          sb._updating = false;
+          mseTask(sb, "abort");
+          mseTask(sb, "updateend");
+        }
+        mseCmd(this._el, "sbdel", "", sb._id, 0);
+        sb._removed = true;
+        this._active._remove(sb);
+        this._sbs._remove(sb);
+        this._update();
+      }
+      endOfStream(error) {
+        if (this._state !== "open") throw mseInvalid("The MediaSource is not open");
+        if (this._sbs._list.some(function (sb) { return sb._updating; })) throw mseInvalid("A SourceBuffer is updating");
+        if (error !== undefined && error !== "network" && error !== "decode") throw new TypeError("The error is not valid");
+        this._state = "ended";
+        mseTask(this, "sourceended");
+        var el = this._el, st = mseState(el);
+        if (!error) {
+          var top = 0;
+          this._sbs._list.forEach(function (sb) { sb._ranges.forEach(function (r) { top = Math.max(top, r[1]); }); });
+          if (top > 0 && (isNaN(this._duration) || top < this._duration || this._duration === Infinity)) this._setDuration(top);
+          mseCmd(el, "mseend", "", 1, 0);
+          this._update();
+          return;
+        }
+        st.error = { code: error === "network" || st.readyState ? (error === "network" ? 2 : 3) : 4,
+                     message: "The media source ended with a " + error + " error",
+                     MEDIA_ERR_ABORTED: 1, MEDIA_ERR_NETWORK: 2, MEDIA_ERR_DECODE: 3, MEDIA_ERR_SRC_NOT_SUPPORTED: 4 };
+        st.paused = true;
+        mseTask(el, "error");
+      }
+      setLiveSeekableRange(start, end) {
+        if (this._state !== "open") throw mseInvalid("The MediaSource is not open");
+        var s = Number(start), e = Number(end);
+        if (!(s >= 0) || !(e >= s)) throw new TypeError("The range is not valid");
+        this._live = [s, e];
+      }
+      clearLiveSeekableRange() {
+        if (this._state !== "open") throw mseInvalid("The MediaSource is not open");
+        this._live = null;
+      }
+      /* the element's side */
+      _attach(el) {
+        this._el = el;
+        this._state = "open";
+        mseTask(this, "sourceopen");
+      }
+      _detach() {
+        this._state = "closed";
+        this._duration = NaN;
+        var self = this;
+        this._sbs._list.slice().forEach(function (sb) {
+          sb._removed = true;
+          self._active._remove(sb, true);
+          self._sbs._remove(sb, true);
+        });
+        this._el = null;
+        mseTask(this, "sourceclose");
+      }
+      _reopen() {
+        this._state = "open";
+        mseTask(this, "sourceopen");
+        mseCmd(this._el, "mseend", "", 0, 0);
+      }
+      _buffered() {
+        var lists = this._active._list.map(function (sb) { return sb._ranges; });
+        if (!lists.length) return [];
+        var ended = this._state === "ended", top = 0;
+        lists.forEach(function (l) { if (l.length) top = Math.max(top, l[l.length - 1][1]); });
+        var out = null;
+        lists.forEach(function (l) {
+          var r = l.map(function (x) { return x.slice(); });
+          if (ended && r.length) r[r.length - 1][1] = top;
+          out = out ? mseIntersect(out, r) : r;
+        });
+        return out || [];
+      }
+      _seekable() {
+        if (this._live) return [this._live.slice()];
+        var b = this._buffered();
+        return b.length ? [[b[0][0], b[b.length - 1][1]]] : [];
+      }
+      _update() {
+        var el = this._el;
+        if (!el) return;
+        var st = mseState(el), list = this._sbs._list;
+        if (!list.length || !list.every(function (sb) { return sb._init; })) return;
+        var t = el.currentTime, b = this._buffered(), rs = 1;
+        for (var i = 0; i < b.length; i++)
+          if (b[i][0] <= t + 0.1 && t < b[i][1]) {
+            rs = b[i][1] - t >= 1 || this._state === "ended" ? 4 : 3;
+            break;
+          }
+        if (rs === 1 && st.frame && this._state === "ended" && b.length && t >= b[b.length - 1][1] - 0.15) rs = 2;
+        g["%mediaReady"](el, rs);
+      }
+      _message(w) {
+        var id = Number(w[1]), sb = null;
+        this._sbs._list.forEach(function (s) { if (s._id === id) sb = s; });
+        if (!sb) return;
+        if (w[0] === "sbinit") {
+          sb._initSegment(Number(w[2]), Number(w[3]), Number(w[4]), Number(w[5]));
+        } else if (w[0] === "sbdone") {
+          var n = Number(w[3]), list = [];
+          for (var i = 0; i < n; i++) list.push([Number(w[4 + 2 * i]) / 1e6, Number(w[5 + 2 * i]) / 1e6]);
+          sb._done(Number(w[2]), list);
+        } else if (w[0] === "sberr") {
+          sb._error(Number(w[2]));
+        }
+      }
+    }
+    def(g, "MediaSource", MediaSource);
+    def(g, "SourceBuffer", SourceBuffer);
+    def(g, "SourceBufferList", SourceBufferList);
+    def(g, "%mseURL", function (ms) {
+      var hex = "";
+      for (var i = 0; i < 8; i++) hex += Math.floor(Math.random() * 65536).toString(16);
+      var origin = location.origin && location.origin !== "null" ? location.origin : "null";
+      var u = "blob:" + origin + "/mse-" + (++mseCount) + "-" + hex;
+      mseURLs[u] = ms;
+      return u;
+    });
+    def(g, "%mseFor", function (u) { return mseURLs[u] || null; });
+    def(g, "%mseRevoke", function (u) { if (!mseURLs[u]) return false; delete mseURLs[u]; return true; });
+  }
+
 })(globalThis);
 );
 
@@ -1189,8 +1586,185 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
   nav.doNotTrack = null;
   nav.product = "Gecko";
   /* no userAgentData or deviceMemory: Chromium's, and the User-Agent names a Gecko browser */
-  URL.createObjectURL = function (blob) { if(!(blob instanceof Blob))throw new TypeError("createObjectURL requires a Blob");return g["%blobURL"](blob._bytes,blob.type); };
-  URL.revokeObjectURL = function (url) { g["%blobURL"](String(url)); };
+  /* Interfaces scripts look for by name, and polyfills patch: where the objects are of one, they are
+   * made so (the window, shadow roots, comments, customElements); the others stand for objects
+   * that are arrays or plain objects here (NodeList, DOMTokenList...), and are there to be found. */
+  var iface = function (name, parent) {
+    if (g[name]) return g[name];
+    var C = function () { throw new TypeError("Illegal constructor"); };
+    Object.defineProperty(C, "name", { value: name });
+    var base = parent && parent.prototype && typeof parent.prototype === "object" ? parent.prototype : Object.prototype;
+    C.prototype = Object.create(base,
+                                { constructor: { value: C, writable: true, configurable: true } });
+    def(g, name, C);
+    return C;
+  };
+  var ownerOf = function (o, k) { while (o && !Object.prototype.hasOwnProperty.call(o, k)) o = Object.getPrototypeOf(o); return o; };
+  if (g.document) {
+    /* Window.prototype: between the window and Object.prototype, with the window's event methods,
+     * which scripts (ShadyDOM) look for there */
+    var WindowIface = iface("Window", null);
+    ["addEventListener", "removeEventListener", "dispatchEvent"].forEach(function (k) {
+      if (typeof g[k] === "function" && !Object.prototype.hasOwnProperty.call(WindowIface.prototype, k))
+        def(WindowIface.prototype, k, g[k]);
+    });
+    if (Object.getPrototypeOf(g) === Object.prototype) {
+      try { Object.setPrototypeOf(g, WindowIface.prototype); } catch (e) {}
+    }
+    var ShadowRootIface = iface("ShadowRoot", g.DocumentFragment);
+    var attachOwner = ownerOf(g.HTMLElement && HTMLElement.prototype, "attachShadow");
+    if (attachOwner) {
+      var nativeAttach = attachOwner.attachShadow;
+      def(attachOwner, "attachShadow", function (init) {
+        var root = nativeAttach.call(this, init);
+        if (root && typeof root === "object" && Object.getPrototypeOf(root) !== ShadowRootIface.prototype)
+          Object.setPrototypeOf(root, ShadowRootIface.prototype);
+        return root;
+      });
+    }
+    var CharacterDataIface = iface("CharacterData", g.Node);
+    var CommentIface = iface("Comment", g.Text || CharacterDataIface);
+    var createComment = document.createComment;
+    if (createComment)
+      def(document, "createComment", function (t) {
+        var c = createComment.call(document, t);
+        if (c && typeof c === "object") Object.setPrototypeOf(c, CommentIface.prototype);
+        return c;
+      });
+    var Registry = iface("CustomElementRegistry", null);
+    if (g.customElements && Object.getPrototypeOf(customElements) === Object.prototype)
+      Object.setPrototypeOf(customElements, Registry.prototype);
+    iface("HTMLUnknownElement", g.HTMLElement);
+    iface("HTMLSlotElement", g.HTMLElement);
+    iface("SVGSVGElement", g.SVGElement || g.HTMLElement);
+    iface("SVGGraphicsElement", g.SVGElement || g.HTMLElement);
+    iface("HTMLDocument", g.Document);
+  }
+  ["NodeList", "HTMLCollection", "NamedNodeMap", "DOMTokenList", "CSSStyleDeclaration", "Attr", "DOMStringMap",
+   "TextTrack", "TextTrackList", "TextTrackCue", "TextTrackCueList", "AudioTrack", "AudioTrackList", "VideoTrack",
+   "VideoTrackList", "MediaError", "VideoPlaybackQuality", "PictureInPictureWindow"].forEach(function (n) { iface(n, null); });
+  ["DocumentType", "AbstractRange", "DOMImplementation", "HTMLFormControlsCollection", "RadioNodeList",
+   "HTMLOptionsCollection", "StyleSheetList", "MediaList", "CSSRuleList", "DOMRectList", "DOMRectReadOnly",
+   "DOMPointReadOnly", "DOMMatrixReadOnly", "MimeTypeArray", "PluginArray", "BarProp", "SubtleCrypto",
+   "PerformanceEntry", "MediaQueryList"].forEach(function (n) { iface(n, null); });
+  if (g.document) {
+    iface("CDATASection", g.Text);
+    iface("ProcessingInstruction", g.CharacterData);
+    iface("XMLDocument", g.Document);
+    /* CSSRule is the DOM library's (loaded when first used): these are plain until then */
+    ["CSSStyleRule", "CSSMediaRule", "CSSKeyframesRule"].forEach(function (n) { iface(n, null); });
+    ["PerformanceNavigationTiming", "PerformanceResourceTiming", "PerformanceMark", "PerformanceMeasure"].forEach(function (n) {
+      iface(n, g.PerformanceEntry);
+    });
+  }
+  /* the window's objects: of their interface, keeping all they had */
+  var reproto = function (o, name) {
+    if (!o || typeof o !== "object") return;
+    var C = iface(name, null), was = Object.getPrototypeOf(o);
+    if (was === C.prototype) return;
+    var mine = Object.create(was, { constructor: { value: C, writable: true, configurable: true } });
+    C.prototype = mine;
+    try { Object.setPrototypeOf(o, mine); } catch (e) {}
+  };
+  [["history", "History"], ["location", "Location"], ["navigator", "Navigator"], ["screen", "Screen"],
+   ["localStorage", "Storage"], ["crypto", "Crypto"], ["performance", "Performance"]].forEach(function (p) {
+    try { reproto(g[p[0]], p[1]); } catch (e) {}
+  });
+  if (g.crypto && g.crypto.subtle) try { reproto(g.crypto.subtle, "SubtleCrypto"); } catch (e) {}
+  if (g.sessionStorage && g.Storage) try { Object.setPrototypeOf(g.sessionStorage, g.Storage.prototype); } catch (e) {}
+  if (g.document && !g.Option) {
+    var Option = function Option(text, value, defaultSelected, selected) {
+      var o = document.createElement("option");
+      if (text !== undefined) o.textContent = String(text);
+      if (value !== undefined) o.value = String(value);
+      if (defaultSelected) o.setAttribute("selected", "");
+      if (selected) o.selected = true;
+      return o;
+    };
+    Option.prototype = g.HTMLOptionElement ? HTMLOptionElement.prototype : Object.prototype;
+    def(g, "Option", Option);
+  }
+  if (g.Event) {
+    if (!g.PromiseRejectionEvent) {
+      class PromiseRejectionEvent extends Event {
+        constructor(type, init) { super(type, init); init = init || {}; def(this, "promise", init.promise); def(this, "reason", init.reason); }
+      }
+      def(g, "PromiseRejectionEvent", PromiseRejectionEvent);
+    }
+    if (!g.MediaQueryListEvent) {
+      class MediaQueryListEvent extends Event {
+        constructor(type, init) { super(type, init); init = init || {}; def(this, "media", String(init.media || "")); def(this, "matches", !!init.matches); }
+      }
+      def(g, "MediaQueryListEvent", MediaQueryListEvent);
+    }
+    if (!g.SecurityPolicyViolationEvent) {
+      class SecurityPolicyViolationEvent extends Event {}
+      def(g, "SecurityPolicyViolationEvent", SecurityPolicyViolationEvent);
+    }
+  }
+  if (g.MediaError)
+    [["MEDIA_ERR_ABORTED", 1], ["MEDIA_ERR_NETWORK", 2], ["MEDIA_ERR_DECODE", 3], ["MEDIA_ERR_SRC_NOT_SUPPORTED", 4]].forEach(function (c) {
+      def(g.MediaError, c[0], c[1]);
+      def(g.MediaError.prototype, c[0], c[1]);
+    });
+  if (!g.VTTCue) {
+    var VTTCue = function VTTCue(start, end, text) {
+      this.startTime = Number(start); this.endTime = Number(end); this.text = String(text);
+      this.id = ""; this.pauseOnExit = false; this.track = null; this.onenter = null; this.onexit = null;
+    };
+    VTTCue.prototype = Object.create(g.TextTrackCue.prototype, { constructor: { value: VTTCue, writable: true, configurable: true } });
+    def(g, "VTTCue", VTTCue);
+  }
+  /* document.implementation: other documents are detached trees, as DOMParser makes them (the
+   * nodes are this document's, which is what an inert document is used for: parsing, templates). */
+  if (g.document && !document.implementation) {
+    var detachedDocument = function (title) {
+      var html = document.createElement("html"), head = document.createElement("head"), body = document.createElement("body");
+      html.appendChild(head);
+      html.appendChild(body);
+      if (title !== undefined) {
+        var t = document.createElement("title");
+        t.textContent = String(title);
+        head.appendChild(t);
+      }
+      var doc = {
+        nodeType: 9, nodeName: "#document", documentElement: html, head: head, body: body, contentType: "text/html",
+        compatMode: "CSS1Compat", characterSet: "UTF-8", readyState: "complete", defaultView: null,
+        get title() { var t = head.querySelector("title"); return t ? t.textContent : ""; },
+        set title(v) { var t = head.querySelector("title"); if (!t) { t = document.createElement("title"); head.appendChild(t); } t.textContent = String(v); },
+        get firstChild() { return html; }, get childNodes() { return [html]; }, get children() { return [html]; },
+        createElement: function (t) { return document.createElement(t); },
+        createElementNS: function (n, t) { return document.createElementNS(n, t); },
+        createTextNode: function (t) { return document.createTextNode(t); },
+        createComment: function (t) { return document.createComment(t); },
+        createDocumentFragment: function () { return document.createDocumentFragment(); },
+        createTreeWalker: function (r, w, f) { return document.createTreeWalker(r, w, f); },
+        importNode: function (n, deep) { return n.cloneNode(!!deep); },
+        adoptNode: function (n) { if (n.parentNode) n.parentNode.removeChild(n); return n; },
+        querySelector: function (q) { return html.querySelector(q); },
+        querySelectorAll: function (q) { return html.querySelectorAll(q); },
+        getElementById: function (id) { return html.querySelector("[id=" + JSON.stringify(String(id)) + "]"); },
+        getElementsByTagName: function (t) { return html.getElementsByTagName(t); },
+        getElementsByClassName: function (c) { return html.getElementsByClassName(c); },
+        addEventListener: function () {}, removeEventListener: function () {}
+      };
+      doc.implementation = impl;
+      doc.ownerDocument = null;
+      return doc;
+    };
+    var impl = {
+      createHTMLDocument: function (title) { return detachedDocument(title); },
+      createDocument: function () { return detachedDocument(); },
+      createDocumentType: function (name, pub, sys) { return { nodeType: 10, name: String(name), publicId: String(pub || ""), systemId: String(sys || "") }; },
+      hasFeature: function () { return true; }
+    };
+    def(document, "implementation", impl);
+    if (g.DOMImplementation) Object.setPrototypeOf(impl, g.DOMImplementation.prototype);
+  }
+  URL.createObjectURL = function (blob) {
+    if (blob && blob["%mse"] && g["%mseURL"]) return g["%mseURL"](blob);     /* a MediaSource, for a media element */
+    if(!(blob instanceof Blob))throw new TypeError("createObjectURL requires a Blob");return g["%blobURL"](blob._bytes,blob.type); };
+  URL.revokeObjectURL = function (url) { if (g["%mseRevoke"] && g["%mseRevoke"](String(url))) return; g["%blobURL"](String(url)); };
   nav.clipboard = {
     writeText: function (text) { try { return Promise.resolve(g["%clipboard"](String(text))); } catch(e) { return Promise.reject(new DOMException(String(e), "NotAllowedError")); } },
     readText: function () { try { return Promise.resolve(g["%clipboard"]()); } catch(e) { return Promise.reject(new DOMException(String(e), "NotAllowedError")); } }
@@ -1431,21 +2005,30 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
       dispatchEvent: function () { return true; }
     };
 
-  /* <audio>: the browser plays the sound (%media) and says what it does (%mediaState), which keeps
-   * the element's state and sends its events; the controls it draws come here too (%mediaUser).
-   * Sound may start once the user has done something on the page (or muted). <video> has no player
-   * here (a click on one downloads its file): its play() fails as for a format it cannot play. */
-  var mediaOp = g["%media"];
+  /* <audio> and <video>: the browser plays them and says what they do. <audio> files are played by
+   * webaudio.c's player (%media), whose answers come to %mediaState; <video>, and anything fed by a
+   * MediaSource, by the media engine (user/desktop/media/engine.c; %media and %mediaCmd), whose
+   * lines come to %mediaMsg. The element keeps its state and sends its events; the controls the
+   * browser draws come here too (%mediaUser). Sound may start once the user has done something on
+   * the page (or muted). */
+  var mediaOp = g["%media"], mediaCmd = g["%mediaCmd"];
   var mediaProtos = [g.HTMLMediaElement, g.HTMLAudioElement, g.HTMLVideoElement].filter(function (c) { return c; })
     .map(function (c) { return c.prototype; }).filter(function (p, i, all) { return all.indexOf(p) === i; });
   var mediaNotSupported = function () { return new DOMException("This browser cannot play that media", "NotSupportedError"); };
-  var mediaError = function () { return { code: 4, message: "The sound could not be played", MEDIA_ERR_ABORTED: 1,
-                                          MEDIA_ERR_NETWORK: 2, MEDIA_ERR_DECODE: 3, MEDIA_ERR_SRC_NOT_SUPPORTED: 4 }; };
+  var mediaError = function (code, message) {
+    var e = Object.create(g.MediaError ? g.MediaError.prototype : Object.prototype);
+    def(e, "code", code || 4);
+    def(e, "message", message || "The sound could not be played");
+    return e;
+  };
   var mstate = function (el) {
     var s = el["%ms"];
     if (!s) {
       s = { paused: true, ended: false, seeking: false, time: 0, duration: NaN, readyState: 0, networkState: 0,
-            error: null, pending: [], volume: 1, muted: el.hasAttribute("muted"), rate: 1, defaultRate: 1, pitch: true };
+            error: null, pending: [], volume: 1, muted: el.hasAttribute("muted"), rate: 1, defaultRate: 1, pitch: true,
+            engine: false, loaded: false, ms: null, srcObject: null, vw: 0, vh: 0, ranges: [], timeAt: 0, given: 0,
+            stalled: false, waiting: false, frame: false, dataLoaded: false, pendingSeek: -1, loadQueued: false,
+            frames: 0 };
       def(el, "%ms", s);
     }
     return s;
@@ -1468,22 +2051,133 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
       return !codecs ? "maybe" : codecs.indexOf("vorbis") >= 0 && codecs.indexOf("opus") < 0 ? "probably" : "";
     return "";
   };
-  var EMPTY_RANGES = { length: 0, start: function () { throw new DOMException("Index out of range", "IndexSizeError"); },
-                       end: function () { throw new DOMException("Index out of range", "IndexSizeError"); } };
-  var ranges = function (from, to) {
-    if (!(to > from)) return EMPTY_RANGES;
-    var check = function (i) { if (i !== 0) throw new DOMException("Index out of range", "IndexSizeError"); };
-    return { length: 1, start: function (i) { check(i); return from; }, end: function (i) { check(i); return to; } };
+  /* A type's codecs= list, without quotes and spaces (null if it names none). */
+  var mcodecs = function (t) {
+    var i = t.indexOf("codecs=");
+    if (i < 0) return null;
+    var v = t.slice(i + 7).split(";")[0].split(String.fromCharCode(34)).join("");
+    return v.split(",").map(function (c) { return c.trim(); }).filter(function (c) { return c; });
+  };
+  /* What the media engine plays: FFmpeg's H.264, VP8/9, MPEG-4, Theora; AAC, MP3, Opus, Vorbis, FLAC. */
+  var vplayable = function (type) {
+    var t = String(type).toLowerCase(), base = t.split(";")[0].trim(), codecs = mcodecs(t);
+    var known = function (list) {
+      if (!codecs) return "maybe";
+      return codecs.every(function (c) { return list.some(function (p) { return c.indexOf(p) === 0; }); }) ? "probably" : "";
+    };
+    var mp4 = ["avc1", "avc3", "mp4a", "mp4v", "hev1", "hvc1", "mp3", "opus", "flac", "ac-3", "ec-3"];
+    var webm = ["vp8", "vp9", "vp09", "opus", "vorbis"];
+    if (["video/mp4", "audio/mp4", "video/quicktime", "audio/x-m4a", "video/x-m4v", "audio/aac"].indexOf(base) >= 0) return known(mp4);
+    if (base === "video/webm" || base === "audio/webm") return known(webm);
+    if (base === "video/x-matroska" || base === "audio/x-matroska") return known(mp4.concat(webm));
+    if (base === "video/ogg" || base === "application/ogg") return known(["theora", "vorbis", "opus", "flac"]);
+    if (base === "video/mpeg" || base === "video/x-msvideo" || base === "video/avi") return "maybe";
+    return "";
+  };
+  /* The buffered spans media show, as TimeRanges. */
+  var TimeRanges = g.TimeRanges || function TimeRanges() { throw new TypeError("Illegal constructor"); };
+  var mkranges = function (list) { var r = Object.create(TimeRanges.prototype); def(r, "_r", list); return r; };
+  if (!g.TimeRanges) {
+    var rcheck = function (r, i) {
+      if (!(i >= 0 && i < r._r.length)) throw new DOMException("Index out of range", "IndexSizeError");
+      return r._r[i | 0];
+    };
+    Object.defineProperty(TimeRanges.prototype, "length", { configurable: true, get: function () { return this._r.length; } });
+    def(TimeRanges.prototype, "start", function (i) { return rcheck(this, Number(i))[0]; });
+    def(TimeRanges.prototype, "end", function (i) { return rcheck(this, Number(i))[1]; });
+    def(g, "TimeRanges", TimeRanges);
+  }
+  var EMPTY_RANGES = mkranges([]);
+  var ranges = function (from, to) { return to > from ? mkranges([[from, to]]) : EMPTY_RANGES; };
+  /* Whether the media engine plays it: a <video>, or anything a MediaSource feeds. */
+  var mseOf = function (el) {
+    var s = mstate(el);
+    if (s.srcObject && s.srcObject["%mse"]) return s.srcObject;
+    var src = el.getAttribute("src");
+    return src && g["%mseFor"] ? g["%mseFor"](el.src) : null;
+  };
+  var engined = function (el) { return el.localName === "video" || !!mstate(el).ms || !!mseOf(el); };
+  /* Where it is: what the engine last said, and the time since while it plays. */
+  var mnow = function (el) {
+    var s = mstate(el);
+    if (!s.engine || s.paused || s.seeking || s.stalled || !s.timeAt) return s.time;
+    var t = s.time + Math.min((performance.now() - s.timeAt) / 1000, 1);
+    if (s.duration >= 0 && t > s.duration) t = s.duration;
+    if (t < s.given) t = s.given;
+    s.given = t;
+    return t;
+  };
+  /* A new readyState, with the events that go with it. */
+  var mplaying = function (el) {
+    var s = mstate(el);
+    if (!s.paused && s.waiting) {
+      s.waiting = false;
+      mfire(el, "playing");
+    }
+    if (!s.paused) msettle(s);
+  };
+  var mwaiting = function (el) {
+    var s = mstate(el);
+    if (!s.paused && !s.waiting) {
+      s.waiting = true;
+      mfire(el, "waiting");
+    }
+  };
+  var mready = function (el, rs) {
+    var s = mstate(el), old = s.readyState;
+    if (rs === old) return;
+    s.readyState = rs;
+    if (old < 1 && rs >= 1) {
+      s.networkState = 1;
+      mfire(el, "loadedmetadata");
+      if (s.pendingSeek >= 0) {
+        var at = s.pendingSeek;
+        s.pendingSeek = -1;
+        el.currentTime = at;
+      }
+    }
+    if (rs >= 2 && !s.dataLoaded) {
+      s.dataLoaded = true;
+      mfire(el, "loadeddata");
+    }
+    if (old < 3 && rs >= 3) {
+      mfire(el, "canplay");
+      if (!s.paused) mplaying(el);
+    }
+    if (old < 4 && rs >= 4) mfire(el, "canplaythrough");
+    if (old >= 3 && rs < 3) mwaiting(el);
+  };
+  def(g, "%mstate", mstate);
+  def(g, "%mfire", mfire);
+  def(g, "%mediaReady", mready);
+  def(g, "%timeRanges", mkranges);
+  /* The resource selection algorithm, for what the engine plays. */
+  var mselect = function (el) {
+    var s = mstate(el);
+    if (s.loaded) return;
+    var ms = mseOf(el), url = el.currentSrc;
+    if (!ms && !url) return;
+    s.loaded = true;
+    s.engine = true;
+    s.networkState = 2;
+    mlater(el, ["loadstart"]);
+    if (ms) {
+      if (ms.readyState !== "closed") {
+        s.error = mediaError(4, "The MediaSource is attached elsewhere");
+        s.networkState = 3;
+        mlater(el, ["error"]);
+        return;
+      }
+      s.ms = ms;
+      mediaOp(el, "mse", 0);
+      ms._attach(el);
+    } else if (el.getAttribute("preload") !== "none" || el.autoplay) {
+      mediaOp(el, "open", 0);
+    }
   };
   mediaProtos.forEach(function (MP) {
     def(MP, "play", function () {
       var el = this, s = mstate(el);
-      if (el.localName !== "audio") {
-        mlater(el, ["error"]);
-        var no = Promise.reject(mediaNotSupported());
-        no.catch(function () {});
-        return no;
-      }
       var p = new Promise(function (resolve, reject) { s.pending.push({ resolve: resolve, reject: reject }); });
       p.catch(function () {});
       if (s.error) {
@@ -1492,6 +2186,36 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
       }
       if (!mediaOp(el, "allowed") && !s.muted) {
         msettle(s, new DOMException("play() can only start sound once the user has interacted with the page", "NotAllowedError"));
+        return p;
+      }
+      if (engined(el)) {
+        if (!s.loaded) mselect(el);
+        if (!s.loaded || s.error) {
+          if (!s.loaded) mlater(el, ["error"]);
+          msettle(s, mediaNotSupported());
+          return p;
+        }
+        var restart = s.ended;
+        if (s.ended) {
+          s.time = 0;
+          s.ended = false;
+          s.given = 0;
+        }
+        mediaOp(el, "volume", s.muted ? 0 : s.volume);
+        if (s.paused) {
+          s.paused = false;
+          s.timeAt = 0;
+          mlater(el, ["play"]);
+          mediaOp(el, "play", restart ? 0 : -1);
+          if (s.readyState >= 3) {
+            s.waiting = true;           /* "playing" follows "play" */
+            setTimeout(function () { mplaying(el); }, 0);
+          } else {
+            setTimeout(function () { mwaiting(el); }, 0);
+          }
+        } else if (s.readyState >= 3) {
+          setTimeout(function () { msettle(s); }, 0);
+        }
         return p;
       }
       if (s.ended && !el.loop) {
@@ -1508,8 +2232,12 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
     });
     def(MP, "pause", function () {
       var el = this, s = mstate(el);
+      if (!s.loaded && engined(el)) mselect(el);
       if (s.paused) return;
+      if (s.engine) s.time = mnow(el);
       s.paused = true;
+      s.timeAt = 0;
+      s.waiting = false;
       mediaOp(el, "pause", 0);
       msettle(s, new DOMException("The play() request was interrupted by a call to pause()", "AbortError"));
       mlater(el, ["timeupdate", "pause"]);
@@ -1517,45 +2245,89 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
     def(MP, "load", function () {
       var el = this, s = mstate(el), had = s.networkState !== 0;
       msettle(s, new DOMException("The play() request was interrupted by a new load request", "AbortError"));
+      if (s.ms) {
+        var old = s.ms;
+        s.ms = null;
+        old._detach();
+      }
       mediaOp(el, "load", 0);
       s.paused = true; s.ended = false; s.seeking = false; s.time = 0; s.duration = NaN;
       s.readyState = 0; s.networkState = 0; s.error = null;
+      s.loaded = false; s.engine = false; s.vw = 0; s.vh = 0; s.ranges = []; s.timeAt = 0; s.given = 0;
+      s.stalled = false; s.waiting = false; s.frame = false; s.dataLoaded = false; s.pendingSeek = -1;
       if (had) mlater(el, ["emptied"]);
-      if (el.autoplay && el.localName === "audio") el.play();
+      if (engined(el)) {
+        mselect(el);
+        if (el.autoplay) el.play();
+      } else if (el.autoplay && el.localName === "audio") {
+        el.play();
+      }
     });
-    def(MP, "canPlayType", function (type) { return this.localName === "video" ? "" : mplayable(type); });
+    def(MP, "canPlayType", function (type) {
+      return this.localName === "video" ? vplayable(type) : mplayable(type);
+    });
     def(MP, "fastSeek", function (t) { this.currentTime = t; });
     def(MP, "addTextTrack", function () { return { mode: "disabled", cues: [], addCue: function () {}, removeCue: function () {} }; });
     def(MP, "setSinkId", function () { return Promise.reject(mediaNotSupported()); });
     def(MP, "captureStream", function () { throw mediaNotSupported(); });
-    ["paused", "ended", "seeking", "duration", "readyState", "networkState", "error"].forEach(function (k) {
+    ["paused", "ended", "seeking", "readyState", "networkState", "error"].forEach(function (k) {
       Object.defineProperty(MP, k, { configurable: true, get: function () { return mstate(this)[k]; } });
     });
-    var fixed = { videoWidth: 0, videoHeight: 0, textTracks: [], audioTracks: [], videoTracks: [], srcObject: null };
+    Object.defineProperty(MP, "duration", { configurable: true, get: function () { return mstate(this).duration; } });
+    var fixed = { textTracks: [], audioTracks: [], videoTracks: [] };
     Object.keys(fixed).forEach(function (k) {
       Object.defineProperty(MP, k, { configurable: true, get: function () { var v = this["%m_" + k]; return v === undefined ? fixed[k] : v; },
                                      set: function (v) { def(this, "%m_" + k, v); } });
     });
-    Object.defineProperty(MP, "buffered", { configurable: true, get: function () { var s = mstate(this); return s.readyState ? ranges(0, s.duration) : EMPTY_RANGES; } });
-    Object.defineProperty(MP, "seekable", { configurable: true, get: function () { var s = mstate(this); return s.readyState ? ranges(0, s.duration) : EMPTY_RANGES; } });
+    Object.defineProperty(MP, "videoWidth", { configurable: true, get: function () { return mstate(this).vw; } });
+    Object.defineProperty(MP, "videoHeight", { configurable: true, get: function () { return mstate(this).vh; } });
+    Object.defineProperty(MP, "srcObject", { configurable: true,
+      get: function () { return mstate(this).srcObject; },
+      set: function (v) {
+        var el = this, s = mstate(el);
+        s.srcObject = v || null;
+        if (!s.loadQueued) {
+          s.loadQueued = true;
+          queueMicrotask(function () { s.loadQueued = false; el.load(); });
+        }
+      } });
+    Object.defineProperty(MP, "buffered", { configurable: true, get: function () {
+      var s = mstate(this);
+      if (s.ms) return mkranges(s.ms._buffered());
+      if (s.engine) return mkranges(s.ranges.map(function (r) { return r.slice(); }));
+      return s.readyState ? ranges(0, s.duration) : EMPTY_RANGES;
+    } });
+    Object.defineProperty(MP, "seekable", { configurable: true, get: function () {
+      var s = mstate(this);
+      if (s.ms && !(s.duration < Infinity)) return mkranges(s.ms._seekable());
+      return s.readyState ? ranges(0, s.duration) : EMPTY_RANGES;
+    } });
     Object.defineProperty(MP, "played", { configurable: true, get: function () { var s = mstate(this); return ranges(0, s.time); } });
     Object.defineProperty(MP, "currentSrc", { configurable: true, get: function () {
       if (this.getAttribute("src")) return this.src;
-      var sources = this.getElementsByTagName("source");
+      var video = this.localName === "video", sources = this.getElementsByTagName("source");
       for (var i = 0; i < sources.length; i++)
-        if (sources[i].getAttribute("src") && (!sources[i].type || mplayable(sources[i].type))) return sources[i].src;
+        if (sources[i].getAttribute("src") && (!sources[i].type || (video ? vplayable(sources[i].type) : mplayable(sources[i].type))))
+          return sources[i].src;
       return "";
     } });
     Object.defineProperty(MP, "currentTime", { configurable: true,
-      get: function () { return mstate(this).time; },
+      get: function () { return mnow(this); },
       set: function (v) {
         var el = this, s = mstate(el), t = Number(v);
+        if (s.engine && !isFinite(t)) throw new TypeError("The provided double value is non-finite.");
         s.time = t >= 0 ? t : 0;
+        if (s.engine && s.duration >= 0 && s.time > s.duration) s.time = s.duration;
         s.ended = false;
+        s.given = 0;
+        s.timeAt = 0;
         if (s.readyState >= 1) {
           s.seeking = true;
           mediaOp(el, "seek", s.time);
           mlater(el, ["seeking"]);
+          if (s.ms) s.ms._update();
+        } else if (engined(el)) {
+          s.pendingSeek = s.time;
         }
       } });
     Object.defineProperty(MP, "volume", { configurable: true,
@@ -1579,18 +2351,48 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
       } });
     [["playbackRate", "rate"], ["defaultPlaybackRate", "defaultRate"], ["preservesPitch", "pitch"]].forEach(function (k) {
       Object.defineProperty(MP, k[0], { configurable: true, get: function () { return mstate(this)[k[1]]; },
-                                        set: function (v) { mstate(this)[k[1]] = k[0] === "preservesPitch" ? !!v : Number(v); } });
+                                        set: function (v) {
+                                          var s = mstate(this), x = k[0] === "preservesPitch" ? !!v : Number(v);
+                                          if (x === s[k[1]]) return;
+                                          s[k[1]] = x;
+                                          if (k[0] === "playbackRate") mlater(this, ["ratechange"]);
+                                        } });
     });
     [["autoplay", "autoplay"], ["loop", "loop"], ["controls", "controls"], ["defaultMuted", "muted"]].forEach(function (k) {
       Object.defineProperty(MP, k[0], { configurable: true, get: function () { return this.hasAttribute(k[1]); },
                                         set: function (v) { if (v) this.setAttribute(k[1], ""); else this.removeAttribute(k[1]); } });
     });
+    Object.defineProperty(MP, "preload", { configurable: true,
+      get: function () { var v = (this.getAttribute("preload") || "").toLowerCase(); return v === "none" || v === "metadata" ? v : v === "" && !this.hasAttribute("preload") ? "metadata" : "auto"; },
+      set: function (v) { this.setAttribute("preload", String(v)); } });
     [["NETWORK_EMPTY", 0], ["NETWORK_IDLE", 1], ["NETWORK_LOADING", 2], ["NETWORK_NO_SOURCE", 3], ["HAVE_NOTHING", 0],
      ["HAVE_METADATA", 1], ["HAVE_CURRENT_DATA", 2], ["HAVE_FUTURE_DATA", 3], ["HAVE_ENOUGH_DATA", 4]].forEach(function (c) {
       def(MP, c[0], c[1]);
       def(MP.constructor, c[0], c[1]);
     });
   });
+  if (g.HTMLVideoElement) {
+    var VP = g.HTMLVideoElement.prototype;
+    def(VP, "getVideoPlaybackQuality", function () {
+      var s = mstate(this);
+      return { creationTime: performance.now(), totalVideoFrames: s.frames, droppedVideoFrames: 0, corruptedVideoFrames: 0 };
+    });
+    Object.defineProperty(VP, "webkitDecodedFrameCount", { configurable: true, get: function () { return mstate(this).frames; } });
+    Object.defineProperty(VP, "webkitDroppedFrameCount", { configurable: true, get: function () { return 0; } });
+    var vcallbacks = [];
+    def(VP, "requestVideoFrameCallback", function (fn) {
+      var el = this;
+      vcallbacks.push(fn);
+      var id = vcallbacks.length;
+      requestAnimationFrame(function (now) { if (vcallbacks[id - 1]) { var f = vcallbacks[id - 1]; vcallbacks[id - 1] = null;
+        f(now, { mediaTime: el.currentTime, presentedFrames: mstate(el).frames, width: el.videoWidth, height: el.videoHeight }); } });
+      return id;
+    });
+    def(VP, "cancelVideoFrameCallback", function (id) { if (id > 0) vcallbacks[id - 1] = null; });
+    Object.defineProperty(VP, "disablePictureInPicture", { configurable: true, get: function () { return this.hasAttribute("disablepictureinpicture"); },
+                                                         set: function (v) { if (v) this.setAttribute("disablepictureinpicture", ""); else this.removeAttribute("disablepictureinpicture"); } });
+    def(VP, "requestPictureInPicture", function () { return Promise.reject(new DOMException("Picture-in-picture is not available", "NotSupportedError")); });
+  }
   g["%mediaState"] = function (el, type, t, d) {
     var s = mstate(el);
     if (t >= 0) s.time = t;
@@ -1634,6 +2436,83 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
       msettle(s, mediaNotSupported());
     }
   };
+  /* A line from the media engine about the element (engine.c lists them). */
+  g["%mediaMsg"] = function (el, line) {
+    var s = mstate(el), w = String(line).split(" "), verb = w[0];
+    var num = function (i) { return Number(w[i]); };
+    if (verb.indexOf("sb") === 0) {
+      if (s.ms) s.ms._message(w);
+      return;
+    }
+    if (!s.engine) return;
+    if (verb === "vmeta") {
+      s.duration = num(2) >= 0 ? num(2) / 1000 : Infinity;
+      s.vw = num(3);
+      s.vh = num(4);
+      mfire(el, "durationchange");
+      mready(el, Math.max(s.readyState, 1));
+    } else if (verb === "vfirst") {
+      s.frame = true;
+      if (s.ms) s.ms._update(); else mready(el, 4);
+    } else if (verb === "vframes") {
+      s.frames = num(2);
+    } else if (verb === "vtime") {
+      if (!s.seeking) {
+        s.time = num(2) / 1000;
+        s.timeAt = s.paused || s.stalled ? 0 : performance.now();
+        if (!s.paused) mfire(el, "timeupdate");
+      }
+    } else if (verb === "vwait") {
+      s.time = mnow(el);
+      s.stalled = true;
+      s.timeAt = 0;
+      mwaiting(el);
+    } else if (verb === "vplaying") {
+      s.stalled = false;
+      if (s.readyState >= 3 || !s.ms) mplaying(el);
+    } else if (verb === "vseeked") {
+      if (!s.seeking) return;
+      s.seeking = false;
+      s.time = num(2) / 1000;
+      s.given = 0;
+      s.timeAt = s.paused ? 0 : performance.now();
+      mfire(el, "timeupdate");
+      mfire(el, "seeked");
+      if (s.ms) s.ms._update();
+    } else if (verb === "vended") {
+      if (el.loop) {
+        s.time = 0;
+        s.given = 0;
+        mediaOp(el, "play", 0);
+        return;
+      }
+      if (s.duration >= 0 && s.duration < Infinity) s.time = s.duration;
+      s.ended = true;
+      s.paused = true;
+      s.timeAt = 0;
+      mfire(el, "timeupdate");
+      mfire(el, "pause");
+      mfire(el, "ended");
+    } else if (verb === "verror") {
+      s.error = mediaError(s.readyState ? 2 : 4, w.slice(2).join(" ") || "The video could not be played");
+      s.networkState = s.readyState ? 1 : 3;
+      s.paused = true;
+      mfire(el, "error");
+      msettle(s, mediaNotSupported());
+    } else if (verb === "vbuffered") {
+      var list = [];
+      for (var i = 0; i < num(2); i++) list.push([num(3 + 2 * i) / 1000, num(4 + 2 * i) / 1000]);
+      s.ranges = list;
+      mfire(el, "progress");
+    }
+  };
+  /* src changed: what the engine plays is loaded again after the script (an <audio> file waits for play()). */
+  g["%mediaSrc"] = function (el) {
+    var s = mstate(el);
+    if (s.loadQueued || !engined(el)) return;
+    s.loadQueued = true;
+    queueMicrotask(function () { s.loadQueued = false; el.load(); });
+  };
   g["%mediaUser"] = function (el, op, t) {
     if (op === "toggle") {
       if (el.paused) el.play(); else el.pause();
@@ -1644,6 +2523,11 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
   if (g.document)
     document.addEventListener("DOMContentLoaded", function () {
       [].forEach.call(document.querySelectorAll("audio[autoplay]"), function (a) { a.play(); });
+      [].forEach.call(document.querySelectorAll("video"), function (v) {
+        if (mstate(v).loaded) return;
+        mselect(v);
+        if (v.autoplay) v.play();
+      });
     });
   if (g.HTMLAudioElement) {
     var Audio = function Audio(src) {

@@ -138,3 +138,17 @@ test("a rejection nobody handles reaches the window (below)", function () {
 Promise.resolve().then(function () {}).then(function () {}).then(function () {
   test("unhandledrejection fired for the two that nobody handled", function () { return rejected.slice().sort(); }, ["boom", "late"]);
 });
+
+var e = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+var p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+p.setAttributeNS(null, "d", "M0 0L10 10");
+p.setAttributeNS("http://www.w3.org/1999/xlink", "xlink:href", "#x");
+e.appendChild(p);
+var h = document.createElementNS("http://www.w3.org/1999/xhtml", "div");
+test("createElementNS and the namespaced attributes", function () {
+  return [e.tagName, e.localName, p.tagName, p.getAttribute("d"), p.getAttributeNS(null, "d"),
+          p.getAttributeNS("http://www.w3.org/1999/xlink", "href"), p.hasAttributeNS(null, "d"),
+          e.namespaceURI, h.tagName, h.namespaceURI, document.body.namespaceURI,
+          (p.removeAttributeNS("http://www.w3.org/1999/xlink", "href"), p.hasAttribute("xlink:href"))];
+}, ["svg", "svg", "path", "M0 0L10 10", "M0 0L10 10", "#x", true, "http://www.w3.org/2000/svg", "DIV",
+    "http://www.w3.org/1999/xhtml", "http://www.w3.org/1999/xhtml", false]);

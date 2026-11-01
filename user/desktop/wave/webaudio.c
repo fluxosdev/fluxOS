@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -29,6 +30,7 @@
 #include "webaudio.h"
 
 #define WAVE_BIN     "/bin/wave"
+#define ENGINE_BIN   "/bin/wavemedia"
 #define OUT_RATE     44100
 #define CHUNK        1024               /* frames mixed and written at a time */
 #define MAX_STREAMS  16
@@ -41,12 +43,24 @@ extern char **environ;
 
 static int to_player = -1, from_player = -1;
 static webaudio_handler handler;
-static char answers[2048];
+static webaudio_line_handler line_handler;
+static int is_engine;
+static char answers[8192];
 static int nanswers;
 
 void webaudio_set_handler(webaudio_handler fn)
 {
     handler = fn;
+}
+
+void webaudio_set_line_handler(webaudio_line_handler fn)
+{
+    line_handler = fn;
+}
+
+int webaudio_engine(void)
+{
+    return is_engine;
 }
 
 static void player_gone(void)
@@ -79,7 +93,12 @@ static void player_said(void *ctx, int revents)
         *nl = 0;
         char what[16];
         int id = 0, a = 0, n = 0;
-        if (sscanf(line, "%15s %d %n", what, &id, &n) >= 2) {
+        if (!strncmp(line, "engine", 6)) {
+            is_engine = 1;              /* the media engine says hello first */
+        } else if (line[0] == 'v' || !strncmp(line, "sb", 2)) {
+            if (line_handler)
+                line_handler(line);
+        } else if (sscanf(line, "%15s %d %n", what, &id, &n) >= 2) {
             a = n ? atoi(line + n) : 0;
             if (handler)
                 handler(id, what, a);
@@ -116,6 +135,8 @@ static int player_start(void)
         signal(SIGINT, SIG_DFL);
         signal(SIGQUIT, SIG_DFL);
         signal(SIGPIPE, SIG_DFL);
+        char *eargv[] = { "wavemedia", NULL };
+        execve(ENGINE_BIN, eargv, environ);
         char *argv[] = { "wave", "--audio", NULL };
         execve(WAVE_BIN, argv, environ);
         _exit(127);
@@ -129,13 +150,14 @@ static int player_start(void)
     }
     to_player = in[1];
     from_player = out[0];
+    is_engine = 0;
     loop_watch(from_player, player_said, NULL);
     return 0;
 }
 
 static int tell(const char *fmt, ...)
 {
-    char line[600];
+    char line[2600];
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(line, sizeof(line), fmt, ap);
@@ -156,6 +178,7 @@ void webaudio_seek(int id, int ms) { tell("seek %d %d\n", id, ms); }
 void webaudio_volume(int id, int per_mille) { tell("volume %d %d\n", id, per_mille); }
 void webaudio_loop(int id, int on) { tell("loop %d %d\n", id, on ? 1 : 0); }
 void webaudio_close(int id) { if (to_player >= 0) tell("close %d\n", id); }
+int webaudio_send(const char *line) { return tell("%s", line); }
 
 /* ---- the player ---- */
 
@@ -175,7 +198,31 @@ struct stream {
 
 static struct stream *streams[MAX_STREAMS];
 static int dsp = -1, out_rate, out_ch;
+static int dsp_delay;                   /* frames written that the card has not played yet */
 static unsigned idle_since;
+static const struct webaudio_ext *ext;
+static pthread_mutex_t say_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void webaudio_set_ext(const struct webaudio_ext *e)
+{
+    ext = e;
+}
+
+static void say_line(const char *line, int n)
+{
+    pthread_mutex_lock(&say_lock);      /* the engine's threads speak too: whole lines only */
+    int done = 0;
+    while (done < n) {
+        int w = (int)write(1, line + done, (size_t)(n - done));
+        if (w <= 0) {
+            if (w < 0 && errno == EINTR)
+                continue;
+            _exit(0);                   /* the browser has gone */
+        }
+        done += w;
+    }
+    pthread_mutex_unlock(&say_lock);
+}
 
 static void say(const char *fmt, ...)
 {
@@ -184,8 +231,23 @@ static void say(const char *fmt, ...)
     va_start(ap, fmt);
     int n = vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
-    if (n > 0 && write(1, line, (size_t)n) < 0)
-        _exit(0);                       /* the browser has gone */
+    if (n > 0)
+        say_line(line, n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
+}
+
+void webaudio_say(const char *fmt, ...)
+{
+    char line[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (n >= (int)sizeof(line)) {       /* cut, but still a line */
+        n = (int)sizeof(line) - 1;
+        line[n - 1] = '\n';
+    }
+    if (n > 0)
+        say_line(line, n);
 }
 
 static uint32_t ratio16(uint32_t a, uint32_t b)
@@ -275,6 +337,8 @@ static void command(char *line)
 {
     char op[16];
     int id, n = 0;
+    if (ext && ext->command(line))
+        return;
     if (sscanf(line, "%15s %d %n", op, &id, &n) < 2)
         return;
     const char *rest = n ? line + n : "";
@@ -416,6 +480,8 @@ static void play_chunk(void)
             say("time %d %d\n", s->id, ms_of(s));
         }
     }
+    if (ext)
+        ext->mix(acc, CHUNK, out_rate, dsp_delay + CHUNK);
     for (int i = 0; i < CHUNK * 2; i++)
         out[i] = (int16_t)(acc[i] > 32767 ? 32767 : acc[i] < -32768 ? -32768 : acc[i]);
     if (out_ch == 1)
@@ -435,23 +501,52 @@ static void play_chunk(void)
         p += w;
         left -= (size_t)w;
     }
+    int bytes = 0;
+    if (ioctl(dsp, SNDCTL_DSP_GETODELAY, &bytes) < 0 || bytes < 0)
+        bytes = 0;
+    dsp_delay = bytes / (out_ch * 2);
+}
+
+/* No card (or another program has it): the engine's sound is used up in time, unheard, so that its
+ * clock goes on. */
+static void play_silent_chunk(void)
+{
+    static int32_t acc[CHUNK * 4 * 2];
+    static unsigned last;
+    static uint64_t owed;               /* frames due, in thousandths, so none are lost to rounding */
+    unsigned now = now_ms();
+    if (!last || now - last > 500)
+        last = now - CHUNK * 1000 / OUT_RATE;
+    owed += (uint64_t)(now - last) * OUT_RATE;
+    last = now;
+    int frames = (int)(owed / 1000);
+    if (frames > CHUNK * 4)
+        frames = CHUNK * 4;
+    owed -= (uint64_t)frames * 1000;
+    if (frames > 0) {
+        memset(acc, 0, sizeof(int32_t) * 2 * (size_t)frames);
+        ext->mix(acc, frames, OUT_RATE, 0);
+    }
+    msleep(10);                         /* the timer's tick: the sleeps are whole ticks */
 }
 
 int webaudio_main(void)
 {
     signal(SIGPIPE, SIG_DFL);
-    static char in[4096];
+    static char in[16384];
     int nin = 0;
+    if (ext)
+        say("engine\n");
     for (;;) {
-        int playing = 0;
+        int playing = 0, engine_sound = ext && ext->want_sound(), busy = ext && ext->busy();
         for (int i = 0; i < MAX_STREAMS; i++)
             playing |= streams[i] && streams[i]->playing;
-        if (!playing && dsp >= 0 && now_ms() - idle_since >= IDLE_MS) {
+        if (!playing && !engine_sound && dsp >= 0 && now_ms() - idle_since >= IDLE_MS) {
             close(dsp);                 /* the others may have the card now */
             dsp = -1;
         }
         struct pollfd pf = { 0, POLLIN, 0 };
-        int wait = playing ? 0 : dsp >= 0 ? IDLE_MS : -1;
+        int wait = playing || engine_sound ? 0 : busy ? 20 : dsp >= 0 ? IDLE_MS : -1;
         if (poll(&pf, 1, wait) > 0 && (pf.revents & (POLLIN | POLLHUP | POLLERR))) {
             int r = (int)read(0, in + nin, sizeof(in) - 1 - (size_t)nin);
             if (r <= 0)
@@ -470,7 +565,9 @@ int webaudio_main(void)
                 nin = 0;
             continue;                   /* what it said may have started or stopped something */
         }
-        if (!playing)
+        if (ext)
+            ext->tick();
+        if (!playing && !engine_sound)
             continue;
         if (device_open() < 0) {        /* no card, or another program has it: the time goes by silently */
             for (int i = 0; i < MAX_STREAMS; i++)
@@ -478,6 +575,8 @@ int webaudio_main(void)
                     streams[i]->playing = 0;
                     say("error %d\n", streams[i]->id);
                 }
+            if (engine_sound)
+                play_silent_chunk();
             continue;
         }
         play_chunk();

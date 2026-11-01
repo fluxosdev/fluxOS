@@ -31,7 +31,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -44,6 +47,7 @@
 #include "webpolicy.h"
 #include "webaudio.h"
 #include "codecs.h"
+#include "ytresolve.h"
 
 #define BR_W        800
 #define BR_H        560
@@ -260,6 +264,8 @@ struct browser {
     struct media *media;
     int nmedia, mediacap;
     int media_click, media_click_w;
+    int media_click_y, media_click_h;   /* ...and down from their top (a <video>'s controls are at its bottom) */
+    unsigned media_box_gen;             /* the layout the engine was last told the <video> boxes of */
     char status[256];
     char page_title[128];       /* the document's title, for favorites */
     int zoom;                   /* page zoom in percent, 0 for 100 (a window's; its frames follow it) */
@@ -389,6 +395,7 @@ static int nvisited;
 static void navigate(struct browser *b, const char *url, const char *post, int mode);
 static unsigned paint_batch_depth;
 static void paint(struct browser *b);
+static void paint_page(struct browser *b, struct surface *s, int ox, int oy);
 static int is_text_field(const struct node *n);
 static int has_keys(struct browser *b);
 static void draw_pop(struct browser *b, struct surface *s, int ox, int oy);
@@ -2010,6 +2017,12 @@ static void sync_frames(struct browser *b)
  * a file for the player, which says how long it is and then plays it on and off as the page asks.
  * What the player says goes to the page's scripts as the element's events (from browser_poll, not
  * while a script runs) and to the controls layout.c draws.
+ *
+ * <video>, and anything a MediaSource feeds, is played by the media engine (/bin/wavemedia, which
+ * is that same player process with FFmpeg: user/desktop/media/engine.c). The engine fetches a
+ * file's address itself (with the page's cookies and referrer); what a page appends to a
+ * SourceBuffer goes to it in files. Its pictures come in shared memory, drawn where the element
+ * is; its other lines go to the page's scripts (jsdom_media_msg), from browser_poll.
  */
 enum { M_IDLE, M_FETCHING, M_OPENING, M_READY, M_FAILED };
 enum { N_LOADSTART = 1, N_META = 2, N_PLAYING = 4, N_TIME = 8, N_SEEKED = 16, N_ENDED = 32, N_ERROR = 64 };
@@ -2020,8 +2033,20 @@ struct media {
     int want_play, playing, seeking;
     int pos_ms, dur_ms, volume;         /* volume per mille */
     int notify;                         /* N_*: what the page's scripts have still to hear */
+    /* the media engine's */
+    int engine, mse, opened;            /* it plays this; fed by a MediaSource; it has been told of it */
+    int shmid, shm_w, shm_h;            /* its frame buffers, mapped */
+    uint8_t *shm;
+    struct image frame;                 /* the last picture, in shm */
+    int frames;
+    int box_w, box_h;                   /* the box it was last told of */
+    char tmpfile[64];                   /* a blob: given to it as a file */
+    int sb[4], nsb;                     /* SourceBuffers */
+    char **lines;                       /* what it said, for the page's scripts */
+    int nlines, caplines;
 };
-static int media_ids;
+static int media_ids, sb_ids;
+static void engine_line(const char *line);
 
 /* The sound an element plays: its src, or the first <source> of a kind the player knows. */
 static int media_url(struct browser *b, struct node *n, char *out, int size)
@@ -2059,6 +2084,7 @@ static struct media *media_for(struct browser *b, struct node *n, int make)
     m->id = ++media_ids;
     m->dur_ms = -1;
     m->volume = 1000;
+    m->shmid = -1;
     return m;
 }
 
@@ -2078,9 +2104,47 @@ static void media_show(struct browser *b, struct media *m)
         paint(b);
 }
 
+static void engine_send(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void engine_send(const char *fmt, ...)
+{
+    static char line[URL_MAX + 600];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (n > 0 && n < (int)sizeof(line))
+        webaudio_send(line);
+}
+
+/* The engine forgets the element: its pictures and what it still had to say go too. */
+static void engine_close(struct media *m)
+{
+    if (m->opened)
+        engine_send("vclose %d\n", m->id);
+    if (m->shm)
+        shmdt(m->shm);
+    m->shm = NULL;
+    m->shmid = -1;
+    if (m->n)
+        m->n->vframe = NULL;
+    for (int i = 0; i < m->nlines; i++)
+        free(m->lines[i]);
+    free(m->lines);
+    m->lines = NULL;
+    m->nlines = m->caplines = 0;
+    if (m->tmpfile[0])
+        unlink(m->tmpfile);
+    m->tmpfile[0] = 0;
+    m->opened = m->mse = m->nsb = 0;
+    m->box_w = m->box_h = 0;
+    m->frames = 0;
+}
+
 static void media_drop(struct media *m)
 {
-    if (m->state == M_OPENING || m->state == M_READY)
+    if (m->engine)
+        engine_close(m);
+    else if (m->state == M_OPENING || m->state == M_READY)
         webaudio_close(m->id);
     m->id = ++media_ids;                /* what the player still says of the old one goes nowhere */
     m->state = M_IDLE;
@@ -2106,6 +2170,17 @@ static void media_answer(int id, const char *what, int a)
     for (struct browser *b = browsers; b; b = b->next)
         for (int i = 0; i < b->nmedia; i++) {
             struct media *m = &b->media[i];
+            if (id < 0 && m->engine && m->opened) {      /* the engine went: nothing it played plays */
+                engine_close(m);
+                m->engine = 1;
+                m->state = M_FAILED;
+                m->playing = m->want_play = 0;
+                char gone[64];
+                snprintf(gone, sizeof(gone), "verror %d The media engine stopped.", m->id);
+                engine_line(gone);
+                media_show(b, m);
+                continue;
+            }
             if (id < 0) {
                 if (m->state == M_OPENING || m->state == M_READY) {
                     if (m->playing || m->want_play)
@@ -2187,17 +2262,163 @@ static void media_fetched(struct browser *b, int id, const char *body, int len)
 }
 
 /* jsdom.c's h.media: what the page's scripts ask of an <audio> element. */
-static void js_media(void *ctx, struct node *n, const char *op, double value)
+static void media_handlers(void)
 {
-    struct browser *b = ctx;
     static int answered;
     if (!answered) {
         webaudio_set_handler(media_answer);
+        webaudio_set_line_handler(engine_line);
         answered = 1;
     }
+}
+
+/* What a <video> plays: its src, or the first <source> of a kind the engine knows. */
+static int engine_type_ok(const char *type)
+{
+    static const char *const known[] = { "video/mp4", "video/webm", "video/ogg", "video/quicktime", "video/x-matroska",
+                                         "video/x-m4v", "audio/mp4", "audio/webm", "audio/ogg", "audio/mpeg",
+                                         "audio/aac", "audio/flac", "audio/wav", "application/ogg" };
+    size_t n = strcspn(type, ";");
+    while (n && type[n - 1] == ' ')
+        n--;
+    for (unsigned i = 0; i < sizeof(known) / sizeof(known[0]); i++)
+        if (strlen(known[i]) == n && !strncasecmp(type, known[i], n))
+            return !strstr(type, "av01");
+    return 0;
+}
+
+static int engine_url(struct browser *b, struct node *n, char *out, int size)
+{
+    const char *src = node_attr(n, "src");
+    for (struct node *k = n->first; (!src || !*src) && k; k = k->next) {
+        const char *type = k->type == N_ELEMENT && k->tag == T_SOURCE ? node_attr(k, "type") : NULL;
+        if (k->type == N_ELEMENT && k->tag == T_SOURCE && (!type || !*type || engine_type_ok(type)))
+            src = node_attr(k, "src");
+    }
+    if (!src || !*src)
+        return 0;
+    url_resolve(b->base, src, out, size);
+    return 1;
+}
+
+/* Give the engine the element's file or address. */
+static void engine_open(struct browser *b, struct media *m)
+{
+    char url[URL_MAX], path[URL_MAX];
+    engine_close(m);
+    m->engine = 1;
+    m->state = M_FETCHING;
+    if (!engine_url(b, m->n, url, sizeof(url))) {
+        char why[64];
+        snprintf(why, sizeof(why), "verror %d There is nothing to play.", m->id);
+        engine_line(why);
+        return;
+    }
+    snprintf(m->url, sizeof(m->url), "%s", url);
+    if (!strncmp(url, "blob:", 5)) {    /* the page's own bytes: a file for the engine */
+        char origin[300] = "null", type[128];
+        unsigned char *bytes = NULL;
+        size_t len = 0;
+        web_origin(b->url, origin, sizeof(origin));
+        int fd = -1;
+        if (web_blob_read(b->js, origin, url, &bytes, &len, type)) {
+            mkdir("/tmp", 01777);
+            snprintf(m->tmpfile, sizeof(m->tmpfile), "/tmp/wave-video-XXXXXX");
+            fd = mkstemp(m->tmpfile);
+        }
+        size_t done = 0;
+        while (fd >= 0 && done < len) {
+            int w = (int)write(fd, bytes + done, len - done);
+            if (w <= 0)
+                break;
+            done += (size_t)w;
+        }
+        if (fd >= 0)
+            close(fd);
+        free(bytes);
+        if (fd < 0 || done < len) {
+            if (m->tmpfile[0])
+                unlink(m->tmpfile);
+            m->tmpfile[0] = 0;
+            char why[64];
+            snprintf(why, sizeof(why), "verror %d The video could not be read.", m->id);
+            engine_line(why);
+            return;
+        }
+        engine_send("vopen %d %s\n", m->id, m->tmpfile);
+    } else if (url_is_file(url)) {
+        if (!url_file_path(url, path, sizeof(path)))
+            return;
+        engine_send("vopen %d %s\n", m->id, path);
+    } else if (url_is_http(url) || url_is_https(url)) {
+        char cookie[2048] = "";
+        cookie_header_context(url, top_of(b)->url, 0, 1, cookie, sizeof(cookie));
+        engine_send("vhdr %d User-Agent: %s\n", m->id, BROWSER_USER_AGENT);
+        if (cookie[0])
+            engine_send("vhdr %d Cookie: %s\n", m->id, cookie);
+        if (url_is_http(b->url) || url_is_https(b->url)) {
+            char ref[URL_MAX];
+            snprintf(ref, sizeof(ref), "%s", b->url);
+            url_strip_fragment(ref);
+            engine_send("vhdr %d Referer: %s\n", m->id, ref);
+        }
+        engine_send("vopen %d %s\n", m->id, url);
+    } else {
+        char why[64];
+        snprintf(why, sizeof(why), "verror %d This address cannot be played.", m->id);
+        engine_line(why);
+        return;
+    }
+    m->opened = 1;
+}
+
+/* jsdom.c's h.media for what the engine plays. */
+static void engine_media(struct browser *b, struct media *m, const char *op, double value)
+{
+    int ms = value > 0 ? (int)(value * 1000 + .5) : 0;
+    if (!strcmp(op, "load")) {
+        media_drop(m);
+        m->engine = 0;
+        m->notify = 0;
+    } else if (!strcmp(op, "mse")) {
+        engine_close(m);
+        m->engine = m->mse = 1;
+        m->state = M_FETCHING;
+        engine_send("vmse %d\n", m->id);
+        m->opened = 1;
+    } else if (!strcmp(op, "open")) {
+        if (!m->opened)
+            engine_open(b, m);
+    } else if (!strcmp(op, "play")) {
+        if (!m->opened && !m->mse)
+            engine_open(b, m);
+        engine_send("vplay %d %d\n", m->id, value < 0 ? -1 : ms);
+        m->playing = m->want_play = 1;
+    } else if (!strcmp(op, "pause")) {
+        engine_send("vpause %d\n", m->id);
+        m->playing = m->want_play = 0;
+    } else if (!strcmp(op, "seek")) {
+        engine_send("vseek %d %d\n", m->id, ms);
+        m->pos_ms = ms;
+    } else if (!strcmp(op, "volume")) {
+        m->volume = value <= 0 ? 0 : value >= 1 ? 1000 : (int)(value * 1000 + .5);
+        engine_send("vvol %d %d\n", m->id, m->volume);
+    }
+    b->media_box_gen = 0;               /* tell it the box again */
+    media_show(b, m);
+}
+
+static void js_media(void *ctx, struct node *n, const char *op, double value)
+{
+    struct browser *b = ctx;
+    media_handlers();
     struct media *m = media_for(b, n, strcmp(op, "load") != 0);
     if (!m)
         return;
+    if (n->tag == T_VIDEO || m->engine || !strcmp(op, "mse")) {
+        engine_media(b, m, op, value);
+        return;
+    }
     int ms = value > 0 ? (int)(value * 1000 + .5) : 0;
     if (!strcmp(op, "load")) {
         media_drop(m);
@@ -2255,6 +2476,22 @@ static void media_notify(struct browser *b)
         { N_SEEKED, "seeked" }, { N_TIME, "timeupdate" }, { N_ENDED, "ended" }, { N_ERROR, "error" },
     };
     for (int i = 0; i < b->nmedia && b->js; i++) {
+        struct media *m = &b->media[i];
+        if (m->nlines) {                /* the engine's lines, in order (a handler may change the page) */
+            char **lines = m->lines;
+            int nlines = m->nlines;
+            struct node *n = m->n;
+            m->lines = NULL;
+            m->nlines = m->caplines = 0;
+            int k = 0;
+            for (; k < nlines && b->js && i < b->nmedia && b->media[i].n == n; k++)
+                jsdom_media_msg(b->js, n, lines[k]);
+            for (int j = 0; j < nlines; j++)
+                free(lines[j]);
+            free(lines);
+            if (k < nlines)
+                return;
+        }
         int bits = b->media[i].notify;
         if (!bits)
             continue;
@@ -2270,12 +2507,254 @@ static void media_notify(struct browser *b)
     }
 }
 
-/* A press on an <audio>'s controls: the play button plays or pauses, the bar goes to that point. */
+/* Draw a new picture of a <video>: only where it is, if nothing else on the screen could have
+ * changed or covers it in ways that box would not show; else all of it. */
+static void video_repaint(struct browser *b, struct node *n)
+{
+    struct browser *t = top_of(b);
+    if (!t->win || tab_hidden(b))
+        return;
+    const struct ditem *d = NULL;
+    for (int i = 0; b->root && i < b->lo.nitems; i++)
+        if (b->lo.items[i].node == n && b->lo.items[i].kind == DK_CONTROL)
+            d = &b->lo.items[i];
+    if (!d || is_frame(b) || b != shown_tab || paint_batch_depth || b->need_layout || b->need_style ||
+        b->discover_changes || b->vt || b->ctx_open || b->tip_shown || b->pop_node || b->find_open || t->ctx_open ||
+        t->tip_shown || b->scroll_x != b->shown_sx || b->scroll_y != b->shown_sy || b->layouts != b->shown_layouts ||
+        d->sb || d->dyn || d->xf || d->fx || d->opacity_group || d->vtg) {
+        paint(b);
+        return;
+    }
+    struct rect v = view_rect(b);
+    struct rect r = rect_intersect(v, mkrect(v.x + d->x - b->scroll_x, v.y + d->y - b->scroll_y, d->w, d->h));
+    if (rect_empty(r))
+        return;
+    struct surface *s = &b->win->content;
+    struct rect saved = s->clip;
+    s->clip = rect_intersect(saved, r);
+    paint_page(b, s, 0, 0);
+    s->clip = saved;
+    wm_damage_client(b->win, r);
+}
+
+/* Tell the engine the size of each <video>'s box, after a layout (frames come scaled to it). */
+static void media_boxes(struct browser *b)
+{
+    unsigned gen = b->layouts * 2 + 1;
+    if (b->media_box_gen == gen || !b->root)
+        return;
+    b->media_box_gen = gen;
+    for (int i = 0; i < b->nmedia; i++) {
+        struct media *m = &b->media[i];
+        if (!m->engine || !m->opened || m->n->tag != T_VIDEO)
+            continue;
+        int w = 0, h = 0;
+        for (int k = 0; k < b->lo.nitems; k++)
+            if (b->lo.items[k].node == m->n && b->lo.items[k].kind == DK_CONTROL) {
+                w = b->lo.items[k].w;
+                h = b->lo.items[k].h;
+            }
+        if (w > 0 && h > 0 && (w != m->box_w || h != m->box_h)) {
+            m->box_w = w;
+            m->box_h = h;
+            engine_send("vsize %d %d %d\n", m->id, w, h);
+        }
+    }
+}
+
+static int media_has_sb(const struct media *m, int sb)
+{
+    for (int i = 0; i < m->nsb; i++)
+        if (m->sb[i] == sb)
+            return 1;
+    return 0;
+}
+
+/* A line for the page's scripts, delivered from browser_poll (times: only the latest is kept). */
+static void engine_queue(struct media *m, const char *line)
+{
+    if (m->nlines && !strncmp(line, "vtime ", 6) && !strncmp(m->lines[m->nlines - 1], "vtime ", 6)) {
+        free(m->lines[m->nlines - 1]);
+        m->lines[m->nlines - 1] = strdup(line);
+        return;
+    }
+    if (m->nlines >= 512)
+        return;                         /* a page that never lets its scripts run */
+    if (m->nlines == m->caplines) {
+        int cap = m->caplines ? m->caplines * 2 : 8;
+        char **more = realloc(m->lines, sizeof(*more) * (size_t)cap);
+        if (!more)
+            return;
+        m->lines = more;
+        m->caplines = cap;
+    }
+    if ((m->lines[m->nlines] = strdup(line)))
+        m->nlines++;
+}
+
+/* What the engine said (webaudio.c's line handler). */
+static void engine_line(const char *line)
+{
+    char verb[16];
+    int id = 0, off = 0;
+    if (sscanf(line, "%15s %d %n", verb, &id, &off) < 2)
+        return;
+    const char *rest = off ? line + off : "";
+    int sb = !strncmp(verb, "sb", 2);
+    for (struct browser *b = browsers; b; b = b->next)
+        for (int i = 0; i < b->nmedia; i++) {
+            struct media *m = &b->media[i];
+            if (!m->engine || (sb ? !media_has_sb(m, id) : m->id != id))
+                continue;
+            struct node *n = m->n;
+            if (!strcmp(verb, "vbuf")) {
+                int shmid = -1, w = 0, h = 0, nb = 0;
+                if (sscanf(rest, "%d %d %d %d", &shmid, &w, &h, &nb) != 4)
+                    return;
+                void *mem = shmat(shmid, NULL, 0);
+                if (mem == (void *)-1)
+                    return;
+                if (m->shm)
+                    shmdt(m->shm);
+                n->vframe = NULL;
+                m->shm = mem;
+                m->shmid = shmid;
+                m->shm_w = w;
+                m->shm_h = h;
+                engine_send("vbufok %d %d\n", m->id, shmid);
+                return;
+            }
+            if (!strcmp(verb, "vframe")) {
+                int shmid = -1, idx = 0, w = 0, h = 0;
+                if (sscanf(rest, "%d %d %d %d", &shmid, &idx, &w, &h) != 4 || shmid != m->shmid || !m->shm ||
+                    w > m->shm_w || h > m->shm_h || idx < 0 || idx > 3)
+                    return;
+                m->frame.w = w;
+                m->frame.h = h;
+                m->frame.px = (uint32_t *)(m->shm + (size_t)idx * (size_t)m->shm_w * (size_t)m->shm_h * 4);
+                n->vframe = &m->frame;
+                m->frames++;
+                video_repaint(b, n);
+                return;
+            }
+            int w = 0, h = 0, v = 0;
+            if (!strcmp(verb, "vmeta")) {
+                int dur = -1, a = 0;
+                sscanf(rest, "%d %d %d %d", &dur, &w, &h, &a);
+                m->dur_ms = dur;
+                m->state = M_READY;
+            } else if (!strcmp(verb, "sbinit")) {
+                int a = 0;
+                sscanf(rest, "%d %d %d %d", &v, &a, &w, &h);
+                if (!v)
+                    w = h = 0;
+                m->state = M_READY;
+            } else if (!strcmp(verb, "vfirst")) {
+                m->state = M_READY;
+            } else if (!strcmp(verb, "vtime")) {
+                m->pos_ms = atoi(rest);
+                char frames[48];
+                snprintf(frames, sizeof(frames), "vframes %d %d", m->id, m->frames);
+                engine_queue(m, frames);
+            } else if (!strcmp(verb, "vseeked")) {
+                m->pos_ms = atoi(rest);
+            } else if (!strcmp(verb, "vended")) {
+                m->playing = m->want_play = 0;
+            } else if (!strcmp(verb, "verror")) {
+                m->state = M_FAILED;
+                m->playing = m->want_play = 0;
+            }
+            if (w > 0 && h > 0 && (n->media_w != w || n->media_h != h)) {
+                n->media_w = w;         /* the picture's own size: a box without a size takes it */
+                n->media_h = h;
+                b->need_layout = 1;
+                paint(b);
+            }
+            engine_queue(m, line);
+            media_show(b, m);
+            return;
+        }
+}
+
+/* jsdom.c's h.media_cmd: a MediaSource's SourceBuffers. */
+static int js_media_cmd(void *ctx, struct node *n, const char *op, const char *str, const void *bytes, int len,
+                        double a, double bb)
+{
+    struct browser *b = ctx;
+    media_handlers();
+    struct media *m = media_for(b, n, 0);
+    if (!m || !m->engine || !m->mse)
+        return -1;
+    int sb = (int)a, seq = (int)bb;
+    char clean[256];
+    snprintf(clean, sizeof(clean), "%s", str ? str : "");
+    for (char *p = clean; *p; p++)
+        if (*p == '\n' || *p == '\r')
+            *p = ' ';
+    if (!strcmp(op, "sbadd")) {
+        if (m->nsb >= 4)
+            return -1;
+        int id = ++sb_ids;
+        m->sb[m->nsb++] = id;
+        engine_send("sbadd %d %d %s\n", m->id, id, clean);
+        return id;
+    }
+    if (!strcmp(op, "mseend")) {
+        engine_send("mseend %d %d\n", m->id, sb ? 1 : 0);
+        return 0;
+    }
+    if (!media_has_sb(m, sb))
+        return -1;
+    if (!strcmp(op, "sbappend")) {
+        char path[64] = "/tmp/wave-mse-XXXXXX";
+        mkdir("/tmp", 01777);
+        int fd = mkstemp(path), done = 0;
+        while (fd >= 0 && done < len) {
+            int w = (int)write(fd, (const char *)bytes + done, (size_t)(len - done));
+            if (w <= 0)
+                break;
+            done += w;
+        }
+        if (fd >= 0)
+            close(fd);
+        if (fd < 0 || done < len) {
+            if (fd >= 0)
+                unlink(path);
+            char err[64];
+            snprintf(err, sizeof(err), "sberr %d %d", sb, seq);
+            engine_line(err);
+            return -1;
+        }
+        engine_send("sbappend %d %d %s\n", sb, seq, path);
+    } else if (!strcmp(op, "sbremove")) {
+        engine_send("sbremove %d %d %s\n", sb, seq, clean);
+    } else if (!strcmp(op, "sbabort")) {
+        engine_send("sbabort %d\n", sb);
+    } else if (!strcmp(op, "sboffset")) {
+        engine_send("sboffset %d %s\n", sb, clean);
+    } else if (!strcmp(op, "sbdel")) {
+        engine_send("sbdel %d\n", sb);
+        for (int i = 0; i < m->nsb; i++)
+            if (m->sb[i] == sb) {
+                memmove(&m->sb[i], &m->sb[i + 1], sizeof(m->sb[0]) * (size_t)(m->nsb - i - 1));
+                m->nsb--;
+                break;
+            }
+    }
+    return 0;
+}
+
+/* A press on an <audio>'s controls: the play button plays or pauses, the bar goes to that point.
+ * A <video>'s controls are a bar along its bottom; a press elsewhere on it plays or pauses. */
 static void media_pressed(struct browser *b, struct node *n)
 {
     if (!b->js)
         return;
     int x0, x1;
+    if (n->tag == T_VIDEO && b->media_click_y < b->media_click_h - LAYOUT_VIDEO_BAR_H) {
+        jsdom_media_user(b->js, n, "toggle", 0);
+        return;
+    }
     layout_media_bar(n, b->media_click_w, &x0, &x1);
     if (b->media_click >= 0 && x1 > x0 && b->media_click >= x0 - 4 && n->media_dur_ms > 0) {
         int at = b->media_click < x0 ? x0 : b->media_click > x1 ? x1 : b->media_click;
@@ -3358,7 +3837,7 @@ static void start_scripts(struct browser *b, const char *url)
         .csp=b->csp,.sandbox=b->sandbox,
         .open_tab = js_open_tab, .window_query = js_window_query, .window_post = js_window_post,
         .window_close = js_window_close, .window_navigate = js_window_navigate, .module_done = js_module_done, .set_url = js_set_url, .submit = js_submit, .node_at = js_node_at,
-        .media = js_media, .view_transition = js_view_transition,
+        .media = js_media, .media_cmd = js_media_cmd, .view_transition = js_view_transition,
     };
     b->js = jsdom_new(&h);
     if (!b->js)
@@ -5307,14 +5786,19 @@ static void activate(struct browser *b, struct node *n)
         media_pressed(b, n);
         return;
     }
-    if (n->tag == T_VIDEO || n->tag == T_AUDIO) {
-        /* nothing here plays video: fetch the file (its src, or its first <source>) to the downloads */
+    if (n->tag == T_VIDEO) {            /* its controls, if it shows them; the page's own otherwise */
+        if (node_attr(n, "controls") && b->js)
+            media_pressed(b, n);
+        return;
+    }
+    if (n->tag == T_AUDIO) {
+        /* no scripts: fetch the file (its src, or its first <source>) to the downloads */
         const char *src = node_attr(n, "src");
         for (struct node *k = n->first; (!src || !*src) && k; k = k->next)
             if (k->type == N_ELEMENT && k->tag == T_SOURCE)
                 src = node_attr(k, "src");
         if (!src || !*src) {
-            set_status(b, "This %s has no file to download", n->tag == T_VIDEO ? "video" : "audio");
+            set_status(b, "This audio has no file to download");
             paint(b);
             return;
         }
@@ -5715,6 +6199,7 @@ enum {
     CB_SEP, CB_BACK, CB_FORWARD, CB_REFRESH, CB_STOP, CB_HOME, CB_COPYPAGE,
     CB_OPENLINK, CB_NEWTAB, CB_NEWWIN, CB_COPYLINK, CB_CUT, CB_COPY, CB_PASTE,
     CB_SAVELINK, CB_SAVEIMG, CB_COPYIMG, CB_FAVORITE, CB_FIND, CB_SAVEPAGE, CB_SOURCE, CB_PRINT,
+    CB_PLAYLINK, CB_PLAYPAGE, CB_PLAYVIDEO,
 };
 
 static const char *const ctx_labels[] = {
@@ -5726,6 +6211,8 @@ static const char *const ctx_labels[] = {
     [CB_SAVELINK] = "Save Link As...", [CB_SAVEIMG] = "Save Image As...",
     [CB_COPYIMG] = "Copy Image Address", [CB_FAVORITE] = "Add to Favorites", [CB_FIND] = "Find in Page...",
     [CB_SAVEPAGE] = "Save Page As...", [CB_SOURCE] = "View Page Source", [CB_PRINT] = "Print...",
+    [CB_PLAYLINK] = "Play in Media Player", [CB_PLAYPAGE] = "Play Video in Media Player",
+    [CB_PLAYVIDEO] = "Open Video in Media Player",
 };
 
 static int bm_find(const char *url);
@@ -7386,6 +7873,8 @@ static void ctx_add(struct browser *t, int code)
         t->ctx_codes[t->ctx_n++] = (uint8_t)code;
 }
 
+static int media_link(const char *url);
+
 /* Open the menu for a right click at (x, y) in b's own coordinates. */
 static void open_ctx(struct browser *b, int x, int y)
 {
@@ -7407,8 +7896,11 @@ static void open_ctx(struct browser *b, int x, int y)
         const struct hotspot *h = b->root ?
             layout_hit(&b->lo, b->lo.links, b->lo.nlinks, x - v.x + b->scroll_x, y - v.y + b->scroll_y,
                        b->scroll_x, b->scroll_y) : NULL;
+        char ytid[16];
         if (h && node_attr(h->node, "href")) {
             url_resolve(b->base, node_attr(h->node, "href"), t->ctx_url, sizeof(t->ctx_url));
+            if (yt_video_id(t->ctx_url, ytid) || media_link(t->ctx_url))
+                ctx_add(t, CB_PLAYLINK);
             ctx_add(t, CB_OPENLINK);
             ctx_add(t, CB_NEWTAB);
             ctx_add(t, CB_NEWWIN);
@@ -7420,6 +7912,18 @@ static void open_ctx(struct browser *b, int x, int y)
         if (under && under->tag == T_IMG && image_source(b, under, t->ctx_image, sizeof(t->ctx_image))) {
             ctx_add(t, CB_SAVEIMG);
             ctx_add(t, CB_COPYIMG);
+            ctx_add(t, CB_SEP);
+        }
+        struct node *vid = under;
+        while (vid && !(vid->type == N_ELEMENT && vid->tag == T_VIDEO))
+            vid = vid->parent;
+        if (vid && media_url(b, vid, t->ctx_image, sizeof(t->ctx_image)) &&
+            (url_is_http(t->ctx_image) || url_is_https(t->ctx_image) || url_is_file(t->ctx_image))) {
+            ctx_add(t, CB_PLAYVIDEO);   /* a plain file: the Media Player can play it */
+            ctx_add(t, CB_SEP);
+        }
+        if (yt_video_id(b->url, ytid) || yt_video_id(top_of(b)->url, ytid)) {
+            ctx_add(t, CB_PLAYPAGE);
             ctx_add(t, CB_SEP);
         }
         ctx_add(t, CB_BACK);
@@ -7465,6 +7969,33 @@ static void start_save(struct browser *t, const char *url)
     paint(t);
 }
 
+/* A link to a video or sound file the Media Player could play, by its name. */
+static int media_link(const char *url)
+{
+    static const char *const exts[] = { ".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi", ".ogv", ".mp3", ".m4a",
+                                        ".ogg", ".opus", ".flac", ".wav" };
+    char path[URL_MAX];
+    snprintf(path, sizeof(path), "%s", url);
+    path[strcspn(path, "?#")] = 0;
+    size_t n = strlen(path);
+    for (unsigned i = 0; i < sizeof(exts) / sizeof(exts[0]); i++) {
+        size_t e = strlen(exts[i]);
+        if (n > e && !strcasecmp(path + n - e, exts[i]))
+            return 1;
+    }
+    return 0;
+}
+
+/* Hand a video (a YouTube link, or a file's address) to the Media Player. */
+static void play_external(struct browser *t, const char *url)
+{
+    if (launch1("mediaplayer", url) < 0)
+        set_status(t, "Could not start the Media Player");
+    else
+        set_status(t, "Opening in the Media Player...");
+    paint(t);
+}
+
 static void ctx_action(struct browser *t, int code)
 {
     int n;
@@ -7480,6 +8011,14 @@ static void ctx_action(struct browser *t, int code)
     case CB_NEWTAB: tab_new(t, t->ctx_url, 0, t, 1); break;
     case CB_NEWWIN: browser_open(t->ctx_url); break;
     case CB_COPYLINK: clipboard_set(t->ctx_url); break;
+    case CB_PLAYLINK: play_external(t, t->ctx_url); break;
+    case CB_PLAYVIDEO: play_external(t, t->ctx_image); break;
+    case CB_PLAYPAGE: {
+        char ytid[16];
+        struct browser *pg = t->tabs ? t->tabs->active : t;
+        play_external(t, yt_video_id(pg->url, ytid) ? pg->url : t->url);
+        break;
+    }
     case CB_SAVELINK: start_save(t, t->ctx_url); break;
     case CB_SAVEIMG: start_save(t, t->ctx_image); break;
     case CB_COPYIMG: clipboard_set(t->ctx_image); break;
@@ -7975,8 +8514,10 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
                 return;
             const struct hotspot *h = layout_hit(&b->lo, b->lo.controls, b->lo.ncontrols, px, py, b->scroll_x, b->scroll_y);
             if (b->press_ctrl && h && h->node == b->press_ctrl) {
-                b->media_click = px - h->x;     /* where on an <audio>'s controls */
+                b->media_click = px - h->x;     /* where on an <audio>'s or <video>'s controls */
                 b->media_click_w = h->w;
+                b->media_click_y = py - h->y;
+                b->media_click_h = h->h;
                 activate(b, b->press_ctrl);
                 return;
             }
@@ -8571,6 +9112,8 @@ static void browser_poll_work(void)
         if (b->js)
             jsdom_run_timers(b->js);
         media_notify(b);
+        if (!hidden && b->nmedia)
+            media_boxes(b);
         if (!hidden && b->root && snap_step(b))
             paint(b);
         if (b->vt && b->vt_done) {      /* a view transition's animation is over */

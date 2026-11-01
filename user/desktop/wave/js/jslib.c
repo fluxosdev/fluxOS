@@ -2631,50 +2631,152 @@ static void read_clock(const char *p, int *h, int *mi, int *sec)
     }
 }
 
-/* A date string: ISO 8601 ("2026-10-24T13:54:46Z"), or "Oct 24 2026"-like. */
-static double parse_date(const char *s)
+/* An ISO 8601 date at p ("2026-10-24", "2026-10-24T13:54:46.250+02:00", "+002026-10-24T13:54Z"): the
+ * time, or NAN if it is not one. Local time is UTC here, so a time without an offset is UTC too. */
+static double parse_iso_date(const char *p)
 {
-    int h = 0, mi = 0, sec = 0;
-    const char *p = s;
-    while (*p == ' ')
-        p++;
     const char *q = p;
-    int y = digits(&q, 6);
-    if (y >= 0 && *q == '-') {
+    int sign = 1;
+    if (*q == '+' || *q == '-') {
+        sign = *q == '-' ? -1 : 1;
         q++;
-        int mo = digits(&q, 2), d = 1;
-        if (mo < 0)
+    }
+    const char *ys = q;
+    int y = digits(&q, 6);
+    if (y < 0 || q - ys < 4 || (*q && *q != '-' && *q != 'T' && *q != 't'))
+        return NAN;
+    int mo = 1, d = 1, h = 0, mi = 0, sec = 0, ms = 0, off = 0, timed = 0;
+    if (*q == '-') {
+        q++;
+        if ((mo = digits(&q, 2)) < 1 || mo > 12)
             return NAN;
         if (*q == '-') {
             q++;
-            d = digits(&q, 2);
-            if (d < 0)
+            if ((d = digits(&q, 2)) < 1 || d > 31)
                 return NAN;
         }
-        if (*q == 'T' || *q == ' ')
-            read_clock(q + 1, &h, &mi, &sec);
-        return make_time(y, mo - 1, d, h, mi, sec, 0);
     }
-    static const char *months[] = { "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec" };
-    for (int m = 0; m < 12; m++) {
-        const char *at = strcasestr(s, months[m]);
-        if (!at)
-            continue;
-        const char *r = at;
-        while (*r && !(*r >= '0' && *r <= '9'))
-            r++;
-        int d = digits(&r, 2);
-        while (*r == ',' || *r == ' ')
-            r++;
-        int yy = digits(&r, 4);
-        if (d < 0 || yy < 0)
+    if (*q == 'T' || *q == 't' || (*q == ' ' && q[1] >= '0' && q[1] <= '9')) {
+        q++;
+        if ((h = digits(&q, 2)) < 0 || h > 24 || *q != ':')
             return NAN;
-        const char *colon = strchr(r, ':');
-        if (colon && colon - r >= 2)
-            read_clock(colon - 2, &h, &mi, &sec);
-        return make_time(yy, m, d, h, mi, sec, 0);
+        q++;
+        if ((mi = digits(&q, 2)) < 0 || mi > 59)
+            return NAN;
+        if (*q == ':') {
+            q++;
+            if ((sec = digits(&q, 2)) < 0 || sec > 60)
+                return NAN;
+            if (*q == '.' || *q == ',') {
+                q++;
+                int scale = 100;
+                if (*q < '0' || *q > '9')
+                    return NAN;
+                while (*q >= '0' && *q <= '9') {   /* milliseconds; finer digits are dropped */
+                    ms += (*q++ - '0') * scale;
+                    scale /= 10;
+                }
+            }
+        }
+        timed = 1;
     }
-    return NAN;
+    if (*q == 'Z' || *q == 'z') {
+        q++;
+    } else if ((*q == '+' || *q == '-') && timed) {
+        int sg = *q++ == '-' ? -1 : 1, oh = digits(&q, 2), om = 0;
+        if (oh < 0 || oh > 23)
+            return NAN;
+        if (*q == ':')
+            q++;
+        if (*q >= '0' && *q <= '9' && (om = digits(&q, 2)) > 59)
+            return NAN;
+        off = sg * (oh * 60 + om);
+    }
+    while (*q == ' ')
+        q++;
+    if (*q)
+        return NAN;
+    return make_time(sign * y, mo - 1, d, h, mi, sec, ms) - off * 60000.0;
+}
+
+/* A date string: ISO 8601 ("2026-10-24T13:54:46Z"), or as people and HTTP write them:
+ * "Oct 24 2026 13:54", "Sat, 24 Oct 2026 13:54:46 GMT", "24 October 2026 1:54 PM +0200". */
+static double parse_date(const char *s)
+{
+    const char *p = s;
+    while (*p == ' ')
+        p++;
+    double iso = parse_iso_date(p);
+    if (!isnan(iso))
+        return iso;
+    static const char *months[] = { "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec" };
+    int m = -1, d = -1, y = -1, h = 0, mi = 0, sec = 0, off = 0, pm = -1;
+    char tok[64];
+    while (*p) {
+        size_t n = strcspn(p, " ,");
+        if (n == 0) {
+            p++;
+            continue;
+        }
+        snprintf(tok, sizeof(tok), "%.*s", (int)(n < sizeof(tok) - 1 ? n : sizeof(tok) - 1), p);
+        p += n;
+        char *t = tok;
+        if (!strncasecmp(t, "GMT", 3) || !strncasecmp(t, "UTC", 3))
+            t += 3;                     /* "GMT+0100" */
+        else if (*t == 'Z' && !t[1])
+            t++;
+        if (!*t)
+            continue;
+        if ((*t == '+' || *t == '-') && t[1] >= '0' && t[1] <= '9' && (y >= 0 || strchr(tok, 'G') || strchr(tok, 'U'))) {
+            const char *z = t + 1;
+            int v = digits(&z, 4);
+            off = (*t == '-' ? -1 : 1) * (z - t - 1 > 2 ? (v / 100) * 60 + v % 100 : v * 60);
+            continue;
+        }
+        if (strchr(t, ':')) {
+            read_clock(t, &h, &mi, &sec);
+            continue;
+        }
+        if (!strcasecmp(t, "am") || !strcasecmp(t, "pm")) {
+            pm = (t[0] == 'p' || t[0] == 'P');
+            continue;
+        }
+        if (*t >= '0' && *t <= '9') {
+            const char *z = t;
+            int v = digits(&z, 6);
+            if (*z == '/' ) {           /* 10/24/2026 */
+                z++;
+                int dd = digits(&z, 2), yy = -1;
+                if (*z == '/') {
+                    z++;
+                    yy = digits(&z, 4);
+                }
+                if (dd > 0 && v >= 1 && v <= 12) {
+                    m = v - 1;
+                    d = dd;
+                    if (yy >= 0)
+                        y = yy;
+                }
+            } else if (z - t >= 3 || v > 31 || d >= 0) {
+                y = v;
+            } else {
+                d = v;
+            }
+            continue;
+        }
+        for (int k = 0; k < 12; k++)
+            if (!strncasecmp(t, months[k], 3))
+                m = k;
+    }
+    if (m < 0 || d < 0 || y < 0)
+        return NAN;
+    if (y < 50)
+        y += 2000;
+    else if (y < 100)
+        y += 1900;
+    if (pm >= 0 && h <= 12)
+        h = pm ? (h % 12) + 12 : h % 12;
+    return make_time(y, m, d, h, mi, sec, 0) - off * 60000.0;
 }
 
 static jsval date_ctor(struct js *J, jsval self, jsval *args, int argc)

@@ -25,6 +25,7 @@ parser.add_argument("--timeout", type=int, default=45)
 parser.add_argument("--kvm", action="store_true", help="run the guest under KVM (same CPU model) when /dev/kvm can be opened, else under TCG as usual")
 parser.add_argument("--disk", metavar="IMAGE", help="a second IDE disk (/dev/hdb), used in place, not copied")
 parser.add_argument("--fsck-ext2", action="store_true", help="the guest leaves an ext2 volume on the scratch disk: have e2fsck check it")
+parser.add_argument("--net", action="store_true", help="give the guest an Intel PRO/1000 on QEMU's user network (NAT to the host's, with DHCP)")
 parser.add_argument("--sound", nargs="?", const="hda", choices=("hda", "sb16", "usb"), help="give the guest a sound card (HD Audio by default), record what it plays, and check that the mixer test's two tones play at once (skipped if QEMU cannot record to a WAV file)")
 args = parser.parse_args()
 
@@ -104,7 +105,8 @@ with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
     command = [qemu, *accel, "-cpu", "core2duo,-lm", "-smp", str(args.cpus),
                "-kernel", kernel, "-initrd", str(overlay), "-append", "automount=off " + args.append,
                "-m", f"{args.memory}M", "-display", "none", "-monitor", "none", "-serial", "stdio",
-               "-no-reboot", "-nic", "none", "-drive", f"file={scratch},format=raw,if=ide,index=0"]
+               "-no-reboot", "-nic", "user,model=e1000" if args.net else "none",
+               "-drive", f"file={scratch},format=raw,if=ide,index=0"]
     if args.disk:
         command += ["-drive", f"file={args.disk},format=raw,if=ide,index=1"]
     recording = temp / "sound.wav"

@@ -607,11 +607,21 @@ static int parse_repeat(struct rparser *P, struct frag *f)
         } else {
             for (int i = 0; i < min; i++)
                 fappend(P, &r, &a);
-            if (max < 0)
+            if (max < 0) {
                 star(P, &r, &a, lazy);
-            else
-                for (int i = min; i < max; i++)
-                    optional(P, &r, &a, lazy);
+            } else if (max > min) {
+                /* a{n,m}: the optional copies nested, a(a(a)?)?, not a?a?a?, so that once one is
+                 * skipped the rest are too: backtracking out of them is linear, not exponential */
+                struct frag tail = { 0 };
+                for (int i = min; i < max; i++) {
+                    struct frag inner = { 0 }, opt = { 0 };
+                    fappend(P, &inner, &a);
+                    fappend(P, &inner, &tail);
+                    optional(P, &opt, &inner, lazy);
+                    tail = opt;
+                }
+                fappend(P, &r, &tail);
+            }
         }
         a = r;
     }

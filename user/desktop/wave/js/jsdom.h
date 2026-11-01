@@ -83,6 +83,13 @@ struct jshost {
     /* <audio>: "play" (from value seconds), "pause", "seek" (to value), "volume" (0 to 1) and "load"
      * (forget the sound: its source changed); the browser answers through jsdom_media_event. */
     void (*media)(void *ctx, struct node *n, const char *op, double value);
+    /* <video> and Media Source Extensions, which the media engine plays: "sbadd" (str: the type;
+     * returns the SourceBuffer's id), "sbappend" (bytes; a: the SourceBuffer, b: the append's
+     * number), "sbremove" (str: "START_US END_US"; a, b), "sbabort" (a), "sboffset" (str: microseconds;
+     * a), "sbdel" (a), "mseend" (a: 1 ended, 0 open again). The engine's answers come back through
+     * jsdom_media_msg. */
+    int (*media_cmd)(void *ctx, struct node *n, const char *op, const char *str, const void *bytes, int len,
+                     double a, double b);
     /* document.startViewTransition(): VT_CAPTURE takes the old pictures (the page is laid out first;
      * types are the transition's types, spaces apart), VT_BEGIN the new ones and starts the animation,
      * VT_END drops it. They return 1 if done, 0 if it cannot be, -1 for elements sharing a name. The
@@ -95,6 +102,8 @@ struct jsdom;
 
 struct jsdom *jsdom_new(const struct jshost *host);
 void jsdom_free(struct jsdom *d);
+/* The bytes the page's scripts hold, once garbage is collected (for diagnosis). */
+size_t jsdom_heap_live(struct jsdom *d);
 void jsdom_focus(struct jsdom *d, struct node *n);
 struct node *jsdom_pointer_capture(struct jsdom *d);
 /* Run a script element's code (inline text, or what was fetched for its src). */
@@ -133,6 +142,9 @@ void jsdom_light_dismiss(struct jsdom *d, struct node *target, int x, int y);
  * "timeupdate", "seeked", "ended" or "error", at time seconds into it (-1: as it was), duration long
  * (-1: not known). */
 void jsdom_media_event(struct jsdom *d, struct node *n, const char *type, double time, double duration);
+/* A line the media engine said about an element's <video> or Media Source ("vtime 3 1500",
+ * "sbdone 7 2 1 0 4000000"...), for jsdomlib.h's %mediaMsg. */
+void jsdom_media_msg(struct jsdom *d, struct node *n, const char *line);
 /* The user pressed an <audio>'s controls: "toggle" (play or pause), or "seek" to time seconds. */
 void jsdom_media_user(struct jsdom *d, struct node *n, const char *op, double time);
 /* Dispatch an event at target, bubbling; returns 1 if a handler called preventDefault. */

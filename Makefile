@@ -194,11 +194,18 @@ DESKTOP_SHELL_OBJS := $(call desktop_objs,$(addprefix shell/,main.c wm.c server.
 DESKTOP_PROGS := wave terminal files editor calculator mediaplayer archiver paint gears chess minesweeper taskmgr \
                  diskmgr display mouse datetime wireless imageview
 PROG_SRCS_wave        := $(patsubst user/desktop/%,%,$(wildcard user/desktop/wave/*.c user/desktop/wave/js/*.c))
+# Wave knows YouTube links (for "Play in Media Player"), but leaves the rest of media/ to the engine
+PROG_SRCS_wave        += media/ytresolve.c media/json.c
+$(call desktop_objs,wave/browser.c): USER_CFLAGS += -Iuser/desktop/media
 PROG_SRCS_terminal    := apps/term.c
 PROG_SRCS_files       := apps/files.c
 PROG_SRCS_editor      := apps/edit.c
 PROG_SRCS_calculator  := apps/calc.c
-PROG_SRCS_mediaplayer := apps/mediaplayer.c
+# media/: what the Media Player and Wave's media engine share (FFmpeg's input from files and the web,
+# YouTube links); kept out of DESKTOP_DIRS, so out of libdesktop and Wave, which do not link FFmpeg.
+MEDIA_SRCS := json.c ytresolve.c httpio.c mediaio.c
+MEDIA_PROG_SRCS := $(addprefix media/,$(MEDIA_SRCS))
+PROG_SRCS_mediaplayer := apps/mediaplayer.c $(MEDIA_PROG_SRCS)
 PROG_SRCS_archiver    := apps/archiver.c
 PROG_SRCS_paint       := apps/paint.c
 PROG_SRCS_gears       := apps/gears.c
@@ -213,13 +220,19 @@ PROG_SRCS_wireless    := apps/wireless.c
 PROG_SRCS_imageview   := apps/imageview.c
 # Libraries a program needs besides the desktop's: the Media Player decodes with FFmpeg's.
 PROG_LIBS_mediaplayer := $(LIBFFMPEG)
-$(call desktop_objs,apps/mediaplayer.c progs/mediaplayer.c): USER_CFLAGS += $(FFMPEG_INC)
+$(call desktop_objs,apps/mediaplayer.c progs/mediaplayer.c): USER_CFLAGS += $(FFMPEG_INC) -Iuser/desktop/media
+$(call desktop_objs,$(MEDIA_PROG_SRCS)): USER_CFLAGS += $(FFMPEG_INC) -Iuser/desktop/media $(DESKTOP_INC)
+# /bin/wavemedia: Wave's media engine (<audio>, <video>, Media Source Extensions), which Wave starts in
+# place of "wave --audio": webaudio.c's player (in libdesktop) with FFmpeg behind it.
+WAVEMEDIA_SRCS := media/engine.c media/store.c media/segments.c $(MEDIA_PROG_SRCS)
+WAVEMEDIA_OBJS := $(call desktop_objs,$(WAVEMEDIA_SRCS))
+$(call desktop_objs,media/engine.c media/store.c media/segments.c): USER_CFLAGS += $(FFMPEG_INC) -Iuser/desktop/media $(DESKTOP_INC)
 DOS_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/dos/*.c)))
 # winrun, the Windows program loader (os_linux.c is its Linux back end, for host tests)
 WIN32_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(filter-out user/win32/os_linux.c,$(wildcard user/win32/*.c user/win32/*.S))))
 BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/fsh $(ROOTFS)/bin/desktop \
              $(addprefix $(ROOTFS)/bin/,$(DESKTOP_PROGS)) \
-             $(ROOTFS)/bin/dos $(ROOTFS)/bin/winrun $(ROOTFS)/bin/[ $(ROOTFS)/bin/gunzip $(ROOTFS)/bin/zcat \
+             $(ROOTFS)/bin/dos $(ROOTFS)/bin/winrun $(ROOTFS)/bin/wavemedia $(ROOTFS)/bin/[ $(ROOTFS)/bin/gunzip $(ROOTFS)/bin/zcat \
              $(ROOTFS)/usr/bin/ffmpeg $(ROOTFS)/usr/bin/ffprobe
 
 ROOTFS_FILES := $(shell find rootfs -type f 2>/dev/null)
@@ -303,6 +316,10 @@ $(ROOTFS)/bin/$(1): $(CRT0) $(call desktop_objs,progs/$(1).c $(PROG_SRCS_$(1)) s
 		$(PROG_LIBS_$(1)) $(LIBC)
 endef
 $(foreach p,$(DESKTOP_PROGS),$(eval $(call DESKTOP_PROG_RULE,$(p))))
+
+$(ROOTFS)/bin/wavemedia: $(CRT0) $(WAVEMEDIA_OBJS) $(LIBDESKTOP) $(LIBFONT) $(LIBFFMPEG) $(LIBC) user/user.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(WAVEMEDIA_OBJS) $(LIBDESKTOP) $(LIBFONT) $(LIBFFMPEG) $(LIBC)
 
 $(ROOTFS)/bin/dos: $(CRT0) $(DOS_OBJS) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
@@ -645,7 +662,7 @@ BROWSER_TEST_SRCS := lib/digest.c lib/sha256.c tests/browser-dom.c tests/canvas-
 .PHONY: test-browser
 test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-worker $(BUILD)/tests/jsworker $(BUILD)/tests/js-engine $(BUILD)/tests/browser-style $(BUILD)/tests/browser-layout $(BUILD)/tests/browser-policy $(BUILD)/tests/browser-http $(BUILD)/tests/browser-images $(BUILD)/tests/browser-navigation $(BUILD)/tests/browser-geometry $(BUILD)/tests/browser-drag $(BUILD)/tests/browser-storage $(BUILD)/tests/browser-vector-text
 	$< rootfs/usr/share/www/classlist-tests.js 20
-	$< rootfs/usr/share/www/dom-feature-tests.js 31
+	$< rootfs/usr/share/www/dom-feature-tests.js 32
 	$(BUILD)/tests/browser-storage
 	$(BUILD)/tests/browser-vector-text
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/platform-gap-tests.js 19
@@ -662,10 +679,11 @@ test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-worker $(BUILD)/
 	$(BUILD)/tests/browser-worker
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/clone-escape-tests.js 23
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/canvas-tests.js 52
-	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 135
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 139
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/inline-cache-tests.js 19
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/toplayer-tests.js 18
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/media-tests.js 5
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/mse-tests.js 7
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/view-transition-tests.js 9
 	rm -rf $(BUILD)/tests/idb
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/indexeddb-tests.js 3
@@ -786,6 +804,39 @@ $(BUILD)/tests/ffmpeg-guest.o: tests/ffmpeg-guest.c
 $(BUILD)/tests/ffmpeg-guest: $(BUILD)/tests/ffmpeg-guest.o $(CRT0) $(LIBC) user/user.ld
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 
+# Wave's media engine: host tests of what needs no FFmpeg (the coded frame store, segments, the JSON
+# reader and YouTube links; MEDIA_LIVE=1 asks YouTube too), and on the real kernel the engine itself,
+# playing real YouTube streams (fetched once by tools/media-samples.py), with a network for HTTPS.
+MEDIA_SAMPLES := $(BUILD)/tests/media-samples
+.PHONY: test-media test-media-qemu
+test-media: $(BUILD)/tests/media-store $(BUILD)/tests/media-ytresolve
+	python3 tools/media-samples.py $(MEDIA_SAMPLES) || true
+	$(BUILD)/tests/media-store $(MEDIA_SAMPLES)
+	$(BUILD)/tests/media-ytresolve
+
+$(BUILD)/tests/media-store: tests/media-store.c user/desktop/media/store.c user/desktop/media/segments.c user/desktop/media/store.h user/desktop/media/segments.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Iuser/desktop/media tests/media-store.c user/desktop/media/store.c user/desktop/media/segments.c -o $@
+
+$(BUILD)/tests/media-ytresolve: tests/media-ytresolve.c user/desktop/media/json.c user/desktop/media/ytresolve.c user/desktop/media/json.h user/desktop/media/ytresolve.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Iuser/desktop/media tests/media-ytresolve.c user/desktop/media/json.c user/desktop/media/ytresolve.c -o $@
+
+MEDIA_GUEST_OBJS := $(BUILD)/tests/media-guest.o $(call desktop_objs,media/json.c media/ytresolve.c media/httpio.c media/segments.c)
+test-media-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/media-guest
+	python3 tools/media-samples.py $(MEDIA_SAMPLES)
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/media-guest \
+		$(foreach f,yt-18.mp4 yt-133.mp4 yt-140.mp4 yt-278.webm yt-249.webm,--add $(MEDIA_SAMPLES)/$(f):/test/$(f)) \
+		--cpus $(KERNEL_TEST_CPUS) --memory 1024 $(TEST_DROP_TOOLCHAIN) --kvm --net --timeout 600 \
+		--success-marker "MEDIA REGRESSIONS PASSED"
+
+$(BUILD)/tests/media-guest.o: tests/media-guest.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Iuser/desktop/media -c $< -o $@
+
+$(BUILD)/tests/media-guest: $(MEDIA_GUEST_OBJS) $(CRT0) $(LIBC) user/user.ld
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(MEDIA_GUEST_OBJS) $(LIBC)
+
 KERNEL_TEST_MEMORY ?= 1024
 KERNEL_TEST_CMDLINE ?=
 # The card the mixer test plays on (--sound=sb16, --sound=usb), or empty for none.
@@ -833,6 +884,12 @@ $(BUILD)/tests/browser-http: tests/browser-http.c $(BROWSER_TEST_SRCS) $(DESKTOP
 		tests/browser-http.c $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS)) \
 		-lm -o $@
 
+# A real page's scripts on the host (tests/browser-page.c): not a regression test, a tool.
+$(BUILD)/tests/browser-page: tests/browser-page.c $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS)) $(DESKTOP_HDRS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -fno-pie -no-pie -DJS_HOST_TEST -DJS_TRACE_ERRORS -DIDB_DIR='"$(CURDIR)/$(BUILD)/tests/idb/"' -pthread $(DESKTOP_INC) -Iinclude -idirafter user/include \
+		tests/browser-page.c $(filter-out tests/browser-dom.c,$(BROWSER_TEST_SRCS)) -lm -o $@
+
 $(BUILD)/tests/browser-font: tests/browser-font.c user/desktop/wave/webfont.c user/desktop/wave/webutil.c user/libc/inflate.c $(FONT_SRCS) $(FREETYPE_DIR)/flux_ftoption.h
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g -msse $(DESKTOP_INC) -idirafter user/include $(FONT_FLAGS) \
@@ -879,7 +936,7 @@ $(BUILD)/tests/js-engine: $(JS_ENGINE_SRCS) $(DESKTOP_HDRS) include/flux/abi.h
 
 .PHONY: test-js bench-js
 test-js: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine
-	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 135
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 139
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/inline-cache-tests.js 19
 	rm -rf $(BUILD)/tests/idb
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/indexeddb-tests.js 3

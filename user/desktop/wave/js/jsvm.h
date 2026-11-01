@@ -919,6 +919,7 @@ struct cg {
     struct ctl *ctl;
     struct jsstr **labels;              /* labels waiting for the statement they name */
     int nlabels;
+    struct patches *chain;              /* an optional chain's short-circuits, to its end (ex_member) */
 };
 
 static void cg_word(struct cg *C, uint32_t w)
@@ -1242,6 +1243,40 @@ static void call_with(struct cg *C, int argc, int name)
         op2(C, I_CALL, -(argc + 1), argc, name);
 }
 
+/* Optional chains: a ?. that finds null or undefined skips the rest of the chain, a.b?.c.d() all of
+ * .c.d(), so each part's short-circuit jumps go to the end of the outermost part (whose object or
+ * callee chain the others are), which lands them. Only objects and callees continue a chain:
+ * keys, arguments and other subexpressions are compiled outside it. */
+static int chain_part(const struct ast *n)
+{
+    return n->kind == N_MEMBER || n->kind == N_INDEX || (n->kind == N_CALL && n->a->kind != N_SUPER);
+}
+
+static void ex_outside_chain(struct cg *C, struct ast *e)
+{
+    struct patches *keep = C->chain;
+    C->chain = NULL;
+    ex(C, e);
+    C->chain = keep;
+}
+
+static void ex_chain_object(struct cg *C, struct ast *obj)
+{
+    if (chain_part(obj))
+        ex(C, obj);
+    else
+        ex_outside_chain(C, obj);
+}
+
+static int args_outside_chain(struct cg *C, struct ast *n)
+{
+    struct patches *keep = C->chain;
+    C->chain = NULL;
+    int argc = args(C, n, 0);
+    C->chain = keep;
+    return argc;
+}
+
 static void ex_call(struct cg *C, struct ast *n)
 {
     struct ast *callee = n->a;
@@ -1253,53 +1288,55 @@ static void ex_call(struct cg *C, struct ast *n)
             op1(C, I_SUPERCALL, 1 - argc, argc);
         return;
     }
-    int name = -1, skip = -1;
+    struct patches mine = { 0 }, *outer = C->chain;
+    if (!outer)
+        C->chain = &mine;               /* the outermost part of a chain */
+    int name = -1;
     if ((callee->kind == N_MEMBER || callee->kind == N_INDEX) && callee->a->kind == N_SUPER) {
         if (callee->kind == N_MEMBER)
             op1(C, I_CONST, 1, cg_str(C, callee->str));
         else
-            ex(C, callee->b);
+            ex_outside_chain(C, callee->b);
         op(C, I_SUPERGET, 0);
         op(C, C->vf->arrow || C->vf->is_root ? I_THISDYN : I_THIS, 1);
     } else if (callee->kind == N_MEMBER || callee->kind == N_INDEX) {
-        ex(C, callee->a);
+        ex_chain_object(C, callee->a);
         if (callee->flags & F_OPTIONAL)
-            skip = jump(C, I_JNULLISH, 0);
+            patches_add(C, C->chain, jump(C, I_JNULLISH, 0));
         op(C, I_DUP, 1);
         if (callee->kind == N_MEMBER) {
             name = cg_str(C, callee->str);
             op1ic(C, I_GETPROP, 0, name);
         } else {
-            ex(C, callee->b);
+            ex_outside_chain(C, callee->b);
             op(C, I_GETELEM, -1);
         }
         op(C, I_SWAP, 0);
     } else {
-        ex(C, callee);
+        ex_chain_object(C, callee);
         if (callee->kind == N_IDENT)
             name = cg_str(C, callee->str);
         op(C, I_UNDEF, 1);
     }
-    int optional = -1;
     if (n->flags & F_OPTIONAL)
-        optional = jump(C, I_OPTCALL, 0);
+        patches_add(C, C->chain, jump(C, I_OPTCALL, 0));
     int argc;
     if (n->op == 1) {                           /* a tagged template: strings, then each value */
         struct ast *tl = n->list[0];
         op1(C, I_TEMPLATE, 1, cg_node(C, tl));
         argc = 1;
         for (int i = 1; i < tl->n; i += 2, argc++)
-            ex(C, tl->list[i]);
+            ex_outside_chain(C, tl->list[i]);
     } else {
-        argc = args(C, n, 0);
+        argc = args_outside_chain(C, n);
     }
     if(callee->kind==N_IDENT && str_is(callee->str,"eval") && !(n->flags&F_OPTIONAL) && n->op!=1)name=-2;
     call_with(C, argc, name);
-    /* A skipped call leaves undefined where its result would be. */
-    if (optional >= 0)
-        land(C, optional);
-    if (skip >= 0)
-        land(C, skip);
+    /* A skipped chain leaves undefined where its result would be. */
+    if (!outer) {
+        patches_land(C, &mine);
+        C->chain = NULL;
+    }
 }
 
 static void ex_new(struct cg *C, struct ast *n)
@@ -1322,18 +1359,22 @@ static void ex_member(struct cg *C, struct ast *n)
         op(C, I_SUPERGET, 0);
         return;
     }
-    ex(C, n->a);
-    int skip = -1;
+    struct patches mine = { 0 }, *outer = C->chain;
+    if (!outer)
+        C->chain = &mine;               /* the outermost part of a chain */
+    ex_chain_object(C, n->a);
     if (n->flags & F_OPTIONAL)
-        skip = jump(C, I_JNULLISH, 0);
+        patches_add(C, C->chain, jump(C, I_JNULLISH, 0));
     if (n->kind == N_MEMBER) {
         op1ic(C, I_GETPROP, 0, cg_str(C, n->str));
     } else {
-        ex(C, n->b);
+        ex_outside_chain(C, n->b);
         op(C, I_GETELEM, -1);
     }
-    if (skip >= 0)
-        land(C, skip);
+    if (!outer) {
+        patches_land(C, &mine);
+        C->chain = NULL;
+    }
 }
 
 /* Store the value on the stack into a simple target (a name, a member, an index)
@@ -3525,7 +3566,15 @@ L_JNULLISH:
 L_SETFNAME: name_function(sp[-1], KSTR(A)); pc++; NEXT;
 L_RETURN: result = *--sp; goto out;
 L_RETUNDEF: goto out;
-L_THROW: sp--; js_throw_value(J, sp[0]); goto unwind;
+L_THROW: sp--;
+#ifdef JS_TRACE_ERRORS
+    if (sp[0].t == JS_OBJ) {
+        jsval m = js_get(J, sp[0], "message");
+        if (m.t == JS_STR)
+            trace_error(m.u.s->s);
+    }
+#endif
+    js_throw_value(J, sp[0]); goto unwind;
 L_TRY:
     hs[nh].pc = (int)A;
     hs[nh].sp = (int)(sp - stack);

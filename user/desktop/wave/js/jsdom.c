@@ -375,6 +375,19 @@ static int insert_node(struct jsdom *d, struct node *parent, struct node *n, str
     return 0;
 }
 
+/* An element's namespace: what createElementNS gave it, else SVG for an <svg> and what is inside one. */
+static int element_ns(const struct node *n)
+{
+    if (n->ns)
+        return n->ns;
+    for (const struct node *k = n; k; k = k->parent)
+        if (k->type == N_ELEMENT && k->tag == T_SVG)
+            return NS_SVG;
+        else if (k->type == N_ELEMENT && k->ns)
+            return k->ns;
+    return NS_HTML;
+}
+
 static struct node *new_node(struct jsdom *d, int type, const char *name)
 {
     struct node *n = arena_alloc(d->h.arena, sizeof(*n));
@@ -410,6 +423,8 @@ static void ce_attr(struct jsdom *d, struct node *n, const char *name, const cha
     ce_hook(d, "%ceAttr", a, 4);
 }
 
+static void media_src_changed(struct jsdom *d, struct node *n, const char *lname);
+
 static void set_attr(struct jsdom *d, struct node *n, const char *name, const char *value)
 {
     if (!is_element(n))
@@ -434,6 +449,7 @@ static void set_attr(struct jsdom *d, struct node *n, const char *name, const ch
             if (d->custom_on && is_custom(n))
                 ce_attr(d, n, lname, old, value);
             top_layer_attr(d, n, lname, old, value);
+            media_src_changed(d, n, lname);
             return;
         }
     struct attr *a = arena_alloc(d->h.arena, sizeof(*a));
@@ -451,6 +467,7 @@ static void set_attr(struct jsdom *d, struct node *n, const char *name, const ch
     if (d->custom_on && is_custom(n))
         ce_attr(d, n, lname, NULL, value);
     top_layer_attr(d, n, lname, NULL, value);
+    media_src_changed(d, n, lname);
 }
 
 static void remove_attr(struct jsdom *d, struct node *n, const char *name)
@@ -1339,6 +1356,10 @@ static int node_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
             *out = js_str(J, "#document-fragment");
             return 1;
         }
+        if (element_ns(n) != NS_HTML) {         /* SVG and MathML names are not upper-cased */
+            *out = js_str(J, n->name);
+            return 1;
+        }
         char up[64];
         int i = 0;
         for (; n->name[i] && i < 63; i++)
@@ -1349,6 +1370,12 @@ static int node_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
     }
     if (IS("localName")) {
         *out = js_str(J, n->type == N_TEXT ? "" : n->name);
+        return 1;
+    }
+    if (IS("namespaceURI")) {
+        static const char *const uri[] = { "http://www.w3.org/1999/xhtml", "http://www.w3.org/2000/svg",
+                                           "http://www.w3.org/1998/Math/MathML" };
+        *out = n->type == N_ELEMENT && !is_fragment(n) ? js_str(J, uri[element_ns(n)]) : js_null;
         return 1;
     }
     if (IS("parentNode") || IS("parentElement")) {
@@ -3450,6 +3477,56 @@ static jsval el_has_attribute(struct js *J, jsval self, jsval *args, int argc)
     return js_bool(n && n->type == N_ELEMENT && node_attr(n, js_tostr(J, ARG(0))->s));
 }
 
+/* The namespaced forms: attributes are kept by their qualified name ("xlink:href"); a local name is
+ * found with or without its prefix. */
+static const char *attr_ns(const struct node *n, const char *local)
+{
+    const char *v = node_attr(n, local);
+    for (const struct attr *a = v ? NULL : n->attrs; a && !v; a = a->next) {
+        const char *colon = strchr(a->name, ':');
+        if (colon && !strcasecmp(colon + 1, local))
+            v = a->value;
+    }
+    return v;
+}
+
+static jsval el_get_attribute_ns(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct node *n = this_node(J, self);
+    const char *v = n && n->type == N_ELEMENT ? attr_ns(n, js_tostr(J, ARG(1))->s) : NULL;
+    return v ? js_str(J, v) : js_null;
+}
+
+static jsval el_set_attribute_ns(struct js *J, jsval self, jsval *args, int argc)
+{
+    jsval two[2] = { ARG(1), ARG(2) };
+    return el_set_attribute(J, self, two, 2);
+}
+
+static jsval el_has_attribute_ns(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct node *n = this_node(J, self);
+    return js_bool(n && n->type == N_ELEMENT && attr_ns(n, js_tostr(J, ARG(1))->s));
+}
+
+static jsval el_remove_attribute_ns(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct node *n = this_node(J, self);
+    const char *local = js_tostr(J, ARG(1))->s;
+    if (!n || n->type != N_ELEMENT)
+        return js_undefined;
+    for (const struct attr *a = n->attrs; a; a = a->next) {
+        const char *colon = strchr(a->name, ':');
+        if (!strcasecmp(a->name, local) || (colon && !strcasecmp(colon + 1, local))) {
+            char name[96];
+            snprintf(name, sizeof(name), "%s", a->name);
+            remove_attr(dom(J), n, name);
+            break;
+        }
+    }
+    return js_undefined;
+}
+
 static jsval el_toggle_attribute(struct js *J, jsval self, jsval *args, int argc)
 {
     struct node *n = this_node(J, self);
@@ -4562,6 +4639,25 @@ static jsval doc_create_element(struct js *J, jsval self, jsval *args, int argc)
             return made;
     }
     struct node *n = new_node(d, N_ELEMENT, name->s);
+    return wrap(d, n);
+}
+
+/* document.createElementNS(namespace, qualifiedName): the name after any prefix; SVG and MathML
+ * elements remember their namespace. */
+static jsval doc_create_element_ns(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct jsdom *d = dom(J);
+    const char *ns = ARG(0).t == JS_NULL || ARG(0).t == JS_UNDEF ? "" : js_tostr(J, ARG(0))->s;
+    struct jsstr *q = js_tostr(J, ARG(1));
+    const char *local = strchr(q->s, ':') ? strchr(q->s, ':') + 1 : q->s;
+    int kind = !strcmp(ns, "http://www.w3.org/2000/svg") ? NS_SVG : !strcmp(ns, "http://www.w3.org/1998/Math/MathML") ? NS_MATHML : NS_HTML;
+    if (kind == NS_HTML) {
+        jsval name = js_str(J, local);
+        return doc_create_element(J, self, &name, 1);
+    }
+    struct node *n = new_node(d, N_ELEMENT, local);
+    if (n)
+        n->ns = (uint8_t)kind;
     return wrap(d, n);
 }
 
@@ -6425,7 +6521,8 @@ void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, i
     X(W, TrustedScript) X(W, TrustedScriptURL) X(W, TrustedTypePolicy) X(W, TrustedTypePolicyFactory)        \
     X(W, trustedTypes) X(D, pointerLockElement) X(D, exitPointerLock) X(D, caretPositionFromPoint)           \
     X(D, caretRangeFromPoint) X(E, requestPointerLock) X(E, attachInternals) X(E, setHTML)                   \
-    X(E, setHTMLUnsafe) X(D, startViewTransition) X(D, activeViewTransition) X(W, ViewTransition)
+    X(E, setHTMLUnsafe) X(D, startViewTransition) X(D, activeViewTransition) X(W, ViewTransition)         \
+    X(W, MediaSource) X(W, SourceBuffer) X(W, SourceBufferList)
 
 static void dom_lib_load(struct jsdom *d)
 {
@@ -6613,6 +6710,48 @@ void jsdom_media_user(struct jsdom *d, struct node *n, const char *op, double ti
     media_call(d, "%mediaUser", n, op, time, 0);
 }
 
+size_t jsdom_heap_live(struct jsdom *d)
+{
+    gc_collect(d->J);
+    return gc_heap_bytes(d->J);
+}
+
+void jsdom_media_msg(struct jsdom *d, struct node *n, const char *line)
+{
+    media_call(d, "%mediaMsg", n, line, 0, 0);
+}
+
+/* A media element's src changed: its media are loaded again (%mediaSrc decides, after the script). */
+static void media_src_changed(struct jsdom *d, struct node *n, const char *lname)
+{
+    if (!((n->tag == T_VIDEO || n->tag == T_AUDIO) && !strcmp(lname, "src") && d->window))
+        return;
+    /* in the middle of a script: the hook queues the load, which runs when the script's jobs do */
+    struct js *J = d->J;
+    jsval fn = js_get(J, js_obj(d->window), "%mediaSrc"), r;
+    if (!js_is_callable(fn))
+        return;
+    jsval args[1] = { wrap(d, n) };
+    if (js_call(J, fn, js_undefined, args, 1, &r) < 0)
+        report(d, "%mediaSrc");
+}
+
+/* %mediaCmd(el, op, x, a, b): h.media_cmd, x a string or bytes. */
+static jsval media_cmd_api(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    struct jsdom *d = dom(J);
+    struct node *n = node_of(ARG(0));
+    const char *op = js_tostr(J, ARG(1))->s;
+    if (!n || !d->h.media_cmd)
+        return js_num(-1);
+    int len = 0;
+    unsigned char *bytes = js_binary_bytes(ARG(2), &len);
+    const char *str = bytes ? "" : js_tostr(J, ARG(2))->s;
+    return js_num(d->h.media_cmd(d->h.ctx, n, op, str, bytes, bytes ? len : 0, js_to_number(J, ARG(3)),
+                                 js_to_number(J, ARG(4))));
+}
+
 static jsval pointer_capture_api(struct js *J, jsval self, jsval *args, int argc)
 {
     struct jsdom *d=dom(J);struct node *n=this_node(J,self);
@@ -6729,6 +6868,8 @@ struct jsdom *jsdom_new(const struct jshost *host)
         { "replaceChildren", el_replace_children, 0 }, { "getAttribute", el_get_attribute, 1 },
         { "setAttribute", el_set_attribute, 2 }, { "removeAttribute", el_remove_attribute, 1 },
         { "hasAttribute", el_has_attribute, 1 }, { "toggleAttribute", el_toggle_attribute, 1 },
+        { "getAttributeNS", el_get_attribute_ns, 2 }, { "setAttributeNS", el_set_attribute_ns, 3 },
+        { "hasAttributeNS", el_has_attribute_ns, 2 }, { "removeAttributeNS", el_remove_attribute_ns, 2 },
         { "getAttributeNames", el_get_attribute_names, 0 }, { "hasAttributes", el_has_attributes, 0 },
         { "querySelector", el_query_selector, 1 }, { "querySelectorAll", el_query_selector_all, 1 },
         { "getElementsByTagName", el_get_by_tag, 1 }, { "getElementsByClassName", el_get_by_class, 1 },
@@ -6856,7 +6997,7 @@ struct jsdom *jsdom_new(const struct jshost *host)
         { "getElementById", doc_get_by_id, 1 }, { "getElementsByTagName", el_get_by_tag, 1 },
         { "getElementsByClassName", el_get_by_class, 1 }, { "getElementsByName", doc_get_by_name, 1 },
         { "querySelector", el_query_selector, 1 }, { "querySelectorAll", el_query_selector_all, 1 },
-        { "createElement", doc_create_element, 1 }, { "createElementNS", doc_create_element, 2 },
+        { "createElement", doc_create_element, 1 }, { "createElementNS", doc_create_element_ns, 2 },
         { "createTextNode", doc_create_text, 1 }, { "createComment", doc_create_comment, 1 },
         { "createDocumentFragment", doc_create_fragment, 0 }, { "write", doc_write, 1 },
         { "writeln", doc_writeln, 1 }, { "open", nothing, 0 }, { "close", nothing, 0 },
@@ -7076,7 +7217,8 @@ struct jsdom *jsdom_new(const struct jshost *host)
         { "HTMLTemplateElement", "template" }, { "HTMLTextAreaElement", "textarea" },
         { "HTMLTimeElement", "time" }, { "HTMLTitleElement", "title" }, { "HTMLTableRowElement", "tr" },
         { "HTMLTrackElement", "track" }, { "HTMLUListElement", "ul" }, { "HTMLVideoElement", "video" },
-        { "SVGElement", "svg" },
+        { "SVGElement", "svg" }, { "HTMLSlotElement", "slot" }, { "HTMLDataElement", "data" },
+        { "HTMLOutputElement", "output" }, { "HTMLProgressElement", "progress" }, { "HTMLMeterElement", "meter" },
     };
     for (unsigned i = 0; i < sizeof(ifaces) / sizeof(ifaces[0]); i++) {
         struct jsobj *proto = js_new_object(J);
@@ -7104,9 +7246,19 @@ struct jsdom *jsdom_new(const struct jshost *host)
             js_put(J, proto, S(J, "returnValue"), js_str(J, ""), 0);
         }
     }
-    jsval media_ctor = js_get(J, wv, "HTMLAudioElement");   /* HTMLMediaElement: audio and video */
-    if (media_ctor.t == JS_OBJ)
-        js_set(J, wv, "HTMLMediaElement", media_ctor);
+    /* HTMLMediaElement: what <audio> and <video> have in common, between them and HTMLElement */
+    {
+        struct jsobj *media_proto = js_new_object(J);
+        media_proto->proto = ep;
+        jsval c = js_new_function(J, nothing, "HTMLMediaElement", 0);
+        js_set(J, c, "prototype", js_obj(media_proto));
+        js_put(J, media_proto, S(J, "constructor"), c, 1);
+        js_set(J, wv, "HTMLMediaElement", c);
+        if (d->tag_protos[T_AUDIO])
+            d->tag_protos[T_AUDIO]->proto = media_proto;
+        if (d->tag_protos[T_VIDEO])
+            d->tag_protos[T_VIDEO]->proto = media_proto;
+    }
     struct jsobj *lazy_on[] = { w, dp, ep, d->text_proto, d->frag_proto };     /* W, D, E, T */
     enum { W, D, E, T, F };
     static const struct { int where; const char *name; js_native get, set; } lazy[] = {
@@ -7123,6 +7275,7 @@ struct jsdom *jsdom_new(const struct jshost *host)
     fn(J,w,"%chosenFile",chosen_file,1);
     fn(J,w,"%pointerCapture",pointer_capture_api,2);
     fn(J,w,"%media",media_api,3);
+    fn(J,w,"%mediaCmd",media_cmd_api,5);
     fn(J,w,"%winop",window_op,4);
     fn(J,w,"%b64",bytes_base64,1);
     fn(J,w,"%unb64",base64_bytes,1);

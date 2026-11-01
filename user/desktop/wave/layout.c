@@ -1645,9 +1645,15 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
             w = ZOOM(n->tag == T_PROGRESS ? 160 : 80);
         if (h < 0)
             h = ZOOM(16);
-    } else if (n->tag == T_VIDEO) {     /* nothing plays here: a box with the poster that offers the file */
-        int iw = ZOOM(canvas_attr(n, "width", n->img && n->img->w > 0 ? n->img->w : 300));
-        int ih = ZOOM(canvas_attr(n, "height", n->img && n->img->h > 0 ? n->img->h : 150));
+    } else if (n->tag == T_VIDEO) {     /* its pictures (browser.c), at their own size until it says */
+        int nw = n->media_w > 0 ? n->media_w : n->img && n->img->w > 0 ? n->img->w : 300;
+        int nh = n->media_h > 0 ? n->media_h : n->img && n->img->h > 0 ? n->img->h : 150;
+        int iw = ZOOM(canvas_attr(n, "width", nw));
+        int ih = ZOOM(canvas_attr(n, "height", nh));
+        if (node_attr(n, "width") && !node_attr(n, "height") && nw > 0)
+            ih = muldiv(iw, nh, nw);
+        else if (node_attr(n, "height") && !node_attr(n, "width") && nh > 0)
+            iw = muldiv(ih, nw, nh);
         if (w < 0 && h < 0)
             w = iw, h = ih;
         else if (w < 0)
@@ -6731,73 +6737,106 @@ static int clock_text(int ms, char *out, int size)
     return snprintf(out, (size_t)size, "%d:%02d", s / 60, s % 60);
 }
 
-/* <video>: nothing here can play it, so it shows its poster and a click downloads the file;
- * <audio controls>: a player, whose sound browser.c plays. */
+/* A frame the media engine scaled to fit the box: its rows, clipped. */
+static void blit_frame(struct surface *s, const struct image *img, int x, int y)
+{
+    struct rect r = rect_intersect(s->clip, mkrect(x, y, img->w, img->h));
+    for (int row = r.y; row < r.y + r.h; row++)
+        memcpy(&s->px[(size_t)row * (size_t)s->stride + (size_t)r.x],
+               &img->px[(size_t)(row - y) * (size_t)img->w + (size_t)(r.x - x)], (size_t)r.w * 4);
+}
+
+/* Draw text that fits in room pixels. */
+static void fitted_text(struct surface *s, const struct wfont *f, int x, int y, const char *text, int room, uint32_t color)
+{
+    int len = (int)strlen(text);
+    while (len > 0 && wfont_width(f, text, len) > room)
+        len--;
+    wfont_draw(s, f, x, y, text, len, color);
+}
+
+/* The play or pause button, the time and the bar, across a strip w wide and h tall at (x, y). */
+static void media_strip(struct surface *s, const struct node *n, const struct wfont *f, int x, int y, int w, int h,
+                        uint32_t fg, uint32_t track, uint32_t played)
+{
+    int fh = wfont_height(f), cy = y + h / 2, bh = h / 2 > 6 ? h / 2 : 6;
+    char label[160];
+    const char *file = media_file(n);
+    if (n->media_state == MEDIA_PLAYING) {              /* pause: two bars */
+        gfx_fill(s, x + 10, cy - bh / 2, bh / 3 > 2 ? bh / 3 : 2, bh, fg);
+        gfx_fill(s, x + 10 + bh / 2 + 1, cy - bh / 2, bh / 3 > 2 ? bh / 3 : 2, bh, fg);
+    } else {
+        play_triangle(s, x + 10, cy, bh, fg);
+    }
+    int x0, x1, len;
+    layout_media_bar(n, w, &x0, &x1);
+    if (n->media_state == MEDIA_FAILED) {
+        snprintf(label, sizeof(label), "Cannot play %s", *file ? file : n->tag == T_VIDEO ? "this video" : "this sound");
+        x1 = x0;                        /* no bar then: the words take the room */
+    } else if (n->media_state == MEDIA_LOADING) {
+        snprintf(label, sizeof(label), "Loading...");
+    } else {
+        len = clock_text(n->media_pos_ms, label, sizeof(label));
+        if (n->media_dur_ms >= 0) {
+            snprintf(label + len, sizeof(label) - (size_t)len, " / ");
+            clock_text(n->media_dur_ms, label + len + 3, (int)sizeof(label) - len - 3);
+        }
+    }
+    fitted_text(s, f, x + 26, y + (h - fh) / 2, label, (x1 > x0 ? x0 - 6 : w - 4) - 26, fg);
+    if (x1 > x0) {                                      /* the bar, filled as far as it has played */
+        int filled = n->media_dur_ms > 0 ? (int)((long long)(x1 - x0) * n->media_pos_ms / n->media_dur_ms) : 0;
+        filled = filled < 0 ? 0 : filled > x1 - x0 ? x1 - x0 : filled;
+        gfx_fill(s, x + x0, cy - 2, x1 - x0, 4, track);
+        gfx_fill(s, x + x0, cy - 2, filled, 4, played);
+        gfx_fill(s, x + x0 + filled - 3, cy - 5, 6, 10, played);
+    }
+}
+
+/* <video>: its picture (browser.c has it from the media engine), else its poster; with controls, a
+ * bar along its bottom. <audio controls>: a player, whose sound browser.c plays. */
 static void draw_media(struct surface *s, const struct ditem *d, int x, int y, int focused)
 {
     const struct node *n = d->node;
     const struct wfont *f = d->font;
     int fh = wfont_height(f);
-    char label[160];
-    const char *file = media_file(n);
     if (n->tag == T_VIDEO) {
-        gfx_fill(s, x, y, d->w, d->h, 0x101010);
-        if (d->img && d->img->w > 0 && d->img->h > 0) {         /* the poster, contained */
+        gfx_fill(s, x, y, d->w, d->h, 0x000000);
+        const struct image *fr = n->vframe;
+        if (fr && fr->w > 0 && fr->h > 0) {
+            if (fr->w <= d->w && fr->h <= d->h && (fr->w >= d->w - 2 || fr->h >= d->h - 2))
+                blit_frame(s, fr, x + (d->w - fr->w) / 2, y + (d->h - fr->h) / 2);     /* fitted: centred */
+            else {                      /* the box changed size since: scaled until the next frame */
+                int pw = d->w, ph = muldiv(fr->h, d->w, fr->w);
+                if (ph > d->h)
+                    ph = d->h, pw = muldiv(fr->w, d->h, fr->h);
+                draw_image_scaled(s, fr, x + (d->w - pw) / 2, y + (d->h - ph) / 2, pw, ph);
+            }
+        } else if (d->img && d->img->w > 0 && d->img->h > 0) {  /* the poster, contained */
             int pw = d->w, ph = muldiv(d->img->h, d->w, d->img->w);
             if (ph > d->h)
                 ph = d->h, pw = muldiv(d->img->w, d->h, d->img->h);
             draw_image_scaled(s, d->img, x + (d->w - pw) / 2, y + (d->h - ph) / 2, pw, ph);
         }
+        int controls = node_attr(n, "controls") != NULL;
         int bs = d->h / 4 < 48 ? d->h / 4 : 48;
-        if (bs >= 12) {
+        if (controls && !fr && n->media_state != MEDIA_PLAYING && bs >= 12) {   /* a big play button */
             int cx = x + d->w / 2, cy = y + d->h / 2;
             gfx_fill(s, cx - bs, cy - bs * 3 / 4, 2 * bs, bs * 3 / 2, 0x303030);
             play_triangle(s, cx - bs / 3, cy, bs, 0xFFFFFF);
         }
-        snprintf(label, sizeof(label), "Video%s%s - click to download", *file ? ": " : "", file);
-        if (d->h > fh * 3) {
-            int len = (int)strlen(label);
-            while (len > 0 && wfont_width(f, label, len) > d->w - 8)
-                len--;
+        if (n->media_state == MEDIA_FAILED && !controls && d->h > fh * 3) {
             gfx_fill(s, x, y + d->h - fh - 6, d->w, fh + 6, 0x000000);
-            wfont_draw(s, f, x + 4, y + d->h - fh - 3, label, len, 0xE0E0E0);
+            fitted_text(s, f, x + 4, y + d->h - fh - 3, "This video cannot be played", d->w - 8, 0xE0E0E0);
+        }
+        if (controls && d->h >= LAYOUT_VIDEO_BAR_H * 2) {
+            int by = y + d->h - LAYOUT_VIDEO_BAR_H;
+            gfx_fill(s, x, by, d->w, LAYOUT_VIDEO_BAR_H, 0x202020);
+            media_strip(s, n, f, x, by, d->w, LAYOUT_VIDEO_BAR_H, 0xF0F0F0, 0x606060, 0xFFFFFF);
         }
     } else {
         gfx_fill(s, x, y, d->w, d->h, 0xF1F3F4);
         gfx_frame(s, x, y, d->w, d->h, 0xC0C0C0);
-        int cy = y + d->h / 2, bh = d->h / 2 > 6 ? d->h / 2 : 6;
-        if (n->media_state == MEDIA_PLAYING) {          /* pause: two bars */
-            gfx_fill(s, x + 10, cy - bh / 2, bh / 3 > 2 ? bh / 3 : 2, bh, 0x202020);
-            gfx_fill(s, x + 10 + bh / 2 + 1, cy - bh / 2, bh / 3 > 2 ? bh / 3 : 2, bh, 0x202020);
-        } else {
-            play_triangle(s, x + 10, cy, bh, 0x202020);
-        }
-        int x0, x1, len;
-        layout_media_bar(n, d->w, &x0, &x1);
-        if (n->media_state == MEDIA_FAILED) {
-            snprintf(label, sizeof(label), "Cannot play %s", *file ? file : "this sound");
-            x1 = x0;                    /* no bar then: the words take the room */
-        } else if (n->media_state == MEDIA_LOADING) {
-            snprintf(label, sizeof(label), "Loading...");
-        } else {
-            len = clock_text(n->media_pos_ms, label, sizeof(label));
-            if (n->media_dur_ms >= 0) {
-                snprintf(label + len, sizeof(label) - (size_t)len, " / ");
-                clock_text(n->media_dur_ms, label + len + 3, (int)sizeof(label) - len - 3);
-            }
-        }
-        len = (int)strlen(label);
-        int room = (x1 > x0 ? x0 - 6 : d->w - 4) - 26;
-        while (len > 0 && wfont_width(f, label, len) > room)
-            len--;
-        wfont_draw(s, f, x + 26, y + (d->h - fh) / 2, label, len, 0x202020);
-        if (x1 > x0) {                                  /* the bar, filled as far as it has played */
-            int filled = n->media_dur_ms > 0 ? (int)((long long)(x1 - x0) * n->media_pos_ms / n->media_dur_ms) : 0;
-            filled = filled < 0 ? 0 : filled > x1 - x0 ? x1 - x0 : filled;
-            gfx_fill(s, x + x0, cy - 2, x1 - x0, 4, 0xC0C4C8);
-            gfx_fill(s, x + x0, cy - 2, filled, 4, 0x404040);
-            gfx_fill(s, x + x0 + filled - 3, cy - 5, 6, 10, 0x404040);
-        }
+        media_strip(s, n, f, x, y, d->w, d->h, 0x202020, 0xC0C4C8, 0x404040);
     }
     if (focused)
         gfx_focus_rect(s, mkrect(x + 1, y + 1, d->w - 2, d->h - 2));

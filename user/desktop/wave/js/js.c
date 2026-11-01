@@ -605,7 +605,7 @@ double js_to_number(struct js *J, jsval v)
         js_throw_error(J, "TypeError: Cannot convert a Symbol value to a number");
         return NAN;
     default: {
-        jsval p = js_to_primitive(J, v, 0);
+        jsval p = js_to_primitive(J, v, HINT_NUMBER);
         if (J->throwing || p.t == JS_OBJ)
             return NAN;
         return js_to_number(J, p);
@@ -1454,6 +1454,10 @@ jsval js_throw_value(struct js *J, jsval v)
     return js_undefined;
 }
 
+#ifdef JS_TRACE_ERRORS
+static void trace_error(const char *msg);
+#endif
+
 jsval js_throw_error(struct js *J, const char *fmt, ...)
 {
     char msg[400], type[32] = "Error";
@@ -1461,6 +1465,9 @@ jsval js_throw_error(struct js *J, const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+#ifdef JS_TRACE_ERRORS
+    trace_error(msg);
+#endif
     const char *text = msg;
     const char *colon = strstr(msg, ": ");
     const char *err_word = strstr(msg, "Error");
@@ -1488,21 +1495,24 @@ int js_strict_equal(jsval a, jsval b)
     }
 }
 
-jsval js_to_primitive(struct js *J, jsval v, int hint_string)
+/* ToPrimitive with a hint: HINT_DEFAULT (0: + and ==), HINT_STRING (1) or HINT_NUMBER (2: arithmetic and
+ * comparisons), which a Date tells apart (it is its string by default, its time as a number). */
+jsval js_to_primitive(struct js *J, jsval v, int hint_kind)
 {
     if (v.t != JS_OBJ)
         return v;
     struct jsobj *o = v.u.o;
+    int hint_string = hint_kind == HINT_STRING;
     jsval exotic = o->cls == C_OBJECT || o->cls == C_HOST || o->cls == C_FUNCTION
                        ? js_get(J, v, SYM_TO_PRIMITIVE) : js_undefined;
     if (js_is_callable(exotic)) {
-        jsval hint = js_str(J, hint_string ? "string" : "default");
+        jsval hint = js_str(J, hint_kind == HINT_STRING ? "string" : hint_kind == HINT_NUMBER ? "number" : "default");
         jsval r = js_call_value(J, exotic, v, &hint, 1);
         if (!J->throwing && r.t == JS_OBJ)
             js_throw_error(J, "TypeError: Symbol.toPrimitive must return a primitive value");
         return J->throwing ? js_undefined : r;
     }
-    if (o->cls == C_DATE && !hint_string)
+    if (o->cls == C_DATE && hint_kind == HINT_DEFAULT)
         hint_string = 1;
     const char *order[2] = { hint_string ? "toString" : "valueOf", hint_string ? "valueOf" : "toString" };
     for (int i = 0; i < 2; i++) {
@@ -4014,9 +4024,65 @@ static jsval make_function(struct js *J, struct ast *fn, struct env *e)
 
 static jsval start_coroutine(struct js *J, struct jsobj *f, jsval self, jsval *args, int argc);
 
+#ifdef JS_TRACE_ERRORS
+static jsval run_user_untraced(struct js *J, struct jsobj *f, jsval self, jsval *args, int argc);
+/* Host debugging (-DJS_TRACE_ERRORS, JS_TRACE=1): the functions running when an error is thrown. */
+static struct ast *trace_stack[512];
+static jsval *trace_args[512];
+static int trace_argc[512];
+static int trace_depth;
+static void trace_value(struct js *J, jsval v)
+{
+    if (v.t == JS_STR)
+        fprintf(stderr, "\"%.120s%s\"", v.u.s->s, v.u.s->len > 120 ? "..." : "");
+    else if (v.t == JS_NUM)
+        fprintf(stderr, "%.17g", v.u.n);
+    else if (v.t == JS_OBJ)
+        fprintf(stderr, "[object%s]", v.u.o->cls == C_ARRAY ? " Array" : v.u.o->cls == C_FUNCTION ? " Function" : "");
+    else
+        fprintf(stderr, "%s", v.t == JS_UNDEF ? "undefined" : v.t == JS_NULL ? "null" : v.t == JS_BOOL ? (v.u.b ? "true" : "false") : "?");
+    (void)J;
+}
+static void trace_error(const char *msg)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("JS_TRACE") != NULL;
+    if (!on)
+        return;
+    fprintf(stderr, "js trace: %s\n", msg);
+    for (int i = (trace_depth > 512 ? 512 : trace_depth) - 1, k = 0; i >= 0 && k < 12; i--, k++) {
+        struct ast *fn = trace_stack[i];
+        fprintf(stderr, "    at function %s (line %d) (", fn->str ? fn->str->s : "?", fn->line);
+        for (int a = 0; a < trace_argc[i] && a < 5; a++) {
+            if (a)
+                fprintf(stderr, ", ");
+            trace_value(NULL, trace_args[i][a]);
+        }
+        fprintf(stderr, ")\n");
+    }
+}
+#endif
+
 static jsval run_user(struct js *J, struct jsobj *f, jsval self, jsval *args, int argc)
 {
     struct ast *fn = f->fn;
+#ifdef JS_TRACE_ERRORS
+    if (trace_depth < 512) {
+        trace_stack[trace_depth] = fn;
+        trace_args[trace_depth] = args;
+        trace_argc[trace_depth] = argc;
+    }
+    trace_depth++;
+    jsval traced = run_user_untraced(J, f, self, args, argc);
+    trace_depth--;
+    return traced;
+}
+
+static jsval run_user_untraced(struct js *J, struct jsobj *f, jsval self, jsval *args, int argc)
+{
+    struct ast *fn = f->fn;
+#endif
     if (++J->depth > JS_MAX_DEPTH || js_stack_low(J)) {
         J->depth--;
         return js_throw_error(J, "RangeError: Maximum call stack size exceeded");
@@ -4194,7 +4260,7 @@ static const char *type_of(jsval v)
 static jsval to_numeric(struct js *J, jsval v)
 {
     if (v.t == JS_OBJ)
-        v = js_to_primitive(J, v, 0);
+        v = js_to_primitive(J, v, HINT_NUMBER);
     if (v.t == JS_BIG || J->throwing)
         return v;
     return js_num(js_to_number(J, v));
@@ -4258,8 +4324,8 @@ static jsval add(struct js *J, jsval a, jsval b)
 static int compare(struct js *J, jsval a, jsval b, int *undef)
 {
     *undef = 0;
-    a = js_to_primitive(J, a, 0);
-    b = js_to_primitive(J, b, 0);
+    a = js_to_primitive(J, a, HINT_NUMBER);
+    b = js_to_primitive(J, b, HINT_NUMBER);
     if (a.t == JS_STR && b.t == JS_STR) {
         const char *ap = a.u.s->s, *bp = b.u.s->s, *ae = ap + a.u.s->len, *be = bp + b.u.s->len;
         int ah = 0, bh = 0;
@@ -4325,9 +4391,9 @@ static jsval binary_op(struct js *J, int op, jsval a, jsval b)
 {
     int undef;
     if (op != OP_ADD && op <= OP_BXOR && (a.t == JS_BIG || b.t == JS_BIG || a.t == JS_OBJ || b.t == JS_OBJ)) {
-        a = js_to_primitive(J, a, 0);
+        a = js_to_primitive(J, a, HINT_NUMBER);
         TRY();
-        b = js_to_primitive(J, b, 0);
+        b = js_to_primitive(J, b, HINT_NUMBER);
         TRY();
         if (a.t == JS_BIG || b.t == JS_BIG)
             return big_op(J, op, a, b);

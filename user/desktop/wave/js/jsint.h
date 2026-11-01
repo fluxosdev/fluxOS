@@ -255,7 +255,8 @@ jsval js_throw_value(struct js *J, jsval v);
 jsval js_make_error(struct js *J, const char *type, const char *msg);
 int js_strict_equal(jsval a, jsval b);
 int js_loose_equal(struct js *J, jsval a, jsval b);
-jsval js_to_primitive(struct js *J, jsval v, int hint_string);
+enum { HINT_DEFAULT, HINT_STRING, HINT_NUMBER };
+jsval js_to_primitive(struct js *J, jsval v, int hint_kind);
 struct jsstr *js_tostr(struct js *J, jsval v);
 int js_index(jsval key, uint32_t *out);           /* key is an array index */
 struct jsstr *js_sym_desc(struct js *J, const struct jsstr *k);    /* a symbol key's description, or NULL */

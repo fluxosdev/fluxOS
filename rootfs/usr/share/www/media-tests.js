@@ -1,12 +1,14 @@
 group("<audio>: state, events and play() promises (the browser's answers played by %mediaState)");
 var said = window["%mediaState"];
 
-test("canPlayType knows the formats the player decodes, and no video", function () {
+test("canPlayType knows the formats the players decode", function () {
   var a = new Audio(), v = document.createElement("video");
   return [a.canPlayType("audio/mpeg"), a.canPlayType("audio/wav"), a.canPlayType("audio/ogg"),
           a.canPlayType("audio/ogg; codecs=vorbis"), a.canPlayType("audio/ogg; codecs=opus"),
-          a.canPlayType("audio/mp4"), v.canPlayType("video/mp4"), v.canPlayType("audio/mpeg")];
-}, ["probably", "probably", "maybe", "probably", "", "", "", ""]);
+          a.canPlayType("audio/mp4"), v.canPlayType("video/mp4"), v.canPlayType("audio/mpeg"),
+          v.canPlayType("video/mp4; codecs=\"avc1.42001E, mp4a.40.2\""), v.canPlayType("video/webm; codecs=\"vp9, opus\""),
+          v.canPlayType("video/mp4; codecs=\"av01.0.05M.08\""), v.canPlayType("video/x-flv")];
+}, ["probably", "probably", "maybe", "probably", "", "", "maybe", "", "probably", "probably", "", ""]);
 
 test("a new element has nothing yet", function () {
   var a = new Audio("x.mp3");
@@ -48,8 +50,10 @@ var log = [], results = {};
   c.addEventListener("error", function () { results.errorEvent = c.error.code; });
   c.play().then(function () { results.third = "resolved"; }, function (e) { results.third = e.name; });
   said(c, "error", -1, -1);
-  /* no player for video */
-  document.createElement("video").play().then(function () { results.video = "played"; }, function (e) { results.video = e.name; });
+  /* a video with nothing to play */
+  var empty = document.createElement("video");
+  empty.muted = true;
+  empty.play().then(function () { results.video = "played"; }, function (e) { results.video = e.name; });
 })();
 
 setTimeout(function () {

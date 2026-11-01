@@ -4,6 +4,10 @@
  * its first picture (or its cover art, or its tags); Play, Pause, Stop and the bar, which can be
  * clicked or dragged, seek.
  *
+ * Besides files it plays http:// and https:// addresses (read through media/httpio.c), and YouTube
+ * links (media/ytresolve.c finds the video's streams): one stream with both picture and sound if
+ * YouTube offers one, or else a picture stream and a sound stream, read side by side.
+ *
  * Playback is four threads of this program's, so the desktop's loop never waits on a decoder:
  *   demux   reads packets and queues them for the sound and the picture, and seeks;
  *   sound   decodes, resamples to what /dev/dsp can play (16 bit stereo, at most 48000 Hz) and
@@ -34,11 +38,15 @@
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 #include "desktop.h"
+#include "httpio.h"
+#include "mediaio.h"
+#include "ytresolve.h"
 
 #define CTRL_H    56                    /* the strip under the picture */
 #define QMAX      64                    /* packets queued per stream */
 #define LATE_MS   80                    /* a frame later than this is dropped, if more are waiting */
 #define MAX_RATE  48000                 /* what /dev/dsp plays */
+#define YT_MAX_H  480                   /* the tallest YouTube picture asked for: software decoding */
 
 enum { ST_STOPPED, ST_PLAYING, ST_PAUSED };
 enum { BT_OPEN, BT_PLAY, BT_STOP, NBT };
@@ -50,7 +58,10 @@ struct pqueue {
 
 /* One open file and the threads playing it. Shared fields are under mu. */
 struct sess {
-    AVFormatContext *fmt;
+    struct media_input in, ain;         /* what is read; ain: a separate sound stream (afmt) */
+    AVFormatContext *fmt, *afmt;
+    int veof, aeof;                     /* with afmt: each input has ended */
+    int64_t last_v_ms, last_a_ms;       /* ...and the time it has been read to */
     AVCodecContext *vdec, *adec;
     int vi, ai;                         /* stream numbers, or -1 */
     int cover;                          /* vi is a picture attached to a sound file */
@@ -70,6 +81,7 @@ struct sess {
     uint32_t clk_at;
     int running;
     int dsp, rate;                      /* /dev/dsp (or -1), and its rate */
+    int inited;                         /* mu and cv are set up */
     /* the picture, scaled to fit_w x fit_h by the video thread */
     uint32_t *vbuf;
     int vbw, vbh, vb_new;
@@ -152,6 +164,12 @@ static int64_t to_ms(int64_t ts, AVRational tb)
     return av_rescale_q(ts, tb, (AVRational){ 1, 1000 });
 }
 
+/* The sound's stream, in whichever input has it. */
+static AVStream *astream(const struct sess *s)
+{
+    return (s->afmt ? s->afmt : s->fmt)->streams[s->ai];
+}
+
 /* ---- the demux thread ---- */
 
 static void push_cover(struct sess *s)                              /* under mu */
@@ -180,28 +198,49 @@ static void *demux_main(void *arg)
             int r = av_seek_frame(s->fmt, -1, ms * 1000, AVSEEK_FLAG_BACKWARD);
             if (r < 0)
                 r = av_seek_frame(s->fmt, -1, ms * 1000, AVSEEK_FLAG_ANY);
+            if (s->afmt && av_seek_frame(s->afmt, -1, ms * 1000, AVSEEK_FLAG_BACKWARD) < 0)
+                av_seek_frame(s->afmt, -1, ms * 1000, AVSEEK_FLAG_ANY);
             pthread_mutex_lock(&s->mu);
             q_clear(&s->vq);
             q_clear(&s->aq);
             s->serial++;
             s->eof = s->vdone = s->adone = 0;
+            s->veof = s->aeof = 0;
+            s->last_v_ms = s->last_a_ms = ms;
             s->target_ms = ms;
             push_cover(s);
             pthread_cond_broadcast(&s->cv);
             continue;
         }
-        if (s->eof || (s->vq.n >= QMAX - 1) || (s->aq.n >= QMAX - 1)) {
+        AVFormatContext *from = s->fmt;
+        if (s->afmt) {                  /* two inputs: read the one that is behind, if it has room */
+            if (s->veof && s->aeof)
+                s->eof = 1;
+            int vok = !s->veof && s->vq.n < QMAX - 1, aok = !s->aeof && s->aq.n < QMAX - 1;
+            if (s->eof || (!vok && !aok)) {
+                pthread_cond_wait(&s->cv, &s->mu);
+                continue;
+            }
+            from = vok && (!aok || s->last_v_ms <= s->last_a_ms) ? s->fmt : s->afmt;
+        } else if (s->eof || (s->vq.n >= QMAX - 1) || (s->aq.n >= QMAX - 1)) {
             pthread_cond_wait(&s->cv, &s->mu);
             continue;
         }
         int serial = s->serial;
         pthread_mutex_unlock(&s->mu);
         AVPacket *pkt = av_packet_alloc();
-        int r = pkt ? av_read_frame(s->fmt, pkt) : AVERROR(ENOMEM);
+        int r = pkt ? av_read_frame(from, pkt) : AVERROR(ENOMEM);
         pthread_mutex_lock(&s->mu);
         if (r < 0) {
             av_packet_free(&pkt);
-            s->eof = 1;
+            if (serial == s->serial && !s->seek_req) {
+                if (!s->afmt)
+                    s->eof = 1;
+                else if (from == s->afmt)
+                    s->aeof = 1;
+                else
+                    s->veof = 1;
+            }
             pthread_cond_broadcast(&s->cv);
             continue;
         }
@@ -210,9 +249,19 @@ static void *demux_main(void *arg)
             continue;
         }
         pkt->opaque = (void *)(intptr_t)serial;
-        if (pkt->stream_index == s->ai && s->adec)
+        int audio = pkt->stream_index == s->ai && (s->afmt ? from == s->afmt : 1);
+        int video = pkt->stream_index == s->vi && from == s->fmt;
+        int64_t ts = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
+        if (ts != AV_NOPTS_VALUE) {
+            int64_t ms = to_ms(ts, from->streams[pkt->stream_index]->time_base);
+            if (from == s->fmt)
+                s->last_v_ms = ms;
+            else
+                s->last_a_ms = ms;
+        }
+        if (audio && s->adec)
             q_push(&s->aq, pkt);
-        else if (pkt->stream_index == s->vi && s->vdec && !s->cover)
+        else if (video && s->vdec && !s->cover)
             q_push(&s->vq, pkt);
         else
             av_packet_free(&pkt);
@@ -243,7 +292,7 @@ static void *audio_main(void *arg)
 {
     struct sess *s = arg;
     AVCodecContext *dec = s->adec;
-    AVStream *st = s->fmt->streams[s->ai];
+    AVStream *st = astream(s);
     AVFrame *frame = av_frame_alloc();
     SwrContext *swr = NULL;
     int16_t *out = NULL;
@@ -518,10 +567,14 @@ static void sess_free(struct sess *s)
 {
     if (!s)
         return;
-    pthread_mutex_lock(&s->mu);
-    s->quit = 1;
-    pthread_cond_broadcast(&s->cv);
-    pthread_mutex_unlock(&s->mu);
+    if (s->nthreads) {
+        pthread_mutex_lock(&s->mu);
+        s->quit = 1;
+        pthread_cond_broadcast(&s->cv);
+        pthread_mutex_unlock(&s->mu);
+    }
+    media_input_abort(&s->in);          /* a read waiting on the network gives up */
+    media_input_abort(&s->ain);
     if (s->dsp >= 0)
         ioctl(s->dsp, SNDCTL_DSP_RESET);
     for (int i = 0; i < s->nthreads; i++)
@@ -532,10 +585,13 @@ static void sess_free(struct sess *s)
     q_clear(&s->aq);
     avcodec_free_context(&s->vdec);
     avcodec_free_context(&s->adec);
-    avformat_close_input(&s->fmt);
+    media_input_close(&s->in);
+    media_input_close(&s->ain);
     free(s->vbuf);
-    pthread_cond_destroy(&s->cv);
-    pthread_mutex_destroy(&s->mu);
+    if (s->nthreads || s->inited) {
+        pthread_cond_destroy(&s->cv);
+        pthread_mutex_destroy(&s->mu);
+    }
     free(s);
 }
 
@@ -563,7 +619,46 @@ static const char *tag(AVFormatContext *f, const char *key)
     return e && e->value[0] ? e->value : NULL;
 }
 
-/* Open path paused at its start; the error message in p->msg if it cannot be played. */
+/* Open what a YouTube link names: one stream with both picture and sound if there is one, or else
+ * a picture stream and a sound stream. 0, or -1 with why in err. */
+static int open_youtube(struct sess *s, const char *id, char *title, size_t tsize, int64_t *dur_ms,
+                        char *err, size_t errsize)
+{
+    struct yt_video v;
+    if (yt_resolve(id, httpio_request, NULL, &v) < 0) {
+        snprintf(err, errsize, "%s", v.error);
+        yt_free(&v);
+        return -1;
+    }
+    char ua[220];
+    snprintf(ua, sizeof(ua), "User-Agent: %s", v.user_agent[0] ? v.user_agent : "Mozilla/5.0");
+    const char *headers[] = { ua };
+    const struct yt_format *m = yt_pick_muxed(&v, YT_MAX_H), *fv = NULL, *fa = NULL;
+    int r = -1;
+    if (m)
+        r = media_input_open(&s->in, m->url, headers, 1, err, errsize);
+    if (r < 0 && yt_pick_split(&v, YT_MAX_H, &fv, &fa) == 0) {
+        r = media_input_open(&s->in, fv->url, headers, 1, err, errsize);
+        if (r == 0 && media_input_open(&s->ain, fa->url, headers, 1, err, errsize) < 0) {
+            media_input_close(&s->in);
+            r = -1;
+        }
+    } else if (r < 0 && !m) {
+        snprintf(err, errsize, "YouTube offers no streams this player can decode.");
+    }
+    if (r == 0) {
+        if (v.author[0])
+            snprintf(title, tsize, "%s - %s", v.author, v.title);
+        else
+            snprintf(title, tsize, "%s", v.title);
+        *dur_ms = (int64_t)v.seconds * 1000;
+    }
+    yt_free(&v);
+    return r;
+}
+
+/* Open path (a file, an address or a YouTube link) paused at its start; the error message in
+ * p->msg if it cannot be played. */
 static void load(struct player *p, const char *path)
 {
     sess_free(p->s);
@@ -581,17 +676,20 @@ static void load(struct player *p, const char *path)
     s->vi = s->ai = -1;
     s->dsp = -1;
     s->rate = 44100;
-    if (avformat_open_input(&s->fmt, path, NULL, NULL) < 0) {
-        snprintf(p->msg, sizeof(p->msg), "Cannot open %s.", strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
-        free(s);
+    char err[160] = "", yt_title[200] = "", id[16];
+    int64_t yt_dur = 0;
+    int r = yt_video_id(path, id) ? open_youtube(s, id, yt_title, sizeof(yt_title), &yt_dur, err, sizeof(err))
+                                  : media_input_open(&s->in, path, NULL, 0, err, sizeof(err));
+    if (r < 0) {
+        if (media_is_url(path) || yt_title[0] || strstr(err, "YouTube"))
+            snprintf(p->msg, sizeof(p->msg), "%s", err);
+        else
+            snprintf(p->msg, sizeof(p->msg), "Cannot open %s.", strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
+        sess_free(s);
         return;
     }
-    if (avformat_find_stream_info(s->fmt, NULL) < 0) {
-        snprintf(p->msg, sizeof(p->msg), "This is not a media file.");
-        avformat_close_input(&s->fmt);
-        free(s);
-        return;
-    }
+    s->fmt = s->in.fmt;
+    s->afmt = s->ain.fmt;
     int pic = -1;
     for (unsigned i = 0; i < s->fmt->nb_streams; i++) {
         AVStream *st = s->fmt->streams[i];
@@ -604,7 +702,8 @@ static void load(struct player *p, const char *path)
             }
         }
     }
-    s->ai = av_find_best_stream(s->fmt, AVMEDIA_TYPE_AUDIO, -1, s->vi, NULL, 0);
+    s->ai = s->afmt ? av_find_best_stream(s->afmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0)
+                    : av_find_best_stream(s->fmt, AVMEDIA_TYPE_AUDIO, -1, s->vi, NULL, 0);
     if (s->ai < 0)
         s->ai = -1;
     if (s->vi < 0 && pic >= 0) {
@@ -614,12 +713,10 @@ static void load(struct player *p, const char *path)
     if (s->vi >= 0)
         s->vdec = open_decoder(s->fmt->streams[s->vi], nprocs > 4 ? 4 : nprocs);
     if (s->ai >= 0)
-        s->adec = open_decoder(s->fmt->streams[s->ai], 1);
+        s->adec = open_decoder(astream(s), 1);
     if (!s->vdec && !s->adec) {
         snprintf(p->msg, sizeof(p->msg), "No sound or picture in this file can be played.");
-        avcodec_free_context(&s->vdec);
-        avformat_close_input(&s->fmt);
-        free(s);
+        sess_free(s);
         return;
     }
     if (s->adec) {
@@ -634,6 +731,10 @@ static void load(struct player *p, const char *path)
             snprintf(p->msg, sizeof(p->msg), "No sound card, or another program is using it.");
     }
     p->dur_ms = s->fmt->duration > 0 ? s->fmt->duration / 1000 : 0;
+    if (!p->dur_ms && s->afmt && s->afmt->duration > 0)
+        p->dur_ms = s->afmt->duration / 1000;
+    if (!p->dur_ms)
+        p->dur_ms = yt_dur;
 
     /* the description line */
     char info[128] = "";
@@ -650,7 +751,9 @@ static void load(struct player *p, const char *path)
 
     const char *title = tag(s->fmt, "title"), *artist = tag(s->fmt, "artist");
     const char *base = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
-    if (title && artist)
+    if (yt_title[0])
+        snprintf(p->title, sizeof(p->title), "%s", yt_title);
+    else if (title && artist)
         snprintf(p->title, sizeof(p->title), "%s - %s", artist, title);
     else
         snprintf(p->title, sizeof(p->title), "%s", title ? title : base);
@@ -662,6 +765,7 @@ static void load(struct player *p, const char *path)
 
     pthread_mutex_init(&s->mu, NULL);
     pthread_cond_init(&s->cv, NULL);
+    s->inited = 1;
     s->paused = 1;
     s->show_one = 1;
     s->fit_w = p->win->content.w;
@@ -854,6 +958,12 @@ static void ask_open_done(void *ctx, const char *text);
 
 static void open_path(struct player *p, const char *path)
 {
+    char id[16];
+    if (media_is_url(path)) {           /* the network can take a moment: say so first */
+        snprintf(p->msg, sizeof(p->msg), yt_video_id(path, id) ? "Finding the YouTube video..." : "Opening...");
+        paint_video(p, 1);
+        wm_flush();
+    }
     load(p, path);
     if (p->s)
         do_play(p);
@@ -871,7 +981,7 @@ static void ask_open(struct player *p)
     const char *home = getenv("HOME");
     char def[PATH_MAX];
     snprintf(def, sizeof(def), "%s", p->path[0] ? p->path : home ? home : "/");
-    ask_text("Open Media", "The sound or video file to open:", def, ask_open_done, p);
+    ask_text("Open Media", "The file, web address or YouTube link to open:", def, ask_open_done, p);
 }
 
 static void mp_key(struct window *w, const struct input_event *ev)

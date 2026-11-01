@@ -202,11 +202,15 @@ struct node {
     struct node *invoker;               /* an open popover: the button that opened it (its implicit anchor) */
     struct node *top_modal;             /* a document's root: its topmost modal dialog, which makes the rest inert */
 
-    /* <audio>: what its sound is doing (browser.c), for the controls layout.c draws */
+    /* <audio> and <video>: what its sound is doing (browser.c), for the controls layout.c draws */
     uint8_t media_state;                /* MEDIA_* */
     int media_pos_ms, media_dur_ms;     /* where it is, and how long (-1: not known) */
+    struct image *vframe;               /* <video>: the picture to show (browser.c, in the engine's shared memory) */
+    uint8_t ns;                         /* NS_*: made by createElementNS in another namespace than HTML's */
+    int media_w, media_h;               /* <video>: the picture's own size, once known (0: not yet) */
 };
 enum { MEDIA_IDLE, MEDIA_LOADING, MEDIA_PLAYING, MEDIA_PAUSED, MEDIA_FAILED };
+enum { NS_HTML, NS_SVG, NS_MATHML };
 enum { POP_NONE, POP_AUTO, POP_MANUAL, POP_HINT };
 
 struct node *html_parse(struct arena *a, const char *text, int len);
@@ -1025,6 +1029,8 @@ void range_nudge(const struct node *n, int dir, char *out, int size);
 const char *input_pattern(const char *type);
 /* <audio controls>: where its seek bar runs, from x0 to x1 pixels in a control w wide (x0 == x1: none). */
 void layout_media_bar(const struct node *n, int w, int *x0, int *x1);
+/* <video controls>: their bar is this tall, along the bottom of the video (layout_media_bar across it). */
+#define LAYOUT_VIDEO_BAR_H 32
 /* The text a button, submit input or select shows. */
 const char *control_label(const struct node *n);
 /* Draw img scaled to w x h, alpha-blended. */

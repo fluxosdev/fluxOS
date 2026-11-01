@@ -48,6 +48,20 @@ static int view_transition(void *ctx, int op, const char *types)
     return 0;
 }
 
+/* The media engine, as far as Media Source Extensions' tests need it: SourceBuffers get ids, and
+ * the tests play the engine's answers themselves (%mediaMsg). */
+static int next_sb = 100, mse_bytes;
+static int media_cmd(void *ctx, struct node *n, const char *op, const char *str, const void *bytes, int len,
+                     double a, double b)
+{
+    (void)ctx, (void)n, (void)str, (void)bytes, (void)a, (void)b;
+    if (!strcmp(op, "sbadd"))
+        return ++next_sb;
+    if (!strcmp(op, "sbappend"))
+        mse_bytes += len;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     /* The engine uses a 32-bit page directory. A non-PIE Linux binary
@@ -69,7 +83,8 @@ int main(int argc, char **argv)
     const char *html = "<!doctype html><html><head></head><body></body></html>";
     struct jshost host = { .arena = &arena, .root = html_parse(&arena, html, (int)strlen(html)),
                            .url = "file:///tests.html", .base = "file:///tests.html",
-                           .status = status, .changed = changed, .view_transition = view_transition };
+                           .status = status, .changed = changed, .view_transition = view_transition,
+                           .media_cmd = media_cmd };
     struct jsdom *dom = jsdom_new(&host);
     if (!dom)
         return 2;
