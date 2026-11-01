@@ -114,25 +114,19 @@ static int current_step(void)
     return (int)p;
 }
 
-/* The logo at half its size, blended over what is there. */
-static void draw_logo(struct surface *sf, int x0, int y0)
+/* The logo's shape at half its size, in c, blended over what is there. */
+static void draw_logo(struct surface *sf, int x0, int y0, color_t c)
 {
     for (int j = 0; j < BD_LOGO; j++) {
         for (int i = 0; i < BD_LOGO; i++) {
-            uint32_t a = 0, r = 0, g = 0, b = 0;
-            for (int k = 0; k < 4; k++) {
-                uint32_t p = fluxos_logo[(2 * j + k / 2) * FLUXOS_LOGO_SIZE + 2 * i + k % 2];
-                uint32_t pa = p >> 24;
-                a += pa;
-                r += (p >> 16 & 0xFF) * pa;
-                g += (p >> 8 & 0xFF) * pa;
-                b += (p & 0xFF) * pa;
-            }
+            uint32_t a = 0;
+            for (int k = 0; k < 4; k++)
+                a += fluxos_logo[(2 * j + k / 2) * FLUXOS_LOGO_SIZE + 2 * i + k % 2] >> 24;
             int x = x0 + i, y = y0 + j;
             if (!a || x < 0 || y < 0 || x >= sf->w || y >= sf->h)
                 continue;
             uint32_t *px = sf->px + y * sf->stride + x;
-            *px = gfx_mix(*px, RGB(r / a, g / a, b / a), (int)(a / 4) * 256 / 255);
+            *px = gfx_mix(*px, c, (int)(a / 4) * 256 / 255);
         }
     }
 }
@@ -147,23 +141,25 @@ static void draw_tick(struct surface *sf, int x, int y, color_t c)
 static void draw_backdrop(int step)
 {
     struct surface *sf = &backdrop;
-    theme_kinetik_blue(sf, sf->w, sf->h);
-    draw_logo(sf, BD_MARGIN, BD_MARGIN);
+    /* Seashell's wallpaper is light: the text is in its ink, the steps to come paler, ticks and
+     * the step under way in its blue. */
+    theme_seashell_wallpaper(sf, sf->w, sf->h);
+    draw_logo(sf, BD_MARGIN, BD_MARGIN, SEASHELL_INK);
     const struct pfont *big = &font_archivo_large;
     gfx_text(sf, big, BD_MARGIN + BD_LOGO + 18, BD_MARGIN + (BD_LOGO - big->height) / 2, "fluxOS Setup",
-             C_WHITE);
+             SEASHELL_INK);
 
-    color_t done = RGB(0xC4, 0xD4, 0xEC), later = RGB(0x8C, 0xA2, 0xC4);
+    color_t done = SEASHELL_INK, later = RGB(0x55, 0x6A, 0x6C), tick = RGB(0x3E, 0x6E, 0x94);
     for (int i = 0; i < NSTEPS; i++) {
         int y = BD_STEPS_Y + i * BD_STEP_H;
         if (i < step) {
-            draw_tick(sf, BD_MARGIN, y + 3, done);
+            draw_tick(sf, BD_MARGIN, y + 3, tick);
             gfx_text(sf, &font_archivo, BD_MARGIN + 24, y, steps[i], done);
         } else if (i == step) {
             gfx_round_fill(sf, mkrect(BD_MARGIN - 10, y - 7, BD_COLUMN_W - BD_MARGIN + 10,
-                                      font_archivo_bold.height + 14), 6, 6, ARGB(0x40, 0xFFFFFF));
-            gfx_fill(sf, BD_MARGIN + 2, y + font_archivo_bold.height / 2 - 4, 8, 8, C_WHITE);
-            gfx_text(sf, &font_archivo_bold, BD_MARGIN + 24, y, steps[i], C_WHITE);
+                                      font_archivo_bold.height + 14), 6, 6, ARGB(0x66, 0xFFFFFF));
+            gfx_fill(sf, BD_MARGIN + 2, y + font_archivo_bold.height / 2 - 4, 8, 8, SEASHELL_BLUE);
+            gfx_text(sf, &font_archivo_bold, BD_MARGIN + 24, y, steps[i], SEASHELL_INK);
         } else {
             gfx_text(sf, &font_archivo, BD_MARGIN + 24, y, steps[i], later);
         }
@@ -178,7 +174,7 @@ void setup_draw_backdrop(struct surface *dst, struct rect clip)
         surface_free(&backdrop);
         if (surface_init(&backdrop, screen_w, screen_h) < 0) {
             backdrop.px = NULL;
-            gfx_fill(dst, clip.x, clip.y, clip.w, clip.h, RGB(0x10, 0x30, 0x60));
+            gfx_fill(dst, clip.x, clip.y, clip.w, clip.h, RGB(0x9E, 0xB5, 0xB5));   /* Seashell's middle */
             return;
         }
         backdrop_step = -1;

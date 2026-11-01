@@ -6,21 +6,28 @@ output is checked in, so building fluxOS does not need this script.
 Breeze is LGPL-3.0-or-later: https://invent.kde.org/frameworks/breeze-icons
 
 Breeze is drawn as SVG at a few design sizes (16, 22, 32, 48, 64...),
-which differ by context. Each icon is rendered from the design made for
-the size wanted if there is one, else from the next larger one (the
-small ones are simplified), else from the largest there is.
+which differ by context, and many of its small designs are monochrome
+glyphs (one dark ink, for toolbars) where the larger ones are in colour.
+Coloured designs are favoured: each icon is rendered from a coloured
+design if it has any, else from its monochrome ones. Among those, it is
+the design made for the size wanted if there is one, else the next
+larger one (the small ones are simplified), else the largest there is.
+A design counts as monochrome if, rendered, everything opaque in it is a
+dark gray (Breeze's glyphs in red or blue, like edit-delete, are colour).
 
 usage: tools/breeze-icons.py [THEME_DIR]   (run from the top of the source tree)
   THEME_DIR defaults to /usr/share/icons/breeze; on Debian/Ubuntu,
   "apt-get download breeze-icon-theme" and "dpkg-deb -x" it anywhere.
   Needs cairosvg ("pip install cairosvg", in a venv if need be).
 """
+import io
 import os
 import re
 import shutil
 import sys
 
 import cairosvg
+from PIL import Image
 
 # icon name in fluxOS (the freedesktop.org name) -> name in Breeze, if different
 ICONS = {
@@ -37,7 +44,7 @@ ICONS = {
     "applications-system": None, "audio-volume-high": None,
     "audio-volume-muted": None, "audio-x-generic": None,
     "applications-graphics": None, "utilities-file-archiver": None,
-    "utilities-system-monitor": None, "edit-bomb": None, "clock": None,
+    "utilities-system-monitor": None, "edit-bomb": None, "clock": "preferences-system-time",
     "preferences-system-time": None,
     # Breeze's battery-low is its 40% one, the same as battery-040: 20% keeps the six steps apart.
     "battery-caution": None, "battery-low": "battery-020", "battery-040": None,
@@ -48,7 +55,9 @@ ICONS = {
     "battery-charging-080": "battery-080-charging", "battery-charging": "battery-100-charging",
     "battery-missing": None,
     "network-wireless": None, "input-mouse": None,
-    "emblem-favorite": None, "video-x-generic": None,
+    # Breeze's emblem-favorite and clock are monochrome only: Files' Favourites gets the coloured
+    # folder-favorites, the Date and Time window the coloured preferences-system-time.
+    "emblem-favorite": "folder-favorites", "video-x-generic": None,
 }
 SIZES = (16, 32, 48)
 OUT = "rootfs/usr/share/icons/breeze"
@@ -74,7 +83,17 @@ def designs(theme, name):
     return found
 
 
+def monochrome(path):
+    """Is the design a glyph in one dark ink (anything opaque is a dark, unsaturated gray)?"""
+    png = cairosvg.svg2png(url=path, output_width=32, output_height=32)
+    opaque = [p for p in Image.open(io.BytesIO(png)).convert("RGBA").getdata() if p[3] >= 96]
+    return all(max(p[:3]) - min(p[:3]) <= 40 and sum(p[:3]) <= 3 * 170 for p in opaque)
+
+
 def pick(found, size):
+    """The design to render at size: a coloured one if there are any."""
+    coloured = {s: path for s, path in found.items() if not monochrome(path)}
+    found = coloured or found
     if size in found:
         return found[size]
     larger = [s for s in found if s > size]

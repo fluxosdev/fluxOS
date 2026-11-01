@@ -3328,13 +3328,13 @@ void wm_resumed(void)
     wm_damage(mkrect(0, 0, screen_w, screen_h));
 }
 
-/* The shutdown screen: Kinetik Blue's wallpaper, whatever the theme, with
- * the logo and the message under it in Archivo, as the startup screen has
- * them (kernel/video/splash.c). */
+/* The shutdown screen: Seashell's wallpaper, whatever the theme, with the
+ * logo and the message under it in Archivo, as the startup screen has them
+ * (kernel/video/splash.c), but in Seashell's ink, as the wallpaper is light. */
 void wm_splash(const char *message)
 {
     gfx_noclip(&screen);
-    theme_kinetik_blue(&screen, screen_w, screen_h);
+    theme_seashell_wallpaper(&screen, screen_w, screen_h);
     int text_h = font_archivo_large.height;
     int y = (screen_h - (FLUXOS_LOGO_SIZE + 24 + text_h)) / 2;
     int lx = (screen_w - FLUXOS_LOGO_SIZE) / 2;
@@ -3346,12 +3346,12 @@ void wm_splash(const char *message)
             uint32_t p = fluxos_logo[j * FLUXOS_LOGO_SIZE + i];
             int x = lx + i;
             if ((p >> 24) && x >= 0 && x < screen_w)
-                row[x] = gfx_mix(row[x], p & 0xFFFFFF, (int)(p >> 24) * 256 / 255);
+                row[x] = gfx_mix(row[x], SEASHELL_INK, (int)(p >> 24) * 256 / 255);   /* its shape */
         }
     }
     y += FLUXOS_LOGO_SIZE + 24;
     gfx_text(&screen, &font_archivo_large, (screen_w - gfx_text_width(&font_archivo_large, message)) / 2, y,
-             message, RGB(0xFF, 0xFF, 0xFF));
+             message, SEASHELL_INK);
     if (hw_cursor)
         hide_cursor();
     struct rect all = mkrect(0, 0, screen_w, screen_h);

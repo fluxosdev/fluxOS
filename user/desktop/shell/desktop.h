@@ -64,7 +64,11 @@ void theme_set(int style, int accent, int icons, int save);
 /* How a style, color and icon set would look, drawn into r of s (with the Kinetik wallpaper behind,
  * or the plain desktop). */
 void theme_sample(struct surface *s, struct rect r, int style, int accent, int icons);
-void theme_kinetik_blue(struct surface *s, int w, int h);      /* Kinetik Blue's wallpaper */
+/* Seashell's Kinetik wallpaper, whatever the theme (Setup's backdrop, the shutdown screen); it is
+ * light, so what goes on it is drawn in Seashell's ink and blue. */
+void theme_seashell_wallpaper(struct surface *s, int w, int h);
+#define SEASHELL_INK  RGB(0x34, 0x44, 0x47)
+#define SEASHELL_BLUE RGB(0x56, 0x87, 0xAD)
 /* Kinetik Glass: the smoked glass of the taskbar, its buttons and the sidebar's strips, over r. */
 void glass_smoke(struct surface *s, struct rect r, int rt, int rb);
 

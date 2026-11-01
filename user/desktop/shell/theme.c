@@ -191,12 +191,12 @@ void glass_smoke(struct surface *s, struct rect r, int rt, int rb)
     gfx_gradient(s, r, rt, rb, 5, c, pos);
 }
 
-/* Kinetik Blue's wallpaper, whatever the theme is (the shutdown screen). */
-void theme_kinetik_blue(struct surface *s, int w, int h)
+/* Seashell's variant of the Kinetik wallpaper, whatever the theme is (Setup and the shutdown screen). */
+void theme_seashell_wallpaper(struct surface *s, int w, int h)
 {
     struct theme saved = theme;
-    const struct palette *p = &palettes[ACCENT_BLUE];
-    theme.style = THEME_KINETIK;        /* not Seashell's own */
+    const struct palette *p = &seashell_palette;
+    theme.style = THEME_SEASHELL;
     theme.wall0 = p->wall0, theme.wall1 = p->wall1, theme.wall2 = p->wall2;
     theme.pale = p->pale, theme.glow = p->glow;
     wallpaper_kinetik(s, w, h);
