@@ -1,0 +1,131 @@
+<!doctype html>
+<html>
+<head>
+<title>Scroll snapping, content-visibility and view transitions</title>
+<style>
+body { font-family: sans-serif; max-width: 780px; margin: 20px auto; padding: 0 16px; line-height: 1.5; color: #1f2430;
+       background: #f3f5f9; }
+h1 { margin-bottom: 4px; }
+.card { background: white; border: 1px solid #cfd8e6; border-radius: 8px; padding: 12px 16px; margin: 14px 0; }
+button { font-size: 13px; padding: 4px 10px; }
+code { background: #eef1f6; padding: 0 3px; border-radius: 3px; }
+
+/* a carousel: each slide comes to rest at the start of the strip */
+.strip { display: flex; gap: 12px; overflow-x: auto; scroll-snap-type: x mandatory; scroll-padding: 0 12px;
+         padding: 8px 12px; background: #e3e8f0; border-radius: 8px; }
+.slide { flex: 0 0 220px; height: 120px; border-radius: 8px; scroll-snap-align: start; color: white;
+         font-size: 28px; font-weight: bold; display: flex; align-items: center; justify-content: center; }
+.slide:nth-child(5n+1) { background: #e76f51; } .slide:nth-child(5n+2) { background: #2a9d8f; }
+.slide:nth-child(5n+3) { background: #264653; } .slide:nth-child(5n+4) { background: #e9c46a; }
+.slide:nth-child(5n) { background: #8e7dbe; }
+#stop { outline: 3px dashed white; outline-offset: -8px; scroll-snap-stop: always; }
+
+/* sections that centre themselves, and only when the scroll ends near one */
+.pages { height: 220px; overflow-y: auto; scroll-snap-type: y proximity; border: 1px solid #cfd8e6;
+         border-radius: 8px; background: white; }
+.pages section { height: 160px; margin: 40px 16px; border-radius: 8px; background: #eef1f6; scroll-snap-align: center;
+                 display: flex; align-items: center; justify-content: center; font-size: 20px; }
+
+/* a long list whose rows are laid out only near the screen */
+.row { content-visibility: auto; contain-intrinsic-size: auto 46px; border-bottom: 1px solid #e3e8f0; padding: 12px 4px; }
+#counter { font-weight: bold; }
+
+/* view transitions: the cards keep their names as they move */
+.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.tile { height: 70px; border-radius: 8px; color: white; display: flex; align-items: center; justify-content: center;
+        font-size: 22px; font-weight: bold; }
+.tile.big { grid-column: span 3; height: 120px; }
+::view-transition-group(*) { animation-duration: .4s; }
+:active-view-transition-type(slide) .grid { outline: 2px solid #e76f51; }
+#theme-demo.dark { background: #1f2430; color: #f3f5f9; }
+::view-transition-new(root) { animation: .5s ease-out both reveal; }
+::view-transition-old(root) { animation: none; }
+@keyframes reveal { from { transform: translateY(40px); opacity: 0 } }
+</style>
+</head>
+<body>
+<h1>Scroll snapping, content-visibility and view transitions</h1>
+<p><a href="home.html">&larr; Home</a></p>
+
+<div class="card">
+<h2>Scroll snapping</h2>
+<p>Turn the wheel over the strip, or use its scroll bar: when the scroll stops, it glides to the nearest slide in the
+direction you went (<code>scroll-snap-type: x mandatory</code>). Slide 4 has <code>scroll-snap-stop: always</code>,
+so a big scroll cannot skip past it. Buttons use <code>scrollBy()</code>, which lands on a slide too.</p>
+<div class="strip" id="strip">
+  <div class="slide">1</div><div class="slide">2</div><div class="slide">3</div><div class="slide" id="stop">4</div>
+  <div class="slide">5</div><div class="slide">6</div><div class="slide">7</div><div class="slide">8</div>
+</div>
+<p><button onclick="document.getElementById('strip').scrollBy(-150, 0)">&larr; Back</button>
+   <button onclick="document.getElementById('strip').scrollBy(150, 0)">Next &rarr;</button></p>
+<p>These sections only snap (to their centres) when a scroll ends close to one: <code>proximity</code>.</p>
+<div class="pages">
+  <section>One</section><section>Two</section><section>Three</section><section>Four</section><section>Five</section>
+</div>
+</div>
+
+<div class="card">
+<h2>View transitions</h2>
+<p><code>document.startViewTransition()</code> shows the old page while the update runs, then moves each element with a
+<code>view-transition-name</code> from its old place to its new one and cross-fades the rest.</p>
+<p><button id="shuffle">Shuffle</button> <button id="grow">Make the first one big</button>
+   <button id="theme">Switch the theme</button> <span id="vt-status"></span></p>
+<div id="theme-demo" class="card">
+<div class="grid" id="grid">
+  <div class="tile" style="background:#e76f51;view-transition-name:t1">A</div>
+  <div class="tile" style="background:#2a9d8f;view-transition-name:t2">B</div>
+  <div class="tile" style="background:#264653;view-transition-name:t3">C</div>
+  <div class="tile" style="background:#e9c46a;view-transition-name:t4">D</div>
+  <div class="tile" style="background:#8e7dbe;view-transition-name:t5">E</div>
+  <div class="tile" style="background:#f4a261;view-transition-name:t6">F</div>
+</div>
+</div>
+</div>
+
+<div class="card">
+<h2>content-visibility: auto</h2>
+<p>Each of these <span id="total"></span> rows has <code>content-visibility: auto</code>: its contents are laid out only
+when it comes near the window, and it keeps the size it had once it has been seen. Rows laid out:
+<span id="counter">?</span> (the count rises as you scroll down).</p>
+<div id="rows"></div>
+</div>
+
+<script>
+(function () {
+  var rows = document.getElementById("rows"), html = "";
+  for (var i = 1; i <= 1500; i++)
+    html += "<div class=row><b>Row " + i + "</b> &mdash; some text that only needs laying out when it shows.</div>";
+  rows.innerHTML = html;
+  document.getElementById("total").textContent = "1500";
+  function count() {
+    var shown = 0, list = rows.children;
+    for (var i = 0; i < list.length; i++)
+      if (list[i].firstChild && list[i].firstChild.getBoundingClientRect().width > 0) shown++;
+    document.getElementById("counter").textContent = shown;
+  }
+  addEventListener("scroll", count);
+  setTimeout(count, 100);
+
+  var status = document.getElementById("vt-status");
+  function change(update, types) {
+    if (!document.startViewTransition) { update(); status.textContent = "(no view transitions here)"; return; }
+    var t = document.startViewTransition({ update: update, types: types || [] });
+    status.textContent = "running...";
+    t.finished.then(function () { status.textContent = "finished"; });
+  }
+  document.getElementById("shuffle").onclick = function () {
+    change(function () {
+      var grid = document.getElementById("grid"), tiles = Array.from(grid.children);
+      tiles.sort(function () { return Math.random() - 0.5; }).forEach(function (t) { grid.appendChild(t); });
+    }, ["slide"]);
+  };
+  document.getElementById("grow").onclick = function () {
+    change(function () { document.getElementById("grid").firstElementChild.classList.toggle("big"); });
+  };
+  document.getElementById("theme").onclick = function () {
+    change(function () { document.getElementById("theme-demo").classList.toggle("dark"); });
+  };
+})();
+</script>
+</body>
+</html>

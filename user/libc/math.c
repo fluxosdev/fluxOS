@@ -35,6 +35,15 @@ double cos(double x)
     return r;
 }
 
+/* Both at once (a GNU extension, which GCC calls for sin and cos of one value). */
+void sincos(double x, double *s, double *c)
+{
+    double sv, cv;
+    __asm__("fsincos" : "=t"(cv), "=u"(sv) : "0"(x));
+    *s = sv;
+    *c = cv;
+}
+
 double tan(double x)
 {
     double r;
@@ -161,6 +170,14 @@ double pow(double x, double y)
 float (sqrtf)(float x) { return __builtin_sqrtf(x); }
 float sinf(float x) { return (float)sin(x); }
 float cosf(float x) { return (float)cos(x); }
+
+void sincosf(float x, float *s, float *c)
+{
+    double sv, cv;
+    sincos(x, &sv, &cv);
+    *s = (float)sv;
+    *c = (float)cv;
+}
 float tanf(float x) { return (float)tan(x); }
 float atan2f(float y, float x) { return (float)atan2(y, x); }
 float powf(float x, float y) { return (float)pow(x, y); }
@@ -264,8 +281,10 @@ double frexp(double x, int *e)
 double ldexp(double x, int n)
 {
     double r;
-    /* FSCALE multiplies by 2^trunc(st1); its result rounds to double on the way out. */
-    __asm__("fscale" : "=t"(r) : "0"(x), "u"((double)n) : "st(1)");
+    /* FSCALE multiplies by 2^trunc(st1); its result rounds to double on the way out. It leaves
+     * st1 on the stack, which GCC pops as a dead input (no st(1) clobber: that would say the asm
+     * popped it, and the x87 stack filled up a call at a time, to NaN). */
+    __asm__("fscale" : "=t"(r) : "0"(x), "u"((double)n));
     return r;
 }
 
@@ -303,6 +322,31 @@ double cbrt(double x)
         return x;
     double r = exp2(log2(fabs(x)) / 3);
     r -= (r * r * r - fabs(x)) / (3 * r * r);   /* one Newton step */
+    return x < 0 ? -r : r;
+}
+
+/* The Bessel function of the first kind, order 1 (POSIX's j1; swscale's Bessel filter), from
+ * Abramowitz and Stegun 9.4.4 and 9.4.6: a polynomial up to 3, the asymptotic form beyond,
+ * good to 1e-7 or so. J1 is odd. */
+double j1(double x)
+{
+    double a = fabs(x), r;
+    if (isnan(x))
+        return x;
+    if (a <= 3) {
+        double t = a * a / 9;
+        r = a * (0.5 + t * (-0.56249985 + t * (0.21093573 + t * (-0.03954289 + t * (0.00443319 +
+                 t * (-0.00031761 + t * 0.00001109))))));
+    } else if (isinf(a)) {
+        r = 0;
+    } else {
+        double t = 3 / a;
+        double f = 0.79788456 + t * (0.00000156 + t * (0.01659667 + t * (0.00017105 + t * (-0.00249511 +
+                   t * (0.00113653 - t * 0.00020033)))));
+        double th = a - 2.35619449 + t * (0.12499612 + t * (0.00005650 + t * (-0.00637879 + t * (0.00074348 +
+                    t * (0.00079824 - t * 0.00029166)))));
+        r = f * cos(th) / sqrt(a);
+    }
     return x < 0 ? -r : r;
 }
 

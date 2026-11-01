@@ -220,7 +220,7 @@ says why.
   - **A software mixer** behind `/dev/dsp`: every program that opens it gets
     a stream of its own, with its own format (8 or 16-bit, mono or stereo,
     4-48 kHz) and buffer, and up to 16 play at once on each card: the
-    desktop's sounds over the Sound Player, a DOS game over both. Each stream
+    desktop's sounds over the Media Player, a DOS game over both. Each stream
     is resampled to the card's rate and they are added up, clipped, at the
     `pcm` volume. A program that falls behind leaves a gap in its own sound,
     not in the others'.
@@ -283,7 +283,7 @@ says why.
   the taskbar and Start menu, the sidebar, its folder on the wallpaper and its own dialogs
   (System Properties, Run, Shut Down, Power, Volume Control, the clock). Wave, the terminal,
   the File Manager, the editor and every other program are separate binaries in `/bin`
-  (`wave`, `terminal`, `files`, `editor`, `calculator`, `player`, `archiver`, `paint`,
+  (`wave`, `terminal`, `files`, `editor`, `calculator`, `mediaplayer`, `archiver`, `paint`,
   `gears`, `chess`, `minesweeper`, `taskmgr`, `diskmgr`, `display`, `mouse`, `datetime`,
   `wireless`, `imageview`) that connect to the desktop over an `AF_UNIX` socket
   (`/tmp/.desktop`) and draw each window's client area into a shared memory segment
@@ -329,7 +329,7 @@ says why.
   its name and what letting go would do ("Move to Downloads", "Open in Paint"); the
   pointer is a no-entry sign where nothing takes it, and Escape cancels. Files from the
   File Manager move into another folder window (copied to another disk, or with Ctrl
-  held), open in a Text Editor, Paint (pictures), the Sound Player (WAV, MP3, Ogg), the Archive
+  held), open in a Text Editor, Paint (pictures), the Media Player (sound and video), the Archive
   Manager (ZIP, 7z) or Wave, and are typed into a terminal as quoted paths. Text
   selected in an editor, and links and pictures from Wave (their address), go into an
   editor where they are let go, into a page's text field, or into a terminal as typed
@@ -350,9 +350,15 @@ says why.
   use.
 - **Text editor**: Notepad-style, File/Edit menus, selection, a clipboard
   shared with the browser, files up to 1 MB. No undo, word wrap or search.
-- **Sound Player**: opens a WAV, MP3 or Ogg Vorbis file (typed path, dropped on it, or from
-  the file manager) with Play, Pause, Stop and a seek bar. It runs `play(1)` (`play -s SECONDS`
-  starts part-way in) so the player keeps running.
+- **Media Player**: plays sound and video through FFmpeg (a port, in `third_party/ffmpeg`):
+  H.264, HEVC, VP8, VP9, MPEG-1/2/4, Theora, WMV and more video; AAC, MP3, Vorbis, Opus, FLAC,
+  AC-3, WMA, PCM and more sound; in MP4, Matroska/WebM, AVI, MPEG, Ogg, FLV, ASF and plain
+  sound files. Open it from the Start menu (Open...), by dropping a file on it or from the file
+  manager. A file opens paused on its first picture, or its cover art; Play, Pause, Stop and a
+  seek bar (click or drag), Space, Left/Right (10 s, 60 s with Shift) and Ctrl+O. The window
+  resizes and maximizes, the picture scaled to fit. Demuxing, sound and video each run in a
+  thread of their own; video follows the sound card's own clock (late frames are dropped), and
+  a file without sound the wall's. `ffmpeg` and `ffprobe` are in `/usr/bin`.
 - **Display Properties**: wallpaper and fill mode with a preview (with **(None)** chosen, a
   `#rrggbb` field sets the solid desktop color; **Kinetik** is the theme's drawn
   wallpaper), the theme and its color with a live sample, resolution,
@@ -485,9 +491,16 @@ fetcher process, so the browser keeps running), or from `file://`.
   `e`, the `lh`, `rlh`, `ic` and `cap` units (and `cq*` units, which are the viewport's, there being
   no container queries), relative colors (`rgb(from <color> r g b / alpha)`, and `hsl()`, `hwb()`,
   `lab()`, `lch()`, `oklab()` and `oklch()` forms) and the system colors (`AccentColor`, `Canvas`,
-  `Mark`...). Around 120 properties that change nothing this renderer draws (`color-scheme`,
-  `touch-action`, `overscroll-behavior`, `scrollbar-width`, `content-visibility`, `contain`,
-  `font-feature-settings`, `scroll-margin`, `scroll-snap-*`...) are parsed but ignored;
+  `Mark`...). Scroll snapping (`scroll-snap-type`, `-align`, `-stop`, `scroll-padding`,
+  `scroll-margin`) settles the page and scrolling boxes on snap positions after wheel, key,
+  scroll bar and script scrolls; `content-visibility: auto` and `hidden` skip laying out
+  off-screen contents (sized by `contain-intrinsic-size`, including `auto`); and
+  `document.startViewTransition()` animates `view-transition-name` elements and cross-fades
+  the page, styled through the `::view-transition-*` pseudo-elements (see
+  `browser-compatibility.md`; try `file:///usr/share/www/scrolling.html`).
+  Around 110 properties that change nothing this renderer draws (`color-scheme`,
+  `touch-action`, `overscroll-behavior`, `scrollbar-width`, `contain`,
+  `font-feature-settings`...) are parsed but ignored;
   `@supports` and `CSS.supports()` return false for these unimplemented properties so
   pages can choose their fallback styles.
   Pictures: comma-separated `background-image` layers (PNG, JPEG, GIF, WebP, ICO,
@@ -841,7 +854,7 @@ make test-kernel-qemu KERNEL_TEST_CPUS=2 KERNEL_TEST_MEMORY=2048 # larger RAM an
 make test-kernel-qemu KERNEL_TEST_CMDLINE=readcache=0 # direct-read fallback
 make test-kernel-qemu KERNEL_TEST_CPUS=4 KERNEL_TEST_CMDLINE=nosmp # single-core fallback
 make test-kernel-qemu KERNEL_TEST_CPUS=4 KERNEL_TEST_CMDLINE=maxcpus=2 # CPU limit
-make disk       # fluxdisk.img, a 256 MiB ext2 data disk (DISK_MB=..., DISKFS=fat32)
+make disk       # fluxdisk.img, a 1 GiB ext2 data disk (DISK_MB=..., DISKFS=fat32)
 make floppy     # fluxfloppy.img, a 1.44 MB FAT12 floppy for drive A:
 make run        # boots the install CD in QEMU with the disk, floppy (if any) and an NE2000
 make run-kernel # boots the kernel directly, the whole system in memory (text console)
@@ -993,7 +1006,7 @@ user/desktop/shell/        the desktop: compositor and window manager (wm.c), it
                            drawing (gfx.c), widgets, icons, dialogs (apps.c), starting
                            programs (launch.c), the loop (loop.c), the themes (theme.c;
                            fonts in font_sans.c and font_archivo.c)
-user/desktop/apps/         the programs: files, edit, calc, player, paint, term, taskmgr,
+user/desktop/apps/         the programs: files, edit, calc, mediaplayer, paint, term, taskmgr,
                            diskmgr, display, mouse, datetime, wireless, archiver, gears,
                            chess (the window; chessview.c draws it, chessrules.c plays),
                            mines, imageview (files.c is the desktop's folder too)

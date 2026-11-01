@@ -61,7 +61,7 @@ SETUPFS := $(BUILD)/setupfs
 SYSROOT := $(BUILD)/sysroot
 SYSROOT_STAMP := $(SYSROOT)/.stamp
 DISK    := fluxdisk.img
-DISK_MB ?= 256
+DISK_MB ?= 1024
 FLOPPY  := fluxfloppy.img
 MKFS_FAT ?= $(shell command -v mkfs.fat 2>/dev/null || ls /usr/sbin/mkfs.fat /sbin/mkfs.fat 2>/dev/null | head -1)
 
@@ -135,6 +135,34 @@ $(BUILD)/u/user/desktop/wave/codecs.o $(BUILD)/u/user/desktop/wave/mp3dec.o: USE
 $(LIBFONT): $(FONT_OBJS)
 	$(AR) rcs $@ $^
 
+# FFmpeg: the part of it tools/ffmpeg/import.sh brought into third_party/ffmpeg, with what its
+# configure generated for fluxOS (gen/) and the lists of its sources (flux.mk). Its libraries are
+# libffmpeg.a, which the Media Player decodes with, and ffmpeg and ffprobe are programs of their
+# own. It is compiled as FFmpeg compiles itself: C17, -O3, with the compiler's builtins (memcpy
+# and the rest inline; -ffreestanding is there only so that GCC's <stdint.h> stands alone, as
+# fluxOS has none of its own), and without a frame pointer, as its inline assembly takes %ebp.
+FFMPEG_DIR := third_party/ffmpeg
+include $(FFMPEG_DIR)/flux.mk
+FFMPEG_INC := -I$(FFMPEG_DIR)/gen -I$(FFMPEG_DIR)
+FFMPEG_CFLAGS := -m32 -march=pentium4 -mfpmath=sse -std=c17 -O3 -ffreestanding -fbuiltin -fomit-frame-pointer \
+	-fno-math-errno -fno-signed-zeros -U__linux__ -U__linux -Ulinux -U__gnu_linux__ -fno-pie -fno-pic -fno-stack-protector \
+	-nostdinc -isystem $(GCC_INC) -fno-asynchronous-unwind-tables -D_ISOC11_SOURCE -D_FILE_OFFSET_BITS=64 \
+	-D_LARGEFILE_SOURCE $(FFMPEG_INC) -I$(FFMPEG_DIR)/compat/stdbit -Iinclude -Iuser/include -w -MMD -MP
+FFMPEG_LIB_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(FFMPEG_LIB_SRCS)))
+FFMPEG_FFMPEG_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(FFMPEG_FFMPEG_SRCS)))
+FFMPEG_FFPROBE_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(FFMPEG_FFPROBE_SRCS)))
+FFMPEG_OBJS := $(sort $(FFMPEG_LIB_OBJS) $(FFMPEG_FFMPEG_OBJS) $(FFMPEG_FFPROBE_OBJS))
+$(FFMPEG_LIB_OBJS): FFMPEG_CFLAGS += -DHAVE_AV_CONFIG_H
+LIBFFMPEG := $(BUILD)/libffmpeg.a
+
+$(FFMPEG_OBJS): $(BUILD)/u/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(FFMPEG_CFLAGS) -c $< -o $@
+
+$(LIBFFMPEG): $(FFMPEG_LIB_OBJS)
+	@rm -f $@
+	$(AR) rcs $@ $^
+
 LIBC_SRCS := $(wildcard user/libc/*.c) $(BROTLI_SRCS) $(MBEDTLS_SRCS) lib/string.c lib/font8x16.c lib/sha256.c lib/sha1.c lib/digest.c lib/logo.c
 LIBC_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(LIBC_SRCS)))
 CRT0      := $(BUILD)/u/user/libc/crt0.o
@@ -163,14 +191,14 @@ LIBDESKTOP := $(BUILD)/libdesktop.a
 DESKTOP_SHELL_OBJS := $(call desktop_objs,$(addprefix shell/,main.c wm.c server.c sidebar.c wallpaper.c \
                         screensaver.c power.c sound.c sysdlg.c clock.c setup.c wifitray.c) apps/files.c)
 # The programs, each /bin/NAME: progs/NAME.c, the program's own sources, and client.c for its windows.
-DESKTOP_PROGS := wave terminal files editor calculator player archiver paint gears chess minesweeper taskmgr \
+DESKTOP_PROGS := wave terminal files editor calculator mediaplayer archiver paint gears chess minesweeper taskmgr \
                  diskmgr display mouse datetime wireless imageview
 PROG_SRCS_wave        := $(patsubst user/desktop/%,%,$(wildcard user/desktop/wave/*.c user/desktop/wave/js/*.c))
 PROG_SRCS_terminal    := apps/term.c
 PROG_SRCS_files       := apps/files.c
 PROG_SRCS_editor      := apps/edit.c
 PROG_SRCS_calculator  := apps/calc.c
-PROG_SRCS_player      := apps/player.c
+PROG_SRCS_mediaplayer := apps/mediaplayer.c
 PROG_SRCS_archiver    := apps/archiver.c
 PROG_SRCS_paint       := apps/paint.c
 PROG_SRCS_gears       := apps/gears.c
@@ -183,12 +211,16 @@ PROG_SRCS_mouse       := apps/mouse.c
 PROG_SRCS_datetime    := apps/datetime.c
 PROG_SRCS_wireless    := apps/wireless.c
 PROG_SRCS_imageview   := apps/imageview.c
+# Libraries a program needs besides the desktop's: the Media Player decodes with FFmpeg's.
+PROG_LIBS_mediaplayer := $(LIBFFMPEG)
+$(call desktop_objs,apps/mediaplayer.c progs/mediaplayer.c): USER_CFLAGS += $(FFMPEG_INC)
 DOS_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/dos/*.c)))
 # winrun, the Windows program loader (os_linux.c is its Linux back end, for host tests)
 WIN32_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(filter-out user/win32/os_linux.c,$(wildcard user/win32/*.c user/win32/*.S))))
 BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/fsh $(ROOTFS)/bin/desktop \
              $(addprefix $(ROOTFS)/bin/,$(DESKTOP_PROGS)) \
-             $(ROOTFS)/bin/dos $(ROOTFS)/bin/winrun $(ROOTFS)/bin/[ $(ROOTFS)/bin/gunzip $(ROOTFS)/bin/zcat
+             $(ROOTFS)/bin/dos $(ROOTFS)/bin/winrun $(ROOTFS)/bin/[ $(ROOTFS)/bin/gunzip $(ROOTFS)/bin/zcat \
+             $(ROOTFS)/usr/bin/ffmpeg $(ROOTFS)/usr/bin/ffprobe
 
 ROOTFS_FILES := $(shell find rootfs -type f 2>/dev/null)
 SETUPFS_FILES := $(shell find setupfs -type f 2>/dev/null)
@@ -264,10 +296,11 @@ $(ROOTFS)/bin/desktop: $(CRT0) $(DESKTOP_SHELL_OBJS) $(LIBDESKTOP) $(LIBFONT) $(
 
 define DESKTOP_PROG_RULE
 $(ROOTFS)/bin/$(1): $(CRT0) $(call desktop_objs,progs/$(1).c $(PROG_SRCS_$(1)) shell/client.c) $(LIBDESKTOP) $(LIBGL) \
-                    $(LIBFONT) $(LIBC) user/user.ld
+                    $(LIBFONT) $(PROG_LIBS_$(1)) $(LIBC) user/user.ld
 	@mkdir -p $$(dir $$@)
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $$@ $(CRT0) \
-		$(call desktop_objs,progs/$(1).c $(PROG_SRCS_$(1)) shell/client.c) $(LIBDESKTOP) $(LIBGL) $(LIBFONT) $(LIBC)
+		$(call desktop_objs,progs/$(1).c $(PROG_SRCS_$(1)) shell/client.c) $(LIBDESKTOP) $(LIBGL) $(LIBFONT) \
+		$(PROG_LIBS_$(1)) $(LIBC)
 endef
 $(foreach p,$(DESKTOP_PROGS),$(eval $(call DESKTOP_PROG_RULE,$(p))))
 
@@ -281,6 +314,16 @@ $(WIN32_OBJS): USER_CFLAGS += -Iuser/desktop/shell
 $(ROOTFS)/bin/winrun: $(CRT0) $(WIN32_OBJS) $(LIBDESKTOP) $(LIBFONT) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(WIN32_OBJS) $(LIBDESKTOP) $(LIBFONT) $(LIBC)
+
+# FFmpeg's programs, in /usr/bin with the other ports (and so left out of the in-memory systems the
+# QEMU tests boot, with the toolchain)
+$(ROOTFS)/usr/bin/ffmpeg: $(CRT0) $(FFMPEG_FFMPEG_OBJS) $(LIBFFMPEG) $(LIBC) user/user.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(FFMPEG_FFMPEG_OBJS) $(LIBFFMPEG) $(LIBC)
+
+$(ROOTFS)/usr/bin/ffprobe: $(CRT0) $(FFMPEG_FFPROBE_OBJS) $(LIBFFMPEG) $(LIBC) user/user.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(FFMPEG_FFPROBE_OBJS) $(LIBFFMPEG) $(LIBC)
 
 # play decodes MP3 and Ogg Vorbis with Wave's decoders
 PLAY_CODECS := $(BUILD)/u/user/desktop/wave/codecs.o $(BUILD)/u/user/desktop/wave/mp3dec.o
@@ -622,6 +665,7 @@ test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-worker $(BUILD)/
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/inline-cache-tests.js 19
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/toplayer-tests.js 18
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/media-tests.js 5
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/view-transition-tests.js 9
 	rm -rf $(BUILD)/tests/idb
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/indexeddb-tests.js 3
 	$(BUILD)/tests/js-engine
@@ -725,6 +769,22 @@ $(BUILD)/tests/build-guest.o: tests/build-guest.c
 $(BUILD)/tests/build-guest: $(BUILD)/tests/build-guest.o $(CRT0) $(LIBC) user/user.ld
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 
+# FFmpeg on the real kernel: FFmpeg's own tests (tests/ffmpeg/fate.txt, a choice of FATE's)
+# decode its samples, fetched once from fate-suite.ffmpeg.org into build/tests/fate-suite, and
+# what ffmpeg makes of them must be what FATE expects (tests/ffmpeg/ref, from FFmpeg's tree).
+.PHONY: test-ffmpeg-qemu
+test-ffmpeg-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/ffmpeg-guest $(ROOTFS)/usr/bin/ffmpeg $(ROOTFS)/usr/bin/ffprobe
+	python3 tools/test-ffmpeg-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/ffmpeg-guest \
+		$(ROOTFS)/usr/bin/ffmpeg $(ROOTFS)/usr/bin/ffprobe -- --cpus $(KERNEL_TEST_CPUS) --memory 1024 \
+		$(TEST_DROP_TOOLCHAIN) --kvm --timeout 1200 --success-marker "FFMPEG REGRESSIONS PASSED"
+
+$(BUILD)/tests/ffmpeg-guest.o: tests/ffmpeg-guest.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(BUILD)/tests/ffmpeg-guest: $(BUILD)/tests/ffmpeg-guest.o $(CRT0) $(LIBC) user/user.ld
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
+
 KERNEL_TEST_MEMORY ?= 256
 KERNEL_TEST_CMDLINE ?=
 # The card the mixer test plays on (--sound=sb16, --sound=usb), or empty for none.
@@ -745,10 +805,10 @@ $(BUILD)/tests/browser-style: tests/browser-style.c user/desktop/wave/html.c use
 		$(DESKTOP_INC) tests/browser-style.c user/desktop/wave/html.c user/desktop/wave/css.c user/desktop/wave/csscolor.c \
 		user/desktop/wave/anim.c user/desktop/wave/shadow.c user/desktop/wave/webutil.c -lm -o $@
 
-$(BUILD)/tests/browser-layout: tests/browser-layout.c user/desktop/wave/layout.c user/desktop/wave/html.c user/desktop/wave/css.c user/desktop/wave/csscolor.c user/desktop/wave/cssfont.c user/desktop/wave/anim.c user/desktop/wave/webutil.c $(DESKTOP_HDRS)
+$(BUILD)/tests/browser-layout: tests/browser-layout.c user/desktop/wave/layout.c user/desktop/wave/vt.c user/desktop/wave/html.c user/desktop/wave/css.c user/desktop/wave/csscolor.c user/desktop/wave/cssfont.c user/desktop/wave/anim.c user/desktop/wave/webutil.c $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g -msse -Wall -Wextra -Wno-unused-parameter $(DESKTOP_INC) -Iinclude \
-		tests/browser-layout.c user/desktop/wave/layout.c user/desktop/wave/shadow.c user/desktop/wave/html.c user/desktop/wave/css.c \
+		tests/browser-layout.c user/desktop/wave/layout.c user/desktop/wave/vt.c user/desktop/wave/shadow.c user/desktop/wave/html.c user/desktop/wave/css.c \
 		user/desktop/wave/csscolor.c user/desktop/wave/cssfont.c user/desktop/wave/anim.c user/desktop/wave/webutil.c -lm -o $@
 
 # TLS tests use temporary certificates and local OpenSSL servers; never the Internet.

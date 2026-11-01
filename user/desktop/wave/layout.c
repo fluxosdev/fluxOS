@@ -3298,6 +3298,158 @@ int layout_cq_changed;
 static struct node *cq_laid[256];
 static int ncq_laid;
 
+/* ---- snap areas, content-visibility and view-transition-name: the boxes the browser asks after ---- */
+
+int layout_view_x, layout_view_y;
+const struct node *layout_cv_reveal;
+
+static int has_id(const struct node *root, const char *id)
+{
+    for (const struct node *k = root->first; k; k = node_next((struct node *)k, root)) {
+        if (k->type != N_ELEMENT)
+            continue;
+        const char *v = node_attr(k, "id");
+        if ((v && !strcmp(v, id)) || (k->tag == T_A && (v = node_attr(k, "name")) && !strcmp(v, id)))
+            return 1;
+    }
+    return 0;
+}
+
+/* Must a content-visibility: auto box show its contents whatever its place: something in it has the
+ * focus, is the page's target (#fragment), or is being scrolled to? */
+static int cv_forced(const struct node *n)
+{
+    return (css_focus_node && node_contains(n, css_focus_node)) ||
+           (layout_cv_reveal && node_contains(n, layout_cv_reveal)) ||
+           (css_target_id && *css_target_id && has_id(n, css_target_id));
+}
+
+/* Is a rectangle (page coordinates, as laid out) near the window: within half a window of it? */
+static int cv_near_window(const struct lctx *c, int x, int y, int w, int h)
+{
+    int mx = c->vw / 2, my = c->vh / 2;
+    return x + w >= layout_view_x - mx && x <= layout_view_x + c->vw + mx &&
+           y + h >= layout_view_y - my && y <= layout_view_y + c->vh + my;
+}
+
+/* Are the contents of n (with content-visibility other than visible) skipped? hidden: always; auto:
+ * as the last layout found its place, or, laid out for the first time, as its place is now. */
+static int cv_skip(const struct lctx *c, struct node *n, int x, int y, int w)
+{
+    const struct style *st = n->style;
+    if (st->cv == CV_VISIBLE || !n->parent || n->tag == T_BODY)
+        return 0;
+    if (st->cv == CV_HIDDEN)
+        return 1;
+    if (cv_forced(n))
+        return 0;
+    if (n->cv_state != CVS_UNKNOWN || c->measuring)
+        return n->cv_state == CVS_SKIPPED;
+    int h = st->cis_auto_h && n->cv_size_known ? n->cv_h : st->cis_h > 0 ? st->cis_h : 0;
+    return !cv_near_window(c, x, y, w, h);
+}
+
+/* A skipped box's content box: its remembered size with contain-intrinsic-size: auto, else what that says. */
+static int cv_stand_in(const struct node *n, int axis)
+{
+    const struct style *st = n->style;
+    if (axis ? st->cis_auto_h && n->cv_size_known : st->cis_auto_w && n->cv_size_known)
+        return axis ? n->cv_h : n->cv_w;
+    int v = axis ? st->cis_h : st->cis_w;
+    return v > 0 ? v : 0;
+}
+
+static void lbox_add(struct lctx *c, struct lbox **list, int *n, int *cap, struct node *node, int slot,
+                     int from, int skipped)
+{
+    struct lbox *grown = grow(c->a, *list, *n, cap, sizeof(struct lbox));
+    if (!grown)
+        return;
+    *list = grown;
+    grown[(*n)++] = (struct lbox){ .node = node, .slot = slot, .from = from, .to = c->lo->nitems,
+                                   .skipped = (uint8_t)skipped };
+}
+
+/* Once everything is in place (before the items are put in paint order): each box's border box from
+ * its background item, dropping what a flex or grid container laid out and then threw away. */
+static unsigned lbox_gen;
+static void lbox_resolve(struct layout *lo, struct lbox *list, int *count, int tag_vt)
+{
+    if (!++lbox_gen)
+        lbox_gen = 1;
+    for (int i = *count - 1; i >= 0; i--) {         /* the last time a node was laid out counts */
+        struct lbox *e = &list[i];
+        if (e->slot < 0 || e->slot >= lo->nitems || lo->items[e->slot].node != e->node ||
+            lo->items[e->slot].kind != DK_FILL || e->node->lbox_gen == lbox_gen) {
+            e->node = NULL;
+            continue;
+        }
+        e->node->lbox_gen = lbox_gen;
+        const struct ditem *d = &lo->items[e->slot];
+        e->x = d->x, e->y = d->y, e->w = d->w, e->h = d->h;
+        e->sb = d->sb, e->dyn = d->dyn;
+    }
+    int kept = 0;
+    for (int i = 0; i < *count; i++)
+        if (list[i].node)
+            list[kept++] = list[i];
+    *count = kept;
+    for (int i = 0; tag_vt && i < kept && i < 0xFFFF; i++)    /* inner ones were laid out first */
+        for (int k = list[i].from; k < list[i].to && k < lo->nitems; k++)
+            if (!lo->items[k].vtg)
+                lo->items[k].vtg = (uint16_t)(i + 1);
+}
+
+/* Where a box is now, the page scrolled to (sx, sy), and whether it is within half a window (or half
+ * the scrolling boxes round it) of what shows. */
+static int lbox_near(const struct layout *lo, const struct lbox *e, int sx, int sy)
+{
+    int dx = 0, dy = 0, ddx = 0, ddy = 0;
+    struct rect clip = mkrect(-BIG, -BIG, 2 * BIG, 2 * BIG);
+    if (e->sb)
+        layout_sb_view(lo, e->sb, sx, sy, &dx, &dy, &clip);
+    if (e->dyn)
+        layout_dyn_offset(lo, e->dyn, sx, sy, &ddx, &ddy);
+    int x = e->x + dx + ddx, y = e->y + dy + ddy, w = e->w, h = e->h > 0 ? e->h : 1;
+    int mx = lo->vw / 2, my = lo->vh / 2;
+    if (x + w < sx - mx || x > sx + lo->vw + mx || y + h < sy - my || y > sy + lo->vh + my)
+        return 0;
+    if (e->sb && clip.w < BIG) {
+        int cx = clip.w / 2, cy = clip.h / 2;
+        if (x + w < clip.x - cx || x > clip.x + clip.w + cx || y + h < clip.y - cy || y > clip.y + clip.h + cy)
+            return 0;
+    }
+    return 1;
+}
+
+/* After a layout: what each content-visibility: auto box should do next time. Returns 1 if one that
+ * was skipped must show now (a box shown though far away is skipped the next time anyway). */
+static int cv_update(struct layout *lo, int sx, int sy)
+{
+    int must = 0;
+    for (int i = 0; i < lo->ncv; i++) {
+        struct lbox *e = &lo->cv[i];
+        struct node *n = e->node;
+        if (n->style->cv != CV_AUTO)
+            continue;
+        int show = cv_forced(n) || lbox_near(lo, e, sx, sy);
+        n->cv_state = show ? CVS_SHOWN : CVS_SKIPPED;
+        if (show && e->skipped)
+            must = 1;
+    }
+    return must;
+}
+
+int layout_cv_stale(const struct layout *lo, int sx, int sy)
+{
+    for (int i = 0; i < lo->ncv; i++) {
+        const struct lbox *e = &lo->cv[i];
+        if (e->skipped && e->node->style->cv == CV_AUTO && lbox_near(lo, e, sx, sy))
+            return 1;
+    }
+    return 0;
+}
+
 static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw, int force_bw,
                             int *mb, int *bg_slot)
 {
@@ -3367,7 +3519,8 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
         defh = force_bh - b.bt - b.bb - b.pt - b.pb > 0 ? force_bh - b.bt - b.bb - b.pt - b.pb : 0;
     if (st->min_height.unit == U_PX)
         minh = st->min_height.v - vt > 0 ? st->min_height.v - vt : 0;
-    int ch = block_content(c, n, cx, cy, b.w, defh, minh, &pm);
+    int cv_skipped = cv_skip(c, n, bx, y, bw);
+    int ch = cv_skipped ? cv_stand_in(n, 1) : block_content(c, n, cx, cy, b.w, defh, minh, &pm);
     c->inside_text[0] = 0;
     if (c->marker_pending && st->display == D_LIST_ITEM)
         place_marker(c, cy + wfont_ascent(st->font));
@@ -3410,6 +3563,10 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
     }
     if (st->min_height.unit == U_PX && ch < st->min_height.v)
         ch = st->min_height.v;
+    if (!cv_skipped && !c->measuring && (st->cv != CV_VISIBLE || st->cis_auto_w || st->cis_auto_h)) {
+        n->cv_w = b.w, n->cv_h = ch;            /* the last size it had, for contain-intrinsic-size: auto */
+        n->cv_size_known = 1;
+    }
     int bh = b.bt + b.pt + ch + b.pb + b.bb;
     if (st->cq_type && !c->measuring) {         /* a query container: its content box, for the next cascade */
         int listed = 0;
@@ -3495,6 +3652,15 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
         dyn_register(c, m_start, 0, bx, y, bw, bh, st, n->parent);
     if (!bg_slot)
         layer_register(c, n, m_start.items, mc0.items);
+    if (!c->measuring && slot >= 0 && n->parent) {
+        struct layout *lo = c->lo;
+        if (st->snap_align_x || st->snap_align_y)
+            lbox_add(c, &lo->snap, &lo->nsnap, &lo->snapcap, n, slot, m_start.items, 0);
+        if (st->cv != CV_VISIBLE)
+            lbox_add(c, &lo->cv, &lo->ncv, &lo->cvcap, n, slot, m_start.items, cv_skipped);
+        if (st->vt_name)
+            lbox_add(c, &lo->vt, &lo->nvt, &lo->vtcap, n, slot, m_start.items, 0);
+    }
     return bh;
 }
 
@@ -3772,6 +3938,12 @@ static void item_place(struct lctx *c, struct fitem *it, int x, int y, int h)
     if (it->kind != FI_BLOCK)
         return;
     finish_box(c, it->n, it->slot, x, y, it->bw, h);
+    if (it->n->style->vt_name)                          /* its borders, drawn just now, are its own */
+        for (int k = c->lo->nvt - 1; k >= 0; k--)
+            if (c->lo->vt[k].node == it->n) {
+                c->lo->vt[k].to = c->lo->nitems;
+                break;
+            }
     if (it->n->style->clips) {                          /* overflow: clip (and scroll) what the item holds */
         struct mark from = it->m0;
         if (it->slot >= 0 && from.items == it->slot) {  /* not its background, nor its picture */
@@ -4791,6 +4963,9 @@ static void measure(struct lctx *c, struct node *n, int *min, int *max)
         if (relative(st->width.unit) || relative(st->max_width.unit))
             mn = 0;
         edges = 0;
+    } else if (st->cv != CV_VISIBLE && n->parent && n->tag != T_BODY &&
+               (st->cv == CV_HIDDEN || (!cv_forced(n) && n->cv_state == CVS_SKIPPED))) {
+        mn = mx = cv_stand_in(n, 0);                    /* its contents are skipped: their stand-in */
     } else if (st->display == D_TABLE || st->display == D_INLINE_TABLE) {
         int saved = c->measuring;
         c->measuring = 1;
@@ -5592,6 +5767,7 @@ static void layout_pass(struct lctx *c, struct node *root, int vw, int vh)
     lo->vh = vh;
     lo->dyn = arena_alloc(c->a, sizeof(struct dynbox) * MAX_DYNBOX);
     lo->sb = arena_alloc(c->a, sizeof(struct sbox) * MAX_SBOX);
+    lo->last_sbox = -1;
     /* The root's background, or else the body's, covers the whole canvas. */
     struct node *body = NULL;
     for (struct node *k = root->first; k; k = k->next)
@@ -5611,9 +5787,14 @@ static void layout_pass(struct lctx *c, struct node *root, int vw, int vh)
     int h = layout_block_box(c, root, 0, 0, vw, -1, &mb, NULL);
     lo->height = h + (mb > 0 ? mb : 0);
     top_layer(c, root);
+    /* the page snaps as the root says (or a body that scrolls in its place) */
+    if (root->style->snap_type)
+        lo->page_snap = root;
+    else if (body && body->style && body->style->snap_type && body->style->clips && !root->style->clips)
+        lo->page_snap = body;
 }
 
-void layout_document(struct arena *a, struct layout *lo, struct node *root, int vw, int vh)
+static void layout_once(struct arena *a, struct layout *lo, struct node *root, int vw, int vh)
 {
     memset(lo, 0, sizeof(*lo));
     lo->canvas = OPAQUE(0xFFFFFF);
@@ -5643,6 +5824,9 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
     }
     for(int k=0;k<lo->ncontrols;k++)if(!lo->controls[k].xf)
         lo->controls[k].xf=(uint16_t)node_transform(lo,lo->controls[k].node);
+    lbox_resolve(lo, lo->snap, &lo->nsnap, 0);
+    lbox_resolve(lo, lo->cv, &lo->ncv, 0);
+    lbox_resolve(lo, lo->vt, &lo->nvt, 1);
     apply_z_order(&c);
     for (int k = 0; k < lo->nfx; k++) {         /* backdrop-filter: before the first of its items to be painted */
         if (!lo->fx[k].node->style->backdrop)
@@ -5670,6 +5854,17 @@ void layout_document(struct arena *a, struct layout *lo, struct node *root, int 
             lo->height = d->y + d->h;
     }
     shadow_restore(composed);
+}
+
+void layout_document(struct arena *a, struct layout *lo, struct node *root, int vw, int vh)
+{
+    /* content-visibility: auto boxes laid out for the first time (or flex and grid items, which are
+     * placed after their contents are laid out) may find themselves elsewhere than was assumed */
+    for (int round = 0; round < 3; round++) {
+        layout_once(a, lo, root, vw, vh);
+        if (!lo->ncv || !cv_update(lo, layout_view_x, layout_view_y))
+            break;
+    }
 }
 
 /* No geometry or item ordering changes: refresh only tagged background fills. */
@@ -7830,8 +8025,10 @@ static int sbox_set(struct layout *lo, int k, int sx, int sy)
     sx = sx < 0 ? 0 : sx > b->max_x ? b->max_x : sx;
     sy = sy < 0 ? 0 : sy > b->max_y ? b->max_y : sy;
     int moved = sx != b->sx || sy != b->sy;
+    lo->last_from_x = b->sx, lo->last_from_y = b->sy;
     b->sx = b->node->scroll_x = sx;
     b->sy = b->node->scroll_y = sy;
+    lo->last_sbox = k;
     return moved;
 }
 
@@ -7982,4 +8179,140 @@ void layout_reveal(struct layout *lo, const struct node *n, int x, int y, int w,
         sbox_set(lo, k, nx, ny);
         accx += b->sx, accy += b->sy;
     }
+}
+
+/* ---- scroll snapping ---- */
+
+int layout_sbox_index(const struct layout *lo, const struct node *n)
+{
+    return n ? sbox_of_node(lo, n) : -1;
+}
+
+int layout_sbox_scroll(struct layout *lo, int k, int sx, int sy)
+{
+    return k >= 0 && k < lo->nsb ? sbox_set(lo, k, sx, sy) : 0;
+}
+
+struct snap_pick {
+    int pos, dist;              /* the snap position, and how far it is from where the scroll was going */
+    int beyond;                 /* it lies past the start in the scroll's direction */
+    const struct lbox *area;
+};
+
+/*
+ * One axis. The snapport runs from pos + pad0 to pos + size - pad1 (scroll coordinates: 0 is the
+ * container's scroll origin, org the page coordinate it is at). Each area aligned on this axis gives a
+ * snap position; one bigger than the snapport gives the whole range over which it fills it.
+ */
+static int snap_axis(const struct layout *lo, int sb, int axis, int org, int size, int pad0, int pad1, int max,
+                     int from, int dir, int mandatory, const struct node *keep, int *pos, struct node **got)
+{
+    int want = *pos, port = size - pad0 - pad1;
+    if (port < 1)
+        port = 1;
+    struct snap_pick best = { 0, 0x7fffffff, 0, NULL }, stop = { 0, 0x7fffffff, 0, NULL }, kept = best;
+    int any = 0;
+    for (int i = 0; i < lo->nsnap; i++) {
+        const struct lbox *e = &lo->snap[i];
+        if (e->sb != sb || (!sb && e->dyn))
+            continue;
+        const struct style *st = e->node->style;
+        int align = axis ? st->snap_align_y : st->snap_align_x;
+        if (align == SA_NONE)
+            continue;
+        int a0 = (axis ? e->y : e->x) - org - st->scroll_margin[axis ? 0 : 3];
+        int a1 = (axis ? e->y + e->h : e->x + e->w) - org + st->scroll_margin[axis ? 2 : 1];
+        int c = align == SA_START ? a0 - pad0 : align == SA_END ? a1 - (size - pad1)
+              : (a0 + a1) / 2 - pad0 - port / 2;
+        if (a1 - a0 > port) {                   /* bigger than the snapport: anywhere it fills it will do */
+            int lo_pos = a0 - pad0, hi_pos = a1 - (size - pad1);
+            c = want < lo_pos ? lo_pos : want > hi_pos ? hi_pos : want;
+        }
+        c = c < 0 ? 0 : c > max ? max : c;
+        struct snap_pick p = { c, c > want ? c - want : want - c, dir ? (c - from) * dir > 0 : 1, e };
+        if (dir && c == want && (c - from) * dir >= 0)
+            p.beyond = 1;
+        any = 1;
+        if (keep && e->node == keep)
+            kept = p;
+        if (p.beyond && p.dist < best.dist)
+            best = p;
+        if (dir && st->snap_stop && p.beyond && (c - from) * dir < (stop.area ? (stop.pos - from) * dir : 0x7fffffff))
+            stop = p;
+    }
+    if (!any)
+        return 0;
+    if (!dir && kept.area)                      /* laid out again: it stays on the area it was on */
+        best = kept;
+    int stopped = 0;
+    if (stop.area && best.area && (best.pos - from) * dir > (stop.pos - from) * dir)
+        best = stop, stopped = 1;               /* scroll-snap-stop: always is not passed over */
+    if (!best.area && dir && mandatory)         /* nothing that way: the nearest, wherever it is */
+        return snap_axis(lo, sb, axis, org, size, pad0, pad1, max, from, 0, mandatory, NULL, pos, got);
+    if (!best.area)
+        return 0;
+    if (!mandatory && !stopped && best.dist > port / 3)     /* proximity: only when it is close */
+        return 0;
+    *pos = best.pos;
+    if (got)
+        *got = best.area->node;
+    return 1;
+}
+
+int layout_snap(const struct layout *lo, const struct snap_query *q, int *x, int *y,
+                struct node **snapped_x, struct node **snapped_y)
+{
+    const struct node *cn;
+    int ox, oy, w, h, max_x, max_y;
+    if (q->box < 0) {
+        cn = lo->page_snap;
+        ox = oy = 0, w = q->vw, h = q->vh, max_x = q->max_x, max_y = q->max_y;
+    } else {
+        if (q->box >= lo->nsb)
+            return 0;
+        const struct sbox *b = &lo->sb[q->box];
+        cn = b->node;
+        ox = b->x, oy = b->y;
+        w = b->w - (b->bar_y ? SB_BAR : 0), h = b->h - (b->bar_x ? SB_BAR : 0);
+        max_x = b->max_x, max_y = b->max_y;
+    }
+    if (!cn || !cn->style || !cn->style->snap_type)
+        return 0;
+    const struct style *st = cn->style;
+    int type = st->snap_type, mandatory = (type & SNAP_MANDATORY) != 0, any = 0;
+    int pad[4];
+    for (int i = 0; i < 4; i++)
+        pad[i] = len_px(st->scroll_pad[i], i & 1 ? w : h);
+    int sb = q->box < 0 ? 0 : q->box + 1;
+    if (snapped_x)
+        *snapped_x = NULL;
+    if (snapped_y)
+        *snapped_y = NULL;
+    if (type & SNAP_X)
+        any |= snap_axis(lo, sb, 0, ox, w, pad[3], pad[1], max_x, q->from_x, q->dir_x, mandatory, q->keep_x, x,
+                         snapped_x);
+    if (type & SNAP_Y)
+        any |= snap_axis(lo, sb, 1, oy, h, pad[0], pad[2], max_y, q->from_y, q->dir_y, mandatory, q->keep_y, y,
+                         snapped_y);
+    return any;
+}
+
+/* ---- painting some of the items (view transitions' snapshots) ---- */
+
+void layout_paint_filtered(const struct layout *lo, struct surface *s, int ox, int oy, int sx, int sy,
+                           uint32_t canvas, int (*keep)(void *ctx, const struct ditem *d), void *ctx)
+{
+    struct ditem *items = lo->nitems ? malloc(sizeof(*items) * (size_t)lo->nitems) : NULL;
+    struct layout subset = *lo;
+    subset.items = items;
+    subset.nitems = 0;
+    subset.nhl = 0;
+    subset.hl = NULL;
+    subset.sel_on = 0;
+    subset.canvas = canvas;
+    for (int k = 0; items && k < lo->nitems; k++)
+        if (keep(ctx, &lo->items[k]))
+            items[subset.nitems++] = lo->items[k];
+    paint_layer(&subset, s, ox, oy, sx, sy, NULL, 0, 0);
+    free(items);
 }

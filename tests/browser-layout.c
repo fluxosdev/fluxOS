@@ -1088,7 +1088,8 @@ static void subgrids(void)
     CHECK(css_supports("(grid-template-columns: subgrid repeat(2, [edge]))"));
     CHECK(!css_supports("(grid-template-columns: subgrid repeat(0, [edge]))"));
     CHECK(css_supports("(grid-template-columns: subgrid)"));
-    CHECK(!css_supports("(scroll-snap-type: x mandatory)"));
+    CHECK(css_supports("(scroll-snap-type: x mandatory)"));
+    CHECK(css_supports("(content-visibility: auto)"));
     CHECK(!css_supports("(contain: layout)"));
     CHECK(!css_supports("(transform-style: preserve-3d)"));
     puts("browser subgrid: columns, rows, inherited names and gaps, nested grids and auto-row contributions passed");
@@ -1284,8 +1285,288 @@ static void anchors(void)
     before_style = NULL;
 }
 
+
+static const struct lbox *lbox_of(const struct lbox *list, int n, const struct node *node)
+{
+    for (int i = 0; i < n; i++)
+        if (list[i].node == node)
+            return &list[i];
+    return NULL;
+}
+
+static void scroll_snapping(void)
+{
+    struct page p;
+    int x, y;
+    struct node *got;
+    /* a box of sections 100px high, one of them taller than the box */
+    load(&p, "<style>body{margin:0}.s{height:100px;width:100px;overflow-y:auto;scroll-snap-type:y mandatory}"
+             ".s div{height:100px;scroll-snap-align:start}.s .big{height:250px}</style>"
+             "<div class=s><div id=a>A</div><div id=b>B</div><div id=c class=big>C</div><div id=d>D</div></div>",
+         300, 300);
+    CHECK(p.lo.nsb == 1 && p.lo.nsnap == 4 && p.lo.sb[0].max_y == 450);
+    struct snap_query q = { .box = 0, .from_y = 0, .dir_y = 1 };
+    x = 0, y = 30;                                      /* a little way down: on to the next */
+    CHECK(layout_snap(&p.lo, &q, &x, &y, NULL, &got) && y == 100 && got == by_id(p.root, "b"));
+    q.from_y = 100, q.dir_y = -1, y = 90;               /* and back */
+    CHECK(layout_snap(&p.lo, &q, &x, &y, NULL, &got) && y == 0 && got == by_id(p.root, "a"));
+    q.from_y = 100, q.dir_y = 1, y = 230;               /* inside the tall one: anywhere it fills the box */
+    CHECK(layout_snap(&p.lo, &q, &x, &y, NULL, &got) && y == 230 && got == by_id(p.root, "c"));
+    q.dir_y = 0, y = 140;                               /* not aimed: the nearest */
+    CHECK(layout_snap(&p.lo, &q, &x, &y, NULL, &got) && y == 100);
+    q.keep_y = by_id(p.root, "d"), y = 140;             /* laid out again: it stays where it was */
+    CHECK(layout_snap(&p.lo, &q, &x, &y, NULL, &got) && y == 450 && got == by_id(p.root, "d"));
+    CHECK(layout_sbox_index(&p.lo, p.lo.sb[0].node) == 0 && layout_sbox_scroll(&p.lo, 0, 0, 100));
+    CHECK(p.lo.sb[0].node->scroll_y == 100 && p.lo.last_sbox == 0);
+    unload(&p);
+
+    /* the page: scroll-padding, center alignment, proximity and scroll-snap-stop */
+    load(&p, "<style>html{scroll-snap-type:y proximity;scroll-padding-top:20px}body{margin:0}"
+             "section{height:300px;scroll-snap-align:start}#m{scroll-snap-align:center;height:100px}"
+             "#s{scroll-snap-stop:always}</style>"
+             "<section id=one>1</section><section id=s>2</section><section id=three>3</section>"
+             "<section id=m>4</section><section>5</section>", 300, 400);
+    CHECK(p.lo.page_snap == p.root && p.lo.nsnap == 5);
+    struct snap_query pq = { .box = -1, .vw = 300, .vh = 400, .max_y = 900, .from_y = 0, .dir_y = 1 };
+    x = 0, y = 270;                                     /* near the second, less its padding */
+    CHECK(layout_snap(&p.lo, &pq, &x, &y, NULL, &got) && y == 280 && got == by_id(p.root, "s"));
+    y = 560;                                            /* it may not be passed over */
+    CHECK(layout_snap(&p.lo, &pq, &x, &y, NULL, &got) && y == 280);
+    pq.from_y = 280, y = 760;                           /* centred: 900 + 50 - 20 - 380 / 2 */
+    CHECK(layout_snap(&p.lo, &pq, &x, &y, NULL, &got) && y == 740 && got == by_id(p.root, "m"));
+    pq.from_y = 0, pq.dir_y = 0, y = 140;               /* proximity: too far from any */
+    CHECK(!layout_snap(&p.lo, &pq, &x, &y, NULL, NULL) && y == 140);
+    unload(&p);
+    /* sections taller than the window: anywhere they fill it, and snap-stop holds there too */
+    load(&p, "<style>html{scroll-snap-type:y mandatory}body{margin:0}section{height:300px;scroll-snap-align:start}"
+             "#s{scroll-snap-stop:always}</style><section>1</section><section id=s>2</section><section>3</section>",
+         300, 200);
+    struct snap_query tq = { .box = -1, .vw = 300, .vh = 200, .max_y = 700, .from_y = 0, .dir_y = 1 };
+    x = 0, y = 350;
+    CHECK(layout_snap(&p.lo, &tq, &x, &y, NULL, &got) && y == 350 && got == by_id(p.root, "s"));
+    y = 650;                                            /* past it: held at the last place it fills the window */
+    CHECK(layout_snap(&p.lo, &tq, &x, &y, NULL, &got) && y == 400 && got == by_id(p.root, "s"));
+    unload(&p);
+
+    /* horizontal, and an area's scroll-margin */
+    load(&p, "<style>body{margin:0}.r{width:100px;height:40px;overflow-x:scroll;white-space:nowrap;"
+             "scroll-snap-type:x mandatory}.r span{display:inline-block;width:80px;height:20px;"
+             "scroll-snap-align:none start}#k{scroll-margin-left:10px}</style>"
+             "<div class=r><span>a</span><span id=k>b</span><span>c</span></div>", 300, 300);
+    CHECK(p.lo.nsb == 1 && p.lo.nsnap == 3);
+    struct snap_query hq = { .box = 0, .from_x = 0, .dir_x = 1 };
+    x = 20, y = 0;
+    CHECK(layout_snap(&p.lo, &hq, &x, &y, &got, NULL) && got == by_id(p.root, "k") &&
+          x == lbox_of(p.lo.snap, p.lo.nsnap, got)->x - p.lo.sb[0].x - 10);
+    unload(&p);
+    /* a flex carousel, with the strip's scroll-padding */
+    load(&p, "<style>body{margin:0}.strip{display:flex;gap:10px;width:200px;overflow-x:auto;scroll-snap-type:x mandatory;"
+             "scroll-padding-left:5px}.strip div{flex:0 0 90px;height:30px;scroll-snap-align:start}</style>"
+             "<div class=strip><div>1</div><div id=f2>2</div><div>3</div><div>4</div></div>", 300, 300);
+    CHECK(p.lo.nsb == 1 && p.lo.nsnap == 4 && p.lo.sb[0].max_x > 0);
+    struct snap_query fq = { .box = 0, .from_x = 0, .dir_x = 1 };
+    x = 15, y = 0;                                      /* the second starts at 100: less the padding */
+    CHECK(layout_snap(&p.lo, &fq, &x, &y, &got, NULL) && got == by_id(p.root, "f2") && x == 95);
+    unload(&p);
+    puts("browser scroll snapping: mandatory and proximity, start/center/end, large areas, padding, margins and stops passed");
+}
+
+static void content_visibility(void)
+{
+    struct page p;
+    layout_view_x = layout_view_y = 0;
+    load(&p, "<style>body{margin:0}.c{content-visibility:auto;contain-intrinsic-size:auto 50px}"
+             "#h{content-visibility:hidden;contain-intrinsic-size:30px 40px}</style>"
+             "<div class=c id=near><p>Near</p></div><div style=height:2000px></div>"
+             "<div class=c id=far><p>Far</p><p>More</p></div><div id=h><p>Hidden</p></div>", 300, 300);
+    struct node *near = by_id(p.root, "near"), *far = by_id(p.root, "far"), *hid = by_id(p.root, "h");
+    CHECK(word(&p, "Near") && !word(&p, "Far") && !word(&p, "Hidden"));
+    CHECK(p.lo.ncv == 3);
+    const struct lbox *f = lbox_of(p.lo.cv, p.lo.ncv, far), *h = lbox_of(p.lo.cv, p.lo.ncv, hid);
+    CHECK(f && f->skipped && f->h == 50 && h && h->skipped && h->h == 40);
+    CHECK(near->cv_state == CVS_SHOWN && far->cv_state == CVS_SKIPPED && near->cv_size_known);
+    CHECK(!layout_cv_stale(&p.lo, 0, 0) && layout_cv_stale(&p.lo, 0, 1800));
+
+    /* scrolled down to it: laid out, and its size remembered */
+    arena_free(&p.la);
+    layout_view_y = 1800;
+    layout_document(&p.la, &p.lo, p.root, 300, 300);
+    f = lbox_of(p.lo.cv, p.lo.ncv, far);
+    CHECK(word(&p, "Far") && word(&p, "More") && f && !f->skipped && f->h > 50 && !word(&p, "Hidden"));
+    int remembered = far->cv_h;
+    CHECK(far->cv_size_known && remembered == f->h && near->cv_state == CVS_SKIPPED);
+
+    /* and back at the top: skipped again, at the size it had */
+    arena_free(&p.la);
+    layout_view_y = 0;
+    layout_document(&p.la, &p.lo, p.root, 300, 300);
+    f = lbox_of(p.lo.cv, p.lo.ncv, far);
+    CHECK(!word(&p, "Far") && f && f->skipped && f->h == remembered && word(&p, "Near"));
+
+    /* what has the focus (or is being scrolled to) shows wherever it is */
+    css_focus_node = far->first;
+    arena_free(&p.la);
+    layout_document(&p.la, &p.lo, p.root, 300, 300);
+    CHECK(word(&p, "Far"));
+    css_focus_node = NULL;
+    layout_cv_reveal = far;
+    arena_free(&p.la);
+    layout_document(&p.la, &p.lo, p.root, 300, 300);
+    CHECK(word(&p, "Far"));
+    layout_cv_reveal = NULL;
+    unload(&p);
+
+    /* grid items are placed after they are laid out: the first layout shows them all (none was
+     * skipped that should show), and the next skips those it found far down */
+    load(&p, "<style>body{margin:0}.g{display:grid;grid-template-columns:100px}"
+             ".g div{content-visibility:auto;height:200px}</style>"
+             "<div class=g><div id=g1>One</div><div>Two</div><div>Three</div><div id=g4>Four</div></div>", 300, 300);
+    CHECK(word(&p, "One") && word(&p, "Four") && by_id(p.root, "g4")->cv_state == CVS_SKIPPED);
+    arena_free(&p.la);
+    layout_document(&p.la, &p.lo, p.root, 300, 300);
+    CHECK(word(&p, "One") && word(&p, "Three") && !word(&p, "Four"));
+    CHECK(lbox_of(p.lo.cv, p.lo.ncv, by_id(p.root, "g4"))->y == 600);
+    unload(&p);
+    /* a skipped box that must show after all is laid out again at once */
+    load(&p, "<style>body{margin:0}.c{content-visibility:auto;contain-intrinsic-size:10px}</style>"
+             "<div style=display:flex;flex-direction:column><div style=height:1000px></div>"
+             "<div class=c id=late>Late</div></div>", 300, 300);
+    arena_free(&p.la);
+    layout_document(&p.la, &p.lo, p.root, 300, 300);
+    CHECK(!word(&p, "Late"));
+    arena_free(&p.la);
+    layout_view_y = 900;
+    layout_document(&p.la, &p.lo, p.root, 300, 300);
+    CHECK(word(&p, "Late"));
+    layout_view_y = 0;
+    unload(&p);
+    puts("browser content-visibility: auto and hidden, intrinsic and remembered sizes, focus, reveal and grid items passed");
+}
+
+static void transition_names(void)
+{
+    struct page p;
+    load(&p, "<style>body{margin:0}#a{view-transition-name:hero;border:2px solid red}#b{view-transition-name:inner}"
+             "#c{view-transition-name:match-element;border:1px solid blue}.f{display:flex}</style>"
+             "<div id=a><p>X</p><div id=b>Y</div></div><p>Z</p><div class=f><div id=c>Q</div></div>", 300, 300);
+    struct node *a = by_id(p.root, "a"), *b = by_id(p.root, "b"), *c = by_id(p.root, "c");
+    CHECK(p.lo.nvt == 3 && a->style->vt_name && !strcmp(a->style->vt_name, "hero"));
+    CHECK(!strcmp(c->style->vt_name, VT_NAME_ELEMENT));
+    int ia = -1, ib = -1, ic = -1;
+    for (int i = 0; i < p.lo.nvt; i++) {
+        if (p.lo.vt[i].node == a) ia = i;
+        if (p.lo.vt[i].node == b) ib = i;
+        if (p.lo.vt[i].node == c) ic = i;
+    }
+    CHECK(ia >= 0 && ib >= 0 && ic >= 0 && ib < ia);   /* the inner one first */
+    CHECK(word(&p, "X")->vtg == ia + 1 && word(&p, "Y")->vtg == ib + 1 && word(&p, "Z")->vtg == 0 &&
+          word(&p, "Q")->vtg == ic + 1);
+    int borders_a = 0, borders_c = 0;
+    for (int i = 0; i < p.lo.nitems; i++) {
+        const struct ditem *d = &p.lo.items[i];
+        if (d->kind == DK_FILL && (d->color & 0xFFFFFF) == 0xFF0000)
+            borders_a += d->vtg == ia + 1;
+        if (d->kind == DK_FILL && (d->color & 0xFFFFFF) == 0x0000FF)
+            borders_c += d->vtg == ic + 1;
+    }
+    CHECK(borders_a == 4 && borders_c == 4);
+    CHECK(p.lo.vt[ia].w == 300 && p.lo.vt[ia].x == 0);
+    unload(&p);
+    puts("browser view-transition-name: the items of named elements, nested and in flex containers passed");
+}
+
+
+/* Style again and lay out (after a test changed the tree), as the browser does. */
+static void restyle(struct page *p, int vw, int vh)
+{
+    arena_free(&p->sa);
+    arena_free(&p->la);
+    css_cascade(&p->sa, p->root, p->sheets, p->nsheets, vw, vh, NULL, NULL);
+    layout_document(&p->la, &p->lo, p->root, vw, vh);
+}
+
+static void set_style_attr(struct node *n, char *value)
+{
+    for (struct attr *a = n->attrs; a; a = a->next)
+        if (!strcmp(a->name, "style"))
+            a->value = value;
+}
+
+static uint32_t pixel(const struct surface *s, int x, int y) { return s->px[y * s->stride + x] & 0xFFFFFF; }
+
+static void view_transitions(void)
+{
+    struct page p;
+    static uint32_t px[200 * 100];
+    struct surface s = { .px = px, .w = 200, .h = 100, .stride = 200, .clip = { 0, 0, 200, 100 } };
+    int dup;
+    load(&p, "<style>body{margin:0}#b{position:absolute;top:0;width:20px;height:20px;background:#f00;"
+             "view-transition-name:box}</style><div id=b style='left:0px'></div>", 200, 100);
+    struct node *b = by_id(p.root, "b");
+    struct vt_page pg = { &p.lo, p.root, p.sheets, p.nsheets, 200, 100, 0, 0 };
+    anim_now = 1000;
+    struct vtrans *t = vt_capture(&pg, &dup);
+    CHECK(t && !dup && !vt_begun(t));
+    set_style_attr(b, "left:100px");
+    restyle(&p, 200, 100);
+    CHECK(vt_draw(t, &pg, &s, 0, 0) && pixel(&s, 5, 5) == 0xFF0000 && pixel(&s, 105, 5) == 0xFFFFFF);
+    CHECK(vt_begin(t, &pg, &dup) && vt_begun(t));
+    CHECK(vt_draw(t, &pg, &s, 0, 0) && pixel(&s, 5, 5) == 0xFF0000 && pixel(&s, 105, 5) == 0xFFFFFF);
+    anim_now = 1125;                                    /* halfway in time, ease: about 80% of the way */
+    CHECK(vt_draw(t, &pg, &s, 0, 0) && pixel(&s, 5, 5) == 0xFFFFFF && pixel(&s, 85, 5) == 0xFF0000);
+    CHECK(pixel(&s, 105, 5) == 0xFFFFFF);
+    anim_now = 1300;
+    CHECK(!vt_draw(t, &pg, &s, 0, 0) && pixel(&s, 105, 5) == 0xFF0000 && pixel(&s, 5, 5) == 0xFFFFFF);
+    vt_free(t);
+    unload(&p);
+
+    /* the root cross-fades, at the timing the page gives its pseudo-elements */
+    load(&p, "<html style='background:#fff'><style>::view-transition-group(root){animation-duration:1s;"
+             "animation-timing-function:linear}</style><body></body></html>", 200, 100);
+    pg = (struct vt_page){ &p.lo, p.root, p.sheets, p.nsheets, 200, 100, 0, 0 };
+    anim_now = 5000;
+    t = vt_capture(&pg, &dup);
+    CHECK(t);
+    CHECK(node_attr(p.root, "style"));
+    set_style_attr(p.root, "background:#000");
+    restyle(&p, 200, 100);
+    CHECK(vt_begin(t, &pg, &dup));
+    anim_now = 5500;
+    CHECK(vt_draw(t, &pg, &s, 0, 0));
+    uint32_t mid = pixel(&s, 50, 50);
+    CHECK((mid & 0xFF) >= 120 && (mid & 0xFF) <= 135 && (mid >> 16) == (mid & 0xFF));
+    anim_now = 6001;
+    CHECK(!vt_draw(t, &pg, &s, 0, 0) && pixel(&s, 50, 50) == 0x000000);
+    vt_free(t);
+    unload(&p);
+
+    /* two elements with one name: no transition */
+    load(&p, "<style>p{view-transition-name:same}</style><p>a</p><p>b</p>", 200, 100);
+    pg = (struct vt_page){ &p.lo, p.root, p.sheets, p.nsheets, 200, 100, 0, 0 };
+    CHECK(!vt_capture(&pg, &dup) && dup);
+    unload(&p);
+
+    /* a page's own keyframes for the new picture: it slides in from the right */
+    load(&p, "<style>body{margin:0}#b{width:200px;height:100px;background:#00f;view-transition-name:slide}"
+             "::view-transition-new(slide){animation:1s linear both in}::view-transition-old(slide){animation:none;opacity:0}"
+             "@keyframes in{from{transform:translateX(100px)}}</style><div id=b></div>", 200, 100);
+    pg = (struct vt_page){ &p.lo, p.root, p.sheets, p.nsheets, 200, 100, 0, 0 };
+    anim_now = 100;
+    t = vt_capture(&pg, &dup);
+    CHECK(t && vt_begin(t, &pg, &dup));
+    anim_now = 600;                                     /* halfway: 50px to the right still */
+    CHECK(vt_draw(t, &pg, &s, 0, 0) && pixel(&s, 40, 50) == 0xFFFFFF && pixel(&s, 60, 50) == 0x0000FF);
+    vt_free(t);
+    unload(&p);
+    puts("browser view transitions: old and new pictures, moving groups, root cross-fades, page timing and keyframes passed");
+}
+
 int main(void)
 {
+    view_transitions();
+    scroll_snapping();
+    content_visibility();
+    transition_names();
     anchors();
     top_layer();
     fit_content();

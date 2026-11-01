@@ -31,7 +31,7 @@ static const struct {
     { "computer", ICON_COMPUTER, "files", "/" },
     { "editor", ICON_EDITOR, "editor", NULL },
     { "calculator", ICON_CALC, "calculator", NULL },
-    { "player", ICON_SOUND, "player", NULL },
+    { "mediaplayer", ICON_VIDEO, "mediaplayer", NULL },
     { "archiver", ICON_ARCHIVE, "archiver", NULL },
     { "paint", ICON_PAINT, "paint", NULL },
     { "gears", ICON_GEARS, "gears", NULL },

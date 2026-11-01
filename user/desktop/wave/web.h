@@ -188,6 +188,13 @@ struct node {
      * the cascade took it to be (css.c); they differ until the page is styled again */
     int cq_w, cq_h, cq_aw, cq_ah;
     uint8_t cq_known, cq_asked;
+    /* content-visibility (layout.c): whether the last layout skipped its contents (CVS_*), and the
+     * size of its content box when they were last laid out (for contain-intrinsic-size: auto) */
+    uint8_t cv_state, cv_size_known;
+    int cv_w, cv_h;
+    unsigned lbox_gen;                  /* layout.c: its box was counted in this pass */
+    /* scroll snapping (browser.c): the snap areas a scroll container (the root: the page) rests on */
+    struct node *snapped_x, *snapped_y;
 
     /* the top layer (jsdom.c): an open popover (POP_*), a dialog shown with showModal() */
     uint8_t popover_open, modal;
@@ -509,6 +516,8 @@ struct anim_event {
     float elapsed;              /* seconds */
 };
 int anim_take_event(const struct node *root, struct anim_event *out);
+/* A timing function's output at x (0 to 1). */
+float anim_ease(const struct css_timing *e, float x);
 /* What transition-property's name stands for, as AP_BIT()s (all: AP_EVERY; unknown: 0). */
 uint64_t anim_prop_bits(const char *name, int len);
 
@@ -643,7 +652,25 @@ struct style {
     const struct css_filter *filter, *backdrop;     /* filter, backdrop-filter (NULL: none) */
     const struct css_clip *clip_path;
     uint8_t blend;                      /* mix-blend-mode, BL_* */
+    /* scroll snapping: a scroll container's scroll-snap-type and scroll-padding; a snap area's
+     * scroll-snap-align (block axis y, inline axis x), scroll-snap-stop and scroll-margin */
+    uint8_t snap_type;                  /* SNAP_X | SNAP_Y, with SNAP_MANDATORY (0: none) */
+    uint8_t snap_align_x, snap_align_y; /* SA_* */
+    uint8_t snap_stop;                  /* scroll-snap-stop: always */
+    struct len scroll_pad[4];           /* top, right, bottom, left (auto: 0) */
+    int scroll_margin[4];               /* pixels */
+    /* content-visibility, and the size a box whose contents are skipped stands in for */
+    uint8_t cv;                         /* CV_* */
+    uint8_t cis_auto_w, cis_auto_h;     /* contain-intrinsic-size: auto <length>: the last size it had first */
+    int cis_w, cis_h;                   /* pixels; -1: none */
+    /* view transitions: view-transition-name (NULL: none; match-element and auto give the element
+     * a name of its own, VT_NAME_ELEMENT) and view-transition-class (names, spaces apart) */
+    const char *vt_name, *vt_class;
 };
+enum { SNAP_X = 1, SNAP_Y = 2, SNAP_MANDATORY = 4 };
+enum { SA_NONE, SA_START, SA_END, SA_CENTER };
+enum { CV_VISIBLE, CV_AUTO, CV_HIDDEN };
+#define VT_NAME_ELEMENT "\001element"
 enum { CQ_NONE, CQ_INLINE, CQ_SIZE };
 /* layout.c: a container came out a size the cascade did not assume; the page needs styling again */
 extern int layout_cq_changed;
@@ -675,6 +702,20 @@ extern int css_shared;
 int css_parse_color(const char *s, int n, uint32_t *out);
 /* oklch(), lab(), hwb(), color(), color-mix() and the rest (csscolor.c, in floating point). */
 int css_color_function(const char *s, uint32_t *out);
+/* ---- view transitions' pseudo-elements (css.c) ----
+ * While a transition runs the root matches :active-view-transition (and :active-view-transition-type()
+ * for the types in css_vt_types, spaces apart); a cascade must follow changing them. */
+extern int css_vt_active;
+extern const char *css_vt_types;
+enum { VT_ROOT_PSEUDO = 9, VT_GROUP, VT_PAIR, VT_OLD, VT_NEW };     /* the PE_ numbers after PE_BACKDROP */
+/* The style of ::view-transition-group(name), -image-pair, -old or -new (kind VT_*), for the group
+ * named name (classes: its view-transition-class, or NULL), inheriting from parent (NULL: the root
+ * element's). Its animations run at anim_now on holder, a node kept apart from the document for the
+ * transition's length (anim_forget(holder) drops them). root is the document's root element, laid out
+ * by css_cascade with the same sheets. NULL if it cannot be worked out. */
+struct style *css_vt_style(struct arena *a, struct node *root, struct sheet **sheets, int nsheets,
+                           int viewport_w, int viewport_h, int kind, const char *name, const char *classes,
+                           const struct style *parent, struct node *holder);
 /* An @supports condition ("(display: grid) and (not (color: oklch(0 0 0)))"), or a declaration. */
 int css_supports(const char *cond);
 /* Does a media query list ("screen and (min-width: 600px)") match a vw x vh viewport? */
@@ -759,6 +800,7 @@ struct ditem {
     uint8_t fade;               /* opacity: 255 minus how much shows (0: opaque) */
     uint16_t fx;                /* effect group (filter, clip-path, blend, backdrop-filter), 1-based */
     uint8_t backdrop;           /* the first item of a group with backdrop-filter: what is behind it is filtered first */
+    uint16_t vtg;               /* 1 + the element with a view-transition-name it is part of, or 0 */
 };
 
 struct hotspot {                /* a link or a form control */
@@ -828,6 +870,18 @@ struct opacity_group {
     int first,last;
     uint16_t parent;
 };
+
+/* An element with scroll-snap-align, content-visibility other than visible, or a view-transition-name:
+ * its border box, and the scrolling box (sb) and fixed or sticky box (dyn) it moves with. */
+struct lbox {
+    struct node *node;
+    int x, y, w, h;
+    uint16_t sb;
+    uint8_t dyn;
+    uint8_t skipped;            /* content-visibility: its contents were not laid out */
+    int slot, from, to;         /* while laid out: its background item, and its items */
+};
+enum { CVS_UNKNOWN, CVS_SHOWN, CVS_SKIPPED };
 struct layout {
     struct opacity_group *opacity;
     int nopacity,opacitycap;
@@ -855,7 +909,62 @@ struct layout {
     /* text the find bar found, painted behind the text: hl_cur is the match that is the current one */
     const struct fhl *hl;
     int nhl, hl_cur;
+    /* scroll snap areas, content-visibility boxes and view-transition-name elements */
+    struct lbox *snap, *cv, *vt;
+    int nsnap, snapcap, ncv, cvcap, nvt, vtcap;
+    struct node *page_snap;     /* the element whose scroll-snap-type the page has (the root's), or NULL */
+    int last_sbox;              /* the box a wheel turn or scroll bar last scrolled (-1: none) */
+    int last_from_x, last_from_y;   /* ...and where it was before */
 };
+
+/* content-visibility: auto shows the boxes near what is on the screen: the page's scroll position
+ * as it is laid out, and an element whose surroundings must show (scrollIntoView: its boxes'). */
+extern int layout_view_x, layout_view_y;
+extern const struct node *layout_cv_reveal;
+/* After scrolling to (sx, sy): has a content-visibility: auto box come near enough the screen to be
+ * laid out (or gone far enough to be skipped)? Then the page wants laying out again. */
+int layout_cv_stale(const struct layout *lo, int sx, int sy);
+
+/* Scroll snapping. Where a scroll container (box: an index into lo->sb, or -1: the page, whose window
+ * is vw x vh and which scrolls as far as max_x, max_y) comes to rest after a scroll from (from_x, from_y)
+ * to (*x, *y), which moved it dir_x, dir_y (-1, 0 or 1 each; 0 0: not a scroll the user aimed, like
+ * a layout). keep_x/keep_y: the areas it rested on, which it stays on if they are still there. *x, *y
+ * become the snap position, snapped_x/snapped_y (may be NULL) the areas. 0 if it does not snap. */
+struct snap_query {
+    int box, vw, vh, max_x, max_y, from_x, from_y, dir_x, dir_y;
+    const struct node *keep_x, *keep_y;
+};
+int layout_snap(const struct layout *lo, const struct snap_query *q, int *x, int *y,
+                struct node **snapped_x, struct node **snapped_y);
+/* A box's index in lo->sb (-1: none). */
+int layout_sbox_index(const struct layout *lo, const struct node *n);
+/* Scroll box k to (sx, sy), clamped (the node keeps it); 1 if it moved. */
+int layout_sbox_scroll(struct layout *lo, int k, int sx, int sy);
+
+/* ---- view transitions (vt.c): pictures of the page before and after a change, and the frames between ---- */
+struct vt_page {                        /* the page as it is now */
+    const struct layout *lo;
+    struct node *root;
+    struct sheet **sheets;
+    int nsheets;
+    int vw, vh;                         /* the window it shows in */
+    int sx, sy;                         /* where it is scrolled to */
+};
+struct vtrans;
+/* Take the old pictures: the page without its view-transition-name elements, and each of them. NULL if
+ * that cannot be done; *duplicate is set when two elements have the same name (which is an error). */
+struct vtrans *vt_capture(const struct vt_page *pg, int *duplicate);
+/* The DOM has been changed: take the new pictures and start at anim_now. 0 if that fails (as capture). */
+int vt_begin(struct vtrans *t, const struct vt_page *pg, int *duplicate);
+/* Draw it in s at (ox, oy), vw x vh: the old pictures until it has begun, then the frame for anim_now.
+ * Returns 1 while it is still running (or waiting for vt_begin), 0 once it has finished. */
+int vt_draw(struct vtrans *t, const struct vt_page *pg, struct surface *s, int ox, int oy);
+int vt_begun(const struct vtrans *t);
+void vt_free(struct vtrans *t);
+
+/* Paint only some of the items: those keep(ctx, item) says to, over a canvas color (opaque: 0xRRGGBB). */
+void layout_paint_filtered(const struct layout *lo, struct surface *s, int ox, int oy, int sx, int sy,
+                           uint32_t canvas, int (*keep)(void *ctx, const struct ditem *d), void *ctx);
 
 /* Select the text between two points (page coordinates), in reading order. */
 void layout_select(struct layout *lo, int ax, int ay, int fx, int fy);

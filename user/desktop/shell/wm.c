@@ -141,7 +141,7 @@ static void open_terminal(void) { app_launch("terminal"); }
 static void open_home(void) { app_launch("files"); }
 static void open_editor(void) { app_launch("editor"); }
 static void open_calculator(void) { app_launch("calculator"); }
-static void open_player(void) { app_launch("player"); }
+static void open_player(void) { app_launch("mediaplayer"); }
 static void open_browser(void) { app_launch("wave"); }
 static void open_gears(void) { app_launch("gears"); }
 static void open_chess(void) { app_launch("chess"); }
@@ -178,7 +178,7 @@ static const struct menu_item accessories_items[] = {
     { ICON_FOLDER, "File Manager", open_home, NULL, 0 },
     { ICON_EDITOR, "Text Editor", open_editor, NULL, 0 },
     { ICON_CALC, "Calculator", open_calculator, NULL, 0 },
-    { ICON_SOUND, "Sound Player", open_player, NULL, 0 },
+    { ICON_VIDEO, "Media Player", open_player, NULL, 0 },
     { ICON_ARCHIVE, "Archive Manager", open_archiver, NULL, 0 },
     { ICON_PAINT, "Paint", open_paint, NULL, 0 },
 };

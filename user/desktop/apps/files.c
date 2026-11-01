@@ -4,7 +4,7 @@
  * field, a scroll bar and a status bar. Double-clicking a folder opens
  * it in the same window; a program runs in a terminal window, a PNG or
  * JPEG picture opens in the image viewer, a text file in the text editor, a WAV sound opens
- * in the sound player, a VOC one plays with play(1), a shortcut (NAME.app) starts what it
+ * in the Media Player, a VOC one plays with play(1), a shortcut (NAME.app) starts what it
  * names, and anything else is shown with more(1).
  *
  * Each of these is a program of its own (launch.c): this one runs as the
@@ -287,12 +287,17 @@ static enum icon_id classify(struct fm *f, const struct entry *e, const char *pa
     if (has_suffix(e->name, ".html") || has_suffix(e->name, ".htm"))
         return ICON_HTML;
     if (has_suffix(e->name, ".wav") || has_suffix(e->name, ".voc") || has_suffix(e->name, ".mp3") ||
-        has_suffix(e->name, ".ogg") || has_suffix(e->name, ".oga"))
+        has_suffix(e->name, ".ogg") || has_suffix(e->name, ".oga") || has_suffix(e->name, ".flac") ||
+        has_suffix(e->name, ".m4a") || has_suffix(e->name, ".aac") || has_suffix(e->name, ".opus") ||
+        has_suffix(e->name, ".wma") || has_suffix(e->name, ".aiff") || has_suffix(e->name, ".aif"))
         return ICON_SOUND;
     if (has_suffix(e->name, ".zip") || has_suffix(e->name, ".7z"))
         return ICON_ARCHIVE;
     if (has_suffix(e->name, ".mp4") || has_suffix(e->name, ".mkv") || has_suffix(e->name, ".avi") ||
-        has_suffix(e->name, ".webm") || has_suffix(e->name, ".mov") || has_suffix(e->name, ".mpg"))
+        has_suffix(e->name, ".webm") || has_suffix(e->name, ".mov") || has_suffix(e->name, ".mpg") ||
+        has_suffix(e->name, ".mpeg") || has_suffix(e->name, ".flv") || has_suffix(e->name, ".wmv") ||
+        has_suffix(e->name, ".m4v") || has_suffix(e->name, ".ogv") || has_suffix(e->name, ".3gp") ||
+        has_suffix(e->name, ".ts") || has_suffix(e->name, ".asf"))
         return ICON_VIDEO;
     struct stat st;
     if (is_dos_program(path) || (stat(path, &st) == 0 && (st.st_mode & 0111) && is_program(path)))
@@ -1368,7 +1373,7 @@ static void open_file(const char *dir, const char *name, const char *path, enum 
     if (has_suffix(name, ".app")) {
         open_shortcut(path, name);
     } else if (icon == ICON_VIDEO) {
-        message_box("Video", ICON_INFO, "fluxOS cannot play videos yet.");
+        launch1("mediaplayer", path);
     } else if (icon == ICON_IMAGE) {
         launch1("imageview", path);
     } else if (icon == ICON_HTML) {
@@ -1376,7 +1381,7 @@ static void open_file(const char *dir, const char *name, const char *path, enum 
         snprintf(url, sizeof(url), "file://%s", path);
         launch1("wave", url);
     } else if (icon == ICON_SOUND && !has_suffix(name, ".voc")) {
-        launch1("player", path);
+        launch1("mediaplayer", path);
     } else if (icon == ICON_SOUND) {
         const char *argv[] = { "/bin/play", path, NULL };
         launch_terminal(NULL, name, argv, 0);

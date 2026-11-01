@@ -83,7 +83,13 @@ struct jshost {
     /* <audio>: "play" (from value seconds), "pause", "seek" (to value), "volume" (0 to 1) and "load"
      * (forget the sound: its source changed); the browser answers through jsdom_media_event. */
     void (*media)(void *ctx, struct node *n, const char *op, double value);
+    /* document.startViewTransition(): VT_CAPTURE takes the old pictures (the page is laid out first;
+     * types are the transition's types, spaces apart), VT_BEGIN the new ones and starts the animation,
+     * VT_END drops it. They return 1 if done, 0 if it cannot be, -1 for elements sharing a name. The
+     * browser calls jsdom_view_transition_done when the animation has finished. */
+    int (*view_transition)(void *ctx, int op, const char *types);
 };
+enum { VT_CAPTURE = 1, VT_BEGIN, VT_END };
 
 struct jsdom;
 
@@ -162,6 +168,8 @@ void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, i
                      const char *body, int blen);
 /* A node that the page's scripts have handlers on (clicks there matter). */
 int jsdom_has_handlers(struct jsdom *d);
+/* The view transition the browser was animating has finished (or the browser gave it up). */
+void jsdom_view_transition_done(struct jsdom *d);
 /* Write localStorage to disk if it changed (called now and then; at most every two seconds). */
 void jsdom_storage_flush(void);
 

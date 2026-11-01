@@ -1,511 +1,1062 @@
 /*
- * The sound player: opens a WAV, MP3 or Ogg Vorbis file (the last two, and
- * float WAV, through Wave's decoders: codecs.c), shows its format and length, and
- * plays it with play(1) as a child process, so the desktop keeps running
- * while it sounds. Pause stops the child and remembers the second; Play
- * starts it again from there (play -s). Clicking or dragging the bar seeks.
+ * The Media Player: plays the sound and video files FFmpeg (third_party/ffmpeg) can read: MP4,
+ * Matroska, WebM, AVI, MPEG, Ogg, FLAC, MP3, AAC, WAV and the rest. A file opens paused, showing
+ * its first picture (or its cover art, or its tags); Play, Pause, Stop and the bar, which can be
+ * clicked or dragged, seek.
+ *
+ * Playback is four threads of this program's, so the desktop's loop never waits on a decoder:
+ *   demux   reads packets and queues them for the sound and the picture, and seeks;
+ *   sound   decodes, resamples to what /dev/dsp can play (16 bit stereo, at most 48000 Hz) and
+ *           writes it; the card's delay (SNDCTL_DSP_GETODELAY) turns what was written into what
+ *           is heard, which is the clock;
+ *   video   decodes, waits until the clock reaches a frame's time (a file without sound has the
+ *           clock of the wall), drops the frames it is late for, and scales the rest into the
+ *           buffer the window draws from.
+ * After a seek the packets before it are told apart by a serial number, and what is decoded
+ * before the target is thrown away, so playback resumes at the time asked for.
  */
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <signal.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
+#include <sys/soundcard.h>
 #include <unistd.h>
-#include "codecs.h"
+#include <flux.h>
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
+#include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
 #include "desktop.h"
 
-#define PL_W      320
-#define PL_H      150
-#define PATH_MAX_CHARS 255
-#define PLAY      "/bin/play"
-#define MAX_COMPRESSED (64 << 20)       /* as play(1) takes */
-
-extern char **environ;
+#define CTRL_H    56                    /* the strip under the picture */
+#define QMAX      64                    /* packets queued per stream */
+#define LATE_MS   80                    /* a frame later than this is dropped, if more are waiting */
+#define MAX_RATE  48000                 /* what /dev/dsp plays */
 
 enum { ST_STOPPED, ST_PLAYING, ST_PAUSED };
-enum { BT_PLAY, BT_PAUSE, BT_STOP, NBT };
+enum { BT_OPEN, BT_PLAY, BT_STOP, NBT };
+
+struct pqueue {
+    AVPacket *p[QMAX];
+    int head, n;
+};
+
+/* One open file and the threads playing it. Shared fields are under mu. */
+struct sess {
+    AVFormatContext *fmt;
+    AVCodecContext *vdec, *adec;
+    int vi, ai;                         /* stream numbers, or -1 */
+    int cover;                          /* vi is a picture attached to a sound file */
+    pthread_t tdem, tvid, taud;
+    int nthreads;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    struct pqueue vq, aq;
+    int quit, paused;
+    int eof, vdone, adone;              /* the file ended; each decoder has drained */
+    int seek_req;
+    int64_t seek_ms;
+    int serial;                         /* the epoch the queued packets belong to */
+    int64_t target_ms;                  /* decoded output before this is dropped */
+    int show_one;                       /* show the next frame at once (after a seek, or at the start) */
+    int64_t clk_ms;                     /* the position at clk_at (now_ms), while running */
+    uint32_t clk_at;
+    int running;
+    int dsp, rate;                      /* /dev/dsp (or -1), and its rate */
+    /* the picture, scaled to fit_w x fit_h by the video thread */
+    uint32_t *vbuf;
+    int vbw, vbh, vb_new;
+    int fit_w, fit_h;
+    int64_t a_base_ms, a_frames;        /* the sound: its time at the first frame after a flush, and frames since */
+    int a_have_base;
+};
 
 struct player {
     struct window *win;
-    char path[PATH_MAX_CHARS + 1];      /* the field */
-    int path_len, path_cur;
-    char loaded[PATH_MAX_CHARS + 1];    /* the file that is open */
-    const char *kind;                   /* "WAV", "MP3", "Ogg Vorbis" */
-    int rate, channels, bits;
-    uint32_t dur_ms;                    /* 0: nothing open */
+    struct sess *s;
+    char path[PATH_MAX];
+    char title[96], info[128], msg[96];
+    int have_art;
+    int64_t dur_ms;
     int state;
-    int pid;                            /* the play process, 0 if none */
-    uint32_t pos_ms, started;           /* where it began, and when (now_ms) */
-    char msg[96];
-    int pressed;                        /* a button held down, or -1 */
-    int seeking, seek_resume;           /* the bar is held; it was playing  */
+    int64_t pos_ms;                     /* while not playing */
+    int pressed, seeking, seek_resume;
+    int64_t seek_to;
+    uint32_t painted_at;
 };
 
 static struct player *cur;
+static int nprocs = 1;
 
-static uint32_t le16(const uint8_t *p) { return p[0] | (uint32_t)p[1] << 8; }
-static uint32_t le32(const uint8_t *p) { return le16(p) | le16(p + 2) << 16; }
+/* ---- the clock ---- */
 
-/* ---- the file ---- */
-
-static int read_full(int fd, void *buf, uint32_t n)
+static int64_t position_locked(const struct sess *s)
 {
-    uint32_t got = 0;
-    while (got < n) {
-        int r = (int)read(fd, (uint8_t *)buf + got, n - got);
-        if (r <= 0)
-            break;
-        got += (uint32_t)r;
-    }
-    return (int)got;
+    int64_t t = s->clk_ms;
+    if (s->running)
+        t += (int64_t)(now_ms() - s->clk_at);
+    return t < 0 ? 0 : t;
 }
 
-/* Read a PCM WAV header; 0 on success, else a message in err (-2: a WAV file of a kind only the
- * codecs can play, such as float). */
-static int wav_info(const char *path, struct player *p, const char **err)
+static int64_t position(struct player *p)
 {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        *err = strerror(errno);
-        return -1;
+    if (!p->s)
+        return p->pos_ms;
+    if (p->state != ST_PLAYING)
+        return p->pos_ms;
+    pthread_mutex_lock(&p->s->mu);
+    int64_t t = position_locked(p->s);
+    pthread_mutex_unlock(&p->s->mu);
+    return p->dur_ms && t > p->dur_ms ? p->dur_ms : t;
+}
+
+static void set_clock(struct sess *s, int64_t ms, int running)     /* under mu */
+{
+    s->clk_ms = ms;
+    s->clk_at = now_ms();
+    s->running = running;
+}
+
+/* ---- packet queues ---- */
+
+static void q_push(struct pqueue *q, AVPacket *pkt)                /* under mu, with room */
+{
+    q->p[(q->head + q->n++) % QMAX] = pkt;
+}
+
+static AVPacket *q_pop(struct pqueue *q)
+{
+    AVPacket *pkt = q->p[q->head];
+    q->head = (q->head + 1) % QMAX;
+    q->n--;
+    return pkt;
+}
+
+static void q_clear(struct pqueue *q)
+{
+    while (q->n) {
+        AVPacket *pkt = q_pop(q);
+        av_packet_free(&pkt);
     }
-    uint8_t h[12], ck[8], fmt[40];
-    int have_fmt = 0, ok = -1;
-    struct stat st;
-    uint64_t at = 12;                   /* where the next chunk starts */
-    *err = "Not a WAV file.";
-    if (fstat(fd, &st) < 0 || read_full(fd, h, 12) != 12 || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4))
-        goto out;
-    for (;;) {
-        /* Seeked to each chunk from the start: always forward, never past the end
-         * (a length of 0xFFFFFFF8 as a long is -8, the same chunk again). */
-        if (at + 8 > (uint64_t)st.st_size || lseek(fd, (off_t)at, SEEK_SET) < 0 || read_full(fd, ck, 8) != 8) {
-            *err = "The file has no sound data.";
-            goto out;
+}
+
+static int64_t to_ms(int64_t ts, AVRational tb)
+{
+    return av_rescale_q(ts, tb, (AVRational){ 1, 1000 });
+}
+
+/* ---- the demux thread ---- */
+
+static void push_cover(struct sess *s)                              /* under mu */
+{
+    if (s->cover && s->vq.n < QMAX) {
+        AVPacket *pkt = av_packet_alloc();
+        if (pkt && av_packet_ref(pkt, &s->fmt->streams[s->vi]->attached_pic) == 0) {
+            pkt->opaque = (void *)(intptr_t)s->serial;
+            q_push(&s->vq, pkt);
+        } else {
+            av_packet_free(&pkt);
         }
-        uint32_t len = le32(ck + 4);
-        at += 8 + (uint64_t)len + (len & 1);
-        if (!memcmp(ck, "fmt ", 4)) {
-            uint32_t n = len < sizeof(fmt) ? len : sizeof(fmt);
-            if (n < 16 || read_full(fd, fmt, n) != (int)n)
-                goto out;
-            uint32_t tag = le16(fmt);
-            if (tag == 0xFFFE && n >= 26)
-                tag = le16(fmt + 24);
-            p->channels = (int)le16(fmt + 2);
-            p->rate = (int)le32(fmt + 4);
-            p->bits = (int)le16(fmt + 14);
-            if (tag != 1 || p->channels < 1 || p->channels > 2 || p->rate < 1000 ||
-                (p->bits != 8 && p->bits != 16 && p->bits != 24 && p->bits != 32)) {
-                *err = "This kind of WAV file cannot be played.";
-                ok = -2;
-                goto out;
+    }
+}
+
+static void *demux_main(void *arg)
+{
+    struct sess *s = arg;
+    pthread_mutex_lock(&s->mu);
+    push_cover(s);
+    while (!s->quit) {
+        if (s->seek_req) {
+            int64_t ms = s->seek_ms;
+            s->seek_req = 0;
+            pthread_mutex_unlock(&s->mu);
+            int r = av_seek_frame(s->fmt, -1, ms * 1000, AVSEEK_FLAG_BACKWARD);
+            if (r < 0)
+                r = av_seek_frame(s->fmt, -1, ms * 1000, AVSEEK_FLAG_ANY);
+            pthread_mutex_lock(&s->mu);
+            q_clear(&s->vq);
+            q_clear(&s->aq);
+            s->serial++;
+            s->eof = s->vdone = s->adone = 0;
+            s->target_ms = ms;
+            push_cover(s);
+            pthread_cond_broadcast(&s->cv);
+            continue;
+        }
+        if (s->eof || (s->vq.n >= QMAX - 1) || (s->aq.n >= QMAX - 1)) {
+            pthread_cond_wait(&s->cv, &s->mu);
+            continue;
+        }
+        int serial = s->serial;
+        pthread_mutex_unlock(&s->mu);
+        AVPacket *pkt = av_packet_alloc();
+        int r = pkt ? av_read_frame(s->fmt, pkt) : AVERROR(ENOMEM);
+        pthread_mutex_lock(&s->mu);
+        if (r < 0) {
+            av_packet_free(&pkt);
+            s->eof = 1;
+            pthread_cond_broadcast(&s->cv);
+            continue;
+        }
+        if (serial != s->serial || s->seek_req) {       /* read before a seek */
+            av_packet_free(&pkt);
+            continue;
+        }
+        pkt->opaque = (void *)(intptr_t)serial;
+        if (pkt->stream_index == s->ai && s->adec)
+            q_push(&s->aq, pkt);
+        else if (pkt->stream_index == s->vi && s->vdec && !s->cover)
+            q_push(&s->vq, pkt);
+        else
+            av_packet_free(&pkt);
+        pthread_cond_broadcast(&s->cv);
+    }
+    pthread_mutex_unlock(&s->mu);
+    return NULL;
+}
+
+/* ---- the sound thread ---- */
+
+static void write_all(struct sess *s, const uint8_t *buf, int n)
+{
+    while (n > 0 && !s->quit) {
+        int w = (int)write(s->dsp, buf, (size_t)n);
+        if (w <= 0) {
+            if (w < 0 && errno == EINTR)
+                continue;
+            s->dsp = -1;
+            return;
+        }
+        buf += w;
+        n -= w;
+    }
+}
+
+static void *audio_main(void *arg)
+{
+    struct sess *s = arg;
+    AVCodecContext *dec = s->adec;
+    AVStream *st = s->fmt->streams[s->ai];
+    AVFrame *frame = av_frame_alloc();
+    SwrContext *swr = NULL;
+    int16_t *out = NULL;
+    int out_cap = 0, dec_serial = -1, drained = 0;
+    AVChannelLayout stereo;
+    av_channel_layout_default(&stereo, 2);
+
+    pthread_mutex_lock(&s->mu);
+    while (!s->quit) {
+        if (s->paused || (!s->aq.n && !(s->eof && !drained))) {
+            if (!s->aq.n && s->eof && drained)
+                s->adone = 1;
+            pthread_cond_wait(&s->cv, &s->mu);
+            continue;
+        }
+        AVPacket *pkt = s->aq.n ? q_pop(&s->aq) : NULL;
+        int serial = s->serial;
+        pthread_cond_broadcast(&s->cv);
+        if (pkt && (int)(intptr_t)pkt->opaque != serial) {
+            av_packet_free(&pkt);
+            continue;
+        }
+        if (dec_serial != serial) {
+            avcodec_flush_buffers(dec);
+            swr_free(&swr);
+            dec_serial = serial;
+            drained = 0;
+            s->a_have_base = 0;
+            s->a_frames = 0;
+        }
+        int64_t target = s->target_ms;
+        pthread_mutex_unlock(&s->mu);
+
+        if (!pkt)
+            drained = 1;
+        int r = avcodec_send_packet(dec, pkt);          /* NULL drains */
+        av_packet_free(&pkt);
+        while (r >= 0 || r == AVERROR(EAGAIN)) {
+            if (avcodec_receive_frame(dec, frame) < 0)
+                break;
+            int64_t pts = frame->best_effort_timestamp == AV_NOPTS_VALUE ? -1 : to_ms(frame->best_effort_timestamp, st->time_base);
+            if (pts >= 0 && pts + (int64_t)frame->nb_samples * 1000 / (frame->sample_rate ? frame->sample_rate : 1) < target) {
+                av_frame_unref(frame);                  /* before the seek's target */
+                continue;
             }
-            have_fmt = 1;
-        } else if (!memcmp(ck, "data", 4)) {
-            if (!have_fmt)
-                goto out;
-            uint32_t frames = len / (uint32_t)(p->channels * p->bits / 8);
-            p->dur_ms = frames / (uint32_t)p->rate * 1000 + frames % (uint32_t)p->rate * 1000 / (uint32_t)p->rate;
-            p->kind = "WAV";
-            ok = 0;
-            goto out;
+            if (!swr) {
+                int rate = frame->sample_rate > MAX_RATE ? MAX_RATE : frame->sample_rate;
+                if (rate < 4000)
+                    rate = 4000;
+                if (swr_alloc_set_opts2(&swr, &stereo, AV_SAMPLE_FMT_S16, rate, &frame->ch_layout, frame->format,
+                                        frame->sample_rate, 0, NULL) < 0 || swr_init(swr) < 0) {
+                    swr_free(&swr);
+                    av_frame_unref(frame);
+                    break;
+                }
+                if (s->dsp >= 0) {
+                    int fmt = AFMT_S16_LE, ch = 2, rt = rate;
+                    ioctl(s->dsp, SNDCTL_DSP_SETFMT, &fmt);
+                    ioctl(s->dsp, SNDCTL_DSP_CHANNELS, &ch);
+                    ioctl(s->dsp, SNDCTL_DSP_SPEED, &rt);
+                    s->rate = rt;
+                    if (rt != rate) {               /* the card chose another: resample to that */
+                        swr_free(&swr);
+                        swr_alloc_set_opts2(&swr, &stereo, AV_SAMPLE_FMT_S16, rt, &frame->ch_layout, frame->format,
+                                            frame->sample_rate, 0, NULL);
+                        swr_init(swr);
+                    }
+                } else {
+                    s->rate = rate;
+                }
+            }
+            int cap = swr_get_out_samples(swr, frame->nb_samples);
+            if (cap > out_cap) {
+                free(out);
+                out = malloc((size_t)cap * 4);
+                out_cap = out ? cap : 0;
+            }
+            int n = out ? swr_convert(swr, (uint8_t **)&out, out_cap, (const uint8_t **)frame->extended_data,
+                                       frame->nb_samples) : 0;
+            pthread_mutex_lock(&s->mu);
+            int stale = dec_serial != s->serial || s->quit;
+            if (!stale && !s->a_have_base) {
+                s->a_have_base = 1;
+                s->a_base_ms = pts >= 0 ? pts : target;
+                s->a_frames = 0;
+            }
+            pthread_mutex_unlock(&s->mu);
+            av_frame_unref(frame);
+            if (stale)
+                break;
+            if (n > 0) {
+                if (s->dsp >= 0)
+                    write_all(s, (const uint8_t *)out, n * 4);
+                else
+                    msleep((unsigned)(n * 1000 / s->rate));
+                int delay = 0;
+                if (s->dsp >= 0 && ioctl(s->dsp, SNDCTL_DSP_GETODELAY, &delay) < 0)
+                    delay = 0;
+                pthread_mutex_lock(&s->mu);
+                s->a_frames += n;
+                int64_t heard = s->a_base_ms + s->a_frames * 1000 / s->rate - (int64_t)delay / 4 * 1000 / s->rate;
+                if (!s->paused && dec_serial == s->serial)
+                    set_clock(s, heard, 1);
+                pthread_mutex_unlock(&s->mu);
+            }
+            pthread_mutex_lock(&s->mu);
+            while (s->paused && !s->quit && dec_serial == s->serial)
+                pthread_cond_wait(&s->cv, &s->mu);
+            pthread_mutex_unlock(&s->mu);
         }
+        pthread_mutex_lock(&s->mu);
     }
-out:
-    close(fd);
-    return ok;
+    pthread_mutex_unlock(&s->mu);
+    swr_free(&swr);
+    free(out);
+    av_frame_free(&frame);
+    av_channel_layout_uninit(&stereo);
+    return NULL;
 }
 
-/* An MP3, Ogg Vorbis or float WAV file: opened with the decoders play(1) uses, for its format and
- * length; 0 on success. */
-static int codec_info(const char *path, struct player *p)
+/* ---- the video thread ---- */
+
+static void *video_main(void *arg)
 {
-    struct stat st;
-    int fd = open(path, O_RDONLY), ok = -1;
-    unsigned char *data = NULL;
-    if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0 && st.st_size <= MAX_COMPRESSED &&
-        (data = malloc((size_t)st.st_size)) && read_full(fd, data, (uint32_t)st.st_size) == (int)st.st_size) {
-        struct codec *c = codec_open(data, (size_t)st.st_size);
-        if (c && codec_frames(c)) {
-            const char *type = codec_sniff(data, (size_t)st.st_size);
-            p->kind = !strcmp(type, "audio/mpeg") ? "MP3" : !strcmp(type, "audio/ogg") ? "Ogg Vorbis" : "WAV";
-            p->rate = codec_rate(c);
-            p->channels = codec_channels(c);
-            p->bits = 16;
-            p->dur_ms = (uint32_t)((uint64_t)codec_frames(c) * 1000 / (uint32_t)p->rate);
-            ok = 0;
+    struct sess *s = arg;
+    AVCodecContext *dec = s->vdec;
+    AVStream *st = s->fmt->streams[s->vi];
+    AVFrame *frame = av_frame_alloc();
+    struct SwsContext *sws = NULL;
+    int sw = 0, sh = 0, sfmt = -1, dw = 0, dh = 0;
+    int dec_serial = -1, drained = 0;
+
+    pthread_mutex_lock(&s->mu);
+    while (!s->quit) {
+        if (!s->vq.n && !(s->eof && !drained)) {
+            if (s->eof && drained)
+                s->vdone = 1;
+            pthread_cond_wait(&s->cv, &s->mu);
+            continue;
         }
-        codec_close(c);
+        AVPacket *pkt = s->vq.n ? q_pop(&s->vq) : NULL;
+        int serial = s->serial;
+        pthread_cond_broadcast(&s->cv);
+        if (pkt && (int)(intptr_t)pkt->opaque != serial) {
+            av_packet_free(&pkt);
+            continue;
+        }
+        if (dec_serial != serial) {
+            avcodec_flush_buffers(dec);
+            dec_serial = serial;
+            drained = 0;
+        }
+        int64_t target = s->target_ms;
+        pthread_mutex_unlock(&s->mu);
+
+        if (!pkt)
+            drained = 1;
+        int r = avcodec_send_packet(dec, pkt);
+        av_packet_free(&pkt);
+        while (r >= 0 || r == AVERROR(EAGAIN)) {
+            if (avcodec_receive_frame(dec, frame) < 0)
+                break;
+            int64_t pts = frame->best_effort_timestamp == AV_NOPTS_VALUE ? -1
+                          : to_ms(frame->best_effort_timestamp, st->time_base);
+            int still = s->cover || pts < 0;
+            if (!still && pts < target) {
+                av_frame_unref(frame);
+                continue;
+            }
+            /* wait for the frame's time */
+            int drop = 0;
+            pthread_mutex_lock(&s->mu);
+            while (!s->quit && dec_serial == s->serial && !s->show_one) {
+                if (still || s->paused) {
+                    if (still)
+                        break;
+                    pthread_cond_wait(&s->cv, &s->mu);
+                    continue;
+                }
+                int64_t ahead = pts - position_locked(s);
+                if (ahead <= 2)
+                    break;
+                pthread_mutex_unlock(&s->mu);
+                msleep((unsigned)(ahead > 20 ? 20 : ahead));
+                pthread_mutex_lock(&s->mu);
+            }
+            int stale = dec_serial != s->serial || s->quit;
+            if (!stale && !s->show_one && !still && position_locked(s) - pts > LATE_MS && s->vq.n > 0)
+                drop = 1;
+            s->show_one = 0;
+            int fw = s->fit_w, fh = s->fit_h;
+            pthread_mutex_unlock(&s->mu);
+            if (stale) {
+                av_frame_unref(frame);
+                break;
+            }
+            if (drop || fw < 2 || fh < 2) {
+                av_frame_unref(frame);
+                continue;
+            }
+            /* fit the frame in fw x fh, keeping its shape */
+            int w = frame->width, h = frame->height;
+            if (frame->sample_aspect_ratio.num > 0 && frame->sample_aspect_ratio.den > 0)
+                w = (int)((int64_t)w * frame->sample_aspect_ratio.num / frame->sample_aspect_ratio.den);
+            if (w < 1) w = 1;
+            if (h < 1) h = 1;
+            int ow = fw, oh = (int)((int64_t)fw * h / w);
+            if (oh > fh) {
+                oh = fh;
+                ow = (int)((int64_t)fh * w / h);
+            }
+            ow &= ~1;
+            oh &= ~1;
+            if (ow < 2 || oh < 2)
+                ow = oh = 2;
+            if (!sws || sw != frame->width || sh != frame->height || sfmt != frame->format || dw != ow || dh != oh) {
+                sws_freeContext(sws);
+                sws = sws_getContext(frame->width, frame->height, frame->format, ow, oh, AV_PIX_FMT_BGR0,
+                                     SWS_FAST_BILINEAR, NULL, NULL, NULL);
+                sw = frame->width;
+                sh = frame->height;
+                sfmt = frame->format;
+                dw = ow;
+                dh = oh;
+            }
+            if (sws) {
+                pthread_mutex_lock(&s->mu);
+                if (s->vbw != ow || s->vbh != oh) {
+                    free(s->vbuf);
+                    s->vbuf = malloc((size_t)ow * (size_t)oh * 4);
+                    s->vbw = s->vbuf ? ow : 0;
+                    s->vbh = s->vbuf ? oh : 0;
+                }
+                if (s->vbuf) {
+                    uint8_t *dst[4] = { (uint8_t *)s->vbuf, NULL, NULL, NULL };
+                    int stride[4] = { ow * 4, 0, 0, 0 };
+                    sws_scale(sws, (const uint8_t *const *)frame->data, frame->linesize, 0, frame->height, dst, stride);
+                    s->vb_new = 1;
+                }
+                pthread_mutex_unlock(&s->mu);
+            }
+            av_frame_unref(frame);
+        }
+        pthread_mutex_lock(&s->mu);
     }
-    free(data);
-    if (fd >= 0)
-        close(fd);
-    return ok;
+    pthread_mutex_unlock(&s->mu);
+    sws_freeContext(sws);
+    av_frame_free(&frame);
+    return NULL;
 }
 
-/* ---- the process ---- */
+/* ---- sessions ---- */
 
-static uint32_t position(const struct player *p)
+static AVCodecContext *open_decoder(AVStream *st, int threads)
 {
-    uint32_t t = p->pos_ms;
-    if (p->state == ST_PLAYING)
-        t += now_ms() - p->started;
-    return t > p->dur_ms ? p->dur_ms : t;
+    const AVCodec *codec = avcodec_find_decoder(st->codecpar->codec_id);
+    AVCodecContext *ctx = codec ? avcodec_alloc_context3(codec) : NULL;
+    if (!ctx)
+        return NULL;
+    if (avcodec_parameters_to_context(ctx, st->codecpar) < 0) {
+        avcodec_free_context(&ctx);
+        return NULL;
+    }
+    ctx->pkt_timebase = st->time_base;
+    ctx->thread_count = threads;
+    if (avcodec_open2(ctx, codec, NULL) < 0)
+        avcodec_free_context(&ctx);
+    return ctx;
 }
 
-static void stop_child(struct player *p)
+static void sess_free(struct sess *s)
 {
-    if (p->pid > 0) {
-        int pid = p->pid;
-        p->pid = 0;                     /* its exit is expected */
-        kill(pid, SIGKILL);
+    if (!s)
+        return;
+    pthread_mutex_lock(&s->mu);
+    s->quit = 1;
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+    if (s->dsp >= 0)
+        ioctl(s->dsp, SNDCTL_DSP_RESET);
+    for (int i = 0; i < s->nthreads; i++)
+        pthread_join(i == 0 ? s->tdem : i == 1 ? s->tvid : s->taud, NULL);
+    if (s->dsp >= 0)
+        close(s->dsp);
+    q_clear(&s->vq);
+    q_clear(&s->aq);
+    avcodec_free_context(&s->vdec);
+    avcodec_free_context(&s->adec);
+    avformat_close_input(&s->fmt);
+    free(s->vbuf);
+    pthread_cond_destroy(&s->cv);
+    pthread_mutex_destroy(&s->mu);
+    free(s);
+}
+
+static void sess_start(struct sess *s)
+{
+    pthread_create(&s->tdem, NULL, demux_main, s);
+    s->nthreads = 1;
+    if (s->vdec && pthread_create(&s->tvid, NULL, video_main, s) == 0)
+        s->nthreads = 2;
+    if (s->adec && s->nthreads == 2 && pthread_create(&s->taud, NULL, audio_main, s) == 0)
+        s->nthreads = 3;
+    else if (s->adec && s->nthreads == 1) {
+        /* thread slots are tdem, tvid, taud in order; a sound-only file puts the sound in tvid's */
+        pthread_create(&s->tvid, NULL, audio_main, s);
+        s->nthreads = 2;
     }
 }
 
-static void paint(struct player *p);
-
-static void start_child(struct player *p, uint32_t from_ms)
+static const char *tag(AVFormatContext *f, const char *key)
 {
-    char sec[16];
-    snprintf(sec, sizeof(sec), "%u", from_ms / 1000);
-    int pid = fork();
-    if (pid == 0) {
-        int null = open("/dev/null", O_RDWR);
-        dup2(null, 0);
-        dup2(null, 1);
-        dup2(null, 2);
-        for (int fd = 3; fd < 32; fd++)
-            close(fd);
-        signal(SIGINT, SIG_DFL);
-        signal(SIGQUIT, SIG_DFL);
-        char *argv[] = { "play", "-q", "-s", sec, p->loaded, NULL };
-        execve(PLAY, argv, environ);
-        _exit(127);
-    }
-    if (pid < 0) {
-        snprintf(p->msg, sizeof(p->msg), "Cannot start playback: %s.", strerror(errno));
-        p->state = ST_STOPPED;
+    AVDictionaryEntry *e = av_dict_get(f->metadata, key, NULL, 0);
+    if (!e && f->nb_streams)
+        for (unsigned i = 0; !e && i < f->nb_streams; i++)
+            e = av_dict_get(f->streams[i]->metadata, key, NULL, 0);
+    return e && e->value[0] ? e->value : NULL;
+}
+
+/* Open path paused at its start; the error message in p->msg if it cannot be played. */
+static void load(struct player *p, const char *path)
+{
+    sess_free(p->s);
+    p->s = NULL;
+    p->state = ST_STOPPED;
+    p->pos_ms = 0;
+    p->dur_ms = 0;
+    p->have_art = 0;
+    p->msg[0] = p->info[0] = p->title[0] = 0;
+    wm_set_title(p->win, "Media Player");
+
+    struct sess *s = calloc(1, sizeof(*s));
+    if (!s)
+        return;
+    s->vi = s->ai = -1;
+    s->dsp = -1;
+    s->rate = 44100;
+    if (avformat_open_input(&s->fmt, path, NULL, NULL) < 0) {
+        snprintf(p->msg, sizeof(p->msg), "Cannot open %s.", strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
+        free(s);
         return;
     }
-    p->pid = pid;
-    p->pos_ms = from_ms / 1000 * 1000;
-    p->started = now_ms();
-    p->state = ST_PLAYING;
-    p->msg[0] = 0;
+    if (avformat_find_stream_info(s->fmt, NULL) < 0) {
+        snprintf(p->msg, sizeof(p->msg), "This is not a media file.");
+        avformat_close_input(&s->fmt);
+        free(s);
+        return;
+    }
+    int pic = -1;
+    for (unsigned i = 0; i < s->fmt->nb_streams; i++) {
+        AVStream *st = s->fmt->streams[i];
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            if (st->disposition & AV_DISPOSITION_ATTACHED_PIC) {
+                if (pic < 0)
+                    pic = (int)i;
+            } else if (s->vi < 0) {
+                s->vi = (int)i;
+            }
+        }
+    }
+    s->ai = av_find_best_stream(s->fmt, AVMEDIA_TYPE_AUDIO, -1, s->vi, NULL, 0);
+    if (s->ai < 0)
+        s->ai = -1;
+    if (s->vi < 0 && pic >= 0) {
+        s->vi = pic;
+        s->cover = 1;
+    }
+    if (s->vi >= 0)
+        s->vdec = open_decoder(s->fmt->streams[s->vi], nprocs > 4 ? 4 : nprocs);
+    if (s->ai >= 0)
+        s->adec = open_decoder(s->fmt->streams[s->ai], 1);
+    if (!s->vdec && !s->adec) {
+        snprintf(p->msg, sizeof(p->msg), "No sound or picture in this file can be played.");
+        avcodec_free_context(&s->vdec);
+        avformat_close_input(&s->fmt);
+        free(s);
+        return;
+    }
+    if (s->adec) {
+        for (int tries = 0; s->dsp < 0 && tries < 20; tries++) {
+            s->dsp = open("/dev/dsp", O_WRONLY);
+            if (s->dsp < 0 && errno == EBUSY)
+                msleep(50);
+            else
+                break;
+        }
+        if (s->dsp < 0)
+            snprintf(p->msg, sizeof(p->msg), "No sound card, or another program is using it.");
+    }
+    p->dur_ms = s->fmt->duration > 0 ? s->fmt->duration / 1000 : 0;
+
+    /* the description line */
+    char info[128] = "";
+    if (s->vdec && !s->cover)
+        snprintf(info, sizeof(info), "%s %dx%d", avcodec_get_name(s->vdec->codec_id), s->vdec->width, s->vdec->height);
+    if (s->adec) {
+        char a[64];
+        snprintf(a, sizeof(a), "%s%s %d Hz, %s", info[0] ? ", " : "", avcodec_get_name(s->adec->codec_id),
+                 s->adec->sample_rate, s->adec->ch_layout.nb_channels == 1 ? "mono"
+                 : s->adec->ch_layout.nb_channels == 2 ? "stereo" : "surround");
+        strncat(info, a, sizeof(info) - strlen(info) - 1);
+    }
+    snprintf(p->info, sizeof(p->info), "%s", info);
+
+    const char *title = tag(s->fmt, "title"), *artist = tag(s->fmt, "artist");
+    const char *base = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+    if (title && artist)
+        snprintf(p->title, sizeof(p->title), "%s - %s", artist, title);
+    else
+        snprintf(p->title, sizeof(p->title), "%s", title ? title : base);
+    p->have_art = s->vdec != NULL;
+    char wt[160];
+    snprintf(wt, sizeof(wt), "%s - Media Player", p->title);
+    wm_set_title(p->win, wt);
+    snprintf(p->path, sizeof(p->path), "%s", path);
+
+    pthread_mutex_init(&s->mu, NULL);
+    pthread_cond_init(&s->cv, NULL);
+    s->paused = 1;
+    s->show_one = 1;
+    s->fit_w = p->win->content.w;
+    s->fit_h = p->win->content.h - CTRL_H;
+    p->s = s;
+    sess_start(s);
+}
+
+/* ---- the controls ---- */
+
+static void seek_to(struct player *p, int64_t ms)
+{
+    struct sess *s = p->s;
+    if (!s)
+        return;
+    if (ms < 0)
+        ms = 0;
+    if (p->dur_ms && ms > p->dur_ms)
+        ms = p->dur_ms;
+    pthread_mutex_lock(&s->mu);
+    s->seek_req = 1;
+    s->seek_ms = ms;
+    s->show_one = 1;
+    set_clock(s, ms, p->state == ST_PLAYING);
+    q_clear(&s->aq);
+    q_clear(&s->vq);
+    s->serial++;                        /* what the decoders hold is stale at once */
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+    if (s->dsp >= 0)
+        ioctl(s->dsp, SNDCTL_DSP_RESET);
+    p->pos_ms = ms;
+}
+
+static void set_paused(struct player *p, int paused)
+{
+    struct sess *s = p->s;
+    pthread_mutex_lock(&s->mu);
+    s->paused = paused;
+    set_clock(s, p->pos_ms, !paused);
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
 }
 
 static void do_play(struct player *p)
 {
-    if (!p->dur_ms || p->state == ST_PLAYING)
+    if (!p->s || p->state == ST_PLAYING)
         return;
-    uint32_t from = p->state == ST_PAUSED ? p->pos_ms : 0;
-    if (from + 1000 > p->dur_ms)
-        from = 0;
-    start_child(p, from);
+    if (p->state == ST_STOPPED || (p->dur_ms && p->pos_ms + 500 >= p->dur_ms))
+        seek_to(p, 0);
+    p->state = ST_PLAYING;
+    p->msg[0] = 0;
+    set_paused(p, 0);
 }
 
 static void do_pause(struct player *p)
 {
-    if (p->state != ST_PLAYING)
+    if (!p->s || p->state != ST_PLAYING)
         return;
     p->pos_ms = position(p);
-    stop_child(p);
     p->state = ST_PAUSED;
+    set_paused(p, 1);
 }
 
 static void do_stop(struct player *p)
 {
-    stop_child(p);
+    if (!p->s)
+        return;
     p->state = ST_STOPPED;
     p->pos_ms = 0;
+    set_paused(p, 1);
+    seek_to(p, 0);
 }
 
-static void load(struct player *p, const char *path)
+static void toggle(struct player *p)
 {
-    do_stop(p);
-    p->dur_ms = 0;
-    p->loaded[0] = 0;
-    p->msg[0] = 0;
-    const char *err;
-    int wav = wav_info(path, p, &err);
-    if (wav == -2 || (wav < 0 && !strcmp(err, "Not a WAV file."))) {     /* MP3, Ogg, float WAV */
-        if (codec_info(path, p) == 0)
-            wav = 0;
-        else if (wav != -2)
-            err = "Not a WAV, MP3 or Ogg Vorbis file.";
-    }
-    if (wav < 0) {
-        p->dur_ms = 0;
-        snprintf(p->msg, sizeof(p->msg), "%s", err);
-        wm_set_title(p->win, "Sound Player");
-        return;
-    }
-    snprintf(p->loaded, sizeof(p->loaded), "%s", path);
-    const char *base = strrchr(path, '/');
-    char title[64];
-    snprintf(title, sizeof(title), "%s - Sound Player", base ? base + 1 : path);
-    wm_set_title(p->win, title);
+    if (p->state == ST_PLAYING)
+        do_pause(p);
+    else
+        do_play(p);
 }
 
 /* ---- the window ---- */
 
-static struct rect path_rect(void) { return mkrect(40, 8, PL_W - 48, 22); }
-static struct rect bar_rect(void) { return mkrect(8, 62, PL_W - 16, 8); }
-static struct rect button_rect(int i) { return mkrect(8 + i * 72, 112, 66, 26); }
-
-/* a * n / total without 64-bit arithmetic (n is at most a few hundred). */
-static uint32_t scale(uint32_t a, uint32_t n, uint32_t total)
+static struct rect video_rect(const struct player *p)
 {
-    uint32_t q = total / 4096 + 1;      /* coarsen a and total until a * n fits */
-    return total ? (a / q) * n / (total / q ? total / q : 1) : 0;
+    return mkrect(0, 0, p->win->content.w, p->win->content.h - CTRL_H);
+}
+static struct rect bar_rect(const struct player *p) { return mkrect(8, p->win->content.h - CTRL_H + 10, p->win->content.w - 16, 8); }
+static struct rect button_rect(const struct player *p, int i)
+{
+    return mkrect(8 + i * 72, p->win->content.h - CTRL_H + 26, 66, 24);
 }
 
-static uint32_t bar_pos(const struct player *p, int x)
+static int64_t bar_pos(const struct player *p, int x)
 {
-    struct rect r = bar_rect();
+    struct rect r = bar_rect(p);
     int off = x - r.x;
-    if (off < 0)
-        off = 0;
-    if (off > r.w)
-        off = r.w;
-    return p->dur_ms / (uint32_t)r.w * (uint32_t)off + p->dur_ms % (uint32_t)r.w * (uint32_t)off / (uint32_t)r.w;
+    off = off < 0 ? 0 : off > r.w ? r.w : off;
+    return r.w ? p->dur_ms * off / r.w : 0;
 }
 
-static void fmt_time(char *out, int size, uint32_t ms)
+static void fmt_time(char *out, int size, int64_t ms)
 {
-    snprintf(out, (size_t)size, "%u:%02u", ms / 60000, ms / 1000 % 60);
+    int sec = (int)(ms / 1000);
+    if (sec >= 3600)
+        snprintf(out, (size_t)size, "%d:%02d:%02d", sec / 3600, sec / 60 % 60, sec % 60);
+    else
+        snprintf(out, (size_t)size, "%d:%02d", sec / 60, sec % 60);
 }
 
-static void paint(struct player *p)
+static void paint_controls(struct player *p)
 {
     struct surface *s = &p->win->content;
+    int y0 = s->h - CTRL_H;
     gfx_noclip(s);
-    gfx_fill(s, 0, 0, s->w, s->h, C_FACE);
-
-    gfx_text(s, &font_sans, 8, 13, "File:", C_BLACK);
-    draw_text_field(s, path_rect(), p->path, p->path_cur, wm_focused() == p->win);
-
-    char line[128], fit[128];
-    if (p->msg[0])
-        snprintf(line, sizeof(line), "%s", p->msg);
-    else if (p->dur_ms)
-        snprintf(line, sizeof(line), "%s, %d Hz, %d bit, %s", p->kind, p->rate, p->bits,
-                 p->channels == 2 ? "stereo" : "mono");
-    else
-        snprintf(line, sizeof(line), "Type the name of a WAV, MP3 or Ogg file and press Enter.");
-    gfx_ellipsize(&font_sans, line, s->w - 16, fit, sizeof(fit));
-    gfx_text(s, &font_sans, 8, 38, fit, p->msg[0] ? C_BLACK : C_SHADOW);
-
-    struct rect bar = bar_rect();
+    gfx_fill(s, 0, y0, s->w, CTRL_H, C_FACE);
+    struct rect bar = bar_rect(p);
     gfx_fill(s, bar.x, bar.y, bar.w, bar.h, C_WHITE);
     gfx_bevel(s, bar, BEVEL_SUNKEN);
-    uint32_t pos = position(p);
-    int px = (int)scale(pos, (uint32_t)(bar.w - 2), p->dur_ms);
+    int64_t pos = position(p);
+    int px = p->dur_ms ? (int)((int64_t)(bar.w - 2) * pos / p->dur_ms) : 0;
     if (px > 0)
         gfx_fill(s, bar.x + 1, bar.y + 1, px, bar.h - 2, C_NAVY);
     struct rect th = mkrect(bar.x + px - 3, bar.y - 5, 8, 18);
     gfx_fill(s, th.x, th.y, th.w, th.h, C_FACE);
     gfx_bevel(s, th, BEVEL_RAISED);
 
-    char a[16], b[16], t[40];
+    static const char *const labels[NBT] = { "Open...", "Play", "Stop" };
+    for (int i = 0; i < NBT; i++) {
+        const char *label = i == BT_PLAY && p->state == ST_PLAYING ? "Pause" : labels[i];
+        draw_button(s, button_rect(p, i), label, p->pressed == i, 0, 0);
+    }
+    char a[24], b[24], t[64];
     fmt_time(a, sizeof(a), pos);
     fmt_time(b, sizeof(b), p->dur_ms);
     snprintf(t, sizeof(t), "%s / %s", a, b);
-    gfx_text(s, &font_sans, 8, 84, t, C_BLACK);
-    const char *st = p->state == ST_PLAYING ? "Playing" : p->state == ST_PAUSED ? "Paused" : "Stopped";
-    gfx_text(s, &font_sans, s->w - 8 - gfx_text_width(&font_sans, st), 84, st, C_SHADOW);
-
-    static const char *const labels[NBT] = { "Play", "Pause", "Stop" };
-    for (int i = 0; i < NBT; i++)
-        draw_button(s, button_rect(i), labels[i], p->pressed == i, i == BT_PLAY && p->state != ST_PLAYING, 0);
-    wm_damage_client(p->win, mkrect(0, 0, s->w, s->h));
+    gfx_text(s, &font_sans, 8 + NBT * 72 + 8, y0 + 32, t, C_BLACK);
+    wm_damage_client(p->win, mkrect(0, y0, s->w, CTRL_H));
 }
 
-static void path_key(struct player *p, const struct input_event *ev)
+static void paint_video(struct player *p, int full)
 {
-    if (ev->code == KEY_ENTER) {
-        if (p->path[0]) {
-            load(p, p->path);
-            if (p->dur_ms)
-                do_play(p);
+    struct surface *s = &p->win->content;
+    struct rect v = video_rect(p);
+    struct sess *ss = p->s;
+    gfx_noclip(s);
+    int drew = 0;
+    if (ss && ss->vdec) {
+        pthread_mutex_lock(&ss->mu);
+        if (ss->vbuf && ss->vbw > 0) {
+            int x0 = (v.w - ss->vbw) / 2, y0 = (v.h - ss->vbh) / 2;
+            if (full || x0 > 0 || y0 > 0)
+                gfx_fill(s, 0, 0, v.w, v.h, C_BLACK);
+            int w = ss->vbw < v.w ? ss->vbw : v.w, h = ss->vbh < v.h ? ss->vbh : v.h;
+            for (int y = 0; y < h; y++)
+                memcpy(s->px + (size_t)(y0 + y) * (size_t)s->stride + (size_t)x0, ss->vbuf + (size_t)y * (size_t)ss->vbw,
+                       (size_t)w * 4);
+            ss->vb_new = 0;
+            drew = 1;
         }
-    } else if (ev->code == KEY_LEFT) {
-        if (p->path_cur > 0)
-            p->path_cur--;
-    } else if (ev->code == KEY_RIGHT) {
-        if (p->path_cur < p->path_len)
-            p->path_cur++;
-    } else if (ev->code == KEY_HOME) {
-        p->path_cur = 0;
-    } else if (ev->code == KEY_END) {
-        p->path_cur = p->path_len;
-    } else if (ev->code == KEY_DELETE) {
-        if (p->path_cur < p->path_len) {
-            memmove(p->path + p->path_cur, p->path + p->path_cur + 1, (size_t)(p->path_len - p->path_cur));
-            p->path_len--;
-        }
-    } else if (ev->len == 1 && ev->text[0] == 0x7F) {
-        if (p->path_cur > 0) {
-            memmove(p->path + p->path_cur - 1, p->path + p->path_cur, (size_t)(p->path_len - p->path_cur + 1));
-            p->path_cur--;
-            p->path_len--;
-        }
-    } else if (ev->len == 1 && ev->text[0] >= 32 && ev->text[0] < 127 && p->path_len < PATH_MAX_CHARS) {
-        memmove(p->path + p->path_cur + 1, p->path + p->path_cur, (size_t)(p->path_len - p->path_cur + 1));
-        p->path[p->path_cur++] = ev->text[0];
-        p->path_len++;
+        pthread_mutex_unlock(&ss->mu);
     }
+    if (!drew) {
+        gfx_fill(s, 0, 0, v.w, v.h, C_BLACK);
+        /* nothing to show: the tags, or what to do */
+        const char *line = p->msg[0] ? p->msg : p->s ? p->title : "Open a sound or video file.";
+        char fit[160];
+        gfx_ellipsize(&font_sans_bold, line, v.w - 24, fit, sizeof(fit));
+        gfx_text(s, &font_sans_bold, 12, v.h / 2 - 16, fit, C_WHITE);
+        if (p->s && p->info[0]) {
+            gfx_ellipsize(&font_sans, p->info, v.w - 24, fit, sizeof(fit));
+            gfx_text(s, &font_sans, 12, v.h / 2 + 4, fit, RGB(0xB0, 0xB0, 0xB0));
+        }
+        if (p->s && p->msg[0]) {
+            gfx_ellipsize(&font_sans, p->title, v.w - 24, fit, sizeof(fit));
+            gfx_text(s, &font_sans, 12, v.h / 2 + 24, fit, RGB(0xB0, 0xB0, 0xB0));
+        }
+    }
+    wm_damage_client(p->win, v);
 }
 
-static void pl_key(struct window *w, const struct input_event *ev)
+static void paint_all(struct player *p)
+{
+    paint_video(p, 1);
+    paint_controls(p);
+}
+
+static void ask_open_done(void *ctx, const char *text);
+
+static void open_path(struct player *p, const char *path)
+{
+    load(p, path);
+    if (p->s)
+        do_play(p);
+    paint_all(p);
+}
+
+static void ask_open_done(void *ctx, const char *text)
+{
+    if (cur && cur == ctx && text && *text)
+        open_path(cur, text);
+}
+
+static void ask_open(struct player *p)
+{
+    const char *home = getenv("HOME");
+    char def[PATH_MAX];
+    snprintf(def, sizeof(def), "%s", p->path[0] ? p->path : home ? home : "/");
+    ask_text("Open Media", "The sound or video file to open:", def, ask_open_done, p);
+}
+
+static void mp_key(struct window *w, const struct input_event *ev)
 {
     struct player *p = w->priv;
     if (!(ev->flags & IEV_PRESSED))
         return;
-    path_key(p, ev);
-    paint(p);
-}
-
-static void press_button(struct player *p, int i)
-{
-    switch (i) {
-    case BT_PLAY: do_play(p); break;
-    case BT_PAUSE: do_pause(p); break;
-    case BT_STOP: do_stop(p); break;
+    if (ev->code == KEY_SPACE || ev->code == KEY_PLAYPAUSE) {
+        toggle(p);
+    } else if (ev->code == KEY_LEFT || ev->code == KEY_RIGHT) {
+        int64_t step = (ev->mods & KMOD_SHIFT) ? 60000 : 10000;
+        if (p->s) {
+            int64_t t = position(p) + (ev->code == KEY_LEFT ? -step : step);
+            seek_to(p, t);
+        }
+    } else if (ev->code == KEY_HOME) {
+        seek_to(p, 0);
+    } else if (ev->code == KEY_STOPCD) {
+        do_stop(p);
+    } else if (ev->len == 1 && (ev->mods & KMOD_CTRL) && (ev->text[0] == 'o' || ev->text[0] == 'O' || ev->text[0] == 0x0F)) {
+        ask_open(p);
     }
+    paint_controls(p);
 }
 
-static void pl_mouse(struct window *w, int x, int y, int buttons, int changed)
+static void mp_mouse(struct window *w, int x, int y, int buttons, int changed)
 {
     struct player *p = w->priv;
     int left = buttons & MOUSE_LEFT;
     if ((changed & MOUSE_LEFT) && left) {
-        struct rect bar = bar_rect();
+        struct rect bar = bar_rect(p);
         bar.y -= 6;
         bar.h += 12;
         p->pressed = -1;
         for (int i = 0; i < NBT; i++)
-            if (rect_contains(button_rect(i), x, y))
+            if (rect_contains(button_rect(p, i), x, y))
                 p->pressed = i;
-        if (p->pressed < 0 && p->dur_ms && rect_contains(bar, x, y)) {
+        if (p->pressed < 0 && p->s && p->dur_ms && rect_contains(bar, x, y)) {
             p->seeking = 1;
             p->seek_resume = p->state == ST_PLAYING;
-            do_pause(p);
-            p->state = ST_PAUSED;
-            p->pos_ms = bar_pos(p, x);
+            p->seek_to = bar_pos(p, x);
+            seek_to(p, p->seek_to);
+        } else if (p->pressed < 0 && rect_contains(video_rect(p), x, y)) {
+            toggle(p);
         }
     } else if ((changed & MOUSE_LEFT) && !left) {
         int i = p->pressed;
         p->pressed = -1;
-        if (i >= 0 && rect_contains(button_rect(i), x, y))
-            press_button(p, i);
-        if (p->seeking) {
-            p->seeking = 0;
-            if (p->seek_resume)
-                start_child(p, p->pos_ms);
+        if (i >= 0 && rect_contains(button_rect(p, i), x, y)) {
+            if (i == BT_OPEN)
+                ask_open(p);
+            else if (i == BT_PLAY)
+                toggle(p);
+            else
+                do_stop(p);
         }
+        p->seeking = 0;
     } else if (p->seeking) {
-        p->pos_ms = bar_pos(p, x);
+        int64_t t = bar_pos(p, x);
+        if (t / 250 != p->seek_to / 250) {      /* not on every pixel of motion */
+            p->seek_to = t;
+            seek_to(p, t);
+        }
     } else {
         return;
     }
-    paint(p);
+    paint_controls(p);
 }
 
-static void pl_focus(struct window *w, int focused)
+static void resized(struct player *p)
+{
+    struct surface *c = &p->win->content;
+    if (p->s) {
+        pthread_mutex_lock(&p->s->mu);
+        p->s->fit_w = c->w;
+        p->s->fit_h = c->h - CTRL_H;
+        if (p->state != ST_PLAYING)
+            p->s->show_one = 1;
+        pthread_cond_broadcast(&p->s->cv);
+        pthread_mutex_unlock(&p->s->mu);
+        if (p->state != ST_PLAYING)
+            seek_to(p, p->pos_ms);          /* the picture again, at the new size */
+    }
+    paint_all(p);
+}
+
+static void mp_resize(struct window *w) { struct player *p = w->priv; if (p->win) resized(p); }
+static void mp_restyle(struct window *w) { struct player *p = w->priv; if (p->win) paint_all(p); }
+static void mp_focus(struct window *w, int focused)
 {
     struct player *p = w->priv;
     if (p->win)                         /* wm_create focuses it before p->win is set */
-        paint(p);
+        paint_controls(p);
 }
 
-static void pl_destroy(struct window *w)
+static void mp_destroy(struct window *w)
 {
     struct player *p = w->priv;
-    stop_child(p);
+    sess_free(p->s);
     if (cur == p)
         cur = NULL;
     free(p);
 }
 
-/* A sound file dragged here plays, as opening it does. */
-static int pl_drop(struct window *w, int x, int y, const struct drag_data *d, int phase, int copy)
+static int mp_drop(struct window *w, int x, int y, const struct drag_data *d, int phase, int copy)
 {
-    (void)w; (void)x; (void)y; (void)copy;
-    size_t n = d->npaths == 1 ? strlen(d->paths[0]) : 0;
-    const char *dot = n ? strrchr(d->paths[0], '.') : NULL;
-    if (phase == DROP_LEAVE || !dot || (strcasecmp(dot, ".wav") && strcasecmp(dot, ".mp3") &&
-                                        strcasecmp(dot, ".ogg") && strcasecmp(dot, ".oga")))
+    (void)x; (void)y; (void)copy;
+    if (phase == DROP_LEAVE || d->npaths != 1)
         return DROP_NONE;
     if (phase == DROP_OVER) {
         wm_drag_hint("Play");
         return DROP_OPEN;
     }
-    player_open(d->paths[0]);           /* this window: there is only one */
+    open_path(w->priv, d->paths[0]);
     return DROP_OPEN;
 }
 
-static const struct window_ops pl_ops = {
-    .drop = pl_drop,
-    .key = pl_key,
-    .mouse = pl_mouse,
-    .focus = pl_focus,
-    .destroy = pl_destroy,
+static const struct window_ops mp_ops = {
+    .drop = mp_drop,
+    .key = mp_key,
+    .mouse = mp_mouse,
+    .resize = mp_resize,
+    .restyle = mp_restyle,
+    .focus = mp_focus,
+    .destroy = mp_destroy,
 };
 
-void player_child_exited(int pid, int status)
+/* ---- the loop's hooks ---- */
+
+int mediaplayer_timeout(void)
+{
+    return cur && cur->state == ST_PLAYING ? 10 : -1;
+}
+
+void mediaplayer_frame(void)
 {
     struct player *p = cur;
-    if (!p || p->pid != pid)
+    if (!p || !p->s)
         return;
-    p->pid = 0;
-    uint32_t played = position(p);
-    if (status != 0 && played < p->pos_ms + 1500) {
-        snprintf(p->msg, sizeof(p->msg), "Cannot play: no sound card, or another program is using it.");
-        p->pos_ms = 0;
-    } else {
-        p->pos_ms = 0;
+    struct sess *s = p->s;
+    int fresh, ended = 0;
+    pthread_mutex_lock(&s->mu);
+    fresh = s->vb_new;
+    if (p->state == ST_PLAYING && s->eof && (!s->vdec || s->vdone) && (!s->adec || s->adone))
+        ended = 1;
+    pthread_mutex_unlock(&s->mu);
+    if (fresh)
+        paint_video(p, 0);
+    /* a picture that arrived while stopped or paused is drawn too (above); the bar 4 times a second */
+    uint32_t now = now_ms();
+    if (ended) {
+        do_stop(p);
+        paint_all(p);
+    } else if (p->state == ST_PLAYING && now - p->painted_at >= 250) {
+        p->painted_at = now;
+        paint_controls(p);
     }
-    p->state = ST_STOPPED;
-    paint(p);
+    if (!ended && p->state != ST_PLAYING && fresh)
+        paint_controls(p);
 }
 
-void player_tick(void)
-{
-    if (cur && cur->state == ST_PLAYING)
-        paint(cur);
-}
-
-struct window *player_open(const char *path)
+struct window *mediaplayer_open(const char *path)
 {
     if (cur) {
         wm_focus(cur->win);
     } else {
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        nprocs = n > 0 ? (int)n : 1;
+        av_log_set_level(AV_LOG_QUIET);
         struct player *p = calloc(1, sizeof(*p));
         if (!p)
             return NULL;
         p->pressed = -1;
-        struct window *w = wm_create("Sound Player", ICON_SOUND, PL_W, PL_H, WF_MINIMIZE, &pl_ops, p);
+        struct window *w = wm_create("Media Player", ICON_VIDEO, 480, 270 + CTRL_H, WF_MINIMIZE | WF_MAXIMIZE, &mp_ops, p);
         if (!w) {
             free(p);
             return NULL;
         }
+        wm_set_min_size(w, 320, 120 + CTRL_H);
         p->win = w;
         cur = p;
     }
-    if (path && *path) {
-        snprintf(cur->path, sizeof(cur->path), "%s", path);
-        cur->path_len = cur->path_cur = (int)strlen(cur->path);
-        load(cur, cur->path);
-        if (cur->dur_ms)
-            do_play(cur);
-    }
-    paint(cur);
+    if (path && *path)
+        open_path(cur, path);
+    else
+        paint_all(cur);
     return cur->win;
 }

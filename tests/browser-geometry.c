@@ -113,7 +113,7 @@ int main(void)
         "var m=value.slice(value.indexOf('(')+1,-1).split(',').map(Number);"
         "check(value.indexOf('matrix3d(')===0&&m.length===16&&m[10]===1&&Math.round(m[11]*100)===-1&&m[14]===50&&m[15]===.5);"
         "check(ps.color==='rgb(0, 255, 0)');"
-        "check(!CSS.supports('contain','layout')&&!CSS.supports('scroll-snap-type','x mandatory'));"
+        "check(!CSS.supports('contain','layout')&&CSS.supports('scroll-snap-type','x mandatory'));"
         "check(!CSS.supports('transform-style','preserve-3d')&&CSS.supports('perspective','200px'));"
         "check(CSS.supports('grid-template-columns','subgrid')&&CSS.supports('grid-template-rows','subgrid [start] [end]'));"
         "check(!CSS.supports('grid-template-columns','subgrid 20px')&&!CSS.supports('grid-template-columns','subgrid [unclosed'));"

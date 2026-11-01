@@ -996,3 +996,8 @@ int anim_timeout(const struct node *root)
     }
     return best;
 }
+
+float anim_ease(const struct css_timing *e, float x)
+{
+    return timing(e, x, 0);
+}

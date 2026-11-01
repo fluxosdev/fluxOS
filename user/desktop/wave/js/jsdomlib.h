@@ -698,6 +698,81 @@ static const char js_dom_lib[] = JS_DOM_SOURCE(
   def(DP, "pictureInPictureEnabled", false);
   def(DP, "hasStorageAccess", function () { return Promise.resolve(true); });
   def(DP, "requestStorageAccess", function () { return Promise.resolve(); });
+
+  /* ---- view transitions: document.startViewTransition(); the browser takes the pictures and draws
+   * the frames (%vtCapture, %vtBegin, %vtEnd), and says when they are over (%vtDone) ---- */
+  var activeVT = null;
+  function vtQuiet(p) { p.catch(function () {}); return p; }
+  function vtCall(name, arg) { var f = g[name]; return typeof f === "function" ? f(arg) : 0; }
+  class ViewTransition {
+    constructor(types) {
+      var s = { phase: "pending", types: new Set(types) };
+      def(this, "%s", s);
+      def(this, "updateCallbackDone", vtQuiet(new Promise(function (ok, no) { s.updateOk = ok; s.updateNo = no; })));
+      def(this, "ready", vtQuiet(new Promise(function (ok, no) { s.readyOk = ok; s.readyNo = no; })));
+      def(this, "finished", vtQuiet(new Promise(function (ok, no) { s.finishOk = ok; s.finishNo = no; })));
+    }
+    get types() { return this["%s"].types; }
+    get transitionRoot() { return document.documentElement; }
+    skipTransition() { vtSkip(this, new DOMException("Skipped ViewTransition due to skipTransition() call", "AbortError")); }
+  }
+  /* Skipped: no animation (or no more of it); finished follows the update callback, which still runs. */
+  function vtSkip(vt, reason) {
+    var s = vt["%s"];
+    if (s.phase === "done" || s.phase === "skipped") return;
+    var animating = s.phase === "animating";
+    s.phase = animating ? "done" : "skipped";
+    if (activeVT === vt) { activeVT = null; vtCall("%vtEnd"); }
+    if (!animating) s.readyNo(reason);
+    vt.updateCallbackDone.then(function () { s.finishOk(); }, function (e) { s.finishNo(e); });
+  }
+  function vtRun(vt, cb) {
+    var s = vt["%s"], p;
+    if (s.phase === "pending") s.phase = "update";
+    try { p = Promise.resolve(cb ? cb() : undefined); } catch (e) { p = Promise.reject(e); }
+    var timer = setTimeout(function () {
+      if (s.phase === "update") vtSkip(vt, new DOMException("Transition was aborted because of timeout in DOM update", "TimeoutError"));
+    }, 4000);
+    p.then(function () {
+      clearTimeout(timer);
+      s.updateOk();
+      if (s.phase !== "update") return;
+      var r = vtCall("%vtBegin");
+      if (r <= 0) {
+        vtSkip(vt, new DOMException(r < 0 ? "Transition was aborted because of duplicate view-transition-name" :
+                                    "Transition was skipped", "InvalidStateError"));
+        return;
+      }
+      s.phase = "animating";
+      s.readyOk();
+    }, function (e) {
+      clearTimeout(timer);
+      s.updateNo(e);
+      vtSkip(vt, e);
+    });
+  }
+  def(DP, "startViewTransition", function (arg) {
+    var cb = typeof arg === "function" ? arg : arg && typeof arg === "object" && typeof arg.update === "function" ? arg.update : null;
+    var types = arg && typeof arg === "object" && arg.types ? Array.from(arg.types, String) : [];
+    var vt = new ViewTransition(types);
+    if (activeVT) vtSkip(activeVT, new DOMException("Old view transition aborted by new view transition.", "AbortError"));
+    activeVT = vt;
+    var r = document.visibilityState === "hidden" ? 0 : vtCall("%vtCapture", types.join(" "));
+    if (r <= 0)
+      vtSkip(vt, new DOMException(r < 0 ? "Transition was aborted because of duplicate view-transition-name" :
+                                  "Transition was skipped", "InvalidStateError"));
+    Promise.resolve().then(function () { vtRun(vt, cb); });
+    return vt;
+  });
+  getter(DP, "activeViewTransition", function () { return activeVT; });
+  def(g, "ViewTransition", ViewTransition);
+  def(g, "%vtDone", function () {
+    var vt = activeVT;
+    if (!vt || vt["%s"].phase !== "animating") return;
+    activeVT = null;
+    vt["%s"].phase = "done";
+    vt["%s"].finishOk();
+  });
   def(EP, "requestFullscreen", function () { return Promise.reject(new DOMException("Fullscreen is not supported", "NotSupportedError")); });
   def(EP, "scrollTo", function (x, y) {
     if (x !== null && typeof x === "object") { y = x.top; x = x.left; }

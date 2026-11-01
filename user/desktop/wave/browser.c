@@ -366,6 +366,16 @@ struct browser {
     uint8_t ctx_codes[24];
     char ctx_image[URL_MAX];            /* the picture the menu was opened on */
     char ctx_url[URL_MAX];              /* the link the menu was opened on */
+
+    /* scroll snapping: a user's scroll comes to rest on a snap position once it pauses (wait), gliding
+     * there (glide); node is the box that scrolls, NULL for the page */
+    struct { int on; struct node *node; int from_x, from_y; unsigned due; } snap_wait;
+    struct { int on; struct node *node; int fx, fy, tx, ty; unsigned t0; } snap_glide;
+    /* document.startViewTransition(): its pictures and frames (vt.c); vt_done: over, scripts to be told */
+    struct vtrans *vt;
+    char vt_types[128];
+    unsigned vt_frame_at;
+    int vt_done;
 };
 
 static struct browser *browsers;
@@ -2277,6 +2287,10 @@ static void media_pressed(struct browser *b, struct node *n)
 
 static void free_page(struct browser *b)
 {
+    vt_free(b->vt);
+    b->vt = NULL;
+    b->vt_done = 0;
+    b->snap_wait.on = b->snap_glide.on = 0;
     image_jobs_cancel(b);
     b->pending_images=0;b->discover_changes=0;
     /* Pending cache placeholders belong to the old page, not future visits. */
@@ -2373,6 +2387,8 @@ static void load_lazy_images(struct browser *b)
     }
 }
 
+static void snap_relaid(struct browser *b);
+
 static void relayout(struct browser *b)
 {
     if (!b->root)
@@ -2391,6 +2407,8 @@ static void relayout(struct browser *b)
             arena_free(&b->sarena);
             css_viewport_h = v.h;
             css_target_id = url_fragment(b->url);
+            css_vt_active = b->vt != NULL;
+            css_vt_types = b->vt_types;
             css_font_lookup=font_lookup;css_font_context=b;
             anim_now = now_ms();
             uint64_t style_start=web_perf_start();
@@ -2403,6 +2421,8 @@ static void relayout(struct browser *b)
         bg_attach(b);
         arena_free(&b->larena);
         uint64_t layout_start=web_perf_start();
+        layout_view_x = b->scroll_x;
+        layout_view_y = b->scroll_y;
         layout_document(&b->larena, &b->lo, b->root, v.w, v.h);
         web_perf_end(WP_LAYOUT,layout_start);
         if (!layout_cq_changed)
@@ -2416,6 +2436,7 @@ static void relayout(struct browser *b)
     if (is_frame(b) && frame_scrolls(b) && b->lo.height > b->frame_h)
         b->frame_vbar = 1;              /* (narrower now: laid out again when next painted) */
     clamp_scroll(b);
+    snap_relaid(b);
     sync_frames(b);
     load_lazy_images(b);
     if (b->js)
@@ -2621,12 +2642,18 @@ static void js_repaint(void *ctx)
         paint(b);
 }
 
+static void snap_now(struct browser *b, struct node *node, int from_x, int from_y, int mode, int glide);
+enum { SNAP_AIMED, SNAP_PLACE, SNAP_KEEP };
+
 static void js_scroll(void *ctx, int x, int y, int relative)
 {
     struct browser *b = ctx;
+    int fx = b->scroll_x, fy = b->scroll_y;
     b->scroll_x = relative ? b->scroll_x + x : x;
     b->scroll_y = relative ? b->scroll_y + y : y;
     clamp_scroll(b);
+    b->snap_glide.on = b->snap_wait.on = 0;
+    snap_now(b, NULL, fx, fy, relative ? SNAP_AIMED : SNAP_PLACE, 0);   /* scripts' scrolls land snapped */
     paint(b);
 }
 
@@ -2966,6 +2993,8 @@ static int js_node_scroll(void *ctx, struct node *n, int set, int *sx, int *sy, 
     struct browser *b = ctx;
     if (set) {
         layout_set_node_scroll(&b->lo, n, *sx, *sy);
+        if (n->style && n->style->snap_type)
+            snap_now(b, n, *sx, *sy, SNAP_PLACE, 0);
         paint(b);
     }
     return layout_node_scroll(&b->lo, n, sx, sy, cw, ch, vw, vh);
@@ -2973,13 +3002,78 @@ static int js_node_scroll(void *ctx, struct node *n, int set, int *sx, int *sy, 
 
 static int js_node_box(void *ctx, struct node *n, int *x, int *y, int *w, int *h);
 
+static void vt_page_of(struct browser *b, struct vt_page *pg);
+
+/* document.startViewTransition(): take the old pictures (VT_CAPTURE), then, once the scripts have
+ * changed the page, the new ones, and run the animation (VT_BEGIN); or drop it (VT_END). */
+static int js_view_transition(void *ctx, int op, const char *types)
+{
+    struct browser *b = ctx;
+    struct vt_page pg;
+    int dup = 0;
+    if (op == VT_END) {
+        if (b->vt) {
+            vt_free(b->vt);
+            b->vt = NULL;
+            b->vt_done = 0;
+            b->need_style = 1;
+            paint(b);
+        }
+        return 0;
+    }
+    if (!b->root || tab_hidden(b) || !top_of(b)->win)
+        return 0;
+    if (op == VT_CAPTURE) {
+        vt_free(b->vt);
+        b->vt = NULL;
+        b->vt_done = 0;
+        if (b->discover_changes)
+            flush_changes(b);           /* the pictures are of the page as the scripts left it */
+        else if (b->need_style || b->need_layout)
+            relayout(b);
+        vt_page_of(b, &pg);
+        b->vt = vt_capture(&pg, &dup);
+        if (!b->vt)
+            return dup ? -1 : 0;
+        snprintf(b->vt_types, sizeof(b->vt_types), "%s", types ? types : "");
+        b->need_style = 1;              /* :active-view-transition matches now */
+        return 1;
+    }
+    if (!b->vt || vt_begun(b->vt))
+        return 0;
+    if (b->discover_changes)
+        flush_changes(b);
+    else if (b->need_style || b->need_layout)
+        relayout(b);
+    vt_page_of(b, &pg);
+    zoom_sync(b);
+    anim_now = now_ms();
+    if (!b->vt || !vt_begin(b->vt, &pg, &dup)) {
+        vt_free(b->vt);
+        b->vt = NULL;
+        b->need_style = 1;
+        paint(b);
+        return dup ? -1 : 0;
+    }
+    b->vt_frame_at = now_ms();
+    paint(b);
+    return 1;
+}
+
 /* element.scrollIntoView(): the boxes that scroll round it, then the page. */
 static void js_reveal(void *ctx, struct node *n)
 {
     struct browser *b = ctx;
     int x, y, w, h;
-    if (!js_node_box(ctx, n, &x, &y, &w, &h))
-        return;
+    if (!js_node_box(ctx, n, &x, &y, &w, &h)) {
+        if (!b->lo.ncv)
+            return;
+        layout_cv_reveal = n;           /* inside a box whose contents were skipped: lay them out */
+        relayout(b);
+        layout_cv_reveal = NULL;
+        if (!js_node_box(ctx, n, &x, &y, &w, &h))
+            return;
+    }
     layout_reveal(&b->lo, n, x, y, w, h);
     for (const struct node *a = n->parent; a; a = a->parent) {      /* it is that much higher up the page now */
         int sx, sy, cw, ch, vw, vh;
@@ -3264,7 +3358,7 @@ static void start_scripts(struct browser *b, const char *url)
         .csp=b->csp,.sandbox=b->sandbox,
         .open_tab = js_open_tab, .window_query = js_window_query, .window_post = js_window_post,
         .window_close = js_window_close, .window_navigate = js_window_navigate, .module_done = js_module_done, .set_url = js_set_url, .submit = js_submit, .node_at = js_node_at,
-        .media = js_media,
+        .media = js_media, .view_transition = js_view_transition,
     };
     b->js = jsdom_new(&h);
     if (!b->js)
@@ -5553,22 +5647,38 @@ static void draw_scrollbars(struct browser *b, struct surface *s, int ox, int oy
     }
 }
 
+static void vt_page_of(struct browser *b, struct vt_page *pg)
+{
+    struct rect v = view_rect(b);
+    *pg = (struct vt_page){ &b->lo, b->root, b->sheets, b->nsheets, v.w, v.h, b->scroll_x, b->scroll_y };
+}
+
 static void paint_page(struct browser *b, struct surface *s, int ox, int oy)
 {
     load_lazy_images(b);
-    if (b->root && b->laid_out_w != view_rect(b).w)
+    if (b->root && (b->laid_out_w != view_rect(b).w ||
+                    (b->lo.ncv && layout_cv_stale(&b->lo, b->scroll_x, b->scroll_y))))
         relayout(b);
     struct rect v = view_rect(b);
     v.x += ox;
     v.y += oy;
     struct rect saved = s->clip;
     s->clip = rect_intersect(saved, v);
-    if (b->root)
+    int transition = 0;
+    if (b->root && b->vt) {             /* a view transition: its pictures instead of the page */
+        struct vt_page pg;
+        vt_page_of(b, &pg);
+        zoom_sync(b);
+        anim_now = now_ms();
+        transition = 1;
+        if (!vt_draw(b->vt, &pg, s, v.x, v.y))
+            b->vt_done = 1;             /* (the scripts hear of it from browser_poll) */
+    } else if (b->root)
         paint_document(&b->lo, s, v.x, v.y, b->scroll_x, b->scroll_y, b->focus, caret_on && has_keys(b));
     else
         gfx_fill(s, v.x, v.y, v.w, v.h, C_WHITE);
     struct rect page = s->clip, box;
-    for (struct browser *f = b->frames; f; f = f->next_frame) {
+    for (struct browser *f = transition ? NULL : b->frames; f; f = f->next_frame) {
         if (!frame_box(b, f, &box))
             continue;
         const struct ditem *frame=frame_item(b,f);
@@ -6432,7 +6542,9 @@ static int has_fixed_bg(struct browser *b)
  */
 static void paint_scrolled(struct browser *b)
 {
-    if(paint_batch_depth || tab_hidden(b)) { paint(b);return; }
+    if(paint_batch_depth || tab_hidden(b) || b->vt) { paint(b);return; }
+    if (b->root && b->lo.ncv && layout_cv_stale(&b->lo, b->scroll_x, b->scroll_y))
+        b->need_layout = 1;             /* content-visibility: auto contents have come into view */
     struct rect v = view_rect(b);
     int dx = b->scroll_x - b->shown_sx, dy = b->scroll_y - b->shown_sy;
     int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
@@ -6567,13 +6679,144 @@ static void print_page(struct browser *t)
     paint(t);
 }
 
+static void snap_later(struct browser *b, struct node *node, int from_x, int from_y);
+
 static void scroll_by(struct browser *b, int dx, int dy)
 {
+    int fx = b->scroll_x, fy = b->scroll_y;
     b->scroll_x += dx;
     b->scroll_y += dy;
     clamp_scroll(b);
+    snap_later(b, NULL, fx, fy);
     load_lazy_images(b);
     if(free_loader(b)&&b->qhead<b->nqueue)start_next(b);
+}
+
+/* ---- scroll snapping ---- */
+
+#define SNAP_WAIT_MS 120                /* a scroll has paused this long: it comes to rest */
+#define SNAP_GLIDE_MS 180               /* ...gliding there in this long */
+
+/* Where a box that scrolls (NULL: the page) is, and the snap containers' own. */
+static int snap_where(struct browser *b, struct node *node, int *x, int *y)
+{
+    if (!node) {
+        *x = b->scroll_x, *y = b->scroll_y;
+        return b->lo.page_snap != NULL;
+    }
+    int k = layout_sbox_index(&b->lo, node);
+    if (k < 0 || !node->style || !node->style->snap_type)
+        return 0;
+    *x = b->lo.sb[k].sx, *y = b->lo.sb[k].sy;
+    return 1;
+}
+
+static void snap_set(struct browser *b, struct node *node, int x, int y)
+{
+    if (node) {
+        layout_sbox_scroll(&b->lo, layout_sbox_index(&b->lo, node), x, y);
+    } else {
+        b->scroll_x = x, b->scroll_y = y;
+        clamp_scroll(b);
+    }
+}
+
+/* Bring a snap container to rest: after a user's scroll from (from_x, from_y) (SNAP_AIMED), after one
+ * with no direction (SNAP_PLACE), or after a layout, on the areas it was on (SNAP_KEEP). */
+static void snap_now(struct browser *b, struct node *node, int from_x, int from_y, int mode, int glide)
+{
+    int cx, cy;
+    if (!b->root || !snap_where(b, node, &cx, &cy))
+        return;
+    struct rect v = view_rect(b);
+    struct sbar vb = vbar(b), hb = hbar(b);
+    struct node *owner = node ? node : b->root;
+    struct snap_query q = { .box = node ? layout_sbox_index(&b->lo, node) : -1, .vw = v.w, .vh = v.h,
+                            .max_x = sbar_max(&hb), .max_y = sbar_max(&vb), .from_x = from_x, .from_y = from_y };
+    if (mode == SNAP_AIMED) {
+        q.dir_x = (cx > from_x) - (cx < from_x);
+        q.dir_y = (cy > from_y) - (cy < from_y);
+    } else if (mode == SNAP_KEEP) {
+        q.keep_x = owner->snapped_x, q.keep_y = owner->snapped_y;
+        q.from_x = cx, q.from_y = cy;
+    }
+    int x = cx, y = cy;
+    struct node *ax = NULL, *ay = NULL;
+    if (!layout_snap(&b->lo, &q, &x, &y, &ax, &ay))
+        return;
+    owner->snapped_x = ax, owner->snapped_y = ay;
+    if (x == cx && y == cy)
+        return;
+    if (glide) {
+        b->snap_glide.on = 1;
+        b->snap_glide.node = node;
+        b->snap_glide.fx = cx, b->snap_glide.fy = cy, b->snap_glide.tx = x, b->snap_glide.ty = y;
+        b->snap_glide.t0 = now_ms();
+    } else {
+        snap_set(b, node, x, y);
+    }
+}
+
+/* A user's scroll of a snap container: once it pauses, it comes to rest. */
+static void snap_later(struct browser *b, struct node *node, int from_x, int from_y)
+{
+    int x, y;
+    if (!b->root || !snap_where(b, node, &x, &y))
+        return;
+    b->snap_glide.on = 0;               /* the user has taken over */
+    if (b->snap_wait.on && b->snap_wait.node != node) {
+        b->snap_wait.on = 0;            /* another box: that one comes to rest first */
+        snap_now(b, b->snap_wait.node, b->snap_wait.from_x, b->snap_wait.from_y, SNAP_AIMED, 0);
+    }
+    if (!b->snap_wait.on) {
+        b->snap_wait.on = 1;
+        b->snap_wait.node = node;
+        b->snap_wait.from_x = from_x, b->snap_wait.from_y = from_y;
+    }
+    b->snap_wait.due = now_ms() + SNAP_WAIT_MS;
+}
+
+/* Laid out again: each snap container stays on the areas it rested on (or finds the nearest). */
+static void snap_relaid(struct browser *b)
+{
+    if (b->lo.page_snap && !(b->snap_wait.on && !b->snap_wait.node) && !(b->snap_glide.on && !b->snap_glide.node))
+        snap_now(b, NULL, b->scroll_x, b->scroll_y, SNAP_KEEP, 0);
+    for (int k = 0; k < b->lo.nsb; k++) {
+        struct node *n = b->lo.sb[k].node;
+        if (n->style && n->style->snap_type && !(b->snap_wait.on && b->snap_wait.node == n) &&
+            !(b->snap_glide.on && b->snap_glide.node == n))
+            snap_now(b, n, b->lo.sb[k].sx, b->lo.sb[k].sy, SNAP_KEEP, 0);
+    }
+}
+
+/* From browser_poll: a scroll that has paused, a glide's next step. 1 if the page must be painted. */
+static int snap_step(struct browser *b)
+{
+    unsigned now = now_ms();
+    if (b->snap_wait.on && (int)(now - b->snap_wait.due) >= 0) {
+        if (b->hold == H_VBAR || b->hold == H_HBAR || b->hold == H_SBOX) {
+            b->snap_wait.due = now + SNAP_WAIT_MS;      /* a scroll bar is still held */
+        } else {
+            b->snap_wait.on = 0;
+            snap_now(b, b->snap_wait.node, b->snap_wait.from_x, b->snap_wait.from_y, SNAP_AIMED, 1);
+        }
+    }
+    if (!b->snap_glide.on)
+        return 0;
+    int el = (int)(now - b->snap_glide.t0);
+    double t = el >= SNAP_GLIDE_MS ? 1 : el <= 0 ? 0 : (double)el / SNAP_GLIDE_MS;
+    double e = 1 - (1 - t) * (1 - t) * (1 - t);         /* ease out */
+    double gx = (b->snap_glide.tx - b->snap_glide.fx) * e, gy = (b->snap_glide.ty - b->snap_glide.fy) * e;
+    int x = b->snap_glide.fx + (int)(gx < 0 ? gx - 0.5 : gx + 0.5);
+    int y = b->snap_glide.fy + (int)(gy < 0 ? gy - 0.5 : gy + 0.5);
+    if (b->snap_glide.node && layout_sbox_index(&b->lo, b->snap_glide.node) < 0)
+        t = 1;                          /* the box is gone */
+    else
+        snap_set(b, b->snap_glide.node, x, y);
+    if (t >= 1)
+        b->snap_glide.on = 0;
+    load_lazy_images(b);
+    return 1;
 }
 
 static void press(struct browser *b, int i)
@@ -6941,6 +7184,8 @@ static int restyle_dynamic(struct browser *b)
     struct rect v = view_rect(b);
     css_viewport_h = v.h;
     css_target_id = url_fragment(b->url);
+    css_vt_active = b->vt != NULL;
+    css_vt_types = b->vt_types;
     css_font_lookup = font_lookup;
     css_font_context = b;
     anim_now = now_ms();
@@ -6965,6 +7210,8 @@ static void animate(struct browser *b)
             struct rect v = view_rect(b);
             css_viewport_h = v.h;
             css_target_id = url_fragment(b->url);
+            css_vt_active = b->vt != NULL;
+            css_vt_types = b->vt_types;
             css_font_lookup = font_lookup;
             css_font_context = b;
             anim_now = now_ms();
@@ -7622,8 +7869,8 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             b->sb_hit = sh;
             if (sh.part == SBP_THUMB)
                 b->sb_grab = sh.coordinate - sh.thumb;
-            else
-                layout_sbar_press(&b->lo, &sh);
+            else if (layout_sbar_press(&b->lo, &sh) && b->lo.last_sbox >= 0)
+                snap_later(b, b->lo.sb[b->lo.last_sbox].node, b->lo.last_from_x, b->lo.last_from_y);
             paint(b);
             return;
         }
@@ -7694,6 +7941,14 @@ static void mouse(struct browser *b, int x, int y, int buttons, int changed)
             if (over)
                 press(b, i);
         } else if (hold == H_VBAR || hold == H_HBAR || hold == H_SBOX) {
+            if (hold == H_SBOX && b->sb_hit.box < b->lo.nsb) {    /* let go: it comes to rest */
+                struct node *n = b->lo.sb[b->sb_hit.box].node;
+                int x, y;
+                if (snap_where(b, n, &x, &y))
+                    snap_now(b, n, x, y, SNAP_PLACE, 1);
+            } else if (hold != H_SBOX && b->lo.page_snap && !b->snap_wait.on) {
+                snap_now(b, NULL, b->scroll_x, b->scroll_y, SNAP_PLACE, 1);
+            }
             paint(b);
         } else if (hold == H_PAGE && b->drag_range) {
             struct node *r = b->drag_range;
@@ -7826,6 +8081,8 @@ static int wheel(struct browser *b, int x, int y, int delta)
     if (b->root && rect_contains(v, x, y) &&            /* a box on the page that scrolls takes it first */
         layout_wheel(&b->lo, x - v.x + b->scroll_x, y - v.y + b->scroll_y, b->scroll_x, b->scroll_y, 0,
                      -delta * lines * LINE_STEP / 2)) {
+        if (b->lo.last_sbox >= 0)
+            snap_later(b, b->lo.sb[b->lo.last_sbox].node, b->lo.last_from_x, b->lo.last_from_y);
         paint(b);
         return 1;
     }
@@ -7995,6 +8252,8 @@ static void draw_tabs(struct browser *b, struct surface *s)
 
 static void tab_visibility(struct browser *b, int hidden)
 {
+    if (hidden && b->vt)
+        b->vt_done = 1;                 /* a hidden page's view transition is skipped */
     if (b->js)
         jsdom_page_event(b->js, "visibilitychange", hidden);
     for (struct browser *frame = b->frames; frame; frame = frame->next_frame)
@@ -8312,6 +8571,20 @@ static void browser_poll_work(void)
         if (b->js)
             jsdom_run_timers(b->js);
         media_notify(b);
+        if (!hidden && b->root && snap_step(b))
+            paint(b);
+        if (b->vt && b->vt_done) {      /* a view transition's animation is over */
+            vt_free(b->vt);
+            b->vt = NULL;
+            b->vt_done = 0;
+            b->need_style = 1;          /* :active-view-transition no longer matches */
+            if (b->js)
+                jsdom_view_transition_done(b->js);
+            paint(b);
+        } else if (b->vt && vt_begun(b->vt) && !hidden && (int)(now_ms() - b->vt_frame_at) >= 16) {
+            b->vt_frame_at = now_ms();
+            paint(b);
+        }
         if (!hidden) {
             if (b->root && b->discover_changes) flush_changes(b);
             else if (b->root && (b->need_style || b->need_layout)) { relayout(b); paint(b); }
@@ -8392,6 +8665,16 @@ int browser_timeout(void)
                 t = 0;
             if (best < 0 || t < best)
                 best = t;
+        }
+        if (!tab_hidden(b) && (b->snap_glide.on || (b->vt && (vt_begun(b->vt) || b->vt_done))))
+            best = best < 0 || best > 16 ? 16 : best;   /* a glide or a transition's next frame */
+        if (b->vt && b->vt_done)
+            return 0;                   /* a transition to finish */
+        if (b->snap_wait.on && !tab_hidden(b)) {
+            int left = (int)(b->snap_wait.due - now_ms());
+            left = left < 0 ? 0 : left;
+            if (best < 0 || left < best)
+                best = left;
         }
         if (b->tip_node && !b->tip_shown) {         /* the tooltip is due */
             unsigned waited = now_ms() - b->tip_since;

@@ -67,6 +67,11 @@ enum prop {
     P_CONTAINER, P_CONTAINER_NAME, P_CONTAINER_TYPE, P_BACKFACE, P_FILTER, P_BACKDROP, P_CLIP_PATH, P_BLEND,
     P_TRANSITION_BEHAVIOR, P_ANCHOR_NAME, P_POSITION_ANCHOR, P_POSITION_AREA, P_POSITION_TRY_FALLBACKS,
     P_POSITION_TRY,
+    P_SNAP_TYPE, P_SNAP_ALIGN, P_SNAP_STOP, P_SCROLL_PADDING, P_SCROLL_PADDING_TOP, P_SCROLL_PADDING_RIGHT,
+    P_SCROLL_PADDING_BOTTOM, P_SCROLL_PADDING_LEFT, P_SCROLL_PADDING_INLINE, P_SCROLL_PADDING_BLOCK,
+    P_SCROLL_MARGIN, P_SCROLL_MARGIN_TOP, P_SCROLL_MARGIN_RIGHT, P_SCROLL_MARGIN_BOTTOM, P_SCROLL_MARGIN_LEFT,
+    P_SCROLL_MARGIN_INLINE, P_SCROLL_MARGIN_BLOCK, P_CONTENT_VISIBILITY, P_CIS, P_CIS_W, P_CIS_H,
+    P_VT_NAME, P_VT_CLASS,
     P_COUNT
 };
 _Static_assert(P_COUNT <= 256, "a declaration keeps its property in a byte");
@@ -149,11 +154,11 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "column-rule-color", P_COLUMN_RULE_COLOR }, { "column-rule-style", P_COLUMN_RULE_STYLE },
     { "column-rule-width", P_COLUMN_RULE_WIDTH }, { "column-span", P_IGNORED }, { "column-width", P_COLUMN_WIDTH },
     { "columns", P_COLUMNS },
-    { "contain", P_IGNORED }, { "contain-intrinsic-block-size", P_IGNORED },
-    { "contain-intrinsic-height", P_IGNORED }, { "contain-intrinsic-inline-size", P_IGNORED },
-    { "contain-intrinsic-size", P_IGNORED }, { "contain-intrinsic-width", P_IGNORED },
+    { "contain", P_IGNORED }, { "contain-intrinsic-block-size", P_CIS_H },
+    { "contain-intrinsic-height", P_CIS_H }, { "contain-intrinsic-inline-size", P_CIS_W },
+    { "contain-intrinsic-size", P_CIS }, { "contain-intrinsic-width", P_CIS_W },
     { "container", P_CONTAINER }, { "container-name", P_CONTAINER_NAME }, { "container-type", P_CONTAINER_TYPE },
-    { "content", P_CONTENT }, { "content-visibility", P_IGNORED }, { "counter-increment", P_COUNTER_INCREMENT },
+    { "content", P_CONTENT }, { "content-visibility", P_CONTENT_VISIBILITY }, { "counter-increment", P_COUNTER_INCREMENT },
     { "counter-reset", P_COUNTER_RESET }, { "counter-set", P_IGNORED }, { "cursor", P_CURSOR },
     { "display", P_DISPLAY }, { "dominant-baseline", P_IGNORED }, { "dynamic-range-limit", P_IGNORED },
     { "empty-cells", P_EMPTY_CELLS }, { "field-sizing", P_IGNORED }, { "filter", P_FILTER }, { "flex", P_FLEX },
@@ -215,14 +220,14 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "pointer-events", P_POINTER_EVENTS }, { "position", P_POSITION }, { "position-anchor", P_POSITION_ANCHOR }, { "position-area", P_POSITION_AREA }, { "position-try", P_POSITION_TRY }, { "position-try-fallbacks", P_POSITION_TRY_FALLBACKS }, { "position-try-options", P_POSITION_TRY_FALLBACKS }, { "position-try-order", P_IGNORED }, { "position-visibility", P_IGNORED }, { "print-color-adjust", P_IGNORED },
     { "quotes", P_IGNORED }, { "resize", P_IGNORED }, { "right", P_RIGHT }, { "rotate", P_ROTATE },
     { "row-gap", P_ROW_GAP }, { "ruby-align", P_IGNORED }, { "ruby-position", P_IGNORED }, { "scale", P_SCALE },
-    { "scroll-behavior", P_IGNORED }, { "scroll-margin", P_IGNORED }, { "scroll-margin-block", P_IGNORED },
-    { "scroll-margin-bottom", P_IGNORED }, { "scroll-margin-inline", P_IGNORED },
-    { "scroll-margin-left", P_IGNORED }, { "scroll-margin-right", P_IGNORED },
-    { "scroll-margin-top", P_IGNORED }, { "scroll-padding", P_IGNORED }, { "scroll-padding-block", P_IGNORED },
-    { "scroll-padding-bottom", P_IGNORED }, { "scroll-padding-inline", P_IGNORED },
-    { "scroll-padding-left", P_IGNORED }, { "scroll-padding-right", P_IGNORED },
-    { "scroll-padding-top", P_IGNORED }, { "scroll-snap-align", P_IGNORED }, { "scroll-snap-stop", P_IGNORED },
-    { "scroll-snap-type", P_IGNORED }, { "scrollbar-color", P_IGNORED }, { "scrollbar-gutter", P_IGNORED },
+    { "scroll-behavior", P_IGNORED }, { "scroll-margin", P_SCROLL_MARGIN }, { "scroll-margin-block", P_SCROLL_MARGIN_BLOCK }, { "scroll-margin-block-end", P_SCROLL_MARGIN_BOTTOM }, { "scroll-margin-block-start", P_SCROLL_MARGIN_TOP },
+    { "scroll-margin-bottom", P_SCROLL_MARGIN_BOTTOM }, { "scroll-margin-inline", P_SCROLL_MARGIN_INLINE }, { "scroll-margin-inline-end", P_SCROLL_MARGIN_RIGHT }, { "scroll-margin-inline-start", P_SCROLL_MARGIN_LEFT },
+    { "scroll-margin-left", P_SCROLL_MARGIN_LEFT }, { "scroll-margin-right", P_SCROLL_MARGIN_RIGHT },
+    { "scroll-margin-top", P_SCROLL_MARGIN_TOP }, { "scroll-padding", P_SCROLL_PADDING }, { "scroll-padding-block", P_SCROLL_PADDING_BLOCK }, { "scroll-padding-block-end", P_SCROLL_PADDING_BOTTOM }, { "scroll-padding-block-start", P_SCROLL_PADDING_TOP },
+    { "scroll-padding-bottom", P_SCROLL_PADDING_BOTTOM }, { "scroll-padding-inline", P_SCROLL_PADDING_INLINE }, { "scroll-padding-inline-end", P_SCROLL_PADDING_RIGHT }, { "scroll-padding-inline-start", P_SCROLL_PADDING_LEFT },
+    { "scroll-padding-left", P_SCROLL_PADDING_LEFT }, { "scroll-padding-right", P_SCROLL_PADDING_RIGHT },
+    { "scroll-padding-top", P_SCROLL_PADDING_TOP }, { "scroll-snap-align", P_SNAP_ALIGN }, { "scroll-snap-stop", P_SNAP_STOP },
+    { "scroll-snap-type", P_SNAP_TYPE }, { "scrollbar-color", P_IGNORED }, { "scrollbar-gutter", P_IGNORED },
     { "scrollbar-width", P_IGNORED }, { "shape-rendering", P_IGNORED }, { "speak", P_IGNORED },
     { "speak-as", P_IGNORED }, { "tab-size", P_TAB_SIZE }, { "table-layout", P_TABLE_LAYOUT },
     { "text-align", P_TEXT_ALIGN }, { "text-align-last", P_TEXT_ALIGN_LAST }, { "text-anchor", P_IGNORED },
@@ -239,7 +244,7 @@ static const struct { const char *name; uint8_t prop; } prop_names[] = {
     { "transform-box", P_IGNORED }, { "transform-origin", P_TRANSFORM_ORIGIN },
     { "transform-style", P_IGNORED }, { "translate", P_TRANSLATE }, { "unicode-bidi", P_IGNORED },
     { "user-select", P_USER_SELECT }, { "vector-effect", P_IGNORED }, { "vertical-align", P_VERTICAL_ALIGN },
-    { "view-transition-class", P_IGNORED }, { "view-transition-name", P_IGNORED },
+    { "view-transition-class", P_VT_CLASS }, { "view-transition-name", P_VT_NAME },
     { "visibility", P_VISIBILITY }, { "white-space", P_WHITE_SPACE }, { "white-space-collapse", P_IGNORED },
     { "widows", P_IGNORED }, { "width", P_WIDTH }, { "will-change", P_IGNORED }, { "word-break", P_WORD_BREAK },
     { "word-spacing", P_WORD_SPACING }, { "word-wrap", P_OVERFLOW_WRAP }, { "z-index", P_Z_INDEX },
@@ -261,7 +266,7 @@ enum {
 #define PS_ACTIVE       (1u << 30)
 #define PS_USER_INVALID (1u << 31)
 /* :modal, :popover-open and :open: states scripts (and invoker buttons) set, outside the attributes */
-enum { ST_MODAL = 1, ST_POPOVER_OPEN = 2, ST_OPEN = 4 };
+enum { ST_MODAL = 1, ST_POPOVER_OPEN = 2, ST_OPEN = 4, ST_ACTIVE_VT = 8, ST_VT_TYPE = 16 };
 
 /* Page zoom in percent (see web.h): the browser sets it before it parses or cascades. */
 int css_zoom = 100;
@@ -304,7 +309,9 @@ struct compound {
     struct selector *is_list;   /* :is(a, b) / :where(): matches one of them */
     int nis;
     char comb;                  /* how it relates to the compound before it */
-    uint8_t pe;                 /* PE_* */
+    uint8_t pe;                 /* PE_* (or VT_*, the view transition pseudo-elements) */
+    const char *vt_arg;         /* ::view-transition-group(...)'s argument: a name, "*", ".class"... */
+    const char *vt_types;       /* :active-view-transition-type(...)'s, commas apart */
 };
 
 struct selector {
@@ -317,6 +324,67 @@ struct selector {
 };
 
 static uint32_t hash_str(const char *s);
+
+/* ---- view transitions: which pseudo-element css_vt_style is styling ---- */
+int css_vt_active;
+const char *css_vt_types;
+static int cur_vt_kind;                 /* VT_*, or 0: an ordinary cascade (their rules match nothing) */
+static const char *cur_vt_name, *cur_vt_classes;
+
+/* Is the identifier w (wl long) one of list's (spaces or commas apart)? */
+static int vt_listed(const char *list, const char *w, int wl)
+{
+    for (const char *p = list; p && *p;) {
+        while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n')
+            p++;
+        const char *e = p;
+        while (*e && *e != ' ' && *e != ',' && *e != '\t' && *e != '\n')
+            e++;
+        if (e > p && e - p == wl && !strncmp(p, w, (size_t)wl))
+            return 1;
+        p = e;
+    }
+    return 0;
+}
+
+static int vt_types_match(const char *types)
+{
+    for (const char *p = types; p && *p;) {
+        while (*p == ' ' || *p == ',' || *p == '\t')
+            p++;
+        const char *e = p;
+        while (*e && *e != ' ' && *e != ',' && *e != '\t')
+            e++;
+        if (e > p && vt_listed(css_vt_types, p, (int)(e - p)))
+            return 1;
+        p = e;
+    }
+    return 0;
+}
+
+/* Does a ::view-transition-*() selector name the pseudo-element being styled? Its argument is a
+ * name or *, then .classes the group's view-transition-class must all have. */
+static int vt_selected(const struct selector *sel)
+{
+    if (!cur_vt_kind || sel->pe != cur_vt_kind)
+        return 0;
+    const char *arg = sel->parts[sel->nparts - 1].vt_arg;
+    if (cur_vt_kind == VT_ROOT_PSEUDO || !arg)
+        return 1;
+    const char *dot = strchr(arg, '.');
+    int nl = dot ? (int)(dot - arg) : (int)strlen(arg);
+    if (nl && !(nl == 1 && arg[0] == '*') &&
+        (!cur_vt_name || (int)strlen(cur_vt_name) != nl || strncmp(cur_vt_name, arg, (size_t)nl)))
+        return 0;
+    while (dot) {
+        const char *cls = dot + 1, *next = strchr(cls, '.');
+        int cl = next ? (int)(next - cls) : (int)strlen(cls);
+        if (!cl || !vt_listed(cur_vt_classes, cls, cl))
+            return 0;
+        dot = next;
+    }
+    return 1;
+}
 
 struct decl {
     uint8_t prop;
@@ -444,6 +512,19 @@ static const char ua_css[] =
     " max-width: calc(100% - 6px - 2em); max-height: calc(100% - 6px - 2em) }"
     "::backdrop { position: fixed; top: 0; right: 0; bottom: 0; left: 0 }"
     "dialog::backdrop { background-color: rgba(0, 0, 0, .1) }"
+    /* view transitions: a group moves from the old box to the new (the browser works out where from
+     * the group's timing), while its old picture fades out and its new one fades in */
+    "::view-transition-group(*) { animation-name: -ua-view-transition-group-anim; animation-duration: .25s;"
+    " animation-fill-mode: both }"
+    "::view-transition-image-pair(*), ::view-transition-old(*), ::view-transition-new(*) {"
+    " animation-duration: inherit; animation-fill-mode: inherit; animation-delay: inherit;"
+    " animation-timing-function: inherit; animation-iteration-count: inherit; animation-direction: inherit;"
+    " animation-play-state: inherit }"
+    "::view-transition-old(*) { animation-name: -ua-view-transition-fade-out }"
+    "::view-transition-new(*) { animation-name: -ua-view-transition-fade-in }"
+    "@keyframes -ua-view-transition-group-anim { from { z-index: auto } to { z-index: auto } }"
+    "@keyframes -ua-view-transition-fade-out { to { opacity: 0 } }"
+    "@keyframes -ua-view-transition-fade-in { from { opacity: 0 } }"
     "[popover] { position: fixed; top: 0; right: 0; bottom: 0; left: 0; width: fit-content; height: fit-content;"
     " margin: auto; border: solid; padding: .25em; overflow: auto; color: black; background-color: white }"
     "[popover]:not(:popover-open):not(dialog[open]) { display: none }"
@@ -736,6 +817,28 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
                 *spec += 1;
                 continue;
             }
+            if (element && !strncmp(name, "view-transition", 15)) {
+                int kind = !strcmp(name, "view-transition") ? VT_ROOT_PSEUDO
+                         : !strcmp(name, "view-transition-group") ? VT_GROUP
+                         : !strcmp(name, "view-transition-image-pair") ? VT_PAIR
+                         : !strcmp(name, "view-transition-old") ? VT_OLD
+                         : !strcmp(name, "view-transition-new") ? VT_NEW : 0;
+                if (!kind || (kind != VT_ROOT_PSEUDO && !args))
+                    return NULL;
+                char arg[128] = "*";
+                if (args) {
+                    const char *p = args, *q = args_end;
+                    while (p < q && isspace((unsigned char)*p)) p++;
+                    while (q > p && isspace((unsigned char)q[-1])) q--;
+                    if (q == p || q - p >= (long)sizeof(arg))
+                        return NULL;
+                    snprintf(arg, sizeof(arg), "%.*s", (int)(q - p), p);
+                }
+                c->pe = (uint8_t)kind;
+                c->vt_arg = arena_strdup(a, arg);
+                *spec += strcmp(arg, "*") ? 1 : 0;
+                continue;
+            }
             if (element)
                 return NULL;            /* other pseudo-elements: not generated */
             if (!strcmp(name, "host")) {
@@ -747,6 +850,17 @@ static const char *parse_compound(struct arena *a, const char *s, const char *en
                 }
             } else if (!strcmp(name, "modal"))
                 c->state |= ST_MODAL;
+            else if (!strcmp(name, "active-view-transition"))
+                c->state |= ST_ACTIVE_VT;
+            else if (!strcmp(name, "active-view-transition-type") && args) {
+                c->state |= ST_ACTIVE_VT | ST_VT_TYPE;
+                char *types = arena_alloc(a, (size_t)(args_end - args) + 1);
+                if (!types)
+                    return NULL;
+                memcpy(types, args, (size_t)(args_end - args));
+                types[args_end - args] = 0;
+                c->vt_types = types;
+            }
             else if (!strcmp(name, "popover-open"))
                 c->state |= ST_POPOVER_OPEN;
             else if (!strcmp(name, "open"))
@@ -2887,6 +3001,10 @@ static int match_compound(const struct compound *c, const struct node *n, const 
             return 0;
         if ((c->state & ST_OPEN) && !((n->tag == T_DETAILS || n->tag == T_DIALOG) && node_attr(n, "open")))
             return 0;
+        if ((c->state & ST_ACTIVE_VT) && (!css_vt_active || n->parent || n->shadow_host))
+            return 0;
+        if ((c->state & ST_VT_TYPE) && !vt_types_match(c->vt_types))
+            return 0;
     }
     if ((ps & PS_DYNAMIC) || c->focus_visible)
         cur_flags |= n == cur_subject ? SF_DYN_SELF : SF_DYN_OTHER;
@@ -3968,6 +4086,7 @@ static void init_initial(void)
     s->lh_kind = LH_NORMAL;
     s->list_style = LS_DISC;
     s->outline_color = 1;
+    s->cis_w = s->cis_h = -1;
     s->outline_w = 3;
     s->tab_size = 8;
     s->bg_w.unit = s->bg_h.unit = U_AUTO;
@@ -5669,6 +5788,23 @@ static void apply_motion(struct style *st, const struct style *parent, int prop,
             }
             return;
         }
+        /* a longhand: the parent's list for it (none for initial) */
+        const char *const *src[] = { &from->tprop, &from->tdur, &from->tease, &from->tdelay, &from->tbehav,
+                                     &from->aname, &from->adur, &from->aease, &from->adelay, &from->aiter,
+                                     &from->adir, &from->afill, &from->astate };
+        const char **dst[] = { &raw->tprop, &raw->tdur, &raw->tease, &raw->tdelay, &raw->tbehav,
+                               &raw->aname, &raw->adur, &raw->aease, &raw->adelay, &raw->aiter,
+                               &raw->adir, &raw->afill, &raw->astate };
+        static const int props[] = { P_TRANSITION_PROPERTY, P_TRANSITION_DURATION, P_TRANSITION_TIMING,
+                                     P_TRANSITION_DELAY, P_TRANSITION_BEHAVIOR, P_ANIMATION_NAME,
+                                     P_ANIMATION_DURATION, P_ANIMATION_TIMING, P_ANIMATION_DELAY,
+                                     P_ANIMATION_ITERATION, P_ANIMATION_DIRECTION, P_ANIMATION_FILL,
+                                     P_ANIMATION_STATE };
+        for (unsigned i = 0; i < sizeof(props) / sizeof(props[0]); i++)
+            if (props[i] == prop) {
+                *dst[i] = *src[i];
+                return;
+            }
     }
     const char *val = arena_strdup(v->a, value);
     switch (prop) {
@@ -6537,6 +6673,190 @@ static void apply(struct style *st, const struct style *parent, int prop, const 
                 type++;
             st->cq_type = initial_kw ? CQ_NONE : !strncasecmp(type, "inline-size", 11) ? CQ_INLINE
                         : !strncasecmp(type, "size", 4) ? CQ_SIZE : CQ_NONE;
+        }
+        break;
+    }
+    case P_SNAP_TYPE:                           /* none | [x | y | block | inline | both] [mandatory | proximity]? */
+        if (inherit_kw) {
+            st->snap_type = parent->snap_type;
+            break;
+        }
+        st->snap_type = 0;
+        n = initial_kw ? 0 : words(value, w, wl, 2);
+        for (int i = 0; i < n; i++) {
+            if (word_is(w[i], wl[i], "x") || word_is(w[i], wl[i], "inline"))
+                st->snap_type |= SNAP_X;
+            else if (word_is(w[i], wl[i], "y") || word_is(w[i], wl[i], "block"))
+                st->snap_type |= SNAP_Y;
+            else if (word_is(w[i], wl[i], "both"))
+                st->snap_type |= SNAP_X | SNAP_Y;
+            else if (word_is(w[i], wl[i], "mandatory") && i)
+                st->snap_type |= SNAP_MANDATORY;
+            else if (!word_is(w[i], wl[i], "proximity") || !i) {
+                st->snap_type = 0;              /* none, or nonsense */
+                break;
+            }
+        }
+        if (!(st->snap_type & (SNAP_X | SNAP_Y)))
+            st->snap_type = 0;
+        break;
+    case P_SNAP_ALIGN: {                        /* block [inline]: none, start, end or center each */
+        if (inherit_kw) {
+            st->snap_align_x = parent->snap_align_x;
+            st->snap_align_y = parent->snap_align_y;
+            break;
+        }
+        n = initial_kw ? 0 : words(value, w, wl, 2);
+        int a[2] = { SA_NONE, SA_NONE }, ok = n > 0;
+        for (int i = 0; i < n; i++)
+            a[i] = word_is(w[i], wl[i], "start") ? SA_START : word_is(w[i], wl[i], "end") ? SA_END
+                 : word_is(w[i], wl[i], "center") ? SA_CENTER : word_is(w[i], wl[i], "none") ? SA_NONE
+                 : (ok = 0);
+        if (n == 1)
+            a[1] = a[0];
+        if (!ok)
+            a[0] = a[1] = SA_NONE;
+        st->snap_align_y = (uint8_t)a[0];
+        st->snap_align_x = (uint8_t)a[1];
+        break;
+    }
+    case P_SNAP_STOP:
+        st->snap_stop = inherit_kw ? parent->snap_stop : !strcasecmp(value, "always");
+        break;
+    case P_SCROLL_PADDING:
+        if (inherit_kw)
+            memcpy(st->scroll_pad, parent->scroll_pad, sizeof(st->scroll_pad));
+        else if (initial_kw)
+            memset(st->scroll_pad, 0, sizeof(st->scroll_pad));
+        else if (box_values(value, v, box))
+            memcpy(st->scroll_pad, box, sizeof(box));
+        break;
+    case P_SCROLL_PADDING_TOP: case P_SCROLL_PADDING_RIGHT: case P_SCROLL_PADDING_BOTTOM:
+    case P_SCROLL_PADDING_LEFT: {
+        struct len *dst = &st->scroll_pad[prop - P_SCROLL_PADDING_TOP];
+        if (inherit_kw)
+            *dst = parent->scroll_pad[prop - P_SCROLL_PADDING_TOP];
+        else if (initial_kw)
+            memset(dst, 0, sizeof(*dst));
+        else
+            set_len(dst, value, v);
+        break;
+    }
+    case P_SCROLL_MARGIN: case P_SCROLL_MARGIN_TOP: case P_SCROLL_MARGIN_RIGHT: case P_SCROLL_MARGIN_BOTTOM:
+    case P_SCROLL_MARGIN_LEFT: case P_SCROLL_MARGIN_INLINE: case P_SCROLL_MARGIN_BLOCK:
+    case P_SCROLL_PADDING_INLINE: case P_SCROLL_PADDING_BLOCK: {
+        /* margins are lengths (no percentages); the logical pairs are start [end] */
+        int pad = prop == P_SCROLL_PADDING_INLINE || prop == P_SCROLL_PADDING_BLOCK;
+        int first = prop == P_SCROLL_MARGIN ? 0 : prop == P_SCROLL_MARGIN_INLINE || prop == P_SCROLL_PADDING_INLINE ? 3
+                  : prop == P_SCROLL_MARGIN_BLOCK || prop == P_SCROLL_PADDING_BLOCK ? 0 : prop - P_SCROLL_MARGIN_TOP;
+        int pair = prop == P_SCROLL_MARGIN_INLINE || prop == P_SCROLL_MARGIN_BLOCK || pad;
+        int sides[4], ns = prop == P_SCROLL_MARGIN ? 4 : pair ? 2 : 1;
+        if (pair)
+            sides[0] = first, sides[1] = first == 3 ? 1 : 2;
+        else
+            for (int i = 0; i < ns; i++)
+                sides[i] = first + i;
+        struct len got[4];
+        memset(got, 0, sizeof(got));
+        if (inherit_kw) {
+            for (int i = 0; i < ns; i++)
+                if (pad) st->scroll_pad[sides[i]] = parent->scroll_pad[sides[i]];
+                else st->scroll_margin[sides[i]] = parent->scroll_margin[sides[i]];
+            break;
+        }
+        if (!initial_kw) {
+            if (ns == 4) {
+                if (!box_values(value, v, got))
+                    break;
+            } else {
+                n = words(value, w, wl, 2);
+                if (!n || (n > 1 && !pair))
+                    break;
+                for (int i = 0; i < ns; i++) {
+                    char tmp[64];
+                    int k = i < n ? i : 0;
+                    if (wl[k] >= (int)sizeof(tmp))
+                        break;
+                    snprintf(tmp, sizeof(tmp), "%.*s", wl[k], w[k]);
+                    if (!length_value(tmp, v, &got[i]))
+                        got[i] = (struct len){ 0, 0, U_PX };
+                }
+            }
+        }
+        for (int i = 0; i < ns; i++) {
+            if (pad)
+                st->scroll_pad[sides[i]] = got[i].unit == U_AUTO ? (struct len){ 0, 0, U_PX } : got[i];
+            else
+                st->scroll_margin[sides[i]] = got[i].unit == U_PX ? got[i].v : 0;
+        }
+        break;
+    }
+    case P_CONTENT_VISIBILITY:
+        st->cv = (uint8_t)(inherit_kw ? parent->cv : !strcasecmp(value, "auto") ? CV_AUTO
+                         : !strcasecmp(value, "hidden") ? CV_HIDDEN : CV_VISIBLE);
+        break;
+    case P_CIS: case P_CIS_W: case P_CIS_H: {
+        /* none | <length> | auto <length>: once for both axes, or width then height */
+        if (inherit_kw) {
+            if (prop != P_CIS_H) st->cis_w = parent->cis_w, st->cis_auto_w = parent->cis_auto_w;
+            if (prop != P_CIS_W) st->cis_h = parent->cis_h, st->cis_auto_h = parent->cis_auto_h;
+            break;
+        }
+        int sizes[2] = { -1, -1 }, autos[2] = { 0, 0 }, axes = 0;
+        n = initial_kw ? 0 : words(value, w, wl, 4);
+        for (int i = 0; i < n && axes < 2; i++) {
+            if (word_is(w[i], wl[i], "auto")) {
+                autos[axes] = 1;
+                continue;
+            }
+            if (word_is(w[i], wl[i], "none")) {
+                sizes[axes++] = -1;
+                continue;
+            }
+            char tmp[64];
+            struct len l;
+            if (wl[i] >= (int)sizeof(tmp))
+                break;
+            snprintf(tmp, sizeof(tmp), "%.*s", wl[i], w[i]);
+            if (!length_value(tmp, v, &l) || l.unit != U_PX)
+                break;
+            sizes[axes++] = l.v < 0 ? 0 : l.v;
+        }
+        if (axes == 1 && prop == P_CIS)
+            sizes[1] = sizes[0], autos[1] = autos[0];
+        if (prop == P_CIS_H)
+            sizes[1] = sizes[0], autos[1] = autos[0];
+        if (prop != P_CIS_H) st->cis_w = sizes[0], st->cis_auto_w = (uint8_t)autos[0];
+        if (prop != P_CIS_W) st->cis_h = sizes[1], st->cis_auto_h = (uint8_t)autos[1];
+        break;
+    }
+    case P_VT_NAME: case P_VT_CLASS: {
+        const char **dst = prop == P_VT_NAME ? &st->vt_name : &st->vt_class;
+        if (inherit_kw) {
+            *dst = prop == P_VT_NAME ? parent->vt_name : parent->vt_class;
+            break;
+        }
+        while (isspace((unsigned char)*value))
+            value++;
+        int len = (int)strlen(value);
+        while (len > 0 && isspace((unsigned char)value[len - 1]))
+            len--;
+        if (initial_kw || !len || (len == 4 && !strncasecmp(value, "none", 4))) {
+            *dst = NULL;
+        } else if (prop == P_VT_NAME && ((len == 13 && !strncasecmp(value, "match-element", 13)) ||
+                                         (len == 4 && !strncasecmp(value, "auto", 4)))) {
+            *dst = VT_NAME_ELEMENT;
+        } else if (prop == P_VT_NAME && (strpbrk(value, " \t,") || isdigit((unsigned char)value[0]))) {
+            /* one identifier only */
+        } else if (v->a) {
+            char *copy = arena_alloc(v->a, (size_t)len + 1);
+            if (copy) {
+                memcpy(copy, value, (size_t)len);
+                copy[len] = 0;
+                *dst = copy;
+            }
+        } else {
+            *dst = value;
         }
         break;
     }
@@ -7883,6 +8203,8 @@ static void match_list(struct collect *c, const struct sheet *sh, const struct r
         const struct selector *sel = &r->sels[ref->sel];
         if (r->starting && !cur_starting)
             continue;
+        if ((sel->pe >= VT_ROOT_PSEUDO || cur_vt_kind) && !vt_selected(sel))
+            continue;
         if (cur_bloom && !cur_bloom->broken && sel->nanc) {   /* an ancestor it needs is not there */
             int i = 0;
             while (i < sel->nanc && bloom_has(cur_bloom, sel->anc[i]))
@@ -7910,6 +8232,7 @@ static void match_sheet(struct collect *c, const struct sheet *sh, const struct 
             for (int j = 0; j < r->nsels; j++) {
                 const struct selector *sel = &r->sels[j];
                 if (n == c->mc->slotted && !sel->parts[sel->nparts-1].nslot) continue;
+                if ((sel->pe >= VT_ROOT_PSEUDO || cur_vt_kind) && !vt_selected(sel)) continue;
                 if (match_from(sel, sel->nparts-1, n, c->mc) && (!r->cq || cq_matches(r->cq, (struct node *)n, sel->pe))) {
                     add_decls(c,r->decls,r->ndecls,rank,sel->spec,sheet_order+(uint32_t)i*256,sel->pe,
                               r->layer ? r->layer->canonical->order : 0x7fffffff);
@@ -8083,6 +8406,18 @@ static void restore_property(struct style *st, const struct style *src, int prop
     case P_CLIP_PATH: COPY(clip_path); break;
     case P_BLEND: COPY(blend); break;
     case P_CONTAINER: case P_CONTAINER_NAME: case P_CONTAINER_TYPE: COPY(cq_type); COPY(cq_name); break;
+    case P_SNAP_TYPE: COPY(snap_type); break;
+    case P_SNAP_ALIGN: COPY(snap_align_x); COPY(snap_align_y); break;
+    case P_SNAP_STOP: COPY(snap_stop); break;
+    case P_SCROLL_PADDING: case P_SCROLL_PADDING_INLINE: case P_SCROLL_PADDING_BLOCK: COPY(scroll_pad); break;
+    case P_SCROLL_PADDING_TOP: case P_SCROLL_PADDING_RIGHT: case P_SCROLL_PADDING_BOTTOM: case P_SCROLL_PADDING_LEFT:
+        COPY(scroll_pad[prop - P_SCROLL_PADDING_TOP]); break;
+    case P_SCROLL_MARGIN: case P_SCROLL_MARGIN_TOP: case P_SCROLL_MARGIN_RIGHT: case P_SCROLL_MARGIN_BOTTOM:
+    case P_SCROLL_MARGIN_LEFT: case P_SCROLL_MARGIN_INLINE: case P_SCROLL_MARGIN_BLOCK: COPY(scroll_margin); break;
+    case P_CONTENT_VISIBILITY: COPY(cv); break;
+    case P_CIS: case P_CIS_W: case P_CIS_H: COPY(cis_w); COPY(cis_h); COPY(cis_auto_w); COPY(cis_auto_h); break;
+    case P_VT_NAME: COPY(vt_name); break;
+    case P_VT_CLASS: COPY(vt_class); break;
     case P_OUTLINE: COPY(outline_style); COPY(outline_w); COPY(outline_color); break;
     case P_OUTLINE_STYLE: COPY(outline_style); break;
     case P_OUTLINE_WIDTH: COPY(outline_w); break;
@@ -8312,6 +8647,10 @@ static const struct keyframes *kf_find(void *ctx, const char *name)
     struct kf_ctx *k = ctx;
     for (int i = k->nsheets - 1; i >= 0; i--)          /* the last definition wins */
         for (const struct keyframes *f = k->sheets[i] ? k->sheets[i]->keyframes : NULL; f; f = f->next)
+            if (!strcmp(f->name, name))
+                return f;
+    if (!strncmp(name, "-ua-", 4))                     /* the user agent's own (view transitions') */
+        for (const struct keyframes *f = ua_sheet ? ua_sheet->keyframes : NULL; f; f = f->next)
             if (!strcmp(f->name, name))
                 return f;
     return NULL;
@@ -9326,4 +9665,68 @@ int css_restyle_animated(struct arena *a, struct node *root, struct sheet **shee
     free(buf);
     free(bloom);
     return changed > 0;
+}
+
+/* ---- view transitions' pseudo-elements ---- */
+
+struct style *css_vt_style(struct arena *a, struct node *root, struct sheet **sheets, int nsheets,
+                           int viewport_w, int viewport_h, int kind, const char *name, const char *classes,
+                           const struct style *parent, struct node *holder)
+{
+    if (!root || !root->style || !ua_sheet || kind < VT_ROOT_PSEUDO || kind > VT_NEW)
+        return NULL;
+    init_initial();
+    struct match *buf = malloc(sizeof(struct match) * MAX_MATCHES);
+    if (!buf)
+        return NULL;
+    struct vctx v = { ZOOM(16), root->style->font_size, viewport_w, viewport_h, a, 0, 0, NULL };
+    struct mctx mc = { .quirks = root->quirks };
+    const struct node *saved_subject = cur_subject;
+    uint8_t saved_flags = cur_flags, saved_node_flags = root->style_flags;
+    struct arena *saved_keys = key_arena;
+    key_arena = a;
+    prepare_layers(a, sheets, nsheets);
+    cur_vt_kind = kind;
+    cur_vt_name = name;
+    cur_vt_classes = classes;
+    cur_subject = root;
+    struct collect c = { .m = buf, .mc = &mc };
+    char hint[1024];
+    const char *inline_style;
+    collect_matches(a, root, sheets, nsheets, &v, &mc, &c, hint, sizeof(hint), &inline_style);
+    cur_vt_kind = 0;
+    cur_vt_name = cur_vt_classes = NULL;
+    cur_subject = saved_subject;
+    cur_flags = saved_flags;
+    root->style_flags = saved_node_flags;
+    key_arena = saved_keys;
+
+    const struct style *from = parent ? parent : root->style;
+    struct style *st = arena_alloc(a, sizeof(*st));
+    if (!st) {
+        free(buf);
+        return NULL;
+    }
+    inherit(st, from);
+    int budget = 8192;
+    for (int pass = 2; pass <= 3; pass++) {
+        if (pass == 3)
+            v.font_size = st->font_size;
+        for (int i = 0; i < c.n; i++) {
+            const struct decl *d = c.m[i].d;
+            int early = d->prop == P_FONT_SIZE || d->prop == P_FONT;
+            if (c.m[i].pe != (uint32_t)kind || d->prop == P_CUSTOM || (pass == 2) != early)
+                continue;
+            apply_match(st, from, &c, i, &v, pass, NULL, &budget);
+        }
+    }
+    finish_motion(a, st);
+    if (holder && (st->ntrans || st->nanims || holder->anim)) {
+        struct kf_ctx kc = { sheets, nsheets, from, &v };
+        struct anim_env env = { a, &kc, kf_find, kf_apply, NULL };
+        anim_style(holder, st, &env);
+    }
+    finish_transform(a, st);
+    free(buf);
+    return st;
 }

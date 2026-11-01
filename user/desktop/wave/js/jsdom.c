@@ -5291,6 +5291,40 @@ static jsval win_watch_view(struct js *J, jsval self, jsval *args, int argc)
     return js_undefined;
 }
 
+/* %vtCapture(types), %vtBegin(), %vtEnd(): what document.startViewTransition() asks of the browser. */
+static jsval view_transition_op(struct js *J, jsval *args, int argc, int op)
+{
+    struct jsdom *d = dom(J);
+    char types[256] = "";
+    if (!d->h.view_transition)
+        return js_num(0);
+    if (op == VT_CAPTURE && argc > 0 && ARG(0).t == JS_STR)
+        snprintf(types, sizeof(types), "%s", js_tostr(J, ARG(0))->s);
+    return js_num(d->h.view_transition(d->h.ctx, op, types));
+}
+static jsval win_vt_capture(struct js *J, jsval self, jsval *args, int argc)
+{ (void)self; return view_transition_op(J, args, argc, VT_CAPTURE); }
+static jsval win_vt_begin(struct js *J, jsval self, jsval *args, int argc)
+{ (void)self; return view_transition_op(J, args, argc, VT_BEGIN); }
+static jsval win_vt_end(struct js *J, jsval self, jsval *args, int argc)
+{ (void)self; return view_transition_op(J, args, argc, VT_END); }
+
+void jsdom_view_transition_done(struct jsdom *d)
+{
+    if (!d)
+        return;
+    struct js *J = d->J;
+    jsval hook = js_get(J, js_obj(d->window), "%vtDone"), r;
+    if (!js_is_callable(hook))
+        return;
+    d->depth++;
+    if (js_call(J, hook, js_undefined, NULL, 0, &r) < 0)
+        report(d, "view transition");
+    d->depth--;
+    js_run_jobs(J);
+    settle(d);
+}
+
 void jsdom_queue_event(struct jsdom *d, struct node *n, const char *type)
 {
     if (!d || !n || d->nqueued == (int)(sizeof(d->queued) / sizeof(d->queued[0])))
@@ -6391,7 +6425,7 @@ void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, i
     X(W, TrustedScript) X(W, TrustedScriptURL) X(W, TrustedTypePolicy) X(W, TrustedTypePolicyFactory)        \
     X(W, trustedTypes) X(D, pointerLockElement) X(D, exitPointerLock) X(D, caretPositionFromPoint)           \
     X(D, caretRangeFromPoint) X(E, requestPointerLock) X(E, attachInternals) X(E, setHTML)                   \
-    X(E, setHTMLUnsafe)
+    X(E, setHTMLUnsafe) X(D, startViewTransition) X(D, activeViewTransition) X(W, ViewTransition)
 
 static void dom_lib_load(struct jsdom *d)
 {
@@ -6897,6 +6931,9 @@ struct jsdom *jsdom_new(const struct jshost *host)
     js_set(J, wv, "history", js_obj(hist));
     js_put(J, w, S(J, "%watchMutations"), js_new_function(J, win_watch_mutations, "watchMutations", 1), 1);
     js_put(J, w, S(J, "%watchView"), js_new_function(J, win_watch_view, "watchView", 1), 1);
+    js_put(J, w, S(J, "%vtCapture"), js_new_function(J, win_vt_capture, "vtCapture", 1), 1);
+    js_put(J, w, S(J, "%vtBegin"), js_new_function(J, win_vt_begin, "vtBegin", 0), 1);
+    js_put(J, w, S(J, "%vtEnd"), js_new_function(J, win_vt_end, "vtEnd", 0), 1);
     js_set(J, wv, "localStorage", make_storage(d, 0));
     js_set(J, wv, "sessionStorage", make_storage(d, 1));
 

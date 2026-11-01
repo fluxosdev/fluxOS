@@ -424,9 +424,9 @@ struct window *files_open_desktop(void);
 void files_open_path(const char *path);
 void files_tick(void);                  /* once a second: follow mounts coming and going */
 struct window *calculator_open(void);
-struct window *player_open(const char *path);      /* path NULL: nothing open yet */
-void player_child_exited(int pid, int status);
-void player_tick(void);
+struct window *mediaplayer_open(const char *path);  /* Media Player (mediaplayer.c); path NULL: nothing open yet */
+int mediaplayer_timeout(void);                      /* the loop's hooks for it */
+void mediaplayer_frame(void);
 struct window *editor_open(const char *path);      /* path NULL: an empty document */
 void editor_blink(void);
 void clipboard_set(const char *text);              /* the desktop's clipboard, every program's */
