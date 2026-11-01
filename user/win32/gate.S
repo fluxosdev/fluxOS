@@ -43,30 +43,53 @@ api_gate_entry:
     pushl %ebp                      /* .ebp: the frame starts here */
     movl %esp, %eax
     leal 52(%esp), %ecx
+    /* Windows callers promise only four-byte alignment. Native GCC code
+     * uses the SysV 16-byte call alignment, including SSE stack temporaries.
+     * EBX is already in the guest frame and is callee-saved by api_dispatch. */
+    movl %esp, %ebx
+    movl 44(%ebx), %edx             /* id */
+    andl $-16, %esp
+    subl $4, %esp
     pushl %eax                      /* regs */
     pushl %ecx                      /* args */
-    pushl 52(%esp)                  /* id */
+    pushl %edx                      /* id */
     call api_dispatch
-    addl $12, %esp
+    movl %ebx, %esp
     popl %ebp
     popl %edi
     popl %esi
     popl %ebx
     addl $16, %esp                  /* .ret_addr, .args, the saved edx and ecx */
-    movl api_edx, %edx
-    movl api_ecx, %ecx
+    /* Snapshot the shared API result before another thread may enter the runtime. */
     cmpl $0, api_ebx_valid
     je 2f
     movl api_ebx, %ebx
-2:  cmpl $0, api_fret_valid
+2:  pushl %eax
+    pushl api_edx
+    pushl api_ecx
+    pushl api_fret_valid
+    pushl api_fret+4
+    pushl api_fret
+    pushl %ebx
+    movl %esp, %ebx
+    andl $-16, %esp
+    call thread_api_leave
+    movl %ebx, %esp
+    popl %ebx
+    cmpl $0, 8(%esp)
     je 1f
-    fldl api_fret
-    movl $0, api_fret_valid
-1:  movw gate_win_ds, %cx
+    fldl (%esp)
+1:  addl $12, %esp
+    popl %ecx
+    popl %edx
+    popl %eax
+    pushl %ecx
+    movw gate_win_ds, %cx
     movw %cx, %ss
     leal -WIN_BASE(%esp), %esp
     movw %cx, %ds
     movw %cx, %es
+    popl %ecx
     lret
 
 /* uint32_t call_guest_on(gp_t fn, int nargs, const uint32_t *args, uint32_t new_stack) */

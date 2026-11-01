@@ -395,7 +395,7 @@ static void run_children(int lfd, const struct wm_state *st)
 
 static void phase2_title(const char *title)
 {
-    while(strcmp(seen_title,title) && !strstr(seen_title,"phase2-failed")) {
+    while(strcmp(seen_title,title) && !strstr(seen_title,"failed")) {
         struct wm_msg *m=next_msg();REQUIRE(m);CHECK(incidental(m->type));free(m);
     }
     if(strcmp(seen_title,title)) printf("phase2: expected %s, got %s\n",title,seen_title);
@@ -416,6 +416,28 @@ static void phase2_popup(const struct wm_state *st,const char *title,int tab)
     m=expect(C_DESTROY);CHECK(m->win==win);free(m);
     shm_surface_detach(&s);shmctl(b.shmid,IPC_RMID,NULL);
 }
+static void run_phase3(int lfd,const struct wm_state *st)
+{
+    int pid=spawn("/test/phase3.exe",-1);struct pollfd p={lfd,POLLIN,0};
+    REQUIRE(poll(&p,1,15000)==1);int fd=accept(lfd,NULL,NULL);REQUIRE(fd>=0);
+    fcntl(fd,F_SETFL,O_NONBLOCK);wm_conn_init(&conn,fd);seen_title[0]=0;
+    struct wm_msg *m=expect(C_HELLO);send_msg(S_STATE,0,m->serial,st,sizeof(*st));free(m);
+    m=expect(C_CREATE);const struct wm_create *cr=wm_payload(m);printf("guest: phase3 initial title %s\n",cr->title);CHECK(!strcmp(cr->title,"Phase3"));uint32_t win=m->win;
+    struct surface s;struct wm_buffer b={new_buffer(&s,cr->w,cr->h),cr->w,cr->h,1,0};send_msg(S_BUFFER,win,m->serial,&b,sizeof(b));free(m);
+    struct wm_int focus={1};send_msg(S_FOCUS,win,0,&focus,sizeof(focus));
+    phase2_title("phase3-ready");
+    mouse(win,40,220,MOUSE_LEFT,MOUSE_LEFT);mouse(win,40,220,0,MOUSE_LEFT);phase2_title("phase3-click");
+    char *paths[]={"/winapps/users/flux/Documents/phase3.txt","/test/console.exe"};
+    struct drag_data drag={0};drag.paths=paths;drag.npaths=2;size_t packed_size;void *packed=wm_drag_pack(&drag,&packed_size);
+    struct wm_drop drop={12,16,DROP_DO,1,1,1};void *payload=malloc(sizeof(drop)+packed_size);memcpy(payload,&drop,sizeof(drop));memcpy((char *)payload+sizeof(drop),packed,packed_size);free(packed);
+    send_msg(S_DROP,win,99,payload,sizeof(drop)+packed_size);free(payload);m=expect(C_DROP_REPLY);CHECK(m->serial==99 && ((struct wm_drop_reply *)wm_payload(m))->effect==DROP_COPY);free(m);
+    key(win,0x20,1,0,"d");key(win,0x20,0,0,NULL);
+    phase2_popup(st,"Open",0);phase2_popup(st,"Save As",0);phase2_popup(st,"Color",0);phase2_popup(st,"Font",0);phase2_popup(st,"Select Folder",0);
+    phase2_title("phase3-ok");send_msg(S_CLOSE,win,0,NULL,0);m=expect(C_DESTROY);CHECK(m->win==win);free(m);
+    int code=wait_exit(pid);printf("guest: phase3.exe exited with %d\n",code);CHECK(code==19);
+    shm_surface_detach(&s);shmctl(b.shmid,IPC_RMID,NULL);wm_conn_close(&conn);
+}
+
 static void run_phase2(int lfd,const struct wm_state *st)
 {
     int pid=spawn("/test/phase2.exe",-1);struct pollfd p={lfd,POLLIN,0};
@@ -462,6 +484,14 @@ int main(void)
     int code = wait_exit(spawn("/test/console.exe", -1));
     printf("guest: console.exe exited with %d\n", code);
     CHECK(code == 5);
+
+    int gdip=wait_exit(spawn("/test/gdiplus.exe",-1));printf("guest: gdiplus.exe exited with %d\n",gdip);CHECK(gdip==21);
+    int threaded=wait_exit(spawn("/test/threads.exe",-1));
+    printf("guest: threads.exe exited with %d\n",threaded);CHECK(threaded==15);
+    int registry=wait_exit(spawn("/test/registry.exe",-1));printf("guest: registry.exe exited with %d\n",registry);CHECK(registry==17);
+    FILE *prefix=fopen("/winapps/prefix-test.txt","rb");REQUIRE(prefix);
+    char prefix_data[7]={0};CHECK(fread(prefix_data,1,6,prefix)==6 && !strcmp(prefix_data,"prefix"));fclose(prefix);
+    CHECK(access("/prefix-test.txt",F_OK)!=0);
 
     /* With no desktop, a GUI program says so and stops. */
     int errp[2];
@@ -560,5 +590,6 @@ int main(void)
     run_input(lfd, &st);
     run_children(lfd, &st);
     run_phase2(lfd, &st);
+    run_phase3(lfd, &st);
     finish();
 }

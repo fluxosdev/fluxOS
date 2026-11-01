@@ -246,7 +246,8 @@ struct win {
     HDC own_dc;                         /* CS_OWNDC and CS_CLASSDC */
     int cursor_sent;                    /* the C_CURSOR kind sent last, plus 1 (0: none yet) */
     int destroying;
-    void *control, *dialog;
+    void *control, *dialog, *common, *aux;
+    int accept_files;
     HMENU menu;
     HICON icon;
     int menu_height, sb_w, sb_h, nonclient;
@@ -274,6 +275,20 @@ void ui_invalidate(HWND h);
 HDC ui_begin(HWND h, struct paintstruct *ps);
 void ui_end(HWND h, struct paintstruct *ps);
 void ui_class(const char *name, const struct api_entry *proc, HBRUSH brush);
+void ui_class_dll(const char *name, struct api_dll *dll, const struct api_entry *proc, HBRUSH brush);
+void common_destroy(struct win *w);
+const struct image *icon_image(HICON h);
+HICON icon_create(const struct image *image);
+int imagelist_draw(HANDLE h,int index,HDC dc,int x,int y,int width,int height,uint32_t style);
+int imagelist_size(HANDLE h,int *width,int *height);
+HWND ui_dialog_new(const uint16_t *title,HWND owner,int width,int height,gp_t proc,LPARAM param);
+HWND ui_control(HWND parent,const uint16_t *cls,const uint16_t *text,uint32_t style,int x,int y,int width,int height,int id);
+int ui_modal(HWND h);
+void shell_drop(HWND h,const struct wm_msg *message);
+gp_t shell_pidl(const char *host);
+char *ui_browse_path(HWND owner,const char *title,const char *initial,gp_t callback,LPARAM data);
+int win_split_command_line(const char *cmd,char **argv,int max,char *buffer,size_t size);
+char *ui_choose_path(HWND owner,const char *title,const char *initial,int save,int directory,const char *filter,const char *extension,uint32_t flags);
 int ui_next(struct msg *m, int block);
 LRESULT ui_dispatch(struct msg *m);
 void ui_fill(HDC dc, int x, int y, int w, int h, COLORREF color);
@@ -302,4 +317,5 @@ HICON icon_load(HINSTANCE inst, gp_t name, int wide);
 void icon_send(uint32_t id, HICON h);
 extern const struct api_entry controls_entries[], dialog_entries[], menu_entries[], clipboard_entries[], icon_entries[];
 extern const int controls_count, dialog_count, menu_count, clipboard_count, icon_count;
+void common_mouse(HWND target,UINT message,POINT screen);
 #endif

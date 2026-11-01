@@ -39,6 +39,7 @@
 #include "gui.h"
 #include "wmconn.h"
 #include "os.h"
+#include "threads.h"
 
 #include "ui.h"
 
@@ -55,9 +56,19 @@ struct qmsg {
     struct qmsg *next;
 };
 
+struct sent_message {
+    struct sent_message *next;
+    HWND hwnd; UINT message; WPARAM wp; LPARAM lp;
+    int unicode,done;LRESULT result;
+};
+
+struct input_state {HWND focus,active,capture;uint8_t keys[256];};
 struct queue {
+    struct input_state input;
+    uint32_t group;
     uint32_t tid;
     struct qmsg *head, *tail;
+    struct sent_message *sent_head,*sent_tail,*active_sent;
     int count;
     int quit;
     uint32_t quit_code;
@@ -79,10 +90,34 @@ static struct queue *queue_for(uint32_t tid)
     struct queue *q = calloc(1, sizeof(*q));
     if (!q)
         wdie("out of memory");
-    q->tid = tid;
+    q->tid = tid;q->group=tid;
     q->next = queues;
     queues = q;
     return q;
+}
+
+struct input_link {uint32_t a,b;struct input_link *next;};
+static struct input_link *input_links;
+static struct input_state *input_for(uint32_t tid)
+{
+    struct queue *q=queue_for(tid);return &queue_for(q->group)->input;
+}
+static int input_shared(uint32_t a,uint32_t b) {return queue_for(a)->group==queue_for(b)->group;}
+static void input_regroup(void)
+{
+    /* Snapshot shared state before choosing new representatives. */
+    for(struct queue *q=queues;q;q=q->next) q->input=*input_for(q->tid);
+    for(struct queue *q=queues;q;q=q->next) q->group=q->tid;
+    int changed;
+    do {changed=0;for(struct input_link *l=input_links;l;l=l->next) {
+        struct queue *a=queue_for(l->a),*b=queue_for(l->b);uint32_t group=a->group<b->group ? a->group:b->group;
+        if(a->group!=group) {a->group=group;changed=1;}if(b->group!=group) {b->group=group;changed=1;}
+    }} while(changed);
+    for(struct queue *q=queues;q;q=q->next) {
+        struct win *w=ui_win(q->input.focus);if(!w || !input_shared(q->tid,w->tid)) q->input.focus=0;
+        w=ui_win(q->input.active);if(!w || !input_shared(q->tid,w->tid)) q->input.active=0;
+        w=ui_win(q->input.capture);if(!w || !input_shared(q->tid,w->tid)) q->input.capture=0;
+    }
 }
 
 /* ---- small things ---- */
@@ -356,6 +391,8 @@ static LRESULT call_proc(gp_t proc, int proc_unicode, HWND h, UINT msg, WPARAM w
     return call_guest4(proc, h, msg, wp, lp);
 }
 
+static void dispatch_sent(uint32_t tid);
+
 static LRESULT send_message(HWND h, UINT msg, WPARAM wp, LPARAM lp, int unicode)
 {
     if (h == HWND_BROADCAST) {
@@ -367,7 +404,26 @@ static LRESULT send_message(HWND h, UINT msg, WPARAM wp, LPARAM lp, int unicode)
     struct win *w = win_get(h);
     if (!w)
         FAIL(ERROR_INVALID_WINDOW_HANDLE);
+    if(w->tid!=cur_tid()) {
+        struct sent_message sent={NULL,h,msg,wp,lp,unicode,0,0};
+        struct queue *q=queue_for(w->tid);
+        if(q->sent_tail) q->sent_tail->next=&sent;else q->sent_head=&sent;
+        q->sent_tail=&sent;thread_notify();
+        while(!sent.done) {dispatch_sent(cur_tid());if(!sent.done) thread_wait_ms(10);}
+        return sent.result;
+    }
     return call_proc(w->wndproc, w->unicode, h, msg, wp, lp, unicode);
+}
+
+static void dispatch_sent(uint32_t tid)
+{
+    struct queue *q=queue_for(tid);
+    while(q->sent_head) {
+        struct sent_message *s=q->sent_head;q->sent_head=s->next;if(!q->sent_head) q->sent_tail=NULL;
+        s->next=q->active_sent;q->active_sent=s;
+        s->result=send_message(s->hwnd,s->message,s->wp,s->lp,s->unicode);
+        q->active_sent=s->next;s->done=1;thread_notify();
+    }
 }
 
 /* What the program says itself; the messages winrun sends of its own accord have no text. */
@@ -444,7 +500,7 @@ static void client_resized(struct win *w, int cw, int ch)
 /* Show w on the desktop. */
 static void desktop_show(struct win *w)
 {
-    int flags = WF_RIGHTCLICK | WF_ALLBUTTONS, ops = WOP_KEY | WOP_MOUSE | WOP_WHEEL | WOP_FOCUS;
+    int flags = WF_RIGHTCLICK | WF_ALLBUTTONS, ops = WOP_KEY | WOP_MOUSE | WOP_WHEEL | WOP_FOCUS | WOP_DROP;
     if (!framed(w))
         flags |= WF_BORDERLESS;
     if (w->style & WS_MINIMIZEBOX)
@@ -455,6 +511,7 @@ static void desktop_show(struct win *w)
         ops |= WOP_RESIZE;
     if (w->exstyle & WS_EX_TOOLWINDOW)
         flags |= WF_NOTASK;
+    if(w->exstyle&0x08000000) flags|=WF_NOACTIVATE;
     char title[WM_TITLE_MAX];
     int n = wide_to_utf8(w->text ? w->text : (const uint16_t *)u"", -1, title, sizeof(title));
     title[n < (int)sizeof(title) ? n : (int)sizeof(title) - 1] = 0;
@@ -712,6 +769,7 @@ static BOOL destroy_window(HWND h)
     if (w->surf.px)
         win_surface_free(&w->surf);
     child_unlink(w);
+    common_destroy(w);
     controls_destroy(w);
     dialog_destroy(w);
     menu_destroy_window(h);
@@ -726,7 +784,8 @@ static BOOL destroy_window(HWND h)
 
 /* ---- input ---- */
 
-static uint8_t key_state[256];          /* as of the messages taken (GetKeyState): 0x80 down, 0x01 toggled */
+#define key_state (input_for(cur_tid())->keys)
+/* static uint8_t key_state[256]; */          /* as of the messages taken (GetKeyState): 0x80 down, 0x01 toggled */
 static uint8_t post_state[256];         /* as of the messages posted */
 static uint8_t async_state[256];        /* as the desktop last said, for GetAsyncKeyState */
 static uint8_t async_pressed[256];      /* pressed since GetAsyncKeyState last asked */
@@ -991,6 +1050,7 @@ static void apply_cursor(void)
 /* Mouse messages: posted to the capture, or else the window the pointer is over. */
 static void post_mouse(struct win *t, UINT msg, LPARAM lp)
 {
+    HWND target=t->hwnd;common_mouse(target,msg,cursor_pos);t=win_get(target);if(!t) return;
     struct queue *q = queue_for(t->tid);
     if (msg == WM_MOUSEMOVE && q->tail && q->tail->m.message == WM_MOUSEMOVE && q->tail->m.hwnd == t->hwnd) {
         q->tail->m.wparam = mk_flags();     /* moves not taken yet come together */
@@ -1111,7 +1171,7 @@ static void activate(struct win *top, int from_desktop)
     } else {
         send0(h, WM_ACTIVATEAPP, TRUE, 0);
     }
-    active_hwnd = h;
+    active_hwnd = h;input_for(top->tid)->active=h;
     if (!win_get(h))
         return;
     send0(h, WM_NCACTIVATE, TRUE, 0);
@@ -1123,13 +1183,13 @@ static void deactivate(struct win *top)
     HWND h = top->hwnd;
     if (active_hwnd != h)
         return;
-    active_hwnd = 0;
+    active_hwnd = 0;input_for(top->tid)->active=0;
     send0(h, WM_NCACTIVATE, FALSE, 0);
     send0(h, WM_ACTIVATE, WA_INACTIVE, 0);
     set_focus(0);
     send0(h, WM_ACTIVATEAPP, FALSE, 0);
     /* keys let go of elsewhere are never heard of */
-    release_all(key_state);
+    release_all(input_for(top->tid)->keys);
     release_all(post_state);
     release_all(async_state);
 }
@@ -1151,6 +1211,8 @@ static HWND set_focus(HWND h)
     if (old == h)
         return old;
     focus_hwnd = h;
+    struct win *focused=win_get(h ? h:old);
+    input_for(focused ? focused->tid:cur_tid())->focus=h;
     if (old && win_get(old))
         send0(old, WM_KILLFOCUS, h, 0);
     if (h && focus_hwnd == h && win_get(h))
@@ -1216,6 +1278,7 @@ static struct timer *timer_due(uint32_t tid, HWND filter)
 /* A window going: nothing of the input or the timers may point at it. */
 static void forget_input(HWND h)
 {
+    for(struct queue *q=queues;q;q=q->next) {if(q->input.focus==h) q->input.focus=0;if(q->input.active==h) q->input.active=0;if(q->input.capture==h) q->input.capture=0;}
     if (focus_hwnd == h)
         focus_hwnd = 0;
     if (active_hwnd == h)
@@ -1295,6 +1358,9 @@ static void desktop_event(const struct wm_msg *m)
     case S_MOUSE:
         if (n >= sizeof(struct wm_mouse_event))
             mouse_event(w, p);
+        break;
+    case S_DROP:
+        shell_drop(h,m);
         break;
     case S_WHEEL:
         if (n >= sizeof(struct wm_int))
@@ -1542,6 +1608,7 @@ static int post(uint32_t tid, HWND h, UINT msg, WPARAM wp, LPARAM lp)
         q->head = m;
     q->tail = m;
     q->count++;
+    thread_notify();
     return 1;
 }
 
@@ -1567,6 +1634,7 @@ static int next_message(struct msg *out, HWND filter, UINT lo, UINT hi, int remo
     for (;;) {
         gui_flush();
         desktop_events();
+        dispatch_sent(tid);
         struct queue *q = queue_for(tid);
         for (struct qmsg **pp = &q->head, *prev = NULL; *pp; prev = *pp, pp = &(*pp)->next) {
             struct qmsg *m = *pp;
@@ -2175,6 +2243,7 @@ DEF(EnableWindow)
         if (capture_hwnd == A(0) || api_IsChild(args)) {
             HWND old = capture_hwnd;
             capture_hwnd = 0;
+            struct win *captured=win_get(old);if(captured) input_for(captured->tid)->capture=0;
             send0(old, WM_CAPTURECHANGED, 0, 0);
         }
     }
@@ -2256,9 +2325,10 @@ DEF(PostMessageW) { return post_message(a); }
 
 static BOOL post_thread_message(uint32_t *a)
 {
-    if (A(0) != cur_tid())
-        FAIL(ERROR_INVALID_THREAD_ID);
-    return post(A(0), 0, A(1), A(2), A(3));
+    for(struct queue *q=queues;q;q=q->next)
+        if(q->tid==A(0)) return post(A(0),0,A(1),A(2),A(3));
+    if(A(0)==cur_tid()) return post(A(0),0,A(1),A(2),A(3));
+    FAIL(ERROR_INVALID_THREAD_ID);
 }
 
 DEF(PostThreadMessageA) { return post_thread_message(a); }
@@ -2661,10 +2731,11 @@ DEF(ToUnicodeEx) { return to_char(a, 1); }
 
 DEF(SetCapture)
 {
-    HWND old = capture_hwnd;
-    if (!win_get(A(0)))
+    HWND old = input_for(cur_tid())->capture;
+    struct win *target=win_get(A(0));
+    if (!target || !input_shared(cur_tid(),target->tid))
         return old;
-    capture_hwnd = A(0);
+    capture_hwnd = A(0);input_for(cur_tid())->capture=A(0);
     if (old && old != A(0) && win_get(old))
         send0(old, WM_CAPTURECHANGED, 0, A(0));
     return old;
@@ -2673,14 +2744,15 @@ DEF(SetCapture)
 DEF(ReleaseCapture)
 {
     (void)a;
-    HWND old = capture_hwnd;
-    capture_hwnd = 0;
+    HWND old = input_for(cur_tid())->capture;
+    if(capture_hwnd==old) capture_hwnd = 0;
+    input_for(cur_tid())->capture=0;
     if (old && win_get(old))
         send0(old, WM_CAPTURECHANGED, 0, 0);
     return TRUE;
 }
 
-DEF(GetCapture) { (void)a; return capture_hwnd; }
+DEF(GetCapture) { (void)a; return input_for(cur_tid())->capture; }
 DEF(GetCursorPos) { *(POINT *)P(0) = cursor_pos; return TRUE; }
 /* The desktop moves the pointer only for the mouse: this is what GetCursorPos says till it moves. */
 DEF(SetCursorPos) { cursor_pos = (POINT){ (int32_t)A(0), (int32_t)A(1) }; return TRUE; }
@@ -2723,9 +2795,16 @@ DEF(MapWindowPoints)
 
 /* ---- focus ---- */
 
-DEF(SetFocus) { return set_focus(A(0)); }
-DEF(GetFocus) { (void)a; return focus_hwnd; }
-DEF(GetActiveWindow) { (void)a; return active_hwnd; }
+DEF(SetFocus) {
+    struct win *w=win_get(A(0));
+    if(A(0) && !w) {set_last_error(ERROR_INVALID_WINDOW_HANDLE);return 0;}
+    if(w && !input_shared(cur_tid(),w->tid)) {set_last_error(5);return 0;}
+    struct input_state *input=input_for(cur_tid());HWND old=input->focus;
+    if(!A(0) && old!=focus_hwnd) {input->focus=0;if(win_get(old)) send0(old,WM_KILLFOCUS,0,0);return old;}
+    set_focus(A(0));return old;
+}
+DEF(GetFocus) { (void)a; return input_for(cur_tid())->focus; }
+DEF(GetActiveWindow) { (void)a; return input_for(cur_tid())->active; }
 DEF(GetForegroundWindow) { (void)a; return active_hwnd; }
 
 static HWND activate_api(HWND h)
@@ -2739,7 +2818,26 @@ static HWND activate_api(HWND h)
     return old;
 }
 
-DEF(SetActiveWindow) { return activate_api(A(0)); }
+DEF(AttachThreadInput)
+{
+    uint32_t first=A(0),second=A(1);
+    struct queue *q=NULL,*r=NULL;
+    for(struct queue *p=queues;p;p=p->next) {if(p->tid==first) q=p;if(p->tid==second) r=p;}
+    if(!q || !r || first==second || !win_thread_exists(first) || !win_thread_exists(second)) {set_last_error(87);return 0;}
+    struct input_link **link=&input_links;
+    while(*link && !(((*link)->a==first && (*link)->b==second) || ((*link)->a==second && (*link)->b==first))) link=&(*link)->next;
+    if(A(2)) {
+        if(!*link) {struct input_link *n=calloc(1,sizeof(*n));if(!n) return 0;n->a=first;n->b=second;n->next=input_links;input_links=n;}
+        struct input_state state=*input_for(second);struct input_state *from=input_for(first);
+        if(from->focus) state.focus=from->focus;
+        if(from->active) state.active=from->active;
+        if(from->capture) state.capture=from->capture;
+        *input_for(first)=state;*input_for(second)=state;
+    } else {if(!*link) {set_last_error(87);return 0;}struct input_link *old=*link;*link=old->next;free(old);}
+    input_regroup();memset(input_for(first)->keys,0,256);memset(input_for(second)->keys,0,256);return 1;
+}
+
+DEF(SetActiveWindow) {struct win *w=win_get(A(0));if(!w) {set_last_error(ERROR_INVALID_WINDOW_HANDLE);return 0;}if(w && !input_shared(cur_tid(),w->tid)) {set_last_error(5);return 0;}HWND old=input_for(cur_tid())->active;activate_api(A(0));return old;}
 DEF(SetForegroundWindow) { return activate_api(A(0)) || active_hwnd == A(0); }
 
 /* ---- timers ---- */
@@ -2807,6 +2905,21 @@ static uint32_t msg_wait(uint32_t n, gp_t handles, int all, uint32_t ms)
 DEF(MsgWaitForMultipleObjects) { return msg_wait(A(0), A(1), A(2) != 0, A(3)); }
 DEF(MsgWaitForMultipleObjectsEx) { return msg_wait(A(0), A(1), (A(4) & 1) != 0, A(2)); }
 
+void user32_thread_exit(uint32_t tid)
+{
+    for(int i=0;i<MAX_WINDOWS;i++) if(table[i] && table[i]->cls && table[i]->tid==tid) destroy_window(table[i]->hwnd);
+    for(int i=0;i<ntimers;) {if(timers[i].tid==tid) timer_remove(&timers[i]);else i++;}
+    struct input_link **link=&input_links;
+    while(*link) {if((*link)->a==tid || (*link)->b==tid) {struct input_link *old=*link;*link=old->next;free(old);}else link=&(*link)->next;}
+    input_regroup();
+    struct queue *q=queue_for(tid);
+    while(q->head) {struct qmsg *m=q->head;q->head=m->next;free(m);}
+    q->tail=NULL;q->count=0;
+    for(struct sent_message *s=q->sent_head;s;s=s->next) {s->result=0;s->done=1;}
+    for(struct sent_message *s=q->active_sent;s;s=s->next) {s->result=0;s->done=1;}
+    q->sent_head=q->sent_tail=q->active_sent=NULL;thread_notify();
+}
+
 void ui_scroll_changed(HWND h,int vertical,int show)
 {
     struct win *w=win_get(h);if(!w) return;
@@ -2838,18 +2951,23 @@ HDC ui_begin(HWND h, struct paintstruct *ps) { struct win *w=win_get(h); return 
 void ui_end(HWND h, struct paintstruct *ps) { end_paint(win_get(h),ps); }
 int ui_next(struct msg *m,int block) { return next_message(m,0,0,0,1,block); }
 LRESULT ui_dispatch(struct msg *m) { return dispatch_message(m,1); }
-void ui_class(const char *name,const struct api_entry *proc,HBRUSH brush)
+void ui_class_dll(const char *name,struct api_dll *dll,const struct api_entry *proc,HBRUSH brush)
 {
     gp_t gn=galloc(strlen(name)+1);
     memcpy(GP(gn),name,strlen(name)+1);
     struct wndclassex wc={0};
-    wc.class_name=gn; wc.wndproc=api_thunk(&user32_dll,proc); wc.brush=brush;
+    wc.class_name=gn; wc.wndproc=api_thunk(dll,proc); wc.brush=brush;
     wc.cursor=CURSOR_HANDLE(IDC_ARROW); wc.style=CS_DBLCLKS;
     if(!strcmp(name,"#32770")) wc.wnd_extra=30;
     register_class(&wc,0);
     struct wclass *c=class_find(gn,0);
     if(c) c->unicode=1;
     gfree(gn);
+}
+
+void ui_class(const char *name,const struct api_entry *proc,HBRUSH brush)
+{
+    ui_class_dll(name,&user32_dll,proc,brush);
 }
 
 static void user32_init(void)
@@ -2966,7 +3084,7 @@ static const struct api_entry user32_entries[] = {
     API(SetClassLongW, 3),
     API(SetCursor, 1),
     API(SetCursorPos, 2),
-    API(SetFocus, 1),
+    API(AttachThreadInput, 3), API(SetFocus, 1),
     API(SetForegroundWindow, 1),
     API(SetKeyboardState, 1),
     API(SetTimer, 4),

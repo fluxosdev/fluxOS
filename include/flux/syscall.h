@@ -117,7 +117,9 @@ extern "C" {
 #define SYS_shmctl      105 /* id, IPC_RMID or IPC_STAT, struct flux_shmid_ds * */
 #define SYS_fstrim      106 /* path, uint64_t *trimmed: tell the SSD under path's filesystem what is free */
 
-#define NSYSCALLS       107
+#define SYS_set_win_teb 107 /* linear TEB base (0: legacy fixed TEB); returns SEG_WIN_FS */
+
+#define NSYSCALLS       108
 
 #ifdef __cplusplus
 }

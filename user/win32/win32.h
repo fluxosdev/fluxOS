@@ -64,7 +64,7 @@ typedef struct { uint16_t year, month, dow, day, hour, minute, second, ms; } SYS
  * compiled code reads directly: the exception chain at 0, the stack limits,
  * the self pointer at 0x18, the last error at 0x34, TLS at 0x2C and 0xE10,
  * the PEB at 0x30. */
-struct teb {
+struct win_teb {
     gp_t except_list;           /* 0x00: SEH chain (-1 ends it) */
     gp_t stack_base;            /* 0x04: highest stack address */
     gp_t stack_limit;           /* 0x08: lowest */
@@ -232,7 +232,9 @@ void guest_resume(const struct guest_regs *r) __attribute__((noreturn));
 /* The registers the current API call was made with: ebx, esi, edi, ebp as the
  * gate saved them, and where the return address lies. */
 struct call_frame { uint32_t ebp, edi, esi, ebx; gp_t ret_addr; gp_t args; uint32_t edx, ecx; };
-extern struct call_frame *api_frame;
+extern struct call_frame *bootstrap_api_frame;
+struct call_frame **thread_frame_slot(void);
+#define api_frame (*thread_frame_slot())
 
 /* ---- vmem.c: the guest's address space ---- */
 #define MEM_COMMIT  0x1000
@@ -377,7 +379,9 @@ void str_upper(char *s);
 void str_lower(char *s);
 
 /* ---- process state (loader.c, kernel32.c) ---- */
-extern struct teb *teb;
+extern struct win_teb *bootstrap_teb;
+struct win_teb *thread_teb(void);
+#define teb (thread_teb())
 extern struct peb *peb;
 extern gp_t teb_gp, peb_gp;
 extern gp_t cmdline_gp, cmdline_w_gp;   /* GetCommandLineA/W */

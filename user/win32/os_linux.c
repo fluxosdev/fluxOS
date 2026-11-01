@@ -48,6 +48,8 @@ static int set_ldt(int idx, uint32_t base, uint32_t limit_pages, int code)
     return (int)syscall(SYS_modify_ldt, 1, &d, sizeof(d));
 }
 
+int os_set_win_teb(uint32_t linear) { (void)linear; return -1; }
+
 void os_init(void)
 {
     void *p = mmap((void *)WIN_SEG_BASE, WIN_SEG_LIMIT, PROT_NONE,

@@ -87,6 +87,8 @@ void glass_smoke(struct surface *s, struct rect r, int rt, int rb);
                                    middle ones too), and so do the moves while one is held, wherever the
                                    pointer goes */
 
+#define WF_NOACTIVATE 0x100    /* passive popups such as tooltips never take focus */
+
 enum icon_id {
     ICON_NONE,
     ICON_FLUX,

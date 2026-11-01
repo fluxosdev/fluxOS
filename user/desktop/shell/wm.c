@@ -1924,6 +1924,7 @@ void wm_destroy(struct window *w)
 
 void wm_focus(struct window *w)
 {
+    if(w && (w->flags&WF_NOACTIVATE)) return;
     struct window *old = focused, *fs = fullscreen();
     if (w) {
         w->minimized = 0;

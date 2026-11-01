@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "win32.h"
+#include "threads.h"
 #include "os.h"
 
 #define DLL_PROCESS_ATTACH 1
@@ -17,7 +18,7 @@
 
 struct module *modules, *main_module;
 char exe_dir_host[PATH_MAX];
-struct teb *teb;
+struct win_teb *bootstrap_teb;
 struct peb *peb;
 gp_t teb_gp, peb_gp;
 gp_t cmdline_gp, cmdline_w_gp;
@@ -319,9 +320,8 @@ void env_init(char **envp)
         }
         env_set(name, eq + 1);
     }
-    const char *home = env_get("HOME");
     char win[MAX_PATH];
-    path_to_win(home ? home : "/", win, sizeof(win));
+    strcpy(win,"C:\\users\\flux");
     static const char *const defaults[][2] = {
         { "SystemRoot", "C:\\WINDOWS" }, { "windir", "C:\\WINDOWS" }, { "SystemDrive", "C:" },
         { "TEMP", "C:\\tmp" }, { "TMP", "C:\\tmp" }, { "OS", "Windows_NT" },
@@ -331,7 +331,7 @@ void env_init(char **envp)
         { "ComSpec", "C:\\WINDOWS\\SYSTEM32\\CMD.EXE" }, { "PATHEXT", ".COM;.EXE;.BAT;.CMD" },
         { "PROMPT", "$P$G" }, { "ProgramFiles", "C:\\Program Files" },
         { "CommonProgramFiles", "C:\\Program Files\\Common Files" },
-        { "ALLUSERSPROFILE", "C:\\home" }, { "APPDATA", NULL }, { "LOCALAPPDATA", NULL },
+        { "ALLUSERSPROFILE", "C:\\ProgramData" }, { "APPDATA", NULL }, { "LOCALAPPDATA", NULL },
         { "USERPROFILE", NULL }, { "HOMEPATH", NULL }, { "COMPUTERNAME", NULL }, { "PATH", "C:\\WINDOWS\\SYSTEM32;C:\\WINDOWS;C:\\bin" },
     };
     char ncpu[8];
@@ -340,8 +340,9 @@ void env_init(char **envp)
         const char *name = defaults[i][0], *value = defaults[i][1];
         if (env_get(name))
             continue;
-        if (!strcmp(name, "USERPROFILE") || !strcmp(name, "APPDATA") || !strcmp(name, "LOCALAPPDATA"))
-            value = win;
+        if (!strcmp(name, "USERPROFILE")) value=win;
+        else if(!strcmp(name,"APPDATA")) value="C:\\users\\flux\\AppData\\Roaming";
+        else if(!strcmp(name,"LOCALAPPDATA")) value="C:\\users\\flux\\AppData\\Local";
         else if (!strcmp(name, "HOMEPATH"))
             value = win + 2;
         else if (!strcmp(name, "COMPUTERNAME")) {
@@ -451,7 +452,7 @@ void process_init(const char *exe_host_path, int argc, char **argv, char **envp)
         wdie("cannot map the thread block at %08x", GUEST_TEB);
     teb_gp = GUEST_TEB;
     peb_gp = GUEST_TEB + 0x1000;
-    teb = GP(teb_gp);
+    bootstrap_teb = GP(teb_gp);
     peb = GP(peb_gp);
     memset(teb, 0, sizeof(*teb));
     memset(peb, 0, sizeof(*peb));
@@ -538,6 +539,7 @@ void process_init(const char *exe_host_path, int argc, char **argv, char **envp)
     pp->std_in = std_handles[0];
     pp->std_out = std_handles[1];
     pp->std_err = std_handles[2];
+    threads_init();
 }
 
 void process_run(void)

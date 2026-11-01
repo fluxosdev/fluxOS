@@ -8,7 +8,7 @@
  * environment) logs every call the program makes into the Windows API on
  * standard error; -s (WINRUN_STRICT=1) stops at the first call of a
  * function winrun does not provide, instead of returning zero from it.
- * Drive C: is the fluxOS root; see paths in util.c.
+ * Drive C: is /winapps; drive Z: is the fluxOS root (util.c).
  */
 #include <dirent.h>
 #include <errno.h>
@@ -117,6 +117,12 @@ int main(int argc, char **argv, char **envp)
     char abspath[PATH_MAX];
     snprintf(abspath, sizeof(abspath), "%s/%s", exe_dir_host, path_basename(path));
 
+    /* Native executables may live outside the prefix, but the guest starts in C:\\ . */
+    char launch_cwd[PATH_MAX];
+    if(!getcwd(launch_cwd,sizeof(launch_cwd)) ||
+       (strncmp(launch_cwd,"/winapps",8) || (launch_cwd[8] && launch_cwd[8]!='/'))) {
+        if(chdir("/winapps")<0) {fprintf(stderr,"winrun: /winapps: %s\n",strerror(errno));return 1;}
+    }
     process_init(abspath, argc - i, argv + i, envp);
     if (pe_resolve_imports(m, err, sizeof(err)) < 0) {
         fprintf(stderr, "winrun: %s: %s\n", path, err);

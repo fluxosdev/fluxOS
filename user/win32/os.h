@@ -11,6 +11,7 @@
 
 /* Before anything else: the guest window and the segment selectors (gate_*). */
 void os_init(void);
+int os_set_win_teb(uint32_t linear);
 /* Where the loader's own memory ends (linear), so the guest gets nothing below. */
 uint32_t os_loader_end(void);
 /* [linear, linear + size) becomes zeroed memory the program can read, write

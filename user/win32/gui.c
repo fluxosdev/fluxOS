@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include "gui.h"
 #include "os.h"
+#include "threads.h"
 #include "wmconn.h"
 
 struct queued {
@@ -138,8 +139,9 @@ static struct wm_msg *wait_reply(uint32_t serial)
             return copy;
         }
         struct pollfd p = { conn.fd, POLLIN, 0 };
-        if (poll(&p, 1, -1) < 0 && errno != EINTR)
-            lost();
+        struct win_pause pause;thread_pause(&pause);
+        int result=poll(&p,1,10);thread_resume(&pause);
+        if(result<0 && errno!=EINTR) lost();
         read_in();
     }
 }
@@ -280,6 +282,12 @@ void gui_damage(uint32_t id, struct rect r)
     send_msg(C_DAMAGE, id, 0, &wr, sizeof(wr));
 }
 
+void gui_drop_reply(uint32_t id,uint32_t serial,int effect)
+{
+    struct wm_drop_reply reply={effect,{0}};
+    send_msg(C_DROP_REPLY,id,serial,&reply,sizeof(reply));
+}
+
 void gui_clip_set(const char *text)
 {
     send_msg(C_CLIP_SET,0,0,text,strlen(text));
@@ -358,17 +366,13 @@ struct wm_msg *gui_event(void)
 /* Wait at most ms (-1: as long as it takes) for news from the desktop: 1 if any came. */
 int gui_wait_ms(int ms)
 {
-    if (!gui_connected) {
-        if (ms < 0)
-            for (;;)
-                pause();
-        if (ms > 0)
-            usleep((useconds_t)ms * 1000);
-        return 0;
-    }
+    if(!gui_connected) {thread_wait_ms(ms);return 0;}
     gui_flush();
     struct pollfd p = { conn.fd, POLLIN, 0 };
+    if(threads_active() && (ms<0 || ms>10)) ms=10;
+    struct win_pause pause;thread_pause(&pause);
     int r = poll(&p, 1, ms);
+    thread_resume(&pause);
     if (r < 0 && errno != EINTR)
         lost();
     return r > 0 ? read_in() : 0;

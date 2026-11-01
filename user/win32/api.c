@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "win32.h"
+#include "threads.h"
 
 uint32_t api_edx, api_ecx, api_ebx;
 int api_ebx_valid;
@@ -18,7 +19,7 @@ double api_fret;
 int api_fret_valid;
 double api_farg[2];
 int api_trace, api_strict;
-struct call_frame *api_frame;
+struct call_frame *bootstrap_api_frame;
 
 #define MAX_DLLS 48
 static struct api_dll *dlls[MAX_DLLS];
@@ -36,7 +37,7 @@ static uint32_t thunk_left;
 
 extern struct api_dll kernel32_dll, ntdll_dll, msvcrt_dll, user32_dll, gdi32_dll, advapi32_dll,
                       shell32_dll, ole32_dll, oleaut32_dll, winmm_dll, comctl32_dll, comdlg32_dll,
-                      version_dll, winspool_dll, ws2_32_dll, imm32_dll, shlwapi_dll, rpcrt4_dll, uxtheme_dll,
+                      gdiplus_dll, version_dll, winspool_dll, ws2_32_dll, imm32_dll, shlwapi_dll, rpcrt4_dll, uxtheme_dll,
                       dwmapi_dll, psapi_dll, crypt32_dll, secur32_dll, wininet_dll, mpr_dll, setupapi_dll;
 
 static void api_register(struct api_dll *d)
@@ -47,14 +48,16 @@ static void api_register(struct api_dll *d)
 
 void api_register_all(void)
 {
-    extern void msvcrt_link(void), user32_link(void);
+    extern void msvcrt_link(void), user32_link(void), gdiplus_link(void);
     msvcrt_link();
     user32_link();
+    gdiplus_link();
     api_register(&kernel32_dll);
     api_register(&ntdll_dll);
     api_register(&msvcrt_dll);
     api_register(&user32_dll);
     api_register(&gdi32_dll);
+    api_register(&gdiplus_dll);
     api_register(&advapi32_dll);
     api_register(&shell32_dll);
     api_register(&ole32_dll);
@@ -349,6 +352,7 @@ void api_set_fret(double d)
 
 uint32_t api_dispatch(uint32_t id, uint32_t *args, uint32_t *regs)
 {
+    thread_api_enter();
     struct call_frame *saved = api_frame;
     api_frame = (struct call_frame *)regs;
     api_edx = 0;

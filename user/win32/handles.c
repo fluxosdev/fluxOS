@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "win32.h"
+#include "threads.h"
 
 #define MAX_HANDLES 1024
 static struct hobj *table[MAX_HANDLES];
@@ -55,6 +56,9 @@ static void release(struct hobj *o)
         if (o->fd > 2)
             close(o->fd);
         break;
+    case H_THREAD:
+        win_thread_reap(o->priv);
+        break;
     case H_MAPPING:
         if (o->priv && ((struct mapping *)o->priv)->fd >= 0)
             close(((struct mapping *)o->priv)->fd);
@@ -65,7 +69,7 @@ static void release(struct hobj *o)
         break;
     }
     free(o->path);
-    free(o->priv);
+    if(o->type!=H_THREAD) free(o->priv);
     free(o);
 }
 

@@ -323,6 +323,22 @@ static HWND make_control(HWND owner,const uint16_t *cls,const uint16_t *text,uin
     gp_t gc=ui_guest(cls,1),gt=ui_guest(text,1);uint32_t ca[]={0,gc,gt,WS_CHILD|WS_VISIBLE|style,x,y,width,height,owner,id,0,0};
     HWND h=ui_create(ca,1);gfree(gc);gfree(gt);return h;
 }
+HWND ui_control(HWND owner,const uint16_t *cls,const uint16_t *text,uint32_t style,int x,int y,int width,int height,int id)
+{
+    return make_control(owner,cls,text,style,x,y,width,height,id);
+}
+HWND ui_dialog_new(const uint16_t *title,HWND owner,int width,int height,gp_t proc,LPARAM param)
+{
+    (void)param;
+    gp_t cls=ui_guest((const uint16_t *)u"#32770",1),caption=ui_guest(title,1);
+    RECT bounds={0,0,width,height};gp_t rectangle=ui_memory(&bounds,sizeof(bounds));U(AdjustWindowRect,rectangle,WS_POPUP|WS_CAPTION|0x80000,0);bounds=*(RECT *)GP(rectangle);gfree(rectangle);
+    uint32_t args[]={0,cls,caption,WS_POPUP|WS_CAPTION|0x00080000|0x02000000,80,60,bounds.right-bounds.left,bounds.bottom-bounds.top,owner,0,main_module ? main_module->base:0,0};
+    HWND h=ui_create(args,1);gfree(cls);gfree(caption);if(!h) return 0;
+    struct dialog *d=calloc(1,sizeof(*d));if(!d) {U(DestroyWindow,h);return 0;}
+    d->owner=owner;d->proc=proc;d->wide=1;d->defid=1;ui_win(h)->dialog=d;return h;
+}
+int ui_modal(HWND h) {return modal(h);}
+
 DEF(MessageBoxProc)
 {
     if(A(1)==WM_INITDIALOG) return 1;

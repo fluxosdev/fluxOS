@@ -53,6 +53,7 @@ struct proc {
     int group_exiting;          /* leader: a thread is ending the process, the others are being killed */
     int reap_self;              /* a thread that exited: freed when its slot is wanted (no waitpid) */
     uint32_t clear_tid;         /* user word holding this thread's id, zeroed and futex-woken when it exits */
+    uint32_t win_teb;           /* per-thread Windows FS base (zero: WIN_TEB_LINEAR) */
     uint32_t tls;               /* base of the TLS segment (SEG_USER_TLS) */
     struct mutex mm_lock;       /* leader: page faults and changes to the mappings */
     spinlock_t fd_lock;         /* leader: taking and freeing descriptor slots */

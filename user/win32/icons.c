@@ -108,3 +108,16 @@ DEF(CopyIcon)
 uint32_t ui_icon_destroy(HICON h) { struct image *im=icon_get(h); if(im) { image_free(im); icons[h-ICON_BASE]=NULL; } return 1; }
 const struct api_entry icon_entries[]={API(DrawIconEx,9),API(DrawIcon,4),API(CopyIcon,1)};
 const int icon_count=sizeof(icon_entries)/sizeof(icon_entries[0]);
+
+const struct image *icon_image(HICON h) {return icon_get(h);}
+HICON icon_create(const struct image *im)
+{
+    if(!im || !im->px || im->w<=0 || im->h<=0) return 0;
+    for(int i=0;i<ICON_MAX;i++) if(!icons[i]) {
+        struct image *copy=malloc(sizeof(*copy));if(!copy) return 0;
+        *copy=*im;copy->px=malloc((size_t)im->w*im->h*4);
+        if(!copy->px) {free(copy);return 0;}
+        memcpy(copy->px,im->px,(size_t)im->w*im->h*4);icons[i]=copy;return ICON_BASE+i;
+    }
+    return 0;
+}

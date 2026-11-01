@@ -2767,3 +2767,33 @@ static const struct api_entry gdi32_entries[] = {
 
 struct api_dll gdi32_dll = { "GDI32.DLL", gdi32_entries, sizeof(gdi32_entries) / sizeof(gdi32_entries[0]),
                              NULL, { NULL }, { 0 }, NULL, NULL, 0 };
+
+/* GDI+ shares the GDI target setup so child clipping, DIB synchronization and
+ * damage tracking stay identical to ordinary GDI drawing. */
+int gdi_dc_valid(HDC h) {return dc_get(h)!=NULL;}
+int gdi_dc_size(HDC h,int *width,int *height)
+{
+    struct dc *d=dc_get(h);if(!d) return -1;
+    if(d->mem) {struct bitmap *b=bitmap_get(d->bitmap);if(!b) return -1;*width=b->w;*height=b->h;return 0;}
+    struct surface *s;int x,y;return win_surface(d->hwnd,&s,&x,&y,width,height);
+}
+int gdi_bitmap_copy(HBITMAP h,struct image *out)
+{
+    struct bitmap *b=bitmap_get(h);if(!b || (uint64_t)b->w*b->h>16*1024*1024) return -1;
+    uint32_t *pixels=malloc((size_t)b->w*b->h*4);if(!pixels) return -1;
+    dib_pull(b,mkrect(0,0,b->w,b->h));
+    for(int y=0;y<b->h;y++) for(int x=0;x<b->w;x++) pixels[y*b->w+x]=0xFF000000|(b->surf.px[y*b->surf.stride+x]&0xFFFFFF);
+    *out=(struct image){b->w,b->h,pixels};return 0;
+}
+int gdi_argb_blit(HDC h,int x,int y,int width,int height,const uint32_t *pixels,int stride,int copy)
+{
+    struct dc *d=dc_get(h);struct target t;if(!d || target(d,&t)<0) return -1;
+    int dx=dev_x(d,x),dy=dev_y(d,y);struct rect r=mkrect(dx,dy,width,height);touch(&t,r);
+    for(int j=0;j<height;j++) for(int i=0;i<width;i++) {
+        int px=t.ox+dx+i,py=t.oy+dy+j;if(!rect_contains(t.clip,px,py)) continue;
+        uint32_t c=pixels[j*stride+i],alpha=c>>24,*dest=&t.s->px[py*t.s->stride+px];
+        if(!copy && alpha<255) {uint32_t mixed=0;for(int sh=0;sh<24;sh+=8) mixed|=((((c>>sh)&255)*alpha+((*dest>>sh)&255)*(255-alpha))/255)<<sh;c=mixed;}
+        if(target_mono(&t)) c=mono_of(c);*dest=c&0xFFFFFF;
+    }
+    drawn(&t,r);return 0;
+}

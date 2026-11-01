@@ -193,105 +193,80 @@ void str_lower(char *s)
 }
 
 /* ---- paths ----
- * Drive C: is the fluxOS root, A: and B: the floppies and D: the CD-ROM,
- * as the DOS layer has them; any other letter is /mnt/<letter>. */
-
-static const char *drive_root(char letter, char *buf)
+ * C: is a Wine-style prefix rooted at /winapps. Z: exposes the Unix root
+ * for native launches and file dialogs; removable drives retain their mappings.
+ * Dot components are normalized within a drive, never above its mount root.
+ */
+static const char *drive_root(char letter,char *buf)
 {
-    switch (letter) {
-    case 'C': return "";
+    switch(letter) {
+    case 'C': return "/winapps";
+    case 'Z': return "";
     case 'A': return "/mnt/fd0";
     case 'B': return "/mnt/fd1";
     case 'D': return "/mnt/cdrom";
-    default:
-        sprintf(buf, "/mnt/%c", letter);
-        return buf;
+    default: snprintf(buf,16,"/mnt/%c",letter);return buf;
     }
 }
-
-int path_to_host(const char *win, char *out)
+static int under_root(const char *path,const char *root)
 {
-    char dbuf[16];
-    char tmp[PATH_MAX];
-    int n = 0;
-    const char *p = win;
-    if (!strncmp(p, "\\\\?\\", 4) || !strncmp(p, "\\\\.\\", 4))
-        p += 4;
-    if (p[0] && p[1] == ':') {
-        char letter = (char)(p[0] & ~0x20);
-        if (letter < 'A' || letter > 'Z')
-            return -1;
-        n = snprintf(tmp, sizeof(tmp), "%s", drive_root(letter, dbuf));
-        p += 2;
-        if (*p != '\\' && *p != '/') {
-            /* "C:foo": relative to the drive's current directory (ours) */
-            char cwd[PATH_MAX];
-            if (letter == 'C' && getcwd(cwd, sizeof(cwd)))
-                n = snprintf(tmp, sizeof(tmp), "%s", cwd);
-            if (n > 0 && tmp[n - 1] != '/' && n < (int)sizeof(tmp) - 1)
-                tmp[n++] = '/';
-        }
+    size_t n=strlen(root);return !strncmp(path,root,n) && (!path[n] || path[n]=='/');
+}
+int path_to_host(const char *win,char *out)
+{
+    if(!win || strlen(win)>=PATH_MAX-16) return -1;
+    const char *p=win;char drive='C',rootbuf[16],cwd[PATH_MAX],relative[PATH_MAX],tmp[PATH_MAX];
+    if(!strncmp(p,"\\\\?\\",4) || !strncmp(p,"\\\\.\\",4)) p+=4;
+    int explicit_drive=p[0] && p[1]==':';
+    if(explicit_drive) {drive=p[0]&~0x20;if(drive<'A' || drive>'Z') return -1;p+=2;}
+    if(!getcwd(cwd,sizeof(cwd))) strcpy(cwd,"/winapps");
+    if(!explicit_drive) {
+        char current[MAX_PATH];path_to_win(cwd,current,sizeof(current));drive=current[0];
     }
-    for (; *p && n < (int)sizeof(tmp) - 1; p++) {
-        char c = *p == '\\' ? '/' : *p;
-        if (c == '/' && n > 0 && tmp[n - 1] == '/')
-            continue;
-        tmp[n++] = c;
+    const char *root=drive_root(drive,rootbuf);relative[0]=0;
+    if(*p!='\\' && *p!='/') {
+        if((!root[0] && drive=='Z') || under_root(cwd,root))
+            snprintf(relative,sizeof(relative),"%s",cwd+strlen(root));
     }
-    tmp[n] = 0;
-    if (!n)
-        strcpy(tmp, "/");
-    /* . and .. */
-    char *parts[128];
-    int np = 0;
-    int absolute = tmp[0] == '/';
-    for (char *s = strtok(tmp, "/"); s; s = strtok(NULL, "/")) {
-        if (!strcmp(s, "."))
-            continue;
-        if (!strcmp(s, "..")) {
-            if (np > 0)
-                np--;
-            continue;
-        }
-        if (np < 128)
-            parts[np++] = s;
+    int n=snprintf(tmp,sizeof(tmp),"%s/%s",relative,p);
+    if(n<0 || n>=(int)sizeof(tmp)) return -1;
+    for(char *q=tmp;*q;q++) if(*q=='\\') *q='/';
+    char *parts[PATH_MAX/2];int count=0;
+    for(char *q=tmp;*q;) {
+        while(*q=='/') q++;
+        if(!*q) break;
+        char *part=q;while(*q && *q!='/') q++;if(*q) *q++=0;
+        if(!strcmp(part,".")) continue;
+        if(!strcmp(part,"..")) {if(count) count--;continue;}
+        parts[count++]=part;
     }
-    n = 0;
-    out[0] = 0;
-    for (int i = 0; i < np; i++)
-        n += snprintf(out + n, (size_t)(PATH_MAX - n), "%s%s", absolute || i ? "/" : "", parts[i]);
-    if (!n)
-        strcpy(out, absolute ? "/" : ".");
-    /* a trailing separator on a directory is fine either way */
+    n=snprintf(out,PATH_MAX,"%s",root);
+    for(int i=0;i<count;i++) {
+        int add=snprintf(out+n,PATH_MAX-n,"/%s",parts[i]);
+        if(add<0 || add>=PATH_MAX-n) return -1;
+        n+=add;
+    }
+    if(!n) strcpy(out,"/");
     return 0;
 }
-
-void path_to_win(const char *host, char *out, size_t size)
+void path_to_win(const char *host,char *out,size_t size)
 {
-    char abs[PATH_MAX];
-    if (host[0] != '/') {
-        char cwd[PATH_MAX];
-        if (getcwd(cwd, sizeof(cwd)) && strcmp(host, "."))
-            snprintf(abs, sizeof(abs), "%s%s%s", cwd, !strcmp(cwd, "/") ? "" : "/", host);
-        else if (getcwd(cwd, sizeof(cwd)))
-            snprintf(abs, sizeof(abs), "%s", cwd);
-        else
-            snprintf(abs, sizeof(abs), "/%s", host);
-        host = abs;
+    if(!size) return;
+    char absolute[PATH_MAX];
+    if(host[0]!='/') {
+        char cwd[PATH_MAX];if(!getcwd(cwd,sizeof(cwd))) strcpy(cwd,"/winapps");
+        snprintf(absolute,sizeof(absolute),"%s/%s",cwd,host);host=absolute;
     }
-    const char *rest = host;
-    const char *drive = "C:";
-    if (!strncmp(host, "/mnt/fd0", 8) && (host[8] == '/' || !host[8])) { drive = "A:"; rest = host + 8; }
-    else if (!strncmp(host, "/mnt/fd1", 8) && (host[8] == '/' || !host[8])) { drive = "B:"; rest = host + 8; }
-    else if (!strncmp(host, "/mnt/cdrom", 10) && (host[10] == '/' || !host[10])) { drive = "D:"; rest = host + 10; }
-    size_t n = (size_t)snprintf(out, size, "%s", drive);
-    if (!*rest && n < size - 1) {
-        out[n++] = '\\';
-        out[n] = 0;
+    const char *rest=host,*drive="Z:";
+    if(under_root(host,"/winapps")) {drive="C:";rest=host+8;}
+    else if(under_root(host,"/mnt/fd0")) {drive="A:";rest=host+8;}
+    else if(under_root(host,"/mnt/fd1")) {drive="B:";rest=host+8;}
+    else if(under_root(host,"/mnt/cdrom")) {drive="D:";rest=host+10;}
+    else if(!strncmp(host,"/mnt/",5) && host[5]>='A' && host[5]<='Y' && (!host[6] || host[6]=='/')) {
+        char name[3]={host[5],':',0};snprintf(out,size,"%s%s",name,host+6);for(char *p=out;*p;p++) if(*p=='/') *p='\\';return;
     }
-    for (; *rest && n < size - 1; rest++)
-        out[n++] = *rest == '/' ? '\\' : *rest;
-    out[n] = 0;
+    snprintf(out,size,"%s%s%s",drive,*rest ? "":"\\",rest);
+    for(char *p=out;*p;p++) if(*p=='/') *p='\\';
 }
 
 /* The exact spelling of path's components, if the exact one is not there

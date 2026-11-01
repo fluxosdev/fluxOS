@@ -25,6 +25,7 @@ void gui_move(uint32_t id, int x, int y);
 void gui_title(uint32_t id, const char *title);
 void gui_cursor(uint32_t id, int kind);     /* enum cursor_kind */
 void gui_focus(uint32_t id);
+void gui_drop_reply(uint32_t id,uint32_t serial,int effect);
 void gui_clip_set(const char *text);
 char *gui_clip_get(void);
 void gui_icon(uint32_t id, const uint32_t *pixels);
@@ -52,6 +53,7 @@ void win_clip_restore(struct clip_save *saved, struct surface *s);
 void user32_flush_damage(void);
 /* The desktop went or the program is ending: let go of every desktop window. */
 void user32_drop_windows(void);
+void user32_thread_exit(uint32_t tid);
 /* The class background brush of a window (for WM_ERASEBKGND). */
 HBRUSH win_class_brush(HWND hwnd);
 /* A key or the mouse, as it is read from the desktop (before it becomes a message). */
@@ -66,6 +68,10 @@ void gdi_set_clip(HDC dc, const RECT *r);
 int gdi_fill_rect(HDC dc, const RECT *r, HBRUSH br);
 /* Forget the window: its DCs draw nothing from now on. */
 void gdi_window_gone(HWND hwnd);
+int gdi_dc_valid(HDC h);
+int gdi_dc_size(HDC h,int *width,int *height);
+int gdi_bitmap_copy(HBITMAP h,struct image *out);
+int gdi_argb_blit(HDC h,int x,int y,int width,int height,const uint32_t *pixels,int stride,int copy);
 /* COLORREF (0x00BBGGRR) and the desktop's 0xRRGGBB. */
 static inline color_t colorref_rgb(COLORREF c)
 {

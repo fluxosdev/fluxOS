@@ -13,6 +13,7 @@ struct proc *current;
 uint32_t *kernel_pd;
 void panic(const char *fmt, ...) { fprintf(stderr, "panic: %s\n", fmt); abort(); }
 void fpu_switch(struct proc *prev, struct proc *next) { (void)prev; (void)next; abort(); }
+void gdt_set_win_teb(uint32_t base) { (void)base; abort(); }
 void gdt_set_tls(uint32_t base) { (void)base; abort(); }
 void tss_set_kernel_stack(uint32_t esp) { (void)esp; abort(); }
 void vmm_switch(uint32_t *pd) { (void)pd; abort(); }

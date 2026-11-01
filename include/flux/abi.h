@@ -355,7 +355,8 @@ struct flux_shmid_ds {
  * data segments whose base is the start of user space, so its address 0
  * is linear WIN_SEG_BASE and its 2 GiB lie over the user half. Its FS
  * segment is the thread block, which the loader maps at WIN_TEB_LINEAR.
- * The descriptors are constant and in every address space (gdt.c). */
+ * The code/data descriptors are constant. SYS_set_win_teb selects a
+ * per-thread FS base; the scheduler updates each CPU's descriptor. */
 #define WIN_SEG_BASE   0x40000000u
 #define WIN_SEG_LIMIT  0x80000000u
 #define WIN_TEB_LINEAR 0xAFFF0000u

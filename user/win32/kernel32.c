@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "win32.h"
+#include "threads.h"
 #include "os.h"
 
 #define A(i) (a[i])
@@ -196,9 +197,9 @@ DEF(GetCurrentThread) { (void)a; return PSEUDO_THREAD; }
 DEF(GetCurrentProcessId) { (void)a; return teb->process_id; }
 DEF(GetCurrentThreadId) { (void)a; return teb->thread_id; }
 DEF(GetProcessId) { (void)a; return teb->process_id; }
-DEF(GetThreadId) { (void)a; return teb->thread_id; }
+DEF(GetThreadId) { return win_thread_id(A(0)); }
 DEF(ExitProcess) { process_exit(A(0)); }
-DEF(ExitThread) { process_exit(A(0)); }
+DEF(ExitThread) { win_thread_exit(A(0)); }
 DEF(TerminateProcess)
 {
     struct hobj *o = handle_get_type(A(0), H_PROCESS);
@@ -209,7 +210,7 @@ DEF(TerminateProcess)
     os_kill(o->pid);
     return 1;
 }
-DEF(TerminateThread) { (void)a; return 1; }
+DEF(TerminateThread) { (void)a; FAIL(ERROR_NOT_SUPPORTED); }
 DEF(GetExitCodeProcess)
 {
     struct hobj *o = handle_get_type(A(0), H_PROCESS);
@@ -225,7 +226,7 @@ DEF(GetExitCodeProcess)
     *(uint32_t *)P(1) = o->exited ? o->exit_code : STILL_ACTIVE;
     return 1;
 }
-DEF(GetExitCodeThread) { *(uint32_t *)P(1) = STILL_ACTIVE; return 1; }
+DEF(GetExitCodeThread) { uint32_t code;if(!win_thread_status(A(0),&code)) FAIL(ERROR_INVALID_HANDLE);*(uint32_t *)P(1)=code;return 1; }
 DEF(GetProcessVersion) { (void)a; return 0x00050001; }
 DEF(GetPriorityClass) { (void)a; return 0x20; }
 DEF(SetPriorityClass) { (void)a; return 1; }
@@ -276,7 +277,7 @@ DEF(GetCommandLineW) { (void)a; return cmdline_w_gp; }
 
 /* Run another program. The command line is split as Windows does; a
  * Windows program is run through winrun, anything else as it is. */
-static int split_cmdline(const char *cmd, char **argv, int max, char *buf, size_t bufsize)
+int win_split_command_line(const char *cmd, char **argv, int max, char *buf, size_t bufsize)
 {
     int argc = 0;
     size_t o = 0;
@@ -355,7 +356,7 @@ static int spawn_program(const char *app, const char *cmd, const char *dir, HAND
 {
     char buf[4096];
     char *argv[128];
-    int argc = split_cmdline(cmd ? cmd : "", argv, 128, buf, sizeof(buf));
+    int argc = win_split_command_line(cmd ? cmd : "", argv, 128, buf, sizeof(buf));
     char exe[PATH_MAX];
     const char *prog = app ? app : argc ? argv[0] : NULL;
     if (!prog || find_executable(prog, exe) < 0)
@@ -450,13 +451,13 @@ DEF(OpenProcess)
 }
 DEF(CreateThread)
 {
-    (void)a;
-    api_unimplemented("CreateThread (threads)");
-    FAIL(ERROR_NOT_SUPPORTED);
+    HANDLE h=win_thread_create(A(1),A(2),A(3),A(4),A(5));
+    if(!h) FAIL(ERROR_NOT_ENOUGH_MEMORY);
+    return h;
 }
-DEF(CreateRemoteThread) { return api_CreateThread(a); }
-DEF(ResumeThread) { (void)a; return 0; }
-DEF(SuspendThread) { (void)a; return 0; }
+DEF(CreateRemoteThread) { (void)a;FAIL(ERROR_NOT_SUPPORTED); }
+DEF(ResumeThread) { return win_thread_resume(A(0)); }
+DEF(SuspendThread) { (void)a;SETERR(ERROR_NOT_SUPPORTED);return (uint32_t)-1; }
 DEF(OpenThread) { (void)a; FAIL(ERROR_INVALID_PARAMETER); }
 DEF(GetThreadContext) { (void)a; FAIL(ERROR_NOT_SUPPORTED); }
 DEF(SetThreadContext) { (void)a; FAIL(ERROR_NOT_SUPPORTED); }
@@ -933,10 +934,9 @@ DEF(Sleep)
             gui_wait_ms(left);
         return 0;
     }
-    if (ms == INFINITE)
-        for (;;) usleep(1000000);
-    if (ms)
-        usleep(ms * 1000);
+    if(ms==INFINITE) for(;;) thread_wait_ms(-1);
+    uint32_t begin=os_ticks_ms();
+    do {thread_wait_ms(ms ? (int)(ms-(os_ticks_ms()-begin)):1);} while(ms && os_ticks_ms()-begin<ms);
     return 0;
 }
 DEF(SleepEx) { api_Sleep(a); return 0; }
@@ -1257,17 +1257,14 @@ DEF(LocalCompact) { (void)a; return 0x100000; }
 
 /* ---- interlocked ---- */
 
-DEF(InterlockedIncrement) { uint32_t *p = P(0); return ++*p; }
-DEF(InterlockedDecrement) { uint32_t *p = P(0); return --*p; }
-DEF(InterlockedExchange) { uint32_t *p = P(0); uint32_t o = *p; *p = A(1); return o; }
-DEF(InterlockedExchangeAdd) { uint32_t *p = P(0); uint32_t o = *p; *p += A(1); return o; }
+DEF(InterlockedIncrement) { uint32_t *p = P(0); return __atomic_add_fetch(p,1,__ATOMIC_SEQ_CST); }
+DEF(InterlockedDecrement) { uint32_t *p = P(0); return __atomic_sub_fetch(p,1,__ATOMIC_SEQ_CST); }
+DEF(InterlockedExchange) { uint32_t *p = P(0); return __atomic_exchange_n(p,A(1),__ATOMIC_SEQ_CST); }
+DEF(InterlockedExchangeAdd) { uint32_t *p = P(0); return __atomic_fetch_add(p,A(1),__ATOMIC_SEQ_CST); }
 DEF(InterlockedCompareExchange)
 {
     uint32_t *p = P(0);
-    uint32_t o = *p;
-    if (o == A(2))
-        *p = A(1);
-    return o;
+    uint32_t expected=A(2);__atomic_compare_exchange_n(p,&expected,A(1),0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST);return expected;
 }
 DEF(InterlockedCompareExchange64)
 {
@@ -1309,22 +1306,20 @@ DEF(SetCriticalSectionSpinCount) { (void)a; return 0; }
 DEF(DeleteCriticalSection) { uint32_t *cs = P(0); memset(cs, 0, 24); return 0; }
 DEF(EnterCriticalSection)
 {
-    uint32_t *cs = P(0);
-    cs[1]++;
-    cs[2]++;
-    cs[3] = teb->thread_id;
-    return 0;
+    uint32_t *cs=P(0),id=teb->thread_id;
+    while(cs[3] && cs[3]!=id) thread_wait_ms(-1);
+    cs[3]=id;cs[2]++;cs[1]=cs[2]-1;return 0;
 }
-DEF(TryEnterCriticalSection) { api_EnterCriticalSection(a); return 1; }
+DEF(TryEnterCriticalSection)
+{
+    uint32_t *cs=P(0);if(cs[3] && cs[3]!=teb->thread_id) return 0;
+    api_EnterCriticalSection(a);return 1;
+}
 DEF(LeaveCriticalSection)
 {
-    uint32_t *cs = P(0);
-    cs[1]--;
-    if (cs[2])
-        cs[2]--;
-    if (!cs[2])
-        cs[3] = 0;
-    return 0;
+    uint32_t *cs=P(0);if(cs[3]!=teb->thread_id || !cs[2]) return 0;
+    cs[2]--;cs[1]=cs[2]-1;
+    if(!cs[2]) {cs[3]=0;thread_notify();}return 0;
 }
 DEF(InitializeSRWLock) { *(uint32_t *)P(0) = 0; return 0; }
 DEF(AcquireSRWLockExclusive) { (void)a; return 0; }
@@ -1363,9 +1358,10 @@ DEF(InitOnceComplete) { uint32_t *once = P(0); *once |= 2; return 1; }
 
 static HANDLE new_sync(enum htype t, int manual, int initial, int max, const char *name)
 {
-    (void)name;
+    if(t==H_SEMAPHORE && (initial<0 || max<=0 || initial>max)) {SETERR(ERROR_INVALID_PARAMETER);return 0;}
     HANDLE h = handle_new(t);
     struct hobj *o = handle_get(h);
+    if(!o) {SETERR(ERROR_NOT_ENOUGH_MEMORY);return 0;}
     o->manual = manual;
     o->signaled = initial;
     o->count = initial;
@@ -1404,7 +1400,7 @@ DEF(CreateEventExA) { uint32_t b[4] = { A(0), (A(2) & 1) != 0, (A(2) & 2) != 0, 
 DEF(CreateEventExW) { uint32_t b[4] = { A(0), (A(2) & 1) != 0, (A(2) & 2) != 0, A(1) }; return api_CreateEventW(b); }
 DEF(OpenEventA) { HANDLE h; if (find_named(H_EVENT, S(2), &h)) return h; FAIL(ERROR_FILE_NOT_FOUND); }
 DEF(OpenEventW) { HANDLE h; if (find_named(H_EVENT, wtmp(A(2)), &h)) return h; FAIL(ERROR_FILE_NOT_FOUND); }
-DEF(SetEvent) { struct hobj *o = handle_get_type(A(0), H_EVENT); if (!o) FAIL(ERROR_INVALID_HANDLE); o->signaled = 1; return 1; }
+DEF(SetEvent) { struct hobj *o = handle_get_type(A(0), H_EVENT); if (!o) FAIL(ERROR_INVALID_HANDLE); o->signaled = 1; thread_notify(); return 1; }
 DEF(ResetEvent) { struct hobj *o = handle_get_type(A(0), H_EVENT); if (!o) FAIL(ERROR_INVALID_HANDLE); o->signaled = 0; return 1; }
 DEF(PulseEvent) { struct hobj *o = handle_get_type(A(0), H_EVENT); if (!o) FAIL(ERROR_INVALID_HANDLE); o->signaled = 0; return 1; }
 DEF(CreateMutexA)
@@ -1415,14 +1411,16 @@ DEF(CreateMutexA)
         return h;
     }
     SETERR(0);
-    return new_sync(H_MUTEX, 0, 0, 0, S(2));
+    h=new_sync(H_MUTEX,0,0,0,S(2));
+    if(h && A(1)) {struct hobj *o=handle_get(h);o->thread_id=teb->thread_id;o->count=1;}
+    return h;
 }
 DEF(CreateMutexW) { uint32_t b[3] = { A(0), A(1), 0 }; gp_t n = A(2) ? gstrdup(wtmp(A(2))) : 0; b[2] = n; uint32_t r = api_CreateMutexA(b); if (n) gfree(n); return r; }
 DEF(CreateMutexExA) { uint32_t b[3] = { A(0), (A(2) & 1) != 0, A(1) }; return api_CreateMutexA(b); }
 DEF(CreateMutexExW) { uint32_t b[3] = { A(0), (A(2) & 1) != 0, A(1) }; return api_CreateMutexW(b); }
 DEF(OpenMutexA) { HANDLE h; if (find_named(H_MUTEX, S(2), &h)) return h; FAIL(ERROR_FILE_NOT_FOUND); }
 DEF(OpenMutexW) { HANDLE h; if (find_named(H_MUTEX, wtmp(A(2)), &h)) return h; FAIL(ERROR_FILE_NOT_FOUND); }
-DEF(ReleaseMutex) { struct hobj *o = handle_get_type(A(0), H_MUTEX); if (!o) FAIL(ERROR_INVALID_HANDLE); if (o->count) o->count--; return 1; }
+DEF(ReleaseMutex) {struct hobj *o=handle_get_type(A(0),H_MUTEX);if(!o) FAIL(ERROR_INVALID_HANDLE);if(o->thread_id!=teb->thread_id || !o->count) FAIL(288);if(!--o->count) {o->thread_id=0;thread_notify();}return 1;}
 DEF(CreateSemaphoreA) { return new_sync(H_SEMAPHORE, 0, (int)A(1), (int)A(2), S(3)); }
 DEF(CreateSemaphoreW) { return new_sync(H_SEMAPHORE, 0, (int)A(1), (int)A(2), A(3) ? wtmp(A(3)) : NULL); }
 DEF(CreateSemaphoreExA) { return new_sync(H_SEMAPHORE, 0, (int)A(1), (int)A(2), S(3)); }
@@ -1433,107 +1431,69 @@ DEF(ReleaseSemaphore)
     if (!o)
         FAIL(ERROR_INVALID_HANDLE);
     if (A(2)) *(uint32_t *)P(2) = (uint32_t)o->count;
-    o->count += (int)A(1);
+    if(!A(1) || A(1)>(uint32_t)(o->max-o->count)) FAIL(298);
+    o->count += (int)A(1);thread_notify();
     return 1;
 }
 DEF(CreateWaitableTimerA) { return new_sync(H_TIMER, (int)A(1), 0, 0, S(2)); }
 DEF(CreateWaitableTimerW) { return new_sync(H_TIMER, (int)A(1), 0, 0, NULL); }
-DEF(SetWaitableTimer) { struct hobj *o = handle_get_type(A(0), H_TIMER); if (!o) FAIL(ERROR_INVALID_HANDLE); o->signaled = 1; return 1; }
+DEF(SetWaitableTimer) { struct hobj *o = handle_get_type(A(0), H_TIMER); if (!o) FAIL(ERROR_INVALID_HANDLE); o->signaled = 1; thread_notify(); return 1; }
 DEF(CancelWaitableTimer) { (void)a; return 1; }
 
-/* With one thread, a wait either passes at once or would last for ever:
- * processes are waited for; an event nobody can set times out. */
-static uint32_t wait_one(HANDLE h, uint32_t timeout)
+static uint32_t ready_one(HANDLE h,int consume)
 {
-    if (h == PSEUDO_PROCESS || h == PSEUDO_THREAD)
-        return timeout == INFINITE ? WAIT_TIMEOUT : WAIT_TIMEOUT;
-    struct hobj *o = handle_get(h);
-    if (!o) {
-        SETERR(ERROR_INVALID_HANDLE);
-        return WAIT_FAILED;
-    }
-    switch (o->type) {
-    case H_PROCESS: {
-        int code;
-        if (o->exited)
-            return WAIT_OBJECT_0;
-        if (os_wait(o->pid, &code, timeout != 0)) {
-            o->exited = 1;
-            o->exit_code = (uint32_t)code;
-            return WAIT_OBJECT_0;
-        }
-        return WAIT_TIMEOUT;
-    }
-    case H_EVENT:
-        if (o->signaled) {
-            if (!o->manual)
-                o->signaled = 0;
-            return WAIT_OBJECT_0;
-        }
-        if (timeout && timeout != INFINITE)
-            api_Sleep(&timeout);
-        return WAIT_TIMEOUT;
+    if(h==PSEUDO_PROCESS || h==PSEUDO_THREAD) return WAIT_TIMEOUT;
+    struct hobj *o=handle_get(h);if(!o) {SETERR(ERROR_INVALID_HANDLE);return WAIT_FAILED;}
+    switch(o->type) {
+    case H_EVENT: if(!o->signaled) return WAIT_TIMEOUT;if(consume && !o->manual) o->signaled=0;return WAIT_OBJECT_0;
     case H_MUTEX:
-        o->count++;
-        return WAIT_OBJECT_0;
-    case H_SEMAPHORE:
-        if (o->count > 0) {
-            o->count--;
-            return WAIT_OBJECT_0;
+        if(o->count && o->thread_id!=teb->thread_id) return WAIT_TIMEOUT;
+        if(consume) {o->count++;o->thread_id=teb->thread_id;}return WAIT_OBJECT_0;
+    case H_SEMAPHORE: if(o->count<=0) return WAIT_TIMEOUT;if(consume) o->count--;return WAIT_OBJECT_0;
+    case H_TIMER: return o->signaled ? WAIT_OBJECT_0:WAIT_TIMEOUT;
+    case H_THREAD: {int done=win_thread_signaled(h);return done<0 ? WAIT_FAILED:done ? WAIT_OBJECT_0:WAIT_TIMEOUT;}
+    case H_PROCESS: {
+        int code;if(!o->exited && os_wait(o->pid,&code,0)) {o->exited=1;o->exit_code=code;}
+        return o->exited ? WAIT_OBJECT_0:WAIT_TIMEOUT;
+    }
+    case H_FILE: case H_PIPE_R: case H_CONSOLE_IN: return os_readable(o->fd,0) ? WAIT_OBJECT_0:WAIT_TIMEOUT;
+    default: return WAIT_OBJECT_0;
+    }
+}
+static uint32_t wait_handles(uint32_t n,const HANDLE *handles,int all,uint32_t timeout)
+{
+    if(!n || n>64) {SETERR(ERROR_INVALID_PARAMETER);return WAIT_FAILED;}
+    HANDLE hs[64];memcpy(hs,handles,n*sizeof(*hs));
+    for(uint32_t i=0;i<n;i++) for(uint32_t j=0;j<i;j++) if(hs[i]==hs[j]) {SETERR(ERROR_INVALID_PARAMETER);return WAIT_FAILED;}
+    uint32_t begin=os_ticks_ms();crt_flush_all();
+    for(;;) {
+        int complete=1;
+        for(uint32_t i=0;i<n;i++) {
+            uint32_t r=ready_one(hs[i],0);if(r==WAIT_FAILED) return r;
+            if(!all && r==WAIT_OBJECT_0) {ready_one(hs[i],1);return WAIT_OBJECT_0+i;}
+            if(r!=WAIT_OBJECT_0) complete=0;
         }
-        return WAIT_TIMEOUT;
-    case H_TIMER:
-        return o->signaled ? WAIT_OBJECT_0 : WAIT_TIMEOUT;
-    case H_THREAD:
-        return WAIT_OBJECT_0;
-    case H_FILE: case H_PIPE_R: case H_CONSOLE_IN:
-        return os_readable(o->fd, timeout == INFINITE ? -1 : (int)timeout) ? WAIT_OBJECT_0 : WAIT_TIMEOUT;
-    default:
-        return WAIT_OBJECT_0;
+        if(all && complete) {for(uint32_t i=0;i<n;i++) ready_one(hs[i],1);return WAIT_OBJECT_0;}
+        uint32_t spent=os_ticks_ms()-begin;if(timeout!=INFINITE && spent>=timeout) return WAIT_TIMEOUT;
+        /* Processes/files can change without a USER32 notification, so also check every 10 ms. */
+        int delay=timeout==INFINITE ? 10:(timeout-spent>10 ? 10:(int)(timeout-spent));
+        thread_wait_ms(delay);
     }
 }
-DEF(WaitForSingleObject)
-{
-    crt_flush_all();
-    uint32_t r = wait_one(A(0), A(1));
-    if (r == WAIT_TIMEOUT && A(1) == INFINITE) {
-        struct hobj *o = handle_get(A(0));
-        wlog("WaitForSingleObject: waiting for ever on a%s that nothing can signal",
-             o && o->type == H_EVENT ? "n event" : " handle");
-    }
-    return r;
-}
-DEF(WaitForSingleObjectEx) { return api_WaitForSingleObject(a); }
-DEF(WaitForMultipleObjects)
-{
-    uint32_t n = A(0), timeout = A(3);
-    const uint32_t *hs = P(1);
-    int all = A(2) != 0;
-    crt_flush_all();
-    if (!n || n > 64)
-        FAIL(ERROR_INVALID_PARAMETER);
-    uint32_t last = WAIT_TIMEOUT;
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t r = wait_one(hs[i], all ? timeout : 0);
-        if (r == WAIT_FAILED)
-            return r;
-        if (!all && r == WAIT_OBJECT_0)
-            return WAIT_OBJECT_0 + i;
-        if (all && r != WAIT_OBJECT_0)
-            last = r;
-    }
-    if (all)
-        return last == WAIT_TIMEOUT ? WAIT_TIMEOUT : WAIT_OBJECT_0;
-    if (timeout && timeout != INFINITE) {
-        api_Sleep(&timeout);
-        for (uint32_t i = 0; i < n; i++)
-            if (wait_one(hs[i], 0) == WAIT_OBJECT_0)
-                return WAIT_OBJECT_0 + i;
-    }
-    return WAIT_TIMEOUT;
-}
+DEF(WaitForSingleObject) {HANDLE h=A(0);return wait_handles(1,&h,0,A(1));}
+DEF(WaitForSingleObjectEx) {return api_WaitForSingleObject(a);}
+DEF(WaitForMultipleObjects) {return wait_handles(A(0),P(1),A(2)!=0,A(3));}
 DEF(WaitForMultipleObjectsEx) { return api_WaitForMultipleObjects(a); }
-DEF(SignalObjectAndWait) { api_SetEvent(a); uint32_t b[2] = { A(1), A(2) }; return api_WaitForSingleObject(b); }
+DEF(SignalObjectAndWait)
+{
+    struct hobj *o=handle_get(A(0));if(!o) {SETERR(ERROR_INVALID_HANDLE);return WAIT_FAILED;}
+    uint32_t ok=0;
+    if(o->type==H_EVENT) ok=api_SetEvent(a);
+    else if(o->type==H_MUTEX) ok=api_ReleaseMutex(a);
+    else if(o->type==H_SEMAPHORE) {uint32_t args[]={A(0),1,0};ok=api_ReleaseSemaphore(args);}
+    if(!ok) return WAIT_FAILED;
+    uint32_t args[]={A(1),A(2)};return api_WaitForSingleObject(args);
+}
 DEF(RegisterWaitForSingleObject) { (void)a; FAIL(ERROR_NOT_SUPPORTED); }
 DEF(UnregisterWait) { (void)a; return 1; }
 DEF(QueueUserAPC) { (void)a; return 0; }
@@ -1553,7 +1513,7 @@ DEF(TlsAlloc)
     for (int i = 0; i < 64; i++)
         if (!(tls_used & (1ull << i))) {
             tls_used |= 1ull << i;
-            teb->tls_slots[i] = 0;
+            win_tls_clear(i);
             return (uint32_t)i;
         }
     FAIL(ERROR_NO_MORE_ITEMS);
@@ -1689,7 +1649,7 @@ DEF(LoadLibraryW) { gp_t n = A(0) ? gstrdup(wtmp(A(0))) : 0; uint32_t b[1] = { n
 DEF(LoadLibraryExA) { return api_LoadLibraryA(a); }
 DEF(LoadLibraryExW) { return api_LoadLibraryW(a); }
 DEF(FreeLibrary) { struct module *m = module_by_base(A(0)); if (!m) FAIL(ERROR_INVALID_HANDLE); module_unload(m); return 1; }
-DEF(FreeLibraryAndExitThread) { api_FreeLibrary(a); process_exit(A(1)); }
+DEF(FreeLibraryAndExitThread) { api_FreeLibrary(a); win_thread_exit(A(1)); }
 DEF(DisableThreadLibraryCalls) { (void)a; return 1; }
 DEF(GetProcAddress)
 {
@@ -2031,11 +1991,25 @@ static int file_fd(HANDLE h, struct hobj **out)
     return o->fd;
 }
 
+static int blocking_read(int fd,void *buffer,uint32_t size)
+{
+    struct win_pause pause;thread_pause(&pause);
+    int result=(int)read(fd,buffer,size),error=errno;
+    thread_resume(&pause);errno=error;return result;
+}
+static int blocking_write(int fd,const void *buffer,uint32_t size)
+{
+    struct win_pause pause;thread_pause(&pause);
+    int result=(int)write(fd,buffer,size),error=errno;
+    thread_resume(&pause);errno=error;return result;
+}
+
 DEF(ReadFile)
 {
-    struct hobj *o;
+    struct hobj *o=NULL;
     int fd = file_fd(A(0), &o);
     uint32_t n = A(2);
+    enum htype type=o ? o->type:H_NONE;
     uint32_t *done = P(3);
     if (fd < 0 || !A(1))
         FAIL(ERROR_INVALID_HANDLE);
@@ -2043,7 +2017,9 @@ DEF(ReadFile)
         *done = 0;
     if (o->type == H_CONSOLE_IN || (o->fd == 0 && o->console)) {
         crt_flush_all();
-        int r = console_read(fd, P(1), n);
+        if(fd==0) console_raw(!(console_in_mode&2));
+        int r=blocking_read(fd,P(1),n);
+        if(r>0 && ((char *)P(1))[r-1]=='\n' && (console_in_mode&2) && (uint32_t)r<n) {((char *)P(1))[r-1]='\r';((char *)P(1))[r++]='\n';}
         if (r < 0)
             FAIL(ERROR_READ_FAULT);
         if (done)
@@ -2052,7 +2028,7 @@ DEF(ReadFile)
     }
     if (o->type == H_PIPE_W)
         FAIL(ERROR_ACCESS_DENIED);
-    int r = (int)read(fd, P(1), n);
+    int r = blocking_read(fd, P(1), n);
     if (r < 0) {
         if (errno == EPIPE)
             FAIL(ERROR_BROKEN_PIPE);
@@ -2060,7 +2036,7 @@ DEF(ReadFile)
     }
     if (done)
         *done = (uint32_t)r;
-    if (o->type == H_PIPE_R && r == 0)
+    if (type == H_PIPE_R && r == 0)
         FAIL(ERROR_BROKEN_PIPE);
     return 1;
 }
@@ -2082,9 +2058,10 @@ DEF(WriteFile)
     int r;
     if (o->console || o->type == H_CONSOLE_OUT) {
         crt_flush_all();
-        r = console_write(fd, P(1), n);
+        uint32_t total=0;r=0;
+        while(total<n) {int wrote=blocking_write(fd,(uint8_t *)P(1)+total,n-total);if(wrote<=0) {r=wrote;break;}total+=wrote;r=total;}
     } else {
-        r = (int)write(fd, P(1), n);
+        r = blocking_write(fd, P(1), n);
     }
     if (r < 0)
         FAIL(errno_to_win(errno));
@@ -2530,7 +2507,7 @@ DEF(GetDriveTypeA)
     }
     switch (l) {
     case 'A': case 'B': return 2;       /* DRIVE_REMOVABLE */
-    case 'C': return 3;                 /* DRIVE_FIXED */
+    case 'Z': case 'C': return 3;                 /* DRIVE_FIXED */
     case 'D': return 5;                 /* DRIVE_CDROM */
     default: {
         char host[PATH_MAX];
@@ -2544,7 +2521,7 @@ DEF(GetDriveTypeW) { gp_t n = A(0) ? gstrdup(wtmp(A(0))) : 0; uint32_t b[1] = { 
 DEF(GetLogicalDrives)
 {
     (void)a;
-    uint32_t mask = 1 << 2;             /* C: */
+    uint32_t mask = (1u << 2) | (1u << 25);             /* C: */
     const char *mounts[] = { "/mnt/fd0", "/mnt/fd1", NULL, "/mnt/cdrom" };
     struct statfs fs, root;
     statfs("/", &root);
@@ -2585,7 +2562,7 @@ DEF(GetLogicalDriveStringsW)
 DEF(GetDiskFreeSpaceA)
 {
     char host[PATH_MAX];
-    if (A(0)) path_to_host(S(0), host); else strcpy(host, "/");
+    if(path_to_host(A(0) ? S(0):"\\",host)<0) FAIL(ERROR_PATH_NOT_FOUND);
     struct statfs fs;
     if (statfs(host, &fs) < 0)
         FAIL(ERROR_PATH_NOT_FOUND);
@@ -2600,7 +2577,7 @@ DEF(GetDiskFreeSpaceW) { gp_t n = A(0) ? gstrdup(wtmp(A(0))) : 0; uint32_t b[5] 
 DEF(GetDiskFreeSpaceExA)
 {
     char host[PATH_MAX];
-    if (A(0)) path_to_host(S(0), host); else strcpy(host, "/");
+    if(path_to_host(A(0) ? S(0):"\\",host)<0) FAIL(ERROR_PATH_NOT_FOUND);
     struct statfs fs;
     if (statfs(host, &fs) < 0)
         FAIL(ERROR_PATH_NOT_FOUND);
@@ -2615,7 +2592,7 @@ DEF(GetDiskFreeSpaceExW) { gp_t n = A(0) ? gstrdup(wtmp(A(0))) : 0; uint32_t b[4
 DEF(GetVolumeInformationA)
 {
     char host[PATH_MAX];
-    if (A(0)) path_to_host(S(0), host); else strcpy(host, "/");
+    if(path_to_host(A(0) ? S(0):"\\",host)<0) FAIL(ERROR_PATH_NOT_FOUND);
     struct statfs fs;
     if (statfs(host, &fs) < 0)
         FAIL(ERROR_PATH_NOT_FOUND);

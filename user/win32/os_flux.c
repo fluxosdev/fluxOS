@@ -15,8 +15,18 @@
 #include <unistd.h>
 #include "win32.h"
 #include "os.h"
+#include "threads.h"
+#include <flux/syscall.h>
 
 void gate_load_fs(void);
+
+int os_set_win_teb(uint32_t linear)
+{
+    int result;
+    __asm__ volatile("int $0x80" : "=a"(result) : "0"(SYS_set_win_teb),"b"(linear) : "memory","cc");
+    if(result>=0) gate_load_fs();
+    return result;
+}
 
 void os_init(void)
 {
@@ -25,7 +35,7 @@ void os_init(void)
     gate_win_fs = SEG_WIN_FS;
     gate_flat_cs = 0x18 | 3;
     gate_flat_ds = 0x20 | 3;
-    gate_load_fs();
+    os_set_win_teb(WIN_TEB_LINEAR);
 }
 
 uint32_t os_loader_end(void)

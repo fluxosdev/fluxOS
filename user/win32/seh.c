@@ -157,7 +157,7 @@ void seh_fault(uint32_t code, gp_t fault_addr, int write, const struct guest_reg
         rec.params[0] = (uint32_t)write;
         rec.params[1] = fault_addr;
         /* a stack overflow: the fault is just below the stack */
-        if (fault_addr < guest_stack_limit && fault_addr + 0x10000 >= guest_stack_limit)
+        if (fault_addr < teb->stack_limit && fault_addr + 0x10000 >= teb->stack_limit)
             rec.code = EXCEPTION_STACK_OVERFLOW;
     }
     struct context ctx;
@@ -171,8 +171,8 @@ void seh_fault(uint32_t code, gp_t fault_addr, int write, const struct guest_reg
         wlog("fault: %s", msg);
     }
     uint32_t stack = (regs->esp - 0x400) & ~15u;
-    if (stack < guest_stack_limit + 0x1000 || stack > GUEST_TOP)
-        stack = guest_stack_base - 0x400;
+    if (stack < teb->stack_limit + 0x1000 || stack > GUEST_TOP)
+        stack = teb->stack_base - 0x400;
     if (dispatch(&rec, &ctx, stack + WIN_BASE)) {
         struct guest_regs r;
         context_to_regs(&ctx, &r);
@@ -185,8 +185,8 @@ void seh_fault(uint32_t code, gp_t fault_addr, int write, const struct guest_reg
 void seh_raise(struct exception_record *rec, struct context *ctx)
 {
     uint32_t stack = (ctx->esp - 0x400) & ~15u;
-    if (stack < guest_stack_limit + 0x1000 || stack > GUEST_TOP)
-        stack = guest_stack_base - 0x400;
+    if (stack < teb->stack_limit + 0x1000 || stack > GUEST_TOP)
+        stack = teb->stack_base - 0x400;
     if (dispatch(rec, ctx, stack + WIN_BASE)) {
         struct guest_regs r;
         context_to_regs(ctx, &r);

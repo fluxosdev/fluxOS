@@ -6,12 +6,8 @@
 
 #define EMPTY_DLL(var, nm) struct api_dll var = { nm, NULL, 0, NULL, { NULL }, { 0 }, NULL, NULL, 0 }
 
-EMPTY_DLL(advapi32_dll, "ADVAPI32.DLL");
-EMPTY_DLL(shell32_dll, "SHELL32.DLL");
-EMPTY_DLL(ole32_dll, "OLE32.DLL");
+
 EMPTY_DLL(oleaut32_dll, "OLEAUT32.DLL");
-EMPTY_DLL(comctl32_dll, "COMCTL32.DLL");
-EMPTY_DLL(comdlg32_dll, "COMDLG32.DLL");
 EMPTY_DLL(version_dll, "VERSION.DLL");
 EMPTY_DLL(winspool_dll, "WINSPOOL.DRV");
 EMPTY_DLL(ws2_32_dll, "WS2_32.DLL");

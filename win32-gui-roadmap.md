@@ -3,8 +3,9 @@
 *Written 2026-10-30, against commit 95a0cc4. Stages 0 and 1 are done (see
 their sections for where they differ from the plan). Stage 2 now has
 its basic controls, dialogs, menus, clipboard and resource icons; see its
-section for the tested workflow and remaining compatibility limits. The
-later stages are plans.*
+section for the tested workflow and remaining compatibility limits. Stage 3
+now has its basic threads, common controls, standard dialogs,
+shell integration and Windows prefix; stage 4 remains a plan.*
 
 `winrun` already runs 32-bit console Windows programs: a PE loader, the
 gate between the loader's flat segments and the program's segments, SEH,
@@ -336,7 +337,7 @@ tracking; scrollbar buttons do not repeat while held. Clipboard support
 is text only, with process-local open/close exclusion (the desktop
 protocol has no cross-process clipboard lock or delayed-rendering
 ownership). Fonts retain stage 0's glyph limitations. Common controls,
-file dialogs and real GUI threads remain stage 3 work.
+file dialogs and GUI threads are covered by stage 3 below.
 
 ## Stage 3: threads and the common libraries
 
@@ -361,6 +362,168 @@ use the common controls and the standard file dialogs.*
   (`DragAcceptFiles`, `WM_DROPFILES` from `S_DROP`).
 - advapi32: a registry kept in a file (`RegOpenKeyEx`, `RegQueryValueEx`,
   `RegSetValueEx`, ...), which many programs read at start.
+
+**Implemented (2026-11-01).** The basic stage-3 workflow now has a
+purpose-built compatibility test in QEMU. This does not imply that every
+Windows utility, installer or common-control style is supported.
+
+- `C:` now maps to `/winapps`, with `WINDOWS/SYSTEM32`, temporary,
+  user-profile and application directories supplied in the system image.
+  `Z:` exposes the fluxOS root, so a native launch such as
+  `winrun /home/flux/tool.exe` is represented as `Z:\home\flux\tool.exe`.
+  A launch outside the prefix starts with `C:\` as its Windows current
+  directory. Relative paths, drive-relative `C:foo`, rooted paths and
+  dot components are resolved within the selected drive; `C:\..` stays
+  inside `/winapps`. This is a drive mapping, not a security sandbox.
+  Folder/environment APIs use prefix paths rather than the native home.
+- The kernel provides `SYS_set_win_teb`. Each thread has a Windows FS
+  base switched in its CPU's GDT independently of libc's GS pthread TLS.
+  The legacy fixed TEB remains the default for the main thread.
+- `threads.c` runs guest entry points on pthreads with private TEBs,
+  guest/native stacks and static TLS data. `CreateThread`, suspended
+  startup/`ResumeThread`, returning from the entry point, `ExitThread`,
+  thread IDs, exit-code queries and thread-handle waits work. TLS slots,
+  last-error state, SEH stack bounds and API call frames are thread-local.
+  Completed native stacks are reaped by waits, handle closure or the next
+  thread creation; small thread records remain until process exit.
+- A recursive runtime lock serializes APIs and protects loader, handle,
+  USER32 and GDI tables while guest code can run concurrently. Blocking
+  waits preserve their gate state and release the lock. Events,
+  recursive mutexes, semaphores, critical sections and wait-all consumption
+  are implemented; `ReadFile`/`WriteFile` release the runtime during I/O.
+  USER32 queues accept cross-thread posts and synchronous sends dispatch
+  on the owning thread, including reciprocal sends while waiting. Thread
+  exit tears down its windows, timers and pending sends. Desktop polling
+  is bounded while threads exist so a local queue post can wake a GUI loop.
+- `advapi32.c` provides basic A/W key creation/open/close, typed value
+  queries/updates, deletion and key information. The registry is a tree of
+  encoded key directories and atomically replaced value files below
+  `/winapps/WINDOWS/registry`. String values are stored as UTF-16, names
+  are case-insensitive for ASCII, and independent processes can reopen
+  persisted values. It persists across boots when `/winapps` is on
+  persistent storage; an initrd-only root remains volatile like other files.
+- `shell32.c` supplies `SHGetFolderPath(A/W)` and
+  `SHGetSpecialFolderPath(A/W)` for the prefix's standard locations.
+- The GUI QEMU target now also runs `threads.exe` and `registry.exe`:
+  private FS/TLS and last-error state on two CPUs, suspended startup,
+  recursive critical sections/mutexes, event/semaphore wakeups, pipe I/O,
+  exit code 259 as a completed thread, atomic wait-all, desktop-free
+  thread messages, C/Z path round trips, actual `/winapps` writes and
+  registry persistence between two processes. The current system image
+  requires 512 MiB for this regression VM.
+
+- `comctl32.c` registers guest-callable builtin procedures for status bars,
+  toolbars, progress bars, trackbars, tabs, report/icon list views, tree
+  views, up-down controls and tooltips. Controls retain text, item data,
+  selection, ranges and image lists, paint with the desktop's colors and
+  send `WM_NOTIFY`, `WM_COMMAND` and scroll notifications to their parent.
+  Trees use stable item handles and preserve subtree order. Tooltip relay,
+  tracking and `TTF_SUBCLASS` mouse tracking use a nonactivating desktop
+  popup (`WF_NOACTIVATE`). Image lists own copies of bitmap/icon pixels,
+  support masks, overlays, duplication and resizing, and invalidate stale
+  handles after destruction.
+- `comdlg32.c` implements A/W open/save, color and font dialogs with the
+  existing themed USER32 controls and modal-loop owner handling. The
+  desktop has no reusable file-picker service, so these are composed
+  dialogs rather than the originally proposed `dialog.h` wrapper. File
+  dialogs list directories, apply the selected initial wildcard filter,
+  navigate up or by typed path, add default extensions, validate required
+  files/directories and confirm replacement. Cancellation preserves the
+  caller's output; insufficient output space reports `FNERR_BUFFERTOOSMALL`.
+  Hooks and per-thread `CommDlgExtendedError` are supported. Font choices
+  reflect the runtime's available mapped faces, not arbitrary installed
+  Windows fonts.
+- Shell execution maps portable PEs to winrun and native files, folders,
+  pictures, media, archives and URLs to fluxOS applications. The Ex APIs
+  can return a waitable process handle. Folder browsing returns an opaque
+  filesystem PIDL usable with `SHGetPathFromIDList`, `ILClone`/`ILFree` or
+  the COM task allocator. Browse callbacks can set the initial selection.
+  Desktop `S_DROP` packets become owned `HDROP` lists and `WM_DROPFILES`;
+  `DragQueryFile`, `DragQueryPoint` and `DragFinish` handle their lifetime.
+- `AttachThreadInput` joins input groups while keeping message queues
+  separate. Focus, active-window, capture and synchronous keyboard state
+  are local to a thread's input group; attaching/detaching clears keyboard
+  state and thread exit removes attachments. The physical foreground
+  window and asynchronous keyboard state still describe the desktop.
+  Registry key/value enumeration is also implemented; names enumerate in
+  their stored ASCII-folded spelling.
+- `tests/win32/phase3.c` extends `make test-win32-gui-qemu` with all nine
+  control classes, control messages and a real toolbar click, image-list
+  pixel/lifetime checks, input-state isolation and attachment, launching
+  and waiting for another PE, and a two-file desktop drop. The stand-in
+  desktop drives open/save/color/font/folder dialogs with real keyboard
+  input. Hook tests cover cancellation and a short output buffer; the
+  registry test checks enumeration from a second process. Earlier stage
+  regressions continue to run on two CPUs.
+
+**Compatibility limits:** common controls implement ordinary stored items
+and basic selection/input, not virtual/owner-data lists, callback text,
+custom drawing, sorting, every style/message, or accessibility. File dialogs
+currently select one file and expose the initially chosen filter; custom
+resource templates, Explorer hook notifications and a filter selector are
+not implemented. Color/font dialogs provide basic choices rather than the
+full Windows option set. Shell associations are built in; there is no COM
+shell namespace, shell extension loading, OLE drag-and-drop or registry-based
+association/verb resolution. PIDLs represent filesystem paths only. Registry
+notifications, security and Windows hive-file compatibility remain absent.
+Running-thread suspension, forced thread termination, SRW/condition-variable
+APIs, `_beginthread(ex)` and fully thread-aware CRT blocking I/O remain
+unsupported; legacy asynchronous fault handling needs a further concurrency
+audit. Named synchronization objects are currently process-local. These are
+compatibility limits beyond the basic workflow implemented here.
+
+## GDI+ compatibility work (2026-11-01)
+
+An initial builtin `GDIPLUS.DLL` now complements the basic stage-3 workflow.
+It is an image-focused implementation, not a complete GDI+ renderer and not
+confirmation that XP Paint runs.
+
+- Startup/shutdown, notification hooks and guest allocation; 87 named
+  exports, with known ordinals for startup and the early bitmap APIs.
+  Generation-tagged handles reject stale objects. Images use separate
+  mapped surfaces, while guest scan buffers and lock results remain in
+  guest memory. The API gateway now aligns native calls to 16 bytes even
+  when the Windows caller provides only four-byte stack alignment.
+- File and guest `IStream::Read` loading for BMP, PNG, JPEG, GIF and ICO.
+  Existing native codecs handle PNG/JPEG/GIF/ICO; a bounded BMP decoder
+  handles uncompressed 1/4/8/24/32-bit files. Stream data is decoded eagerly.
+  Codec enumeration advertises BMP/JPEG/PNG/GIF decoders and only the three
+  implemented encoders: BMP, JPEG and PNG. JPEG quality parameters and
+  encoder parameter enumeration are supported. PNG output uses lossless
+  stored DEFLATE blocks, favoring simplicity over compressed file size.
+- Bitmap creation from scan buffers, graphics, DIBs, HBITMAPs and HICONs;
+  conversion back to GDI objects; dimensions, pixel formats, raw formats,
+  in-memory DPI, pixels, cloning, rotation/flipping and thumbnails. Supported
+  scan/lock formats are 24-bit RGB, 32-bit RGB, ARGB and premultiplied ARGB.
+  External scan buffers remain shared; negative strides and caller-provided
+  lock buffers are checked. Locked images reject incompatible operations.
+- Drawing to bitmap graphics and HDCs shares GDI's clipping, DIB updates and
+  damage tracking. Image rectangles, nearest-neighbor scaling, alpha
+  source-over/source-copy, solid fills, clearing, positive axis scaling and
+  translation are implemented. HDC borrowing prevents drawing until the
+  DC is released. This subset defaults to nearest-neighbor interpolation;
+  requests for other interpolation modes return `NotImplemented`.
+- `tests/win32/gdiplus.c`, run by `make test-win32-gui-qemu`, checks startup
+  and notification callbacks, ordinal lookup, RGB/ARGB conversions, negative
+  strides and shared buffers, locks, cloning/rotation, alpha drawing to
+  bitmap and GDI targets, guest codec pointers, BMP/PNG/JPEG round trips,
+  JPEG quality validation, stream callbacks and stale handles. Earlier GUI
+  and thread regressions run alongside it on two CPUs.
+
+Still absent: TIFF, GIF/TIFF encoding, compressed/bitfield BMPs, indexed
+bitmap creation, multiframe animation, retained EXIF/property metadata,
+color management, stream saving, the vector/path/pen/text rendering APIs,
+image attributes, arbitrary affine transforms and advanced clipping or
+interpolation. DPI metadata is not preserved consistently by every codec.
+ICM entry points return `NotImplemented`. The full Windows image or codec
+behavior must not be inferred from the presence of this subset.
+
+The implementation is original fluxOS code using the existing graphics
+backend. ABI and behavior references consulted:
+[Microsoft's bitmap flat API](https://learn.microsoft.com/en-us/windows/win32/gdiplus/-gdiplus-bitmap-flat),
+[Wine's export definitions](https://github.com/wine-mirror/wine/blob/master/dlls/gdiplus/gdiplus.spec)
+and [Wine's image tests](https://github.com/wine-mirror/wine/blob/master/dlls/gdiplus/tests/image.c).
+No Wine or ReactOS implementation code was incorporated.
 
 ## Stage 4: OpenGL, sound and DirectDraw
 

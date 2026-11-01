@@ -360,14 +360,15 @@ int pe_setup_tls(struct module *m)
     uint32_t size = end > start ? end - start : 0;
     if (size > m->size || zero_fill > GUEST_TOP - m->size)     /* the block size cannot wrap */
         return -1;
-    if (next_tls_index >= 64)
+    if (m->tls_index<0 && next_tls_index >= 64)
         return -1;
-    int index = next_tls_index++;
+    int index = m->tls_index>=0 ? m->tls_index:next_tls_index++;
     m->tls_index = index;
     /* absolute addresses in the image, wherever it was loaded */
     if (index_at >= m->base && index_at - m->base <= m->size - 4)
         memcpy(GP(index_at), &index, 4);
-    gp_t block = vm_alloc_loader(size + zero_fill + 16);
+    gp_t block = vm_alloc(0,size+zero_fill+16,PAGE_READWRITE,MEM_PRIVATE,0);
+    if(!block) return -1;
     if (size && start >= m->base && start - m->base <= m->size - size)
         memcpy(GP(block), GP(start), size);
     uint32_t *array = GP(teb->tls_pointer);

@@ -254,6 +254,7 @@ static void sched_switch(void)
         return;
 
     fpu_switch(prev, next);
+    gdt_set_win_teb(next->win_teb);
     gdt_set_tls(next->tls);             /* %gs is loaded from it on the way back to user mode */
     if (next->kstack)
         tss_set_kernel_stack((uint32_t)next->kstack + KSTACK_SIZE);
@@ -641,6 +642,7 @@ int do_fork(void)
     child->leader->cwd = parent->leader->cwd;
     vfs_ref(child->leader->cwd);
     vfs_unlock();
+    child->win_teb = parent->win_teb;
     child->tls = parent->tls;                   /* the same thread block, in the copy */
     child->leader->sig_ignored = parent->leader->sig_ignored;
     child->sig_blocked = parent->sig_blocked;

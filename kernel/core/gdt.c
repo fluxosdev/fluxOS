@@ -5,10 +5,9 @@
  * to find the kernel stack when an interrupt arrives from ring 3 (and by
  * this_cpu() to tell the processors apart).
  *
- * Each processor has its own copy, differing in one entry: the TLS
- * segment (SEG_USER_TLS), whose base is the thread block of the thread
- * running there. The scheduler sets it at each switch; the thread's %gs
- * is loaded from it again on the way back to user mode.
+ * Each processor has its own copy. The scheduler switches libc's GS TLS
+ * base (SEG_USER_TLS) and Windows' FS TEB base (SEG_WIN_FS) independently;
+ * segment registers are reloaded on the way back to user mode.
  */
 #include "kernel.h"
 #include "arch.h"
@@ -100,6 +99,14 @@ void gdt_set_tls(uint32_t base)
     e->base_low = base & 0xFFFF;
     e->base_mid = (base >> 16) & 0xFF;
     e->base_high = (base >> 24) & 0xFF;
+}
+
+/* Windows uses FS independently of libc's GS TLS. Each CPU has its own descriptor. */
+void gdt_set_win_teb(uint32_t base)
+{
+    struct gdt_entry *e=&gdts[this_cpu()->index][7];
+    if(!base) base=WIN_TEB_LINEAR;
+    e->base_low=base&0xFFFF;e->base_mid=(base>>16)&0xFF;e->base_high=base>>24;
 }
 
 /* Load a processor's TSS. LTR marks the descriptor busy and refuses one

@@ -693,6 +693,26 @@ fetcher process, so the browser keeps running), or from `file://`.
   the HTML, CSS and DOM additions in 0.2.0, and `modern.html` the modules,
   observers, custom elements, nesting and colors that came after.
 
+**Windows programs** (`/bin/winrun`)
+
+32-bit PE programs can use the builtin Windows console APIs and the basic
+USER32/GDI desktop implementation. The Windows C: drive lives in `/winapps`:
+copy portable programs there or into `/winapps/Program Files`, then run
+`winrun 'C:\Program Files\Example\example.exe'`. Native paths such as
+`winrun /home/flux/example.exe` also work; native files are exposed as Z:.
+The prefix includes Windows/system, temporary, profile and application
+folders, and its registry data lives under `/winapps/WINDOWS/registry`.
+It is persistent when the backing filesystem is persistent.
+
+Native Windows threads, synchronization, common controls, image lists,
+standard file/color/font dialogs, shell launch/folder/file-drop APIs and a
+file-backed registry are implemented for the basic Phase 3 workflow. See
+`win32-gui-roadmap.md` for tested behavior and compatibility limits.
+An initial GDI+ image layer adds bitmap/stream loading, BMP/PNG/JPEG saving,
+codec enumeration, pixel locking and basic alpha drawing. It is a partial
+implementation; XP Paint has not yet been verified.
+`make test-win32-gui-qemu` exercises the compatibility layer in QEMU.
+
 **DOS programs** (`/bin/dos`)
 - Runs `.COM` and MZ `.EXE` files in the terminal (`./GAME.EXE`, `dos game`, or
   double-click). `dos` emulates a PC in user space: an x86 CPU (8086 to 486, no

@@ -342,9 +342,10 @@ $(ROOTFS)/bin/[: $(ROOTFS)/bin/test
 $(ROOTFS)/bin/gunzip $(ROOTFS)/bin/zcat: $(ROOTFS)/bin/gzip
 	cp $< $@
 
-$(BUILD)/.rootfs-stamp: $(ROOTFS_FILES)
+$(BUILD)/.rootfs-stamp: Makefile $(ROOTFS_FILES)
 	@mkdir -p $(ROOTFS)
 	cp -r rootfs/. $(ROOTFS)/
+	mkdir -p "$(ROOTFS)/winapps/Program Files/Common Files"
 	@touch $@
 
 # The ports (GNU make and binutils for fluxOS, tools/ports/build.sh) go into the
@@ -938,10 +939,10 @@ test-desktop-jobs-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/desktop-imagejob
 OBJCOPY ?= objcopy
 WIN32_TEST_CFLAGS := -m32 -march=i686 -O2 -ffreestanding -fno-pic -fno-pie -fno-stack-protector \
 	-fno-asynchronous-unwind-tables -mpreferred-stack-boundary=2 -nostdinc -isystem $(GCC_INC) -Wall -Wextra
-WIN32_TEST_DEPS := tests/win32/winapi.h tests/win32/imports.h tests/win32/imports.S tests/win32/pe.ld
+WIN32_TEST_DEPS := tests/win32/winapi.h tests/win32/imports.h tests/win32/gdip-imports.h tests/win32/imports.S tests/win32/pe.ld
 
 WIN32_SUBSYSTEM = windows
-$(BUILD)/tests/win32/console.exe: WIN32_SUBSYSTEM = console
+$(BUILD)/tests/win32/console.exe $(BUILD)/tests/win32/threads.exe $(BUILD)/tests/win32/registry.exe $(BUILD)/tests/win32/gdiplus.exe: WIN32_SUBSYSTEM = console
 
 $(BUILD)/tests/win32/resources.S: tests/win32/resources.py
 	@mkdir -p $(dir $@)
@@ -953,7 +954,7 @@ $(BUILD)/tests/win32/resources.o: $(BUILD)/tests/win32/resources.S
 $(BUILD)/tests/win32/phase2.exe: WIN32_TEST_EXTRA = $(BUILD)/tests/win32/resources.o
 $(BUILD)/tests/win32/phase2.exe: $(BUILD)/tests/win32/resources.o
 
-$(BUILD)/tests/win32/imports.o: tests/win32/imports.S tests/win32/imports.h
+$(BUILD)/tests/win32/imports.o: tests/win32/imports.S tests/win32/imports.h tests/win32/gdip-imports.h
 	@mkdir -p $(dir $@)
 	$(CC) $(WIN32_TEST_CFLAGS) -c $< -o $@
 
@@ -973,13 +974,17 @@ $(BUILD)/tests/win32-gui-guest: $(BUILD)/tests/win32-gui-guest.o $(CRT0) $(LIBDE
 
 .PHONY: test-win32-gui-qemu
 test-win32-gui-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/win32-gui-guest $(BUILD)/tests/win32/hello.exe \
-                     $(BUILD)/tests/win32/console.exe $(BUILD)/tests/win32/input.exe $(BUILD)/tests/win32/children.exe $(BUILD)/tests/win32/phase2.exe
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/win32-gui-guest --cpus $(KERNEL_TEST_CPUS) \
+                     $(BUILD)/tests/win32/console.exe $(BUILD)/tests/win32/input.exe $(BUILD)/tests/win32/children.exe $(BUILD)/tests/win32/phase2.exe $(BUILD)/tests/win32/threads.exe $(BUILD)/tests/win32/registry.exe $(BUILD)/tests/win32/phase3.exe $(BUILD)/tests/win32/gdiplus.exe
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/win32-gui-guest --memory 512 --cpus $(KERNEL_TEST_CPUS) \
 		$(TEST_DROP_TOOLCHAIN) --add $(BUILD)/tests/win32/hello.exe:/test/hello.exe \
 		--add $(BUILD)/tests/win32/console.exe:/test/console.exe \
 		--add $(BUILD)/tests/win32/input.exe:/test/input.exe \
 		--add $(BUILD)/tests/win32/children.exe:/test/children.exe \
-		--add $(BUILD)/tests/win32/phase2.exe:/test/phase2.exe --timeout 120 \
+		--add $(BUILD)/tests/win32/phase2.exe:/test/phase2.exe \
+		--add $(BUILD)/tests/win32/threads.exe:/test/threads.exe \
+		--add $(BUILD)/tests/win32/registry.exe:/test/registry.exe \
+		--add $(BUILD)/tests/win32/phase3.exe:/test/phase3.exe \
+		--add $(BUILD)/tests/win32/gdiplus.exe:/test/gdiplus.exe --timeout 120 \
 		--success-marker "WIN32 GUI REGRESSIONS PASSED"
 
 $(BUILD)/tests/browser-navigation: tests/browser-navigation.c user/desktop/wave/webutil.c $(DESKTOP_HDRS)

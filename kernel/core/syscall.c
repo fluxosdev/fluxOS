@@ -321,6 +321,15 @@ static int sys_set_tls(uint32_t base, uint32_t b, uint32_t c, uint32_t d, uint32
     return SEG_USER_TLS;
 }
 
+static int sys_set_win_teb(uint32_t base,uint32_t b,uint32_t c,uint32_t d,uint32_t e)
+{
+    (void)b;(void)c;(void)d;(void)e;
+    if(base && (base<USER_BASE || base>USER_TOP-WIN_TEB_SIZE)) return -EINVAL;
+    uint32_t flags=irq_save();
+    current->win_teb=base;gdt_set_win_teb(base);
+    irq_restore(flags);return SEG_WIN_FS;
+}
+
 static int sys_gettid(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)a; (void)b; (void)c; (void)d; (void)e;
@@ -2050,6 +2059,7 @@ static const syscall_fn syscalls[NSYSCALLS] = {
     [SYS_thread_exit] = sys_thread_exit,
     [SYS_futex] = sys_futex,
     [SYS_set_tls] = sys_set_tls,
+    [SYS_set_win_teb] = sys_set_win_teb,
     [SYS_gettid] = sys_gettid,
     [SYS_tkill] = sys_tkill,
     [SYS_setitimer] = sys_setitimer,
