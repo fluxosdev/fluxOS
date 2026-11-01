@@ -5,7 +5,9 @@ their sections for where they differ from the plan). Stage 2 now has
 its basic controls, dialogs, menus, clipboard and resource icons; see its
 section for the tested workflow and remaining compatibility limits. Stage 3
 now has its basic threads, common controls, standard dialogs,
-shell integration and Windows prefix; stage 4 remains a plan.*
+shell integration and Windows prefix. Stage 4 now has its basic OpenGL,
+PCM/MIDI, DirectDraw and DirectSound workflows; see its tested subset and
+compatibility limits below.*
 
 `winrun` already runs 32-bit console Windows programs: a PE loader, the
 gate between the loader's flat segments and the program's segments, SEH,
@@ -467,7 +469,7 @@ shell namespace, shell extension loading, OLE drag-and-drop or registry-based
 association/verb resolution. PIDLs represent filesystem paths only. Registry
 notifications, security and Windows hive-file compatibility remain absent.
 Running-thread suspension, forced thread termination, SRW/condition-variable
-APIs, `_beginthread(ex)` and fully thread-aware CRT blocking I/O remain
+APIs and fully thread-aware CRT blocking I/O remain
 unsupported; legacy asynchronous fault handling needs a further concurrency
 audit. Named synchronization objects are currently process-local. These are
 compatibility limits beyond the basic workflow implemented here.
@@ -525,6 +527,49 @@ backend. ABI and behavior references consulted:
 and [Wine's image tests](https://github.com/wine-mirror/wine/blob/master/dlls/gdiplus/tests/image.c).
 No Wine or ReactOS implementation code was incorporated.
 
+## Compatibility pass before stage 4 (2026-11-01)
+
+- Required PE imports now fail during loading with the importing module,
+  missing DLL or symbol name/ordinal, and nested dependency error. Import
+  descriptors, strings and thunk bounds are checked. A DLL whose imports
+  fail is removed from the module list and unmapped. These errors no longer
+  become zero-returning missing-function thunks. Optional dynamic lookups
+  still return failure to the caller.
+- GDI has `SaveDC`/`RestoreDC`, including nested absolute/relative restore,
+  selected-object references, drawing attributes, origins and copied clips.
+  Rectangular region objects support AND/OR/XOR/DIFF/COPY, queries and
+  offsets. Application clip regions are copied into the DC, independently
+  of the paint/visibility clip. Intersections and exclusions affect shared
+  drawing paths, including text, blits, shapes and GDI+ rendering. Complex
+  clipping currently preserves excluded pixels around drawing operations;
+  it is correct for the tested paths but costs extra memory and copying.
+- Pattern brushes snapshot bitmap pixels and support monochrome color
+  mapping and device-relative brush origins. All six hatch styles support
+  transparent or opaque backgrounds. Pattern sampling is used by fills,
+  filled shapes and pattern-dependent raster operations. `CreateBrushIndirect`
+  dispatches the supported solid/null/hatch/pattern styles.
+- `_beginthread`/`_endthread` and `_beginthreadex`/`_endthreadex` use the
+  existing Windows TEB/TLS thread implementation. The former closes its
+  handle automatically; the latter preserves its waitable handle and exit
+  code. Suspended `_beginthreadex` startup is supported. This does not make
+  all CRT state or blocking I/O thread-local/thread-aware.
+- `timeSetEvent`/`timeKillEvent` support one-shot/periodic function callbacks
+  and event-set notifications. Callback workers have their own Windows
+  thread context. Cancellation wakes waiting workers; synchronous cancellation
+  waits for an in-flight callback, and self-cancellation does not deadlock.
+  Timing resolution remains the host clock/scheduler's resolution; the
+  requested resolution does not guarantee precision. Event-pulse timer
+  callbacks are explicitly rejected because PulseEvent is not implemented.
+- `tests/win32/prephase4.c` covers region pixel output and copied ownership,
+  nested DC restore, brush copies/origins/backgrounds, CRT return and explicit
+  exit, handle ownership, suspended startup, timer callback thread identity,
+  event notification, cancellation before firing, self-cancellation and
+  synchronous cancellation during a callback. Valid PEs with missing DLL,
+  name and ordinal imports check diagnostics and exit status 126 before
+  execution. `make test-win32-regions` checks disjoint region algebra against
+  pixel membership across generated rectangle sets. These run alongside the
+  existing two-CPU GUI/thread/GDI+ regressions.
+
 ## Stage 4: OpenGL, sound and DirectDraw
 
 *Goal: OpenGL demos and older games run.*
@@ -544,6 +589,92 @@ No Wine or ReactOS implementation code was incorporated.
   path as `StretchDIBits`.
 - dsound: `DirectSoundCreate` with secondary buffers mixed onto the
   waveOut path.
+
+**Basic workflow implemented (2026-11-01).** This is an original fluxOS
+implementation over its existing GL, GDI and sound backends. It is not a
+claim of general DirectX compatibility or that every older game runs.
+
+- `opengl32.c` implements one RGBA pixel format, WGL context creation,
+  binding, deletion, current context/DC queries, proc lookup and buffer
+  presentation. `ChoosePixelFormat`, `DescribePixelFormat`, `SetPixelFormat`,
+  `GetPixelFormat` and `SwapBuffers` are GDI32 exports. Context ownership is
+  per Windows thread, native GL state is rebound on every API call, and
+  backing buffers resize with the DC. The bridge deliberately uses the
+  software renderer; native GPU mappings have not been integrated with the
+  guest VM allocator. `gen-win32-gl.py` generates 269 stdcall wrappers from
+  the native header; `glGetString` and `glGetPointerv` have explicit guest
+  pointer handling. Floats/doubles are decoded from Windows stack arguments.
+  A separate `libGL-win32.a` uses 16-byte-aligned managed allocations so
+  graphics data cannot grow the loader's native heap into the guest EXE.
+- `audio.c` mixes sources at 44.1 kHz, stereo signed 16-bit, saturating
+  additions before writing to `/dev/dsp`. Blocking device writes release
+  the runtime lock. Playback-delay tracking defers wave buffer completion
+  until the native device has consumed it. Workers have Windows TEB/TLS.
+  `waveout.c` implements device queries, PCM open/query, prepare/unprepare,
+  queued writes, completion callbacks (function/window/thread/event),
+  pause/restart/reset, position, volume, close, single-header loops and
+  break-loop. Supported input is 8/16-bit mono/stereo PCM at 4–192 kHz,
+  resampled into the mixer. Reset preserves submission order when returning
+  headers. `PlaySound(A/W)` and `sndPlaySound(A/W)` support uncompressed WAV
+  files, memory and RT_WAVE resources, with sync/async, looping and stop.
+- `midi.c` maps MIDI channel messages onto the native nine-voice OPL2
+  interface (also available on OPL3 hardware). Note on/off, sustain,
+  volume, program selection, pitch bend, all-notes-off/reset and basic
+  capability/volume/ID APIs are present. MIDI headers and completion
+  callbacks support General MIDI reset and universal master-volume SysEx.
+  Eight local FM timbres approximate program families; no external bank
+  or Microsoft runtime is shipped.
+- `ddraw.c` supplies DirectDraw 1/2/4/7, surface 1/2/3/4/7, palette and
+  basic HWND clipper interfaces with shared COM identity/reference counts.
+  Supported surfaces are 8-bit indexed, RGB565, 24-bit RGB and 32-bit RGB,
+  backed by guest memory. Lock/unlock, surface descriptors/caps, palette
+  updates, color fill, nearest-neighbor/scaled copies, overlapping self-blits,
+  source/destination color keys, a primary/back-buffer flip pair, and
+  GDI DC acquisition/release are implemented. Windowed primaries use screen
+  coordinates; logical display modes scale to the target window. Native
+  physical display modes and exclusive ownership do not change.
+- `dsound.c` provides DirectSound/DirectSound8 and basic buffer/buffer8
+  interfaces. Secondary buffers expose guest memory, wrapped locks,
+  looping/one-shot playback, stop, seeking, volume/pan/frequency controls,
+  status/cursors and shared-data duplication. They feed the same mixer as
+  waveOut. Primary buffers expose format negotiation. `ole32.c` supplies
+  basic thread initialization and in-process activation of the implemented
+  DirectDraw/DirectSound classes. COM vtable slot/argument metadata comes
+  from Microsoft SDK declarations through `gen-win32-com.py`; unsupported
+  methods return failure with the correct calling convention.
+- `tests/win32/phase4.c` checks float/double GL arguments, pixel output,
+  guest pointers, context ownership, allocations larger than the loader's
+  address gap, COM activation, surface locks/busy state/flip/palette/GDI,
+  windowed screen coordinates, DirectSound wrap/shared-data/control state,
+  wave completion/reset order/high-rate loops, WAV memory/file/resource
+  playback and MIDI messages/SysEx. `phase4-gui.c` renders through the
+  desktop protocol and checks repaint after resize. The new
+  `make test-win32-phase4-qemu` runs the complete GUI suite on two CPUs with
+  SB16 and AdLib emulation. Its recorded output is checked for simultaneous
+  440 Hz waveOut and 660 Hz DirectSound tones; the regression measured
+  1.20 seconds of overlap. The ordinary GUI target still works without an
+  audio device and skips hardware-dependent sound checks.
+
+**Compatibility limits:** OpenGL functionality is limited to the native GL
+subset; WGL list sharing/context copying, font helpers, advanced pixel
+formats, modern GL extensions and hardware acceleration are absent. DirectDraw
+overlays, arbitrary clip lists, multiple back buffers, caller-owned surface
+storage, most private-data/texture methods and physical fullscreen modes are
+unsupported. DirectSound capture, 3D/effects, hardware buffers and position
+notifications are absent; cursors reflect the software mixing position and
+native queued audio introduces latency. Stop/reset cannot retract individual
+sources from audio already mixed into the native device queue. WaveOut
+multi-header loop groups, compressed audio and registry sound aliases are
+unsupported. MIDI is a small FM approximation, not a full General MIDI
+instrument/percussion implementation or a MIDI stream/file player. Unsupported
+COM methods and formats fail instead of claiming success.
+
+ABI references:
+[Microsoft DirectDraw declarations](https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/um/ddraw.h),
+[DirectSound declarations](https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/um/dsound.h),
+[waveOutOpen](https://learn.microsoft.com/en-us/windows/win32/api/mmeapi/nf-mmeapi-waveoutopen),
+[WAVEHDR](https://learn.microsoft.com/en-us/windows/win32/api/mmeapi/ns-mmeapi-wavehdr).
+No Wine or ReactOS implementation code was incorporated.
 
 ## Order and dependencies
 

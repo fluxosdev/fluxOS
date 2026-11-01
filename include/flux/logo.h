@@ -1,6 +1,8 @@
 /*
- * The fluxOS logo (lib/logo.c, made by tools/mklogo.py), shared by the
- * kernel's startup screen and the desktop's shutdown screen.
+ * The fluxOS logo (lib/logo.c, made by tools/mklogo.py from
+ * assets/fluxos-logo.svg), shared by the kernel's startup and panic screens
+ * and the desktop's shutdown screen, screen saver and Setup. It is the
+ * shape in white, as all of them draw it on a dark background.
  */
 #ifndef FLUX_LOGO_H
 #define FLUX_LOGO_H

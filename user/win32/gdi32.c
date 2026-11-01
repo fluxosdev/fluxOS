@@ -38,6 +38,7 @@
 #include <flux/font.h>
 #include "gui.h"
 #include "desktop.h"
+#include "region.h"
 
 #define A(i) (a[i])
 #define P(i) gp(a[i])
@@ -50,10 +51,13 @@
 #define OBJ_PAL 5
 #define OBJ_FONT 6
 #define OBJ_BITMAP 7
+#define OBJ_REGION 8
 #define OBJ_MEMDC 10
 
 #define BS_SOLID 0
 #define BS_NULL 1
+#define BS_HATCHED 2
+#define BS_PATTERN 3
 #define PS_SOLID 0
 #define PS_DASH 1
 #define PS_DOT 2
@@ -138,7 +142,10 @@ struct dc {
     COLORREF text, bk, dc_brush, dc_pen;
     int bk_mode, rop2, stretch_mode, fill_mode;
     uint32_t align;
-    POINT cur, vp_org, win_org;
+    POINT cur, vp_org, win_org, brush_org;
+    struct region app_clip;
+    int app_clipped, level, pixel_format;
+    struct dc *saved;
 };
 
 struct gobj {
@@ -147,12 +154,13 @@ struct gobj {
     int selected;                       /* DCs it is selected into */
     int deleted;                        /* DeleteObject while selected: freed once it is not */
     union {
-        struct { int style, sys, dc; COLORREF color; } brush;   /* sys: a COLOR_ index, or -1 */
+        struct { int style, sys, dc, hatch; COLORREF color; struct bitmap *pattern; } brush;   /* sys: a COLOR_ index, or -1 */
         struct { int style, width, dc; COLORREF color; } pen;
         struct font font;
         struct dc dc;
         struct bitmap *bm;
         struct palette *pal;
+        struct region region;
     } u;
 };
 
@@ -214,6 +222,8 @@ static void obj_free(HGDIOBJ h)
         bitmap_free(o->u.bm);
     else if (o->type == OBJ_PAL)
         free(o->u.pal);
+    else if (o->type == OBJ_REGION) region_free(&o->u.region);
+    else if (o->type == OBJ_BRUSH && o->u.brush.pattern) bitmap_free(o->u.brush.pattern);
     free(o);
     objs[i - 1] = NULL;
 }
@@ -669,18 +679,36 @@ static void deselect(HGDIOBJ h)
         obj_free(h);
 }
 
+static void dc_refs(struct dc *d,int add)
+{
+    HGDIOBJ handles[]={d->brush,d->pen,d->font,d->palette,d->bitmap};
+    for(int i=0;i<5;i++) if(handles[i]) {if(add) select_ref(handles[i]);else deselect(handles[i]);}
+}
 void gdi_release_dc(HDC h)
 {
-    struct dc *d = dc_get(h);
-    if (!d)
-        return;
-    deselect(d->brush);
-    deselect(d->pen);
-    deselect(d->font);
-    deselect(d->palette);
-    if (d->bitmap)
-        deselect(d->bitmap);
-    obj_free(h);
+    struct dc *d=dc_get(h);if(!d) return;
+    struct dc *save=d->saved;
+    while(save) {struct dc *next=save->saved;dc_refs(save,0);region_free(&save->app_clip);free(save);save=next;}
+    dc_refs(d,0);region_free(&d->app_clip);obj_free(h);
+}
+DEF(SaveDC)
+{
+    struct dc *d=dc_get(A(0));if(!d) FAIL(ERROR_INVALID_HANDLE);
+    struct dc *save=malloc(sizeof(*save));if(!save) FAIL(ERROR_NOT_ENOUGH_MEMORY);
+    *save=*d;save->app_clip=(struct region){0};
+    if(!region_copy(&save->app_clip,&d->app_clip)) {free(save);FAIL(ERROR_NOT_ENOUGH_MEMORY);}
+    dc_refs(save,1);d->saved=save;return ++d->level;
+}
+DEF(RestoreDC)
+{
+    struct dc *d=dc_get(A(0));if(!d) FAIL(ERROR_INVALID_HANDLE);
+    int level=(int32_t)A(1);if(level<0) level=d->level+level+1;
+    if(level<=0 || level>d->level) FAIL(ERROR_INVALID_PARAMETER);
+    while(d->level>=level) {
+        struct dc *save=d->saved;
+        dc_refs(d,0);region_free(&d->app_clip);*d=*save;free(save);
+    }
+    return TRUE;
 }
 
 void gdi_set_clip(HDC h, const RECT *r)
@@ -713,6 +741,7 @@ static int dev_y(struct dc *d, int y)
 
 /* Where a DC draws: the surface, the device origin in it (a window's client area), the clip
  * (surface coordinates, also set on the surface) and the bitmap, for a memory DC. */
+struct region_backup {struct rect box;uint32_t *pixels;struct region_backup *next;};
 struct target {
     struct surface *s;
     int ox, oy;
@@ -721,6 +750,7 @@ struct target {
     struct bitmap *bm;
     struct dc *d;
     struct clip_save *saved;
+    struct region_backup *region_saved;
 };
 
 static int target(struct dc *d, struct target *t)
@@ -741,6 +771,10 @@ static int target(struct dc *d, struct target *t)
     if (d->clipped)
         c = rect_intersect(c, mkrect(d->clip.left, d->clip.top, d->clip.right - d->clip.left,
                                      d->clip.bottom - d->clip.top));
+    if(d->app_clipped) {
+        RECT b=region_bounds(&d->app_clip);
+        c=rect_intersect(c,mkrect(b.left,b.top,b.right-b.left,b.bottom-b.top));
+    }
     c.x += t->ox;
     c.y += t->oy;
     t->clip = rect_intersect(c, mkrect(0, 0, t->s->w, t->s->h));
@@ -756,6 +790,17 @@ static int target(struct dc *d, struct target *t)
 /* r (device coordinates) is about to be drawn over: a converted DIB's copy is brought up to date. */
 static void touch(struct target *t, struct rect r)
 {
+    if(t->d->app_clipped && t->d->app_clip.n>1) {
+        struct rect b=rect_intersect(mkrect(r.x+t->ox,r.y+t->oy,r.w,r.h),t->clip);
+        if(!rect_empty(b)) {
+            if(t->bm) dib_pull(t->bm,b);
+            struct region_backup *save=malloc(sizeof(*save));
+            uint32_t *pixels=malloc((size_t)b.w*b.h*4);
+            if(!save || !pixels) wdie("out of memory preserving GDI region");
+            for(int y=0;y<b.h;y++) memcpy(pixels+y*b.w,t->s->px+(b.y+y)*t->s->stride+b.x,b.w*4);
+            *save=(struct region_backup){b,pixels,t->region_saved};t->region_saved=save;
+        }
+    }
     if (!t->bm) {
         struct rect touched=rect_intersect(mkrect(r.x+t->ox,r.y+t->oy,r.w,r.h),t->clip);
         t->saved = win_clip_save(t->hwnd,t->s,touched,t->saved);
@@ -768,6 +813,13 @@ static void touch(struct target *t, struct rect r)
 static void drawn(struct target *t, struct rect r)
 {
     r = rect_intersect(mkrect(r.x + t->ox, r.y + t->oy, r.w, r.h), t->clip);
+    while(t->region_saved) {
+        struct region_backup *save=t->region_saved;struct rect b=save->box;
+        for(int y=0;y<b.h;y++) for(int x=0;x<b.w;x++)
+            if(!region_contains(&t->d->app_clip,b.x+x-t->ox,b.y+y-t->oy))
+                t->s->px[(b.y+y)*t->s->stride+b.x+x]=save->pixels[y*b.w+x];
+        t->region_saved=save->next;free(save->pixels);free(save);
+    }
     if (t->bm)
         dib_push(t->bm, r);
     else {
@@ -802,6 +854,30 @@ static int brush_color(struct dc *d, HBRUSH h, color_t *out)
     return 1;
 }
 
+/* Device-relative tiling: brush origin is independent of viewport origin. */
+static int brush_sample(struct dc *d,HBRUSH h,int x,int y,color_t *c)
+{
+    if(!brush_color(d,h,c)) return 0;
+    struct gobj *o=obj_get(h,OBJ_BRUSH);if(!o) return 1;
+    int bx=x-d->brush_org.x,by=y-d->brush_org.y;
+    if(o->u.brush.style==BS_PATTERN) {
+        struct bitmap *bm=o->u.brush.pattern;
+        bx=((bx%bm->w)+bm->w)%bm->w;by=((by%bm->h)+bm->h)%bm->h;
+        *c=bm->surf.px[by*bm->surf.stride+bx]&0xffffff;
+        if(bm->mono) *c=*c?rgb_of(d,d->bk):rgb_of(d,d->text);
+    } else if(o->u.brush.style==BS_HATCHED) {
+        bx=(unsigned)bx&7;by=(unsigned)by&7;
+        int hit=0;
+        switch(o->u.brush.hatch) {
+        case 0:hit=by==0;break;case 1:hit=bx==0;break;
+        case 2:hit=((bx+by)&7)==0;break;case 3:hit=bx==by;break;
+        case 4:hit=bx==0 || by==0;break;case 5:hit=bx==by || ((bx+by)&7)==0;break;
+        }
+        if(!hit) {if(d->bk_mode==TRANSPARENT) return 0;*c=rgb_of(d,d->bk);}
+    }
+    return 1;
+}
+
 static int target_mono(const struct target *t)
 {
     return t->bm && t->bm->mono;
@@ -824,7 +900,10 @@ int gdi_fill_rect(HDC h, const RECT *r, HBRUSH br)
     if (target(d, &t) < 0)
         return 1;
     struct rect fr = dev_rect(d, r);
-    fill(&t, fr, c);
+    touch(&t,fr);
+    struct rect bounds=rect_intersect(mkrect(fr.x+t.ox,fr.y+t.oy,fr.w,fr.h),t.clip);
+    for(int y=bounds.y;y<bounds.y+bounds.h;y++) for(int x=bounds.x;x<bounds.x+bounds.w;x++)
+        if(brush_sample(d,br,x-t.ox,y-t.oy,&c)) t.s->px[y*t.s->stride+x]=target_mono(&t)?mono_of(c):c;
     drawn(&t, fr);
     return 1;
 }
@@ -863,6 +942,15 @@ static void span(struct target *t, int x0, int x1, int y, color_t c)    /* [x0, 
     }
     for (int x = x0; x < x1; x++)
         plot(t, t->ox + x, t->oy + y, c);
+}
+
+static void brush_span(struct target *t,int x0,int x1,int y,color_t unused)
+{
+    (void)unused;
+    if(y+t->oy<t->clip.y || y+t->oy>=t->clip.y+t->clip.h) return;
+    if(x0<t->clip.x-t->ox) x0=t->clip.x-t->ox;
+    if(x1>t->clip.x+t->clip.w-t->ox) x1=t->clip.x+t->clip.w-t->ox;
+    for(int x=x0;x<x1;x++) {color_t c;if(brush_sample(t->d,t->d->brush,x,y,&c)) plot(t,t->ox+x,t->oy+y,c);}
 }
 
 struct pen_info {
@@ -1047,7 +1135,7 @@ DEF(Rectangle)
     touch(&t, box);
     if (has_brush)
         for (int y = tp; y < b; y++)
-            span(&t, l, r, y, c);
+            brush_span(&t, l, r, y, c);
     if (has_pen && r > l && b > tp) {
         int w = p.width < (r - l + 1) / 2 ? p.width : (r - l + 1) / 2;
         for (int k = 0; k < w; k++) {
@@ -1098,7 +1186,7 @@ DEF(Ellipse)
         int ox0 = (int)(cx - outer + 0.5), ox1 = (int)(cx + outer + 0.5) + 1;
         int ix0 = inner < 0 ? ox1 : (int)(cx - inner + 0.5), ix1 = inner < 0 ? ox1 : (int)(cx + inner + 0.5) + 1;
         if (has_brush && ix1 > ix0)
-            span(&t, ix0, ix1, y, c);
+            brush_span(&t, ix0, ix1, y, c);
         if (has_pen) {
             if (inner < 0) {
                 span(&t, ox0, ox1, y, p.color);
@@ -1162,12 +1250,12 @@ DEF(Polygon)
                 for (int i = 0; i + 1 < k; i++) {
                     wind += dir[i];
                     if (wind)
-                        span(&t, (int)(xs[i] + 0.5), (int)(xs[i + 1] + 0.5), y, c);
+                        brush_span(&t, (int)(xs[i] + 0.5), (int)(xs[i + 1] + 0.5), y, c);
                 }
             } else {
                 qsort(xs, (size_t)k, sizeof(*xs), cmp_double);
                 for (int i = 0; i + 1 < k; i += 2)
-                    span(&t, (int)(xs[i] + 0.5), (int)(xs[i + 1] + 0.5), y, c);
+                    brush_span(&t, (int)(xs[i] + 0.5), (int)(xs[i + 1] + 0.5), y, c);
             }
         }
         free(xs);
@@ -1186,7 +1274,7 @@ static COLORREF set_pixel(uint32_t *a)
     if (!d || target(d, &t) < 0)
         return CLR_INVALID;
     int x = dev_x(d, (int32_t)A(1)), y = dev_y(d, (int32_t)A(2));
-    if (!rect_contains(t.clip, t.ox + x, t.oy + y)) {
+    if (!rect_contains(t.clip, t.ox + x, t.oy + y) || (d->app_clipped && !region_contains(&d->app_clip,x,y))) {
         gfx_noclip(t.s);
         return CLR_INVALID;
     }
@@ -1211,7 +1299,7 @@ DEF(GetPixel)
         return CLR_INVALID;
     int x = t.ox + dev_x(d, (int32_t)A(1)), y = t.oy + dev_y(d, (int32_t)A(2));
     COLORREF r = CLR_INVALID;
-    if (rect_contains(t.clip, x, y)) {
+    if (rect_contains(t.clip, x, y) && (!d->app_clipped || region_contains(&d->app_clip,x-t.ox,y-t.oy))) {
         if (t.bm)
             dib_pull(t.bm, mkrect(x, y, 1, 1));
         r = rgb_colorref(t.s->px[y * t.s->stride + x] & 0xFFFFFF);
@@ -1356,6 +1444,10 @@ static void blit(struct dc *d, int dx, int dy, int dw, int dh, const struct sour
                         sv = sv ? bk : text;    /* white is the background, black the text color */
                     else if (dmono && !src->mono)
                         sv = sv == src->bk ? 0xFFFFFF : 0;
+                }
+                if(rop_uses_pat(code)) {
+                    if(!brush_sample(d,d->brush,x-t.ox,y-t.oy,&pat)) continue;
+                    if(dmono) pat=mono_of(pat);
                 }
                 uint32_t r = rop3(code, pat, sv, drow[x] & 0xFFFFFF);
                 drow[x] = dmono ? mono_of(r) : r;
@@ -2328,8 +2420,9 @@ DEF(SelectObject)
     case OBJ_FONT: slot = &d->font; break;
     case OBJ_BITMAP:
         /* only into a memory DC, and a bitmap into one at a time */
-        if (!d->mem || (o->selected && !o->stock && d->bitmap != A(1)))
-            return 0;
+        if (!d->mem) return 0;
+        if(!o->stock) for(int i=0;i<MAX_GDI;i++) if(objs[i] && objs[i]->type==OBJ_DC && &objs[i]->u.dc!=d)
+            for(struct dc *other=&objs[i]->u.dc;other;other=other->saved) if(other->bitmap==A(1)) return 0;
         slot = &d->bitmap;
         break;
     default:
@@ -2424,7 +2517,7 @@ static uint32_t get_object(uint32_t *a, int unicode)
         break;
     }
     case OBJ_BRUSH: {
-        uint32_t v[3] = { (uint32_t)o->u.brush.style, o->u.brush.sys >= 0 ? sys_color(o->u.brush.sys) : o->u.brush.color, 0 };
+        uint32_t v[3] = { (uint32_t)o->u.brush.style, o->u.brush.sys >= 0 ? sys_color(o->u.brush.sys) : o->u.brush.color, (uint32_t)o->u.brush.hatch };
         memcpy(buf, v, 12);
         n = 12;
         break;
@@ -2514,7 +2607,8 @@ DEF(GetWindowOrgEx) { struct dc *d = dc_get(A(0)); return d ? origin(a, &d->win_
 DEF(OffsetWindowOrgEx) { struct dc *d = dc_get(A(0)); return d ? origin(a, &d->win_org, 2) : 0; }
 DEF(SetMapMode) { (void)a; return 1; }  /* MM_TEXT, the only one */
 DEF(GetMapMode) { (void)a; return 1; }
-DEF(SetBrushOrgEx) { if (A(3)) *(POINT *)P(3) = (POINT){ 0, 0 }; return TRUE; }  /* solid brushes only */
+DEF(SetBrushOrgEx) { struct dc *d=dc_get(A(0));return d?origin(a,&d->brush_org,0):0; }
+DEF(GetBrushOrgEx) {struct dc *d=dc_get(A(0));if(!d || !A(1)) return 0;*(POINT *)P(1)=d->brush_org;return 1;}
 
 DEF(GetDeviceCaps)
 {
@@ -2672,6 +2766,107 @@ const struct api_entry gdi_user32_entries[] = {
 };
 const int gdi_user32_count = sizeof(gdi_user32_entries) / sizeof(gdi_user32_entries[0]);
 
+DEF(CreateRectRgn)
+{
+    struct gobj *o;HGDIOBJ h=obj_new(OBJ_REGION,&o);if(!h) return 0;
+    int l=(int32_t)A(0),t=(int32_t)A(1),r=(int32_t)A(2),b=(int32_t)A(3);normalize(&l,&t,&r,&b);
+    if(l<-(1<<26) || t<-(1<<26) || r>=(1<<26) || b>=(1<<26)) {obj_free(h);return 0;}
+    if(!region_add(&o->u.region,(RECT){l,t,r,b})) {obj_free(h);return 0;}return h;
+}
+DEF(CreateRectRgnIndirect) {if(!A(0)) return 0;RECT *r=P(0);uint32_t b[]={r->left,r->top,r->right,r->bottom};return api_CreateRectRgn(b);}
+DEF(SetRectRgn)
+{
+    struct gobj *o=obj_get(A(0),OBJ_REGION);if(!o) return 0;
+    uint32_t b[]={A(1),A(2),A(3),A(4)};HGDIOBJ h=api_CreateRectRgn(b);if(!h) return 0;
+    struct gobj *n=obj_get(h,OBJ_REGION);region_free(&o->u.region);o->u.region=n->u.region;n->u.region=(struct region){0};obj_free(h);return 1;
+}
+DEF(CombineRgn)
+{
+    struct gobj *d=obj_get(A(0),OBJ_REGION),*x=obj_get(A(1),OBJ_REGION),*y=obj_get(A(2),OBJ_REGION);
+    if(!d || !x || (A(3)!=5 && !y)) return 0;
+    return region_combine(&d->u.region,&x->u.region,y?&y->u.region:NULL,A(3))?region_type(&d->u.region):0;
+}
+DEF(GetRgnBox) {struct gobj *o=obj_get(A(0),OBJ_REGION);if(!o || !A(1)) return 0;*(RECT *)P(1)=region_bounds(&o->u.region);return region_type(&o->u.region);}
+DEF(PtInRegion) {struct gobj *o=obj_get(A(0),OBJ_REGION);return o && region_contains(&o->u.region,(int32_t)A(1),(int32_t)A(2));}
+DEF(RectInRegion)
+{
+    struct gobj *o=obj_get(A(0),OBJ_REGION);if(!o || !A(1)) return 0;
+    for(int i=0;i<o->u.region.n;i++) {RECT b=region_intersect(o->u.region.rects[i],*(RECT *)P(1));if(b.left<b.right && b.top<b.bottom) return 1;}return 0;
+}
+static int offset_region(struct region *r,int x,int y)
+{
+    for(int i=0;i<r->n;i++) {RECT b=r->rects[i];
+        if((int64_t)b.left+x<INT32_MIN || (int64_t)b.right+x>INT32_MAX || (int64_t)b.top+y<INT32_MIN || (int64_t)b.bottom+y>INT32_MAX) return 0;
+    }
+    for(int i=0;i<r->n;i++) {r->rects[i].left+=x;r->rects[i].right+=x;r->rects[i].top+=y;r->rects[i].bottom+=y;}
+    return region_type(r);
+}
+DEF(OffsetRgn) {struct gobj *o=obj_get(A(0),OBJ_REGION);return o?offset_region(&o->u.region,(int32_t)A(1),(int32_t)A(2)):0;}
+DEF(EqualRgn)
+{
+    struct gobj *x=obj_get(A(0),OBJ_REGION),*y=obj_get(A(1),OBJ_REGION);struct region diff={0};if(!x || !y) return 0;
+    if(!region_combine(&diff,&x->u.region,&y->u.region,3)) return 0;
+    int equal=!diff.n;region_free(&diff);return equal;
+}
+static int dc_region(struct dc *d,struct region *out)
+{
+    int w=gui_screen_w(),h=gui_screen_h(),ox=0,oy=0;struct surface *surface;
+    struct bitmap *bm=d->mem?bitmap_get(d->bitmap):NULL;
+    if(bm) {w=bm->w;h=bm->h;}else if(d->hwnd) win_surface(d->hwnd,&surface,&ox,&oy,&w,&h);
+    RECT b={0,0,w,h};if(d->clipped) b=region_intersect(b,d->clip);
+    struct region visible={0};if(!region_add(&visible,b)) return 0;
+    int ok=d->app_clipped?region_combine(out,&d->app_clip,&visible,1):region_copy(out,&visible);
+    region_free(&visible);return ok;
+}
+DEF(ExtSelectClipRgn)
+{
+    struct dc *d=dc_get(A(0));struct gobj *r=obj_get(A(1),OBJ_REGION);
+    int mode=A(2);if(!d || mode<1 || mode>5 || (A(1) && !r) || (!r && mode!=5)) return 0;
+    if(!r) {region_free(&d->app_clip);d->app_clipped=0;return 2;}
+    struct region current={0};
+    if(mode!=5 && !(d->app_clipped?region_copy(&current,&d->app_clip):dc_region(d,&current))) return 0;
+    int ok=mode==5?region_copy(&d->app_clip,&r->u.region):region_combine(&d->app_clip,&current,&r->u.region,mode);
+    region_free(&current);if(!ok) return 0;d->app_clipped=1;return region_type(&d->app_clip);
+}
+DEF(SelectClipRgn) {uint32_t b[]={A(0),A(1),5};return api_ExtSelectClipRgn(b);}
+DEF(GetClipRgn) {struct dc *d=dc_get(A(0));struct gobj *r=obj_get(A(1),OBJ_REGION);if(!d || !r) return -1;if(!d->app_clipped) return 0;return region_copy(&r->u.region,&d->app_clip)?1:(uint32_t)-1;}
+DEF(GetClipBox)
+{
+    struct dc *d=dc_get(A(0));if(!d || !A(1)) return 0;struct region r={0};if(!dc_region(d,&r)) return 0;
+    RECT b=region_bounds(&r);int type=region_type(&r);region_free(&r);
+    b.left+=d->win_org.x-d->vp_org.x;b.right+=d->win_org.x-d->vp_org.x;b.top+=d->win_org.y-d->vp_org.y;b.bottom+=d->win_org.y-d->vp_org.y;
+    *(RECT *)P(1)=b;return type;
+}
+static uint32_t clip_rect(uint32_t *a,int mode)
+{
+    struct dc *d=dc_get(A(0));if(!d) return 0;
+    uint32_t b[]={dev_x(d,(int32_t)A(1)),dev_y(d,(int32_t)A(2)),dev_x(d,(int32_t)A(3)),dev_y(d,(int32_t)A(4))};
+    HGDIOBJ r=api_CreateRectRgn(b);if(!r) return 0;uint32_t args[]={A(0),r,mode};uint32_t result=api_ExtSelectClipRgn(args);obj_free(r);return result;
+}
+DEF(IntersectClipRect) {return clip_rect(a,1);}
+DEF(ExcludeClipRect) {return clip_rect(a,4);}
+DEF(OffsetClipRgn) {struct dc *d=dc_get(A(0));if(!d) return 0;return d->app_clipped?offset_region(&d->app_clip,(int32_t)A(1),(int32_t)A(2)):2;}
+DEF(CreateHatchBrush) {if(A(0)>5) FAIL(ERROR_INVALID_PARAMETER);HBRUSH h=new_brush(BS_HATCHED,A(1),-1,0);struct gobj *o=obj_get(h,OBJ_BRUSH);if(o) o->u.brush.hatch=A(0);return h;}
+DEF(CreatePatternBrush)
+{
+    struct bitmap *src=bitmap_get(A(0));if(!src || src->w<=0 || src->h<=0) FAIL(ERROR_INVALID_HANDLE);
+    struct bitmap *copy=calloc(1,sizeof(*copy));if(!copy) return 0;
+    copy->w=src->w;copy->h=src->h;copy->mono=src->mono;copy->bpp=src->bpp;
+    if(win_surface_init(&copy->surf,copy->w,copy->h)<0) {free(copy);return 0;}
+    dib_pull(src,mkrect(0,0,src->w,src->h));
+    for(int y=0;y<src->h;y++) memcpy(copy->surf.px+y*copy->surf.stride,src->surf.px+y*src->surf.stride,src->w*4);
+    HBRUSH h=new_brush(BS_PATTERN,0,-1,0);struct gobj *o=obj_get(h,OBJ_BRUSH);
+    if(!o) {bitmap_free(copy);return 0;}o->u.brush.pattern=copy;return h;
+}
+DEF(CreateBrushIndirect)
+{
+    if(!A(0)) return 0;
+    uint32_t *b=P(0),args[]={b[2],b[1]};
+    switch(b[0]) {case BS_SOLID:return new_brush(BS_SOLID,b[1],-1,0);case BS_NULL:return new_brush(BS_NULL,0,-1,0);case BS_HATCHED:return api_CreateHatchBrush(args);case BS_PATTERN:return api_CreatePatternBrush(args);default:return 0;}
+}
+
+extern uint32_t api_ChoosePixelFormat(uint32_t *),api_DescribePixelFormat(uint32_t *),
+    api_SetPixelFormat(uint32_t *),api_GetPixelFormat(uint32_t *),api_SwapBuffers(uint32_t *);
 static const struct api_entry gdi32_entries[] = {
     API(AnimatePalette, 4),
     API(BitBlt, 9),
@@ -2691,6 +2886,12 @@ static const struct api_entry gdi32_entries[] = {
     API(CreatePen, 3),
     API(CreatePenIndirect, 1),
     API(CreateSolidBrush, 1),
+    API(ChoosePixelFormat,2),API(DescribePixelFormat,4),API(SetPixelFormat,3),API(GetPixelFormat,1),API(SwapBuffers,1),
+    API(SaveDC,1), API(RestoreDC,2), API(CreateRectRgn,4), API(CreateRectRgnIndirect,1),
+    API(SetRectRgn,5), API(CombineRgn,4), API(OffsetRgn,3), API(GetRgnBox,2), API(PtInRegion,3), API(RectInRegion,2),
+    API(EqualRgn,2), API(SelectClipRgn,2), API(ExtSelectClipRgn,3), API(GetClipRgn,2), API(GetClipBox,2),
+    API(IntersectClipRect,5), API(ExcludeClipRect,5), API(OffsetClipRgn,3),
+    API(CreatePatternBrush,1), API(CreateHatchBrush,2), API(CreateBrushIndirect,1), API(GetBrushOrgEx,2),
     API(DeleteDC, 1),
     API(DeleteObject, 1),
     API(Ellipse, 5),
@@ -2770,7 +2971,19 @@ struct api_dll gdi32_dll = { "GDI32.DLL", gdi32_entries, sizeof(gdi32_entries) /
 
 /* GDI+ shares the GDI target setup so child clipping, DIB synchronization and
  * damage tracking stay identical to ordinary GDI drawing. */
+int gdi_pixel_format(HDC h,int set)
+{
+    struct dc *d=dc_get(h);if(!d) return 0;
+    if(set && !d->pixel_format) d->pixel_format=1;
+    return d->pixel_format;
+}
 int gdi_dc_valid(HDC h) {return dc_get(h)!=NULL;}
+int gdi_dc_copy(HDC h,uint32_t *pixels,int stride)
+{
+    struct dc *d=dc_get(h);struct source s;if(!d || dc_source(d,&s)<0 || stride<s.view.w)return -1;
+    for(int y=0;y<s.view.h;y++)memcpy(pixels+y*stride,s.view.px+y*s.view.stride,s.view.w*4);
+    return 0;
+}
 int gdi_dc_size(HDC h,int *width,int *height)
 {
     struct dc *d=dc_get(h);if(!d) return -1;

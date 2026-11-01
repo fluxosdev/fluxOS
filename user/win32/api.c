@@ -40,6 +40,8 @@ extern struct api_dll kernel32_dll, ntdll_dll, msvcrt_dll, user32_dll, gdi32_dll
                       gdiplus_dll, version_dll, winspool_dll, ws2_32_dll, imm32_dll, shlwapi_dll, rpcrt4_dll, uxtheme_dll,
                       dwmapi_dll, psapi_dll, crypt32_dll, secur32_dll, wininet_dll, mpr_dll, setupapi_dll;
 
+extern struct api_dll opengl32_dll,ddraw_dll,dsound_dll;
+
 static void api_register(struct api_dll *d)
 {
     if (ndlls < MAX_DLLS)
@@ -48,7 +50,8 @@ static void api_register(struct api_dll *d)
 
 void api_register_all(void)
 {
-    extern void msvcrt_link(void), user32_link(void), gdiplus_link(void);
+    extern void msvcrt_link(void), user32_link(void), gdiplus_link(void),winmm_link(void);
+    winmm_link();
     msvcrt_link();
     user32_link();
     gdiplus_link();
@@ -63,6 +66,9 @@ void api_register_all(void)
     api_register(&ole32_dll);
     api_register(&oleaut32_dll);
     api_register(&winmm_dll);
+    api_register(&opengl32_dll);
+    api_register(&ddraw_dll);
+    api_register(&dsound_dll);
     api_register(&comctl32_dll);
     api_register(&comdlg32_dll);
     api_register(&version_dll);

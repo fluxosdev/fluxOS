@@ -181,8 +181,12 @@ struct module *module_load(const char *name, const char *from_dir, char *err, si
     m->refs = 1;
     module_add(m);
     wtrace("loaded %s at %08x", m->name, m->base);
-    if (pe_resolve_imports(m, err, errsize) < 0)
+    if (pe_resolve_imports(m, err, errsize) < 0) {
+        for (struct module **pp=&modules; *pp; pp=&(*pp)->next)
+            if (*pp==m) { *pp=m->next; break; }
+        vm_free(m->base,0);free(m);
         return NULL;
+    }
     if (teb)
         pe_setup_tls(m);
     if (process_running)

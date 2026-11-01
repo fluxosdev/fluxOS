@@ -69,6 +69,7 @@ int gdi_fill_rect(HDC dc, const RECT *r, HBRUSH br);
 /* Forget the window: its DCs draw nothing from now on. */
 void gdi_window_gone(HWND hwnd);
 int gdi_dc_valid(HDC h);
+int gdi_dc_copy(HDC h,uint32_t *pixels,int stride);
 int gdi_dc_size(HDC h,int *width,int *height);
 int gdi_bitmap_copy(HBITMAP h,struct image *out);
 int gdi_argb_blit(HDC h,int x,int y,int width,int height,const uint32_t *pixels,int stride,int copy);

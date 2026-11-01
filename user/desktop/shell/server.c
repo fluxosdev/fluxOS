@@ -91,6 +91,7 @@ static void fill_state(struct wm_state *s)
     s->work_bottom = wm_work_bottom();
     s->style = theme.style;
     s->accent = theme.accent;
+    s->icons = theme.icons;
     s->wall_mode = wallpaper_mode();
     s->wall_color = wallpaper_color();
     struct saver_config sc = saver_get();
@@ -340,7 +341,7 @@ static void draw_sample(struct client *c, const struct wm_msg *m)
     struct surface s;
     if (wm_payload_len(m) >= sizeof(*sm) && sm->w <= 4096 && sm->h <= 4096 &&
         shm_surface_attach(&s, sm->shmid, sm->w, sm->h) == 0) {
-        theme_sample(&s, mkrect(0, 0, s.w, s.h), sm->style, sm->accent);
+        theme_sample(&s, mkrect(0, 0, s.w, s.h), sm->style, sm->accent, sm->icons);
         shm_surface_detach(&s);
         done.value = 0;
     }
@@ -480,7 +481,7 @@ static void handle(struct client *c, const struct wm_msg *m)
     case C_THEME: {
         const struct wm_theme *t = p;
         if (n >= sizeof(*t))
-            theme_set(t->style, t->accent, t->save);
+            theme_set(t->style, t->accent, t->icons, t->save);
         break;
     }
     case C_WALLPAPER: {
@@ -698,9 +699,11 @@ void shell_open(const char *what)
 
 /* Change the look: the programs hear of it first, so the windows they are asked to draw again come
  * out in it. */
-void theme_set(int style, int accent, int save)
+void theme_set(int style, int accent, int icons, int save)
 {
     int old = theme.style;
+    if (icons >= 0 && icons < ICON_SETS)
+        theme.icons = icons;
     theme_apply(style, accent);
     server_state_changed();
     wm_restyle();
@@ -709,13 +712,15 @@ void theme_set(int style, int accent, int save)
         theme_save();
 }
 
-/* How a style and color would look (Display Properties), drawn into r of s: the Kinetik wallpaper
- * behind, or the plain desktop. */
-void theme_sample(struct surface *s, struct rect r, int style, int accent)
+/* How a style, color and icon set would look (Display Properties), drawn into r of s: the Kinetik
+ * wallpaper behind, or the plain desktop. */
+void theme_sample(struct surface *s, struct rect r, int style, int accent, int icons)
 {
     struct theme saved = theme;
     struct syscolors saved_sys = sys;
     struct pfont saved_sans = font_sans, saved_bold = font_sans_bold;
+    if (icons >= 0 && icons < ICON_SETS)
+        theme.icons = icons;
     theme_apply(style, accent);
     struct surface bg;
     if (KINETIK && surface_init(&bg, r.w, r.h) == 0) {

@@ -27,6 +27,7 @@ parser.add_argument("--disk", metavar="IMAGE", help="a second IDE disk (/dev/hdb
 parser.add_argument("--fsck-ext2", action="store_true", help="the guest leaves an ext2 volume on the scratch disk: have e2fsck check it")
 parser.add_argument("--net", action="store_true", help="give the guest an Intel PRO/1000 on QEMU's user network (NAT to the host's, with DHCP)")
 parser.add_argument("--sound", nargs="?", const="hda", choices=("hda", "sb16", "usb"), help="give the guest a sound card (HD Audio by default), record what it plays, and check that the mixer test's two tones play at once (skipped if QEMU cannot record to a WAV file)")
+parser.add_argument("--opl", action="store_true", help="add an AdLib OPL2 device alongside the recorded sound card")
 args = parser.parse_args()
 
 
@@ -119,6 +120,8 @@ with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
             "sb16": ["-device", "sb16,audiodev=snd"],
             "usb": ["-device", "qemu-xhci", "-device", "usb-audio,audiodev=snd"],
         }[args.sound]
+    if args.opl and args.sound:
+        command += ["-device", "adlib,audiodev=snd"]
     # The guest's console is shown as it comes, since a long run (a native
     # build) can take hours.
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -147,11 +150,11 @@ with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
         power = {hz: tone_power(samples, rate, hz) for hz in (440, 660, 550)}
         print("sound: tone power " + ", ".join(f"{hz} Hz {p:.3g}" for hz, p in power.items()))
         if min(power[440], power[660]) < 100 * max(power[550], 1.0):
-            raise SystemExit("QEMU sound: the recording does not hold both programs' tones")
+            raise SystemExit("QEMU sound: the recording does not hold both sources' tones")
         overlap = tones_overlap(samples, rate, (440, 660), 550)
         print(f"sound: both tones together for {overlap:.2f} s")
         if overlap < 0.5:
-            raise SystemExit("QEMU sound: the two programs' tones did not play at once")
+            raise SystemExit("QEMU sound: the two sources' tones did not play at once")
     if args.fsck_ext2:
         if shutil.which("e2fsck"):
             check = subprocess.run(["e2fsck", "-fn", str(scratch)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

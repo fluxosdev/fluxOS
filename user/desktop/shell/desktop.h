@@ -28,9 +28,12 @@
  * Seashell is Kinetik flat and light, in warm sage grays with blue for what is chosen. */
 enum theme_style { THEME_CLASSIC, THEME_KINETIK, THEME_GLASS, THEME_SEASHELL, THEME_STYLES };
 enum { ACCENT_BLUE, ACCENT_PURPLE, ACCENT_ORANGE, ACCENT_GREEN, ACCENT_WHITE, ACCENT_BLACK, ACCENTS };
+/* The icons: KDE's Breeze, or its older Oxygen (/usr/share/icons/breeze or oxygen). */
+enum { ICONS_BREEZE, ICONS_OXYGEN, ICON_SETS };
 
 struct theme {
     int style, accent;
+    int icons;                  /* ICONS_*: kept apart from the style, theme_apply leaves it be */
     /* frame geometry */
     int border;                 /* the frame below and beside the client area */
     int cap_inset;              /* the caption's distance from the frame's top and sides */
@@ -47,16 +50,20 @@ extern struct theme theme;
 extern const char *const theme_style_names[THEME_STYLES];
 extern const char *const accent_names[ACCENTS];
 extern const color_t accent_swatches[ACCENTS];
+extern const char *const icon_set_names[ICON_SETS];
+extern const char *const icon_set_dirs[ICON_SETS];     /* "breeze", "oxygen" */
 
-/* The look in use, at startup: the saved one (fluxos_theme in grubenv), or Kinetik. */
+/* The look in use, at startup: the saved one (fluxos_theme and fluxos_icons in grubenv), or
+ * Seashell with Breeze's icons. */
 void theme_init(void);
 /* Take on a look: the values only (theme_set is what changes it for everyone). */
 void theme_apply(int style, int accent);
 void theme_save(void);                  /* the look in use, for the next start */
-/* Change it: everything is drawn again (and kept for the next start, if save). */
-void theme_set(int style, int accent, int save);
-/* How a style and color would look, drawn into r of s (with the Kinetik wallpaper behind, or the plain desktop). */
-void theme_sample(struct surface *s, struct rect r, int style, int accent);
+/* Change it, and the icons: everything is drawn again (and kept for the next start, if save). */
+void theme_set(int style, int accent, int icons, int save);
+/* How a style, color and icon set would look, drawn into r of s (with the Kinetik wallpaper behind,
+ * or the plain desktop). */
+void theme_sample(struct surface *s, struct rect r, int style, int accent, int icons);
 void theme_kinetik_blue(struct surface *s, int w, int h);      /* Kinetik Blue's wallpaper */
 /* Kinetik Glass: the smoked glass of the taskbar, its buttons and the sidebar's strips, over r. */
 void glass_smoke(struct surface *s, struct rect r, int rt, int rb);
@@ -374,8 +381,11 @@ void sidebar_layout(void);              /* the theme or the screen changed */
 void sidebar_tick(void);                /* once a second */
 
 /* ---- icons (icons.c) ---- */
+/* From the icon set in use (theme.icons); a change of set is picked up at the next draw. */
 void draw_icon(struct surface *s, int x, int y, enum icon_id id, int size);   /* 16, 32, 48 */
 void draw_icon_selected(struct surface *s, int x, int y, enum icon_id id, int size);
+/* Its shape in the one color ink, for a one-color mark (the logo) on a background of any shade. */
+void draw_icon_ink(struct surface *s, int x, int y, enum icon_id id, int size, color_t ink);
 enum icon_id icon_by_name(const char *name);    /* "folder", "wave": its file's name, or ICON_NONE */
 /* Draw the pointer with its hot spot at (x, y); cursor_bounds is what it covers. */
 void draw_cursor(struct surface *s, int x, int y, enum cursor_kind kind);
@@ -471,7 +481,7 @@ int grubenv_update(const char *dir, const char *const *keys, const char *const *
 enum { WALL_FILL, WALL_STRETCH, WALL_CENTER, WALL_TILE, WALL_MODES };
 extern const char *const wall_mode_names[WALL_MODES];
 #define WALLPAPER_DIR     "/usr/share/wallpapers"
-#define WALLPAPER_DEFAULT WALLPAPER_DIR "/bamboo.jpg"
+#define WALLPAPER_DEFAULT WALLPAPER_DIR "/trees.jpg"
 #define WALLPAPER_KINETIK "kinetik"     /* not a file: the Kinetik theme's own, drawn in its color */
 /* The Kinetik wallpaper (Seashell's under Seashell) at w x h, into s at (0, 0). */
 void wallpaper_kinetik(struct surface *s, int w, int h);

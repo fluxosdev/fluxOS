@@ -24,8 +24,12 @@
  * look in use, and changing it is the desktop's to do (server.c's
  * theme_set, and theme_sample).
  *
+ * The icons are a choice of their own: KDE's Breeze, or Oxygen (icons.c).
+ * Without a choice saved, the look is Seashell with Breeze's icons.
+ *
  * The choice is kept in GRUB's environment block when the system runs from
- * a hard disk (fluxos_theme: "classic", "glass", "seashell", or "kinetik-" and the color).
+ * a hard disk (fluxos_theme: "classic", "glass", "seashell", or "kinetik-" and
+ * the color; fluxos_icons: "breeze" or "oxygen").
  */
 #include <stdio.h>
 #include <string.h>
@@ -38,6 +42,8 @@ const char *const theme_style_names[THEME_STYLES] = { "Classic", "Kinetik", "Kin
 static const char *const style_keys[THEME_STYLES] = { "classic", "kinetik", "glass", "seashell" };
 const char *const accent_names[ACCENTS] = { "Blue", "Purple", "Orange", "Green", "White", "Black" };
 static const char *const accent_keys[ACCENTS] = { "blue", "purple", "orange", "green", "white", "black" };
+const char *const icon_set_names[ICON_SETS] = { "Breeze", "Oxygen" };
+const char *const icon_set_dirs[ICON_SETS] = { "breeze", "oxygen" };
 /* The color each one is named for (the studies' swatches). */
 const color_t accent_swatches[ACCENTS] = {
     RGB(0x23, 0x99, 0xF3), RGB(0xBF, 0x00, 0xFF), RGB(0xF5, 0x8B, 0x23),
@@ -79,7 +85,7 @@ static const struct palette seashell_palette = { 0x2E4546, 0x9EB5B5, 0x5687AD, 0
 
 void theme_apply(int style, int accent)
 {
-    theme.style = style >= 0 && style < THEME_STYLES ? style : THEME_KINETIK;
+    theme.style = style >= 0 && style < THEME_STYLES ? style : THEME_SEASHELL;
     theme.accent = accent >= 0 && accent < ACCENTS ? accent : ACCENT_BLUE;
     /* Kinetik's colors are kept under Classic too, for its wallpaper if that is still chosen.
      * Glass and Seashell have one color of their own (the accent is kept for going back to Kinetik). */
@@ -131,7 +137,7 @@ void theme_apply(int style, int accent)
 /* "classic", "glass", "seashell", "kinetik-blue" and the like. */
 static void parse(const char *text, int *style, int *accent)
 {
-    *style = THEME_KINETIK;
+    *style = THEME_SEASHELL;
     *accent = ACCENT_BLUE;
     for (int i = 0; i < THEME_STYLES; i++) {
         size_t n = strlen(style_keys[i]);
@@ -148,9 +154,16 @@ static void parse(const char *text, int *style, int *accent)
 void theme_init(void)
 {
     char dir[128], value[32];
-    int style = THEME_KINETIK, accent = ACCENT_BLUE;
-    if (grubenv_boot_dir(dir, sizeof(dir)) && grubenv_get(dir, "fluxos_theme", value, sizeof(value)))
-        parse(value, &style, &accent);
+    int style = THEME_SEASHELL, accent = ACCENT_BLUE;
+    theme.icons = ICONS_BREEZE;
+    if (grubenv_boot_dir(dir, sizeof(dir))) {
+        if (grubenv_get(dir, "fluxos_theme", value, sizeof(value)))
+            parse(value, &style, &accent);
+        if (grubenv_get(dir, "fluxos_icons", value, sizeof(value)))
+            for (int i = 0; i < ICON_SETS; i++)
+                if (!strcmp(value, icon_set_dirs[i]))
+                    theme.icons = i;
+    }
     theme_apply(style, accent);
 }
 
@@ -163,8 +176,9 @@ void theme_save(void)
         snprintf(value, sizeof(value), "%s", style_keys[theme.style]);
     else
         snprintf(value, sizeof(value), "%s-%s", style_keys[theme.style], accent_keys[theme.accent]);
-    const char *keys[1] = { "fluxos_theme" }, *vals[1] = { value };
-    grubenv_update(dir, keys, vals, 1);
+    const char *keys[2] = { "fluxos_theme", "fluxos_icons" };
+    const char *vals[2] = { value, icon_set_dirs[theme.icons >= 0 && theme.icons < ICON_SETS ? theme.icons : 0] };
+    grubenv_update(dir, keys, vals, 2);
 }
 
 void glass_smoke(struct surface *s, struct rect r, int rt, int rb)

@@ -19,6 +19,9 @@ struct win_thread {
     uint32_t stack_size,id,code,entry,param;
     int depth,done,suspended,main,reaped;
     pthread_t native;
+    uint32_t (*native_fn)(void *);
+    void *native_arg;
+    HANDLE auto_handle;
     jmp_buf exit_context;
 };
 static pthread_key_t key;
@@ -119,24 +122,33 @@ static void *thread_start(void *arg)
     if(!setjmp(t->exit_context)) {
         for(struct module *m=modules;m;m=m->next) if(!m->builtin && pe_setup_tls(m)<0) win_thread_exit(ERROR_NOT_ENOUGH_MEMORY);
         callbacks(2); /* DLL_THREAD_ATTACH */
+        if(t->native_fn) t->code=t->native_fn(t->native_arg);
+        else {
         struct win_pause pause;thread_pause(&pause);
         uint32_t args[]={t->param};
         t->code=call_guest_on(t->entry,1,args,WIN_BASE+t->stack+t->stack_size-64);
         thread_resume(&pause);
+        }
+        if(t->auto_handle) t->code=0;
     }
+    extern void opengl_thread_exit(uint32_t tid);
+    opengl_thread_exit(t->id);
+    extern void ole_thread_exit(uint32_t tid);ole_thread_exit(t->id);
     user32_thread_exit(t->id);
     callbacks(3); /* DLL_THREAD_DETACH */
 cleanup:
     if(live==1) process_exit(t->code);
     for(int i=0;i<64;i++) {gp_t block=((gp_t *)GP(t->block->tls_pointer))[i];if(block) vm_free(block,0);}
     vm_free(t->block->tls_pointer,0);vm_free(t->stack,0);vm_free(t->teb_address,0);
-    t->block=NULL;t->done=1;live--;thread_notify();
+    t->block=NULL;t->done=1;live--;
+    if(t->auto_handle) {HANDLE h=t->auto_handle;t->auto_handle=0;handle_close(h);}
+    thread_notify();
     while(t->depth) thread_api_leave();
     return NULL;
 }
 static void reap(struct win_thread *t)
 {
-    if(t && t->done && !t->main && !t->reaped) {
+    if(t && t->done && !t->main && !t->reaped && !pthread_equal(t->native,pthread_self())) {
         pthread_join(t->native,NULL);t->reaped=1;
         if(t->native_stack) {vm_free(t->native_stack,0);t->native_stack=0;}
     }
@@ -147,10 +159,10 @@ void win_tls_clear(uint32_t index)
     if(index>=64) return;
     for(struct win_thread *t=all;t;t=t->next) if(t->block) t->block->tls_slots[index]=0;
 }
-HANDLE win_thread_create(uint32_t size,gp_t entry,gp_t param,uint32_t flags,gp_t tid)
+static HANDLE create_thread(uint32_t size,gp_t entry,gp_t param,uint32_t flags,gp_t tid,uint32_t (*native_fn)(void *),void *native_arg)
 {
     for(struct win_thread *old=all;old;old=old->next) reap(old);
-    if(!entry || (flags&~0x10004u) || !vm_readable(entry,1)) return 0;
+    if((!native_fn && (!entry || !vm_readable(entry,1))) || (flags&~0x10004u)) return 0;
     if(size<0x100000) size=0x100000;
     if(size>0x4000000) return 0;
     size=(size+0xFFFF)&~0xFFFFu;
@@ -163,6 +175,7 @@ HANDLE win_thread_create(uint32_t size,gp_t entry,gp_t param,uint32_t flags,gp_t
     t->block->process_id=teb->process_id;t->block->thread_id=t->id=next_id++;
     t->block->peb=peb_gp;t->block->locale=0x409;t->block->stack_limit=t->stack;t->block->stack_base=t->stack+size;
     t->block->tls_pointer=vm_alloc(0,64*4,PAGE_READWRITE,MEM_PRIVATE,0);if(!t->block->tls_pointer) goto fail;
+    t->native_fn=native_fn;t->native_arg=native_arg;
     t->stack_size=size;t->entry=entry;t->param=param;t->suspended=(flags&4)!=0;
     HANDLE h=handle_new(H_THREAD);if(!h) goto fail;
     struct hobj *o=handle_get(h);o->priv=t;o->pid=t->id;
@@ -178,12 +191,28 @@ fail:
     if(t->stack) vm_free(t->stack,0);
     free(t);return 0;
 }
+HANDLE win_thread_create(uint32_t size,gp_t entry,gp_t param,uint32_t flags,gp_t tid)
+{return create_thread(size,entry,param,flags,tid,NULL,NULL);}
+HANDLE win_thread_create_native(uint32_t (*fn)(void *),void *arg)
+{return create_thread(0,0,0,0,0,fn,arg);}
+void win_thread_autoclose(HANDLE h)
+{
+    struct hobj *o=handle_get_type(h,H_THREAD);if(o) ((struct win_thread *)o->priv)->auto_handle=h;
+}
+void win_thread_end_crt(void)
+{
+    struct win_thread *t=ready?pthread_getspecific(key):NULL;
+    /* _beginthread marks its handle before the runtime lock is released. */
+    (void)t;win_thread_exit(0);
+}
 void win_thread_exit(uint32_t code)
 {
     struct win_thread *t=ready ? pthread_getspecific(key):NULL;
     if(!t) process_exit(code);
     t->code=code;
     if(!t->main) longjmp(t->exit_context,1);
+    extern void opengl_thread_exit(uint32_t tid),ole_thread_exit(uint32_t tid);
+    opengl_thread_exit(t->id);ole_thread_exit(t->id);
     user32_thread_exit(t->id);t->done=1;live--;if(!live) process_exit(code);thread_notify();while(t->depth) thread_api_leave();pthread_exit(NULL);
 }
 uint32_t win_thread_id(HANDLE h)

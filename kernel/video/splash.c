@@ -26,7 +26,7 @@
 #define TICKS_PER_STEP 5                /* after the boot: a step every 50 ms */
 
 #define BAR_TRACK  0x262626u
-#define BAR_LEFT   0x16467Du            /* the logo's blues, dark to bright */
+#define BAR_LEFT   0x16467Du            /* Kinetik Blue's blues, dark to bright */
 #define BAR_RIGHT  0x448CCAu
 #define TEXT_WHITE 0xFFFFFFu
 #define TEXT_GREY  0x8C8C8Cu

@@ -42,6 +42,7 @@
 #include "threads.h"
 
 #include "ui.h"
+#include "messages.h"
 
 static struct wclass *classes;
 static ATOM next_atom = 0xC000;
@@ -2973,11 +2974,31 @@ void ui_class(const char *name,const struct api_entry *proc,HBRUSH brush)
 static void user32_init(void)
 {
     if (!gui_connected)
-        theme_apply(THEME_KINETIK, ACCENT_BLUE);    /* the frame and fonts the desktop would have */
+        theme_apply(THEME_SEASHELL, ACCENT_BLUE);   /* the frame and fonts the desktop would have */
     controls_init();
     dialog_init();
     menu_init();
 }
+
+/* Registered messages use the case-insensitive system atom namespace. */
+static uint32_t register_window_message(uint32_t *a, int wide)
+{
+    if (!A(0)) { set_last_error(ERROR_INVALID_PARAMETER); return 0; }
+    uint16_t name[256];
+    size_t len;
+    for (len = 0; len < 256; len++) {
+        uint16_t c = wide ? ((const uint16_t *)P(0))[len] : ((const uint8_t *)P(0))[len];
+        if (!c) break;
+        name[len] = c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;
+    }
+    if (!len || len == 256) { set_last_error(ERROR_INVALID_NAME); return 0; }
+    name[len] = 0;
+    uint32_t id = message_register_in("/tmp/winrun-messages", name, len);
+    if (!id) set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+    return id;
+}
+DEF(RegisterWindowMessageA) { return register_window_message(a, 0); }
+DEF(RegisterWindowMessageW) { return register_window_message(a, 1); }
 
 static const struct api_entry user32_entries[] = {
     API(GetDlgItem, 2),
@@ -3067,6 +3088,7 @@ static const struct api_entry user32_entries[] = {
     API(PostQuitMessage, 1),
     API(PostThreadMessageA, 4),
     API(PostThreadMessageW, 4),
+    API(RegisterWindowMessageA, 1), API(RegisterWindowMessageW, 1),
     API(RegisterClassA, 1),
     API(RegisterClassExA, 1),
     API(RegisterClassExW, 1),

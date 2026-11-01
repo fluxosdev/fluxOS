@@ -191,14 +191,16 @@ static struct wm_msg *request(int type, uint32_t win, const void *p, size_t n)
 
 static void apply_state(const struct wm_state *s)
 {
-    int restyle = !have_state || s->style != state.style || s->accent != state.accent;
+    int restyle = !have_state || s->style != state.style || s->accent != state.accent || s->icons != state.icons;
     state = *s;
     state.wall_path[sizeof(state.wall_path) - 1] = 0;
     have_state = 1;
     screen_w = s->screen_w;
     screen_h = s->screen_h;
-    if (restyle)
+    if (restyle) {
+        theme.icons = s->icons;             /* icons.c loads the new set's at the next draw */
         theme_apply(s->style, s->accent);   /* the windows hear S_RESTYLE, each */
+    }
     mouse_set_config(s->mouse, s->mouse_saved);
     tz_set(s->tz_minutes);
 }
@@ -654,20 +656,20 @@ int wm_set_mode(const struct dispmode *mode)
     return r;
 }
 
-void theme_set(int style, int accent, int save)
+void theme_set(int style, int accent, int icons, int save)
 {
-    struct wm_theme t = { style, accent, save };
+    struct wm_theme t = { style, accent, icons, save };
     send_msg(C_THEME, 0, &t, sizeof(t));
 }
 
 /* The desktop draws the sample, into a segment of ours. */
-void theme_sample(struct surface *s, struct rect r, int style, int accent)
+void theme_sample(struct surface *s, struct rect r, int style, int accent, int icons)
 {
     struct surface t;
     int id = shm_surface_create(&t, r.w, r.h);
     if (id < 0)
         return;
-    struct wm_sample sm = { id, r.w, r.h, style, accent };
+    struct wm_sample sm = { id, r.w, r.h, style, accent, icons };
     struct wm_msg *m = request(C_SAMPLE, 0, &sm, sizeof(sm));
     if (m->type == S_DONE && wm_payload_len(m) >= sizeof(struct wm_int) && ((struct wm_int *)wm_payload(m))->value == 0)
         gfx_blit(s, r.x, r.y, &t, 0, 0, r.w, r.h);

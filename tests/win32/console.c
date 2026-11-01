@@ -42,5 +42,20 @@ void start(void)
     CHECK(filenamew(wide) == wide + 5 && extensionw(wide) == wide + 6);
     CHECK(!relativew(wide) && relativew(wide + 5));
     removew(wide); CHECK(!wide[6] && extensionw(wide) == wide + 6 && wide[5] == 0x6587);
+    HMODULE user = W(GetModuleHandleA)("user32.dll");
+    typedef UINT (WINAPI *register_a)(const char *);
+    typedef UINT (WINAPI *register_w)(const unsigned short *);
+    register_a reg = (register_a)W(GetProcAddress)(user, "RegisterWindowMessageA");
+    register_w regw = (register_w)W(GetProcAddress)(user, "RegisterWindowMessageW");
+    CHECK(reg && regw);
+    UINT message = reg("flux-test-message");
+    CHECK(message >= 0xc000 && message <= 0xffff);
+    CHECK(reg("flux-test-message") == message);
+    CHECK(reg("FLUX-TEST-MESSAGE") == message);
+    CHECK(regw((const unsigned short *)u"flux-test-message") == message);
+    UINT other = reg("flux-test-message-other");
+    CHECK(other >= 0xc000 && other <= 0xffff && other != message);
+    CHECK(regw((const unsigned short *)u"flux-test-message-other") == other);
+    CHECK(!reg(0) && !reg(""));
     W(ExitProcess)(5);
 }

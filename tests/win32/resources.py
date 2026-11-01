@@ -39,7 +39,9 @@ accel = struct.pack('<HHHH', 0x89, ord('N'), 501, 0)
 dib = struct.pack('<IiiHHIIIIII', 40, 32, 64, 1, 32, 0, 32*32*4, 0, 0, 0, 0)
 dib += struct.pack('<I', 0xffff0000) * (32*32) + bytes(32*4)
 group = struct.pack('<HHH', 0, 1, 1) + struct.pack('<BBBBHHIH', 32, 32, 0, 0, 1, 32, len(dib), 1)
-resources = {3: {1: dib}, 4: {1: menu, 2: menuex}, 5: {1: dialog(), 2: dialog(True), 3: dialog()[:20]}, 9: {1: accel}, 14: {1: group}}
+pcm = bytes(16)
+wave = b'RIFF' + struct.pack('<I', 36+len(pcm)) + b'WAVEfmt ' + struct.pack('<IHHIIHH',16,1,1,44100,88200,2,16) + b'data' + struct.pack('<I',len(pcm)) + pcm
+resources = {3: {1: dib}, 4: {1: menu, 2: menuex}, 5: {1: dialog(), 2: dialog(True), 3: dialog()[:20]}, 9: {1: accel}, 12: {1: wave}, 14: {1: group}}
 lines = ['.section .rsrc,"a"', '.balign 4', 'resource_root:', '.long 0,0', '.short 0,0,0,%d' % len(resources)]
 for kind in resources:
     lines += ['.long %d, (type_%d-resource_root)+0x80000000' % (kind, kind)]

@@ -27,9 +27,11 @@ The desktop
 
   Display Properties (Start menu > Settings)
                    Background: wallpaper (Fill, Stretch, Center, Tile) or a
-                   plain color; Appearance: the Kinetik theme in six colors,
-                   or Classic, the Windows 95 look; video mode, monitor and
-                   refresh rate where the video driver can change them
+                   plain color; Appearance: Seashell (the default), the
+                   Kinetik theme in six colors, Kinetik Glass, or Classic,
+                   the Windows 95 look, and Breeze or Oxygen icons; video
+                   mode, monitor and refresh rate where the video driver
+                   can change them
 
 
 Programs
@@ -219,7 +221,7 @@ System
 
 More about fluxOS is in README.md in the source tree, including the full
 list of what works, what does not, and how to build it. Credits: the default
-wallpaper is a photograph by kazuend on Unsplash (and mountains.jpg is by
-Stefan Stefancik); the icons are from KDE's Oxygen theme; the Kinetik
-theme's text is set in Archivo (SIL Open Font License, in
-/usr/share/doc/fonts/LICENSE.archivo).
+wallpaper is a photograph by Geranimo on Unsplash (and the others are by
+kazuend, Stefan Stefancik, Nattu Adnan and Almas Salakhov); the icons are
+from KDE's Breeze and Oxygen themes; the Kinetik theme's text is set in
+Archivo (SIL Open Font License, in /usr/share/doc/fonts/LICENSE.archivo).

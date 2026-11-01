@@ -156,11 +156,11 @@ struct wm_list_entry {
     char title[WM_TITLE_MAX];
 };
 
-struct wm_theme { int32_t style, accent, save; };
+struct wm_theme { int32_t style, accent, icons, save; };
 struct wm_wallpaper { int32_t mode, save; char path[256]; };
 struct wm_wall_color { uint32_t rgb; int32_t save; };
 struct wm_saver { int32_t enabled, timeout, size, save; };
-struct wm_sample { int32_t shmid, w, h, style, accent; };
+struct wm_sample { int32_t shmid, w, h, style, accent, icons; };
 
 /* The mouse's settings as the Mouse Properties window has them: in use, and kept. */
 struct wm_mouse {
@@ -172,6 +172,7 @@ struct wm_state {
     int32_t screen_w, screen_h;
     int32_t work_right, work_bottom;    /* windows are placed left of and above these */
     int32_t style, accent;              /* the theme */
+    int32_t icons;                      /* its icon set (ICONS_*) */
     int32_t wall_mode;
     uint32_t wall_color;
     int32_t saver_enabled, saver_timeout, saver_size;

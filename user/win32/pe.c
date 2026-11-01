@@ -310,57 +310,49 @@ gp_t pe_export(struct module *m, const char *name, int ordinal)
 
 /* ---- imports ---- */
 
+static const char *image_string(const struct module *m, uint32_t rva)
+{
+    const char *p = rva < m->size ? (const char *)GP(m->base) + rva : NULL;
+    return p && memchr(p, 0, m->size - rva) ? p : NULL;
+}
+
 int pe_resolve_imports(struct module *m, char *err, size_t errsize)
 {
-    uint32_t rva = m->dir[DIR_IMPORT][0];
-    if (!rva || !m->dir[DIR_IMPORT][1])
-        return 0;
-    uint8_t *img = GP(m->base);
-    char from_dir[PATH_MAX];
-    snprintf(from_dir, sizeof(from_dir), "%s", m->path);
-    char *slash = strrchr(from_dir, '/');
-    if (slash)
-        *slash = 0;
-    else
-        strcpy(from_dir, ".");
-    for (uint32_t d = rva; d + 20 <= m->size; d += 20) {
-        uint32_t oft = rd32(img + d), name = rd32(img + d + 12), ft = rd32(img + d + 16);
-        if (!name && !ft)
-            break;
-        if (name >= m->size || ft >= m->size)
-            break;
-        const char *dll = (const char *)img + name;
-        /* the import holds one reference, so FreeLibrary cannot pull the
-         * DLL out from under it; loader_resolve below takes none */
+    uint32_t rva=m->dir[DIR_IMPORT][0], size=m->dir[DIR_IMPORT][1];
+    if(!rva || !size) return 0;
+    uint8_t *img=GP(m->base);
+    if(rva>m->size || size>m->size-rva) goto malformed;
+    char from_dir[PATH_MAX];snprintf(from_dir,sizeof(from_dir),"%s",m->path);
+    char *slash=strrchr(from_dir,'/');if(slash) *slash=0;else strcpy(from_dir,".");
+    for(uint32_t off=0;size-off>=20;off+=20) {
+        uint32_t d=rva+off,oft=rd32(img+d),name=rd32(img+d+12),ft=rd32(img+d+16);
+        if(!name && !ft) return 0;
+        const char *dll=image_string(m,name);
+        if(!dll || !*dll || !ft) goto malformed;
         char lerr[256];
-        module_load(dll, from_dir, lerr, sizeof(lerr));
-        uint32_t thunks = oft && oft < m->size ? oft : ft;
-        for (uint32_t i = 0; thunks + i * 4 + 4 <= m->size; i++) {
-            uint32_t e = rd32(img + thunks + i * 4);
-            if (!e)
-                break;
+        if(!module_load(dll,from_dir,lerr,sizeof(lerr))) {
+            snprintf(err,errsize,"%s: cannot load %.80s: %.120s",m->name,dll,lerr);return -1;
+        }
+        uint32_t thunks=oft?oft:ft;
+        for(uint32_t i=0;;i+=4) {
+            if(thunks>m->size || i>m->size-thunks || m->size-thunks-i<4 ||
+               ft>m->size || i>m->size-ft || m->size-ft-i<4) goto malformed;
+            uint32_t e=rd32(img+thunks+i);if(!e) break;
             gp_t addr;
-            if (e & 0x80000000u) {
-                addr = loader_resolve(dll, NULL, (int)(e & 0xFFFF), from_dir);
-                if (!addr) {
-                    char nm[32];
-                    snprintf(nm, sizeof(nm), "#%u", e & 0xFFFF);
-                    addr = api_missing_thunk(dll, nm);
-                }
+            if(e&0x80000000u) {
+                addr=loader_resolve(dll,NULL,(int)(e&0xffff),from_dir);
+                if(!addr) {snprintf(err,errsize,"%s: unresolved import %.100s!#%u",m->name,dll,e&0xffff);return -1;}
             } else {
-                if (e + 2 >= m->size)
-                    break;
-                const char *fn = (const char *)img + e + 2;
-                addr = loader_resolve(dll, fn, 0, from_dir);
-                if (!addr)
-                    addr = api_missing_thunk(dll, fn);
+                const char *fn=e<=m->size && m->size-e>=2?image_string(m,e+2):NULL;
+                if(!fn) goto malformed;
+                addr=loader_resolve(dll,fn,0,from_dir);
+                if(!addr) {snprintf(err,errsize,"%s: unresolved import %.80s!%.100s",m->name,dll,fn);return -1;}
             }
-            if (ft + i * 4 + 4 <= m->size)
-                memcpy(img + ft + i * 4, &addr, 4);
+            memcpy(img+ft+i,&addr,4);
         }
     }
-    (void)err; (void)errsize;
-    return 0;
+malformed:
+    snprintf(err,errsize,"%s: malformed import directory",m->name);return -1;
 }
 
 /* ---- thread local storage ---- */

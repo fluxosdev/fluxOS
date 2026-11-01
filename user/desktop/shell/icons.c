@@ -1,17 +1,16 @@
 /*
- * Icons and the mouse pointer. Icons are PNG files from the Oxygen icon
- * theme in /usr/share/icons/oxygen/<size>x<size>/, loaded the first time
- * they are drawn. If a file is missing, a simple built-in icon drawn
+ * Icons and the mouse pointer. Icons are PNG files from the icon set in
+ * use (theme.icons): KDE's Breeze in /usr/share/icons/breeze, or Oxygen
+ * in /usr/share/icons/oxygen, each in <size>x<size>/, loaded the first
+ * time they are drawn. If a file is missing, a simple built-in icon drawn
  * with rectangles on a 32x32 design grid takes its place.
  */
 #include <stdio.h>
 #include <string.h>
 #include "desktop.h"
 
-#define ICON_DIR "/usr/share/icons/oxygen"
+#define ICON_DIR "/usr/share/icons"
 
-#define PURPLE RGB(0x7B, 0x3F, 0xBF)
-#define ORANGE RGB(0xF0, 0x80, 0x20)
 #define GREEN  RGB(0x20, 0xB0, 0x60)
 #define YELLOW RGB(0xF8, 0xD8, 0x30)
 #define BLUE   RGB(0x00, 0x00, 0xFF)
@@ -277,15 +276,16 @@ static void icon_warning(void)
     P(15, 21, 3, 3, C_BLACK);
 }
 
+static color_t flux_ink = C_BLACK;      /* the logo's color (draw_icon_ink) */
+
+/* The logo (assets/fluxos-logo.svg): a bar across the top and a stem down the left, each 3/8 of
+ * the square, and a band from the corner between them to the bottom right, 45 degrees. */
 static void icon_flux(void)
 {
-    /* Four panes of a flag in the wind. */
-    static const color_t pane[4] = { PURPLE, ORANGE, RGB(0x20, 0xA0, 0xD0), YELLOW };
-    for (int k = 0; k < 4; k++) {
-        int x = k & 1 ? 17 : 3, y = (k & 2 ? 17 : 4) + (k & 1) * 2;
-        P(x, y, 12, 11, pane[k]);
-        frame(x, y, 12, 11, C_BLACK);
-    }
+    for (int y = 0; y < 32; y++)
+        for (int x = 0; x < 32; x++)
+            if (x < 12 || y < 12 || (x + y >= 32 && x - y <= 8 && y - x <= 8))
+                P(x, y, 1, 1, flux_ink);
 }
 
 static const char *const icon_names[ICON_COUNT] = {
@@ -352,22 +352,24 @@ static const int icon_sizes[] = { 16, 24, 32, 48 };
 static struct {
     struct image *img;
     int tried;
-} cache[ICON_COUNT][NSIZES];
+} cache[ICON_SETS][ICON_COUNT][NSIZES];   /* each set's apart: a sample may show the other */
 
 static struct image *icon_image(enum icon_id id, int size)
 {
     if (id <= ICON_NONE || id >= ICON_COUNT || !icon_names[id])
         return NULL;
+    int set = theme.icons >= 0 && theme.icons < ICON_SETS ? theme.icons : ICONS_BREEZE;
     for (int k = 0; k < NSIZES; k++) {
         if (icon_sizes[k] != size)
             continue;
-        if (!cache[id][k].tried) {
+        if (!cache[set][id][k].tried) {
             char path[128];
-            snprintf(path, sizeof(path), ICON_DIR "/%dx%d/%s.png", size, size, icon_names[id]);
-            cache[id][k].img = image_load_png(path);
-            cache[id][k].tried = 1;
+            snprintf(path, sizeof(path), ICON_DIR "/%s/%dx%d/%s.png", icon_set_dirs[set], size, size,
+                     icon_names[id]);
+            cache[set][id][k].img = image_load_png(path);
+            cache[set][id][k].tried = 1;
         }
-        return cache[id][k].img;
+        return cache[set][id][k].img;
     }
     return NULL;
 }
@@ -411,6 +413,27 @@ void draw_icon(struct surface *s, int x, int y, enum icon_id id, int size)
         gfx_image(s, x, y, img);
     else
         draw_builtin(s, x, y, id, size);
+}
+
+void draw_icon_ink(struct surface *s, int x, int y, enum icon_id id, int size, color_t ink)
+{
+    struct image *img = icon_image(id, size);
+    if (!img) {
+        flux_ink = ink;
+        draw_builtin(s, x, y, id, size);
+        flux_ink = C_BLACK;
+        return;
+    }
+    struct rect r = rect_intersect(mkrect(x, y, img->w, img->h), s->clip);
+    for (int j = r.y; j < r.y + r.h; j++) {
+        const uint32_t *src = img->px + (j - y) * img->w;
+        uint32_t *dst = s->px + j * s->stride;
+        for (int i = r.x; i < r.x + r.w; i++) {
+            uint32_t a = src[i - x] >> 24;
+            if (a)
+                dst[i] = gfx_mix(dst[i], ink, (int)a * 256 / 255);
+        }
+    }
 }
 
 enum icon_id icon_by_name(const char *name)

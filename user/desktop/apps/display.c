@@ -55,7 +55,7 @@ enum { DROW_VGA, DROW_VOODOO, DROW_RADEON, DROW_INTEL, DRIVER_ROWS };
 /* Controls, in Tab order. */
 enum ctl {
     K_TABS, K_DRIVER, K_COLORS, K_AREA, K_REFRESH, K_MONITOR,
-    K_WALL, K_BROWSE, K_WALLMODE, K_COLOR, K_THEME, K_ACCENT,
+    K_WALL, K_BROWSE, K_WALLMODE, K_COLOR, K_THEME, K_ICONS, K_ACCENT,
     K_SAVER, K_SAVER_TIME, K_SAVER_SIZE, K_PREVIEW,
     K_OK, K_CANCEL, K_APPLY, K_COUNT
 };
@@ -141,7 +141,7 @@ struct dprops {
     int sb_drag, sb_grab;               /* the list's scroll bar thumb is held */
 
     /* the Appearance page */
-    int style, accent;
+    int style, accent, icons;
 
     /* the Screen Saver page */
     struct saver_config saver;
@@ -422,6 +422,7 @@ static struct rect ctl_rect(enum ctl k)
     switch (k) {
     case K_TABS: return mkrect(6, 4, 370, 22);
     case K_THEME: return mkrect(78, 226, 150, 21);
+    case K_ICONS: return mkrect(288, 226, 100, 21);
     case K_ACCENT: return mkrect(78, 258, ACCENTS * SWATCH_W, 42);
     case K_WALL: return mkrect(18, 190, 268, WALL_ROWS * ITEM_H + 4);
     case K_BROWSE: return mkrect(298, 190, 90, 23);
@@ -452,7 +453,7 @@ static int on_page(struct dprops *d, enum ctl k)
         return d->page == PAGE_MONITOR;
     case K_WALL: case K_BROWSE: case K_WALLMODE: case K_COLOR:
         return d->page == PAGE_BACKGROUND;
-    case K_THEME: case K_ACCENT:
+    case K_THEME: case K_ICONS: case K_ACCENT:
         return d->page == PAGE_APPEARANCE;
     case K_SAVER: case K_SAVER_TIME: case K_SAVER_SIZE: case K_PREVIEW:
         return d->page == PAGE_SAVER;
@@ -573,6 +574,11 @@ static int combo_items(struct dprops *d, enum ctl k, char rows[][48], int *chose
             snprintf(rows[i], 48, "%s", theme_style_names[i]);
         *chosen = d->style;
         return THEME_STYLES;
+    case K_ICONS:
+        for (int i = 0; i < ICON_SETS; i++)
+            snprintf(rows[i], 48, "%s", icon_set_names[i]);
+        *chosen = d->icons;
+        return ICON_SETS;
     default:
         return 0;
     }
@@ -612,6 +618,10 @@ static void choose_item(struct dprops *d, enum ctl k, int i)
     case K_THEME:
         if (i >= 0 && i < THEME_STYLES)
             d->style = i;
+        return;
+    case K_ICONS:
+        if (i >= 0 && i < ICON_SETS)
+            d->icons = i;
         return;
     case K_SAVER:
         d->saver.enabled = i == 1;
@@ -1176,10 +1186,11 @@ static void appearance_page(struct dprops *d, struct surface *s)
     gfx_fill(s, sample.x - 1, sample.y - 1, sample.w + 2, sample.h + 2, C_BLACK);
     struct rect saved = s->clip;
     s->clip = rect_intersect(saved, sample);
-    theme_sample(s, sample, d->style, d->accent);
+    theme_sample(s, sample, d->style, d->accent, d->icons);
     s->clip = saved;
 
     gfx_text(s, &font_sans, 18, 230, "Theme:", C_BLACK);
+    gfx_text(s, &font_sans, 246, 230, "Icons:", C_BLACK);
     int on = ctl_enabled(d, K_ACCENT);
     gfx_text(s, &font_sans, 18, 262, "Color:", on ? C_BLACK : C_SHADOW);
     struct rect a = ctl_rect(K_ACCENT);
@@ -1218,6 +1229,8 @@ static void appearance_page(struct dprops *d, struct surface *s)
                   C_BLACK);
     combo_items(d, K_THEME, rows, &chosen);
     draw_combo(s, ctl_rect(K_THEME), rows[chosen], 1, d->focus == K_THEME, d->open == K_THEME);
+    combo_items(d, K_ICONS, rows, &chosen);
+    draw_combo(s, ctl_rect(K_ICONS), rows[chosen], 1, d->focus == K_ICONS, d->open == K_ICONS);
 }
 
 static void saver_page(struct dprops *d, struct surface *s)
@@ -1620,13 +1633,16 @@ static void background_sync(struct dprops *d)
     wall_select(d, i < 0 ? 0 : i);
 }
 
-/* Put the chosen theme on, and the chosen wallpaper (but for one the theme brings, if the
- * Background page was left alone). */
+/* Put the chosen theme and icons on, and the chosen wallpaper (but for one the theme brings, if
+ * the Background page was left alone). */
 static int apply_look(struct dprops *d)
 {
     int touched = background_changed(d);
-    if (d->style != theme.style || (d->style == THEME_KINETIK && d->accent != theme.accent)) {
-        theme_set(d->style, d->accent, 1);
+    if (d->icons != theme.icons && d->style == theme.style &&
+        (d->style != THEME_KINETIK || d->accent == theme.accent)) {
+        theme_set(d->style, d->accent, d->icons, 1);  /* only the icons: the wallpaper stays */
+    } else if (d->style != theme.style || (d->style == THEME_KINETIK && d->accent != theme.accent)) {
+        theme_set(d->style, d->accent, d->icons, 1);
         if (!touched) {
             background_sync(d);
             return 0;
@@ -1735,6 +1751,7 @@ static void step(struct dprops *d, int dir)
     case K_MONITOR:
     case K_WALLMODE:
     case K_THEME:
+    case K_ICONS:
     case K_SAVER:
     case K_SAVER_TIME:
     case K_SAVER_SIZE: {
@@ -1836,7 +1853,7 @@ static void dp_key(struct window *w, const struct input_event *ev)
         wall_select(d, to < 0 ? 0 : to >= d->nwalls ? d->nwalls - 1 : to);
     } else if (code == KEY_DOWN && (ev->mods & KMOD_ALT) &&
                (d->focus == K_DRIVER || d->focus == K_COLORS || d->focus == K_REFRESH ||
-                d->focus == K_MONITOR || d->focus == K_WALLMODE || d->focus == K_THEME || d->focus == K_SAVER ||
+                d->focus == K_MONITOR || d->focus == K_WALLMODE || d->focus == K_THEME || d->focus == K_ICONS || d->focus == K_SAVER ||
                 d->focus == K_SAVER_TIME || d->focus == K_SAVER_SIZE) && ctl_enabled(d, d->focus)) {
         d->open = d->focus;
         d->hover = -1;
@@ -2106,6 +2123,7 @@ void display_open(void)
     read_grubenv(d->bootdir, d->saved_gfx, d->saved_video, d->saved_driver);
     d->style = theme.style;
     d->accent = theme.accent;
+    d->icons = theme.icons;
     d->saver = saver_get();
     wall_init(d);
     dp_reload(d);

@@ -168,7 +168,7 @@ void wallpaper_theme_changed(int old_style)
         wallpaper_set("", cur_mode, 1);                 /* Classic has no drawn wallpaper of its own */
 }
 
-/* At startup: the saved choice, or the bamboo photograph, filled. */
+/* At startup: the saved choice, or the trees photograph, filled. */
 void wallpaper_init(void)
 {
     char dir[128], path[256], name[16];

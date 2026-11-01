@@ -328,9 +328,9 @@ $(ROOTFS)/bin/dos: $(CRT0) $(DOS_OBJS) $(LIBC) user/user.ld
 # winrun draws Windows programs' windows with the desktop's drawing, fonts and theme, and speaks
 # the window protocol with its plumbing (wmconn.c)
 $(WIN32_OBJS): USER_CFLAGS += -Iuser/desktop/shell
-$(ROOTFS)/bin/winrun: $(CRT0) $(WIN32_OBJS) $(LIBDESKTOP) $(LIBFONT) $(LIBC) user/user.ld
+$(ROOTFS)/bin/winrun: $(CRT0) $(WIN32_OBJS) $(LIBDESKTOP) $(BUILD)/libGL-win32.a $(LIBFONT) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
-	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(WIN32_OBJS) $(LIBDESKTOP) $(LIBFONT) $(LIBC)
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(WIN32_OBJS) $(LIBDESKTOP) $(BUILD)/libGL-win32.a $(LIBFONT) $(LIBC)
 
 # FFmpeg's programs, in /usr/bin with the other ports (and so left out of the in-memory systems the
 # QEMU tests boot, with the toolchain)
@@ -999,7 +999,7 @@ WIN32_TEST_CFLAGS := -m32 -march=i686 -O2 -ffreestanding -fno-pic -fno-pie -fno-
 WIN32_TEST_DEPS := tests/win32/winapi.h tests/win32/imports.h tests/win32/gdip-imports.h tests/win32/imports.S tests/win32/pe.ld
 
 WIN32_SUBSYSTEM = windows
-$(BUILD)/tests/win32/console.exe $(BUILD)/tests/win32/threads.exe $(BUILD)/tests/win32/registry.exe $(BUILD)/tests/win32/gdiplus.exe: WIN32_SUBSYSTEM = console
+$(BUILD)/tests/win32/console.exe $(BUILD)/tests/win32/threads.exe $(BUILD)/tests/win32/registry.exe $(BUILD)/tests/win32/gdiplus.exe $(BUILD)/tests/win32/prephase4.exe $(BUILD)/tests/win32/phase4.exe: WIN32_SUBSYSTEM = console
 
 $(BUILD)/tests/win32/resources.S: tests/win32/resources.py
 	@mkdir -p $(dir $@)
@@ -1008,8 +1008,8 @@ $(BUILD)/tests/win32/resources.S: tests/win32/resources.py
 $(BUILD)/tests/win32/resources.o: $(BUILD)/tests/win32/resources.S
 	$(CC) $(WIN32_TEST_CFLAGS) -c $< -o $@
 
-$(BUILD)/tests/win32/phase2.exe: WIN32_TEST_EXTRA = $(BUILD)/tests/win32/resources.o
-$(BUILD)/tests/win32/phase2.exe: $(BUILD)/tests/win32/resources.o
+$(BUILD)/tests/win32/phase2.exe $(BUILD)/tests/win32/phase4.exe: WIN32_TEST_EXTRA = $(BUILD)/tests/win32/resources.o
+$(BUILD)/tests/win32/phase2.exe $(BUILD)/tests/win32/phase4.exe: $(BUILD)/tests/win32/resources.o
 
 $(BUILD)/tests/win32/imports.o: tests/win32/imports.S tests/win32/imports.h tests/win32/gdip-imports.h
 	@mkdir -p $(dir $@)
@@ -1029,10 +1029,14 @@ $(BUILD)/tests/win32-gui-guest.o: tests/win32-gui-guest.c $(DESKTOP_HDRS)
 $(BUILD)/tests/win32-gui-guest: $(BUILD)/tests/win32-gui-guest.o $(CRT0) $(LIBDESKTOP) $(LIBFONT) $(LIBC) user/user.ld
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBDESKTOP) $(LIBFONT) $(LIBC)
 
+$(BUILD)/tests/win32/bad-imports.stamp: $(BUILD)/tests/win32/console.exe tests/win32/bad-imports.py
+	python3 tests/win32/bad-imports.py $<
+	touch $@
+
 .PHONY: test-win32-gui-qemu
 test-win32-gui-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/win32-gui-guest $(BUILD)/tests/win32/hello.exe \
-                     $(BUILD)/tests/win32/console.exe $(BUILD)/tests/win32/input.exe $(BUILD)/tests/win32/children.exe $(BUILD)/tests/win32/phase2.exe $(BUILD)/tests/win32/threads.exe $(BUILD)/tests/win32/registry.exe $(BUILD)/tests/win32/phase3.exe $(BUILD)/tests/win32/gdiplus.exe
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/win32-gui-guest --memory 512 --cpus $(KERNEL_TEST_CPUS) \
+                     $(BUILD)/tests/win32/console.exe $(BUILD)/tests/win32/input.exe $(BUILD)/tests/win32/children.exe $(BUILD)/tests/win32/phase2.exe $(BUILD)/tests/win32/threads.exe $(BUILD)/tests/win32/registry.exe $(BUILD)/tests/win32/phase3.exe $(BUILD)/tests/win32/gdiplus.exe $(BUILD)/tests/win32/prephase4.exe $(BUILD)/tests/win32/phase4.exe $(BUILD)/tests/win32/phase4-gui.exe $(BUILD)/tests/win32/bad-imports.stamp
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/win32-gui-guest --memory 512 $(WIN32_AUDIO_TEST) --cpus $(KERNEL_TEST_CPUS) \
 		$(TEST_DROP_TOOLCHAIN) --add $(BUILD)/tests/win32/hello.exe:/test/hello.exe \
 		--add $(BUILD)/tests/win32/console.exe:/test/console.exe \
 		--add $(BUILD)/tests/win32/input.exe:/test/input.exe \
@@ -1041,7 +1045,12 @@ test-win32-gui-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/win32-gui-guest $(B
 		--add $(BUILD)/tests/win32/threads.exe:/test/threads.exe \
 		--add $(BUILD)/tests/win32/registry.exe:/test/registry.exe \
 		--add $(BUILD)/tests/win32/phase3.exe:/test/phase3.exe \
-		--add $(BUILD)/tests/win32/gdiplus.exe:/test/gdiplus.exe --timeout 120 \
+		--add $(BUILD)/tests/win32/gdiplus.exe:/test/gdiplus.exe --add $(BUILD)/tests/win32/prephase4.exe:/test/prephase4.exe \
+		--add $(BUILD)/tests/win32/phase4.exe:/test/phase4.exe \
+		--add $(BUILD)/tests/win32/phase4-gui.exe:/test/phase4-gui.exe \
+		--add $(BUILD)/tests/win32/missing-dll.exe:/test/missing-dll.exe \
+		--add $(BUILD)/tests/win32/missing-ordinal.exe:/test/missing-ordinal.exe \
+		--add $(BUILD)/tests/win32/missing-symbol.exe:/test/missing-symbol.exe --timeout 120 \
 		--success-marker "WIN32 GUI REGRESSIONS PASSED"
 
 $(BUILD)/tests/browser-navigation: tests/browser-navigation.c user/desktop/wave/webutil.c $(DESKTOP_HDRS)
@@ -1109,3 +1118,39 @@ test-win32-pe: $(BUILD)/tests/win32-pe
 $(BUILD)/tests/win32-pe: tests/win32-pe.c user/win32/pe.c user/win32/win32.h
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -ffunction-sections -fdata-sections -Iinclude $< -Wl,--gc-sections -o $@
+
+.PHONY: test-win32-messages
+test-win32-messages: $(BUILD)/tests/win32-messages
+	$<
+
+$(BUILD)/tests/win32-messages: tests/win32-messages.c user/win32/messages.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -g -Wall -Wextra $< -o $@
+
+.PHONY: test-win32-regions
+test-win32-regions: $(BUILD)/tests/win32-regions
+	$<
+
+$(BUILD)/tests/win32-regions: tests/win32-regions.c user/win32/region.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra $< -o $@
+
+$(BUILD)/generated/win32-gl.inc: user/include/GL/gl.h tools/gen-win32-gl.py
+	@mkdir -p $(dir $@)
+	python3 tools/gen-win32-gl.py $< $@
+
+$(BUILD)/u/user/win32/opengl32.o: $(BUILD)/generated/win32-gl.inc
+$(BUILD)/u/user/win32/opengl32.o: USER_CFLAGS += -I$(BUILD)/generated
+
+.PHONY: test-win32-phase4-qemu
+test-win32-phase4-qemu: WIN32_AUDIO_TEST=--sound sb16 --opl
+test-win32-phase4-qemu: test-win32-gui-qemu
+
+WIN32_GL_OBJS := $(patsubst user/gl/%.c,$(BUILD)/win32-gl/%.o,$(wildcard user/gl/*.c))
+$(BUILD)/win32-gl/%.o: user/gl/%.c user/win32/graphics-memory.h
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -Dmalloc=win_graphics_malloc -Dcalloc=win_graphics_calloc -Drealloc=win_graphics_realloc -Dfree=win_graphics_free -c $< -o $@
+
+$(BUILD)/libGL-win32.a: $(WIN32_GL_OBJS)
+	@rm -f $@
+	$(AR) rcs $@ $^

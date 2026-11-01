@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include "crt.h"
 #include "os.h"
+#include "threads.h"
 
 #define A(i) (a[i])
 #define S(i) gstr(a[i])
@@ -1365,6 +1366,24 @@ XDEF(_set_se_translator) { (void)a; return 0; }
 XDEF(__RTDynamicCast) { return A(0); }
 XDEF(__std_terminate) { return api_terminate(a); }
 
+/* call_guest_on accepts both cdecl and stdcall thread entry points. */
+DEF(_beginthread)
+{
+    if(!A(0)) {crt_set_errno(CRT_EINVAL);return 0xffffffffu;}
+    HANDLE h=win_thread_create(A(1),A(0),A(2),0,0);
+    if(!h) {crt_set_errno(11);return 0xffffffffu;}
+    win_thread_autoclose(h);return h;
+}
+DEF(_beginthreadex)
+{
+    if(!A(2) || (A(4)&~0x10004u)) {crt_set_errno(CRT_EINVAL);return 0;}
+    HANDLE h=win_thread_create(A(1),A(2),A(3),A(4),A(5));
+    if(!h) crt_set_errno(11);
+    return h;
+}
+DEF(_endthread) {(void)a;win_thread_end_crt();}
+DEF(_endthreadex) {win_thread_exit(A(0));}
+
 /* ---- the export table ---- */
 
 /* An entry whose x87 argument is ST(0) but whose result is an integer in edx:eax. */
@@ -1374,6 +1393,7 @@ XDEF(__std_terminate) { return api_terminate(a); }
 static gp_t iob_data, commode_data, fmode_data, initenv_data, wininitenv_data, mb_cur_max_data, argc_data, argv_data;
 
 static const struct api_entry msvcrt_entries[] = {
+    APIC(_beginthread), APIC(_beginthreadex), APIC(_endthread), APIC(_endthreadex),
     APIC(_errno), APIC(__doserrno), APIC(_get_errno), APIC(_set_errno), APIC(strerror), APIC(_strerror),
     APIC(strerror_s), APIC(perror),
     APIC(__getmainargs), APIC(__wgetmainargs), APIC(__p___argc), APIC(__p___argv), APIC(__p___wargv),

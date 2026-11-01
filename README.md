@@ -290,15 +290,15 @@ says why.
   the desktop composes from. A program that hangs or crashes takes only its own windows
   with it; one that exits when its last window closes frees what it used. They can be
   started from a terminal too (`paint picture.png`, `wave https://...`).
-- Four themes, chosen on the **Appearance** page of Display Properties. **Kinetik**
-  (the default): frames with rounded corners and a soft shadow, captions, taskbar
+- Four themes, chosen on the **Appearance** page of Display Properties. **Kinetik**:
+  frames with rounded corners and a soft shadow, captions, taskbar
   and Start menu heading in a gradient of the theme's color with centered titles,
   glassy Start and taskbar buttons, light blue-gray faces with flat outlines, and its
   own wallpaper (a gradient, a glow and sweeping curves, drawn at the screen's size),
   in Blue, Purple, Orange, Green, White or Black; UI text is anti-aliased Archivo.
   **Kinetik Glass**: Kinetik with see-through frames, taskbar and sidebar.
-  **Seashell**: Kinetik flat and light, in warm sage grays with dark captions, solid
-  sidebar cards, a restrained blue for selections and a plain sage gradient wallpaper.
+  **Seashell** (the default): Kinetik flat and light, in warm sage grays with dark captions,
+  solid sidebar cards, a restrained blue for selections and a plain sage gradient wallpaper.
   **Classic**: the Windows 95 look, a purple desktop, gray beveled windows with navy
   captions, and Liberation Sans. Either way the desktop is a folder browsed on the
   wallpaper (below) with a taskbar (Start button, a button per window, clock, volume
@@ -321,7 +321,8 @@ says why.
   (click for Task Manager), added or removed from its menu (the heading's button,
   "Add widgets...", or a right click). Right-click the taskbar for **Show
   Sidebar**. It is on by default at 1024 pixels wide and more; the choice is kept.
-- Oxygen icons (PNG), PNG, JPEG, GIF and SVG decoding (the first bytes decide,
+- KDE's Breeze icons (PNG; Oxygen's older ones can be chosen instead on the Appearance
+  page), PNG, JPEG, GIF and SVG decoding (the first bytes decide,
   whatever the name), and a wallpaper (Fill, Stretch, Center or Tile).
 - Windows move, minimize, maximize and cascade; the browser, text editor, file
   manager, Task Manager, Gears and Chess resize by dragging an edge.
@@ -361,7 +362,7 @@ says why.
   a file without sound the wall's. `ffmpeg` and `ffprobe` are in `/usr/bin`.
 - **Display Properties**: wallpaper and fill mode with a preview (with **(None)** chosen, a
   `#rrggbb` field sets the solid desktop color; **Kinetik** is the theme's drawn
-  wallpaper), the theme and its color with a live sample, resolution,
+  wallpaper), the theme, its color and the icons (Breeze or Oxygen) with a live sample, resolution,
   color depth and refresh rate (with a 15 s "keep this mode?" prompt on the
   3dfx and Radeon drivers), monitor type and EDID details. Settings are saved
   in GRUB's environment block on an installed system.
@@ -1000,8 +1001,8 @@ Makefile, linker.ld        build and kernel link script
 grub/grub.cfg              boot menu
 include/flux/              kernel <-> user ABI (syscall numbers, structs, errno)
 lib/                       string/printf routines and the 8x16 font, shared by kernel and libc
-tools/                     mkfont.py (fonts), oxygen-icons.py (icons), mksounds.py (sounds),
-                           mklogo.py (the logo for the startup and shutdown screens)
+tools/                     mkfont.py (fonts), breeze-icons.py and oxygen-icons.py (icons), mksounds.py (sounds),
+                           mklogo.py (the logo for the startup and shutdown screens, and its icon)
 kernel/core/               boot.S, entry.S, kmain, cpu/fpu/sse, gdt/idt, smp, timer,
                            pmm/vmm/heap, proc/exec/syscall, pci, tty/serial/kprintf
 kernel/acpi/               acpi (tables, namespace, power-off), osl (uACPI's kernel
@@ -1340,16 +1341,17 @@ The FPU state is saved with FXSAVE, so AVX and later cannot be used.
 
 ## Credits
 
-The default wallpaper, `/usr/share/wallpapers/bamboo.jpg`, is a photograph by
-kazuend on [Unsplash](https://unsplash.com), `mountains.jpg` one by Štefan
-Štefančík, and `shore.jpg` one by Nattu Adnan, and `waves.jpg` one by Almas Salakhov, all used under the [Unsplash License](https://unsplash.com/license).
+The default wallpaper, `/usr/share/wallpapers/trees.jpg`, is a photograph by
+Geranimo on [Unsplash](https://unsplash.com); `bamboo.jpg` is one by kazuend, `mountains.jpg` one by
+Štefan Štefančík, `shore.jpg` one by Nattu Adnan and `waves.jpg` one by Almas Salakhov, all used under
+the [Unsplash License](https://unsplash.com/license).
 Thank you for sharing them.
 
 The startup, shutdown and error sounds (`/usr/share/sounds/startup.wav`, `shutdown.wav` and
 `error.wav`) are made from the Zero-G sample library.
 
-The icons are from KDE's [Oxygen icon
-theme](https://invent.kde.org/frameworks/oxygen-icons5) (LGPL-3.0-or-later), and the desktop's
+The icons are from KDE's [Breeze](https://invent.kde.org/frameworks/breeze-icons) and
+[Oxygen](https://invent.kde.org/frameworks/oxygen-icons5) icon themes (both LGPL-3.0-or-later), and the desktop's
 text is rasterised from Liberation Sans, Serif and Mono and, in the Kinetik theme, from
 [Archivo](https://fonts.google.com/specimen/Archivo) by The Archivo Project Authors (SIL Open
 Font License 1.1; its license is in `/usr/share/doc/fonts/LICENSE.archivo`). Kinetik's look follows the

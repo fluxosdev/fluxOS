@@ -2,7 +2,7 @@
  * Power on the desktop: the battery in the taskbar's tray, the kernel's
  * news about power (IEV_POWER events), and sleep.
  *
- * The battery icon (Oxygen's) shows the charge in six steps, with a bolt
+ * The battery icon (from the icon set in use) shows the charge in six steps, with a bolt
  * while the AC adapter is in; clicking it opens the Power dialog
  * (apps.c). Closing the lid, the sleep button or the Shut Down dialog's
  * Sleep suspend the machine; once it is back everything is drawn again,

@@ -1,0 +1,10 @@
+Icons from the Breeze icon theme (KDE, breeze-icons 5.115), LGPL-3.0-or-later.
+Source: https://invent.kde.org/frameworks/breeze-icons
+Rendered from Breeze's SVGs with tools/breeze-icons.py, each from the design made for its size, or
+else the next larger one. The names are freedesktop.org's, as in the Oxygen set beside this one:
+media-cdrom is Breeze's media-optical, system-installer its system-software-install,
+battery-low its battery-020 (Breeze's own battery-low is the same as its battery-040), and the
+battery-charging-* ones its battery-*-charging (battery-charging is battery-100-charging).
+fluxos.png is the fluxOS logo (assets/fluxos-logo.svg, made by tools/mklogo.py), not part of
+Breeze. wave.png is the Wave browser icon, rendered from assets/wave.svg (user-supplied artwork),
+also not part of Breeze; both are the same files as in the Oxygen set.

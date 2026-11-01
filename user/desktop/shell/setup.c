@@ -449,7 +449,7 @@ static void paint(struct setup *s)
     gfx_fill(sf, panel.x, panel.y, panel.w, panel.h, C_DESKTOP);
     gfx_bevel(sf, panel, BEVEL_SUNKEN);
     int cx = panel.x + panel.w / 2;
-    draw_icon(sf, cx - 24, panel.y + 40, ICON_FLUX, 48);
+    draw_icon_ink(sf, cx - 24, panel.y + 40, ICON_FLUX, 48, C_WHITE);    /* like the title under it */
     draw_icon(sf, cx - 24, panel.y + 120, ICON_INSTALL, 48);
     int tw = gfx_text_width(&font_sans_bold, "fluxOS Setup");
     gfx_text(sf, &font_sans_bold, cx - tw / 2, panel.y + panel.h - 30, "fluxOS Setup", C_WHITE);

@@ -64,6 +64,7 @@ static void apply_state(const struct wm_state *s)
 {
     state = *s;
     state.wall_path[sizeof(state.wall_path) - 1] = 0;
+    theme.icons = s->icons;
     theme_apply(s->style, s->accent);
     mouse_set_config(s->mouse, s->mouse_saved);
 }

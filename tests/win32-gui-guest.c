@@ -343,6 +343,21 @@ static void child_title(const char *title)
     REQUIRE(!strcmp(seen_title, title));
 }
 
+static void run_phase4_gui(int lfd,const struct wm_state *state)
+{
+    int pid=spawn("/test/phase4-gui.exe",-1);struct pollfd p={lfd,POLLIN,0};REQUIRE(poll(&p,1,15000)==1);
+    int fd=accept(lfd,NULL,NULL);REQUIRE(fd>=0);fcntl(fd,F_SETFL,O_NONBLOCK);wm_conn_init(&conn,fd);
+    struct wm_msg *m=expect(C_HELLO);send_msg(S_STATE,0,m->serial,state,sizeof(*state));free(m);
+    m=expect(C_CREATE);const struct wm_create *cr=wm_payload(m);CHECK(cr->w==32 && cr->h==32);uint32_t win=m->win;
+    struct surface surface;struct wm_buffer buffer={new_buffer(&surface,32,32),32,32,1,0};
+    send_msg(S_BUFFER,win,m->serial,&buffer,sizeof(buffer));free(m);await_paint(32,32,NULL,0);
+    pixel(&surface,0,0,0x00ff00);pixel(&surface,31,31,0x00ff00);
+    struct surface resized;struct wm_buffer next={new_buffer(&resized,48,40),48,40,2,1};send_msg(S_BUFFER,win,0,&next,sizeof(next));await_paint(48,40,NULL,0);
+    pixel(&resized,0,0,0x00ff00);pixel(&resized,47,39,0x00ff00);send_msg(S_CLOSE,win,0,NULL,0);
+    int code=wait_exit(pid);printf("guest: phase4-gui.exe exited with %d\n",code);CHECK(code==27);
+    shm_surface_detach(&surface);shmctl(buffer.shmid,IPC_RMID,NULL);shm_surface_detach(&resized);shmctl(next.shmid,IPC_RMID,NULL);wm_conn_close(&conn);
+}
+
 static void run_children(int lfd, const struct wm_state *st)
 {
     int pid = spawn("/test/children.exe", -1);
@@ -485,6 +500,18 @@ int main(void)
     printf("guest: console.exe exited with %d\n", code);
     CHECK(code == 5);
 
+    const char *bad_exes[]={"/test/missing-dll.exe","/test/missing-ordinal.exe","/test/missing-symbol.exe"};
+    const char *expected[]={"ABSENT32.dll","!#65535","!XXXXXXXX"};
+    for(int i=0;i<3;i++) {
+        int fds[2];REQUIRE(pipe(fds)==0);int child=spawn(bad_exes[i],fds[1]);close(fds[1]);
+        char diagnostic[1024];int used=0,got;
+        while(used<(int)sizeof(diagnostic)-1 && (got=read(fds[0],diagnostic+used,sizeof(diagnostic)-1-used))>0) used+=got;
+        diagnostic[used]=0;close(fds[0]);
+        int status=wait_exit(child);printf("guest: loader diagnostic: %s",diagnostic);
+        CHECK(status==126 && strstr(diagnostic,expected[i]) && !strstr(diagnostic,"access violation"));
+    }
+    int prep=wait_exit(spawn("/test/prephase4.exe",-1));printf("guest: prephase4.exe exited with %d\n",prep);CHECK(prep==23);
+    int phase4=wait_exit(spawn("/test/phase4.exe",-1));printf("guest: phase4.exe exited with %d\n",phase4);CHECK(phase4==25);
     int gdip=wait_exit(spawn("/test/gdiplus.exe",-1));printf("guest: gdiplus.exe exited with %d\n",gdip);CHECK(gdip==21);
     int threaded=wait_exit(spawn("/test/threads.exe",-1));
     printf("guest: threads.exe exited with %d\n",threaded);CHECK(threaded==15);
@@ -589,6 +616,7 @@ int main(void)
 
     run_input(lfd, &st);
     run_children(lfd, &st);
+    run_phase4_gui(lfd, &st);
     run_phase2(lfd, &st);
     run_phase3(lfd, &st);
     finish();
