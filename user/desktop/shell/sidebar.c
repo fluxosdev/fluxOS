@@ -8,8 +8,8 @@
  * "Add widgets..." at the foot. Under Classic it takes the gray faces and
  * navy title strips of Windows 95 instead, and under Kinetik Glass it is
  * smoked glass with the desktop and windows showing through. Under
- * Seashell it is pale and flat, after the Kinetik Flat study: solid cards
- * with recessed faces and graphs, and its blue for the hands and bars.
+ * Seashell it is pale and flat, after the Kinetik Flat study: solid,
+ * unshadowed cards with recessed faces and graphs, and its blue for the hands and bars.
  *
  * The widgets are an analog clock (clicking it opens Date and Time), the
  * month's calendar (paged with its arrows; clicking the month comes back
@@ -268,7 +268,6 @@ static void paint_body(struct surface *s, int w, int h)
         static const int pos[2] = { 0, 256 };
         static const color_t body[2] = { ARGB(255, 0xEDF0EC), ARGB(255, 0xD5DED9) };
         gfx_gradient(s, mkrect(0, 0, w, h), 0, 0, 2, body, pos);
-        tint(s, mkrect(0, 0, 1, h), ARGB(255, 0x8D9F98));
         tint(s, mkrect(1, 0, 1, h), ARGB(191, 0xFFFFFF));
         chrome_fill(s, mkrect(2, 0, w - 2, HEAD_H), 0, 0);
         tint(s, mkrect(2, 1, w - 2, 1), ARGB(255, 0xFFFFFF));
@@ -329,10 +328,9 @@ static void paint_card(struct surface *s, struct rect r, const char *title, cons
         gfx_round_frame(s, r, 5, 5, ARGB(178, 0x58616A));
         chrome_fill(s, strip, 4, 0);
         tint(s, mkrect(strip.x + 5, strip.y, strip.w - 10, 1), ARGB(41, 0xFFFFFF));
-    } else if (SEASHELL) {              /* solid, softly shadowed, the strip ruled off */
+    } else if (SEASHELL) {              /* solid and flat, the strip ruled off */
         static const int pos[2] = { 0, 256 };
         static const color_t fill[2] = { ARGB(255, 0xFAFBF8), ARGB(255, 0xEDF1EC) };
-        gfx_shadow(s, r, 5, 3, 3, ARGB(41, 0x263D3E));
         gfx_gradient(s, r, 5, 5, 2, fill, pos);
         chrome_fill(s, strip, 4, 0);
         tint(s, mkrect(strip.x + 4, strip.y, strip.w - 8, 1), ARGB(255, 0xFFFFFF));
@@ -376,7 +374,6 @@ static void paint_clock(struct surface *s, struct rect r, const struct tm *tm)
     color_t face_ink = KINETIK ? ink() : C_BLACK, sec = hot();
     if (SEASHELL) {
         struct rect face = mkrect(cx - FACE_R, cy - FACE_R, 2 * FACE_R + 1, 2 * FACE_R + 1);
-        gfx_shadow(s, face, FACE_R, 1, 1, ARGB(46, 0x263D3E));
         recess(s, face, FACE_R, 0xB7C6BE);
         gfx_round_frame(s, mkrect(face.x + 2, face.y + 2, face.w - 4, face.h - 4), FACE_R - 2, FACE_R - 2,
                         ARGB(178, 0xFFFFFF));

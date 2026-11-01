@@ -37,6 +37,7 @@
 #include <unistd.h>
 #include "desktop.h"
 #include "imagejobs.h"
+#include "executable.h"
 
 /* The desktop's folder draws the wallpaper, which only the desktop has (the File Manager never
  * shows the desktop's folder). */
@@ -195,22 +196,6 @@ static int has_suffix(const char *name, const char *suffix)
     return n > k && !strcasecmp(name + n - k, suffix);
 }
 
-/* A DOS program, which runs under /bin/dos: .COM, or an MZ executable. */
-static int is_dos_program(const char *path)
-{
-    if (has_suffix(path, ".com"))
-        return 1;
-    if (!has_suffix(path, ".exe"))
-        return 0;
-    char head[2];
-    int fd = open(path, O_RDONLY);
-    if (fd < 0)
-        return 0;
-    int n = (int)read(fd, head, sizeof(head));
-    close(fd);
-    return n == 2 && ((head[0] == 'M' && head[1] == 'Z') || (head[0] == 'Z' && head[1] == 'M'));
-}
-
 /* Files the double-click opens in the text editor. */
 static int is_text_name(const char *name)
 {
@@ -300,7 +285,7 @@ static enum icon_id classify(struct fm *f, const struct entry *e, const char *pa
         has_suffix(e->name, ".ts") || has_suffix(e->name, ".asf"))
         return ICON_VIDEO;
     struct stat st;
-    if (is_dos_program(path) || (stat(path, &st) == 0 && (st.st_mode & 0111) && is_program(path)))
+    if (foreign_program_loader(path) || (stat(path, &st) == 0 && (st.st_mode & 0111) && is_program(path)))
         return ICON_RUN;
     return ICON_README;
 }
@@ -1388,11 +1373,12 @@ static void open_file(const char *dir, const char *name, const char *path, enum 
     } else if (icon == ICON_ARCHIVE) {
         launch1("archiver", path);
     } else if (icon == ICON_RUN) {
-        /* DOS programs go through the emulator even without execute permission.
+        /* Foreign programs use their loader even without execute permission.
          * Programs start in their own folder, as on Windows: a DOS game's
          * setup program runs the game by a name relative to it. */
-        const char *dos_argv[] = { "/bin/dos", path, NULL }, *argv[] = { path, NULL };
-        launch_terminal(dir, name, is_dos_program(path) ? dos_argv : argv, 1);
+        const char *loader = foreign_program_loader(path);
+        const char *foreign_argv[] = { loader, path, NULL }, *argv[] = { path, NULL };
+        launch_terminal(dir, name, loader ? foreign_argv : argv, 1);
     } else if (is_text_name(name)) {
         launch1("editor", path);
     } else {

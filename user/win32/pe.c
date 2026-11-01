@@ -23,7 +23,7 @@
 static uint16_t rd16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
 static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 
-/* The headers of a file, read into a buffer: 0 on success. */
+/* The headers of a file: return the number of bytes read, or -1. */
 static int read_headers(int fd, uint8_t *hdr, uint32_t hdrsize, uint32_t *nt_off, char *err, size_t errsize)
 {
     lseek(fd, 0, SEEK_SET);
@@ -33,11 +33,11 @@ static int read_headers(int fd, uint8_t *hdr, uint32_t hdrsize, uint32_t *nt_off
         return -1;
     }
     uint32_t off = rd32(hdr + 0x3C);
-    if (off + 0x100 > hdrsize) {
+    if (off < 0x40 || off > (uint32_t)n || (uint32_t)n - off < 24) {
         snprintf(err, errsize, "header too far into the file");
         return -1;
     }
-    if (off + 4 > (uint32_t)n || memcmp(hdr + off, "PE\0\0", 4) != 0) {
+    if (memcmp(hdr + off, "PE\0\0", 4) != 0) {
         snprintf(err, errsize, "not a Windows program (no PE header)");
         return -1;
     }
@@ -45,12 +45,22 @@ static int read_headers(int fd, uint8_t *hdr, uint32_t hdrsize, uint32_t *nt_off
         snprintf(err, errsize, "not a 32-bit x86 program (machine %04x)", rd16(hdr + off + 4));
         return -1;
     }
+    uint32_t opt_size = rd16(hdr + off + 20);
+    if (opt_size < 96 || opt_size > (uint32_t)n - off - 24) {
+        snprintf(err, errsize, "truncated optional header");
+        return -1;
+    }
+    uint32_t ndirs = rd32(hdr + off + 24 + 92);
+    if (ndirs > (opt_size - 96) / 8) {
+        snprintf(err, errsize, "truncated data directories");
+        return -1;
+    }
     if (rd16(hdr + off + 24) != 0x10B) {
         snprintf(err, errsize, "not a 32-bit program (optional header magic %04x)", rd16(hdr + off + 24));
         return -1;
     }
     *nt_off = off;
-    return 0;
+    return n;
 }
 
 int pe_file_info(const char *path, uint16_t *subsystem, int *is_dll)
@@ -121,28 +131,36 @@ int pe_map(const char *path, struct module *m, char *err, size_t errsize)
     }
     uint8_t hdr[4096];
     uint32_t nt;
-    if (read_headers(fd, hdr, sizeof(hdr), &nt, err, errsize) < 0) {
+    int have = read_headers(fd, hdr, sizeof(hdr), &nt, err, errsize);
+    if (have < 0) {
         close(fd);
         return -1;
     }
     struct stat st;
-    fstat(fd, &st);
+    if (fstat(fd, &st) < 0) {
+        snprintf(err, errsize, "cannot stat the program");
+        close(fd);
+        return -1;
+    }
     const uint8_t *fh = hdr + nt + 4, *oh = hdr + nt + 24;
     uint16_t nsections = rd16(fh + 2), characteristics = rd16(fh + 18);
     uint16_t opt_size = rd16(fh + 16);
     uint32_t image_base = rd32(oh + 28), size_of_image = rd32(oh + 56), size_of_headers = rd32(oh + 60);
     uint32_t section_align = rd32(oh + 32);
     uint32_t sect_off = nt + 24 + opt_size;
-    if (sect_off + nsections * 40u > sizeof(hdr) || size_of_headers > sizeof(hdr)) {
-        /* a bigger header: read the section table where it is */
-        if (sect_off + nsections * 40u > sizeof(hdr)) {
-            snprintf(err, errsize, "too many sections");
-            close(fd);
-            return -1;
-        }
+    if (sect_off > (uint32_t)have || nsections > ((uint32_t)have - sect_off) / 40 ||
+        size_of_headers < sect_off + nsections * 40u || size_of_headers > (uint32_t)st.st_size) {
+        snprintf(err, errsize, "truncated image headers or section table");
+        close(fd);
+        return -1;
     }
     if (!size_of_image || size_of_image < size_of_headers || size_of_image > 0x40000000u) {
         snprintf(err, errsize, "bad image size %u", size_of_image);
+        close(fd);
+        return -1;
+    }
+    if (rd32(oh + 16) >= size_of_image) {
+        snprintf(err, errsize, "entry point outside the image");
         close(fd);
         return -1;
     }

@@ -1037,3 +1037,18 @@ $(BUILD)/tests/browser-storage: tests/browser-storage.c user/desktop/wave/websto
 $(BUILD)/tests/browser-vector-text: tests/browser-vector-text.c user/desktop/image/svg.c $(addprefix user/desktop/wave/,html.c shadow.c css.c csscolor.c cssfont.c anim.c webutil.c webtext.h) $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g $(DESKTOP_INC) -Iinclude tests/browser-vector-text.c user/desktop/image/svg.c user/desktop/wave/html.c user/desktop/wave/shadow.c user/desktop/wave/css.c user/desktop/wave/csscolor.c user/desktop/wave/cssfont.c user/desktop/wave/anim.c user/desktop/wave/webutil.c -lm -o $@
+
+.PHONY: test-executable-routing test-win32-pe
+test-executable-routing: $(BUILD)/tests/executable-routing
+	$<
+
+$(BUILD)/tests/executable-routing: tests/executable-routing.c user/desktop/shell/executable.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -g -Wall -Wextra $< -o $@
+
+test-win32-pe: $(BUILD)/tests/win32-pe
+	$<
+
+$(BUILD)/tests/win32-pe: tests/win32-pe.c user/win32/pe.c user/win32/win32.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -ffunction-sections -fdata-sections -Iinclude $< -Wl,--gc-sections -o $@

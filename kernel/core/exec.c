@@ -305,7 +305,7 @@ static int is_pe_program(const struct image *img)
         return 0;
     uint32_t off;
     memcpy(&off, img->data + 0x3C, 4);
-    if (off < 0x40 || off > img->size - 4 || (off & 3))
+    if (off < 0x40 || off > img->size - 4)
         return 0;
     uint8_t sig[4];
     if (off + 4 <= img->have)
