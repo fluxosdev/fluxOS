@@ -853,6 +853,11 @@ static void ipc_regressions(void)
     close(c);
     ls = socket(AF_UNIX, SOCK_STREAM, 0); CHECK(ls >= 0);
     CHECK(bind(ls, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    /* file calls that expect a vnode, on a socket that has none: an error, not a kernel fault */
+    struct stat sst;
+    CHECK(fstat(ls, &sst) == 0 && S_ISSOCK(sst.st_mode));
+    CHECK(lseek(ls, 0, SEEK_SET) == -1 && errno == ESPIPE);
+    CHECK(lseek64(ls, 0, SEEK_CUR) == -1 && errno == ESPIPE);
     close(ls);
     puts("guest: AF_UNIX stream sockets passed");
 }

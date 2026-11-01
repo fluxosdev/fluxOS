@@ -41,7 +41,8 @@ struct cpu {
     int nlocks;                         /* spinlocks held here */
     const char *held[CPU_HELD_NAMES];   /* the first few of them, for panics */
     volatile int kicked;                /* sent VEC_RESCHED, not yet scheduled */
-    volatile int tlb_flush;             /* asked to flush its TLB */
+    volatile uint32_t tlb_req;          /* TLB flushes asked of it (smp_flush_tlb) ... */
+    volatile uint32_t tlb_done;         /* ... and the request its latest flush covered */
     uint32_t idle_ticks;                /* timer ticks it found itself idle */
     int from_user;                      /* the latest interrupt or trap here came from user mode */
 } __attribute__((aligned(CPU_CACHE_LINE)));

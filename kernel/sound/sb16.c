@@ -289,7 +289,29 @@ static uint8_t reg_from_level(uint32_t level, int bits)
     return (uint8_t)(((level * max + 50) / 100) << (8 - bits));
 }
 
-static int mixer_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg)
+/* With snd_lock, on a kernel copy of the caller's struct (filled in for MIXER_READ). */
+static int mixer_ioctl_locked(uint32_t req, struct mixer_level *ml)
+{
+    if (ml->channel >= MIXER_CHANNELS)
+        return -EINVAL;
+    uint8_t reg = mixer_regs[ml->channel].reg;
+    int bits = mixer_regs[ml->channel].bits, stereo = mixer_regs[ml->channel].stereo;
+    if (req == MIXER_READ) {
+        ml->left = level_from_reg(mix_read(reg), bits);
+        ml->right = stereo ? level_from_reg(mix_read((uint8_t)(reg + 1)), bits) : ml->left;
+        return 0;
+    }
+    mix_write(reg, reg_from_level(stereo ? ml->left : (ml->left + ml->right) / 2, bits));
+    if (stereo)
+        mix_write((uint8_t)(reg + 1), reg_from_level(ml->right, bits));
+    return 0;
+}
+
+/* ---- the device calls and the interrupt, under snd_lock ---- */
+
+/* User memory is copied with nothing held: a page of it may need faulting
+ * in, which a spinlock holder cannot do (mm_enter). */
+static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
 {
     (void)vn;
     if (req == SOUND_INFO) {
@@ -302,28 +324,11 @@ static int mixer_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg)
     struct mixer_level ml;
     if (copy_from_user(&ml, (const void *)arg, sizeof(ml)) < 0)
         return -EFAULT;
-    if (ml.channel >= MIXER_CHANNELS)
-        return -EINVAL;
-    uint8_t reg = mixer_regs[ml.channel].reg;
-    int bits = mixer_regs[ml.channel].bits, stereo = mixer_regs[ml.channel].stereo;
-    if (req == MIXER_READ) {
-        ml.left = level_from_reg(mix_read(reg), bits);
-        ml.right = stereo ? level_from_reg(mix_read((uint8_t)(reg + 1)), bits) : ml.left;
-        return copy_to_user((void *)arg, &ml, sizeof(ml));
-    }
-    mix_write(reg, reg_from_level(stereo ? ml.left : (ml.left + ml.right) / 2, bits));
-    if (stereo)
-        mix_write((uint8_t)(reg + 1), reg_from_level(ml.right, bits));
-    return 0;
-}
-
-/* ---- the device calls and the interrupt, under snd_lock ---- */
-
-static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
-{
     spin_lock(&snd_lock);
-    int r = mixer_ioctl_locked(vn, req, arg);
+    int r = mixer_ioctl_locked(req, &ml);
     spin_unlock(&snd_lock);
+    if (r == 0 && req == MIXER_READ)
+        r = copy_to_user((void *)arg, &ml, sizeof(ml));
     return r;
 }
 

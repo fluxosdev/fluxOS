@@ -1061,8 +1061,8 @@ static int sys_poll(uint32_t ufds, uint32_t nfds, uint32_t timeout, uint32_t d, 
  */
 static int seek(struct file *f, int64_t off, uint32_t whence, uint64_t *out)
 {
-    if (f->type == FT_PIPE || f->type == FT_SOCKET)
-        return -ESPIPE;
+    if (f->type == FT_PIPE || f->type == FT_SOCKET || f->type == FT_UNIX)
+        return -ESPIPE;                 /* (an AF_UNIX file has no vnode) */
     if (f->vn->type == VN_CHR) {
         *out = 0;
         return 1;                       /* terminals and the like: nowhere to go */
@@ -1224,7 +1224,7 @@ static int sys_fstat(uint32_t fd, uint32_t ust, uint32_t c, uint32_t d, uint32_t
         return -EFAULT;
     struct stat st;
     memset(&st, 0, sizeof(st));
-    if (f->type == FT_SOCKET) {
+    if (f->type == FT_SOCKET || f->type == FT_UNIX) {    /* (an AF_UNIX file has no vnode) */
         st.st_mode = S_IFSOCK | 0777;
         st.st_nlink = 1;
     } else if (f->type == FT_PIPE) {

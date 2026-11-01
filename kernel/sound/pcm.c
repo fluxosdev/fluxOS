@@ -342,16 +342,6 @@ static int stream_poll(struct vnode *vn)
     return r;
 }
 
-static int get_int(uint32_t arg, int *v)
-{
-    return copy_from_user(v, (const void *)arg, sizeof(*v));
-}
-
-static int put_int(uint32_t arg, int v)
-{
-    return copy_to_user((void *)arg, &v, sizeof(v));
-}
-
 /* A new format, once what was written in the old one has played. */
 static int change_format(struct pcm_stream *s, int rate, int channels, int fmt)
 {
@@ -364,11 +354,17 @@ static int change_format(struct pcm_stream *s, int rate, int channels, int fmt)
     return 0;
 }
 
-static int stream_ioctl_locked(struct pcm_stream *s, uint32_t req, uint32_t arg)
+/*
+ * With snd_lock, on kernel copies of the argument: *v is the caller's int
+ * on the way in and the answer on the way out, *bi the GETOSPACE answer.
+ * User memory is copied with nothing held (stream_ioctl): a page of it may
+ * need faulting in, which a spinlock holder cannot do (mm_enter).
+ */
+static int stream_ioctl_locked(struct pcm_stream *s, uint32_t req, int *v, struct audio_buf_info *bi)
 {
     struct pcm *p = s->pcm;
-    int v, r;
-    if (gone(p) && req != SOUND_INFO)
+    int r;
+    if (gone(p))
         return -ENODEV;
     switch (req) {
     case SNDCTL_DSP_RESET:
@@ -386,42 +382,35 @@ static int stream_ioctl_locked(struct pcm_stream *s, uint32_t req, uint32_t arg)
         s->flush = 1;
         kick(p, 1);
         return 0;
-    case SNDCTL_DSP_SPEED:
-        if ((r = get_int(arg, &v)) < 0)
+    case SNDCTL_DSP_SPEED: {
+        int want = *v < MIN_RATE ? MIN_RATE : *v > MAX_RATE ? MAX_RATE : *v;
+        if ((r = change_format(s, want, s->channels, s->fmt)) < 0)
             return r;
-        v = v < MIN_RATE ? MIN_RATE : v > MAX_RATE ? MAX_RATE : v;
-        if ((r = change_format(s, v, s->channels, s->fmt)) < 0)
-            return r;
-        return put_int(arg, s->rate);
+        *v = s->rate;
+        return 0;
+    }
     case SNDCTL_DSP_CHANNELS:
-        if ((r = get_int(arg, &v)) < 0)
+        if ((r = change_format(s, s->rate, *v >= 2 ? 2 : 1, s->fmt)) < 0)
             return r;
-        if ((r = change_format(s, s->rate, v >= 2 ? 2 : 1, s->fmt)) < 0)
-            return r;
-        return put_int(arg, s->channels);
+        *v = s->channels;
+        return 0;
     case SNDCTL_DSP_SETFMT:
-        if ((r = get_int(arg, &v)) < 0)
+        if ((r = change_format(s, s->rate, s->channels, *v == AFMT_S16_LE ? AFMT_S16_LE : AFMT_U8)) < 0)
             return r;
-        if ((r = change_format(s, s->rate, s->channels, v == AFMT_S16_LE ? AFMT_S16_LE : AFMT_U8)) < 0)
-            return r;
-        return put_int(arg, s->fmt);
+        *v = s->fmt;
+        return 0;
     case SNDCTL_DSP_GETOSPACE: {
-        struct audio_buf_info bi;
         uint32_t room = RING_SIZE - ring_used(s);
-        bi.bytes = (int32_t)(room - room % s->uf);
-        bi.fragsize = FRAG_SIZE;
-        bi.fragstotal = RING_SIZE / FRAG_SIZE;
-        bi.fragments = bi.bytes / FRAG_SIZE;
-        return copy_to_user((void *)arg, &bi, sizeof(bi));
+        bi->bytes = (int32_t)(room - room % s->uf);
+        bi->fragsize = FRAG_SIZE;
+        bi->fragstotal = RING_SIZE / FRAG_SIZE;
+        bi->fragments = bi->bytes / FRAG_SIZE;
+        return 0;
     }
     case SNDCTL_DSP_GETODELAY: {
         uint64_t frames = (uint64_t)unplayed(s) * (uint32_t)s->rate / (uint32_t)p->be->rate;
-        return put_int(arg, (int)(ring_used(s) + frames * s->uf));
-    }
-    case SOUND_INFO: {
-        struct sound_info si;
-        sound_get_info(&si);
-        return copy_to_user((void *)arg, &si, sizeof(si));
+        *v = (int)(ring_used(s) + frames * s->uf);
+        return 0;
     }
     }
     return -EINVAL;
@@ -430,12 +419,29 @@ static int stream_ioctl_locked(struct pcm_stream *s, uint32_t req, uint32_t arg)
 static int stream_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
 {
     struct pcm_stream *s = vn->dev_priv;
+    if (req == SOUND_INFO) {            /* answered whether the card is still there or not */
+        struct sound_info si;
+        sound_get_info(&si);
+        return copy_to_user((void *)arg, &si, sizeof(si));
+    }
+    int takes_int = req == SNDCTL_DSP_SPEED || req == SNDCTL_DSP_CHANNELS || req == SNDCTL_DSP_SETFMT;
+    int gives_int = takes_int || req == SNDCTL_DSP_GETODELAY;
+    int v = 0;
+    struct audio_buf_info bi;
+    if (takes_int && copy_from_user(&v, (const void *)arg, sizeof(v)) < 0)
+        return -EFAULT;
     spin_lock(&snd_lock);
-    int r = stream_ioctl_locked(s, req, arg);
+    int r = stream_ioctl_locked(s, req, &v, &bi);
     spin_unlock(&snd_lock);
     if (req == SNDCTL_DSP_RESET && s->pcm->be->recover)
         s->pcm->be->recover();          /* after a stall or drop(), as at an open */
-    return r;
+    if (r < 0)
+        return r;
+    if (gives_int)
+        return copy_to_user((void *)arg, &v, sizeof(v));
+    if (req == SNDCTL_DSP_GETOSPACE)
+        return copy_to_user((void *)arg, &bi, sizeof(bi));
+    return 0;
 }
 
 /* Its last file was closed: what it has plays out, then it goes. */

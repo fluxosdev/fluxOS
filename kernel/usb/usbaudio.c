@@ -431,10 +431,31 @@ static void apply_master(int level)
     }
 }
 
-static int mixer_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg, int *hw_level)
+/* With snd_lock, on a kernel copy of the caller's struct (filled in for MIXER_READ). */
+static int mixer_ioctl_locked(uint32_t req, struct mixer_level *ml, int *hw_level)
+{
+    *hw_level = -1;
+    int *level = ml->channel == MIXER_MASTER ? &ua.master : ml->channel == MIXER_PCM ? &ua.pcm : NULL;
+    if (!level)
+        return -EINVAL;
+    if (req == MIXER_READ) {
+        ml->left = ml->right = (uint32_t)*level;
+        return 0;
+    }
+    uint32_t v = (ml->left + ml->right) / 2;
+    *level = (int)MIN(v, 100u);
+    if (ml->channel == MIXER_MASTER && ua.fu_volume)
+        *hw_level = *level;
+    return 0;
+}
+
+/* ---- the device calls, under snd_lock ---- */
+
+/* User memory is copied with nothing held: a page of it may need faulting
+ * in, which a spinlock holder cannot do (mm_enter). */
+static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
 {
     (void)vn;
-    *hw_level = -1;
     if (req == SOUND_INFO) {
         struct sound_info si;
         sound_get_info(&si);
@@ -445,30 +466,14 @@ static int mixer_ioctl_locked(struct vnode *vn, uint32_t req, uint32_t arg, int 
     struct mixer_level ml;
     if (copy_from_user(&ml, (const void *)arg, sizeof(ml)) < 0)
         return -EFAULT;
-    int *level = ml.channel == MIXER_MASTER ? &ua.master : ml.channel == MIXER_PCM ? &ua.pcm : NULL;
-    if (!level)
-        return -EINVAL;
-    if (req == MIXER_READ) {
-        ml.left = ml.right = (uint32_t)*level;
-        return copy_to_user((void *)arg, &ml, sizeof(ml));
-    }
-    uint32_t v = (ml.left + ml.right) / 2;
-    *level = (int)MIN(v, 100u);
-    if (ml.channel == MIXER_MASTER && ua.fu_volume)
-        *hw_level = *level;
-    return 0;
-}
-
-/* ---- the device calls, under snd_lock ---- */
-
-static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
-{
     int hw_level;
     spin_lock(&snd_lock);
-    int r = mixer_ioctl_locked(vn, req, arg, &hw_level);
+    int r = mixer_ioctl_locked(req, &ml, &hw_level);
     spin_unlock(&snd_lock);
     if (r == 0 && hw_level >= 0)
         apply_master(hw_level);
+    if (r == 0 && req == MIXER_READ)
+        r = copy_to_user((void *)arg, &ml, sizeof(ml));
     return r;
 }
 

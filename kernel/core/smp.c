@@ -87,17 +87,30 @@ static uint8_t unpark_stack[4096] __attribute__((aligned(16)));
 extern char ap_trampoline[], ap_trampoline_end[];
 void ap_main(void) __attribute__((noreturn));
 
+/*
+ * Flush, and record which request this flush answers: the latest seen
+ * before it. A request made during the reload stays unanswered (tlb_done
+ * falls short of it), so its sender keeps waiting for the next flush, which
+ * then covers its change; a single "asked" flag could not tell the two apart.
+ */
 static void flush_local(struct cpu *c)
 {
+    uint32_t req = __atomic_load_n(&c->tlb_req, __ATOMIC_ACQUIRE);
     write_cr3(read_cr3());
-    __atomic_store_n(&c->tlb_flush, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&c->tlb_done, req, __ATOMIC_RELEASE);
+}
+
+static int flush_pending(const struct cpu *c)
+{
+    return __atomic_load_n(&c->tlb_req, __ATOMIC_ACQUIRE) !=
+           __atomic_load_n(&c->tlb_done, __ATOMIC_ACQUIRE);
 }
 
 /* Interrupts off: VEC_TLB cannot arrive, so look for the request here. */
 void smp_tlb_check(void)
 {
     struct cpu *c = this_cpu();
-    if (__atomic_load_n(&c->tlb_flush, __ATOMIC_ACQUIRE))
+    if (flush_pending(c))
         flush_local(c);
 }
 
@@ -521,15 +534,19 @@ void smp_flush_tlb(uint32_t *pd)
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     uint32_t flags = irq_save();
     struct cpu *self = this_cpu();
+    uint32_t want[MAX_CPUS];            /* the request number each asked processor must answer */
+    int asked[MAX_CPUS] = { 0 };
     for (int i = 0; i < ncpus; i++) {
         struct cpu *c = &cpus[i];
         if (c != self && c->pd == pd) {
-            __atomic_store_n(&c->tlb_flush, 1, __ATOMIC_RELEASE);
+            want[i] = __atomic_add_fetch(&c->tlb_req, 1, __ATOMIC_ACQ_REL);
+            asked[i] = 1;
             send_ipi(c, VEC_TLB);
         }
     }
     for (int i = 0; i < ncpus; i++)
-        while (&cpus[i] != self && __atomic_load_n(&cpus[i].tlb_flush, __ATOMIC_ACQUIRE)) {
+        while (asked[i] &&
+               (int32_t)(__atomic_load_n(&cpus[i].tlb_done, __ATOMIC_ACQUIRE) - want[i]) < 0) {
             if (panicking)
                 smp_stopped();
             smp_tlb_check();

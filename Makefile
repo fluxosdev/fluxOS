@@ -785,7 +785,7 @@ $(BUILD)/tests/ffmpeg-guest.o: tests/ffmpeg-guest.c
 $(BUILD)/tests/ffmpeg-guest: $(BUILD)/tests/ffmpeg-guest.o $(CRT0) $(LIBC) user/user.ld
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 
-KERNEL_TEST_MEMORY ?= 256
+KERNEL_TEST_MEMORY ?= 1024
 KERNEL_TEST_CMDLINE ?=
 # The card the mixer test plays on (--sound=sb16, --sound=usb), or empty for none.
 KERNEL_TEST_SOUND ?= --sound
