@@ -1077,8 +1077,6 @@ static void glass(struct rect r, int rad, int pressed)
         static const int p2[2] = { 0, 256 };
         static const color_t up[2] = { ARGB(255, 0xF7F8F5), ARGB(255, 0xDCE2DD) };
         static const color_t down[2] = { ARGB(255, 0xD3DDD8), ARGB(255, 0xE6ECE8) };
-        if (!pressed)
-            gfx_shadow(&screen, r, rad, 1, 2, ARGB(46, 0x263D3E));
         gfx_gradient(&screen, r, rad, rad, 2, pressed ? down : up, p2);
         if (!pressed)
             gfx_round_fill(&screen, mkrect(r.x + rad, r.y + 1, r.w - 2 * rad, 1), 0, 0, ARGB(255, 0xFFFFFF));

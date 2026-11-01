@@ -12,7 +12,6 @@ EMPTY_DLL(version_dll, "VERSION.DLL");
 EMPTY_DLL(winspool_dll, "WINSPOOL.DRV");
 EMPTY_DLL(ws2_32_dll, "WS2_32.DLL");
 EMPTY_DLL(imm32_dll, "IMM32.DLL");
-EMPTY_DLL(shlwapi_dll, "SHLWAPI.DLL");
 EMPTY_DLL(rpcrt4_dll, "RPCRT4.DLL");
 EMPTY_DLL(uxtheme_dll, "UXTHEME.DLL");
 EMPTY_DLL(dwmapi_dll, "DWMAPI.DLL");
