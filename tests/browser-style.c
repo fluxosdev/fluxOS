@@ -442,11 +442,80 @@ static void starting_and_discrete(void)
     arena_free(&a);
 }
 
+/* What a hostile sheet can throw at the parser and matcher: deep calc() nesting, huge numbers and
+ * exponents, selectors that would backtrack exponentially, and a transition outliving its style arena. */
+static void hostile_values(void)
+{
+    struct arena a = {0};
+    int depth = 20000;
+    char *style = malloc((size_t)depth * 2 + 64), *html = malloc((size_t)depth * 2 + 512);
+    CHECK(style && html);
+    int o = sprintf(style, "width: calc(");
+    for (int i = 0; i < depth; i++) style[o++] = '(';
+    o += sprintf(style + o, "5px");
+    for (int i = 0; i < depth; i++) style[o++] = ')';
+    sprintf(style + o, ")");
+    sprintf(html, "<!doctype html><div id='deep' style='%s'></div><div id='ok' style='width: calc(((((7px)))))'></div>"
+                  "<div id='big' style='width: 30000000px; height: 1e2000000000px; min-width: 1e-2000000000px'></div>",
+            style);
+    struct node *root = html_parse(&a, html, (int)strlen(html));
+    css_cascade(&a, root, NULL, 0, 800, 600, NULL, NULL);
+    CHECK(id(root, "ok")->style->width.v == 7);         /* ordinary nesting still works; the deep one is dropped */
+    struct node *big = id(root, "big");
+    CHECK(big->style->width.v == 10000000 && big->style->height.v == 10000000 && big->style->min_width.v == 0);
+    free(style), free(html);
+    arena_free(&a);
+
+    /* ".x div div ... span" with .x just above the span: no match, but every ancestor is a candidate */
+    struct arena b = {0};
+    static char deep[8192], css[512];
+    o = sprintf(deep, "<!doctype html><body>");
+    for (int i = 0; i < 200; i++) o += sprintf(deep + o, "<div>");
+    o += sprintf(deep + o, "<p class=x><span id='s'>t</span></p><i class=x><div><div><em id='m'></em></div></div></i>");
+    o = sprintf(css, ".x");
+    for (int i = 0; i < 12; i++) o += sprintf(css + o, " div");
+    sprintf(css + o, " span, .x div div em { color: #ff0000 }");
+    root = html_parse(&b, deep, (int)strlen(deep));
+    struct sheet *sheet = css_parse(&b, css, (int)strlen(css), 800);
+    css_cascade(&b, root, &sheet, 1, 800, 600, NULL, NULL);     /* finishes at once (was exponential) */
+    CHECK(id(root, "s")->style->color != OPAQUE(0xff0000) && id(root, "m")->style->color == OPAQUE(0xff0000));
+    arena_free(&b);
+
+    /* the browser frees the style arena before each whole cascade: a running transition keeps its name */
+    struct arena doc = {0}, s1 = {0}, s2 = {0}, s3 = {0};
+    const char *page = "<!doctype html><div id='d' class='a'></div>";
+    const char *tcss = "#d { width: 10px; transition: width 1s } #d.b { width: 20px }";
+    root = html_parse(&doc, page, (int)strlen(page));
+    struct node *d = id(root, "d");
+    anim_now = 1000;
+    sheet = css_parse(&doc, tcss, (int)strlen(tcss), 800);
+    css_cascade(&s1, root, &sheet, 1, 800, 600, NULL, NULL);
+    set_class(d, "a b");
+    arena_free(&s1);
+    anim_now = 1100;
+    css_cascade(&s2, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(anim_running(d) && took(root, "transitionrun", "width"));
+    arena_free(&s2);
+    struct arena junk = {0};                    /* likely reuses s2's memory: scribble over it */
+    for (int i = 0; i < 4; i++) {
+        char *x = arena_alloc(&junk, 60000);
+        if (x) memset(x, 'X', 60000);
+    }
+    anim_now = 3000;
+    css_cascade(&s3, root, &sheet, 1, 800, 600, NULL, NULL);
+    CHECK(took(root, "transitionend", "width"));
+    arena_free(&junk);
+    arena_free(&s3);
+    anim_forget(root);
+    arena_free(&doc);
+}
+
 int main(void)
 {
     transitions_and_animations();
     starting_and_discrete();
     entities(); cascade(); cascade_layers(); shadow_selectors_and_adoption(); selector_specificity(); nth_boundaries();
     text_and_interaction_properties(); state_pseudo_classes(); backgrounds_and_overflow(); counters_and_selectors();
+    hostile_values();
     puts("browser HTML/CSS: named references, filtered siblings, cascade specificity, @starting-style, discrete transitions and new properties passed");
 }

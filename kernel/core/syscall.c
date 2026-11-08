@@ -810,7 +810,13 @@ static int file_io(struct file *f, uint8_t *ubuf, uint32_t n, int write)
         }
         if (locked)
             vfs_lock();
-        r = write ? file_write(f, kbuf, chunk) : file_read(f, kbuf, chunk);
+        /* A terminal's device calls do not see the file's flags: O_NONBLOCK goes its own way. */
+        r = -ENOTTY;
+        if ((f->flags & O_NONBLOCK) && f->type == FT_VNODE && f->vn->type == VN_CHR &&
+            (f->flags & O_ACCMODE) != (write ? O_RDONLY : O_WRONLY))
+            r = tty_io_nonblock(f->vn, (char *)kbuf, chunk, write);
+        if (r == -ENOTTY)
+            r = write ? file_write(f, kbuf, chunk) : file_read(f, kbuf, chunk);
         if (locked)
             vfs_unlock();
         if (r < 0)
@@ -861,16 +867,12 @@ static int sys_open(uint32_t upath, uint32_t flags, uint32_t mode, uint32_t d, u
     int r = vfs_resolve(path, current->leader->cwd, &vn);
 
     if (r == -ENOENT && (flags & O_CREAT)) {
-        struct vnode *dir;
-        char name[NAME_MAX + 1];
-        r = vfs_resolve_parent(path, current->leader->cwd, &dir, name);
-        if (r == 0) {
-            r = vfs_create(dir, name, VN_FILE, &vn);
-            if (r == 0 && vn) {
-                uint32_t m = mode ? (mode & 07777) : 0666;
-                vn->mode = (m & ~(current->leader->umask & 0777)) | (m & 07000);
-                vfs_setattr(vn);        /* kept where the filesystem keeps modes (ext2) */
-            }
+        /* (through a dangling symbolic link: made where it points) */
+        r = vfs_create_file(path, current->leader->cwd, (flags & O_EXCL) != 0, &vn);
+        if (r == 0 && vn) {
+            uint32_t m = mode ? (mode & 07777) : 0666;
+            vn->mode = (m & ~(current->leader->umask & 0777)) | (m & 07000);
+            vfs_setattr(vn);            /* kept where the filesystem keeps modes (ext2) */
         }
     } else if (r == 0 && (flags & O_CREAT) && (flags & O_EXCL)) {
         return -EEXIST;
@@ -1307,11 +1309,19 @@ static int sys_getdents(uint32_t fd, uint32_t ubuf, uint32_t count, uint32_t d, 
         return -EFAULT;
     uint32_t used = 0;
     struct dirent de;
-    while (count - used >= sizeof(de) && f->off < UINT32_MAX && vfs_dirent(f->vn, (uint32_t)f->off, &de)) {
+    while (count - used >= sizeof(de) && f->off < UINT32_MAX) {
+        /* Go on after the name returned last, unless lseek moved the offset since. */
+        const char *after = f->dir_after && f->dir_off == f->off ? f->dir_after : NULL;
+        int r = vfs_dirent(f->vn, (uint32_t)f->off, after, &de);
+        if (r <= 0)
+            return used ? (int)used : r;
         if (copy_to_user((uint8_t *)ubuf + used, &de, sizeof(de)) < 0)
             return used ? (int)used : -EFAULT;
         used += sizeof(de);
-        f->off++;
+        if (f->off++ >= 2 && (f->dir_after || (f->dir_after = kmalloc(NAME_MAX + 1)))) {
+            strlcpy(f->dir_after, de.d_name, NAME_MAX + 1);
+            f->dir_off = f->off;
+        }
     }
     return (int)used;
 }
@@ -1410,9 +1420,9 @@ static int sys_times(uint32_t ubuf, uint32_t b, uint32_t c, uint32_t d, uint32_t
     (void)b; (void)c; (void)d; (void)e;
     if (ubuf) {
         struct flux_tms tms = {
-            .tms_utime = current->cpu_ticks,
+            .tms_utime = proc_cpu_ticks(current),       /* the process's, every thread's */
             .tms_stime = 0,
-            .tms_cutime = current->child_ticks,
+            .tms_cutime = current->leader->child_ticks, /* waitpid() keeps it on the leader */
             .tms_cstime = 0,
         };
         if (copy_to_user((void *)ubuf, &tms, sizeof(tms)) < 0)
@@ -1533,11 +1543,12 @@ static int sys_connect(uint32_t fd, uint32_t uaddr, uint32_t len, uint32_t d, ui
         return r < 0 ? r : unix_connect(uf, path);
     }
     struct socket *s;
+    struct file *f;
     struct sockaddr_in sin;
-    int r = get_socket(fd, &s);
+    int r = get_socket_file(fd, &s, &f);
     if (r == 0)
         r = copy_sockaddr(uaddr, len, &sin);
-    return r < 0 ? r : sock_connect(s, &sin);
+    return r < 0 ? r : sock_connect(s, &sin, (f->flags & O_NONBLOCK) != 0);
 }
 
 static int sys_listen(uint32_t fd, uint32_t backlog, uint32_t c, uint32_t d, uint32_t e)
@@ -1567,13 +1578,14 @@ static int sys_accept(uint32_t fd, uint32_t uaddr, uint32_t c, uint32_t d, uint3
         return r;
     }
     struct socket *s, *conn;
+    struct file *f;
     struct sockaddr_in peer;
-    int r = get_socket(fd, &s);
+    int r = get_socket_file(fd, &s, &f);
     if (r < 0)
         return r;
     if (uaddr && user_check_w((void *)uaddr, sizeof(peer)) < 0)
         return -EFAULT;
-    r = sock_accept(s, &conn, &peer);
+    r = sock_accept(s, &conn, &peer, (f->flags & O_NONBLOCK) != 0);
     if (r < 0)
         return r;
     r = install_socket(conn);
@@ -1585,10 +1597,42 @@ static int sys_accept(uint32_t fd, uint32_t uaddr, uint32_t c, uint32_t d, uint3
 static int sys_write(uint32_t fd, uint32_t buf, uint32_t n, uint32_t d, uint32_t e);
 static int sys_read(uint32_t fd, uint32_t buf, uint32_t n, uint32_t d, uint32_t e);
 
+/*
+ * send and recv on an AF_UNIX descriptor, which is connected: no address.
+ * MSG_DONTWAIT makes this one transfer non-blocking through a copy of the
+ * file with O_NONBLOCK, not the descriptor's shared flags; the copy takes
+ * no reference, as get_unix() holds the file (and so the connection) for
+ * the call. MSG_PEEK copies what a read would give and leaves it there:
+ * at most a pipe's worth, which is all a pipe can hold.
+ */
+static int unix_io(struct file *f, uint32_t buf, uint32_t n, uint32_t flags, int write)
+{
+    if ((write ? user_check((void *)buf, n) : user_check_w((void *)buf, n)) < 0)
+        return -EFAULT;
+    if (!write && (flags & MSG_PEEK)) {
+        uint32_t len = MIN(n, (uint32_t)PIPE_SIZE);
+        uint8_t *kbuf = bounce_alloc(len);
+        if (!kbuf)
+            return -ENOMEM;
+        int nonblock = (flags & MSG_DONTWAIT) || (f->flags & O_NONBLOCK);
+        int r = file_peek(f, kbuf, len, nonblock);
+        if (r > 0 && copy_to_user((void *)buf, kbuf, (uint32_t)r) < 0)
+            r = -EFAULT;
+        kfree(kbuf);
+        return r;
+    }
+    if (!(flags & MSG_DONTWAIT))
+        return file_io(f, (uint8_t *)buf, n, write);
+    struct file once = *f;
+    once.flags |= O_NONBLOCK;
+    return file_io(&once, (uint8_t *)buf, n, write);
+}
+
 static int sys_sendto(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, uint32_t uaddr)
 {
-    if (get_unix(fd))
-        return sys_write(fd, buf, n, 0, 0);     /* connected: no address, and no flags kept */
+    struct file *uf = get_unix(fd);
+    if (uf)
+        return unix_io(uf, buf, n, flags, 1);
     struct socket *s;
     struct file *f;
     struct sockaddr_in sin;
@@ -1625,8 +1669,9 @@ static int sys_sendto(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, uin
 
 static int sys_recvfrom(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, uint32_t uaddr)
 {
-    if (get_unix(fd))
-        return sys_read(fd, buf, n, 0, 0);
+    struct file *uf = get_unix(fd);
+    if (uf)
+        return unix_io(uf, buf, n, flags, 0);
     struct socket *s;
     struct file *f;
     struct sockaddr_in sin;

@@ -121,10 +121,17 @@ void wm_conn_consume(struct wm_conn *c)
 
 /* ---- shared surfaces ---- */
 
+/* w x h pixels' bytes fit a size_t (32 bits here): a size that wraps would make a small segment
+ * that is then drawn on as a large one. */
+static int surface_size_ok(int w, int h)
+{
+    return w >= 1 && h >= 1 && (unsigned long long)w * (unsigned long long)h * 4 <= (size_t)-1;
+}
+
 int shm_surface_create(struct surface *s, int w, int h)
 {
     memset(s, 0, sizeof(*s));
-    if (w < 1 || h < 1)
+    if (!surface_size_ok(w, h))
         return -1;
     int id = shmget(IPC_PRIVATE, (size_t)w * (size_t)h * 4, 0);
     if (id < 0)
@@ -140,7 +147,8 @@ int shm_surface_attach(struct surface *s, int shmid, int w, int h)
 {
     memset(s, 0, sizeof(*s));
     struct shmid_ds ds;
-    if (w < 1 || h < 1 || shmctl(shmid, IPC_STAT, &ds) < 0 || ds.shm_segsz < (size_t)w * (size_t)h * 4)
+    if (!surface_size_ok(w, h) || shmctl(shmid, IPC_STAT, &ds) < 0 ||
+        (unsigned long long)ds.shm_segsz < (unsigned long long)w * (unsigned long long)h * 4)
         return -1;
     void *px = shmat(shmid, NULL, 0);
     if (px == (void *)-1)

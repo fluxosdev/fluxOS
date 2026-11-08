@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -173,9 +174,34 @@ pid_t wait(int *status) { return waitpid(-1, status, 0); }
 
 int chdir(const char *path) { return ret(sc1(SYS_chdir, (int)path)); }
 
+/* getcwd(NULL, size), as glibc has it: a buffer of size bytes (0: as long as the path) from
+ * malloc. */
 char *getcwd(char *buf, size_t size)
 {
-    return ret(sc2(SYS_getcwd, (int)buf, (int)size)) < 0 ? NULL : buf;
+    if (buf) {
+        if (!size) {
+            errno = EINVAL;
+            return NULL;
+        }
+        return ret(sc2(SYS_getcwd, (int)buf, (int)size)) < 0 ? NULL : buf;
+    }
+    char *b = malloc(size ? size : PATH_MAX);
+    if (!b) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    if (ret(sc2(SYS_getcwd, (int)b, (int)(size ? size : PATH_MAX))) < 0) {
+        int e = errno;
+        free(b);
+        errno = e;
+        return NULL;
+    }
+    if (!size) {
+        char *shrunk = realloc(b, strlen(b) + 1);
+        if (shrunk)
+            b = shrunk;
+    }
+    return b;
 }
 
 int mkdir(const char *path, mode_t mode)

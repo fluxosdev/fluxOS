@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #include <fnmatch.h>
 #include <getopt.h>
+#include <pthread.h>
 #include <regex.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -12,7 +13,8 @@
 #include <string.h>
 #include <time.h>
 
-int flux_errno;
+__thread int flux_errno;
+int *flux___errno_location(void) { return &flux_errno; }
 
 /* The flux_ versions, with the host's types where they agree (regex_t
  * differs: the flux one is handled as an opaque block). */
@@ -248,9 +250,74 @@ static void test_getopt(void)
     }
 }
 
+/* regexec from several threads at once, each with its own pattern. */
+static void *regex_race(void *arg)
+{
+    int which = (int)(intptr_t)arg & 1;
+    struct flux_regex re;
+    regmatch_t m[3];
+    intptr_t bad = 0;
+    flux_regcomp(&re, which ? "([a-z]+)-([0-9]+)" : "(foo|bar)+(baz)?", REG_EXTENDED);
+    for (int i = 0; i < 5000; i++) {
+        int r = flux_regexec(&re, which ? "xx abc-123 yy" : "..foobarfoo..", 3, m, 0);
+        if (which)
+            bad += r || m[1].rm_so != 3 || m[1].rm_eo != 6 || m[2].rm_so != 7 || m[2].rm_eo != 10;
+        else
+            bad += r || m[0].rm_so != 2 || m[0].rm_eo != 11 || m[1].rm_so != 8 || m[2].rm_so != -1;
+    }
+    flux_regfree(&re);
+    return (void *)bad;
+}
+
+static void test_regex_limits(void)
+{
+    pthread_t t[4];
+    intptr_t bad = 0;
+    for (intptr_t i = 0; i < 4; i++)
+        pthread_create(&t[i], NULL, regex_race, (void *)i);
+    for (int i = 0; i < 4; i++) {
+        void *r;
+        pthread_join(t[i], &r);
+        bad += (intptr_t)r;
+    }
+    checks++;
+    if (bad) {
+        failures++;
+        printf("regexec in 4 threads: %ld wrong results\n", (long)bad);
+    }
+    /* a repeated group recurses per round: a long subject must stop (REG_ESPACE), not overflow */
+    static const char *const deep[] = { "(a)*", "(a|b)*", "([^,]*,)*" };
+    size_t n = 1 << 20;
+    char *s = malloc(n + 1);
+    memset(s, 'a', n);
+    s[n] = 0;
+    for (unsigned i = 0; i < sizeof(deep) / sizeof(deep[0]); i++) {
+        struct flux_regex re;
+        regmatch_t m[1];
+        flux_regcomp(&re, deep[i], REG_EXTENDED);
+        int r = flux_regexec(&re, s, 1, m, 0);
+        checks++;
+        if (r != 0 && r != REG_ESPACE) {
+            failures++;
+            printf("regexec(\"%s\") on 1 MiB: %d\n", deep[i], r);
+        }
+        s[200] = 0;                     /* and a short one still matches whole */
+        r = flux_regexec(&re, s, 1, m, 0);
+        s[200] = 'a';
+        checks++;
+        if (r || m[0].rm_so != 0 || m[0].rm_eo != (deep[i][1] == '[' ? 0 : 200)) {
+            failures++;
+            printf("regexec(\"%s\") on 200 a's: %d [%d, %d]\n", deep[i], r, m[0].rm_so, m[0].rm_eo);
+        }
+        flux_regfree(&re);
+    }
+    free(s);
+}
+
 int main(void)
 {
     test_regex();
+    test_regex_limits();
     test_fnmatch();
     test_time();
     test_getopt();

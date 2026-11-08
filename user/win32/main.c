@@ -6,8 +6,10 @@
  * The kernel runs Windows programs through this, so "./app.exe" and a
  * double-click in the File Manager work too. -d (or WINRUN_DEBUG=1 in the
  * environment) logs every call the program makes into the Windows API on
- * standard error; -s (WINRUN_STRICT=1) stops at the first call of a
- * function winrun does not provide, instead of returning zero from it.
+ * standard error; -s (WINRUN_STRICT=1) is accepted for compatibility: every
+ * import is resolved when the program is loaded, so a program importing a
+ * function winrun does not provide does not start (the import is reported
+ * as unresolved), and there are no calls of missing functions to stop at.
  * Drive C: is /winapps; drive Z: is the fluxOS root (util.c).
  */
 #include <dirent.h>

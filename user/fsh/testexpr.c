@@ -116,6 +116,14 @@ static int te_primary(struct test_state *s)
         return 0;
     }
     int left = s->n - s->pos;
+    /* "x OP y" where it ends the expression (or a -a, -o or ")" follows) is a comparison, even
+     * when x is "!" or "(": [ "$v" = x ] must work whatever $v holds */
+    if (left >= 3 && te_is_binary(s->a[s->pos + 1]) &&
+        (left == 3 || !strcmp(s->a[s->pos + 3], "-a") || !strcmp(s->a[s->pos + 3], "-o") ||
+         !strcmp(s->a[s->pos + 3], ")"))) {
+        s->pos += 3;
+        return te_binary(s, s->a[s->pos - 3], s->a[s->pos - 2], s->a[s->pos - 1]);
+    }
     if (!strcmp(t, "!") && left > 1) {
         s->pos++;
         return !te_primary(s);

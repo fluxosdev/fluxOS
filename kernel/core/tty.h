@@ -33,6 +33,9 @@ int tty_dev_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n);
 int tty_dev_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n);
 int tty_dev_poll(struct vnode *vn);
 int tty_dev_ioctl(struct vnode *vn, uint32_t req, uint32_t arg);   /* TIOCGWINSZ, TIOCSWINSZ */
+/* O_NONBLOCK I/O on a terminal's (or pty master's) node: -EAGAIN rather than waiting;
+ * -ENOTTY if vn is not one. buf is kernel memory. */
+int tty_io_nonblock(struct vnode *vn, char *buf, uint32_t n, int write);
 
 int pty_create(struct file **master, struct file **slave);
 

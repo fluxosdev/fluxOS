@@ -25,6 +25,8 @@
 #define MAX_RULES 128
 #define MAX_DEPTH 24
 #define MAX_PX    2048
+#define MAX_WORK  1e9                   /* pixels and edges worked on for one picture; past that it stops */
+#define MAX_LAYERS 4                    /* clip paths and masks inside each other (each takes two canvases) */
 #define PI        3.14159265358979323846
 
 struct pt { double x, y; };
@@ -166,8 +168,8 @@ static struct pt path_cur(const struct path *p)
 
 static int steps_for(double len, double scale)
 {
-    int n = (int)(len * scale / 3) + 4;
-    return n > 80 ? 80 : n;
+    double n = len * scale / 3 + 4;     /* (in doubles: an int cast of inf or NaN is undefined) */
+    return n < 80 ? (int)n : 80;
 }
 
 static void path_cubic(struct path *p, double x1, double y1, double x2, double y2, double x3, double y3,
@@ -521,6 +523,10 @@ struct canvas {
     int nrules;
     double vw, vh;              /* the viewport, for percentages */
     int failed;
+    double work;                /* what has been done (MAX_WORK): <use> can repeat a lot many times over */
+    int layers;                 /* clip paths and masks being drawn into */
+    const struct node *uses[MAX_DEPTH + 1];     /* the <use> targets being drawn, to stop a cycle */
+    int nuses;
 };
 
 static int parse_color_value(const char *s, int n, const struct gs *g, struct paint *out)
@@ -886,7 +892,7 @@ static void add_user_poly(struct polys *ps, const struct mat *m, const struct pt
 /* Fill the polygons into cv->mask (0..255 coverage). */
 static void rasterize(struct canvas *cv, const struct polys *ps, int evenodd)
 {
-    memset(cv->mask, 0, (size_t)cv->w * (size_t)cv->h);
+    /* (no clearing: each row from ry0 to ry1 is written whole, and nothing reads the others) */
     cv->ry0 = cv->ry1 = 0;
     int ne = 0;
     for (int i = 0; i < ps->n; i++)
@@ -926,6 +932,11 @@ static void rasterize(struct canvas *cv, const struct polys *ps, int evenodd)
     ymin = ymin < 0 ? 0 : ymin > cv->h ? cv->h : ymin;
     ymax = ymax < 0 ? 0 : ymax > cv->h ? cv->h : ymax;
     int y0 = (int)floor(ymin), y1 = (int)ceil(ymax);
+    cv->work += (double)(y1 - y0) * ((double)cv->w + (double)k * SS);
+    if (cv->work > MAX_WORK) {
+        cv->failed = 1;
+        y1 = y0;                        /* too much: nothing more is drawn */
+    }
     cv->ry0 = y0;
     cv->ry1 = y1;
     for (int y = y0; y < y1; y++) {
@@ -1186,6 +1197,7 @@ static int make_shader(struct canvas *cv, const struct paint *p, const struct gs
 /* Blend the mask, shaded, over the canvas. */
 static void composite(struct canvas *cv, const struct shader *sh, double alpha)
 {
+    cv->work += (double)(cv->ry1 - cv->ry0) * cv->w;
     for (int y = cv->ry0; y < cv->ry1; y++) {
         const uint8_t *m = cv->mask + (size_t)y * (size_t)cv->w;
         uint32_t *d = cv->px + (size_t)y * (size_t)cv->w;
@@ -1507,12 +1519,11 @@ static void draw_text(struct canvas *cv, const struct node *n, const struct mat 
         return;
     if (wfont_init() < 0)
         return;
-    double sc = mat_scale(ctm);
-    int px = (int)(g->font_size * sc + 0.5);
-    if (px < 4)
+    double sc = mat_scale(ctm), size = g->font_size * sc + 0.5;
+    if (!(size >= 4))                   /* (NaN too) */
         return;
-    if (px > 100)
-        px = 100;
+    int px = size > 100 ? 100 : (int)size;
+    cv->work += 2.0 * cv->w * cv->h;
     const struct wfont *f = wfont_get(FAM_SANS, g->bold, g->italic, px);
     if (!f)
         return;
@@ -1583,6 +1594,7 @@ static uint32_t svg_over(uint32_t dst,uint32_t src)
 static void draw_node(struct canvas *cv,const struct node *n,struct mat ctm,struct gs g,int depth)
 {
     if(depth>MAX_DEPTH || cv->failed || !n->name)return;
+    if((cv->work+=64)>MAX_WORK){cv->failed=1;return;}
     char value[256];const char *spec=effect_reference(n,"clip-path",value);int len=0,is_mask=0;
     const char *id=spec?ref_id(spec,&len):NULL;
     const struct node *clip=id?find_id(cv->root,id,len):NULL;
@@ -1590,11 +1602,12 @@ static void draw_node(struct canvas *cv,const struct node *n,struct mat ctm,stru
         spec=effect_reference(n,"mask",value);id=spec?ref_id(spec,&len):NULL;
         clip=id?find_id(cv->root,id,len):NULL;is_mask=clip!=NULL;
     }
-    if(!clip || clip==n){draw_node_impl(cv,n,ctm,g,depth);return;}
+    if(!clip || clip==n || cv->layers>=MAX_LAYERS){draw_node_impl(cv,n,ctm,g,depth);return;}
     size_t pixels=(size_t)cv->w*cv->h;
+    cv->work+=3.0*pixels;
     uint32_t *source=calloc(pixels,sizeof(uint32_t)),*coverage=calloc(pixels,sizeof(uint32_t));
     if(!source || !coverage){free(source);free(coverage);cv->failed=1;return;}
-    struct canvas layer=*cv;layer.px=source;draw_node_impl(&layer,n,ctm,g,depth);
+    struct canvas layer=*cv;layer.px=source;layer.layers++;draw_node_impl(&layer,n,ctm,g,depth);
     struct mat clipmat=ctm,t;
     const char *transform=attr(n,"transform");if(transform && svg_parse_transform(transform,&t)==0)clipmat=mat_mul(clipmat,t);
     const char *units=attr(clip,is_mask?"maskcontentunits":"clippathunits");
@@ -1618,7 +1631,7 @@ static void draw_node(struct canvas *cv,const struct node *n,struct mat ctm,stru
         p=(p&0xffffffu)|(((p>>24)*mask+127)/255)<<24;
         cv->px[i]=svg_over(cv->px[i],p);
     }
-    cv->failed|=layer.failed;free(source);free(coverage);
+    cv->failed|=layer.failed;cv->work=layer.work;free(source);free(coverage);
 }
 
 static void draw_node_impl(struct canvas *cv, const struct node *n, struct mat ctm, struct gs g, int depth)
@@ -1659,8 +1672,15 @@ static void draw_node_impl(struct canvas *cv, const struct node *n, struct mat c
         int len;
         const char *id = h ? ref_id(h, &len) : NULL;
         const struct node *t = id ? find_id(cv->root, id, len) : NULL;
-        if (!t || t == n)
+        if (!t || cv->nuses == MAX_DEPTH + 1)
             return;
+        for (const struct node *a = n; a; a = a->parent)
+            if (a == t)
+                return;                 /* it uses what holds it */
+        for (int i = 0; i < cv->nuses; i++)
+            if (cv->uses[i] == t)
+                return;                 /* ...or what uses it */
+        cv->uses[cv->nuses++] = t;
         struct mat tr2 = { 1, 0, 0, 1, len_attr(cv, n, "x", cv->vw, &g), len_attr(cv, n, "y", cv->vh, &g) };
         ctm = mat_mul(ctm, tr2);
         if (name_is(t, "symbol")) {
@@ -1669,6 +1689,7 @@ static void draw_node_impl(struct canvas *cv, const struct node *n, struct mat c
             /* draw the target even if it sits in <defs> */
             draw_node(cv, t, ctm, g, depth + 1);
         }
+        cv->nuses--;
         return;
     }
     if (!strcmp(nm, "rect")) {

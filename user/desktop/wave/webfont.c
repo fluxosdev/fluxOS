@@ -1111,27 +1111,40 @@ static const char *shape_cached(const char *text,int *n,char **owned)
     if(entry->visual_len<0)return text;
     *n=visual_len;return entry->visual;
 }
+/* A downloaded font measures and draws its missing characters with a bundled one, through these same
+ * caches: its text must not stay in a cache slot that the inner call may take over. */
+static const char *shape_owned(const struct wfont *f,const char *text,int *n,char **owned)
+{
+    const char *visual=shape_cached(text,n,owned);
+    if(f->face && !*owned && visual!=text && *n>0 && (*owned=malloc((size_t)*n))) {
+        memcpy(*owned,visual,(size_t)*n);
+        visual=*owned;
+    }
+    return visual;
+}
 int wfont_width(const struct wfont *f, const char *s, int n)
 {
     uint64_t start=web_perf_start();
-    struct measured_text *entry=NULL;
     uint32_t hash=0;
     int length=n;
+    const char *key=s;
     if(n>0 && n<=TEXT_KEY_MAX) {
         hash=text_hash(s,n);
-        entry=&widths[(hash^((uintptr_t)f>>4))%512];
+        struct measured_text *entry=&widths[(hash^((uintptr_t)f>>4))%512];
         if(entry->font==f && entry->epoch==text_epoch && entry->hash==hash && entry->len==n &&
            !memcmp(entry->key,s,(size_t)n)) {
             web_perf.events[WP_WIDTH_HIT]++;web_perf_end(WP_TEXT,start);return entry->width;
         }
-        entry->font=f;entry->epoch=text_epoch;entry->hash=hash;entry->len=n;
-        memcpy(entry->key,s,(size_t)n);
     }
     char *owned;
-    const char *visual=shape_cached(s,&n,&owned);
+    const char *visual=shape_owned(f,s,&n,&owned);
     int width=f->face?downloaded_width(f,visual,n):(width16(f,visual,n)+8)>>4;
+    if(length>0 && length<=TEXT_KEY_MAX) {     /* filled in only now: measuring may have used the slot */
+        struct measured_text *entry=&widths[(hash^((uintptr_t)f>>4))%512];
+        entry->font=f;entry->epoch=text_epoch;entry->hash=hash;entry->len=length;entry->width=width;
+        memcpy(entry->key,key,(size_t)length);
+    }
     free(owned);
-    if(entry && entry->len==length)entry->width=width;
     web_perf_end(WP_TEXT,start);return width;
 }
 
@@ -1196,7 +1209,7 @@ int wfont_draw(struct surface *s,const struct wfont *f,int x,int y,const char *t
 {
     uint64_t start=web_perf_start();
     char *owned;
-    const char *visual=shape_cached(text,&n,&owned);
+    const char *visual=shape_owned(f,text,&n,&owned);
     int advance=draw_visual(s,f,x,y,visual,n,c);
     free(owned);web_perf_end(WP_TEXT,start);return advance;
 }

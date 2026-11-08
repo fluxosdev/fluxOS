@@ -262,6 +262,8 @@ gp_t vm_alloc(gp_t addr, uint32_t size, uint32_t protect, uint32_t type, int fix
 int vm_free(gp_t addr, uint32_t size);          /* release a whole allocation */
 int vm_commit(gp_t addr, uint32_t size, uint32_t protect);  /* within a reservation: marks it */
 int vm_decommit(gp_t addr, uint32_t size);
+gp_t vm_alloc_end(gp_t addr);                   /* the end of the reservation addr is in (0: none) */
+gp_t vm_alloc_stack(uint32_t size);             /* a stack with an unmapped guard below it */
 int vm_protect(gp_t addr, uint32_t size, uint32_t protect, uint32_t *old);
 struct vm_info { gp_t base, alloc_base; uint32_t alloc_protect, size, state, protect, type; };
 int vm_query(gp_t addr, struct vm_info *out);
@@ -438,6 +440,8 @@ int console_read(int fd, char *buf, uint32_t n);
 int console_raw(int on);                /* raw (no echo, no line editing) input mode */
 int console_kbhit(void);
 int console_getch(void);
+/* ---- file mappings (kernel32.c) ---- */
+void file_views_flush(void);           /* at exit: views written back to their files */
 
 /* ---- SEH (seh.c) ---- */
 #define EXCEPTION_ACCESS_VIOLATION 0xC0000005u
@@ -479,6 +483,7 @@ void seh_raise(struct exception_record *rec, struct context *ctx);
 /* A fault in guest code: the registers are those at the fault. Never returns. */
 void seh_fault(uint32_t code, gp_t fault_addr, int write, const struct guest_regs *regs, uint32_t fs) __attribute__((noreturn));
 void seh_unwind(gp_t target_frame, gp_t target_ip, struct exception_record *rec, uint32_t retval, struct context *ctx);
+void seh_reset_depth(void);             /* a longjmp or unwind ended the exception's dispatch */
 extern gp_t unhandled_filter;           /* SetUnhandledExceptionFilter */
 extern gp_t vectored_handlers[8];
 extern int nvectored;

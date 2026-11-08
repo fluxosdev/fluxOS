@@ -172,7 +172,8 @@ static int parse_group(const char *line, struct group *gr)
     if (n < 4)
         return -1;
     int m = 0;
-    for (char *s = strtok(f[3], ","); s && m < 15; s = strtok(NULL, ","))
+    char *save;                         /* strtok_r: the caller's strtok() goes on where it was */
+    for (char *s = strtok_r(f[3], ",", &save); s && m < 15; s = strtok_r(NULL, ",", &save))
         gr_members[m++] = s;
     gr_members[m] = NULL;
     gr->gr_name = f[0];

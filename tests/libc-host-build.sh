@@ -2,7 +2,9 @@
 # Compile fluxOS libc sources for the host, against the fluxOS headers (so
 # they are the code fluxOS runs, with its constants and types), and rename
 # what they define to flux_<name>, so a test can call them next to glibc's.
-# errno becomes flux_errno, which the test defines.
+# errno is (*__errno_location()) in the fluxOS headers: that becomes
+# flux___errno_location, which the test defines (returning its flux_errno),
+# so the errno libc sets is the one the test reads, not glibc's.
 #   tests/libc-host-build.sh OUT.o SOURCE.c...
 set -e
 out=$1
@@ -21,4 +23,5 @@ done
 ld -r -o "$dir/all.o" $objs
 nm "$dir/all.o" | awk '$2 ~ /^[TDBRC]$/ { n = $3; if (n !~ /^__/ || n == "__vformat" || n == "__vscan") print n " flux_" n }' > "$dir/map"
 echo "errno flux_errno" >> "$dir/map"
+echo "__errno_location flux___errno_location" >> "$dir/map"
 objcopy --redefine-syms="$dir/map" "$dir/all.o" "$out"

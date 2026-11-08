@@ -506,8 +506,11 @@ static const char js_chunk_misc[] = JS_SOURCE(
   });
 
   var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  function badChars(text) { return new DOMException(text, "InvalidCharacterError"); }
   lz("btoa", function (s) {
     s = String(s);
+    for (var k = 0; k < s.length; k++)
+      if (s.charCodeAt(k) > 255) throw badChars("The string to be encoded contains characters outside of the Latin1 range.");
     var o = "";
     for (var i = 0; i < s.length; i += 3) {
       var a = s.charCodeAt(i), b = s.charCodeAt(i + 1), c = s.charCodeAt(i + 2);
@@ -517,13 +520,16 @@ static const char js_chunk_misc[] = JS_SOURCE(
     }
     return o;
   });
+  /* forgiving-base64 decode: ASCII white space goes, then up to two = at the end of a whole quantum */
   lz("atob", function (s) {
-    s = String(s).split("=").join("");
+    s = String(s).replace(new RegExp("[\\t\\n\\f\\r ]+", "g"), "");
+    if (s.length % 4 === 0) s = s.replace(new RegExp("==?$"), "");
+    if (s.length % 4 === 1 || new RegExp("[^A-Za-z0-9+/]").test(s))
+      throw badChars("The string to be decoded is not correctly encoded.");
     var o = "", bits = 0, acc = 0;
     for (var i = 0; i < s.length; i++) {
       var v = B64.indexOf(s[i]);
-      if (v < 0) continue;
-      acc = (acc << 6) | v;
+      acc = ((acc << 6) | v) & 0xFFFF;
       bits += 6;
       if (bits >= 8) { bits -= 8; o += String.fromCharCode((acc >> bits) & 255); }
     }
@@ -588,13 +594,20 @@ static const char js_chunk_misc[] = JS_SOURCE(
     for (var i = int.length; i > 0; i -= 3) out = int.slice(Math.max(0, i - 3), i) + (out ? sep + out : "");
     return out;
   }
+  /* toFixed, but in digits past 1e21 too (toFixed gives exponent notation there) */
+  function fixed(x, d) {
+    return x >= 1e21 ? BigInt(x).toString() + (d > 0 ? "." + "0".repeat(d) : "") : x.toFixed(d);
+  }
   function roundTo(x, o, fdSet) {
     var s;
     if (o.maximumSignificantDigits !== undefined) {
       /* to so many significant digits (the place the last one is at, from the number's size) */
       var e = x === 0 ? 0 : Math.floor(Math.log(x) / Math.LN10 + 1e-12);
       var places = o.maximumSignificantDigits - 1 - e, f = Math.pow(10, places);
-      s = (Math.round(x * f) / f).toFixed(Math.max(0, places));
+      if (places < 0) {                 /* whole tens, hundreds...: exact from toPrecision */
+        var m = x.toPrecision(o.maximumSignificantDigits).split("e"), dg = m[0].replace(".", "");
+        s = dg + "0".repeat(Math.max(0, Number(m[1] || 0) + 1 - dg.length));
+      } else s = fixed(Math.round(x * f) / f, places);
       if (s.indexOf(".") >= 0) s = s.replace(new RegExp("0+$"), "").replace(new RegExp("[.]$"), "");
       var digits = s.replace(".", "").replace(/^0+/, "").length;
       if (digits < o.minimumSignificantDigits) {
@@ -603,7 +616,7 @@ static const char js_chunk_misc[] = JS_SOURCE(
       }
       return s;
     }
-    s = x.toFixed(o.maximumFractionDigits);
+    s = fixed(x, o.maximumFractionDigits);
     if (s.indexOf(".") >= 0) {
       var keep = s.length - (o.maximumFractionDigits - o.minimumFractionDigits);
       while (s.length > keep && s[s.length - 1] === "0") s = s.slice(0, -1);

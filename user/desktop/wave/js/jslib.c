@@ -85,12 +85,30 @@ static int rel_index(struct js *J, jsval *args, int argc, int i, int def, int le
     return (int)d;
 }
 
-static struct jsobj *this_array(struct js *J, jsval self)
+/* An array whose elements past the dense limit are properties (js.c, splen) is beyond the methods
+ * that walk items[]: a RangeError rather than an answer that misses those elements. */
+static int too_sparse(struct js *J, const struct jsobj *a)
+{
+    if (a->cls == C_ARRAY && a->splen > (uint32_t)a->len) {
+        js_throw_error(J, "RangeError: array too large for this operation");
+        return 1;
+    }
+    return 0;
+}
+
+static struct jsobj *this_any_array(struct js *J, jsval self)
 {
     if (self.t == JS_OBJ && (self.u.o->cls == C_ARRAY || self.u.o->cls == C_ARGUMENTS))
         return self.u.o;
     js_throw_error(J, "TypeError: not an array");
     return NULL;
+}
+
+/* this as an array whose elements are all in items[] (len of them). */
+static struct jsobj *this_array(struct js *J, jsval self)
+{
+    struct jsobj *a = this_any_array(J, self);
+    return a && !too_sparse(J, a) ? a : NULL;
 }
 
 static struct jsstr *this_string(struct js *J, jsval self)
@@ -102,6 +120,13 @@ static struct jsstr *this_string(struct js *J, jsval self)
         return js_mkstr(J, "", 0);
     }
     return js_tostr(J, self);
+}
+
+/* An engine-internal property key (a Map's or Set's entries): a symbol key with the tag "m", which
+ * Symbol() and Symbol.for never make. Scripts are never handed one. */
+static int internal_key(const struct jsstr *k)
+{
+    return js_is_symkey(k) && k->len > 1 && k->s[1] == 'm';
 }
 
 /* ---- Object ---- */
@@ -403,7 +428,8 @@ static jsval object_get_own_descriptors(struct js *J, jsval self, jsval *args, i
         return js_obj(r);
     for (uint32_t i = 0; i < o.u.o->nprops; i++) {
         struct jsstr *key = o.u.o->props[i].key;
-        js_put(J, r, key, descriptor_of(J, o, key), 0);
+        if (!internal_key(key))
+            js_put(J, r, key, descriptor_of(J, o, key), 0);
     }
     return js_obj(r);
 }
@@ -414,7 +440,7 @@ static jsval object_own_symbols(struct js *J, jsval self, jsval *args, int argc)
     struct jsobj *a = js_new_array(J);
     if (ARG(0).t == JS_OBJ)
         for (uint32_t i = 0; i < args[0].u.o->nprops; i++)
-            if (js_is_symkey(args[0].u.o->props[i].key))
+            if (js_is_symkey(args[0].u.o->props[i].key) && !internal_key(args[0].u.o->props[i].key))
                 js_array_push(J, a, js_keyval(args[0].u.o->props[i].key));
     return js_obj(a);
 }
@@ -466,8 +492,8 @@ static jsval proto_has_own(struct js *J, jsval self, jsval *args, int argc)
     uint32_t i;
     if (o->phandler)
         return js_bool(js_has(J, self, key));
-    if ((o->cls == C_ARRAY || o->cls == C_ARGUMENTS) && js_index(strv(key), &i))
-        return js_bool(i < (uint32_t)o->len);
+    if ((o->cls == C_ARRAY || o->cls == C_ARGUMENTS) && js_index(strv(key), &i) && i < (uint32_t)o->len)
+        return js_bool(1);              /* past len: a property, if it is there (js.c) */
     if (o->cls == C_HOST) {
         jsval tmp;
         if (o->hcls->get && o->hcls->get(J, o, key->s, &tmp))
@@ -568,8 +594,11 @@ static jsval function_apply(struct js *J, jsval self, jsval *args, int argc)
     jsval list = ARG(1);
     if (list.t == JS_UNDEF || list.t == JS_NULL)
         return js_call_value(J, self, ARG(0), NULL, 0);
-    if (list.t == JS_OBJ && (list.u.o->cls == C_ARRAY || list.u.o->cls == C_ARGUMENTS))
+    if (list.t == JS_OBJ && (list.u.o->cls == C_ARRAY || list.u.o->cls == C_ARGUMENTS)) {
+        if (too_sparse(J, list.u.o))
+            return js_undefined;
         return js_call_value(J, self, ARG(0), list.u.o->items, list.u.o->len);
+    }
     jsval len = js_get(J, list, "length");
     int n = len.t == JS_NUM ? (int)len.u.n : 0;
     if (n < 0 || n > 65536)
@@ -616,7 +645,11 @@ static jsval array_ctor(struct js *J, jsval self, jsval *args, int argc)
     struct jsobj *a = js_new_array(J);
     if (argc == 1 && args[0].t == JS_NUM) {
         double d = args[0].u.n;
-        if (d < 0 || d != floor(d) || js_array_set_len(J, a, (int)d) < 0)
+        if (!(d >= 0) || d != floor(d) || d > 4294967295.0)
+            return js_throw_error(J, "RangeError: invalid array length");
+        if (d > (1 << 24))
+            a->splen = (uint32_t)d;     /* all holes: past the dense limit, only the length */
+        else if (js_array_set_len(J, a, (int)d) < 0)
             return js_throw_error(J, "RangeError: invalid array length");
         return js_obj(a);
     }
@@ -673,20 +706,40 @@ static jsval array_of(struct js *J, jsval self, jsval *args, int argc)
 
 static jsval array_push(struct js *J, jsval self, jsval *args, int argc)
 {
-    struct jsobj *a = this_array(J, self);
+    struct jsobj *a = this_any_array(J, self);
     if (!a)
         return js_undefined;
-    for (int i = 0; i < argc; i++)
-        js_array_push(J, a, args[i]);
-    return js_num(a->len);
+    for (int i = 0; i < argc; i++) {
+        if (a->cls == C_ARRAY && (a->splen > (uint32_t)a->len || a->len >= (1 << 24))) {
+            /* past the dense limit: a property (js.c) */
+            double at = js_array_length(a);
+            if (at >= 4294967295.0)
+                return js_throw_error(J, "TypeError: array length would exceed 2^32 - 1");
+            js_setv(J, self, js_num(at), args[i]);
+            if (J->throwing)
+                return js_undefined;
+        } else {
+            js_array_push(J, a, args[i]);
+        }
+    }
+    return js_num(js_array_length(a));
 }
 
 static jsval array_pop(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)args;
     (void)argc;
-    struct jsobj *a = this_array(J, self);
-    if (!a || !a->len)
+    struct jsobj *a = this_any_array(J, self);
+    if (!a)
+        return js_undefined;
+    if (a->cls == C_ARRAY && a->splen > (uint32_t)a->len) {    /* the last is past the dense limit */
+        double last = js_array_length(a) - 1;
+        jsval v = js_getv(J, self, js_num(last));
+        if (!J->throwing)
+            js_setv(J, self, js_str(J, "length"), js_num(last));
+        return J->throwing ? js_undefined : v;
+    }
+    if (!a->len)
         return js_undefined;
     return a->items[--a->len];
 }
@@ -710,7 +763,8 @@ static jsval array_unshift(struct js *J, jsval self, jsval *args, int argc)
     if (!a)
         return js_undefined;
     int old = a->len;
-    js_array_set_len(J, a, old + argc);
+    if (js_array_set_len(J, a, old + argc) < 0)
+        return js_throw_error(J, "RangeError: invalid array length");
     memmove(a->items + argc, a->items, sizeof(jsval) * (size_t)old);
     for (int i = 0; i < argc; i++)
         a->items[i] = args[i];
@@ -723,6 +777,8 @@ static jsval array_slice(struct js *J, jsval self, jsval *args, int argc)
     if (!a)
         return js_undefined;
     int from = rel_index(J, args, argc, 0, 0, a->len), to = rel_index(J, args, argc, 1, a->len, a->len);
+    if (to > a->len)                    /* valueOf may have shortened it */
+        to = a->len;
     struct jsobj *r = js_new_array(J);
     for (int i = from; i < to; i++)
         js_array_push(J, r, a->items[i]);
@@ -736,16 +792,30 @@ static jsval array_splice(struct js *J, jsval self, jsval *args, int argc)
         return js_undefined;
     int start = rel_index(J, args, argc, 0, 0, a->len);
     int del = argc < 2 ? a->len - start : int_arg(J, args, argc, 1, 0, 0, a->len - start);
+    if (J->throwing)
+        return js_undefined;
+    /* valueOf may have changed the array: measure against what it is now */
+    if (start > a->len)
+        start = a->len;
+    if (del > a->len - start)
+        del = a->len - start;
+    if (del < 0)
+        del = 0;
     int add = argc > 2 ? argc - 2 : 0;
+    jsval *ins = NULL;                  /* the new items, copied: they may be the array's own */
+    if (add) {
+        ins = js_alloc(J, sizeof(jsval) * (size_t)add);
+        memcpy(ins, args + 2, sizeof(jsval) * (size_t)add);
+    }
     struct jsobj *removed = js_new_array(J);
     for (int i = 0; i < del; i++)
         js_array_push(J, removed, a->items[start + i]);
     int old = a->len, nl = old - del + add;
-    if (nl > old)
-        js_array_set_len(J, a, nl);
+    if (nl > old && js_array_set_len(J, a, nl) < 0)
+        return js_throw_error(J, "RangeError: invalid array length");
     memmove(a->items + start + add, a->items + start + del, sizeof(jsval) * (size_t)(old - start - del));
     for (int i = 0; i < add; i++)
-        a->items[start + i] = args[2 + i];
+        a->items[start + i] = ins[i];
     a->len = nl;
     return js_obj(removed);
 }
@@ -755,6 +825,8 @@ static jsval array_concat(struct js *J, jsval self, jsval *args, int argc)
     struct jsobj *r = js_new_array(J);
     for (int i = -1; i < argc; i++) {
         jsval v = i < 0 ? self : args[i];
+        if (js_is_array(v) && too_sparse(J, v.u.o))
+            return js_undefined;
         if (js_is_array(v))
             for (int k = 0; k < v.u.o->len; k++)
                 js_array_push(J, r, v.u.o->items[k]);
@@ -769,6 +841,8 @@ jsval js_array_join(struct js *J, struct jsobj *a, const char *sep)
     static int depth;
     if (depth > 32)
         return js_str(J, "");
+    if (too_sparse(J, a))
+        return js_undefined;
     depth++;
     /* An element's toString may change the array: join the length it had. */
     int n = a->len, seplen = (int)strlen(sep);
@@ -860,7 +934,20 @@ static jsval array_last_index_of(struct js *J, jsval self, jsval *args, int argc
     struct jsobj *a = this_array(J, self);
     if (!a)
         return js_undefined;
-    for (int i = a->len - 1; i >= 0; i--)
+    int from = a->len - 1;
+    if (argc > 1) {                     /* fromIndex: where to start, counting back */
+        double d = js_to_number(J, args[1]);
+        if (J->throwing)
+            return js_undefined;
+        d = isnan(d) ? 0 : trunc(d);
+        if (d < 0)
+            d += a->len;
+        if (d < from)
+            from = d < -1 ? -1 : (int)d;
+    }
+    if (from >= a->len)                 /* valueOf may have shortened it */
+        from = a->len - 1;
+    for (int i = from; i >= 0; i--)
         if (js_strict_equal(a->items[i], ARG(0)))
             return js_num(i);
     return js_num(-1);
@@ -871,7 +958,8 @@ static jsval array_includes(struct js *J, jsval self, jsval *args, int argc)
     struct jsobj *a = this_array(J, self);
     if (!a)
         return js_undefined;
-    for (int i = 0; i < a->len; i++)
+    int from = rel_index(J, args, argc, 1, 0, a->len);
+    for (int i = from; i < a->len; i++)
         if (same_value_zero(a->items[i], ARG(0)))
             return js_bool(1);
     return js_bool(0);
@@ -958,6 +1046,8 @@ static jsval array_fill(struct js *J, jsval self, jsval *args, int argc)
     if (!a)
         return js_undefined;
     int from = rel_index(J, args, argc, 1, 0, a->len), to = rel_index(J, args, argc, 2, a->len, a->len);
+    if (to > a->len)                    /* valueOf may have shortened it */
+        to = a->len;
     for (int i = from; i < to; i++)
         a->items[i] = ARG(0);
     return self;
@@ -1022,6 +1112,8 @@ static jsval array_flat(struct js *J, jsval self, jsval *args, int argc)
         if (js_is_array(v) && depth > 0) {
             jsval d = js_num(depth - 1);
             jsval inner = array_flat(J, v, &d, 1);
+            if (J->throwing)
+                return js_undefined;
             for (int k = 0; k < inner.u.o->len; k++)
                 js_array_push(J, r, inner.u.o->items[k]);
         } else {
@@ -1103,6 +1195,28 @@ static jsval string_from_char_code(struct js *J, jsval self, jsval *args, int ar
                 cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                 i++;
             }
+        }
+        n += utf8_put(buf + n, cp);
+    }
+    return js_strn(J, buf, n);
+}
+
+static jsval string_from_code_point(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    char *buf = js_alloc(J, (size_t)argc * 4 + 1);
+    int n = 0;
+    for (int i = 0; i < argc; i++) {
+        double d = js_to_number(J, args[i]);
+        if (J->throwing)
+            return js_undefined;
+        if (!(d >= 0 && d <= 0x10FFFF) || d != trunc(d))
+            return js_throw_error(J, "RangeError: Invalid code point %s", js_text(J, args[i]));
+        int cp = (int)d;
+        if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < argc && args[i + 1].t == JS_NUM &&
+            args[i + 1].u.n >= 0xDC00 && args[i + 1].u.n < 0xE000 && args[i + 1].u.n == trunc(args[i + 1].u.n)) {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + ((int)args[i + 1].u.n - 0xDC00);   /* a surrogate pair */
+            i++;
         }
         n += utf8_put(buf + n, cp);
     }
@@ -1474,11 +1588,14 @@ static jsval regexp_exec(struct js *J, jsval self, jsval *args, int argc)
     int start = 0, global = re_global(re) || strchr(re_flags(re), 'y');
     if (global) {
         double li = js_to_number(J, js_get(J, self, "lastIndex"));
-        start = isnan(li) || li < 0 ? 0 : (int)li;
-        if (start > s->len) {
+        if (J->throwing)
+            return js_undefined;
+        li = isnan(li) || li < 0 ? 0 : trunc(li);
+        if (li > s->len) {              /* compared as a double: no int overflow */
             js_set(J, self, "lastIndex", js_num(0));
             return js_null;
         }
+        start = (int)li;
     }
     int caps[2 * RE_MAX_GROUPS];
     if (re_exec(re, s->s, s->len, start, caps) < 0) {
@@ -1763,68 +1880,147 @@ static double this_number(struct js *J, jsval self)
     return NAN;
 }
 
-/* An integer below 1e21 as decimal digits (long double, so no 64-bit division). */
-static int big_digits(long double v, char *out)
+/*
+ * x's exact decimal digits (x finite and above 0): into dig (room for 800), no trailing zeros;
+ * *e10 is the power of ten of the first. A double needs at most 767 of them.
+ */
+static int exact_digits(double x, char *dig, int *e10)
 {
-    char tmp[64];
+    char b[840];
+    snprintf(b, sizeof(b), "%.780e", x);
     int n = 0;
-    if (v < 1) {
-        out[0] = '0';
-        out[1] = 0;
-        return 1;
-    }
-    while (v >= 1 && n < 60) {
-        long double q = (long double)(long long)(v / 10);
-        if (v >= 9e18L)
-            q = v / 10 - (long double)fmod((double)(v / 10), 1.0);
-        int d = (int)(v - q * 10 + 0.5L);
-        if (d > 9)
-            d = 9;
-        if (d < 0)
-            d = 0;
-        tmp[n++] = (char)('0' + d);
-        v = q;
-    }
-    for (int i = 0; i < n; i++)
-        out[i] = tmp[n - 1 - i];
-    out[n] = 0;
+    const char *p = b;
+    for (; *p && *p != 'e'; p++)
+        if (*p >= '0' && *p <= '9')
+            dig[n++] = *p;
+    *e10 = *p ? atoi(p + 1) : 0;
+    while (n > 1 && dig[n - 1] == '0')
+        n--;
     return n;
+}
+
+/* Keep the first keep digits, rounding halves up as toFixed and the like do: the new count (0 when it
+ * rounds to nothing); a carry out of the first digit makes it "1" and raises *e10. */
+static int round_digits(char *dig, int n, int keep, int *e10)
+{
+    if (keep >= n)
+        return n;
+    if (keep < 0)
+        return 0;
+    if (dig[keep] < '5')
+        return keep;
+    int i = keep - 1;
+    while (i >= 0 && dig[i] == '9')
+        i--;
+    if (i >= 0) {
+        dig[i]++;
+        return i + 1;
+    }
+    dig[0] = '1';                       /* 99.9 up to 100, or 0.5 up to 1 when keep is 0 */
+    (*e10)++;
+    return 1;
+}
+
+/* The digit worth 10^j. */
+static char dec_digit(const char *dig, int n, int e10, int j)
+{
+    int i = e10 - j;
+    return i >= 0 && i < n ? dig[i] : '0';
+}
+
+/* ToIntegerOrInfinity */
+static double int_or_inf(struct js *J, jsval v)
+{
+    double d = js_to_number(J, v);
+    return isnan(d) ? 0 : trunc(d);
 }
 
 static jsval number_to_fixed(struct js *J, jsval self, jsval *args, int argc)
 {
     double x = this_number(J, self);
-    int d = int_arg(J, args, argc, 0, 0, 0, 100);
     if (J->throwing)
         return js_undefined;
+    double f = int_or_inf(J, ARG(0));
+    if (J->throwing)
+        return js_undefined;
+    if (f < 0 || f > 100)
+        return js_throw_error(J, "RangeError: toFixed() digits argument must be between 0 and 100");
     char buf[160];
     if (isnan(x) || isinf(x) || fabs(x) >= 1e21) {
         js_numtostr(x, buf);
         return js_str(J, buf);
     }
-    int neg = x < 0;
-    long double scaled = (long double)fabs(x);
-    for (int i = 0; i < d; i++)
-        scaled *= 10;
-    scaled = (long double)floor((double)(scaled + 0.5L));
-    char digits[128];
-    int n = big_digits(scaled, digits);
-    if (n <= d) {                       /* leading zeros: 0.0x */
-        memmove(digits + (d - n + 1), digits, (size_t)n + 1);
-        memset(digits, '0', (size_t)(d - n + 1));
-        n = d + 1;
-    }
-    int o = 0;
-    if (neg && strspn(digits, "0") != (size_t)n)
+    int d = (int)f, o = 0, e10 = 0, n = 0;
+    char dig[800];
+    if (x < 0)
         buf[o++] = '-';
-    memcpy(buf + o, digits, (size_t)(n - d));
-    o += n - d;
+    if (x != 0) {
+        n = exact_digits(fabs(x), dig, &e10);
+        n = round_digits(dig, n, e10 + d + 1, &e10);
+    }
+    if (!n || e10 < 0) {
+        buf[o++] = '0';
+    } else {
+        for (int j = e10; j >= 0; j--)
+            buf[o++] = dec_digit(dig, n, e10, j);
+    }
     if (d) {
         buf[o++] = '.';
-        memcpy(buf + o, digits + n - d, (size_t)d);
-        o += d;
+        for (int j = -1; j >= -d; j--)
+            buf[o++] = n ? dec_digit(dig, n, e10, j) : '0';
     }
     buf[o] = 0;
+    return js_str(J, buf);
+}
+
+/* d.ddde+x: the significant digits in dig (count n, padded with zeros to p) and the exponent. */
+static void put_exponential(char *buf, int *o, const char *dig, int n, int p, int e10)
+{
+    buf[(*o)++] = n ? dig[0] : '0';
+    if (p > 1) {
+        buf[(*o)++] = '.';
+        for (int i = 1; i < p; i++)
+            buf[(*o)++] = i < n ? dig[i] : '0';
+    }
+    *o += sprintf(buf + *o, "e%c%d", e10 < 0 ? '-' : '+', e10 < 0 ? -e10 : e10);
+}
+
+static jsval number_to_exponential(struct js *J, jsval self, jsval *args, int argc)
+{
+    double x = this_number(J, self);
+    if (J->throwing)
+        return js_undefined;
+    double f = int_or_inf(J, ARG(0));
+    if (J->throwing)
+        return js_undefined;
+    char buf[160], dig[800];
+    if (isnan(x) || isinf(x)) {
+        js_numtostr(x, buf);
+        return js_str(J, buf);
+    }
+    if (f < 0 || f > 100)
+        return js_throw_error(J, "RangeError: toExponential() argument must be between 0 and 100");
+    int o = 0, e10 = 0, n = 0, p;
+    if (x < 0)
+        buf[o++] = '-';
+    if (ARG(0).t == JS_UNDEF) {         /* as many digits as it takes to tell x apart */
+        p = 1;
+        if (x != 0) {
+            for (p = 1; p < 17; p++) {
+                char t[40];
+                snprintf(t, sizeof(t), "%.*e", p - 1, fabs(x));
+                if (strtod(t, NULL) == fabs(x))
+                    break;
+            }
+        }
+    } else {
+        p = (int)f + 1;
+    }
+    if (x != 0) {
+        n = exact_digits(fabs(x), dig, &e10);
+        n = round_digits(dig, n, p, &e10);
+    }
+    put_exponential(buf, &o, dig, n, p, e10);
     return js_str(J, buf);
 }
 
@@ -1870,16 +2066,43 @@ static jsval number_to_string(struct js *J, jsval self, jsval *args, int argc)
 static jsval number_to_precision(struct js *J, jsval self, jsval *args, int argc)
 {
     double x = this_number(J, self);
-    if (argc == 0 || args[0].t == JS_UNDEF || isnan(x) || isinf(x) || x == 0)
+    if (J->throwing)
+        return js_undefined;
+    if (ARG(0).t == JS_UNDEF)
         return number_to_string(J, self, NULL, 0);
-    int p = int_arg(J, args, argc, 0, 1, 1, 21);
-    int e = (int)floor(log10(fabs(x)));
-    int decimals = p - 1 - e;
-    if (decimals >= 0 && decimals <= 20) {
-        jsval d = js_num(decimals);
-        return number_to_fixed(J, self, &d, 1);
+    double f = int_or_inf(J, args[0]);
+    if (J->throwing)
+        return js_undefined;
+    char buf[160], dig[800];
+    if (isnan(x) || isinf(x)) {
+        js_numtostr(x, buf);
+        return js_str(J, buf);
     }
-    return number_to_string(J, self, NULL, 0);
+    if (f < 1 || f > 100)
+        return js_throw_error(J, "RangeError: toPrecision() argument must be between 1 and 100");
+    int p = (int)f, o = 0, e10 = 0, n = 0;
+    if (x < 0)
+        buf[o++] = '-';
+    if (x != 0) {
+        n = exact_digits(fabs(x), dig, &e10);
+        n = round_digits(dig, n, p, &e10);
+    }
+    if (n && (e10 < -6 || e10 >= p)) {
+        put_exponential(buf, &o, dig, n, p, e10);
+    } else if (e10 >= 0 || !n) {
+        for (int j = e10; j > e10 - p; j--) {
+            buf[o++] = dec_digit(dig, n, e10, j);
+            if (j == 0 && p > e10 + 1)
+                buf[o++] = '.';
+        }
+    } else {                            /* 0.000ddd */
+        buf[o++] = '0';
+        buf[o++] = '.';
+        for (int j = -1; j > e10 - p; j--)
+            buf[o++] = dec_digit(dig, n, e10, j);
+    }
+    buf[o] = 0;
+    return js_str(J, buf);
 }
 
 static jsval number_value_of(struct js *J, jsval self, jsval *args, int argc)
@@ -2030,10 +2253,14 @@ static jsval global_is_finite(struct js *J, jsval self, jsval *args, int argc)
 static jsval uri_encode(struct js *J, jsval *args, int argc, const char *keep)
 {
     struct jsstr *s = js_tostr(J, ARG(0));
+    if (J->throwing)
+        return js_undefined;
     char *out = js_alloc(J, (size_t)s->len * 3 + 1);
     int n = 0;
     for (int i = 0; i < s->len; i++) {
         unsigned char c = (unsigned char)s->s[i];
+        if (c == 0xED && i + 1 < s->len && ((unsigned char)s->s[i + 1] & 0xE0) == 0xA0)
+            return js_throw_error(J, "URIError: URI malformed");      /* a lone surrogate */
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
             (c && strchr(keep, c)))
             out[n++] = (char)c;
@@ -2055,30 +2282,135 @@ static jsval global_encode_uri(struct js *J, jsval self, jsval *args, int argc)
     return uri_encode(J, args, argc, "-_.!~*'();/?:@&=+$,#");
 }
 
-static jsval global_escape(struct js *J, jsval self, jsval *args, int argc)
-{
-    (void)self;
-    return uri_encode(J, args, argc, "@*_+-./");
-}
-
 static int hexv(int c)
 {
     return c >= '0' && c <= '9' ? c - '0' : (c | 32) >= 'a' && (c | 32) <= 'f' ? (c | 32) - 'a' + 10 : -1;
 }
 
-static jsval global_decode_uri(struct js *J, jsval self, jsval *args, int argc)
+/* The byte of a %XX at s[i], or -1. */
+static int pct_byte(const struct jsstr *s, int i)
 {
-    (void)self;
+    if (i < 0 || i + 2 >= s->len || s->s[i] != '%' || hexv(s->s[i + 1]) < 0 || hexv(s->s[i + 2]) < 0)
+        return -1;
+    return hexv(s->s[i + 1]) * 16 + hexv(s->s[i + 2]);
+}
+
+/* decodeURI and decodeURIComponent: escapes of whole UTF-8 characters, or a URIError (so no string
+ * ever holds bytes that are not UTF-8); escapes of the characters in keep stay as they are. */
+static jsval uri_decode(struct js *J, jsval *args, int argc, const char *keep)
+{
     struct jsstr *s = js_tostr(J, ARG(0));
+    if (J->throwing)
+        return js_undefined;
     char *out = js_alloc(J, (size_t)s->len + 1);
     int n = 0;
     for (int i = 0; i < s->len; i++) {
-        if (s->s[i] == '%' && i + 2 < s->len && hexv(s->s[i + 1]) >= 0 && hexv(s->s[i + 2]) >= 0) {
-            out[n++] = (char)(hexv(s->s[i + 1]) * 16 + hexv(s->s[i + 2]));
-            i += 2;
-        } else {
+        if (s->s[i] != '%') {
             out[n++] = s->s[i];
+            continue;
         }
+        int b = pct_byte(s, i);
+        if (b < 0)
+            return js_throw_error(J, "URIError: URI malformed");
+        if (b < 0x80) {
+            if (b && strchr(keep, b)) {
+                memcpy(out + n, s->s + i, 3);
+                n += 3;
+            } else {
+                out[n++] = (char)b;
+            }
+            i += 2;
+            continue;
+        }
+        int len = b >= 0xC2 && b <= 0xDF ? 2 : b >= 0xE0 && b <= 0xEF ? 3 : b >= 0xF0 && b <= 0xF4 ? 4 : 0;
+        unsigned char u[4] = { (unsigned char)b };
+        for (int k = 1; k < len; k++) {
+            int c = pct_byte(s, i + 3 * k);
+            if (c < 0x80 || c > 0xBF)
+                return js_throw_error(J, "URIError: URI malformed");
+            u[k] = (unsigned char)c;
+        }
+        if (!len || (b == 0xE0 && u[1] < 0xA0) || (b == 0xED && u[1] > 0x9F) || (b == 0xF0 && u[1] < 0x90) ||
+            (b == 0xF4 && u[1] > 0x8F))             /* overlong, a surrogate, past U+10FFFF */
+            return js_throw_error(J, "URIError: URI malformed");
+        memcpy(out + n, u, (size_t)len);
+        n += len;
+        i += 3 * len - 1;
+    }
+    return js_strn(J, out, n);
+}
+
+static jsval global_decode_uri_component(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    return uri_decode(J, args, argc, "");
+}
+
+static jsval global_decode_uri(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    return uri_decode(J, args, argc, ";/?:@&=+$,#");
+}
+
+/* escape: %XX below 256, %uXXXX above, by UTF-16 code unit. */
+static jsval global_escape(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    struct jsstr *s = js_tostr(J, ARG(0));
+    if (J->throwing)
+        return js_undefined;
+    char *out = js_alloc(J, (size_t)s->len * 6 + 1);
+    int n = 0;
+    const char *p = s->s, *end = s->s + s->len;
+    while (p < end) {
+        int c = utf8_next(&p, end);
+        if (c >= 0x10000) {
+            n += sprintf(out + n, "%%u%04X%%u%04X", 0xD800 + ((c - 0x10000) >> 10), 0xDC00 + ((c - 0x10000) & 0x3FF));
+        } else if (c >= 0x100) {
+            n += sprintf(out + n, "%%u%04X", c);
+        } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                   (c && strchr("@*_+-./", c))) {
+            out[n++] = (char)c;
+        } else {
+            n += sprintf(out + n, "%%%02X", c);
+        }
+    }
+    return js_strn(J, out, n);
+}
+
+/* unescape: %XX and %uXXXX are code units (pairs of surrogates make one character); anything else stays. */
+static jsval global_unescape(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)self;
+    struct jsstr *s = js_tostr(J, ARG(0));
+    if (J->throwing)
+        return js_undefined;
+    char *out = js_alloc(J, (size_t)s->len + 1);
+    int n = 0;
+    for (int i = 0; i < s->len; i++) {
+        int c = -1, used = 0;
+        if (s->s[i] == '%' && i + 5 < s->len && s->s[i + 1] == 'u' && hexv(s->s[i + 2]) >= 0 &&
+            hexv(s->s[i + 3]) >= 0 && hexv(s->s[i + 4]) >= 0 && hexv(s->s[i + 5]) >= 0) {
+            c = hexv(s->s[i + 2]) << 12 | hexv(s->s[i + 3]) << 8 | hexv(s->s[i + 4]) << 4 | hexv(s->s[i + 5]);
+            used = 6;
+        } else if ((c = pct_byte(s, i)) >= 0) {
+            used = 3;
+        }
+        if (c < 0) {
+            out[n++] = s->s[i];
+            continue;
+        }
+        i += used - 1;
+        if (c >= 0xD800 && c < 0xDC00 && i + 6 < s->len && s->s[i + 1] == '%' && s->s[i + 2] == 'u') {
+            int lo = 0, ok = 1;
+            for (int k = 3; k < 7; k++)
+                ok &= hexv(s->s[i + k]) >= 0, lo = lo << 4 | (hexv(s->s[i + k]) & 15);
+            if (ok && lo >= 0xDC00 && lo < 0xE000) {
+                c = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00);
+                i += 6;
+            }
+        }
+        n += utf8_put(out + n, c);
     }
     return js_strn(J, out, n);
 }
@@ -2242,17 +2574,42 @@ static void newline_indent(struct sbuf *b, const char *indent, int depth)
         sb_str(b, indent);
 }
 
-static int json_value(struct sbuf *b, jsval v, const char *indent, int depth)
+struct jstate {
+    struct sbuf b;
+    const char *indent;
+    jsval replacer;                     /* a replacer function, or undefined */
+    struct jsstr **keep;                /* a replacer array's property names, or NULL */
+    int nkeep;
+    struct jsobj **open;                /* the objects being written, outermost first */
+    int depth, cap;
+};
+
+/* SerializeJSONProperty: v is holder[key]. 1 if it is left out (undefined, a function, a symbol). */
+static int json_value(struct jstate *st, jsval holder, jsval key, jsval v)
 {
-    struct js *J = b->J;
-    if (depth > 64) {
-        js_throw_error(J, "TypeError: converting circular structure to JSON");
-        return -1;
-    }
+    struct js *J = st->b.J;
+    struct sbuf *b = &st->b;
     if (v.t == JS_OBJ || v.t == JS_BIG) {
         jsval tojson = js_get(J, v, "toJSON");
-        if (js_is_callable(tojson))
-            v = js_call_value(J, tojson, v, NULL, 0);
+        if (J->throwing)
+            return -1;
+        if (js_is_callable(tojson)) {
+            jsval k = strv(js_tostr(J, key));
+            v = js_call_value(J, tojson, v, &k, 1);
+            if (J->throwing)
+                return -1;
+        }
+    }
+    if (st->replacer.t != JS_UNDEF) {
+        jsval ra[2] = { strv(js_tostr(J, key)), v };
+        v = js_call_value(J, st->replacer, holder, ra, 2);
+        if (J->throwing)
+            return -1;
+    }
+    if (v.t == JS_OBJ && (v.u.o->cls == C_STRING || v.u.o->cls == C_NUMBER || v.u.o->cls == C_BOOLEAN)) {
+        int cls = v.u.o->cls;
+        v = cls == C_NUMBER ? js_num(js_to_number(J, v)) : cls == C_STRING ? strv(js_tostr(J, v))
+                                                                          : js_bool(v.u.o->num != 0);
         if (J->throwing)
             return -1;
     }
@@ -2281,76 +2638,139 @@ static int json_value(struct sbuf *b, jsval v, const char *indent, int depth)
     case JS_OBJ:
         break;
     default:
-        return 1;                       /* undefined: left out */
+        return 1;                       /* undefined and symbols: left out */
     }
     struct jsobj *o = v.u.o;
     if (o->cls == C_FUNCTION)
         return 1;
-    if (o->cls == C_STRING || o->cls == C_NUMBER || o->cls == C_BOOLEAN)
-        return json_value(b, js_to_primitive(J, v, 0), indent, depth);
+    if (js_stack_low(J)) {
+        js_throw_error(J, "RangeError: Maximum call stack size exceeded");
+        return -1;
+    }
+    for (int i = 0; i < st->depth; i++)
+        if (st->open[i] == o) {
+            js_throw_error(J, "TypeError: converting circular structure to JSON");
+            return -1;
+        }
+    if (st->depth == st->cap) {
+        int nc = st->cap ? st->cap * 2 : 16;
+        struct jsobj **no = js_alloc(J, sizeof(*no) * (size_t)nc);
+        if (st->depth)
+            memcpy(no, st->open, sizeof(*no) * (size_t)st->depth);
+        st->open = no;
+        st->cap = nc;
+    }
+    st->open[st->depth++] = o;
+    int depth = st->depth, colon = st->indent && *st->indent ? 2 : 1;
     if (o->cls == C_ARRAY) {
+        if (too_sparse(J, o))
+            return -1;
         sb_add(b, "[", 1);
         for (int i = 0; i < o->len; i++) {
             if (i)
                 sb_add(b, ",", 1);
-            newline_indent(b, indent, depth + 1);
-            int r = json_value(b, o->items[i], indent, depth + 1);
+            newline_indent(b, st->indent, depth);
+            int r = json_value(st, v, js_num(i), o->items[i]);
             if (r < 0)
                 return -1;
             if (r > 0)
                 sb_str(b, "null");
         }
         if (o->len)
-            newline_indent(b, indent, depth);
+            newline_indent(b, st->indent, depth - 1);
         sb_add(b, "]", 1);
-        return 0;
-    }
-    sb_add(b, "{", 1);
-    struct jsstr **keys;
-    int nk = js_keys(J, v, 0, &keys), first = 1;
-    for (int i = 0; i < nk; i++) {
-        jsval pv = js_get_str(J, v, keys[i]);
+    } else {
+        sb_add(b, "{", 1);
+        struct jsstr **keys = st->keep;
+        int nk = st->keep ? st->nkeep : js_keys(J, v, 0, &keys), first = 1;
         if (J->throwing)
             return -1;
-        if (pv.t == JS_UNDEF || pv.t == JS_SYM || js_is_callable(pv))
-            continue;
+        for (int i = 0; i < nk; i++) {
+            jsval pv = js_get_str(J, v, keys[i]);
+            if (J->throwing)
+                return -1;
+            int mark = b->n;            /* taken back if the value is left out */
+            if (!first)
+                sb_add(b, ",", 1);
+            newline_indent(b, st->indent, depth);
+            json_quote(b, keys[i]);
+            sb_add(b, colon == 2 ? ": " : ":", colon);
+            int r = json_value(st, v, strv(keys[i]), pv);
+            if (r < 0)
+                return -1;
+            if (r > 0)
+                b->n = mark;
+            else
+                first = 0;
+        }
         if (!first)
-            sb_add(b, ",", 1);
-        first = 0;
-        newline_indent(b, indent, depth + 1);
-        json_quote(b, keys[i]);
-        sb_add(b, indent && *indent ? ": " : ":", indent && *indent ? 2 : 1);
-        if (json_value(b, pv, indent, depth + 1) < 0)
-            return -1;
+            newline_indent(b, st->indent, depth - 1);
+        sb_add(b, "}", 1);
     }
-    if (!first)
-        newline_indent(b, indent, depth);
-    sb_add(b, "}", 1);
+    st->depth--;
     return 0;
+}
+
+static struct jsstr *json_run(struct jstate *st, jsval v)
+{
+    jsval holder = js_undefined;
+    if (st->replacer.t != JS_UNDEF) {   /* the replacer's first this: { "": v } */
+        struct jsobj *w = js_new_object(st->b.J);
+        js_put(st->b.J, w, js_mkstr(st->b.J, "", 0), v, 0);
+        holder = js_obj(w);
+    }
+    int r = json_value(st, holder, strv(js_mkstr(st->b.J, "", 0)), v);
+    if (r != 0)
+        return NULL;
+    return js_mkstr(st->b.J, st->b.p ? st->b.p : "", st->b.n);
 }
 
 struct jsstr *js_json_stringify(struct js *J, jsval v, const char *indent)
 {
-    struct sbuf b = { J, NULL, 0, 0 };
-    int r = json_value(&b, v, indent, 0);
-    if (r != 0)
-        return NULL;
-    return js_mkstr(J, b.p ? b.p : "", b.n);
+    struct jstate st = { { J, NULL, 0, 0 }, indent, js_undefined, NULL, 0, NULL, 0, 0 };
+    return json_run(&st, v);
 }
 
 static jsval json_stringify(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
-    char indent[16] = "";
-    jsval sp = ARG(2);
-    if (sp.t == JS_NUM) {
-        int n = (int)sp.u.n;
-        for (int i = 0; i < n && i < 10; i++)
-            indent[i] = ' ';
-    } else if (sp.t == JS_STR) {
-        snprintf(indent, sizeof(indent), "%.10s", sp.u.s->s);
+    struct jstate st = { { J, NULL, 0, 0 }, "", js_undefined, NULL, 0, NULL, 0, 0 };
+    jsval rep = ARG(1), sp = ARG(2);
+    if (js_is_callable(rep)) {
+        st.replacer = rep;
+    } else if (js_is_array(rep)) {      /* the names to keep, in this order, once each */
+        int n = rep.u.o->len;
+        st.keep = js_alloc(J, sizeof(*st.keep) * (size_t)(n ? n : 1));
+        for (int i = 0; i < n && i < rep.u.o->len; i++) {
+            jsval e = rep.u.o->items[i];
+            if (!(e.t == JS_STR || e.t == JS_NUM ||
+                  (e.t == JS_OBJ && (e.u.o->cls == C_STRING || e.u.o->cls == C_NUMBER))))
+                continue;
+            struct jsstr *k = js_tostr(J, e);
+            if (J->throwing)
+                return js_undefined;
+            int dup = 0;
+            for (int j = 0; j < st.nkeep && !dup; j++)
+                dup = st.keep[j]->len == k->len && !memcmp(st.keep[j]->s, k->s, (size_t)k->len);
+            if (!dup)
+                st.keep[st.nkeep++] = k;
+        }
     }
-    struct jsstr *s = js_json_stringify(J, ARG(0), indent);
+    if (sp.t == JS_OBJ && sp.u.o->cls == C_NUMBER)
+        sp = js_num(js_to_number(J, sp));
+    else if (sp.t == JS_OBJ && sp.u.o->cls == C_STRING)
+        sp = strv(js_tostr(J, sp));
+    if (J->throwing)
+        return js_undefined;
+    if (sp.t == JS_NUM) {
+        static const char spaces[] = "          ";
+        double n = isnan(sp.u.n) ? 0 : trunc(sp.u.n);
+        st.indent = spaces + 10 - (n < 0 ? 0 : n > 10 ? 10 : (int)n);
+    } else if (sp.t == JS_STR) {
+        int len = js_u16len(sp.u.s);
+        st.indent = js_u16slice(J, sp.u.s, 0, len < 10 ? len : 10)->s;     /* the first ten units */
+    }
+    struct jsstr *s = json_run(&st, ARG(0));
     return s ? strv(s) : js_undefined;
 }
 
@@ -2524,6 +2944,38 @@ static jsval jvalue(struct jparse *p, int depth)
     return js_undefined;
 }
 
+/* InternalizeJSONProperty: holder[name], its members revived first, through the reviver. */
+static jsval json_revive(struct js *J, jsval holder, jsval name, jsval reviver)
+{
+    if (js_stack_low(J))                /* a reviver can hang anything, cycles too, on what is left */
+        return js_throw_error(J, "RangeError: Maximum call stack size exceeded");
+    jsval val = js_getv(J, holder, name);
+    if (J->throwing)
+        return js_undefined;
+    if (val.t == JS_OBJ && val.u.o->cls != C_FUNCTION) {
+        int array = js_is_array(val), n = array ? val.u.o->len : 0;
+        if (array && too_sparse(J, val.u.o))
+            return js_undefined;
+        struct jsstr **keys = NULL;
+        if (!array)
+            n = js_keys(J, val, 0, &keys);
+        for (int i = 0; i < n && !J->throwing; i++) {
+            jsval k = array ? js_num(i) : strv(keys[i]);
+            jsval nv = json_revive(J, val, k, reviver);
+            if (J->throwing)
+                break;
+            if (nv.t == JS_UNDEF)
+                js_delete(J, val, js_tostr(J, k));
+            else
+                js_setv(J, val, k, nv);
+        }
+        if (J->throwing)
+            return js_undefined;
+    }
+    jsval ra[2] = { strv(js_tostr(J, name)), val };
+    return js_call_value(J, reviver, holder, ra, 2);
+}
+
 static jsval json_parse(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
@@ -2535,6 +2987,12 @@ static jsval json_parse(struct js *J, jsval self, jsval *args, int argc)
         p.error = "unexpected text after JSON";
     if (p.error)
         return js_throw_error(J, "SyntaxError: JSON.parse: %s", p.error);
+    if (js_is_callable(ARG(1))) {       /* the reviver, from the leaves up, holder { "": v } first */
+        struct jsobj *root = js_new_object(J);
+        struct jsstr *empty = js_mkstr(J, "", 0);
+        js_put(J, root, empty, v, 0);
+        return json_revive(J, js_obj(root), strv(empty), args[1]);
+    }
     return v;
 }
 
@@ -2779,6 +3237,21 @@ static double parse_date(const char *s)
     return make_time(y, m, d, h, mi, sec, 0) - off * 60000.0;
 }
 
+/* TimeClip: a time a Date can hold, within 100 million days of 1970, or NaN. */
+static double time_clip(double t)
+{
+    if (isnan(t) || fabs(t) > 8.64e15)
+        return NAN;
+    return trunc(t) + 0.0;
+}
+
+/* MakeFullYear: years 0 to 99 given apart are 1900 to 1999. */
+static double full_year(double y)
+{
+    double yi = trunc(y);
+    return !isnan(y) && yi >= 0 && yi <= 99 ? 1900 + yi : y;
+}
+
 static jsval date_ctor(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
@@ -2792,7 +3265,7 @@ static jsval date_ctor(struct js *J, jsval self, jsval *args, int argc)
     else if (argc == 1)
         t = js_to_number(J, args[0]);
     else
-        t = make_time(num_arg(J, args, argc, 0), num_arg(J, args, argc, 1),
+        t = make_time(full_year(num_arg(J, args, argc, 0)), num_arg(J, args, argc, 1),
                       argc > 2 ? num_arg(J, args, argc, 2) : 1, argc > 3 ? num_arg(J, args, argc, 3) : 0,
                       argc > 4 ? num_arg(J, args, argc, 4) : 0, argc > 5 ? num_arg(J, args, argc, 5) : 0,
                       argc > 6 ? num_arg(J, args, argc, 6) : 0);
@@ -2807,7 +3280,7 @@ static jsval date_ctor(struct js *J, jsval self, jsval *args, int argc)
         return js_str(J, b);
     }
     struct jsobj *o = js_mkobj(J, C_DATE, J->date_proto);
-    o->num = isnan(t) ? NAN : trunc(t);
+    o->num = time_clip(t);
     return js_obj(o);
 }
 
@@ -2823,16 +3296,16 @@ static jsval date_now(struct js *J, jsval self, jsval *args, int argc)
 static jsval date_parse_fn(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
-    return js_num(parse_date(js_tostr(J, ARG(0))->s));
+    return js_num(time_clip(parse_date(js_tostr(J, ARG(0))->s)));
 }
 
 static jsval date_utc(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)self;
-    return js_num(make_time(num_arg(J, args, argc, 0), argc > 1 ? num_arg(J, args, argc, 1) : 0,
-                            argc > 2 ? num_arg(J, args, argc, 2) : 1, argc > 3 ? num_arg(J, args, argc, 3) : 0,
-                            argc > 4 ? num_arg(J, args, argc, 4) : 0, argc > 5 ? num_arg(J, args, argc, 5) : 0,
-                            argc > 6 ? num_arg(J, args, argc, 6) : 0));
+    return js_num(time_clip(make_time(full_year(num_arg(J, args, argc, 0)), argc > 1 ? num_arg(J, args, argc, 1) : 0,
+                                      argc > 2 ? num_arg(J, args, argc, 2) : 1, argc > 3 ? num_arg(J, args, argc, 3) : 0,
+                                      argc > 4 ? num_arg(J, args, argc, 4) : 0, argc > 5 ? num_arg(J, args, argc, 5) : 0,
+                                      argc > 6 ? num_arg(J, args, argc, 6) : 0)));
 }
 
 static struct jsobj *this_date(struct js *J, jsval self)
@@ -2895,17 +3368,22 @@ static jsval date_set(struct js *J, jsval self, jsval *args, int argc, int what)
     if (!d)
         return js_undefined;
     if (what == DG_TIME) {
-        d->num = trunc(num_arg(J, args, argc, 0));
+        d->num = time_clip(num_arg(J, args, argc, 0));
         return js_num(d->num);
     }
+    int invalid = isnan(d->num);        /* only setFullYear makes an invalid date valid */
     struct civil c;
-    civil_from_ms(isnan(d->num) ? 0 : d->num, &c);
+    civil_from_ms(invalid ? 0 : d->num, &c);
     double f[7] = { c.year, c.month - 1, c.day, c.hour, c.min, c.sec, c.ms };
     int first = what == DG_YEAR ? 0 : what == DG_MONTH ? 1 : what == DG_DATE ? 2 :
                 what == DG_HOURS ? 3 : what == DG_MINUTES ? 4 : what == DG_SECONDS ? 5 : 6;
     for (int i = 0; i < argc && first + i < 7; i++)
         f[first + i] = js_to_number(J, args[i]);
-    d->num = make_time(f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
+    if (J->throwing)
+        return js_undefined;
+    if (invalid && what != DG_YEAR)
+        return js_num(NAN);
+    d->num = time_clip(make_time(f[0], f[1], f[2], f[3], f[4], f[5], f[6]));
     return js_num(d->num);
 }
 
@@ -2945,8 +3423,9 @@ static jsval date_format(struct js *J, jsval self, int fmt)
     const char *ampm = c.hour < 12 ? "AM" : "PM";
     switch (fmt) {
     case DF_ISO:
-        snprintf(b, sizeof(b), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ", c.year, c.month, c.day, c.hour,
-                 c.min, c.sec, c.ms);
+        snprintf(b, sizeof(b), c.year >= 0 && c.year <= 9999 ? "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ"
+                                                             : "%+07d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+                 c.year, c.month, c.day, c.hour, c.min, c.sec, c.ms);
         break;
     case DF_DATE:
         snprintf(b, sizeof(b), "%s %s %02d %d", wday_names[c.wday], month_names[c.month - 1], c.day, c.year);
@@ -2987,6 +3466,24 @@ DATE_FORMAT(to_locale, DF_LOCALE)
 DATE_FORMAT(to_locale_date, DF_LOCALE_DATE)
 DATE_FORMAT(to_locale_time, DF_LOCALE_TIME)
 DATE_FORMAT(to_utc, DF_UTC)
+
+/* toJSON: null for an invalid date (JSON.stringify must not throw for one), else toISOString(). */
+static jsval date_to_json(struct js *J, jsval self, jsval *args, int argc)
+{
+    (void)args;
+    (void)argc;
+    jsval tv = js_to_primitive(J, self, HINT_NUMBER);
+    if (J->throwing)
+        return js_undefined;
+    if (tv.t == JS_NUM && (isnan(tv.u.n) || isinf(tv.u.n)))
+        return js_null;
+    jsval f = js_get(J, self, "toISOString");
+    if (J->throwing)
+        return js_undefined;
+    if (!js_is_callable(f))
+        return js_throw_error(J, "TypeError: toISOString is not a function");
+    return js_call_value(J, f, self, NULL, 0);
+}
 
 /* ---- Error ---- */
 
@@ -3030,27 +3527,102 @@ static jsval error_to_string(struct js *J, jsval self, jsval *args, int argc)
 
 /* ---- Map and Set: arrays of keys and values, searched in order ---- */
 
-static jsval collection_items(struct js *J, jsval self, const char *which)
+/*
+ * A Map's or Set's entries live in a host object under COLL_KEY, a hidden symbol key with a tag that
+ * Symbol() and Symbol.for never make, so scripts can neither name nor list it. Each entry has a
+ * sequence number, rising in insertion order: forEach and the iterators go on from the first entry
+ * after the last one they gave, so deleting entries as they go skips none.
+ */
+#define COLL_KEY "\xff" "m" "\xff" "collection"
+
+struct coll {
+    jsval *keys, *vals;                 /* vals NULL for a Set */
+    double *seqs;
+    int n, cap;
+    double next;                        /* the next entry's sequence number */
+};
+
+static const struct jsclass coll_class = { "Collection", NULL, NULL, NULL };
+
+/* self's entries: kind 1 a Map's, 0 a Set's, -1 either's; a TypeError if self is not one. */
+static struct coll *coll_of(struct js *J, jsval self, int kind)
 {
-    jsval v = self.t == JS_OBJ ? js_get(J, self, which) : js_undefined;
-    if (!js_is_array(v))
-        return js_throw_error(J, "TypeError: not a Map or Set");
-    return v;
+    struct prop *p = self.t == JS_OBJ && !self.u.o->phandler ? js_own(self.u.o, S(J, COLL_KEY)) : NULL;
+    struct coll *c = p && !p->getter && !p->setter && p->v.t == JS_OBJ ? js_host_data(p->v.u.o, &coll_class) : NULL;
+    if (!c || (kind >= 0 && (c->vals != NULL) != kind)) {
+        js_throw_error(J, "TypeError: Method called on an object that is not a %s",
+                       kind == 1 ? "Map" : kind == 0 ? "Set" : "Map or Set");
+        return NULL;
+    }
+    return c;
 }
 
-static int collection_find(jsval keys, jsval k)
+static int coll_find(const struct coll *c, jsval k)
 {
-    for (int i = 0; i < keys.u.o->len; i++)
-        if (same_value_zero(keys.u.o->items[i], k))
+    for (int i = 0; i < c->n; i++)
+        if (same_value_zero(c->keys[i], k))
             return i;
     return -1;
 }
 
+/* The first entry after sequence number last (c->n if none): numbers rise along the arrays. */
+static int coll_after(const struct coll *c, double last)
+{
+    int lo = 0, hi = c->n;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (c->seqs[mid] <= last)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+static void coll_add(struct js *J, struct coll *c, jsval k, jsval v)
+{
+    if (c->n == c->cap) {
+        int nc = c->cap ? c->cap * 2 : 8;
+        jsval *nk = js_alloc(J, sizeof(jsval) * (size_t)nc), *nv = c->vals ? js_alloc(J, sizeof(jsval) * (size_t)nc) : NULL;
+        double *ns = js_alloc_atomic(J, sizeof(double) * (size_t)nc);
+        if (c->n) {
+            memcpy(nk, c->keys, sizeof(jsval) * (size_t)c->n);
+            if (nv)
+                memcpy(nv, c->vals, sizeof(jsval) * (size_t)c->n);
+            memcpy(ns, c->seqs, sizeof(double) * (size_t)c->n);
+        }
+        c->keys = nk;
+        if (nv)
+            c->vals = nv;
+        c->seqs = ns;
+        c->cap = nc;
+    }
+    if (k.t == JS_NUM && k.u.n == 0)
+        k = js_num(0);                  /* -0 is kept as +0 */
+    c->keys[c->n] = k;
+    if (c->vals)
+        c->vals[c->n] = v;
+    c->seqs[c->n] = c->next++;
+    c->n++;
+}
+
+static void coll_remove(struct coll *c, int i)
+{
+    int rest = c->n - i - 1;
+    memmove(c->keys + i, c->keys + i + 1, sizeof(jsval) * (size_t)rest);
+    if (c->vals)
+        memmove(c->vals + i, c->vals + i + 1, sizeof(jsval) * (size_t)rest);
+    memmove(c->seqs + i, c->seqs + i + 1, sizeof(double) * (size_t)rest);
+    c->n--;
+}
+
 static void collection_init(struct js *J, struct jsobj *o, int map, jsval src)
 {
-    js_put(J, o, S(J, "__items"), js_obj(js_new_array(J)), 1);
+    struct coll *c = js_alloc(J, sizeof(*c));
+    c->next = 1;
     if (map)
-        js_put(J, o, S(J, "__values"), js_obj(js_new_array(J)), 1);
+        c->vals = js_alloc(J, sizeof(jsval));  /* not NULL: a Map, even while empty */
+    js_put(J, o, S(J, COLL_KEY), js_obj(js_new_host(J, &coll_class, c)), 1);
     if (src.t == JS_UNDEF || src.t == JS_NULL)
         return;
     struct iter iter;
@@ -3059,19 +3631,22 @@ static void collection_init(struct js *J, struct jsobj *o, int map, jsval src)
     jsval it;
     int r;
     while ((r = js_iter_next(J, &iter, &it)) > 0) {
-        jsval keys = js_get(J, js_obj(o), "__items");
         if (map) {
-            jsval k = js_getv(J, it, js_num(0)), v = js_getv(J, it, js_num(1));
-            jsval vals = js_get(J, js_obj(o), "__values");
-            int at = collection_find(keys, k);
-            if (at >= 0) {
-                vals.u.o->items[at] = v;
-            } else {
-                js_array_push(J, keys.u.o, k);
-                js_array_push(J, vals.u.o, v);
+            if (it.t != JS_OBJ) {
+                js_iter_close(J, &iter);
+                js_throw_error(J, "TypeError: Iterator value %s is not an entry object", js_text(J, it));
+                return;
             }
-        } else if (collection_find(keys, it) < 0) {
-            js_array_push(J, keys.u.o, it);
+            jsval k = js_getv(J, it, js_num(0)), v = js_getv(J, it, js_num(1));
+            if (J->throwing)
+                return;
+            int at = coll_find(c, k);
+            if (at >= 0)
+                c->vals[at] = v;
+            else
+                coll_add(J, c, k, v);
+        } else if (coll_find(c, it) < 0) {
+            coll_add(J, c, it, js_undefined);
         }
     }
 }
@@ -3099,51 +3674,41 @@ static jsval set_ctor(struct js *J, jsval self, jsval *args, int argc)
 
 static jsval map_get(struct js *J, jsval self, jsval *args, int argc)
 {
-    jsval keys = collection_items(J, self, "__items");
-    if (J->throwing)
+    struct coll *c = coll_of(J, self, 1);
+    if (!c)
         return js_undefined;
-    int at = collection_find(keys, ARG(0));
-    return at < 0 ? js_undefined : js_get(J, self, "__values").u.o->items[at];
+    int at = coll_find(c, ARG(0));
+    return at < 0 ? js_undefined : c->vals[at];
 }
 
 static jsval map_set(struct js *J, jsval self, jsval *args, int argc)
 {
-    jsval keys = collection_items(J, self, "__items");
-    if (J->throwing)
+    struct coll *c = coll_of(J, self, 1);
+    if (!c)
         return js_undefined;
-    jsval vals = js_get(J, self, "__values");
-    int at = collection_find(keys, ARG(0));
-    if (at >= 0) {
-        vals.u.o->items[at] = ARG(1);
-    } else {
-        js_array_push(J, keys.u.o, ARG(0));
-        js_array_push(J, vals.u.o, ARG(1));
-    }
+    int at = coll_find(c, ARG(0));
+    if (at >= 0)
+        c->vals[at] = ARG(1);
+    else
+        coll_add(J, c, ARG(0), ARG(1));
     return self;
 }
 
 static jsval collection_has(struct js *J, jsval self, jsval *args, int argc)
 {
-    jsval keys = collection_items(J, self, "__items");
-    if (J->throwing)
-        return js_undefined;
-    return js_bool(collection_find(keys, ARG(0)) >= 0);
+    struct coll *c = coll_of(J, self, -1);
+    return c ? js_bool(coll_find(c, ARG(0)) >= 0) : js_undefined;
 }
 
 static jsval collection_delete(struct js *J, jsval self, jsval *args, int argc)
 {
-    jsval keys = collection_items(J, self, "__items");
-    if (J->throwing)
+    struct coll *c = coll_of(J, self, -1);
+    if (!c)
         return js_undefined;
-    int at = collection_find(keys, ARG(0));
+    int at = coll_find(c, ARG(0));
     if (at < 0)
         return js_bool(0);
-    jsval idx = js_num(at), one = js_num(1);
-    jsval sa[2] = { idx, one };
-    array_splice(J, keys, sa, 2);
-    jsval vals = js_get(J, self, "__values");
-    if (js_is_array(vals))
-        array_splice(J, vals, sa, 2);
+    coll_remove(c, at);
     return js_bool(1);
 }
 
@@ -3151,35 +3716,36 @@ static jsval collection_clear(struct js *J, jsval self, jsval *args, int argc)
 {
     (void)args;
     (void)argc;
-    jsval keys = collection_items(J, self, "__items");
-    if (J->throwing)
-        return js_undefined;
-    keys.u.o->len = 0;
-    jsval vals = js_get(J, self, "__values");
-    if (js_is_array(vals))
-        vals.u.o->len = 0;
+    struct coll *c = coll_of(J, self, -1);
+    if (c)
+        c->n = 0;
     return js_undefined;
 }
 
 static jsval set_add(struct js *J, jsval self, jsval *args, int argc)
 {
-    jsval keys = collection_items(J, self, "__items");
-    if (J->throwing)
+    struct coll *c = coll_of(J, self, 0);
+    if (!c)
         return js_undefined;
-    if (collection_find(keys, ARG(0)) < 0)
-        js_array_push(J, keys.u.o, ARG(0));
+    if (coll_find(c, ARG(0)) < 0)
+        coll_add(J, c, ARG(0), js_undefined);
     return self;
 }
 
 static jsval collection_for_each(struct js *J, jsval self, jsval *args, int argc)
 {
-    jsval keys = collection_items(J, self, "__items");
-    if (J->throwing)
+    struct coll *c = coll_of(J, self, -1);
+    if (!c)
         return js_undefined;
-    jsval vals = js_get(J, self, "__values");
-    for (int i = 0; i < keys.u.o->len; i++) {
-        jsval k = keys.u.o->items[i];
-        jsval cb[3] = { js_is_array(vals) ? vals.u.o->items[i] : k, k, self };
+    if (!js_is_callable(ARG(0)))
+        return js_throw_error(J, "TypeError: forEach callback is not a function");
+    for (double last = 0;;) {           /* entries added meanwhile are visited, deleted ones not */
+        int i = coll_after(c, last);
+        if (i >= c->n)
+            break;
+        jsval k = c->keys[i];
+        jsval cb[3] = { c->vals ? c->vals[i] : k, k, self };
+        last = c->seqs[i];
         js_call_value(J, ARG(0), ARG(1), cb, 3);
         if (J->throwing)
             return js_undefined;
@@ -3187,14 +3753,13 @@ static jsval collection_for_each(struct js *J, jsval self, jsval *args, int argc
     return js_undefined;
 }
 
-/* Map and Set iterators walk the key and value arrays as they are then. */
+static jsval make_coll_iter(struct js *J, struct coll *c, int kind);
+
+/* Map and Set iterators see entries added and deleted after they were made, as forEach does. */
 static jsval collection_iter(struct js *J, jsval self, int kind)
 {
-    jsval keys = collection_items(J, self, "__items");
-    if (J->throwing)
-        return js_undefined;
-    jsval vals = js_get(J, self, "__values");
-    return make_seqiter(J, keys, js_is_array(vals) ? vals : js_undefined, kind, 0);
+    struct coll *c = coll_of(J, self, -1);
+    return c ? make_coll_iter(J, c, kind) : js_undefined;
 }
 
 static jsval collection_keys(struct js *J, jsval self, jsval *args, int argc)
@@ -3223,6 +3788,8 @@ static jsval collection_entries(struct js *J, jsval self, jsval *args, int argc)
 struct seqiter {
     jsval keys, vals;           /* an array or array-like to walk, and a Map's values */
     struct jsstr *str;          /* or a string's characters */
+    struct coll *coll;          /* or a Map's or Set's entries, after sequence number last */
+    double last;
     int i, kind, index_keys;    /* index_keys: the keys are indexes (arrays) */
     int done;
 };
@@ -3242,6 +3809,13 @@ static jsval make_seqiter(struct js *J, jsval keys, jsval vals, int kind, int in
     return js_obj(o);
 }
 
+static jsval make_coll_iter(struct js *J, struct coll *c, int kind)
+{
+    jsval r = make_seqiter(J, js_undefined, js_undefined, kind, 0);
+    ((struct seqiter *)r.u.o->hdata)->coll = c;
+    return r;
+}
+
 static jsval iter_result(struct js *J, jsval value, int done)
 {
     struct jsobj *r = js_new_object(J);
@@ -3253,7 +3827,7 @@ static jsval iter_result(struct js *J, jsval value, int done)
 static int seq_len(struct js *J, jsval a)
 {
     if (a.t == JS_OBJ && (a.u.o->cls == C_ARRAY || a.u.o->cls == C_ARGUMENTS))
-        return a.u.o->len;
+        return too_sparse(J, a.u.o) ? 0 : a.u.o->len;
     double d = js_to_number(J, js_get(J, a, "length"));
     return d > 0 && d < (1 << 30) ? (int)d : 0;
 }
@@ -3287,15 +3861,34 @@ static jsval seqiter_next(struct js *J, jsval self, jsval *args, int argc)
         it->i += n;
         return iter_result(J, ch, 0);
     }
-    if (it->i >= seq_len(J, it->keys)) {
+    jsval k, v;
+    if (it->coll) {
+        struct coll *c = it->coll;
+        int i = coll_after(c, it->last);
+        if (i >= c->n) {
+            it->done = 1;
+            return iter_result(J, js_undefined, 1);
+        }
+        it->last = c->seqs[i];
+        k = c->keys[i];
+        v = c->vals ? c->vals[i] : k;
+        goto give;
+    }
+    int len = seq_len(J, it->keys);
+    if (J->throwing)
+        return js_undefined;
+    if (it->i >= len) {
         it->done = 1;
         return iter_result(J, js_undefined, 1);
     }
     int i = it->i++;
-    jsval k = it->index_keys ? js_num(i) : seq_at(J, it->keys, i);
+    k = it->index_keys ? js_num(i) : seq_at(J, it->keys, i);
     if (it->kind == ITK_KEYS)
         return iter_result(J, k, 0);
-    jsval v = it->vals.t == JS_OBJ ? seq_at(J, it->vals, i) : it->index_keys ? seq_at(J, it->keys, i) : k;
+    v = it->vals.t == JS_OBJ ? seq_at(J, it->vals, i) : it->index_keys ? seq_at(J, it->keys, i) : k;
+give:
+    if (it->kind == ITK_KEYS)
+        return iter_result(J, k, 0);
     if (it->kind == ITK_VALUES)
         return iter_result(J, v, 0);
     struct jsobj *pair = js_new_array(J);
@@ -3360,10 +3953,8 @@ static jsval collection_size_getter(struct js *J, jsval self, jsval *args, int a
 {
     (void)args;
     (void)argc;
-    jsval keys = collection_items(J, self, "__items");
-    if (J->throwing)
-        return js_undefined;
-    return js_num(keys.u.o->len);
+    struct coll *c = coll_of(J, self, -1);
+    return c ? js_num(c->n) : js_undefined;
 }
 
 static void define_getter(struct js *J, struct jsobj *o, const char *name, js_native fn)
@@ -3501,7 +4092,7 @@ void js_init_lib(struct js *J)
     sp->str = js_mkstr(J, "", 0);
     struct jsobj *string = ctor_obj(J, "String", string_ctor, 1, sp);
     fn_obj(J, string, "fromCharCode", string_from_char_code, 1);
-    fn_obj(J, string, "fromCodePoint", string_from_char_code, 1);
+    fn_obj(J, string, "fromCodePoint", string_from_code_point, 1);
     static const struct {
         const char *name;
         js_native fn;
@@ -3552,6 +4143,7 @@ void js_init_lib(struct js *J)
     fn_obj(J, np, "toFixed", number_to_fixed, 1);
     fn_obj(J, np, "toString", number_to_string, 1);
     fn_obj(J, np, "toPrecision", number_to_precision, 1);
+    fn_obj(J, np, "toExponential", number_to_exponential, 1);
     fn_obj(J, np, "valueOf", number_value_of, 0);
     fn_obj(J, np, "toLocaleString", number_to_locale, 0);
     fn_obj(J, number, "isInteger", number_is_integer, 1);
@@ -3580,10 +4172,10 @@ void js_init_lib(struct js *J)
     fn_obj(J, g, "isFinite", global_is_finite, 1);
     fn_obj(J, g, "encodeURIComponent", global_encode_uri_component, 1);
     fn_obj(J, g, "encodeURI", global_encode_uri, 1);
-    fn_obj(J, g, "decodeURIComponent", global_decode_uri, 1);
+    fn_obj(J, g, "decodeURIComponent", global_decode_uri_component, 1);
     fn_obj(J, g, "decodeURI", global_decode_uri, 1);
     fn_obj(J, g, "escape", global_escape, 1);
-    fn_obj(J, g, "unescape", global_decode_uri, 1);
+    fn_obj(J, g, "unescape", global_unescape, 1);
     put_value(J, g, "NaN", js_num(NAN));
     put_value(J, g, "Infinity", js_num(INFINITY));
     put_value(J, g, "undefined", js_undefined);
@@ -3640,7 +4232,7 @@ void js_init_lib(struct js *J)
         { "setUTCFullYear", date_set_full_year }, { "setUTCMonth", date_set_month },
         { "setUTCDate", date_set_date }, { "setUTCHours", date_set_hours },
         { "setUTCMinutes", date_set_minutes }, { "setUTCSeconds", date_set_seconds },
-        { "toString", date_to_string }, { "toISOString", date_to_iso }, { "toJSON", date_to_iso },
+        { "toString", date_to_string }, { "toISOString", date_to_iso }, { "toJSON", date_to_json },
         { "toDateString", date_to_date_string }, { "toTimeString", date_to_time_string },
         { "toLocaleString", date_to_locale }, { "toLocaleDateString", date_to_locale_date },
         { "toLocaleTimeString", date_to_locale_time }, { "toUTCString", date_to_utc },

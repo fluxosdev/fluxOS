@@ -305,11 +305,55 @@ void crt_run_atexit(void)
 
 XDEF(atexit) { if (natexit >= 256) return (uint32_t)-1; atexit_fns[natexit++] = A(0); return 0; }
 XDEF(_onexit) { if (natexit >= 256) return 0; atexit_fns[natexit++] = A(0); return A(0); }
-XDEF(__dllonexit) { return api__onexit(a); }
+/* A DLL's own exit functions go into its own table (begin, end: guest pointers in its memory),
+ * which its startup code runs when it is detached: never the process's list, which would call
+ * them after the DLL is gone. The table is in the process heap, as the DLL allocated it. */
+static gp_t onexit_add(gp_t *first, gp_t *last, gp_t *end, gp_t fn)
+{
+    if (!*first || *last >= *end) {
+        uint32_t n = *first ? (*last - *first) / 4 : 0, cap = n < 16 ? 32 : n * 2;
+        gp_t t = heap_alloc(process_heap, cap * 4, 1);
+        if (!t)
+            return 0;
+        if (n)
+            memcpy(GP(t), GP(*first), n * 4);
+        if (*first && heap_validate(process_heap, *first))
+            heap_free(process_heap, *first);
+        *first = t;
+        *last = t + n * 4;
+        *end = t + cap * 4;
+    }
+    *(gp_t *)GP(*last) = fn;
+    *last += 4;
+    return fn;
+}
+XDEF(__dllonexit)
+{
+    /* (fn, &begin, &end): the room left is what the heap block holds */
+    gp_t *begin = P(1), *endp = P(2);
+    if (!begin || !endp) return 0;
+    uint32_t size = *begin ? heap_size(process_heap, *begin) : 0;
+    gp_t cap_end = *begin && size != 0xFFFFFFFFu ? *begin + (size & ~3u) : *endp;
+    return onexit_add(begin, endp, &cap_end, A(0));
+}
 XDEF(_crt_atexit) { return api_atexit(a); }
-XDEF(_register_onexit_function) { (void)a[0]; uint32_t b[1] = { A(1) }; return api_atexit(b); }
-XDEF(_initialize_onexit_table) { (void)a; return 0; }
-XDEF(_execute_onexit_table) { (void)a; return 0; }
+/* _onexit_table_t: first, last, end */
+XDEF(_initialize_onexit_table) { gp_t *t = P(0); if (!t) return (uint32_t)-1; t[0] = t[1] = t[2] = 0; return 0; }
+XDEF(_register_onexit_function) { gp_t *t = P(0); if (!t) return (uint32_t)-1; return onexit_add(&t[0], &t[1], &t[2], A(1)) ? 0 : (uint32_t)-1; }
+XDEF(_execute_onexit_table)
+{
+    gp_t *t = P(0);
+    if (!t) return (uint32_t)-1;
+    gp_t first = t[0], last = t[1];
+    t[0] = t[1] = t[2] = 0;
+    for (gp_t p = last; first && p > first; ) {
+        p -= 4;
+        gp_t fn = *(gp_t *)GP(p);
+        if (fn) call_guest(fn, 0, NULL);
+    }
+    if (first) heap_free(process_heap, first);
+    return 0;
+}
 XDEF(at_quick_exit) { (void)a; return 0; }
 
 XDEF(exit) { crt_run_atexit(); process_exit(A(0)); }
@@ -413,6 +457,7 @@ XDEF(_aligned_malloc)
 {
     uint32_t align = A(1) < 4 ? 4 : A(1);
     if (align & (align - 1)) { crt_set_errno(CRT_EINVAL); return 0; }
+    if (align > 0x10000000u || A(0) > 0x7FFF0000u - align - 4) { crt_set_errno(CRT_ENOMEM); return 0; }
     gp_t raw = heap_alloc(process_heap, A(0) + align + 4, 0);
     if (!raw) return 0;
     gp_t p = (raw + 4 + align - 1) & ~(align - 1);
@@ -699,21 +744,40 @@ XDEF(wcstod)
     return 0;
 }
 XDEF(_wtof) { api_set_fret(crt_strtod(wtmp(A(0)), NULL)); return 0; }
-static uint32_t to_str(uint64_t v, int neg, gp_t out, int radix, int wide)
+/* The digits of v in radix (2 to 36) into buf (72 bytes); their count. */
+static int num_str(uint64_t v, int neg, int radix, char *buf)
 {
     char tmp[72];
     int n = 0;
+    do { int d = (int)(v % (unsigned)radix); tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); v /= (unsigned)radix; } while (v);
+    if (neg) tmp[n++] = '-';
+    for (int i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
+    buf[n] = 0;
+    return n;
+}
+static uint32_t to_str(uint64_t v, int neg, gp_t out, int radix, int wide)
+{
     if (radix < 2 || radix > 36) {      /* an invalid parameter: an empty string */
         if (wide) *(uint16_t *)GP(out) = 0; else *(char *)GP(out) = 0;
         return out;
     }
-    do { int d = (int)(v % (unsigned)radix); tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); v /= (unsigned)radix; } while (v);
-    if (neg) tmp[n++] = '-';
     char buf[72];
-    for (int i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
-    buf[n] = 0;
+    int n = num_str(v, neg, radix, buf);
     if (wide) ansi_to_wide(buf, -1, GP(out), n + 1); else memcpy(GP(out), buf, (size_t)n + 1);
     return out;
+}
+/* _itoa_s(value, buf, size, radix): an errno value; the digits only if they fit */
+static uint32_t itoa_s_common(uint32_t *a, int wide)
+{
+    if (!A(1) || !A(2)) return CRT_EINVAL;
+    if (A(3) < 2 || A(3) > 36) { if (wide) *(uint16_t *)P(1) = 0; else *(char *)P(1) = 0; return CRT_EINVAL; }
+    int32_t v = (int32_t)A(0);
+    int neg = A(3) == 10 && v < 0;
+    char buf[72];
+    int n = num_str(neg ? (uint64_t)-(int64_t)v : (uint32_t)v, neg, (int)A(3), buf);
+    if ((uint32_t)n + 1 > A(2)) { if (wide) *(uint16_t *)P(1) = 0; else *(char *)P(1) = 0; return CRT_ERANGE; }
+    if (wide) ansi_to_wide(buf, -1, P(1), n + 1); else memcpy(P(1), buf, (size_t)n + 1);
+    return 0;
 }
 XDEF(_itoa) { int32_t v = (int32_t)A(0); int neg = A(2) == 10 && v < 0; return to_str(neg ? (uint64_t)-(int64_t)v : (uint32_t)v, neg, A(1), (int)A(2), 0); }
 XDEF(_ltoa) { return api__itoa(a); }
@@ -723,9 +787,9 @@ XDEF(_ui64toa) { uint64_t v; memcpy(&v, a, 8); return to_str(v, 0, A(2), (int)A(
 XDEF(_itow) { int32_t v = (int32_t)A(0); int neg = A(2) == 10 && v < 0; return to_str(neg ? (uint64_t)-(int64_t)v : (uint32_t)v, neg, A(1), (int)A(2), 1); }
 XDEF(_ltow) { return api__itow(a); }
 XDEF(_ultow) { return to_str(A(0), 0, A(1), (int)A(2), 1); }
-XDEF(_itoa_s) { uint32_t b[3] = { A(0), A(1), A(3) }; api__itoa(b); return 0; }
-XDEF(_ltoa_s) { return api__itoa_s(a); }
-XDEF(_itow_s) { uint32_t b[3] = { A(0), A(1), A(3) }; api__itow(b); return 0; }
+XDEF(_itoa_s) { return itoa_s_common(a, 0); }
+XDEF(_ltoa_s) { return itoa_s_common(a, 0); }
+XDEF(_itow_s) { return itoa_s_common(a, 1); }
 XDEF(abs) { int32_t v = (int32_t)A(0); return (uint32_t)(v < 0 ? -v : v); }
 XDEF(labs) { return api_abs(a); }
 XDEF(_abs64) { int64_t v; memcpy(&v, a, 8); if (v < 0) v = -v; api_edx = (uint32_t)((uint64_t)v >> 32); return (uint32_t)v; }
@@ -802,21 +866,40 @@ XDEF(snprintf) { return (uint32_t)crt_vsnprintf(S(0), A(1), S(2), a + 3, 0); }
 XDEF(vsnprintf) { return (uint32_t)crt_vsnprintf(S(0), A(1), S(2), VA(3), 0); }
 XDEF(sprintf_s) { int r = crt_vsnprintf(S(0), A(1), S(2), a + 3, 0); return (uint32_t)(r >= (int)A(1) ? -1 : r); }
 XDEF(vsprintf_s) { int r = crt_vsnprintf(S(0), A(1), S(2), VA(3), 0); return (uint32_t)(r >= (int)A(1) ? -1 : r); }
-XDEF(_snprintf_s) { uint32_t cap = A(2) < A(1) ? A(2) + 1 : A(1); return (uint32_t)crt_vsnprintf(S(0), cap, S(3), a + 4, 1); }
-XDEF(_vsnprintf_s) { uint32_t cap = A(2) < A(1) ? A(2) + 1 : A(1); return (uint32_t)crt_vsnprintf(S(0), cap, S(3), VA(4), 1); }
+/* (buf, size, count, fmt...): at most count characters (_TRUNCATE: what fits), always with the
+ * NUL; -1 when the output was cut short, and an empty buffer when it did not fit and count asked
+ * for more than the buffer holds. */
+static uint32_t snprintf_s_common(gp_t buf, uint32_t size, uint32_t count, gp_t fmt, const uint32_t *args, int wide)
+{
+    if (!buf || !size || !fmt) { crt_set_errno(CRT_EINVAL); return (uint32_t)-1; }
+    int truncate = count == 0xFFFFFFFFu || count < size;
+    uint32_t limit = count < size ? count : size - 1;
+    int n = wide ? crt_vsnwprintf(GP(buf), limit + 1, GP(fmt), args, 0) : crt_vsnprintf(GP(buf), limit + 1, GP(fmt), args, 0);
+    if (n >= 0 && (uint32_t)n <= limit)
+        return (uint32_t)n;
+    if (!truncate) {                    /* it had to fit the buffer, and it did not */
+        if (wide) *(uint16_t *)GP(buf) = 0; else *(char *)GP(buf) = 0;
+        crt_set_errno(CRT_ERANGE);
+    }
+    return (uint32_t)-1;
+}
+XDEF(_snprintf_s) { return snprintf_s_common(A(0), A(1), A(2), A(3), a + 4, 0); }
+XDEF(_vsnprintf_s) { return snprintf_s_common(A(0), A(1), A(2), A(3), VA(4), 0); }
 XDEF(_scprintf) { return (uint32_t)crt_vscprintf(S(0), 0, a + 1); }
 XDEF(_vscprintf) { return (uint32_t)crt_vscprintf(S(0), 0, VA(1)); }
 XDEF(_scwprintf) { return (uint32_t)crt_vscprintf(WS(0), 1, a + 1); }
 XDEF(_vscwprintf) { return (uint32_t)crt_vscprintf(WS(0), 1, VA(1)); }
-XDEF(swprintf) { return (uint32_t)crt_vsnwprintf(WS(0), A(1), WS(2), a + 3, 0); }   /* the ISO form, with a count */
+/* msvcrt.dll's (and ntdll's) swprintf and vswprintf are the old forms, without a count: the ISO
+ * ones are inline functions in the headers that come to _vsnwprintf or _vswprintf_c. */
+XDEF(swprintf) { return (uint32_t)crt_vsnwprintf(WS(0), 0x7FFFFFFF, WS(1), a + 2, 0); }
 XDEF(_swprintf) { return (uint32_t)crt_vsnwprintf(WS(0), 0x7FFFFFFF, WS(1), a + 2, 0); }
-XDEF(vswprintf) { return (uint32_t)crt_vsnwprintf(WS(0), A(1), WS(2), VA(3), 0); }
+XDEF(vswprintf) { return (uint32_t)crt_vsnwprintf(WS(0), 0x7FFFFFFF, WS(1), VA(2), 0); }
 XDEF(_vswprintf) { return (uint32_t)crt_vsnwprintf(WS(0), 0x7FFFFFFF, WS(1), VA(2), 0); }
 XDEF(_snwprintf) { return (uint32_t)crt_vsnwprintf(WS(0), A(1), WS(2), a + 3, 1); }
 XDEF(_vsnwprintf) { return (uint32_t)crt_vsnwprintf(WS(0), A(1), WS(2), VA(3), 1); }
 XDEF(swprintf_s) { return (uint32_t)crt_vsnwprintf(WS(0), A(1), WS(2), a + 3, 0); }
 XDEF(vswprintf_s) { return (uint32_t)crt_vsnwprintf(WS(0), A(1), WS(2), VA(3), 0); }
-XDEF(_snwprintf_s) { uint32_t cap = A(2) < A(1) ? A(2) + 1 : A(1); return (uint32_t)crt_vsnwprintf(WS(0), cap, WS(3), a + 4, 1); }
+XDEF(_snwprintf_s) { return snprintf_s_common(A(0), A(1), A(2), A(3), a + 4, 1); }
 
 /* scanf */
 struct str_src { const uint8_t *s; int pos; int wide; };
@@ -831,28 +914,28 @@ static int str_get(void *ctx)
 static void str_unget(void *ctx, int c) { (void)c; ((struct str_src *)ctx)->pos--; }
 static int stream_get(void *ctx) { return crt_stream_getc(ctx); }
 static void stream_unget(void *ctx, int c) { crt_stream_ungetc(ctx, c); }
-static uint32_t scan_str(const void *s, int wide, const void *fmt, const uint32_t *args)
+static uint32_t scan_str(const void *s, int wide, const void *fmt, const uint32_t *args, int secure)
 {
     struct str_src x = { s, 0, wide };
-    struct scan_src in = { str_get, str_unget, &x, wide };
+    struct scan_src in = { str_get, str_unget, &x, wide, secure };
     return (uint32_t)crt_vscanf(&in, fmt, wide, args);
 }
-static uint32_t scan_stream(struct crt_stream *st, const void *fmt, int wide, const uint32_t *args)
+static uint32_t scan_stream(struct crt_stream *st, const void *fmt, int wide, const uint32_t *args, int secure)
 {
     if (!st) return (uint32_t)-1;
     crt_flush_all();
-    struct scan_src in = { stream_get, stream_unget, st, wide };
+    struct scan_src in = { stream_get, stream_unget, st, wide, secure };
     return (uint32_t)crt_vscanf(&in, fmt, wide, args);
 }
-XDEF(sscanf) { return scan_str(S(0), 0, S(1), a + 2); }
-XDEF(sscanf_s) { return scan_str(S(0), 0, S(1), a + 2); }
-XDEF(vsscanf) { return scan_str(S(0), 0, S(1), VA(2)); }
-XDEF(swscanf) { return scan_str(WS(0), 1, WS(1), a + 2); }
-XDEF(scanf) { return scan_stream(in_s(), S(0), 0, a + 1); }
-XDEF(scanf_s) { return scan_stream(in_s(), S(0), 0, a + 1); }
-XDEF(fscanf) { return scan_stream(F(0), S(1), 0, a + 2); }
-XDEF(fscanf_s) { return scan_stream(F(0), S(1), 0, a + 2); }
-XDEF(wscanf) { return scan_stream(in_s(), WS(0), 1, a + 1); }
+XDEF(sscanf) { return scan_str(S(0), 0, S(1), a + 2, 0); }
+XDEF(sscanf_s) { return scan_str(S(0), 0, S(1), a + 2, 1); }
+XDEF(vsscanf) { return scan_str(S(0), 0, S(1), VA(2), 0); }
+XDEF(swscanf) { return scan_str(WS(0), 1, WS(1), a + 2, 0); }
+XDEF(scanf) { return scan_stream(in_s(), S(0), 0, a + 1, 0); }
+XDEF(scanf_s) { return scan_stream(in_s(), S(0), 0, a + 1, 1); }
+XDEF(fscanf) { return scan_stream(F(0), S(1), 0, a + 2, 0); }
+XDEF(fscanf_s) { return scan_stream(F(0), S(1), 0, a + 2, 1); }
+XDEF(wscanf) { return scan_stream(in_s(), WS(0), 1, a + 1, 0); }
 
 XDEF(fopen)
 {
@@ -1004,10 +1087,10 @@ XDEF(_ftelli64) { struct crt_stream *s = F(0); int64_t r = s ? crt_stream_tell(s
 XDEF(ftello64) { return api__ftelli64(a); }
 XDEF(fgetpos) { struct crt_stream *s = F(0); if (!s) return (uint32_t)-1; int64_t r = crt_stream_tell(s); memcpy(P(1), &r, 8); return 0; }
 XDEF(fsetpos) { struct crt_stream *s = F(0); if (!s) return (uint32_t)-1; int64_t off; memcpy(&off, P(1), 8); return crt_stream_seek(s, off, SEEK_SET) < 0 ? (uint32_t)-1 : 0; }
-XDEF(rewind) { struct crt_stream *s = F(0); if (s) { crt_stream_seek(s, 0, SEEK_SET); s->error = 0; } return 0; }
+XDEF(rewind) { struct crt_stream *s = F(0); if (s) { crt_stream_seek(s, 0, SEEK_SET); s->error = 0; crt_stream_sync(s); } return 0; }
 XDEF(feof) { struct crt_stream *s = F(0); return s ? (uint32_t)(s->eof && s->unget < 0 && s->ipos >= s->ilen) : 0; }
 XDEF(ferror) { struct crt_stream *s = F(0); return s ? (uint32_t)s->error : 0; }
-XDEF(clearerr) { struct crt_stream *s = F(0); if (s) s->eof = s->error = 0; return 0; }
+XDEF(clearerr) { struct crt_stream *s = F(0); if (s) { s->eof = s->error = 0; crt_stream_sync(s); } return 0; }
 XDEF(_fileno) { struct crt_stream *s = F(0); return s ? (uint32_t)s->fd : (uint32_t)-1; }
 XDEF(setvbuf)
 {
@@ -1328,6 +1411,7 @@ XDEF(longjmp)
         ctx.eip = jb[5];
         seh_unwind(jb[6], 0, NULL, 0, &ctx);
     }
+    seh_reset_depth();
     guest_resume(&r);
 }
 XDEF(_longjmpex) { return api_longjmp(a); }

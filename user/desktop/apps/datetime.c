@@ -234,17 +234,30 @@ static int parse_datetime(const char *p, int v[6])
     return *p ? -1 : 0;
 }
 
+static int days_in_month(int y, int m)
+{
+    static const int8_t days[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    return m == 2 && y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) ? 29 : days[m - 1];
+}
+
 static void manual_done(void *ctx, const char *text)
 {
     (void)ctx;
     int v[6];
     if (parse_datetime(text, v) < 0 || v[0] < 2000 || v[0] > 2099 || v[1] < 1 || v[1] > 12 || v[2] < 1 ||
-        v[2] > 31 || v[3] > 23 || v[4] > 59 || v[5] > 59) {
-        message_box("Date and Time", ICON_WARNING, "Type the date and time as YYYY-MM-DD HH:MM:SS.");
+        v[2] > days_in_month(v[0], v[1]) || v[3] > 23 || v[4] > 59 || v[5] > 59) {
+        message_box("Date and Time", ICON_WARNING, "Type a date and time that exist, as YYYY-MM-DD HH:MM:SS.");
         return;
     }
-    long local = (long)days_from_civil(v[0], v[1], v[2]) * 86400L + v[3] * 3600L + v[4] * 60L + v[5];
-    time_t t = (time_t)(local - zones[zone].minutes * 60L);
+    /* In 64 bits: the clock's time_t is 32, and ends in January 2038. */
+    long long local = (long long)days_from_civil(v[0], v[1], v[2]) * 86400 + v[3] * 3600 + v[4] * 60 + v[5];
+    long long utc = local - zones[zone].minutes * 60LL;
+    if (utc < 0 || utc > 0x7FFFFFFFLL) {
+        message_box("Date and Time", ICON_WARNING,
+                    "The clock cannot be set past 19 January 2038, 03:14:07 UTC: fluxOS's time ends there.");
+        return;
+    }
+    time_t t = (time_t)utc;
     stime(&t);
     snprintf(status, sizeof(status), "The clock was set by hand.");
     paint();

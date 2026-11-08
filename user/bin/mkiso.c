@@ -111,10 +111,10 @@ static void scan(struct node *dir)
         char *path = xmalloc(len);
         snprintf(path, len, "%s/%s", dir->path, de->d_name);
         struct stat st;
-        if (stat(path, &st) < 0)
+        if (lstat(path, &st) < 0)       /* links are left out, not followed (a loop would never end) */
             die("%s: %s", path);
         if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) {
-            fprintf(stderr, "mkiso: %s: not a file or directory, left out\n", path);
+            fprintf(stderr, "mkiso: %s: %s, left out\n", path, S_ISLNK(st.st_mode) ? "a symbolic link" : "not a file or directory");
             nwarn++;
             free(path);
             continue;

@@ -46,6 +46,8 @@ void power_fixed_button(int sleep);     /* the fixed power (0) or sleep (1) butt
 void power_resumed(void);
 int power_lid_closed(void);
 void power_arm_wake(int on);            /* the lid and buttons may wake the machine */
+void power_quiesce(void);               /* suspend: kpwrd's AML waits until power_unquiesce() */
+void power_unquiesce(void);
 
 /* sleep.c */
 int sleep_supported(void);              /* the firmware has \_S3 */

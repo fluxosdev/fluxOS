@@ -10,7 +10,8 @@
  * target file may be given instead); -R applies a diff backwards; -N
  * skips hunks that look applied already; -b keeps the old file as
  * file.orig; -s says nothing unless something failed; --dry-run changes
- * nothing. New files (--- /dev/null) are made, emptied ones removed. A
+ * nothing. New files (--- /dev/null) are made, emptied ones removed; a
+ * name from the diff that is absolute or has ".." in it is refused. A
  * hunk that fits nowhere goes to file.rej. Exit status 0, 1 if some hunk
  * was rejected, 2 on trouble.
  */
@@ -144,7 +145,7 @@ static char *strip_name(const char *name)
     memcpy(s, name, (size_t)(end - name));
     s[end - name] = 0;
     /* quotes around names with odd characters */
-    if (s[0] == '"' && s[strlen(s) - 1] == '"') {
+    if (strlen(s) >= 2 && s[0] == '"' && s[strlen(s) - 1] == '"') {
         memmove(s, s + 1, strlen(s) - 2);
         s[strlen(s) - 2] = 0;
     }
@@ -455,6 +456,22 @@ static void write_reject(const char *path, const struct filepatch *fp)
     fprintf(stderr, "patch: saving rejects to file %s\n", rej);
 }
 
+/* A name from the diff that would write outside the current directory: absolute, or with "..". */
+static int dangerous_name(const char *name)
+{
+    if (name[0] == '/')
+        return 1;
+    for (const char *q = name; *q; ) {
+        size_t len = strcspn(q, "/");
+        if (len == 2 && q[0] == '.' && q[1] == '.')
+            return 1;
+        q += len;
+        while (*q == '/')
+            q++;
+    }
+    return 0;
+}
+
 static int apply_filepatch(struct filepatch *fp)
 {
     const char *path;
@@ -486,6 +503,11 @@ static int apply_filepatch(struct filepatch *fp)
             creating = 1;
         }
         path = chosen;
+        if (dangerous_name(path)) {
+            fprintf(stderr, "patch: ignoring potentially dangerous file name %s\n", path);
+            free(chosen);
+            return 2;
+        }
     }
     struct lines file;
     if (read_lines(path, &file) < 0) {
@@ -500,7 +522,7 @@ static int apply_filepatch(struct filepatch *fp)
     }
     if (!silent)
         printf("patching file %s\n", path);
-    int offset = 0, rejects = 0, applied_already = 0;
+    int offset = 0, rejects = 0, skipped = 0;
     for (int k = 0; k < fp->nhunks; k++) {
         struct hunk *h = &fp->hunks[k];
         int start = (reverse ? h->new_start : h->old_start) - 1 + offset;
@@ -527,6 +549,7 @@ static int apply_filepatch(struct filepatch *fp)
         }
         if (found < 0 && skip_applied) {
             /* already applied? then its new side matches */
+            int applied_already = 0;
             for (int pos = 0; pos <= file.n; pos++)
                 if (hunk_matches(h, &file, pos, 0, !reverse)) {
                     applied_already = 1;
@@ -535,6 +558,7 @@ static int apply_filepatch(struct filepatch *fp)
             if (applied_already) {
                 if (!silent)
                     printf("Hunk #%d ignored: already applied.\n", k + 1);
+                skipped++;
                 continue;
             }
         }
@@ -571,10 +595,13 @@ static int apply_filepatch(struct filepatch *fp)
                 fp->nhunks == 1 ? "" : "s", path);
         rejected_any = 1;
     }
-    if (!dry_run && rejects < fp->nhunks && !applied_already) {
+    if (!dry_run && rejects + skipped < fp->nhunks) {
+        struct stat bst;
+        int have_mode = 0;
         if (backup && !creating) {
             char orig[PATH_MAX];
             snprintf(orig, sizeof(orig), "%s.orig", path);
+            have_mode = stat(path, &bst) == 0;      /* write_lines cannot see it once renamed */
             rename(path, orig);
         }
         int removing = file.n == 0 && ((fp->new_name && !strcmp(fp->new_name, "/dev/null") && !reverse) ||
@@ -594,6 +621,8 @@ static int apply_filepatch(struct filepatch *fp)
             }
             if (write_lines(path, &file) < 0)
                 trouble = 1;
+            else if (have_mode)
+                chmod(path, bst.st_mode & 07777);
         }
     }
     if (rejects && !dry_run)

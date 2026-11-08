@@ -88,11 +88,18 @@ static void play(uint32_t n)
     pcm_tick();
 }
 
+static struct pcm *the_pcm;
+static int wake_after;                  /* sleeps until the machine wakes from suspend */
+
 /* Sleeping (a full ring, SNDCTL_DSP_SYNC): time passes and the card plays on. */
 void sleep_on_lock_timeout(void *chan, spinlock_t *lk, uint32_t deadline)
 {
     (void)chan; (void)lk; (void)deadline;
     sleeps++;
+    if (wake_after && --wake_after == 0) {
+        cdead = 0;                      /* the card is set up again, as hda_resume does */
+        pcm_sleep(the_pcm, 0);
+    }
     play(32);
 }
 
@@ -123,6 +130,7 @@ int main(void)
 {
     static struct vnode devdir;
     struct pcm *p = pcm_create(&devdir, "dsp", 0, &card_be);
+    the_pcm = p;
     CHECK(p && node && node->dev_clone);
     CHECK(pcm_of(node) == p);
 
@@ -263,7 +271,29 @@ int main(void)
     CHECK(p->nstreams == 0);
     cdead = 0;
 
+    /* Suspend to RAM: the card is off and will not start (hda_suspend), yet
+     * a writer with a full ring waits for the wake instead of failing, and a
+     * stream closed meanwhile is kept to play out afterwards. */
+    ctail = chead;
+    crunning = 0;
+    pcm_sleep(p, 1);
+    cdead = 1;
+    struct vnode *closing = open_dsp(48000, 2, AFMT_S16_LE);
+    write_s16(closing, 9, 9, 100);
+    vfs_unref(closing);
+    play(0);
+    CHECK(p->nstreams == 1 && !crunning);
+    struct vnode *w = open_dsp(8000, 1, AFMT_U8);
+    sleeps = 0;
+    wake_after = 5;
+    CHECK(w->dev_write(w, big, 0, sizeof(big)) == (int)sizeof(big));
+    CHECK(sleeps >= 5 && !p->asleep && !cdead);
+    vfs_unref(w);
+    for (int i = 0; i < 10000 && p->nstreams; i++)
+        play(64);
+    CHECK(p->nstreams == 0);
+
     puts("kernel pcm: mixing, clipping, idle streams, resampling, close, sync, full rings, reset, "
-         "2^31 frames and dead cards passed");
+         "2^31 frames, dead cards and suspend passed");
     return 0;
 }

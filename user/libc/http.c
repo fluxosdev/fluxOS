@@ -161,7 +161,7 @@ static void clean_path(char *path)
         *q = 0;
     }
     char out[2048];
-    size_t o = 0;
+    size_t o = 0, root = path[0] == '/';       /* ".." does not go above the first "/" */
     for (char *p = path; *p;) {
         char *seg = p;
         size_t sl = strcspn(p, "/");
@@ -169,11 +169,11 @@ static void clean_path(char *path)
         if (sl == 1 && seg[0] == '.')
             continue;
         if (sl == 2 && seg[0] == '.' && seg[1] == '.') {
-            while (o > 0 && out[o - 1] != '/')
+            while (o > root && out[o - 1] != '/')
                 o--;
-            if (o > 0)
+            if (o > root)
                 o--;
-            while (o > 0 && out[o - 1] != '/')
+            while (o > root && out[o - 1] != '/')
                 o--;
             continue;
         }
@@ -193,7 +193,9 @@ void http_resolve(const char *base, const char *ref, char *out, size_t size)
     char r[2048];
     snprintf(r, sizeof(r), "%.*s", (int)strcspn(ref, "#"), ref);
     struct url b;
-    if (strstr(r, "://") || parse_url(base, &b) < 0) {
+    size_t sl = strspn(r, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+-.");
+    int absolute = sl > 0 && isalpha((unsigned char)r[0]) && r[sl] == ':';      /* "scheme:" (RFC 3986 3.1) */
+    if (absolute || parse_url(base, &b) < 0) {
         snprintf(out, size, "%s", r);
         return;
     }
@@ -244,6 +246,33 @@ static int header_get(const char *block, size_t len, const char *name, char *out
                 n--;
             snprintf(out, size, "%.*s", (int)n, v);
             return 1;
+        }
+        p = eol + 1;
+    }
+    return 0;
+}
+
+/* Are there two headers called name with different values? */
+static int header_conflict(const char *block, size_t len, const char *name)
+{
+    size_t nl = strlen(name);
+    const char *first = NULL;
+    size_t flen = 0;
+    for (const char *p = block; p < block + len;) {
+        const char *eol = memchr(p, '\n', (size_t)(block + len - p));
+        if (!eol)
+            eol = block + len;
+        if ((size_t)(eol - p) > nl && !strncasecmp(p, name, nl) && p[nl] == ':') {
+            const char *v = p + nl + 1;
+            while (v < eol && (*v == ' ' || *v == '\t'))
+                v++;
+            size_t n = (size_t)(eol - v);
+            while (n > 0 && (v[n - 1] == '\r' || v[n - 1] == ' ' || v[n - 1] == '\t'))
+                n--;
+            if (!first)
+                first = v, flen = n;
+            else if (n != flen || memcmp(v, first, n))
+                return 1;
         }
         p = eol + 1;
     }
@@ -635,7 +664,7 @@ static struct conn *conn_reuse(struct http_client *cl, const struct http_request
             return c;
         }
         struct pollfd p = { c->sock, POLLIN, 0 };
-        if (poll(&p, 1, 0) > 0 || (c->tls && tls_pending(c->tls))) {
+        if (c->rpos < c->rlen || poll(&p, 1, 0) > 0 || (c->tls && tls_pending(c->tls))) {
             conn_close(c);                  /* readable while idle: closed by the server (or noise) */
             continue;
         }
@@ -902,11 +931,11 @@ struct freshness {
 static struct freshness freshness_of(const char *headers, size_t hlen, int status, long now)
 {
     struct freshness f = { 0, 0, 1 };
-    char cc[300], v[300];
+    char cc[2048], v[300];
     int explicit_ = 0;
     header_get(headers, hlen, "Cache-Control", cc, sizeof(cc));
-    if (has_token(cc, "no-store"))
-        f.store = 0;
+    if (has_token(cc, "no-store") || strlen(cc) >= sizeof(cc) - 1)
+        f.store = 0;                    /* (one too long to read whole may say no-store further on) */
     long date = now;
     if (header_get(headers, hlen, "Date", v, sizeof(v))) {
         long d = http_date(v);
@@ -991,13 +1020,28 @@ static int head_add(struct head *h, const char *line, size_t n)
 
 /* Read the head of a response (skipping 1xx ones). Returns 0, 1 if the stream ended before any byte
  * came, or -1 (err set; "" for a stop). */
+static int read_head_lines(struct conn *c, const struct http_request *rq, int timeout_ms, struct head *h,
+                           char *line, char *err, size_t esize);
+
 static int read_head(struct conn *c, const struct http_request *rq, int timeout_ms, struct head *h,
                      char *err, size_t esize)
 {
-    char line[4096];
+    char *line = malloc(MAX_HEAD);
+    if (!line) {
+        snprintf(err, esize, "out of memory");
+        return -1;
+    }
+    int r = read_head_lines(c, rq, timeout_ms, h, line, err, esize);
+    free(line);
+    return r;
+}
+
+static int read_head_lines(struct conn *c, const struct http_request *rq, int timeout_ms, struct head *h,
+                           char *line, char *err, size_t esize)
+{
     for (;;) {
         head_free(h);
-        int n = conn_line(c, rq, timeout_ms, line, sizeof(line), err, esize);
+        int n = conn_line(c, rq, timeout_ms, line, MAX_HEAD, err, esize);
         if (n == -1)
             return 1;
         if (n < 0)
@@ -1009,9 +1053,11 @@ static int read_head(struct conn *c, const struct http_request *rq, int timeout_
         snprintf(h->status_line, sizeof(h->status_line), "%s", line);
         h->status = atoi(strchr(line, ' ') + 1);
         h->minor = line[7] == '0' ? 0 : 1;
-        while ((n = conn_line(c, rq, timeout_ms, line, sizeof(line), err, esize)) > 0)
-            if (!head_add(h, line, (size_t)n))
-                break;
+        while ((n = conn_line(c, rq, timeout_ms, line, MAX_HEAD, err, esize)) > 0)
+            if (!head_add(h, line, (size_t)n)) {
+                snprintf(err, esize, "the server's response head is too large");
+                return -1;
+            }
         if (n < 0 && n != -1)
             return -1;
         if (n == -1) {
@@ -1371,7 +1417,7 @@ static int unpad(const uint8_t **p, uint32_t *n, int flags, int priority)
 
 struct h2fields {
     struct head *h;                     /* where the fields go; NULL to only keep HPACK's table right */
-    int status, bad;
+    int status, bad, big;
 };
 
 static int h2_field(void *ctx, const char *name, size_t nl, const char *value, size_t vl)
@@ -1385,11 +1431,17 @@ static int h2_field(void *ctx, const char *name, size_t nl, const char *value, s
     }
     if (nl && name[0] == ':')
         return f->bad = 1, 0;
-    if (nl + vl > 8000)
-        return 0;
-    char line[8200];
-    int n = snprintf(line, sizeof(line), "%.*s: %.*s", (int)nl, name, (int)vl, value);
-    head_add(f->h, line, (size_t)n);
+    if (nl + vl + 2 > MAX_HEAD)
+        return f->big = 1, 0;
+    char *line = malloc(nl + vl + 2);
+    if (!line)
+        return f->big = 1, 0;
+    memcpy(line, name, nl);
+    memcpy(line + nl, ": ", 2);
+    memcpy(line + nl + 2, value, vl);
+    if (!head_add(f->h, line, nl + vl + 2))
+        f->big = 1;
+    free(line);
     return 0;
 }
 
@@ -1398,7 +1450,7 @@ static int h2_field(void *ctx, const char *name, size_t nl, const char *value, s
 static int h2_block_done(struct h2 *h, struct h2stream *s, char *err, size_t esize)
 {
     int mine = s && h->block_stream == s->id && s->state < 2;
-    struct h2fields f = { mine && s->state == 0 ? s->h : NULL, 0, 0 };
+    struct h2fields f = { mine && s->state == 0 ? s->h : NULL, 0, 0, 0 };
     if (f.h)
         head_free(f.h);
     if (hpack_decode(&h->dec, h->block, h->blen, h2_field, &f) < 0) {
@@ -1409,6 +1461,10 @@ static int h2_block_done(struct h2 *h, struct h2stream *s, char *err, size_t esi
     if (!mine)
         return 0;
     if (s->state == 0) {
+        if (f.big) {
+            snprintf(err, esize, "the server's response head is too large");
+            return -1;
+        }
         if (f.status < 100 || f.status > 999 || f.bad) {
             snprintf(err, esize, "the server's HTTP/2 answer is malformed");
             return -1;
@@ -1545,8 +1601,14 @@ static int h2_frame(struct conn *c, struct h2stream *s, const struct http_reques
                     snprintf(err, esize, "the server's window size is too big");
                     return -1;
                 }
-                if (s)
-                    s->send_window += (long)v - h->peer_window;
+                if (s) {
+                    long long w = (long long)s->send_window + (long)v - h->peer_window;
+                    if (w > 0x7FFFFFFF) {
+                        snprintf(err, esize, "the server's window size is too big");
+                        return -1;
+                    }
+                    s->send_window = (long)w;
+                }
                 h->peer_window = (long)v;
             } else if (which == 5) {    /* MAX_FRAME_SIZE */
                 if (v < 16384 || v > 16777215) {
@@ -1581,10 +1643,13 @@ static int h2_frame(struct conn *c, struct h2stream *s, const struct http_reques
             return -1;
         }
         long inc = (long)(get32(p) & 0x7FFFFFFF);
-        if (!id)
-            h->send_window += inc;
-        else if (ours)
-            s->send_window += inc;
+        long *w = !id ? &h->send_window : ours ? &s->send_window : NULL;
+        if (w && (long long)*w + inc > 0x7FFFFFFF) {   /* RFC 9113 6.9.1: a flow control error */
+            snprintf(err, esize, "the server opened its window too far");
+            return -1;
+        }
+        if (w)
+            *w += inc;
         return 0;
     }
     case F_PUSH_PROMISE:
@@ -1707,7 +1772,7 @@ static size_t h2_head(uint8_t *out, size_t cap, const char *method, const struct
         const char *eol = strstr(p, "\r\n");
         size_t ll = eol ? (size_t)(eol - p) : strlen(p);
         const char *colon = memchr(p, ':', ll);
-        char name[128], value[8192];
+        char name[128];
         if (colon && colon > p && (size_t)(colon - p) < sizeof(name)) {
             size_t nl = (size_t)(colon - p);
             for (size_t i = 0; i < nl; i++)
@@ -1716,11 +1781,11 @@ static size_t h2_head(uint8_t *out, size_t cap, const char *method, const struct
             const char *v = colon + 1;
             while (v < p + ll && (*v == ' ' || *v == '\t'))
                 v++;
-            snprintf(value, sizeof(value), "%.*s", (int)(p + ll - v), v);
-            int skip = !strcmp(name, "te") && strcmp(value, "trailers");
+            size_t vl = (size_t)(p + ll - v);
+            int skip = !strcmp(name, "te") && !(vl == 8 && !memcmp(v, "trailers", 8));
             for (size_t i = 0; i < sizeof(banned) / sizeof(banned[0]); i++)
                 skip |= !strcmp(name, banned[i]);
-            if (!skip && hpack_encode(out, cap, &len, name, value) < 0)
+            if (!skip && hpack_encode_len(out, cap, &len, name, v, vl) < 0)
                 return 0;
         }
         p += ll + (eol ? 2 : 0);
@@ -1968,6 +2033,13 @@ static int one_request(struct http_client *cl, const struct http_request *rq, co
     long length = -1;
     if (header_get(h.raw, h.len, "Content-Length", v, sizeof(v)) && isdigit((unsigned char)v[0]))
         length = atol(v);
+    if (header_conflict(h.raw, h.len, "Content-Length")) {
+        conn_abandon(c, &st);
+        set_err(rs, "the server sent conflicting Content-Length headers");
+        entry_free(&ent);
+        head_free(&h);
+        return -1;
+    }
     int chunked = header_get(h.raw, h.len, "Transfer-Encoding", v, sizeof(v)) && strcasestr(v, "chunked");
     char encoding[64];
     header_get(h.raw, h.len, "Content-Encoding", encoding, sizeof(encoding));
@@ -1984,6 +2056,8 @@ static int one_request(struct http_client *cl, const struct http_request *rq, co
     /* Stream it as it comes when nothing needs the whole body first. */
     int following = is_redirect(h.status) && may_follow;
     int stream = (rq->on_data || rq->on_headers) && !coded && !no_body && !following && h.status != 304;
+    if (stream_only && !stream && max > DEFAULT_MAX)
+        max = DEFAULT_MAX;              /* a body that must be held whole (coded, a redirect's) is held as usual */
     struct http_request sub = *rq;
     if (!stream) {
         sub.on_data = NULL;

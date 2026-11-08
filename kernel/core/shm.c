@@ -15,13 +15,23 @@
 #include "proc.h"
 #include "syscall.h"
 
-#define SHM_SEGS    256
+#define SHM_SEGS    1024
 #define SHM_MAXSIZE (64u << 20)
+/*
+ * Segments made and not yet removed are limited per process, so that a few
+ * programs cannot take them all (Linux has SHMMNI for the system). The limit
+ * is the web engine's own quota of shared buffers. The process that has the
+ * screen, the desktop, makes one for each window of every program it serves:
+ * it is not limited, and the others together leave it SHM_RESERVE.
+ */
+#define SHM_PER_PROC 128
+#define SHM_RESERVE  256
 
 struct shm_seg {
     int used;
     int key;                    /* IPC_PRIVATE: none */
     int creator;                /* its process's pid */
+    int display;                /* made by the process that had the screen: in no limit */
     uint32_t size, npages;
     uint32_t *frames;
     uint32_t seq;               /* ids are slot + SHM_SEGS * seq: an old id names no new segment */
@@ -32,7 +42,7 @@ static spinlock_t shm_lock = SPINLOCK_INIT("shm");
 
 static int seg_id(int slot)
 {
-    return (int)(((segs[slot].seq & 0x7FFFFF) * SHM_SEGS) + (uint32_t)slot);
+    return (int)(((segs[slot].seq & (0x7FFFFFFFu / SHM_SEGS)) * SHM_SEGS) + (uint32_t)slot);
 }
 
 /* With shm_lock: the slot id names, or -1. */
@@ -62,10 +72,34 @@ static uint32_t *seg_remove(int slot, uint32_t *n)
     return frames;
 }
 
+/* With shm_lock: may process pid (display: it has the screen) make another segment? */
+static int may_create(int pid, int display)
+{
+    if (display)
+        return 1;
+    int mine = 0, others = 0;
+    for (int i = 0; i < SHM_SEGS; i++) {
+        if (!segs[i].used)
+            continue;
+        if (segs[i].creator == pid)
+            mine++;
+        if (!segs[i].display)
+            others++;
+    }
+    return mine < SHM_PER_PROC && others < SHM_SEGS - SHM_RESERVE;
+}
+
 static int shm_create(int key, uint32_t size)
 {
     if (!size || size > SHM_MAXSIZE)
         return -EINVAL;
+    int pid = current->leader->pid;
+    int display = vmm_mmio_mapped(current->pd, USER_MMIO_BASE);    /* the screen, by fbmap */
+    spin_lock(&shm_lock);
+    int ok = may_create(pid, display);
+    spin_unlock(&shm_lock);
+    if (!ok)
+        return -ENOSPC;                 /* (looked at again once the memory is there) */
     uint32_t n = ALIGN_UP(size, PAGE_SIZE) / PAGE_SIZE;
     uint32_t *frames = kzalloc(n * sizeof(*frames));
     if (!frames)
@@ -83,14 +117,15 @@ static int shm_create(int key, uint32_t size)
     for (int i = 0; i < SHM_SEGS && slot < 0; i++)
         if (!segs[i].used)
             slot = i;
-    if (slot < 0) {
+    if (slot < 0 || !may_create(pid, display)) {
         spin_unlock(&shm_lock);
         free_frames(frames, n);
         return -ENOSPC;
     }
     segs[slot].used = 1;
     segs[slot].key = key;
-    segs[slot].creator = current->leader->pid;
+    segs[slot].creator = pid;
+    segs[slot].display = display;
     segs[slot].size = size;
     segs[slot].npages = n;
     segs[slot].frames = frames;

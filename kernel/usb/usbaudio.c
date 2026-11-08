@@ -331,8 +331,11 @@ static void stop(void)
     int t = usb_enter();
     ua.streaming = 0;
     if (!ua.gone) {
-        if (ua.inflight)
-            usb_cancel(&ua.x[0]);       /* cancels every transfer queued on the endpoint */
+        /* Cancelling one cancels every transfer queued on the endpoint, but
+         * only a pending one: the first may have finished already. */
+        for (int k = 0; k < NX; k++)
+            if (ua.x[k].status == USB_PENDING)
+                usb_cancel(&ua.x[k]);
         if (ua.fb_running)
             usb_cancel(&ua.fx);
     }
@@ -861,8 +864,9 @@ static void audio_disconnect(struct usb_dev *dev, void *priv)
         return;                         /* each of its interfaces says so once */
     ua.gone = 1;
     ua.streaming = 0;
-    if (ua.inflight)
-        usb_cancel(&ua.x[0]);
+    for (int k = 0; k < NX; k++)
+        if (ua.x[k].status == USB_PENDING)
+            usb_cancel(&ua.x[k]);
     if (ua.fb_running)
         usb_cancel(&ua.fx);
     ua.inflight = 0;

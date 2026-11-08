@@ -16,19 +16,18 @@
 #include <unistd.h>
 #include "fsh.h"
 
-#define MAX_JOBS 32
-#define MAX_PIPE 32
-
 struct job {
     int id;
-    int pid;                    /* its process group (the first process) */
-    int pids[MAX_PIPE];         /* the processes still to be waited for */
+    int pid;                    /* its process group (the first process); 0: a free slot */
+    int *pids;                  /* the processes still to be waited for */
     int npids;
     int stopped;                /* suspended by ^Z (or a stop signal) */
     char *text;
 };
 
-static struct job jobs[MAX_JOBS];
+/* Grows as needed: a script may start any number of background jobs and wait for them later. */
+static struct job *jobs;
+static int njobs;               /* slots */
 
 /* ---- functions ---- */
 
@@ -229,7 +228,7 @@ int find_command(const char *name, char *out, size_t size)
 int jobs_count(void)
 {
     int n = 0;
-    for (int i = 0; i < MAX_JOBS; i++)
+    for (int i = 0; i < njobs; i++)
         if (jobs[i].pid)
             n++;
     return n;
@@ -238,27 +237,35 @@ int jobs_count(void)
 /* A job of process group pgid, waiting for n processes. */
 static struct job *job_add(int pgid, const int *pids, int n, const char *text)
 {
-    int id = 1;
-    for (int i = 0; i < MAX_JOBS; i++)
+    int id = 1, slot = -1;
+    for (int i = 0; i < njobs; i++) {
         if (jobs[i].pid && jobs[i].id >= id)
             id = jobs[i].id + 1;
-    for (int i = 0; i < MAX_JOBS; i++) {
-        if (!jobs[i].pid) {
-            jobs[i].id = id;
-            jobs[i].pid = pgid;
-            jobs[i].npids = n < MAX_PIPE ? n : MAX_PIPE;
-            memcpy(jobs[i].pids, pids, sizeof(int) * (size_t)jobs[i].npids);
-            jobs[i].stopped = 0;
-            jobs[i].text = xstrdup(text ? text : "");
-            return &jobs[i];
-        }
+        if (!jobs[i].pid && slot < 0)
+            slot = i;
     }
-    return NULL;
+    if (slot < 0) {
+        int cap = njobs ? njobs * 2 : 32;
+        jobs = xrealloc(jobs, sizeof(struct job) * (size_t)cap);
+        memset(jobs + njobs, 0, sizeof(struct job) * (size_t)(cap - njobs));
+        slot = njobs;
+        njobs = cap;
+    }
+    struct job *j = &jobs[slot];
+    j->id = id;
+    j->pid = pgid;
+    j->npids = n;
+    j->pids = xmalloc(sizeof(int) * (size_t)(n ? n : 1));
+    memcpy(j->pids, pids, sizeof(int) * (size_t)n);
+    j->stopped = 0;
+    j->text = xstrdup(text ? text : "");
+    return j;
 }
 
 static void job_remove(struct job *j)
 {
     free(j->text);
+    free(j->pids);
     memset(j, 0, sizeof(*j));
 }
 
@@ -274,7 +281,7 @@ void jobs_reap(int notify)
 {
     int st, pid;
     while ((pid = waitpid(-1, &st, WNOHANG | WUNTRACED)) > 0) {
-        for (int i = 0; i < MAX_JOBS; i++) {
+        for (int i = 0; i < njobs; i++) {
             int k = 0;
             while (k < jobs[i].npids && jobs[i].pids[k] != pid)
                 k++;
@@ -307,7 +314,7 @@ int job_pid(struct job *j)
 
 struct job *job_find_pid(int pid)
 {
-    for (int i = 0; i < MAX_JOBS; i++)
+    for (int i = 0; i < njobs; i++)
         for (int k = 0; jobs[i].pid && k < jobs[i].npids; k++)
             if (jobs[i].pids[k] == pid)
                 return &jobs[i];
@@ -318,7 +325,7 @@ struct job *job_find(const char *spec)
 {
     struct job *best = NULL;
     if (!spec || !strcmp(spec, "%%") || !strcmp(spec, "%+") || !strcmp(spec, "%")) {
-        for (int i = 0; i < MAX_JOBS; i++)
+        for (int i = 0; i < njobs; i++)
             if (jobs[i].pid && (!best || jobs[i].id > best->id))
                 best = &jobs[i];
         return best;
@@ -326,7 +333,7 @@ struct job *job_find(const char *spec)
     if (spec[0] == '%')
         spec++;
     int id = atoi(spec);
-    for (int i = 0; i < MAX_JOBS; i++)
+    for (int i = 0; i < njobs; i++)
         if (jobs[i].pid && jobs[i].id == id)
             return &jobs[i];
     return NULL;
@@ -335,7 +342,7 @@ struct job *job_find(const char *spec)
 void jobs_list(void)
 {
     struct job *cur = job_find(NULL);
-    for (int i = 0; i < MAX_JOBS; i++)
+    for (int i = 0; i < njobs; i++)
         if (jobs[i].pid)
             printf("[%d]  %c %-10s %s\n", jobs[i].id, &jobs[i] == cur ? '+' : ' ',
                    jobs[i].stopped ? "suspended" : "running", jobs[i].text);
@@ -378,8 +385,9 @@ static int wait_pids(int *pids, int n, int pgid, const char *text)
 
 int job_wait(struct job *j, int announce)
 {
-    int pgid = j->pid, pids[MAX_PIPE], n = j->npids, stopped = j->stopped;
-    memcpy(pids, j->pids, sizeof(int) * (size_t)n);
+    int pgid = j->pid, n = j->npids, stopped = j->stopped;
+    int *pids = j->pids;
+    j->pids = NULL;                     /* ours now: job_remove frees the rest */
     char *text = xstrdup(j->text);
     if (announce)
         fprintf(stderr, "[%d]  + %s  %s\n", j->id, stopped ? "continued" : "running  ", text);
@@ -391,6 +399,7 @@ int job_wait(struct job *j, int announce)
     int st = wait_pids(pids, n, pgid, text);
     if (sh.interactive)
         tcsetpgrp(0, sh.shell_pgid);
+    free(pids);
     free(text);
     return st;
 }
@@ -860,8 +869,8 @@ static void run_in_child(struct node *n)
 
 static int run_pipeline(struct node *n)
 {
-    int pids[MAX_PIPE];
-    int count = n->nitems < MAX_PIPE ? n->nitems : MAX_PIPE;
+    int *pids = xmalloc(sizeof(int) * (size_t)n->nitems);
+    int count = n->nitems;
     int pgid = 0, prev = -1, forked_all = 1;
 
     fflush(stdout);
@@ -915,6 +924,7 @@ static int run_pipeline(struct node *n)
     int status = wait_pids(pids, count, pgid, n->text);
     if (sh.interactive)
         tcsetpgrp(0, sh.shell_pgid);
+    free(pids);
     return forked_all ? status : 1;
 }
 

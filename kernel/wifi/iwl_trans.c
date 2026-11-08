@@ -574,7 +574,7 @@ int iwl_trans_tx(int h, const void *cmd, const uint8_t *f, uint32_t hlen, uint32
     else if ((uint16_t)(q->write - q->read) >= TX_COUNT - 1) r = -EAGAIN;
     else {
         uint8_t *p = q->buffers.p + (q->write & (TX_COUNT - 1)) * PAGE_SIZE;
-        uint16_t seq = (q->id << 8) | (q->write & (TX_COUNT - 1));
+        uint16_t seq = (uint16_t)((q->id & 0x1f) << 8 | (q->write & (TX_COUNT - 1)));  /* QUEUE_TO_SEQ | INDEX_TO_SEQ */
         p[0] = 0x1c; p[1] = 0; memcpy(p + 2, &seq, 2);
         memcpy(p + 4, cmd, 28); memcpy(p + 32, f, len);
         unsigned idx = q->write & (TX_COUNT - 1);

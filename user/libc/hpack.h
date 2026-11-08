@@ -34,5 +34,7 @@ int hpack_decode(struct hpack *h, const uint8_t *p, size_t n,
 /* Append one field to out (cap bytes, *len used) as a literal without indexing, naming it from the
  * static table where it can; name must be lower case. Returns 0, or -1 if it does not fit. */
 int hpack_encode(uint8_t *out, size_t cap, size_t *len, const char *name, const char *value);
+/* The same with a value of vlen bytes (not NUL-terminated). */
+int hpack_encode_len(uint8_t *out, size_t cap, size_t *len, const char *name, const char *value, size_t vlen);
 
 #endif

@@ -2113,7 +2113,7 @@ static void engine_send(const char *fmt, ...)
     int n = vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
     if (n > 0 && n < (int)sizeof(line))
-        webaudio_send(line);
+        webaudio_send(line);            /* (which refuses a line with a control character in it) */
 }
 
 /* The engine forgets the element: its pictures and what it still had to say go too. */
@@ -2301,6 +2301,15 @@ static int engine_url(struct browser *b, struct node *n, char *out, int size)
     return 1;
 }
 
+/* A control character would end or split a line to the engine. */
+static int has_control(const char *s)
+{
+    for (; *s; s++)
+        if ((unsigned char)*s < 32 || *s == 127)
+            return 1;
+    return 0;
+}
+
 /* Give the engine the element's file or address. */
 static void engine_open(struct browser *b, struct media *m)
 {
@@ -2347,10 +2356,14 @@ static void engine_open(struct browser *b, struct media *m)
         }
         engine_send("vopen %d %s\n", m->id, m->tmpfile);
     } else if (url_is_file(url)) {
-        if (!url_file_path(url, path, sizeof(path)))
+        if (!url_is_file(b->url) || !url_file_path(url, path, sizeof(path)) || has_control(path)) {
+            char why[64];                       /* a local file is a local page's only */
+            snprintf(why, sizeof(why), "verror %d This address cannot be played.", m->id);
+            engine_line(why);
             return;
+        }
         engine_send("vopen %d %s\n", m->id, path);
-    } else if (url_is_http(url) || url_is_https(url)) {
+    } else if ((url_is_http(url) || url_is_https(url)) && !has_control(url)) {
         char cookie[2048] = "";
         cookie_header_context(url, top_of(b)->url, 0, 1, cookie, sizeof(cookie));
         engine_send("vhdr %d User-Agent: %s\n", m->id, BROWSER_USER_AGENT);
@@ -2689,8 +2702,8 @@ static int js_media_cmd(void *ctx, struct node *n, const char *op, const char *s
     char clean[256];
     snprintf(clean, sizeof(clean), "%s", str ? str : "");
     for (char *p = clean; *p; p++)
-        if (*p == '\n' || *p == '\r')
-            *p = ' ';
+        if ((unsigned char)*p < 32 || *p == 127)
+            *p = ' ';                   /* the engine's lines are one line each */
     if (!strcmp(op, "sbadd")) {
         if (m->nsb >= 4)
             return -1;
@@ -3229,8 +3242,8 @@ static void js_window_post(void *ctx, int wid, const char *data, int len, const 
     web_origin(t->url, to, sizeof(to));
     if (!strcmp(target_origin, "/"))
         snprintf(want, sizeof(want), "%s", from);
-    else if (strcmp(target_origin, "*") && web_origin(target_origin, want, sizeof(want)) < 0)
-        return;
+    else if (strcmp(target_origin, "*") && !web_origin(target_origin, want, sizeof(want)))
+        return;                         /* not an origin: delivered nowhere */
     if (want[0] && strcmp(want, to))
         return;                         /* not for the page that is there now */
     jsdom_message(t->js, data, len, from, wid_of(b));
@@ -3725,6 +3738,18 @@ static void push_history(struct browser *b, const char *url);
 static int js_set_url(void *ctx, const char *url, int replace)
 {
     struct browser *b = ctx;
+    /* the document's own origin only (scheme included): a local file may move among local files, and any
+     * other document only to another fragment of its own address */
+    char now[URL_MAX], want[URL_MAX];
+    snprintf(now, sizeof(now), "%s", b->url);
+    snprintf(want, sizeof(want), "%s", url);
+    url_strip_fragment(now);
+    url_strip_fragment(want);
+    size_t scheme = strcspn(b->url, ":");
+    int same_scheme = strcspn(url, ":") == scheme && !strncasecmp(b->url, url, scheme);
+    if (!(same_scheme && web_same_origin(b->url, url)) && !(url_is_file(b->url) && url_is_file(url)) &&
+        strcmp(now, want))
+        return b->nhist ? b->hist[b->hpos].id : 0;
     if (!replace || !b->nhist) {
         push_history(b, url);
         b->hist[b->hpos].id = ++b->entry_ids;
@@ -4896,8 +4921,9 @@ static void save_download(struct browser *b, const struct fetch *f, const struct
         free(p->body);
         free(p);
     }
-    /* No box to be had (one is already open): the Downloads folder. */
-    finish_save(b, f->url, quiet, name, r->body, r->len, path);
+    /* No box to be had (one is already open): nothing is saved unasked. */
+    set_status(b, "Did not save %.100s: another question is open, finish it and try again", f->url);
+    paint(b);
 }
 
 /* The status bar once a page is in: a secure page says what that means here. */
@@ -4988,6 +5014,8 @@ static void fetch_complete(struct browser *b)
             url_resolve(done.url, r.location, next, sizeof(next));
             if (done.redirects >= 10)
                 page_failed(b, done.url, "Too many redirects");
+            else if (!url_is_http(next) && !url_is_https(next))
+                page_failed(b, done.url, "The server redirected to an address that is not on the web");
             else {
                 if (!url_fragment(next) && url_fragment(done.url)) {
                     size_t l = strlen(next);
@@ -5213,6 +5241,13 @@ static void navigate(struct browser *b, const char *url, const char *post, int m
     snprintf(u, sizeof(u), "%s", url);
     int source = !strncasecmp(u, "view-source:", 12);      /* its text, not the page it makes */
     const char *fu = source ? u + 12 : u;                  /* what is fetched */
+    /* Only the user, or a local page, opens a local file: not a link, form, refresh, frame or
+     * window.open of a page from anywhere else. */
+    if (url_is_file(fu) && from[0] && !url_is_file(from)) {
+        set_status(b, "Blocked a page from opening a local file");
+        paint(b);
+        return;
+    }
 
     /* Use the same asynchronous archive opener as File Manager, before reading
      * the file or changing the current page. Archives can exceed MAX_PAGE. */
@@ -6087,9 +6122,10 @@ static void draw_status(struct browser *b, struct surface *s)
     gfx_fill(s, 0, s->h - STATUS_H - 2, s->w, STATUS_H + 2, C_FACE);
     gfx_bevel(s, r, BEVEL_THIN_SUNKEN);
     char text[300];
-    if (b->hover) {
+    const char *href = b->hover ? node_attr(b->hover, "href") : NULL;  /* a script may have taken it away */
+    if (href) {
         char abs[URL_MAX];
-        url_resolve(b->base, node_attr(b->hover, "href"), abs, sizeof(abs));
+        url_resolve(b->base, href, abs, sizeof(abs));
         snprintf(text, sizeof(text), "%s", abs);
     } else {
         snprintf(text, sizeof(text), "%s", b->status);

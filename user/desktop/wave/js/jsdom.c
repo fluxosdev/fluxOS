@@ -96,7 +96,9 @@ struct jsdom {
     int depth;                          /* nested entries from the browser */
     char cookies[2048];
     struct xhr_request requests[MAX_XHR];
-    struct jsobj *xhr[MAX_XHR];         /* requests in flight, by id */
+    struct jsobj *xhr[MAX_XHR];         /* requests in flight, by slot */
+    int xhr_wire[MAX_XHR];              /* the id the browser knows each slot's request by (slot + MAX_XHR * n) */
+    unsigned xhr_gen;
     struct jsobj *xhr_proto;
     unsigned int started;               /* uptime when the page's scripts began */
     struct jsobj **wraps;               /* every node's wrapper, for the collector (not roots) */
@@ -175,15 +177,56 @@ static void settle(struct jsdom *d)
     }
 }
 
-/* Publish mutations before a synchronous read. The host can then skip clean flushes. */
-static void flush_layout(struct jsdom *d)
+/*
+ * The browser styles and lays out (h.flush, node_box, reveal, view_transition) on the stack the
+ * script is on, which in a generator or async function is a coroutine's small one. That costs stack
+ * in proportion to how deeply the page nests (painting alone does not), so before it: room for the
+ * base cost and a level for each, or a RangeError. The engine has no way to move native
+ * work to the main stack, so this refuses rather than risk running off the end. 0 if refused.
+ */
+#define LAYOUT_STACK_BASE  (48u << 10)  /* styling, laying out and painting a flat page, with room to spare */
+#define LAYOUT_STACK_LEVEL 1280u        /* each level of nesting (measured: about 1 KiB on a 64-bit host) */
+#define LAYOUT_MAX_DEPTH   512          /* layout.c goes no deeper */
+static int layout_room(struct jsdom *d)
 {
-    if(!d->h.flush)return;
+    struct js *J = d->J;
+    const char *sp = __builtin_frame_address(0);
+    if (!J->stack_lo || sp < J->stack_lo || sp >= J->stack_hi)
+        return 1;                       /* not a stack the engine runs on */
+    size_t room = (size_t)(sp - J->stack_lo);
+    if (room >= LAYOUT_STACK_BASE + (size_t)LAYOUT_MAX_DEPTH * LAYOUT_STACK_LEVEL)
+        return 1;                       /* the main stack */
+    int allowed = room > LAYOUT_STACK_BASE ? (int)((room - LAYOUT_STACK_BASE) / LAYOUT_STACK_LEVEL) : -1;
+    for (struct node *n = allowed >= 0 ? d->h.root : NULL; n; n = node_next_shadow(n, d->h.root)) {
+        if (n->first || n->shadow_root)
+            continue;                   /* the deepest nodes are the leaves */
+        int depth = 0;
+        for (const struct node *p = n; p && depth <= allowed; p = p->parent ? p->parent : p->shadow_host)
+            depth++;
+        if (depth > allowed) {
+            allowed = -1;
+            break;
+        }
+    }
+    if (allowed >= 0)
+        return 1;
+    if (!J->throwing)
+        js_throw_error(J, "RangeError: the page nests too deeply to lay out on this stack");
+    return 0;
+}
+
+/* Publish mutations before a synchronous read. The host can then skip clean flushes. 0 if refused
+ * (a RangeError is pending): the caller must not ask the browser about boxes then either. */
+static int flush_layout(struct jsdom *d)
+{
+    if(!layout_room(d))return 0;
+    if(!d->h.flush)return 1;
     if(d->dirty) {
         d->dirty=0;d->repaint=0;
         if(d->h.changed)d->h.changed(d->h.ctx);
     }
     d->h.flush(d->h.ctx);
+    return 1;
 }
 
 void jsdom_canvas_dirty(struct js *J)
@@ -555,6 +598,8 @@ static void set_text_content(struct jsdom *d, struct node *n, const char *s, int
 struct out {
     char *p;
     int n, cap;
+    struct js *J;
+    int overflow;                       /* the tree was too deep to serialize on this stack */
 };
 
 static void out_add(struct out *o, const char *s, int n)
@@ -603,6 +648,12 @@ static int is_void(int tag)
 
 static void serialize(struct out *o, const struct node *n, int self)
 {
+    if (o->overflow)
+        return;
+    if (o->J && js_stack_low(o->J)) {       /* a deep tree must not run off the stack */
+        o->overflow = 1;
+        return;
+    }
     if (n->type == N_TEXT) {
         int raw = n->parent && (n->parent->tag == T_SCRIPT || n->parent->tag == T_STYLE);
         if (raw)
@@ -637,7 +688,12 @@ static void serialize(struct out *o, const struct node *n, int self)
 static jsval html_of(struct js *J, const struct node *n, int outer)
 {
     struct out o = { 0 };
+    o.J = J;
     serialize(&o, n, outer);
+    if (o.overflow) {
+        free(o.p);
+        return js_throw_error(J, "RangeError: the node tree is too deep to serialize");
+    }
     jsval v = js_strn(J, o.p ? o.p : "", o.n);
     free(o.p);
     return v;
@@ -1309,7 +1365,8 @@ static const char *control_value(struct node *n)
 static jsval rect_object(struct jsdom *d, struct node *n)
 {
     struct js *J = d->J;
-    flush_layout(d);
+    if (!flush_layout(d))
+        return js_undefined;
     int x = 0, y = 0, w = 0, h = 0, sx = 0, sy = 0;
     if (d->h.node_visual_box)
         d->h.node_visual_box(d->h.ctx, n, &x, &y, &w, &h);
@@ -1553,7 +1610,10 @@ static int node_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
     if (IS("offsetWidth") || IS("offsetHeight") || IS("clientWidth") || IS("clientHeight") ||
         IS("offsetTop") || IS("offsetLeft") || IS("scrollWidth") || IS("scrollHeight")) {
         int x = 0, y = 0, w = 0, h = 0;
-        flush_layout(d);
+        if (!flush_layout(d)) {
+            *out = js_undefined;
+            return 1;
+        }
         if (d->h.node_box)
             d->h.node_box(d->h.ctx, n, &x, &y, &w, &h);
         int ssx, ssy, scw, sch, svw, svh;
@@ -1572,7 +1632,10 @@ static int node_get(struct js *J, struct jsobj *o, const char *key, jsval *out)
             if (d->h.scroll_pos)
                 d->h.scroll_pos(d->h.ctx, &sx, &sy);
         } else if (d->h.node_scroll) {
-            flush_layout(d);
+            if (!flush_layout(d)) {
+                *out = js_undefined;
+                return 1;
+            }
             d->h.node_scroll(d->h.ctx, n, 0, &sx, &sy, &cw, &ch, &vw, &vh);
         }
         *out = js_num(IS("scrollTop") ? sy : sx);
@@ -1788,7 +1851,8 @@ static int node_set(struct js *J, struct jsobj *o, const char *key, jsval v)
             d->h.scroll(d->h.ctx, IS("scrollLeft") ? (int)p : sx, IS("scrollTop") ? (int)p : sy, 0);
         } else if (d->h.node_scroll) {
             int cw, ch, vw, vh;
-            flush_layout(d);
+            if (!flush_layout(d))
+                return 1;
             sx = n->scroll_x, sy = n->scroll_y;
             d->h.node_scroll(d->h.ctx, n, 0, &sx, &sy, &cw, &ch, &vw, &vh);
             if (IS("scrollLeft"))
@@ -2017,7 +2081,10 @@ static int computed_get(struct js *J, struct jsobj *o, const char *key, jsval *o
 {
     struct node *n = o->hdata;
     struct jsdom *d = dom(J);
-    flush_layout(d);
+    if (!flush_layout(d)) {
+        *out = js_undefined;
+        return 1;
+    }
     const struct style *st = n->style;
     char b[512];
     if (!strcmp(key,"transform") || !strcmp(key,"transformOrigin") || !strcmp(key,"transform-origin")) {
@@ -2531,6 +2598,10 @@ static jsval el_replace_children(struct js *J, jsval self, jsval *args, int argc
 
 static struct node *clone(struct jsdom *d, const struct node *n, int deep)
 {
+    if (js_stack_low(d->J)) {           /* a deep tree must not run off the stack */
+        js_throw_error(d->J, "RangeError: the node tree is too deep to clone");
+        return NULL;
+    }
     struct node *c = n->type == N_TEXT ? new_text(d, n->text, n->len) : new_node(d, N_ELEMENT, n->name);
     if (!c)
         return NULL;
@@ -2546,6 +2617,8 @@ static struct node *clone(struct jsdom *d, const struct node *n, int deep)
             struct node *kc = clone(d, k, 1);
             if (kc)
                 insert_node(d, c, kc, NULL);
+            else if (js_throwing(d->J))
+                return NULL;
         }
     if (deep && n->tag == T_TEMPLATE && n->js) {   /* a template's content went to its fragment */
         struct node *content = node_of(js_get(d->J, js_obj(n->js), "__content"));
@@ -2553,6 +2626,8 @@ static struct node *clone(struct jsdom *d, const struct node *n, int deep)
             struct node *kc = clone(d, k, 1);
             if (kc)
                 insert_node(d, c, kc, NULL);
+            else if (js_throwing(d->J))
+                return NULL;
         }
     }
     return c;
@@ -2694,8 +2769,12 @@ static jsval el_get_root_node(struct js *J, jsval self, jsval *args, int argc)
     return n == d->h.root ? js_obj(d->document) : wrap(d, n);
 }
 
-static int equal_nodes(const struct node *a, const struct node *b)
+static int equal_nodes(struct js *J, const struct node *a, const struct node *b)
 {
+    if (js_stack_low(J)) {              /* a deep tree must not run off the stack */
+        js_throw_error(J, "RangeError: the node tree is too deep to compare");
+        return 0;
+    }
     if (a->type != b->type)
         return 0;
     if (a->type == N_TEXT)
@@ -2714,7 +2793,7 @@ static int equal_nodes(const struct node *a, const struct node *b)
         return 0;
     const struct node *p = a->first, *q = b->first;
     for (; p && q; p = p->next, q = q->next)
-        if (!equal_nodes(p, q))
+        if (!equal_nodes(J, p, q))
             return 0;
     return !p && !q;
 }
@@ -2722,7 +2801,7 @@ static int equal_nodes(const struct node *a, const struct node *b)
 static jsval el_is_equal_node(struct js *J, jsval self, jsval *args, int argc)
 {
     struct node *a = this_node(J, self), *b = node_of(ARG(0));
-    return js_bool(a && b && equal_nodes(a, b));
+    return js_bool(a && b && equal_nodes(J, a, b));
 }
 
 static jsval el_is_same_node(struct js *J, jsval self, jsval *args, int argc)
@@ -2874,7 +2953,8 @@ static void open_focus(struct jsdom *d, struct node *n, int dialog)
     struct js *J = d->J;
     jsval w = wrap(d, n);
     js_put(J, w.u.o, S(J, "__prevFocus"), d->active ? wrap(d, d->active) : js_null, 0);
-    flush_layout(d);                    /* styled now: what was display: none can be focused */
+    if (!flush_layout(d))               /* styled now: what was display: none can be focused */
+        return;
     struct node *f = focus_delegate(n, !dialog);
     if (f)
         jsdom_focus(d, f);
@@ -3701,6 +3781,8 @@ static jsval el_scroll_into_view(struct js *J, jsval self, jsval *args, int argc
     struct node *n = this_node(J, self);
     struct jsdom *d = dom(J);
     int x, y, w, h;
+    if (n && !layout_room(d))        /* revealing lays the page out first */
+        return js_undefined;
     if (n && d->h.reveal)
         d->h.reveal(d->h.ctx, n);
     else if (n && d->h.node_box && d->h.node_box(d->h.ctx, n, &x, &y, &w, &h) && d->h.scroll)
@@ -5244,11 +5326,15 @@ static jsval history_change(struct js *J, jsval *args, int argc, int replace)
         snprintf(abs, sizeof(abs), "%s", d->h.url);
     else
         url_resolve(d->h.url, js_tostr(J, url)->s, abs, sizeof(abs));
-    /* the same origin only: scheme, host and port */
-    const char *a = strstr(abs, "://"), *b = strstr(d->h.url, "://");
-    if (a && b) {
-        size_t la = strcspn(a + 3, "/?#") + (size_t)(a + 3 - abs), lb = strcspn(b + 3, "/?#") + (size_t)(b + 3 - d->h.url);
-        if (la != lb || strncasecmp(abs, d->h.url, la))
+    /* the same origin only: scheme, host and port (a local file stays a local file; any other
+     * document, about:blank or data: say, may change only its fragment) */
+    if (!web_same_origin(abs, d->h.url) && !(url_is_file(abs) && url_is_file(d->h.url))) {
+        char a[URL_MAX], b[URL_MAX];
+        snprintf(a, sizeof(a), "%s", abs);
+        snprintf(b, sizeof(b), "%s", d->h.url);
+        url_strip_fragment(a);
+        url_strip_fragment(b);
+        if (url_is_http(a) || url_is_https(a) || url_is_file(a) || strcmp(a, b))
             return js_throw_error(J, "SecurityError: a history state cannot change the origin");
     }
     int id = d->entry;
@@ -5394,6 +5480,8 @@ static jsval view_transition_op(struct js *J, jsval *args, int argc, int op)
     char types[256] = "";
     if (!d->h.view_transition)
         return js_num(0);
+    if (op != VT_END && !layout_room(d))     /* capturing and beginning lay the page out */
+        return js_undefined;
     if (op == VT_CAPTURE && argc > 0 && ARG(0).t == JS_STR)
         snprintf(types, sizeof(types), "%s", js_tostr(J, ARG(0))->s);
     return js_num(d->h.view_transition(d->h.ctx, op, types));
@@ -6092,8 +6180,11 @@ static jsval xhr_open(struct js *J, jsval self, jsval *args, int argc)
     if (self.u.o->hcls != &xhr_class)
         return js_throw_error(J, "TypeError: invalid XMLHttpRequest receiver");
     for (int i = 0; i < MAX_XHR; i++)
-        if (d->xhr[i] == self.u.o)
+        if (d->xhr[i] == self.u.o) {            /* opened again while in flight: that fetch stops */
             d->xhr[i] = NULL;
+            if (d->h.http_cancel)
+                d->h.http_cancel(d->h.ctx, d->xhr_wire[i]);
+        }
     struct xhr_request *request = self.u.o->hdata;
     memset(request, 0, sizeof(*request));
     request->url = S(J, abs);
@@ -6165,7 +6256,7 @@ static void xhr_issue(struct jsdom *d, int id, jsval x, int preflight)
         }
         char head[300];int n=snprintf(head,sizeof(head),"Content-Type: %s\r\nContent-Length: %u\r\n",*type?type:"application/octet-stream",(unsigned)len);
         r->cross=0;r->preflight=0;r->received=0;
-        jsdom_http_done(d,id,200,head,n,(const char *)bytes,!strcmp(method,"HEAD")?0:(int)len);
+        jsdom_http_done(d,d->xhr_wire[id],200,head,n,(const char *)bytes,!strcmp(method,"HEAD")?0:(int)len);
         free(bytes);return;
     }
     char origin[300] = "null", target[300];
@@ -6208,7 +6299,7 @@ static void xhr_issue(struct jsdom *d, int id, jsval x, int preflight)
         }
         if (nn)
             snprintf(request + n, sizeof(request) - (size_t)n, "Access-Control-Request-Headers: %s\n", names);
-        d->h.http(d->h.ctx, id, "OPTIONS", url, NULL, 0, request, 0);
+        d->h.http(d->h.ctx, d->xhr_wire[id], "OPTIONS", url, NULL, 0, request, 0);
     } else {
         int send_origin=!local && (cross || (strcmp(method,"GET") && strcmp(method,"HEAD")));
         snprintf(request,sizeof(request),"%s%s%s%s",headers,send_origin?"Origin: ":"",send_origin?origin:"",send_origin?"\n":"");
@@ -6216,7 +6307,7 @@ static void xhr_issue(struct jsdom *d, int id, jsval x, int preflight)
         int len = r->body ? r->body->len : 0;
         if (!strcmp(method, "GET") || !strcmp(method, "HEAD"))
             bytes = NULL, len = 0;
-        d->h.http(d->h.ctx, id, method, url, bytes, len, request, credentials);
+        d->h.http(d->h.ctx, d->xhr_wire[id], method, url, bytes, len, request, credentials);
     }
 }
 static jsval xhr_send(struct js *J, jsval self, jsval *args, int argc)
@@ -6241,6 +6332,9 @@ static jsval xhr_send(struct js *J, jsval self, jsval *args, int argc)
         return js_undefined;
     }
     d->xhr[id] = self.u.o;
+    /* A new id each time: a late answer to a request this slot had before reaches no one. */
+    d->xhr_gen = (d->xhr_gen + 1) % (JSWORKER_ID_BASE / MAX_XHR);
+    d->xhr_wire[id] = id + MAX_XHR * (int)d->xhr_gen;
     source->opened = 0;
     struct xhr_request *r = &d->requests[id];
     *r = *source;
@@ -6266,7 +6360,7 @@ static jsval http_pause(struct js *J,jsval self,jsval *args,int argc)
 {
     struct jsdom *d=dom(J);
     if(d->h.http_pause && ARG(0).t==JS_OBJ)
-        for(int k=0;k<MAX_XHR;k++)if(d->xhr[k]==ARG(0).u.o)d->h.http_pause(d->h.ctx,k,js_truthy(ARG(1)));
+        for(int k=0;k<MAX_XHR;k++)if(d->xhr[k]==ARG(0).u.o)d->h.http_pause(d->h.ctx,d->xhr_wire[k],js_truthy(ARG(1)));
     return js_undefined;
 }
 
@@ -6279,7 +6373,7 @@ static jsval xhr_abort(struct js *J, jsval self, jsval *args, int argc)
         if (self.t == JS_OBJ && d->xhr[i] == self.u.o)
         {
             d->xhr[i]=NULL;
-            if(d->h.http_cancel)d->h.http_cancel(d->h.ctx,i);
+            if(d->h.http_cancel)d->h.http_cancel(d->h.ctx,d->xhr_wire[i]);
             js_set(J,self,"status",js_num(0));
             xhr_state(d,self,4);
             fire_on(d,self,NULL,"abort",new_event(d,"abort",self));
@@ -6319,15 +6413,23 @@ static jsval xhr_all_headers(struct js *J, jsval self, jsval *args, int argc)
     return h.t == JS_STR ? h : js_str(J, "");
 }
 
+/* The slot of the request the browser knows as wire id, or -1 (it was cancelled or is over). */
+static int xhr_slot(struct jsdom *d,int wire)
+{
+    if(!d||wire<0||wire>=JSWORKER_ID_BASE)return -1;
+    int slot=wire%MAX_XHR;
+    return d->xhr[slot]&&d->xhr_wire[slot]==wire?slot:-1;
+}
 int jsdom_http_streaming(struct jsdom *d,int id)
 {
     if(d&&id>=JSWORKER_ID_BASE)return jsworkers_http_streaming(d->workers,id);
-    return d&&id>=0&&id<MAX_XHR&&d->xhr[id]&&d->requests[id].streaming;
+    int slot=xhr_slot(d,id);
+    return slot>=0&&d->requests[slot].streaming;
 }
 int jsdom_http_headers(struct jsdom *d,int id,int status,const char *headers,int hlen)
 {
     if(d&&id>=JSWORKER_ID_BASE)return jsworkers_http_headers(d->workers,id,status,headers,hlen);
-    if(!d||id<0||id>=MAX_XHR||!d->xhr[id])return -1;
+    if((id=xhr_slot(d,id))<0)return -1;
     struct js *J=d->J;jsval x=js_obj(d->xhr[id]);struct xhr_request *request=&d->requests[id];
     if(request->received)return request->streaming?2:1;
     if(request->preflight || (status>=300&&status<=308&&status!=304))return 0;
@@ -6367,7 +6469,7 @@ int jsdom_http_headers(struct jsdom *d,int id,int status,const char *headers,int
 void jsdom_http_chunk(struct jsdom *d,int id,const void *data,int len)
 {
     if(d&&id>=JSWORKER_ID_BASE){jsworkers_http_chunk(d->workers,id,data,len);return;}
-    if(!d||id<0||id>=MAX_XHR||!d->xhr[id]||len<=0)return;
+    if((id=xhr_slot(d,id))<0||len<=0)return;
     struct xhr_request *r=&d->requests[id];if(!r->received || (r->cross&&r->mode==2))return;
     struct js *J=d->J;jsval x=js_obj(d->xhr[id]);
     r->chunks++;r->loaded+=len;
@@ -6389,7 +6491,8 @@ void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, i
         jsworkers_http_done(d->workers, id, status, headers, hlen, body, blen);
         return;
     }
-    if (!d || id < 0 || id >= MAX_XHR || !d->xhr[id])
+    int wire = id;
+    if ((id = xhr_slot(d, wire)) < 0)
         return;
     struct js *J = d->J;
     jsval x = js_obj(d->xhr[id]);
@@ -6459,9 +6562,10 @@ void jsdom_http_done(struct jsdom *d, int id, int status, const char *headers, i
     int opaque = request->cross && request->mode == 2;
     if(!status&&!opaque){xhr_failure(d,id,x);js_run_jobs(J);return;}
     if(!request->received){
-        jsdom_http_headers(d,id,status,headers,hlen);
-        if(!d->xhr[id])return;
-        if(body&&blen)jsdom_http_chunk(d,id,body,blen);
+        jsdom_http_headers(d,wire,status,headers,hlen);
+        if(xhr_slot(d,wire)<0)return;           /* its handlers aborted it (or sent another) */
+        if(body&&blen)jsdom_http_chunk(d,wire,body,blen);
+        if(xhr_slot(d,wire)<0)return;
     }
     d->xhr[id]=NULL;
     d->depth++;

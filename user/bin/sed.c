@@ -678,13 +678,25 @@ static int substitute(struct cmd *c)
     size_t pos = 0;
     int count = 0, replaced = 0;
     int caseconv = 0, onechar = 0;      /* \L \U \E and \l \u */
+    size_t last_end = (size_t)-1;       /* where the last non-empty match ended */
     while (pos <= ps.len) {
         int eflags = pos ? REG_NOTBOL : 0;
         if (regexec(c->re, ps.s + pos, 10, m, eflags) != 0)
             break;
         size_t ms = pos + (size_t)m[0].rm_so, me = pos + (size_t)m[0].rm_eo;
+        if (ms == me && ms == last_end) {
+            /* an empty match right after a match is not one: s, a* by x, g turns baaac into xbxcx */
+            str_append(&o, ps.s + pos, ms - pos);
+            if (ms < ps.len)
+                str_putc(&o, ps.s[ms]);
+            pos = ms + 1;
+            continue;
+        }
+        if (me > ms)
+            last_end = me;
         count++;
-        int take = c->s_nth ? count == c->s_nth : 1;
+        /* N: the Nth match; with g, the Nth and every one after it */
+        int take = !c->s_nth || (c->s_global ? count >= c->s_nth : count == c->s_nth);
         str_append(&o, ps.s + pos, ms - pos);
         if (take) {
             replaced = 1;
@@ -1059,7 +1071,15 @@ int main(int argc, char **argv)
             }
             if (in_place) {
                 struct stat st;
-                fclose(out);
+                /* what was written must all be there before it replaces the file */
+                int werr = ferror(out);
+                if (fclose(out) != 0 || werr) {
+                    fprintf(stderr, "sed: couldn't write %s: %s\n", tmp_name, strerror(errno ? errno : EIO));
+                    unlink(tmp_name);
+                    out = stdout;
+                    status = 4;
+                    continue;
+                }
                 out = stdout;
                 if (stat(in_name, &st) == 0)
                     chmod(tmp_name, st.st_mode & 07777);

@@ -75,7 +75,8 @@ int arc_extract(struct archive *a, const uint8_t *want, const char *dest, int fl
 int arc_extract_fd(struct archive *a, int i, int fd, char *err, int errsize);
 
 /* A path that is safe to make under a folder: no leading /, no "..",
- * backslashes as /. Returns its length (0 if nothing is left). */
+ * backslashes as /. Returns its length (0 if nothing is left), or -1 if
+ * it does not fit in size (out then holds as much as did). */
 int arc_safe_path(const char *name, char *out, int size);
 /* Make every folder on the way to path (not path itself). */
 int arc_make_parents(const char *path);

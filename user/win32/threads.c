@@ -168,8 +168,9 @@ static HANDLE create_thread(uint32_t size,gp_t entry,gp_t param,uint32_t flags,g
     size=(size+0xFFFF)&~0xFFFFu;
     struct win_thread *t=calloc(1,sizeof(*t));if(!t) return 0;
     t->teb_address=vm_alloc(0,WIN_TEB_SIZE,PAGE_READWRITE,MEM_PRIVATE,0);
-    t->stack=vm_alloc(0,size,PAGE_READWRITE,MEM_PRIVATE|MEM_TOP_DOWN,0);
-    t->native_stack=vm_alloc(0,0x100000,PAGE_READWRITE,MEM_PRIVATE|MEM_TOP_DOWN,0);
+    /* each with an unmapped guard below it, so that neither runs into the other */
+    t->stack=vm_alloc_stack(size);
+    t->native_stack=vm_alloc_stack(0x100000);
     if(!t->teb_address || !t->stack || !t->native_stack) goto fail;
     t->block=GP(t->teb_address);t->block->self=t->teb_address;t->block->except_list=0xFFFFFFFF;
     t->block->process_id=teb->process_id;t->block->thread_id=t->id=next_id++;
@@ -214,6 +215,15 @@ void win_thread_exit(uint32_t code)
     extern void opengl_thread_exit(uint32_t tid),ole_thread_exit(uint32_t tid);
     opengl_thread_exit(t->id);ole_thread_exit(t->id);
     user32_thread_exit(t->id);t->done=1;live--;if(!live) process_exit(code);thread_notify();while(t->depth) thread_api_leave();pthread_exit(NULL);
+}
+/* A real handle for the calling thread (DuplicateHandle of GetCurrentThread()). */
+HANDLE win_thread_open_current(void)
+{
+    struct win_thread *t=ready ? pthread_getspecific(key):NULL;
+    if(!t) return 0;
+    HANDLE h=handle_new(H_THREAD);struct hobj *o=handle_get(h);
+    if(!o) return 0;
+    o->priv=t;o->pid=t->id;return h;
 }
 uint32_t win_thread_id(HANDLE h)
 {

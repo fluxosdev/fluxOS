@@ -38,6 +38,7 @@ uint32_t csum_pseudo(uint32_t src, uint32_t dst, uint8_t proto, uint32_t len)
 #define LOCAL  IP4(10, 0, 0, 1)
 #define REMOTE IP4(10, 0, 0, 2)
 int ip_is_local(uint32_t addr) { return addr == LOCAL; }
+uint32_t ip_source_for(uint32_t dst) { (void)dst; return LOCAL; }
 static struct { uint32_t seq, ack; uint8_t flags; uint16_t win; uint32_t len; int n; } out;
 int ip_send(uint32_t src, uint32_t dst, uint8_t proto, const void *hdr, uint32_t hlen,
             const void *data, uint32_t dlen)
@@ -172,7 +173,78 @@ static void test_tcp(void)
             peer(6001, 4001, s->snd_una, TCP_ACK, 0, 0);
     }
     CHECK(!alive(s));
+
+    /* A zero window kept shut by a peer that answers every probe: probes go
+     * on (RFC 1122 4.2.2.17), snd_nxt stays, answers are not duplicate ACKs,
+     * and the probed byte goes again with the rest once the window opens. */
+    s = sock_alloc(SOCK_STREAM, IPPROTO_TCP);
+    s->has_file = 1;
+    s->laddr = LOCAL, s->lport = 80, s->raddr = REMOTE, s->rport = 6002;
+    tcp_connect(s);
+    peer(6002, 5000, s->iss + 1, TCP_SYN | TCP_ACK, 0, 0);
+    CHECK(tcp_write(s, (const uint8_t *)"hello", 5) == 5);
+    uint32_t una = s->snd_una;
+    for (int i = 0; i < 40; i++) {
+        int sent = out.n;
+        run_timers(31 * HZ);
+        CHECK(out.n != sent && out.seq == una && out.len == 1);
+        sent = out.n;
+        peer(6002, 5001, una, TCP_ACK, 0, 0);
+        CHECK(out.n == sent);           /* no fast retransmit into the closed window */
+    }
+    CHECK(alive(s) && s->state == TCP_ESTABLISHED && s->snd_nxt == una);
+    peer(6002, 5001, una, TCP_ACK, 8192, 0);
+    CHECK(out.seq == una && out.len == 5);
+
+    /* New data for a closed socket is refused with a reset, not acknowledged. */
+    s = sock_alloc(SOCK_STREAM, IPPROTO_TCP);
+    s->has_file = 1;
+    s->laddr = LOCAL, s->lport = 80, s->raddr = REMOTE, s->rport = 6003;
+    tcp_connect(s);
+    peer(6003, 7000, s->iss + 1, TCP_SYN | TCP_ACK, 8192, 0);
+    s->has_file = 0;
+    tcp_close(s);
+    CHECK(s->state == TCP_FIN_WAIT_1 && out.flags == (TCP_FIN | TCP_ACK));
+    peer(6003, 7001, s->snd_max, TCP_ACK, 8192, 10);
+    CHECK(!alive(s) && (out.flags & TCP_RST));
+
+    /* shutdown(SHUT_WR) while connecting: the FIN follows the handshake. */
+    s = sock_alloc(SOCK_STREAM, IPPROTO_TCP);
+    s->has_file = 1;
+    s->laddr = LOCAL, s->lport = 80, s->raddr = REMOTE, s->rport = 6004;
+    tcp_connect(s);
+    tcp_shutdown(s);
+    CHECK(s->state == TCP_SYN_SENT);
+    peer(6004, 8000, s->iss + 1, TCP_SYN | TCP_ACK, 8192, 0);
+    CHECK(s->state == TCP_FIN_WAIT_1 && out.flags == (TCP_FIN | TCP_ACK) && out.seq == s->iss + 1);
+
+    /* Non-blocking accept and connect. */
+    struct socket *l2 = sock_alloc(SOCK_STREAM, IPPROTO_TCP);
+    l2->lport = 81;
+    l2->has_file = 1;
+    tcp_listen(l2, 4);
+    struct socket *got;
+    CHECK(sock_accept_locked(l2, &got, NULL, 1) == -EAGAIN);
+    struct sockaddr_in sin = { .sin_family = AF_INET, .sin_port = htons(6005),
+                               .sin_addr.s_addr = htonl(REMOTE) };
+    s = sock_alloc(SOCK_STREAM, IPPROTO_TCP);
+    s->has_file = 1;
+    s->lport = 80;
+    CHECK(sock_connect_locked(s, &sin, 1) == -EINPROGRESS && s->state == TCP_SYN_SENT);
+    CHECK(sock_connect_locked(s, &sin, 1) == -EALREADY);
+    peer(6005, 9000, s->iss + 1, TCP_SYN | TCP_ACK, 8192, 0);
+    CHECK(sock_connect_locked(s, &sin, 1) == 0 && s->state == TCP_ESTABLISHED);
+    CHECK(sock_connect_locked(s, &sin, 1) == -EISCONN);
+    sin.sin_port = htons(6006);
+    s = sock_alloc(SOCK_STREAM, IPPROTO_TCP);
+    s->has_file = 1;
+    s->lport = 80;
+    CHECK(sock_connect_locked(s, &sin, 1) == -EINPROGRESS);
+    peer(6006, 0, s->iss + 1, TCP_RST | TCP_ACK, 0, 0);
+    CHECK(sock_connect_locked(s, &sin, 1) == -ECONNREFUSED && !s->connected && !s->raddr);
     puts("kernel sockets: TCP bad ACKs, RFC 5961 resets, window, early close and orphans passed");
+    puts("kernel sockets: zero-window probes, data after close, shutdown while connecting, "
+         "non-blocking accept and connect passed");
 }
 
 int main(void)

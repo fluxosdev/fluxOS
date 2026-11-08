@@ -22,6 +22,7 @@ static int fb_owner;                    /* pid with the screen mapped, or 0 */
 static uint32_t owner_mapped;           /* how much of USER_MMIO_BASE it has mapped */
 static int panicked;                    /* the panic screen is up: nobody else draws */
 static int switching;                   /* a driver is changing fb: the console keeps off it */
+static int remap_pending;               /* fb changed: the owner's mapping is to follow (remap_owner) */
 
 /* Everything SYS_display, SYS_fbmap and the display drivers do; they may
  * sleep waiting for the GPU. The console has its own lock (kprintf.c). */
@@ -160,14 +161,37 @@ static void release_screen(void)
 /*
  * The driver switched modes and updated fb. The process that has the
  * screen gets the new one mapped in place of the old (it must read
- * fbinfo again), and the console lays itself out for the new size.
+ * fbinfo again) once the display lock is let go (remap_owner), and the
+ * console lays itself out for the new size.
  */
 void fb_mode_changed(void)
 {
-    struct proc *p = fb_owner ? proc_find(fb_owner) : NULL;
-    if (p && p->state != P_ZOMBIE)
-        map_screen(p->pd, &owner_mapped);
+    remap_pending = 1;
     vga_reset_fb();
+}
+
+/*
+ * After a mode change: the screen's owner gets the new mode mapped. Its
+ * page tables change only under its mm_lock, as in a page fault, a fork
+ * or munmap, and that lock comes before the display's (sys_display's
+ * DISP_MAPBUF, fb_pinned), so it is taken here with the display lock let go.
+ */
+static void remap_owner(void)
+{
+    mutex_lock(&display_mutex);
+    int pid = remap_pending ? fb_owner : 0;
+    remap_pending = 0;
+    mutex_unlock(&display_mutex);
+    struct proc *p = pid ? proc_find(pid) : NULL;
+    if (!p || p->state == P_ZOMBIE)
+        return;
+    struct mutex *mm = &p->leader->mm_lock;
+    mutex_lock(mm);
+    mutex_lock(&display_mutex);
+    if (fb_owner == pid && p->state != P_ZOMBIE)
+        map_screen(p->pd, &owner_mapped);
+    mutex_unlock(&display_mutex);
+    mutex_unlock(mm);
 }
 
 uint32_t fb_pack(uint32_t rgb)
@@ -296,9 +320,12 @@ static int map_user(void);
 /* Map the framebuffer into the calling process and take the screen. */
 int fb_map_user(void)
 {
+    struct mutex *mm = &current->leader->mm_lock;   /* its page tables change: before the display's */
+    mutex_lock(mm);
     mutex_lock(&display_mutex);
     int r = map_user();
     mutex_unlock(&display_mutex);
+    mutex_unlock(mm);
     return r;
 }
 
@@ -411,6 +438,8 @@ int fb_display(int op, void *arg)
     mutex_lock(&display_mutex);
     int r = display_op(op, arg);
     mutex_unlock(&display_mutex);
+    if (op == DISP_SETMODE)             /* (DISP_MAPBUF's caller holds its mm_lock already) */
+        remap_owner();
     return r;
 }
 

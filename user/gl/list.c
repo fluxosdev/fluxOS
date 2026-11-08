@@ -17,6 +17,7 @@
 #include "glint.h"
 
 #define MAX_CALL_DEPTH 64               /* lists calling lists */
+#define MAX_LIST_FLOATS (1 << 28)       /* a list's size, so its count and bytes fit */
 
 #define GET_CTX(c)                      \
     struct fgl_context *c = gl_ctx;     \
@@ -34,6 +35,10 @@ static void list_free(struct dlist *l)
 int gl_record(struct fgl_context *c, int op, int nargs, const float *args)
 {
     struct dlist *l = c->compiling;
+    if (nargs < 0 || nargs > MAX_LIST_FLOATS - 2 - l->n) {
+        gl_error(c, GL_OUT_OF_MEMORY);  /* the counts below must not wrap */
+        return c->list_mode == GL_COMPILE;
+    }
     if (l->n + 2 + nargs > l->cap) {
         int cap = l->cap ? l->cap * 2 : 256;
         while (cap < l->n + 2 + nargs)
@@ -171,10 +176,14 @@ GLboolean glIsList(GLuint list)
 
 static void call_list(struct fgl_context *c, GLuint list);
 
-/* OP_BITMAP: width, height, origin and move, then the bits sixteen to a float. */
-static void replay_bitmap(struct fgl_context *c, const float *a)
+/* OP_BITMAP: width, height, origin and move, then the bits sixteen to a float
+ * (n arguments in all). */
+static void replay_bitmap(struct fgl_context *c, const float *a, int n)
 {
     int w = (int)a[0], h = (int)a[1];
+    if (w < 0 || h < 0 || !gl_size_ok((size_t)w, (size_t)h, 1) ||
+        (size_t)w * (size_t)h > (size_t)(n - 6) * 16)
+        return;                         /* not as recorded (sizes past 2^24 do not survive a float) */
     size_t bits = (size_t)w * (size_t)h;
     uint8_t *on = bits ? malloc(bits) : NULL;
     if (bits && !on) {
@@ -262,7 +271,7 @@ static void replay(struct fgl_context *c, const struct dlist *l)
         }
         case OP_TEX_GEN: glTexGenfv((GLenum)a[0], (GLenum)a[1], a + 2); break;
         case OP_RASTER_POS: glRasterPos4f(a[0], a[1], a[2], a[3]); break;
-        case OP_BITMAP: replay_bitmap(c, a); break;
+        case OP_BITMAP: replay_bitmap(c, a, n); break;
         case OP_PIXEL_ZOOM: glPixelZoom(a[0], a[1]); break;
         case OP_ACTIVE_TEXTURE: glActiveTextureARB((GLenum)a[0]); break;
         case OP_MULTI_TEXCOORD: glMultiTexCoord4fARB((GLenum)a[0], a[1], a[2], a[3], a[4]); break;
@@ -329,7 +338,7 @@ void glCallLists(GLsizei n, GLenum type, const GLvoid *lists)
     }
     if (c->compiling && !c->executing) {
         /* The names go in as floats, which hold them exactly up to 2^24. */
-        float *names = malloc(((size_t)n + 1) * sizeof(float));
+        float *names = n < MAX_LIST_FLOATS ? calloc((size_t)n + 1, sizeof(float)) : NULL;
         if (!names) {
             gl_error(c, GL_OUT_OF_MEMORY);
             return;

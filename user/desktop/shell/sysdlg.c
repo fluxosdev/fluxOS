@@ -131,7 +131,7 @@ void about_tick(void)
 static void run_command(struct dialog *d, int id)
 {
     if (id == ID_OK) {
-        char cmd[128];
+        char cmd[sizeof(d->edit)];      /* all of it: a command cut short is another command */
         snprintf(cmd, sizeof(cmd), "%s", d->edit);
         if (!cmd[0])
             return;

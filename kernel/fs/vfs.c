@@ -153,14 +153,35 @@ void vfs_unref(struct vnode *vn)
         vfs_unlock();
 }
 
-static struct vnode *find_child(struct vnode *dir, const char *name)
+/* name in dir, or NULL with *err saying why: -ENOENT, or the error reading
+ * the directory (which is not taken for "no such name"). */
+static struct vnode *lookup_child(struct vnode *dir, const char *name, int *err)
 {
-    if (ensure_loaded(dir) < 0)
+    int r = ensure_loaded(dir);
+    if (r < 0) {
+        *err = r;
         return NULL;
+    }
     for (struct vnode *c = dir->children; c; c = c->next)
         if (!name_cmp(dir, c->name, name))
             return c;
+    *err = -ENOENT;
     return NULL;
+}
+
+static struct vnode *find_child(struct vnode *dir, const char *name)
+{
+    int err;
+    return lookup_child(dir, name, &err);
+}
+
+/* 0 if name is free in dir, else -EEXIST or the error reading dir. */
+static int name_free(struct vnode *dir, const char *name)
+{
+    int err;
+    if (lookup_child(dir, name, &err))
+        return -EEXIST;
+    return err == -ENOENT ? 0 : err;
 }
 
 static void attach(struct vnode *dir, struct vnode *vn)
@@ -253,11 +274,9 @@ int vfs_lookup(const char *path, struct vnode *cwd, int follow, struct vnode **o
             continue;
         }
         struct vnode *dir = v;
-        v = cross(find_child(v, comp));
-        if (!v) {
-            r = -ENOENT;
+        v = cross(lookup_child(v, comp, &r));
+        if (!v)
             break;
-        }
         if (v->type != VN_LNK)
             continue;
         const char *rest = p;
@@ -360,13 +379,14 @@ int vfs_create(struct vnode *dir, const char *name, int type, struct vnode **out
         return -ENOTDIR;
     if (!dir->linked)
         return -ENOENT;
-    if (find_child(dir, name))
-        return -EEXIST;
+    int r = name_free(dir, name);
+    if (r < 0)
+        return r;
     if (dir->fs) {
         if (dir->fs->readonly || !dir->fs->ops->create)
             return -EROFS;
         struct vnode *vn = NULL;
-        int r = dir->fs->ops->create(dir, name, type, &vn);
+        r = dir->fs->ops->create(dir, name, type, &vn);
         if (r == 0 && out)
             *out = vn;
         return r;
@@ -378,6 +398,42 @@ int vfs_create(struct vnode *dir, const char *name, int type, struct vnode **out
     if (out)
         *out = vn;
     return 0;
+}
+
+/*
+ * open(O_CREAT) of a path that does not resolve: the regular file it names
+ * is made. A dangling symbolic link there is followed and the file is made
+ * where it points, as on Linux; with O_EXCL (excl) the link is -EEXIST.
+ */
+int vfs_create_file(const char *path, struct vnode *cwd, int excl, struct vnode **out)
+{
+    char *buf = kmalloc(2 * PATH_MAX), *target;
+    if (!buf)
+        return -ENOMEM;
+    target = buf + PATH_MAX;
+    char name[NAME_MAX + 1];
+    int r = strlcpy(buf, path, PATH_MAX) >= PATH_MAX ? -ENAMETOOLONG : 0;
+    for (int links = 0; r == 0; links++) {
+        struct vnode *dir, *vn;
+        if ((r = vfs_resolve_parent(buf, cwd, &dir, name)) < 0)
+            break;
+        vn = find_child(dir, name);
+        if (!vn || vn->type != VN_LNK || excl) {
+            r = vfs_create(dir, name, VN_FILE, out);    /* -EEXIST if vn is there */
+            break;
+        }
+        if (links >= VFS_MAX_SYMLINKS) {
+            r = -ELOOP;
+            break;
+        }
+        if ((r = read_link(vn, target, PATH_MAX)) < 0)
+            break;
+        r = 0;
+        strcpy(buf, target);
+        cwd = dir;                      /* a relative target starts at the link's directory */
+    }
+    kfree(buf);
+    return r;
 }
 
 int vfs_mkdir(const char *path, struct vnode *cwd)
@@ -499,7 +555,9 @@ int vfs_rename(const char *from, const char *to, struct vnode *cwd)
         if (a == src)
             return -EINVAL;
 
-    struct vnode *dst = find_child(dir, name);
+    struct vnode *dst = lookup_child(dir, name, &r);
+    if (!dst && r != -ENOENT)
+        return r;
     if (dst == src) {
         if (!strcmp(src->name, name))
             return 0;
@@ -571,8 +629,8 @@ int vfs_symlink(const char *target, const char *path, struct vnode *cwd)
         return r;
     if (!dir->linked)
         return -ENOENT;
-    if (find_child(dir, name))
-        return -EEXIST;
+    if ((r = name_free(dir, name)) < 0)
+        return r;
     if (dir->fs) {
         if (dir->fs->readonly)
             return -EROFS;
@@ -606,8 +664,8 @@ int vfs_link(const char *from, const char *to, struct vnode *cwd)
         return r;
     if (!dir->linked)
         return -ENOENT;
-    if (find_child(dir, name))
-        return -EEXIST;
+    if ((r = name_free(dir, name)) < 0)
+        return r;
     if (src->fs != dir->fs)
         return -EXDEV;
     if (!src->fs || !src->fs->ops->link)
@@ -744,7 +802,7 @@ void vfs_stat(struct vnode *vn, struct stat *st)
     uint32_t fmt = vn->type == VN_DIR ? S_IFDIR : vn->type == VN_CHR ? S_IFCHR :
                    vn->type == VN_BLK ? S_IFBLK : vn->type == VN_LNK ? S_IFLNK : S_IFREG;
     memset(st, 0, sizeof(*st));
-    st->st_dev = vn->fs ? (uint32_t)(uintptr_t)vn->fs : 1;     /* ramfs and devices: 1 */
+    st->st_dev = vn->fs ? vn->fs->dev : 1;     /* ramfs and devices: 1 */
     st->st_ino = vn->ino;
     st->st_mode = fmt | (vn->mode & 07777);
     st->st_size = vn->size;
@@ -763,8 +821,14 @@ static uint8_t dtype(struct vnode *vn)
            vn->type == VN_BLK ? DT_BLK : vn->type == VN_LNK ? DT_LNK : DT_REG;
 }
 
-/* Entry `index` of a directory: 0 is ".", 1 is "..", then children. */
-int vfs_dirent(struct vnode *dir, uint32_t index, struct dirent *de)
+/*
+ * Entry `index` of a directory: 0 is ".", 1 is "..", then children. From 2
+ * on, after (if not NULL) is the name the previous entry had, and the entry
+ * is the first child named after it: children are kept sorted by name, so
+ * names removed or added meanwhile do not shift the rest (readdir while
+ * unlinking skips nothing). 1: de filled, 0: no more, < 0: an error.
+ */
+int vfs_dirent(struct vnode *dir, uint32_t index, const char *after, struct dirent *de)
 {
     struct vnode *vn;
     const char *name;
@@ -775,11 +839,16 @@ int vfs_dirent(struct vnode *dir, uint32_t index, struct dirent *de)
         vn = dir->parent ? dir->parent : vfs_root;
         name = "..";
     } else {
-        if (ensure_loaded(dir) < 0)
-            return 0;
+        int r = ensure_loaded(dir);
+        if (r < 0)
+            return r;
         vn = dir->children;
-        for (uint32_t i = 2; vn && i < index; i++)
-            vn = vn->next;
+        if (after)
+            while (vn && strcmp(vn->name, after) <= 0)
+                vn = vn->next;
+        else
+            for (uint32_t i = 2; vn && i < index; i++)
+                vn = vn->next;
         if (!vn)
             return 0;
         name = vn->name;
@@ -877,6 +946,8 @@ static int fs_probe(struct blockdev *bd, const char *type, struct fs **out)
         blk_invalidate(bd);             /* no unmount will forget what the probes read */
         return r;
     }
+    static uint32_t next_dev = 2;
+    fs->dev = next_dev++;
     *out = fs;
     return 0;
 }
@@ -885,6 +956,10 @@ static int fs_probe(struct blockdev *bd, const char *type, struct fs **out)
 static void fs_discard(struct fs *fs)
 {
     subtree_free(fs->root);
+    /* Mounting marked the volume in use (ext2's state): clean again, as an
+     * unmount leaves it; the write-back cache keeps what this stages. */
+    if (!fs->readonly && fs->ops->sync)
+        fs->ops->sync(fs);
     if (fs->ops->unmount)
         fs->ops->unmount(fs);
     blk_invalidate(fs->bd);
@@ -944,25 +1019,40 @@ int vfs_mount(const char *source, const char *target, const char *type, struct v
     return r;
 }
 
-static int subtree_busy(struct vnode *vn)
+/* Both walks go by the parent pointers, not recursion: directories nest as
+ * deep as anyone likes, and the kernel stack is small. */
+static int subtree_busy(struct vnode *top)
 {
-    if (vn->refs > 0 || vn->mounted)
-        return 1;
-    for (struct vnode *c = vn->children; c; c = c->next)
-        if (subtree_busy(c))
+    struct vnode *vn = top;
+    for (;;) {
+        if (vn->refs > 0 || vn->mounted)
             return 1;
-    return 0;
+        if (vn->children) {
+            vn = vn->children;
+            continue;
+        }
+        while (vn != top && !vn->next)
+            vn = vn->parent;
+        if (vn == top)
+            return 0;
+        vn = vn->next;
+    }
 }
 
-static void subtree_free(struct vnode *vn)
+static void subtree_free(struct vnode *top)
 {
-    struct vnode *c = vn->children;
-    while (c) {
-        struct vnode *next = c->next;
-        subtree_free(c);
-        c = next;
+    struct vnode *vn = top;
+    for (;;) {
+        while (vn->children)
+            vn = vn->children;
+        if (vn == top)
+            break;
+        struct vnode *parent = vn->parent;  /* vn is its first child: freed, the next takes its place */
+        parent->children = vn->next;
+        vnode_free(vn);
+        vn = parent;
     }
-    vnode_free(vn);
+    vnode_free(top);
 }
 
 /* media_gone: the medium was taken out, so what was not written is lost. */

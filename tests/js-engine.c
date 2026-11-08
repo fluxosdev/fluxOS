@@ -186,6 +186,71 @@ int main(void)
     drain_requests();
     run("assert(importFinished===true);");
 
+    /* Deep but ordinary code compiles (or throws a catchable error) without
+     * stopping the page; regex loops whose turns can be empty terminate. */
+    run("assert(Function('return 1'+'+1'.repeat(600))()===601);"
+        "var chain='var x=0;if(x==0)x=1;';for(var ci=1;ci<600;ci++)chain+='else if(x=='+ci+')x='+ci+';';"
+        "eval(chain);"
+        "assert(/(a*)*b/.exec('aab')[1]==='aa');assert(/(?:a?)*$/.test('x'));"
+        "assert(/(a|b?)*c/.exec('abc')[1]==='b');assert(/\\c1/.test('\\\\c1'));assert(/\\cJ/.test('\\n'));"
+        "var re=/a/g;re.lastIndex=1e10;assert(re.test('aaa')===false);");
+    run("var g='';for(var gi=0;gi<40;gi++)g+='(.)';"
+        "var gm=new RegExp(g+'\\\\40').exec('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNN');"
+        "assert(gm&&gm.length===41&&gm[40]==='N');"
+        "var threw=0;try{new RegExp('(.)'.repeat(100));}catch(e){threw=1;}assert(threw);"
+        "threw=0;try{new RegExp('a{2147483648}');}catch(e){threw=1;}assert(threw);");
+    /* Indices: 2^32 - 1 and up are names; elements past the dense limit are
+     * properties, and length follows them. */
+    run("var ia=[5];assert(ia['4294967296']===undefined&&ia['4294967295']===undefined);"
+        "var sa=[1,2];sa[123456789]=7;assert(sa.length===123456790&&sa[123456789]===7&&(123456789 in sa));"
+        "sa.length=5;assert(sa.length===5&&sa[123456789]===undefined);"
+        "var mx=[];mx[4294967294]=1;assert(mx.length===4294967295);"
+        "var [d0]=[1];assert(d0===1);"
+        "var big=[];for(var bi=0;bi<100;bi++)big.push(bi);"
+        "assert(Math.max.bind(null).apply(null,big)===99);"
+        "function BF(){this.n=arguments.length;}assert(new (BF.bind(null,1))(...big).n===101);");
+    /* for-of reaches the elements past the dense limit (a long loop: more steps). */
+    engine->step_limit = 400000000u;
+    run("var it=[1];it[16777217]=9;var seen=0,last;for(var v of it){seen++;last=v;}"
+        "assert(seen===16777218&&last===9);");
+    engine->step_limit = JS_STEP_LIMIT;
+    /* Parentheses end an optional chain; for-in over many keys stays linear. */
+    run("var nul=null,te=0;try{(nul?.b).c;}catch(e){te=e instanceof TypeError;}assert(te);"
+        "te=0;try{(nul?.b)();}catch(e){te=e instanceof TypeError;}assert(te);"
+        "var ob={v:3,f(){return this.v;}};assert((ob?.f)()===3&&nul?.b.c===undefined);"
+        "var many={};for(var mi=0;mi<50000;mi++)many['k'+mi]=mi;var mc=0;for(var mk in many)mc++;"
+        "assert(mc===50000);");
+
+    /* The standard library (jslib.c): fromIndex, splice under a shrinking valueOf, unreachable
+     * Map/Set storage, deleting while iterating, JSON replacers, revivers and real cycle detection,
+     * number formatting, dates, URI decoding and forgiving base64. */
+    run("function eq(a,b){if(JSON.stringify(a)!==JSON.stringify(b))throw new Error(JSON.stringify(a)+' !== '+JSON.stringify(b));}"
+        "function throws(f,name){try{f();}catch(e){return e.name===name;}return false;}"
+        "eq([[1,2,3,2,1].lastIndexOf(1,2),[1,2,3,4].lastIndexOf(4,2),[1,2,3].lastIndexOf(3,-1),[1,2,3].includes(1,2),[1,2,3].includes(3,-1)],[0,-1,2,false,true]);"
+        "var sp=[1,2,3,4,5,6,7,8,9,10];sp.splice(5,{valueOf(){sp.length=0;return 3;}});sp.push(9);eq(sp,[9]);"
+        "var sq=[1,2,3,4,5];sq.splice({valueOf(){sq.length=3;return 8;}},1,'x');eq(sq,[1,2,3,'x']);"
+        "var mp=new Map([[1,2]]);assert(Object.getOwnPropertyNames(mp).length===0&&Object.getOwnPropertySymbols(mp).length===0);"
+        "mp.__values=5;assert(mp.get(1)===2);assert(throws(()=>Map.prototype.get.call({__items:[1],__values:1.5},1),'TypeError'));"
+        "assert(throws(()=>Set.prototype.add.call(mp,1),'TypeError'));"
+        "var dm=new Map([[1,1],[2,2],[3,3],[4,4]]),seen=[];dm.forEach((v,k)=>{seen.push(k);dm.delete(k);});eq(seen,[1,2,3,4]);"
+        "var ds=new Set([1,2,3]);seen=[];for(var x of ds){seen.push(x);ds.delete(x);if(x<3)ds.add(x+10);}eq(seen,[1,2,3,11,12]);"
+        "eq([JSON.stringify({a:1,b:2,c:3},['c','a']),JSON.stringify({a:1,b:2},(k,v)=>k==='b'?undefined:v)],['{\"c\":3,\"a\":1}','{\"a\":1}']);"
+        "eq(JSON.parse('{\"a\":1,\"b\":[1,2]}',(k,v)=>typeof v==='number'?v+100:v),{a:101,b:[101,102]});"
+        "var deep={},dc=deep;for(var di=0;di<200;di++){dc.n={};dc=dc.n;}assert(JSON.stringify(deep).length>1000);"
+        "var cy={a:{}};cy.a.b=cy;assert(throws(()=>JSON.stringify(cy),'TypeError'));var sh={};eq(JSON.stringify([sh,sh]),'[{},{}]');"
+        "eq(JSON.stringify({d:new Date(NaN)}),'{\"d\":null}');"
+        "eq([(9.99).toPrecision(2),(123456).toPrecision(2),(1.234e-7).toPrecision(2),(5).toPrecision(30).length,(1234.5678).toExponential(2),(0).toExponential(),(2.5).toFixed(0),(1.005).toFixed(2),(-0.0001).toFixed(2)],"
+        "['10','1.2e+5','1.2e-7',31,'1.23e+3','0e+0','3','1.00','-0.00']);"
+        "assert(throws(()=>(1).toPrecision(101),'RangeError')&&throws(()=>(1).toFixed(101),'RangeError')&&throws(()=>(1).toExponential(-1),'RangeError'));"
+        "assert(String.fromCodePoint(0x1F600)==='\\ud83d\\ude00'&&throws(()=>String.fromCodePoint(0x110000),'RangeError'));"
+        "assert(isNaN(new Date(8.7e15).getTime())&&throws(()=>new Date(8.7e15).toISOString(),'RangeError'));"
+        "eq([new Date(8.64e15).toISOString(),new Date(Date.UTC(-1,0,1)).toISOString(),new Date(99,0).getFullYear()],['+275760-09-13T00:00:00.000Z','-000001-01-01T00:00:00.000Z',1999]);"
+        "var re=/a/g;re.lastIndex=4294967296;assert(re.exec('aaa')===null&&re.lastIndex===0);"
+        "assert(throws(()=>decodeURIComponent('%FF'),'URIError')&&throws(()=>decodeURIComponent('%ED%A0%80'),'URIError')&&decodeURIComponent('%E2%82%AC')==='\\u20ac');"
+        "eq([decodeURI('%2F%20'),escape('\\u00e9\\u20ac'),unescape('%u20AC%E9')],['%2F ','%E9%u20AC','\\u20ac\\u00e9']);"
+        "eq([atob(' aGVs\\nbG8 '),atob('YQ'),btoa('\\u00ff')],['hello','a','/w==']);"
+        "assert(throws(()=>btoa('\\u0100'),'InvalidCharacterError')&&throws(()=>atob('Y'),'InvalidCharacterError')&&throws(()=>atob('YQ=a'),'InvalidCharacterError')&&throws(()=>atob('aGV*'),'InvalidCharacterError'));");
+
     /* Repeated allocation must really be reclaimed, including unreachable
      * bytecode and ASTs; keep a global closure throughout. */
     size_t before = gc_heap_bytes(engine);

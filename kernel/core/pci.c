@@ -319,6 +319,11 @@ void *pci_map_bar(const struct pci_dev *p, int bar)
     return vmm_map_mmio(base, size, PTE_PCD | PTE_PWT);
 }
 
+void pci_unmap_bar(void *regs)
+{
+    vmm_unmap_mmio(regs);
+}
+
 /* ---- suspend to RAM ---- */
 
 /*

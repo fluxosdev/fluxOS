@@ -28,6 +28,10 @@ static void test_json(void)
     CHECK(json_parse("{\"a\":}", 6) == NULL);
     CHECK(json_parse("[1,2", 4) == NULL);
     CHECK(json_parse("{} x", 4) == NULL);
+    const char *big = "{\"n\":12345678901234567890123456789012345678901234567890123456789012345678901234567890}";
+    j = json_parse(big, strlen(big));      /* longer than any buffer for a number: still read whole */
+    CHECK(j && json_num(j, "n", 0) > 1.2e79 && json_num(j, "n", 0) < 1.3e79);
+    json_free(j);
 }
 
 static void test_ids(void)
@@ -67,10 +71,14 @@ static void test_pick(void)
              "{\"itag\":399,\"mimeType\":\"video/mp4; codecs=\\\"av01.0.08M.08\\\"\",\"height\":1080,\"url\":\"https://x/399\"},"
              "{\"itag\":140,\"mimeType\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\",\"bitrate\":130000,\"url\":\"https://x/140\"},"
              "{\"itag\":251,\"mimeType\":\"audio/webm; codecs=\\\"opus\\\"\",\"bitrate\":160000,\"url\":\"https://x/251\"},"
-             "{\"itag\":250,\"mimeType\":\"audio/webm; codecs=\\\"opus\\\"\",\"signatureCipher\":\"s=1\"}]}}";
+             "{\"itag\":250,\"mimeType\":\"audio/webm; codecs=\\\"opus\\\"\",\"signatureCipher\":\"s=1\"},"
+             "{\"itag\":22,\"mimeType\":\"video/mp4; codecs=\\\"avc1.64001F, mp4a.40.2\\\"\",\"height\":720,\"url\":\"file:///etc/passwd\"},"
+             "{\"itag\":23,\"mimeType\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\",\"url\":\"/etc/passwd\"}]}}";
     struct yt_video v;
     CHECK(yt_resolve("dQw4w9WgXcQ", canned_http, NULL, &v) == 0);
-    CHECK(!strcmp(v.title, "T") && v.seconds == 19 && v.nf == 7);
+    CHECK(!strcmp(v.title, "T") && v.seconds == 19 && v.nf == 7);     /* not the file names */
+    for (int i = 0; i < v.nf; i++)
+        CHECK(!strncmp(v.f[i].url, "https://", 8));
     const struct yt_format *m = yt_pick_muxed(&v, 720), *fv, *fa;
     CHECK(m && m->itag == 18 && m->video && m->audio);
     CHECK(yt_pick_split(&v, 720, &fv, &fa) == 0);

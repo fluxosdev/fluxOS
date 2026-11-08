@@ -47,7 +47,7 @@ with tempfile.TemporaryDirectory(prefix='flux-suspend-') as directory:
                    check=True, stdout=subprocess.DEVNULL)
     log = temp / 'serial.log'
     command = [args.qemu, '-cpu', 'core2duo,-lm', '-smp', str(args.cpus),
-               '-cdrom', str(temp / 'boot.iso'), '-m', '256', '-display', 'none',
+               '-cdrom', str(temp / 'boot.iso'), '-m', '512', '-display', 'none',
                '-serial', 'stdio', '-qmp', f'unix:{temp}/qmp,server=on,wait=off',
                '-no-reboot', '-nic', 'none']
     cycles = 0

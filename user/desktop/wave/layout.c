@@ -119,7 +119,12 @@ struct lctx {
     struct node *root;
     struct abox { struct node *n; int x, y, w, h; uint8_t known, fixed; } *ab;
     int nab, abcap, anchor_pass;
+    int nest;                   /* boxes being laid out or measured inside one another (see LAYOUT_MAX_NEST) */
 };
+
+/* Layout recurses once per level of nested boxes, and a script can nest elements without end (the
+ * parser stops at 256): what is deeper than this is left out rather than running the stack out. */
+#define LAYOUT_MAX_NEST 512
 
 static unsigned layout_gen;
 static int len_px(struct len l, int base);
@@ -1567,9 +1572,9 @@ static void layout_replaced(struct lctx *c, struct node *n, int avail, int *ow, 
         if (w < 0 && h < 0)
             w = iw, h = ih;
         else if (w < 0)
-            w = h * iw / ih;
+            w = ih ? h * iw / ih : 0;   /* page zoom can round a 1px size down to 0 */
         else if (h < 0)
-            h = w * ih / iw;
+            h = iw ? w * ih / iw : 0;
         if (st->max_width.unit == U_PX || (relative(st->max_width.unit) && !c->measuring)) {
             int mx = len_px(st->max_width, avail);
             if (w > mx && mx > 0) {
@@ -2598,7 +2603,11 @@ static void flow_node(struct lctx *c, struct flow *f, struct node *n)
     if (n->tag == T_A && node_attr(n, "href"))
         f->link = n;
     add_pseudo(c, f, n, 0);
-    flow_children(c, f, n);
+    if (c->nest < LAYOUT_MAX_NEST) {            /* inline elements nest by recursion too */
+        c->nest++;
+        flow_children(c, f, n);
+        c->nest--;
+    }
     add_pseudo(c, f, n, 1);
     f->link = saved;
     it = push_item(f, I_CLOSE, st);
@@ -3456,28 +3465,34 @@ int layout_cv_stale(const struct layout *lo, int sx, int sy)
     return 0;
 }
 
-static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw, int force_bw,
-                            int *mb, int *bg_slot)
+/* width: fit-content: as wide as its contents want, within what there is. Apart from layout_block_box,
+ * whose frame every level of nesting pays for, as the style copy here is large. */
+static __attribute__((noinline)) void fit_content_box(struct lctx *c, struct node *n, int cw, struct boxm *b)
+{
+    const struct style *st = n->style;
+    resolve_box(st, cw, -1, b);
+    int mn, mx, room = cw - (st->margin[3].unit == U_AUTO ? 0 : b->ml) - (st->margin[1].unit == U_AUTO ? 0 : b->mr);
+    measure(c, n, &mn, &mx);
+    mn -= b->ml + b->mr, mx -= b->ml + b->mr;
+    int fit = mx < room ? mx : room;
+    if (fit < mn)
+        fit = mn;
+    struct style sized = *st;                   /* sized like a box of that width, auto margins centring it */
+    sized.width = (struct len){ fit - (st->box_sizing_border ? 0 : hz(b)), 0, U_PX };
+    resolve_box(&sized, cw, -1, b);
+}
+
+static int layout_block_box_at(struct lctx *c, struct node *n, int x, int y, int cw, int force_bw,
+                               int *mb, int *bg_slot)
 {
     const struct style *st = n->style;
     int force_bh = c->force_bh1 - 1;
     c->force_bh1 = 0;
     struct boxm b;
-    if (force_bw < 0 && st->fit_w && st->width.unit == U_AUTO && !c->measuring) {
-        /* width: fit-content: as wide as its contents want, within what there is */
-        resolve_box(st, cw, -1, &b);
-        int mn, mx, room = cw - (st->margin[3].unit == U_AUTO ? 0 : b.ml) - (st->margin[1].unit == U_AUTO ? 0 : b.mr);
-        measure(c, n, &mn, &mx);
-        mn -= b.ml + b.mr, mx -= b.ml + b.mr;
-        int fit = mx < room ? mx : room;
-        if (fit < mn)
-            fit = mn;
-        struct style sized = *st;               /* sized like a box of that width, auto margins centring it */
-        sized.width = (struct len){ fit - (st->box_sizing_border ? 0 : hz(&b)), 0, U_PX };
-        resolve_box(&sized, cw, -1, &b);
-    } else {
+    if (force_bw < 0 && st->fit_w && st->width.unit == U_AUTO && !c->measuring)
+        fit_content_box(c, n, cw, &b);
+    else
         resolve_box(st, cw, force_bw, &b);
-    }
     int bw = b.bl + b.pl + b.w + b.pr + b.br;
     if (force_bw < 0 && st->width.unit != U_AUTO && n->parent && n->parent->style &&
         n->parent->style->center_blocks)
@@ -3670,6 +3685,22 @@ static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw
     return bh;
 }
 
+static int layout_block_box(struct lctx *c, struct node *n, int x, int y, int cw, int force_bw,
+                            int *mb, int *bg_slot)
+{
+    if (c->nest >= LAYOUT_MAX_NEST) {           /* too deep: an empty box */
+        c->force_bh1 = 0;
+        *mb = 0;
+        if (bg_slot)
+            *bg_slot = -1;
+        return 0;
+    }
+    c->nest++;
+    int h = layout_block_box_at(c, n, x, y, cw, force_bw, mb, bg_slot);
+    c->nest--;
+    return h;
+}
+
 /* ---- flex and grid containers ---- */
 
 /* a * b / c without overflowing 32 bits on the way (c > 0). */
@@ -3701,6 +3732,7 @@ struct fitem {
     const struct style *st;     /* the element's style; the container's for text */
     uint8_t kind, which;        /* FI_*; FI_PSEUDO: 0 ::before, 1 ::after */
     int order;
+    int pos;                    /* its place in document order, to keep among equal orders */
     int ml, mr, mt, mb;         /* margins; auto ones are 0 here and flagged */
     uint8_t aml, amr, amt, amb;
     int hz, vt;                 /* borders and padding across and down */
@@ -3742,7 +3774,16 @@ static void push_fitem(struct fitem *items, int *n, struct node *node, const str
     it->kind = (uint8_t)kind;
     it->which = (uint8_t)which;
     it->order = kind == FI_PSEUDO ? (which ? 1 << 30 : -(1 << 30)) : anonymous(it) ? 0 : st->order;
+    it->pos = *n;
     it->slot = -1;
+}
+
+static int fitem_order_cmp(const void *a, const void *b)
+{
+    const struct fitem *x = a, *y = b;
+    if (x->order != y->order)
+        return x->order < y->order ? -1 : 1;
+    return x->pos < y->pos ? -1 : x->pos > y->pos;
 }
 
 /*
@@ -3781,16 +3822,12 @@ static int container_items(struct node *n, struct fitem **out)
                  : st->display == D_TABLE || st->display == D_INLINE_TABLE ? FI_TABLE : FI_BLOCK;
         push_fitem(items, &ni, k, st, kind, 0);
     }
-    /* order, keeping document order among equals */
-    for (int i = 1; i < ni; i++) {
-        struct fitem t = items[i];
-        int j = i;
-        while (j > 0 && items[j - 1].order > t.order) {
-            items[j] = items[j - 1];
-            j--;
-        }
-        items[j] = t;
-    }
+    /* order, keeping document order among equals (a sort, not insertion: a page can have many items) */
+    int sorted = 1;
+    for (int i = 1; i < ni && sorted; i++)
+        sorted = items[i - 1].order <= items[i].order;
+    if (!sorted)
+        qsort(items, (size_t)ni, sizeof(*items), fitem_order_cmp);
     return ni;
 }
 
@@ -4300,7 +4337,10 @@ static int flex_column(struct lctx *c, const struct style *st, struct fitem *it,
     return h > avail ? h : avail;
 }
 
-static int layout_flex(struct lctx *c, struct node *n, int x, int y, int w, int defh, int minh)
+/* Out of line: block_content would otherwise inline it into layout_block_box, whose frame each level of
+ * nesting pays for. */
+static __attribute__((noinline)) int layout_flex(struct lctx *c, struct node *n, int x, int y, int w,
+                                                int defh, int minh)
 {
     const struct style *st = n->style;
     struct fitem *items;
@@ -4625,8 +4665,9 @@ static int grid_item_layout(struct lctx *c,struct fitem *t,int bw,int cw,
     return h;
 }
 
-/* Subgrid measurements must not leave an extra copy of the child's display list. */
-static int grid_item_probe(struct lctx *c,struct fitem *t,int bw,int cw,
+/* Subgrid measurements must not leave an extra copy of the child's display list. Out of line: the
+ * context copy is large, and only subgrids need it. */
+static __attribute__((noinline)) int grid_item_probe(struct lctx *c,struct fitem *t,int bw,int cw,
                            const int *cols,const int *rows,int cgap,int rgap,int *contribute)
 {
     struct arena a={0};struct layout lo={0};struct lctx probe=*c;
@@ -4639,7 +4680,9 @@ static int grid_item_probe(struct lctx *c,struct fitem *t,int bw,int cw,
     return h;
 }
 
-static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int defh, int minh)
+/* Out of line, like layout_flex. */
+static __attribute__((noinline)) int layout_grid(struct lctx *c, struct node *n, int x, int y, int w,
+                                                int defh, int minh)
 {
     const struct style *st = n->style;
     struct fitem *it;
@@ -4751,12 +4794,15 @@ static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int 
     for (int k = 0; k < nt; k++)
         colx[k + 1] = colx[k] + colw[k] + cstep;
 
-    int *rowh = calloc((size_t)(nrows + 1) * 2, sizeof(int));
+    /* row heights and tops, then each row's kind (0 auto, 1 fixed, 2 fr) and fr weight: on the heap, as
+     * grids nest by recursion */
+    int *rowh = calloc((size_t)(nrows + 1) * 3 + (size_t)nrows, sizeof(int));
     if (!rowh) {
         free(it);
         return 0;
     }
-    int *rowy = rowh + nrows + 1;
+    int *rowy = rowh + nrows + 1, *rweight = rowy + nrows + 1;
+    uint8_t *rkind = (uint8_t *)(rweight + nrows);
     for (int i = 0; i < ni; i++) {
         struct fitem *t = &it[i];
         int cw = colx[t->col + t->cspan] - colx[t->col] - cstep;
@@ -4784,8 +4830,6 @@ static int layout_grid(struct lctx *c, struct node *n, int x, int y, int w, int 
     }
     /* row sizes from grid-template-rows and grid-auto-rows */
     int sumfr = 0, nauto = 0;
-    uint8_t rkind[1100];                        /* 0 auto, 1 fixed, 2 fr */
-    int rweight[1100];
     for (int r = 0; r < nrows && r < 1100; r++) {
         const struct track *t = !subr && r < erows ? &rspec->t[r]
                               : !subr && aspec && aspec->n ? &aspec->t[(r - erows) % aspec->n] : NULL;
@@ -4948,6 +4992,8 @@ static void container_measure(struct lctx *c, struct node *n, int *min, int *max
 
 /* ---- intrinsic widths ---- */
 
+static void measure_at(struct lctx *c, struct node *n, int *min, int *max);
+
 static void measure(struct lctx *c, struct node *n, int *min, int *max)
 {
     if (n->mgen == c->gen) {
@@ -4955,6 +5001,17 @@ static void measure(struct lctx *c, struct node *n, int *min, int *max)
         *max = n->mmax;
         return;
     }
+    if (c->nest >= LAYOUT_MAX_NEST) {           /* too deep (see layout_block_box) */
+        *min = *max = 0;
+        return;
+    }
+    c->nest++;
+    measure_at(c, n, min, max);
+    c->nest--;
+}
+
+static void measure_at(struct lctx *c, struct node *n, int *min, int *max)
+{
     const struct style *st = n->style;
     struct boxm b;
     resolve_box(st, 0, -1, &b);
@@ -5524,7 +5581,21 @@ struct zsort {
     int *owner;                 /* scratch: the sub-layer an item is in, for the context being sorted */
     int *out, nout;
     int n;
+    int *kid_at, *kid_list;     /* the layers whose context is c: kid_list[kid_at[c + 1] .. kid_at[c + 2]) */
 };
+
+/* A sub-layer to paint, by z-index then document order (layers are sorted by where they start). */
+struct zpick {
+    int z, i, k;
+};
+
+static int zpick_cmp(const void *a, const void *b)
+{
+    const struct zpick *x = a, *y = b;
+    if (x->z != y->z)
+        return x->z < y->z ? -1 : 1;
+    return x->i < y->i ? -1 : x->i > y->i;
+}
 
 static void z_paint(struct zsort *z, int ctx, int from, int lead, int to);
 
@@ -5532,28 +5603,32 @@ static void z_paint(struct zsort *z, int ctx, int from, int lead, int to);
  * order among equals (flat layers are always z-index 0). */
 static void z_kids(struct zsort *z, int *kids, int nk, int lo, int hi)
 {
-    for (int pass = 0; pass < nk; pass++) {
-        int best = -1;
-        for (int k = 0; k < nk; k++) {
-            int i = kids[k];
-            if (i < 0 || z->zl[i].z < lo || z->zl[i].z > hi || !z->zl[i].ctx)
-                continue;
-            if (best < 0 || z->zl[i].z < z->zl[kids[best]].z)
-                best = k;
+    struct zpick *pick = malloc(sizeof(*pick) * (size_t)(nk ? nk : 1));
+    int np = 0;
+    for (int k = 0; k < nk; k++) {
+        int i = kids[k];
+        if (i < 0 || z->zl[i].z < lo || z->zl[i].z > hi || !z->zl[i].ctx)
+            continue;
+        if (pick)
+            pick[np++] = (struct zpick){ z->zl[i].z, i, k };
+        else {                          /* no memory to sort: in document order */
+            kids[k] = -1;
+            z_paint(z, i, z->zl[i].from, z->zl[i].lead, z->zl[i].to);
         }
-        if (best < 0)
-            return;
-        int i = kids[best];
-        kids[best] = -1;
+    }
+    if (np > 1)                         /* (one sort: picking the lowest each time was quadratic) */
+        qsort(pick, (size_t)np, sizeof(*pick), zpick_cmp);
+    for (int p = 0; p < np; p++) {
+        int i = pick[p].i;
+        kids[pick[p].k] = -1;
         z_paint(z, i, z->zl[i].from, z->zl[i].lead, z->zl[i].to);
     }
+    free(pick);
 }
 
 static void z_paint(struct zsort *z, int ctx, int from, int lead, int to)
 {
-    int nk = 0;
-    for (int i = 0; i < z->n; i++)
-        nk += z->ctxp[i] == ctx;
+    int nk = z->kid_at[ctx + 2] - z->kid_at[ctx + 1];
     int *kids = malloc(sizeof(int) * (size_t)(nk ? nk : 1));
     int *flow = malloc(sizeof(int) * (size_t)(to - lead > 0 ? to - lead : 1));
     if (!kids || !flow) {
@@ -5563,10 +5638,8 @@ static void z_paint(struct zsort *z, int ctx, int from, int lead, int to)
             z->out[z->nout++] = t;
         return;
     }
-    nk = 0;
-    for (int i = 0; i < z->n; i++)      /* in document order: the layers are sorted by from */
-        if (z->ctxp[i] == ctx)
-            kids[nk++] = i;
+    /* in document order: the layers are sorted by from */
+    memcpy(kids, z->kid_list + z->kid_at[ctx + 1], sizeof(int) * (size_t)nk);
     /* Which sub-layer each item is in (the innermost); outer ones are earlier in the list. */
     for (int t = from; t < to; t++)
         z->owner[t] = -1;
@@ -5639,6 +5712,19 @@ static int zl_cmp(const void *a, const void *b)
     return x->to > y->to ? -1 : x->to < y->to;  /* the outer one first */
 }
 
+/* Stable: the layers' places before sorting break ties. */
+struct zl_ranked {
+    struct zlayer l;
+    int rank;
+};
+
+static int zl_ranked_cmp(const void *a, const void *b)
+{
+    const struct zl_ranked *x = a, *y = b;
+    int r = zl_cmp(&x->l, &y->l);
+    return r ? r : x->rank < y->rank ? -1 : x->rank > y->rank;
+}
+
 static void apply_z_order(struct lctx *c)
 {
     struct layout *lo = c->lo;
@@ -5646,23 +5732,23 @@ static void apply_z_order(struct lctx *c)
     if (!n || !lo->nitems)
         return;
     struct zlayer *zl = c->zl;
-    /* Registered inside out: for equal ranges the later is the outer box. Then by position. */
-    for (int i = 0; i < n / 2; i++) {
-        struct zlayer t = zl[i];
-        zl[i] = zl[n - 1 - i];
-        zl[n - 1 - i] = t;
-    }
-    for (int i = 1; i < n; i++)         /* stable insertion sort */
-        for (int j = i; j > 0 && zl_cmp(&zl[j - 1], &zl[j]) > 0; j--) {
-            struct zlayer t = zl[j];
-            zl[j] = zl[j - 1];
-            zl[j - 1] = t;
-        }
+    /* Registered inside out: for equal ranges the later is the outer box. Then by position (a stable
+     * sort: insertion was quadratic, and siblings arrive in exactly the wrong order for it). */
+    struct zl_ranked *ranked = malloc(sizeof(*ranked) * (size_t)n);
+    if (!ranked)
+        return;
+    for (int i = 0; i < n; i++)
+        ranked[i] = (struct zl_ranked){ zl[n - 1 - i], i };
+    qsort(ranked, (size_t)n, sizeof(*ranked), zl_ranked_cmp);
+    for (int i = 0; i < n; i++)
+        zl[i] = ranked[i].l;
+    free(ranked);
     struct zsort z = { zl, malloc(sizeof(int) * (size_t)n), malloc(sizeof(int) * (size_t)n),
-                       malloc(sizeof(int) * (size_t)lo->nitems), malloc(sizeof(int) * (size_t)lo->nitems), 0, 0 };
-    int *stack = malloc(sizeof(int) * (size_t)n), depth = 0;
+                       malloc(sizeof(int) * (size_t)lo->nitems), malloc(sizeof(int) * (size_t)lo->nitems), 0, 0,
+                       malloc(sizeof(int) * (size_t)(n + 2)), malloc(sizeof(int) * (size_t)n) };
+    int *stack = malloc(sizeof(int) * (size_t)(n + 1)), depth = 0;  /* n + 1: reused as cursors below */
     struct ditem *copy = malloc(sizeof(struct ditem) * (size_t)lo->nitems);
-    if (!z.parent || !z.ctxp || !z.owner || !z.out || !stack || !copy)
+    if (!z.parent || !z.ctxp || !z.owner || !z.out || !z.kid_at || !z.kid_list || !stack || !copy)
         goto done;
     /* The tree: each layer's parent is the innermost earlier one containing it. Overlaps that do
      * not nest (which layout should not make) are dropped. */
@@ -5685,6 +5771,15 @@ static void apply_z_order(struct lctx *c)
             p = z.parent[p];
         z.ctxp[i] = p;
     }
+    memset(z.kid_at, 0, sizeof(int) * (size_t)(n + 2));     /* each context's sub-layers, in order */
+    for (int i = 0; i < n; i++)
+        z.kid_at[z.ctxp[i] + 2]++;
+    for (int k = 1; k < n + 2; k++)
+        z.kid_at[k] += z.kid_at[k - 1];
+    for (int i = 0, *fill = stack; i < n + 1; i++)          /* (stack is free again: the next slots) */
+        fill[i] = z.kid_at[i];
+    for (int i = 0; i < n; i++)
+        z.kid_list[stack[z.ctxp[i] + 1]++] = i;
     z_paint(&z, -1, 0, 0, lo->nitems);
     if (z.nout == lo->nitems) {
         memcpy(copy, lo->items, sizeof(struct ditem) * (size_t)lo->nitems);
@@ -5709,6 +5804,8 @@ done:
     free(z.ctxp);
     free(z.owner);
     free(z.out);
+    free(z.kid_at);
+    free(z.kid_list);
 }
 
 static int top_cmp(const void *a, const void *b)
@@ -6418,6 +6515,14 @@ static void fill_rich(struct surface *s, const struct ditem *d, int x, int y)
     free(gp);
 }
 
+/* The picture's row (or column) under pixel pos of len drawn from its n: in 64 bits, as a picture can be
+ * drawn millions of pixels tall, and clamped to the picture. */
+static int scaled_index(int pos, int n, int len)
+{
+    long long v = len > 0 ? (long long)pos * n / len : 0;
+    return v < 0 ? 0 : v >= n ? n - 1 : (int)v;
+}
+
 /* An image with its corners rounded off, or put (object-fit) somewhere other than filling its box. */
 static void draw_image_round(struct surface *s, const struct ditem *d, int x, int y)
 {
@@ -6432,7 +6537,7 @@ static void draw_image_round(struct surface *s, const struct ditem *d, int x, in
     for (int j = r.y; j < r.y + r.h; j++) {
         if (j < fy || j >= fy + fh)
             continue;
-        const uint32_t *src = img->px + ((j - fy) * img->h / fh) * img->w;
+        const uint32_t *src = img->px + (size_t)scaled_index(j - fy, img->h, fh) * img->w;
         uint32_t *dst = s->px + j * s->stride;
         for (int i = r.x; i < r.x + r.w; i++) {
             if (i < fx || i >= fx + fw)
@@ -6440,7 +6545,7 @@ static void draw_image_round(struct surface *s, const struct ditem *d, int x, in
             int cov = rounded ? coverage(i - x, j - y, d->w, d->h, d->rad) : 256;
             if (!cov)
                 continue;
-            uint32_t p = src[((i - fx) * img->w / fw)];
+            uint32_t p = src[scaled_index(i - fx, img->w, fw)];
             uint32_t a = (p >> 24) * (uint32_t)cov / 256;
             if (a == 255)
                 dst[i] = p & 0xFFFFFF;
@@ -6472,7 +6577,7 @@ static void draw_bgimg_layer(struct surface *s, const struct ditem *d, const str
                 rel %= bp->tw;
                 if (rel < 0)
                     rel += bp->tw;
-                xs[i] = (rel * img->w / bp->tw);
+                xs[i] = scaled_index(rel, img->w, bp->tw);
             }
             int rounded = d->rad[0] || d->rad[1] || d->rad[2] || d->rad[3];
             for (int j = r.y; j < r.y + r.h; j++) {
@@ -6482,7 +6587,7 @@ static void draw_bgimg_layer(struct surface *s, const struct ditem *d, const str
                 rel %= bp->th;
                 if (rel < 0)
                     rel += bp->th;
-                const uint32_t *src = img->px + (rel * img->h / bp->th) * img->w;
+                const uint32_t *src = img->px + (size_t)scaled_index(rel, img->h, bp->th) * img->w;
                 uint32_t *dst = s->px + j * s->stride;
                 for (int i = 0; i < r.w; i++) {
                     if (xs[i] < 0)
@@ -6558,11 +6663,11 @@ void draw_image_scaled(struct surface *s, const struct image *img, int x, int y,
     if (rect_empty(r) || !img || img->w <= 0 || img->h <= 0)
         return;
     for (int j = r.y; j < r.y + r.h; j++) {
-        int sy = (j - y) * img->h / h;
-        const uint32_t *src = img->px + sy * img->w;
+        int sy = scaled_index(j - y, img->h, h);
+        const uint32_t *src = img->px + (size_t)sy * img->w;
         uint32_t *dst = s->px + j * s->stride;
         for (int i = r.x; i < r.x + r.w; i++) {
-            uint32_t p = src[(i - x) * img->w / w];
+            uint32_t p = src[scaled_index(i - x, img->w, w)];
             uint32_t a = p >> 24;
             if (a == 255)
                 dst[i] = p & 0xFFFFFF;

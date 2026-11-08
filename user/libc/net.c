@@ -178,11 +178,15 @@ static uint16_t be16(const uint8_t *p)
     return (uint16_t)(p[0] << 8 | p[1]);
 }
 
-/* Returns the number of addresses found, 0 if the name does not exist, -1 on failure. */
-static int parse_reply(const uint8_t *msg, int len, uint16_t id, struct in_addr *addrs)
+/* Returns the number of addresses found, 0 if the name does not exist, -1 on failure (or a reply to
+ * another question than q, qlen bytes of name, type and class). */
+static int parse_reply(const uint8_t *msg, int len, uint16_t id, const uint8_t *q, int qlen, struct in_addr *addrs)
 {
-    if (len < 12 || be16(msg) != id || !(msg[2] & 0x80))
+    if (len < 12 + qlen || be16(msg) != id || !(msg[2] & 0x80) || be16(msg + 4) != 1)
         return -1;
+    for (int i = 0; i < qlen; i++)          /* the question, as asked (names in any case) */
+        if (tolower(msg[12 + i]) != tolower(q[i]))
+            return -1;
     int rcode = msg[3] & 0x0F;
     if (rcode == 3)
         return 0;                       /* NXDOMAIN */
@@ -218,6 +222,13 @@ static int dns_lookup(const char *name, struct in_addr *addrs)
     }
     uint8_t q[512];
     uint16_t id = (uint16_t)(uptime_ms() * 2654435761u >> 16 ^ (unsigned)getpid());
+    int rfd = open("/dev/urandom", O_RDONLY);  /* an unguessable id, so a spoofed reply has to guess it */
+    if (rfd >= 0) {
+        uint8_t rnd[2];
+        if (read(rfd, rnd, 2) == 2)
+            id = (uint16_t)(rnd[0] << 8 | rnd[1]);
+        close(rfd);
+    }
     memset(q, 0, 12);
     q[0] = (uint8_t)(id >> 8);
     q[1] = (uint8_t)id;
@@ -257,7 +268,7 @@ static int dns_lookup(const char *name, struct in_addr *addrs)
                 int r = (int)recv(fd, reply, sizeof(reply), 0);
                 if (r < 0)
                     break;
-                found = parse_reply(reply, r, id, addrs);
+                found = parse_reply(reply, r, id, q + 12, n - 12, addrs);
                 if (found >= 0)
                     break;              /* a stray or broken reply: keep waiting */
             }

@@ -243,12 +243,10 @@ void draw_text_field(struct surface *s, struct rect r, const char *text, int cur
     struct rect saved = s->clip;
     s->clip = rect_intersect(saved, inner);
 
-    /* Scroll so the caret stays visible. */
-    char before[256];
-    int n = cursor < (int)sizeof(before) - 1 ? cursor : (int)sizeof(before) - 1;
-    memcpy(before, text, (size_t)n);
-    before[n] = 0;
-    int caret_x = gfx_text_width(&font_sans, before);
+    /* Scroll so the caret stays visible (text may be a whole path). */
+    int caret_x = 0;
+    for (int i = 0; i < cursor && text[i]; i++)
+        caret_x += gfx_text_width(&font_sans, (char[]){ text[i], 0 });
     int scroll = caret_x > inner.w - 6 ? caret_x - (inner.w - 6) : 0;
     int tx = inner.x + 2 - scroll, ty = r.y + (r.h - font_sans.height) / 2;
     gfx_text(s, &font_sans, tx, ty, text, C_BLACK);

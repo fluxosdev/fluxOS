@@ -10,7 +10,9 @@
  * instructions avoid what 64-bit mode lacks or reads differently: 40-4F
  * (REX prefixes there), DAA/DAS/AAA/AAS/AAM/AAD/SALC, and ModR/M disp32
  * alone (RIP-relative there; a SIB byte with no base gives the absolute
- * address instead). No instruction touches ESP.
+ * address instead). No instruction touches ESP. DAA, DAS, AAA and AAS are
+ * checked against a model of the SDM's pseudocode instead, and the trap
+ * flag in real mode.
  */
 #define _GNU_SOURCE
 #include <setjmp.h>
@@ -471,6 +473,138 @@ static void dump(const char *tag, const struct regs *r)
            r->r[0], r->r[1], r->r[2], r->r[3], r->r[5], r->r[6], r->r[7], (unsigned)(r->flags & 0xFFF));
 }
 
+/* ---- BCD adjustments, against the Intel SDM's pseudocode ---- */
+
+/* The host cannot run DAA, DAS, AAA or AAS (they do not exist in 64-bit
+ * mode), so these are checked against a model of what the SDM says a 386
+ * and later do: ax and the flags in, ax and the flags out. */
+static uint32_t bcd_model(uint8_t op, uint16_t *ax, uint32_t flags)
+{
+    uint8_t al = (uint8_t)*ax, ah = (uint8_t)(*ax >> 8), old_al = al;
+    int cf = (flags & F_CF) != 0, af = (flags & F_AF) != 0, old_cf = cf;
+    if (op == 0x27 || op == 0x2F) {             /* DAA, DAS */
+        int sub = op == 0x2F;
+        cf = 0;
+        if ((al & 0x0F) > 9 || af) {
+            cf = old_cf | (sub ? al < 6 : al > 0xF9);
+            al = (uint8_t)(sub ? al - 6 : al + 6);
+            af = 1;
+        } else {
+            af = 0;
+        }
+        if (old_al > 0x99 || old_cf) {
+            al = (uint8_t)(sub ? al - 0x60 : al + 0x60);
+            cf = 1;
+        }
+        *ax = (uint16_t)(ah << 8 | al);
+        flags &= ~(uint32_t)(F_CF | F_AF | F_SF | F_ZF | F_PF);
+        flags |= (cf ? F_CF : 0) | (af ? F_AF : 0) | (al & 0x80 ? F_SF : 0) | (al ? 0 : F_ZF) |
+                 (__builtin_parity(al) ? 0 : F_PF);
+        return flags;
+    }
+    if ((al & 0x0F) > 9 || af) {                /* AAA, AAS */
+        if (op == 0x37) {
+            *ax = (uint16_t)(*ax + 0x106);
+        } else {
+            *ax = (uint16_t)(*ax - 6);
+            *ax = (uint16_t)(*ax - 0x100);
+        }
+        cf = af = 1;
+    } else {
+        cf = af = 0;
+    }
+    *ax &= 0xFF0F;
+    return (flags & ~(uint32_t)(F_CF | F_AF)) | (cf ? F_CF : 0) | (af ? F_AF : 0);
+}
+
+static long bcd_tests(void)
+{
+    static const uint8_t ops[] = { 0x27, 0x2F, 0x37, 0x3F };
+    long failures = 0;
+    for (int k = 0; k < 4; k++) {
+        uint32_t defined = ops[k] <= 0x2F ? (F_CF | F_AF | F_SF | F_ZF | F_PF) : (F_CF | F_AF);
+        for (uint32_t v = 0; v < 0x10000 * 4 && failures < 20; v += 7) {
+            uint16_t ax = (uint16_t)(v * 0x9E37), want = ax;
+            uint32_t flags = 0x202 | ((v & 1) ? F_CF : 0) | ((v & 2) ? F_AF : 0);
+            uint32_t want_flags = bcd_model(ops[k], &want, flags);
+            memset(&cpu.base, 0, sizeof(cpu.base));
+            cpu.pm = cpu.code32 = cpu.stack32 = 1;
+            cpu.ip_mask = 0xFFFFFFFF;
+            cpu.ip = CODE;
+            mem[CODE] = ops[k];
+            cpu.r[R_AX] = 0x55AA0000u | ax;
+            cpu.flags = flags;
+            cpu.inhibit = cpu.halted = 0;
+            cpu_run(1);
+            if (cpu.r[R_AX] != (0x55AA0000u | want) || ((cpu.flags ^ want_flags) & defined)) {
+                printf("MISMATCH bcd %02x: ax=%04x fl=%03x: emulator %04x %03x, model %04x %03x\n", ops[k], ax,
+                       flags & 0xFFF, AX, cpu.flags & 0xFFF, want, want_flags & 0xFFF);
+                failures++;
+            }
+        }
+    }
+    return failures;
+}
+
+/* ---- the trap flag ---- */
+
+/* Real mode at 8000:0000 with TF as given; INT 1 and INT 3 go to 9000:0100
+ * and 9000:0300. Runs n instructions; returns 1 if the INT 1 handler was
+ * entered from IP after (with TF in the flags it pushed). */
+static int trapped(const uint8_t *code, int len, uint32_t flags, int n, uint16_t after)
+{
+    cpu.pm = cpu.code32 = cpu.stack32 = 0;
+    cpu.ip_mask = 0xFFFF;
+    cpu.seg[S_CS] = 0x8000;
+    cpu.seg[S_SS] = 0x7000;
+    cpu.r[R_SP] = 0x100;
+    cpu.r[R_AX] = 0x7000;
+    cpu.ip = 0;
+    cpu.flags = flags;
+    cpu.inhibit = cpu.halted = 0;
+    memcpy(mem + 0x80000, code, (size_t)len);
+    ww(1 * 4, 0x0100);
+    ww(1 * 4 + 2, 0x9000);
+    ww(3 * 4, 0x0300);
+    ww(3 * 4 + 2, 0x9000);
+    ww(0x70000 + 0xFE, (uint16_t)(0x202 | F_TF));   /* for POPF */
+    for (int i = 0; i < n; i++)
+        cpu_run(1);
+    return CS == 0x9000 && cpu.ip == 0x0100 && !(cpu.flags & F_TF) && rw(0x70000 + SP) == after &&
+           rw(0x70000 + SP + 2) == 0x8000 && (rw(0x70000 + SP + 4) & F_TF);
+}
+
+static long trap_tests(void)
+{
+    static const uint8_t nops[] = { 0x90, 0x90, 0x90 };
+    static const uint8_t mov_ss[] = { 0x8E, 0xD0, 0x90, 0x90 };    /* mov ss, ax; nop */
+    static const uint8_t popf[] = { 0x83, 0xEC, 0x02, 0x9D, 0x90 };  /* sub sp, 2; popf; nop */
+    static const uint8_t int3[] = { 0xCC };
+    long failures = 0;
+    if (!trapped(nops, 3, 0x202 | F_TF, 1, 1)) {
+        printf("MISMATCH trap flag: no INT 1 after an instruction\n");
+        failures++;
+    }
+    if (trapped(mov_ss, 4, 0x202 | F_TF, 1, 2) || !trapped(mov_ss, 4, 0x202 | F_TF, 2, 3)) {
+        printf("MISMATCH trap flag: MOV SS does not hold off the trap for one instruction\n");
+        failures++;
+    }
+    if (trapped(popf, 5, 0x202, 2, 4) || !trapped(popf, 5, 0x202, 3, 5)) {
+        printf("MISMATCH trap flag: POPF setting TF traps after the instruction after it\n");
+        failures++;
+    }
+    trapped(int3, 1, 0x202 | F_TF, 1, 1);
+    if (CS != 0x9000 || cpu.ip != 0x0300) {
+        printf("MISMATCH trap flag: INT 3 with TF set went to %04x:%04x, not its handler\n", CS, cpu.ip);
+        failures++;
+    }
+    if (trapped(nops, 3, 0x202, 1, 1)) {
+        printf("MISMATCH trap flag: INT 1 without TF\n");
+        failures++;
+    }
+    return failures;
+}
+
 int main(int argc, char **argv)
 {
     long count = argc > 1 ? atol(argv[1]) : 1000000;
@@ -630,6 +764,8 @@ fail:
             failures++;
         }
     }
+    failures += bcd_tests();
+    failures += trap_tests();
     printf("%ld instructions, %ld failures, %ld skipped\n", count, failures, skipped);
     return failures != 0;
 }

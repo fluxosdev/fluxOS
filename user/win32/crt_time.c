@@ -226,37 +226,44 @@ XDEF(timegm) { return api__mkgmtime(a); }
 static const char *const wdays[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
 static const char *const months[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 
-static void asctime_into(const struct gtm *g, char *out)
+/* The 26 characters (with the NUL) of asctime, or -1 if a field is out of range (the
+ * runtime then fails with EINVAL, as Microsoft's does, instead of writing more). */
+static int asctime_into(const struct gtm *g, char *out)
 {
-    int wd = g->wday >= 0 && g->wday < 7 ? g->wday : 0, mo = g->mon >= 0 && g->mon < 12 ? g->mon : 0;
-    sprintf(out, "%s %s %2d %02d:%02d:%02d %d\n", wdays[wd], months[mo], g->mday, g->hour, g->min, g->sec, g->year + 1900);
+    if (!g || g->sec < 0 || g->sec > 60 || g->min < 0 || g->min > 59 || g->hour < 0 || g->hour > 23 ||
+        g->mday < 1 || g->mday > 31 || g->mon < 0 || g->mon > 11 || g->year < 0 || g->year > 8099 ||
+        g->wday < 0 || g->wday > 6)
+        return -1;
+    snprintf(out, 26, "%s %s %2d %02d:%02d:%02d %04d\n", wdays[g->wday], months[g->mon], g->mday, g->hour, g->min,
+             g->sec, g->year + 1900);
+    return 0;
 }
 
 XDEF(asctime)
 {
     if (!asc_buf) asc_buf = vm_alloc_loader(32);
-    asctime_into(P(0), GP(asc_buf));
+    if (asctime_into(P(0), GP(asc_buf)) < 0) { crt_set_errno(CRT_EINVAL); return 0; }
     return asc_buf;
 }
 XDEF(_wasctime)
 {
     if (!wasc_buf) wasc_buf = vm_alloc_loader(64);
     char tmp[32];
-    asctime_into(P(0), tmp);
+    if (asctime_into(P(0), tmp) < 0) { crt_set_errno(CRT_EINVAL); return 0; }
     ansi_to_wide(tmp, -1, GP(wasc_buf), 32);
     return wasc_buf;
 }
 XDEF(asctime_s)
 {
-    if (!A(0) || A(1) < 26 || !A(2)) return CRT_EINVAL;
-    asctime_into(P(2), P(0));
+    if (!A(0) || A(1) < 26 || !A(2)) { if (A(0) && A(1)) *(char *)P(0) = 0; return CRT_EINVAL; }
+    if (asctime_into(P(2), P(0)) < 0) { *(char *)P(0) = 0; return CRT_EINVAL; }
     return 0;
 }
 XDEF(_wasctime_s)
 {
-    if (!A(0) || A(1) < 26 || !A(2)) return CRT_EINVAL;
+    if (!A(0) || A(1) < 26 || !A(2)) { if (A(0) && A(1)) *(uint16_t *)P(0) = 0; return CRT_EINVAL; }
     char tmp[32];
-    asctime_into(P(2), tmp);
+    if (asctime_into(P(2), tmp) < 0) { *(uint16_t *)P(0) = 0; return CRT_EINVAL; }
     ansi_to_wide(tmp, -1, P(0), (int)A(1));
     return 0;
 }

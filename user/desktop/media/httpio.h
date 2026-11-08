@@ -18,6 +18,9 @@ struct httpio;
 /* Start reading url, with more request headers ("Name: value"). Waits until the server has
  * answered: NULL (with why in err) if it will not give the file. */
 struct httpio *httpio_open(const char *url, const char *const *headers, int nheaders, char *err, size_t errsize);
+/* The same, giving up as soon as *cancel becomes non-zero (another thread's, e.g. the player closing). */
+struct httpio *httpio_open_cancel(const char *url, const char *const *headers, int nheaders, char *err, size_t errsize,
+                                  const volatile int *cancel);
 /* Read up to n bytes at the position: how many (0 at the end, -1 on an error, which err says). */
 int httpio_read(struct httpio *h, void *buf, int n);
 /* lseek's whence: SEEK_SET, SEEK_CUR or SEEK_END. The new position, or -1. */

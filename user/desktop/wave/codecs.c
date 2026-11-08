@@ -129,6 +129,8 @@ static int wav_open(struct codec *c)
             c->end = size > len - body ? len : body + size;
             break;
         }
+        if (size > len - body)
+            break;                      /* runs past the end (and body + size could wrap) */
         at = body + size + (size & 1);
     }
     if (!fmt_ok || !c->start || c->channels < 1 || c->channels > 8 || c->rate < 1000 || c->rate > 192000)

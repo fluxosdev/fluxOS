@@ -84,6 +84,7 @@ void file_close(struct file *f)
         if (f->vn->dev_close)
             f->vn->dev_close(f->vn, f->flags);
         vfs_unref(f->vn);
+        kfree(f->dir_after);
     } else if (f->type == FT_SOCKET) {
         sock_close(f->sock);
     } else if (f->type == FT_PIPE) {
@@ -106,8 +107,9 @@ void file_close(struct file *f)
 }
 
 /* buf is a kernel buffer (sys_read bounces user memory), so copying it
- * holding the lock cannot fault. */
-static int pipe_read_flags(struct pipe *p, uint8_t *buf, uint32_t n, int nonblock)
+ * holding the lock cannot fault. peek: the bytes are copied and left in
+ * the pipe (recv's MSG_PEEK), waiting for them as a read would. */
+static int pipe_read_mode(struct pipe *p, uint8_t *buf, uint32_t n, int nonblock, int peek)
 {
     if (!n)
         return 0;
@@ -127,13 +129,21 @@ static int pipe_read_flags(struct pipe *p, uint8_t *buf, uint32_t n, int nonbloc
         }
         sleep_on_lock_intr(p, &pipe_lock);
     }
-    uint32_t i = 0;
-    while (i < n && p->rpos != p->wpos)
-        buf[i++] = (uint8_t)p->buf[p->rpos++ % PIPE_SIZE];
-    wakeup(p);
-    poll_wakeup();
+    uint32_t i = 0, pos = p->rpos;
+    while (i < n && pos != p->wpos)
+        buf[i++] = (uint8_t)p->buf[pos++ % PIPE_SIZE];
+    if (!peek) {
+        p->rpos = pos;
+        wakeup(p);                      /* room for writers */
+        poll_wakeup();
+    }
     spin_unlock(&pipe_lock);
     return (int)i;
+}
+
+static int pipe_read_flags(struct pipe *p, uint8_t *buf, uint32_t n, int nonblock)
+{
+    return pipe_read_mode(p, buf, n, nonblock, 0);
 }
 
 static int pipe_read(struct pipe *p, uint8_t *buf, uint32_t n)
@@ -141,9 +151,13 @@ static int pipe_read(struct pipe *p, uint8_t *buf, uint32_t n)
     return pipe_read_flags(p, buf, n, 0);
 }
 
+/* Writes of at most this many bytes are never split: all or nothing (POSIX's PIPE_BUF). */
+#define PIPE_ATOMIC 4096
+
 static int pipe_write_flags(struct pipe *p, const uint8_t *buf, uint32_t n, int nonblock)
 {
     uint32_t i = 0;
+    int atomic = n <= PIPE_ATOMIC;
     spin_lock(&pipe_lock);
     while (i < n) {
         if (p->readers <= 0) {
@@ -151,7 +165,8 @@ static int pipe_write_flags(struct pipe *p, const uint8_t *buf, uint32_t n, int 
             proc_signal(current, SIGPIPE);
             return i ? (int)i : -EPIPE;
         }
-        if (p->wpos - p->rpos == PIPE_SIZE) {
+        uint32_t room = PIPE_SIZE - (p->wpos - p->rpos);
+        if (!room || (atomic && room < n - i)) {
             wakeup(p);
             poll_wakeup();
             if (nonblock) {
@@ -198,6 +213,14 @@ int file_read(struct file *f, void *buf, uint32_t n)
     if (r > 0)
         f->off += (uint64_t)r;
     return r;
+}
+
+/* recv(MSG_PEEK) on a connected AF_UNIX socket: what file_read would give, left to read again. */
+int file_peek(struct file *f, void *buf, uint32_t n, int nonblock)
+{
+    if (f->type != FT_UNIX)
+        return -EOPNOTSUPP;
+    return f->usock->rx ? pipe_read_mode(f->usock->rx, buf, n, nonblock, 1) : -ENOTCONN;
 }
 
 int file_write(struct file *f, const void *buf, uint32_t n)
@@ -403,8 +426,8 @@ static int unix_poll(struct unix_sock *u)
             ready |= POLLIN | POLLHUP;
         if (u->tx->readers <= 0)
             ready |= POLLERR;
-        else if (u->tx->wpos - u->tx->rpos < PIPE_SIZE)
-            ready |= POLLOUT;
+        else if (u->tx->wpos - u->tx->rpos <= PIPE_SIZE - PIPE_ATOMIC)
+            ready |= POLLOUT;           /* room for a write that is not split */
     }
     spin_unlock(&pipe_lock);
     return ready;
@@ -451,7 +474,7 @@ int file_poll(struct file *f, int events)
         struct pipe *p = f->pipe;
         spin_lock(&pipe_lock);
         if (can_write(f)) {
-            ready = p->readers <= 0 ? POLLERR : p->wpos - p->rpos < PIPE_SIZE ? POLLOUT : 0;
+            ready = p->readers <= 0 ? POLLERR : p->wpos - p->rpos <= PIPE_SIZE - PIPE_ATOMIC ? POLLOUT : 0;
         } else {
             ready = p->wpos != p->rpos ? POLLIN : 0;
             if (p->writers <= 0)

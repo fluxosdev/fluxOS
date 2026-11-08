@@ -218,6 +218,7 @@ int do_getsid(int pid);
 int proc_setitimer(int which, uint32_t value, uint32_t interval, uint32_t *old_value, uint32_t *old_interval);
 int proc_exec(struct proc *p, const char *path, char *const argv[], char *const envp[]);
 int proc_info(int slot, struct procinfo *pi);
+uint32_t proc_cpu_ticks(struct proc *p);    /* the whole process's, all its threads */
 struct proc *proc_find(int pid);
 
 void proc_signal(struct proc *p, int sig);

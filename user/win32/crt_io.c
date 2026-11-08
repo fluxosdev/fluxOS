@@ -88,17 +88,29 @@ int crt_fd_read(int fd, void *buf, uint32_t n)
     struct crt_fd *f = crt_fd_get(fd);
     if (!f)
         return -1;
-    if (f->eof)
+    if (f->eof || !n)
         return 0;
-    int r;
-    if (f->console && f->fd == 0) {
-        crt_flush_all();
-        r = console_read(f->fd, buf, n);
-    } else {
-        r = (int)read(f->fd, buf, n);
+    int r, pre = 0;
+    if (f->has_pending) {               /* the byte that followed a CR last time */
+        ((char *)buf)[0] = f->pending;
+        f->has_pending = 0;
+        pre = 1;
     }
-    if (r <= 0)
+    if (pre && n == 1) {
+        r = 0;
+    } else if (f->console && f->fd == 0) {
+        crt_flush_all();
+        r = console_read(f->fd, (char *)buf + pre, n - pre);
+    } else {
+        r = (int)read(f->fd, (char *)buf + pre, n - pre);
+    }
+    if (r < 0 && pre)
+        r = 0;
+    if (r < 0)
         return r;
+    r += pre;
+    if (r == 0)
+        return 0;
     if (f->text) {
         /* CR LF -> LF; ^Z ends the file */
         char *p = buf;
@@ -107,16 +119,18 @@ int crt_fd_read(int fd, void *buf, uint32_t n)
             if (p[i] == '\r' && i + 1 < r && p[i + 1] == '\n')
                 continue;
             if (p[i] == '\r' && i + 1 == r) {
-                /* a CR at the end: look at the next byte */
+                /* a CR at the end: look at the next byte, keeping it for next time
+                 * if it is not the LF (there is room for one byte here, not two) */
                 char next;
                 int k = (int)read(f->fd, &next, 1);
-                if (k == 1 && next != '\n') {
-                    p[o++] = '\r';
-                    p[o++] = next;
-                } else if (k == 1) {
+                if (k == 1 && next == '\n') {
                     p[o++] = '\n';
                 } else {
                     p[o++] = '\r';
+                    if (k == 1) {
+                        f->pending = next;
+                        f->has_pending = 1;
+                    }
                 }
                 continue;
             }
@@ -165,6 +179,11 @@ int64_t crt_fd_seek(int fd, int64_t off, int whence)
     struct crt_fd *f = crt_fd_get(fd);
     if (!f)
         return -1;
+    if (f->has_pending) {               /* the read-ahead byte is given back to the file */
+        if (whence == SEEK_CUR)
+            off -= 1;
+        f->has_pending = 0;
+    }
     off_t r = lseek(f->fd, (off_t)off, whence);
     if (r >= 0)
         f->eof = 0;
@@ -203,6 +222,11 @@ static void sync_guest_file(int i)
     if (s->unbuffered) flag |= 0x4;     /* _IONBF */
     f[3] = flag;
     f[4] = (uint32_t)s->fd;
+}
+
+void crt_stream_sync(struct crt_stream *s)
+{
+    sync_guest_file((int)(s - crt_streams));
 }
 
 static int stream_new(void)
@@ -256,6 +280,7 @@ int crt_stream_flush(struct crt_stream *s)
     s->olen = 0;
     if (r < 0) {
         s->error = 1;
+        crt_stream_sync(s);
         return -1;
     }
     return 0;
@@ -272,6 +297,7 @@ int crt_stream_write(struct crt_stream *s, const void *data, uint32_t n)
 {
     if (!s->write) {
         s->error = 1;
+        crt_stream_sync(s);
         crt_set_errno(CRT_EBADF);
         return 0;
     }
@@ -282,7 +308,7 @@ int crt_stream_write(struct crt_stream *s, const void *data, uint32_t n)
     }
     if (s->unbuffered) {
         int r = crt_fd_write(s->fd, data, n);
-        if (r < 0) { s->error = 1; return 0; }
+        if (r < 0) { s->error = 1; crt_stream_sync(s); return 0; }
         return r;
     }
     const char *p = data;
@@ -315,6 +341,7 @@ static int fill(struct crt_stream *s)
     if (r <= 0) {
         if (r < 0) s->error = 1; else s->eof = 1;
         s->ilen = s->ipos = 0;
+        crt_stream_sync(s);             /* feof and ferror can be macros reading _flag */
         return -1;
     }
     s->ilen = r;
@@ -331,6 +358,7 @@ int crt_stream_getc(struct crt_stream *s)
     }
     if (!s->read) {
         s->error = 1;
+        crt_stream_sync(s);
         return -1;
     }
     if (s->ipos >= s->ilen && fill(s) < 0)
@@ -347,7 +375,10 @@ int crt_stream_ungetc(struct crt_stream *s, int c)
     } else {
         s->unget = c & 0xFF;
     }
-    s->eof = 0;
+    if (s->eof) {
+        s->eof = 0;
+        crt_stream_sync(s);
+    }
     return c & 0xFF;
 }
 
@@ -375,6 +406,7 @@ int crt_stream_read(struct crt_stream *s, void *data, uint32_t n)
             int r = crt_fd_read(s->fd, p + done, n - done);
             if (r <= 0) {
                 if (r < 0) s->error = 1; else s->eof = 1;
+                crt_stream_sync(s);
                 break;
             }
             done += (uint32_t)r;
@@ -394,6 +426,7 @@ int64_t crt_stream_seek(struct crt_stream *s, int64_t off, int whence)
     s->ilen = s->ipos = 0;
     s->unget = -1;
     s->eof = 0;
+    crt_stream_sync(s);
     return crt_fd_seek(s->fd, off, whence);
 }
 

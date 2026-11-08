@@ -1799,7 +1799,8 @@ void gl_check_backend(struct fgl_context *c)
 int gl_use_software(struct fgl_context *c, int keep_picture)
 {
     size_t n = (size_t)c->width * (size_t)c->height;
-    uint32_t *picture = keep_picture ? malloc(n * 4) : NULL;
+    /* Zeroed: a hung engine's read leaves it as it is (black, not old heap). */
+    uint32_t *picture = keep_picture ? calloc(n, 4) : NULL;
     float *depths = keep_picture && c->be->read_depth ? malloc(n * sizeof(float)) : NULL;
     if (picture || depths)
         c->be->finish(c);

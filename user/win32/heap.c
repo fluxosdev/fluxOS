@@ -3,7 +3,9 @@
  * heap is one reservation, used from the bottom up; blocks carry a
  * header with their size and that of the block before them, and free
  * ones are kept on lists by size class and merged with free neighbours.
- * Blocks are 8-byte aligned, as the Windows heap's are.
+ * Blocks are 8-byte aligned, as the Windows heap's are. A growable heap
+ * gives a big block a reservation of its own, as Windows does, so a heap
+ * is not limited to its first reservation.
  */
 #include <stdio.h>
 #include <string.h>
@@ -12,8 +14,10 @@
 #define HEAP_MAGIC 0x50414548u          /* "HEAP" */
 #define BLOCK_USED 1u
 #define NCLASSES 32
-#define HDR 8u
-#define MIN_BLOCK 24u                   /* header, the free links, 8 bytes of payload */
+#define HDR 16u
+#define MIN_BLOCK 24u                   /* header, then the free links (in the payload) */
+#define BIG_HDR 16u
+#define BIG_MIN 0x80000u                /* blocks this big get a reservation of their own */
 
 struct heap {
     uint32_t magic;
@@ -25,13 +29,19 @@ struct heap {
     gp_t last;                          /* the last block, or 0 */
     gp_t free_lists[NCLASSES];
     uint32_t allocs;
+    gp_t big;                           /* the first big block's reservation */
 };
 
 struct block {
     uint32_t size_flags;                /* size including the header; bit 0: in use */
     uint32_t prev_size;                 /* the block before (0: this is the first) */
+    uint32_t req;                       /* the size asked for (HeapSize) */
+    uint32_t spare;
     gp_t next_free, prev_free;          /* while free */
 };
+
+/* A big block: its own reservation, this header at its start, the data after. */
+struct big { uint32_t cap; gp_t heap; uint32_t req; gp_t next; };
 
 gp_t process_heap;
 
@@ -100,7 +110,8 @@ static void free_remove(struct heap *hp, gp_t b)
 
 gp_t heap_create(uint32_t initial, uint32_t max, uint32_t flags)
 {
-    uint32_t reserve = max ? (max + 0xFFFFu) & ~0xFFFFu : 0x4000000u;    /* 64 MiB to grow into */
+    /* 64 MiB to grow into (the process heap 256 MiB: pages come as they are touched) */
+    uint32_t reserve = max ? (max + 0xFFFFu) & ~0xFFFFu : process_heap ? 0x4000000u : 0x10000000u;
     if (reserve < 0x10000)
         reserve = 0x10000;
     gp_t base = vm_alloc(0, reserve, PAGE_READWRITE, MEM_PRIVATE, 0);
@@ -127,9 +138,52 @@ int heap_destroy(gp_t h)
     struct heap *hp = H(h);
     if (!hp || h == process_heap)
         return -1;
+    for (gp_t b = hp->big; b; ) {
+        gp_t next = ((struct big *)GP(b))->next;
+        vm_free(b, 0);
+        b = next;
+    }
     hp->magic = 0;
     vm_free(h, 0);
     return 0;
+}
+
+/* The big block whose data is at p, or NULL. */
+static struct big *big_of(struct heap *hp, gp_t p)
+{
+    if ((p & 0xFFFF) != BIG_HDR)
+        return NULL;
+    for (gp_t b = hp->big; b; b = ((struct big *)GP(b))->next)
+        if (b + BIG_HDR == p)
+            return GP(b);
+    return NULL;
+}
+
+static gp_t big_alloc(struct heap *hp, uint32_t size)
+{
+    gp_t b = vm_alloc(0, size + BIG_HDR, PAGE_READWRITE, MEM_PRIVATE, 0);
+    if (!b)
+        return 0;
+    struct big *bg = GP(b);
+    bg->cap = ((size + BIG_HDR + 0xFFFu) & ~0xFFFu) - BIG_HDR;
+    bg->heap = hp->base;
+    bg->req = size;
+    bg->next = hp->big;
+    hp->big = b;
+    hp->allocs++;
+    return b + BIG_HDR;                 /* fresh pages: already zero */
+}
+
+static void big_free(struct heap *hp, gp_t p)
+{
+    for (gp_t *pp = &hp->big; *pp; pp = &((struct big *)GP(*pp))->next)
+        if (*pp + BIG_HDR == p) {
+            gp_t b = *pp;
+            *pp = ((struct big *)GP(b))->next;
+            vm_free(b, 0);
+            hp->allocs--;
+            return;
+        }
 }
 
 gp_t heap_alloc(gp_t h, uint32_t size, int zero)
@@ -137,6 +191,8 @@ gp_t heap_alloc(gp_t h, uint32_t size, int zero)
     struct heap *hp = H(h);
     if (!hp || size > 0x7FFF0000u)
         return 0;
+    if (!hp->max && size >= BIG_MIN)
+        return big_alloc(hp, size);
     uint32_t need = size + HDR;
     if (need < MIN_BLOCK)
         need = MIN_BLOCK;
@@ -168,7 +224,7 @@ gp_t heap_alloc(gp_t h, uint32_t size, int zero)
         B(b)->size_flags |= BLOCK_USED;
     } else {
         if (hp->top + need > hp->size)
-            return 0;
+            return hp->max ? 0 : big_alloc(hp, size);
         b = hp->base + hp->top;
         B(b)->size_flags = need | BLOCK_USED;
         B(b)->prev_size = hp->last ? bsize(hp->last) : 0;
@@ -176,6 +232,7 @@ gp_t heap_alloc(gp_t h, uint32_t size, int zero)
         hp->top += need;
     }
     hp->allocs++;
+    B(b)->req = size;
     gp_t p = b + HDR;
     if (zero)
         memset(GP(p), 0, bsize(b) - HDR);
@@ -198,6 +255,10 @@ int heap_free(gp_t h, gp_t p)
         return -1;
     if (!p)
         return 0;
+    if (big_of(hp, p)) {
+        big_free(hp, p);
+        return 0;
+    }
     if (!valid_block(hp, p)) {
         wlog("HeapFree: bad pointer %08x", p);
         return -1;
@@ -235,9 +296,12 @@ int heap_free(gp_t h, gp_t p)
 uint32_t heap_size(gp_t h, gp_t p)
 {
     struct heap *hp = H(h);
+    struct big *bg = hp ? big_of(hp, p) : NULL;
+    if (bg)
+        return bg->req;
     if (!hp || !valid_block(hp, p))
         return 0xFFFFFFFFu;
-    return bsize(p - HDR) - HDR;
+    return B(p - HDR)->req;
 }
 
 int heap_validate(gp_t h, gp_t p)
@@ -245,7 +309,7 @@ int heap_validate(gp_t h, gp_t p)
     struct heap *hp = H(h);
     if (!hp)
         return 0;
-    return p ? valid_block(hp, p) : 1;
+    return p ? big_of(hp, p) || valid_block(hp, p) : 1;
 }
 
 gp_t heap_realloc(gp_t h, gp_t p, uint32_t size, int zero, int in_place)
@@ -255,12 +319,19 @@ gp_t heap_realloc(gp_t h, gp_t p, uint32_t size, int zero, int in_place)
         return 0;
     if (!p)
         return heap_alloc(h, size, zero);
-    if (!valid_block(hp, p))
+    struct big *bg = big_of(hp, p);
+    if (!bg && !valid_block(hp, p))
         return 0;
-    uint32_t old = bsize(p - HDR) - HDR;
-    if (size <= old) {
-        if (zero && size < old)
-            memset((char *)GP(p) + size, 0, old - size);
+    if (size > 0x7FFF0000u)
+        return 0;
+    /* what the block can hold, and what was asked for: only the bytes past
+     * the latter are new, and those are what HEAP_ZERO_MEMORY clears */
+    uint32_t cap = bg ? bg->cap : bsize(p - HDR) - HDR;
+    uint32_t old = bg ? bg->req : B(p - HDR)->req;
+    if (size <= cap) {
+        if (zero && size > old)
+            memset((char *)GP(p) + old, 0, size - old);
+        if (bg) bg->req = size; else B(p - HDR)->req = size;
         return p;
     }
     if (in_place)

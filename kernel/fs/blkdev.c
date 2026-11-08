@@ -573,10 +573,10 @@ int blk_register(struct blockdev *bd)
     struct vnode *dev;
     if (vfs_resolve("/dev", NULL, &dev) == 0) {
         int disk = bd->parent ? bd->parent->index : bd->index;
-        int part = bd->parent ? (int)(bd->name[strlen(bd->name) - 1] - '0') : 0;
-        uint32_t rdev = bd->type == BLK_FLOPPY
-                      ? MKDEV(FLOPPY_MAJOR, bd->name[strlen(bd->name) - 1] - '0')
-                      : MKDEV(IDE_MAJOR, disk * 16 + part);
+        size_t len = strlen(bd->name);
+        int last = len ? bd->name[len - 1] - '0' : 0;   /* the partition or drive number */
+        int part = bd->parent ? last : 0;
+        uint32_t rdev = bd->type == BLK_FLOPPY ? MKDEV(FLOPPY_MAJOR, last) : MKDEV(IDE_MAJOR, disk * 16 + part);
         struct vnode *vn = vfs_mknod(dev, bd->name, rdev, dev_blk_read, dev_blk_write);
         if (vn) {
             vn->type = VN_BLK;

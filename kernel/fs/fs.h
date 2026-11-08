@@ -53,6 +53,7 @@ struct fs {
     int readonly;
     int case_insensitive;
     uint32_t refs;             /* external vnode references, including unlinked files */
+    uint32_t dev;              /* st_dev of its files: a number of its own (ramfs is 1) */
     struct fs *next;
 };
 

@@ -727,7 +727,7 @@ $(BUILD)/tests/dos-cpu: tests/dos-cpu.c user/dos/cpu.c user/dos/dos.h
 
 .PHONY: test-libc-qemu
 test-libc-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/libc-guest
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/libc-guest --cpus $(KERNEL_TEST_CPUS) $(TEST_DROP_TOOLCHAIN) --success-marker "LIBC REGRESSIONS PASSED"
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/libc-guest --cpus $(KERNEL_TEST_CPUS) --memory 512 $(TEST_DROP_TOOLCHAIN) --success-marker "LIBC REGRESSIONS PASSED"
 
 $(BUILD)/tests/libc-guest.o: tests/libc-guest.c
 	@mkdir -p $(dir $@)
@@ -975,20 +975,20 @@ $(BUILD)/tests/desktop-mouse: tests/desktop-mouse.c user/desktop/apps/mouse.c us
 test-desktop-jobs: $(BUILD)/tests/desktop-imagejobs
 	$<
 
-$(BUILD)/tests/desktop-imagejobs: tests/desktop-imagejobs.c tests/desktop-host.h user/desktop/shell/imagejobs.c $(DESKTOP_HDRS)
+$(BUILD)/tests/desktop-imagejobs: tests/desktop-imagejobs.c tests/desktop-host.h user/desktop/shell/imagejobs.c user/desktop/image/webp.c $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra $(DESKTOP_INC) -Iinclude -include tests/desktop-host.h tests/desktop-imagejobs.c -o $@
+	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra $(DESKTOP_INC) -Iinclude -include tests/desktop-host.h tests/desktop-imagejobs.c user/desktop/image/webp.c -o $@
 
 $(BUILD)/tests/desktop-imagejobs-guest.o: tests/desktop-imagejobs.c user/desktop/shell/imagejobs.c $(DESKTOP_HDRS)
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) $(DESKTOP_INC) -DIMAGEJOBS_GUEST -c $< -o $@
 
-$(BUILD)/tests/desktop-imagejobs-guest: $(BUILD)/tests/desktop-imagejobs-guest.o $(CRT0) $(LIBC) user/user.ld
-	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
+$(BUILD)/tests/desktop-imagejobs-guest: $(BUILD)/tests/desktop-imagejobs-guest.o $(BUILD)/u/user/desktop/image/webp.o $(CRT0) $(LIBC) user/user.ld
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(BUILD)/u/user/desktop/image/webp.o $(LIBC)
 
 .PHONY: test-desktop-jobs-qemu
 test-desktop-jobs-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/desktop-imagejobs-guest
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/desktop-imagejobs-guest --cpus $(KERNEL_TEST_CPUS) $(TEST_DROP_TOOLCHAIN) --success-marker "DESKTOP JOB REGRESSIONS PASSED"
+	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/desktop-imagejobs-guest --cpus $(KERNEL_TEST_CPUS) --memory 512 $(TEST_DROP_TOOLCHAIN) --success-marker "DESKTOP JOB REGRESSIONS PASSED"
 
 # winrun's windows: a Windows program built here (gcc's ELF, laid out at 0x400000 and turned into
 # a PE by objcopy, with the import directory of tests/win32/imports.S), run in QEMU with

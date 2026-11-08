@@ -69,7 +69,9 @@ struct desc {
     uint32_t base, limit;               /* limit in bytes, granularity applied */
     uint8_t access;                     /* P, DPL, S, type */
     uint8_t big;                        /* D/B */
-    uint8_t used;
+    uint8_t used;                       /* 1: the client's, 2: a real-mode segment's (0002h),
+                                         * 3: the host's own; 0: free */
+    uint8_t dos_count;                  /* the first of a DOS block's (0100h): how many it has */
 };
 
 struct block {
@@ -159,7 +161,7 @@ static int desc_alloc(int n)
             k++;
         if (k == n) {
             for (k = 0; k < n; k++)
-                desc[i + k] = (struct desc){ 0, 0, 0xF2, 0, 1 };
+                desc[i + k] = (struct desc){ 0, 0, 0xF2, 0, 1, 0 };
             return i;
         }
         i += k;
@@ -167,13 +169,23 @@ static int desc_alloc(int n)
     return -1;
 }
 
+/* A new descriptor's selector; 0 when they have run out. */
 static uint16_t make_desc(uint32_t base, uint32_t limit, uint8_t access, int big)
 {
     int i = desc_alloc(1);
     if (i < 0)
-        fatal("DPMI: out of descriptors");
-    desc[i] = (struct desc){ base, limit, access, (uint8_t)big, 1 };
+        return 0;
+    desc[i] = (struct desc){ base, limit, access, (uint8_t)big, 1, 0 };
     return sel_of(i);
+}
+
+/* The host's own descriptors: the client can neither free nor change them. */
+static uint16_t host_desc(uint32_t base, uint32_t limit, uint8_t access, int big)
+{
+    uint16_t sel = make_desc(base, limit, access, big);
+    if (sel)
+        desc[sel >> 3].used = 3;
+    return sel;
 }
 
 static void desc_to_bytes(const struct desc *d, uint8_t b[8])
@@ -211,7 +223,8 @@ static uint16_t seg_selector(uint16_t seg)
         if (desc[i].used == 2 && desc[i].base == (uint32_t)seg << 4)
             return sel_of(i);
     uint16_t sel = make_desc((uint32_t)seg << 4, 0xFFFF, 0xF2, 0);
-    desc[sel >> 3].used = 2;            /* kept: such selectors cannot be freed */
+    if (sel)
+        desc[sel >> 3].used = 2;        /* kept: such selectors cannot be freed */
     return sel;
 }
 
@@ -435,12 +448,13 @@ static void enter(void)
     ext_end = EXT_MEM;
     rm_sp = RM_STACK - 2;
 
-    code32_sel = make_desc(0xF0000, 0xFFFF, 0xFA, 1);
-    code16_sel = make_desc(0xF0000, 0xFFFF, 0xFA, 0);
+    /* With the table just emptied, these descriptors are always there. */
+    code32_sel = host_desc(0xF0000, 0xFFFF, 0xFA, 1);
+    code16_sel = host_desc(0xF0000, 0xFFFF, 0xFA, 0);
     pm_stack_lin = block_alloc(PM_STACK);
-    stack_sel = make_desc(pm_stack_lin, PM_STACK - 1, 0xF2, 1);
+    stack_sel = host_desc(pm_stack_lin, PM_STACK - 1, 0xF2, 1);
     pm_sp = PM_STACK - 4;
-    rmcb_ss_sel = make_desc(0, 0xFFFF, 0xF2, 0);
+    rmcb_ss_sel = host_desc(0, 0xFFFF, 0xF2, 0);
     uint16_t stubs = client32 ? code32_sel : code16_sel;
     for (int n = 0; n < 256; n++) {
         pm_vec[n].sel = stubs;
@@ -622,6 +636,37 @@ static void fail(uint16_t code)
     set_cf(1);
 }
 
+/* Descriptor i is free now: segment registers holding it become null. */
+static void desc_release(int i)
+{
+    desc[i].used = 0;
+    desc[i].dos_count = 0;
+    for (int s = 0; s < 6; s++)
+        if ((cpu.seg[s] >> 3) == i && (cpu.seg[s] & 0xFFFC) && s != S_CS && s != S_SS)
+            cpu_load_seg(s, 0);
+}
+
+/* The n descriptors from i of a DOS block of paras paragraphs at seg: the
+ * first spans it all, the others a 64 KiB piece each. */
+static void dos_descs(int i, uint16_t seg, uint32_t paras, int n)
+{
+    for (int k = 0; k < n; k++) {
+        uint32_t left = paras * 16 - (uint32_t)k * 0x10000;
+        uint32_t size = k == 0 ? paras * 16 : (left < 0x10000 ? left : 0x10000);
+        desc[i + k].base = ((uint32_t)seg << 4) + (uint32_t)k * 0x10000;
+        desc[i + k].limit = size ? size - 1 : 0;
+        desc[i + k].dos_count = 0;
+    }
+    desc[i].dos_count = (uint8_t)n;
+}
+
+/* The descriptors a DOS block of paras paragraphs takes: one for each 64 KiB. */
+static int dos_desc_count(uint32_t paras)
+{
+    int n = (int)((paras + 0xFFF) / 0x1000);
+    return n ? n : 1;
+}
+
 /* INT 31h 0300h-0302h: run real-mode code with the registers in ES:(E)DI. */
 static void simulate(int fn)
 {
@@ -705,14 +750,17 @@ static void int31(void)
             fail(0x8022);
             return;
         }
-        d->used = 0;
-        for (int s = 0; s < 6; s++)     /* segment registers holding it become null */
-            if (cpu.seg[s] == BX && s != S_CS && s != S_SS)
-                cpu_load_seg(s, 0);
+        desc_release(BX >> 3);
         return;
-    case 0x0002:                        /* real-mode segment to descriptor */
-        AX = seg_selector(BX);
+    case 0x0002: {                      /* real-mode segment to descriptor */
+        uint16_t sel = seg_selector(BX);
+        if (!sel) {
+            fail(0x8011);
+            return;
+        }
+        AX = sel;
         return;
+    }
     case 0x0003:                        /* selector increment */
         AX = 8;
         return;
@@ -725,21 +773,21 @@ static void int31(void)
         DX = (uint16_t)d->base;
         return;
     case 0x0007:                        /* set segment base */
-        if (!(d = desc_of(BX))) {
+        if (!(d = desc_of(BX)) || d->used == 3) {
             fail(0x8022);
             return;
         }
         d->base = (uint32_t)CX << 16 | DX;
         break;
     case 0x0008:                        /* set segment limit */
-        if (!(d = desc_of(BX))) {
+        if (!(d = desc_of(BX)) || d->used == 3) {
             fail(0x8022);
             return;
         }
         d->limit = (uint32_t)CX << 16 | DX;
         break;
     case 0x0009:                        /* set access rights */
-        if (!(d = desc_of(BX))) {
+        if (!(d = desc_of(BX)) || d->used == 3) {
             fail(0x8022);
             return;
         }
@@ -760,6 +808,7 @@ static void int31(void)
         desc[i] = copy;
         desc[i].access = (uint8_t)((copy.access & 0xF0) | 0x02);
         desc[i].used = 1;
+        desc[i].dos_count = 0;
         AX = sel_of(i);
         return;
     }
@@ -775,7 +824,7 @@ static void int31(void)
     }
     case 0x000C: {                      /* set descriptor */
         uint8_t b[8];
-        if (!(d = desc_of(BX))) {
+        if (!(d = desc_of(BX)) || d->used == 3) {
             fail(0x8022);
             return;
         }
@@ -789,58 +838,70 @@ static void int31(void)
             fail(0x8011);
             return;
         }
-        desc[i] = (struct desc){ 0, 0, 0xF2, 0, 1 };
+        desc[i] = (struct desc){ 0, 0, 0xF2, 0, 1, 0 };
         return;
     }
     case 0x0100: {                      /* allocate DOS memory */
         uint16_t seg, largest;
         uint32_t paras = BX;
-        int n = (int)((paras + 0xFFF) / 0x1000);
+        int n = dos_desc_count(paras);
         int err = dos_mem_alloc((uint16_t)paras, &seg, &largest);
         if (err) {
             BX = largest;
             fail((uint16_t)err);
             return;
         }
-        int i = desc_alloc(n ? n : 1);
+        int i = desc_alloc(n);
         if (i < 0) {
             dos_mem_free(seg);
             fail(0x8011);
             return;
         }
-        for (int k = 0; k < (n ? n : 1); k++) {
-            uint32_t left = paras * 16 - (uint32_t)k * 0x10000;
-            desc[i + k].base = ((uint32_t)seg << 4) + (uint32_t)k * 0x10000;
-            desc[i + k].limit = (k == 0 ? paras * 16 : (left < 0x10000 ? left : 0x10000)) - 1;
-        }
+        dos_descs(i, seg, paras, n);
         AX = seg;
         DX = sel_of(i);
         return;
     }
-    case 0x0101:                        /* free DOS memory */
-        if (!(d = desc_of(DX))) {
+    case 0x0101: {                      /* free DOS memory, and the block's descriptors */
+        if (!(d = desc_of(DX)) || d->used != 1 || !d->dos_count) {
             fail(0x8022);
             return;
         }
+        int i = DX >> 3, n = d->dos_count;
         if (dos_mem_free((uint16_t)(d->base >> 4))) {
             fail(9);
             return;
         }
-        d->used = 0;
+        for (int k = 0; k < n; k++)
+            if (desc[i + k].used == 1)
+                desc_release(i + k);
         return;
-    case 0x0102: {                      /* resize DOS memory */
+    }
+    case 0x0102: {                      /* resize DOS memory, and the block's descriptors */
         uint16_t max;
-        if (!(d = desc_of(DX))) {
+        if (!(d = desc_of(DX)) || d->used != 1 || !d->dos_count) {
             fail(0x8022);
             return;
         }
-        int err = dos_mem_resize((uint16_t)(d->base >> 4), BX, &max);
+        int i = DX >> 3, n = d->dos_count, nn = dos_desc_count(BX);
+        for (int k = n; k < nn; k++)    /* a bigger block needs the descriptors after its own */
+            if (i + k >= MAX_DESC || desc[i + k].used) {
+                fail(0x8011);
+                return;
+            }
+        uint16_t seg = (uint16_t)(d->base >> 4);
+        int err = dos_mem_resize(seg, BX, &max);
         if (err) {
             BX = max;
             fail((uint16_t)err);
             return;
         }
-        d->limit = (uint32_t)BX * 16 - 1;
+        for (int k = n; k < nn; k++)
+            desc[i + k] = (struct desc){ 0, 0, d->access, d->big, 1, 0 };
+        for (int k = nn; k < n; k++)
+            if (desc[i + k].used == 1)
+                desc_release(i + k);
+        dos_descs(i, seg, BX, nn);
         return;
     }
     case 0x0200:                        /* get real-mode interrupt vector */

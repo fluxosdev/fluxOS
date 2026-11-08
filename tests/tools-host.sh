@@ -275,12 +275,19 @@ t "$(printf "'a b' c \"d e\" f\\\\ g\n" | xargs printf '<%s>')" sh -c "printf \"
 t "$(printf '' | xargs -r echo x; echo "[$?]")" sh -c "printf '' | $tools/xargs -r echo x; echo \"[\$?]\""
 t "$(printf '' | xargs echo x)" sh -c "printf '' | $tools/xargs echo x"
 t "$(printf '1\n2\n3\n' | xargs false; echo "rc=$?")" sh -c "printf '1\n2\n3\n' | $tools/xargs false; echo rc=\$?"
-t "$(seq 1 5000 | xargs echo | wc -l)" sh -c "seq 1 5000 | $tools/xargs echo | wc -l"
+t "$(seq 1 4000 | xargs echo | wc -l)" sh -c "seq 1 4000 | $tools/xargs echo | wc -l"
+# fluxOS's exec takes at most 4096 argument strings (kernel/core/exec.c): echo and 4095 numbers a run
+t "2" sh -c "seq 1 5000 | $tools/xargs echo | wc -l"
+t "$(seq 1 5000 | xargs echo | tr ' ' '\n' | wc -l)" sh -c "seq 1 5000 | $tools/xargs echo | tr ' ' '\n' | wc -l"
+t "$(printf 'a b\nc d\n\ne\n' | xargs -L 1 echo X)" sh -c "printf 'a b\nc d\n\ne\n' | $tools/xargs -L 1 echo X"
+t "$(printf 'a\nb\nc\n' | xargs -L 2 echo X)" sh -c "printf 'a\nb\nc\n' | $tools/xargs -L 2 echo X"
 t "$(cmp old.txt new.txt; echo "rc=$?")" sh -c "$tools/cmp old.txt new.txt; echo rc=\$?"
 t "$(cmp old.txt old.txt; echo "rc=$?")" sh -c "$tools/cmp old.txt old.txt; echo rc=\$?"
 t "$(cmp -s old.txt new.txt; echo "rc=$?")" sh -c "$tools/cmp -s old.txt new.txt; echo rc=\$?"
-t "$(cmp -l nl1.txt nl2.txt 2>&1; echo "rc=$?")" sh -c "$tools/cmp -l nl1.txt nl2.txt 2>&1; echo rc=\$?"
-t "$(cmp nl1.txt nl2.txt 2>&1; echo "rc=$?")" sh -c "$tools/cmp nl1.txt nl2.txt 2>&1; echo rc=\$?"
+# newer GNU cmp quotes the file names (with curly quotes in a UTF-8 locale); ours does not
+unquote() { sed -e "s/‘//g" -e "s/’//g" -e "s/'//g"; }
+t "$({ cmp -l nl1.txt nl2.txt 2>&1; echo "rc=$?"; } | unquote)" sh -c "$tools/cmp -l nl1.txt nl2.txt 2>&1; echo rc=\$?"
+t "$({ cmp nl1.txt nl2.txt 2>&1; echo "rc=$?"; } | unquote)" sh -c "$tools/cmp nl1.txt nl2.txt 2>&1; echo rc=\$?"
 t "$(printf '%s=%d\n' a 1 b 2)" "$tools/printf" '%s=%d\n' a 1 b 2
 t "$(printf '%5.2f|%-4s|%04x|%o|%c|%%\n' 3.14159 ab 255 8 xyz)" "$tools/printf" '%5.2f|%-4s|%04x|%o|%c|%%\n' 3.14159 ab 255 8 xyz
 t "$(/usr/bin/printf 'tab\there\n')" "$tools/printf" 'tab\there\n'
@@ -367,6 +374,34 @@ if command -v xorriso >/dev/null 2>&1; then
     xorriso -osirrox on -indev t.iso -extract /random.bin iso.random 2>/dev/null && same tree/src/random.bin iso.random "mkiso contents"
     xorriso -indev t.iso -report_el_torito plain 2>/dev/null | grep -q 'boot-info-table' && ok || bad "mkiso El Torito"
 fi
+
+# ---- fixes from the 2026-11 audit ----
+echo aaaa > s2g.txt; t "$(sed 's/a/b/2g' s2g.txt)" "$tools/sed" 's/a/b/2g' s2g.txt
+echo baaac > sem.txt; t "$(sed 's/a*/x/g' sem.txt)" "$tools/sed" 's/a*/x/g' sem.txt
+rm -rf fdel && mkdir -p fdel/sub/deeper fdel/empty && touch fdel/sub/f fdel/sub/deeper/g
+"$tools/find" fdel -delete && [ ! -e fdel ] && ok || bad "find -delete takes the contents first"
+mkdir -p fdel2/e && "$tools/find" fdel2 -name e -delete && [ -d fdel2 ] && [ ! -e fdel2/e ] && ok || bad "find -name e -delete"
+seq 1 5000 | sed 's/^/x/' > many.txt; mkdir -p manyd; (cd manyd && xargs touch < ../many.txt)
+# at most 4096 argument strings an exec: echo and 4095 names, then the rest
+t "2 5000" sh -c "cd manyd && $tools/find . -type f -exec echo {} + > ../many.out; echo \$(wc -l < ../many.out) \$(tr ' ' '\n' < ../many.out | wc -l)"
+t "1" sh -c "$tools/test '!' = x; echo \$?"; t "0" sh -c "$tools/test '(' = '('; echo \$?"
+t "$(printf '[%*d|%-*s]' 5 42 3 a)" "$tools/printf" '[%*d|%-*s]' 5 42 3 a
+"$tools/printf" '%-----------------.*d' -2000000000 5 >/dev/null 2>&1; [ $? -lt 128 ] && ok || bad "printf with long * numbers"
+# patch: -N with one hunk applied already still applies the other; -b keeps the mode; ../ refused
+seq 1 30 > pn.orig; sed -e 's/^5$/five/' -e 's/^25$/twentyfive/' pn.orig > pn.new; diff -u pn.orig pn.new > pn.diff
+sed 's/^5$/five/' pn.orig > pn.t; "$tools/patch" -s -N pn.t < pn.diff; same pn.new pn.t "patch -N with a hunk applied already"
+printf '#!/bin/sh\necho a\n' > pb.sh; chmod 755 pb.sh; printf '#!/bin/sh\necho b\n' > pb2; diff -u pb.sh pb2 > pb.diff
+"$tools/patch" -s -b pb.sh < pb.diff && [ -x pb.sh ] && [ -f pb.sh.orig ] && ok || bad "patch -b keeps the mode"
+mkdir -p pwork && printf 'x\n' > pvictim && printf -- '--- a/../pvictim\n+++ b/../pvictim\n@@ -1 +1 @@\n-x\n+y\n' > pwork/t.diff
+(cd pwork && "$tools/patch" -s -p1 < t.diff >/dev/null 2>&1); [ "$(cat pvictim)" = x ] && ok || bad "patch refuses ../ names"
+# tar: a symbolic link's target longer than 100 bytes survives, and GNU tar reads it
+rm -rf tll && mkdir -p tll/src && ln -s "$(printf 'd%.0s' $(seq 1 150))" tll/src/long && ln -s "$(printf 'e%.0s' $(seq 1 100))" tll/src/l100
+(cd tll && "$tools/tar" -cf a.tar src && mkdir o g && "$tools/tar" -xf a.tar -C o && tar -xf a.tar -C g) &&
+    [ "$(readlink tll/o/src/long)" = "$(readlink tll/src/long)" ] && [ "$(readlink tll/g/src/long)" = "$(readlink tll/src/long)" ] &&
+    [ "$(readlink tll/o/src/l100)" = "$(readlink tll/src/l100)" ] && ok || bad "tar long link targets"
+# mkiso leaves symbolic links out (a loop would never end)
+rm -rf mlt && mkdir -p mlt/d && echo hi > mlt/d/f && ln -s .. mlt/d/up
+"$tools/mkiso" -o mlt.iso mlt 2>/dev/null; [ $? = 1 ] && [ -s mlt.iso ] && ok || bad "mkiso with a symbolic link loop"
 
 # ---- mbcheck: a Multiboot header with a good checksum, one PT_LOAD ----
 printf '\177ELF' > notkernel && if "$tools/mbcheck" -q notkernel 2>/dev/null; then bad "mbcheck accepts junk"; else ok; fi

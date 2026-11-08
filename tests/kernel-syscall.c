@@ -1,9 +1,21 @@
 #include "kernel-test.h"
 #include <sys/mman.h>
 #include "../kernel/core/syscall.c"
+/* (shmat hands proc_map_frames a malloc'd array, which the host compiler takes for unset) */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#include "../kernel/core/shm.c"
+#pragma GCC diagnostic pop
 struct proc *current;
 void *kmalloc(size_t n) { return malloc(n); }
+void *kzalloc(size_t n) { return calloc(1, n); }
 void kfree(void *p) { free(p); }
+/* Shared memory segments: frames are only numbers here, and the screen is mapped when the test says. */
+static uint32_t next_frame = 0x1000, screen_mapped;
+uint32_t pmm_alloc_user(void) { return next_frame += PAGE_SIZE; }
+void pmm_free(uint32_t phys) { (void)phys; }
+void vmm_zero_frame(uint32_t phys) { (void)phys; }
+int vmm_mmio_mapped(uint32_t *pd, uint32_t va) { (void)pd; return va == USER_MMIO_BASE && screen_mapped; }
 static int calls, truncate_error, opens;
 static struct vnode open_vnode = { .type = VN_FILE };
 static struct vnode *resolves_to = &open_vnode;
@@ -49,15 +61,32 @@ static int io_step(const void *buf, uint32_t n)
     int r = io_result[ios++];
     return r == 1 ? (int)n : r;         /* 1: all of it */
 }
+static int io_flags;                    /* the flags of the file the latest transfer was given */
 int file_read(struct file *f, void *buf, uint32_t n)
 {
-    (void)f;
+    io_flags = f->flags;
     int r = io_step(buf, n);
     if (r > 0)
         memset(buf, io_fill, (uint32_t)r);
     return r;
 }
-int file_write(struct file *f, const void *buf, uint32_t n) { (void)f; return io_step(buf, n); }
+int file_write(struct file *f, const void *buf, uint32_t n) { io_flags = f->flags; return io_step(buf, n); }
+static int peeks, peek_nonblock;
+int file_peek(struct file *f, void *buf, uint32_t n, int nonblock)
+{
+    (void)f;
+    peeks++;
+    peek_nonblock = nonblock;
+    int r = io_step(buf, n);
+    if (r > 0)
+        memset(buf, io_fill, (uint32_t)r);
+    return r;
+}
+/* A terminal's node: O_NONBLOCK transfers go to tty.c, which has no input here. */
+static struct vnode tty_vn = { .type = VN_CHR };
+static int tty_calls;
+int tty_io_nonblock(struct vnode *vn, char *buf, uint32_t n, int write)
+{ (void)buf; (void)n; (void)write; tty_calls++; return vn == &tty_vn ? -EAGAIN : -ENOTTY; }
 int sock_sendto(struct socket *s, const void *buf, uint32_t n, int flags, const struct sockaddr_in *to)
 { (void)s; (void)flags; (void)to; return io_step(buf, n); }
 int sock_recvfrom(struct socket *s, void *buf, uint32_t n, int flags, struct sockaddr_in *from)
@@ -84,6 +113,8 @@ int vfs_resolve_parent(const char *path, struct vnode *cwd, struct vnode **out, 
 { (void)path; (void)cwd; (void)out; (void)name; abort(); }
 int vfs_create(struct vnode *dir, const char *name, int type, struct vnode **out)
 { (void)dir; (void)name; (void)type; (void)out; abort(); }
+int vfs_create_file(const char *path, struct vnode *cwd, int excl, struct vnode **out)
+{ (void)path; (void)cwd; (void)excl; (void)out; abort(); }
 struct file *file_open(struct vnode *vn, int flags)
 { (void)vn; (void)flags; opens++; return &open_file; }
 /* Descriptor lookups hold the file until the system call returns
@@ -212,6 +243,68 @@ int main(void)
     CHECK(ended(sys_recvfrom(5, umem + 8, 10, 0, 0)) == -EFAULT && ios == 1);
     hole = 1;
     io_unmaps = 0;
+
+    /* AF_UNIX: MSG_DONTWAIT is this call's alone (the shared file keeps its flags); MSG_PEEK peeks. */
+    struct file uf = { .type = FT_UNIX, .flags = O_RDWR };
+    p.fds[6] = &uf;
+    io_expect(-EAGAIN, 0, 0);
+    CHECK(ended(sys_recvfrom(6, umem, 10, MSG_DONTWAIT, 0)) == -EAGAIN && (io_flags & O_NONBLOCK));
+    CHECK(!(uf.flags & O_NONBLOCK));
+    io_expect(-EAGAIN, 0, 0);
+    CHECK(ended(sys_sendto(6, umem, 10, MSG_DONTWAIT, 0)) == -EAGAIN && (io_flags & O_NONBLOCK));
+    io_expect(1, 0, 0);
+    CHECK(ended(sys_sendto(6, umem, 10, 0, 0)) == 10 && !(io_flags & O_NONBLOCK));
+    io_fill = 'k';
+    io_expect(1, 0, 0);
+    memset(mem, 0, 10);
+    CHECK(ended(sys_recvfrom(6, umem, 10, MSG_PEEK, 0)) == 10 && peeks == 1 && !peek_nonblock &&
+          ios == 1 && mem[9] == 'k');
+    io_expect(-EAGAIN, 0, 0);
+    CHECK(ended(sys_recvfrom(6, umem, 10, MSG_PEEK | MSG_DONTWAIT, 0)) == -EAGAIN && peeks == 2 &&
+          peek_nonblock && !(uf.flags & O_NONBLOCK));
+    hole = umem;                        /* an unmapped buffer: refused before peeking */
+    io_expect(1, 0, 0);
+    CHECK(ended(sys_recvfrom(6, umem + 8, 10, MSG_PEEK, 0)) == -EFAULT && peeks == 2);
+    hole = 1;
+
+    /* A terminal opened O_NONBLOCK does not wait: its device calls cannot see the flag. */
+    struct file tf = { .type = FT_VNODE, .flags = O_RDWR | O_NONBLOCK, .vn = &tty_vn };
+    p.fds[7] = &tf;
+    ios = 0;
+    CHECK(ended(sys_read(7, umem, 10, 0, 0)) == -EAGAIN && ios == 0 && tty_calls == 1);
+    tf.flags = O_RDWR;
+    io_expect(1, 0, 0);
+    CHECK(ended(sys_read(7, umem, 10, 0, 0)) == 10 && ios == 1 && tty_calls == 1);
     CHECK(munmap(mem, 4 * IO_CHUNK) == 0);
-    puts("kernel syscall: ftruncate lengths, open truncation error propagation, clone leak and bounced I/O passed");
+
+    /* SysV segments: SHM_PER_PROC a process; the one with the screen (the desktop) has no limit,
+     * and the others together leave it SHM_RESERVE. Removing one, or the creator's exit, gives it back. */
+    p.pid = 100;
+    int first = sys_shmget(IPC_PRIVATE, 1, 0, 0, 0);
+    CHECK(first >= 0);
+    for (int i = 1; i < SHM_PER_PROC; i++)
+        CHECK(sys_shmget(IPC_PRIVATE, 1, 0, 0, 0) >= 0);
+    CHECK(sys_shmget(IPC_PRIVATE, 1, 0, 0, 0) == -ENOSPC);
+    CHECK(sys_shmctl((uint32_t)first, IPC_RMID, 0, 0, 0) == 0);
+    CHECK(sys_shmget(IPC_PRIVATE, 1, 0, 0, 0) >= 0);
+    int made = SHM_PER_PROC;
+    for (p.pid = 101; p.pid < 120; p.pid++)
+        while (sys_shmget(IPC_PRIVATE, 1, 0, 0, 0) >= 0)
+            made++;
+    CHECK(made == SHM_SEGS - SHM_RESERVE);
+    p.pid = 1000;
+    screen_mapped = 1;
+    for (int i = 0; i < SHM_RESERVE; i++)
+        CHECK(sys_shmget(IPC_PRIVATE, 1, 0, 0, 0) >= 0);
+    CHECK(sys_shmget(IPC_PRIVATE, 1, 0, 0, 0) == -ENOSPC);     /* (the table is full) */
+    screen_mapped = 0;
+    shm_proc_exit(100);
+    p.pid = 200;
+    CHECK(sys_shmget(IPC_PRIVATE, 1, 0, 0, 0) >= 0);
+    for (int pid = 100; pid < 120; pid++)
+        shm_proc_exit(pid);
+    shm_proc_exit(200);
+    shm_proc_exit(1000);
+    p.pid = 0;
+    puts("kernel syscall: ftruncate lengths, open truncation error propagation, clone leak, bounced I/O, AF_UNIX flags, non-blocking terminals and shm limits passed");
 }

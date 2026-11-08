@@ -1839,7 +1839,10 @@ static const char js_dom_eager[] = JS_DOM_SOURCE(
       case "ab": return refs[x.i] = unbytes(x.v).buffer;
       case "sab":return refs[x.i]=g["%sharedImport"](x.v);
       case "ta": {
-        var C=x.t==="DataView"?DataView:g[x.t] || Uint8Array,b=x.b?dec(x.b):unbytes(x.v).buffer;
+        /* Only a real TypedArray or DataView name: never an arbitrary global constructor. */
+        var C=x.t==="DataView"?DataView:/^(Int8|Uint8|Uint8Clamped|Int16|Uint16|Int32|Uint32|Float32|Float64|BigInt64|BigUint64)Array$/.test(x.t)?g[x.t]:null;
+        if(!C)throw cloneError();
+        var b=x.b?dec(x.b):unbytes(x.v).buffer;
         var offset=x.b?x.o:0,n=x.b?x.n:b.byteLength;
         return refs[x.i]=C===DataView?new DataView(b,offset,n):new C(b,offset,n/C.BYTES_PER_ELEMENT);
       }

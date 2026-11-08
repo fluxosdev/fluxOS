@@ -391,7 +391,8 @@ static void paint(HWND h,HDC dc)
         else if(c->kind==LISTVIEW && c->nparts) {
             int left=0;
             for(int j=0;j<c->nparts;j++) {
-                ui_label(dc,j ? item->sub[j]:item->text,(RECT){
+                /* Columns may outnumber the subitems an item keeps. */
+                ui_label(dc,!j ? item->text:j<MAX_SUBITEMS ? item->sub[j]:NULL,(RECT){
                     left+(j ? 4:x),y,left+c->edges[j]-2,r.bottom
                 }
                 ,0x24,fg);

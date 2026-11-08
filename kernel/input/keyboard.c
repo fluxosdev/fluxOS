@@ -65,8 +65,13 @@ static uint8_t leds;
 
 static void kbd_write(uint8_t b)
 {
-    for (int i = 0; i < 100000 && (inb(0x64) & 0x02); i++)
-        ;
+    for (int i = 0; i < 100000; i++) {
+        uint8_t st = inb(0x64);
+        if (st == 0xFF)
+            return;                     /* no i8042 (a USB keyboard's Caps Lock): nothing to wait for */
+        if (!(st & 0x02))
+            break;
+    }
     outb(0x60, b);
 }
 

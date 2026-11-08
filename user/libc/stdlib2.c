@@ -169,6 +169,9 @@ char *mktemp(char *tmpl)
 
 /* ---- realpath: an absolute path without ".", ".." or doubled slashes ---- */
 
+/* Symbolic links are followed as they come: the rest of the path is put
+ * after the link's target and resolved from where the link is (or from "/"
+ * for an absolute target), at most SYMLOOP_MAX of them. */
 char *realpath(const char *path, char *resolved)
 {
     if (!path) {
@@ -179,29 +182,23 @@ char *realpath(const char *path, char *resolved)
         errno = ENOENT;
         return NULL;
     }
-    char work[PATH_MAX];
-    if (path[0] == '/') {
-        if (strlen(path) >= sizeof(work)) {
-            errno = ENAMETOOLONG;
-            return NULL;
-        }
-        strcpy(work, path);
-    } else {
-        if (!getcwd(work, sizeof(work)))
-            return NULL;
-        size_t n = strlen(work);
-        if (n + 1 + strlen(path) >= sizeof(work)) {
-            errno = ENAMETOOLONG;
-            return NULL;
-        }
-        if (n > 1)
-            work[n++] = '/';
-        strcpy(work + n, path);
+    char rest[PATH_MAX], out[PATH_MAX], link[PATH_MAX];
+    if (strlen(path) >= sizeof(rest)) {
+        errno = ENAMETOOLONG;
+        return NULL;
     }
-    char out[PATH_MAX];
-    size_t o = 0;
-    out[o++] = '/';
-    for (char *p = work; *p;) {
+    strcpy(rest, path);
+    size_t o;                           /* out is resolved so far: "/" or no trailing slash */
+    if (path[0] == '/') {
+        out[0] = '/';
+        o = 1;
+    } else {
+        if (!getcwd(out, sizeof(out)))
+            return NULL;
+        o = strlen(out);
+    }
+    int links = 0;
+    for (char *p = rest; *p;) {
         while (*p == '/')
             p++;
         if (!*p)
@@ -216,14 +213,44 @@ char *realpath(const char *path, char *resolved)
             if (o > 1)
                 o--;                    /* the slash too, unless it is the root */
         } else {
+            size_t parent = o;
+            if (o + 1 + len >= sizeof(out)) {
+                errno = ENAMETOOLONG;
+                return NULL;
+            }
             if (o > 1)
                 out[o++] = '/';
             memcpy(out + o, p, len);
             o += len;
             out[o] = 0;
             struct stat st;
-            if (stat(out, &st) < 0)     /* each part must exist */
+            if (lstat(out, &st) < 0)    /* each part must exist */
                 return NULL;
+            if (S_ISLNK(st.st_mode)) {
+                if (++links > SYMLOOP_MAX) {
+                    errno = ELOOP;
+                    return NULL;
+                }
+                ssize_t n = readlink(out, link, sizeof(link) - 1);
+                if (n < 0)
+                    return NULL;
+                if (n == 0) {
+                    errno = ENOENT;
+                    return NULL;
+                }
+                const char *tail = p + len;
+                size_t tlen = strlen(tail);
+                if ((size_t)n + tlen >= sizeof(rest)) {
+                    errno = ENAMETOOLONG;
+                    return NULL;
+                }
+                memmove(rest + n, tail, tlen + 1);
+                memcpy(rest, link, (size_t)n);
+                o = link[0] == '/' ? 1 : parent;
+                out[0] = '/';
+                p = rest;
+                continue;
+            }
             if (end && !S_ISDIR(st.st_mode)) {
                 errno = ENOTDIR;
                 return NULL;

@@ -21,6 +21,11 @@
 #include <unistd.h>
 #include <flux/font.h>
 #include "desktop.h"
+#include "dialog.h"
+
+/* The most a prompt's text field holds: a longer path would come back from it cut short. */
+#define PROMPT_MAX ((int)sizeof(((struct dialog *)0)->edit) - 1)
+_Static_assert(sizeof(((struct dialog *)0)->edit) >= 128, "a prompt holds a file name");
 
 #define ED_W       620
 #define ED_H       420
@@ -103,6 +108,7 @@ struct ed {
     int anchor;                         /* where a mouse selection started */
     int vscroll, hscroll;               /* first visible line, and pixels scrolled left */
     char path[PATH_MAX];                /* "" for an untitled document */
+    char pending[PATH_MAX];             /* Save As: the file a "replace it?" prompt is about */
     int modified, crlf;
     enum action after;                  /* what to do once a pending save is done */
     int focused;
@@ -696,10 +702,25 @@ static int write_all(int fd, const char *p, int n)
     return 0;
 }
 
+/* Write the document to a new file beside path, then put that in path's place: a write that
+ * fails (a full disk) leaves what was there as it was. The file keeps its permissions, and a
+ * symbolic link stays one: what it points to is replaced. */
 static int save_file(struct ed *e, const char *path)
 {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC);
-    int ok = fd >= 0;
+    char real[PATH_MAX], tmp[PATH_MAX];
+    struct stat st;
+    const char *dest = path;
+    if (lstat(path, &st) == 0 && S_ISLNK(st.st_mode) && realpath(path, real))
+        dest = real;
+    int existed = stat(dest, &st) == 0;
+    mode_t mode = existed ? st.st_mode & 07777 : 0644;
+    const char *slash = strrchr(dest, '/');
+    int dirlen = slash ? (int)(slash - dest) + 1 : 0, fd = -1, err = 0;
+    int ok = snprintf(tmp, sizeof(tmp), "%.*s.edit-%d.tmp", dirlen, dest, (int)getpid()) < (int)sizeof(tmp);
+    if (!ok)
+        err = ENAMETOOLONG;
+    else if (!(ok = (fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, mode)) >= 0))
+        err = errno;
     if (ok && e->crlf) {                /* put the CRs back, line by line */
         int start = 0;
         for (int i = 0; ok && i <= e->len; i++) {
@@ -712,12 +733,19 @@ static int save_file(struct ed *e, const char *path)
     } else if (ok) {
         ok = write_all(fd, e->text, e->len) == 0;
     }
-    if (ok)
-        ok = fsync(fd) == 0;
-    int err = errno;
-    if (fd >= 0)
-        close(fd);
+    if (!ok && !err)
+        err = errno ? errno : EIO;      /* the write's */
+    if (ok && existed)
+        fchmod(fd, mode);               /* as it was, whatever the umask */
+    if (ok && fsync(fd) < 0)
+        ok = 0, err = errno;
+    if (fd >= 0 && close(fd) < 0 && ok)
+        ok = 0, err = errno;
+    if (ok && rename(tmp, dest) < 0)
+        ok = 0, err = errno;
     if (!ok) {
+        if (fd >= 0)
+            unlink(tmp);                /* what was there is untouched */
         message("save", base_name(path), err);
         return -1;
     }
@@ -762,15 +790,8 @@ static void open_done(void *ctx, const char *name)
     paint(e);
 }
 
-static void save_as_done(void *ctx, const char *name)
+static void save_as_to(struct ed *e, const char *path)
 {
-    struct ed *e = alive(ctx);
-    char path[PATH_MAX];
-    if (!e)
-        return;
-    resolve(name, path, sizeof(path));
-    if (!strchr(base_name(path), '.') && strlen(path) + 4 < sizeof(path))
-        strcat(path, ".txt");           /* like Notepad: .txt unless you give an extension */
     enum action then = e->after;
     e->after = A_NONE;
     if (save_file(e, path) == 0 && then != A_NONE) {
@@ -778,6 +799,51 @@ static void save_as_done(void *ctx, const char *name)
         return;
     }
     paint(e);
+}
+
+static void replace_yes(void *ctx)
+{
+    struct ed *e = alive(ctx);
+    char path[PATH_MAX];
+    if (!e || !e->pending[0])
+        return;
+    snprintf(path, sizeof(path), "%s", e->pending);
+    e->pending[0] = 0;
+    save_as_to(e, path);
+}
+
+static void save_as_done(void *ctx, const char *name)
+{
+    struct ed *e = alive(ctx);
+    char path[PATH_MAX];
+    struct stat st;
+    if (!e)
+        return;
+    resolve(name, path, sizeof(path));
+    if (!strchr(base_name(path), '.') && strlen(path) + 4 < sizeof(path))
+        strcat(path, ".txt");           /* like Notepad: .txt unless you give an extension */
+    if (strcmp(path, e->path) && stat(path, &st) == 0) {        /* another file: ask first */
+        char msg[NAME_MAX + 64];
+        snprintf(e->pending, sizeof(e->pending), "%s", path);
+        snprintf(msg, sizeof(msg), "%s is there already. Replace it?", base_name(path));
+        ask_yes_no("Save As", ICON_WARNING, msg, replace_yes, e);
+        return;
+    }
+    save_as_to(e, path);
+}
+
+/* What the Save As prompt starts with: the document's path, if the prompt can hold it (cut
+ * short it would name another file), else its name (in the home folder), else untitled.txt. */
+static void save_as_initial(struct ed *e, char *out, size_t size)
+{
+    if (e->path[0] && (int)strlen(e->path) <= PROMPT_MAX)
+        snprintf(out, size, "%s", e->path);
+    else if (e->path[0] && (int)strlen(base_name(e->path)) <= PROMPT_MAX)
+        snprintf(out, size, "%s", base_name(e->path));
+    else
+        resolve("untitled.txt", out, size);
+    if ((int)strlen(out) > PROMPT_MAX)  /* a home folder that long */
+        snprintf(out, size, "untitled.txt");
 }
 
 static void ask_path(struct ed *e, const char *title, const char *initial,
@@ -791,7 +857,7 @@ static void begin_save(struct ed *e, enum action then)
     e->after = then;
     if (!e->path[0]) {
         char initial[PATH_MAX];
-        resolve("untitled.txt", initial, sizeof(initial));
+        save_as_initial(e, initial, sizeof(initial));
         ask_path(e, "Save As", initial, save_as_done);
         return;
     }
@@ -897,10 +963,7 @@ static void run_command(struct ed *e, enum cmd c)
     case C_SAVEAS: {
         e->after = A_NONE;
         char initial[PATH_MAX];
-        if (e->path[0])
-            snprintf(initial, sizeof(initial), "%s", e->path);
-        else
-            resolve("untitled.txt", initial, sizeof(initial));
+        save_as_initial(e, initial, sizeof(initial));
         ask_path(e, "Save As", initial, save_as_done);
         return;
     }

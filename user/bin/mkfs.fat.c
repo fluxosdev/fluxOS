@@ -109,7 +109,10 @@ static int format_fat12(int fd, const char *dev, const struct blkinfo *bi, const
     wr16(sec + 14, 1);                          /* reserved: the boot sector */
     sec[16] = 2;
     wr16(sec + 17, root_entries);
-    wr16(sec + 19, total);
+    if (total <= 0xFFFF)
+        wr16(sec + 19, total);
+    else
+        wr32(sec + 32, total);          /* past 16 bits: the 32-bit count, the 16-bit one 0 */
     sec[21] = (unsigned char)media;
     wr16(sec + 22, fatsz);
     wr16(sec + 24, spt);

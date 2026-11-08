@@ -24,6 +24,7 @@ struct scan_src {
     void (*unget)(void *ctx, int c);
     void *ctx;
     int wide;                           /* %s and %c produce UTF-16 by default */
+    int secure;                         /* scanf_s: %c, %s and %[ take a buffer size after the buffer */
 };
 int crt_vscanf(struct scan_src *in, const void *fmt, int wide_fmt, const uint32_t *args);
 
@@ -49,6 +50,8 @@ struct crt_fd {
     int eof;                            /* a ^Z was seen (text mode) */
     HANDLE handle;                      /* the kernel32 handle it came from, if any */
     int pipe_end;
+    int has_pending;                    /* text mode: a byte read ahead after a CR */
+    char pending;
 };
 extern struct crt_fd crt_fds[CRT_MAX_FDS];
 extern gp_t crt_iob;                    /* the FILE array in guest memory */
@@ -75,6 +78,7 @@ int crt_stream_putc(struct crt_stream *s, int c);
 int crt_stream_getc(struct crt_stream *s);
 int crt_stream_ungetc(struct crt_stream *s, int c);
 int crt_stream_flush(struct crt_stream *s);
+void crt_stream_sync(struct crt_stream *s);    /* the FILE the program sees: its _flag */
 int crt_stream_write(struct crt_stream *s, const void *data, uint32_t n);
 int crt_stream_read(struct crt_stream *s, void *data, uint32_t n);
 int64_t crt_stream_seek(struct crt_stream *s, int64_t off, int whence);

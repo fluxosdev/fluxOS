@@ -1,6 +1,8 @@
 /*
  * DLLs winrun names but does not fill in yet: their tables are empty, so
- * every import from them reaches api_missing_thunk (logged, returns 0).
+ * the DLL itself is found (LoadLibrary and GetModuleHandle succeed) but
+ * every function imported from it is unresolved: a program that imports
+ * one does not start, and GetProcAddress gives NULL.
  */
 #include "win32.h"
 

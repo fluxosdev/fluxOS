@@ -1192,8 +1192,16 @@ static void xhci_init(const struct pci_dev *pci)
         memset(arr, 0, frames * PAGE_SIZE);
         for (int i = 0; i < nscratch; i++) {
             uint32_t pg = pmm_alloc();
-            if (pg)
-                memset((void *)pg, 0, PAGE_SIZE);
+            if (!pg) {                  /* not page 0 for the controller to scribble on */
+                while (i--)
+                    pmm_free((uint32_t)arr[i]);
+                for (uint32_t f = 0; f < frames; f++)
+                    pmm_free((uint32_t)arr + f * PAGE_SIZE);
+                klog("xhci: out of memory\n");
+                x->events = NULL;
+                return;
+            }
+            memset((void *)pg, 0, PAGE_SIZE);
             arr[i] = pg;
         }
         x->dcbaa[0] = (uint32_t)arr;

@@ -483,18 +483,28 @@ const struct usb_driver usbmsc_driver = {
     .disconnect = msc_disconnect,
 };
 
-/* Is a file system mounted from a USB disk (or one of its partitions)?
- * Suspend to RAM lets go of every USB device, which such a disk would not
- * survive. */
+/* Is a USB disk (or one of its partitions) in use: a file system mounted
+ * from it, or its device node open? Suspend to RAM lets go of every USB
+ * device, which such a disk would not survive. */
 int usbmsc_in_use(void)
 {
-    for (int i = 0; i < BLK_MAX_DEVS; i++) {
+    int lock = !vfs_locked();
+    if (lock)
+        vfs_lock();
+    int used = 0;
+    for (int i = 0; i < BLK_MAX_DEVS && !used; i++) {
         struct blockdev *bd = blk_get(i);
-        if (!bd || !bd->fs)
+        if (!bd)
             continue;
         struct blockdev *disk = bd->parent ? bd->parent : bd;
-        if (disk->read == msc_read)
-            return 1;
+        if (disk->read != msc_read)
+            continue;
+        char path[24];
+        struct vnode *vn;
+        snprintf(path, sizeof(path), "/dev/%s", bd->name);
+        used = bd->fs || (vfs_resolve(path, NULL, &vn) == 0 && vn->refs > 0);
     }
-    return 0;
+    if (lock)
+        vfs_unlock();
+    return used;
 }

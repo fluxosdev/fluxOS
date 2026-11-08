@@ -11,6 +11,7 @@
 #include "mm.h"
 #include "net.h"
 #include "pci.h"
+#include "proc.h"
 
 #define ARP_ENTRIES    16
 #define ARP_TTL        (300 * HZ)   /* forget a resolved address after 5 minutes */
@@ -58,9 +59,11 @@ uint32_t csum_pseudo(uint32_t src, uint32_t dst, uint8_t proto, uint32_t len)
 
 static int net_asleep;                  /* suspend to RAM: the card is not to be touched */
 
+/* With net_lock (as everything that sends): one frame at a time, kept off
+ * the interrupt stack, which a wireless card's transmit path needs. */
 static int eth_send(const uint8_t *dst_mac, uint16_t type, const void *payload, uint32_t len)
 {
-    uint8_t frame[ETH_FRAME_MAX];
+    static uint8_t frame[ETH_FRAME_MAX];
     if (!netif.present || net_asleep || len > ETH_MTU)
         return -ENETDOWN;
     struct eth_hdr *eh = (struct eth_hdr *)frame;
@@ -298,7 +301,7 @@ static void loop_tick(void)
 int ip_send(uint32_t src, uint32_t dst, uint8_t proto, const void *hdr, uint32_t hlen,
             const void *data, uint32_t dlen)
 {
-    uint8_t pkt[ETH_MTU];
+    static uint8_t pkt[ETH_MTU];        /* net_lock held, as for eth_send */
     uint32_t len = sizeof(struct ip_hdr) + hlen + dlen;
     if (len > ETH_MTU)
         return -EMSGSIZE;
@@ -386,18 +389,21 @@ static void ip_input(const uint8_t *data, uint32_t len)
     }
     uint32_t dst = ntohl(ip->dst);
     int bcast = is_broadcast(dst);
-    /* Before DHCP has given us an address, accept whatever comes. */
-    if (netif.ip && !ip_is_local(dst) && !bcast)
+    /* Before DHCP has given us an address, its reply may come to the address
+     * on offer: only that. Nothing else for another host is answered. */
+    int foreign = !ip_is_local(dst) && !bcast;
+    if (foreign && netif.ip)
         return;
 
     const uint8_t *payload = data + hlen;
     uint32_t plen = total - hlen;
     switch (ip->proto) {
     case IPPROTO_ICMP:
-        icmp_input(ip, payload, plen);
+        if (!foreign)
+            icmp_input(ip, payload, plen);
         break;
     case IPPROTO_TCP:
-        if (!bcast)
+        if (!bcast && !foreign)
             tcp_input(ntohl(ip->src), dst, payload, plen);
         break;
     case IPPROTO_UDP:
@@ -412,6 +418,8 @@ static void ip_input(const uint8_t *data, uint32_t len)
                     dhcp_input(payload, ulen);
                 break;
             }
+            if (foreign)
+                break;
             /* Nobody listening: tell the sender, unless it was a broadcast. */
             if (!udp_input(ntohl(ip->src), dst, payload, plen) && !bcast)
                 icmp_send_unreachable(ip, total, ICMP_UNREACH_PORT);
@@ -791,17 +799,53 @@ void net_init(void)
     dhcp.timeout = ticks;
 }
 
+/* ---- the link thread ----
+ *
+ * A card's link changes need its PHY, over a management bus whose every
+ * access may wait milliseconds: not in an interrupt, nor holding net_lock.
+ * knetd runs the driver's link_work every 2 s, and soon after its interrupt
+ * handler pokes it. The mutex keeps suspend and resume out meanwhile.
+ */
+static struct mutex link_mutex = MUTEX_INIT("net-link");
+static volatile int link_poked;
+
+void net_link_poke(void)
+{
+    link_poked = 1;
+    wakeup((void *)&link_poked);
+}
+
+static void knetd(void)
+{
+    for (;;) {
+        wait_event_timeout((void *)&link_poked, link_poked, ticks + 2 * HZ);
+        link_poked = 0;
+        mutex_lock(&link_mutex);
+        if (!net_asleep)
+            netif.dev.link_work();
+        mutex_unlock(&link_mutex);
+    }
+}
+
+void net_start(void)
+{
+    if (netif.present && netif.dev.link_work)
+        proc_spawn_kthread("knetd", knetd);
+}
+
 /* ---- suspend to RAM ---- */
 
 void net_suspend(void)
 {
     if (!netif.present)
         return;
+    mutex_lock(&link_mutex);
     spin_lock(&net_lock);
     net_asleep = 1;
     spin_unlock(&net_lock);
     if (netif.dev.suspend)
         netif.dev.suspend();
+    mutex_unlock(&link_mutex);
 }
 
 /* The card back; and a new lease, as the machine may have been carried
@@ -810,6 +854,7 @@ void net_resume(void)
 {
     if (!netif.present)
         return;
+    mutex_lock(&link_mutex);
     if (netif.dev.resume)
         netif.dev.resume();
     spin_lock(&net_lock);
@@ -820,6 +865,7 @@ void net_resume(void)
         dhcp.tries = 0;
     }
     spin_unlock(&net_lock);
+    mutex_unlock(&link_mutex);
 }
 
 int net_configure(const struct netinfo *ni)

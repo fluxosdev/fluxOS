@@ -35,6 +35,7 @@ struct expander {
     struct strvec *out;
     int flags;
     int error;
+    int vglob;              /* sh mode, unquoted: * ? [ in an expansion's value are a pattern */
     struct word w;
 };
 
@@ -99,10 +100,27 @@ static void flush_word(struct expander *e)
 /* Append expansion output; unquoted command substitution (and, in sh mode,
  * parameters) is split on IFS: blanks in IFS separate and collapse, other
  * characters in it each end a field. */
+/* A character of an expansion's value at v: in sh mode, unquoted, a glob character
+ * there is a pattern as POSIX has it (x='*.c'; echo $x), marked like a typed one. */
+static void put_value_char(struct expander *e, const char *v)
+{
+    char c = *v;
+    if (e->vglob && (c == '*' || c == '?' || (c == '[' && v[1] && strchr(v + 2, ']')))) {
+        sb_putc(&e->w.b, c == '*' ? G_STAR : c == '?' ? G_QUEST : G_LBRAK);
+        e->w.glob = 1;
+    } else {
+        sb_putc(&e->w.b, c);
+    }
+}
+
 static void emit_value(struct expander *e, const char *v, int split)
 {
     if (!split) {
-        sb_puts(&e->w.b, v);
+        if (!e->vglob)
+            sb_puts(&e->w.b, v);
+        else
+            for (; *v; v++)
+                put_value_char(e, v);
         return;
     }
     const char *ifs = getenv("IFS");
@@ -113,7 +131,7 @@ static void emit_value(struct expander *e, const char *v, int split)
     int after_sep = 0, at_start = 1;
     for (; *v; v++) {
         if (!strchr(ifs, *v)) {
-            sb_putc(&e->w.b, *v);
+            put_value_char(e, v);
             after_sep = 0;
             at_start = 0;
             continue;
@@ -300,6 +318,7 @@ static int expand_dollar(struct expander *e, const char *raw, int i, int in_dq)
 {
     char buf[32];
     int split = !in_dq && !(e->flags & EXP_NOSPLIT);
+    e->vglob = sh.posix && !in_dq && !(e->flags & EXP_NOGLOB);
     i++;
 
     if (raw[i] == '(' && raw[i + 1] == '(') {
@@ -415,6 +434,7 @@ static int expand_backquote(struct expander *e, const char *raw, int i, int in_d
     }
     char *c = sb_take(&cmd);
     char *outp = capture_output(c);
+    e->vglob = sh.posix && !in_dq && !(e->flags & EXP_NOGLOB);
     size_t n = strlen(outp);
     while (n && outp[n - 1] == '\n')
         outp[--n] = 0;
@@ -569,7 +589,7 @@ int expand_word(const char *raw, struct strvec *out, int flags)
 
 static int expand_one(const char *raw, struct strvec *out, int flags)
 {
-    struct expander e = { out, flags, 0, { { NULL, 0, 0 }, 0, 0 } };
+    struct expander e = { out, flags, 0, 0, { { NULL, 0, 0 }, 0, 0 } };
     int i = 0, in_dq = 0;
     int heredoc = flags & EXP_HEREDOC;  /* quotes are literal; only $ ` \ and newline escape */
     word_reset(&e.w);

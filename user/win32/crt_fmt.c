@@ -723,6 +723,8 @@ int crt_vscanf(struct scan_src *in, const void *vfmt, int wide_fmt, const uint32
             if (size == 1) wide = 0;
             int n = width ? width : 1;
             void *dst = suppress ? NULL : GP(args[ai++]);
+            if (dst && in->secure && (uint32_t)n > args[ai++])
+                return assigned;        /* does not fit: as the _s functions fail */
             for (int k = 0; k < n; k++) {
                 int ch = sget(in);
                 if (ch < 0)
@@ -765,10 +767,18 @@ int crt_vscanf(struct scan_src *in, const void *vfmt, int wide_fmt, const uint32
                 sunget(in, ch);
             }
             void *dst = suppress ? NULL : GP(args[ai++]);
+            uint32_t room = dst && in->secure ? args[ai++] : 0xFFFFFFFFu;   /* elements, with the NUL */
+            if (!room)
+                return assigned;
             int n = 0, ch;
             while ((!width || n < width) && (ch = sget(in)) >= 0) {
                 int ok = use_set ? ((ch < 256 ? set[ch] : 0) != negate) : !is_space_c(ch);
                 if (!ok) { sunget(in, ch); break; }
+                if ((uint32_t)n + 1 >= room) {      /* no room for it and the NUL */
+                    sunget(in, ch);
+                    if (wide) *(uint16_t *)dst = 0; else *(char *)dst = 0;
+                    return assigned;
+                }
                 consumed++;
                 if (dst) {
                     if (wide) ((uint16_t *)dst)[n] = (uint16_t)ch;

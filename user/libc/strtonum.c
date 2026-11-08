@@ -217,7 +217,7 @@ static long double scale10(int e)
 /* Compare the decimal with mm * 2^em: -1, 0, 1, or 2 if too big to tell. */
 static int compare_exact(const struct decimal *d, uint64_t mm, int em)
 {
-    static struct bn a, b;              /* 3 KiB each: off the stack */
+    struct bn a, b;                     /* 1.6 KiB each, on the caller's stack: threads convert at once */
     a.n = 0;
     for (int i = 0; i < d->n; i++)
         if (bn_muladd(&a, 10, (uint32_t)d->dig[i]) < 0)
@@ -412,7 +412,7 @@ static long double parse(const char *s, char **end, int kind, int *nonzero)
     }
 
     /* decimal */
-    static struct decimal d;
+    struct decimal d;                   /* on the stack, not static: strtod is called from several threads */
     d.n = 0;
     d.exp10 = 0;
     int any = 0, sticky = 0, dot = 0;

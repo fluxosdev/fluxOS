@@ -67,6 +67,8 @@ int pci_irq(const struct pci_dev *p);
  * NULL if the BAR is not memory or lies out of reach. Boot time only.
  */
 void *pci_map_bar(const struct pci_dev *p, int bar);
+/* Give back what pci_map_bar() mapped (a driver that rejects the device); boot time only. */
+void pci_unmap_bar(void *regs);
 
 /* Suspend to RAM: every function's configuration, kept and put back. */
 void pci_suspend(void);

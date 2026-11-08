@@ -7,7 +7,8 @@
  * FILE, -mtime [+-]N, -size [+-]N[ckM], -empty, -true, -false; actions:
  * -print (the default), -print0, -prune, -delete, -exec cmd {} \; and
  * -exec cmd {} +, -ok; joined with -a (or nothing), -o, ! or -not and
- * \( \). -maxdepth N and -mindepth N come first. Symbolic links are not
+ * \( \). -maxdepth N and -mindepth N come first; -depth (which -delete
+ * implies) takes a directory after its contents. Symbolic links are not
  * followed (-L does).
  */
 #include <dirent.h>
@@ -37,7 +38,7 @@ struct expr {
     struct expr *a, *b;
 };
 
-static int status, follow, maxdepth = -1, mindepth, pruned, has_action;
+static int status, follow, maxdepth = -1, mindepth, pruned, has_action, depth_first;
 static time_t now;
 static const char *prog = "find";
 
@@ -128,7 +129,8 @@ static struct expr *parse_primary(char **argv, int *i, int argc)
     if (!strcmp(t, "-print")) { has_action = 1; return node(X_PRINT); }
     if (!strcmp(t, "-print0")) { has_action = 1; return node(X_PRINT0); }
     if (!strcmp(t, "-prune")) return node(X_PRUNE);
-    if (!strcmp(t, "-delete")) { has_action = 1; return node(X_DELETE); }
+    if (!strcmp(t, "-delete")) { has_action = depth_first = 1; return node(X_DELETE); }     /* contents first */
+    if (!strcmp(t, "-depth")) { depth_first = 1; return node(X_TRUE); }
     if (!strcmp(t, "-exec") || !strcmp(t, "-ok") || !strcmp(t, "-execdir")) {
         has_action = 1;
         e = node(X_EXEC);
@@ -183,6 +185,8 @@ static struct expr *parse_or(char **argv, int *i, int argc)
 }
 
 /* ---- -exec ... {} + collects paths and runs the command in batches ---- */
+
+#define MAX_EXEC_ARGS 4096              /* the kernel's limit on argv strings (MAX_ARGS in kernel/core/exec.c) */
 
 struct batch {
     struct expr *e;
@@ -251,7 +255,8 @@ static void add_to_batch(struct expr *e, const char *path)
     }
     b->args[b->n++] = strdup(path);
     b->bytes += strlen(path) + 1;
-    if (b->bytes > 65536 || b->n >= 4096)
+    /* the kernel takes at most MAX_EXEC_ARGS strings, the command's own included */
+    if (b->bytes > 65536 || b->e->argc + b->n >= MAX_EXEC_ARGS)
         flush_batch(b);
 }
 
@@ -329,6 +334,8 @@ static int eval(struct expr *e, const char *path, const char *name, const struct
     case X_PRINT0: fputs(path, stdout); putchar(0); return 1;
     case X_PRUNE: pruned = 1; return 1;
     case X_DELETE:
+        if (!strcmp(path, "."))
+            return 1;                   /* the starting directory stays, as in GNU find */
         if ((S_ISDIR(st->st_mode) ? rmdir(path) : unlink(path)) < 0) {
             fprintf(stderr, "find: cannot delete '%s': %s\n", path, strerror(errno));
             status = 1;
@@ -349,6 +356,8 @@ static int cmp_name(const void *a, const void *b)
     return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
+static void walk_dir(const char *path, struct expr *e, int depth);
+
 static void walk(const char *path, struct expr *e, int depth)
 {
     struct stat st;
@@ -363,12 +372,17 @@ static void walk(const char *path, struct expr *e, int depth)
         name = "/";
     pruned = 0;
     int is_dir = S_ISDIR(st.st_mode);
-    int delete_dir = 0;
-    if (depth >= mindepth)
+    /* -depth (and -delete): a directory after what is in it */
+    if (!depth_first && depth >= mindepth)
         eval(e, path, name, &st, depth);
-    if (!is_dir || pruned || (maxdepth >= 0 && depth >= maxdepth))
-        return;
-    (void)delete_dir;
+    if (is_dir && !pruned && !(maxdepth >= 0 && depth >= maxdepth))
+        walk_dir(path, e, depth);
+    if (depth_first && depth >= mindepth)
+        eval(e, path, name, &st, depth);
+}
+
+static void walk_dir(const char *path, struct expr *e, int depth)
+{
     DIR *d = opendir(path);
     if (!d) {
         fprintf(stderr, "find: '%s': %s\n", path, strerror(errno));

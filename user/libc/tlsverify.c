@@ -57,7 +57,7 @@ static int load_roots(void)
     mbedtls_x509_crt_init(&roots);
     int rc = got == n ? mbedtls_x509_crt_parse(&roots, buf, n + 1) : -1;
     free(buf);
-    if (rc != 0) {
+    if (rc < 0 || !roots.raw.len) {    /* > 0: that many could not be parsed, the rest are good */
         mbedtls_x509_crt_free(&roots);
         return -1;
     }

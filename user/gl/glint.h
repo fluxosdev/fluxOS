@@ -397,4 +397,11 @@ static inline float gl_clampf(float f)
     return f < 0 ? 0 : f > 1 ? 1 : f;
 }
 
+/* n x m items of size bytes can be counted in a size_t (32 bits here): a
+ * size worked out from the program's numbers must not wrap. */
+static inline int gl_size_ok(size_t n, size_t m, size_t size)
+{
+    return !n || !m || n <= (size_t)-1 / size / m;
+}
+
 #endif

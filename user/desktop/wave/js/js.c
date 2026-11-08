@@ -670,13 +670,15 @@ int js_index(jsval key, uint32_t *out)
         const struct jsstr *s = key.u.s;
         if (!s->len || s->len > 10 || (s->len > 1 && s->s[0] == '0'))
             return 0;
-        uint32_t v = 0;
+        uint64_t v = 0;
         for (int i = 0; i < s->len; i++) {
             if (s->s[i] < '0' || s->s[i] > '9')
                 return 0;
-            v = v * 10 + (uint32_t)(s->s[i] - '0');
+            v = v * 10 + (uint64_t)(s->s[i] - '0');
         }
-        *out = v;
+        if (v > 4294967294u)                    /* indices are below 2^32 - 1 */
+            return 0;
+        *out = (uint32_t)v;
         return 1;
     }
     return 0;
@@ -975,6 +977,50 @@ int js_array_set_len(struct js *J, struct jsobj *a, int len)
     return 0;
 }
 
+#define ARRAY_DENSE (1u << 24)          /* elements past this are kept as properties */
+
+/* a[i] = v (key: i as a string, or NULL). Up to ARRAY_DENSE the items grow to
+ * take it; past that it is an ordinary property, and an array's length follows. */
+static void array_store(struct js *J, struct jsobj *a, uint32_t i, struct jsstr *key, jsval v)
+{
+    if (i < (uint32_t)a->len) {
+        a->items[i] = v;
+        return;
+    }
+    if (i < ARRAY_DENSE) {
+        js_array_set_len(J, a, (int)i + 1);
+        a->items[i] = v;
+        return;
+    }
+    if (!key) {
+        char b[16];
+        snprintf(b, sizeof(b), "%u", (unsigned)i);
+        key = js_mkstr(J, b, (int)strlen(b));
+    }
+    js_put(J, a, key, v, 0);
+    if (a->cls == C_ARRAY && i + 1 > a->splen)
+        a->splen = i + 1;
+}
+
+/* a.length = d: -1 if d is not a valid length. Elements at or past it go. */
+static int array_set_length(struct js *J, struct jsobj *a, double d)
+{
+    if (!(d >= 0) || d != floor(d) || d > 4294967295.0 || (d > ARRAY_DENSE && a->cls != C_ARRAY))
+        return -1;
+    uint32_t n = (uint32_t)d, k;
+    if (a->splen > n) {
+        for (uint32_t i = a->nprops; i-- > 0;)
+            if (js_index(strv(a->props[i].key), &k) && k >= n)
+                prop_remove(J, a, i);
+        a->splen = n > (uint32_t)a->len ? n : 0;
+    }
+    if (n <= ARRAY_DENSE)
+        js_array_set_len(J, a, (int)n);
+    else
+        a->splen = n;
+    return 0;
+}
+
 void js_array_push(struct js *J, struct jsobj *a, jsval v)
 {
     array_reserve(J, a, a->len + 1);
@@ -1024,7 +1070,7 @@ static int obj_get(struct js *J, struct jsobj *o, struct jsstr *key, jsval self,
         if (x->phandler)
             return proxy_get(J, x, key, self, out);
         if ((x->cls == C_ARRAY || x->cls == C_ARGUMENTS) && str_is(key, "length")) {
-            *out = js_num(x->len);
+            *out = js_num(js_array_length(x));
             return 1;
         }
         if (x->cls == C_HOST && x->hcls->get && x->hcls->get(J, x, key->s, out))
@@ -1118,7 +1164,7 @@ jsval js_getv(struct js *J, jsval obj, jsval key)
 {
     uint32_t i;
     if (obj.t == JS_OBJ && (obj.u.o->cls == C_ARRAY || obj.u.o->cls == C_ARGUMENTS) &&
-        js_index(key, &i)) {
+        js_index(key, &i) && (i < (uint32_t)obj.u.o->len || i < ARRAY_DENSE || !obj.u.o->nprops)) {
         struct jsobj *a = obj.u.o;
         return i < (uint32_t)a->len ? a->items[i] : js_undefined;
     }
@@ -1156,16 +1202,12 @@ static void obj_set(struct js *J, struct jsobj *o, struct jsstr *key, jsval v, j
     if (o->cls == C_ARRAY || o->cls == C_ARGUMENTS) {
         uint32_t i;
         if (js_index(strv(key), &i)) {
-            if (i >= (uint32_t)o->len && js_array_set_len(J, o, (int)i + 1) < 0) {
-                js_throw_error(J, "RangeError: array too large");
-                return;
-            }
-            o->items[i] = v;
+            array_store(J, o, i, key, v);
             return;
         }
         if (str_is(key, "length")) {
             double d = js_to_number(J, v);
-            if (d < 0 || d != floor(d) || js_array_set_len(J, o, (int)d) < 0)
+            if (!J->throwing && array_set_length(J, o, d) < 0)
                 js_throw_error(J, "RangeError: invalid array length");
             return;
         }
@@ -1205,11 +1247,7 @@ void js_setv(struct js *J, jsval obj, jsval key, jsval v)
     uint32_t i;
     struct jsobj *o = obj.u.o;
     if ((o->cls == C_ARRAY || o->cls == C_ARGUMENTS) && key.t == JS_NUM && js_index(key, &i)) {
-        if (i >= (uint32_t)o->len && js_array_set_len(J, o, (int)i + 1) < 0) {
-            js_throw_error(J, "RangeError: array too large");
-            return;
-        }
-        o->items[i] = v;
+        array_store(J, o, i, NULL, v);
         return;
     }
     if (o->cls == C_HOST && key.t == JS_NUM && js_index(key, &i) && js_typed_set_index(J, o, i, v))
@@ -1271,9 +1309,8 @@ int js_delete(struct js *J, jsval obj, struct jsstr *key)
         }
         return !J->throwing && js_delete(J, js_obj(o->ptarget), key);
     }
-    if ((o->cls == C_ARRAY || o->cls == C_ARGUMENTS) && js_index(strv(key), &i)) {
-        if (i < (uint32_t)o->len)
-            o->items[i] = js_undefined;
+    if ((o->cls == C_ARRAY || o->cls == C_ARGUMENTS) && js_index(strv(key), &i) && i < (uint32_t)o->len) {
+        o->items[i] = js_undefined;
         return 1;
     }
     int at = own_index(J, o, key);
@@ -1300,6 +1337,26 @@ int js_own_symbols(struct js *J, jsval obj, struct jsstr ***out)
             keys[n++] = p->key;
     }
     return n;
+}
+
+/* js_keys' keys so far, as an open addressing table (cap a power of two), so that
+ * telling whether a key is already there does not cost a pass over them all. */
+static int keyset_put(struct jsstr **tab, uint32_t cap, struct jsstr *k)
+{
+    uint32_t i = js_str_hash(k) & (cap - 1);
+    for (; tab[i]; i = (i + 1) & (cap - 1))
+        if (key_eq(tab[i], k))
+            return 0;
+    tab[i] = k;
+    return 1;
+}
+
+static int key_index_cmp(const void *a, const void *b)
+{
+    uint32_t x = 0, y = 0;
+    js_index(strv(*(struct jsstr *const *)a), &x);
+    js_index(strv(*(struct jsstr *const *)b), &y);
+    return x < y ? -1 : x > y;
 }
 
 int js_keys(struct js *J, jsval obj, int inherited, struct jsstr ***out)
@@ -1349,6 +1406,8 @@ int js_keys(struct js *J, jsval obj, int inherited, struct jsstr ***out)
         }
         return js_keys(J, tgt, inherited, out);
     }
+    struct jsstr **seen = NULL;
+    uint32_t seencap = 0;
     for (struct jsobj *x = obj.u.o; x; x = inherited ? x->proto : NULL) {
         int typedlen = js_typed_length(js_obj(x));
         int count = (x->cls == C_ARRAY || x->cls == C_ARGUMENTS) ? x->len : typedlen > 0 ? typedlen : 0;
@@ -1360,20 +1419,24 @@ int js_keys(struct js *J, jsval obj, int inherited, struct jsstr ***out)
             memcpy(nk, keys, sizeof(*nk) * (size_t)n);
             keys = nk;
         }
+        if ((uint32_t)cap * 2 > seencap) {      /* room for every key at half load */
+            seencap = (uint32_t)cap * 2;
+            seen = js_alloc(J, sizeof(*seen) * seencap);
+            for (int i = 0; i < n; i++)
+                keyset_put(seen, seencap, keys[i]);
+        }
         if (x->cls == C_ARRAY || x->cls == C_ARGUMENTS || typedlen >= 0)
             for (int i = 0, len = typedlen >= 0 ? typedlen : x->len; i < len; i++) {
                 char b[16];
                 snprintf(b, sizeof(b), "%d", i);
-                keys[n++] = js_mkstr(J, b, (int)strlen(b));
+                keys[n] = js_mkstr(J, b, (int)strlen(b));
+                keyset_put(seen, seencap, keys[n++]);
             }
         for (uint32_t pi = 0; pi < x->nprops; pi++) {
             struct prop *p = &x->props[pi];
             if (p->hidden || js_is_symkey(p->key) || (p->key->len > 1 && p->key->s[0] == '#'))
                 continue;                       /* not enumerable, a symbol, or "#..." private */
-            int dup = 0;
-            for (int i = 0; i < n && !dup; i++)
-                dup = str_eq(keys[i], p->key);
-            if (!dup)
+            if (keyset_put(seen, seencap, p->key))
                 keys[n++] = p->key;
         }
     }
@@ -1392,21 +1455,12 @@ int js_keys(struct js *J, jsval obj, int inherited, struct jsstr ***out)
     if (nint && !ordered) {
         struct jsstr **sorted = js_alloc(J, sizeof(*sorted) * (size_t)(n ? n : 1));
         int k = 0;
-        for (int i = 0; i < n; i++) {           /* integer keys, by insertion sort */
+        for (int i = 0; i < n; i++) {           /* integer keys (each once), sorted */
             uint32_t v;
-            if (!js_index(strv(keys[i]), &v))
-                continue;
-            int j = k++;
-            while (j > 0) {
-                uint32_t pv;
-                js_index(strv(sorted[j - 1]), &pv);
-                if (pv <= v)
-                    break;
-                sorted[j] = sorted[j - 1];
-                j--;
-            }
-            sorted[j] = keys[i];
+            if (js_index(strv(keys[i]), &v))
+                sorted[k++] = keys[i];
         }
+        qsort(sorted, (size_t)k, sizeof(*sorted), key_index_cmp);
         for (int i = 0; i < n; i++) {
             uint32_t v;
             if (!js_index(strv(keys[i]), &v))
@@ -2046,6 +2100,7 @@ struct ast {
 };
 
 #define F_OPTIONAL 1                    /* ?. */
+#define F_PAREN    128                  /* a member, index or call in parentheses: it ends an optional chain */
 #define F_ARROW    1                    /* functions */
 #define F_REST     2                    /* the last parameter is ...rest */
 #define F_SCOPED   1                    /* blocks with let, const or functions */
@@ -2752,6 +2807,8 @@ static struct ast *primary(struct parser *P)
             n = expression(P);
             if (n && !expect(P, ")"))
                 n = NULL;
+            if (n && (n->kind == N_MEMBER || n->kind == N_INDEX || n->kind == N_CALL))
+                n->flags |= F_PAREN;    /* (a?.b).c reads c of undefined */
         } else if (accept(P, "[")) {
             n = array_literal(P);
         } else if (accept(P, "{")) {
@@ -4102,16 +4159,25 @@ static jsval run_user_untraced(struct js *J, struct jsobj *f, jsval self, jsval 
     return J->throwing ? js_undefined : result;
 }
 
+/* A bound function's arguments: the stored ones, then the call's, in buf if they fit. */
+static jsval *bound_args(struct js *J, struct jsobj *f, jsval *args, int argc, jsval *buf, int nbuf, int *n)
+{
+    *n = f->nbound + argc;
+    jsval *all = *n <= nbuf ? buf : js_alloc(J, sizeof(jsval) * (size_t)*n);
+    if (f->nbound)
+        memcpy(all, f->bound_args, sizeof(jsval) * (size_t)f->nbound);
+    if (argc)
+        memcpy(all + f->nbound, args, sizeof(jsval) * (size_t)argc);
+    return all;
+}
+
 /* A bound function: the stored arguments, then the call's. Kept out of line: its
  * buffer would otherwise make every call's stack frame big. */
 static __attribute__((noinline)) jsval call_bound(struct js *J, struct jsobj *f, jsval *args, int argc)
 {
-    jsval all[64];
-    int n = 0;
-    for (int i = 0; i < f->nbound && n < 64; i++)
-        all[n++] = f->bound_args[i];
-    for (int i = 0; i < argc && n < 64; i++)
-        all[n++] = args[i];
+    jsval buf[64];
+    int n;
+    jsval *all = bound_args(J, f, args, argc, buf, 64, &n);
     int chain = f->bound->bound != NULL;     /* a bound bound function counts as a call */
     if (chain && ++J->depth > JS_MAX_DEPTH) {
         J->depth--;
@@ -4206,12 +4272,9 @@ static jsval construct_impl(struct js *J, jsval fv, jsval *args, int argc)
         return J->throwing?js_undefined:construct_impl(J,js_obj(f->ptarget),args,argc);
     }
     if (f->bound) {                             /* new (F.bind(null, a))(b): a, b */
-        jsval all[64];
-        int n = 0;
-        for (int i = 0; i < f->nbound && n < 64; i++)
-            all[n++] = f->bound_args[i];
-        for (int i = 0; i < argc && n < 64; i++)
-            all[n++] = args[i];
+        jsval buf[64];
+        int n;
+        jsval *all = bound_args(J, f, args, argc, buf, 64, &n);
         int chain = f->bound->bound != NULL;
         if (chain && ++J->depth > JS_MAX_DEPTH) {
             J->depth--;
@@ -4502,10 +4565,21 @@ int js_iter_next(struct js *J, struct iter *it, jsval *out)
 {
     switch (it->kind) {
     case IT_ARRAY:
-        if (it->i >= it->arr->len)
+        if (it->i < it->arr->len) {
+            *out = it->arr->items[it->i++];
+            return 1;
+        }
+        /* past the items: an array's elements beyond the dense limit, to its length */
+        if (it->arr->splen <= (uint32_t)it->i || it->i == 0x7FFFFFFF)
             return 0;
-        *out = it->arr->items[it->i++];
-        return 1;
+        if ((uint32_t)it->i < ARRAY_DENSE) {      /* the gap below them holds nothing */
+            it->i++;
+            *out = js_undefined;
+            return 1;
+        }
+        step(J);
+        *out = js_getv(J, js_obj(it->arr), js_num(it->i++));
+        return J->throwing ? -1 : 1;
     case IT_STR: {
         if (it->sp >= it->send)
             return 0;

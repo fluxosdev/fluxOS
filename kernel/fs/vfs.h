@@ -81,6 +81,7 @@ int vfs_resolve(const char *path, struct vnode *cwd, struct vnode **out);     /*
 int vfs_resolve_parent(const char *path, struct vnode *cwd,
                        struct vnode **parent, char *name);
 int vfs_create(struct vnode *dir, const char *name, int type, struct vnode **out);
+int vfs_create_file(const char *path, struct vnode *cwd, int excl, struct vnode **out);
 int vfs_mkdir(const char *path, struct vnode *cwd);
 int vfs_mkdir_p(const char *path, struct vnode **out);
 int vfs_unlink(const char *path, struct vnode *cwd);
@@ -101,7 +102,7 @@ int vfs_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n);
 int vfs_truncate(struct vnode *vn, uint32_t size);
 int vfs_utime(const char *path, struct vnode *cwd, uint32_t mtime);
 void vfs_stat(struct vnode *vn, struct stat *st);
-int vfs_dirent(struct vnode *dir, uint32_t index, struct dirent *de);
+int vfs_dirent(struct vnode *dir, uint32_t index, const char *after, struct dirent *de);
 int vfs_getpath(struct vnode *vn, char *buf, uint32_t size);
 
 /* ---- open file descriptions ---- */
@@ -128,6 +129,9 @@ struct file {
     struct socket *sock;
     struct unix_sock *usock;    /* FT_UNIX */
     struct readcache_stream read_stream;
+    /* getdents: the name of the entry returned last, while off is still dir_off */
+    char *dir_after;
+    uint64_t dir_off;
 };
 
 struct file *file_open(struct vnode *vn, int flags);
@@ -135,6 +139,7 @@ struct file *file_socket(struct socket *s);
 struct file *file_dup(struct file *f);
 void file_close(struct file *f);
 int file_read(struct file *f, void *buf, uint32_t n);
+int file_peek(struct file *f, void *buf, uint32_t n, int nonblock);    /* FT_UNIX only */
 int file_write(struct file *f, const void *buf, uint32_t n);
 int pipe_create(struct file **rd, struct file **wr);
 

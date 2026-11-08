@@ -1,11 +1,13 @@
 /*
  * Minimal vsnprintf shared by the kernel (kprintf) and libc (printf).
- * Supports: %d %i %u %x %X %o %c %s %p %% with flags '-', '0', '+', ' ',
- * width and precision (both may be '*'), and the l/ll/h/z modifiers
- * (all treated as 32-bit). No floating point.
+ * Supports: %d %i %u %x %X %o %c %s %p %n %% with flags '-', '0', '+', ' ',
+ * width and precision (both may be '*'), and the hh/h/l/ll/j/z/t
+ * modifiers. No floating point: %f %e %g %a take their argument and are
+ * printed as written.
  */
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -26,6 +28,25 @@ static void emit_pad(struct out *o, char c, int n)
 {
     while (n-- > 0)
         emit(o, c);
+}
+
+/* *v / base, returning the remainder, without the 64-bit division libgcc would have to provide. */
+static unsigned int divmod(unsigned long long *v, unsigned int base)
+{
+    if (!(*v >> 32)) {
+        unsigned int x = (unsigned int)*v;
+        *v = x / base;
+        return x % base;
+    }
+    unsigned long long q = 0;
+    unsigned int r = 0;
+    for (int i = 48; i >= 0; i -= 16) {             /* r < base <= 16: each step fits 32 bits */
+        unsigned int cur = r << 16 | (unsigned int)(*v >> i & 0xFFFF);
+        q |= (unsigned long long)(cur / base) << i;
+        r = cur % base;
+    }
+    *v = q;
+    return r;
 }
 
 int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
@@ -75,10 +96,17 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
             }
         }
 
-        while (*fmt == 'l' || *fmt == 'h' || *fmt == 'z')
-            fmt++;
+        int lng = 0, half = 0;          /* lng: 1 long (and size_t), 2 long long; half: 1 short, 2 char */
+        for (;; fmt++) {
+            if (*fmt == 'l') lng++;
+            else if (*fmt == 'h') half++;
+            else if (*fmt == 'z' || *fmt == 't') lng = 1;
+            else if (*fmt == 'j' || *fmt == 'q' || *fmt == 'L') lng = 2;
+            else break;
+        }
 
-        char tmp[16];
+        char tmp[24];                   /* a 64-bit number in octal is 22 digits */
+        int zeros = 0;                  /* the precision's leading zeros */
         const char *s = tmp;
         int slen = 0;
         const char *prefix = "";
@@ -100,11 +128,27 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
             tmp[0] = '%';
             slen = 1;
             break;
+        case 'n':
+            if (lng >= 2) *va_arg(ap, long long *) = (long long)o.len;
+            else if (lng) *va_arg(ap, long *) = (long)o.len;
+            else if (half == 1) *va_arg(ap, short *) = (short)o.len;
+            else if (half >= 2) *va_arg(ap, signed char *) = (signed char)o.len;
+            else *va_arg(ap, int *) = (int)o.len;
+            continue;
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A':
+            if (lng == 2)               /* (the L of long double) */
+                (void)va_arg(ap, long double);
+            else
+                (void)va_arg(ap, double);
+            emit(&o, '%');
+            emit(&o, *fmt);
+            continue;
         case 'p':
             alt = 1;
             zero = 1;
             if (width < 10)
                 width = 10;
+            lng = sizeof(void *) > sizeof(int) ? 1 : 0;
             /* fallthrough */
         case 'x':
             base = 16;
@@ -122,25 +166,29 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
             /* fallthrough */
         case 'u':
         number: {
-            unsigned int v;
+            unsigned long long v;
             int neg = 0;
             if (is_signed) {
-                int sv = va_arg(ap, int);
+                long long sv = lng >= 2 ? va_arg(ap, long long) : lng ? va_arg(ap, long) : va_arg(ap, int);
+                if (!lng && half)
+                    sv = half == 1 ? (short)sv : (signed char)sv;
                 neg = sv < 0;
-                v = neg ? 0u - (unsigned int)sv : (unsigned int)sv;
+                v = neg ? 0ull - (unsigned long long)sv : (unsigned long long)sv;
             } else {
-                v = va_arg(ap, unsigned int);
+                v = lng >= 2 ? va_arg(ap, unsigned long long) : lng ? va_arg(ap, unsigned long)
+                                                                    : va_arg(ap, unsigned int);
+                if (!lng && half)
+                    v = half == 1 ? (unsigned short)v : (unsigned char)v;
             }
             const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
             char *p = tmp + sizeof(tmp);
             do {
-                *--p = digits[v % base];
-                v /= base;
+                *--p = digits[divmod(&v, base)];
             } while (v);
-            while (prec > 0 && (tmp + sizeof(tmp) - p) < prec)
-                *--p = '0';
             s = p;
             slen = (int)(tmp + sizeof(tmp) - p);
+            if (prec > slen)
+                zeros = prec - slen;
             if (neg) prefix = "-";
             else if (is_signed && plus) prefix = "+";
             else if (is_signed && space) prefix = " ";
@@ -157,13 +205,14 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
         }
 
         int plen = (int)strlen(prefix);
-        int pad = width - slen - plen;
+        int pad = width - slen - zeros - plen;
         if (!left && !zero)
             emit_pad(&o, ' ', pad);
         for (const char *q = prefix; *q; q++)
             emit(&o, *q);
         if (!left && zero)
             emit_pad(&o, '0', pad);
+        emit_pad(&o, '0', zeros);
         for (int i = 0; i < slen; i++)
             emit(&o, s[i]);
         if (left)

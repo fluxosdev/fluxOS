@@ -137,6 +137,22 @@ int main(void)
     CHECK(!strcmp(web_fetch_site("https://a.example.com/x", "https://img.example.com/y"), "same-site"));
     CHECK(!strcmp(web_fetch_site("https://a.example.com/x", "https://example.org/y"), "cross-site"));
     CHECK(!strcmp(web_fetch_site("https://a.github.io/", "https://b.github.io/"), "cross-site"));
+    /* CSP host sources: a target without a web origin is never matched, however the last check went */
+    CHECK(web_csp_allows("script-src https://cdn.example.com","https://site.example/","script-src-elem","https://cdn.example.com/x.js",NULL));
+    CHECK(!web_csp_allows("script-src https://cdn.example.com","https://site.example/","script-src-elem","data:text/javascript,1",NULL));
+    CHECK(web_csp_allows("script-src https://cdn.example.com","https://site.example/","script-src-elem","https://cdn.example.com/x.js",NULL));
+    CHECK(!web_csp_allows("script-src https://cdn.example.com","https://site.example/","script-src-elem","file:///etc/passwd",NULL));
+    CHECK(!web_csp_allows("img-src foo:bar","https://site.example/","img-src","https://site.example/x.png",NULL));
+    /* ...and WebSocket sources match WebSocket targets */
+    CHECK(web_csp_allows("connect-src wss://ws.example.com","https://site.example/","connect-src","wss://ws.example.com/feed",NULL));
+    CHECK(!web_csp_allows("connect-src wss://ws.example.com","https://site.example/","connect-src","wss://evil.example/feed",NULL));
+    CHECK(!web_csp_allows("connect-src wss://ws.example.com","https://site.example/","connect-src","https://ws.example.com/",NULL));
+    /* IPv6 hosts are each their own, not all "[" */
+    cookie_set("http://[2001:db8::1]/", "v6=secret", 0);
+    cookie_header("http://[2001:db8::1]/", 0, out, sizeof(out));
+    CHECK(!strcmp(out, "v6=secret"));
+    cookie_header("http://[2001:db8::99]:8080/", 0, out, sizeof(out));
+    CHECK(!out[0]);
     puts("browser policy: origins, public suffixes, CORS, preflights, SameSite cookies, referrers and fetch metadata passed");
     return 0;
 }

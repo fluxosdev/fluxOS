@@ -19,6 +19,8 @@
 
 static int opl_type;                    /* 0: none, 2: OPL2, 3: OPL3 */
 static int opl_owner;                   /* pid with /dev/opl open */
+static int opl_opens;                   /* its open file descriptions */
+static struct mutex opl_mutex = MUTEX_INIT("opl-open");
 
 /* Waits measured in reads of the status port (about 1 us each): the OPL2
  * needs 3.3 us after an address and 23 us after data, the OPL3 far less. */
@@ -88,20 +90,32 @@ int opl_present(void)
 static int opl_open(struct vnode *vn, int flags)
 {
     (void)vn; (void)flags;
+    mutex_lock(&opl_mutex);
     if (opl_owner && opl_owner != current->leader->pid) {
         struct proc *p = proc_find(opl_owner);
-        if (p && p->state != P_ZOMBIE)
+        if (p && p->state != P_ZOMBIE) {
+            mutex_unlock(&opl_mutex);
             return -EBUSY;
+        }
+        opl_opens = 0;                  /* the last owner is gone */
     }
     opl_owner = current->leader->pid;
+    opl_opens++;
+    mutex_unlock(&opl_mutex);
     return 0;
 }
 
+/* Each open file description as it goes: the voices are silenced, and the
+ * device let go of, only when the owner's last one does. */
 static void opl_close(struct vnode *vn, int flags)
 {
     (void)vn; (void)flags;
-    opl_silence();
-    opl_owner = 0;
+    mutex_lock(&opl_mutex);
+    if (opl_opens > 0 && --opl_opens == 0) {
+        opl_silence();
+        opl_owner = 0;
+    }
+    mutex_unlock(&opl_mutex);
 }
 
 static int opl_dev_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)

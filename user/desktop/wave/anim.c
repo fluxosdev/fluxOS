@@ -465,7 +465,8 @@ struct transition {
     struct apval reverse_from;  /* where the one it replaced started, for shortening a reversal */
     float scale;                /* reversing: the fraction of a full transition this one is */
     uint8_t started;            /* transitionstart has been sent */
-    const char *name;           /* the transition-property name it came from */
+    char name[64];              /* the transition-property name it came from (a copy: the style's is in an
+                                   arena a later cascade frees) */
 };
 
 struct animation {
@@ -833,7 +834,7 @@ static void sync_transitions(struct anim_state *s, const struct style *st)
         t.ap = ap;
         t.duration = spec->duration;
         t.ease = spec->ease;
-        t.name = spec->name;
+        snprintf(t.name, sizeof(t.name), "%s", spec->name ? spec->name : "");
         t.scale = 1;
         if (old)
             transition_value(old, anim_now, &t.from);

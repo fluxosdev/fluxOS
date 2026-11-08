@@ -232,8 +232,9 @@ void tty_input(char c)
     spin_unlock(&tty_lock);
 }
 
-/* buf is kernel memory (read() copies it out afterwards): it is filled holding the lock. */
-int tty_read(struct tty *t, char *buf, uint32_t n)
+/* buf is kernel memory (read() copies it out afterwards): it is filled holding the lock.
+ * nonblock: -EAGAIN instead of waiting for input. */
+static int read_tty(struct tty *t, char *buf, uint32_t n, int nonblock)
 {
     if (!n)
         return 0;
@@ -241,8 +242,8 @@ int tty_read(struct tty *t, char *buf, uint32_t n)
     for (;;) {
         if (readable(t))
             break;
-        if ((t->pty && t->pty->hungup) || signal_pending(current)) {
-            int r = t->pty && t->pty->hungup ? 0 : -EINTR;
+        if ((t->pty && t->pty->hungup) || nonblock || signal_pending(current)) {
+            int r = t->pty && t->pty->hungup ? 0 : nonblock ? -EAGAIN : -EINTR;
             spin_unlock(&tty_lock);
             return r;
         }
@@ -271,7 +272,13 @@ int tty_read(struct tty *t, char *buf, uint32_t n)
     return (int)i;
 }
 
-int tty_write(struct tty *t, const char *buf, uint32_t n)
+int tty_read(struct tty *t, char *buf, uint32_t n)
+{
+    return read_tty(t, buf, n, 0);
+}
+
+/* nonblock: what fits in a pty's buffer now, or -EAGAIN if nothing does. */
+static int write_tty(struct tty *t, const char *buf, uint32_t n, int nonblock)
 {
     if (!t->pty) {
         splash_end(1);
@@ -279,9 +286,14 @@ int tty_write(struct tty *t, const char *buf, uint32_t n)
         return (int)n;
     }
     spin_lock(&tty_lock);
-    int r = output(t, buf, n, 1);
+    int r = output(t, buf, n, !nonblock);
     spin_unlock(&tty_lock);
-    return r;
+    return nonblock && r == 0 && n ? -EAGAIN : r;
+}
+
+int tty_write(struct tty *t, const char *buf, uint32_t n)
+{
+    return write_tty(t, buf, n, 0);
 }
 
 int tty_set_mode(struct tty *t, int newmode)
@@ -457,37 +469,43 @@ int tty_dev_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
 int tty_dev_poll(struct vnode *vn)
 {
     struct tty *t = vnode_tty(vn);
-    int ev = POLLOUT;
+    int ev = 0;
     spin_lock(&tty_lock);
     if (readable(t))
         ev |= POLLIN;
     if (t->pty && t->pty->hungup)
-        ev |= POLLHUP;
+        ev |= POLLHUP | POLLOUT;        /* (a write fails at once) */
+    else if (!t->pty || t->pty->ohead - t->pty->otail < OBUF_SIZE)
+        ev |= POLLOUT;                  /* a write would not wait for the master */
     spin_unlock(&tty_lock);
     return ev;
 }
 
 /* ---- pseudo-terminals ---- */
 
-static int master_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
+static int read_master(struct pty *p, char *d, uint32_t n, int nonblock)
 {
-    (void)off;
-    struct pty *p = vn->dev_priv;
     spin_lock(&tty_lock);
     while (p->ohead == p->otail) {
-        if (p->slave_closed || signal_pending(current)) {
+        if (p->slave_closed || nonblock || signal_pending(current)) {
             spin_unlock(&tty_lock);
-            return p->slave_closed ? 0 : -EINTR;
+            return p->slave_closed ? 0 : nonblock ? -EAGAIN : -EINTR;
         }
         sleep_on_lock_intr(p->obuf, &tty_lock);
     }
     uint32_t i = 0;
-    char *d = buf;
     while (i < n && p->otail != p->ohead)
         d[i++] = p->obuf[p->otail++ % OBUF_SIZE];
     wakeup(p->obuf);
+    poll_wakeup();                      /* the slave has room to write again */
     spin_unlock(&tty_lock);
     return (int)i;
+}
+
+static int master_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
+{
+    (void)off;
+    return read_master(vn->dev_priv, buf, n, 0);
 }
 
 /* A piece at a time, so a long paste does not keep interrupts off. */
@@ -503,6 +521,17 @@ static int master_write(struct vnode *vn, const void *buf, uint64_t off, uint32_
         spin_unlock(&tty_lock);
     }
     return (int)n;
+}
+
+/* A read or write of a terminal's or a pty master's node that must not wait (O_NONBLOCK, which
+ * the device calls do not see); -ENOTTY for any other node. A master's writes never wait. */
+int tty_io_nonblock(struct vnode *vn, char *buf, uint32_t n, int write)
+{
+    if (vn->dev_read == master_read)
+        return write ? master_write(vn, buf, 0, n) : read_master(vn->dev_priv, buf, n, 1);
+    if (vn->dev_read == tty_dev_read)
+        return write ? write_tty(vnode_tty(vn), buf, n, 1) : read_tty(vnode_tty(vn), buf, n, 1);
+    return -ENOTTY;
 }
 
 static int master_poll(struct vnode *vn)

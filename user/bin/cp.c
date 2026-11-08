@@ -175,6 +175,37 @@ static int copy_path(const char *src, const char *dst, int top)
     return status;
 }
 
+/* Would copying directory src to dst put dst inside src (cp -r d d/sub)? It would never end. */
+static int inside_itself(const char *src, const char *dst)
+{
+    char rs[PATH_MAX], rd[PATH_MAX], parent[PATH_MAX];
+    if (!realpath(src, rs))
+        return 0;
+    if (!realpath(dst, rd)) {
+        /* not there yet: its directory, then its name */
+        snprintf(parent, sizeof(parent), "%s", dst);
+        char *slash = strrchr(parent, '/');
+        const char *name = dst;
+        if (slash) {
+            *slash = 0;
+            name = slash + 1;
+            if (!parent[0])
+                strcpy(parent, "/");
+        } else {
+            strcpy(parent, ".");
+        }
+        char rp[PATH_MAX];
+        if (!realpath(parent, rp))
+            return 0;
+        if (snprintf(rd, sizeof(rd), "%s/%s", strcmp(rp, "/") ? rp : "", name) >= (int)sizeof(rd))
+            return 0;
+    }
+    size_t n = strlen(rs);
+    if (!strcmp(rs, "/"))
+        return 1;
+    return !strncmp(rd, rs, n) && (rd[n] == '/' || !rd[n]);
+}
+
 int main(int argc, char **argv)
 {
     int i = 1;
@@ -219,6 +250,12 @@ int main(int argc, char **argv)
             snprintf(target, sizeof(target), "%s/%s", dest, name);
         else
             snprintf(target, sizeof(target), "%s", dest);
+        struct stat sst;
+        if (recursive && stat(argv[i], &sst) == 0 && S_ISDIR(sst.st_mode) && inside_itself(argv[i], target)) {
+            fprintf(stderr, "cp: cannot copy a directory, '%s', into itself, '%s'\n", argv[i], target);
+            status = 1;
+            continue;
+        }
         status |= copy_path(argv[i], target, 1);
     }
     return status;

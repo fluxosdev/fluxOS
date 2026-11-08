@@ -388,9 +388,12 @@ static struct dialog *message_dialog(const char *title, enum icon_id icon, const
     int h = text_y + nlines * line_h + 62;
     if (h < 100)
         h = 100;
+    struct window *owner = wm_prompt_owner();
     struct dialog *d = dialog_new(title, icon, w, h, WF_NOTASK, &ask_dlg);
     if (!d)
         return NULL;
+    if (owner)
+        owner->blocker = d->win;        /* its input comes here until the answer (wm_destroy lets go) */
     d->command = ask_command;
     d->default_id = ids[0];
     d->cancel_id = ids[nbuttons - 1];
@@ -443,9 +446,16 @@ int ask_text_cancel(const char *title, const char *label, const char *initial,
         wm_focus(ask_dlg->win);
         return 0;
     }
+    if (!initial)
+        initial = "";
+    if (strlen(initial) >= sizeof(((struct dialog *)0)->edit))
+        return 0;                       /* it would be cut short, and acted on so */
+    struct window *owner = wm_prompt_owner();
     struct dialog *d = dialog_new(title, ICON_NONE, 320, 104, WF_NOTASK, &ask_dlg);
     if (!d)
         return 0;
+    if (owner)
+        owner->blocker = d->win;        /* its input comes here until the answer (wm_destroy lets go) */
     d->on_cancel = cancel;
     d->command = ask_command;
     d->default_id = ID_OK;

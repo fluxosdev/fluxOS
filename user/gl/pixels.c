@@ -400,7 +400,7 @@ void glBitmap(GLsizei width, GLsizei height, GLfloat xorig, GLfloat yorig, GLflo
     }
     uint8_t *on = NULL;
     if (width && height && bitmap) {
-        if (!(on = malloc((size_t)width * (size_t)height))) {
+        if (!gl_size_ok((size_t)width, (size_t)height, 1) || !(on = malloc((size_t)width * (size_t)height))) {
             gl_error(c, GL_OUT_OF_MEMORY);
             return;
         }
@@ -488,7 +488,8 @@ void glDrawPixels(GLsizei width, GLsizei height, GLenum format, GLenum type, con
     }
     if (!c->raster_valid || !width || !height || !pixels)
         return;
-    uint32_t *img = malloc((size_t)width * (size_t)height * 4);
+    uint32_t *img = gl_size_ok((size_t)width, (size_t)height, 4) ? malloc((size_t)width * (size_t)height * 4)
+                                                                 : NULL;
     if (!img) {
         gl_error(c, GL_OUT_OF_MEMORY);
         return;
@@ -516,6 +517,10 @@ void glCopyPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum type)
     }
     if (!c->raster_valid || !width || !height)
         return;
+    if (!gl_size_ok((size_t)width, (size_t)height, 4)) {
+        gl_error(c, GL_OUT_OF_MEMORY);
+        return;
+    }
     uint32_t *picture = gl_read_picture(c);
     uint32_t *img = malloc((size_t)width * (size_t)height * 4);
     if (!picture || !img) {

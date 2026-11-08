@@ -159,7 +159,17 @@ static int bind_ephemeral(struct socket *s)
     return s->lport ? 0 : -EADDRNOTAVAIL;
 }
 
-static int sock_connect_locked(struct socket *s, const struct sockaddr_in *sin)
+/* Not connected after all: the socket is as before, and may try again. */
+static void connect_undo(struct socket *s, uint32_t had_laddr)
+{
+    s->connected = 0;
+    s->connecting = 0;
+    s->laddr = had_laddr;
+    s->raddr = 0;
+    s->rport = 0;
+}
+
+static int sock_connect_locked(struct socket *s, const struct sockaddr_in *sin, int nonblock)
 {
     if (sin->sin_family != AF_INET)
         return -EAFNOSUPPORT;
@@ -180,6 +190,17 @@ static int sock_connect_locked(struct socket *s, const struct sockaddr_in *sin)
 
     if (s->state == TCP_LISTEN)
         return -EINVAL;
+    if (s->connecting) {                /* a non-blocking connect() came first */
+        if (s->state == TCP_SYN_SENT || s->state == TCP_SYN_RECEIVED)
+            return -EALREADY;
+        s->connecting = 0;
+        if (s->state != TCP_CLOSED)
+            return 0;                   /* it is up now */
+        r = -(s->error ? s->error : ECONNREFUSED);
+        s->error = 0;
+        connect_undo(s, s->bound_laddr);
+        return r;
+    }
     if (s->connected)
         return -EISCONN;
     uint32_t had_laddr = s->laddr;      /* bind()'s, if any: kept whatever happens */
@@ -193,6 +214,11 @@ static int sock_connect_locked(struct socket *s, const struct sockaddr_in *sin)
     r = tcp_connect(s);
     if (r < 0)
         goto failed;
+    if (nonblock) {                     /* poll() for POLLOUT, then connect() again for the outcome */
+        s->connecting = 1;
+        s->bound_laddr = had_laddr;
+        return -EINPROGRESS;
+    }
     while (s->state == TCP_SYN_SENT || s->state == TCP_SYN_RECEIVED) {
         if (signal_pending(current)) {
             s->state = TCP_CLOSED;
@@ -210,11 +236,7 @@ static int sock_connect_locked(struct socket *s, const struct sockaddr_in *sin)
     return 0;
 
 failed:
-    /* Not connected after all: the socket is as before, and may try again. */
-    s->connected = 0;
-    s->laddr = had_laddr;
-    s->raddr = 0;
-    s->rport = 0;
+    connect_undo(s, had_laddr);
     return r;
 }
 
@@ -228,13 +250,16 @@ static int sock_listen_locked(struct socket *s, int backlog)
     return r < 0 ? r : tcp_listen(s, backlog);
 }
 
-static int sock_accept_locked(struct socket *s, struct socket **out, struct sockaddr_in *peer)
+static int sock_accept_locked(struct socket *s, struct socket **out, struct sockaddr_in *peer,
+                              int nonblock)
 {
     if (s->type != SOCK_STREAM)
         return -EOPNOTSUPP;
     if (s->state != TCP_LISTEN)
         return -EINVAL;
     while (!s->acceptq) {
+        if (nonblock)
+            return -EAGAIN;
         if (signal_pending(current))
             return -EINTR;
         sleep_on_lock_intr(s, &net_lock);
@@ -260,6 +285,15 @@ static int stream_send(struct socket *s, const uint8_t *buf, uint32_t n, int fla
             int err = s->error;
             s->error = 0;
             return done ? (int)done : -err;
+        }
+        if (s->state == TCP_SYN_SENT || s->state == TCP_SYN_RECEIVED) {
+            /* A non-blocking connect() still under way: wait for it as for room. */
+            if (flags & MSG_DONTWAIT)
+                return done ? (int)done : -EAGAIN;
+            if (signal_pending(current))
+                return done ? (int)done : -EINTR;
+            sleep_on_lock_intr(s, &net_lock);
+            continue;
         }
         if (s->state != TCP_ESTABLISHED && s->state != TCP_CLOSE_WAIT) {
             if (!s->connected)
@@ -536,10 +570,10 @@ int sock_bind(struct socket *s, const struct sockaddr_in *sin)
     return r;
 }
 
-int sock_connect(struct socket *s, const struct sockaddr_in *sin)
+int sock_connect(struct socket *s, const struct sockaddr_in *sin, int nonblock)
 {
     spin_lock(&net_lock);
-    int r = sock_connect_locked(s, sin);
+    int r = sock_connect_locked(s, sin, nonblock);
     spin_unlock(&net_lock);
     return r;
 }
@@ -552,10 +586,10 @@ int sock_listen(struct socket *s, int backlog)
     return r;
 }
 
-int sock_accept(struct socket *s, struct socket **out, struct sockaddr_in *peer)
+int sock_accept(struct socket *s, struct socket **out, struct sockaddr_in *peer, int nonblock)
 {
     spin_lock(&net_lock);
-    int r = sock_accept_locked(s, out, peer);
+    int r = sock_accept_locked(s, out, peer, nonblock);
     spin_unlock(&net_lock);
     return r;
 }

@@ -916,14 +916,16 @@ static void paint_video(struct player *p, int full)
     int drew = 0;
     if (ss && ss->vdec) {
         pthread_mutex_lock(&ss->mu);
-        if (ss->vbuf && ss->vbw > 0) {
-            int x0 = (v.w - ss->vbw) / 2, y0 = (v.h - ss->vbh) / 2;
+        if (ss->vbuf && ss->vbw > 0 && v.w > 0 && v.h > 0) {
+            /* A picture scaled for a bigger window (just shrunk; the next frame fits) shows its
+             * middle: what is copied never goes outside the view. */
+            int w = ss->vbw < v.w ? ss->vbw : v.w, h = ss->vbh < v.h ? ss->vbh : v.h;
+            int x0 = (v.w - w) / 2, y0 = (v.h - h) / 2, sx = (ss->vbw - w) / 2, sy = (ss->vbh - h) / 2;
             if (full || x0 > 0 || y0 > 0)
                 gfx_fill(s, 0, 0, v.w, v.h, C_BLACK);
-            int w = ss->vbw < v.w ? ss->vbw : v.w, h = ss->vbh < v.h ? ss->vbh : v.h;
             for (int y = 0; y < h; y++)
-                memcpy(s->px + (size_t)(y0 + y) * (size_t)s->stride + (size_t)x0, ss->vbuf + (size_t)y * (size_t)ss->vbw,
-                       (size_t)w * 4);
+                memcpy(s->px + (size_t)(y0 + y) * (size_t)s->stride + (size_t)x0,
+                       ss->vbuf + (size_t)(sy + y) * (size_t)ss->vbw + (size_t)sx, (size_t)w * 4);
             ss->vb_new = 0;
             drew = 1;
         }

@@ -167,6 +167,9 @@ static int scan(void)
     if (st.scanning || st.active) return -EBUSY; /* initially scan only while idle */
     static struct iwl_scan_req_umac_v17 c;
     memset(&c, 0, sizeof(c));
+    /* A new UID each time (Linux's are 0-3, by slot): a late SCAN_COMPLETE
+     * of a scan aborted on timeout must not end this one. */
+    st.scan_uid = (st.scan_uid + 1) & 3;
     c.uid = st.scan_uid; c.ooc_priority = 6;
     struct iwl_scan_general_params_v11 *g = &c.scan_params.general_params;
     g->flags = (1u << 1) | (1u << 2) | (1u << 6) | (1u << 11);
@@ -264,7 +267,8 @@ static int authorized(void)
 static int tx_frame(const uint8_t *frame, uint32_t len, int encrypt)
 {
     if (len < HDR_LEN || len > 1800) return -EMSGSIZE;
-    uint8_t f[1816], cmd[28] = { 0 };
+    static uint8_t f[1816];             /* under sta_lock: off the stack of an interrupted thread */
+    uint8_t cmd[28] = { 0 };
     spin_lock(&sta_lock);
     if (!st.active || (encrypt && !st.key_valid[0])) { spin_unlock(&sta_lock); return -ENETDOWN; }
     memcpy(f, frame, len);
@@ -298,22 +302,27 @@ static int set_key(int pairwise, int idx, const uint8_t *key, uint32_t len, cons
     if (rsc) for (int i = 0; i < 6; i++) pn |= (uint64_t)rsc[i] << (8 * i);
     c.u.add.rx_seq = pn;
     int slot = pairwise ? 0 : idx + 1;
-    /* Remove a group key before rekeying the same ID. WPA rejects duplicate
-     * PTK installation; firmware must not reset an existing TX counter. */
+    /* Remove the old key before installing a new one under the same ID: a
+     * group rekey, or a pairwise one (a new PTK, new counters). wpa.c never
+     * asks to install the same key twice (KRACK). Nothing encrypted is sent
+     * meanwhile. */
     if (st.key_valid[slot]) {
         struct iwl_sec_key_cmd rm = { 0 };
-        if (pairwise) return -EINVAL;
+        spin_lock(&sta_lock);
+        st.key_valid[slot] = 0;
+        spin_unlock(&sta_lock);
         rm.action = REMOVE; rm.u.remove.sta_mask = 1; rm.u.remove.key_id = idx;
         rm.u.remove.key_flags = c.u.add.key_flags;
         int r = send(GRP_DATA_PATH, SEC_KEY, &rm, sizeof(rm));
         if (r < 0) return r;
-        st.key_valid[slot] = 0;
     }
     int r = send(GRP_DATA_PATH, SEC_KEY, &c, sizeof(c));
     memset(&c, 0, sizeof(c));
     if (!r) {
         for (int i = 0; i < 17; i++) st.rx_pn[slot][i] = pn;
+        spin_lock(&sta_lock);
         st.key_valid[slot] = 1;
+        spin_unlock(&sta_lock);
     }
     return r;
 }

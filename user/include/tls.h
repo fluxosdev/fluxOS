@@ -29,8 +29,9 @@ struct tls *tls_connect_alpn(int fd, const char *host, const char *protocols, in
                              size_t errsize);
 const char *tls_alpn(struct tls *t);
 
-/* Bytes read (at most n), 0 at the end of the stream, -1 on an error
- * (tls_error says which; a timeout is one). */
+/* Bytes read (at most n), 0 at the end of the stream (the server's close_notify),
+ * -1 on an error (tls_error says which; a timeout is one, and so is the TCP
+ * connection ending without close_notify, which may be a truncation). */
 int tls_read(struct tls *t, void *buf, int n);
 
 /* Write all n bytes; returns n, or -1 on an error. */

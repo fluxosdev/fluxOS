@@ -49,6 +49,10 @@ void initrd_load(const uint8_t *data, uint32_t size)
         }
 
         uint32_t fsize = octal(h->size, sizeof(h->size));
+        if (fsize > size - off - 512) {
+            kprintf("initrd: a file at offset %u runs past the end of the archive\n", off);
+            break;
+        }
         uint32_t mode = octal(h->mode, sizeof(h->mode));
         uint32_t mtime = octal(h->mtime, sizeof(h->mtime));
 

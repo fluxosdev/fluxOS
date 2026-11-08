@@ -517,7 +517,7 @@ static void ns_probe(struct nvme_ctrl *c, uint32_t nsid, uint8_t *id, const char
         return;                         /* not an active namespace */
     uint32_t lbaf = *(uint32_t *)(id + 128 + 4 * (id[26] & 0x0F));
     uint32_t ms = lbaf & 0xFFFF, shift = (lbaf >> 16) & 0xFF;
-    if (ms || shift < 9 || (1u << shift) > BLK_MAX_SECTOR || (1u << shift) > c->max_xfer) {
+    if (ms || shift < 9 || shift > 11 || (1u << shift) > BLK_MAX_SECTOR || (1u << shift) > c->max_xfer) {
         boot_warn("nvme%dn%u: %u-byte sectors%s: not supported", c->num, nsid,
                   shift < 32 ? 1u << shift : 0, ms ? " with metadata" : "");
         return;

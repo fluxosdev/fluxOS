@@ -31,6 +31,7 @@ enum {
     R_CHAR, R_ANY, R_CLASS, R_SPLIT, R_JMP, R_SAVE, R_MATCH, R_BOL, R_EOL, R_WORDB, R_NWORDB,
     R_BACKREF, R_LOOK, R_NLOOK, R_LBEH, R_NLBEH, R_LBEND,
     R_FOLD,                             /* /i: a character whose case folding is x */
+    R_LOOPSAVE, R_LOOPCHK,              /* a * loop's turn starts here; it fails if it matched nothing */
 };
 
 struct rinst {
@@ -48,6 +49,7 @@ struct regex {
     char *source, *flags;
     const char *names[RE_MAX_GROUPS];   /* named groups, by number */
     int nnames;
+    int nloops;                         /* registers for R_LOOPSAVE and R_LOOPCHK */
 };
 
 /* A character class: its set of code points (as written, before any ^), with
@@ -71,10 +73,13 @@ struct rparser {
     int groups;
     int class_cap;
     int nest;                           /* groups and classes open now */
+    int looks;                          /* lookarounds open now */
 };
 
-/* Matching a lookaround recurses as deep as it nests: keep both well in the stack. */
+/* Matching a lookaround recurses as deep as lookarounds nest, each level with
+ * a copy of the captures: keep both well in the stack. */
 #define RE_MAX_NEST 128
+#define RE_MAX_LOOKS 16
 
 static void femit(struct rparser *P, struct frag *f, int op, int x, int y)
 {
@@ -185,8 +190,8 @@ static int hexd(int c)
     return c >= '0' && c <= '9' ? c - '0' : (c | 32) >= 'a' && (c | 32) <= 'f' ? (c | 32) - 'a' + 10 : -1;
 }
 
-/* An escape that stands for one character (after the backslash); -1 if it is not one. */
-static int escape_char(struct rparser *P)
+/* An escape that stands for one character (after the backslash). */
+static int escape_char(struct rparser *P, int in_class)
 {
     char c = *P->s++;
     switch (c) {
@@ -196,10 +201,16 @@ static int escape_char(struct rparser *P)
     case 'f': return '\f';
     case 'v': return '\v';
     case '0': return 0;
-    case 'c':
-        if (P->s < P->end)
-            return *P->s++ & 31;
-        return 'c';
+    case 'c': {
+        /* \cX with a letter (in a class a digit or _ too); otherwise the backslash is itself */
+        int x = P->s < P->end ? (unsigned char)*P->s : 0;
+        if (((x | 32) >= 'a' && (x | 32) <= 'z') || (in_class && ((x >= '0' && x <= '9') || x == '_'))) {
+            P->s++;
+            return x & 31;
+        }
+        P->s--;
+        return '\\';
+    }
     case 'x':
         if (P->end - P->s >= 2 && hexd(P->s[0]) >= 0 && hexd(P->s[1]) >= 0) {
             int v = hexd(P->s[0]) * 16 + hexd(P->s[1]);
@@ -301,7 +312,7 @@ static int class_atom(struct rparser *P, struct uset *u, int *lo)
             P->s++;
             *lo = '-';
         } else {
-            *lo = escape_char(P);
+            *lo = escape_char(P, 1);
         }
         return 1;
     }
@@ -354,7 +365,7 @@ static int class_body_in(struct rparser *P, struct uset *u, int *negate)
             P->s++;
             if (*P->s == '\\') {
                 P->s++;
-                hi = escape_char(P);
+                hi = escape_char(P, 1);
             } else {
                 hi = class_char(P);
             }
@@ -444,16 +455,20 @@ static int parse_atom(struct rparser *P, struct frag *f)
             }
         }
         int g = -1;
-        if (capture && P->groups < RE_MAX_GROUPS - 1) {
+        if (capture) {
+            if (P->groups >= RE_MAX_GROUPS - 1)
+                return P->error = "too many capturing groups", -1;
             g = ++P->groups;
             if (name)
                 P->re->names[g] = js_mkstr(P->J, name, name_len)->s, P->re->nnames++;
         }
         struct frag body = { 0 };
-        if (P->nest >= RE_MAX_NEST || js_stack_low(P->J))
+        if (P->nest >= RE_MAX_NEST || (look && P->looks >= RE_MAX_LOOKS) || js_stack_low(P->J))
             return P->error = "pattern nested too deeply", -1;
         P->nest++;
+        P->looks += look != 0;
         int r = parse_alt(P, &body);
+        P->looks -= look != 0;
         P->nest--;
         if (r < 0)
             return -1;
@@ -501,8 +516,11 @@ static int parse_atom(struct rparser *P, struct frag *f)
             return 0;
         }
         if (e >= '1' && e <= '9') {
-            P->s++;
-            femit(P, f, R_BACKREF, e - '0', 0);
+            /* \12 is group 12 if there is one so far, else \1 and a 2 */
+            int g = *P->s++ - '0';
+            while (P->s < P->end && *P->s >= '0' && *P->s <= '9' && g * 10 + (*P->s - '0') <= P->groups)
+                g = g * 10 + (*P->s++ - '0');
+            femit(P, f, R_BACKREF, g, 0);
             return 0;
         }
         if (e == 'k' && P->s + 1 < P->end && P->s[1] == '<') {     /* \k<name> */
@@ -518,7 +536,7 @@ static int parse_atom(struct rparser *P, struct frag *f)
                 }
             }
         }
-        emit_char(P, f, escape_char(P));
+        emit_char(P, f, escape_char(P, 0));
         return 0;
     }
     case '*':
@@ -537,12 +555,74 @@ static int parse_atom(struct rparser *P, struct frag *f)
     }
 }
 
-/* Quantified atom: a repeated per the quantifier at P->s. */
+/* Can fragment a match without taking a character? */
+static int frag_nullable(const struct frag *a)
+{
+    int small_seen[64], small_todo[64];
+    int *seen = a->n < 64 ? small_seen : calloc((size_t)a->n + 1, sizeof(int));
+    int *todo = a->n < 64 ? small_todo : malloc(((size_t)a->n + 1) * sizeof(int));
+    int nullable = 0, ntodo = 0;
+    if (!seen || !todo) {
+        if (seen != small_seen)
+            free(seen);
+        if (todo != small_todo)
+            free(todo);
+        return 1;                       /* when in doubt, check */
+    }
+    if (seen == small_seen)
+        memset(small_seen, 0, sizeof(small_seen));
+    seen[0] = 1;
+    todo[ntodo++] = 0;
+    while (ntodo && !nullable) {
+        int pc = todo[--ntodo], next[2], nnext = 0;
+        if (pc == a->n) {
+            nullable = 1;
+            break;
+        }
+        const struct rinst *in = &a->c[pc];
+        switch (in->op) {
+        case R_CHAR: case R_ANY: case R_CLASS: case R_FOLD: case R_MATCH: case R_LBEND:
+            break;
+        case R_SPLIT:
+            next[nnext++] = pc + in->x;
+            next[nnext++] = pc + in->y;
+            break;
+        case R_JMP:
+            next[nnext++] = pc + in->x;
+            break;
+        case R_LOOK: case R_NLOOK: case R_LBEH: case R_NLBEH:
+            next[nnext++] = pc + in->x + 1;
+            break;
+        default:                        /* saves, assertions, backreferences, loop marks */
+            next[nnext++] = pc + 1;
+            break;
+        }
+        for (int i = 0; i < nnext; i++)
+            if (next[i] >= 0 && next[i] <= a->n && !seen[next[i]]) {
+                seen[next[i]] = 1;
+                todo[ntodo++] = next[i];
+            }
+    }
+    if (seen != small_seen)
+        free(seen);
+    if (todo != small_todo)
+        free(todo);
+    return nullable;
+}
+
+/* Quantified atom: a repeated per the quantifier at P->s. A turn that matches
+ * nothing fails (as the language has it), so a* of an atom that can be empty
+ * cannot loop forever. */
 static void star(struct rparser *P, struct frag *f, const struct frag *a, int lazy)
 {
-    femit(P, f, R_SPLIT, lazy ? a->n + 2 : 1, lazy ? 1 : a->n + 2);
+    int check = frag_nullable(a), body = a->n + (check ? 2 : 0), k = check ? P->re->nloops++ : 0;
+    femit(P, f, R_SPLIT, lazy ? body + 2 : 1, lazy ? 1 : body + 2);
+    if (check)
+        femit(P, f, R_LOOPSAVE, k, 0);
     fappend(P, f, a);
-    femit(P, f, R_JMP, -(a->n + 1), 0);
+    if (check)
+        femit(P, f, R_LOOPCHK, k, 0);
+    femit(P, f, R_JMP, -(body + 1), 0);
 }
 
 static void optional(struct rparser *P, struct frag *f, const struct frag *a, int lazy)
@@ -573,8 +653,10 @@ static int parse_repeat(struct rparser *P, struct frag *f)
         } else if (c == '{') {
             const char *q = P->s + 1;
             int lo = 0, hi, any = 0;
-            while (q < P->end && *q >= '0' && *q <= '9')
-                lo = lo * 10 + (*q++ - '0'), any = 1;
+            while (q < P->end && *q >= '0' && *q <= '9') {   /* saturating: too big is too big */
+                lo = lo < 100000 ? lo * 10 + (*q - '0') : lo;
+                q++, any = 1;
+            }
             if (!any)
                 break;                  /* a literal { */
             hi = lo;
@@ -582,8 +664,10 @@ static int parse_repeat(struct rparser *P, struct frag *f)
                 q++;
                 if (q < P->end && *q >= '0' && *q <= '9') {
                     hi = 0;
-                    while (q < P->end && *q >= '0' && *q <= '9')
-                        hi = hi * 10 + (*q++ - '0');
+                    while (q < P->end && *q >= '0' && *q <= '9') {
+                        hi = hi < 100000 ? hi * 10 + (*q - '0') : hi;
+                        q++;
+                    }
                 } else {
                     hi = -1;
                 }
@@ -601,7 +685,7 @@ static int parse_repeat(struct rparser *P, struct frag *f)
         if (lazy)
             P->s++;
         struct frag r = { 0 };
-        if (min == 1 && max == -1) {    /* + : a, then back */
+        if (min == 1 && max == -1 && !frag_nullable(&a)) {    /* + : a, then back */
             fappend(P, &r, &a);
             femit(P, &r, R_SPLIT, lazy ? 1 : -a.n, lazy ? -a.n : 1);
         } else {
@@ -677,7 +761,7 @@ struct regex *re_compile(struct js *J, const char *pattern, int len, const char 
             return NULL;
         }
     }
-    struct rparser P = { J, pattern, pattern + len, re, NULL, 0, 0, 0 };
+    struct rparser P = { J, pattern, pattern + len, re, NULL, 0, 0, 0, 0 };
     struct frag f = { 0 };
     femit(&P, &f, R_SAVE, 0, 0);
     if (parse_alt(&P, &f) < 0 || (P.s < P.end && *P.s == ')' && (P.error = "unmatched )"))) {
@@ -698,8 +782,10 @@ struct regex *re_compile(struct js *J, const char *pattern, int len, const char 
 
 struct bt {
     int pc, sp;                         /* a branch to try */
-    int slot, old;                      /* slot >= 0: undo a capture instead */
+    int slot, old;                      /* slot >= 0: undo a capture (or past LOOP_UNDO, a loop's mark) instead */
 };
+
+#define LOOP_UNDO (1 << 20)
 
 struct matcher {
     struct regex *re;
@@ -709,6 +795,7 @@ struct matcher {
     int top, cap;
     long steps;
     int lb_target;                      /* where the lookbehind being tried must end */
+    int *loops;                         /* where each * loop's current turn started */
 };
 
 /* The character at s[sp]: its code point, and how many bytes it takes. */
@@ -829,6 +916,18 @@ static int run(struct matcher *m, int pc, int sp, int *caps)
         case R_JMP:
             pc += in->x;
             break;
+        case R_LOOPSAVE:
+            if (push(m, 0, 0, LOOP_UNDO + in->x, m->loops[in->x]) < 0)
+                goto fail_all;
+            m->loops[in->x] = sp;
+            pc++;
+            break;
+        case R_LOOPCHK:
+            if (sp == m->loops[in->x])
+                ok = 0;
+            else
+                pc++;
+            break;
         case R_SAVE:
             if (push(m, 0, 0, in->x, caps[in->x]) < 0)
                 goto fail_all;
@@ -894,7 +993,7 @@ static int run(struct matcher *m, int pc, int sp, int *caps)
         case R_LBEH:
         case R_NLBEH: {
             int sub[2 * RE_MAX_GROUPS], hit = 0, saved_target = m->lb_target;
-            memcpy(sub, caps, sizeof(sub));
+            memcpy(sub, caps, sizeof(int) * 2 * (size_t)re->ngroups);
             m->lb_target = sp;
             for (int from = sp; from >= 0 && !hit; from--) {
                 if (from < m->len && (m->s[from] & 0xC0) == 0x80)
@@ -911,14 +1010,14 @@ static int run(struct matcher *m, int pc, int sp, int *caps)
                 break;
             }
             if (hit)
-                memcpy(caps, sub, sizeof(sub));
+                memcpy(caps, sub, sizeof(int) * 2 * (size_t)re->ngroups);
             pc += in->x + 1;
             break;
         }
         case R_LOOK:
         case R_NLOOK: {
             int sub[2 * RE_MAX_GROUPS];
-            memcpy(sub, caps, sizeof(sub));
+            memcpy(sub, caps, sizeof(int) * 2 * (size_t)re->ngroups);
             int hit = run(m, pc + 1, sp, sub);
             if (m->steps > MAX_STEPS)
                 goto fail_all;
@@ -927,7 +1026,7 @@ static int run(struct matcher *m, int pc, int sp, int *caps)
                 break;
             }
             if (hit)
-                memcpy(caps, sub, sizeof(sub));
+                memcpy(caps, sub, sizeof(int) * 2 * (size_t)re->ngroups);
             pc += in->x + 1;
             break;
         }
@@ -939,6 +1038,10 @@ static int run(struct matcher *m, int pc, int sp, int *caps)
             if (m->top == base)
                 return 0;
             struct bt b = m->stack[--m->top];
+            if (b.slot >= LOOP_UNDO) {
+                m->loops[b.slot - LOOP_UNDO] = b.old;
+                continue;
+            }
             if (b.slot >= 0) {
                 caps[b.slot] = b.old;
                 continue;
@@ -956,8 +1059,19 @@ fail_all:
 
 int re_exec(struct regex *re, const char *s, int len, int start, int caps[2 * RE_MAX_GROUPS])
 {
-    struct matcher m = { re, (const unsigned char *)s, len, NULL, 0, 0, 0, 0 };
+    struct matcher m = { re, (const unsigned char *)s, len, NULL, 0, 0, 0, 0, NULL };
     int found = -1;
+    for (int i = 0; i < 2 * RE_MAX_GROUPS; i++)
+        caps[i] = -1;
+    if (start < 0 || start > len)       /* callers clamp lastIndex; never match outside s */
+        return -1;
+    int small_loops[16];
+    if (re->nloops > 16 && !(m.loops = malloc(sizeof(int) * (size_t)re->nloops)))
+        return -1;
+    if (!m.loops)
+        m.loops = small_loops;
+    for (int i = 0; i < re->nloops; i++)
+        m.loops[i] = -1;
     int anchored = re->code[1].op == R_BOL && !re->multiline;
     for (int at = start; at <= len; at++) {
         if (at > start && at < len && ((unsigned char)s[at] & 0xC0) == 0x80)
@@ -979,6 +1093,8 @@ int re_exec(struct regex *re, const char *s, int len, int start, int caps[2 * RE
         }
     }
     free(m.stack);
+    if (m.loops != small_loops)
+        free(m.loops);
     return found;
 }
 

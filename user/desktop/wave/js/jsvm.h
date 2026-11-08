@@ -913,7 +913,7 @@ struct cg {
     int n, cap;
     jsval *k;
     int nk, kcap;
-    int sp, maxsp, depth;
+    int sp, maxsp;
     int nregs, niters, h, maxh;
     int nic;
     struct ctl *ctl;
@@ -1249,7 +1249,8 @@ static void call_with(struct cg *C, int argc, int name)
  * keys, arguments and other subexpressions are compiled outside it. */
 static int chain_part(const struct ast *n)
 {
-    return n->kind == N_MEMBER || n->kind == N_INDEX || (n->kind == N_CALL && n->a->kind != N_SUPER);
+    return !(n->flags & F_PAREN) &&
+           (n->kind == N_MEMBER || n->kind == N_INDEX || (n->kind == N_CALL && n->a->kind != N_SUPER));
 }
 
 static void ex_outside_chain(struct cg *C, struct ast *e)
@@ -1300,6 +1301,9 @@ static void ex_call(struct cg *C, struct ast *n)
         op(C, I_SUPERGET, 0);
         op(C, C->vf->arrow || C->vf->is_root ? I_THISDYN : I_THIS, 1);
     } else if (callee->kind == N_MEMBER || callee->kind == N_INDEX) {
+        struct patches own = { 0 }, *keep = C->chain;
+        if (callee->flags & F_PAREN)
+            C->chain = &own;            /* (a?.b)(): the callee's chain ends at its parenthesis */
         ex_chain_object(C, callee->a);
         if (callee->flags & F_OPTIONAL)
             patches_add(C, C->chain, jump(C, I_JNULLISH, 0));
@@ -1312,6 +1316,14 @@ static void ex_call(struct cg *C, struct ast *n)
             op(C, I_GETELEM, -1);
         }
         op(C, I_SWAP, 0);
+        C->chain = keep;
+        if (own.n) {                    /* skipped: call undefined, which throws */
+            int over = jump(C, I_JUMP, 0);
+            C->sp--;
+            patches_land(C, &own);
+            op(C, I_UNDEF, 1);
+            land(C, over);
+        }
     } else {
         ex_chain_object(C, callee);
         if (callee->kind == N_IDENT)
@@ -1623,13 +1635,22 @@ static void ex_function(struct cg *C, struct ast *fn)
     op1(C, f->named && f->named->has_env ? I_CLOSUREN : I_CLOSURE, 1, cg_node(C, fn));
 }
 
+/* Code nested too deeply for the compiler's stack throws when it runs, and the page goes on. */
+static void cg_too_deep(struct cg *C)
+{
+    op1(C, I_CONST, 1, cg_str(C, js_mkstr(C->J, "SyntaxError: the script is nested too deeply", 44)));
+    op(C, I_THROW, -1);
+}
+
 static void ex_inner(struct cg *C, struct ast *n);
 static void ex(struct cg *C, struct ast *n)
 {
-    if (++C->depth > 512)
-        bail(C->J, "a script is nested too deeply to compile");
+    if (js_stack_low(C->J)) {
+        cg_too_deep(C);
+        op(C, I_UNDEF, 1);
+        return;
+    }
     ex_inner(C, n);
-    C->depth--;
 }
 
 static void ex_inner(struct cg *C, struct ast *n)
@@ -2285,10 +2306,11 @@ static void st_switch(struct cg *C, struct ast *n)
 static void st_inner(struct cg *C, struct ast *n);
 static void st(struct cg *C, struct ast *n)
 {
-    if (++C->depth > 512)
-        bail(C->J, "a script is nested too deeply to compile");
+    if (js_stack_low(C->J)) {
+        cg_too_deep(C);
+        return;
+    }
     st_inner(C, n);
-    C->depth--;
 }
 
 static void st_inner(struct cg *C, struct ast *n)
@@ -2790,7 +2812,7 @@ static inline int ic_get(struct js *J, struct vic *ic, jsval v, jsval *out)
     struct prop *p;
     if (ic->kind == IC_LENGTH) {
         if (v.t == JS_OBJ && (v.u.o->cls == C_ARRAY || v.u.o->cls == C_ARGUMENTS))
-            *out = js_num(v.u.o->len);
+            *out = js_num(js_array_length(v.u.o));
         else if (v.t == JS_STR)
             *out = js_num(js_u16len(v.u.s));
         else
@@ -3216,7 +3238,8 @@ L_GETELEM: {
     sp--;
     jsval o = sp[-1], key = sp[0];
     uint32_t i;
-    if (o.t == JS_OBJ && o.u.o->cls == C_ARRAY && key.t == JS_NUM && js_index(key, &i)) {
+    if (o.t == JS_OBJ && o.u.o->cls == C_ARRAY && key.t == JS_NUM && js_index(key, &i) &&
+        (i < (uint32_t)o.u.o->len || i < ARRAY_DENSE || !o.u.o->nprops)) {
         sp[-1] = i < (uint32_t)o.u.o->len ? o.u.o->items[i] : js_undefined;
         NEXT;
     }

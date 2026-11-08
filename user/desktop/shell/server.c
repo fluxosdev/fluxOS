@@ -27,6 +27,12 @@
 #include "wmconn.h"
 
 #define QUEUE_MAX (16u << 20)           /* bytes a program may leave unread before it is cut off */
+#define DIM_MAX   8192                  /* a client area's width or height at most */
+#define COORD_MAX 32768                 /* how far off the screen a program may put a window */
+#define WINDOWS_MAX 48                  /* windows one program may have: each takes a shared segment of
+                                           the few the system has */
+#define MODE_BURST 4                    /* video mode changes the desktop makes in MODE_WINDOW_MS at most */
+#define MODE_WINDOW_MS 10000
 
 struct client {
     struct wm_conn conn;
@@ -241,6 +247,24 @@ static struct wm_link *find_link(struct client *c, uint32_t id)
     return NULL;
 }
 
+int server_same_client(const struct wm_link *a, const struct wm_link *b)
+{
+    return a && b && a->c == b->c;
+}
+
+static int clamp(int v, int lo, int hi)
+{
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
+static int window_count(struct client *c)
+{
+    int n = 0;
+    for (struct wm_link *l = links; l; l = l->next)
+        n += l->c == c;
+    return n;
+}
+
 static struct window *find_handle(uint32_t handle)
 {
     for (int i = 0; wm_nth(i); i++)
@@ -254,6 +278,11 @@ static void create_window(struct client *c, const struct wm_msg *m)
     const struct wm_create *cr = wm_payload(m);
     if (wm_payload_len(m) < sizeof(*cr) || find_link(c, m->win))
         return;
+    struct wm_buffer none = { -1, 0, 0, 0, 0 };
+    if (!m->win || window_count(c) >= WINDOWS_MAX) {    /* 0 names no window in what follows */
+        send_msg(c, S_BUFFER, m->win, m->serial, &none, sizeof(none));
+        return;
+    }
     struct wm_link *l = calloc(1, sizeof(*l));
     if (!l) {
         c->dead = 1;
@@ -280,15 +309,15 @@ static void create_window(struct client *c, const struct wm_msg *m)
     char title[WM_TITLE_MAX];
     memcpy(title, cr->title, sizeof(title));
     title[sizeof(title) - 1] = 0;
-    int w = cr->w < 1 ? 1 : cr->w > 8192 ? 8192 : cr->w, h = cr->h < 1 ? 1 : cr->h > 8192 ? 8192 : cr->h;
+    int w = clamp(cr->w, 1, DIM_MAX), h = clamp(cr->h, 1, DIM_MAX);
     l->next = links;
     links = l;
+    /* A program's WF_MODAL window holds only that program's windows (wm.c's blocker_of). */
     l->w = wm_create_remote(l, title, (enum icon_id)cr->icon, w, h, cr->flags & ~WF_DESKTOP, &l->ops);
     if (!l->w) {
         links = l->next;
         free(l);
-        struct wm_buffer b = { -1, 0, 0, 0, 0 };
-        send_msg(c, S_BUFFER, m->win, m->serial, &b, sizeof(b));
+        send_msg(c, S_BUFFER, m->win, m->serial, &none, sizeof(none));
         return;
     }
     send_buffer(l, 0, m->serial);
@@ -398,7 +427,7 @@ static void handle(struct client *c, const struct wm_msg *m)
     case C_MOVE: {
         const struct wm_point *pt = p;
         if (n >= sizeof(*pt))
-            wm_move(w, pt->x, pt->y);
+            wm_move(w, clamp(pt->x, -COORD_MAX, COORD_MAX), clamp(pt->y, -COORD_MAX, COORD_MAX));
         break;
     }
     case C_CENTER:
@@ -412,7 +441,7 @@ static void handle(struct client *c, const struct wm_msg *m)
         if (n >= sizeof(*sz)) {
             reply_link = l;
             reply_serial = m->serial;
-            wm_resize_client(w, sz->w, sz->h);
+            wm_resize_client(w, clamp(sz->w, 1, DIM_MAX), clamp(sz->h, 1, DIM_MAX));    /* as C_CREATE's */
         }
         if (reply_link == l) {          /* nothing changed: the program still hears */
             reply_link = NULL;
@@ -423,7 +452,7 @@ static void handle(struct client *c, const struct wm_msg *m)
     case C_MIN_SIZE: {
         const struct wm_size *sz = p;
         if (n >= sizeof(*sz))
-            wm_set_min_size(w, sz->w, sz->h);
+            wm_set_min_size(w, clamp(sz->w, 0, DIM_MAX), clamp(sz->h, 0, DIM_MAX));    /* resizing uses it */
         break;
     }
     case C_CURSOR:
@@ -517,9 +546,19 @@ static void handle(struct client *c, const struct wm_msg *m)
         draw_sample(c, m);
         break;
     case C_SETMODE: {
+        /* Display Properties' to ask (by the name it says hello with, which is only its word), and at
+         * most MODE_BURST changes in MODE_WINDOW_MS (a change and going back fit): no program can
+         * keep the screen flickering. */
+        static unsigned int mode_ms[MODE_BURST];
+        static int mode_next;
         struct wm_int r = { -1 };
-        if (n >= sizeof(struct dispmode))
+        unsigned int now = now_ms();
+        if (n >= sizeof(struct dispmode) && !strcmp(c->name, "display") &&
+            (!mode_ms[mode_next] || now - mode_ms[mode_next] >= MODE_WINDOW_MS)) {
+            mode_ms[mode_next] = now ? now : 1;
+            mode_next = (mode_next + 1) % MODE_BURST;
             r.value = wm_set_mode(p);
+        }
         send_msg(c, S_DONE, 0, m->serial, &r, sizeof(r));
         break;
     }

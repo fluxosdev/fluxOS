@@ -24,6 +24,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define SHELL     "/bin/fsh"
@@ -134,6 +135,10 @@ static int spawn(const char *path, char *const argv[])
     if (pid == 0) {
         setpgid(0, 0);
         tcsetpgrp(0, getpid());
+        /* what init ignores is not for its children (an ignored signal stays so across exec) */
+        signal(SIGINT, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
         chdir(getenv("HOME"));
         execve(path, argv, environ);
         fprintf(stderr, "init: exec %s: %s\n", path, strerror(errno));
@@ -152,6 +157,9 @@ static void join_wifi(void)
     int pid = fork();
     if (pid == 0) {
         char *argv[] = { "wifi", "auto", NULL };
+        signal(SIGINT, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
         execve("/bin/wifi", argv, environ);
         _exit(127);
     }
@@ -219,6 +227,7 @@ int main(void)
 
     for (;;) {
         char *argv[] = { "-fsh", NULL };
+        time_t started = time(NULL);
         int shell = spawn(SHELL, argv);
         if (shell < 0) {
             sleep(1);
@@ -227,5 +236,7 @@ int main(void)
         wait_for(shell);
         tcsetpgrp(0, getpgrp());
         printf("\ninit: shell exited, starting a new session\n\n");
+        if (time(NULL) - started < 2)
+            sleep(2);                   /* a shell that cannot start must not flood the console */
     }
 }

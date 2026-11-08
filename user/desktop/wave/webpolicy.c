@@ -481,7 +481,22 @@ static int csp_source(const char *source,size_t n,const char *document,const cha
     if(path){snprintf(path_copy,sizeof(path_copy),"%s",path);*path=0;}
     int wildcard=!strncmp(host,"*.",2);
     if(wildcard)memmove(host,host+2,strlen(host+2)+1);
-    if(web_origin(resolved,want,sizeof(want))<0 || web_origin(target,origin,sizeof(origin))<0)return 0;
+    /* WebSocket addresses compare as their http(s) equivalents; a ws(s) source matches only ws(s) targets. */
+    char wtarget[URL_MAX];
+    int source_ws=!strncasecmp(resolved,"ws://",5) || !strncasecmp(resolved,"wss://",6);
+    int target_ws=!strncasecmp(target,"ws://",5) || !strncasecmp(target,"wss://",6);
+    if(source_ws && !target_ws)return 0;
+    if(source_ws) {
+        size_t rl=strlen(resolved);
+        if(rl+3>=sizeof(resolved))return 0;
+        memmove(resolved+4,resolved+2,rl-1);memcpy(resolved,"http",4);
+    }
+    if(target_ws) {
+        if(strlen(target)+3>=sizeof(wtarget))return 0;
+        snprintf(wtarget,sizeof(wtarget),"http%s",target+2);
+        target=wtarget;
+    }
+    if(!web_origin(resolved,want,sizeof(want)) || !web_origin(target,origin,sizeof(origin)))return 0;
     if(wildcard) {
         const char *oh=strstr(origin,"://"),*wh=strstr(want,"://");if(!oh || !wh)return 0;
         if(oh-origin!=wh-want || strncasecmp(origin,want,(size_t)(oh-origin)))return 0;

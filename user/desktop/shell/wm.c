@@ -37,6 +37,7 @@
 #define SHADOW_DY    5
 #define SHADOW_COLOR ARGB(0x48, 0x020B19)
 #define GLASS_SHADOW ARGB(0x30, 0x020B19)      /* lighter under see-through frames */
+#define CLIENT_MAX   16384      /* a client area's width or height at most, whoever asks */
 
 struct surface screen;
 int screen_w, screen_h;
@@ -1615,12 +1616,31 @@ static void draw_outline(void)
     gfx_invert_dither(&screen, o.x + o.w - OUTLINE, o.y + OUTLINE, OUTLINE, o.h - 2 * OUTLINE);
 }
 
+/* The desktop's own modal window (Shut Down), which holds everything. A program's holds only its own
+ * windows (blocker_of): no program can take the whole desktop from the user. */
 static struct window *modal_window(void)
 {
     for (struct window *w = bottom; w; w = w->above)
-        if ((w->flags & WF_MODAL) && !w->minimized)
+        if ((w->flags & WF_MODAL) && !w->minimized && !w->link)
             return w;
     return NULL;
+}
+
+/* What takes w's input instead of it, or NULL: a prompt of its own that is open (w->blocker), or, for
+ * a program's window, the topmost modal window of the same program (not another modal one). */
+static struct window *blocker_of(struct window *w)
+{
+    if (!w)
+        return NULL;
+    if (w->blocker)
+        return w->blocker;
+    if (!w->link || (w->flags & WF_MODAL))
+        return NULL;
+    struct window *found = NULL;
+    for (struct window *m = bottom; m; m = m->above)
+        if (m != w && (m->flags & WF_MODAL) && !m->minimized && server_same_client(m->link, w->link))
+            found = m;
+    return found;
 }
 
 /* The topmost window whose contents cover all of r: nothing under it shows there. */
@@ -1892,6 +1912,9 @@ void wm_destroy(struct window *w)
         dnd_clear();
     else if (dnd.target == w)
         dnd.target = NULL;              /* found again at the next move */
+    for (struct window *x = bottom; x; x = x->above)
+        if (x->blocker == w)
+            x->blocker = NULL;          /* its prompt closed: it takes input again */
     if (last_caption_win == w)
         last_caption_win = NULL;        /* a new window may come at the same address */
     if (button_win == w)
@@ -1922,6 +1945,8 @@ void wm_destroy(struct window *w)
 void wm_focus(struct window *w)
 {
     if(w && (w->flags&WF_NOACTIVATE)) return;
+    for (int i = 0; i < 4 && blocker_of(w); i++)
+        w = blocker_of(w);              /* a window with a prompt or modal window open: that instead */
     struct window *old = focused, *fs = fullscreen();
     if (w) {
         w->minimized = 0;
@@ -1955,6 +1980,12 @@ void wm_focus(struct window *w)
 struct window *wm_focused(void)
 {
     return focused;
+}
+
+/* A prompt of the desktop's is about one of its own windows, never a program's. */
+struct window *wm_prompt_owner(void)
+{
+    return focused && !focused->link ? focused : NULL;
 }
 
 static void minimize(struct window *w)
@@ -2031,7 +2062,7 @@ void wm_set_min_size(struct window *w, int client_w, int client_h)
 static int set_frame(struct window *w, struct rect r)
 {
     int cw = r.w - frame_w(w), ch = r.h - frame_h(w);
-    if (cw < 1 || ch < 1)
+    if (cw < 1 || ch < 1 || cw > CLIENT_MAX || ch > CLIENT_MAX)
         return -1;
     struct rect old = w->r;
     if (cw != w->content.w || ch != w->content.h) {
@@ -2280,10 +2311,14 @@ void wm_damage_client(struct window *w, struct rect r)
 {
     if (w->minimized)
         return;
+    /* Within the client area first, in its own coordinates: a program's rectangle may be anything. */
+    r = rect_intersect(r, mkrect(0, 0, w->content.w, w->content.h));
+    if (rect_empty(r))
+        return;
     struct rect cl = wm_client_rect(w);
     r.x += cl.x;
     r.y += cl.y;
-    wm_damage(rect_intersect(r, cl));
+    wm_damage(r);
 }
 
 int wm_window_count(void)
@@ -2298,6 +2333,10 @@ static void close_window(struct window *w)
 {
     if (w->flags & WF_DESKTOP)
         return;                         /* it stays as long as the desktop does */
+    if (blocker_of(w)) {
+        wm_focus(w);                    /* its prompt or modal window first */
+        return;
+    }
     if (w->ops && w->ops->close)
         w->ops->close(w);
     else
@@ -2688,8 +2727,9 @@ static void dnd_update(void)
         return;
     damage_drag_image();
     struct window *t = window_at(mx, my);
-    if (t && t != dnd.src && (!rect_contains(wm_client_rect(t), mx, my) || !t->ops || !t->ops->drop))
-        t = NULL;                       /* its frame, or a window that takes nothing */
+    if (t && t != dnd.src &&
+        (!rect_contains(wm_client_rect(t), mx, my) || !t->ops || !t->ops->drop || blocker_of(t)))
+        t = NULL;                       /* its frame, a window that takes nothing, or one held by a prompt */
     if (dnd.target && dnd.target != t && dnd.target != dnd.src)
         dnd.target->ops->drop(dnd.target, 0, 0, &dnd.d, DROP_LEAVE, dnd_copy());
     dnd.target = t;
@@ -2870,6 +2910,10 @@ static void press_left(void)
     if (!w) {                           /* bare wallpaper: only without a desktop window */
         if (!modal && focused)
             wm_focus(NULL);
+        return;
+    }
+    if (blocker_of(w)) {
+        wm_focus(w);                    /* to its prompt or modal window, which has its input */
         return;
     }
 
@@ -3069,7 +3113,8 @@ static void release_left(void)
 static int press_other(int button)
 {
     struct window *w = window_at(mx, my);
-    if (!w || !(w->flags & WF_ALLBUTTONS) || menu_open || ctx_open || !rect_contains(wm_client_rect(w), mx, my) ||
+    if (!w || !(w->flags & WF_ALLBUTTONS) || blocker_of(w) || menu_open || ctx_open ||
+        !rect_contains(wm_client_rect(w), mx, my) ||
         (drag != DRAG_NONE && !(drag == DRAG_CLIENT && drag_win == w)))
         return 0;
     wm_focus(w);
@@ -3083,6 +3128,11 @@ static void press_right(void)
     if (menu_open)
         set_menu(0);
     struct window *rw = window_at(mx, my);
+    if (rw && blocker_of(rw) && drag == DRAG_NONE) {
+        set_ctx(NULL, 0, 0, 0);
+        wm_focus(rw);                   /* its prompt or modal window */
+        return;
+    }
     if (rw && (rw->flags & WF_RIGHTCLICK) && drag == DRAG_NONE && rect_contains(wm_client_rect(rw), mx, my)) {
         set_ctx(NULL, 0, 0, 0);
         wm_focus(rw);
@@ -3138,7 +3188,7 @@ static void mouse_event(const struct input_event *ev)
         struct window *w = window_at(mx, my);
         if (!w)
             w = focused;
-        if (w && !w->minimized && w->ops && w->ops->wheel)
+        if (w && !w->minimized && !blocker_of(w) && w->ops && w->ops->wheel)
             w->ops->wheel(w, wheel);
     }
 
@@ -3218,7 +3268,7 @@ static void key_event(const struct input_event *ev)
     }
     if (!(ev->flags & IEV_PRESSED)) {
         /* Releases only matter to a window that follows keys held down. */
-        if (!menu_open && focused && focused->ops && focused->ops->key)
+        if (!menu_open && focused && !blocker_of(focused) && focused->ops && focused->ops->key)
             focused->ops->key(focused, ev);
         return;
     }
@@ -3229,6 +3279,10 @@ static void key_event(const struct input_event *ev)
 
     if (setup_mode && code == KEY_F10 && (ev->mods & KMOD_SHIFT)) {
         launch_terminal(NULL, "Command Prompt", NULL, 0);
+        return;
+    }
+    if (!setup_mode && ctrl && (ev->mods & KMOD_SHIFT) && code == KEY_ESC) {
+        open_taskmgr();                 /* whatever a program's windows do: the way to end it */
         return;
     }
     if (code == KEY_LWIN || code == KEY_RWIN || (ctrl && code == KEY_ESC)) {
@@ -3292,7 +3346,7 @@ static void key_event(const struct input_event *ev)
             focus_next();
         return;
     }
-    if (focused && focused->ops && focused->ops->key)
+    if (focused && !blocker_of(focused) && focused->ops && focused->ops->key)
         focused->ops->key(focused, ev);
 }
 

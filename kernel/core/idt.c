@@ -165,7 +165,7 @@ static int exception_signal(uint32_t vec)
 {
     switch (vec) {
     case 0: case 16: case 19: return SIGFPE;
-    case 3: return SIGTRAP;
+    case 1: case 3: return SIGTRAP;     /* single step (TF) or INT1, and INT3 */
     case 6: return SIGILL;
     case 17: return SIGBUS;
     default: return SIGSEGV;
@@ -195,6 +195,10 @@ static void handle_exception(struct trapframe *tf, int from_user)
     if (from_user) {
         if (vec == 7) {                 /* first FPU use since a task switch */
             fpu_trap();
+            return;
+        }
+        if (vec == 2) {                 /* the hardware's, not the process's doing */
+            klog("NMI while pid %d (%s) ran, eip %08x\n", current->pid, current->name, tf->eip);
             return;
         }
         klog("pid %d (%s): %s at eip %08x, addr %08x, err %x\n",

@@ -36,8 +36,13 @@
 #include <sys/statfs.h>
 #include <unistd.h>
 #include "desktop.h"
+#include "dialog.h"
 #include "imagejobs.h"
 #include "executable.h"
+
+/* The most a prompt's text field holds: a longer name would come back from it cut short. */
+#define PROMPT_MAX ((int)sizeof(((struct dialog *)0)->edit) - 1)
+_Static_assert(sizeof(((struct dialog *)0)->edit) >= 128, "a prompt holds a file name");
 
 /* The desktop's folder draws the wallpaper, which only the desktop has (the File Manager never
  * shows the desktop's folder). */
@@ -146,7 +151,6 @@ struct fm {
     int dragging;                       /* HOLD_ITEM moved far enough to be a drag */
     int last_click;
     unsigned int last_click_ms;
-    char pending[NAME_MAX + 1];         /* entry a delete/rename prompt is about */
     int editing;                        /* typing in the address field */
     char addr[PATH_MAX];
     int addr_len, addr_cur;
@@ -176,6 +180,48 @@ static int join(char *out, size_t size, const char *dir, const char *name)
         errno = ENAMETOOLONG;
         return -1;
     }
+    return 0;
+}
+
+/* path made absolute (from the working folder) and plain: no "." or ".." in it, no doubled or
+ * trailing slashes, so that going up and comparing folders go by its text. -1 if it does not fit. */
+static int plain_path(char *out, size_t size, const char *path)
+{
+    char buf[PATH_MAX], cwd[PATH_MAX];
+    if (path[0] != '/' && !getcwd(cwd, sizeof(cwd)))
+        snprintf(cwd, sizeof(cwd), "/");
+    if (path[0] == '/' ? snprintf(buf, sizeof(buf), "%s", path) >= (int)sizeof(buf)
+                       : join(buf, sizeof(buf), cwd, path) < 0) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    size_t n = 0;
+    for (const char *p = buf; *p;) {
+        while (*p == '/')
+            p++;
+        const char *e = p;
+        while (*e && *e != '/')
+            e++;
+        size_t len = (size_t)(e - p);
+        if (len == 2 && p[0] == '.' && p[1] == '.') {
+            while (n > 0 && out[n - 1] != '/')
+                n--;
+            if (n > 0)
+                n--;                    /* the slash before it too */
+        } else if (len && !(len == 1 && p[0] == '.')) {
+            if (n + 1 + len >= size) {
+                errno = ENAMETOOLONG;
+                return -1;
+            }
+            out[n++] = '/';
+            memcpy(out + n, p, len);
+            n += len;
+        }
+        p = e;
+    }
+    if (!n)
+        out[n++] = '/';
+    out[n] = 0;
     return 0;
 }
 
@@ -1242,6 +1288,8 @@ static void go_up(struct fm *f)
     char parent[PATH_MAX], child[NAME_MAX + 1];
     snprintf(parent, sizeof(parent), "%s", f->path);
     char *slash = strrchr(parent, '/');
+    if (!slash)
+        return;                         /* never: folders' paths are absolute */
     snprintf(child, sizeof(child), "%s", slash + 1);
     if (slash == parent)
         slash[1] = 0;
@@ -1443,25 +1491,47 @@ static void report(const char *title, const char *what, const char *name)
 
 static int remove_tree(const char *path);
 
+/*
+ * What a prompt is about, as it was when it opened: the folder and the names it named. The
+ * selection, or the folder shown, may change before it is answered, and only what was asked
+ * about is acted on. The prompt brings back the number it was opened with; one that could not
+ * open (another prompt was up) leaves that older one with a number that no longer matches, so
+ * its answer does nothing.
+ */
+static struct {
+    struct fm *f;
+    char dir[PATH_MAX];
+    char (*names)[NAME_MAX + 1];
+    int n;
+    uintptr_t serial;
+} del;
+
+static struct {
+    struct fm *f;
+    char dir[PATH_MAX];
+    char name[NAME_MAX + 1];
+    uintptr_t serial;
+} ren;
+
 static void do_delete(void *ctx)
 {
-    struct fm *f = alive(ctx);
-    if (!f)
+    if (!del.names || (uintptr_t)ctx != del.serial)
         return;
-    for (int i = 0; i < f->n; i++) {
-        if (!f->ents[i].selected)
-            continue;
+    for (int i = 0; i < del.n; i++) {
         char path[PATH_MAX];
-        struct stat st;
-        int r = join(path, sizeof(path), f->path, f->ents[i].name) < 0 ? -1 :
-                lstat(path, &st) == 0 && S_ISDIR(st.st_mode) ? rmdir(path) : unlink(path);
-        if (r < 0) {
-            report("Error Deleting File", "delete", f->ents[i].name);
+        if (join(path, sizeof(path), del.dir, del.names[i]) < 0 || remove_tree(path) < 0) {
+            report("Error Deleting File", "delete", del.names[i]);
             break;
         }
     }
-    f->sel = -1;
-    reload(f, NULL);
+    free(del.names);
+    del.names = NULL;
+    del.n = 0;
+    struct fm *f = alive(del.f);
+    if (f) {
+        f->sel = -1;
+        reload(f, NULL);
+    }
 }
 
 static void ask_delete(struct fm *f)
@@ -1469,16 +1539,34 @@ static void ask_delete(struct fm *f)
     int nsel = count_selected(f);
     if (nsel == 0)
         return;
-    char msg[NAME_MAX + 64];
+    char (*names)[NAME_MAX + 1] = malloc((size_t)nsel * sizeof(*names));
+    if (!names)
+        return;
+    free(del.names);
+    del.names = names;
+    del.n = 0;
+    del.f = f;
+    snprintf(del.dir, sizeof(del.dir), "%s", f->path);
+    int dir = 0;
+    for (int i = 0; i < f->n && del.n < nsel; i++) {
+        if (!f->ents[i].selected)
+            continue;
+        snprintf(del.names[del.n++], sizeof(*names), "%s", f->ents[i].name);
+        dir = f->ents[i].is_dir;
+    }
+    void *ctx = (void *)++del.serial;
+    char msg[NAME_MAX + 96];
     if (nsel > 1) {
         snprintf(msg, sizeof(msg), "Are you sure you want to delete these %d items?", nsel);
-        ask_yes_no("Confirm Multiple File Delete", ICON_WARNING, msg, do_delete, f);
+        ask_yes_no("Confirm Multiple File Delete", ICON_WARNING, msg, do_delete, ctx);
         return;
     }
-    struct entry *e = &f->ents[f->sel];
-    snprintf(msg, sizeof(msg), "Are you sure you want to delete '%s'?", e->name);
-    ask_yes_no(e->is_dir ? "Confirm Folder Delete" : "Confirm File Delete", ICON_WARNING, msg,
-               do_delete, f);
+    if (dir)
+        snprintf(msg, sizeof(msg), "Are you sure you want to delete the folder '%s' and everything in it?",
+                 del.names[0]);
+    else
+        snprintf(msg, sizeof(msg), "Are you sure you want to delete '%s'?", del.names[0]);
+    ask_yes_no(dir ? "Confirm Folder Delete" : "Confirm File Delete", ICON_WARNING, msg, do_delete, ctx);
 }
 
 static void do_mkdir(void *ctx, const char *name)
@@ -1496,28 +1584,46 @@ static void do_mkdir(void *ctx, const char *name)
 
 static void do_rename(void *ctx, const char *name)
 {
-    struct fm *f = alive(ctx);
-    if (!f || !strcmp(name, f->pending))
+    if (!ren.name[0] || (uintptr_t)ctx != ren.serial || !strcmp(name, ren.name))
         return;
     char from[PATH_MAX], to[PATH_MAX];
-    if (join(from, sizeof(from), f->path, f->pending) < 0 || join(to, sizeof(to), f->path, name) < 0 ||
-        strchr(name, '/') || rename(from, to) < 0) {
-        if (strchr(name, '/'))
-            errno = EINVAL;
-        report("Error Renaming File", "rename", f->pending);
+    struct stat fs, ts;
+    if (strchr(name, '/') || !strcmp(name, ".") || !strcmp(name, ".."))
+        errno = EINVAL;
+    else if (join(from, sizeof(from), ren.dir, ren.name) < 0 || join(to, sizeof(to), ren.dir, name) < 0 ||
+             lstat(from, &fs) < 0)
+        ;                               /* errno says why */
+    else if (lstat(to, &ts) == 0 && (ts.st_dev != fs.st_dev || ts.st_ino != fs.st_ino))
+        errno = EEXIST;                 /* never over another file (the same one: a change of case) */
+    else if (rename(from, to) == 0) {
+        struct fm *f = alive(ren.f);
+        ren.name[0] = 0;
+        if (f)
+            reload(f, strcmp(f->path, ren.dir) ? NULL : name);
         return;
     }
-    reload(f, name);
+    report("Error Renaming File", "rename", ren.name);
+    ren.name[0] = 0;
 }
 
 static void ask_rename(struct fm *f)
 {
     if (f->sel < 0 || count_selected(f) != 1)
         return;
-    snprintf(f->pending, sizeof(f->pending), "%s", f->ents[f->sel].name);
+    const char *name = f->ents[f->sel].name;
+    if ((int)strlen(name) > PROMPT_MAX) {
+        message_box("Rename", ICON_WARNING, "This name is too long to edit here: rename it with mv in a terminal.");
+        return;
+    }
     char label[NAME_MAX + 32];
-    snprintf(label, sizeof(label), "New name for '%s':", f->pending);
-    ask_text("Rename", label, f->pending, do_rename, f);
+    snprintf(label, sizeof(label), "New name for '%s':", name);
+    void *ctx = (void *)(ren.serial + 1);
+    if (ask_text_cancel("Rename", label, name, do_rename, NULL, ctx)) {
+        ren.serial++;
+        ren.f = f;
+        snprintf(ren.dir, sizeof(ren.dir), "%s", f->path);
+        snprintf(ren.name, sizeof(ren.name), "%s", name);
+    }
 }
 
 /* ---- cut, copy and paste ---- */
@@ -1597,14 +1703,19 @@ static int copy_tree(const char *src, const char *dst)
     return r;
 }
 
-/* Removes a file or folder tree; a symbolic link goes, not what it points to. */
-static int remove_tree(const char *path)
+/* Removes a folder tree on the filesystem dev; a symbolic link goes, not what it points to. A
+ * disk mounted somewhere in it is never emptied through it (EBUSY). */
+static int remove_tree_on(const char *path, uint32_t dev)
 {
     struct stat st;
     if (lstat(path, &st) < 0)
         return -1;
     if (!S_ISDIR(st.st_mode))
         return unlink(path);
+    if (st.st_dev != dev) {
+        errno = EBUSY;
+        return -1;
+    }
     char *c = malloc(PATH_MAX);
     DIR *d = c ? opendir(path) : NULL;
     if (!d) {
@@ -1616,11 +1727,29 @@ static int remove_tree(const char *path)
     while (r == 0 && (de = readdir(d))) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
             continue;
-        r = join(c, PATH_MAX, path, de->d_name) < 0 ? -1 : remove_tree(c);
+        r = join(c, PATH_MAX, path, de->d_name) < 0 ? -1 : remove_tree_on(c, dev);
     }
     closedir(d);
     free(c);
     return r ? r : rmdir(path);
+}
+
+/* Removes a file or a whole folder tree, but not a mount point (a disk's own folder). */
+static int remove_tree(const char *path)
+{
+    struct stat st, up;
+    char parent[PATH_MAX];
+    if (lstat(path, &st) < 0)
+        return -1;
+    if (!S_ISDIR(st.st_mode))
+        return unlink(path);
+    if (join(parent, sizeof(parent), path, "..") < 0 || stat(parent, &up) < 0)
+        return -1;
+    if (up.st_dev != st.st_dev) {
+        errno = EBUSY;
+        return -1;
+    }
+    return remove_tree_on(path, st.st_dev);
 }
 
 static void clip_set(struct fm *f, int cut)
@@ -1641,6 +1770,38 @@ static void clip_set(struct fm *f, int cut)
     paint(f);
 }
 
+/* Is the folder dir the folder src, or inside it? By what the filesystem says as well as by the
+ * text, for a path through ".." or a symbolic link names a folder differently. */
+static int inside(const char *dir, const char *src)
+{
+    size_t n = strlen(src);
+    if (!strncmp(dir, src, n) && (dir[n] == '/' || !dir[n]))
+        return 1;
+    struct stat s, st, prev;
+    char *p = malloc(PATH_MAX);
+    if (!p || stat(src, &s) < 0) {
+        free(p);
+        return 0;
+    }
+    snprintf(p, PATH_MAX, "%s", dir);
+    int r = 0;
+    for (int depth = 0; depth < PATH_MAX / 3 && stat(p, &st) == 0; depth++) {
+        if (st.st_dev == s.st_dev && st.st_ino == s.st_ino) {
+            r = 1;
+            break;
+        }
+        if (depth && st.st_dev == prev.st_dev && st.st_ino == prev.st_ino)
+            break;                      /* "/" is its own parent */
+        prev = st;
+        n = strlen(p);
+        if (n + 4 > PATH_MAX)
+            break;
+        memcpy(p + n, "/..", 4);
+    }
+    free(p);
+    return r;
+}
+
 static int exists(const char *path)
 {
     struct stat st;
@@ -1659,13 +1820,10 @@ static int paste_one(const char *dir, const char *src, char *name, int cut)
         goto out;
 
     /* A folder cannot go inside itself. */
-    size_t n = strlen(src);
-    if (!strncmp(dst, src, n) && dst[n] == '/') {
-        struct stat st;
-        if (lstat(src, &st) == 0 && S_ISDIR(st.st_mode)) {
-            message_box("File Manager", ICON_WARNING, "Cannot copy a folder into itself.");
-            return 1;
-        }
+    struct stat sst;
+    if (lstat(src, &sst) == 0 && S_ISDIR(sst.st_mode) && inside(dir, src)) {
+        message_box("File Manager", ICON_WARNING, "Cannot copy a folder into itself.");
+        return 1;
     }
     if (cut && !strcmp(dst, src))
         return 0;                       /* moved onto itself */
@@ -1729,13 +1887,11 @@ static void start_editing(struct fm *f)
 static void go_to_address(struct fm *f)
 {
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s", f->addr);
-    size_t n = strlen(path);
-    while (n > 1 && path[n - 1] == '/')
-        path[--n] = 0;
     struct stat st;
     f->editing = 0;
-    if (path[0] != '/' || stat(path, &st) < 0 || !S_ISDIR(st.st_mode)) {
+    if (f->addr[0] != '/' || plain_path(path, sizeof(path), f->addr) < 0 || stat(path, &st) < 0 ||
+        !S_ISDIR(st.st_mode)) {
+        snprintf(path, sizeof(path), "%s", f->addr);
         char msg[PATH_MAX + 64];
         snprintf(msg, sizeof(msg), "Cannot find the folder '%s'.", path);
         paint(f);
@@ -2402,6 +2558,10 @@ struct window *files_open(const char *path)
         launch1("files", path);         /* a window of the File Manager's, not the desktop's */
         return NULL;
     }
+    char abs[PATH_MAX];
+    if (plain_path(abs, sizeof(abs), path) < 0)
+        snprintf(abs, sizeof(abs), "/");
+    path = abs;                         /* "files ." in a terminal: going up needs the whole path */
     struct fm *f = calloc(1, sizeof(*f));
     if (!f)
         return NULL;

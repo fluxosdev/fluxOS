@@ -24,7 +24,7 @@ struct dialog {
     int pressed_in;             /* ...and the pointer is still over it */
     int radio;                  /* value of the checked radio button */
     int default_id, cancel_id;
-    char edit[128];
+    char edit[PATH_MAX];        /* a whole path: what is asked about is never cut short */
     int edit_len, edit_cur;
     int masked;                 /* the edit field shows asterisks (a password) */
     void (*command)(struct dialog *d, int id);

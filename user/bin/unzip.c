@@ -18,7 +18,8 @@ static void usage(void)
             "  -o  replace files that exist  -n  never replace them (the default)\n"
             "  -j  no folders: every file into dir    -q  quieter\n"
             "  -d  extract into dir (default: here)\n"
-            "  names may be files, folders or patterns with * and ?; -@ reads more from a file\n"
+            "  names may be files, folders or patterns with * and ?; -@ reads exact names (a folder\n"
+            "  stands for what is in it) from a file, one a line, * ? [ in them taken as they are\n"
             "unzip also reads 7z archives.\n");
     exit(2);
 }
@@ -124,6 +125,19 @@ static void on_failed(void *ctx, int i, const char *why)
     fflush(stdout);
 }
 
+/* A name from a -@ list against an entry: the same name, or a folder the entry is in. Nothing in
+ * it is a pattern: the Archive Manager passes the names as they are, and "a[1].txt" or "*.c"
+ * must not pick out other members. */
+static int literal_match(const char *want, const char *name)
+{
+    while (*want == '/' || (want[0] == '.' && want[1] == '/'))
+        want += *want == '/' ? 1 : 2;
+    size_t n = strlen(want);
+    while (n && want[n - 1] == '/')
+        n--;
+    return n && !strncmp(want, name, n) && (!name[n] || name[n] == '/');
+}
+
 /* Names to extract, one per line, from a file (the Archive Manager passes its selection so). */
 static char **read_list(const char *path, int *n)
 {
@@ -222,7 +236,7 @@ int main(int argc, char **argv)
                     any = 1;
                 }
             for (int j = 0; j < nlist; j++)
-                if (arc_name_match(list_names[j], arc_entry(a, k)->name)) {
+                if (literal_match(list_names[j], arc_entry(a, k)->name)) {
                     want[k] = 1;
                     any = 1;
                 }

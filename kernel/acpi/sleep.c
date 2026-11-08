@@ -20,7 +20,9 @@
  *
  * What cannot come back stops it from starting: firmware without \_S3, a
  * display driver (Radeon, Voodoo) that cannot set its card up again, a
- * USB disk in use.
+ * USB disk in use. The power thread's AML (kpwrd: the EC, the batteries)
+ * waits throughout (power_quiesce), and the sound card's writers wait for
+ * it to come back rather than give up on it (pcm_sleep).
  *
  * The screen is blanked just before SLP_EN. On real hardware the wake
  * path runs the video ROM's initialisation again and sets the boot
@@ -240,6 +242,7 @@ int acpi_suspend(void)
         klog("power: cannot suspend: %s\n", why);
         return -ENOSYS;
     }
+    power_quiesce();                    /* no AML from the power thread meanwhile */
     mutex_lock(&sleep_mutex);
     klog("power: suspending to RAM\n");
     beeps = cmdline_has("s3_beep");
@@ -254,6 +257,18 @@ int acpi_suspend(void)
     vfs_lock();
     blk_sync_all();                     /* what was written meanwhile, should the battery die */
     fb_suspend();
+    /* Asked again with the display lock held: a mode set since the first
+     * look may leave a screen that only its driver could set up again. */
+    if (fb_wake_mode() < 0) {
+        klog("power: cannot suspend: the display changed mode meanwhile\n");
+        fb_resume();
+        vfs_unlock();
+        usb_resume();
+        proc_pin(-1);
+        mutex_unlock(&sleep_mutex);
+        power_unquiesce();
+        return -ENOSYS;
+    }
     devices_suspend();
     pci_suspend();
     power_arm_wake(1);
@@ -294,5 +309,6 @@ int acpi_suspend(void)
     klog("power: %s\n", sleep_failed ? "suspend failed; carrying on" : slept ? "resumed" : "woke at once");
     power_resumed();
     mutex_unlock(&sleep_mutex);
+    power_unquiesce();
     return sleep_failed ? -EIO : 0;
 }

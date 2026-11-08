@@ -14,7 +14,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "desktop.h"
+#include "dialog.h"
 #include "imagejobs.h"
+
+/* The most a prompt's text field holds: a longer path would come back from it cut short. */
+#define PROMPT_MAX ((int)sizeof(((struct dialog *)0)->edit) - 1)
+_Static_assert(sizeof(((struct dialog *)0)->edit) >= 128, "a prompt holds a file name");
 
 #define MAX_DIM     2048
 #define DEF_W       400
@@ -713,6 +718,14 @@ static void ask_save_as(struct paint *p)
     } else {
         const char *home = getenv("HOME");
         snprintf(def, sizeof(def), "%s/picture.jpg", home ? home : "");
+    }
+    if ((int)strlen(def) > PROMPT_MAX) {        /* cut short it would name another file */
+        const char *home = getenv("HOME");
+        char name[512];
+        snprintf(name, sizeof(name), "%s", base_name(def));
+        snprintf(def, sizeof(def), "%s/%s", home ? home : "", name);
+        if ((int)strlen(def) > PROMPT_MAX)
+            snprintf(def, sizeof(def), "%s", (int)strlen(name) <= PROMPT_MAX ? name : "picture.jpg");
     }
     ask_text("Save As", "Save as a JPEG picture:", def, save_chosen, p);
 }

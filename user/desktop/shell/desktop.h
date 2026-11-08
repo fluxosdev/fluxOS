@@ -225,6 +225,8 @@ struct window {
     enum cursor_kind cursor;    /* the pointer over the client area (wm_set_cursor) */
     uint32_t handle;            /* the desktop's number for it (wm_list_windows) */
     struct wm_link *link;       /* in the desktop: the program it belongs to (NULL: its own) */
+    /* A prompt of its own is open (apps.c): the window's input goes to it instead, until it closes. */
+    struct window *blocker;
 };
 
 /* ---- screen and compositor (wm.c) ---- */
@@ -249,6 +251,8 @@ int wm_resize_client(struct window *w, int client_w, int client_h);
 void wm_cascade(struct window *w);
 void wm_focus(struct window *w);
 struct window *wm_focused(void);
+/* The window a prompt opened now is about: this process's own focused window, or NULL. */
+struct window *wm_prompt_owner(void);
 void wm_set_title(struct window *w, const char *title);
 void wm_set_icon(struct window *w, enum icon_id icon);
 /* A picture for the caption and taskbar instead of the icon (a page's favicon, at most 32 x 32),
@@ -349,6 +353,7 @@ void server_state_changed(void);        /* the theme, screen or settings changed
 int server_buffer_new(struct wm_link *l, struct surface *s, int w, int h);
 void server_buffer_free(struct wm_link *l, struct surface *s);
 void server_buffer_changed(struct wm_link *l);
+int server_same_client(const struct wm_link *a, const struct wm_link *b);  /* both one program's */
 
 /* ---- a program: its windows are the desktop's to show (client.c) ---- */
 struct app {
@@ -579,8 +584,10 @@ void ask_yes_no_cancel(const char *title, enum icon_id icon, const char *text,
                        void (*yes)(void *ctx), void (*no)(void *ctx), void *ctx);
 void ask_text(const char *title, const char *label, const char *initial,
               void (*done)(void *ctx, const char *text), void *ctx);
-/* The same, but cancel is called if it is closed without an answer. Returns 0, calling
- * neither, if a prompt is already open. */
+/* While a prompt is open, the window that had the focus when it opened takes no input (it goes to the
+ * prompt), so what the callbacks act on cannot change meanwhile from there.
+ * The same, but cancel is called if it is closed without an answer. Returns 0, calling
+ * neither, if a prompt is already open, or initial is too long (PATH_MAX) to be edited whole. */
 int ask_text_cancel(const char *title, const char *label, const char *initial,
                     void (*done)(void *ctx, const char *text), void (*cancel)(void *ctx), void *ctx);
 /* ask_text_cancel for a password: the field shows asterisks, and the text is wiped after done. */

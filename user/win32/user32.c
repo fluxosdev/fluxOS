@@ -1803,6 +1803,10 @@ static ATOM register_class(const struct wndclassex *wc, int unicode)
     c->menu_name = wc->menu_name;
     c->unicode = unicode;
     c->extra = calloc(1, (size_t)c->cls_extra + 1);
+    if (!c->extra) {
+        free(c);
+        FAIL(ERROR_NOT_ENOUGH_MEMORY);
+    }
     c->next = classes;
     classes = c;
     return c->atom;
@@ -1908,7 +1912,7 @@ static uint32_t class_long(uint32_t *a, int set, int unicode)
     case GCL_CBCLSEXTRA: return (uint32_t)c->cls_extra;
     case GCW_ATOM: return c->atom;
     default:
-        if (index < 0 || index + 4 > c->cls_extra)
+        if (index < 0 || (int64_t)index + 4 > c->cls_extra)
             FAIL(ERROR_INVALID_INDEX);
         memcpy(&v, c->extra + index, 4);
         if (set)
@@ -1949,9 +1953,12 @@ static HWND create_window(uint32_t *a, int unicode)
     if (message_only)
         style &= ~WS_CHILD;
     desktop_window();
-    struct win *w = win_new();
-    if (!w)
+    uint8_t *extra = calloc(1, (size_t)c->wnd_extra + 1);
+    struct win *w = extra ? win_new() : NULL;
+    if (!w) {
+        free(extra);
         FAIL(ERROR_NOT_ENOUGH_MEMORY);
+    }
     HWND h = w->hwnd;
     w->cls = c;
     c->nwindows++;
@@ -1977,7 +1984,7 @@ static HWND create_window(uint32_t *a, int unicode)
         w->menu_height=menu_height(w->menu);
     }
     w->nextra = c->wnd_extra;
-    w->extra = calloc(1, (size_t)w->nextra + 1);
+    w->extra = extra;
     w->text = wdup((const uint16_t *)u"", 0);
 
     if (is_top(w)) {
@@ -2536,7 +2543,7 @@ static uint32_t window_long(uint32_t *a, int set, int unicode)
     case GWL_EXSTYLE: field = &w->exstyle; break;
     case GWL_USERDATA: field = &w->userdata; break;
     default:
-        if (index < 0 || index + 4 > w->nextra)
+        if (index < 0 || (int64_t)index + 4 > w->nextra)
             FAIL(ERROR_INVALID_INDEX);
         memcpy(&v, w->extra + index, 4);
         if (set)

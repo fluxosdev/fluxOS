@@ -176,9 +176,18 @@ static unsigned octal(const char *s, size_t n)
     return v;
 }
 
-/* An archive member's name, or a link's target, as a path under dir. */
+/* An archive member's name, or a hard link's target, as a path under dir; one with a ".."
+ * in it, which could reach outside dir, is refused. */
 static void member_path(char *out, size_t size, const char *dir, char *name)
 {
+    for (const char *q = name; *q; ) {
+        size_t len = strcspn(q, "/");
+        if (len == 2 && q[0] == '.' && q[1] == '.')
+            die("archive member %s has '..' in its name", name);
+        q += len;
+        while (*q == '/')
+            q++;
+    }
     char *p = name;
     while (*p == '.' && p[1] == '/')
         p += 2;
@@ -191,6 +200,25 @@ static void member_path(char *out, size_t size, const char *dir, char *name)
         path_join(out, size, dir, p);
     else
         out[0] = 0;
+}
+
+/* Whether a directory on the way to path, below dir, is a symbolic link: a member written
+ * through one (an archive holding "l -> /" and then "l/etc/x") would land outside dir. */
+static int through_symlink(const char *path, const char *dir)
+{
+    char tmp[PATH_MAX];
+    struct stat st;
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + strlen(dir) + 1; *p; p++) {
+        if (*p != '/')
+            continue;
+        *p = 0;
+        int link = lstat(tmp, &st) == 0 && S_ISLNK(st.st_mode);
+        *p = '/';
+        if (link)
+            return 1;
+    }
+    return 0;
 }
 
 /* Unpack the ustar archive `tar` into dir: directories, files and their
@@ -214,10 +242,17 @@ static void extract_tar(const char *tar, const char *dir, unsigned long *bytes, 
         unsigned size = octal((char *)h + 124, 12);
         unsigned padded = (size + SECTOR - 1) / SECTOR * SECTOR;
         char dst[PATH_MAX], target[101];
+        if (h[156] == 'L' || h[156] == 'K' || h[156] == 'x' || h[156] == 'g')
+            die("%s: has GNU or pax extended headers (long names), which fluxinstall does not unpack", tar);
         member_path(dst, sizeof(dst), dir, name);
         snprintf(target, sizeof(target), "%.100s", (char *)h + 157);
+        if (dst[0] && through_symlink(dst, dir))
+            die("%s: member %s is beneath a symbolic link", tar, name);
 
+        struct stat lst;
         if (dst[0] && h[156] == '5') {
+            if (lstat(dst, &lst) == 0 && S_ISLNK(lst.st_mode))
+                die("%s: directory %s is a symbolic link already", tar, name);
             make_dir(dst);
             chmod(dst, mode);
         } else if (dst[0] && h[156] == '1') {
@@ -226,6 +261,8 @@ static void extract_tar(const char *tar, const char *dir, unsigned long *bytes, 
             unlink(dst);
             if (!from[0])
                 die("%s: %s links to nothing", tar, dst);
+            if (through_symlink(from, dir))
+                die("%s: %s links beneath a symbolic link", tar, dst);
             if (link(from, dst) < 0) {
                 copy_file(from, dst, bytes);
                 chmod(dst, mode);
@@ -236,6 +273,7 @@ static void extract_tar(const char *tar, const char *dir, unsigned long *bytes, 
             if (symlink(target, dst) == 0)
                 (*files)++;
         } else if (dst[0] && (h[156] == '0' || h[156] == 0)) {
+            unlink(dst);                        /* never written through a link already there */
             int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode);
             if (out < 0)
                 die("%s: %s", dst, strerror(errno));
@@ -271,15 +309,21 @@ static int part_sep(const char *disk)
     return n && isdigit((unsigned char)disk[n - 1]);
 }
 
-/* Is device `name` the disk `disk` or one of its partitions? */
+/* Is device `name` the disk `disk` or one of its partitions (hda1; nvme0n1p1, not nvme0n10)? */
 static int on_disk(const char *name, const char *disk)
 {
     size_t n = strlen(disk);
     if (strncmp(name, disk, n))
         return 0;
-    if (part_sep(disk) && name[n] == 'p')
+    if (!name[n])
+        return 1;
+    if (part_sep(disk) && name[n++] != 'p')
+        return 0;
+    if (!isdigit((unsigned char)name[n]))
+        return 0;
+    while (isdigit((unsigned char)name[n]))
         n++;
-    return !name[n] || isdigit((unsigned char)name[n]);
+    return !name[n];
 }
 
 static void size_str(unsigned sectors, char *out, size_t n)
@@ -571,6 +615,8 @@ int main(int argc, char **argv)
         }
         if (mib < need_mib)
             die("-r %u: the system partition needs at least %u MiB", mib, need_mib);
+        if (mib >= target.sectors / 2048)     /* also keeps mib * 2048 from wrapping */
+            die("%s is too small for a %u MiB system partition and an ext2 one of 64 MiB or more", dev, mib);
         sys_sectors = mib * 2048;
         data_start = PART_START + sys_sectors;
         if (data_start >= target.sectors || target.sectors - data_start < 64 * 2048)

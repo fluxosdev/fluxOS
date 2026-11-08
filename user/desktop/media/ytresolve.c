@@ -133,6 +133,11 @@ static int add_formats(struct yt_video *v, const struct json *list, const char *
         }
         if (!f->url)
             return -1;
+        if (strncasecmp(f->url, "https://", 8) && strncasecmp(f->url, "http://", 7)) {
+            free(f->url);               /* only web addresses: never a file name for FFmpeg to open */
+            f->url = NULL;
+            continue;
+        }
         v->nf++;
     }
     return 0;

@@ -104,5 +104,26 @@ int main(void)
     CHECK(proc_mmap(g, &a, &at) == -ENOMEM && at == 0);
     a.len = 0x08000000u;                /* one that fits goes above the heap */
     CHECK(proc_mmap(g, &a, &at) == 0 && at >= g->brk && at + a.len <= USER_MMIO_BASE);
-    puts("kernel processes: exec losing to exit, and mmap placement near the top passed");
+
+    /* The leader ended early (pthread_exit) and the thread left is stopped: SIGCONT
+     * sets it going, and the leader reports the stop and the continue for the process. */
+    reset(1);
+    g = &procs[1], t = &procs[2];
+    g->pid = 10, t->pid = 11;
+    g->state = P_ZOMBIE;
+    g->nthreads = 1;
+    t->leader = g;
+    t->state = P_STOPPED;
+    t->last_cpu = t->pin_cpu = -1;
+    g->stop_report = 1;
+    CHECK(group_stopped(g));
+    proc_signal(g, SIGCONT);
+    CHECK(t->state == P_READY && !group_stopped(g));
+    CHECK(g->cont_report == 1 && g->stop_report == 0);
+
+    /* times(): the process's ticks are every thread's. */
+    g->cpu_ticks = 5, t->cpu_ticks = 7;
+    CHECK(proc_cpu_ticks(t) == 12 && proc_cpu_ticks(g) == 12);
+    puts("kernel processes: exec losing to exit, mmap placement near the top, SIGCONT after the leader's exit "
+         "and process times passed");
 }

@@ -401,14 +401,16 @@ void __fork_prepare(void)
     for (int i = natfork - 1; i >= 0; i--)
         if (atfork[i].prepare)
             atfork[i].prepare();
-    __rlock_take(&__malloc_lock);       /* no other thread is halfway through these in the child */
+    /* No other thread is halfway through these in the child. stdio's list before malloc: a
+     * stream's operations take malloc's lock under stdio's, so the other order deadlocks. */
     __rlock_take(&__stdio_lock);
+    __rlock_take(&__malloc_lock);
 }
 
 void __fork_parent(void)
 {
-    __rlock_give(&__stdio_lock);
     __rlock_give(&__malloc_lock);
+    __rlock_give(&__stdio_lock);
     for (int i = 0; i < natfork; i++)
         if (atfork[i].parent)
             atfork[i].parent();
@@ -419,8 +421,9 @@ void __fork_child(void)
     struct __pthread *self = __self();
     self->tid = sys4(SYS_gettid, 0, 0, 0, 0);       /* the child's one thread has a new id */
     live_threads = 1;
-    __rlock_give(&__stdio_lock);
+    __stdio_fork_child();               /* streams other threads had locked are free */
     __rlock_give(&__malloc_lock);
+    __rlock_give(&__stdio_lock);
     for (int i = 0; i < natfork; i++)
         if (atfork[i].child)
             atfork[i].child();

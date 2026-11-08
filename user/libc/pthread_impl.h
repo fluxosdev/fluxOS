@@ -56,7 +56,8 @@ void __rlock_take(struct __rlock *l);
 void __rlock_give(struct __rlock *l);
 
 void __init_tls(void);                  /* the main thread's block, before anything uses errno */
-extern struct __rlock __malloc_lock, __stdio_lock;
+extern struct __rlock __malloc_lock, __stdio_lock;     /* __stdio_lock: the list of open streams */
+void __stdio_fork_child(void);          /* stdio.c: frees the stream locks other threads held */
 void __fork_prepare(void);              /* around fork(): every lock libc has is free in the child */
 void __fork_parent(void);
 void __fork_child(void);

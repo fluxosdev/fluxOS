@@ -50,6 +50,8 @@ static struct {
     const struct sim_net *joined;
     uint8_t pmk[WPA_PMK_LEN], anonce[WPA_NONCE_LEN], ptk[WPA_PTK_LEN];
     uint64_t replay;
+    uint8_t keys[5][WPA_TK_LEN];        /* what set_key installed: the PTK, then GTKs 0-3 */
+    uint8_t key_valid[5];
     struct { uint8_t f[QFRAME]; uint32_t len, due; int rssi, channel, band; } q[QLEN];
     uint32_t qhead, qtail;
 } s;
@@ -341,18 +343,28 @@ static int authorized(void)
 static void leave(void)
 {
     s.joined = NULL;
+    memset(s.key_valid, 0, sizeof(s.key_valid));
     spin_lock(&sim_lock);
     s.qtail = s.qhead;                  /* answers still in the air are lost */
     spin_unlock(&sim_lock);
 }
 
+/* As the AX210's (iwl_sta.c): CCMP-128 keys only, while joined, the PTK as
+ * key 0 and GTKs 0-3; a key replaces the one under its ID (a rekey). The
+ * same key bytes twice would reset the hardware's counters (KRACK): the
+ * station never asks for that, and here it fails, so it would be seen. */
 static int set_key(int pairwise, int idx, const uint8_t *key, uint32_t len, const uint8_t rsc[8])
 {
-    (void)pairwise;
-    (void)idx;
-    (void)key;
-    (void)len;
     (void)rsc;
+    if (!s.joined || len != WPA_TK_LEN || idx < 0 || idx > 3 || (pairwise && idx))
+        return -EINVAL;
+    int slot = pairwise ? 0 : idx + 1;
+    if (s.key_valid[slot] && !memcmp(s.keys[slot], key, len)) {
+        klog("wifi-sim: key %d installed twice\n", slot);
+        return -EINVAL;
+    }
+    memcpy(s.keys[slot], key, len);
+    s.key_valid[slot] = 1;
     return 0;
 }
 

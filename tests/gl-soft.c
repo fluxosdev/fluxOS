@@ -368,6 +368,36 @@ static void test_mipmaps(void)
     CHECK(v == 2, "level 1 width %d", v);
     glGetIntegerv(GL_UNPACK_ALIGNMENT, &v);
     CHECK(v == 1, "unpack alignment %d after gluBuild2DMipmaps", v);
+
+    /* An error the program has not read yet neither fails it nor goes away. */
+    glEnable(0xFFFF);
+    CHECK(gluBuild2DMipmaps(GL_TEXTURE_2D, GL_LUMINANCE, 4, 4, GL_LUMINANCE, GL_UNSIGNED_BYTE, checker) == 0,
+          "gluBuild2DMipmaps failed with an error pending");
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 2, GL_TEXTURE_WIDTH, &v);
+    CHECK(v == 1, "level 2 width %d with an error pending", v);
+    GLenum e = glGetError();
+    CHECK(e == GL_INVALID_ENUM, "pending error 0x%x after gluBuild2DMipmaps", e);
+    /* GLU's error codes; an image past the largest texture is halved to fit. */
+    CHECK(gluBuild2DMipmaps(GL_TEXTURE_2D, GL_LUMINANCE, 0, 4, GL_LUMINANCE, GL_UNSIGNED_BYTE, checker) ==
+              GLU_INVALID_VALUE, "no GLU_INVALID_VALUE for width 0");
+    CHECK(gluBuild2DMipmaps(GL_TEXTURE_2D, GL_LUMINANCE, 4, 4, GL_LUMINANCE, GL_FLOAT, checker) == GLU_INVALID_ENUM,
+          "no GLU_INVALID_ENUM for GL_FLOAT");
+    CHECK(gluBuild2DMipmaps(GL_TEXTURE_2D, 99, 4, 4, GL_LUMINANCE, GL_UNSIGNED_BYTE, checker) == GLU_INVALID_VALUE,
+          "no GLU_INVALID_VALUE for internal format 99");
+    CHECK(glGetError() == GL_INVALID_VALUE, "glTexImage2D's error not left for glGetError");
+    static uint8_t wide[4096 * 2];
+    memset(wide, 200, sizeof(wide));
+    CHECK(gluBuild2DMipmaps(GL_TEXTURE_2D, GL_LUMINANCE, 4096, 2, GL_LUMINANCE, GL_UNSIGNED_BYTE, wide) == 0,
+          "gluBuild2DMipmaps of 4096 x 2 failed");
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &v);
+    CHECK(v == 2048, "4096 x 2 came down to width %d", v);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 11, GL_TEXTURE_WIDTH, &v);
+    CHECK(v == 1, "4096 x 2: level 11 width %d", v);
+
+    /* Sizes from the program's numbers that a 32-bit size_t cannot hold. */
+    CHECK(!gl_size_ok((size_t)-1 / 2, 3, 1) && !gl_size_ok(65536, 65536, ((size_t)-1 >> 32) + 1) &&
+              gl_size_ok(2048, 2048, 4) && gl_size_ok(0, (size_t)-1, 4),
+          "gl_size_ok");
     end_test();
 }
 

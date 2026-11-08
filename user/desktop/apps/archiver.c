@@ -21,6 +21,11 @@
 #include <time.h>
 #include <unistd.h>
 #include "desktop.h"
+#include "dialog.h"
+
+/* The most a prompt's text field holds: a longer path would come back from it cut short. */
+#define PROMPT_MAX ((int)sizeof(((struct dialog *)0)->edit) - 1)
+_Static_assert(sizeof(((struct dialog *)0)->edit) >= 128, "a prompt holds a file name");
 
 #define AW_W        600
 #define AW_H        400
@@ -87,7 +92,11 @@ struct arcwin {
     char indexfile[80], opening_path[PATH_LEN], reload_cwd[PATH_LEN];
     int extract_after_open;
     int overwrite;                      /* for the job about to start */
-    uint8_t *pending;                   /* names chosen before the destination was asked */
+    /* What the destination prompt is about, as it was when it opened: the archive, and the
+     * names chosen in it (NULL: everything). The folder shown may change meanwhile. */
+    char **pending;
+    int npending;
+    char pending_archive[PATH_LEN];
 };
 
 static struct arcwin *wins;
@@ -919,23 +928,6 @@ static void start_job(struct arcwin *w, int job, const char *dest, char **names,
     paint(w);
 }
 
-/* The names of the selected rows (folders stand for all they hold); NULL: none chosen. */
-static char **chosen_names(struct arcwin *w, const uint8_t *chosen, int *n)
-{
-    *n = 0;
-    if (!chosen)
-        return NULL;
-    char **v = calloc((size_t)w->nrows + 1, sizeof(char *));
-    for (int i = 0; v && i < w->nrows; i++) {
-        if (!chosen[i])
-            continue;
-        char name[PATH_LEN * 2];
-        full_name(w, &w->rows[i], name, sizeof(name));
-        v[(*n)++] = strdup(name);
-    }
-    return v;
-}
-
 static void free_names(char **v, int n)
 {
     for (int i = 0; i < n; i++)
@@ -943,14 +935,57 @@ static void free_names(char **v, int n)
     free(v);
 }
 
+/* unzip -@ reads one name a line: a name with a line break (or ending in a CR) would be read
+ * as others. Says so, if it is one. */
+static int listable(const char *name)
+{
+    size_t l = strlen(name);
+    if (!strchr(name, '\n') && !(l && name[l - 1] == '\r'))
+        return 1;
+    message_box("Archive Manager", ICON_WARNING,
+                "A name in the archive holds a line break, so it cannot be chosen alone: extract everything instead.");
+    return 0;
+}
+
+/* The full names of the selected rows (folders stand for all they hold), with how many in *n;
+ * NULL with *n -1 if one cannot be passed to unzip, or there is no memory. */
+static char **selected_names(struct arcwin *w, int *n)
+{
+    char **v = calloc((size_t)w->nrows + 1, sizeof(char *));
+    *n = 0;
+    for (int i = 0; v && i < w->nrows; i++) {
+        if (!w->rows[i].sel)
+            continue;
+        char name[PATH_LEN * 2];
+        full_name(w, &w->rows[i], name, sizeof(name));
+        if (!listable(name) || !(v[*n] = strdup(name))) {
+            free_names(v, *n);
+            *n = -1;
+            return NULL;
+        }
+        (*n)++;
+    }
+    if (!v)
+        *n = -1;
+    return v;
+}
+
+static void forget_pending(struct arcwin *w)
+{
+    free_names(w->pending, w->npending);
+    w->pending = NULL;
+    w->npending = 0;
+}
+
 static void run_extract(struct arcwin *w)
 {
-    int n;
-    char **names = chosen_names(w, w->pending, &n);
-    start_job(w, JOB_EXTRACT, w->dest, names, n, 0);
-    free_names(names, n);
-    free(w->pending);
-    w->pending = NULL;
+    if (strcmp(w->path, w->pending_archive)) {
+        forget_pending(w);
+        message_box("Archive Manager", ICON_WARNING, "Another archive was opened meanwhile: choose what to extract again.");
+        return;
+    }
+    start_job(w, JOB_EXTRACT, w->dest, w->pending, w->npending, 0);
+    forget_pending(w);
 }
 
 static void replace_yes(void *ctx)
@@ -1007,14 +1042,13 @@ static void dest_chosen(void *ctx, const char *text)
 /* Ask where to extract; selected: only the selected rows. */
 static void ask_extract(struct arcwin *w, int selected)
 {
-    free(w->pending);
-    w->pending = NULL;
-    if (selected) {
-        w->pending = calloc((size_t)w->nrows + 1, 1);
-        if (!w->pending)
-            return;
-        for (int i = 0; i < w->nrows; i++)
-            w->pending[i] = w->rows[i].sel;
+    char **names = NULL;
+    int n = 0;
+    if (selected && !(names = selected_names(w, &n)))
+        return;
+    if (selected && !n) {               /* nothing chosen is not everything */
+        free_names(names, n);
+        return;
     }
     /* next to the archive, in a folder named after it; at home if that cannot be written */
     char dir[PATH_LEN], name[PATH_LEN], def[PATH_LEN * 2];
@@ -1035,7 +1069,23 @@ static void ask_extract(struct arcwin *w, int selected)
     if (dot && dot != name)
         *dot = 0;
     snprintf(def, sizeof(def), "%s%s%s", dir, dir[strlen(dir) - 1] == '/' ? "" : "/", name);
-    ask_text(selected ? "Extract" : "Extract All", "Extract the files to this folder:", def, dest_chosen, w);
+    if ((int)strlen(def) > PROMPT_MAX) {
+        /* cut short it would name another folder (made if missing): at home, else typed in */
+        const char *home = getenv("HOME");
+        snprintf(def, sizeof(def), "%s/%s", home ? home : "", name);
+        if ((int)strlen(def) > PROMPT_MAX)
+            def[0] = 0;
+    }
+    /* What is chosen now is what gets extracted, whatever the window shows by the answer. */
+    if (!ask_text_cancel(selected ? "Extract" : "Extract All", "Extract the files to this folder:", def,
+                         dest_chosen, NULL, w)) {
+        free_names(names, n);           /* another prompt is up: it keeps what it was about */
+        return;
+    }
+    forget_pending(w);
+    w->pending = names;
+    w->npending = n;
+    snprintf(w->pending_archive, sizeof(w->pending_archive), "%s", w->path);
 }
 
 /* Double-clicking a file: extract it to /tmp and open it there. */
@@ -1048,13 +1098,20 @@ static void view_row(struct arcwin *w, int i)
                     "This file uses a compression method the Archive Manager cannot unpack.");
         return;
     }
-    char dest[PATH_LEN];
-    mkdir("/tmp", 01777);
-    mkdir(VIEW_DIR, 0755);
-    snprintf(dest, sizeof(dest), VIEW_DIR "/%d", (int)(now_ms() % 100000));
-    mkdir(dest, 0755);
     char name[PATH_LEN * 2], *names[1] = { name };
     full_name(w, r, name, sizeof(name));
+    if (!listable(name))
+        return;
+    /* a folder of its own that no one else made: never one that is there already */
+    char dest[PATH_LEN];
+    struct stat st;
+    mkdir("/tmp", 01777);
+    mkdir(VIEW_DIR, 0700);
+    snprintf(dest, sizeof(dest), VIEW_DIR "/XXXXXX");
+    if (lstat(VIEW_DIR, &st) < 0 || !S_ISDIR(st.st_mode) || !mkdtemp(dest)) {
+        message_box("Archive Manager", ICON_WARNING, "Cannot make a folder in " VIEW_DIR " to open the file in.");
+        return;
+    }
     snprintf(w->view_name, sizeof(w->view_name), "%s", r->name);
     w->overwrite = 1;
     start_job(w, JOB_VIEW, dest, names, 1, 1);
@@ -1095,6 +1152,8 @@ static void button_action(struct arcwin *w, int b)
         const char *home = getenv("HOME");
         char def[PATH_LEN];
         snprintf(def, sizeof(def), "%s", w->a ? w->path : home ? home : "/");
+        if ((int)strlen(def) > PROMPT_MAX)  /* cut short it would name another file */
+            snprintf(def, sizeof(def), "%s", home && (int)strlen(home) <= PROMPT_MAX ? home : "/");
         ask_text("Open Archive", "The ZIP or 7z file to open:", def, do_open, w);
         break;
     }
@@ -1293,7 +1352,7 @@ static void aw_key(struct window *win, const struct input_event *ev)
         move_cursor(w, c + vis, shift);
     } else if (ev->code == KEY_ENTER) {
         open_row(w, c);
-    } else if (ev->len == 1 && ev->text[0] == 0x08) {  /* Backspace */
+    } else if (ev->len == 1 && (ev->text[0] == 0x7F || ev->text[0] == 0x08)) {     /* Backspace, Ctrl+H */
         go_up(w);
     } else if (ev->code == KEY_ESC) {
         cancel_job(w);
@@ -1340,7 +1399,7 @@ static void aw_destroy(struct window *win)
         }
     free_rows(w);
     free(w->rows);
-    free(w->pending);
+    forget_pending(w);
     close_index(w);
     if (w->listfile[0])
         unlink(w->listfile);            /* closed mid-extract: the job's end never comes */

@@ -479,7 +479,7 @@ int getlogin_r(char *buf, size_t size)
 
 int nanosleep(const struct timespec *req, struct timespec *rem)
 {
-    if (req->tv_nsec < 0 || req->tv_nsec >= 1000000000) {
+    if (req->tv_sec < 0 || req->tv_nsec < 0 || req->tv_nsec >= 1000000000) {
         errno = EINVAL;
         return -1;
     }
@@ -642,7 +642,8 @@ int pause(void)
 
 int select(int nfds, fd_set *rd, fd_set *wr, fd_set *ex, struct timeval *timeout)
 {
-    if (nfds < 0 || nfds > FD_SETSIZE) {
+    if (nfds < 0 || nfds > FD_SETSIZE ||
+        (timeout && (timeout->tv_sec < 0 || timeout->tv_usec < 0 || timeout->tv_usec >= 1000000))) {
         errno = EINVAL;
         return -1;
     }

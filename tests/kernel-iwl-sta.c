@@ -131,6 +131,10 @@ int main(void)
     CHECK(scan_command.scan_params.channel_params.channel_config[1].flags==0);
     CHECK(scan()==-EBUSY);
     st.scanning=0;
+    /* A new scan has a new UID: a late completion of the last one cannot end it. */
+    uint32_t first_uid=scan_command.uid;
+    CHECK(scan()==0 && scan_command.uid!=first_uid);
+    st.scanning=0;
     rx_test(); tx_test();
     /* Passive-only and radar channels can be joined; invalid ones cannot. */
     iwl_have_chan_flags=1; iwl_chan_flags[18]=NVM_VALID|NVM_RADAR;
@@ -138,6 +142,13 @@ int main(void)
     CHECK(channel_joinable(52,BAND_5GHZ));
     CHECK(!channel_joinable(2,BAND_2GHZ) && !channel_joinable(165,BAND_5GHZ));
     st.mac=st.link=1; join_test();
+    /* A pairwise rekey replaces the key (the old one removed first). */
+    uint8_t key[16]={1};
+    st.active=1; ncmds=0;
+    CHECK(set_key(1,0,key,16,NULL)==0 && st.key_valid[0]);
+    key[0]=2;
+    CHECK(set_key(1,0,key,16,NULL)==0 && st.key_valid[0] && ncmds==3);
+    st.active=0;
     iwl_have_chan_flags=0; CHECK(!channel_joinable(1,BAND_2GHZ));
     uint8_t packet[64]={0}; struct iwl_rx_packet *p=(void*)packet;
     p->cmd=0x1c; p->len_n_flags=4+47; p->data[0]=1;

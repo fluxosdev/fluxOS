@@ -285,7 +285,8 @@ static uint32_t get_src_int(struct exec *e, uint8_t attr, int *ptr, uint32_t *sa
     case ATOM_ARG_FB:
         idx = U8(*ptr);
         (*ptr)++;
-        if (g->fb_base + idx * 4 >= g->scratch_size_bytes) {
+        /* In 64 bits: fb_base is whatever the table set (SETFBBASE). */
+        if ((uint64_t)g->fb_base + idx * 4 + 4 > g->scratch_size_bytes) {
             klog("atom: scratch read past its end\n");
             val = 0;
         } else {
@@ -422,7 +423,7 @@ static void put_dst(struct exec *e, int arg, uint8_t attr, int *ptr, uint32_t va
     case ATOM_ARG_FB:
         idx = U8(*ptr);
         (*ptr)++;
-        if (g->fb_base + idx * 4 >= g->scratch_size_bytes)
+        if ((uint64_t)g->fb_base + idx * 4 + 4 > g->scratch_size_bytes)
             klog("atom: scratch write past its end\n");
         else
             g->scratch[g->fb_base / 4 + idx] = val;

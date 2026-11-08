@@ -282,6 +282,45 @@ static void exercise(uint32_t bs)
     }
     put("/mnt/many/new-in-a-gap", "gap", 3, 0);
 
+    /* readdir in batches of 16 (as libc's) while unlinking what it returns: none skipped */
+    CHECK(create("/mnt/drain", VN_DIR, NULL) == 0);
+    for (int i = 0; i < 40; i++) {
+        snprintf(path, sizeof(path), "/mnt/drain/f%02d", i);
+        put(path, "x", 1, 0);
+    }
+    struct vnode *drain = look("/mnt/drain", 1);
+    CHECK(drain);
+    char after[NAME_MAX + 1] = "";
+    uint32_t index = 0, seen = 0, after_index = UINT32_MAX;
+    for (int more = 1; more;) {
+        struct dirent batch[16];
+        int got = 0;
+        vfs_lock();
+        while (got < 16) {
+            int r = vfs_dirent(drain, index, after_index == index ? after : NULL, &batch[got]);
+            CHECK(r >= 0);
+            if (!r) {
+                more = 0;
+                break;
+            }
+            if (index++ >= 2) {
+                strcpy(after, batch[got].d_name);
+                after_index = index;
+            }
+            got++;
+        }
+        vfs_unlock();
+        for (int i = 0; i < got; i++) {
+            if (!strcmp(batch[i].d_name, ".") || !strcmp(batch[i].d_name, ".."))
+                continue;
+            snprintf(path, sizeof(path), "/mnt/drain/%s", batch[i].d_name);
+            CHECK(LOCKED(vfs_unlink(path, NULL)) == 0);
+            seen++;
+        }
+    }
+    CHECK(seen == 40 && !drain->children);
+    CHECK(LOCKED(vfs_rmdir("/mnt/drain", NULL)) == 0);
+
     /* symbolic links: fast and slow, to files and directories, relative and absolute */
     CHECK(LOCKED(vfs_symlink("small.txt", "/mnt/link-small", NULL)) == 0);
     CHECK(LOCKED(vfs_symlink("/mnt/dir/sub", "/mnt/link-sub", NULL)) == 0);
@@ -308,6 +347,14 @@ static void exercise(uint32_t bs)
     CHECK(!look("/mnt/loop1", 1) && LOCKED(vfs_lookup("/mnt/loop1", NULL, 1, &vn)) == -ELOOP);
     CHECK(LOCKED(vfs_lookup("/mnt/dangling", NULL, 1, &vn)) == -ENOENT);
     CHECK(look("/mnt/dangling", 0));
+    /* open(O_CREAT) through a dangling link makes the file it points at; O_EXCL refuses */
+    CHECK(LOCKED(vfs_symlink("../made-through", "/mnt/dir/sub/to-be", NULL)) == 0);
+    CHECK(LOCKED(vfs_create_file("/mnt/dir/sub/to-be", NULL, 1, &vn)) == -EEXIST);
+    CHECK(LOCKED(vfs_create_file("/mnt/dir/sub/to-be", NULL, 0, &vn)) == 0 && vn->type == VN_FILE &&
+          !strcmp(vn->name, "made-through") && vn->parent == look("/mnt/dir", 1));
+    CHECK(look("/mnt/dir/sub/to-be", 1) == vn);
+    CHECK(LOCKED(vfs_create_file("/mnt/loop1", NULL, 0, &vn)) == -ELOOP);
+    CHECK(LOCKED(vfs_unlink("/mnt/dir/sub/to-be", NULL)) == 0 && LOCKED(vfs_unlink("/mnt/dir/made-through", NULL)) == 0);
     /* ".." after a link is the target's parent (/mnt/dir/sub/.. is /mnt/dir) */
     CHECK(LOCKED(vfs_lookup("/mnt/link-sub/../small.txt", NULL, 1, &vn)) == -ENOENT);
     CHECK(LOCKED(vfs_lookup("/mnt/link-sub/../../small.txt", NULL, 1, &vn)) == 0 && vn->type == VN_FILE &&
@@ -648,7 +695,49 @@ static void crafted(void)
     for (int k = 0; k < 3; k++)
         CHECK(!look("/mnt/d/a-name-long-enough-to-fill-blocks-00", 1));
     CHECK(!d->children && !d->loaded);
+    /* the damage is an error, not "no such file", and nothing is made beside it */
+    struct vnode *vn;
+    CHECK(LOCKED(vfs_lookup("/mnt/d/a-name-long-enough-to-fill-blocks-00", NULL, 1, &vn)) == -EIO);
+    CHECK(create("/mnt/d/new", VN_FILE, NULL) == -EIO);
     unmount_image();
+
+    /* A volume probed and given up (vfs_mount_root without /bin/init) is left clean. */
+    load_image();
+    memset(&bd, 0, sizeof(bd));
+    strcpy(bd.name, "test");
+    bd.sector_size = 512;
+    bd.nsectors = disk_sectors;
+    struct fs *probed;
+    CHECK(rd16(disk + 1024 + 58) & 1);
+    vfs_lock();
+    CHECK(fs_probe(&bd, "ext2", &probed) == 0);
+    CHECK(!(rd16(disk + 1024 + 58) & 1));
+    fs_discard(probed);
+    vfs_unlock();
+    CHECK(rd16(disk + 1024 + 58) & 1);
+
+    /* Directories nested deeper than a kernel stack could recurse: walked
+     * by parent pointers when an unmount looks for users and frees them. */
+    struct vnode *top = vnode_new("top", VN_DIR), *v = top;
+    CHECK(top);
+    top->parent = top;
+    for (int i = 0; i < 100000; i++) {
+        struct vnode *c = vnode_new(i % 2 ? "b" : "a", i % 1000 == 999 ? VN_FILE : VN_DIR);
+        CHECK(c);
+        attach(v, c);
+        if (i % 3 == 0) {
+            struct vnode *leaf = vnode_new("z", VN_FILE);
+            CHECK(leaf);
+            attach(v, leaf);
+        }
+        if (c->type == VN_DIR)
+            v = c;
+    }
+    CHECK(!subtree_busy(top));
+    v->refs = 1;
+    CHECK(subtree_busy(top));
+    v->refs = 0;
+    subtree_free(top);
 
     /* A fast symbolic link with an extended-attribute block: its target is
      * not taken for block numbers when it goes. (block[0] is made to name a

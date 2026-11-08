@@ -100,6 +100,10 @@ struct netdev {
      * (from a process, without net_lock: the stack sends nothing meanwhile). */
     void (*suspend)(void);
     void (*resume)(void);
+    /* Optional: the link's slow work (PHY registers over a management bus),
+     * from the knetd thread without net_lock, every 2 s and soon after
+     * net_link_poke(). Never in an interrupt. */
+    void (*link_work)(void);
 };
 
 /* An Ethernet PHY on a MAC's MII management bus (mii.c). */
@@ -142,6 +146,8 @@ void net_tick(void);                    /* timer interrupt, every tick */
 void net_register(const struct netdev *dev);
 void net_receive(const uint8_t *frame, uint32_t len);   /* driver, in its IRQ */
 void net_link_changed(int up);          /* driver: the link came up or went down */
+void net_link_poke(void);               /* driver, from its IRQ: run link_work soon */
+void net_start(void);                   /* once processes run: knetd, if a driver has link_work */
 void net_get_info(struct netinfo *ni);
 int net_configure(const struct netinfo *ni);
 
@@ -200,6 +206,8 @@ struct socket {
     uint32_t laddr, raddr;      /* laddr 0: any local address */
     uint16_t lport, rport;      /* ICMP: lport is the echo identifier */
     int connected;
+    int connecting;             /* a non-blocking connect() under way (or failed, not yet told) */
+    uint32_t bound_laddr;       /* bind()'s address, kept for a connect() that fails */
     int shut_rd, shut_wr;
 
     /* datagram sockets */
@@ -241,9 +249,9 @@ uint16_t sock_ephemeral_port(int proto);
 
 int sock_create(int domain, int type, int proto, struct socket **out);
 int sock_bind(struct socket *s, const struct sockaddr_in *sin);
-int sock_connect(struct socket *s, const struct sockaddr_in *sin);
+int sock_connect(struct socket *s, const struct sockaddr_in *sin, int nonblock);
 int sock_listen(struct socket *s, int backlog);
-int sock_accept(struct socket *s, struct socket **out, struct sockaddr_in *peer);
+int sock_accept(struct socket *s, struct socket **out, struct sockaddr_in *peer, int nonblock);
 int sock_sendto(struct socket *s, const void *buf, uint32_t n, int flags,
                 const struct sockaddr_in *to);
 int sock_recvfrom(struct socket *s, void *buf, uint32_t n, int flags, struct sockaddr_in *from);

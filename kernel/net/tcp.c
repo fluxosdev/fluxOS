@@ -226,7 +226,10 @@ static void retransmit(struct socket *s)
 {
     int probe = s->snd_wnd == 0 && s->snd_nxt == s->snd_una && s->slen > 0;
     int max = s->state == TCP_SYN_SENT || s->state == TCP_SYN_RECEIVED ? SYN_RETRIES : DATA_RETRIES;
-    if (!probe && ++s->retries > max) {
+    /* A peer that answers our probes may keep its window shut as long as it
+     * likes (RFC 1122 4.2.2.17), unless nobody is left to send the data. */
+    int orphan = !s->has_file && !s->queued;
+    if ((!probe || orphan) && ++s->retries > max) {
         tcp_closed(s, ETIMEDOUT);
         return;
     }
@@ -241,11 +244,12 @@ static void retransmit(struct socket *s)
     } else if (s->state == TCP_SYN_RECEIVED) {
         send_segment(s, s->iss, TCP_SYN | TCP_ACK, NULL, 0);
     } else if (probe) {
-        /* One byte past the closed window: the reply tells us when it opens. */
+        /* One byte past the closed window: the reply tells us when it opens.
+         * snd_nxt stays: once it opens, that byte goes again with the rest
+         * (the peer most likely dropped it); snd_max covers an ACK of it. */
         send_segment(s, s->snd_una, TCP_ACK, s->sbuf, 1);
-        s->snd_nxt = s->snd_una + 1;
-        if (SEQ_GT(s->snd_nxt, s->snd_max))
-            s->snd_max = s->snd_nxt;
+        if (SEQ_GT(s->snd_una + 1, s->snd_max))
+            s->snd_max = s->snd_una + 1;
     } else {
         /* Go back to the oldest unacknowledged byte; ACKs bring the rest. */
         s->snd_nxt = s->snd_una;
@@ -358,8 +362,9 @@ static void syn_sent_input(struct socket *s, const struct seg *g)
     s->rtt_timing = 0;
     s->retries = 0;
     s->rtx_on = 0;
-    s->state = TCP_ESTABLISHED;
+    s->state = s->fin_queued ? TCP_FIN_WAIT_1 : TCP_ESTABLISHED;   /* shut down while connecting */
     send_ack(s);
+    output(s, 0);
     sock_wake(s);
 }
 
@@ -456,8 +461,9 @@ static int ack_input(struct socket *s, const struct seg *g)
                 break;
             }
         }
-    } else if (g->ack == s->snd_una && g->len == 0 && g->win == s->snd_wnd &&
+    } else if (g->ack == s->snd_una && g->len == 0 && g->win && g->win == s->snd_wnd &&
                s->snd_max != s->snd_una && !(g->flags & TCP_FIN)) {
+        /* (An answer to a zero-window probe is not a duplicate.) */
         /* The third duplicate ACK: the segment at snd_una was lost. */
         if (++s->dupacks == 3 && s->slen) {
             send_segment(s, s->snd_una, TCP_ACK, s->sbuf, MIN(s->slen, (uint32_t)s->mss));
@@ -489,7 +495,7 @@ static void data_input(struct socket *s, const struct seg *g, int *need_ack)
     if (!n || seq != s->rcv_nxt)
         return;                         /* out of order: wait for the gap to be resent */
     uint32_t take = MIN(n, rcv_window(s));
-    if (s->has_file || s->queued) {
+    if (s->has_file || s->queued) {     /* (a closed socket's data was refused by the caller) */
         uint32_t tail = (s->rhead + s->rlen) % TCP_RING;
         uint32_t first = MIN(take, TCP_RING - tail);
         memcpy(s->rbuf + tail, d, first);
@@ -497,7 +503,6 @@ static void data_input(struct socket *s, const struct seg *g, int *need_ack)
         s->rlen += take;
         sock_wake(s);
     }
-    /* A closed socket has no reader: the data is acknowledged and dropped. */
     s->rcv_nxt += take;
 }
 
@@ -567,8 +572,16 @@ static void synchronized_input(struct socket *s, const struct seg *g)
 
     int need_ack = 0;
     if (g->len && (s->state == TCP_ESTABLISHED || s->state == TCP_FIN_WAIT_1 ||
-                   s->state == TCP_FIN_WAIT_2))
+                   s->state == TCP_FIN_WAIT_2)) {
+        if (!s->has_file && !s->queued && SEQ_GT(g->seq + g->len, s->rcv_nxt)) {
+            /* New data for a closed socket: nobody will read it, so the
+             * peer must not think it delivered (RFC 1122 4.2.2.13). */
+            send_reset(s);
+            tcp_closed(s, 0);
+            return;
+        }
         data_input(s, g, &need_ack);
+    }
     if (g->flags & TCP_FIN)
         fin_input(s, g, &need_ack);
     if (need_ack)
@@ -683,8 +696,8 @@ int tcp_read(struct socket *s, uint8_t *buf, uint32_t n, int peek)
 
 void tcp_shutdown(struct socket *s)
 {
-    if (s->state == TCP_SYN_RECEIVED) {
-        s->fin_queued = 1;              /* sent once our SYN is acknowledged */
+    if (s->state == TCP_SYN_SENT || s->state == TCP_SYN_RECEIVED) {
+        s->fin_queued = 1;              /* sent once the connection is synchronized */
         return;
     }
     if (s->state == TCP_ESTABLISHED)

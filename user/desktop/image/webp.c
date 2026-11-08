@@ -293,7 +293,8 @@ static int decode_pixels(struct lbits *b, int xsize, int ysize, int is_main, uin
 {
     uint32_t *pix = NULL, *meta = NULL, *cache = NULL;
     struct hgroup *groups = NULL;
-    int ngroups = 0, rc = -1;
+    int *map = NULL;
+    int ngroups = 0, ncodes = 1, rc = -1;
     int cache_bits = 0, meta_bits = 0, meta_xsize = 0;
     size_t total = (size_t)xsize * ysize;
     pix = malloc(total * sizeof(uint32_t));
@@ -313,10 +314,20 @@ static int decode_pixels(struct lbits *b, int xsize, int ysize, int is_main, uin
         int meta_ysize = (ysize + (1 << meta_bits) - 1) >> meta_bits;
         if (decode_pixels(b, meta_xsize, meta_ysize, 0, &meta))
             goto fail;
+        /* The codes of groups 0 to the largest index used are all in the stream, but only those used
+         * are kept (renumbered), so a tiny file naming group 65535 does not ask for 65536 of them. */
+        map = malloc(65536 * sizeof(int));
+        if (!map)
+            goto fail;
+        memset(map, 0xFF, 65536 * sizeof(int));
+        ncodes = 0;
         for (int i = 0; i < meta_xsize * meta_ysize; i++) {
             int g = (int)((meta[i] >> 8) & 0xFFFF);
-            if (g + 1 > ngroups)
-                ngroups = g + 1;
+            if (g + 1 > ncodes)
+                ncodes = g + 1;
+            if (map[g] < 0)
+                map[g] = ngroups++;
+            meta[i] = (uint32_t)map[g];
         }
     } else {
         ngroups = 1;
@@ -324,11 +335,17 @@ static int decode_pixels(struct lbits *b, int xsize, int ysize, int is_main, uin
     groups = calloc((size_t)ngroups, sizeof(*groups));
     if (!groups)
         goto fail;
-    for (int g = 0; g < ngroups; g++) {
+    for (int g = 0; g < ncodes; g++) {
         static const int base[5] = {256 + 24, 256, 256, 256, 40};
+        struct hgroup unused;
+        memset(&unused, 0, sizeof(unused));
+        struct hgroup *to = !map ? &groups[g] : map[g] >= 0 ? &groups[map[g]] : &unused;
         for (int k = 0; k < 5; k++) {
             int alpha = base[k] + (k == 0 && cache_bits ? 1 << cache_bits : 0);
-            if (read_huff_code(b, &groups[g].c[k], alpha))
+            int bad = read_huff_code(b, &to->c[k], alpha);
+            if (to == &unused)
+                huff_free(&unused.c[k]);
+            if (bad)
                 goto fail;
         }
     }
@@ -338,7 +355,7 @@ static int decode_pixels(struct lbits *b, int xsize, int ysize, int is_main, uin
         struct hgroup *g = &groups[0];
         while (pos < total) {
             if (meta)
-                g = &groups[(meta[(y >> meta_bits) * meta_xsize + (x >> meta_bits)] >> 8) & 0xFFFF];
+                g = &groups[meta[(y >> meta_bits) * meta_xsize + (x >> meta_bits)]];
             int s = huff_read(b, &g->c[0]);
             if (lb_bad(b))
                 goto fail;
@@ -407,6 +424,7 @@ static int decode_pixels(struct lbits *b, int xsize, int ysize, int is_main, uin
     rc = 0;
 fail:
     groups_free(groups, ngroups);
+    free(map);
     free(cache);
     free(meta);
     if (rc) {
@@ -839,8 +857,9 @@ static int get_coeffs(struct bd *br, uint8_t (*pr)[3][11], int ctx, const int *d
     return 16;
 }
 
-#define MUL1(a) ((((a)*20091) >> 16) + (a))
-#define MUL2(a) (((a)*35468) >> 16)
+/* (in 64 bits: damaged data can make the sums large enough to overflow an int) */
+#define MUL1(a) ((int)(((int64_t)(a)*20091) >> 16) + (a))
+#define MUL2(a) ((int)(((int64_t)(a)*35468) >> 16))
 
 static void idct_add(const int16_t *in, uint8_t *dst)
 {
@@ -1757,8 +1776,8 @@ struct image *image_decode_webp(const uint8_t *data, uint32_t len)
         return NULL;
     uint32_t riff = rd32(data + 4);
     const uint8_t *end = data + len;
-    if (riff + 8 < len)
-        end = data + riff + 8;
+    if (riff < len - 8)                 /* (riff + 8 could wrap) */
+        end = data + 8 + riff;
     const uint8_t *p = data + 12;
     int cw = 0, ch = 0;
     while (end - p >= 8) {

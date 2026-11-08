@@ -11,6 +11,8 @@
 #include <glob.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <math.h>
+#include <pthread.h>
 #include <pwd.h>
 #include <regex.h>
 #include <signal.h>
@@ -109,6 +111,14 @@ static void test_files(void)
     char cwd[PATH_MAX], real[PATH_MAX];
     CHECK(getcwd(cwd, sizeof(cwd)) && !strcmp(cwd, dirt));
     CHECK(realpath("../../tmp/./", real) && !strcmp(real, "/tmp"));
+    char *dyn = getcwd(NULL, 0);
+    CHECK(dyn && !strcmp(dyn, dirt));
+    free(dyn);
+    /* realpath follows links: "l/.." is the parent of what l names */
+    CHECK(mkdir("d", 0755) == 0 && mkdir("d/e", 0755) == 0 && symlink("d/e", "l") == 0);
+    CHECK(realpath("l/..", real) && !strcmp(real + strlen(dirt), "/d"));
+    CHECK(realpath("l", real) && !strcmp(real + strlen(dirt), "/d/e"));
+    CHECK(unlink("l") == 0 && rmdir("d/e") == 0 && rmdir("d") == 0);
     CHECK(chdir("/") == 0 && rmdir(dirt) == 0);
     close(dfd);
 
@@ -122,6 +132,18 @@ static void test_files(void)
     char fixed[16];
     FILE *fm = fmemopen(fixed, sizeof(fixed), "w");
     CHECK(fm && fputs("hello", fm) >= 0 && fclose(fm) == 0 && !strcmp(fixed, "hello"));
+
+    /* fgets with room for the terminator only; fwrite of a size that overflows; fdopen "a" appends */
+    f = fopen(path, "w+");
+    CHECK(f && fputs("abc", f) >= 0 && fseek(f, 0, SEEK_SET) == 0);
+    CHECK(fgets(line, 1, f) == line && line[0] == 0);
+    CHECK(fwrite("x", (size_t)1 << 31, 4, f) == 0 && errno == EOVERFLOW);
+    CHECK(fclose(f) == 0);
+    fd = open(path, O_WRONLY);
+    CHECK(fd >= 0);
+    f = fdopen(fd, "a");
+    CHECK(f && fputs("d", f) >= 0 && fclose(f) == 0);
+    CHECK(stat(path, &st) == 0 && st.st_size == 4);
     CHECK(unlink(path) == 0);
 }
 
@@ -293,8 +315,47 @@ static void test_time(void)
     CHECK(strftime(buf, sizeof(buf), "%F %T %a %j", &tm) && !strcmp(buf, "2000-02-29 12:00:00 Tue 060"));
 }
 
+/* strtod and regexec from several threads at once */
+static void *libc_race(void *arg)
+{
+    intptr_t bad = 0;
+    regex_t re;
+    regmatch_t m[3];
+    int which = (int)(intptr_t)arg & 1;
+    regcomp(&re, which ? "([a-z]+)-([0-9]+)" : "(foo|bar)+", REG_EXTENDED);
+    for (int i = 0; i < 2000; i++) {
+        bad += strtod(which ? "3.14159265358979323846" : "2.2250738585072014e-308", NULL) !=
+               (which ? 3.14159265358979323846 : 2.2250738585072014e-308);
+        int r = regexec(&re, which ? "xx abc-123 yy" : "..foobarfoo..", 3, m, 0);
+        bad += which ? r || m[2].rm_so != 7 || m[2].rm_eo != 10 : r || m[0].rm_so != 2 || m[0].rm_eo != 11;
+    }
+    regfree(&re);
+    return (void *)bad;
+}
+
 static void test_misc(void)
 {
+    /* exact powers are exact; halves round away from zero; huge arguments stay in range */
+    CHECK(pow(10, 2) == 100 && pow(10, 15) == 1e15 && pow(3, 10) == 59049 && pow(2, -3) == 0.125);
+    CHECK(pow(1, NAN) == 1 && pow(-0.0, -1) == -HUGE_VAL && pow(-2, 3) == -8 && isnan(pow(-8, 1.0 / 3)));
+    CHECK(fabs(pow(2, 0.5) - 1.4142135623730951) < 1e-15);
+    CHECK(round(0.49999999999999994) == 0 && round(4503599627370497.0) == 4503599627370497.0 && round(-2.5) == -3);
+    CHECK(fabs(sin(1e20)) <= 1 && fabs(cos(1e300)) <= 1);
+    pthread_t t[4];
+    intptr_t bad = 0;
+    for (intptr_t i = 0; i < 4; i++)
+        CHECK(pthread_create(&t[i], NULL, libc_race, (void *)i) == 0);
+    for (int i = 0; i < 4; i++) {
+        void *r;
+        pthread_join(t[i], &r);
+        bad += (intptr_t)r;
+    }
+    CHECK(bad == 0);
+    struct timespec neg = { -1, 0 };
+    CHECK(nanosleep(&neg, NULL) < 0 && errno == EINVAL);
+    struct timeval ntv = { -1, 0 };
+    CHECK(select(0, NULL, NULL, NULL, &ntv) < 0 && errno == EINVAL);
+
     regex_t re;
     regmatch_t m[3];
     CHECK(regcomp(&re, "([a-z]+)=([0-9]+)", REG_EXTENDED) == 0);

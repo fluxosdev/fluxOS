@@ -147,6 +147,7 @@ int pcm_active(const struct pcm *p);    /* streams open (any lock, or none) */
 struct pcm *pcm_of(struct vnode *vn);   /* the mixer a /dev/dsp node opens; NULL if not one */
 void pcm_point(struct vnode *vn, struct pcm *p);  /* opens of vn go to p from now on */
 void pcm_tick(void);
+void pcm_sleep(struct pcm *p, int asleep);  /* the card off for suspend to RAM: writers wait for the wake */
 void hda_suspend(void);                 /* suspend to RAM: playback stopped */
 void hda_resume(void);                  /* the controller and codec set up again */
 int opl_present(void);                  /* 0, 2 (OPL2) or 3 (OPL3) */
@@ -201,7 +202,7 @@ int usb_info(int index, struct usbinfo *ui);
  * then set up again, and the devices found anew. */
 void usb_suspend(void);
 void usb_resume(void);
-int usbmsc_in_use(void);                /* a USB disk has a file system mounted */
+int usbmsc_in_use(void);                /* a USB disk has a file system mounted or its device open */
 
 /* Wireless networking (kernel/wifi): the station layer and Intel's AX210 */
 int iwl_probe(void);                    /* from net_init: 0 if a card was found */

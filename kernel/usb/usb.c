@@ -34,6 +34,8 @@ static volatile int kusbd_kicked;
 static int started;
 static int in_callback;                 /* a completion callback is running */
 static int suspended;                   /* suspend to RAM: the controllers are not to be touched */
+static int suspending;                  /* usb_suspend is taking the devices away */
+static volatile int scanning;           /* kusbd is looking at the hubs (it may let usb_lock go) */
 
 spinlock_t usb_lock = SPINLOCK_INIT("usb");
 
@@ -619,7 +621,7 @@ static void usb_disconnect(struct usb_dev *dev)
 void usb_hub_scan(struct usb_hub *h, int all)
 {
     for (int port = 1; port <= h->nports && port <= USB_MAX_PORTS; port++) {
-        if (h->dev && h->dev->gone)
+        if ((h->dev && h->dev->gone) || suspending)
             return;
         int st = h->port_status(h, port);
         if (st < 0)
@@ -657,6 +659,8 @@ void usb_hub_scan(struct usb_hub *h, int all)
 
     for (int port = 1; port <= h->nports && port <= USB_MAX_PORTS; port++) {
         struct usb_dev *c = h->child[port];
+        if (suspending || (h->dev && h->dev->gone))
+            return;
         if (c && c->hub && !c->gone && (all || c->hub->changed)) {
             c->hub->changed = 0;
             usb_hub_scan(c->hub, all);
@@ -675,10 +679,13 @@ static void kusbd(void)
         kusbd_kicked = 0;
         current->sig_pending = 0;
         spin_lock(&usb_lock);
-        if (suspended) {
+        if (suspended || suspending) {
             spin_unlock(&usb_lock);
             continue;
         }
+        /* The scan lets usb_lock go while it waits for devices: usb_suspend
+         * waits for it to end before taking the devices (and hubs) away. */
+        scanning = 1;
         /* Hub devices report changes; every few seconds look anyway. */
         int all = (int32_t)(ticks - last_full) >= 3 * HZ;
         if (all)
@@ -686,6 +693,8 @@ static void kusbd(void)
         for (struct usb_hc *hc = hcs; hc; hc = hc->next)
             usb_hub_scan(&hc->root, all);
         usbhid_service();
+        scanning = 0;
+        wakeup((void *)&scanning);
         spin_unlock(&usb_lock);
     }
 }
@@ -746,6 +755,11 @@ void usb_suspend(void)
     if (!hcs)
         return;
     spin_lock(&usb_lock);
+    /* A scan in progress holds pointers to hubs and devices: let it end
+     * (it stops early once it sees suspending), and start no other. */
+    suspending = 1;
+    while (scanning)
+        sleep_on_lock((void *)&scanning, &usb_lock);
     for (struct usb_hc *hc = hcs; hc; hc = hc->next) {
         for (int port = 1; port <= hc->root.nports && port <= USB_MAX_PORTS; port++) {
             struct usb_dev *child = hc->root.child[port];
@@ -758,6 +772,7 @@ void usb_suspend(void)
         if (hc->ops->suspend)
             hc->ops->suspend(hc);
     suspended = 1;
+    suspending = 0;
     spin_unlock(&usb_lock);
 }
 

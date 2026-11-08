@@ -23,7 +23,7 @@
 #include "web.h"
 
 #define MAX_PARTS   16
-#define MAX_MATCHES 512
+#define MAX_MATCHES 4096            /* declarations matching one element (and its pseudo-elements); heap-allocated */
 #define INDEX_BUCKETS 256
 
 enum prop {
@@ -2517,10 +2517,13 @@ struct nkeys {
     const char *id;
     uint32_t id_h;
     int ncls;
+    unsigned sgen;              /* sib_first and sib_last hold for the cascade pass numbered sib_gen */
+    int sib_first, sib_last;    /* its place among its element siblings, from the first and from the last */
     struct nclass cls[];
 };
 
 static unsigned key_gen = 1;            /* bumped by every cascade: older keys are stale */
+static unsigned sib_gen = 1;            /* bumped by every pass over a tree (it does not change during one) */
 static struct arena *key_arena;
 
 static const struct nkeys *node_keys(const struct node *cn)
@@ -2649,6 +2652,36 @@ static const struct node *next_element(const struct node *n)
     for (n = n->next; n && n->type != N_ELEMENT; n = n->next)
         ;
     return n;
+}
+
+/*
+ * An element's place among its element siblings (from 1; from the last with last), for :nth-child()
+ * and :nth-last-child(). Counting them for every element would be quadratic in a long list of siblings:
+ * the first time in a pass, the whole list is numbered. -1 if the keys cannot be had (then count).
+ */
+static int sibling_index(const struct node *n, int last)
+{
+    struct nkeys *k = (struct nkeys *)node_keys(n);
+    if (!k)
+        return -1;
+    if (k->sgen != sib_gen) {
+        const struct node *first = n, *p;
+        while ((p = prev_element(first)))
+            first = p;
+        int count = 0;
+        for (p = first; p; p = next_element(p)) {
+            struct nkeys *pk = (struct nkeys *)node_keys(p);
+            if (!pk)
+                return -1;
+            pk->sgen = sib_gen;
+            pk->sib_first = ++count;
+        }
+        for (p = first; p; p = next_element(p)) {
+            struct nkeys *pk = (struct nkeys *)node_keys(p);
+            pk->sib_last = count + 1 - pk->sib_first;
+        }
+    }
+    return last ? k->sib_last : k->sib_first;
 }
 
 /*
@@ -3140,15 +3173,18 @@ static int match_compound(const struct compound *c, const struct node *n, const 
     if (c->has_nth) {
         if (!match_nth_filter(c, n, m))
             return 0;
-        int idx = 1;
-        if (c->nth_last) {
-            for (const struct node *p = next_element(n); p; p = next_element(p))
-                if ((!c->nth_of_type || same_type(p, n)) && match_nth_filter(c, p, m))
-                    idx++;
-        } else {
-            for (const struct node *p = prev_element(n); p; p = prev_element(p))
-                if ((!c->nth_of_type || same_type(p, n)) && match_nth_filter(c, p, m))
-                    idx++;
+        int idx = !c->nnth && !c->nth_of_type ? sibling_index(n, c->nth_last) : -1;
+        if (idx <= 0) {                 /* "of S" and -of-type: count the siblings that qualify */
+            idx = 1;
+            if (c->nth_last) {
+                for (const struct node *p = next_element(n); p; p = next_element(p))
+                    if ((!c->nth_of_type || same_type(p, n)) && match_nth_filter(c, p, m))
+                        idx++;
+            } else {
+                for (const struct node *p = prev_element(n); p; p = prev_element(p))
+                    if ((!c->nth_of_type || same_type(p, n)) && match_nth_filter(c, p, m))
+                        idx++;
+            }
         }
         if (!web_nth_fits(c->nth_a, c->nth_b, idx))
             return 0;
@@ -3191,48 +3227,80 @@ static int match_compound(const struct compound *c, const struct node *n, const 
     return 1;
 }
 
-static int match_from(const struct selector *s, int i, const struct node *n, const struct mctx *m)
+/*
+ * Matching compound i and those left of it, from n. Besides a match, a failure says how far it
+ * reaches, so that the walks over ancestors and siblings stop when trying further cannot help
+ * (otherwise "a b c d e" on a deep tree backtracks exponentially):
+ *   M_FAIL_LOCAL     only this n failed: another candidate may do;
+ *   M_FAIL_SIBLINGS  no earlier sibling of n (or of the element it was reached from) can do;
+ *   M_FAIL_ALL       no ancestor of n can do either: what is left of the selector ran out of tree.
+ */
+enum { M_MATCH, M_FAIL_LOCAL, M_FAIL_SIBLINGS, M_FAIL_ALL };
+
+static int match_rec(const struct selector *s, int i, const struct node *n, const struct mctx *m)
 {
-    if (!n) return 0;
+    if (!n) return M_FAIL_ALL;
+    int slotted = 0;
     if (s->parts[i].nslot) {
-        if (!m->host || n->parent != m->host || n->type != N_ELEMENT) return 0;
+        if (!m->host || n->parent != m->host || n->type != N_ELEMENT) return M_FAIL_LOCAL;
         struct mctx outer = *m;
         outer.host = NULL;
-        if (!match_from(s->parts[i].slot_args, 0, n, &outer)) return 0;
+        if (!match_from(s->parts[i].slot_args, 0, n, &outer)) return M_FAIL_LOCAL;
         const char *name = node_attr(n, "slot");
         n = shadow_slot((struct node *)m->host, name ? name : "");
-        if (!n) return 0;
+        if (!n) return M_FAIL_LOCAL;
+        slotted = 1;
     }
     if (!match_compound(&s->parts[i], n, m))
-        return 0;
+        return M_FAIL_LOCAL;
     if (i == 0)
-        return 1;
+        return M_MATCH;
     const struct node *p;
+    int r;
     switch (s->parts[i].comb) {
     case '>':
         p = n->parent;
         if (p && p->shadow_host == m->host && m->host) p = m->host;
-        return p && match_from(s, i - 1, p, m);
+        r = p ? match_rec(s, i - 1, p, m) : M_FAIL_ALL;
+        if (r == M_FAIL_SIBLINGS)
+            r = M_FAIL_LOCAL;           /* about the parent's siblings, not the caller's candidates */
+        break;
     case '+':
         if (n == cur_subject)
             cur_flags |= SF_NOSHARE;    /* depends on where it stands among its siblings */
         p = prev_element(n);
-        return p && match_from(s, i - 1, p, m);
+        r = p ? match_rec(s, i - 1, p, m) : M_FAIL_SIBLINGS;
+        break;
     case '~':
         if (n == cur_subject)
             cur_flags |= SF_NOSHARE;
+        r = M_FAIL_SIBLINGS;
         for (p = prev_element(n); p; p = prev_element(p))
-            if (match_from(s, i - 1, p, m))
-                return 1;
-        return 0;
+            if ((r = match_rec(s, i - 1, p, m)) != M_FAIL_LOCAL)
+                break;
+        if (r == M_FAIL_LOCAL)
+            r = M_FAIL_SIBLINGS;
+        break;
     default:
+        r = M_FAIL_ALL;
         for (p = n->parent; p; p = p == m->host ? NULL : p->parent) {
             if (p->shadow_host == m->host && m->host) p = m->host;
-            if (match_from(s, i - 1, p, m))
-                return 1;
+            r = match_rec(s, i - 1, p, m);
+            if (r == M_MATCH || r == M_FAIL_ALL)
+                break;
         }
-        return 0;
+        if (r != M_MATCH)
+            r = M_FAIL_ALL;
+        break;
     }
+    /* A slotted compound was matched at the slot it is assigned to, whose ancestors and siblings are
+     * not those of the element the caller walks: its failures say nothing about other candidates. */
+    return slotted && r != M_MATCH ? M_FAIL_LOCAL : r;
+}
+
+static int match_from(const struct selector *s, int i, const struct node *n, const struct mctx *m)
+{
+    return match_rec(s, i, n, m) == M_MATCH;
 }
 
 /* ---- values ---- */
@@ -3303,6 +3371,10 @@ static const struct named_color {
     { "yellow", 0xffff00 }, { "yellowgreen", 0x9acd32 },
 };
 
+/* The largest magnitude a CSS number keeps, times 100 (ten million, as calc()'s infinity): beyond it
+ * values saturate, so that they and the arithmetic done on them stay inside an int. */
+#define NUM_MAX100 1000000000L
+
 /* A number as fixed point times 100; returns the characters used, 0 if none. */
 static int parse_num(const char *s, int *out)
 {
@@ -3314,8 +3386,7 @@ static int parse_num(const char *s, int *out)
         return 0;
     long v = 0;
     while (isdigit((unsigned char)*p)) {
-        if (v < 100000000)
-            v = v * 10 + (*p - '0');
+        v = v < NUM_MAX100 / 1000 ? v * 10 + (*p - '0') : NUM_MAX100 / 100;
         p++;
     }
     v *= 100;
@@ -3333,11 +3404,22 @@ static int parse_num(const char *s, int *out)
         p++;
         if (*p == '-')
             eneg = 1, p++;
-        while (isdigit((unsigned char)*p))
-            e = e * 10 + (*p++ - '0');
-        while (e-- > 0)
-            v = eneg ? v / 10 : v * 10;
+        while (isdigit((unsigned char)*p)) {
+            if (e < 100)
+                e = e * 10 + (*p - '0');
+            p++;
+        }
+        while (e-- > 0 && v)            /* at most a few dozen steps: v runs out or saturates */
+            if (eneg)
+                v /= 10;
+            else if (v >= NUM_MAX100 / 10) {
+                v = NUM_MAX100;
+                break;
+            } else
+                v *= 10;
     }
+    if (v > NUM_MAX100)
+        v = NUM_MAX100;
     *out = (int)(neg ? -v : v);
     return (int)(p - s);
 }
@@ -3495,9 +3577,9 @@ int css_parse_color(const char *s, int n, uint32_t *out)
 }
 
 /* num (times 100) of `unit` in hundredths of a pixel; 0 for an unknown unit. */
-static int unit_px100(const char *unit, long num, const struct vctx *v, long *out)
+static int unit_px100(const char *unit, long num_in, const struct vctx *v, long *out)
 {
-    long px;
+    long long num = num_in, px;     /* 64-bit: a large number times a font or viewport size */
     int absolute = 1;
     if (!strcmp(unit, "px"))
         px = num;
@@ -3558,7 +3640,9 @@ static int unit_px100(const char *unit, long num, const struct vctx *v, long *ou
         px = num * (v->vw > v->vh ? v->vw : v->vh) / 100, absolute = 0;
     else
         return 0;
-    *out = absolute && css_zoom != 100 ? px * css_zoom / 100 : px;
+    if (absolute && css_zoom != 100)
+        px = px * css_zoom / 100;
+    *out = (long)(px > NUM_MAX100 ? NUM_MAX100 : px < -NUM_MAX100 ? -NUM_MAX100 : px);
     return 1;
 }
 
@@ -3571,6 +3655,12 @@ struct cval {
     int pick;                   /* 1 the smaller, 2 the larger of px and pct (not a sum) */
     int angle;                  /* a number that is an angle, in degrees (times 100) */
 };
+
+/* A result of calc() arithmetic, saturated to what a CSS number can hold (see parse_num). */
+static long calc_sat(long long x)
+{
+    return (long)(x > NUM_MAX100 ? NUM_MAX100 : x < -NUM_MAX100 ? -NUM_MAX100 : x);
+}
 
 /* A value to do arithmetic on: a pick of px and percent becomes the percent. */
 static struct cval calc_flat(struct cval a)
@@ -3604,7 +3694,8 @@ static struct cval calc_pick(struct cval a, struct cval b, int larger)
     if (!a.px && !b.px)
         return (larger ? a.pct >= b.pct : a.pct <= b.pct) ? a : b;
     if ((!a.pct && !b.px) || (!a.px && !b.pct)) {
-        struct cval r = { a.px + b.px, a.pct + b.pct, 0, 1, larger ? 2 : 1, 0 };
+        struct cval r = { calc_sat((long long)a.px + b.px), calc_sat((long long)a.pct + b.pct), 0, 1,
+                          larger ? 2 : 1, 0 };
         return r;
     }
     return a.pct ? a : b;
@@ -3682,6 +3773,9 @@ static double calc_scalar(struct cval a, int *kind)
 static struct cval calc_like(struct cval like, double x)
 {
     struct cval r = like;
+    if (x != x)
+        x = 0;
+    x = x > 1e7 ? 1e7 : x < -1e7 ? -1e7 : x;
     long v = (long)(x * 100 + (x < 0 ? -0.5 : 0.5));
     r.pick = 0;
     if (like.pct && !like.num)
@@ -3797,7 +3891,22 @@ static int calc_function_at(const char *s)
     return 0;
 }
 
+/* One operand: a number, a bracket or a function. Brackets and functions nest by recursion, so
+ * the depth is limited (a page could nest thousands and run the stack out). */
+static struct cval calc_term_at(const char **p, const struct vctx *v);
+
 static struct cval calc_term(const char **p, const struct vctx *v)
+{
+    static int depth;
+    if (depth >= 32)
+        return (struct cval){ 0, 0, 0, 0, 0, 0 };
+    depth++;
+    struct cval r = calc_term_at(p, v);
+    depth--;
+    return r;
+}
+
+static struct cval calc_term_at(const char **p, const struct vctx *v)
 {
     static const struct { const char *name; int kind; } funcs[] = {
         { "calc(", -1 }, { "-webkit-calc(", -1 }, { "min(", 0 }, { "max(", 1 }, { "clamp(", 2 },
@@ -3884,13 +3993,13 @@ static struct cval calc_product(const char **p, const struct vctx *v)
             return (struct cval){ 0, 0, 0, 0, 0, 0 };
         if (op == '*' && (b.num || a.num)) {
             struct cval k = b.num ? b : a, x = b.num ? a : b;
-            x.px = x.px * k.px / 100;
-            x.pct = x.pct * k.px / 100;
+            x.px = calc_sat((long long)x.px * k.px / 100);
+            x.pct = calc_sat((long long)x.pct * k.px / 100);
             x.num = a.num && b.num;
             a = x;
         } else if (op == '/' && b.num && b.px) {
-            a.px = a.px * 100 / b.px;
-            a.pct = a.pct * 100 / b.px;
+            a.px = calc_sat((long long)a.px * 100 / b.px);
+            a.pct = calc_sat((long long)a.pct * 100 / b.px);
         } else {
             a.ok = 0;
         }
@@ -3912,8 +4021,8 @@ static struct cval calc_sum(const char **p, const struct vctx *v)
         if (!a.ok || !b.ok)
             return (struct cval){ 0, 0, 0, 0, 0, 0 };
         long sign = op == '-' ? -1 : 1;
-        a.px += sign * b.px;
-        a.pct += sign * b.pct;
+        a.px = calc_sat(a.px + (long long)sign * b.px);
+        a.pct = calc_sat(a.pct + (long long)sign * b.pct);
         a.num = a.num && b.num;
     }
 }
@@ -3938,7 +4047,7 @@ static int length_value(const char *s, const struct vctx *v, struct len *out)
         const char *p = s;
         struct cval r = calc_term(&p, v);
         if (!r.ok || (r.num && r.px && !r.angle))
-            return r.ok && r.num ? (out->unit = U_PX, out->v = (int)(r.px * css_zoom / 10000), 1) : 0;
+            return r.ok && r.num ? (out->unit = U_PX, out->v = (int)((long long)r.px * css_zoom / 10000), 1) : 0;
         if (r.angle)
             return 0;
         long px = (r.px + (r.px >= 0 ? 50 : -50)) / 100;
@@ -3977,7 +4086,7 @@ static int length_value(const char *s, const struct vctx *v, struct len *out)
         return 1;
     }
     if (!unit[0])
-        px = num * css_zoom / 100;
+        px = calc_sat((long long)num * css_zoom / 100);
     else if (!unit_px100(unit, num, v, &px))
         return 0;
     out->v = (int)((px + (px >= 0 ? 50 : -50)) / 100);
@@ -9402,6 +9511,8 @@ static int cascade_tree(struct arena *a, struct node *root, const struct style *
 {
     if (!dyn)
         prepare_layers(a, sheets, nsheets);
+    if (!++sib_gen)                     /* the tree may have changed since the last pass */
+        sib_gen = 1;
     cur_bloom = bloom;
     int changed = 0;
     struct node *n = root;
@@ -9686,6 +9797,8 @@ struct style *css_vt_style(struct arena *a, struct node *root, struct sheet **sh
     struct arena *saved_keys = key_arena;
     key_arena = a;
     prepare_layers(a, sheets, nsheets);
+    if (!++sib_gen)
+        sib_gen = 1;
     cur_vt_kind = kind;
     cur_vt_name = name;
     cur_vt_classes = classes;

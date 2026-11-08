@@ -4,6 +4,9 @@
  *   dd [if=FILE] [of=FILE] [bs=N] [ibs=N] [obs=N] [count=N] [skip=N] [seek=N]
  *      [conv=notrunc,sync,fsync,noerror] [status=none|noxfer]
  *
+ * conv=noerror goes on past a block that cannot be read (with sync, it is
+ * written as zeros); the exit status still says something went wrong.
+ *
  * Sizes take c, w, b, k, K, M, G suffixes (and a product like 2x512).
  * Reads are of ibs bytes, writes of obs (bs sets both); skip and seek
  * are in blocks; count is in input blocks.
@@ -140,15 +143,17 @@ int main(int argc, char **argv)
     int status = 0;
     while (count < 0 || full_in + part_in < count) {
         int n = (int)read(in, ibuf, (size_t)ibs);
+        int failed = 0;
         if (n < 0) {
             fprintf(stderr, "dd: error reading '%s': %s\n", in_name ? in_name : "stdin", strerror(errno));
-            if (!noerror) {
-                status = 1;
+            status = 1;
+            /* noerror: go on past the bad block (sync gives zeros for it); a pipe cannot be skipped */
+            if (!noerror || lseek64(in, (off64_t)ibs, SEEK_CUR) < 0)
                 break;
-            }
+            failed = 1;
             n = 0;
         }
-        if (n == 0)
+        if (n == 0 && !failed)
             break;
         if (n == ibs)
             full_in++;

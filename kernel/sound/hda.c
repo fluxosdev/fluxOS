@@ -165,6 +165,7 @@
 #define MAX_DACS  8
 #define STREAM_TAG 1
 
+
 #define HALF      7680                  /* 40 ms at 48 kHz, 16-bit stereo; a multiple of 128 */
 #define RING_SIZE 65536
 #define FRAME     4                     /* the codec's frame: 16-bit stereo */
@@ -1097,15 +1098,27 @@ void hda_init(struct vnode *devdir)
     int found = 0;
     for (int i = 0; !found && pci_find_class_nth(0x0403, i, &pci, &prog_if) == 0; i++) {
         if (!page && (!(page = pmm_alloc()) || !(buf = pmm_alloc_contig(4))))
-            return;
+            break;
         hda.irq = pci_irq(&pci);
         hda.pci = pci;
+        hda.regs = NULL;
         found = controller_init(&pci, (uint8_t *)page) == 0;
-        if (!found && hda.regs)
+        if (!found && hda.regs) {
+            wr32(INTCTL, 0);
             wr32(GCTL, rd32(GCTL) & ~GCTL_CRST);        /* leave it in reset */
+            /* and off the bus: it must not DMA into the pages handed back */
+            pci_write32(&pci, PCI_COMMAND, pci_read32(&pci, PCI_COMMAND) & 0xFFFF & ~PCI_CMD_MASTER);
+            pci_unmap_bar((void *)hda.regs);           /* and its registers' window back */
+            hda.regs = NULL;
+        }
     }
-    if (!found)
+    if (!found) {
+        if (page)
+            pmm_free(page);
+        for (uint32_t k = 0; buf && k < 4; k++)
+            pmm_free(buf + k * PAGE_SIZE);
         return;
+    }
     hda.buf = (uint8_t *)buf;
     memset(hda.buf, 0, 4 * PAGE_SIZE);
     hda.master = 80;
@@ -1144,7 +1157,16 @@ void hda_suspend(void)
     spin_lock(&snd_lock);
     stop();
     hda.asleep = 1;
+    pcm_sleep(hda.dsp, 1);              /* writers wait for the wake, not give up */
     wr32(INTCTL, 0);
+    spin_unlock(&snd_lock);
+}
+
+/* The card did not come back: writers learn that it will not start. */
+static void resume_failed(void)
+{
+    spin_lock(&snd_lock);
+    pcm_sleep(hda.dsp, 0);
     spin_unlock(&snd_lock);
 }
 
@@ -1160,11 +1182,13 @@ void hda_resume(void)
     wr32(INTCTL, 0);
     if (controller_reset() < 0) {
         klog("hda: controller did not come out of reset after suspend\n");
+        resume_failed();
         return;
     }
     rings_init((uint8_t *)hda.bdl - 0xC00);
     if (codec_init(hda.cad) < 0) {
         klog("hda: codec %d did not come back after suspend\n", hda.cad);
+        resume_failed();
         return;
     }
     spin_lock(&snd_lock);
@@ -1173,5 +1197,6 @@ void hda_resume(void)
     if (hda.irq >= 0)
         wr32(INTCTL, intctl());
     start();
+    pcm_sleep(hda.dsp, 0);
     spin_unlock(&snd_lock);
 }

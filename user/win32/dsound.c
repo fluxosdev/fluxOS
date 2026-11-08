@@ -138,7 +138,7 @@ static uint32_t ds_dispatch(int kind,int op,uint32_t *a)
         if(!o->storage || o->locked)return DS_INVALID;
         uint32_t offset=A(1),bytes=A(2),size=o->storage->size;
         if(A(7)&~3u)return DS_INVALID;
-        if(A(7)&1)offset=(o->phase>>32)*o->format.block;
+        if(A(7)&1)offset=(uint32_t)(((o->phase>>32)+1024)*o->format.block%size); /* the write cursor GetCurrentPosition reports */
         if(A(7)&2){offset=0;
         bytes=size;
         }

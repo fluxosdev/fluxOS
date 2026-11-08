@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <unistd.h>
 #include <flux.h>
 #include <http.h>
@@ -274,6 +275,12 @@ static void *fetcher(void *arg)
 
 struct httpio *httpio_open(const char *url, const char *const *headers, int nheaders, char *err, size_t errsize)
 {
+    return httpio_open_cancel(url, headers, nheaders, err, errsize, NULL);
+}
+
+struct httpio *httpio_open_cancel(const char *url, const char *const *headers, int nheaders, char *err, size_t errsize,
+                                  const volatile int *cancel)
+{
     struct httpio *h = calloc(1, sizeof(*h));
     if (!h || !(h->url = strdup(url)) || !(h->buf = malloc(WINDOW)) || !(h->client = http_client_new())) {
         snprintf(err, errsize, "Out of memory.");
@@ -298,8 +305,22 @@ struct httpio *httpio_open(const char *url, const char *const *headers, int nhea
     }
     h->started = 1;
     pthread_mutex_lock(&h->mu);
-    while (!h->answered && !h->aborted)
-        pthread_cond_wait(&h->cv, &h->mu);
+    while (!h->answered && !h->aborted) {
+        if (cancel && *cancel) {
+            h->aborted = 1;
+            break;
+        }
+        if (!cancel) {
+            pthread_cond_wait(&h->cv, &h->mu);
+            continue;
+        }
+        struct timespec ts;             /* nothing signals the flag: look at it now and then */
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 100 * 1000000L;
+        ts.tv_sec += ts.tv_nsec / 1000000000L;
+        ts.tv_nsec %= 1000000000L;
+        pthread_cond_timedwait(&h->cv, &h->mu, &ts);
+    }
     int failed = h->failed || h->aborted;
     if (failed)
         snprintf(err, errsize, "%s", h->err[0] ? h->err : "Stopped.");

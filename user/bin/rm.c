@@ -2,6 +2,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -25,27 +26,33 @@ static int remove_path(const char *path)
         int status = 0;
         DIR *d = opendir(path);
         if (d) {
+            /* the names first: removing entries while reading would shift the listing */
+            char **names = NULL;
+            int n = 0, cap = 0;
             struct dirent *de;
-            /* Removing entries shifts the listing, so restart after each. */
-            for (;;) {
-                rewinddir(d);
-                int removed = 0;
-                while ((de = readdir(d))) {
-                    if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
-                        continue;
-                    char child[PATH_MAX];
-                    snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
-                    if (remove_path(child)) {
-                        status = 1;
-                        continue;
-                    }
-                    removed = 1;
-                    break;
+            while ((de = readdir(d))) {
+                if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+                    continue;
+                if (n == cap) {
+                    cap = cap ? cap * 2 : 32;
+                    char **nn = realloc(names, sizeof(char *) * (size_t)cap);
+                    if (!nn)
+                        break;
+                    names = nn;
                 }
-                if (!removed)
+                if (!(names[n] = strdup(de->d_name)))
                     break;
+                n++;
             }
             closedir(d);
+            for (int k = 0; k < n; k++) {
+                char child[PATH_MAX];
+                snprintf(child, sizeof(child), "%s/%s", path, names[k]);
+                if (remove_path(child))
+                    status = 1;
+                free(names[k]);
+            }
+            free(names);
         }
         if (rmdir(path) < 0) {
             fprintf(stderr, "rm: cannot remove '%s': %s\n", path, strerror(errno));
@@ -82,7 +89,26 @@ int main(int argc, char **argv)
         fprintf(stderr, "rm: missing operand\n");
         return 1;
     }
-    for (; i < argc; i++)
+    for (; i < argc; i++) {
+        /* ".", ".." and "/" are refused, as GNU rm does: rm -r .. would empty the parent */
+        char tmp[PATH_MAX];
+        snprintf(tmp, sizeof(tmp), "%s", argv[i]);
+        size_t len = strlen(tmp);
+        while (len > 1 && tmp[len - 1] == '/')
+            tmp[--len] = 0;
+        const char *base = strrchr(tmp, '/');
+        base = base && base[1] ? base + 1 : tmp;
+        if (!strcmp(base, ".") || !strcmp(base, "..")) {
+            fprintf(stderr, "rm: refusing to remove '.' or '..' directory: skipping '%s'\n", argv[i]);
+            status = 1;
+            continue;
+        }
+        if (recursive && !strcmp(tmp, "/")) {
+            fprintf(stderr, "rm: it is dangerous to operate recursively on '/'\n");
+            status = 1;
+            continue;
+        }
         status |= remove_path(argv[i]);
+    }
     return status;
 }

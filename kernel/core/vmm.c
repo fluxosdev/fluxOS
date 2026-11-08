@@ -34,6 +34,9 @@
 
 uint32_t *kernel_pd;
 static uint32_t mmio_next = KERNEL_MMIO_BASE;
+#define MMIO_WINDOWS 32                 /* vmm_map_mmio()'s windows, for vmm_unmap_mmio() */
+static struct { uint32_t start, end; } mmio_windows[MMIO_WINDOWS];
+static int spaces_made;                 /* an address space copied the kernel's mappings */
 
 #define LATE_PDES 4                     /* 16 MiB of late mappings */
 static uint32_t late_base, late_next;   /* the window, and its first unused page */
@@ -151,13 +154,15 @@ uint32_t *vmm_create(void)
         return NULL;
     memcpy(pd, kernel_pd, KERNEL_PDES * sizeof(uint32_t));
     memcpy(pd + USER_PDE_END, kernel_pd + USER_PDE_END, (1024 - USER_PDE_END) * sizeof(uint32_t));
+    spaces_made = 1;                    /* (the device windows are copied too: vmm_unmap_mmio) */
     return pd;
 }
 
 /*
  * Map device memory into the kernel above 3 GiB with 4 MiB pages. Only
  * for use before the first process exists: address spaces copy these
- * entries when they are created.
+ * entries when they are created. Each call gets a window of its own,
+ * kept so that vmm_unmap_mmio() can take it back.
  */
 void *vmm_map_mmio(uint32_t phys, uint32_t size, uint32_t flags)
 {
@@ -169,7 +174,42 @@ void *vmm_map_mmio(uint32_t phys, uint32_t size, uint32_t flags)
     for (uint32_t pa = base; pa != end; pa += 0x400000u, mmio_next += 0x400000u)
         kernel_pd[PDE_INDEX(mmio_next)] = pa | PTE_PRESENT | PTE_WRITE | PTE_LARGE | PTE_GLOBAL | flags;
     write_cr3(read_cr3());
+    for (int i = 0; i < MMIO_WINDOWS; i++) {
+        if (mmio_windows[i].end <= mmio_windows[i].start) {
+            mmio_windows[i].start = va;
+            mmio_windows[i].end = mmio_next;
+            break;
+        }
+    }
     return (void *)(va + (phys - base));
+}
+
+/*
+ * Undo vmm_map_mmio() (or pci_map_bar()): virt is what it returned. Boot time
+ * only too: once an address space or another processor has the mappings, they
+ * stay (logged), as their copies and global TLB entries cannot be recalled here.
+ * The virtual window is reused if it was the latest.
+ */
+void vmm_unmap_mmio(void *virt)
+{
+    uint32_t v = (uint32_t)virt;
+    for (int i = 0; v && i < MMIO_WINDOWS; i++) {
+        uint32_t start = mmio_windows[i].start, end = mmio_windows[i].end;
+        if (end <= start || v < start || v >= end)
+            continue;
+        if (spaces_made || ncpus > 1) {
+            klog("vmm: device memory at %08x stays mapped (unmapped after boot)\n", v);
+            return;
+        }
+        for (uint32_t va = start; va != end; va += 0x400000u) {
+            kernel_pd[PDE_INDEX(va)] = 0;
+            invlpg(va);                 /* (a global page: a CR3 reload would keep it) */
+        }
+        if (end == mmio_next)
+            mmio_next = start;
+        mmio_windows[i].start = mmio_windows[i].end = 0;
+        return;
+    }
 }
 
 static uint32_t *get_pte(uint32_t *pd, uint32_t va, int create)
@@ -313,6 +353,15 @@ int vmm_pte_present(uint32_t *pd, uint32_t va)
         return 0;
     uint32_t *pte = get_pte(pd, va, 0);
     return pte && (*pte & (PTE_PRESENT | PTE_MMIO)) == PTE_PRESENT;
+}
+
+/* Is device memory mapped at va (the screen at USER_MMIO_BASE, by fbmap)? */
+int vmm_mmio_mapped(uint32_t *pd, uint32_t va)
+{
+    if (va < USER_BASE || va >= USER_TOP)
+        return 0;
+    uint32_t *pte = get_pte(pd, va, 0);
+    return pte && (*pte & (PTE_PRESENT | PTE_MMIO)) == (PTE_PRESENT | PTE_MMIO);
 }
 
 uint32_t vmm_translate(uint32_t *pd, uint32_t va)

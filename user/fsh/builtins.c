@@ -438,10 +438,10 @@ static int bi_unset(int argc, char **argv)
         }
         if (funcs)
             func_unset(argv[i]);
-        else {
-            unsetenv(argv[i]);
-            func_unset(argv[i]);        /* POSIX: without -f, the variable, else the function */
-        }
+        else if (getenv(argv[i]))
+            unsetenv(argv[i]);          /* without -f: the variable, and only if there is none the function */
+        else
+            func_unset(argv[i]);
     }
     return 0;
 }

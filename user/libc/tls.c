@@ -1705,8 +1705,10 @@ int tls_read(struct tls *t, void *buf, int n)
         if (t->eof)
             return 0;
         int r = read_record(t);
-        if (r <= 0)
-            return r;
+        if (r < 0)
+            return -1;
+        if (r == 0)                     /* close_notify sets eof; a bare end of TCP may be an attacker's cut */
+            return t->eof ? 0 : set_error(t, "the connection closed without close_notify (the data may be cut off)");
         if (t->type == CT_HANDSHAKE && post_handshake(t) < 0)
             return -1;
     }

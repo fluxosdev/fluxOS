@@ -410,6 +410,22 @@ static const char *code_text(int r)
     }
 }
 
+/* Passes on at most left bytes: a stream that would give more is damaged. */
+struct lsink {
+    struct arc_sink sink;
+    struct arc_sink *next;
+    uint32_t left;
+};
+
+static int lsink_write(struct arc_sink *s, const uint8_t *p, uint32_t n)
+{
+    struct lsink *l = (struct lsink *)s;
+    if (n > l->left)
+        return ARC_EDATA;
+    l->left -= n;
+    return l->next->write(l->next, p, n);
+}
+
 /* Unpack ZIP entry e into f; 0 or an error code. */
 static int zip_unpack(struct archive *a, const struct arc_entry *e, struct fsink *f)
 {
@@ -423,15 +439,16 @@ static int zip_unpack(struct archive *a, const struct arc_entry *e, struct fsink
     if (arc_rd_open(&in, a->fd, data, e->csize) < 0)
         return ARC_ENOMEM;
     int r;
+    struct lsink lim = { { lsink_write }, &f->sink, e->size };
     if (e->zmethod == 0) {
-        r = e->csize == e->size ? arc_copy(&in, e->size, &f->sink) : ARC_EDATA;
+        r = e->csize == e->size ? arc_copy(&in, e->size, &lim.sink) : ARC_EDATA;
     } else if (e->zmethod == 8) {
-        r = arc_inflate(&in, &f->sink);
+        r = arc_inflate(&in, &lim.sink);
     } else {                                            /* 14: LZMA, after a little header */
         uint8_t hdr[9];
         for (int i = 0; i < 9; i++)
             hdr[i] = (uint8_t)arc_rd_byte(&in);
-        r = in.eof || le16(hdr + 2) != 5 ? ARC_EDATA : arc_lzma(&in, &f->sink, hdr + 4, e->size, 1);
+        r = in.eof || le16(hdr + 2) != 5 ? ARC_EDATA : arc_lzma(&in, &lim.sink, hdr + 4, e->size, 1);
     }
     arc_rd_close(&in);
     if (r == 0 && (f->n != e->size || (e->has_crc && f->crc != e->crc)))
@@ -671,6 +688,10 @@ static void parse_streams(struct hbuf *b, struct streams *s)
             return;
         }
         s->pack_sizes = calloc((size_t)s->npack + 1, sizeof(uint32_t));
+        if (!s->pack_sizes) {
+            b->err = 1;
+            return;
+        }
         for (id = hb_byte(b); id != K_END && !b->err; id = hb_byte(b)) {
             if (id == K_SIZE) {
                 for (int i = 0; i < s->npack; i++)
@@ -1452,8 +1473,10 @@ int arc_safe_path(const char *name, char *out, int size)
         int len = (int)(p - s);
         if (!len || (len == 1 && s[0] == '.') || (len == 2 && s[0] == '.' && s[1] == '.'))
             continue;
-        if (o + len + 2 > size)
-            break;
+        if (o + len + 2 > size) {
+            out[o] = 0;
+            return -1;
+        }
         if (o)
             out[o++] = '/';
         for (int i = 0; i < len; i++) {
@@ -1524,19 +1547,20 @@ int arc_name_match(const char *pattern, const char *name)
     return 0;
 }
 
-/* Where entry e goes: dest/name (or dest/basename when flat). 0 if nowhere. */
+/* Where entry e goes: dest/name (or dest/basename when flat). 1, 0 if nowhere, -1 if too long. */
 static int out_path(const struct arc_entry *e, const char *dest, int flags, char *out, int size)
 {
     char safe[1024];
-    if (!arc_safe_path(e->name, safe, sizeof(safe)))
-        return 0;
+    int l = arc_safe_path(e->name, safe, sizeof(safe));
+    if (l <= 0)
+        return l;
     const char *n = safe;
     if (flags & ARC_FLAT) {
         const char *slash = strrchr(safe, '/');
         n = slash ? slash + 1 : safe;
     }
-    snprintf(out, (size_t)size, "%s%s%s", dest, dest[0] && dest[strlen(dest) - 1] != '/' ? "/" : "", n);
-    return 1;
+    int k = snprintf(out, (size_t)size, "%s%s%s", dest, dest[0] && dest[strlen(dest) - 1] != '/' ? "/" : "", n);
+    return k < size ? 1 : -1;
 }
 
 static void failed(struct xctx *x, int i, const char *why)
@@ -1557,7 +1581,12 @@ static int open_entry(struct archive *a, int i, const char *dest, int flags, str
             return ARC_CANCEL;
         return 0;
     }
-    if (!out_path(e, dest, flags, path, psize))
+    int op = out_path(e, dest, flags, path, psize);
+    if (op < 0) {
+        failed(x, i, "its name is too long");
+        return -1;
+    }
+    if (!op)
         return 1;
     struct stat st;
     if (!(flags & ARC_OVERWRITE) && stat(path, &st) == 0) {
@@ -1759,7 +1788,12 @@ int arc_extract(struct archive *a, const uint8_t *want, const char *dest, int fl
                 return -1;
             continue;
         }
-        if (!out_path(e, dest, flags, path, sizeof(path)))
+        int op = out_path(e, dest, flags, path, sizeof(path));
+        if (op < 0) {
+            failed(&x, i, "its name is too long");
+            fails++;
+        }
+        if (op <= 0)
             continue;
         if (e->is_dir) {
             if (flags & ARC_FLAT)

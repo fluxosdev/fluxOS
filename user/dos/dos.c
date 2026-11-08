@@ -411,6 +411,8 @@ static int load_program(const char *host, const char *dosname, uint16_t env_src,
     if (exe) {
         need = 0x10 + load + e.minalloc;
         want = high ? 0xFFFF : 0x10 + load + e.maxalloc;
+        if (want < need)
+            want = need;                /* MAXALLOC below MINALLOC: the minimum it needs */
     } else {
         need = (0x100 + n + 0x100 + 15) / 16;   /* PSP, image, a small stack */
         want = 0xFFFF;

@@ -52,6 +52,15 @@ static int put_escaped(const char *s)
     return 0;
 }
 
+/* A width or precision given by "*" into spec at k (room for any int); returns the new k. */
+static int put_number(char *spec, int k, int v)
+{
+    char num[16];
+    int n = snprintf(num, sizeof(num), "%d", v);
+    memcpy(spec + k, num, (size_t)n);
+    return k + n;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -91,13 +100,13 @@ int main(int argc, char **argv)
                 p++;
                 continue;
             }
-            char spec[32];
+            char spec[64];              /* flags, two numbers of up to 11 characters, "ll", the conversion */
             int k = 0;
             spec[k++] = *p++;
             while (*p && strchr("-+ #0", *p) && k < 20)
                 spec[k++] = *p++;
             if (*p == '*') {
-                k += snprintf(spec + k, 8, "%d", ai < argc ? atoi(argv[ai++]) : 0);
+                k = put_number(spec, k, ai < argc ? atoi(argv[ai++]) : 0);
                 p++;
             }
             while (isdigit((unsigned char)*p) && k < 24)
@@ -105,7 +114,7 @@ int main(int argc, char **argv)
             if (*p == '.') {
                 spec[k++] = *p++;
                 if (*p == '*') {
-                    k += snprintf(spec + k, 8, "%d", ai < argc ? atoi(argv[ai++]) : 0);
+                    k = put_number(spec, k, ai < argc ? atoi(argv[ai++]) : 0);
                     p++;
                 }
                 while (isdigit((unsigned char)*p) && k < 28)

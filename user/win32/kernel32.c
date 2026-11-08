@@ -226,7 +226,16 @@ DEF(GetExitCodeProcess)
     *(uint32_t *)P(1) = o->exited ? o->exit_code : STILL_ACTIVE;
     return 1;
 }
-DEF(GetExitCodeThread) { uint32_t code;if(!win_thread_status(A(0),&code)) FAIL(ERROR_INVALID_HANDLE);*(uint32_t *)P(1)=code;return 1; }
+DEF(GetExitCodeThread)
+{
+    uint32_t code;
+    if (handle_get_type(A(0), H_PROCESS))       /* another program's main thread (CreateProcess) */
+        return api_GetExitCodeProcess(a);
+    if (!win_thread_status(A(0), &code))
+        FAIL(ERROR_INVALID_HANDLE);
+    *(uint32_t *)P(1) = code;
+    return 1;
+}
 DEF(GetProcessVersion) { (void)a; return 0x00050001; }
 DEF(GetPriorityClass) { (void)a; return 0x20; }
 DEF(SetPriorityClass) { (void)a; return 1; }
@@ -411,7 +420,8 @@ DEF(CreateProcessA)
     HANDLE h = handle_new(H_PROCESS);
     struct hobj *o = handle_get(h);
     o->pid = pid;
-    HANDLE t = handle_new(H_THREAD);
+    /* the main thread's handle: the process object again, signaled when the program ends */
+    HANDLE t = handle_dup(h);
     if (pi) {
         pi[0] = h;
         pi[1] = t;
@@ -456,7 +466,7 @@ DEF(CreateThread)
     return h;
 }
 DEF(CreateRemoteThread) { (void)a;FAIL(ERROR_NOT_SUPPORTED); }
-DEF(ResumeThread) { return win_thread_resume(A(0)); }
+DEF(ResumeThread) { if (handle_get_type(A(0), H_PROCESS)) return 0; return win_thread_resume(A(0)); }  /* (another program's thread: running) */
 DEF(SuspendThread) { (void)a;SETERR(ERROR_NOT_SUPPORTED);return (uint32_t)-1; }
 DEF(OpenThread) { (void)a; FAIL(ERROR_INVALID_PARAMETER); }
 DEF(GetThreadContext) { (void)a; FAIL(ERROR_NOT_SUPPORTED); }
@@ -975,6 +985,9 @@ DEF(VirtualAlloc)
             FAIL(ERROR_INVALID_ADDRESS);
         return r;
     }
+    /* the range must lie within the one reservation */
+    if (addr + size < addr || addr + size > vm_alloc_end(addr))
+        FAIL(ERROR_INVALID_ADDRESS);
     if (vm_commit(addr, size, protect) < 0)
         FAIL(ERROR_INVALID_ADDRESS);
     /* committing clears the pages Windows would hand out fresh */
@@ -985,18 +998,23 @@ DEF(VirtualFree)
 {
     gp_t addr = A(0);
     uint32_t size = A(1), type = A(2);
+    struct vm_info info;
+    gp_t end = vm_alloc_end(addr);
+    if (!end || vm_query(addr, &info) < 0)
+        FAIL(ERROR_INVALID_ADDRESS);
     if (type == MEM_RELEASE) {
-        if (vm_free(addr, size) < 0)
+        /* the whole reservation, by its base, with no size */
+        if (size || addr != info.alloc_base)
+            FAIL(ERROR_INVALID_PARAMETER);
+        if (vm_free(addr, 0) < 0)
             FAIL(ERROR_INVALID_ADDRESS);
         return 1;
     }
     if (type == MEM_DECOMMIT) {
-        if (!size) {
-            struct vm_info info;
-            if (vm_query(addr, &info) < 0)
-                FAIL(ERROR_INVALID_ADDRESS);
-            size = info.alloc_base + info.size - addr;
-        }
+        if (!size)                      /* to the end of the reservation */
+            size = end - addr;
+        if (addr + size < addr || addr + size > end)
+            FAIL(ERROR_INVALID_PARAMETER);
         if (vm_decommit(addr, size) < 0)
             FAIL(ERROR_INVALID_ADDRESS);
         return 1;
@@ -1321,18 +1339,62 @@ DEF(LeaveCriticalSection)
     cs[2]--;cs[1]=cs[2]-1;
     if(!cs[2]) {cs[3]=0;thread_notify();}return 0;
 }
+/* Slim reader/writer locks: the word is 0 when free, SRW_EXCLUSIVE when a writer has it, else
+ * the number of readers. Like the critical sections, they are kept under the runtime lock and
+ * waited for with thread_wait_ms. */
+#define SRW_EXCLUSIVE 0xFFFFFFFFu
 DEF(InitializeSRWLock) { *(uint32_t *)P(0) = 0; return 0; }
-DEF(AcquireSRWLockExclusive) { (void)a; return 0; }
-DEF(ReleaseSRWLockExclusive) { (void)a; return 0; }
-DEF(AcquireSRWLockShared) { (void)a; return 0; }
-DEF(ReleaseSRWLockShared) { (void)a; return 0; }
-DEF(TryAcquireSRWLockExclusive) { (void)a; return 1; }
-DEF(TryAcquireSRWLockShared) { (void)a; return 1; }
+DEF(AcquireSRWLockExclusive) { uint32_t *l = P(0); while (*l) thread_wait_ms(-1); *l = SRW_EXCLUSIVE; return 0; }
+DEF(ReleaseSRWLockExclusive) { uint32_t *l = P(0); if (*l == SRW_EXCLUSIVE) { *l = 0; thread_notify(); } return 0; }
+DEF(AcquireSRWLockShared) { uint32_t *l = P(0); while (*l == SRW_EXCLUSIVE) thread_wait_ms(-1); ++*l; return 0; }
+DEF(ReleaseSRWLockShared) { uint32_t *l = P(0); if (*l && *l != SRW_EXCLUSIVE && !--*l) thread_notify(); return 0; }
+DEF(TryAcquireSRWLockExclusive) { uint32_t *l = P(0); if (*l) return 0; *l = SRW_EXCLUSIVE; return 1; }
+DEF(TryAcquireSRWLockShared) { uint32_t *l = P(0); if (*l == SRW_EXCLUSIVE) return 0; ++*l; return 1; }
+/* Condition variables: the word counts wakes; a sleeper waits for it to change (or the time to
+ * run out), with its lock given up meanwhile. Waking one wakes all: a spurious wake is allowed. */
+#define ERROR_TIMEOUT 1460
 DEF(InitializeConditionVariable) { *(uint32_t *)P(0) = 0; return 0; }
-DEF(WakeConditionVariable) { (void)a; return 0; }
-DEF(WakeAllConditionVariable) { (void)a; return 0; }
-DEF(SleepConditionVariableCS) { (void)a; FAIL(ERROR_SEM_TIMEOUT); }
-DEF(SleepConditionVariableSRW) { (void)a; FAIL(ERROR_SEM_TIMEOUT); }
+DEF(WakeConditionVariable) { ++*(uint32_t *)P(0); thread_notify(); return 0; }
+DEF(WakeAllConditionVariable) { ++*(uint32_t *)P(0); thread_notify(); return 0; }
+static int cv_wait(const uint32_t *cv, uint32_t timeout)
+{
+    uint32_t gen = *cv, begin = os_ticks_ms();
+    while (*cv == gen) {
+        uint32_t spent = os_ticks_ms() - begin;
+        if (timeout != INFINITE && spent >= timeout)
+            return 0;
+        thread_wait_ms(timeout == INFINITE ? -1 : (int)(timeout - spent));
+    }
+    return 1;
+}
+DEF(SleepConditionVariableCS)
+{
+    uint32_t *cs = P(1), id = teb->thread_id;
+    if (cs[3] != id || !cs[2])
+        FAIL(ERROR_NOT_OWNER);
+    uint32_t depth = cs[2];             /* give the section up entirely, then take it back as it was */
+    cs[2] = 0; cs[1] = (uint32_t)-1; cs[3] = 0;
+    thread_notify();
+    int woke = cv_wait(P(0), A(2));
+    while (cs[3] && cs[3] != id) thread_wait_ms(-1);
+    cs[3] = id; cs[2] = depth; cs[1] = depth - 1;
+    if (!woke)
+        FAIL(ERROR_TIMEOUT);
+    return 1;
+}
+DEF(SleepConditionVariableSRW)
+{
+    uint32_t *l = P(1);
+    int shared = (A(3) & 1) != 0;       /* CONDITION_VARIABLE_LOCKMODE_SHARED */
+    if (shared) { if (*l && *l != SRW_EXCLUSIVE && !--*l) thread_notify(); }
+    else { *l = 0; thread_notify(); }
+    int woke = cv_wait(P(0), A(2));
+    if (shared) { while (*l == SRW_EXCLUSIVE) thread_wait_ms(-1); ++*l; }
+    else { while (*l) thread_wait_ms(-1); *l = SRW_EXCLUSIVE; }
+    if (!woke)
+        FAIL(ERROR_TIMEOUT);
+    return 1;
+}
 DEF(InitOnceExecuteOnce)
 {
     uint32_t *once = P(0);
@@ -1735,11 +1797,15 @@ DEF(SizeofResource)
     uint32_t rva = res - m->base;
     /* scan the directory's data entries (the leaves) for one with this RVA */
     uint32_t rsize = m->dir[DIR_RESOURCE][1];
+    if (root >= m->size)
+        return 0;
+    if (rsize > m->size - root)         /* the directory as far as the image goes */
+        rsize = m->size - root;
     for (uint32_t off = 0; off + 16 <= rsize; off += 4) {
         uint32_t v, s;
         memcpy(&v, img + root + off, 4);
         memcpy(&s, img + root + off + 4, 4);
-        if (v == rva && s && s < m->size)
+        if (v == rva && s && s <= m->size - rva)
             return s;
     }
     return 0;
@@ -1774,10 +1840,12 @@ DEF(DuplicateHandle)
     if (src == PSEUDO_PROCESS || src == PSEUDO_THREAD) {
         if (!A(3))
             return 1;
-        HANDLE d = src == PSEUDO_PROCESS ? handle_new(H_PROCESS) : handle_new(H_THREAD);
+        HANDLE d = src == PSEUDO_PROCESS ? handle_new(H_PROCESS) : win_thread_open_current();
+        if (!d)
+            FAIL(ERROR_NOT_ENOUGH_MEMORY);
         *(uint32_t *)P(3) = d;
         struct hobj *o = handle_get(d);
-        if (o) o->pid = (int)teb->process_id;
+        if (o && src == PSEUDO_PROCESS) o->pid = (int)teb->process_id;
         return 1;
     }
     HANDLE d = handle_dup(src);
@@ -1913,11 +1981,9 @@ static HANDLE create_file(const char *win, uint32_t access, uint32_t share, uint
         /* no access asked: just a handle for attributes */
         oflags = O_RDONLY;
     }
-    fd = open(host, oflags, 0666);
-    if (fd < 0 && errno == EACCES && (oflags & O_ACCMODE) == O_RDWR)
-        fd = open(host, (oflags & ~O_ACCMODE) | O_RDONLY, 0666);
+    fd = open(host, oflags, 0666);      /* no write access: ERROR_ACCESS_DENIED, as on Windows */
     if (fd < 0)
-        FAIL(errno_to_win(errno));
+        FAIL(errno == EEXIST ? ERROR_FILE_EXISTS : errno_to_win(errno));
     if (disposition == CREATE_ALWAYS || disposition == OPEN_ALWAYS)
         SETERR(existed ? ERROR_ALREADY_EXISTS : 0);
     else
@@ -2004,17 +2070,38 @@ static int blocking_write(int fd,const void *buffer,uint32_t size)
     thread_resume(&pause);errno=error;return result;
 }
 
+/* An OVERLAPPED (Internal, InternalHigh, Offset, OffsetHigh, hEvent) given for a file: the
+ * operation happens at its offset, and completes at once. */
+static void overlapped_seek(struct hobj *o, int fd, const uint32_t *ov)
+{
+    if (ov && o->type == H_FILE && !o->console)
+        lseek(fd, (off_t)((uint64_t)ov[3] << 32 | ov[2]), SEEK_SET);
+}
+static void overlapped_done(uint32_t *ov, uint32_t status, uint32_t n)
+{
+    if (!ov)
+        return;
+    ov[0] = status;
+    ov[1] = n;
+    struct hobj *e = handle_get_type(ov[4], H_EVENT);
+    if (e) {
+        e->signaled = 1;
+        thread_notify();
+    }
+}
+
 DEF(ReadFile)
 {
     struct hobj *o=NULL;
     int fd = file_fd(A(0), &o);
     uint32_t n = A(2);
     enum htype type=o ? o->type:H_NONE;
-    uint32_t *done = P(3);
+    uint32_t *done = P(3), *ov = P(4);
     if (fd < 0 || !A(1))
         FAIL(ERROR_INVALID_HANDLE);
     if (done)
         *done = 0;
+    overlapped_seek(o, fd, ov);
     if (o->type == H_CONSOLE_IN || (o->fd == 0 && o->console)) {
         crt_flush_all();
         if(fd==0) console_raw(!(console_in_mode&2));
@@ -2024,6 +2111,7 @@ DEF(ReadFile)
             FAIL(ERROR_READ_FAULT);
         if (done)
             *done = (uint32_t)r;
+        overlapped_done(ov, 0, (uint32_t)r);
         return 1;
     }
     if (o->type == H_PIPE_W)
@@ -2038,6 +2126,11 @@ DEF(ReadFile)
         *done = (uint32_t)r;
     if (type == H_PIPE_R && r == 0)
         FAIL(ERROR_BROKEN_PIPE);
+    if (ov && !r && n && type == H_FILE) {  /* at the end, as an overlapped read reports it */
+        overlapped_done(ov, 0xC0000011u, 0);
+        FAIL(ERROR_HANDLE_EOF);
+    }
+    overlapped_done(ov, 0, (uint32_t)r);
     return 1;
 }
 DEF(ReadFileEx) { uint32_t b[5] = { A(0), A(1), A(2), 0, A(3) }; return api_ReadFile(b); }
@@ -2046,13 +2139,16 @@ DEF(WriteFile)
     struct hobj *o;
     int fd = file_fd(A(0), &o);
     uint32_t n = A(2);
-    uint32_t *done = P(3);
+    uint32_t *done = P(3), *ov = P(4);
     if (fd < 0)
         FAIL(ERROR_INVALID_HANDLE);
     if (done)
         *done = 0;
-    if (!n)
+    if (!n) {
+        overlapped_done(ov, 0, 0);
         return 1;
+    }
+    overlapped_seek(o, fd, ov);
     if (o->append)
         lseek(fd, 0, SEEK_END);
     int r;
@@ -2067,6 +2163,7 @@ DEF(WriteFile)
         FAIL(errno_to_win(errno));
     if (done)
         *done = (uint32_t)r;
+    overlapped_done(ov, 0, (uint32_t)r);
     return 1;
 }
 DEF(WriteFileEx) { uint32_t b[5] = { A(0), A(1), A(2), 0, A(3) }; return api_WriteFile(b); }
@@ -2087,16 +2184,18 @@ DEF(SetFilePointer)
 {
     struct hobj *o;
     int fd = file_fd(A(0), &o);
-    if (fd < 0)
-        FAIL(ERROR_INVALID_HANDLE);
+    if (fd < 0) {
+        SETERR(ERROR_INVALID_HANDLE);
+        return 0xFFFFFFFFu;             /* INVALID_SET_FILE_POINTER */
+    }
     int64_t dist = (int32_t)A(1);
     if (A(2))
         dist = (int64_t)((uint64_t)*(uint32_t *)P(2) << 32 | A(1));
     int whence = A(3) == 0 ? SEEK_SET : A(3) == 1 ? SEEK_CUR : SEEK_END;
     off_t r = lseek(fd, (off_t)dist, whence);
     if (r < 0) {
-        if (A(2)) *(uint32_t *)P(2) = 0xFFFFFFFFu;
-        FAIL(errno == EINVAL ? ERROR_NEGATIVE_SEEK : errno_to_win(errno));
+        SETERR(errno == EINVAL ? ERROR_NEGATIVE_SEEK : errno_to_win(errno));
+        return 0xFFFFFFFFu;             /* INVALID_SET_FILE_POINTER (the high part is left alone) */
     }
     if (A(2))
         *(uint32_t *)P(2) = (uint32_t)((uint64_t)r >> 32);
@@ -2126,8 +2225,10 @@ DEF(GetFileSize)
     struct hobj *o;
     int fd = file_fd(A(0), &o);
     struct stat st;
-    if (fd < 0 || fstat(fd, &st) < 0)
-        FAIL(ERROR_INVALID_HANDLE);
+    if (fd < 0 || fstat(fd, &st) < 0) {
+        SETERR(ERROR_INVALID_HANDLE);
+        return 0xFFFFFFFFu;             /* INVALID_FILE_SIZE */
+    }
     if (A(1))
         *(uint32_t *)P(1) = 0;
     SETERR(0);
@@ -2178,7 +2279,7 @@ DEF(LockFileEx) { (void)a; return 1; }
 DEF(UnlockFileEx) { (void)a; return 1; }
 DEF(GetFileTime)
 {
-    struct hobj *o;
+    struct hobj *o = NULL;
     int fd = file_fd(A(0), &o);
     struct stat st;
     if (!o)
@@ -2194,7 +2295,7 @@ DEF(GetFileTime)
 DEF(SetFileTime) { (void)a; return 1; }
 DEF(GetFileInformationByHandle)
 {
-    struct hobj *o;
+    struct hobj *o = NULL;
     int fd = file_fd(A(0), &o);
     struct stat st;
     if (!o || (fd < 0 ? !o->path || stat(o->path, &st) < 0 : fstat(fd, &st) < 0))
@@ -2629,7 +2730,17 @@ DEF(AreFileApisANSI) { (void)a; return 1; }
 DEF(SetFileApisToANSI) { (void)a; return 0; }
 DEF(SetFileApisToOEM) { (void)a; return 0; }
 DEF(DeviceIoControl) { (void)a; FAIL(ERROR_INVALID_FUNCTION); }
-DEF(GetOverlappedResult) { (void)a; FAIL(ERROR_NOT_SUPPORTED); }
+DEF(GetOverlappedResult)
+{
+    /* (handle, overlapped, bytes*, wait): every operation has completed by now */
+    const uint32_t *ov = P(1);
+    if (!ov)
+        FAIL(ERROR_INVALID_PARAMETER);
+    if (A(2)) *(uint32_t *)P(2) = ov[1];
+    if (ov[0] == 0xC0000011u)
+        FAIL(ERROR_HANDLE_EOF);
+    return 1;
+}
 DEF(CancelIo) { (void)a; return 1; }
 DEF(CreatePipe)
 {
@@ -2678,10 +2789,12 @@ static int glob_match(const char *pat, const char *s)
                 pat++;
             if (!*pat)
                 return 1;
+            const char *rest = s;
             for (; *s; s++)
                 if (glob_match(pat, s))
                     return 1;
-            return !*pat || !strcmp(pat, ".");
+            /* "*." is the names without an extension */
+            return !strcmp(pat, ".") && !strchr(rest, '.');
         }
         if (*pat == '?') {
             if (!*s)
@@ -2692,8 +2805,9 @@ static int glob_match(const char *pat, const char *s)
         }
         if (*pat == '.' && !*s && !strcmp(pat, "."))
             return 1;                   /* "name." matches "name" */
-        if (!*s || ((*pat | 0x20) != (*s | 0x20) && !(*pat >= 'a' && *pat <= 'z') && *pat != *s) ||
-            ((*pat | 0x20) != (*s | 0x20)))
+        int pc = *pat >= 'A' && *pat <= 'Z' ? *pat + 32 : *pat;     /* letters match in either case */
+        int sc = *s >= 'A' && *s <= 'Z' ? *s + 32 : *s;
+        if (!*s || pc != sc)
             return 0;
         pat++;
         s++;
@@ -2933,6 +3047,12 @@ static void view_flush(struct view *v)
             break;
         done += (uint32_t)r;
     }
+}
+/* At exit: what the program wrote into its views reaches the files, as on Windows. */
+void file_views_flush(void)
+{
+    for (struct view *v = views; v; v = v->next)
+        view_flush(v);
 }
 DEF(FlushViewOfFile)
 {
@@ -3575,43 +3695,45 @@ static const char *locale_info(uint32_t type)
 DEF(GetLocaleInfoA)
 {
     uint32_t type = A(1);
-    const char *v = locale_info(type);
-    if (type == 0x000E) v = ".";        /* LOCALE_SDECIMAL */
-    if (type == 0x000F) v = ",";        /* LOCALE_STHOUSAND */
-    if (type == 0x0010) v = "3;0";      /* LOCALE_SGROUPING */
-    if (type == 0x0011) v = "2";        /* LOCALE_IDIGITS */
-    if (type == 0x0012) v = "1";        /* LOCALE_ILZERO */
-    if (type == 0x0014) v = "$";        /* LOCALE_SCURRENCY */
-    if (type == 0x0015) v = "USD";
-    if (type == 0x0016) v = ".";        /* LOCALE_SMONDECIMALSEP */
-    if (type == 0x0017) v = ",";
-    if (type == 0x0018) v = "3;0";
-    if (type == 0x0019) v = "2";        /* LOCALE_ICURRDIGITS */
-    if (type == 0x001B) v = "0";        /* LOCALE_ICURRENCY */
-    if (type == 0x001C) v = "0";
-    if (type == 0x001D) v = "/";        /* LOCALE_SDATE */
-    if (type == 0x001E) v = ":";        /* LOCALE_STIME */
-    if (type == 0x001F) v = "M/d/yyyy";
-    if (type == 0x0020) v = "dddd, MMMM d, yyyy";
-    if (type == 0x1003) v = "h:mm:ss tt";   /* LOCALE_STIMEFORMAT */
-    if (type == 0x0021) v = "0";        /* LOCALE_IDATE */
-    if (type == 0x0022) v = "0";        /* LOCALE_ILDATE */
-    if (type == 0x0023) v = "0";        /* LOCALE_ITIME */
-    if (type == 0x0025) v = "0";        /* LOCALE_ICENTURY */
-    if (type == 0x0026) v = "0";        /* LOCALE_ITLZERO */
-    if (type == 0x0027) v = "0";
-    if (type == 0x0028) v = "AM";
-    if (type == 0x0029) v = "PM";
-    if (type == 0x0050) v = "-";        /* LOCALE_SNEGATIVESIGN */
-    if (type == 0x0051) v = "+";        /* LOCALE_SPOSITIVESIGN */
-    if (type == 0x0052) v = "0";
-    if (type == 0x0053) v = "1";
-    if (type == 0x0054) v = "1";
-    if (type == 0x0055) v = "1";        /* LOCALE_INEGSEPBYSPACE? */
-    if (type == 0x0058) v = "1";
-    if (type == 0x100C) v = "0";
-    if (type == 0x1005) v = "1";        /* LOCALE_IDEFAULTCODEPAGE? */
-    if (type == 0x1009) v = "1252";
+    /* the value asked for, without LOCALE_NOUSEROVERRIDE, LOCALE_USE_CP_ACP and LOCALE_RETURN_NUMBER */
+    uint32_t t = type & ~0xE0000000u;
+    const char *v = locale_info(t);
+    if (t == 0x000E) v = ".";        /* LOCALE_SDECIMAL */
+    if (t == 0x000F) v = ",";        /* LOCALE_STHOUSAND */
+    if (t == 0x0010) v = "3;0";      /* LOCALE_SGROUPING */
+    if (t == 0x0011) v = "2";        /* LOCALE_IDIGITS */
+    if (t == 0x0012) v = "1";        /* LOCALE_ILZERO */
+    if (t == 0x0014) v = "$";        /* LOCALE_SCURRENCY */
+    if (t == 0x0015) v = "USD";
+    if (t == 0x0016) v = ".";        /* LOCALE_SMONDECIMALSEP */
+    if (t == 0x0017) v = ",";
+    if (t == 0x0018) v = "3;0";
+    if (t == 0x0019) v = "2";        /* LOCALE_ICURRDIGITS */
+    if (t == 0x001B) v = "0";        /* LOCALE_ICURRENCY */
+    if (t == 0x001C) v = "0";
+    if (t == 0x001D) v = "/";        /* LOCALE_SDATE */
+    if (t == 0x001E) v = ":";        /* LOCALE_STIME */
+    if (t == 0x001F) v = "M/d/yyyy";
+    if (t == 0x0020) v = "dddd, MMMM d, yyyy";
+    if (t == 0x1003) v = "h:mm:ss tt";   /* LOCALE_STIMEFORMAT */
+    if (t == 0x0021) v = "0";        /* LOCALE_IDATE */
+    if (t == 0x0022) v = "0";        /* LOCALE_ILDATE */
+    if (t == 0x0023) v = "0";        /* LOCALE_ITIME */
+    if (t == 0x0025) v = "0";        /* LOCALE_ICENTURY */
+    if (t == 0x0026) v = "0";        /* LOCALE_ITLZERO */
+    if (t == 0x0027) v = "0";
+    if (t == 0x0028) v = "AM";
+    if (t == 0x0029) v = "PM";
+    if (t == 0x0050) v = "-";        /* LOCALE_SNEGATIVESIGN */
+    if (t == 0x0051) v = "+";        /* LOCALE_SPOSITIVESIGN */
+    if (t == 0x0052) v = "0";
+    if (t == 0x0053) v = "1";
+    if (t == 0x0054) v = "1";
+    if (t == 0x0055) v = "1";        /* LOCALE_INEGSEPBYSPACE? */
+    if (t == 0x0058) v = "1";
+    if (t == 0x100C) v = "0";
+    if (t == 0x1005) v = "1";        /* LOCALE_IDEFAULTCODEPAGE? */
+    if (t == 0x1009) v = "1252";
     if ((type & 0x20000000) && v) {     /* LOCALE_RETURN_NUMBER */
         if (A(3) < 2)
             FAIL(ERROR_INSUFFICIENT_BUFFER);
@@ -3961,9 +4083,20 @@ static uint32_t format_message(uint32_t flags, const char *src, uint32_t id, cha
         memcpy(out, buf, o + 1);
     return o;
 }
+/* The inserts: an array of DWORDs with FORMAT_MESSAGE_ARGUMENT_ARRAY, else a va_list *, that is
+ * a pointer to (the guest address of) the arguments. */
+static const uint32_t *format_args(uint32_t flags, gp_t arguments)
+{
+    if (!arguments)
+        return NULL;
+    if (flags & 0x2000)
+        return GP(arguments);
+    gp_t list = *(gp_t *)GP(arguments);
+    return list ? GP(list) : NULL;
+}
 DEF(FormatMessageA)
 {
-    return format_message(A(0), S(1), A(2), P(4), A(5), A(6) ? P(6) : NULL, 0);
+    return format_message(A(0), S(1), A(2), P(4), A(5), format_args(A(0), A(6)), 0);
 }
 DEF(FormatMessageW)
 {
@@ -3973,7 +4106,7 @@ DEF(FormatMessageW)
         wide_to_ansi(WS(1), -1, src, sizeof(src));
         s = src;
     }
-    return format_message(A(0), s, A(2), P(4), A(5), A(6) ? P(6) : NULL, 1);
+    return format_message(A(0), s, A(2), P(4), A(5), format_args(A(0), A(6)), 1);
 }
 
 /* ---- INI files ---- */

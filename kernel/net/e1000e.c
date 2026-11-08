@@ -31,9 +31,10 @@
  * is turned off in the PHY: the MAC-side handling it needs is not here.
  *
  * The interrupt handler passes received frames up; the timer tick looks
- * at the rings and the link as well, so a lost interrupt costs only
- * latency. For the first minute the tick also logs what the controller
- * and the PHY see, for working out why no frames get through.
+ * at the rings as well, so a lost interrupt costs only latency. The link,
+ * whose settings reach the PHY, is the knetd thread's (net.c): every 2 s
+ * and after a link interrupt. For the first minute it also logs what the
+ * controller and the PHY see, for working out why no frames get through.
  *
  * Kernel options: e1000e=off; e1000e=phycycle power-cycles the PHY at
  * start even when it answers (what the BIOS left in it is then gone).
@@ -279,7 +280,7 @@ static struct {
     uint8_t *rx_buf[RX_RING], *tx_buf[TX_RING];
     uint32_t rx_next;                   /* the next descriptor to look at */
     uint32_t tx_next, tx_done;          /* free-running */
-    int link_up, speed, full, polls;
+    int link_up, speed, full;
     uint32_t max_ltr;                   /* the most latency the BIOS lets us report, encoded */
     uint32_t hw_rx, hw_tx, hw_crc, hw_all_rx, hw_all_tx, hw_nobuf, hw_rxerr;   /* the controller's own counts */
     int diag, diag_polls;               /* reports left to log (the first minute, and after a link change) */
@@ -737,7 +738,9 @@ static void update_link(int force)
     set_ltr(speed);
     if (up)
         phy_link_settings(speed, full);
+    spin_lock(&net_lock);
     net_link_changed(up);
+    spin_unlock(&net_lock);
 }
 
 /* ---- sending and receiving ---- */
@@ -811,49 +814,54 @@ static void e_irq(struct trapframe *tf)
         if (!icr)
             break;
         if (icr & ICR_LSC)
-            update_link(0);
+            net_link_poke();            /* the PHY's settings are knetd's: they may take long */
         rx_process();
         tx_reclaim();
     }
     spin_unlock(&net_lock);
 }
 
-/* From the timer: anything the interrupt missed; the link and the
- * frames dropped for want of buffers every 2 s. */
+/* From the timer: anything the interrupt missed. */
 static void e_poll(void)
 {
     rx_process();
     tx_reclaim();
-    if (++e.polls >= 20) {
-        e.polls = 0;
-        update_link(0);
-        netif.rx_dropped += rd(R_MPC);
-        e.hw_rx += rd(R_GPRC);
-        e.hw_tx += rd(R_GPTC);
-        e.hw_crc += rd(R_CRCERRS);
-        e.hw_all_rx += rd(R_TPR);
-        e.hw_all_tx += rd(R_TPT);
-        e.hw_nobuf += rd(R_RNBC);
-        e.hw_rxerr += rd(R_RXERRC);
-        /* For the first minute, and the first after a link change, every
-         * 10 s: whether frames get through the controller at all, and
-         * what the PHY makes of the cable. */
-        if (e.diag && ++e.diag_polls % 5 == 0) {
-            e.diag--;
-            uint32_t tdh = rd(R_TDH), tdt = rd(R_TDT);
-            klog("%s: link %s; controller sent %u frames (%u good), received %u (%u good, CRC errors %u, "
-                 "other errors %u, missed %u, no buffer %u); stack sent %u, received %u; rings TDH %u TDT %u "
-                 "RDH %u RDT %u\n", e.dev.name, e.link_up ? "up" : "down", e.hw_all_tx, e.hw_tx,
-                 e.hw_all_rx, e.hw_rx, e.hw_crc, e.hw_rxerr, netif.rx_dropped, e.hw_nobuf, netif.tx_packets,
-                 netif.rx_packets, tdh, tdt, rd(R_RDH), rd(R_RDT));
-            log_phy();
-            if (tdh != tdt) {           /* frames waiting that the transmit unit has not taken */
-                const volatile uint32_t *d = (const volatile uint32_t *)&e.tx_ring[tdh % TX_RING];
-                klog("%s: transmit stuck: TCTL %08x TXDCTL0 %08x TARC0 %08x TARC1 %08x TIPG %08x PBA %08x "
-                     "TDBAL %08x TDLEN %u TDFH %u TDFT %u; descriptor %u: %08x %08x %08x %08x\n", e.dev.name,
-                     rd(R_TCTL), rd(R_TXDCTL0), rd(R_TARC0), rd(R_TARC1), rd(R_TIPG), rd(R_PBA), rd(R_TDBAL),
-                     rd(R_TDLEN), rd(R_TDFH), rd(R_TDFT), tdh, d[0], d[1], d[2], d[3]);
-            }
+}
+
+/* From knetd, without net_lock, every 2 s and after a link interrupt: the
+ * link (whose settings reach the PHY) and the frames dropped for want of buffers. */
+static void e_link_work(void)
+{
+    update_link(0);
+    uint32_t missed = rd(R_MPC);
+    spin_lock(&net_lock);
+    netif.rx_dropped += missed;
+    spin_unlock(&net_lock);
+    e.hw_rx += rd(R_GPRC);
+    e.hw_tx += rd(R_GPTC);
+    e.hw_crc += rd(R_CRCERRS);
+    e.hw_all_rx += rd(R_TPR);
+    e.hw_all_tx += rd(R_TPT);
+    e.hw_nobuf += rd(R_RNBC);
+    e.hw_rxerr += rd(R_RXERRC);
+    /* For the first minute, and the first after a link change, every
+     * 10 s: whether frames get through the controller at all, and
+     * what the PHY makes of the cable. */
+    if (e.diag && ++e.diag_polls % 5 == 0) {
+        e.diag--;
+        uint32_t tdh = rd(R_TDH), tdt = rd(R_TDT);
+        klog("%s: link %s; controller sent %u frames (%u good), received %u (%u good, CRC errors %u, "
+             "other errors %u, missed %u, no buffer %u); stack sent %u, received %u; rings TDH %u TDT %u "
+             "RDH %u RDT %u\n", e.dev.name, e.link_up ? "up" : "down", e.hw_all_tx, e.hw_tx,
+             e.hw_all_rx, e.hw_rx, e.hw_crc, e.hw_rxerr, netif.rx_dropped, e.hw_nobuf, netif.tx_packets,
+             netif.rx_packets, tdh, tdt, rd(R_RDH), rd(R_RDT));
+        log_phy();
+        if (tdh != tdt) {           /* frames waiting that the transmit unit has not taken */
+            const volatile uint32_t *d = (const volatile uint32_t *)&e.tx_ring[tdh % TX_RING];
+            klog("%s: transmit stuck: TCTL %08x TXDCTL0 %08x TARC0 %08x TARC1 %08x TIPG %08x PBA %08x "
+                 "TDBAL %08x TDLEN %u TDFH %u TDFT %u; descriptor %u: %08x %08x %08x %08x\n", e.dev.name,
+                 rd(R_TCTL), rd(R_TXDCTL0), rd(R_TARC0), rd(R_TARC1), rd(R_TIPG), rd(R_PBA), rd(R_TDBAL),
+                 rd(R_TDLEN), rd(R_TDFH), rd(R_TDFT), tdh, d[0], d[1], d[2], d[3]);
         }
     }
 }
@@ -1021,6 +1029,7 @@ int e1000e_init(void)
     e.dev.irq = irq >= 0 ? (uint32_t)irq : 0;
     e.dev.transmit = e_transmit;
     e.dev.poll = e_poll;
+    e.dev.link_work = e_link_work;
     e.dev.suspend = e_suspend;
     e.dev.resume = e_resume;
     e.irq = irq;

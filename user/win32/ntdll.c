@@ -73,12 +73,19 @@ DEF(RtlNtStatusToDosError)
     default: return 317;               /* ERROR_MR_MID_NOT_FOUND */
     }
 }
-DEF(RtlInitializeCriticalSection) { uint32_t *cs = P(0); memset(cs, 0, 24); cs[1] = (uint32_t)-1; return 0; }
-DEF(RtlInitializeCriticalSectionAndSpinCount) { uint32_t *cs = P(0); memset(cs, 0, 24); cs[1] = (uint32_t)-1; return 0; }
-DEF(RtlDeleteCriticalSection) { memset(P(0), 0, 24); return 0; }
-DEF(RtlEnterCriticalSection) { uint32_t *cs = P(0); cs[1]++; cs[2]++; cs[3] = teb->thread_id; return 0; }
-DEF(RtlLeaveCriticalSection) { uint32_t *cs = P(0); cs[1]--; if (cs[2]) cs[2]--; return 0; }
-DEF(RtlTryEnterCriticalSection) { api_RtlEnterCriticalSection(a); return 1; }
+/* Critical sections are KERNEL32's (whose functions are these on Windows): one implementation,
+ * so that a section entered through one and left through the other is still exclusive. */
+extern struct api_dll kernel32_dll;
+static uint32_t k32_call(const char *name, uint32_t *a)
+{
+    return api_find(&kernel32_dll, name)->fn(a);
+}
+DEF(RtlInitializeCriticalSection) { return k32_call("InitializeCriticalSection", a); }
+DEF(RtlInitializeCriticalSectionAndSpinCount) { k32_call("InitializeCriticalSection", a); return 0; }
+DEF(RtlDeleteCriticalSection) { return k32_call("DeleteCriticalSection", a); }
+DEF(RtlEnterCriticalSection) { return k32_call("EnterCriticalSection", a); }
+DEF(RtlLeaveCriticalSection) { return k32_call("LeaveCriticalSection", a); }
+DEF(RtlTryEnterCriticalSection) { return k32_call("TryEnterCriticalSection", a); }
 DEF(RtlAllocateHeap) { return heap_alloc(A(0), A(2), (A(1) & 8) != 0); }
 DEF(RtlFreeHeap) { return heap_free(A(0), A(2)) == 0; }
 DEF(RtlReAllocateHeap) { return heap_realloc(A(0), A(2), A(3), (A(1) & 8) != 0, 0); }
@@ -294,20 +301,17 @@ DEF(NtAllocateVirtualMemory)
 }
 DEF(NtFreeVirtualMemory)
 {
-    gp_t *base = P(1);
-    uint32_t *size = P(2);
-    if (A(3) == MEM_RELEASE)
-        vm_free(*base, *size);
-    else
-        vm_decommit(*base, *size);
-    return 0;
+    uint32_t b[3] = { *(gp_t *)P(1), *(uint32_t *)P(2), A(3) };
+    extern struct api_dll kernel32_dll;
+    return api_find(&kernel32_dll, "VirtualFree")->fn(b) ? 0 : 0xC000000Du;  /* STATUS_INVALID_PARAMETER */
 }
 DEF(NtProtectVirtualMemory)
 {
     gp_t *base = P(1);
     uint32_t *size = P(2);
     uint32_t old;
-    vm_protect(*base, *size, A(3), &old);
+    if (vm_protect(*base, *size, A(3), &old) < 0)
+        return 0xC0000045u;             /* STATUS_INVALID_PAGE_PROTECTION */
     if (A(4)) *(uint32_t *)P(4) = old;
     return 0;
 }

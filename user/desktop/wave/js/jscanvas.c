@@ -601,12 +601,12 @@ static jsval ctx_create_pattern(struct js *J, jsval self, jsval *args, int argc)
                                  "provided value is not of type '(CSSImageValue or HTMLImageElement or SVGImageElement "
                                  "or HTMLVideoElement or HTMLCanvasElement or ImageBitmap or OffscreenCanvas or "
                                  "VideoFrame)'.");
-    const struct image *src = image_source(J, args[0]);
-    if (!src || src->w <= 0 || src->h <= 0)
-        return js_null;
+    /* Coerce the repeat argument first: its toString can relayout and free the source bitmap. */
     int repeat = CV_REPEAT;
     if (args[1].t != JS_NULL && args[1].t != JS_UNDEF) {
         const char *r = js_cstr(js_to_string(J, args[1]));
+        if (js_throwing(J))
+            return js_undefined;
         if (!strcmp(r, "repeat") || !*r)
             repeat = CV_REPEAT;
         else if (!strcmp(r, "repeat-x"))
@@ -619,6 +619,9 @@ static jsval ctx_create_pattern(struct js *J, jsval self, jsval *args, int argc)
             return throw_dom(J, "SyntaxError", "The provided type ('') is not one of 'repeat', 'repeat-x', 'repeat-y', "
                                                "or 'no-repeat'.");
     }
+    const struct image *src = image_source(J, args[0]);
+    if (!src || src->w <= 0 || src->h <= 0)
+        return js_null;
     size_t px = (size_t)src->w * src->h * 4;
     struct cv_pat *p = js_alloc(J, sizeof(*p) + px);
     if (!p)
@@ -1317,6 +1320,13 @@ static jsval ctx_draw_image(struct js *J, jsval self, jsval *args, int argc)
                                  "value is not of type '(CSSImageValue or HTMLImageElement or SVGImageElement or "
                                  "HTMLVideoElement or HTMLCanvasElement or ImageBitmap or OffscreenCanvas or "
                                  "VideoFrame)'.");
+    /* Coerce every coordinate first: a valueOf of theirs can relayout the page and free a source
+     * element's bitmap, so the source pointer must be taken only after they have run. */
+    double d[9] = {0};
+    for (int i = 1; i < argc && i < 9; i++)
+        d[i] = js_to_number(J, args[i]);
+    if (js_throwing(J))
+        return js_undefined;
     const struct image *src = image_source(J, args[0]);
     if (!src || src->w <= 0 || src->h <= 0) {
         struct node *n = jsdom_node_of(args[0]);
@@ -1337,21 +1347,21 @@ static jsval ctx_draw_image(struct js *J, jsval self, jsval *args, int argc)
         }
         memcpy(copy->px, src->px, (size_t)src->w * src->h * 4);
         if (argc >= 9)
-            cv_draw_image(c, copy, NUM(1), NUM(2), NUM(3), NUM(4), NUM(5), NUM(6), NUM(7), NUM(8));
+            cv_draw_image(c, copy, d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8]);
         else if (argc >= 5)
-            cv_draw_image(c, copy, 0, 0, copy->w, copy->h, NUM(1), NUM(2), NUM(3), NUM(4));
+            cv_draw_image(c, copy, 0, 0, copy->w, copy->h, d[1], d[2], d[3], d[4]);
         else
-            cv_draw_image(c, copy, 0, 0, copy->w, copy->h, NUM(1), NUM(2), copy->w, copy->h);
+            cv_draw_image(c, copy, 0, 0, copy->w, copy->h, d[1], d[2], copy->w, copy->h);
         img_release(copy);
         touch(J);
         return js_undefined;
     }
     if (argc >= 9)
-        cv_draw_image(c, src, NUM(1), NUM(2), NUM(3), NUM(4), NUM(5), NUM(6), NUM(7), NUM(8));
+        cv_draw_image(c, src, d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8]);
     else if (argc >= 5)
-        cv_draw_image(c, src, 0, 0, src->w, src->h, NUM(1), NUM(2), NUM(3), NUM(4));
+        cv_draw_image(c, src, 0, 0, src->w, src->h, d[1], d[2], d[3], d[4]);
     else
-        cv_draw_image(c, src, 0, 0, src->w, src->h, NUM(1), NUM(2), src->w, src->h);
+        cv_draw_image(c, src, 0, 0, src->w, src->h, d[1], d[2], src->w, src->h);
     touch(J);
     return js_undefined;
 }

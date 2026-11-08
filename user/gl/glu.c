@@ -2,7 +2,9 @@
  * gluBuild2DMipmaps. */
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 #include <GL/glu.h>
+#include "glint.h"
 
 void gluPerspective(GLdouble fovy, GLdouble aspect, GLdouble z_near, GLdouble z_far)
 {
@@ -52,53 +54,82 @@ void gluLookAt(GLdouble eye_x, GLdouble eye_y, GLdouble eye_z,
     glTranslated(-eye_x, -eye_y, -eye_z);
 }
 
-/* Level 0 from the program, then each level the last one halved (a box
- * filter over two by two texels, or two in a line once a side is 1), down
- * to 1 x 1. The levels come from level 0 as glGetTexImage reads it back
- * in RGBA, which glTexImage2D takes again into the same internal format. */
+/* An RGBA image w x h halved in place (a box filter over two by two
+ * texels, or two in a line once a side is 1): each texel written comes
+ * after every one it reads. */
+static void halve(unsigned char *img, int *pw, int *ph)
+{
+    int w = *pw, h = *ph;
+    int nw = w > 1 ? w / 2 : 1, nh = h > 1 ? h / 2 : 1;
+    int sx = w > 1 ? 2 : 1, sy = h > 1 ? 2 : 1;
+    for (int y = 0; y < nh; y++) {
+        for (int x = 0; x < nw; x++) {
+            for (int k = 0; k < 4; k++) {
+                unsigned sum = 0;
+                for (int j = 0; j < sy; j++)
+                    for (int i = 0; i < sx; i++)
+                        sum += img[((size_t)(y * sy + j) * (size_t)w + (size_t)(x * sx + i)) * 4 + (size_t)k];
+                img[((size_t)y * (size_t)nw + (size_t)x) * 4 + (size_t)k] =
+                    (unsigned char)((sum + (unsigned)(sx * sy) / 2) / (unsigned)(sx * sy));
+            }
+        }
+    }
+    *pw = nw;
+    *ph = nh;
+}
+
+/* The image from the program (with its unpack rules) as RGBA, halved
+ * until it fits the largest texture, is level 0; then each level the last
+ * one halved, down to 1 x 1. The GL errors the uploads raise are left for
+ * glGetError, behind any the program had not read yet; the result is a GLU
+ * error code, or 0. */
 GLint gluBuild2DMipmaps(GLenum target, GLint internal_format, GLsizei width, GLsizei height,
                         GLenum format, GLenum type, const void *data)
 {
-    glTexImage2D(target, 0, internal_format, width, height, 0, format, type, data);
-    if (glGetError() != GL_NO_ERROR)
-        return GL_INVALID_VALUE;
+    struct fgl_context *c = gl_ctx;
     if (width < 1 || height < 1)
-        return 0;
-    unsigned char *img = malloc((size_t)width * (size_t)height * 4);
+        return GLU_INVALID_VALUE;
+    if (!gl_format_size(format) || type != GL_UNSIGNED_BYTE)
+        return GLU_INVALID_ENUM;
+    if (!c || c->in_begin)
+        return GLU_INVALID_OPERATION;
+    unsigned char *img = gl_size_ok((size_t)width, (size_t)height, 4) ? malloc((size_t)width * (size_t)height * 4)
+                                                                     : NULL;
     if (!img)
-        return GL_OUT_OF_MEMORY;
-    glPushClientAttrib(GL_CLIENT_PIXEL_STORE_BIT);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
-    glPixelStorei(GL_PACK_SKIP_ROWS, 0);
-    glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-    glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
-    glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
-    glGetTexImage(target, 0, GL_RGBA, GL_UNSIGNED_BYTE, img);
+        return GLU_OUT_OF_MEMORY;
+    if (data)
+        gl_unpack_image(c, (uint32_t *)(void *)img, width, width, height, format, GL_RGBA, data);
+    else
+        memset(img, 0, (size_t)width * (size_t)height * 4);
     int w = width, h = height;
-    for (GLint level = 1; w > 1 || h > 1; level++) {
-        int nw = w > 1 ? w / 2 : 1, nh = h > 1 ? h / 2 : 1;
-        int sx = w > 1 ? 2 : 1, sy = h > 1 ? 2 : 1;
-        /* In place: each texel written comes after every one it reads. */
-        for (int y = 0; y < nh; y++) {
-            for (int x = 0; x < nw; x++) {
-                for (int k = 0; k < 4; k++) {
-                    unsigned sum = 0;
-                    for (int j = 0; j < sy; j++)
-                        for (int i = 0; i < sx; i++)
-                            sum += img[((size_t)(y * sy + j) * (size_t)w + (size_t)(x * sx + i)) * 4 + (size_t)k];
-                    img[((size_t)y * (size_t)nw + (size_t)x) * 4 + (size_t)k] =
-                        (unsigned char)((sum + (unsigned)(sx * sy) / 2) / (unsigned)(sx * sy));
-                }
-            }
-        }
-        w = nw;
-        h = nh;
+    while (w > MAX_TEXTURE || h > MAX_TEXTURE)
+        halve(img, &w, &h);
+
+    GLenum pending = c->error;
+    c->error = GL_NO_ERROR;
+    /* The levels are tightly packed: the program's unpack rules are put
+     * aside meanwhile (not on its glPushClientAttrib stack, which may be full). */
+    int align = c->unpack_align, row_length = c->unpack_row_length;
+    int skip_rows = c->unpack_skip_rows, skip_pixels = c->unpack_skip_pixels;
+    c->unpack_align = 1;
+    c->unpack_row_length = c->unpack_skip_rows = c->unpack_skip_pixels = 0;
+    glTexImage2D(target, 0, internal_format, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, img);
+    for (GLint level = 1; c->error == GL_NO_ERROR && (w > 1 || h > 1); level++) {
+        halve(img, &w, &h);
         glTexImage2D(target, level, internal_format, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, img);
     }
-    glPopClientAttrib();
+    c->unpack_align = align;
+    c->unpack_row_length = row_length;
+    c->unpack_skip_rows = skip_rows;
+    c->unpack_skip_pixels = skip_pixels;
     free(img);
-    return glGetError() == GL_NO_ERROR ? 0 : GL_INVALID_VALUE;
+    GLenum e = c->error;
+    c->error = pending != GL_NO_ERROR ? pending : e;
+    switch (e) {
+    case GL_NO_ERROR: return 0;
+    case GL_INVALID_ENUM: return GLU_INVALID_ENUM;
+    case GL_OUT_OF_MEMORY: return GLU_OUT_OF_MEMORY;
+    case GL_INVALID_OPERATION: return GLU_INVALID_OPERATION;
+    default: return GLU_INVALID_VALUE;
+    }
 }

@@ -19,7 +19,7 @@ static int copy_and_remove(const char *src, const char *dst)
     int in = open(src, O_RDONLY);
     if (in < 0)
         return -1;
-    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC);
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);     /* its own mode is set below */
     if (out < 0) {
         close(in);
         return -1;

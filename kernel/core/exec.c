@@ -251,21 +251,25 @@ static int build_stack(uint32_t *pd, char *const argv[], char *const envp[], uin
     return r;
 }
 
-/* Run interp with the program's path as argv[1], followed by argv[1..]. */
-static int exec_interp(struct proc *p, const char *interp, const char *path,
+/* Run interp, with its argument iarg if there is one (NULL: none), then the program's path,
+ * followed by argv[1..]. */
+static int exec_interp(struct proc *p, const char *interp, const char *iarg, const char *path,
                        char *const argv[], char *const envp[])
 {
     int argc = 0;
     while (argv && argv[argc])
         argc++;
-    char **nargv = kmalloc(sizeof(char *) * (uint32_t)(argc + 3));
+    char **nargv = kmalloc(sizeof(char *) * (uint32_t)(argc + 4));
     if (!nargv)
         return -ENOMEM;
-    nargv[0] = (char *)interp;
-    nargv[1] = (char *)path;
-    for (int k = 1; k < argc; k++)
-        nargv[k + 1] = argv[k];
-    nargv[argc < 1 ? 2 : argc + 1] = NULL;
+    int k = 0;
+    nargv[k++] = (char *)interp;
+    if (iarg)
+        nargv[k++] = (char *)iarg;
+    nargv[k++] = (char *)path;
+    for (int a = 1; a < argc; a++)
+        nargv[k++] = argv[a];
+    nargv[k] = NULL;
 
     struct vnode *ivn;
     char magic[2] = { 0, 0 };
@@ -279,22 +283,35 @@ static int exec_interp(struct proc *p, const char *interp, const char *path,
     return r;
 }
 
-/* "#!/path/to/interp" -> run interp with the script path as argv[1]. */
+static int hash_bang_blank(uint8_t c)
+{
+    return c == ' ' || c == '\t';
+}
+
+/* "#!/path/to/interp [arg]" -> run interp (with arg, the rest of the line as one argument, as
+ * Linux has it) with the script path after them. */
 static int exec_script(struct proc *p, struct image *vn, const char *path,
                        char *const argv[], char *const envp[])
 {
-    char interp[256];                   /* (an interpreter's path on a #! line is short) */
-    uint32_t i = 2, n = 0;
-    while (i < vn->have && vn->data[i] == ' ')
+    char interp[256], arg[256];         /* (a #! line is short) */
+    uint32_t i = 2, n = 0, m = 0;
+    while (i < vn->have && hash_bang_blank(vn->data[i]))
         i++;
     while (i < vn->have && n < sizeof(interp) - 1 && vn->data[i] != '\n' &&
-           vn->data[i] != ' ' && vn->data[i] != '\r')
+           !hash_bang_blank(vn->data[i]) && vn->data[i] != '\r')
         interp[n++] = (char)vn->data[i++];
     interp[n] = 0;
+    while (i < vn->have && hash_bang_blank(vn->data[i]))
+        i++;
+    while (i < vn->have && m < sizeof(arg) - 1 && vn->data[i] != '\n' && vn->data[i] != '\r')
+        arg[m++] = (char)vn->data[i++];
+    while (m && hash_bang_blank((uint8_t)arg[m - 1]))
+        m--;
+    arg[m] = 0;
     image_free(vn);
     if (!n)
         return -ENOEXEC;
-    return exec_interp(p, interp, path, argv, envp);
+    return exec_interp(p, interp, m ? arg : NULL, path, argv, envp);
 }
 
 /* A Windows program: an "MZ" executable whose header points at a "PE" one. */
@@ -347,11 +364,11 @@ int proc_exec(struct proc *p, const char *path, char *const argv[], char *const 
         return exec_script(p, &img, path, argv, envp);
     if (is_pe_program(&img)) {
         image_free(&img);
-        return exec_interp(p, WIN_LOADER, path, argv, envp);
+        return exec_interp(p, WIN_LOADER, NULL, path, argv, envp);
     }
     if (is_dos_program(&img, path)) {
         image_free(&img);
-        return exec_interp(p, DOS_LOADER, path, argv, envp);
+        return exec_interp(p, DOS_LOADER, NULL, path, argv, envp);
     }
 
     uint32_t *pd = vmm_create();

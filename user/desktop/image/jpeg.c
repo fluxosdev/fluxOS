@@ -255,7 +255,14 @@ static inline uint8_t clamp8(int v)
     p4 *= -1598;                                                        \
     t3 += p1 + p4; t2 += p2 + p3; t1 += p2 + p4; t0 += p1 + p3;
 
-/* in: 64 dequantized coefficients in natural order. */
+/* A column result, kept to what the row pass can take without overflowing an int: with inputs of
+ * 16 bits a column gives at most about 1e6, a picture's real ones under 10000. */
+static inline int32_t clamp_col(int32_t v)
+{
+    return v < -65535 ? -65535 : v > 65535 ? 65535 : v;
+}
+
+/* in: 64 dequantized coefficients in natural order, each within 16 bits. */
 static void idct_block(uint8_t *out, int stride, const int32_t *in)
 {
     int32_t tmp[64];
@@ -264,19 +271,19 @@ static void idct_block(uint8_t *out, int stride, const int32_t *in)
         const int32_t *d = in + i;
         int32_t *v = tmp + i;
         if (!(d[8] | d[16] | d[24] | d[32] | d[40] | d[48] | d[56])) {
-            int32_t dc = d[0] * 4;
+            int32_t dc = clamp_col(d[0] * 4);
             v[0] = v[8] = v[16] = v[24] = v[32] = v[40] = v[48] = v[56] = dc;
         } else {
             IDCT_1D(d[0], d[8], d[16], d[24], d[32], d[40], d[48], d[56])
             x0 += 512; x1 += 512; x2 += 512; x3 += 512;
-            v[0] = (x0 + t3) >> 10;
-            v[56] = (x0 - t3) >> 10;
-            v[8] = (x1 + t2) >> 10;
-            v[48] = (x1 - t2) >> 10;
-            v[16] = (x2 + t1) >> 10;
-            v[40] = (x2 - t1) >> 10;
-            v[24] = (x3 + t0) >> 10;
-            v[32] = (x3 - t0) >> 10;
+            v[0] = clamp_col((x0 + t3) >> 10);
+            v[56] = clamp_col((x0 - t3) >> 10);
+            v[8] = clamp_col((x1 + t2) >> 10);
+            v[48] = clamp_col((x1 - t2) >> 10);
+            v[16] = clamp_col((x2 + t1) >> 10);
+            v[40] = clamp_col((x2 - t1) >> 10);
+            v[24] = clamp_col((x3 + t0) >> 10);
+            v[32] = clamp_col((x3 - t0) >> 10);
         }
     }
     for (int i = 0; i < 8; i++, out += stride) {    /* rows */
@@ -326,7 +333,7 @@ static int seq_block(struct jpeg *j, struct comp *c, int32_t *blk)
     int t = huff_decode(b, &j->dc[c->dc]);
     if (t > 15)
         return -1;
-    c->pred += receive_extend(b, t);
+    c->pred = clamp16(c->pred + receive_extend(b, t));     /* (damaged data could run it past an int) */
     blk[0] = clamp16(c->pred * c->qt[0]);
     for (int k = 1; k < 64; ) {
         int rs = huff_decode(b, &j->ac[c->ac]);
@@ -361,7 +368,7 @@ static int prog_block(struct jpeg *j, struct comp *c, int16_t *blk, const struct
             int t = huff_decode(b, &j->dc[c->dc]);
             if (t > 15)
                 return -1;
-            c->pred += receive_extend(b, t);
+            c->pred = clamp16(c->pred + receive_extend(b, t));
             blk[0] = (int16_t)(c->pred * (1 << sc->al));
         } else if (br_bits(b, 1)) {     /* DC refinement: one more bit */
             blk[0] = (int16_t)(blk[0] | (1 << sc->al));
@@ -506,11 +513,11 @@ static void finish_progressive(struct jpeg *j)
         for (int by = 0; by < c->bh; by++) {
             for (int bx = 0; bx < c->bw; bx++) {
                 const int16_t *co = c->coef + ((size_t)by * c->bw + bx) * 64;
-                if (j->bs == 1) {
-                    blk[0] = co[0] * (int32_t)c->qt[0];
+                if (j->bs == 1) {               /* (16 bits, like a sequential block's) */
+                    blk[0] = clamp16(co[0] * (int32_t)c->qt[0]);
                 } else {
                     for (int k = 0; k < 64; k++)
-                        blk[k] = co[k] * (int32_t)c->qt[k];
+                        blk[k] = clamp16(co[k] * (int32_t)c->qt[k]);
                 }
                 put_block(j, c, bx, by, blk);
             }

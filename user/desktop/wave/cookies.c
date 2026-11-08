@@ -52,6 +52,12 @@ static int split_url(const char *url, char *host, int hsize, char *path, int psi
     if (at)
         url = at + 1;
     int hl = (int)strcspn(url, "/?#:");
+    if (url[0] == '[') {                /* an IPv6 address: all of it, brackets included */
+        hl = (int)strcspn(url, "]/?#");
+        if (url[hl] != ']')
+            return -1;
+        hl++;
+    }
     if (hl <= 0 || hl >= hsize)
         return -1;
     for (int i = 0; i < hl; i++)
@@ -79,6 +85,8 @@ static void free_cookie(struct cookie *c)
 
 static int is_ip(const char *h)
 {
+    if (*h == '[')
+        return 1;
     for (; *h; h++)
         if (!isdigit((unsigned char)*h) && *h != '.' && *h != ':')
             return 0;

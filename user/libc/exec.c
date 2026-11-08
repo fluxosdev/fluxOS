@@ -9,10 +9,34 @@ int execv(const char *path, char *const argv[])
     return execve(path, argv, environ);
 }
 
+/* A file the kernel cannot run (ENOEXEC: a script without "#!") is handed to the shell, as
+ * POSIX has execvp do. */
+static void exec_script(const char *path, char *const argv[])
+{
+    int n = 0;
+    while (argv[n])
+        n++;
+    char **nv = malloc(sizeof(char *) * (size_t)(n + 3));
+    if (!nv)
+        return;
+    nv[0] = "sh";
+    nv[1] = (char *)path;
+    for (int i = 1; i < n; i++)
+        nv[i + 1] = argv[i];
+    nv[n > 0 ? n + 1 : 2] = NULL;
+    execve("/bin/sh", nv, environ);
+    free(nv);
+    errno = ENOEXEC;
+}
+
 int execvp(const char *file, char *const argv[])
 {
-    if (strchr(file, '/'))
-        return execve(file, argv, environ);
+    if (strchr(file, '/')) {
+        execve(file, argv, environ);
+        if (errno == ENOEXEC)
+            exec_script(file, argv);
+        return -1;
+    }
 
     const char *path = getenv("PATH");
     if (!path || !*path)
@@ -31,6 +55,8 @@ int execvp(const char *file, char *const argv[])
                 strcpy(buf, file);
             }
             execve(buf, argv, environ);
+            if (errno == ENOEXEC)
+                exec_script(buf, argv);
             if (errno != ENOENT)
                 saved = errno;
         }

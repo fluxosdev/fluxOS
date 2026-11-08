@@ -46,15 +46,22 @@ static int read_code(struct lzw_reader *r, int size)
     return code;
 }
 
-/* Decode the image data into w*h palette indexes; 0 on success. */
+/* Decode the image data into up to w*h palette indexes: how many came out (data that is cut short
+ * or damaged gives the pixels before the damage, as other browsers show them), or -1. */
 static int lzw_decode(const uint8_t *p, const uint8_t *end, int min_size, uint8_t *out, int total)
 {
     if (min_size < 1 || min_size > 11)
         return -1;
     struct lzw_reader r = { p, end, 0, 0, 0 };
     int clear = 1 << min_size, eoi = clear + 1, next = clear + 2, size = min_size + 1;
-    static uint16_t prefix[4096];
-    static uint8_t suffix[4096], stack[4097];
+    struct tables {                     /* (on the heap: not shared between threads, nor on a small stack) */
+        uint16_t prefix[4096];
+        uint8_t suffix[4096], stack[4097];
+    } *t = malloc(sizeof(*t));
+    if (!t)
+        return -1;
+    uint16_t *prefix = t->prefix;
+    uint8_t *suffix = t->suffix, *stack = t->stack;
     int prev = -1, n = 0;
     uint8_t first = 0;
     for (int i = 0; i < clear; i++)
@@ -72,7 +79,7 @@ static int lzw_decode(const uint8_t *p, const uint8_t *end, int min_size, uint8_
         int sp = 0, cur = code;
         if (prev < 0) {
             if (code >= clear)
-                return -1;
+                break;
             out[n++] = (uint8_t)code;
             first = (uint8_t)code;
             prev = code;
@@ -80,16 +87,16 @@ static int lzw_decode(const uint8_t *p, const uint8_t *end, int min_size, uint8_
         }
         if (code >= next) {
             if (code > next)
-                return -1;
+                break;
             stack[sp++] = first;        /* the KwKwK case */
             cur = prev;
         }
-        while (cur >= clear) {
-            if (sp >= 4096)
-                return -1;
+        while (cur >= clear && sp < 4096) {
             stack[sp++] = suffix[cur];
             cur = prefix[cur];
         }
+        if (cur >= clear)
+            break;
         first = suffix[cur];
         stack[sp++] = first;
         while (sp && n < total)
@@ -103,7 +110,8 @@ static int lzw_decode(const uint8_t *p, const uint8_t *end, int min_size, uint8_
         }
         prev = code;
     }
-    return n == total ? 0 : -1;
+    free(t);
+    return n;
 }
 
 /* Decoder state is owned by the image, without changing the image ABI used by
@@ -193,7 +201,8 @@ static int next_frame(struct gif_animation *a, int adopted)
             (size_t)w*h > 16u*1024*1024) return -1;
         int min_size=*p++;
         const uint8_t *after=skip_blocks(p,end);
-        if (!after) return -1;
+        if (!after && a->frames) return -1;
+        if (!after) after=end;          /* a file cut short: as much of its first picture as came */
         if (adopted) {
             /* The helper already decoded these pixels. Only reconstruct the
              * cursor/timing state, without doing the expensive LZW work again. */
@@ -204,9 +213,8 @@ static int next_frame(struct gif_animation *a, int adopted)
         } else {
         uint8_t *indices=malloc((size_t)w*h);
         if (!indices) return -1;
-        if (lzw_decode(p,after,min_size,indices,w*h)<0) {free(indices);return -1;}
-        for (int i=0; i<w*h; i++)
-            if (indices[i]>=colors && indices[i]!=transparent) {free(indices);return -1;}
+        int got=lzw_decode(p,after,min_size,indices,w*h);
+        if (got<=0) {free(indices);return -1;}
         dispose_frame(a);
         size_t bytes=(size_t)a->img->w*a->img->h*sizeof(uint32_t);
         if (disposal == 3) {
@@ -219,9 +227,9 @@ static int next_frame(struct gif_animation *a, int adopted)
         for (int i=0;i<h;i++) {
             int cy=y+row;
             if (cy<a->img->h)
-                for (int j=0;j<w && x+j<a->img->w;j++) {
-                    int index=indices[i*w+j];
-                    if (index!=transparent) a->img->px[cy*a->img->w+x+j]=palette_color(ct,index);
+                for (int j=0;j<w && x+j<a->img->w && i*w+j<got;j++) {
+                    int index=indices[i*w+j];   /* (past the colours there are: left as it is) */
+                    if (index!=transparent && index<colors) a->img->px[cy*a->img->w+x+j]=palette_color(ct,index);
                 }
             if (flags&0x40) {
                 row+=steps[pass];

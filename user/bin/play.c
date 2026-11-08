@@ -162,6 +162,10 @@ static int voc_next(struct source *s)
             s->rate = (int)le32(b);
             s->bits = b[4];
             s->channels = b[5];
+            if (s->rate < 1000 || s->rate > 192000) {   /* 0 would divide by zero later */
+                fprintf(stderr, "play: VOC sample rate %d is not supported\n", s->rate);
+                return 0;
+            }
             if ((le16(b + 6) != 0 && le16(b + 6) != 4) || (s->bits != 8 && s->bits != 16) ||
                 s->channels < 1 || s->channels > 2)
                 goto unsupported;

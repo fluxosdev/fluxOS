@@ -113,6 +113,8 @@ struct jsobj {
     /* C_ARRAY, C_ARGUMENTS */
     jsval *items;
     int len, cap;
+    uint32_t splen;                     /* C_ARRAY: its length when that is past len (elements beyond
+                                         * the dense limit are ordinary properties); js_array_length */
     /* C_FUNCTION */
     struct ast *fn;                     /* NULL for natives */
     struct env *scope;
@@ -265,6 +267,11 @@ void js_numtostr(double d, char *out);
 double js_strtonum(const char *s, int n);           /* NaN if it is not a number */
 double js_parse_float_prefix(const char *s, int n); /* parseFloat */
 int js_array_set_len(struct js *J, struct jsobj *a, int len);
+/* An array's length: len, or more if elements were stored past the dense limit (splen). */
+static inline double js_array_length(const struct jsobj *a)
+{
+    return a->splen > (uint32_t)a->len ? (double)a->splen : (double)a->len;
+}
 void js_define_native(struct js *J, struct jsobj *o, const char *name, js_native fn, int nargs);
 int js_is_array(jsval v);
 /* The keys for for-in and Object.keys, own and enumerable (inherited too if asked). */
@@ -356,7 +363,7 @@ struct jsstr *uc_change_case(struct js *J, struct jsstr *s, int upper);
 struct jsstr *uc_normalize(struct js *J, struct jsstr *s, int compat, int compose);
 
 /* jsre.c: backtracking regular expressions over UTF-8 bytes */
-#define RE_MAX_GROUPS 32
+#define RE_MAX_GROUPS 100               /* group 0 and up to 99 capturing groups */
 struct regex *re_compile(struct js *J, const char *pattern, int len, const char *flags,
                          const char **error);
 /* Match at or after start; caps[2*i], caps[2*i+1] are group i's offsets (-1: unmatched). */

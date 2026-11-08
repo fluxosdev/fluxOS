@@ -544,6 +544,24 @@ void regfree(regex_t *re)
 #define MAX_GROUPS 32
 #define STEP_BUDGET 2000000
 
+/* Matching recurses once per round of a repeated group, so a long subject
+ * goes deep: past this much of the stack the search stops (REG_ESPACE if
+ * nothing matched yet) instead of overflowing it. Half the thread's stack,
+ * or of the main thread's 32 MiB. */
+#ifdef __i386__
+#include "pthread_impl.h"
+static size_t stack_budget(void)
+{
+    size_t size = __self()->stack_size;
+    return size ? size / 2 : 8u << 20;
+}
+#else
+static size_t stack_budget(void)
+{
+    return 256u << 10;                  /* (a host build, for the tests) */
+}
+#endif
+
 struct matcher {
     const char *str, *end;
     int eflags, cflags, icase;
@@ -554,6 +572,9 @@ struct matcher {
     const char *best_start[MAX_GROUPS + 1], *best_stop[MAX_GROUPS + 1];
     long steps;
     int give_up;                        /* past the budget: the first match found stands */
+    uintptr_t stack_top;                /* where regexec's frame is, and how far below it run() may go */
+    size_t stack_budget;
+    int too_deep;                       /* out of stack: stop, with the longest match found so far */
 };
 
 /* What is left to match after the current node's sequence ends. */
@@ -634,6 +655,10 @@ static int finish(struct matcher *m, const char *s, struct cont *k)
 
 static int run(struct matcher *m, struct node *n, const char *s, struct cont *k)
 {
+    if (m->too_deep || m->stack_top - (uintptr_t)__builtin_frame_address(0) > m->stack_budget) {
+        m->too_deep = 1;
+        return m->best_end != NULL;
+    }
     for (;;) {
         if (++m->steps > STEP_BUDGET && !m->give_up) {
             m->give_up = 1;
@@ -769,8 +794,10 @@ int regexec(const regex_t *re, const char *s, size_t nmatch, regmatch_t *match, 
         return REG_BADPAT;
     if (pr->ngroups > MAX_GROUPS)
         return REG_ESPACE;
-    static struct matcher m;            /* large: kept off the stack */
+    struct matcher m;                   /* each call its own: regexec is called from several threads */
     memset(&m, 0, sizeof(m));
+    m.stack_top = (uintptr_t)__builtin_frame_address(0);
+    m.stack_budget = stack_budget();
     m.str = s;
     m.end = s + strlen(s);
     m.eflags = eflags;
@@ -799,6 +826,8 @@ int regexec(const regex_t *re, const char *s, size_t nmatch, regmatch_t *match, 
             }
             return 0;
         }
+        if (m.too_deep)
+            return REG_ESPACE;
         if (p == m.end)
             break;
     }

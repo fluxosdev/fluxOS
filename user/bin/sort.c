@@ -44,12 +44,21 @@ static void slurp(FILE *f)
 int main(int argc, char **argv)
 {
     int i = 1;
-    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++)
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        if (!strcmp(argv[i], "--")) {
+            i++;
+            break;
+        }
         for (const char *f = argv[i] + 1; *f; f++) {
             if (*f == 'r') opt_r = 1;
             else if (*f == 'n') opt_n = 1;
             else if (*f == 'u') opt_u = 1;
+            else {                      /* -k, -t and the rest: an error, not a silently different sort */
+                fprintf(stderr, "sort: invalid option -- '%c' (only -n, -r and -u are supported)\n", *f);
+                return 2;
+            }
         }
+    }
     if (i >= argc)
         slurp(stdin);
     for (; i < argc; i++) {

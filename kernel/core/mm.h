@@ -51,6 +51,7 @@ int vmm_alloc_prot(uint32_t *pd, uint32_t va, uint32_t prot, uint32_t flags);
 int vmm_protect_page(uint32_t *pd, uint32_t va, uint32_t prot);
 void vmm_free_page(uint32_t *pd, uint32_t va);
 int vmm_pte_present(uint32_t *pd, uint32_t va);
+int vmm_mmio_mapped(uint32_t *pd, uint32_t va);  /* device memory there (the screen) */
 uint32_t vmm_translate(uint32_t *pd, uint32_t va);
 int vmm_write_ok(uint32_t *pd, uint32_t va);
 int vmm_resolve_cow(uint32_t *pd, uint32_t va);
@@ -59,6 +60,7 @@ void vmm_read_phys(void *dst, uint32_t phys, uint32_t n);   /* any frame, high m
 uint32_t vmm_user_pages(uint32_t *pd);
 /* flags: extra page bits, such as PTE_PCD for device registers */
 void *vmm_map_mmio(uint32_t phys, uint32_t size, uint32_t flags);  /* boot time only */
+void vmm_unmap_mmio(void *virt);            /* undo it (or pci_map_bar), boot time only */
 void *vmm_map_late(uint32_t phys, uint32_t size, uint32_t flags);  /* any time; kept for good */
 int vmm_map_phys(uint32_t *pd, uint32_t va, uint32_t phys, uint32_t size, uint32_t flags);
 void vmm_zero_frame(uint32_t phys);         /* any frame, high memory too */

@@ -343,6 +343,9 @@ void wm_destroy(struct window *w)
     if (focused == w)
         focused = NULL;
     unlink_window(w);
+    for (struct window *x = windows; x; x = x->link->next)
+        if (x->blocker == w)
+            x->blocker = NULL;          /* its prompt closed: it takes input again */
     if (w->ops && w->ops->destroy)
         w->ops->destroy(w);
     shm_surface_detach(&w->content);
@@ -410,12 +413,19 @@ int wm_resize_client(struct window *w, int client_w, int client_h)
 
 void wm_focus(struct window *w)
 {
+    for (int i = 0; i < 4 && w->blocker; i++)
+        w = w->blocker;                 /* a window with a prompt open: the prompt */
     send_msg(C_FOCUS, w->link->id, NULL, 0);
 }
 
 struct window *wm_focused(void)
 {
     return focused;
+}
+
+struct window *wm_prompt_owner(void)
+{
+    return focused;                     /* every window here is the program's own */
 }
 
 void wm_set_title(struct window *w, const char *title)
@@ -536,6 +546,29 @@ static void drop_arrived(struct window *w, const struct wm_msg *m)
 
 /* ---- events ---- */
 
+/* w has a prompt open (apps.c): the desktop does not know, so its input is turned away here, and the
+ * prompt brought up instead. 1 if m was w's input, taken. */
+static int blocked_input(struct window *w, const struct wm_msg *m)
+{
+    switch (m->type) {
+    case S_KEY:
+    case S_MOUSE:
+    case S_WHEEL:
+        return 1;
+    case S_CLOSE:
+        wm_focus(w);
+        return 1;
+    case S_DROP: {
+        const struct wm_drop *d = wm_payload(m);
+        struct wm_drop_reply r = { DROP_NONE, { 0 } };
+        if (wm_payload_len(m) >= sizeof(*d) && d->phase != DROP_LEAVE)
+            send_msg2(C_DROP_REPLY, w->link->id, m->serial, &r, sizeof(r), NULL, 0);
+        return 1;
+    }
+    }
+    return 0;
+}
+
 static void restyle(struct window *w)
 {
     if (w->ops && w->ops->restyle) {
@@ -567,6 +600,8 @@ static void dispatch(const struct wm_msg *m)
     struct window *w = find_window(m->win);
     if (!w)
         return;                         /* closed meanwhile */
+    if (w->blocker && blocked_input(w, m))
+        return;
     const struct window_ops *ops = w->ops;
     switch (m->type) {
     case S_BUFFER:
@@ -589,6 +624,8 @@ static void dispatch(const struct wm_msg *m)
             focused = w;
         else if (focused == w)
             focused = NULL;
+        if (v->value && w->blocker)
+            wm_focus(w);                /* clicked or chosen on the taskbar: its prompt comes up */
         if (ops && ops->focus)
             ops->focus(w, v->value);
         break;

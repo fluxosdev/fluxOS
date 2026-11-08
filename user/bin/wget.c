@@ -114,7 +114,7 @@ static void open_output(const char *url)
         out = 1;
         return;
     }
-    out = open(name, O_WRONLY | O_CREAT | O_TRUNC);
+    out = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (out < 0)
         fail(EXIT_FILE, "cannot create '%s': %s", name, strerror(errno));
     say("Saving to: '%s'\n", out_name);

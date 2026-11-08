@@ -25,11 +25,17 @@ int rect_contains(struct rect r, int x, int y)
     return x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h;
 }
 
+/* The ends are worked out in 64 bits: a rectangle far off the surface (a program may say where its
+ * window goes) must not wrap round into one that seems to be on it, and get past every clip. */
 struct rect rect_intersect(struct rect a, struct rect b)
 {
     int x0 = MAX(a.x, b.x), y0 = MAX(a.y, b.y);
-    int x1 = MIN(a.x + a.w, b.x + b.w), y1 = MIN(a.y + a.h, b.y + b.h);
-    return mkrect(x0, y0, x1 - x0, y1 - y0);
+    long long x1 = MIN((long long)a.x + a.w, (long long)b.x + b.w);
+    long long y1 = MIN((long long)a.y + a.h, (long long)b.y + b.h);
+    if (x1 <= x0 || y1 <= y0)
+        return mkrect(x0, y0, 0, 0);
+    long long w = x1 - x0, h = y1 - y0;
+    return mkrect(x0, y0, w > 0x7FFFFFFF ? 0x7FFFFFFF : (int)w, h > 0x7FFFFFFF ? 0x7FFFFFFF : (int)h);
 }
 
 int rect_overlaps(struct rect a, struct rect b)

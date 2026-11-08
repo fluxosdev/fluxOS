@@ -476,18 +476,56 @@ struct dibinfo {
     int ncolors;
 };
 
-static int parse_bmi(const uint8_t *bmi, int usage, struct dc *d, struct dibinfo *di)
+/* The largest BITMAPINFOHEADER taken (BITMAPV5HEADER is 124), and the most a BITMAPINFO can
+ * span with its masks and 256 colors. */
+#define BMI_MAX_HEADER 1024
+#define BMI_MAX_SPAN (BMI_MAX_HEADER + 12 + 256 * 4)
+
+/* How many bytes from p (at most max) the program can read. */
+static uint32_t readable_span(gp_t p, uint32_t max)
+{
+    uint32_t n = 0;
+    while (p && n < max) {
+        uint32_t step = 4096 - ((p + n) & 4095);
+        if (step > max - n)
+            step = max - n;
+        if (!vm_readable(p + n, step))
+            break;
+        n += step;
+    }
+    return n;
+}
+
+/* rows rows of stride bytes at p are the program's to read (or write). */
+static int guest_rows(gp_t p, uint32_t stride, int64_t rows, int writable)
+{
+    if (rows <= 0)
+        return 1;
+    uint64_t bytes = (uint64_t)stride * (uint64_t)rows;
+    if (!p || bytes > 0x7FFFFFFF)
+        return 0;
+    return writable ? vm_writable(p, (uint32_t)bytes) : vm_readable(p, (uint32_t)bytes);
+}
+
+/* A BITMAPINFO in the program's memory, as parse_bmi takes it. */
+static int parse_guest_bmi(gp_t p, int usage, struct dc *d, struct dibinfo *di);
+
+/* bmi has limit bytes that may be read: the header, masks and colors must lie within them. */
+static int parse_bmi(const uint8_t *bmi, uint32_t limit, int usage, struct dc *d, struct dibinfo *di)
 {
     uint32_t size;
     int32_t h;
     uint16_t bpp;
     memset(di, 0, sizeof(*di));
+    if (!bmi || limit < 40)
+        return -1;
     memcpy(&size, bmi, 4);
     memcpy(&di->w, bmi + 4, 4);
     memcpy(&h, bmi + 8, 4);
     memcpy(&bpp, bmi + 14, 2);
     memcpy(&di->compression, bmi + 16, 4);
-    if (size < 40 || di->w <= 0 || !h || di->w > 32768 || h > 32768 || h < -32768)
+    if (size < 40 || size > BMI_MAX_HEADER || size > limit || di->w <= 0 || !h || di->w > 32768 ||
+        h > 32768 || h < -32768)
         return -1;
     if (bpp != 1 && bpp != 4 && bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32)
         return -1;
@@ -499,6 +537,8 @@ static int parse_bmi(const uint8_t *bmi, int usage, struct dc *d, struct dibinfo
     di->stride = dib_stride(di->w, bpp);
     const uint8_t *colors = bmi + size;
     if (di->compression == BI_BITFIELDS) {
+        if (size < 52 && limit - size < 12)
+            return -1;
         memcpy(di->masks, size >= 52 ? bmi + 40 : bmi + size, 12);
         if (size < 52)
             colors += 12;
@@ -515,6 +555,8 @@ static int parse_bmi(const uint8_t *bmi, int usage, struct dc *d, struct dibinfo
         uint32_t used;
         memcpy(&used, bmi + 32, 4);
         di->ncolors = used && used <= (1u << bpp) ? (int)used : 1 << bpp;
+        if ((uint32_t)(colors - bmi) + (uint32_t)di->ncolors * (usage == DIB_PAL_COLORS ? 2 : 4) > limit)
+            return -1;
         struct palette *p = usage == DIB_PAL_COLORS && d ? palette_get(d->palette) : NULL;
         for (int i = 0; i < di->ncolors; i++) {
             if (usage == DIB_PAL_COLORS) {
@@ -527,6 +569,11 @@ static int parse_bmi(const uint8_t *bmi, int usage, struct dc *d, struct dibinfo
         }
     }
     return 0;
+}
+
+static int parse_guest_bmi(gp_t p, int usage, struct dc *d, struct dibinfo *di)
+{
+    return parse_bmi(gp(p), readable_span(p, BMI_MAX_SPAN), usage, d, di);
 }
 
 static size_t bmi_colors_size(const struct dibinfo *di, int usage)
@@ -1522,7 +1569,8 @@ DEF(StretchDIBits)
 {
     struct dc *d = dc_get(A(0));
     struct dibinfo di;
-    if (!d || !A(9) || !A(10) || parse_bmi(P(10), (int)A(11), d, &di) < 0)
+    if (!d || !A(9) || !A(10) || parse_guest_bmi(A(10), (int)A(11), d, &di) < 0 ||
+        !guest_rows(A(9), di.stride, di.h, 0))
         FAIL(ERROR_INVALID_PARAMETER);
     int sx = (int32_t)A(5), sy = (int32_t)A(6), sw = (int32_t)A(7), sh = (int32_t)A(8);
     if (!di.top_down)
@@ -1540,10 +1588,17 @@ DEF(SetDIBitsToDevice)
 {
     struct dc *d = dc_get(A(0));
     struct dibinfo di;
-    if (!d || !A(9) || !A(10) || parse_bmi(P(10), (int)A(11), d, &di) < 0)
+    if (!d || !A(9) || !A(10) || parse_guest_bmi(A(10), (int)A(11), d, &di) < 0)
         FAIL(ERROR_INVALID_PARAMETER);
     int w = (int32_t)A(3), h = (int32_t)A(4), sx = (int32_t)A(5), sy = (int32_t)A(6);
     int start = (int32_t)A(7), nlines = (int32_t)A(8);
+    /* uStartScan and cLines are unsigned: past the image there is nothing to draw */
+    if (A(7) >= (uint32_t)di.h || !A(8))
+        return 0;
+    if (A(8) > (uint32_t)di.h - A(7))
+        nlines = di.h - start;
+    if (!guest_rows(A(9), di.stride, nlines, 0))
+        FAIL(ERROR_INVALID_PARAMETER);
     if (!di.top_down)
         sy = di.h - sy - h;
     /* The bits hold scan lines [start, start + nlines): image rows y0..y1, top to bottom. */
@@ -1595,7 +1650,7 @@ DEF(CreateCompatibleBitmap)
     return hb;
 }
 
-static HBITMAP create_bitmap(int w, int h, int bpp, const uint8_t *bits)
+static HBITMAP create_bitmap(int w, int h, int bpp, gp_t bits)
 {
     struct bitmap *bm;
     stock_init();
@@ -1603,21 +1658,24 @@ static HBITMAP create_bitmap(int w, int h, int bpp, const uint8_t *bits)
         return new_bitmap(1, 1, 1, NULL);
     if (w > 16384 || h > 16384)
         FAIL(ERROR_INVALID_PARAMETER);
+    int known = bpp == 1 || bpp == 16 || bpp == 24 || bpp == 32;
+    uint32_t stride = known ? (((uint32_t)w * (uint32_t)bpp + 15) / 16) * 2 : 0;    /* rows of whole words */
+    if (bits && known && !guest_rows(bits, stride, h, 0))
+        FAIL(ERROR_INVALID_PARAMETER);
     HBITMAP hb = new_bitmap(w, h, bpp == 1, &bm);
     if (!hb)
         FAIL(ERROR_NOT_ENOUGH_MEMORY);
-    if (bits && (bpp == 1 || bpp == 16 || bpp == 24 || bpp == 32)) {
+    if (bits && known) {
         static const uint32_t bw[2] = { 0, 0xFFFFFF }, m555[3] = { 0x7C00, 0x3E0, 0x1F },
                               m888[3] = { 0xFF0000, 0xFF00, 0xFF };
-        uint32_t stride = (((uint32_t)w * (uint32_t)bpp + 15) / 16) * 2;      /* rows of whole words */
         for (int y = 0; y < h; y++)
-            row_get(bits + (size_t)y * stride, bpp, bpp == 16 ? m555 : m888, bw, 2, 0, w,
+            row_get((const uint8_t *)GP(bits) + (size_t)y * stride, bpp, bpp == 16 ? m555 : m888, bw, 2, 0, w,
                     bm->surf.px + (size_t)y * bm->surf.stride);
     }
     return hb;
 }
 
-DEF(CreateBitmap) { return create_bitmap((int32_t)A(0), (int32_t)A(1), (int)(A(2) * A(3)), P(4)); }
+DEF(CreateBitmap) { return create_bitmap((int32_t)A(0), (int32_t)A(1), (int)(A(2) * A(3)), A(4)); }
 
 DEF(CreateBitmapIndirect)
 {
@@ -1625,12 +1683,14 @@ DEF(CreateBitmapIndirect)
     int32_t w, h;
     uint16_t planes, bpp;
     gp_t bits;
+    if (!vm_readable(A(0), 24))
+        FAIL(ERROR_INVALID_PARAMETER);
     memcpy(&w, b + 4, 4);
     memcpy(&h, b + 8, 4);
     memcpy(&planes, b + 16, 2);
     memcpy(&bpp, b + 18, 2);
     memcpy(&bits, b + 20, 4);
-    return create_bitmap(w, h, planes * bpp, gp(bits));
+    return create_bitmap(w, h, planes * bpp, bits);
 }
 
 static HBITMAP dib_section(struct dc *d, const struct dibinfo *di, gp_t *bits_out)
@@ -1685,7 +1745,7 @@ DEF(CreateDIBSection)
     struct dc *d = dc_get(A(0));
     struct dibinfo di;
     stock_init();
-    if (!A(1) || parse_bmi(P(1), (int)A(2), d, &di) < 0)
+    if (!A(1) || parse_guest_bmi(A(1), (int)A(2), d, &di) < 0)
         FAIL(ERROR_INVALID_PARAMETER);
     if (A(4))
         wlog("CreateDIBSection on a file mapping is not supported: its bits are memory of their own");
@@ -1727,18 +1787,23 @@ DEF(SetDIBits)
     struct dc *d = dc_get(A(0));
     struct bitmap *bm = bitmap_get(A(1));
     struct dibinfo di;
-    if (!bm || !A(4) || !A(5) || parse_bmi(P(5), (int)A(6), d, &di) < 0)
+    if (!bm || !A(4) || !A(5) || parse_guest_bmi(A(5), (int)A(6), d, &di) < 0)
+        FAIL(ERROR_INVALID_PARAMETER);
+    /* uStartScan and cScanLines are unsigned: only scan lines of the DIB are read */
+    if (A(2) >= (uint32_t)di.h || !A(3))
+        return 0;
+    int lines = A(3) > (uint32_t)di.h - A(2) ? di.h - (int)A(2) : (int)A(3);
+    if (!guest_rows(A(4), di.stride, lines, 0))
         FAIL(ERROR_INVALID_PARAMETER);
     dib_pull(bm, mkrect(0, 0, bm->w, bm->h));
-    return (uint32_t)set_dib_rows(bm, &di, P(4), (int32_t)A(2), (int32_t)A(3));
+    return (uint32_t)set_dib_rows(bm, &di, P(4), (int)A(2), lines);
 }
 
-static HBITMAP dib_to_ddb(struct dc *d, const uint8_t *bmi, int usage, const uint8_t *bits)
+/* A DDB of a parsed DIB, its bits (bits: di.h rows that may be read) drawn into it. */
+static HBITMAP dib_to_ddb(const struct dibinfo *dip, const uint8_t *bits)
 {
-    struct dibinfo di;
+    struct dibinfo di = *dip;
     struct bitmap *bm;
-    if (parse_bmi(bmi, usage, d, &di) < 0)
-        FAIL(ERROR_INVALID_PARAMETER);
     stock_init();
     int mono = di.bpp == 1 && di.ncolors == 2 && ((di.pal[0] == 0 && di.pal[1] == 0xFFFFFF) ||
                                                   (di.pal[0] == 0xFFFFFF && di.pal[1] == 0));
@@ -1758,22 +1823,33 @@ DEF(CreateDIBitmap)
         FAIL(ERROR_INVALID_PARAMETER);
     if (!(A(2) & CBM_INIT) || !A(3) || !A(4)) {
         int32_t w, h;
+        if (!vm_readable(A(1), 12))
+            FAIL(ERROR_INVALID_PARAMETER);
         memcpy(&w, hdr + 4, 4);
         memcpy(&h, hdr + 8, 4);
+        if (h < 0 && h != INT32_MIN)
+            h = -h;
         stock_init();
-        HBITMAP hb = new_bitmap(w, h < 0 ? -h : h, 0, NULL);
+        if (w <= 0 || h <= 0)
+            return new_bitmap(1, 1, 1, NULL);
+        if (w > 16384 || h > 16384)
+            FAIL(ERROR_INVALID_PARAMETER);
+        HBITMAP hb = new_bitmap(w, h, 0, NULL);
         if (!hb)
             FAIL(ERROR_NOT_ENOUGH_MEMORY);
         return hb;
     }
-    return dib_to_ddb(d, P(4), (int)A(5), P(3));
+    struct dibinfo di;
+    if (parse_guest_bmi(A(4), (int)A(5), d, &di) < 0 || !guest_rows(A(3), di.stride, di.h, 0))
+        FAIL(ERROR_INVALID_PARAMETER);
+    return dib_to_ddb(&di, P(3));
 }
 
 DEF(GetDIBits)
 {
     struct bitmap *bm = bitmap_get(A(1));
     uint8_t *bmi = P(5);
-    if (!bm || !bmi)
+    if (!bm || !bmi || !vm_writable(A(5), 40))
         FAIL(ERROR_INVALID_PARAMETER);
     uint16_t bpp;
     int32_t h;
@@ -1799,22 +1875,30 @@ DEF(GetDIBits)
             return (uint32_t)bm->h;
     }
     struct dibinfo di;
-    if (parse_bmi(bmi, DIB_RGB_COLORS, NULL, &di) < 0 || (di.bpp != 1 && di.bpp != 16 && di.bpp != 24 && di.bpp != 32))
+    if (parse_guest_bmi(A(5), DIB_RGB_COLORS, NULL, &di) < 0 || (di.bpp != 1 && di.bpp != 16 && di.bpp != 24 && di.bpp != 32))
         FAIL(ERROR_INVALID_PARAMETER);
     if (di.bpp == 1) {
         static const uint8_t bw[8] = { 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0 };
-        uint32_t used;
+        uint32_t used, hs;
         memcpy(&used, bmi + 32, 4);
-        memcpy(bmi + 40, bw, 8);
+        memcpy(&hs, bmi, 4);            /* parse_bmi bounded it; the colors follow the header */
+        if (!vm_writable(A(5), hs + 8))
+            FAIL(ERROR_INVALID_PARAMETER);
+        memcpy(bmi + hs, bw, 8);
         di.pal[0] = 0;
         di.pal[1] = 0xFFFFFF;
         di.ncolors = 2;
         (void)used;
     }
+    /* uStartScan and cScanLines are unsigned: only scan lines of the bitmap are copied */
+    if (A(2) >= (uint32_t)bm->h || !A(3))
+        return 0;
+    int start = (int)A(2), n = A(3) > (uint32_t)bm->h - A(2) ? bm->h - start : (int)A(3), done = 0;
+    if (!guest_rows(A(4), di.stride, n, 1))
+        FAIL(ERROR_INVALID_PARAMETER);
     dib_pull(bm, mkrect(0, 0, bm->w, bm->h));
-    int start = (int32_t)A(2), n = (int32_t)A(3), done = 0;
     uint8_t *bits = P(4);
-    for (int s = start; s < start + n && s < bm->h; s++, done++) {
+    for (int s = start; s < start + n; s++, done++) {
         int y = di.top_down ? s : bm->h - 1 - s;
         uint8_t *row = bits + (size_t)(s - start) * di.stride;
         memset(row, 0, di.stride);
@@ -2664,15 +2748,15 @@ DEF(FrameRect)
 static HBITMAP packed_dib(const uint8_t *dib, uint32_t size, int section)
 {
     struct dibinfo di;
-    if (size < 40 || parse_bmi(dib, DIB_RGB_COLORS, NULL, &di) < 0)
+    if (size < 40 || parse_bmi(dib, size, DIB_RGB_COLORS, NULL, &di) < 0)
         return 0;
     uint32_t hs;
     memcpy(&hs, dib, 4);
     size_t off = hs + bmi_colors_size(&di, DIB_RGB_COLORS) + (di.compression == BI_BITFIELDS && hs < 52 ? 12 : 0);
-    if (off + (size_t)di.stride * di.h > size)
+    if ((uint64_t)off + (uint64_t)di.stride * (uint32_t)di.h > size)
         return 0;
     if (!section)
-        return dib_to_ddb(NULL, dib, DIB_RGB_COLORS, dib + off);
+        return dib_to_ddb(&di, dib + off);
     gp_t bits;
     stock_init();
     HBITMAP h = dib_section(NULL, &di, &bits);
@@ -3006,7 +3090,8 @@ int gdi_argb_blit(HDC h,int x,int y,int width,int height,const uint32_t *pixels,
         int px=t.ox+dx+i,py=t.oy+dy+j;if(!rect_contains(t.clip,px,py)) continue;
         uint32_t c=pixels[j*stride+i],alpha=c>>24,*dest=&t.s->px[py*t.s->stride+px];
         if(!copy && alpha<255) {uint32_t mixed=0;for(int sh=0;sh<24;sh+=8) mixed|=((((c>>sh)&255)*alpha+((*dest>>sh)&255)*(255-alpha))/255)<<sh;c=mixed;}
-        if(target_mono(&t)) c=mono_of(c);*dest=c&0xFFFFFF;
+        if(target_mono(&t)) c=mono_of(c);
+        *dest=c&0xFFFFFF;
     }
     drawn(&t,r);return 0;
 }

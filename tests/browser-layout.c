@@ -1561,6 +1561,64 @@ static void view_transitions(void)
     puts("browser view transitions: old and new pictures, moving groups, root cross-fades, page timing and keyframes passed");
 }
 
+/* What a hostile page can do to layout: nest boxes far deeper than the parser allows (a script can), and
+ * scale a picture to millions of pixels and scroll into the middle of it. */
+static struct node *nested_child(struct arena *a, struct node *parent, int tag)
+{
+    struct node *n = arena_alloc(a, sizeof(*n));
+    n->type = N_ELEMENT;
+    n->tag = (uint8_t)tag;
+    n->name = arena_strdup(a, tag_name(tag));
+    n->parent = parent;
+    if (parent->last)
+        parent->last->next = n, n->prev = parent->last;
+    else
+        parent->first = n;
+    parent->last = n;
+    return n;
+}
+
+static void hostile_layout(void)
+{
+    for (int flex = 0; flex < 2; flex++) {
+        struct arena a = {0}, sa = {0}, la = {0};
+        const char *html = flex ? "<!doctype html><style>div{display:flex}</style><body><div id=top></div>"
+                                : "<!doctype html><body><div id=top></div>";
+        struct node *root = html_parse(&a, html, (int)strlen(html)), *n = node_find(root, T_DIV);
+        for (int i = 0; i < 20000; i++)                 /* as appendChild in a loop would make it */
+            n = nested_child(&a, n, T_DIV);
+        struct sheet *sheet = NULL;
+        for (struct node *k = root; k; k = node_next(k, root))
+            if (k->type == N_ELEMENT && k->tag == T_STYLE && k->first)
+                sheet = css_parse(&a, k->first->text, k->first->len, 800);
+        css_cascade(&sa, root, &sheet, sheet ? 1 : 0, 800, 600, NULL, NULL);
+        struct layout lo;
+        layout_document(&la, &lo, root, 800, 600);      /* (it ran the stack out) */
+        CHECK(lo.nitems > 100);
+        arena_free(&a), arena_free(&sa), arena_free(&la);
+    }
+    static uint32_t green[40 * 20];             /* load() gives every <img> test_img: green pixels, for now */
+    for (int i = 0; i < 40 * 20; i++)
+        green[i] = 0xFF00FF00u;
+    uint32_t *saved_px = test_img.px;
+    test_img.px = green;
+    const char *styles[] = { "width:300px;height:10000000px", "width:300px;height:10000000px;border-radius:9px",
+                             "width:10000000px;height:300px" };
+    for (int k = 0; k < 3; k++) {
+        char html[256];
+        snprintf(html, sizeof(html), "<!doctype html><body style='margin:0'><img style='%s'>", styles[k]);
+        struct page p;
+        load(&p, html, 800, 600);
+        static uint32_t pixels[400 * 300];
+        struct surface surface = { .px = pixels, .w = 400, .h = 300, .stride = 400, .clip = { 0, 0, 400, 300 } };
+        int far = 3000000;                              /* far into the picture: the row times its height overflowed */
+        paint_document(&p.lo, &surface, 0, 0, k == 2 ? far : 0, k == 2 ? 0 : far, NULL, 0);
+        CHECK(pixels[100 * 400 + 100] == 0x00FF00);
+        unload(&p);
+    }
+    test_img.px = saved_px;
+}
+
 int main(void)
 {
     view_transitions();
@@ -1589,5 +1647,6 @@ int main(void)
     shadow_layout();
     canvas_layout();
     cjk_wrapping();
+    hostile_layout();
     puts("browser layout: spacing, wrapping, fixed and sticky boxes, the top layer, anchor positioning, fit-content, outlines, tables, ruby, background pictures, object-fit, scrolling boxes, canvases, CJK wrapping and multi-column boxes passed");
 }

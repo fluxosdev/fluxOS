@@ -471,9 +471,13 @@ static int read_dir(struct fat_fs *f, uint32_t first, uint8_t **out, uint32_t *l
         *len = size;
         return 0;
     }
-    for (uint32_t c = first, guard = 0; !is_end(f, c) && guard < f->nclusters; guard++) {
-        if (size + f->cluster_bytes > MAX_DIR_BYTES)
-            break;
+    for (uint32_t c = first, guard = 0; !is_end(f, c); guard++) {
+        /* Longer than this driver lets a directory grow, or a chain that
+         * loops: damaged. Half of it would hide names and mislead add_entry. */
+        if (guard >= f->nclusters || size + f->cluster_bytes > MAX_DIR_BYTES) {
+            kfree(buf);
+            return -EIO;
+        }
         uint8_t *nb = krealloc(buf, size + f->cluster_bytes);
         if (!nb) {
             kfree(buf);
@@ -698,12 +702,14 @@ static int fat_load_dir(struct vnode *dir)
             continue;
 
         struct vnode *vn = make_vnode(f, dir, name, e, off, slots);
-        if (!vn)
+        if (!vn) {
+            r = -ENOMEM;                        /* not half a directory: names would seem free */
             break;
+        }
         fs_attach(dir, vn);
     }
     kfree(buf);
-    return 0;
+    return r;
 }
 
 /* ---- creating entries ---- */
@@ -877,8 +883,8 @@ static int add_entry(struct fat_fs *f, struct vnode *dir, const char *name, uint
     /* Grow the directory to fit. */
     uint32_t end = start + need * 32;
     while (len < end) {
-        if (dn->first == FIXED_ROOT)
-            return -ENOSPC;                     /* a FAT12/16 root is full */
+        if (dn->first == FIXED_ROOT || len + f->cluster_bytes > MAX_DIR_BYTES)
+            return -ENOSPC;                     /* a FAT12/16 root is full, or a directory as long as read_dir takes */
         uint32_t c = node_cluster(f, dn, len / f->cluster_bytes, 1);
         if (!c || zero_cluster(f, c) < 0)
             return -ENOSPC;

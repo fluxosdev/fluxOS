@@ -790,6 +790,8 @@ static void daa_das(int sub)
     if ((old & 0x0F) > 9 || af) {
         AL = (uint8_t)(sub ? AL - 6 : AL + 6);
         cpu.flags |= F_AF;
+        if (sub ? old < 6 : old > 0xF9)
+            cpu.flags |= F_CF;          /* the borrow or carry out of the low adjustment */
     }
     if (old > 0x99 || cf) {
         AL = (uint8_t)(sub ? AL - 0x60 : AL + 0x60);
@@ -801,8 +803,8 @@ static void daa_das(int sub)
 static void aaa_aas(int sub)
 {
     if ((AL & 0x0F) > 9 || (cpu.flags & F_AF)) {
-        if (sub) {
-            AL = (uint8_t)(AL - 6);
+        if (sub) {                      /* as AAA, a 286 and later borrow from AH too */
+            AX = (uint16_t)(AX - 6);
             AH = (uint8_t)(AH - 1);
         } else {
             AX = (uint16_t)(AX + 0x106);
@@ -1665,7 +1667,12 @@ void cpu_run(uint32_t count)
             cpu.stop = 1;
             break;
         }
+        /* TF set when an instruction starts traps after it (INT 1), unless
+         * the instruction cleared TF (INT n, a fault) or loaded SS. */
+        int trap = (cpu.flags & F_TF) != 0;
         step();
+        if (trap && (cpu.flags & F_TF) && !cpu.inhibit && !cpu.halted)
+            cpu_interrupt(1);
     }
 }
 

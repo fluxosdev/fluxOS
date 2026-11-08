@@ -1,8 +1,9 @@
 /*
- * PNG images: a small decoder for non-interlaced 8-bit PNGs (grey, RGB,
- * palette, grey+alpha and RGBA, with tRNS transparency), including the
- * DEFLATE decompressor it needs. The inflate code follows the structure
- * of Mark Adler's puff.c: canonical Huffman codes decoded bit by bit.
+ * PNG images: a small decoder for every kind of PNG (grey, RGB, palette,
+ * grey+alpha and RGBA; 1, 2, 4, 8 and 16 bits a sample; plain or Adam7
+ * interlaced; with tRNS transparency), including the DEFLATE decompressor
+ * it needs. The inflate code follows the structure of Mark Adler's
+ * puff.c: canonical Huffman codes decoded bit by bit.
  */
 #include <fcntl.h>
 #include <stdlib.h>
@@ -154,21 +155,17 @@ static void stored(struct inflate *s)
 
 static void fixed(struct inflate *s)
 {
-    static struct huffman lit, dist;
-    static int built;
-    if (!built) {
-        uint8_t lengths[288];
-        int i = 0;
-        for (; i < 144; i++) lengths[i] = 8;
-        for (; i < 256; i++) lengths[i] = 9;
-        for (; i < 280; i++) lengths[i] = 7;
-        for (; i < 288; i++) lengths[i] = 8;
-        build(&lit, lengths, 288);
-        for (i = 0; i < 30; i++)
-            lengths[i] = 5;
-        build(&dist, lengths, 30);
-        built = 1;
-    }
+    struct huffman lit, dist;           /* (built each time, which is quick: nothing shared between threads) */
+    uint8_t lengths[288];
+    int i = 0;
+    for (; i < 144; i++) lengths[i] = 8;
+    for (; i < 256; i++) lengths[i] = 9;
+    for (; i < 280; i++) lengths[i] = 7;
+    for (; i < 288; i++) lengths[i] = 8;
+    build(&lit, lengths, 288);
+    for (i = 0; i < 30; i++)
+        lengths[i] = 5;
+    build(&dist, lengths, 30);
     codes(s, &lit, &dist);
 }
 
@@ -268,7 +265,7 @@ static void unfilter_up(uint8_t *cur, const uint8_t *prev, uint32_t n)
         cur[i] = (uint8_t)(cur[i] + prev[i]);
 }
 
-/* Sub, Average and Paeth a byte at a time, for 1- and 2-byte pixels. */
+/* Sub, Average and Paeth a byte at a time, for pixels of other sizes than 3 and 4 bytes. */
 static void unfilter_bytes(uint8_t *cur, const uint8_t *prev, uint32_t n, int bpp, int type)
 {
     for (uint32_t i = 0; i < n; i++) {
@@ -359,7 +356,7 @@ static int unfilter(uint8_t *data, int h, uint32_t stride, int bpp)
             ok = 0;
         else if (type == F_UP)
             unfilter_up(cur, prev, stride);
-        else if (type != F_NONE && bpp >= 3)
+        else if (type != F_NONE && (bpp == 3 || bpp == 4))
             unfilter_pixels(cur, prev, stride, bpp, type);
         else if (type != F_NONE)
             unfilter_bytes(cur, prev, stride, bpp, type);
@@ -369,20 +366,104 @@ static int unfilter(uint8_t *data, int h, uint32_t stride, int bpp)
     return ok ? 0 : -1;
 }
 
+/* What the pixels are coded as. */
+struct pngfmt {
+    int ctype, depth, channels;
+    int bpp;                            /* bytes a pixel for the filters (at least 1) */
+    uint8_t pal[256][4];
+    uint32_t ntrns;
+    uint32_t key[3];                    /* tRNS: the transparent grey or RGB, as samples */
+};
+
+/* Bytes in a row of w pixels, without its filter byte. */
+static uint32_t row_bytes(const struct pngfmt *f, uint32_t w)
+{
+    return (w * (uint32_t)(f->channels * f->depth) + 7) / 8;
+}
+
+/* Sample i of a row. */
+static uint32_t sample(const uint8_t *row, uint32_t i, int depth)
+{
+    if (depth == 8)
+        return row[i];
+    if (depth == 16)
+        return (uint32_t)row[2 * i] << 8 | row[2 * i + 1];
+    uint32_t bit = i * (uint32_t)depth;
+    return (uint32_t)(row[bit >> 3] >> (8 - depth - (bit & 7))) & ((1u << depth) - 1);
+}
+
+/* An unfiltered row of n pixels to 0xAARRGGBB, every step-th pixel of out. */
+static void convert_row(const struct pngfmt *f, const uint8_t *row, uint32_t n, uint32_t *out, uint32_t step)
+{
+    int d = f->depth;
+    /* a sample to 8 bits: 16-bit ones lose their low byte, small ones are spread over 0..255 */
+    uint32_t mul = d == 1 ? 255 : d == 2 ? 85 : d == 4 ? 17 : 1;
+    for (uint32_t x = 0; x < n; x++, out += step) {
+        uint32_t r, g, b, a = 255;
+        switch (f->ctype) {
+        case 0: {
+            uint32_t v = sample(row, x, d);
+            if (f->ntrns >= 2 && v == f->key[0])
+                a = 0;
+            r = g = b = d == 16 ? v >> 8 : v * mul;
+            break;
+        }
+        case 2: {
+            uint32_t sr = sample(row, 3 * x, d), sg = sample(row, 3 * x + 1, d), sb = sample(row, 3 * x + 2, d);
+            if (f->ntrns >= 6 && sr == f->key[0] && sg == f->key[1] && sb == f->key[2])
+                a = 0;
+            int sh = d == 16 ? 8 : 0;
+            r = sr >> sh; g = sg >> sh; b = sb >> sh;
+            break;
+        }
+        case 3: {
+            const uint8_t *c = f->pal[sample(row, x, d)];
+            r = c[0]; g = c[1]; b = c[2]; a = c[3];
+            break;
+        }
+        case 4: {
+            int sh = d == 16 ? 8 : 0;
+            r = g = b = sample(row, 2 * x, d) >> sh;
+            a = sample(row, 2 * x + 1, d) >> sh;
+            break;
+        }
+        default: {
+            int sh = d == 16 ? 8 : 0;
+            r = sample(row, 4 * x, d) >> sh; g = sample(row, 4 * x + 1, d) >> sh;
+            b = sample(row, 4 * x + 2, d) >> sh; a = sample(row, 4 * x + 3, d) >> sh;
+            break;
+        }
+        }
+        *out = a << 24 | r << 16 | g << 8 | b;
+    }
+}
+
+/* Adam7: where each of the seven passes starts, and its steps. */
+static const uint8_t adam_x0[7] = { 0, 4, 0, 2, 0, 1, 0 }, adam_y0[7] = { 0, 0, 4, 0, 2, 0, 1 };
+static const uint8_t adam_dx[7] = { 8, 8, 4, 4, 2, 2, 1 }, adam_dy[7] = { 8, 8, 8, 4, 4, 2, 2 };
+
+static uint32_t pass_size(uint32_t full, uint32_t start, uint32_t step)
+{
+    return full > start ? (full - start + step - 1) / step : 0;
+}
+
 struct image *image_decode_png(const uint8_t *p, uint32_t n)
 {
     static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n' };
     if (n < 8 || memcmp(p, sig, 8))
         return NULL;
 
-    uint32_t w = 0, h = 0, palcount = 0, ntrns = 0, idat_len = 0;
-    int ctype = -1;
-    uint8_t pal[256][4];
-    uint8_t key[6] = { 0 };             /* tRNS: the transparent grey or RGB */
+    uint32_t w = 0, h = 0, idat_len = 0;
+    int interlace = 0;
+    struct pngfmt *f = calloc(1, sizeof(*f));
     uint8_t *idat = malloc(n);          /* the IDAT data is never larger than the file */
-    if (!idat)
-        return NULL;
-    memset(pal, 0xFF, sizeof(pal));
+    uint8_t *raw = NULL;
+    uint32_t *px = NULL;
+    struct image *img = NULL;
+    if (!f || !idat)
+        goto fail;
+    f->ctype = -1;
+    memset(f->pal, 0xFF, sizeof(f->pal));
 
     uint32_t pos = 8;
     while (pos + 12 <= n) {
@@ -393,23 +474,26 @@ struct image *image_decode_png(const uint8_t *p, uint32_t n)
         if (!memcmp(type, "IHDR", 4) && len >= 13) {
             w = be32(d);
             h = be32(d + 4);
-            ctype = d[9];
-            if (d[8] != 8 || d[10] || d[11] || d[12])
-                goto fail;              /* 8-bit, deflate, no interlace only */
+            f->depth = d[8];
+            f->ctype = d[9];
+            interlace = d[12];
+            if (d[10] || d[11] || interlace > 1)
+                goto fail;              /* deflate, the one filter method, plain or Adam7 */
         } else if (!memcmp(type, "PLTE", 4)) {
-            palcount = len / 3;
-            for (uint32_t i = 0; i < palcount && i < 256; i++) {
-                pal[i][0] = d[i * 3];
-                pal[i][1] = d[i * 3 + 1];
-                pal[i][2] = d[i * 3 + 2];
+            uint32_t count = len / 3;
+            for (uint32_t i = 0; i < count && i < 256; i++) {
+                f->pal[i][0] = d[i * 3];
+                f->pal[i][1] = d[i * 3 + 1];
+                f->pal[i][2] = d[i * 3 + 2];
             }
         } else if (!memcmp(type, "tRNS", 4)) {
-            ntrns = len;
-            if (ctype == 3)
+            f->ntrns = len;
+            if (f->ctype == 3)
                 for (uint32_t i = 0; i < len && i < 256; i++)
-                    pal[i][3] = d[i];
+                    f->pal[i][3] = d[i];
             else
-                memcpy(key, d, len < 6 ? len : 6);
+                for (uint32_t i = 0; i < 3 && 2 * i + 1 < len; i++)
+                    f->key[i] = (uint32_t)d[2 * i] << 8 | d[2 * i + 1];
         } else if (!memcmp(type, "IDAT", 4)) {
             memcpy(idat + idat_len, d, len);
             idat_len += len;
@@ -420,59 +504,53 @@ struct image *image_decode_png(const uint8_t *p, uint32_t n)
     }
 
     static const int channels[7] = { 1, 0, 3, 1, 2, 0, 4 };
-    if (ctype < 0 || ctype > 6 || !channels[ctype] || !w || !h || w > MAX_DIM || h > MAX_DIM)
+    int dp = f->depth, ct = f->ctype;
+    int depth_ok = dp == 8 || (dp == 16 && ct != 3) || ((dp == 1 || dp == 2 || dp == 4) && (ct == 0 || ct == 3));
+    if (ct < 0 || ct > 6 || !channels[ct] || !depth_ok || !w || !h || w > MAX_DIM || h > MAX_DIM)
         goto fail;
-    int bpp = channels[ctype];
-    uint32_t stride = w * (uint32_t)bpp;
-    uint32_t raw_len = h * (stride + 1);
-    uint8_t *raw = malloc(raw_len);
-    struct image *img = malloc(sizeof(*img));
-    uint32_t *px = malloc(w * h * 4);
-    if (!raw || !img || !px || zlib_inflate(idat, idat_len, raw, raw_len) != (int)raw_len ||
-        unfilter(raw, (int)h, stride, bpp) < 0) {
-        free(raw);
-        free(img);
-        free(px);
-        goto fail;
-    }
+    f->channels = channels[ct];
+    f->bpp = (f->channels * dp + 7) / 8;
 
-    for (uint32_t y = 0; y < h; y++) {
-        const uint8_t *s = raw + y * (stride + 1) + 1;
-        for (uint32_t x = 0; x < w; x++, s += bpp) {
-            uint32_t r, g, b, a = 255;
-            switch (ctype) {
-            case 0:
-                r = g = b = s[0];
-                if (ntrns >= 2 && s[0] == key[1])
-                    a = 0;
-                break;
-            case 2:
-                r = s[0]; g = s[1]; b = s[2];
-                if (ntrns >= 6 && r == key[1] && g == key[3] && b == key[5])
-                    a = 0;
-                break;
-            case 3:
-                r = pal[s[0]][0]; g = pal[s[0]][1]; b = pal[s[0]][2]; a = pal[s[0]][3];
-                break;
-            case 4:
-                r = g = b = s[0];
-                a = s[1];
-                break;
-            default:
-                r = s[0]; g = s[1]; b = s[2]; a = s[3];
-                break;
-            }
-            px[y * w + x] = a << 24 | r << 16 | g << 8 | b;
-        }
+    /* the passes' rows one after another, each with its filter byte (an empty pass has none) */
+    uint32_t raw_len = 0;
+    for (int k = 0; k < (interlace ? 7 : 1); k++) {
+        uint32_t pw = interlace ? pass_size(w, adam_x0[k], adam_dx[k]) : w;
+        uint32_t ph = interlace ? pass_size(h, adam_y0[k], adam_dy[k]) : h;
+        if (pw && ph)
+            raw_len += ph * (row_bytes(f, pw) + 1);     /* at most 4096 * 32769 in all */
+    }
+    raw = malloc(raw_len);
+    img = malloc(sizeof(*img));
+    px = malloc((size_t)w * h * 4);
+    if (!raw || !img || !px || zlib_inflate(idat, idat_len, raw, raw_len) != (int)raw_len)
+        goto fail;
+    uint8_t *at = raw;
+    for (int k = 0; k < (interlace ? 7 : 1); k++) {
+        uint32_t x0 = interlace ? adam_x0[k] : 0, y0 = interlace ? adam_y0[k] : 0;
+        uint32_t dx = interlace ? adam_dx[k] : 1, dy = interlace ? adam_dy[k] : 1;
+        uint32_t pw = pass_size(w, x0, dx), ph = pass_size(h, y0, dy);
+        if (!pw || !ph)
+            continue;
+        uint32_t stride = row_bytes(f, pw);
+        if (unfilter(at, (int)ph, stride, f->bpp) < 0)
+            goto fail;
+        for (uint32_t y = 0; y < ph; y++)
+            convert_row(f, at + y * (stride + 1) + 1, pw, px + (y0 + y * dy) * w + x0, dx);
+        at += ph * (stride + 1);
     }
     free(raw);
     free(idat);
+    free(f);
     img->w = (int)w;
     img->h = (int)h;
     img->px = px;
     return img;
 fail:
+    free(raw);
+    free(img);
+    free(px);
     free(idat);
+    free(f);
     return NULL;
 }
 

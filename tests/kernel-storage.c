@@ -438,11 +438,35 @@ static void trimming(void)
     finish();
 }
 
+/* A directory whose chain loops is damaged: not read in part, not grown over itself. */
+static void looped_directory(void)
+{
+    setup();
+    struct vnode *a = create_file("A.TXT", "a");
+    CHECK(a);
+    struct fat_fs *f = mounted_fs->priv;
+    CHECK(fat_set(f, 2, 3) == 0 && fat_set(f, 3, 2) == 0);     /* the root: 2 -> 3 -> 2 ... */
+    mounted_fs->root->loaded = 0;
+    detach(a);
+    vnode_free(a);
+    uint8_t before[2][512];
+    memcpy(before, disk[cluster_lba(f, 2)], sizeof(before));
+    struct vnode *vn;
+    CHECK(vfs_lookup("/mnt/A.TXT", NULL, 1, &vn) == -EIO);
+    CHECK(vfs_create(mounted_fs->root, "B.TXT", VN_FILE, &vn) == -EIO);
+    uint8_t *e = NULL;
+    uint32_t len = 0;
+    CHECK(read_dir(f, 2, &e, &len) == -EIO);
+    CHECK(!memcmp(before, disk[cluster_lba(f, 2)], sizeof(before)));
+    CHECK(fat_set(f, 3, 0) == 0 && fat_set(f, 2, FAT_END) == 0);
+    finish();
+}
+
 int main(void)
 {
     trimming();
     unlink_lifetime(); rename_lifetime(); metadata_errors(); unmount_errors(); unlinked_directory();
     truncate_errors(); rename_errors(); directory_rename_errors(); mirrored_truncate_errors();
-    one_second_times();
+    one_second_times(); looped_directory();
     puts("kernel storage: lifetime, mount references, atomic rename/truncate failures, flush retries and 1 s FAT times and fstrim passed");
 }

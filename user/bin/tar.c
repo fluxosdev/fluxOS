@@ -17,7 +17,8 @@
  * the --format, --owner, --group, --numeric-owner options are accepted
  * for compatibility (modes and times are always kept). "-" or no -f
  * means standard input or output. Member names must fit ustar: 100
- * bytes, or 255 with a / in the last 155.
+ * bytes, or 255 with a / in the last 155; a link's target longer than
+ * 100 bytes goes in a GNU long-link record.
  */
 #include <dirent.h>
 #include <errno.h>
@@ -286,6 +287,29 @@ static int split_name(struct header *h, const char *path)
     return -1;
 }
 
+/* A link target longer than the 100 bytes ustar has: GNU's ././@LongLink record ('K') before the
+ * member, which GNU tar and this one read. */
+static int write_long_link(const char *link)
+{
+    struct header h;
+    size_t len = strlen(link) + 1;
+    memset(&h, 0, sizeof(h));
+    snprintf(h.name, sizeof(h.name), "././@LongLink");
+    put_octal(h.mode, 8, 0644);
+    put_octal(h.uid, 8, 0);
+    put_octal(h.gid, 8, 0);
+    put_octal(h.size, 12, (uint32_t)len);
+    put_octal(h.mtime, 12, 0);
+    h.typeflag = 'K';
+    memcpy(h.magic, "ustar", 6);
+    memcpy(h.version, "00", 2);
+    set_checksum(&h);
+    static const char zeros[512];
+    if (write_full(fd, &h, 512) < 0 || write_full(fd, link, len) < 0)
+        return -1;
+    return len & 511 ? write_full(fd, zeros, 512 - (len & 511)) : 0;
+}
+
 static int write_header(const char *name, const struct stat *st, char type, const char *link)
 {
     struct header h;
@@ -294,14 +318,16 @@ static int write_header(const char *name, const struct stat *st, char type, cons
         warn("%s: file name is too long (max 100; or 255 with a /)%s", name, "");
         return -1;
     }
+    if (link && strlen(link) > sizeof(h.linkname) && write_long_link(link) < 0)
+        return -1;
     put_octal(h.mode, 8, st->st_mode & 07777);
     put_octal(h.uid, 8, owner_id);
     put_octal(h.gid, 8, group_id);
     put_octal(h.size, 12, type == '0' ? (uint32_t)st->st_size : 0);
     put_octal(h.mtime, 12, (uint32_t)st->st_mtime);
     h.typeflag = type;
-    if (link)
-        snprintf(h.linkname, sizeof(h.linkname), "%s", link);
+    if (link)                           /* all 100 bytes may be used: no terminator needed */
+        memcpy(h.linkname, link, strlen(link) < sizeof(h.linkname) ? strlen(link) : sizeof(h.linkname));
     memcpy(h.magic, "ustar", 6);
     memcpy(h.version, "00", 2);
     set_checksum(&h);

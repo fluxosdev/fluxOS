@@ -1,11 +1,12 @@
 /*
  * xargs - run a command with arguments read from standard input
  *
- *   xargs [-0] [-n N] [-s SIZE] [-I STR] [-r] [-t] [-p] [command [args...]]
+ *   xargs [-0] [-n N] [-L N] [-s SIZE] [-I STR] [-r] [-t] [-p] [command [args...]]
  *
  * Arguments are whitespace-separated (quotes and backslashes as in the
  * shell; -0 takes NUL-separated ones) and appended to the command, as
- * many as fit (-s, 64 KiB) or -n says, running it as often as needed;
+ * many as fit (-s, 64 KiB, and the kernel's 4096 arguments) or -n says,
+ * or those of N lines with -L, running it as often as needed;
  * -I STR runs it once per line with STR replaced; -r runs nothing for
  * empty input; -t echoes each command first. Exit status 123 if a run
  * failed, 127 if the command was not found.
@@ -20,7 +21,10 @@
 
 static int status, trace, no_run_if_empty, nul;
 static size_t max_bytes = 65536;
-static int max_args;
+static int max_args, max_lines;
+static int ended_line;                  /* the last argument read ended its line (-L) */
+
+#define MAX_EXEC_ARGS 4096              /* the kernel's limit on argv strings (MAX_ARGS in kernel/core/exec.c) */
 static const char *replace;
 
 static char **args;
@@ -108,6 +112,7 @@ static char *next_arg(void)
         buf[n] = 0;
         return strdup(buf);
     }
+    ended_line = 0;
     while ((c = getchar()) != EOF && isspace(c))
         ;
     if (c == EOF)
@@ -131,12 +136,16 @@ static char *next_arg(void)
             if (c == EOF)
                 break;
         } else if (isspace(c)) {
+            if (c == '\n')
+                ended_line = 1;
             break;
         }
         if (n + 1 >= cap)
             buf = realloc(buf, cap = cap ? cap * 2 : 256);
         buf[n++] = (char)c;
     }
+    if (c == EOF)
+        ended_line = 1;
     if (n + 1 >= cap)
         buf = realloc(buf, cap = cap ? cap * 2 : 256);
     buf[n] = 0;
@@ -164,7 +173,7 @@ int main(int argc, char **argv)
             if (a[1] == 'n') max_args = atoi(v);
             else if (a[1] == 's') max_bytes = (size_t)atol(v);
             else if (a[1] == 'I') replace = v;
-            else if (a[1] == 'L') max_args = 0;     /* lines: close enough to one call per line is -I */
+            else if (a[1] == 'L') max_lines = atoi(v);
             continue;
         }
         fprintf(stderr, "xargs: invalid option %s\n", a);
@@ -218,7 +227,7 @@ int main(int argc, char **argv)
     for (int k = 0; k < ncmd; k++)
         base_bytes += strlen(cmd[k]) + 1;
     char *arg;
-    int any = 0;
+    int any = 0, lines = 0;
     nargs = 0;
     for (int k = 0; k < ncmd; k++)
         push(cmd[k]);
@@ -226,7 +235,8 @@ int main(int argc, char **argv)
     while ((arg = next_arg())) {
         any = 1;
         size_t need = strlen(arg) + 1;
-        if (nargs > ncmd && ((max_args && nargs - ncmd >= max_args) || bytes + need > max_bytes)) {
+        if (nargs > ncmd && ((max_args && nargs - ncmd >= max_args) || bytes + need > max_bytes ||
+                             nargs >= MAX_EXEC_ARGS)) {
             run(args);
             for (int k = ncmd; k < nargs; k++)
                 free(args[k]);
@@ -236,6 +246,15 @@ int main(int argc, char **argv)
         }
         push(arg);
         bytes += need;
+        if (max_lines && ended_line && ++lines >= max_lines) {    /* -L: a run every N input lines */
+            run(args);
+            for (int k = ncmd; k < nargs; k++)
+                free(args[k]);
+            nargs = ncmd;
+            args[nargs] = NULL;
+            bytes = base_bytes;
+            lines = 0;
+        }
     }
     if (nargs > ncmd || (!any && !no_run_if_empty))
         run(args);

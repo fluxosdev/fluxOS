@@ -3,9 +3,11 @@
  *   make test-libc
  * Every case prints the format, the value and both outputs on a mismatch.
  */
+#include <errno.h>
 #include <float.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,7 +29,9 @@ unsigned long flux_strtoul(const char *s, char **end, int base);
 unsigned long long flux_strtoull(const char *s, char **end, int base);
 int flux_sscanf(const char *s, const char *fmt, ...);
 
-int flux_errno;
+/* libc's errno (tests/libc-host-build.sh points its __errno_location here) */
+__thread int flux_errno;
+int *flux___errno_location(void) { return &flux_errno; }
 static int failures, checks;
 static uint64_t rng = 0x9E3779B97F4A7C15ull;
 
@@ -237,6 +241,64 @@ static void test_strtol(void)
             printf("strtol: 32-bit overflow wrong\n");
         }
     }
+    /* errno: ERANGE on overflow, EINVAL for a bad base, untouched otherwise */
+    static const struct { const char *s; int base, err; } er[] = {
+        { "99999999999999999999", 10, ERANGE }, { "-99999999999999999999", 10, ERANGE }, { "42", 10, 0 },
+        { "18446744073709551616", 0, ERANGE }, { "1", 1, EINVAL }, { "1", 37, EINVAL },
+    };
+    for (unsigned i = 0; i < sizeof(er) / sizeof(er[0]); i++) {
+        flux_errno = 0;
+        flux_strtoll(er[i].s, NULL, er[i].base);
+        checks++;
+        if (flux_errno != er[i].err) {
+            failures++;
+            printf("strtoll(\"%s\", %d): errno %d, want %d\n", er[i].s, er[i].base, flux_errno, er[i].err);
+        }
+    }
+    static const struct { const char *s; int err; } ed[] = {
+        { "1e-400", ERANGE }, { "1e400", ERANGE }, { "-1e999", ERANGE }, { "2.4703282292062327e-324", ERANGE },
+        { "1e-300", 0 }, { "0", 0 }, { "inf", 0 },
+    };
+    for (unsigned i = 0; i < sizeof(ed) / sizeof(ed[0]); i++) {
+        flux_errno = errno = 0;
+        double g = strtod(ed[i].s, NULL), f = flux_strtod(ed[i].s, NULL);
+        checks++;
+        if (flux_errno != ed[i].err || errno != ed[i].err || g != f) {
+            failures++;
+            printf("strtod(\"%s\"): errno flux %d glibc %d, want %d\n", ed[i].s, flux_errno, errno, ed[i].err);
+        }
+    }
+}
+
+/* strtod from several threads at once: its working state must be each call's own. */
+static const char *const race_in[] = { "0.1", "3.14159265358979323846", "1e300", "2.2250738585072014e-308" };
+
+static void *strtod_race(void *arg)
+{
+    const char *s = race_in[(intptr_t)arg];
+    double want = strtod(s, NULL);
+    intptr_t bad = 0;
+    for (int i = 0; i < 20000; i++)
+        bad += flux_strtod(s, NULL) != want;
+    return (void *)bad;
+}
+
+static void test_strtod_threads(void)
+{
+    pthread_t t[4];
+    intptr_t bad = 0;
+    for (intptr_t i = 0; i < 4; i++)
+        pthread_create(&t[i], NULL, strtod_race, (void *)i);
+    for (int i = 0; i < 4; i++) {
+        void *r;
+        pthread_join(t[i], &r);
+        bad += (intptr_t)r;
+    }
+    checks++;
+    if (bad) {
+        failures++;
+        printf("strtod in 4 threads: %ld wrong results\n", (long)bad);
+    }
 }
 
 static void test_sscanf(void)
@@ -297,6 +359,7 @@ int main(void)
     test_long_doubles();
     test_strtod();
     test_strtol();
+    test_strtod_threads();
     test_sscanf();
     printf("libc format: %d checks, %d failures\n", checks, failures);
     return failures != 0;

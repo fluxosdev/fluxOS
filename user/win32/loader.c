@@ -528,7 +528,7 @@ void process_init(const char *exe_host_path, int argc, char **argv, char **envp)
     if (guest_stack_size > 0x4000000)
         guest_stack_size = 0x4000000;
     guest_stack_size = (guest_stack_size + 0xFFFF) & ~0xFFFFu;
-    guest_stack_alloc = vm_alloc(0, guest_stack_size, PAGE_READWRITE, MEM_PRIVATE | MEM_TOP_DOWN, 0);
+    guest_stack_alloc = vm_alloc_stack(guest_stack_size);   /* a guard below: overflowing faults */
     if (!guest_stack_alloc)
         wdie("cannot allocate the stack");
     guest_stack_limit = guest_stack_alloc;
@@ -568,6 +568,7 @@ void process_exit(uint32_t code)
         exiting = 1;
         exit_code = code;
         crt_flush_all();
+        file_views_flush();
         gui_exit();
         module_detach_all();
     }

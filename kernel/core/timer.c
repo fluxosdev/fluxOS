@@ -84,11 +84,17 @@ void udelay(uint32_t us)
     }
 }
 
-/* Wait at least `ms` milliseconds: a process sleeps, the boot code spins. */
+/* Wait at least `ms` milliseconds: a process sleeps, the boot code spins, and
+ * so does a caller with interrupts off or a spinlock held, which must not sleep
+ * (nor could see `ticks` move, on the boot processor). */
 void mdelay(uint32_t ms)
 {
     static int chan;
-    if (!current || current->pid <= 0) {
+    uint32_t flags = irq_save();
+    int atomic = !(flags & EFLAGS_IF) || this_cpu()->nlocks > 0;
+    struct proc *p = this_cpu()->proc;
+    irq_restore(flags);
+    if (atomic || !p || p->pid <= 0) {
         udelay(ms * 1000);
         return;
     }

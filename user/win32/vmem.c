@@ -239,14 +239,48 @@ int vm_commit(gp_t addr, uint32_t size, uint32_t protect)
     return apply(addr, size, set_state, &c) ? 0 : -1;
 }
 
+static void set_reserved(struct region *r, void *ctx)
+{
+    (void)ctx;
+    r->state = MEM_RESERVE;
+    r->protect = PAGE_NOACCESS;
+    os_map(r->base + WIN_BASE, r->size);    /* fresh zeroes when committed again */
+}
+
 int vm_decommit(gp_t addr, uint32_t size)
 {
-    struct commit_arg c = { MEM_RESERVE, PAGE_NOACCESS };
-    if (!apply(addr, size, set_state, &c))
-        return -1;
-    addr &= ~(PAGE - 1);
-    os_map(addr + WIN_BASE, round_up(size, PAGE));  /* fresh zeroes when committed again */
-    return 0;
+    /* only the program's own pieces of the range are touched: never a neighbour's gap */
+    return apply(addr, size, set_reserved, NULL) ? 0 : -1;
+}
+
+/* The end of the reservation addr lies in, or 0. */
+gp_t vm_alloc_end(gp_t addr)
+{
+    struct region *r = region_find(addr);
+    if (!r || r->loader)
+        return 0;
+    gp_t end = 0;
+    for (struct region *q = regions; q; q = q->next)
+        if (q->alloc_base == r->alloc_base && !q->loader && q->base + q->size > end)
+            end = q->base + q->size;
+    return end;
+}
+
+/* A stack, top down, with a reservation below it that nothing is mapped
+ * in: running off the end faults instead of writing into whatever was
+ * allocated next. Returns the stack's lowest address (vm_free frees both). */
+gp_t vm_alloc_stack(uint32_t size)
+{
+    size = round_up(size, PAGE);
+    gp_t base = vm_alloc(0, size + GRANULARITY, PAGE_READWRITE, MEM_PRIVATE | MEM_TOP_DOWN, 0);
+    if (!base)
+        return 0;
+    struct region *r = region_find(base);
+    split(r, base + GRANULARITY);
+    r->state = MEM_RESERVE;
+    r->protect = PAGE_NOACCESS;
+    os_unmap(base + WIN_BASE, GRANULARITY);
+    return base + GRANULARITY;
 }
 
 struct protect_arg { uint32_t protect, old; int first; };

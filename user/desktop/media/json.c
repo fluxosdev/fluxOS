@@ -194,17 +194,22 @@ static struct json *parse_value(struct parser *ps)
         }
     }
     if (c == '-' || (c >= '0' && c <= '9')) {
-        char tmp[64];
+        char tmp[64], *num = tmp;
         size_t n = 0;
-        while (ps->p + n < ps->end && n < sizeof(tmp) - 1 && strchr("+-0123456789.eE", ps->p[n]))
+        while (ps->p + n < ps->end && ps->p[n] && strchr("+-0123456789.eE", ps->p[n]))
             n++;
-        memcpy(tmp, ps->p, n);
-        tmp[n] = 0;
-        char *e;
-        double d = strtod(tmp, &e);
-        if (e == tmp)
+        if (n >= sizeof(tmp) && !(num = malloc(n + 1)))     /* a long one is still a number */
             return NULL;
-        ps->p += e - tmp;
+        memcpy(num, ps->p, n);
+        num[n] = 0;
+        char *e;
+        double d = strtod(num, &e);
+        size_t used = (size_t)(e - num);
+        if (num != tmp)
+            free(num);
+        if (!used)
+            return NULL;
+        ps->p += used;
         struct json *v = new_value(JSON_NUM);
         if (v)
             v->num = d;

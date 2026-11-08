@@ -76,6 +76,7 @@ struct pcm {
     int active;                         /* streams still open */
     uint32_t mixed;                     /* frames given to the card */
     uint32_t progress;                  /* times frames were */
+    int asleep;                         /* suspend to RAM: the card is off, not dead (pcm_sleep) */
 };
 
 static struct pcm pcms[MAX_PCMS];
@@ -230,7 +231,7 @@ static uint32_t pump(struct pcm *p, uint32_t n)
 static void kick(struct pcm *p, int force)
 {
     struct pcm_backend *be = p->be;
-    if (gone(p))
+    if (gone(p) || p->asleep)
         return;
     uint32_t q = be->queued();
     if (q < be->lead)
@@ -256,11 +257,19 @@ static int others_queued(const struct pcm_stream *s)
     return 0;
 }
 
-/* Sleep until the card takes or plays something; -EIO when a second passes without it. */
+/* Sleep until the card takes or plays something; -EIO when a second passes without it.
+ * While the machine suspends the card is off, not stalled: that is waited out. */
 static int wait_card(struct pcm_stream *s)
 {
     struct pcm *p = s->pcm;
     struct pcm_backend *be = p->be;
+    while (p->asleep) {
+        sleep_on_lock_timeout(p, &snd_lock, ticks + HZ);
+        if (signal_pending(current))
+            return -EINTR;
+        if (gone(p))
+            return -ENODEV;
+    }
     kick(p, 1);
     if (gone(p))
         return -ENODEV;
@@ -453,7 +462,7 @@ static void stream_release(struct vnode *vn)
     s->closed = 1;
     p->active--;
     kick(p, 1);
-    reap(p, !gone(p) && !p->be->running());    /* asked to start, it did not */
+    reap(p, !gone(p) && !p->asleep && !p->be->running());    /* asked to start, it did not */
     spin_unlock(&snd_lock);
 }
 
@@ -526,6 +535,21 @@ void pcm_pull(struct pcm *p, uint32_t frames)
     wakeup(p);                          /* the card moved on: drain() looks again */
 }
 
+/*
+ * With snd_lock: the card is being suspended to RAM (asleep 1) or is back
+ * (0). Meanwhile nothing is mixed into it or started, and writers, drains
+ * and closing streams wait for it instead of taking it for a card that
+ * will not start.
+ */
+void pcm_sleep(struct pcm *p, int asleep)
+{
+    if (!p)
+        return;
+    p->asleep = asleep;
+    if (!asleep)
+        wakeup(p);
+}
+
 int pcm_active(const struct pcm *p)
 {
     return p ? __atomic_load_n(&p->active, __ATOMIC_RELAXED) : 0;
@@ -557,7 +581,7 @@ void pcm_tick(void)
         } else {
             int f = flushing(p);
             kick(p, f);
-            if (f && !p->be->running())
+            if (f && !p->asleep && !p->be->running())
                 reap(p, 1);             /* it would not start */
         }
         wakeup(p);

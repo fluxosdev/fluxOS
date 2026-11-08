@@ -559,10 +559,28 @@ void proc_spawn_init(const char *path)
     spin_unlock(&sched_lock);
 }
 
+/* Where a kernel thread's function returns to, should it ever return: the
+ * thread ends, and its slot is reaped like an exited thread's. */
+static void kthread_return(void) __attribute__((noreturn, used));
+static void kthread_return(void)
+{
+    struct proc *p = current;
+    klog("kernel thread %d (%s) returned\n", p->pid, p->name);
+    fpu_release(p);
+    cli();
+    spin_lock(&sched_lock);
+    p->state = P_ZOMBIE;
+    p->reap_self = 1;
+    sched_switch();
+    panic("exited kernel thread %d was scheduled", p->pid);
+}
+
 /*
  * A kernel thread starts by "returning" through trapret into fn in ring
  * 0, with interrupts on: it is preemptible like any kernel code, and
- * takes the locks of whatever it works on.
+ * takes the locks of whatever it works on. An iret to ring 0 pops only
+ * eip, cs and eflags, so the stack then points at the frame's useresp:
+ * that is fn's return address, and a return ends the thread.
  */
 void proc_spawn_kthread(const char *name, void (*fn)(void))
 {
@@ -575,6 +593,7 @@ void proc_spawn_kthread(const char *name, void (*fn)(void))
     tf->ds = tf->es = tf->fs = tf->gs = SEG_KDATA;
     tf->eflags = 0x202;                         /* IF set */
     tf->eip = (uint32_t)fn;
+    tf->useresp = (uint32_t)kthread_return;     /* fn's return address (see above) */
     p->kthread = 1;
     p->pgid = p->sid = p->pid;
     strlcpy(p->name, name, sizeof(p->name));
@@ -664,6 +683,15 @@ static int thread_alive(const struct proc *q, const struct proc *g)
     return q->leader == g && q->state != P_UNUSED && q->state != P_ZOMBIE && q->state != P_EMBRYO;
 }
 
+/* With sched_lock: is a thread of the process g stopped? (g itself may have ended early.) */
+static int group_stopped(const struct proc *g)
+{
+    for (int i = 1; i < MAX_PROCS; i++)
+        if (thread_alive(&procs[i], g) && procs[i].state == P_STOPPED)
+            return 1;
+    return 0;
+}
+
 static void wake_futex(uint32_t addr);
 
 /* The calling thread ends, and others of its process go on (sched_lock is let go by the switch away). */
@@ -701,8 +729,12 @@ static void exit_this_thread(struct proc *p)
     p->pd = kernel_pd;                  /* (the others' address space goes on without it; cr3 is left as it is) */
     p->state = P_ZOMBIE;
     p->reap_self = p != g;              /* the leader stays, holding what the threads share */
-    if (p == g)
+    if (p == g) {
         p->exit_status = 0;
+    } else {
+        g->cpu_ticks += p->cpu_ticks;   /* the process's time keeps the thread's */
+        p->cpu_ticks = 0;
+    }
     sched_switch();
     panic("exited thread %d was scheduled", p->pid);
 }
@@ -797,10 +829,10 @@ void do_exit(int status)
         struct proc *q = &procs[i];
         if (q->state != P_UNUSED && q->ppid == g->pid && q->leader == q) {
             q->ppid = init_proc->pid;
-            if (q->state == P_ZOMBIE) {
+            if (q->state == P_ZOMBIE && q->nthreads == 0) {
                 signal_locked(init_proc, SIGCHLD);
                 wakeup_locked(init_proc);
-            } else if (q->state == P_STOPPED) {
+            } else if (group_stopped(q)) {
                 /* Nobody is left to continue it: hang up, and let it see that. */
                 signal_locked(q, SIGHUP);
                 signal_locked(q, SIGCONT);
@@ -814,6 +846,8 @@ void do_exit(int status)
     if (p != g) {
         p->state = P_ZOMBIE;
         p->reap_self = 1;
+        g->cpu_ticks += p->cpu_ticks;   /* the parent's waitpid() counts the leader's */
+        p->cpu_ticks = 0;
     }
     struct proc *parent = proc_find_locked(g->ppid);
     if (parent) {
@@ -971,7 +1005,8 @@ int do_waitpid(int pid, int *status, int options)
                 return r;
             }
             int code = -1;
-            if ((options & WUNTRACED) && q->state == P_STOPPED && q->stop_report) {
+            /* (Stops and continues are reported on the leader, which may have ended early.) */
+            if ((options & WUNTRACED) && q->stop_report && group_stopped(q)) {
                 q->stop_report = 0;
                 code = (q->stop_sig << 8) | 0x7f;
             } else if ((options & WCONTINUED) && q->cont_report) {
@@ -1108,16 +1143,18 @@ static void notify_parent_locked(struct proc *p)
 }
 
 /* With sched_lock: SIGCONT, whatever its disposition, cancels pending stop
- * signals and sets a stopped process going again. */
+ * signals and sets a stopped thread going again. Its process's leader
+ * reports it to waitpid(). */
 static void continue_locked(struct proc *p)
 {
     __atomic_and_fetch(&p->sig_pending, ~STOP_SIGS, __ATOMIC_RELAXED);
     if (p->state != P_STOPPED)
         return;
-    p->stop_report = 0;
-    p->cont_report = 1;
+    struct proc *g = p->leader;
+    g->stop_report = 0;
+    g->cont_report = 1;
     make_ready(p);
-    notify_parent_locked(p);
+    notify_parent_locked(g);
 }
 
 /* With sched_lock: the thread of p's process to give a signal sent to the process: p if it can
@@ -1155,11 +1192,11 @@ static void signal_locked(struct proc *p, int sig)
     int every = g->nthreads > 1 && (sig == SIGKILL || sig == SIGCONT ||
                                     ((STOP_SIGS & (1u << sig)) && (sig == SIGSTOP || h == SIGDISP_DFL)));
     if (sig == SIGCONT) {
-        for (int i = 1; i < MAX_PROCS && every; i++)
-            if (thread_alive(&procs[i], g) && &procs[i] != g)
+        /* Every thread still going: the leader may have ended early, and the
+         * one left be another. */
+        for (int i = 1; i < MAX_PROCS; i++)
+            if (thread_alive(&procs[i], g))
                 continue_locked(&procs[i]);
-        if (g->state != P_ZOMBIE)
-            continue_locked(g);
     } else if (STOP_SIGS & (1u << sig)) {
         for (int i = 1; i < MAX_PROCS; i++)
             if (thread_alive(&procs[i], g))
@@ -1349,9 +1386,11 @@ static int try_stop(struct proc *p, int sig, uint32_t mask)
         }
         p->state = P_STOPPED;
         p->stop_sig = sig;
-        p->stop_report = 1;
-        p->cont_report = 0;
-        notify_parent_locked(p);
+        /* The leader reports it for the process, even one that ended early. */
+        p->leader->stop_sig = sig;
+        p->leader->stop_report = 1;
+        p->leader->cont_report = 0;
+        notify_parent_locked(p->leader);
         sched_switch();
     }
     spin_unlock(&sched_lock);
@@ -1460,7 +1499,7 @@ void proc_check_signals(void)
 
         tf->eip = sa.fsa_handler;
         tf->useresp = frame_sp;
-        tf->eflags &= ~0x400u;                  /* clear DF for handler entry */
+        tf->eflags &= ~0x500u;                  /* clear DF, and TF: a SIGTRAP handler is not single-stepped */
         if (based || tf->cs != SEG_UCODE) {
             tf->cs = SEG_UCODE;
             tf->ss = tf->ds = tf->es = tf->fs = SEG_UDATA;
@@ -1918,6 +1957,19 @@ int futex_wake(uint32_t addr, int n)
     if (n > 0)
         wake_futex(addr);
     return 0;
+}
+
+/* The timer ticks p's process has had: its threads' (exited ones' are folded into the leader). */
+uint32_t proc_cpu_ticks(struct proc *p)
+{
+    struct proc *g = p->leader;
+    uint32_t n = 0;
+    spin_lock(&sched_lock);
+    for (int i = 1; i < MAX_PROCS; i++)
+        if (procs[i].state != P_UNUSED && procs[i].leader == g)
+            n += procs[i].cpu_ticks;
+    spin_unlock(&sched_lock);
+    return n;
 }
 
 int proc_info(int slot, struct procinfo *pi)

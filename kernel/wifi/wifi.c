@@ -89,6 +89,8 @@ static struct {
 } w;
 
 static spinlock_t wifi_lock = SPINLOCK_INIT("wifi");
+/* send_data's frame: from kwifid and from the network stack (net_lock, then this). */
+static spinlock_t wifi_tx_lock = SPINLOCK_INIT("wifi-tx");
 
 static const uint8_t rates_2ghz[] = { 2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108 };
 static const uint8_t rates_5ghz[] = { 12, 18, 24, 36, 48, 72, 96, 108 };
@@ -329,9 +331,11 @@ static int send_assoc(void)
 static int send_data(const uint8_t *dst, const uint8_t *src, uint16_t type, const uint8_t *payload,
                      uint32_t len, int encrypt)
 {
-    uint8_t f[HDR_LEN + LLC_SNAP_LEN + ETH_MTU];
+    /* Not on the stack: this runs in network interrupts too, deep in the stack's own frames. */
+    static uint8_t f[HDR_LEN + LLC_SNAP_LEN + ETH_MTU];
     if (len > ETH_MTU)
         return -EMSGSIZE;
+    spin_lock(&wifi_tx_lock);
     struct ieee80211_hdr *h = (void *)f;
     memset(h, 0, HDR_LEN);
     h->fc[0] = FC_TYPE_DATA;
@@ -343,7 +347,9 @@ static int send_data(const uint8_t *dst, const uint8_t *src, uint16_t type, cons
     f[HDR_LEN + 6] = (uint8_t)(type >> 8);
     f[HDR_LEN + 7] = (uint8_t)type;
     memcpy(f + HDR_LEN + LLC_SNAP_LEN, payload, len);
-    return w.hw->tx_data(f, HDR_LEN + LLC_SNAP_LEN + len, encrypt);
+    int r = w.hw->tx_data(f, HDR_LEN + LLC_SNAP_LEN + len, encrypt);
+    spin_unlock(&wifi_tx_lock);
+    return r;
 }
 
 static int send_eapol(const uint8_t *frame, uint32_t len)
@@ -701,7 +707,8 @@ static void take_requests(void)
             w.hw->leave();
             memset(&w.cur, 0, sizeof(w.cur));
         }
-        w.state = M_IDLE;
+        /* A scan under way goes on (the card would refuse another meanwhile). */
+        w.state = w.state == M_SCAN || w.state == M_SCAN_CONNECT ? M_SCAN : M_IDLE;
         w.error[0] = 0;
     }
     if (w.req_connect) {
@@ -721,8 +728,12 @@ static void take_requests(void)
         w.backoff = 0;
         w.handshake_fails = 0;
         w.error[0] = 0;
-        w.state = M_IDLE;
-        w.retry_at = ticks;
+        if (w.state == M_SCAN || w.state == M_SCAN_CONNECT) {
+            w.state = M_SCAN_CONNECT;   /* the scan under way finds it (its deadline stands) */
+        } else {
+            w.state = M_IDLE;
+            w.retry_at = ticks;
+        }
     }
     if (w.req_scan && (w.state == M_IDLE || w.state == M_CONNECTED)) {
         w.req_scan = 0;

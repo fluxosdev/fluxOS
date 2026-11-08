@@ -162,7 +162,12 @@ static int tell(const char *fmt, ...)
     va_start(ap, fmt);
     int n = vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
-    if (n <= 0 || n >= (int)sizeof(line) || player_start() < 0)
+    if (n <= 0 || n >= (int)sizeof(line) || line[n - 1] != '\n')
+        return -1;
+    for (int i = 0; i < n - 1; i++)     /* one line: a path or address with a line break in it would make two */
+        if ((unsigned char)line[i] < 32 || line[i] == 127)
+            return -1;
+    if (player_start() < 0)
         return -1;
     if (write(to_player, line, (size_t)n) != n) {
         player_gone();
@@ -289,6 +294,32 @@ static void seek_to(struct stream *s, int ms)
     s->eof = 0;
 }
 
+/* The browser hands over only files it made with mkstemp("/tmp/wave-audio-XXXXXX") (browser.c,
+ * media_fetched): one of those, a regular file of this user's, is opened (not through a symbolic
+ * link); anything else is refused and left alone. Returns the descriptor, or -1. */
+#define TEMP_PREFIX "/tmp/wave-audio-"
+static int open_temp(const char *path, struct stat *st)
+{
+    size_t pl = sizeof(TEMP_PREFIX) - 1;
+    if (strncmp(path, TEMP_PREFIX, pl) || strlen(path) != pl + 6)
+        return -1;
+    for (const char *p = path + pl; *p; p++)
+        if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')))
+            return -1;
+    struct stat link;
+    if (lstat(path, &link) < 0 || !S_ISREG(link.st_mode) || link.st_uid != getuid())
+        return -1;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0)
+        return -1;
+    if (fstat(fd, st) < 0 || !S_ISREG(st->st_mode) || st->st_uid != getuid() || st->st_dev != link.st_dev ||
+        st->st_ino != link.st_ino) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 static void open_stream(int id, const char *path)
 {
     int slot = -1;
@@ -299,11 +330,14 @@ static void open_stream(int id, const char *path)
         if (!streams[i])
             slot = i;
     struct stat st;
-    int fd = open(path, O_RDONLY);
+    int fd = open_temp(path, &st);
+    if (fd < 0) {
+        say("error %d\n", id);         /* not one of ours: neither read nor deleted */
+        return;
+    }
     unsigned char *data = NULL;
     size_t got = 0;
-    if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0 && st.st_size <= MAX_FILE &&
-        (data = malloc((size_t)st.st_size))) {
+    if (st.st_size > 0 && st.st_size <= MAX_FILE && (data = malloc((size_t)st.st_size))) {
         while (got < (size_t)st.st_size) {
             int r = (int)read(fd, data + got, (size_t)st.st_size - got);
             if (r <= 0)
@@ -311,9 +345,8 @@ static void open_stream(int id, const char *path)
             got += (size_t)r;
         }
     }
-    if (fd >= 0)
-        close(fd);
-    unlink(path);
+    close(fd);
+    unlink(path);                       /* ours (checked above), and read */
     struct codec *c = data && slot >= 0 ? codec_open(data, got) : NULL;
     struct stream *s = c ? calloc(1, sizeof(*s)) : NULL;
     if (!s) {

@@ -242,6 +242,8 @@ fail:
 
 /* ---- exports ---- */
 
+static const char *image_string(const struct module *m, uint32_t rva);
+
 gp_t pe_export(struct module *m, const char *name, int ordinal)
 {
     uint32_t rva = m->dir[DIR_EXPORT][0], size = m->dir[DIR_EXPORT][1];
@@ -260,10 +262,10 @@ gp_t pe_export(struct module *m, const char *name, int ordinal)
         uint32_t lo = 0, hi = nnames;
         while (lo < hi) {
             uint32_t mid = (lo + hi) / 2;
-            uint32_t nrva = rd32(img + names + mid * 4);
-            if (nrva >= m->size)
+            const char *nm = image_string(m, rd32(img + names + mid * 4));
+            if (!nm)
                 return 0;
-            int c = strcmp(name, (const char *)img + nrva);
+            int c = strcmp(name, nm);
             if (c == 0) {
                 index = rd16(img + ords + mid * 2);
                 break;
@@ -275,8 +277,8 @@ gp_t pe_export(struct module *m, const char *name, int ordinal)
         }
         if (index == 0xFFFFFFFFu) {         /* not sorted after all? look once more */
             for (uint32_t i = 0; i < nnames; i++) {
-                uint32_t nrva = rd32(img + names + i * 4);
-                if (nrva < m->size && !strcmp(name, (const char *)img + nrva)) {
+                const char *nm = image_string(m, rd32(img + names + i * 4));
+                if (nm && !strcmp(name, nm)) {
                     index = rd16(img + ords + i * 2);
                     break;
                 }
@@ -293,17 +295,22 @@ gp_t pe_export(struct module *m, const char *name, int ordinal)
     if (!frva)
         return 0;
     if (frva >= rva && frva - rva < size && frva < m->size) {   /* a forwarder: "DLL.Name" or "DLL.#12" */
+        static int forwards;            /* forwarders to forwarders, as far as this: no loops */
+        const char *str = image_string(m, frva);
+        if (!str || forwards >= 8)
+            return 0;
         char fwd[256];
-        snprintf(fwd, sizeof(fwd), "%s", (const char *)img + frva);
+        snprintf(fwd, sizeof(fwd), "%s", str);
         char *dot = strrchr(fwd, '.');
         if (!dot)
             return 0;
         *dot++ = 0;
         char dll[260];
         snprintf(dll, sizeof(dll), "%s.DLL", fwd);
-        if (*dot == '#')
-            return loader_resolve(dll, NULL, atoi(dot + 1), NULL);
-        return loader_resolve(dll, dot, 0, NULL);
+        forwards++;
+        gp_t r = *dot == '#' ? loader_resolve(dll, NULL, atoi(dot + 1), NULL) : loader_resolve(dll, dot, 0, NULL);
+        forwards--;
+        return r;
     }
     return m->base + frva;
 }
@@ -362,7 +369,7 @@ static int next_tls_index;
 int pe_setup_tls(struct module *m)
 {
     uint32_t rva = m->dir[DIR_TLS][0];
-    if (!rva || !m->dir[DIR_TLS][1] || rva + 24 > m->size)
+    if (!rva || !m->dir[DIR_TLS][1] || rva > m->size || m->size - rva < 24)
         return 0;
     const uint8_t *img = GP(m->base);
     const uint8_t *t = img + rva;
@@ -389,7 +396,7 @@ int pe_setup_tls(struct module *m)
 void pe_run_tls_callbacks(struct module *m, uint32_t reason)
 {
     uint32_t rva = m->dir[DIR_TLS][0];
-    if (!rva || !m->dir[DIR_TLS][1] || rva + 24 > m->size)
+    if (!rva || !m->dir[DIR_TLS][1] || rva > m->size || m->size - rva < 24)
         return;
     const uint8_t *img = GP(m->base);
     uint32_t cbs = rd32(img + rva + 12);
@@ -397,7 +404,7 @@ void pe_run_tls_callbacks(struct module *m, uint32_t reason)
         return;
     if (cbs < m->base || cbs >= m->base + m->size)
         return;
-    for (uint32_t i = 0; ; i++) {
+    for (uint32_t i = 0; (cbs - m->base) + i * 4 <= m->size - 4; i++) {    /* an unterminated list ends with the image */
         uint32_t cb = rd32(img + (cbs - m->base) + i * 4);
         if (!cb)
             break;
@@ -419,7 +426,7 @@ static uint32_t res_lookup(struct module *m, uint32_t dir_rva, uint32_t id, cons
 {
     uint32_t root = m->dir[DIR_RESOURCE][0];
     const uint8_t *img = GP(m->base);
-    if (dir_rva + 16 > m->size)
+    if (dir_rva > m->size || m->size - dir_rva < 16)
         return 0;
     const uint8_t *d = img + dir_rva;
     uint32_t nnamed = rd16(d + 12), nids = rd16(d + 14);
@@ -433,10 +440,13 @@ static uint32_t res_lookup(struct module *m, uint32_t dir_rva, uint32_t id, cons
         if (key & 0x80000000u) {
             if (!name)
                 continue;
-            uint32_t soff = root + (key & 0x7FFFFFFFu);
-            if (soff + 2 > m->size)
+            uint32_t soff = key & 0x7FFFFFFFu;
+            if (soff > m->size - root || m->size - root - soff < 2)
                 continue;
+            soff += root;
             uint16_t len = rd16(img + soff);
+            if ((uint32_t)len * 2 > m->size - soff - 2)   /* the name lies in the image */
+                continue;
             const uint16_t *s = (const uint16_t *)(img + soff + 2);
             int k = 0;
             while (k < len && name[k] && wlower16(name[k]) == wlower16(s[k]))
@@ -454,24 +464,25 @@ gp_t pe_find_resource(struct module *m, uint32_t type_id, const uint16_t *type_n
                       uint32_t name_id, const uint16_t *name_name, uint32_t *size)
 {
     uint32_t root = m->dir[DIR_RESOURCE][0];
-    if (!root || !m->dir[DIR_RESOURCE][1])
+    if (!root || !m->dir[DIR_RESOURCE][1] || root >= m->size)
         return 0;
+    /* the offsets in the directory are from its root, and must stay in the image */
     uint32_t t = res_lookup(m, root, type_id, type_name, 0);
-    if (!(t & 0x80000000u))
+    if (!(t & 0x80000000u) || (t & 0x7FFFFFFFu) >= m->size - root)
         return 0;
     uint32_t n = res_lookup(m, root + (t & 0x7FFFFFFFu), name_id, name_name, 0);
-    if (!(n & 0x80000000u))
+    if (!(n & 0x80000000u) || (n & 0x7FFFFFFFu) >= m->size - root)
         return 0;
     uint32_t l = res_lookup(m, root + (n & 0x7FFFFFFFu), 0, NULL, 1);
-    if (l & 0x80000000u)
+    if ((l & 0x80000000u) || l >= m->size - root || m->size - root - l < 16)
         return 0;
     uint32_t de = root + l;
-    if (de + 16 > m->size)
-        return 0;
     const uint8_t *img = GP(m->base);
     uint32_t data = rd32(img + de), dsize = rd32(img + de + 4);
     if (data >= m->size)
         return 0;
+    if (dsize > m->size - data)         /* no more than the image holds */
+        dsize = m->size - data;
     if (size)
         *size = dsize;
     return m->base + data;

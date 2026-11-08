@@ -21,34 +21,48 @@ double (sqrt)(double x)
     return r;
 }
 
+/* FSIN, FCOS and FPTAN leave |x| >= 2^63 as it is: bring it below 2pi first (FPREM1, as glibc's
+ * x87 versions did; a reduction by the 64-bit 2pi, so the result is in range but not exact). */
+static long double trig_arg(double x)
+{
+    long double r = x;
+    if (fabs(x) >= 9223372036854775808.0 && !isinf(x))
+        __asm__("1: fprem1\n\t"
+                "fnstsw %%ax\n\t"
+                "testw $0x400, %%ax\n\t"
+                "jnz 1b"
+                : "=t"(r) : "0"(r), "u"(6.28318530717958647692528676655900577L) : "ax", "cc");
+    return r;
+}
+
 double sin(double x)
 {
-    double r;
-    __asm__("fsin" : "=t"(r) : "0"(x));
-    return r;
+    long double r;
+    __asm__("fsin" : "=t"(r) : "0"(trig_arg(x)));
+    return (double)r;
 }
 
 double cos(double x)
 {
-    double r;
-    __asm__("fcos" : "=t"(r) : "0"(x));
-    return r;
+    long double r;
+    __asm__("fcos" : "=t"(r) : "0"(trig_arg(x)));
+    return (double)r;
 }
 
 /* Both at once (a GNU extension, which GCC calls for sin and cos of one value). */
 void sincos(double x, double *s, double *c)
 {
-    double sv, cv;
-    __asm__("fsincos" : "=t"(cv), "=u"(sv) : "0"(x));
-    *s = sv;
-    *c = cv;
+    long double sv, cv;
+    __asm__("fsincos" : "=t"(cv), "=u"(sv) : "0"(trig_arg(x)));
+    *s = (double)sv;
+    *c = (double)cv;
 }
 
 double tan(double x)
 {
-    double r;
-    __asm__("fptan\n\tfstp %%st(0)" : "=t"(r) : "0"(x));     /* FPTAN pushes 1.0 */
-    return r;
+    long double r;
+    __asm__("fptan\n\tfstp %%st(0)" : "=t"(r) : "0"(trig_arg(x)));     /* FPTAN pushes 1.0 */
+    return (double)r;
 }
 
 double atan2(double y, double x)
@@ -81,10 +95,10 @@ double (fabs)(double x)
 }
 
 /* FRNDINT in the given rounding mode. */
-static double round_mode(double x, unsigned short mode)
+static long double round_mode(long double x, unsigned short mode)
 {
     unsigned short cw, ncw;
-    double r;
+    long double r;
     __asm__ volatile("fnstcw %0" : "=m"(cw));
     ncw = (unsigned short)((cw & ~CW_ROUND_MASK) | mode);
     __asm__ volatile("fldcw %0" : : "m"(ncw));
@@ -93,13 +107,18 @@ static double round_mode(double x, unsigned short mode)
     return r;
 }
 
-double floor(double x) { return round_mode(x, CW_DOWN); }
-double ceil(double x) { return round_mode(x, CW_UP); }
-double trunc(double x) { return round_mode(x, CW_CHOP); }
+double floor(double x) { return (double)round_mode(x, CW_DOWN); }
+double ceil(double x) { return (double)round_mode(x, CW_UP); }
+double trunc(double x) { return (double)round_mode(x, CW_CHOP); }
 
+/* Halves away from zero. x - trunc(x) is exact, where x + 0.5 would round (0.49999999999999994,
+ * or odd numbers from 2^52 on). */
 double round(double x)
 {
-    return x < 0 ? -floor(0.5 - x) : floor(x + 0.5);
+    double t = trunc(x);
+    if (fabs(x - t) >= 0.5)
+        t += x < 0 ? -1.0 : 1.0;
+    return t;
 }
 
 double fmod(double x, double y)
@@ -114,57 +133,94 @@ double fmod(double x, double y)
     return r;
 }
 
+static long double log2_x87(long double x)
+{
+    long double r;
+    __asm__("fyl2x" : "=t"(r) : "0"(x), "u"(1.0L) : "st(1)");   /* 1 * log2(x) */
+    return r;
+}
+
 double log2(double x)
 {
-    double r;
-    __asm__("fyl2x" : "=t"(r) : "0"(x), "u"(1.0) : "st(1)");    /* 1 * log2(x) */
-    return r;
+    return (double)log2_x87(x);
 }
 
 double log(double x)
 {
-    return log2(x) * M_LN2;
+    return (double)(log2_x87(x) * 0.693147180559945309417232121458176568L);
 }
 
 double log10(double x)
 {
-    return log2(x) * 0.30102999566398119521;
+    return (double)(log2_x87(x) * 0.301029995663981195213738894724493027L);
 }
 
-double exp2(double x)
+/* 2^x in the x87's 64-bit precision. */
+static long double exp2_x87(long double x)
 {
     if (x != x)
         return x;
     if (x > 16384)
-        return HUGE_VAL;
+        return __builtin_infl();
     if (x < -16384)
         return 0;
-    double i = round_mode(x, CW_DOWN), f = x - i, r;   /* 0 <= f < 1 */
+    long double i = round_mode(x, CW_DOWN), f = x - i, r;      /* 0 <= f < 1 */
     __asm__("f2xm1" : "=t"(r) : "0"(f));
-    r += 1.0;
+    r += 1.0L;
     __asm__("fscale" : "=t"(r) : "0"(r), "u"(i));
     return r;
 }
 
-double exp(double x)
+double exp2(double x)
 {
-    return exp2(x * M_LOG2E);
+    return (double)exp2_x87(x);
 }
 
+double exp(double x)
+{
+    return (double)exp2_x87(x * 1.44269504088896340735992468100189214L);
+}
+
+/* C's special cases first. A whole exponent up to 2^16 is multiplied out in 64-bit precision, so
+ * exact powers come out exact (pow(10, 2) is 100, not 99.99999999999997); the rest is
+ * 2^(y log2 x) with log2 x kept to 64 bits. */
 double pow(double x, double y)
 {
-    if (y == 0)
+    if (y == 0 || x == 1)
         return 1;
+    if (x != x || y != y)
+        return x + y;
+    double ax = fabs(x);
+    if (isinf(y)) {
+        if (ax == 1)
+            return 1;
+        return (ax > 1) == (y > 0) ? HUGE_VAL : 0;
+    }
+    int whole = trunc(y) == y;
+    int odd = whole && fabs(y) < 9007199254740992.0 && fmod(y, 2.0) != 0;
     if (x == 0)
-        return y > 0 ? 0 : HUGE_VAL;
-    if (x > 0)
-        return exp2(y * log2(x));
-    /* A negative base needs a whole exponent. */
-    double iy = trunc(y);
-    if (iy != y)
-        return NAN;
-    double r = exp2(y * log2(-x));
-    return fmod(iy, 2.0) != 0 ? -r : r;
+        return y > 0 ? (odd ? x : 0) : (odd ? 1 / x : HUGE_VAL);
+    if (isinf(x)) {
+        double r = y > 0 ? HUGE_VAL : 0;
+        return x < 0 && odd ? -r : r;
+    }
+    if (x < 0 && !whole)
+        return NAN;                     /* a negative base needs a whole exponent */
+    long double r;
+    if (whole && fabs(y) <= 65536) {
+        long double b = ax;
+        unsigned n = (unsigned)fabs(y);
+        r = 1;
+        for (; n; n >>= 1, b *= b)
+            if (n & 1)
+                r *= b;
+        if (y < 0)
+            r = 1 / r;
+    } else {
+        r = exp2_x87(y * log2_x87(ax));
+    }
+    double d = (double)r;
+    return x < 0 && odd ? -d : d;
 }
 
 float (sqrtf)(float x) { return __builtin_sqrtf(x); }

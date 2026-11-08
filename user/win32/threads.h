@@ -18,6 +18,7 @@ int threads_active(void);
 int win_thread_exists(uint32_t tid);
 HANDLE win_thread_create(uint32_t size,gp_t entry,gp_t param,uint32_t flags,gp_t tid);
 HANDLE win_thread_create_native(uint32_t (*fn)(void *),void *arg);
+HANDLE win_thread_open_current(void);
 void win_thread_autoclose(HANDLE h);
 void win_thread_end_crt(void) __attribute__((noreturn));
 void win_thread_reap(void *thread);

@@ -210,5 +210,17 @@ if [ "$got" = "one
 got=$("$ours" -n -c 'echo RAN' 2>&1; echo "[$?]")
 if [ "$got" = "[0]" ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL: -n: $got"; fi
 
+# glob characters from unquoted expansions are a pattern (POSIX); quoted ones are not
+t "glob from var" 'x="d/*.c"; echo $x; echo "$x"'
+t "glob from subst" 'echo $(echo "d/*.h")'
+t "case pattern var" 'p="a*"; case abc in $p) echo match;; *) echo no;; esac; case abc in "$p") echo match;; *) echo no;; esac'
+t "glob var nomatch" 'x="nope/*.z"; echo $x'
+t "unset var keeps fn" 'foo=1; foo() { echo fn; }; unset foo; foo; echo "[${foo-unset}]"'
+te "unset fn" "127
+[0]" 'f() { echo fn; }; unset f; f 2>/dev/null; echo $?'      # no variable f: the function goes (as bash; dash keeps it)
+t "test bang operand" 'v="!"; [ "$v" = x ]; echo $?; v="("; [ "$v" = "(" ]; echo $?'
+t "long pipeline" "echo x$(i=0; while [ $i -lt 40 ]; do printf ' | cat'; i=$((i+1)); done) | sed s/x/LAST/"
+t "wait 40 jobs" 'i=0; while [ $i -lt 40 ]; do (sleep 0.1; echo d) & i=$((i+1)); done; (sleep 0.5; echo late) & wait; echo waited'
+
 echo "sh: $pass checks passed, $fail failed"
 [ $fail = 0 ]

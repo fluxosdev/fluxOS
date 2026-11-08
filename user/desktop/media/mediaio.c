@@ -37,7 +37,9 @@ static int interrupted(void *opaque)
 int media_input_open(struct media_input *in, const char *where, const char *const *headers, int nheaders,
                      char *err, size_t errsize)
 {
+    int abort = in->abort;              /* given up already (before this thread got here): stays so */
     memset(in, 0, sizeof(*in));
+    in->abort = abort;
     in->fmt = avformat_alloc_context();
     if (!in->fmt) {
         snprintf(err, errsize, "Out of memory.");
@@ -46,7 +48,8 @@ int media_input_open(struct media_input *in, const char *where, const char *cons
     in->fmt->interrupt_callback.callback = interrupted;
     in->fmt->interrupt_callback.opaque = in;
     if (media_is_url(where)) {
-        in->hio = httpio_open(where, headers, nheaders, err, errsize);
+        /* (in->hio is only set once this returns: until then in->abort is what stops the wait) */
+        in->hio = httpio_open_cancel(where, headers, nheaders, err, errsize, &in->abort);
         if (!in->hio) {
             avformat_free_context(in->fmt);
             in->fmt = NULL;
@@ -97,4 +100,5 @@ void media_input_close(struct media_input *in)
     }
     httpio_close(in->hio);
     in->hio = NULL;
+    in->abort = 0;                      /* the next open starts afresh */
 }

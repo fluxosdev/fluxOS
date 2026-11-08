@@ -12,8 +12,9 @@
  * 16-byte one with a high address word on everything newer.
  *
  * The interrupt handler passes received frames up; the timer tick looks
- * at the rings and the link as well, so a lost interrupt costs only
- * latency. Link changes (cable, speed, duplex) reprogram the MAC.
+ * at the rings as well, so a lost interrupt costs only latency. The link
+ * is the knetd thread's (net.c), every 2 s and after a link interrupt:
+ * changes (cable, speed, duplex) reprogram the MAC.
  */
 #include "kernel.h"
 #include "arch.h"
@@ -102,7 +103,7 @@
 #define LINKSPEED_10     1000
 #define LINKSPEED_100    100
 #define TXWM_DESC1       0x0200010
-#define TXWM_DESC23      0x0E08000      /* 10/100; 0x1E08000 is for gigabit */
+#define TXWM_DESC23      0x1E08000      /* 10/100 (Linux's NVREG_TX_WM_DESC2_3_DEFAULT); 0xFE08000 is for gigabit */
 #define TXPAUSE_OFF      0x0FFF0080
 #define MISC1_PAUSE_TX   0x01
 #define TXRXCTL_KICK     0x0001
@@ -221,7 +222,7 @@ static struct {
     uint32_t rx_next;                   /* free-running */
     uint32_t tx_next, tx_done;
     uint32_t linkspeed;
-    int duplex, link_up, polls;
+    int duplex, link_up;
     uint32_t power2;                    /* R_POWERSTATE2 with the PHY and MAC powered */
     int irq;
     struct mii_phy phy;
@@ -365,6 +366,8 @@ static void stop_tx(void)
 /*
  * Read the link from the PHY and set the MAC to match. Both engines stop
  * while the speed and duplex change. Down counts as 10 Mbit/s half duplex.
+ * Never in an interrupt (the PHY's bus is slow); the MAC is reprogrammed
+ * holding net_lock, as the transmit path kicks it.
  */
 static void update_link(int force)
 {
@@ -379,6 +382,7 @@ static void update_link(int force)
         else if (!force)
             klog("%s: link down\n", fd.dev.name);
     }
+    spin_lock(&net_lock);
     net_link_changed(up);
     fd.link_up = up;
     fd.linkspeed = ls;
@@ -403,6 +407,7 @@ static void update_link(int force)
         start_rx();
     if (restart_tx)
         start_tx();
+    spin_unlock(&net_lock);
 }
 
 /* ---- sending and receiving ---- */
@@ -488,7 +493,7 @@ static void fd_irq(struct trapframe *tf)
             uint32_t st = rd(R_MIISTATUS);
             wr(R_MIISTATUS, MIISTAT_MASK_ALL);
             if (st & MIISTAT_LINKCHANGE)
-                update_link(0);
+                net_link_poke();        /* knetd reads the PHY */
         }
         if (ev & NVI_RECOVER)
             netif.rx_errors++;
@@ -496,15 +501,17 @@ static void fd_irq(struct trapframe *tf)
     spin_unlock(&net_lock);
 }
 
-/* From the timer: anything the interrupt missed, and the link every 2 s. */
+/* From the timer: anything the interrupt missed. */
 static void fd_poll(void)
 {
     rx_process();
     tx_reclaim();
-    if (++fd.polls >= 20) {
-        fd.polls = 0;
-        update_link(0);
-    }
+}
+
+/* From knetd, without net_lock: the link, every 2 s and after a link interrupt. */
+static void fd_link_work(void)
+{
+    update_link(0);
 }
 
 /* ---- setup ---- */
@@ -763,6 +770,7 @@ int forcedeth_init(void)
     fd.dev.irq = irq >= 0 ? (uint32_t)irq : 0;
     fd.dev.transmit = fd_transmit;
     fd.dev.poll = fd_poll;
+    fd.dev.link_work = fd_link_work;
     fd.dev.suspend = fd_suspend;
     fd.dev.resume = fd_resume;
     fd.irq = irq;

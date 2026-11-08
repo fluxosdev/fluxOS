@@ -97,10 +97,56 @@ static gp_t guest_copy(const void *p, uint32_t size)
     return g;
 }
 
-/* Walk the handlers: 1 if one of them wants execution to continue, with ctx
- * updated; 0 if none took it. stack is where the handlers' frames may go (linear). */
-static int dispatch(struct exception_record *rec, struct context *ctx, uint32_t stack)
+/* Fields of the thread block the system keeps for itself: the top of the
+ * thread's spare stack for handlers, and how deep in faults it is. */
+#define TEB_HANDLER_STACK(t) ((t)->reserved1[0])
+#define TEB_FAULT_DEPTH(t) ((t)->reserved1[1])
+#define SPARE_STACK 0x10000u
+
+/* Where handlers may run (a linear address), given the program's stack
+ * pointer at the exception and a frame of the loader's that is still in
+ * use (frame). During an API call, and on fluxOS during a fault, the
+ * loader's own frames (the gate's, the API's, this dispatch's) lie on the
+ * program's stack below esp, so the handlers go below them too. When that
+ * leaves no room (a stack overflow), they get the thread's spare stack. */
+static uint32_t handler_stack(uint32_t esp, const void *frame)
 {
+    struct win_teb *t = teb;
+    gp_t lo = t->stack_limit, hi = t->stack_base, spare = TEB_HANDLER_STACK(t);
+    int on_spare = spare && esp <= spare && esp > spare - SPARE_STACK;
+    if (on_spare) {
+        lo = spare - SPARE_STACK;
+        hi = spare;
+    }
+    uint32_t s = (esp - 0x400) & ~15u;
+    uint32_t native = (uint32_t)(uintptr_t)frame - WIN_BASE;
+    if ((uintptr_t)frame >= WIN_BASE && native >= lo && native < hi && native - 0x400 < s)
+        s = (native - 0x400) & ~15u;
+    if (s < lo + 0x1000 || s > hi) {
+        if (!on_spare) {
+            if (!spare) {
+                gp_t g = vm_alloc(0, SPARE_STACK, PAGE_READWRITE, MEM_PRIVATE, 0);
+                if (g)
+                    TEB_HANDLER_STACK(t) = spare = g + SPARE_STACK;
+            }
+            if (spare)
+                s = spare - 0x40;
+        }
+        /* (on the spare stack already: as low as it goes; a fault there ends the program) */
+    }
+    return s + WIN_BASE;
+}
+
+void seh_reset_depth(void)
+{
+    TEB_FAULT_DEPTH(teb) = 0;
+}
+
+/* Walk the handlers: 1 if one of them wants execution to continue, with ctx
+ * updated; 0 if none took it. esp is the program's stack pointer at the exception. */
+__attribute__((noinline)) static int dispatch(struct exception_record *rec, struct context *ctx, uint32_t esp)
+{
+    uint32_t stack = handler_stack(esp, __builtin_frame_address(0));
     gp_t grec = guest_copy(rec, sizeof(*rec)), gctx = guest_copy(ctx, sizeof(*ctx));
     if (!grec || !gctx)
         return 0;
@@ -162,21 +208,18 @@ void seh_fault(uint32_t code, gp_t fault_addr, int write, const struct guest_reg
     }
     struct context ctx;
     regs_to_context(regs, &ctx);
-    static int depth;
-    if (depth++ > 2)
+    /* faults within handlers: per thread; an unwind (seh_unwind) ends the dispatch too */
+    if (TEB_FAULT_DEPTH(teb)++ > 2)
         terminate(&rec);
     if (api_trace) {
         char msg[256];
         describe(&rec, msg, sizeof(msg));
         wlog("fault: %s", msg);
     }
-    uint32_t stack = (regs->esp - 0x400) & ~15u;
-    if (stack < teb->stack_limit + 0x1000 || stack > GUEST_TOP)
-        stack = teb->stack_base - 0x400;
-    if (dispatch(&rec, &ctx, stack + WIN_BASE)) {
+    if (dispatch(&rec, &ctx, regs->esp)) {
         struct guest_regs r;
         context_to_regs(&ctx, &r);
-        depth--;
+        TEB_FAULT_DEPTH(teb)--;
         guest_resume(&r);
     }
     terminate(&rec);
@@ -184,10 +227,7 @@ void seh_fault(uint32_t code, gp_t fault_addr, int write, const struct guest_reg
 
 void seh_raise(struct exception_record *rec, struct context *ctx)
 {
-    uint32_t stack = (ctx->esp - 0x400) & ~15u;
-    if (stack < teb->stack_limit + 0x1000 || stack > GUEST_TOP)
-        stack = teb->stack_base - 0x400;
-    if (dispatch(rec, ctx, stack + WIN_BASE)) {
+    if (dispatch(rec, ctx, ctx->esp)) {
         struct guest_regs r;
         context_to_regs(ctx, &r);
         guest_resume(&r);
@@ -213,7 +253,7 @@ void seh_unwind(gp_t target_frame, gp_t target_ip, struct exception_record *rec,
     if (!target_frame)
         rec->flags |= EXCEPTION_EXIT_UNWIND;
     gp_t grec = guest_copy(rec, sizeof(*rec)), gctx = guest_copy(ctx, sizeof(*ctx));
-    uint32_t stack = ((ctx->esp - 0x400) & ~15u) + WIN_BASE;
+    uint32_t stack = handler_stack(ctx->esp, __builtin_frame_address(0));
     int depth = 0;
     while (teb->except_list != 0xFFFFFFFFu && teb->except_list && depth++ < 64) {
         gp_t reg = teb->except_list;
@@ -233,6 +273,7 @@ void seh_unwind(gp_t target_frame, gp_t target_ip, struct exception_record *rec,
             call_guest_on(handler, 4, args, stack);
     }
     teb->except_list = target_frame ? target_frame : 0xFFFFFFFFu;
+    seh_reset_depth();                  /* the exception has been dealt with */
     if (target_ip) {
         struct guest_regs r;
         context_to_regs(ctx, &r);

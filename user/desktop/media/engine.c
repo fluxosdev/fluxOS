@@ -852,11 +852,14 @@ static void *src_main(void *arg)
 
 /* ---- SourceBuffers ---- */
 
-static void intersect(int64_t *a, int *na, const int64_t *b, int nb)
+/* a (*na spans, room for cap) becomes its intersection with b: up to *na + nb - 1 spans */
+static void intersect(int64_t *a, int *na, const int64_t *b, int nb, int cap)
 {
     int64_t out[64];
     int n = 0;
-    for (int i = 0, j = 0; i < *na && j < nb && n < 32;) {
+    if (cap > 32)
+        cap = 32;
+    for (int i = 0, j = 0; i < *na && j < nb && n < cap;) {
         int64_t s = a[2 * i] > b[2 * j] ? a[2 * i] : b[2 * j];
         int64_t e = a[2 * i + 1] < b[2 * j + 1] ? a[2 * i + 1] : b[2 * j + 1];
         if (s < e) {
@@ -884,7 +887,7 @@ static void sb_answer(struct sbuf *sb, int seq)
     if (sb->feeds_a) {
         int m = store_ranges(&p->as, TOL, o, 32);
         if (sb->feeds_v)
-            intersect(r, &n, o, m);
+            intersect(r, &n, o, m, 32);
         else {
             memcpy(r, o, sizeof(int64_t) * 2 * (size_t)m);
             n = m;
@@ -1168,13 +1171,41 @@ static void group_compact(struct group *g)
     }
 }
 
+/* Text from a command line that is used as a name, an address or a header: no control characters
+ * (a line break in it would be another command). */
+static int clean_text(const char *s)
+{
+    for (; *s; s++)
+        if ((unsigned char)*s < 0x20 || *s == 0x7F)
+            return 0;
+    return 1;
+}
+
+/* What Wave appends is in a file it made with mkstemp("/tmp/wave-mse-XXXXXX") for the engine to
+ * read and delete: only such a name, a plain file of this user's, is opened (and then deleted). */
+static int mse_file(const char *path)
+{
+    static const char prefix[] = "/tmp/wave-mse-";
+    size_t n = sizeof(prefix) - 1;
+    if (strncmp(path, prefix, n) || strlen(path + n) != 6)
+        return 0;
+    for (const char *c = path + n; *c; c++)
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9')))
+            return 0;
+    struct stat st;
+    return lstat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == (uint32_t)getuid();
+}
+
 static unsigned char *read_whole(const char *path, size_t *len)
 {
-    int fd = open(path, O_RDONLY);
+    *len = 0;
+    if (!mse_file(path))
+        return NULL;                    /* not a file of Wave's: neither read nor deleted */
+    int fd = open(path, O_RDONLY | O_NOFOLLOW);
     struct stat st;
     unsigned char *d = NULL;
-    *len = 0;
-    if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size >= 0 && (d = malloc((size_t)st.st_size + 1))) {
+    if (fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
+        (d = malloc((size_t)st.st_size + 1))) {
         while (*len < (size_t)st.st_size) {
             int r = (int)read(fd, d + *len, (size_t)st.st_size - *len);
             if (r <= 0)
@@ -1408,6 +1439,8 @@ static int ext_command(char *line)
     const char *rest = n ? line + n : "";
     if (op[0] != 'v' && strncmp(op, "sb", 2) && strncmp(op, "mse", 3))
         return 0;
+    if (!clean_text(rest))
+        return 1;                       /* a name or address with control characters: ignored */
     if (!strcmp(op, "vopen") || !strcmp(op, "vmse")) {
         struct player *keep = find_player(id);
         char *hdr[MAX_HDR];
@@ -1628,7 +1661,7 @@ static void ext_tick(void)
             if (p->has_a) {
                 int no = store_ranges(&p->as, TOL, o, 8);
                 if (p->has_v)
-                    intersect(r, &nr, o, no);
+                    intersect(r, &nr, o, no, 8);
                 else {
                     memcpy(r, o, sizeof(int64_t) * 2 * (size_t)no);
                     nr = no;

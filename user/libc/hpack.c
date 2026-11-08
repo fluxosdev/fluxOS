@@ -331,27 +331,31 @@ static int put_int(uint8_t *out, size_t cap, size_t *len, uint8_t first, int bit
     }
 }
 
-static int put_string(uint8_t *out, size_t cap, size_t *len, const char *s)
+static int put_string(uint8_t *out, size_t cap, size_t *len, const char *s, size_t n)
 {
-    size_t n = strlen(s);
-    if (put_int(out, cap, len, 0, 7, n) < 0 || *len + n > cap)
+    if (put_int(out, cap, len, 0, 7, n) < 0 || n > cap - *len)
         return -1;
     memcpy(out + *len, s, n);
     *len += n;
     return 0;
 }
 
-int hpack_encode(uint8_t *out, size_t cap, size_t *len, const char *name, const char *value)
+int hpack_encode_len(uint8_t *out, size_t cap, size_t *len, const char *name, const char *value, size_t vlen)
 {
     size_t at = *len;
     int idx = 0;
     for (int i = 0; i < 61 && !idx; i++)
         if (!strcmp(static_table[i].name, name))
             idx = i + 1;
-    if (put_int(out, cap, len, 0, 4, (size_t)idx) < 0 || (!idx && put_string(out, cap, len, name) < 0) ||
-        put_string(out, cap, len, value) < 0) {
+    if (put_int(out, cap, len, 0, 4, (size_t)idx) < 0 || (!idx && put_string(out, cap, len, name, strlen(name)) < 0) ||
+        put_string(out, cap, len, value, vlen) < 0) {
         *len = at;
         return -1;
     }
     return 0;
+}
+
+int hpack_encode(uint8_t *out, size_t cap, size_t *len, const char *name, const char *value)
+{
+    return hpack_encode_len(out, cap, len, name, value, strlen(value));
 }

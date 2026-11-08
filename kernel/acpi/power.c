@@ -78,6 +78,11 @@ static volatile uint32_t resumed_at;    /* ticks; buttons just after are the wak
 static volatile int bl_restore;         /* back from S3: the backlight level again */
 static int pwr_chan;
 static struct mutex backlight_mutex = MUTEX_INIT("backlight");
+/* Held by kpwrd while it works (AML, the EC), and by a suspend (power_quiesce)
+ * so that none of that runs while the devices go down. Before sleep.c's
+ * sleep_mutex and the VFS lock, which kpwrd takes inside it. */
+static struct mutex work_mutex = MUTEX_INIT("kpwrd");
+static struct proc *kpwrd_thread;
 
 static void kick(void)
 {
@@ -724,86 +729,118 @@ static void check_lid(int report)
         acpi_suspend();
 }
 
+static uint32_t seen_power, seen_sleep;
+static uint32_t last_status, last_thermal, last_lid, last_ec;
+static int asked;                       /* the desktop was told of the power button */
+
+/* What kpwrd does each time it wakes, holding work_mutex. */
+static void kpwrd_work(void)
+{
+    if ((power_presses != seen_power || sleep_presses != seen_sleep) &&
+        (int32_t)(ticks - resumed_at) < 2 * HZ && resumed_at) {
+        seen_power = power_presses;         /* the press that woke us */
+        seen_sleep = sleep_presses;
+    }
+    if (power_presses != seen_power) {
+        seen_power = power_presses;
+        if (input_grabbed() && !asked) {
+            key(KEY_POWER);
+            asked = 1;
+        } else {
+            switch_off("power button");
+            asked = 0;
+        }
+    }
+    if (sleep_presses != seen_sleep) {
+        seen_sleep = sleep_presses;
+        if (input_grabbed())
+            key(KEY_SLEEP);
+        else
+            acpi_suspend();
+    }
+    if (!acpi_aml)
+        return;
+    if (bl_restore) {
+        /* The firmware need not bring the panel's backlight back at
+         * the level it had (Linux's acpi_video sets it again too). */
+        bl_restore = 0;
+        if (pw.backlight && pw.nlevels) {
+            mutex_lock(&backlight_mutex);
+            set_level(pw.level);
+            mutex_unlock(&backlight_mutex);
+        }
+    }
+    if (bright_note) {
+        int note = bright_note;
+        bright_note = 0;
+        if (pw.backlight)
+            brightness_key(note);
+    }
+    if (lid_dirty || (int32_t)(ticks - last_lid) >= 2 * HZ) {
+        lid_dirty = 0;
+        last_lid = ticks;
+        check_lid(1);
+    }
+    if (status_dirty || (int32_t)(ticks - last_status) >= 15 * HZ) {
+        int told = status_dirty;
+        status_dirty = 0;
+        last_status = ticks;
+        refresh_status();
+        if (told)
+            event(PEV_STATUS, 0);
+    }
+    if (thermal_dirty || (int32_t)(ticks - last_thermal) >= 10 * HZ) {
+        thermal_dirty = 0;
+        last_thermal = ticks;
+        check_thermal();
+    }
+    if ((int32_t)(ticks - last_ec) >= 2 * HZ) {
+        last_ec = ticks;
+        ec_poll();
+    }
+}
+
 static void kpwrd(void)
 {
-    uint32_t seen_power = 0, seen_sleep = 0;
-    uint32_t last_status = 0, last_thermal = 0, last_lid = 0, last_ec = 0;
-    int asked = 0;                      /* the desktop was told of the power button */
+    kpwrd_thread = current;
+    mutex_lock(&work_mutex);
     if (acpi_aml) {
         check_lid(0);
         refresh_status();
         check_thermal();
     }
+    mutex_unlock(&work_mutex);
     for (;;) {
         wait_event_timeout(&pwr_chan,
                            power_presses != seen_power || sleep_presses != seen_sleep || status_dirty ||
                            lid_dirty || bright_note || thermal_dirty,
                            ticks + HZ);
         current->sig_pending = 0;
-
-        if ((power_presses != seen_power || sleep_presses != seen_sleep) &&
-            (int32_t)(ticks - resumed_at) < 2 * HZ && resumed_at) {
-            seen_power = power_presses;         /* the press that woke us */
-            seen_sleep = sleep_presses;
-        }
-        if (power_presses != seen_power) {
-            seen_power = power_presses;
-            if (input_grabbed() && !asked) {
-                key(KEY_POWER);
-                asked = 1;
-            } else {
-                switch_off("power button");
-                asked = 0;
-            }
-        }
-        if (sleep_presses != seen_sleep) {
-            seen_sleep = sleep_presses;
-            if (input_grabbed())
-                key(KEY_SLEEP);
-            else
-                acpi_suspend();
-        }
-        if (!acpi_aml)
-            continue;
-        if (bl_restore) {
-            /* The firmware need not bring the panel's backlight back at
-             * the level it had (Linux's acpi_video sets it again too). */
-            bl_restore = 0;
-            if (pw.backlight && pw.nlevels) {
-                mutex_lock(&backlight_mutex);
-                set_level(pw.level);
-                mutex_unlock(&backlight_mutex);
-            }
-        }
-        if (bright_note) {
-            int note = bright_note;
-            bright_note = 0;
-            if (pw.backlight)
-                brightness_key(note);
-        }
-        if (lid_dirty || (int32_t)(ticks - last_lid) >= 2 * HZ) {
-            lid_dirty = 0;
-            last_lid = ticks;
-            check_lid(1);
-        }
-        if (status_dirty || (int32_t)(ticks - last_status) >= 15 * HZ) {
-            int told = status_dirty;
-            status_dirty = 0;
-            last_status = ticks;
-            refresh_status();
-            if (told)
-                event(PEV_STATUS, 0);
-        }
-        if (thermal_dirty || (int32_t)(ticks - last_thermal) >= 10 * HZ) {
-            thermal_dirty = 0;
-            last_thermal = ticks;
-            check_thermal();
-        }
-        if ((int32_t)(ticks - last_ec) >= 2 * HZ) {
-            last_ec = ticks;
-            ec_poll();
-        }
+        mutex_lock(&work_mutex);
+        kpwrd_work();
+        mutex_unlock(&work_mutex);
     }
+}
+
+/*
+ * Suspend to RAM is starting (sleep.c): no AML from kpwrd or a brightness
+ * call until power_unquiesce(), so that none is half done on another
+ * processor when it is parked, nor touches the EC as the devices go
+ * down. kpwrd itself may be the one suspending (the lid, the sleep
+ * button): it holds work_mutex already.
+ */
+void power_quiesce(void)
+{
+    if (current != kpwrd_thread)
+        mutex_lock(&work_mutex);
+    mutex_lock(&backlight_mutex);
+}
+
+void power_unquiesce(void)
+{
+    mutex_unlock(&backlight_mutex);
+    if (current != kpwrd_thread)
+        mutex_unlock(&work_mutex);
 }
 
 /* After the GPEs are set up (which leaves wake GPEs off): the wake GPEs
