@@ -1,0 +1,27 @@
+test('callable proxy apply',function(){var p=new Proxy(function(a){return this.x+a;},{apply:function(t,s,a){return t.apply(s,a)*2;}});return [typeof p,p.call({x:4},3)];},['function',14]);
+test('callable proxy fallback',function(){var p=new Proxy(function(x){return x+1;},{});return p(3);},4);
+test('proxy constructor',function(){function F(x){this.x=x;}var P=new Proxy(F,{construct:function(t,a,n){return {x:a[0]+5};}}),refused=false;try{new (new Proxy(Math.max,{construct:function(){return {};}}))();}catch(e){refused=true;}return [new P(3).x,refused];},[8,true]);
+test('transfer views',function(){var b=new ArrayBuffer(4),a=new Uint8Array(b);a[1]=9;var c=structuredClone({b:b,a:a},{transfer:[b]});return [a.length,a[1],b.byteLength,c.a[1],c.a.buffer===c.b];},[0,undefined,0,9,true]);
+test('transfer validation atomic',function(){var b=new ArrayBuffer(2);try{structuredClone({bad:function(){}},{transfer:[b]});}catch(e){var err=structuredClone(new RangeError('range')),file=structuredClone(new File(['x'],'x.txt',{lastModified:7}));return [b.byteLength,err instanceof RangeError,err.message,file instanceof File,file.name,file.lastModified];}},[2,true,'range',true,'x.txt',7]);
+var result=[];
+var bytes=new ReadableStream({type:'bytes',start:function(c){c.enqueue(new Uint8Array([1,2,3]));c.close();}});
+var reader=bytes.getReader({mode:'byob'}),v=new Uint8Array(2);
+reader.read(v).then(function(r){result.push(Array.from(r.value));return reader.read(new Uint8Array(2));}).then(function(r){result.push(Array.from(r.value));return reader.read(new Uint8Array(2));}).then(function(r){result.push(r.done);});
+setTimeout(function(){test('BYOB byte queue',function(){return [result,v.byteLength];},[[[1,2],[3],true],0]);},0);
+var direct=[];
+var byob=new ReadableStream({type:'bytes',pull:function(c){var q=c.byobRequest;q.view[0]=7;q.respond(1);c.close();}}).getReader({mode:'byob'});
+byob.read(new Uint8Array(4)).then(function(r){direct=Array.from(r.value);});
+setTimeout(function(){test('BYOB source response',function(){return direct;},[7]);},0);
+test('shared clone retains memory',function(){var b=new SharedArrayBuffer(8),a=new Int32Array(b);a[0]=3;var c=structuredClone(b);new Int32Array(c)[0]=9;return [a[0],b===c,c instanceof SharedArrayBuffer];},[9,false,true]);
+test('atomic integer operations',function(){var a=new Int32Array(new SharedArrayBuffer(8));Atomics.store(a,0,5);var x=Atomics.add(a,0,3),y=Atomics.compareExchange(a,0,8,-4);return [x,y,Atomics.load(a,0),Atomics.exchange(a,0,10),Atomics.sub(a,0,2),a[0]];},[5,8,-4,-4,10,8]);
+test('shared slice is independent',function(){var a=new Uint8Array(new SharedArrayBuffer(3));a[1]=7;var s=a.buffer.slice(1);new Uint8Array(s)[0]=9;return [s instanceof SharedArrayBuffer,a[1],s.byteLength];},[true,7,2]);
+test('shared buffers cannot transfer',function(){var b=new SharedArrayBuffer(4);try{structuredClone(b,{transfer:[b]});return false;}catch(e){return [e.name,b.byteLength];}},['DataCloneError',4]);
+test('atomic BigInt lanes',function(){var a=new BigInt64Array(new SharedArrayBuffer(8));Atomics.store(a,0,12n);return [String(Atomics.add(a,0,3n)),String(a[0])];},['12','15']);
+test('byte streams reject incompatible strategies',function(){try{new ReadableStream({type:'bytes'},{size:function(){return 1;}});return false;}catch(e){return e.name;}},'RangeError');
+test('duplicate transfer leaves buffer attached',function(){var b=new ArrayBuffer(2);try{structuredClone(b,{transfer:[b,b]});}catch(e){return b.byteLength;}},2);
+
+test('direct eval reads and updates lexical locals',function(){var x=3;function run(a){let local=4;eval('local += a');return [local,eval('local'),eval('a')];}return run(x);},[7,7,3]);
+test('indirect eval keeps global scope',function(){globalThis.evalGlobal=9;var evalGlobal=2,alias=eval;return alias('globalThis.evalGlobal');},9);
+test('direct eval preserves const bindings',function(){const k=7;try{eval('k=8');return false;}catch(e){return k;}},7);
+test('direct eval preserves loop closures',function(){var a=[];for(let k=0;k<3;k++){eval('k');a.push(function(){return k;});}return a.map(function(f){return f();});},[0,1,2]);
+test('MessagePort transfer detaches its source',function(){var c=new MessageChannel(),b=new ArrayBuffer(3);c.port1.postMessage(b,[b]);return b.byteLength;},0);

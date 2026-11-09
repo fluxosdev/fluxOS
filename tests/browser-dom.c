@@ -1,0 +1,120 @@
+/* Host runner: links the actual browser parser, DOM and JS interpreter. */
+#include <flux.h>
+#include <malloc.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "jsdom.h"
+
+static unsigned int host_time;
+unsigned int uptime_ms(void)
+{
+    return host_time;
+}
+int wfont_height(const struct wfont *f) { (void)f; return 16; }
+const struct wfont *wfont_get(int family, int bold, int italic, int px)
+{ (void)family; (void)bold; (void)italic; (void)px; return NULL; }
+int meminfo(struct meminfo *info) { (void)info; return -1; }
+static int errors;
+static void changed(void *ctx) { (void)ctx; }
+static void status(void *ctx, const char *message)
+{
+    (void)ctx;
+    fprintf(stderr, "%s\n", message);
+    errors++;
+}
+
+/* View transitions: pictures are always taken (types "fail" and "dup" ask for the errors), and the
+ * animation ends once the page has nothing left to do. */
+static int vt_state;                    /* 0 none, 1 captured, 2 animating */
+static int view_transition(void *ctx, int op, const char *types)
+{
+    (void)ctx;
+    if (op == VT_CAPTURE) {
+        if (strstr(types, "fail"))
+            return 0;
+        if (strstr(types, "dup"))
+            return -1;
+        vt_state = 1;
+        return 1;
+    }
+    if (op == VT_BEGIN) {
+        if (vt_state != 1)
+            return 0;
+        vt_state = 2;
+        return 1;
+    }
+    vt_state = 0;
+    return 0;
+}
+
+/* The media engine, as far as Media Source Extensions' tests need it: SourceBuffers get ids, and
+ * the tests play the engine's answers themselves (%mediaMsg). */
+static int next_sb = 100, mse_bytes;
+static int media_cmd(void *ctx, struct node *n, const char *op, const char *str, const void *bytes, int len,
+                     double a, double b)
+{
+    (void)ctx, (void)n, (void)str, (void)bytes, (void)a, (void)b;
+    if (!strcmp(op, "sbadd"))
+        return ++next_sb;
+    if (!strcmp(op, "sbappend"))
+        mse_bytes += len;
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    /* The engine uses a 32-bit page directory. A non-PIE Linux binary
+     * with mmap allocation disabled keeps its heap below 4 GiB. */
+    mallopt(M_MMAP_MAX, 0);
+    if (argc != 3)
+        return 2;
+    FILE *f = fopen(argv[1], "rb");
+    if (!f)
+        return 2;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    rewind(f);
+    char *src = calloc((size_t)size + 1, 1);
+    if (!src || fread(src, 1, (size_t)size, f) != (size_t)size)
+        return 2;
+    fclose(f);
+    struct arena arena = { 0 };
+    const char *html = "<!doctype html><html><head></head><body></body></html>";
+    struct jshost host = { .arena = &arena, .root = html_parse(&arena, html, (int)strlen(html)),
+                           .url = "file:///tests.html", .base = "file:///tests.html",
+                           .status = status, .changed = changed, .view_transition = view_transition,
+                           .media_cmd = media_cmd };
+    struct jsdom *dom = jsdom_new(&host);
+    if (!dom)
+        return 2;
+    const char *prelude =
+        "var count = 0; function group(n) {}"
+        "function test(n, f, expected) {"
+        " var result = f();"
+        " if (JSON.stringify(result) !== JSON.stringify(expected))"
+        "   throw new Error(n + ': ' + JSON.stringify(result));"
+        " count++; }";
+    jsdom_run_script(dom, NULL, prelude, (int)strlen(prelude), "test harness");
+    jsdom_run_script(dom, NULL, src, (int)size, argv[1]);
+    int expected = atoi(argv[2]);
+    if (expected <= 0)
+        return 2;
+    char end[128];
+    for (int i = 0; i < 400 && jsdom_next_timer(dom) == 0; i++)
+        jsdom_run_timers(dom);          /* what the tests queued: posted messages, timers due now */
+    for (int round = 0; round < 16 && vt_state == 2; round++) {
+        vt_state = 0;                   /* the animation the page started has run */
+        jsdom_view_transition_done(dom);
+        for (int i = 0; i < 400 && jsdom_next_timer(dom) == 0; i++)
+            jsdom_run_timers(dom);
+    }
+    snprintf(end, sizeof(end), "if (count !== %d) throw new Error('Incomplete test run: ' + count);", expected);
+    jsdom_run_script(dom, NULL, end, (int)strlen(end), "test count");
+    jsdom_free(dom);
+    arena_free(&arena);
+    free(src);
+    if (!errors)
+        printf("%d browser DOM regressions passed (%s)\n", expected, argv[1]);
+    return errors ? 1 : 0;
+}

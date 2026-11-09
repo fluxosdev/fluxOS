@@ -1,0 +1,48 @@
+--- a/config.sub
++++ b/config.sub
+@@ -1766,7 +1766,7 @@
+ 	     | onefs* | tirtos* | phoenix* | fuchsia* | redox* | bme* \
+ 	     | midnightbsd* | amdhsa* | unleashed* | emscripten* | wasi* \
+ 	     | nsk* | powerunix* | genode* | zvmoe* | qnx* | emx* | zephyr* \
+-	     | fiwix* | mlibc* | cos* | mbr* )
++	     | fiwix* | mlibc* | cos* | mbr* | fluxos* )
+ 		;;
+ 	# This one is extra strict with allowed versions
+ 	sco3.2v2 | sco3.2v[4-9]* | sco5v6*)
+--- a/bfd/config.bfd
++++ b/bfd/config.bfd
+@@ -591,6 +591,11 @@
+     targ_defvec=i386_elf32_vec
+     targ_selvecs="iamcu_elf32_vec i386_coff_vec"
+     ;;
++  i[3-7]86-*-fluxos*)
++    targ_defvec=i386_elf32_vec
++    targ_selvecs=
++    targ64_selvecs=x86_64_elf64_vec
++    ;;
+   i[3-7]86-*-solaris2*)
+     targ_defvec=i386_elf32_sol2_vec
+     targ_selvecs="iamcu_elf32_vec i386_coff_vec i386_pei_vec"
+--- a/gas/configure.tgt
++++ b/gas/configure.tgt
+@@ -229,6 +229,7 @@
+   i386-*-beos*)				fmt=elf ;;
+   i386-*-elfiamcu)			fmt=elf arch=iamcu ;;
+   i386-*-elf*)				fmt=elf ;;
++  i386-*-fluxos*)			fmt=elf em=linux ;;
+   i386-*-fuchsia*)			fmt=elf ;;
+   i386-*-haiku*)			fmt=elf em=haiku ;;
+   i386-*-genode*)			fmt=elf ;;
+--- a/ld/configure.tgt
++++ b/ld/configure.tgt
+@@ -402,6 +402,10 @@
+ i[3-7]86-*-elfiamcu)	targ_emul=elf_iamcu
+ 			targ_extra_emuls=elf_i386
+ 			;;
++i[3-7]86-*-fluxos*)	targ_emul=elf_i386
++			targ_extra_emuls=
++			targ64_extra_emuls="elf_x86_64"
++			;;
+ i[3-7]86-*-elf* | i[3-7]86-*-rtems* | i[3-7]86-*-genode*)
+ 			targ_emul=elf_i386
+ 			targ_extra_emuls=elf_iamcu

@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Browser test page</title>
+<style>
+body { font-family: Georgia, serif; max-width: 720px; margin: 16px auto; padding: 0 12px; line-height: 1.4; }
+h1 { font-family: sans-serif; color: #3f175f; border-bottom: 3px double #3f175f; }
+h2 { font-family: sans-serif; font-size: 18px; margin-top: 28px; }
+.box { border: 2px solid #4a8; background: #eefaf3; padding: 8px 12px; margin: 10px 0; }
+.warn { border-left: 6px solid #e33; background: #fff0f0; padding: 6px 10px; }
+.chips span { display: inline-block; padding: 2px 10px; margin: 2px; border-radius: 10px;
+  background: #3f175f; color: white; font: bold 12px sans-serif; }
+.cols { display: flex; }
+.cols > div { box-sizing: border-box; width: 32%; padding: 8px; border: 1px dashed #999; margin: 2px; }
+table.data { border-collapse: collapse; width: 100%; font-family: sans-serif; font-size: 14px; }
+table.data th { background: #3f175f; color: white; text-align: left; padding: 4px 8px; }
+table.data td { border-bottom: 1px solid #ccc; padding: 4px 8px; }
+table.data tr:nth-child(even) td { background: #f4f0f8; }
+.num { text-align: right; font-family: monospace; }
+blockquote { border-left: 3px solid #bbb; margin-left: 10px; padding-left: 12px; color: #555; font-style: italic; }
+q { color: #750; }
+code { background: #eee; padding: 0 3px; }
+.right { text-align: right; } .center { text-align: center; }
+.big { font-size: 32px; } .small { font-size: 11px; } .caps { text-transform: uppercase; letter-spacing: 1px; }
+:root { --accent: #f08020; }
+.var { color: var(--accent); font-weight: bold; }
+.crumbs li { display: inline; } .crumbs li + li::before { content: " \203A  "; color: #888; }
+</style>
+</head>
+<body>
+<h1>fluxOS browser test page</h1>
+<p>This page exercises the HTML parser, the CSS cascade and the layout engine.
+It has <b>bold</b>, <i>italic</i>, <u>underlined</u>, <s>struck</s>, <code>code</code>,
+<small>small</small>, <big>big</big>, H<sub>2</sub>O and E=mc<sup>2</sup> text, and
+entities: &copy; &reg; &trade; &euro; &pound; &yen; &laquo;&raquo; &ldquo;quotes&rdquo; &mdash; &hellip;
+caf&eacute; na&iuml;ve &Uuml;ber stra&szlig;e.</p>
+
+<ul class="crumbs"><li>Home</li><li>Tests</li><li>Generated content</li></ul>
+
+<h2>Boxes and colors</h2>
+<div class="box">A box with a 2px solid border, padding and a background color.</div>
+<div class="warn">A warning with a thick left border. <span class="var">This text uses var(--accent).</span></div>
+<p class="chips"><span>inline-block</span><span>chips</span><span>with padding</span></p>
+
+<h2>Text alignment and sizes</h2>
+<p class="center">Centered text.</p>
+<p class="right">Right-aligned text.</p>
+<p><span class="big">Big</span> and <span class="small">small</span> and <span class="caps">upper case by CSS</span>.</p>
+<blockquote>A blockquote, styled with a left border. <q>Quotes come from ::before and ::after.</q></blockquote>
+
+<h2>Lists</h2>
+<ol><li>First</li><li>Second<ul><li>nested disc</li><li>another<ul><li>square</li></ul></li></ul></li><li>Third</li></ol>
+<ol type="I" start="4"><li>Roman four</li><li>Roman five</li></ol>
+<dl><dt>Term</dt><dd>Its definition, indented.</dd></dl>
+
+<h2>A table</h2>
+<table class="data">
+<tr><th>Protocol</th><th>Layer</th><th class="num">Header bytes</th></tr>
+<tr><td>Ethernet</td><td>Link</td><td class="num">14</td></tr>
+<tr><td>IPv4</td><td>Network</td><td class="num">20</td></tr>
+<tr><td>TCP</td><td>Transport</td><td class="num">20</td></tr>
+<tr><td>UDP</td><td>Transport</td><td class="num">8</td></tr>
+<tr><td colspan="2">ICMP echo (two columns wide)</td><td class="num">8</td></tr>
+</table>
+
+<h2>An old-style table</h2>
+<table border="1" cellpadding="6" cellspacing="0" width="70%" align="center" bgcolor="#ffffcc">
+<tr><td rowspan="2" bgcolor="#ccccff" valign="top">Spans two rows</td><td>Top right</td></tr>
+<tr><td align="center"><font color="red" size="+1">Font tag</font></td></tr>
+</table>
+
+<h2>Columns with flexbox</h2>
+<div class="cols"><div>One third.</div><div>Another third, with a bit more text in it so it wraps.</div><div>The last.</div></div>
+
+<h2>Preformatted</h2>
+<pre>
+int main(void)
+{
+    printf("hello, world\n");   /* spaces kept */
+}
+</pre>
+
+<h2>A form</h2>
+<form action="http://wiby.me/" method="get">
+<p>Search: <input name="q" value="fluxOS" size="20"> <input type="submit" value="Go">
+<input type="checkbox" checked> Checkbox <input type="radio" name="r" checked> Radio
+<select name="s"><option>Option one</option><option>Option two</option></select></p>
+<textarea rows="3" cols="40">A text area,
+over two lines.</textarea>
+<p><button type="submit">A button element</button> <input type="reset"></p>
+</form>
+
+<h2>Images</h2>
+<p><img src="/usr/share/icons/oxygen/48x48/internet-web-browser.png" alt="globe"> A PNG next to text,
+and one that is missing: <img src="missing.png" alt="[missing image]">.</p>
+
+<hr>
+<p class="small">The end. <a href="#">Back to the top</a> &middot; <a href="home.html">Home</a></p>
+</body>
+</html>

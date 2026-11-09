@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Modern CSS test page</title>
+<style>
+:root { --accent: #3f175f; --gap: 10px; --card: #f4effa; }
+body { font-family: sans-serif; max-width: 760px; margin: 16px auto; padding: 0 12px; line-height: 1.4; }
+h1 { color: var(--accent); border-bottom: 3px double var(--accent); }
+h2 { font-size: 17px; color: var(--accent); margin: 22px 0 4px; }
+p.expect { margin: 0 0 8px; font-size: 13px; color: #555; }
+.box { background: var(--card); border: 1px solid #c9b8dd; padding: 6px 8px; }
+
+/* flexbox */
+.nav { display: flex; align-items: center; gap: 12px; background: var(--accent); padding: 8px 12px; }
+.nav a { color: white; text-decoration: none; }
+.nav .logo { font-weight: bold; color: #ffd76a; }
+.nav .push { margin-left: auto; }
+.grow { display: flex; gap: var(--gap); }
+.grow > div { flex: 1; }
+.grow > .two { flex: 2; }
+.grow > .fixed { flex: 0 0 120px; }
+.justify { display: flex; justify-content: space-between; margin-bottom: 4px; }
+.justify.center { justify-content: center; gap: 8px; }
+.justify.evenly { justify-content: space-evenly; }
+.tall { display: flex; height: 90px; gap: var(--gap); }
+.tall > .start { align-self: flex-start; }
+.tall > .center { align-self: center; }
+.tall > .end { align-self: flex-end; }
+.wrap { display: flex; flex-wrap: wrap; gap: 6px; }
+.wrap > span { flex: 0 0 110px; text-align: center; }
+.column { display: flex; flex-direction: column; height: 150px; gap: 6px; }
+.column > .fill { flex-grow: 1; }
+.hero { display: flex; justify-content: center; align-items: center; height: 80px; }
+.order { display: flex; gap: var(--gap); }
+.order .first { order: -1; }
+
+/* grid */
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 160px), 1fr)); gap: var(--gap); }
+.layout { display: grid; grid-template-columns: 140px 1fr 1fr; gap: 8px; }
+.layout .head, .layout .foot { grid-column: 1 / -1; }
+.layout .side { grid-row: span 2; }
+.span2 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.span2 .wide { grid-column: span 2; }
+
+/* calc */
+.calc { width: calc(100% - 80px); margin: 0 auto; }
+.calc2 { width: calc(50% + 2 * 20px); }
+.clamp { font-size: clamp(14px, 3vw, 22px); }
+
+/* corners and gradients */
+.round { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+.pill { background: var(--accent); color: white; padding: 4px 14px; border-radius: 999px; }
+.rounded { border: 3px solid var(--accent); border-radius: 12px; padding: 10px; }
+.circle { width: 48px; height: 48px; border-radius: 50%; background: #e05a3a; }
+.tab { background: #3a7be0; color: white; padding: 6px 12px; border-radius: 10px 10px 0 0; }
+.grad-down { height: 40px; background: linear-gradient(#ffd76a, #e05a3a); border-radius: 6px; }
+.grad-right { height: 40px; background-image: linear-gradient(to right, #3a7be0, #3fbf8f); }
+.grad-angle { height: 40px; background: linear-gradient(270deg, rgba(63, 23, 95, .9), rgba(63, 23, 95, 0)); }
+.button { display: inline-block; color: white; padding: 8px 18px; border-radius: 6px;
+          background: linear-gradient(to bottom, #5aa0ff, #2a63c8); }
+</style>
+</head>
+<body>
+<h1>Modern CSS test page</h1>
+<p>Each section shows a layout feature next to a note saying what it should look like.
+Anything that looks different is a bug worth reporting.</p>
+
+<h2>Flex: a navigation bar</h2>
+<p class="expect">One purple bar: the logo on the left, two links next to it, "Sign in" pushed to the far right, all centered vertically.</p>
+<div class="nav"><a class="logo" href="#">fluxOS</a><a href="#">Docs</a><a href="#">Download</a><a class="push" href="#">Sign in</a></div>
+
+<h2>Flex: growing</h2>
+<p class="expect">One row: two equal boxes, one twice as wide, and a 120px box at the end. All the same height, though the first has more text.</p>
+<div class="grow">
+  <div class="box">flex: 1, with enough text in it to wrap onto a second line</div>
+  <div class="box">flex: 1</div>
+  <div class="box two">flex: 2</div>
+  <div class="box fixed">120px</div>
+</div>
+
+<h2>Flex: justify-content</h2>
+<p class="expect">Three rows of three boxes: spread to both edges; together in the middle; evenly spaced.</p>
+<div class="justify"><span class="box">A</span><span class="box">B</span><span class="box">C</span></div>
+<div class="justify center"><span class="box">A</span><span class="box">B</span><span class="box">C</span></div>
+<div class="justify evenly"><span class="box">A</span><span class="box">B</span><span class="box">C</span></div>
+
+<h2>Flex: align-self</h2>
+<p class="expect">In a 90px row: one box full height, then boxes at the top, middle and bottom.</p>
+<div class="tall"><div class="box">stretch</div><div class="box start">start</div><div class="box center">center</div><div class="box end">end</div></div>
+
+<h2>Flex: wrapping</h2>
+<p class="expect">Tags 110px wide, wrapping onto as many lines as the width needs.</p>
+<div class="wrap">
+  <span class="box">one</span><span class="box">two</span><span class="box">three</span><span class="box">four</span>
+  <span class="box">five</span><span class="box">six</span><span class="box">seven</span><span class="box">eight</span>
+</div>
+
+<h2>Flex: column</h2>
+<p class="expect">A 150px column: a header, a middle box that grows to fill, and a footer at the bottom.</p>
+<div class="column"><div class="box">header</div><div class="box fill">grows</div><div class="box">footer</div></div>
+
+<h2>Flex: centered both ways</h2>
+<p class="expect">The box sits in the middle of an 80px band, across and down.</p>
+<div class="hero box"><span class="pill">centered</span></div>
+
+<h2>Flex: order</h2>
+<p class="expect">The boxes read 1, 2, 3, though 1 comes last in the source.</p>
+<div class="order"><div class="box">2</div><div class="box">3</div><div class="box first">1</div></div>
+
+<h2>Grid: auto-fill cards</h2>
+<p class="expect">Cards at least 160px wide, as many to a row as fit, all the same width.</p>
+<div class="cards">
+  <div class="box">Card one</div><div class="box">Card two</div><div class="box">Card three</div>
+  <div class="box">Card four</div><div class="box">Card five</div><div class="box">Card six</div>
+  <div class="box">Card seven</div>
+</div>
+
+<h2>Grid: page layout</h2>
+<p class="expect">A header across the top, a 140px sidebar two rows tall, four boxes beside it, and a footer across the bottom.</p>
+<div class="layout">
+  <div class="box head">header (1 / -1)</div>
+  <div class="box side">sidebar (span 2 rows)</div>
+  <div class="box">a</div><div class="box">b</div><div class="box">c</div><div class="box">d</div>
+  <div class="box foot">footer</div>
+</div>
+
+<h2>Grid: spans</h2>
+<p class="expect">Four columns; the second box is two columns wide.</p>
+<div class="span2"><div class="box">1</div><div class="box wide">2 (span 2)</div><div class="box">3</div><div class="box">4</div><div class="box">5</div></div>
+
+<h2>calc() and clamp()</h2>
+<p class="expect">A box 80px narrower than the page and centered; a box just over half the page; text whose size follows the window's width.</p>
+<div class="box calc">width: calc(100% - 80px)</div>
+<div class="box calc2" style="margin-top: 6px">width: calc(50% + 2 * 20px)</div>
+<p class="clamp">font-size: clamp(14px, 3vw, 22px)</p>
+
+<h2>Rounded corners</h2>
+<p class="expect">A pill, a box with a rounded purple border, a red circle, and a tab rounded only at the top.</p>
+<div class="round"><span class="pill">pill</span><div class="rounded">rounded border</div><div class="circle"></div><span class="tab">tab</span></div>
+
+<h2>Gradients</h2>
+<p class="expect">Yellow to red going down, with rounded corners; blue to green going right; purple fading out to the left; a blue gradient button with white text.</p>
+<div class="grad-down"></div>
+<div class="grad-right" style="margin-top: 6px"></div>
+<div class="grad-angle" style="margin-top: 6px"></div>
+<p><a class="button" href="#">Gradient button</a></p>
+</body>
+</html>

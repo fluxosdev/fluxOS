@@ -1,0 +1,151 @@
+<!doctype html>
+<html>
+<head>
+<title>Columns and drag and drop</title>
+<style>
+body { font-family: sans-serif; max-width: 760px; margin: 20px auto; padding: 0 16px; line-height: 1.5;
+       color: #1f2430; background: #f4f7fb; }
+h1 { background: #2f5fd0; color: white; padding: 10px 14px; border-radius: 8px; }
+h2 { margin-bottom: 4px; }
+.card { background: white; border: 1px solid #ccd6e6; border-radius: 8px; padding: 12px 16px; margin: 14px 0; }
+.article { column-count: 3; column-gap: 24px; column-rule: 1px solid #ccd6e6; text-align: justify; }
+.article p { margin: 0 0 8px; }
+.widths { column-width: 150px; column-gap: 12px; }
+.widths div { break-inside: avoid; background: #e8eef7; border: 1px solid #b8c7de; border-radius: 6px;
+              padding: 6px; margin: 0 0 8px; }
+.widths .tall { height: 70px; }
+.forced { columns: 2; column-rule: 2px dashed #b04cf0; }
+.forced h3 { margin: 0; }
+.forced .next { break-before: column; }
+ul.sort { list-style: none; padding: 0; margin: 0; }
+ul.sort li { background: #e8eef7; border: 1px solid #b8c7de; border-radius: 6px; padding: 6px 10px; margin: 4px 0;
+             cursor: move; }
+ul.sort li.over { border-color: #2f5fd0; background: #d4e0f8; }
+.zone { border: 2px dashed #9aa9c0; border-radius: 8px; padding: 14px; text-align: center; color: #5a6c80; }
+.zone.over { border-color: #2f5fd0; background: #eef3fd; color: #1f2430; }
+#log { font-family: monospace; font-size: 12px; white-space: pre-wrap; height: 90px; overflow: auto;
+       background: #1f2430; color: #cde; padding: 6px; border-radius: 6px; }
+.track { position: relative; height: 24px; background: #dde5f2; border-radius: 12px; }
+.knob { position: absolute; top: 0; left: 0; width: 24px; height: 24px; border-radius: 12px; background: #2f5fd0; }
+</style>
+</head>
+<body>
+<h1>Columns and drag and drop</h1>
+
+<div class="card">
+<h2>Three balanced columns</h2>
+<div class="article">
+<p>Multi-column layout cuts a box's contents into columns of even height, side by side. This paragraph and the ones
+after it are laid out once, as a single column a third of the width, then cut between lines.</p>
+<p>A column ends between two lines, never through one; the margin where it ends is dropped, so the next column
+starts right at the top of its first line.</p>
+<p>The rules between the columns are column-rule: one pixel, solid, in the color of the card's border. They are as
+tall as the tallest column.</p>
+<p>column-gap: normal is 1em between columns. Here it is set to 24 pixels.</p>
+<p>Resize the window and the columns get narrower, but there are always three of them.</p>
+</div>
+</div>
+
+<div class="card">
+<h2>As many 150 pixel columns as fit</h2>
+<div class="widths">
+<div>column-width: 150px</div><div class="tall">break-inside: avoid keeps each box in one column</div>
+<div>One</div><div>Two</div><div class="tall">A taller one</div><div>Three</div><div>Four</div><div>Five</div>
+</div>
+</div>
+
+<div class="card">
+<h2>A forced break</h2>
+<div class="forced">
+<h3>First column</h3><p>Only this, although there is room for more.</p>
+<h3 class="next">Second column</h3><p>break-before: column starts this heading in a new column.</p>
+</div>
+</div>
+
+<div class="card">
+<h2>Drag to reorder</h2>
+<p>HTML drag and drop: each item has draggable="true"; dragover lets the list accept a drop.</p>
+<ul class="sort" id="sort">
+<li draggable="true">Alpha</li><li draggable="true">Bravo</li><li draggable="true">Charlie</li>
+<li draggable="true">Delta</li><li draggable="true">Echo</li>
+</ul>
+</div>
+
+<div class="card">
+<h2>Drop zone and text fields</h2>
+<p>Drag the link or the item below onto the zone, or drag the link into the text field (the browser types what is
+dropped there if the page does not take it). Escape cancels a drag.</p>
+<p><a href="https://example.org/dropped">a link to drag</a> &middot;
+<span draggable="true" id="chip" style="background:#ffe8a8;padding:2px 8px;border-radius:10px">a draggable chip</span></p>
+<div class="zone" id="zone">Drop here</div>
+<p><input id="field" size="40" placeholder="or drop into this field"></p>
+<div id="log"></div>
+</div>
+
+<div class="card">
+<h2>Dragging with the pointer</h2>
+<p>A slider made with pointerdown, pointermove and pointerup: the page hears the pointer move while the button is
+held.</p>
+<div class="track" id="track"><div class="knob" id="knob"></div></div>
+<p id="value">0%</p>
+</div>
+
+<script>
+var log = document.getElementById("log");
+function note(s) { log.textContent += s + "\n"; log.scrollTop = log.scrollHeight; }
+
+var list = document.getElementById("sort"), dragged = null;
+list.addEventListener("dragstart", function (e) {
+  dragged = e.target;
+  e.dataTransfer.effectAllowed = "move";
+  e.dataTransfer.setData("text/plain", dragged.textContent);
+});
+list.addEventListener("dragover", function (e) {
+  var li = e.target.closest ? e.target.closest("li") : null;
+  if (!dragged || !li || li === dragged) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+  Array.prototype.forEach.call(list.children, function (x) { x.classList.toggle("over", x === li); });
+});
+list.addEventListener("drop", function (e) {
+  var li = e.target.closest ? e.target.closest("li") : null;
+  if (!dragged || !li) return;
+  e.preventDefault();
+  var items = Array.prototype.slice.call(list.children);
+  list.insertBefore(dragged, items.indexOf(dragged) < items.indexOf(li) ? li.nextSibling : li);
+});
+list.addEventListener("dragend", function () {
+  Array.prototype.forEach.call(list.children, function (x) { x.classList.remove("over"); });
+  dragged = null;
+});
+
+document.getElementById("chip").addEventListener("dragstart", function (e) {
+  e.dataTransfer.setData("text/plain", "the chip");
+  e.dataTransfer.setData("application/x-chip", "42");
+});
+var zone = document.getElementById("zone");
+zone.addEventListener("dragenter", function (e) { e.preventDefault(); zone.classList.add("over"); });
+zone.addEventListener("dragover", function (e) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; });
+zone.addEventListener("dragleave", function () { zone.classList.remove("over"); });
+zone.addEventListener("drop", function (e) {
+  e.preventDefault();
+  zone.classList.remove("over");
+  note("drop: types [" + e.dataTransfer.types.join(", ") + "], text \"" + e.dataTransfer.getData("text") +
+       "\", url \"" + e.dataTransfer.getData("URL") + "\"");
+  zone.textContent = "Dropped: " + e.dataTransfer.getData("text");
+});
+document.addEventListener("dragend", function (e) { note("dragend: " + e.dataTransfer.dropEffect); });
+document.getElementById("field").addEventListener("input", function (e) { note("field: " + e.target.value); });
+
+var track = document.getElementById("track"), knob = document.getElementById("knob"), holding = false;
+function slide(e) {
+  var r = track.getBoundingClientRect(), x = Math.max(0, Math.min(r.width - 24, e.clientX - r.left - 12));
+  knob.style.left = x + "px";
+  document.getElementById("value").textContent = Math.round(100 * x / (r.width - 24)) + "%";
+}
+knob.addEventListener("pointerdown", function (e) { holding = true; e.preventDefault(); slide(e); });
+document.addEventListener("pointermove", function (e) { if (holding && e.buttons) slide(e); });
+document.addEventListener("pointerup", function () { holding = false; });
+</script>
+</body>
+</html>

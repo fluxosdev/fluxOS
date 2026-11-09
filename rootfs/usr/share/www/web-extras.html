@@ -1,0 +1,129 @@
+<!doctype html>
+<html>
+<head>
+<title>Gradients, grids and newer APIs</title>
+<style>
+body { font-family: sans-serif; max-width: 760px; margin: 20px auto; padding: 0 16px; line-height: 1.5;
+       color: #1f2430; background: linear-gradient(#f4f7fb, #e8eef7); }
+h1 { background: linear-gradient(90deg, #3a6ff7, #b04cf0); color: white; padding: 10px 14px; border-radius: 8px; }
+h2 { margin-bottom: 4px; }
+.card { background: white; border: 1px solid #ccd6e6; border-radius: 8px; padding: 12px 16px; margin: 14px 0; }
+.swatches { display: flex; flex-wrap: wrap; gap: 8px; }
+.swatches > div { width: 110px; height: 70px; border-radius: 6px; color: white; font-size: 11px; padding: 4px;
+                  text-shadow: 0 1px 2px black; }
+.lin { background: linear-gradient(135deg, #ff6a00, #ee0979 50%, #4a00e0); }
+.rad { background: radial-gradient(circle at 30% 30%, #fff 0, #7ec8ff 30%, #003366); }
+.ell { background: radial-gradient(ellipse farthest-side at bottom, #ffd200, #f7971e 60%, #6b2400); }
+.con { background: conic-gradient(from 90deg, red, yellow, lime, aqua, blue, magenta, red); border-radius: 50%; }
+.str { background: repeating-linear-gradient(45deg, #333 0 8px, #ffcc00 8px 16px); }
+.chk { background: conic-gradient(#999 25%, #eee 0 50%, #999 0 75%, #eee 0) 0 0 / 20px 20px; color: black; text-shadow: none; }
+.grid-bg { background: linear-gradient(#ccd 1px, transparent 1px) 0 0 / 100% 12px,
+                       linear-gradient(90deg, #ccd 1px, transparent 1px) 0 0 / 12px 100%, white;
+           color: black; text-shadow: none; }
+.fade { background: linear-gradient(to right, transparent, #0a64d6); color: black; text-shadow: none; }
+.math div { padding: 2px 0; }
+#m1 { width: round(up, 33.3%, 10px); background: #cde; }
+#m2 { width: calc(200px * sin(45deg)); background: #dec; }
+#m3 { width: calc(2lh + 10px); background: #edc; line-height: 20px; }
+.rel1 { background: rgb(from #0a64d6 r g b / 40%); }
+.rel2 { background: hsl(from #0a64d6 calc(h + 120) s l); }
+.rel3 { background: oklch(from #0a64d6 calc(l + 0.2) c h); color: black; text-shadow: none; }
+.sys { background: AccentColor; color: AccentColorText; }
+.spin { width: 60px; height: 30px; background: #3a6ff7; display: inline-block; margin: 12px 24px;
+        translate: 10px 0; rotate: 15deg; scale: 1.2; }
+.wrap { display: flex; flex-wrap: wrap; height: 140px; align-content: space-between; background: #f0f3f9;
+        border: 1px dashed #99a; }
+.wrap > span { width: 30%; margin: 2px; background: #b9cdfa; text-align: center; }
+.cols { display: grid; grid-template-rows: 30px 30px; grid-auto-flow: column; grid-auto-columns: 80px;
+        gap: 4px; justify-content: center; }
+.cols > span { background: #fde3b8; text-align: center; }
+p.drop::first-letter { font-size: 2.4em; color: #b04cf0; font-weight: bold; }
+p.drop::first-line { color: #3a6ff7; }
+video { border-radius: 6px; }
+#out { font-family: monospace; white-space: pre-wrap; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>Gradients, grids and newer web APIs</h1>
+
+<div class="card">
+<h2>Gradients</h2>
+<div class="swatches">
+  <div class="lin">linear, 3 stops</div><div class="rad">radial circle</div><div class="ell">radial ellipse</div>
+  <div class="con">conic</div><div class="str">repeating stripes</div><div class="chk">conic checkers, tiled</div>
+  <div class="grid-bg">two tiled layers</div><div class="fade">fade from transparent</div>
+</div>
+</div>
+
+<div class="card math">
+<h2>Math functions, units and colors</h2>
+<div id="m1">round(up, 33.3%, 10px)</div>
+<div id="m2">calc(200px * sin(45deg))</div>
+<div id="m3">calc(2lh + 10px)</div>
+<div class="swatches" style="margin-top: 8px">
+  <div class="rel1">rgb(from ... / 40%)</div><div class="rel2">hsl(from ... h + 120)</div>
+  <div class="rel3">oklch(from ... l + 0.2)</div><div class="sys">AccentColor</div>
+</div>
+<div><span class="spin"></span> translate, rotate and scale as properties</div>
+</div>
+
+<div class="card">
+<h2>Flex and grid</h2>
+<p>align-content: space-between on wrapping flex lines:</p>
+<div class="wrap"><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span></div>
+<p>grid-auto-flow: column with grid-auto-columns, centred by justify-content:</p>
+<div class="cols"><span>a</span><span>b</span><span>c</span><span>d</span><span>e</span></div>
+</div>
+
+<div class="card">
+<h2>::first-letter and ::first-line</h2>
+<p class="drop">Once upon a time this paragraph began with a large purple letter, and its whole
+first line was blue, however far the window was made wide or narrow; the lines after it keep
+the paragraph's own color.</p>
+</div>
+
+<div class="card">
+<h2>Media and shadow roots</h2>
+<video width="320" height="180" src="example.mp4">This is fallback text that is not shown.</video>
+<audio controls src="example.mp3"></audio>
+<div><template shadowrootmode="open"><b style="color: #b04cf0">Text from a declarative shadow root</b>
+ and <slot></slot></template>light DOM text through a slot.</div>
+</div>
+
+<div class="card">
+<h2>Script APIs</h2>
+<div id="out">running...</div>
+</div>
+
+<script>
+var out = [];
+function line(name, f) {
+  try { out.push(name + ": " + f()); } catch (e) { out.push(name + ": FAILED " + e); }
+}
+line("Iterator helpers", function () { return [1, 2, 3, 4, 5].values().filter(function (x) { return x % 2; }).map(function (x) { return x * 10; }).toArray(); });
+line("Generators are iterators", function () { function* g() { yield 1; yield 2; } return g().map(function (x) { return x + 1; }).toArray(); });
+line("Intl.NumberFormat", function () {
+  return [new Intl.NumberFormat("en", { notation: "compact" }).format(1234567),
+          (19.99).toLocaleString("en-US", { style: "currency", currency: "EUR" }),
+          (0.42).toLocaleString("en", { style: "percent" }),
+          (12).toLocaleString("en", { style: "unit", unit: "kilometer-per-hour" })].join(" | ");
+});
+line("Intl.Locale", function () { return new Intl.Locale("zh").maximize().toString(); });
+line("Intl.DisplayNames", function () { return new Intl.DisplayNames(["en"], { type: "region" }).of("JP"); });
+line("URLPattern", function () { var m = new URLPattern({ pathname: "/books/:id" }).exec("https://example.com/books/42"); return "id " + m.pathname.groups.id; });
+line("RegExp d flag", function () { return JSON.stringify(/(o+)/d.exec("foo").indices); });
+line("setHTML", function () { var d = document.createElement("div"); d.setHTML("<b onclick='x()'>ok</b><script>alert(1)<\/script>"); return d.innerHTML; });
+line("Trusted Types", function () { var p = trustedTypes.createPolicy("demo", { createHTML: function (s) { return s.toUpperCase(); } }); return String(p.createHTML("<i>x</i>")); });
+line("File", function () { var f = new File(["hello"], "a.txt", { type: "text/plain" }); return f.name + " " + f.size + " bytes"; });
+line("Audio().play()", function () { new Audio("x.mp3").play().catch(function (e) { out.push("Audio().play() rejected: " + e.name); show(); }); return "pending"; });
+(async function () {
+  var gz = new Uint8Array(await new Response(new Blob(["fluxOS ".repeat(50)]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer());
+  var back = await new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream("gzip"))).text();
+  out.push("CompressionStream: 350 bytes to " + gz.length + ", back to " + back.length);
+  show();
+})().catch(function (e) { out.push("CompressionStream: FAILED " + e); show(); });
+function show() { document.getElementById("out").textContent = out.join("\n"); }
+show();
+</script>
+</body>
+</html>

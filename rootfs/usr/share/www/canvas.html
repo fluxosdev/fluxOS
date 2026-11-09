@@ -1,0 +1,91 @@
+<!doctype html>
+<html>
+<head>
+<title>Canvas 2D</title>
+<style>
+body { font-family: sans-serif; max-width: 760px; margin: 20px auto; padding: 0 16px; background: #f4f4f0; color: #222; }
+h1 { font-size: 1.4em; }
+canvas { background: white; border: 1px solid #aaa; display: block; margin: 8px 0 16px; }
+p { margin: 4px 0; }
+</style>
+</head>
+<body>
+<h1>Canvas 2D</h1>
+<p>Shapes, gradients, clipping, shadows, transforms and text, drawn once.</p>
+<canvas id="still" width="720" height="260"></canvas>
+<p>An animation (requestAnimationFrame): a spinning star, an orbiting dot and a bouncing ball.</p>
+<canvas id="anim" width="720" height="200"></canvas>
+<p>Pixels: <button id="invert">Invert</button> <button id="blur">Fade</button> <button id="reset">Redraw</button></p>
+<canvas id="pix" width="320" height="120"></canvas>
+<p id="info"></p>
+<script>
+function star(x, cx, cy, r1, r2, n) {
+  x.beginPath();
+  for (var i = 0; i < n * 2; i++) {
+    var r = i % 2 ? r2 : r1, a = i * Math.PI / n - Math.PI / 2;
+    x[i ? "lineTo" : "moveTo"](cx + r * Math.cos(a), cy + r * Math.sin(a));
+  }
+  x.closePath();
+}
+(function () {
+  var x = document.getElementById("still").getContext("2d");
+  var g = x.createLinearGradient(0, 0, 720, 0);
+  g.addColorStop(0, "#fde68a"); g.addColorStop(0.5, "#fca5a5"); g.addColorStop(1, "#a5b4fc");
+  x.fillStyle = g; x.fillRect(0, 0, 720, 260);
+  x.save(); x.shadowColor = "rgba(0,0,0,0.35)"; x.shadowBlur = 12; x.shadowOffsetX = 4; x.shadowOffsetY = 6;
+  x.fillStyle = "#1d4ed8"; x.beginPath(); x.roundRect(30, 30, 160, 90, 18); x.fill(); x.restore();
+  x.fillStyle = "#fff"; x.font = "bold 22px sans-serif"; x.fillText("roundRect", 52, 82);
+  var r = x.createRadialGradient(300, 90, 8, 300, 90, 70);
+  r.addColorStop(0, "#fff"); r.addColorStop(1, "#059669"); x.fillStyle = r; x.beginPath(); x.arc(300, 90, 60, 0, 7); x.fill();
+  var c = x.createConicGradient(0, 450, 90); c.addColorStop(0, "red"); c.addColorStop(0.25, "yellow");
+  c.addColorStop(0.5, "lime"); c.addColorStop(0.75, "cyan"); c.addColorStop(1, "red");
+  x.fillStyle = c; x.beginPath(); x.arc(450, 90, 55, 0, 7); x.fill();
+  x.save(); star(x, 600, 90, 58, 26, 5); x.clip(); x.fillStyle = "#facc15"; x.fillRect(540, 30, 120, 120);
+  x.fillStyle = "#b45309"; for (var i = 0; i < 12; i++) x.fillRect(540, 30 + i * 10, 120, 3); x.restore();
+  x.lineWidth = 10; x.lineCap = "round"; x.lineJoin = "round"; x.strokeStyle = "#7c3aed";
+  x.beginPath(); x.moveTo(30, 200); x.lineTo(90, 150); x.lineTo(150, 210); x.lineTo(210, 160); x.stroke();
+  x.setLineDash([12, 10]); x.lineWidth = 4; x.strokeStyle = "#111"; x.beginPath(); x.moveTo(250, 200); x.bezierCurveTo(300, 130, 380, 270, 440, 190); x.stroke();
+  x.setLineDash([]);
+  x.fillStyle = "#111"; x.font = "28px serif"; x.fillText("Serif 28px — ¡Hola! ñ é ü", 30, 245);
+  x.font = "italic 18px sans-serif"; x.fillStyle = "#333"; x.fillText("中文 日本語 한국어 Ελληνικά Русский", 400, 240);
+  x.save(); x.translate(640, 200); x.rotate(-0.4); x.font = "bold 20px sans-serif"; x.fillStyle = "#be123c"; x.fillText("rotated", 0, 0); x.restore();
+})();
+(function () {
+  var cv = document.getElementById("anim"), x = cv.getContext("2d"), t0 = null, frames = 0;
+  function frame(t) {
+    if (t0 === null) t0 = t;
+    var s = (t - t0) / 1000;
+    x.fillStyle = "#0f172a"; x.fillRect(0, 0, 720, 200);
+    x.save(); x.translate(120, 100); x.rotate(s * 1.5); star(x, 0, 0, 70, 30, 6);
+    x.fillStyle = "#fbbf24"; x.fill(); x.lineWidth = 3; x.strokeStyle = "#fff"; x.stroke(); x.restore();
+    x.fillStyle = "#38bdf8"; x.beginPath(); x.arc(330 + 90 * Math.cos(s * 2), 100 + 70 * Math.sin(s * 2), 14, 0, 7); x.fill();
+    x.strokeStyle = "rgba(255,255,255,0.25)"; x.beginPath(); x.ellipse(330, 100, 90, 70, 0, 0, 7); x.stroke();
+    var by = 170 - Math.abs(Math.sin(s * 3)) * 130;
+    x.fillStyle = "rgba(0,0,0,0.4)"; x.beginPath(); x.ellipse(560, 185, 28 - (170 - by) / 8, 6, 0, 0, 7); x.fill();
+    x.fillStyle = "#f87171"; x.beginPath(); x.arc(560, by, 22, 0, 7); x.fill();
+    frames++;
+    x.fillStyle = "#94a3b8"; x.font = "12px sans-serif"; x.fillText("frame " + frames, 640, 20);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+(function () {
+  var cv = document.getElementById("pix"), x = cv.getContext("2d");
+  function draw() {
+    var g = x.createLinearGradient(0, 0, 320, 120); g.addColorStop(0, "#22c55e"); g.addColorStop(1, "#3b82f6");
+    x.fillStyle = g; x.fillRect(0, 0, 320, 120); x.fillStyle = "#fff"; x.font = "bold 36px sans-serif"; x.fillText("Pixels", 20, 70);
+    x.beginPath(); x.arc(250, 60, 36, 0, 7); x.fillStyle = "#f97316"; x.fill();
+  }
+  draw();
+  document.getElementById("invert").onclick = function () {
+    var d = x.getImageData(0, 0, 320, 120), p = d.data;
+    for (var i = 0; i < p.length; i += 4) { p[i] = 255 - p[i]; p[i + 1] = 255 - p[i + 1]; p[i + 2] = 255 - p[i + 2]; }
+    x.putImageData(d, 0, 0);
+  };
+  document.getElementById("blur").onclick = function () { x.fillStyle = "rgba(255,255,255,0.3)"; x.fillRect(0, 0, 320, 120); };
+  document.getElementById("reset").onclick = draw;
+  document.getElementById("info").textContent = "toDataURL starts: " + cv.toDataURL().slice(0, 40) + "... ";
+})();
+</script>
+</body>
+</html>

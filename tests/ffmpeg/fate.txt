@@ -1,0 +1,43 @@
+# FFmpeg's own tests (FATE) that make test-ffmpeg-qemu runs on fluxOS, with the commands
+# FFmpeg 9.0.2's tests/fate/*.mak give them. Each line:
+#
+#   name | comparison | ffmpeg's arguments
+#
+# SAMPLES/ is FATE's sample suite (https://fate-suite.ffmpeg.org/, fetched into
+# build/tests/fate-suite). The comparisons are FATE's:
+#   framecrc, framemd5   the frames' checksums, exactly ref/NAME (from tests/ref/fate)
+#   md5                  the decoded sound's MD5, exactly ref/NAME
+#   oneoff N FILE        16-bit sound no sample of which is more than N from FILE (a sample)
+#   stddev T N FILE      16-bit sound whose deviation from FILE is within N of T
+# ffmpeg runs as FATE runs it: -nostdin -nostats -noauto_conversion_filters -cpuflags all,
+# and -hwaccel none -threads 1 -thread_type frame+slice before each -i (unless the line
+# says how many threads).
+
+# H.264: CAVLC, CABAC, the High profile's FRExt; the last again on four threads, by frame
+h264-conformance-ba1_ft_c | framecrc | -framerate 19 -i SAMPLES/h264-conformance/BA1_FT_C.264
+h264-conformance-cabac_mot_frm0_full | framecrc | -i SAMPLES/h264-conformance/camp_mot_frm0_full.26l
+h264-conformance-frext-frext_mmco4_sony_b | framecrc | -i SAMPLES/h264-conformance/FRext/FRExt_MMCO4_Sony_B.264
+h264-conformance-frext-frext_mmco4_sony_b | framecrc | -threads 4 -thread_type frame -i SAMPLES/h264-conformance/FRext/FRExt_MMCO4_Sony_B.264
+
+# HEVC, 8 and 10 bit
+hevc-conformance-AMP_A_Samsung_4 | framecrc | -i SAMPLES/hevc-conformance/AMP_A_Samsung_4.bit -pix_fmt yuv420p
+hevc-conformance-WPP_A_ericsson_MAIN10_2 | framecrc | -i SAMPLES/hevc-conformance/WPP_A_ericsson_MAIN10_2.bit -pix_fmt yuv420p10le -vf scale
+
+# VP8 (IVF), VP9 (WebM)
+vp8-test-vector-001 | framemd5 | -i SAMPLES/vp8-test-vectors-r1/vp80-00-comprehensive-001.ivf
+vp9-00-quantizer-00 | framemd5 | -i SAMPLES/vp9-test-vectors/vp90-2-00-quantizer-00.webm
+
+# MPEG-4 part 2, MPEG-2 (program stream), Theora (Ogg)
+m4v | framecrc | -flags +bitexact -idct simple -i SAMPLES/mpeg4/demo.m4v
+mpeg2-ticket186 | framecrc | -flags +bitexact -idct simple -i SAMPLES/mpeg2/t.mpg -an
+theora-offset | framecrc | -flags +bitexact -i SAMPLES/vp3/offset_test.ogv
+
+# Containers: QuickTime edit lists, Matroska lacing, PCM in QuickTime
+mov-3elist | framemd5 | -i SAMPLES/mov/mov-3elist.mov
+matroska-xiph-lacing | framecrc | -i SAMPLES/mkv/xiph_lacing.mka -c:a copy
+pcm_s16le-stereo | md5 | -i SAMPLES/qt-surge-suite/surge-2-16-L-sowt.mov
+
+# Sound: AAC (MP4), Vorbis (Ogg), Opus (Matroska)
+aac-al04_44 | oneoff 2 aac/al04_44.s16 | -auto_conversion_filters -i SAMPLES/aac/al04_44.mp4 -vn
+vorbis-1 | oneoff 1 vorbis/1.0.1-test_small.pcm | -auto_conversion_filters -i SAMPLES/vorbis/1.0.1-test_small.ogg -vn
+opus-testvector01 | stddev 0 3 opus/testvector01.dec | -i SAMPLES/opus/testvector01.mka -af aresample

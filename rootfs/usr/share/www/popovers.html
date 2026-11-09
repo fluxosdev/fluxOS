@@ -1,0 +1,87 @@
+<!doctype html>
+<html>
+<head>
+<title>Popovers, dialogs, anchors and sound</title>
+<style>
+body { font-family: sans-serif; max-width: 780px; margin: 20px auto; padding: 0 16px; line-height: 1.5; color: #1f2430;
+       background: #f3f5f9; }
+h1 { margin-bottom: 4px; }
+.card { background: white; border: 1px solid #cfd8e6; border-radius: 8px; padding: 12px 16px; margin: 14px 0; }
+button { font-size: 13px; padding: 4px 10px; }
+code { background: #eef1f6; padding: 0 3px; border-radius: 3px; }
+
+/* a popover that fades and slides in from its starting style, and out again, staying in the top
+   layer until it has gone */
+#menu { border: 1px solid #9aa7bd; border-radius: 8px; padding: 8px 12px; background: white;
+        opacity: 0; transform: translateY(-8px);
+        transition: opacity .25s, transform .25s, display .25s allow-discrete, overlay .25s allow-discrete; }
+#menu:popover-open { opacity: 1; transform: translateY(0); }
+@starting-style { #menu:popover-open { opacity: 0; transform: translateY(-8px); } }
+
+/* anchored: below the button that opened it, flipping above when there is no room below */
+#tip { inset: auto; margin: 4px 0 0; padding: 6px 10px; border: 0; border-radius: 6px; background: #1f2430; color: white;
+       font-size: 12px; position-area: bottom span-right; position-try-fallbacks: flip-block; }
+
+/* a named anchor, with a box placed against its right edge */
+#target { anchor-name: --target; display: inline-block; padding: 6px 12px; background: #2a9d8f; color: white; border-radius: 6px; }
+#label { position: absolute; position-anchor: --target; left: calc(anchor(right) + 8px); top: anchor(center);
+         translate: 0 -50%; background: #e9c46a; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+
+dialog { border: 0; border-radius: 10px; padding: 18px 20px; box-shadow: 0 8px 30px rgba(0, 0, 0, .3); }
+dialog::backdrop { background: rgba(20, 30, 50, .45); }
+</style>
+</head>
+<body>
+<h1>Popovers, dialogs, anchors and sound</h1>
+<p><a href="home.html">Home</a></p>
+
+<div class="card">
+<h2>Popovers</h2>
+<p><button popovertarget="menu">Open the menu</button> opens an auto popover with no script: a click outside
+it, or Escape, closes it again. It fades in from <code>@starting-style</code> and out with
+<code>transition-behavior: allow-discrete</code>.</p>
+<div id="menu" popover>
+  <p style="margin: 0 0 6px">A popover menu.</p>
+  <button popovertarget="menu" popovertargetaction="hide">Close</button>
+</div>
+<p><button popovertarget="tip" id="tip-button">What is this?</button> opens a hint anchored to its button
+(<code>position-area</code>).</p>
+<div id="tip" popover>Placed by anchor positioning.</div>
+</div>
+
+<div class="card">
+<h2>A modal dialog</h2>
+<p><button commandfor="dlg" command="show-modal">Open the dialog</button> &mdash; while it is open the rest
+of the page is inert. <span id="dialog-result"></span></p>
+<dialog id="dlg">
+  <p style="margin-top: 0">A modal <code>&lt;dialog&gt;</code>, opened by a <code>commandfor</code> button.</p>
+  <form method="dialog">
+    <button value="cancel">Cancel</button>
+    <button value="ok">OK</button>
+  </form>
+</dialog>
+</div>
+
+<div class="card">
+<h2>Anchors</h2>
+<p style="position: relative"><span id="target">The anchor</span> <span id="label">anchor(right)</span></p>
+</div>
+
+<div class="card">
+<h2>Sound</h2>
+<p><audio controls src="file:///usr/share/sounds/startup.wav"></audio></p>
+<p><button id="ding">Ding</button> plays <code>new Audio(...)</code> from a script.</p>
+</div>
+
+<script>
+document.getElementById("dlg").addEventListener("close", function () {
+  document.getElementById("dialog-result").textContent = "It closed with " + this.returnValue + ".";
+});
+document.getElementById("ding").addEventListener("click", function () {
+  new Audio("file:///usr/share/sounds/ding.wav").play().catch(function (e) {
+    document.getElementById("ding").textContent = "Ding (" + e.name + ")";
+  });
+});
+</script>
+</body>
+</html>

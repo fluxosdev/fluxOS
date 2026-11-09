@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>iframe test page</title>
+<style>
+body { font-family: sans-serif; max-width: 760px; margin: 16px auto; padding: 0 12px; line-height: 1.4; }
+h1 { color: #3f175f; border-bottom: 3px double #3f175f; }
+h2 { font-size: 17px; color: #3f175f; margin: 22px 0 4px; }
+p.expect { margin: 0 0 8px; font-size: 13px; color: #555; }
+.row { display: flex; gap: 12px; align-items: flex-start; }
+</style>
+</head>
+<body>
+<h1>iframe test page</h1>
+<p>Each section shows a kind of iframe next to a note saying what it should do.</p>
+
+<h2>A page in a frame</h2>
+<p class="expect">The browser test page in a 2px sunken box, with a scroll bar; the wheel scrolls it while the pointer is over it, and links in it open inside the box.</p>
+<iframe src="test.html" width="700" height="220"></iframe>
+
+<h2>srcdoc, no border, no scrolling</h2>
+<p class="expect">A yellow box with no border round it, and no scroll bar though its text is long.</p>
+<iframe frameborder="0" scrolling="no" width="700" height="60"
+ srcdoc="<body style='margin:0;background:#fffbe6;font-family:sans-serif'><p style='margin:8px'>This page came from the srcdoc attribute. It goes on: one two three four five six seven eight nine ten eleven twelve.</p><p>(cut off)</p></body>"></iframe>
+
+<h2>Links that aim at frames</h2>
+<p class="expect">The first two links load into the frame on the right; the last opens in the whole window.</p>
+<div class="row">
+  <ul>
+    <li><a href="js.html" target="side">JavaScript test page, in the frame</a></li>
+    <li><a href="home.html" target="side">Home page, in the frame</a></li>
+    <li><a href="home.html" target="_top">Home page, in the window</a></li>
+  </ul>
+  <iframe name="side" src="about:blank" width="380" height="200"></iframe>
+</div>
+
+<h2>A form in a frame</h2>
+<p class="expect">Click in the field and type: the letters go into it, not to the page. Enter searches inside the frame.</p>
+<iframe width="700" height="70"
+ srcdoc="<form action='https://html.duckduckgo.com/html/'><input name='q' size='40'> <input type='submit' value='Search'></form>"></iframe>
+
+<h2>Added by a script</h2>
+<p class="expect">A frame with the home page in it appears below once the script runs.</p>
+<div id="slot"></div>
+<script>
+var f = document.createElement("iframe");
+f.setAttribute("src", "home.html");
+f.setAttribute("width", "700");
+f.setAttribute("height", "160");
+document.getElementById("slot").appendChild(f);
+</script>
+</body>
+</html>

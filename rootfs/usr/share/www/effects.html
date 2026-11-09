@@ -1,0 +1,151 @@
+<!doctype html>
+<html>
+<head>
+<title>Effects and container queries</title>
+<style>
+body { font-family: sans-serif; max-width: 780px; margin: 20px auto; padding: 0 16px; line-height: 1.5; color: #1f2430;
+       background: #f3f5f9; padding-bottom: env(safe-area-inset-bottom, 20px); }
+h1 { margin-bottom: 4px; }
+.card { background: white; border: 1px solid #cfd8e6; border-radius: 8px; padding: 12px 16px; margin: 14px 0; }
+.row { display: flex; flex-wrap: wrap; gap: 12px; }
+.tile { width: 100px; text-align: center; font-size: 12px; }
+.sw { width: 100px; height: 64px; border-radius: 6px;
+      background: linear-gradient(135deg, #e63946, #f4a261 40%, #2a9d8f 70%, #264653); }
+
+/* filter */
+.f1 { filter: grayscale(1); }      .f2 { filter: sepia(1); }       .f3 { filter: invert(1); }
+.f4 { filter: hue-rotate(90deg); } .f5 { filter: saturate(3); }    .f6 { filter: brightness(1.5); }
+.f7 { filter: contrast(.4); }      .f8 { filter: blur(3px); }      .f9 { filter: opacity(.4); }
+.f10 { filter: drop-shadow(4px 6px 3px rgba(0, 0, 0, .5)); }
+
+/* clip-path */
+.c1 { clip-path: circle(50%); }          .c2 { clip-path: ellipse(48px 24px at 50% 50%); }
+.c3 { clip-path: inset(10px 20px round 10px); }
+.c4 { clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%); }
+.c5 { clip-path: polygon(20% 0, 80% 0, 100% 100%, 0 100%); }
+
+/* mix-blend-mode over stripes */
+.stage { background: repeating-linear-gradient(90deg, #1d3557 0 20px, #a8dadc 20px 40px); padding: 10px; border-radius: 6px; }
+.blob { width: 100px; height: 44px; background: #e63946; border-radius: 22px; color: white; font-size: 12px; text-align: center; line-height: 44px; }
+.b1 { mix-blend-mode: multiply; } .b2 { mix-blend-mode: screen; } .b3 { mix-blend-mode: difference; }
+.b4 { mix-blend-mode: overlay; }
+
+/* backdrop-filter */
+.scene { position: relative; height: 150px; border-radius: 8px; overflow: hidden;
+         background: linear-gradient(120deg, #ff006e, #8338ec 50%, #3a86ff); }
+.scene span { position: absolute; font-size: 40px; font-weight: bold; color: #ffbe0b; }
+.glass { position: absolute; top: 30px; height: 90px; width: 200px; border-radius: 14px;
+         background: rgba(255, 255, 255, .2); border: 1px solid rgba(255, 255, 255, .5);
+         color: white; padding: 10px; box-sizing: border-box; font-size: 13px; }
+.g1 { left: 20px; -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
+.g2 { left: 250px; backdrop-filter: grayscale(1) brightness(1.2); }
+.g3 { left: 480px; backdrop-filter: invert(1); background: transparent; }
+
+/* 3D transforms, seen flat */
+.flip { width: 120px; height: 70px; position: relative; }
+.flip > div { position: absolute; inset: 0; border-radius: 8px; display: flex; align-items: center;
+              justify-content: center; color: white; backface-visibility: hidden; }
+.front { background: #2a9d8f; }
+.back { background: #e76f51; transform: rotateY(180deg); }
+.flip:hover .front { transform: rotateY(180deg); }
+.flip:hover .back { transform: rotateY(0deg); }
+.t3 { width: 100px; height: 50px; background: #264653; color: white; font-size: 12px; display: flex;
+      align-items: center; justify-content: center; }
+.t3a { transform: translate3d(20px, 0, 0); } .t3b { transform: rotateX(55deg); } .t3c { transform: perspective(300px) rotateY(50deg); }
+
+/* container queries: the same card in a wide and a narrow container */
+.shelf { container: shelf / inline-size; border: 1px dashed #9aa7bb; padding: 8px; margin: 8px 0; }
+.product { display: grid; gap: 8px; grid-template-columns: 1fr; background: #eef3fb; border-radius: 6px; padding: 8px; }
+.product .pic { height: 60px; border-radius: 4px; background: linear-gradient(#8ecae6, #219ebc); }
+.product .size::after { content: "narrow layout (container under 400px)"; }
+@container shelf (min-width: 400px) {
+  .product { grid-template-columns: 120px 1fr; }
+  .product .size::after { content: "wide layout (container 400px or more)"; }
+}
+.product h3 { margin: 0; font-size: clamp(14px, 6cqi, 22px); }
+
+/* @scope and @property */
+@scope (.scoped) {
+  :scope { border-left: 4px solid #8338ec; padding-left: 8px; }
+  p { color: #8338ec; margin: 4px 0; }
+}
+@property --swatch { syntax: '<color>'; inherits: true; initial-value: #2a9d8f; }
+.prop { width: 80px; height: 24px; background: var(--swatch); border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>Effects and container queries</h1>
+<p>CSS that modern sites lean on: <code>filter</code>, <code>clip-path</code>, <code>mix-blend-mode</code>,
+<code>backdrop-filter</code>, 3D transforms (drawn flat), <code>@container</code>, <code>@scope</code>,
+<code>@property</code>, <code>env()</code> and <code>image-set()</code>.</p>
+
+<div class="card">
+<h2>filter</h2>
+<div class="row">
+<div class="tile"><div class="sw"></div>none</div>
+<div class="tile"><div class="sw f1"></div>grayscale(1)</div>
+<div class="tile"><div class="sw f2"></div>sepia(1)</div>
+<div class="tile"><div class="sw f3"></div>invert(1)</div>
+<div class="tile"><div class="sw f4"></div>hue-rotate(90deg)</div>
+<div class="tile"><div class="sw f5"></div>saturate(3)</div>
+<div class="tile"><div class="sw f6"></div>brightness(1.5)</div>
+<div class="tile"><div class="sw f7"></div>contrast(.4)</div>
+<div class="tile"><div class="sw f8"></div>blur(3px)</div>
+<div class="tile"><div class="sw f9"></div>opacity(.4)</div>
+<div class="tile"><div class="sw f10"></div>drop-shadow()</div>
+</div>
+</div>
+
+<div class="card">
+<h2>clip-path</h2>
+<div class="row">
+<div class="tile"><div class="sw c1" style="width:64px;margin:auto"></div>circle(50%)</div>
+<div class="tile"><div class="sw c2"></div>ellipse()</div>
+<div class="tile"><div class="sw c3"></div>inset(… round)</div>
+<div class="tile"><div class="sw c4"></div>polygon (diamond)</div>
+<div class="tile"><div class="sw c5"></div>polygon (trapezoid)</div>
+</div>
+</div>
+
+<div class="card">
+<h2>mix-blend-mode</h2>
+<div class="stage row">
+<div class="blob">normal</div><div class="blob b1">multiply</div><div class="blob b2">screen</div>
+<div class="blob b3">difference</div><div class="blob b4">overlay</div>
+</div>
+</div>
+
+<div class="card">
+<h2>backdrop-filter</h2>
+<div class="scene">
+<span style="left:30px;top:20px">Wave</span><span style="left:150px;top:70px">fluxOS</span>
+<span style="left:330px;top:10px">glass</span><span style="left:520px;top:60px">★★★</span>
+<div class="glass g1">blur(8px) over a translucent panel</div>
+<div class="glass g2">grayscale(1) brightness(1.2)</div>
+<div class="glass g3">invert(1)</div>
+</div>
+</div>
+
+<div class="card">
+<h2>3D transforms</h2>
+<p>Seen from the front with no perspective: a flip card shows its front, and its back when the pointer is over it.</p>
+<div class="row">
+<div class="flip"><div class="front">Front</div><div class="back">Back</div></div>
+<div class="t3 t3a">translate3d</div><div class="t3 t3b">rotateX(55deg)</div><div class="t3 t3c">rotateY(50deg)</div>
+</div>
+</div>
+
+<div class="card">
+<h2>@container</h2>
+<div class="shelf"><div class="product"><div class="pic"></div><div><h3>Wide shelf</h3><span class="size"></span></div></div></div>
+<div class="shelf" style="max-width:300px"><div class="product"><div class="pic"></div><div><h3>Narrow shelf</h3><span class="size"></span></div></div></div>
+</div>
+
+<div class="card scoped">
+<h2>@scope and @property</h2>
+<p>This paragraph is purple because of an @scope rule; paragraphs elsewhere are not.</p>
+<div class="prop"></div>
+</div>
+<p>This paragraph is outside the scope.</p>
+</body>
+</html>

@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Pictures and grid test page</title>
+<style>
+body { font-family: sans-serif; max-width: 760px; margin: 16px auto; padding: 0 12px; line-height: 1.4; }
+h1 { color: #3f175f; border-bottom: 3px double #3f175f; }
+h2 { font-size: 17px; color: #3f175f; margin: 22px 0 4px; }
+p.expect { margin: 0 0 8px; font-size: 13px; color: #555; }
+.row > * { vertical-align: middle; margin-right: 12px; }
+.layout { display: grid; grid-template-columns: 140px 1fr 1fr; grid-template-rows: 40px 80px 30px; gap: 6px;
+  grid-template-areas: "head head head" "nav main side" "foot foot foot"; }
+.layout > div { padding: 6px; color: white; }
+.head { grid-area: head; background: #3f175f; }
+.nav { grid-area: nav; background: #2d7d46; }
+.main { grid-area: main; background: #c0392b; }
+.side { grid-area: side; background: #2471a3; }
+.foot { grid-area: foot; background: #7d6608; }
+.auto { display: grid; grid-template-columns: repeat(3, 1fr); grid-auto-rows: 36px; gap: 4px; }
+.auto > div { background: #8e44ad; color: white; padding: 4px; }
+.auto > .wide { grid-column: span 2; background: #16a085; }
+</style>
+</head>
+<body>
+<h1>Pictures and grid</h1>
+
+<h2>GIF</h2>
+<p class="expect">A red disc in a blue ring on a checkered yellow square; the corner pixel is transparent.</p>
+<div class="row"><img src="test.gif" alt="gif" width="32" height="32"> <img src="test.gif" alt="gif" width="96" height="96"></div>
+
+<h2>SVG as a picture</h2>
+<p class="expect">A purple-to-gold rounded square with a dashed white ring and a white check mark.</p>
+<div class="row"><img src="test.svg" alt="svg" width="60" height="60"> <img src="test.svg" alt="svg"></div>
+
+<h2>Inline SVG</h2>
+<p class="expect">Shapes, curves, an arc, a radial gradient, strokes with round joins and some text.</p>
+<div class="row">
+<svg width="260" height="130" viewBox="0 0 260 130">
+  <defs><radialGradient id="r"><stop offset="0" stop-color="#fff"/><stop offset="1" stop-color="#2471a3"/></radialGradient></defs>
+  <rect width="260" height="130" fill="#f4effa"/>
+  <circle cx="50" cy="50" r="38" fill="url(#r)" stroke="#1b4f72" stroke-width="3"/>
+  <path d="M110 100 C 120 10, 180 10, 190 100 S 240 120 250 60" fill="none" stroke="#c0392b" stroke-width="5"/>
+  <polygon points="100,20 120,60 80,60" fill="#2d7d46" stroke="#145a32" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M20 120 A 30 20 0 0 1 80 120 Z" fill="#f1c40f" fill-rule="evenodd"/>
+  <ellipse cx="215" cy="30" rx="30" ry="14" fill="#8e44ad" opacity="0.6"/>
+  <text x="10" y="14" font-size="12" fill="#3f175f">fluxOS SVG</text>
+</svg>
+<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#3f175f" stroke-width="2" stroke-linecap="round">
+  <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>
+</svg>
+</div>
+
+<h2>Grid: template areas and rows</h2>
+<p class="expect">A purple header across the top, green nav on the left, red and blue columns, and a gold footer.</p>
+<div class="layout"><div class="head">head</div><div class="nav">nav</div><div class="main">main</div><div class="side">side</div><div class="foot">foot</div></div>
+
+<h2>Grid: auto rows and spans</h2>
+<p class="expect">Three columns of 36px-tall cells; the teal cell spans two columns.</p>
+<div class="auto"><div>1</div><div class="wide">2 (wide)</div><div>3</div><div>4</div><div>5</div><div>6</div></div>
+
+<p><a href="home.html">Back to the home page</a></p>
+</body>
+</html>

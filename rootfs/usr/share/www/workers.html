@@ -1,0 +1,96 @@
+<!doctype html>
+<html>
+<head>
+<title>Web workers</title>
+<style>
+body { font-family: sans-serif; max-width: 760px; margin: 20px auto; padding: 0 16px; line-height: 1.5;
+       color: #1f2430; background: #f4f7fb; }
+h1 { background: #2f5fd0; color: white; padding: 10px 14px; border-radius: 8px; }
+h2 { margin-bottom: 4px; }
+.card { background: white; border: 1px solid #ccd6e6; border-radius: 8px; padding: 12px 16px; margin: 14px 0; }
+.track { position: relative; height: 24px; background: #dde5f2; border-radius: 12px; margin: 10px 0; }
+.ball { position: absolute; top: 0; left: 0; width: 24px; height: 24px; border-radius: 12px; background: #2f5fd0; }
+button { font: inherit; padding: 4px 12px; margin-right: 6px; }
+#result, #echoed { font-family: monospace; }
+ul.results { list-style: none; padding: 0; margin: 0; font-family: monospace; font-size: 13px; }
+ul.results li.ok::before { content: "ok   "; color: #1a8a3a; white-space: pre; }
+ul.results li.fail::before { content: "FAIL "; color: #c0303a; white-space: pre; }
+#summary { font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>Web workers</h1>
+
+<div class="card">
+<h2>Work off the page</h2>
+<p>Each worker is a process of its own, so a page can hand it long work and keep moving. Count the primes
+below a number on the page, and the ball stops until the count is done; count them in a worker, and it keeps
+rolling.</p>
+<div class="track"><div class="ball" id="ball"></div></div>
+<p>Below <input id="limit" type="number" value="60000" size="8">
+<button id="here">Count on the page</button><button id="there">Count in a worker</button></p>
+<p id="result">&nbsp;</p>
+</div>
+
+<div class="card">
+<h2>Messages</h2>
+<p>What you type goes to a worker made from a blob: URL, as a structured clone, and comes back.</p>
+<p><input id="text" value="Hello from the page" size="30"> <button id="send">Send</button></p>
+<p id="echoed">&nbsp;</p>
+</div>
+
+<div class="card">
+<h2>Self-test</h2>
+<p id="summary">Running&hellip;</p>
+<ul class="results" id="results"></ul>
+</div>
+
+<script src="worker-lib.js"></script>
+<script src="worker-tests.js"></script>
+<script>
+var ball = document.getElementById("ball"), x = 0, dir = 1;
+function roll() {
+  x += dir * 4;
+  if (x > 300 || x < 0) dir = -dir;
+  ball.style.left = x + "px";
+  requestAnimationFrame(roll);
+}
+requestAnimationFrame(roll);
+
+var result = document.getElementById("result"), counter = null;
+function limit() { return Math.max(2, Math.min(5000000, Number(document.getElementById("limit").value) || 2)); }
+document.getElementById("here").onclick = function () {
+  var started = Date.now(), n = limit();
+  result.textContent = countPrimes(n) + " primes below " + n + ", on the page in " + (Date.now() - started) + " ms";
+};
+document.getElementById("there").onclick = function () {
+  if (!counter) counter = new Worker("worker-echo.js");
+  var started = Date.now(), n = limit();
+  result.textContent = "Counting in a worker…";
+  counter.onmessage = function (e) {
+    result.textContent = e.data.value + " primes below " + n + ", in a worker in " + (Date.now() - started) + " ms";
+  };
+  counter.postMessage({ op: "primes", value: n });
+};
+
+var echo = new Worker(URL.createObjectURL(new Blob([
+  "onmessage = function (e) { postMessage({ text: e.data.text.split('').reverse().join(''), when: new Date() }); };"
+])));
+echo.onmessage = function (e) {
+  document.getElementById("echoed").textContent = "The worker sent back “" + e.data.text + "” at " +
+    e.data.when.toLocaleTimeString();
+};
+document.getElementById("send").onclick = function () { echo.postMessage({ text: document.getElementById("text").value }); };
+
+var list = document.getElementById("results");
+runWorkerTests(function (name, ok, detail) {
+  var li = document.createElement("li");
+  li.className = ok ? "ok" : "fail";
+  li.textContent = name + (ok ? "" : ": " + detail);
+  list.appendChild(li);
+  if (workerResults.done)
+    document.getElementById("summary").textContent = workerResults.passed.length + " of " + workerResults.total + " passed";
+});
+</script>
+</body>
+</html>

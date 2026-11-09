@@ -1,0 +1,28 @@
+# Build output
+/build/
+/build-*/
+/grub-2.06/
+*.o
+*.d
+*.a
+*.elf
+*.bin
+!/firmware/**/*.bin
+*.kernel
+
+# Disk images (GRUB's boot images in firmware/grub are sources)
+*.iso
+*.img
+!/firmware/**/*.img
+
+# Emulator logs and dumps
+*.log
+qemu-*.ppm
+serial.out
+
+# Editor and OS clutter
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

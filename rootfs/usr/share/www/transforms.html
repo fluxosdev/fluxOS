@@ -1,0 +1,33 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Wave: 2D transforms and cloning</title>
+<style>
+body{font:16px sans-serif;margin:24px;background:#f4f6f8;color:#182636}
+h1{font-size:24px}.row{display:flex;gap:35px;margin:36px 0 48px}
+.card{width:130px;height:65px;padding:10px;background:#1764a0;color:white;border:2px solid #0a3558}
+.rotate{transform:rotate(12deg)}.scale{transform:scale(1.2,.8)}.skew{transform:skewX(-15deg)}
+.nested{transform:translate(30px,10px) rotate(-8deg);width:320px;background:#dbe8ef;padding:12px}
+.nested button{transform:rotate(16deg);margin:15px}.clipped{overflow:hidden;width:180px;height:80px;border:2px solid #5b6f7d}
+.clipped div{width:180px;height:60px;background:#c9e3a7;transform:translate(45px,20px) rotate(-8deg)}
+iframe{display:block;width:300px;height:100px;margin:35px;transform:rotate(6deg) scale(.9);border:2px solid #1764a0}
+pre{white-space:pre-wrap;background:white;border:1px solid #bbc8d2;padding:12px}
+</style></head><body>
+<h1>2D transforms, escaping and binary cloning</h1>
+<p>The cards stay in normal flow. Their pixels and clickable areas follow their transforms.</p>
+<div class="row"><div class="card rotate">Rotate 12 degrees</div><div class="card scale">Scale X and Y</div><div class="card skew">Skew X</div></div>
+<div class="nested">Nested transforms <button id="click">Click the rotated button</button><input type="range" min="0" max="100" value="30"></div>
+<p id="pointer">No click yet.</p>
+<div class="clipped"><div>Transformed content stays clipped.</div></div>
+<iframe srcdoc="&lt;body style='font:16px sans-serif;background:#fff'>&lt;p>Transformed iframe&lt;/p>&lt;button onclick='this.textContent=&quot;Clicked inside iframe&quot;'>Click inside iframe&lt;/button>&lt;/body>"></iframe>
+<button id="toggle">Change card transform</button>
+<pre id="results">Checking binary cloning and escaped selectors...</pre>
+<script>
+var button=document.getElementById('click');
+button.addEventListener('click',function(e){document.getElementById('pointer').textContent='Clicked. Local coordinates: '+e.offsetX+', '+e.offsetY;});
+var alternate=false;document.getElementById('toggle').onclick=function(){alternate=!alternate;document.querySelector('.rotate').style.transform=alternate?'translate(15px,5px) rotate(-20deg)':'rotate(12deg)';};
+var buffer=new ArrayBuffer(8),view=new Uint8Array(buffer,2,3);view.set([0,128,255]);
+var original={buffer:buffer,view:view};original.self=original;var cloned=structuredClone(original);
+var element=document.createElement('span');element.id='0:escaped id';document.body.appendChild(element);
+var escaped=CSS.escape(element.id),found=document.querySelector('#'+escaped)===element;
+document.getElementById('results').textContent='CSS.escape: '+escaped+'\nSelector round trip: '+found+'\nTyped array preserved: '+(cloned.view instanceof Uint8Array)+'\nShared cloned buffer: '+(cloned.view.buffer===cloned.buffer)+'\nIndependent original: '+(cloned.buffer!==buffer)+'\nBytes: '+Array.from(cloned.view).join(', ')+'\nCycle preserved: '+(cloned.self===cloned);
+element.remove();
+</script></body></html>

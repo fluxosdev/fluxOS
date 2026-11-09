@@ -1,0 +1,90 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Wave video test</title>
+<style>
+  body { margin: 8px; background: #fff; font: 14px sans-serif; }
+  video { width: 320px; height: 240px; background: #000; margin-right: 8px; }
+</style>
+</head>
+<body>
+<h3>Wave &lt;video&gt;: a file and Media Source Extensions</h3>
+<video id="file" src="yt-18.mp4" muted autoplay controls></video>
+<video id="mse" muted controls></video>
+<p id="out">running</p>
+<script>
+/* The engine's work as the page sees it, on the console (tools/test-wave-video-qemu.py reads it). */
+function say(what) { console.log("WAVETEST " + what); }
+var file = document.getElementById("file"), mv = document.getElementById("mse");
+var seen = { file: [], mse: [] };
+["loadstart", "loadedmetadata", "loadeddata", "canplay", "playing", "waiting", "seeking", "seeked", "ended", "error"].forEach(function (t) {
+  file.addEventListener(t, function () { seen.file.push(t); });
+  mv.addEventListener(t, function () { seen.mse.push(t); });
+});
+say("types " + [file.canPlayType("video/mp4; codecs=\"avc1.42001E, mp4a.40.2\""),
+                MediaSource.isTypeSupported("video/mp4; codecs=\"avc1.4D400C\""),
+                MediaSource.isTypeSupported("audio/mp4; codecs=\"mp4a.40.2\"")].join(","));
+
+/* Media Source Extensions: the video and the sound as YouTube's player gets them, appended in pieces */
+var ms = new MediaSource();
+mv.src = URL.createObjectURL(ms);
+function initLength(bytes) {           /* ftyp and moov: up to the first moof or sidx */
+  var off = 0;
+  while (off + 8 <= bytes.length) {
+    var size = (bytes[off] << 24 | bytes[off + 1] << 16 | bytes[off + 2] << 8 | bytes[off + 3]) >>> 0;
+    var type = String.fromCharCode(bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7]);
+    if (type === "moof" || type === "sidx" || type === "styp") return off;
+    off += size;
+  }
+  return off;
+}
+function feed(sb, bytes, pieces) {
+  return new Promise(function (resolve, reject) {
+    var init = initLength(bytes), parts = [bytes.subarray(0, init)], rest = bytes.length - init;
+    for (var i = 0; i < pieces; i++)
+      parts.push(bytes.subarray(init + Math.floor(rest * i / pieces), init + Math.floor(rest * (i + 1) / pieces)));
+    var k = 0;
+    sb.addEventListener("updateend", function step() {
+      if (k < parts.length) sb.appendBuffer(parts[k++]);
+      else { sb.removeEventListener("updateend", step); resolve(); }
+    });
+    sb.addEventListener("error", function () { reject(new Error("append error")); });
+    sb.appendBuffer(parts[k++]);
+  });
+}
+ms.addEventListener("sourceopen", function () {
+  say("sourceopen");
+  var vsb = ms.addSourceBuffer("video/mp4; codecs=\"avc1.4D400C\"");
+  var asb = ms.addSourceBuffer("audio/mp4; codecs=\"mp4a.40.2\"");
+  Promise.all([fetch("yt-133.mp4").then(function (r) { return r.arrayBuffer(); }),
+               fetch("yt-140.mp4").then(function (r) { return r.arrayBuffer(); })]).then(function (b) {
+    say("fetched " + b[0].byteLength + " " + b[1].byteLength);
+    return Promise.all([feed(vsb, new Uint8Array(b[0]), 5), feed(asb, new Uint8Array(b[1]), 3)]);
+  }).then(function () {
+    var r = mv.buffered;
+    say("appended " + r.length + " " + (r.length ? r.start(0).toFixed(2) + "-" + r.end(0).toFixed(2) : "") +
+        " readyState " + mv.readyState + " size " + mv.videoWidth + "x" + mv.videoHeight);
+    return mv.play();
+  }).then(function () { say("mse playing"); }, function (e) { say("mse failed " + e); });
+});
+
+setTimeout(function () {
+  say("file at " + file.currentTime.toFixed(2) + " readyState " + file.readyState + " size " + file.videoWidth + "x" +
+      file.videoHeight + " paused " + file.paused + " duration " + file.duration.toFixed(2) + " events " + seen.file.join(","));
+  say("mse at " + mv.currentTime.toFixed(2) + " readyState " + mv.readyState + " paused " + mv.paused +
+      " events " + seen.mse.join(","));
+  mv.currentTime = 15;
+  mv.addEventListener("seeked", function () {
+    say("mse seeked to " + mv.currentTime.toFixed(2));
+    ms.endOfStream();
+  });
+  mv.addEventListener("ended", function () { say("mse ended at " + mv.currentTime.toFixed(2)); });
+}, 9000);
+setTimeout(function () {
+  say("final file " + file.currentTime.toFixed(2) + " mse " + mv.currentTime.toFixed(2) + " ended " + mv.ended);
+  document.getElementById("out").textContent = "done";
+}, 16000);
+</script>
+</body>
+</html>
