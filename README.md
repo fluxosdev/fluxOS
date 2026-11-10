@@ -697,6 +697,19 @@ fetcher process, so the browser keeps running), or from `file://`.
   (linked from the home page) are live test pages. `features.html` demonstrates
   the HTML, CSS and DOM additions in 0.2.0, and `modern.html` the modules,
   observers, custom elements, nesting and colors that came after.
+- **WebAssembly** (jswasm.c, jswasmlib.h): `WebAssembly.Module`, `Instance`, `Memory`,
+  `Table`, `Global`, `validate`, `compile`, `instantiate`, `compileStreaming` and
+  `instantiateStreaming`, with `CompileError`, `LinkError` and `RuntimeError`. Modules are
+  validated in full when compiled; each function is translated on its first call into
+  fixed-size instructions with resolved branch targets and run by an interpreter (no
+  JIT), roughly five times as fast as the same loop in JavaScript. It covers WebAssembly
+  1.0 plus sign extension, non-trapping float-to-int conversion, bulk memory, reference
+  types (funcref, externref, several tables), multiple values and mutable globals; SIMD,
+  threads and shared memory, exception handling, tail calls, GC types, memory64 and more
+  than one memory are refused with a `CompileError`. Memory is limited to 1 GiB and to the
+  page's script heap; long-running code is stopped like a runaway script. CSP allows it
+  with `'wasm-unsafe-eval'` or `'unsafe-eval'`. `compileStreaming` does not insist on the
+  `application/wasm` type.
 
 **Windows programs** (`/bin/winrun`)
 
@@ -1043,7 +1056,8 @@ user/desktop/wave/         the Wave browser: window (browser.c), HTML (html.c), 
                            fonts (webfont.c), URLs (webutil.c), request policy
                            (webpolicy.c), cookies, storage, <canvas> (canvas.c), and
                            <audio> (webaudio.c, the player; codecs.c, the decoders)
-user/desktop/wave/js/      JavaScript (js.c, jslib*.c, jsbinary.c, jsre.c, jsgc.c, jsdom.c)
+user/desktop/wave/js/      JavaScript (js.c, jslib*.c, jsbinary.c, jsre.c, jsgc.c, jsdom.c),
+                           WebAssembly (jswasm.c)
 third_party/mbedtls/        upstream verification library subset and its fluxOS config
 third_party/uacpi/         uACPI 6.1.1, the AML interpreter (unmodified)
 third_party/minimp3/       minimp3, Wave's MP3 decoder (unmodified, public domain)

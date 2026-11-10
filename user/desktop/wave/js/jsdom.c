@@ -6885,6 +6885,8 @@ static void update_pointer_capture(struct jsdom *d)
 
 static int csp_codegen(struct js *J)
 {struct jsdom *d=dom(J);return !(d->h.sandbox&WEB_SB_SCRIPTS) && web_csp_allows(d->h.csp,d->h.url,"eval",NULL,NULL);}
+static int csp_wasm(struct js *J)
+{struct jsdom *d=dom(J);return web_csp_allows(d->h.csp,d->h.url,"wasm",NULL,NULL);}
 static int csp_resource(struct js *J,const char *directive,const char *url)
 {struct jsdom *d=dom(J);return !(d->h.sandbox&WEB_SB_ORIGIN) && web_csp_allows(d->h.csp,d->h.url,directive,url,NULL);}
 
@@ -7390,7 +7392,7 @@ struct jsdom *jsdom_new(const struct jshost *host)
     char origin[300]="null";web_origin(d->h.url,origin,sizeof(origin));
     d->network=jsnet_new(J,d->h.base?d->h.base:d->h.url,origin,d,network_event,network_cookies);
     d->workers=jsworkers_new(J,&d->h,d);
-    d->J->codegen_allowed=csp_codegen;d->J->resource_allowed=csp_resource;
+    d->J->codegen_allowed=csp_codegen;d->J->resource_allowed=csp_resource;d->J->wasm_allowed=csp_wasm;
     d->active_next=active_doms;active_doms=d;
     return d;
 }

@@ -294,7 +294,8 @@ static const char js_core[] = JS_SOURCE(
     return true;
   });
   var M = Math;
-  def(M, "fround", function (x) { return Number(x); });
+  var f32 = null;
+  def(M, "fround", function (x) { if (!f32) f32 = new Float32Array(1); f32[0] = Number(x); return f32[0]; });
   def(M, "sinh", function (x) { return (M.exp(x) - M.exp(-x)) / 2; });
   def(M, "cosh", function (x) { return (M.exp(x) + M.exp(-x)) / 2; });
   def(M, "tanh", function (x) {
@@ -497,6 +498,7 @@ static const char js_chunk_misc[] = JS_SOURCE(
     transfer.forEach(function(b){
       if(g["%binaryType"](b)!=="ArrayBuffer" || b.detached || seen.has(b))
         throw new DOMException("Invalid transfer list", "DataCloneError");
+      if(g["%binaryFixed"](b))throw new TypeError("A WebAssembly memory's buffer cannot be transferred");
       seen.add(b);
     });
     var result=copy(v,new Map());

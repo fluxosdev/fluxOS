@@ -656,7 +656,7 @@ $(BUILD)/tests/gcc-guest.o: tests/gcc-guest.c
 $(BUILD)/tests/gcc-guest: $(BUILD)/tests/gcc-guest.o $(CRT0) $(LIBC) user/user.ld
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 BROWSER_TEST_SRCS := lib/digest.c lib/sha256.c tests/browser-dom.c tests/canvas-font-stub.c tests/js-host-stack.c \
-	$(addprefix user/desktop/wave/js/,js.c jsbig.c jsuni.c jslib.c jslib2.c jsbinary.c jsnet.c jsre.c jsgc.c jsdom.c jscanvas.c jsworker.c) \
+	$(addprefix user/desktop/wave/js/,js.c jsbig.c jsuni.c jslib.c jslib2.c jsbinary.c jswasm.c jsnet.c jsre.c jsgc.c jsdom.c jscanvas.c jsworker.c) \
 	$(addprefix user/desktop/wave/,canvas.c html.c shadow.c webblob.c webintegrity.c webinput.c webutil.c webpolicy.c webstore.c css.c csscolor.c cssfont.c anim.c) \
 	user/libc/inflate.c
 .PHONY: test-browser
@@ -685,6 +685,7 @@ test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-worker $(BUILD)/
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/media-tests.js 5
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/mse-tests.js 7
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/view-transition-tests.js 9
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/wasm-tests.js 26
 	rm -rf $(BUILD)/tests/idb
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/indexeddb-tests.js 3
 	$(BUILD)/tests/js-engine
@@ -926,7 +927,7 @@ $(BUILD)/tests/browser-ws: tests/browser-ws.c $(BROWSER_TEST_SRCS) $(DESKTOP_HDR
 
 # Engine-level tests include real collections on the host's main and coroutine stacks.
 JS_ENGINE_SRCS := lib/digest.c lib/sha256.c tests/js-engine.c tests/js-host-stack.c \
-	$(addprefix user/desktop/wave/js/,js.c jsbig.c jsuni.c jslib.c jslib2.c jsbinary.c jsre.c jsgc.c) \
+	$(addprefix user/desktop/wave/js/,js.c jsbig.c jsuni.c jslib.c jslib2.c jsbinary.c jswasm.c jsre.c jsgc.c) \
 	user/desktop/wave/webutil.c user/libc/inflate.c
 $(BUILD)/tests/js-engine: $(JS_ENGINE_SRCS) $(DESKTOP_HDRS) include/flux/abi.h
 	@mkdir -p $(dir $@)

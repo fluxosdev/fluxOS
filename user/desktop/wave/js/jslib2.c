@@ -10,6 +10,7 @@
 #include <string.h>
 #include "jsint.h"
 #include "jsprelude.h"
+#include "jswasmlib.h"
 #include "jsbinarylib.h"
 
 #define ARG(i) ((i) < argc ? args[(i)] : js_undefined)
@@ -861,6 +862,7 @@ static const struct lazy_chunk {
      {"Headers", "Response", "Request", "ReadableStream", "WritableStream", "TransformStream",
       "CountQueuingStrategy", "ByteLengthQueuingStrategy", "fetch", "EventSource", "TextDecoderStream",
       "TextEncoderStream", "CompressionStream", "DecompressionStream", NULL}},
+    {js_chunk_wasm, sizeof(js_chunk_wasm) - 1, {"WebAssembly", NULL}},
 };
 
 /* A chunk gives a name its value, unless the page has set it already. */

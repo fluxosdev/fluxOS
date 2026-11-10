@@ -1,7 +1,7 @@
 # Wave compatibility work
 
 This change works on the nine areas after the first six in the browser gap review.
-It does not add video/Web Audio, WebAssembly, WebGL/WebGPU, service workers,
+It does not add video/Web Audio, WebGL/WebGPU, service workers,
 WebRTC/capture, or additional cryptography/passkey APIs.
 
 | Area | Implemented in this change | Remaining work |
@@ -29,6 +29,23 @@ tagging and rendered transition frames) and `view-transition-tests.js` (the Java
 The layout and renderer tests also pass under AddressSanitizer and UndefinedBehaviorSanitizer.
 Interactive behaviour (wheel gestures, glides and animation frames) has not been exercised in a
 running fluxOS desktop.
+
+## WebAssembly
+
+| Area | Implemented | Remaining work |
+| --- | --- | --- |
+| JavaScript API | `WebAssembly.Module` (with `imports`, `exports`, `customSections`), `Instance`, `Memory` (`buffer`, `grow`; the old buffer is detached on growth and cannot be transferred), `Table` (`get`, `set`, `grow`, `length`), `Global` (`value`, `valueOf`), `validate`, `compile`, `instantiate`, `compileStreaming`, `instantiateStreaming`, `CompileError`, `LinkError`, `RuntimeError`. Exported functions keep their identity when re-exported, imported or read from a table; `i64` crosses as BigInt; several results come back as an array | Modules cannot be posted to workers or stored in IndexedDB. The exports object is not frozen, as the engine has no `Object.freeze`. `compileStreaming` does not check for `application/wasm`. No JS Promise Integration, ESM integration or `WebAssembly.Tag`/`Exception` |
+| Instructions | WebAssembly 1.0, sign extension, non-trapping float-to-int, bulk memory and table operations, reference types (`funcref`, `externref`, several tables, `ref.func`, typed `select`), multiple values (block types by index), mutable globals, extended constant expressions | SIMD, threads/atomics and shared memory, exception handling, tail calls, function references and GC types, memory64, several memories, table initializer expressions, custom page sizes |
+| Execution | Full validation at compile time; each function is translated on its first call into fixed-size instructions with resolved branch targets, stack heights and value counts, and run by an interpreter that does not recurse in C for calls between WebAssembly functions. Traps raise `RuntimeError`; stack exhaustion (10000 frames or 64K value slots) raises `RangeError`; loops count against the script step limit | No JIT or tiering. Memory is limited to 1 GiB (16384 pages) and must fit the page's script heap, which it shares; it is moved, not grown in place, when it outgrows the room set aside for it. NaN bit patterns are whatever the host's SSE2 arithmetic produces |
+| Security policy | CSP `script-src` (or `default-src`) must allow `'wasm-unsafe-eval'` or `'unsafe-eval'` | No reporting |
+
+`wasm-tests.js` assembles its modules from bytes (there is no text-format compiler in the
+tree) and covers arithmetic, recursion, memory and data segments, growth, imports and
+re-entry, globals, tables and indirect calls, `br_table`, several values, floating point,
+traps, bulk memory, references, start functions, the module descriptions and the promise
+API. It passes under UndefinedBehaviorSanitizer. 30000 mutated modules were run through
+validation, instantiation and calls with no crash. The 32-bit `wave` executable links;
+nothing has been run in a fluxOS session yet.
 
 ## Verification
 

@@ -18,6 +18,7 @@
 struct buffer {
     unsigned char *data;
     int len, detached, shared;
+    int fixed;                          /* WebAssembly memory's: not transferable */
     struct shared_header *shared_header;
 };
 struct view {
@@ -609,13 +610,38 @@ static jsval binary_clone(struct js *J, jsval self, jsval *args, int argc)
     return js_obj(o);
 }
 
+static jsval binary_fixed(struct js *J, jsval self, jsval *args, int argc)
+{
+    struct buffer *b = buffer_of(ARG(0));
+    return js_bool(b && b->fixed);
+}
+
 /* Detach only after structured serialization has succeeded. Existing views consult this flag. */
 static jsval binary_detach(struct js *J,jsval self,jsval *args,int argc)
 {
     struct buffer *b=buffer_of(ARG(0));
+    if(b && b->fixed)return js_throw_error(J,"TypeError: a WebAssembly memory's buffer cannot be transferred");
     if(!b || b->shared || b->detached)return js_throw_error(J,"DataCloneError: buffer is not transferable");
     b->detached=1;b->len=0;
     return js_undefined;
+}
+jsval js_buffer_over(struct js *J, unsigned char *data, int len)
+{
+    struct buffer *b = js_alloc(J, sizeof(*b));
+    b->data = data;
+    b->len = len;
+    b->fixed = 1;
+    struct jsobj *o = js_new_host(J, &buffer_class, b);
+    o->proto = J->buffer_proto;
+    return js_obj(o);
+}
+void js_buffer_detach(jsval v)
+{
+    struct buffer *b = buffer_of(v);
+    if (b) {
+        b->detached = 1;
+        b->len = 0;
+    }
 }
 /* A new Uint8Array holding a copy of n bytes. */
 jsval js_new_bytes(struct js *J, const unsigned char *p, int n)
@@ -1002,6 +1028,7 @@ void js_init_binary(struct js *J)
     js_define_native(J, J->global, "%binaryType", binary_type, 1);
     js_define_native(J, J->global, "%binaryClone", binary_clone, 2);
     js_define_native(J, J->global, "%binaryDetach", binary_detach, 1);
+    js_define_native(J, J->global, "%binaryFixed", binary_fixed, 1);
     js_define_native(J,J->global,"%sharedExport",shared_export,1);
     js_define_native(J,J->global,"%sharedImport",shared_import,1);
     js_define_native(J,J->global,"%atomic",atomic_op,5);
@@ -1036,6 +1063,7 @@ void js_init_binary(struct js *J)
     BIND(Int8) BIND(Uint8) BIND(Int16) BIND(Uint16) BIND(Int32) BIND(Uint32) BIND(Float32) BIND(Float64)
     BIND(BigInt64) BIND(BigUint64)
 #undef BIND
+    js_init_wasm(J);
 }
 
 /* Encoding helpers keep binary bytes separate from JavaScript's UTF-16 indexing. */

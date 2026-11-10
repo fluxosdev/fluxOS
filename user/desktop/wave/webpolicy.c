@@ -515,7 +515,7 @@ int web_csp_allows(const char *policies,const char *document,const char *directi
 {
     for(const char *p=policies?policies:"";*p;) {
         const char *end=strchr(p,'\n');if(!end)end=p+strlen(p);
-        const char *v=NULL,*stop=NULL;int eval=!strcmp(directive,"eval");
+        const char *v=NULL,*stop=NULL;int wasm=!strcmp(directive,"wasm"),eval=wasm || !strcmp(directive,"eval");
         const char *name=eval?"script-src":directive;
         int found=csp_directive(p,end,name,&v,&stop);
         if(!found && (!strcmp(name,"frame-src") || !strcmp(name,"worker-src")))found=csp_directive(p,end,"child-src",&v,&stop);
@@ -531,6 +531,7 @@ int web_csp_allows(const char *policies,const char *document,const char *directi
                 const char *s=v;while(v<stop && !isspace((unsigned char)*v))v++;size_t n=(size_t)(v-s);
                 if(!n)break;
                 if(n==13 && !strncmp(s,"'unsafe-eval'",13) && eval)allowed=1;
+                if(n==18 && !strncmp(s,"'wasm-unsafe-eval'",18) && wasm)allowed=1;
                 if(n==15 && !strncmp(s,"'unsafe-inline'",15))unsafe=1;
                 if(n>8 && !strncmp(s,"'nonce-",7) && s[n-1]=='\'') {
                     has_nonce=1;if(nonce && strlen(nonce)==n-8 && !memcmp(s+7,nonce,n-8))allowed=1;

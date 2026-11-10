@@ -144,6 +144,8 @@ struct js {
     struct gcheap *heap;                /* jsgc.c */
     int gc_inhibit;                     /* no collections while this is above 0 (parsing) */
     int (*codegen_allowed)(struct js *J);
+    int (*wasm_allowed)(struct js *J);  /* may the page compile WebAssembly (CSP)? NULL: yes */
+    void *wasm;                         /* jswasm.c: the WebAssembly runtime, once used */
     int (*resource_allowed)(struct js *J,const char *directive,const char *url);
     void *host;
     void *network;                      /* jsnet: WebSocket worker state */
@@ -377,5 +379,12 @@ const char *re_source(struct regex *re);
 const char *re_flags(struct regex *re);
 
 void js_binary_free(struct js *J);
+/* An ArrayBuffer over bytes owned elsewhere (WebAssembly memory): it cannot be
+ * transferred, and js_buffer_detach empties it when the memory moves. */
+jsval js_buffer_over(struct js *J, unsigned char *data, int len);
+void js_buffer_detach(jsval buf);
+
+/* jswasm.c: the primitives the WebAssembly namespace (jswasmlib.h) is built on */
+void js_init_wasm(struct js *J);
 
 #endif
