@@ -321,7 +321,7 @@ says why.
   (click for Task Manager), added or removed from its menu (the heading's button,
   "Add widgets...", or a right click). Right-click the taskbar for **Show
   Sidebar**. It is on by default at 1024 pixels wide and more; the choice is kept.
-- KDE's Breeze icons (PNG; Oxygen's older ones can be chosen instead on the Appearance
+- KDE's Oxygen icons (PNG; Breeze's newer ones can be chosen instead on the Appearance
   page), PNG, JPEG, GIF and SVG decoding (the first bytes decide,
   whatever the name), and a wallpaper (Fill, Stretch, Center or Tile).
 - Windows move, minimize, maximize and cascade; the browser, text editor, file
@@ -362,7 +362,7 @@ says why.
   a file without sound the wall's. `ffmpeg` and `ffprobe` are in `/usr/bin`.
 - **Display Properties**: wallpaper and fill mode with a preview (with **(None)** chosen, a
   `#rrggbb` field sets the solid desktop color; **Kinetik** is the theme's drawn
-  wallpaper), the theme, its color and the icons (Breeze or Oxygen) with a live sample, resolution,
+  wallpaper), the theme, its color and the icons (Oxygen, the default, or Breeze) with a live sample, resolution,
   color depth and refresh rate (with a 15 s "keep this mode?" prompt on the
   3dfx and Radeon drivers), monitor type and EDID details. Settings are saved
   in GRUB's environment block on an installed system.

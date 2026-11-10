@@ -1,7 +1,7 @@
 /*
  * Icons and the mouse pointer. Icons are PNG files from the icon set in
- * use (theme.icons): KDE's Breeze in /usr/share/icons/breeze, or Oxygen
- * in /usr/share/icons/oxygen, each in <size>x<size>/, loaded the first
+ * use (theme.icons): KDE's Oxygen in /usr/share/icons/oxygen (the default), or Breeze
+ * in /usr/share/icons/breeze, each in <size>x<size>/, loaded the first
  * time they are drawn. If a file is missing, a simple built-in icon drawn
  * with rectangles on a 32x32 design grid takes its place.
  */
@@ -358,7 +358,7 @@ static struct image *icon_image(enum icon_id id, int size)
 {
     if (id <= ICON_NONE || id >= ICON_COUNT || !icon_names[id])
         return NULL;
-    int set = theme.icons >= 0 && theme.icons < ICON_SETS ? theme.icons : ICONS_BREEZE;
+    int set = theme.icons >= 0 && theme.icons < ICON_SETS ? theme.icons : ICONS_OXYGEN;
     for (int k = 0; k < NSIZES; k++) {
         if (icon_sizes[k] != size)
             continue;

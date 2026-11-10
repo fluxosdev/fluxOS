@@ -15,8 +15,10 @@ int wfont_ascent(const struct wfont *f) { return f->px; }
 int wfont_size(const struct wfont *f) { return f->px; }
 int wfont_width(const struct wfont *f, const char *s, int n)
 { int w = 0; for (int i = 0; i < n; i++) if (((unsigned char)s[i] & 0xC0) != 0x80) w += f->px / 2; return w; }
+static int draw_glyph_boxes;            /* text paints its boxes, for tests that compare pixels of it */
+void gfx_fill(struct surface *s, int x, int y, int w, int h, color_t c);
 int wfont_draw(struct surface *s, const struct wfont *f, int x, int y, const char *str, int n, color_t c)
-{ (void)s; (void)x; (void)y; (void)str; (void)c; return wfont_width(f, str, n); }
+{ int w = wfont_width(f, str, n); if (draw_glyph_boxes) gfx_fill(s, x, y, w, wfont_height(f), c); return w; }
 struct syscolors sys;
 int rect_empty(struct rect r) { return r.w <= 0 || r.h <= 0; }
 struct rect rect_intersect(struct rect a, struct rect b) {
@@ -1618,6 +1620,57 @@ static void hostile_layout(void)
     }
     test_img.px = saved_px;
 }
+#define WORDS "aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt uu vv ww xx yy zz "
+#define DIVS "<div></div><div></div><div></div><div></div><div></div><div></div><div></div><div></div><div></div><div></div>"
+
+/* After a scroll the browser moves what the view shows and paints only the strip that came into view
+ * (browser.c paint_scrolled). That must give the same pixels as painting the whole view: text whose
+ * shadow or underline reaches past its box, and filters, whose blur must not stop at the clip. */
+static void scrolled_strips(void)
+{
+    enum { W = 120, H = 200, VX = 6, VY = 30, VW = 100, VH = 150 };
+    static uint32_t moved[W * H], whole[W * H];
+    static const char *const pages[] = {
+        "<style>body{margin:0;font-size:16px;color:blue;text-shadow:2px -3px 2px red}</style><p>" WORDS WORDS,
+        "<style>body{margin:0;font-size:16px;color:blue;text-shadow:-9px 12px 0 red}</style><p>" WORDS WORDS,
+        "<style>body{margin:0;font-size:16px;text-decoration:underline;text-underline-offset:9px}</style><p>" WORDS WORDS,
+        "<style>body{margin:0}div{height:23px;margin:9px;background:red;filter:blur(3px)}</style>" DIVS,
+        "<style>body{margin:0}div{height:23px;margin:9px;background:red;filter:drop-shadow(0 5px 3px black)}</style>" DIVS,
+    };
+    draw_glyph_boxes = 1;
+    for (unsigned k = 0; k < sizeof(pages) / sizeof(pages[0]); k++) {
+        struct page p;
+        load(&p, pages[k], VW, VH);
+        static const int steps[] = { 1, 7, 40, -1, -7, -40 };
+        for (unsigned j = 0; j < sizeof(steps) / sizeof(steps[0]); j++)
+            for (int from = 0; from <= 120; from += 17) {
+                int to = from + steps[j], dy = steps[j], ady = dy < 0 ? -dy : dy;
+                if (to < 0)
+                    continue;
+                struct surface s = { moved, W, H, W, { VX, VY, VW, VH } };
+                paint_document(&p.lo, &s, VX, VY, 0, from, NULL, 0);
+                if (dy > 0)
+                    for (int r = 0; r < VH - ady; r++)
+                        memmove(&moved[(VY + r) * W + VX], &moved[(VY + r + dy) * W + VX], VW * sizeof(*moved));
+                else
+                    for (int r = VH - ady - 1; r >= 0; r--)
+                        memmove(&moved[(VY + ady + r) * W + VX], &moved[(VY + r) * W + VX], VW * sizeof(*moved));
+                s.clip = dy > 0 ? mkrect(VX, VY + VH - dy, VW, dy) : mkrect(VX, VY, VW, ady);
+                paint_document(&p.lo, &s, VX, VY, 0, to, NULL, 0);
+                s = (struct surface){ whole, W, H, W, { VX, VY, VW, VH } };
+                paint_document(&p.lo, &s, VX, VY, 0, to, NULL, 0);
+                for (int y = VY; y < VY + VH; y++)
+                    for (int x = VX; x < VX + VW; x++)
+                        if (moved[y * W + x] != whole[y * W + x]) {
+                            fprintf(stderr, "page %u scrolled %d from %d: (%d,%d) is %06x, not %06x\n", k, dy, from,
+                                    x - VX, y - VY, moved[y * W + x] & 0xffffff, whole[y * W + x] & 0xffffff);
+                            CHECK(0);
+                        }
+            }
+        unload(&p);
+    }
+    draw_glyph_boxes = 0;
+}
 
 int main(void)
 {
@@ -1648,5 +1701,6 @@ int main(void)
     canvas_layout();
     cjk_wrapping();
     hostile_layout();
-    puts("browser layout: spacing, wrapping, fixed and sticky boxes, the top layer, anchor positioning, fit-content, outlines, tables, ruby, background pictures, object-fit, scrolling boxes, canvases, CJK wrapping and multi-column boxes passed");
+    scrolled_strips();
+    puts("browser layout: spacing, wrapping, fixed and sticky boxes, the top layer, anchor positioning, fit-content, outlines, tables, ruby, background pictures, object-fit, scrolling boxes, canvases, CJK wrapping, multi-column boxes and scrolled strips passed");
 }

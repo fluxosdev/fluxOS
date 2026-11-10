@@ -221,7 +221,7 @@ struct browser {
     unsigned shown_layouts;
     struct rect shown_view;
     unsigned fixed_bg_for;              /* 1 + the layout fixed_bg is of */
-    int fixed_bg;                       /* some background stays put while the page scrolls */
+    int fixed_bg;                       /* some background stays put, or is filtered, while the page scrolls */
     int scroll_x, scroll_y;
     int restore_scroll;         /* back/forward: where the page was */
     const char *pending_fragment;
@@ -7044,13 +7044,17 @@ static void paint(struct browser *b)
     web_perf_end(WP_PAINT,paint_start);
 }
 
-/* Whether some background picture is fixed to the window (it does not move with the page). */
+/* Whether some of the page cannot just be moved when it scrolls: a background picture fixed to the
+ * window, or a backdrop-filter (it filters what is on the screen behind it, so a strip of the view
+ * painted alone would filter only the strip). */
 static int has_fixed_bg(struct browser *b)
 {
     if (b->fixed_bg_for != b->layouts + 1) {
         b->fixed_bg = 0;
         for (int i = 0; i < b->lo.nitems && !b->fixed_bg; i++)
-            if (b->lo.items[i].kind == DK_BGIMG)
+            if (b->lo.items[i].backdrop)
+                b->fixed_bg = 1;
+            else if (b->lo.items[i].kind == DK_BGIMG)
                 for (const struct bgpaint *p = b->lo.items[i].bgp; p && !b->fixed_bg; p = p->next)
                     b->fixed_bg = p->fixed;
         b->fixed_bg_for = b->layouts + 1;

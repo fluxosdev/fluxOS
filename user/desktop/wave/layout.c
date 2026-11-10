@@ -7796,14 +7796,20 @@ static void paint_transformed(const struct layout *lo,const struct ditem *item,s
     /* filter, clip-path and blend: the groups round the item, innermost first */
     int chain[64],nchain=0,effects=item->fx && fx_offscreen(lo,item->fx);
     for(int g=item->fx;effects && g>0 && g<=lo->nfx && nchain<64;g=lo->fx[g-1].parent)chain[nchain++]=g;
-    int pad=8+abs(d.sh_x)+abs(d.sh_y)+d.sh_blur;
-    for(int k=0;k<nchain;k++)pad+=fx_reach(lo->fx[chain[k]-1].node->style->filter);
+    int pad=8+abs(d.sh_x)+abs(d.sh_y)+d.sh_blur,reach=0;
+    for(int k=0;k<nchain;k++)reach+=fx_reach(lo->fx[chain[k]-1].node->style->filter);
+    if(reach>512)reach=512;
+    pad+=reach;
     if(pad>512)pad=512;
     struct rect source=mkrect(d.x-pad,d.y-pad,d.w+2*pad,d.h+2*pad);
     struct rect visible=mkrect(dst->clip.x-ox+sx,dst->clip.y-oy+sy,dst->clip.w,dst->clip.h);
     struct rect output=rect_intersect(mapped_rect(m,source),visible);
     if(rect_empty(output))return;
-    source=rect_intersect(source,mapped_rect(inv,output));
+    /* A blur or shadow at the edge of what shows draws on pixels beyond it: keep those in the source,
+     * or the result would depend on where the clip falls (and scrolled strips would not match). */
+    struct rect needed=mapped_rect(inv,output);
+    needed=mkrect(needed.x-reach,needed.y-reach,needed.w+2*reach,needed.h+2*reach);
+    source=rect_intersect(source,needed);
     if(rect_empty(source))return;
     /* Bound scratch memory even for extreme matrices and enormous source boxes. */
     size_t pixels=(size_t)source.w*(size_t)source.h;
@@ -7986,6 +7992,22 @@ static int paint_opacity(const struct layout *lo,int group,struct surface *dst,i
     }
     opacity_release(storage,scratch_slot);return 1;
 }
+/* How far a text item can draw outside its box: web-font and fallback glyphs taller or wider than the
+ * line, its shadow and its decorations. When only a strip of the view is painted (after a scroll),
+ * an item skipped for its box alone would leave the part of it inside the strip unpainted. */
+static int text_ink(const struct ditem *d)
+{
+    int m = (d->font ? wfont_size(d->font) : 16) + 4;
+    if (d->sh_color)
+        m += abs(d->sh_x) + abs(d->sh_y) + 2;
+    if (d->deco) {
+        int off = d->underline_offset == (-2147483647-1) ? 0 : abs(d->underline_offset);
+        int thick = abs(d->deco_thickness);
+        m += (off > 4096 ? 4096 : off) + (thick > 4096 ? 4096 : thick);
+    }
+    return m;
+}
+
 static void paint_layer(const struct layout *lo, struct surface *s, int ox, int oy, int sx, int sy,
                     const struct node *focus, int caret_on,int skip)
 {
@@ -8039,9 +8061,9 @@ static void paint_layer(const struct layout *lo, struct surface *s, int ox, int 
                 sbclip = view;
             }
         }
-        int idx = d->sb ? sbdx : 0, idy = d->sb ? sbdy : 0;
-        if (d->y + ddy + idy >= vy + view.h || d->y + ddy + idy + d->h + 4 <= vy ||
-            d->x + ddx + idx >= vx + view.w || d->x + ddx + idx + d->w <= vx)
+        int idx = d->sb ? sbdx : 0, idy = d->sb ? sbdy : 0, ink = d->kind == DK_TEXT ? text_ink(d) : 0;
+        if (d->y + ddy + idy - ink >= vy + view.h || d->y + ddy + idy + d->h + 4 + ink <= vy ||
+            d->x + ddx + idx - ink >= vx + view.w || d->x + ddx + idx + d->w + ink <= vx)
             continue;
         if (d->sb && rect_empty(sbclip))
             continue;

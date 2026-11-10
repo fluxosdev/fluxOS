@@ -29,7 +29,7 @@ The desktop
                    Background: wallpaper (Fill, Stretch, Center, Tile) or a
                    plain color; Appearance: Seashell (the default), the
                    Kinetik theme in six colors, Kinetik Glass, or Classic,
-                   the Windows 95 look, and Breeze or Oxygen icons; video
+                   the Windows 95 look, and Oxygen or Breeze icons; video
                    mode, monitor and refresh rate where the video driver
                    can change them
 

@@ -24,8 +24,8 @@
  * look in use, and changing it is the desktop's to do (server.c's
  * theme_set, and theme_sample).
  *
- * The icons are a choice of their own: KDE's Breeze, or Oxygen (icons.c).
- * Without a choice saved, the look is Seashell with Breeze's icons.
+ * The icons are a choice of their own: KDE's Oxygen, or Breeze (icons.c).
+ * Without a choice saved, the look is Seashell with Oxygen's icons.
  *
  * The choice is kept in GRUB's environment block when the system runs from
  * a hard disk (fluxos_theme: "classic", "glass", "seashell", or "kinetik-" and
@@ -155,7 +155,7 @@ void theme_init(void)
 {
     char dir[128], value[32];
     int style = THEME_SEASHELL, accent = ACCENT_BLUE;
-    theme.icons = ICONS_BREEZE;
+    theme.icons = ICONS_OXYGEN;
     if (grubenv_boot_dir(dir, sizeof(dir))) {
         if (grubenv_get(dir, "fluxos_theme", value, sizeof(value)))
             parse(value, &style, &accent);
@@ -177,7 +177,7 @@ void theme_save(void)
     else
         snprintf(value, sizeof(value), "%s-%s", style_keys[theme.style], accent_keys[theme.accent]);
     const char *keys[2] = { "fluxos_theme", "fluxos_icons" };
-    const char *vals[2] = { value, icon_set_dirs[theme.icons >= 0 && theme.icons < ICON_SETS ? theme.icons : 0] };
+    const char *vals[2] = { value, icon_set_dirs[theme.icons >= 0 && theme.icons < ICON_SETS ? theme.icons : ICONS_OXYGEN] };
     grubenv_update(dir, keys, vals, 2);
 }
 

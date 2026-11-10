@@ -28,7 +28,7 @@
  * Seashell is Kinetik flat and light, in warm sage grays with blue for what is chosen. */
 enum theme_style { THEME_CLASSIC, THEME_KINETIK, THEME_GLASS, THEME_SEASHELL, THEME_STYLES };
 enum { ACCENT_BLUE, ACCENT_PURPLE, ACCENT_ORANGE, ACCENT_GREEN, ACCENT_WHITE, ACCENT_BLACK, ACCENTS };
-/* The icons: KDE's Breeze, or its older Oxygen (/usr/share/icons/breeze or oxygen). */
+/* The icons: KDE's Oxygen (the default), or its newer Breeze (/usr/share/icons/oxygen or breeze). */
 enum { ICONS_BREEZE, ICONS_OXYGEN, ICON_SETS };
 
 struct theme {
@@ -54,7 +54,7 @@ extern const char *const icon_set_names[ICON_SETS];
 extern const char *const icon_set_dirs[ICON_SETS];     /* "breeze", "oxygen" */
 
 /* The look in use, at startup: the saved one (fluxos_theme and fluxos_icons in grubenv), or
- * Seashell with Breeze's icons. */
+ * Seashell with Oxygen's icons. */
 void theme_init(void);
 /* Take on a look: the values only (theme_set is what changes it for everyone). */
 void theme_apply(int style, int accent);
