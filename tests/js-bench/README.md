@@ -53,3 +53,26 @@ ran 1.3x to 1.5x faster in this comparison, which the property changes do not
 explain; treat those as differences in how the compiler laid out the VM. The
 heap after start-up and a collection grew from 2.7 MB to 3.1 MB on the host,
 mostly the shared second-level cache and the shapes' tables.
+
+## Memory per byte of script
+
+`make bench-js-memory JS_MEMORY_FILES="..."` runs each script's top level in a
+fresh engine and prints the live heap after a collection, in bytes per byte of
+source, with peak resident memory. On 2026-11-09, on the host (64-bit, so
+pointers are twice the target's), with three large bundles from a local VS Code
+install (not part of the repository):
+
+| Script | Source | Live before | Live after | Time before | Time after |
+|---|---:|---:|---:|---:|---:|
+| typescript.js | 8.7 MB | 117.5 MB | 24.9 MB | 2.7 s | 1.6 s |
+| esbuild webview bundle | 5.8 MB | did not parse | 32.5 MB | | 1.0 s |
+| esbuild mermaid bundle | 4.8 MB | did not parse | 13.8 MB | | 1.2 s |
+
+Once their template literals parsed, the esbuild bundles took 6 to 12 s, as
+scopes and constant pools were searched one entry at a time; both are hashed
+past a dozen entries now.
+
+The two esbuild bundles stop at a missing `window` or `acquireVsCodeApi`, as
+nothing outside a browser provides them. Peak memory is still the whole first
+parse (about 270 MB for each of these on the host): every function's tree
+exists until the script's top level has been analysed and compiled.

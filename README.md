@@ -597,7 +597,11 @@ fetcher process, so the browser keeps running), or from `file://`.
   that runs inline and external scripts (`defer` ones and modules after the
   rest), then `DOMContentLoaded` and `load`. Scope analysis resolves local
   variables to frame slots and captured variables to heap environment slots;
-  functions compile on first use. Ordinary functions, generators, async
+  functions compile on first use. Once a function (or a script's top level) is
+  compiled, the functions it makes become stubs that keep only where they are in
+  the source: their syntax trees are let go and parsed again when first called,
+  and compiled code lets go of its own tree, so a big bundle keeps about three
+  bytes per byte of source rather than the dozen or more its whole tree takes. Ordinary functions, generators, async
   functions, classes, destructuring, modules, `eval` and event handlers all run
   as bytecode. Objects built alike share a shape (their keys' layout, in
   insertion order), and property reads, writes, object literals and global
@@ -855,6 +859,7 @@ make check      # verifies the kernel is a valid Multiboot image (mbcheck)
 make test-browser # DOM, CSS/layout, binary/Unicode, shadow/motion and HTTP policy regressions
 make test-js     # language, module, suspended-frame and real garbage-collection regressions
 make bench-js   # ten standalone JavaScript workloads with wall time and peak memory
+make bench-js-memory JS_MEMORY_FILES="a.js b.js" # live heap kept per byte of each script
 make test-browser-fonts # real glyph rendering and malformed-font rejection
 make test-tls     # local OpenSSL servers: authenticated handshakes and rejected certificates
 make test-websocket # local ws/wss transport and browser API integration tests

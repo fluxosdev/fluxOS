@@ -258,6 +258,29 @@ int main(void)
         "collectNow();assert(held()===11);}churn();");
     CHECK(gc_heap_bytes(engine) < before + (12u << 20));
     CHECK(sweeps > 10);
+
+    /* A big script whose functions mostly never run keeps little of its syntax trees: the
+     * functions not yet called are stubs, parsed again when they are, and what was compiled lets
+     * go of its tree. The bundle's wrapper runs at once; f7 runs later, after collections. */
+    {
+        enum { NFUNCS = 3000 };
+        size_t cap = (size_t)NFUNCS * 160 + 256, n = 0;
+        char *big = malloc(cap);
+        CHECK(big != NULL);
+        n += (size_t)snprintf(big + n, cap - n, "var lazyKeep=(function(){var shared=5;");
+        for (int i = 0; i < NFUNCS; i++)
+            n += (size_t)snprintf(big + n, cap - n, "function f%d(a){var o={k:a+%d,s:shared};"
+                                  "return [o].map(function(x){return x.k*2+x.s;})[0];}", i, i);
+        n += (size_t)snprintf(big + n, cap - n, "return f7;})();");
+        gc_collect(engine);
+        size_t base = gc_heap_bytes(engine);
+        CHECK(js_eval(engine, big, (int)n, "lazy bundle") == 0);
+        gc_collect(engine);
+        /* The whole tree would be over 20 MiB on the host; what is kept is about the source. */
+        CHECK(gc_heap_bytes(engine) < base + n * 4 + (1u << 20));
+        free(big);
+        run("collectNow();assert(lazyKeep(1)===21);collectNow();assert(lazyKeep(2)===23);");
+    }
     js_free(engine);
 
     /* A runaway script ends the entry with a diagnostic. */

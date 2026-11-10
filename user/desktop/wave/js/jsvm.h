@@ -59,7 +59,11 @@ struct vscope {
     struct vdecl **d;
     int nd, cap;
     int nslots;
+    uint32_t *tab;                      /* past SC_SCAN declarations: name hash -> index + 1 */
+    uint32_t tabcap;
 };
+
+#define SC_SCAN 12                      /* declarations a scope searches one by one */
 
 struct vfunc {
     struct ast *ast;                    /* N_FUNC, or a root (script, module, eval) */
@@ -103,8 +107,40 @@ static struct vscope *sc_new(struct an *A, struct vscope *parent, int kind)
     return s;
 }
 
+/* Minified bundles put tens of thousands of names in one scope, and every use of a name searches
+ * each scope out to the one that declares it: past SC_SCAN, scopes look names up by hash. */
+static void sc_index(struct vscope *s, uint32_t i)
+{
+    uint32_t mask = s->tabcap - 1, h = js_str_hash(s->d[i]->name) & mask;
+    while (s->tab[h])
+        h = (h + 1) & mask;
+    s->tab[h] = i + 1;
+}
+
+static void sc_rehash(struct js *J, struct vscope *s)
+{
+    uint32_t cap = 64;
+    while (cap < (uint32_t)s->nd * 2)
+        cap *= 2;
+    uint32_t *tab = js_alloc_atomic(J, sizeof(*tab) * cap);
+    memset(tab, 0, sizeof(*tab) * cap);
+    s->tab = tab;
+    s->tabcap = cap;
+    for (int i = 0; i < s->nd; i++)
+        sc_index(s, (uint32_t)i);
+}
+
 static struct vdecl *sc_find(struct vscope *s, struct jsstr *name)
 {
+    if (s->tab) {
+        uint32_t mask = s->tabcap - 1;
+        for (uint32_t h = js_str_hash(name) & mask; s->tab[h]; h = (h + 1) & mask) {
+            struct vdecl *d = s->d[s->tab[h] - 1];
+            if (d->name == name || str_eq(d->name, name))
+                return d;
+        }
+        return NULL;
+    }
     for (int i = 0; i < s->nd; i++)
         if (s->d[i]->name == name)
             return s->d[i];
@@ -134,6 +170,10 @@ static struct vdecl *sc_add(struct js *J, struct vscope *s, struct jsstr *name, 
         s->cap = nc;
     }
     s->d[s->nd++] = d;
+    if (s->tab && (uint32_t)s->nd * 2 <= s->tabcap)
+        sc_index(s, (uint32_t)s->nd - 1);
+    else if (s->nd > SC_SCAN)
+        sc_rehash(J, s);
     return d;
 }
 
@@ -913,6 +953,8 @@ struct cg {
     int n, cap;
     jsval *k;
     int nk, kcap;
+    uint32_t *ktab;                     /* constants by hash -> index + 1, once there are many */
+    uint32_t ktabcap;
     int sp, maxsp;
     int nregs, niters, h, maxh;
     int nic;
@@ -973,12 +1015,54 @@ static void op2ic(struct cg *C, int code, int delta, int a, int b)
     cg_word(C, (uint32_t)C->nic++);
 }
 
+/* Constants are the same if they are numbers with the same bits (-0 is not 0), or the same thing. */
+static int k_same(jsval a, jsval b)
+{
+    return a.t == b.t && (a.t == JS_NUM ? !memcmp(&a.u.n, &b.u.n, sizeof(double)) : a.u.s == b.u.s);
+}
+
+static uint32_t k_hash(jsval v)
+{
+    uint64_t x = 0;
+    if (v.t == JS_NUM)
+        memcpy(&x, &v.u.n, sizeof(x));
+    else
+        x = (uint64_t)(uintptr_t)v.u.s;
+    x = (x ^ (x >> 29) ^ v.t) * 0x9E3779B97F4A7C15ull;
+    return (uint32_t)(x >> 32);
+}
+
+#define K_SCAN 16                       /* constants a function's pool searches one by one */
+
+static void k_index(struct cg *C, int i)
+{
+    uint32_t mask = C->ktabcap - 1, h = k_hash(C->k[i]) & mask;
+    while (C->ktab[h])
+        h = (h + 1) & mask;
+    C->ktab[h] = (uint32_t)i + 1;
+}
+
+/* Big functions (a bundle's top level) have thousands of constants: past K_SCAN, look them up by hash. */
 static int cg_const(struct cg *C, jsval v)
 {
-    for (int i = 0; i < C->nk; i++)     /* numbers by their bits: -0 is not 0 */
-        if (C->k[i].t == v.t && (v.t == JS_NUM ? !memcmp(&C->k[i].u.n, &v.u.n, sizeof(double))
-                                               : C->k[i].u.s == v.u.s))
-            return i;
+    if (C->ktab) {
+        uint32_t mask = C->ktabcap - 1;
+        for (uint32_t h = k_hash(v) & mask; C->ktab[h]; h = (h + 1) & mask)
+            if (k_same(C->k[C->ktab[h] - 1], v))
+                return (int)C->ktab[h] - 1;
+    } else {
+        for (int i = 0; i < C->nk; i++)
+            if (k_same(C->k[i], v))
+                return i;
+    }
+    if (C->nk >= K_SCAN && (uint32_t)(C->nk + 1) * 2 > C->ktabcap) {
+        uint32_t cap = C->ktabcap ? C->ktabcap * 2 : 64;
+        C->ktab = js_alloc_atomic(C->J, sizeof(*C->ktab) * cap);
+        memset(C->ktab, 0, sizeof(*C->ktab) * cap);
+        C->ktabcap = cap;
+        for (int i = 0; i < C->nk; i++)
+            k_index(C, i);
+    }
     if (C->nk == C->kcap) {
         int nc = C->kcap ? C->kcap * 2 : 16;
         jsval *nk = js_alloc(C->J, sizeof(*nk) * (size_t)nc);
@@ -988,6 +1072,8 @@ static int cg_const(struct cg *C, jsval v)
         C->kcap = nc;
     }
     C->k[C->nk] = v;
+    if (C->ktab)
+        k_index(C, C->nk);
     return C->nk++;
 }
 

@@ -1617,16 +1617,15 @@ int js_loose_equal(struct js *J, jsval a, jsval b)
 
 enum { K_EOF, K_NUM, K_STR, K_TEMPLATE, K_IDENT, K_PUNCT, K_REGEX };
 
+/* A token is where it is in the source; its value (a number's, a string's) is worked out from
+ * there when the parser wants it (tok_num, tok_str, tok_regex), as a big script has millions. */
 struct tok {
     uint8_t kind;
     uint8_t nl;                         /* a line break came before it */
-    uint8_t big;                        /* a BigInt literal: its digits are str */
+    uint8_t big;                        /* a BigInt literal */
     int line;
     const char *p;                      /* source text */
     int len;
-    double num;
-    struct jsstr *str;                  /* strings: the value; regex: the pattern */
-    struct jsstr *flags;                /* regex */
 };
 
 struct lexer {
@@ -1781,7 +1780,9 @@ static struct jsstr *cook(struct js *J, const char *s, const char *end)
 static struct tok *new_tok(struct lexer *L)
 {
     if (L->n == L->cap) {
-        int cap = L->cap ? L->cap * 2 : 256;
+        /* A minified script has a token for every two or three bytes. */
+        int guess = (int)((L->end - L->s) / 4);
+        int cap = L->cap ? L->cap + L->cap / 2 : guess > 256 ? guess : 256;
         struct tok *nt = realloc(L->toks, sizeof(struct tok) * (size_t)cap);
         if (!nt)
             return NULL;
@@ -1804,6 +1805,112 @@ static int regex_allowed(const struct tok *prev)
         return is_keyword(prev) && !tok_is(prev, "this") && !tok_is(prev, "null") &&
                !tok_is(prev, "true") && !tok_is(prev, "false") && !tok_is(prev, "super");
     return !tok_is(prev, ")") && !tok_is(prev, "]") && !tok_is(prev, "}");
+}
+
+/*
+ * Template literals' extent. A ${...} substitution is code, so it is skipped as code: strings,
+ * comments, regular expressions and nested templates in it may hold braces and backticks of
+ * their own. s is just past the opening backtick (template_end) or the "${" (subst_end); the
+ * result is the closing backtick or brace, or NULL if there is none. *lines counts the line
+ * breaks passed. depth bounds the nesting, as the input may be a page's.
+ */
+#define TEMPLATE_MAX_DEPTH 64
+static const char *subst_end(const char *s, const char *end, int *lines, int depth);
+
+static const char *template_end(const char *s, const char *end, int *lines, int depth)
+{
+    if (depth > TEMPLATE_MAX_DEPTH)
+        return NULL;
+    while (s < end) {
+        if (*s == '\\') {
+            if (s + 1 < end && s[1] == '\n')
+                (*lines)++;
+            s += s + 1 < end ? 2 : 1;
+            continue;
+        }
+        if (*s == '`')
+            return s;
+        if (*s == '$' && s + 1 < end && s[1] == '{') {
+            const char *e = subst_end(s + 2, end, lines, depth + 1);
+            if (!e)
+                return NULL;
+            s = e + 1;
+            continue;
+        }
+        if (*s == '\n')
+            (*lines)++;
+        s++;
+    }
+    return NULL;
+}
+
+static const char *subst_end(const char *s, const char *end, int *lines, int depth)
+{
+    struct tok prev = { .kind = K_PUNCT, .p = "(", .len = 1 };     /* what the last token was like */
+    int braces = 0;
+    while (s < end) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '\n') {
+            (*lines)++;
+            s++;
+        } else if (is_space(c)) {
+            s++;
+        } else if (c == '/' && s + 1 < end && s[1] == '/') {
+            while (s < end && *s != '\n')
+                s++;
+        } else if (c == '/' && s + 1 < end && s[1] == '*') {
+            for (s += 2; s < end && !(*s == '*' && s + 1 < end && s[1] == '/'); s++)
+                if (*s == '\n')
+                    (*lines)++;
+            if (s >= end)
+                return NULL;
+            s += 2;
+        } else if (c == '"' || c == '\'') {
+            for (s++; s < end && *s != (char)c && *s != '\n'; s++)
+                if (*s == '\\' && s + 1 < end)
+                    s++;
+            if (s >= end || *s != (char)c)
+                return NULL;
+            s++;
+            prev = (struct tok){ .kind = K_STR };
+        } else if (c == '`') {
+            const char *e = template_end(s + 1, end, lines, depth + 1);
+            if (!e)
+                return NULL;
+            s = e + 1;
+            prev = (struct tok){ .kind = K_TEMPLATE };
+        } else if (c == '/' && regex_allowed(&prev)) {
+            int in_class = 0;
+            for (s++; s < end && *s != '\n' && (in_class || *s != '/'); s++) {
+                if (*s == '\\' && s + 1 < end)
+                    s++;
+                else if (*s == '[')
+                    in_class = 1;
+                else if (*s == ']')
+                    in_class = 0;
+            }
+            if (s >= end || *s != '/')
+                return NULL;
+            for (s++; s < end && ident_char((unsigned char)*s); s++)
+                ;
+            prev = (struct tok){ .kind = K_REGEX };
+        } else if (ident_char(c) || c == '\\' || c == '#') {
+            const char *w = s;
+            while (s < end && (ident_char((unsigned char)*s) || *s == '\\' || *s == '#' ||
+                               (*s == '.' && w[0] >= '0' && w[0] <= '9')))
+                s++;
+            prev = (struct tok){ .kind = w[0] >= '0' && w[0] <= '9' ? K_NUM : K_IDENT,
+                                 .p = w, .len = (int)(s - w) };
+        } else if (c == '}' && !braces) {
+            return s;
+        } else {
+            if (c == '{' || c == '}')
+                braces += c == '{' ? 1 : -1;
+            prev = (struct tok){ .kind = K_PUNCT, .p = s, .len = 1 };
+            s++;
+        }
+    }
+    return NULL;
 }
 
 static int lex(struct lexer *L)
@@ -1872,8 +1979,7 @@ static int lex(struct lexer *L)
             while (run < L->end && (ident_char((unsigned char)*run) || *run == '.'))
                 run++;
             if (run[-1] == 'n' && !memchr(s, '.', (size_t)(run - s))) {
-                t->big = 1;             /* a BigInt: the digits as written (0x, 0o, 0b, _) */
-                t->str = js_mkstr(L->J, s, (int)(run - 1 - s));
+                t->big = 1;             /* a BigInt: the digits as written (0x, 0o, 0b, _), then n */
                 t->len = (int)(run - s);
                 L->s = run;
                 continue;
@@ -1889,15 +1995,14 @@ static int lex(struct lexer *L)
             clean[nclean] = 0;
             int used_clean = 0;
             if (has_sep && run - s < (int)sizeof(clean)) {
-                double v = parse_number(clean, nclean, &used_clean);
+                parse_number(clean, nclean, &used_clean);
                 if (used_clean == nclean) {
-                    t->num = v;
                     t->len = (int)(run - s);
                     L->s = run;
                     continue;
                 }
             }
-            t->num = parse_number(s, (int)(L->end - s), &used);
+            parse_number(s, (int)(L->end - s), &used);
             if (!used) {
                 L->error = "bad number";
                 L->error_line = L->line;
@@ -1906,13 +2011,10 @@ static int lex(struct lexer *L)
             /* legacy octal like 0755 */
             if (s[0] == '0' && used > 1 && s[1] >= '0' && s[1] <= '7') {
                 int k = 1;
-                double v = 0;
                 while (s + k < L->end && s[k] >= '0' && s[k] <= '7')
-                    v = v * 8 + (s[k++] - '0');
-                if (s + k >= L->end || !(s[k] >= '8' && s[k] <= '9') ) {
-                    t->num = v;
-                    used = k;
-                }
+                    k++;
+                if (s + k >= L->end || !(s[k] >= '8' && s[k] <= '9') )
+                    used = k;           /* tok_num reads it as octal */
             }
             t->len = used;
             L->s = s + used;
@@ -1944,45 +2046,16 @@ static int lex(struct lexer *L)
                 return -1;
             }
             t->kind = K_STR;
-            t->str = cook(L->J, s + 1, q);
             t->len = (int)(q + 1 - s);
             L->s = q + 1;
             continue;
         }
         if (c == '`') {
-            const char *q = s + 1;
-            int depth = 0;
-            while (q < L->end) {
-                if (*q == '\\') {
-                    q += 2;
-                    continue;
-                }
-                if (*q == '\n')
-                    L->line++;
-                if (!depth && *q == '`')
-                    break;
-                if (*q == '$' && q + 1 < L->end && q[1] == '{') {
-                    depth++;
-                    q += 2;
-                    continue;
-                }
-                if (depth && *q == '{')
-                    depth++;
-                else if (depth && *q == '}')
-                    depth--;
-                else if (depth && (*q == '"' || *q == '\'' || *q == '`')) {
-                    char quote = *q++;
-                    while (q < L->end && *q != quote) {
-                        if (*q == '\\')
-                            q++;
-                        q++;
-                    }
-                }
-                q++;
-            }
-            if (q >= L->end) {
+            int start_line = L->line;
+            const char *q = template_end(s + 1, L->end, &L->line, 0);
+            if (!q) {
                 L->error = "unterminated template literal";
-                L->error_line = L->line;
+                L->error_line = start_line;
                 return -1;
             }
             t->kind = K_TEMPLATE;
@@ -2011,8 +2084,6 @@ static int lex(struct lexer *L)
             while (f < L->end && ident_char((unsigned char)*f))
                 f++;
             t->kind = K_REGEX;
-            t->str = js_mkstr(L->J, s + 1, (int)(q - s - 1));
-            t->flags = js_mkstr(L->J, q + 1, (int)(f - q - 1));
             t->len = (int)(f - s);
             L->s = f;
             continue;
@@ -2046,6 +2117,54 @@ static int lex(struct lexer *L)
     return 0;
 }
 
+/* A number token's value: as the lexer read it, without its _ separators, legacy octal too. */
+static double tok_num(const struct tok *t)
+{
+    const char *s = t->p;
+    int len = t->len, used;
+    if (memchr(s, '_', (size_t)len) && len < 80) {
+        char clean[80];
+        int n = 0;
+        for (int i = 0; i < len; i++)
+            if (s[i] != '_')
+                clean[n++] = s[i];
+        clean[n] = 0;
+        double v = parse_number(clean, n, &used);
+        if (used == n)
+            return v;
+    }
+    if (s[0] == '0' && len > 1 && s[1] >= '0' && s[1] <= '7') {
+        int octal = 1;
+        for (int i = 1; i < len && octal; i++)
+            octal = s[i] >= '0' && s[i] <= '7';
+        if (octal) {
+            double v = 0;
+            for (int i = 1; i < len; i++)
+                v = v * 8 + (s[i] - '0');
+            return v;
+        }
+    }
+    return parse_number(s, len, &used);
+}
+
+/* A string token's value, or a BigInt token's digits. */
+static struct jsstr *tok_str(struct js *J, const struct tok *t)
+{
+    if (t->kind == K_NUM)
+        return js_mkstr(J, t->p, t->len - 1);
+    return cook(J, t->p + 1, t->p + t->len - 1);
+}
+
+/* A regular expression token's pattern and flags. */
+static struct jsstr *tok_regex(struct js *J, const struct tok *t, struct jsstr **flags)
+{
+    const char *f = t->p + t->len;
+    while (f > t->p + 2 && ident_char((unsigned char)f[-1]))
+        f--;
+    *flags = js_mkstr(J, f, (int)(t->p + t->len - f));
+    return js_mkstr(J, t->p + 1, (int)(f - 1 - (t->p + 1)));
+}
+
 /* ---- the syntax tree ---- */
 
 enum {
@@ -2074,6 +2193,9 @@ enum {
     OP_NOT, OP_BNOT, OP_NEG, OP_PLUS, OP_TYPEOF, OP_VOID, OP_DELETE, OP_INC, OP_DEC,
 };
 
+struct vscope;
+struct vfunc;
+
 struct fninfo {
     int prepared;
     struct jsstr **vars;                /* var-declared names, hoisted */
@@ -2081,6 +2203,20 @@ struct fninfo {
     struct ast **funcs;                 /* function declarations at the top level */
     int nfuncs;
     int uses_args;
+    /*
+     * Where the parameters and body are in the script's source, so that the syntax tree can be
+     * dropped and parsed again (lazy_parse). Once the function that makes this one's closures
+     * has been compiled, this one becomes a stub: its tree and analysis are let go, and outer,
+     * outer_fn are where its analysis starts again when it is first called. src is NULL for a
+     * function that was not written as one (an implied constructor) or cannot be parsed alone
+     * (a constructor, which has the instance fields written into it).
+     */
+    struct jsstr *src;
+    int start, end, line;
+    uint8_t module;                     /* parsed as part of a module */
+    uint8_t stub;
+    struct vscope *outer;
+    struct vfunc *outer_fn;
 };
 
 struct ast {
@@ -2125,6 +2261,7 @@ struct parser {
     int module;                         /* parsing a module: import and export, top-level await */
     int fn_depth;                       /* functions the parser is inside */
     int tla;                            /* the module awaits at its top level */
+    struct jsstr *source;               /* the script, which every token points into */
 };
 
 static struct ast *mk(struct parser *P, int kind)
@@ -2261,23 +2398,10 @@ static struct ast *template_literal(struct parser *P, struct tok *t)
             list_add(P, &n->list, &n->n, &cap, str);
             if (s == end)
                 break;
-            const char *e = s + 2;
-            int depth = 1;
-            while (e < end && depth) {
-                if (*e == '{')
-                    depth++;
-                else if (*e == '}' && !--depth)
-                    break;
-                else if (*e == '"' || *e == '\'' || *e == '`') {
-                    char q = *e++;
-                    while (e < end && *e != q) {
-                        if (*e == '\\')
-                            e++;
-                        e++;
-                    }
-                }
-                e++;
-            }
+            int lines = 0;
+            const char *e = subst_end(s + 2, end, &lines, 0);
+            if (!e)
+                return fail_parse(P, "unterminated template substitution"), NULL;
             struct ast *x = parse_source_expr(P, s + 2, (int)(e - s - 2));
             if (!x)
                 return NULL;
@@ -2331,13 +2455,14 @@ static int prop_key(struct parser *P, struct ast *prop)
     if (t->kind == K_IDENT) {
         prop->str = tok_name(P, t);
     } else if (t->kind == K_STR) {
-        prop->str = t->str;
+        prop->str = tok_str(P->J, t);
     } else if (t->kind == K_NUM && t->big) {
-        struct jsbig *g = jb_parse(P->J, t->str->s, t->str->len, 0, 0);
-        prop->str = g ? jb_tostr(P->J, g, 10) : t->str;
+        struct jsstr *digits = tok_str(P->J, t);
+        struct jsbig *g = jb_parse(P->J, digits->s, digits->len, 0, 0);
+        prop->str = g ? jb_tostr(P->J, g, 10) : digits;
     } else if (t->kind == K_NUM) {
         char b[64];
-        js_numtostr(t->num, b);
+        js_numtostr(tok_num(t), b);
         prop->str = js_mkstr(P->J, b, (int)strlen(b));
     } else {
         return fail_parse(P, "bad property name");
@@ -2425,9 +2550,26 @@ static struct ast *function_rest(struct parser *P, struct ast *fn, int arrow)
 
 static struct ast *function_body_inner(struct parser *P, struct ast *fn, int arrow);
 
+/* Remember that fn's parameters and body are the tokens from first to the last one read. */
+static void note_source(struct parser *P, struct ast *fn, const struct tok *first)
+{
+    const struct tok *last = &P->t[P->pos - 1];
+    struct jsstr *src = P->source;
+    if (!src || P->pos == 0 || first->p < src->s || last->p + last->len > src->s + src->len)
+        return;
+    if (!fn->info)
+        fn->info = js_alloc(P->J, sizeof(struct fninfo));
+    fn->info->src = src;
+    fn->info->start = (int)(first->p - src->s);
+    fn->info->end = (int)(last->p + last->len - src->s);
+    fn->info->line = first->line;
+    fn->info->module = (uint8_t)P->module;
+}
+
 static struct ast *function_body(struct parser *P, struct ast *fn, int arrow)
 {
     int saved_async = P->in_async, saved_gen = P->in_gen;
+    const struct tok *first = peek(P);
     P->in_async = (fn->flags & F_ASYNC) != 0;
     P->in_gen = (fn->flags & F_GEN) != 0;
     P->fn_depth++;
@@ -2435,6 +2577,8 @@ static struct ast *function_body(struct parser *P, struct ast *fn, int arrow)
     P->fn_depth--;
     P->in_async = saved_async;
     P->in_gen = saved_gen;
+    if (r)
+        note_source(P, fn, first);
     return r;
 }
 
@@ -2506,6 +2650,63 @@ body:
     /* Arrow functions see their surroundings' arguments. */
     P->fn_uses_args = arrow ? saved_args | P->fn_uses_args : saved_args;
     return fn;
+}
+
+/* x => ...: an arrow function with one parameter and no parentheses, from the parameter on
+ * (fn is F_ASYNC if async came before it). */
+static struct ast *arrow_single(struct parser *P, struct ast *fn)
+{
+    const struct tok *first = peek(P);
+    int saved_async = P->in_async, saved_gen = P->in_gen;
+    P->in_async = (fn->flags & F_ASYNC) != 0;
+    P->in_gen = 0;
+    P->fn_depth++;
+    struct ast *param = mk(P, N_IDENT);
+    param->str = tok_name(P, first);
+    fn->list = js_alloc(P->J, sizeof(struct ast *));
+    fn->list[0] = param;
+    fn->n = 1;
+    P->pos += 2;
+    fn->flags |= F_ARROW;
+    struct ast *r = fn;
+    if (at(P, "{")) {
+        /* the body parser's way, as the parameter has been read */
+        int saved_args = P->fn_uses_args, saved_noin = P->noin;
+        P->fn_uses_args = 0;
+        P->noin = 0;
+        P->pos++;
+        struct ast *body = mk(P, S_BLOCK);
+        int bcap = 0;
+        while (r && !at(P, "}")) {
+            struct ast *s = NULL;
+            if (peek(P)->kind == K_EOF)
+                fail_parse(P, "unexpected end of script");
+            else
+                s = statement(P);
+            if (s)
+                list_add(P, &body->list, &body->n, &bcap, s);
+            else
+                r = NULL;
+        }
+        if (r) {
+            P->pos++;
+            fn->a = body;
+            fn->info = js_alloc(P->J, sizeof(struct fninfo));
+        }
+        P->fn_uses_args = saved_args | P->fn_uses_args;
+        P->noin = saved_noin;
+    } else {
+        fn->flags |= F_EXPRBODY;
+        fn->a = assignment(P);
+        if (!fn->a)
+            r = NULL;
+    }
+    P->fn_depth--;
+    P->in_async = saved_async;
+    P->in_gen = saved_gen;
+    if (r)
+        note_source(P, fn, first);
+    return r;
 }
 
 /* Is the '(' at pos the start of an arrow function's parameters? */
@@ -2619,6 +2820,7 @@ static struct ast *class_expr(struct parser *P)
                 return NULL;
             if (!m->op && m->kind == N_PROP && !m->b && m->str && !strcmp(m->str->s, "constructor")) {
                 n->b = m->a;
+                n->b->info->src = NULL;         /* the instance fields are written into it */
                 continue;
             }
         } else if (m->kind == N_PROP) {
@@ -2709,16 +2911,17 @@ static struct ast *primary(struct parser *P)
     switch (t->kind) {
     case K_NUM:
         n = mk(P, N_NUM);
-        n->num = t->num;
         if (t->big) {
             n->flags = 1;
-            n->str = t->str;
+            n->str = tok_str(P->J, t);
+        } else {
+            n->num = tok_num(t);
         }
         P->pos++;
         return n;
     case K_STR:
         n = mk(P, N_STR);
-        n->str = t->str;
+        n->str = tok_str(P->J, t);
         P->pos++;
         return n;
     case K_TEMPLATE:
@@ -2727,9 +2930,8 @@ static struct ast *primary(struct parser *P)
     case K_REGEX: {
         const char *err = NULL;
         n = mk(P, N_REGEX);
-        n->str = t->str;
-        n->re_flags = t->flags;
-        n->re = re_compile(P->J, t->str->s, t->str->len, t->flags->s, &err);
+        n->str = tok_regex(P->J, t, &n->re_flags);
+        n->re = re_compile(P->J, n->str->s, n->str->len, n->re_flags->s, &err);
         if (!n->re) {                   /* the script runs; evaluating this literal throws */
             n->a = mk(P, N_STR);
             n->a->str = js_mkstr(P->J, err ? err : "bad regular expression", err ? (int)strlen(err) : 22);
@@ -3142,46 +3344,7 @@ static struct ast *assignment(struct parser *P)
         struct ast *fn = mk(P, N_FUNC);
         if (async_arrow)
             fn->flags |= F_ASYNC;
-        int saved_async = P->in_async, saved_gen = P->in_gen;
-        P->in_async = async_arrow;
-        P->in_gen = 0;
-        struct ast *param = mk(P, N_IDENT);
-        param->str = tok_name(P, t);
-        fn->list = js_alloc(P->J, sizeof(struct ast *));
-        fn->list[0] = param;
-        fn->n = 1;
-        P->pos += 2;
-        fn->flags |= F_ARROW;
-        if (at(P, "{")) {
-            /* reuse the body parser: pretend the parameters were already read */
-            int saved_args = P->fn_uses_args, saved_noin = P->noin;
-            P->fn_uses_args = 0;
-            P->noin = 0;
-            P->pos++;
-            struct ast *body = mk(P, S_BLOCK);
-            int bcap = 0;
-            while (!at(P, "}")) {
-                if (peek(P)->kind == K_EOF)
-                    return fail_parse(P, "unexpected end of script"), NULL;
-                struct ast *s = statement(P);
-                if (!s)
-                    return NULL;
-                list_add(P, &body->list, &body->n, &bcap, s);
-            }
-            P->pos++;
-            fn->a = body;
-            fn->info = js_alloc(P->J, sizeof(struct fninfo));
-            P->fn_uses_args = saved_args | P->fn_uses_args;
-            P->noin = saved_noin;
-            P->in_async = saved_async;
-            P->in_gen = saved_gen;
-            return fn;
-        }
-        fn->flags |= F_EXPRBODY;
-        fn->a = assignment(P);
-        P->in_async = saved_async;
-        P->in_gen = saved_gen;
-        return fn->a ? fn : NULL;
+        return arrow_single(P, fn);
     }
     if (tok_is(t, "(") && arrow_ahead(P)) {
         struct ast *fn = mk(P, N_FUNC);
@@ -3665,7 +3828,7 @@ static struct jsstr *module_name(struct parser *P)
     if (t->kind != K_IDENT && t->kind != K_STR)
         return fail_parse(P, "expected a name"), NULL;
     P->pos++;
-    return t->kind == K_STR ? t->str : tok_name(P, t);
+    return t->kind == K_STR ? tok_str(P->J, t) : tok_name(P, t);
 }
 
 static struct jsstr *local_name(struct parser *P)
@@ -3685,7 +3848,7 @@ static int module_from(struct parser *P, struct ast *n)
     struct tok *t = peek(P);
     if (t->kind != K_STR)
         return fail_parse(P, "expected a module specifier");
-    n->str = t->str;
+    n->str = tok_str(P->J, t);
     P->pos++;
     if ((at(P, "with") || at(P, "assert")) && !peek(P)->nl && tok_is(peek2(P), "{")) {
         P->pos += 2;
@@ -3701,7 +3864,7 @@ static struct ast *import_declaration(struct parser *P)
     int cap = 0;
     struct jsstr *star = js_mkstr(P->J, "*", 1), *dflt = js_mkstr(P->J, "default", 7);
     if (peek(P)->kind == K_STR) {                /* import "x"; */
-        n->str = peek(P)->str;
+        n->str = tok_str(P->J, peek(P));
         P->pos++;
         return semicolon(P) ? n : NULL;
     }
@@ -3858,8 +4021,10 @@ static struct ast *module_item(struct parser *P)
  * expr_only: 0 a script, 1 an expression, 2 a module (prog->op is 1 if it awaits at its top level). */
 static struct ast *parse(struct js *J, const char *src, int len, const char *where, int expr_only)
 {
-    struct lexer L = { J, src, src + len, 1, NULL, 0, 0, NULL, 0 };
     J->gc_inhibit++;
+    /* The functions' stubs parse their part of it again, after the caller's copy is gone. */
+    struct jsstr *source = js_mkstr(J, src, len);
+    struct lexer L = { J, source->s, source->s + len, 1, NULL, 0, 0, NULL, 0 };
     if (lex(&L) < 0) {
         snprintf(J->err, sizeof(J->err), "SyntaxError: %s (%s, line %d)", L.error ? L.error : "?",
                  where, L.error_line);
@@ -3868,6 +4033,7 @@ static struct ast *parse(struct js *J, const char *src, int len, const char *whe
         return NULL;
     }
     struct parser P = { J, L.toks, 0, L.n, NULL, 0, 0, 0, where, 0, 0, NULL, 0, 0, 0, 0, 0 };
+    P.source = source;
     struct ast *prog;
     if (expr_only == 2) {
         P.module = 1;
@@ -3907,13 +4073,41 @@ static struct ast *parse(struct js *J, const char *src, int len, const char *whe
     return prog;
 }
 
-/* A ${...} in a template literal, parsed on its own. */
+/* A ${...} in a template literal: its tokens are lexed on their own (the template was one token),
+ * and parsed as part of the code around it, so await, yield, arguments and the names it uses
+ * mean what they do there. */
 static struct ast *parse_source_expr(struct parser *P, const char *s, int len)
 {
-    struct ast *e = parse(P->J, s, len, P->where, 1);
-    if (!e)
-        fail_parse(P, "bad expression in template literal");
-    return e;
+    int line = peek(P)->line;
+    struct lexer L = { P->J, s, s + len, line, NULL, 0, 0, NULL, 0 };
+    if (lex(&L) < 0) {
+        free(L.toks);
+        if (!P->error) {
+            P->error = L.error ? L.error : "bad expression in template literal";
+            P->error_line = L.error_line;
+        }
+        return NULL;
+    }
+    struct parser sub = *P;
+    sub.t = L.toks;
+    sub.pos = 0;
+    sub.n = L.n;
+    sub.noin = 0;
+    struct ast *e = expression(&sub);
+    if (e && peek(&sub)->kind != K_EOF)
+        fail_parse(&sub, "unexpected token in template literal");
+    /* What the outer parser carries on: its name table (which may have grown), what it learned. */
+    P->names = sub.names;
+    P->names_cap = sub.names_cap;
+    P->nnames = sub.nnames;
+    P->fn_uses_args = sub.fn_uses_args;
+    P->tla = sub.tla;
+    if (sub.error && !P->error) {
+        P->error = sub.error;
+        P->error_line = sub.error_line;
+    }
+    free(L.toks);
+    return sub.error ? NULL : e;
 }
 
 /* ---- environments ---- */
@@ -4013,10 +4207,12 @@ struct vcompile {
     struct js *J;
     void *stack, *sp, *caller_sp;
     struct vfunc *vf;
+    struct ast *stub;                   /* a stub to parse again before compiling (lazy_parse) */
     struct vproto *result;
     int root, active;
 };
 static struct vproto *compile_on_stack(struct js *J, struct vfunc *vf, int root);
+static struct vproto *compile_stub_on_stack(struct js *J, struct ast *fn);
 static struct vfunc *an_root(struct js *J, struct ast *prog);
 static jsval global_eval(struct js *J,jsval self,jsval *args,int argc);
 static struct vproto *compile_function(struct js *J, struct vfunc *vf);
@@ -4148,12 +4344,17 @@ static jsval run_user_untraced(struct js *J, struct jsobj *f, jsval self, jsval 
     if (fn->flags & F_MODULE) {         /* its bindings were made when it was linked */
         vm_run(J, compile_on_stack(J, fn->a->vm, 1), NULL, f->scope, js_undefined, NULL, 0);
         result = js_undefined;
-    } else if (!fn->vm) {
+    } else if (!fn->vm && !(fn->info && fn->info->stub)) {
         result = js_throw_error(J, "InternalError: function %s was not compiled", f->name ? f->name : "");
     } else {
-        if (!f->arrow && (self.t == JS_UNDEF || self.t == JS_NULL))
-            self = js_obj(J->global);           /* sloppy mode */
-        result = vm_run(J, compile_on_stack(J, fn->vm, 0), f, f->scope, self, args, argc);
+        struct vproto *code = fn->vm ? compile_on_stack(J, fn->vm, 0) : compile_stub_on_stack(J, fn);
+        if (!code) {
+            result = js_undefined;
+        } else {
+            if (!f->arrow && (self.t == JS_UNDEF || self.t == JS_NULL))
+                self = js_obj(J->global);       /* sloppy mode */
+            result = vm_run(J, code, f, f->scope, self, args, argc);
+        }
     }
     J->depth--;
     return J->throwing ? js_undefined : result;
@@ -4508,6 +4709,7 @@ int js_iter_open(struct js *J, jsval v, struct iter *it)
     memset(it, 0, sizeof(*it));
     if (v.t == JS_STR) {
         it->kind = IT_STR;
+        it->obj = v;                    /* keeps the string: sp ends just past it */
         it->sp = v.u.s->s;
         it->send = v.u.s->s + v.u.s->len;
         return 0;
@@ -4873,14 +5075,207 @@ static void co_prepare(struct coro *co)
     co->sp = prepare_stack(co->stack, CORO_STACK, co_main, co);
 }
 
+/* ---- lazy parsing ----
+ *
+ * Most of a big script's functions never run, and a syntax tree takes many times the memory of
+ * the source it came from. So once a function (or a script's top level) is compiled, the
+ * functions it makes closures of become stubs: their trees and analyses are let go, to be parsed
+ * and analysed again from the script's source when they are first called, and the compiled
+ * function lets go of its own tree. The first parse has found any syntax error. Analysing a
+ * function again on its own decides what analysing the whole script did, as every way the
+ * analysis touches the scopes around a function (marking what it captures, its parent's
+ * arguments and env) was done then and is done the same way again; those scopes are kept, and
+ * nothing in them changes once their function is compiled.
+ */
+/*
+ * The collector is conservative, and a stray word that looks like a pointer (a value's padding, a
+ * stale stack slot) keeps whatever it points into alive, and all that leads from there. A syntax
+ * tree and its analysis lead everywhere: up through parents and scopes, down through bodies. So a
+ * tree that is let go is taken apart, and a stray pointer keeps only a piece of it.
+ */
+static void drop_scope(struct vscope *s)
+{
+    if (!s)
+        return;
+    s->parent = NULL;
+    s->fn = NULL;
+    s->d = NULL;
+    s->nd = s->cap = 0;
+    s->tab = NULL;
+    s->tabcap = 0;
+}
+
+static void drop_vfunc(struct vfunc *f)
+{
+    if (!f)
+        return;
+    for (int i = 0; i < f->nscopes; i++)
+        drop_scope(f->scopes[i]);
+    drop_scope(f->named);
+    f->ast = NULL;
+    f->parent = NULL;
+    f->scope = f->params = f->named = NULL;
+    f->args = NULL;
+    f->scopes = NULL;
+    f->nscopes = f->scap = 0;
+}
+
+/* Take apart the tree at n. live: it is a compiled function's, whose code still uses its
+ * functions, classes, templates and regular expressions, and whose scopes stubs still need;
+ * otherwise nothing uses any of it. */
+static void drop_tree(struct js *J, struct ast *n, int live)
+{
+    if (!n || js_stack_low(J))
+        return;
+    if (live && (n->kind == N_FUNC || n->kind == N_CLASS || n->kind == N_TEMPLATE || n->kind == N_REGEX))
+        return;
+    struct ast *a = n->a, *b = n->b, *c = n->c, *d = n->d, **list = n->list;
+    int count = n->list ? n->n : 0;
+    n->a = n->b = n->c = n->d = NULL;
+    n->list = NULL;
+    if (n->kind != N_FUNC)
+        n->n = 0;
+    if (!live) {
+        if (n->kind == N_FUNC) {
+            drop_vfunc(n->vm);
+            if (n->info) {
+                n->info->vars = NULL;
+                n->info->funcs = NULL;
+                n->info->nvars = n->info->nfuncs = 0;
+            }
+        } else {
+            drop_scope(n->vm);
+        }
+        n->vm = NULL;
+    }
+    drop_tree(J, a, live);
+    drop_tree(J, b, live);
+    drop_tree(J, c, live);
+    drop_tree(J, d, live);
+    for (int i = 0; i < count; i++)
+        drop_tree(J, list[i], live);
+}
+
+static void make_stub(struct js *J, struct ast *fn)
+{
+    struct fninfo *fi = fn->info;
+    struct vfunc *f = fn->vm;
+    if (fn->kind != N_FUNC || (fn->flags & F_MODULE) || !fi || !fi->src || fi->stub || !f ||
+        f->proto || !f->params)
+        return;
+    fi->outer = f->named ? f->named->parent : f->params->parent;
+    fi->outer_fn = f->parent;
+    fi->stub = 1;
+    fi->prepared = 0;
+    fi->vars = NULL;
+    fi->nvars = 0;
+    fi->funcs = NULL;
+    fi->nfuncs = 0;
+    struct ast *body = fn->a, **params = fn->list;
+    fn->a = NULL;
+    fn->list = NULL;                    /* fn->n stays: it is the function's length */
+    fn->vm = NULL;
+    drop_vfunc(f);
+    drop_tree(J, body, 0);
+    for (int i = 0; params && i < fn->n; i++)
+        drop_tree(J, params[i], 0);
+}
+
+/* vf has been compiled to p: the functions p makes become stubs, and vf's tree can go. */
+static void after_compile(struct js *J, struct vfunc *vf, struct vproto *p)
+{
+    for (int i = 0; i < p->nk; i++)
+        if (p->k[i].t == VK_NODE)
+            make_stub(J, (struct ast *)p->k[i].u.s);
+    struct ast *fn = vf->ast;
+    if (vf->is_root) {
+        /* A script's function declarations were made before its code ran, not by its code. */
+        for (int i = 0; fn && fn->kind != N_FUNC && fn->info && i < fn->info->nfuncs; i++)
+            make_stub(J, fn->info->funcs[i]);
+        vf->ast = NULL;                 /* a module's statements stay in its record, for its exports */
+    } else if (!(fn->flags & F_MODULE)) {
+        drop_tree(J, fn->a, 1);
+        for (int i = 0; fn->list && i < fn->n; i++)
+            drop_tree(J, fn->list[i], 1);
+        fn->a = NULL;
+        fn->list = NULL;
+        if (fn->info) {
+            fn->info->vars = NULL;
+            fn->info->nvars = 0;
+            fn->info->funcs = NULL;
+            fn->info->nfuncs = 0;
+        }
+    }
+}
+
+/* A stub's parameters and body, parsed again into fn and analysed where it is: 0, or -1 with an
+ * error thrown. */
+static int lazy_parse(struct js *J, struct ast *fn)
+{
+    struct fninfo *fi = fn->info;
+    struct jsstr *src = fi->src;
+    struct vscope *outer = fi->outer;
+    struct vfunc *outer_fn = fi->outer_fn;
+    int nparams = fn->n;
+    J->gc_inhibit++;
+    struct lexer L = { J, src->s + fi->start, src->s + fi->end, fi->line, NULL, 0, 0, NULL, 0 };
+    struct parser P = { 0 };
+    struct ast *r = NULL;
+    if (lex(&L) == 0) {
+        P.J = J;
+        P.t = L.toks;
+        P.n = L.n;
+        P.where = "script";
+        P.module = fi->module;
+        P.source = src;
+        fn->a = NULL;
+        fn->list = NULL;
+        fn->n = 0;
+        if ((fn->flags & F_ARROW) && L.toks[0].kind == K_IDENT)
+            r = arrow_single(&P, fn);
+        else
+            r = function_body(&P, fn, (fn->flags & F_ARROW) != 0);
+        if (P.error || (r && peek(&P)->kind != K_EOF))
+            r = NULL;
+    }
+    free(P.names);
+    free(L.toks);
+    J->gc_inhibit--;
+    if (!r) {
+        fn->n = nparams;
+        js_throw_error(J, "InternalError: function %s could not be parsed again",
+                       fn->str ? fn->str->s : "");
+        return -1;
+    }
+    fn->info->stub = 0;
+    fn->info->outer = NULL;
+    fn->info->outer_fn = NULL;
+    struct an A = { J, outer_fn, outer };
+    an_function(&A, fn);
+    return J->throwing ? -1 : 0;
+}
+
 static void compiler_main(void *arg) __attribute__((noreturn, used));
 static void compiler_main(void *arg)
 {
     struct vcompile *c = arg;
-    c->result = c->root ? compile_root(c->J, c->vf) : compile_function(c->J, c->vf);
+    if (c->stub) {
+        c->vf = NULL;
+        c->result = NULL;
+        if (lazy_parse(c->J, c->stub) == 0) {
+            c->vf = c->stub->vm;
+            c->result = compile_function(c->J, c->vf);
+        }
+    } else {
+        c->result = c->root ? compile_root(c->J, c->vf) : compile_function(c->J, c->vf);
+    }
+    if (c->result)
+        after_compile(c->J, c->vf, c->result);
     js_coro_switch(&c->sp, c->caller_sp);
     __builtin_unreachable();
 }
+
+static struct vproto *run_compiler(struct js *J, struct vfunc *vf, int root, struct ast *stub);
 
 /* Compilation can recurse through source much more deeply than running
  * its bytecode. Give it its own stack even when called from a generator. */
@@ -4888,6 +5283,17 @@ static struct vproto *compile_on_stack(struct js *J, struct vfunc *vf, int root)
 {
     if (vf->proto)
         return vf->proto;
+    return run_compiler(J, vf, root, NULL);
+}
+
+/* A stub's code: parsed again, analysed and compiled (NULL, with an error thrown, if it fails). */
+static struct vproto *compile_stub_on_stack(struct js *J, struct ast *fn)
+{
+    return run_compiler(J, NULL, 0, fn);
+}
+
+static struct vproto *run_compiler(struct js *J, struct vfunc *vf, int root, struct ast *stub)
+{
     if (!J->compiler) {
         struct vcompile *c = calloc(1, sizeof(*c));
         if (!c)
@@ -4903,6 +5309,7 @@ static struct vproto *compile_on_stack(struct js *J, struct vfunc *vf, int root)
     struct vcompile *c = J->compiler;
     c->vf = vf;
     c->root = root;
+    c->stub = stub;
     c->active = 1;
     c->sp = prepare_stack(c->stack, COMPILE_STACK, compiler_main, c);
     const char *saved_lo = J->stack_lo, *saved_hi = J->stack_hi;
@@ -4914,6 +5321,7 @@ static struct vproto *compile_on_stack(struct js *J, struct vfunc *vf, int root)
     struct vproto *result = c->result;
     c->active = 0;
     c->vf = NULL;
+    c->stub = NULL;
     c->result = NULL;
     return result;
 }

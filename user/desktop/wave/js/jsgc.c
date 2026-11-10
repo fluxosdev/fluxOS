@@ -6,8 +6,12 @@
  * the coroutines' stacks (from js.c), the program's data and bss, the
  * struct js, and memory hosts register (the jsdom). Anything there that
  * points into or just past the end of a block keeps it alive; so does any
- * such word inside a block that is alive, except in strings, which are
- * allocated as having no pointers in them. Hosts that point into the heap
+ * word inside a block that is alive that points into one, except in
+ * strings, which are allocated as having no pointers in them. (Just past
+ * the end counts only from the stacks and saved registers, where C code
+ * keeps end pointers: anywhere else, a pointer to a block would also keep
+ * the block before it alive, and stray words, such as the padding of a
+ * copied value, would keep more.) Hosts that point into the heap
  * from memory the collector cannot see (DOM nodes and their wrappers)
  * hook into each collection.
  *
@@ -77,6 +81,7 @@ struct gcheap {
     struct js_gc_hooks hooks;
     int has_hooks;
     struct span *stack;                 /* marking: blocks whose insides are still to scan */
+    int from_stacks;                     /* scanning stacks: a pointer just past a block keeps it */
     int sp, stack_cap;
     int overflow;                       /* the mark stack could not grow: rescan */
 };
@@ -299,7 +304,7 @@ static void mark_word(struct gcheap *h, uintptr_t w)
     if (!pg || pg->heap != h)
         return;
     if (pg->large) {
-        if (w > (uintptr_t)pg->base + pg->size || pg->marked)
+        if (w > (uintptr_t)pg->base + pg->size - !h->from_stacks || pg->marked)
             return;
         pg->marked = 1;
         if (!pg->atomic)
@@ -311,7 +316,7 @@ static void mark_word(struct gcheap *h, uintptr_t w)
     uint32_t off = (uint32_t)(w - (uintptr_t)pg->base), idx = off / pg->size;
     if (idx < pg->nslots)
         mark_slot(h, pg, idx);
-    if (idx && idx <= pg->nslots && off == idx * pg->size)
+    if (h->from_stacks && idx && idx <= pg->nslots && off == idx * pg->size)
         mark_slot(h, pg, idx - 1);
 }
 
@@ -368,7 +373,10 @@ static int __attribute__((noinline)) scan_roots(struct js *J)
 {
     struct gcheap *h = J->heap;
     const char *sp = __builtin_frame_address(0);
-    if (js_gc_scan_stacks(J, sp, scan_cb) < 0)
+    h->from_stacks = 1;
+    int known = js_gc_scan_stacks(J, sp, scan_cb);
+    h->from_stacks = 0;
+    if (known < 0)
         return -1;
     scan_range(h, __gc_data_start, __gc_data_end);
     scan_range(h, J, J + 1);

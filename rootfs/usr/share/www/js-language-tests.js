@@ -922,3 +922,50 @@ test("ToPrimitive hints: a Date is a number in arithmetic and comparisons, a str
   o[Symbol.toPrimitive] = function (h) { return h === "number" ? 42 : h === "string" ? "str" : "dflt"; };
   return [d / 1000, +d, d - new Date(1000), d > 4000, typeof (d + 1), d == d.toString(), +o, o * 1, String(o), o + "", o < 50];
 }, [5, 5000, 4000, true, "string", true, 42, 42, "str", "dflt", true]);
+
+/* ---- template literals: a ${...} is code, parsed where it is ---- */
+test("template substitutions holding braces, quotes, backticks, comments and regular expressions", function () {
+  var v = 3;
+  return [`x${`y${1}z`}w`, `x${ "}" }w`, `x${ /'/.source }w`, `x${ /[`}]/.source }w`, `x${ 1 /* } ` */ }w`,
+          `x${ `a${"`"}b` }w`, `x${ {a: 1}.a }w`, `x${ (() => { return `q${2}`; })() }w`, `a\`b${1}`,
+          `a${1}\${2}`, `${`${`${v}`}`}`, `${ 6 / 2 / 3 }`, `${ [1, 2].map(x => `<${x}>`).join(`|`) }`,
+          `${ "a'b`c".replace(/['`]/g, "") }`];
+}, ["xy1zw", "x}w", "x'w", "x[`}]w", "x1w", "xa`bw", "x1w", "xq2w", "a`b1", "a1${2}", "3", "1", "<1>|<2>", "abc"]);
+test("template substitutions see arguments, yield and their function's names", function () {
+  function args() { return `${arguments.length}:${arguments[0]}`; }
+  function viaArrow() { return (() => `${arguments[1]}`)(); }
+  function* gen() { var r = `${yield 1}!`; return r; }
+  var it = gen();
+  it.next();
+  var tag = function (s) { return s.raw.join("|") + Array.prototype.slice.call(arguments, 1).join(","); };
+  return [args(7, 8), viaArrow(1, "b"), it.next("v").value, tag`a${1}b${`c${2}`}d`];
+}, ["2:7", "b", "v!", "a|b|d1,c2"]);
+asyncTest("await in a template substitution", async function () {
+  return `${await Promise.resolve(5)}-${await 6}`;
+}, "5-6");
+
+/* ---- functions compiled late: parsed again from the source when first called ---- */
+test("functions that run long after the script was parsed", function () {
+  var outer = 10;
+  function add(a, b = outer) { return a + b; }
+  function two(a, b) {}
+  function counter() { var n = 0; return { inc() { return ++n; }, get v() { return n; } }; }
+  var c = counter(); c.inc(); c.inc();
+  var fact = function f(n) { return n <= 1 ? 1 : n * f(n - 1); };
+  var single = x => x * x, rest = (...xs) => xs.length;
+  function evalLocal() { var q = 9; return eval("q + 1"); }
+  function deep() { return function () { return function () { return function () { return outer + 1; }; }; }; }
+  function letLoop() { var fs = []; for (let i = 0; i < 3; i++) fs.push(() => i); return fs.map(f => f()).join(); }
+  function destructure({a, b: [c] = [4]} = {}, ...more) { return a + c + more.length; }
+  function named() { return typeof named; }
+  return [add(1), two.length, c.v, fact(5), single(7), rest(1, 2, 3), evalLocal(), deep()()()(), letLoop(),
+          destructure({a: 1}, 9, 9), named()];
+}, [11, 2, 2, 120, 49, 3, 10, 11, "0,1,2", 7, "function"]);
+test("classes whose methods and constructors are compiled late", function () {
+  class A { #p = 3; f = () => this.x; constructor(x) { this.x = x; } get p() { return this.#p; }
+            static s() { return "s"; } m(y) { return this.x + y; } }
+  class B extends A { m(y) { return super.m(y) * 2; } }
+  var Counter = class { static #c = 0; static { this.ready = 1; } static inc() { return ++Counter.#c; } };
+  var b = new B(1);
+  return [b.m(2), b.p, b.f(), A.s(), Counter.inc(), Counter.inc(), Counter.ready];
+}, [6, 3, 1, "s", 1, 2, 1]);

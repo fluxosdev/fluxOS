@@ -679,7 +679,7 @@ test-browser: $(BUILD)/tests/browser-dom $(BUILD)/tests/browser-worker $(BUILD)/
 	$(BUILD)/tests/browser-worker
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/clone-escape-tests.js 23
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/canvas-tests.js 52
-	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 139
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 144
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/inline-cache-tests.js 19
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/toplayer-tests.js 18
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/media-tests.js 5
@@ -936,7 +936,7 @@ $(BUILD)/tests/js-engine: $(JS_ENGINE_SRCS) $(DESKTOP_HDRS) include/flux/abi.h
 
 .PHONY: test-js bench-js
 test-js: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine
-	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 139
+	$(BUILD)/tests/browser-dom rootfs/usr/share/www/js-language-tests.js 144
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/inline-cache-tests.js 19
 	rm -rf $(BUILD)/tests/idb
 	$(BUILD)/tests/browser-dom rootfs/usr/share/www/indexeddb-tests.js 3
@@ -946,6 +946,19 @@ test-js: $(BUILD)/tests/browser-dom $(BUILD)/tests/js-engine
 bench-js: $(BUILD)/tests/browser-bench
 	@set -e; for case in tests/js-bench/*.js; do \
 		/usr/bin/time -f '%e seconds, %M KiB peak RSS' $< $$case 1; \
+	done
+
+# What the engine keeps per byte of script: make bench-js-memory JS_MEMORY_FILES="big.js ..."
+JS_MEMORY_SRCS := $(filter-out tests/js-engine.c,$(JS_ENGINE_SRCS)) tests/js-memory.c
+$(BUILD)/tests/js-memory: $(JS_MEMORY_SRCS) $(DESKTOP_HDRS) include/flux/abi.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=gnu11 -O2 -g -fno-pie -no-pie -DJS_HOST_TEST -pthread \
+		$(DESKTOP_INC) -Iinclude -idirafter user/include $(JS_MEMORY_SRCS) -lm -o $@
+
+.PHONY: bench-js-memory
+bench-js-memory: $(BUILD)/tests/js-memory
+	@for f in $(JS_MEMORY_FILES); do \
+		/usr/bin/time -f '    peak RSS %M KiB' $< $$f; \
 	done
 
 # Measure the optimized VM without the test runner's per-instruction assertions.
