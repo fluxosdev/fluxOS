@@ -1,5 +1,6 @@
 /*
- * Linear framebuffer set up by the boot loader (Multiboot video mode).
+ * Linear framebuffer set up by the boot loader (the mode Limine set, from
+ * the VESA BIOS or UEFI's graphics output).
  * The kernel console draws on it until a user process (the desktop)
  * claims it with SYS_fbmap; the console takes the screen back when that
  * process exits.
@@ -13,7 +14,7 @@
 #include "kernel.h"
 #include "drivers.h"
 #include "mm.h"
-#include "multiboot.h"
+#include "boot.h"
 #include "proc.h"
 
 struct framebuffer fb;
@@ -28,95 +29,39 @@ static int remap_pending;               /* fb changed: the owner's mapping is to
  * sleep waiting for the GPU. The console has its own lock (kprintf.c). */
 static struct mutex display_mutex = MUTEX_INIT("display");
 
-/* What the VESA BIOS says about the adapter, for the standard driver. */
-static char vesa_name[48];
-static uint32_t vesa_vram_kb;
-static uint16_t vesa_mode;              /* the mode the boot loader set, or 0 */
-
-struct vbe_info {
-    char sig[4];                        /* "VESA" */
-    uint16_t version;
-    uint32_t oem;                       /* real-mode far pointers (segment:offset) */
-    uint32_t caps;
-    uint32_t modes;
-    uint16_t memory;                    /* 64 KiB blocks */
-    uint16_t oem_rev;
-    uint32_t vendor, product, product_rev;      /* VBE 2.0 */
-} __attribute__((packed));
-
-/* Append the BIOS string at a real-mode far pointer to out. */
-static void append_bios_string(char *out, size_t size, uint32_t farptr)
+/* The boot loader's mode (boot.h), its memory mapped as the device memory
+ * it is: UEFI firmware may have put it anywhere, above 4 GiB too. */
+int fb_init(void)
 {
-    uint32_t lin = (farptr >> 16) * 16 + (farptr & 0xFFFF);
-    if (!farptr || lin >= 0x100000)
-        return;
-    const char *s = (const char *)lin;
-    size_t n = strlen(out);
-    if (n && n + 1 < size)
-        out[n++] = ' ';
-    for (size_t i = 0; n + 1 < size && s[i] >= 32 && s[i] < 127; i++)
-        out[n++] = s[i];
-    while (n > 0 && out[n - 1] == ' ')
-        n--;
-    out[n] = 0;
-}
-
-/* Paging is still off, so the BIOS data GRUB found can be read where it is. */
-static void read_vbe_info(struct multiboot_info *mbi)
-{
-    if (!(mbi->flags & MB_INFO_VBE) || !mbi->vbe_control_info)
-        return;
-    vesa_mode = mbi->vbe_mode;
-    const struct vbe_info *vi = (const struct vbe_info *)mbi->vbe_control_info;
-    if (memcmp(vi->sig, "VESA", 4) != 0)
-        return;
-    vesa_vram_kb = (uint32_t)vi->memory * 64;
-    if (vi->version >= 0x200) {
-        append_bios_string(vesa_name, sizeof(vesa_name), vi->vendor);
-        append_bios_string(vesa_name, sizeof(vesa_name), vi->product);
-    }
-    if (!vesa_name[0])
-        append_bios_string(vesa_name, sizeof(vesa_name), vi->oem);
-}
-
-int fb_init(struct multiboot_info *mbi)
-{
-    read_vbe_info(mbi);
-    if (!(mbi->flags & MB_INFO_FB) || mbi->fb_type != MB_FB_TYPE_RGB)
+    if (!boot.fb.bpp || boot.fb.width < 640 || boot.fb.height < 400)
         return 0;
-    if (mbi->fb_addr >> 32 || mbi->fb_width < 640 || mbi->fb_height < 400)
-        return 0;
-    uint32_t bpp = mbi->fb_bpp;
+    uint32_t bpp = boot.fb.bpp;
     if (bpp != 15 && bpp != 16 && bpp != 24 && bpp != 32)
         return 0;
-
-    fb.phys = (uint32_t)mbi->fb_addr;
-    fb.width = mbi->fb_width;
-    fb.height = mbi->fb_height;
-    fb.pitch = mbi->fb_pitch;
+    fb.phys = boot.fb.phys;
+    fb.width = boot.fb.width;
+    fb.height = boot.fb.height;
+    fb.pitch = boot.fb.pitch;
     fb.bpp = bpp;
     fb.bytespp = (bpp + 7) / 8;
-    fb.red_pos = mbi->fb_red_pos;
-    fb.red_size = mbi->fb_red_size;
-    fb.green_pos = mbi->fb_green_pos;
-    fb.green_size = mbi->fb_green_size;
-    fb.blue_pos = mbi->fb_blue_pos;
-    fb.blue_size = mbi->fb_blue_size;
+    fb.red_pos = boot.fb.red_pos;
+    fb.red_size = boot.fb.red_size;
+    fb.green_pos = boot.fb.green_pos;
+    fb.green_size = boot.fb.green_size;
+    fb.blue_pos = boot.fb.blue_pos;
+    fb.blue_size = boot.fb.blue_size;
     fb.size = ALIGN_UP(fb.pitch * fb.height, PAGE_SIZE);
-    /* Paging is still off, so the physical address works for now. */
-    fb.base = (uint8_t *)fb.phys;
+    fb.base = vmm_map_mmio(fb.phys, fb.size, 0);
+    if (!fb.base)
+        return 0;
     return 1;
 }
 
-/* Once paging is on, reach the framebuffer through the kernel MMIO window. */
+/* The boot loader's mode is what a display driver goes back to. */
 void fb_map(void)
 {
-    if (!fb.base)
-        return;
-    fb.base = vmm_map_mmio(fb.phys, fb.size, 0);
-    if (!fb.base)
-        panic("cannot map the framebuffer at %08x", fb.phys);
-    fb_boot = fb;
+    if (fb.base)
+        fb_boot = fb;
 }
 
 /* How much of the screen fbmap maps: two pages where the driver flips. */
@@ -131,7 +76,7 @@ static uint32_t map_size(void)
 
 /* Take pages [from, to) of the screen's mapping out of a process; only
  * device memory, never ordinary memory it may have put there since. */
-static void unmap_screen(uint32_t *pd, uint32_t from, uint32_t to)
+static void unmap_screen(pte_t *pd, uint32_t from, uint32_t to)
 {
     for (uint32_t off = ALIGN_UP(from, PAGE_SIZE); off < to; off += PAGE_SIZE)
         if (!vmm_pte_present(pd, USER_MMIO_BASE + off))
@@ -144,7 +89,7 @@ static void unmap_screen(uint32_t *pd, uint32_t from, uint32_t to)
  * smaller mode leaves nothing of the larger one's memory behind. If it
  * cannot be mapped, none of it stays.
  */
-static int map_screen(uint32_t *pd, uint32_t *mapped)
+static int map_screen(pte_t *pd, uint32_t *mapped)
 {
     uint32_t size = map_size();
     int r = vmm_map_phys(pd, USER_MMIO_BASE, fb.phys, size, pte_wc);
@@ -478,10 +423,11 @@ static int display_op(int op, void *arg)
         } else if (radeon_present()) {
             radeon_info(di);
         } else {
-            strlcpy(di->adapter, vesa_name[0] ? vesa_name : "Standard VGA", sizeof(di->adapter));
+            strlcpy(di->adapter, !fb_boot.base ? "Standard VGA" : boot.uefi ? "UEFI graphics output"
+                                 : "VESA BIOS display", sizeof(di->adapter));
             strlcpy(di->driver, fb_boot.base ? "vesa" : "vga", sizeof(di->driver));
             di->flags = DISPF_BOOT;
-            di->vram_kb = vesa_vram_kb;
+            di->vram_kb = fb_boot.size / 1024;   /* (what the mode takes: the boot loader says no more) */
             boot_mode(&di->boot);
             di->mode = di->boot;
             di->screen_bytes = fb.base ? fb.pitch * fb.height : 0;
@@ -569,10 +515,12 @@ static int display_op(int op, void *arg)
 /* ---- suspend to RAM ---- */
 
 /*
- * The VESA mode to set again when the machine wakes (the BIOS forgets
- * it), 0 for text mode, or -1 if the screen is a driver's and only that
- * driver could set it up again (the Radeon driver can while it keeps to
- * the BIOS mode without its 3D engine).
+ * What the screen needs when the machine wakes (the firmware forgets its
+ * mode): 1 the boot loader's graphics mode set again by the VESA BIOS, 0
+ * text mode, or -1 if nothing could: the screen is a driver's and only
+ * that driver could set it up again (the Radeon driver can while it keeps
+ * to the BIOS mode without its 3D engine), or UEFI firmware started the
+ * machine, and there is no BIOS to ask.
  */
 int fb_wake_mode(void)
 {
@@ -581,7 +529,9 @@ int fb_wake_mode(void)
         return -1;
     if (!fb.base)
         return 0;
-    return vesa_mode ? (vesa_mode & 0x1FF) | 0x4000 : 0;    /* with the linear framebuffer */
+    if (boot.uefi && !radeon_present() && !intel_present() && !navi_present())
+        return -1;
+    return 1;
 }
 
 /* Nothing draws through SYS_display while the machine sleeps; the desktop

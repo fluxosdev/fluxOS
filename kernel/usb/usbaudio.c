@@ -462,12 +462,12 @@ static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
     if (req == SOUND_INFO) {
         struct sound_info si;
         sound_get_info(&si);
-        return copy_to_user((void *)arg, &si, sizeof(si));
+        return copy_to_user(UPTR(arg), &si, sizeof(si));
     }
     if (req != MIXER_READ && req != MIXER_WRITE)
         return -EINVAL;
     struct mixer_level ml;
-    if (copy_from_user(&ml, (const void *)arg, sizeof(ml)) < 0)
+    if (copy_from_user(&ml, UPTR(arg), sizeof(ml)) < 0)
         return -EFAULT;
     int hw_level;
     spin_lock(&snd_lock);
@@ -476,7 +476,7 @@ static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
     if (r == 0 && hw_level >= 0)
         apply_master(hw_level);
     if (r == 0 && req == MIXER_READ)
-        r = copy_to_user((void *)arg, &ml, sizeof(ml));
+        r = copy_to_user(UPTR(arg), &ml, sizeof(ml));
     return r;
 }
 
@@ -718,7 +718,7 @@ static int alloc_buffers(void)
         uint32_t pages = pmm_alloc_contig(RING_PAGES);
         if (!pages)
             return -1;
-        ua.ring = (uint8_t *)pages;
+        ua.ring = (uint8_t *)phys_to_virt(pages);
     }
     for (int k = 0; k < NX; k++)
         if (!ua.buf[k] && !(ua.buf[k] = usb_dma_alloc(XFER_BYTES)))

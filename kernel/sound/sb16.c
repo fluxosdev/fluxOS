@@ -15,6 +15,7 @@
  * but silence is left to play the DSP is stopped.
  */
 #include "kernel.h"
+#include "mm.h"
 #include "arch.h"
 #include "drivers.h"
 #include "proc.h"
@@ -54,7 +55,8 @@
 
 spinlock_t snd_lock = SPINLOCK_INIT("sound");    /* drivers.h */
 
-static uint8_t dma_buf[DMA_SIZE] __attribute__((aligned(DMA_SIZE)));
+static uint8_t *dma_buf;                /* from pmm_alloc_isa(): where ISA DMA reaches */
+_Static_assert(DMA_SIZE == 32768, "what pmm_alloc_isa() gives");
 static uint8_t ring[RING_SIZE];
 
 static struct {
@@ -203,7 +205,7 @@ static void start(void)
     fill_half(1);
     sb.next_half = 0;
     int ch = sb.dev16 ? sb.dma16 : sb.dma8;
-    if (isa_dma_start(ch, (uint32_t)dma_buf, 2 * sb.half, DMA_PLAY_AUTO) < 0)
+    if (isa_dma_start(ch, virt_to_phys(dma_buf), 2 * sb.half, DMA_PLAY_AUTO) < 0)
         return;
     uint32_t count = (sb.dev16 ? sb.half / 2 : sb.half) - 1;   /* samples per block, less one */
     uint8_t mode = (uint8_t)(MODE_STEREO | (sb.dev16 ? MODE_SIGNED : 0));
@@ -317,18 +319,18 @@ static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
     if (req == SOUND_INFO) {
         struct sound_info si;
         sound_get_info(&si);
-        return copy_to_user((void *)arg, &si, sizeof(si));
+        return copy_to_user(UPTR(arg), &si, sizeof(si));
     }
     if (req != MIXER_READ && req != MIXER_WRITE)
         return -EINVAL;
     struct mixer_level ml;
-    if (copy_from_user(&ml, (const void *)arg, sizeof(ml)) < 0)
+    if (copy_from_user(&ml, UPTR(arg), sizeof(ml)) < 0)
         return -EFAULT;
     spin_lock(&snd_lock);
     int r = mixer_ioctl_locked(req, &ml);
     spin_unlock(&snd_lock);
     if (r == 0 && req == MIXER_READ)
-        r = copy_to_user((void *)arg, &ml, sizeof(ml));
+        r = copy_to_user(UPTR(arg), &ml, sizeof(ml));
     return r;
 }
 
@@ -388,8 +390,6 @@ void sb16_init(struct vnode *devdir)
 {
     if (cmdline_has("sb16=off"))
         return;
-    if ((uint32_t)dma_buf + DMA_SIZE > 0x1000000u)
-        return;                         /* ISA DMA cannot reach it */
     static const uint16_t bases[] = { 0x220, 0x240, 0x260, 0x280 };
     for (uint32_t i = 0; i < ARRAY_SIZE(bases) && !sb.present; i++) {
         sb.base = bases[i];
@@ -408,6 +408,13 @@ void sb16_init(struct vnode *devdir)
     }
     if (!sb.present)
         return;
+    uint32_t dma_phys = pmm_alloc_isa();
+    if (!dma_phys) {
+        kprintf("sb16: no memory below 16 MiB for its DMA buffer, ignoring it\n");
+        sb.present = 0;
+        return;
+    }
+    dma_buf = phys_to_virt(dma_phys);
     if (!read_resources()) {
         /* Not configured: the usual settings, A220 I5 D1 H5. */
         mix_write(MIX_IRQ, 0x02);

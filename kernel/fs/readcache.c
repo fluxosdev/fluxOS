@@ -97,7 +97,7 @@ static struct read_block *get(struct blockdev *disk, uint32_t base)
         if (!blocks[i].data) {
             uint32_t page = pmm_alloc_reserved(reserve_frames);
             if (page) {
-                blocks[i].data = (uint8_t *)(uintptr_t)page;
+                blocks[i].data = phys_to_virt(page);
                 resident++;
             } else {
                 /* At the reserve, recycle a resident page instead of growing. */
@@ -133,7 +133,7 @@ static uint32_t reclaim(uint32_t pages)
             if (!b->data) continue;
             if (!pass && b->used) { b->used = 0; continue; }
             remove_block((int)i);
-            pmm_free((uint32_t)(uintptr_t)b->data);
+            pmm_free(virt_to_phys(b->data));
             b->data = NULL;
             resident--; released++;
         }
@@ -201,7 +201,7 @@ void readcache_discard(struct blockdev *disk)
         for (uint32_t i = 0; i < capacity; i++)
             if (blocks[i].disk == disk) {
                 remove_block((int)i);
-                pmm_free((uint32_t)(uintptr_t)blocks[i].data);
+                pmm_free(virt_to_phys(blocks[i].data));
                 blocks[i].data = NULL; resident--;
             }
     spin_unlock(&cache_lock);

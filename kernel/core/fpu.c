@@ -73,8 +73,8 @@ static inline void fpu_restore(const uint8_t *image)
 
 void fpu_init_cpu(void)
 {
-    uint32_t cr0 = read_cr0();
-    cr0 &= ~CR0_EM;
+    uint64_t cr0 = read_cr0();
+    cr0 &= ~(uint64_t)CR0_EM;
     cr0 |= CR0_MP | CR0_NE | CR0_TS;
     write_cr0(cr0);
     write_cr4(read_cr4() | CR4_OSFXSR | CR4_OSXMMEXCPT);

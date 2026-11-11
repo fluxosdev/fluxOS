@@ -5,7 +5,7 @@
  * It is drawn by the window manager's own compositor (wm.c calls
  * saver_draw), so it works with every video driver.
  *
- * The choice is kept in GRUB's environment block as fluxos_saver, for
+ * The choice is kept in the boot partition's settings as fluxos_saver, for
  * example "bounce-300-128" (or "off-300-128"): the wait in seconds, then
  * the logo's size in pixels. Without a disk to save it on it lasts until a
  * restart.
@@ -43,7 +43,7 @@ void saver_init(void)
 {
     char dir[128], value[48];
     last_input = now_ms();
-    if (!grubenv_boot_dir(dir, sizeof(dir)) || !grubenv_get(dir, "fluxos_saver", value, sizeof(value)))
+    if (!bootenv_boot_dir(dir, sizeof(dir)) || !bootenv_get(dir, "fluxos_saver", value, sizeof(value)))
         return;
     if (!strncmp(value, "bounce-", 7))
         cfg.enabled = 1;
@@ -72,11 +72,11 @@ void saver_set(struct saver_config c, int save)
     cfg = c;
     last_input = now_ms();
     char dir[128], value[48];
-    if (!save || !grubenv_boot_dir(dir, sizeof(dir)))
+    if (!save || !bootenv_boot_dir(dir, sizeof(dir)))
         return;
     snprintf(value, sizeof(value), "%s-%d-%d", cfg.enabled ? "bounce" : "off", cfg.timeout, cfg.size);
     const char *keys[1] = { "fluxos_saver" }, *vals[1] = { value };
-    grubenv_update(dir, keys, vals, 1);
+    bootenv_update(dir, keys, vals, 1);
 }
 
 /* ---- the logo, scaled ---- */

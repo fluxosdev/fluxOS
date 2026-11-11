@@ -107,7 +107,7 @@ struct uhci {
 
 static inline uint32_t phys(const void *p)
 {
-    return (uint32_t)p;
+    return virt_to_phys(p);
 }
 
 static inline void barrier(void)
@@ -224,7 +224,7 @@ static void iso_unlink(struct uhci *u, struct uhci_td *td)
 {
     volatile uint32_t *pp = &u->frames[td->sched & 1023];
     while (!(*pp & (LP_T | LP_QH))) {
-        struct uhci_td *t = (struct uhci_td *)(*pp & ~0xFu);
+        struct uhci_td *t = (struct uhci_td *)phys_to_virt(*pp & ~0xFu);
         if (t == td) {
             *pp = td->link;
             return;
@@ -250,16 +250,16 @@ static int iso_submit(struct uhci *u, struct uhci_qh *qh, struct usb_xfer *x)
         start = (uint16_t)((now + 2) & 0x7FF);         /* idle, late, or absurd: soon */
 
     struct uhci_td *first = NULL, *last = NULL;
-    uint32_t a = (uint32_t)x->buf;
+    uint32_t a = virt_to_phys(x->buf);
     for (uint32_t i = 0; i < x->npackets; i++) {
         uint32_t len = x->iso_len[i];
         if (in)
-            a = (uint32_t)x->buf + i * mps;
-        if (len > mps || a + len > (uint32_t)x->buf + x->len) {
+            a = virt_to_phys(x->buf) + i * mps;
+        if (len > mps || a + len > virt_to_phys(x->buf) + x->len) {
             free_chain(first);
             return -EINVAL;
         }
-        struct uhci_td *td = td_new(dev, ep, in ? PID_IN : PID_OUT, 0, (void *)a, len);
+        struct uhci_td *td = td_new(dev, ep, in ? PID_IN : PID_OUT, 0, phys_to_virt(a), len);
         if (!td) {
             free_chain(first);
             return -ENOMEM;
@@ -772,7 +772,7 @@ static void uhci_init(const struct pci_dev *pci)
     }
     u->skel[0]->link = phys(u->skel[1]) | LP_QH;
     u->skel[1]->link = phys(u->skel[2]) | LP_QH;
-    u->frames = (uint32_t *)page;
+    u->frames = (uint32_t *)phys_to_virt(page);
     for (int i = 0; i < 1024; i++)
         u->frames[i] = phys(u->skel[0]) | LP_QH;
 

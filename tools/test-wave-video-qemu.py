@@ -21,7 +21,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("disk")
 parser.add_argument("samples")
 parser.add_argument("outdir")
-parser.add_argument("--qemu", default="qemu-system-i386")
+parser.add_argument("--qemu", default="qemu-system-x86_64")
 parser.add_argument("--rootfs", default="build/rootfs")
 parser.add_argument("--page", default="tests/wave-video/video.html")
 parser.add_argument("--seconds", type=int, default=40, help="how long after boot to let it run")
@@ -86,7 +86,7 @@ with tempfile.TemporaryDirectory(prefix="flux-wave-") as tmp:
     debugfs(commands, write=True)
     put_part()
     sock = pathlib.Path(tmp) / "mon.sock"
-    cmd = [args.qemu, "-enable-kvm", "-cpu", "core2duo,-lm", "-smp", "2", "-m", "1024",
+    cmd = [args.qemu, "-enable-kvm", "-cpu", "core2duo", "-smp", "2", "-m", "1024",
            "-drive", f"file={disk},format=raw,if=ide,index=0", "-boot", "c", "-display", "none",
            "-vga", "std", "-monitor", f"unix:{sock},server,nowait", "-serial", "file:" + str(out / "serial.log"),
            "-nic", "user,model=e1000" if args.net else "none"]

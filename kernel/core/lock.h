@@ -41,7 +41,7 @@ typedef struct spinlock {
 
 #define SPINLOCK_INIT(n) { 0, 0, -1, 0, n }
 
-void lock_init(void);                   /* once cpu_init() has checked for a 486 and more */
+void lock_init(void);                   /* once the processor and its tables are set up (kmain) */
 void spin_lock(spinlock_t *l);
 void spin_unlock(spinlock_t *l);
 int spin_trylock(spinlock_t *l);        /* 1 if taken; never waits */

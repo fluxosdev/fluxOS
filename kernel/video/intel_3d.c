@@ -264,7 +264,7 @@ _Static_assert(K_DEBUG + sizeof(ps_debug) <= CC_VIEWPORT, "ps_debug overlaps");
 
 static struct {
     int ok;                         /* passed the self-test and has not hung */
-    uint8_t *k3d;                   /* the kernel's pages (identity mapped) */
+    uint8_t *k3d;                   /* the kernel's pages (in the direct map) */
     uint32_t k3d_phys, k3d_first;   /* and their first GTT page */
     volatile uint32_t *ring, *hws;
     uint32_t tail, seq;
@@ -959,7 +959,7 @@ void intel_3d_init(void)
     r3.k3d_phys = pmm_alloc_contig(K3D_BYTES / PAGE_SIZE);
     if (!r3.k3d_phys)
         return;
-    r3.k3d = (uint8_t *)r3.k3d_phys;
+    r3.k3d = (uint8_t *)phys_to_virt(r3.k3d_phys);
     memset(r3.k3d, 0, K3D_BYTES);
     r3.ring = (volatile uint32_t *)(r3.k3d + RRING_OFF);
     r3.hws = (volatile uint32_t *)(r3.k3d + RHWS_OFF);
@@ -1026,7 +1026,7 @@ int intel_map3d(struct disp3d *d)
             uint32_t pg = pmm_alloc();
             if (!pg)
                 break;
-            memset((void *)pg, 0, PAGE_SIZE);
+            memset(phys_to_virt(pg), 0, PAGE_SIZE);
             r3.pages[r3.npages++] = pg;
         }
         r3.owner = current->leader->pid;
@@ -1065,7 +1065,7 @@ int intel_submit3d(const struct dispsubmit *sub)
     for (uint32_t done = 0; done < n * 4;) {
         uint32_t at = off + done;
         uint32_t chunk = MIN(n * 4 - done, PAGE_SIZE - (at & 0xFFF));
-        memcpy((uint8_t *)ops_copy + done, (const uint8_t *)r3.pages[at >> 12] + (at & 0xFFF), chunk);
+        memcpy((uint8_t *)ops_copy + done, (const uint8_t *)phys_to_virt(r3.pages[at >> 12]) + (at & 0xFFF), chunk);
         done += chunk;
     }
     r3.space_gpu = r3.arena_first << 12;

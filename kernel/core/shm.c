@@ -192,7 +192,7 @@ int sys_shmat(uint32_t id, uint32_t usize, uint32_t c, uint32_t d, uint32_t e)
         return r;
     }
     kfree(frames);
-    if (usize && copy_to_user((void *)usize, &size, sizeof(size)) < 0) {
+    if (usize && copy_to_user(UPTR(usize), &size, sizeof(size)) < 0) {
         proc_munmap(current, addr, n * PAGE_SIZE);
         return -EFAULT;
     }
@@ -211,7 +211,7 @@ int sys_shmctl(uint32_t id, uint32_t cmd, uint32_t ubuf, uint32_t d, uint32_t e)
     if (cmd == IPC_STAT) {
         struct flux_shmid_ds ds = { segs[slot].size, segs[slot].creator, 0 };
         spin_unlock(&shm_lock);
-        return copy_to_user((void *)ubuf, &ds, sizeof(ds)) < 0 ? -EFAULT : 0;
+        return copy_to_user(UPTR(ubuf), &ds, sizeof(ds)) < 0 ? -EFAULT : 0;
     }
     if (cmd != IPC_RMID) {
         spin_unlock(&shm_lock);

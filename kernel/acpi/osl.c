@@ -2,9 +2,9 @@
  * The kernel's side of uACPI (third_party/uacpi): the services its
  * kernel_api.h asks for, built on what the kernel has.
  *
- * Memory: the first GiB is identity-mapped already; firmware memory
- * above it (the tables and ACPI NVS on a machine with more RAM, and
- * chipset registers) goes into the kernel's late window, and stays
+ * Memory: the first 4 GiB are in the kernel's direct map already;
+ * firmware memory above them (on a machine whose firmware put its tables
+ * or registers there) goes into the kernel's late window, and stays
  * mapped: uACPI maps the same few ranges again and again, so a small list
  * of what is mapped serves the repeats, and unmapping does nothing.
  *
@@ -37,7 +37,7 @@
 #define NMAPS 48
 
 static struct {
-    uint32_t phys, len;                 /* page-aligned */
+    uint64_t phys, len;                 /* page-aligned */
     uint8_t *virt;
 } maps[NMAPS];
 static int nmaps;
@@ -56,16 +56,14 @@ void *uacpi_kernel_map(uacpi_phys_addr addr, uacpi_size len)
 {
     if (!len)
         len = 1;
-    if (addr >> 32 || addr + len > 0x100000000ull)
-        return UACPI_MAP_FAILED;        /* no PAE: out of reach */
-    uint32_t pa = (uint32_t)addr;
-    if (pa + len <= KERNEL_SPACE_END) {
-        void *p = (void *)pa;
-        __asm__("" : "+r"(p));          /* (past the compiler's idea of a null pointer) */
-        return p;
-    }
-    uint32_t base = ALIGN_DOWN(pa, PAGE_SIZE);
-    uint32_t span = ALIGN_UP(pa + (uint32_t)len, PAGE_SIZE) - base;
+    if (addr + len < addr)
+        return UACPI_MAP_FAILED;
+    uint64_t pa = addr;
+    if (pa + len <= 0x100000000ull)
+        return phys_to_virt(pa);        /* the direct map has all of the first 4 GiB */
+    /* Above it (a table or a register of firmware that put it there): mapped a page at a time. */
+    uint64_t base = ALIGN_DOWN(pa, (uint64_t)PAGE_SIZE);
+    uint64_t span = ALIGN_UP(pa + len, (uint64_t)PAGE_SIZE) - base;
     spin_lock(&map_lock);
     for (int i = 0; i < nmaps; i++) {
         if (base >= maps[i].phys && base + span <= maps[i].phys + maps[i].len) {
@@ -78,7 +76,7 @@ void *uacpi_kernel_map(uacpi_phys_addr addr, uacpi_size len)
     /* Write-back: the processor's MTRRs make device registers uncached. */
     uint8_t *v = vmm_map_late(base, span, 0);
     if (!v) {
-        klog("acpi: cannot map %08x+%x: the window is full\n", pa, (uint32_t)len);
+        klog("acpi: cannot map %lx+%x: out of memory\n", pa, (uint32_t)len);
         return UACPI_MAP_FAILED;
     }
     spin_lock(&map_lock);

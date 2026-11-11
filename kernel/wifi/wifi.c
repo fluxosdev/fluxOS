@@ -848,7 +848,7 @@ int wifi_syscall(uint32_t op, uint32_t arg)
         struct wifi_status st;
         memset(&st, 0, sizeof(st));
         if (!w.hw)
-            return copy_to_user((void *)arg, &st, sizeof(st));
+            return copy_to_user(UPTR(arg), &st, sizeof(st));
         st.state = (uint32_t)status_of();
         st.scans = w.scans;
         strlcpy(st.driver, w.hw->name, sizeof(st.driver));
@@ -870,7 +870,7 @@ int wifi_syscall(uint32_t op, uint32_t arg)
         }
         strlcpy(st.error, w.error, sizeof(st.error));
         spin_unlock(&wifi_lock);
-        return copy_to_user((void *)arg, &st, sizeof(st));
+        return copy_to_user(UPTR(arg), &st, sizeof(st));
     }
     case WIFI_SCAN:
         if (!w.hw || w.status == WIFI_ST_FAILED)
@@ -880,7 +880,7 @@ int wifi_syscall(uint32_t op, uint32_t arg)
         return 0;
     case WIFI_BSS: {
         struct wifi_bss_info bi;
-        if (copy_from_user(&bi, (const void *)arg, sizeof(bi)) < 0)
+        if (copy_from_user(&bi, UPTR(arg), sizeof(bi)) < 0)
             return -EFAULT;
         uint32_t want = bi.index, n = 0;
         int found = 0;
@@ -904,13 +904,13 @@ int wifi_syscall(uint32_t op, uint32_t arg)
         spin_unlock(&wifi_lock);
         if (!found)
             return -ENOENT;
-        return copy_to_user((void *)arg, &bi, sizeof(bi));
+        return copy_to_user(UPTR(arg), &bi, sizeof(bi));
     }
     case WIFI_CONNECT: {
         struct wifi_connect c;
         if (!w.hw || w.status == WIFI_ST_FAILED)
             return -ENODEV;                 /* while starting, it waits for the card */
-        if (copy_from_user(&c, (const void *)arg, sizeof(c)) < 0)
+        if (copy_from_user(&c, UPTR(arg), sizeof(c)) < 0)
             return -EFAULT;
         if (!c.ssid_len || c.ssid_len > WIFI_SSID_MAX)
             return -EINVAL;

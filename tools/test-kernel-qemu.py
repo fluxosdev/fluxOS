@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Boot the kernel regressions with a temporary initrd and blank scratch disk."""
+"""Boot the kernel regressions with a temporary initrd and blank scratch disk.
+
+The kernel starts as it does on a real machine, through Limine: from a small
+CD made for the run (tools/bootiso.sh) that holds it and the initrd."""
 import argparse
 import array
 import math
@@ -21,7 +24,8 @@ parser.add_argument("--memory", type=int, default=256, choices=range(64, 4097), 
 parser.add_argument("--success-marker", default="KERNEL REGRESSIONS PASSED")
 parser.add_argument("--add", action="append", default=[], metavar="HOST:GUEST", help="a host file to add to the initrd at that guest path")
 parser.add_argument("--drop", action="append", default=[], metavar="PREFIX", help="leave initrd members under this path out (the toolchain, for tests that do not need it in memory)")
-parser.add_argument("--timeout", type=int, default=45)
+parser.add_argument("--timeout", type=int, default=60)
+parser.add_argument("--mkiso", default=None, help="the build's mkiso (default: build/host/mkiso)")
 parser.add_argument("--kvm", action="store_true", help="run the guest under KVM (same CPU model) when /dev/kvm can be opened, else under TCG as usual")
 parser.add_argument("--disk", metavar="IMAGE", help="a second IDE disk (/dev/hdb), used in place, not copied")
 parser.add_argument("--fsck-ext2", action="store_true", help="the guest leaves an ext2 volume on the scratch disk: have e2fsck check it")
@@ -103,8 +107,15 @@ with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
             print("host: running the guest under KVM")
         else:
             print("host: /dev/kvm cannot be opened, so the guest runs under TCG")
-    command = [qemu, *accel, "-cpu", "core2duo,-lm", "-smp", str(args.cpus),
-               "-kernel", kernel, "-initrd", str(overlay), "-append", "automount=off " + args.append,
+    # The CD: Limine, the kernel and the initrd (in text mode: nothing looks at the screen).
+    tools = pathlib.Path(__file__).resolve().parent
+    boot = temp / "boot.iso"
+    subprocess.run(["sh", str(tools / "bootiso.sh"), str(boot), kernel, str(overlay),
+                    "textmode automount=off " + args.append,
+                    args.mkiso or str(tools.parent / "build/host/mkiso")], check=True)
+    overlay.unlink()
+    command = [qemu, *accel, "-cpu", "core2duo", "-smp", str(args.cpus),
+               "-boot", "d", "-cdrom", str(boot),
                "-m", f"{args.memory}M", "-display", "none", "-monitor", "none", "-serial", "stdio",
                "-no-reboot", "-nic", "user,model=e1000" if args.net else "none",
                "-drive", f"file={scratch},format=raw,if=ide,index=0"]

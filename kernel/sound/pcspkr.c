@@ -121,7 +121,7 @@ static int spkr_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
     switch (req) {
     case SPKR_TONE: {
         struct spkr_tone tone;
-        if (copy_from_user(&tone, (const void *)arg, sizeof(tone)) < 0)
+        if (copy_from_user(&tone, UPTR(arg), sizeof(tone)) < 0)
             return -EFAULT;
         const struct spkr_tone *t = &tone;
         spin_lock(&spkr_lock);
@@ -160,7 +160,7 @@ static int spkr_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
     case SOUND_INFO: {
         struct sound_info si;
         sound_get_info(&si);
-        return copy_to_user((void *)arg, &si, sizeof(si));
+        return copy_to_user(UPTR(arg), &si, sizeof(si));
     }
     }
     return -EINVAL;

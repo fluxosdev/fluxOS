@@ -124,7 +124,7 @@ static int load_bios(void)
     bios = kzalloc(BIOS_MAX);
     if (!bios)
         return -1;
-    const uint8_t *shadow = (const uint8_t *)0xC0000;
+    const uint8_t *shadow = phys_to_virt(0xC0000);
     if (shadow[0] == 0x55 && shadow[1] == 0xAA) {
         uint32_t size = MIN((uint32_t)shadow[2] * 512, BIOS_MAX);
         memcpy(bios, shadow, size);

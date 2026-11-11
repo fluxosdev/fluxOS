@@ -4,16 +4,15 @@
 #                   fluxOS Setup and installs fluxOS onto a hard disk
 #   make run        boot the ISO in QEMU (serial console on stdio), with
 #                   fluxdisk.img to install onto
-#   make run-kernel boot the kernel directly with QEMU's multiboot loader,
-#                   running the whole system from memory (for development;
-#                   text console only: that loader cannot set a video mode)
+#   make run-kernel boot the kernel from a small CD with the whole system as
+#                   its initrd, running it from memory (for development)
 #   make run-disk   boot fluxdisk.img alone (after installing onto it)
 #   make run-q35    boot the ISO on a q35 machine: fluxdisk.img and the CD on
 #                   its SATA (AHCI) controller, a USB keyboard and tablet on xHCI
 #   make run-usb    boot the ISO with fluxdisk.img as a USB stick on EHCI, and
 #                   a USB keyboard and mouse on UHCI
 #   make run-nvme   boot the ISO with fluxdisk.img as an NVMe disk
-#   make check      verify the kernel is a valid multiboot image
+#   make check      verify the kernel is an image Limine can start
 #   make disk       create fluxdisk.img, an ext2 data disk (kept by make clean)
 #   make floppy     create fluxfloppy.img, a 1.44 MB FAT12 floppy that the
 #                   QEMU targets then put in drive A: (kept by make clean)
@@ -22,30 +21,25 @@
 CC      ?= gcc
 LD      ?= ld
 AR      ?= ar
-QEMU    ?= qemu-system-i386
-# A Core 2 Duo (SSE2 through SSSE3), two cores; QEMU_SMP=1 or 4 for other counts.
-QEMU_CPU ?= -cpu core2duo,-lm
+QEMU    ?= qemu-system-x86_64
+# A Core 2 Duo (64-bit, SSE2 through SSSE3), two cores; QEMU_SMP=1 or 4 for other counts.
+QEMU_CPU ?= -cpu core2duo
 QEMU_SMP ?= 2
-# GRUB 2.06 from Debian 12 (2.12 reboots some older PCs right after "Welcome
-# to GRUB!"): its boot images and the modules the menus load are checked in
-# (firmware/grub, see its README), and mkiso (user/bin/mkiso.c, built for the
-# machine running the build: Linux, or fluxOS itself) makes the CD from them.
-# grub-mkrescue can still make it, from Debian's GRUB fetched into grub-2.06/
-# by tools/fetch-grub.sh, or the host's own:
-#   make MKRESCUE=grub-2.06/usr/bin/grub-mkrescue
-#   make MKRESCUE=grub-mkrescue GRUB=/ GRUB_DEP=
-MKRESCUE ?=
-GRUB    ?= grub-2.06
-GRUB_DEP ?= $(GRUB)/usr/bin/grub-mkimage
-GRUB_PC_DIR ?= $(GRUB)/usr/lib/grub/i386-pc
-GRUB_FIRMWARE := $(shell find firmware/grub -type f 2>/dev/null)
+# Limine starts fluxOS, from the CD and from an installed disk, on a BIOS or
+# on UEFI firmware: its files are checked in (firmware/limine, see its
+# README), and mkiso (user/bin/mkiso.c, built for the machine running the
+# build: Linux, or fluxOS itself) makes the CD from them. Limine's installer
+# (third_party/limine, built likewise) then puts its first sector into the
+# image, so that it starts from a USB stick as well.
+LIMINE_FIRMWARE := $(addprefix firmware/limine/,limine-bios.sys limine-bios-cd.bin limine-uefi-cd.bin BOOTX64.EFI)
 
 # Programs the build runs on the machine it runs on, from user/bin: the C
 # compiler there (on fluxOS, the native gcc) builds them.
 HOSTCC ?= cc
 HOST_TOOLS = $(BUILD)/host
 MKISO   = $(HOST_TOOLS)/mkiso
-MBCHECK = $(HOST_TOOLS)/mbcheck
+LIMINE  = $(HOST_TOOLS)/limine
+KCHECK  = $(HOST_TOOLS)/kcheck
 
 # Plain "make" builds the ISO, whatever rule comes first below.
 .DEFAULT_GOAL := all
@@ -53,7 +47,6 @@ MBCHECK = $(HOST_TOOLS)/mbcheck
 BUILD   := build
 ISO     := fluxOS.iso
 KERNEL  := $(BUILD)/fluxos.kernel
-TEXT_KERNEL := $(BUILD)/fluxos-text.kernel
 SYSTEM  := $(BUILD)/system.tar
 SETUP   := $(BUILD)/setup.tar
 ROOTFS  := $(BUILD)/rootfs
@@ -67,36 +60,38 @@ MKFS_FAT ?= $(shell command -v mkfs.fat 2>/dev/null || ls /usr/sbin/mkfs.fat /sb
 
 GCC_INC := $(shell $(CC) -print-file-name=include)
 
-# fluxOS needs a Pentium 4: everything is built for its instruction set,
-# SSE2 included (kernel/core/cpu.c stops the boot on anything older). A Linux
-# compiler's own macros are taken away, so that the code is compiled for fluxOS
-# as the native gcc compiles it (which defines none of them).
-CFLAGS_COMMON := -m32 -march=pentium4 -std=gnu11 -O2 -g \
+# fluxOS needs a 64-bit processor (x86-64). The kernel is 64-bit code; the
+# programs are still 32-bit ones, built for a Pentium 4's instruction set, SSE2
+# included (which every 64-bit processor has), and run in the processor's
+# compatibility mode. A Linux compiler's own macros are taken away, so that
+# the code is compiled for fluxOS as the native gcc compiles it (which defines
+# none of them).
+CFLAGS_BASE := -std=gnu11 -O2 -g \
 	-U__linux__ -U__linux -Ulinux -U__gnu_linux__ \
 	-ffreestanding -fno-pie -fno-pic -fno-stack-protector -fno-builtin \
 	-nostdinc -isystem $(GCC_INC) \
 	-fno-asynchronous-unwind-tables -fno-strict-aliasing \
 	-fno-tree-loop-distribute-patterns \
 	-Wall -Wextra -Wno-unused-parameter -MMD -MP
+CFLAGS_COMMON := -m32 -march=pentium4 $(CFLAGS_BASE)
 
-# The kernel's C code keeps off the FPU and SSE registers, which belong to
-# user processes (fpu.c switches them lazily); kernel/core/sse.S borrows the SSE
-# registers for bulk copies, saving what it touches.
-KERNEL_CFLAGS := $(CFLAGS_COMMON) -mgeneral-regs-only -fno-omit-frame-pointer \
+# The kernel runs in the top 2 GiB of the address space (-mcmodel=kernel) and
+# on stacks that interrupts push onto (no red zone). Its C code keeps off the
+# FPU and SSE registers, which belong to user processes (fpu.c switches them
+# lazily); kernel/core/sse.S borrows the SSE registers for bulk copies, saving
+# what it touches. A cast between a pointer and a narrower integer is an
+# error: a kernel address does not fit 32 bits, and what once was such a cast
+# is now virt_to_phys(), phys_to_virt() or UPTR() (mm.h).
+KERNEL_CFLAGS := -m64 -march=x86-64 -mcmodel=kernel -mno-red-zone $(CFLAGS_BASE) \
+	-mgeneral-regs-only -fno-omit-frame-pointer \
+	-Werror=pointer-to-int-cast -Werror=int-to-pointer-cast \
 	-Iinclude -Ikernel/include -Ikernel/core -Ikernel/fs -Ikernel/net -Ikernel/usb -Ikernel/input -Ikernel/storage -Ikernel/sound -Ikernel/video -Ikernel/acpi -Ikernel/wifi
 # User code does all its float and double arithmetic on SSE2 (the x87 is
 # left to long double) and may use the SSE2 intrinsics.
 USER_CFLAGS   := $(CFLAGS_COMMON) -mfpmath=sse -fno-math-errno -Iinclude -Iuser/include
 
-# What runs before kernel/core/cpu.c has checked the processor (the console, the
-# string routines and kmain) is built for any 386, so that an older machine
-# shows why it cannot run fluxOS instead of hanging on an i686 instruction.
-KERNEL_EARLY_OBJS := $(addprefix $(BUILD)/k/,kernel/core/kmain.o kernel/core/cpu.o kernel/core/kprintf.o \
-	kernel/core/lock.o kernel/video/vga.o kernel/video/fb.o kernel/core/serial.o kernel/video/splash.o \
-	lib/string.o lib/vsnprintf.o lib/font8x16.o)
-$(KERNEL_EARLY_OBJS): KERNEL_CFLAGS += -march=i386 -mtune=pentium4
-
 LDFLAGS_COMMON := -m elf_i386 -nostdlib -z noexecstack --no-warn-rwx-segments
+KERNEL_LDFLAGS := -m elf_x86_64 -nostdlib -static -z noexecstack -z max-page-size=0x1000 --no-warn-rwx-segments
 
 # ---- kernel ----
 # uACPI, the AML interpreter behind kernel/acpi: its sources and the kernel's
@@ -107,8 +102,8 @@ UACPI_FLAGS := -I$(UACPI_DIR)/include -include kernel/acpi/uacpi_flux.h
 
 KERNEL_SRCS := $(wildcard kernel/*/*.S kernel/*/*.c) lib/string.c lib/vsnprintf.c lib/font8x16.c \
                lib/sha256.c lib/sha1.c lib/aes.c lib/logo.c user/desktop/shell/font_archivo.c $(UACPI_SRCS)
-KERNEL_OBJS := $(patsubst %,$(BUILD)/k/%.o,$(basename $(KERNEL_SRCS)))
-UACPI_OBJS := $(patsubst %,$(BUILD)/k/%.o,$(basename $(UACPI_SRCS) $(wildcard kernel/acpi/*.c)))
+KERNEL_OBJS := $(patsubst %,$(BUILD)/k64/%.o,$(basename $(KERNEL_SRCS)))
+UACPI_OBJS := $(patsubst %,$(BUILD)/k64/%.o,$(basename $(UACPI_SRCS) $(wildcard kernel/acpi/*.c)))
 $(UACPI_OBJS): KERNEL_CFLAGS += $(UACPI_FLAGS)
 
 # ---- user space ----
@@ -185,7 +180,7 @@ desktop_objs = $(patsubst %,$(BUILD)/u/user/desktop/%.o,$(basename $(1)))
 # (SVG pictures are drawn with Wave's HTML, CSS and font code.)
 LIBDESKTOP_SRCS := $(wildcard user/desktop/image/*.c) $(filter-out %/browser.c,$(wildcard user/desktop/wave/*.c)) \
                    $(addprefix user/desktop/shell/,gfx.c font_archivo.c font_sans.c icons.c widgets.c theme.c \
-                     wallpaint.c grubenv.c imagejobs.c apps.c launch.c loop.c wmconn.c mousecfg.c)
+                     wallpaint.c bootenv.c imagejobs.c apps.c launch.c loop.c wmconn.c mousecfg.c)
 LIBDESKTOP := $(BUILD)/libdesktop.a
 # The desktop process: the window manager, the taskbar, its folder, its dialogs, and setup's screen.
 DESKTOP_SHELL_OBJS := $(call desktop_objs,$(addprefix shell/,main.c wm.c server.c sidebar.c wallpaper.c \
@@ -230,7 +225,7 @@ $(call desktop_objs,media/engine.c media/store.c media/segments.c): USER_CFLAGS 
 DOS_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/dos/*.c)))
 # winrun, the Windows program loader (os_linux.c is its Linux back end, for host tests)
 WIN32_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(filter-out user/win32/os_linux.c,$(wildcard user/win32/*.c user/win32/*.S))))
-BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/fsh $(ROOTFS)/bin/desktop \
+BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/limine $(ROOTFS)/bin/fsh $(ROOTFS)/bin/desktop \
              $(addprefix $(ROOTFS)/bin/,$(DESKTOP_PROGS)) \
              $(ROOTFS)/bin/dos $(ROOTFS)/bin/winrun $(ROOTFS)/bin/wavemedia $(ROOTFS)/bin/[ $(ROOTFS)/bin/gunzip $(ROOTFS)/bin/zcat \
              $(ROOTFS)/usr/bin/ffmpeg $(ROOTFS)/usr/bin/ffprobe
@@ -238,12 +233,12 @@ BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/fsh $(ROOTFS)/bi
 ROOTFS_FILES := $(shell find rootfs -type f 2>/dev/null)
 SETUPFS_FILES := $(shell find setupfs -type f 2>/dev/null)
 
-# The install CD's setup system, the one GRUB loads into memory: fluxOS
+# The install CD's setup system, the one Limine loads into memory: fluxOS
 # Setup (the desktop and fluxinstall), its icons, the terminal and Disk
 # Manager it opens, and a few tools for the command prompt Shift+F10 opens. Small, so that it fits the kernel heap of
 # a machine with little memory; the system it installs is $(SYSTEM), which
 # fluxinstall reads from the CD.
-SETUP_BINS := init desktop terminal diskmgr fluxinstall mkfs.fat mkfs.ext2 fsh cat ls lsblk mount umount df dmesg \
+SETUP_BINS := init desktop terminal diskmgr fluxinstall limine mkfs.fat mkfs.ext2 fsh cat ls lsblk mount umount df dmesg \
               ps free uname clear more mkdir rm cp mv sync reboot poweroff halt
 
 .PHONY: all iso kernel system setup disk floppy run run-kernel run-disk run-q35 run-usb run-nvme check clean
@@ -255,29 +250,19 @@ kernel: $(KERNEL)
 system: $(SYSTEM)
 setup: $(SETUP)
 
-$(BUILD)/k/%.o: %.c
+$(BUILD)/k64/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD)/k/%.o: %.S
+$(BUILD)/k64/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 # The Radeon microcode is pulled in with .incbin.
-$(BUILD)/k/kernel/video/radeon_fw.o: $(wildcard firmware/radeon/*.bin)
+$(BUILD)/k64/kernel/video/radeon_fw.o: $(wildcard firmware/radeon/*.bin)
 
 $(KERNEL): $(KERNEL_OBJS) linker.ld
-	$(LD) $(LDFLAGS_COMMON) -T linker.ld -o $@ $(KERNEL_OBJS)
-
-# The same kernel without the Multiboot video request, for run-kernel.
-$(BUILD)/k/kernel/core/boot-text.o: kernel/core/boot.S
-	@mkdir -p $(dir $@)
-	$(CC) $(KERNEL_CFLAGS) -DMB_TEXT_ONLY -c $< -o $@
-
-TEXT_KERNEL_OBJS := $(BUILD)/k/kernel/core/boot-text.o $(filter-out $(BUILD)/k/kernel/core/boot.o,$(KERNEL_OBJS))
-
-$(TEXT_KERNEL): $(TEXT_KERNEL_OBJS) linker.ld
-	$(LD) $(LDFLAGS_COMMON) -T linker.ld -o $@ $(TEXT_KERNEL_OBJS)
+	$(LD) $(KERNEL_LDFLAGS) -T linker.ld -o $@ $(KERNEL_OBJS)
 
 $(BUILD)/u/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -341,6 +326,12 @@ $(ROOTFS)/usr/bin/ffmpeg: $(CRT0) $(FFMPEG_FFMPEG_OBJS) $(LIBFFMPEG) $(LIBC) use
 $(ROOTFS)/usr/bin/ffprobe: $(CRT0) $(FFMPEG_FFPROBE_OBJS) $(LIBFFMPEG) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(FFMPEG_FFPROBE_OBJS) $(LIBFFMPEG) $(LIBC)
+
+# Limine's installer (limine bios-install DISK), which fluxinstall runs: Limine's own source.
+$(BUILD)/u/third_party/limine/limine.o: USER_CFLAGS += -std=gnu99 -w
+$(ROOTFS)/bin/limine: $(BUILD)/u/third_party/limine/limine.o $(CRT0) $(LIBC) user/user.ld
+	@mkdir -p $(dir $@)
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 
 # play decodes MP3 and Ogg Vorbis with Wave's decoders
 PLAY_CODECS := $(BUILD)/u/user/desktop/wave/codecs.o $(BUILD)/u/user/desktop/wave/mp3dec.o
@@ -411,37 +402,35 @@ $(SETUP): Makefile $(BUILD)/.rootfs-stamp $(BINS) $(SETUPFS_FILES) $(IWL_FIRMWAR
 	cp firmware/iwlwifi/LICENCE.iwlwifi_firmware $(SETUPFS)/usr/share/doc/firmware/
 	tar --format=ustar --owner=0 --group=0 --numeric-owner -cf $@ -C $(SETUPFS) .
 
-$(GRUB)/usr/bin/grub-mkimage:
-	sh tools/fetch-grub.sh $(GRUB)
-
 $(HOST_TOOLS)/%: user/bin/%.c
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -DHOST_TOOL -idirafter user/include $< -o $@
 
-# The CD: GRUB's menu (grub/install.cfg), the kernel, the setup system it
-# loads and the system Setup installs, with GRUB's El Torito image and
-# modules (firmware/grub) in boot/grub/i386-pc. GRUB for hard disks is in
-# firmware/grub, as in the tree: /bin/fluxinstall writes boot.img into the
-# MBR and core.img into the gap before the first partition, which reads its
-# modules and menu (grub/grub.cfg, copied from boot/install) from /boot/grub
-# on that FAT32 partition. boot_hybrid.img makes the ISO start from a USB
-# stick too.
-$(ISO): $(KERNEL) $(SETUP) $(SYSTEM) grub/grub.cfg grub/install.cfg $(GRUB_FIRMWARE) \
-		$(if $(MKRESCUE),$(GRUB_DEP),$(MKISO))
+# Limine's installer, for the machine the build runs on.
+$(LIMINE): third_party/limine/limine.c third_party/limine/limine-bios-hdd.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=c99 -O2 -w $< -o $@
+
+# The CD: Limine's menu (limine/install.conf), the kernel, the setup system
+# it loads and the system Setup installs, with Limine itself (firmware/limine)
+# in boot/limine: its El Torito images for a BIOS and for UEFI firmware, and
+# what they read from the CD. boot/install holds what /bin/fluxinstall puts
+# on a hard disk with them: the disk's menu (limine/limine.conf) and Limine
+# for UEFI; Limine's first sectors for the disk it writes with /bin/limine.
+# The partition table (mkiso -P) and Limine's sector in it make the ISO
+# start from a USB stick too.
+$(ISO): $(KERNEL) $(SETUP) $(SYSTEM) limine/limine.conf limine/install.conf $(LIMINE_FIRMWARE) $(MKISO) $(LIMINE)
 	rm -rf $(BUILD)/iso
-	mkdir -p $(BUILD)/iso/boot/grub $(BUILD)/iso/boot/install $(BUILD)/iso/firmware/grub
+	mkdir -p $(BUILD)/iso/boot/limine $(BUILD)/iso/boot/install
 	cp $(KERNEL) $(BUILD)/iso/boot/fluxos.kernel
 	cp $(SETUP) $(BUILD)/iso/boot/setup.tar
 	cp $(SYSTEM) $(BUILD)/iso/boot/system.tar
-	cp grub/install.cfg $(BUILD)/iso/boot/grub/grub.cfg
-	cp grub/grub.cfg $(BUILD)/iso/boot/install/grub.cfg
-	cp firmware/grub/boot.img firmware/grub/core.img firmware/grub/README $(BUILD)/iso/firmware/grub/
-ifeq ($(MKRESCUE),)
-	cp -r firmware/grub/i386-pc $(BUILD)/iso/boot/grub/
-	$(MKISO) -o $@ -b boot/grub/i386-pc/eltorito.img -G firmware/grub/boot_hybrid.img $(BUILD)/iso
-else
-	PATH="$(abspath $(GRUB))/usr/bin:$$PATH" $(MKRESCUE) -d $(GRUB_PC_DIR) -o $@ $(BUILD)/iso
-endif
+	cp limine/install.conf $(BUILD)/iso/boot/limine/limine.conf
+	cp firmware/limine/limine-bios.sys firmware/limine/limine-bios-cd.bin firmware/limine/limine-uefi-cd.bin \
+		$(BUILD)/iso/boot/limine/
+	cp limine/limine.conf firmware/limine/BOOTX64.EFI $(BUILD)/iso/boot/install/
+	$(MKISO) -o $@ -b boot/limine/limine-bios-cd.bin -e boot/limine/limine-uefi-cd.bin -P $(BUILD)/iso
+	$(LIMINE) bios-install --quiet $@
 
 # The fluxOS sysroot: the headers and libraries a compiler targeting
 # fluxOS (i686-fluxos-gcc, tools/toolchain) builds programs against.
@@ -465,10 +454,11 @@ $(SYSROOT_STAMP): $(LIBC) $(LIBGL) $(LIBFONT) $(CRT0) user/user.ld $(wildcard us
 toolchain: sysroot
 	tools/toolchain/build.sh --sysroot $(SYSROOT) --prefix $(BUILD)/toolchain/cross
 
-# The Multiboot header GRUB looks for, and the one PT_LOAD segment the linker
-# script promises (mbcheck, built for the machine the build runs on).
-check: $(KERNEL) $(MBCHECK)
-	$(MBCHECK) $(KERNEL)
+# What Limine wants of a kernel: a 64-bit ELF image linked into the top
+# 2 GiB of the address space, with the requests of the Limine boot protocol
+# in it (kcheck, built for the machine the build runs on).
+check: $(KERNEL) $(KCHECK)
+	$(KCHECK) $(KERNEL)
 
 disk: $(DISK)
 
@@ -530,8 +520,12 @@ QEMU_SND  ?= $(QEMU_AUDIO) -device sb16,audiodev=snd0
 run: $(ISO) $(DISK)
 	$(QEMU) $(QEMU_CPU) -smp $(QEMU_SMP) -m 2G -serial stdio -boot d -cdrom $(ISO) $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
 
-run-kernel: $(TEXT_KERNEL) $(SYSTEM) $(DISK)
-	$(QEMU) $(QEMU_CPU) -smp $(QEMU_SMP) -kernel $(TEXT_KERNEL) -initrd $(SYSTEM) -m 1G -serial stdio $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
+# The kernel and the whole system as its initrd on a small CD of their own
+# (tools/bootiso.sh): no install, no disk to start from.
+RUN_KERNEL_CMDLINE ?= nosplash
+run-kernel: $(KERNEL) $(SYSTEM) $(DISK) $(MKISO)
+	sh tools/bootiso.sh $(BUILD)/run-kernel.iso $(KERNEL) $(SYSTEM) "$(RUN_KERNEL_CMDLINE)" $(MKISO)
+	$(QEMU) $(QEMU_CPU) -smp $(QEMU_SMP) -boot d -cdrom $(BUILD)/run-kernel.iso -m 1G -serial stdio $(QEMU_DISK) $(QEMU_NET) $(QEMU_SND)
 
 # Boot fluxdisk.img on its own, after "fluxinstall /dev/hda".
 run-disk: $(DISK)
@@ -577,7 +571,7 @@ clean:
 # The phase 3 tools (tar, gzip, sed, diff, patch, find...) built for the host and
 # checked against the GNU originals (tests/tools-host.sh).
 TOOL_TESTS := find install cmp cut xargs truncate dd ln nproc true false printf test mktemp diff patch sed gzip tar \
-	mkfs.ext2 fsck.ext2 mkiso mbcheck
+	mkfs.ext2 fsck.ext2 mkiso kcheck
 TOOL_TEST_BINS := $(addprefix $(BUILD)/tests/tools/,$(TOOL_TESTS))
 .PHONY: test-tools
 test-tools: $(TOOL_TEST_BINS)
@@ -631,8 +625,8 @@ $(BUILD)/tests/chess-rules: tests/chess-rules.c user/desktop/apps/chessrules.c u
 # The native GCC on the real kernel: compiles and runs a program under QEMU and
 # compares the binary with the cross compiler's (needs "make toolchain-native").
 .PHONY: test-gcc-qemu
-test-gcc-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/gcc-guest $(BUILD)/tests/gcc-hello.cross $(BUILD)/tests/gcc-hellocc.cross $(NATIVE_ROOT)/usr/bin/gcc
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/gcc-guest --cpus $(KERNEL_TEST_CPUS) \
+test-gcc-qemu: $(KERNEL) $(MKISO) $(SYSTEM) $(BUILD)/tests/gcc-guest $(BUILD)/tests/gcc-hello.cross $(BUILD)/tests/gcc-hellocc.cross $(NATIVE_ROOT)/usr/bin/gcc
+	python3 tools/test-kernel-qemu.py $(QEMU) $(KERNEL) $(SYSTEM) $(BUILD)/tests/gcc-guest --cpus $(KERNEL_TEST_CPUS) \
 		--memory 1024 --add $(BUILD)/tests/gcc-hello.cross:tests/hello.cross --add tests/gcc-hello.c:tests/hello.c \
 		--add $(BUILD)/tests/gcc-hellocc.cross:tests/hellocc.cross --add tests/gcc-hello.cc:tests/hello.cc \
 		--success-marker "GCC REGRESSIONS PASSED" --timeout 480
@@ -727,8 +721,8 @@ $(BUILD)/tests/dos-cpu: tests/dos-cpu.c user/dos/cpu.c user/dos/dos.h
 	$(HOSTCC) -O1 -w -Iuser/dos tests/dos-cpu.c user/dos/cpu.c -o $@
 
 .PHONY: test-libc-qemu
-test-libc-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/libc-guest
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/libc-guest --cpus $(KERNEL_TEST_CPUS) --memory 512 $(TEST_DROP_TOOLCHAIN) --success-marker "LIBC REGRESSIONS PASSED"
+test-libc-qemu: $(KERNEL) $(MKISO) $(SYSTEM) $(BUILD)/tests/libc-guest
+	python3 tools/test-kernel-qemu.py $(QEMU) $(KERNEL) $(SYSTEM) $(BUILD)/tests/libc-guest --cpus $(KERNEL_TEST_CPUS) --memory 512 $(TEST_DROP_TOOLCHAIN) --success-marker "LIBC REGRESSIONS PASSED"
 
 $(BUILD)/tests/libc-guest.o: tests/libc-guest.c
 	@mkdir -p $(dir $@)
@@ -755,10 +749,13 @@ $(BUILD)/tests/kernel-%: tests/kernel-%.c tests/kernel-test.h tests/kernel-readc
 .PHONY: test-kernel-qemu
 # Override to exercise other core counts, nosmp and maxcpus without touching a real disk.
 KERNEL_TEST_CPUS ?= $(QEMU_SMP)
-# Install from a CD made by mkiso (GRUB from firmware/grub) onto a blank disk
+# Install from a CD made by mkiso (Limine from firmware/limine) onto a blank disk
 # with fluxinstall, then start the computer from that disk alone.
+# With INSTALL_TEST_UEFI=OVMF_CODE.fd,OVMF_VARS.fd (edk2's firmware files), UEFI firmware starts the disk as well.
+INSTALL_TEST_UEFI ?=
 test-install-qemu: $(ISO) $(BUILD)/tests/install-guest
-	python3 tools/test-install-qemu.py $(QEMU) $(MKISO) $(BUILD)/iso firmware/grub $(BUILD)/tests/install-guest
+	python3 tools/test-install-qemu.py $(QEMU) $(MKISO) $(BUILD)/iso firmware/limine $(BUILD)/tests/install-guest \
+		$(if $(INSTALL_TEST_UEFI),--uefi $(INSTALL_TEST_UEFI))
 
 $(BUILD)/tests/install-guest.o: tests/install-guest.c
 	@mkdir -p $(dir $@)
@@ -776,10 +773,10 @@ NATIVE_BUILD_CPUS ?= $(KERNEL_TEST_CPUS)
 NATIVE_BUILD_MEMORY ?= 2048
 NATIVE_BUILD_TIMEOUT ?= 21600
 .PHONY: test-native-build-qemu
-test-native-build-qemu: $(TEXT_KERNEL) $(SYSTEM) $(ISO) $(BUILD)/tests/build-guest $(BUILD)/tests/install-guest $(MKISO) \
+test-native-build-qemu: $(KERNEL) $(MKISO) $(SYSTEM) $(ISO) $(BUILD)/tests/build-guest $(BUILD)/tests/install-guest $(MKISO) \
 		$(NATIVE_ROOT)/usr/bin/gcc $(PORTS_ROOT)/usr/bin/make srcdisk
-	python3 tools/test-native-build-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/build-guest $(SRCDISK) \
-		$(BUILD)/iso $(MKISO) firmware/grub $(BUILD)/tests/install-guest --kvm --cpus $(NATIVE_BUILD_CPUS) \
+	python3 tools/test-native-build-qemu.py $(QEMU) $(KERNEL) $(SYSTEM) $(BUILD)/tests/build-guest $(SRCDISK) \
+		$(BUILD)/iso $(MKISO) firmware/limine $(BUILD)/tests/install-guest --kvm --cpus $(NATIVE_BUILD_CPUS) \
 		--memory $(NATIVE_BUILD_MEMORY) --timeout $(NATIVE_BUILD_TIMEOUT)
 
 $(BUILD)/tests/build-guest.o: tests/build-guest.c
@@ -793,8 +790,8 @@ $(BUILD)/tests/build-guest: $(BUILD)/tests/build-guest.o $(CRT0) $(LIBC) user/us
 # decode its samples, fetched once from fate-suite.ffmpeg.org into build/tests/fate-suite, and
 # what ffmpeg makes of them must be what FATE expects (tests/ffmpeg/ref, from FFmpeg's tree).
 .PHONY: test-ffmpeg-qemu
-test-ffmpeg-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/ffmpeg-guest $(ROOTFS)/usr/bin/ffmpeg $(ROOTFS)/usr/bin/ffprobe
-	python3 tools/test-ffmpeg-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/ffmpeg-guest \
+test-ffmpeg-qemu: $(KERNEL) $(MKISO) $(SYSTEM) $(BUILD)/tests/ffmpeg-guest $(ROOTFS)/usr/bin/ffmpeg $(ROOTFS)/usr/bin/ffprobe
+	python3 tools/test-ffmpeg-qemu.py $(QEMU) $(KERNEL) $(SYSTEM) $(BUILD)/tests/ffmpeg-guest \
 		$(ROOTFS)/usr/bin/ffmpeg $(ROOTFS)/usr/bin/ffprobe -- --cpus $(KERNEL_TEST_CPUS) --memory 1024 \
 		$(TEST_DROP_TOOLCHAIN) --kvm --timeout 1200 --success-marker "FFMPEG REGRESSIONS PASSED"
 
@@ -824,9 +821,9 @@ $(BUILD)/tests/media-ytresolve: tests/media-ytresolve.c user/desktop/media/json.
 	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Iuser/desktop/media tests/media-ytresolve.c user/desktop/media/json.c user/desktop/media/ytresolve.c -o $@
 
 MEDIA_GUEST_OBJS := $(BUILD)/tests/media-guest.o $(call desktop_objs,media/json.c media/ytresolve.c media/httpio.c media/segments.c)
-test-media-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/media-guest
+test-media-qemu: $(KERNEL) $(MKISO) $(SYSTEM) $(BUILD)/tests/media-guest
 	python3 tools/media-samples.py $(MEDIA_SAMPLES)
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/media-guest \
+	python3 tools/test-kernel-qemu.py $(QEMU) $(KERNEL) $(SYSTEM) $(BUILD)/tests/media-guest \
 		$(foreach f,yt-18.mp4 yt-133.mp4 yt-140.mp4 yt-278.webm yt-249.webm,--add $(MEDIA_SAMPLES)/$(f):/test/$(f)) \
 		--cpus $(KERNEL_TEST_CPUS) --memory 1024 $(TEST_DROP_TOOLCHAIN) --kvm --net --timeout 600 \
 		--success-marker "MEDIA REGRESSIONS PASSED"
@@ -842,8 +839,8 @@ KERNEL_TEST_MEMORY ?= 1024
 KERNEL_TEST_CMDLINE ?=
 # The card the mixer test plays on (--sound=sb16, --sound=usb), or empty for none.
 KERNEL_TEST_SOUND ?= --sound
-test-kernel-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest --cpus $(KERNEL_TEST_CPUS) --memory $(KERNEL_TEST_MEMORY) $(TEST_DROP_TOOLCHAIN) --append "$(KERNEL_TEST_CMDLINE)" --fsck-ext2 $(KERNEL_TEST_SOUND)
+test-kernel-qemu: $(KERNEL) $(MKISO) $(SYSTEM) $(BUILD)/tests/kernel-guest
+	python3 tools/test-kernel-qemu.py $(QEMU) $(KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-guest --cpus $(KERNEL_TEST_CPUS) --memory $(KERNEL_TEST_MEMORY) $(TEST_DROP_TOOLCHAIN) --append "$(KERNEL_TEST_CMDLINE)" --fsck-ext2 $(KERNEL_TEST_SOUND)
 
 $(BUILD)/tests/kernel-guest.o: tests/kernel-guest.c
 	@mkdir -p $(dir $@)
@@ -1001,8 +998,8 @@ $(BUILD)/tests/desktop-imagejobs-guest: $(BUILD)/tests/desktop-imagejobs-guest.o
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(BUILD)/u/user/desktop/image/webp.o $(LIBC)
 
 .PHONY: test-desktop-jobs-qemu
-test-desktop-jobs-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/desktop-imagejobs-guest
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/desktop-imagejobs-guest --cpus $(KERNEL_TEST_CPUS) --memory 512 $(TEST_DROP_TOOLCHAIN) --success-marker "DESKTOP JOB REGRESSIONS PASSED"
+test-desktop-jobs-qemu: $(KERNEL) $(MKISO) $(SYSTEM) $(BUILD)/tests/desktop-imagejobs-guest
+	python3 tools/test-kernel-qemu.py $(QEMU) $(KERNEL) $(SYSTEM) $(BUILD)/tests/desktop-imagejobs-guest --cpus $(KERNEL_TEST_CPUS) --memory 512 $(TEST_DROP_TOOLCHAIN) --success-marker "DESKTOP JOB REGRESSIONS PASSED"
 
 # winrun's windows: a Windows program built here (gcc's ELF, laid out at 0x400000 and turned into
 # a PE by objcopy, with the import directory of tests/win32/imports.S), run in QEMU with
@@ -1048,9 +1045,9 @@ $(BUILD)/tests/win32/bad-imports.stamp: $(BUILD)/tests/win32/console.exe tests/w
 	touch $@
 
 .PHONY: test-win32-gui-qemu
-test-win32-gui-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/win32-gui-guest $(BUILD)/tests/win32/hello.exe \
+test-win32-gui-qemu: $(KERNEL) $(MKISO) $(SYSTEM) $(BUILD)/tests/win32-gui-guest $(BUILD)/tests/win32/hello.exe \
                      $(BUILD)/tests/win32/console.exe $(BUILD)/tests/win32/input.exe $(BUILD)/tests/win32/children.exe $(BUILD)/tests/win32/phase2.exe $(BUILD)/tests/win32/threads.exe $(BUILD)/tests/win32/registry.exe $(BUILD)/tests/win32/phase3.exe $(BUILD)/tests/win32/gdiplus.exe $(BUILD)/tests/win32/prephase4.exe $(BUILD)/tests/win32/phase4.exe $(BUILD)/tests/win32/phase4-gui.exe $(BUILD)/tests/win32/bad-imports.stamp
-	python3 tools/test-kernel-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/win32-gui-guest --memory 512 $(WIN32_AUDIO_TEST) --cpus $(KERNEL_TEST_CPUS) \
+	python3 tools/test-kernel-qemu.py $(QEMU) $(KERNEL) $(SYSTEM) $(BUILD)/tests/win32-gui-guest --memory 512 $(WIN32_AUDIO_TEST) --cpus $(KERNEL_TEST_CPUS) \
 		$(TEST_DROP_TOOLCHAIN) --add $(BUILD)/tests/win32/hello.exe:/test/hello.exe \
 		--add $(BUILD)/tests/win32/console.exe:/test/console.exe \
 		--add $(BUILD)/tests/win32/input.exe:/test/input.exe \
@@ -1098,10 +1095,10 @@ $(BUILD)/tests/browser-geometry: tests/browser-geometry.c $(BROWSER_TEST_SRCS) $
 # quarter of RAM, holds the files).
 TEST_DROP_TOOLCHAIN := --drop usr/bin --drop usr/libexec --drop usr/lib --drop usr/include
 
-# S3 must boot through firmware/GRUB: QEMU -kernel reloads RAM on wake.
+# S3 through the firmware and Limine, as a real machine wakes.
 .PHONY: test-suspend-qemu
-test-suspend-qemu: $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-suspend $(MKISO) $(GRUB_FIRMWARE)
-	python3 tools/test-suspend-qemu.py $(QEMU) $(TEXT_KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-suspend $(MKISO) firmware/grub --cpus $(KERNEL_TEST_CPUS) $(TEST_DROP_TOOLCHAIN)
+test-suspend-qemu: $(KERNEL) $(MKISO) $(SYSTEM) $(BUILD)/tests/kernel-suspend $(LIMINE_FIRMWARE)
+	python3 tools/test-suspend-qemu.py $(QEMU) $(KERNEL) $(SYSTEM) $(BUILD)/tests/kernel-suspend $(MKISO) firmware/limine --cpus $(KERNEL_TEST_CPUS) $(TEST_DROP_TOOLCHAIN)
 
 $(BUILD)/tests/kernel-suspend.o: tests/kernel-suspend.c
 	@mkdir -p $(dir $@)

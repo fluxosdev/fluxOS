@@ -431,13 +431,13 @@ static int stream_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
     if (req == SOUND_INFO) {            /* answered whether the card is still there or not */
         struct sound_info si;
         sound_get_info(&si);
-        return copy_to_user((void *)arg, &si, sizeof(si));
+        return copy_to_user(UPTR(arg), &si, sizeof(si));
     }
     int takes_int = req == SNDCTL_DSP_SPEED || req == SNDCTL_DSP_CHANNELS || req == SNDCTL_DSP_SETFMT;
     int gives_int = takes_int || req == SNDCTL_DSP_GETODELAY;
     int v = 0;
     struct audio_buf_info bi;
-    if (takes_int && copy_from_user(&v, (const void *)arg, sizeof(v)) < 0)
+    if (takes_int && copy_from_user(&v, UPTR(arg), sizeof(v)) < 0)
         return -EFAULT;
     spin_lock(&snd_lock);
     int r = stream_ioctl_locked(s, req, &v, &bi);
@@ -447,9 +447,9 @@ static int stream_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
     if (r < 0)
         return r;
     if (gives_int)
-        return copy_to_user((void *)arg, &v, sizeof(v));
+        return copy_to_user(UPTR(arg), &v, sizeof(v));
     if (req == SNDCTL_DSP_GETOSPACE)
-        return copy_to_user((void *)arg, &bi, sizeof(bi));
+        return copy_to_user(UPTR(arg), &bi, sizeof(bi));
     return 0;
 }
 

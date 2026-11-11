@@ -6,10 +6,9 @@
  * looks for a flush request itself as it waits: the processor that sent
  * it may be the holder, waiting for the flush before it lets go.
  *
- * The console takes a spinlock before cpu_init() has checked the
- * processor, so this file is built for any 386 (see the Makefile), and
- * until lock_init() a spinlock only turns interrupts off: XADD and
- * CMPXCHG need a 486, and nothing else runs yet anyway.
+ * Until lock_init() a spinlock only turns interrupts off: this_cpu()
+ * means nothing before the kernel's own descriptor tables are loaded
+ * (kmain), and nothing else runs yet anyway.
  */
 #include "kernel.h"
 #include "proc.h"

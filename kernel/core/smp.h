@@ -14,6 +14,8 @@
 #include "arch.h"
 #include "lock.h"
 
+typedef uint64_t pte_t;                 /* an entry of a page table (mm.h) */
+
 #define MAX_CPUS 16
 #define CPU_CACHE_LINE 64
 #define CPU_HELD_NAMES 4
@@ -35,7 +37,7 @@ struct cpu {
     struct proc *proc;                  /* running here */
     struct proc *idle;                  /* runs when nothing else can */
     struct proc *fpu_owner;             /* whose registers the FPU may hold (fpu.c) */
-    uint32_t *pd;                       /* the page directory in CR3 */
+    pte_t *pd;                          /* the address space in CR3 */
     int slice;                          /* timer ticks left in this time slice */
     volatile int resched;               /* schedule() on the way out of the kernel */
     int nlocks;                         /* spinlocks held here */
@@ -50,12 +52,13 @@ struct cpu {
 extern struct cpu cpus[MAX_CPUS];
 extern int ncpus;                       /* processors running */
 
-/* This processor: each has its own TSS, so the task register tells them apart. */
+/* This processor: each has its own TSS, so the task register tells them apart
+ * (a 64-bit TSS descriptor takes two entries of the GDT). */
 static inline struct cpu *this_cpu(void)
 {
     uint16_t tr;
     __asm__ volatile("str %0" : "=r"(tr));
-    uint32_t i = ((uint32_t)tr - SEG_TSS) >> 3;
+    uint32_t i = ((uint32_t)tr - SEG_TSS) >> 4;
     return &cpus[i < MAX_CPUS ? i : 0];
 }
 
@@ -70,7 +73,7 @@ void smp_tick(void);                    /* the timer ticked: pass it on */
 int smp_wake_idle(int preferred);       /* prefer its last CPU if idle; -1 means any */
 int smp_wake_cpu(int cpu);              /* a pinned process is ready: that CPU looks */
 void smp_kick_proc(struct proc *p);     /* p, running elsewhere, has a signal */
-void smp_flush_tlb(uint32_t *pd);       /* pd's mappings changed */
+void smp_flush_tlb(pte_t *pd);          /* pd's mappings changed */
 void smp_tlb_ipi(void);
 void smp_tlb_check(void);               /* waiting with interrupts off: flush if asked */
 void smp_stop_others(void);

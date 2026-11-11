@@ -172,22 +172,24 @@ static void proc_release(struct proc *p)
 /*
  * Lay out a fresh kernel stack: a trap frame at the very top (where the
  * CPU will push user state on later traps), and below it a context
- * frame that switch_context() "returns" through into forkret.
+ * frame that switch_context() "returns" through into forkret. `above`
+ * bytes (a multiple of 16) are left over the trap frame: a kernel thread's
+ * frame is never pushed to again, and its stack starts there.
  */
-static void setup_kstack(struct proc *p, const struct trapframe *src)
+static void setup_kstack(struct proc *p, const struct trapframe *src, uint32_t above)
 {
-    uint8_t *sp = p->kstack + KSTACK_SIZE;
+    uint8_t *sp = p->kstack + KSTACK_SIZE - above;
     sp -= sizeof(struct trapframe);
     p->tf = (struct trapframe *)sp;
     if (src)
         *p->tf = *src;
     else
         memset(p->tf, 0, sizeof(*p->tf));
-    sp -= sizeof(uint32_t);
-    *(uint32_t *)sp = (uint32_t)forkret;
-    sp -= 4 * sizeof(uint32_t);                 /* edi, esi, ebx, ebp */
-    memset(sp, 0, 4 * sizeof(uint32_t));
-    p->esp = (uint32_t)sp;
+    sp -= sizeof(uint64_t);
+    *(uint64_t *)sp = (uint64_t)(uintptr_t)forkret;
+    sp -= 6 * sizeof(uint64_t);                 /* r15, r14, r13, r12, rbx, rbp */
+    memset(sp, 0, 6 * sizeof(uint64_t));
+    p->ksp = (uint64_t)(uintptr_t)sp;
 }
 
 /* Preserve round-robin order within each preference. A remote task that
@@ -257,9 +259,9 @@ static void sched_switch(void)
     gdt_set_win_teb(next->win_teb);
     gdt_set_tls(next->tls);             /* %gs is loaded from it on the way back to user mode */
     if (next->kstack)
-        tss_set_kernel_stack((uint32_t)next->kstack + KSTACK_SIZE);
+        tss_set_kernel_stack((uint64_t)(uintptr_t)next->kstack + KSTACK_SIZE);
     vmm_switch(next->pd);
-    switch_context(&prev->esp, next->esp);
+    switch_context(&prev->ksp, next->ksp);
 }
 
 /* Interrupts are off in here whatever they were, as sched_lock's saved
@@ -516,10 +518,10 @@ int proc_setitimer(int which, uint32_t value, uint32_t interval, uint32_t *old_v
 
 /* Give p (current, or one not running) the address space pd; returns the
  * one it had, now loaded nowhere and free to destroy. */
-uint32_t *proc_set_pd(struct proc *p, uint32_t *pd)
+pte_t *proc_set_pd(struct proc *p, pte_t *pd)
 {
     spin_lock(&sched_lock);
-    uint32_t *old = p->pd;
+    pte_t *old = p->pd;
     p->pd = pd;
     if (p == this_cpu()->proc)
         vmm_switch(pd);
@@ -532,7 +534,7 @@ void proc_spawn_init(const char *path)
     struct proc *p = proc_alloc();
     if (!p)
         panic("cannot allocate init process");
-    setup_kstack(p, NULL);
+    setup_kstack(p, NULL, 0);
     p->pgid = p->sid = p->pid;
     p->leader->umask = 022;
     p->leader->cwd = vfs_root;
@@ -578,22 +580,24 @@ static void kthread_return(void)
 /*
  * A kernel thread starts by "returning" through trapret into fn in ring
  * 0, with interrupts on: it is preemptible like any kernel code, and
- * takes the locks of whatever it works on. An iret to ring 0 pops only
- * eip, cs and eflags, so the stack then points at the frame's useresp:
- * that is fn's return address, and a return ends the thread.
+ * takes the locks of whatever it works on. The frame's stack pointer is
+ * the top of the thread's stack less one word, fn's return address (as a
+ * call would leave it), so a return ends the thread.
  */
 void proc_spawn_kthread(const char *name, void (*fn)(void))
 {
     struct proc *p = proc_alloc();
     if (!p)
         panic("cannot create kernel thread %s", name);
-    setup_kstack(p, NULL);
+    setup_kstack(p, NULL, 16);
     struct trapframe *tf = p->tf;
+    uint64_t *ret = (uint64_t *)(p->kstack + KSTACK_SIZE - sizeof(uint64_t));
+    *ret = (uint64_t)(uintptr_t)kthread_return; /* fn's return address (see above) */
     tf->cs = SEG_KCODE;
-    tf->ds = tf->es = tf->fs = tf->gs = SEG_KDATA;
-    tf->eflags = 0x202;                         /* IF set */
-    tf->eip = (uint32_t)fn;
-    tf->useresp = (uint32_t)kthread_return;     /* fn's return address (see above) */
+    tf->ss = tf->ds = tf->es = SEG_KDATA;
+    tf->rflags = 0x202;                         /* IF set */
+    tf->rip = (uint64_t)(uintptr_t)fn;
+    tf->rsp = (uint64_t)(uintptr_t)ret;
     p->kthread = 1;
     p->pgid = p->sid = p->pid;
     strlcpy(p->name, name, sizeof(p->name));
@@ -628,14 +632,14 @@ int do_fork(void)
 
     struct proc *g = parent->leader;
     mutex_lock(&g->mm_lock);                    /* the other threads' mappings hold still */
-    uint32_t *pd = vmm_clone(parent->pd);
+    pte_t *pd = vmm_clone(parent->pd);
     if (!pd) {
         mutex_unlock(&g->mm_lock);
         proc_release(child);
         return -ENOMEM;
     }
     proc_set_pd(child, pd);
-    setup_kstack(child, parent->tf);
+    setup_kstack(child, parent->tf, 0);
     child->tf->eax = 0;                         /* fork() returns 0 in the child */
 
     child->ppid = g->pid;                       /* only the calling thread goes on in the child */
@@ -712,7 +716,7 @@ static void exit_this_thread(struct proc *p)
     free_paths(p);
     if (p->clear_tid) {                 /* pthread_join() waits for this to become 0 */
         uint32_t zero = 0;
-        if (copy_to_user((void *)p->clear_tid, &zero, 4) == 0)
+        if (copy_to_user(UPTR(p->clear_tid), &zero, 4) == 0)
             wake_futex(p->clear_tid);
     }
     fpu_release(p);
@@ -796,7 +800,7 @@ void do_exit(int status)
     struct proc *g = p->leader;
     if (p->clear_tid) {
         uint32_t zero = 0;
-        copy_to_user((void *)p->clear_tid, &zero, 4);
+        copy_to_user(UPTR(p->clear_tid), &zero, 4);
     }
     for (int i = 0; i < MAX_FDS; i++) {
         if (g->fds[i]) {
@@ -815,7 +819,7 @@ void do_exit(int status)
     free_paths(p);
     g->it_real_at = g->it_virt_left = g->it_prof_left = 0;
 
-    uint32_t *old = proc_set_pd(p, kernel_pd);
+    pte_t *old = proc_set_pd(p, kernel_pd);
     if (p != g)
         proc_set_pd(g, kernel_pd);
     if (old != kernel_pd)
@@ -888,7 +892,7 @@ int thread_create(uint32_t entry, uint32_t stack, uint32_t tls, uint32_t clear_t
     struct proc *t = proc_alloc();
     if (!t)
         return -EAGAIN;
-    setup_kstack(t, me->tf);
+    setup_kstack(t, me->tf, 0);
     t->tf->eax = 0;
     t->tf->eip = entry;
     t->tf->useresp = stack;
@@ -907,7 +911,7 @@ int thread_create(uint32_t entry, uint32_t stack, uint32_t tls, uint32_t clear_t
     memcpy(t->name, g->name, sizeof(t->name));
     /* Its id goes into its block before it runs: the creator may not touch the block once it does
      * (a detached thread frees its stack, block and all, when it ends). */
-    if (clear_tid && copy_to_user((void *)clear_tid, &t->pid, 4) < 0) {
+    if (clear_tid && copy_to_user(UPTR(clear_tid), &t->pid, 4) < 0) {
         proc_release(t);
         return -EFAULT;
     }
@@ -1443,7 +1447,7 @@ void proc_check_signals(void)
         memset(&ctx, 0, sizeof(ctx));
         ctx.gs = tf->gs; ctx.fs = tf->fs; ctx.es = tf->es; ctx.ds = tf->ds;
         ctx.edi = tf->edi; ctx.esi = tf->esi; ctx.ebp = tf->ebp;
-        ctx.esp = tf->esp_dummy;
+        ctx.esp = 0;                            /* (the kernel's own, where PUSHA once left it) */
         ctx.ebx = tf->ebx; ctx.edx = tf->edx; ctx.ecx = tf->ecx; ctx.eax = tf->eax;
         ctx.eip = tf->eip; ctx.cs = tf->cs; ctx.eflags = tf->eflags;
         ctx.useresp = tf->useresp; ctx.ss = tf->ss;
@@ -1930,7 +1934,7 @@ int futex_wait(uint32_t addr, uint32_t val, int timeout_ms)
         prepare_wait(chan);
     }
     uint32_t cur;
-    if (copy_from_user(&cur, (const void *)addr, 4) < 0) {
+    if (copy_from_user(&cur, UPTR(addr), 4) < 0) {
         cancel_wait();
         return -EFAULT;
     }

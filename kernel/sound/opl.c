@@ -140,7 +140,7 @@ static int opl_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
     case SOUND_INFO: {
         struct sound_info si;
         sound_get_info(&si);
-        return copy_to_user((void *)arg, &si, sizeof(si));
+        return copy_to_user(UPTR(arg), &si, sizeof(si));
     }
     }
     return -EINVAL;

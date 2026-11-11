@@ -85,9 +85,8 @@ static int scsi(struct msc *m, const uint8_t *cdb, void *data, uint32_t len, int
     struct usb_dev *dev = m->dev;
     if (!dev || dev->gone)
         return -ENODEV;
-    uint32_t addr = (uint32_t)data;
     void *buf = data;
-    if (len && (addr < 0x100000 || addr + len > KERNEL_SPACE_END || addr + len < addr)) {
+    if (len && !virt_dma_ok(data, len)) {
         buf = m->bounce;                /* not kernel memory the controller can reach */
         if (!in)
             memcpy(buf, data, len);

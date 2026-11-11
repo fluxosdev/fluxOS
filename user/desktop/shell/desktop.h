@@ -53,7 +53,7 @@ extern const color_t accent_swatches[ACCENTS];
 extern const char *const icon_set_names[ICON_SETS];
 extern const char *const icon_set_dirs[ICON_SETS];     /* "breeze", "oxygen" */
 
-/* The look in use, at startup: the saved one (fluxos_theme and fluxos_icons in grubenv), or
+/* The look in use, at startup: the saved one (fluxos_theme and fluxos_icons in the boot partition's settings), or
  * Seashell with Oxygen's icons. */
 void theme_init(void);
 /* Take on a look: the values only (theme_set is what changes it for everyone). */
@@ -376,7 +376,7 @@ int app_focus_existing(const char *title);
  * A column of widgets down the right edge, from the top of the screen to the
  * taskbar, always in view as the taskbar is: windows maximize beside it. Its
  * widgets (an analog clock, the month's calendar, a graph of the processor and
- * memory) are chosen from its menu; the choice is kept in grubenv. */
+ * memory) are chosen from its menu; the choice is kept in the boot partition's settings. */
 void sidebar_init(void);                /* the saved choice */
 int sidebar_width(void);                /* 0 while it is hidden */
 int sidebar_shown(void);
@@ -480,11 +480,11 @@ void datetime_tick(void);               /* once a second */
 void datetime_init(void);               /* the saved time zone */
 void datetime_zone_changed(int minutes);    /* Date and Time changed it: tell the desktop */
 
-/* GRUB's environment block on the boot partition (grubenv.c): for settings
+/* The settings file on the boot partition, beside Limine (bootenv.c): for settings
  * that have to outlive the RAM filesystem. dir is the partition's mount point. */
-int grubenv_boot_dir(char *out, size_t size);                   /* 1 if started from a disk */
-int grubenv_get(const char *dir, const char *key, char *out, size_t size);
-int grubenv_update(const char *dir, const char *const *keys, const char *const *vals, int count);
+int bootenv_boot_dir(char *out, size_t size);                   /* 1 if started from a disk */
+int bootenv_get(const char *dir, const char *key, char *out, size_t size);
+int bootenv_update(const char *dir, const char *const *keys, const char *const *vals, int count);
 
 /* The wallpaper (wallpaper.c) */
 enum { WALL_FILL, WALL_STRETCH, WALL_CENTER, WALL_TILE, WALL_MODES };

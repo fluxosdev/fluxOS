@@ -883,7 +883,7 @@ int power_syscall(uint32_t op, uint32_t arg)
             pi.flags |= PWR_CAN_SLEEP;
         else
             strlcpy(pi.nosleep, why, sizeof(pi.nosleep));
-        return copy_to_user((void *)arg, &pi, sizeof(pi));
+        return copy_to_user(UPTR(arg), &pi, sizeof(pi));
     }
     case POWER_SLEEP:
         return acpi_suspend();

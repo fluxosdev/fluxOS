@@ -1,4 +1,4 @@
-/* Runs as init in the disposable GRUB/QEMU suspend regression. */
+/* Runs as init in the disposable Limine/QEMU suspend regression. */
 #include <flux.h>
 #include <stdio.h>
 #include <unistd.h>

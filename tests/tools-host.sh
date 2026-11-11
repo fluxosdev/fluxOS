@@ -403,8 +403,8 @@ rm -rf tll && mkdir -p tll/src && ln -s "$(printf 'd%.0s' $(seq 1 150))" tll/src
 rm -rf mlt && mkdir -p mlt/d && echo hi > mlt/d/f && ln -s .. mlt/d/up
 "$tools/mkiso" -o mlt.iso mlt 2>/dev/null; [ $? = 1 ] && [ -s mlt.iso ] && ok || bad "mkiso with a symbolic link loop"
 
-# ---- mbcheck: a Multiboot header with a good checksum, one PT_LOAD ----
-printf '\177ELF' > notkernel && if "$tools/mbcheck" -q notkernel 2>/dev/null; then bad "mbcheck accepts junk"; else ok; fi
+# ---- kcheck: a 64-bit ELF image with Limine's requests in it ----
+printf '\177ELF' > notkernel && if "$tools/kcheck" -q notkernel 2>/dev/null; then bad "kcheck accepts junk"; else ok; fi
 
 echo "tools: $pass checks passed, $fail failed"
 [ $fail = 0 ]

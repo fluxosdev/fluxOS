@@ -301,10 +301,10 @@ static void desc_set(void *ring, uint32_t i, void *buf, uint32_t flags)
     if (fd.ver == 3) {
         struct desc3 *d = &((struct desc3 *)ring)[i];
         d->bufhigh = 0;
-        d->buflow = (uint32_t)buf;
+        d->buflow = virt_to_phys(buf);
         d->txvlan = 0;
     } else {
-        ((struct desc1 *)ring)[i].buf = (uint32_t)buf;
+        ((struct desc1 *)ring)[i].buf = virt_to_phys(buf);
     }
     barrier();
     *flaglen(ring, i) = flags;
@@ -560,16 +560,16 @@ static int alloc_buffers(void)
     uint32_t page = pmm_alloc();
     if (!page)
         return -1;
-    memset((void *)page, 0, PAGE_SIZE);
-    fd.rx_ring = (void *)page;                          /* 32 x 16 bytes */
-    fd.tx_ring = (void *)(page + 2048);
+    memset(phys_to_virt(page), 0, PAGE_SIZE);
+    fd.rx_ring = phys_to_virt(page);                          /* 32 x 16 bytes */
+    fd.tx_ring = phys_to_virt(page + 2048);
     for (int i = 0; i < RX_RING + TX_RING; i += 2) {
         uint32_t p = pmm_alloc();
         if (!p)
             return -1;
         uint8_t **slot = i < RX_RING ? &fd.rx_buf[i] : &fd.tx_buf[i - RX_RING];
-        slot[0] = (uint8_t *)p;
-        slot[1] = (uint8_t *)p + BUF_SIZE;
+        slot[0] = (uint8_t *)phys_to_virt(p);
+        slot[1] = (uint8_t *)phys_to_virt(p) + BUF_SIZE;
     }
     return 0;
 }
@@ -601,8 +601,8 @@ static void start(void)
     wr(R_TXPOLL, rd(R_TXPOLL) & TXPOLL_MAC_REV);
     txrx_reset();
     wr(R_SETUP6, 0);
-    wr(R_TXRING, (uint32_t)fd.tx_ring);
-    wr(R_RXRING, (uint32_t)fd.rx_ring);
+    wr(R_TXRING, virt_to_phys(fd.tx_ring));
+    wr(R_RXRING, virt_to_phys(fd.rx_ring));
     if (fd.ver == 3) {
         wr(R_TXRINGHI, 0);
         wr(R_RXRINGHI, 0);

@@ -59,7 +59,7 @@ int iwl_read_file(const char *path, uint8_t **out, uint32_t *len, uint32_t *page
         return -EINVAL;
     }
     uint32_t n = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-    uint8_t *buf = n ? (uint8_t *)pmm_alloc_contig(n) : NULL;
+    uint8_t *buf = n ? pmm_alloc_pages(n) : NULL;
     if (!buf) {
         vfs_unlock();
         return -ENOMEM;
@@ -68,7 +68,7 @@ int iwl_read_file(const char *path, uint8_t **out, uint32_t *len, uint32_t *page
     vfs_unlock();
     if (r != (int)size) {
         for (uint32_t i = 0; i < n; i++)
-            pmm_free((uint32_t)buf + i * PAGE_SIZE);
+            pmm_free(virt_to_phys(buf) + i * PAGE_SIZE);
         return r < 0 ? r : -EIO;
     }
     *out = buf;
@@ -80,7 +80,7 @@ int iwl_read_file(const char *path, uint8_t **out, uint32_t *len, uint32_t *page
 void iwl_free_file(uint8_t *buf, uint32_t pages)
 {
     for (uint32_t i = 0; buf && i < pages; i++)
-        pmm_free((uint32_t)buf + i * PAGE_SIZE);
+        pmm_free(virt_to_phys(buf) + i * PAGE_SIZE);
 }
 
 /* ---- crash dump ---- */

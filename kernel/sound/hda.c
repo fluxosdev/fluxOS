@@ -350,9 +350,9 @@ static void rings_init(uint8_t *page)
         wr8(CORBSIZE, (uint8_t)((cs & ~3) | 2));        /* 256 entries */
     if (rs & 0x40)
         wr8(RIRBSIZE, (uint8_t)((rs & ~3) | 2));
-    wr32(CORBLBASE, (uint32_t)hda.corb);
+    wr32(CORBLBASE, virt_to_phys(hda.corb));
     wr32(CORBUBASE, 0);
-    wr32(RIRBLBASE, (uint32_t)hda.rirb);
+    wr32(RIRBLBASE, virt_to_phys(hda.rirb));
     wr32(RIRBUBASE, 0);
 
     /* Reset the CORB read pointer: set the bit, see it set (some, such as
@@ -886,12 +886,12 @@ static void start(void)
     fill_half(1);
     stream_reset();
     for (int h = 0; h < 2; h++) {
-        hda.bdl[h * 4] = (uint32_t)(hda.buf + h * HALF);
+        hda.bdl[h * 4] = virt_to_phys(hda.buf + h * HALF);
         hda.bdl[h * 4 + 1] = 0;
         hda.bdl[h * 4 + 2] = HALF;
         hda.bdl[h * 4 + 3] = 1;         /* interrupt on completion */
     }
-    sd_wr32(SD_BDPL, (uint32_t)hda.bdl);
+    sd_wr32(SD_BDPL, virt_to_phys(hda.bdl));
     sd_wr32(SD_BDPU, 0);
     sd_wr32(SD_CBL, 2 * HALF);
     sd_wr16(SD_LVI, 1);
@@ -1008,18 +1008,18 @@ static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
     if (req == SOUND_INFO) {
         struct sound_info si;
         sound_get_info(&si);
-        return copy_to_user((void *)arg, &si, sizeof(si));
+        return copy_to_user(UPTR(arg), &si, sizeof(si));
     }
     if (req != MIXER_READ && req != MIXER_WRITE)
         return -EINVAL;
     struct mixer_level ml;
-    if (copy_from_user(&ml, (const void *)arg, sizeof(ml)) < 0)
+    if (copy_from_user(&ml, UPTR(arg), sizeof(ml)) < 0)
         return -EFAULT;
     spin_lock(&snd_lock);
     int r = mixer_ioctl_locked(req, &ml);
     spin_unlock(&snd_lock);
     if (r == 0 && req == MIXER_READ)
-        r = copy_to_user((void *)arg, &ml, sizeof(ml));
+        r = copy_to_user(UPTR(arg), &ml, sizeof(ml));
     return r;
 }
 
@@ -1102,7 +1102,7 @@ void hda_init(struct vnode *devdir)
         hda.irq = pci_irq(&pci);
         hda.pci = pci;
         hda.regs = NULL;
-        found = controller_init(&pci, (uint8_t *)page) == 0;
+        found = controller_init(&pci, (uint8_t *)phys_to_virt(page)) == 0;
         if (!found && hda.regs) {
             wr32(INTCTL, 0);
             wr32(GCTL, rd32(GCTL) & ~GCTL_CRST);        /* leave it in reset */
@@ -1119,7 +1119,7 @@ void hda_init(struct vnode *devdir)
             pmm_free(buf + k * PAGE_SIZE);
         return;
     }
-    hda.buf = (uint8_t *)buf;
+    hda.buf = (uint8_t *)phys_to_virt(buf);
     memset(hda.buf, 0, 4 * PAGE_SIZE);
     hda.master = 80;
     hda.pcm = 100;

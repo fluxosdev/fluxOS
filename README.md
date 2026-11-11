@@ -18,7 +18,8 @@
 > been tested by running it in QEMU, not reviewed or audited by people, so
 > read it with that in mind.
 
-fluxOS is a small 32-bit x86 Unix-like operating system with preemptive
+fluxOS is a small x86-64 Unix-like operating system (a 64-bit kernel that
+runs 32-bit programs) with preemptive
 multitasking, ring-3 processes, paging, a root filesystem on the hard disk it
 is installed on, IDE/SATA/floppy/USB storage, FAT and ISO9660, an
 NE2000, nForce, Intel PRO/1000 and Intel I217 network drivers with a TCP/IP stack, a zsh-flavoured shell
@@ -26,18 +27,22 @@ NE2000, nForce, Intel PRO/1000 and Intel I217 network drivers with a TCP/IP stac
 Radeon HD 4000 display drivers with a small OpenGL library, an Intel HD Graphics
 4600 display driver with 3D, an AMD Radeon RX 5500 display driver, PC speaker, Sound
 Blaster 16 and HD Audio sound, and a layer that runs DOS programs in the
-terminal. The ISO image is an install CD: GRUB (Multiboot) starts fluxOS
-Setup, which installs fluxOS onto a hard disk, and the installed system boots
+terminal. The ISO image is an install CD: Limine (the Limine boot
+protocol) starts fluxOS Setup, on a BIOS or on UEFI firmware, which installs fluxOS onto a hard disk, and the installed system boots
 straight into the desktop.
 
-fluxOS needs a **Pentium 4** or another processor with SSE2 (an Athlon 64, a
-Pentium M or anything newer). The whole system is built for it: the kernel
-moves pages and framebuffer lines through the SSE registers, the C library
-copies with them, GL transforms and lights vertices four lanes at a time, the
+fluxOS needs a **64-bit processor** (x86-64: an Athlon 64, a Pentium 4 with
+EM64T, a Core 2 or anything newer). The kernel is 64-bit code: it lives at
+the top of the 64-bit address space, with all of physical memory mapped
+there, and Limine starts it in long mode. The programs are still 32-bit
+ones, which the processor runs in compatibility mode, in the 4 GiB address
+space and with the system calls they always had; they are built for the
+SSE2 every 64-bit processor has: the C library copies with the SSE
+registers, GL transforms and lights vertices four lanes at a time, the
 desktop, browser and image decoders blend and convert pixels eight 16-bit
 lanes at a time in the SSE2 integer instructions, and all floating point,
-doubles included, runs on SSE2. On an older processor it stops at boot and
-says why.
+doubles included, runs on SSE2. (Until 0.4 fluxOS was a 32-bit system for
+the Pentium 4, started by GRUB; a 32-bit processor no longer starts it.)
 
 ## Features
 
@@ -47,8 +52,9 @@ says why.
   console comes back on a panic, when a program writes to it, or with
   `nosplash` (the boot menu's "show boot messages" entry). Shutting down and
   restarting show the logo on Kinetik Blue's wallpaper.
-- Multiboot entry, GDT/TSS/IDT, one trap dispatcher for exceptions, IRQs and
-  the `int 0x80` system call gate.
+- Limine boot protocol entry in long mode, GDT/TSS/IDT, one trap dispatcher
+  for exceptions, IRQs and the `int 0x80` system call gate, which 32-bit
+  programs call from compatibility mode.
 - Preemptive round-robin scheduler (PIT at 100 Hz) with sleep/wait queues.
 - Multiprocessor (SMP): the other processors and cores, found in the ACPI
   MADT or the MultiProcessor Specification table, are started with INIT and
@@ -80,12 +86,14 @@ says why.
   (`<pthread.h>`: mutexes, condition variables, read-write locks, once, keys, barriers, spinlocks;
   `<semaphore.h>`), with `errno`, `malloc` and stdio safe to use from several threads. `threadtest`
   checks them.
-- Processor check at boot (a Pentium 4 with SSE2 is the minimum), and a
+- Processor check at boot (a 64-bit processor, so SSE2, is the minimum), and a
   write-combining framebuffer through the page attribute table (`pat=off`
   keeps it uncached).
-- Memory: bitmap frame allocator over the first 4 GiB of RAM, paging (first
-  GiB identity-mapped for the kernel, user pages in the RAM above it first,
-  4 KiB user pages), growing user stack, `sbrk` heaps, first-fit kernel heap. Pages
+- Memory: bitmap frame allocator over the first 4 GiB of RAM, four-level
+  paging (all of physical memory mapped for the kernel at the start of its
+  half of the address space with 2 MiB pages, its own memory from the first
+  GiB and user pages from the RAM above it first, 4 KiB user pages), growing
+  user stack, `sbrk` heaps, first-fit kernel heap. Pages
   are cleared and copied (for `fork`) with SSE, the copies streamed past the
   caches.
 - VFS over an in-memory filesystem unpacked from a ustar initrd at boot, with
@@ -167,7 +175,9 @@ says why.
   the PS/2 devices are set up again, with the processors' MTRRs and PCI
   functions brought back to D0 first. On real hardware the wake code runs the
   video ROM's initialisation and sets the boot loader's VESA mode again
-  (what pre-KMS Linux needed as `acpi_sleep=s3_bios,s3_mode`), keeping its
+  (what pre-KMS Linux needed as `acpi_sleep=s3_bios,s3_mode`; the mode is
+  found again by its size in the VESA BIOS's list, as Limine does not say
+  which it set), then goes from real mode back to long mode, keeping its
   real-mode code out of the first 64 KiB, which some firmware overwrites
   while resuming; under a hypervisor it does neither, since the virtual BIOS
   restores the display itself. Options: `acpi=off`, `acpi=basic` (tables
@@ -373,7 +383,9 @@ says why.
   wallpaper), the theme, its color and the icons (Oxygen, the default, or Breeze) with a live sample, resolution,
   color depth and refresh rate (with a 15 s "keep this mode?" prompt on the
   3dfx and Radeon drivers), monitor type and EDID details. Settings are saved
-  in GRUB's environment block on an installed system.
+  beside the boot loader on an installed system (`/boot/limine/fluxos.env`
+  on the partition it started from; the resolution also in Limine's menu
+  there).
 - **Wireless Networks** (Settings, or the wireless icon in the tray, which is
   crossed out while not connected): the networks in range with their signal and
   security, Connect (asking for a WPA2 password), Disconnect, and how the
@@ -795,7 +807,7 @@ implementation; XP Paint has not yet been verified.
 
 **Userland** (`/bin`): 7z [ basename beep cat chmod clear cmp cp cut date dd desktop
 (and its programs, above) df diff dirname dmesg dos echo env false fetch find fluxinstall free fsh fstrim grep gunzip
-gzip halt head hexdump host ifconfig init install ln ls lsblk mbcheck mkdir mkfs.ext2
+gzip halt head hexdump host ifconfig init install kcheck limine ln ls lsblk mkdir mkfs.ext2
 mkfs.fat mkiso mktemp fsck.ext2 mixer more mount mv nc nproc patch ping play poweroff
 printf ps reboot rm rmdir sed
 seq sh sleep sort spin stat sync tail tar tee test threadtest top touch tr true
@@ -863,20 +875,20 @@ sudo apt install build-essential qemu-system-x86
 # optional: mtools, and e2fsprogs and xorriso, which the tests check images with
 ```
 
-No cross compiler is needed: everything is built with the host GCC using `-m32
--march=pentium4 -ffreestanding`, and nothing links against libgcc or the host
-libc. GRUB is not built or downloaded: its boot images and the modules the
-menus load are checked in (`firmware/grub`, Debian 12's GRUB 2.06, with their
-provenance and hashes in its README; 2.12 reboots some older PCs right after
-"Welcome to GRUB!"), and `mkiso`, fluxOS's own, makes the ISO from them: El
-Torito for CDs, and a hybrid MBR so the image written to a USB stick starts
-too. `make MKRESCUE=grub-2.06/usr/bin/grub-mkrescue` makes it with
-grub-mkrescue instead, from GRUB fetched by `tools/fetch-grub.sh`, which also
-remakes `firmware/grub` (`--firmware`). The ISO boots on legacy BIOS only.
+No cross compiler is needed on an x86-64 host: the kernel is built with the
+host GCC using `-m64 -mcmodel=kernel -ffreestanding`, the programs with
+`-m32 -march=pentium4 -ffreestanding`, and nothing links against libgcc or
+the host libc. Limine is not built or downloaded: its files are checked in
+(`firmware/limine`, the binary release 9.6.7, with their provenance and
+hashes in its README; its installer's source is in `third_party/limine`),
+and `mkiso`, fluxOS's own, makes the ISO from them: El Torito entries for
+a BIOS and for UEFI firmware, and a partition table into which Limine's
+installer puts its boot sector, so the image written to a USB stick starts
+too. The ISO boots on a legacy BIOS and on 64-bit UEFI firmware.
 
 ```sh
 make            # builds fluxOS.iso
-make check      # verifies the kernel is a valid Multiboot image (mbcheck)
+make check      # verifies the kernel is an image Limine can start (kcheck)
 make test-browser # DOM, CSS/layout, binary/Unicode, shadow/motion and HTTP policy regressions
 make test-js     # language, module, suspended-frame and real garbage-collection regressions
 make bench-js   # ten standalone JavaScript workloads with wall time and peak memory
@@ -904,7 +916,7 @@ make test-kernel-qemu KERNEL_TEST_CPUS=4 KERNEL_TEST_CMDLINE=maxcpus=2 # CPU lim
 make disk       # fluxdisk.img, a 1 GiB ext2 data disk (DISK_MB=..., DISKFS=fat32)
 make floppy     # fluxfloppy.img, a 1.44 MB FAT12 floppy for drive A:
 make run        # boots the install CD in QEMU with the disk, floppy (if any) and an NE2000
-make run-kernel # boots the kernel directly, the whole system in memory (text console)
+make run-kernel # boots the kernel from a small CD of its own, the whole system in memory
 make run-disk   # boots fluxdisk.img alone, after installing fluxOS onto it
 make run-q35    # q35 machine: disk and CD on SATA, USB keyboard and tablet on xHCI
 make run-usb    # disk as a USB stick on EHCI, keyboard and mouse on UHCI
@@ -935,17 +947,18 @@ The TLS host tests additionally need OpenSSL and the Python `cryptography`
 package. They generate temporary CA/server certificates and use loopback-only
 servers, including tampered signature/transcript rejection checks.
 
-The QEMU targets emulate a two-core Core 2 Duo (`QEMU_CPU=-cpu core2duo,-lm`,
+The QEMU targets emulate a two-core Core 2 Duo (`QEMU_CPU=-cpu core2duo`,
 `QEMU_SMP=2`; `make run QEMU_SMP=1` for one core). `make run
 QEMU_NET="-nic user,model=ne2k_pci -device intel-hda -device hda-duplex"` adds
 HD Audio. To boot real hardware or another VM, write
 `fluxOS.iso` to a USB stick as a raw image (**DD Image mode** in Rufus), or
-attach it as a CD-ROM, and boot in **legacy BIOS** mode, then install
-(below). The ISO does not include a UEFI bootloader. Writing the raw image
-erases the USB stick and preserves the bundled GRUB core and matching modules.
-Rufus's ISO Image mode can substitute an incompatible GRUB core. The kernel
-uses one contiguous ELF load segment to avoid GRUB relocator free-list
-corruption between adjacent segments on some BIOS memory layouts.
+attach it as a CD-ROM, and boot in **legacy BIOS** or **UEFI** mode (with
+Secure Boot off: Limine is not signed), then install (below). Writing the
+raw image erases the USB stick and keeps Limine's boot sector and partition
+table as the build made them. UEFI firmware has no BIOS for the kernel to
+call: there is no text console there (the boot loader's graphics mode is
+all there is), and suspend to RAM needs a display driver that can set the
+screen up again by itself.
 On the installed disk the default entry starts the desktop at 1024x768; **fluxOS (text console)**
 boots to the shell. In QEMU the mouse needs no grabbing; elsewhere click into
 the VM window.
@@ -974,11 +987,19 @@ partition, ext2, for a source tree (or `-e /home`): the system partition gets
 half the disk up to 4 GiB (`-r MIB` says otherwise) and the second one the rest,
 mounted on `/src` at start-up from `/etc/fstab`.
 
-Setup writes an MBR with one bootable ext2 partition at 1 MiB, installs GRUB,
-formats the partition, copies the kernel and GRUB's files onto it and unpacks
-the system (`boot/system.tar` on the CD). **This erases the whole disk**, which
-must be at least 34 MiB. Once a disk has fluxOS, the CD's menu starts the hard
-disk by default, so a CD left in the drive does no harm. In QEMU, install with
+Setup writes an MBR partition table with a small FAT32 boot partition at
+1 MiB (64 MiB: the kernel, Limine and its menu, which is all Limine can
+read) and an ext2 partition for the system after it, has Limine's installer
+(`limine bios-install`) put Limine's first sectors into the MBR and the gap
+before the first partition, formats the partitions, copies the kernel and
+Limine's files and unpacks the system (`boot/system.tar` on the CD). With
+`-t fat32` the system's FAT32 partition is the only one, and holds the boot
+loader too. Limine for UEFI firmware goes on the FAT32 partition as
+`/EFI/BOOT/BOOTX64.EFI`, so the same disk starts either way. **This erases
+the whole disk**, which must be at least 98 MiB (34 MiB with `-t fat32`).
+Take the CD out when Setup restarts the computer (or choose **Start fluxOS
+from the hard disk** on its menu: Limine's menus cannot look at the disk and
+choose by themselves, as GRUB's could). In QEMU, install with
 `make run`, then quit and `make run-disk`. The installed system runs from disk,
 so anything saved outside `/tmp` stays. Its boot menu's **safe mode** starts on
 one processor in the BIOS display mode, without the Radeon, Intel and Voodoo drivers;
@@ -1024,7 +1045,7 @@ fluxfloppy.img GAME.EXE ::`.
 
 ```
 Makefile, linker.ld        build and kernel link script
-grub/grub.cfg              boot menu
+limine/limine.conf         boot menu
 include/flux/              kernel <-> user ABI (syscall numbers, structs, errno)
 lib/                       string/printf routines and the 8x16 font, shared by kernel and libc
 tools/                     mkfont.py (fonts), breeze-icons.py and oxygen-icons.py (icons), mksounds.py (sounds),
@@ -1075,33 +1096,38 @@ user/bin/                  one program per file (fluxinstall.c is the installer)
 rootfs/                    the installed system's files (/etc, /home/flux, icons,
                            the browser's fonts and home page in /usr/share/www)
 setupfs/                   the CD's setup system's own files (/etc/setup, its motd)
-grub/                      the CD's boot menu (install.cfg) and the installed disk's
-                           (grub.cfg)
-firmware/grub/             GRUB's boot images and modules, checked in (see its README)
+limine/                    the CD's boot menu (install.conf) and the installed disk's
+                           (limine.conf)
+firmware/limine/           Limine, checked in (see its README)
+third_party/limine/        Limine's installer (limine bios-install), for the host and for fluxOS
 ```
 
 ## Design notes
 
 **Memory map.** Every address space shares the kernel half.
 
-| Range                       | Use                                              |
-|-----------------------------|--------------------------------------------------|
-| `0x00000000 - 0x3FFFFFFF`   | kernel; identity map of the first GiB of RAM     |
-| `0x40000000 - ...`          | user program image, then the `sbrk` heap         |
-| `0xB0000000 - ...`          | the framebuffer, in the process that mapped it   |
-| `0xBE000000 - 0xBFFFFFFF`   | user stack (up to 32 MiB, grown on page faults)  |
-| `0xC0000000 - ...`          | kernel mappings of device memory (framebuffer)   |
-| `0xFEC00000 - 0xFEFFFFFF`   | temporary mappings of high user pages (kmap)     |
-| `0xFF000000 - 0xFFFFFFFF`   | late mappings (ACPI's firmware memory)           |
+| Range                                         | Use                                              |
+|-----------------------------------------------|--------------------------------------------------|
+| `0x40000000 - ...`                            | user program image, then the `sbrk` heap         |
+| `0xB0000000 - ...`                            | the framebuffer, in the process that mapped it   |
+| `0xBE000000 - 0xBFFFFFFF`                     | user stack (up to 32 MiB, grown on page faults)  |
+| `0xFFFF800000000000 - ...`                    | the direct map: all of physical memory           |
+| `0xFFFFC00000000000 - ...`                    | kernel mappings of device memory (2 MiB pages)   |
+| `0xFFFFC08000000000 - ...`                    | late mappings, a page at a time (ACPI's memory)  |
+| `0xFFFFFFFF80000000 - 0xFFFFFFFFFFFFFFFF`     | the kernel image                                 |
 
-The kernel's own memory (page tables, heap, stacks, DMA buffers) comes from
-the first GiB, which it reaches through the identity map. User pages come
-from the RAM above it first; the kernel reaches those, to clear them, copy
-them for `fork` or load a program into them, through two pages per
-processor mapped for a moment with interrupts off. Without PAE, RAM past
-4 GiB is out of reach.
+A process has the 2 GiB from `0x40000000` of the low half (it is a 32-bit
+program; the rest of the low half is empty), the kernel the high half, with
+four-level page tables whose upper half every address space shares. The
+kernel's own memory (page tables, heap, stacks, DMA buffers) comes from the
+first GiB of RAM and user pages from the RAM above it first; the kernel
+reaches every frame through the direct map, so a pointer to kernel memory
+is its physical address plus a constant (`phys_to_virt`, `virt_to_phys`),
+and a device is given the physical one. Frame addresses are still 32 bits
+wide, as the drivers give them to their devices: RAM past 4 GiB is not
+used yet.
 
-**Scheduling.** Each trap pushes a `struct trapframe` on the process's 16 KiB
+**Scheduling.** Each trap pushes a `struct trapframe` on the process's 32 KiB
 kernel stack. The kernel is not preemptible (interrupt gates keep IF clear): a
 process gives up the CPU only in `schedule()`, when it blocks or when the timer
 set `need_resched` and the trap is about to return to user mode.
@@ -1122,8 +1148,9 @@ update resident clean copies without filling the read cache. A run of contiguous
 written as one DMA command. A sync writes dirty sectors in LBA order, merging
 neighbours, then issues one FLUSH CACHE.
 
-**Graphics.** GRUB sets the video mode. The kernel maps the framebuffer above
-3 GiB with 4 MiB pages; `fbmap` maps it into a process as device memory, which
+**Graphics.** Limine sets the video mode (a VESA BIOS's, or UEFI's graphics
+output). The kernel maps the framebuffer among its device mappings with
+2 MiB pages; `fbmap` maps it into a process as device memory, which
 `fork` shares and `exit` never frees. That mapping is write-combining: the
 kernel reprograms PAT entry 1 (normally write-through) to write-combining, so
 PWT alone selects it, and the desktop's streaming stores reach the card in
@@ -1196,12 +1223,14 @@ user range and page tables first.
   binutils and GCC itself run on fluxOS, and the Makefile's tools exist
   (`tar`, `gzip`, `sed`, `diff`, `patch`, `find`, `install`...) with `fsh`
   as `/bin/sh`, the build tree has a filesystem with links and one-second
-  times (ext2), and the ISO is made by fluxOS's own `mkiso` from GRUB's
-  checked-in images; what is left is the bootstrap itself. The native compiler is tested on the kernel by `make
+  times (ext2), and the ISO is made by fluxOS's own `mkiso` and Limine's
+  installer from Limine's checked-in files; what is left is the bootstrap
+  itself. **The native GCC is an i686 compiler, which cannot build the 64-bit
+  kernel**: until the fluxOS toolchain can also emit 64-bit code (see
+  self-hosting-roadmap.md), fluxOS builds its programs on itself but not its
+  kernel. The native compiler is tested on the kernel by `make
   test-gcc-qemu`; the tools and the `sh` mode on the host against the GNU
-  originals and dash. For QEMU S3 tests, boot through GRUB (ISO or installed
-  disk), not `make run-kernel`: QEMU's direct kernel loader reloads kernel
-  memory on wake, destroying the saved resume context.
+  originals and dash.
 - **The Radeon driver on Llano APUs (HD 6520G and kin) is partial:** page
   flipping, the hardware pointer, and native modes only for a laptop panel
   behind a DisplayPort bridge (TRAVIS, as on the HP Pavilion g6); eDP panels and

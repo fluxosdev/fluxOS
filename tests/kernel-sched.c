@@ -10,18 +10,18 @@ int smp_wake_cpu(int cpu) { (void)cpu; return 0; }
 void smp_kick_proc(struct proc *p) { (void)p; }
 /* Never reached by these tests: no switching away, no page tables. */
 struct proc *current;
-uint32_t *kernel_pd;
+pte_t *kernel_pd;
 void panic(const char *fmt, ...) { fprintf(stderr, "panic: %s\n", fmt); abort(); }
 void fpu_switch(struct proc *prev, struct proc *next) { (void)prev; (void)next; abort(); }
 void gdt_set_win_teb(uint32_t base) { (void)base; abort(); }
 void gdt_set_tls(uint32_t base) { (void)base; abort(); }
-void tss_set_kernel_stack(uint32_t esp) { (void)esp; abort(); }
-void vmm_switch(uint32_t *pd) { (void)pd; abort(); }
-void switch_context(uint32_t *old_esp, uint32_t new_esp) { (void)old_esp; (void)new_esp; abort(); }
+void tss_set_kernel_stack(uint64_t rsp) { (void)rsp; abort(); }
+void vmm_switch(pte_t *pd) { (void)pd; abort(); }
+void switch_context(uint64_t *old_sp, uint64_t new_sp) { (void)old_sp; (void)new_sp; abort(); }
 int fb_pinned(int pid, uint32_t start, uint32_t end) { (void)pid; (void)start; (void)end; abort(); }
-int vmm_alloc_prot(uint32_t *pd, uint32_t va, uint32_t prot, uint32_t flags)
+int vmm_alloc_prot(pte_t *pd, uint32_t va, uint32_t prot, uint32_t flags)
 { (void)pd; (void)va; (void)prot; (void)flags; abort(); }
-void vmm_free_page(uint32_t *pd, uint32_t va) { (void)pd; (void)va; abort(); }
+void vmm_free_page(pte_t *pd, uint32_t va) { (void)pd; (void)va; abort(); }
 
 static void reset(int cores)
 {

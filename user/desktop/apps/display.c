@@ -24,10 +24,10 @@
  * with a hardware pointer, as Intel HD Graphics' driver does in the BIOS
  * mode; choosing either asks the same question.
  *
- * Choices are saved in GRUB's environment block, /boot/grub/grubenv on the
- * partition fluxOS started from: fluxos_gfx is the mode GRUB asks the BIOS
- * for, fluxos_video the 3dfx or Radeon driver's mode, which GRUB passes to
- * the kernel as video=, and fluxos_driver "radeon", "intel" or "navi" when the
+ * Choices are saved with the desktop's other settings on the partition
+ * fluxOS started from (bootenv.c): fluxos_gfx is the mode Limine asks the
+ * firmware for, fluxos_video the 3dfx or Radeon driver's mode, which Limine
+ * passes to the kernel as video=, and fluxos_driver "radeon", "intel" or "navi" when the
  * Radeon, Intel or RX 5500 driver is chosen, which the desktop reads when it starts. Started from the CD
  * there is nowhere to save them, and they last until a restart.
  */
@@ -82,7 +82,7 @@ static const struct monitor generic_monitors[] = {
 #define NGENERIC ((int)(sizeof(generic_monitors) / sizeof(generic_monitors[0])))
 #define DEFAULT_GENERIC 3               /* without EDID: a 1280x1024 monitor */
 
-/* Resolutions GRUB may ask a VESA BIOS for. */
+/* Resolutions Limine may ask the firmware (a VESA BIOS, or UEFI) for. */
 static const struct { int w, h; } bios_sizes[] = {
     { 640, 480 }, { 800, 600 }, { 1024, 768 }, { 1152, 864 }, { 1280, 1024 }, { 1600, 1200 },
 };
@@ -115,7 +115,7 @@ struct dprops {
     int native_ok;                      /* the 3dfx driver can set modes */
     int radeon_ok;                      /* there is a Radeon (or Intel, or Navi) driver */
     int radeon_modes;                   /* and it can set modes */
-    char bootdir[128];                  /* the partition with GRUB, or "" */
+    char bootdir[128];                  /* the partition with Limine, or "" */
     char saved_gfx[32], saved_video[32], saved_driver[16];
 
     struct monitor mons[NGENERIC + 1];
@@ -169,26 +169,26 @@ static struct confirm *cfm;
 static void dp_paint(struct dprops *d);
 static void dp_reload(struct dprops *d);
 
-/* ---- grubenv (see grubenv.c) ---- */
+/* ---- the saved settings (see bootenv.c) ---- */
 
 static void find_boot_dir(char *out, size_t size)
 {
-    grubenv_boot_dir(out, size);
+    bootenv_boot_dir(out, size);
 }
 
-static void read_grubenv(const char *dir, char *gfx, char *video, char *driver)
+static void read_bootenv(const char *dir, char *gfx, char *video, char *driver)
 {
-    grubenv_get(dir, "fluxos_gfx", gfx, 32);
-    grubenv_get(dir, "fluxos_video", video, 32);
-    grubenv_get(dir, "fluxos_driver", driver, 16);
+    bootenv_get(dir, "fluxos_gfx", gfx, 32);
+    bootenv_get(dir, "fluxos_video", video, 32);
+    bootenv_get(dir, "fluxos_driver", driver, 16);
 }
 
-/* Empty values are left out of the file, which GRUB treats as unset. */
-static int write_grubenv(const char *dir, const char *gfx, const char *video, const char *driver)
+/* Empty values are left out of the file (Limine's mode then goes back to the default). */
+static int write_bootenv(const char *dir, const char *gfx, const char *video, const char *driver)
 {
     const char *keys[3] = { "fluxos_gfx", "fluxos_video", "fluxos_driver" };
     const char *vals[3] = { gfx, video, driver };
-    return grubenv_update(dir, keys, vals, 3);
+    return bootenv_update(dir, keys, vals, 3);
 }
 
 /* "1024x768x32" (refresh 0) or "1024x768x16@85" */
@@ -1465,7 +1465,7 @@ static void confirm_close(int keep)
     wm_destroy(c->win);                 /* frees c */
 
     if (keep) {
-        if (bootdir[0] && write_grubenv(bootdir, gfx, video, driver) == 0 && dlg) {
+        if (bootdir[0] && write_bootenv(bootdir, gfx, video, driver) == 0 && dlg) {
             snprintf(dlg->saved_gfx, sizeof(dlg->saved_gfx), "%s", gfx);
             snprintf(dlg->saved_video, sizeof(dlg->saved_video), "%s", video);
             snprintf(dlg->saved_driver, sizeof(dlg->saved_driver), "%s", driver);
@@ -1523,7 +1523,7 @@ static int apply(struct dprops *d)
         if (same && !accel_on) {
             if (d->bootdir[0] && (strcmp(video, d->saved_video) != 0 ||
                                   strcmp(driver, d->saved_driver) != 0) &&
-                write_grubenv(d->bootdir, gfx, video, driver) == 0) {
+                write_bootenv(d->bootdir, gfx, video, driver) == 0) {
                 snprintf(d->saved_video, sizeof(d->saved_video), "%s", video);
                 snprintf(d->saved_driver, sizeof(d->saved_driver), "%s", driver);
             }
@@ -1578,7 +1578,7 @@ static int apply(struct dprops *d)
     if (d->driver != DRV_RADEON && accel)
         wm_set_accel(0);
     if (d->bootdir[0] && (startup_changed || d->saved_video[0] || strcmp(driver, d->saved_driver) != 0)) {
-        if (write_grubenv(d->bootdir, gfx, "", driver) < 0) {
+        if (write_bootenv(d->bootdir, gfx, "", driver) < 0) {
             message_box("Display Properties", ICON_WARNING, "The settings could not be saved.");
             return -1;
         }
@@ -2127,7 +2127,7 @@ void display_open(void)
     d->open = -1;
     d->hover = -1;
     find_boot_dir(d->bootdir, sizeof(d->bootdir));
-    read_grubenv(d->bootdir, d->saved_gfx, d->saved_video, d->saved_driver);
+    read_bootenv(d->bootdir, d->saved_gfx, d->saved_video, d->saved_driver);
     d->style = theme.style;
     d->accent = theme.accent;
     d->icons = theme.icons;

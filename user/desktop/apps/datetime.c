@@ -1,7 +1,7 @@
 /*
  * Date and Time under Settings: the current time, the time zone (the clock
  * itself runs on UTC), setting the clock by hand, and synchronizing it with
- * a network time server over SNTP. The zone is kept in GRUB's environment
+ * a network time server over SNTP. The zone is kept in the boot partition's settings
  * block when fluxOS runs from a disk.
  */
 #include <arpa/inet.h>
@@ -102,11 +102,11 @@ static void paint(void)
 static void save_zone(void)
 {
     char dir[128], value[16];
-    if (!grubenv_boot_dir(dir, sizeof(dir)))
+    if (!bootenv_boot_dir(dir, sizeof(dir)))
         return;
     snprintf(value, sizeof(value), "%d", zones[zone].minutes);
     const char *keys[1] = { "fluxos_tz" }, *vals[1] = { value };
-    grubenv_update(dir, keys, vals, 1);
+    bootenv_update(dir, keys, vals, 1);
 }
 
 static void set_zone(int i)

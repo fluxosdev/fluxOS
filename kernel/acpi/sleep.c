@@ -44,6 +44,8 @@
 #include <uacpi/sleep.h>
 #include <uacpi/uacpi.h>
 #include "kernel.h"
+#include "mm.h"
+#include "boot.h"
 #include "acpi.h"
 #include "arch.h"
 #include "blkdev.h"
@@ -62,7 +64,13 @@
 #define WF_TEXT 0x4
 #define WF_BEEP 0x8
 
-extern char wakeup_start[], wakeup_end[], wakeup_flags[], wakeup_vbe_mode[], wakeup_vga_bdf[];
+#define WAKE_BUF  0x1000                /* as in wakeup.S: where its code must end */
+#define MSR_EFER  0xC0000080
+#define EFER_KEEP ((1u << 0) | (1u << 8) | (1u << 11))     /* SCE, LME, NXE */
+
+extern char wakeup_start[], wakeup_end[], wakeup_flags[], wakeup_vga_bdf[];
+extern char wakeup_vbe_width[], wakeup_vbe_height[], wakeup_vbe_bpp[];
+extern char wakeup_cr3[], wakeup_efer[], wakeup_context[], wakeup_entry[];
 
 struct cpu_context wake_context;        /* wakeup.S passes it to context_restore() */
 
@@ -87,10 +95,14 @@ const char *acpi_sleep_blocker(void)
         return "the firmware's ACPI methods are not running";
     if (!sleep_supported())
         return "the firmware has no S3 sleep state";
+    if (!boot_mem_is_ram(WAKE_BASE, 0x10000))
+        return "the firmware keeps the memory the wake code needs (512 KiB to 576 KiB)";
     if (fb_wake_mode() < 0)
         return radeon_present() ? "the Radeon driver's own mode or 3D is in use"
                : intel_present() ? "the Intel driver's own mode is in use"
-                                 : "not with the 3dfx driver (boot with voodoo=off)";
+               : voodoo_present() ? "not with the 3dfx driver (boot with voodoo=off)"
+               : navi_present() ? "the Radeon driver's own mode is in use"
+                                : "started by UEFI firmware, there is no BIOS to set the screen's mode again";
     if (usbmsc_in_use())
         return "a USB disk is in use: unmount it first";
     return NULL;
@@ -98,9 +110,7 @@ const char *acpi_sleep_blocker(void)
 
 static void *low(uint32_t pa)
 {
-    void *p = (void *)pa;
-    __asm__("" : "+r"(p));              /* (past the compiler's idea of a null pointer) */
-    return p;
+    return phys_to_virt(pa);
 }
 
 /* A beep from the speaker with interrupts off and the other processors
@@ -136,11 +146,23 @@ static int under_hypervisor(void)
 static void place_trampoline(void)
 {
     uint8_t *dst = low(WAKE_BASE);
+    if (wakeup_end - wakeup_start > WAKE_BUF)
+        panic("wakeup.S has outgrown its 4 KiB");
     memcpy(dst, wakeup_start, (size_t)(wakeup_end - wakeup_start));
+    /* Its way back into long mode and the kernel (as smp.c's trampoline). */
+    uint32_t cr3 = (uint32_t)vmm_boot_cr3();
+    uint32_t efer = (uint32_t)rdmsr(MSR_EFER) & EFER_KEEP;
+    uint64_t context = (uint64_t)(uintptr_t)&wake_context;
+    uint64_t entry = (uint64_t)(uintptr_t)context_restore;
+    memcpy(dst + (wakeup_cr3 - wakeup_start), &cr3, sizeof(cr3));
+    memcpy(dst + (wakeup_efer - wakeup_start), &efer, sizeof(efer));
+    memcpy(dst + (wakeup_context - wakeup_start), &context, sizeof(context));
+    memcpy(dst + (wakeup_entry - wakeup_start), &entry, sizeof(entry));
+    /* The BIOS is there to call only if a BIOS started the machine. */
     int mode = fb_wake_mode();
-    int bare = !under_hypervisor();
-    int post = (cmdline_has("s3_bios") || bare) && !cmdline_has("s3_nobios");
-    int set = (cmdline_has("s3_mode") || post) && !cmdline_has("s3_nomode");
+    int bare = !under_hypervisor() && !boot.uefi;
+    int post = (cmdline_has("s3_bios") || bare) && !cmdline_has("s3_nobios") && !boot.uefi;
+    int set = (cmdline_has("s3_mode") || post) && !cmdline_has("s3_nomode") && !boot.uefi;
     uint8_t flags = 0;
     if (post)
         flags |= WF_POST;
@@ -149,7 +171,9 @@ static void place_trampoline(void)
     if (beeps)
         flags |= WF_BEEP;
     dst[wakeup_flags - wakeup_start] = flags;
-    memcpy(dst + (wakeup_vbe_mode - wakeup_start), &(uint16_t){ (uint16_t)(mode > 0 ? mode : 0) }, 2);
+    memcpy(dst + (wakeup_vbe_width - wakeup_start), &(uint16_t){ (uint16_t)fb_boot.width }, 2);
+    memcpy(dst + (wakeup_vbe_height - wakeup_start), &(uint16_t){ (uint16_t)fb_boot.height }, 2);
+    dst[wakeup_vbe_bpp - wakeup_start] = (uint8_t)fb_boot.bpp;
     /* The ROM's initialisation takes its device in AX (PCI firmware spec). */
     struct pci_dev vga;
     uint8_t pif;

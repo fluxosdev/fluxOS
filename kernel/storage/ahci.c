@@ -312,10 +312,8 @@ static int port_exec(struct ahci_port *p, const struct ata_cmd *c, void *buf, ui
 {
     if (len > BOUNCE_SIZE)
         return -EIO;
-    uint32_t addr = (uint32_t)buf;
     void *mem = buf;
-    if (len && (addr < 0x100000 || addr + len > KERNEL_SPACE_END || addr + len < addr ||
-                (addr & 1))) {
+    if (len && (!virt_dma_ok(buf, len) || ((uintptr_t)buf & 1))) {
         mem = bounce;
         if (write)
             memcpy(mem, buf, len);
@@ -341,7 +339,7 @@ static int port_exec(struct ahci_port *p, const struct ata_cmd *c, void *buf, ui
     if (c->packet)
         memcpy(ct->acmd, c->packet, 12);
     if (len) {
-        ct->prdt[0].dba = (uint32_t)mem;
+        ct->prdt[0].dba = virt_to_phys(mem);
         ct->prdt[0].dbc = ((len + 1) & ~1u) - 1;
     }
 
@@ -349,7 +347,7 @@ static int port_exec(struct ahci_port *p, const struct ata_cmd *c, void *buf, ui
     h->flags = (uint16_t)(5 | (c->packet ? CH_ATAPI : 0) | (write ? CH_WRITE : 0));
     h->prdtl = len ? 1 : 0;
     h->prdbc = 0;
-    h->ctba = (uint32_t)ct;
+    h->ctba = virt_to_phys(ct);
     h->ctbau = 0;
 
     px_wr(p, PX_IS, 0xFFFFFFFFu);
@@ -650,21 +648,21 @@ static void port_probe(struct hba *h, int n, uint16_t *id)
             pmm_free(page);
         return;
     }
-    memset((void *)page, 0, PAGE_SIZE);
+    memset(phys_to_virt(page), 0, PAGE_SIZE);
     p->hba = h;
     p->num = n;
     p->regs = h->regs + 0x100 + 0x80 * n;
-    p->cl = (struct cmd_header *)page;                  /* 1 KiB aligned */
-    p->fis = (uint8_t *)page + 0x400;                   /* 256 aligned */
-    p->ct = (struct cmd_table *)(page + 0x500);         /* 128 aligned */
+    p->cl = (struct cmd_header *)phys_to_virt(page);                  /* 1 KiB aligned */
+    p->fis = (uint8_t *)phys_to_virt(page) + 0x400;                   /* 256 aligned */
+    p->ct = (struct cmd_table *)phys_to_virt(page + 0x500);         /* 128 aligned */
 
     if (port_stop(p) < 0) {
         port_comreset(p);
         port_stop(p);
     }
-    px_wr(p, PX_CLB, (uint32_t)p->cl);
+    px_wr(p, PX_CLB, virt_to_phys(p->cl));
     px_wr(p, PX_CLBU, 0);
-    px_wr(p, PX_FB, (uint32_t)p->fis);
+    px_wr(p, PX_FB, virt_to_phys(p->fis));
     px_wr(p, PX_FBU, 0);
 
     if (port_link(p, (hba_rd(h, HBA_CAP) & CAP_SSS) != 0) < 0)
@@ -832,9 +830,9 @@ void ahci_resume(void)
                 port_comreset(p);
                 port_stop(p);
             }
-            px_wr(p, PX_CLB, (uint32_t)p->cl);
+            px_wr(p, PX_CLB, virt_to_phys(p->cl));
             px_wr(p, PX_CLBU, 0);
-            px_wr(p, PX_FB, (uint32_t)p->fis);
+            px_wr(p, PX_FB, virt_to_phys(p->fis));
             px_wr(p, PX_FBU, 0);
             if (port_link(p, (hba_rd(h, HBA_CAP) & CAP_SSS) != 0) < 0) {
                 klog("%s: the drive did not come back\n", p->bd.name);

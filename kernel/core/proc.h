@@ -21,7 +21,7 @@
 #define MAX_PROCS   128          /* threads count too */
 #define MAX_FDS     256
 #define MAX_VMAS    256
-#define KSTACK_SIZE 16384
+#define KSTACK_SIZE 32768       /* (64-bit frames are deeper than the 32-bit kernel's were) */
 #define QUANTUM     5           /* timer ticks per time slice (50 ms) */
 
 struct proc_vma {
@@ -69,9 +69,9 @@ struct proc {
                                    a reference until it returns, so that a close in another
                                    thread cannot free them under it (syscall.c) */
     int nheld;
-    uint32_t esp;               /* saved kernel stack pointer */
+    uint64_t ksp;               /* saved kernel stack pointer */
     uint8_t *kstack;
-    uint32_t *pd;               /* page directory (physical == virtual) */
+    pte_t *pd;                  /* the address space: its top-level page table (mm.h) */
     struct trapframe *tf;       /* user registers on syscall/trap entry */
     void *chan;                 /* wait channel while P_BLOCKED */
     uint32_t wake_tick;         /* deadline while P_SLEEPING (or timed P_BLOCKED) */
@@ -226,7 +226,7 @@ void proc_signal_force(struct proc *p, int sig);
 void proc_signal_group(int pgid, int sig);
 void proc_signal_ctty(struct tty *t, int sig);
 void proc_signal_exec(struct proc *p);
-uint32_t *proc_set_pd(struct proc *p, uint32_t *pd);    /* returns the old one */
+pte_t *proc_set_pd(struct proc *p, pte_t *pd);          /* returns the old one */
 int signal_pending(struct proc *p);
 void proc_check_signals(void);
 int proc_grow_stack(uint32_t addr);

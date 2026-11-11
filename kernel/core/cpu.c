@@ -1,21 +1,21 @@
 /*
- * The processor. fluxOS needs a Pentium 4, or any other processor with
- * SSE2 (and the FXSAVE, CMOV, MMX and SSE that come with it): the whole
- * system is built for it. cpu_init() checks first thing at boot, and this file,
- * like everything else that runs before it, is built for any 386 (see the
- * Makefile), so an older machine says why it stops instead of hanging.
+ * The processor. fluxOS needs a 64-bit one (x86-64): the kernel is 64-bit
+ * code, and the boot loader does not start it on anything less. Every
+ * such processor has the SSE2 (and the FXSAVE, CMOV, MMX and SSE that come
+ * with it) the programs are built for; cpu_init() looks all the same, and
+ * says why it stops if a processor (or an emulator's idea of one) lacks
+ * something.
  *
- * It also reprograms the page attribute table, which every Pentium 4
- * has, so that pages can be write-combining (pte_wc): the screen's owner
- * gets the framebuffer that way, and its writes, SSE's streaming stores
- * above all, reach the card in whole bursts instead of one at a time.
+ * It also reprograms the page attribute table, which every 64-bit
+ * processor has, so that pages can be write-combining (pte_wc): the
+ * screen's owner gets the framebuffer that way, and its writes, SSE's
+ * streaming stores above all, reach the card in whole bursts instead of
+ * one at a time.
  */
 #include "kernel.h"
 #include "drivers.h"
 #include "mm.h"
 #include "x86.h"
-
-#define EFLAGS_ID (1u << 21)
 
 /* CPUID 1, EDX */
 #define F_FPU  (1u << 0)
@@ -40,14 +40,6 @@
 uint32_t pte_wc;
 
 static char name[49];
-
-static int have_cpuid(void)
-{
-    uint32_t before = read_eflags(), after;
-    __asm__ volatile("pushl %1; popfl; pushfl; popl %0" : "=r"(after) : "r"(before ^ EFLAGS_ID) : "cc");
-    __asm__ volatile("pushl %0; popfl" : : "r"(before) : "cc");
-    return ((before ^ after) & EFLAGS_ID) != 0;
-}
 
 /* The brand string where there is one (from the Pentium 4 and Athlon on),
  * or else the vendor and model. */
@@ -84,7 +76,7 @@ static void read_name(uint32_t sig)
 static void cannot_run(const char *what, const char *missing)
 {
     splash_end(1);
-    kprintf("\n\033[1;31mfluxOS needs a Pentium 4 or a newer processor.\033[0m\n"
+    kprintf("\n\033[1;31mfluxOS needs a 64-bit processor with SSE2.\033[0m\n"
             "This one (%s) has no %s.\n\nSystem halted.\n", what, missing);
     cli();
     for (;;)
@@ -93,8 +85,6 @@ static void cannot_run(const char *what, const char *missing)
 
 void cpu_init(void)
 {
-    if (!have_cpuid())
-        cannot_run("a 386 or 486", "CPUID instruction");
     uint32_t r[4];
     cpuid(0, r);
     uint32_t max = r[0], sig = 0, edx = 0;
@@ -112,7 +102,7 @@ void cpu_init(void)
         { F_MMX, "MMX" },
         { F_FXSR, "FXSAVE instruction" },
         { F_SSE, "SSE" },
-        { F_SSE2, "SSE2 (it is older than a Pentium 4)" },
+        { F_SSE2, "SSE2" },
     };
     for (uint32_t i = 0; i < ARRAY_SIZE(need); i++)
         if (!(edx & need[i].bit))
@@ -201,11 +191,11 @@ static void mtrr_restore(void)
     if (same)
         return;
 
-    uint32_t cr4 = read_cr4();
+    uint64_t cr4 = read_cr4();
     if (cr4 & CR4_PGE)
-        write_cr4(cr4 & ~CR4_PGE);      /* global pages out of the TLB too */
-    uint32_t cr0 = read_cr0();
-    write_cr0((cr0 | CR0_CD) & ~CR0_NW);        /* no-fill cache mode */
+        write_cr4(cr4 & ~(uint64_t)CR4_PGE);    /* global pages out of the TLB too */
+    uint64_t cr0 = read_cr0();
+    write_cr0((cr0 | CR0_CD) & ~(uint64_t)CR0_NW);      /* no-fill cache mode */
     __asm__ volatile("wbinvd" ::: "memory");
     write_cr3(read_cr3());
     wrmsr(MSR_MTRRDEFTYPE, mtrr.deftype & ~0xC00ull);      /* E and FE off while they change */
@@ -219,7 +209,7 @@ static void mtrr_restore(void)
     __asm__ volatile("wbinvd" ::: "memory");
     write_cr3(read_cr3());
     wrmsr(MSR_MTRRDEFTYPE, mtrr.deftype);
-    write_cr0(cr0 & ~(CR0_CD | CR0_NW));
+    write_cr0(cr0 & ~(uint64_t)(CR0_CD | CR0_NW));
     write_cr4(cr4);
 }
 

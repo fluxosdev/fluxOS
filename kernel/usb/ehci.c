@@ -219,7 +219,7 @@ static void qh_link(struct ehci *e, struct qh *qh)
         h->snext->sprev = qh;
     h->snext = qh;
     barrier();
-    h->link = (uint32_t)qh | LP_QH;
+    h->link = virt_to_phys(qh) | LP_QH;
 }
 
 static void qh_unlink(struct qh *qh)
@@ -287,7 +287,7 @@ static struct qtd *qtd_new(uint32_t pid, int toggle, void *buf, uint32_t len)
     t->next = LP_T;
     t->alt = LP_T;
     t->token = QTD_ACTIVE | pid | QTD_CERR3 | len << 16 | (toggle ? QTD_DT : 0);
-    uint32_t a = (uint32_t)buf;
+    uint32_t a = virt_to_phys(buf);
     if (len) {
         t->buf[0] = a;
         for (int i = 1; i < 5; i++)
@@ -312,7 +312,7 @@ static int ehci_submit(struct usb_hc *hc, struct usb_xfer *x)
 
     struct qtd *first = NULL, *last = NULL, *t, *status = NULL;
 #define APPEND(n) do { if (!(t = (n))) goto nomem; \
-        if (last) { last->snext = t; last->next = (uint32_t)t; } else first = t; \
+        if (last) { last->snext = t; last->next = virt_to_phys(t); } else first = t; \
         last = t; } while (0)
 
     int control = ep->type == USB_EP_CONTROL;
@@ -343,7 +343,7 @@ static int ehci_submit(struct usb_hc *hc, struct usb_xfer *x)
     /* A short IN packet skips the rest: to the status stage, or to the end. */
     for (t = first; t; t = t->snext)
         if (t->is_data && t->is_in)
-            t->alt = status ? (uint32_t)status : (uint32_t)qh->end;
+            t->alt = status ? virt_to_phys(status) : virt_to_phys(qh->end);
 
     qh->xfer = x;
     qh->tds = first;
@@ -352,7 +352,7 @@ static int ehci_submit(struct usb_hc *hc, struct usb_xfer *x)
     qh->token &= QTD_DT;
     qh->alt = LP_T;
     barrier();
-    qh->next = (uint32_t)first;
+    qh->next = virt_to_phys(first);
     (void)ndata;
     return 0;
 
@@ -650,15 +650,15 @@ static void ehci_setup(struct ehci *e)
 
     /* The async ring starts as its head alone; the head never runs. */
     struct qh *ah = e->async_head;
-    ah->link = (uint32_t)ah | LP_QH;
+    ah->link = virt_to_phys(ah) | LP_QH;
     ah->info1 = QH_HEAD | 2u << 12;
     ah->token = QTD_HALTED;
     ah->type = USB_EP_CONTROL;
     e->intr_head->type = USB_EP_INTR;
     for (int i = 0; i < 1024; i++)
-        e->frames[i] = (uint32_t)e->intr_head | LP_QH;
-    op_wr(e, OP_PERIODIC, (uint32_t)e->frames);
-    op_wr(e, OP_ASYNC, (uint32_t)ah);
+        e->frames[i] = virt_to_phys(e->intr_head) | LP_QH;
+    op_wr(e, OP_PERIODIC, virt_to_phys(e->frames));
+    op_wr(e, OP_ASYNC, virt_to_phys(ah));
     op_wr(e, OP_USBSTS, STS_ACK);
 
     if (hc->irq >= 0)
@@ -705,7 +705,7 @@ static void ehci_init(const struct pci_dev *pci)
     }
     e->op = e->cap + *(volatile uint8_t *)(e->cap + CAP_LENGTH);
     e->pci = *pci;
-    e->frames = (uint32_t *)page;
+    e->frames = (uint32_t *)phys_to_virt(page);
     pci_enable(pci, PCI_CMD_MEM | PCI_CMD_MASTER);
 
     struct usb_hc *hc = &e->hc;

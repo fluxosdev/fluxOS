@@ -5,21 +5,21 @@
 #include <stdint.h>
 #include <flux/abi.h>
 
-struct multiboot_info;
 struct vnode;
 
 /* Linear framebuffer from the boot loader (fb.base is NULL without one) */
 struct framebuffer {
     uint8_t *base;
-    uint32_t phys, size;
+    uint64_t phys;                      /* (a card's memory may be above 4 GiB) */
+    uint32_t size;
     uint32_t width, height, pitch, bpp, bytespp;
     uint8_t red_pos, red_size, green_pos, green_size, blue_pos, blue_size;
 };
 extern struct framebuffer fb;
 extern struct framebuffer fb_boot;      /* the boot loader's mode */
 
-int fb_init(struct multiboot_info *mbi);
-void fb_map(void);
+int fb_init(void);                      /* the boot loader's mode (boot.h) */
+void fb_map(void);                      /* fb_boot: once the boot mode is final */
 void fb_mode_changed(void);             /* a driver set a new mode in fb */
 int fb_display(int op, void *arg);      /* SYS_display; arg checked by the caller */
 int fb_video_option(struct dispmode *m);    /* video= on the command line; 1 if given */
@@ -34,7 +34,7 @@ int fb_get_info(struct fbinfo *fi);
 int fb_map_user(void);
 void fb_proc_exit(int pid);             /* at exit and exec: the screen and GPU it held */
 int fb_pinned(int pid, uint32_t start, uint32_t end);  /* radeon_pinned, under the display lock */
-int fb_wake_mode(void);                 /* VESA mode to set on waking, 0 text, -1 none possible */
+int fb_wake_mode(void);                 /* on waking: 1 the boot mode again, 0 text, -1 none possible */
 void fb_suspend(void);                  /* holds the display lock until fb_resume() */
 void fb_resume(void);
 void fb_blank(void);                    /* the screen dark for S3; interrupts off */

@@ -46,4 +46,17 @@ void do_wait(void) { sleep_on(NULL); }
 #define CHECK(expr) do { if (!(expr)) { \
     fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #expr); exit(1); \
 } } while (0)
+/* The kernel's direct map (kernel.h): here kernel memory is where its
+ * "physical" address says, and a test that hands out frames takes them
+ * from the host's first 4 GiB (mmap's MAP_32BIT), which is all a physical
+ * address of the kernel's holds. Weak: a test may have its own. */
+__attribute__((weak)) uint64_t hhdm_base;
+__attribute__((weak)) uint32_t virt_to_phys(const volatile void *virt)
+{
+    return (uint32_t)(uintptr_t)virt;   /* (of the host's heap: only good for telling addresses apart) */
+}
+__attribute__((weak)) int virt_dma_ok(const void *virt, uint32_t len)
+{
+    return (uintptr_t)virt >= 0x100000 && (uintptr_t)virt + len <= 0x100000000ull;
+}
 #endif

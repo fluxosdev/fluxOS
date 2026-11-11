@@ -106,8 +106,8 @@ struct usb_dev;
 struct usb_xfer;
 
 /*
- * A transfer. The buffer must be kernel memory below KERNEL_SPACE_END
- * (identity-mapped, so the controller can reach it by DMA). Only one
+ * A transfer. The buffer must be kernel memory of the direct map, below 4 GiB
+ * (contiguous there, so the controller can reach it by DMA). Only one
  * transfer per endpoint may be in flight, except on an isochronous
  * endpoint, where several may be queued: the controller sends them in
  * order, one packet per service interval, each starting right after the

@@ -301,9 +301,11 @@ void *pci_map_bar(const struct pci_dev *p, int bar)
     uint32_t v = pci_read32(p, bar);
     if (v & 1)
         return NULL;                                    /* an I/O port BAR */
-    if ((v & 6) == 4 && pci_read32(p, bar + 4))
-        return NULL;                                    /* 64-bit, above 4 GiB */
-    uint32_t base = v & ~0xFu;
+    /* A 64-bit BAR is two registers, and may be anywhere: UEFI firmware
+     * likes to put them above 4 GiB. */
+    int wide = (v & 6) == 4;
+    uint32_t high = wide ? pci_read32(p, bar + 4) : 0;
+    uint64_t base = (uint64_t)high << 32 | (v & ~0xFu);
     if (!base)
         return NULL;
 
@@ -311,10 +313,19 @@ void *pci_map_bar(const struct pci_dev *p, int bar)
     uint32_t cmd = pci_read32(p, PCI_COMMAND) & 0xFFFF;
     pci_write32(p, PCI_COMMAND, cmd & ~PCI_CMD_MEM);
     pci_write32(p, bar, 0xFFFFFFFFu);
-    uint32_t mask = pci_read32(p, bar) & ~0xFu;
+    uint64_t mask = pci_read32(p, bar) & ~0xFu;
     pci_write32(p, bar, v);
+    if (wide) {
+        pci_write32(p, bar + 4, 0xFFFFFFFFu);
+        mask |= (uint64_t)pci_read32(p, bar + 4) << 32;
+        pci_write32(p, bar + 4, high);
+    } else {
+        mask |= 0xFFFFFFFF00000000ull;
+    }
     pci_write32(p, PCI_COMMAND, cmd | PCI_CMD_MEM);
-    uint32_t size = mask ? ~mask + 1 : PAGE_SIZE;
+    uint64_t size = (mask & 0xFFFFFFF0u) || wide ? ~mask + 1 : PAGE_SIZE;
+    if (!size || size > (1ull << 32))
+        return NULL;                                    /* (no device register block is that big) */
 
     return vmm_map_mmio(base, size, PTE_PCD | PTE_PWT);
 }

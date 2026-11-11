@@ -97,10 +97,10 @@ with tempfile.TemporaryDirectory(prefix="flux-native-build-") as directory:
     if not same:
         raise SystemExit("native-build: the native build's files differ from the Linux build's")
 
-    # the native ISO as it is, as a CD: GRUB from it, then the kernel up to init
+    # the native ISO as it is, as a CD: Limine from it, then the kernel up to init
     log = temp / "boot.log"
     with log.open("w") as output:
-        proc = subprocess.Popen([args.qemu, "-cpu", "core2duo,-lm", "-smp", "2", "-m", "1G", "-display", "none",
+        proc = subprocess.Popen([args.qemu, "-cpu", "core2duo", "-smp", "2", "-m", "1G", "-display", "none",
                                  "-nic", "none", "-no-reboot", "-serial", f"file:{log}", "-boot", "d",
                                  "-cdrom", str(native_iso)], stdout=output, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + 180

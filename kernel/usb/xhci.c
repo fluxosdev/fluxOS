@@ -209,7 +209,7 @@ static int ring_init(struct ring *r)
     if (!r->trbs)
         return -ENOMEM;
     struct trb *link = &r->trbs[RING_TRBS - 1];
-    link->p0 = (uint32_t)r->trbs;
+    link->p0 = virt_to_phys(r->trbs);
     link->control = TRB_TYPE(TRB_LINK) | TRB_TC;
     r->enq = 0;
     r->cycle = 1;
@@ -221,7 +221,7 @@ static void ring_reset(struct ring *r)
 {
     memset(r->trbs, 0, (RING_TRBS - 1) * sizeof(struct trb));
     struct trb *link = &r->trbs[RING_TRBS - 1];
-    link->p0 = (uint32_t)r->trbs;
+    link->p0 = virt_to_phys(r->trbs);
     link->p1 = 0;
     link->status = 0;
     link->control = TRB_TYPE(TRB_LINK) | TRB_TC;
@@ -253,12 +253,12 @@ static uint32_t ring_put(struct ring *r, uint32_t p0, uint32_t p1, uint32_t stat
         r->enq = 0;
         r->cycle ^= 1;
     }
-    return (uint32_t)t;
+    return virt_to_phys(t);
 }
 
 static uint32_t ring_deq_ptr(struct ring *r)
 {
-    return (uint32_t)&r->trbs[r->enq] | r->cycle;
+    return virt_to_phys(&r->trbs[r->enq]) | r->cycle;
 }
 
 /* ---- contexts ---- */
@@ -313,7 +313,7 @@ static struct xep *ep_of(struct xhci *x, int slot, int dci)
 /* The ring index of a TRB address, counting past the link. */
 static uint32_t ring_index(struct ring *r, uint32_t trb)
 {
-    return (trb - (uint32_t)r->trbs) / sizeof(struct trb);
+    return (trb - virt_to_phys(r->trbs)) / sizeof(struct trb);
 }
 
 /* An event for an isochronous endpoint: which queued transfer and packet
@@ -324,7 +324,7 @@ static void iso_event(struct xep *ep, struct trb *ev, int cc, uint32_t residual,
     for (int k = 0; k < ep->iso_n; k++) {
         int q = (ep->iso_head + k) % ISO_QUEUE;
         struct usb_xfer *xf = ep->iso[q];
-        uint32_t first = ring_index(&ep->ring, (uint32_t)xf->hcpriv);
+        uint32_t first = ring_index(&ep->ring, virt_to_phys(xf->hcpriv));
         uint32_t idx = ring_index(&ep->ring, ev->p0);
         if (idx >= RING_TRBS - 1)
             continue;
@@ -453,7 +453,7 @@ static void xhci_poll(struct usb_hc *hc)
         }
     }
     if (any) {
-        *(volatile uint32_t *)(x->rt + IR_ERDP) = (uint32_t)&x->events[x->ev_deq] | ERDP_EHB;
+        *(volatile uint32_t *)(x->rt + IR_ERDP) = virt_to_phys(&x->events[x->ev_deq]) | ERDP_EHB;
         *(volatile uint32_t *)(x->rt + IR_ERDP + 4) = 0;
     }
     while (done) {
@@ -541,7 +541,7 @@ static void note_trb(struct xep *ep, uint32_t addr, uint32_t len)
 static int put_data(struct xep *ep, uint8_t *buf, uint32_t len, uint32_t mps, uint32_t first_type,
                     uint32_t dir, uint32_t last_flags, int *hold_first, uint32_t *first_trb)
 {
-    uint32_t a = (uint32_t)buf, left = len, done = 0;
+    uint32_t a = virt_to_phys(buf), left = len, done = 0;
     uint32_t type = first_type;
     do {
         uint32_t n = MIN(left, 0x10000u - (a & 0xFFFF));
@@ -578,12 +578,12 @@ static int iso_submit(struct xhci *x, struct xslot *s, struct xep *ep, struct us
         return -EINVAL;
     if (ep->iso_n >= ISO_QUEUE)
         return -EBUSY;
-    uint32_t first = 0, a = (uint32_t)xf->buf;
+    uint32_t first = 0, a = virt_to_phys(xf->buf);
     for (uint32_t i = 0; i < xf->npackets; i++) {
         uint32_t len = xf->iso_len[i];
         if (in)
-            a = (uint32_t)xf->buf + i * mps;
-        if (len > mps || (a & 0xFFFF) + len > 0x10000 || a + len > (uint32_t)xf->buf + xf->len)
+            a = virt_to_phys(xf->buf) + i * mps;
+        if (len > mps || (a & 0xFFFF) + len > 0x10000 || a + len > virt_to_phys(xf->buf) + xf->len)
             return -EINVAL;             /* a packet is one TRB: no 64 KiB crossing */
         uint32_t pkts = len ? (len + mps - 1) / mps : 1;
         uint32_t ctl = TRB_TYPE(TRB_ISOCH) | TRB_IOC | TRB_SIA | (in ? TRB_ISP : 0) | (pkts - 1) << 16;
@@ -597,9 +597,9 @@ static int iso_submit(struct xhci *x, struct xslot *s, struct xep *ep, struct us
     ep->iso[q] = xf;
     ep->iso_seen[q] = 0;
     ep->iso_n++;
-    xf->hcpriv = (void *)first;
+    xf->hcpriv = phys_to_virt(first);
     barrier();
-    ((struct trb *)first)->control ^= TRB_CYCLE;
+    ((struct trb *)phys_to_virt(first))->control ^= TRB_CYCLE;
     barrier();
     x->db[s->id] = (uint32_t)dci_of(xf->ep->addr);
     return 0;
@@ -654,7 +654,7 @@ static int xhci_submit(struct usb_hc *hc, struct usb_xfer *xf)
     ep->xfer = xf;
     xf->hcpriv = ep;
     barrier();
-    ((struct trb *)first)->control ^= TRB_CYCLE;       /* now the controller may start */
+    ((struct trb *)phys_to_virt(first))->control ^= TRB_CYCLE;       /* now the controller may start */
     barrier();
     x->db[s->id] = (uint32_t)dci;
     return 0;
@@ -777,7 +777,7 @@ static int xhci_ep_enable(struct usb_hc *hc, struct usb_dev *dev, struct usb_ep 
     sc[0] = (sc[0] & ~(0x1Fu << 27)) | (uint32_t)maxdci << 27;
     in_ctrl(x, s)[0] = 0;
     in_ctrl(x, s)[1] = 1u | 1u << dci;
-    return command(x, (uint32_t)s->in, 0, TRB_TYPE(TRB_CONFIG_EP) | (uint32_t)s->id << 24,
+    return command(x, virt_to_phys(s->in), 0, TRB_TYPE(TRB_CONFIG_EP) | (uint32_t)s->id << 24,
                    NULL) == CC_SUCCESS ? 0 : -EIO;
 }
 
@@ -795,7 +795,7 @@ static void xhci_ep_disable(struct usb_hc *hc, struct usb_dev *dev, struct usb_e
     xe->xfer = NULL;
     in_ctrl(x, s)[0] = 1u << dci;       /* drop */
     in_ctrl(x, s)[1] = 1u;
-    command(x, (uint32_t)s->in, 0, TRB_TYPE(TRB_CONFIG_EP) | (uint32_t)s->id << 24, NULL);
+    command(x, virt_to_phys(s->in), 0, TRB_TYPE(TRB_CONFIG_EP) | (uint32_t)s->id << 24, NULL);
     ring_reset(&xe->ring);
     xe->halted = 0;
 }
@@ -821,7 +821,7 @@ static int xhci_dev_init(struct usb_hc *hc, struct usb_dev *dev)
         return -ENOMEM;
     }
     x->slots[id] = s;
-    x->dcbaa[id] = (uint32_t)s->out;
+    x->dcbaa[id] = virt_to_phys(s->out);
     dev->hcpriv = s;
 
     uint32_t *sc = slot_ctx(x, in_dev(x, s));
@@ -833,7 +833,7 @@ static int xhci_dev_init(struct usb_hc *hc, struct usb_dev *dev)
 
     in_ctrl(x, s)[0] = 0;
     in_ctrl(x, s)[1] = 0x3;             /* slot and ep0 */
-    if (command(x, (uint32_t)s->in, 0, TRB_TYPE(TRB_ADDRESS_DEV) | (uint32_t)id << 24,
+    if (command(x, virt_to_phys(s->in), 0, TRB_TYPE(TRB_ADDRESS_DEV) | (uint32_t)id << 24,
                 NULL) != CC_SUCCESS)
         return -EIO;                    /* the core frees the slot */
     dev->addr = slot_ctx(x, s->out)[3] & 0xFF;
@@ -849,7 +849,7 @@ static int xhci_dev_update(struct usb_hc *hc, struct usb_dev *dev)
     c[1] = (c[1] & 0xFFFF) | (uint32_t)dev->ep0.maxpacket << 16;
     in_ctrl(x, s)[0] = 0;
     in_ctrl(x, s)[1] = 0x2;
-    return command(x, (uint32_t)s->in, 0, TRB_TYPE(TRB_EVAL_CTX) | (uint32_t)s->id << 24,
+    return command(x, virt_to_phys(s->in), 0, TRB_TYPE(TRB_EVAL_CTX) | (uint32_t)s->id << 24,
                    NULL) == CC_SUCCESS ? 0 : -EIO;
 }
 
@@ -876,7 +876,7 @@ static int xhci_dev_configure(struct usb_hc *hc, struct usb_dev *dev)
     sc[0] = (sc[0] & ~(0x1Fu << 27)) | (uint32_t)maxdci << 27;
     in_ctrl(x, s)[0] = 0;
     in_ctrl(x, s)[1] = add;
-    return command(x, (uint32_t)s->in, 0, TRB_TYPE(TRB_CONFIG_EP) | (uint32_t)s->id << 24,
+    return command(x, virt_to_phys(s->in), 0, TRB_TYPE(TRB_CONFIG_EP) | (uint32_t)s->id << 24,
                    NULL) == CC_SUCCESS ? 0 : -EIO;
 }
 
@@ -893,7 +893,7 @@ static int xhci_dev_hub(struct usb_hc *hc, struct usb_dev *dev, int nports, int 
     in_ctrl(x, s)[1] = 1;
     /* As Linux does: 0.95 controllers take hub fields by Evaluate Context. */
     uint32_t type = x->version > 0x95 ? TRB_CONFIG_EP : TRB_EVAL_CTX;
-    return command(x, (uint32_t)s->in, 0, TRB_TYPE(type) | (uint32_t)s->id << 24,
+    return command(x, virt_to_phys(s->in), 0, TRB_TYPE(type) | (uint32_t)s->id << 24,
                    NULL) == CC_SUCCESS ? 0 : -EIO;
 }
 
@@ -1106,17 +1106,17 @@ static int xhci_setup(struct xhci *x)
     x->dead = 0;
 
     op_wr(x, OP_CONFIG, (op_rd(x, OP_CONFIG) & ~0xFFu) | (uint32_t)x->maxslots);
-    op_wr64(x, OP_DCBAAP, (uint32_t)x->dcbaa);
-    op_wr64(x, OP_CRCR, (uint32_t)x->cmd.trbs | 1);
-    x->erst[0] = (uint32_t)x->events;
+    op_wr64(x, OP_DCBAAP, virt_to_phys(x->dcbaa));
+    op_wr64(x, OP_CRCR, virt_to_phys(x->cmd.trbs) | 1);
+    x->erst[0] = virt_to_phys(x->events);
     x->erst[1] = 0;
     x->erst[2] = RING_TRBS;
     x->ev_deq = 0;
     x->ev_cycle = 1;
     rt_wr(x, IR_ERSTSZ, 1);
-    rt_wr(x, IR_ERDP, (uint32_t)x->events);
+    rt_wr(x, IR_ERDP, virt_to_phys(x->events));
     rt_wr(x, IR_ERDP + 4, 0);
-    rt_wr(x, IR_ERSTBA, (uint32_t)x->erst);
+    rt_wr(x, IR_ERSTBA, virt_to_phys(x->erst));
     rt_wr(x, IR_ERSTBA + 4, 0);
     rt_wr(x, IR_IMOD, 0);
 
@@ -1183,7 +1183,7 @@ static void xhci_init(const struct pci_dev *pci)
     int nscratch = (int)(((hcs2 >> 27) & 0x1F) | ((hcs2 >> 21) & 0x1F) << 5);
     if (nscratch) {
         uint32_t frames = ((uint32_t)nscratch * 8 + PAGE_SIZE - 1) / PAGE_SIZE;
-        uint64_t *arr = (uint64_t *)pmm_alloc_contig(frames);
+        uint64_t *arr = pmm_alloc_pages(frames);
         if (!arr) {
             klog("xhci: out of memory\n");
             x->events = NULL;
@@ -1196,15 +1196,15 @@ static void xhci_init(const struct pci_dev *pci)
                 while (i--)
                     pmm_free((uint32_t)arr[i]);
                 for (uint32_t f = 0; f < frames; f++)
-                    pmm_free((uint32_t)arr + f * PAGE_SIZE);
+                    pmm_free(virt_to_phys(arr) + f * PAGE_SIZE);
                 klog("xhci: out of memory\n");
                 x->events = NULL;
                 return;
             }
-            memset((void *)pg, 0, PAGE_SIZE);
+            memset(phys_to_virt(pg), 0, PAGE_SIZE);
             arr[i] = pg;
         }
-        x->dcbaa[0] = (uint32_t)arr;
+        x->dcbaa[0] = virt_to_phys(arr);
     }
 
     struct usb_hc *hc = &x->hc;

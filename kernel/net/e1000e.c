@@ -769,7 +769,7 @@ static int e_transmit(const void *frame, uint32_t len)
     memcpy(e.tx_buf[i], frame, len);
     memset(e.tx_buf[i] + len, 0, n - len);
     struct tx_desc *d = &e.tx_ring[i];
-    d->addr_lo = (uint32_t)e.tx_buf[i];
+    d->addr_lo = virt_to_phys(e.tx_buf[i]);
     d->addr_hi = 0;
     d->length = (uint16_t)n;
     d->cso = 0;
@@ -873,16 +873,16 @@ static int alloc_buffers(void)
     uint32_t page = pmm_alloc();
     if (!page)
         return -1;
-    memset((void *)page, 0, PAGE_SIZE);
-    e.rx_ring = (struct rx_desc *)page;                 /* 32 x 16 bytes */
-    e.tx_ring = (struct tx_desc *)(page + 2048);        /* 16 x 16 bytes */
+    memset(phys_to_virt(page), 0, PAGE_SIZE);
+    e.rx_ring = (struct rx_desc *)phys_to_virt(page);                 /* 32 x 16 bytes */
+    e.tx_ring = (struct tx_desc *)phys_to_virt(page + 2048);        /* 16 x 16 bytes */
     for (int i = 0; i < RX_RING + TX_RING; i += 2) {
         uint32_t p = pmm_alloc();
         if (!p)
             return -1;
         uint8_t **slot = i < RX_RING ? &e.rx_buf[i] : &e.tx_buf[i - RX_RING];
-        slot[0] = (uint8_t *)p;
-        slot[1] = (uint8_t *)p + BUF_SIZE;
+        slot[0] = (uint8_t *)phys_to_virt(p);
+        slot[1] = (uint8_t *)phys_to_virt(p) + BUF_SIZE;
     }
     return 0;
 }
@@ -890,7 +890,7 @@ static int alloc_buffers(void)
 static void start_rings(void)
 {
     for (uint32_t i = 0; i < RX_RING; i++) {
-        e.rx_ring[i].addr_lo = (uint32_t)e.rx_buf[i];
+        e.rx_ring[i].addr_lo = virt_to_phys(e.rx_buf[i]);
         e.rx_ring[i].addr_hi = 0;
         e.rx_ring[i].status = 0;
         e.rx_ring[i].errors = 0;
@@ -899,7 +899,7 @@ static void start_rings(void)
     e.rx_next = 0;
     e.tx_next = e.tx_done = 0;
 
-    wr(R_TDBAL, (uint32_t)e.tx_ring);
+    wr(R_TDBAL, virt_to_phys(e.tx_ring));
     wr(R_TDBAH, 0);
     wr(R_TDLEN, TX_RING * sizeof(struct tx_desc));
     wr(R_TDH, 0);
@@ -912,7 +912,7 @@ static void start_rings(void)
     wr(R_RDTR, 0);                      /* an interrupt for each frame, */
     wr(R_RADV, 8);
     wr(R_ITR, 195);                     /* but no more than 20000 a second */
-    wr(R_RDBAL, (uint32_t)e.rx_ring);
+    wr(R_RDBAL, virt_to_phys(e.rx_ring));
     wr(R_RDBAH, 0);
     wr(R_RDLEN, RX_RING * sizeof(struct rx_desc));
     wr(R_RDH, 0);

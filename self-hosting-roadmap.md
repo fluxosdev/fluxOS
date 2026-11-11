@@ -7,6 +7,31 @@ on fluxOS; phases 5 and 6 on 2026-10-30: ext2 with links, and the ISO made
 natively; phase 6.5 on 2026-10-31: the first native build); phase 7 is a
 plan.*
 
+> **2026-11-11, fluxOS 0.5.0: the kernel is 64-bit, and Limine starts it.**
+> This roadmap was written for the 32-bit system that GRUB started, and its
+> phases stand as the record of that work. Two things have changed under it:
+>
+> - **The boot loader is Limine**, not GRUB. Where a phase below says
+>   `firmware/grub`, `boot.img`/`core.img`, `mkiso -G` or `mbcheck`, the tree
+>   now has `firmware/limine` (Limine's files, checked in the same way),
+>   `third_party/limine` (Limine's installer, a C program built for the host
+>   and as `/bin/limine`, which `fluxinstall` runs and the build runs on the
+>   ISO), `mkiso -e`/`-P` and `kcheck`. Nothing of the boot loader is built
+>   or downloaded, as before, so this part of self-hosting is unchanged in
+>   kind: `make iso` on fluxOS needs `mkiso` and `limine`, both in the tree.
+> - **The kernel is x86-64 code** (`gcc -m64 -mcmodel=kernel`), while the
+>   programs, the C library and the ports are still i686 (`gcc -m32`). The
+>   fluxOS toolchain (`i686-fluxos`, phases 1 and 4) emits only 32-bit code,
+>   so **the native build can build every program but not the kernel**, and
+>   stages 1 to 3 below do not hold for 0.5.0 until it can. What that takes:
+>   a GCC and binutils for fluxOS that also know x86-64 (binutils'
+>   `elf_x86_64` emulation and a `cc1` with the 64-bit back end: an
+>   `i686-fluxos` GCC configured as a bi-arch compiler, or an
+>   `x86_64-fluxos` one whose default multilib is `-m32`). The kernel needs
+>   no library from it: it links without libgcc. `tools/toolchain` and its
+>   patches are as they were and need that work; `make test-gcc-qemu` and
+>   `make test-native-build-qemu` were not run against 0.5.0.
+
 "Self-hosting" means that fluxOS, running on its own kernel, can turn a
 checkout of this repository into a bootable `fluxOS.iso` and an installed
 disk, with no other operating system involved. That takes a C compiler, an

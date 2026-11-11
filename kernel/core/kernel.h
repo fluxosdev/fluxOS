@@ -12,24 +12,59 @@
 #include "lock.h"
 
 #define FLUXOS_NAME    "fluxOS"
-#define FLUXOS_RELEASE "0.4.0"
+#define FLUXOS_RELEASE "0.5.0"
 
 #define PAGE_SIZE 4096u
-#define ALIGN_UP(x, a)   (((x) + ((a) - 1)) & ~((a) - 1))
-#define ALIGN_DOWN(x, a) ((x) & ~((a) - 1))
+/* (The mask in x's own type: a 32-bit one would cut a 64-bit address short.) */
+#define ALIGN_UP(x, a)   (((x) + ((a) - 1)) & ~((__typeof__(x))(a) - 1))
+#define ALIGN_DOWN(x, a) ((x) & ~((__typeof__(x))(a) - 1))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
-/* Virtual memory layout. The kernel identity-maps the first 1 GiB. */
-#define KERNEL_SPACE_END 0x40000000u
+/*
+ * Virtual memory layout. Processes are 32-bit programs: theirs is the 2 GiB
+ * from USER_BASE, in the low half of the 64-bit address space, which is
+ * otherwise empty. The kernel has the high half: all of physical memory at
+ * hhdm_base (mm.h; where the boot loader put it, usually the very start of
+ * the half), device memory mapped from KERNEL_MMIO_BASE, and its image in
+ * the top 2 GiB.
+ */
 #define USER_BASE        0x40000000u
 #define USER_TOP         0xC0000000u
 #define USER_STACK_TOP   USER_TOP
 #define USER_STACK_MAX   (32u * 1024 * 1024)
 #define USER_STACK_LIMIT (USER_STACK_TOP - USER_STACK_MAX)
 #define USER_MMIO_BASE   0xB0000000u    /* device memory (framebuffer); heap ends here */
-#define KERNEL_MMIO_BASE 0xC0000000u    /* kernel mappings of device memory */
+#define KERNEL_MMIO_BASE 0xFFFFC00000000000ull  /* kernel mappings of device memory */
+#define KERNEL_LATE_BASE 0xFFFFC08000000000ull  /* and those made a page at a time (vmm_map_late) */
+#define KERNEL_VIRT_BASE 0xFFFFFFFF80000000ull  /* the kernel image (linker.ld) */
+/* The first GiB of physical memory is the kernel's own (pmm.c): its heap,
+ * page tables, stacks and DMA buffers come from there. */
+#define LOW_MEM_END      0x40000000u
+
+/*
+ * Addresses. The kernel's own memory is not where its physical addresses
+ * say: all of physical memory is mapped at hhdm_base (the "direct map": the
+ * heap, page tables, DMA buffers and every frame are reached there), and
+ * the kernel image in the top 2 GiB. A device wants physical addresses and
+ * the kernel uses virtual ones, so every crossing goes through these.
+ * Physical addresses the frame allocator hands out fit 32 bits.
+ */
+extern uint64_t hhdm_base;
+static inline void *phys_to_virt(uint64_t phys)
+{
+    return (void *)(uintptr_t)(hhdm_base + phys);
+}
+/* Of kernel memory (the direct map or the image; NULL gives 0). It must be
+ * below 4 GiB, which is all a 32-bit device address reaches: panics if not. */
+uint32_t virt_to_phys(const volatile void *virt);
+/* Is [virt, virt + len) kernel memory a device can be given as it is: in
+ * the direct map (so contiguous), below 4 GiB and above the first MiB?
+ * A user address, or one of the kernel image, is not. */
+int virt_dma_ok(const void *virt, uint32_t len);
+/* A user address (32 bits, as a process's registers hold it) as a pointer. */
+#define UPTR(addr) ((void *)(uintptr_t)(uint32_t)(addr))
 
 /* Linker-provided symbols. */
 extern char kernel_start[], kernel_end[];

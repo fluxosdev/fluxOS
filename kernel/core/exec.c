@@ -96,7 +96,7 @@ static void image_free(struct image *img)
 }
 
 /* n bytes of the file from off into the new address space at va. */
-static int image_copy_in(uint32_t *pd, const struct image *img, uint32_t va, uint32_t off, uint32_t n)
+static int image_copy_in(pte_t *pd, const struct image *img, uint32_t va, uint32_t off, uint32_t n)
 {
     if (!n)
         return 0;
@@ -133,7 +133,7 @@ static int page_writable(const struct elf32_phdr *ph, int nph, uint32_t va)
     return 0;
 }
 
-static int load_segments(uint32_t *pd, const struct image *img, uint32_t *entry, uint32_t *top)
+static int load_segments(pte_t *pd, const struct image *img, uint32_t *entry, uint32_t *top)
 {
     const struct elf32_ehdr *eh = (const struct elf32_ehdr *)img->data;
 
@@ -202,7 +202,7 @@ static int load_segments(uint32_t *pd, const struct image *img, uint32_t *entry,
     return r;
 }
 
-static int build_stack(uint32_t *pd, char *const argv[], char *const envp[], uint32_t *sp_out)
+static int build_stack(pte_t *pd, char *const argv[], char *const envp[], uint32_t *sp_out)
 {
     uint32_t str_bytes = 0;
     int argc = count_strings(argv, &str_bytes);
@@ -371,7 +371,7 @@ int proc_exec(struct proc *p, const char *path, char *const argv[], char *const 
         return exec_interp(p, DOS_LOADER, NULL, path, argv, envp);
     }
 
-    uint32_t *pd = vmm_create();
+    pte_t *pd = vmm_create();
     if (!pd) {
         image_free(&img);
         return -ENOMEM;

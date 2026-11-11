@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Exercise real S3 wake through GRUB, without touching an installed disk.
+"""Exercise real S3 wake, without touching an installed disk.
 
-QEMU's -kernel loader reloads kernel memory on reset/wakeup, destroying the
-saved CPU context. Boot an ISO instead so that RAM survives S3.
+The kernel starts through the firmware and Limine, from a small CD made for
+the run, and comes back from S3 through the firmware's waking vector:
+real mode, kernel/acpi/wakeup.S, long mode again.
 """
 import argparse
 import json
 import pathlib
-import shutil
 import socket
 import subprocess
 import tarfile
@@ -15,17 +15,15 @@ import tempfile
 import time
 
 parser = argparse.ArgumentParser(description=__doc__)
-for name in ('qemu', 'kernel', 'initrd', 'guest', 'mkiso', 'grubdir'):
+for name in ('qemu', 'kernel', 'initrd', 'guest', 'mkiso', 'liminedir'):
     parser.add_argument(name)
 parser.add_argument('--cpus', type=int, default=2, choices=range(1, 17))
 parser.add_argument('--drop', action='append', default=[], metavar='PREFIX', help='leave initrd members under this path out')
 args = parser.parse_args()
 with tempfile.TemporaryDirectory(prefix='flux-suspend-') as directory:
     temp = pathlib.Path(directory)
-    tree = temp / 'iso'
-    (tree / 'boot/grub').mkdir(parents=True)
-    shutil.copy(args.kernel, tree / 'kernel')
-    with tarfile.open(args.initrd) as src, tarfile.open(tree / 'initrd', 'w', format=tarfile.USTAR_FORMAT) as dst:
+    initrd = temp / 'initrd.tar'
+    with tarfile.open(args.initrd) as src, tarfile.open(initrd, 'w', format=tarfile.USTAR_FORMAT) as dst:
         replaced = False
         for member in src:
             name = member.name.lstrip('./')
@@ -38,15 +36,13 @@ with tempfile.TemporaryDirectory(prefix='flux-suspend-') as directory:
                 dst.addfile(member, src.extractfile(member) if member.isfile() else None)
         if not replaced:
             raise SystemExit('initrd has no /bin/init')
-    (tree / 'boot/grub/grub.cfg').write_text(
-        'set timeout=0\nmenuentry test {\n multiboot /kernel automount=off\n'
-        ' module /initrd\n boot\n}\n')
-    # GRUB's El Torito image and modules, as the CD has them (firmware/grub)
-    shutil.copytree(pathlib.Path(args.grubdir) / 'i386-pc', tree / 'boot/grub/i386-pc')
-    subprocess.run([args.mkiso, '-o', str(temp / 'boot.iso'), '-b', 'boot/grub/i386-pc/eltorito.img', str(tree)],
+    # Limine, the kernel and the initrd on a CD (firmware/limine, tools/bootiso.sh)
+    subprocess.run(['sh', str(pathlib.Path(__file__).resolve().parent / 'bootiso.sh'), str(temp / 'boot.iso'),
+                    args.kernel, str(initrd), 'textmode automount=off', args.mkiso, args.liminedir],
                    check=True, stdout=subprocess.DEVNULL)
+    initrd.unlink()
     log = temp / 'serial.log'
-    command = [args.qemu, '-cpu', 'core2duo,-lm', '-smp', str(args.cpus),
+    command = [args.qemu, '-cpu', 'core2duo', '-smp', str(args.cpus),
                '-cdrom', str(temp / 'boot.iso'), '-m', '512', '-display', 'none',
                '-serial', 'stdio', '-qmp', f'unix:{temp}/qmp,server=on,wait=off',
                '-no-reboot', '-nic', 'none']

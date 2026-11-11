@@ -91,7 +91,7 @@ static int dma_alloc(struct dma_mem *m, uint32_t size)
 {
     if (!size || size > FW_MAX_DMA || m->p) return -EINVAL;
     m->pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-    m->p = (void *)pmm_alloc_contig(m->pages);
+    m->p = pmm_alloc_pages(m->pages);
     if (!m->p) { m->pages = 0; return -ENOMEM; }
     memset(m->p, 0, m->pages * PAGE_SIZE);
     return 0;
@@ -99,7 +99,7 @@ static int dma_alloc(struct dma_mem *m, uint32_t size)
 static void dma_free(struct dma_mem *m)
 {
     for (uint32_t i = 0; m->p && i < m->pages; i++)
-        pmm_free((uint32_t)m->p + i * PAGE_SIZE);
+        pmm_free(virt_to_phys(m->p) + i * PAGE_SIZE);
     m->p = NULL; m->pages = 0;
 }
 uint32_t iwl_read32(uint32_t r) { return *(volatile uint32_t *)(iwl.regs + r); }
@@ -281,7 +281,7 @@ int iwl_trans_start_fw(void)
     struct context *c = (void *)t.ctx.p;
     s->mac = (uint16_t)iwl.hw_rev; s->size = sizeof(*s) / 4;
     s->flags = (1u << 16) | (1u << 17) | 0xc0000;
-    s->free_rbd = (uint32_t)t.rbd.p;
+    s->free_rbd = virt_to_phys(t.rbd.p);
     struct iwl_fw_sec_list *lists[] = { &iwl.fw.umac, &iwl.fw.lmac, &iwl.fw.paging };
     for (int part = 0; part < 3; part++) {
         for (uint32_t i = 0; i < lists[part]->n; i++) {
@@ -289,26 +289,26 @@ int iwl_trans_start_fw(void)
             if (dma_alloc(&t.sections[part][i], sec->len) < 0) return -ENOMEM;
             memcpy(t.sections[part][i].p, sec->data, sec->len);
             /* All three address maps have the same packed 64-entry format. */
-            uint64_t address = (uint32_t)t.sections[part][i].p;
+            uint64_t address = virt_to_phys(t.sections[part][i].p);
             memcpy((uint8_t *)s + 124 + part * 512 + i * 8, &address, 8);
         }
     }
     for (int i = 0; i < RX_COUNT; i++) {
         if (dma_alloc(&t.rx[i], PAGE_SIZE) < 0) return -ENOMEM;
-        ((struct rx_desc *)t.rbd.p)[i].addr = (uint32_t)t.rx[i].p;
+        ((struct rx_desc *)t.rbd.p)[i].addr = virt_to_phys(t.rx[i].p);
         ((struct rx_desc *)t.rbd.p)[i].id = i + 1;
     }
-    c->info = (uint32_t)t.info.p; c->scratch = (uint32_t)t.scratch.p;
-    c->scratch_size = sizeof(*s); c->cr_head = (uint32_t)t.status.p;
-    c->tr_tail = (uint32_t)t.info.p + PAGE_SIZE / 2;
-    c->cr_tail = (uint32_t)t.info.p + 3 * PAGE_SIZE / 4;
-    c->mtr = (uint32_t)t.cmd.desc.p; c->mcr = (uint32_t)t.used.p;
+    c->info = virt_to_phys(t.info.p); c->scratch = virt_to_phys(t.scratch.p);
+    c->scratch_size = sizeof(*s); c->cr_head = virt_to_phys(t.status.p);
+    c->tr_tail = virt_to_phys(t.info.p) + PAGE_SIZE / 2;
+    c->cr_tail = virt_to_phys(t.info.p) + 3 * PAGE_SIZE / 4;
+    c->mtr = virt_to_phys(t.cmd.desc.p); c->mcr = virt_to_phys(t.used.p);
     c->mtr_size = 4; /* log2(128) - 3 */ c->mcr_size = 9; /* log2(512) */
     t.cmd.id = CMD_QUEUE; t.cmd.active = 1;
     t.rx_read = 0; t.rx_write = RX_COUNT - 8; t.rx_fragment = 0;
     barrier();
-    iwl_write32(0x118, (uint32_t)t.ctx.p); iwl_write32(0x11c, 0);
-    iwl_write32(0x120, (uint32_t)t.iml.p); iwl_write32(0x124, 0);
+    iwl_write32(0x118, virt_to_phys(t.ctx.p)); iwl_write32(0x11c, 0);
+    iwl_write32(0x120, virt_to_phys(t.iml.p)); iwl_write32(0x124, 0);
     iwl_write32(0x128, iwl.fw.iml_len);
     setbits(0, 2);
     t.running = 1;
@@ -364,15 +364,15 @@ int iwl_trans_set_pnvm(const uint8_t *const chunks[], const uint32_t lens[], int
         for (int i = 0; i < n; i++) {
             if (dma_alloc(&t.pnvm[i], lens[i]) < 0) return -ENOMEM;
             memcpy(t.pnvm[i].p, chunks[i], lens[i]);
-            ((uint64_t *)t.pnvm_map.p)[i] = (uint32_t)t.pnvm[i].p;
+            ((uint64_t *)t.pnvm_map.p)[i] = virt_to_phys(t.pnvm[i].p);
         }
-        s->pnvm = (uint32_t)t.pnvm_map.p;
+        s->pnvm = virt_to_phys(t.pnvm_map.p);
     } else {
         if (n != 2) return -EINVAL;
         if (dma_alloc(&t.pnvm[0], total) < 0) return -ENOMEM;
         memcpy(t.pnvm[0].p, chunks[0], lens[0]);
         memcpy(t.pnvm[0].p + lens[0], chunks[1], lens[1]);
-        s->pnvm = (uint32_t)t.pnvm[0].p;
+        s->pnvm = virt_to_phys(t.pnvm[0].p);
     }
     s->pnvm_size = total; barrier(); return 0;
 }
@@ -406,7 +406,7 @@ static void describe(struct queue *q, uint32_t len)
     struct tfd *d = (void *)(q->desc.p + idx * sizeof(*d));
     memset(d, 0, sizeof(*d));
     d->n = len > 20 ? 2 : 1;
-    d->tb[0].addr = (uint32_t)q->buffers.p + idx * PAGE_SIZE;
+    d->tb[0].addr = virt_to_phys(q->buffers.p) + idx * PAGE_SIZE;
     d->tb[0].len = MIN(len, 20u);
     if (len > 20) { d->tb[1].addr = d->tb[0].addr + 20; d->tb[1].len = len - 20; }
     ((uint16_t *)q->bc.p)[idx] = len;
@@ -518,7 +518,7 @@ void iwl_trans_service(void)
             off += (n + 4 + 63) & ~63u;
         }
         memset(buf, 0, PAGE_SIZE);
-        ((struct rx_desc *)t.rbd.p)[t.rx_write].addr = (uint32_t)buf;
+        ((struct rx_desc *)t.rbd.p)[t.rx_write].addr = virt_to_phys(buf);
         ((struct rx_desc *)t.rbd.p)[t.rx_write].id = id;
         t.rx_write = (t.rx_write + 1) & (RX_COUNT - 1);
         t.rx_read = (t.rx_read + 1) & (RX_COUNT - 1);
@@ -538,7 +538,7 @@ int iwl_trans_alloc_txq(int sta, int tid)
     /* TX_QUEUE_CFG_RSP: queue number, flags, write pointer, reserved; 16 bits each. */
     uint8_t cmd[36] = { 0 }, rsp[8]; uint32_t got = 0;
     put32(cmd + 4, 1u << sta); cmd[8] = tid;
-    put32(cmd + 16, 4); put32(cmd + 20, (uint32_t)q->bc.p); put32(cmd + 28, (uint32_t)q->desc.p);
+    put32(cmd + 16, 4); put32(cmd + 20, virt_to_phys(q->bc.p)); put32(cmd + 28, virt_to_phys(q->desc.p));
     int r = iwl_send_cmd(GRP_DATA_PATH, 0x17, cmd, sizeof(cmd), rsp, sizeof(rsp), &got);
     if (r < 0) {
         /* The firmware may own these addresses: after a timeout, and after
@@ -581,10 +581,10 @@ int iwl_trans_tx(int h, const void *cmd, const uint8_t *f, uint32_t hlen, uint32
         struct tfd *d = (void *)(q->desc.p + idx * sizeof(*d));
         memset(d, 0, sizeof(*d));
         d->n = len > hlen ? 3 : 2;
-        d->tb[0].addr = (uint32_t)p; d->tb[0].len = 20;
-        d->tb[1].addr = (uint32_t)p + 20; d->tb[1].len = 12 + hlen;
+        d->tb[0].addr = virt_to_phys(p); d->tb[0].len = 20;
+        d->tb[1].addr = virt_to_phys(p) + 20; d->tb[1].len = 12 + hlen;
         if (len > hlen) {
-            d->tb[2].addr = (uint32_t)p + 32 + hlen;
+            d->tb[2].addr = virt_to_phys(p) + 32 + hlen;
             d->tb[2].len = len - hlen;
         }
         ((uint16_t *)q->bc.p)[idx] = len;

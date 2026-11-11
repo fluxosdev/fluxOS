@@ -25,6 +25,7 @@
 #include <uacpi/tables.h>
 #include <uacpi/utilities.h>
 #include "kernel.h"
+#include "boot.h"
 #include "acpi.h"
 #include "drivers.h"
 #include "mm.h"
@@ -63,29 +64,13 @@ static uint32_t rsdp_phys;
 
 /* ---- reading physical memory at boot ---- */
 
-static uint32_t win_phys;               /* the 4 MiB window above the identity map, mapped */
-static uint8_t *win_virt;
-
-/* A pointer to len bytes of physical memory, or NULL. Only while booting. */
+/* A pointer to len bytes of physical memory, or NULL: the tables are below
+ * 4 GiB (acpi_init() takes no others), all of which the direct map has. */
 static const void *phys(uint32_t pa, uint32_t len)
 {
     if (len > 0x400000u || pa + len < pa)
         return NULL;
-    if (pa + len <= KERNEL_SPACE_END) {
-        const void *p = (const void *)pa;       /* the kernel maps low memory one to one */
-        __asm__("" : "+r"(p));          /* (so the compiler does not take 0x40E for a null pointer) */
-        return p;
-    }
-    uint32_t base = pa & ~0x3FFFFFu;
-    if (pa + len > base + 0x400000u)
-        return NULL;                    /* across two windows: not worth it */
-    if (!win_virt || win_phys != base) {
-        win_virt = vmm_map_mmio(base, 0x400000u, 0);
-        win_phys = base;
-        if (!win_virt)
-            return NULL;
-    }
-    return win_virt + (pa - base);
+    return phys_to_virt(pa);
 }
 
 static int sum_ok(const void *p, uint32_t len)
@@ -119,8 +104,17 @@ static const uint8_t *find_rsdp_in(uint32_t start, uint32_t len)
     return NULL;
 }
 
+/* The root pointer: where the boot loader says it is (UEFI firmware keeps
+ * it anywhere, and tells only the loader), or else where a BIOS leaves it. */
 static const uint8_t *find_rsdp(void)
 {
+    if (boot.rsdp_phys && boot.rsdp_phys < 0xFFFFFF00u) {
+        const uint8_t *p = phys((uint32_t)boot.rsdp_phys, 36);
+        if (p && !memcmp(p, "RSD PTR ", 8) && sum_ok(p, 20))
+            return p;
+    }
+    if (boot.uefi)
+        return NULL;
     const uint8_t *bda = phys(0x40E, 2);         /* the BIOS data area: the EBDA's segment */
     uint32_t ebda = bda ? (uint32_t)(bda[0] | bda[1] << 8) << 4 : 0;
     const uint8_t *r = NULL;
@@ -129,7 +123,6 @@ static const uint8_t *find_rsdp(void)
     return r ? r : find_rsdp_in(0xE0000, 0x20000);
 }
 
-/* Below 1 MiB, so its virtual address is its physical one. */
 uint32_t acpi_rsdp_phys(void)
 {
     return rsdp_phys;
@@ -229,7 +222,7 @@ void acpi_init(void)
         boot_warn("ACPI: no tables found (power-off will not work)");
         return;
     }
-    rsdp_phys = (uint32_t)rsdp;
+    rsdp_phys = virt_to_phys(rsdp);
     uint8_t rev = rsdp[15];
     uint32_t rsdt_pa = rd32(rsdp, 16), xsdt_pa = 0;
     if (rev >= 2 && sum_ok(rsdp, rd32(rsdp, 20) < 36 ? 20 : 36) && rd32(rsdp, 28) == 0)

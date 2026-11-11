@@ -5,14 +5,19 @@
 #include <stdint.h>
 #include <flux/abi.h>
 
-#define SEG_KCODE 0x08
+/*
+ * The kernel is 64-bit code; processes are 32-bit code, run in the
+ * processor's compatibility mode, in the segments they always had (their
+ * selectors are part of the ABI: <flux/abi.h>).
+ */
+#define SEG_KCODE 0x08                  /* 64-bit code */
 #define SEG_KDATA 0x10
-#define SEG_UCODE (0x18 | 3)
+#define SEG_UCODE (0x18 | 3)            /* 32-bit code */
 #define SEG_UDATA (0x20 | 3)
 #define SEG_WCODE SEG_WIN_CODE          /* Win32 programs: see <flux/abi.h> */
 #define SEG_WDATA SEG_WIN_DATA
 #define SEG_WFS   SEG_WIN_FS
-#define SEG_TSS   0x40
+#define SEG_TSS   0xC8                  /* the first processor's; each takes two entries (gdt.c) */
 
 #define IRQ_BASE    32
 #define IRQ_TIMER   0
@@ -20,22 +25,37 @@
 #define IRQ_COM1    4
 #define SYSCALL_VEC 0x80
 
+/* A register of the frame under both its names: all 64 bits, and the 32 a
+ * process sees. Code that works for a process (system calls, signals) uses
+ * the short names, with the arithmetic of the 32-bit registers they are. */
+#define REG(r64, r32) union { uint64_t r64; uint32_t r32; }
+
 /* Layout produced by isr_common in entry.S, lowest address first. */
 struct trapframe {
-    uint32_t gs, fs, es, ds;
-    uint32_t edi, esi, ebp, esp_dummy, ebx, edx, ecx, eax;
-    uint32_t int_no, err_code;
-    /* pushed by the CPU */
-    uint32_t eip, cs, eflags;
-    /* only present when the trap came from ring 3 */
-    uint32_t useresp, ss;
+    uint64_t gs, fs, es, ds;            /* selectors; the kernel itself uses none of them */
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    REG(rdi, edi);
+    REG(rsi, esi);
+    REG(rbp, ebp);
+    REG(rbx, ebx);
+    REG(rdx, edx);
+    REG(rcx, ecx);
+    REG(rax, eax);
+    uint64_t int_no, err_code;
+    /* pushed by the CPU, all of it whatever was interrupted */
+    REG(rip, eip);
+    uint64_t cs;
+    REG(rflags, eflags);
+    REG(rsp, useresp);
+    uint64_t ss;
 };
+_Static_assert(sizeof(struct trapframe) == 26 * 8, "the frame entry.S builds");
 
 typedef void (*irq_handler_t)(struct trapframe *tf);
 
 void gdt_init(void);
 void gdt_init_ap(int cpu);              /* another processor: the same GDT, its own TSS */
-void tss_set_kernel_stack(uint32_t esp0);
+void tss_set_kernel_stack(uint64_t rsp0);
 
 void idt_init(void);
 void idt_init_ap(void);
@@ -46,13 +66,13 @@ void irq_unmask(int irq);
 /* A processor's state across suspend to RAM (entry.S). context_save()
  * returns 0, then 1 again when context_restore() brings it back. */
 struct cpu_context {
-    uint32_t ebx, esi, edi, ebp, esp, eip;
-    uint32_t cr0, cr3, cr4, eflags;
-    uint8_t gdtr[8], idtr[8];           /* 6 bytes each, as SGDT and SIDT store them */
+    uint64_t rbx, rbp, r12, r13, r14, r15, rsp, rip;
+    uint64_t cr0, cr3, cr4, rflags;
+    uint8_t gdtr[16], idtr[16];         /* 10 bytes each, as SGDT and SIDT store them */
 };
-_Static_assert(__builtin_offsetof(struct cpu_context, eflags) == 36 &&
-               __builtin_offsetof(struct cpu_context, gdtr) == 40 &&
-               __builtin_offsetof(struct cpu_context, idtr) == 48, "the offsets entry.S uses");
+_Static_assert(__builtin_offsetof(struct cpu_context, rflags) == 88 &&
+               __builtin_offsetof(struct cpu_context, gdtr) == 96 &&
+               __builtin_offsetof(struct cpu_context, idtr) == 112, "the offsets entry.S uses");
 int context_save(struct cpu_context *c) __attribute__((returns_twice));
 void context_restore(struct cpu_context *c) __attribute__((noreturn));
 
@@ -66,7 +86,7 @@ void gdt_set_tls(uint32_t base);          /* this processor's SEG_USER_TLS */
 
 void trapret(void);
 void forkret(void);                     /* a new process's first way out of the kernel */
-void switch_context(uint32_t *old_esp, uint32_t new_esp);
+void switch_context(uint64_t *old_sp, uint64_t new_sp);
 
 /* A copy that survives a missing user page (entry.S): 0, or -EFAULT. The
  * page fault handler turns a fault at uaccess_copy_ip into uaccess_fixup. */

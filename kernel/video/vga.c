@@ -11,10 +11,11 @@
  */
 #include "kernel.h"
 #include "drivers.h"
+#include "mm.h"
 #include "x86.h"
 #include <flux/font.h>
 
-#define VGA_MEM ((volatile uint16_t *)0xB8000)
+#define VGA_MEM ((volatile uint16_t *)phys_to_virt(0xB8000))
 #define MAX_COLS 256
 #define MAX_ROWS 96
 #define MAX_PARAMS 8
@@ -25,6 +26,7 @@ enum { ST_NORMAL, ST_ESC, ST_CSI };
 static int cols = 80, rows = 25;
 static uint16_t cells[MAX_COLS * MAX_ROWS];
 static uint16_t drawn[MAX_COLS * MAX_ROWS];     /* what the screen shows */
+static int ready;                       /* vga_init() ran: before it, only the serial port has the messages */
 static int graphics;                    /* drawing on the framebuffer */
 static int pending_scroll;              /* lines scrolled since the last flush */
 static int cursor_at = -1;              /* cell with the drawn fb cursor */
@@ -358,6 +360,8 @@ int vga_take_bell(void)
  * vga_reset_fb(), which take it. */
 void vga_write(const char *buf, uint32_t len)
 {
+    if (!ready)                         /* (the screen's memory is not mapped yet: kmain) */
+        return;
     for (uint32_t i = 0; i < len; i++)
         vga_putc(buf[i]);
     flush();
@@ -445,6 +449,7 @@ static void reset_fb(void)
 
 void vga_init(void)
 {
+    ready = 1;
     if (fb.base) {
         graphics = 1;
         cols = MIN((int)(fb.width / FONT_W), MAX_COLS);

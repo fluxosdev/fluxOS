@@ -242,21 +242,19 @@ static int wait_idle(struct ata_dev *d)
 
 /*
  * Describe the transfer to the controller. Memory the controller can
- * reach directly (identity-mapped kernel memory, dword aligned) is used
+ * reach directly (kernel memory of the direct map, dword aligned) is used
  * as is; anything else, such as user buffers, goes through the bounce
  * buffer. Returns the memory actually used.
  */
 static void *dma_prepare(struct ata_chan *ch, void *buf, uint32_t bytes, int to_device)
 {
-    uint32_t addr = (uint32_t)buf;
     void *mem = buf;
-    if (addr < 0x100000 || addr + bytes > KERNEL_SPACE_END || addr + bytes < addr ||
-        (addr & 3)) {
+    if (!virt_dma_ok(buf, bytes) || ((uintptr_t)buf & 3)) {
         mem = dma_bounce;
         if (to_device)
             memcpy(mem, buf, bytes);
-        addr = (uint32_t)mem;
     }
+    uint32_t addr = virt_to_phys(mem);
 
     /* A PRD entry may not cross a 64 KiB boundary. */
     uint32_t n = 0, left = bytes;
@@ -270,7 +268,7 @@ static void *dma_prepare(struct ata_chan *ch, void *buf, uint32_t bytes, int to_
     }
     ch->prd[(n - 1) * 2 + 1] |= PRD_EOT;
 
-    outl(ch->bm + BM_PRD, (uint32_t)ch->prd);
+    outl(ch->bm + BM_PRD, virt_to_phys(ch->prd));
     outb(ch->bm + BM_STATUS, (uint8_t)((inb(ch->bm + BM_STATUS) & 0x60) | BM_ERR | BM_INTR));
     outb(ch->bm + BM_CMD, to_device ? 0 : BM_READ);
     barrier();
@@ -777,7 +775,7 @@ static void dma_init(void)
         pmm_free(f);
     for (uint32_t f = aligned + 0x10000; f < raw + 0x20000; f += PAGE_SIZE)
         pmm_free(f);
-    dma_bounce = (uint8_t *)aligned;
+    dma_bounce = (uint8_t *)phys_to_virt(aligned);
 
     for (int c = 0; c < nchans; c++) {
         struct ata_chan *ch = &chans[c];
@@ -790,7 +788,7 @@ static void dma_init(void)
         uint32_t page = pmm_alloc();                    /* PRD tables: dword aligned */
         if (!page)
             continue;
-        ch->prd = (uint32_t *)page;
+        ch->prd = (uint32_t *)phys_to_virt(page);
         ch->bm = (uint16_t)((bar4 & 0xFFFC) + 8 * ch->chan_no);
         pci_enable(&k->pci, PCI_CMD_IO | PCI_CMD_MASTER);
     }

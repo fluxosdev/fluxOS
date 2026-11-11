@@ -13,9 +13,10 @@ struct block {
     uint32_t magic;
     uint32_t size;          /* payload bytes */
     uint32_t free;
+    uint32_t pad;
     struct block *prev, *next;
-    uint32_t pad[3];        /* header is 32 bytes: payload stays aligned */
 };
+_Static_assert(sizeof(struct block) == 32, "the header is 32 bytes: payload stays aligned");
 
 static struct block *heap_head;
 static uint32_t heap_size;
@@ -42,7 +43,7 @@ void heap_init(void)
     if (!base)
         panic("heap: cannot reserve %u KiB", size / 1024);
 
-    heap_head = (struct block *)base;
+    heap_head = phys_to_virt(base);
     heap_head->magic = HEAP_MAGIC;
     heap_head->size = size - sizeof(struct block);
     heap_head->free = 1;

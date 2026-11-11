@@ -184,7 +184,7 @@ static int gart_init(void)
     gart.dummy = pmm_alloc();
     if (!gart.dummy)
         return -1;
-    memset((void *)gart.dummy, 0, PAGE_SIZE);
+    memset(phys_to_virt(gart.dummy), 0, PAGE_SIZE);
     gart.pt = (volatile uint32_t *)(rcp.cpu + PT_OFF);
     for (uint32_t i = 0; i < GTT_PAGES; i++)
         gart_set(i, 0);
@@ -563,7 +563,7 @@ static int gart_test(void)
     uint32_t page = pmm_alloc();
     if (!page)
         return -1;
-    uint32_t *p = (uint32_t *)page, *a = (uint32_t *)(rcp.cpu + TEST_OFF);
+    uint32_t *p = (uint32_t *)phys_to_virt(page), *a = (uint32_t *)(rcp.cpu + TEST_OFF);
     for (uint32_t i = 0; i < 1024; i++)
         p[i] = pattern(i);
     memset(a, 0, TW * TH * 4);

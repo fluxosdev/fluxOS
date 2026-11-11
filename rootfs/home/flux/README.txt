@@ -1,4 +1,4 @@
-Welcome to fluxOS 0.4.0
+Welcome to fluxOS 0.5.0
 =======================
 
 fluxOS is an experimental hobby operating system, built with AI assistance

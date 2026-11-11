@@ -265,6 +265,6 @@ void clock_open(void)
 void datetime_init(void)
 {
     char dir[128], value[16];
-    if (grubenv_boot_dir(dir, sizeof(dir)) && grubenv_get(dir, "fluxos_tz", value, sizeof(value)) > 0)
+    if (bootenv_boot_dir(dir, sizeof(dir)) && bootenv_get(dir, "fluxos_tz", value, sizeof(value)) > 0)
         tz_set(atoi(value));
 }

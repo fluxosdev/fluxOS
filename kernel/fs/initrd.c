@@ -1,5 +1,5 @@
 /*
- * Unpacks the ustar archive GRUB loaded as a module into the ramfs.
+ * Unpacks the ustar archive the boot loader loaded as a module into the ramfs.
  */
 #include "kernel.h"
 #include "mm.h"

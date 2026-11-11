@@ -2,6 +2,11 @@
  * System call entry points. Arguments arrive in ebx, ecx, edx, esi, edi;
  * every user pointer is validated (and the stack demand-grown) before
  * the kernel touches it.
+ *
+ * Processes are 32-bit programs and the kernel is 64-bit code: what a
+ * process passes is 32 bits wide, its addresses included (UPTR() makes
+ * a pointer of one), and anything read from its memory has its layout,
+ * not the kernel's: a pointer there is four bytes.
  */
 #include "kernel.h"
 #include "blkdev.h"
@@ -21,10 +26,10 @@ typedef int (*syscall_fn)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 
 static int user_check(const void *ptr, uint32_t len)
 {
-    uint32_t a = (uint32_t)ptr;
+    uint32_t a = (uint32_t)(uintptr_t)ptr;
     if (!len)
         return 0;
-    if (a < USER_BASE || a >= USER_TOP || len > USER_TOP - a)
+    if ((uintptr_t)ptr < USER_BASE || (uintptr_t)ptr >= USER_TOP || len > USER_TOP - a)
         return -EFAULT;
     for (uint32_t pg = ALIGN_DOWN(a, PAGE_SIZE); pg < a + len; pg += PAGE_SIZE)
         if (!vmm_translate(current->pd, pg) && !proc_grow_stack(pg))
@@ -34,10 +39,10 @@ static int user_check(const void *ptr, uint32_t len)
 
 static int user_check_w(void *ptr, uint32_t len)
 {
-    uint32_t a = (uint32_t)ptr;
+    uint32_t a = (uint32_t)(uintptr_t)ptr;
     if (!len)
         return 0;
-    if (a < USER_BASE || a >= USER_TOP || len > USER_TOP - a)
+    if ((uintptr_t)ptr < USER_BASE || (uintptr_t)ptr >= USER_TOP || len > USER_TOP - a)
         return -EFAULT;
     for (uint32_t pg = ALIGN_DOWN(a, PAGE_SIZE); pg < a + len; pg += PAGE_SIZE)
         if (!vmm_write_ok(current->pd, pg) && !proc_page_fault(pg, 1))
@@ -68,10 +73,10 @@ int copy_to_user(void *udst, const void *src, uint32_t n)
  * little past the NUL. */
 static int copy_str(char *dst, const char *src, uint32_t max)
 {
-    uint32_t a = (uint32_t)src, i = 0;
+    uint32_t a = (uint32_t)(uintptr_t)src, i = 0;
     while (i < max) {
         uint32_t n = MIN(MIN(max - i, PAGE_SIZE - (a & 0xFFF)), 256u);
-        if (copy_from_user(dst + i, (const void *)a, n) < 0)
+        if (copy_from_user(dst + i, UPTR(a), n) < 0)
             return -EFAULT;
         for (uint32_t end = i + n; i < end; i++)
             if (!dst[i])
@@ -102,7 +107,7 @@ static int user_path(char **out, uint32_t uptr)
     int r = path_buf(&b);
     if (r < 0)
         return r;
-    r = copy_str(b, (const char *)uptr, PATH_MAX);
+    r = copy_str(b, (const char *)UPTR(uptr), PATH_MAX);
     if (r < 0)
         return r;
     *out = b;
@@ -212,14 +217,14 @@ static int copy_vector(uint32_t uvec, char **kvec, int max, char **pool, uint32_
     }
     for (;; n++) {
         uint32_t slot = uvec + (uint32_t)n * 4;
-        const char *s;
-        if (copy_from_user(&s, (const void *)slot, 4) < 0)
+        uint32_t s;                     /* (a pointer of the process's: 32 bits) */
+        if (copy_from_user(&s, UPTR(slot), 4) < 0)
             return -EFAULT;
         if (!s)
             break;
         if (n >= max)
             return -E2BIG;
-        int len = copy_str(*pool, s, *pool_left);
+        int len = copy_str(*pool, UPTR(s), *pool_left);
         if (len < 0)
             return len == -ENAMETOOLONG ? -E2BIG : len;
         kvec[n] = *pool;
@@ -264,11 +269,11 @@ static int sys_execve(uint32_t upath, uint32_t uargv, uint32_t uenvp, uint32_t d
 static int sys_waitpid(uint32_t pid, uint32_t ustatus, uint32_t options, uint32_t d, uint32_t e)
 {
     (void)d; (void)e;
-    if (ustatus && user_check_w((void *)ustatus, sizeof(int)) < 0)
+    if (ustatus && user_check_w(UPTR(ustatus), sizeof(int)) < 0)
         return -EFAULT;
     int status = 0;
     int r = do_waitpid((int)pid, &status, (int)options);
-    if (r > 0 && ustatus && copy_to_user((void *)ustatus, &status, sizeof(status)) < 0)
+    if (r > 0 && ustatus && copy_to_user(UPTR(ustatus), &status, sizeof(status)) < 0)
         return -EFAULT;
     return r;
 }
@@ -354,9 +359,9 @@ static int sys_setitimer(uint32_t which, uint32_t uvalue, uint32_t uold, uint32_
 {
     (void)d; (void)e;
     struct flux_itimer v = { 0, 0 };
-    if (uvalue && copy_from_user(&v, (const void *)uvalue, sizeof(v)) < 0)
+    if (uvalue && copy_from_user(&v, UPTR(uvalue), sizeof(v)) < 0)
         return -EFAULT;
-    if (uold && user_check_w((void *)uold, sizeof(v)) < 0)
+    if (uold && user_check_w(UPTR(uold), sizeof(v)) < 0)
         return -EFAULT;
     uint32_t ov, oi;
     int r = proc_setitimer((int)which, ms_to_ticks(v.value_ms), ms_to_ticks(v.interval_ms), &ov, &oi);
@@ -364,7 +369,7 @@ static int sys_setitimer(uint32_t which, uint32_t uvalue, uint32_t uold, uint32_
         return r;
     if (uold) {
         struct flux_itimer o = { ov * (1000 / HZ), oi * (1000 / HZ) };
-        if (copy_to_user((void *)uold, &o, sizeof(o)) < 0)
+        if (copy_to_user(UPTR(uold), &o, sizeof(o)) < 0)
             return -EFAULT;
     }
     return 0;
@@ -373,7 +378,7 @@ static int sys_setitimer(uint32_t which, uint32_t uvalue, uint32_t uold, uint32_
 static int sys_getitimer(uint32_t which, uint32_t uout, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)c; (void)d; (void)e;
-    if (user_check_w((void *)uout, sizeof(struct flux_itimer)) < 0)
+    if (user_check_w(UPTR(uout), sizeof(struct flux_itimer)) < 0)
         return -EFAULT;
     struct proc *g = current->leader;
     struct flux_itimer o;
@@ -392,14 +397,14 @@ static int sys_getitimer(uint32_t which, uint32_t uout, uint32_t c, uint32_t d, 
     spin_unlock(&sched_lock);
     o.value_ms *= 1000 / HZ;
     o.interval_ms *= 1000 / HZ;
-    return copy_to_user((void *)uout, &o, sizeof(o)) < 0 ? -EFAULT : 0;
+    return copy_to_user(UPTR(uout), &o, sizeof(o)) < 0 ? -EFAULT : 0;
 }
 
 static int sys_sigpending(uint32_t uset, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)b; (void)c; (void)d; (void)e;
     uint32_t set = __atomic_load_n(&current->sig_pending, __ATOMIC_RELAXED);
-    return copy_to_user((void *)uset, &set, sizeof(set)) < 0 ? -EFAULT : 0;
+    return copy_to_user(UPTR(uset), &set, sizeof(set)) < 0 ? -EFAULT : 0;
 }
 
 static int sys_sigaltstack(uint32_t uss, uint32_t uold, uint32_t c, uint32_t d, uint32_t e)
@@ -413,7 +418,7 @@ static int sys_sigaltstack(uint32_t uss, uint32_t uold, uint32_t c, uint32_t d, 
     old.size = p->alt_size;
     old.flags = !p->alt_size ? SS_DISABLE : on ? SS_ONSTACK : 0;
     if (uss) {
-        if (copy_from_user(&ss, (const void *)uss, sizeof(ss)) < 0)
+        if (copy_from_user(&ss, UPTR(uss), sizeof(ss)) < 0)
             return -EFAULT;
         if (on)
             return -EPERM;              /* not while running on it */
@@ -430,7 +435,7 @@ static int sys_sigaltstack(uint32_t uss, uint32_t uold, uint32_t c, uint32_t d, 
             p->alt_size = ss.size;
         }
     }
-    if (uold && copy_to_user((void *)uold, &old, sizeof(old)) < 0)
+    if (uold && copy_to_user(UPTR(uold), &old, sizeof(old)) < 0)
         return -EFAULT;
     return 0;
 }
@@ -544,13 +549,13 @@ static int sys_sigaction(uint32_t sig, uint32_t uact, uint32_t uoact, uint32_t d
         return -EINVAL;
     struct flux_sigaction act;
     if (uact) {
-        if (copy_from_user(&act, (const void *)uact, sizeof(act)) < 0)
+        if (copy_from_user(&act, UPTR(uact), sizeof(act)) < 0)
             return -EFAULT;
         if (act.fsa_handler != SIGDISP_DFL && act.fsa_handler != SIGDISP_IGN &&
             (act.fsa_handler < USER_BASE || act.fsa_handler >= USER_TOP))
             return -EINVAL;
     }
-    if (uoact && user_check_w((void *)uoact, sizeof(struct flux_sigaction)) < 0)
+    if (uoact && user_check_w(UPTR(uoact), sizeof(struct flux_sigaction)) < 0)
         return -EFAULT;
 
     struct proc *p = current;
@@ -573,7 +578,7 @@ static int sys_sigaction(uint32_t sig, uint32_t uact, uint32_t uoact, uint32_t d
         }
     }
     spin_unlock(&sched_lock);
-    if (uoact && copy_to_user((void *)uoact, &old, sizeof(old)) < 0)
+    if (uoact && copy_to_user(UPTR(uoact), &old, sizeof(old)) < 0)
         return -EFAULT;
     return 0;
 }
@@ -582,9 +587,9 @@ static int sys_sigprocmask(uint32_t how, uint32_t uset, uint32_t uoset, uint32_t
 {
     (void)d; (void)e;
     uint32_t set = 0;
-    if (uset && copy_from_user(&set, (const void *)uset, sizeof(set)) < 0)
+    if (uset && copy_from_user(&set, UPTR(uset), sizeof(set)) < 0)
         return -EFAULT;
-    if (uoset && user_check_w((void *)uoset, sizeof(uint32_t)) < 0)
+    if (uoset && user_check_w(UPTR(uoset), sizeof(uint32_t)) < 0)
         return -EFAULT;
 
     struct proc *p = current;
@@ -602,7 +607,7 @@ static int sys_sigprocmask(uint32_t how, uint32_t uset, uint32_t uoset, uint32_t
         p->sig_blocked &= ~((1u << SIGKILL) | (1u << SIGSTOP) | 1u);
     }
     spin_unlock(&sched_lock);
-    if (uoset && copy_to_user((void *)uoset, &old, sizeof(old)) < 0)
+    if (uoset && copy_to_user(UPTR(uoset), &old, sizeof(old)) < 0)
         return -EFAULT;
     return 0;
 }
@@ -617,7 +622,7 @@ static int sys_sigreturn(uint32_t uctx, uint32_t b, uint32_t c, uint32_t d, uint
 {
     (void)b; (void)c; (void)d; (void)e;
     struct flux_sigcontext sc;
-    if (copy_from_user(&sc, (const void *)uctx, sizeof(sc)) < 0)
+    if (copy_from_user(&sc, UPTR(uctx), sizeof(sc)) < 0)
         return -EFAULT;
     /* The segments come back too: the flat ones, or a Win32 program's
      * based ones (gdt.c), whose offsets stay within the 2 GiB. Anything
@@ -666,7 +671,7 @@ static int sys_mmap(uint32_t uargs, uint32_t b, uint32_t c, uint32_t d, uint32_t
 {
     (void)b; (void)c; (void)d; (void)e;
     struct flux_mmap_args a;
-    if (copy_from_user(&a, (const void *)uargs, sizeof(a)) < 0)
+    if (copy_from_user(&a, UPTR(uargs), sizeof(a)) < 0)
         return -EFAULT;
     if (!a.len || (a.flags & MAP_KFRAMES))
         return -EINVAL;
@@ -709,7 +714,7 @@ static int sys_mmap(uint32_t uargs, uint32_t b, uint32_t c, uint32_t d, uint32_t
         if (foff < f->vn->size) {
             uint32_t n = MIN((uint32_t)PAGE_SIZE, f->vn->size - foff);
             int nr = vfs_read(f->vn, page, foff, n);
-            if (nr > 0 && copy_to_user((void *)(base + off), page, (uint32_t)nr) < 0)
+            if (nr > 0 && copy_to_user(UPTR(base + off), page, (uint32_t)nr) < 0)
                 nr = -EFAULT;
             if (nr < 0) {
                 vfs_unlock();
@@ -843,9 +848,9 @@ static int sys_read(uint32_t fd, uint32_t buf, uint32_t n, uint32_t d, uint32_t 
     struct file *f = get_file(fd);
     if (!f)
         return -EBADF;
-    if (user_check_w((void *)buf, n) < 0)
+    if (user_check_w(UPTR(buf), n) < 0)
         return -EFAULT;
-    return file_io(f, (uint8_t *)buf, n, 0);
+    return file_io(f, (uint8_t *)UPTR(buf), n, 0);
 }
 
 static int sys_write(uint32_t fd, uint32_t buf, uint32_t n, uint32_t d, uint32_t e)
@@ -854,9 +859,9 @@ static int sys_write(uint32_t fd, uint32_t buf, uint32_t n, uint32_t d, uint32_t
     struct file *f = get_file(fd);
     if (!f)
         return -EBADF;
-    if (user_check((void *)buf, n) < 0)
+    if (user_check(UPTR(buf), n) < 0)
         return -EFAULT;
-    return file_io(f, (uint8_t *)buf, n, 1);
+    return file_io(f, (uint8_t *)UPTR(buf), n, 1);
 }
 
 static int sys_open(uint32_t upath, uint32_t flags, uint32_t mode, uint32_t d, uint32_t e)
@@ -1001,7 +1006,7 @@ static int sys_fcntl(uint32_t fd, uint32_t cmd, uint32_t arg, uint32_t d, uint32
 static int sys_pipe(uint32_t ufds, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)b; (void)c; (void)d; (void)e;
-    if (user_check_w((void *)ufds, 2 * sizeof(int)) < 0)
+    if (user_check_w(UPTR(ufds), 2 * sizeof(int)) < 0)
         return -EFAULT;
     struct file *rd, *wr;
     int r = pipe_create(&rd, &wr);
@@ -1010,7 +1015,7 @@ static int sys_pipe(uint32_t ufds, uint32_t b, uint32_t c, uint32_t d, uint32_t 
     int fd0 = alloc_fd(rd);
     int fd1 = fd0 >= 0 ? alloc_fd(wr) : -EMFILE;
     int fds[2] = { fd0, fd1 };
-    int r2 = fd1 < 0 ? -EMFILE : copy_to_user((void *)ufds, fds, sizeof(fds));
+    int r2 = fd1 < 0 ? -EMFILE : copy_to_user(UPTR(ufds), fds, sizeof(fds));
     if (r2 < 0) {
         /* A slot another thread already closed gave its file back itself. */
         if (fd0 < 0 || fd_take_back(fd0, rd))
@@ -1025,7 +1030,7 @@ static int sys_pipe(uint32_t ufds, uint32_t b, uint32_t c, uint32_t d, uint32_t 
 static int sys_openpty(uint32_t ufds, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)b; (void)c; (void)d; (void)e;
-    if (user_check_w((void *)ufds, 2 * sizeof(int)) < 0)
+    if (user_check_w(UPTR(ufds), 2 * sizeof(int)) < 0)
         return -EFAULT;
     struct file *master, *slave;
     int r = pty_create(&master, &slave);
@@ -1034,7 +1039,7 @@ static int sys_openpty(uint32_t ufds, uint32_t b, uint32_t c, uint32_t d, uint32
     int fd0 = alloc_fd(master);
     int fd1 = fd0 >= 0 ? alloc_fd(slave) : -EMFILE;
     int fds[2] = { fd0, fd1 };
-    int r2 = fd1 < 0 ? -EMFILE : copy_to_user((void *)ufds, fds, sizeof(fds));
+    int r2 = fd1 < 0 ? -EMFILE : copy_to_user(UPTR(ufds), fds, sizeof(fds));
     if (r2 < 0) {
         /* A slot another thread already closed gave its file back itself. */
         if (fd0 < 0 || fd_take_back(fd0, master))
@@ -1057,11 +1062,11 @@ static int sys_poll(uint32_t ufds, uint32_t nfds, uint32_t timeout, uint32_t d, 
      * front, so that the results can be written back after the wait. */
     struct pollfd fds[POLL_MAX];
     uint32_t bytes = nfds * sizeof(fds[0]);
-    if (user_check_w((void *)ufds, bytes) < 0 ||
-        (bytes && copy_from_user(fds, (const void *)ufds, bytes) < 0))
+    if (user_check_w(UPTR(ufds), bytes) < 0 ||
+        (bytes && copy_from_user(fds, UPTR(ufds), bytes) < 0))
         return -EFAULT;
     int r = do_poll(fds, nfds, (int)timeout);
-    if (bytes && copy_to_user((void *)ufds, fds, bytes) < 0)
+    if (bytes && copy_to_user(UPTR(ufds), fds, bytes) < 0)
         return -EFAULT;
     return r;
 }
@@ -1120,7 +1125,7 @@ static int sys_llseek(uint32_t fd, uint32_t hi, uint32_t lo, uint32_t uresult, u
     struct file *f = get_file(fd);
     if (!f)
         return -EBADF;
-    if (user_check_w((void *)uresult, sizeof(uint64_t)) < 0)
+    if (user_check_w(UPTR(uresult), sizeof(uint64_t)) < 0)
         return -EFAULT;
     uint64_t pos;
     int r = seek(f, (int64_t)((uint64_t)hi << 32 | lo), whence, &pos);
@@ -1128,13 +1133,13 @@ static int sys_llseek(uint32_t fd, uint32_t hi, uint32_t lo, uint32_t uresult, u
         return r;
     if (r == 0)
         f->off = pos;
-    return copy_to_user((void *)uresult, &pos, sizeof(pos));
+    return copy_to_user(UPTR(uresult), &pos, sizeof(pos));
 }
 
 static int stat_path(uint32_t upath, uint32_t ust, int follow)
 {
     COPY_PATH(path, upath);
-    if (user_check_w((void *)ust, sizeof(struct stat)) < 0)
+    if (user_check_w(UPTR(ust), sizeof(struct stat)) < 0)
         return -EFAULT;
     struct vnode *vn;
     int r = vfs_lookup(path, current->leader->cwd, follow, &vn);
@@ -1143,7 +1148,7 @@ static int stat_path(uint32_t upath, uint32_t ust, int follow)
     struct stat st;
     memset(&st, 0, sizeof(st));
     vfs_stat(vn, &st);
-    return copy_to_user((void *)ust, &st, sizeof(st));
+    return copy_to_user(UPTR(ust), &st, sizeof(st));
 }
 
 static int sys_stat(uint32_t upath, uint32_t ust, uint32_t c, uint32_t d, uint32_t e)
@@ -1165,13 +1170,13 @@ static int sys_readlink(uint32_t upath, uint32_t ubuf, uint32_t size, uint32_t d
     if (!size)
         return -EINVAL;
     size = MIN(size, (uint32_t)PATH_MAX);
-    if (user_check_w((void *)ubuf, size) < 0)
+    if (user_check_w(UPTR(ubuf), size) < 0)
         return -EFAULT;
     char *tmp = kmalloc(size);
     if (!tmp)
         return -ENOMEM;
     int r = vfs_readlink(path, current->leader->cwd, tmp, size);
-    if (r > 0 && copy_to_user((void *)ubuf, tmp, (uint32_t)r) < 0)
+    if (r > 0 && copy_to_user(UPTR(ubuf), tmp, (uint32_t)r) < 0)
         r = -EFAULT;
     kfree(tmp);
     return r;
@@ -1231,7 +1236,7 @@ static int sys_fstat(uint32_t fd, uint32_t ust, uint32_t c, uint32_t d, uint32_t
     struct file *f = get_file(fd);
     if (!f)
         return -EBADF;
-    if (user_check_w((void *)ust, sizeof(struct stat)) < 0)
+    if (user_check_w(UPTR(ust), sizeof(struct stat)) < 0)
         return -EFAULT;
     struct stat st;
     memset(&st, 0, sizeof(st));
@@ -1245,7 +1250,7 @@ static int sys_fstat(uint32_t fd, uint32_t ust, uint32_t c, uint32_t d, uint32_t
     } else {
         vfs_stat(f->vn, &st);
     }
-    return copy_to_user((void *)ust, &st, sizeof(st));
+    return copy_to_user(UPTR(ust), &st, sizeof(st));
 }
 
 static int sys_chdir(uint32_t upath, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
@@ -1292,7 +1297,7 @@ static int sys_getcwd(uint32_t ubuf, uint32_t size, uint32_t c, uint32_t d, uint
     uint32_t len = strlen(path) + 1;
     if (len > size)
         return -ERANGE;
-    if (copy_to_user((void *)ubuf, path, len) < 0)
+    if (copy_to_user(UPTR(ubuf), path, len) < 0)
         return -EFAULT;
     return (int)len;
 }
@@ -1305,7 +1310,7 @@ static int sys_getdents(uint32_t fd, uint32_t ubuf, uint32_t count, uint32_t d, 
         return -EBADF;
     if (f->type != FT_VNODE || f->vn->type != VN_DIR)
         return -ENOTDIR;
-    if (user_check_w((void *)ubuf, count) < 0)
+    if (user_check_w(UPTR(ubuf), count) < 0)
         return -EFAULT;
     uint32_t used = 0;
     struct dirent de;
@@ -1315,7 +1320,7 @@ static int sys_getdents(uint32_t fd, uint32_t ubuf, uint32_t count, uint32_t d, 
         int r = vfs_dirent(f->vn, (uint32_t)f->off, after, &de);
         if (r <= 0)
             return used ? (int)used : r;
-        if (copy_to_user((uint8_t *)ubuf + used, &de, sizeof(de)) < 0)
+        if (copy_to_user((uint8_t *)UPTR(ubuf) + used, &de, sizeof(de)) < 0)
             return used ? (int)used : -EFAULT;
         used += sizeof(de);
         if (f->off++ >= 2 && (f->dir_after || (f->dir_after = kmalloc(NAME_MAX + 1)))) {
@@ -1408,7 +1413,7 @@ static int sys_utime(uint32_t upath, uint32_t utimes, uint32_t c, uint32_t d, ui
     uint32_t mtime = time_now();
     if (utimes) {
         struct flux_utimbuf tb;
-        if (copy_from_user(&tb, (const void *)utimes, sizeof(tb)) < 0)
+        if (copy_from_user(&tb, UPTR(utimes), sizeof(tb)) < 0)
             return -EFAULT;
         mtime = tb.modtime;
     }
@@ -1425,7 +1430,7 @@ static int sys_times(uint32_t ubuf, uint32_t b, uint32_t c, uint32_t d, uint32_t
             .tms_cutime = current->leader->child_ticks, /* waitpid() keeps it on the leader */
             .tms_cstime = 0,
         };
-        if (copy_to_user((void *)ubuf, &tms, sizeof(tms)) < 0)
+        if (copy_to_user(UPTR(ubuf), &tms, sizeof(tms)) < 0)
             return -EFAULT;
     }
     return (int)ticks;
@@ -1456,7 +1461,7 @@ static int copy_sockaddr(uint32_t uaddr, uint32_t len, struct sockaddr_in *out)
 {
     if (len < sizeof(*out))
         return -EINVAL;
-    return copy_from_user(out, (const void *)uaddr, sizeof(*out)) < 0 ? -EFAULT : 0;
+    return copy_from_user(out, UPTR(uaddr), sizeof(*out)) < 0 ? -EFAULT : 0;
 }
 
 static int install_socket(struct socket *s)
@@ -1486,8 +1491,8 @@ static int copy_unix_path(uint32_t uaddr, uint32_t len, char *path)
         return -EINVAL;
     uint32_t n = MIN(len - 2, (uint32_t)UNIX_PATH_MAX - 1);
     uint16_t family;
-    if (copy_from_user(&family, (const void *)uaddr, 2) < 0 ||
-        copy_from_user(path, (const char *)uaddr + 2, n) < 0)
+    if (copy_from_user(&family, UPTR(uaddr), 2) < 0 ||
+        copy_from_user(path, (const char *)UPTR(uaddr) + 2, n) < 0)
         return -EFAULT;
     if (family != AF_UNIX)
         return -EAFNOSUPPORT;
@@ -1583,14 +1588,14 @@ static int sys_accept(uint32_t fd, uint32_t uaddr, uint32_t c, uint32_t d, uint3
     int r = get_socket_file(fd, &s, &f);
     if (r < 0)
         return r;
-    if (uaddr && user_check_w((void *)uaddr, sizeof(peer)) < 0)
+    if (uaddr && user_check_w(UPTR(uaddr), sizeof(peer)) < 0)
         return -EFAULT;
     r = sock_accept(s, &conn, &peer, (f->flags & O_NONBLOCK) != 0);
     if (r < 0)
         return r;
     r = install_socket(conn);
     if (r >= 0 && uaddr)
-        copy_to_user((void *)uaddr, &peer, sizeof(peer));  /* checked above; the connection is the caller's now */
+        copy_to_user(UPTR(uaddr), &peer, sizeof(peer));  /* checked above; the connection is the caller's now */
     return r;
 }
 
@@ -1607,7 +1612,7 @@ static int sys_read(uint32_t fd, uint32_t buf, uint32_t n, uint32_t d, uint32_t 
  */
 static int unix_io(struct file *f, uint32_t buf, uint32_t n, uint32_t flags, int write)
 {
-    if ((write ? user_check((void *)buf, n) : user_check_w((void *)buf, n)) < 0)
+    if ((write ? user_check(UPTR(buf), n) : user_check_w(UPTR(buf), n)) < 0)
         return -EFAULT;
     if (!write && (flags & MSG_PEEK)) {
         uint32_t len = MIN(n, (uint32_t)PIPE_SIZE);
@@ -1616,16 +1621,16 @@ static int unix_io(struct file *f, uint32_t buf, uint32_t n, uint32_t flags, int
             return -ENOMEM;
         int nonblock = (flags & MSG_DONTWAIT) || (f->flags & O_NONBLOCK);
         int r = file_peek(f, kbuf, len, nonblock);
-        if (r > 0 && copy_to_user((void *)buf, kbuf, (uint32_t)r) < 0)
+        if (r > 0 && copy_to_user(UPTR(buf), kbuf, (uint32_t)r) < 0)
             r = -EFAULT;
         kfree(kbuf);
         return r;
     }
     if (!(flags & MSG_DONTWAIT))
-        return file_io(f, (uint8_t *)buf, n, write);
+        return file_io(f, (uint8_t *)UPTR(buf), n, write);
     struct file once = *f;
     once.flags |= O_NONBLOCK;
-    return file_io(&once, (uint8_t *)buf, n, write);
+    return file_io(&once, (uint8_t *)UPTR(buf), n, write);
 }
 
 static int sys_sendto(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, uint32_t uaddr)
@@ -1639,7 +1644,7 @@ static int sys_sendto(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, uin
     int r = get_socket_file(fd, &s, &f);
     if (r < 0)
         return r;
-    if (user_check((void *)buf, n) < 0)
+    if (user_check(UPTR(buf), n) < 0)
         return -EFAULT;
     if (uaddr && (r = copy_sockaddr(uaddr, sizeof(sin), &sin)) < 0)
         return r;
@@ -1652,7 +1657,7 @@ static int sys_sendto(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, uin
     uint32_t done = 0;
     do {
         uint32_t chunk = MIN(n - done, (uint32_t)IO_CHUNK);
-        if (copy_from_user(kbuf, (const uint8_t *)buf + done, chunk) < 0) {
+        if (copy_from_user(kbuf, (const uint8_t *)UPTR(buf) + done, chunk) < 0) {
             r = -EFAULT;
             break;
         }
@@ -1678,7 +1683,7 @@ static int sys_recvfrom(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, u
     int r = get_socket_file(fd, &s, &f);
     if (r < 0)
         return r;
-    if (user_check_w((void *)buf, n) < 0 || (uaddr && user_check_w((void *)uaddr, sizeof(sin)) < 0))
+    if (user_check_w(UPTR(buf), n) < 0 || (uaddr && user_check_w(UPTR(uaddr), sizeof(sin)) < 0))
         return -EFAULT;
     int sflags = (int)flags | ((f->flags & O_NONBLOCK) ? MSG_DONTWAIT : 0);
     /* Up to a chunk, received into a kernel buffer as by file_io(). */
@@ -1686,11 +1691,11 @@ static int sys_recvfrom(uint32_t fd, uint32_t buf, uint32_t n, uint32_t flags, u
     if (!kbuf)
         return -ENOMEM;
     r = sock_recvfrom(s, kbuf, MIN(n, (uint32_t)IO_CHUNK), sflags, uaddr ? &sin : NULL);
-    if (r > 0 && copy_to_user((void *)buf, kbuf, (uint32_t)r) < 0)
+    if (r > 0 && copy_to_user(UPTR(buf), kbuf, (uint32_t)r) < 0)
         r = -EFAULT;                    /* (the data is taken, and lost) */
     kfree(kbuf);
     if (r >= 0 && uaddr)
-        copy_to_user((void *)uaddr, &sin, sizeof(sin));    /* checked above; the data is already taken */
+        copy_to_user(UPTR(uaddr), &sin, sizeof(sin));    /* checked above; the data is already taken */
     return r;
 }
 
@@ -1711,11 +1716,11 @@ static int sys_sockname(uint32_t fd, uint32_t uaddr, uint32_t peer, uint32_t d, 
     int r = get_socket(fd, &s);
     if (r < 0)
         return r;
-    if (user_check_w((void *)uaddr, sizeof(sin)) < 0)
+    if (user_check_w(UPTR(uaddr), sizeof(sin)) < 0)
         return -EFAULT;
     r = sock_name(s, (int)peer, &sin);
     if (r == 0)
-        r = copy_to_user((void *)uaddr, &sin, sizeof(sin));
+        r = copy_to_user(UPTR(uaddr), &sin, sizeof(sin));
     return r;
 }
 
@@ -1724,14 +1729,14 @@ static int sys_netinfo(uint32_t ubuf, uint32_t b, uint32_t c, uint32_t d, uint32
     (void)b; (void)c; (void)d; (void)e;
     struct netinfo ni;
     net_get_info(&ni);
-    return copy_to_user((void *)ubuf, &ni, sizeof(ni));
+    return copy_to_user(UPTR(ubuf), &ni, sizeof(ni));
 }
 
 static int sys_netconf(uint32_t ubuf, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)b; (void)c; (void)d; (void)e;
     struct netinfo ni;
-    if (copy_from_user(&ni, (const void *)ubuf, sizeof(ni)) < 0)
+    if (copy_from_user(&ni, UPTR(ubuf), sizeof(ni)) < 0)
         return -EFAULT;
     return net_configure(&ni);
 }
@@ -1744,7 +1749,7 @@ static int sys_mount(uint32_t usrc, uint32_t utarget, uint32_t utype, uint32_t d
     COPY_PATH(src, usrc);
     COPY_PATH(target, utarget);
     char type[16] = "auto";
-    if (utype && copy_str(type, (const char *)utype, sizeof(type)) < 0)
+    if (utype && copy_str(type, (const char *)UPTR(utype), sizeof(type)) < 0)
         return -EINVAL;
     return vfs_mount(src, target, type, current->leader->cwd);
 }
@@ -1760,7 +1765,7 @@ static int sys_statfs(uint32_t upath, uint32_t ubuf, uint32_t c, uint32_t d, uin
 {
     (void)c; (void)d; (void)e;
     COPY_PATH(path, upath);
-    if (user_check_w((void *)ubuf, sizeof(struct statfs)) < 0)
+    if (user_check_w(UPTR(ubuf), sizeof(struct statfs)) < 0)
         return -EFAULT;
     struct vnode *vn;
     int r = vfs_resolve(path, current->leader->cwd, &vn);
@@ -1768,21 +1773,21 @@ static int sys_statfs(uint32_t upath, uint32_t ubuf, uint32_t c, uint32_t d, uin
         return r;
     struct statfs st;
     r = vfs_statfs(vn, &st);
-    return r < 0 ? r : copy_to_user((void *)ubuf, &st, sizeof(st));
+    return r < 0 ? r : copy_to_user(UPTR(ubuf), &st, sizeof(st));
 }
 
 static int sys_getmounts(uint32_t ubuf, uint32_t size, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)c; (void)d; (void)e;
     size = MIN(size, 8192u);
-    if (user_check_w((void *)ubuf, size) < 0)
+    if (user_check_w(UPTR(ubuf), size) < 0)
         return -EFAULT;
     char *tmp = kmalloc(size + 1);
     if (!tmp)
         return -ENOMEM;
     int n = vfs_mounts_text(tmp, size + 1);
     n = MIN(n, (int)size);
-    if (copy_to_user((void *)ubuf, tmp, (uint32_t)n) < 0)
+    if (copy_to_user(UPTR(ubuf), tmp, (uint32_t)n) < 0)
         n = -EFAULT;
     kfree(tmp);
     return n;
@@ -1791,7 +1796,7 @@ static int sys_getmounts(uint32_t ubuf, uint32_t size, uint32_t c, uint32_t d, u
 static int sys_blkinfo(uint32_t idx, uint32_t ubuf, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)c; (void)d; (void)e;
-    if (user_check_w((void *)ubuf, sizeof(struct blkinfo)) < 0)
+    if (user_check_w(UPTR(ubuf), sizeof(struct blkinfo)) < 0)
         return -EFAULT;
     struct blockdev *bd = blk_get((int)idx);
     if (!bd)
@@ -1810,17 +1815,17 @@ static int sys_blkinfo(uint32_t idx, uint32_t ubuf, uint32_t c, uint32_t d, uint
         strlcpy(bi.fstype, bd->fs->name, sizeof(bi.fstype));
         vfs_mountpoint_of(bd, bi.mountpoint, sizeof(bi.mountpoint));
     }
-    return copy_to_user((void *)ubuf, &bi, sizeof(bi));
+    return copy_to_user(UPTR(ubuf), &bi, sizeof(bi));
 }
 
 static int sys_usbinfo(uint32_t idx, uint32_t ubuf, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)c; (void)d; (void)e;
-    if (user_check_w((void *)ubuf, sizeof(struct usbinfo)) < 0)
+    if (user_check_w(UPTR(ubuf), sizeof(struct usbinfo)) < 0)
         return -EFAULT;
     struct usbinfo ui;
     int r = usb_info((int)idx, &ui);
-    return r < 0 ? r : copy_to_user((void *)ubuf, &ui, sizeof(ui));
+    return r < 0 ? r : copy_to_user(UPTR(ubuf), &ui, sizeof(ui));
 }
 
 static int sys_wifi(uint32_t op, uint32_t arg, uint32_t c, uint32_t d, uint32_t e)
@@ -1832,7 +1837,7 @@ static int sys_wifi(uint32_t op, uint32_t arg, uint32_t c, uint32_t d, uint32_t 
 static int sys_power(uint32_t op, uint32_t arg, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)c; (void)d; (void)e;
-    if (op == POWER_INFO && user_check_w((void *)arg, sizeof(struct powerinfo)) < 0)
+    if (op == POWER_INFO && user_check_w(UPTR(arg), sizeof(struct powerinfo)) < 0)
         return -EFAULT;
     return power_syscall(op, arg);
 }
@@ -1867,18 +1872,18 @@ static int sys_uname(uint32_t ubuf, uint32_t b, uint32_t c, uint32_t d, uint32_t
     strcpy(u.nodename, "fluxOS");
     strcpy(u.release, FLUXOS_RELEASE);
     strcpy(u.version, "#1 PREEMPT " __DATE__ " " __TIME__);
-    strcpy(u.machine, "i686");
-    return copy_to_user((void *)ubuf, &u, sizeof(u));
+    strcpy(u.machine, "i686");          /* what programs are (and are built as), on a 64-bit kernel */
+    return copy_to_user(UPTR(ubuf), &u, sizeof(u));
 }
 
 static int sys_procinfo(uint32_t slot, uint32_t ubuf, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)c; (void)d; (void)e;
-    if (user_check_w((void *)ubuf, sizeof(struct procinfo)) < 0)
+    if (user_check_w(UPTR(ubuf), sizeof(struct procinfo)) < 0)
         return -EFAULT;
     struct procinfo pi;
     int r = proc_info((int)slot, &pi);
-    if (r == 1 && copy_to_user((void *)ubuf, &pi, sizeof(pi)) < 0)
+    if (r == 1 && copy_to_user(UPTR(ubuf), &pi, sizeof(pi)) < 0)
         return -EFAULT;
     return r;
 }
@@ -1898,7 +1903,7 @@ static int sys_meminfo(uint32_t ubuf, uint32_t b, uint32_t c, uint32_t d, uint32
     mi.ncpu = (uint32_t)ncpus;
     for (int i = 0; i < 16; i++)
         mi.cpu_idle[i] = i < ncpus ? cpus[i].idle_ticks : 0;
-    return copy_to_user((void *)ubuf, &mi, sizeof(mi));
+    return copy_to_user(UPTR(ubuf), &mi, sizeof(mi));
 }
 
 /* Re-read the partition table of a whole disk (like Linux's BLKRRPART). */
@@ -1919,7 +1924,7 @@ static int sys_fstrim(uint32_t upath, uint32_t utrimmed, uint32_t c, uint32_t d,
 {
     (void)c; (void)d; (void)e;
     COPY_PATH(path, upath);
-    if (utrimmed && user_check_w((void *)utrimmed, sizeof(uint64_t)) < 0)
+    if (utrimmed && user_check_w(UPTR(utrimmed), sizeof(uint64_t)) < 0)
         return -EFAULT;
     struct vnode *vn;
     int r = vfs_resolve(path, current->leader->cwd, &vn);
@@ -1927,7 +1932,7 @@ static int sys_fstrim(uint32_t upath, uint32_t utrimmed, uint32_t c, uint32_t d,
         return r;
     uint64_t trimmed;
     r = vfs_trim(vn, &trimmed);
-    if (utrimmed && copy_to_user((void *)utrimmed, &trimmed, sizeof(trimmed)) < 0)
+    if (utrimmed && copy_to_user(UPTR(utrimmed), &trimmed, sizeof(trimmed)) < 0)
         return -EFAULT;
     return r;
 }
@@ -1971,11 +1976,11 @@ static int sys_ftruncate(uint32_t fd, uint32_t size, uint32_t c, uint32_t d, uin
 static int sys_fbinfo(uint32_t ubuf, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)b; (void)c; (void)d; (void)e;
-    if (user_check_w((void *)ubuf, sizeof(struct fbinfo)) < 0)
+    if (user_check_w(UPTR(ubuf), sizeof(struct fbinfo)) < 0)
         return -EFAULT;
     struct fbinfo fi;
     int r = fb_get_info(&fi);
-    return r < 0 ? r : copy_to_user((void *)ubuf, &fi, sizeof(fi));
+    return r < 0 ? r : copy_to_user(UPTR(ubuf), &fi, sizeof(fi));
 }
 
 static int sys_fbmap(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e)
@@ -2021,7 +2026,7 @@ static int sys_display(uint32_t op, uint32_t uarg, uint32_t c, uint32_t d, uint3
     case DISP_SUBMIT: size = sizeof(struct dispsubmit); break;
     default: return -EINVAL;
     }
-    if ((writes ? user_check_w((void *)uarg, size) : user_check((const void *)uarg, size)) < 0)
+    if ((writes ? user_check_w(UPTR(uarg), size) : user_check(UPTR(uarg), size)) < 0)
         return -EFAULT;
     /* The drivers work on a private copy: they check fields and use them
      * again later, and another thread could change the caller's memory in
@@ -2029,7 +2034,7 @@ static int sys_display(uint32_t op, uint32_t uarg, uint32_t c, uint32_t d, uint3
     void *karg = kmalloc(size);
     if (!karg)
         return -ENOMEM;
-    if (copy_from_user(karg, (const void *)uarg, size) < 0) {
+    if (copy_from_user(karg, UPTR(uarg), size) < 0) {
         kfree(karg);
         return -EFAULT;
     }
@@ -2043,7 +2048,7 @@ static int sys_display(uint32_t op, uint32_t uarg, uint32_t c, uint32_t d, uint3
     int r = fb_display((int)op, karg);
     if (mm)
         mutex_unlock(mm);
-    if (writes && copy_to_user((void *)uarg, karg, size) < 0)
+    if (writes && copy_to_user(UPTR(uarg), karg, size) < 0)
         r = -EFAULT;
     kfree(karg);
     return r;
@@ -2076,13 +2081,13 @@ static int sys_dmesg(uint32_t ubuf, uint32_t size, uint32_t c, uint32_t d, uint3
 {
     (void)c; (void)d; (void)e;
     size = MIN(size, (uint32_t)KLOG_SIZE);
-    if (user_check_w((void *)ubuf, size) < 0)
+    if (user_check_w(UPTR(ubuf), size) < 0)
         return -EFAULT;
     char *tmp = kmalloc(size ? size : 1);   /* the log is read holding its lock */
     if (!tmp)
         return -ENOMEM;
     int n = klog_read(tmp, size);
-    if (copy_to_user((void *)ubuf, tmp, (uint32_t)n) < 0)
+    if (copy_to_user(UPTR(ubuf), tmp, (uint32_t)n) < 0)
         n = -EFAULT;
     kfree(tmp);
     return n;

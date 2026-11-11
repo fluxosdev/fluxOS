@@ -5,15 +5,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
-struct multiboot_info;
+typedef uint64_t pte_t;                 /* an entry of a page table, at any of the four levels */
 
 /* ---- physical frame allocator ---- */
-void pmm_init(struct multiboot_info *mbi);
+void pmm_init(void);                        /* from the boot loader's memory map (boot.h) */
+void pmm_reclaim_loader(void);              /* the loader's own memory, once nothing reads it */
 void pmm_reserve(uint32_t start, uint32_t end);
 void pmm_release(uint32_t start, uint32_t end);
 uint32_t pmm_alloc(void);                   /* below 1 GiB; 0 when out of memory */
-uint32_t pmm_alloc_user(void);              /* anywhere, for user pages (vmm_kmap) */
-uint32_t pmm_alloc_contig(uint32_t frames); /* below 1 GiB */
+uint32_t pmm_alloc_user(void);              /* anywhere below 4 GiB, for user pages */
+uint32_t pmm_alloc_contig(uint32_t frames); /* below 1 GiB, the lowest run there is */
+uint32_t pmm_alloc_isa(void);               /* 32 KiB below 16 MiB, for ISA DMA; kept for good */
 uint32_t pmm_alloc_reserved(uint32_t reserve); /* cache pages; never reclaim, retain low frames */
 void pmm_set_reclaimer(uint32_t (*reclaim)(uint32_t pages)); /* boot-time registration */
 int pmm_ref(uint32_t phys);                 /* add a COW/shared reference; 0 if full/invalid */
@@ -22,6 +24,18 @@ void pmm_free(uint32_t phys);
 uint32_t pmm_total_kb(void);
 uint32_t pmm_free_kb(void);
 uint32_t pmm_low_free_kb(void);             /* of the first GiB, the kernel's own */
+/* The same as kernel memory, through the direct map: NULL when there is none.
+ * (virt_to_phys() gives the frame back, to free it or to tell a device.) */
+static inline void *pmm_alloc_page(void)
+{
+    uint32_t phys = pmm_alloc();
+    return phys ? phys_to_virt(phys) : NULL;
+}
+static inline void *pmm_alloc_pages(uint32_t frames)
+{
+    uint32_t phys = pmm_alloc_contig(frames);
+    return phys ? phys_to_virt(phys) : NULL;
+}
 
 /* ---- paging ---- */
 #define PTE_PRESENT 0x001
@@ -36,35 +50,39 @@ uint32_t pmm_low_free_kb(void);             /* of the first GiB, the kernel's ow
 #define PTE_SHARED  0x800       /* (available bit) shared across fork without COW */
 
 /* PTE bits for write-combining device memory (the framebuffer), or 0 if
- * the processor has no page attribute table (cpu.c). */
+ * the page attribute table is not to be used (cpu.c). */
 extern uint32_t pte_wc;
 
-extern uint32_t *kernel_pd;
+/* An address space is its top-level table (the PML4), by its address in
+ * the direct map. The kernel's has no user half. */
+extern pte_t *kernel_pd;
 
 void paging_init(void);
-void vmm_switch(uint32_t *pd);
-uint32_t *vmm_create(void);
-void vmm_destroy(uint32_t *pd);
-uint32_t *vmm_clone(uint32_t *pd);
-int vmm_alloc(uint32_t *pd, uint32_t va);   /* map a zeroed user page */
-int vmm_alloc_prot(uint32_t *pd, uint32_t va, uint32_t prot, uint32_t flags);
-int vmm_protect_page(uint32_t *pd, uint32_t va, uint32_t prot);
-void vmm_free_page(uint32_t *pd, uint32_t va);
-int vmm_pte_present(uint32_t *pd, uint32_t va);
-int vmm_mmio_mapped(uint32_t *pd, uint32_t va);  /* device memory there (the screen) */
-uint32_t vmm_translate(uint32_t *pd, uint32_t va);
-int vmm_write_ok(uint32_t *pd, uint32_t va);
-int vmm_resolve_cow(uint32_t *pd, uint32_t va);
-int vmm_copy_to(uint32_t *pd, uint32_t va, const void *src, uint32_t len);
-void vmm_read_phys(void *dst, uint32_t phys, uint32_t n);   /* any frame, high memory too */
-uint32_t vmm_user_pages(uint32_t *pd);
-/* flags: extra page bits, such as PTE_PCD for device registers */
-void *vmm_map_mmio(uint32_t phys, uint32_t size, uint32_t flags);  /* boot time only */
+uint64_t vmm_boot_cr3(void);                /* tables that also map low memory one to one (trampoline.S, wakeup.S) */
+void vmm_switch(pte_t *pd);
+pte_t *vmm_create(void);
+void vmm_destroy(pte_t *pd);
+pte_t *vmm_clone(pte_t *pd);
+int vmm_alloc(pte_t *pd, uint32_t va);      /* map a zeroed user page */
+int vmm_alloc_prot(pte_t *pd, uint32_t va, uint32_t prot, uint32_t flags);
+int vmm_protect_page(pte_t *pd, uint32_t va, uint32_t prot);
+void vmm_free_page(pte_t *pd, uint32_t va);
+int vmm_pte_present(pte_t *pd, uint32_t va);
+int vmm_mmio_mapped(pte_t *pd, uint32_t va);    /* device memory there (the screen) */
+uint32_t vmm_translate(pte_t *pd, uint32_t va);
+int vmm_write_ok(pte_t *pd, uint32_t va);
+int vmm_resolve_cow(pte_t *pd, uint32_t va);
+int vmm_copy_to(pte_t *pd, uint32_t va, const void *src, uint32_t len);
+void vmm_read_phys(void *dst, uint32_t phys, uint32_t n);   /* any frame */
+uint32_t vmm_user_pages(pte_t *pd);
+/* flags: extra page bits, such as PTE_PCD for device registers. Device
+ * memory may be anywhere in the 64-bit physical address space. */
+void *vmm_map_mmio(uint64_t phys, uint64_t size, uint32_t flags);  /* 2 MiB pages */
 void vmm_unmap_mmio(void *virt);            /* undo it (or pci_map_bar), boot time only */
-void *vmm_map_late(uint32_t phys, uint32_t size, uint32_t flags);  /* any time; kept for good */
-int vmm_map_phys(uint32_t *pd, uint32_t va, uint32_t phys, uint32_t size, uint32_t flags);
-void vmm_zero_frame(uint32_t phys);         /* any frame, high memory too */
-int vmm_map_frame(uint32_t *pd, uint32_t va, uint32_t frame, uint32_t prot);
+void *vmm_map_late(uint64_t phys, uint64_t size, uint32_t flags);  /* 4 KiB pages; kept for good */
+int vmm_map_phys(pte_t *pd, uint32_t va, uint64_t phys, uint32_t size, uint32_t flags);
+void vmm_zero_frame(uint32_t phys);         /* any frame */
+int vmm_map_frame(pte_t *pd, uint32_t va, uint32_t frame, uint32_t prot);
 
 /*
  * ---- SSE block moves (sse.S) ----

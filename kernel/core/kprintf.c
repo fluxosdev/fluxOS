@@ -127,18 +127,20 @@ void boot_warn(const char *fmt, ...)
 #define TRACE_MAX 8
 
 /* Return addresses up the frame-pointer chain from panic()'s caller. */
-static int backtrace(uint32_t *out, int max)
+static int backtrace(uint64_t *out, int max)
 {
-    uint32_t *fp = __builtin_frame_address(0);
+    uint64_t *fp = __builtin_frame_address(0);
     int n = 0;
-    while (n < max && !((uint32_t)fp & 3) && (uint32_t)fp >= PAGE_SIZE &&
-           (uint32_t)fp < KERNEL_SPACE_END - 8) {
-        uint32_t ret = fp[1];
-        if (ret < (uint32_t)kernel_start || ret >= (uint32_t)kernel_end)
+    /* Kernel stacks are in the kernel's half of the address space, and a
+     * caller's frame is above its callee's, not far away. */
+    while (n < max && !((uintptr_t)fp & 7) && (uintptr_t)fp >= 0xFFFF800000000000ull &&
+           (uintptr_t)fp < UINTPTR_MAX - 16) {
+        uint64_t ret = fp[1];
+        if (ret < (uintptr_t)kernel_start || ret >= (uintptr_t)kernel_end)
             break;
         out[n++] = ret;
-        uint32_t *next = (uint32_t *)fp[0];
-        if (next <= fp)
+        uint64_t *next = (uint64_t *)(uintptr_t)fp[0];
+        if (next <= fp || (uintptr_t)next - (uintptr_t)fp > 65536)
             break;
         fp = next;
     }
@@ -166,7 +168,7 @@ void panic(const char *fmt, ...)
 {
     static int nested;
     char buf[256];
-    uint32_t trace[TRACE_MAX];
+    uint64_t trace[TRACE_MAX];
     va_list ap;
     cli();
     panicking = 1;                      /* locks stop waiting (lock.c) */
@@ -188,7 +190,7 @@ void panic(const char *fmt, ...)
     if (n) {
         kprintf("Call trace:");
         for (int i = 0; i < n; i++)
-            kprintf(" %08x", trace[i]);
+            kprintf(" %lx", trace[i]);
         kprintf("\n");
     }
     if (!panic_screen(buf))

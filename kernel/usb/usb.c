@@ -123,10 +123,10 @@ void *usb_dma_alloc(uint32_t size)
         if (!page)
             return NULL;
         for (uint32_t off = PAGE_SIZE - sz; off > 0; off -= sz) {
-            *(void **)(page + off) = dma_free_list[k];
-            dma_free_list[k] = (void *)(page + off);
+            *(void **)phys_to_virt(page + off) = dma_free_list[k];
+            dma_free_list[k] = phys_to_virt(page + off);
         }
-        p = (void *)page;
+        p = phys_to_virt(page);
     }
     memset(p, 0, sz);
     return p;

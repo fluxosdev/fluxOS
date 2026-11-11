@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Install fluxOS from a CD made by mkiso onto a blank disk, then start it.
 
-The CD is the build's (build/iso, with GRUB from firmware/grub), except
+The CD is the build's (build/iso, with Limine from firmware/limine), except
 that its setup system's init is tests/install-guest.c, which runs
 fluxinstall onto the disk, and its menu starts that at once, in text mode.
-The disk is then started alone: GRUB's boot sector and core image that
-fluxinstall wrote, its modules and menu on the ext2 partition, the kernel
-from there and the system unpacked onto it, as / .
+The disk is then started alone: Limine's first sectors that fluxinstall had
+Limine's installer write, Limine itself, its menu and the kernel on the
+FAT32 boot partition, and the system unpacked onto the ext2 one, as / .
+With --uefi (and OVMF's firmware files) the disk is started once more by
+UEFI firmware, which finds Limine as /EFI/BOOT/BOOTX64.EFI there.
 """
 import argparse
 import io
@@ -23,10 +25,12 @@ for name in ('qemu', 'mkiso', 'isotree', 'firmware', 'guest'):
 parser.add_argument('--disk-mb', type=int, default=768)
 parser.add_argument('--data-dir', default='/src', help="fluxinstall -e: a second, ext2, partition for it ('' for none)")
 parser.add_argument('--system-mib', type=int, default=320, help='fluxinstall -r, with --data-dir')
+parser.add_argument('--fat32', action='store_true', help='fluxinstall -t fat32: the system on one FAT32 partition, the boot loader with it')
 parser.add_argument('--timeout', type=int, default=600)
+parser.add_argument('--uefi', metavar='OVMF_CODE,OVMF_VARS', help="also start the installed disk with this UEFI firmware (edk2's OVMF_CODE.fd and OVMF_VARS.fd)")
 args = parser.parse_args()
 
-QEMU = [args.qemu, '-cpu', 'core2duo,-lm', '-smp', '2', '-m', '1G', '-display', 'none', '-nic', 'none',
+QEMU = [args.qemu, '-cpu', 'core2duo', '-smp', '2', '-m', '1G', '-display', 'none', '-nic', 'none',
         '-no-reboot']
 
 
@@ -57,18 +61,20 @@ with tempfile.TemporaryDirectory(prefix='flux-install-test-') as directory:
                 dst.add(args.guest, arcname=member.name)
             else:
                 dst.addfile(member, src.extractfile(member) if member.isfile() else None)
-        if args.data_dir:
-            extra = f'-e\n{args.data_dir}\n-r\n{args.system_mib}\n'.encode()
+        if args.data_dir or args.fat32:
+            extra = (f'-e\n{args.data_dir}\n-r\n{args.system_mib}\n' if args.data_dir else '').encode()
+            if args.fat32:
+                extra += b'-t\nfat32\n'
             info = tarfile.TarInfo('./etc/install-args')
             info.size = len(extra)
             dst.addfile(info, io.BytesIO(extra))
     shutil.move(patched, setup)
-    (tree / 'boot/grub/grub.cfg').write_text(
-        'set timeout=0\nmenuentry setup {\n multiboot /boot/fluxos.kernel bootfs=iso9660 nosplash\n'
-        ' module /boot/setup.tar setup\n set gfxpayload=text\n boot\n}\n')
+    (tree / 'boot/limine/limine.conf').write_text(
+        'timeout: 0\n\n/setup\n    protocol: limine\n    path: boot():/boot/fluxos.kernel\n'
+        '    cmdline: bootfs=iso9660 nosplash\n    module_path: boot():/boot/setup.tar\n    textmode: yes\n')
     iso = temp / 'install.iso'
-    subprocess.run([args.mkiso, '-o', str(iso), '-b', 'boot/grub/i386-pc/eltorito.img',
-                    '-G', str(pathlib.Path(args.firmware) / 'boot_hybrid.img'), str(tree)], check=True)
+    subprocess.run([args.mkiso, '-o', str(iso), '-b', 'boot/limine/limine-bios-cd.bin',
+                    '-e', 'boot/limine/limine-uefi-cd.bin', str(tree)], check=True)
     disk = temp / 'disk.img'
     with disk.open('wb') as f:
         f.truncate(args.disk_mb << 20)
@@ -106,22 +112,43 @@ with tempfile.TemporaryDirectory(prefix='flux-install-test-') as directory:
             raise SystemExit(f'install: e2fsck finds the ext2 partition for {what} damaged')
         print(f'install: the ext2 partition for {what} ({count // 2048} MiB) is clean to e2fsck')
 
-    check_ext2(0, 'the system')
+    # the FAT32 boot partition first, then the system's and the data's
+    boot_entry = disk.read_bytes()[446:462]
+    if boot_entry[4] != 0x0C or boot_entry[0] != 0x80:
+        raise SystemExit('install: the first partition is not an active FAT32 one (the boot partition)')
+    # (with --fat32 that one is the system's as well)
+    system = 1 if args.fat32 else 2
+    if not args.fat32:
+        check_ext2(1, 'the system')
     if args.data_dir:
-        check_ext2(1, args.data_dir)
+        check_ext2(system, args.data_dir)
 
     log = temp / 'boot.log'
     # with a data partition, until init has mounted it (/etc/fstab)
-    marker = f'init: mounted /dev/hda2 on {args.data_dir}' if args.data_dir else 'Scheduler started, launching /bin/init'
+    marker = f'init: mounted /dev/hda{system + 1} on {args.data_dir}' if args.data_dir else 'Scheduler started, launching /bin/init'
     ok = run(QEMU + ['-serial', f'file:{log}', '-boot', 'c',
                      '-drive', f'file={disk},format=raw,if=ide,index=0'],
              log, marker, 120)
     text = log.read_text(errors='replace')
-    root = [l for l in text.splitlines() if 'Root filesystem: /dev/hda1' in l]
+    root = [l for l in text.splitlines() if f'Root filesystem: /dev/hda{system}' in l]
     if not ok or not root or 'panic' in text.lower():
         print(text[-4000:])
         raise SystemExit('install: the installed disk did not start from its own partition (see the log above)')
-    print('install: the disk started from GRUB on its own:', root[0].split('] ', 1)[-1])
+    print('install: the disk started from Limine on its own:', root[0].split('] ', 1)[-1])
     if args.data_dir:
         print(f'install: init mounted the ext2 partition on {args.data_dir} (/etc/fstab)')
+    if args.uefi:
+        code, variables = args.uefi.split(',')
+        shutil.copy(variables, temp / 'vars.fd')
+        log = temp / 'uefi.log'
+        ok = run([args.qemu, '-cpu', 'qemu64', '-smp', '2', '-m', '1G', '-display', 'none', '-nic', 'none', '-no-reboot',
+                  '-drive', f'if=pflash,format=raw,readonly=on,file={code}',
+                  '-drive', f'if=pflash,format=raw,file={temp / "vars.fd"}',
+                  '-serial', f'file:{log}', '-drive', f'file={disk},format=raw,if=ide,index=0'],
+                 log, marker, 180)
+        text = log.read_text(errors='replace')
+        if not ok or 'UEFI firmware' not in text or 'panic' in text.lower():
+            print(text[-4000:])
+            raise SystemExit('install: UEFI firmware did not start the installed disk (see the log above)')
+        print('install: UEFI firmware started the disk too (Limine as /EFI/BOOT/BOOTX64.EFI)')
     print('INSTALL TEST PASSED')

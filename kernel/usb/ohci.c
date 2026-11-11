@@ -254,7 +254,7 @@ static void ed_link(struct ohci *o, struct ohci_ed *ed)
         h->snext->sprev = ed;
     h->snext = ed;
     barrier();
-    h->next = (uint32_t)ed;
+    h->next = virt_to_phys(ed);
 }
 
 static void ed_unlink(struct ohci_ed *ed)
@@ -286,7 +286,7 @@ static struct ohci_ed *ep_ed(struct ohci *o, struct usb_dev *dev, struct usb_ep 
         ed->info |= ED_ISO | ((ep->addr & USB_DIR_IN) ? ED_DIR_IN : ED_DIR_OUT);
     ed->dummy = dummy;
     ed->idummy = idummy;
-    ed->tailp = iso ? (uint32_t)idummy : (uint32_t)dummy;
+    ed->tailp = iso ? virt_to_phys(idummy) : virt_to_phys(dummy);
     ed->headp = ed->tailp;
     ed_link(o, ed);
     ep->hcpriv = ed;
@@ -307,11 +307,11 @@ static int iso_submit(struct ohci *o, struct ohci_ed *ed, struct usb_xfer *x)
         return -EINVAL;
     if (ed->iso_n >= ISO_QUEUE)
         return -EBUSY;
-    uint32_t addr[USB_ISO_MAX_PACKETS], a = (uint32_t)x->buf;
+    uint32_t addr[USB_ISO_MAX_PACKETS], a = virt_to_phys(x->buf);
     for (uint32_t i = 0; i < x->npackets; i++) {
         if (in)
-            a = (uint32_t)x->buf + i * mps;
-        if (x->iso_len[i] > mps || a + x->iso_len[i] > (uint32_t)x->buf + x->len)
+            a = virt_to_phys(x->buf) + i * mps;
+        if (x->iso_len[i] > mps || a + x->iso_len[i] > virt_to_phys(x->buf) + x->len)
             return -EINVAL;
         addr[i] = a;
         if (!in)
@@ -361,7 +361,7 @@ static int iso_submit(struct ohci *o, struct ohci_ed *ed, struct usb_xfer *x)
             td->psw[j] = j < k ? (uint16_t)(0xE000 | ((addr[p + j] - page) & 0x1FFF)) : 0;
         td->npackets = (uint16_t)k;
         td->snext = i + 1 < n ? tds[i + 1] : NULL;
-        td->next = (uint32_t)tds[i + 1];
+        td->next = virt_to_phys(tds[i + 1]);
     }
     tds[n - 1]->info &= ~TD_NOINT;
     ed->idummy = tds[n];
@@ -371,7 +371,7 @@ static int iso_submit(struct ohci *o, struct ohci_ed *ed, struct usb_xfer *x)
     ed->next_frame = (uint16_t)(start + x->npackets);
     x->hcpriv = tds[0];
     barrier();
-    ed->tailp = (uint32_t)tds[n];
+    ed->tailp = virt_to_phys(tds[n]);
     return 0;
 }
 
@@ -453,9 +453,9 @@ static struct ohci_itd *iso_drop(struct ohci_ed *ed, int status)
 static void td_fill(struct ohci_td *td, uint32_t info, void *buf, uint32_t len)
 {
     td->info = info | TD_NOINT | (uint32_t)CC_NOTACCESSED << 28;
-    td->cbp = len ? (uint32_t)buf : 0;
-    td->be = len ? (uint32_t)buf + len - 1 : 0;
-    td->start = (uint32_t)buf;
+    td->cbp = len ? virt_to_phys(buf) : 0;
+    td->be = len ? virt_to_phys(buf) + len - 1 : 0;
+    td->start = virt_to_phys(buf);
     td->len = (uint16_t)len;
 }
 
@@ -483,7 +483,7 @@ static int ohci_submit(struct usb_hc *hc, struct usb_xfer *x)
     int control = ep->type == USB_EP_CONTROL;
     int in = control ? (x->setup[0] & USB_RT_IN) != 0 : (ep->addr & USB_DIR_IN) != 0;
     int ndata = 0;
-    uint32_t a = (uint32_t)x->buf, left = x->len, mps = ep->maxpacket ? ep->maxpacket : 8;
+    uint32_t a = virt_to_phys(x->buf), left = x->len, mps = ep->maxpacket ? ep->maxpacket : 8;
     do {
         uint32_t c = chunk_at(a, left, mps);
         ndata++;
@@ -514,7 +514,7 @@ static int ohci_submit(struct usb_hc *hc, struct usb_xfer *x)
     uint8_t *p = x->buf;
     left = x->len;
     for (int k = 0; k < ndata; k++) {
-        uint32_t c = chunk_at((uint32_t)p, left, mps);
+        uint32_t c = chunk_at(virt_to_phys(p), left, mps);
         uint32_t info = in ? TD_IN : TD_OUT;
         if (control && k == 0)
             info |= TD_DATA1;
@@ -530,14 +530,14 @@ static int ohci_submit(struct usb_hc *hc, struct usb_xfer *x)
 
     for (int k = 0; k < n; k++) {
         td[k]->snext = k + 1 < n ? td[k + 1] : NULL;
-        td[k]->next = (uint32_t)td[k + 1];
+        td[k]->next = virt_to_phys(td[k + 1]);
     }
     ed->tds = td[0];
     ed->dummy = td[n];
     ed->xfer = x;
     x->hcpriv = ed;
     barrier();
-    ed->tailp = (uint32_t)td[n];
+    ed->tailp = virt_to_phys(td[n]);
     if (control)
         wr(o, HC_CMDSTATUS, CMD_CLF);
     else if (ep->type == USB_EP_BULK)
@@ -810,10 +810,10 @@ static void ohci_setup(struct ohci *o)
     wr(o, HC_PERIODSTART, fi * 9 / 10);
     wr(o, HC_LSTHRESH, 0x628);
     for (int i = 0; i < 32; i++)
-        o->hcca[i] = (uint32_t)o->head[0];
-    wr(o, HC_HCCA, (uint32_t)o->hcca);
-    wr(o, HC_CTRLHEAD, (uint32_t)o->head[1]);
-    wr(o, HC_BULKHEAD, (uint32_t)o->head[2]);
+        o->hcca[i] = virt_to_phys(o->head[0]);
+    wr(o, HC_HCCA, virt_to_phys(o->hcca));
+    wr(o, HC_CTRLHEAD, virt_to_phys(o->head[1]));
+    wr(o, HC_BULKHEAD, virt_to_phys(o->head[2]));
     wr(o, HC_CTRLCUR, 0);
     wr(o, HC_BULKCUR, 0);
     wr(o, HC_INTSTATUS, 0xFFFFFFFFu);

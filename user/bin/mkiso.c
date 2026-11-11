@@ -1,7 +1,7 @@
 /*
  * mkiso - make an ISO 9660 image of a directory, bootable through El Torito
  *
- *   mkiso -o IMAGE [-V VOLUME] [-b BOOTIMAGE [-G MBR]] DIR
+ *   mkiso -o IMAGE [-V VOLUME] [-b BOOTIMAGE] [-e EFIIMAGE] [-P] DIR
  *
  * DIR's files and directories become the image's, with ISO 9660 level 1
  * names (8.3, upper case, made unique) and Rock Ridge entries carrying the
@@ -13,15 +13,20 @@
  * emulation, 4 sectors loaded at 0x7C00, a boot catalog /boot.catalog,
  * and a boot information table written into the image (offset 8: the
  * primary volume descriptor's block, the image's block, its length and a
- * checksum), as xorriso's -boot-info-table does. GRUB's eltorito.img
- * needs that table.
+ * checksum), as xorriso's -boot-info-table does. Limine's
+ * limine-bios-cd.bin needs that table.
  *
- * -G MBR makes the image a hybrid that also starts when written to a USB
- * stick: MBR, GRUB's boot_hybrid.img, is the image's first sector, with a
- * partition table holding one partition (type 0xCD) over the image, and
- * GRUB's two addresses patched in as xorriso's --grub2-mbr and
- * --grub2-boot-info do: the boot image's first 512-byte sector + 4 at
- * offset 0x1B0 of the MBR, + 5 at offset 2548 of the boot image.
+ * -e EFIIMAGE, another path inside DIR, is a FAT image with the boot
+ * loader for UEFI firmware (Limine's limine-uefi-cd.bin): the catalog's
+ * second entry, for the EFI platform, loaded whole.
+ *
+ * -P gives the image an MBR partition table, so that it can also start
+ * when written to a USB stick: the boot loader's first sector goes there
+ * afterwards ("limine bios-install IMAGE", which keeps the table and puts
+ * the rest of itself into the unused blocks before the volume
+ * descriptors). The partitions cover the image from 32 KiB on, the EFI
+ * image as a partition of its own (type 0xEF), which is where UEFI
+ * firmware looks for the boot loader on a stick.
  *
  * The volume's dates are SOURCE_DATE_EPOCH's when it is set, else now.
  */
@@ -242,12 +247,6 @@ static void be32(uint8_t *p, uint32_t v)
 {
     for (int i = 0; i < 4; i++)
         p[3 - i] = (uint8_t)(v >> (8 * i));
-}
-
-static void le64(uint8_t *p, uint64_t v)
-{
-    for (int i = 0; i < 8; i++)
-        p[i] = (uint8_t)(v >> (8 * i));
 }
 
 /* The 7-byte time of directory records and TF, in UTC. */
@@ -515,15 +514,30 @@ static struct node *find(struct node *root, const char *path)
     return n;
 }
 
+/* A sector's cylinder, head and sector, as a partition table entry has them. */
+static void mbr_chs(uint8_t *p, uint32_t lba)
+{
+    uint32_t c = lba / (MBR_HEADS * MBR_SECTORS);
+    uint32_t h = lba / MBR_SECTORS % MBR_HEADS;
+    uint32_t s = lba % MBR_SECTORS + 1;
+    if (c > 1023) {
+        c = 1023; h = MBR_HEADS - 1; s = MBR_SECTORS;
+    }
+    p[0] = (uint8_t)h;
+    p[1] = (uint8_t)(s | (c >> 2 & 0xC0));
+    p[2] = (uint8_t)c;
+}
+
 static void usage(void)
 {
-    fprintf(stderr, "usage: mkiso -o IMAGE [-V VOLUME] [-b BOOTIMAGE [-G MBR]] DIR\n");
+    fprintf(stderr, "usage: mkiso -o IMAGE [-V VOLUME] [-b BOOTIMAGE] [-e EFIIMAGE] [-P] DIR\n");
     exit(2);
 }
 
 int main(int argc, char **argv)
 {
-    const char *volume = "FLUXOS", *boot_path = NULL, *mbr_path = NULL, *dir = NULL;
+    const char *volume = "FLUXOS", *boot_path = NULL, *efi_path = NULL, *dir = NULL;
+    int partitions = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc)
             out_name = argv[++i];
@@ -531,14 +545,16 @@ int main(int argc, char **argv)
             volume = argv[++i];
         else if (!strcmp(argv[i], "-b") && i + 1 < argc)
             boot_path = argv[++i];
-        else if (!strcmp(argv[i], "-G") && i + 1 < argc)
-            mbr_path = argv[++i];
+        else if (!strcmp(argv[i], "-e") && i + 1 < argc)
+            efi_path = argv[++i];
+        else if (!strcmp(argv[i], "-P"))
+            partitions = 1;
         else if (argv[i][0] == '-' || dir)
             usage();
         else
             dir = argv[i];
     }
-    if (!out_name || !dir || (mbr_path && !boot_path))
+    if (!out_name || !dir || (efi_path && !boot_path))
         usage();
     const char *sde = getenv("SOURCE_DATE_EPOCH");
     now = sde && *sde ? (uint32_t)strtoul(sde, NULL, 10) : (uint32_t)time(NULL);
@@ -556,16 +572,28 @@ int main(int argc, char **argv)
 
     /* The boot catalog, a file in the root made here. */
     static uint8_t catalog[BLOCK];
-    struct node *cat = NULL, *boot = NULL;
+    struct node *cat = NULL, *boot = NULL, *efi = NULL;
     if (boot_path) {
         boot = find(root, boot_path);
         if (!boot || boot->isdir) {
             errno = ENOENT;
             die("boot image %s: %s", boot_path);
         }
-        if (boot->size < 64 || boot->size > MAX_BOOT || (mbr_path && boot->size < 2556)) {
+        if (boot->size < 64 || boot->size > MAX_BOOT) {
             errno = EINVAL;
             die("boot image %s: %s", boot_path);
+        }
+        if (efi_path) {
+            efi = find(root, efi_path);
+            if (!efi || efi->isdir) {
+                errno = ENOENT;
+                die("EFI boot image %s: %s", efi_path);
+            }
+            /* (the catalog counts its 512-byte sectors in 16 bits) */
+            if (!efi->size || efi->size > 0xFFFFu * 512) {
+                errno = EINVAL;
+                die("EFI boot image %s: %s", efi_path);
+            }
         }
         if (find(root, "boot.catalog")) {
             errno = EEXIST;
@@ -606,7 +634,7 @@ int main(int argc, char **argv)
     }
     uint32_t total = lba + PAD_BLOCKS;
 
-    /* The boot image, with its table and GRUB's address filled in. */
+    /* The boot image, with its table filled in. */
     uint8_t *boot_data = NULL;
     if (boot) {
         uint32_t padded_size = (boot->size + 3) & ~3u;
@@ -615,9 +643,6 @@ int main(int argc, char **argv)
         if (!f || fread(boot_data, 1, boot->size, f) != boot->size)
             die("%s: %s", boot->path);
         fclose(f);
-        if (mbr_path)
-            le64(boot_data + 2548, (uint64_t)boot->lba * 4 + 5);
-        /* the checksum is of the image as written, GRUB's address included */
         uint32_t sum = 0;
         for (uint32_t i = 64; i < padded_size; i += 4)
             sum += (uint32_t)boot_data[i] | (uint32_t)boot_data[i + 1] << 8 |
@@ -642,6 +667,17 @@ int main(int argc, char **argv)
         catalog[32] = 0x88;                     /* bootable, no emulation */
         catalog[38] = BOOT_SECTORS;
         le32(catalog + 40, boot->lba);
+        if (efi) {
+            /* a section of one entry for the EFI platform, the last */
+            catalog[64] = 0x91;
+            catalog[65] = 0xEF;
+            catalog[66] = 1;
+            catalog[96] = 0x88;                 /* bootable, no emulation */
+            uint32_t sectors = (efi->size + 511) / 512;
+            catalog[102] = (uint8_t)sectors;
+            catalog[103] = (uint8_t)(sectors >> 8);
+            le32(catalog + 104, efi->lba);
+        }
     }
 
     out = fopen(out_name, "wb");
@@ -651,30 +687,28 @@ int main(int argc, char **argv)
     /* the system area */
     uint8_t sector[BLOCK];
     memset(sector, 0, sizeof(sector));
-    if (mbr_path) {
-        FILE *f = fopen(mbr_path, "rb");
-        if (!f || fread(sector, 1, 446, f) != 446)
-            die("%s: %s", mbr_path);
-        fclose(f);
-        le64(sector + 0x1B0, (uint64_t)boot->lba * 4 + 4);
-        memset(sector + 0x1B8, 0, 6);           /* no disk signature */
-        uint32_t sectors = total * (BLOCK / 512);
-        uint32_t last = sectors - 1, c, h, s;
+    if (partitions) {
+        /* What is not the EFI image, before and after it, as partitions of
+         * type 0xCD (a CD's contents); the first 32 KiB, where the volume
+         * has nothing, stay outside them for the boot loader. */
+        uint32_t sectors = total * (BLOCK / 512), first = 16 * (BLOCK / 512);
+        uint32_t efi_start = efi ? efi->lba * (BLOCK / 512) : sectors;
+        uint32_t efi_end = efi ? efi_start + blocks(efi->size) * (BLOCK / 512) : sectors;
+        const struct { uint32_t start, end; uint8_t type; } parts[3] = {
+            { first, efi_start, 0xCD }, { efi_start, efi_end, 0xEF }, { efi_end, sectors, 0xCD },
+        };
         uint8_t *e = sector + 446;
-        e[0] = 0x80;
-        e[1] = 0; e[2] = 2; e[3] = 0;           /* CHS of sector 1 */
-        e[4] = 0xCD;
-        c = last / (MBR_HEADS * MBR_SECTORS);
-        h = last / MBR_SECTORS % MBR_HEADS;
-        s = last % MBR_SECTORS + 1;
-        if (c > 1023) {
-            c = 1023; h = MBR_HEADS - 1; s = MBR_SECTORS;
+        for (int i = 0; i < 3; i++) {
+            if (parts[i].end <= parts[i].start)
+                continue;
+            mbr_chs(e + 1, parts[i].start);
+            e[4] = parts[i].type;
+            mbr_chs(e + 5, parts[i].end - 1);
+            le32(e + 8, parts[i].start);
+            le32(e + 12, parts[i].end - parts[i].start);
+            e += 16;
         }
-        e[5] = (uint8_t)h;
-        e[6] = (uint8_t)(s | (c >> 2 & 0xC0));
-        e[7] = (uint8_t)c;
-        le32(e + 8, 1);
-        le32(e + 12, sectors - 1);
+        sector[446] = 0x80;                     /* some BIOSes start only a disk with an active partition */
         sector[510] = 0x55;
         sector[511] = 0xAA;
     }

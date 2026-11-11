@@ -9,45 +9,40 @@
  * moves and XORPS used here neither read nor change MXCSR or the x87.
  *
  * Only for use once fpu_init() has set CR4.OSFXSR (kernel_sse).
+ *
+ * Arguments arrive in %rdi, %rsi and %rdx (and stay there: nothing here
+ * is called); %rax, %rcx, %r8 and %r9 are free.
  */
-
 #define CR0_TS 8
 
-/* Arguments at 8(%ebp), 12(%ebp), 16(%ebp); %esi, %edi and %ebx are free. */
 .macro SSE_BEGIN
-    pushl %ebp
-    movl %esp, %ebp
-    pushl %ebx
-    pushl %esi
-    pushl %edi
-    pushfl
+    pushq %rbp
+    movq %rsp, %rbp
+    pushfq
     cli
-    movl %cr0, %eax
-    pushl %eax
+    movq %cr0, %rax
+    pushq %rax
     clts
-    andl $-16, %esp
-    subl $64, %esp
-    movaps %xmm0, (%esp)
-    movaps %xmm1, 16(%esp)
-    movaps %xmm2, 32(%esp)
-    movaps %xmm3, 48(%esp)
+    andq $-16, %rsp
+    subq $64, %rsp
+    movaps %xmm0, (%rsp)
+    movaps %xmm1, 16(%rsp)
+    movaps %xmm2, 32(%rsp)
+    movaps %xmm3, 48(%rsp)
 .endm
 
 .macro SSE_END
-    movaps (%esp), %xmm0
-    movaps 16(%esp), %xmm1
-    movaps 32(%esp), %xmm2
-    movaps 48(%esp), %xmm3
-    leal -20(%ebp), %esp
-    popl %eax
+    movaps (%rsp), %xmm0
+    movaps 16(%rsp), %xmm1
+    movaps 32(%rsp), %xmm2
+    movaps 48(%rsp), %xmm3
+    leaq -16(%rbp), %rsp
+    popq %rax
     testl $CR0_TS, %eax
     jz 9f
-    movl %eax, %cr0                 /* TS was set: set it again */
-9:  popfl
-    popl %edi
-    popl %esi
-    popl %ebx
-    popl %ebp
+    movq %rax, %cr0                 /* TS was set: set it again */
+9:  popfq
+    popq %rbp
     ret
 .endm
 
@@ -58,14 +53,13 @@
 .type sse_zero_page, @function
 sse_zero_page:
     SSE_BEGIN
-    movl 8(%ebp), %edi
     xorps %xmm0, %xmm0
     movl $4096 / 64, %ecx
-1:  movaps %xmm0, (%edi)
-    movaps %xmm0, 16(%edi)
-    movaps %xmm0, 32(%edi)
-    movaps %xmm0, 48(%edi)
-    addl $64, %edi
+1:  movaps %xmm0, (%rdi)
+    movaps %xmm0, 16(%rdi)
+    movaps %xmm0, 32(%rdi)
+    movaps %xmm0, 48(%rdi)
+    addq $64, %rdi
     decl %ecx
     jnz 1b
     SSE_END
@@ -80,20 +74,18 @@ sse_zero_page:
 .type sse_copy_page, @function
 sse_copy_page:
     SSE_BEGIN
-    movl 8(%ebp), %edi
-    movl 12(%ebp), %esi
     movl $4096 / 64, %ecx
-1:  prefetchnta 256(%esi)
-    movaps (%esi), %xmm0
-    movaps 16(%esi), %xmm1
-    movaps 32(%esi), %xmm2
-    movaps 48(%esi), %xmm3
-    movntps %xmm0, (%edi)
-    movntps %xmm1, 16(%edi)
-    movntps %xmm2, 32(%edi)
-    movntps %xmm3, 48(%edi)
-    addl $64, %esi
-    addl $64, %edi
+1:  prefetchnta 256(%rsi)
+    movaps (%rsi), %xmm0
+    movaps 16(%rsi), %xmm1
+    movaps 32(%rsi), %xmm2
+    movaps 48(%rsi), %xmm3
+    movntps %xmm0, (%rdi)
+    movntps %xmm1, 16(%rdi)
+    movntps %xmm2, 32(%rdi)
+    movntps %xmm3, 48(%rdi)
+    addq $64, %rsi
+    addq $64, %rdi
     decl %ecx
     jnz 1b
     sfence
@@ -110,53 +102,51 @@ sse_copy_page:
 .type sse_copy, @function
 sse_copy:
     SSE_BEGIN
-    movl 8(%ebp), %edi
-    movl 12(%ebp), %esi
-    movl 16(%ebp), %ebx
-    cmpl $64, %ebx
+    movq %rdx, %r8                  /* bytes left */
+    cmpq $64, %r8
     jb 4f
-    movl %edi, %ecx                 /* bytes up to a 16-byte boundary of dst */
-    negl %ecx
-    andl $15, %ecx
-    subl %ecx, %ebx
+    movq %rdi, %rcx                 /* bytes up to a 16-byte boundary of dst */
+    negq %rcx
+    andq $15, %rcx
+    subq %rcx, %r8
     rep movsb
-    movl %ebx, %edx
-    shrl $6, %edx                   /* 64-byte blocks */
-    andl $63, %ebx
-    testl %edx, %edx
+    movq %r8, %rdx
+    shrq $6, %rdx                   /* 64-byte blocks */
+    andq $63, %r8
+    testq %rdx, %rdx
     jz 4f
-    testl $15, %esi
+    testq $15, %rsi
     jnz 2f
-1:  movaps (%esi), %xmm0
-    movaps 16(%esi), %xmm1
-    movaps 32(%esi), %xmm2
-    movaps 48(%esi), %xmm3
-    movaps %xmm0, (%edi)
-    movaps %xmm1, 16(%edi)
-    movaps %xmm2, 32(%edi)
-    movaps %xmm3, 48(%edi)
-    addl $64, %esi
-    addl $64, %edi
-    decl %edx
+1:  movaps (%rsi), %xmm0
+    movaps 16(%rsi), %xmm1
+    movaps 32(%rsi), %xmm2
+    movaps 48(%rsi), %xmm3
+    movaps %xmm0, (%rdi)
+    movaps %xmm1, 16(%rdi)
+    movaps %xmm2, 32(%rdi)
+    movaps %xmm3, 48(%rdi)
+    addq $64, %rsi
+    addq $64, %rdi
+    decq %rdx
     jnz 1b
     jmp 4f
-2:  movups (%esi), %xmm0
-    movups 16(%esi), %xmm1
-    movups 32(%esi), %xmm2
-    movups 48(%esi), %xmm3
-    movaps %xmm0, (%edi)
-    movaps %xmm1, 16(%edi)
-    movaps %xmm2, 32(%edi)
-    movaps %xmm3, 48(%edi)
-    addl $64, %esi
-    addl $64, %edi
-    decl %edx
+2:  movups (%rsi), %xmm0
+    movups 16(%rsi), %xmm1
+    movups 32(%rsi), %xmm2
+    movups 48(%rsi), %xmm3
+    movaps %xmm0, (%rdi)
+    movaps %xmm1, 16(%rdi)
+    movaps %xmm2, 32(%rdi)
+    movaps %xmm3, 48(%rdi)
+    addq $64, %rsi
+    addq $64, %rdi
+    decq %rdx
     jnz 2b
-4:  movl %ebx, %ecx                 /* the rest, a word at a time */
-    shrl $2, %ecx
-    rep movsl
-    movl %ebx, %ecx
-    andl $3, %ecx
+4:  movq %r8, %rcx                  /* the rest, eight bytes at a time */
+    shrq $3, %rcx
+    rep movsq
+    movq %r8, %rcx
+    andq $7, %rcx
     rep movsb
     SSE_END
 .size sse_copy, . - sse_copy
@@ -166,34 +156,30 @@ sse_copy:
 .type sse_fill, @function
 sse_fill:
     SSE_BEGIN
-    movl 8(%ebp), %edi
-    movl 12(%ebp), %eax
-    movl 16(%ebp), %ebx
-    shrl $2, %ebx                   /* in words from here on */
-1:  testl $15, %edi                 /* words up to a 16-byte boundary */
+    movl %esi, %eax
+    movq %rdx, %r8
+    shrq $2, %r8                    /* in words from here on */
+1:  testq $15, %rdi                 /* words up to a 16-byte boundary */
     jz 2f
-    testl %ebx, %ebx
+    testq %r8, %r8
     jz 5f
     stosl
-    decl %ebx
+    decq %r8
     jmp 1b
-2:  subl $16, %esp                  /* the pattern in all four lanes of xmm0 */
-    movl %eax, (%esp)
-    movss (%esp), %xmm0
-    addl $16, %esp
+2:  movd %eax, %xmm0                /* the pattern in all four lanes of xmm0 */
     shufps $0, %xmm0, %xmm0
-    movl %ebx, %edx
-    shrl $4, %edx                   /* 64-byte blocks */
+    movq %r8, %rdx
+    shrq $4, %rdx                   /* 64-byte blocks */
     jz 4f
-3:  movaps %xmm0, (%edi)
-    movaps %xmm0, 16(%edi)
-    movaps %xmm0, 32(%edi)
-    movaps %xmm0, 48(%edi)
-    addl $64, %edi
-    decl %edx
+3:  movaps %xmm0, (%rdi)
+    movaps %xmm0, 16(%rdi)
+    movaps %xmm0, 32(%rdi)
+    movaps %xmm0, 48(%rdi)
+    addq $64, %rdi
+    decq %rdx
     jnz 3b
-4:  movl %ebx, %ecx
-    andl $15, %ecx
+4:  movq %r8, %rcx
+    andq $15, %rcx
     rep stosl
 5:  SSE_END
 .size sse_fill, . - sse_fill

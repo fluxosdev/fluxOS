@@ -18,7 +18,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("disk")
 parser.add_argument("sample")
 parser.add_argument("outdir")
-parser.add_argument("--qemu", default="qemu-system-i386")
+parser.add_argument("--qemu", default="qemu-system-x86_64")
 parser.add_argument("--rootfs", default="build/rootfs")
 parser.add_argument("--seconds", type=int, default=25, help="how long after boot to let it play")
 parser.add_argument("--shots", type=int, default=3)
@@ -43,7 +43,7 @@ with tempfile.TemporaryDirectory(prefix="flux-mp-") as tmp:
         subprocess.run(["mcopy", "-o", "-i", target, src, dst], check=True)
     wav = out / "sound.wav"
     sock = pathlib.Path(tmp) / "mon.sock"
-    cmd = [args.qemu, "-enable-kvm", "-cpu", "core2duo,-lm", "-smp", "2", "-m", "1024",
+    cmd = [args.qemu, "-enable-kvm", "-cpu", "core2duo", "-smp", "2", "-m", "1024",
            "-drive", f"file={disk},format=raw,if=ide,index=0", "-boot", "c", "-display", "none",
            "-vga", "std", "-monitor", f"unix:{sock},server,nowait", "-serial", "file:" + str(out / "serial.log"),
            "-audiodev", f"wav,id=snd,path={wav}", "-device", "sb16,audiodev=snd", "-nic", "none"]

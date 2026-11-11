@@ -17,14 +17,16 @@
 struct idt_entry {
     uint16_t base_low;
     uint16_t sel;
-    uint8_t zero;
+    uint8_t ist;                        /* a stack of the TSS to switch to, or 0 */
     uint8_t flags;
-    uint16_t base_high;
+    uint16_t base_mid;
+    uint32_t base_high;
+    uint32_t reserved;
 } __attribute__((packed));
 
 struct idt_ptr {
     uint16_t limit;
-    uint32_t base;
+    uint64_t base;
 } __attribute__((packed));
 
 static struct idt_entry idt[256];
@@ -34,7 +36,7 @@ static struct idt_ptr idt_desc;
 #define IRQ_SHARED 4
 static irq_handler_t irq_handlers[16][IRQ_SHARED];
 
-extern uint32_t isr_stub_table[48];
+extern uint64_t isr_stub_table[48];
 extern void isr128(void);
 extern void isr240(void), isr241(void), isr242(void), isr243(void), isr244(void), isr255(void);
 void idt_load(struct idt_ptr *p);
@@ -52,12 +54,13 @@ static const char *exception_names[32] = {
     "Reserved",
 };
 
-static void idt_set(int vec, uint32_t handler, uint8_t flags)
+static void idt_set(int vec, uint64_t handler, uint8_t flags)
 {
     idt[vec].base_low = handler & 0xFFFF;
-    idt[vec].base_high = (handler >> 16) & 0xFFFF;
+    idt[vec].base_mid = (handler >> 16) & 0xFFFF;
+    idt[vec].base_high = (uint32_t)(handler >> 32);
     idt[vec].sel = SEG_KCODE;
-    idt[vec].zero = 0;
+    idt[vec].ist = 0;
     idt[vec].flags = flags;
 }
 
@@ -131,20 +134,21 @@ void idt_init(void)
 {
     memset(idt, 0, sizeof(idt));
     pic_remap();
-    /* 0x8E: present, ring 0, 32-bit interrupt gate (IF cleared on entry) */
+    /* 0x8E: present, ring 0, interrupt gate (IF cleared on entry) */
     for (int i = 0; i < 48; i++)
         idt_set(i, isr_stub_table[i], 0x8E);
+    idt[8].ist = 1;                     /* a double fault: on its own stack (gdt.c) */
     /* 0xEE: same, but callable from ring 3 */
-    idt_set(SYSCALL_VEC, (uint32_t)isr128, 0xEE);
-    idt_set(VEC_RESCHED, (uint32_t)isr240, 0x8E);
-    idt_set(VEC_TICK, (uint32_t)isr241, 0x8E);
-    idt_set(VEC_TLB, (uint32_t)isr242, 0x8E);
-    idt_set(VEC_STOP, (uint32_t)isr243, 0x8E);
-    idt_set(VEC_PARK, (uint32_t)isr244, 0x8E);
-    idt_set(VEC_SPURIOUS, (uint32_t)isr255, 0x8E);
+    idt_set(SYSCALL_VEC, (uint64_t)(uintptr_t)isr128, 0xEE);
+    idt_set(VEC_RESCHED, (uint64_t)(uintptr_t)isr240, 0x8E);
+    idt_set(VEC_TICK, (uint64_t)(uintptr_t)isr241, 0x8E);
+    idt_set(VEC_TLB, (uint64_t)(uintptr_t)isr242, 0x8E);
+    idt_set(VEC_STOP, (uint64_t)(uintptr_t)isr243, 0x8E);
+    idt_set(VEC_PARK, (uint64_t)(uintptr_t)isr244, 0x8E);
+    idt_set(VEC_SPURIOUS, (uint64_t)(uintptr_t)isr255, 0x8E);
 
     idt_desc.limit = sizeof(idt) - 1;
-    idt_desc.base = (uint32_t)&idt;
+    idt_desc.base = (uint64_t)(uintptr_t)&idt;
     idt_load(&idt_desc);
 }
 
@@ -155,10 +159,13 @@ void idt_init_ap(void)
 
 static void dump_frame(struct trapframe *tf)
 {
-    kprintf("  eax=%08x ebx=%08x ecx=%08x edx=%08x\n", tf->eax, tf->ebx, tf->ecx, tf->edx);
-    kprintf("  esi=%08x edi=%08x ebp=%08x eip=%08x\n", tf->esi, tf->edi, tf->ebp, tf->eip);
-    kprintf("  cs=%04x ds=%04x eflags=%08x err=%08x cr2=%08x\n",
-            tf->cs, tf->ds, tf->eflags, tf->err_code, read_cr2());
+    kprintf("  rax=%016lx rbx=%016lx rcx=%016lx\n", tf->rax, tf->rbx, tf->rcx);
+    kprintf("  rdx=%016lx rsi=%016lx rdi=%016lx\n", tf->rdx, tf->rsi, tf->rdi);
+    kprintf("  rbp=%016lx rsp=%016lx rip=%016lx\n", tf->rbp, tf->rsp, tf->rip);
+    kprintf("  r8=%016lx r9=%016lx r10=%016lx r11=%016lx\n", tf->r8, tf->r9, tf->r10, tf->r11);
+    kprintf("  r12=%016lx r13=%016lx r14=%016lx r15=%016lx\n", tf->r12, tf->r13, tf->r14, tf->r15);
+    kprintf("  cs=%04lx ss=%04lx rflags=%08lx err=%08lx cr2=%016lx\n",
+            tf->cs, tf->ss, tf->rflags, tf->err_code, read_cr2());
 }
 
 static int exception_signal(uint32_t vec)
@@ -174,22 +181,22 @@ static int exception_signal(uint32_t vec)
 
 static void handle_exception(struct trapframe *tf, int from_user)
 {
-    uint32_t vec = tf->int_no;
+    uint32_t vec = (uint32_t)tf->int_no;
 
-    uint32_t addr = read_cr2();         /* before anything can fault again */
+    uint64_t addr = read_cr2();         /* before anything can fault again */
     if (vec == 14 && addr >= USER_BASE && addr < USER_TOP && current && !current->kthread) {
         int write = (tf->err_code & 2) != 0;
         if (from_user)
             sti();
-        int grown = proc_page_fault(addr, write);
+        int grown = proc_page_fault((uint32_t)addr, write);
         if (from_user)
             cli();
         if (grown)
             return;
     }
     /* copy_from_user/copy_to_user found the page gone: they return -EFAULT. */
-    if (!from_user && vec == 14 && tf->eip == (uint32_t)uaccess_copy_ip) {
-        tf->eip = (uint32_t)uaccess_fixup;
+    if (!from_user && vec == 14 && tf->rip == (uint64_t)(uintptr_t)uaccess_copy_ip) {
+        tf->rip = (uint64_t)(uintptr_t)uaccess_fixup;
         return;
     }
     if (from_user) {
@@ -201,10 +208,10 @@ static void handle_exception(struct trapframe *tf, int from_user)
             klog("NMI while pid %d (%s) ran, eip %08x\n", current->pid, current->name, tf->eip);
             return;
         }
-        klog("pid %d (%s): %s at eip %08x, addr %08x, err %x\n",
+        klog("pid %d (%s): %s at eip %08x, addr %08lx, err %x\n",
              current->pid, current->name, exception_names[vec], tf->eip,
-             addr, tf->err_code);
-        current->fault_addr = addr;
+             addr, (uint32_t)tf->err_code);
+        current->fault_addr = (uint32_t)addr;   /* (a 32-bit program's faults are below 4 GiB) */
         proc_signal_force(current, exception_signal(vec));
         return;
     }
@@ -212,7 +219,7 @@ static void handle_exception(struct trapframe *tf, int from_user)
     /* The registers go to the log, where the panic screen shows them. */
     kprintf("\n%s (vector %u) in kernel mode\n", exception_names[vec], vec);
     dump_frame(tf);
-    panic("%s at %08x", exception_names[vec], tf->eip);
+    panic("%s at %016lx", exception_names[vec], tf->rip);
 }
 
 static void handle_irq(struct trapframe *tf)

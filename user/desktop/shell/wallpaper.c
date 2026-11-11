@@ -19,7 +19,7 @@
  * the Kinetik studies, at whatever size the screen is (Seashell's is a
  * plain sage gradient, corner to corner).
  *
- * The choice is kept for the next start in GRUB's environment block when
+ * The choice is kept for the next start in the boot partition's settings when
  * the system runs from a hard disk (fluxos_wall, fluxos_wallmode).
  */
 #include <stdio.h>
@@ -87,13 +87,13 @@ void wallpaper_resize(void)
 static void save_setting(void)
 {
     char dir[128];
-    if (!grubenv_boot_dir(dir, sizeof(dir)))
+    if (!bootenv_boot_dir(dir, sizeof(dir)))
         return;
     char color[8];
     snprintf(color, sizeof(color), "%06X", (unsigned)desk_color);
     const char *keys[3] = { "fluxos_wall", "fluxos_wallmode", "fluxos_wallcolor" };
     const char *vals[3] = { cur_path[0] ? cur_path : "none", mode_keys[cur_mode], color };
-    grubenv_update(dir, keys, vals, 3);
+    bootenv_update(dir, keys, vals, 3);
 }
 
 void wallpaper_set_color(uint32_t rgb, int save)
@@ -174,13 +174,13 @@ void wallpaper_init(void)
     char dir[128], path[256], name[16];
     const char *use = WALLPAPER_DEFAULT;
     int mode = WALL_FILL;
-    if (grubenv_boot_dir(dir, sizeof(dir))) {
-        if (grubenv_get(dir, "fluxos_wall", path, sizeof(path)) && path[0])
+    if (bootenv_boot_dir(dir, sizeof(dir))) {
+        if (bootenv_get(dir, "fluxos_wall", path, sizeof(path)) && path[0])
             use = !strcmp(path, "none") ? "" : path;
         uint32_t rgb;
-        if (grubenv_get(dir, "fluxos_wallcolor", name, sizeof(name)) && parse_hex_color(name, &rgb) == 0)
+        if (bootenv_get(dir, "fluxos_wallcolor", name, sizeof(name)) && parse_hex_color(name, &rgb) == 0)
             desk_color = rgb;
-        if (grubenv_get(dir, "fluxos_wallmode", name, sizeof(name)))
+        if (bootenv_get(dir, "fluxos_wallmode", name, sizeof(name)))
             for (int i = 0; i < WALL_MODES; i++)
                 if (!strcmp(name, mode_keys[i]))
                     mode = i;

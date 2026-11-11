@@ -1,6 +1,6 @@
 /*
  * Runs as the setup system's init in "make test-install-qemu": installs
- * fluxOS from the CD (mkiso's, with GRUB from firmware/grub) onto the blank
+ * fluxOS from the CD (mkiso's, with Limine from firmware/limine) onto the blank
  * disk /dev/hda with fluxinstall, as Setup would, then powers off. The
  * script then starts the computer from that disk alone. /etc/install-args,
  * one per line, are more options for fluxinstall (-e /src, say).

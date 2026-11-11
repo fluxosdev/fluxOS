@@ -367,11 +367,11 @@ static int winsize_ioctl(struct tty *t, uint32_t req, uint32_t arg)
         spin_lock(&tty_lock);
         ws = t->ws;
         spin_unlock(&tty_lock);
-        return copy_to_user((void *)arg, &ws, sizeof(ws)) < 0 ? -EFAULT : 0;
+        return copy_to_user(UPTR(arg), &ws, sizeof(ws)) < 0 ? -EFAULT : 0;
     }
     if (req != TIOCSWINSZ)
         return -ENOTTY;
-    if (copy_from_user(&ws, (const void *)arg, sizeof(ws)) < 0)
+    if (copy_from_user(&ws, UPTR(arg), sizeof(ws)) < 0)
         return -EFAULT;
     spin_lock(&tty_lock);
     int changed = ws.ws_row != t->ws.ws_row || ws.ws_col != t->ws.ws_col, pgid = t->fg_pgid;

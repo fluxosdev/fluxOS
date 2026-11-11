@@ -58,7 +58,7 @@ static uint32_t fb16_mask[3];           /* and their bits in the pixel */
 /* With two pages of the screen, frames are drawn on the one not shown and
  * flipped to; that page still lacks what changed in the frame before.
  * Both this and the hardware pointer are used only when the adapter's own
- * driver is chosen in Display Properties (fluxos_driver in grubenv). */
+ * driver is chosen in Display Properties (fluxos_driver in the boot partition's settings). */
 static int accel_wanted;
 static int flip_ok;
 static uint32_t page_offset;
@@ -3524,8 +3524,8 @@ void wm_init(int setup)
     mx = screen_w / 2;
     my = screen_h / 2;
     char dir[128], drv[16];
-    accel_wanted = grubenv_boot_dir(dir, sizeof(dir)) &&
-                   grubenv_get(dir, "fluxos_driver", drv, sizeof(drv)) &&
+    accel_wanted = bootenv_boot_dir(dir, sizeof(dir)) &&
+                   bootenv_get(dir, "fluxos_driver", drv, sizeof(drv)) &&
                    (!strcmp(drv, "radeon") || !strcmp(drv, "intel") || !strcmp(drv, "navi"));
     use_adapter();
     update_clock();

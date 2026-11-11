@@ -1,52 +1,56 @@
-/* fluxOS kernel link script: loaded by GRUB at the 1 MiB mark. */
+/* fluxOS kernel link script: a 64-bit kernel in the top 2 GiB of the address
+ * space, where the Limine boot protocol wants it (and -mcmodel=kernel). Limine
+ * puts it wherever it finds physical memory and maps it here; the kernel then
+ * makes its own page tables (vmm.c). */
+OUTPUT_FORMAT(elf64-x86-64)
 ENTRY(_start)
 
-/* Reserve the kernel in one operation. Separate adjacent LOAD segments can
- * leave GRUB relocator free-list headers in the next segment's destination.
- * The kernel establishes its own page permissions after the handoff. */
 PHDRS
 {
-    kernel PT_LOAD FILEHDR PHDRS FLAGS(7);
-    stack PT_GNU_STACK FLAGS(6);
+    text   PT_LOAD FLAGS(5);
+    rodata PT_LOAD FLAGS(4);
+    data   PT_LOAD FLAGS(6);
+    stack  PT_GNU_STACK FLAGS(6);
 }
 
 SECTIONS
 {
-    . = 1M;
+    . = 0xFFFFFFFF80000000;
     kernel_start = .;
-    /* Keep the Multiboot header in the first 8 KiB of the file even when a
-     * DMA buffer raises the segment alignment above a page. */
-    . += SIZEOF_HEADERS;
 
-    .text BLOCK(4K) : ALIGN(4K)
+    .text : ALIGN(4K)
     {
-        *(.multiboot)
         *(.text .text.*)
-    } :kernel
+    } :text
 
-    .rodata BLOCK(4K) : ALIGN(4K)
+    .rodata : ALIGN(4K)
     {
         *(.rodata .rodata.*)
-    } :kernel
+    } :rodata
 
-    .data BLOCK(4K) : ALIGN(4K)
+    /* What the kernel asks of Limine (bootinfo.c): between the two markers, so
+     * that the loader need not search the whole image for them. */
+    .data : ALIGN(4K)
     {
+        KEEP(*(.limine_requests_start))
+        KEEP(*(.limine_requests))
+        KEEP(*(.limine_requests_end))
         *(.data .data.*)
-    } :kernel
+    } :data
 
-    .bss BLOCK(4K) : ALIGN(4K)
+    .bss : ALIGN(4K)
     {
         *(COMMON)
         *(.bss .bss.*)
-    } :kernel
+    } :data
 
     . = ALIGN(4K);
     kernel_end = .;
 
     /DISCARD/ :
     {
+        *(.eh_frame*)
         *(.comment)
-        *(.note .note.*)
-        *(.eh_frame .eh_frame_hdr)
+        *(.note.gnu.property)
     }
 }

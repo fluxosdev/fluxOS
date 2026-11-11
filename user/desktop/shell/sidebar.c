@@ -24,7 +24,7 @@
  * twice, over black and over white, which tells the compositor how much of
  * what is under each pixel shows through it (gfx_blit_glass).
  *
- * The choice is kept in GRUB's environment block when the system runs from
+ * The choice is kept in the boot partition's settings when the system runs from
  * a hard disk (fluxos_sidebar: "on" or "off", then the widgets shown).
  */
 #include <flux.h>
@@ -706,14 +706,14 @@ void sidebar_tick(void)
 static void save(void)
 {
     char dir[128], value[64];
-    if (!grubenv_boot_dir(dir, sizeof(dir)))
+    if (!bootenv_boot_dir(dir, sizeof(dir)))
         return;
     int n = snprintf(value, sizeof(value), "%s", shown ? "on" : "off");
     for (int i = 0; i < NWIDGETS; i++)
         if (enabled[i])
             n += snprintf(value + n, sizeof(value) - (size_t)n, ",%s", widget_keys[i]);
     const char *keys[1] = { "fluxos_sidebar" }, *vals[1] = { value };
-    grubenv_update(dir, keys, vals, 1);
+    bootenv_update(dir, keys, vals, 1);
 }
 
 static void toggle(int i)
@@ -807,7 +807,7 @@ void sidebar_init(void)
     view_year = tm.tm_year + 1900;
     view_month = tm.tm_mon;
     shown = screen_w >= 1024;
-    if (!grubenv_boot_dir(dir, sizeof(dir)) || !grubenv_get(dir, "fluxos_sidebar", value, sizeof(value)))
+    if (!bootenv_boot_dir(dir, sizeof(dir)) || !bootenv_get(dir, "fluxos_sidebar", value, sizeof(value)))
         return;
     shown = !strncmp(value, "on", 2);
     for (int i = 0; i < NWIDGETS; i++)

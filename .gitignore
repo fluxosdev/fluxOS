@@ -1,7 +1,6 @@
 # Build output
 /build/
 /build-*/
-/grub-2.06/
 *.o
 *.d
 *.a
@@ -10,7 +9,7 @@
 !/firmware/**/*.bin
 *.kernel
 
-# Disk images (GRUB's boot images in firmware/grub are sources)
+# Disk images (Limine's in firmware/limine are sources)
 *.iso
 *.img
 !/firmware/**/*.img

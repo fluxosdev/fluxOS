@@ -321,14 +321,14 @@ static int create_io_queues(struct nvme_ctrl *c)
     submit(c, &c->admin, &cmd, CMD_TIMEOUT);    /* one of each; refusals are harmless */
 
     cmd = (struct nvme_sqe){
-        .cdw0 = ADM_CREATE_CQ, .prp1 = (uint32_t)c->io.cq,
+        .cdw0 = ADM_CREATE_CQ, .prp1 = virt_to_phys(c->io.cq),
         .cdw10 = (uint32_t)(c->io.depth - 1) << 16 | c->io.qid,
         .cdw11 = 1u << 1 | 1u,                  /* interrupts on (vector 0), contiguous */
     };
     if (submit(c, &c->admin, &cmd, CMD_TIMEOUT) != 0)
         return -1;
     cmd = (struct nvme_sqe){
-        .cdw0 = ADM_CREATE_SQ, .prp1 = (uint32_t)c->io.sq,
+        .cdw0 = ADM_CREATE_SQ, .prp1 = virt_to_phys(c->io.sq),
         .cdw10 = (uint32_t)(c->io.depth - 1) << 16 | c->io.qid,
         .cdw11 = (uint32_t)c->io.qid << 16 | 1u,   /* completions to that queue, contiguous */
     };
@@ -354,8 +354,8 @@ static int ctrl_start(struct nvme_ctrl *c)
     spin_unlock(&c->lock);
 
     wr32(c, REG_AQA, (uint32_t)(ADMIN_DEPTH - 1) << 16 | (ADMIN_DEPTH - 1));
-    wr64(c, REG_ASQ, (uint32_t)c->admin.sq);
-    wr64(c, REG_ACQ, (uint32_t)c->admin.cq);
+    wr64(c, REG_ASQ, virt_to_phys(c->admin.sq));
+    wr64(c, REG_ACQ, virt_to_phys(c->admin.cq));
     wr32(c, REG_INTMS, 1);
     wr32(c, REG_CC, CC_IOCQES | CC_IOSQES | CC_EN);    /* NVM commands, 4 KiB pages */
     if (wait_csts(c, CSTS_RDY | CSTS_CFS, CSTS_RDY) < 0)
@@ -373,8 +373,8 @@ static int ctrl_start(struct nvme_ctrl *c)
 
 /*
  * Describe [buf, buf + len) to the controller as a PRP pair: the first
- * page, then the second or a list of the rest. Kernel memory below
- * 1 GiB is identity-mapped, so contiguous here is contiguous to it.
+ * page, then the second or a list of the rest. Kernel memory is in the
+ * direct map, so what is contiguous here is contiguous to it.
  */
 static void build_prps(struct nvme_ctrl *c, struct nvme_sqe *cmd, uint32_t addr, uint32_t len)
 {
@@ -389,16 +389,15 @@ static void build_prps(struct nvme_ctrl *c, struct nvme_sqe *cmd, uint32_t addr,
     }
     for (uint32_t i = 0; i * PAGE_SIZE < rest; i++)
         c->prp_list[i] = next + i * PAGE_SIZE;
-    cmd->prp2 = (uint32_t)c->prp_list;
+    cmd->prp2 = virt_to_phys(c->prp_list);
 }
 
 static int ns_rw(struct nvme_ns *ns, uint32_t lba, uint32_t count, void *buf, int write)
 {
     struct nvme_ctrl *c = ns->c;
     uint32_t len = count << ns->shift;
-    uint32_t addr = (uint32_t)buf;
     void *mem = buf;
-    if (addr < 0x100000 || addr + len > KERNEL_SPACE_END || addr + len < addr || (addr & 3)) {
+    if (!virt_dma_ok(buf, len) || ((uintptr_t)buf & 3)) {
         mem = c->bounce;
         if (write)
             memcpy(mem, buf, len);
@@ -407,7 +406,7 @@ static int ns_rw(struct nvme_ns *ns, uint32_t lba, uint32_t count, void *buf, in
         .cdw0 = write ? NVM_WRITE : NVM_READ, .nsid = ns->nsid,
         .cdw10 = lba, .cdw11 = 0, .cdw12 = count - 1,
     };
-    build_prps(c, &cmd, (uint32_t)mem, len);
+    build_prps(c, &cmd, virt_to_phys(mem), len);
     int r = submit(c, &c->io, &cmd, CMD_TIMEOUT);
     if (r != 0) {
         if (r > 0)
@@ -480,7 +479,7 @@ static int nvme_trim(struct blockdev *bd, const struct blk_extent *ext, uint32_t
         range[4 * i + 2] = ext[i].lba;
         range[4 * i + 3] = 0;
     }
-    struct nvme_sqe cmd = { .cdw0 = NVM_DSM, .nsid = ns->nsid, .prp1 = (uint32_t)range,
+    struct nvme_sqe cmd = { .cdw0 = NVM_DSM, .nsid = ns->nsid, .prp1 = virt_to_phys(range),
                             .cdw10 = n - 1, .cdw11 = DSM_AD };
     int r = submit(c, &c->io, &cmd, 30000);
     if (r > 0)
@@ -493,7 +492,7 @@ static int nvme_trim(struct blockdev *bd, const struct blk_extent *ext, uint32_t
 
 static int identify(struct nvme_ctrl *c, uint32_t cns, uint32_t nsid, void *page)
 {
-    struct nvme_sqe cmd = { .cdw0 = ADM_IDENTIFY, .nsid = nsid, .prp1 = (uint32_t)page,
+    struct nvme_sqe cmd = { .cdw0 = ADM_IDENTIFY, .nsid = nsid, .prp1 = virt_to_phys(page),
                             .cdw10 = cns };
     return submit(c, &c->admin, &cmd, CMD_TIMEOUT);
 }
@@ -581,14 +580,14 @@ static void ctrl_init(const struct pci_dev *pci)
     for (int i = 0; i < 5; i++)
         if (!(pages[i] = pmm_alloc()))
             goto nomem;
-    c->bounce = (uint8_t *)pmm_alloc_contig(BOUNCE_SIZE / PAGE_SIZE);
+    c->bounce = pmm_alloc_pages(BOUNCE_SIZE / PAGE_SIZE);
     if (!c->bounce)
         goto nomem;
-    c->admin = (struct nvme_queue){ .sq = (void *)pages[0], .cq = (void *)pages[1],
+    c->admin = (struct nvme_queue){ .sq = phys_to_virt(pages[0]), .cq = phys_to_virt(pages[1]),
                                     .depth = ADMIN_DEPTH, .qid = 0 };
-    c->io = (struct nvme_queue){ .sq = (void *)pages[2], .cq = (void *)pages[3],
+    c->io = (struct nvme_queue){ .sq = phys_to_virt(pages[2]), .cq = phys_to_virt(pages[3]),
                                  .depth = (uint16_t)MIN(mqes, (uint32_t)IO_DEPTH), .qid = 1 };
-    c->prp_list = (uint64_t *)pages[4];
+    c->prp_list = (uint64_t *)phys_to_virt(pages[4]);
     c->max_xfer = BOUNCE_SIZE;
     nctrls++;
 
@@ -597,13 +596,13 @@ static void ctrl_init(const struct pci_dev *pci)
         return;
     }
 
-    uint8_t *id = (uint8_t *)pmm_alloc();
+    uint8_t *id = pmm_alloc_page();
     if (!id)
         return;
     char model[44];
     if (identify(c, 1, 0, id) != 0) {
         boot_warn("nvme%d: controller does not answer IDENTIFY", c->num);
-        pmm_free((uint32_t)id);
+        pmm_free(virt_to_phys(id));
         return;
     }
     ident_string(id + 24, 40, model, sizeof(model));
@@ -618,7 +617,7 @@ static void ctrl_init(const struct pci_dev *pci)
             model, nn, nn == 1 ? "" : "s", c->irq, c->irq < 0 ? " (polled)" : "");
     for (uint32_t nsid = 1; nsid <= nn && c->nns < MAX_NS; nsid++)
         ns_probe(c, nsid, id, model);
-    pmm_free((uint32_t)id);
+    pmm_free(virt_to_phys(id));
 
     if (c->irq >= 0) {
         irq_register(c->irq, nvme_irq);

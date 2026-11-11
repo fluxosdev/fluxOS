@@ -23,6 +23,7 @@
  * /mnt/fdN and mounts a disk that is already in a drive.
  */
 #include "kernel.h"
+#include "mm.h"
 #include "arch.h"
 #include "blkdev.h"
 #include "drivers.h"
@@ -121,8 +122,9 @@ static volatile int fired;
 static int nopoll;                      /* floppy.nopoll: never look for new disks */
 
 /* One side of a track, in memory the DMA controller can reach: below
- * 16 MiB (the kernel is loaded at 1 MiB) and inside one 64 KiB page. */
-static uint8_t track_buf[MAX_SPT * SECTOR] __attribute__((aligned(32768)));
+ * 16 MiB and inside one 64 KiB page (pmm_alloc_isa()). */
+static uint8_t *track_buf;
+_Static_assert(MAX_SPT * SECTOR <= 32768, "what pmm_alloc_isa() gives");
 static struct fd_drive *cache_drive;    /* whose track track_buf holds, if any */
 static uint32_t cache_cyl, cache_head;
 
@@ -333,7 +335,7 @@ static void dma_setup(uint32_t addr, uint32_t len, int to_device)
 static int transfer(struct fd_drive *d, uint32_t cyl, uint32_t head, uint32_t sector,
                     uint32_t count, int write)
 {
-    dma_setup((uint32_t)track_buf + (sector - 1) * SECTOR, count * SECTOR, write);
+    dma_setup(virt_to_phys(track_buf) + (sector - 1) * SECTOR, count * SECTOR, write);
     set_rate(d->fmt->rate);
     uint8_t cmd[] = {
         write ? CMD_WRITE : CMD_READ, (uint8_t)(head << 2 | (uint32_t)d->unit),
@@ -614,14 +616,16 @@ static uint8_t cmos_read(uint8_t reg)
 
 void floppy_init(void)
 {
-    if ((uint32_t)track_buf + sizeof(track_buf) > DMA_LIMIT) {
-        klog("floppy: no DMA buffer below 16 MiB\n");
-        return;
-    }
     nopoll = cmdline_has("floppy.nopoll");
     uint8_t types = cmos_read(0x10);
     if (!types || inb(FDC_MSR) == 0xFF)
         return;                         /* no drives, or no controller */
+    uint32_t buf_phys = pmm_alloc_isa();
+    if (!buf_phys) {
+        klog("floppy: no DMA buffer below 16 MiB\n");
+        return;
+    }
+    track_buf = phys_to_virt(buf_phys);
     for (int unit = 0; unit < 2; unit++) {
         int type = unit == 0 ? types >> 4 : types & 0x0F;
         if (type < 1 || type > 6)

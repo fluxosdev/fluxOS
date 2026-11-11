@@ -1,18 +1,21 @@
 /*
- * Physical frame allocator: one bit per 4 KiB frame of the first 4 GiB
- * (without PAE, what a 32-bit address reaches).
+ * Physical frame allocator: one bit per 4 KiB frame of the first 4 GiB.
+ * Frame addresses fit 32 bits, which is what the device drivers give their
+ * hardware and what the rest of the kernel keeps them in; memory above
+ * 4 GiB is left unused.
  *
- * Low memory, the first GiB, is the kernel's identity-mapped memory: its
- * page tables, heap, stacks and DMA buffers come from there (pmm_alloc,
- * pmm_alloc_contig). High memory, above it, holds only user pages
- * (pmm_alloc_user, which falls back to low memory when high runs out);
- * the kernel reaches those through vmm.c's temporary mappings.
+ * Low memory, the first GiB, is the kernel's own: its page tables, heap,
+ * stacks and DMA buffers come from there (pmm_alloc, pmm_alloc_contig),
+ * the lowest of it last, where the oldest devices must have their buffers.
+ * High memory, above it, holds only user pages (pmm_alloc_user, which
+ * falls back to low memory when high runs out). The kernel reaches every
+ * frame through the direct map (phys_to_virt).
  */
 #include "kernel.h"
+#include "boot.h"
 #include "mm.h"
-#include "multiboot.h"
 
-#define LOW_FRAMES (KERNEL_SPACE_END / PAGE_SIZE)
+#define LOW_FRAMES (LOW_MEM_END / PAGE_SIZE)
 #define MAX_FRAMES (0x100000000ull / PAGE_SIZE)
 
 static uint32_t bitmap[MAX_FRAMES / 32];
@@ -22,6 +25,11 @@ static uint32_t free_frames, low_free_frames;
 static uint32_t (*reclaim_pages)(uint32_t);
 static uint32_t search_hint, high_hint;
 static spinlock_t pmm_lock = SPINLOCK_INIT("pmm");
+
+#define ISA_DMA_END     0x1000000u      /* what an ISA DMA controller's 24 address bits reach */
+#define ISA_BLOCK       32768u
+#define ISA_POOL_FRAMES 32              /* 128 KiB: four blocks */
+static uint32_t isa_pool, isa_pool_used;
 
 void pmm_set_reclaimer(uint32_t (*reclaim)(uint32_t))
 {
@@ -91,36 +99,66 @@ void pmm_release(uint32_t start, uint32_t end)
     spin_unlock(&pmm_lock);
 }
 
-void pmm_init(struct multiboot_info *mbi)
+void pmm_init(void)
 {
     memset(bitmap, 0xFF, sizeof(bitmap));
     memset(share_count, 0, sizeof(share_count));
     free_frames = low_free_frames = 0;
     total_frames = 0;
 
-    if (mbi->flags & MB_INFO_MMAP) {
-        uint32_t p = mbi->mmap_addr;
-        uint32_t end = mbi->mmap_addr + mbi->mmap_length;
-        while (p < end) {
-            struct multiboot_mmap_entry *e = (struct multiboot_mmap_entry *)p;
-            if (e->type == MULTIBOOT_MEMORY_AVAILABLE)
-                add_region(e->addr, e->addr + e->len);
-            p += e->size + sizeof(e->size);
-        }
-    } else if (mbi->flags & MB_INFO_MEMORY) {
-        add_region(0x100000, 0x100000 + (uint64_t)mbi->mem_upper * 1024);
-    } else {
-        panic("bootloader provided no memory information");
-    }
+    /* What the loader calls usable: not the kernel image, the initrd or the
+     * loader's own memory, which it lists apart. */
+    for (int i = 0; i < boot.nmem; i++)
+        if (boot.mem[i].type == BOOT_MEM_USABLE)
+            add_region(boot.mem[i].base, boot.mem[i].base + boot.mem[i].len);
+    if (!total_frames)
+        panic("the boot loader reported no usable memory");
 
-    /* Low memory (BIOS, VGA), the kernel image and boot modules. */
+    /* The first MiB stays out of it: the firmware's data, and the pages the
+     * other processors and a waking machine start in (smp.c, sleep.c). */
     pmm_reserve(0, 0x100000);
-    pmm_reserve((uint32_t)kernel_start, (uint32_t)kernel_end);
-    if (mbi->flags & MB_INFO_MODS) {
-        struct multiboot_module *mods = (struct multiboot_module *)mbi->mods_addr;
-        for (uint32_t i = 0; i < mbi->mods_count; i++)
-            pmm_reserve(mods[i].mod_start, mods[i].mod_end);
+
+    /* The ISA devices' buffers, before anything else takes the memory they
+     * can reach: the lowest free stretch, on a 64 KiB boundary. */
+    for (uint32_t f = 0x100000 / PAGE_SIZE; f + ISA_POOL_FRAMES <= ISA_DMA_END / PAGE_SIZE && !isa_pool; f += 16) {
+        uint32_t n = 0;
+        while (n < ISA_POOL_FRAMES && !frame_used(f + n))
+            n++;
+        if (n == ISA_POOL_FRAMES) {
+            for (uint32_t k = 0; k < n; k++)
+                frame_set(f + k);
+            isa_pool = f * PAGE_SIZE;
+        }
     }
+}
+
+/*
+ * Memory an ISA DMA controller can reach (the first 16 MiB) for a floppy
+ * or Sound Blaster driver's buffer: 32 KiB blocks on 32 KiB boundaries, so
+ * that none crosses the 64 KiB pages of that controller. Kept for good;
+ * 0 when there is none left.
+ */
+uint32_t pmm_alloc_isa(void)
+{
+    spin_lock(&pmm_lock);
+    uint32_t addr = 0;
+    if (isa_pool && isa_pool_used + ISA_BLOCK <= ISA_POOL_FRAMES * PAGE_SIZE) {
+        addr = isa_pool + isa_pool_used;
+        isa_pool_used += ISA_BLOCK;
+    }
+    spin_unlock(&pmm_lock);
+    return addr;
+}
+
+/* The boot loader's memory (its page tables and stack, and what it told
+ * the kernel, all copied by now: bootinfo.c): ordinary memory from here on. */
+void pmm_reclaim_loader(void)
+{
+    spin_lock(&pmm_lock);
+    for (int i = 0; i < boot.nmem; i++)
+        if (boot.mem[i].type == BOOT_MEM_LOADER && boot.mem[i].base >= 0x100000)
+            add_region(boot.mem[i].base, boot.mem[i].base + boot.mem[i].len);
+    spin_unlock(&pmm_lock);
 }
 
 /* A low frame with a caller-selected reserve; no callbacks or recursive reclaim. */

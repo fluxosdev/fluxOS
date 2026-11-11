@@ -7,8 +7,8 @@
  * processor's goes on taking the 8259 PIC's interrupts (ExtINT on LINT0,
  * as Linux does with "noapic"), and the I/O APIC is left alone, so every
  * device interrupt still arrives on the boot processor. The others are
- * woken by INIT and startup IPIs into trampoline.S and wait in their own
- * idle loops. The boot CPU accounts all timer ticks under sched_lock;
+ * woken by INIT and startup IPIs into trampoline.S, which takes them from
+ * real mode to long mode, and wait in their own idle loops. The boot CPU accounts all timer ticks under sched_lock;
  * other CPUs receive VEC_RESCHED only for expired slices or new work.
  *
  * Every processor runs kernel code at once; the locks of lock.h keep
@@ -25,6 +25,7 @@
  * "maxcpus=N" to N processors.
  */
 #include "kernel.h"
+#include "boot.h"
 #include "drivers.h"
 #include "mm.h"
 #include "proc.h"
@@ -64,10 +65,11 @@
 #define ICR_ASSERT   0x4000
 #define ICR_LEVEL    0x8000
 
-#define CR0_WP  (1u << 16)
-#define CR0_PG  (1u << 31)
-#define CR4_PSE (1u << 4)
 #define CR4_PGE (1u << 7)
+#define MSR_EFER 0xC0000080
+#define EFER_SCE (1u << 0)
+#define EFER_LME (1u << 8)
+#define EFER_NXE (1u << 11)
 
 struct cpu cpus[MAX_CPUS];
 int ncpus = 1;
@@ -77,7 +79,6 @@ static int napic;
 static volatile uint32_t *lapic;        /* mapped only when there are others to start */
 
 static struct proc ap_idle[MAX_CPUS];
-uint32_t ap_stack_top;                  /* trampoline.S takes its stack from here */
 static volatile int ap_index;           /* the processor starting */
 static volatile int ap_abort;           /* one did not start in time: stop if it ever does */
 
@@ -85,6 +86,7 @@ static volatile int unparking;          /* ap_main() goes back to a parked state
 static struct cpu_context park_ctx[MAX_CPUS];
 static uint8_t unpark_stack[4096] __attribute__((aligned(16)));
 extern char ap_trampoline[], ap_trampoline_end[];
+extern char tramp_cr3[], tramp_efer[], tramp_stack[], tramp_entry[];   /* words of it smp.c fills in */
 void ap_main(void) __attribute__((noreturn));
 
 /*
@@ -188,13 +190,10 @@ void smp_add_cpu(uint8_t apic_id)
     apic_ids[napic++] = apic_id;
 }
 
-/* Low physical memory through the identity map (and past the compiler,
- * which takes small constant addresses for null pointers). */
+/* Low physical memory, through the direct map. */
 static void *low(uint32_t pa)
 {
-    void *p = (void *)pa;
-    __asm__("" : "+r"(p));
-    return p;
+    return phys_to_virt(pa);
 }
 
 static int sum_ok(const void *p, uint32_t len)
@@ -254,7 +253,7 @@ static void read_mp_table(void)
         smp_add_cpu(1);
         return;
     }
-    if (!f->config || f->config >= KERNEL_SPACE_END - 0x10000)
+    if (!f->config || f->config >= 0xFFFF0000u)
         return;
     const struct mp_config *c = low(f->config);
     if (memcmp(c->sig, "PCMP", 4) || c->length < sizeof(*c) || !sum_ok(c, c->length))
@@ -277,7 +276,7 @@ static void read_mp_table(void)
 
 void smp_init(void)
 {
-    if (!napic)
+    if (!napic && !boot.uefi)           /* (the BIOS's table: UEFI firmware has ACPI's) */
         read_mp_table();
     if (napic < 2)
         return;                         /* one processor: the APIC stays as it is */
@@ -293,7 +292,13 @@ void smp_init(void)
                   (base & APIC_BASE_X2APIC) ? "in x2APIC mode" : "off");
         return;
     }
-    lapic = vmm_map_mmio((uint32_t)base & 0xFFFFF000u, PAGE_SIZE, PTE_PCD | PTE_PWT);
+    /* The others start in real mode at TRAMP_BASE: that page must be memory
+     * (it is, on a PC; UEFI firmware is free to keep anything for itself). */
+    if (!boot_mem_is_ram(TRAMP_BASE, PAGE_SIZE)) {
+        boot_warn("SMP: %d processors found, but the firmware keeps the page they start in: using one", napic);
+        return;
+    }
+    lapic = vmm_map_mmio(base & 0xFFFFFFFFFF000ull, PAGE_SIZE, PTE_PCD | PTE_PWT);
     if (!lapic)
         boot_warn("SMP: cannot map the local APIC: using one processor");
 }
@@ -306,7 +311,7 @@ static void cmos_write(uint8_t reg, uint8_t val)
     outb(0x71, val);
 }
 
-static int wake_ap(struct cpu *c, uint32_t stack_top);
+static int wake_ap(struct cpu *c, uint64_t stack_top);
 
 /* Wake the processor with this APIC ID as cpus[ncpus]; 0 if it does not answer. */
 static int start_ap(uint8_t apic_id)
@@ -327,7 +332,7 @@ static int start_ap(uint8_t apic_id)
     c->idle = idle;
     c->pd = kernel_pd;
     c->slice = QUANTUM;
-    if (!wake_ap(c, (uint32_t)stack + KSTACK_SIZE)) {
+    if (!wake_ap(c, (uint64_t)(uintptr_t)stack + KSTACK_SIZE)) {
         ap_abort = 1;                   /* (its stack stays: it might still come) */
         return 0;
     }
@@ -337,11 +342,11 @@ static int start_ap(uint8_t apic_id)
 
 /* INIT, then two startup IPIs, as the MultiProcessor Specification has it,
  * into trampoline.S and ap_main() on the stack given. 1 once it is up. */
-static int wake_ap(struct cpu *c, uint32_t stack_top)
+static int wake_ap(struct cpu *c, uint64_t stack_top)
 {
     uint8_t apic_id = c->apic_id;
     ap_index = c->index;
-    ap_stack_top = stack_top;
+    memcpy((uint8_t *)low(TRAMP_BASE) + (tramp_stack - ap_trampoline), &stack_top, sizeof(stack_top));
     lapic_write(LAPIC_ESR, 0);
     lapic_ipi(apic_id, ICR_LEVEL | ICR_ASSERT | DM_INIT);
     lapic_wait_icr();
@@ -364,7 +369,16 @@ static int wake_ap(struct cpu *c, uint32_t stack_top)
  * 0Ah: jump to 40:67), which the oldest APICs start through instead. */
 static void trampoline_in(void)
 {
-    memcpy(low(TRAMP_BASE), ap_trampoline, (size_t)(ap_trampoline_end - ap_trampoline));
+    uint8_t *t = low(TRAMP_BASE);
+    memcpy(t, ap_trampoline, (size_t)(ap_trampoline_end - ap_trampoline));
+    /* What it needs to reach long mode and the kernel: page tables that
+     * map it where it is, this processor's EFER bits, and ap_main(). */
+    uint32_t cr3 = (uint32_t)vmm_boot_cr3();
+    uint32_t efer = (uint32_t)rdmsr(MSR_EFER) & (EFER_SCE | EFER_LME | EFER_NXE);
+    uint64_t entry = (uint64_t)(uintptr_t)ap_main;
+    memcpy(t + (tramp_cr3 - ap_trampoline), &cr3, sizeof(cr3));
+    memcpy(t + (tramp_efer - ap_trampoline), &efer, sizeof(efer));
+    memcpy(t + (tramp_entry - ap_trampoline), &entry, sizeof(entry));
     cmos_write(0x0F, 0x0A);
     *(volatile uint16_t *)low(0x467) = 0;
     *(volatile uint16_t *)low(0x469) = TRAMP_BASE >> 4;
@@ -414,16 +428,15 @@ void smp_start(void)
         boot_warn("SMP: running on one processor");
 }
 
-/* Another processor, from trampoline.S: protected mode, no paging yet,
+/* Another processor, from trampoline.S: long mode on the boot page tables,
  * interrupts off, on its own stack. */
 void ap_main(void)
 {
     if (ap_abort)
         smp_stopped();
     struct cpu *c = &cpus[ap_index];
-    write_cr4(read_cr4() | CR4_PSE | CR4_PGE);
-    write_cr3((uint32_t)kernel_pd);
-    write_cr0(read_cr0() | CR0_PG | CR0_WP);
+    write_cr3(virt_to_phys(kernel_pd));
+    write_cr4(read_cr4() | CR4_PGE);
     gdt_init_ap(c->index);
     idt_init_ap();
     if (unparking)
@@ -525,7 +538,7 @@ void smp_kick_proc(struct proc *p)
 
 /* The mappings of pd changed. Two processors may do this at once, each
  * waiting for the other's flush, so each flushes for the other meanwhile. */
-void smp_flush_tlb(uint32_t *pd)
+void smp_flush_tlb(pte_t *pd)
 {
     if (ncpus < 2)
         return;
@@ -641,7 +654,7 @@ void smp_unpark_others(void)
         if (c == self || c->online)
             continue;
         /* The stack only until context_restore() leaves it: one at a time. */
-        if (!wake_ap(c, (uint32_t)unpark_stack + sizeof(unpark_stack)))
+        if (!wake_ap(c, (uint64_t)(uintptr_t)unpark_stack + sizeof(unpark_stack)))
             klog("smp: processor %d did not come back from suspend\n", i);
     }
     unparking = 0;

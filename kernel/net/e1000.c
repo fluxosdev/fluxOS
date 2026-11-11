@@ -284,16 +284,16 @@ static int alloc_buffers(void)
     uint32_t page = pmm_alloc();
     if (!page)
         return -1;
-    memset((void *)page, 0, PAGE_SIZE);
-    e.rx = (struct rx_desc *)page;                      /* 32 x 16 bytes each */
-    e.tx = (struct tx_desc *)(page + 2048);
+    memset(phys_to_virt(page), 0, PAGE_SIZE);
+    e.rx = (struct rx_desc *)phys_to_virt(page);                      /* 32 x 16 bytes each */
+    e.tx = (struct tx_desc *)phys_to_virt(page + 2048);
     for (int i = 0; i < RX_RING + TX_RING; i += 2) {
         uint32_t p = pmm_alloc();
         if (!p)
             return -1;
         uint8_t **slot = i < RX_RING ? &e.rx_buf[i] : &e.tx_buf[i - RX_RING];
-        slot[0] = (uint8_t *)p;
-        slot[1] = (uint8_t *)p + BUF_SIZE;
+        slot[0] = (uint8_t *)phys_to_virt(p);
+        slot[1] = (uint8_t *)phys_to_virt(p) + BUF_SIZE;
     }
     return 0;
 }
@@ -319,14 +319,14 @@ static void start(void)
         wr(R_MTA + 4 * i, 0);
 
     for (int i = 0; i < RX_RING; i++) {
-        e.rx[i] = (struct rx_desc){ .addr_lo = (uint32_t)e.rx_buf[i] };
+        e.rx[i] = (struct rx_desc){ .addr_lo = virt_to_phys(e.rx_buf[i]) };
     }
     for (int i = 0; i < TX_RING; i++)
-        e.tx[i] = (struct tx_desc){ .addr_lo = (uint32_t)e.tx_buf[i], .status = DESC_DD };
+        e.tx[i] = (struct tx_desc){ .addr_lo = virt_to_phys(e.tx_buf[i]), .status = DESC_DD };
     e.rx_next = 0;
     e.tx_next = e.tx_done = 0;
 
-    wr(R_RDBAL, (uint32_t)e.rx);
+    wr(R_RDBAL, virt_to_phys(e.rx));
     wr(R_RDBAH, 0);
     wr(R_RDLEN, RX_RING * sizeof(struct rx_desc));
     wr(R_RDH, 0);
@@ -334,7 +334,7 @@ static void start(void)
     wr(R_RDTR, 0);
     wr(R_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC);
 
-    wr(R_TDBAL, (uint32_t)e.tx);
+    wr(R_TDBAL, virt_to_phys(e.tx));
     wr(R_TDBAH, 0);
     wr(R_TDLEN, TX_RING * sizeof(struct tx_desc));
     wr(R_TDH, 0);

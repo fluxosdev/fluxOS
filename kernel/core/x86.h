@@ -40,14 +40,17 @@ static inline uint32_t inl(uint16_t port)
     return v;
 }
 
+/* (The count is all of RCX: a 32-bit one would leave its high half to chance.) */
 static inline void insw(uint16_t port, void *buf, uint32_t words)
 {
-    __asm__ volatile("rep insw" : "+D"(buf), "+c"(words) : "d"(port) : "memory");
+    uint64_t n = words;
+    __asm__ volatile("rep insw" : "+D"(buf), "+c"(n) : "d"(port) : "memory");
 }
 
 static inline void outsw(uint16_t port, const void *buf, uint32_t words)
 {
-    __asm__ volatile("rep outsw" : "+S"(buf), "+c"(words) : "d"(port) : "memory");
+    uint64_t n = words;
+    __asm__ volatile("rep outsw" : "+S"(buf), "+c"(n) : "d"(port) : "memory");
 }
 
 static inline void io_wait(void)
@@ -59,50 +62,50 @@ static inline void cli(void) { __asm__ volatile("cli" ::: "memory"); }
 static inline void sti(void) { __asm__ volatile("sti" ::: "memory"); }
 static inline void hlt(void) { __asm__ volatile("hlt" ::: "memory"); }
 
-static inline uint32_t read_cr0(void)
+static inline uint64_t read_cr0(void)
 {
-    uint32_t v;
+    uint64_t v;
     __asm__ volatile("mov %%cr0, %0" : "=r"(v));
     return v;
 }
 
-static inline void write_cr0(uint32_t v)
+static inline void write_cr0(uint64_t v)
 {
     __asm__ volatile("mov %0, %%cr0" : : "r"(v) : "memory");
 }
 
-static inline uint32_t read_cr2(void)
+static inline uint64_t read_cr2(void)
 {
-    uint32_t v;
+    uint64_t v;
     __asm__ volatile("mov %%cr2, %0" : "=r"(v));
     return v;
 }
 
-static inline uint32_t read_cr3(void)
+static inline uint64_t read_cr3(void)
 {
-    uint32_t v;
+    uint64_t v;
     __asm__ volatile("mov %%cr3, %0" : "=r"(v));
     return v;
 }
 
-static inline void write_cr3(uint32_t v)
+static inline void write_cr3(uint64_t v)
 {
     __asm__ volatile("mov %0, %%cr3" : : "r"(v) : "memory");
 }
 
-static inline uint32_t read_cr4(void)
+static inline uint64_t read_cr4(void)
 {
-    uint32_t v;
+    uint64_t v;
     __asm__ volatile("mov %%cr4, %0" : "=r"(v));
     return v;
 }
 
-static inline void write_cr4(uint32_t v)
+static inline void write_cr4(uint64_t v)
 {
     __asm__ volatile("mov %0, %%cr4" : : "r"(v) : "memory");
 }
 
-static inline void invlpg(uint32_t addr)
+static inline void invlpg(uintptr_t addr)
 {
     __asm__ volatile("invlpg (%0)" : : "r"(addr) : "memory");
 }
@@ -137,11 +140,12 @@ static inline void cpu_relax(void)
     __asm__ volatile("rep; nop" ::: "memory");
 }
 
+/* RFLAGS: the flags this kernel looks at are all in its low half. */
 static inline uint32_t read_eflags(void)
 {
-    uint32_t v;
-    __asm__ volatile("pushfl; popl %0" : "=r"(v));
-    return v;
+    uint64_t v;
+    __asm__ volatile("pushfq; popq %0" : "=r"(v));
+    return (uint32_t)v;
 }
 
 #endif

@@ -1,0 +1,43 @@
+Limine 9.6.7, as the fluxOS CD and installed disks boot it
+==========================================================
+
+These files are Limine's (https://limine-bootloader.org), built by Limine's
+own release process and checked in so that the CD can be made without
+Limine's build or a download (by mkiso, on Linux or on fluxOS itself). They
+are the binary release v9.6.7, commit ee5d29cd0a8034612dcd1df3f00052480db785c5
+of the v9.x-binary branch of https://github.com/limine-bootloader/limine,
+unchanged; SHA256SUMS lists every file's hash, and LICENSE is Limine's
+(BSD 2-clause).
+
+  limine-bios.sys      Limine itself for a BIOS: read by its first stages
+                       from /boot/limine on the CD, or on the partition the
+                       kernel is on (FAT32, or the CD's ISO 9660: Limine
+                       reads no other filesystems).
+  limine-bios-cd.bin   the CD's El Torito boot image (no emulation), which
+                       mkiso -b gives a boot information table.
+  limine-uefi-cd.bin   a FAT image holding Limine for UEFI firmware: the
+                       CD's El Torito entry for the EFI platform, and the
+                       EFI partition of the image written to a USB stick
+                       (mkiso -e, -P).
+  BOOTX64.EFI          Limine for 64-bit UEFI firmware, which fluxinstall
+                       copies to /EFI/BOOT on an installed disk's FAT32
+                       partition.
+
+Limine's first stages for a hard disk (its boot sector and what follows it)
+are not files here: they are built into Limine's own installer,
+third_party/limine/limine.c with limine-bios-hdd.h, from the same release.
+"limine bios-install DISK" writes them into the MBR and the sectors before
+the first partition, keeping the partition table. The build makes the
+installer for the machine it runs on (build/host/limine, which makes
+fluxOS.iso start from a USB stick too) and for fluxOS (/bin/limine, which
+fluxinstall runs on the disk it installs to).
+
+The kernel speaks the Limine boot protocol (kernel/core/limine.h,
+bootinfo.c): Limine loads it as a 64-bit ELF image, maps it and starts it
+in long mode. The menus are limine/install.conf (the CD's) and
+limine/limine.conf (an installed disk's).
+
+To move to another Limine release, replace these four files and the two in
+third_party/limine from its binary branch, and make SHA256SUMS again:
+
+  git clone --depth 1 --branch v9.x-binary https://github.com/limine-bootloader/limine

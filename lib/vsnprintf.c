@@ -136,10 +136,14 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
             else *va_arg(ap, int *) = (int)o.len;
             continue;
         case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A':
+            /* (A 64-bit caller passes a double in an SSE register: where the
+             * compiler may not touch those, in the kernel, nobody passes one.) */
+#if !defined(__x86_64__) || defined(__SSE2__)
             if (lng == 2)               /* (the L of long double) */
                 (void)va_arg(ap, long double);
             else
                 (void)va_arg(ap, double);
+#endif
             emit(&o, '%');
             emit(&o, *fmt);
             continue;

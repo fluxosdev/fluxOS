@@ -4,7 +4,7 @@
  * desktop moves the pointer by them; every program reads the double-click
  * time and the wheel's. The desktop keeps them for everyone (server.c).
  *
- * They are kept in GRUB's environment block as fluxos_mouse, for example
+ * They are kept in the boot partition's settings as fluxos_mouse, for example
  * "4-4-0-3-0" (pointer speed, double-click step, left-handed, wheel lines,
  * reverse wheel). Without a disk to save them on they last until a restart.
  */
@@ -35,7 +35,7 @@ int mouse_clamp(int v, int lo, int hi)
 void mouse_init(void)
 {
     char dir[128], val[48];
-    if (!grubenv_boot_dir(dir, sizeof(dir)) || !grubenv_get(dir, "fluxos_mouse", val, sizeof(val)))
+    if (!bootenv_boot_dir(dir, sizeof(dir)) || !bootenv_get(dir, "fluxos_mouse", val, sizeof(val)))
         return;
     int v[5] = { 4, 4, 0, 3, 0 };
     const char *p = val;
@@ -62,12 +62,12 @@ void mouse_init(void)
 void mouse_save(const struct mouse_config *c)
 {
     char dir[128], val[48];
-    if (!grubenv_boot_dir(dir, sizeof(dir)))
+    if (!bootenv_boot_dir(dir, sizeof(dir)))
         return;
     snprintf(val, sizeof(val), "%d-%d-%d-%d-%d",
              c->speed, c->dblclick, c->left_handed, c->wheel_lines, c->wheel_reverse);
     const char *keys[1] = { "fluxos_mouse" }, *vals[1] = { val };
-    grubenv_update(dir, keys, vals, 1);
+    bootenv_update(dir, keys, vals, 1);
 }
 
 int mouse_left_handed(void)

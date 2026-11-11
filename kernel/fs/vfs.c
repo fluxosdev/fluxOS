@@ -1262,7 +1262,7 @@ int vfs_mountpoint_of(struct blockdev *bd, char *buf, uint32_t size)
     return vfs_getpath(bd->fs->root, buf, size);
 }
 
-/* A FAT volume's serial number, written as GRUB's "probe --fs-uuid" does. */
+/* A FAT volume's serial number, as blkid writes it and fluxinstall puts it in the boot menu. */
 static int fat_uuid(struct blockdev *bd, char *out, uint32_t size)
 {
     uint8_t b[512];
@@ -1279,7 +1279,7 @@ static int fat_uuid(struct blockdev *bd, char *out, uint32_t size)
     return 0;
 }
 
-/* An ext2 volume's UUID, 8-4-4-4-12 hex digits as GRUB and Linux write it. */
+/* An ext2 volume's UUID, 8-4-4-4-12 hex digits as Linux writes it. */
 static int ext2_uuid(struct blockdev *bd, char *out, uint32_t size)
 {
     uint8_t sb[1024];

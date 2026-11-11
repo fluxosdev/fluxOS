@@ -3,21 +3,29 @@
  *
  *   fluxinstall [-y] [-p] [-s SOURCE] [-n HOSTNAME] [-t ext2|fat32] [-e DIR [-r MIB]] [/dev/hdX]
  *
- * The disk gets a new MBR partition table with one bootable partition
- * starting at 1 MiB, ext2 (links, permissions and one-second times) or,
- * with -t fat32, FAT32 (which other systems can read too). With -e, a
- * second partition after it, ext2, holds DIR (such as /src for a source
- * tree, or /home). The system partition then gets -r MIB of the disk (by
- * default half, up to 4 GiB, and at least what the system needs) and the
- * second one the rest; /etc/fstab on the system says where init mounts it. GRUB's boot sector goes into the MBR and
- * its core image into the gap before the partition, which is what
- * grub-install does for a BIOS disk. The partition is formatted, and the
- * kernel, GRUB's modules and its menu for a hard disk are copied there
+ * The disk gets a new MBR partition table. The system partition is ext2
+ * (links, permissions and one-second times) or, with -t fat32, FAT32
+ * (which other systems can read too). Limine, the boot loader, reads only
+ * FAT, so an ext2 system partition is the second one, after a small FAT32
+ * boot partition (64 MiB, at 1 MiB) that holds the kernel, Limine and its
+ * menu; a FAT32 system partition is the first, and holds those itself.
+ * With -e, a further partition after the system's, ext2, holds DIR (such
+ * as /src for a source tree, or /home). The system partition then gets
+ * -r MIB of the disk (by default half, up to 4 GiB, and at least what the
+ * system needs) and that one the rest; /etc/fstab on the system says where
+ * init mounts it.
+ *
+ * Limine's first sectors go into the MBR and the gap before the first
+ * partition (by /bin/limine, Limine's own installer: "limine bios-install"),
+ * for a BIOS; for UEFI firmware Limine is a file on the FAT32 partition,
+ * /EFI/BOOT/BOOTX64.EFI. The partitions are formatted, and the kernel,
+ * Limine and its menu for a hard disk (with the system partition's UUID
+ * filled in, which the kernel finds its root by) are copied to /boot there
  * from SOURCE, the install medium: the fluxOS CD, or a USB stick written
  * from it, found wherever it is mounted unless -s names it. The system
- * itself, boot/system.tar on the medium, is unpacked onto the partition,
- * which the installed system runs from as its root. With -n the installed
- * system's /etc/hostname gets the name given.
+ * itself, boot/system.tar on the medium, is unpacked onto the system
+ * partition, which the installed system runs from as its root. With -n the
+ * installed system's /etc/hostname gets the name given.
  *
  * Without a disk, fluxinstall guides the user through choosing one and
  * naming the computer: the CD's setup in text mode, when there is no
@@ -41,17 +49,15 @@
 #include <unistd.h>
 
 #define SECTOR      512
-#define PART_START  2048                /* 1 MiB: room for GRUB's core image */
+#define PART_START  2048                /* 1 MiB: room for Limine's first sectors */
+#define BOOT_PART   131072              /* 64 MiB: the FAT32 boot partition before an ext2 system */
 #define MIN_PART    67584               /* 33 MiB: enough clusters for FAT32 (-t fat32) */
 #define MOUNTPOINT  "/mnt/install"
+#define BOOTPOINT   "/mnt/installboot"  /* the boot partition, when it is not the system's */
 #define MAX_DISKS   8
 
-/* Offsets inside GRUB's boot.img and core.img (grub/boot/i386/pc). */
-#define BOOT_KERNEL_SECTOR 0x5C         /* 64-bit LBA of core.img */
-#define BOOT_DRIVE_CHECK   0x66         /* "jmp 3f": nop it out for hard disks */
 #define MBR_SIGNATURE      0x1B8
 #define MBR_PARTITIONS     0x1BE
-#define CORE_SEGMENT       0x0820       /* where diskboot loads the rest of core */
 
 static const char *source;              /* -s, or found */
 static const char *hostname;            /* -n: for the installed /etc/hostname */
@@ -59,6 +65,7 @@ static int fat_root;                    /* -t fat32: the system partition is FAT
 static const char *data_dir;            /* -e: the second, ext2, partition's mount point */
 static unsigned system_mib;             /* -r: the system partition's size (0: chosen) */
 static int mounted;
+static int boot_mounted;                /* the boot partition too, on BOOTPOINT */
 static int progress_lines;              /* -p */
 
 /* Overall progress: the copying is most of it. */
@@ -100,17 +107,17 @@ static void die(const char *fmt, ...)
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
-    if (mounted) {
+    if (mounted || boot_mounted)
         sync();
+    if (boot_mounted)
+        umount(BOOTPOINT);
+    if (mounted)
         umount(MOUNTPOINT);
-    }
     exit(1);
 }
 
 static void wr16(unsigned char *p, unsigned v) { p[0] = (unsigned char)v; p[1] = (unsigned char)(v >> 8); }
 static void wr32(unsigned char *p, unsigned v) { wr16(p, v); wr16(p + 2, v >> 16); }
-static unsigned rd16(const unsigned char *p) { return p[0] | (unsigned)p[1] << 8; }
-static unsigned rd32(const unsigned char *p) { return rd16(p) | rd16(p + 2) << 16; }
 
 static void path_join(char *out, size_t size, const char *a, const char *b)
 {
@@ -336,13 +343,21 @@ static void size_str(unsigned sectors, char *out, size_t n)
 }
 
 /* Format dev: ext2 with bytes_per_inode (NULL: mkfs.ext2's own), or FAT32. */
-static int run_mkfs(const char *dev, int ext2, const char *label, const char *bytes_per_inode)
+/* small_clusters: FAT32 with 512-byte clusters, so that a small volume has
+ * the 65525 clusters that make it FAT32 to Limine (and to the FAT
+ * specification), whatever mkfs.fat would choose for its size. */
+static int run_mkfs(const char *dev, int ext2, const char *label, const char *bytes_per_inode, int small_clusters)
 {
     int pid = fork();
     if (pid < 0)
         return -1;
     if (pid == 0) {
-        char *fat[] = { "mkfs.fat", "-n", (char *)label, (char *)dev, NULL };
+        char *fat[] = { "mkfs.fat", "-n", (char *)label, (char *)dev, NULL, NULL, NULL };
+        if (small_clusters) {
+            fat[3] = "-s";
+            fat[4] = "1";
+            fat[5] = (char *)dev;
+        }
         char *e2[] = { "mkfs.ext2", "-q", "-L", (char *)label, (char *)dev, NULL, NULL, NULL };
         if (bytes_per_inode) {
             e2[4] = "-i";
@@ -356,6 +371,43 @@ static int run_mkfs(const char *dev, int ext2, const char *label, const char *by
     if (waitpid(pid, &st, 0) < 0)
         return -1;
     return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+}
+
+/* Limine's installer on the disk: its first sector into the MBR (the
+ * partition table stays) and the rest into the sectors after it. */
+static int run_limine(const char *dev)
+{
+    int pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        char *argv[] = { "limine", "bios-install", "--quiet", (char *)dev, NULL };
+        execve("/bin/limine", argv, environ);
+        _exit(127);
+    }
+    int st;
+    if (waitpid(pid, &st, 0) < 0)
+        return -1;
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+}
+
+/* A FAT volume's serial number, as the kernel matches root=UUID= against it. */
+static int fat_uuid(const char *dev, char *out, size_t size)
+{
+    int fd = open(dev, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    unsigned char b[SECTOR];
+    int ok = read(fd, b, sizeof(b)) == (ssize_t)sizeof(b) && b[510] == 0x55 && b[511] == 0xAA;
+    close(fd);
+    if (!ok)
+        return -1;
+    /* FAT32 has no 16-bit FAT size; its extended boot record sits further in. */
+    const unsigned char *e = (b[22] | b[23]) ? b + 38 : b + 66;
+    if (e[0] != 0x29)
+        return -1;
+    snprintf(out, size, "%02x%02x-%02x%02x", e[4], e[3], e[2], e[1]);
+    return 0;
 }
 
 /* An ext2 volume's UUID, as init matches /etc/fstab's UUID= against it. */
@@ -403,11 +455,12 @@ static int valid_hostname(const char *s)
     return 1;
 }
 
-/* The files an install medium has. GRUB's boot sector and core image for
- * a hard disk are in firmware/grub, as in the source tree (mkiso's CD). */
+/* The files an install medium has: the kernel and the system, Limine as a
+ * BIOS reads it, and what goes onto a hard disk with them (boot/install:
+ * the disk's menu, Limine for UEFI firmware). */
 static const char *const needed[] = {
-    "boot/fluxos.kernel", "boot/system.tar", "boot/install/grub.cfg",
-    "firmware/grub/boot.img", "firmware/grub/core.img", NULL,
+    "boot/fluxos.kernel", "boot/system.tar", "boot/limine/limine-bios.sys",
+    "boot/install/limine.conf", "boot/install/BOOTX64.EFI", NULL,
 };
 
 static int is_medium(const char *dir)
@@ -475,7 +528,8 @@ static const char *guided(void)
         char size[32];
         size_str(bi.sectors, size, sizeof(size));
         const char *why = bi.sector_size != SECTOR ? "unsupported sector size"
-                        : bi.sectors < PART_START + MIN_PART ? "too small, needs 34 MiB"
+                        : bi.sectors < PART_START + (fat_root ? 0 : BOOT_PART) + MIN_PART
+                              ? (fat_root ? "too small, needs 34 MiB" : "too small, needs 98 MiB")
                         : source_dev[0] && on_disk(source_dev, bi.name) ? "holds the install files"
                         : NULL;
         snprintf(disks[n].name, sizeof(disks[n].name), "%s", bi.name);
@@ -567,16 +621,21 @@ int main(int argc, char **argv)
     if (!source && !(source = find_source()))
         die("cannot find the fluxOS installation files: is the fluxOS CD in the drive? (use -s DIR)");
     if (!is_medium(source))
-        die("%s is not a fluxOS install medium: boot/system.tar or GRUB's files are missing", source);
+        die("%s is not a fluxOS install medium: boot/system.tar or Limine's files are missing", source);
 
     int guided_mode = i == argc;
     const char *dev = guided_mode ? guided() : argv[i];
     const char *disk = strrchr(dev, '/') ? strrchr(dev, '/') + 1 : dev;
-    char devpath[64], partpath[64];
+    /* The partitions: the boot one (FAT32, which Limine reads) is the
+     * system's itself with -t fat32, and the first of two otherwise. */
+    char devpath[64], bootpath[64], partpath[64], datapath[64];
+    const char *sep = part_sep(disk) ? "p" : "";
+    int sys_index = fat_root ? 1 : 2;
+    unsigned boot_sectors = fat_root ? 0 : BOOT_PART, sys_start = PART_START + boot_sectors;
     snprintf(devpath, sizeof(devpath), "/dev/%s", disk);
-    snprintf(partpath, sizeof(partpath), "/dev/%s%s1", disk, part_sep(disk) ? "p" : "");
-    char datapath[64];
-    snprintf(datapath, sizeof(datapath), "/dev/%s%s2", disk, part_sep(disk) ? "p" : "");
+    snprintf(bootpath, sizeof(bootpath), "/dev/%s%s1", disk, sep);
+    snprintf(partpath, sizeof(partpath), "/dev/%s%s%d", disk, sep, sys_index);
+    snprintf(datapath, sizeof(datapath), "/dev/%s%s%d", disk, sep, sys_index + 1);
 
     /* ---- the target ---- */
     struct blkinfo bi, target;
@@ -592,17 +651,17 @@ int main(int argc, char **argv)
         die("%s is not a whole hard disk; give a disk such as /dev/hda", dev);
     if (target.sector_size != SECTOR)
         die("%s: unsupported sector size %u", dev, target.sector_size);
-    if (target.sectors < PART_START + MIN_PART)
-        die("%s is too small: fluxOS needs a disk of at least 34 MiB", dev);
+    if (target.sectors < sys_start + MIN_PART)
+        die("%s is too small: fluxOS needs a disk of at least %u MiB", dev, (sys_start + MIN_PART) / 2048 + 1);
 
     /* With -e: the system partition's size, and the ext2 one after it. */
-    unsigned sys_sectors = target.sectors - PART_START, data_start = 0, data_sectors = 0;
+    unsigned sys_sectors = target.sectors - sys_start, data_start = 0, data_sectors = 0;
     if (data_dir) {
         struct stat tst;
         char tarpath[PATH_MAX];
         path_join(tarpath, sizeof(tarpath), source, "boot/system.tar");
         unsigned long long need = stat(tarpath, &tst) == 0 ? (unsigned long long)tst.st_size : 0;
-        need += need / 4 + (64ull << 20);               /* the filesystem's own, GRUB, room to spare */
+        need += need / 4 + (64ull << 20);               /* the filesystem's own, the kernel, room to spare */
         unsigned need_mib = (unsigned)(need >> 20), mib = system_mib;
         if (need_mib < MIN_PART / 2048 + 1)
             need_mib = MIN_PART / 2048 + 1;
@@ -615,10 +674,10 @@ int main(int argc, char **argv)
         }
         if (mib < need_mib)
             die("-r %u: the system partition needs at least %u MiB", mib, need_mib);
-        if (mib >= target.sectors / 2048)     /* also keeps mib * 2048 from wrapping */
+        if (mib >= (target.sectors - sys_start) / 2048)     /* also keeps mib * 2048 from wrapping */
             die("%s is too small for a %u MiB system partition and an ext2 one of 64 MiB or more", dev, mib);
         sys_sectors = mib * 2048;
-        data_start = PART_START + sys_sectors;
+        data_start = sys_start + sys_sectors;
         if (data_start >= target.sectors || target.sectors - data_start < 64 * 2048)
             die("%s is too small for a %u MiB system partition and an ext2 one of 64 MiB or more", dev, mib);
         data_sectors = target.sectors - data_start;
@@ -637,16 +696,7 @@ int main(int argc, char **argv)
         on_disk(sfs.f_source + 5, disk))
         die("the install medium %s is on %s itself", source, dev);
 
-    unsigned boot_size, core_size;
-    path_join(path, sizeof(path), source, "firmware/grub/boot.img");
-    unsigned char *boot = slurp(path, &boot_size);
-    path_join(path, sizeof(path), source, "firmware/grub/core.img");
-    unsigned char *core = slurp(path, &core_size);
-    unsigned core_sectors = (core_size + SECTOR - 1) / SECTOR;
-    if (boot_size != SECTOR || boot[510] != 0x55 || boot[511] != 0xAA)
-        die("boot.img is not a GRUB boot sector");
-    if (core_sectors < 2 || core_sectors >= PART_START)
-        die("core.img does not fit before the partition (%u sectors)", core_sectors);
+    (void)path;
 
     /* ---- confirmation ---- */
     const char *fstype = fat_root ? "FAT32" : "ext2";
@@ -662,11 +712,15 @@ int main(int argc, char **argv)
         char a[32], b[32];
         size_str(sys_sectors, a, sizeof(a));
         size_str(data_sectors, b, sizeof(b));
-        printf("This creates a %s partition (%s, %s) and installs GRUB and fluxOS on it,\n"
+        printf("This creates a %s partition (%s, %s) and installs fluxOS on it,\n"
                "and an ext2 partition (%s, %s) for %s.\n", fstype, partpath, a, datapath, b, data_dir);
     } else {
-        printf("This creates one %s partition (%s) and installs GRUB and fluxOS.\n", fstype, partpath);
+        printf("This creates a %s partition (%s) and installs fluxOS on it.\n", fstype, partpath);
     }
+    if (!fat_root)
+        printf("The kernel and the Limine boot loader go on a FAT32 boot partition before it (%s).\n", bootpath);
+    else
+        printf("The kernel and the Limine boot loader go on it too.\n");
     printf("\033[1;31mALL DATA ON %s WILL BE ERASED.\033[0m\n", devpath);
     if (!yes) {
         char answer[16];
@@ -689,8 +743,8 @@ int main(int argc, char **argv)
                 bi.mountpoint, strerror(errno));
     }
 
-    /* ---- [1/4] boot loader and partition table ---- */
-    printf("[1/4] Writing GRUB and the partition table to %s\n", devpath);
+    /* ---- [1/4] partition table and boot loader ---- */
+    printf("[1/4] Writing the partition table and Limine to %s\n", devpath);
     int fd = open(devpath, O_RDWR);
     if (fd < 0)
         die("%s: %s", devpath, strerror(errno));
@@ -698,24 +752,9 @@ int main(int argc, char **argv)
     if (!gap)
         die("out of memory");
 
-    /* core.img's first sector (diskboot) lists where the rest lives:
-     * the following sectors, from LBA 2. Rewrite that list as
-     * grub-bios-setup does for an embedded core. */
-    memcpy(gap + SECTOR, core, core_size);
-    unsigned char *list = gap + 2 * SECTOR - 12;
-    memset(list - 12, 0, 12);                           /* terminator */
-    wr32(list, 2);
-    wr32(list + 4, 0);
-    wr16(list + 8, core_sectors - 1);
-    wr16(list + 10, CORE_SEGMENT);
-
-    /* The MBR: GRUB's boot code, then a disk signature and one partition. */
+    /* The MBR: no boot code yet (Limine's installer puts its own there),
+     * a disk signature and the partitions. */
     unsigned char *mbr = gap;
-    memcpy(mbr, boot, MBR_SIGNATURE);
-    wr32(mbr + BOOT_KERNEL_SECTOR, 1);
-    wr32(mbr + BOOT_KERNEL_SECTOR + 4, 0);
-    if (mbr[BOOT_DRIVE_CHECK] == 0xEB)                  /* trust the BIOS drive number */
-        mbr[BOOT_DRIVE_CHECK] = mbr[BOOT_DRIVE_CHECK + 1] = 0x90;
     unsigned sig = (unsigned)time(NULL) ^ (unsigned)getpid() * 2654435761u;
     int rnd = open("/dev/urandom", O_RDONLY);
     if (rnd >= 0) {
@@ -723,52 +762,61 @@ int main(int argc, char **argv)
         close(rnd);
     }
     wr32(mbr + MBR_SIGNATURE, sig);
+    const struct { unsigned start, sectors; unsigned char type; } parts[3] = {
+        { PART_START, fat_root ? sys_sectors : boot_sectors, 0x0C },    /* FAT32 (LBA) */
+        { fat_root ? data_start : sys_start, fat_root ? data_sectors : sys_sectors, 0x83 },    /* Linux */
+        { fat_root ? 0 : data_start, fat_root ? 0 : data_sectors, 0x83 },
+    };
     unsigned char *pe = mbr + MBR_PARTITIONS;
-    unsigned psize = sys_sectors;
-    pe[0] = 0x80;                                       /* bootable */
-    pe[1] = 0xFE; pe[2] = 0xFF; pe[3] = 0xFF;           /* CHS: use LBA */
-    pe[4] = fat_root ? 0x0C : 0x83;                     /* FAT32 (LBA), or Linux */
-    pe[5] = 0xFE; pe[6] = 0xFF; pe[7] = 0xFF;
-    wr32(pe + 8, PART_START);
-    wr32(pe + 12, psize);
-    if (data_dir) {                                     /* the ext2 one */
-        pe += 16;
-        pe[0] = 0;
-        pe[1] = 0xFE; pe[2] = 0xFF; pe[3] = 0xFF;
-        pe[4] = 0x83;                                   /* Linux */
+    for (int k = 0; k < 3; k++) {
+        if (!parts[k].sectors)
+            continue;
+        pe[0] = k == 0 ? 0x80 : 0;                      /* the boot partition: active */
+        pe[1] = 0xFE; pe[2] = 0xFF; pe[3] = 0xFF;       /* CHS: use LBA */
+        pe[4] = parts[k].type;
         pe[5] = 0xFE; pe[6] = 0xFF; pe[7] = 0xFF;
-        wr32(pe + 8, data_start);
-        wr32(pe + 12, data_sectors);
+        wr32(pe + 8, parts[k].start);
+        wr32(pe + 12, parts[k].sectors);
+        pe += 16;
     }
     mbr[510] = 0x55;
     mbr[511] = 0xAA;
 
-    /* The gap first, the MBR last: an interrupted install never leaves
-     * a boot sector pointing at a half-written core image. */
-    if (lseek(fd, SECTOR, SEEK_SET) < 0 ||
-        write(fd, gap + SECTOR, (PART_START - 1) * SECTOR) != (PART_START - 1) * SECTOR)
-        die("writing %s: %s", devpath, strerror(errno));
-    if (fsync(fd) < 0 || lseek(fd, 0, SEEK_SET) < 0 || write(fd, mbr, SECTOR) != SECTOR ||
+    /* The gap is cleared with it: nothing of an older boot loader, or of
+     * a filesystem that began there, is left for anything to mistake. */
+    if (lseek(fd, 0, SEEK_SET) < 0 || write(fd, gap, PART_START * SECTOR) != PART_START * SECTOR ||
         fsync(fd) < 0)
-        die("writing the MBR of %s: %s", devpath, strerror(errno));
+        die("writing the partition table of %s: %s", devpath, strerror(errno));
     close(fd);
-    if (rd32(gap + 2 * SECTOR - 12) != 2)
-        die("internal error: bad core.img block list");
+    free(gap);
     if (blkrescan(devpath) < 0)
         die("re-reading the partition table of %s: %s", devpath, strerror(errno));
+    if (run_limine(devpath) < 0)
+        die("installing the Limine boot loader on %s failed", devpath);
 
     /* ---- [2/4] filesystem ---- */
     progress(2);
     printf("[2/4] Formatting %s as %s\n", partpath, fstype);
     /* one inode per 16 KiB, as mke2fs makes them: the system's files are
      * not small, and a whole large disk's inode tables are less to write */
-    if (run_mkfs(partpath, !fat_root, "FLUXOS", "16384") < 0)
+    if (run_mkfs(partpath, !fat_root, "FLUXOS", "16384", 0) < 0)
         die("formatting %s failed", partpath);
+    if (!fat_root) {
+        printf("      Formatting %s as FAT32 for the kernel and Limine\n", bootpath);
+        if (run_mkfs(bootpath, 0, "FLUXBOOT", NULL, 1) < 0)
+            die("formatting %s failed", bootpath);
+    }
     if (data_dir) {
         printf("      Formatting %s as ext2 for %s\n", datapath, data_dir);
-        if (run_mkfs(datapath, 1, data_dir + 1, NULL) < 0)
+        if (run_mkfs(datapath, 1, data_dir + 1, NULL, 0) < 0)
             die("formatting %s failed", datapath);
     }
+    /* What the kernel finds its root by: the system partition's UUID (a
+     * FAT32 one's serial number), which goes into Limine's menu. */
+    char root_uuid[40];
+    if ((fat_root ? fat_uuid(partpath, root_uuid, sizeof(root_uuid))
+                  : ext2_uuid(partpath, root_uuid, sizeof(root_uuid))) < 0)
+        die("%s: no %s filesystem after formatting it", partpath, fstype);
 
     /* ---- [3/4] files ---- */
     progress(COPY_FROM);
@@ -777,16 +825,26 @@ int main(int argc, char **argv)
     if (mount(partpath, MOUNTPOINT, fat_root ? "fat32" : "ext2") < 0)
         die("mount %s: %s", partpath, strerror(errno));
     mounted = 1;
+    /* Where /boot's files go: the system partition, or the boot one. */
+    const char *bootdir = MOUNTPOINT;
+    if (!fat_root) {
+        make_dir(BOOTPOINT);
+        if (mount(bootpath, BOOTPOINT, "fat32") < 0)
+            die("mount %s: %s", bootpath, strerror(errno));
+        boot_mounted = 1;
+        bootdir = BOOTPOINT;
+    }
 
     unsigned long bytes = 0;
     unsigned files = 0;
     char src[PATH_MAX], dst[PATH_MAX];
 
-    /* What is to be copied, for the progress: the kernel, GRUB's modules
-     * and the system's archive. */
+    /* What is to be copied, for the progress: the kernel, Limine and the
+     * system's archive. */
     static const char *const top[][2] = {
         { "boot/fluxos.kernel", "boot/fluxos.kernel" },
-        { "boot/install/grub.cfg", "boot/grub/grub.cfg" },     /* the hard disk's menu */
+        { "boot/limine/limine-bios.sys", "boot/limine/limine-bios.sys" },  /* Limine, for a BIOS */
+        { "boot/install/BOOTX64.EFI", "EFI/BOOT/BOOTX64.EFI" },             /* and for UEFI firmware */
         { NULL, NULL },
     };
     struct stat st;
@@ -798,41 +856,41 @@ int main(int argc, char **argv)
     path_join(src, sizeof(src), source, "boot/system.tar");
     if (stat(src, &st) == 0)
         copy_total += st.st_size;
-    path_join(src, sizeof(src), source, "boot/grub/i386-pc");
-    DIR *d = opendir(src);
-    if (!d)
-        die("%s: %s", src, strerror(errno));
-    struct dirent *de;
-    while ((de = readdir(d))) {
-        char s2[PATH_MAX];
-        snprintf(s2, sizeof(s2), "%s/%s", src, de->d_name);
-        if (de->d_type == DT_REG && stat(s2, &st) == 0)
-            copy_total += st.st_size;
-    }
 
-    make_dir(MOUNTPOINT "/boot");
-    make_dir(MOUNTPOINT "/boot/grub");
+    path_join(dst, sizeof(dst), bootdir, "boot");
+    make_dir(dst);
+    path_join(dst, sizeof(dst), bootdir, "boot/limine");
+    make_dir(dst);
+    path_join(dst, sizeof(dst), bootdir, "EFI");
+    make_dir(dst);
+    path_join(dst, sizeof(dst), bootdir, "EFI/BOOT");
+    make_dir(dst);
     for (int k = 0; top[k][0]; k++) {
         path_join(src, sizeof(src), source, top[k][0]);
-        path_join(dst, sizeof(dst), MOUNTPOINT, top[k][1]);
+        path_join(dst, sizeof(dst), bootdir, top[k][1]);
         copy_file(src, dst, &bytes);
         files++;
     }
 
-    /* GRUB's modules: core.img loads normal.mod and friends from here. */
-    path_join(src, sizeof(src), source, "boot/grub/i386-pc");
-    rewinddir(d);
-    make_dir(MOUNTPOINT "/boot/grub/i386-pc");
-    while ((de = readdir(d))) {
-        if (de->d_type != DT_REG)
-            continue;
-        char s2[PATH_MAX];
-        snprintf(s2, sizeof(s2), "%s/%s", src, de->d_name);
-        snprintf(dst, sizeof(dst), MOUNTPOINT "/boot/grub/i386-pc/%s", de->d_name);
-        copy_file(s2, dst, &bytes);
+    /* The hard disk's menu: the medium's, with the root's name in place
+     * of its "@ROOT@" (limine/limine.conf in the source tree). */
+    {
+        unsigned size;
+        path_join(src, sizeof(src), source, "boot/install/limine.conf");
+        char *conf = (char *)slurp(src, &size);
+        char *mark = size ? memmem(conf, size, "@ROOT@", 6) : NULL;
+        if (!mark)
+            die("%s: not a fluxOS boot menu (no @ROOT@ in it)", src);
+        path_join(dst, sizeof(dst), bootdir, "boot/limine/limine.conf");
+        FILE *f = fopen(dst, "w");
+        if (!f || fwrite(conf, 1, (size_t)(mark - conf), f) != (size_t)(mark - conf) ||
+            fprintf(f, "bootfs=%s root=UUID=%s", fat_root ? "fat" : "ext2", root_uuid) < 0 ||
+            fwrite(mark + 6, 1, size - (size_t)(mark + 6 - conf), f) != size - (size_t)(mark + 6 - conf) ||
+            fclose(f) != 0)
+            die("%s: %s", dst, strerror(errno));
+        free(conf);
         files++;
     }
-    closedir(d);
 
     /* The system itself, which runs from this partition. */
     path_join(src, sizeof(src), source, "boot/system.tar");
@@ -867,6 +925,12 @@ int main(int argc, char **argv)
     progress(COPY_TO);
     printf("[4/4] Writing everything to disk\n");
     sync();
+    if (boot_mounted) {
+        if (umount(BOOTPOINT) < 0)
+            die("umount: %s", strerror(errno));
+        boot_mounted = 0;
+        rmdir(BOOTPOINT);
+    }
     if (umount(MOUNTPOINT) < 0)
         die("umount: %s", strerror(errno));
     mounted = 0;

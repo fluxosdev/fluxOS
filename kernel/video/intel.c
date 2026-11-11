@@ -591,7 +591,7 @@ static int gart_test(void)
     uint32_t page = pmm_alloc();
     if (!page)
         return -1;
-    uint32_t *p = (uint32_t *)page, *a = (uint32_t *)ig.test, *b = (uint32_t *)(ig.test + 0x1000);
+    uint32_t *p = (uint32_t *)phys_to_virt(page), *a = (uint32_t *)ig.test, *b = (uint32_t *)(ig.test + 0x1000);
     for (uint32_t i = 0; i < TW * TW; i++) {
         p[i] = pattern(i * 7);
         a[i] = pattern(i * 3);
@@ -655,7 +655,7 @@ static uint32_t slot_gpu(const struct slot *sl)
 }
 
 /* Point a slot's GTT pages at its process's memory; -EFAULT if some is not there. */
-static int map_slot(struct slot *sl, uint32_t *pd)
+static int map_slot(struct slot *sl, pte_t *pd)
 {
     for (uint32_t i = 0; i < sl->npages; i++) {
         uint32_t phys = vmm_translate(pd, sl->va + i * PAGE_SIZE);
@@ -969,7 +969,7 @@ static void accel_init(void)
     ig.scratch = pmm_alloc();
     if (!ig.scratch)
         return;
-    memset((void *)ig.scratch, 0, PAGE_SIZE);
+    memset(phys_to_virt(ig.scratch), 0, PAGE_SIZE);
     ig.buf_first = ALIGN_UP(ig.aper_size, 1u << 20) >> 12;
     int room = ig.buf_first + BUF_PAGES <= ig.gtt_entries;
     if (room) {
