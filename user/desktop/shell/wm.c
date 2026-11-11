@@ -3526,7 +3526,7 @@ void wm_init(int setup)
     char dir[128], drv[16];
     accel_wanted = grubenv_boot_dir(dir, sizeof(dir)) &&
                    grubenv_get(dir, "fluxos_driver", drv, sizeof(drv)) &&
-                   (!strcmp(drv, "radeon") || !strcmp(drv, "intel"));
+                   (!strcmp(drv, "radeon") || !strcmp(drv, "intel") || !strcmp(drv, "navi"));
     use_adapter();
     update_clock();
     wm_damage(mkrect(0, 0, screen_w, screen_h));

@@ -24,7 +24,7 @@ is installed on, IDE/SATA/floppy/USB storage, FAT and ISO9660, an
 NE2000, nForce, Intel PRO/1000 and Intel I217 network drivers with a TCP/IP stack, a zsh-flavoured shell
 (**fsh**), a desktop with a web browser and four themes (Kinetik, Kinetik Glass, Seashell and Windows 95 style Classic), 3dfx Voodoo3 and
 Radeon HD 4000 display drivers with a small OpenGL library, an Intel HD Graphics
-4600 display driver with 3D, PC speaker, Sound
+4600 display driver with 3D, an AMD Radeon RX 5500 display driver, PC speaker, Sound
 Blaster 16 and HD Audio sound, and a layer that runs DOS programs in the
 terminal. The ISO image is an install CD: GRUB (Multiboot) starts fluxOS
 Setup, which installs fluxOS onto a hard disk, and the installed system boots
@@ -201,6 +201,14 @@ says why.
     self-test, copies between the pages and from the desktop's back buffer
     through the GART, as on the HD 4000s (`radeon.accel=0` turns it off).
     No OpenGL on it yet (see *Work in progress*).
+  - **AMD Radeon RX 5500 / 5500 XT** (Navi 14, the first RDNA generation, and
+    the Radeon Pro W5500, W5500M and W5300M on the same chip): page flipping
+    at the vertical update and the 64x64 hardware pointer over the mode the
+    video BIOS set for the boot loader, driving DCN 2.0's display pipes
+    directly (HUBP for the pages and the pointer, the DPP for its
+    blending), and the card's real amount of video memory. Chosen in
+    Display Properties as "AMD Radeon RX 5500". `navi=off` turns it off.
+    No modes of its own and no 3D engine yet (see *Work in progress*).
   - **Intel HD Graphics of Haswell processors** (HD 4600, 4400, 4200, 5000,
     Iris 5100, Iris Pro 5200): page flipping at vblank and the hardware
     pointer in the boot loader's mode. The second page lives in the stolen
@@ -1033,7 +1041,7 @@ kernel/input/              input, keyboard, mouse, touchpad
 kernel/net/                net/tcp/socket, ne2000, forcedeth/mii, e1000, e1000e
 kernel/sound/              pcspkr, sb16/opl/isadma, hda
 kernel/video/              fb/vga, the startup screen (splash.c), voodoo, radeon*, atom, intel*,
-                           modes (EDID mode lists)
+                           navi (RX 5500), modes (EDID mode lists)
 user/libc, user/include    the C library (math.c is the x87 math library; http.c, hpack.c and
                            inflate.c are the HTTP/1.1 and HTTP/2 client and Deflate) and headers
 user/gl/                   the OpenGL library and its backends
@@ -1208,6 +1216,15 @@ user range and page tables first.
   tried on hardware; the boot self-test decides whether the desktop uses
   it. OpenGL needs the GL library's shaders and the kernel's command
   buffer check redone for Evergreen's instruction set and registers.
+- **The Radeon RX 5500 driver (Navi 14) is new and partial:** page flipping
+  and the hardware pointer in the BIOS mode, not yet tried on the card
+  itself (QEMU has no Navi to emulate; it needs the card passed through to
+  a VM booted with SeaBIOS, or a real machine booted in legacy BIOS mode,
+  so that its video BIOS sets a VESA mode). `dmesg | grep navi` shows each
+  display pipe's state and which ones it found showing the screen. Modes
+  of its own need DCN 2.0's clocks (DCCG, through the SMU), OTG timing and
+  DisplayPort/HDMI link set-up; the 3D engine needs the PSP to load AMD's
+  firmware (SMU, RLC, CP and SDMA) first.
 - **The Intel HD Graphics driver (Haswell) is partial:** page flipping, the
   hardware pointer, blitter copies and 3D (working on an HD 4600: 3D Gears
   draws on it; the boot self-test still decides, and a hang turns it off);

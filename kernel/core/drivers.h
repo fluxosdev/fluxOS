@@ -74,6 +74,19 @@ void radeon_resume(void);               /* the page and the pointer, after wakin
 /* Are any of pid's pages in [start, end) lent to the GPU (DISP_MAPBUF)? */
 int radeon_pinned(int pid, uint32_t start, uint32_t end);
 
+/* AMD Radeon RX 5500 (Navi 14, DCN 2.0) display driver (navi.c): page
+ * flipping and a hardware pointer in the BIOS mode */
+void navi_init(void);
+int navi_present(void);
+void navi_info(struct dispinfo *di);
+uint32_t navi_map_size(void);           /* what fbmap maps */
+int navi_flip(int page);
+int navi_cursor(const struct dispcursor *dc);
+int navi_cursor_pos(const struct disppos *p);
+void navi_release(void);                /* the screen goes back to the console */
+int navi_can_resume(void);
+void navi_resume(void);                 /* the page and the pointer, after waking */
+
 /* Intel HD Graphics (Haswell) display driver (intel.c, intel_modeset.c):
  * page flipping, a hardware pointer, the blitter, and native modes on VGA */
 void intel_init(void);

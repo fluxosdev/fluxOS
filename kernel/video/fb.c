@@ -124,6 +124,8 @@ static uint32_t map_size(void)
 {
     if (intel_present())
         return intel_map_size();
+    if (navi_present())
+        return navi_map_size();
     return radeon_present() ? radeon_map_size() : fb.size;
 }
 
@@ -155,6 +157,7 @@ static int map_screen(uint32_t *pd, uint32_t *mapped)
 static void release_screen(void)
 {
     intel_release();
+    navi_release();
     radeon_release();
 }
 
@@ -470,6 +473,8 @@ static int display_op(int op, void *arg)
             di->screen_bytes = (uint32_t)voodoo_screen_bytes();
         } else if (intel_present()) {
             intel_info(di);
+        } else if (navi_present()) {
+            navi_info(di);
         } else if (radeon_present()) {
             radeon_info(di);
         } else {
@@ -511,26 +516,29 @@ static int display_op(int op, void *arg)
             return intel_map3d(arg);
         return radeon_present() ? radeon_map3d_user(arg) : -ENODEV;
     case DISP_FLIP:
-        if (!radeon_present() && !intel_present())
+        if (!radeon_present() && !intel_present() && !navi_present())
             return -ENODEV;
         if (!screen_owner())
             return -EPERM;
         if (intel_present())
             return intel_flip((int)((const struct dispflip *)arg)->page);
+        if (navi_present())
+            return navi_flip((int)((const struct dispflip *)arg)->page);
         return radeon_flip((int)((const struct dispflip *)arg)->page);
     case DISP_CURSOR:
-        if (!radeon_present() && !intel_present())
+        if (!radeon_present() && !intel_present() && !navi_present())
             return -ENODEV;
         if (!screen_owner())
             return -EPERM;
-        return intel_present() ? intel_cursor(arg) : radeon_cursor(arg);
+        return intel_present() ? intel_cursor(arg) : navi_present() ? navi_cursor(arg) : radeon_cursor(arg);
     case DISP_CURSORPOS: {
-        if (!radeon_present() && !intel_present())
+        if (!radeon_present() && !intel_present() && !navi_present())
             return -ENODEV;
         if (!screen_owner())
             return -EPERM;
         struct disppos pos = *(const struct disppos *)arg;
-        return intel_present() ? intel_cursor_pos(&pos) : radeon_cursor_pos(&pos);
+        return intel_present() ? intel_cursor_pos(&pos)
+               : navi_present() ? navi_cursor_pos(&pos) : radeon_cursor_pos(&pos);
     }
     case DISP_COPYRECTS:
         if (!radeon_present() && !intel_present())
@@ -569,7 +577,7 @@ static int display_op(int op, void *arg)
 int fb_wake_mode(void)
 {
     if (voodoo_present() || (radeon_present() && !radeon_can_resume()) ||
-        (intel_present() && !intel_can_resume()))
+        (intel_present() && !intel_can_resume()) || (navi_present() && !navi_can_resume()))
         return -1;
     if (!fb.base)
         return 0;
@@ -598,7 +606,7 @@ void fb_blank(void)
 {
     if (fb.base)
         fb_fill(0, 0, fb.width, fb.height, 0);
-    if (radeon_present())
+    if (radeon_present() || navi_present())
         return;
     outb(0x3C4, 0x01);                  /* clocking mode: screen off */
     outb(0x3C5, inb(0x3C5) | 0x20);
@@ -609,7 +617,7 @@ void fb_blank(void)
 /* Back from sleep, or it never went: the screen on again. */
 void fb_unblank(void)
 {
-    if (radeon_present())
+    if (radeon_present() || navi_present())
         return;
     outb(0x3C4, 0x01);
     outb(0x3C5, inb(0x3C5) & (uint8_t)~0x20);
@@ -622,6 +630,7 @@ void fb_resume(void)
 {
     if (radeon_present())
         radeon_resume();
+    navi_resume();
     intel_resume();
     mutex_unlock(&display_mutex);
     if (fb_console_active())

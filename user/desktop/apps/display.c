@@ -27,8 +27,8 @@
  * Choices are saved in GRUB's environment block, /boot/grub/grubenv on the
  * partition fluxOS started from: fluxos_gfx is the mode GRUB asks the BIOS
  * for, fluxos_video the 3dfx or Radeon driver's mode, which GRUB passes to
- * the kernel as video=, and fluxos_driver "radeon" or "intel" when the
- * Radeon or Intel driver is chosen, which the desktop reads when it starts. Started from the CD
+ * the kernel as video=, and fluxos_driver "radeon", "intel" or "navi" when the
+ * Radeon, Intel or RX 5500 driver is chosen, which the desktop reads when it starts. Started from the CD
  * there is nowhere to save them, and they last until a restart.
  */
 #include <dirent.h>
@@ -48,9 +48,9 @@
 #define CONFIRM_SECS 15
 
 enum page { PAGE_BACKGROUND, PAGE_APPEARANCE, PAGE_SAVER, PAGE_SETTINGS, PAGE_MONITOR, PAGE_COUNT };
-enum driver { DRV_STANDARD, DRV_NATIVE, DRV_RADEON };    /* DRV_RADEON: or Intel's */
-/* The rows of the display driver list; the last two are both DRV_RADEON. */
-enum { DROW_VGA, DROW_VOODOO, DROW_RADEON, DROW_INTEL, DRIVER_ROWS };
+enum driver { DRV_STANDARD, DRV_NATIVE, DRV_RADEON };    /* DRV_RADEON: or Intel's, or Navi's */
+/* The rows of the display driver list; the last three are all DRV_RADEON. */
+enum { DROW_VGA, DROW_VOODOO, DROW_RADEON, DROW_INTEL, DROW_NAVI, DRIVER_ROWS };
 
 /* Controls, in Tab order. */
 enum ctl {
@@ -113,7 +113,7 @@ struct dprops {
     struct dispmode modes[DISP_MAX_MODES];
     int nmodes;
     int native_ok;                      /* the 3dfx driver can set modes */
-    int radeon_ok;                      /* there is a Radeon (or Intel) driver */
+    int radeon_ok;                      /* there is a Radeon (or Intel, or Navi) driver */
     int radeon_modes;                   /* and it can set modes */
     char bootdir[128];                  /* the partition with GRUB, or "" */
     char saved_gfx[32], saved_video[32], saved_driver[16];
@@ -479,6 +479,11 @@ static int is_intel(struct dprops *d)
     return !strcmp(d->di.driver, "intel");
 }
 
+static int is_navi(struct dprops *d)
+{
+    return !strcmp(d->di.driver, "navi");
+}
+
 /* Can row i of a drop-down list be chosen? All can but the drivers for
  * adapters that are not there. */
 static int item_ok(struct dprops *d, enum ctl k, int i)
@@ -488,8 +493,9 @@ static int item_ok(struct dprops *d, enum ctl k, int i)
     switch (i) {
     case DROW_VGA: return 1;
     case DROW_VOODOO: return d->native_ok;
-    case DROW_RADEON: return d->radeon_ok && !is_intel(d);
+    case DROW_RADEON: return d->radeon_ok && !is_intel(d) && !is_navi(d);
     case DROW_INTEL: return d->radeon_ok && is_intel(d);
+    case DROW_NAVI: return d->radeon_ok && is_navi(d);
     default: return 0;
     }
 }
@@ -513,8 +519,9 @@ static int combo_items(struct dprops *d, enum ctl k, char rows[][48], int *chose
         snprintf(rows[DROW_VOODOO], 48, "3dfx Voodoo%s", item_ok(d, k, DROW_VOODOO) ? "" : " (not found)");
         snprintf(rows[DROW_RADEON], 48, "ATI Radeon%s", item_ok(d, k, DROW_RADEON) ? "" : " (not found)");
         snprintf(rows[DROW_INTEL], 48, "Intel HD Graphics%s", item_ok(d, k, DROW_INTEL) ? "" : " (not found)");
+        snprintf(rows[DROW_NAVI], 48, "AMD Radeon RX 5500%s", item_ok(d, k, DROW_NAVI) ? "" : " (not found)");
         *chosen = d->driver == DRV_STANDARD ? DROW_VGA : d->driver == DRV_NATIVE ? DROW_VOODOO
-                  : is_intel(d) ? DROW_INTEL : DROW_RADEON;
+                  : is_intel(d) ? DROW_INTEL : is_navi(d) ? DROW_NAVI : DROW_RADEON;
         return DRIVER_ROWS;
     case K_COLORS:
         snprintf(rows[0], 48, "High Color (16 bit)");
@@ -1498,7 +1505,7 @@ static int apply(struct dprops *d)
     snprintf(gfx, sizeof(gfx), "%s", d->saved_gfx);
     video[0] = 0;
 
-    const char *driver = d->driver == DRV_RADEON ? d->di.driver : "";    /* "radeon" or "intel" */
+    const char *driver = d->driver == DRV_RADEON ? d->di.driver : "";    /* "radeon", "intel" or "navi" */
     int accel = wm_accel();
 
     if (own_modes(d)) {
@@ -2071,7 +2078,7 @@ static void dp_reload(struct dprops *d)
     display(DISP_INFO, &d->di);
     int n = display(DISP_MODES, d->modes);
     d->nmodes = n > 0 ? n : 0;
-    d->radeon_ok = !strcmp(d->di.driver, "radeon") || !strcmp(d->di.driver, "intel");
+    d->radeon_ok = !strcmp(d->di.driver, "radeon") || !strcmp(d->di.driver, "intel") || is_navi(d);
     d->native_ok = !d->radeon_ok && (d->di.flags & DISPF_NATIVE) && d->nmodes > 0;
     d->radeon_modes = d->radeon_ok && (d->di.flags & DISPF_NATIVE) && d->nmodes > 0;
 
