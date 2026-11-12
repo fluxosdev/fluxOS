@@ -151,7 +151,8 @@ static struct navi {
     uint8_t revision;
     struct pci_dev pci;
     volatile uint8_t *regs;
-    uint32_t aper_phys, aper_size;
+    uint64_t aper_phys, aper_size;  /* BAR0: UEFI firmware may put it above 4 GiB, and
+                                     * with resizable BAR it is all of video memory */
     uint32_t vram_mb;               /* 4 or 8 GiB on an RX 5500 XT: past 32 bits in bytes */
     uint64_t mc_base;               /* the aperture's start, as HUBP sees it */
     int pipes;                      /* bit n: pipe n shows the screen */
@@ -201,17 +202,30 @@ static const struct chip *find_chip(struct pci_dev *out)
     return NULL;
 }
 
-/* A memory BAR's size: write all ones with decoding off, see which bits stick. */
-static uint32_t bar_size(const struct pci_dev *p, int bar)
+/* A memory BAR's address and size (both halves of a 64-bit one): write
+ * all ones with decoding off, see which bits stick. 0 if it is not memory. */
+static uint64_t bar_size(const struct pci_dev *p, int bar, uint64_t *base)
 {
     uint32_t v = pci_read32(p, bar);
+    if (v & 1)
+        return 0;
+    int wide = (v & 6) == 4;
+    uint32_t high = wide ? pci_read32(p, bar + 4) : 0;
+    *base = (uint64_t)high << 32 | (v & ~0xFu);
     uint32_t cmd = pci_read32(p, PCI_COMMAND) & 0xFFFF;
     pci_write32(p, PCI_COMMAND, cmd & ~PCI_CMD_MEM);
     pci_write32(p, bar, 0xFFFFFFFFu);
-    uint32_t mask = pci_read32(p, bar) & ~0xFu;
+    uint64_t mask = pci_read32(p, bar) & ~0xFu;
     pci_write32(p, bar, v);
+    if (wide) {
+        pci_write32(p, bar + 4, 0xFFFFFFFFu);
+        mask |= (uint64_t)pci_read32(p, bar + 4) << 32;
+        pci_write32(p, bar + 4, high);
+    } else {
+        mask |= 0xFFFFFFFF00000000ull;
+    }
     pci_write32(p, PCI_COMMAND, cmd);
-    return mask ? ~mask + 1 : 0;
+    return *base && mask != 0xFFFFFFFF00000000ull ? ~mask + 1 : 0;
 }
 
 /* CPU writes through the aperture pass the HDP, which may hold them a
@@ -242,7 +256,9 @@ static void find_pipes(void)
     if (!fb_boot.base || fb_boot.phys < nv.aper_phys ||
         fb_boot.phys - nv.aper_phys >= nv.aper_size)
         return;                     /* text mode, or a screen outside the aperture */
-    nv.page0 = fb_boot.phys - nv.aper_phys;
+    if (fb_boot.phys - nv.aper_phys + fb_boot.size > 0xFFFFFFFFu)
+        return;                     /* (offsets in the aperture are 32 bits) */
+    nv.page0 = (uint32_t)(fb_boot.phys - nv.aper_phys);
     uint32_t want_pitch = fb_boot.pitch / fb_boot.bytespp;
     uint64_t surface = 0;
     for (int p = 0; p < NPIPES; p++) {
@@ -288,8 +304,11 @@ static void plan_vram(void)
         return;
     nv.page_size = fb.size;
     uint64_t vram = (uint64_t)nv.vram_mb << 20;
-    uint32_t limit = vram > (uint64_t)nv.aper_size + VRAM_TOP_RESERVE ? nv.aper_size
-                     : vram > VRAM_TOP_RESERVE ? (uint32_t)(vram - VRAM_TOP_RESERVE) : 0;
+    uint64_t end = vram > nv.aper_size + VRAM_TOP_RESERVE ? nv.aper_size
+                   : vram > VRAM_TOP_RESERVE ? vram - VRAM_TOP_RESERVE : 0;
+    /* (a resizable BAR's aperture is all of video memory; the pages and
+     * the pointer stay in its first 4 GiB, where offsets are 32 bits) */
+    uint32_t limit = end > 0xFFF00000u ? 0xFFF00000u : (uint32_t)end;
     uint32_t screen_end = nv.page0 + 2 * nv.page_size;
     nv.flip = screen_end > nv.page0 && screen_end <= limit;
     uint32_t cur = MAX(CURSOR_MIN_OFF, ALIGN_UP(nv.flip ? screen_end : nv.page0 + nv.page_size, 1u << 20));
@@ -506,30 +525,34 @@ void navi_init(void)
     if (!chip)
         return;
 
-    uint32_t bar0 = pci_read32(&p, PCI_BAR0), bar5 = pci_read32(&p, PCI_BAR5);
-    if ((bar0 & 1) || (bar5 & 1) || !(bar0 & ~0xFu) || !(bar5 & ~0xFu) ||
-        ((bar0 & 6) == 4 && pci_read32(&p, PCI_BAR1)) || (bar5 & 6) == 4) {
-        kprintf("navi: %s has no memory BARs below 4 GiB, ignoring it\n", chip->name);
+    uint32_t bar5 = pci_read32(&p, PCI_BAR5);
+    nv.pci = p;
+    nv.aper_size = bar_size(&p, PCI_BAR0, &nv.aper_phys);
+    klog("navi: %02x:%02x.%u %04x:%04x, aperture %08x%08x size %u MiB, registers %08x\n",
+         p.bus, p.dev, p.fn, VENDOR_AMD, nv.device, (uint32_t)(nv.aper_phys >> 32),
+         (uint32_t)nv.aper_phys, (uint32_t)(nv.aper_size >> 20), bar5);
+    if (!nv.aper_size || (bar5 & 1) || !(bar5 & ~0xFu)) {
+        kprintf("navi: %s has no video memory or register BAR assigned, ignoring it\n", chip->name);
         return;
     }
-    nv.pci = p;
-    nv.aper_phys = bar0 & ~0xFu;
-    nv.aper_size = bar_size(&p, PCI_BAR0);
     /* Another adapter shows the boot loader's screen: leave this one be. */
     if (fb_boot.base && (fb_boot.phys < nv.aper_phys || fb_boot.phys - nv.aper_phys >= nv.aper_size)) {
-        kprintf("navi: %s does not show the screen, ignoring it\n", chip->name);
+        kprintf("navi: %s does not show the screen (it is at %08x%08x), ignoring it\n", chip->name,
+                (uint32_t)(fb_boot.phys >> 32), (uint32_t)fb_boot.phys);
         return;
     }
     pci_enable(&p, PCI_CMD_IO | PCI_CMD_MEM);
     nv.regs = pci_map_bar(&p, PCI_BAR5);
-    if (!nv.regs || !nv.aper_size)
+    if (!nv.regs) {
+        kprintf("navi: %s: cannot map its registers\n", chip->name);
         return;
+    }
     nv.name = chip->name;
     /* Not a size the card could have (or registers that do not answer,
      * reading all ones): the aperture is all that is known of it. */
     nv.vram_mb = rd(RCC_CONFIG_MEMSIZE);
     if (nv.vram_mb < 256 || nv.vram_mb > 32768)
-        nv.vram_mb = nv.aper_size >> 20;
+        nv.vram_mb = (uint32_t)(nv.aper_size >> 20);
     if (fb_boot.base) {
         nv.boot_mode.width = (uint16_t)fb_boot.width;
         nv.boot_mode.height = (uint16_t)fb_boot.height;
