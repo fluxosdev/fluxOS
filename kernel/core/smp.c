@@ -605,6 +605,8 @@ void smp_park(void)
     lapic_eoi();
     fpu_suspend_cpu();
     if (context_save(&park_ctx[this_cpu()->index])) {
+        if (this_cpu()->proc)
+            proc_load_tls(this_cpu()->proc);    /* (its thread block's base went with the power) */
         __atomic_store_n(&this_cpu()->online, 1, __ATOMIC_RELEASE);
         return;                         /* back where the interrupt came */
     }

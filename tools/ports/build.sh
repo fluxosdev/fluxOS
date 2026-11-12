@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build the GNU programs that run on fluxOS (phase 2 and 3 of the
 # self-hosting roadmap): GNU make and binutils, cross-compiled with the
-# i686-fluxos toolchain into static programs for the system image.
+# x86_64-fluxos toolchain into static (64-bit) programs for the system image.
 #
 #   tools/ports/build.sh [--toolchain DIR] [--sysroot DIR] [--jobs N] [--cache DIR]
 #                        [--work DIR] [--dest DIR] [--only make|binutils]
@@ -14,7 +14,7 @@
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 top=$(cd "$here/../.." && pwd)
-TARGET=i686-fluxos
+TARGET=x86_64-fluxos
 BINUTILS=binutils-2.42
 BINUTILS_SHA256=f6e4d41fd5fc778b06b7891457b3620da5ecea1006c6a4a41ae998109f85a800
 MAKE=make-4.4.1

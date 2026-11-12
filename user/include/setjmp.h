@@ -7,9 +7,15 @@ extern "C" {
 
 #include <stdint.h>
 
+#ifdef __x86_64__
+/* rbx, rbp, r12, r13, r14, r15, rsp, rip, mask_saved, sigmask */
+typedef uint64_t jmp_buf[10];
+typedef uint64_t sigjmp_buf[10];
+#else
 /* ebx, esi, edi, ebp, esp, eip, mask_saved, sigmask */
 typedef uint32_t jmp_buf[8];
 typedef uint32_t sigjmp_buf[8];
+#endif
 
 int setjmp(jmp_buf env) __attribute__((returns_twice));
 int _setjmp(jmp_buf env) __attribute__((returns_twice));

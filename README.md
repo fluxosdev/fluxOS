@@ -18,8 +18,8 @@
 > been tested by running it in QEMU, not reviewed or audited by people, so
 > read it with that in mind.
 
-fluxOS is a small x86-64 Unix-like operating system (a 64-bit kernel that
-runs 32-bit programs) with preemptive
+fluxOS is a small x86-64 Unix-like operating system (64-bit, kernel and
+programs) with preemptive
 multitasking, ring-3 processes, paging, a root filesystem on the hard disk it
 is installed on, IDE/SATA/floppy/USB storage, FAT and ISO9660, an
 NE2000, nForce, Intel PRO/1000 and Intel I217 network drivers with a TCP/IP stack, a zsh-flavoured shell
@@ -34,15 +34,29 @@ straight into the desktop.
 fluxOS needs a **64-bit processor** (x86-64: an Athlon 64, a Pentium 4 with
 EM64T, a Core 2 or anything newer). The kernel is 64-bit code: it lives at
 the top of the 64-bit address space, with all of physical memory mapped
-there, and Limine starts it in long mode. The programs are still 32-bit
-ones, which the processor runs in compatibility mode, in the 4 GiB address
-space and with the system calls they always had; they are built for the
-SSE2 every 64-bit processor has: the C library copies with the SSE
-registers, GL transforms and lights vertices four lanes at a time, the
-desktop, browser and image decoders blend and convert pixels eight 16-bit
-lanes at a time in the SSE2 integer instructions, and all floating point,
-doubles included, runs on SSE2. (Until 0.4 fluxOS was a 32-bit system for
-the Pentium 4, started by GRUB; a 32-bit processor no longer starts it.)
+there (more than 4 GiB of it too), and Limine starts it in long mode. The
+programs are 64-bit code as well, with the sixteen registers and the
+calling convention of x86-64; they are built for the SSE2 every 64-bit
+processor has: the C library copies with the SSE registers, GL transforms
+and lights vertices four lanes at a time, the desktop, browser and image
+decoders blend and convert pixels eight 16-bit lanes at a time in the SSE2
+integer instructions, and all floating point, doubles included, runs on
+SSE2. A 64-bit program has the low half of the 64-bit address space: it is
+loaded at 1 GiB, where programs always were, but its heap starts at 4 GiB
+and its stack and mappings are at the top of the half, so what it
+allocates has addresses above 4 GiB, and one program can use more memory
+than 32 bits address (`make test-highmem-qemu` has one hold 4.5 GiB in a
+single block). Its system calls take and return 64-bit values: a file may
+be larger than 4 GiB (`off_t` is 64 bits), and one `read` or `write` moves
+as much of it as was asked for. Its stack grows as far as its limit, which
+is 32 MiB until `ulimit -s` or `setrlimit` raises or lifts it. The
+kernel runs 32-bit programs too, in the processor's compatibility mode,
+in the 2 GiB from 1 GiB to 3 GiB they always had and with the system
+calls and structures they were built for: the Windows program loader is
+one (the programs it runs are 32-bit code), and so is anything built for
+an older fluxOS. (Until 0.4 fluxOS was a
+32-bit system for the Pentium 4, started by GRUB; a 32-bit processor no
+longer starts it.)
 
 ## Features
 
@@ -53,8 +67,9 @@ the Pentium 4, started by GRUB; a 32-bit processor no longer starts it.)
   `nosplash` (the boot menu's "show boot messages" entry). Shutting down and
   restarting show the logo on Kinetik Blue's wallpaper.
 - Limine boot protocol entry in long mode, GDT/TSS/IDT, one trap dispatcher
-  for exceptions, IRQs and the `int 0x80` system call gate, which 32-bit
-  programs call from compatibility mode.
+  for exceptions, IRQs and the `int 0x80` system call gate, the same for
+  64-bit programs and for 32-bit ones in compatibility mode (ELF64 and
+  ELF32 executables: `exec` starts either).
 - Preemptive round-robin scheduler (PIT at 100 Hz) with sleep/wait queues.
 - Multiprocessor (SMP): the other processors and cores, found in the ACPI
   MADT or the MultiProcessor Specification table, are started with INIT and
@@ -89,7 +104,10 @@ the Pentium 4, started by GRUB; a 32-bit processor no longer starts it.)
 - Processor check at boot (a 64-bit processor, so SSE2, is the minimum), and a
   write-combining framebuffer through the page attribute table (`pat=off`
   keeps it uncached).
-- Memory: bitmap frame allocator over the first 4 GiB of RAM, four-level
+- Memory: bitmap frame allocator over all of RAM (sized to the machine at
+  boot; programs' pages come from above 4 GiB first, which devices with
+  32-bit addresses cannot use, and a page lent to such a device is moved
+  below), four-level
   paging (all of physical memory mapped for the kernel at the start of its
   half of the address space with 2 MiB pages, its own memory from the first
   GiB and user pages from the RAM above it first, 4 KiB user pages), growing
@@ -106,14 +124,17 @@ the Pentium 4, started by GRUB; a 32-bit processor no longer starts it.)
   to the second, kept in the creation time's 10 ms field besides the 2 s
   write time), ISO 9660 with Rock Ridge (read), and ext2 (read/write,
   revision 0 and 1): permissions, owners, one-second times, symbolic and
-  hard links, files through triple-indirect blocks. ext3 mounts as ext2
+  hard links, files through triple-indirect blocks, of 4 GiB and more (up
+  to 16 GiB on a volume of 1 KiB blocks, 2 TiB on one of 4 KiB blocks, which
+  `mkfs.ext2` gives a volume of 512 MiB or more). ext3 mounts as ext2
   while its journal is clean; ext4 is refused, and volumes with features
   writing would not keep up to date (checksums) mount read-only. `/etc/fstab`
   lines (`UUID=... /src ext2`) are mounted at start-up. The CD's
   initrd is a small setup system, not the whole one: files in memory live in
-  the kernel heap, a quarter of RAM (up to 256 MiB, and at most half of the
-  first GiB), so the whole system with its compiler in memory (`make
-  run-kernel`, `make test-gcc-qemu`) wants a machine with 1 GiB.
+  the kernel heap, a quarter of RAM (up to 256 MiB; more where the initrd
+  needs it, and at most half of the first GiB), so the whole system with
+  its compiler in memory (`make run-kernel`, `make test-gcc-qemu`) wants a
+  machine with 1 GiB.
 - Storage:
   - IDE (ATA LBA28/48 and ATAPI) with bus-master DMA, interrupt driven, falling
     back to PIO on failure; native-mode PCI IDE controllers. Options:
@@ -286,7 +307,9 @@ the Pentium 4, started by GRUB; a 32-bit processor no longer starts it.)
   (`!! !$ !n !str`), aliases, `source`, `~/.fshrc`, `~/.fsh_history`, AUTO_CD.
 - `case ... esac`, here documents (`<<EOF`, `<<-EOF`, quoted delimiters),
   `${VAR#pat} ${VAR%pat}` (and `##`, `%%`), `trap`, `getopts`, `local`,
-  `command -v`, `set -e -u -x -f -n`, `umask`, a `test`/`[` with every POSIX
+  `command -v`, `set -e -u -x -f -n`, `umask`, `ulimit` (`-s` sets how far the
+  stack of the programs run from the shell may grow, `unlimited` too; the
+  other limits are shown), a `test`/`[` with every POSIX
   operator, and `printf` with `%f`.
 - **As `/bin/sh`** (started as `sh`, or `fsh --posix`): the POSIX shell that
   `make`'s recipes and `configure` scripts expect. Unquoted `$var` and
@@ -877,7 +900,8 @@ sudo apt install build-essential qemu-system-x86
 
 No cross compiler is needed on an x86-64 host: the kernel is built with the
 host GCC using `-m64 -mcmodel=kernel -ffreestanding`, the programs with
-`-m32 -march=pentium4 -ffreestanding`, and nothing links against libgcc or
+`-m64 -ffreestanding` (and the Windows program loader, with the libraries
+it links, with `-m32 -march=pentium4`), and nothing links against libgcc or
 the host libc. Limine is not built or downloaded: its files are checked in
 (`firmware/limine`, the binary release 9.6.7, with their provenance and
 hashes in its README; its installer's source is in `third_party/limine`),
@@ -898,7 +922,7 @@ make test-tls     # local OpenSSL servers: authenticated handshakes and rejected
 make test-websocket # local ws/wss transport and browser API integration tests
 make test-kernel # runs allocator, filesystem (FAT and ext2, judged by e2fsck), pipe and socket regressions on the host
 make test-libc   # libc printf/strtod/scanf/regex/fnmatch/getopt/time against glibc, on the host
-make test-libc-qemu # the libc on the real kernel (files, popen, pipes, select, time) in QEMU
+make test-libc-qemu # the libc on the real kernel (files, also past 4 GiB, popen, pipes, select, time, the stack's limit) in QEMU
 make test-tools  # tar, gzip, sed, diff, patch, find... built for the host, against GNU's
 make test-sh     # fsh as /bin/sh, built for the host, against the host's /bin/sh
 make test-gl     # the GL library's software renderer, built for the host, drawn with pixel by pixel
@@ -922,22 +946,26 @@ make run-q35    # q35 machine: disk and CD on SATA, USB keyboard and tablet on x
 make run-usb    # disk as a USB stick on EHCI, keyboard and mouse on UHCI
 make clean      # removes build/ and the ISO; the disk images are kept
 make sysroot    # build/sysroot: fluxOS's headers, libc.a, libGL.a, crt0.o for a cross compiler
-make toolchain  # binutils and GCC (C and C++) for the i686-fluxos target, in build/toolchain/cross
+make toolchain  # binutils and GCC (C and C++) for the x86_64-fluxos target, in build/toolchain/cross
 make ports      # GNU make and binutils built for fluxOS, for the system image
 make toolchain-native # GCC built to run on fluxOS (the Canadian cross), for the system image
 ```
 
-`make toolchain` builds a GCC that targets fluxOS (`i686-fluxos-gcc` and
+`make toolchain` builds a GCC that targets fluxOS (`x86_64-fluxos-gcc` and
 `-g++`, with `as`, `ld`, `ar`, `libgcc` and `libstdc++`): it fetches binutils
 2.42 and GCC 13.2.0 from gnu.org (checked against fixed SHA-256 sums), applies
 the small target patches in `tools/toolchain/patches/`, and installs into
 `build/toolchain/cross`. It needs `curl`, `patch`, a host C and C++ compiler
-and about twenty minutes. With it, `i686-fluxos-gcc hello.c` makes a program
-for fluxOS without the Makefile's flags (linked with `/usr/lib/fluxos.ld`,
-the system's linker script), and `make BUILD=build-cross
-CC=.../i686-fluxos-gcc LD=.../i686-fluxos-ld AR=.../i686-fluxos-ar` builds
-the tree with it. `make ports` then builds GNU make and binutils for fluxOS,
-and `make toolchain-native` GCC itself, configured `--host=i686-fluxos` (its
+and about twenty minutes. With it, `x86_64-fluxos-gcc hello.c` makes a
+(64-bit) program for fluxOS without the Makefile's flags (linked with
+`/usr/lib/fluxos.ld`, the system's linker script), and `make
+BUILD=build-cross CC=.../x86_64-fluxos-gcc LD=.../x86_64-fluxos-ld
+AR=.../x86_64-fluxos-ar` builds the tree with it: the compiler makes 64-bit
+code for the kernel and the programs and, with `-m32`, the 32-bit code of
+the Windows program loader (its own libraries, libgcc and libstdc++, are
+64-bit only, which the tree does not use). `make ports` then builds GNU
+make and binutils for fluxOS,
+and `make toolchain-native` GCC itself, configured `--host=x86_64-fluxos` (its
 C++ parts against that `libstdc++`); the next `make` puts them on the system
 image with the sysroot as `/usr/include` and `/usr/lib`. The whole of
 `self-hosting-roadmap.md` describes the way from there to a fluxOS that
@@ -1108,24 +1136,30 @@ third_party/limine/        Limine's installer (limine bios-install), for the hos
 
 | Range                                         | Use                                              |
 |-----------------------------------------------|--------------------------------------------------|
-| `0x40000000 - ...`                            | user program image, then the `sbrk` heap         |
+| `0x40000000 - ...`                            | user program image (then a 32-bit program's `sbrk` heap) |
 | `0xB0000000 - ...`                            | the framebuffer, in the process that mapped it   |
-| `0xBE000000 - 0xBFFFFFFF`                     | user stack (up to 32 MiB, grown on page faults)  |
+| `0xBE000000 - 0xBFFFFFFF`                     | a 32-bit program's stack (up to 32 MiB, grown on page faults) |
+| `0x100000000 - ...`                           | a 64-bit program's `sbrk` heap                   |
+| `... - 0x7EFFEFFFEFFF`                        | a 64-bit program's mappings, made downwards      |
+| `0x7EFFFFFFF000 - 0x7FFFFFFFEFFF`             | a 64-bit program's stack: grown on page faults down to its limit (32 MiB unless raised), with room for 1 TiB |
 | `0xFFFF800000000000 - ...`                    | the direct map: all of physical memory           |
 | `0xFFFFC00000000000 - ...`                    | kernel mappings of device memory (2 MiB pages)   |
 | `0xFFFFC08000000000 - ...`                    | late mappings, a page at a time (ACPI's memory)  |
 | `0xFFFFFFFF80000000 - 0xFFFFFFFFFFFFFFFF`     | the kernel image                                 |
 
-A process has the 2 GiB from `0x40000000` of the low half (it is a 32-bit
-program; the rest of the low half is empty), the kernel the high half, with
+A process has the low half from `0x40000000`: a 32-bit program the 2 GiB
+up to `0xC0000000`, with its mappings made downwards from the framebuffer's
+place, a 64-bit program all of it. The kernel has the high half, with
 four-level page tables whose upper half every address space shares. The
 kernel's own memory (page tables, heap, stacks, DMA buffers) comes from the
 first GiB of RAM and user pages from the RAM above it first; the kernel
 reaches every frame through the direct map, so a pointer to kernel memory
 is its physical address plus a constant (`phys_to_virt`, `virt_to_phys`),
-and a device is given the physical one. Frame addresses are still 32 bits
-wide, as the drivers give them to their devices: RAM past 4 GiB is not
-used yet.
+and a device is given the physical one. The kernel's own frames have
+32-bit addresses, as the drivers give them to their devices; a program's
+pages may be anywhere, above 4 GiB first, and one that is lent to a device
+(the GPU) is moved below. Device registers may be above 4 GiB too (a 64-bit
+BAR, as UEFI firmware likes to assign them).
 
 **Scheduling.** Each trap pushes a `struct trapframe` on the process's 32 KiB
 kernel stack. The kernel is not preemptible (interrupt gates keep IF clear): a
@@ -1214,8 +1248,13 @@ controls in page coordinates, which painting clips to the view. CSS numbers are
 fixed point with two decimals.
 
 **System calls.** `int 0x80`, number in `eax`, arguments in `ebx`, `ecx`, `edx`,
-`esi`, `edi`; failures return `-errno`. Every user pointer is checked against the
-user range and page tables first.
+`esi`, `edi`; failures return `-errno`. A 64-bit program's are the whole
+registers (`rbx` and the rest, and `rax` for the result), so an address or a
+size goes through whole; a 32-bit program's are their low halves, as they
+always were. The few structures that hold an address (`struct flux_sigaction`,
+`flux_mmap_args` and such in `<flux/abi.h>`) are as wide there as the program's
+pointers, and the kernel reads either layout. Every user pointer is checked
+against the program's part of the address space and the page tables first.
 
 ## Work in progress
 
@@ -1225,10 +1264,8 @@ user range and page tables first.
   as `/bin/sh`, the build tree has a filesystem with links and one-second
   times (ext2), and the ISO is made by fluxOS's own `mkiso` and Limine's
   installer from Limine's checked-in files; what is left is the bootstrap
-  itself. **The native GCC is an i686 compiler, which cannot build the 64-bit
-  kernel**: until the fluxOS toolchain can also emit 64-bit code (see
-  self-hosting-roadmap.md), fluxOS builds its programs on itself but not its
-  kernel. The native compiler is tested on the kernel by `make
+  itself. The toolchain's target is `x86_64-fluxos` (64-bit code, and
+  32-bit with `-m32`), as the tree is built. The native compiler is tested on the kernel by `make
   test-gcc-qemu`; the tools and the `sh` mode on the host against the GNU
   originals and dash.
 - **The Radeon driver on Llano APUs (HD 6520G and kin) is partial:** page
@@ -1285,14 +1322,13 @@ The FPU state is saved with FXSAVE, so AVX and later cannot be used.
   `s3_nomode` turn them off) or the virtual BIOS under a hypervisor. No
   hibernation (S4), no processor frequency scaling, and touchpads other than
   Synaptics have no scrolling.
-- **SATA:** AHCI only, no NCQ, port multipliers or hot plugging; a controller
-  above 4 GiB can't be reached.
+- **SATA:** AHCI only, no NCQ, port multipliers or hot plugging.
 - **USB:** isochronous transfers only on UHCI, OHCI and xHCI (a USB audio
   device on an EHCI port works where the chipset hands full-speed devices
   to a companion controller, not behind an EHCI rate-matching hub); no UAS,
   only LUN 0 of mass storage, no
   keyboard LEDs or power management, boot-protocol/plain HID devices only,
-  interrupt endpoints polled every 1 ms, controllers above 4 GiB skipped,
+  interrupt endpoints polled every 1 ms,
   at most 32 devices on an xHCI controller. Unmount or `sync` before pulling
   out a stick.
 - **Recent writes can be lost on a crash:** metadata reaches the disk within
@@ -1301,9 +1337,12 @@ The FPU state is saved with FXSAVE, so AVX and later cannot be used.
 - **Disks and filesystems:** MBR with four primary partitions only (no GPT,
   extended or logical; a FAT volume without a table is accepted); FAT12/16/32
   only; ISO9660 has no Joliet. FAT files show as `rwxr-xr-x` and `chmod` on FAT/
-  ISO is lost on unmount. Raw `/dev/hdX` access and file sizes are limited to
-  4 GiB by 32-bit offsets, directories to 4 MiB, FAT names to 255 UTF-8 bytes,
-  and FAT timestamps have 2 s resolution.
+  ISO is lost on unmount. Disks are limited to 2 TiB by 32-bit sector
+  numbers; a file on FAT or ISO 9660 ends before 4 GiB, as those formats have
+  it (one extent on ISO 9660), a file in memory (`/tmp`) has to fit the
+  kernel heap, and a 32-bit program sees files under 2 GiB only. Directories
+  are limited to 4 MiB, FAT names to 255 UTF-8 bytes, and FAT timestamps have
+  2 s resolution.
 - **Floppies:** primary controller only, two drives, double- and high-density
   disks. Unmount before removal or recent changes are lost; looking for a disk
   in an empty drive steps the head every 2 s.

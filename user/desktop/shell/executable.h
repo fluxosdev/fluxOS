@@ -19,14 +19,14 @@ static const char *foreign_program_loader(const char *path)
     const char *loader = NULL;
     if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode))
         goto done;
-    int n = (int)read(fd, head, sizeof(head));
+    ssize_t n = read(fd, head, sizeof(head));
     if (n >= 2 && ((head[0] == 'M' && head[1] == 'Z') ||
                    (head[0] == 'Z' && head[1] == 'M'))) {
         loader = "/bin/dos";
         if (n == sizeof(head)) {
             uint32_t off;
             memcpy(&off, head + 0x3c, 4);
-            if (off >= 64 && st.st_size >= 4 && off <= (uint32_t)st.st_size - 4 &&
+            if (off >= 64 && st.st_size >= 4 && off <= (uint64_t)st.st_size - 4 &&
                 lseek(fd, (off_t)off, SEEK_SET) == (off_t)off &&
                 read(fd, sig, 4) == 4 && !memcmp(sig, "PE\0\0", 4))
                 loader = "/bin/winrun";

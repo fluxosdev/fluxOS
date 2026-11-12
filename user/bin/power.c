@@ -34,7 +34,7 @@ static const char *state_name(const struct battery_info *b)
 static int status(int verbose)
 {
     struct powerinfo pi;
-    if (power(POWER_INFO, (unsigned int)&pi) < 0) {
+    if (power(POWER_INFO, (unsigned long)&pi) < 0) {
         perror("power");
         return 1;
     }
@@ -86,7 +86,7 @@ static int brightness(const char *arg)
     unsigned int v;
     if (!arg) {
         struct powerinfo pi;
-        if (power(POWER_INFO, (unsigned int)&pi) < 0 || !(pi.flags & PWR_BACKLIGHT)) {
+        if (power(POWER_INFO, (unsigned long)&pi) < 0 || !(pi.flags & PWR_BACKLIGHT)) {
             fprintf(stderr, "power: the backlight cannot be set on this machine\n");
             return 1;
         }
@@ -112,7 +112,7 @@ static int brightness(const char *arg)
 static int suspend(void)
 {
     struct powerinfo pi;
-    if (power(POWER_INFO, (unsigned int)&pi) == 0 && !(pi.flags & PWR_CAN_SLEEP)) {
+    if (power(POWER_INFO, (unsigned long)&pi) == 0 && !(pi.flags & PWR_CAN_SLEEP)) {
         fprintf(stderr, "power: cannot suspend: %s\n", pi.nosleep);
         return 1;
     }

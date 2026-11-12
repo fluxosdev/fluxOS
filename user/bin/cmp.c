@@ -28,7 +28,7 @@ static int skip_to(int fd, long long n)
 {
     char buf[4096];
     while (n > 0) {
-        int r = (int)read(fd, buf, n < (long long)sizeof(buf) ? (size_t)n : sizeof(buf));
+        ssize_t r = read(fd, buf, n < (long long)sizeof(buf) ? (size_t)n : sizeof(buf));
         if (r <= 0)
             return -1;
         n -= r;
@@ -69,14 +69,14 @@ int main(int argc, char **argv)
     long long pos = 0, line = 1;
     int differ = 0;
     for (;;) {
-        int r1 = (int)read(f1, b1, sizeof(b1));
+        ssize_t r1 = read(f1, b1, sizeof(b1));
         if (r1 < 0) {
             fprintf(stderr, "cmp: %s: %s\n", n1, strerror(errno));
             return 2;
         }
         int got2 = 0;
         while (got2 < r1) {
-            int r2 = (int)read(f2, b2 + got2, (size_t)(r1 - got2));
+            ssize_t r2 = read(f2, b2 + got2, (size_t)(r1 - got2));
             if (r2 < 0) {
                 fprintf(stderr, "cmp: %s: %s\n", n2, strerror(errno));
                 return 2;
@@ -111,7 +111,7 @@ int main(int argc, char **argv)
         if (r1 == 0) {
             /* f1 is done: is f2? */
             char c;
-            int r2 = (int)read(f2, &c, 1);
+            ssize_t r2 = read(f2, &c, 1);
             if (r2 > 0) {
                 if (!silent && list)
                     fprintf(stderr, "cmp: EOF on %s after byte %lld\n", n1, pos);

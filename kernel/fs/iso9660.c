@@ -199,7 +199,8 @@ static int iso_load_dir(struct vnode *dir)
     return 0;
 }
 
-static int iso_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
+/* (A file is one extent, whose length is 32 bits: under 4 GiB.) */
+static int iso_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
 {
     struct iso_fs *f = vn->fs->priv;
     struct iso_node *nd = vn->fs_data;
@@ -282,6 +283,7 @@ static int iso_mount(struct fs *fs)
     root->fs_data = rn;
     root->mode = 0555;
     fs->priv = f;
+    fs->max_file = 0xFFFFFFFFu;
     fs->root = root;
     fs->readonly = 1;
     fs->case_insensitive = !f->rock_ridge;

@@ -813,6 +813,125 @@ static void trimming(uint32_t bs)
            bs, trim_calls);
 }
 
+/* ---- files of 2 GiB and more: sparse, so that a 16 MiB image holds them ---- */
+
+static void put_at(struct vnode *vn, uint64_t off, const char *text)
+{
+    uint32_t n = (uint32_t)strlen(text);
+    CHECK(LOCKED(vfs_write(vn, text, off, n)) == (int)n);
+}
+
+static void same_at(struct vnode *vn, uint64_t off, const void *data, uint32_t n)
+{
+    uint8_t buf[64];
+    CHECK(n <= sizeof(buf));
+    int r = LOCKED(vfs_read(vn, buf, off, n));
+    if (r != (int)n || memcmp(buf, data, n)) {
+        fprintf(stderr, "kernel-ext2: large file at %llu: read %d of %u, different\n",
+                (unsigned long long)off, r, n);
+        exit(1);
+    }
+}
+
+/* max: the largest file a volume of such blocks holds. */
+static void large_files(uint32_t bs, uint64_t max)
+{
+    static const uint8_t zeros[32];
+    const uint64_t G = 1ull << 30;
+    uint8_t buf[8];
+    char want[64];
+    struct vnode *vn;
+    struct stat st;
+
+    /* (mke2fs marks a new volume as holding large files unless told not to, and to leave out
+     * the inode it keeps for growing the volume, which is one: here the first one does.) */
+    sh("mke2fs -q -F -t ext2 -b %u -O ^large_file,^resize_inode %s %uM >/dev/null 2>&1", bs, img, DISK_MB);
+    CHECK(!strstr(debugfs("stats"), "large_file"));
+    load_image();
+    CHECK(mount_image() == 0);
+    CHECK(mounted_fs->max_file == max);
+    CHECK(create("/mnt/huge", VN_FILE, &vn) == 0);
+    put_at(vn, 2 * G - 5, "across 2G");
+    CHECK(vn->size == 2 * G + 4);
+    put_at(vn, 4 * G - 3, "across 4G");
+    CHECK(vn->size == 4 * G + 6);
+    put_at(vn, 5 * G + 12345, "past 5 GiB");
+    put_at(vn, max - 8, "the end!");
+    CHECK(vn->size == max);
+    /* nothing past the largest size: a write that reaches it is cut short there */
+    CHECK(LOCKED(vfs_write(vn, "x", max, 1)) == -EFBIG);
+    CHECK(LOCKED(vfs_write(vn, "abcdef", max - 2, 6)) == 2);
+    CHECK(vn->size == max);
+    CHECK(LOCKED(vfs_truncate(vn, max + 1)) == -EFBIG);
+    same_at(vn, 2 * G - 5, "across 2G", 9);
+    same_at(vn, 4 * G - 3, "across 4G", 9);
+    same_at(vn, 5 * G + 12345, "past 5 GiB", 10);
+    same_at(vn, max - 8, "the enab", 8);
+    same_at(vn, 3 * G, zeros, 32);              /* a hole */
+    CHECK(LOCKED(vfs_read(vn, buf, max, 8)) == 0);
+    CHECK(LOCKED(vfs_read(vn, buf, max - 3, 8)) == 3);
+    vfs_stat(vn, &st);
+    CHECK((uint64_t)st.st_size == max && st.st_blocks == max / 512);
+
+    /* Linux reads the same size, and finds the volume marked and whole */
+    unmount_image();
+    save_image();
+    fsck_clean("writing a file past 4 GiB");
+    CHECK(strstr(debugfs("stats"), "large_file"));
+    snprintf(want, sizeof(want), "Size: %llu\n", (unsigned long long)max);
+    CHECK(strstr(debugfs("stat /huge"), want));
+
+    /* the size comes back whole, and shrinking frees what is past the new end */
+    load_image();
+    CHECK(mount_image() == 0);
+    vn = look("/mnt/huge", 1);
+    CHECK(vn && vn->size == max);
+    same_at(vn, 5 * G + 12345, "past 5 GiB", 10);
+    same_at(vn, max - 8, "the enab", 8);
+    CHECK(LOCKED(vfs_truncate(vn, 4 * G + 2)) == 0);
+    CHECK(vn->size == 4 * G + 2);
+    same_at(vn, 4 * G - 3, "acros", 5);
+    CHECK(LOCKED(vfs_read(vn, buf, 4 * G + 2, 8)) == 0);
+    CHECK(LOCKED(vfs_truncate(vn, 6 * G)) == 0);
+    same_at(vn, 4 * G - 3, "acros", 5);
+    same_at(vn, 4 * G + 2, zeros, 4);           /* what was cut off does not come back */
+    same_at(vn, 5 * G + 12345, zeros, 10);
+    unmount_image();
+    save_image();
+    fsck_clean("shrinking a file past 4 GiB");
+    snprintf(want, sizeof(want), "Size: %llu\n", (unsigned long long)(6 * G));
+    CHECK(strstr(debugfs("stat /huge"), want));
+
+    load_image();
+    CHECK(mount_image() == 0);
+    CHECK(LOCKED(vfs_unlink("/mnt/huge", NULL)) == 0);
+    unmount_image();
+    save_image();
+    fsck_clean("removing a file past 4 GiB");
+    printf("kernel-ext2: files up to %llu bytes on %u-byte blocks\n", (unsigned long long)max, bs);
+}
+
+/* A revision 0 volume cannot say that it holds a file of 2 GiB or more: it gets none. */
+static void large_files_rev0(void)
+{
+    struct vnode *vn;
+    /* (As mke2fs has it now, or as it had it before 1.47.) */
+    sh("mke2fs -q -F -t ext2 -E revision=0 -b 1024 %s %uM >/dev/null 2>&1 ||"
+       " mke2fs -q -F -t ext2 -r 0 -b 1024 %s %uM >/dev/null 2>&1", img, DISK_MB, img, DISK_MB);
+    CHECK(strstr(debugfs("stats"), "Filesystem revision #:    0"));
+    load_image();
+    CHECK(mount_image() == 0);
+    CHECK(mounted_fs->max_file == 0x7FFFFFFFu);
+    CHECK(create("/mnt/old", VN_FILE, &vn) == 0);
+    put_at(vn, 0x7FFFFFFFu - 4, "last");
+    CHECK(vn->size == 0x7FFFFFFFu);
+    CHECK(LOCKED(vfs_write(vn, "x", 0x7FFFFFFFu, 1)) == -EFBIG);
+    CHECK(LOCKED(vfs_truncate(vn, 0x80000000u)) == -EFBIG);
+    unmount_image();
+    save_image();
+    fsck_clean("the largest file of a revision 0 volume");
+}
+
 int main(void)
 {
     if (!have_e2fsprogs()) {
@@ -833,7 +952,10 @@ int main(void)
     crafted();
     trimming(1024);
     trimming(4096);
+    large_files(1024, 17247252480ull);          /* 16 GiB: what the block map reaches */
+    large_files(4096, 2196873662464ull);        /* 2 TiB: what the inode's count of sectors holds */
+    large_files_rev0();
     sh("rm -rf %s", workdir);
-    printf("kernel ext2: files, directories, symbolic and hard links, renames and truncation passed\n");
+    printf("kernel ext2: files (past 4 GiB too), directories, symbolic and hard links, renames and truncation passed\n");
     return 0;
 }

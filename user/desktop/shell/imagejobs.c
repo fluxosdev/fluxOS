@@ -96,7 +96,7 @@ static int read_all(int fd, void *out, unsigned bytes)
 {
     unsigned got = 0;
     while (got < bytes) {
-        int n = (int)read(fd,(uint8_t *)out+got,bytes-got);
+        ssize_t n = read(fd,(uint8_t *)out+got,bytes-got);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return -1;
         got += (unsigned)n;
@@ -107,7 +107,7 @@ static int write_all(int fd, const void *data, unsigned bytes)
 {
     unsigned sent = 0;
     while (sent < bytes) {
-        int n = (int)write(fd,(const uint8_t *)data+sent,bytes-sent);
+        ssize_t n = write(fd,(const uint8_t *)data+sent,bytes-sent);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return -1;
         sent += (unsigned)n;
@@ -278,7 +278,7 @@ static void ready(void *context, int revents)
             out=worker.image ? (uint8_t *)worker.image->px+worker.received : discarded;
         }
         if (!wanted) {broken();return;}
-        int n=(int)read(worker.from,out,wanted);
+        ssize_t n = read(worker.from,out,wanted);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) {broken();return;}
         budget -= (unsigned)n > budget ? budget : (unsigned)n;

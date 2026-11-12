@@ -81,7 +81,7 @@ void wifi_hw_failed(const char *why);       /* the firmware died */
 
 /* From the kernel */
 void wifi_start(void);                      /* once processes run: the thread */
-int wifi_syscall(uint32_t op, uint32_t arg);   /* SYS_wifi; arg checked here */
+int wifi_syscall(uint32_t op, uintptr_t arg);   /* SYS_wifi; arg checked here */
 int iwl_probe(void);                        /* look for an Intel card: 0 if found */
 
 /* Channel numbers and frequencies */

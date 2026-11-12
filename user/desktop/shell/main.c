@@ -84,7 +84,7 @@ int main(int argc, char **argv)
         /* Input first, before background I/O callbacks (the programs' messages among them). */
         if (fds[0].revents & POLLIN) {
             struct input_event ev[64];
-            int r = (int)read(input, ev, sizeof(ev));
+            ssize_t r = read(input, ev, sizeof(ev));
             for (int i = 0; i < r / (int)sizeof(ev[0]); i++)
                 wm_input(&ev[i]);
         }

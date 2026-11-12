@@ -97,7 +97,7 @@ struct ext2_inode {
     uint32_t ino;
     uint16_t mode, links;
     uint32_t uid, gid;
-    uint32_t size, size_high;
+    uint64_t size;                      /* (a regular file's: past 4 GiB with the volume's large-file flag) */
     uint32_t atime, ctime, mtime, dtime;
     uint32_t blocks;                    /* 512-byte sectors, indirect blocks included */
     uint32_t flags, file_acl;
@@ -386,7 +386,8 @@ static int read_inode(struct ext2_fs *e, struct ext2_inode *in)
     for (int k = 0; k < EXT2_N_BLOCKS; k++)
         in->block[k] = rd32(raw + 40 + 4 * k);
     in->file_acl = rd32(raw + 104);
-    in->size_high = (in->mode & S_IFMT_) == S_IFREG_ ? rd32(raw + 108) : 0;
+    if ((in->mode & S_IFMT_) == S_IFREG_)       /* (a directory's: its ACL, which is kept) */
+        in->size |= (uint64_t)rd32(raw + 108) << 32;
     return 0;
 }
 
@@ -399,7 +400,7 @@ static int write_inode(struct ext2_fs *e, struct ext2_inode *in)
         return -EIO;
     wr16(raw, in->mode);
     wr16(raw + 2, in->uid & 0xFFFF);
-    wr32(raw + 4, in->size);
+    wr32(raw + 4, (uint32_t)in->size);
     wr32(raw + 8, in->atime);
     wr32(raw + 12, in->ctime);
     wr32(raw + 16, in->mtime);
@@ -412,7 +413,7 @@ static int write_inode(struct ext2_fs *e, struct ext2_inode *in)
         wr32(raw + 40 + 4 * k, in->block[k]);
     wr32(raw + 104, in->file_acl);
     if ((in->mode & S_IFMT_) == S_IFREG_)
-        wr32(raw + 108, in->size_high);
+        wr32(raw + 108, (uint32_t)(in->size >> 32));
     wr16(raw + 120, in->uid >> 16);
     wr16(raw + 122, in->gid >> 16);
     return dev_put(e, off, raw, 128);
@@ -530,23 +531,24 @@ static struct vnode *make_vnode(struct ext2_fs *e, struct vnode *dir, const char
 /* The device block of logical block idx of in, 0 for a hole. With alloc,
  * holes are filled: indirect blocks zeroed, data blocks not (*fresh says
  * which were new). *err gets -ENOSPC, -EFBIG or -EIO. */
-static uint32_t bmap(struct ext2_fs *e, struct ext2_inode *in, uint32_t idx, int alloc, int *fresh, int *err)
+static uint32_t bmap(struct ext2_fs *e, struct ext2_inode *in, uint64_t idx, int alloc, int *fresh, int *err)
 {
     uint32_t apb = e->apb;
     uint32_t path[4], depth;
     if (fresh)
         *fresh = 0;
     if (idx < EXT2_NDIR) {
-        path[0] = idx;
+        path[0] = (uint32_t)idx;
         depth = 0;
     } else if ((idx -= EXT2_NDIR) < apb) {
-        path[0] = EXT2_IND; path[1] = idx;
+        path[0] = EXT2_IND; path[1] = (uint32_t)idx;
         depth = 1;
     } else if ((idx -= apb) < apb * apb) {
-        path[0] = EXT2_DIND; path[1] = idx / apb; path[2] = idx % apb;
+        path[0] = EXT2_DIND; path[1] = (uint32_t)(idx / apb); path[2] = (uint32_t)(idx % apb);
         depth = 2;
     } else if ((idx -= apb * apb) / apb / apb < apb) {
-        path[0] = EXT2_TIND; path[1] = idx / apb / apb; path[2] = idx / apb % apb; path[3] = idx % apb;
+        path[0] = EXT2_TIND; path[1] = (uint32_t)(idx / apb / apb);
+        path[2] = (uint32_t)(idx / apb % apb); path[3] = (uint32_t)(idx % apb);
         depth = 3;
     } else {
         *err = -EFBIG;
@@ -723,14 +725,15 @@ static int free_inode(struct ext2_fs *e, struct ext2_inode *in)
 
 /* ---- file data ---- */
 
-static int ext2_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
+static int ext2_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
 {
     struct ext2_fs *e = vn->fs->priv;
     struct ext2_inode *in = vn->fs_data;
     uint8_t *out = buf;
     uint32_t done = 0;
     while (done < n) {
-        uint32_t pos = off + done, idx = pos / e->bs, within = pos % e->bs;
+        uint64_t pos = off + done, idx = pos / e->bs;
+        uint32_t within = (uint32_t)(pos % e->bs);
         int err = 0;
         uint32_t blk = bmap(e, in, idx, 0, NULL, &err);
         if (err)
@@ -761,11 +764,12 @@ static int ext2_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
     return (int)done;
 }
 
-static int write_data(struct ext2_fs *e, struct ext2_inode *in, const uint8_t *src, uint32_t off, uint32_t n)
+static int write_data(struct ext2_fs *e, struct ext2_inode *in, const uint8_t *src, uint64_t off, uint32_t n)
 {
     uint32_t done = 0;
     while (done < n) {
-        uint32_t pos = off + done, idx = pos / e->bs, within = pos % e->bs;
+        uint64_t pos = off + done, idx = pos / e->bs;
+        uint32_t within = (uint32_t)(pos % e->bs);
         int err = 0, fresh = 0;
         uint32_t blk = bmap(e, in, idx, 1, &fresh, &err);
         if (!blk)
@@ -798,7 +802,9 @@ static int write_data(struct ext2_fs *e, struct ext2_inode *in, const uint8_t *s
     return (int)done;
 }
 
-static void note_large(struct ext2_fs *e, uint32_t size)
+/* The first file of 2 GiB or more marks the volume as having one (which a
+ * revision 1 volume can say: max_file_size() keeps them off the others). */
+static void note_large(struct ext2_fs *e, uint64_t size)
 {
     if (size > 0x7FFFFFFFu && !(rd32(e->sb + SB_FEATURE_RO_COMPAT) & RO_COMPAT_LARGE_FILE)) {
         wr32(e->sb + SB_FEATURE_RO_COMPAT, rd32(e->sb + SB_FEATURE_RO_COMPAT) | RO_COMPAT_LARGE_FILE);
@@ -806,12 +812,10 @@ static void note_large(struct ext2_fs *e, uint32_t size)
     }
 }
 
-static int ext2_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n)
+static int ext2_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
 {
     struct ext2_fs *e = vn->fs->priv;
     struct ext2_inode *in = vn->fs_data;
-    if (in->size_high)
-        return -EFBIG;
     int r = write_data(e, in, buf, off, n);
     if (r > 0 && off + (uint32_t)r > in->size) {
         in->size = off + (uint32_t)r;
@@ -824,21 +828,22 @@ static int ext2_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t 
     return r < 0 ? r : w < 0 ? w : r;
 }
 
-static int ext2_truncate(struct vnode *vn, uint32_t size)
+static int ext2_truncate(struct vnode *vn, uint64_t size)
 {
     struct ext2_fs *e = vn->fs->priv;
     struct ext2_inode *in = vn->fs_data;
-    if (in->size_high)
-        return -EFBIG;
     int r = 0;
     if (size < in->size) {
-        r = truncate_blocks(e, in, (uint32_t)(((uint64_t)size + e->bs - 1) / e->bs));
+        /* (A file larger than this volume lets one be, made elsewhere, has
+         * no blocks past what the map reaches: none to free there.) */
+        uint64_t keep = MIN((size + e->bs - 1) / e->bs, (uint64_t)UINT32_MAX);
+        r = truncate_blocks(e, in, (uint32_t)keep);
         /* the rest of the last block reads as zeros if the file grows again */
         if (r == 0 && size % e->bs) {
             int err = 0;
             uint32_t blk = bmap(e, in, size / e->bs, 0, NULL, &err);
             if (blk && read_block(e, blk, e->buf) == 0) {
-                memset(e->buf + size % e->bs, 0, e->bs - size % e->bs);
+                memset(e->buf + size % e->bs, 0, (uint32_t)(e->bs - size % e->bs));
                 r = write_block(e, blk, e->buf);
             }
         }
@@ -900,7 +905,7 @@ static void put_dent(struct ext2_fs *e, uint8_t *b, uint32_t off, uint32_t ino, 
 
 static uint32_t dir_blocks(struct ext2_fs *e, struct ext2_inode *dir)
 {
-    return dir->size / e->bs;
+    return (uint32_t)(dir->size / e->bs);
 }
 
 /* A directory has changed: its time, and no stale hash index. */
@@ -1251,7 +1256,7 @@ static int ext2_readlink(struct vnode *vn, char *buf, uint32_t size)
 {
     struct ext2_fs *e = vn->fs->priv;
     struct ext2_inode *in = vn->fs_data;
-    uint32_t len = in->size;
+    uint32_t len = (uint32_t)in->size;
     if (len >= PATH_MAX || len >= e->bs)
         return -EIO;
     if (fast_symlink(e, in)) {
@@ -1459,6 +1464,24 @@ static int ext2_trim(struct fs *fs, struct blk_trimmer *t)
 
 /* ---- mounting ---- */
 
+/* The largest file: what the block map reaches (the 12 direct blocks and
+ * the three trees) and no more blocks, the map's own among them, than the
+ * inode's count of 512-byte sectors holds in its 32 bits: 16 GiB with 1 KiB
+ * blocks, 256 GiB with 2 KiB ones, 2 TiB with 4 KiB ones. A revision 0
+ * volume has no flag to say it holds a file of 2 GiB or more, so it holds
+ * none. */
+static uint64_t max_file_size(const struct ext2_fs *e, uint32_t rev)
+{
+    if (!rev)
+        return 0x7FFFFFFFu;
+    uint64_t apb = e->apb;
+    uint64_t blocks = EXT2_NDIR + apb + apb * apb + apb * apb * apb;
+    uint64_t counted = UINT32_MAX / (e->bs / 512);
+    if (blocks + blocks / apb + blocks / (apb * apb) + 4 > counted)
+        blocks = counted - counted / apb - counted / (apb * apb) - 4;
+    return blocks * e->bs;
+}
+
 static int ext2_mount(struct fs *fs)
 {
     struct blockdev *bd = fs->bd;
@@ -1513,6 +1536,7 @@ static int ext2_mount(struct fs *fs)
         return -EINVAL;
     }
     e->ngroups = (e->blocks_count - e->first_data_block + e->bpg - 1) / e->bpg;
+    fs->max_file = max_file_size(e, rev);
     /* the descriptor table follows the superblock in the first group */
     if ((uint64_t)e->ngroups * e->ipg != e->inodes_count ||
         (uint64_t)e->ngroups * GD_SIZE > (uint64_t)e->bpg * e->bs) {

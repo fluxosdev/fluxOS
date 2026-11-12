@@ -48,7 +48,7 @@ static void put(const void *p, size_t n)
 {
     const char *c = p;
     while (n > 0) {
-        int w = (int)write(1, c, n);
+        ssize_t w = write(1, c, n);
         if (w <= 0)
             _exit(0);                   /* the browser is gone */
         c += w;
@@ -82,7 +82,7 @@ static int input_more(int wait_ms)
         inbuf = nb;
         incap = cap;
     }
-    int r = (int)read(0, inbuf + inlen, incap - inlen);
+    ssize_t r = read(0, inbuf + inlen, incap - inlen);
     if (r <= 0) {
         input_eof = 1;
         return 0;

@@ -1207,7 +1207,7 @@ static unsigned char *read_whole(const char *path, size_t *len)
     if (fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
         (d = malloc((size_t)st.st_size + 1))) {
         while (*len < (size_t)st.st_size) {
-            int r = (int)read(fd, d + *len, (size_t)st.st_size - *len);
+            ssize_t r = read(fd, d + *len, (size_t)st.st_size - *len);
             if (r <= 0)
                 break;
             *len += (size_t)r;

@@ -318,7 +318,7 @@ void fb_proc_exit(int pid)
 }
 
 /* Are any of pid's pages in [start, end) lent to the GPU? */
-int fb_pinned(int pid, uint32_t start, uint32_t end)
+int fb_pinned(int pid, uint64_t start, uint64_t end)
 {
     mutex_lock(&display_mutex);
     int r = radeon_pinned(pid, start, end) || intel_pinned(pid, start, end);

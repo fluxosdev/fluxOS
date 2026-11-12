@@ -81,7 +81,7 @@ static int read_at(int fd, uint32_t off, void *buf, uint32_t n)
         return -1;
     uint8_t *p = buf;
     while (n) {
-        int r = (int)read(fd, p, n);
+        ssize_t r = read(fd, p, n);
         if (r <= 0)
             return -1;
         p += r;
@@ -381,7 +381,7 @@ static int fsink_write(struct arc_sink *s, const uint8_t *p, uint32_t n)
         uint32_t left = n;
         const uint8_t *q = p;
         while (left) {
-            int w = (int)write(f->fd, q, left);
+            ssize_t w = write(f->fd, q, left);
             if (w <= 0)
                 return ARC_ESINK;
             q += w;
@@ -1329,6 +1329,11 @@ struct archive *arc_open(const char *path, char *err, int errsize)
         seterr(err, errsize, "not an archive (too short)", NULL);
         return NULL;
     }
+    if ((uint64_t)st.st_size > 0xFFFFFFFFu) {   /* (positions in it are 32 bits here) */
+        close(fd);
+        seterr(err, errsize, "an archive of 4 GiB or more", NULL);
+        return NULL;
+    }
     struct archive *a = calloc(1, sizeof(*a));
     if (!a) {
         close(fd);
@@ -1336,7 +1341,7 @@ struct archive *arc_open(const char *path, char *err, int errsize)
         return NULL;
     }
     a->fd = fd;
-    a->file_size = st.st_size;
+    a->file_size = (uint32_t)st.st_size;
     static const uint8_t z7sig[6] = { '7', 'z', 0xBC, 0xAF, 0x27, 0x1C };
     int r;
     if (!memcmp(sig, z7sig, 6)) {

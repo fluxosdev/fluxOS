@@ -58,14 +58,39 @@ DISK_MB ?= 1024
 FLOPPY  := fluxfloppy.img
 MKFS_FAT ?= $(shell command -v mkfs.fat 2>/dev/null || ls /usr/sbin/mkfs.fat /sbin/mkfs.fat 2>/dev/null | head -1)
 
+# What a build tree's objects, libraries and programs were made for. make
+# cannot tell that an object or a program is for another kind of processor
+# (a tree built before the programs became 64-bit code, say: nothing in it is
+# older than its source), so a tree that says anything else has what was
+# compiled in it swept out first, and is built again. The cross toolchain
+# ($(BUILD)/toolchain/cross) is left alone: it is the build machine's. The
+# programs built with it for fluxOS (the ports and the native GCC, which
+# hold the C library they were linked with) would not run on this system:
+# they are kept off its image until "make toolchain ports toolchain-native"
+# has made them again.
+# (2: a 64-bit program's addresses and system call arguments are 64 bits.)
+BUILD_ABI := x86_64-kernel x86_64-programs 3
+ifeq ($(findstring n,$(firstword -$(MAKEFLAGS))),)
+ifneq ($(wildcard $(BUILD)),)
+ifneq ($(shell cat $(BUILD)/.abi 2>/dev/null),$(BUILD_ABI))
+$(info $(BUILD): built for something else than "$(BUILD_ABI)": compiling everything again)
+$(shell rm -rf $(BUILD)/u $(BUILD)/u32 $(BUILD)/u64 $(BUILD)/k $(BUILD)/k64 $(BUILD)/win32-gl $(BUILD)/*.a \
+	$(BUILD)/rootfs $(BUILD)/setupfs $(BUILD)/sysroot $(BUILD)/iso $(BUILD)/tests $(BUILD)/*.tar \
+	$(BUILD)/*.kernel $(BUILD)/.rootfs-stamp $(BUILD)/ports/root $(BUILD)/toolchain/native/root)
+endif
+endif
+$(shell mkdir -p $(BUILD) && echo "$(BUILD_ABI)" > $(BUILD)/.abi)
+endif
+
 GCC_INC := $(shell $(CC) -print-file-name=include)
 
-# fluxOS needs a 64-bit processor (x86-64). The kernel is 64-bit code; the
-# programs are still 32-bit ones, built for a Pentium 4's instruction set, SSE2
-# included (which every 64-bit processor has), and run in the processor's
-# compatibility mode. A Linux compiler's own macros are taken away, so that
-# the code is compiled for fluxOS as the native gcc compiles it (which defines
-# none of them).
+# fluxOS needs a 64-bit processor (x86-64): the kernel and the programs are
+# 64-bit code. One program is still built for the 386 as well, with the
+# libraries it links: the Windows program loader, whose programs are 32-bit
+# code (the 32-bit programs, below); those run in the processor's
+# compatibility mode, as any older fluxOS program does. A Linux compiler's
+# own macros are taken away, so that the code is compiled for fluxOS as the
+# native gcc compiles it (which defines none of them).
 CFLAGS_BASE := -std=gnu11 -O2 -g \
 	-U__linux__ -U__linux -Ulinux -U__gnu_linux__ \
 	-ffreestanding -fno-pie -fno-pic -fno-stack-protector -fno-builtin \
@@ -73,7 +98,12 @@ CFLAGS_BASE := -std=gnu11 -O2 -g \
 	-fno-asynchronous-unwind-tables -fno-strict-aliasing \
 	-fno-tree-loop-distribute-patterns \
 	-Wall -Wextra -Wno-unused-parameter -MMD -MP
-CFLAGS_COMMON := -m32 -march=pentium4 $(CFLAGS_BASE)
+# What makes code 64-bit, or 32-bit (for a Pentium 4's instruction set, SSE2
+# included, which every 64-bit processor has: floats and doubles on SSE2
+# there too, as 64-bit code has them anyway).
+ARCH64 := -m64 -march=x86-64
+ARCH32 := -m32 -march=pentium4 -mfpmath=sse
+CFLAGS_COMMON := $(ARCH64) $(CFLAGS_BASE)
 
 # The kernel runs in the top 2 GiB of the address space (-mcmodel=kernel) and
 # on stacks that interrupts push onto (no red zone). Its C code keeps off the
@@ -87,10 +117,18 @@ KERNEL_CFLAGS := -m64 -march=x86-64 -mcmodel=kernel -mno-red-zone $(CFLAGS_BASE)
 	-Werror=pointer-to-int-cast -Werror=int-to-pointer-cast \
 	-Iinclude -Ikernel/include -Ikernel/core -Ikernel/fs -Ikernel/net -Ikernel/usb -Ikernel/input -Ikernel/storage -Ikernel/sound -Ikernel/video -Ikernel/acpi -Ikernel/wifi
 # User code does all its float and double arithmetic on SSE2 (the x87 is
-# left to long double) and may use the SSE2 intrinsics.
-USER_CFLAGS   := $(CFLAGS_COMMON) -mfpmath=sse -fno-math-errno -Iinclude -Iuser/include
+# left to long double) and may use the SSE2 intrinsics. A program's addresses
+# all fit 32 bits (its address space is the 2 GiB from 1 GiB, as a 32-bit
+# program's is), and code that keeps one in 32 bits says so with a cast
+# through uintptr_t: a plain cast between a pointer and a narrower integer is
+# an error here as in the kernel.
+USER_CFLAGS   := $(CFLAGS_COMMON) -fno-math-errno -Werror=pointer-to-int-cast -Werror=int-to-pointer-cast \
+	-Iinclude -Iuser/include
+# The same for the 386: whatever a 64-bit object's flags are, with the other processor's.
+user32_cflags = $(subst $(ARCH64),$(ARCH32),$(USER_CFLAGS))
 
-LDFLAGS_COMMON := -m elf_i386 -nostdlib -z noexecstack --no-warn-rwx-segments
+LDFLAGS_COMMON := -m elf_x86_64 -nostdlib -z noexecstack -z max-page-size=0x1000 --no-warn-rwx-segments
+LDFLAGS32 := -m elf_i386 -nostdlib -z noexecstack --no-warn-rwx-segments
 KERNEL_LDFLAGS := -m elf_x86_64 -nostdlib -static -z noexecstack -z max-page-size=0x1000 --no-warn-rwx-segments
 
 # ---- kernel ----
@@ -121,13 +159,14 @@ FREETYPE_SRCS := $(addprefix $(FREETYPE_DIR)/src/,base/ftbase.c base/ftinit.c ba
 	psnames/psnames.c psaux/psaux.c pshinter/pshinter.c raster/raster.c smooth/smooth.c gzip/ftgzip.c)
 BROTLI_SRCS := $(wildcard $(BROTLI_DIR)/c/common/*.c $(BROTLI_DIR)/c/dec/*.c)
 FONT_SRCS := $(FREETYPE_SRCS) $(BROTLI_SRCS)
-FONT_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(FONT_SRCS)))
+FONT_OBJS := $(patsubst %,$(BUILD)/u64/%.o,$(basename $(FONT_SRCS)))
 LIBFONT := $(BUILD)/libfont.a
-$(FONT_OBJS) $(BUILD)/u/user/desktop/wave/webfont.o: USER_CFLAGS += $(FONT_FLAGS)
-$(BUILD)/u/user/libc/brdecode.o: USER_CFLAGS += -I$(BROTLI_DIR)/c/include
-$(BUILD)/u/user/desktop/wave/codecs.o $(BUILD)/u/user/desktop/wave/mp3dec.o: USER_CFLAGS += -Ithird_party/minimp3 \
+$(FONT_OBJS) $(BUILD)/u64/user/desktop/wave/webfont.o: USER_CFLAGS += $(FONT_FLAGS)
+$(BUILD)/u64/user/libc/brdecode.o: USER_CFLAGS += -I$(BROTLI_DIR)/c/include
+$(BUILD)/u64/user/desktop/wave/codecs.o $(BUILD)/u64/user/desktop/wave/mp3dec.o: USER_CFLAGS += -Ithird_party/minimp3 \
 	-Ithird_party/stb_vorbis
 $(LIBFONT): $(FONT_OBJS)
+	@rm -f $@
 	$(AR) rcs $@ $^
 
 # FFmpeg: the part of it tools/ffmpeg/import.sh brought into third_party/ffmpeg, with what its
@@ -139,18 +178,18 @@ $(LIBFONT): $(FONT_OBJS)
 FFMPEG_DIR := third_party/ffmpeg
 include $(FFMPEG_DIR)/flux.mk
 FFMPEG_INC := -I$(FFMPEG_DIR)/gen -I$(FFMPEG_DIR)
-FFMPEG_CFLAGS := -m32 -march=pentium4 -mfpmath=sse -std=c17 -O3 -ffreestanding -fbuiltin -fomit-frame-pointer \
+FFMPEG_CFLAGS := $(ARCH64) -std=c17 -O3 -ffreestanding -fbuiltin -fomit-frame-pointer \
 	-fno-math-errno -fno-signed-zeros -U__linux__ -U__linux -Ulinux -U__gnu_linux__ -fno-pie -fno-pic -fno-stack-protector \
 	-nostdinc -isystem $(GCC_INC) -fno-asynchronous-unwind-tables -D_ISOC11_SOURCE -D_FILE_OFFSET_BITS=64 \
 	-D_LARGEFILE_SOURCE $(FFMPEG_INC) -I$(FFMPEG_DIR)/compat/stdbit -Iinclude -Iuser/include -w -MMD -MP
-FFMPEG_LIB_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(FFMPEG_LIB_SRCS)))
-FFMPEG_FFMPEG_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(FFMPEG_FFMPEG_SRCS)))
-FFMPEG_FFPROBE_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(FFMPEG_FFPROBE_SRCS)))
+FFMPEG_LIB_OBJS := $(patsubst %,$(BUILD)/u64/%.o,$(basename $(FFMPEG_LIB_SRCS)))
+FFMPEG_FFMPEG_OBJS := $(patsubst %,$(BUILD)/u64/%.o,$(basename $(FFMPEG_FFMPEG_SRCS)))
+FFMPEG_FFPROBE_OBJS := $(patsubst %,$(BUILD)/u64/%.o,$(basename $(FFMPEG_FFPROBE_SRCS)))
 FFMPEG_OBJS := $(sort $(FFMPEG_LIB_OBJS) $(FFMPEG_FFMPEG_OBJS) $(FFMPEG_FFPROBE_OBJS))
 $(FFMPEG_LIB_OBJS): FFMPEG_CFLAGS += -DHAVE_AV_CONFIG_H
 LIBFFMPEG := $(BUILD)/libffmpeg.a
 
-$(FFMPEG_OBJS): $(BUILD)/u/%.o: %.c
+$(FFMPEG_OBJS): $(BUILD)/u64/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(FFMPEG_CFLAGS) -c $< -o $@
 
@@ -159,22 +198,22 @@ $(LIBFFMPEG): $(FFMPEG_LIB_OBJS)
 	$(AR) rcs $@ $^
 
 LIBC_SRCS := $(wildcard user/libc/*.c) $(BROTLI_SRCS) $(MBEDTLS_SRCS) lib/string.c lib/font8x16.c lib/sha256.c lib/sha1.c lib/digest.c lib/logo.c
-LIBC_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(LIBC_SRCS)))
-CRT0      := $(BUILD)/u/user/libc/crt0.o
+LIBC_OBJS := $(patsubst %,$(BUILD)/u64/%.o,$(basename $(LIBC_SRCS)))
+CRT0      := $(BUILD)/u64/user/libc/crt0.o
 LIBC      := $(BUILD)/libc.a
-GL_OBJS   := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/gl/*.c)))
+GL_OBJS   := $(patsubst %,$(BUILD)/u64/%.o,$(basename $(wildcard user/gl/*.c)))
 LIBGL     := $(BUILD)/libGL.a
 
 PROGS     := $(basename $(notdir $(wildcard user/bin/*.c)))
-FSH_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/fsh/*.c)))
+FSH_OBJS  := $(patsubst %,$(BUILD)/u64/%.o,$(basename $(wildcard user/fsh/*.c)))
 DESKTOP_DIRS := user/desktop/apps user/desktop/image user/desktop/shell user/desktop/wave user/desktop/wave/js \
                 user/desktop/progs
 DESKTOP_INC  := $(addprefix -I,$(DESKTOP_DIRS))
 DESKTOP_SRCS := $(foreach d,$(DESKTOP_DIRS),$(wildcard $(d)/*.c))
 DESKTOP_HDRS := $(foreach d,$(DESKTOP_DIRS),$(wildcard $(d)/*.h))
-DESKTOP_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(DESKTOP_SRCS)))
+DESKTOP_OBJS := $(patsubst %,$(BUILD)/u64/%.o,$(basename $(DESKTOP_SRCS)))
 $(DESKTOP_OBJS): USER_CFLAGS += $(DESKTOP_INC)
-desktop_objs = $(patsubst %,$(BUILD)/u/user/desktop/%.o,$(basename $(1)))
+desktop_objs = $(patsubst %,$(BUILD)/u64/user/desktop/%.o,$(basename $(1)))
 # What the desktop and every program share: drawing, pictures, icons, dialogs, the theme, starting
 # programs, the window protocol's plumbing. A program takes from it only what it uses.
 # (SVG pictures are drawn with Wave's HTML, CSS and font code.)
@@ -222,9 +261,9 @@ $(call desktop_objs,$(MEDIA_PROG_SRCS)): USER_CFLAGS += $(FFMPEG_INC) -Iuser/des
 WAVEMEDIA_SRCS := media/engine.c media/store.c media/segments.c $(MEDIA_PROG_SRCS)
 WAVEMEDIA_OBJS := $(call desktop_objs,$(WAVEMEDIA_SRCS))
 $(call desktop_objs,media/engine.c media/store.c media/segments.c): USER_CFLAGS += $(FFMPEG_INC) -Iuser/desktop/media $(DESKTOP_INC)
-DOS_OBJS  := $(patsubst %,$(BUILD)/u/%.o,$(basename $(wildcard user/dos/*.c)))
+DOS_OBJS  := $(patsubst %,$(BUILD)/u64/%.o,$(basename $(wildcard user/dos/*.c)))
 # winrun, the Windows program loader (os_linux.c is its Linux back end, for host tests)
-WIN32_OBJS := $(patsubst %,$(BUILD)/u/%.o,$(basename $(filter-out user/win32/os_linux.c,$(wildcard user/win32/*.c user/win32/*.S))))
+WIN32_OBJS := $(patsubst %,$(BUILD)/u32/%.o,$(basename $(filter-out user/win32/os_linux.c,$(wildcard user/win32/*.c user/win32/*.S))))
 BINS      := $(addprefix $(ROOTFS)/bin/,$(PROGS)) $(ROOTFS)/bin/limine $(ROOTFS)/bin/fsh $(ROOTFS)/bin/desktop \
              $(addprefix $(ROOTFS)/bin/,$(DESKTOP_PROGS)) \
              $(ROOTFS)/bin/dos $(ROOTFS)/bin/winrun $(ROOTFS)/bin/wavemedia $(ROOTFS)/bin/[ $(ROOTFS)/bin/gunzip $(ROOTFS)/bin/zcat \
@@ -264,11 +303,11 @@ $(BUILD)/k64/kernel/video/radeon_fw.o: $(wildcard firmware/radeon/*.bin)
 $(KERNEL): $(KERNEL_OBJS) linker.ld
 	$(LD) $(KERNEL_LDFLAGS) -T linker.ld -o $@ $(KERNEL_OBJS)
 
-$(BUILD)/u/%.o: %.c
+$(BUILD)/u64/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(BUILD)/u/%.o: %.S
+$(BUILD)/u64/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
@@ -310,12 +349,52 @@ $(ROOTFS)/bin/dos: $(CRT0) $(DOS_OBJS) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(DOS_OBJS) $(LIBC)
 
+# ---- the 32-bit programs ----
+# winrun, the Windows program loader, is a 32-bit program: the programs it
+# loads are 32-bit code, which runs in its address space and calls straight
+# into it (user/win32/gate.S). So what it links is built a second time, for
+# the 386, into $(BUILD)/u32: the C library, the desktop's library, the
+# fonts' and its GL. The kernel runs both kinds of program, and they talk to
+# each other (the window protocol, shared memory) in structures that are
+# the same for both.
+to32 = $(patsubst $(BUILD)/u64/%,$(BUILD)/u32/%,$(1))
+CRT032    := $(call to32,$(CRT0))
+LIBC32    := $(BUILD)/libc32.a
+LIBDESKTOP32 := $(BUILD)/libdesktop32.a
+LIBFONT32 := $(BUILD)/libfont32.a
+# (the flags a file's 64-bit object is given beyond the common ones, for its 32-bit one too)
+$(call to32,$(FONT_OBJS) $(BUILD)/u64/user/desktop/wave/webfont.o): USER_CFLAGS += $(FONT_FLAGS)
+$(call to32,$(BUILD)/u64/user/libc/brdecode.o): USER_CFLAGS += -I$(BROTLI_DIR)/c/include
+$(call to32,$(BUILD)/u64/user/desktop/wave/codecs.o $(BUILD)/u64/user/desktop/wave/mp3dec.o): USER_CFLAGS += -Ithird_party/minimp3 \
+	-Ithird_party/stb_vorbis
+$(call to32,$(DESKTOP_OBJS)): USER_CFLAGS += $(DESKTOP_INC)
+
+$(BUILD)/u32/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(user32_cflags) -c $< -o $@
+
+$(BUILD)/u32/%.o: %.S
+	@mkdir -p $(dir $@)
+	$(CC) $(user32_cflags) -c $< -o $@
+
+$(LIBC32): $(call to32,$(LIBC_OBJS))
+	@rm -f $@
+	$(AR) rcs $@ $^
+
+$(LIBFONT32): $(call to32,$(FONT_OBJS))
+	@rm -f $@
+	$(AR) rcs $@ $^
+
+$(LIBDESKTOP32): $(call to32,$(call desktop_objs,$(patsubst user/desktop/%,%,$(LIBDESKTOP_SRCS)))) Makefile
+	@rm -f $@
+	$(AR) rcs $@ $(filter %.o,$^)
+
 # winrun draws Windows programs' windows with the desktop's drawing, fonts and theme, and speaks
 # the window protocol with its plumbing (wmconn.c)
 $(WIN32_OBJS): USER_CFLAGS += -Iuser/desktop/shell
-$(ROOTFS)/bin/winrun: $(CRT0) $(WIN32_OBJS) $(LIBDESKTOP) $(BUILD)/libGL-win32.a $(LIBFONT) $(LIBC) user/user.ld
+$(ROOTFS)/bin/winrun: $(CRT032) $(WIN32_OBJS) $(LIBDESKTOP32) $(BUILD)/libGL-win32.a $(LIBFONT32) $(LIBC32) user/user.ld
 	@mkdir -p $(dir $@)
-	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(WIN32_OBJS) $(LIBDESKTOP) $(BUILD)/libGL-win32.a $(LIBFONT) $(LIBC)
+	$(LD) $(LDFLAGS32) -s -T user/user.ld -o $@ $(CRT032) $(WIN32_OBJS) $(LIBDESKTOP32) $(BUILD)/libGL-win32.a $(LIBFONT32) $(LIBC32)
 
 # FFmpeg's programs, in /usr/bin with the other ports (and so left out of the in-memory systems the
 # QEMU tests boot, with the toolchain)
@@ -328,19 +407,19 @@ $(ROOTFS)/usr/bin/ffprobe: $(CRT0) $(FFMPEG_FFPROBE_OBJS) $(LIBFFMPEG) $(LIBC) u
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $(FFMPEG_FFPROBE_OBJS) $(LIBFFMPEG) $(LIBC)
 
 # Limine's installer (limine bios-install DISK), which fluxinstall runs: Limine's own source.
-$(BUILD)/u/third_party/limine/limine.o: USER_CFLAGS += -std=gnu99 -w
-$(ROOTFS)/bin/limine: $(BUILD)/u/third_party/limine/limine.o $(CRT0) $(LIBC) user/user.ld
+$(BUILD)/u64/third_party/limine/limine.o: USER_CFLAGS += -std=gnu99 -w
+$(ROOTFS)/bin/limine: $(BUILD)/u64/third_party/limine/limine.o $(CRT0) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 
 # play decodes MP3 and Ogg Vorbis with Wave's decoders
-PLAY_CODECS := $(BUILD)/u/user/desktop/wave/codecs.o $(BUILD)/u/user/desktop/wave/mp3dec.o
-$(BUILD)/u/user/bin/play.o: USER_CFLAGS += -Iuser/desktop/wave
-$(ROOTFS)/bin/play: $(BUILD)/u/user/bin/play.o $(PLAY_CODECS) $(CRT0) $(LIBC) user/user.ld
+PLAY_CODECS := $(BUILD)/u64/user/desktop/wave/codecs.o $(BUILD)/u64/user/desktop/wave/mp3dec.o
+$(BUILD)/u64/user/bin/play.o: USER_CFLAGS += -Iuser/desktop/wave
+$(ROOTFS)/bin/play: $(BUILD)/u64/user/bin/play.o $(PLAY_CODECS) $(CRT0) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(PLAY_CODECS) $(LIBC)
 
-$(ROOTFS)/bin/%: $(BUILD)/u/user/bin/%.o $(CRT0) $(LIBC) user/user.ld
+$(ROOTFS)/bin/%: $(BUILD)/u64/user/bin/%.o $(CRT0) $(LIBC) user/user.ld
 	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
 
@@ -433,7 +512,7 @@ $(ISO): $(KERNEL) $(SETUP) $(SYSTEM) limine/limine.conf limine/install.conf $(LI
 	$(LIMINE) bios-install --quiet $@
 
 # The fluxOS sysroot: the headers and libraries a compiler targeting
-# fluxOS (i686-fluxos-gcc, tools/toolchain) builds programs against.
+# fluxOS (x86_64-fluxos-gcc, tools/toolchain) builds programs against.
 .PHONY: sysroot
 sysroot: $(SYSROOT_STAMP)
 
@@ -449,7 +528,7 @@ $(SYSROOT_STAMP): $(LIBC) $(LIBGL) $(LIBFONT) $(CRT0) user/user.ld $(wildcard us
 	@touch $@
 	@echo "$(SYSROOT): headers, libc.a (with pthreads and libm), libGL.a, libfont.a, crt0.o, fluxos.ld"
 
-# The cross toolchain (binutils and GCC for i686-fluxos) in build/toolchain/cross.
+# The cross toolchain (binutils and GCC for x86_64-fluxos) in build/toolchain/cross.
 .PHONY: toolchain
 toolchain: sysroot
 	tools/toolchain/build.sh --sysroot $(SYSROOT) --prefix $(BUILD)/toolchain/cross
@@ -491,6 +570,8 @@ srcdisk:
 	git ls-files -z -c -o --exclude-standard | tar --null --ignore-failed-read -T - -cf - | tar -C $(BUILD)/srcdisk -xf -
 	$(if $(wildcard $(PORTS_ROOT)),mkdir -p $(BUILD)/srcdisk/$(dir $(PORTS_ROOT)) && cp -a $(PORTS_ROOT) $(BUILD)/srcdisk/$(PORTS_ROOT))
 	$(if $(NATIVE_FILES),mkdir -p $(BUILD)/srcdisk/$(dir $(NATIVE_ROOT)) && cp -a $(NATIVE_ROOT) $(BUILD)/srcdisk/$(NATIVE_ROOT))
+	@# (what they were built for: the build there keeps them, as this one does)
+	cp $(BUILD)/.abi $(BUILD)/srcdisk/$(BUILD)/.abi
 	truncate -s $(SRCDISK_MB)M $(SRCDISK)
 	mke2fs -q -F -t ext2 -L FLUXSRC -E root_owner=0:0 -d $(BUILD)/srcdisk $(SRCDISK)
 	rm -rf $(BUILD)/srcdisk
@@ -633,15 +714,15 @@ test-gcc-qemu: $(KERNEL) $(MKISO) $(SYSTEM) $(BUILD)/tests/gcc-guest $(BUILD)/te
 
 # Built from a copy named hello.c, as the guest compiles it: the symbol table keeps
 # the source's name, so the unstripped programs can agree too.
-$(BUILD)/tests/gcc-hello.cross: tests/gcc-hello.c $(BUILD)/toolchain/cross/bin/i686-fluxos-gcc $(SYSROOT)/usr/lib/libc.a
+$(BUILD)/tests/gcc-hello.cross: tests/gcc-hello.c $(BUILD)/toolchain/cross/bin/x86_64-fluxos-gcc $(SYSROOT)/usr/lib/libc.a
 	@mkdir -p $(BUILD)/tests/gcc-hello
 	cp $< $(BUILD)/tests/gcc-hello/hello.c
-	cd $(BUILD)/tests/gcc-hello && $(CURDIR)/$(BUILD)/toolchain/cross/bin/i686-fluxos-gcc -O2 -o $(CURDIR)/$@ hello.c
+	cd $(BUILD)/tests/gcc-hello && $(CURDIR)/$(BUILD)/toolchain/cross/bin/x86_64-fluxos-gcc -O2 -o $(CURDIR)/$@ hello.c
 
-$(BUILD)/tests/gcc-hellocc.cross: tests/gcc-hello.cc $(BUILD)/toolchain/cross/bin/i686-fluxos-g++ $(SYSROOT)/usr/lib/libc.a
+$(BUILD)/tests/gcc-hellocc.cross: tests/gcc-hello.cc $(BUILD)/toolchain/cross/bin/x86_64-fluxos-g++ $(SYSROOT)/usr/lib/libc.a
 	@mkdir -p $(BUILD)/tests/gcc-hello
 	cp $< $(BUILD)/tests/gcc-hello/hello.cc
-	cd $(BUILD)/tests/gcc-hello && $(CURDIR)/$(BUILD)/toolchain/cross/bin/i686-fluxos-g++ -O2 -o $(CURDIR)/$@ hello.cc
+	cd $(BUILD)/tests/gcc-hello && $(CURDIR)/$(BUILD)/toolchain/cross/bin/x86_64-fluxos-g++ -O2 -o $(CURDIR)/$@ hello.cc
 
 $(BUILD)/tests/gcc-guest.o: tests/gcc-guest.c
 	@mkdir -p $(dir $@)
@@ -720,9 +801,36 @@ $(BUILD)/tests/dos-cpu: tests/dos-cpu.c user/dos/cpu.c user/dos/dos.h
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -O1 -w -Iuser/dos tests/dos-cpu.c user/dos/cpu.c -o $@
 
+# More memory than fits below 4 GiB, held at once by several processes and by
+# one alone (its heap, a mapping, its stack), and more than 2 GiB of a file
+# moved by one write and one read: the scratch disk is 4 GiB for that, in the
+# build directory (under KVM where there is one: it is a great many pages to
+# fault in).
+.PHONY: test-highmem-qemu
+HIGHMEM_TEST_MB ?= 6144
+test-highmem-qemu: $(KERNEL) $(MKISO) $(SYSTEM) $(BUILD)/tests/highmem-guest
+	python3 tools/test-kernel-qemu.py $(QEMU) $(KERNEL) $(SYSTEM) $(BUILD)/tests/highmem-guest --cpus $(KERNEL_TEST_CPUS) \
+		--memory $(HIGHMEM_TEST_MB) $(TEST_DROP_TOOLCHAIN) --kvm --timeout 900 --success-marker "HIGHMEM REGRESSIONS PASSED" \
+		--scratch-mib 4096 --temp-dir $(BUILD)/tests
+
+$(BUILD)/tests/highmem-guest.o: tests/highmem-guest.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(BUILD)/tests/highmem-guest: $(BUILD)/tests/highmem-guest.o $(CRT0) $(LIBC) user/user.ld
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(LIBC)
+
 .PHONY: test-libc-qemu
-test-libc-qemu: $(KERNEL) $(MKISO) $(SYSTEM) $(BUILD)/tests/libc-guest
-	python3 tools/test-kernel-qemu.py $(QEMU) $(KERNEL) $(SYSTEM) $(BUILD)/tests/libc-guest --cpus $(KERNEL_TEST_CPUS) --memory 512 $(TEST_DROP_TOOLCHAIN) --success-marker "LIBC REGRESSIONS PASSED"
+test-libc-qemu: $(KERNEL) $(MKISO) $(SYSTEM) $(BUILD)/tests/libc-guest $(BUILD)/tests/libc32-guest
+	python3 tools/test-kernel-qemu.py $(QEMU) $(KERNEL) $(SYSTEM) $(BUILD)/tests/libc-guest --cpus $(KERNEL_TEST_CPUS) --memory 512 $(TEST_DROP_TOOLCHAIN) --success-marker "LIBC REGRESSIONS PASSED" \
+		--add $(BUILD)/tests/libc32-guest:/test/libc32
+
+# A 32-bit program that the libc regressions run: what one sees of a file
+# past 4 GiB and of its stack's limit.
+$(BUILD)/tests/libc32-guest: tests/libc32-guest.c $(CRT032) $(LIBC32) user/user.ld
+	@mkdir -p $(dir $@)
+	$(CC) $(user32_cflags) -c $< -o $@.o
+	$(LD) $(LDFLAGS32) -s -T user/user.ld -o $@ $(CRT032) $@.o $(LIBC32)
 
 $(BUILD)/tests/libc-guest.o: tests/libc-guest.c
 	@mkdir -p $(dir $@)
@@ -994,8 +1102,8 @@ $(BUILD)/tests/desktop-imagejobs-guest.o: tests/desktop-imagejobs.c user/desktop
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) $(DESKTOP_INC) -DIMAGEJOBS_GUEST -c $< -o $@
 
-$(BUILD)/tests/desktop-imagejobs-guest: $(BUILD)/tests/desktop-imagejobs-guest.o $(BUILD)/u/user/desktop/image/webp.o $(CRT0) $(LIBC) user/user.ld
-	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(BUILD)/u/user/desktop/image/webp.o $(LIBC)
+$(BUILD)/tests/desktop-imagejobs-guest: $(BUILD)/tests/desktop-imagejobs-guest.o $(BUILD)/u64/user/desktop/image/webp.o $(CRT0) $(LIBC) user/user.ld
+	$(LD) $(LDFLAGS_COMMON) -s -T user/user.ld -o $@ $(CRT0) $< $(BUILD)/u64/user/desktop/image/webp.o $(LIBC)
 
 .PHONY: test-desktop-jobs-qemu
 test-desktop-jobs-qemu: $(KERNEL) $(MKISO) $(SYSTEM) $(BUILD)/tests/desktop-imagejobs-guest
@@ -1146,12 +1254,20 @@ $(BUILD)/tests/win32-regions: tests/win32-regions.c user/win32/region.h
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra $< -o $@
 
-$(BUILD)/generated/win32-gl.inc: user/include/GL/gl.h tools/gen-win32-gl.py
+# The wrappers opengl32.dll calls fluxOS's GL through, written from GL/gl.h by
+# a program built for the machine the build runs on (as mkiso is: fluxOS has
+# a C compiler and no Python, and builds itself).
+GEN_WIN32_GL := $(HOST_TOOLS)/gen-win32-gl
+$(GEN_WIN32_GL): tools/gen-win32-gl.c
 	@mkdir -p $(dir $@)
-	python3 tools/gen-win32-gl.py $< $@
+	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra $< -o $@
 
-$(BUILD)/u/user/win32/opengl32.o: $(BUILD)/generated/win32-gl.inc
-$(BUILD)/u/user/win32/opengl32.o: USER_CFLAGS += -I$(BUILD)/generated
+$(BUILD)/generated/win32-gl.inc: user/include/GL/gl.h $(GEN_WIN32_GL)
+	@mkdir -p $(dir $@)
+	$(GEN_WIN32_GL) $< $@
+
+$(BUILD)/u32/user/win32/opengl32.o: $(BUILD)/generated/win32-gl.inc
+$(BUILD)/u32/user/win32/opengl32.o: USER_CFLAGS += -I$(BUILD)/generated
 
 .PHONY: test-win32-phase4-qemu
 test-win32-phase4-qemu: WIN32_AUDIO_TEST=--sound sb16 --opl
@@ -1160,7 +1276,7 @@ test-win32-phase4-qemu: test-win32-gui-qemu
 WIN32_GL_OBJS := $(patsubst user/gl/%.c,$(BUILD)/win32-gl/%.o,$(wildcard user/gl/*.c))
 $(BUILD)/win32-gl/%.o: user/gl/%.c user/win32/graphics-memory.h
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -Dmalloc=win_graphics_malloc -Dcalloc=win_graphics_calloc -Drealloc=win_graphics_realloc -Dfree=win_graphics_free -c $< -o $@
+	$(CC) $(user32_cflags) -Dmalloc=win_graphics_malloc -Dcalloc=win_graphics_calloc -Drealloc=win_graphics_realloc -Dfree=win_graphics_free -c $< -o $@
 
 $(BUILD)/libGL-win32.a: $(WIN32_GL_OBJS)
 	@rm -f $@

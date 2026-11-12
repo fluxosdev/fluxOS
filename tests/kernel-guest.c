@@ -161,7 +161,7 @@ static void cached_files(void)
 }
 
 static volatile sig_atomic_t usr1_count, usr2_count, chld_count, last_si_signo;
-static volatile uint32_t last_si_addr;
+static volatile uintptr_t last_si_addr;
 static void *segv_fix_page;
 static sigjmp_buf sig_jump_env;
 
@@ -301,7 +301,7 @@ static void phase0_regressions(void)
         }
         close(pfd[1]);
         char rbuf[4] = {0};
-        int nr = (int)read(pfd[0], rbuf, 2);
+        ssize_t nr = read(pfd[0], rbuf, 2);
         if (!restart) {
             CHECK(nr == -1 && errno == EINTR);
             CHECK(read(pfd[0], rbuf, 2) == 2 && !memcmp(rbuf, "ok", 2));
@@ -384,7 +384,7 @@ static void phase0_regressions(void)
     sa.sa_flags = SA_SIGINFO;
     CHECK(sigaction(SIGSEGV, &sa, NULL) == 0);
     *(volatile uint32_t *)segv_fix_page = 0xABCD1234u;
-    CHECK(last_si_addr == (uint32_t)segv_fix_page);
+    CHECK(last_si_addr == (uintptr_t)segv_fix_page);
     CHECK(*(volatile uint32_t *)segv_fix_page == 0xABCD1234u);
     CHECK(signal(SIGSEGV, SIG_DFL) != SIG_ERR);
     CHECK(munmap(segv_fix_page, 4096) == 0);

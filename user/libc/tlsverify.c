@@ -47,7 +47,7 @@ static int load_roots(void)
         return -1;
     }
     while (got < n) {
-        int r = (int)read(fd, buf + got, n - got);
+        ssize_t r = read(fd, buf + got, n - got);
         if (r <= 0)
             break;
         got += (size_t)r;
@@ -188,7 +188,7 @@ static int urandom(void *ctx, unsigned char *out, size_t n)
     int fd = open("/dev/urandom", O_RDONLY);
     size_t got = 0;
     while (fd >= 0 && got < n) {
-        int r = (int)read(fd, out + got, n - got);
+        ssize_t r = read(fd, out + got, n - got);
         if (r <= 0)
             break;
         got += (size_t)r;

@@ -26,7 +26,7 @@ static int sleeping;
 static int read_info(void)
 {
     struct powerinfo n;
-    if (power(POWER_INFO, (unsigned int)&n) < 0)
+    if (power(POWER_INFO, (unsigned long)&n) < 0)
         return 0;
     int changed = !have || memcmp(&n, &pi, sizeof(n)) != 0;
     pi = n;

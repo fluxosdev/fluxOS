@@ -942,15 +942,19 @@ static int update_entry(struct fat_fs *f, struct vnode *vn)
     e[11] = n->attr;
     wr16(e + 20, n->first >> 16);
     wr16(e + 26, n->first & 0xFFFF);
-    wr32(e + 28, vn->type == VN_DIR ? 0 : vn->size);
+    wr32(e + 28, vn->type == VN_DIR ? 0 : (uint32_t)vn->size);
     set_entry_times(e, vn->mtime);
     return slot_write(f, n->dir_first, n->ent_off, e);
 }
 
 /* ---- file data ---- */
 
-static int fat_read(struct vnode *vn, void *buf, uint32_t off, uint32_t n)
+/* (A FAT file ends before 4 GiB, its size being 32 bits in its directory
+ * entry: positions and sizes are 32 bits from here down, and the VFS lets
+ * nothing through that is past fs->max_file.) */
+static int fat_read(struct vnode *vn, void *buf, uint64_t off64, uint32_t n)
 {
+    uint32_t off = (uint32_t)off64;
     struct fat_fs *f = vn->fs->priv;
     struct fat_node *nd = vn->fs_data;
     uint32_t cb = f->cluster_bytes;
@@ -1027,8 +1031,8 @@ static int write_range(struct fat_fs *f, struct vnode *vn, const uint8_t *in, ui
         if (r < 0)
             return done ? (int)done : -EIO;
         done += chunk;
-        if (pos + chunk > vn->size)
-            vn->size = pos + chunk;
+        if ((uint64_t)pos + chunk > vn->size)
+            vn->size = (uint64_t)pos + chunk;
     }
     return (int)done;
 }
@@ -1046,12 +1050,13 @@ static int zero_fill(struct fat_fs *f, struct vnode *vn, uint32_t from, uint32_t
     return 0;
 }
 
-static int fat_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n)
+static int fat_write(struct vnode *vn, const void *buf, uint64_t off64, uint32_t n)
 {
+    uint32_t off = (uint32_t)off64;
     struct fat_fs *f = vn->fs->priv;
     int r = 0;
     if (off > vn->size)
-        r = zero_fill(f, vn, vn->size, off);
+        r = zero_fill(f, vn, (uint32_t)vn->size, off);
     if (r == 0)
         r = write_range(f, vn, buf, off, n);
     vn->mtime = time_now();
@@ -1060,8 +1065,9 @@ static int fat_write(struct vnode *vn, const void *buf, uint32_t off, uint32_t n
     return r < 0 ? r : meta < 0 ? meta : info < 0 ? info : r;
 }
 
-static int fat_truncate(struct vnode *vn, uint32_t size)
+static int fat_truncate(struct vnode *vn, uint64_t size64)
 {
+    uint32_t size = (uint32_t)size64;
     struct fat_fs *f = vn->fs->priv;
     struct fat_node *nd = vn->fs_data;
     int r = 0;
@@ -1069,7 +1075,7 @@ static int fat_truncate(struct vnode *vn, uint32_t size)
         /* Commit the smaller size and detached chain together before any
          * cluster can be reused. An error leaves the original file intact. */
         struct fat_node saved = *nd;
-        uint32_t old_size = vn->size, old_mtime = vn->mtime;
+        uint32_t old_size = (uint32_t)vn->size, old_mtime = vn->mtime;
         uint32_t tail = 0;
         r = edit_begin(f);
         if (r < 0)
@@ -1109,7 +1115,7 @@ static int fat_truncate(struct vnode *vn, uint32_t size)
         return r < 0 ? r : info;
     }
     if (size > vn->size)
-        r = zero_fill(f, vn, vn->size, size);
+        r = zero_fill(f, vn, (uint32_t)vn->size, size);
     vn->mtime = time_now();
     int meta = update_entry(f, vn);
     int info = flush_fsinfo(f);
@@ -1210,7 +1216,7 @@ static int fat_rename(struct vnode *vn, struct vnode *newdir, const char *newnam
         r = update_entry(f, &moved);
     } else {
         r = add_entry(f, newdir, newname, n->attr, n->first,
-                      vn->type == VN_DIR ? 0 : vn->size, vn->mtime,
+                      vn->type == VN_DIR ? 0 : (uint32_t)vn->size, vn->mtime,
                       &target.ent_off, &target.lfn_count);
     }
     if (!r)
@@ -1367,6 +1373,7 @@ static int fat_mount(struct fs *fs)
     root->fs_data = rn;
     root->mode = 0755;
     fs->priv = f;
+    fs->max_file = 0xFFFFFFFFu;
     fs->root = root;
     fs->case_insensitive = 1;
     fs->name = f->bits == 12 ? "fat12" : f->bits == 16 ? "fat16" : "fat32";

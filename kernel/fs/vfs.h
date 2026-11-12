@@ -18,7 +18,7 @@ typedef void (*dev_release_t)(struct vnode *vn);        /* last reference gone *
 typedef int (*dev_open_t)(struct vnode *vn, int flags);  /* before a file opens it */
 typedef void (*dev_close_t)(struct vnode *vn, int flags);    /* its last file closed */
 /* arg is the caller's value: a user pointer must be checked with user_access_ok(). */
-typedef int (*dev_ioctl_t)(struct vnode *vn, uint32_t req, uint32_t arg);
+typedef int (*dev_ioctl_t)(struct vnode *vn, uint32_t req, uintptr_t arg);
 /* Opening vn opens *out instead: an anonymous device of the opener's own (/dev/dsp). */
 typedef int (*dev_clone_t)(struct vnode *vn, int flags, struct vnode **out);
 
@@ -29,8 +29,8 @@ struct vnode {
     uint32_t mode;              /* permission bits, cosmetic */
     uint32_t uid, gid;          /* owner, kept where the filesystem keeps them (ext2) */
     uint32_t nlink;             /* names the file has (ext2's hard links); 0: the usual 1 or 2 */
-    uint32_t size;              /* a symbolic link's: its target's length */
-    uint32_t cap;
+    uint64_t size;              /* a symbolic link's: its target's length */
+    uint32_t cap;               /* ramfs: bytes data has room for */
     uint32_t mtime;
     uint32_t rdev;              /* device nodes only */
     uint8_t *data;              /* ramfs: a file's contents, a symbolic link's target */
@@ -96,10 +96,13 @@ struct vnode *vfs_mknod(struct vnode *dir, const char *name, uint32_t rdev,
                         dev_read_t rd, dev_write_t wr);
 struct vnode *vfs_mknod_anon(uint32_t rdev, dev_read_t rd, dev_write_t wr);
 
-/* Files end before 4 GiB (their size is 32 bits); devices may go on. */
+/* A file is as large as its filesystem lets it be (struct fs's max_file;
+ * RAMFS_MAX_FILE in memory): writing or growing one past that is EFBIG. */
+#define RAMFS_MAX_FILE 0xFFFFFFFFull    /* (and the kernel heap has to hold it) */
 int vfs_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n);
 int vfs_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n);
-int vfs_truncate(struct vnode *vn, uint32_t size);
+int vfs_truncate(struct vnode *vn, uint64_t size);
+uint64_t vfs_max_file(struct vnode *vn);
 int vfs_utime(const char *path, struct vnode *cwd, uint32_t mtime);
 void vfs_stat(struct vnode *vn, struct stat *st);
 int vfs_dirent(struct vnode *dir, uint32_t index, const char *after, struct dirent *de);

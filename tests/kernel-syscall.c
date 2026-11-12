@@ -12,24 +12,24 @@ void *kzalloc(size_t n) { return calloc(1, n); }
 void kfree(void *p) { free(p); }
 /* Shared memory segments: frames are only numbers here, and the screen is mapped when the test says. */
 static uint32_t next_frame = 0x1000, screen_mapped;
-uint32_t pmm_alloc_user(void) { return next_frame += PAGE_SIZE; }
-void pmm_free(uint32_t phys) { (void)phys; }
-void vmm_zero_frame(uint32_t phys) { (void)phys; }
-int vmm_mmio_mapped(pte_t *pd, uint32_t va) { (void)pd; return va == USER_MMIO_BASE && screen_mapped; }
+uint32_t pmm_alloc_user_low(void) { return next_frame += PAGE_SIZE; }
+void pmm_free(uint64_t phys) { (void)phys; }
+void vmm_zero_frame(uint64_t phys) { (void)phys; }
+int vmm_mmio_mapped(pte_t *pd, uint64_t va) { (void)pd; return va == USER_MMIO_BASE && screen_mapped; }
 static int calls, truncate_error, opens;
 static struct vnode open_vnode = { .type = VN_FILE };
 static struct vnode *resolves_to = &open_vnode;
 static struct file open_file;
-int vfs_truncate(struct vnode *vn, uint32_t size)
+int vfs_truncate(struct vnode *vn, uint64_t size)
 { (void)vn; (void)size; calls++; return truncate_error; }
 /* User memory: the host's own, but for a page made to be missing (another
  * thread's munmap), which the copies must find without touching it. */
 static uint32_t hole = 1;
-static int missing(uint32_t va) { return (va & ~0xFFFu) == hole; }
-uint32_t vmm_translate(pte_t *pd, uint32_t va) { (void)pd; return missing(va) ? 0 : va; }
-int vmm_write_ok(pte_t *pd, uint32_t va) { (void)pd; return !missing(va); }
-int proc_grow_stack(uint32_t va) { (void)va; return 0; }
-int proc_page_fault(uint32_t va, int write) { (void)va; (void)write; return 0; }
+static int missing(uint64_t va) { return (va & ~0xFFFu) == hole; }
+uint64_t vmm_translate(pte_t *pd, uint64_t va) { (void)pd; return missing(va) ? 0 : va; }
+int vmm_write_ok(pte_t *pd, uint64_t va) { (void)pd; return !missing(va); }
+int proc_grow_stack(uint64_t va) { (void)va; return 0; }
+int proc_page_fault(uint64_t va, int write) { (void)va; (void)write; return 0; }
 int uaccess_copy(void *dst, const void *src, uint32_t n)
 {
     for (uint32_t i = 0; i < n; i++)

@@ -134,6 +134,8 @@ static void scan(struct node *dir)
         n->isdir = S_ISDIR(st.st_mode);
         n->mode = n->isdir ? (S_IFDIR | 0755) : (S_IFREG | ((st.st_mode & 0111) ? 0755 : 0644));
         n->mtime = (uint32_t)st.st_mtime;
+        if (!S_ISDIR(st.st_mode) && st.st_size > 0xFFFFFFFFll)
+            die("%s: a file of 4 GiB or more does not fit one extent", path);
         n->size = n->isdir ? 0 : (uint32_t)st.st_size;
         add_kid(dir, n);
         if (n->isdir)

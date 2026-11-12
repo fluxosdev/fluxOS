@@ -83,6 +83,7 @@ void boot_info_init(void)
         panic("the boot loader left no memory map: fluxOS starts by the Limine boot protocol");
 
     boot.hhdm = hhdm_request.response->offset;
+    hhdm_base = boot.hhdm;              /* phys_to_virt() works from here on, for what the loader mapped */
     boot.kernel_phys = address_request.response->physical_base;
     boot.kernel_virt = address_request.response->virtual_base;
 

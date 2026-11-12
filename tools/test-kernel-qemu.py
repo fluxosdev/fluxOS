@@ -20,7 +20,7 @@ for name in ("qemu", "kernel", "initrd", "guest"):
     parser.add_argument(name)
 parser.add_argument("--cpus", type=int, default=2, choices=range(1, 17))
 parser.add_argument("--append", default="")
-parser.add_argument("--memory", type=int, default=256, choices=range(64, 4097), help="guest RAM in MiB")
+parser.add_argument("--memory", type=int, default=256, help="guest RAM in MiB")
 parser.add_argument("--success-marker", default="KERNEL REGRESSIONS PASSED")
 parser.add_argument("--add", action="append", default=[], metavar="HOST:GUEST", help="a host file to add to the initrd at that guest path")
 parser.add_argument("--drop", action="append", default=[], metavar="PREFIX", help="leave initrd members under this path out (the toolchain, for tests that do not need it in memory)")
@@ -28,6 +28,8 @@ parser.add_argument("--timeout", type=int, default=60)
 parser.add_argument("--mkiso", default=None, help="the build's mkiso (default: build/host/mkiso)")
 parser.add_argument("--kvm", action="store_true", help="run the guest under KVM (same CPU model) when /dev/kvm can be opened, else under TCG as usual")
 parser.add_argument("--disk", metavar="IMAGE", help="a second IDE disk (/dev/hdb), used in place, not copied")
+parser.add_argument("--scratch-mib", type=int, default=32, help="the size of the blank scratch disk (/dev/hda), a sparse file")
+parser.add_argument("--temp-dir", default=None, help="where the run's files go (default: the system's temporary directory): somewhere on a disk for a scratch disk the guest writes gigabytes to, which a /tmp held in memory has no room for")
 parser.add_argument("--fsck-ext2", action="store_true", help="the guest leaves an ext2 volume on the scratch disk: have e2fsck check it")
 parser.add_argument("--net", action="store_true", help="give the guest an Intel PRO/1000 on QEMU's user network (NAT to the host's, with DHCP)")
 parser.add_argument("--sound", nargs="?", const="hda", choices=("hda", "sb16", "usb"), help="give the guest a sound card (HD Audio by default), record what it plays, and check that the mixer test's two tones play at once (skipped if QEMU cannot record to a WAV file)")
@@ -78,7 +80,7 @@ for option in args.append.split():
         expected_cpus = min(expected_cpus, max(1, int(option.split("=", 1)[1])))
 if "nosmp" in args.append.split():
     expected_cpus = 1
-with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
+with tempfile.TemporaryDirectory(prefix="flux-kernel-test-", dir=args.temp_dir) as directory:
     temp = pathlib.Path(directory)
     overlay = temp / "initrd.tar"
     replaced = False
@@ -99,7 +101,7 @@ with tempfile.TemporaryDirectory(prefix="flux-kernel-test-") as directory:
         raise SystemExit("initrd has no /bin/init to replace")
     scratch = temp / "disk.img"
     with scratch.open("wb") as disk:
-        disk.truncate(32 * 1024 * 1024)
+        disk.truncate(args.scratch_mib * 1024 * 1024)
     accel = []
     if args.kvm:
         if os.access("/dev/kvm", os.R_OK | os.W_OK):

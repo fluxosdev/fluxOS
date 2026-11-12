@@ -24,7 +24,7 @@ for name in ('qemu', 'mkiso', 'isotree', 'firmware', 'guest'):
     parser.add_argument(name)
 parser.add_argument('--disk-mb', type=int, default=768)
 parser.add_argument('--data-dir', default='/src', help="fluxinstall -e: a second, ext2, partition for it ('' for none)")
-parser.add_argument('--system-mib', type=int, default=320, help='fluxinstall -r, with --data-dir')
+parser.add_argument('--system-mib', type=int, default=416, help='fluxinstall -r, with --data-dir')
 parser.add_argument('--fat32', action='store_true', help='fluxinstall -t fat32: the system on one FAT32 partition, the boot loader with it')
 parser.add_argument('--timeout', type=int, default=600)
 parser.add_argument('--uefi', metavar='OVMF_CODE,OVMF_VARS', help="also start the installed disk with this UEFI firmware (edk2's OVMF_CODE.fd and OVMF_VARS.fd)")

@@ -382,12 +382,12 @@ static int winsize_ioctl(struct tty *t, uint32_t req, uint32_t arg)
     return 0;
 }
 
-int tty_dev_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
+int tty_dev_ioctl(struct vnode *vn, uint32_t req, uintptr_t arg)
 {
     return winsize_ioctl(vnode_tty(vn), req, arg);
 }
 
-static int master_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
+static int master_ioctl(struct vnode *vn, uint32_t req, uintptr_t arg)
 {
     struct pty *p = vn->dev_priv;
     return winsize_ioctl(&p->tty, req, arg);

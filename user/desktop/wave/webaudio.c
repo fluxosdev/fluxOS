@@ -80,7 +80,7 @@ static void player_gone(void)
 static void player_said(void *ctx, int revents)
 {
     (void)ctx, (void)revents;
-    int r = (int)read(from_player, answers + nanswers, sizeof(answers) - 1 - (size_t)nanswers);
+    ssize_t r = read(from_player, answers + nanswers, sizeof(answers) - 1 - (size_t)nanswers);
     if (r <= 0) {
         if (r == 0 || errno != EINTR)
             player_gone();
@@ -218,7 +218,7 @@ static void say_line(const char *line, int n)
     pthread_mutex_lock(&say_lock);      /* the engine's threads speak too: whole lines only */
     int done = 0;
     while (done < n) {
-        int w = (int)write(1, line + done, (size_t)(n - done));
+        ssize_t w = write(1, line + done, (size_t)(n - done));
         if (w <= 0) {
             if (w < 0 && errno == EINTR)
                 continue;
@@ -339,7 +339,7 @@ static void open_stream(int id, const char *path)
     size_t got = 0;
     if (st.st_size > 0 && st.st_size <= MAX_FILE && (data = malloc((size_t)st.st_size))) {
         while (got < (size_t)st.st_size) {
-            int r = (int)read(fd, data + got, (size_t)st.st_size - got);
+            ssize_t r = read(fd, data + got, (size_t)st.st_size - got);
             if (r <= 0)
                 break;
             got += (size_t)r;
@@ -523,7 +523,7 @@ static void play_chunk(void)
     const uint8_t *p = (const uint8_t *)out;
     size_t left = (size_t)CHUNK * (size_t)out_ch * 2;
     while (left) {
-        int w = (int)write(dsp, p, left);
+        ssize_t w = write(dsp, p, left);
         if (w <= 0) {
             if (w < 0 && errno == EINTR)
                 continue;
@@ -581,7 +581,7 @@ int webaudio_main(void)
         struct pollfd pf = { 0, POLLIN, 0 };
         int wait = playing || engine_sound ? 0 : busy ? 20 : dsp >= 0 ? IDLE_MS : -1;
         if (poll(&pf, 1, wait) > 0 && (pf.revents & (POLLIN | POLLHUP | POLLERR))) {
-            int r = (int)read(0, in + nin, sizeof(in) - 1 - (size_t)nin);
+            ssize_t r = read(0, in + nin, sizeof(in) - 1 - (size_t)nin);
             if (r <= 0)
                 return 0;               /* the browser has gone */
             nin += r;

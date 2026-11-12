@@ -56,7 +56,7 @@ static struct {
         int pid;                    /* 0: free */
         uint32_t first, npages;     /* GART pages */
         uint32_t offset, size;      /* the buffer within them */
-        uint32_t va;                /* the first page, in the process */
+        uint64_t va;                /* the first page, in the process */
     } slots[MAX_SLOTS];
 } gart;
 
@@ -655,8 +655,8 @@ int radeon_map_buffer(struct dispbuf *b)
         return -ENODEV;
     if (!b->size || b->size > (32u << 20) || b->addr + b->size < b->addr)
         return -EINVAL;
-    uint32_t first_va = b->addr & ~0xFFFu;
-    uint32_t npages = (b->addr + b->size - first_va + 4095) >> 12;
+    uint64_t first_va = b->addr & ~(uint64_t)0xFFF;
+    uint32_t npages = (uint32_t)((b->addr + b->size - first_va + 4095) >> 12);
     int free_idx = -1;
     for (int i = 0; i < MAX_SLOTS && free_idx < 0; i++)
         if (!gart.slots[i].pid)
@@ -678,10 +678,10 @@ int radeon_map_buffer(struct dispbuf *b)
     if (first + npages > GTT_PAGES)
         return -ENOMEM;
     for (uint32_t i = 0; i < npages; i++) {
-        uint32_t va = first_va + i * 4096;
+        uint64_t va = first_va + (uint64_t)i * 4096;
         uint32_t phys = 0;
         if ((vmm_write_ok(current->pd, va) || vmm_resolve_cow(current->pd, va)))
-            phys = vmm_translate(current->pd, va);
+            phys = vmm_translate_low(current->pd, va);     /* (the GART is given 32-bit addresses) */
         if (!phys) {
             for (uint32_t j = 0; j < i; j++)
                 gart_set(first + j, 0);
@@ -696,7 +696,7 @@ int radeon_map_buffer(struct dispbuf *b)
     sl->first = first;
     sl->npages = npages;
     sl->va = first_va;
-    sl->offset = b->addr & 0xFFF;
+    sl->offset = (uint32_t)(b->addr & 0xFFF);
     sl->size = b->size;
     b->handle = (uint32_t)free_idx + 1;
     uint64_t gpu = slot_gpu(sl);
@@ -714,11 +714,11 @@ int radeon_unmap_buffer(const struct dispbuf *b)
     return 0;
 }
 
-int radeon_pinned(int pid, uint32_t start, uint32_t end)
+int radeon_pinned(int pid, uint64_t start, uint64_t end)
 {
     for (int i = 0; i < MAX_SLOTS; i++) {
         const struct slot *sl = &gart.slots[i];
-        if (sl->pid && sl->pid == pid && sl->va < end && start < sl->va + sl->npages * 4096)
+        if (sl->pid && sl->pid == pid && sl->va < end && start < sl->va + (uint64_t)sl->npages * 4096)
             return 1;
     }
     return 0;

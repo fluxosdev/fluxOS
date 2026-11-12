@@ -74,7 +74,7 @@ struct enc {
 static void flush(struct enc *e)
 {
     for (int off = 0; off < e->n && !e->err;) {
-        int w = (int)write(e->fd, e->buf + off, (size_t)(e->n - off));
+        ssize_t w = write(e->fd, e->buf + off, (size_t)(e->n - off));
         if (w <= 0)
             e->err = 1;
         else

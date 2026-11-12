@@ -1060,7 +1060,7 @@ static int random_bytes(uint8_t *p, int n)
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0)
         return -1;
-    int got = (int)read(fd, p, (size_t)n);
+    ssize_t got = read(fd, p, (size_t)n);
     close(fd);
     return got == n ? 0 : -1;
 }

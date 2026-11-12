@@ -19,6 +19,7 @@
  * signal and broadcast change and waiters wait for to change.
  */
 #include <errno.h>
+#include <flux.h>
 #include <flux/syscall.h>
 #include <limits.h>
 #include <pthread.h>
@@ -38,11 +39,11 @@ struct __pthread __main_thread;
 int __tls_ok;                           /* the kernel gave us a TLS segment (else everything is the main thread) */
 static volatile int live_threads = 1;   /* for "the last thread to end ends the process" */
 
-static inline int sys4(int n, int a, int b, int c, int d)
+static inline int sys4(int n, long a, long b, long c, long d)
 {
-    int r;
+    long r;
     __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a), "c"(b), "d"(c), "S"(d) : "memory");
-    return r;
+    return (int)r;                      /* (none of these calls answers with an address) */
 }
 
 /* ---- the thread block and errno ---- */
@@ -53,11 +54,18 @@ void __init_tls(void)
     m->self = m;
     m->tid = sys4(SYS_gettid, 0, 0, 0, 0);
     m->state = T_JOINABLE;
-    int sel = sys4(SYS_set_tls, (int)m, 0, 0, 0);
+    int sel = sys4(SYS_set_tls, (long)m, 0, 0, 0);
+#ifdef __x86_64__
+    /* The kernel makes the block's address FS's base: there is no selector to load (and
+     * loading one would lose the base). */
+    if (sel >= 0)
+        __tls_ok = 1;
+#else
     if (sel > 0) {
         __asm__ volatile("movw %w0, %%gs" : : "r"(sel));
         __tls_ok = 1;
     }
+#endif
 }
 
 int *__errno_location(void)
@@ -74,12 +82,12 @@ pid_t gettid(void)
 
 int __futex_wait(volatile int *addr, int val, int timeout_ms)
 {
-    return sys4(SYS_futex, (int)addr, FUTEX_WAIT, val, timeout_ms);
+    return sys4(SYS_futex, (long)addr, FUTEX_WAIT, val, timeout_ms);
 }
 
 void __futex_wake(volatile int *addr, int n)
 {
-    sys4(SYS_futex, (int)addr, FUTEX_WAKE, n, 0);
+    sys4(SYS_futex, (long)addr, FUTEX_WAKE, n, 0);
 }
 
 void __lock(volatile int *l)
@@ -170,14 +178,21 @@ void pthread_exit(void *result)
         exit(0);                        /* the last thread: the process ends as if by exit(0) */
     int old = __sync_val_compare_and_swap(&self->state, T_JOINABLE, T_EXITED);
     if (old == T_DETACHED && self->map)
-        sys4(SYS_thread_exit, (int)self->map, (int)self->map_size, 0, 0);   /* nobody will free it */
+        sys4(SYS_thread_exit, (long)self->map, (long)self->map_size, 0, 0);  /* nobody will free it */
     sys4(SYS_thread_exit, 0, 0, 0, 0);
     for (;;)
         ;
 }
 
-/* A new thread starts here, on its own stack, with its block as the argument. */
+/* A new thread starts here, on its own stack, with its block as the argument (a 64-bit
+ * program's by way of __thread_start, crt0.S, which has the block from FS). */
+#ifdef __x86_64__
+void __thread_start(void);
+void __thread_entry(struct __pthread *self);
+void __thread_entry(struct __pthread *self)
+#else
 static void thread_entry(struct __pthread *self)
+#endif
 {
     pthread_exit(self->start(self->arg));
 }
@@ -216,14 +231,19 @@ int pthread_create(pthread_t *out, const pthread_attr_t *attr, void *(*start)(vo
     t->stack_size = a.stack_size;
     t->guard_size = guard;
     t->state = a.detached ? T_DETACHED : T_JOINABLE;
-    /* The entry is called as if by "call": its argument above a (never used) return address,
-     * 16-byte aligned where the argument is. */
-    uint32_t base = ((uint32_t)(uintptr_t)t - 64) & ~15u;
-    ((uint32_t *)(uintptr_t)base)[0] = (uint32_t)(uintptr_t)t;
-    ((uint32_t *)(uintptr_t)base)[-1] = 0;
+    uintptr_t base = ((uintptr_t)t - 64) & ~(uintptr_t)15;
     __atomic_add_fetch(&live_threads, 1, __ATOMIC_ACQ_REL);
     *out = t;                           /* before the thread exists: once it runs, t may be gone (detached) */
-    int tid = sys4(SYS_thread_create, (int)thread_entry, (int)(base - 4), (int)t, (int)&t->tid);
+#ifdef __x86_64__
+    /* The stack pointer 16-byte aligned, as at a program's start: __thread_start calls on from there. */
+    int tid = sys4(SYS_thread_create, (long)__thread_start, (long)base, (long)t, (long)&t->tid);
+#else
+    /* The entry is called as if by "call": its argument above a (never used) return address,
+     * 16-byte aligned where the argument is. */
+    ((uintptr_t *)base)[0] = (uintptr_t)t;
+    ((uintptr_t *)base)[-1] = 0;
+    int tid = sys4(SYS_thread_create, (long)thread_entry, (long)(base - 4), (long)t, (long)&t->tid);
+#endif
     if (tid < 0) {
         __atomic_sub_fetch(&live_threads, 1, __ATOMIC_ACQ_REL);
         if (map)
@@ -353,6 +373,12 @@ int pthread_getattr_np(pthread_t t, pthread_attr_t *a)
         a->stack = (uint8_t *)t->map + t->guard_size;
         a->stack_size = t->map_size - t->guard_size;
         a->guard_size = t->guard_size;
+    } else if (t == &__main_thread) {
+        void *low, *high;
+        flux_main_stack(&low, &high);
+        a->stack = low;
+        a->stack_size = (size_t)((char *)high - (char *)low);
+        a->guard_size = 0;
     }
     return 0;
 }

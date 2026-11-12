@@ -25,7 +25,7 @@
 #define QUANTUM     5           /* timer ticks per time slice (50 ms) */
 
 struct proc_vma {
-    uint32_t start, end;        /* page-aligned [start, end), or 0 when unused */
+    uint64_t start, end;        /* page-aligned [start, end), or 0 when unused */
     uint32_t prot;              /* PROT_* */
     uint32_t flags;             /* MAP_* */
 };
@@ -52,9 +52,12 @@ struct proc {
     int nthreads;               /* leader: threads not yet exited, itself included */
     int group_exiting;          /* leader: a thread is ending the process, the others are being killed */
     int reap_self;              /* a thread that exited: freed when its slot is wanted (no waitpid) */
-    uint32_t clear_tid;         /* user word holding this thread's id, zeroed and futex-woken when it exits */
+    uint64_t clear_tid;         /* user word holding this thread's id, zeroed and futex-woken when it exits */
     uint32_t win_teb;           /* per-thread Windows FS base (zero: WIN_TEB_LINEAR) */
-    uint32_t tls;               /* base of the TLS segment (SEG_USER_TLS) */
+    uint64_t tls;               /* the thread block: the base of the TLS segment (SEG_USER_TLS) of a
+                                   32-bit program, the FS base of a 64-bit one */
+    int user64;                 /* a 64-bit program (exec.c): 64-bit registers, calling convention,
+                                   addresses and structure layouts */
     struct mutex mm_lock;       /* leader: page faults and changes to the mappings */
     spinlock_t fd_lock;         /* leader: taking and freeing descriptor slots */
     int sid;                    /* leader: the session (the id of the process that started it) */
@@ -62,7 +65,7 @@ struct proc {
     /* leader: the interval timers, in ticks (real: when it goes off, 0 for none; the others:
      * ticks left, 0 for none) and what they are set again to */
     uint32_t it_real_at, it_real_interval, it_virt_left, it_virt_interval, it_prof_left, it_prof_interval;
-    uint32_t alt_sp, alt_size;  /* this thread's stack for SA_ONSTACK handlers (size 0: none) */
+    uint64_t alt_sp, alt_size;  /* this thread's stack for SA_ONSTACK handlers (size 0: none) */
     char *paths[3];             /* user paths copied for the system call in progress (syscall.c) */
     int npaths;
     struct file *held[2];       /* descriptors the system call in progress looked up, each holding
@@ -85,7 +88,7 @@ struct proc {
     uint32_t sig_ignored;
     uint32_t sig_blocked;
     struct flux_sigaction sig_actions[NSIG];
-    uint32_t fault_addr;
+    uint64_t fault_addr;
     int in_syscall;
     uint32_t syscall_orig_eax;
     struct file *fds[MAX_FDS];
@@ -93,8 +96,12 @@ struct proc {
     uint32_t umask;
     struct vnode *cwd;
     struct tty *ctty;           /* controlling terminal */
-    uint32_t heap_start, brk;
-    uint32_t stack_low;         /* lowest mapped stack page */
+    uint64_t heap_start, brk;
+    uint64_t stack_low;         /* lowest mapped stack page */
+    /* RLIMIT_STACK in bytes: what the stack may grow to (as far as the layout has room: see
+     * user_stack_limit) and the hard limit above it, FLUX_RLIM_INFINITY for none. Kept over
+     * fork and exec. */
+    uint64_t stack_cur, stack_max;
     struct proc_vma vmas[MAX_VMAS];
     uint32_t cpu_ticks;
     uint32_t child_ticks;       /* reaped children's cpu_ticks + child_ticks */
@@ -120,6 +127,15 @@ static inline void fd_cloexec_set(struct proc *p, int fd, int on)
     else
         p->leader->fd_cloexec[fd >> 5] &= ~(1u << (fd & 31));
 }
+
+/* A process's part of the address space (kernel.h): where it ends, which is
+ * where its stack does, how far down the stack may grow, and where its
+ * mappings are made downwards from. */
+#define user_top(p)         ((p)->user64 ? USER64_TOP : (uint64_t)USER_TOP)
+#define user_stack_room(p)  ((p)->user64 ? USER64_STACK_ROOM : (uint64_t)USER_STACK_MAX)
+#define user_stack_limit(p) (user_top(p) - MIN((p)->leader->stack_cur, user_stack_room(p)))
+#define user_mmap_top(p)    ((p)->user64 ? USER64_TOP - USER64_STACK_ROOM - USER64_STACK_GAP \
+                                         : (uint64_t)USER_MMIO_BASE)
 
 extern struct proc procs[MAX_PROCS];
 extern spinlock_t sched_lock;
@@ -199,13 +215,13 @@ int sleep_ticks_intr(uint32_t n);       /* a pending signal ends it, or skips it
 
 int do_fork(void);
 void do_exit(int status) __attribute__((noreturn));     /* the whole process (exit, a fatal signal) */
-void thread_exit(uint32_t unmap_addr, uint32_t unmap_len) __attribute__((noreturn));
-int thread_create(uint32_t entry, uint32_t stack, uint32_t tls, uint32_t clear_tid);
+void thread_exit(uint64_t unmap_addr, uint64_t unmap_len) __attribute__((noreturn));
+int thread_create(uint64_t entry, uint64_t stack, uint64_t tls, uint64_t clear_tid);
 /* exec: the other threads go, and p is the process; -EINTR (nothing changed) if
  * another thread is ending the process first: p is killed on its way out. */
 int proc_exec_alone(struct proc *p);
-int futex_wait(uint32_t addr, uint32_t val, int timeout_ms);
-int futex_wake(uint32_t addr, int n);
+int futex_wait(uint64_t addr, uint32_t val, int timeout_ms);
+int futex_wake(uint64_t addr, int n);
 int do_tkill(int tid, int sig);
 int do_waitpid(int pid, int *status, int options);
 int do_kill(int pid, int sig);
@@ -229,15 +245,21 @@ void proc_signal_exec(struct proc *p);
 pte_t *proc_set_pd(struct proc *p, pte_t *pd);          /* returns the old one */
 int signal_pending(struct proc *p);
 void proc_check_signals(void);
-int proc_grow_stack(uint32_t addr);
-int proc_page_fault(uint32_t addr, int write);
-uint32_t proc_vma_lowest(const struct proc *p);
+int proc_grow_stack(uint64_t addr);
+/* RLIMIT_STACK: how far the process's stack may grow. A limit below what it has grown to
+ * leaves that mapped. -EINVAL for a soft limit above the hard one or under STACK_LIMIT_MIN. */
+#define STACK_LIMIT_MIN (64u * 1024)
+void proc_stack_rlimit(struct proc *p, struct flux_rlimit *l);
+int proc_set_stack_rlimit(struct proc *p, const struct flux_rlimit *l);
+int proc_page_fault(uint64_t addr, int write);
+uint64_t proc_vma_lowest(const struct proc *p);
+void proc_load_tls(struct proc *p);     /* p's thread block, on this processor (p is running here) */
 /* Kernel only, in flux_mmap_args.flags: the pages are put in by the caller (proc_map_frames). */
 #define MAP_KFRAMES 0x40000000u
-int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint32_t *out);
-int proc_map_frames(struct proc *p, const uint32_t *frames, uint32_t npages, uint32_t *out);
-int proc_munmap(struct proc *p, uint32_t addr, uint32_t len);
-int proc_mprotect(struct proc *p, uint32_t addr, uint32_t len, uint32_t prot);
+int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint64_t *out);
+int proc_map_frames(struct proc *p, const uint32_t *frames, uint32_t npages, uint64_t *out);
+int proc_munmap(struct proc *p, uint64_t addr, uint64_t len);
+int proc_mprotect(struct proc *p, uint64_t addr, uint64_t len, uint32_t prot);
 
 /* Lazy FPU switching (fpu.c) */
 void fpu_init(void);

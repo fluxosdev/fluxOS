@@ -870,7 +870,7 @@ void power_resumed(void)
 
 /* ---- SYS_power ---- */
 
-int power_syscall(uint32_t op, uint32_t arg)
+int power_syscall(uint32_t op, uintptr_t arg)
 {
     switch (op) {
     case POWER_INFO: {

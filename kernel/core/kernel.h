@@ -23,19 +23,37 @@
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
 /*
- * Virtual memory layout. Processes are 32-bit programs: theirs is the 2 GiB
- * from USER_BASE, in the low half of the 64-bit address space, which is
- * otherwise empty. The kernel has the high half: all of physical memory at
- * hhdm_base (mm.h; where the boot loader put it, usually the very start of
- * the half), device memory mapped from KERNEL_MMIO_BASE, and its image in
- * the top 2 GiB.
+ * Virtual memory layout. Processes have the low half of the 64-bit address
+ * space, from USER_BASE, where a program is loaded. A 32-bit program's
+ * part is the 2 GiB up to USER_TOP: its heap follows it, mappings are made
+ * downwards from USER_MMIO_BASE, device memory (the screen) is mapped from
+ * there, and the stack ends at USER_TOP. A 64-bit program is loaded at the
+ * same place and finds device memory at the same place, but its heap starts
+ * at USER64_HEAP_BASE, its stack ends at USER64_TOP, the end of the half,
+ * and mappings are made downwards from below the stack: what it allocates
+ * has addresses that do not fit 32 bits. (proc.h has what a given process's
+ * are: user_top() and the rest.)
+ *
+ * The kernel has the high half: all of physical memory at hhdm_base (mm.h;
+ * where the boot loader put it, usually the very start of the half), device
+ * memory mapped from KERNEL_MMIO_BASE, and its image in the top 2 GiB.
  */
 #define USER_BASE        0x40000000u
 #define USER_TOP         0xC0000000u
 #define USER_STACK_TOP   USER_TOP
-#define USER_STACK_MAX   (32u * 1024 * 1024)
+#define USER_STACK_MAX   FLUX_STACK_ROOM32   /* 32 MiB: a stack's limit to begin with, and a 32-bit program's most */
 #define USER_STACK_LIMIT (USER_STACK_TOP - USER_STACK_MAX)
-#define USER_MMIO_BASE   0xB0000000u    /* device memory (framebuffer); heap ends here */
+#define USER_MMIO_BASE   0xB0000000u    /* device memory (framebuffer); a 32-bit program's heap ends here */
+#define USER64_TOP       0x00007FFFFFFFF000ull
+#define USER64_HEAP_BASE 0x0000000100000000ull
+/* The most a 64-bit program's stack can be let grow to (setrlimit, "ulimit
+ * -s"): more than a machine has memory for, so no limit of the layout's. */
+#define USER64_STACK_ROOM FLUX_STACK_ROOM64    /* 1 TiB */
+/* Its mappings end this far below where its stack may reach: a stack that
+ * outgrows its limit finds nothing there, as a 32-bit program's does. */
+#define USER64_STACK_GAP 0x10000000ull
+/* Where any process's memory ends: no user address is at or above this. */
+#define USER_LIMIT       USER64_TOP
 #define KERNEL_MMIO_BASE 0xFFFFC00000000000ull  /* kernel mappings of device memory */
 #define KERNEL_LATE_BASE 0xFFFFC08000000000ull  /* and those made a page at a time (vmm_map_late) */
 #define KERNEL_VIRT_BASE 0xFFFFFFFF80000000ull  /* the kernel image (linker.ld) */
@@ -63,8 +81,9 @@ uint32_t virt_to_phys(const volatile void *virt);
  * the direct map (so contiguous), below 4 GiB and above the first MiB?
  * A user address, or one of the kernel image, is not. */
 int virt_dma_ok(const void *virt, uint32_t len);
-/* A user address (32 bits, as a process's registers hold it) as a pointer. */
-#define UPTR(addr) ((void *)(uintptr_t)(uint32_t)(addr))
+/* A user address (64 bits; a 32-bit program's, zero-extended) as a pointer. */
+typedef uint64_t uaddr_t;
+#define UPTR(addr) ((void *)(uintptr_t)(addr))
 
 /* Linker-provided symbols. */
 extern char kernel_start[], kernel_end[];

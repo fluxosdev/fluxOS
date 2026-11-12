@@ -49,7 +49,7 @@ void readcache_init(void)
         if (valid && mb <= 64) budget = mb << 20;
     }
     capacity = budget / RC_BYTES;
-    reserve_frames = MIN(32u << 20, MAX(8u << 20, total_kb / 16 * 1024)) / PAGE_SIZE;
+    reserve_frames = MIN(32u << 20, MAX(8u << 20, MIN(total_kb / 16, 32u << 10) * 1024)) / PAGE_SIZE;
     for (unsigned i = 0; i < RC_BUCKETS; i++) buckets[i] = -1;
     pmm_set_reclaimer(reclaim);
     klog("Read cache: up to %u MiB, allocated on demand\n", budget >> 20);

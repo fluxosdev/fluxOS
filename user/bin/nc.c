@@ -79,7 +79,7 @@ int main(int argc, char **argv)
         if (poll(p + !stdin_open, stdin_open ? 2 : 1, -1) < 0)
             break;
         if (stdin_open && p[0].revents) {
-            int n = (int)read(0, buf, sizeof(buf));
+            ssize_t n = read(0, buf, sizeof(buf));
             if (n <= 0) {
                 stdin_open = 0;
                 if (!udp)

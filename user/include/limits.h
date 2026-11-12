@@ -20,15 +20,26 @@ extern "C" {
 #define INT_MIN   (-2147483647 - 1)
 #define INT_MAX   2147483647
 #define UINT_MAX  4294967295U
+#ifdef __x86_64__               /* a 64-bit program: long and pointers are 64 bits */
+#define LONG_MIN  (-9223372036854775807L - 1)
+#define LONG_MAX  9223372036854775807L
+#define ULONG_MAX 18446744073709551615UL
+#else
 #define LONG_MIN  INT_MIN
 #define LONG_MAX  INT_MAX
 #define ULONG_MAX UINT_MAX
+#endif
 #define LLONG_MIN  (-9223372036854775807LL - 1)
 #define LLONG_MAX  9223372036854775807LL
 #define ULLONG_MAX 18446744073709551615ULL
+#ifdef __x86_64__
+#define LONG_BIT  64
+#define SSIZE_MAX LONG_MAX
+#else
 #define LONG_BIT  32
-#define WORD_BIT  32
 #define SSIZE_MAX INT_MAX
+#endif
+#define WORD_BIT  32
 
 /* What one process may count on (sysconf(3) answers for the others). */
 #define ARG_MAX        (256 * 1024)

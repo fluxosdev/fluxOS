@@ -76,7 +76,7 @@ static int read_file(const char *path, struct file *f)
                 return -1;
             }
         }
-        int n = (int)read(fd, f->data + f->size, cap - f->size);
+        ssize_t n = read(fd, f->data + f->size, cap - f->size);
         if (n < 0) {
             fprintf(stderr, "diff: %s: %s\n", path, strerror(errno));
             close(fd);

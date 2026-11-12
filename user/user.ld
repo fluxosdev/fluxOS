@@ -1,4 +1,4 @@
-/* fluxOS user programs: static ELF32 executables at 1 GiB. */
+/* fluxOS user programs: static ELF executables at 1 GiB (64-bit ones, or with -m elf_i386 32-bit). */
 ENTRY(_start)
 
 SECTIONS

@@ -355,7 +355,7 @@ void jsnet_poll(struct jsnet *net)
                 p->rx = next;
                 p->rc = cap;
             }
-            int n = (int)read(p->from, p->rx + p->rn, p->rc - p->rn);
+            ssize_t n = read(p->from, p->rx + p->rn, p->rc - p->rn);
             if (n <= 0) {
                 p->error = 1;
                 continue;
@@ -441,7 +441,7 @@ void jsnet_poll(struct jsnet *net)
             struct pollfd w = {p->to, POLLOUT, 0};
             if (poll(&w, 1, 0) > 0 && (w.revents & POLLOUT)) {
                 void (*old)(int) = signal(SIGPIPE, SIG_IGN);
-                int sent = (int)write(p->to, p->tx + p->sent, n);
+                ssize_t sent = write(p->to, p->tx + p->sent, n);
                 signal(SIGPIPE, old);
                 if (sent <= 0)
                     p->error = 1;

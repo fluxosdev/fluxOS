@@ -7,9 +7,10 @@ on fluxOS; phases 5 and 6 on 2026-10-30: ext2 with links, and the ISO made
 natively; phase 6.5 on 2026-10-31: the first native build); phase 7 is a
 plan.*
 
-> **2026-11-11, fluxOS 0.5.0: the kernel is 64-bit, and Limine starts it.**
+> **2026-11-11, fluxOS 0.5.0: the system is 64-bit, and Limine starts it.**
 > This roadmap was written for the 32-bit system that GRUB started, and its
-> phases stand as the record of that work. Two things have changed under it:
+> phases stand as the record of that work. Three things have changed under
+> it:
 >
 > - **The boot loader is Limine**, not GRUB. Where a phase below says
 >   `firmware/grub`, `boot.img`/`core.img`, `mkiso -G` or `mbcheck`, the tree
@@ -19,18 +20,35 @@ plan.*
 >   ISO), `mkiso -e`/`-P` and `kcheck`. Nothing of the boot loader is built
 >   or downloaded, as before, so this part of self-hosting is unchanged in
 >   kind: `make iso` on fluxOS needs `mkiso` and `limine`, both in the tree.
-> - **The kernel is x86-64 code** (`gcc -m64 -mcmodel=kernel`), while the
->   programs, the C library and the ports are still i686 (`gcc -m32`). The
->   fluxOS toolchain (`i686-fluxos`, phases 1 and 4) emits only 32-bit code,
->   so **the native build can build every program but not the kernel**, and
->   stages 1 to 3 below do not hold for 0.5.0 until it can. What that takes:
->   a GCC and binutils for fluxOS that also know x86-64 (binutils'
->   `elf_x86_64` emulation and a `cc1` with the 64-bit back end: an
->   `i686-fluxos` GCC configured as a bi-arch compiler, or an
->   `x86_64-fluxos` one whose default multilib is `-m32`). The kernel needs
->   no library from it: it links without libgcc. `tools/toolchain` and its
->   patches are as they were and need that work; `make test-gcc-qemu` and
->   `make test-native-build-qemu` were not run against 0.5.0.
+> - **The kernel and the programs are x86-64 code** (`gcc -m64`; the
+>   kernel with `-mcmodel=kernel`), and one program, the Windows program
+>   loader, with the libraries it links, is still built for the 386
+>   (`gcc -m32`). A build therefore needs a compiler, an assembler and a
+>   linker that do both. A 64-bit program's memory is no longer the 2 GiB
+>   the phases below count with ("2 GiB of address space per process"): its
+>   heap, mappings and stack are above 4 GiB, with as much address space as
+>   the processor has, so the compiler is limited by the machine's memory.
+>   Nor are its files the "under 2 GiB" of the phases below: `off_t` is 64
+>   bits there, and an ext2 volume holds files of up to 16 GiB (1 KiB
+>   blocks) or 2 TiB (4 KiB blocks). The stack's 32 MiB are a limit that
+>   `setrlimit` and the shell's `ulimit -s` raise or lift, kept by the
+>   programs run from the one that set it (a compiler that recurses deeply
+>   needs no rebuilt kernel for it).
+> - **The toolchain's target is `x86_64-fluxos`**, where the phases below
+>   say `i686-fluxos`: binutils with the `elf_x86_64` and `elf_i386`
+>   emulations, and a GCC that makes 64-bit code by default and 32-bit code
+>   with `-m32` (its libgcc and libstdc++ are the 64-bit ones only: the tree
+>   links neither). The native GCC, make and binutils are 64-bit programs
+>   themselves. Programs built by the older `i686-fluxos` toolchain still
+>   run: the kernel starts ELF32 executables as before.
+>
+> `make test-gcc-qemu` (which now also has the native `gcc -m32` make a
+> program the kernel runs, and compile for the kernel's code model) and
+> `make test-native-build-qemu` (phase 6.5: the whole tree built on fluxOS
+> by the 64-bit toolchain, its ISO started and installed from) pass again.
+> One step of the build had come to need Python since phase 6.5 was done,
+> the Windows loader's GL wrappers; a C program built for the machine the
+> build runs on writes them now (`tools/gen-win32-gl.c`).
 
 "Self-hosting" means that fluxOS, running on its own kernel, can turn a
 checkout of this repository into a bootable `fluxOS.iso` and an installed

@@ -693,7 +693,7 @@ static int load_file(struct ed *e, const char *path)
 static int write_all(int fd, const char *p, int n)
 {
     while (n > 0) {
-        int w = (int)write(fd, p, (size_t)n);
+        ssize_t w = write(fd, p, (size_t)n);
         if (w <= 0)
             return -1;
         p += w;

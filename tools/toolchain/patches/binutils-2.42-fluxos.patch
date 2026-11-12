@@ -1,16 +1,6 @@
---- a/config.sub
-+++ b/config.sub
-@@ -1766,7 +1766,7 @@
- 	     | onefs* | tirtos* | phoenix* | fuchsia* | redox* | bme* \
- 	     | midnightbsd* | amdhsa* | unleashed* | emscripten* | wasi* \
- 	     | nsk* | powerunix* | genode* | zvmoe* | qnx* | emx* | zephyr* \
--	     | fiwix* | mlibc* | cos* | mbr* )
-+	     | fiwix* | mlibc* | cos* | mbr* | fluxos* )
- 		;;
- 	# This one is extra strict with allowed versions
- 	sco3.2v2 | sco3.2v[4-9]* | sco5v6*)
---- a/bfd/config.bfd
-+++ b/bfd/config.bfd
+diff -ruN a/bfd/config.bfd b/bfd/config.bfd
+--- a/bfd/config.bfd	2026-11-11 11:46:05.673242682 -0500
++++ b/bfd/config.bfd	2026-11-11 11:46:05.674080482 -0500
 @@ -591,6 +591,11 @@
      targ_defvec=i386_elf32_vec
      targ_selvecs="iamcu_elf32_vec i386_coff_vec"
@@ -23,8 +13,33 @@
    i[3-7]86-*-solaris2*)
      targ_defvec=i386_elf32_sol2_vec
      targ_selvecs="iamcu_elf32_vec i386_coff_vec i386_pei_vec"
---- a/gas/configure.tgt
-+++ b/gas/configure.tgt
+@@ -681,6 +686,11 @@
+     targ_selvecs="i386_elf32_vec iamcu_elf32_vec"
+     want64=true
+     ;;
++  x86_64-*-fluxos*)
++    targ_defvec=x86_64_elf64_vec
++    targ_selvecs=i386_elf32_vec
++    want64=true
++    ;;
+   x86_64-*-elf* | x86_64-*-rtems* | x86_64-*-fuchsia | x86_64-*-genode*)
+     targ_defvec=x86_64_elf64_vec
+     targ_selvecs="i386_elf32_vec iamcu_elf32_vec x86_64_elf32_vec"
+diff -ruN a/config.sub b/config.sub
+--- a/config.sub	2026-11-11 11:46:05.673283153 -0500
++++ b/config.sub	2026-11-11 11:46:05.674211226 -0500
+@@ -1766,7 +1766,7 @@
+ 	     | onefs* | tirtos* | phoenix* | fuchsia* | redox* | bme* \
+ 	     | midnightbsd* | amdhsa* | unleashed* | emscripten* | wasi* \
+ 	     | nsk* | powerunix* | genode* | zvmoe* | qnx* | emx* | zephyr* \
+-	     | fiwix* | mlibc* | cos* | mbr* )
++	     | fiwix* | mlibc* | cos* | mbr* | fluxos* )
+ 		;;
+ 	# This one is extra strict with allowed versions
+ 	sco3.2v2 | sco3.2v[4-9]* | sco5v6*)
+diff -ruN a/gas/configure.tgt b/gas/configure.tgt
+--- a/gas/configure.tgt	2026-11-11 11:46:05.673314600 -0500
++++ b/gas/configure.tgt	2026-11-11 11:46:05.674121206 -0500
 @@ -229,6 +229,7 @@
    i386-*-beos*)				fmt=elf ;;
    i386-*-elfiamcu)			fmt=elf arch=iamcu ;;
@@ -33,8 +48,9 @@
    i386-*-fuchsia*)			fmt=elf ;;
    i386-*-haiku*)			fmt=elf em=haiku ;;
    i386-*-genode*)			fmt=elf ;;
---- a/ld/configure.tgt
-+++ b/ld/configure.tgt
+diff -ruN a/ld/configure.tgt b/ld/configure.tgt
+--- a/ld/configure.tgt	2026-11-11 11:46:05.673340288 -0500
++++ b/ld/configure.tgt	2026-11-11 11:46:05.674147492 -0500
 @@ -402,6 +402,10 @@
  i[3-7]86-*-elfiamcu)	targ_emul=elf_iamcu
  			targ_extra_emuls=elf_i386
@@ -46,3 +62,13 @@
  i[3-7]86-*-elf* | i[3-7]86-*-rtems* | i[3-7]86-*-genode*)
  			targ_emul=elf_i386
  			targ_extra_emuls=elf_iamcu
+@@ -1036,6 +1040,9 @@
+ 			tdir_elf_i386=`echo ${targ_alias} | \
+ 			    sed -e 's/x86_64/i386/' -e 's/aout//'`
+ 			;;
++x86_64-*-fluxos*)	targ_emul=elf_x86_64
++			targ_extra_emuls=elf_i386
++			;;
+ x86_64-*-elf* | x86_64-*-rtems* | x86_64-*-fuchsia* | x86_64-*-genode*)
+ 			targ_emul=elf_x86_64
+ 			targ_extra_emuls="elf_i386 elf_iamcu elf32_x86_64"

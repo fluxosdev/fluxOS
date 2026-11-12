@@ -105,7 +105,7 @@ static int shm_create(int key, uint32_t size)
     if (!frames)
         return -ENOMEM;
     for (uint32_t i = 0; i < n; i++) {
-        frames[i] = pmm_alloc_user();
+        frames[i] = pmm_alloc_user_low();    /* (below 4 GiB: its frames are kept in 32 bits, and the GPU may be lent them) */
         if (!frames[i]) {
             free_frames(frames, i);
             return -ENOMEM;
@@ -156,7 +156,7 @@ int sys_shmget(uint32_t key, uint32_t size, uint32_t flags, uint32_t d, uint32_t
     return shm_create((int)key, size);
 }
 
-int sys_shmat(uint32_t id, uint32_t usize, uint32_t c, uint32_t d, uint32_t e)
+long sys_shmat(uint32_t id, uint64_t usize, uint32_t c, uint32_t d, uint32_t e)
 {
     (void)c; (void)d; (void)e;
     /* The frames are copied out with a reference each for the mapping, so removing the
@@ -183,7 +183,7 @@ int sys_shmat(uint32_t id, uint32_t usize, uint32_t c, uint32_t d, uint32_t e)
             break;                      /* shared too widely */
     }
     spin_unlock(&shm_lock);
-    uint32_t addr = 0;
+    uint64_t addr = 0;
     int r = got < n ? -ENOMEM : proc_map_frames(current, frames, n, &addr);
     if (r < 0) {
         for (uint32_t i = 0; i < got; i++)
@@ -193,13 +193,13 @@ int sys_shmat(uint32_t id, uint32_t usize, uint32_t c, uint32_t d, uint32_t e)
     }
     kfree(frames);
     if (usize && copy_to_user(UPTR(usize), &size, sizeof(size)) < 0) {
-        proc_munmap(current, addr, n * PAGE_SIZE);
+        proc_munmap(current, addr, (uint64_t)n * PAGE_SIZE);
         return -EFAULT;
     }
-    return (int)addr;
+    return (long)addr;
 }
 
-int sys_shmctl(uint32_t id, uint32_t cmd, uint32_t ubuf, uint32_t d, uint32_t e)
+int sys_shmctl(uint32_t id, uint32_t cmd, uint64_t ubuf, uint32_t d, uint32_t e)
 {
     (void)d; (void)e;
     spin_lock(&shm_lock);

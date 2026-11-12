@@ -24,7 +24,7 @@ static int full_write(int fd, const void *data, size_t n)
 {
     const unsigned char *p = data;
     while (n) {
-        int r = (int)write(fd, p, n);
+        ssize_t r = write(fd, p, n);
         if (r <= 0)
             return -1;
         p += r;
@@ -51,7 +51,7 @@ static int random_bytes(unsigned char *p, int n)
         return -1;
     int got = 0;
     while (got < n) {
-        int r = (int)read(fd, p + got, (size_t)(n - got));
+        ssize_t r = read(fd, p + got, (size_t)(n - got));
         if (r <= 0)
             break;
         got += r;
@@ -339,7 +339,7 @@ int main(int argc, char **argv)
             break;
         }
         if (fds[0].revents & (POLLIN | POLLHUP)) {
-            int n = (int)read(0, input + ilen, MAX_MESSAGE + 5 - ilen);
+            ssize_t n = read(0, input + ilen, MAX_MESSAGE + 5 - ilen);
             if (n <= 0) {
                 result = 0;
                 break;

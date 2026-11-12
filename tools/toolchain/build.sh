@@ -1,7 +1,10 @@
 #!/bin/sh
-# Build the fluxOS GCC toolchain: binutils and GCC with an i686-fluxos
+# Build the fluxOS GCC toolchain: binutils and GCC with an x86_64-fluxos
 # target, as a cross compiler that runs on the build host, and then as a
-# GCC that runs on fluxOS itself.
+# GCC that runs on fluxOS itself. It makes 64-bit code, as fluxOS's kernel
+# and programs are; with -m32 it makes code for the 386 as well (the
+# Windows program loader is built so), which the assembler and the linker
+# take too. Its libraries (libgcc, libstdc++) are the 64-bit ones only.
 #
 #   tools/toolchain/build.sh [--prefix DIR] [--sysroot DIR] [--jobs N]
 #                            [--cache DIR] [--work DIR] [--only binutils|gcc]
@@ -9,15 +12,15 @@
 #
 # The sysroot must hold fluxOS's headers and libraries first ("make
 # sysroot" puts them in build/sysroot). The result is
-# PREFIX/bin/i686-fluxos-gcc, -g++, -ld, -as, -ar..., with libgcc and
+# PREFIX/bin/x86_64-fluxos-gcc, -g++, -ld, -as, -ar..., with libgcc and
 # libstdc++ for the target; "make toolchain" runs this with the defaults
 # below.
 #
 # --native is the Canadian cross (phase 4 of self-hosting-roadmap.md): with
-# the cross toolchain on the path, GCC is configured --host=i686-fluxos
-# --target=i686-fluxos --prefix=/usr and installed under DEST
+# the cross toolchain on the path, GCC is configured --host=x86_64-fluxos
+# --target=x86_64-fluxos --prefix=/usr and installed under DEST
 # (build/toolchain/native/root) laid out as it goes onto the system
-# image: usr/bin/gcc, usr/libexec/gcc/i686-fluxos/13.2.0/cc1, ... Its
+# image: usr/bin/gcc, usr/libexec/gcc/x86_64-fluxos/13.2.0/cc1, ... Its
 # assembler and linker are the binutils "make ports" builds. "make
 # toolchain-native" runs this.
 #
@@ -28,7 +31,7 @@ BINUTILS=binutils-2.42
 BINUTILS_SHA256=f6e4d41fd5fc778b06b7891457b3620da5ecea1006c6a4a41ae998109f85a800
 GCC=gcc-13.2.0
 GCC_SHA256=e275e76442a6067341a27f04c5c6b83d8613144004c0413528863dc6b5c743da
-TARGET=i686-fluxos
+TARGET=x86_64-fluxos
 
 here=$(cd "$(dirname "$0")" && pwd)
 top=$(cd "$here/../.." && pwd)
@@ -108,7 +111,13 @@ prerequisites() {
 GCC_OPTIONS="--enable-languages=c,c++ --disable-nls --disable-shared --disable-threads --disable-tls
     --enable-initfini-array --disable-multilib --disable-libssp --disable-libquadmath --disable-libgomp
     --disable-libatomic --disable-libstdcxx-pch --disable-fixincludes --disable-lto --disable-plugin
-    --with-arch=pentium4 --with-tune=generic"
+    --with-arch=x86-64 --with-arch-32=pentium4 --with-tune=generic"
+
+# The build machine's compilers, held to the language standards this GCC's
+# own sources were written in: a newer host GCC's defaults (C23, C++20 and
+# later) do not take them (u8"" literals in libcody, for one).
+host_cc="${CC:-gcc} -std=gnu17"
+host_cxx="${CXX:-g++} -std=gnu++17"
 
 build_binutils() {
     fetch $BINUTILS $BINUTILS_SHA256 "https://ftp.gnu.org/gnu/binutils/$BINUTILS.tar.xz"
@@ -131,7 +140,8 @@ build_gcc() {
     rm -rf "$work/build-gcc"
     mkdir -p "$work/build-gcc"
     cd "$work/build-gcc"
-    PATH="$prefix/bin:$PATH" "$work/$GCC/configure" --target=$TARGET --prefix="$prefix" --with-sysroot="$sysroot" \
+    PATH="$prefix/bin:$PATH" CC="$host_cc" CXX="$host_cxx" \
+    "$work/$GCC/configure" --target=$TARGET --prefix="$prefix" --with-sysroot="$sysroot" \
         $GCC_OPTIONS >configure.log 2>&1 || { tail -30 configure.log; exit 1; }
     PATH="$prefix/bin:$PATH" make -j"$jobs" all-gcc >build-gcc.log 2>&1 || { tail -40 build-gcc.log; exit 1; }
     PATH="$prefix/bin:$PATH" make -j"$jobs" all-target-libgcc >build-libgcc.log 2>&1 || { tail -40 build-libgcc.log; exit 1; }
@@ -174,7 +184,7 @@ build_native() {
     # What configure cannot find out by running a program on the host: the
     # compiler's page allocator takes its pages from malloc (the kernel's
     # mapping table is small; the heap can grow to the mappings).
-    PATH="$prefix/bin:$PATH" \
+    PATH="$prefix/bin:$PATH" CC_FOR_BUILD="$host_cc" CXX_FOR_BUILD="$host_cxx" \
     gcc_cv_func_mmap_file=no gcc_cv_func_mmap_dev_zero=no gcc_cv_func_mmap_anon=no \
     "$src/configure" --build="$build" --host=$TARGET --target=$TARGET --prefix=/usr \
         --with-sysroot=/ --with-build-sysroot="$sysroot" --with-native-system-header-dir=/usr/include \

@@ -67,7 +67,7 @@ static int same_file(const char *a, const char *b)
     static char ba[65536], bb[65536];
     int same = 1;
     for (;;) {
-        int ra = (int)read(fa, ba, sizeof(ba)), rb = (int)read(fb, bb, sizeof(bb));
+        ssize_t ra = read(fa, ba, sizeof(ba)), rb = (int)read(fb, bb, sizeof(bb));
         if (ra != rb || (ra > 0 && memcmp(ba, bb, (size_t)ra))) {
             same = 0;
             break;
@@ -78,6 +78,12 @@ static int same_file(const char *a, const char *b)
     close(fa);
     close(fb);
     return same;
+}
+
+static void write_file(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "w");
+    CHECK(f && fputs(text, f) >= 0 && fclose(f) == 0);
 }
 
 int main(void)
@@ -149,6 +155,31 @@ int main(void)
     CHECK(st == 0 && atoi(out) >= 1);
     st = run("gcc -S -O1 -o /tmp/hello.s /tests/hello.c && as -o /tmp/hello.o /tmp/hello.s && gcc -o /tmp/hello2 /tmp/hello.o && /tmp/hello2", out, sizeof(out));
     CHECK(st == 0 && strstr(out, "hello from fluxOS gcc"));
+
+    /* The other two kinds of code the system is built of. -m32 makes a
+     * program for the 386, which the kernel runs beside the 64-bit ones
+     * (the Windows program loader is one); this one makes its system calls
+     * itself, as the libraries on the system image are the 64-bit ones. */
+    write_file("/tmp/bits.c",
+               "static const char msg[] = \"made by gcc -m32\\n\";\n"
+               "void _start(void)\n"
+               "{\n"
+               "    int r;\n"
+               "    __asm__ volatile(\"int $0x80\" : \"=a\"(r) : \"a\"(4), \"b\"(1), \"c\"(msg), \"d\"(sizeof(msg) - 1) : \"memory\");\n"
+               "    __asm__ volatile(\"int $0x80\" : \"=a\"(r) : \"a\"(1), \"b\"(sizeof(void *) * 8) : \"memory\");\n"
+               "    for (;;) { }\n"
+               "}\n");
+    st = run("gcc -m32 -O2 -nostdlib -o /tmp/bits32 /tmp/bits.c 2>&1 && /tmp/bits32", out, sizeof(out));
+    printf("%s", out);
+    CHECK(st == 32 && !strcmp(out, "made by gcc -m32\n"));
+    st = run("readelf -h /tmp/bits32 | grep -c 'ELF32'", out, sizeof(out));
+    CHECK(st == 0 && atoi(out) == 1);
+    /* And the kernel's: 64-bit code for the top 2 GiB of the address space,
+     * where an address is a sign-extended 32-bit value. */
+    st = run("gcc -m64 -mcmodel=kernel -mno-red-zone -ffreestanding -O2 -c -o /tmp/bitsk.o /tmp/bits.c 2>&1 && "
+             "readelf -r /tmp/bitsk.o | grep -c R_X86_64_32S", out, sizeof(out));
+    printf("kernel code model: %s", out);
+    CHECK(st == 0 && atoi(out) >= 1);
 
     /* make driving it, with a recipe through /bin/sh */
     st = run("printf 'all: /tmp/hello3\\n/tmp/hello3: /tests/hello.c\\n\\tgcc -O2 -o $@ $<\\n\\ttest -x $@ && echo built\\n' > /tmp/Makefile && make -C /tmp -f /tmp/Makefile", out, sizeof(out));

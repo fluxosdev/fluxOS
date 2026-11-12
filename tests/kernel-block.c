@@ -23,7 +23,7 @@ uint32_t pmm_alloc_reserved(uint32_t reserve)
     CHECK(page!=MAP_FAILED && (uintptr_t)page<=UINT32_MAX);
     return (uint32_t)(uintptr_t)page;
 }
-void pmm_free(uint32_t phys) { CHECK(munmap((void *)(uintptr_t)phys,PAGE_SIZE)==0); }
+void pmm_free(uint64_t phys) { CHECK(munmap((void *)(uintptr_t)phys,PAGE_SIZE)==0); }
 int cmdline_value(const char *key,char *out,size_t size)
 {
     CHECK(!strcmp(key,"readcache"));

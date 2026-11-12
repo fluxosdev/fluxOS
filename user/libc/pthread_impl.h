@@ -8,7 +8,8 @@
 #include <pthread.h>
 #include <stdint.h>
 
-/* A thread's block: %gs:0 points at it (self). A new thread's sits at the top of its stack. */
+/* A thread's block: %fs:0 points at it (self) in a 64-bit program, %gs:0 in a 32-bit one. A new
+ * thread's sits at the top of its stack. */
 struct __pthread {
     struct __pthread *self;
     volatile int tid;                   /* its id, written by the kernel before it runs; zeroed (and a joiner
@@ -36,7 +37,11 @@ static inline struct __pthread *__self(void)
     struct __pthread *s;
     if (!__tls_ok)
         return &__main_thread;          /* (a kernel without SYS_set_tls: one thread only) */
+#ifdef __x86_64__
+    __asm__("movq %%fs:0, %0" : "=r"(s));
+#else
     __asm__("movl %%gs:0, %0" : "=r"(s));
+#endif
     return s;
 }
 

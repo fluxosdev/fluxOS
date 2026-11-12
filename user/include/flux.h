@@ -11,6 +11,10 @@ extern "C" {
 int ttymode(int mode);                  /* returns old mode; -1 queries */
 int procinfo(int slot, struct procinfo *pi);
 int meminfo(struct meminfo *mi);
+/* The stack the program started on, its first thread's: where it ends, and
+ * the lowest address the kernel will grow it down to. (Where that is
+ * depends on the kind of program: far above 4 GiB in a 64-bit one.) */
+void flux_main_stack(void **low, void **high);
 unsigned int uptime_ms(void);
 int reboot(int cmd);
 int dmesg(char *buf, unsigned int size);
@@ -28,7 +32,7 @@ int usbinfo(int index, struct usbinfo *ui); /* the index-th USB device plugged i
  * POWER_INFO (arg: struct powerinfo *), POWER_SLEEP (returns once the
  * machine is back), or POWER_BRIGHTNESS (arg: a percentage, BRIGHTNESS_UP
  * or BRIGHTNESS_DOWN; returns the percentage set). See <flux/abi.h>. */
-int power(int op, unsigned int arg);
+int power(int op, unsigned long arg);   /* arg: a number, or an address ((unsigned long)&info) */
 
 /* Wireless networking: op is WIFI_STATUS, WIFI_SCAN, WIFI_BSS, WIFI_CONNECT or
  * WIFI_DISCONNECT, with the struct each takes (see <flux/abi.h>). */

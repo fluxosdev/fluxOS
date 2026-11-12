@@ -5747,9 +5747,6 @@ static void co_free_all(struct js *J)
 
 /* ---- for the garbage collector ---- */
 
-#define MAIN_STACK_TOP 0xC0000000u      /* the kernel puts a program's stack below here */
-#define MAIN_STACK_LOW (MAIN_STACK_TOP - (8u << 20))
-
 static int on_stack(const char *p, const char *lo, const char *hi)
 {
     return p >= lo && p < hi;
@@ -5762,8 +5759,11 @@ static void main_stack(const char **lo, const char **hi)
     extern void js_test_stack_bounds(const char **lo, const char **hi);
     js_test_stack_bounds(lo, hi);
 #else
-    *lo = (const char *)MAIN_STACK_LOW;
-    *hi = (const char *)MAIN_STACK_TOP;
+    /* The program's first stack, wherever the kernel put it (the C library knows). */
+    void *low, *high;
+    flux_main_stack(&low, &high);
+    *lo = low;
+    *hi = high;
 #endif
 }
 

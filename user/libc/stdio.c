@@ -376,7 +376,7 @@ static off64_t tell64(FILE *f)
 static off_t ftello__l(FILE *f)
 {
     off64_t pos = tell64(f);
-    if (pos > INT_MAX) {
+    if ((off64_t)(off_t)pos != pos) {   /* (past 2 GiB, in a 32-bit program) */
         errno = EOVERFLOW;
         return -1;
     }

@@ -76,7 +76,7 @@ static void write_out(const void *p, size_t n)
 {
     const char *c = p;
     while (n > 0) {
-        int w = (int)write(out, c, n);
+        ssize_t w = write(out, c, n);
         if (w <= 0)
             fail(EXIT_FILE, "cannot write to '%s': %s", out_name, strerror(errno));
         c += w;

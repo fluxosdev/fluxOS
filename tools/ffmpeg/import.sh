@@ -7,7 +7,7 @@
 #   tools/ffmpeg/import.sh [--toolchain DIR] [--sysroot DIR] [--jobs N] [--cache DIR] [--work DIR]
 #
 # The release is fetched into the toolchain's download cache and verified;
-# configure runs with the i686-fluxos cross compiler ("make toolchain")
+# configure runs with the x86_64-fluxos cross compiler ("make toolchain")
 # against the sysroot ("make sysroot"), choosing the components below, and
 # the libraries, ffmpeg and ffprobe are built once in the work directory.
 # What that build compiled and included (its .d files) is copied into
@@ -18,7 +18,7 @@
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 top=$(cd "$here/../.." && pwd)
-TARGET=i686-fluxos
+TARGET=x86_64-fluxos
 FFMPEG=ffmpeg-9.0.2
 FFMPEG_SHA256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 
@@ -87,7 +87,7 @@ cd "$work/cfg"
 # configure's lists are comma-separated
 list() { echo $1 | tr ' ' ','; }
 echo "configuring"
-"../$FFMPEG/configure" --enable-cross-compile --cross-prefix=$TARGET- --arch=x86_32 --cpu=pentium4 \
+"../$FFMPEG/configure" --enable-cross-compile --cross-prefix=$TARGET- --arch=x86_64 --cpu=x86-64 \
     --target-os=none --prefix=/usr --disable-everything --disable-autodetect --disable-doc --disable-debug \
     --disable-avdevice --disable-network --disable-x86asm --disable-ffplay --enable-ffmpeg --enable-ffprobe \
     --enable-pthreads --enable-static --disable-shared --enable-swscale --enable-swresample --enable-avfilter \
@@ -103,6 +103,14 @@ make -j"$jobs" >build.log 2>&1 || { grep -E "error|undefined" build.log | head -
 printf 'print-%%:\n\t@echo $($*)\n' >print.mk
 ffmpeg_objs=$(make -s -f Makefile -f print.mk print-OBJS-ffmpeg)
 ffprobe_objs=$(make -s -f Makefile -f print.mk print-OBJS-ffprobe)
+
+# One configuration for both kinds of program fluxOS builds: what follows
+# the processor's word size in config.h is made to follow the compiler's
+# (a 32-bit program's FFmpeg, should one be built again, takes the same
+# sources and the other half of these).
+sed -i -e 's/^#define ARCH_X86_32 [01]$/#ifdef __x86_64__\n#define ARCH_X86_32 0\n#else\n#define ARCH_X86_32 1\n#endif/' \
+    -e 's/^#define ARCH_X86_64 [01]$/#ifdef __x86_64__\n#define ARCH_X86_64 1\n#else\n#define ARCH_X86_64 0\n#endif/' \
+    -e 's/^#define HAVE_FAST_64BIT [01]$/#ifdef __x86_64__\n#define HAVE_FAST_64BIT 1\n#else\n#define HAVE_FAST_64BIT 0\n#endif/' config.h
 
 echo "copying into $dest"
 rm -rf "$dest.new"

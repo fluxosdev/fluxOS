@@ -653,7 +653,7 @@ static void complete(struct editor *e, int listing)
 static int read_byte(void)
 {
     unsigned char c;
-    int r = (int)read(0, &c, 1);
+    ssize_t r = read(0, &c, 1);
     return r == 1 ? c : -1;
 }
 

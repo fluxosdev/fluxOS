@@ -89,7 +89,7 @@ static int read_full(void *buf, size_t n)
         npending--;
     }
     while (got < n) {
-        int r = (int)read(fd, p + got, n - got);
+        ssize_t r = read(fd, p + got, n - got);
         if (r < 0 && errno == EINTR)
             continue;
         if (r <= 0)
@@ -103,7 +103,7 @@ static int write_full(int to, const void *buf, size_t n)
 {
     const uint8_t *p = buf;
     while (n) {
-        int w = (int)write(to, p, n);
+        ssize_t w = write(to, p, n);
         if (w < 0 && errno == EINTR)
             continue;
         if (w <= 0)
@@ -114,14 +114,14 @@ static int write_full(int to, const void *buf, size_t n)
     return 0;
 }
 
-static int skip_bytes(uint32_t n)
+static int skip_bytes(uint64_t n)
 {
     static char buf[8192];
     while (n) {
-        size_t take = n < sizeof(buf) ? n : sizeof(buf);
+        size_t take = n < sizeof(buf) ? (size_t)n : sizeof(buf);
         if (read_full(buf, take) < 0)
             return -1;
-        n -= (uint32_t)take;
+        n -= take;
     }
     return 0;
 }
@@ -225,21 +225,42 @@ static uint32_t octal(const char *s, int n)
     return v;
 }
 
-/* A size field may be base 256 (GNU, for 8 GiB and more: too big for us anyway). */
-static uint32_t field_size(const char *s)
+/* A size field: 11 octal digits, which hold up to 8 GiB - 1, or base 256
+ * (GNU's, for a member of 8 GiB and more: the top bit of the first byte
+ * says so, and the number is the field's last 8 bytes). */
+#define OCTAL_SIZE_MAX 077777777777ull
+
+static uint64_t field_size(const char *s)
 {
+    uint64_t v = 0;
     if ((unsigned char)s[0] & 0x80) {
-        uint64_t v = 0;
         for (int i = 4; i < 12; i++)
             v = v << 8 | (unsigned char)s[i];
-        return v > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)v;
+        return v;
     }
-    return octal(s, 12);
+    int i = 0;
+    while (i < 12 && (s[i] == ' ' || s[i] == '0'))
+        i++;
+    for (; i < 12 && s[i] >= '0' && s[i] <= '7'; i++)
+        v = v * 8 + (uint64_t)(s[i] - '0');
+    return v;
 }
 
 static void put_octal(char *field, int n, uint32_t v)
 {
     snprintf(field, (size_t)n, "%0*o", n - 1, v);
+}
+
+static void put_size(char *field, uint64_t v)
+{
+    if (v <= OCTAL_SIZE_MAX) {
+        snprintf(field, 12, "%011llo", (unsigned long long)v);
+        return;
+    }
+    memset(field, 0, 12);
+    field[0] = (char)0x80;
+    for (int i = 0; i < 8; i++)
+        field[11 - i] = (char)(v >> (8 * i));
 }
 
 static int checksum_ok(const struct header *h)
@@ -323,7 +344,7 @@ static int write_header(const char *name, const struct stat *st, char type, cons
     put_octal(h.mode, 8, st->st_mode & 07777);
     put_octal(h.uid, 8, owner_id);
     put_octal(h.gid, 8, group_id);
-    put_octal(h.size, 12, type == '0' ? (uint32_t)st->st_size : 0);
+    put_size(h.size, type == '0' ? (uint64_t)st->st_size : 0);
     put_octal(h.mtime, 12, (uint32_t)st->st_mtime);
     h.typeflag = type;
     if (link)                           /* all 100 bytes may be used: no terminator needed */
@@ -399,10 +420,10 @@ static int add_file(const char *path, const char *name, const struct stat *st)
         return -1;
     }
     static char buf[65536];
-    uint32_t left = (uint32_t)st->st_size;
+    uint64_t left = (uint64_t)st->st_size;
     int r = 0;
     while (left) {
-        int n = (int)read(in, buf, left < sizeof(buf) ? left : sizeof(buf));
+        ssize_t n = read(in, buf, left < sizeof(buf) ? (size_t)left : sizeof(buf));
         if (n <= 0) {
             warn("%s: file shrank while reading%s", path, "");
             memset(buf, 0, sizeof(buf));
@@ -412,7 +433,7 @@ static int add_file(const char *path, const char *name, const struct stat *st)
             r = -1;
             break;
         }
-        left -= (uint32_t)n;
+        left -= (uint64_t)n;
     }
     close(in);
     if (r == 0 && (st->st_size & 511)) {
@@ -625,7 +646,7 @@ static void remember_dir_time(const char *path, uint32_t mtime)
     ndir_times++;
 }
 
-static void list_entry(const char *name, const struct header *h, uint32_t size, uint32_t mtime, char type, const char *link)
+static void list_entry(const char *name, const struct header *h, uint64_t size, uint32_t mtime, char type, const char *link)
 {
     if (!verbose) {
         printf("%s\n", name);
@@ -642,7 +663,7 @@ static void list_entry(const char *name, const struct header *h, uint32_t size, 
     char when[32];
     gmtime_r(&t, &tm);
     strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &tm);
-    printf("%s %u/%u %10u %s %s", perms, octal(h->uid, 8), octal(h->gid, 8), size, when, name);
+    printf("%s %u/%u %10llu %s %s", perms, octal(h->uid, 8), octal(h->gid, 8), (unsigned long long)size, when, name);
     if (type == '2')
         printf(" -> %s", link);
     else if (type == '1')
@@ -650,7 +671,7 @@ static void list_entry(const char *name, const struct header *h, uint32_t size, 
     printf("\n");
 }
 
-static int extract_file(const char *path, uint32_t size, uint32_t mode, uint32_t mtime)
+static int extract_file(const char *path, uint64_t size, uint32_t mode, uint32_t mtime)
 {
     int out;
     if (to_stdout) {
@@ -659,31 +680,31 @@ static int extract_file(const char *path, uint32_t size, uint32_t mode, uint32_t
         if (keep_old && access(path, F_OK) == 0) {
             if (verbose)
                 fprintf(stderr, "tar: %s: exists, kept\n", path);
-            return skip_bytes((size + 511) & ~511u);
+            return skip_bytes((size + 511) & ~511ull);
         }
         make_parents(path);
         unlink(path);
         out = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (out < 0) {
             warn("%s: cannot create: %s", path, strerror(errno));
-            return skip_bytes((size + 511) & ~511u);
+            return skip_bytes((size + 511) & ~511ull);
         }
     }
     static char buf[65536];
-    uint32_t left = size;
+    uint64_t left = size;
     int r = 0;
     while (left) {
-        size_t take = left < sizeof(buf) ? left : sizeof(buf);
+        size_t take = left < sizeof(buf) ? (size_t)left : sizeof(buf);
         if ((r = read_full(buf, take)) < 0)
             break;
         if (write_full(out, buf, take) < 0) {
             warn("%s: write error: %s", path, strerror(errno));
             r = 0;
-            skip_bytes(left - (uint32_t)take);
+            skip_bytes(left - take);
             left = 0;
             break;
         }
-        left -= (uint32_t)take;
+        left -= take;
     }
     if (r == 0 && (size & 511))
         r = skip_bytes(512 - (size & 511));
@@ -713,7 +734,7 @@ static int read_archive(const char *extract_dir)
     fd = in;
     /* gzip's magic: expand through gzip, whether -z was given or not */
     uint8_t first[2];
-    int nfirst = (int)read(in, first, 2);
+    ssize_t nfirst = read(in, first, 2);
     if (nfirst < 0)
         nfirst = 0;
     int seekable = lseek(in, 0, SEEK_SET) == 0;
@@ -725,7 +746,7 @@ static int read_archive(const char *extract_dir)
     }
 
     char longname[PATH_MAX] = "", longlink[PATH_MAX] = "", paxpath[PATH_MAX] = "", paxlink[PATH_MAX] = "";
-    uint32_t paxsize = 0;
+    uint64_t paxsize = 0;
     int have_paxsize = 0;
     int zero_blocks = 0;
     for (;;) {
@@ -753,7 +774,8 @@ static int read_archive(const char *extract_dir)
             break;
         }
         int ustar = !memcmp(h.magic, "ustar", 5);
-        uint32_t size = field_size(h.size), mode = octal(h.mode, 8), mtime = octal(h.mtime, 12);
+        uint64_t size = field_size(h.size);
+        uint32_t mode = octal(h.mode, 8), mtime = octal(h.mtime, 12);
         char type = h.typeflag ? h.typeflag : '0';
         if (type == '7')
             type = '0';
@@ -765,8 +787,8 @@ static int read_archive(const char *extract_dir)
                 status = 2;
                 break;
             }
-            char *data = malloc(size + 1);
-            if (!data || read_full(data, size) < 0 || skip_bytes((512 - (size & 511)) & 511) < 0) {
+            char *data = malloc((size_t)size + 1);
+            if (!data || read_full(data, (size_t)size) < 0 || skip_bytes((512 - (size & 511)) & 511) < 0) {
                 free(data);
                 fprintf(stderr, "tar: unexpected end of archive\n");
                 status = 2;
@@ -796,7 +818,7 @@ static int read_archive(const char *extract_dir)
                         else if (!strcmp(rec, "linkpath"))
                             snprintf(paxlink, sizeof(paxlink), "%s", val);
                         else if (!strcmp(rec, "size")) {
-                            paxsize = (uint32_t)strtoul(val, NULL, 10);
+                            paxsize = strtoull(val, NULL, 10);
                             have_paxsize = 1;
                         }
                     }
@@ -830,13 +852,13 @@ static int read_archive(const char *extract_dir)
             size = 0;                   /* nothing follows these, whatever the field says */
 
         if (!wanted(name)) {
-            if (skip_bytes((size + 511) & ~511u) < 0)
+            if (skip_bytes((size + 511) & ~511ull) < 0)
                 break;
             continue;
         }
         if (mode_l) {
             list_entry(name, &h, size, mtime, type, lnk);
-            if (skip_bytes((size + 511) & ~511u) < 0)
+            if (skip_bytes((size + 511) & ~511ull) < 0)
                 break;
             continue;
         }
@@ -844,14 +866,14 @@ static int read_archive(const char *extract_dir)
             fprintf(stderr, "%s\n", name);
         char path[PATH_MAX];
         if (!safe_path(name, path, sizeof(path))) {
-            if (skip_bytes((size + 511) & ~511u) < 0)
+            if (skip_bytes((size + 511) & ~511ull) < 0)
                 break;
             continue;
         }
         if (!to_stdout && through_symlink(path)) {
             warn("%s: member is beneath a symbolic link, skipped%s", name, "");
             status = 2;
-            if (skip_bytes((size + 511) & ~511u) < 0)
+            if (skip_bytes((size + 511) & ~511ull) < 0)
                 break;
             continue;
         }
@@ -910,7 +932,7 @@ static int read_archive(const char *extract_dir)
             }
         } else {
             warn("%s: unsupported member type, skipped%s", name, "");
-            if (skip_bytes((size + 511) & ~511u) < 0)
+            if (skip_bytes((size + 511) & ~511ull) < 0)
                 break;
         }
     }

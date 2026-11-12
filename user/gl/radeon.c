@@ -242,7 +242,7 @@ static void *lend(uint32_t size, void **mem, uint32_t *handle, uint64_t *gpu)
         return NULL;
     void *p = (void *)(((uintptr_t)m + 4095) & ~(uintptr_t)4095);
     memset(p, 0, size);
-    struct dispbuf b = { (uint32_t)(uintptr_t)p, size, 0, 0, 0 };
+    struct dispbuf b = { (uintptr_t)p, size, 0, 0, 0 };
     if (display(DISP_MAPBUF, &b) < 0) {
         free(m);
         return NULL;

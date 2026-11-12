@@ -160,7 +160,8 @@ struct intel {
     struct slot {
         int pid;
         uint32_t first, npages;     /* GTT pages, from buf_first */
-        uint32_t va, offset, size;  /* where it is in the process */
+        uint64_t va;                /* where it is in the process */
+        uint32_t offset, size;
     } slots[MAX_SLOTS];
 
     /* Native modes (intel_modeset.c) */

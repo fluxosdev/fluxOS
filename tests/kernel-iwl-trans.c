@@ -33,7 +33,7 @@ uint32_t pmm_alloc_contig(uint32_t frames)
     CHECK(p != MAP_FAILED && (uintptr_t)p <= UINT32_MAX);
     return (uint32_t)(uintptr_t)p;
 }
-void pmm_free(uint32_t phys) { CHECK(munmap((void *)(uintptr_t)phys, PAGE_SIZE) == 0); pages_freed++; }
+void pmm_free(uint64_t phys) { CHECK(munmap((void *)(uintptr_t)phys, PAGE_SIZE) == 0); pages_freed++; }
 static uint8_t reply[16]; static uint32_t reply_len;
 int sleep_ticks(uint32_t n)
 {

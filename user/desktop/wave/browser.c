@@ -774,7 +774,7 @@ static int helper_pull(struct helper *h)
         h->buf = nb;
         h->cap = cap;
     }
-    int n = (int)read(h->from, h->buf + h->len, (size_t)(h->cap - h->len));
+    ssize_t n = read(h->from, h->buf + h->len, (size_t)(h->cap - h->len));
     if (n <= 0)
         return -1;
     h->len += n;
@@ -805,7 +805,7 @@ static int helper_write(struct helper *h, const void *buf, size_t n)
         }
         if (!(pf[0].revents & POLLOUT))
             continue;
-        int w = (int)write(h->to, p, n);
+        ssize_t w = write(h->to, p, n);
         if (w <= 0) {
             ok = 0;
             break;
@@ -1062,7 +1062,7 @@ static void fetch_output_selected(struct browser *b,int revents)
         struct pollfd p = { f->out, POLLIN, 0 };
         if (!(revents & (POLLIN | POLLHUP)) || poll(&p, 1, 0) <= 0)
             break;
-        int n = (int)read(f->out, f->buf + f->len, (size_t)(f->cap - f->len - 1));
+        ssize_t n = read(f->out, f->buf + f->len, (size_t)(f->cap - f->len - 1));
         if (n <= 0) {
             f->eof = 1;
             break;
@@ -2245,7 +2245,7 @@ static void media_fetched(struct browser *b, int id, const char *body, int len)
     if (fd >= 0) {
         int done = 0;
         while (done < len) {
-            int w = (int)write(fd, body + done, (size_t)(len - done));
+            ssize_t w = write(fd, body + done, (size_t)(len - done));
             if (w <= 0)
                 break;
             done += w;
@@ -2337,7 +2337,7 @@ static void engine_open(struct browser *b, struct media *m)
         }
         size_t done = 0;
         while (fd >= 0 && done < len) {
-            int w = (int)write(fd, bytes + done, len - done);
+            ssize_t w = write(fd, bytes + done, len - done);
             if (w <= 0)
                 break;
             done += (size_t)w;
@@ -2723,7 +2723,7 @@ static int js_media_cmd(void *ctx, struct node *n, const char *op, const char *s
         mkdir("/tmp", 01777);
         int fd = mkstemp(path), done = 0;
         while (fd >= 0 && done < len) {
-            int w = (int)write(fd, (const char *)bytes + done, (size_t)(len - done));
+            ssize_t w = write(fd, (const char *)bytes + done, (size_t)(len - done));
             if (w <= 0)
                 break;
             done += w;
@@ -4816,7 +4816,7 @@ static void finish_save(struct browser *b, const char *url, int quiet, const cha
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     int ok = fd >= 0;
     for (int off = 0; ok && off < len;) {
-        int n = (int)write(fd, body + off, (size_t)(len - off));
+        ssize_t n = write(fd, body + off, (size_t)(len - off));
         if (n <= 0)
             ok = 0;
         else

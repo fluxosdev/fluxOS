@@ -6,14 +6,16 @@
 #include <flux/abi.h>
 
 /*
- * The kernel is 64-bit code; processes are 32-bit code, run in the
- * processor's compatibility mode, in the segments they always had (their
- * selectors are part of the ABI: <flux/abi.h>).
+ * The kernel is 64-bit code. So are most programs, in SEG_UCODE64; a
+ * 32-bit program runs in the processor's compatibility mode, in the
+ * segments such programs always had (the selectors are part of the ABI:
+ * <flux/abi.h>).
  */
 #define SEG_KCODE 0x08                  /* 64-bit code */
 #define SEG_KDATA 0x10
 #define SEG_UCODE (0x18 | 3)            /* 32-bit code */
 #define SEG_UDATA (0x20 | 3)
+#define SEG_UCODE64 SEG_USER_CODE64     /* 64-bit code: a 64-bit program's (<flux/abi.h>) */
 #define SEG_WCODE SEG_WIN_CODE          /* Win32 programs: see <flux/abi.h> */
 #define SEG_WDATA SEG_WIN_DATA
 #define SEG_WFS   SEG_WIN_FS
@@ -26,8 +28,8 @@
 #define SYSCALL_VEC 0x80
 
 /* A register of the frame under both its names: all 64 bits, and the 32 a
- * process sees. Code that works for a process (system calls, signals) uses
- * the short names, with the arithmetic of the 32-bit registers they are. */
+ * 32-bit program sees. Code that works for one (its signals) uses the
+ * short names, with the arithmetic of the 32-bit registers they are. */
 #define REG(r64, r32) union { uint64_t r64; uint32_t r32; }
 
 /* Layout produced by isr_common in entry.S, lowest address first. */

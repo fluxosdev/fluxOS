@@ -848,7 +848,7 @@ static void unlend_screen(void)
 /* Lend the back buffer to the GPU so it can copy from it. */
 static void lend_screen(void)
 {
-    struct dispbuf b = { (uint32_t)(uintptr_t)screen.px, (uint32_t)(screen.stride * screen.h * 4), 0, 0, 0 };
+    struct dispbuf b = { (uintptr_t)screen.px, (uint32_t)(screen.stride * screen.h * 4), 0, 0, 0 };
     if (display(DISP_MAPBUF, &b) == 0) {
         screen_handle = b.handle;
         gpu_present = 1;

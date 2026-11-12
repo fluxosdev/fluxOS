@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -593,10 +594,102 @@ static int bi_umask(int argc, char **argv)
 }
 
 static int bi_hash(int argc, char **argv) { return 0; }
+
+/* ulimit [-HS] [-a] [-cdfnstuv] [limit]: a resource limit of the shell's,
+ * which the programs it runs start with. The stack's (-s, in KiB) is the
+ * one the kernel lets be set. */
+static const struct {
+    char opt;
+    int resource;
+    unsigned unit;
+    const char *what;
+} limits[] = {
+    { 'c', RLIMIT_CORE, 512, "core file size (blocks)" },
+    { 'd', RLIMIT_DATA, 1024, "data seg size (kbytes)" },
+    { 'f', RLIMIT_FSIZE, 512, "file size (blocks)" },
+    { 'n', RLIMIT_NOFILE, 1, "open files" },
+    { 's', RLIMIT_STACK, 1024, "stack size (kbytes)" },
+    { 't', RLIMIT_CPU, 1, "cpu time (seconds)" },
+    { 'u', RLIMIT_NPROC, 1, "max user processes" },
+    { 'v', RLIMIT_AS, 1024, "virtual memory (kbytes)" },
+};
+#define NLIMITS ((int)(sizeof(limits) / sizeof(limits[0])))
+
+static void print_limit(rlim_t v, unsigned unit)
+{
+    if (v == RLIM_INFINITY)
+        puts("unlimited");
+    else
+        printf("%lu\n", (unsigned long)(v / unit));
+}
+
 static int bi_ulimit(int argc, char **argv)
 {
-    if (argc < 2 || argv[argc - 1][0] == '-')
-        puts("unlimited");
+    int hard = 0, soft = 0, all = 0, which = 2;         /* (-f, as POSIX has it) */
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        for (const char *o = argv[i] + 1; *o; o++) {
+            int k = 0;
+            while (k < NLIMITS && limits[k].opt != *o)
+                k++;
+            if (*o == 'H') {
+                hard = 1;
+            } else if (*o == 'S') {
+                soft = 1;
+            } else if (*o == 'a') {
+                all = 1;
+            } else if (k < NLIMITS) {
+                which = k;
+            } else {
+                fsh_error("ulimit: -%c: unknown option", *o);
+                return 2;
+            }
+        }
+    }
+    struct rlimit rl;
+    if (all) {
+        for (int k = 0; k < NLIMITS; k++) {
+            if (getrlimit(limits[k].resource, &rl) < 0)
+                continue;
+            printf("%-26s (-%c) ", limits[k].what, limits[k].opt);
+            print_limit(hard ? rl.rlim_max : rl.rlim_cur, limits[k].unit);
+        }
+        return 0;
+    }
+    unsigned unit = limits[which].unit;
+    if (getrlimit(limits[which].resource, &rl) < 0) {
+        fsh_error("ulimit: %s", strerror(errno));
+        return 1;
+    }
+    if (i >= argc) {
+        print_limit(hard ? rl.rlim_max : rl.rlim_cur, unit);
+        return 0;
+    }
+    rlim_t v;
+    if (!strcmp(argv[i], "unlimited")) {
+        v = RLIM_INFINITY;
+    } else if (!strcmp(argv[i], "hard")) {
+        v = rl.rlim_max;
+    } else if (!strcmp(argv[i], "soft")) {
+        v = rl.rlim_cur;
+    } else {
+        char *end;
+        unsigned long long n = strtoull(argv[i], &end, 10);
+        if (end == argv[i] || *end) {
+            fsh_error("ulimit: %s: not a number", argv[i]);
+            return 2;
+        }
+        v = n >= RLIM_INFINITY / unit ? RLIM_INFINITY : (rlim_t)n * unit;
+    }
+    /* Neither -H nor -S: both limits, as other shells have it. */
+    if (hard || !soft)
+        rl.rlim_max = v;
+    if (soft || !hard)
+        rl.rlim_cur = v;
+    if (setrlimit(limits[which].resource, &rl) < 0) {
+        fsh_error("ulimit: %s: %s", argv[i], strerror(errno));
+        return 1;
+    }
     return 0;
 }
 

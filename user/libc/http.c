@@ -722,7 +722,7 @@ static int read_all(int fd, void *buf, size_t n)
 {
     char *p = buf;
     while (n) {
-        int r = (int)read(fd, p, n);
+        ssize_t r = read(fd, p, n);
         if (r <= 0)
             return -1;
         p += r;
@@ -887,7 +887,7 @@ static void cache_prune(struct http_client *cl)
             cap *= 2;
         }
         snprintf(files[n].name, sizeof(files[n].name), "%s", de->d_name);
-        files[n].size = st.st_size;
+        files[n].size = (unsigned)st.st_size;      /* (a cached response: a few MiB at most) */
         files[n].mtime = st.st_mtime;
         total += st.st_size;
         n++;

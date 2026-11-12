@@ -33,6 +33,7 @@
  * a zombie holding the shared state until the process is over.
  */
 #include "kernel.h"
+#include "compat.h"
 #include "drivers.h"
 #include "mm.h"
 #include "proc.h"
@@ -257,11 +258,31 @@ static void sched_switch(void)
 
     fpu_switch(prev, next);
     gdt_set_win_teb(next->win_teb);
-    gdt_set_tls(next->tls);             /* %gs is loaded from it on the way back to user mode */
+    proc_load_tls(next);
     if (next->kstack)
         tss_set_kernel_stack((uint64_t)(uintptr_t)next->kstack + KSTACK_SIZE);
     vmm_switch(next->pd);
     switch_context(&prev->ksp, next->ksp);
+}
+
+/*
+ * p's thread block, on this processor, which p runs on (or is about to).
+ * A 32-bit program's is the base of this processor's SEG_USER_TLS segment,
+ * which %gs is loaded from on the way back to user mode. A 64-bit
+ * program's is the base of FS itself, an address that fits no segment
+ * descriptor: FS holds no selector then, and the way back to user mode
+ * leaves a register without one alone (trapret), base and all. So FS is
+ * emptied here for either kind: no thread goes on with another's
+ * selector in it. Interrupts off.
+ */
+#define MSR_FS_BASE 0xC0000100u
+void proc_load_tls(struct proc *p)
+{
+    __asm__ volatile("movw %w0, %%fs" : : "r"(0));
+    if (p->user64)
+        wrmsr(MSR_FS_BASE, p->tls);
+    else
+        gdt_set_tls((uint32_t)p->tls);
 }
 
 /* Interrupts are off in here whatever they were, as sched_lock's saved
@@ -537,6 +558,8 @@ void proc_spawn_init(const char *path)
     setup_kstack(p, NULL, 0);
     p->pgid = p->sid = p->pid;
     p->leader->umask = 022;
+    p->leader->stack_cur = USER_STACK_MAX;
+    p->leader->stack_max = FLUX_RLIM_INFINITY;
     p->leader->cwd = vfs_root;
     vfs_ref(vfs_root);
     p->leader->ctty = &console_tty;
@@ -640,12 +663,13 @@ int do_fork(void)
     }
     proc_set_pd(child, pd);
     setup_kstack(child, parent->tf, 0);
-    child->tf->eax = 0;                         /* fork() returns 0 in the child */
+    child->tf->rax = 0;                         /* fork() returns 0 in the child */
 
     child->ppid = g->pid;                       /* only the calling thread goes on in the child */
     child->pgid = parent->pgid;
     child->sid = g->sid;
     child->no_ctty = g->no_ctty;
+    child->user64 = parent->user64;
     child->alt_sp = parent->alt_sp;
     child->alt_size = parent->alt_size;
     spin_lock(&g->fd_lock);                     /* other threads may be closing descriptors */
@@ -658,6 +682,8 @@ int do_fork(void)
     child->leader->heap_start = parent->leader->heap_start;
     child->leader->brk = parent->leader->brk;
     child->leader->stack_low = parent->leader->stack_low;
+    child->leader->stack_cur = parent->leader->stack_cur;
+    child->leader->stack_max = parent->leader->stack_max;
     memcpy(child->leader->vmas, parent->leader->vmas, sizeof(child->leader->vmas));
     mutex_unlock(&g->mm_lock);
     /* After mm_lock, which a page fault takes holding the VFS lock: never the other way round. */
@@ -696,7 +722,7 @@ static int group_stopped(const struct proc *g)
     return 0;
 }
 
-static void wake_futex(uint32_t addr);
+static void wake_futex(uint64_t addr);
 
 /* The calling thread ends, and others of its process go on (sched_lock is let go by the switch away). */
 static void exit_this_thread(struct proc *p) __attribute__((noreturn));
@@ -865,7 +891,7 @@ void do_exit(int status)
 
 /* pthread_exit(): this thread ends; the process with it if it is the last. A stack to unmap
  * (a detached thread's own) goes first, once nothing runs on it. */
-void thread_exit(uint32_t unmap_addr, uint32_t unmap_len)
+void thread_exit(uint64_t unmap_addr, uint64_t unmap_len)
 {
     struct proc *p = current, *g = p->leader;
     sti();
@@ -883,22 +909,29 @@ void thread_exit(uint32_t unmap_addr, uint32_t unmap_len)
 
 /* A new thread of the calling process, starting at entry with stack pointer stack (and eax 0),
  * with TLS base tls; clear_tid is zeroed and futex-woken when it exits. Returns its id. */
-int thread_create(uint32_t entry, uint32_t stack, uint32_t tls, uint32_t clear_tid)
+int thread_create(uint64_t entry, uint64_t stack, uint64_t tls, uint64_t clear_tid)
 {
     struct proc *me = current, *g = me->leader;
-    if (entry < USER_BASE || entry >= USER_TOP || stack < USER_BASE || stack > USER_TOP ||
-        (clear_tid && (clear_tid < USER_BASE || clear_tid > USER_TOP - 4)))
+    uint64_t top = user_top(me);
+    if (entry < USER_BASE || entry >= top || stack < USER_BASE || stack > top ||
+        (clear_tid && (clear_tid < USER_BASE || clear_tid > top - 4)) || (tls && tls >= top))
         return -EINVAL;
     struct proc *t = proc_alloc();
     if (!t)
         return -EAGAIN;
     setup_kstack(t, me->tf, 0);
-    t->tf->eax = 0;
-    t->tf->eip = entry;
-    t->tf->useresp = stack;
-    t->tf->cs = SEG_UCODE;
-    t->tf->ss = t->tf->ds = t->tf->es = t->tf->fs = SEG_UDATA;
-    t->tf->gs = tls ? SEG_USER_TLS : SEG_UDATA;
+    t->tf->rax = 0;
+    t->tf->rip = entry;
+    t->tf->rsp = stack;
+    /* Flat segments, and its thread block where its kind of program looks
+     * for it: a 32-bit one through GS, a 64-bit one through FS. */
+    t->user64 = me->user64;
+    t->tf->cs = t->user64 ? SEG_UCODE64 : SEG_UCODE;
+    t->tf->ss = t->tf->ds = t->tf->es = t->tf->fs = t->tf->gs = SEG_UDATA;
+    if (t->user64)
+        t->tf->fs = t->tf->gs = 0;          /* (FS's base is the block: proc_load_tls) */
+    else if (tls)
+        t->tf->gs = SEG_USER_TLS;
     t->tf->eflags = 0x202;
     t->leader = g;
     t->nthreads = 0;
@@ -950,6 +983,8 @@ int proc_exec_alone(struct proc *p)
     p->heap_start = g->heap_start;
     p->brk = g->brk;
     p->stack_low = g->stack_low;
+    p->stack_cur = g->stack_cur;
+    p->stack_max = g->stack_max;
     p->sid = g->sid;
     p->no_ctty = g->no_ctty;
     p->it_real_at = g->it_real_at, p->it_real_interval = g->it_real_interval;
@@ -1190,7 +1225,7 @@ static void signal_locked(struct proc *p, int sig)
     if (p->state == P_ZOMBIE && (p->leader != p || p->nthreads == 0))
         return;                         /* (a leader that ended early still stands for its threads) */
     struct proc *g = p->leader;
-    uint32_t h = g->sig_actions[sig].fsa_handler;
+    uint64_t h = g->sig_actions[sig].fsa_handler;
     if (g->pid == 1 && h < USER_BASE)
         return;
     int every = g->nthreads > 1 && (sig == SIGKILL || sig == SIGCONT ||
@@ -1235,7 +1270,7 @@ int do_tkill(int tid, int sig)
     if (!t || t->leader != me->leader || !thread_alive(t, me->leader))
         r = -ESRCH;
     else if (sig) {
-        uint32_t h = t->leader->sig_actions[sig].fsa_handler;
+        uint64_t h = t->leader->sig_actions[sig].fsa_handler;
         int ignored = sig != SIGKILL && sig != SIGSTOP &&
                       ((t->leader->sig_ignored & (1u << sig)) || h == SIGDISP_IGN ||
                        (h == SIGDISP_DFL && sig_default_ignore(sig)));
@@ -1351,15 +1386,150 @@ int signal_pending(struct proc *p)
     return (__atomic_load_n(&p->sig_pending, __ATOMIC_RELAXED) & ~mask) != 0;
 }
 
-static int user_write_range(struct proc *p, uint32_t va, const void *src, uint32_t len)
+static int user_write_range(struct proc *p, uint64_t va, const void *src, uint32_t len)
 {
-    if (va < USER_BASE || va >= USER_TOP || len > USER_TOP - va)
+    if (va < USER_BASE || va >= user_top(p) || len > user_top(p) - va)
         return -EFAULT;
-    for (uint32_t pg = ALIGN_DOWN(va, PAGE_SIZE); pg < va + len; pg += PAGE_SIZE)
+    for (uint64_t pg = ALIGN_DOWN(va, PAGE_SIZE); pg < va + len; pg += PAGE_SIZE)
         if (!vmm_write_ok(p->pd, pg) && !proc_page_fault(pg, 1))
             return -EFAULT;
     /* Another thread may unmap it meanwhile: the copy then fails instead of the kernel. */
     return uaccess_copy((void *)(uintptr_t)va, src, len);
+}
+
+/*
+ * A handler's frame on the process's stack, and the registers that start
+ * it there: the context it was interrupted in (which sigreturn puts
+ * back), the siginfo, a few instructions that call sigreturn for a
+ * program that names no restorer of its own, and the handler's arguments.
+ * -1 if the stack cannot take it. First for a 32-bit program, whose
+ * handler finds its arguments on the stack.
+ */
+static int signal_frame32(struct proc *p, struct trapframe *tf, int sig, const struct flux_sigaction *sa)
+{
+    struct flux_sigcontext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.gs = tf->gs; ctx.fs = tf->fs; ctx.es = tf->es; ctx.ds = tf->ds;
+    ctx.edi = tf->edi; ctx.esi = tf->esi; ctx.ebp = tf->ebp;
+    ctx.esp = 0;                            /* (the kernel's own, where PUSHA once left it) */
+    ctx.ebx = tf->ebx; ctx.edx = tf->edx; ctx.ecx = tf->ecx; ctx.eax = tf->eax;
+    ctx.eip = tf->eip; ctx.cs = tf->cs; ctx.eflags = tf->eflags;
+    ctx.useresp = tf->useresp; ctx.ss = tf->ss;
+    ctx.oldmask = p->sig_blocked;
+    ctx.cr2 = (uint32_t)p->fault_addr;
+    fpu_save_to(p, &ctx.fpu_used, ctx.fpu);
+
+    struct flux_siginfo32 info;
+    memset(&info, 0, sizeof(info));
+    info.fsi_signo = sig;
+    info.fsi_addr = (uint32_t)p->fault_addr;
+
+    uint8_t tramp[16] = {
+        0x8b, 0x5c, 0x24, 0x0c,             /* movl 12(%esp), %ebx */
+        0xb8, (uint8_t)SYS_sigreturn, 0x00, 0x00, 0x00,
+        0xcd, 0x80, 0x90, 0x90, 0x90, 0x90, 0x90
+    };
+
+    /* A Win32 program's stack segment is based (SEG_WDATA): its stack
+     * pointer is an offset from WIN_SEG_BASE. The handler runs in the
+     * flat segments, on the same stack; sigreturn brings the others back. */
+    int based = tf->ss == SEG_WDATA;
+    uint32_t sp = based ? tf->useresp + WIN_SEG_BASE : tf->useresp;
+    /* SA_ONSTACK: on the thread's signal stack, unless it is on it already */
+    if (!based && (sa->fsa_flags & SA_ONSTACK) && p->alt_size &&
+        !(sp > p->alt_sp && sp <= p->alt_sp + p->alt_size))
+        sp = (uint32_t)(p->alt_sp + p->alt_size);
+    uint32_t tramp_va = ALIGN_DOWN(sp - sizeof(tramp), 16u);
+    uint32_t ctx_va = ALIGN_DOWN(tramp_va - sizeof(ctx), 16u);
+    uint32_t info_va = ALIGN_DOWN(ctx_va - sizeof(info), 16u);
+    uint32_t args_va = ALIGN_DOWN(info_va - 16u, 16u);
+    uint32_t frame_sp = args_va - 4u;
+    uint32_t call_frame[5] = {
+        sa->fsa_restorer ? (uint32_t)sa->fsa_restorer : tramp_va,
+        (uint32_t)sig,
+        info_va,
+        ctx_va,
+        ctx_va,
+    };
+
+    if (user_write_range(p, tramp_va, tramp, sizeof(tramp)) < 0 ||
+        user_write_range(p, ctx_va, &ctx, sizeof(ctx)) < 0 ||
+        user_write_range(p, info_va, &info, sizeof(info)) < 0 ||
+        user_write_range(p, frame_sp, call_frame, sizeof(call_frame)) < 0)
+        return -1;
+
+    tf->rip = (uint32_t)sa->fsa_handler;
+    tf->rsp = frame_sp;
+    tf->eflags &= ~0x500u;                  /* clear DF, and TF: a SIGTRAP handler is not single-stepped */
+    if (based || tf->cs != SEG_UCODE) {
+        tf->cs = SEG_UCODE;
+        tf->ss = tf->ds = tf->es = tf->fs = SEG_UDATA;
+        if (tf->gs != SEG_USER_TLS)         /* (the handler may want its thread block) */
+            tf->gs = SEG_UDATA;
+    }
+    return 0;
+}
+
+/*
+ * The same for a 64-bit program: its sixteen registers whole, the
+ * handler's arguments in RDI, RSI and RDX, and a stack as a call leaves it
+ * (the return address at its top, 16 bytes short of an aligned address),
+ * below the 128 bytes under the stack pointer that the interrupted code
+ * may be using. The word above the return address is the context's
+ * address: where the handler returns to takes it from there for
+ * sigreturn.
+ */
+static int signal_frame64(struct proc *p, struct trapframe *tf, int sig, const struct flux_sigaction *sa)
+{
+    struct flux_sigcontext64 ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.r15 = tf->r15; ctx.r14 = tf->r14; ctx.r13 = tf->r13; ctx.r12 = tf->r12;
+    ctx.r11 = tf->r11; ctx.r10 = tf->r10; ctx.r9 = tf->r9; ctx.r8 = tf->r8;
+    ctx.rdi = tf->rdi; ctx.rsi = tf->rsi; ctx.rbp = tf->rbp; ctx.rbx = tf->rbx;
+    ctx.rdx = tf->rdx; ctx.rcx = tf->rcx; ctx.rax = tf->rax;
+    ctx.rip = tf->rip; ctx.rflags = tf->rflags; ctx.rsp = tf->rsp;
+    ctx.cs = (uint32_t)tf->cs; ctx.ss = (uint32_t)tf->ss;
+    ctx.ds = (uint32_t)tf->ds; ctx.es = (uint32_t)tf->es;
+    ctx.fs = (uint32_t)tf->fs; ctx.gs = (uint32_t)tf->gs;
+    ctx.oldmask = p->sig_blocked;
+    ctx.cr2 = p->fault_addr;
+    fpu_save_to(p, &ctx.fpu_used, ctx.fpu);
+
+    struct flux_siginfo info;
+    memset(&info, 0, sizeof(info));
+    info.fsi_signo = sig;
+    info.fsi_addr = p->fault_addr;
+
+    uint8_t tramp[16] = {
+        0x48, 0x8b, 0x1c, 0x24,             /* movq (%rsp), %rbx */
+        0xb8, (uint8_t)SYS_sigreturn, 0x00, 0x00, 0x00,
+        0xcd, 0x80, 0x0f, 0x0b, 0x90, 0x90, 0x90
+    };
+
+    uint64_t sp = tf->rsp;
+    if ((sa->fsa_flags & SA_ONSTACK) && p->alt_size && !(sp > p->alt_sp && sp <= p->alt_sp + p->alt_size))
+        sp = p->alt_sp + p->alt_size;
+    else
+        sp -= 128;                          /* the red zone */
+    uint64_t tramp_va = ALIGN_DOWN(sp - sizeof(tramp), 16u);
+    uint64_t ctx_va = ALIGN_DOWN(tramp_va - sizeof(ctx), 16u);
+    uint64_t info_va = ALIGN_DOWN(ctx_va - sizeof(info), 16u);
+    uint64_t frame_sp = ALIGN_DOWN(info_va - 16u, 16u) - 8u;
+    uint64_t call_frame[2] = { sa->fsa_restorer ? sa->fsa_restorer : tramp_va, ctx_va };
+
+    if (user_write_range(p, tramp_va, tramp, sizeof(tramp)) < 0 ||
+        user_write_range(p, ctx_va, &ctx, sizeof(ctx)) < 0 ||
+        user_write_range(p, info_va, &info, sizeof(info)) < 0 ||
+        user_write_range(p, frame_sp, call_frame, sizeof(call_frame)) < 0)
+        return -1;
+
+    tf->rdi = (uint32_t)sig;
+    tf->rsi = info_va;
+    tf->rdx = ctx_va;
+    tf->rip = sa->fsa_handler;
+    tf->rsp = frame_sp;
+    tf->rflags &= ~0x500ull;                /* clear DF, and TF: a SIGTRAP handler is not single-stepped */
+    return 0;
 }
 
 /*
@@ -1384,8 +1554,8 @@ static int try_stop(struct proc *p, int sig, uint32_t mask)
          * another signal's handler is about to run and decide that. */
         struct trapframe *tf = p->tf;
         if (p->in_syscall > 0 && tf->eax == (uint32_t)-EINTR && !(pending & ~mask & ~bit)) {
-            tf->eax = p->syscall_orig_eax;
-            tf->eip -= 2;
+            tf->rax = p->syscall_orig_eax;
+            tf->rip -= 2;
             p->in_syscall = 0;
         }
         p->state = P_STOPPED;
@@ -1437,61 +1607,13 @@ void proc_check_signals(void)
         if (p->in_syscall > 0 && tf->eax == (uint32_t)-EINTR) {
             if ((sa.fsa_flags & SA_RESTART) &&
                 p->in_syscall != SYS_sleep && p->in_syscall != SYS_poll) {
-                tf->eax = p->syscall_orig_eax;
-                tf->eip -= 2;
+                tf->rax = p->syscall_orig_eax;
+                tf->rip -= 2;
             }
             p->in_syscall = 0;
         }
 
-        struct flux_sigcontext ctx;
-        memset(&ctx, 0, sizeof(ctx));
-        ctx.gs = tf->gs; ctx.fs = tf->fs; ctx.es = tf->es; ctx.ds = tf->ds;
-        ctx.edi = tf->edi; ctx.esi = tf->esi; ctx.ebp = tf->ebp;
-        ctx.esp = 0;                            /* (the kernel's own, where PUSHA once left it) */
-        ctx.ebx = tf->ebx; ctx.edx = tf->edx; ctx.ecx = tf->ecx; ctx.eax = tf->eax;
-        ctx.eip = tf->eip; ctx.cs = tf->cs; ctx.eflags = tf->eflags;
-        ctx.useresp = tf->useresp; ctx.ss = tf->ss;
-        ctx.oldmask = p->sig_blocked;
-        ctx.cr2 = p->fault_addr;
-        fpu_save_to(p, &ctx.fpu_used, ctx.fpu);
-
-        struct flux_siginfo info;
-        memset(&info, 0, sizeof(info));
-        info.fsi_signo = sig;
-        info.fsi_addr = p->fault_addr;
-
-        uint8_t tramp[16] = {
-            0x8b, 0x5c, 0x24, 0x0c,             /* movl 12(%esp), %ebx */
-            0xb8, (uint8_t)SYS_sigreturn, 0x00, 0x00, 0x00,
-            0xcd, 0x80, 0x90, 0x90, 0x90, 0x90, 0x90
-        };
-
-        /* A Win32 program's stack segment is based (SEG_WDATA): its stack
-         * pointer is an offset from WIN_SEG_BASE. The handler runs in the
-         * flat segments, on the same stack; sigreturn brings the others back. */
-        int based = tf->ss == SEG_WDATA;
-        uint32_t sp = based ? tf->useresp + WIN_SEG_BASE : tf->useresp;
-        /* SA_ONSTACK: on the thread's signal stack, unless it is on it already */
-        if (!based && (sa.fsa_flags & SA_ONSTACK) && p->alt_size &&
-            !(sp > p->alt_sp && sp <= p->alt_sp + p->alt_size))
-            sp = p->alt_sp + p->alt_size;
-        uint32_t tramp_va = ALIGN_DOWN(sp - sizeof(tramp), 16u);
-        uint32_t ctx_va = ALIGN_DOWN(tramp_va - sizeof(ctx), 16u);
-        uint32_t info_va = ALIGN_DOWN(ctx_va - sizeof(info), 16u);
-        uint32_t args_va = ALIGN_DOWN(info_va - 16u, 16u);
-        uint32_t frame_sp = args_va - 4u;
-        uint32_t call_frame[5] = {
-            sa.fsa_restorer ? sa.fsa_restorer : tramp_va,
-            (uint32_t)sig,
-            info_va,
-            ctx_va,
-            ctx_va,
-        };
-
-        if (user_write_range(p, tramp_va, tramp, sizeof(tramp)) < 0 ||
-            user_write_range(p, ctx_va, &ctx, sizeof(ctx)) < 0 ||
-            user_write_range(p, info_va, &info, sizeof(info)) < 0 ||
-            user_write_range(p, frame_sp, call_frame, sizeof(call_frame)) < 0)
+        if ((p->user64 ? signal_frame64(p, tf, sig, &sa) : signal_frame32(p, tf, sig, &sa)) < 0)
             do_exit(SIGSEGV);
 
         spin_lock(&sched_lock);
@@ -1500,22 +1622,12 @@ void proc_check_signals(void)
             p->sig_blocked |= bit;
         p->sig_blocked &= ~((1u << SIGKILL) | (1u << SIGSTOP));
         spin_unlock(&sched_lock);
-
-        tf->eip = sa.fsa_handler;
-        tf->useresp = frame_sp;
-        tf->eflags &= ~0x500u;                  /* clear DF, and TF: a SIGTRAP handler is not single-stepped */
-        if (based || tf->cs != SEG_UCODE) {
-            tf->cs = SEG_UCODE;
-            tf->ss = tf->ds = tf->es = tf->fs = SEG_UDATA;
-            if (tf->gs != SEG_USER_TLS)         /* (the handler may want its thread block) */
-                tf->gs = SEG_UDATA;
-        }
         break;
     }
     p->in_syscall = 0;
 }
 
-static struct proc_vma *find_vma(struct proc *p, uint32_t addr)
+static struct proc_vma *find_vma(struct proc *p, uint64_t addr)
 {
     for (int i = 0; i < MAX_VMAS; i++) {
         struct proc_vma *v = &p->leader->vmas[i];
@@ -1548,9 +1660,9 @@ static void coalesce_vmas(struct proc *p)
     }
 }
 
-uint32_t proc_vma_lowest(const struct proc *p)
+uint64_t proc_vma_lowest(const struct proc *p)
 {
-    uint32_t low = USER_MMIO_BASE;
+    uint64_t low = user_mmap_top(p);
     for (int i = 0; i < MAX_VMAS; i++)
         if (p->leader->vmas[i].end > p->leader->vmas[i].start && p->leader->vmas[i].start < low)
             low = p->leader->vmas[i].start;
@@ -1559,7 +1671,7 @@ uint32_t proc_vma_lowest(const struct proc *p)
 
 /* Free VMA slots once [addr, end) is unmapped: negative if splitting a
  * mapping around it would not fit. */
-static int vma_slots_after_unmap(const struct proc *p, uint32_t addr, uint32_t end)
+static int vma_slots_after_unmap(const struct proc *p, uint64_t addr, uint64_t end)
 {
     int slots = 0;
     for (int i = 0; i < MAX_VMAS; i++) {
@@ -1572,13 +1684,13 @@ static int vma_slots_after_unmap(const struct proc *p, uint32_t addr, uint32_t e
     return slots;
 }
 
-static int munmap_locked(struct proc *p, uint32_t addr, uint32_t len)
+static int munmap_locked(struct proc *p, uint64_t addr, uint64_t len)
 {
     if (!len || (addr & (PAGE_SIZE - 1)))
         return -EINVAL;
-    uint32_t end = ALIGN_UP(addr + len, PAGE_SIZE);
-    if (addr < USER_BASE || end > USER_MMIO_BASE || end <= addr)
+    if (addr < USER_BASE || addr >= user_mmap_top(p) || len > user_mmap_top(p) - addr)
         return -EINVAL;
+    uint64_t end = ALIGN_UP(addr + len, PAGE_SIZE);
     if (fb_pinned(p->leader->pid, addr, end))
         return -EBUSY;
     if (vma_slots_after_unmap(p, addr, end) < 0)
@@ -1595,7 +1707,7 @@ static int munmap_locked(struct proc *p, uint32_t addr, uint32_t len)
         } else if (end >= v->end) {
             v->end = addr;
         } else {
-            uint32_t old_end = v->end;
+            uint64_t old_end = v->end;
             v->end = addr;
             for (int k = 0; k < MAX_VMAS; k++) {
                 if (p->leader->vmas[k].end <= p->leader->vmas[k].start) {
@@ -1608,20 +1720,19 @@ static int munmap_locked(struct proc *p, uint32_t addr, uint32_t len)
             }
         }
     }
-    for (uint32_t va = addr; va < end; va += PAGE_SIZE)
-        vmm_free_page(p->pd, va);
+    vmm_free_range(p->pd, addr, end);
     return 0;
 }
 
-static int mprotect_locked(struct proc *p, uint32_t addr, uint32_t len, uint32_t prot)
+static int mprotect_locked(struct proc *p, uint64_t addr, uint64_t len, uint32_t prot)
 {
     if ((addr & (PAGE_SIZE - 1)) || (prot & ~(uint32_t)(PROT_READ | PROT_WRITE | PROT_EXEC)))
         return -EINVAL;
     if (!len)
         return 0;
-    uint32_t end = ALIGN_UP(addr + len, PAGE_SIZE);
-    if (addr < USER_BASE || end > USER_STACK_TOP || end <= addr)
+    if (addr < USER_BASE || addr >= user_top(p) || len > user_top(p) - addr)
         return -EINVAL;
+    uint64_t end = ALIGN_UP(addr + len, PAGE_SIZE);
 
     int free_slots = 0, need_slots = 0;
     for (int i = 0; i < MAX_VMAS; i++) {
@@ -1638,7 +1749,7 @@ static int mprotect_locked(struct proc *p, uint32_t addr, uint32_t len, uint32_t
     if (need_slots > free_slots)
         return -ENOMEM;
 
-    for (uint32_t va = addr; va < end; va += PAGE_SIZE) {
+    for (uint64_t va = addr; va < end; va += PAGE_SIZE) {
         if (!vmm_pte_present(p->pd, va) && !find_vma(p, va))
             return -ENOMEM;
     }
@@ -1647,9 +1758,9 @@ static int mprotect_locked(struct proc *p, uint32_t addr, uint32_t len, uint32_t
         struct proc_vma *v = &p->leader->vmas[i];
         if (v->end <= v->start || v->prot == prot || end <= v->start || addr >= v->end)
             continue;
-        uint32_t orig_start = v->start, orig_end = v->end;
+        uint64_t orig_start = v->start, orig_end = v->end;
         uint32_t orig_prot = v->prot, orig_flags = v->flags;
-        uint32_t mid_s = MAX(addr, orig_start), mid_e = MIN(end, orig_end);
+        uint64_t mid_s = MAX(addr, orig_start), mid_e = MIN(end, orig_end);
         v->start = mid_s;
         v->end = mid_e;
         v->prot = prot;
@@ -1671,14 +1782,15 @@ static int mprotect_locked(struct proc *p, uint32_t addr, uint32_t len, uint32_t
         }
     }
     coalesce_vmas(p);
-    for (uint32_t va = addr; va < end; va += PAGE_SIZE)
+    for (uint64_t va = addr; va < end; va += PAGE_SIZE)
         if (vmm_pte_present(p->pd, va))
             vmm_protect_page(p->pd, va, prot);
     return 0;
 }
 
-static int mmap_locked(struct proc *p, const struct flux_mmap_args *a, uint32_t *out)
+static int mmap_locked(struct proc *p, const struct flux_mmap_args *a, uint64_t *out)
 {
+    const uint64_t top = user_mmap_top(p);  /* mappings are below this */
     if (!a->len)
         return -EINVAL;
     int shared = (a->flags & MAP_SHARED) != 0;
@@ -1687,15 +1799,15 @@ static int mmap_locked(struct proc *p, const struct flux_mmap_args *a, uint32_t 
         return -EINVAL;
     if ((a->prot & ~(uint32_t)(PROT_READ | PROT_WRITE | PROT_EXEC)))
         return -EINVAL;
-    uint32_t len = ALIGN_UP(a->len, PAGE_SIZE);
-    if (len < a->len || len > USER_MMIO_BASE - USER_BASE)
+    uint64_t len = ALIGN_UP(a->len, PAGE_SIZE);
+    if (len < a->len || len > top - USER_BASE)
         return -ENOMEM;
 
-    uint32_t brk_end = ALIGN_UP(p->leader->brk, PAGE_SIZE);
-    uint32_t start = 0;
+    uint64_t brk_end = ALIGN_UP(p->leader->brk, PAGE_SIZE);
+    uint64_t start = 0;
     if (a->flags & MAP_FIXED) {
         if ((a->addr & (PAGE_SIZE - 1)) || a->addr < brk_end ||
-            a->addr >= USER_MMIO_BASE || len > USER_MMIO_BASE - a->addr)
+            a->addr >= top || len > top - a->addr)
             return -EINVAL;
         /* The new mapping's slot must be there before the old one goes. */
         if (vma_slots_after_unmap(p, a->addr, a->addr + len) < 1)
@@ -1705,9 +1817,9 @@ static int mmap_locked(struct proc *p, const struct flux_mmap_args *a, uint32_t 
             return r;
         start = a->addr;
     } else {
-        uint32_t floor = brk_end + 0x100000u <= USER_MMIO_BASE - len ? brk_end + 0x100000u : brk_end;
-        uint32_t hint = ALIGN_DOWN(a->addr, PAGE_SIZE);
-        if (hint >= floor && hint < USER_MMIO_BASE && len <= USER_MMIO_BASE - hint) {
+        uint64_t floor = brk_end + 0x100000u <= top - len ? brk_end + 0x100000u : brk_end;
+        uint64_t hint = ALIGN_DOWN((uint64_t)a->addr, PAGE_SIZE);
+        if (hint >= floor && hint < top && len <= top - hint) {
             int ok = 1;
             for (int i = 0; i < MAX_VMAS; i++) {
                 const struct proc_vma *v = &p->leader->vmas[i];
@@ -1720,12 +1832,12 @@ static int mmap_locked(struct proc *p, const struct flux_mmap_args *a, uint32_t 
                 start = hint;
         }
         if (!start) {
-            uint32_t cand_end = USER_MMIO_BASE;
+            uint64_t cand_end = top;
             for (int moved = 1; moved;) {
                 moved = 0;
                 if (cand_end < floor || cand_end - floor < len)    /* (floor + len may wrap) */
                     return -ENOMEM;
-                uint32_t cand_start = cand_end - len;
+                uint64_t cand_start = cand_end - len;
                 for (int i = 0; i < MAX_VMAS; i++) {
                     const struct proc_vma *v = &p->leader->vmas[i];
                     if (v->end > v->start && v->start < cand_end && cand_start < v->end) {
@@ -1756,9 +1868,9 @@ static int mmap_locked(struct proc *p, const struct flux_mmap_args *a, uint32_t 
     if (!(a->flags & MAP_KFRAMES) &&
         (shared || !(a->flags & MAP_ANONYMOUS) || (len <= 64 * 1024 && a->prot != PROT_NONE))) {
         uint32_t init_prot = !(a->flags & MAP_ANONYMOUS) ? (a->prot | PROT_WRITE) : a->prot;
-        for (uint32_t va = start; va < start + len; va += PAGE_SIZE) {
+        for (uint64_t va = start; va < start + len; va += PAGE_SIZE) {
             if (vmm_alloc_prot(p->pd, va, init_prot, a->flags) < 0) {
-                for (uint32_t u = start; u < va; u += PAGE_SIZE)
+                for (uint64_t u = start; u < va; u += PAGE_SIZE)
                     vmm_free_page(p->pd, u);
                 return -ENOMEM;
             }
@@ -1793,7 +1905,7 @@ static void mm_leave(struct proc *p, int locked)
         mutex_unlock(&p->leader->mm_lock);
 }
 
-int proc_munmap(struct proc *p, uint32_t addr, uint32_t len)
+int proc_munmap(struct proc *p, uint64_t addr, uint64_t len)
 {
     int locked = mm_enter(p);
     int r = munmap_locked(p, addr, len);
@@ -1801,7 +1913,7 @@ int proc_munmap(struct proc *p, uint32_t addr, uint32_t len)
     return r;
 }
 
-int proc_mprotect(struct proc *p, uint32_t addr, uint32_t len, uint32_t prot)
+int proc_mprotect(struct proc *p, uint64_t addr, uint64_t len, uint32_t prot)
 {
     int locked = mm_enter(p);
     int r = mprotect_locked(p, addr, len, prot);
@@ -1809,7 +1921,7 @@ int proc_mprotect(struct proc *p, uint32_t addr, uint32_t len, uint32_t prot)
     return r;
 }
 
-int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint32_t *out)
+int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint64_t *out)
 {
     int locked = mm_enter(p);
     int r = mmap_locked(p, a, out);
@@ -1819,18 +1931,18 @@ int proc_mmap(struct proc *p, const struct flux_mmap_args *a, uint32_t *out)
 
 /* Map npages frames, read-write and shared, where there is room. Each frame comes with the reference
  * its mapping is to hold; on failure none is taken and the references are the caller's still. */
-int proc_map_frames(struct proc *p, const uint32_t *frames, uint32_t npages, uint32_t *out)
+int proc_map_frames(struct proc *p, const uint32_t *frames, uint32_t npages, uint64_t *out)
 {
     struct flux_mmap_args a = {
-        .len = npages * PAGE_SIZE, .prot = PROT_READ | PROT_WRITE,
+        .len = (uint64_t)npages * PAGE_SIZE, .prot = PROT_READ | PROT_WRITE,
         .flags = MAP_SHARED | MAP_ANONYMOUS | MAP_KFRAMES, .fd = -1,
     };
-    if (!npages || npages > (USER_MMIO_BASE - USER_BASE) / PAGE_SIZE)
+    if (!npages || npages > (USER_MMIO_BASE - USER_BASE) / PAGE_SIZE)   /* (segments are under 2 GiB) */
         return -EINVAL;
     int locked = mm_enter(p);
     int r = mmap_locked(p, &a, out);
     for (uint32_t i = 0; r == 0 && i < npages; i++) {
-        if (vmm_map_frame(p->pd, *out + i * PAGE_SIZE, frames[i], a.prot) < 0) {
+        if (vmm_map_frame(p->pd, *out + (uint64_t)i * PAGE_SIZE, frames[i], a.prot) < 0) {
             /* Give back the references of the pages mapped so far by taking new ones for them:
              * unmapping drops what the mappings hold, and the caller still has its own. */
             for (uint32_t j = 0; j < i; j++)
@@ -1843,17 +1955,17 @@ int proc_map_frames(struct proc *p, const uint32_t *frames, uint32_t npages, uin
     return r;
 }
 
-static int page_fault_locked(struct proc *p, uint32_t addr, int write);
+static int page_fault_locked(struct proc *p, uint64_t addr, int write);
 
 /* Resolve a user page fault: COW break, demand-paged mmap VMA or stack growth.
  * Not in kernel code holding a spinlock, which cannot wait for mm_lock: a fault
  * there would race with the other threads' (two COW breaks of one frame free it
  * twice). The kernel copies user memory with nothing held, so that is a bug, or
  * a race with munmap: the copy fails (uaccess_copy) instead. */
-int proc_page_fault(uint32_t addr, int write)
+int proc_page_fault(uint64_t addr, int write)
 {
     struct proc *p = current;
-    if (!p || p->kthread || addr < USER_BASE || addr >= USER_TOP)
+    if (!p || p->kthread || addr < USER_BASE || addr >= user_top(p))
         return 0;
     int locked = mm_enter(p);
     if (!locked)
@@ -1863,7 +1975,7 @@ int proc_page_fault(uint32_t addr, int write)
     return r;
 }
 
-static int page_fault_locked(struct proc *p, uint32_t addr, int write)
+static int page_fault_locked(struct proc *p, uint64_t addr, int write)
 {
     if (vmm_pte_present(p->pd, addr)) {
         if (!vmm_translate(p->pd, addr))
@@ -1876,18 +1988,38 @@ static int page_fault_locked(struct proc *p, uint32_t addr, int write)
             return 0;
         return vmm_alloc_prot(p->pd, addr, v->prot, v->flags) == 0;
     }
-    if (addr < USER_STACK_LIMIT || addr >= USER_STACK_TOP || addr < p->leader->brk)
+    if (addr < user_stack_limit(p) || addr >= user_top(p) || addr < p->leader->brk)
         return 0;
     if (vmm_alloc(p->pd, addr) < 0)
         return 0;
-    uint32_t page = ALIGN_DOWN(addr, PAGE_SIZE);
+    uint64_t page = ALIGN_DOWN(addr, PAGE_SIZE);
     if (page < p->leader->stack_low)
         p->leader->stack_low = page;
     return 1;
 }
 
+void proc_stack_rlimit(struct proc *p, struct flux_rlimit *l)
+{
+    int locked = mm_enter(p);
+    l->cur = p->leader->stack_cur;
+    l->max = p->leader->stack_max;
+    mm_leave(p, locked);
+}
+
+/* (One user, who is root: the hard limit may be raised as well as lowered.) */
+int proc_set_stack_rlimit(struct proc *p, const struct flux_rlimit *l)
+{
+    if (l->cur > l->max || l->cur < STACK_LIMIT_MIN)
+        return -EINVAL;
+    int locked = mm_enter(p);
+    p->leader->stack_cur = l->cur;
+    p->leader->stack_max = l->max;
+    mm_leave(p, locked);
+    return 0;
+}
+
 /* Demand-grow the user stack or fault in a demand-paged VMA. */
-int proc_grow_stack(uint32_t addr)
+int proc_grow_stack(uint64_t addr)
 {
     return proc_page_fault(addr, 0);
 }
@@ -1902,23 +2034,23 @@ int proc_grow_stack(uint32_t addr)
  */
 static uint8_t futex_chans[64];
 
-static void *futex_chan(const struct proc *g, uint32_t addr)
+static void *futex_chan(const struct proc *g, uint64_t addr)
 {
-    uint32_t h = ((uint32_t)(uintptr_t)g >> 4) * 2654435761u ^ (addr >> 2) * 40503u;
+    uint32_t h = ((uint32_t)(uintptr_t)g >> 4) * 2654435761u ^ (uint32_t)(addr >> 2 ^ addr >> 34) * 40503u;
     return &futex_chans[(h ^ h >> 13) % sizeof(futex_chans)];
 }
 
-static void wake_futex(uint32_t addr)
+static void wake_futex(uint64_t addr)
 {
     wakeup(futex_chan(current->leader, addr));
 }
 
 /* Sleep while the word at addr is val: 0 when woken (perhaps spuriously), -EAGAIN if it was not val,
  * -ETIMEDOUT after timeout_ms (< 0: no limit), -EINTR for a signal. */
-int futex_wait(uint32_t addr, uint32_t val, int timeout_ms)
+int futex_wait(uint64_t addr, uint32_t val, int timeout_ms)
 {
     struct proc *p = current;
-    if ((addr & 3) || addr < USER_BASE || addr > USER_TOP - 4)
+    if ((addr & 3) || addr < USER_BASE || addr > user_top(p) - 4)
         return -EINVAL;
     if (timeout_ms == 0)
         return -ETIMEDOUT;
@@ -1954,9 +2086,9 @@ int futex_wait(uint32_t addr, uint32_t val, int timeout_ms)
     return 0;
 }
 
-int futex_wake(uint32_t addr, int n)
+int futex_wake(uint64_t addr, int n)
 {
-    if ((addr & 3) || addr < USER_BASE || addr > USER_TOP - 4)
+    if ((addr & 3) || addr < USER_BASE || addr > user_top(current) - 4)
         return -EINVAL;
     if (n > 0)
         wake_futex(addr);

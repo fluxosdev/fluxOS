@@ -44,7 +44,7 @@ static int out_write(void *ctx, const void *p, size_t n)
     o->size += (uint32_t)n;
     const uint8_t *q = p;
     while (n) {
-        int w = (int)write(o->fd, q, n);
+        ssize_t w = write(o->fd, q, n);
         if (w <= 0) {
             o->err = errno ? errno : EIO;
             return -1;
@@ -59,7 +59,7 @@ static int write_all(int fd, const void *p, size_t n)
 {
     const uint8_t *q = p;
     while (n) {
-        int w = (int)write(fd, q, n);
+        ssize_t w = write(fd, q, n);
         if (w <= 0)
             return -1;
         q += w;
@@ -279,7 +279,7 @@ static int list_file(int fd, const char *path)
     if (expanded_name(path, shown, sizeof(shown)) < 0)
         snprintf(shown, sizeof(shown), "%s", path);
     double ratio = o.size ? 100.0 * (1.0 - (double)st.st_size / (double)o.size) : 0;
-    printf("%10u %10u %5.1f%% %s\n", (unsigned)st.st_size, o.size, ratio < 0 ? 0 : ratio, shown);
+    printf("%10llu %10u %5.1f%% %s\n", (unsigned long long)st.st_size, o.size, ratio < 0 ? 0 : ratio, shown);
     return 0;
 }
 

@@ -152,9 +152,17 @@ extern "C" {
 #define S_ISSOCK(m) (((m) & S_IFMT) == S_IFSOCK)
 #define S_ISLNK(m)  (((m) & S_IFMT) == S_IFLNK)
 
-/* POSIX's fields, as plain 32-bit numbers. Ownership is cosmetic (one
- * user, uid 0), and the three times are the filesystem's one time until
- * it keeps more. st_dev tells mounted filesystems apart, not disks. */
+/* A file's size or a position in one (off_t), and a count of its blocks:
+ * 64 bits in a 64-bit program, the 32 they always were in a 32-bit one,
+ * where a file of 2 GiB or more cannot be told of (stat fails with
+ * EOVERFLOW) and lseek64 reaches the positions past that. */
+typedef intptr_t  flux_off_t;
+typedef uintptr_t flux_blkcnt_t;
+
+/* POSIX's fields, as plain 32-bit numbers but for the size and the count
+ * of blocks. Ownership is cosmetic (one user, uid 0), and the three times
+ * are the filesystem's one time until it keeps more. st_dev tells mounted
+ * filesystems apart, not disks. */
 struct stat {
     uint32_t st_dev;            /* the filesystem the file is on */
     uint32_t st_ino;
@@ -163,9 +171,9 @@ struct stat {
     uint32_t st_uid;
     uint32_t st_gid;
     uint32_t st_rdev;           /* device number for device nodes */
-    int32_t  st_size;           /* off_t: files are under 2 GiB */
+    flux_off_t st_size;
     uint32_t st_blksize;        /* the preferred I/O size */
-    uint32_t st_blocks;         /* 512-byte blocks */
+    flux_blkcnt_t st_blocks;    /* 512-byte blocks */
     int32_t  st_atime;          /* time_t */
     int32_t  st_mtime;
     int32_t  st_ctime;
@@ -260,6 +268,12 @@ struct dirent {
 #define SIG_SETMASK 2
 #endif
 
+/*
+ * Addresses and sizes in the structures below are as wide as the program's
+ * own pointers (uintptr_t): four bytes in a 32-bit program, eight in a
+ * 64-bit one, whose addresses do not fit 32 bits. The kernel reads and
+ * writes each kind of program's layout.
+ */
 struct flux_siginfo {
     int32_t  fsi_signo;
     int32_t  fsi_errno;
@@ -267,7 +281,7 @@ struct flux_siginfo {
     int32_t  fsi_pid;
     uint32_t fsi_uid;
     int32_t  fsi_status;
-    uint32_t fsi_addr;
+    uintptr_t fsi_addr;
 };
 
 struct flux_sigcontext {
@@ -280,16 +294,36 @@ struct flux_sigcontext {
     uint8_t  fpu[512] __attribute__((aligned(16)));
 };
 
+/*
+ * The same for a 64-bit program: all sixteen registers, whole. A handler
+ * is called as the 64-bit calling convention has it (the signal number,
+ * the siginfo and this in RDI, RSI and RDX), on a stack that leaves the
+ * 128 bytes below the interrupted code's stack pointer alone.
+ */
+struct flux_sigcontext64 {
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rdi, rsi, rbp, rbx, rdx, rcx, rax;
+    uint64_t rip, rflags, rsp;
+    uint32_t cs, ss, ds, es, fs, gs;
+    uint32_t oldmask;
+    int32_t  fpu_used;
+    uint64_t cr2;
+    uint32_t reserved[2];
+    uint8_t  fpu[512] __attribute__((aligned(16)));
+};
+
 struct flux_sigaction {
-    uint32_t fsa_handler;       /* user handler address, SIGDISP_DFL or SIGDISP_IGN */
+    uintptr_t fsa_handler;      /* user handler address, SIGDISP_DFL or SIGDISP_IGN */
     uint32_t fsa_mask;
     uint32_t fsa_flags;
-    uint32_t fsa_restorer;      /* user signal return trampoline */
+    uintptr_t fsa_restorer;     /* user signal return trampoline */
 };
 
 /* SYS_sigaltstack: where SA_ONSTACK handlers run (a thread's own). */
 struct flux_stack {
-    uint32_t sp, flags, size;   /* flags: SS_ONSTACK (reported), SS_DISABLE */
+    uintptr_t sp;
+    uint32_t flags;             /* SS_ONSTACK (reported), SS_DISABLE */
+    uintptr_t size;
 };
 #ifndef SS_ONSTACK
 #define SS_ONSTACK 1
@@ -326,13 +360,28 @@ struct flux_itimer {
 #endif
 
 struct flux_mmap_args {
-    uint32_t addr;
-    uint32_t len;
+    uintptr_t addr;
+    uintptr_t len;
     uint32_t prot;
     uint32_t flags;
     int32_t  fd;
-    uint32_t offset;
+    uintptr_t offset;           /* where in the file (an off_t), a multiple of the page size */
 };
+
+/* ---- resource limits (SYS_getrlimit, SYS_setrlimit) ---- */
+#define FLUX_RLIMIT_STACK  3            /* the one the kernel keeps: <sys/resource.h>'s RLIMIT_STACK */
+#define FLUX_RLIM_INFINITY (~0ull)
+
+/* In bytes, the same in every program. cur is what is enforced (the soft
+ * limit) and may be anything up to max, the hard limit. */
+struct flux_rlimit {
+    uint64_t cur, max;
+};
+
+/* The room a program's address space has for its first stack, which is what
+ * a limit above it comes to: a 64-bit program's and a 32-bit one's. */
+#define FLUX_STACK_ROOM64 0x0000010000000000ull
+#define FLUX_STACK_ROOM32 0x02000000u
 
 /* ---- shared memory segments (SYS_shmget, SYS_shmat, SYS_shmctl), System V style ---- */
 #ifndef IPC_PRIVATE
@@ -370,6 +419,20 @@ struct flux_shmid_ds {
 
 /* A thread's TLS segment: %gs:0 is the start of its thread block (SYS_set_tls, SYS_thread_create). */
 #define SEG_USER_TLS   (0xC0 | 3)
+/*
+ * A 64-bit program's code segment (the kernel starts one in it: an ELF64
+ * executable for x86-64). Such a program runs in 64-bit mode and makes the
+ * same system calls as a 32-bit one (int 0x80, the number in EAX), with
+ * the arguments in RBX, RCX, RDX, RSI and RDI and the result in RAX, all
+ * 64 bits of them: it is loaded at 0x40000000 like a 32-bit program, but
+ * its heap, its mappings and its stack are above 4 GiB. The structures
+ * are the same but for those that hold an address, which are as wide in
+ * it as its pointers. Its thread block is reached through FS, as the
+ * 64-bit ABI has it: SYS_set_tls makes the block's address FS's base (no
+ * selector is loaded: the base would not fit a segment's); a 32-bit
+ * program loads SEG_USER_TLS into GS.
+ */
+#define SEG_USER_CODE64 (0x40 | 3)
 
 /* ---- utime(2) and times(2) ---- */
 struct flux_utimbuf {
@@ -602,7 +665,8 @@ struct dispcopy {
  * at. A Radeon's buffers keep its 3D engine's rules: surfaces start on a
  * 256 byte boundary and lines are a multiple of 256 bytes. */
 struct dispbuf {
-    uint32_t addr, size;
+    uintptr_t addr;
+    uint32_t size;
     uint32_t handle;
     uint32_t gpu_lo, gpu_hi;
 };

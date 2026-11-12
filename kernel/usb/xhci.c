@@ -14,7 +14,7 @@
  * TRB that interrupts; every TRB asks to start as soon as possible, which
  * on a running endpoint means the service interval after the one before.
  *
- * The register window must lie below 4 GiB (this kernel has no PAE).
+ * The register window may be anywhere (pci_map_bar() maps a 64-bit BAR whole).
  */
 #include "kernel.h"
 #include "arch.h"
@@ -1154,7 +1154,7 @@ static void xhci_init(const struct pci_dev *pci)
         return;
     x->cap = pci_map_bar(pci, PCI_BAR0);
     if (!x->cap) {
-        klog("xhci: registers above 4 GiB or missing; controller not used\n");
+        klog("xhci: no registers to map; controller not used\n");
         kfree(x);
         return;
     }

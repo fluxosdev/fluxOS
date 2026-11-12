@@ -83,7 +83,7 @@ static int run(char *const *argv, struct buf *out, struct buf *err)
         for (int i = 0; i < 2; i++) {
             if (fds[i].fd < 0 || !fds[i].revents)
                 continue;
-            int r = (int)read(fds[i].fd, chunk, sizeof(chunk));
+            ssize_t r = read(fds[i].fd, chunk, sizeof(chunk));
             if (r > 0) {
                 buf_add(i ? err : out, chunk, (size_t)r);
             } else {

@@ -145,7 +145,7 @@ int gethostname(char *name, size_t size);
 int sethostname(const char *name, size_t size);
 int nice(int inc);
 
-void *sbrk(int incr);
+void *sbrk(intptr_t incr);
 int brk(void *addr);
 unsigned int sleep(unsigned int seconds);
 int usleep(unsigned int usec);

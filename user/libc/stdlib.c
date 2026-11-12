@@ -4,11 +4,13 @@
  */
 #include <ctype.h>
 #include <errno.h>
+#include <flux.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include "pthread_impl.h"
 
@@ -49,9 +51,43 @@ const char *__progname = "";
 char *program_invocation_name = "";
 char *program_invocation_short_name = "";
 
+/* Where the stack this started on ends: the kernel puts the arguments'
+ * and the environment's strings at its very end, their pointers below. */
+static uintptr_t stack_end;
+
+static void find_stack_end(char **argv, char **envp)
+{
+    char **last = envp;
+    uintptr_t end = 0;
+    for (char **v = argv; *v; v++)
+        end = (uintptr_t)*v + strlen(*v) + 1 > end ? (uintptr_t)*v + strlen(*v) + 1 : end;
+    for (; *last; last++)
+        end = (uintptr_t)*last + strlen(*last) + 1 > end ? (uintptr_t)*last + strlen(*last) + 1 : end;
+    if (!end)
+        end = (uintptr_t)(last + 1);    /* no strings: the pointers are the end */
+    stack_end = (end + 4095) & ~(uintptr_t)4095;
+}
+
+/* It may grow down as far as its limit lets it (RLIMIT_STACK), within the
+ * room the address space has for it. */
+void flux_main_stack(void **low, void **high)
+{
+#ifdef __x86_64__
+    uintptr_t size = FLUX_STACK_ROOM64;
+#else
+    uintptr_t size = FLUX_STACK_ROOM32;
+#endif
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur < size)
+        size = rl.rlim_cur;
+    *high = (void *)stack_end;
+    *low = (void *)(stack_end - size);
+}
+
 void __libc_start(int argc, char **argv, char **envp)
 {
     __init_tls();                       /* errno is the thread's: before anything can set it */
+    find_stack_end(argv, envp);
     environ = envp;
     if (argc > 0 && argv[0]) {
         const char *slash = strrchr(argv[0], '/');
@@ -140,19 +176,22 @@ void abort(void)
 
 #define ALIGN     16u
 #define HDR       16u                   /* header, before the payload */
-#define MIN_BLOCK 32u                   /* header, two links and a footer */
+#define MIN_BLOCK (sizeof(void *) == 8 ? 48u : 32u)     /* header, two links and a footer */
 #define CHUNK     (64u * 1024)
 #define INUSE     1u
 #define PINUSE    2u                    /* the block below is in use */
 #define SMALL     1024u                 /* exact bins below this */
 #define NBINS     160
-#define MAX_REQ   0x7FF00000u           /* what sbrk(int) can be asked for */
+/* The most that is asked of sbrk() at once: what a 32-bit program's address
+ * space could hold, and in a 64-bit program more than any machine has. */
+#define MAX_REQ   (sizeof(void *) == 8 ? (size_t)1 << 46 : (size_t)0x7FF00000u)
 
 struct block {
     size_t head;                        /* size | INUSE | PINUSE */
-    uint32_t pad[3];
+    char pad[HDR - sizeof(size_t)];
     struct block *next, *prev;          /* free blocks only: their bin */
 };
+_Static_assert(__builtin_offsetof(struct block, next) == HDR, "the links start the payload");
 
 /* The links fit in the smallest block, ahead of its footer. */
 _Static_assert(HDR + 2 * sizeof(void *) + sizeof(size_t) <= MIN_BLOCK, "block too small");
@@ -169,7 +208,7 @@ static int bin_of(size_t size)
 {
     if (size < SMALL)
         return (int)(size >> 4);
-    int lg = 31 - __builtin_clz((unsigned)size);
+    int lg = (int)(8 * sizeof(size_t)) - 1 - __builtin_clzl(size);    /* (a size may not fit 32 bits) */
     int i = 64 + (lg - 10) * 4 + (int)((size >> (lg - 2)) & 3);
     return i < NBINS ? i : NBINS - 1;
 }
@@ -238,7 +277,7 @@ static int grow(size_t need)
     size_t total = need < CHUNK ? CHUNK : need;
     if (total > MAX_REQ - HDR)
         return -1;
-    char *p = sbrk((int)(total + HDR));
+    char *p = sbrk((intptr_t)(total + HDR));
     if (p == (void *)-1)
         return -1;
     struct block *b;
@@ -445,6 +484,10 @@ static void *realloc_locked(void *p, size_t n)
         return p;
     }
     struct block *nb = after(b);        /* grow into a free block above */
+    /* The heap's last block grows with the heap: nothing is copied (a block of more than
+     * half the memory there is could not be). */
+    if (nb == fence && grow(size - bsize(b)) == 0)
+        nb = after(b);
     if (!(nb->head & INUSE) && bsize(b) + bsize(nb) >= size) {
         bin_remove(nb);
         b->head += bsize(nb);

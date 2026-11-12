@@ -841,7 +841,7 @@ static int status_of(void)
     }
 }
 
-int wifi_syscall(uint32_t op, uint32_t arg)
+int wifi_syscall(uint32_t op, uintptr_t arg)
 {
     switch (op) {
     case WIFI_STATUS: {

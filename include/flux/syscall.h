@@ -1,6 +1,9 @@
 /*
  * System call numbers. Invoked with `int $0x80`:
- *   eax = number, ebx/ecx/edx/esi/edi = arguments, eax = result.
+ *   eax = number, ebx/ecx/edx/esi/edi = arguments, eax = result
+ * in a 32-bit program, and the whole registers in a 64-bit one (rbx, rcx,
+ * rdx, rsi and rdi; the result in rax), where an address or the size of
+ * memory may not fit 32 bits.
  * Results in [-4095, -1] are negated errno values.
  */
 #ifndef FLUX_SYSCALL_H
@@ -79,7 +82,8 @@ extern "C" {
 #define SYS_ioctl     67
 #define SYS_usbinfo   68
 #define SYS_stime     69
-#define SYS_llseek      70  /* fd, offset high, offset low, uint64_t *result, whence */
+#define SYS_llseek      70  /* fd, offset high, offset low, uint64_t *result, whence (a 32-bit program's
+                             * way past 2 GiB: SYS_lseek takes and gives 64 bits in a 64-bit one) */
 #define SYS_power       71  /* POWER_* op, arg */
 #define SYS_sigaction   72  /* sig, const struct flux_sigaction *act, struct flux_sigaction *oact */
 #define SYS_sigprocmask 73  /* how, const uint32_t *set, uint32_t *oset */
@@ -96,7 +100,8 @@ extern "C" {
 #define SYS_thread_create 84 /* entry, stack, tls base, clear_tid address: the new thread's id */
 #define SYS_thread_exit 85  /* stack address and length to unmap (0, 0: none) */
 #define SYS_futex       86  /* addr, FUTEX_WAIT or FUTEX_WAKE, value (or count), timeout in ms (-1: none) */
-#define SYS_set_tls     87  /* base: this thread's TLS segment; returns its selector */
+#define SYS_set_tls     87  /* base: this thread's block; returns its segment's selector, for GS
+                               (a 64-bit program: 0, and the base is FS's from then on) */
 #define SYS_gettid      88
 #define SYS_tkill       89  /* thread id, signal */
 #define SYS_setitimer   90  /* ITIMER_*, const struct flux_itimer *value, struct flux_itimer *old */
@@ -119,7 +124,10 @@ extern "C" {
 
 #define SYS_set_win_teb 107 /* linear TEB base (0: legacy fixed TEB); returns SEG_WIN_FS */
 
-#define NSYSCALLS       108
+#define SYS_getrlimit   108 /* FLUX_RLIMIT_*, struct flux_rlimit * */
+#define SYS_setrlimit   109 /* FLUX_RLIMIT_*, const struct flux_rlimit * */
+
+#define NSYSCALLS       110
 
 #ifdef __cplusplus
 }

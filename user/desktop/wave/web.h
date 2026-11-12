@@ -22,7 +22,7 @@
  * is named at the end. The Gecko version is an extended-support release: keep it a supported one. */
 #define BROWSER_GECKO_VERSION "140.0"
 #define BROWSER_USER_AGENT \
-    "Mozilla/5.0 (X11; Linux i686; rv:" BROWSER_GECKO_VERSION ") Gecko/20100101 Firefox/" BROWSER_GECKO_VERSION " Wave/1.0"
+    "Mozilla/5.0 (X11; Linux x86_64; rv:" BROWSER_GECKO_VERSION ") Gecko/20100101 Firefox/" BROWSER_GECKO_VERSION " Wave/1.0"
 /* Where what is typed in the address bar that is not an address goes. */
 #define SEARCH_URL "https://html.duckduckgo.com/html/?q="
 

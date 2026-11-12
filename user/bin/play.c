@@ -62,7 +62,7 @@ static int read_full(int fd, void *buf, uint32_t n)
 {
     uint32_t got = 0;
     while (got < n) {
-        int r = (int)read(fd, (uint8_t *)buf + got, n - got);
+        ssize_t r = read(fd, (uint8_t *)buf + got, n - got);
         if (r <= 0)
             return r < 0 ? -1 : (int)got;
         got += (uint32_t)r;
@@ -270,7 +270,7 @@ static int write_all(const int16_t *buf, int frames)
     const uint8_t *p = (const uint8_t *)buf;
     uint32_t n = (uint32_t)frames * (uint32_t)out_channels * 2;
     while (n) {
-        int w = (int)write(dsp, p, n);
+        ssize_t w = write(dsp, p, n);
         if (w < 0) {
             if (errno == EINTR)
                 return -1;

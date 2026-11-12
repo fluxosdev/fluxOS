@@ -38,7 +38,7 @@ static int compare(const void *a, const void *b)
     const struct entry *x = a, *y = b;
     int r;
     if (opt_size_sort)
-        r = (int)(y->st.st_size - x->st.st_size);
+        r = y->st.st_size > x->st.st_size ? 1 : y->st.st_size < x->st.st_size ? -1 : 0;
     else if (opt_time_sort)
         r = (int)(y->st.st_mtime - x->st.st_mtime);
     else
@@ -100,14 +100,16 @@ static void mode_string(uint32_t m, char *s)
     s[10] = 0;
 }
 
-static void human(uint32_t n, char *buf, size_t size)
+static void human(unsigned long long n, char *buf, size_t size)
 {
-    if (n < 1024)
-        snprintf(buf, size, "%u", n);
-    else if (n < 1024 * 1024)
-        snprintf(buf, size, "%u.%uK", n / 1024, (n % 1024) * 10 / 1024);
-    else
-        snprintf(buf, size, "%u.%uM", n / (1024 * 1024), (n % (1024 * 1024)) * 10 / (1024 * 1024));
+    if (n < 1024) {
+        snprintf(buf, size, "%llu", n);
+        return;
+    }
+    int unit = 0;                       /* n counts 1024^unit bytes: under 1024 * 1024 of them */
+    for (; n >= 1024 * 1024 && unit < 3; unit++)
+        n /= 1024;
+    snprintf(buf, size, "%llu.%llu%c", n / 1024, n % 1024 * 10 / 1024, "KMGT"[unit]);
 }
 
 static void print_long(const struct entry *e)
@@ -121,9 +123,9 @@ static void print_long(const struct entry *e)
     if (S_ISCHR(e->st.st_mode) || S_ISBLK(e->st.st_mode))
         snprintf(size, sizeof(size), "%u, %u", MAJOR(e->st.st_rdev), MINOR(e->st.st_rdev));
     else if (opt_human)
-        human(e->st.st_size, size, sizeof(size));
+        human((unsigned long long)e->st.st_size, size, sizeof(size));
     else
-        snprintf(size, sizeof(size), "%u", e->st.st_size);
+        snprintf(size, sizeof(size), "%lld", (long long)e->st.st_size);
     printf("%s %2u flux flux %7s %s ", mode, e->st.st_nlink, size, when);
     print_name(e);
     if (e->link)
@@ -207,10 +209,10 @@ static void list_dir(const char *path)
     closedir(d);
     qsort(v, (size_t)n, sizeof(struct entry), compare);
     if (opt_long) {
-        uint32_t blocks = 0;
+        unsigned long long blocks = 0;
         for (int i = 0; i < n; i++)
-            blocks += (v[i].st.st_size + 1023) / 1024;
-        printf("total %u\n", blocks);
+            blocks += ((unsigned long long)v[i].st.st_size + 1023) / 1024;
+        printf("total %llu\n", blocks);
     }
     print_entries(v, n);
     if (opt_recursive) {

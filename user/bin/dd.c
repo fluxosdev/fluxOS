@@ -120,16 +120,18 @@ int main(int argc, char **argv)
         }
     }
     if (seek) {
-        /* 64-bit: off_t is 32 bits here, and seek=4608 bs=1M must not
-         * wrap to 512 MiB on a disk */
-        if (lseek64(out, (off64_t)(seek * obs), SEEK_SET) < 0) {
+        /* 64-bit, whatever off_t is where this is built: seek=4608 bs=1M
+         * must not wrap to 512 MiB on a disk */
+        off64_t at = (off64_t)(seek * obs);
+        off_t cut = (off_t)at;
+        if (lseek64(out, at, SEEK_SET) < 0) {
             fprintf(stderr, "dd: cannot seek '%s': %s\n", out_name ? out_name : "stdout", strerror(errno));
             return 1;
         }
         /* ftruncate takes an off_t: past its range, leave the file as it is
          * rather than cut it at a wrapped size */
-        if (!notrunc && out_name && (off64_t)(seek * obs) == (off64_t)(off_t)(seek * obs))
-            (void)!ftruncate(out, (off_t)(seek * obs));
+        if (!notrunc && out_name && (off64_t)cut == at)
+            (void)!ftruncate(out, cut);
     }
     char *ibuf = malloc((size_t)ibs), *obuf = malloc((size_t)obs);
     if (!ibuf || !obuf) {
@@ -142,7 +144,7 @@ int main(int argc, char **argv)
     clock_gettime(CLOCK_MONOTONIC, &t0);
     int status = 0;
     while (count < 0 || full_in + part_in < count) {
-        int n = (int)read(in, ibuf, (size_t)ibs);
+        ssize_t n = read(in, ibuf, (size_t)ibs);
         int failed = 0;
         if (n < 0) {
             fprintf(stderr, "dd: error reading '%s': %s\n", in_name ? in_name : "stdin", strerror(errno));

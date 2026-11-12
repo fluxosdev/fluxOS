@@ -4,6 +4,7 @@
  * free blocks can be merged on kfree().
  */
 #include "kernel.h"
+#include "boot.h"
 #include "mm.h"
 
 #define HEAP_MAGIC 0xF10C0DE5u
@@ -23,25 +24,30 @@ static uint32_t heap_size;
 static uint32_t heap_used;
 static spinlock_t heap_lock = SPINLOCK_INIT("heap");    /* interrupt handlers allocate too */
 
-/* A quarter of RAM, between 4 MiB and 256 MiB, and never more than half of the
- * low memory the kernel's page tables, stacks and DMA buffers share with it.
- * Files that live in memory (an initrd that is the whole system, as "make
- * run-kernel" and the QEMU tests boot) have to fit in it. */
+/* A quarter of RAM, between 4 MiB and 256 MiB. Files that live in memory
+ * have to fit in it, so where the initrd is larger than that leaves room for
+ * (the whole system with its compiler, as "make run-kernel" and the QEMU
+ * tests boot it), the heap is what the initrd unpacks to and something
+ * beside. Never more than half of the low memory the kernel's page tables,
+ * stacks and DMA buffers share with it, though: under 512 MiB. (In KiB: a
+ * quarter of RAM in bytes need not fit 32 bits.) */
 void heap_init(void)
 {
-    uint32_t total = pmm_total_kb() * 1024;
-    uint32_t size = total / 4;
-    uint32_t low_half = pmm_low_free_kb() / 2 * 1024;
-    if (size > low_half)
-        size = low_half;
-    if (size < 4u << 20)
-        size = 4u << 20;
-    if (size > 256u << 20)
-        size = 256u << 20;
+    uint32_t size_kb = MIN(pmm_total_kb() / 4, 256u << 10);
+    uint64_t initrd_kb = boot.initrd_size / 1024;
+    uint64_t need_kb = initrd_kb ? initrd_kb + initrd_kb / 4 + (32u << 10) : 0;
+    if (size_kb < need_kb)
+        size_kb = (uint32_t)MIN(need_kb, (uint64_t)UINT32_MAX);
+    size_kb = MIN(size_kb, pmm_low_free_kb() / 2);
+    size_kb = MAX(size_kb, 4u << 10);
 
-    uint32_t base = pmm_alloc_contig(size / PAGE_SIZE);
+    /* One run of whole frames; a shorter one where low memory is in pieces. */
+    uint32_t frames = size_kb / (PAGE_SIZE / 1024), base;
+    while (!(base = pmm_alloc_contig(frames)) && frames > 1024)
+        frames -= frames / 8;
     if (!base)
-        panic("heap: cannot reserve %u KiB", size / 1024);
+        panic("heap: cannot reserve %u KiB", frames * (PAGE_SIZE / 1024));
+    uint32_t size = frames * PAGE_SIZE;
 
     heap_head = phys_to_virt(base);
     heap_head->magic = HEAP_MAGIC;

@@ -6,11 +6,20 @@ static unsigned reclaimed_calls;
 static uint32_t release_first, release_count;
 void spin_lock(spinlock_t *l) { (void)l; CHECK(!locked); locked=1; }
 void spin_unlock(spinlock_t *l) { (void)l; CHECK(locked); locked=0; }
+/* The allocator's bitmap and share counts for 5 GiB of frames: all in use until released. */
+struct boot_info boot;
 static void reset(void)
 {
-    memset(bitmap,0xff,sizeof(bitmap));
-    memset(share_count,0,sizeof(share_count));
-    free_frames=low_free_frames=0;search_hint=high_hint=0;reclaim_pages=NULL;
+    static uint32_t *bits;
+    static uint8_t *shares;
+    uint32_t frames = (uint32_t)((5ull << 30) / PAGE_SIZE);
+    if (!bits) {
+        bits = malloc(frames / 8);
+        shares = malloc(frames);
+        CHECK(bits && shares);
+    }
+    pmm_setup(bits, shares, frames);
+    reclaim_pages=NULL;
     reclaimed_calls=0;release_count=0;
 }
 static uint32_t release_cache(uint32_t pages)
@@ -64,5 +73,23 @@ int main(void)
     CHECK(pmm_claim_sole(cow));
     pmm_free(cow);
     CHECK(free_frames==1 && low_free_frames==1);
-    puts("kernel physical memory: low reserve, high pages, pressure reclaim and contiguous retry passed");
+    /* Memory above 4 GiB: user pages come from it first, and a page a device
+     * must reach never does; its frames keep their whole addresses. */
+    reset();
+    uint64_t top=(uint64_t)(MID_FRAMES+7)*PAGE_SIZE;
+    pmm_release(top,top+2*PAGE_SIZE);
+    pmm_free((uint64_t)(LOW_FRAMES+9)*PAGE_SIZE);
+    pmm_free(700*PAGE_SIZE);
+    CHECK(free_frames==4 && low_free_frames==1 && top_free_frames==2);
+    CHECK(pmm_alloc_user_low()==(LOW_FRAMES+9)*PAGE_SIZE && top_free_frames==2);
+    CHECK(pmm_alloc_user()==top && pmm_alloc_user()==top+PAGE_SIZE && !top_free_frames);
+    CHECK(pmm_ref(top) && !pmm_claim_sole(top));
+    pmm_free(top);pmm_free(top);
+    CHECK(top_free_frames==1 && free_frames==2);
+    CHECK(pmm_alloc_user()==top);
+    CHECK(pmm_alloc_user()==700*PAGE_SIZE && !free_frames);   /* then below 4 GiB, then low memory */
+    CHECK(!pmm_alloc_user() && !pmm_alloc_user_low());
+    pmm_free((uint64_t)(5ull<<30)+PAGE_SIZE);                  /* past what the bitmap covers: ignored */
+    CHECK(!free_frames);
+    puts("kernel physical memory: low reserve, high pages, memory above 4 GiB, pressure reclaim and contiguous retry passed");
 }

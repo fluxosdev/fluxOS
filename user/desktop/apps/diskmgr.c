@@ -194,7 +194,7 @@ static void sniff(struct dev *d)
     if (fd < 0)
         return;
     unsigned char sec[512];
-    int n = (int)read(fd, sec, sizeof(sec));
+    ssize_t n = read(fd, sec, sizeof(sec));
     close(fd);
     if (n != 512)
         return;
@@ -277,7 +277,7 @@ static int mbr_read(const char *disk, unsigned char *mbr)
     int fd = open(path, O_RDONLY);
     if (fd < 0)
         return -1;
-    int n = (int)read(fd, mbr, 512);
+    ssize_t n = read(fd, mbr, 512);
     close(fd);
     if (n != 512)
         return -1;

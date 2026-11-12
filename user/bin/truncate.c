@@ -43,6 +43,7 @@ int main(int argc, char **argv)
     case 'K': case 'k': mult = 1024; break;
     case 'M': case 'm': mult = 1024 * 1024; break;
     case 'G': case 'g': mult = 1024LL * 1024 * 1024; break;
+    case 'T': case 't': mult = 1024LL * 1024 * 1024 * 1024; break;
     default:
         fprintf(stderr, "truncate: invalid size: %s\n", size);
         return 1;
@@ -75,8 +76,8 @@ int main(int argc, char **argv)
             if (want < 0)
                 want = 0;
         }
-        if (want > 0x7FFFFFFFLL) {
-            fprintf(stderr, "truncate: %s: sizes above 2 GiB are not supported\n", argv[i]);
+        if ((long long)(off_t)want != want) {
+            fprintf(stderr, "truncate: %s: too large a size\n", argv[i]);
             status = 1;
         } else if (ftruncate(fd, (off_t)want) < 0) {
             fprintf(stderr, "truncate: %s: %s\n", argv[i], strerror(errno));

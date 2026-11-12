@@ -601,7 +601,7 @@ claim of general DirectX compatibility or that every older game runs.
   per Windows thread, native GL state is rebound on every API call, and
   backing buffers resize with the DC. The bridge deliberately uses the
   software renderer; native GPU mappings have not been integrated with the
-  guest VM allocator. `gen-win32-gl.py` generates 269 stdcall wrappers from
+  guest VM allocator. `tools/gen-win32-gl.c` generates 269 stdcall wrappers from
   the native header; `glGetString` and `glGetPointerv` have explicit guest
   pointer handling. Floats/doubles are decoded from Windows stack arguments.
   A separate `libGL-win32.a` uses 16-byte-aligned managed allocations so

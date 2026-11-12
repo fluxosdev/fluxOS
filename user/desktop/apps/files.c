@@ -231,7 +231,7 @@ static int is_program(const char *path)
     int fd = open(path, O_RDONLY);
     if (fd < 0)
         return 0;
-    int n = (int)read(fd, head, sizeof(head));
+    ssize_t n = read(fd, head, sizeof(head));
     close(fd);
     return (n == 4 && !memcmp(head, "\x7f" "ELF", 4)) || (n >= 2 && head[0] == '#' && head[1] == '!');
 }
@@ -264,7 +264,7 @@ static int read_shortcut(const char *path, char *exec, size_t size, enum icon_id
     int fd = open(path, O_RDONLY);
     if (fd < 0)
         return -1;
-    int n = (int)read(fd, buf, sizeof(buf) - 1);
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
     if (n < 0)
         return -1;
@@ -790,9 +790,14 @@ static void format_status(struct fm *f, char *buf, size_t size)
     if (e->is_dir || stat(path, &st) < 0)
         snprintf(buf, size, "1 object selected");
     else if (st.st_size < 1024)
-        snprintf(buf, size, "%s: %u bytes", e->name, st.st_size);
-    else
-        snprintf(buf, size, "%s: %u.%uKB", e->name, st.st_size / 1024, st.st_size % 1024 * 10 / 1024);
+        snprintf(buf, size, "%s: %d bytes", e->name, (int)st.st_size);
+    else {
+        unsigned long long n = (unsigned long long)st.st_size;
+        int unit = 0;                   /* n counts 1024^unit bytes: under 1024 * 1024 of them */
+        for (; n >= 1024 * 1024 && unit < 3; unit++)
+            n /= 1024;
+        snprintf(buf, size, "%s: %llu.%llu%cB", e->name, n / 1024, n % 1024 * 10 / 1024, "KMGT"[unit]);
+    }
 }
 
 /* Free space on the folder's drive: a usage bar and a caption at the right of the status bar. */

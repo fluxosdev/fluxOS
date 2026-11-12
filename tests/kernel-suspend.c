@@ -7,7 +7,7 @@ int main(void)
 {
     struct powerinfo before, after;
     for (int i = 0; i < 3; i++) {
-        if (power(POWER_INFO, (unsigned int)&before) < 0 ||
+        if (power(POWER_INFO, (unsigned long)&before) < 0 ||
             !(before.flags & PWR_CAN_SLEEP))
             goto failed;
         printf("suspend: cycle %d\n", i + 1);
@@ -16,7 +16,7 @@ int main(void)
             goto failed;
         /* Exercise the restored timer, scheduler and user-mode return. */
         msleep(100);
-        if (power(POWER_INFO, (unsigned int)&after) < 0 ||
+        if (power(POWER_INFO, (unsigned long)&after) < 0 ||
             after.sleeps != before.sleeps + 1)
             goto failed;
     }

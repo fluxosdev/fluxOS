@@ -152,7 +152,7 @@ static int next_line(char *out, size_t size, int ms, int frames)
         struct pollfd pf = { from_eng, POLLIN, 0 };
         if (poll(&pf, 1, left) <= 0)
             continue;
-        int r = (int)read(from_eng, inbuf + nin, sizeof(inbuf) - 1 - (size_t)nin);
+        ssize_t r = read(from_eng, inbuf + nin, sizeof(inbuf) - 1 - (size_t)nin);
         CHECK(r > 0);                   /* the engine died */
         nin += r;
     }
@@ -272,7 +272,7 @@ static unsigned char *slurp(const char *path, size_t *len)
     CHECK(d != NULL);
     *len = 0;
     while (*len < (size_t)st.st_size) {
-        int r = (int)read(fd, d + *len, (size_t)st.st_size - *len);
+        ssize_t r = read(fd, d + *len, (size_t)st.st_size - *len);
         CHECK(r > 0);
         *len += (size_t)r;
     }

@@ -467,7 +467,7 @@ static int apply_heredoc(const struct redir *r, struct saved_fds *save)
     if (len <= 32768) {
         const char *q = body;
         while (len) {
-            int w = (int)write(p[1], q, len);
+            ssize_t w = write(p[1], q, len);
             if (w <= 0)
                 break;
             q += w;
@@ -479,7 +479,7 @@ static int apply_heredoc(const struct redir *r, struct saved_fds *save)
             close(p[0]);
             const char *q = body;
             while (len) {
-                int w = (int)write(p[1], q, len);
+                ssize_t w = write(p[1], q, len);
                 if (w <= 0)
                     break;
                 q += w;

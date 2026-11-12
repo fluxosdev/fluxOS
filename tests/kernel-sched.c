@@ -18,10 +18,10 @@ void gdt_set_tls(uint32_t base) { (void)base; abort(); }
 void tss_set_kernel_stack(uint64_t rsp) { (void)rsp; abort(); }
 void vmm_switch(pte_t *pd) { (void)pd; abort(); }
 void switch_context(uint64_t *old_sp, uint64_t new_sp) { (void)old_sp; (void)new_sp; abort(); }
-int fb_pinned(int pid, uint32_t start, uint32_t end) { (void)pid; (void)start; (void)end; abort(); }
-int vmm_alloc_prot(pte_t *pd, uint32_t va, uint32_t prot, uint32_t flags)
+int fb_pinned(int pid, uint64_t start, uint64_t end) { (void)pid; (void)start; (void)end; abort(); }
+int vmm_alloc_prot(pte_t *pd, uint64_t va, uint32_t prot, uint32_t flags)
 { (void)pd; (void)va; (void)prot; (void)flags; abort(); }
-void vmm_free_page(pte_t *pd, uint32_t va) { (void)pd; (void)va; abort(); }
+void vmm_free_page(pte_t *pd, uint64_t va) { (void)pd; (void)va; abort(); }
 
 static void reset(int cores)
 {
@@ -100,7 +100,7 @@ int main(void)
     g->brk = USER_MMIO_BASE - 0x10000000u;
     struct flux_mmap_args a = { .len = USER_MMIO_BASE - USER_BASE - PAGE_SIZE,
                                 .prot = PROT_READ | PROT_WRITE, .flags = MAP_PRIVATE | MAP_ANONYMOUS };
-    uint32_t at = 0;
+    uint64_t at = 0;
     CHECK(proc_mmap(g, &a, &at) == -ENOMEM && at == 0);
     a.len = 0x08000000u;                /* one that fits goes above the heap */
     CHECK(proc_mmap(g, &a, &at) == 0 && at >= g->brk && at + a.len <= USER_MMIO_BASE);

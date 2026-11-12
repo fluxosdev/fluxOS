@@ -184,11 +184,11 @@ static void handle_exception(struct trapframe *tf, int from_user)
     uint32_t vec = (uint32_t)tf->int_no;
 
     uint64_t addr = read_cr2();         /* before anything can fault again */
-    if (vec == 14 && addr >= USER_BASE && addr < USER_TOP && current && !current->kthread) {
+    if (vec == 14 && addr >= USER_BASE && addr < USER_LIMIT && current && !current->kthread) {
         int write = (tf->err_code & 2) != 0;
         if (from_user)
             sti();
-        int grown = proc_page_fault((uint32_t)addr, write);
+        int grown = proc_page_fault(addr, write);
         if (from_user)
             cli();
         if (grown)
@@ -205,13 +205,13 @@ static void handle_exception(struct trapframe *tf, int from_user)
             return;
         }
         if (vec == 2) {                 /* the hardware's, not the process's doing */
-            klog("NMI while pid %d (%s) ran, eip %08x\n", current->pid, current->name, tf->eip);
+            klog("NMI while pid %d (%s) ran, at %08lx\n", current->pid, current->name, tf->rip);
             return;
         }
-        klog("pid %d (%s): %s at eip %08x, addr %08lx, err %x\n",
-             current->pid, current->name, exception_names[vec], tf->eip,
+        klog("pid %d (%s): %s at %08lx, addr %08lx, err %x\n",
+             current->pid, current->name, exception_names[vec], tf->rip,
              addr, (uint32_t)tf->err_code);
-        current->fault_addr = (uint32_t)addr;   /* (a 32-bit program's faults are below 4 GiB) */
+        current->fault_addr = addr;
         proc_signal_force(current, exception_signal(vec));
         return;
     }

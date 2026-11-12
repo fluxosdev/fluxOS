@@ -9,18 +9,20 @@ typedef uint64_t pte_t;                 /* an entry of a page table, at any of t
 
 /* ---- physical frame allocator ---- */
 void pmm_init(void);                        /* from the boot loader's memory map (boot.h) */
+void pmm_remap(void);                       /* the direct map moved (paging_init) */
 void pmm_reclaim_loader(void);              /* the loader's own memory, once nothing reads it */
-void pmm_reserve(uint32_t start, uint32_t end);
-void pmm_release(uint32_t start, uint32_t end);
+void pmm_reserve(uint64_t start, uint64_t end);
+void pmm_release(uint64_t start, uint64_t end);
 uint32_t pmm_alloc(void);                   /* below 1 GiB; 0 when out of memory */
-uint32_t pmm_alloc_user(void);              /* anywhere below 4 GiB, for user pages */
+uint64_t pmm_alloc_user(void);              /* anywhere, above 4 GiB first: for user pages */
+uint32_t pmm_alloc_user_low(void);          /* for a user page a 32-bit device address must reach */
 uint32_t pmm_alloc_contig(uint32_t frames); /* below 1 GiB, the lowest run there is */
 uint32_t pmm_alloc_isa(void);               /* 32 KiB below 16 MiB, for ISA DMA; kept for good */
 uint32_t pmm_alloc_reserved(uint32_t reserve); /* cache pages; never reclaim, retain low frames */
 void pmm_set_reclaimer(uint32_t (*reclaim)(uint32_t pages)); /* boot-time registration */
-int pmm_ref(uint32_t phys);                 /* add a COW/shared reference; 0 if full/invalid */
-int pmm_claim_sole(uint32_t phys);          /* 1 if allocated with no extra references */
-void pmm_free(uint32_t phys);
+int pmm_ref(uint64_t phys);                 /* add a COW/shared reference; 0 if full/invalid */
+int pmm_claim_sole(uint64_t phys);          /* 1 if allocated with no extra references */
+void pmm_free(uint64_t phys);
 uint32_t pmm_total_kb(void);
 uint32_t pmm_free_kb(void);
 uint32_t pmm_low_free_kb(void);             /* of the first GiB, the kernel's own */
@@ -63,26 +65,28 @@ void vmm_switch(pte_t *pd);
 pte_t *vmm_create(void);
 void vmm_destroy(pte_t *pd);
 pte_t *vmm_clone(pte_t *pd);
-int vmm_alloc(pte_t *pd, uint32_t va);      /* map a zeroed user page */
-int vmm_alloc_prot(pte_t *pd, uint32_t va, uint32_t prot, uint32_t flags);
-int vmm_protect_page(pte_t *pd, uint32_t va, uint32_t prot);
-void vmm_free_page(pte_t *pd, uint32_t va);
-int vmm_pte_present(pte_t *pd, uint32_t va);
-int vmm_mmio_mapped(pte_t *pd, uint32_t va);    /* device memory there (the screen) */
-uint32_t vmm_translate(pte_t *pd, uint32_t va);
-int vmm_write_ok(pte_t *pd, uint32_t va);
-int vmm_resolve_cow(pte_t *pd, uint32_t va);
-int vmm_copy_to(pte_t *pd, uint32_t va, const void *src, uint32_t len);
-void vmm_read_phys(void *dst, uint32_t phys, uint32_t n);   /* any frame */
+int vmm_alloc(pte_t *pd, uint64_t va);      /* map a zeroed user page */
+int vmm_alloc_prot(pte_t *pd, uint64_t va, uint32_t prot, uint32_t flags);
+int vmm_protect_page(pte_t *pd, uint64_t va, uint32_t prot);
+void vmm_free_page(pte_t *pd, uint64_t va);
+void vmm_free_range(pte_t *pd, uint64_t start, uint64_t end);    /* its pages: page-aligned */
+int vmm_pte_present(pte_t *pd, uint64_t va);
+int vmm_mmio_mapped(pte_t *pd, uint64_t va);    /* device memory there (the screen) */
+uint64_t vmm_translate(pte_t *pd, uint64_t va);     /* a user page's frame (and offset), or 0 */
+uint32_t vmm_translate_low(pte_t *pd, uint64_t va); /* for a device: moved below 4 GiB if need be */
+int vmm_write_ok(pte_t *pd, uint64_t va);
+int vmm_resolve_cow(pte_t *pd, uint64_t va);
+int vmm_copy_to(pte_t *pd, uint64_t va, const void *src, uint32_t len);
+void vmm_read_phys(void *dst, uint64_t phys, uint32_t n);   /* any frame */
 uint32_t vmm_user_pages(pte_t *pd);
 /* flags: extra page bits, such as PTE_PCD for device registers. Device
  * memory may be anywhere in the 64-bit physical address space. */
 void *vmm_map_mmio(uint64_t phys, uint64_t size, uint32_t flags);  /* 2 MiB pages */
 void vmm_unmap_mmio(void *virt);            /* undo it (or pci_map_bar), boot time only */
 void *vmm_map_late(uint64_t phys, uint64_t size, uint32_t flags);  /* 4 KiB pages; kept for good */
-int vmm_map_phys(pte_t *pd, uint32_t va, uint64_t phys, uint32_t size, uint32_t flags);
-void vmm_zero_frame(uint32_t phys);         /* any frame */
-int vmm_map_frame(pte_t *pd, uint32_t va, uint32_t frame, uint32_t prot);
+int vmm_map_phys(pte_t *pd, uint64_t va, uint64_t phys, uint32_t size, uint32_t flags);
+void vmm_zero_frame(uint64_t phys);         /* any frame */
+int vmm_map_frame(pte_t *pd, uint64_t va, uint32_t frame, uint32_t prot);
 
 /*
  * ---- SSE block moves (sse.S) ----

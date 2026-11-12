@@ -130,7 +130,7 @@ static int opl_dev_write(struct vnode *vn, const void *buf, uint64_t off, uint32
     return (int)(count * sizeof(*w));
 }
 
-static int opl_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
+static int opl_ioctl(struct vnode *vn, uint32_t req, uintptr_t arg)
 {
     (void)vn;
     switch (req) {

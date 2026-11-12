@@ -90,20 +90,67 @@ static uint8_t size_class[MAX_SMALL / 8 + 1];
 
 /* ---- the page map ---- */
 
-static struct gcpage **page_dir[1024];  /* by address >> 22: a table for each 4 MiB */
+/*
+ * Which page an address is in: a table of 1024 pages for each 4 MiB of the
+ * address space that has any, and a hash table of those by which 4 MiB it
+ * is. (Not an array of them by address: a 64-bit program's addresses are
+ * 47 bits wide, and what it allocates is above 4 GiB.) A table, once made,
+ * stays: its pages come and go.
+ */
+static struct region {
+    uintptr_t key;                      /* address >> 22, plus one: 0 is an empty slot */
+    struct gcpage **pages;
+} *regions;
+static size_t region_cap, region_count; /* slots (a power of two, or none yet), and those in use */
+
+static size_t region_slot(uintptr_t key, size_t cap)
+{
+    return (size_t)(((uint64_t)key * 0x9E3779B97F4A7C15ull) >> 32) & (cap - 1);
+}
+
+static struct region *find_region(uintptr_t key)
+{
+    for (size_t i = region_slot(key, region_cap);; i = (i + 1) & (region_cap - 1))
+        if (regions[i].key == key || !regions[i].key)
+            return &regions[i];         /* (never full: an empty slot ends the search) */
+}
 
 static struct gcpage *page_of(uintptr_t p)
 {
-    struct gcpage **t = page_dir[p >> 22];
-    return t ? t[(p >> PAGE_SHIFT) & 1023] : NULL;
+    if (!region_cap)
+        return NULL;
+    const struct region *r = find_region((p >> 22) + 1);
+    return r->key ? r->pages[(p >> PAGE_SHIFT) & 1023] : NULL;
 }
 
 static int map_page(uintptr_t p, struct gcpage *pg)
 {
-    struct gcpage ***t = &page_dir[p >> 22];
-    if (!*t && !(*t = calloc(1024, sizeof(**t))))
-        return -1;
-    (*t)[(p >> PAGE_SHIFT) & 1023] = pg;
+    uintptr_t key = (p >> 22) + 1;
+    if ((region_count + 1) * 2 > region_cap) {      /* at most half full */
+        size_t cap = region_cap ? region_cap * 2 : 64;
+        struct region *bigger = calloc(cap, sizeof(*bigger)), *old = regions;
+        if (!bigger)
+            return -1;
+        size_t old_cap = region_cap;
+        regions = bigger;
+        region_cap = cap;
+        for (size_t i = 0; i < old_cap; i++)
+            if (old[i].key)
+                *find_region(old[i].key) = old[i];
+        free(old);
+    }
+    struct region *r = find_region(key);
+    if (!r->key) {
+        if (!pg)
+            return 0;                   /* nothing there to forget */
+        struct gcpage **pages = calloc(1024, sizeof(*pages));
+        if (!pages)
+            return -1;
+        r->key = key;
+        r->pages = pages;
+        region_count++;
+    }
+    r->pages[(p >> PAGE_SHIFT) & 1023] = pg;
     return 0;
 }
 

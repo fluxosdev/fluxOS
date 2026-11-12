@@ -84,14 +84,19 @@ isr_common:
 /* Also the first "return address" of every new process: the scheduler
  * switches to a fresh kernel stack whose context frame returns here.
  * FS and GS take their bases from this processor's GDT as they are loaded:
- * the thread block of the thread now running here (gdt.c). */
+ * the thread block of the thread now running here (gdt.c). An FS without
+ * a selector is left as it is: a 64-bit program's has a base no descriptor
+ * holds, which loading it again, selector or none, would lose
+ * (proc_load_tls). */
 .global trapret
 trapret:
     movq 0(%rsp), %rax
     movw %ax, %gs
     movq 8(%rsp), %rax
+    testw %ax, %ax
+    jz 1f
     movw %ax, %fs
-    movq 16(%rsp), %rax
+1:  movq 16(%rsp), %rax
     movw %ax, %es
     movq 24(%rsp), %rax
     movw %ax, %ds

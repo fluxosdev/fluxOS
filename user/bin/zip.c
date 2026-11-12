@@ -78,7 +78,7 @@ static int out_write(const void *p, uint32_t n)
 {
     const uint8_t *q = p;
     while (n) {
-        int w = (int)write(out_fd, q, n);
+        ssize_t w = write(out_fd, q, n);
         if (w <= 0)
             return -1;
         q += w;
@@ -158,14 +158,19 @@ static int add_file(const char *path, const char *name, const struct stat *st)
         fprintf(stderr, "zip: cannot open %s: %s\n", path, strerror(errno));
         return 1;
     }
+    if (st->st_size > 0xFFFFFFFFll) {   /* (sizes are 32 bits in a zip file that is not zip64) */
+        fprintf(stderr, "zip: %s: a file of 4 GiB or more\n", path);
+        close(fd);
+        return 1;
+    }
     struct central *c = add_entry(name, st);
-    uint32_t size = st->st_size;
+    uint32_t size = (uint32_t)st->st_size;
     c->usize = size;
     uint8_t *data = size <= MAX_IN_MEMORY ? malloc(size ? size : 1) : NULL;
     if (data) {
         uint32_t got = 0;
         while (got < size) {
-            int r = (int)read(fd, data + got, size - got);
+            ssize_t r = read(fd, data + got, size - got);
             if (r <= 0)
                 break;
             got += (uint32_t)r;
@@ -197,7 +202,7 @@ static int add_file(const char *path, const char *name, const struct stat *st)
         uint8_t *buf = malloc(65536);
         uint32_t left = size;
         while (buf && left) {
-            int r = (int)read(fd, buf, left < 65536 ? left : 65536);
+            ssize_t r = read(fd, buf, left < 65536 ? left : 65536);
             if (r <= 0)
                 break;
             c->crc = arc_crc32(c->crc, buf, (uint32_t)r);

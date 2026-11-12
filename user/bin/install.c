@@ -118,7 +118,7 @@ static int copy_one(const char *src, const char *dst)
     while ((n = (int)read(in, buf, sizeof(buf))) > 0) {
         const char *p = buf;
         while (n > 0) {
-            int w = (int)write(out, p, (size_t)n);
+            ssize_t w = write(out, p, (size_t)n);
             if (w <= 0) {
                 fprintf(stderr, "install: cannot write '%s': %s\n", dst, strerror(errno));
                 r = 1;

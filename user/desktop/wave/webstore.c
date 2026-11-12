@@ -28,7 +28,7 @@ char *store_read_file(const char *path, long max, long *len)
     char *buf = malloc((size_t)size + 1);
     long got = 0;
     while (buf && got < size) {
-        int r = (int)read(fd, buf + got, (size_t)(size - got));
+        ssize_t r = read(fd, buf + got, (size_t)(size - got));
         if (r <= 0)
             break;
         got += r;
@@ -53,7 +53,7 @@ int store_write_file(const char *path, const char *data, size_t len)
         return -1;
     int ok = 1;
     while (len > 0 && ok) {
-        int w = (int)write(fd, data, len);
+        ssize_t w = write(fd, data, len);
         if (w <= 0)
             ok = 0;
         else
@@ -145,7 +145,7 @@ static size_t idb_usage(const char *origin)
         size_t n=strlen(entry->d_name);if(n<4 || strcmp(entry->d_name+n-4,".idb"))continue;
         char path[300],header[1024];snprintf(path,sizeof(path),IDB_DIR "%s",entry->d_name);
         int fd=open(path,O_RDONLY);if(fd<0)continue;
-        int got=(int)read(fd,header,sizeof(header)-1);header[got>0?got:0]=0;
+        ssize_t got = read(fd,header,sizeof(header)-1);header[got>0?got:0]=0;
         if(idb_header(header,origin,NULL)){long size=lseek(fd,0,SEEK_END);if(size>0)total+=(size_t)size;}
         close(fd);
     }
@@ -240,7 +240,7 @@ char *store_idb(const char *op, const char *origin, const char *name, const char
                 int fd=open(path,O_WRONLY);size_t written=0;
                 if(fd>=0 && ftruncate(fd,(long)valid)==0 && lseek(fd,(long)valid,SEEK_SET)>=0) {
                     while(written<inserted+24) {
-                        int n=(int)write(fd,record+written,inserted+24-written);if(n<=0)break;written+=(size_t)n;
+                        ssize_t n = write(fd,record+written,inserted+24-written);if(n<=0)break;written+=(size_t)n;
                     }
                     ok=written==inserted+24 && fsync(fd)==0;
                 }

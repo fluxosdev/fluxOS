@@ -1146,7 +1146,7 @@ static jsval random_fill(struct js *J, jsval self, jsval *args, int argc)
         return js_throw_error(J, "OperationError: random source unavailable");
     int got = 0;
     while (got < len) {
-        int n = (int)read(fd, p + got, (size_t)(len - got));
+        ssize_t n = read(fd, p + got, (size_t)(len - got));
         if (n <= 0)
             break;
         got += n;

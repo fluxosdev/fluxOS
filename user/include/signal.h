@@ -19,7 +19,7 @@ typedef struct {
     int32_t  si_pid;
     uint32_t si_uid;
     int32_t  si_status;
-    uint32_t si_addr;
+    uintptr_t si_addr;                  /* the address of a fault, whole (struct flux_siginfo) */
 } siginfo_t;
 
 #define SIG_DFL ((sighandler_t)0)

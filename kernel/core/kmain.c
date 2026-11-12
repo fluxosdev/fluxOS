@@ -108,7 +108,7 @@ void kmain(void)
     cpu_init();
     lock_init();
 
-    boot_ok("GDT and IDT loaded (64-bit kernel, 32-bit user segments, TSS), PIC remapped to vectors 32-47");
+    boot_ok("GDT and IDT loaded (64-bit kernel, 64-bit and 32-bit user segments, TSS), PIC remapped to vectors 32-47");
     boot_ok("Physical memory: %u MiB usable, %u KiB free",
             pmm_total_kb() / 1024, pmm_free_kb());
     fpu_init();
@@ -175,10 +175,9 @@ void kmain(void)
     }
     if (r < 0)
         initrd_load(phys_to_virt(boot.initrd_phys), (uint32_t)boot.initrd_size);
-    /* The module's memory is the loader's no longer (what of it is above
-     * 4 GiB stays unused, like all memory there). */
-    if (have_initrd && boot.initrd_phys + boot.initrd_size <= 0x100000000ull)
-        pmm_release((uint32_t)boot.initrd_phys, (uint32_t)(boot.initrd_phys + boot.initrd_size));
+    /* The module's memory is the loader's no longer. */
+    if (have_initrd)
+        pmm_release(boot.initrd_phys, boot.initrd_phys + boot.initrd_size);
     record_boot_source();
     vfs_automount();
     net_init();

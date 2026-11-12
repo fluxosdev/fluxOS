@@ -53,7 +53,7 @@ static void read_hostname(char *out, size_t size)
     if (fd < 0)
         return;
     char buf[64];
-    int n = (int)read(fd, buf, sizeof(buf) - 1);
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
     if (n <= 0)
         return;

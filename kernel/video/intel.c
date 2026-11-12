@@ -658,7 +658,7 @@ static uint32_t slot_gpu(const struct slot *sl)
 static int map_slot(struct slot *sl, pte_t *pd)
 {
     for (uint32_t i = 0; i < sl->npages; i++) {
-        uint32_t phys = vmm_translate(pd, sl->va + i * PAGE_SIZE);
+        uint32_t phys = vmm_translate_low(pd, sl->va + (uint64_t)i * PAGE_SIZE);  /* (a GTT entry here is 32 bits) */
         if (!phys)
             return -EFAULT;
         ig.gtt[ig.buf_first + sl->first + i] = (phys & ~0xFFFu) | PTE_LLC | PTE_VALID;
@@ -681,8 +681,8 @@ int intel_mapbuf(struct dispbuf *b)
         return -ENODEV;
     if (!b->size || b->size > MAX_BUF || b->addr + b->size < b->addr)
         return -EINVAL;
-    uint32_t va = b->addr & ~0xFFFu;
-    uint32_t npages = (b->addr + b->size - va + PAGE_SIZE - 1) >> 12;
+    uint64_t va = b->addr & ~(uint64_t)0xFFF;
+    uint32_t npages = (uint32_t)((b->addr + b->size - va + PAGE_SIZE - 1) >> 12);
     int idx = -1;
     for (int i = 0; i < MAX_SLOTS && idx < 0; i++)
         if (!ig.slots[i].pid)
@@ -706,12 +706,12 @@ int intel_mapbuf(struct dispbuf *b)
     /* Every page present and the process's own (no copy-on-write left),
      * so the pages stay put while lent (fb_pinned). */
     for (uint32_t i = 0; i < npages; i++) {
-        uint32_t a = va + i * PAGE_SIZE;
+        uint64_t a = va + (uint64_t)i * PAGE_SIZE;
         if (!vmm_write_ok(current->pd, a) && !vmm_resolve_cow(current->pd, a))
             return -EFAULT;
     }
     struct slot *sl = &ig.slots[idx];
-    *sl = (struct slot){ current->leader->pid, first, npages, va, b->addr & 0xFFF, b->size };
+    *sl = (struct slot){ current->leader->pid, first, npages, va, (uint32_t)(b->addr & 0xFFF), b->size };
     if (map_slot(sl, current->pd) < 0) {
         unmap_slot(sl);
         return -EFAULT;
@@ -731,11 +731,11 @@ int intel_unmapbuf(const struct dispbuf *b)
     return 0;
 }
 
-int intel_pinned(int pid, uint32_t start, uint32_t end)
+int intel_pinned(int pid, uint64_t start, uint64_t end)
 {
     for (int i = 0; i < MAX_SLOTS; i++) {
         const struct slot *sl = &ig.slots[i];
-        if (sl->pid && sl->pid == pid && sl->va < end && start < sl->va + sl->npages * PAGE_SIZE)
+        if (sl->pid && sl->pid == pid && sl->va < end && start < sl->va + (uint64_t)sl->npages * PAGE_SIZE)
             return 1;
     }
     return 0;

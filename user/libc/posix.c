@@ -29,30 +29,30 @@
 #include <time.h>
 #include <unistd.h>
 
-static inline int sc0(int n)
+static inline long sc0(int n)
 {
-    int r;
+    long r;
     __asm__ volatile("int $0x80" : "=a"(r) : "a"(n) : "memory");
     return r;
 }
 
-static inline int sc1(int n, int a)
+static inline long sc1(int n, long a)
 {
-    int r;
+    long r;
     __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a) : "memory");
     return r;
 }
 
-static inline int sc2(int n, int a, int b)
+static inline long sc2(int n, long a, long b)
 {
-    int r;
+    long r;
     __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a), "c"(b) : "memory");
     return r;
 }
 
-static inline int sc3(int n, int a, int b, int c)
+static inline long sc3(int n, long a, long b, long c)
 {
-    int r;
+    long r;
     __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a), "c"(b), "d"(c) : "memory");
     return r;
 }
@@ -595,7 +595,7 @@ static void ms_tv(uint32_t ms, struct timeval *tv)
 int getitimer(int which, struct itimerval *value)
 {
     struct flux_itimer t;
-    if (ret(sc2(SYS_getitimer, which, (int)&t)) < 0)
+    if (ret(sc2(SYS_getitimer, which, (long)&t)) < 0)
         return -1;
     ms_tv(t.value_ms, &value->it_value);
     ms_tv(t.interval_ms, &value->it_interval);
@@ -614,7 +614,7 @@ int setitimer(int which, const struct itimerval *value, struct itimerval *old)
         t.value_ms = tv_ms(&value->it_value);
         t.interval_ms = tv_ms(&value->it_interval);
     }
-    if (ret(sc3(SYS_setitimer, which, value ? (int)&t : 0, (int)&o)) < 0)
+    if (ret(sc3(SYS_setitimer, which, value ? (long)&t : 0, (long)&o)) < 0)
         return -1;
     if (old) {
         ms_tv(o.value_ms, &old->it_value);
@@ -626,7 +626,7 @@ int setitimer(int which, const struct itimerval *value, struct itimerval *old)
 unsigned int alarm(unsigned int seconds)
 {
     struct flux_itimer t = { seconds > 0x7FFFFFFF / 1000 ? 0x7FFFFFFF : seconds * 1000, 0 }, o;
-    if (sc3(SYS_setitimer, ITIMER_REAL, (int)&t, (int)&o) < 0)
+    if (sc3(SYS_setitimer, ITIMER_REAL, (long)&t, (long)&o) < 0)
         return 0;
     return (o.value_ms + 999) / 1000;
 }
@@ -740,14 +740,34 @@ pid_t wait3(int *status, int options, struct rusage *usage)
     return wait4(-1, status, options, usage);
 }
 
-/* ---- resource limits: what the kernel enforces, reported ---- */
+/* ---- resource limits: what the kernel enforces, reported ----
+ *
+ * The stack's is the one that can be set (and is kept by the kernel, for
+ * the programs run from this one too): how far the first thread's stack
+ * may grow, 32 MiB unless raised. A 64-bit program's may be raised as far
+ * as there is memory for; a 32-bit program's address space has room for
+ * those 32 MiB and no more, whatever the limit says.
+ */
+static rlim_t stack_rlim(uint64_t v)
+{
+#ifndef __x86_64__
+    if (v > FLUX_STACK_ROOM32)
+        return FLUX_STACK_ROOM32;
+#endif
+    return v == FLUX_RLIM_INFINITY ? RLIM_INFINITY : (rlim_t)v;
+}
 
 int getrlimit(int resource, struct rlimit *rl)
 {
     switch (resource) {
-    case RLIMIT_STACK:
-        rl->rlim_cur = rl->rlim_max = 32ul * 1024 * 1024;
+    case RLIMIT_STACK: {
+        struct flux_rlimit l;
+        if (ret((int)sc2(SYS_getrlimit, FLUX_RLIMIT_STACK, (long)&l)) < 0)
+            return -1;
+        rl->rlim_cur = stack_rlim(l.cur);
+        rl->rlim_max = stack_rlim(l.max);
         return 0;
+    }
     case RLIMIT_NOFILE:
         rl->rlim_cur = rl->rlim_max = OPEN_MAX;
         return 0;
@@ -772,6 +792,13 @@ int getrlimit(int resource, struct rlimit *rl)
 
 int setrlimit(int resource, const struct rlimit *rl)
 {
+    if (resource == RLIMIT_STACK) {
+        struct flux_rlimit l = {
+            rl->rlim_cur == RLIM_INFINITY ? FLUX_RLIM_INFINITY : rl->rlim_cur,
+            rl->rlim_max == RLIM_INFINITY ? FLUX_RLIM_INFINITY : rl->rlim_max,
+        };
+        return ret((int)sc2(SYS_setrlimit, FLUX_RLIMIT_STACK, (long)&l));
+    }
     struct rlimit cur;
     if (getrlimit(resource, &cur) < 0)
         return -1;
@@ -796,7 +823,7 @@ int killpg(pid_t pgrp, int sig)
 int sigpending(sigset_t *set)
 {
     uint32_t s;
-    if (ret(sc1(SYS_sigpending, (int)&s)) < 0)
+    if (ret(sc1(SYS_sigpending, (long)&s)) < 0)
         return -1;
     *set = s;
     return 0;
@@ -818,14 +845,14 @@ int sigaltstack(const stack_t *ss, stack_t *old)
 {
     struct flux_stack ks, ko;
     if (ss) {
-        ks.sp = (uint32_t)ss->ss_sp;
+        ks.sp = (uintptr_t)ss->ss_sp;
         ks.flags = (uint32_t)ss->ss_flags;
         ks.size = ss->ss_size;
     }
-    if (ret(sc2(SYS_sigaltstack, ss ? (int)&ks : 0, old ? (int)&ko : 0)) < 0)
+    if (ret(sc2(SYS_sigaltstack, ss ? (long)&ks : 0, old ? (long)&ko : 0)) < 0)
         return -1;
     if (old) {
-        old->ss_sp = (void *)ko.sp;
+        old->ss_sp = (void *)(uintptr_t)ko.sp;
         old->ss_flags = (int)ko.flags;
         old->ss_size = ko.size;
     }
@@ -896,7 +923,7 @@ int munlock(const void *addr, size_t len) { (void)addr; (void)len; return 0; }
 int brk(void *addr)
 {
     void *cur = sbrk(0);
-    if (sbrk((int)((char *)addr - (char *)cur)) == (void *)-1)
+    if (sbrk((char *)addr - (char *)cur) == (void *)-1)
         return -1;
     return 0;
 }

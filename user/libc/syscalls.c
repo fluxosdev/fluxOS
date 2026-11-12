@@ -32,53 +32,79 @@
 #include "pthread_impl.h"
 
 
-static inline int sc0(int n)
+/*
+ * The kernel's interface: int 0x80 with the call's number in eax, its
+ * arguments in the registers ebx, ecx, edx, esi and edi and the result in
+ * eax, all of them whole: a long, which is 64 bits in a 64-bit program
+ * (rbx and the rest), where an address does not fit 32. A pointer goes in
+ * as (long)p: one cut down to an int on the way would be an integer to the
+ * compiler, which would then take it that nothing reads or writes what it
+ * pointed at. What comes back is a number, a negative error among them, or
+ * an address, which is_err() tells from an error.
+ */
+static inline int is_err(long r)
 {
-    int r;
+    return (unsigned long)r >= (unsigned long)-4095;
+}
+
+static inline long sc0(int n)
+{
+    long r;
     __asm__ volatile("int $0x80" : "=a"(r) : "a"(n) : "memory");
     return r;
 }
 
-static inline int sc1(int n, int a)
+static inline long sc1(int n, long a)
 {
-    int r;
+    long r;
     __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a) : "memory");
     return r;
 }
 
-static inline int sc2(int n, int a, int b)
+static inline long sc2(int n, long a, long b)
 {
-    int r;
+    long r;
     __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a), "c"(b) : "memory");
     return r;
 }
 
-static inline int sc3(int n, int a, int b, int c)
+static inline long sc3(int n, long a, long b, long c)
 {
-    int r;
+    long r;
     __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a), "c"(b), "d"(c) : "memory");
     return r;
 }
 
-static inline int sc4(int n, int a, int b, int c, int d)
+static inline long sc4(int n, long a, long b, long c, long d)
 {
-    int r;
+    long r;
     __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a), "c"(b), "d"(c), "S"(d) : "memory");
     return r;
 }
 
-static inline int sc5(int n, int a, int b, int c, int d, int e)
+static inline long sc5(int n, long a, long b, long c, long d, long e)
 {
-    int r;
+    long r;
     __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "b"(a), "c"(b), "d"(c), "S"(d), "D"(e)
                      : "memory");
     return r;
 }
 
-static int ret(int r)
+/* A call's result that is a number (which fits an int) or an error. */
+static int ret(long r)
 {
-    if ((unsigned int)r >= (unsigned int)-4095) {
-        errno = -r;
+    if (is_err(r)) {
+        errno = (int)-r;
+        return -1;
+    }
+    return (int)r;
+}
+
+/* One that is a count of bytes or a position in a file. */
+static long retl(long r)
+{
+    if (is_err(r)) {
+        errno = (int)-r;
         return -1;
     }
     return r;
@@ -95,7 +121,7 @@ void _exit(int status)
 pid_t fork(void)
 {
     __fork_prepare();
-    int r = sc0(SYS_fork);
+    int r = (int)sc0(SYS_fork);
     if (r == 0)
         __fork_child();
     else
@@ -105,11 +131,21 @@ pid_t fork(void)
 
 int execve(const char *path, char *const argv[], char *const envp[])
 {
-    return ret(sc3(SYS_execve, (int)path, (int)argv, (int)envp));
+    return ret(sc3(SYS_execve, (long)path, (long)argv, (long)envp));
 }
 
-ssize_t read(int fd, void *buf, size_t n) { return ret(sc3(SYS_read, fd, (int)buf, (int)n)); }
-ssize_t write(int fd, const void *buf, size_t n) { return ret(sc3(SYS_write, fd, (int)buf, (int)n)); }
+/* A count of bytes for a call that takes 32 bits of it and answers with an
+ * int (a socket's, a path's): more than 2 GiB at once (a 64-bit program
+ * can ask) is done in part, as such a call may, and a buffer is never taken
+ * for smaller than it is by more than that. */
+static inline int count(size_t n)
+{
+    return n > 0x7FFFF000u ? 0x7FFFF000 : (int)n;
+}
+
+/* (The whole count, and what was moved of it: a 64-bit program's are 64 bits.) */
+ssize_t read(int fd, void *buf, size_t n) { return (ssize_t)retl(sc3(SYS_read, fd, (long)buf, (long)n)); }
+ssize_t write(int fd, const void *buf, size_t n) { return (ssize_t)retl(sc3(SYS_write, fd, (long)buf, (long)n)); }
 
 int open(const char *path, int flags, ...)
 {
@@ -120,7 +156,7 @@ int open(const char *path, int flags, ...)
         mode = (mode_t)va_arg(ap, int);
         va_end(ap);
     }
-    return ret(sc3(SYS_open, (int)path, flags, (int)mode));
+    return ret(sc3(SYS_open, (long)path, flags, (int)mode));
 }
 
 int creat(const char *path, mode_t mode)
@@ -130,10 +166,11 @@ int creat(const char *path, mode_t mode)
 
 int fcntl(int fd, int cmd, ...)
 {
-    int arg = 0;
+    /* (An int, or for the lock commands an address: as wide as the wider.) */
+    long arg = 0;
     va_list ap;
     va_start(ap, cmd);
-    arg = va_arg(ap, int);
+    arg = va_arg(ap, long);
     va_end(ap);
     switch (cmd) {
     case F_GETLK:                       /* one user: no lock is ever in the way */
@@ -154,25 +191,30 @@ int fcntl(int fd, int cmd, ...)
 int close(int fd) { return ret(sc1(SYS_close, fd)); }
 int dup(int fd) { return ret(sc1(SYS_dup, fd)); }
 int dup2(int oldfd, int newfd) { return ret(sc2(SYS_dup2, oldfd, newfd)); }
-int pipe(int fds[2]) { return ret(sc1(SYS_pipe, (int)fds)); }
-off_t lseek(int fd, off_t off, int whence) { return ret(sc3(SYS_lseek, fd, off, whence)); }
+int pipe(int fds[2]) { return ret(sc1(SYS_pipe, (long)fds)); }
+off_t lseek(int fd, off_t off, int whence) { return (off_t)retl(sc3(SYS_lseek, fd, off, whence)); }
 
+/* Positions past what a 32-bit program's off_t holds; lseek itself in a 64-bit one. */
 off64_t lseek64(int fd, off64_t off, int whence)
 {
+#ifdef __x86_64__
+    return lseek(fd, off, whence);
+#else
     uint64_t pos;
-    if (ret(sc5(SYS_llseek, fd, (int)((uint64_t)off >> 32), (int)off, (int)&pos, whence)) < 0)
+    if (ret(sc5(SYS_llseek, fd, (int)((uint64_t)off >> 32), (int)off, (long)&pos, whence)) < 0)
         return -1;
     return (off64_t)pos;
+#endif
 }
 
 pid_t waitpid(pid_t pid, int *status, int options)
 {
-    return ret(sc3(SYS_waitpid, pid, (int)status, options));
+    return ret(sc3(SYS_waitpid, pid, (long)status, options));
 }
 
 pid_t wait(int *status) { return waitpid(-1, status, 0); }
 
-int chdir(const char *path) { return ret(sc1(SYS_chdir, (int)path)); }
+int chdir(const char *path) { return ret(sc1(SYS_chdir, (long)path)); }
 
 /* getcwd(NULL, size), as glibc has it: a buffer of size bytes (0: as long as the path) from
  * malloc. */
@@ -183,14 +225,14 @@ char *getcwd(char *buf, size_t size)
             errno = EINVAL;
             return NULL;
         }
-        return ret(sc2(SYS_getcwd, (int)buf, (int)size)) < 0 ? NULL : buf;
+        return ret(sc2(SYS_getcwd, (long)buf, count(size))) < 0 ? NULL : buf;
     }
     char *b = malloc(size ? size : PATH_MAX);
     if (!b) {
         errno = ENOMEM;
         return NULL;
     }
-    if (ret(sc2(SYS_getcwd, (int)b, (int)(size ? size : PATH_MAX))) < 0) {
+    if (ret(sc2(SYS_getcwd, (long)b, (int)(size ? size : PATH_MAX))) < 0) {
         int e = errno;
         free(b);
         errno = e;
@@ -206,11 +248,11 @@ char *getcwd(char *buf, size_t size)
 
 int mkdir(const char *path, mode_t mode)
 {
-    return ret(sc2(SYS_mkdir, (int)path, (int)mode));
+    return ret(sc2(SYS_mkdir, (long)path, (int)mode));
 }
 
-int rmdir(const char *path) { return ret(sc1(SYS_rmdir, (int)path)); }
-int chmod(const char *path, mode_t mode) { return ret(sc2(SYS_chmod, (int)path, (int)mode)); }
+int rmdir(const char *path) { return ret(sc1(SYS_rmdir, (long)path)); }
+int chmod(const char *path, mode_t mode) { return ret(sc2(SYS_chmod, (long)path, (int)mode)); }
 mode_t umask(mode_t mask) { return (mode_t)sc1(SYS_umask, (int)mask); }
 int utime(const char *path, const struct utimbuf *times)
 {
@@ -219,7 +261,7 @@ int utime(const char *path, const struct utimbuf *times)
         ft.actime = (uint32_t)times->actime;
         ft.modtime = (uint32_t)times->modtime;
     }
-    return ret(sc2(SYS_utime, (int)path, times ? (int)&ft : 0));
+    return ret(sc2(SYS_utime, (long)path, times ? (long)&ft : 0));
 }
 
 int utimes(const char *path, const struct timeval times[2])
@@ -229,17 +271,17 @@ int utimes(const char *path, const struct timeval times[2])
         ft.actime = (uint32_t)times[0].tv_sec;
         ft.modtime = (uint32_t)times[1].tv_sec;
     }
-    return ret(sc2(SYS_utime, (int)path, times ? (int)&ft : 0));
+    return ret(sc2(SYS_utime, (long)path, times ? (long)&ft : 0));
 }
-int unlink(const char *path) { return ret(sc1(SYS_unlink, (int)path)); }
-int rename(const char *from, const char *to) { return ret(sc2(SYS_rename, (int)from, (int)to)); }
-int stat(const char *path, struct stat *st) { return ret(sc2(SYS_stat, (int)path, (int)st)); }
-int lstat(const char *path, struct stat *st) { return ret(sc2(SYS_lstat, (int)path, (int)st)); }
-int fstat(int fd, struct stat *st) { return ret(sc2(SYS_fstat, fd, (int)st)); }
+int unlink(const char *path) { return ret(sc1(SYS_unlink, (long)path)); }
+int rename(const char *from, const char *to) { return ret(sc2(SYS_rename, (long)from, (long)to)); }
+int stat(const char *path, struct stat *st) { return ret(sc2(SYS_stat, (long)path, (long)st)); }
+int lstat(const char *path, struct stat *st) { return ret(sc2(SYS_lstat, (long)path, (long)st)); }
+int fstat(int fd, struct stat *st) { return ret(sc2(SYS_fstat, fd, (long)st)); }
 
 int getdents(int fd, struct dirent *buf, unsigned int count)
 {
-    return ret(sc3(SYS_getdents, fd, (int)buf, (int)count));
+    return ret(sc3(SYS_getdents, fd, (long)buf, (int)(count > 0x7FFFF000u ? 0x7FFFF000u : count)));
 }
 
 pid_t getpid(void) { return sc0(SYS_getpid); }
@@ -253,12 +295,12 @@ int setgid(gid_t gid) { (void)gid; return 0; }
 /* Owners stay where the filesystem keeps them (ext2); -1 keeps one. */
 int chown(const char *path, uid_t owner, gid_t group)
 {
-    return ret(sc4(SYS_chown, (int)path, (int)owner, (int)group, 1));
+    return ret(sc4(SYS_chown, (long)path, (int)owner, (int)group, 1));
 }
 
 int lchown(const char *path, uid_t owner, gid_t group)
 {
-    return ret(sc4(SYS_chown, (int)path, (int)owner, (int)group, 0));
+    return ret(sc4(SYS_chown, (long)path, (int)owner, (int)group, 0));
 }
 
 int fchown(int fd, uid_t owner, gid_t group)
@@ -268,12 +310,12 @@ int fchown(int fd, uid_t owner, gid_t group)
 
 /* Links are ext2's (and a symbolic one ramfs's too); FAT has neither:
  * EPERM, as Linux answers for vfat. */
-int link(const char *from, const char *to) { return ret(sc2(SYS_link, (int)from, (int)to)); }
-int symlink(const char *target, const char *path) { return ret(sc2(SYS_symlink, (int)target, (int)path)); }
+int link(const char *from, const char *to) { return ret(sc2(SYS_link, (long)from, (long)to)); }
+int symlink(const char *target, const char *path) { return ret(sc2(SYS_symlink, (long)target, (long)path)); }
 
 ssize_t readlink(const char *path, char *buf, size_t size)
 {
-    return ret(sc3(SYS_readlink, (int)path, (int)buf, (int)size));
+    return ret(sc3(SYS_readlink, (long)path, (long)buf, count(size)));
 }
 int kill(pid_t pid, int sig) { return ret(sc2(SYS_kill, pid, sig)); }
 int raise(int sig) { return kill(getpid(), sig); }
@@ -299,17 +341,17 @@ int sigaction(int sig, const struct sigaction *act, struct sigaction *oldact)
 {
     struct flux_sigaction kact, koact;
     if (act) {
-        kact.fsa_handler = (uint32_t)act->sa_handler;
+        kact.fsa_handler = (uintptr_t)act->sa_handler;
         kact.fsa_flags = act->sa_flags;
         kact.fsa_mask = act->sa_mask;
-        kact.fsa_restorer = (uint32_t)(act->sa_restorer ? act->sa_restorer : __sigrestorer);
+        kact.fsa_restorer = (uintptr_t)(act->sa_restorer ? act->sa_restorer : __sigrestorer);
     }
-    int r = ret(sc3(SYS_sigaction, sig, act ? (int)&kact : 0, oldact ? (int)&koact : 0));
+    int r = ret(sc3(SYS_sigaction, sig, act ? (long)&kact : 0, oldact ? (long)&koact : 0));
     if (r == 0 && oldact) {
-        oldact->sa_handler = (sighandler_t)koact.fsa_handler;
+        oldact->sa_handler = (sighandler_t)(uintptr_t)koact.fsa_handler;
         oldact->sa_flags = koact.fsa_flags;
         oldact->sa_mask = koact.fsa_mask;
-        oldact->sa_restorer = (void (*)(void))koact.fsa_restorer;
+        oldact->sa_restorer = (void (*)(void))(uintptr_t)koact.fsa_restorer;
     }
     return r;
 }
@@ -328,7 +370,7 @@ sighandler_t signal(int sig, sighandler_t handler)
 
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
 {
-    return ret(sc3(SYS_sigprocmask, how, (int)set, (int)oldset));
+    return ret(sc3(SYS_sigprocmask, how, (long)set, (long)oldset));
 }
 
 int sigemptyset(sigset_t *set)
@@ -380,32 +422,36 @@ int sigismember(const sigset_t *set, int sig)
     return (*set & (1u << sig)) != 0;
 }
 
-void __sigjmp_save_mask(uint32_t *env)
+/* (setjmp's buffer: its last word, the ninth of a 64-bit program's ten and
+ * the seventh of a 32-bit one's eight, counted from 0.) */
+#define JB_MASK (sizeof(jmp_buf) / sizeof(((jmp_buf *)0)[0][0]) - 1)
+
+void __sigjmp_save_mask(jmp_buf env)
 {
     sigset_t mask = 0;
     sigprocmask(SIG_SETMASK, NULL, &mask);
-    env[7] = mask;
+    env[JB_MASK] = mask;
 }
 
-void __sigjmp_restore_mask(const uint32_t *env)
+void __sigjmp_restore_mask(const jmp_buf env)
 {
-    sigset_t mask = env[7];
+    sigset_t mask = (sigset_t)env[JB_MASK];
     sigprocmask(SIG_SETMASK, &mask, NULL);
 }
 
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
 {
     struct flux_mmap_args a = {
-        .addr = (uint32_t)addr,
-        .len = (uint32_t)len,
+        .addr = (uintptr_t)addr,
+        .len = len,
         .prot = (uint32_t)prot,
         .flags = (uint32_t)flags,
         .fd = (int32_t)fd,
-        .offset = (uint32_t)offset,
+        .offset = (uintptr_t)offset,
     };
-    int r = sc1(SYS_mmap, (int)&a);
-    if ((unsigned int)r >= (unsigned int)-4095) {
-        errno = -r;
+    long r = sc1(SYS_mmap, (long)&a);
+    if (is_err(r)) {
+        errno = (int)-r;
         return MAP_FAILED;
     }
     return (void *)r;
@@ -413,18 +459,22 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
 
 int munmap(void *addr, size_t len)
 {
-    return ret(sc2(SYS_munmap, (int)addr, (int)len));
+    return ret(sc2(SYS_munmap, (long)addr, (long)len));
 }
 
 int mprotect(void *addr, size_t len, int prot)
 {
-    return ret(sc3(SYS_mprotect, (int)addr, (int)len, prot));
+    return ret(sc3(SYS_mprotect, (long)addr, (long)len, prot));
 }
 
-void *sbrk(int incr)
+void *sbrk(intptr_t incr)
 {
-    int r = ret(sc1(SYS_sbrk, incr));
-    return r == -1 ? (void *)-1 : (void *)r;
+    long r = sc1(SYS_sbrk, incr);
+    if (is_err(r)) {
+        errno = (int)-r;
+        return (void *)-1;
+    }
+    return (void *)r;
 }
 
 int msleep(unsigned int ms) { return ret(sc1(SYS_sleep, (int)ms)); }
@@ -481,7 +531,7 @@ int gettimeofday(struct timeval *tv, struct timezone *tz)
 clock_t times(struct tms *buf)
 {
     struct flux_tms ft;
-    int r = ret(sc1(SYS_times, buf ? (int)&ft : 0));
+    int r = ret(sc1(SYS_times, buf ? (long)&ft : 0));
     if (r >= 0 && buf) {
         buf->tms_utime = (clock_t)ft.tms_utime;
         buf->tms_stime = (clock_t)ft.tms_stime;
@@ -518,57 +568,57 @@ int getrusage(int who, struct rusage *usage)
     return 0;
 }
 
-int uname(struct utsname *buf) { return ret(sc1(SYS_uname, (int)buf)); }
+int uname(struct utsname *buf) { return ret(sc1(SYS_uname, (long)buf)); }
 int sched_yield(void) { return sc0(SYS_yield); }
 int ttymode(int mode) { return sc1(SYS_ttymode, mode); }
-int procinfo(int slot, struct procinfo *pi) { return ret(sc2(SYS_procinfo, slot, (int)pi)); }
-int meminfo(struct meminfo *mi) { return ret(sc1(SYS_meminfo, (int)mi)); }
+int procinfo(int slot, struct procinfo *pi) { return ret(sc2(SYS_procinfo, slot, (long)pi)); }
+int meminfo(struct meminfo *mi) { return ret(sc1(SYS_meminfo, (long)mi)); }
 unsigned int uptime_ms(void) { return (unsigned int)sc0(SYS_uptime); }
 int reboot(int cmd) { return ret(sc1(SYS_reboot, cmd)); }
-int dmesg(char *buf, unsigned int size) { return ret(sc2(SYS_dmesg, (int)buf, (int)size)); }
+int dmesg(char *buf, unsigned int size) { return ret(sc2(SYS_dmesg, (long)buf, (int)size)); }
 int mount(const char *source, const char *target, const char *type)
 {
-    return ret(sc3(SYS_mount, (int)source, (int)target, (int)type));
+    return ret(sc3(SYS_mount, (long)source, (long)target, (long)type));
 }
-int umount(const char *target) { return ret(sc1(SYS_umount, (int)target)); }
+int umount(const char *target) { return ret(sc1(SYS_umount, (long)target)); }
 void sync(void) { sc0(SYS_sync); }
-int blkrescan(const char *disk) { return ret(sc1(SYS_blkrescan, (int)disk)); }
+int blkrescan(const char *disk) { return ret(sc1(SYS_blkrescan, (long)disk)); }
 int fstrim(const char *path, unsigned long long *trimmed)
 {
-    return ret(sc2(SYS_fstrim, (int)path, (int)trimmed));
+    return ret(sc2(SYS_fstrim, (long)path, (long)trimmed));
 }
 int fsync(int fd) { return ret(sc1(SYS_fsync, fd)); }
-int ftruncate(int fd, off_t size) { return ret(sc2(SYS_ftruncate, fd, (int)size)); }
-int statfs(const char *path, struct statfs *st) { return ret(sc2(SYS_statfs, (int)path, (int)st)); }
-int getmounts(char *buf, unsigned int size) { return ret(sc2(SYS_getmounts, (int)buf, (int)size)); }
-int blkinfo(int index, struct blkinfo *bi) { return ret(sc2(SYS_blkinfo, index, (int)bi)); }
-int usbinfo(int index, struct usbinfo *ui) { return ret(sc2(SYS_usbinfo, index, (int)ui)); }
-int power(int op, unsigned int arg) { return ret(sc2(SYS_power, op, (int)arg)); }
-int wifi(int op, void *arg) { return ret(sc2(SYS_wifi, op, (int)arg)); }
+int ftruncate(int fd, off_t size) { return ret(sc2(SYS_ftruncate, fd, size)); }
+int statfs(const char *path, struct statfs *st) { return ret(sc2(SYS_statfs, (long)path, (long)st)); }
+int getmounts(char *buf, unsigned int size) { return ret(sc2(SYS_getmounts, (long)buf, (int)size)); }
+int blkinfo(int index, struct blkinfo *bi) { return ret(sc2(SYS_blkinfo, index, (long)bi)); }
+int usbinfo(int index, struct usbinfo *ui) { return ret(sc2(SYS_usbinfo, index, (long)ui)); }
+int power(int op, unsigned long arg) { return ret(sc2(SYS_power, op, (long)arg)); }
+int wifi(int op, void *arg) { return ret(sc2(SYS_wifi, op, (long)arg)); }
 
 int poll(struct pollfd *fds, unsigned int nfds, int timeout_ms)
 {
-    return ret(sc3(SYS_poll, (int)fds, (int)nfds, timeout_ms));
+    return ret(sc3(SYS_poll, (long)fds, (int)nfds, timeout_ms));
 }
 
-int openpty(int fds[2]) { return ret(sc1(SYS_openpty, (int)fds)); }
-int fbinfo(struct fbinfo *fi) { return ret(sc1(SYS_fbinfo, (int)fi)); }
-int display(int op, void *arg) { return ret(sc2(SYS_display, op, (int)arg)); }
+int openpty(int fds[2]) { return ret(sc1(SYS_openpty, (long)fds)); }
+int fbinfo(struct fbinfo *fi) { return ret(sc1(SYS_fbinfo, (long)fi)); }
+int display(int op, void *arg) { return ret(sc2(SYS_display, op, (long)arg)); }
 
 int ioctl(int fd, unsigned int request, ...)
 {
     va_list ap;
     va_start(ap, request);
-    int arg = va_arg(ap, int);
+    long arg = va_arg(ap, long);         /* (a number or an address) */
     va_end(ap);
     return ret(sc3(SYS_ioctl, fd, (int)request, arg));
 }
 
 void *fbmap(void)
 {
-    int r = sc0(SYS_fbmap);
-    if ((unsigned int)r >= (unsigned int)-4095) {
-        errno = -r;
+    long r = sc0(SYS_fbmap);
+    if (is_err(r)) {
+        errno = (int)-r;
         return NULL;
     }
     return (void *)r;
@@ -616,12 +666,12 @@ int socket(int domain, int type, int protocol)
 
 int bind(int fd, const struct sockaddr *addr, socklen_t len)
 {
-    return ret(sc3(SYS_bind, fd, (int)addr, (int)len));
+    return ret(sc3(SYS_bind, fd, (long)addr, (int)len));
 }
 
 int connect(int fd, const struct sockaddr *addr, socklen_t len)
 {
-    return ret(sc3(SYS_connect, fd, (int)addr, (int)len));
+    return ret(sc3(SYS_connect, fd, (long)addr, (int)len));
 }
 
 int listen(int fd, int backlog) { return ret(sc2(SYS_listen, fd, backlog)); }
@@ -638,7 +688,7 @@ static void give_addr(const struct sockaddr_in *sin, struct sockaddr *addr, sock
 int accept(int fd, struct sockaddr *addr, socklen_t *len)
 {
     struct sockaddr_in sin = { 0 };     /* an AF_UNIX peer has no address for the kernel to fill */
-    int r = ret(sc2(SYS_accept, fd, (int)&sin));
+    int r = ret(sc2(SYS_accept, fd, (long)&sin));
     if (r >= 0)
         give_addr(&sin, addr, len);
     return r;
@@ -651,13 +701,13 @@ ssize_t sendto(int fd, const void *buf, size_t n, int flags, const struct sockad
         errno = EINVAL;
         return -1;
     }
-    return ret(sc5(SYS_sendto, fd, (int)buf, (int)n, flags, (int)to));
+    return ret(sc5(SYS_sendto, fd, (long)buf, count(n), flags, (long)to));
 }
 
 ssize_t recvfrom(int fd, void *buf, size_t n, int flags, struct sockaddr *from, socklen_t *len)
 {
     struct sockaddr_in sin;
-    int r = ret(sc5(SYS_recvfrom, fd, (int)buf, (int)n, flags, from ? (int)&sin : 0));
+    int r = ret(sc5(SYS_recvfrom, fd, (long)buf, count(n), flags, from ? (long)&sin : 0));
     if (r >= 0)
         give_addr(&sin, from, len);
     return r;
@@ -670,7 +720,7 @@ int shutdown(int fd, int how) { return ret(sc2(SYS_shutdown, fd, how)); }
 static int sockname(int fd, struct sockaddr *addr, socklen_t *len, int peer)
 {
     struct sockaddr_in sin;
-    int r = ret(sc3(SYS_sockname, fd, (int)&sin, peer));
+    int r = ret(sc3(SYS_sockname, fd, (long)&sin, peer));
     if (r == 0)
         give_addr(&sin, addr, len);
     return r;
@@ -679,8 +729,8 @@ static int sockname(int fd, struct sockaddr *addr, socklen_t *len, int peer)
 int getsockname(int fd, struct sockaddr *addr, socklen_t *len) { return sockname(fd, addr, len, 0); }
 int getpeername(int fd, struct sockaddr *addr, socklen_t *len) { return sockname(fd, addr, len, 1); }
 
-int netinfo(struct netinfo *ni) { return ret(sc1(SYS_netinfo, (int)ni)); }
-int netconf(const struct netinfo *ni) { return ret(sc1(SYS_netconf, (int)ni)); }
+int netinfo(struct netinfo *ni) { return ret(sc1(SYS_netinfo, (long)ni)); }
+int netconf(const struct netinfo *ni) { return ret(sc1(SYS_netconf, (long)ni)); }
 
 /* ---- shared memory ---- */
 
@@ -727,10 +777,10 @@ void *shmat(int id, const void *addr, int flags)
         return (void *)-1;
     }
     uint32_t size = 0;
-    int r = sc2(SYS_shmat, id, (int)&size);
-    if ((unsigned int)r >= (unsigned int)-4095) {
+    long r = sc2(SYS_shmat, id, (long)&size);
+    if (is_err(r)) {
         shm_unlock_table();
-        errno = -r;
+        errno = (int)-r;
         return (void *)-1;
     }
     shm_attached[slot].addr = (void *)r;
@@ -758,7 +808,7 @@ int shmdt(const void *addr)
 int shmctl(int id, int cmd, struct shmid_ds *buf)
 {
     struct flux_shmid_ds ds;
-    int r = ret(sc3(SYS_shmctl, id, cmd, (int)&ds));
+    int r = ret(sc3(SYS_shmctl, id, cmd, (long)&ds));
     if (r == 0 && cmd == IPC_STAT && buf) {
         buf->shm_segsz = ds.shm_segsz;
         buf->shm_cpid = ds.shm_cpid;

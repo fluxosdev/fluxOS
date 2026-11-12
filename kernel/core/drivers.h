@@ -33,7 +33,7 @@ int fb_panic(void);                     /* the panic screen takes the screen */
 int fb_get_info(struct fbinfo *fi);
 int fb_map_user(void);
 void fb_proc_exit(int pid);             /* at exit and exec: the screen and GPU it held */
-int fb_pinned(int pid, uint32_t start, uint32_t end);  /* radeon_pinned, under the display lock */
+int fb_pinned(int pid, uint64_t start, uint64_t end);  /* radeon_pinned, under the display lock */
 int fb_wake_mode(void);                 /* on waking: 1 the boot mode again, 0 text, -1 none possible */
 void fb_suspend(void);                  /* holds the display lock until fb_resume() */
 void fb_resume(void);
@@ -72,7 +72,7 @@ void radeon_proc_exit(int pid);         /* its buffers and the 3D engine */
 int radeon_can_resume(void);            /* suspend to RAM: in the BIOS mode, without the 3D engine */
 void radeon_resume(void);               /* the page and the pointer, after waking */
 /* Are any of pid's pages in [start, end) lent to the GPU (DISP_MAPBUF)? */
-int radeon_pinned(int pid, uint32_t start, uint32_t end);
+int radeon_pinned(int pid, uint64_t start, uint64_t end);
 
 /* AMD Radeon RX 5500 (Navi 14, DCN 2.0) display driver (navi.c): page
  * flipping and a hardware pointer in the BIOS mode */
@@ -106,7 +106,7 @@ int intel_copy_rects(const struct dispcopy *c);
 int intel_blit(const struct dispblit *b, int screen_owner);
 int intel_mapbuf(struct dispbuf *b);
 int intel_unmapbuf(const struct dispbuf *b);
-int intel_pinned(int pid, uint32_t start, uint32_t end);
+int intel_pinned(int pid, uint64_t start, uint64_t end);
 void intel_proc_exit(int pid);          /* its lent buffers and the 3D engine */
 int intel_map3d(struct disp3d *d);      /* the 3D engine's memory (intel_3d.c) */
 int intel_submit3d(const struct dispsubmit *s);    /* a list of drawing operations */
@@ -221,7 +221,7 @@ int usbmsc_in_use(void);                /* a USB disk has a file system mounted 
 int iwl_probe(void);                    /* from net_init: 0 if a card was found */
 int wifi_sim_probe(void);               /* wifi.sim: a simulated card, for trying the station */
 void wifi_start(void);                  /* after the scheduler: the card's thread */
-int wifi_syscall(uint32_t op, uint32_t arg);   /* SYS_wifi; arg checked by it */
+int wifi_syscall(uint32_t op, uintptr_t arg);   /* SYS_wifi; arg checked by it */
 
 /*
  * Input events for the desktop (/dev/input). While that device is open,
@@ -257,7 +257,7 @@ void acpi_power_start(void);            /* its threads and events, once processe
 void acpi_prepare_poweroff(void);       /* _PTS, before interrupts go off */
 void acpi_poweroff(void);               /* interrupts off; returns only if it failed */
 void acpi_button(int sleep);            /* the keyboard's power (0) or sleep (1) key, with no desktop */
-int power_syscall(uint32_t op, uint32_t arg);  /* SYS_power; arg checked by the caller */
+int power_syscall(uint32_t op, uintptr_t arg);  /* SYS_power; arg checked by the caller */
 /* Suspend to RAM (sleep.c): 0 once the machine is back, or -errno. */
 int acpi_suspend(void);
 const char *acpi_sleep_blocker(void);   /* why suspend cannot be tried, or NULL */

@@ -53,11 +53,11 @@ int iwl_read_file(const char *path, uint8_t **out, uint32_t *len, uint32_t *page
         vfs_unlock();
         return r < 0 ? r : -ENOENT;
     }
-    uint32_t size = vn->size;
-    if (!size || size > (16u << 20)) {
+    if (!vn->size || vn->size > (16u << 20)) {
         vfs_unlock();
         return -EINVAL;
     }
+    uint32_t size = (uint32_t)vn->size;
     uint32_t n = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     uint8_t *buf = n ? pmm_alloc_pages(n) : NULL;
     if (!buf) {

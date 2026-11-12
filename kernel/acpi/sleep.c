@@ -238,6 +238,7 @@ static void machine_sleep(void)
     if (slept) {
         cpu_resume();
         fpu_init_cpu();
+        proc_load_tls(current);         /* the thread block of the thread that put it to sleep */
     }
     pic_resume();
     pit_resume();

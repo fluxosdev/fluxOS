@@ -276,7 +276,7 @@ static void *demux_main(void *arg)
 static void write_all(struct sess *s, const uint8_t *buf, int n)
 {
     while (n > 0 && !s->quit) {
-        int w = (int)write(s->dsp, buf, (size_t)n);
+        ssize_t w = write(s->dsp, buf, (size_t)n);
         if (w <= 0) {
             if (w < 0 && errno == EINTR)
                 continue;

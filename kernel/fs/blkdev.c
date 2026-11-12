@@ -521,19 +521,12 @@ uint64_t blk_bytes(struct blockdev *bd)
     return (uint64_t)bd->nsectors * bd->sector_size;
 }
 
-/* What stat() shows: the size, or as much of it as 32 bits hold. */
-static uint32_t dev_bytes(struct blockdev *bd)
-{
-    uint64_t bytes = blk_bytes(bd);
-    return bytes > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)bytes;
-}
-
 static int dev_blk_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
 {
     struct blockdev *bd = vn->dev_priv;
     if (bd->refresh && bd->nsectors == 0)
         bd->refresh(bd);
-    vn->size = dev_bytes(bd);
+    vn->size = blk_bytes(bd);          /* (what stat() shows) */
     uint64_t size = blk_bytes(bd);
     if (off >= size)
         return 0;
@@ -546,7 +539,7 @@ static int dev_blk_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
 static int dev_blk_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
 {
     struct blockdev *bd = vn->dev_priv;
-    vn->size = dev_bytes(bd);
+    vn->size = blk_bytes(bd);          /* (what stat() shows) */
     uint64_t size = blk_bytes(bd);
     if (off >= size)
         return -ENOSPC;
@@ -582,7 +575,7 @@ int blk_register(struct blockdev *bd)
             vn->type = VN_BLK;
             vn->mode = 0660;
             vn->dev_priv = bd;
-            vn->size = dev_bytes(bd);
+            vn->size = blk_bytes(bd);          /* (what stat() shows) */
         }
     }
     return 0;

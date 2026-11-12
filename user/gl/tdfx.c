@@ -148,8 +148,8 @@ static int open_card(void)
     struct disp3d d;
     if (display(DISP_INFO, &di) < 0 || !(di.flags & DISPF_3D) || display(DISP_MAP3D, &d) < 0)
         return -1;
-    hw.regs = (volatile uint32_t *)d.regs;
-    hw.vram = (uint8_t *)d.vram;
+    hw.regs = (volatile uint32_t *)(uintptr_t)d.regs;
+    hw.vram = (uint8_t *)(uintptr_t)d.vram;
     hw.vram_size = d.vram_size;
     hw.screen_end = d.screen_end;
     strncpy(hw.name, di.adapter, sizeof(hw.name) - 1);

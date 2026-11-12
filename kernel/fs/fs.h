@@ -23,9 +23,10 @@ struct fs_ops {
     /* Release memory only; sync and the device flush run before teardown. */
     void (*unmount)(struct fs *fs);
     int (*load_dir)(struct vnode *dir);
-    int (*read)(struct vnode *vn, void *buf, uint32_t off, uint32_t n);
-    int (*write)(struct vnode *vn, const void *buf, uint32_t off, uint32_t n);
-    int (*truncate)(struct vnode *vn, uint32_t size);
+    /* off + n and size are within the file (read) or fs->max_file (write, truncate). */
+    int (*read)(struct vnode *vn, void *buf, uint64_t off, uint32_t n);
+    int (*write)(struct vnode *vn, const void *buf, uint64_t off, uint32_t n);
+    int (*truncate)(struct vnode *vn, uint64_t size);
     int (*create)(struct vnode *dir, const char *name, int type, struct vnode **out);
     int (*remove)(struct vnode *vn);
     /* On success, replace dst's directory entry (if present). On failure,
@@ -52,6 +53,7 @@ struct fs {
     void *priv;
     int readonly;
     int case_insensitive;
+    uint64_t max_file;          /* the largest file its format holds, in bytes (mount sets it) */
     uint32_t refs;             /* external vnode references, including unlinked files */
     uint32_t dev;              /* st_dev of its files: a number of its own (ramfs is 1) */
     struct fs *next;

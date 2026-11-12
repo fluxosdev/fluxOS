@@ -11,9 +11,9 @@
  * segment registers are reloaded on the way back to user mode.
  *
  * The user segments' selectors are what they were on the 32-bit kernel
- * (programs have them built in), which leaves entries 8 to 23, once the
- * 32-bit TSSs, unused: the 64-bit ones, two entries each, follow the TLS
- * segment.
+ * (programs have them built in), which left entries 8 to 23, once the
+ * 32-bit TSSs, unused: the first is now the code segment of 64-bit
+ * programs, and the 64-bit TSSs, two entries each, follow the TLS segment.
  */
 #include "kernel.h"
 #include "arch.h"
@@ -80,6 +80,8 @@ void gdt_init(void)
     gdt_set(5, WIN_SEG_BASE, (WIN_SEG_LIMIT >> 12) - 1, 0xFA, 0xC0);
     gdt_set(6, WIN_SEG_BASE, (WIN_SEG_LIMIT >> 12) - 1, 0xF2, 0xC0);
     gdt_set(7, WIN_TEB_LINEAR, (WIN_TEB_SIZE >> 12) - 1, 0xF2, 0xC0);
+    gdt_set(8, 0, 0xFFFFF, 0xFA, 0xAF);     /* user code, ring 3, 64-bit (L) */
+    _Static_assert(SEG_UCODE64 == (8 << 3 | 3), "SEG_USER_CODE64 is entry 8");
     gdt_set(GDT_TLS, 0, 0xFFFFF, 0xF2, 0xCF);           /* user data until a thread sets its base */
 
     memset(tss, 0, sizeof(tss));

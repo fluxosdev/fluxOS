@@ -102,8 +102,8 @@ void initrd_load(const uint8_t *data, uint32_t size)
             if (fsize && vfs_write(vn, content, 0, fsize) != (int)fsize) {
                 uint32_t total, used;
                 heap_stats(&total, &used);
-                panic("initrd: no room for %s (%u KiB): the %u MiB initrd does not fit the %u MiB kernel heap, "
-                      "a quarter of RAM (up to 256 MiB): give the machine more memory", p, fsize / 1024,
+                panic("initrd: no room for %s (%u KiB): the %u MiB initrd does not fit the %u MiB kernel heap "
+                      "(at most half of the first GiB of memory): give the machine more memory", p, fsize / 1024,
                       size >> 20, total >> 20);
             }
             vn->mode = mode & 07777;

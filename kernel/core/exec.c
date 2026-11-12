@@ -1,10 +1,17 @@
 /*
- * execve: load a static ELF32 executable (or a "#!" script, a Windows
+ * execve: load a static ELF executable (or a "#!" script, a Windows
  * program, which runs under /bin/winrun, or a DOS program, which runs
  * under /bin/dos) into a new address space and build the initial user
  * stack:
  *
  *   sp -> argc, argv[0..argc-1], NULL, envp[0..n-1], NULL, strings...
+ *
+ * The executable is a 64-bit one for x86-64 (ELF64), which runs in 64-bit
+ * mode, or a 32-bit one for the 386 (ELF32), which runs in the
+ * processor's compatibility mode. Both are loaded from USER_BASE; a 32-bit
+ * program's heap follows it and its stack ends at USER_TOP, a 64-bit
+ * program's heap and stack are far above (kernel.h), the words of its
+ * stack are 8 bytes, and its stack pointer is 16-byte aligned.
  */
 #include "kernel.h"
 #include "drivers.h"
@@ -15,6 +22,7 @@
 #define ELF_MAGIC "\x7f" "ELF"
 #define ET_EXEC   2
 #define EM_386    3
+#define EM_X86_64 62
 #define PT_LOAD   1
 #define PF_X      1
 #define PF_W      2
@@ -38,6 +46,25 @@ struct elf32_ehdr {
 struct elf32_phdr {
     uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
 } __attribute__((packed));
+
+struct elf64_ehdr {
+    uint8_t ident[16];
+    uint16_t type, machine;
+    uint32_t version;
+    uint64_t entry, phoff, shoff;
+    uint32_t flags;
+    uint16_t ehsize, phentsize, phnum, shentsize, shnum, shstrndx;
+} __attribute__((packed));
+
+struct elf64_phdr {
+    uint32_t type, flags;
+    uint64_t offset, vaddr, paddr, filesz, memsz, align;
+} __attribute__((packed));
+
+/* A loadable segment of either kind (a 64-bit program's are below 4 GiB too: checked). */
+struct segment {
+    uint32_t flags, offset, vaddr, filesz, memsz;
+};
 
 static int count_strings(char *const v[], uint32_t *bytes)
 {
@@ -68,13 +95,15 @@ static int image_load(struct vnode *vn, struct image *img)
 {
     img->vn = vn;
     img->owned = NULL;
-    img->size = vn->size;
+    if (vn->size > UINT32_MAX)          /* (no program is: its image has to fit below the device window) */
+        return -ENOEXEC;
+    img->size = (uint32_t)vn->size;
     if (!vn->fs) {
         img->data = vn->data;
-        img->have = vn->size;
+        img->have = img->size;
         return 0;
     }
-    uint32_t n = MIN(vn->size, (uint32_t)HEAD_BYTES);
+    uint32_t n = MIN(img->size, (uint32_t)HEAD_BYTES);
     img->owned = kmalloc(n ? n : 1);
     if (!img->owned)
         return -ENOMEM;
@@ -122,59 +151,123 @@ static int image_copy_in(pte_t *pd, const struct image *img, uint32_t va, uint32
 }
 
 /* Is the page at va part of a writable segment? */
-static int page_writable(const struct elf32_phdr *ph, int nph, uint32_t va)
+static int page_writable(const struct segment *seg, int nseg, uint32_t va)
 {
-    for (int i = 0; i < nph; i++) {
-        if (ph[i].type != PT_LOAD || !ph[i].memsz || !(ph[i].flags & PF_W))
+    for (int i = 0; i < nseg; i++) {
+        if (!(seg[i].flags & PF_W))
             continue;
-        if (va + PAGE_SIZE > ALIGN_DOWN(ph[i].vaddr, PAGE_SIZE) && va < ph[i].vaddr + ph[i].memsz)
+        if (va + PAGE_SIZE > ALIGN_DOWN(seg[i].vaddr, PAGE_SIZE) && va < seg[i].vaddr + seg[i].memsz)
             return 1;
     }
     return 0;
 }
 
-static int load_segments(pte_t *pd, const struct image *img, uint32_t *entry, uint32_t *top)
+/* n bytes of the file at off: in the head read already, or else fetched (*fetched, for the caller to free). */
+static const void *image_bytes(const struct image *img, uint64_t off, uint32_t n, void **fetched)
 {
-    const struct elf32_ehdr *eh = (const struct elf32_ehdr *)img->data;
-
-    if (img->have < sizeof(*eh) || memcmp(eh->ident, ELF_MAGIC, 4) != 0)
-        return -ENOEXEC;
-    if (eh->ident[4] != 1 || eh->ident[5] != 1 || eh->type != ET_EXEC ||
-        eh->machine != EM_386 || eh->phentsize != sizeof(struct elf32_phdr))
-        return -ENOEXEC;
-    uint32_t ph_bytes = (uint32_t)eh->phnum * sizeof(struct elf32_phdr);
-    if (eh->phoff > img->size || ph_bytes > img->size - eh->phoff)
-        return -ENOEXEC;
-
-    /* The program headers: in the head read already, or else fetched. */
-    struct elf32_phdr *fetched = NULL;
-    const struct elf32_phdr *ph;
-    if (eh->phoff + ph_bytes <= img->have) {
-        ph = (const struct elf32_phdr *)(img->data + eh->phoff);
-    } else {
-        fetched = kmalloc(ph_bytes ? ph_bytes : 1);
-        if (!fetched)
-            return -ENOMEM;
-        if (vfs_read(img->vn, fetched, eh->phoff, ph_bytes) != (int)ph_bytes) {
-            kfree(fetched);
-            return -EIO;
-        }
-        ph = fetched;
+    *fetched = NULL;
+    if (off > img->size || n > img->size - off)
+        return NULL;
+    if (off + n <= img->have)
+        return img->data + off;
+    void *buf = kmalloc(n ? n : 1);
+    if (!buf)
+        return NULL;
+    if (vfs_read(img->vn, buf, (uint32_t)off, n) != (int)n) {
+        kfree(buf);
+        return NULL;
     }
+    return *fetched = buf;
+}
 
-    int r = 0;
-    *top = 0;
-    for (int i = 0; i < eh->phnum && r == 0; i++) {
-        const struct elf32_phdr *p = &ph[i];
-        if (p->type != PT_LOAD || p->memsz == 0)
+/*
+ * The executable's loadable segments (*out, for the caller to free), its
+ * entry point and which kind it is: 0 an ELF32 program for the 386, 1 an
+ * ELF64 one for x86-64.
+ */
+static int read_segments(const struct image *img, struct segment **out, int *nseg, uint32_t *entry, int *is64)
+{
+    const struct elf32_ehdr *e32 = (const struct elf32_ehdr *)img->data;
+    const struct elf64_ehdr *e64 = (const struct elf64_ehdr *)img->data;
+    if (img->have < sizeof(*e32) || memcmp(e32->ident, ELF_MAGIC, 4) != 0 || e32->ident[5] != 1)
+        return -ENOEXEC;
+    uint64_t phoff, entry64;
+    uint32_t phnum, phentsize;
+    if (e32->ident[4] == 1 && e32->type == ET_EXEC && e32->machine == EM_386 &&
+        e32->phentsize == sizeof(struct elf32_phdr)) {
+        *is64 = 0;
+        phoff = e32->phoff;
+        phnum = e32->phnum;
+        entry64 = e32->entry;
+        phentsize = sizeof(struct elf32_phdr);
+    } else if (e32->ident[4] == 2 && img->have >= sizeof(*e64) && e64->type == ET_EXEC &&
+               e64->machine == EM_X86_64 && e64->phentsize == sizeof(struct elf64_phdr)) {
+        *is64 = 1;
+        phoff = e64->phoff;
+        phnum = e64->phnum;
+        entry64 = e64->entry;
+        phentsize = sizeof(struct elf64_phdr);
+    } else {
+        return -ENOEXEC;
+    }
+    void *fetched;
+    const uint8_t *ph = image_bytes(img, phoff, phnum * phentsize, &fetched);
+    if (!ph)
+        return -ENOEXEC;
+    struct segment *seg = kmalloc((phnum ? phnum : 1) * sizeof(*seg));
+    if (!seg) {
+        kfree(fetched);
+        return -ENOMEM;
+    }
+    int n = 0, r = 0;
+    for (uint32_t i = 0; i < phnum && r == 0; i++) {
+        uint64_t offset, vaddr, filesz, memsz;
+        uint32_t type, flags;
+        if (*is64) {
+            const struct elf64_phdr *p = (const struct elf64_phdr *)(ph + i * phentsize);
+            type = p->type; flags = p->flags;
+            offset = p->offset; vaddr = p->vaddr; filesz = p->filesz; memsz = p->memsz;
+        } else {
+            const struct elf32_phdr *p = (const struct elf32_phdr *)(ph + i * phentsize);
+            type = p->type; flags = p->flags;
+            offset = p->offset; vaddr = p->vaddr; filesz = p->filesz; memsz = p->memsz;
+        }
+        if (type != PT_LOAD || memsz == 0)
             continue;
-        uint32_t end = p->vaddr + p->memsz;
-        if (p->memsz < p->filesz || p->vaddr < USER_BASE || end < p->vaddr ||
-            end > USER_MMIO_BASE || p->offset > img->size ||
-            p->filesz > img->size - p->offset) {
+        /* Where programs are loaded (below the device memory, a 64-bit
+         * program too: its code is linked for an address under 2 GiB), and
+         * within the file. */
+        if (memsz < filesz || vaddr < USER_BASE || vaddr > USER_MMIO_BASE || memsz > USER_MMIO_BASE - vaddr ||
+            offset > img->size || filesz > img->size - offset) {
             r = -ENOEXEC;
             break;
         }
+        seg[n++] = (struct segment){ flags, (uint32_t)offset, (uint32_t)vaddr, (uint32_t)filesz, (uint32_t)memsz };
+    }
+    kfree(fetched);
+    if (r == 0 && entry64 >> 32)
+        r = -ENOEXEC;
+    if (r < 0) {
+        kfree(seg);
+        return r;
+    }
+    *out = seg;
+    *nseg = n;
+    *entry = (uint32_t)entry64;
+    return 0;
+}
+
+static int load_segments(pte_t *pd, const struct image *img, uint32_t *entry, uint32_t *top, int *is64)
+{
+    struct segment *seg;
+    int nseg;
+    int r = read_segments(img, &seg, &nseg, entry, is64);
+    if (r < 0)
+        return r;
+    *top = 0;
+    for (int i = 0; i < nseg && r == 0; i++) {
+        const struct segment *p = &seg[i];
+        uint32_t end = p->vaddr + p->memsz;
         for (uint32_t va = ALIGN_DOWN(p->vaddr, PAGE_SIZE); va < end && r == 0; va += PAGE_SIZE)
             if (vmm_alloc(pd, va) < 0)
                 r = -ENOMEM;
@@ -182,27 +275,27 @@ static int load_segments(pte_t *pd, const struct image *img, uint32_t *entry, ui
             r = image_copy_in(pd, img, p->vaddr, p->offset, p->filesz);
         *top = MAX(*top, end);
     }
-    if (r == 0 && (*top == 0 || eh->entry < USER_BASE || eh->entry >= *top))
+    if (r == 0 && (*top == 0 || *entry < USER_BASE || *entry >= *top))
         r = -ENOEXEC;
-
     /* The segments' own permissions: code and read-only data stay as the
      * compiler left them, unless a writable segment shares the page. */
-    for (int i = 0; i < eh->phnum && r == 0; i++) {
-        const struct elf32_phdr *p = &ph[i];
-        if (p->type != PT_LOAD || p->memsz == 0 || (p->flags & PF_W))
+    for (int i = 0; i < nseg && r == 0; i++) {
+        const struct segment *p = &seg[i];
+        if (p->flags & PF_W)
             continue;
         uint32_t prot = PROT_READ | ((p->flags & PF_X) ? PROT_EXEC : 0);
         for (uint32_t va = ALIGN_DOWN(p->vaddr, PAGE_SIZE); va < p->vaddr + p->memsz; va += PAGE_SIZE)
-            if (!page_writable(ph, eh->phnum, va))
+            if (!page_writable(seg, nseg, va))
                 vmm_protect_page(pd, va, prot);
     }
-    kfree(fetched);
-    if (r == 0)
-        *entry = eh->entry;
+    kfree(seg);
     return r;
 }
 
-static int build_stack(pte_t *pd, char *const argv[], char *const envp[], uint32_t *sp_out)
+/* word: the size of the stack's words, 4 bytes for a 32-bit program and 8 for a 64-bit one;
+ * top: where the stack ends. */
+static int build_stack(pte_t *pd, char *const argv[], char *const envp[], uint32_t word, uint64_t top,
+                       uint64_t *sp_out)
 {
     uint32_t str_bytes = 0;
     int argc = count_strings(argv, &str_bytes);
@@ -211,38 +304,38 @@ static int build_stack(pte_t *pd, char *const argv[], char *const envp[], uint32
         return -E2BIG;
 
     uint32_t nptrs = 1 + (uint32_t)argc + 1 + (uint32_t)envc + 1;
-    uint32_t str_base = USER_STACK_TOP - ALIGN_UP(str_bytes, 16u);
-    uint32_t sp = ALIGN_DOWN(str_base - nptrs * 4, 16u);
-    uint32_t size = USER_STACK_TOP - sp;
+    uint64_t str_base = top - ALIGN_UP(str_bytes, 16u);
+    uint64_t sp = ALIGN_DOWN(str_base - nptrs * word, 16u);
+    uint32_t size = (uint32_t)(top - sp);
 
     uint8_t *frame = kzalloc(size);
     if (!frame)
         return -ENOMEM;
-    uint32_t *ptrs = (uint32_t *)frame;
+    /* (The frame is zeroed: a word's high half stays 0, and so do the two NULLs.) */
+    uint8_t *ptrs = frame;
     char *strs = (char *)frame + (str_base - sp);
-    uint32_t va = str_base;
+    uint64_t va = str_base;
     uint32_t k = 0;
 
-    ptrs[k++] = (uint32_t)argc;
+    memcpy(ptrs + word * k++, &(uint32_t){ (uint32_t)argc }, 4);
     for (int i = 0; i < argc; i++) {
         uint32_t len = strlen(argv[i]) + 1;
         memcpy(strs, argv[i], len);
-        ptrs[k++] = va;
+        memcpy(ptrs + word * k++, &va, word);
         strs += len;
         va += len;
     }
-    ptrs[k++] = 0;
+    k++;
     for (int i = 0; i < envc; i++) {
         uint32_t len = strlen(envp[i]) + 1;
         memcpy(strs, envp[i], len);
-        ptrs[k++] = va;
+        memcpy(ptrs + word * k++, &va, word);
         strs += len;
         va += len;
     }
-    ptrs[k++] = 0;
 
     int r = 0;
-    for (uint32_t pg = ALIGN_DOWN(sp, PAGE_SIZE) - STACK_SLACK; pg < USER_STACK_TOP && !r; pg += PAGE_SIZE)
+    for (uint64_t pg = ALIGN_DOWN(sp, PAGE_SIZE) - STACK_SLACK; pg < top && !r; pg += PAGE_SIZE)
         r = vmm_alloc(pd, pg);
     if (!r)
         r = vmm_copy_to(pd, sp, frame, size);
@@ -377,11 +470,14 @@ int proc_exec(struct proc *p, const char *path, char *const argv[], char *const 
         return -ENOMEM;
     }
 
-    uint32_t entry, top, sp;
-    r = load_segments(pd, &img, &entry, &top);
+    uint32_t entry, top;
+    uint64_t sp = 0;
+    int is64 = 0;
+    r = load_segments(pd, &img, &entry, &top, &is64);
     image_free(&img);
+    /* A 64-bit program's stack and heap are where a 32-bit one's cannot be (kernel.h). */
     if (r == 0)
-        r = build_stack(pd, argv, envp, &sp);
+        r = build_stack(pd, argv, envp, is64 ? 8 : 4, is64 ? USER64_TOP : USER_STACK_TOP, &sp);
     if (r < 0) {
         vmm_destroy(pd);
         return r;
@@ -421,7 +517,7 @@ int proc_exec(struct proc *p, const char *path, char *const argv[], char *const 
             file_close(f);
         }
     }
-    p->leader->heap_start = p->leader->brk = ALIGN_UP(top, PAGE_SIZE);
+    p->leader->heap_start = p->leader->brk = is64 ? USER64_HEAP_BASE : ALIGN_UP(top, PAGE_SIZE);
     p->leader->stack_low = ALIGN_DOWN(sp, PAGE_SIZE) - STACK_SLACK;
 
     const char *base = strrchr(path, '/');
@@ -429,10 +525,17 @@ int proc_exec(struct proc *p, const char *path, char *const argv[], char *const 
 
     struct trapframe *tf = p->tf;
     memset(tf, 0, sizeof(*tf));
-    tf->cs = SEG_UCODE;
+    p->user64 = is64;
+    tf->cs = is64 ? SEG_UCODE64 : SEG_UCODE;
     tf->ds = tf->es = tf->fs = tf->gs = tf->ss = SEG_UDATA;
+    if (is64)
+        tf->fs = tf->gs = 0;                /* no selectors: a 64-bit program's FS has a base of its own (proc_load_tls) */
     tf->eflags = 0x202;                     /* IF set */
-    tf->eip = entry;
-    tf->useresp = sp;
+    tf->rip = entry;
+    tf->rsp = sp;
+    /* No thread block yet, of the kind of program it now is. */
+    uint32_t flags = irq_save();
+    proc_load_tls(p);
+    irq_restore(flags);
     return 0;
 }

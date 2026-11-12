@@ -32,7 +32,7 @@ static int booted_from_disk(void)
     int fd = open("/etc/boot-source", O_RDONLY);
     if (fd < 0)
         return 0;
-    int n = (int)read(fd, buf, sizeof(buf) - 1);
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
     return n >= 4 && !strncmp(buf, "disk", 4);
 }
@@ -88,7 +88,7 @@ static int write_file(const char *dir, const char *file, const char *buf, int le
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0)
         return -1;
-    int w = (int)write(fd, buf, (size_t)len);
+    ssize_t w = write(fd, buf, (size_t)len);
     if (close(fd) < 0 || w != len || rename(tmp, path) < 0) {
         unlink(tmp);
         return -1;

@@ -715,11 +715,16 @@ int vfs_read(struct vnode *vn, void *buf, uint64_t off, uint32_t n)
         return -EINVAL;
     if (off >= vn->size)
         return 0;
-    n = MIN(n, vn->size - (uint32_t)off);
+    n = (uint32_t)MIN((uint64_t)n, vn->size - off);
     if (vn->fs)
-        return vn->fs->ops->read(vn, buf, (uint32_t)off, n);
+        return vn->fs->ops->read(vn, buf, off, n);
     memcpy(buf, vn->data + off, n);
     return (int)n;
+}
+
+uint64_t vfs_max_file(struct vnode *vn)
+{
+    return vn->fs ? vn->fs->max_file : RAMFS_MAX_FILE;
 }
 
 static int reserve(struct vnode *vn, uint32_t size)
@@ -746,36 +751,39 @@ int vfs_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t n)
         return -EINVAL;
     if (!n)
         return 0;
-    if (off + n > UINT32_MAX)
+    if (vn->fs && (vn->fs->readonly || !vn->fs->ops->write))
+        return -EROFS;
+    /* Up to the largest size a file may have, and nothing from there on. */
+    uint64_t max = vfs_max_file(vn);
+    if (off >= max)
         return -EFBIG;
-    uint32_t pos = (uint32_t)off;
-    if (vn->fs) {
-        if (vn->fs->readonly || !vn->fs->ops->write)
-            return -EROFS;
-        return vn->fs->ops->write(vn, buf, pos, n);
-    }
+    n = (uint32_t)MIN((uint64_t)n, max - off);
+    if (vn->fs)
+        return vn->fs->ops->write(vn, buf, off, n);
+    uint32_t pos = (uint32_t)off, size = (uint32_t)vn->size;    /* (in memory: under 4 GiB) */
     int r = reserve(vn, pos + n);
     if (r < 0)
         return r;
-    if (pos > vn->size)
-        memset(vn->data + vn->size, 0, pos - vn->size);
+    if (pos > size)
+        memset(vn->data + size, 0, pos - size);
     memcpy(vn->data + pos, buf, n);
-    vn->size = MAX(vn->size, pos + n);
+    vn->size = MAX(size, pos + n);
     vn->mtime = time_now();
     return (int)n;
 }
 
-int vfs_truncate(struct vnode *vn, uint32_t size)
+int vfs_truncate(struct vnode *vn, uint64_t size)
 {
     if (vn->type != VN_FILE)
         return vn->type == VN_DIR ? -EISDIR : 0;
-    if (vn->fs) {
-        if (vn->fs->readonly || !vn->fs->ops->truncate)
-            return -EROFS;
+    if (vn->fs && (vn->fs->readonly || !vn->fs->ops->truncate))
+        return -EROFS;
+    if (size > vfs_max_file(vn))
+        return -EFBIG;
+    if (vn->fs)
         return vn->fs->ops->truncate(vn, size);
-    }
     if (size > vn->size) {
-        int r = reserve(vn, size);
+        int r = reserve(vn, (uint32_t)size);
         if (r < 0)
             return r;
         memset(vn->data + vn->size, 0, size - vn->size);
@@ -805,12 +813,12 @@ void vfs_stat(struct vnode *vn, struct stat *st)
     st->st_dev = vn->fs ? vn->fs->dev : 1;     /* ramfs and devices: 1 */
     st->st_ino = vn->ino;
     st->st_mode = fmt | (vn->mode & 07777);
-    st->st_size = vn->size;
+    st->st_size = (flux_off_t)vn->size;
     st->st_nlink = vn->nlink ? vn->nlink : vn->type == VN_DIR ? 2 : 1;
     st->st_uid = vn->uid;
     st->st_gid = vn->gid;
     st->st_blksize = 4096;
-    st->st_blocks = (vn->size + 511) / 512;
+    st->st_blocks = vn->size / 512 + (vn->size % 512 != 0);
     st->st_atime = st->st_mtime = st->st_ctime = vn->mtime;
     st->st_rdev = vn->rdev;
 }

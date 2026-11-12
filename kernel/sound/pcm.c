@@ -425,7 +425,7 @@ static int stream_ioctl_locked(struct pcm_stream *s, uint32_t req, int *v, struc
     return -EINVAL;
 }
 
-static int stream_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
+static int stream_ioctl(struct vnode *vn, uint32_t req, uintptr_t arg)
 {
     struct pcm_stream *s = vn->dev_priv;
     if (req == SOUND_INFO) {            /* answered whether the card is still there or not */

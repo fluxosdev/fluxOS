@@ -456,7 +456,7 @@ static int mixer_ioctl_locked(uint32_t req, struct mixer_level *ml, int *hw_leve
 
 /* User memory is copied with nothing held: a page of it may need faulting
  * in, which a spinlock holder cannot do (mm_enter). */
-static int mixer_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
+static int mixer_ioctl(struct vnode *vn, uint32_t req, uintptr_t arg)
 {
     (void)vn;
     if (req == SOUND_INFO) {

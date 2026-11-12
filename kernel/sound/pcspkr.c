@@ -115,7 +115,7 @@ static int spkr_write(struct vnode *vn, const void *buf, uint64_t off, uint32_t 
     return (int)(done * sizeof(*t));
 }
 
-static int spkr_ioctl(struct vnode *vn, uint32_t req, uint32_t arg)
+static int spkr_ioctl(struct vnode *vn, uint32_t req, uintptr_t arg)
 {
     (void)vn;
     switch (req) {

@@ -16,7 +16,7 @@ uint8_t *file_read_all(const char *path, uint32_t *len)
         return NULL;
     struct stat st;
     uint8_t *buf = NULL;
-    if (fstat(fd, &st) == 0 && st.st_size > 0 && (uint32_t)st.st_size < MAX_FILE) {
+    if (fstat(fd, &st) == 0 && st.st_size > 0 && st.st_size < (off_t)MAX_FILE) {
         buf = malloc((size_t)st.st_size);
         uint32_t got = 0;
         int r = 1;

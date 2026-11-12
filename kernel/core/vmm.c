@@ -9,9 +9,9 @@
  * all of these hang off top-level entries made at boot, so a mapping
  * added to them later is in every address space at once.
  *
- * The user half is the 2 GiB from USER_BASE, of 4 KiB pages: processes
- * are 32-bit programs. Page tables, and any frame, are reached through
- * the direct map. User pages marked PTE_MMIO map device memory, lent to
+ * The user half is 4 KiB pages from USER_BASE up to USER_LIMIT (which of
+ * it a process may use is its own matter: proc.h). Page tables, and any
+ * frame, are reached through the direct map. User pages marked PTE_MMIO map device memory, lent to
  * one process: never freed, and not copied into a forked child, which
  * has no claim on the device.
  *
@@ -36,9 +36,7 @@
 
 #define HHDM_BASE     0xFFFF800000000000ull     /* the direct map, in the kernel's own tables */
 #define KERNEL_PML4   256                       /* the first top-level entry of the kernel half */
-/* The page tables of the user half, 2 MiB each. */
-#define USER_TABLES   ((USER_TOP - USER_BASE) >> 21)
-#define USER_TABLE_VA(n) (USER_BASE + ((uint32_t)(n) << 21))
+#define USER_HALF_END (1ull << 47)               /* where the kernel half's entries begin to map */
 
 #define CR0_WP  (1u << 16)
 #define CR4_PGE (1u << 7)
@@ -87,7 +85,7 @@ static pte_t *table(pte_t e)
 }
 
 /* The first page tables are made before fpu_init() enables SSE. */
-static void zero_page(uint32_t phys)
+static void zero_page(uint64_t phys)
 {
     void *p = phys_to_virt(phys);
     if (kernel_sse)
@@ -96,7 +94,7 @@ static void zero_page(uint32_t phys)
         memset(p, 0, PAGE_SIZE);
 }
 
-static void copy_page(uint32_t to, uint32_t from)
+static void copy_page(uint64_t to, uint64_t from)
 {
     if (kernel_sse)
         sse_copy_page(phys_to_virt(to), phys_to_virt(from));
@@ -162,7 +160,7 @@ static void map_direct(pte_t *pd, uint64_t start, uint64_t end)
  */
 void paging_init(void)
 {
-    hhdm_base = boot.hhdm;
+    hhdm_base = boot.hhdm;              /* (as bootinfo.c left it) */
     kernel_phys = boot.kernel_phys;
     if (boot.kernel_virt != KERNEL_VIRT_BASE)
         panic("the kernel was loaded at %lx, not where it was linked", boot.kernel_virt);
@@ -204,6 +202,7 @@ void paging_init(void)
     hhdm_base = HHDM_BASE;
     kernel_pd = phys_to_virt(pd_phys);
     boot_pd = phys_to_virt(bpd_phys);
+    pmm_remap();
     /* Global pages on (which also empties the TLB of the loader's
      * mappings), and read-only pages honoured in ring 0. */
     write_cr4(read_cr4() & ~(uint64_t)CR4_PGE);
@@ -328,41 +327,62 @@ void vmm_unmap_mmio(void *virt)
     }
 }
 
-static pte_t *get_pte(pte_t *pd, uint32_t va, int create)
+static pte_t *get_pte(pte_t *pd, uint64_t va, int create)
 {
     return walk(pd, va, 0, create, UTABLE);
 }
 
-/* The page table of the n-th 2 MiB of the user half, or NULL. */
-static pte_t *user_table(pte_t *pd, uint32_t n)
+/* The first page table of pd's user half that maps from *va (a multiple of
+ * 2 MiB) or above, with *va set to where it maps from; NULL when there is
+ * no more. Whatever is not mapped is stepped over a whole table at a time. */
+static pte_t *next_user_table(pte_t *pd, uint64_t *va)
 {
-    pte_t *e = walk(pd, USER_TABLE_VA(n), 1, 0, 0);
-    return e && (*e & PTE_PRESENT) ? table(*e) : NULL;
+    uint64_t a = *va;
+    while (a < USER_HALF_END) {
+        pte_t e = pd[INDEX(a, 3)];
+        if (!(e & PTE_PRESENT)) {
+            a = (a | ((1ull << 39) - 1)) + 1;
+            continue;
+        }
+        e = table(e)[INDEX(a, 2)];
+        if (!(e & PTE_PRESENT) || (e & PTE_LARGE)) {
+            a = (a | ((1ull << 30) - 1)) + 1;
+            continue;
+        }
+        e = table(e)[INDEX(a, 1)];
+        if (!(e & PTE_PRESENT) || (e & PTE_LARGE)) {
+            a += LARGE_PAGE;
+            continue;
+        }
+        *va = a;
+        return table(e);
+    }
+    return NULL;
 }
 
-static void flush_page(pte_t *pd, uint32_t va)
+static void flush_page(pte_t *pd, uint64_t va)
 {
     if (read_cr3() == virt_to_phys(pd))
         invlpg(va);
     smp_flush_tlb(pd);              /* other threads of this process */
 }
 
-int vmm_alloc(pte_t *pd, uint32_t va)
+int vmm_alloc(pte_t *pd, uint64_t va)
 {
     return vmm_alloc_prot(pd, va, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
 }
 
-int vmm_alloc_prot(pte_t *pd, uint32_t va, uint32_t prot, uint32_t flags)
+int vmm_alloc_prot(pte_t *pd, uint64_t va, uint32_t prot, uint32_t flags)
 {
     va = ALIGN_DOWN(va, PAGE_SIZE);
-    if (va < USER_BASE || va >= USER_TOP)
+    if (va < USER_BASE || va >= USER_LIMIT)
         return -EFAULT;
     pte_t *pte = get_pte(pd, va, 1);
     if (!pte)
         return -ENOMEM;
     if (*pte & PTE_PRESENT)
         return 0;
-    uint32_t frame = pmm_alloc_user();
+    uint64_t frame = pmm_alloc_user();
     if (!frame)
         return -ENOMEM;
     zero_page(frame);
@@ -378,10 +398,10 @@ int vmm_alloc_prot(pte_t *pd, uint32_t va, uint32_t prot, uint32_t flags)
     return 0;
 }
 
-int vmm_protect_page(pte_t *pd, uint32_t va, uint32_t prot)
+int vmm_protect_page(pte_t *pd, uint64_t va, uint32_t prot)
 {
     va = ALIGN_DOWN(va, PAGE_SIZE);
-    if (va < USER_BASE || va >= USER_TOP)
+    if (va < USER_BASE || va >= USER_LIMIT)
         return -EFAULT;
     pte_t *pte = get_pte(pd, va, 0);
     if (!pte || !(*pte & PTE_PRESENT) || (*pte & PTE_MMIO))
@@ -391,7 +411,7 @@ int vmm_protect_page(pte_t *pd, uint32_t va, uint32_t prot)
         e &= ~(pte_t)(PTE_USER | PTE_WRITE);
     } else if (prot & PROT_WRITE) {
         e |= PTE_USER;
-        if ((e & PTE_SHARED) || pmm_claim_sole((uint32_t)FRAME(e))) {
+        if ((e & PTE_SHARED) || pmm_claim_sole(FRAME(e))) {
             e = (e & ~(pte_t)PTE_COW) | PTE_WRITE;
         } else {
             e = (e & ~(pte_t)PTE_WRITE) | PTE_COW;
@@ -404,17 +424,17 @@ int vmm_protect_page(pte_t *pd, uint32_t va, uint32_t prot)
     return 0;
 }
 
-void vmm_zero_frame(uint32_t phys)
+void vmm_zero_frame(uint64_t phys)
 {
     zero_page(phys);
 }
 
 /* Map an ordinary frame at va, shared across fork (a shared memory segment's). The caller has
  * taken the reference the mapping holds, which unmapping gives back. */
-int vmm_map_frame(pte_t *pd, uint32_t va, uint32_t frame, uint32_t prot)
+int vmm_map_frame(pte_t *pd, uint64_t va, uint32_t frame, uint32_t prot)
 {
     va = ALIGN_DOWN(va, PAGE_SIZE);
-    if (va < USER_BASE || va >= USER_TOP)
+    if (va < USER_BASE || va >= USER_LIMIT)
         return -EFAULT;
     pte_t *pte = get_pte(pd, va, 1);
     if (!pte)
@@ -432,9 +452,10 @@ int vmm_map_frame(pte_t *pd, uint32_t va, uint32_t frame, uint32_t prot)
 }
 
 /* Map [phys, phys + size) into a user address space as device memory. */
-int vmm_map_phys(pte_t *pd, uint32_t va, uint64_t phys, uint32_t size, uint32_t flags)
+int vmm_map_phys(pte_t *pd, uint64_t va, uint64_t phys, uint32_t size, uint32_t flags)
 {
-    if (va < USER_BASE || va + size > USER_STACK_LIMIT || va + size < va)
+    /* (Device memory is below a 32-bit program's stack, in any process.) */
+    if (va < USER_BASE || va >= USER_STACK_LIMIT || size > USER_STACK_LIMIT - va)
         return -EINVAL;
     for (uint32_t off = 0; off < size; off += PAGE_SIZE) {
         pte_t *pte = get_pte(pd, va + off, 1);
@@ -448,7 +469,7 @@ int vmm_map_phys(pte_t *pd, uint32_t va, uint64_t phys, uint32_t size, uint32_t 
     return 0;
 }
 
-void vmm_free_page(pte_t *pd, uint32_t va)
+void vmm_free_page(pte_t *pd, uint64_t va)
 {
     pte_t *pte = get_pte(pd, ALIGN_DOWN(va, PAGE_SIZE), 0);
     if (pte && (*pte & PTE_PRESENT)) {
@@ -456,40 +477,90 @@ void vmm_free_page(pte_t *pd, uint32_t va)
         *pte = 0;
         flush_page(pd, va);             /* no processor may still write to it once it is reused */
         if (!(e & PTE_MMIO))
-            pmm_free((uint32_t)FRAME(e));
+            pmm_free(FRAME(e));
     }
 }
 
-int vmm_pte_present(pte_t *pd, uint32_t va)
+/* The same for every page of [start, end): what is not mapped at all in
+ * there, however much, takes no time. */
+void vmm_free_range(pte_t *pd, uint64_t start, uint64_t end)
 {
-    if (va < USER_BASE || va >= USER_TOP)
+    pte_t *pt;
+    for (uint64_t base = ALIGN_DOWN(start, LARGE_PAGE);
+         base < end && (pt = next_user_table(pd, &base)) != NULL && base < end; base += LARGE_PAGE) {
+        for (int j = 0; j < ENTRIES; j++) {
+            uint64_t va = base | ((uint64_t)j << 12);
+            if (va >= start && va < end && (pt[j] & PTE_PRESENT))
+                vmm_free_page(pd, va);
+        }
+    }
+}
+
+int vmm_pte_present(pte_t *pd, uint64_t va)
+{
+    if (va < USER_BASE || va >= USER_LIMIT)
         return 0;
     pte_t *pte = get_pte(pd, va, 0);
     return pte && (*pte & (PTE_PRESENT | PTE_MMIO)) == PTE_PRESENT;
 }
 
 /* Is device memory mapped at va (the screen at USER_MMIO_BASE, by fbmap)? */
-int vmm_mmio_mapped(pte_t *pd, uint32_t va)
+int vmm_mmio_mapped(pte_t *pd, uint64_t va)
 {
-    if (va < USER_BASE || va >= USER_TOP)
+    if (va < USER_BASE || va >= USER_LIMIT)
         return 0;
     pte_t *pte = get_pte(pd, va, 0);
     return pte && (*pte & (PTE_PRESENT | PTE_MMIO)) == (PTE_PRESENT | PTE_MMIO);
 }
 
-uint32_t vmm_translate(pte_t *pd, uint32_t va)
+uint64_t vmm_translate(pte_t *pd, uint64_t va)
 {
-    if (va < USER_BASE || va >= USER_TOP)
+    if (va < USER_BASE || va >= USER_LIMIT)
         return 0;
     pte_t *pte = get_pte(pd, va, 0);
     if (!pte || (*pte & (PTE_PRESENT | PTE_USER | PTE_MMIO)) != (PTE_PRESENT | PTE_USER))
         return 0;                               /* device memory or PROT_NONE is not RAM */
-    return (uint32_t)FRAME(*pte) | (va & 0xFFF);
+    return FRAME(*pte) | (va & 0xFFF);
 }
 
-int vmm_write_ok(pte_t *pd, uint32_t va)
+/*
+ * The same for a device that takes 32-bit addresses (a page lent to the
+ * GPU): a page above 4 GiB is moved below first, its contents with it.
+ * The caller holds the process's mm lock, so no page fault of another
+ * thread gets in between; a thread using the page meanwhile faults (the
+ * page is taken away while it is copied) and waits for that lock. A page
+ * shared with other address spaces by design (a shared memory segment's)
+ * cannot move, and need not: those are made below 4 GiB. 0 if there is no
+ * page, or no memory to move it to.
+ */
+uint32_t vmm_translate_low(pte_t *pd, uint64_t va)
 {
-    if (va < USER_BASE || va >= USER_TOP)
+    if (va < USER_BASE || va >= USER_LIMIT)
+        return 0;
+    pte_t *pte = get_pte(pd, va, 0);
+    if (!pte || (*pte & (PTE_PRESENT | PTE_USER | PTE_MMIO)) != (PTE_PRESENT | PTE_USER))
+        return 0;
+    pte_t e = *pte;
+    uint64_t frame = FRAME(e);
+    if (frame >> 32) {
+        if (e & PTE_SHARED)
+            return 0;
+        uint32_t low = pmm_alloc_user_low();
+        if (!low)
+            return 0;
+        *pte = 0;
+        flush_page(pd, va);
+        copy_page(low, frame);
+        *pte = low | (e & 0xFFFu);      /* (as it was: a copy-on-write page still is, now with a copy of its own) */
+        pmm_free(frame);
+        frame = low;
+    }
+    return (uint32_t)frame | (va & 0xFFF);
+}
+
+int vmm_write_ok(pte_t *pd, uint64_t va)
+{
+    if (va < USER_BASE || va >= USER_LIMIT)
         return 0;
     pte_t *pte = get_pte(pd, va, 0);
     if (!pte)
@@ -498,10 +569,10 @@ int vmm_write_ok(pte_t *pd, uint32_t va)
     return (*pte & (req | PTE_MMIO)) == req;
 }
 
-int vmm_resolve_cow(pte_t *pd, uint32_t va)
+int vmm_resolve_cow(pte_t *pd, uint64_t va)
 {
     va = ALIGN_DOWN(va, PAGE_SIZE);
-    if (va < USER_BASE || va >= USER_TOP)
+    if (va < USER_BASE || va >= USER_LIMIT)
         return 0;
     pte_t *pte = get_pte(pd, va, 0);
     if (!pte || (*pte & (PTE_PRESENT | PTE_USER | PTE_MMIO)) != (PTE_PRESENT | PTE_USER))
@@ -510,13 +581,13 @@ int vmm_resolve_cow(pte_t *pd, uint32_t va)
         return 1;
     if (!(*pte & PTE_COW))
         return 0;
-    uint32_t old_frame = (uint32_t)FRAME(*pte);
+    uint64_t old_frame = FRAME(*pte);
     if (pmm_claim_sole(old_frame)) {
         *pte = (*pte & ~(pte_t)PTE_COW) | PTE_WRITE;
         flush_page(pd, va);
         return 1;
     }
-    uint32_t new_frame = pmm_alloc_user();
+    uint64_t new_frame = pmm_alloc_user();
     if (!new_frame)
         return 0;
     copy_page(new_frame, old_frame);
@@ -527,19 +598,19 @@ int vmm_resolve_cow(pte_t *pd, uint32_t va)
 }
 
 /* Copy n bytes of physical memory, any frame, into kernel memory. */
-void vmm_read_phys(void *dst, uint32_t phys, uint32_t n)
+void vmm_read_phys(void *dst, uint64_t phys, uint32_t n)
 {
     memcpy(dst, phys_to_virt(phys), n);
 }
 
 /* Copy kernel memory into another address space, a page at a time. */
-int vmm_copy_to(pte_t *pd, uint32_t va, const void *src, uint32_t len)
+int vmm_copy_to(pte_t *pd, uint64_t va, const void *src, uint32_t len)
 {
     const uint8_t *s = src;
     while (len) {
         if (!vmm_write_ok(pd, va) && !vmm_resolve_cow(pd, va))
             return -EFAULT;
-        uint32_t phys = vmm_translate(pd, va);
+        uint64_t phys = vmm_translate(pd, va);
         if (!phys)
             return -EFAULT;
         uint32_t chunk = MIN(len, PAGE_SIZE - (va & 0xFFF));
@@ -556,8 +627,10 @@ void vmm_destroy(pte_t *pd)
 {
     if (!pd || pd == kernel_pd)
         return;
-    if (pd[0] & PTE_PRESENT) {
-        pte_t *pdpt = table(pd[0]);
+    for (int top = 0; top < KERNEL_PML4; top++) {
+        if (!(pd[top] & PTE_PRESENT))
+            continue;
+        pte_t *pdpt = table(pd[top]);
         for (int i = 0; i < ENTRIES; i++) {
             if (!(pdpt[i] & PTE_PRESENT))
                 continue;
@@ -568,12 +641,12 @@ void vmm_destroy(pte_t *pd)
                 pte_t *pt = table(dir[j]);
                 for (int k = 0; k < ENTRIES; k++)
                     if ((pt[k] & (PTE_PRESENT | PTE_MMIO)) == PTE_PRESENT)
-                        pmm_free((uint32_t)FRAME(pt[k]));
-                pmm_free((uint32_t)FRAME(dir[j]));
+                        pmm_free(FRAME(pt[k]));
+                pmm_free(FRAME(dir[j]));
             }
-            pmm_free((uint32_t)FRAME(pdpt[i]));
+            pmm_free(FRAME(pdpt[i]));
         }
-        pmm_free((uint32_t)FRAME(pd[0]));
+        pmm_free(FRAME(pd[top]));
     }
     pmm_free(virt_to_phys(pd));
 }
@@ -596,14 +669,11 @@ pte_t *vmm_clone(pte_t *src)
     if (!pd)
         return NULL;
     int pid = current ? current->leader->pid : 0;
-    for (uint32_t i = 0; i < USER_TABLES; i++) {
-        pte_t *spt = user_table(src, i);
-        if (!spt)
-            continue;
-        uint32_t base = USER_TABLE_VA(i);
-        int pde_pinned = pid > 0 && fb_pinned(pid, base, base + (uint32_t)LARGE_PAGE);
+    pte_t *spt;
+    for (uint64_t base = 0; (spt = next_user_table(src, &base)) != NULL; base += LARGE_PAGE) {
+        int pde_pinned = pid > 0 && fb_pinned(pid, base, base + LARGE_PAGE);
         for (int j = 0; j < ENTRIES; j++) {
-            uint32_t va = base | ((uint32_t)j << 12);
+            uint64_t va = base | ((uint64_t)j << 12);
             if ((spt[j] & (PTE_PRESENT | PTE_MMIO)) == PTE_PRESENT &&
                 (spt[j] & (PTE_WRITE | PTE_COW)) && !(spt[j] & PTE_SHARED) &&
                 !(pde_pinned && fb_pinned(pid, va, va + PAGE_SIZE)))
@@ -611,30 +681,26 @@ pte_t *vmm_clone(pte_t *src)
         }
     }
     flush_pd(src);
-    for (uint32_t i = 0; i < USER_TABLES; i++) {
-        pte_t *spt = user_table(src, i);
-        if (!spt)
-            continue;
-        uint32_t base = USER_TABLE_VA(i);
+    for (uint64_t base = 0; (spt = next_user_table(src, &base)) != NULL; base += LARGE_PAGE) {
         pte_t *de = walk(pd, base, 1, 1, UTABLE);
         pte_t *dpt = de ? alloc_table() : NULL;
         if (!dpt)
             goto fail;
         *de = direct_phys(dpt) | UTABLE;
-        int pde_pinned = pid > 0 && fb_pinned(pid, base, base + (uint32_t)LARGE_PAGE);
+        int pde_pinned = pid > 0 && fb_pinned(pid, base, base + LARGE_PAGE);
         for (int j = 0; j < ENTRIES; j++) {
             if ((spt[j] & (PTE_PRESENT | PTE_MMIO)) != PTE_PRESENT)
                 continue;
-            uint32_t va = base | ((uint32_t)j << 12);
+            uint64_t va = base | ((uint64_t)j << 12);
             int pinned = pde_pinned && fb_pinned(pid, va, va + PAGE_SIZE);
-            if (!pinned && pmm_ref((uint32_t)FRAME(spt[j]))) {
+            if (!pinned && pmm_ref(FRAME(spt[j]))) {
                 dpt[j] = spt[j];        /* (made copy-on-write above) */
                 continue;
             }
-            uint32_t frame = pmm_alloc_user();
+            uint64_t frame = pmm_alloc_user();
             if (!frame)
                 goto fail;
-            copy_page(frame, (uint32_t)FRAME(spt[j]));
+            copy_page(frame, FRAME(spt[j]));
             pte_t eflags = spt[j] & 0xFFFu & ~(pte_t)(PTE_COW | PTE_SHARED);
             if (spt[j] & PTE_COW)
                 eflags |= PTE_WRITE;
@@ -652,10 +718,8 @@ uint32_t vmm_user_pages(pte_t *pd)
     uint32_t n = 0;
     if (!pd || pd == kernel_pd)
         return 0;
-    for (uint32_t i = 0; i < USER_TABLES; i++) {
-        pte_t *pt = user_table(pd, i);
-        if (!pt)
-            continue;
+    pte_t *pt;
+    for (uint64_t base = 0; (pt = next_user_table(pd, &base)) != NULL; base += LARGE_PAGE) {
         for (int j = 0; j < ENTRIES; j++)
             if ((pt[j] & (PTE_PRESENT | PTE_MMIO)) == PTE_PRESENT)
                 n++;
